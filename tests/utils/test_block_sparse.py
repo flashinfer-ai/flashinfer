@@ -18,7 +18,10 @@ import numpy as np
 import pytest
 import scipy as sp
 import torch
-from tests.test_helpers.jit_utils import gen_decode_attention_modules, gen_prefill_attention_modules
+from tests.test_helpers.jit_utils import (
+    gen_decode_attention_modules,
+    gen_prefill_attention_modules,
+)
 
 import flashinfer
 

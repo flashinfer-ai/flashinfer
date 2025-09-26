@@ -8,6 +8,8 @@ from torch import nn
 import flashinfer
 from tests.test_helpers.rope_reference import apply_rotary_emb, precompute_freqs_cis
 from tests.test_helpers.test_helpers import skip_on_gpu_arch_error
+
+
 def wmape(target: torch.Tensor, preds: torch.Tensor):
     sum_abs_error = (preds - target).abs().sum().detach().item()
     sum_scale = target.abs().sum().detach().item()
@@ -503,6 +505,7 @@ def test_mla_decode_kernel(bsz, kv_len, page_size):
         output_vanilla.reshape(-1), output_mat_absorbed_use_flashinfer.reshape(-1)
     )
     print(f"mse_use_flashinfer = {mse_use_flashinfer}")
+
 
 if __name__ == "__main__":
     bsz = 6

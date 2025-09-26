@@ -1,7 +1,8 @@
-import torch 
+import torch
 import functools
 import os
 import gc
+
 
 @functools.cache
 def get_device_properties(device: torch.device):
@@ -18,6 +19,7 @@ def skip_on_gpu_arch_error(func):
 
     return wrapper
 
+
 def clear_cuda_cache(device: torch.device) -> None:
     total_memory = get_device_properties(device).total_memory
     reserved_memory = torch.cuda.memory_reserved()
@@ -28,6 +30,7 @@ def clear_cuda_cache(device: torch.device) -> None:
     if reserved_memory > threshold * total_memory:
         gc.collect()
         torch.cuda.empty_cache()
+
 
 def assert_close_with_mismatch_tolerance(
     actual: torch.Tensor,

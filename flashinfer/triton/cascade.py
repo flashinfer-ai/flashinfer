@@ -12,6 +12,7 @@ from .utils import check_device, check_dim, check_input, check_shape
 
 EXPECT_HOPPER = 9
 
+
 def merge_state(
     v_a: torch.Tensor, s_a: torch.Tensor, v_b: torch.Tensor, s_b: torch.Tensor
 ):

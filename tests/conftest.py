@@ -140,6 +140,7 @@ def pytest_runtest_call(item):
         else:
             raise
 
+
 def skip_on_gpu_arch_error(func):
     @functools.wraps(func)
     def wrapper(*args, **kwargs):

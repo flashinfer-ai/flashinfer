@@ -2,7 +2,11 @@ import math
 
 import pytest
 import torch
-from tests.test_helpers.utils_fp4 import cast_from_fp4, recover_swizzled_scales, ref_fp4_quant
+from tests.test_helpers.utils_fp4 import (
+    cast_from_fp4,
+    recover_swizzled_scales,
+    ref_fp4_quant,
+)
 from tests.test_helpers.test_helpers import assert_close_with_mismatch_tolerance
 import einops
 from tests.test_helpers.sink_attention_reference import sink_attention_unified
