@@ -637,6 +637,11 @@ class AutoTuner:
                 )
             else:
                 opt_shapes = spec.gen_tuning_buckets
+
+            # Normalize candidate buckets to be monotonically non-decreasing and non-empty
+            opt_shapes = tuple(sorted(set(opt_shapes)))
+            assert len(opt_shapes) > 0, "Empty tuning buckets are not allowed"
+
             opt_shapes_max = {
                 v1: v2
                 for v1, v2 in zip(opt_shapes, tuple(opt_shapes[1:]) + (float("inf"),))
