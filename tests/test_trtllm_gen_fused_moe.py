@@ -220,6 +220,7 @@ class QuantMode(IntEnum):
     FP4_MXFP4_Bf16 = 3
     FP8_BLOCK_SCALE = 4
     FP8_PER_TENSOR = 5
+    BF16 = 6
 
 
 # ====================================================================================
@@ -1027,38 +1028,28 @@ class BF16Moe(Moe):
         # Use shuffled weights with BlockMajorK layout for better performance
         use_shuffled_weight = weight_processing["use_shuffled_weight"]
         weight_layout = weight_processing["layout"]
-
+    
         if use_shuffled_weight:
             # FIXME: this depends on the kernel internals
             epilogue_tile_m = 128
 
             # Reorder rows of W1 for fused gated activation
-            gemm1_weights_bf16_interleaved = []
-            for i in range(num_experts):
-                gemm1_weights_bf16_interleaved.append(
-                    reorder_rows_for_gated_act_gemm(args.gemm1_weights[i].clone())
-                )
-
-            # Stack weights and scales for all experts
-            gemm1_weights_bf16_interleaved = torch.stack(
-                gemm1_weights_bf16_interleaved
-            ).reshape(num_experts, 2 * intermediate_size, hidden_size)
-
-            # Shuffle weights and scaling factors for transposed mma output
             gemm1_weights_bf16_shuffled = []
             gemm2_weights_bf16_shuffled = []
             for i in range(num_experts):
+                tmp_weights1 = reorder_rows_for_gated_act_gemm(args.gemm1_weights[i].clone())
+
                 tmp_weights1 = shuffle_matrix_a(
-                    args.gemm1_weights[i].view(torch.uint8), epilogue_tile_m
+                    tmp_weights1.view(torch.uint8), epilogue_tile_m
                 )
                 tmp_weights2 = shuffle_matrix_a(
-                    args.gemm2_weights[i].view(torch.uint8), epilogue_tile_m
+                    args.gemm2_weights[i].clone().view(torch.uint8), epilogue_tile_m
                 )
 
                 if weight_layout == WeightLayout.BlockMajorK:
                     block_k = 64
-                    tmp_weights1 = convert_to_block_layout(tmp_weights1, block_k)
-                    tmp_weights2 = convert_to_block_layout(tmp_weights2, block_k)
+                    tmp_weights1 = convert_to_block_layout(tmp_weights1.view(torch.bfloat16), block_k)
+                    tmp_weights2 = convert_to_block_layout(tmp_weights2.view(torch.bfloat16), block_k)
 
                 gemm1_weights_bf16_shuffled.append(tmp_weights1)
                 gemm2_weights_bf16_shuffled.append(tmp_weights2)
@@ -1066,10 +1057,11 @@ class BF16Moe(Moe):
             # Stack weights for all experts
             gemm1_weights_bf16_shuffled = torch.stack(gemm1_weights_bf16_shuffled).view(
                 torch.bfloat16
-            )
+            ).contiguous()
             gemm2_weights_bf16_shuffled = torch.stack(gemm2_weights_bf16_shuffled).view(
                 torch.bfloat16
-            )
+            ).contiguous()
+            print(gemm1_weights_bf16_shuffled.shape, gemm2_weights_bf16_shuffled.shape)
 
             return {
                 "gemm1_weights": gemm1_weights_bf16_shuffled,
@@ -1412,6 +1404,7 @@ def check_accuracy(a, b, atol, rtol, percent):
         raise Exception("Inf in actual output")
     assert a.shape == b.shape, f"Shape mismatch: {a.shape} vs {b.shape}"
 
+    print(a, b)
     left = torch.abs(a - b)
     right = atol + rtol * torch.abs(b)
     count = torch.sum(left > right)
@@ -1725,6 +1718,10 @@ def run_moe_dequant(args, quant_mode: QuantMode):
             .to(torch.float)
         )
         args.c_global_sf = 1.0
+    elif quant_mode == QuantMode.BF16:
+        activation_output = activation_output.to(torch.bfloat16).to(torch.float)
+        args.c_global_sf = 1.0
+        print(activation_output)
     else:  # mxfp4Bf16
         activation_output = activation_output.to(torch.bfloat16).to(torch.float)
         args.c_global_sf = 1.0
@@ -1958,7 +1955,7 @@ def run_moe_reference_bf16(args):
         GatedActType.SwiGlu.value,  # gated_act_type
     )
 
-    return run_moe_dequant(args_dequant, QuantMode.FP8_PER_TENSOR), args_dequant
+    return run_moe_dequant(args_dequant, QuantMode.BF16), args_dequant
 
 
 def _compute_moe_actual_unified(moe_impl, args_dequant, args, **kwargs):
@@ -2255,7 +2252,7 @@ def test_moe_quantization_classes(
     else:
         routing_bias = None
 
-    hidden_states = 2 * torch.randn(
+    hidden_states = torch.ones(
         (num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16
     )
     gemm1_weights = torch.randn(
@@ -2263,6 +2260,12 @@ def test_moe_quantization_classes(
         device="cuda",
         dtype=torch.bfloat16,
     )
+    # for n in range(intermediate_size):
+    # for k in range(hidden_size):
+    #     gemm1_weights[:, 1, k] = k * 0.01
+    #     gemm1_weights[:, 1 + intermediate_size, k] = (k + k%2 + 30) * 0.00001
+        # gemm1_weights[:, 1 + intermediate_size, k] = k * 0.01
+
     gemm2_weights = torch.randn(
         (num_experts, hidden_size, intermediate_size),
         device="cuda",
