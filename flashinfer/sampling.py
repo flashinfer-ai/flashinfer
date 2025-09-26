@@ -16,8 +16,7 @@ limitations under the License.
 
 import functools
 from types import SimpleNamespace
-from typing import Optional, Tuple, Union
-
+from typing import Any, Optional, Tuple, Union
 import torch
 
 from .jit import JitSpec
@@ -495,6 +494,27 @@ def _to_tensor_scalar_tuple(x):
         return (None, x)
 
 
+def _check_tensor_param(param: Any, tensor: torch.Tensor) -> None:
+    """Validate sampling parameters."""
+    if isinstance(param, torch.Tensor):
+        if param.dim() == 0:
+            raise ValueError(
+                f"Expected a 1D tensor of shape (batch_size,) or scalar for the sampling parameter, "
+                f"but got a 0-dimensional tensor with shape {param.shape}. "
+            )
+        elif param.dim() > 1:
+            raise ValueError(
+                f"Expected a 1D tensor or scalar for the sampling parameter, "
+                f"but got a {param.dim()}D tensor with shape {param.shape}. "
+            )
+        elif param.shape[0] != tensor.shape[0]:
+            raise ValueError(
+                f"Sampling parameter tensor batch size mismatch: "
+                f"expected length {tensor.shape[0]} to match the reference tensor batch size, "
+                f"but got length {param.shape[0]} with shape {param.shape}."
+            )
+
+
 def softmax(
     logits: torch.Tensor,
     temperature: Optional[Union[torch.Tensor, float]] = None,
@@ -697,8 +717,8 @@ def top_p_sampling_from_probs(
         shape should be ``(unique_batch_size, num_classes)`` where unique_batch_size is the number of unique
         probability distributions.
     top_p: Union[torch.Tensor, float]
-        Either a scalar or a tensor of shape ``(batch_size,)``, representing the threshold for top-p sampling.
-        If a scalar, the same threshold is used for all requests.
+        Either a float or a tensor of shape ``(batch_size,)``, representing the threshold for top-p sampling.
+        If a float, the same threshold is used for all requests.
         If a tensor, each request has its own threshold.
     indices: Optional[torch.Tensor]
         Optional indices tensor of shape ``(batch_size,)`` that maps each output to a row in probs.
@@ -751,6 +771,7 @@ def top_p_sampling_from_probs(
     if check_nan:
         if torch.any(torch.isnan(probs)):
             raise ValueError("Input probs contains NaN.")
+    _check_tensor_param(top_p, probs)
     return get_sampling_module().top_p_sampling_from_probs(
         probs, indices, *_to_tensor_scalar_tuple(top_p), deterministic, generator
     )
@@ -833,6 +854,7 @@ def top_k_sampling_from_probs(
     if check_nan:
         if torch.any(torch.isnan(probs)):
             raise ValueError("Input probs contains NaN.")
+    _check_tensor_param(top_k, probs)
     return get_sampling_module().top_k_sampling_from_probs(
         probs, indices, *_to_tensor_scalar_tuple(top_k), deterministic, generator
     )
@@ -911,6 +933,7 @@ def min_p_sampling_from_probs(
     if check_nan:
         if torch.any(torch.isnan(probs)):
             raise ValueError("Input probs contains NaN.")
+    _check_tensor_param(min_p, probs)
     return get_sampling_module().min_p_sampling_from_probs(
         probs, indices, *_to_tensor_scalar_tuple(min_p), deterministic, generator
     )
@@ -1008,6 +1031,8 @@ def top_k_top_p_sampling_from_logits(
     top_k_mask_logits
     top_p_sampling_from_probs
     """
+    _check_tensor_param(top_k, logits)
+    _check_tensor_param(top_p, logits)
     if filter_apply_order == "top_k_first":
         masked_logits = top_k_mask_logits(logits, top_k)
         probs = torch.softmax(masked_logits, dim=-1)
@@ -1123,6 +1148,8 @@ def top_k_top_p_sampling_from_probs(
     top_p_renorm_probs
     top_k_mask_logits
     """
+    _check_tensor_param(top_k, probs)
+    _check_tensor_param(top_p, probs)
     if filter_apply_order == "top_k_first":
         renorm_probs = top_k_renorm_probs(probs, top_k)
         return top_p_sampling_from_probs(
@@ -1206,6 +1233,7 @@ def top_p_renorm_probs(
     sampling_from_probs
     top_k_renorm_probs
     """
+    _check_tensor_param(top_p, probs)
     return get_sampling_module().top_p_renorm_probs(
         probs, *_to_tensor_scalar_tuple(top_p)
     )
@@ -1270,6 +1298,7 @@ def top_k_renorm_probs(
     sampling_from_probs
     top_p_renorm_probs
     """
+    _check_tensor_param(top_k, probs)
     return get_sampling_module().top_k_renorm_probs(
         probs, *_to_tensor_scalar_tuple(top_k)
     )
@@ -1329,6 +1358,7 @@ def top_k_mask_logits(
     --------
     top_k_renorm_probs
     """
+    _check_tensor_param(top_k, logits)
     return get_sampling_module().top_k_mask_logits(
         logits, *_to_tensor_scalar_tuple(top_k)
     )
