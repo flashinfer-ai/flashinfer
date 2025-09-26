@@ -1,6 +1,8 @@
 import torch
 import functools
 import os
+from flashinfer.utils import GPUArchitectureError
+import pytest
 import gc
 
 
@@ -14,7 +16,7 @@ def skip_on_gpu_arch_error(func):
     def wrapper(*args, **kwargs):
         try:
             return func(*args, **kwargs)
-        except flashinfer.utils.GPUArchitectureError as e:
+        except GPUArchitectureError as e:
             pytest.skip(e.msg)
 
     return wrapper

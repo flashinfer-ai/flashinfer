@@ -1,5 +1,3 @@
-import functools
-import gc
 import os
 import types
 from typing import Any, Dict
@@ -139,4 +137,3 @@ def pytest_runtest_call(item):
             pytest.skip("Skipping due to OOM")
         else:
             raise
-
