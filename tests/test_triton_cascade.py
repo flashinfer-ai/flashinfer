@@ -21,7 +21,7 @@ def test_merge_state(seq_len, num_heads, head_dim):
         assert torch.allclose(v_merged, v_merged_std, atol=1e-2)
         assert torch.allclose(s_merged, s_merged_std, atol=1e-2)
     except GPUArchitectureError as e:
-        pytest.skip(e.msg)
+        pytest.skip(str(e))
 
 
 @pytest.mark.parametrize("seq_len", [2048])
@@ -44,7 +44,7 @@ def test_merge_state_in_place(seq_len, num_heads, head_dim):
         assert torch.allclose(s, s_std, atol=1e-2)
 
     except GPUArchitectureError as e:
-        pytest.skip(e.msg)
+        pytest.skip(str(e))
 
 
 @pytest.mark.parametrize("seq_len", [2048])
@@ -63,7 +63,7 @@ def test_merge_states(seq_len, num_states, num_heads, head_dim):
         assert torch.allclose(v_merged, v_merged_std, atol=1e-2)
         assert torch.allclose(s_merged, s_merged_std, atol=1e-2)
     except GPUArchitectureError as e:
-        pytest.skip(e.msg)
+        pytest.skip(str(e))
 
 
 @pytest.mark.parametrize("seq_len", [2048])
@@ -94,4 +94,4 @@ def test_variable_length_merge_states(seq_len, num_heads, head_dim):
             assert torch.allclose(v_merged[i], v_merged_std, atol=1e-2)
             assert torch.allclose(s_merged[i], s_merged_std, atol=1e-2)
     except GPUArchitectureError as e:
-        pytest.skip(e.msg)
+        pytest.skip(str(e))

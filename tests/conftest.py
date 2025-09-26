@@ -146,6 +146,17 @@ def get_device_properties(device: torch.device):
     return torch.cuda.get_device_properties(device)
 
 
+def skip_on_gpu_arch_error(func):
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except flashinfer.utils.GPUArchitectureError as e:
+            pytest.skip(e.msg)
+
+    return wrapper
+
+
 def clear_cuda_cache(device: torch.device) -> None:
     total_memory = get_device_properties(device).total_memory
     reserved_memory = torch.cuda.memory_reserved()
