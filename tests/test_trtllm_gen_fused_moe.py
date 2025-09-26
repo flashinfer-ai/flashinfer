@@ -1056,7 +1056,7 @@ class BF16Moe(Moe):
                 )
 
                 if weight_layout == WeightLayout.BlockMajorK:
-                    block_k = 128
+                    block_k = 64
                     tmp_weights1 = convert_to_block_layout(tmp_weights1, block_k)
                     tmp_weights2 = convert_to_block_layout(tmp_weights2, block_k)
 
@@ -1074,6 +1074,8 @@ class BF16Moe(Moe):
             return {
                 "gemm1_weights": gemm1_weights_bf16_shuffled,
                 "gemm2_weights": gemm2_weights_bf16_shuffled,
+                "use_shuffled_weight": use_shuffled_weight,
+                "weight_layout": weight_layout,
             }
 
     def call_moe(
@@ -1105,6 +1107,8 @@ class BF16Moe(Moe):
             num_experts,
             # the rest are enforced by the api to be passed in the keyword form
             # as opposed to the positional form
+            use_shuffled_weight=static_data["use_shuffled_weight"],
+            weight_layout=static_data["weight_layout"],
             tile_tokens_dim=tile_tokens_dim,
             routing_method_type=routing_method_type,
         )

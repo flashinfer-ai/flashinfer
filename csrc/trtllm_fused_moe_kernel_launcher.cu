@@ -269,7 +269,7 @@ class FusedMoeLauncher {
     using RunnerType = tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner;
     moe_runner = std::make_unique<RunnerType>(
         this->mDtypeAct, this->mDtypeWeights, args->mUseDeepSeekFp8, (int32_t)tile_tokens_dim,
-        static_cast<GatedActType>(this->gated_act_type), this->use_shuffled_weight);
+        static_cast<GatedActType>(this->gated_act_type), this->use_shuffled_weight, this->weight_layout);
 
     if (moe_tactic == -1) {
       moe_tactic = moe_runner->getDefaultValidConfigIndex(
