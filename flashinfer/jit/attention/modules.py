@@ -152,7 +152,7 @@ def gen_batch_mla_module(
         for filename in [
             "batch_mla_plan.cu",
             "batch_mla_run.cu",
-            "batch_mla_bindings.cu",
+            "batch_mla_binding.cu",
         ]:
             src_path = jit_env.FLASHINFER_CSRC_DIR / filename
             dest_path = gen_directory / filename
@@ -179,7 +179,7 @@ def gen_batch_mla_module(
         for filename in [
             "batch_mla_sm90_plan.cu",
             "batch_mla_sm90_run.cu",
-            "batch_mla_sm90_bindings.cu",
+            "batch_mla_sm90_binding.cu",
         ]:
             src_path = jit_env.FLASHINFER_CSRC_DIR / filename
             dest_path = gen_directory / filename
@@ -292,13 +292,13 @@ def gen_batch_decode_mla_module(
     if arc == "sm80":
         filenames = [
             "batch_decode_mla_cute_sm80.cu",
-            "batch_decode_mla_bindings.cu",
+            "batch_decode_mla_binding.cu",
         ]
     else:
         filenames = [
             "batch_decode_mla_plan.cu",
             "batch_decode_mla_run.cu",
-            "batch_decode_mla_bindings.cu",
+            "batch_decode_mla_binding.cu",
         ]
 
     source_paths = []
@@ -717,7 +717,7 @@ def gen_customize_pod_module(
 
     for filename in [
         "pod.cu",
-        "pod_jit_bindings.cu",
+        "pod_jit_binding.cu",
     ]:
         src_path = jit_env.FLASHINFER_CSRC_DIR / filename
         dest_path = gen_directory / filename
@@ -1054,7 +1054,7 @@ def gen_customize_single_decode_module(
 
     for filename in [
         "single_decode.cu",
-        "single_decode_jit_bindings.cu",
+        "single_decode_jit_binding.cu",
     ]:
         src_path = jit_env.FLASHINFER_CSRC_DIR / filename
         dest_path = gen_directory / filename
@@ -1149,7 +1149,7 @@ def gen_customize_single_prefill_module(
 
         for filename in [
             "single_prefill.cu",
-            "single_prefill_jit_bindings.cu",
+            "single_prefill_jit_binding.cu",
         ]:
             src_path = jit_env.FLASHINFER_CSRC_DIR / filename
             dest_path = gen_directory / filename
@@ -1213,7 +1213,7 @@ def gen_customize_single_prefill_module(
 
         for filename in [
             _file_csrc,
-            "single_prefill_sm90_jit_bindings.cu",
+            "single_prefill_sm90_jit_binding.cu",
         ]:
             src_path = jit_env.FLASHINFER_CSRC_DIR / filename
             dest_path = gen_directory / filename
@@ -1299,7 +1299,7 @@ def gen_customize_batch_decode_module(
 
     for filename in [
         "batch_decode.cu",
-        "batch_decode_jit_bindings.cu",
+        "batch_decode_jit_binding.cu",
     ]:
         src_path = jit_env.FLASHINFER_CSRC_DIR / filename
         dest_path = gen_directory / filename
@@ -1411,7 +1411,7 @@ def gen_customize_batch_prefill_module(
 
         for filename in [
             "batch_prefill.cu",
-            "batch_prefill_jit_bindings.cu",
+            "batch_prefill_jit_binding.cu",
         ]:
             src_path = jit_env.FLASHINFER_CSRC_DIR / filename
             dest_path = gen_directory / filename
@@ -1483,7 +1483,7 @@ def gen_customize_batch_prefill_module(
 
         for filename in [
             _file_csrc,
-            "batch_prefill_sm90_jit_bindings.cu",
+            "batch_prefill_sm90_jit_binding.cu",
         ]:
             src_path = jit_env.FLASHINFER_CSRC_DIR / filename
             dest_path = gen_directory / filename
@@ -1554,7 +1554,7 @@ def gen_fmha_cutlass_sm100a_module(
 
     source_paths = [
         jit_env.FLASHINFER_CSRC_DIR / "fmha_cutlass_sm100.cu",
-        jit_env.FLASHINFER_CSRC_DIR / "fmha_cutlass_sm100_bindings.cu",
+        jit_env.FLASHINFER_CSRC_DIR / "fmha_cutlass_sm100_binding.cu",
         jit_env.FLASHINFER_CSRC_DIR / "blackwell_fmha_plan.cu",
     ]
 
@@ -1668,7 +1668,7 @@ def gen_customize_batch_attention_module(
 
     for filename in [
         "batch_attention.cu",
-        "batch_attention_jit_bindings.cu",
+        "batch_attention_jit_binding.cu",
     ]:
         src_path = jit_env.FLASHINFER_CSRC_DIR / filename
         dest_path = gen_directory / filename

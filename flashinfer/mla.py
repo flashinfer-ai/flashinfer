@@ -66,7 +66,7 @@ def gen_mla_module() -> JitSpec:
         "mla",
         [
             jit_env.FLASHINFER_CSRC_DIR / "cutlass_mla.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "flashinfer_mla_bindings.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "flashinfer_mla_binding.cu",
         ],
         extra_cuda_cflags=nvcc_flags,
     )
