@@ -30,7 +30,7 @@ def gen_norm_module() -> JitSpec:
         "norm",
         [
             jit_env.FLASHINFER_CSRC_DIR / "norm.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "flashinfer_norm_ops.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "flashinfer_norm_bindings.cu",
         ],
     )
 

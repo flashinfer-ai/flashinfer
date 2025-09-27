@@ -30,7 +30,7 @@ def gen_rope_module() -> JitSpec:
         "rope",
         [
             jit_env.FLASHINFER_CSRC_DIR / "rope.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "flashinfer_rope_ops.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "flashinfer_rope_bindings.cu",
         ],
     )
 
