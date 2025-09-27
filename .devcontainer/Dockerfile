@@ -1,15 +1,13 @@
-FROM nvidia/cuda:12.8.0-devel-ubuntu24.04
+ARG VERSION
+FROM flashinfer/flashinfer-ci-${VERSION}:latest
 
-# Update package lists and install system dependencies
 RUN apt-get update && apt-get install -y \
-    curl \
-    wget \
-    git \
     clang-format \
     clangd-19 \
     vim \
     zsh \
     && rm -rf /var/lib/apt/lists/*
+
 
 # Install oh-my-zsh
 RUN sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended
@@ -50,22 +48,17 @@ RUN cp -r /root/.oh-my-zsh /home/$USERNAME/.oh-my-zsh && \
 USER $USERNAME
 WORKDIR /home/$USERNAME
 
-# Install python
-COPY install/install_python.sh /install/install_python.sh
-RUN bash /install/install_python.sh py312
-
 # clangd
 ENV PATH="/usr/lib/llvm-19/bin:$PATH"
 # conda
-ENV PATH="/home/devuser/conda/bin:$PATH"
-ENV PATH="/home/devuser/conda/envs/py312/bin:$PATH"
+ENV PATH="/opt/conda/bin:$PATH"
+ENV PATH="/opt/conda/envs/py312/bin:$PATH"
 
 # Triton
 ENV TRITON_PTXAS_PATH="/usr/local/cuda/bin/ptxas"
 
 # Install python packages
-COPY install/install_python_packages.sh /install/install_python_packages.sh
-RUN bash /install/install_python_packages.sh
+RUN pip3 install pre-commit
 RUN echo "source activate py312" >> /home/devuser/.zshrc
 
 # Set zsh as default shell
