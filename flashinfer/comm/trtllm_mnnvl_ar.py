@@ -13,9 +13,7 @@ import torch
 
 from flashinfer.comm.mapping import Mapping
 
-from ..jit import JitSpec
-from ..jit import env as jit_env
-from ..jit import gen_jit_spec
+from ..jit import gen_trtllm_mnnvl_comm_module
 from ..utils import register_custom_op
 from .mnnvl import McastGPUBuffer
 
@@ -25,15 +23,6 @@ def mpi_barrier():
 
     """MPI barrier - could potentially be replaced with dist.barrier()"""
     MPI.COMM_WORLD.Barrier()
-
-
-def gen_trtllm_mnnvl_comm_module() -> JitSpec:
-    return gen_jit_spec(
-        "trtllm_mnnvl_comm",
-        [
-            jit_env.FLASHINFER_CSRC_DIR / "trtllm_mnnvl_allreduce.cu",
-        ],
-    )
 
 
 @functools.cache

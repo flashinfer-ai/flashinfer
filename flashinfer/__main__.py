@@ -26,9 +26,10 @@ from .artifacts import (
 )
 from .jit import clear_cache_dir, jit_spec_registry
 from .jit.cubin_loader import FLASHINFER_CUBINS_REPOSITORY
-from .jit.env import FLASHINFER_CACHE_DIR, FLASHINFER_CUBIN_DIR
+from .jit.env import FLASHINFER_CACHE_DIR, FLASHINFER_CUBIN_DIR, FLASHINFER_AOT_DIR
 from .jit.core import current_compilation_context
 from .jit.cpp_ext import get_cuda_path, get_cuda_version
+from . import __version__
 
 
 def _download_cubin():
@@ -73,6 +74,7 @@ def cli(ctx, download_cubin_flag):
 env_variables = {
     "FLASHINFER_CACHE_DIR": FLASHINFER_CACHE_DIR,
     "FLASHINFER_CUBIN_DIR": FLASHINFER_CUBIN_DIR,
+    "FLASHINFER_AOT_DIR": FLASHINFER_AOT_DIR,
     "CUDA_HOME": get_cuda_path(),
     "CUDA_VERSION": get_cuda_version(),
     "FLASHINFER_CUDA_ARCH_LIST": current_compilation_context.TARGET_CUDA_ARCHS,
@@ -83,9 +85,14 @@ env_variables = {
 @cli.command("show-config")
 def show_config_cmd():
     """Show configuration"""
-    import torch
+
+    click.secho("=== Version Info ===", fg="yellow")
+    click.secho("FlashInfer version:", fg="magenta", nl=False)
+    click.secho(f" {__version__}", fg="cyan")
 
     # Section: Torch Version Info
+    import torch
+
     click.secho("=== Torch Version Info ===", fg="yellow")
     click.secho("Torch version:", fg="magenta", nl=False)
     click.secho(f" {torch.__version__}", fg="cyan")

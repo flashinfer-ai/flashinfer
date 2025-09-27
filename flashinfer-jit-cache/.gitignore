@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+build/
+dist/
+flashinfer_jit_cache/jit_cache/
+_build_meta.py

@@ -20,6 +20,7 @@ limitations under the License.
 
 import os
 import pathlib
+import importlib.util
 from ..compilation_context import CompilationContext
 
 FLASHINFER_BASE_DIR = pathlib.Path(
@@ -27,6 +28,7 @@ FLASHINFER_BASE_DIR = pathlib.Path(
 )
 
 FLASHINFER_CACHE_DIR = FLASHINFER_BASE_DIR / ".cache" / "flashinfer"
+_package_root = pathlib.Path(__file__).resolve().parents[1]
 
 
 def _get_cubin_dir():
@@ -37,12 +39,10 @@ def _get_cubin_dir():
     3. Default cache directory
     """
     # First check if flashinfer-cubin package is installed
-    try:
+    if importlib.util.find_spec("flashinfer_cubin"):
         import flashinfer_cubin
 
         return pathlib.Path(flashinfer_cubin.get_cubin_dir())
-    except ImportError:
-        pass
 
     # Then check environment variable
     env_dir = os.getenv("FLASHINFER_CUBIN_DIR")
@@ -54,6 +54,25 @@ def _get_cubin_dir():
 
 
 FLASHINFER_CUBIN_DIR = _get_cubin_dir()
+
+
+def _get_aot_dir():
+    """
+    Get the AOT directory path with the following priority:
+    1. flashinfer-jit-cache package if installed
+    2. Default fallback to _package_root / "data" / "aot"
+    """
+    # First check if flashinfer-jit-cache package is installed
+    if importlib.util.find_spec("flashinfer_jit_cache"):
+        import flashinfer_jit_cache
+
+        return pathlib.Path(flashinfer_jit_cache.get_jit_cache_dir())
+
+    # Fall back to default directory
+    return _package_root / "data" / "aot"
+
+
+FLASHINFER_AOT_DIR = _get_aot_dir()
 
 
 def _get_workspace_dir_name() -> pathlib.Path:
@@ -68,13 +87,10 @@ def _get_workspace_dir_name() -> pathlib.Path:
 FLASHINFER_WORKSPACE_DIR = _get_workspace_dir_name()
 FLASHINFER_JIT_DIR = FLASHINFER_WORKSPACE_DIR / "cached_ops"
 FLASHINFER_GEN_SRC_DIR = FLASHINFER_WORKSPACE_DIR / "generated"
-_package_root = pathlib.Path(__file__).resolve().parents[1]
 FLASHINFER_DATA = _package_root / "data"
 FLASHINFER_INCLUDE_DIR = _package_root / "data" / "include"
 FLASHINFER_CSRC_DIR = _package_root / "data" / "csrc"
-# FLASHINFER_SRC_DIR = _package_root / "data" / "src"
 FLASHINFER_TVM_BINDING_DIR = _package_root / "data" / "tvm_binding"
-FLASHINFER_AOT_DIR = _package_root / "data" / "aot"
 CUTLASS_INCLUDE_DIRS = [
     _package_root / "data" / "cutlass" / "include",
     _package_root / "data" / "cutlass" / "tools" / "util" / "include",

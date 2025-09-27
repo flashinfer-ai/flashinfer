@@ -21,22 +21,10 @@ from typing import Optional, Tuple
 
 import torch
 
-from ..jit import JitSpec
-from ..jit import env as jit_env
-from ..jit import gen_jit_spec
+from ..jit import gen_comm_alltoall_module
 from ..utils import register_custom_op
 from .mapping import Mapping
 from .mnnvl import MnnvlMemory, MnnvlConfig
-
-
-def gen_comm_alltoall_module() -> JitSpec:
-    return gen_jit_spec(
-        "comm",
-        [
-            jit_env.FLASHINFER_CSRC_DIR / "trtllm_alltoall.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "trtllm_alltoall_prepare.cu",
-        ],
-    )
 
 
 @functools.cache
