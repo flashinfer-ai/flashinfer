@@ -35,7 +35,7 @@ FLASHINFER_CUBINS_REPOSITORY = os.environ.get(
 
 
 def download_file(
-    source, local_path, retries=3, delay=5, timeout=10, lock_timeout=30, session=None
+    source: str, local_path: str, retries: int = 3, delay: int = 5, timeout: int = 10, lock_timeout: int = 30, session=None
 ):
     """
     Downloads a file from a URL or copies from a local path to a destination.
@@ -107,7 +107,7 @@ def download_file(
         return False
 
 
-def load_cubin(cubin_path, sha256) -> bytes:
+def load_cubin(cubin_path: str, sha256: str) -> bytes:
     """
     Load a cubin from the provide local path and
     ensure that the sha256 signature matches.
@@ -133,9 +133,9 @@ def load_cubin(cubin_path, sha256) -> bytes:
     return b""
 
 
-def get_cubin(name, sha256, file_extension=".cubin", session=None):
+def get_cubin(file_name: str, sha256: str, session=None) -> bytes:
     """
-    Load a cubin from the local cache directory with {name} and
+    Load a cubin from the local cache directory with {file_name} and
     ensure that the sha256 signature matches.
 
     If the kernel does not exist in the cache, it will downloaded.
@@ -143,16 +143,14 @@ def get_cubin(name, sha256, file_extension=".cubin", session=None):
     Returns:
     None on failure.
     """
-    cubin_fname = name + file_extension
-    cubin_path = FLASHINFER_CUBIN_DIR / cubin_fname
+    cubin_path = str(FLASHINFER_CUBIN_DIR / file_name)
     cubin = load_cubin(cubin_path, sha256)
     if cubin:
         return cubin
     # either the file does not exist or it is corrupted, we'll download a new one.
 
-    base = FLASHINFER_CUBINS_REPOSITORY.rstrip("/")
-    uri = urljoin(base + "/", cubin_fname)
-    logger.info(f"Fetching cubin {name} from {uri}")
+    uri = urljoin(FLASHINFER_CUBINS_REPOSITORY, file_name)
+    logger.info(f"Fetching cubin {file_name} from {uri}")
     download_file(uri, cubin_path, session=session)
     return load_cubin(cubin_path, sha256)
 
@@ -165,7 +163,7 @@ def convert_to_ctypes_char_p(data: bytes):
 dll_cubin_handlers = {}
 
 
-def setup_cubin_loader(dll_path: str):
+def setup_cubin_loader(dll_path: str) -> None:
     if dll_path in dll_cubin_handlers:
         return
 
