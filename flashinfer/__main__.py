@@ -74,14 +74,13 @@ env_variables = {
     "FLASHINFER_CACHE_DIR": FLASHINFER_CACHE_DIR,
     "FLASHINFER_CUBIN_DIR": FLASHINFER_CUBIN_DIR,
     "FLASHINFER_CUDA_ARCH_LIST": current_compilation_context.TARGET_CUDA_ARCHS,
+    "FLASHINFER_CUDA_VERSION": get_cuda_version(),
     "FLASHINFER_CUBINS_REPOSITORY": FLASHINFER_CUBINS_REPOSITORY,
 }
 try:
     env_variables["CUDA_HOME"] = get_cuda_path()
-    env_variables["CUDA_VERSION"] = get_cuda_version()
 except Exception:
     env_variables["CUDA_HOME"] = "Not Found"
-    env_variables["CUDA_VERSION"] = "Not Found"
 
 
 @cli.command("show-config")
