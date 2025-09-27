@@ -100,9 +100,9 @@ def get_cubin_file_list() -> Generator[str, None, None]:
     base = FLASHINFER_CUBINS_REPOSITORY
 
     # The meta info header files first.
-    yield safe_urljoin(safe_urljoin(base, ArtifactPath.TRTLLM_GEN_FMHA), "include/flashInferMetaInfo.h")
-    yield safe_urljoin(safe_urljoin(base, ArtifactPath.TRTLLM_GEN_GEMM), "include/flashinferMetaInfo.h")
-    yield safe_urljoin(safe_urljoin(base, ArtifactPath.TRTLLM_GEN_BMM), "include/flashinferMetaInfo.h")
+    yield safe_urljoin(ArtifactPath.TRTLLM_GEN_FMHA, "include/flashInferMetaInfo.h")
+    yield safe_urljoin(ArtifactPath.TRTLLM_GEN_GEMM, "include/flashinferMetaInfo.h")
+    yield safe_urljoin(ArtifactPath.TRTLLM_GEN_BMM, "include/flashinferMetaInfo.h")
 
     # All the actual kernel cubin's.
     for kernel in [
@@ -114,7 +114,7 @@ def get_cubin_file_list() -> Generator[str, None, None]:
         for name in get_available_cubin_files(
                 safe_urljoin(base, kernel)
             ):
-            yield safe_urljoin(base, name)
+            yield safe_urljoin(kernel, name)
 
 
 def download_artifacts() -> None:
