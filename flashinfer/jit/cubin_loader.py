@@ -33,6 +33,11 @@ FLASHINFER_CUBINS_REPOSITORY = os.environ.get(
     "https://edge.urm.nvidia.com/artifactory/sw-kernelinferencelibrary-public-generic-local/",
 )
 
+def safe_urljoin(base, path):
+    """Join URLs ensuring base is treated as a directory."""
+    if not base.endswith('/'):
+        base += '/'
+    return urljoin(base, path)
 
 def download_file(
     source: str, local_path: str, retries: int = 3, delay: int = 5, timeout: int = 10, lock_timeout: int = 30, session=None
@@ -149,7 +154,7 @@ def get_cubin(file_name: str, sha256: str, session=None) -> bytes:
         return cubin
     # either the file does not exist or it is corrupted, we'll download a new one.
 
-    uri = urljoin(FLASHINFER_CUBINS_REPOSITORY, file_name)
+    uri = safe_urljoin(FLASHINFER_CUBINS_REPOSITORY, file_name)
     logger.info(f"Fetching cubin {file_name} from {uri}")
     download_file(uri, cubin_path, session=session)
     return load_cubin(cubin_path, sha256)

@@ -20,7 +20,6 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Generator
-from urllib.parse import urljoin
 import requests  # type: ignore[import-untyped]
 import shutil
 
@@ -28,6 +27,7 @@ from .jit.core import logger
 from .jit.cubin_loader import (
     FLASHINFER_CUBINS_REPOSITORY,
     get_cubin,
+    safe_urljoin,
     FLASHINFER_CUBIN_DIR,
 )
 
@@ -100,9 +100,9 @@ def get_cubin_file_list() -> Generator[str, None, None]:
     base = FLASHINFER_CUBINS_REPOSITORY
 
     # The meta info header files first.
-    yield urljoin(urljoin(base, ArtifactPath.TRTLLM_GEN_FMHA), "include/flashInferMetaInfo.h")
-    yield urljoin(urljoin(base, ArtifactPath.TRTLLM_GEN_GEMM), "include/flashinferMetaInfo.h")
-    yield urljoin(urljoin(base, ArtifactPath.TRTLLM_GEN_BMM), "include/flashinferMetaInfo.h")
+    yield safe_urljoin(safe_urljoin(base, ArtifactPath.TRTLLM_GEN_FMHA), "include/flashInferMetaInfo.h")
+    yield safe_urljoin(safe_urljoin(base, ArtifactPath.TRTLLM_GEN_GEMM), "include/flashinferMetaInfo.h")
+    yield safe_urljoin(safe_urljoin(base, ArtifactPath.TRTLLM_GEN_BMM), "include/flashinferMetaInfo.h")
 
     # All the actual kernel cubin's.
     for kernel in [
@@ -112,9 +112,9 @@ def get_cubin_file_list() -> Generator[str, None, None]:
         ArtifactPath.DEEPGEMM,
     ]:
         for name in get_available_cubin_files(
-                urljoin(base, kernel)
+                safe_urljoin(base, kernel)
             ):
-            yield urljoin(base, name)
+            yield safe_urljoin(base, name)
 
 
 def download_artifacts() -> None:
