@@ -5,7 +5,7 @@ set -x
 : ${JUNIT_DIR:=$(realpath ./junit)}
 
 pip install -e . -v
-pip install --upgrade nvidia-cudnn-cu12
+pip install --upgrade "nvidia-cudnn-cu12>=9.11.0.98"
 
 EXIT_CODE=0
 scripts_to_run=(
