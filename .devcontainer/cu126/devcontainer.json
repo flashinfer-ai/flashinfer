@@ -1,8 +1,8 @@
 {
     "name": "CUDA Development Container",
     "build": {
-        "dockerfile": "Dockerfile",
-        "context": "."
+        "dockerfile": "../../docker/Dockerfile.cu126.dev",
+        "context": "../../docker/"
     },
     "runArgs": [
         "--gpus=all"
@@ -12,8 +12,10 @@
             "extensions": [
                 "llvm-vs-code-extensions.vscode-clangd",
                 "ms-python.python",
-                "ms-python.black-formatter",
-                "nvidia.nsight-vscode-edition"
+                "nvidia.nsight-vscode-edition",
+                "xaver.clang-format",
+                "charliermarsh.ruff",
+                "matangover.mypy"
             ]
         }
     },
