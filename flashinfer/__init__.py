@@ -66,6 +66,7 @@ from .fp4_quantization import (
     mxfp4_quantize,
     nvfp4_quantize,
     nvfp4_batched_quantize,
+    silu_and_mul_fp4_batched_quantize,
     shuffle_matrix_a,
     shuffle_matrix_sf_a,
 )
