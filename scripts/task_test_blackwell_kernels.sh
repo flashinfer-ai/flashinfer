@@ -1,7 +1,6 @@
 #!/bin/bash
 
 set -eo pipefail
-set -x
 
 : ${JUNIT_DIR:=$(realpath ./junit)}
 : ${MAX_JOBS:=$(nproc)}
@@ -33,27 +32,44 @@ if [ -f "./pytest.ini" ]; then
     fi
 fi
 
-echo "Finding all test files in tests/ directory..."
+echo "Finding test subdirectories in tests/ directory..."
 
-# Build find command with exclusions
-FIND_CMD="find tests/ -name \"test_*.py\" -type f"
-for excluded_dir in $EXCLUDED_DIRS; do
-    excluded_dir=$(echo "$excluded_dir" | xargs)  # trim whitespace
-    if [ -n "$excluded_dir" ]; then
-        FIND_CMD="$FIND_CMD -not -path \"tests/$excluded_dir/*\" -not -path \"tests/*/$excluded_dir/*\""
+# Find all subdirectories that contain test_*.py files
+ALL_TEST_DIRS=$(find tests/ -name "test_*.py" -type f -exec dirname {} \; | sort -u)
+
+# Filter out excluded directories
+TEST_DIRS=""
+for test_dir in $ALL_TEST_DIRS; do
+    exclude_dir=false
+    for excluded_dir in $EXCLUDED_DIRS; do
+        excluded_dir=$(echo "$excluded_dir" | xargs)  # trim whitespace
+        if [ -n "$excluded_dir" ]; then
+            # Check if this directory should be excluded
+            if [[ "$test_dir" == *"/$excluded_dir" ]] || [[ "$test_dir" == "tests/$excluded_dir" ]] || [[ "$test_dir" == *"/$excluded_dir/"* ]]; then
+                exclude_dir=true
+                break
+            fi
+        fi
+    done
+
+    if [ "$exclude_dir" = false ]; then
+        TEST_DIRS="$TEST_DIRS $test_dir"
     fi
 done
 
-# Execute the find command
-TEST_FILES=$(eval $FIND_CMD | sort)
+# Clean up whitespace
+TEST_DIRS=$(echo "$TEST_DIRS" | xargs)
 
-if [ -z "$TEST_FILES" ]; then
-    echo "No test files found in tests/ directory (after exclusions)"
+if [ -z "$TEST_DIRS" ]; then
+    echo "No test directories found in tests/ directory (after exclusions)"
     exit 1
 fi
 
-echo "Found test files:"
-echo "$TEST_FILES"
+echo "Found test directories:"
+for test_dir in $TEST_DIRS; do
+    test_count=$(find "$test_dir" -maxdepth 1 -name "test_*.py" -type f | wc -l)
+    echo "  $test_dir ($test_count test files)"
+done
 echo ""
 
 FAILED_TESTS=""
@@ -62,37 +78,38 @@ PASSED_TESTS=0
 
 if [ "$DRY_RUN" == "true" ]; then
     echo "=========================================="
-    echo "DRY RUN: Tests that would be executed"
+    echo "DRY RUN: Test directories that would be executed"
     echo "=========================================="
 
-    for test_file in $TEST_FILES; do
+    for test_dir in $TEST_DIRS; do
         TOTAL_TESTS=$((TOTAL_TESTS + 1))
-        echo "$TOTAL_TESTS. pytest $test_file"
+        test_count=$(find "$test_dir" -maxdepth 1 -name "test_*.py" -type f | wc -l)
+        echo "$TOTAL_TESTS. pytest $test_dir  (contains $test_count test files)"
     done
 
     echo ""
     echo "=========================================="
     echo "DRY RUN SUMMARY"
     echo "=========================================="
-    echo "Total test files that would be executed: $TOTAL_TESTS"
+    echo "Total test directories that would be executed: $TOTAL_TESTS"
     echo ""
     echo "To actually run the tests, execute without --dry-run:"
     echo "  $0"
     echo "Or set DRY_RUN=false $0"
 else
-    for test_file in $TEST_FILES; do
+    for test_dir in $TEST_DIRS; do
         echo "=========================================="
-        echo "Running: $test_file"
+        echo "Running: pytest $test_dir"
         echo "=========================================="
 
         TOTAL_TESTS=$((TOTAL_TESTS + 1))
 
-        if pytest "$test_file"; then
-            echo "✅ PASSED: $test_file"
+        if pytest "$test_dir"; then
+            echo "✅ PASSED: $test_dir"
             PASSED_TESTS=$((PASSED_TESTS + 1))
         else
-            echo "❌ FAILED: $test_file"
-            FAILED_TESTS="$FAILED_TESTS\n  - $test_file"
+            echo "❌ FAILED: $test_dir"
+            FAILED_TESTS="$FAILED_TESTS\n  - $test_dir"
             EXIT_CODE=1
         fi
 
@@ -102,13 +119,13 @@ else
     echo "=========================================="
     echo "TEST SUMMARY"
     echo "=========================================="
-    echo "Total tests: $TOTAL_TESTS"
+    echo "Total test directories: $TOTAL_TESTS"
     echo "Passed: $PASSED_TESTS"
     echo "Failed: $((TOTAL_TESTS - PASSED_TESTS))"
 
     if [ -n "$FAILED_TESTS" ]; then
         echo ""
-        echo "Failed test files:"
+        echo "Failed test directories:"
         echo -e "$FAILED_TESTS"
     fi
 fi
