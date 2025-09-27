@@ -40,12 +40,13 @@ def get_cuda_path() -> str:
         return cuda_home
     # get output of "which nvcc"
     nvcc_path = subprocess.run(["which", "nvcc"], capture_output=True)
-    if nvcc_path.returncode != 0:
-        raise RuntimeError("Could not find nvcc")
-    cuda_home = os.path.dirname(
-        os.path.dirname(nvcc_path.stdout.decode("utf-8").strip())
-    )
-    return cuda_home
+    if nvcc_path.returncode == 0:
+        cuda_home = os.path.dirname(
+            os.path.dirname(nvcc_path.stdout.decode("utf-8").strip())
+        )
+        return cuda_home
+    # Return a placeholder if nvcc is not found
+    return "CUDA_HOME_NOT_FOUND"
 
 
 @functools.cache
