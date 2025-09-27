@@ -13,16 +13,12 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "pytorch_extension_utils.h"
+#include "tvm_ffi_utils.h"
 
-void packbits(at::Tensor x, const std::string& bitorder, at::Tensor y);
+void packbits(Tensor x, const std::string& bitorder, Tensor y);
 
-void segment_packbits(at::Tensor x, at::Tensor input_indptr, at::Tensor output_indptr,
-                      const std::string& bitorder, at::Tensor y);
+void segment_packbits(Tensor x, Tensor input_indptr, Tensor output_indptr,
+                      const std::string& bitorder, Tensor y);
 
-TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
-  // GPU packbits operator
-  m.def("packbits", packbits);
-  // GPU segment packbits operator
-  m.def("segment_packbits", segment_packbits);
-}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(packbits, packbits);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(segment_packbits, segment_packbits);

@@ -14,22 +14,18 @@
  * limitations under the License.
  */
 
-#include "pytorch_extension_utils.h"
+#include "tvm_ffi_utils.h"
 
 void xqa_wrapper(int64_t multiProcessorCount, int64_t nbKHeads, int64_t slidingWinSize,
-                 double qScale, at::Tensor output,
+                 double qScale, Tensor output,
 #if LOW_PREC_OUTPUT
-                 at::Tensor rcpOutScale,
+                 Tensor rcpOutScale,
 #endif
-                 at::Tensor q, at::Tensor attentionSinks, at::Tensor pool,
-                 at::Tensor kvCachePageList, int64_t maxSeqLen, at::Tensor seqLen,
-                 int64_t batchSize, at::Tensor kvCacheScale,
+                 Tensor q, Tensor attentionSinks, Tensor pool, Tensor kvCachePageList,
+                 int64_t maxSeqLen, Tensor seqLen, int64_t batchSize, Tensor kvCacheScale,
 #if SPEC_DEC
-                 int64_t qSeqLen, at::Tensor qCuSeqLens, at::Tensor mask,
+                 int64_t qSeqLen, Tensor qCuSeqLens, Tensor mask,
 #endif
-                 at::Tensor semaphores, at::Tensor scratch);
+                 Tensor semaphores, Tensor scratch);
 
-TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
-  // "XQA Wrapper"
-  m.def("xqa_wrapper", xqa_wrapper);
-}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(xqa_wrapper, xqa_wrapper);

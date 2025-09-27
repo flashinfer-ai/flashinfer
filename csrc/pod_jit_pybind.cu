@@ -14,27 +14,26 @@
  * limitations under the License.
  */
 #include "pod_config.inc"
-#include "pytorch_extension_utils.h"
+#include "tvm_ffi_utils.h"
+
+using tvm::ffi::Array;
+using tvm::ffi::Optional;
 
 void pod_with_kv_cache_tensor(
     // Prefill params
-    at::Tensor q_p, at::Tensor k_p, at::Tensor v_p, at::Tensor tmp_p, at::Tensor o_p,
-    std::optional<at::Tensor> maybe_lse_p, int64_t mask_mode_code_p, int64_t layout_p,
-    int64_t window_left_p, std::optional<at::Tensor> maybe_custom_mask_p,
-    std::optional<at::Tensor> maybe_alibi_slopes_p, double logits_soft_cap_p, double sm_scale_p,
-    double rope_rcp_scale_p, double rope_rcp_theta_p,
+    Tensor q_p, Tensor k_p, Tensor v_p, Tensor tmp_p, Tensor o_p, Optional<Tensor> maybe_lse_p,
+    int64_t mask_mode_code_p, int64_t layout_p, int64_t window_left_p,
+    Optional<Tensor> maybe_custom_mask_p, Optional<Tensor> maybe_alibi_slopes_p,
+    double logits_soft_cap_p, double sm_scale_p, double rope_rcp_scale_p, double rope_rcp_theta_p,
     // Decode params
-    at::Tensor float_workspace_buffer_d, at::Tensor int_workspace_buffer_d,
-    at::Tensor plan_info_vec, at::Tensor q_d, at::Tensor paged_k_cache_d,
-    at::Tensor paged_v_cache_d, at::Tensor qo_indptr_d, at::Tensor paged_kv_indptr_d,
-    at::Tensor paged_kv_indices_d, at::Tensor paged_kv_last_page_len_d, at::Tensor o_d,
-    std::optional<at::Tensor> maybe_lse_d, int64_t mask_mode_code_d, int64_t layout_d,
-    int64_t window_left_d, std::optional<at::Tensor> maybe_custom_mask_d,
-    std::optional<at::Tensor> maybe_mask_indptr_d, std::optional<at::Tensor> maybe_alibi_slopes_d,
+    Tensor float_workspace_buffer_d, Tensor int_workspace_buffer_d, Array<int64_t> plan_info_vec,
+    Tensor q_d, Tensor paged_k_cache_d, Tensor paged_v_cache_d, Tensor qo_indptr_d,
+    Tensor paged_kv_indptr_d, Tensor paged_kv_indices_d, Tensor paged_kv_last_page_len_d,
+    Tensor o_d, Optional<Tensor> maybe_lse_d, int64_t mask_mode_code_d, int64_t layout_d,
+    int64_t window_left_d, Optional<Tensor> maybe_custom_mask_d,
+    Optional<Tensor> maybe_mask_indptr_d, Optional<Tensor> maybe_alibi_slopes_d,
     double logits_soft_cap_d, double sm_scale_d, double rope_rcp_scale_d, double rope_rcp_theta_d,
     bool enable_pdl);
 
-TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
-  // Batch-request prefill attention with KV-Cache operator
-  m.def("pod_with_kv_cache_tensor", pod_with_kv_cache_tensor);
-}
+// Batch-request prefill attention with KV-Cache operator
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(pod_with_kv_cache_tensor, pod_with_kv_cache_tensor);

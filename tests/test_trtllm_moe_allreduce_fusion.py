@@ -8,6 +8,7 @@ import torch
 import torch.distributed as dist
 
 import flashinfer.comm as comm
+from tvm_ffi import use_torch_stream
 
 # todo(Yingyi): add benchmark and quant test
 
@@ -207,7 +208,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
                             # warmup
                             s = torch.cuda.Stream()
                             s.wait_stream(torch.cuda.current_stream())
-                            with torch.cuda.stream(s):
+                            with use_torch_stream(torch.cuda.stream(s)):
                                 for _ in range(3):  # Multiple warmup iterations
                                     comm.trtllm_moe_allreduce_fusion(
                                         world_size=world_size,
@@ -236,7 +237,7 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
 
                             # capture
                             g = torch.cuda.CUDAGraph()
-                            with torch.cuda.graph(g):
+                            with use_torch_stream(torch.cuda.graph(g)):
                                 for _ in range(3):  # Multiple iterations in graph
                                     comm.trtllm_moe_allreduce_fusion(
                                         world_size=world_size,

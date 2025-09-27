@@ -13,21 +13,21 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "pytorch_extension_utils.h"
 
-void merge_state(at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b,
-                 at::Tensor v_merged, at::Tensor s_merged);
+#include "tvm_ffi_utils.h"
 
-void merge_state_in_place(at::Tensor v, at::Tensor s, at::Tensor v_other, at::Tensor s_other,
-                          std::optional<at::Tensor> mask);
+using tvm::ffi::Optional;
 
-void merge_states(at::Tensor v, at::Tensor s, at::Tensor v_merged, at::Tensor s_merged);
+void merge_state(Tensor v_a, Tensor s_a, Tensor v_b, Tensor s_b, Tensor v_merged, Tensor s_merged);
 
-TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
-  // Merge two self-attention states
-  m.def("merge_state", merge_state);
-  // Merge another self-attention state in-place.
-  m.def("merge_state_in_place", merge_state_in_place);
-  // "Merge multiple self-attention states"
-  m.def("merge_states", merge_states);
-}
+void merge_state_in_place(Tensor v, Tensor s, Tensor v_other, Tensor s_other,
+                          Optional<Tensor> mask);
+
+void merge_states(Tensor v, Tensor s, Tensor v_merged, Tensor s_merged);
+
+// Merge two self-attention states
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(merge_state, merge_state);
+// Merge another self-attention state in-place.
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(merge_state_in_place, merge_state_in_place);
+// "Merge multiple self-attention states"
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(merge_states, merge_states);

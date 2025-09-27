@@ -17,7 +17,6 @@
 #include <flashinfer/attention/scheduler.cuh>
 #include <flashinfer/pos_enc.cuh>
 #include <flashinfer/utils.cuh>
-#include <optional>
 
 #include "batch_decode_config.inc"
 #include "tvm_binding_utils.h"

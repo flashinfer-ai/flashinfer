@@ -70,7 +70,7 @@ from .utils import (
 def get_single_decode_module(*args):
     uri = get_single_decode_uri(*args)
     module = gen_single_decode_module(*args).build_and_load()
-    run_func = module.run.default
+    run_func = module.run
 
     # torch library for single_decode_with_kv_cache
 
@@ -130,8 +130,8 @@ def get_single_decode_module(*args):
 
 @functools.cache
 def get_batch_decode_jit_module(module_name: str, jit_module: Any):
-    plan_func = jit_module.plan.default
-    run_func = jit_module.run.default
+    plan_func = jit_module.plan
+    run_func = jit_module.run
 
     @register_custom_op(
         f"flashinfer::{module_name}_run",
@@ -209,8 +209,8 @@ def get_batch_decode_jit_module(module_name: str, jit_module: Any):
 def get_batch_decode_module(*args):
     uri = get_batch_decode_uri(*args)
     mod = gen_batch_decode_module(*args).build_and_load()
-    plan_func = mod.plan.default
-    run_func = mod.run.default
+    plan_func = mod.plan
+    run_func = mod.run
 
     # torch library for batch_decode_with_paged_kv_cache_run
 
@@ -327,7 +327,7 @@ def single_decode_with_kv_cache_with_jit_module(
         lse = torch.empty((q.size(0)), dtype=torch.float32, device=device)
     else:
         lse = None
-    jit_module.run.default(
+    jit_module.run(
         q,
         k,
         v,
@@ -1885,6 +1885,13 @@ class TrtllmGenDecodeModule:
         if self._sm_count is None:
             self._sm_count = get_device_sm_count(query.device)
 
+        bmm1_scale = (
+            bmm1_scale.item() if isinstance(bmm1_scale, torch.Tensor) else bmm1_scale
+        )
+        bmm2_scale = (
+            bmm2_scale.item() if isinstance(bmm2_scale, torch.Tensor) else bmm2_scale
+        )
+
         self._op.trtllm_paged_attention_decode(
             out,
             None,  # fp4 output not supported in wrapper api yet.
@@ -2207,6 +2214,13 @@ def trtllm_batch_decode_with_kv_cache(
         check_shape_dtype_device(out, query.shape, out_dtype, query.device, "out")
     else:
         raise ValueError(f"Invalid out_dtype: {out_dtype}")
+
+    bmm1_scale = (
+        bmm1_scale.item() if isinstance(bmm1_scale, torch.Tensor) else bmm1_scale
+    )
+    bmm2_scale = (
+        bmm2_scale.item() if isinstance(bmm2_scale, torch.Tensor) else bmm2_scale
+    )
 
     run_func(
         out,

@@ -10,12 +10,8 @@ from packaging.version import Version
 from pathlib import Path
 from typing import List, Optional
 
+import tvm_ffi
 import torch
-from torch.utils.cpp_extension import (
-    _TORCH_PATH,
-    CUDA_HOME,
-    _get_num_workers,
-)
 
 from . import env as jit_env
 from ..compilation_context import CompilationContext
@@ -39,24 +35,25 @@ def torch_get_pybind11_abi_build_flags() -> List[str]:
 
 @functools.cache
 def get_cuda_path() -> str:
-    if CUDA_HOME is None:
-        # get output of "which nvcc"
-        result = subprocess.run(["which", "nvcc"], capture_output=True)
-        if result.returncode != 0:
-            raise RuntimeError("Could not find nvcc")
-        return result.stdout.decode("utf-8").strip()
-    else:
-        return CUDA_HOME
+    cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
+    if cuda_home is not None:
+        return cuda_home
+    # get output of "which nvcc"
+    nvcc_path = subprocess.run(["which", "nvcc"], capture_output=True)
+    if nvcc_path.returncode != 0:
+        raise RuntimeError("Could not find nvcc")
+    cuda_home = os.path.dirname(
+        os.path.dirname(nvcc_path.stdout.decode("utf-8").strip())
+    )
+    return cuda_home
 
 
 @functools.cache
 def get_cuda_version() -> Version:
-    if CUDA_HOME is None:
-        nvcc = "nvcc"
-    else:
-        nvcc = os.path.join(CUDA_HOME, "bin/nvcc")
     # Try to query nvcc for CUDA version; if nvcc is unavailable, fall back to torch.version.cuda
     try:
+        cuda_home = get_cuda_path()
+        nvcc = os.path.join(cuda_home, "bin/nvcc")
         txt = subprocess.check_output([nvcc, "--version"], text=True)
         matches = re.findall(r"release (\d+\.\d+),", txt)
         if not matches:
@@ -64,7 +61,7 @@ def get_cuda_version() -> Version:
                 f"Could not parse CUDA version from nvcc --version output: {txt}"
             )
         return Version(matches[0])
-    except (FileNotFoundError, subprocess.CalledProcessError) as e:
+    except (RuntimeError, FileNotFoundError, subprocess.CalledProcessError) as e:
         # NOTE(Zihao): when nvcc is unavailable, fall back to torch.version.cuda
         if torch.version.cuda is None:
             raise RuntimeError(
@@ -104,6 +101,8 @@ def generate_ninja_build_for_op(
         "$torch_home/include/torch/csrc/api/include",
         "$cuda_home/include",
         "$cuda_home/include/cccl",
+        tvm_ffi.libinfo.find_include_path(),
+        tvm_ffi.libinfo.find_dlpack_include_path(),
         jit_env.FLASHINFER_INCLUDE_DIR.resolve(),
         jit_env.FLASHINFER_CSRC_DIR.resolve(),
     ]
@@ -197,14 +196,14 @@ def generate_ninja_build_for_op(
         ldflags += extra_ldflags
 
     cxx = os.environ.get("CXX", "c++")
-    cuda_home = CUDA_HOME or "/usr/local/cuda"
+    cuda_home = get_cuda_path()
     nvcc = os.environ.get("PYTORCH_NVCC", "$cuda_home/bin/nvcc")
 
     lines = [
         "ninja_required_version = 1.3",
         f"name = {name}",
         f"cuda_home = {cuda_home}",
-        f"torch_home = {_TORCH_PATH}",
+        f"torch_home = {torch.__path__[0]}",
         f"cxx = {cxx}",
         f"nvcc = {nvcc}",
         "",
@@ -264,6 +263,13 @@ def generate_ninja_build_for_op(
     return "\n".join(lines)
 
 
+def _get_num_workers() -> Optional[int]:
+    max_jobs = os.environ.get("MAX_JOBS")
+    if max_jobs is not None and max_jobs.isdigit():
+        return int(max_jobs)
+    return None
+
+
 def run_ninja(workdir: Path, ninja_file: Path, verbose: bool) -> None:
     workdir.mkdir(parents=True, exist_ok=True)
     command = [
@@ -274,7 +280,7 @@ def run_ninja(workdir: Path, ninja_file: Path, verbose: bool) -> None:
         "-f",
         str(ninja_file.resolve()),
     ]
-    num_workers = _get_num_workers(verbose)
+    num_workers = _get_num_workers()
     if num_workers is not None:
         command += ["-j", str(num_workers)]
 

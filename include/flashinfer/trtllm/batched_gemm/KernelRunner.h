@@ -19,7 +19,6 @@
 #include <cuda.h>
 
 #include <cstdint>
-#include <optional>
 #include <vector>
 
 #include "trtllmGen_bmm_export/Enums.h"

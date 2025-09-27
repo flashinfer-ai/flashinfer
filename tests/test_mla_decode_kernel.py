@@ -6,8 +6,9 @@ import torch.nn.functional as F
 from torch import nn
 
 import flashinfer
-from rope_reference import apply_rotary_emb, precompute_freqs_cis
 from conftest import skip_on_gpu_arch_error
+from rope_reference import apply_rotary_emb, precompute_freqs_cis
+from tvm_ffi import use_torch_stream
 
 
 def wmape(target: torch.Tensor, preds: torch.Tensor):
@@ -371,7 +372,7 @@ class DeepseekV2AttentionMatAbsorbDecode(nn.Module):
 
             s = torch.cuda.Stream()
             s.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(s):
+            with use_torch_stream(torch.cuda.stream(s)):
                 for _ in range(3):
                     o, lse = wrapper.run(
                         q_nope, q_pe, paged_ckv_cache, paged_kpe_cache, return_lse=True
@@ -379,7 +380,7 @@ class DeepseekV2AttentionMatAbsorbDecode(nn.Module):
             torch.cuda.current_stream().wait_stream(s)
 
             g = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(g):
+            with use_torch_stream(torch.cuda.graph(g)):
                 attn_output = wrapper.run(
                     q_nope, q_pe, paged_ckv_cache, paged_kpe_cache
                 )

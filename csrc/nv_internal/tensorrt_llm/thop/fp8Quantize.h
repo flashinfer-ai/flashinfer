@@ -15,14 +15,16 @@
  */
 
 #pragma once
-#include <ATen/ATen.h>
-#include <ATen/Tensor.h>
+
+#include <tvm/ffi/container/tuple.h>
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/quantization.h"
-#include "tensorrt_llm/thop/thUtils.h"
+#include "tensorrt_llm/thop/utils.h"
 
-namespace torch_ext {
+using tvm::ffi::Tensor;
+using tvm::ffi::Tuple;
+
 // colIdx and totalCloumn should be in SFMatrix, not activation Matrix, so no sfVecSize needed.
 inline int computeSFIndex(int rowIdx, int colIdx, int totalRow, int totalColumn,
                           tensorrt_llm::QuantizationSFLayout layout, bool useUE8M0 = false) {
@@ -64,16 +66,15 @@ inline int computeSFIndex(int rowIdx, int colIdx, int totalRow, int totalColumn,
 // linear layout. See QuantizationSFLayout enum for more details about the two layouts.
 // alignment: sfVecSize
 // returns fp8_quantized and block_scale_factors.
-std::tuple<at::Tensor, at::Tensor> mxfp8_quantize(at::Tensor input, bool is_sf_swizzled_layout,
-                                                  int64_t alignment, bool enable_pdl);
+void mxfp8_quantize(Tensor input, Tensor valMxFP8, Tensor scaleFP8SF, bool is_sf_swizzled_layout,
+                    int64_t alignment, bool enable_pdl);
 
 // x_fp32: [M, K], fp32_quantized (on the host)
 // isSfSwizzledLayout: bool, if true, the scale factors are stored in swizzled layout, otherwise in
 // linear layout. See QuantizationSFLayout enum for more details about the two layouts.
 // returns fp8_quantized and block_scale_factors (on the host).
-std::tuple<at::Tensor, at::Tensor> mxfp8_quantize_host(at::Tensor x_fp32,
-                                                       bool is_sf_swizzled_layout = true);
-at::Tensor mxfp8_dequantize_host(at::Tensor value_e4m3, at::Tensor scale_ue8m08sf,
-                                 bool is_sf_swizzled_layout = true);
+void mxfp8_quantize_host(Tensor x_fp32, Tensor fp8_tensor, Tensor scale_tensor,
+                         bool is_sf_swizzled_layout = true);
 
-}  // namespace torch_ext
+void mxfp8_dequantize_host(Tensor value_e4m3, Tensor scale_ue8m08sf, Tensor float_tensor,
+                           bool is_sf_swizzled_layout = true);

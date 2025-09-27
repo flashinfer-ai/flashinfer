@@ -20,6 +20,7 @@ from functools import partial
 from jit_utils import gen_decode_attention_modules, gen_prefill_attention_modules
 
 import flashinfer
+from tvm_ffi import use_torch_stream
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -269,14 +270,14 @@ def test_batch_decode_tensor_cores_cuda_graph(
     # warmup
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(s):
+    with use_torch_stream(torch.cuda.stream(s)):
         for _ in range(3):
             o, lse = wrapper.run(q, kv_data, return_lse=True)
     torch.cuda.current_stream().wait_stream(s)
 
     # capture
     g = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(g):
+    with use_torch_stream(torch.cuda.graph(g)):
         o, lse = wrapper.run(q, kv_data, return_lse=True)
 
     # replay
@@ -307,7 +308,7 @@ def test_batch_decode_tensor_cores_cuda_graph(
     # warmup
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(s):
+    with use_torch_stream(torch.cuda.stream(s)):
         for _ in range(3):
             o_tensor_cores, lse_tensor_cores = wrapper_tensor_cores.run(
                 q, kv_data, return_lse=True
@@ -316,7 +317,7 @@ def test_batch_decode_tensor_cores_cuda_graph(
 
     # capture
     g = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(g):
+    with use_torch_stream(torch.cuda.graph(g)):
         o_tensor_cores, lse_tensor_cores = wrapper_tensor_cores.run(
             q, kv_data, return_lse=True
         )
@@ -566,14 +567,14 @@ def test_batch_fast_decode_tensor_cores_cuda_graph(
     # warmup
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(s):
+    with use_torch_stream(torch.cuda.stream(s)):
         for _ in range(3):
             o, lse = wrapper.run(q, kv_data, return_lse=True)
     torch.cuda.current_stream().wait_stream(s)
 
     # capture
     g = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(g):
+    with use_torch_stream(torch.cuda.graph(g)):
         o, lse = wrapper.run(q, kv_data, return_lse=True)
 
     # replay
@@ -624,7 +625,7 @@ def test_batch_fast_decode_tensor_cores_cuda_graph(
     # warmup
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(s):
+    with use_torch_stream(torch.cuda.stream(s)):
         for _ in range(3):
             o_tensor_cores, lse_tensor_cores = wrapper_tensor_cores.run(
                 q, kv_data, return_lse=True
@@ -633,7 +634,7 @@ def test_batch_fast_decode_tensor_cores_cuda_graph(
 
     # capture
     g = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(g):
+    with use_torch_stream(torch.cuda.graph(g)):
         o_tensor_cores, lse_tensor_cores = wrapper_tensor_cores.run(
             q, kv_data, return_lse=True
         )

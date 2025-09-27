@@ -19,7 +19,6 @@
 #include <flashinfer/attention/scheduler.cuh>
 #include <flashinfer/layout.cuh>
 #include <flashinfer/math.cuh>
-#include <optional>
 
 #include "batch_prefill_sm90_config.inc"
 #include "tvm_binding_utils.h"

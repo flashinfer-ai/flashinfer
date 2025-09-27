@@ -14,24 +14,24 @@
  * limitations under the License.
  */
 #include "batch_attention_config.inc"
-#include "pytorch_extension_utils.h"
+#include "tvm_ffi_utils.h"
 
-at::Tensor BatchPagedAttentionPlan(at::Tensor float_workspace_buffer,
-                                   at::Tensor int_workspace_buffer,
-                                   at::Tensor page_locked_int_workspace_buffer,
-                                   at::Tensor qo_indptr, at::Tensor kv_indptr, at::Tensor kv_len,
-                                   int64_t batch_size, int64_t num_qo_heads, int64_t num_kv_heads,
-                                   int64_t head_dim_o, bool causal);
+using tvm::ffi::Array;
+using tvm::ffi::Optional;
 
-void BatchPagedAttentionRun(at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
-                            at::Tensor plan_info_vec, at::Tensor q, at::Tensor k_cache,
-                            at::Tensor v_cache, at::Tensor kv_indices, at::Tensor o,
-                            std::optional<at::Tensor> maybe_lse, int64_t mask_mode_code,
-                            int64_t layout_code, int64_t num_qo_heads, int64_t num_kv_heads,
-                            int64_t page_size, double v_scale, double sm_scale,
+Array<int64_t> BatchPagedAttentionPlan(Tensor float_workspace_buffer, Tensor int_workspace_buffer,
+                                       Tensor page_locked_int_workspace_buffer, Tensor qo_indptr,
+                                       Tensor kv_indptr, Tensor kv_len, int64_t batch_size,
+                                       int64_t num_qo_heads, int64_t num_kv_heads,
+                                       int64_t head_dim_o, bool causal);
+
+void BatchPagedAttentionRun(Tensor float_workspace_buffer, Tensor int_workspace_buffer,
+                            Array<int64_t> plan_info_vec, Tensor q, Tensor k_cache, Tensor v_cache,
+                            Tensor kv_indices, Tensor o, Optional<Tensor> maybe_lse,
+                            int64_t mask_mode_code, int64_t layout_code, int64_t num_qo_heads,
+                            int64_t num_kv_heads, int64_t page_size, double v_scale,
+                            double sm_scale,
                             double logits_soft_cap ADDITIONAL_FUNC_PARAMS PROFILER_FUNC_PARAMS);
 
-TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
-  m.def("plan", &BatchPagedAttentionPlan);
-  m.def("run", &BatchPagedAttentionRun);
-}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(plan, &BatchPagedAttentionPlan);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, &BatchPagedAttentionRun);
