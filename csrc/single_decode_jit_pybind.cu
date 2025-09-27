@@ -14,14 +14,14 @@
  * limitations under the License.
  */
 
-#include "pytorch_extension_utils.h"
 #include "single_decode_config.inc"
+#include "tvm_ffi_utils.h"
 
-void single_decode_with_kv_cache(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor tmp,
-                                 at::Tensor o, std::optional<at::Tensor> maybe_lse, int64_t layout,
+using tvm::ffi::Optional;
+
+void single_decode_with_kv_cache(Tensor q, Tensor k, Tensor v, Tensor tmp, Tensor o,
+                                 Optional<Tensor> maybe_lse, int64_t layout,
                                  int64_t window_left ADDITIONAL_FUNC_PARAMS);
 
-TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
-  // Single-request decode with KV-Cache operator
-  m.def("run", single_decode_with_kv_cache);
-}
+// Single-request decode with KV-Cache operator
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, single_decode_with_kv_cache);

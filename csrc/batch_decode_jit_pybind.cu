@@ -14,27 +14,27 @@
  * limitations under the License.
  */
 #include "batch_decode_config.inc"
-#include "pytorch_extension_utils.h"
+#include "tvm/ffi/container/array.h"
+#include "tvm_ffi_utils.h"
 
-at::Tensor BatchDecodeWithPagedKVCachePlan(
-    at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
-    at::Tensor page_locked_int_workspace_buffer, at::Tensor indptr, int64_t batch_size,
+using tvm::ffi::Array;
+using tvm::ffi::Optional;
+
+Array<int64_t> BatchDecodeWithPagedKVCachePlan(
+    Tensor float_workspace_buffer, Tensor int_workspace_buffer,
+    Tensor page_locked_int_workspace_buffer, Tensor indptr, int64_t batch_size,
     int64_t num_qo_heads, int64_t num_kv_heads, int64_t page_size, bool enable_cuda_graph,
     int64_t window_left, double logits_soft_cap, int64_t head_dim_qk, int64_t head_dim_vo,
-    at::Tensor empty_q_data, at::Tensor empty_kv_data);
+    Tensor empty_q_data, Tensor empty_kv_data);
 
-void BatchDecodeWithPagedKVCacheRun(at::Tensor float_workspace_buffer,
-                                    at::Tensor int_workspace_buffer, at::Tensor plan_info_vec,
-                                    at::Tensor q, at::Tensor paged_k_cache,
-                                    at::Tensor paged_v_cache, at::Tensor paged_kv_indptr,
-                                    at::Tensor paged_kv_indices, at::Tensor paged_kv_last_page_len,
-                                    at::Tensor o, std::optional<at::Tensor> maybe_lse,
-                                    int64_t kv_layout_code, int64_t window_left,
-                                    bool enable_pdl ADDITIONAL_FUNC_PARAMS);
+void BatchDecodeWithPagedKVCacheRun(Tensor float_workspace_buffer, Tensor int_workspace_buffer,
+                                    Array<int64_t> plan_info_vec, Tensor q, Tensor paged_k_cache,
+                                    Tensor paged_v_cache, Tensor paged_kv_indptr,
+                                    Tensor paged_kv_indices, Tensor paged_kv_last_page_len,
+                                    Tensor o, Optional<Tensor> maybe_lse, int64_t kv_layout_code,
+                                    int64_t window_left, bool enable_pdl ADDITIONAL_FUNC_PARAMS);
 
-TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
-  // Batched decode with paged KV-Cache plan
-  m.def("plan", BatchDecodeWithPagedKVCachePlan);
-  // Batched decode with paged KV-Cache run
-  m.def("run", BatchDecodeWithPagedKVCacheRun);
-}
+// Batched decode with paged KV-Cache plan
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(plan, BatchDecodeWithPagedKVCachePlan);
+// Batched decode with paged KV-Cache run
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, BatchDecodeWithPagedKVCacheRun);

@@ -13,34 +13,38 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "batch_prefill_sm90_config.inc"
-#include "pytorch_extension_utils.h"
+#include <tvm/ffi/container/array.h>
 
-at::Tensor BatchPrefillWithKVCacheSM90Plan(
-    at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
-    at::Tensor page_locked_int_workspace_buffer, at::Tensor qo_indptr, at::Tensor kv_indptr,
-    at::Tensor kv_len_arr, int64_t total_num_rows, int64_t batch_size, int64_t num_qo_heads,
+#include "batch_prefill_sm90_config.inc"
+#include "tvm_ffi_utils.h"
+
+using tvm::ffi::Array;
+using tvm::ffi::Optional;
+
+Array<int64_t> BatchPrefillWithKVCacheSM90Plan(
+    ffi::Tensor float_workspace_buffer, ffi::Tensor int_workspace_buffer,
+    ffi::Tensor page_locked_int_workspace_buffer, ffi::Tensor qo_indptr, ffi::Tensor kv_indptr,
+    ffi::Tensor kv_len_arr, int64_t total_num_rows, int64_t batch_size, int64_t num_qo_heads,
     int64_t num_kv_heads, int64_t page_size, bool enable_cuda_graph, int64_t head_dim_qk,
     int64_t head_dim_vo, bool causal, int64_t window_left);
 
-void BatchPrefillWithRaggedKVCacheSM90Run(
-    at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer, at::Tensor plan_info_vec,
-    at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor qo_indptr, at::Tensor kv_indptr,
-    at::Tensor o, std::optional<at::Tensor> maybe_lse, int64_t mask_mode_code, int64_t layout,
-    int64_t window_left, bool enable_pdl ADDITIONAL_FUNC_PARAMS);
+void BatchPrefillWithRaggedKVCacheSM90Run(ffi::Tensor float_workspace_buffer,
+                                          ffi::Tensor int_workspace_buffer,
+                                          Array<int64_t> plan_info_vec, ffi::Tensor q,
+                                          ffi::Tensor k, ffi::Tensor v, ffi::Tensor qo_indptr,
+                                          ffi::Tensor kv_indptr, ffi::Tensor o,
+                                          Optional<ffi::Tensor> maybe_lse, int64_t mask_mode_code,
+                                          int64_t layout, int64_t window_left,
+                                          bool enable_pdl ADDITIONAL_FUNC_PARAMS);
 
 void BatchPrefillWithPagedKVCacheSM90Run(
-    at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer, at::Tensor plan_info_vec,
-    at::Tensor q, at::Tensor paged_k_cache, at::Tensor paged_v_cache, at::Tensor qo_indptr,
-    at::Tensor paged_kv_indptr, at::Tensor paged_kv_indices, at::Tensor paged_kv_last_page_len,
-    at::Tensor o, std::optional<at::Tensor> maybe_lse, int64_t mask_mode_code, int64_t layout,
-    int64_t window_left, bool enable_pdl ADDITIONAL_FUNC_PARAMS);
+    ffi::Tensor float_workspace_buffer, ffi::Tensor int_workspace_buffer,
+    Array<int64_t> plan_info_vec, ffi::Tensor q, ffi::Tensor paged_k_cache,
+    ffi::Tensor paged_v_cache, ffi::Tensor qo_indptr, ffi::Tensor paged_kv_indptr,
+    ffi::Tensor paged_kv_indices, ffi::Tensor paged_kv_last_page_len, ffi::Tensor o,
+    Optional<ffi::Tensor> maybe_lse, int64_t mask_mode_code, int64_t layout, int64_t window_left,
+    bool enable_pdl ADDITIONAL_FUNC_PARAMS);
 
-TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
-  // Batch-request prefill attention with KV-Cache plan
-  m.def("plan", BatchPrefillWithKVCacheSM90Plan);
-  // Batch-request prefill attention with KV-Cache operator
-  m.def("ragged_run", BatchPrefillWithRaggedKVCacheSM90Run);
-  // Batch-request prefill attention with KV-Cache operator
-  m.def("paged_run", BatchPrefillWithPagedKVCacheSM90Run);
-}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(plan, BatchPrefillWithKVCacheSM90Plan);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(ragged_run, BatchPrefillWithRaggedKVCacheSM90Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(paged_run, BatchPrefillWithPagedKVCacheSM90Run);

@@ -28,7 +28,6 @@
 
 #include <array>
 #include <map>
-#include <optional>
 #include <random>
 #include <utility>
 

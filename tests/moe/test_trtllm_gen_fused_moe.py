@@ -23,6 +23,8 @@ import torch
 from cuda.bindings import runtime
 from torch.nn import functional as F
 
+import tvm_ffi
+
 from flashinfer import (
     RoutingMethodType,
     GatedActType,
@@ -106,7 +108,7 @@ class CUDAGraphMoE:
         self.input_tensor = hidden_states_sample.clone()
 
         # Warmup
-        with torch.cuda.stream(torch_stream), autotune(True):
+        with tvm_ffi.use_torch_stream(torch.cuda.stream(torch_stream)), autotune(True):
             for _ in range(1):
                 self._run_moe_computation(runtime_args)
 
@@ -124,7 +126,7 @@ class CUDAGraphMoE:
 
         try:
             # Capture computation on our stream
-            with torch.cuda.stream(torch_stream):
+            with tvm_ffi.use_torch_stream(torch.cuda.stream(torch_stream)):
                 self.output_tensor = self._run_moe_computation(runtime_args)
             err, self.graph = runtime.cudaStreamEndCapture(self.stream)
             check_cuda(err)

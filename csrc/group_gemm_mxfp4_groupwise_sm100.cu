@@ -15,92 +15,92 @@
  */
 #include <flashinfer/cutlass_utils.cuh>
 
-#include "pytorch_extension_utils.h"
+#include "tvm_ffi_utils.h"
 
 using namespace flashinfer;
 
-#define DISPATCH_MMA_SM(mma_sm, MMA_SM, ...)  \
-  [&]() -> bool {                             \
-    if (mma_sm == 1) {                        \
-      constexpr int MMA_SM = 1;               \
-      return __VA_ARGS__();                   \
-    } else if (mma_sm == 2) {                 \
-      constexpr int MMA_SM = 2;               \
-      return __VA_ARGS__();                   \
-    }                                         \
-    TORCH_CHECK(false, "Unsupported MMA SM"); \
-    return false;                             \
+#define DISPATCH_MMA_SM(mma_sm, MMA_SM, ...)       \
+  [&]() -> bool {                                  \
+    if (mma_sm == 1) {                             \
+      constexpr int MMA_SM = 1;                    \
+      return __VA_ARGS__();                        \
+    } else if (mma_sm == 2) {                      \
+      constexpr int MMA_SM = 2;                    \
+      return __VA_ARGS__();                        \
+    }                                              \
+    TVM_FFI_ICHECK(false) << "Unsupported MMA SM"; \
+    return false;                                  \
   }()
 
-#define DISPATCH_TILE_M(tile_m, TILE_M, ...)  \
-  [&]() -> bool {                             \
-    if (tile_m == 128) {                      \
-      constexpr int TILE_M = 128;             \
-      return __VA_ARGS__();                   \
-    }                                         \
-    TORCH_CHECK(false, "Unsupported TILE M"); \
-    return false;                             \
+#define DISPATCH_TILE_M(tile_m, TILE_M, ...)       \
+  [&]() -> bool {                                  \
+    if (tile_m == 128) {                           \
+      constexpr int TILE_M = 128;                  \
+      return __VA_ARGS__();                        \
+    }                                              \
+    TVM_FFI_ICHECK(false) << "Unsupported TILE M"; \
+    return false;                                  \
   }()
 
-#define DISPATCH_TILE_N(tile_n, TILE_N, ...)  \
-  [&]() -> bool {                             \
-    if (tile_n == 64) {                       \
-      constexpr int TILE_N = 64;              \
-      return __VA_ARGS__();                   \
-    } else if (tile_n == 128) {               \
-      constexpr int TILE_N = 128;             \
-      return __VA_ARGS__();                   \
-    } else if (tile_n == 192) {               \
-      constexpr int TILE_N = 192;             \
-      return __VA_ARGS__();                   \
-    } else if (tile_n == 256) {               \
-      constexpr int TILE_N = 256;             \
-      return __VA_ARGS__();                   \
-    }                                         \
-    TORCH_CHECK(false, "Unsupported TILE N"); \
-    return false;                             \
+#define DISPATCH_TILE_N(tile_n, TILE_N, ...)       \
+  [&]() -> bool {                                  \
+    if (tile_n == 64) {                            \
+      constexpr int TILE_N = 64;                   \
+      return __VA_ARGS__();                        \
+    } else if (tile_n == 128) {                    \
+      constexpr int TILE_N = 128;                  \
+      return __VA_ARGS__();                        \
+    } else if (tile_n == 192) {                    \
+      constexpr int TILE_N = 192;                  \
+      return __VA_ARGS__();                        \
+    } else if (tile_n == 256) {                    \
+      constexpr int TILE_N = 256;                  \
+      return __VA_ARGS__();                        \
+    }                                              \
+    TVM_FFI_ICHECK(false) << "Unsupported TILE N"; \
+    return false;                                  \
   }()
 
-#define DISPATCH_TILE_K(tile_k, TILE_K, ...)  \
-  [&]() -> bool {                             \
-    if (tile_k == 128) {                      \
-      constexpr int TILE_K = 128;             \
-      return __VA_ARGS__();                   \
-    } else if (tile_k == 256) {               \
-      constexpr int TILE_K = 256;             \
-      return __VA_ARGS__();                   \
-    }                                         \
-    TORCH_CHECK(false, "Unsupported TILE K"); \
-    return false;                             \
+#define DISPATCH_TILE_K(tile_k, TILE_K, ...)       \
+  [&]() -> bool {                                  \
+    if (tile_k == 128) {                           \
+      constexpr int TILE_K = 128;                  \
+      return __VA_ARGS__();                        \
+    } else if (tile_k == 256) {                    \
+      constexpr int TILE_K = 256;                  \
+      return __VA_ARGS__();                        \
+    }                                              \
+    TVM_FFI_ICHECK(false) << "Unsupported TILE K"; \
+    return false;                                  \
   }()
 
-#define DISPATCH_SWAP_AB(swap_ab, SWAP_AB, ...) \
-  [&]() -> bool {                               \
-    if (swap_ab == true) {                      \
-      constexpr bool SWAP_AB = true;            \
-      return __VA_ARGS__();                     \
-    } else if (swap_ab == false) {              \
-      constexpr bool SWAP_AB = false;           \
-      return __VA_ARGS__();                     \
-    }                                           \
-    TORCH_CHECK(false, "Unsupported SWAP AB");  \
-    return false;                               \
+#define DISPATCH_SWAP_AB(swap_ab, SWAP_AB, ...)     \
+  [&]() -> bool {                                   \
+    if (swap_ab == true) {                          \
+      constexpr bool SWAP_AB = true;                \
+      return __VA_ARGS__();                         \
+    } else if (swap_ab == false) {                  \
+      constexpr bool SWAP_AB = false;               \
+      return __VA_ARGS__();                         \
+    }                                               \
+    TVM_FFI_ICHECK(false) << "Unsupported SWAP AB"; \
+    return false;                                   \
   }()
 
-#define DISPATCH_PYTORCH_INPUT_OUTPUT_DTYPE(input_a_dtype, input_b_dtype, sf_a_dtype, sf_b_dtype, \
-                                            output_dtype, c_type_in_a, c_type_in_b, c_type_sf_a,  \
-                                            c_type_sf_b, c_type_out, ...)                         \
-  [&]() -> bool {                                                                                 \
-    return DISPATCH_PYTORCH_DTYPE_TO_CTYPE(output_dtype, c_type_out, [&] {                        \
-      return DISPATCH_PYTORCH_DTYPE_TO_CTYPE_SF(sf_b_dtype, c_type_sf_b, [&] {                    \
-        return DISPATCH_PYTORCH_DTYPE_TO_CTYPE_SF(sf_a_dtype, c_type_sf_a, [&] {                  \
-          return DISPATCH_PYTORCH_DTYPE_TO_CTYPE(input_b_dtype, c_type_in_b, [&] {                \
-            return DISPATCH_PYTORCH_DTYPE_TO_CTYPE(input_a_dtype, c_type_in_a,                    \
-                                                   [&] { return __VA_ARGS__(); });                \
-          });                                                                                     \
-        });                                                                                       \
-      });                                                                                         \
-    });                                                                                           \
+#define DISPATCH_DLPACK_INPUT_OUTPUT_DTYPE(input_a_dtype, input_b_dtype, sf_a_dtype, sf_b_dtype, \
+                                           output_dtype, c_type_in_a, c_type_in_b, c_type_sf_a,  \
+                                           c_type_sf_b, c_type_out, ...)                         \
+  [&]() -> bool {                                                                                \
+    return DISPATCH_DLPACK_DTYPE_TO_CTYPE(output_dtype, c_type_out, [&] {                        \
+      return DISPATCH_DLPACK_DTYPE_TO_CTYPE_SF(sf_b_dtype, c_type_sf_b, [&] {                    \
+        return DISPATCH_DLPACK_DTYPE_TO_CTYPE_SF(sf_a_dtype, c_type_sf_a, [&] {                  \
+          return DISPATCH_DLPACK_DTYPE_TO_CTYPE(input_b_dtype, c_type_in_b, [&] {                \
+            return DISPATCH_DLPACK_DTYPE_TO_CTYPE(input_a_dtype, c_type_in_a,                    \
+                                                  [&] { return __VA_ARGS__(); });                \
+          });                                                                                    \
+        });                                                                                      \
+      });                                                                                        \
+    });                                                                                          \
   }()
 
 template <typename T_A, typename T_B, typename T_SFA, typename T_SFB, typename T_OUT>
@@ -127,18 +127,17 @@ cudaError_t CutlassMXFP4GroupwiseScaledGroupGEMMSM100(
 }  // namespace group_gemm
 }  // namespace flashinfer
 
-void CutlassGroupGemmMXFP4GroupwiseScaledSM100(at::Tensor int_workspace_buffer,
-                                               at::Tensor float_workspace_buffer, at::Tensor A,
-                                               at::Tensor B, at::Tensor SFA, at::Tensor SFB,
-                                               at::Tensor D, at::Tensor m_indptr, int64_t n,
-                                               int64_t k, int64_t mma_sm, int64_t tile_m,
+void CutlassGroupGemmMXFP4GroupwiseScaledSM100(Tensor int_workspace_buffer,
+                                               Tensor float_workspace_buffer, Tensor A, Tensor B,
+                                               Tensor SFA, Tensor SFB, Tensor D, Tensor m_indptr,
+                                               int64_t n, int64_t k, int64_t mma_sm, int64_t tile_m,
                                                int64_t tile_n, int64_t tile_k, bool swap_ab) {
-  const c10::cuda::OptionalCUDAGuard device_guard(float_workspace_buffer.device());
-  auto stream = at::cuda::getCurrentCUDAStream(A.device().index());
-  int num_groups = m_indptr.size(0) - 1;
-  DISPATCH_PYTORCH_INPUT_OUTPUT_DTYPE(
-      A.scalar_type(), B.scalar_type(), SFA.scalar_type(), SFB.scalar_type(), D.scalar_type(),
-      c_type_in_a, c_type_in_b, c_type_sf_a, c_type_sf_b, c_type_out, [&] {
+  cudaSetDevice(float_workspace_buffer->device.device_id);
+  auto stream = get_stream(A->device);
+  int num_groups = m_indptr->shape[0] - 1;
+  DISPATCH_DLPACK_INPUT_OUTPUT_DTYPE(
+      A->dtype, B->dtype, SFA->dtype, SFB->dtype, D->dtype, c_type_in_a, c_type_in_b, c_type_sf_a,
+      c_type_sf_b, c_type_out, [&] {
         return DISPATCH_MMA_SM(mma_sm, MMA_SM, [&] {
           return DISPATCH_TILE_M(tile_m, TILE_M, [&] {
             return DISPATCH_TILE_N(tile_n, TILE_N, [&] {
@@ -153,19 +152,19 @@ void CutlassGroupGemmMXFP4GroupwiseScaledSM100(at::Tensor int_workspace_buffer,
                     using cutlass_t_out = cutlass_dtype_t<c_type_out>;
                     auto status = flashinfer::group_gemm::CutlassMXFP4GroupwiseScaledGroupGEMMSM100<
                         TILE_M, TILE_N, TILE_K, MMA_SM, SWAP_AB>(
-                        static_cast<int*>(int_workspace_buffer.data_ptr()),
-                        int_workspace_buffer.element_size() * int_workspace_buffer.size(0),
-                        static_cast<float*>(float_workspace_buffer.data_ptr()),
-                        float_workspace_buffer.element_size() * float_workspace_buffer.size(0),
-                        static_cast<cutlass_t_in_a*>(A.data_ptr()),
-                        static_cast<cutlass_t_in_b*>(B.data_ptr()),
-                        static_cast<cutlass_t_sf_a*>(SFA.data_ptr()),
-                        static_cast<cutlass_t_sf_b*>(SFB.data_ptr()),
-                        static_cast<cutlass_t_out*>(D.data_ptr()),
-                        static_cast<int*>(m_indptr.data_ptr()), n, k, num_groups, stream);
+                        static_cast<int*>(int_workspace_buffer->data),
+                        get_element_size(int_workspace_buffer) * int_workspace_buffer->shape[0],
+                        static_cast<float*>(float_workspace_buffer->data),
+                        get_element_size(float_workspace_buffer) * float_workspace_buffer->shape[0],
+                        static_cast<cutlass_t_in_a*>(A->data),
+                        static_cast<cutlass_t_in_b*>(B->data),
+                        static_cast<cutlass_t_sf_a*>(SFA->data),
+                        static_cast<cutlass_t_sf_b*>(SFB->data),
+                        static_cast<cutlass_t_out*>(D->data), static_cast<int*>(m_indptr->data), n,
+                        k, num_groups, stream);
                     return status == cudaSuccess;
                   } else {
-                    TORCH_CHECK(false, "Unsupported input data type");
+                    TVM_FFI_ICHECK(false) << "Unsupported input data type";
                     return false;
                   }
                 });

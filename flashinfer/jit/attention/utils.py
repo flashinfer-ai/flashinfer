@@ -40,9 +40,9 @@ def generate_additional_params(
     additional_func_params = "".join(
         [
             (
-                f", std::optional<at::Tensor> {var}"
+                f", Optional<ffi::Tensor> {var}"
                 if var.startswith("maybe")
-                else f", at::Tensor {var}"
+                else f", ffi::Tensor {var}"
             )
             for var in additional_tensor_names
         ]
@@ -55,9 +55,9 @@ def generate_additional_params(
         additional_params_setter = " \\\n".join(
             [
                 (
-                    f"params.additional_params.{var} = {var} ? static_cast<{dtype}*>({var}->data_ptr()): nullptr;"
+                    f"params.additional_params.{var} = {var} ? static_cast<{dtype}*>({var}.value()->data): nullptr;"
                     if var.startswith("maybe")
-                    else f"params.additional_params.{var} = static_cast<{dtype}*>({var}.data_ptr());"
+                    else f"params.additional_params.{var} = static_cast<{dtype}*>({var}->data);"
                 )
                 for dtype, var in zip(additional_tensor_dtypes, additional_tensor_names)
             ]
@@ -70,9 +70,9 @@ def generate_additional_params(
         additional_params_setter = " \\\n".join(
             [
                 (
-                    f"params.{var} = {var} ? static_cast<{dtype}*>({var}->data_ptr()): nullptr;"
+                    f"params.{var} = {var} ? static_cast<{dtype}*>({var}.value()->data): nullptr;"
                     if var.startswith("maybe")
-                    else f"params.{var} = static_cast<{dtype}*>({var}.data_ptr());"
+                    else f"params.{var} = static_cast<{dtype}*>({var}->data);"
                 )
                 for dtype, var in zip(additional_tensor_dtypes, additional_tensor_names)
             ]

@@ -13,15 +13,15 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "pytorch_extension_utils.h"
 #include "single_prefill_sm90_config.inc"
+#include "tvm_ffi_utils.h"
 
-void single_prefill_with_kv_cache_sm90(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor tmp,
-                                       at::Tensor o, std::optional<at::Tensor> maybe_lse,
+using tvm::ffi::Optional;
+
+void single_prefill_with_kv_cache_sm90(ffi::Tensor q, ffi::Tensor k, ffi::Tensor v, ffi::Tensor tmp,
+                                       ffi::Tensor o, Optional<ffi::Tensor> maybe_lse,
                                        int64_t mask_mode_code, int64_t layout,
                                        int64_t window_left ADDITIONAL_FUNC_PARAMS);
 
-TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
-  // Single-request prefill attention with KV-Cache operator
-  m.def("run", single_prefill_with_kv_cache_sm90);
-}
+// Single-request prefill attention with KV-Cache operator
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, single_prefill_with_kv_cache_sm90);

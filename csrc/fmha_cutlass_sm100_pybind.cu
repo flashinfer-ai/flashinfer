@@ -13,22 +13,20 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "pytorch_extension_utils.h"
+#include "tvm_ffi_utils.h"
 
-void FMHACutlassSM100Run(at::Tensor workspace_buffer, at::Tensor q, at::Tensor k, at::Tensor v,
-                         at::Tensor qo_segment_offsets, at::Tensor kv_segment_offsets,
-                         at::Tensor work_indptr, at::Tensor qo_tile_indices,
-                         at::Tensor qo_head_indices, at::Tensor batch_indices, at::Tensor o,
-                         std::optional<at::Tensor> maybe_lse, int64_t mask_mode_code,
+using tvm::ffi::Optional;
+
+void FMHACutlassSM100Run(Tensor workspace_buffer, Tensor q, Tensor k, Tensor v,
+                         Tensor qo_segment_offsets, Tensor kv_segment_offsets, Tensor work_indptr,
+                         Tensor qo_tile_indices, Tensor qo_head_indices, Tensor batch_indices,
+                         Tensor o, Optional<Tensor> maybe_lse, int64_t mask_mode_code,
                          double sm_scale, int64_t num_qo_heads, int64_t num_kv_heads,
                          int64_t head_dim_qk, int64_t head_dim_vo, int64_t max_qo_len);
 
-void blackwell_fmha_plan(at::Tensor qo_segment_offsets, at::Tensor kv_segment_offsets,
-                         at::Tensor work_indptr, at::Tensor qo_tile_indices,
-                         at::Tensor head_indices, at::Tensor batch_indices, int64_t qo_tile_size,
-                         int64_t num_heads, int64_t num_buckets, bool causal);
+void blackwell_fmha_plan(Tensor qo_segment_offsets, Tensor kv_segment_offsets, Tensor work_indptr,
+                         Tensor qo_tile_indices, Tensor head_indices, Tensor batch_indices,
+                         int64_t qo_tile_size, int64_t num_heads, int64_t num_buckets, bool causal);
 
-TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
-  m.def("run", FMHACutlassSM100Run);
-  m.def("plan", blackwell_fmha_plan);
-}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, FMHACutlassSM100Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(plan, blackwell_fmha_plan);

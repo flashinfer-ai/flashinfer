@@ -24,8 +24,8 @@ from .utils import write_if_different
 
 activation_templ = r"""
 #include <flashinfer/activation.cuh>
-#include "pytorch_extension_utils.h"
 #include <cuda_runtime.h>
+#include "tvm_ffi_utils.h"
 
 {% set func_name = act_func_name ~ '_and_mul' %}
 
@@ -33,14 +33,14 @@ using namespace flashinfer;
 
 {{ act_func_def }}
 
-void {{ func_name }}(at::Tensor& out, at::Tensor& input, bool enable_pdl) {
-  int d = input.size(-1) / 2;
-  int64_t num_tokens = input.numel() / input.size(-1);
+void {{ func_name }}(Tensor out, Tensor input, bool enable_pdl) {
+  int d = input->shape[input->ndim -1] / 2;
+  int64_t num_tokens = get_numel(input) / input->shape[input->ndim -1];
   dim3 grid(num_tokens);
 
-  const c10::cuda::OptionalCUDAGuard device_guard(out.device());
-  auto stream = at::cuda::getCurrentCUDAStream();
-  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), c_type, [&] {
+  cudaSetDevice(out->device.device_id);
+  const cudaStream_t stream = get_stream(out->device);
+  DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(input->dtype, c_type, [&] {
     uint32_t vec_size = 16 / sizeof(c_type);
     cudaLaunchConfig_t config;
     config.gridDim = num_tokens;
@@ -55,19 +55,17 @@ void {{ func_name }}(at::Tensor& out, at::Tensor& input, bool enable_pdl) {
 
     auto kernel = flashinfer::activation::act_and_mul_kernel<c_type, {{ act_func_name }}>;
 
-    cudaLaunchKernelEx(&config, kernel, static_cast<c_type*>(out.data_ptr()),
-                       static_cast<c_type*>(input.data_ptr()), d);
+    cudaLaunchKernelEx(&config, kernel, static_cast<c_type*>(out->data),
+                       static_cast<c_type*>(input->data), d);
 
     cudaError_t err = cudaGetLastError();
-    TORCH_CHECK(err == cudaSuccess, "Failed to launch kernel: ", cudaGetErrorString(err));
+    TVM_FFI_ICHECK(err == cudaSuccess) << "Failed to launch kernel: " << cudaGetErrorString(err);
 
     return true;
   });
 }
 
-TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
-  m.def("{{ func_name }}", {{ func_name }});
-}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC({{ func_name }}, {{ func_name }});
 """
 
 

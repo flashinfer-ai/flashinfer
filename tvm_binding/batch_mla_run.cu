@@ -16,7 +16,6 @@
 #include <flashinfer/attention/mla.cuh>
 #include <flashinfer/attention/scheduler.cuh>
 #include <flashinfer/fastdiv.cuh>
-#include <optional>
 
 #include "batch_mla_config.inc"
 #include "tvm_binding_utils.h"

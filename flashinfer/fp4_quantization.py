@@ -43,6 +43,12 @@ from .utils import (
 )
 
 
+def _compute_swizzled_layout_sf_size(total_row, total_column, row_size=128):
+    padded_row = (total_row + row_size - 1) // row_size * row_size
+    padded_column = (total_column + 3) // 4 * 4
+    return padded_row * padded_column
+
+
 def _pad_scale_factors(
     unswizzled_sf: torch.Tensor, m: int, n: int, sf_vec_size: int = 16
 ) -> torch.Tensor:
@@ -175,15 +181,32 @@ def get_fp4_quantization_module(backend: str = "100"):
         """
         if enable_pdl is None:
             enable_pdl = device_support_pdl(input.device)
-        return module.fp4_quantize(
+        out_val = torch.empty(
+            (*input.shape[:-1], input.shape[-1] // 2),
+            dtype=torch.uint8,
+            device=input.device,
+        )
+        m = input.numel() // input.shape[-1]
+        k = input.shape[-1]
+        if is_sf_swizzled_layout:
+            out_sf_size = _compute_swizzled_layout_sf_size(
+                m, k // sf_vec_size, 8 if is_sf_8x4_layout else 128
+            )
+        else:
+            out_sf_size = m * k // sf_vec_size
+        out_sf = torch.empty((out_sf_size,), dtype=torch.uint8, device=input.device)
+        module.fp4_quantize(
             input,
             global_scale,
+            out_val,
+            out_sf,
             sf_vec_size,
             sf_use_ue8m0,
             is_sf_swizzled_layout,
             is_sf_8x4_layout,
             enable_pdl,
         )
+        return out_val, out_sf
 
     @register_fake_op("flashinfer::fp4_quantize_sm100")
     def _fake_fp4_quantize_sm100(
@@ -208,11 +231,18 @@ def get_fp4_quantization_module(backend: str = "100"):
         scale: torch.Tensor,
         group_size: int = 32,
     ) -> torch.Tensor:
-        return module.mxfp4_dequantize_host(
+        out = torch.empty(
+            (weight.shape[0], weight.shape[1] * 2),
+            dtype=torch.float32,
+            device=weight.device,
+        )
+        module.mxfp4_dequantize_host(
             weight,
             scale,
+            out,
             group_size,
         )
+        return out
 
     @register_fake_op("flashinfer::mxfp4_dequantize_host")
     def _fake_mxfp4_dequantize_host(
@@ -239,9 +269,17 @@ def get_fp4_quantization_module(backend: str = "100"):
         Returns:
             torch.Tensor: output tensor for swizzled block scale with dtype uint8.
         """
-        return module.block_scale_interleave_sm100(
-            unswizzled_sf,
+        num_experts = unswizzled_sf.shape[0] if unswizzled_sf.dim() == 3 else 1
+        expert_out_size = _compute_swizzled_layout_sf_size(
+            unswizzled_sf.shape[-2], unswizzled_sf.shape[-1], 128
         )
+        out = torch.empty(
+            (num_experts * expert_out_size,),
+            dtype=torch.uint8,
+            device=unswizzled_sf.device,
+        )
+        module.block_scale_interleave_sm100(unswizzled_sf, out)
+        return out
 
     @register_fake_op("flashinfer::block_scale_interleave_sm100")
     def _fake_block_scale_interleave_sm100(
@@ -296,12 +334,26 @@ def get_fp4_quantization_module(backend: str = "100"):
             rounds (K / sf_vec_size) up to a multiple of 4 for storage.
             - The batch dimension B is preserved for both outputs.
         """
-        return module.fp4_batched_quantize(
+        b, m, k = input.shape
+        out_val = torch.empty(
+            (b, m, k // 2),
+            dtype=torch.uint8,
+            device=input.device,
+        )
+        out_sf = torch.empty(
+            (b, _compute_swizzled_layout_sf_size(m, k // sf_vec_size, 128)),
+            dtype=torch.uint8,
+            device=input.device,
+        )
+        module.fp4_batched_quantize(
             input,
             global_scale,
+            out_val,
+            out_sf,
             sf_vec_size,
             sf_use_ue8m0,
         )
+        return out_val, out_sf
 
     @register_fake_op("flashinfer::fp4_batched_quantize_sm100")
     def _fp4_batched_quantize_sm100(
@@ -344,14 +396,21 @@ def get_fp4_quantization_module(backend: str = "100"):
         Returns:
             torch.Tensor: Dequantized float tensor of shape [M, K] with dtype float32.
         """
-        return module.e2m1_and_ufp8sf_scale_to_float_sm100(
+        out = torch.zeros(
+            (e2m1_tensor.shape[0], e2m1_tensor.shape[1] * 2),
+            dtype=torch.float32,
+            device="cpu",
+        )
+        module.e2m1_and_ufp8sf_scale_to_float_sm100(
             e2m1_tensor.cpu(),
             ufp8_scale_tensor.cpu().reshape(-1),
             global_scale_tensor.cpu(),
+            out,
             sf_vec_size,
             ufp8_type,
             is_sf_swizzled_layout,
         )
+        return out
 
     @register_fake_op("flashinfer::e2m1_and_ufp8sf_scale_to_float_sm100")
     def _fake_e2m1_and_ufp8sf_scale_to_float_sm100(

@@ -16,10 +16,11 @@ limitations under the License.
 
 import os
 import platform
-import re
-import subprocess
 import sysconfig
+import subprocess
+import re
 from pathlib import Path
+from packaging.version import Version
 from typing import List, Mapping
 
 import setuptools
@@ -45,6 +46,32 @@ def get_version():
     return f"{package_version}+{local_version}"
 
 
+def get_cuda_path() -> str:
+    cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
+    if cuda_home is not None:
+        return cuda_home
+    # get output of "which nvcc"
+    nvcc_path = subprocess.run(["which", "nvcc"], capture_output=True)
+    if nvcc_path.returncode != 0:
+        raise RuntimeError("Could not find nvcc")
+    cuda_home = os.path.dirname(
+        os.path.dirname(nvcc_path.stdout.decode("utf-8").strip())
+    )
+    return cuda_home
+
+
+def get_cuda_version() -> Version:
+    cuda_home = get_cuda_path()
+    nvcc = os.path.join(cuda_home, "bin/nvcc")
+    txt = subprocess.check_output([nvcc, "--version"], text=True)
+    matches = re.findall(r"release (\d+\.\d+),", txt)
+    if not matches:
+        raise RuntimeError(
+            f"Could not parse CUDA version from nvcc --version output: {txt}"
+        )
+    return Version(matches[0])
+
+
 def generate_build_meta(aot_build_meta: dict) -> None:
     build_meta_str = f"__version__ = {get_version()!r}\n"
     if len(aot_build_meta) != 0:
@@ -64,6 +91,7 @@ install_requires = [
     "click",
     "tqdm",
     "tabulate",
+    "apache-tvm-ffi>=0.1.0a8",
     "packaging>=24.2",
     "nvidia-cudnn-frontend>=1.13.0",
 ]
@@ -71,16 +99,6 @@ generate_build_meta({})
 
 if enable_aot:
     import torch
-    import torch.utils.cpp_extension as torch_cpp_ext
-    from packaging.version import Version
-
-    def get_cuda_version() -> Version:
-        if torch_cpp_ext.CUDA_HOME is None:
-            nvcc = "nvcc"
-        else:
-            nvcc = os.path.join(torch_cpp_ext.CUDA_HOME, "bin/nvcc")
-        txt = subprocess.check_output([nvcc, "--version"], text=True)
-        return Version(re.findall(r"release (\d+\.\d+),", txt)[0])
 
     cuda_version = get_cuda_version()
     torch_full_version = Version(torch.__version__)
