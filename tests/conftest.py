@@ -152,7 +152,7 @@ def skip_on_gpu_arch_error(func):
         try:
             return func(*args, **kwargs)
         except flashinfer.utils.GPUArchitectureError as e:
-            pytest.skip(e.msg)
+            pytest.skip(str(e))
 
     return wrapper
 
