@@ -33,6 +33,9 @@ def test_sanity_check_urllib_behavior():
     joined = safe_urljoin(safe_urljoin(base_with_trailing_slash, intermediate_segments), single_segment)
     assert joined == "https://example.com/some/path/more/path/file.txt"
 
+    joined = safe_urljoin(intermediate_segments, single_segment)
+    assert joined == "more/path/file.txt"
+
 # Fake but real-enough looking URL, these tests should not actually try to reach it.
 test_cubin_repository = "https://edge.urm.nvidia.com/artifactory/sw-kernelinferencelibrary-public-generic-unit-test"
 
@@ -257,18 +260,22 @@ def test_get_cubin_file_list(monkeypatch):
     cubin_files = list(get_cubin_file_list())
 
     # Check that all the cubin's are in there.
-    for expected_file in expected_gemm_cubin_files:
-        assert any(expected_file in url for url in cubin_files), f"Expected cubin file '{expected_file}' not found in cubin file list"
+    for expected_file_name in expected_gemm_cubin_files:
+        expected_file_path = artifact_paths.TRTLLM_GEN_GEMM + "/" + expected_file_name
+        assert any(expected_file_path in url for url in cubin_files), f"Expected cubin file '{expected_file_path}' not found in cubin file list"
 
-    for expected_file in expected_fmha_cubin_files:
-        assert any(expected_file in url for url in cubin_files), f"Expected cubin file '{expected_file}' not found in cubin file list"
+    for expected_file_name in expected_fmha_cubin_files:
+        expected_file_path = artifact_paths.TRTLLM_GEN_FMHA + "/" + expected_file_name
+        assert any(expected_file_path in url for url in cubin_files), f"Expected cubin file '{expected_file_path}' not found in cubin file list"
 
-    for expected_file in expected_bmm_cubin_files:
-        assert any(expected_file in url for url in cubin_files), f"Expected cubin file '{expected_file}' not found in cubin file list"
+    for expected_file_name in expected_bmm_cubin_files:
+        expected_file_path = artifact_paths.TRTLLM_GEN_BMM + "/" + expected_file_name
+        assert any(expected_file_path in url for url in cubin_files), f"Expected cubin file '{expected_file_path}' not found in cubin file list"
 
-    for expected_file in expected_deepgemm_cubin_files:
-        assert any(expected_file in url for url in cubin_files), f"Expected cubin file '{expected_file}' not found in cubin file list"
-    
+    for expected_file_name in expected_deepgemm_cubin_files:
+        expected_file_path = artifact_paths.DEEPGEMM + "/" + expected_file_name
+        assert any(expected_file_path in url for url in cubin_files), f"Expected cubin file '{expected_file_path}' not found in cubin file list"
+
     # Check that the meta info headers are included (note the inconsistent casing in the actual function)
     # Capitalization is inconsistent in the actual filenames, so we check for both variants.
     meta_info_headers = [url for url in cubin_files if "include/flashInferMetaInfo.h" in url or "include/flashinferMetaInfo.h" in url]
