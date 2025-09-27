@@ -1,11 +1,8 @@
 {
     "name": "CUDA Development Container",
     "build": {
-        "dockerfile": "../Dockerfile",
-        "context": ".",
-        "args": {
-            "VERSION": "cu130"
-        }
+        "dockerfile": "../../docker/Dockerfile.cu130.dev",
+        "context": "../../docker/"
     },
     "runArgs": [
         "--gpus=all"

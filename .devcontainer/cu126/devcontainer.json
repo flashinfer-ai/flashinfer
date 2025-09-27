@@ -1,7 +1,7 @@
 {
     "name": "CUDA Development Container",
     "build": {
-        "dockerfile": "../../docker/Dockerfile.cu128.dev",
+        "dockerfile": "../../docker/Dockerfile.cu126.dev",
         "context": "../../docker/"
     },
     "runArgs": [
