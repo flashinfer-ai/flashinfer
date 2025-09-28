@@ -18,7 +18,6 @@ import pytest
 import torch
 
 import flashinfer.comm.trtllm_alltoall as tllm_alltoall
-from tvm_ffi import use_torch_stream
 
 has_setup_max_sm_count = False
 
@@ -291,7 +290,7 @@ def test_moe_alltoall_multi_rank_single_gpu(
 
     # do alltoall in parallel
     for rank in range(world_size):
-        with use_torch_stream(torch.cuda.stream(cuda_streams_all_ranks[rank])):
+        with torch.cuda.stream(cuda_streams_all_ranks[rank]):
             tllm_alltoall.moe_comm(
                 input_tensors_all_ranks[rank],
                 send_cumsum_all_ranks[rank],
@@ -703,7 +702,7 @@ def test_moe_alltoall_prepare(
     )
 
     stream = torch.cuda.Stream()
-    with use_torch_stream(torch.cuda.stream(stream)):
+    with torch.cuda.stream(stream):
         tllm_alltoall.moe_prepare(
             expert_ids_all_ranks[0],
             scales_all_ranks[0],
@@ -778,7 +777,7 @@ def test_moe_alltoall_prepare(
 
     # do prepare in parallel
     for rank in range(ep_size):
-        with use_torch_stream(torch.cuda.stream(cuda_streams_all_ranks[rank])):
+        with torch.cuda.stream(cuda_streams_all_ranks[rank]):
             if rank == ep_rank:
                 (
                     prepared_local_experts,
