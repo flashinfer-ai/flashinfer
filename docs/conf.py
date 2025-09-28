@@ -1,6 +1,8 @@
 from pathlib import Path
 from typing import Any, List
 
+import flashinfer  # noqa: F401
+
 # import tlcpack_sphinx_addon
 # Configuration file for the Sphinx documentation builder.
 #
