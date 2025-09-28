@@ -3,7 +3,7 @@ import torch
 
 import flashinfer
 import flashinfer.triton
-from conftest import skip_on_gpu_arch_error
+from tests.test_helpers.test_helpers import skip_on_gpu_arch_error
 
 
 @skip_on_gpu_arch_error
