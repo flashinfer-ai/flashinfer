@@ -20,6 +20,7 @@
 // for that. XQA kernels assume all length should use uint32_t.
 
 #include <cassert>
+#include <optional>
 
 #include "../../exception.h"
 #include "../../utils.cuh"
