@@ -52,7 +52,6 @@ packages = [
     "flashinfer.jit.attention",
     "flashinfer.jit.cutlass_gemm",
     "flashinfer.testing",
-    "flashinfer.jit.gemm",
     "flashinfer.triton",
     "flashinfer.tuning_configs",
     "flashinfer.profiler",
