@@ -343,7 +343,8 @@ def build_jit_specs(
             continue
         lines.append(f"subninja {spec.ninja_path}")
         if not spec.is_ninja_generated:
-            spec.write_ninja()
+            with FileLock(spec.lock_path, thread_local=False):
+                spec.write_ninja()
     if not lines:
         return
 
