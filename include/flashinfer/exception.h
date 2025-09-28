@@ -36,7 +36,6 @@ void write_to_stream(std::ostringstream& oss, T&& val, Args&&... args) {
   if (!(condition)) {                    \
     std::ostringstream oss;              \
     write_to_stream(oss, __VA_ARGS__);   \
-    std::cerr << oss.str() << std::endl; \
     FLASHINFER_ERROR(oss.str());         \
   }
 
