@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <cute/tensor.hpp>
 
+#include "../../utils.cuh"
 #include "../common.h"
 #include "fmhaRunnerParams.h"
 
@@ -173,7 +174,7 @@ struct KernelParams {
       numHeads /= numGroupedHeads;
     }
     // Make sure the math works.
-    TORCH_CHECK(numHeads * numGroupedHeads == options.mNumHeadsQ, "internal error");
+    FLASHINFER_CHECK(numHeads * numGroupedHeads == options.mNumHeadsQ, "internal error");
 
     // The number of tokens.
     int32_t numTokens{options.mSumOfSeqLensQ};
@@ -189,7 +190,7 @@ struct KernelParams {
     // The hidden dimension when the Q, K and V tensors are packed.
     int32_t hiddenDimQkv{hiddenDimQ};
     if (isPackedQkv(options.mQkvLayout)) {
-      TORCH_CHECK(!groupsHeadsQ, "internal error");
+      FLASHINFER_CHECK(!groupsHeadsQ, "internal error");
       hiddenDimQkv += options.mNumHeadsKv * (options.mHeadDimQk + options.mHeadDimV);
     }
 
@@ -213,7 +214,7 @@ struct KernelParams {
                                             static_cast<uint32_t>(tileSizeQ)};
     if (groupsHeadsQ) {
       if (isSpecDecodingGenerationKernel(options.mKernelType)) {
-        TORCH_CHECK((tileSizeQ % numGroupedHeads == 0), "internal error");
+        FLASHINFER_CHECK((tileSizeQ % numGroupedHeads == 0), "internal error");
         tileShapes = std::vector<uint32_t>{static_cast<uint32_t>(numEltsInClampedHeadDimQ),
                                            static_cast<uint32_t>(numGroupedHeads), 1,
                                            static_cast<uint32_t>(tileSizeQ / numGroupedHeads)};
@@ -387,7 +388,7 @@ struct KernelParams {
     // numHeadsKv, batchSize)
 
     // Note that it only works for pagedKv layout.
-    TORCH_CHECK(isPagedKv(options.mQkvLayout), "The qkvLayout is not supported.");
+    FLASHINFER_CHECK(isPagedKv(options.mQkvLayout), "The qkvLayout is not supported.");
 
     auto shape = std::vector<uint64_t>{
         16, static_cast<uint64_t>(numKeys * headDim / NumEltsPerSf / 16),
@@ -452,7 +453,7 @@ struct KernelParams {
     } else if (dtypeElt == DATA_TYPE_BF16) {
       tmaDataFormat = CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
     } else {
-      TORCH_CHECK(false, "Unexpected dtype %d", static_cast<int32_t>(dtypeElt));
+      FLASHINFER_CHECK(false, "Unexpected dtype %d", static_cast<int32_t>(dtypeElt));
     }
 
     // The swizzle type.
@@ -467,25 +468,25 @@ struct KernelParams {
     } else if ((numBytesInLeadingDim % 32) == 0) {
       swizzleType = CU_TENSOR_MAP_SWIZZLE_32B;
     } else {
-      TORCH_CHECK(false, "Unexpected numBytesInLeadingDim %d", numBytesInLeadingDim);
+      FLASHINFER_CHECK(false, "Unexpected numBytesInLeadingDim %d", numBytesInLeadingDim);
     }
 
     // Check gmem address must be 16B-aligned
-    TORCH_CHECK((reinterpret_cast<uint64_t>(gmemAddr) & 0b1111) == 0);
+    FLASHINFER_CHECK((reinterpret_cast<uint64_t>(gmemAddr) & 0b1111) == 0);
 
     // Check shape must be in range [1, 2^32]
     int32_t dim = shapes.size();
     // Max five dimension and min 3 dimension.
-    TORCH_CHECK((dim <= 5) && (dim >= 3));
+    FLASHINFER_CHECK((dim <= 5) && (dim >= 3));
     // Check shape range.
     for (int32_t ii = 0; ii < dim; ++ii) {
-      TORCH_CHECK(shapes[ii] >= (uint64_t(1)));        // Size must be min 1
-      TORCH_CHECK(shapes[ii] <= (uint64_t(1) << 32));  // Size must be max 2^32
+      FLASHINFER_CHECK(shapes[ii] >= (uint64_t(1)));        // Size must be min 1
+      FLASHINFER_CHECK(shapes[ii] <= (uint64_t(1) << 32));  // Size must be max 2^32
     }
 
     // TMA descriptor does not store the zeroth stride and assumes it is 1.
-    TORCH_CHECK(static_cast<int32_t>(strides.size()) == dim);
-    TORCH_CHECK(strides[0] == 1);
+    FLASHINFER_CHECK(static_cast<int32_t>(strides.size()) == dim);
+    FLASHINFER_CHECK(strides[0] == 1);
 
     // Build strides in bytes.
     // cuTensorMapEncodeTiled ignores the stride of the first dimension (implicitly 1).
@@ -522,7 +523,7 @@ struct KernelParams {
       std::cerr << "tileStrides: " << tileStrides[0] << " " << tileStrides[1] << " "
                 << tileStrides[2] << " " << tileStrides[3] << " " << tileStrides[4] << std::endl;
       std::cerr << "swizzleType: " << int(swizzleType) << std::endl;
-      TORCH_CHECK(false);
+      FLASHINFER_CHECK(false);
     }
 
     return desc;
@@ -671,8 +672,8 @@ struct KernelParams {
     if (isSlidingOrChunkedCausalMask(
             static_cast<TrtllmGenAttentionMaskType>(kernelMeta.mMaskType)) &&
         options.mChunkedAttentionSize != INT_MAX) {
-      TORCH_CHECK((options.mChunkedAttentionSize & (options.mChunkedAttentionSize - 1)) == 0,
-                  "Chunked attention size must be a power of 2");
+      FLASHINFER_CHECK((options.mChunkedAttentionSize & (options.mChunkedAttentionSize - 1)) == 0,
+                       "Chunked attention size must be a power of 2");
       params.mChunkedAttentionSizeLog2 = std::log2(options.mChunkedAttentionSize);
     } else {
       // Default 0 means that chunked attention is disabled.

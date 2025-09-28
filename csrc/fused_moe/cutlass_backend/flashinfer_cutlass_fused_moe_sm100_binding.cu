@@ -30,13 +30,6 @@
 #include "tensorrt_llm/common/workspace.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
 
-#define C10_THROW_ERROR_FORMATTED(ErrorType, ...) \
-  do {                                            \
-    std::ostringstream oss;                       \
-    oss << __VA_ARGS__;                           \
-    C10_THROW_ERROR(ErrorType, oss.str());        \
-  } while (0)
-
 namespace common = tensorrt_llm::common;
 namespace kernels = CUTLASS_MOE_GEMM_KERNELS_NAMESPACE;
 using ActivationParams = CUTLASS_MOE_GEMM_NAMESPACE::ActivationParams;

@@ -24,10 +24,11 @@
 #include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
 #include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/trtllm/gen/SfLayoutDecl.h"
 // #include <cuda_runtime_api.h>
-#include <c10/util/Exception.h>
 #include <cutlass/cutlass.h>
 #include <cutlass/numeric_size.h>
 #include <cutlass/numeric_types.h>
+
+#include "../../exception.cuh"
 // #include <tensorrt_llm/common/assert.h>
 #include "flashinfer/trtllm/common/cudaUtils.h"
 
@@ -40,7 +41,7 @@ namespace moe::dev {
       std::cout << "CUDA error in " << __FILE__ << ":" << __LINE__ << " executing '" << #cmd \
                 << "': " << cudaGetErrorString(e);                                           \
     }                                                                                        \
-    TORCH_CHECK(e == cudaSuccess, "Got CUDA error. See above for details.");                 \
+    FLASHINFER_CHECK(e == cudaSuccess, "Got CUDA error. See above for details.");            \
   } while (0)
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

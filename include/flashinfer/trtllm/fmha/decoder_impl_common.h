@@ -21,6 +21,7 @@
 
 #include <cassert>
 
+#include "../../exception.h"
 #include "../../utils.cuh"
 #include "decoder_params.h"
 
@@ -144,7 +145,7 @@ struct XQAKernelFullHashKey {
       : load_key(load_key), runtime_key(runtime_key) {}
 
   XQAKernelFullHashKey(void const* buffer, size_t buffer_size) {
-    TORCH_CHECK(sizeof(*this) <= buffer_size);
+    FLASHINFER_CHECK(sizeof(*this) <= buffer_size);
     memcpy(this, buffer, sizeof(*this));
   }
 
@@ -155,7 +156,7 @@ struct XQAKernelFullHashKey {
   size_t getSerializationSize() const { return sizeof(*this); }
 
   void serialize(void* buffer, size_t buffer_size) const {
-    TORCH_CHECK(sizeof(*this) <= buffer_size);
+    FLASHINFER_CHECK(sizeof(*this) <= buffer_size);
     memcpy(buffer, this, sizeof(*this));
   }
 };
@@ -196,7 +197,7 @@ std::optional<T> getGlobalVar(CUmodule hmod, char const* const name, bool requir
   T ret;
   switch (error) {
     case CUDA_SUCCESS:
-      TORCH_CHECK(size == sizeof(T));
+      FLASHINFER_CHECK(size == sizeof(T));
       CUDACHECK(cudaMemcpy(&ret, pVar, size, cudaMemcpyDeviceToHost));
       break;
     case CUDA_ERROR_NOT_FOUND:
@@ -240,8 +241,8 @@ inline int computeMultiBlockCount(XQAParams const& xqaParams, int batch_size,
   // maxNbSubSeq).
   multi_block_count = std::max(std::min(multi_block_count, maxNbSubSeq / batch_size), 1);
 
-  TORCH_CHECK(multi_block_count >= 1, "MultiBlock count should be larger than 1");
-  TORCH_CHECK(multi_block_count == 1 || batch_size * multi_block_count <= maxNbSubSeq,
-              "Insufficient workspace");
+  FLASHINFER_CHECK(multi_block_count >= 1, "MultiBlock count should be larger than 1");
+  FLASHINFER_CHECK(multi_block_count == 1 || batch_size * multi_block_count <= maxNbSubSeq,
+                   "Insufficient workspace");
   return multi_block_count;
 }
