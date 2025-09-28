@@ -1,5 +1,3 @@
-import os
-import sys
 from pathlib import Path
 from typing import Any, List
 
@@ -13,8 +11,7 @@ from typing import Any, List
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
 
 root = Path(__file__).parents[1].resolve()
-sys.path.insert(0, str(root))
-os.environ["BUILD_DOC"] = "1"
+# FlashInfer is installed via pip before building docs
 autodoc_mock_imports = [
     "torch",
     "triton",
