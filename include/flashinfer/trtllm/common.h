@@ -16,7 +16,9 @@
 
 #pragma once
 
+#include <cuda.h>
 #include <cuda_fp8.h>
+#include <cuda_runtime.h>
 #include <limits.h>
 #include <stdint.h>
 
