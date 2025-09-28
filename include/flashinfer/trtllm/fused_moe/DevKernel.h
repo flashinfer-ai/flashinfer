@@ -28,7 +28,7 @@
 #include <cutlass/numeric_size.h>
 #include <cutlass/numeric_types.h>
 
-#include "../../exception.cuh"
+#include "../../exception.h"
 // #include <tensorrt_llm/common/assert.h>
 #include "flashinfer/trtllm/common/cudaUtils.h"
 
