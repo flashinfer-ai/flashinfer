@@ -21,6 +21,7 @@ from dataclasses import dataclass
 import platform
 import sys
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
+import pynvml
 
 import torch
 
@@ -63,13 +64,13 @@ def create_tensor_from_cuda_memory(
     Create a PyTorch tensor from a CUDA memory pointer using DLPack.
 
     Args:
-    ptr: CUDA memory pointer address as integer
-    shape: Desired tensor shape
-    dtype: PyTorch data type
-    device_id: CUDA device ID
+        ptr: CUDA memory pointer address as integer
+        shape: Desired tensor shape
+        dtype: PyTorch data type
+        device_id: CUDA device ID
 
     Returns:
-    PyTorch tensor that wraps the CUDA memory
+        PyTorch tensor that wraps the CUDA memory
     """
     # Calculate total size in elements
     numel = 1
@@ -97,12 +98,12 @@ def test_cuda_memory_access(ptr: int, size: int, device_id: int) -> bool:
     Test if CUDA memory at ptr is accessible by trying to read/write a small amount.
 
     Args:
-    ptr: CUDA memory pointer
-    size: Size of memory region
-    device_id: CUDA device ID
+        ptr: CUDA memory pointer
+        size: Size of memory region
+        device_id: CUDA device ID
 
     Returns:
-    True if memory is accessible, False otherwise
+        True if memory is accessible, False otherwise
     """
     try:
         # Test with a small 4-byte read/write
@@ -157,8 +158,6 @@ class CommBackend(ABC):
     @abstractmethod
     def Split(self, color: int, key: int) -> "CommBackend": ...
 
-
-import pynvml
 
 if TYPE_CHECKING:
     from mpi4py import MPI  # noqa: F401
