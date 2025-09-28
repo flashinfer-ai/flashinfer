@@ -21,6 +21,11 @@
 
 #define FLASHINFER_ERROR(message) throw flashinfer::Error(__FUNCTION__, __FILE__, __LINE__, message)
 
+// Base case for empty arguments
+inline void write_to_stream(std::ostringstream& oss) {
+  // No-op for empty arguments
+}
+
 template <typename T>
 void write_to_stream(std::ostringstream& oss, T&& val) {
   oss << std::forward<T>(val);
@@ -32,12 +37,25 @@ void write_to_stream(std::ostringstream& oss, T&& val, Args&&... args) {
   write_to_stream(oss, std::forward<Args>(args)...);
 }
 
-#define FLASHINFER_CHECK(condition, ...) \
-  if (!(condition)) {                    \
-    std::ostringstream oss;              \
-    write_to_stream(oss, __VA_ARGS__);   \
-    FLASHINFER_ERROR(oss.str());         \
+// Helper macro to handle empty __VA_ARGS__
+#define FLASHINFER_CHECK_IMPL(condition, message) \
+  if (!(condition)) {                             \
+    FLASHINFER_ERROR(message);                    \
   }
+
+// Main macro that handles both cases
+#define FLASHINFER_CHECK(condition, ...)   \
+  do {                                     \
+    if (!(condition)) {                    \
+      std::ostringstream oss;              \
+      write_to_stream(oss, ##__VA_ARGS__); \
+      std::string msg = oss.str();         \
+      if (msg.empty()) {                   \
+        msg = "Check failed: " #condition; \
+      }                                    \
+      FLASHINFER_ERROR(msg);               \
+    }                                      \
+  } while (0)
 
 namespace flashinfer {
 class Error : public std::exception {
