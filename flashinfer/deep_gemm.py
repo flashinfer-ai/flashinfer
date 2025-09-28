@@ -1490,8 +1490,8 @@ class KernelMap:
         self.indice = None
 
     def init_indices(self):
-        indice_path = ArtifactPath.DEEPGEMM + "kernel_map"
-        assert get_cubin(indice_path, self.sha256, file_extension=".json"), (
+        indice_path = ArtifactPath.DEEPGEMM + "kernel_map.json"
+        assert get_cubin(indice_path, self.sha256), (
             "cubin kernel map file not found, nor downloaded with matched sha256"
         )
         path = FLASHINFER_CUBIN_DIR / f"{indice_path}.json"
