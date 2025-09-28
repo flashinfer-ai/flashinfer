@@ -78,54 +78,90 @@ PASSED_TESTS=0
 
 if [ "$DRY_RUN" == "true" ]; then
     echo "=========================================="
-    echo "DRY RUN: Test directories that would be executed"
+    echo "DRY RUN: Tests that would be executed"
     echo "=========================================="
 
     for test_dir in $TEST_DIRS; do
-        TOTAL_TESTS=$((TOTAL_TESTS + 1))
-        test_count=$(find "$test_dir" -maxdepth 1 -name "test_*.py" -type f | wc -l)
-        echo "$TOTAL_TESTS. pytest $test_dir  (contains $test_count test files)"
+        if [ "$test_dir" == "tests/utils" ]; then
+            # Run utils tests individually for debugging
+            echo ""
+            echo "📝 NOTE: tests/utils will be run individually for debugging"
+            utils_files=$(find "$test_dir" -maxdepth 1 -name "test_*.py" -type f | sort)
+            for test_file in $utils_files; do
+                TOTAL_TESTS=$((TOTAL_TESTS + 1))
+                echo "$TOTAL_TESTS. pytest $test_file"
+            done
+        else
+            # Run other directories as groups
+            TOTAL_TESTS=$((TOTAL_TESTS + 1))
+            test_count=$(find "$test_dir" -maxdepth 1 -name "test_*.py" -type f | wc -l)
+            echo "$TOTAL_TESTS. pytest $test_dir  (contains $test_count test files)"
+        fi
     done
 
     echo ""
     echo "=========================================="
     echo "DRY RUN SUMMARY"
     echo "=========================================="
-    echo "Total test directories that would be executed: $TOTAL_TESTS"
+    echo "Total test commands that would be executed: $TOTAL_TESTS"
     echo ""
     echo "To actually run the tests, execute without --dry-run:"
     echo "  $0"
     echo "Or set DRY_RUN=false $0"
 else
     for test_dir in $TEST_DIRS; do
-        echo "=========================================="
-        echo "Running: pytest $test_dir"
-        echo "=========================================="
+        if [ "$test_dir" == "tests/utils" ]; then
+            # Run utils tests individually for debugging
+            echo "=========================================="
+            echo "Running tests/utils individually for debugging"
+            echo "=========================================="
 
-        TOTAL_TESTS=$((TOTAL_TESTS + 1))
+            utils_files=$(find "$test_dir" -maxdepth 1 -name "test_*.py" -type f | sort)
+            for test_file in $utils_files; do
+                echo "Running: pytest $test_file"
+                TOTAL_TESTS=$((TOTAL_TESTS + 1))
 
-        if pytest "$test_dir"; then
-            echo "✅ PASSED: $test_dir"
-            PASSED_TESTS=$((PASSED_TESTS + 1))
+                if pytest "$test_file"; then
+                    echo "✅ PASSED: $test_file"
+                    PASSED_TESTS=$((PASSED_TESTS + 1))
+                else
+                    echo "❌ FAILED: $test_file"
+                    FAILED_TESTS="$FAILED_TESTS\n  - $test_file"
+                    EXIT_CODE=1
+                fi
+                echo ""
+            done
         else
-            echo "❌ FAILED: $test_dir"
-            FAILED_TESTS="$FAILED_TESTS\n  - $test_dir"
-            EXIT_CODE=1
-        fi
+            # Run other directories as groups
+            echo "=========================================="
+            echo "Running: pytest $test_dir"
+            echo "=========================================="
 
-        echo ""
+            TOTAL_TESTS=$((TOTAL_TESTS + 1))
+
+            if pytest "$test_dir"; then
+                echo "✅ PASSED: $test_dir"
+                PASSED_TESTS=$((PASSED_TESTS + 1))
+            else
+                echo "❌ FAILED: $test_dir"
+                FAILED_TESTS="$FAILED_TESTS\n  - $test_dir"
+                EXIT_CODE=1
+            fi
+
+            echo ""
+        fi
     done
 
     echo "=========================================="
     echo "TEST SUMMARY"
     echo "=========================================="
-    echo "Total test directories: $TOTAL_TESTS"
+    echo "Total test commands executed: $TOTAL_TESTS"
     echo "Passed: $PASSED_TESTS"
     echo "Failed: $((TOTAL_TESTS - PASSED_TESTS))"
 
     if [ -n "$FAILED_TESTS" ]; then
         echo ""
-        echo "Failed test directories:"
+        echo "Failed tests:"
         echo -e "$FAILED_TESTS"
     fi
 fi
