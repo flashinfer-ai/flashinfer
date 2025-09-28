@@ -46,7 +46,6 @@ packages = [
     "flashinfer.data.csrc",
     "flashinfer.data.cutlass",
     "flashinfer.data.spdlog",
-    "flashinfer.data.tvm_binding",
     "flashinfer.data.include",
     "flashinfer.fused_moe",
     "flashinfer.jit",
@@ -74,7 +73,6 @@ include-package-data = false
 "flashinfer.data" = [
     "csrc/**",
     "include/**",
-    "tvm_binding/**",
     "version.txt"
 ]
 "flashinfer.data.aot" = [
