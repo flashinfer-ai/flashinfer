@@ -33,6 +33,10 @@
 #endif        // WIN32
 
 #include <cassert>
+#include <cstdlib>   // for std::getenv
+#include <cstring>   // for std::strcmp
+#include <iostream>  // for std::cerr
+#include <mutex>     // for std::once_flag and std::call_once
 
 #define HOST_DEVICE_FUNC __host__ __device__
 #define DEVICE_FUNC __device__

@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <iostream>
 #include <map>
+#include <mutex>
 
 #include "cudnn_sdpa_utils.h"
 #include "tvm_ffi_utils.h"
