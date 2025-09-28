@@ -177,9 +177,9 @@ def setup_cubin_loader(dll_path: str) -> None:
     # Define the correct callback type
     CALLBACK_TYPE = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_char_p)
 
-    def get_cubin_callback(name, sha256):
+    def get_cubin_callback(name: bytes, sha256: bytes):
         # Both name and sha256 are bytes (c_char_p)
-        cubin = get_cubin(name.decode("utf-8"), sha256.decode("utf-8"))
+        cubin = get_cubin(name.decode("utf-8") + ".cubin", sha256.decode("utf-8"))
         _LIB.FlashInferSetCurrentCubin(
             convert_to_ctypes_char_p(cubin), ctypes.c_int(len(cubin))
         )
