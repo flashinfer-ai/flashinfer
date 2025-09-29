@@ -22,7 +22,6 @@
 // #include "tensorrt_llm/common/logger.h"
 // #include "tensorrt_llm/common/tllmException.h"
 
-#include <c10/util/Exception.h>
 #include <cublasLt.h>
 #include <cublas_v2.h>
 #include <cuda.h>
@@ -39,6 +38,8 @@
 #include <optional>
 #include <sstream>
 #include <string>
+
+#include "../../exception.h"
 
 // #ifndef _WIN32 // Linux
 // #include <sys/sysinfo.h>
@@ -111,8 +112,8 @@ inline std::optional<bool> isCudaLaunchBlocking() {
 
 inline std::optional<bool> isCapturing(cudaStream_t stream) {
   cudaStreamCaptureStatus status;
-  TORCH_CHECK(cudaStreamIsCapturing(stream, &status) == cudaSuccess,
-              "CUDA error in cudaStreamIsCapturing");
+  FLASHINFER_CHECK(cudaStreamIsCapturing(stream, &status) == cudaSuccess,
+                   "CUDA error in cudaStreamIsCapturing");
   return status == cudaStreamCaptureStatus::cudaStreamCaptureStatusActive;
 }
 
@@ -137,7 +138,7 @@ inline void syncAndCheck(cudaStream_t stream, char const* const file, int const 
   if (doCheckError(stream)) {
     cudaStreamSynchronize(stream);
     auto error = cudaGetLastError();
-    TORCH_CHECK(error == cudaSuccess, "CUDA error in %s: %s", file, cudaGetErrorString(error));
+    FLASHINFER_CHECK(error == cudaSuccess, "CUDA error in %s: %s", file, cudaGetErrorString(error));
   }
 }
 

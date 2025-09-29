@@ -52,7 +52,7 @@ def gen_sampling_module() -> JitSpec:
         [
             jit_env.FLASHINFER_CSRC_DIR / "sampling.cu",
             jit_env.FLASHINFER_CSRC_DIR / "renorm.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "flashinfer_sampling_ops.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "flashinfer_sampling_binding.cu",
         ],
     )
 

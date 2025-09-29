@@ -22,7 +22,6 @@ from tests.test_helpers.jit_utils import (
 )
 from functools import partial
 import flashinfer
-from tvm_ffi import use_torch_stream
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -583,14 +582,14 @@ def test_cuda_graph_batch_decode_with_paged_kv_cache(
     # warmup
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
-    with use_torch_stream(torch.cuda.stream(s)):
+    with torch.cuda.stream(s):
         for _ in range(3):
             o = wrapper.run(q, kv_data)
     torch.cuda.current_stream().wait_stream(s)
 
     # capture
     g = torch.cuda.CUDAGraph()
-    with use_torch_stream(torch.cuda.graph(g)):
+    with torch.cuda.graph(g):
         o = wrapper.run(q, kv_data)
 
     # replay multiple times

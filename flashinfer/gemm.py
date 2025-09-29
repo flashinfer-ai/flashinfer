@@ -94,7 +94,7 @@ def gen_gemm_module() -> JitSpec:
         [
             jit_env.FLASHINFER_CSRC_DIR / "bmm_fp8.cu",
             jit_env.FLASHINFER_CSRC_DIR / "group_gemm.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "flashinfer_gemm_ops.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "flashinfer_gemm_binding.cu",
         ],
         extra_ldflags=["-lcublas", "-lcublasLt"],
     )
@@ -391,8 +391,8 @@ def gen_gemm_sm100_module() -> JitSpec:
         "gemm_groupwise_sm100.cu",
         "group_gemm_fp8_groupwise_sm100.cu",
         "group_gemm_mxfp4_groupwise_sm100.cu",
-        "gemm_sm100_pybind.cu",
-        "group_gemm_sm100_pybind.cu",
+        "gemm_sm100_binding.cu",
+        "group_gemm_sm100_binding.cu",
     ]:
         src_path = jit_env.FLASHINFER_CSRC_DIR / filename
         dest_path = gen_directory / filename
@@ -480,8 +480,8 @@ def gen_gemm_sm120_module() -> JitSpec:
     for filename in [
         "gemm_groupwise_sm120.cu",
         "group_gemm_fp8_groupwise_sm120.cu",
-        "gemm_sm120_pybind.cu",
-        "group_gemm_sm120_pybind.cu",
+        "gemm_sm120_binding.cu",
+        "group_gemm_sm120_binding.cu",
     ]:
         src_path = jit_env.FLASHINFER_CSRC_DIR / filename
         dest_path = gen_directory / filename
@@ -1084,7 +1084,7 @@ def gen_gemm_sm90_module() -> JitSpec:
         write_if_different(dest_path, source)
     for filename in [
         "group_gemm_sm90.cu",
-        "flashinfer_gemm_sm90_ops.cu",
+        "flashinfer_gemm_sm90_binding.cu",
     ]:
         src_path = jit_env.FLASHINFER_CSRC_DIR / filename
         dest_path = gen_directory / filename
