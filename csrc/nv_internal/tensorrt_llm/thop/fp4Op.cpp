@@ -306,7 +306,7 @@ void mxfp4_dequantize_host(Tensor weight, Tensor scale, Tensor dequant_weight, i
   CHECK_CPU_INPUT(scale, dl_uint8);
   CHECK_CONTIGUOUS(weight);
   CHECK_CONTIGUOUS(scale);
-  TVM_FFI_ICHECK_NE(weight.shape()->Product(), 0) << "weight should not be empty tensor";
+  TVM_FFI_ICHECK_NE(weight.shape().Product(), 0) << "weight should not be empty tensor";
   CHECK_INPUT_TYPE(weight, dl_uint8);
   CHECK_INPUT_TYPE(scale, dl_uint8);
 
@@ -324,7 +324,7 @@ void mxfp4_dequantize_host(Tensor weight, Tensor scale, Tensor dequant_weight, i
   float fp4_lut[] = {0.0, 0.5,  1.0,  1.5,  2.0,  3.0,  4.0,  6.0,
                      0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0};
 
-  for (int packed_idx = 0; packed_idx < weight.shape()->Product(); ++packed_idx) {
+  for (int packed_idx = 0; packed_idx < weight.shape().Product(); ++packed_idx) {
     int8_t weight_packed_data = weight_packed_ptr[packed_idx];
 
     uint8_t weight_low_ = weight_packed_data & 0xF;
