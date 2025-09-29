@@ -48,7 +48,9 @@ def temp_env_var(key: str, value: str):
             os.environ[key] = old_value
 
 
-def get_available_cubin_files(source: str, retries: int = 3, delay: int = 5, timeout: int = 10) -> tuple[str, ...]:
+def get_available_cubin_files(
+    source: str, retries: int = 3, delay: int = 5, timeout: int = 10
+) -> tuple[str, ...]:
     for attempt in range(1, retries + 1):
         try:
             response = requests.get(source, timeout=timeout)
@@ -64,7 +66,7 @@ def get_available_cubin_files(source: str, retries: int = 3, delay: int = 5, tim
             if attempt < retries:
                 logger.info(f"Retrying in {delay} seconds...")
                 time.sleep(delay)
-    
+
     # TODO: check if we really want to return an empty collection here instead of crashing.
     logger.error("Max retries reached. Fetch failed.")
     return tuple()
@@ -96,6 +98,7 @@ class MetaInfoHash:
         "0345358c916d990709f9670e113e93f35c76aa22715e2d5128ec2ca8740be5ba"
     )
 
+
 def get_cubin_file_list() -> Generator[str, None, None]:
     base = FLASHINFER_CUBINS_REPOSITORY
 
@@ -111,9 +114,7 @@ def get_cubin_file_list() -> Generator[str, None, None]:
         ArtifactPath.TRTLLM_GEN_GEMM,
         ArtifactPath.DEEPGEMM,
     ]:
-        for name in get_available_cubin_files(
-                safe_urljoin(base, kernel)
-            ):
+        for name in get_available_cubin_files(safe_urljoin(base, kernel)):
             yield safe_urljoin(kernel, name)
 
 

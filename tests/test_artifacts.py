@@ -1,8 +1,13 @@
-from flashinfer.artifacts import ArtifactPath, get_available_cubin_files, get_cubin_file_list
+from flashinfer.artifacts import (
+    ArtifactPath,
+    get_available_cubin_files,
+    get_cubin_file_list,
+)
 
 import responses
 
 from flashinfer.jit.cubin_loader import safe_urljoin
+
 
 def test_sanity_check_urllib_behavior():
     # We use safe_urljoin which ensures the base is always treated as a directory
@@ -24,17 +29,22 @@ def test_sanity_check_urllib_behavior():
     joined = safe_urljoin(base_with_trailing_slash, single_segment_with_leading_slash)
     assert joined == "https://example.com/file.txt"
 
-    joined = safe_urljoin(base_without_trailing_slash, single_segment_with_leading_slash)
+    joined = safe_urljoin(
+        base_without_trailing_slash, single_segment_with_leading_slash
+    )
     assert joined == "https://example.com/file.txt"
 
     joined = safe_urljoin(base_with_trailing_slash, multiple_segments)
     assert joined == "https://example.com/some/path/more/path/file.txt"
 
-    joined = safe_urljoin(safe_urljoin(base_with_trailing_slash, intermediate_segments), single_segment)
+    joined = safe_urljoin(
+        safe_urljoin(base_with_trailing_slash, intermediate_segments), single_segment
+    )
     assert joined == "https://example.com/some/path/more/path/file.txt"
 
     joined = safe_urljoin(intermediate_segments, single_segment)
     assert joined == "more/path/file.txt"
+
 
 # Fake but real-enough looking URL, these tests should not actually try to reach it.
 test_cubin_repository = "https://edge.urm.nvidia.com/artifactory/sw-kernelinferencelibrary-public-generic-unit-test"
@@ -202,6 +212,7 @@ expected_deepgemm_cubin_files = {
     "kernel.fp8_m_grouped_gemm.0457375eb02f.cubin",
 }
 
+
 def _mock_file_index_responses():
     gemm_source = safe_urljoin(test_cubin_repository, artifact_paths.TRTLLM_GEN_GEMM)
     responses.add(responses.GET, gemm_source, body=success_gemm_response, status=200)
@@ -210,22 +221,31 @@ def _mock_file_index_responses():
     bmm_source = safe_urljoin(test_cubin_repository, artifact_paths.TRTLLM_GEN_BMM)
     responses.add(responses.GET, bmm_source, body=success_bmm_response, status=200)
     deepgemm_source = safe_urljoin(test_cubin_repository, artifact_paths.DEEPGEMM)
-    responses.add(responses.GET, deepgemm_source, body=success_deepgemm_response, status=200)
+    responses.add(
+        responses.GET, deepgemm_source, body=success_deepgemm_response, status=200
+    )
+
 
 @responses.activate
 def test_get_available_cubin_files():
     _mock_file_index_responses()
     source = safe_urljoin(test_cubin_repository, artifact_paths.TRTLLM_GEN_GEMM)
-    available_cubin_files = get_available_cubin_files(source, retries=3, delay=0, timeout=5)
+    available_cubin_files = get_available_cubin_files(
+        source, retries=3, delay=0, timeout=5
+    )
     assert len(available_cubin_files) == 3
-    
+
     # Check that all expected files are present
     actual_cubin_files = set(available_cubin_files)
-    assert actual_cubin_files == expected_gemm_cubin_files, f"Expected files: {expected_gemm_cubin_files}, but got: {actual_cubin_files}"
-    
+    assert actual_cubin_files == expected_gemm_cubin_files, (
+        f"Expected files: {expected_gemm_cubin_files}, but got: {actual_cubin_files}"
+    )
+
     # Check that each individual expected file is in the results
     for expected_file in expected_gemm_cubin_files:
-        assert expected_file in available_cubin_files, f"Expected cubin file '{expected_file}' not found in results"
+        assert expected_file in available_cubin_files, (
+            f"Expected cubin file '{expected_file}' not found in results"
+        )
 
 
 @responses.activate
@@ -233,22 +253,28 @@ def test_get_available_cubin_files_non_200_response():
     """Test that non-200 response codes return an empty tuple."""
     gemm_path = "037e528e719ec3456a7d7d654f26b805e44c63b1/gemm-8704aa4-f91dc9e/"
     source = safe_urljoin(test_cubin_repository, gemm_path)
-    
+
     # Test 404 Not Found
     responses.add(responses.GET, source, status=404)
-    available_cubin_files = get_available_cubin_files(source, retries=1, delay=0, timeout=5)
+    available_cubin_files = get_available_cubin_files(
+        source, retries=1, delay=0, timeout=5
+    )
     assert available_cubin_files == ()
-    
+
     # Reset responses and test 500 Internal Server Error
     responses.reset()
     responses.add(responses.GET, source, status=500)
-    available_cubin_files = get_available_cubin_files(source, retries=1, delay=0, timeout=5)
+    available_cubin_files = get_available_cubin_files(
+        source, retries=1, delay=0, timeout=5
+    )
     assert available_cubin_files == ()
-    
+
     # Reset responses and test 403 Forbidden
     responses.reset()
     responses.add(responses.GET, source, status=403)
-    available_cubin_files = get_available_cubin_files(source, retries=1, delay=0, timeout=5)
+    available_cubin_files = get_available_cubin_files(
+        source, retries=1, delay=0, timeout=5
+    )
     assert available_cubin_files == ()
 
 
@@ -256,27 +282,45 @@ def test_get_available_cubin_files_non_200_response():
 def test_get_cubin_file_list(monkeypatch):
     _mock_file_index_responses()
     from flashinfer import artifacts
-    monkeypatch.setattr(artifacts, 'FLASHINFER_CUBINS_REPOSITORY', test_cubin_repository)
+
+    monkeypatch.setattr(
+        artifacts, "FLASHINFER_CUBINS_REPOSITORY", test_cubin_repository
+    )
     cubin_files = list(get_cubin_file_list())
 
     # Check that all the cubin's are in there.
     for expected_file_name in expected_gemm_cubin_files:
         expected_file_path = artifact_paths.TRTLLM_GEN_GEMM + "/" + expected_file_name
-        assert any(expected_file_path in url for url in cubin_files), f"Expected cubin file '{expected_file_path}' not found in cubin file list"
+        assert any(expected_file_path in url for url in cubin_files), (
+            f"Expected cubin file '{expected_file_path}' not found in cubin file list"
+        )
 
     for expected_file_name in expected_fmha_cubin_files:
         expected_file_path = artifact_paths.TRTLLM_GEN_FMHA + "/" + expected_file_name
-        assert any(expected_file_path in url for url in cubin_files), f"Expected cubin file '{expected_file_path}' not found in cubin file list"
+        assert any(expected_file_path in url for url in cubin_files), (
+            f"Expected cubin file '{expected_file_path}' not found in cubin file list"
+        )
 
     for expected_file_name in expected_bmm_cubin_files:
         expected_file_path = artifact_paths.TRTLLM_GEN_BMM + "/" + expected_file_name
-        assert any(expected_file_path in url for url in cubin_files), f"Expected cubin file '{expected_file_path}' not found in cubin file list"
+        assert any(expected_file_path in url for url in cubin_files), (
+            f"Expected cubin file '{expected_file_path}' not found in cubin file list"
+        )
 
     for expected_file_name in expected_deepgemm_cubin_files:
         expected_file_path = artifact_paths.DEEPGEMM + "/" + expected_file_name
-        assert any(expected_file_path in url for url in cubin_files), f"Expected cubin file '{expected_file_path}' not found in cubin file list"
+        assert any(expected_file_path in url for url in cubin_files), (
+            f"Expected cubin file '{expected_file_path}' not found in cubin file list"
+        )
 
     # Check that the meta info headers are included (note the inconsistent casing in the actual function)
     # Capitalization is inconsistent in the actual filenames, so we check for both variants.
-    meta_info_headers = [url for url in cubin_files if "include/flashInferMetaInfo.h" in url or "include/flashinferMetaInfo.h" in url]
-    assert len(meta_info_headers) == 3, f"Meta info headers count mismatch. Expected 3, got {len(meta_info_headers)}. Headers found: {meta_info_headers}"
+    meta_info_headers = [
+        url
+        for url in cubin_files
+        if "include/flashInferMetaInfo.h" in url
+        or "include/flashinferMetaInfo.h" in url
+    ]
+    assert len(meta_info_headers) == 3, (
+        f"Meta info headers count mismatch. Expected 3, got {len(meta_info_headers)}. Headers found: {meta_info_headers}"
+    )

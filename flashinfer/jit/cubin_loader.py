@@ -33,14 +33,22 @@ FLASHINFER_CUBINS_REPOSITORY = os.environ.get(
     "https://edge.urm.nvidia.com/artifactory/sw-kernelinferencelibrary-public-generic-local/",
 )
 
+
 def safe_urljoin(base, path):
     """Join URLs ensuring base is treated as a directory."""
-    if not base.endswith('/'):
-        base += '/'
+    if not base.endswith("/"):
+        base += "/"
     return urljoin(base, path)
 
+
 def download_file(
-    source: str, local_path: str, retries: int = 3, delay: int = 5, timeout: int = 10, lock_timeout: int = 30, session=None
+    source: str,
+    local_path: str,
+    retries: int = 3,
+    delay: int = 5,
+    timeout: int = 10,
+    lock_timeout: int = 30,
+    session=None,
 ):
     """
     Downloads a file from a URL or copies from a local path to a destination.
