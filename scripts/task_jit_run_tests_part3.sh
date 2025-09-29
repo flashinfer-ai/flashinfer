@@ -7,4 +7,4 @@ set -x
 
 pip install -e . -v
 
-pytest -s tests/test_sampling.py
+pytest -s tests/utils/test_sampling.py
