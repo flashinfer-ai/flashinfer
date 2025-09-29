@@ -324,7 +324,8 @@ void mxfp4_dequantize_host(Tensor weight, Tensor scale, Tensor dequant_weight, i
   float fp4_lut[] = {0.0, 0.5,  1.0,  1.5,  2.0,  3.0,  4.0,  6.0,
                      0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0};
 
-  for (int packed_idx = 0; packed_idx < weight.shape().Product(); ++packed_idx) {
+  const auto num_packed_elements = weight.shape().Product();
+  for (int packed_idx = 0; packed_idx < num_packed_elements; ++packed_idx) {
     int8_t weight_packed_data = weight_packed_ptr[packed_idx];
 
     uint8_t weight_low_ = weight_packed_data & 0xF;
