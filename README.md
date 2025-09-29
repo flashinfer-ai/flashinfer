@@ -80,7 +80,7 @@ Run the following command to install micromamba and set it up inside `bash`
 source ~/.bashrc
 ```
 After installing micromamba a custom environment for FlashInfer+ROCm
-development should be setup. The micromamba environment is used to only manage 
+development should be setup. The micromamba environment is used to only manage
 the Python version, rest of the dependencies are installed using `pip`.
 
 ```bash
@@ -100,14 +100,14 @@ Clone the latest trunk from https://github.com/ROCm/flashinfer.
 git clone https://github.com/ROCm/flashinfer
 cd flashinfer/
 ```
-The Flashinfer+ROCm library can be built in two ways: with ahead-of-time (AOT) 
+The Flashinfer+ROCm library can be built in two ways: with ahead-of-time (AOT)
 compiled kernels and without any AOT kernels.
 
-Building the library with AOT kernels will take more time and local disk space 
-as several common configurations of the core Flashinfer kernels are built 
+Building the library with AOT kernels will take more time and local disk space
+as several common configurations of the core Flashinfer kernels are built
 during installation.
 
-When building without AOT compilation, every kernel will be just-in-time (JIT) 
+When building without AOT compilation, every kernel will be just-in-time (JIT)
 compiled at the time of first use.
 
 * Instructions to build with AOT are as follows:

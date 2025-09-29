@@ -1,16 +1,21 @@
 import torch
+
 import flashinfer
 
+
 def verify_tensors(tensor1, tensor2, rtol=1e-3, atol=1e-3):
-    
+
     for i in range(tensor1.shape[0]):
         for j in range(tensor1.shape[1]):
-            if torch.abs(tensor1[i][j] - tensor2[i][j]) > atol + rtol * torch.abs(tensor2[i][j]):
+            if torch.abs(tensor1[i][j] - tensor2[i][j]) > atol + rtol * torch.abs(
+                tensor2[i][j]
+            ):
                 print(f"Error at {i}, {j}")
                 print(f"Expected: {tensor2[i][j]}")
                 print(f"Got: {tensor1[i][j]}")
                 return False
     return True
+
 
 def test_batch_decode_with_paged_kv_cache(
     batch_size,
@@ -119,10 +124,7 @@ def test_batch_decode_with_paged_kv_cache(
             dim=0,
         ).to(kv_dtype)
         # print(qi.shape, ki.shape, vi.shape)
-        o_ref_i = flashinfer.single_decode_with_kv_cache(
-            qi,
-            ki,
-            vi)
+        o_ref_i = flashinfer.single_decode_with_kv_cache(qi, ki, vi)
         # torch.testing.assert_close(o[i], o_ref_i, rtol=1e-3, atol=1e-3)
         result += verify_tensors(o[i], o_ref_i, rtol=1e-3, atol=1e-3)
 
@@ -136,14 +138,15 @@ def test_batch_decode_with_paged_kv_cache(
     else:
         print("FAIL")
 
+
 if __name__ == "__main__":
 
     batch_size = 256
-    page_size = 8   
+    page_size = 8
 
     # # This configuration works
-    num_qo_heads = 32 
-    num_kv_heads = 4 
+    num_qo_heads = 32
+    num_kv_heads = 4
     head_dim = 256
     kv_len = 512
 
@@ -152,7 +155,7 @@ if __name__ == "__main__":
     # num_kv_heads = 8
     # head_dim = 128
     # kv_len = 54
-    
+
     kv_layout = "NHD"
     pos_encoding_mode = "NONE"
     logits_soft_cap = 0.0
@@ -160,9 +163,9 @@ if __name__ == "__main__":
     q_dtype = torch.float16
     kv_dtype = torch.float16
     contiguous_kv = True
-    
-    num_qo_heads = 32 
-    num_kv_heads = 4 
+
+    num_qo_heads = 32
+    num_kv_heads = 4
     head_dim = 256
     kv_len = 512
     test_batch_decode_with_paged_kv_cache(
@@ -178,5 +181,5 @@ if __name__ == "__main__":
         return_lse,
         q_dtype,
         kv_dtype,
-        contiguous_kv)
-    
+        contiguous_kv,
+    )

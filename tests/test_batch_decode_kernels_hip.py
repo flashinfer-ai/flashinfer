@@ -16,11 +16,10 @@ limitations under the License.
 
 import pytest
 import torch
-from jit_utils import (
-    jit_decode_attention_func_args
-)
+from jit_utils import jit_decode_attention_func_args
 
 import flashinfer
+
 
 @pytest.fixture(autouse=True, scope="module")
 def warmup_jit():
@@ -318,6 +317,7 @@ def test_batch_decode_with_tuple_paged_kv_cache(
         )
         torch.testing.assert_close(o[i], o_ref_i, rtol=1e-3, atol=1e-3)
 
+
 if __name__ == "__main__":
     test_batch_decode_with_paged_kv_cache(
         256,
@@ -395,4 +395,3 @@ if __name__ == "__main__":
         torch.float16,
         True,
     )
-

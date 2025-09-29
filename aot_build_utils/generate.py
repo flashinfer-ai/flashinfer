@@ -252,11 +252,14 @@ def get_instantiation_cu(args: argparse.Namespace) -> List[str]:
                             f"use_logits_cap_{logits_soft_cap}_"
                             f"f16qk_{bool(use_fp16_qk_reduction)}"
                         )
-    final_list = single_decode_uris + batch_decode_uris + single_prefill_uris + batch_prefill_uris
-    print(final_list)
-    return (
-        final_list
+    final_list = (
+        single_decode_uris
+        + batch_decode_uris
+        + single_prefill_uris
+        + batch_prefill_uris
     )
+    print(final_list)
+    return final_list
 
 
 if __name__ == "__main__":

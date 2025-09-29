@@ -103,7 +103,6 @@ def test_fused_add_rmsnorm(batch_size, hidden_size, dtype, enable_pdl, contiguou
         x = torch.randn(batch_size, hidden_size * 2, device="cuda").to(dtype)
         x = x[:, :hidden_size]
 
-
     residual = torch.randn_like(x)
     weight = torch.randn(hidden_size, dtype=dtype, device="cuda")
 
