@@ -938,17 +938,13 @@ def dequantize_block(
 @pytest.mark.parametrize("num_experts", NUM_EXPERTS)
 @pytest.mark.parametrize("top_k", TOP_K_VALUES)
 @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
-@pytest.mark.skipif(
-    torch.cuda.get_device_capability()[0] not in [10, 11, 12],
-    reason="FP8 block scaling is only supported on SM100, SM110 and SM120",
-)
 def test_moe_fp8_block_scaling(
     batch_size, hidden_size, num_experts, top_k, intermediate_size
 ):
     """
     Test MoE with FP8 block scaling (Deepseek style):
-    - Activation: 128x1 blocks
-    - Weights: 128x128 blocks
+    - Activation: BF16 (unquantized)
+    - Weights: FP8 with 128x128 block scaling
     - Each block has its own scaling factor
 
     Args:
@@ -957,7 +953,6 @@ def test_moe_fp8_block_scaling(
         num_experts: Number of experts
         top_k: Number of experts to route to per token
         intermediate_size: Intermediate dimension size
-        Only support bf16 for hidden_states
     """
     torch.manual_seed(42)
     otype = torch.bfloat16
@@ -965,12 +960,10 @@ def test_moe_fp8_block_scaling(
     x = torch.randn(batch_size, hidden_size, dtype=otype).cuda()
 
     w31_weight = (
-        torch.randn(num_experts, 2 * intermediate_size, hidden_size, dtype=otype).cuda()
-        / 10
+        torch.randn(num_experts, 2 * intermediate_size, hidden_size, dtype=otype).cuda() / 10
     )
     w2_weight = (
-        torch.randn(num_experts, hidden_size, intermediate_size, dtype=otype).cuda()
-        / 10
+        torch.randn(num_experts, hidden_size, intermediate_size, dtype=otype).cuda() / 10
     )
 
     # Generate unique random expert indices for each token
@@ -981,11 +974,6 @@ def test_moe_fp8_block_scaling(
     routing_weights = torch.randn((batch_size, top_k)).cuda()
     routing_weights = F.softmax(routing_weights, dim=1)
 
-    # Run reference implementation (no quantization)
-    _ref_output = compute_with_experts(
-        num_experts, x, w31_weight, w2_weight, selected_experts, routing_weights
-    )
-
     # Quantize input and weights
     x_quant, x_scales = per_token_group_quant_fp8(x, group_size=128)
 
@@ -993,13 +981,13 @@ def test_moe_fp8_block_scaling(
     w2_dequant = torch.empty_like(w2_weight)
     w31_quant = torch.empty_like(w31_weight).to(torch.float8_e4m3fn)
     w2_quant = torch.empty_like(w2_weight).to(torch.float8_e4m3fn)
-    w31_scales = torch.randn(
+    w31_scales = torch.zeros(
         num_experts,
         ceil_div(2 * intermediate_size, 128),
         ceil_div(hidden_size, 128),
         dtype=torch.float32,
     ).cuda()
-    w2_scales = torch.randn(
+    w2_scales = torch.zeros(
         num_experts,
         ceil_div(hidden_size, 128),
         ceil_div(intermediate_size, 128),
@@ -1013,7 +1001,7 @@ def test_moe_fp8_block_scaling(
         w31_scales.data[expert_id].copy_(w31_s)
         w2_quant.data[expert_id].copy_(w2)
         w2_scales.data[expert_id].copy_(w2_s)
-    # Dequantize for verificationa
+    # Dequantize for verification
     x_dequant = dequantize_block(x_quant, x_scales, x.dtype, x.shape)
     w31_dequant = dequantize_block(
         w31_quant, w31_scales, w31_weight.dtype, w31_weight.shape
@@ -1021,7 +1009,7 @@ def test_moe_fp8_block_scaling(
     w2_dequant = dequantize_block(w2_quant, w2_scales, w2_weight.dtype, w2_weight.shape)
 
     # Run reference implementation with dequantized tensors
-    _ref_output = compute_with_experts(
+    ref_output = compute_with_experts(
         num_experts,
         x_dequant,
         w31_dequant,
@@ -1029,29 +1017,21 @@ def test_moe_fp8_block_scaling(
         selected_experts,
         routing_weights,
     )
-    quant_scales = [
-        w31_scales,  # .view(-1),  # W31 scales
-        w2_scales,  # .view(-1),  # W2 scales
-    ]
 
-    # Call flashinfer implementation with block scaling and expect NotImplementedError
-    with pytest.raises(
-        NotImplementedError,
-        match="DeepSeek FP8 Block Scaling is not yet implemented in CUTLASS for Blackwell",
-    ):
-        _ = fused_moe.cutlass_fused_moe(
-            x.contiguous(),
-            selected_experts.to(torch.int),
-            routing_weights,
-            w31_quant.contiguous(),
-            w2_quant.contiguous(),
-            otype,
-            tp_size=1,
-            tp_rank=0,
-            use_deepseek_fp8_block_scale=True,
-            quant_scales=quant_scales,
-        )
+    flash_output = torch.zeros_like(x)
+    _ = fused_moe.cutlass_fused_moe(
+        x.contiguous(),
+        selected_experts.to(torch.int),
+        routing_weights,
+        w31_quant.contiguous(),
+        w2_quant.contiguous(),
+        otype,
+        use_deepseek_fp8_block_scale=True,
+        quant_scales=[w31_scales.contiguous(), w2_scales.contiguous()],
+        output=flash_output,
+    )
 
+    torch.testing.assert_close(flash_output, ref_output, rtol=1e-1, atol=1e-1)
 
 def quant_mxfp4_batches(a, num_experts):
     quant_a = []

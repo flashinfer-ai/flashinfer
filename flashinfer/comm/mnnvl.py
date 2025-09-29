@@ -25,7 +25,7 @@ from typing import Any, Dict, List, Optional, TYPE_CHECKING
 import torch
 
 try:
-    from cuda import cuda
+    import cuda as cuda
 except ImportError as e:
     raise ImportError(
         "Could not import the 'cuda' module. "

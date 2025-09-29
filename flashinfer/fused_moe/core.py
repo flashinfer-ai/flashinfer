@@ -348,7 +348,7 @@ def gen_cutlass_fused_moe_module(
             jit_env.FLASHINFER_CSRC_DIR
             / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp16_fp4.cu",
             jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm_stub.cu",
+            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.cu",
             jit_env.FLASHINFER_CSRC_DIR
             / "fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_sm100_ops.cu",
             jit_env.FLASHINFER_CSRC_DIR
@@ -369,7 +369,7 @@ def gen_cutlass_fused_moe_module(
         ],
         extra_cuda_cflags=nvcc_flags,
         extra_cflags=["-DFAST_BUILD"] if use_fast_build else [],
-        extra_ldflags=["-lcuda"],
+        extra_ldflags=["-lcuda", "-lnvrtc"],
         extra_include_paths=[
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "include",
@@ -860,10 +860,6 @@ def cutlass_fused_moe(
     - Currently, some advanced features like FP8 block scaling and minimum latency mode
         are not implemented for Blackwell architecture.
     """
-    if use_deepseek_fp8_block_scale:
-        raise NotImplementedError(
-            "DeepSeek FP8 Block Scaling is not yet implemented in CUTLASS for Blackwell."
-        )
     if min_latency_mode:
         raise NotImplementedError("min latency mode not yet implemented for Blackwell.")
 
