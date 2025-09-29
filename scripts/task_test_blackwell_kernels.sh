@@ -15,7 +15,7 @@ if [[ "$1" == "--dry-run" ]] || [[ "${DRY_RUN}" == "true" ]]; then
 fi
 
 if [ "$DRY_RUN" != "true" ]; then
-    pip install -e . -v
+    pip install -e . -v --no-deps
 fi
 
 EXIT_CODE=0
