@@ -11,6 +11,7 @@ from flashinfer import (
     mxfp4_quantize,
     mxfp4_dequantize,
     nvfp4_batched_quantize,
+    silu_and_mul_fp4_batched_quantize,
 )
 from flashinfer.utils import is_sm100a_supported
 
@@ -316,12 +317,14 @@ def test_mxfp4_quantize_roundtrip(device: str):
 @pytest.mark.parametrize("batch_shape", BATCH_SHAPES)
 @pytest.mark.parametrize("seed", SEEDS)
 @pytest.mark.parametrize("device", CUDA_DEVICES)
+@pytest.mark.parametrize("use_mask", [False, True])
 @torch.inference_mode()
 def test_nvfp4_batched_quantize(
     dtype: torch.dtype,
     batch_shape: tuple[int, int, int],
     seed: int,
     device: str,
+    use_mask: bool,
 ) -> None:
     """Test nvfp4_batched_quantize function."""
     if not is_sm100a_supported(torch.device(device)):
@@ -333,9 +336,15 @@ def test_nvfp4_batched_quantize(
     x = torch.randn(batch_shape, dtype=dtype)
     tensor_amax = torch.abs(x).max().to(torch.float32)
     global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax
-
+    mask = None
     # Test the batched quantization
-    out, out_scale = nvfp4_batched_quantize(x, global_scale)
+    if use_mask:
+        mask = torch.randint(
+            low=1, high=m + 1, size=(b,), dtype=torch.int32, device=device
+        )
+        out, out_scale = nvfp4_batched_quantize(x, global_scale, mask=mask)
+    else:
+        out, out_scale = nvfp4_batched_quantize(x, global_scale)
 
     # Basic shape checks
     assert out.shape == (
@@ -349,9 +358,77 @@ def test_nvfp4_batched_quantize(
     # Compare with single tensor quantization for each batch
     for i in range(b):
         single_out, single_scale = fp4_quantize(x[i], global_scale, 16, False, True)
-        torch.testing.assert_close(out[i], single_out, rtol=1e-5, atol=1e-5)
+        if use_mask:
+            torch.testing.assert_close(
+                out[i][: mask[i]], single_out[: mask[i]], rtol=1e-5, atol=1e-5
+            )
+            scale_ref = unswizzle_sf(single_scale, m, n)
+            scale_ans = unswizzle_sf(out_scale[i], m, n)
+            torch.testing.assert_close(scale_ref[: mask[i]], scale_ans[: mask[i]])
+        else:
+            torch.testing.assert_close(out[i], single_out, rtol=1e-5, atol=1e-5)
+            torch.testing.assert_close(
+                out_scale[i], single_scale.flatten(), rtol=1e-5, atol=1e-5
+            )
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("batch_shape", BATCH_SHAPES)
+@pytest.mark.parametrize("seed", SEEDS)
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_silu_and_mul_fp4_batched_quantize(
+    dtype: torch.dtype,
+    batch_shape: tuple[int, int, int],
+    seed: int,
+    device: str,
+) -> None:
+    """Test silu_and_mul_fp4_batched_quantize function."""
+    if not is_sm100a_supported(torch.device(device)):
+        pytest.skip("Nvfp4 Requires compute capability of 10 or above")
+    torch.set_default_device(device)
+    torch.manual_seed(seed)
+
+    b, m, n = batch_shape
+    x = torch.randn((b, m, n * 2), dtype=dtype)
+    mask = torch.randint(low=1, high=m + 1, size=(b,), dtype=torch.int32, device=device)
+    from flashinfer import silu_and_mul
+
+    ref_y = silu_and_mul(x)
+
+    tensor_amax = ref_y.abs().amax(dim=(1, 2)).to(torch.float32)
+    global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax
+
+    out, out_scale = silu_and_mul_fp4_batched_quantize(x, mask, global_scale)
+    ref_out, ref_out_scale = nvfp4_batched_quantize(
+        ref_y,
+        global_scale,
+        mask=mask,
+    )
+    # Basic shape checks
+    assert out.shape == (b, m, n // 2), f"Expected shape {(b, m, n)}, got {out.shape}"
+    assert out.dtype == torch.uint8, f"Expected uint8, got {out.dtype}"
+    assert out_scale.dtype == torch.uint8, f"Expected uint8, got {out_scale.dtype}"
+
+    # Compare with single tensor quantization for each batch
+    for i in range(b):
+        x_silu_mul = silu_and_mul(x[i])
+        single_out, single_scale = fp4_quantize(
+            x_silu_mul, global_scale, 16, False, True
+        )
         torch.testing.assert_close(
-            out_scale[i], single_scale.flatten(), rtol=1e-5, atol=1e-5
+            out[i][: mask[i]], single_out[: mask[i]], rtol=1e-5, atol=1e-5
+        )
+        torch.testing.assert_close(
+            out[i][: mask[i]], ref_out[i][: mask[i]], rtol=1e-5, atol=1e-5
+        )
+
+        scale_ref = unswizzle_sf(single_scale, m, n)
+        scale_ans = unswizzle_sf(out_scale[i], m, n)
+        ref_out_scale_expert = unswizzle_sf(ref_out_scale[i], m, n)
+        torch.testing.assert_close(scale_ref[: mask[i]], scale_ans[: mask[i]])
+        torch.testing.assert_close(
+            ref_out_scale_expert[: mask[i]], scale_ans[: mask[i]]
         )
 
 
