@@ -1,8 +1,6 @@
 import pytest
 import torch
-from jit_utils import (
-    jit_decode_attention_func_args
-)
+from jit_utils import jit_decode_attention_func_args
 
 import flashinfer
 
