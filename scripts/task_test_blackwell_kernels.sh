@@ -82,12 +82,12 @@ if [ "$DRY_RUN" == "true" ]; then
     echo "=========================================="
 
     for test_dir in $TEST_DIRS; do
-        if [ "$test_dir" == "tests/utils" ]; then
-            # Run utils tests individually for debugging
+        if [ "$test_dir" == "tests/utils" ] || [ "$test_dir" == "tests/comm" ]; then
+            # Run utils and comm tests individually for debugging
             echo ""
-            echo "📝 NOTE: tests/utils will be run individually for debugging"
-            utils_files=$(find "$test_dir" -maxdepth 1 -name "test_*.py" -type f | sort)
-            for test_file in $utils_files; do
+            echo "📝 NOTE: $test_dir will be run individually for debugging"
+            test_files=$(find "$test_dir" -maxdepth 1 -name "test_*.py" -type f | sort)
+            for test_file in $test_files; do
                 TOTAL_TESTS=$((TOTAL_TESTS + 1))
                 echo "$TOTAL_TESTS. pytest $test_file"
             done
@@ -110,14 +110,14 @@ if [ "$DRY_RUN" == "true" ]; then
     echo "Or set DRY_RUN=false $0"
 else
     for test_dir in $TEST_DIRS; do
-        if [ "$test_dir" == "tests/utils" ]; then
-            # Run utils tests individually for debugging
+        if [ "$test_dir" == "tests/utils" ] || [ "$test_dir" == "tests/comm" ]; then
+            # Run utils and comm tests individually for debugging
             echo "=========================================="
-            echo "Running tests/utils individually for debugging"
+            echo "Running $test_dir individually for debugging"
             echo "=========================================="
 
-            utils_files=$(find "$test_dir" -maxdepth 1 -name "test_*.py" -type f | sort)
-            for test_file in $utils_files; do
+            test_files=$(find "$test_dir" -maxdepth 1 -name "test_*.py" -type f | sort)
+            for test_file in $test_files; do
                 echo "Running: pytest $test_file"
                 TOTAL_TESTS=$((TOTAL_TESTS + 1))
 
