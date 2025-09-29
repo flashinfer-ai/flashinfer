@@ -18,6 +18,7 @@
 
 #include <string>
 
+#include "flashinfer/exception.h"
 #include "flashinfer/trtllm/common.h"
 #include "flashinfer/trtllm/gemm/trtllmGen_gemm_export/Enums.h"
 #include "flashinfer/trtllm/gemm/trtllmGen_gemm_export/GemmInterface.h"
@@ -101,15 +102,16 @@ class TrtllmGenGemmRunner {
       }
     }
 
-    TORCH_CHECK(mPassingConfigIndices.size() > 0,
-                "No valid tactic found for the given options (precision, transpose, sf layout)");
+    FLASHINFER_CHECK(
+        mPassingConfigIndices.size() > 0,
+        "No valid tactic found for the given options (precision, transpose, sf layout)");
   }
 
   int64_t getWorkspaceSizeInBytes(int64_t m, int64_t n, int64_t k, int64_t tactic) {
     auto gemm = gemm::gemm::GemmInterface();
     auto const configs = gemm.getGemmConfigs();
-    TORCH_CHECK(tactic >= 0 && tactic < gemm.getNumGemmConfigs(),
-                "Invalid tactic in getWorkspaceSizeInBytes");
+    FLASHINFER_CHECK(tactic >= 0 && tactic < gemm.getNumGemmConfigs(),
+                     "Invalid tactic in getWorkspaceSizeInBytes");
     auto const config = configs[tactic];
 
     gemm::gemm::GemmData gemmData;

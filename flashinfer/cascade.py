@@ -32,7 +32,7 @@ def gen_cascade_module() -> JitSpec:
         "cascade",
         [
             jit_env.FLASHINFER_CSRC_DIR / "cascade.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "flashinfer_cascade_ops.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "flashinfer_cascade_binding.cu",
         ],
     )
 

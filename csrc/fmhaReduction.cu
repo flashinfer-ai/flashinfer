@@ -17,6 +17,7 @@
 #include <cuda_runtime_api.h>
 #include <float.h>
 
+#include "flashinfer/exception.h"
 #include "flashinfer/trtllm/common/cudaTypeUtils.cuh"
 #include "flashinfer/trtllm/common/cudaUtils.h"
 #include "flashinfer/trtllm/fmha/fmhaReduction.h"
@@ -257,16 +258,16 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2)
     } else if (kernelMeta.mDataTypeO == DATA_TYPE_BF16) {                                         \
       kernel = &fmhaReductionKernel<64, 512, HeadDimPerCta, true, __nv_bfloat16, __nv_bfloat16>;  \
     } else {                                                                                      \
-      TORCH_CHECK(false, "Not implemented");                                                      \
+      FLASHINFER_CHECK(false, "Not implemented");                                                 \
     }                                                                                             \
   } else {                                                                                        \
-    TORCH_CHECK(kernelMeta.mDataTypeQ == kernelMeta.mDataTypeO, "Not implemented");               \
+    FLASHINFER_CHECK(kernelMeta.mDataTypeQ == kernelMeta.mDataTypeO, "Not implemented");          \
     if (kernelMeta.mDataTypeQ == DATA_TYPE_FP16) {                                                \
       kernel = &fmhaReductionKernel<64, 512, HeadDimPerCta, false, half, half>;                   \
     } else if (kernelMeta.mDataTypeQ == DATA_TYPE_BF16) {                                         \
       kernel = &fmhaReductionKernel<64, 512, HeadDimPerCta, false, __nv_bfloat16, __nv_bfloat16>; \
     } else {                                                                                      \
-      TORCH_CHECK(false, "Not implemented");                                                      \
+      FLASHINFER_CHECK(false, "Not implemented");                                                 \
     }                                                                                             \
   }
 
@@ -282,18 +283,18 @@ void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, KernelParams 
 
   // This should only be enabled when the keepsMmaAbForGeneration MLA kernel (either 1-CTA or 2-CTA)
   // is used.
-  TORCH_CHECK(
+  FLASHINFER_CHECK(
       kernelMeta.mHeadDimQk == 576 && kernelMeta.mHeadDimV == 512 &&
           isKeepsMmaAbForGenerationKernel(static_cast<FmhaKernelType>(kernelMeta.mKernelType)),
       "Not implemented");
   // The tileSizeQ and tileSizeKv should be 64 and 128 for those kernels.
-  TORCH_CHECK(kernelMeta.mTileSizeQ == 64 && kernelMeta.mTileSizeKv == 128, "Not implemented");
+  FLASHINFER_CHECK(kernelMeta.mTileSizeQ == 64 && kernelMeta.mTileSizeKv == 128, "Not implemented");
 
   // The headDimPerCtaV.
   int32_t const headDimPerCtaV =
       kernelMeta.m2CtaMma ? kernelMeta.mHeadDimPerCtaV * 2 : kernelMeta.mHeadDimPerCtaV;
-  TORCH_CHECK(headDimPerCtaV == 128 || headDimPerCtaV == 256 || headDimPerCtaV == 512,
-              "Not implemented");
+  FLASHINFER_CHECK(headDimPerCtaV == 128 || headDimPerCtaV == 256 || headDimPerCtaV == 512,
+                   "Not implemented");
 
   // The number of slices for the reduction work.
   int32_t const numSlices = (headDimPerCtaV * /* bytesPerPartialElt */ 2 * kernelMeta.mTileSizeQ) /
@@ -348,7 +349,7 @@ void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, KernelParams 
   cudaLaunchKernelEx(&config, kernel, params, numCtasForReduction, numCtasForAllHeads,
                      numHeadDimCtasV);
   cudaError_t err = cudaGetLastError();
-  TORCH_CHECK(err == cudaSuccess, "Failed to launch kernel: ", cudaGetErrorString(err));
+  FLASHINFER_CHECK(err == cudaSuccess, "Failed to launch kernel: ", cudaGetErrorString(err));
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

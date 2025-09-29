@@ -16,6 +16,7 @@
 
 #include <iostream>
 
+#include "flashinfer/exception.h"
 #include "flashinfer/trtllm/batched_gemm/KernelRunner.h"
 #include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
 #include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/trtllm/gen/SfLayoutDecl.h"
@@ -38,7 +39,7 @@ inline int32_t computeLog2(int32_t val, std::string const& name = "") {
   while (n >>= 1) {
     ++out;
   }
-  TORCH_CHECK((1 << out) == val, "Expected ", name, " to be a power of 2, got ", val);
+  FLASHINFER_CHECK((1 << out) == val, "Expected ", name, " to be a power of 2, got ", val);
   return out;
 }
 }  // namespace
@@ -57,8 +58,8 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
                  int32_t* numNonExitingCtas, btg::Dtype dtypeElt, bool useRoutingScalesOnInput,
                  bool useDeepSeekFp8, RoutingMethodType routingMethodType, cudaStream_t stream) {
   if (routingMethodType == RoutingMethodType::DeepSeekV3) {
-    TORCH_CHECK(topK <= 8, "For DeepSeek routing method, must have topK <= 8");
-    TORCH_CHECK(topkGroup <= 4, "For DeepSeek routing method, must have topkGroup <= 4");
+    FLASHINFER_CHECK(topK <= 8, "For DeepSeek routing method, must have topK <= 8");
+    FLASHINFER_CHECK(topkGroup <= 4, "For DeepSeek routing method, must have topkGroup <= 4");
     moe::dev::routing::routingDeepSeek::Data routingData;
     routingData.mDtypeExpW = btg::Dtype::Bfloat16;
     routingData.mUsePdl = true;
@@ -91,10 +92,10 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mUseRoutingSoftmax = false;
     moe::dev::routing::routingDeepSeek::run(routingData, stream);
   } else if (routingMethodType == RoutingMethodType::Llama4) {
-    TORCH_CHECK(topK == 1, "For Llama routing method, must have topK == 1");
+    FLASHINFER_CHECK(topK == 1, "For Llama routing method, must have topK == 1");
     if (nGroup > 0 || topkGroup > 0) {
-      TORCH_WARN("For Llama routing method, nGroup/topkGroup is ignored, got ", nGroup, "/",
-                 topkGroup);
+      FLASHINFER_WARN("For Llama routing method, nGroup/topkGroup is ignored, got ", nGroup, "/",
+                      topkGroup);
     }
     moe::dev::routing::routingLlama4::Data routingData;
     routingData.mDtypeExpW = btg::Dtype::Bfloat16;
@@ -170,9 +171,9 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
 
     moe::dev::routing::routingRenormalize::run(routingData, stream);
   } else {
-    TORCH_CHECK(false, "Unimplemented routing method ",
-                serializeMoeRoutingMethodType(routingMethodType), " of enum ",
-                (int)routingMethodType);
+    FLASHINFER_CHECK(false, "Unimplemented routing method ",
+                     serializeMoeRoutingMethodType(routingMethodType), " of enum ",
+                     (int)routingMethodType);
   }
 }
 }  // namespace Routing
@@ -203,8 +204,8 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
         .weightLayout = weightLayout};
     return options;
   } else {
-    TORCH_CHECK(false, "Unimplemented gated act type ", MoE::serializeGatedActType(gatedActType),
-                " of enum ", (int)gatedActType);
+    FLASHINFER_CHECK(false, "Unimplemented gated act type ",
+                     MoE::serializeGatedActType(gatedActType), " of enum ", (int)gatedActType);
   }
 }
 
@@ -380,8 +381,8 @@ Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, bool useDeepSeekFp8
       mPassingConfigs.push_back(MoEConfig{indexGemm1, indexGemm2});
     }
   }
-  TORCH_CHECK(!mPassingConfigs.empty(),
-              "No compatible configs found for the fp8 block scale MoE runner.");
+  FLASHINFER_CHECK(!mPassingConfigs.empty(),
+                   "No compatible configs found for the fp8 block scale MoE runner.");
 }
 
 Runner::Runner(btg::Dtype dtypeElt, bool useDeepSeekFp8, int32_t tileTokensDim,
@@ -489,8 +490,8 @@ int64_t Runner::getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize,
                          [indexGemm1, indexGemm2](MoEConfig cfg) {
                            return (cfg.gemm1Config == indexGemm1 && cfg.gemm2Config == indexGemm2);
                          });
-  TORCH_CHECK(it != mPassingConfigs.end(),
-              "No compatible configs found for the block scale MoE runner.");
+  FLASHINFER_CHECK(it != mPassingConfigs.end(),
+                   "No compatible configs found for the block scale MoE runner.");
   return std::distance(mPassingConfigs.begin(), it);
 }
 

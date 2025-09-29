@@ -24,6 +24,7 @@
 #include <cuda/std/functional>
 #include <cuda/std/type_traits>
 
+#include "flashinfer/exception.h"
 #include "flashinfer/trtllm/fused_moe/DevKernel.h"
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -166,7 +167,7 @@ void run(Data const& data, void* stream) {
   if (data.mDtypeElt == tg::Dtype::E2m1) {
     // Note: this should be unreachable because the options are checked beforehand.
     // E2m1 requires using higher-precision intermediate data (bf16).
-    TORCH_CHECK(false, "Activation with E2m1_t isn't supported.");
+    FLASHINFER_CHECK(false, "Activation with E2m1_t isn't supported.");
     return;
   }
 

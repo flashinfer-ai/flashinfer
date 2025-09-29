@@ -20,7 +20,6 @@ import torch
 from jit_utils import gen_prefill_attention_modules
 
 import flashinfer
-from tvm_ffi import use_torch_stream
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -195,7 +194,7 @@ def test_batch_prefill_with_paged_kv_cache(
         # warmup
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
-        with use_torch_stream(torch.cuda.stream(s)):
+        with torch.cuda.stream(s):
             for _ in range(3):
                 if return_lse:
                     o, _ = wrapper.run(q, kv_data, return_lse=True)
@@ -204,7 +203,7 @@ def test_batch_prefill_with_paged_kv_cache(
         torch.cuda.current_stream().wait_stream(s)
         # capture
         g = torch.cuda.CUDAGraph()
-        with use_torch_stream(torch.cuda.graph(g)):
+        with torch.cuda.graph(g):
             if return_lse:
                 o, _ = wrapper.run(q, kv_data, return_lse=True)
             else:
@@ -433,7 +432,7 @@ def test_batch_prefill_with_tuple_paged_kv_cache(
         # warmup
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
-        with use_torch_stream(torch.cuda.stream(s)):
+        with torch.cuda.stream(s):
             for _ in range(3):
                 if return_lse:
                     o, _ = wrapper.run(q, kv_data, return_lse=True)
@@ -442,7 +441,7 @@ def test_batch_prefill_with_tuple_paged_kv_cache(
         torch.cuda.current_stream().wait_stream(s)
         # capture
         g = torch.cuda.CUDAGraph()
-        with use_torch_stream(torch.cuda.graph(g)):
+        with torch.cuda.graph(g):
             if return_lse:
                 o, _ = wrapper.run(q, kv_data, return_lse=True)
             else:

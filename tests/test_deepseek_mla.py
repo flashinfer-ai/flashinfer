@@ -32,7 +32,6 @@ from flashinfer.utils import (
     is_sm100a_supported,
     is_sm110a_supported,
 )
-from tvm_ffi import use_torch_stream
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -588,14 +587,14 @@ def test_batch_mla_page_attention(
         # warmup
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
-        with use_torch_stream(torch.cuda.stream(s)):
+        with torch.cuda.stream(s):
             for _ in range(3):
                 o, lse = wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=True)
         torch.cuda.current_stream().wait_stream(s)
 
         # capture
         g = torch.cuda.CUDAGraph()
-        with use_torch_stream(torch.cuda.graph(g)):
+        with torch.cuda.graph(g):
             o, lse = wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=True)
 
     wrapper.plan(
