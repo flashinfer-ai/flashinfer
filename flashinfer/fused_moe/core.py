@@ -1251,33 +1251,8 @@ def get_trtllm_moe_sm100_module():
         if enable_pdl is None:
             enable_pdl = device_support_pdl(hidden_states.device)
         # Call the C++ function for block scale MoE
-        # FIXME: remove these prints once done
-        print(
-            "@@@@",
-            routing_logits.dtype,
-            "routing_bias.dtype",
-            hidden_states.dtype,
-            gemm1_weights.dtype,
-            gemm2_weights.dtype,
-        )
-        print("@@@@", gemm1_weights.shape, gemm2_weights.shape)
-        print(
-            num_experts,
-            top_k,
-            n_group,
-            topk_group,
-            intermediate_size,
-            local_expert_offset,
-            local_num_experts,
-            tile_tokens_dim,
-            use_shuffled_weight,
-            weight_layout,
-            moe_tactic,
-            routing_method_type,
-            enable_pdl,
-        )
         output = moe_op.trtllm_bf16_moe(
-            routing_logits.to(torch.float),  # FIXME what's the supported type?
+            routing_logits,
             routing_bias,
             hidden_states,
             gemm1_weights,

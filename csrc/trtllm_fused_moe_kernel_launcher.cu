@@ -71,7 +71,7 @@ Driver calls take place to carry out the gemm operations.
 */
 
 class FusedMoeLauncher {
- protected:
+protected:
   at::Tensor const* routing_logits{};
   at::Tensor const* routing_bias{};
   at::Tensor const* hidden_states{};
@@ -305,7 +305,7 @@ class FusedMoeLauncher {
     int routing_device = routing_logits->get_device();
     auto const& routing_stream = at::cuda::getCurrentCUDAStream(routing_device);
     routing_runner.run(
-        routing_logits->data_ptr<float>(), args->routing_bias, args->num_tokens, args->num_experts,
+        routing_logits->data_ptr(), args->routing_bias, args->num_tokens, args->num_experts,
         args->top_k, args->n_group, args->topk_group, args->local_expert_offset,
         args->local_num_experts, args->routed_scaling_factor, expert_indexes.data_ptr<int>(),
         expert_count_histogram.data_ptr<int>(), total_num_padded_tokens.data_ptr<int>(),
@@ -356,7 +356,7 @@ void FusedMoeLauncher::init_common(
   this->gemm1_weights = gemm1_weights;
   this->gemm2_weights = gemm2_weights;
 
-  args->routing_logits = routing_logits->data_ptr<float>();
+  args->routing_logits = routing_logits->data_ptr();
   args->routing_bias = routing_bias ? routing_bias->data_ptr() : nullptr;
   args->hidden_states = hidden_states->data_ptr();
   args->gemm1_weights = gemm1_weights->data_ptr();
@@ -433,7 +433,7 @@ class Bf16MoeLauncher : public FusedMoeLauncher {
 
     int32_t max_num_padded_tokens = workspace.total_max_padded_tokens;
     gemm1_output =
-        at::detail::empty_cuda({max_num_padded_tokens, 2 * args->intermediate_size},
+        at::detail::empty_cuda({max_num_padded_tokens, args->intermediate_size},
                                at::ScalarType::BFloat16, hidden_states->device(), std::nullopt);
     activation_output =
         at::detail::empty_cuda({max_num_padded_tokens, args->intermediate_size},
@@ -496,9 +496,10 @@ at::Tensor trtllm_bf16_moe(at::Tensor const& routing_logits,
 
   Bf16MoeLauncher launcher;
   launcher.init(routing_logits, routing_bias, hidden_states, gemm1_weights, gemm2_weights,
-                std::move(args), tile_tokens_dim, routing_method_type, use_shuffled_weight,
-                weight_layout);
-  return launcher.run(moe_tactic, enable_pdl)[0];
+    std::move(args), tile_tokens_dim, routing_method_type, use_shuffled_weight,
+    weight_layout);
+  auto data = launcher.run(moe_tactic, enable_pdl)[0];
+  return data;
 }
 
 at::Tensor trtllm_fp8_per_tensor_scale_moe_launcher(

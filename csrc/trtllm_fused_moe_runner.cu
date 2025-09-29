@@ -137,7 +137,6 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mDoSoftmaxBeforeTopK = routingMethodType == RoutingMethodType::RenormalizeNaive;
     routingData.mNormTopkProb = routingMethodType == RoutingMethodType::RenormalizeNaive;
     routingData.mApplySoftmaxAfterTopK = routingMethodType == RoutingMethodType::Renormalize;
-
     routingData.mPtrScores = routingLogits;
 
     //

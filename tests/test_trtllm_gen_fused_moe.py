@@ -1037,22 +1037,21 @@ class BF16Moe(Moe):
             gemm1_weights_bf16_shuffled = []
             gemm2_weights_bf16_shuffled = []
             for i in range(num_experts):
-                tmp_weights1 = reorder_rows_for_gated_act_gemm(args.gemm1_weights[i].clone())
-
+                tmp_weights1 = reorder_rows_for_gated_act_gemm(args.gemm1_weights[i].clone().view(torch.uint8))
                 tmp_weights1 = shuffle_matrix_a(
-                    tmp_weights1.view(torch.uint8), epilogue_tile_m
+                    tmp_weights1, epilogue_tile_m
                 )
                 tmp_weights2 = shuffle_matrix_a(
                     args.gemm2_weights[i].clone().view(torch.uint8), epilogue_tile_m
                 )
 
                 if weight_layout == WeightLayout.BlockMajorK:
-                    block_k = 64
-                    tmp_weights1 = convert_to_block_layout(tmp_weights1.view(torch.bfloat16), block_k)
-                    tmp_weights2 = convert_to_block_layout(tmp_weights2.view(torch.bfloat16), block_k)
+                    block_k = 128
+                    tmp_weights1 = convert_to_block_layout(tmp_weights1.view(torch.uint8), block_k)
+                    tmp_weights2 = convert_to_block_layout(tmp_weights2.view(torch.uint8), block_k)
 
-                gemm1_weights_bf16_shuffled.append(tmp_weights1)
-                gemm2_weights_bf16_shuffled.append(tmp_weights2)
+                gemm1_weights_bf16_shuffled.append(tmp_weights1.view(torch.bfloat16))
+                gemm2_weights_bf16_shuffled.append(tmp_weights2.view(torch.bfloat16))
 
             # Stack weights for all experts
             gemm1_weights_bf16_shuffled = torch.stack(gemm1_weights_bf16_shuffled).view(
@@ -1061,7 +1060,6 @@ class BF16Moe(Moe):
             gemm2_weights_bf16_shuffled = torch.stack(gemm2_weights_bf16_shuffled).view(
                 torch.bfloat16
             ).contiguous()
-            print(gemm1_weights_bf16_shuffled.shape, gemm2_weights_bf16_shuffled.shape)
 
             return {
                 "gemm1_weights": gemm1_weights_bf16_shuffled,
@@ -1404,14 +1402,11 @@ def check_accuracy(a, b, atol, rtol, percent):
         raise Exception("Inf in actual output")
     assert a.shape == b.shape, f"Shape mismatch: {a.shape} vs {b.shape}"
 
-    print(a, b)
     left = torch.abs(a - b)
     right = atol + rtol * torch.abs(b)
     count = torch.sum(left > right)
     mismatch_percent = count / a.numel()
     if mismatch_percent > 1 - percent:
-        print(a)
-        print(b)
         raise Exception(
             f"Mismatch percentage is {mismatch_percent:.4f} for rtol {rtol} "
             f"(threshold: {1 - percent:.4f})"
@@ -1721,7 +1716,6 @@ def run_moe_dequant(args, quant_mode: QuantMode):
     elif quant_mode == QuantMode.BF16:
         activation_output = activation_output.to(torch.bfloat16).to(torch.float)
         args.c_global_sf = 1.0
-        print(activation_output)
     else:  # mxfp4Bf16
         activation_output = activation_output.to(torch.bfloat16).to(torch.float)
         args.c_global_sf = 1.0
@@ -2252,7 +2246,7 @@ def test_moe_quantization_classes(
     else:
         routing_bias = None
 
-    hidden_states = torch.ones(
+    hidden_states = 2 * torch.randn(
         (num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16
     )
     gemm1_weights = torch.randn(
@@ -2260,12 +2254,6 @@ def test_moe_quantization_classes(
         device="cuda",
         dtype=torch.bfloat16,
     )
-    # for n in range(intermediate_size):
-    # for k in range(hidden_size):
-    #     gemm1_weights[:, 1, k] = k * 0.01
-    #     gemm1_weights[:, 1 + intermediate_size, k] = (k + k%2 + 30) * 0.00001
-        # gemm1_weights[:, 1 + intermediate_size, k] = k * 0.01
-
     gemm2_weights = torch.randn(
         (num_experts, hidden_size, intermediate_size),
         device="cuda",
