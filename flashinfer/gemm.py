@@ -43,6 +43,7 @@ from .utils import (
     is_sm120a_supported,
     is_sm121a_supported,
     LibraryError,
+    supports_backends,
 )
 
 CUDNN_AVAILABLE = False
@@ -1999,6 +2000,11 @@ def _expand_block_scale_tensor_shape(block_scale_tensor, batch_size):
     return (tuple(block_scale_shape), tuple(block_scale_stride))
 
 
+@supports_backends(
+    ["cudnn", "trtllm", "cutlass"],
+    anti_capabilities={"trtllm": ["110"]},
+    capability_tensor_arg="a",
+)
 def mm_fp4(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -2113,8 +2119,6 @@ def mm_fp4(
         raise ValueError("mxfp4 supports block_size = 32.")
     if backend != "trtllm" and use_8x4_sf_layout:
         raise ValueError("Only TRTLLM FP4 GEMM supports 8x4 scale factor layout.")
-    if backend == "trtllm" and _match_sm_version(a.device, ["110"]):
-        raise ValueError("TRTLLM FP4 GEMM is not supported on SM110.")
     if backend != "cudnn" and not use_nvfp4:
         raise ValueError("Only cudnn FP4 GEMM supports mxfp4 quantization.")
     if (
