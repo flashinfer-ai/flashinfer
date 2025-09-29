@@ -1,91 +1,221 @@
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://github.com/flashinfer-ai/web-data/blob/main/logo/FlashInfer-black-background.png?raw=true">
-    <img alt="FlashInfer" src="https://github.com/flashinfer-ai/web-data/blob/main/logo/FlashInfer-white-background.png?raw=true" width=55%>
-  </picture>
-</p>
 <h1 align="center">
-Kernel Library for LLM Serving
+FlashInfer+ROCm: An AMD ROCm port of FlashInfer
 </h1>
 
-<p align="center">
-| <a href="https://flashinfer.ai"><b>Blog</b></a> | <a href="https://docs.flashinfer.ai"><b>Documentation</b></a> | <a href="https://join.slack.com/t/flashinfer/shared_invite/zt-2r93kj2aq-wZnC2n_Z2~mf73N5qnVGGA"><b>Slack</b></a>|  <a href="https://github.com/orgs/flashinfer-ai/discussions"><b>Discussion Forum</b></a> |
-</p>
+FlashInfer+ROCm is a port of the [FlashInfer](https://github.com/flashinfer-ai/flashinfer)
+library to add support for AMD GPUs. The project is in its early
+active stage of development and does not yet support all functionalities
+implemented upstream. The feature support matrix lists currently supported
+features.
 
-[![Build Status](https://ci.tlcpack.ai/job/flashinfer-ci/job/main/badge/icon)](https://ci.tlcpack.ai/job/flashinfer-ci/job/main/)
-[![Release](https://github.com/flashinfer-ai/flashinfer/actions/workflows/release_wheel.yml/badge.svg)](https://github.com/flashinfer-ai/flashinfer/actions/workflows/release_wheel.yml)
-[![Documentation](https://github.com/flashinfer-ai/flashinfer/actions/workflows/build-doc.yml/badge.svg)](https://github.com/flashinfer-ai/flashinfer/actions/workflows/build-doc.yml)
+To determine which upstream version a specific FlashInfer+ROCm release is
+based on, please refer to the release tag. The versioning convention,
+`<upstream_version>+rocm`, directly links each of the FlashInfer+ROCm releases
+to a corresponding upstream tag. For example, the `0.2.5+rocm` release is
+synchronized with the upstream `v0.2.5` tag.
 
 
-FlashInfer is a library and kernel generator for Large Language Models that provides high-performance implementation of LLM GPU kernels such as FlashAttention, SparseAttention, PageAttention, Sampling, and more. FlashInfer focuses on LLM serving and inference, and delivers state-of-the-art performance across diverse scenarios.
+**Feature Support Matrix**
+| Kernel Type | FP16 / BF16 | FP8 (E4M3, E5M2) | Notes |
+| :--- | :---: | :---: | :--- |
+| **Decode Attention** | ✅ | WIP | Supports MHA, GQA, and MQA variants. |
+| **Prefill Attention** | WIP | WIP | MHA/GQA/MQA support is a work in progress. |
+| **Cascade** | WIP | WIP | not yet ported. |
+| **MLA** | TBD | TBD | not yet ported. |
+| **POD** | TBD | TBD | not yet ported. |
+| **Positional Encoding** | TBD | TBD | LLaMA RoPE is supported. |
+| **Sampling** | TBD | TBD | Top-K/Top-P sampling is not yet ported. |
+| **Normalization** | TBD | TBD | RMS-Norm/Layer-Norm is not yet ported. |
 
-Check our [v0.2 release blog](https://flashinfer.ai/2024/12/16/flashinfer-v02-release.html) for new features!
 
-The core features of FlashInfer include:
-1. **Efficient Sparse/Dense Attention Kernels**: Efficient single/batch attention for sparse(paged)/dense KV-storage on CUDA Cores and Tensor Cores (both FA2 & FA3) templates. The vector-sparse attention can achieve 90% of the bandwidth of dense kernels with same problem size.
-2. **Load-Balanced Scheduling**: FlashInfer decouples `plan`/`run` stage of attention computation where we schedule the computation of variable-length inputs in `plan` stage to alleviate load-imbalance issue.
-3. **Memory Efficiency**: FlashInfer offers [Cascade Attention](https://docs.flashinfer.ai/api/cascade.html#flashinfer.cascade.MultiLevelCascadeAttentionWrapper) for hierarchical KV-Cache, and implements Head-Query fusion for accelerating Grouped-Query Attention, and efficient kernels for low-precision attention and fused-RoPE attention for compressed KV-Cache.
-4. **Customizable Attention**: Bring your own attention variants through JIT-compilation.
-5. **CUDAGraph and torch.compile Compatibility**: FlashInfer kernels can be captured by CUDAGraphs and torch.compile for low-latency inference.
-6. **Efficient LLM-specific Operators**: High-Performance [fused kernel for Top-P, Top-K/Min-P sampling](https://docs.flashinfer.ai/api/sampling.html) without the need to sorting.
+**GPU Support**
+| Model | Architecture |
+|---|---|
+| MI300x | CDNA3 |
 
-FlashInfer supports PyTorch, TVM and C++ (header-only) APIs, and can be easily integrated into existing projects.
+**ROCm Support**
 
-## News
-- [Mar 10, 2025] [Blog Post](https://flashinfer.ai/2025/03/10/sampling.html) Sorting-Free GPU Kernels for LLM Sampling, which explains the design of sampling kernels in FlashInfer.
-- [Mar 1, 2025] Checkout flashinfer's [intra-kernel profiler](https://github.com/flashinfer-ai/flashinfer/tree/main/profiler) for visualizing the timeline of each threadblock in GPU kernels.
-- [Dec 16, 2024] [Blog Post](https://flashinfer.ai/2024/12/16/flashinfer-v02-release.html) FlashInfer 0.2 - Efficient and Customizable Kernels for LLM Inference Serving
-- [Sept 2024] We've launched a [Slack](https://join.slack.com/t/flashinfer/shared_invite/zt-2r93kj2aq-wZnC2n_Z2~mf73N5qnVGGA) workspace for Flashinfer users and developers. Join us for timely support, discussions, updates and knowledge sharing!
-- [Jan 31, 2024] [Blog Post](https://flashinfer.ai/2024/01/08/cascade-inference.html) Cascade Inference: Memory-Efficient Shared Prefix Batch Decoding
-- [Jan 31, 2024] [Blog Post](https://flashinfer.ai/2024/01/03/introduce-flashinfer.html) Accelerating Self-Attentions for LLM Serving with FlashInfer
+6.3.2, 6.4.1
 
-## Getting Started
+**Docker image compatibility**
 
-Using our PyTorch API is the easiest way to get started:
+| Docker Image | ROCm | Flashinfer | PyTorch |
+|---|---|---|---|
+| TBD | 6.4.1 | 0.2.5 | 2.7.1
 
-### Install from PIP
 
-We provide prebuilt python wheels for Linux. Install FlashInfer with the following command:
+Table of Contents
+=================
 
+   * [Development Setup Inside a Pre-built Docker Container](#manual-setup)
+      * [Step 0: Docker pull](#step-0-docker-pull)
+      * [Step 1: Setting up micromamba](#step-1-setting-up-micromamba)
+      * [Step 2: Installing Flashinfer](#step-2-installing-flashinfer)
+      * [Step3: Verifying Installation](#step3-verifying-installation)
+      * [Configure C++ Tests](#configure-c-tests)
+      * [Configure PyTest](#configure-pytest)
+   * [Using ROCm Dockerfile](#using-rocm-dockerfile)
+      * [Step 1: Clone the repository](#step-1-clone-the-repository)
+      * [Step 2: Docker build](#step-2-docker-build)
+      * [Step 3: Using the container](#step-3-using-the-container)
+
+## Development Setup Inside a Pre-built Docker Container
+The recommended docker image to setup a development environment for
+FlashInfer+ROCm is `rocm/pytorch:rocm6.4.1_ubuntu24.04_py3.12_pytorch_release_2.7.1`
+
+### Step 0: Docker pull
 ```bash
-# For CUDA 12.6 & torch 2.6
-pip install flashinfer-python -i https://flashinfer.ai/whl/cu126/torch2.6
-# For other CUDA & torch versions, check https://docs.flashinfer.ai/installation.html
+docker pull rocm/pytorch:rocm6.4.1_ubuntu24.04_py3.12_pytorch_release_2.7.1
+```
+```bash
+docker run -it --privileged --network=host --device=/dev/kfd --device=/dev/dri \
+--group-add video --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+--ipc=host --shm-size 128G --name=<container name> rocm/pytorch:rocm6.4.1_ubuntu24.04_py3.12_pytorch_release_2.7.1
 ```
 
-To try the latest features from the main branch, use our nightly-built wheels:
+### Step 1: Setting up micromamba
+Run the following command to install micromamba and set it up inside `bash`
+```bash
+"${SHELL}" <(curl -L micro.mamba.pm/install.sh)
+source ~/.bashrc
+```
+After installing micromamba a custom environment for FlashInfer+ROCm
+development should be setup. The micromamba environment is used to only manage 
+the Python version, rest of the dependencies are installed using `pip`.
 
 ```bash
-pip install flashinfer-python -i https://flashinfer.ai/whl/nightly/cu126/torch2.6
+# Create a micromamba env for Python 3.12
+micromamba create -n <environment_name> python=3.12 -c conda-forge --override-channels
+# Activate the environment
+micromamba activate <environment_name>
+# Install added dependencies using pip
+pip install setuptools-scm scikit-build-core pytest numpy cmake ninja pybind11
+pip install torch --index-url https://download.pytorch.org/whl/rocm6.4
 ```
+### Step 2: Installing Flashinfer into the Docker container
 
-For a JIT version (compiling every kernel from scratch, [NVCC](https://developer.nvidia.com/cuda-downloads) is required), install from [PyPI](https://pypi.org/project/flashinfer-python/):
+Clone the latest trunk from https://github.com/ROCm/flashinfer.
 
 ```bash
-pip install flashinfer-python
+git clone https://github.com/ROCm/flashinfer
+cd flashinfer/
 ```
+The Flashinfer+ROCm library can be built in two ways: with ahead-of-time (AOT) 
+compiled kernels and without any AOT kernels.
 
-### Install from Source
+Building the library with AOT kernels will take more time and local disk space 
+as several common configurations of the core Flashinfer kernels are built 
+during installation.
 
-Alternatively, build FlashInfer from source:
+When building without AOT compilation, every kernel will be just-in-time (JIT) 
+compiled at the time of first use.
+
+* Instructions to build with AOT are as follows:
+```bash
+FLASHINFER_HIP_ARCHITECTURES=gfx942 FLASHINFER_AOT_TORCH_EXTS=ON python -m pip wheel . --wheel-dir=./dist/ --no-deps --no-build-isolation -v
+cd dist
+pip install flashinfer-*.whl
+```
+* Instructions to build using JIT requires setting the FLASHINFER_AOT_TORCH_EXTS build flag to OFF.
 
 ```bash
-git clone https://github.com/flashinfer-ai/flashinfer.git --recursive
-cd flashinfer
-pip install -e . -v
+FLASHINFER_HIP_ARCHITECTURES=gfx942 python -m pip wheel . --wheel-dir=./dist/ --no-deps --no-build-isolation -v
+cd dist
+pip install flashinfer-*.whl
 ```
+**Note:** The `--no-deps` flags assumes that all require dependencies are already available in the build environment. Otherwise, refer the earlier steps to install required packages. If building without first installing all Python and build dependencies, the `--no-deps` flag should be omitted. In that case, the build step will download all needed dependencies.
 
-To pre-compile essential kernels, set the environment variable `FLASHINFER_ENABLE_AOT=1` before running the installation command:
+Development mode or editable installs (PEP 660) is supported and can be used
+with both AOT and JIT builds of the package. To setup an editable install, follow these steps:
 
 ```bash
-FLASHINFER_ENABLE_AOT=1 pip install -e . -v
+FLASHINFER_HIP_ARCHITECTURES=gfx942 python -m pip install --no-build-isolation -ve.
+```
+### Step3: Verifying Installation
+A convenience script is provided inside the example directory that runs two HIPified kernels from Flashinfer: `SingleDecodeWithKVCache` and `BatchDecodeWithKVCache` and verifies the correctness of the generated results.
+
+Following are the instructions to run the script:
+```bash
+cd examples/
+python test_batch_decode_example.py
+```
+If Flashinfer+ROCm was installed without AOT kernels, the output should look as follows:
+```
+Failed to import __aot_prebuilt_uris__: No module named 'flashinfer.__aot_prebuilt_uris__'
+2025-07-23 21:45:24,657 - INFO - flashinfer.jit: Prebuilt kernels not found, using JIT backend
+PASS
+```
+### Configure C++ Tests
+Flashinfer+ROCm provides a C++ test suite to test all HIP kernels and C++ code. Installing Flashinfer does not automatically install the tests, instead these have to be configured separately.
+
+1. To configure the rest of the test suite
+```bash
+cd flashinfer/libflashinfer/tests/hip
+mkdir build && cd build/
+cmake -DCMAKE_CXX_COMPILER:PATH=/opt/rocm/bin/amdclang++ -DFLASHINFER_INCLUDE_DIRS=<path to flashinfer includ dirs> ..
+ninja
+```
+2. To run individual tests
+```bash
+./test_<target_test_name>
+```
+3. To run all tests
+```bash
+ctest
+```
+The output should look something like this
+```
+Test project /root/flashinfer/libflashinfer/tests/hip/build
+    Start 1: MathTest
+1/6 Test #1: MathTest .........................   Passed    3.40 sec
+    Start 2: PosEncTest
+2/6 Test #2: PosEncTest .......................   Passed    3.40 sec
+    Start 3: CascadeTest
+3/6 Test #3: CascadeTest ......................   Passed  985.27 sec
+    Start 4: PageTest
+4/6 Test #4: PageTest .........................   Passed  112.40 sec
+    Start 5: SingleDecodeTest
+5/6 Test #5: SingleDecodeTest .................   Passed   35.46 sec
+    Start 6: BatchDecodeTest
+6/6 Test #6: BatchDecodeTest ..................   Passed  556.81 sec
+
+100% tests passed, 0 tests failed out of 6
+```
+### Configure PyTest
+To run pytests, run the following helper script from the project root directory:
+
+```bash
+cd scripts/
+./run_hip_tests.sh
 ```
 
-For more details, refer to the [Install from Source documentation](https://docs.flashinfer.ai/installation.html#install-from-source).
+## Using ROCm Dockerfile
 
-### Trying it out
+### Step 1: Clone the repository
+```bash
+git clone https://github.com/ROCm/flashinfer
+```
 
-Below is a minimal example of using FlashInfer's single-request decode/append/prefill attention kernels:
+### Step 2: Docker build
+
+```bash
+docker build -f docker/Dockerfile.rocm_ci --target flashinfer_base -t <docker-image-tag> .
+```
+```bash
+docker run -it --privileged --network=host --device=/dev/kfd --device=/dev/dri \
+--group-add video --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+--ipc=host --shm-size 128G --name=<container name> <docker-image-tag>
+```
+
+### Step 3: Using the container
+The docker container will come with micromamba pre-installed. It also builds
+and pre-installs Flashinfer AOT version. To use Flashiner, first activate the
+environment and then use the `flashinfer` package from Python.
+
+
+```bash
+micromamba activate flashinfer-py3.12-torch2.7.1-rocm6.4.1
+```
 
 ```python
 import torch
@@ -105,82 +235,4 @@ q = torch.randn(num_qo_heads, head_dim).half().to(0)
 
 o = flashinfer.single_decode_with_kv_cache(q, k, v) # decode attention without RoPE on-the-fly
 o_rope_on_the_fly = flashinfer.single_decode_with_kv_cache(q, k, v, pos_encoding_mode="ROPE_LLAMA") # decode with LLaMA style RoPE on-the-fly
-
-# append attention
-append_qo_len = 128
-q = torch.randn(append_qo_len, num_qo_heads, head_dim).half().to(0) # append attention, the last 128 tokens in the KV-Cache are the new tokens
-o = flashinfer.single_prefill_with_kv_cache(q, k, v, causal=True) # append attention without RoPE on-the-fly, apply causal mask
-o_rope_on_the_fly = flashinfer.single_prefill_with_kv_cache(q, k, v, causal=True, pos_encoding_mode="ROPE_LLAMA") # append attention with LLaMA style RoPE on-the-fly, apply causal mask
-
-# prefill attention
-qo_len = 2048
-q = torch.randn(qo_len, num_qo_heads, head_dim).half().to(0) # prefill attention
-o = flashinfer.single_prefill_with_kv_cache(q, k, v, causal=False) # prefill attention without RoPE on-the-fly, do not apply causal mask
-```
-
-Check out [documentation](https://docs.flashinfer.ai/) for usage of batch decode/append/prefill kernels and shared-prefix cascading kernels.
-
-## Custom Attention Variants
-
-Starting from FlashInfer v0.2, users can customize their own attention variants with additional parameters. For more details, refer to our [JIT examples](https://github.com/flashinfer-ai/flashinfer/blob/main/tests/test_jit_example.py).
-
-## Run Benchmarks
-
-We profile FlashInfer kernel performance with [nvbench](https://github.com/NVIDIA/nvbench) and you can compile and run the benchmarks with the following commands:
-
-```bash
-mkdir build
-cp cmake/config.cmake build # you can modify the config.cmake to enable/disable benchmarks and change CUDA architectures
-cd build
-cmake ..
-make -j12
-```
-
-You can run `./bench_{single/batch}_{prefill/decode}` to benchmark the performance (e.g. `./bench_single_prefill` for single-request prefill attention). `./bench_{single/batch}_{prefill/decode} --help` will show you the available options.
-
-## C++ API and TVM Bindings
-
-FlashInfer also provides C++ API and TVM bindings, please refer to [documentation](https://docs.flashinfer.ai/) for more details.
-
-## Adoption
-
-We are thrilled to share that FlashInfer is being adopted by many cutting-edge projects, including but not limited to:
-- [MLC-LLM](https://github.com/mlc-ai/mlc-llm)
-- [Punica](https://github.com/punica-ai/punica)
-- [SGLang](https://github.com/sgl-project/sglang)
-- [ScaleLLM](https://github.com/vectorch-ai/ScaleLLM)
-- [vLLM](https://github.com/vllm-project/vllm)
-- [TGI](https://github.com/huggingface/text-generation-inference)
-- [lorax](https://github.com/predibase/lorax)
-- [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM)
-- [LightLLM](https://github.com/ModelTC/lightllm)
-
-## Acknowledgement
-
-FlashInfer is inspired by [FlashAttention 1&2](https://github.com/dao-AILab/flash-attention/), [vLLM](https://github.com/vllm-project/vllm), [stream-K](https://arxiv.org/abs/2301.03598), [cutlass](https://github.com/nvidia/cutlass) and [AITemplate](https://github.com/facebookincubator/AITemplate) projects.
-
-## Citation
-
-If you find FlashInfer helpful in your project or research, please consider citing our [paper](https://arxiv.org/abs/2501.01005):
-
-```bibtex
-@article{ye2025flashinfer,
-    title = {FlashInfer: Efficient and Customizable Attention Engine for LLM Inference Serving},
-    author = {
-      Ye, Zihao and
-      Chen, Lequn and
-      Lai, Ruihang and
-      Lin, Wuwei and
-      Zhang, Yineng and
-      Wang, Stephanie and
-      Chen, Tianqi and
-      Kasikci, Baris and
-      Grover, Vinod and
-      Krishnamurthy, Arvind and
-      Ceze, Luis
-    },
-    journal = {arXiv preprint arXiv:2501.01005},
-    year = {2025},
-    url = {https://arxiv.org/abs/2501.01005}
-}
 ```
