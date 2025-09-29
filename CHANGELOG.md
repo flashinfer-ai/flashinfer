@@ -1,6 +1,6 @@
 # v0.2.5+rocm
 
-The initial technical preview release of a ROCm port of FlashInfer, The release
+The initial technical preview release of a ROCm port of FlashInfer. The release
 has the port of the decode kernels and the some infrastructure changes.
 
 ## Added
