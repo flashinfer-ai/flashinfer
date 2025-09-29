@@ -810,7 +810,7 @@ def trtllm_allreduce_fusion(
     - residual_out: the residual output tensor. [token_num, hidden_dim]
     - norm_out: the norm output tensor. [token_num, hidden_dim]
     - quant_out: the quant output tensor. [token_num, hidden_dim]
-    - scale_out: the scale output tensor. Initialization referece: tests/test_trtllm_allreduce_fusion.py
+    - scale_out: the scale output tensor. Initialization referece: tests/comm/test_trtllm_allreduce_fusion.py
     - rms_gamma: the rms gamma tensor. [hidden_dim]
     - rms_eps: the rms epsilon value.
     - scale_factor: the scale factor. For cudaGraphs safety, it should be a tensor.
@@ -913,7 +913,7 @@ def trtllm_moe_allreduce_fusion(
     - residual_out: the residual output tensor. [token_num, hidden_dim]
     - norm_out: the norm output tensor. [token_num, hidden_dim]
     - quant_out: the quant output tensor. [token_num // 4, hidden_dim], fp16/bf16 -> fp4
-    - scale_out: the scale output tensor. Initialization referece: tests/test_trtllm_moe_allreduce_fusion.py
+    - scale_out: the scale output tensor. Initialization referece: tests/comm/test_trtllm_moe_allreduce_fusion.py
     """
 
     required_lamport_comm_size = moe_reduction_token_input.numel() * 2 * world_size
