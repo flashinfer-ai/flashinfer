@@ -43,6 +43,10 @@ def create_mc_tensor(torch_tensor_cpu, dtype, leading_dim, is_dynamic_layout=Tru
     torch_symm_tensor.copy_(torch_tensor_cpu)
     symm = symm_mem.rendezvous(torch_symm_tensor, group=dist.group.WORLD.group_name)
     mc_ptr = symm.multicast_ptr
+    
+    if not mc_ptr:
+        raise ValueError("Multicast support is not available")
+    
     # create MC tensor memref
     cute_tensor_mc = from_dlpack(
         cutlass_torch.as_tensor(mc_ptr, torch_tensor_cpu.shape, torch_tensor_cpu.dtype),
