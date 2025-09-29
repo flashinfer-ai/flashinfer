@@ -86,7 +86,7 @@ namespace moe::dev {
   } else if (data.mDtypeElt == tg::Dtype::Bfloat16) {                                              \
     LAUNCH_PDL(data, false, cutlass::bfloat16_t, kernel, numBlocks, numThreads, smemSize, stream); \
   } else {                                                                                         \
-    TORCH_WARN("Unsupported dtypeElt");                                                            \
+    FLASHINFER_WARN("Unsupported dtypeElt");                                                       \
   }
 
 #define LAUNCH_EXPW(data, kernel, numBlocks, numThreads, smemSize, stream)                         \
@@ -109,7 +109,7 @@ namespace moe::dev {
     LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::bfloat16_t, cutlass::bfloat16_t), kernel,          \
                numBlocks, numThreads, smemSize, stream);                                           \
   } else {                                                                                         \
-    TORCH_WARN("Unsupported pair");                                                                \
+    FLASHINFER_WARN("Unsupported pair");                                                           \
   }
 
 #define LAUNCH_ROUTING(data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream)     \
@@ -120,7 +120,7 @@ namespace moe::dev {
     LAUNCH_PDL(data, coopLaunch, LAUNCH_ESC(__nv_bfloat16, __nv_bfloat16), kernel, numBlocks, \
                numThreads, smemSize, stream);                                                 \
   } else {                                                                                    \
-    TORCH_WARN("Unsupported dtypeExpW");                                                      \
+    FLASHINFER_WARN("Unsupported dtypeExpW");                                                 \
   }
 
 #define LAUNCH_ROUTING_WITH_EXTRA_FLAG(data, coopLaunch, kernel, numBlocks, numThreads, smemSize, \
@@ -144,7 +144,7 @@ namespace moe::dev {
     LAUNCH_PDL(data, coopLaunch, LAUNCH_ESC(__nv_bfloat16, __nv_bfloat16, false), kernel,         \
                numBlocks, numThreads, smemSize, stream);                                          \
   } else {                                                                                        \
-    TORCH_WARN("Unsupported dtypeExpW");                                                          \
+    FLASHINFER_WARN("Unsupported dtypeExpW");                                                     \
   }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

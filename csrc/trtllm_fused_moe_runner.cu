@@ -94,8 +94,8 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
   } else if (routingMethodType == RoutingMethodType::Llama4) {
     FLASHINFER_CHECK(topK == 1, "For Llama routing method, must have topK == 1");
     if (nGroup > 0 || topkGroup > 0) {
-      TORCH_WARN("For Llama routing method, nGroup/topkGroup is ignored, got ", nGroup, "/",
-                 topkGroup);
+      FLASHINFER_WARN("For Llama routing method, nGroup/topkGroup is ignored, got ", nGroup, "/",
+                      topkGroup);
     }
     moe::dev::routing::routingLlama4::Data routingData;
     routingData.mDtypeExpW = btg::Dtype::Bfloat16;

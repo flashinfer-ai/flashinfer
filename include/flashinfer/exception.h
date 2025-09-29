@@ -17,6 +17,7 @@
 #define FLASHINFER_EXCEPTION_H_
 
 #include <exception>
+#include <iostream>
 #include <sstream>
 
 #define FLASHINFER_ERROR(message) throw flashinfer::Error(__FUNCTION__, __FILE__, __LINE__, message)
@@ -57,6 +58,18 @@ void write_to_stream(std::ostringstream& oss, T&& val, Args&&... args) {
     }                                      \
   } while (0)
 
+// Warning macro
+#define FLASHINFER_WARN(...)                                           \
+  do {                                                                 \
+    std::ostringstream oss;                                            \
+    write_to_stream(oss, ##__VA_ARGS__);                               \
+    std::string msg = oss.str();                                       \
+    if (msg.empty()) {                                                 \
+      msg = "Warning triggered";                                       \
+    }                                                                  \
+    flashinfer::Warning(__FUNCTION__, __FILE__, __LINE__, msg).emit(); \
+  } while (0)
+
 namespace flashinfer {
 class Error : public std::exception {
  private:
@@ -71,6 +84,21 @@ class Error : public std::exception {
   }
 
   virtual const char* what() const noexcept override { return message_.c_str(); }
+};
+
+class Warning {
+ private:
+  std::string message_;
+
+ public:
+  Warning(const std::string& func, const std::string& file, int line, const std::string& message) {
+    std::ostringstream oss;
+    oss << "Warning in function '" << func << "' "
+        << "at " << file << ":" << line << ": " << message;
+    message_ = oss.str();
+  }
+
+  void emit() const { std::cerr << message_ << std::endl; }
 };
 
 }  // namespace flashinfer
