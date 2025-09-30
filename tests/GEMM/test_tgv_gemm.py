@@ -6,15 +6,7 @@ from flashinfer import (
     tgv_gemm_sm100,
 )
 
-from flashinfer.utils import (
-    get_compute_capability,
-)
-
-
-def _match_sm_version(device: torch.device, sm_version: list[str]):
-    major, minor = get_compute_capability(device)
-    device_arch = f"{major * 10 + minor}"
-    return device_arch in sm_version
+from flashinfer.gemm import _match_sm_version
 
 
 @pytest.mark.parametrize("m", [1, 8, 16, 32, 64])

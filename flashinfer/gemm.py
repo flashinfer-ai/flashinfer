@@ -65,7 +65,7 @@ from .jit import (
     gen_jit_spec,
     sm90a_nvcc_flags,
     sm100a_nvcc_flags,
-    sm103a_nvcc_flags,
+    sm100f_nvcc_flags,
     current_compilation_context,
 )
 from .jit.cubin_loader import setup_cubin_loader
@@ -925,17 +925,10 @@ def gen_gemm_sm100_module_tgv(dtype: torch.dtype = torch.bfloat16) -> JitSpec:
         )
         write_if_different(dest_path, source)
 
-    if _match_sm_version(torch.device("cuda"), ["100"]):
-        sm_nvcc_flags = sm100a_nvcc_flags
-    elif _match_sm_version(torch.device("cuda"), ["103"]):
-        sm_nvcc_flags = sm103a_nvcc_flags
-    else:
-        raise ValueError(f"Unsupported SM version {torch.device('cuda').sm_version}")
-
     return gen_jit_spec(
         module_name,
         source_paths,
-        extra_cuda_cflags=sm_nvcc_flags,
+        extra_cuda_cflags=sm100f_nvcc_flags,
         extra_include_paths=[
             jit_env.FLASHINFER_INCLUDE_DIR,
             jit_env.FLASHINFER_CSRC_DIR,
