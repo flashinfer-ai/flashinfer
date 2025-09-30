@@ -230,7 +230,6 @@ def gen_gemm_sm100_module_cutlass_fp4() -> JitSpec:
         extra_cflags=[
             "-DFAST_BUILD",
         ],
-        extra_ldflags=["-lcuda"],
     )
 
 
@@ -277,7 +276,6 @@ def gen_gemm_sm120_module_cutlass_fp4() -> JitSpec:
         extra_cflags=[
             "-DFAST_BUILD",
         ],
-        extra_ldflags=["-lcuda"],
     )
 
 
@@ -328,7 +326,6 @@ def gen_gemm_sm100_module_cutlass_fp8() -> JitSpec:
         extra_cflags=[
             "-DFAST_BUILD",
         ],
-        extra_ldflags=["-lcuda"],
     )
 
 
@@ -647,7 +644,6 @@ def gen_trtllm_gen_gemm_module() -> JitSpec:
         + sm100a_nvcc_flags,
         # link "include" sub-directory in cache
         extra_include_paths=[jit_env.FLASHINFER_CUBIN_DIR / include_path],
-        extra_ldflags=["-lcuda"],
     )
 
 
