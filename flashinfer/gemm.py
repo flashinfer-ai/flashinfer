@@ -2766,57 +2766,39 @@ def group_gemm_fp8_nt_groupwise(
         # SM120/121 doesn't use mma_sm parameter
         # TODO (yongwww): SM120/121 has correctness issues with multi-group scenarios
         # Fall back to loop-based processing for now
-        use_loop_fallback = num_groups > 1
+        for i in range(num_groups):
+            m_start = m_indptr[i].item()
+            m_end = m_indptr[i + 1].item()
+            group_m = m_end - m_start
 
-        if use_loop_fallback:
-            for i in range(num_groups):
-                m_start = m_indptr[i].item()
-                m_end = m_indptr[i + 1].item()
-                group_m = m_end - m_start
+            a_group = a[m_start:m_end, :].contiguous()
+            b_group = b[i : i + 1, :, :].contiguous()
 
-                a_group = a[m_start:m_end, :].contiguous()
-                b_group = b[i : i + 1, :, :].contiguous()
+            # Extract scales based on mode
+            if scale_major_mode == "K":
+                a_scale_group = a_scale[m_start:m_end, :].contiguous()
+                b_scale_group = b_scale[i : i + 1, :, :].contiguous()
+            else:  # MN mode
+                sf_m_start = m_start // scale_granularity_mnk[0]
+                sf_m_end = (
+                    m_end + scale_granularity_mnk[0] - 1
+                ) // scale_granularity_mnk[0]
+                a_scale_group = a_scale[:, sf_m_start:sf_m_end].contiguous()
+                b_scale_group = b_scale[i : i + 1, :, :].contiguous()
 
-                # Extract scales based on mode
-                if scale_major_mode == "K":
-                    a_scale_group = a_scale[m_start:m_end, :].contiguous()
-                    b_scale_group = b_scale[i : i + 1, :, :].contiguous()
-                else:  # MN mode
-                    sf_m_start = m_start // scale_granularity_mnk[0]
-                    sf_m_end = (
-                        m_end + scale_granularity_mnk[0] - 1
-                    ) // scale_granularity_mnk[0]
-                    a_scale_group = a_scale[:, sf_m_start:sf_m_end].contiguous()
-                    b_scale_group = b_scale[i : i + 1, :, :].contiguous()
+            group_m_indptr = torch.tensor(
+                [0, group_m], dtype=torch.int32, device=a.device
+            )
 
-                group_m_indptr = torch.tensor(
-                    [0, group_m], dtype=torch.int32, device=a.device
-                )
-
-                get_gemm_sm120_module().group_gemm_fp8_nt_groupwise(
-                    int_workspace_buffer,
-                    float_workspace_buffer,
-                    a_group,
-                    b_group,
-                    a_scale_group,
-                    b_scale_group,
-                    out[m_start:m_end, :],
-                    group_m_indptr,
-                    n,
-                    k,
-                    *scale_granularity_mnk,
-                    scale_major_mode,
-                )
-        else:
             get_gemm_sm120_module().group_gemm_fp8_nt_groupwise(
                 int_workspace_buffer,
                 float_workspace_buffer,
-                a,
-                b,
-                a_scale,
-                b_scale,
-                out,
-                m_indptr,
+                a_group,
+                b_group,
+                a_scale_group,
+                b_scale_group,
+                out[m_start:m_end, :],
+                group_m_indptr,
                 n,
                 k,
                 *scale_granularity_mnk,
