@@ -10,6 +10,7 @@ from flashinfer.utils import (
     get_compute_capability,
 )
 
+
 def _match_sm_version(device: torch.device, sm_version: list[str]):
     major, minor = get_compute_capability(device)
     device_arch = f"{major * 10 + minor}"
