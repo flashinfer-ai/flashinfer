@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+from contextlib import nullcontext
+
 import pytest
 import torch
 from torch.nn import functional as F
@@ -1021,19 +1023,27 @@ def test_moe_fp8_block_scaling(
     )
 
     flash_output = torch.zeros_like(x)
-    _ = fused_moe.cutlass_fused_moe(
-        x.contiguous(),
-        selected_experts.to(torch.int),
-        routing_weights,
-        w31_quant.contiguous(),
-        w2_quant.contiguous(),
-        otype,
-        use_deepseek_fp8_block_scale=True,
-        quant_scales=[w31_scales.contiguous(), w2_scales.contiguous()],
-        output=flash_output,
+
+    excption_context = (
+        pytest.raises(NotImplementedError)
+        if torch.cuda.get_device_capability()[0] != 90
+        else nullcontext()
     )
 
-    torch.testing.assert_close(flash_output, ref_output, rtol=1e-1, atol=1e-1)
+    with excption_context:
+        _ = fused_moe.cutlass_fused_moe(
+            x.contiguous(),
+            selected_experts.to(torch.int),
+            routing_weights,
+            w31_quant.contiguous(),
+            w2_quant.contiguous(),
+            otype,
+            use_deepseek_fp8_block_scale=True,
+            quant_scales=[w31_scales.contiguous(), w2_scales.contiguous()],
+            output=flash_output,
+        )
+
+        torch.testing.assert_close(flash_output, ref_output, rtol=1e-1, atol=1e-1)
 
 
 def quant_mxfp4_batches(a, num_experts):

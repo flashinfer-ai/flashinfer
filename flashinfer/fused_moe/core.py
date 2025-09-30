@@ -849,8 +849,6 @@ def cutlass_fused_moe(
     ------
     NotImplementedError:
         If any of the following features are requested but not implemented:
-            - FP8 Block Scaling
-            - W4A8 Group Scaling
             - Minimum Latency Mode
 
     Note
@@ -860,8 +858,16 @@ def cutlass_fused_moe(
     - Currently, some advanced features like FP8 block scaling and minimum latency mode
         are not implemented for Blackwell architecture.
     """
+    major, minor = torch.cuda.get_device_capability()
+    device_arch = f"{major * 10 + minor}"
+
     if min_latency_mode:
         raise NotImplementedError("min latency mode not yet implemented for Blackwell.")
+
+    if use_deepseek_fp8_block_scale and device_arch != "90":
+        raise NotImplementedError(
+            "FP8 block scaling not yet implemented for Blackwell."
+        )
 
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)
@@ -878,9 +884,6 @@ def cutlass_fused_moe(
         check_shape_dtype_device(
             output, output_shape, output_dtype, input.device, "output"
         )
-
-    major, minor = torch.cuda.get_device_capability()
-    device_arch = f"{major * 10 + minor}"
 
     return get_cutlass_fused_moe_module(device_arch).cutlass_fused_moe(
         output,
