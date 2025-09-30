@@ -375,10 +375,10 @@ def get_fp4_quantization_module(backend: str = "100"):
         )
 
     @register_custom_op(
-        "flashinfer::silu_and_mul_fp4_batched_quantize_sm100",
+        "flashinfer::silu_and_mul_nvfp4_batched_quantize_sm100",
         mutates_args=("",),
     )
-    def silu_and_mul_fp4_batched_quantize_sm100(
+    def silu_and_mul_nvfp4_batched_quantize_sm100(
         input: torch.Tensor,
         mask: torch.Tensor,
         global_scale: Optional[torch.Tensor] = None,
@@ -429,7 +429,7 @@ def get_fp4_quantization_module(backend: str = "100"):
             dtype=torch.uint8,
             device=input.device,
         )
-        module.silu_and_mul_fp4_batched_quantize(
+        module.silu_and_mul_nvfp4_batched_quantize(
             input,
             mask,
             global_scale,
@@ -439,8 +439,8 @@ def get_fp4_quantization_module(backend: str = "100"):
         )
         return out_val, out_sf
 
-    @register_fake_op("flashinfer::silu_and_mul_fp4_batched_quantize_sm100")
-    def _silu_and_mul_fp4_batched_quantize_sm100(
+    @register_fake_op("flashinfer::silu_and_mul_nvfp4_batched_quantize_sm100")
+    def _silu_and_mul_nvfp4_batched_quantize_sm100(
         input: torch.Tensor,
         mask: torch.Tensor,
         global_scale: Optional[torch.Tensor] = None,
@@ -518,7 +518,7 @@ def get_fp4_quantization_module(backend: str = "100"):
         e2m1_and_ufp8sf_scale_to_float_sm100=e2m1_and_ufp8sf_scale_to_float_sm100,
         mxfp4_dequantize_host=mxfp4_dequantize_host,
         fp4_batched_quantize_sm100=fp4_batched_quantize_sm100,
-        silu_and_mul_fp4_batched_quantize_sm100=silu_and_mul_fp4_batched_quantize_sm100,
+        silu_and_mul_nvfp4_batched_quantize_sm100=silu_and_mul_nvfp4_batched_quantize_sm100,
     )
 
 

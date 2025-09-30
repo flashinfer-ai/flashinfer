@@ -142,7 +142,7 @@ def silu_and_mul(
     return out
 
 
-def silu_and_mul_fp4_batched_quantize(
+def silu_and_mul_nvfp4_batched_quantize(
     a,
     mask,
     a_global_sf,
@@ -166,7 +166,7 @@ def silu_and_mul_fp4_batched_quantize(
     device_arch = f"{major * 10 + minor}"
     a_fp4, a_sf = get_fp4_quantization_module(
         device_arch
-    ).silu_and_mul_fp4_batched_quantize_sm100(
+    ).silu_and_mul_nvfp4_batched_quantize_sm100(
         a,
         mask,
         a_global_sf,

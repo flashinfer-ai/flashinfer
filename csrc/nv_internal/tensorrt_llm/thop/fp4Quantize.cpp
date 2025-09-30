@@ -194,9 +194,9 @@ void fp4_batched_quantize(Tensor self, Optional<Tensor> const& mask, Tensor glob
 #undef LAUNCH_FP4_QUANTIZE_KERNEL
 }
 
-void silu_and_mul_fp4_batched_quantize(Tensor const& self, Tensor const& mask,
-                                       Tensor const& globalScale, Tensor valueE2M1,
-                                       Tensor scaleFP8SF, int64_t sfVecSize) {
+void silu_and_mul_nvfp4_batched_quantize(Tensor const& self, Tensor const& mask,
+                                         Tensor const& globalScale, Tensor valueE2M1,
+                                         Tensor scaleFP8SF, int64_t sfVecSize) {
   // TODO(shuw): mask can be none
   CHECK_CUDA(self);
   CHECK_CONTIGUOUS(self);
@@ -225,7 +225,7 @@ void silu_and_mul_fp4_batched_quantize(Tensor const& self, Tensor const& mask,
   const thread_local int mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
   auto layout = tensorrt_llm::QuantizationSFLayout::SWIZZLED_128x4;
 
-#define LAUNCH_SILU_AND_MUL_FP4_QUANTIZE_KERNEL(T, SF_VEC_SIZE)                               \
+#define LAUNCH_SILU_AND_MUL_NVFP4_QUANTIZE_KERNEL(T, SF_VEC_SIZE)                             \
   tensorrt_llm::kernels::invokeSiluAndMulFP4Quantization<T, SF_VEC_SIZE>(                     \
       b, m, k_by_2, reinterpret_cast<T*>(self->data), static_cast<float*>(globalScale->data), \
       static_cast<int32_t*>(mask->data), reinterpret_cast<int64_t*>(valueE2M1->data),         \
@@ -233,10 +233,10 @@ void silu_and_mul_fp4_batched_quantize(Tensor const& self, Tensor const& mask,
       get_stream(self->device));
 
   if (self->dtype == dl_float16) {
-    LAUNCH_SILU_AND_MUL_FP4_QUANTIZE_KERNEL(half, 16)
+    LAUNCH_SILU_AND_MUL_NVFP4_QUANTIZE_KERNEL(half, 16)
   } else if (self->dtype == dl_bfloat16) {
 #ifdef ENABLE_BF16
-    LAUNCH_SILU_AND_MUL_FP4_QUANTIZE_KERNEL(__nv_bfloat16, 16)
+    LAUNCH_SILU_AND_MUL_NVFP4_QUANTIZE_KERNEL(__nv_bfloat16, 16)
 #else
     TVM_FFI_LOG_AND_THROW(NotImplementedError)
         << "BFloat16 must be enabled to quantize an bf16 tensor to fp4.";
@@ -246,9 +246,10 @@ void silu_and_mul_fp4_batched_quantize(Tensor const& self, Tensor const& mask,
         << "fp4_quantize only supports input tensor with dtypes fp16/bf16.";
   }
 
-#undef LAUNCH_SILU_AND_MUL_FP4_QUANTIZE_KERNEL
+#undef LAUNCH_SILU_AND_MUL_NVFP4_QUANTIZE_KERNEL
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp4_quantize, fp4_quantize);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp4_batched_quantize, fp4_batched_quantize);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(silu_and_mul_fp4_batched_quantize, silu_and_mul_fp4_batched_quantize);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(silu_and_mul_nvfp4_batched_quantize,
+                              silu_and_mul_nvfp4_batched_quantize);

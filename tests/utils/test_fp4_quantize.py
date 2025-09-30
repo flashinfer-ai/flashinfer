@@ -11,7 +11,7 @@ from flashinfer import (
     mxfp4_quantize,
     mxfp4_dequantize,
     nvfp4_batched_quantize,
-    silu_and_mul_fp4_batched_quantize,
+    silu_and_mul_nvfp4_batched_quantize,
 )
 from flashinfer.utils import is_sm100a_supported
 
@@ -377,13 +377,13 @@ def test_nvfp4_batched_quantize(
 @pytest.mark.parametrize("seed", SEEDS)
 @pytest.mark.parametrize("device", CUDA_DEVICES)
 @torch.inference_mode()
-def test_silu_and_mul_fp4_batched_quantize(
+def test_silu_and_mul_nvfp4_batched_quantize(
     dtype: torch.dtype,
     batch_shape: tuple[int, int, int],
     seed: int,
     device: str,
 ) -> None:
-    """Test silu_and_mul_fp4_batched_quantize function."""
+    """Test silu_and_mul_nvfp4_batched_quantize function."""
     if not is_sm100a_supported(torch.device(device)):
         pytest.skip("Nvfp4 Requires compute capability of 10 or above")
     torch.set_default_device(device)
@@ -399,7 +399,7 @@ def test_silu_and_mul_fp4_batched_quantize(
     tensor_amax = ref_y.abs().amax(dim=(1, 2)).to(torch.float32)
     global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax
 
-    out, out_scale = silu_and_mul_fp4_batched_quantize(x, mask, global_scale)
+    out, out_scale = silu_and_mul_nvfp4_batched_quantize(x, mask, global_scale)
     ref_out, ref_out_scale = nvfp4_batched_quantize(
         ref_y,
         global_scale,
