@@ -774,6 +774,57 @@ def get_native_fp4_dtype():
 def supports_backends(
     backends, capabilities=None, anti_capabilities=None, capability_tensor_arg=None
 ):
+    """Decorator to validate backend and capability support for functions.
+
+    This decorator wraps functions to ensure they are only called with supported
+    backends and optionally validates compute capabilities for specific tensor arguments.
+
+    Args:
+        backends (list): List of supported backend strings (e.g., ['cudnn', 'trtllm', 'cutlass']).
+        capabilities (dict, optional): Dictionary mapping backends to lists of supported
+            capabilities. Format: {'backend': ['capability1', 'capability2']}.
+            If provided, only listed capabilities are allowed for each backend.
+        anti_capabilities (dict, optional): Dictionary mapping backends to lists of
+            unsupported capabilities. Format: {'backend': ['capability1', 'capability2']}.
+            Takes precedence over capabilities - if a capability is in anti_capabilities,
+            it will be rejected even if listed in capabilities.
+        capability_tensor_arg (str, optional): Name of the tensor argument to use for
+            automatic compute capability detection. The tensor's device compute capability
+            will be extracted and used for validation.
+
+    Returns:
+        callable: Decorator function that wraps the target function.
+
+    Raises:
+        BackendSupportedError: If the function is called with an unsupported backend
+            or backend/capability combination.
+        ValueError: If capability_tensor_arg is specified but the tensor is None.
+
+    Added Attributes:
+        The decorated function gains two additional methods:
+        - is_supported(capability): Returns True if any backend supports the capability.
+        - is_backend_supported(backend, capability=None): Returns True if the specific
+          backend supports the given capability.
+
+    Example:
+        >>> @supports_backends(["cudnn", "trtllm"],
+        ...                   capabilities={'cudnn': ['100', '110', '102']},
+        ...                   anti_capabilities={"trtllm": ["110"]},
+        ...                   capability_tensor_arg='input_tensor')
+        ... def my_function(input_tensor, backend):
+        ...     return f"Processing on {backend}"
+
+        >>> # Check support without calling
+        >>> my_function.is_supported('110')  # True
+        >>> my_function.is_backend_supported('cudnn', '110')  # True
+        >>> my_function.is_backend_supported('trtllm', '110')   # False (anti-capability)
+
+        >>> # Function calls with validation
+        >>> tensor = torch.tensor([1, 2, 3]).cuda()  # Assume SM_100
+        >>> result = my_function(tensor, backend='cudnn')  # OK
+        >>> result = my_function(tensor, backend='cutlass')  # Raises BackendSupportedError
+    """
+
     def decorator(func):
         # Returns True if backend is supported; with capability, also checks if backend specifically supports it
         def is_backend_supported(backend, capability=None):
