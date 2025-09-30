@@ -483,6 +483,7 @@ def test_cute_dsl_gemm_allreduce_two_shot(world_size):
             f"world_size {world_size} is greater than available_gpus {available_gpus}"
         )
     from flashinfer.utils import get_compute_capability
+
     if get_compute_capability(torch.device("cuda")) != (10, 0):
         pytest.skip("cute_dsl_gemm_allreduce_two_shot requires SM100")
 
