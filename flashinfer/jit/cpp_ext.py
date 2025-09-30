@@ -17,22 +17,6 @@ from . import env as jit_env
 from ..compilation_context import CompilationContext
 
 
-def parse_env_flags(env_var_name) -> List[str]:
-    env_flags = os.environ.get(env_var_name)
-    if env_flags:
-        try:
-            import shlex
-
-            return shlex.split(env_flags)
-        except ValueError as e:
-            print(
-                f"Warning: Could not parse {env_var_name} with shlex: {e}. Falling back to simple split.",
-                file=sys.stderr,
-            )
-            return env_flags.split()
-    return []
-
-
 def _get_glibcxx_abi_build_flags() -> List[str]:
     glibcxx_abi_cflags = [
         "-D_GLIBCXX_USE_CXX11_ABI=" + str(int(torch._C._GLIBCXX_USE_CXX11_ABI))
@@ -168,17 +152,21 @@ def generate_ninja_build_for_op(
         "-lcudart",
     ]
 
-    extra_ldflags = parse_env_flags("FLASHINFER_EXTRA_LDFLAGS")
+    env_extra_ldflags = os.environ.get("FLASHINFER_EXTRA_LDFLAGS")
+    if env_extra_ldflags:
+        try:
+            import shlex
+
+            ldflags += shlex.split(env_extra_ldflags)
+        except ValueError as e:
+            print(
+                f"Warning: Could not parse FLASHINFER_EXTRA_LDFLAGS with shlex: {e}. Falling back to simple split.",
+                file=sys.stderr,
+            )
+            ldflags += env_extra_ldflags.split()
+
     if extra_ldflags is not None:
         ldflags += extra_ldflags
-
-    extra_cflags = parse_env_flags("FLASHINFER_EXTRA_CFLAGS")
-    if extra_cflags is not None:
-        cflags += extra_cflags
-
-    extra_cuda_cflags = parse_env_flags("FLASHINFER_EXTRA_CUDAFLAGS")
-    if extra_cuda_cflags is not None:
-        cuda_cflags += extra_cuda_cflags
 
     cxx = os.environ.get("CXX", "c++")
     cuda_home = get_cuda_path()
