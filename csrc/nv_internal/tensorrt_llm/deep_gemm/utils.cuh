@@ -29,50 +29,39 @@
 #ifndef NVRTC_JIT_COMPILATION
 #include <exception>
 
-class AssertionException : public std::exception
-{
-private:
-    std::string message{};
+class AssertionException : public std::exception {
+ private:
+  std::string message{};
 
-public:
-    explicit AssertionException(std::string const& message)
-        : message(message)
-    {
-    }
+ public:
+  explicit AssertionException(std::string const& message) : message(message) {}
 
-    char const* what() const noexcept override
-    {
-        return message.c_str();
-    }
+  char const* what() const noexcept override { return message.c_str(); }
 };
 #endif
 
 #ifndef DG_HOST_ASSERT
 #ifdef NVRTC_JIT_COMPILATION
-#define DG_HOST_ASSERT(cond) ((void) 0)
+#define DG_HOST_ASSERT(cond) ((void)0)
 #else
-#define DG_HOST_ASSERT(cond)                                                                                           \
-    do                                                                                                                 \
-    {                                                                                                                  \
-        if (not(cond))                                                                                                 \
-        {                                                                                                              \
-            printf("Assertion failed: %s:%d, condition: %s\n", __FILE__, __LINE__, #cond);                             \
-            throw AssertionException("Assertion failed: " #cond);                                                      \
-        }                                                                                                              \
-    } while (0)
+#define DG_HOST_ASSERT(cond)                                                         \
+  do {                                                                               \
+    if (not(cond)) {                                                                 \
+      printf("Assertion failed: %s:%d, condition: %s\n", __FILE__, __LINE__, #cond); \
+      throw AssertionException("Assertion failed: " #cond);                          \
+    }                                                                                \
+  } while (0)
 #endif
 #endif
 
 #ifndef DG_DEVICE_ASSERT
-#define DG_DEVICE_ASSERT(cond)                                                                                         \
-    do                                                                                                                 \
-    {                                                                                                                  \
-        if (not(cond))                                                                                                 \
-        {                                                                                                              \
-            printf("Assertion failed: %s:%d, condition: %s\n", __FILE__, __LINE__, #cond);                             \
-            asm("trap;");                                                                                              \
-        }                                                                                                              \
-    } while (0)
+#define DG_DEVICE_ASSERT(cond)                                                       \
+  do {                                                                               \
+    if (not(cond)) {                                                                 \
+      printf("Assertion failed: %s:%d, condition: %s\n", __FILE__, __LINE__, #cond); \
+      asm("trap;");                                                                  \
+    }                                                                                \
+  } while (0)
 #endif
 
 #ifndef DG_STATIC_ASSERT
@@ -80,7 +69,6 @@ public:
 #endif
 
 template <typename T>
-__device__ __host__ constexpr T ceil_div(T a, T b)
-{
-    return (a + b - 1) / b;
+__device__ __host__ constexpr T ceil_div(T a, T b) {
+  return (a + b - 1) / b;
 }

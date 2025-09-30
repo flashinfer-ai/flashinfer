@@ -29,41 +29,29 @@ using int64_t = signed long long;
 using uint64_t = unsigned long long;
 using cuuint64_t = unsigned long long;
 
-namespace std
-{
+namespace std {
 template <class T, T v>
-struct integral_constant
-{
-    static constexpr T value = v;
-    using value_type = T;
-    using type = integral_constant; // using injected-class-name
+struct integral_constant {
+  static constexpr T value = v;
+  using value_type = T;
+  using type = integral_constant;  // using injected-class-name
 
-    __device__ constexpr operator value_type() const noexcept
-    {
-        return value;
-    }
+  __device__ constexpr operator value_type() const noexcept { return value; }
 
-    __device__ constexpr value_type operator()() const noexcept
-    {
-        return value;
-    } // since c++14
+  __device__ constexpr value_type operator()() const noexcept { return value; }  // since c++14
 };
 
 using false_type = integral_constant<bool, false>;
 using true_type = integral_constant<bool, true>;
 
 template <class T, class U>
-struct is_same : false_type
-{
-};
+struct is_same : false_type {};
 
 template <class T>
-struct is_same<T, T> : true_type
-{
-};
+struct is_same<T, T> : true_type {};
 
 template <class T, class U>
 inline constexpr bool is_same_v = is_same<T, U>::value;
-} // namespace std
+}  // namespace std
 
 #endif

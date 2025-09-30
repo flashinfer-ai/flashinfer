@@ -960,10 +960,12 @@ def test_moe_fp8_block_scaling(
     x = torch.randn(batch_size, hidden_size, dtype=otype).cuda()
 
     w31_weight = (
-        torch.randn(num_experts, 2 * intermediate_size, hidden_size, dtype=otype).cuda() / 10
+        torch.randn(num_experts, 2 * intermediate_size, hidden_size, dtype=otype).cuda()
+        / 10
     )
     w2_weight = (
-        torch.randn(num_experts, hidden_size, intermediate_size, dtype=otype).cuda() / 10
+        torch.randn(num_experts, hidden_size, intermediate_size, dtype=otype).cuda()
+        / 10
     )
 
     # Generate unique random expert indices for each token
@@ -1032,6 +1034,7 @@ def test_moe_fp8_block_scaling(
     )
 
     torch.testing.assert_close(flash_output, ref_output, rtol=1e-1, atol=1e-1)
+
 
 def quant_mxfp4_batches(a, num_experts):
     quant_a = []
