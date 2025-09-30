@@ -26,13 +26,14 @@ ENV PATH="/opt/conda/envs/py312/bin:$PATH"
 
 # Install torch and other python packages
 COPY install/install_python_packages.sh /install/install_python_packages.sh
-RUN bash /install/install_python_packages.sh cu126 && pip3 install pre-commit
+# use nightly/cu130 temporarily and change to cu130 when torch releases stable version
+RUN bash /install/install_python_packages.sh nightly/cu130 && pip3 install pre-commit
 
 # Install mpi4py in the conda environment
 RUN conda install -n py312 -y mpi4py
 
 # Install oh-my-zsh
-RUN sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended
+RUN sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)"
 
 # Install zsh-autosuggestions
 RUN git clone https://github.com/zsh-users/zsh-autosuggestions ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/zsh-autosuggestions
