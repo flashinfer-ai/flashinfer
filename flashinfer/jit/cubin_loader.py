@@ -125,6 +125,8 @@ def load_cubin(cubin_path, sha256) -> bytes:
             actual_sha = m.hexdigest()
             if sha256 == actual_sha:
                 return cubin
+            if "checksums" in cubin_path:  # checksum file isn't checked
+                return cubin
             logger.warning(
                 f"sha256 mismatch (expected {sha256} actual {actual_sha}) for {cubin_path}"
             )

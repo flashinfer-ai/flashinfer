@@ -107,9 +107,9 @@ def get_checksums(kernels):
     return checksums
 
 
-def get_cubin_file_list():
+def get_subdir_file_list():
     base = FLASHINFER_CUBINS_REPOSITORY.rstrip("/")
-    cubin_files = [
+    subdir_files = [
         (
             ArtifactPath.TRTLLM_GEN_FMHA + "include/flashInferMetaInfo",
             ".h",
@@ -135,13 +135,14 @@ def get_cubin_file_list():
     checksums = get_checksums(kernels)
 
     for kernel in kernels:
-        cubin_files += [
+        subdir_files += [(kernel + "checksums", ".txt", None)]
+        subdir_files += [
             (kernel + name, extension, checksums[kernel + name + extension])
             for name, extension in get_available_cubin_files(
                 urljoin(base + "/", kernel)
             )
         ]
-    return cubin_files
+    return subdir_files
 
 
 def download_artifacts():
@@ -150,7 +151,7 @@ def download_artifacts():
     # use a shared session to make use of HTTP keep-alive and reuse of
     # HTTPS connections.
     session = requests.Session()
-    cubin_files = get_cubin_file_list()
+    cubin_files = get_subdir_file_list()
     num_threads = int(os.environ.get("FLASHINFER_CUBIN_DOWNLOAD_THREADS", "4"))
     with tqdm_logging_redirect(
         total=len(cubin_files), desc="Downloading cubins"
@@ -162,6 +163,8 @@ def download_artifacts():
         with ThreadPoolExecutor(num_threads) as pool:
             futures = []
             for name, extension, checksum in cubin_files:
+                if "checksums" in name:
+                    continue
                 fut = pool.submit(get_cubin, name, checksum, extension, session)
                 fut.add_done_callback(update_pbar_cb)
                 futures.append(fut)
@@ -178,7 +181,7 @@ def get_artifacts_status():
     Check which cubins are already downloaded and return (num_downloaded, total).
     Does not download any cubins.
     """
-    cubin_files = get_cubin_file_list()
+    cubin_files = get_subdir_file_list()
     status = []
     for name, extension in cubin_files:
         # get_cubin stores cubins in FLASHINFER_CUBIN_DIR with the same relative path
