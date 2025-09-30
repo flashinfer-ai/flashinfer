@@ -2779,6 +2779,9 @@ def group_gemm_fp8_nt_groupwise(
                 a_scale_group = a_scale[m_start:m_end, :].contiguous()
                 b_scale_group = b_scale[i : i + 1, :, :].contiguous()
             else:  # MN mode
+                assert m_start % scale_granularity_mnk[0] == 0, (
+                    f"m_start ({m_start}) is not aligned to scale_granularity_m ({scale_granularity_mnk[0]})"
+                )
                 sf_m_start = m_start // scale_granularity_mnk[0]
                 sf_m_end = (
                     m_end + scale_granularity_mnk[0] - 1
