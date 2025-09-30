@@ -263,6 +263,23 @@ def convert_to_block_layout(input_tensor: torch.Tensor, blockK: int) -> torch.Te
     return input_tensor.view(M, K // blockK, blockK).permute(1, 0, 2).contiguous()
 
 
+def gen_cutlass_fused_moe_sm120_module(use_fast_build: bool = False) -> JitSpec:
+    nvcc_flags = [
+        "-DCOMPILE_BLACKWELL_TMA_GEMMS",
+        "-DCOMPILE_BLACKWELL_SM120_TMA_GROUPED_GEMMS",
+        "-DENABLE_BF16",
+        "-DENABLE_FP8",
+        "-DENABLE_FP4",
+        "-DUSING_OSS_CUTLASS_MOE_GEMM",
+    ]
+
+    nvcc_flags += current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[12]
+    )
+
+    return gen_cutlass_fused_moe_module(nvcc_flags, "120", use_fast_build)
+
+
 def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool = False) -> JitSpec:
     nvcc_flags = [
         "-DCOMPILE_BLACKWELL_TMA_GEMMS",
@@ -274,7 +291,7 @@ def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool = False) -> JitSpec:
     ]
 
     nvcc_flags += current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[10, 11, 12]
+        supported_major_versions=[10, 11]
     )
 
     return gen_cutlass_fused_moe_module(nvcc_flags, "100", use_fast_build)
@@ -396,7 +413,9 @@ def gen_cutlass_fused_moe_module(
 
 @functools.cache
 def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = False):
-    if backend in ("100", "103", "110", "120", "121"):
+    if backend in ("120", "121"):
+        module = gen_cutlass_fused_moe_sm120_module(use_fast_build).build_and_load()
+    elif backend in ("100", "103", "110"):
         module = gen_cutlass_fused_moe_sm100_module(use_fast_build).build_and_load()
     elif backend == "90":
         module = gen_cutlass_fused_moe_sm90_module(use_fast_build).build_and_load()
