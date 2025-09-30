@@ -15,13 +15,16 @@
  */
 
 #include "fp8_blockscale_gemm.h"
+#ifdef ENABLE_FP8_BLOCK_SCALE
 #include "fp8_blockscale_gemm_kernel.cuh"
+#endif
 #include "tensorrt_llm/common/logger.h"
 
 namespace tensorrt_llm::kernels::fp8_blockscale_gemm {
 
 template <typename ElementA, typename ElementB, typename ElementD>
 void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::gemm(
+#ifdef ENABLE_FP8_BLOCK_SCALE
     void* mat_d, void const* mat_a, void const* mat_b, int shape_m, int shape_n, int shape_k,
     cudaStream_t stream, float const* scales_a, float const* scales_b) {
   constexpr bool internal_quantize_a = !std::is_same_v<ElementA, __nv_fp8_e4m3>;
@@ -67,8 +70,11 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::gemm(
                  shape_m, shape_n, shape_k, stream, internal_quantize_a, internal_quantize_b);
   }
 #else   // COMPILE_HOPPER_TMA_GEMMS
-  TLLM_THROW("fp8 blockscale gemm only support Hopper.");
+  TLLM_THROW("fp8 blockscale gemm only supported on Hopper.");
 #endif  // COMPILE_HOPPER_TMA_GEMMS
+#else
+  TLLM_THROW("fp8 blockscale gemm only supported on cuda version 12.8 or higher.");
+#endif
 }
 
 template <typename ElementA, typename ElementB, typename ElementD>
@@ -76,13 +82,18 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::gemm(
     __nv_fp8_e4m3 const* mat_a, int ld_a, __nv_fp8_e4m3 const* mat_b, int ld_b,
     __nv_bfloat16* mat_d, int ld_d, int shape_m, int shape_n, int shape_k, float const* scales_a,
     float const* scales_b, cudaStream_t stream) {
+#ifdef ENABLE_FP8_BLOCK_SCALE
   fp8_gemm_run(const_cast<__nv_fp8_e4m3*>(mat_a), ld_a, const_cast<__nv_fp8_e4m3*>(mat_b), ld_b,
                mat_d, ld_d, shape_m, shape_n, shape_k, const_cast<float*>(scales_a),
                const_cast<float*>(scales_b), stream);
+#else
+  TLLM_THROW("fp8 blockscale gemm only supported on cuda version 12.8 or higher.");
+#endif
 }
 
 template <typename ElementA, typename ElementB, typename ElementD>
 void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::moeGemm(
+#ifdef ENABLE_FP8_BLOCK_SCALE
     void* mat_d, void const* mat_a, void const* mat_b, int64_t const* problem_m_offsets,
     size_t num_problems, size_t shape_n, size_t shape_k, cudaStream_t stream, float const* scales_a,
     float const* scales_b) {
@@ -149,6 +160,9 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::moeGemm(
 #else
   TLLM_THROW("fp8 blockscale gemm only support Hopper.");
 #endif
+#else
+  TLLM_THROW("fp8 blockscale gemm only supported on cuda version 12.8 or higher.");
+#endif
 }
 
 template <typename ElementA, typename ElementB, typename ElementD>
@@ -156,35 +170,52 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::strideBatchGe
     __nv_bfloat16* mat_d, int ld_d, int stride_d, __nv_fp8_e4m3* mat_a, int ld_a, int stride_a,
     __nv_fp8_e4m3* mat_b, int ld_b, int stride_b, int num_problems, int shape_m, int shape_n,
     int shape_k, cudaStream_t stream, float* scales_a, int stride_scales_a, float* scales_b) {
+#ifdef ENABLE_FP8_BLOCK_SCALE
   fp8_stride_batch_gemm_run(nullptr, mat_a, scales_a, ld_a, stride_a, stride_scales_a, nullptr,
                             mat_b, scales_b, ld_b, stride_b, mat_d, ld_d, stride_d, num_problems,
                             shape_m, shape_n, shape_k, stream, false, false);
+#else
+  TLLM_THROW("fp8 blockscale gemm only supported on cuda version 12.8 or higher.");
+#endif
 }
 
 template <typename ElementA, typename ElementB, typename ElementD>
 void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::fp8CS1x128(
     __nv_fp8_e4m3* mat_quant, float* scales, __nv_bfloat16 const* mat, int shape_x, int shape_y,
     cudaStream_t stream) {
+#ifdef ENABLE_FP8_BLOCK_SCALE
   fp8_1x128_cs(mat_quant, scales, mat, shape_x, shape_y, stream);
+#else
+  TLLM_THROW("fp8 blockscale gemm only supported on cuda version 12.8 or higher.");
+#endif
 }
 
 template <typename ElementA, typename ElementB, typename ElementD>
 void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::fp8CS1x128Reshape(
     __nv_fp8_e4m3* mat_quant, float* scales, __nv_bfloat16 const* mat, int shape_x, int shape_h,
     int shape_y, int stride_x, cudaStream_t stream) {
+#ifdef ENABLE_FP8_BLOCK_SCALE
   fp8_1x128_cs_reshape(mat_quant, scales, mat, shape_x, shape_h, shape_y, stride_x, stream);
+#else
+  TLLM_THROW("fp8 blockscale gemm only supported on cuda version 12.8 or higher.");
+#endif
 }
 
 template <typename ElementA, typename ElementB, typename ElementD>
 void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::fp8CS128x128(
     __nv_fp8_e4m3* mat_quant, float* scales, __nv_bfloat16 const* mat, int shape_x, int shape_y,
     cudaStream_t stream) {
+#ifdef ENABLE_FP8_BLOCK_SCALE
   fp8_128x128_cs(mat_quant, scales, mat, shape_x, shape_y, stream);
+#else
+  TLLM_THROW("fp8 blockscale gemm only supported on cuda version 12.8 or higher.");
+#endif
 }
 
 template <typename ElementA, typename ElementB, typename ElementD>
 size_t CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::getWorkspaceSizeBase(
     size_t max_shape_m, size_t shape_n, size_t shape_k, size_t num_problems) {
+#ifdef ENABLE_FP8_BLOCK_SCALE
   max_shape_m_4_align_ = std::max(max_shape_m_4_align_, int64_t(div_up(max_shape_m, 4) * 4));
   if (expected_m_ == 0) {
     expected_m_ = div_up(max_shape_m_4_align_, num_problems);
@@ -210,19 +241,27 @@ size_t CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::getWorkspac
   }
 
   return total_workspace_size;
+#else
+  TLLM_THROW("fp8 blockscale gemm only supported on cuda version 12.8 or higher.");
+#endif
 }
 
 template <typename ElementA, typename ElementB, typename ElementD>
 size_t CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::getWorkspaceSize(
     size_t shape_m, size_t shape_n, size_t shape_k, size_t top_k, size_t num_problems) {
+#ifdef ENABLE_FP8_BLOCK_SCALE
   expected_m_ = shape_m;
   return getWorkspaceSizeBase(shape_m * top_k, shape_n, shape_k, num_problems);
+#else
+  TLLM_THROW("fp8 blockscale gemm only supported on cuda version 12.8 or higher.");
+#endif
 }
 
 template <typename ElementA, typename ElementB, typename ElementD>
 size_t CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::getFP8DataSize(int shape_m,
                                                                                     int shape_n,
                                                                                     bool is_act) {
+#ifdef ENABLE_FP8_BLOCK_SCALE
   int shape_m_4_align = div_up(shape_m, 4) * 4;
   constexpr bool internal_quantize_a = !std::is_same_v<ElementA, __nv_fp8_e4m3>;
   constexpr bool internal_quantize_b = !std::is_same_v<ElementB, __nv_fp8_e4m3>;
@@ -234,11 +273,15 @@ size_t CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::getFP8DataS
     return div_up(shape_m * shape_n * sizeof(__nv_fp8_e4m3), 128) * 128;
   }
   return 0;
+#else
+  TLLM_THROW("fp8 blockscale gemm only supported on cuda version 12.8 or higher.");
+#endif
 }
 
 template <typename ElementA, typename ElementB, typename ElementD>
 size_t CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::getActScaleSize(int shape_m,
                                                                                      int shape_k) {
+#ifdef ENABLE_FP8_BLOCK_SCALE
   int shape_m_4_align = div_up(shape_m, 4) * 4;
   constexpr bool internal_quantize_a = !std::is_same_v<ElementA, __nv_fp8_e4m3>;
   size_t total_workspace_size = 0;
@@ -248,11 +291,15 @@ size_t CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::getActScale
         div_up(shape_m_4_align * div_up(shape_k, 128) * sizeof(float), 128) * 128;
   }
   return total_workspace_size;
+#else
+  TLLM_THROW("fp8 blockscale gemm only supported on cuda version 12.8 or higher.");
+#endif
 }
 
 template <typename ElementA, typename ElementB, typename ElementD>
 size_t CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::getWeightScaleSize(
     int shape_n, int shape_k) {
+#ifdef ENABLE_FP8_BLOCK_SCALE
   constexpr bool internal_quantize_b = !std::is_same_v<ElementB, __nv_fp8_e4m3>;
   size_t total_workspace_size = 0;
   if constexpr (internal_quantize_b) {
@@ -262,18 +309,29 @@ size_t CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::getWeightSc
   }
 
   return total_workspace_size;
+#else
+  TLLM_THROW("fp8 blockscale gemm only supported on cuda version 12.8 or higher.");
+#endif
 }
 
 template <typename ElementA, typename ElementB, typename ElementD>
 size_t CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::getActWorkspaceSize(
     int shape_m, int shape_k) {
+#ifdef ENABLE_FP8_BLOCK_SCALE
   return getFP8DataSize(shape_m, shape_k, true) + getActScaleSize(shape_m, shape_k);
+#else
+  TLLM_THROW("fp8 blockscale gemm only supported on cuda version 12.8 or higher.");
+#endif
 }
 
 template <typename ElementA, typename ElementB, typename ElementD>
 size_t CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::getWeightWorkspaceSize(
     int shape_n, int shape_k) {
+#ifdef ENABLE_FP8_BLOCK_SCALE
   return getFP8DataSize(shape_n, shape_k, false) + getWeightScaleSize(shape_n, shape_k);
+#else
+  TLLM_THROW("fp8 blockscale gemm only supported on cuda version 12.8 or higher.");
+#endif
 }
 
 template class CutlassFp8BlockScaleGemmRunner<__nv_bfloat16, __nv_bfloat16, __nv_bfloat16>;

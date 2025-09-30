@@ -285,6 +285,7 @@ def gen_cutlass_fused_moe_sm90_module(use_fast_build: bool = False) -> JitSpec:
         "-DCOMPILE_HOPPER_TMA_GROUPED_GEMMS",
         "-DENABLE_BF16",
         "-DENABLE_FP8",
+        "-DENABLE_FP8_BLOCK_SCALE" if is_cuda_version_at_least("12.8") else "",
         "-DENABLE_FP4" if is_cuda_version_at_least("12.8") else "",
         "-DUSING_OSS_CUTLASS_MOE_GEMM",
     ]
@@ -864,10 +865,15 @@ def cutlass_fused_moe(
     if min_latency_mode:
         raise NotImplementedError("min latency mode not yet implemented for Blackwell.")
 
-    if use_deepseek_fp8_block_scale and device_arch != "90":
-        raise NotImplementedError(
-            "FP8 block scaling not yet implemented for Blackwell."
-        )
+    if use_deepseek_fp8_block_scale:
+        if device_arch != "90":
+            raise NotImplementedError(
+                "FP8 block scaling not yet implemented for Blackwell."
+            )
+        elif not is_cuda_version_at_least("12.8"):
+            raise NotImplementedError(
+                "FP8 block scaling not implemented for CUDA 12.6 or lower."
+            )
 
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)

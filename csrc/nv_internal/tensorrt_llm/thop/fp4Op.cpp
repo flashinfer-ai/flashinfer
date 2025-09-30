@@ -402,7 +402,7 @@ at::Tensor mxfp4_dequantize_host(at::Tensor weight, at::Tensor scale, int64_t gr
   }
 #else
   // NOTE(Zihao): __nv_fp8_e8m0 is not supported for CUDA < 12.8
-  TLLM_THROW("mxfp4_dequantize_host is not supported for CUDA < 12.8");
+  TLLM_THROW("mxfp4_dequantize_host is not supported for CUDA < 12.8 ");
 #endif
 
   return dequant_weight;

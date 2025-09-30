@@ -1024,13 +1024,13 @@ def test_moe_fp8_block_scaling(
 
     flash_output = torch.zeros_like(x)
 
-    excption_context = (
+    execption_context = (
         pytest.raises(NotImplementedError)
-        if torch.cuda.get_device_capability()[0] != 90
+        if torch.cuda.get_device_capability()[0] != 9
         else nullcontext()
     )
 
-    with excption_context:
+    with execption_context:
         _ = fused_moe.cutlass_fused_moe(
             x.contiguous(),
             selected_experts.to(torch.int),

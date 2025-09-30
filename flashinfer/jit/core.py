@@ -72,6 +72,7 @@ common_nvcc_flags = [
     "-DFLASHINFER_ENABLE_FP8_E8M0",
     "-DFLASHINFER_ENABLE_FP4_E2M1",
 ]
+
 sm90a_nvcc_flags = ["-gencode=arch=compute_90a,code=sm_90a"] + common_nvcc_flags
 sm100a_nvcc_flags = ["-gencode=arch=compute_100a,code=sm_100a"] + common_nvcc_flags
 sm103a_nvcc_flags = ["-gencode=arch=compute_103a,code=sm_103a"] + common_nvcc_flags
@@ -262,7 +263,13 @@ def gen_jit_spec(
     check_cuda_arch()
     verbose = os.environ.get("FLASHINFER_JIT_VERBOSE", "0") == "1"
 
-    cflags = ["-O3", "-std=c++17", "-Wno-switch-bool"]
+    cflags = [
+        "-O3",
+        "-std=c++17",
+        "-Wno-switch-bool",
+        "-D__CUDACC_VER_MAJOR__=" + str(torch.version.cuda.split(".")[0]),
+        "-D__CUDACC_VER_MINOR__=" + str(torch.version.cuda.split(".")[1]),
+    ]
     cuda_cflags = [
         "-O3",
         "-std=c++17",
