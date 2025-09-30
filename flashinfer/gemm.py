@@ -1014,8 +1014,8 @@ def tgv_gemm_sm100(
         - Tensor b is expected to be in column-major layout (transposed from typical PyTorch row-major)
     """
     # Verify SM100 architecture support
-    if not _match_sm_version(a.device, ["100", "103", "110"]):
-        raise ValueError("TGV GEMM requires SM100, SM103, or SM110 architecture")
+    if not _match_sm_version(a.device, ["100"]):
+        raise ValueError("TGV GEMM requires SM100 architecture")
 
     # Verify dtype support
     if a.dtype not in [torch.bfloat16, torch.float16]:
