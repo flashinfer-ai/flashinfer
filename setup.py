@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import os
 from pathlib import Path
 from typing import List, Mapping
 
@@ -32,10 +31,7 @@ def write_if_different(path: Path, content: str) -> None:
 
 def get_version():
     package_version = (root / "version.txt").read_text().strip()
-    local_version = os.environ.get("FLASHINFER_LOCAL_VERSION")
-    if local_version is None:
-        return package_version
-    return f"{package_version}+{local_version}"
+    return f"{package_version}"
 
 
 def generate_build_meta() -> None:

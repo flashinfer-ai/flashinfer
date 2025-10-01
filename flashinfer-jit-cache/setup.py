@@ -25,6 +25,15 @@ def get_version():
     return version
 
 
+def generate_build_meta():
+    """Generate build metadata file."""
+    build_meta_file = Path(__file__).parent / "_build_meta.py"
+    version = get_version()
+    with open(build_meta_file, "w") as f:
+        f.write('"""Build metadata for flashinfer-jit-cache package."""\n')
+        f.write(f'__version__ = "{version}"\n')
+
+
 class PlatformSpecificBdistWheel(bdist_wheel):
     """Custom wheel builder that uses py_limited_api for cp39+."""
 

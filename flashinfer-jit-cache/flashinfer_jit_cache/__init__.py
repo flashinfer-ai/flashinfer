@@ -19,33 +19,20 @@ from pathlib import Path
 from typing import List, Optional
 
 # Get the path to the AOT modules directory within this package
-jit_cache_DIR = Path(__file__).parent / "jit_cache"
+jit_cache_dir = Path(__file__).parent / "jit_cache"
 
 
 def get_jit_cache_dir() -> str:
     """Get the directory containing the AOT compiled modules."""
-    return str(jit_cache_DIR)
+    return str(jit_cache_dir)
 
 
-# Read version from build metadata or fallback to main flashinfer version.txt
-def _get_version():
-    # First try to read from build metadata (for wheel distributions)
-    try:
-        from . import _build_meta
-
-        return _build_meta.__version__
-    except ImportError:
-        pass
-
-    # Fallback to reading from the main flashinfer version.txt (for development)
-    version_file = Path(__file__).parent.parent.parent / "version.txt"
-    if version_file.exists():
-        with open(version_file, "r") as f:
-            return f.read().strip()
-    return "0.0.0"
+try:
+    from ._build_meta import __version__ as __version__
+except ModuleNotFoundError:
+    __version__ = "0.0.0+unknown"
 
 
-__version__ = _get_version()
 __all__ = [
     "get_jit_cache_dir",
 ]
