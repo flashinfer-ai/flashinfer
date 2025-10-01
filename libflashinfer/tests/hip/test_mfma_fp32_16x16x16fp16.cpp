@@ -41,7 +41,6 @@ void gemm_reference(const __half* A, const __half* B, float* C, int M, int N, in
     for (int j = 0; j < N; ++j) {
       float acc = 0.0f;
       for (int k = 0; k < K; ++k) {
-        // Use __half_as_float to properly convert __half to float
         acc += __half2float(A[i * K + k]) * __half2float(B[k * N + j]);
       }
       C[i * N + j] = acc;
@@ -54,26 +53,15 @@ __global__ void test_mfma_kernel(const __half* A, const __half* B, float* C) {
   uint32_t b_reg[2];
   float c_reg[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
-  // A Matrix is read row wise. Threads T0...T15 read Col 0...3 of Row 0...15
-  // Threads T16...T31 read Col 4...7 of Row 0...15
-  // Threads T32...T47 read Col 8...11 of Row 0...15
-  // Threads T48...T63 read Col 12...15 of Row 0...15
-
-  // B Matrix is read column wise. Threads T0...T15 read Row 0...3 of Col
-  // 0...15 (Each thread reads 1 column per 4 rows) Threads T16...T31 read
-  // Row 4...7 of Col 0...15 Threads T32...T47 read Row 8...11 of Col 0...15
-  // Threads T48...T63 read Row 12...15 of Col 0...15
-  int a_idx = (threadIdx.x / 16) * 4 + threadIdx.x % 16 * LDA;
-  int b_idx = (threadIdx.x / 16) * LDB * 4 + threadIdx.x % 16;
+  int a_idx = (threadIdx.x % 16) * LDA + (threadIdx.x / 16) * 4;
+  int b_idx = ((threadIdx.x % 4) + 4 * (threadIdx.x / 16)) * LDB + ((threadIdx.x % 16) / 4) * 4;
 
   flashinfer::gpu_iface::mma::load_fragment<__half>(a_reg, &A[a_idx]);
-  flashinfer::gpu_iface::mma::load_fragment_transpose<__half>(b_reg, &B[b_idx], LDB);
-
+  flashinfer::gpu_iface::mma_impl::hip::load_fragment_4x4_half_registers<__half>(b_reg, &B[b_idx]);
   flashinfer::gpu_iface::mma::mma_sync_m16n16k16_row_col_f16f16f32<__half>(c_reg, a_reg, b_reg);
 
   for (int i = 0; i < 4; ++i) {
-    const int d_idx = threadIdx.x % 16 + i * LDC + (threadIdx.x / 16) * 4 * LDC;
-
+    int d_idx = ((threadIdx.x / 16) * 4 + i) * LDC + (threadIdx.x % 16);
     C[d_idx] = c_reg[i];
   }
 }
