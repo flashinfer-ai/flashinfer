@@ -22,7 +22,7 @@ from tests.test_helpers.jit_utils import (
 )
 
 import flashinfer
-from flashinfer.jit.attention.pytorch import gen_pod_module
+from flashinfer.jit.attention import gen_pod_module
 
 
 @pytest.fixture(autouse=True, scope="module")
