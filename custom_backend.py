@@ -24,7 +24,6 @@ def _create_data_dir():
     ln("3rdparty/spdlog", "spdlog")
     ln("csrc", "csrc")
     ln("include", "include")
-    ln("tvm_binding", "tvm_binding")
 
 
 def _prepare_for_wheel():

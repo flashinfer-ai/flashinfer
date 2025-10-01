@@ -19,7 +19,6 @@
 #include <cuda_runtime_api.h>
 
 #include <array>
-#include <optional>
 #include <vector>
 
 #include "./common.h"

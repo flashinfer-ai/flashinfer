@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "flashinfer/exception.h"
 #include "flashinfer/trtllm/fused_moe/RoutingKernel.cuh"
 
 namespace moe::dev::routing {
@@ -22,10 +23,13 @@ namespace routingDeepSeek {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+static constexpr int NumThreads = 384;
+static constexpr int NumWarps = NumThreads / WarpSize;
 static constexpr int NumTopGroupScores = 2;
 static constexpr int MaxNumTopExperts = 8;
+static constexpr int MaxNumTopGroupsDefault = 16;
 
-__host__ __device__ int constexpr getMaxNumTopGroups(const bool useGroups, const int numExperts) {
+__host__ __device__ int getMaxNumTopGroups(const bool useGroups, const int numExperts) {
   if (useGroups || numExperts <= 256) {
     return 4;
   } else {
@@ -38,10 +42,8 @@ __global__ void routingMainKernel(KernelParams params) {
   // declare types
   using OutputT = typename KernelParams::OutputT;
   using InputT = typename KernelParams::InputT;
-  static constexpr int NumThreads = KernelParams::NumExperts;  // DeepSeek uses 1 thread per expert
   static constexpr int NumWarps = NumThreads / WarpSize;
-  constexpr int MaxNumTopGroups =
-      getMaxNumTopGroups(KernelParams::UseGroups, KernelParams::NumExperts);
+  int MaxNumTopGroups = getMaxNumTopGroups(KernelParams::UseGroups, params.mNumExperts);
 
   // declare shared memory structure
   // number of experts is bounded by number of threads
@@ -71,19 +73,19 @@ __global__ void routingMainKernel(KernelParams params) {
 
   // load bias already; each warp represents one expert group
   auto threadExpert = threadIdx.x;
-  bool expertSelected = threadExpert < KernelParams::NumExperts;
+  bool expertSelected = threadExpert < params.mNumExperts;
   if constexpr (KernelParams::UseGroups) {
     threadExpert = warpIdx * params.mNumExpertsPerGroup + laneIdx;
     expertSelected = laneIdx < params.mNumExpertsPerGroup;
   }
-  auto scoreIdx = int64_t{blockIdx.x} * int64_t{KernelParams::NumExperts} + threadExpert;
+  auto scoreIdx = int64_t{blockIdx.x} * int64_t{params.mNumExperts} + threadExpert;
   auto biasVal = expertSelected ? params.mPtrRoutingBias[threadExpert] : invalidScore;
 
   // initialize the mPtrExpertCounts
   if (params.mPtrExpertCounts) {
     int32_t globalThreadIdx = blockIdx.x * NumThreads + threadIdx.x;
     int32_t globalThreadStride = gridDim.x * NumThreads;
-    int32_t expertCountsNum = 2 * KernelParams::NumExperts;
+    int32_t expertCountsNum = 2 * params.mNumExperts;
     initArr(globalThreadIdx, expertCountsNum, globalThreadStride, params.mPtrExpertCounts, 0);
   }
 
@@ -118,10 +120,10 @@ __global__ void routingMainKernel(KernelParams params) {
   // registers for top group score reduction
   float topExpGroupScores[NumTopGroupScores];
   [[maybe_unused]] int32_t topExpGroupIdx[NumTopGroupScores];
-  float topGroups[MaxNumTopGroups];  // bound of params.mNumLimitedGroups
-  int32_t topGroupIdx[MaxNumTopGroups];
-  float expertScoreGroup[MaxNumTopGroups];
-  int32_t expertIdxGroup[MaxNumTopGroups];
+  float topGroups[MaxNumTopGroupsDefault];  // bound of params.mNumLimitedGroups
+  int32_t topGroupIdx[MaxNumTopGroupsDefault];
+  float expertScoreGroup[MaxNumTopGroupsDefault];
+  int32_t expertIdxGroup[MaxNumTopGroupsDefault];
   float topScores[MaxNumTopExperts];  // bound of params.mTopK
   int32_t topExperts[MaxNumTopExperts];
 
@@ -168,15 +170,13 @@ __global__ void routingMainKernel(KernelParams params) {
     } else {
       // without groups, each thread just takes `MaxNumTopGroups` experts
 
-#pragma unroll
       for (int ii = 0; ii < MaxNumTopGroups; ++ii) {
         auto expertIdx = ii * WarpSize + laneIdx;
         expertIdxGroup[ii] = expertIdx;
         expertScoreGroup[ii] =
-            expertIdx < KernelParams::NumExperts ? smemScoreBias[expertIdx] : invalidScoreFloat;
+            expertIdx < params.mNumExperts ? smemScoreBias[expertIdx] : invalidScoreFloat;
       }
     }
-
     topk::reduceTopK(warp, topScores, topExperts, expertScoreGroup, expertIdxGroup,
                      /* minValue */ invalidScoreFloat, params.mTopK);
 
@@ -214,10 +214,8 @@ __global__ void routingMainKernel(KernelParams params) {
 template <typename KernelParams>
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1)
-    __launch_bounds__(KernelParams::NumExperts) routingIndicesClusterKernel(KernelParams params) {
+    routingIndicesClusterKernel(KernelParams params) {
   using OutputT = typename KernelParams::OutputT;
-  static constexpr int NumThreads = KernelParams::NumExperts;  // DeepSeek uses 1 thread per expert
-  static constexpr int NumWarps = NumThreads / WarpSize;
 
   int32_t const warpIdx = __shfl_sync(0xffffffff, threadIdx.x / WarpSize, 0);
   int32_t const clusterBlockRank = blockIdx.x;
@@ -241,9 +239,7 @@ __global__ void routingIndicesClusterKernel(KernelParams params) {
 
 template <typename KernelParams>
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-__global__ void __launch_bounds__(KernelParams::NumExperts)
-    routingIndicesCoopKernel(KernelParams params) {
-  static constexpr int NumThreads = KernelParams::NumExperts;  // DeepSeek uses 1 thread per expert
+__global__ void routingIndicesCoopKernel(KernelParams params) {
   static constexpr int NumWarps = NumThreads / WarpSize;
   // number of experts is bounded by number of threads
   __shared__ int32_t __attribute((aligned(128))) smemExpertCount[NumThreads];
@@ -336,7 +332,7 @@ __global__ void __launch_bounds__(KernelParams::NumExperts)
   int32_t const localExpertCount = smemExpertCount[threadIdx.x];
 
   int32_t blockExpertOffset = 0;
-  if (threadIdx.x < KernelParams::NumExperts) {
+  if (threadIdx.x < params.mNumExperts) {
     blockExpertOffset = atomicAdd(&params.mPtrExpertCounts[threadIdx.x], localExpertCount);
   }
 
@@ -344,8 +340,7 @@ __global__ void __launch_bounds__(KernelParams::NumExperts)
   grid.sync();
 
   // Get total count for this expert.
-  int32_t count =
-      (threadIdx.x < KernelParams::NumExperts) ? params.mPtrExpertCounts[threadIdx.x] : 0;
+  int32_t count = (threadIdx.x < params.mNumExperts) ? params.mPtrExpertCounts[threadIdx.x] : 0;
 
   // Note: the scan is redundant in all CTAs, but doing it in only 1 CTA would be worse for latency.
 
@@ -422,65 +417,66 @@ __global__ void routingIndicesCoopKernel(KernelParams params) {
 #endif
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-
-template <int NumExperts>
 void runImpl(Data& data, void* stream) {
-  static constexpr int NumThreads = NumExperts;  // DeepSeek: 1 thread per expert
   static constexpr int NumWarps = NumThreads / WarpSize;
-  const int MaxNumTopGroups = getMaxNumTopGroups(data.mNumExpertGroups > 1, NumExperts);
+  int MaxNumTopGroups = getMaxNumTopGroups(data.mNumExpertGroups > 1, data.mNumExperts);
 
   // Validate that the template parameter matches the data
-  TORCH_CHECK(data.mNumExperts == NumExperts, "DeepSeek routing kernel expects exactly ",
-              NumExperts, " experts, got ", data.mNumExperts);
-  TORCH_CHECK(data.mPtrExpertIdx != nullptr || data.mPtrPermutedIdxSize != nullptr ||
-                  data.mPtrExpertWeights != nullptr,
-              "Routing kernel requires at least one output parameter");
+  // FLASHINFER_CHECK(data.mNumExperts == NumExperts, "DeepSeek routing kernel expects exactly ",
+  //             NumExperts, " experts, got ", data.mNumExperts);
+  FLASHINFER_CHECK(data.mPtrExpertIdx != nullptr || data.mPtrPermutedIdxSize != nullptr ||
+                       data.mPtrExpertWeights != nullptr,
+                   "Routing kernel requires at least one output parameter");
   if (data.mPtrExpandedIdxToPermutedIdx != nullptr || data.mPtrPermutedIdxToTokenIdx != nullptr)
-    TORCH_CHECK(data.mPtrExpertIdx != nullptr && data.mPtrPermutedIdxSize,
-                "If permuted index is required, `mPtrExpertIdx` is also required");
-  TORCH_CHECK(!data.mUseRoutingSoftmax, "Routing with softmax not implemented yet");
-  TORCH_CHECK(data.mNumLimitedGroups <= MaxNumTopGroups,
-              "Routing kernel expects <= ", MaxNumTopGroups, " top groups, got ",
-              data.mNumLimitedGroups);
-  TORCH_CHECK(data.mTopK <= MaxNumTopExperts,
-              "Routing kernel expects topK experts <= ", MaxNumTopExperts, ", got ", data.mTopK);
-  TORCH_CHECK(data.mTopK <= WarpSize, "Routing kernel expects top K <= warp size, got ",
-              data.mTopK);
-  TORCH_CHECK(data.mTopK * data.mNumLimitedGroups <= WarpSize,
-              "Routing kernel expects top K * top groups <= warp size (for now), got ", data.mTopK,
-              " * ", data.mNumLimitedGroups);
-  TORCH_CHECK(data.mNumExperts >= MaxNumTopExperts, "Routing kernel expects ", MaxNumTopExperts,
-              " to be at most #experts ", data.mNumExperts);
-  TORCH_CHECK(data.mNumExperts <= NumThreads, "Routing kernel expects #experts ", data.mNumExperts,
-              " <= #threads ", NumThreads);
-  TORCH_CHECK(data.mNumExpertGroups >= data.mNumLimitedGroups, "Routing kernel expects top groups ",
-              data.mNumLimitedGroups, " to be limited by #expert groups ", data.mNumExpertGroups);
+    FLASHINFER_CHECK(data.mPtrExpertIdx != nullptr && data.mPtrPermutedIdxSize,
+                     "If permuted index is required, `mPtrExpertIdx` is also required");
+  FLASHINFER_CHECK(!data.mUseRoutingSoftmax, "Routing with softmax not implemented yet");
+  FLASHINFER_CHECK(data.mNumLimitedGroups <= MaxNumTopGroups,
+                   "Routing kernel expects <= ", MaxNumTopGroups, " top groups, got ",
+                   data.mNumLimitedGroups);
+  FLASHINFER_CHECK(data.mTopK <= MaxNumTopExperts,
+                   "Routing kernel expects topK experts <= ", MaxNumTopExperts, ", got ",
+                   data.mTopK);
+  FLASHINFER_CHECK(data.mTopK <= WarpSize, "Routing kernel expects top K <= warp size, got ",
+                   data.mTopK);
+  FLASHINFER_CHECK(data.mTopK * data.mNumLimitedGroups <= WarpSize,
+                   "Routing kernel expects top K * top groups <= warp size (for now), got ",
+                   data.mTopK, " * ", data.mNumLimitedGroups);
+  FLASHINFER_CHECK(data.mNumExperts >= MaxNumTopExperts, "Routing kernel expects ",
+                   MaxNumTopExperts, " to be at most #experts ", data.mNumExperts);
+  FLASHINFER_CHECK(data.mNumExperts <= NumThreads, "Routing kernel expects #experts ",
+                   data.mNumExperts, " <= #threads ", NumThreads);
+  FLASHINFER_CHECK(data.mNumExpertGroups >= data.mNumLimitedGroups,
+                   "Routing kernel expects top groups ", data.mNumLimitedGroups,
+                   " to be limited by #expert groups ", data.mNumExpertGroups);
   if (data.mNumExpertGroups > 1) {
-    TORCH_CHECK(data.mNumExpertGroups <= NumWarps, "Routing kernel expects #experts groups ",
-                data.mNumExpertGroups, " to be <= #warps ", NumWarps);
-    TORCH_CHECK(data.mNumExperts % data.mNumExpertGroups == 0, "Routing kernel expects #experts ",
-                data.mNumExperts, " to be a multiple of #expert groups ", data.mNumExpertGroups);
-    TORCH_CHECK(data.mNumExperts / data.mNumExpertGroups <= WarpSize,
-                "Routing kernel expects #experts per group <= warp size, got ",
-                data.mNumExperts / data.mNumExpertGroups);
+    FLASHINFER_CHECK(data.mNumExpertGroups <= NumWarps, "Routing kernel expects #experts groups ",
+                     data.mNumExpertGroups, " to be <= #warps ", NumWarps);
+    FLASHINFER_CHECK(data.mNumExperts % data.mNumExpertGroups == 0,
+                     "Routing kernel expects #experts ", data.mNumExperts,
+                     " to be a multiple of #expert groups ", data.mNumExpertGroups);
+    FLASHINFER_CHECK(data.mNumExperts / data.mNumExpertGroups <= WarpSize,
+                     "Routing kernel expects #experts per group <= warp size, got ",
+                     data.mNumExperts / data.mNumExpertGroups);
   } else {
-    TORCH_CHECK(data.mNumExperts <= WarpSize * MaxNumTopGroups, "Routing kernel expects #experts ",
-                data.mNumExperts, " <= WarpSize * MaxNumTopGroups ", WarpSize * MaxNumTopGroups);
-    TORCH_CHECK(data.mTopK <= NumWarps, "Routing kernel expects top K ", data.mTopK,
-                " to be <= #warps ", NumWarps);
+    FLASHINFER_CHECK(data.mNumExperts <= WarpSize * MaxNumTopGroups,
+                     "Routing kernel expects #experts ", data.mNumExperts,
+                     " <= WarpSize * MaxNumTopGroups ", WarpSize * MaxNumTopGroups);
+    FLASHINFER_CHECK(data.mTopK <= NumWarps, "Routing kernel expects top K ", data.mTopK,
+                     " to be <= #warps ", NumWarps);
   }
-  TORCH_CHECK(data.mNumExperts % 4 == 0, "Routing kernel expects #experts ", data.mNumExperts,
-              " to be a multiple of 4.");
-  TORCH_CHECK(data.mPaddingLog2 < 8, "Routing kernel expects padding log2 < 8, got ",
-              data.mPaddingLog2);
+  FLASHINFER_CHECK(data.mNumExperts % 4 == 0, "Routing kernel expects #experts ", data.mNumExperts,
+                   " to be a multiple of 4.");
+  FLASHINFER_CHECK(data.mPaddingLog2 < 8, "Routing kernel expects padding log2 < 8, got ",
+                   data.mPaddingLog2);
   int const numBlocks = data.mNumTokens;
 
   bool const useSingleCluster = data.mNumTokens <= 1024;
   if (!useSingleCluster) {
     // Reset the global histograms (not used in single-cluster code path).
     // Cover both for the cooperative and two-kernel code paths.
-    TORCH_CHECK(data.mPtrExpertCounts != nullptr,
-                "When #tokens is large, `mPtrExpertCounts` is a required input.");
+    FLASHINFER_CHECK(data.mPtrExpertCounts != nullptr,
+                     "When #tokens is large, `mPtrExpertCounts` is a required input.");
   } else {
     data.mPtrExpertCounts =
         nullptr;  // Set it to nullptr for single-cluster code path, as it won't be used
@@ -503,22 +499,21 @@ void runImpl(Data& data, void* stream) {
   LAUNCH_ROUTING_WITH_EXTRA_FLAG(data,
                                  /*coopLaunch=*/false, routingMainKernel, numBlocks, NumThreads,
                                  /*smemSize=*/0,  // No dynamic smem
-                                 stream, data.mNumExpertGroups > 1, /*forceFloatInput=*/true,
-                                 NumExperts);
+                                 stream, data.mNumExpertGroups > 1, /*forceFloatInput=*/true);
 
   if (data.mPtrPermutedIdxSize != nullptr) {
     if (useSingleCluster) {
-      LAUNCH_ROUTING_WITH_EXTRA_FLAG(
-          data,
-          /*coopLaunch=*/false, routingIndicesClusterKernel, NumBlocksPerCluster, NumThreads,
-          /*smemSize=*/0,  // No dynamic smem
-          stream, data.mNumExpertGroups > 1, /*forceFloatInput=*/true, NumExperts);
+      LAUNCH_ROUTING_WITH_EXTRA_FLAG(data,
+                                     /*coopLaunch=*/false, routingIndicesClusterKernel,
+                                     NumBlocksPerCluster, NumThreads,
+                                     /*smemSize=*/0,  // No dynamic smem
+                                     stream, data.mNumExpertGroups > 1, /*forceFloatInput=*/true);
     } else if (data.mNumTokens <= maxTokensCoop) {
-      LAUNCH_ROUTING_WITH_EXTRA_FLAG(
-          data,
-          /*coopLaunch=*/true, routingIndicesCoopKernel, numBlocksCoop, NumThreads,
-          /*smemSize=*/0,  // No dynamic smem
-          stream, data.mNumExpertGroups > 1, /*forceFloatInput=*/true, NumExperts);
+      LAUNCH_ROUTING_WITH_EXTRA_FLAG(data,
+                                     /*coopLaunch=*/true, routingIndicesCoopKernel, numBlocksCoop,
+                                     NumThreads,
+                                     /*smemSize=*/0,  // No dynamic smem
+                                     stream, data.mNumExpertGroups > 1, /*forceFloatInput=*/true);
     } else {
       const int32_t expandedIdxSize = data.mNumTokens * data.mTopK;
 
@@ -533,31 +528,21 @@ void runImpl(Data& data, void* stream) {
       int const numBlocksOffsets =
           std::min((expandedIdxSize + offsetEltsPerBlock - 1) / offsetEltsPerBlock, maxNumBlocks);
 
-      LAUNCH_ROUTING_WITH_EXTRA_FLAG(
-          data,
-          /*coopLaunch=*/false, routingIndicesHistogramKernel, numBlocksHistogram, NumThreads,
-          /*smemSize=*/0,  // No dynamic smem
-          stream, data.mNumExpertGroups > 1, /*forceFloatInput=*/true, NumExperts);
-      LAUNCH_ROUTING_WITH_EXTRA_FLAG(
-          data,
-          /*coopLaunch=*/false, routingIndicesOffsetsKernel, numBlocksOffsets, NumThreads,
-          /*smemSize=*/0,  // No dynamic smem
-          stream, data.mNumExpertGroups > 1, /*forceFloatInput=*/true, NumExperts);
+      LAUNCH_ROUTING_WITH_EXTRA_FLAG(data,
+                                     /*coopLaunch=*/false, routingIndicesHistogramKernel,
+                                     numBlocksHistogram, NumThreads,
+                                     /*smemSize=*/0,  // No dynamic smem
+                                     stream, data.mNumExpertGroups > 1, /*forceFloatInput=*/true);
+      LAUNCH_ROUTING_WITH_EXTRA_FLAG(data,
+                                     /*coopLaunch=*/false, routingIndicesOffsetsKernel,
+                                     numBlocksOffsets, NumThreads,
+                                     /*smemSize=*/0,  // No dynamic smem
+                                     stream, data.mNumExpertGroups > 1, /*forceFloatInput=*/true);
     }
   }
 }
 
-void run(Data& data, void* stream) {
-  if (data.mNumExperts == 72) {
-    runImpl<72>(data, stream);
-  } else if (data.mNumExperts == 256) {
-    runImpl<256>(data, stream);
-  } else if (data.mNumExperts == 384) {
-    runImpl<384>(data, stream);
-  } else {
-    TORCH_CHECK(false, "Unsupported number of experts: ", data.mNumExperts);
-  }
-}
+void run(Data& data, void* stream) { runImpl(data, stream); }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

@@ -18,6 +18,7 @@ from .flashinfer_benchmark_utils import (
     get_device,
     print_perf_metrics,
     is_close_stats,
+    filter_backends_by_compute_capability,
 )
 
 
@@ -202,6 +203,12 @@ def testGemmFp8NtGroupwise(args):
     mma_sm = args.mma_sm
     is_cuda_graph_compatible = not args.no_cuda_graph
     run_refcheck = args.refcheck
+    res = []
+
+    backends = filter_backends_by_compute_capability(backends, args.routine, device)
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
 
     out_dtype = dtype_str_to_torch_dtype(args.out_dtype)
     if out_dtype not in [torch.bfloat16, torch.float16]:
@@ -314,7 +321,6 @@ def testGemmFp8NtGroupwise(args):
                             f"[ERROR] Backend {tested_backends[i]} output mismatch with {num_different_elements} elements"
                         )
 
-    res = []
     for backend in backends:
         if len(backend_times[backend]) > 0:
             median_time = np.median(backend_times[backend])
@@ -386,6 +392,12 @@ def testGroupGemmFp8NtGroupwise(args):
     mma_sm = args.mma_sm
     is_cuda_graph_compatible = not args.no_cuda_graph
     run_refcheck = args.refcheck
+    res = []
+
+    backends = filter_backends_by_compute_capability(backends, args.routine, device)
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
 
     out_dtype = dtype_str_to_torch_dtype(args.out_dtype)
     if out_dtype not in [torch.bfloat16, torch.float16]:
@@ -491,7 +503,6 @@ def testGroupGemmFp8NtGroupwise(args):
                             f"[ERROR] Backend {tested_backends[i]} output mismatch with {num_different_elements} elements"
                         )
 
-    res = []
     for backend in backends:
         if len(backend_times[backend]) > 0:
             median_time = np.median(backend_times[backend])
@@ -568,6 +579,12 @@ def testBmmFp8(args):
     autotune_supported_backends = [
         "cutlass",
     ]
+    res = []
+
+    backends = filter_backends_by_compute_capability(backends, args.routine, device)
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
 
     input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
     if input_dtype not in [torch.float8_e4m3fn, torch.float8_e5m2]:
@@ -693,7 +710,6 @@ def testBmmFp8(args):
                             f"[ERROR] Backend {tested_backends[i]} output mismatch with cos_sim={cos_sim}"
                         )
 
-    res = []
     for backend in backends:
         backend_name = backend + (
             "_autotune"
@@ -775,6 +791,9 @@ def testMmFp4(args):
     use_128x4_sf_layout = args.use_128x4_sf_layout
     use_nvfp4 = args.use_nvfp4
     autotune_supported_backends = ["cutlass", "trtllm"]
+    res = []
+
+    backends = filter_backends_by_compute_capability(backends, args.routine, device)
 
     res_dtype = dtype_str_to_torch_dtype(args.out_dtype)
     if res_dtype not in [torch.bfloat16, torch.float16]:
@@ -942,7 +961,6 @@ def testMmFp4(args):
                             f"[ERROR] Backend {tested_backends[i]} output mismatch with cos_sim={cos_sim}"
                         )
 
-    res = []
     for backend in backends:
         backend_name = backend + (
             "_autotune"

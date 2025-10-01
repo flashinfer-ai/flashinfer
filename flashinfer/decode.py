@@ -61,6 +61,8 @@ from .utils import (
     register_fake_op,
     ceil_div,
     round_up,
+    get_compute_capability,
+    GPUArchitectureError,
 )
 
 
@@ -68,7 +70,7 @@ from .utils import (
 def get_single_decode_module(*args):
     uri = get_single_decode_uri(*args)
     module = gen_single_decode_module(*args).build_and_load()
-    run_func = module.run.default
+    run_func = module.run
 
     # torch library for single_decode_with_kv_cache
 
@@ -128,8 +130,8 @@ def get_single_decode_module(*args):
 
 @functools.cache
 def get_batch_decode_jit_module(module_name: str, jit_module: Any):
-    plan_func = jit_module.plan.default
-    run_func = jit_module.run.default
+    plan_func = jit_module.plan
+    run_func = jit_module.run
 
     @register_custom_op(
         f"flashinfer::{module_name}_run",
@@ -207,8 +209,8 @@ def get_batch_decode_jit_module(module_name: str, jit_module: Any):
 def get_batch_decode_module(*args):
     uri = get_batch_decode_uri(*args)
     mod = gen_batch_decode_module(*args).build_and_load()
-    plan_func = mod.plan.default
-    run_func = mod.run.default
+    plan_func = mod.plan
+    run_func = mod.run
 
     # torch library for batch_decode_with_paged_kv_cache_run
 
@@ -325,7 +327,7 @@ def single_decode_with_kv_cache_with_jit_module(
         lse = torch.empty((q.size(0)), dtype=torch.float32, device=device)
     else:
         lse = None
-    jit_module.run.default(
+    jit_module.run(
         q,
         k,
         v,
@@ -834,12 +836,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
         Parameters
         ----------
         indptr : torch.Tensor
-            The indptr of the paged kv cache, shape: ``[batch_size + 1]``
+            The indptr of the paged kv cache, shape: ``[batch_size + 1]``, dtype: ``torch.int32``
         indices : torch.Tensor
-            The page indices of the paged kv cache, shape: ``[kv_indptr[-1]]``
+            The page indices of the paged kv cache, shape: ``[kv_indptr[-1]]``, dtype: ``torch.int32``
         last_page_len : torch.Tensor
             The number of entries in the last page of each request in the paged kv
-            cache, shape: ``[batch_size]``
+            cache, shape: ``[batch_size]``, dtype: ``torch.int32``
         num_qo_heads : int
             The number of query/output heads
         num_kv_heads : int
@@ -895,6 +897,16 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         The :meth:`plan` method cannot be used in Cuda Graph or in ``torch.compile``.
         """
+        for tensor, name in [
+            (indptr, "indptr"),
+            (indices, "indices"),
+            (last_page_len, "last_page_len"),
+        ]:
+            if tensor.dtype != torch.int32:
+                raise ValueError(
+                    f"{name} must have dtype torch.int32, got {tensor.dtype}"
+                )
+
         self._workspace_size = (
             self._float_workspace_buffer.numel()
             * self._float_workspace_buffer.element_size()
@@ -1609,12 +1621,12 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
         Parameters
         ----------
         indptr : torch.Tensor
-            The indptr of the paged kv cache, shape: ``[batch_size + 1]``
+            The indptr of the paged kv cache, shape: ``[batch_size + 1]``, dtype: ``torch.int32``
         indices : torch.Tensor
-            The page indices of the paged kv cache, shape: ``[qo_indptr[-1]]``
+            The page indices of the paged kv cache, shape: ``[qo_indptr[-1]]``, dtype: ``torch.int32``
         last_page_len : torch.Tensor
             The number of entries in the last page of each request in the paged kv
-            cache, shape: ``[batch_size]``
+            cache, shape: ``[batch_size]``, dtype: ``torch.int32``
         num_qo_heads : int
             The number of query/output heads
         head_dim_compressed_kv : int
@@ -1644,6 +1656,16 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
         :meth:`run_return_lse` calls, auxiliary data structures will be created
         during this call and cached for multiple run calls.
         """
+        for tensor, name in [
+            (indptr, "indptr"),
+            (indices, "indices"),
+            (last_page_len, "last_page_len"),
+        ]:
+            if tensor.dtype != torch.int32:
+                raise ValueError(
+                    f"{name} must have dtype torch.int32, got {tensor.dtype}"
+                )
+
         batch_size = len(last_page_len)
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
@@ -1755,6 +1777,15 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
             * attention output, shape: ``[batch_size, num_qo_heads, head_dim]``
             * logsumexp of attention scores, shape: ``[batch_size, num_qo_heads]``.
         """
+
+        # MLA decode kernel supports SM80 only
+        major, minor = get_compute_capability(q_nope.device)
+        device_arch = major * 10 + minor
+        if device_arch != 80:
+            raise GPUArchitectureError(
+                f"MLA decode kernel is not supported on this GPU (SM{device_arch}). "
+                "Supported architecture: SM80."
+            )
         window_left = self._window_left
         logits_soft_cap = self._logits_soft_cap
         sm_scale = self._sm_scale
@@ -1853,6 +1884,13 @@ class TrtllmGenDecodeModule:
             out = torch.empty_like(query)
         if self._sm_count is None:
             self._sm_count = get_device_sm_count(query.device)
+
+        bmm1_scale = (
+            bmm1_scale.item() if isinstance(bmm1_scale, torch.Tensor) else bmm1_scale
+        )
+        bmm2_scale = (
+            bmm2_scale.item() if isinstance(bmm2_scale, torch.Tensor) else bmm2_scale
+        )
 
         self._op.trtllm_paged_attention_decode(
             out,
@@ -2177,6 +2215,13 @@ def trtllm_batch_decode_with_kv_cache(
     else:
         raise ValueError(f"Invalid out_dtype: {out_dtype}")
 
+    bmm1_scale = (
+        bmm1_scale.item() if isinstance(bmm1_scale, torch.Tensor) else bmm1_scale
+    )
+    bmm2_scale = (
+        bmm2_scale.item() if isinstance(bmm2_scale, torch.Tensor) else bmm2_scale
+    )
+
     run_func(
         out,
         out_scale_factor,
@@ -2368,9 +2413,6 @@ def trtllm_batch_decode_with_kv_cache_mla(
     return out
 
 
-global_override_indptr_cpu = None
-
-
 def fast_decode_plan(
     self,
     indptr: torch.Tensor,
@@ -2392,6 +2434,7 @@ def fast_decode_plan(
     non_blocking: bool = True,
     fixed_split_size: Optional[int] = None,
     disable_split_kv: bool = False,
+    global_override_indptr_cpu: Optional[torch.Tensor] = None,
 ) -> None:
     """
     A faster version of BatchDecodeWithPagedKVCacheWrapper::plan used for FlashInferMultiStepDraftBackend.

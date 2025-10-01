@@ -24,6 +24,7 @@
 #include <mutex>
 #include <unordered_map>
 
+#include "../../exception.h"
 #include "../../utils.cuh"
 #include "../common.h"
 #include "cuda_runtime_api.h"
@@ -96,15 +97,16 @@ class TllmGenFmhaKernel {
                          int multiCtasKvMode, int headDimPerCtaV, int headDimQk, int headDimV,
                          int tileSizeKv, int numTokensPerPage, int maxNumHeadsQPerKvInCta,
                          bool reuseSmemKForV, bool uses2CtaMma) const {
-    TORCH_CHECK((headDimPerCtaV >= 32) && (headDimQk >= 32) && (headDimV >= 32) &&
-                    (headDimPerCtaV <= 2048) && (headDimQk <= 2048) && (headDimV <= 2048) &&
-                    (numTokensPerPage <= 128),
-                "Expect (32 <= headDim <= 2048) && (numTokensPerPage <= 128), "
-                "got headDimPerCtaV=%d, headDimQk=%d, "
-                "headDimV=%d, numTokensPerPage=%d",
-                headDimPerCtaV, headDimQk, headDimV, numTokensPerPage);
-    TORCH_CHECK(maxNumHeadsQPerKvInCta <= 128, "The maxNumHeadsQPerKvInCta <= 128 is required.");
-    TORCH_CHECK(tileSizeKv == 64 || tileSizeKv == 128, "The tileSizeKv must be 64 or 128.");
+    FLASHINFER_CHECK((headDimPerCtaV >= 32) && (headDimQk >= 32) && (headDimV >= 32) &&
+                         (headDimPerCtaV <= 2048) && (headDimQk <= 2048) && (headDimV <= 2048) &&
+                         (numTokensPerPage <= 128),
+                     "Expect (32 <= headDim <= 2048) && (numTokensPerPage <= 128), "
+                     "got headDimPerCtaV=%d, headDimQk=%d, "
+                     "headDimV=%d, numTokensPerPage=%d",
+                     headDimPerCtaV, headDimQk, headDimV, numTokensPerPage);
+    FLASHINFER_CHECK(maxNumHeadsQPerKvInCta <= 128,
+                     "The maxNumHeadsQPerKvInCta <= 128 is required.");
+    FLASHINFER_CHECK(tileSizeKv == 64 || tileSizeKv == 128, "The tileSizeKv must be 64 or 128.");
     // Format of the hash key:
     // Bit 0  - 3 : qkvLayout.
     // Bit 4  - 7 : maskType.
@@ -157,13 +159,14 @@ class TllmGenFmhaKernel {
     while (true) {
       // Any value >= 2 should work here, but we set it larger in case that we
       // might have more complicated heuristic in the future.
-      TORCH_CHECK(selectKernelIter < 8,
-                  "A deadlock is detected when selecting trtllm-gen kernels.");
+      FLASHINFER_CHECK(selectKernelIter < 8,
+                       "A deadlock is detected when selecting trtllm-gen kernels.");
       auto [hashId, info] = hashFromRunnerParams(params, selectKernelParams);
       auto const findMetaIter = mKernelMetaMap.find(hashId);
 
       // Add debug info when kernels are not found.
-      TORCH_CHECK(findMetaIter != mKernelMetaMap.end(), "Trtllm-gen kernels not found: " + info);
+      FLASHINFER_CHECK(findMetaIter != mKernelMetaMap.end(),
+                       "Trtllm-gen kernels not found: " + info);
 
       //  auto const& kernelMeta = mKernelMeta[findIter->second.mMetaInfoIndex];
       auto const findFuncIter = mFunctions.find(hashId);
@@ -299,11 +302,11 @@ class TllmGenFmhaKernel {
                              ? std::min(params.mNumHeadsQPerKv, kernelMeta.mMaxNumHeadsQPerKvInCta)
                              : 1;
     int numCtasForAllHeadsQ = params.mNumHeadsQ / numHeadsPerCta;
-    TORCH_CHECK(numHeadsPerCta * numCtasForAllHeadsQ == params.mNumHeadsQ,
-                "The numHeadsQ/numHeadsKv is not supported.");
+    FLASHINFER_CHECK(numHeadsPerCta * numCtasForAllHeadsQ == params.mNumHeadsQ,
+                     "The numHeadsQ/numHeadsKv is not supported.");
     // Take the number of headDim CTAs.
-    TORCH_CHECK(kernelMeta.mHeadDimV % selectKernelParams.mHeadDimPerCtaV == 0,
-                "The headDimPerCtaV is not supported.");
+    FLASHINFER_CHECK(kernelMeta.mHeadDimV % selectKernelParams.mHeadDimPerCtaV == 0,
+                     "The headDimPerCtaV is not supported.");
     int numCtasPerHeadDim = kernelMeta.mHeadDimV / selectKernelParams.mHeadDimPerCtaV;
     // Compute the current numCtasX.
     int numCtasX = numCtasPerSeqQ;
@@ -315,8 +318,8 @@ class TllmGenFmhaKernel {
     // for heads, so numCtasPerHeadDim and numCtasForAllHeadsQ will be handled by the 2Ctas in the x
     // dimension.
     if (isMlaGenKernel(params) && selectKernelParams.mUses2CtaMma) {
-      TORCH_CHECK(numCtasForAllHeadsQ == 2 && numCtasPerHeadDim == 2,
-                  "Internal error: numCtasPerHeadDim should be 2.");
+      FLASHINFER_CHECK(numCtasForAllHeadsQ == 2 && numCtasPerHeadDim == 2,
+                       "Internal error: numCtasPerHeadDim should be 2.");
       numCtasX *= 2;
       numCtasY /= (numCtasForAllHeadsQ * numCtasPerHeadDim);
     }
@@ -490,18 +493,18 @@ class TllmGenFmhaKernel {
       // Set the corresponding maxNumHeadsQPerKvInCta (tileSizeQ) for low-latency generation
       // kernels.
       maxNumHeadsQPerKvInCta = (params.mNumHeadsQPerKv <= 8) ? 8 : 16;
-      TORCH_CHECK((maxNumHeadsQPerKvInCta == 8 || maxNumHeadsQPerKvInCta == 16) &&
-                      (params.mNumHeadsQPerKv < maxNumHeadsQPerKvInCta ||
-                       params.mNumHeadsQPerKv % maxNumHeadsQPerKvInCta == 0),
-                  "Not supported");
+      FLASHINFER_CHECK((maxNumHeadsQPerKvInCta == 8 || maxNumHeadsQPerKvInCta == 16) &&
+                           (params.mNumHeadsQPerKv < maxNumHeadsQPerKvInCta ||
+                            params.mNumHeadsQPerKv % maxNumHeadsQPerKvInCta == 0),
+                       "Not supported");
     } else if (isKeepsMmaAbForGenerationKernel(kernelType)) {
       // Use the maxNumHeadsQPerKvInCta (tileSizeQ) = 64 for MLA high-throughput generation kernels.
       maxNumHeadsQPerKvInCta = isMlaGenKernel(params) ? 64 : 32;
-      TORCH_CHECK((params.mNumHeadsQPerKv < maxNumHeadsQPerKvInCta ||
-                   params.mNumHeadsQPerKv % maxNumHeadsQPerKvInCta == 0),
-                  "Not supported");
+      FLASHINFER_CHECK((params.mNumHeadsQPerKv < maxNumHeadsQPerKvInCta ||
+                        params.mNumHeadsQPerKv % maxNumHeadsQPerKvInCta == 0),
+                       "Not supported");
     } else if (isContextKernel(kernelType)) {
-      TORCH_CHECK(maxNumHeadsQPerKvInCta == 1, "Not supported");
+      FLASHINFER_CHECK(maxNumHeadsQPerKvInCta == 1, "Not supported");
     }
 
     // The mask type.
@@ -513,9 +516,10 @@ class TllmGenFmhaKernel {
          !isContextKernel(params.mKernelType)) &&
         (params.mMaxSeqLenKv > params.mAttentionWindowSize ||
          params.mChunkedAttentionSize != INT_MAX)) {
-      TORCH_CHECK(params.mMaxSeqLenKv <= params.mAttentionWindowSize ||
-                      params.mMaxSeqLenKv <= params.mChunkedAttentionSize,
-                  "Sliding window attention and chunked attention should not be used together");
+      FLASHINFER_CHECK(
+          params.mMaxSeqLenKv <= params.mAttentionWindowSize ||
+              params.mMaxSeqLenKv <= params.mChunkedAttentionSize,
+          "Sliding window attention and chunked attention should not be used together");
       selectKernelParams.mMaskType = TrtllmGenAttentionMaskType::SlidingOrChunkedCausal;
     }
     // NumTokensPerPage is set to 0 when not selecting pagedKv-layout kernels.
@@ -568,7 +572,7 @@ class TllmGenFmhaKernel {
     };
     if (findModuleIter == mModules.end()) {
       // Load the module.
-      std::string cubin_path = tllm_gen_fmha_cubin_path + kernelMeta.mFuncName;
+      std::string cubin_path = tllm_gen_fmha_cubin_path + "/" + kernelMeta.mFuncName + ".cubin";
       std::string cubin = getCubin(cubin_path, kernelMeta.sha256);
       if (cubin.empty()) {
         throw std::runtime_error("Failed to load cubin for " + kernelName);
@@ -641,7 +645,7 @@ class TllmFmhaKernelFactory {
     cudaGetDevice(&deviceId);
     static std::unique_ptr<TllmFmhaKernelFactory> sFactory[32] = {nullptr};
     if (sFactory[deviceId] == nullptr) {
-      TORCH_CHECK(deviceId < 32, "Invalid deviceId %d (max is 32 devices)", deviceId);
+      FLASHINFER_CHECK(deviceId < 32, "Invalid deviceId %d (max is 32 devices)", deviceId);
       sFactory[deviceId] = std::make_unique<TllmFmhaKernelFactory>(TllmFmhaKernelFactory());
     }
 

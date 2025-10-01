@@ -5,6 +5,10 @@ on:
     branches:
       - main
 
+  pull_request:
+    branches:
+      - main
+
 # Sets permissions of the GITHUB_TOKEN to allow deployment to GitHub Pages
 permissions:
   contents: read
@@ -42,17 +46,18 @@ jobs:
         python -m pip install -r docs/requirements.txt
 
     - name: Bulid Documentation
-      if: github.ref == 'refs/heads/main'
       run: |
         cd docs
         ./build_docs.sh
 
     - name: Upload artifact
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
       uses: actions/upload-pages-artifact@v3
       with:
         # Upload entire repository
         path: 'docs/_build/html'
 
     - name: Deploy to GitHub Pages
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
       id: deployment
       uses: actions/deploy-pages@v4

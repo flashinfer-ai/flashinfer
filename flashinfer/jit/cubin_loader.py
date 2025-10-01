@@ -17,6 +17,7 @@ limitations under the License.
 import ctypes
 import hashlib
 import os
+from urllib.parse import urljoin
 import shutil
 import time
 
@@ -33,8 +34,21 @@ FLASHINFER_CUBINS_REPOSITORY = os.environ.get(
 )
 
 
+def safe_urljoin(base, path):
+    """Join URLs ensuring base is treated as a directory."""
+    if not base.endswith("/"):
+        base += "/"
+    return urljoin(base, path)
+
+
 def download_file(
-    source, local_path, retries=3, delay=5, timeout=10, lock_timeout=30, session=None
+    source: str,
+    local_path: str,
+    retries: int = 3,
+    delay: int = 5,
+    timeout: int = 10,
+    lock_timeout: int = 30,
+    session=None,
 ):
     """
     Downloads a file from a URL or copies from a local path to a destination.
@@ -105,14 +119,8 @@ def download_file(
         )
         return False
 
-    finally:
-        # Clean up the lock file
-        if os.path.exists(lock_path):
-            os.remove(lock_path)
-            logger.info(f"Lock file {lock_path} removed.")
 
-
-def load_cubin(cubin_path, sha256) -> bytes:
+def load_cubin(cubin_path: str, sha256: str) -> bytes:
     """
     Load a cubin from the provide local path and
     ensure that the sha256 signature matches.
@@ -138,9 +146,9 @@ def load_cubin(cubin_path, sha256) -> bytes:
     return b""
 
 
-def get_cubin(name, sha256, file_extension=".cubin", session=None):
+def get_cubin(file_name: str, sha256: str, session=None) -> bytes:
     """
-    Load a cubin from the local cache directory with {name} and
+    Load a cubin from the local cache directory with {file_name} and
     ensure that the sha256 signature matches.
 
     If the kernel does not exist in the cache, it will downloaded.
@@ -148,14 +156,14 @@ def get_cubin(name, sha256, file_extension=".cubin", session=None):
     Returns:
     None on failure.
     """
-    cubin_fname = name + file_extension
-    cubin_path = FLASHINFER_CUBIN_DIR / cubin_fname
+    cubin_path = str(FLASHINFER_CUBIN_DIR / file_name)
     cubin = load_cubin(cubin_path, sha256)
     if cubin:
         return cubin
     # either the file does not exist or it is corrupted, we'll download a new one.
-    uri = FLASHINFER_CUBINS_REPOSITORY + "/" + cubin_fname
-    logger.info(f"Fetching cubin {name} from {uri}")
+
+    uri = safe_urljoin(FLASHINFER_CUBINS_REPOSITORY, file_name)
+    logger.info(f"Fetching cubin {file_name} from {uri}")
     download_file(uri, cubin_path, session=session)
     return load_cubin(cubin_path, sha256)
 
@@ -168,7 +176,7 @@ def convert_to_ctypes_char_p(data: bytes):
 dll_cubin_handlers = {}
 
 
-def setup_cubin_loader(dll_path: str):
+def setup_cubin_loader(dll_path: str) -> None:
     if dll_path in dll_cubin_handlers:
         return
 
@@ -177,7 +185,7 @@ def setup_cubin_loader(dll_path: str):
     # Define the correct callback type
     CALLBACK_TYPE = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_char_p)
 
-    def get_cubin_callback(name, sha256):
+    def get_cubin_callback(name: bytes, sha256: bytes):
         # Both name and sha256 are bytes (c_char_p)
         cubin = get_cubin(name.decode("utf-8"), sha256.decode("utf-8"))
         _LIB.FlashInferSetCurrentCubin(

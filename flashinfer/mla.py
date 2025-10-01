@@ -66,7 +66,7 @@ def gen_mla_module() -> JitSpec:
         "mla",
         [
             jit_env.FLASHINFER_CSRC_DIR / "cutlass_mla.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "flashinfer_mla_ops.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "flashinfer_mla_binding.cu",
         ],
         extra_cuda_cflags=nvcc_flags,
     )
@@ -308,7 +308,7 @@ class BatchMLAPagedAttentionWrapper:
         self._sm_scale = sm_scale
         self._use_profiler = use_profiler
 
-        self._plan_info = self._cached_module.plan.default(
+        self._plan_info = self._cached_module.plan(
             self._float_workspace_buffer,
             self._int_workspace_buffer,
             self._pin_memory_int_workspace_buffer,
@@ -408,7 +408,7 @@ class BatchMLAPagedAttentionWrapper:
             ckv_kpe_cache = torch.cat([ckv_cache, kpe_cache], dim=-1)
             _check_cutlass_shape(q_nope_pe, ckv_kpe_cache, kv_len, page_table)
             lse = torch.empty(0, dtype=torch.float32, device=self.device)
-            self._cached_module.cutlass_mla_paged_attention.default(
+            self._cached_module.cutlass_mla_paged_attention(
                 self._float_workspace_buffer,
                 out,
                 lse,
@@ -445,7 +445,7 @@ class BatchMLAPagedAttentionWrapper:
                     lse, q_nope.shape[:2], torch.float32, q_nope.device, "lse"
                 )
         profiler_args = (profiler_buffer,) if self._use_profiler else ()
-        self._cached_module.run.default(
+        self._cached_module.run(
             self._float_workspace_buffer,
             self._int_workspace_buffer,
             self._plan_info,

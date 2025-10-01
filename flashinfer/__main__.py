@@ -26,7 +26,7 @@ from .artifacts import (
 )
 from .jit import clear_cache_dir, jit_spec_registry
 from .jit.cubin_loader import FLASHINFER_CUBINS_REPOSITORY
-from .jit.env import FLASHINFER_CACHE_DIR, FLASHINFER_CUBIN_DIR, FLASHINFER_AOT_DIR
+from .jit.env import FLASHINFER_CACHE_DIR, FLASHINFER_CUBIN_DIR
 from .jit.core import current_compilation_context
 from .jit.cpp_ext import get_cuda_path, get_cuda_version
 from . import __version__
@@ -74,12 +74,16 @@ def cli(ctx, download_cubin_flag):
 env_variables = {
     "FLASHINFER_CACHE_DIR": FLASHINFER_CACHE_DIR,
     "FLASHINFER_CUBIN_DIR": FLASHINFER_CUBIN_DIR,
-    "FLASHINFER_AOT_DIR": FLASHINFER_AOT_DIR,
+    "FLASHINFER_CUDA_ARCH_LIST": current_compilation_context.TARGET_CUDA_ARCHS,
+    "FLASHINFER_CUDA_VERSION": get_cuda_version(),
+    "FLASHINFER_CUBINS_REPOSITORY": FLASHINFER_CUBINS_REPOSITORY,
     "CUDA_HOME": get_cuda_path(),
     "CUDA_VERSION": get_cuda_version(),
-    "FLASHINFER_CUDA_ARCH_LIST": current_compilation_context.TARGET_CUDA_ARCHS,
-    "FLASHINFER_CUBINS_REPOSITORY": FLASHINFER_CUBINS_REPOSITORY,
 }
+try:
+    env_variables["CUDA_HOME"] = get_cuda_path()
+except Exception:
+    env_variables["CUDA_HOME"] = "Not Found"
 
 
 @cli.command("show-config")
