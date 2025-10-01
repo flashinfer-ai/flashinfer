@@ -547,6 +547,7 @@ def set_log_level(lvl_str: str) -> None:
     get_logging_module().set_log_level(log_level_map[lvl_str].value)
 
 
+@functools.cache
 def device_support_pdl(device: torch.device) -> bool:
     if device.type != "cuda":
         return False
@@ -573,6 +574,7 @@ def round_up(x: int, y: int) -> int:
     return ceil_div(x, y) * y
 
 
+@functools.cache
 def get_device_sm_count(device: torch.device) -> int:
     return torch.cuda.get_device_properties(device).multi_processor_count
 
