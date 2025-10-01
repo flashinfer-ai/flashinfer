@@ -42,7 +42,6 @@ packages = [
     "flashinfer",
     "flashinfer.cute_dsl",
     "flashinfer.data",
-    "flashinfer.data.aot",
     "flashinfer.data.csrc",
     "flashinfer.data.cutlass",
     "flashinfer.data.spdlog",
@@ -72,9 +71,6 @@ include-package-data = false
     "csrc/**",
     "include/**",
     "version.txt"
-]
-"flashinfer.data.aot" = [
-    "**"
 ]
 "flashinfer.data.cutlass" = [
     "include/**",
