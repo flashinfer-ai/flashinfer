@@ -14,9 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from .core import JitSpec, gen_jit_spec
+from .core import JitSpec, gen_jit_spec, current_compilation_context
 from . import env as jit_env
-from ..compilation_context import current_compilation_context
 import shlex
 import os
 
