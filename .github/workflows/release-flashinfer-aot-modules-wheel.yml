@@ -64,7 +64,7 @@ jobs:
         strategy:
             fail-fast: false
             matrix:
-                cuda: ["12.9"] #["12.8", "12.9", "13.0"]
+                cuda: ["12.8", "12.9", "13.0"]
                 arch: ['x86_64', 'aarch64']
 
         # Use self-hosted runners with specific labels based on architecture
