@@ -795,7 +795,6 @@ __device__ inline void quantize_with_block_size_impl(int32_t numbatches, int32_t
   static constexpr int CVT_NUM_THREADS_PER_SF = SF_VEC_SIZE / ELTS_PER_THREAD;
   static_assert(sizeof(PackedVec) == sizeof(Type) * ELTS_PER_THREAD, "Vec size is not matched.");
 
-  float const SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[0];
   bool isSfSwizzledLayout = layout == QuantizationSFLayout::SWIZZLED_128x4 ||
                             layout == QuantizationSFLayout::SWIZZLED_8x4;
   int rowTile = (layout == QuantizationSFLayout::SWIZZLED_128x4) ? 128 : 8;
@@ -810,6 +809,7 @@ __device__ inline void quantize_with_block_size_impl(int32_t numbatches, int32_t
   asm volatile("griddepcontrol.wait;");
   for (int rowIdx = blockIdx.x; rowIdx < numPaddedRowsForSf; rowIdx += gridDim.x) {
     for (int batchIdx = 0; batchIdx < numbatches; batchIdx++) {
+      float const SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[batchIdx];
       for (int colIdx = threadIdx.x; colIdx < numColThreadsForSf; colIdx += blockDim.x) {
         std::optional<int> optionalBatchIdx = batchIdx;
         std::optional<int> optionalNumRows = numRows;

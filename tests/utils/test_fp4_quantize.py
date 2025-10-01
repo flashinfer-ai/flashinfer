@@ -18,7 +18,7 @@ from flashinfer.utils import is_sm100a_supported
 DTYPES = [torch.float16, torch.bfloat16]
 # The batch dimension doesn't need to be multiple of 128
 SHAPES = [(128, 64), (256, 128), (120, 64), (200, 256)]
-BATCH_SHAPES = [(2, 128, 64), (3, 256, 128), (1, 120, 64)]
+BATCH_SHAPES = [(1, 256, 128), (2, 128, 64), (3, 256, 128), (1, 120, 64)]
 SEEDS = [42]
 CUDA_DEVICES = ["cuda:0"]
 
@@ -334,7 +334,7 @@ def test_nvfp4_batched_quantize(
 
     b, m, n = batch_shape
     x = torch.randn(batch_shape, dtype=dtype)
-    tensor_amax = torch.abs(x).max().to(torch.float32)
+    tensor_amax = torch.abs(x).amax(dim=(1, 2)).to(torch.float32)
     global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax
     mask = None
     # Test the batched quantization
@@ -357,7 +357,7 @@ def test_nvfp4_batched_quantize(
 
     # Compare with single tensor quantization for each batch
     for i in range(b):
-        single_out, single_scale = fp4_quantize(x[i], global_scale, 16, False, True)
+        single_out, single_scale = fp4_quantize(x[i], global_scale[i], 16, False, True)
         if use_mask:
             torch.testing.assert_close(
                 out[i][: mask[i]], single_out[: mask[i]], rtol=1e-5, atol=1e-5
@@ -414,7 +414,7 @@ def test_silu_and_mul_nvfp4_batched_quantize(
     for i in range(b):
         x_silu_mul = silu_and_mul(x[i])
         single_out, single_scale = fp4_quantize(
-            x_silu_mul, global_scale, 16, False, True
+            x_silu_mul, global_scale[i], 16, False, True
         )
         torch.testing.assert_close(
             out[i][: mask[i]], single_out[: mask[i]], rtol=1e-5, atol=1e-5
