@@ -173,7 +173,10 @@ def generate_ninja_build_for_op(
         "-lcudart",
     ]
 
-    extra_ldflags = parse_env_flags("FLASHINFER_EXTRA_LDFLAGS")
+    env_extra_ldflags = parse_env_flags("FLASHINFER_EXTRA_LDFLAGS")
+    if env_extra_ldflags is not None:
+        ldflags += env_extra_ldflags
+
     if extra_ldflags is not None:
         ldflags += extra_ldflags
 
