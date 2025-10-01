@@ -87,7 +87,7 @@ jobs:
                   export CUDA_MINOR
                   export CUDA_VERSION_SUFFIX="cu${CUDA_MAJOR}${CUDA_MINOR}"
 
-                  chown -R $CI_UID:$CI_GID ${{ github.workspace }}
+                  chown -R $(id -u):$(id -g) ${{ github.workspace }}
 
                   # Run the build script inside the container with proper mounts
                   docker run --rm \
@@ -100,7 +100,7 @@ jobs:
                     -e CUDA_VERSION_SUFFIX="$CUDA_VERSION_SUFFIX" \
                     -e ARCH="${{ matrix.arch }}" \
                     -e FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST}" \
-                    --user $CI_UID:$CI_GID \
+                    --user $(id -u):$(id -g) \
                     -w /workspace \
                     ${{ env.DOCKER_IMAGE }} \
                     bash /workspace/scripts/build_flashinfer_jit_cache_whl.sh
