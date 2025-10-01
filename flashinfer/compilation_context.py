@@ -20,6 +20,8 @@ Global compilation context management for FlashInfer.
 import os
 import torch
 import logging
+import subprocess
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -69,3 +71,44 @@ class CompilationContext:
             f"-gencode=arch=compute_{major}{minor},code=sm_{major}{minor}"
             for major, minor in supported_cuda_archs
         ] + self.COMMON_NVCC_FLAGS
+
+    # I've included the two version here:
+    #  - torch.version.cuda is the version which torch was compiled with
+    #  - nvcc --version is the version of CUDA toolkit installed on the system
+    def get_cuda_version(self, use_nvcc: bool = False):
+        if use_nvcc:
+            return self.get_cuda_version_from_nvcc()
+        else:
+            return torch.version.cuda.split(".")
+
+    def get_cuda_version_from_nvcc(self):
+        """Return (major, minor) CUDA version detected from `nvcc --version`.
+
+        We assume `nvcc` is installed and available on PATH.
+        """
+        try:
+            proc = subprocess.run(
+                ["nvcc", "--version"],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            out = proc.stdout
+        except Exception as e:
+            raise RuntimeError(f"Failed to execute nvcc --version: {e}") from e
+
+        # Try common patterns in nvcc output
+        # Example lines:
+        #   Cuda compilation tools, release 12.4, V12.4.131
+        #   Build cuda_12.3.r12.3/compiler....
+        m = re.search(r"release\s+(\d+)\.(\d+)", out)
+        if not m:
+            m = re.search(r"V(\d+)\.(\d+)", out)
+        if not m:
+            m = re.search(r"cuda_(\d+)\.(\d+)", out)
+        if not m:
+            raise RuntimeError(f"Unable to parse CUDA version from nvcc output:\n{out}")
+
+        major, minor = m.group(1), m.group(2)
+        return major, minor

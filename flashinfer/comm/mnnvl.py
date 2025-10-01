@@ -26,14 +26,6 @@ import pynvml
 import torch
 
 try:
-<<<<<<< HEAD
-    import cuda as cuda
-except ImportError as e:
-    raise ImportError(
-        "Could not import the 'cuda' module. "
-        "Please install cuda-python that matches your CUDA version."
-    ) from e
-=======
     # cuda-python >= 12.9 (has cuda.bindings.driver)
     from cuda.bindings import driver as cuda
 except ImportError:
@@ -46,7 +38,6 @@ except ImportError:
             "Could not import the 'cuda' module. "
             "Please install cuda-python that matches your CUDA version."
         ) from e
->>>>>>> origin/main
 
 from ..cuda_utils import checkCudaErrors
 from .dlpack_utils import create_dlpack_capsule, pack_strided_memory

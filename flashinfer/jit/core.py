@@ -264,11 +264,12 @@ def gen_jit_spec(
     check_cuda_arch()
     verbose = os.environ.get("FLASHINFER_JIT_VERBOSE", "0") == "1"
 
+    cuda_major, cuda_minor = current_compilation_context.get_cuda_version()
     cflags = [
         "-std=c++17",
         "-Wno-switch-bool",
-        "-D__CUDACC_VER_MAJOR__=" + str(torch.version.cuda.split(".")[0]),
-        "-D__CUDACC_VER_MINOR__=" + str(torch.version.cuda.split(".")[1]),
+        f"-D__CUDACC_VER_MAJOR__={cuda_major}",
+        f"-D__CUDACC_VER_MINOR__={cuda_minor}",
     ]
     cuda_cflags = [
         "-std=c++17",
