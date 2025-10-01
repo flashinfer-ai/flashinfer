@@ -76,7 +76,9 @@ def _get_aot_dir():
         import flashinfer_jit_cache
 
         flashinfer_jit_cache_version = flashinfer_jit_cache.__version__
-        if flashinfer_version != flashinfer_jit_cache_version:
+        # NOTE(Zihao): we don't use exact version match here because the version of flashinfer-jit-cache
+        # contains the CUDA version suffix: e.g. 0.3.1+cu129.
+        if not flashinfer_jit_cache_version.startswith(flashinfer_version):
             raise RuntimeError(
                 f"flashinfer-jit-cache version ({flashinfer_jit_cache_version}) does not match "
                 f"flashinfer version ({flashinfer_version}). "
