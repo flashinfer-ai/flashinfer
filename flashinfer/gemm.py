@@ -40,6 +40,7 @@ from .fused_moe.utils import (
 from .jit.cubin_loader import get_cubin
 from .utils import (
     is_sm100a_supported,
+    is_sm100f_supported,
     is_sm120a_supported,
     is_sm121a_supported,
     LibraryError,
@@ -871,12 +872,16 @@ def get_gemm_sm120_module_cutlass_fp4():
     )
 
 
-def gen_gemm_sm100_module_tgv(dtype: torch.dtype = torch.bfloat16) -> JitSpec:
+def gen_tgv_gemm_sm10x_module(
+    dtype: torch.dtype = torch.bfloat16, use_sm_100f: bool = False
+) -> JitSpec:
     """
     Generate TGV GEMM module for SM100 architecture.
 
     Args:
         dtype: Data type for the GEMM operation (torch.bfloat16 or torch.float16)
+        use_sm_100f: Whether to compile with SM100f flags (default: False), which makes the compiled kernel
+            compatible with both B200 and B300 GPUs. However, it's only available with CUDA 12.9+.
 
     Returns:
         JitSpec for the TGV GEMM module
@@ -928,7 +933,7 @@ def gen_gemm_sm100_module_tgv(dtype: torch.dtype = torch.bfloat16) -> JitSpec:
     return gen_jit_spec(
         module_name,
         source_paths,
-        extra_cuda_cflags=sm100f_nvcc_flags,
+        extra_cuda_cflags=sm100f_nvcc_flags if use_sm_100f else sm100a_nvcc_flags,
         extra_include_paths=[
             jit_env.FLASHINFER_INCLUDE_DIR,
             jit_env.FLASHINFER_CSRC_DIR,
@@ -937,17 +942,21 @@ def gen_gemm_sm100_module_tgv(dtype: torch.dtype = torch.bfloat16) -> JitSpec:
 
 
 @functools.cache
-def get_gemm_sm100_module_tgv(dtype: torch.dtype = torch.bfloat16):
+def get_tgv_gemm_sm10x_module(
+    dtype: torch.dtype = torch.bfloat16, use_sm_100f: bool = False
+):
     """
     Get and build the TGV GEMM module for the specified dtype.
 
     Args:
         dtype: Data type for the GEMM operation (torch.bfloat16 or torch.float16)
+        use_sm_100f: Whether to compile with SM100f flags (default: False), which makes the compiled kernel
+            compatible with both B200 and B300 GPUs. However, it's only available with CUDA 12.9+.
 
     Returns:
         SimpleNamespace with the runner function
     """
-    module = gen_gemm_sm100_module_tgv(dtype).build_and_load()
+    module = gen_tgv_gemm_sm10x_module(dtype, use_sm_100f).build_and_load()
 
     def tgv_gemm_runner():
         class TGVGemmRunner(TunableRunner):
@@ -1030,7 +1039,8 @@ def tgv_gemm_sm100(
         )
 
     runners = []
-    runners.append(get_gemm_sm100_module_tgv(a.dtype).tgv_gemm_runner())
+    use_sm_100f = is_sm100f_supported(a.device)
+    runners.append(get_tgv_gemm_sm10x_module(a.dtype, use_sm_100f).tgv_gemm_runner())
 
     tuner = AutoTuner.get()
     a_tensor_index = 0
