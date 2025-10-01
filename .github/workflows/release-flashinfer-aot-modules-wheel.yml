@@ -12,9 +12,6 @@ on:
       branches:
         - main
 
-env:
-    FLASHINFER_CUDA_ARCH_LIST: "7.5 8.0 8.9 9.0a 10.0a 10.3a 12.0a"
-
 jobs:
     # validate-tag:
     #   runs-on: ubuntu-latest
@@ -78,7 +75,8 @@ jobs:
 
             - name: Build wheel in container
               env:
-                  DOCKER_IMAGE: ${{ matrix.arch == 'aarch64' && format('pytorch/manylinux2_28_aarch64-builder:cuda{0}', matrix.cuda) || format('pytorch/manylinux2_28-builder:cuda{0}', matrix.cuda) }}
+                  DOCKER_IMAGE: ${{ matrix.arch == 'aarch64' && format('pytorch/manylinuxaarch64-builder:cuda{0}', matrix.cuda) || format('pytorch/manylinux2_28-builder:cuda{0}', matrix.cuda) }}
+                  FLASHINFER_CUDA_ARCH_LIST: ${{ matrix.cuda == '12.8' && '7.5 8.0 8.9 9.0a 10.0a 12.0a' || '7.5 8.0 8.9 9.0a 10.0a 10.3a 12.0a' }}
               run: |
                   # Extract CUDA major and minor versions
                   CUDA_MAJOR=$(echo "${{ matrix.cuda }}" | cut -d'.' -f1)
@@ -87,12 +85,14 @@ jobs:
                   export CUDA_MINOR
                   export CUDA_VERSION_SUFFIX="cu${CUDA_MAJOR}${CUDA_MINOR}"
 
-                  chown -R $CI_UID:$CI_GID ${{ github.workspace }}
+                  chown -R $(id -u):$(id -g) ${{ github.workspace }}
+                  mkdir -p ${{ github.workspace }}/ci-cache
+                  chown -R $(id -u):$(id -g) ${{ github.workspace }}/ci-cache
 
                   # Run the build script inside the container with proper mounts
                   docker run --rm \
                     -v ${{ github.workspace }}:/workspace \
-                    -v "$CI_RUNNER_CACHE_DIR":/ci-cache \
+                    -v ${{ github.workspace }}/ci-cache:/ci-cache \
                     -e FLASHINFER_CI_CACHE=/ci-cache \
                     -e CUDA_VERSION="${{ matrix.cuda }}" \
                     -e CUDA_MAJOR="$CUDA_MAJOR" \
@@ -100,7 +100,7 @@ jobs:
                     -e CUDA_VERSION_SUFFIX="$CUDA_VERSION_SUFFIX" \
                     -e ARCH="${{ matrix.arch }}" \
                     -e FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST}" \
-                    --user $CI_UID:$CI_GID \
+                    --user $(id -u):$(id -g) \
                     -w /workspace \
                     ${{ env.DOCKER_IMAGE }} \
                     bash /workspace/scripts/build_flashinfer_jit_cache_whl.sh
