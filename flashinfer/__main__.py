@@ -144,7 +144,7 @@ def show_config_cmd():
     click.secho("=== Downloaded Cubins ===", fg="yellow")
 
     status = get_artifacts_status()
-    num_downloaded = sum(1 for _, _, exists in status if exists)
+    num_downloaded = sum(1 for _, exists in status if exists)
     total_cubins = len(status)
 
     click.secho(f"Downloaded {num_downloaded}/{total_cubins} cubins", fg="cyan")
@@ -167,10 +167,10 @@ def list_cubins_cmd():
     """List downloaded cubins"""
     status = get_artifacts_status()
     table_data = []
-    for name, extension, exists in status:
+    for name, exists in status:
         status_str = "Downloaded" if exists else "Missing"
         color = "green" if exists else "red"
-        table_data.append([f"{name}{extension}", click.style(status_str, fg=color)])
+        table_data.append([name, click.style(status_str, fg=color)])
 
     click.echo(tabulate(table_data, headers=["Cubin", "Status"], tablefmt="github"))
     click.secho("", fg="white")
