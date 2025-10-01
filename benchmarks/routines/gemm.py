@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from einops import einsum
 
 import flashinfer
+from flashinfer.autotuner import autotune
 from flashinfer.testing.utils import (
     bench_gpu_time,
     dequantize_fp8,
@@ -17,6 +18,7 @@ from .flashinfer_benchmark_utils import (
     get_device,
     print_perf_metrics,
     is_close_stats,
+    filter_backends_by_compute_capability,
 )
 
 
@@ -137,6 +139,17 @@ def parse_gemm_args(line, parser):
         action="store_true",
         help="Use 128x4 SF layout for the input and mat2.",
     )
+    parser.add_argument(
+        "--use_nvfp4",
+        action="store_true",
+        help="In mm_fp4, whether to use nvfp4 quantization or mxfp4 quantization, defaults to False.",
+    )
+    parser.add_argument(
+        "--autotune",
+        action="store_true",
+        default=False,
+        help=("Enable autotuner warmup for supported routines (mm_fp4 and bmm_fp8)."),
+    )
 
     args = parser.parse_args(line)
     if args.verbose >= 1:
@@ -190,6 +203,12 @@ def testGemmFp8NtGroupwise(args):
     mma_sm = args.mma_sm
     is_cuda_graph_compatible = not args.no_cuda_graph
     run_refcheck = args.refcheck
+    res = []
+
+    backends = filter_backends_by_compute_capability(backends, args.routine, device)
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
 
     out_dtype = dtype_str_to_torch_dtype(args.out_dtype)
     if out_dtype not in [torch.bfloat16, torch.float16]:
@@ -302,7 +321,6 @@ def testGemmFp8NtGroupwise(args):
                             f"[ERROR] Backend {tested_backends[i]} output mismatch with {num_different_elements} elements"
                         )
 
-    res = []
     for backend in backends:
         if len(backend_times[backend]) > 0:
             median_time = np.median(backend_times[backend])
@@ -374,6 +392,12 @@ def testGroupGemmFp8NtGroupwise(args):
     mma_sm = args.mma_sm
     is_cuda_graph_compatible = not args.no_cuda_graph
     run_refcheck = args.refcheck
+    res = []
+
+    backends = filter_backends_by_compute_capability(backends, args.routine, device)
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
 
     out_dtype = dtype_str_to_torch_dtype(args.out_dtype)
     if out_dtype not in [torch.bfloat16, torch.float16]:
@@ -479,7 +503,6 @@ def testGroupGemmFp8NtGroupwise(args):
                             f"[ERROR] Backend {tested_backends[i]} output mismatch with {num_different_elements} elements"
                         )
 
-    res = []
     for backend in backends:
         if len(backend_times[backend]) > 0:
             median_time = np.median(backend_times[backend])
@@ -553,6 +576,15 @@ def testBmmFp8(args):
     backends = args.backends
     is_cuda_graph_compatible = not args.no_cuda_graph
     run_refcheck = args.refcheck
+    autotune_supported_backends = [
+        "cutlass",
+    ]
+    res = []
+
+    backends = filter_backends_by_compute_capability(backends, args.routine, device)
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
 
     input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
     if input_dtype not in [torch.float8_e4m3fn, torch.float8_e5m2]:
@@ -572,6 +604,19 @@ def testBmmFp8(args):
             f"Unsupported res dtype: {res_dtype}. Supported dtypes are bfloat16 and float16."
         )
     ## Done parsing input arguments
+
+    if getattr(args, "autotune", False):
+        backends_to_remove = []
+        for cur_backend in backends:
+            if cur_backend not in autotune_supported_backends:
+                print(f"[INFO] {cur_backend} backend does not support autotune")
+                backends_to_remove.append(cur_backend)
+        for cur_backend in backends_to_remove:
+            backends.remove(cur_backend)
+
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return
 
     ## Prepare input tensors
     input = torch.randn([batch_size, m, k], device=device, dtype=torch.bfloat16)
@@ -609,6 +654,18 @@ def testBmmFp8(args):
     if run_refcheck:
         reference_output = torch.bmm(input, mat2)
         has_reference_output = True
+
+    if getattr(args, "autotune", False):
+        warmup_iters = (
+            args.dry_run_iters if args.dry_run_iters and args.dry_run_iters > 0 else 10
+        )
+        for cur_backend in backends:
+            if cur_backend in autotune_supported_backends:
+                if args.verbose >= 1:
+                    print(f"[INFO] Autotune warmup for bmm_fp8: {warmup_iters} iters")
+                with autotune(True):
+                    for _ in range(warmup_iters):
+                        run_backend(cur_backend)
 
     # Storage for timing results and outputs
     backend_times = {backend: [] for backend in backends}
@@ -653,8 +710,15 @@ def testBmmFp8(args):
                             f"[ERROR] Backend {tested_backends[i]} output mismatch with cos_sim={cos_sim}"
                         )
 
-    res = []
     for backend in backends:
+        backend_name = backend + (
+            "_autotune"
+            if (
+                getattr(args, "autotune", False)
+                and backend in autotune_supported_backends
+            )
+            else ""
+        )
         if len(backend_times[backend]) > 0:
             median_time = np.median(backend_times[backend])
             std_time = np.std(backend_times[backend])
@@ -666,7 +730,7 @@ def testBmmFp8(args):
             )
             tflops = problem_flops / (10**9 * median_time)  # in TFLOPs/sec
             tb_per_sec = problem_bytes / (10**9 * median_time)  # in TB/sec
-            print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
+            print_perf_metrics(backend_name, median_time, std_time, tflops, tb_per_sec)
 
             if args.output_path is not None:
                 cur_res = defaultdict(str)
@@ -682,7 +746,7 @@ def testBmmFp8(args):
                 cur_res["input_dtype"] = input_dtype
                 cur_res["mat2_dtype"] = mat2_dtype
                 cur_res["out_dtype"] = res_dtype
-                cur_res["backend"] = backend
+                cur_res["backend"] = backend_name
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
     return res
@@ -725,6 +789,11 @@ def testMmFp4(args):
     is_cuda_graph_compatible = not args.no_cuda_graph
     run_refcheck = args.refcheck
     use_128x4_sf_layout = args.use_128x4_sf_layout
+    use_nvfp4 = args.use_nvfp4
+    autotune_supported_backends = ["cutlass", "trtllm"]
+    res = []
+
+    backends = filter_backends_by_compute_capability(backends, args.routine, device)
 
     res_dtype = dtype_str_to_torch_dtype(args.out_dtype)
     if res_dtype not in [torch.bfloat16, torch.float16]:
@@ -736,24 +805,42 @@ def testMmFp4(args):
     if "trtllm" in backends:
         remove_trtllm = False
         if res_dtype == torch.float16:
-            print("[INFO] trtllm backend does not suppot float16 output")
+            print("[INFO] trtllm backend does not support float16 output")
             remove_trtllm = True
         if remove_trtllm:
+            backends.remove("trtllm")
+        if not use_nvfp4:
+            print(
+                "[INFO] trtllm backend does not support mxfp4 quantization (use_nvfp4=False)"
+            )
             backends.remove("trtllm")
     if "cutlass" in backends:
         remove_cutlass = False
         if not use_128x4_sf_layout:
-            print("[INFO] cutlass backend does not suppot use_128x4_sf_layout=False")
+            print("[INFO] cutlass backend does not support use_128x4_sf_layout=False")
             remove_cutlass = True
+        if not use_nvfp4:
+            print(
+                "[INFO] cutlass backend does not support mxfp4 quantization (use_nvfp4=False)"
+            )
+            backends.remove("cutlass")
         if remove_cutlass:
             backends.remove("cutlass")
     if "cudnn" in backends:
         remove_cudnn = False
         if not use_128x4_sf_layout:
-            print("[INFO] cudnn backend does not suppot use_128x4_sf_layout=False")
+            print("[INFO] cudnn backend does not support use_128x4_sf_layout=False")
             remove_cudnn = True
         if remove_cudnn:
             backends.remove("cudnn")
+    if getattr(args, "autotune", False):
+        backends_to_remove = []
+        for cur_backend in backends:
+            if cur_backend not in autotune_supported_backends:
+                print(f"[INFO] {cur_backend} backend does not support autotune")
+                backends_to_remove.append(cur_backend)
+        for cur_backend in backends_to_remove:
+            backends.remove(cur_backend)
 
     if len(backends) == 0:
         print("[ERROR] No backends to test. Exiting.")
@@ -770,15 +857,20 @@ def testMmFp4(args):
     global_sf_input = (448 * 6) / input.float().abs().nan_to_num().max()
     global_sf_mat2 = (448 * 6) / mat2.float().abs().nan_to_num().max()
 
-    input_fp4, input_inv_s = flashinfer.nvfp4_quantize(
-        input, global_sf_input, sfLayout=a_sf_layout, do_shuffle=False
-    )
-    mat2_fp4, mat2_inv_s = flashinfer.nvfp4_quantize(
-        mat2,
-        global_sf_mat2,
-        sfLayout=flashinfer.SfLayout.layout_128x4,
-        do_shuffle=False,
-    )
+    if use_nvfp4:
+        input_fp4, input_inv_s = flashinfer.nvfp4_quantize(
+            input, global_sf_input, sfLayout=a_sf_layout, do_shuffle=False
+        )
+        mat2_fp4, mat2_inv_s = flashinfer.nvfp4_quantize(
+            mat2,
+            global_sf_mat2,
+            sfLayout=flashinfer.SfLayout.layout_128x4,
+            do_shuffle=False,
+        )
+    else:  # mxfp4
+        input_fp4, input_inv_s = flashinfer.mxfp4_quantize(input)
+        mat2_fp4, mat2_inv_s = flashinfer.mxfp4_quantize(mat2)
+
     if "trtllm" in backends:
         mat2_fp4_trtllm, mat2_inv_s_trtllm = flashinfer.nvfp4_quantize(
             mat2,
@@ -793,7 +885,7 @@ def testMmFp4(args):
         print(f"[VVERBOSE] {mat2_fp4.shape = }")
         print(f"[VVERBOSE] {mat2_fp4.dtype = }")
 
-    alpha = 1.0 / (global_sf_input * global_sf_mat2)
+    alpha = 1.0 / (global_sf_input * global_sf_mat2) if use_nvfp4 else None
     # res = torch.empty([m, n], device="cuda", dtype=res_dtype)
 
     def run_backend(backend):
@@ -805,9 +897,12 @@ def testMmFp4(args):
                 b_descale=mat2_inv_s.T if backend != "trtllm" else mat2_inv_s_trtllm.T,
                 alpha=alpha,
                 out_dtype=res_dtype,
-                block_size=16,  # Only supports 16
+                block_size=16
+                if use_nvfp4
+                else 32,  # nvfp4 only supports 16; mxfp4 only supports 32.
                 use_8x4_sf_layout=not use_128x4_sf_layout,
                 backend=backend,
+                use_nvfp4=use_nvfp4,
             )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
@@ -816,6 +911,18 @@ def testMmFp4(args):
     if run_refcheck:
         reference_output = torch.mm(input, mat2.T)
         has_reference_output = True
+
+    if getattr(args, "autotune", False):
+        warmup_iters = (
+            args.dry_run_iters if args.dry_run_iters and args.dry_run_iters > 0 else 10
+        )
+        for cur_backend in backends:
+            if cur_backend in autotune_supported_backends:
+                if args.verbose >= 1:
+                    print(f"[INFO] Autotune warmup for mm_fp4: {warmup_iters} iters")
+                with autotune(True):
+                    for _ in range(warmup_iters):
+                        run_backend(cur_backend)
 
     # Storage for timing results and outputs
     backend_times = {backend: [] for backend in backends}
@@ -854,8 +961,15 @@ def testMmFp4(args):
                             f"[ERROR] Backend {tested_backends[i]} output mismatch with cos_sim={cos_sim}"
                         )
 
-    res = []
     for backend in backends:
+        backend_name = backend + (
+            "_autotune"
+            if (
+                getattr(args, "autotune", False)
+                and backend in autotune_supported_backends
+            )
+            else ""
+        )
         if len(backend_times[backend]) > 0:
             median_time = np.median(backend_times[backend])
             std_time = np.std(backend_times[backend])
@@ -865,7 +979,7 @@ def testMmFp4(args):
             )  # 0.5 for fp4
             tflops = problem_flops / (10**9 * median_time)  # in TFLOPs/sec
             tb_per_sec = problem_bytes / (10**9 * median_time)  # in TB/sec
-            print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
+            print_perf_metrics(backend_name, median_time, std_time, tflops, tb_per_sec)
 
             if args.output_path is not None:
                 cur_res = defaultdict(str)
@@ -879,7 +993,8 @@ def testMmFp4(args):
                 cur_res["k"] = k
                 cur_res["out_dtype"] = res_dtype
                 cur_res["use_128x4_sf_layout"] = use_128x4_sf_layout
-                cur_res["backend"] = backend
+                cur_res["backend"] = backend_name
+                cur_res["use_nvfp4"] = use_nvfp4
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
     return res

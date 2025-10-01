@@ -14,17 +14,18 @@
  * limitations under the License.
  */
 
-#include <ATen/cuda/EmptyTensor.h>
 #include <cuda.h>
 
 #include <string>
 
+#include "flashinfer/exception.h"
 #include "flashinfer/trtllm/common.h"
 #include "flashinfer/trtllm/gemm/trtllmGen_gemm_export/Enums.h"
 #include "flashinfer/trtllm/gemm/trtllmGen_gemm_export/GemmInterface.h"
 #include "flashinfer/trtllm/gemm/trtllmGen_gemm_export/trtllm/gen/DtypeDecl.h"
 #include "flashinfer/trtllm/gemm/trtllmGen_gemm_export/trtllm/gen/SfLayoutDecl.h"
-#include "pytorch_extension_utils.h"
+#include "tvm/ffi/container/array.h"
+#include "tvm_ffi_utils.h"
 
 namespace {
 static thread_local gemm::gemm::GemmInterface::ModuleCache globalTrtllmGenGemmModuleCache;
@@ -79,7 +80,7 @@ int64_t select_kernel_fp8(int32_t M, int32_t N, int32_t K,
     }
   }
 
-  TORCH_CHECK(false, "Kernel not found");
+  TVM_FFI_ICHECK(false) << "Kernel not found";
 }
 
 class TrtllmGenGemmRunner {
@@ -101,15 +102,16 @@ class TrtllmGenGemmRunner {
       }
     }
 
-    TORCH_CHECK(mPassingConfigIndices.size() > 0,
-                "No valid tactic found for the given options (precision, transpose, sf layout)");
+    FLASHINFER_CHECK(
+        mPassingConfigIndices.size() > 0,
+        "No valid tactic found for the given options (precision, transpose, sf layout)");
   }
 
   int64_t getWorkspaceSizeInBytes(int64_t m, int64_t n, int64_t k, int64_t tactic) {
     auto gemm = gemm::gemm::GemmInterface();
     auto const configs = gemm.getGemmConfigs();
-    TORCH_CHECK(tactic >= 0 && tactic < gemm.getNumGemmConfigs(),
-                "Invalid tactic in getWorkspaceSizeInBytes");
+    FLASHINFER_CHECK(tactic >= 0 && tactic < gemm.getNumGemmConfigs(),
+                     "Invalid tactic in getWorkspaceSizeInBytes");
     auto const config = configs[tactic];
 
     gemm::gemm::GemmData gemmData;
@@ -127,9 +129,9 @@ class TrtllmGenGemmRunner {
            CUstream stream, int32_t device_index, int64_t tactic) {
     auto gemm = gemm::gemm::GemmInterface();
     auto const configs = gemm.getGemmConfigs();
-    TORCH_CHECK(tactic >= 0 && tactic < gemm.getNumGemmConfigs(), "Invalid tactic id in run");
+    TVM_FFI_ICHECK(tactic >= 0 && tactic < gemm.getNumGemmConfigs()) << "Invalid tactic id in run";
     auto const& config = configs[tactic];
-    TORCH_CHECK(config.mOptions.mSfLayoutB == mOptions.sfLayoutB, "Invalid sf layout in run");
+    TVM_FFI_ICHECK(config.mOptions.mSfLayoutB == mOptions.sfLayoutB) << "Invalid sf layout in run";
 
     gemm::gemm::GemmData gemmData;
     // Dims
@@ -150,7 +152,7 @@ class TrtllmGenGemmRunner {
     gemmData.mOutputBuffers.mPtrC = c;
     gemmData.mOutputBuffers.mPtrSfC = cScalePtr;
 
-    TORCH_CHECK(gemm.isValidConfig(config, gemmData), "unsupported tactic id in run");
+    TVM_FFI_ICHECK(gemm.isValidConfig(config, gemmData)) << "unsupported tactic id in run";
 
     const int32_t multiProcessorCount = [device_index]() {
       static thread_local int32_t cached_multi_processor_count = -1;
@@ -162,17 +164,17 @@ class TrtllmGenGemmRunner {
         int32_t count;
         cudaError_t cudaStatus =
             cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, device_index);
-        TORCH_CHECK(cudaStatus == cudaSuccess,
-                    "Failed to get device attribute: ", cudaGetErrorString(cudaStatus));
+        TVM_FFI_ICHECK(cudaStatus == cudaSuccess)
+            << "Failed to get device attribute: " << cudaGetErrorString(cudaStatus);
         cached_multi_processor_count = count;
         cached_device_index = device_index;
         return count;
       }
     }();
 
-    TORCH_CHECK(gemm.run(config, workspace, gemmData, static_cast<void*>(stream),
-                         multiProcessorCount, true, globalTrtllmGenGemmModuleCache) == 0,
-                "Error occurred when running GEMM!");
+    TVM_FFI_ICHECK(gemm.run(config, workspace, gemmData, static_cast<void*>(stream),
+                            multiProcessorCount, true, globalTrtllmGenGemmModuleCache) == 0)
+        << "Error occurred when running GEMM!";
   }
 
   std::vector<int64_t> getValidTactics(int64_t m, int64_t n, int64_t k) const {
@@ -237,12 +239,12 @@ class TrtllmGenGemmRunner {
       return select_kernel_fp8(m, n, k, gemm::gemm::GemmInterface());
     } else if (mOptions.eltType == gemm::trtllm::gen::Dtype::E2m1) {
       auto sortedIndices = getValidTactics(m, n, k);
-      TORCH_CHECK(!sortedIndices.empty(), "No valid tactic found");
+      TVM_FFI_ICHECK(!sortedIndices.empty()) << "No valid tactic found";
 
       // the getValidTactics is sorted by priority, so the first one is the best one
       return sortedIndices[0];
     } else {
-      TORCH_CHECK(false, "Unsupported eltType");
+      TVM_FFI_ICHECK(false) << "Unsupported eltType";
     }
   }
 
@@ -251,42 +253,39 @@ class TrtllmGenGemmRunner {
   std::vector<int64_t> mPassingConfigIndices;
 };
 
-void trtllm_gemm(at::Tensor workspace_buffer, at::Tensor a, at::Tensor b, at::Tensor a_scale,
-                 at::Tensor b_scale, at::optional<at::Tensor> globalScale, at::Tensor out,
-                 bool use_8x4_sf_layout, int64_t tactic) {
-  TORCH_CHECK(a.device() == b.device(), "a and b must be on the same device");
-  TORCH_CHECK(a.device() == out.device(), "a and out must be on the same device");
-  TORCH_CHECK(a.is_cuda() && a.is_contiguous(), "a must be a contiguous CUDA tensor");
-  TORCH_CHECK(b.is_cuda() && b.is_contiguous(), "b must be a contiguous CUDA tensor");
-  TORCH_CHECK(out.is_cuda() && out.is_contiguous(), "out must be a contiguous CUDA tensor");
-  TORCH_CHECK(workspace_buffer.is_cuda() && workspace_buffer.is_contiguous(),
-              "workspace_buffer must be a contiguous CUDA tensor");
-  TORCH_CHECK(workspace_buffer.sizes().size() == 1, "workspace_buffer must be a 1D CUDA tensor");
-  TORCH_CHECK(a.dim() == 2, "a must be a matrix");
-  TORCH_CHECK(b.dim() == 2, "b must be a matrix");
-  TORCH_CHECK(a.scalar_type() == b.scalar_type(), "a and b must have the same scalar type");
-  TORCH_CHECK(
-      a.scalar_type() == at::ScalarType::Float8_e4m3fn || a.scalar_type() == at::ScalarType::Byte,
-      "a must be a Float8 or Byte(e2m1) tensor");
-  bool is_fp8 = a.scalar_type() == at::ScalarType::Float8_e4m3fn;
+using tvm::ffi::Array;
+using tvm::ffi::Optional;
+
+void trtllm_gemm(Tensor workspace_buffer, Tensor a, Tensor b, Tensor a_scale, Tensor b_scale,
+                 Optional<Tensor> globalScale, Tensor out, bool use_8x4_sf_layout, int64_t tactic) {
+  CHECK_DEVICE(a, b);
+  CHECK_DEVICE(a, out);
+  CHECK_INPUT(a);
+  CHECK_INPUT(b);
+  CHECK_INPUT(out);
+  CHECK_INPUT(workspace_buffer);
+  TVM_FFI_ICHECK_EQ(workspace_buffer->ndim, 1);
+  CHECK_DIM(2, a);
+  CHECK_DIM(2, b);
+  TVM_FFI_ICHECK_EQ(a->dtype, b->dtype);
+  TVM_FFI_ICHECK(a->dtype == dl_float8_e4m3fn || a->dtype == dl_uint8)
+      << "a must be a Float8 or Byte(e2m1) tensor";
+  bool is_fp8 = a->dtype == dl_float8_e4m3fn;
   if (is_fp8) {
-    TORCH_CHECK(!globalScale.has_value(), "globalScale must be a none tensor");
+    TVM_FFI_ICHECK(!globalScale.has_value()) << "globalScale must be a none tensor";
   } else {
-    TORCH_CHECK(a_scale.is_cuda() && a_scale.is_contiguous(),
-                "a_scale must be a contiguous CUDA tensor");
-    TORCH_CHECK(b_scale.is_cuda() && b_scale.is_contiguous(),
-                "b_scale must be a contiguous CUDA tensor");
+    CHECK_INPUT(a_scale);
+    CHECK_INPUT(b_scale);
     if (globalScale.has_value()) {
-      TORCH_CHECK(globalScale.value().is_cuda() && globalScale.value().is_contiguous(),
-                  "globalScale must be a contiguous CUDA tensor");
+      CHECK_INPUT(globalScale.value());
     }
   }
 
-  int32_t m = a.size(0);
-  int32_t k = is_fp8 ? a.size(1) : a.size(1) * 2;
-  int32_t n = b.size(0);
-  TORCH_CHECK(b.size(1) == a.size(1), "Matrix dimensions don't match for multiplication");
-  TORCH_CHECK(out.size(0) == m && out.size(1) == n, "Output tensor has wrong dimensions");
+  int32_t m = a->shape[0];
+  int32_t k = is_fp8 ? a->shape[1] : a->shape[1] * 2;
+  int32_t n = b->shape[0];
+  TVM_FFI_ICHECK_EQ(b->shape[1], a->shape[1]) << "Matrix dimensions don't match for multiplication";
+  TVM_FFI_ICHECK(out->shape[0] == m && out->shape[1] == n) << "Output tensor has wrong dimensions";
 
   auto runner = flashinfer::TrtllmGenGemmRunner(flashinfer::TrtllmGenGemmRunnerOptions{
       .eltType = is_fp8 ? gemm::trtllm::gen::Dtype::E4m3 : gemm::trtllm::gen::Dtype::E2m1,
@@ -300,23 +299,22 @@ void trtllm_gemm(at::Tensor workspace_buffer, at::Tensor a, at::Tensor b, at::Te
     tactic = runner.selectHeuristic(m, n, k);
   }
 
-  auto stream = at::cuda::getCurrentCUDAStream(a.device().index());
+  auto stream = get_stream(a->device);
 
   auto runKernel = [&](void* workspace) {
-    runner.run(m, n, k, a.data_ptr(), a_scale.data_ptr(), b.data_ptr(), b_scale.data_ptr(),
-               out.data_ptr(), globalScale.has_value() ? globalScale.value().data_ptr() : nullptr,
-               nullptr, workspace, stream, a.device().index(), tactic);
+    runner.run(m, n, k, a->data, a_scale->data, b->data, b_scale->data, out->data,
+               globalScale.has_value() ? globalScale.value()->data : nullptr, nullptr, workspace,
+               stream, a->device.device_id, tactic);
   };
 
   int64_t const required_workspace_size = runner.getWorkspaceSizeInBytes(m, n, k, tactic);
   int64_t const provided_workspace_size =
-      workspace_buffer.numel() * workspace_buffer.element_size();
+      get_numel(workspace_buffer) * get_element_size(workspace_buffer);
   if (provided_workspace_size < required_workspace_size) {
-    auto new_workspace = at::detail::empty_cuda({required_workspace_size}, at::ScalarType::Char,
-                                                a.device(), std::nullopt);
-    runKernel(new_workspace.data_ptr());
+    Tensor new_workspace = alloc_tensor({required_workspace_size}, dl_int8, a->device);
+    runKernel(new_workspace->data);
   } else {
-    runKernel(workspace_buffer.data_ptr());
+    runKernel(workspace_buffer->data);
   }
 }
 
@@ -326,12 +324,13 @@ enum class Dtype : int64_t {
   Bfloat16 = 2,
 };
 
-std::vector<int64_t> trtllm_gemm_tactics(int64_t m, int64_t n, int64_t k, int64_t input_dtype,
-                                         int64_t output_dtype, bool use_8x4_sf_layout) {
-  TORCH_CHECK(input_dtype == static_cast<int64_t>(Dtype::E4m3) ||
-                  input_dtype == static_cast<int64_t>(Dtype::E2m1),
-              "Unsupported input dtype");
-  TORCH_CHECK(output_dtype == static_cast<int64_t>(Dtype::Bfloat16), "Unsupported output dtype");
+Array<int64_t> trtllm_gemm_tactics(int64_t m, int64_t n, int64_t k, int64_t input_dtype,
+                                   int64_t output_dtype, bool use_8x4_sf_layout) {
+  TVM_FFI_ICHECK(input_dtype == static_cast<int64_t>(Dtype::E4m3) ||
+                 input_dtype == static_cast<int64_t>(Dtype::E2m1))
+      << "Unsupported input dtype";
+  TVM_FFI_ICHECK_EQ(output_dtype, static_cast<int64_t>(Dtype::Bfloat16))
+      << "Unsupported output dtype";
 
   auto runner = flashinfer::TrtllmGenGemmRunner(flashinfer::TrtllmGenGemmRunnerOptions{
       .eltType = input_dtype == static_cast<int64_t>(Dtype::E4m3) ? gemm::trtllm::gen::Dtype::E4m3
@@ -351,7 +350,5 @@ namespace trtllm_cubin_loader {
 
 }  // namespace flashinfer
 
-TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
-  m.def("trtllm_gemm", &flashinfer::trtllm_gemm);
-  m.def("trtllm_gemm_tactics", &flashinfer::trtllm_gemm_tactics);
-}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_gemm, flashinfer::trtllm_gemm);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_gemm_tactics, flashinfer::trtllm_gemm_tactics);

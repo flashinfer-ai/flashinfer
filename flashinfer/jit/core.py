@@ -1,12 +1,12 @@
 import dataclasses
 import logging
 import os
+import tvm_ffi
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Union
 from datetime import datetime
 
-import torch
 from filelock import FileLock
 
 from . import env as jit_env
@@ -220,21 +220,22 @@ class JitSpec:
         )
         write_if_different(ninja_path, content)
 
+    @property
+    def is_ninja_generated(self) -> bool:
+        return self.ninja_path.exists()
+
     def build(self, verbose: bool, need_lock: bool = True) -> None:
         lock = (
             FileLock(self.lock_path, thread_local=False) if need_lock else nullcontext()
         )
         with lock:
+            # Write ninja file if it doesn't exist (deferred case)
+            if not self.is_ninja_generated:
+                self.write_ninja()
             run_ninja(jit_env.FLASHINFER_JIT_DIR, self.ninja_path, verbose)
 
     def load(self, so_path: Path, class_name: str = None):
-        load_class = class_name is not None
-        loader = torch.classes if load_class else torch.ops
-        loader.load_library(so_path)
-        if load_class:
-            cls = torch._C._get_custom_class_python_wrapper(self.name, class_name)
-            return cls
-        return getattr(loader, self.name)
+        return tvm_ffi.load_module(str(so_path))
 
     def build_and_load(self, class_name: str = None):
         if self.is_aot:
@@ -264,14 +265,12 @@ def gen_jit_spec(
     verbose = os.environ.get("FLASHINFER_JIT_VERBOSE", "0") == "1"
 
     cflags = [
-        "-O3",
         "-std=c++17",
         "-Wno-switch-bool",
         "-D__CUDACC_VER_MAJOR__=" + str(torch.version.cuda.split(".")[0]),
         "-D__CUDACC_VER_MINOR__=" + str(torch.version.cuda.split(".")[1]),
     ]
     cuda_cflags = [
-        "-O3",
         "-std=c++17",
         f"--threads={os.environ.get('FLASHINFER_NVCC_THREADS', '1')}",
         "-use_fast_math",
@@ -281,8 +280,11 @@ def gen_jit_spec(
         "-DFLASHINFER_ENABLE_FP8_E5M2",
     ]
     if verbose:
+        cflags += ["-O0", "-g"]
         cuda_cflags += [
             "-g",
+            "-O0",
+            "-G",
             "-lineinfo",
             "--ptxas-options=-v",
             "--ptxas-options=--verbose,--register-usage-level=10,--warn-on-local-memory-usage",
@@ -290,7 +292,8 @@ def gen_jit_spec(
         ]
     else:
         # non debug mode
-        cuda_cflags += ["-DNDEBUG"]
+        cuda_cflags += ["-DNDEBUG", "-O3"]
+        cflags += ["-O3"]
 
     # useful for ncu
     if bool(os.environ.get("FLASHINFER_JIT_LINEINFO", "0")):
@@ -314,7 +317,6 @@ def gen_jit_spec(
         ),
         needs_device_linking=needs_device_linking,
     )
-    spec.write_ninja()
 
     # Register the spec in the global registry
     jit_spec_registry.register(spec)
@@ -340,6 +342,9 @@ def build_jit_specs(
         if skip_prebuilt and spec.aot_path.exists():
             continue
         lines.append(f"subninja {spec.ninja_path}")
+        if not spec.is_ninja_generated:
+            with FileLock(spec.lock_path, thread_local=False):
+                spec.write_ninja()
     if not lines:
         return
 

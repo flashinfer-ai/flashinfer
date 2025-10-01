@@ -1,3 +1,25 @@
+"""
+Copyright (c) 2025 by FlashInfer team.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+AOT build script for FlashInfer.
+
+NOTE (Zihao): The following modules are intentionally excluded from the AOT build:
+- gen_pod_module
+- gen_deepgemm_sm100_module (it doesn't involve host-side compilation)
+"""
+
 import argparse
 import os
 import shutil
@@ -12,10 +34,15 @@ from .activation import act_func_def_str, gen_act_and_mul_module
 from .fp8_quantization import gen_mxfp8_quantization_sm100_module
 from .cascade import gen_cascade_module
 from .fp4_quantization import (
-    gen_fp4_quantization_sm100_module,
     gen_fp4_quantization_sm90_module,
+    gen_fp4_quantization_sm100_module,
+    gen_fp4_quantization_sm103_module,
+    gen_fp4_quantization_sm110_module,
+    gen_fp4_quantization_sm120_module,
+    gen_fp4_quantization_sm121_module,
 )
 from .fused_moe import (
+    gen_cutlass_fused_moe_sm120_module,
     gen_cutlass_fused_moe_sm100_module,
     gen_cutlass_fused_moe_sm90_module,
     gen_trtllm_gen_fused_moe_sm100_module,
@@ -27,14 +54,18 @@ from .gemm import (
     gen_gemm_sm100_module_cutlass_fp4,
     gen_gemm_sm100_module_cutlass_fp8,
     gen_gemm_sm100_module_tgv,
+    gen_gemm_sm120_module,
+    gen_gemm_sm120_module_cutlass_fp4,
     gen_trtllm_gen_gemm_module,
 )
 from .jit import JitSpec, build_jit_specs
 from .jit import env as jit_env
 from .jit import (
+    gen_batch_attention_module,
     gen_batch_decode_module,
     gen_batch_mla_module,
     gen_batch_prefill_module,
+    gen_cudnn_fmha_module,
     gen_fmha_cutlass_sm100a_module,
     gen_single_decode_module,
     gen_single_prefill_module,
@@ -186,6 +217,18 @@ def gen_attention(
             head_dim_vo=head_dim_vo,
             use_sliding_window=use_sliding_window,
             use_logits_soft_cap=use_logits_soft_cap,
+        )
+        yield gen_batch_attention_module(
+            dtype_q=dtype_qo,
+            dtype_kv=dtype_kv,
+            dtype_o=dtype_qo,
+            dtype_idx=torch.int32,
+            head_dim_qk=head_dim_qk,
+            head_dim_vo=head_dim_vo,
+            pos_encoding_mode=0,
+            # use_sliding_window=use_sliding_window,
+            use_logits_soft_cap=use_logits_soft_cap,
+            use_profiler=False,
         )
 
     # FA3 MHA / MQA / GQA
@@ -357,8 +400,7 @@ def gen_all_modules(
     fa3_head_dim_: List[Tuple[int, int]],
     use_sliding_window_: List[bool],
     use_logits_soft_cap_: List[bool],
-    has_sm90: bool,
-    has_sm100: bool,
+    sm_capabilities: dict,
     add_comm: bool,
     add_gemma: bool,
     add_oai_oss: bool,
@@ -368,6 +410,12 @@ def gen_all_modules(
     add_xqa: bool,
 ) -> List[JitSpec]:
     jit_specs: List[JitSpec] = []
+    has_sm90 = sm_capabilities.get("sm90", False)
+    has_sm100 = sm_capabilities.get("sm100", False)
+    has_sm103 = sm_capabilities.get("sm103", False)
+    has_sm110 = sm_capabilities.get("sm110", False)
+    has_sm120 = sm_capabilities.get("sm120", False)
+    has_sm121 = sm_capabilities.get("sm121", False)
 
     jit_specs += list(
         gen_attention(
@@ -406,6 +454,17 @@ def gen_all_modules(
             jit_specs.append(gen_mxfp8_quantization_sm100_module())
             jit_specs.append(gen_trtllm_gen_gemm_module())
             jit_specs.append(gen_trtllm_gen_fused_moe_sm100_module())
+        if has_sm103:
+            jit_specs.append(gen_fp4_quantization_sm103_module())
+        if has_sm110:
+            jit_specs.append(gen_fp4_quantization_sm110_module())
+        if has_sm120:
+            jit_specs.append(gen_fp4_quantization_sm120_module())
+            jit_specs.append(gen_cutlass_fused_moe_sm120_module())
+            jit_specs.append(gen_gemm_sm120_module())
+            jit_specs.append(gen_gemm_sm120_module_cutlass_fp4())
+        if has_sm121:
+            jit_specs.append(gen_fp4_quantization_sm121_module())
 
     if add_comm:
         from .comm import gen_trtllm_comm_module, gen_vllm_comm_module
@@ -449,6 +508,9 @@ def gen_all_modules(
                 has_sm90,
             )
         )
+
+    # Add cuDNN FMHA module
+    jit_specs.append(gen_cudnn_fmha_module())
 
     # dedup
     names = set()
@@ -523,13 +585,20 @@ def detect_sm_capabilities():
             return True
         return version_at_least(torch.version.cuda, version)
 
-    return has_sm("compute_90", "12.3"), has_sm("compute_100", "12.8")
+    return {
+        "sm90": has_sm("compute_90", "12.3"),
+        "sm100": has_sm("compute_100", "12.8"),
+        "sm103": has_sm("compute_103", "12.8"),
+        "sm110": has_sm("compute_110", "12.9"),
+        "sm120": has_sm("compute_120", "13.0"),
+        "sm121": has_sm("compute_121", "13.0"),
+    }
 
 
 def register_default_modules() -> int:
     """Register the default set of modules"""
     config = get_default_config()
-    has_sm90, has_sm100 = detect_sm_capabilities()
+    sm_capabilities = detect_sm_capabilities()
 
     jit_specs = gen_all_modules(
         config["f16_dtype"],
@@ -538,8 +607,7 @@ def register_default_modules() -> int:
         config["fa3_head_dim"],
         config["use_sliding_window"],
         config["use_logits_soft_cap"],
-        has_sm90,
-        has_sm100,
+        sm_capabilities,
         config["add_comm"],
         config["add_gemma"],
         config["add_oai_oss"],
@@ -649,7 +717,7 @@ def main():
     if "FLASHINFER_CUDA_ARCH_LIST" not in os.environ:
         raise RuntimeError("Please explicitly set env var FLASHINFER_CUDA_ARCH_LIST.")
 
-    has_sm90, has_sm100 = detect_sm_capabilities()
+    sm_capabilities = detect_sm_capabilities()
 
     # Update data dir
     jit_env.FLASHINFER_CSRC_DIR = project_root / "csrc"
@@ -678,8 +746,10 @@ def main():
     print("  use_sliding_window:", config["use_sliding_window"])
     print("  use_logits_soft_cap:", config["use_logits_soft_cap"])
     print("  FLASHINFER_CUDA_ARCH_LIST:", os.environ["FLASHINFER_CUDA_ARCH_LIST"])
-    print("  has_sm90:", has_sm90)
-    print("  has_sm100:", has_sm100)
+    print("  SM capabilities detected:")
+    for sm_name, has_sm in sm_capabilities.items():
+        if has_sm:
+            print(f"    {sm_name}: True")
     for key in [
         "add_comm",
         "add_gemma",
@@ -701,8 +771,7 @@ def main():
         config["fa3_head_dim"],
         config["use_sliding_window"],
         config["use_logits_soft_cap"],
-        has_sm90,
-        has_sm100,
+        sm_capabilities,
         config["add_comm"],
         config["add_gemma"],
         config["add_oai_oss"],

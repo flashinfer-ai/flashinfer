@@ -3,6 +3,10 @@ set -eo pipefail
 set -x
 echo "Building FlashInfer documentation..."
 
+# Install flashinfer package first
+echo "Installing FlashInfer package..."
+pip install -e ..
+
 make clean
 make SPHINXOPTS='-T -v' html
 

@@ -1,48 +1,53 @@
 #include <flashinfer/attention/decode.cuh>
 #include <flashinfer/attention/scheduler.cuh>
-#include <optional>
 
 #include "mla_config.inc"
-#include "pytorch_conversion_utils.h"
-#include "pytorch_extension_utils.h"
+#include "tvm/ffi/container/array.h"
+#include "tvm_ffi_utils.h"
 
 using namespace flashinfer;
 
-void BatchDecodeWithPagedKVCacheRunMLA(
-    at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer, at::Tensor plan_info_vec,
-    at::Tensor q_nope, at::Tensor q_pe, at::Tensor paged_ckv_cache, at::Tensor paged_kpe_cache,
-    at::Tensor paged_kv_indptr, at::Tensor paged_kv_indices, at::Tensor paged_kv_last_page_len,
-    at::Tensor o, double sm_scale, int64_t window_left, double logits_soft_cap, double rope_scale,
-    double rope_theta, std::optional<at::Tensor> maybe_lse, bool enable_pdl, int64_t cuda_stream) {
+using tvm::ffi::Array;
+using tvm::ffi::Optional;
+
+void BatchDecodeWithPagedKVCacheRunMLA(Tensor float_workspace_buffer, Tensor int_workspace_buffer,
+                                       Array<int64_t> plan_info_vec, Tensor q_nope, Tensor q_pe,
+                                       Tensor paged_ckv_cache, Tensor paged_kpe_cache,
+                                       Tensor paged_kv_indptr, Tensor paged_kv_indices,
+                                       Tensor paged_kv_last_page_len, Tensor o, double sm_scale,
+                                       int64_t window_left, double logits_soft_cap,
+                                       double rope_scale, double rope_theta,
+                                       Optional<Tensor> maybe_lse, bool enable_pdl) {
   DecodePlanInfo plan_info;
-  plan_info.FromVector(tensor_to_vec(plan_info_vec));
+  plan_info.FromVector(std::vector<int64_t>(plan_info_vec.begin(), plan_info_vec.end()));
 
-  auto device = q_nope.device();
-  int64_t batch_size = q_nope.size(0);
-  int64_t num_qo_heads = q_nope.size(1);
-  int64_t page_size = paged_ckv_cache.size(1);
+  int64_t batch_size = q_nope->shape[0];
+  int64_t num_qo_heads = q_nope->shape[1];
+  int64_t page_size = paged_ckv_cache->shape[1];
 
-  if (maybe_lse) {
-    const auto& lse = *maybe_lse;
-    TORCH_CHECK(lse.size(0) == batch_size, lse.size(0), q_nope.size(0));
-    TORCH_CHECK(lse.size(1) == num_qo_heads, lse.size(1), q_nope.size(1));
+  if (maybe_lse.has_value()) {
+    const auto& lse = maybe_lse.value();
+    TVM_FFI_ICHECK_EQ(lse->shape[0], batch_size);
+    TVM_FFI_ICHECK_EQ(lse->shape[1], num_qo_heads);
   }
 
-  TORCH_CHECK(logits_soft_cap >= 0.f, "logits_soft_cap must be non-negative");
+  TVM_FFI_ICHECK_GE(logits_soft_cap, 0.f) << "logits_soft_cap must be non-negative";
 
-  void* float_buffer = static_cast<void*>(float_workspace_buffer.data_ptr());
-  void* int_buffer = static_cast<void*>(int_workspace_buffer.data_ptr());
+  void* float_buffer = static_cast<void*>(float_workspace_buffer->data);
+  void* int_buffer = static_cast<void*>(int_workspace_buffer->data);
+
+  cudaSetDevice(q_nope->device.device_id);
+  const cudaStream_t stream = get_stream(q_nope->device);
 
   paged_kv_mla_t<DTypeKV, IdType> paged_kv(
       page_size, HEAD_DIM_CKV, HEAD_DIM_KPE, batch_size,
-      static_cast<DTypeKV*>(paged_ckv_cache.data_ptr()), paged_ckv_cache.strides().data(),
-      static_cast<DTypeKV*>(paged_kpe_cache.data_ptr()), paged_kpe_cache.strides().data(),
-      static_cast<IdType*>(paged_kv_indices.data_ptr()),
-      static_cast<IdType*>(paged_kv_indptr.data_ptr()),
-      static_cast<IdType*>(paged_kv_last_page_len.data_ptr()));
-  Params params(static_cast<DTypeQ*>(q_nope.data_ptr()), static_cast<DTypeQ*>(q_pe.data_ptr()),
-                /*q_offset=*/nullptr, paged_kv, static_cast<DTypeO*>(o.data_ptr()),
-                /*lse=*/(maybe_lse ? static_cast<float*>(maybe_lse->data_ptr()) : nullptr),
+      static_cast<DTypeKV*>(paged_ckv_cache->data), paged_ckv_cache.strides().data(),
+      static_cast<DTypeKV*>(paged_kpe_cache->data), paged_kpe_cache.strides().data(),
+      static_cast<IdType*>(paged_kv_indices->data), static_cast<IdType*>(paged_kv_indptr->data),
+      static_cast<IdType*>(paged_kv_last_page_len->data));
+  Params params(static_cast<DTypeQ*>(q_nope->data), static_cast<DTypeQ*>(q_pe->data),
+                /*q_offset=*/nullptr, paged_kv, static_cast<DTypeO*>(o->data),
+                /*lse=*/(maybe_lse ? static_cast<float*>(maybe_lse.value()->data) : nullptr),
                 num_qo_heads, window_left, logits_soft_cap, sm_scale, rope_scale, rope_theta);
 
   DTypeO* tmp_v = nullptr;
@@ -64,11 +69,11 @@ void BatchDecodeWithPagedKVCacheRunMLA(
   }
   params.padded_batch_size = plan_info.padded_batch_size;
 
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   cudaError_t status =
       BatchDecodeWithPagedKVCacheDispatchedMLA<HEAD_DIM_CKV, HEAD_DIM_KPE, AttentionVariant,
                                                Params>(params, tmp_v, tmp_s, enable_pdl,
                                                        /*stream=*/stream);
-  TORCH_CHECK(status == cudaSuccess, "BatchDecodeWithPagedKVCache failed with error ",
-              cudaGetErrorString(status));
+
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "BatchDecodeWithPagedKVCache failed with error: " << cudaGetErrorString(status);
 }

@@ -13,7 +13,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <ATen/cuda/EmptyTensor.h>
 #include <cuda_fp16.h>
 
 #include <cstddef>
@@ -25,7 +24,7 @@
 #include "flashinfer/gemm/cutlass_gemm_configs.h"
 #include "flashinfer/gemm/fp8_gemm_cutlass.h"
 #include "flashinfer/gemm/fp8_gemm_cutlass_template.h"
-#include "pytorch_extension_utils.h"
+#include "tvm_ffi_utils.h"
 
 using flashinfer::gemm::ClusterShape;
 using flashinfer::gemm::CutlassFp8GemmRunner;
@@ -52,43 +51,41 @@ CutlassGemmConfig getFp8GemmConfig(int64_t m, int64_t n, int64_t k, int64_t tact
     return gemmRunner.getConfigs();
   };
   static std::vector<CutlassGemmConfig> globalConfigs = getCutlassFp8GemmConfigs();
-  TORCH_CHECK(tactic >= 0 && tactic < globalConfigs.size(), "tactic must be between 0 and ",
-              globalConfigs.size());
+  TVM_FFI_ICHECK(tactic >= 0 && tactic < globalConfigs.size())
+      << "tactic must be between 0 and " << globalConfigs.size();
   return globalConfigs[tactic];
 }
 
 template <typename T>
-void runGemm(at::Tensor& out, at::Tensor const& mat1, at::Tensor const& mat2,
-             at::Tensor const& scale_a, at::Tensor const& scale_b, int64_t m, int64_t n, int64_t k,
-             int64_t b, CutlassGemmConfig const& gemmConfig, at::Tensor workspace_buffer) {
+void runGemm(Tensor out, Tensor mat1, Tensor mat2, Tensor scale_a, Tensor scale_b, int64_t m,
+             int64_t n, int64_t k, int64_t b, CutlassGemmConfig const& gemmConfig,
+             Tensor workspace_buffer) {
   CutlassFp8GemmRunner<T> gemmRunner;
 
   int64_t const required_workspace_size = gemmRunner.getWorkspaceSize(m, n, k);
   int64_t const provided_workspace_size =
-      workspace_buffer.numel() * workspace_buffer.element_size();
+      get_numel(workspace_buffer) * get_element_size(workspace_buffer);
 
   auto runKernel = [&](void* workspace) {
-    gemmRunner.gemm(reinterpret_cast<__nv_fp8_e4m3 const*>(mat1.const_data_ptr()),
-                    reinterpret_cast<__nv_fp8_e4m3 const*>(mat2.const_data_ptr()),
-                    reinterpret_cast<float const*>(scale_a.const_data_ptr()),
-                    reinterpret_cast<float const*>(scale_b.const_data_ptr()), out.data_ptr(), m, n,
-                    k, b, gemmConfig, reinterpret_cast<char*>(workspace), required_workspace_size,
-                    at::cuda::getCurrentCUDAStream(mat1.get_device()));
+    gemmRunner.gemm(static_cast<__nv_fp8_e4m3*>(mat1->data),
+                    static_cast<__nv_fp8_e4m3*>(mat2->data), static_cast<float*>(scale_a->data),
+                    static_cast<float*>(scale_b->data), out->data, m, n, k, b, gemmConfig,
+                    static_cast<char*>(workspace), required_workspace_size,
+                    get_stream(mat1->device));
   };
 
   if (provided_workspace_size < required_workspace_size) {
-    at::Tensor new_workspace = at::detail::empty_cuda(
-        {required_workspace_size}, at::ScalarType::Char, mat1.device(), std::nullopt);
+    Tensor new_workspace =
+        alloc_tensor({required_workspace_size}, DLDataType{kDLInt, 8, 1}, mat1->device);
 
-    runKernel(new_workspace.data_ptr());
+    runKernel(new_workspace->data);
   } else {
-    runKernel(workspace_buffer.data_ptr());
+    runKernel(workspace_buffer->data);
   }
 }
 
-at::Tensor fp8_bmm_impl(at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& scale_a,
-                        at::Tensor const& scale_b, at::Tensor out, at::Tensor workspace_buffer,
-                        int64_t tactic) {
+Tensor fp8_bmm_impl(Tensor mat1, Tensor mat2, Tensor scale_a, Tensor scale_b, Tensor out,
+                    Tensor workspace_buffer, int64_t tactic) {
   CHECK_INPUT(mat1);
   CHECK_INPUT(mat2);
   CHECK_INPUT(scale_a);
@@ -97,28 +94,29 @@ at::Tensor fp8_bmm_impl(at::Tensor const& mat1, at::Tensor const& mat2, at::Tens
   int mat2_k_scale = 1;
 
   int64_t m, n, k, b;
-  if (mat1.dim() == 2) {
-    TORCH_CHECK(mat2.dim() == 2, "mat2 must be a matrix");
-    TORCH_CHECK(mat1.sizes()[1] == mat2.sizes()[1] * mat2_k_scale,
-                "mat1 and mat2 shapes cannot be multiplied (", mat1.sizes()[0], "x",
-                mat1.sizes()[1], " and ", mat2.sizes()[0], "x", mat2.sizes()[1], ")");
-    m = mat1.sizes()[0];
-    n = mat2.sizes()[0];
-    k = mat2.sizes()[1];
+  if (mat1->ndim == 2) {
+    TVM_FFI_ICHECK_EQ(mat2->ndim, 2) << "mat2 must be a matrix";
+    TVM_FFI_ICHECK_EQ(mat1->shape[1], mat2->shape[1] * mat2_k_scale)
+        << "mat1 and mat2 shapes cannot be multiplied (" << mat1->shape[0] << "x" << mat1->shape[1]
+        << " and " << mat2->shape[0] << "x" << mat2->shape[1] << ")";
+    m = mat1->shape[0];
+    n = mat2->shape[0];
+    k = mat2->shape[1];
     b = 1;
-  } else if (mat1.dim() == 3) {
-    TORCH_CHECK(mat2.dim() == 3, "mat2 must be a batch of matrices");
-    TORCH_CHECK(mat1.sizes()[0] == mat2.sizes()[0], "mat1 and mat2 must have the same batch size (",
-                mat1.sizes()[0], " and ", mat2.sizes()[0], ")");
-    TORCH_CHECK(mat1.sizes()[2] == mat2.sizes()[2] * mat2_k_scale,
-                "mat1 and mat2 shapes cannot be multiplied (", mat1.sizes()[1], "x",
-                mat1.sizes()[2], " and ", mat2.sizes()[1], "x", mat2.sizes()[2], ")");
-    m = mat1.sizes()[1];
-    n = mat2.sizes()[1];
-    k = mat2.sizes()[2];
-    b = mat1.sizes()[0];
+  } else if (mat1->ndim == 3) {
+    TVM_FFI_ICHECK_EQ(mat2->ndim, 3) << "mat2 must be a batch of matrices";
+    TVM_FFI_ICHECK_EQ(mat1->shape[0], mat2->shape[0])
+        << "mat1 and mat2 must have the same batch size (" << mat1->shape[0] << " and "
+        << mat2->shape[0] << ")";
+    TVM_FFI_ICHECK_EQ(mat1->shape[2], mat2->shape[2] * mat2_k_scale)
+        << "mat1 and mat2 shapes cannot be multiplied (" << mat1->shape[1] << "x" << mat1->shape[2]
+        << " and " << mat2->shape[1] << "x" << mat2->shape[2] << ")";
+    m = mat1->shape[1];
+    n = mat2->shape[1];
+    k = mat2->shape[2];
+    b = mat1->shape[0];
   } else {
-    C10_THROW_ERROR(NotImplementedError, "mat1 must be a matrix or a batch of matrices");
+    TVM_FFI_LOG_AND_THROW(NotImplementedError) << "mat1 must be a matrix or a batch of matrices";
   }
 
   // No heuristic for now, we rely on the autotuner to select the best tactic.
@@ -129,33 +127,33 @@ at::Tensor fp8_bmm_impl(at::Tensor const& mat1, at::Tensor const& mat2, at::Tens
 
   // Validate out dimensions
   std::vector<int64_t> out_shape =
-      mat1.dim() == 2 ? std::vector<int64_t>{m, n} : std::vector<int64_t>{b, m, n};
-  TORCH_CHECK(out.dim() == out_shape.size(), "out must have ", out_shape.size(),
-              " dimensions, but got ", out.dim());
+      mat1->ndim == 2 ? std::vector<int64_t>{m, n} : std::vector<int64_t>{b, m, n};
+  TVM_FFI_ICHECK_EQ(out->ndim, out_shape.size())
+      << "out must have " << out_shape.size() << " dimensions, but got " << out->ndim;
   for (int i = 0; i < out_shape.size(); ++i) {
-    TORCH_CHECK(out.sizes()[i] == out_shape[i], "out shape mismatch at dimension ", i,
-                ": expected ", out_shape[i], ", got ", out.sizes()[i]);
+    TVM_FFI_ICHECK_EQ(out->shape[i], out_shape[i])
+        << "out shape mismatch at dimension " << i << ": expected " << out_shape[i] << ", got "
+        << out->shape[i];
   }
 
-  switch (out.scalar_type()) {
-    case at::ScalarType::Half:
+  switch (encode_dlpack_dtype(out->dtype)) {
+    case float16_code:
       runGemm<half>(out, mat1, mat2, scale_a, scale_b, m, n, k, b, config, workspace_buffer);
       break;
-    case at::ScalarType::BFloat16:
+    case bfloat16_code:
       runGemm<__nv_bfloat16>(out, mat1, mat2, scale_a, scale_b, m, n, k, b, config,
                              workspace_buffer);
       break;
     default:
-      TORCH_CHECK(false, "out_dtype must be one of fp16/bf16.");
+      TVM_FFI_LOG_AND_THROW(NotImplementedError) << "out_dtype must be one of fp16/bf16.";
   }
   return out;
 }
 
 }  // namespace
 
-at::Tensor fp8_gemm(at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& scale_a,
-                    at::Tensor const& scale_b, at::Tensor out, at::Tensor workspace_buffer,
-                    int64_t tactic) {
+Tensor fp8_gemm(Tensor mat1, Tensor mat2, Tensor scale_a, Tensor scale_b, Tensor out,
+                Tensor workspace_buffer, int64_t tactic) {
   return fp8_bmm_impl(mat1, mat2, scale_a, scale_b, out, workspace_buffer, tactic);
 }
 
@@ -170,7 +168,5 @@ int64_t fp8_gemm_tactic_num() {
 
 }  // namespace torch_ext
 
-TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
-  m.def("fp8_gemm", &torch_ext::fp8_gemm);
-  m.def("fp8_gemm_tactic_num", &torch_ext::fp8_gemm_tactic_num);
-}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp8_gemm, torch_ext::fp8_gemm);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp8_gemm_tactic_num, torch_ext::fp8_gemm_tactic_num);

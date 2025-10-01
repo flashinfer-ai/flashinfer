@@ -7,10 +7,10 @@ set -x
 
 pip install -e . -v
 
-pytest -s tests/test_block_sparse.py
-pytest -s tests/test_jit_example.py
-pytest -s tests/test_jit_warmup.py
-pytest -s tests/test_norm.py
-pytest -s tests/test_rope.py
-pytest -s tests/test_mla_page.py
-pytest -s tests/test_quantization.py
+pytest -s tests/utils/test_block_sparse.py
+pytest -s tests/utils/test_jit_example.py
+pytest -s tests/utils/test_jit_warmup.py
+pytest -s tests/utils/test_norm.py
+pytest -s tests/attention/test_rope.py
+pytest -s tests/attention/test_mla_page.py
+pytest -s tests/utils/test_quantization.py

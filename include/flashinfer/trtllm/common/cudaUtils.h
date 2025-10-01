@@ -31,12 +31,16 @@
 #include <algorithm>
 #include <cassert>
 #include <cinttypes>
+#include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <memory>
 #include <optional>
 #include <sstream>
 #include <string>
+
+#include "../../exception.h"
+
 // #ifndef _WIN32 // Linux
 // #include <sys/sysinfo.h>
 // #endif         // not WIN32
@@ -94,7 +98,7 @@ namespace tensorrt_llm::common {
 inline std::optional<bool> isCudaLaunchBlocking() {
   thread_local bool firstCall = true;
   thread_local std::optional<bool> result = std::nullopt;
-  if (!firstCall) {
+  if (firstCall) {
     char const* env = std::getenv("CUDA_LAUNCH_BLOCKING");
     if (env != nullptr && std::string(env) == "1") {
       result = true;
@@ -108,8 +112,8 @@ inline std::optional<bool> isCudaLaunchBlocking() {
 
 inline std::optional<bool> isCapturing(cudaStream_t stream) {
   cudaStreamCaptureStatus status;
-  TORCH_CHECK(cudaStreamIsCapturing(stream, &status) == cudaSuccess,
-              "CUDA error in cudaStreamIsCapturing");
+  FLASHINFER_CHECK(cudaStreamIsCapturing(stream, &status) == cudaSuccess,
+                   "CUDA error in cudaStreamIsCapturing");
   return status == cudaStreamCaptureStatus::cudaStreamCaptureStatusActive;
 }
 
@@ -134,7 +138,7 @@ inline void syncAndCheck(cudaStream_t stream, char const* const file, int const 
   if (doCheckError(stream)) {
     cudaStreamSynchronize(stream);
     auto error = cudaGetLastError();
-    TORCH_CHECK(error == cudaSuccess, "CUDA error in %s: %s", file, cudaGetErrorString(error));
+    FLASHINFER_CHECK(error == cudaSuccess, "CUDA error in %s: %s", file, cudaGetErrorString(error));
   }
 }
 

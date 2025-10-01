@@ -23,6 +23,7 @@ from .flashinfer_benchmark_utils import (
     dtype_str_to_torch_dtype,
     get_device,
     print_perf_metrics,
+    filter_backends_by_compute_capability,
 )
 
 
@@ -565,6 +566,13 @@ def testTrtllmFp4BlockScaleMoe(args):
     weight_layout = args.weight_layout
     is_cuda_graph_compatible = not args.no_cuda_graph
     gated_act_type = args.gated_act_type
+    res = []
+
+    backends = ["trtllm"]
+    backends = filter_backends_by_compute_capability(backends, args.routine, device)
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
 
     if args.verbose >= 1:
         print(
@@ -754,7 +762,6 @@ def testTrtllmFp4BlockScaleMoe(args):
 
     print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
 
-    res = []
     if args.output_path is not None:
         cur_res = defaultdict(str)
         cur_res["routine"] = args.routine
@@ -789,7 +796,7 @@ def testTrtllmFp4BlockScaleMoe(args):
 
 def testCutlassFusedMoe(args):
     """
-    Benchmark cutlass_fused_moe (CUTLASS MoE) with variants mirroring tests in tests/test_trtllm_cutlass_fused_moe.py
+    Benchmark cutlass_fused_moe (CUTLASS MoE) with variants mirroring tests in tests/moe/test_trtllm_cutlass_fused_moe.py
     Variants:
       - base: no quantization
       - fp8: per-tensor fp8 for weights and activation scale
@@ -819,6 +826,12 @@ def testCutlassFusedMoe(args):
     ep_size = getattr(args, "ep_size", 1)
     ep_rank = getattr(args, "ep_rank", 0)
     is_cuda_graph_compatible = not args.no_cuda_graph
+    res = []
+    backends = ["cutlass"]
+    backends = filter_backends_by_compute_capability(backends, args.routine, device)
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
 
     # Create base tensors
     torch.manual_seed(args.random_seed)
@@ -1087,7 +1100,6 @@ def testCutlassFusedMoe(args):
 
     print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
 
-    res = []
     if args.output_path is not None:
         cur_res = defaultdict(str)
         cur_res["routine"] = args.routine
@@ -1178,6 +1190,12 @@ def testTrtllmFp8BlockScaleMoe(args):
     use_shuffled_weight = args.use_shuffled_weight
     weight_layout = args.weight_layout
     is_cuda_graph_compatible = not args.no_cuda_graph
+    res = []
+    backends = ["trtllm"]
+    backends = filter_backends_by_compute_capability(backends, args.routine, device)
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
 
     if args.verbose >= 1:
         print(
@@ -1345,7 +1363,6 @@ def testTrtllmFp8BlockScaleMoe(args):
     backend = "trtllm"
     print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
 
-    res = []
     if args.output_path is not None:
         cur_res = defaultdict(str)
         cur_res["routine"] = args.routine
@@ -1435,6 +1452,12 @@ def testTrtllmFp8PerTensorScaleMoe(args):
     routing_method_type = args.routing_method_type
     use_routing_scales_on_input = args.use_routing_scales_on_input
     is_cuda_graph_compatible = not args.no_cuda_graph
+    res = []
+    backends = ["trtllm"]
+    backends = filter_backends_by_compute_capability(backends, args.routine, device)
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
 
     if args.verbose >= 1:
         print(
@@ -1544,7 +1567,6 @@ def testTrtllmFp8PerTensorScaleMoe(args):
     backend = "trtllm"
     print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
 
-    res = []
     if args.output_path is not None:
         cur_res = defaultdict(str)
         cur_res["routine"] = args.routine

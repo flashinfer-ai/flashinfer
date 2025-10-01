@@ -13,7 +13,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <ATen/cuda/EmptyTensor.h>
 #include <cuda_fp16.h>
 
 #include <cstddef>
@@ -25,7 +24,7 @@
 #include "flashinfer/gemm/cutlass_gemm_configs.h"
 // Use SM120-specific dispatch template (includes fp4_gemm_cutlass.h)
 #include "flashinfer/gemm/fp4_gemm_cutlass_template_sm120.h"
-#include "pytorch_extension_utils.h"
+#include "tvm_ffi_utils.h"
 
 using flashinfer::gemm::ClusterShape;
 using flashinfer::gemm::CutlassFp4GemmRunner;
@@ -45,96 +44,97 @@ CutlassGemmConfig getFp4GemmConfig(int64_t m, int64_t n, int64_t k, int64_t tact
     return gemmRunner.getConfigs();
   };
   static std::vector<CutlassGemmConfig> globalConfigs = getCutlassFp4GemmConfigs();
-  TORCH_CHECK(tactic >= 0 && tactic < globalConfigs.size(), "tactic must be between 0 and ",
-              globalConfigs.size());
+  TVM_FFI_ICHECK(tactic >= 0 && tactic < globalConfigs.size())
+      << "tactic must be between 0 and " << globalConfigs.size();
   return globalConfigs[tactic];
 }
 
 template <typename T>
-void runGemm(at::Tensor& out, at::Tensor const& mat1, at::Tensor const& mat2,
-             at::Tensor const& mat1Scale, at::Tensor const& mat2Scale,
-             at::Tensor const& globalScale, int64_t m, int64_t n, int64_t k, int64_t batch_count,
-             CutlassGemmConfig const& gemmConfig, at::Tensor workspace_buffer) {
+void runGemm(Tensor& out, Tensor const& mat1, Tensor const& mat2, Tensor const& mat1Scale,
+             Tensor const& mat2Scale, Tensor const& globalScale, int64_t m, int64_t n, int64_t k,
+             int64_t batch_count, CutlassGemmConfig const& gemmConfig, Tensor workspace_buffer) {
   CutlassFp4GemmRunner<T, FP4GemmType::W4A4_NVFP4_NVFP4> gemmRunner;
 
   int64_t const required_workspace_size = gemmRunner.getWorkspaceSize(m, n, k, batch_count);
   int64_t const provided_workspace_size =
-      workspace_buffer.numel() * workspace_buffer.element_size();
+      get_numel(workspace_buffer) * get_element_size(workspace_buffer);
 
   auto runKernel = [&](void* workspace) {
-    gemmRunner.gemm(out.data_ptr(), mat1.const_data_ptr(), mat2.const_data_ptr(),
-                    mat1Scale.const_data_ptr(), mat2Scale.const_data_ptr(),
-                    globalScale.data_ptr<float>(), m, n, k, batch_count, gemmConfig,
+    gemmRunner.gemm(out->data, mat1->data, mat2->data, mat1Scale->data, mat2Scale->data,
+                    static_cast<float*>(globalScale->data), m, n, k, batch_count, gemmConfig,
                     reinterpret_cast<char*>(workspace), required_workspace_size,
-                    at::cuda::getCurrentCUDAStream(mat1.get_device()));
+                    get_stream(mat1->device));
   };
 
   if (provided_workspace_size < required_workspace_size) {
-    at::Tensor new_workspace = at::detail::empty_cuda(
-        {required_workspace_size}, at::ScalarType::Char, mat1.device(), std::nullopt);
-
-    runKernel(new_workspace.data_ptr());
+    Tensor new_workspace =
+        alloc_tensor({required_workspace_size}, DLDataType{kDLInt, 8, 1}, mat1->device);
+    runKernel(new_workspace->data);
   } else {
-    runKernel(workspace_buffer.data_ptr());
+    runKernel(workspace_buffer->data);
   }
 }
 
-constexpr auto FLOAT4_E2M1X2 = at::ScalarType::Byte;  // uint8_t
-constexpr auto SF_DTYPE = at::ScalarType::Byte;       // uint8_t
+constexpr auto FLOAT4_E2M1X2 = dl_uint8;  // uint8_t
+constexpr auto SF_DTYPE = dl_uint8;       // uint8_t
 
-at::Tensor fp4_bmm_impl(at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& mat1Scale,
-                        at::Tensor const& mat2Scale, at::Tensor const& globalScale, at::Tensor out,
-                        at::Tensor workspace_buffer, int64_t tactic) {
+Tensor fp4_bmm_impl(Tensor const& mat1, Tensor const& mat2, Tensor const& mat1Scale,
+                    Tensor const& mat2Scale, Tensor const& globalScale, Tensor out,
+                    Tensor workspace_buffer, int64_t tactic) {
   // Validate inputs
-  TORCH_CHECK(mat1.dtype() == FLOAT4_E2M1X2, "mat1 must be FLOAT4_E2M1X2 (uint8)");
-  TORCH_CHECK(mat2.dtype() == FLOAT4_E2M1X2, "mat2 must be FLOAT4_E2M1X2 (uint8)");
-  TORCH_CHECK(mat1Scale.dtype() == SF_DTYPE, "mat1Scale must be SF_DTYPE (uint8)");
-  TORCH_CHECK(mat2Scale.dtype() == SF_DTYPE, "mat2Scale must be SF_DTYPE (uint8)");
-  TORCH_CHECK(globalScale.dtype() == at::ScalarType::Float, "globalScale must be float");
-  TORCH_CHECK(mat1.is_cuda(), "mat1 must be on CUDA device");
-  TORCH_CHECK(mat2.is_cuda(), "mat2 must be on CUDA device");
-  TORCH_CHECK(mat1Scale.is_cuda(), "mat1Scale must be on CUDA device");
-  TORCH_CHECK(mat2Scale.is_cuda(), "mat2Scale must be on CUDA device");
-  TORCH_CHECK(globalScale.is_cuda(), "globalScale must be on CUDA device");
-  TORCH_CHECK(out.is_cuda(), "out must be on CUDA device");
-  TORCH_CHECK(workspace_buffer.is_cuda(), "workspace_buffer must be on CUDA device");
+  TVM_FFI_ICHECK_EQ(mat1->dtype, FLOAT4_E2M1X2) << "mat1 must be FLOAT4_E2M1X2 (uint8)";
+  TVM_FFI_ICHECK_EQ(mat2->dtype, FLOAT4_E2M1X2) << "mat2 must be FLOAT4_E2M1X2 (uint8)";
+  TVM_FFI_ICHECK_EQ(mat1Scale->dtype, SF_DTYPE) << "mat1Scale must be SF_DTYPE (uint8)";
+  TVM_FFI_ICHECK_EQ(mat2Scale->dtype, SF_DTYPE) << "mat2Scale must be SF_DTYPE (uint8)";
+  TVM_FFI_ICHECK_EQ(globalScale->dtype, dl_float32) << "globalScale must be float";
+  TVM_FFI_ICHECK_EQ(mat1->device.device_type, kDLCUDA) << "mat1 must be on CUDA device";
+  TVM_FFI_ICHECK_EQ(mat2->device.device_type, kDLCUDA) << "mat2 must be on CUDA device";
+  TVM_FFI_ICHECK_EQ(mat1Scale->device.device_type, kDLCUDA) << "mat1Scale must be on CUDA device";
+  TVM_FFI_ICHECK_EQ(mat2Scale->device.device_type, kDLCUDA) << "mat2Scale must be on CUDA device";
+  TVM_FFI_ICHECK_EQ(globalScale->device.device_type, kDLCUDA)
+      << "globalScale must be on CUDA device";
+  TVM_FFI_ICHECK_EQ(out->device.device_type, kDLCUDA) << "out must be on CUDA device";
+  TVM_FFI_ICHECK_EQ(workspace_buffer->device.device_type, kDLCUDA)
+      << "workspace_buffer must be on CUDA device";
 
   // Check device consistency
-  TORCH_CHECK(mat1.device() == mat2.device() && mat1.device() == mat1Scale.device() &&
-                  mat1.device() == mat2Scale.device() && mat1.device() == globalScale.device() &&
-                  mat1.device() == out.device() && mat1.device() == workspace_buffer.device(),
-              "All tensors must be on the same device");
+  CHECK_DEVICE(mat1, mat2);
+  CHECK_DEVICE(mat1, mat1Scale);
+  CHECK_DEVICE(mat1, mat2Scale);
+  CHECK_DEVICE(mat1, globalScale);
+  CHECK_DEVICE(mat1, out);
+  CHECK_DEVICE(mat1, workspace_buffer);
 
   // Get dimensions
   int64_t b = 1;
   int64_t m, k_packed, n;
 
-  if (mat1.dim() == 2) {
-    m = mat1.size(0);
-    k_packed = mat1.size(1);
-  } else if (mat1.dim() == 3) {
-    b = mat1.size(0);
-    m = mat1.size(1);
-    k_packed = mat1.size(2);
+  if (mat1->ndim == 2) {
+    m = mat1->shape[0];
+    k_packed = mat1->shape[1];
+  } else if (mat1->ndim == 3) {
+    b = mat1->shape[0];
+    m = mat1->shape[1];
+    k_packed = mat1->shape[2];
   } else {
-    TORCH_CHECK(false, "mat1 must be 2D or 3D tensor");
+    TVM_FFI_ICHECK(false) << "mat1 must be 2D or 3D tensor";
   }
 
-  if (mat2.dim() == 2) {
-    n = mat2.size(0);
-    TORCH_CHECK(mat2.size(1) == k_packed, "mat2.size(1) must match mat1.size(-1)");
-  } else if (mat2.dim() == 3) {
-    TORCH_CHECK(mat2.size(0) == b, "Batch dimensions must match");
-    n = mat2.size(1);
-    TORCH_CHECK(mat2.size(2) == k_packed, "mat2.size(2) must match mat1.size(-1)");
+  if (mat2->ndim == 2) {
+    n = mat2->shape[0];
+    TVM_FFI_ICHECK_EQ(mat2->shape[1], k_packed) << "mat2->shape[1] must match mat1.size(-1)";
+  } else if (mat2->ndim == 3) {
+    TVM_FFI_ICHECK_EQ(mat2->shape[0], b) << "Batch dimensions must match";
+    n = mat2->shape[1];
+    TVM_FFI_ICHECK_EQ(mat2->shape[2], k_packed) << "mat2->shape[2] must match mat1.size(-1)";
   } else {
-    TORCH_CHECK(false, "mat2 must be 2D or 3D tensor");
+    TVM_FFI_ICHECK(false) << "mat2 must be 2D or 3D tensor";
   }
 
   // k_packed stores 2 FP4 values per byte
   int64_t k = k_packed * 2;
 
-  TORCH_CHECK(globalScale.numel() == 1, "globalScale must be a scalar tensor");
+  TVM_FFI_ICHECK_EQ(get_numel(globalScale), 1) << "globalScale must be a scalar tensor";
 
   // Configure the kernel
   CutlassGemmConfig config =
@@ -146,34 +146,33 @@ at::Tensor fp4_bmm_impl(at::Tensor const& mat1, at::Tensor const& mat2, at::Tens
   // Validate output dimensions
   std::vector<int64_t> out_shape =
       (b > 1) ? std::vector<int64_t>{b, m, n} : std::vector<int64_t>{m, n};
-  TORCH_CHECK(out.dim() == out_shape.size(), "out must have ", out_shape.size(), " dimensions");
+  TVM_FFI_ICHECK_EQ(out->ndim, out_shape.size())
+      << "out must have " << out_shape.size() << " dimensions";
   for (size_t i = 0; i < out_shape.size(); ++i) {
-    TORCH_CHECK(out.sizes()[i] == out_shape[i], "out.size(", i, "): expected ", out_shape[i],
-                ", got ", out.sizes()[i]);
+    TVM_FFI_ICHECK_EQ(out->shape[i], out_shape[i])
+        << "out.size(" << i << "): expected " << out_shape[i] << ", got " << out->shape[i];
   }
 
-  c10::ScalarType out_dtype = out.scalar_type();
-
-  switch (out_dtype) {
-    case at::ScalarType::Half:
+  switch (encode_dlpack_dtype(out->dtype)) {
+    case float16_code:
       runGemm<half>(out, mat1, mat2, mat1Scale, mat2Scale, globalScale, m, n, k, b, config,
                     workspace_buffer);
       break;
-    case at::ScalarType::BFloat16:
+    case bfloat16_code:
       runGemm<__nv_bfloat16>(out, mat1, mat2, mat1Scale, mat2Scale, globalScale, m, n, k, b, config,
                              workspace_buffer);
       break;
     default:
-      TORCH_CHECK(false, "out_dtype must be one of fp16/bf16.");
+      TVM_FFI_ICHECK(false) << "out_dtype must be one of fp16/bf16.";
   }
   return out;
 }
 
 }  // namespace
 
-at::Tensor fp4_gemm(at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& mat1Scale,
-                    at::Tensor const& mat2Scale, at::Tensor const& globalScale, at::Tensor out,
-                    at::Tensor workspace_buffer, int64_t tactic) {
+Tensor fp4_gemm(Tensor const& mat1, Tensor const& mat2, Tensor const& mat1Scale,
+                Tensor const& mat2Scale, Tensor const& globalScale, Tensor out,
+                Tensor workspace_buffer, int64_t tactic) {
   return fp4_bmm_impl(mat1, mat2, mat1Scale, mat2Scale, globalScale, out, workspace_buffer, tactic);
 }
 
@@ -185,7 +184,5 @@ int64_t fp4_gemm_tactic_num() {
 
 }  // namespace torch_ext
 
-TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
-  m.def("fp4_gemm", &torch_ext::fp4_gemm);
-  m.def("fp4_gemm_tactic_num", &torch_ext::fp4_gemm_tactic_num);
-}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp4_gemm, torch_ext::fp4_gemm);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp4_gemm_tactic_num, torch_ext::fp4_gemm_tactic_num);

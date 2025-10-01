@@ -46,7 +46,6 @@ packages = [
     "flashinfer.data.csrc",
     "flashinfer.data.cutlass",
     "flashinfer.data.spdlog",
-    "flashinfer.data.tvm_binding",
     "flashinfer.data.include",
     "flashinfer.fused_moe",
     "flashinfer.jit",
@@ -73,7 +72,6 @@ include-package-data = false
 "flashinfer.data" = [
     "csrc/**",
     "include/**",
-    "tvm_binding/**",
     "version.txt"
 ]
 "flashinfer.data.aot" = [
@@ -88,12 +86,19 @@ include-package-data = false
 ]
 
 [tool.mypy]
-ignore_missing_imports = false
+files = ["flashinfer"]
+ignore_missing_imports = true
 show_column_numbers = true
 show_error_context = true
 follow_imports = "skip"
 ignore_errors = false
 strict_optional = false
+exclude = [
+    "flashinfer-cubin/",
+    "3rdparty/",
+    "flashinfer/data/cutlass/",
+    "build/",
+]
 
 
 [tool.ruff.lint]

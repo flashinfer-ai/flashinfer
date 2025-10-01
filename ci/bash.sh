@@ -70,6 +70,10 @@ echo "ENV VARIABLES: ${DOCKER_ENV}"
 echo "VOLUMES: ${DOCKER_VOLUMNS}"
 echo "COMMANDS: '${COMMAND[@]}'"
 
+# Pull the latest docker image
+echo "Pulling latest image: ${DOCKER_IMAGE_NAME}"
+${DOCKER_BINARY} pull ${DOCKER_IMAGE_NAME}
+
 # By default we cleanup - remove the container once it finish running (--rm)
 # and share the PID namespace (--pid=host) so the process inside does not have
 # pid 1 and SIGKILL is propagated to the process inside (jenkins can kill it).
