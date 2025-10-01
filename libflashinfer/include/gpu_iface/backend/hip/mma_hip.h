@@ -92,7 +92,7 @@ __device__ __forceinline__ void mma_sync_m16n16k16_row_col_f16f16f32(float* C, u
   } else if constexpr (std::is_same_v<T, __hip_bfloat16>) {
     C_fp32 = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(A_fp16, B_fp16, C_fp32, 0, 0, 0);
   }
-  
+
   reinterpret_cast<f32x4*>(C)[0] = C_fp32;
 #elif defined(__HIP_DEVICE_COMPILE__)
 #error "Unsupported GFX platform for MFMA ops."
