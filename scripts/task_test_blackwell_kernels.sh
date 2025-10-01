@@ -6,6 +6,9 @@ set -eo pipefail
 : ${MAX_JOBS:=$(nproc)}
 : ${CUDA_VISIBLE_DEVICES:=0}
 
+# Pytest configuration flags
+PYTEST_FLAGS="--continue-on-collection-errors -s"
+
 # Check for dry-run mode
 DRY_RUN=false
 if [[ "$1" == "--dry-run" ]] || [[ "${DRY_RUN}" == "true" ]]; then
@@ -121,7 +124,7 @@ else
                 echo "Running: pytest $test_file"
                 TOTAL_TESTS=$((TOTAL_TESTS + 1))
 
-                if pytest "$test_file"; then
+                if pytest "$test_file" $PYTEST_FLAGS; then
                     echo "✅ PASSED: $test_file"
                     PASSED_TESTS=$((PASSED_TESTS + 1))
                 else
@@ -139,7 +142,7 @@ else
 
             TOTAL_TESTS=$((TOTAL_TESTS + 1))
 
-            if pytest "$test_dir"; then
+            if pytest "$test_dir" $PYTEST_FLAGS; then
                 echo "✅ PASSED: $test_dir"
                 PASSED_TESTS=$((PASSED_TESTS + 1))
             else
