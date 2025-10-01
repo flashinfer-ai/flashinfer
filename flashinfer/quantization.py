@@ -30,7 +30,7 @@ def gen_quantization_module() -> JitSpec:
         "quantization",
         [
             jit_env.FLASHINFER_CSRC_DIR / "quantization.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "flashinfer_quantization_ops.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "flashinfer_quantization_binding.cu",
         ],
     )
 

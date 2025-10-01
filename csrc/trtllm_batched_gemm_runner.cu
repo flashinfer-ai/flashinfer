@@ -14,12 +14,11 @@
  * limitations under the License.
  */
 
-#include <c10/util/Exception.h>
-
 #include <vector>
 
 #include "flashinfer/trtllm/batched_gemm/KernelRunner.h"
 // #include "tensorrt_llm/common/assert.h"
+#include "flashinfer/exception.h"
 #include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/BatchedGemmInterface.h"
 #include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/Enums.h"
 #include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
@@ -116,7 +115,7 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
     }
   }
 
-  TORCH_CHECK(!mPassingConfigIndices.empty(), "No kernel found for the given options");
+  FLASHINFER_CHECK(!mPassingConfigIndices.empty(), "No kernel found for the given options");
 }
 
 size_t TrtllmGenBatchedGemmRunner::getWorkspaceSizeInBytes(
@@ -163,24 +162,26 @@ void TrtllmGenBatchedGemmRunner::run(
 
   auto const& config = configs[configIndex];
 
-  TORCH_CHECK(numBatches > 0, "Batched GEMM requires numBatches > 0");
+  FLASHINFER_CHECK(numBatches > 0, "Batched GEMM requires numBatches > 0");
   if (!mOptions.staticBatch) {
-    TORCH_CHECK(totalNumPaddedTokens,
-                "Batched GEMM with dynamic batching requires totalNumPaddedTokens");
-    TORCH_CHECK(ctaIdxXyToBatchIdx,
-                "Batched GEMM with dynamic batching requires ctaIdxXyToBatchIdx");
-    TORCH_CHECK(ctaIdxXyToMnLimit, "Batched GEMM with dynamic batching requires ctaIdxXyToMnLimit");
-    TORCH_CHECK(numNonExitingCtas, "Batched GEMM with dynamic batching requires numNonExitingCtas");
+    FLASHINFER_CHECK(totalNumPaddedTokens,
+                     "Batched GEMM with dynamic batching requires totalNumPaddedTokens");
+    FLASHINFER_CHECK(ctaIdxXyToBatchIdx,
+                     "Batched GEMM with dynamic batching requires ctaIdxXyToBatchIdx");
+    FLASHINFER_CHECK(ctaIdxXyToMnLimit,
+                     "Batched GEMM with dynamic batching requires ctaIdxXyToMnLimit");
+    FLASHINFER_CHECK(numNonExitingCtas,
+                     "Batched GEMM with dynamic batching requires numNonExitingCtas");
   }
 
   if (!mOptions.staticBatch && numTokens != 0) {
-    TORCH_CHECK(maxNumCtasInBatchDim > 0,
-                "Batched GEMM with dynamic batching requires maxNumCtasInBatchDim > 0");
+    FLASHINFER_CHECK(maxNumCtasInBatchDim > 0,
+                     "Batched GEMM with dynamic batching requires maxNumCtasInBatchDim > 0");
   }
 
   if (mOptions.routeAct) {
-    TORCH_CHECK(routeMap, "Batched GEMM with routeAct requires routeMap");
-    TORCH_CHECK(numTokens > 0, "Batched GEMM with routeAct requires numTokens > 0");
+    FLASHINFER_CHECK(routeMap, "Batched GEMM with routeAct requires routeMap");
+    FLASHINFER_CHECK(numTokens > 0, "Batched GEMM with routeAct requires numTokens > 0");
   }
 
   // Dims
@@ -236,11 +237,11 @@ void TrtllmGenBatchedGemmRunner::run(
   auto const err = bmm.run(config, workspace, gemmData, static_cast<void*>(stream),
                            multiProcessorCount, enable_pdl, globalTrtllmGenBatchedGemmModuleCache);
 
-  TORCH_CHECK(err == 0,
-              "Error occurred when running GEMM!"
-              " (numBatches: ",
-              numBatches, ", GemmMNK: ", m, " ", n, " ", k, ", Kernel: ", config.mFunctionName,
-              ")");
+  FLASHINFER_CHECK(err == 0,
+                   "Error occurred when running GEMM!"
+                   " (numBatches: ",
+                   numBatches, ", GemmMNK: ", m, " ", n, " ", k, ", Kernel: ", config.mFunctionName,
+                   ")");
 }
 
 void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k,
@@ -384,7 +385,8 @@ std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(
     }
   }
 
-  TORCH_CHECK(!validConfigIndices.empty(), "No valid config found for the given problem shape");
+  FLASHINFER_CHECK(!validConfigIndices.empty(),
+                   "No valid config found for the given problem shape");
 
   return validConfigIndices;
 }

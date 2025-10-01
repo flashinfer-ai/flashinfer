@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "flashinfer/exception.h"
 #include "flashinfer/trtllm/fused_moe/RoutingKernel.cuh"
 
 namespace moe::dev::routing {
@@ -421,57 +422,61 @@ void runImpl(Data& data, void* stream) {
   int MaxNumTopGroups = getMaxNumTopGroups(data.mNumExpertGroups > 1, data.mNumExperts);
 
   // Validate that the template parameter matches the data
-  // TORCH_CHECK(data.mNumExperts == NumExperts, "DeepSeek routing kernel expects exactly ",
+  // FLASHINFER_CHECK(data.mNumExperts == NumExperts, "DeepSeek routing kernel expects exactly ",
   //             NumExperts, " experts, got ", data.mNumExperts);
-  TORCH_CHECK(data.mPtrExpertIdx != nullptr || data.mPtrPermutedIdxSize != nullptr ||
-                  data.mPtrExpertWeights != nullptr,
-              "Routing kernel requires at least one output parameter");
+  FLASHINFER_CHECK(data.mPtrExpertIdx != nullptr || data.mPtrPermutedIdxSize != nullptr ||
+                       data.mPtrExpertWeights != nullptr,
+                   "Routing kernel requires at least one output parameter");
   if (data.mPtrExpandedIdxToPermutedIdx != nullptr || data.mPtrPermutedIdxToTokenIdx != nullptr)
-    TORCH_CHECK(data.mPtrExpertIdx != nullptr && data.mPtrPermutedIdxSize,
-                "If permuted index is required, `mPtrExpertIdx` is also required");
-  TORCH_CHECK(!data.mUseRoutingSoftmax, "Routing with softmax not implemented yet");
-  TORCH_CHECK(data.mNumLimitedGroups <= MaxNumTopGroups,
-              "Routing kernel expects <= ", MaxNumTopGroups, " top groups, got ",
-              data.mNumLimitedGroups);
-  TORCH_CHECK(data.mTopK <= MaxNumTopExperts,
-              "Routing kernel expects topK experts <= ", MaxNumTopExperts, ", got ", data.mTopK);
-  TORCH_CHECK(data.mTopK <= WarpSize, "Routing kernel expects top K <= warp size, got ",
-              data.mTopK);
-  TORCH_CHECK(data.mTopK * data.mNumLimitedGroups <= WarpSize,
-              "Routing kernel expects top K * top groups <= warp size (for now), got ", data.mTopK,
-              " * ", data.mNumLimitedGroups);
-  TORCH_CHECK(data.mNumExperts >= MaxNumTopExperts, "Routing kernel expects ", MaxNumTopExperts,
-              " to be at most #experts ", data.mNumExperts);
-  TORCH_CHECK(data.mNumExperts <= NumThreads, "Routing kernel expects #experts ", data.mNumExperts,
-              " <= #threads ", NumThreads);
-  TORCH_CHECK(data.mNumExpertGroups >= data.mNumLimitedGroups, "Routing kernel expects top groups ",
-              data.mNumLimitedGroups, " to be limited by #expert groups ", data.mNumExpertGroups);
+    FLASHINFER_CHECK(data.mPtrExpertIdx != nullptr && data.mPtrPermutedIdxSize,
+                     "If permuted index is required, `mPtrExpertIdx` is also required");
+  FLASHINFER_CHECK(!data.mUseRoutingSoftmax, "Routing with softmax not implemented yet");
+  FLASHINFER_CHECK(data.mNumLimitedGroups <= MaxNumTopGroups,
+                   "Routing kernel expects <= ", MaxNumTopGroups, " top groups, got ",
+                   data.mNumLimitedGroups);
+  FLASHINFER_CHECK(data.mTopK <= MaxNumTopExperts,
+                   "Routing kernel expects topK experts <= ", MaxNumTopExperts, ", got ",
+                   data.mTopK);
+  FLASHINFER_CHECK(data.mTopK <= WarpSize, "Routing kernel expects top K <= warp size, got ",
+                   data.mTopK);
+  FLASHINFER_CHECK(data.mTopK * data.mNumLimitedGroups <= WarpSize,
+                   "Routing kernel expects top K * top groups <= warp size (for now), got ",
+                   data.mTopK, " * ", data.mNumLimitedGroups);
+  FLASHINFER_CHECK(data.mNumExperts >= MaxNumTopExperts, "Routing kernel expects ",
+                   MaxNumTopExperts, " to be at most #experts ", data.mNumExperts);
+  FLASHINFER_CHECK(data.mNumExperts <= NumThreads, "Routing kernel expects #experts ",
+                   data.mNumExperts, " <= #threads ", NumThreads);
+  FLASHINFER_CHECK(data.mNumExpertGroups >= data.mNumLimitedGroups,
+                   "Routing kernel expects top groups ", data.mNumLimitedGroups,
+                   " to be limited by #expert groups ", data.mNumExpertGroups);
   if (data.mNumExpertGroups > 1) {
-    TORCH_CHECK(data.mNumExpertGroups <= NumWarps, "Routing kernel expects #experts groups ",
-                data.mNumExpertGroups, " to be <= #warps ", NumWarps);
-    TORCH_CHECK(data.mNumExperts % data.mNumExpertGroups == 0, "Routing kernel expects #experts ",
-                data.mNumExperts, " to be a multiple of #expert groups ", data.mNumExpertGroups);
-    TORCH_CHECK(data.mNumExperts / data.mNumExpertGroups <= WarpSize,
-                "Routing kernel expects #experts per group <= warp size, got ",
-                data.mNumExperts / data.mNumExpertGroups);
+    FLASHINFER_CHECK(data.mNumExpertGroups <= NumWarps, "Routing kernel expects #experts groups ",
+                     data.mNumExpertGroups, " to be <= #warps ", NumWarps);
+    FLASHINFER_CHECK(data.mNumExperts % data.mNumExpertGroups == 0,
+                     "Routing kernel expects #experts ", data.mNumExperts,
+                     " to be a multiple of #expert groups ", data.mNumExpertGroups);
+    FLASHINFER_CHECK(data.mNumExperts / data.mNumExpertGroups <= WarpSize,
+                     "Routing kernel expects #experts per group <= warp size, got ",
+                     data.mNumExperts / data.mNumExpertGroups);
   } else {
-    TORCH_CHECK(data.mNumExperts <= WarpSize * MaxNumTopGroups, "Routing kernel expects #experts ",
-                data.mNumExperts, " <= WarpSize * MaxNumTopGroups ", WarpSize * MaxNumTopGroups);
-    TORCH_CHECK(data.mTopK <= NumWarps, "Routing kernel expects top K ", data.mTopK,
-                " to be <= #warps ", NumWarps);
+    FLASHINFER_CHECK(data.mNumExperts <= WarpSize * MaxNumTopGroups,
+                     "Routing kernel expects #experts ", data.mNumExperts,
+                     " <= WarpSize * MaxNumTopGroups ", WarpSize * MaxNumTopGroups);
+    FLASHINFER_CHECK(data.mTopK <= NumWarps, "Routing kernel expects top K ", data.mTopK,
+                     " to be <= #warps ", NumWarps);
   }
-  TORCH_CHECK(data.mNumExperts % 4 == 0, "Routing kernel expects #experts ", data.mNumExperts,
-              " to be a multiple of 4.");
-  TORCH_CHECK(data.mPaddingLog2 < 8, "Routing kernel expects padding log2 < 8, got ",
-              data.mPaddingLog2);
+  FLASHINFER_CHECK(data.mNumExperts % 4 == 0, "Routing kernel expects #experts ", data.mNumExperts,
+                   " to be a multiple of 4.");
+  FLASHINFER_CHECK(data.mPaddingLog2 < 8, "Routing kernel expects padding log2 < 8, got ",
+                   data.mPaddingLog2);
   int const numBlocks = data.mNumTokens;
 
   bool const useSingleCluster = data.mNumTokens <= 1024;
   if (!useSingleCluster) {
     // Reset the global histograms (not used in single-cluster code path).
     // Cover both for the cooperative and two-kernel code paths.
-    TORCH_CHECK(data.mPtrExpertCounts != nullptr,
-                "When #tokens is large, `mPtrExpertCounts` is a required input.");
+    FLASHINFER_CHECK(data.mPtrExpertCounts != nullptr,
+                     "When #tokens is large, `mPtrExpertCounts` is a required input.");
   } else {
     data.mPtrExpertCounts =
         nullptr;  // Set it to nullptr for single-cluster code path, as it won't be used

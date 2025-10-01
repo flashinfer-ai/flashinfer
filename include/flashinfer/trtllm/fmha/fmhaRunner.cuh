@@ -18,6 +18,7 @@
 
 #include <cuda_runtime.h>
 
+#include "../../exception.h"
 #include "fmhaKernels.cuh"
 #include "fmhaRunnerParams.h"
 
@@ -26,15 +27,16 @@ class TllmGenFmhaRunner {
   // Constructor.
   explicit TllmGenFmhaRunner(Data_type dtypeQ, Data_type dtypeKv, Data_type dtypeOut)
       : mSM(getSMVersion()), mDtypeQ(dtypeQ), mDtypeKv(dtypeKv), mDtypeOut(dtypeOut) {
-    TORCH_CHECK(mSM == kSM_100 || mSM == kSM_103, "Unsupported architecture");
-    TORCH_CHECK(mDtypeQ == DATA_TYPE_E4M3 || mDtypeQ == DATA_TYPE_FP16 || mDtypeQ == DATA_TYPE_BF16,
-                "Unsupported Q data type: " + std::string(toStr(mDtypeQ)));
-    TORCH_CHECK(
+    FLASHINFER_CHECK(mSM == kSM_100 || mSM == kSM_103, "Unsupported architecture");
+    FLASHINFER_CHECK(
+        mDtypeQ == DATA_TYPE_E4M3 || mDtypeQ == DATA_TYPE_FP16 || mDtypeQ == DATA_TYPE_BF16,
+        "Unsupported Q data type: " + std::string(toStr(mDtypeQ)));
+    FLASHINFER_CHECK(
         mDtypeKv == DATA_TYPE_E4M3 || mDtypeKv == DATA_TYPE_FP16 || mDtypeKv == DATA_TYPE_BF16,
         "Unsupported Kv data type: " + std::string(toStr(mDtypeKv)));
-    TORCH_CHECK(mDtypeOut == DATA_TYPE_E4M3 || mDtypeOut == DATA_TYPE_FP16 ||
-                    mDtypeOut == DATA_TYPE_BF16 || mDtypeOut == DATA_TYPE_E2M1,
-                "Unsupported Output data type: " + std::string(toStr(mDtypeOut)));
+    FLASHINFER_CHECK(mDtypeOut == DATA_TYPE_E4M3 || mDtypeOut == DATA_TYPE_FP16 ||
+                         mDtypeOut == DATA_TYPE_BF16 || mDtypeOut == DATA_TYPE_E2M1,
+                     "Unsupported Output data type: " + std::string(toStr(mDtypeOut)));
     mKernel = getTllmFmhaKernels(mDtypeQ, mDtypeKv, mDtypeOut, mSM);
   }
 

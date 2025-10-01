@@ -17,20 +17,27 @@ from . import env as jit_env
 from ..compilation_context import CompilationContext
 
 
-def torch_get_pybind11_abi_build_flags() -> List[str]:
-    # NOTE: starting from torch 2.9, this function is no longer needed
-    # torch (cuda) version format is now like 2.9.0+cu129, so we need to split the version string
-    # and check if the major version is at least 2.9
-    torch_major_version = re.split(r"(\d+\.\d+)", torch.__version__)[1]
-    if Version(torch_major_version) >= Version("2.9"):
-        return []
-    else:
-        abi_cflags = []
-        for pname in ["COMPILER_TYPE", "STDLIB", "BUILD_ABI"]:
-            pval = getattr(torch._C, f"_PYBIND11_{pname}")
-            if pval is not None:
-                abi_cflags.append(f'-DPYBIND11_{pname}=\\"{pval}\\"')
-        return abi_cflags
+def parse_env_flags(env_var_name) -> List[str]:
+    env_flags = os.environ.get(env_var_name)
+    if env_flags:
+        try:
+            import shlex
+
+            return shlex.split(env_flags)
+        except ValueError as e:
+            print(
+                f"Warning: Could not parse {env_var_name} with shlex: {e}. Falling back to simple split.",
+                file=sys.stderr,
+            )
+            return env_flags.split()
+    return []
+
+
+def _get_glibcxx_abi_build_flags() -> List[str]:
+    glibcxx_abi_cflags = [
+        "-D_GLIBCXX_USE_CXX11_ABI=" + str(int(torch._C._GLIBCXX_USE_CXX11_ABI))
+    ]
+    return glibcxx_abi_cflags
 
 
 @functools.cache
@@ -75,13 +82,6 @@ def is_cuda_version_at_least(version_str: str) -> bool:
     return get_cuda_version() >= Version(version_str)
 
 
-def _get_glibcxx_abi_build_flags() -> List[str]:
-    glibcxx_abi_cflags = [
-        "-D_GLIBCXX_USE_CXX11_ABI=" + str(int(torch._C._GLIBCXX_USE_CXX11_ABI))
-    ]
-    return glibcxx_abi_cflags
-
-
 def join_multiline(vs: List[str]) -> str:
     return " $\n    ".join(vs)
 
@@ -97,8 +97,6 @@ def generate_ninja_build_for_op(
 ) -> str:
     system_includes = [
         sysconfig.get_path("include"),
-        "$torch_home/include",
-        "$torch_home/include/torch/csrc/api/include",
         "$cuda_home/include",
         "$cuda_home/include/cccl",
         tvm_ffi.libinfo.find_include_path(),
@@ -109,13 +107,14 @@ def generate_ninja_build_for_op(
     system_includes += [p.resolve() for p in jit_env.CUTLASS_INCLUDE_DIRS]
     system_includes.append(jit_env.SPDLOG_INCLUDE_DIR.resolve())
 
-    common_cflags = [
-        "-DTORCH_EXTENSION_NAME=$name",
-        "-DTORCH_API_INCLUDE_EXTENSION_H",
-    ]
+    cuda_home = get_cuda_path()
+    if cuda_home == "/usr":
+        # NOTE: this will resolve to /usr/include, which will mess up includes. See #1793
+        system_includes.remove("$cuda_home/include")
+
+    common_cflags = []
     if not sysconfig.get_config_var("Py_GIL_DISABLED"):
         common_cflags.append("-DPy_LIMITED_API=0x03090000")
-    common_cflags += torch_get_pybind11_abi_build_flags()
     common_cflags += _get_glibcxx_abi_build_flags()
     if extra_include_dirs is not None:
         for extra_dir in extra_include_dirs:
@@ -169,41 +168,33 @@ def generate_ninja_build_for_op(
 
     ldflags = [
         "-shared",
-        "-L$torch_home/lib",
         "-L$cuda_home/lib64",
-        "-lc10",
-        "-lc10_cuda",
-        "-ltorch_cpu",
-        "-ltorch_cuda",
-        "-ltorch",
+        "-L$cuda_home/lib64/stubs",
         "-lcudart",
     ]
 
-    env_extra_ldflags = os.environ.get("FLASHINFER_EXTRA_LDFLAGS")
-    if env_extra_ldflags:
-        try:
-            import shlex
-
-            ldflags += shlex.split(env_extra_ldflags)
-        except ValueError as e:
-            print(
-                f"Warning: Could not parse FLASHINFER_EXTRA_LDFLAGS with shlex: {e}. Falling back to simple split.",
-                file=sys.stderr,
-            )
-            ldflags += env_extra_ldflags.split()
+    env_extra_ldflags = parse_env_flags("FLASHINFER_EXTRA_LDFLAGS")
+    if env_extra_ldflags is not None:
+        ldflags += env_extra_ldflags
 
     if extra_ldflags is not None:
         ldflags += extra_ldflags
 
+    extra_cflags = parse_env_flags("FLASHINFER_EXTRA_CFLAGS")
+    if extra_cflags is not None:
+        cflags += extra_cflags
+
+    extra_cuda_cflags = parse_env_flags("FLASHINFER_EXTRA_CUDAFLAGS")
+    if extra_cuda_cflags is not None:
+        cuda_cflags += extra_cuda_cflags
+
     cxx = os.environ.get("CXX", "c++")
-    cuda_home = get_cuda_path()
-    nvcc = os.environ.get("PYTORCH_NVCC", "$cuda_home/bin/nvcc")
+    nvcc = os.environ.get("FLASHINFER_NVCC", "$cuda_home/bin/nvcc")
 
     lines = [
         "ninja_required_version = 1.3",
         f"name = {name}",
         f"cuda_home = {cuda_home}",
-        f"torch_home = {torch.__path__[0]}",
         f"cxx = {cxx}",
         f"nvcc = {nvcc}",
         "",
