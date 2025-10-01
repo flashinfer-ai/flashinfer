@@ -30,6 +30,7 @@ import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 
 from flashinfer.cute_dsl.gemm_allreduce_two_shot import PersistentDenseGemmKernel
+from flashinfer.utils import get_compute_capability
 
 
 logger = logging.getLogger(__name__)
@@ -482,6 +483,10 @@ def test_cute_dsl_gemm_allreduce_two_shot(world_size):
         pytest.skip(
             f"world_size {world_size} is greater than available_gpus {available_gpus}"
         )
+
+    if get_compute_capability(torch.device("cuda")) != (10, 0):
+        pytest.skip("cute_dsl_gemm_allreduce_two_shot requires SM100")
+
     print(f"Running test for world_size={world_size}")
     multi_process_parallel(
         world_size,
