@@ -94,6 +94,28 @@ def show_config_cmd():
     click.secho("FlashInfer version:", fg="magenta", nl=False)
     click.secho(f" {__version__}", fg="cyan")
 
+    # Check for additional packages
+    try:
+        import importlib.metadata
+
+        try:
+            cubin_version = importlib.metadata.version("flashinfer-cubin")
+            click.secho("flashinfer-cubin version:", fg="magenta", nl=False)
+            click.secho(f" {cubin_version}", fg="cyan")
+        except importlib.metadata.PackageNotFoundError:
+            click.secho("flashinfer-cubin:", fg="magenta", nl=False)
+            click.secho(" Not installed", fg="red")
+
+        try:
+            jit_cache_version = importlib.metadata.version("flashinfer-jit-cache")
+            click.secho("flashinfer-jit-cache version:", fg="magenta", nl=False)
+            click.secho(f" {jit_cache_version}", fg="cyan")
+        except importlib.metadata.PackageNotFoundError:
+            click.secho("flashinfer-jit-cache:", fg="magenta", nl=False)
+            click.secho(" Not installed", fg="red")
+    except Exception as e:
+        click.secho(f"Error checking package versions: {e}", fg="yellow")
+
     # Section: Torch Version Info
     import torch
 
