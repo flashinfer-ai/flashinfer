@@ -8,6 +8,19 @@ echo "=========================================="
 echo "Building flashinfer-jit-cache wheel"
 echo "=========================================="
 
+# MAX_JOBS = min(nproc, max(1, MemAvailable_GB/4))
+MEM_AVAILABLE_GB=$(free -g | awk '/^Mem:/ {print $7}')
+NPROC=$(nproc)
+MAX_JOBS=$(( MEM_AVAILABLE_GB / 4 ))
+if (( MAX_JOBS < 1 )); then
+  MAX_JOBS=1
+elif (( NPROC < MAX_JOBS )); then
+  MAX_JOBS=$NPROC
+fi
+
+# Export MAX_JOBS for PyTorch's cpp_extension to use
+export MAX_JOBS
+
 # Display build environment info
 echo "CUDA Version: ${CUDA_VERSION}"
 echo "CPU Architecture: ${ARCH}"
@@ -15,6 +28,8 @@ echo "CUDA Major: ${CUDA_MAJOR}"
 echo "CUDA Minor: ${CUDA_MINOR}"
 echo "CUDA Version Suffix: ${CUDA_VERSION_SUFFIX}"
 echo "CUDA Architectures: ${FLASHINFER_CUDA_ARCH_LIST}"
+echo "MAX_JOBS: ${MAX_JOBS}"
+echo "Python Version: $(python --version)"
 echo "Working directory: $(pwd)"
 echo ""
 
