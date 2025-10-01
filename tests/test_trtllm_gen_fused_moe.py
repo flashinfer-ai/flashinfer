@@ -1028,7 +1028,7 @@ class BF16Moe(Moe):
         # Use shuffled weights with BlockMajorK layout for better performance
         use_shuffled_weight = weight_processing["use_shuffled_weight"]
         weight_layout = weight_processing["layout"]
-    
+
         if use_shuffled_weight:
             # FIXME: this depends on the kernel internals
             epilogue_tile_m = 128
@@ -1037,29 +1037,37 @@ class BF16Moe(Moe):
             gemm1_weights_bf16_shuffled = []
             gemm2_weights_bf16_shuffled = []
             for i in range(num_experts):
-                tmp_weights1 = reorder_rows_for_gated_act_gemm(args.gemm1_weights[i].clone().view(torch.uint8))
-                tmp_weights1 = shuffle_matrix_a(
-                    tmp_weights1, epilogue_tile_m
+                tmp_weights1 = reorder_rows_for_gated_act_gemm(
+                    args.gemm1_weights[i].clone().view(torch.uint8)
                 )
+                tmp_weights1 = shuffle_matrix_a(tmp_weights1, epilogue_tile_m)
                 tmp_weights2 = shuffle_matrix_a(
                     args.gemm2_weights[i].clone().view(torch.uint8), epilogue_tile_m
                 )
 
                 if weight_layout == WeightLayout.BlockMajorK:
                     block_k = 128
-                    tmp_weights1 = convert_to_block_layout(tmp_weights1.view(torch.uint8), block_k)
-                    tmp_weights2 = convert_to_block_layout(tmp_weights2.view(torch.uint8), block_k)
+                    tmp_weights1 = convert_to_block_layout(
+                        tmp_weights1.view(torch.uint8), block_k
+                    )
+                    tmp_weights2 = convert_to_block_layout(
+                        tmp_weights2.view(torch.uint8), block_k
+                    )
 
                 gemm1_weights_bf16_shuffled.append(tmp_weights1.view(torch.bfloat16))
                 gemm2_weights_bf16_shuffled.append(tmp_weights2.view(torch.bfloat16))
 
             # Stack weights for all experts
-            gemm1_weights_bf16_shuffled = torch.stack(gemm1_weights_bf16_shuffled).view(
-                torch.bfloat16
-            ).contiguous()
-            gemm2_weights_bf16_shuffled = torch.stack(gemm2_weights_bf16_shuffled).view(
-                torch.bfloat16
-            ).contiguous()
+            gemm1_weights_bf16_shuffled = (
+                torch.stack(gemm1_weights_bf16_shuffled)
+                .view(torch.bfloat16)
+                .contiguous()
+            )
+            gemm2_weights_bf16_shuffled = (
+                torch.stack(gemm2_weights_bf16_shuffled)
+                .view(torch.bfloat16)
+                .contiguous()
+            )
 
             return {
                 "gemm1_weights": gemm1_weights_bf16_shuffled,

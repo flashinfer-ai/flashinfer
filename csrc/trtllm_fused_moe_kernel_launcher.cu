@@ -71,7 +71,7 @@ Driver calls take place to carry out the gemm operations.
 */
 
 class FusedMoeLauncher {
-protected:
+ protected:
   at::Tensor const* routing_logits{};
   at::Tensor const* routing_bias{};
   at::Tensor const* hidden_states{};
@@ -267,9 +267,10 @@ protected:
 
   void prepare_moe_common(int64_t& moe_tactic) {
     using RunnerType = tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner;
-    moe_runner = std::make_unique<RunnerType>(
-        this->mDtypeAct, this->mDtypeWeights, args->mUseDeepSeekFp8, (int32_t)tile_tokens_dim,
-        static_cast<GatedActType>(this->gated_act_type), this->use_shuffled_weight, this->weight_layout);
+    moe_runner = std::make_unique<RunnerType>(this->mDtypeAct, this->mDtypeWeights,
+                                              args->mUseDeepSeekFp8, (int32_t)tile_tokens_dim,
+                                              static_cast<GatedActType>(this->gated_act_type),
+                                              this->use_shuffled_weight, this->weight_layout);
 
     if (moe_tactic == -1) {
       moe_tactic = moe_runner->getDefaultValidConfigIndex(
@@ -496,8 +497,8 @@ at::Tensor trtllm_bf16_moe(at::Tensor const& routing_logits,
 
   Bf16MoeLauncher launcher;
   launcher.init(routing_logits, routing_bias, hidden_states, gemm1_weights, gemm2_weights,
-    std::move(args), tile_tokens_dim, routing_method_type, use_shuffled_weight,
-    weight_layout);
+                std::move(args), tile_tokens_dim, routing_method_type, use_shuffled_weight,
+                weight_layout);
   auto data = launcher.run(moe_tactic, enable_pdl)[0];
   return data;
 }
@@ -761,27 +762,6 @@ at::Tensor trtllm_fp8_per_tensor_scale_moe(
   auto dtype = hidden_states.dtype();
   if (dtype == at::ScalarType::Half || dtype == at::ScalarType::BFloat16 ||
       dtype == at::ScalarType::Float8_e4m3fn) {
-    //        // Create unified runner for FP8 per-tensor mode
-    // using RunnerType = tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner;
-    // auto mRunner = std::make_unique<RunnerType>(
-    //     btg::Dtype::E4m3, false, tile_tokens_dim, /*useShuffledMatrixA*/ true);
-
-    // auto const moeConfigIndex = mRunner->getDefaultValidConfigIndex(
-    //     top_k, hidden_states.sizes()[1], intermediate_size, local_num_experts,
-    //     hidden_states.sizes()[0]);
-
-    // // Call unified launcher with nullopt for expert_indices, expert_weights, and output (will be
-    // created internally) auto results = trtllm_fp4_block_scale_moe_launcher(
-    //     routing_logits, std::nullopt, std::nullopt, routing_bias, hidden_states, std::nullopt,
-    //     gemm1_weights, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-    //     gemm2_weights, std::nullopt, std::nullopt,
-    //     output1_scales_scalar, output1_scales_gate_scalar, output2_scales_scalar,
-    //     num_experts, top_k, n_group, topk_group, intermediate_size, local_expert_offset,
-    //     local_num_experts, routed_scaling_factor, tile_tokens_dim, routing_method_type, true, //
-    //     do_finalize = true *mRunner, btg::Dtype::E4m3, btg::Dtype::E4m3, moeConfigIndex,
-    //     enable_pdl);
-
-    // return results[0];  // Return the first tensor from the vector
     return trtllm_fp8_per_tensor_scale_moe_launcher(
         routing_logits, routing_bias, hidden_states, gemm1_weights, output1_scales_scalar,
         output1_scales_gate_scalar, gemm2_weights, output2_scales_scalar, num_experts, top_k,
