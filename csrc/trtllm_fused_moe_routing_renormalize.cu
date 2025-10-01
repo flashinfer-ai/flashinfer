@@ -22,10 +22,11 @@ namespace routingRenormalize {
 
 static constexpr int NumThreads = 1024;
 static constexpr int NumWarps = NumThreads / WarpSize;
-static constexpr int MaxNumTopExperts = 8;
-static constexpr int MaxNumExperts = 128;
+static constexpr int MaxNumTopExperts = 10;
+static constexpr int NumExpertsLimit = 512;
 static constexpr int MaxNumTokensSingleCluster = NumBlocksPerCluster * NumThreads;
 static constexpr int MaxNumTokensSingleClusterScores = NumBlocksPerCluster * NumWarps;
+static constexpr int BlockKernelMaxNumTokens = 4;
 
 template <typename DataType, typename InputType, int VecSize, bool DoSoftmaxBeforeTopK>
 __forceinline__ __device__ void routingTopKExperts(
@@ -380,28 +381,25 @@ int32_t constexpr getMaxNumExperts(int32_t numExperts) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 void run(Data const& data, void* stream) {
-  TVM_FFI_ICHECK_LE(
-      data.mPtrTopKPacked != nullptr || data.mPtrScores != nullptr || data.mPtrTopKIds != nullptr,
-      "Routing kernel requires at least one input parameter");
+  TVM_FFI_ICHECK(
+      data.mPtrTopKPacked != nullptr || data.mPtrScores != nullptr || data.mPtrTopKIds != nullptr)
+      << "Routing kernel requires at least one input parameter";
   if (data.mPtrTopKIds != nullptr) {
-    TVM_FFI_ICHECK_LE(data.mPtrTopKWeights != nullptr,
-                      "When mPtrTopKIds is provided, mPtrTopKWeights must also be provided for "
-                      "Renormalize routing.");
+    TVM_FFI_ICHECK(data.mPtrTopKWeights != nullptr)
+                      << "When mPtrTopKIds is provided, mPtrTopKWeights must also be provided for "
+                      "Renormalize routing.";
   }
-  TVM_FFI_ICHECK_LE(
+  TVM_FFI_ICHECK(
       data.mPtrPermutedIdxSize != nullptr && data.mPtrCtaIdxXyToBatchIdx != nullptr &&
-          data.mPtrCtaIdxXyToMnLimit != nullptr && data.mPtrNumNonExitingCtas != nullptr,
-      "Llama4 routing kernel expects permuted idx and grouped Gemm launch config buffers");
-  TVM_FFI_ICHECK_LE(data.mTopK <= MaxNumTopExperts,
-                    "Routing kernel expects topK experts <= %d, got %d", MaxNumTopExperts,
-                    data.mTopK);
-  TVM_FFI_ICHECK_LE(data.mNumExperts <= NumExpertsLimit,
-                    "Routing kernel expects #experts %d to be no more than %d", data.mNumExperts,
-                    NumExpertsLimit);
-  TVM_FFI_ICHECK_LE(data.mNumExperts % 4 == 0,
-                    "Routing kernel expects #experts %d to be a multiple of 4.", data.mNumExperts);
-  TVM_FFI_ICHECK_LE(data.mPaddingLog2 < 8, "Routing kernel expects padding log2 < 8, got %d",
-                    data.mPaddingLog2);
+          data.mPtrCtaIdxXyToMnLimit != nullptr && data.mPtrNumNonExitingCtas != nullptr)
+      << "Llama4 routing kernel expects permuted idx and grouped Gemm launch config buffers";
+  TVM_FFI_ICHECK_LE(data.mTopK, MaxNumTopExperts)
+                    << "Routing kernel expects topK experts <= " << MaxNumTopExperts << ", got " << data.mTopK;
+  TVM_FFI_ICHECK_LE(data.mNumExperts, NumExpertsLimit)
+                    << "Routing kernel expects #experts " << data.mNumExperts << " to be no more than " << NumExpertsLimit << ".";
+  TVM_FFI_ICHECK_EQ(data.mNumExperts % 4, 0)
+                    << "Routing kernel expects #experts " << data.mNumExperts << " to be a multiple of 4.";
+  TVM_FFI_ICHECK_LE(data.mPaddingLog2, 8) << "Routing kernel expects padding log2 < 8, got " << data.mPaddingLog2;
 
   bool const useSingleBlock = data.mNumTokens <= BlockKernelMaxNumTokens;
 
@@ -411,11 +409,11 @@ void run(Data const& data, void* stream) {
                               : MaxNumTokensSingleCluster);
 
   if (!useSingleCluster && !useSingleBlock) {
-    TVM_FFI_ICHECK_LE(
-        (data.mPtrTopKPacked != nullptr || data.mPtrTopKIds != nullptr),
-        "When #tokens is large, `mPtrTopKPacked` or `mPtrTopKIds` is a required input.");
-    TVM_FFI_ICHECK_LE(data.mPtrExpertCounts != nullptr,
-                      "When #tokens is large, `mPtrExpertCounts` is a required input.");
+    TVM_FFI_ICHECK
+        (data.mPtrTopKPacked != nullptr || data.mPtrTopKIds != nullptr)
+        << "When #tokens is large, `mPtrTopKPacked` or `mPtrTopKIds` is a required input.";
+    TVM_FFI_ICHECK(data.mPtrExpertCounts != nullptr)
+        << "When #tokens is large, `mPtrExpertCounts` is a required input.";
   }
 
   if (useSingleBlock) {
@@ -466,19 +464,19 @@ void run(Data const& data, void* stream) {
   }
 }
 
-void run(Data const& data, void* stream) {
-  TVM_FFI_ICHECK(data.mPtrExpertIdx != nullptr || data.mPtrScores != nullptr)
-      << "Routing kernel requires at least one input parameter";
-  TVM_FFI_ICHECK(data.mPtrPermutedIdxSize != nullptr && data.mPtrCtaIdxXyToBatchIdx != nullptr &&
-                 data.mPtrCtaIdxXyToMnLimit != nullptr && data.mPtrNumNonExitingCtas != nullptr)
-      << "Llama4 routing kernel expects permuted idx and grouped Gemm launch config buffers";
-  TVM_FFI_ICHECK_LE(data.mTopK, MaxNumTopExperts)
-      << "Routing kernel expects topK experts <= " << MaxNumTopExperts << ", got " << data.mTopK;
-  TVM_FFI_ICHECK_LT(data.mPaddingLog2, 8)
-      << "Routing kernel expects padding log2 < 8, got " << data.mPaddingLog2;
+// void run(Data const& data, void* stream) {
+//   TVM_FFI_ICHECK(data.mPtrExpertIdx != nullptr || data.mPtrScores != nullptr)
+//       << "Routing kernel requires at least one input parameter";
+//   TVM_FFI_ICHECK(data.mPtrPermutedIdxSize != nullptr && data.mPtrCtaIdxXyToBatchIdx != nullptr &&
+//                  data.mPtrCtaIdxXyToMnLimit != nullptr && data.mPtrNumNonExitingCtas != nullptr)
+//       << "Llama4 routing kernel expects permuted idx and grouped Gemm launch config buffers";
+//   TVM_FFI_ICHECK_LE(data.mTopK, MaxNumTopExperts)
+//       << "Routing kernel expects topK experts <= " << MaxNumTopExperts << ", got " << data.mTopK;
+//   TVM_FFI_ICHECK_LT(data.mPaddingLog2, 8)
+//       << "Routing kernel expects padding log2 < 8, got " << data.mPaddingLog2;
 
-  runImpl(data, stream);
-}
+//   runImpl(data, stream);
+// }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

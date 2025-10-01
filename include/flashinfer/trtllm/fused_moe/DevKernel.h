@@ -31,6 +31,7 @@
 #include "../../exception.h"
 // #include <tensorrt_llm/common/assert.h>
 #include "flashinfer/trtllm/common/cudaUtils.h"
+#include "tensorrt_llm/common/logger.h"
 
 namespace moe::dev {
 

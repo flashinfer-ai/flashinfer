@@ -32,7 +32,7 @@ namespace trtllmgen_moe {
 namespace Routing {
 
 // The type of method in top-K routing, for use in torch custom op
-// Please keep this in sync with the counterpart defined in
+// Please keep this in sync with the counterpart defined in 
 // flashinfer/fused_moe/core.py
 enum class RoutingMethodType : int64_t {
   // Default: Softmax -> TopK

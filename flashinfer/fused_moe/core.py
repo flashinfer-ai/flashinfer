@@ -1340,7 +1340,7 @@ def get_trtllm_moe_sm100_module():
         intermediate_size: int,
         local_expert_offset: int,
         local_num_experts: int,
-        routed_scaling_factor: float,
+        routed_scaling_factor: Optional[float],
         use_routing_scales_on_input: bool,
         tile_tokens_dim: int = 8,
         routing_method_type: int = 0,
@@ -1372,7 +1372,7 @@ def get_trtllm_moe_sm100_module():
         intermediate_size: int,
         local_expert_offset: int,
         local_num_experts: int,
-        routed_scaling_factor: float,
+        routed_scaling_factor: Optional[float],
         tile_tokens_dim: int,
         routing_method_type: int,
         use_shuffled_weight: bool = False,
@@ -1381,6 +1381,7 @@ def get_trtllm_moe_sm100_module():
     ) -> torch.Tensor:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(hidden_states.device)
+
         # Call the C++ function for block scale MoE
         moe_op.trtllm_fp8_block_scale_moe(
             routing_logits,
@@ -1427,7 +1428,7 @@ def get_trtllm_moe_sm100_module():
         intermediate_size: int,
         local_expert_offset: int,
         local_num_experts: int,
-        routed_scaling_factor: float,
+        routed_scaling_factor: Optional[float],
         tile_tokens_dim: int = 8,
         routing_method_type: int = 0,
         use_shuffled_weight: bool = False,
@@ -1755,7 +1756,7 @@ def trtllm_fp8_block_scale_moe(
     intermediate_size: int,
     local_expert_offset: int,
     local_num_experts: int,
-    routed_scaling_factor: float,
+    routed_scaling_factor: Optional[float],
     tile_tokens_dim: int = 8,
     routing_method_type: int = 0,
     use_shuffled_weight: bool = False,
