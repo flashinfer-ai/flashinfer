@@ -86,6 +86,8 @@ jobs:
                   export CUDA_VERSION_SUFFIX="cu${CUDA_MAJOR}${CUDA_MINOR}"
 
                   chown -R $(id -u):$(id -g) ${{ github.workspace }}
+                  mkdir -p ${{ github.workspace }}/ci-cache
+                  chown -R $(id -u):$(id -g) ${{ github.workspace }}/ci-cache
 
                   # Run the build script inside the container with proper mounts
                   docker run --rm \
