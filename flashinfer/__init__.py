@@ -142,26 +142,3 @@ from .sparse import (
 )
 from .utils import next_positive_power_of_2 as next_positive_power_of_2
 from .xqa import xqa as xqa
-
-# Check optional dependencies for version consistency.
-if importlib.util.find_spec("flashinfer_cubin"):
-    import flashinfer_cubin
-
-    flashinfer_cubin_version = flashinfer_cubin.__version__
-    if __version__ != flashinfer_cubin_version:
-        raise RuntimeError(
-            f"flashinfer-cubin version ({flashinfer_cubin_version}) does not match "
-            f"flashinfer version ({__version__}). "
-            "Please install the same version of both packages."
-        )
-
-if importlib.util.find_spec("flashinfer_jit_cache"):
-    import flashinfer_jit_cache
-
-    flashinfer_jit_cache_version = flashinfer_jit_cache.__version__
-    if __version__ != flashinfer_jit_cache_version:
-        raise RuntimeError(
-            f"flashinfer-jit-cache version ({flashinfer_jit_cache_version}) does not match "
-            f"flashinfer version ({__version__}). "
-            "Please install the same version of both packages."
-        )

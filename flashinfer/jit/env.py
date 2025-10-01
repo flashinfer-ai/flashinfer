@@ -22,6 +22,7 @@ import os
 import pathlib
 import importlib.util
 from ..compilation_context import CompilationContext
+from .. import __version__ as flashinfer_version
 
 FLASHINFER_BASE_DIR = pathlib.Path(
     os.getenv("FLASHINFER_WORKSPACE_BASE", pathlib.Path.home().as_posix())
@@ -41,6 +42,14 @@ def _get_cubin_dir():
     # First check if flashinfer-cubin package is installed
     if importlib.util.find_spec("flashinfer_cubin"):
         import flashinfer_cubin
+
+        flashinfer_cubin_version = flashinfer_cubin.__version__
+        if flashinfer_version != flashinfer_cubin_version:
+            raise RuntimeError(
+                f"flashinfer-cubin version ({flashinfer_cubin_version}) does not match "
+                f"flashinfer version ({flashinfer_version}). "
+                "Please install the same version of both packages."
+            )
 
         return pathlib.Path(flashinfer_cubin.get_cubin_dir())
 
@@ -65,6 +74,14 @@ def _get_aot_dir():
     # First check if flashinfer-jit-cache package is installed
     if importlib.util.find_spec("flashinfer_jit_cache"):
         import flashinfer_jit_cache
+
+        flashinfer_jit_cache_version = flashinfer_jit_cache.__version__
+        if flashinfer_version != flashinfer_jit_cache_version:
+            raise RuntimeError(
+                f"flashinfer-jit-cache version ({flashinfer_jit_cache_version}) does not match "
+                f"flashinfer version ({flashinfer_version}). "
+                "Please install the same version of both packages."
+            )
 
         return pathlib.Path(flashinfer_jit_cache.get_jit_cache_dir())
 
