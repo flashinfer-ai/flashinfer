@@ -410,6 +410,7 @@ def gen_all_modules(
     add_xqa: bool,
 ) -> List[JitSpec]:
     jit_specs: List[JitSpec] = []
+    jit_specs.append(gen_logging_module())
     has_sm90 = sm_capabilities.get("sm90", False)
     has_sm100 = sm_capabilities.get("sm100", False)
     has_sm103 = sm_capabilities.get("sm103", False)
@@ -512,8 +513,6 @@ def gen_all_modules(
     # Add cuDNN FMHA module
     jit_specs.append(gen_cudnn_fmha_module())
 
-    jit_specs = [gen_trtllm_gen_fmha_module()]
-
     # dedup
     names = set()
     ret: List[JitSpec] = []
@@ -615,8 +614,7 @@ def compile_and_package_modules(
     # Generate JIT specs
     if verbose:
         print("Generating JIT specs...")
-    jit_specs = [gen_logging_module()]
-    jit_specs += gen_all_modules(
+    jit_specs = gen_all_modules(
         config["f16_dtype"],
         config["f8_dtype"],
         config["fa2_head_dim"],

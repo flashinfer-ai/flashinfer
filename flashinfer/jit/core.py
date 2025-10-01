@@ -88,15 +88,10 @@ class JitSpecStatus:
 
     name: str
     created_at: datetime
-    is_aot: bool
     is_compiled: bool
     library_path: Optional[Path]
     sources: List[Path]
     needs_device_linking: bool
-
-    @property
-    def compilation_type(self) -> str:
-        return "AOT" if self.is_aot else "JIT"
 
     @property
     def status(self) -> str:
@@ -129,17 +124,12 @@ class JitSpecRegistry:
             return None
 
         spec = self._specs[name]
-        library_path = (
-            spec.get_library_path()
-            if (spec.is_aot or spec.jit_library_path.exists())
-            else None
-        )
+        library_path = spec.get_library_path() if spec.is_compiled else None
 
         return JitSpecStatus(
             name=spec.name,
             created_at=self._creation_times[name],
-            is_aot=spec.is_aot,
-            is_compiled=spec.is_aot or spec.jit_library_path.exists(),
+            is_compiled=spec.is_compiled,
             library_path=library_path,
             sources=spec.sources,
             needs_device_linking=spec.needs_device_linking,
@@ -159,8 +149,7 @@ class JitSpecRegistry:
         statuses = self.get_all_statuses()
         return {
             "total": len(statuses),
-            "aot_compiled": sum(1 for s in statuses if s.is_aot),
-            "jit_compiled": sum(1 for s in statuses if not s.is_aot and s.is_compiled),
+            "compiled": sum(1 for s in statuses if s.is_compiled),
             "not_compiled": sum(1 for s in statuses if not s.is_compiled),
         }
 
@@ -200,6 +189,10 @@ class JitSpec:
     @property
     def is_aot(self) -> bool:
         return self.aot_path.exists()
+
+    @property
+    def is_compiled(self) -> bool:
+        return self.get_library_path().exists()
 
     @property
     def lock_path(self) -> Path:

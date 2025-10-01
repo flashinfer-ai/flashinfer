@@ -76,10 +76,8 @@ def compile_jit_cache(output_dir: Path, verbose: bool = True):
     )
 
 
-def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
-    """Build wheel with custom AOT module compilation."""
-    print("Building flashinfer-jit-cache wheel...")
-
+def _prepare_build():
+    """Shared preparation logic for both wheel and editable builds."""
     # First, ensure AOT modules are compiled
     aot_package_dir = Path(__file__).parent / "flashinfer_jit_cache" / "jit_cache"
     aot_package_dir.mkdir(parents=True, exist_ok=True)
@@ -109,6 +107,13 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
         f.write(f'__version__ = "{version}"\n')
 
     print(f"Created build metadata file with version {version}")
+
+
+def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
+    """Build wheel with custom AOT module compilation."""
+    print("Building flashinfer-jit-cache wheel...")
+
+    _prepare_build()
 
     # Now build the wheel using setuptools
     # The setup.py file will handle the platform-specific wheel naming
@@ -146,11 +151,26 @@ def build_sdist(sdist_directory, config_settings=None):
     return _orig.build_sdist(sdist_directory, config_settings)
 
 
+def build_editable(wheel_directory, config_settings=None, metadata_directory=None):
+    """Build editable install with custom AOT module compilation."""
+    print("Building flashinfer-jit-cache in editable mode...")
+
+    _prepare_build()
+
+    # Now build the editable install using setuptools
+    _orig_build_editable = getattr(_orig, "build_editable", None)
+    if _orig_build_editable is None:
+        raise RuntimeError("build_editable not supported by setuptools backend")
+
+    result = _orig_build_editable(wheel_directory, config_settings, metadata_directory)
+
+    return result
+
+
 # Export the required interface
 get_requires_for_build_wheel = _orig.get_requires_for_build_wheel
 get_requires_for_build_sdist = _orig.get_requires_for_build_sdist
 prepare_metadata_for_build_wheel = _orig.prepare_metadata_for_build_wheel
-build_editable = getattr(_orig, "build_editable", None)
 get_requires_for_build_editable = getattr(
     _orig, "get_requires_for_build_editable", None
 )
