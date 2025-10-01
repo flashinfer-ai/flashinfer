@@ -71,7 +71,7 @@ jobs:
             - name: Display Machine Information
               run: |
                 echo "CPU: $(nproc) cores, $(lscpu | grep 'Model name' | cut -d':' -f2 | xargs)"
-                echo "RAM: $(free -h | awk '/^Mem:/ {print $2}')"
+                echo "RAM: $(free -h | awk '/^Mem:/ {print $7 " available out of " $2}')"
                 echo "Disk: $(df -h / | awk 'NR==2 {print $4 " available out of " $2}')"
                 echo "Architecture: $(uname -m)"
             - uses: actions/checkout@v4
