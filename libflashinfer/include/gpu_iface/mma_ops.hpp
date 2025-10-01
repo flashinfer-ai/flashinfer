@@ -33,13 +33,12 @@ __device__ __forceinline__ void load_fragment(uint32_t* R, const T* smem_ptr) {
   mma_detail::load_fragment<T>(R, smem_ptr);
 }
 
-#if defined(PLATFORM_HIP_DEVICE) && defined(__gfx942__)
+#if defined(PLATFORM_HIP_DEVICE)
 template <typename T>
-__device__ __forceinline__ void load_fragment_transpose_4x4_half_registers(uint32_t* R,
-                                                                           const T* smem_ptr) {
+__device__ __forceinline__ void load_quad_transposed_fragment(uint32_t* R, const T* smem_ptr) {
   static_assert(std::is_same<T, __half>::value,
-                "Only __half is supported for the 4x4 register transpose");
-  mma_detail::load_fragment_4x4_half_registers<__half>(R, smem_ptr);
+                "Only __half is supported for load_quad_transposed_fragment");
+  mma_detail::load_quad_transposed_fragment<T>(R, smem_ptr);
 }
 #endif
 

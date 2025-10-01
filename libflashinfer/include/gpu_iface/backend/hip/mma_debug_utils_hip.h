@@ -57,7 +57,7 @@ __device__ void load_bmatrix_layout(T* arr, uint32_t* R, uint32_t dimY) {
   static_assert(std::is_same_v<T, __half>, "Only supported for __half types");
   const int lane_id = threadIdx.x % 64;
   int b_idx = ((lane_id % 4) + 4 * (lane_id / 16)) * dimY + ((lane_id % 16) / 4) * 4;
-  mma_impl::hip::load_fragment_4x4_half_registers<__half>(R, &arr[b_idx]);
+  mma_impl::hip::load_quad_transposed_fragment<__half>(R, &arr[b_idx]);
 }
 
 /// @brief Prints the four `half` values held in a thread's registers.

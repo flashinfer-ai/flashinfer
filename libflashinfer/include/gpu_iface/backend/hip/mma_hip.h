@@ -21,7 +21,26 @@ namespace hip {
 
 #define FLASHINFER_RUNTIME_ASSERT(x) assert(0 && x)
 
-__device__ __forceinline__ void transpose_4x4_half_registers(uint32_t* R) {
+/// @brief Transposes a 4x4 matrix of `half` values held across a quad of 4 threads.
+/// @details This function operates on a group of 4 consecutive threads (a quad). It assumes
+///          each thread holds 4 `half` values, which together form a 4x4 matrix where each
+///          thread holds one row. The function permutes these values using a series of
+///          `__shfl_xor` operations so that each thread ends up holding one column of the
+///          original 4x4 matrix.
+///
+///          Visual Representation:
+///          If `[a,b,c,d]` are the 4 `half` values in Thread 0's registers:
+///
+///          Before:                          After:
+///          Thread 0: [a, b, c, d]           Thread 0: [a, e, i, m]
+///          Thread 1: [e, f, g, h]   --->    Thread 1: [b, f, j, n]
+///          Thread 2: [i, j, k, l]           Thread 2: [c, g, k, o]
+///          Thread 3: [m, n, o, p]           Thread 3: [d, h, l, p]
+///
+/// @note    This function can be combined with `transpose_inter_quad_fragments` to perform a
+///          full 16x16 in-register matrix transpose. This function handles the transposition
+///          *within* each 4x4 data block.
+__device__ __forceinline__ void transpose_intra_quad_fragments(uint32_t* R) {
   // Calculate lane within 4-thread group
   uint32_t lane_id = threadIdx.x % 64;
   uint32_t lane_in_group = lane_id % 4;
@@ -53,6 +72,43 @@ __device__ __forceinline__ void transpose_4x4_half_registers(uint32_t* R) {
   regid = 1 - regid;
   exchanged_val = __shfl_xor(R[regid], 0x1);
   R[regid] = (R[regid] & keep_mask) | ((exchanged_val >> right_shift_amount) << left_shift_amount);
+}
+
+/// @brief Permutes matrix fragments between thread quads in a wavefront to perform a block-wise
+///        transpose.
+/// @details This function treats the 64-thread wavefront as a 4x4 grid of thread quads.
+///          Each quad (4 consecutive threads) is considered to hold a 4x4 data fragment.
+///          The function transposes this 4x4 grid of fragments by swapping the register
+///          contents of threads in off-diagonal quads.
+///
+///          Visual Representation:
+///          If B(r,c) is the 4x4 data fragment held by the quad at block-row 'r' and block-col 'c':
+///
+///          Before:                                          After:
+///          +--------+--------+--------+--------+            +--------+--------+--------+--------+
+///          | B(0,0) | B(0,1) | B(0,2) | B(0,3) |            | B(0,0) | B(1,0) | B(2,0) | B(3,0) |
+///          +--------+--------+--------+--------+            +--------+--------+--------+--------+
+///          | B(1,0) | B(1,1) | B(1,2) | B(1,3) |   --->     | B(0,1) | B(1,1) | B(2,1) | B(3,1) |
+//          +--------+--------+--------+--------+            +--------+--------+--------+--------+
+///          | B(2,0) | B(2,1) | B(2,2) | B(2,3) |            | B(0,2) | B(1,2) | B(2,2) | B(3,2) |
+///          +--------+--------+--------+--------+            +--------+--------+--------+--------+
+///          | B(3,0) | B(3,1) | B(3,2) | B(3,3) |            | B(0,3) | B(1,3) | B(2,3) | B(3,3) |
+///          +--------+--------+--------+--------+            +--------+--------+--------+--------+
+///
+/// @note    This function can be combined with `transpose_intra_quad_fragments` (which transposes
+///          the data *within* each fragment) to perform a full 16x16 in-register matrix transpose.
+__device__ __forceinline__ void transpose_inter_quad_fragments(uint32_t* R) {
+  uint32_t lane_id = threadIdx.x % 64;
+
+  uint32_t block_row = (lane_id % 16) / 4;
+  uint32_t block_col = (lane_id / 16);
+  uint32_t thread_in_block = lane_id % 4;
+  uint32_t partner_lane_id = (block_row * 16) + (block_col * 4) + thread_in_block;
+  uint32_t xor_mask = lane_id ^ partner_lane_id;
+
+  // Exchange both registers with the partner thread
+  R[0] = __shfl_xor(R[0], xor_mask, 64);
+  R[1] = __shfl_xor(R[1], xor_mask, 64);
 }
 
 // Single unified load function for all fragment types
@@ -116,10 +172,10 @@ __device__ __forceinline__ void mma_sync_m16n16k16_row_col_f16f16f32(float* C, u
 /// T2 : c g k o
 /// T3 : d h l p
 template <typename T>
-__device__ __forceinline__ void load_fragment_4x4_half_registers(uint32_t* R, const T* smem_ptr) {
+__device__ __forceinline__ void load_quad_transposed_fragment(uint32_t* R, const T* smem_ptr) {
   static_assert(std::is_same_v<T, __half>, "Only half type is supported");
   load_fragment(R, smem_ptr);
-  transpose_4x4_half_registers(R);
+  transpose_intra_quad_fragments(R);
 }
 
 // TODO: Verify correct matrix multiplication order for rowsum on CDNA3
@@ -135,7 +191,7 @@ __device__ __forceinline__ void load_fragment_4x4_half_registers(uint32_t* R, co
 template <typename DType>
 __device__ __forceinline__ void m16k16_rowsum_f16f16f32(float* d, DType* s_frag) {
   static_assert(sizeof(DType) == 2, "DType must be 16-bit type");
-  transpose_4x4_half_registers(reinterpret_cast<uint32_t*>(s_frag));
+  transpose_intra_quad_fragments(reinterpret_cast<uint32_t*>(s_frag));
   f16x4 a = reinterpret_cast<const f16x4*>(s_frag)[0];
   f16x4 b = {f16(1.0f), f16(1.0f), f16(1.0f), f16(1.0f)};
   f32x4 c = {d[0], d[1], d[2], d[3]};
