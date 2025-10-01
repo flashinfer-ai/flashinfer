@@ -27,7 +27,7 @@ def get_version():
 
 def generate_build_meta():
     """Generate build metadata file."""
-    build_meta_file = Path(__file__).parent / "_build_meta.py"
+    build_meta_file = Path(__file__).parent / "flashinfer_jit_cache" / "_build_meta.py"
     version = get_version()
     with open(build_meta_file, "w") as f:
         f.write('"""Build metadata for flashinfer-jit-cache package."""\n')
@@ -69,6 +69,7 @@ class PlatformSpecificBdistWheel(bdist_wheel):
 
 
 if __name__ == "__main__":
+    generate_build_meta()
     setup(
         name="flashinfer-jit-cache",
         version=get_version(),
