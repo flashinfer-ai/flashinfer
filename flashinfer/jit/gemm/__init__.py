@@ -22,7 +22,7 @@ from .core import (
     gen_gemm_sm100_module,
     gen_gemm_sm120_module,
     gen_trtllm_gen_gemm_module,
-    gen_tgv_gemm_sm100_module,
+    gen_tgv_gemm_sm10x_module,
     gen_gemm_sm90_module,
 )
 from .deepgemm import gen_deepgemm_sm100_module
@@ -35,7 +35,7 @@ __all__ = [
     "gen_gemm_sm100_module",
     "gen_gemm_sm120_module",
     "gen_trtllm_gen_gemm_module",
-    "gen_tgv_gemm_sm100_module",
+    "gen_tgv_gemm_sm10x_module",
     "gen_gemm_sm90_module",
     "gen_deepgemm_sm100_module",
 ]
