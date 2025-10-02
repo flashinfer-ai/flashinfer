@@ -2,11 +2,16 @@ name: Release CI Docker
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - 'docker/**'
   pull_request:
     branches:
       - main
-    # paths:
-    #   - 'docker/**'
+    paths:
+      - 'docker/**'
 
 jobs:
   generate-tag:
