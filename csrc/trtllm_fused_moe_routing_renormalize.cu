@@ -462,6 +462,9 @@ void run(Data const& data, void* stream) {
                                /*smemSize=*/0,  // No dynamic smem
                                stream, data.mDoSoftmaxBeforeTopK);
   }
+  cudaDeviceSynchronize();
+  cudaError_t result = cudaGetLastError();
+  std::cout << "cudaGetLastError: " << cudaGetErrorString(result) << std::endl;
 }
 
 // void run(Data const& data, void* stream) {
