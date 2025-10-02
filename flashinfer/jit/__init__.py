@@ -76,14 +76,6 @@ from .comm import gen_vllm_comm_module as gen_vllm_comm_module
 from .comm import gen_nvshmem_module as gen_nvshmem_module
 
 
-@functools.cache
-def get_cudnn_fmha_gen_module():
-    mod = gen_cudnn_fmha_module()
-    op = mod.build_and_load()
-    setup_cubin_loader(mod.get_library_path())
-    return op
-
-
 cuda_lib_path = os.environ.get(
     "CUDA_LIB_PATH", "/usr/local/cuda/targets/x86_64-linux/lib/"
 )
