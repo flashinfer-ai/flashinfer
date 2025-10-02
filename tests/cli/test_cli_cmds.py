@@ -137,17 +137,37 @@ def test_clear_cubin_cmd_mocked(monkeypatch):
 # need to check that there aren't side effects if we do this
 
 
-def test_module_status_cmd_mocked(monkeypatch):
-    # Avoid module registration/inspection
-    monkeypatch.setattr("flashinfer.__main__._ensure_modules_registered", lambda: [])
+_MOCKED_CUDA_ARCH_LIST = "7.5 8.0 8.9 9.0a 10.0a"
 
-    _ = _test_cmd_helper(["module-status"])
-    # TODO: check output
+
+def test_module_status_cmd_mocked(monkeypatch):
+    """
+    Test that module-status command runs without error and sanity checks the output
+
+    The only mock is to set the CUDA architecture list via monkeypatch, for isolation.
+    """
+    monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", _MOCKED_CUDA_ARCH_LIST)
+    out = _test_cmd_helper(["module-status"])
+    assert "=== Summary ===" in out
+    assert "Total modules:" in out
+    assert "AOT compiled:" in out
+    assert "JIT compiled:" in out
+    assert "Not compiled:" in out
+
+
+# TODO: test module-status command with different filters
+# TODO: test module-status command with detailed output
 
 
 def test_list_modules_cmd_mocked(monkeypatch):
-    # Avoid module registration/inspection
-    monkeypatch.setattr("flashinfer.__main__._ensure_modules_registered", lambda: [])
+    """
+    Test that list-modules command runs without error and sanity checks the output
 
-    _ = _test_cmd_helper(["list-modules"])
-    # TODO: check output
+    The only mock is to set the CUDA architecture list via monkeypatch, for isolation.
+    """
+    monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", _MOCKED_CUDA_ARCH_LIST)
+    out = _test_cmd_helper(["list-modules"])
+    assert "Available compilation modules:" in out
+
+
+# TODO: test list-modules command with module name
