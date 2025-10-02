@@ -4,7 +4,7 @@ Tests the module-status and list-modules commands
 This is factored out from test_cli_cmds.py because these tests require a GPU.
 """
 
-from .cli_cmd_helpers import _test_cmd_helper
+from cli_cmd_helpers import _test_cmd_helper
 
 
 _MOCKED_CUDA_ARCH_LIST = "7.5 8.0 8.9 9.0a 10.0a"
