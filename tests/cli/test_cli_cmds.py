@@ -106,17 +106,35 @@ def test_list_cubins_cmd_mocked(monkeypatch):
 
 
 def test_clear_cache_cmd_mocked(monkeypatch):
+    """
+    Test that clear-cache command works without actually clearing the cache.
+
+    This doesn't test much, just a basic sanity check.
+    """
     monkeypatch.setattr("flashinfer.__main__.clear_cache_dir", lambda: None)
 
     out = _test_cmd_helper(["clear-cache"])
     assert "Cache cleared successfully" in out
 
 
+# TODO: add test that actually clears the cache
+# need to check that there aren't side effects if we do this
+
+
 def test_clear_cubin_cmd_mocked(monkeypatch):
+    """
+    Test that clear-cubin command works without actually clearing the cubin.
+
+    This doesn't test much, just a basic sanity check.
+    """
     monkeypatch.setattr("flashinfer.__main__.clear_cubin", lambda: None)
 
     out = _test_cmd_helper(["clear-cubin"])
     assert "Cubin cleared successfully" in out
+
+
+# TODO: add test that actually clears the cubins
+# need to check that there aren't side effects if we do this
 
 
 def test_module_status_cmd_mocked(monkeypatch):
