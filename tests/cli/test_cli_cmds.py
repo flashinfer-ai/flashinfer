@@ -1,8 +1,3 @@
-from click.testing import CliRunner
-
-from flashinfer.__main__ import cli
-from flashinfer.artifacts import ArtifactPath
-
 """
 Test that the CLI commands work as expected.
 
@@ -11,17 +6,12 @@ In general there can be two types of tests for each command:
 - Mocked tests (with suffix `_mocked`) that use monkeypatch to mock logic that would
   otherwise be slow (e.g. downloading cubins, filesystem calls, etc), and also to
   create deterministic state so we can check for expected output (e.g. number of cubins)
+
+These tests don't require a GPU. CLI tests that require a GPU are in test_cli_cmds_gpu.py.
 """
 
-
-def _test_cmd_helper(cmd: [str]):
-    """
-    Helper for command tests
-    """
-    runner = CliRunner()
-    result = runner.invoke(cli, cmd)
-    assert result.exit_code == 0, result.output
-    return result.output
+from cli_cmd_helpers import _test_cmd_helper
+from flashinfer.artifacts import ArtifactPath
 
 
 def test_show_config_cmd_real():
@@ -135,39 +125,3 @@ def test_clear_cubin_cmd_mocked(monkeypatch):
 
 # TODO: add test that actually clears the cubins
 # need to check that there aren't side effects if we do this
-
-
-_MOCKED_CUDA_ARCH_LIST = "7.5 8.0 8.9 9.0a 10.0a"
-
-
-def test_module_status_cmd_mocked(monkeypatch):
-    """
-    Test that module-status command runs without error and sanity checks the output
-
-    The only mock is to set the CUDA architecture list via monkeypatch, for isolation.
-    """
-    monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", _MOCKED_CUDA_ARCH_LIST)
-    out = _test_cmd_helper(["module-status"])
-    assert "=== Summary ===" in out
-    assert "Total modules:" in out
-    assert "AOT compiled:" in out
-    assert "JIT compiled:" in out
-    assert "Not compiled:" in out
-
-
-# TODO: test module-status command with different filters
-# TODO: test module-status command with detailed output
-
-
-def test_list_modules_cmd_mocked(monkeypatch):
-    """
-    Test that list-modules command runs without error and sanity checks the output
-
-    The only mock is to set the CUDA architecture list via monkeypatch, for isolation.
-    """
-    monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", _MOCKED_CUDA_ARCH_LIST)
-    out = _test_cmd_helper(["list-modules"])
-    assert "Available compilation modules:" in out
-
-
-# TODO: test list-modules command with module name
