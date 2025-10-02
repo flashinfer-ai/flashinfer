@@ -110,7 +110,6 @@ def test_clear_cache_cmd_mocked(monkeypatch):
 
     out = _test_cmd_helper(["clear-cache"])
     assert "Cache cleared successfully" in out
-    assert "Cache cleared successfully" in out
 
 
 def test_clear_cubin_cmd_mocked(monkeypatch):
