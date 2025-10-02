@@ -265,12 +265,7 @@ def gen_jit_spec(
     verbose = os.environ.get("FLASHINFER_JIT_VERBOSE", "0") == "1"
 
     cuda_major, cuda_minor = current_compilation_context.get_cuda_version()
-    cflags = [
-        "-std=c++17",
-        "-Wno-switch-bool",
-        f"-D__CUDACC_VER_MAJOR__={cuda_major}",
-        f"-D__CUDACC_VER_MINOR__={cuda_minor}",
-    ]
+    cflags = ["-std=c++17", "-Wno-switch-bool"]
     cuda_cflags = [
         "-std=c++17",
         f"--threads={os.environ.get('FLASHINFER_NVCC_THREADS', '1')}",
