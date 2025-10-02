@@ -333,18 +333,18 @@ void trtllm_fp8_block_scale_moe_launcher(
         << "routing_bias has incorrect shape.";
   }
 
-//   if (n_group <= 0 || topk_group <= 0) {
-//     TVM_FFI_ICHECK_EQ(top_k, 1) << "Current routing kernel (no groups) only supports top_k=1.";
-//   } else {
-//     TVM_FFI_ICHECK_LE(top_k, 8) << "Current routing kernel (with groups) only supports top_k<=8.";
-//     TVM_FFI_ICHECK_LE(topk_group, 4)
-//         << "Current routing kernel (with groups) only supports topk_group<=4.";
-//     TVM_FFI_ICHECK_LE(topk_group, n_group) << "n_group must not be smaller than topk_group.";
-//     TVM_FFI_ICHECK_EQ(num_experts % n_group, 0) << "num_experts must be divisible by n_group";
-//     // This check ensures we have enough experts in the selected groups to handle the top_k routing
-//     TVM_FFI_ICHECK_LT(top_k, (topk_group * num_experts / n_group))
-//         << "top_k must be less than total number of experts in selected groups";
-//   }
+  //   if (n_group <= 0 || topk_group <= 0) {
+  //     TVM_FFI_ICHECK_EQ(top_k, 1) << "Current routing kernel (no groups) only supports top_k=1.";
+  //   } else {
+  //     TVM_FFI_ICHECK_LE(top_k, 8) << "Current routing kernel (with groups) only supports
+  //     top_k<=8."; TVM_FFI_ICHECK_LE(topk_group, 4)
+  //         << "Current routing kernel (with groups) only supports topk_group<=4.";
+  //     TVM_FFI_ICHECK_LE(topk_group, n_group) << "n_group must not be smaller than topk_group.";
+  //     TVM_FFI_ICHECK_EQ(num_experts % n_group, 0) << "num_experts must be divisible by n_group";
+  //     // This check ensures we have enough experts in the selected groups to handle the top_k
+  //     routing TVM_FFI_ICHECK_LT(top_k, (topk_group * num_experts / n_group))
+  //         << "top_k must be less than total number of experts in selected groups";
+  //   }
   TVM_FFI_ICHECK_EQ(num_experts % 4, 0)
       << "Routing kernel expects that num_experts must be divisible by 4";
   TVM_FFI_ICHECK_GT(num_experts, top_k) << "num_experts must be greater than top_k";
