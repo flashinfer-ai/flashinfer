@@ -795,7 +795,7 @@ Array<TensorView> trtllm_fp4_block_scale_moe_launcher(
                                      dtype_act == btg::Dtype::Bfloat16 ? dl_bfloat16 : dl_uint8,
                                      hidden_states->device);
 
-  Optional<Tensor> gemm1_output_scale = std::nullopt;
+  Optional<TensorView> gemm1_output_scale = std::nullopt;
   if (dtype_act == btg::Dtype::E2m1 || dtype_act == btg::Dtype::MxE4m3) {
     int64_t sf_size = tensorrt_llm::computeSwizzledLayoutSFSize(max_num_padded_tokens,
                                                                 intermediate_size / sf_vec_size);
