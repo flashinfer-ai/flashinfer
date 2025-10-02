@@ -26,10 +26,10 @@ using tvm::ffi::Optional;
     }                                                                               \
   }()
 
-void trtllm_mnnvl_all_reduce(Tensor in, int64_t multicast_buffer_ptr, int64_t buffer_ptrs_dev,
-                             int64_t buffer_M, Tensor buffer_flags_mnnvl, int64_t nranks,
+void trtllm_mnnvl_all_reduce(TensorView in, int64_t multicast_buffer_ptr, int64_t buffer_ptrs_dev,
+                             int64_t buffer_M, TensorView buffer_flags_mnnvl, int64_t nranks,
                              int64_t rank, bool wait_for_results, bool launch_with_pdl,
-                             Optional<Tensor> out) {
+                             Optional<TensorView> out) {
   cudaSetDevice(in->device.device_id);
   auto stream = get_stream(in->device);
 
@@ -71,9 +71,9 @@ void trtllm_mnnvl_all_reduce(Tensor in, int64_t multicast_buffer_ptr, int64_t bu
   });
 }
 
-void trtllm_mnnvl_rmsnorm(int64_t multicast_buffer_ptr, Tensor prenorm_output, Tensor normed_output,
-                          Tensor gamma, double epsilon, Tensor residual, Tensor buffer_flags,
-                          bool launch_with_pdl) {
+void trtllm_mnnvl_rmsnorm(int64_t multicast_buffer_ptr, TensorView prenorm_output,
+                          TensorView normed_output, TensorView gamma, double epsilon,
+                          TensorView residual, TensorView buffer_flags, bool launch_with_pdl) {
   cudaSetDevice(prenorm_output->device.device_id);
   auto stream = get_stream(prenorm_output->device);
 

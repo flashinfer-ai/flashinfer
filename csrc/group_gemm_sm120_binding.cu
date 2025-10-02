@@ -18,8 +18,9 @@
 #include "tvm_ffi_utils.h"
 
 void CutlassGroupGemmFP8GroupwiseScaledSM120(
-    Tensor int_workspace_buffer, Tensor float_workspace_buffer, Tensor A, Tensor B, Tensor SFA,
-    Tensor SFB, Tensor D, Tensor m_indptr, int64_t n, int64_t k, int64_t scale_granularity_m,
-    int64_t scale_granularity_n, int64_t scale_granularity_k, std::string scale_major_mode);
+    TensorView int_workspace_buffer, TensorView float_workspace_buffer, TensorView A, TensorView B,
+    TensorView SFA, TensorView SFB, TensorView D, TensorView m_indptr, int64_t n, int64_t k,
+    int64_t scale_granularity_m, int64_t scale_granularity_n, int64_t scale_granularity_k,
+    std::string scale_major_mode);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(group_gemm_fp8_nt_groupwise, CutlassGroupGemmFP8GroupwiseScaledSM120);

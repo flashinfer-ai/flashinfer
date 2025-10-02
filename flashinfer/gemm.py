@@ -982,8 +982,9 @@ def get_tgv_gemm_sm10x_module(
                 # tgv_gemm takes mat1 as weights and mat2 as input tensor
                 # from [m,k]x[k,n]+[n,] to [n,k]x[k,m]+[n,]
                 gemm_fn = module.tgv_gemm
-                out = gemm_fn(b.t(), a.t(), bias, tactic, pdl)
-                return out.t()
+                c = torch.empty((a.shape[0], b.shape[1]), dtype=a.dtype, device=a.device)
+                gemm_fn(b.t(), a.t(), bias, tactic, c, pdl)
+                return c.t()
 
         return TGVGemmRunner()
 

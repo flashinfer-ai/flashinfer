@@ -20,16 +20,17 @@
 using tvm::ffi::Array;
 using tvm::ffi::Optional;
 
-Array<int64_t> BatchMLAPagedAttentionPlan(Tensor float_workspace_buffer,
-                                          Tensor int_workspace_buffer,
-                                          Tensor page_locked_int_workspace_buffer, Tensor qo_indptr,
-                                          Tensor kv_indptr, Tensor kv_len, int64_t num_heads,
-                                          int64_t head_dim_o, bool causal);
+Array<int64_t> BatchMLAPagedAttentionPlan(TensorView float_workspace_buffer,
+                                          TensorView int_workspace_buffer,
+                                          TensorView page_locked_int_workspace_buffer,
+                                          TensorView qo_indptr, TensorView kv_indptr,
+                                          TensorView kv_len, int64_t num_heads, int64_t head_dim_o,
+                                          bool causal);
 
-void BatchMLAPagedAttentionRun(Tensor float_workspace_buffer, Tensor int_workspace_buffer,
-                               Array<int64_t> plan_info_vec, Tensor q_nope, Tensor q_pe,
-                               Tensor ckv_cache, Tensor kpe_cache, Tensor kv_indices, Tensor o,
-                               Optional<Tensor> maybe_lse, int64_t mask_mode_code,
+void BatchMLAPagedAttentionRun(TensorView float_workspace_buffer, TensorView int_workspace_buffer,
+                               Array<int64_t> plan_info_vec, TensorView q_nope, TensorView q_pe,
+                               TensorView ckv_cache, TensorView kpe_cache, TensorView kv_indices,
+                               TensorView o, Optional<TensorView> maybe_lse, int64_t mask_mode_code,
                                int64_t num_heads, int64_t page_size, double sm_scale);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(plan, BatchMLAPagedAttentionPlan);

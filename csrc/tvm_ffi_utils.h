@@ -23,6 +23,7 @@
 #include "dlpack/dlpack.h"
 
 using tvm::ffi::Tensor;
+using tvm::ffi::TensorView;
 namespace ffi = tvm::ffi;
 
 inline constexpr int64_t encode_dlpack_dtype(DLDataType dtype) {
@@ -227,6 +228,15 @@ inline void check_shape(const tvm::ffi::Tensor& a, const tvm::ffi::Tensor& b, co
   }
 }
 
+inline void check_shape(const tvm::ffi::TensorView& a, const tvm::ffi::TensorView& b,
+                        const char* a_name, const char* b_name) {
+  TVM_FFI_ICHECK_EQ(a->ndim, b->ndim) << a_name << "->ndim and " << b_name << "->ndim mismatch";
+  for (int i = 0; i < a->ndim; ++i) {
+    TVM_FFI_ICHECK_EQ(a->shape[i], b->shape[i])
+        << a_name << "->shape[" << i << "] and " << b_name << "->shape[" << i << "] mismatch";
+  }
+}
+
 #define CHECK_CUDA(x) \
   TVM_FFI_ICHECK_EQ(x->device.device_type, kDLCUDA) << #x " must be a CUDA tensor";
 #define CHECK_CPU(x) \
@@ -265,7 +275,7 @@ inline cudaStream_t get_stream(DLDevice device) {
 
 inline int64_t get_element_size(ffi::Tensor x) { return (x->dtype.bits * x->dtype.lanes) / 8; }
 
-inline int64_t get_numel(ffi::Tensor x) { return x.shape().Product(); }
+inline int64_t get_element_size(ffi::TensorView x) { return (x->dtype.bits * x->dtype.lanes) / 8; }
 
 inline ffi::Tensor alloc_tensor(tvm::ffi::Shape shape, DLDataType dtype, DLDevice device) {
   return ffi::Tensor::FromDLPackAlloc(TVMFFIEnvGetTensorAllocator(), shape, dtype, device);

@@ -23,11 +23,12 @@ using namespace flashinfer;
 
 using tvm::ffi::Array;
 
-Array<int64_t> BatchMLAPagedAttentionPlan(Tensor float_workspace_buffer,
-                                          Tensor int_workspace_buffer,
-                                          Tensor page_locked_int_workspace_buffer, Tensor qo_indptr,
-                                          Tensor kv_indptr, Tensor kv_len, int64_t num_heads,
-                                          int64_t head_dim_o, bool causal) {
+Array<int64_t> BatchMLAPagedAttentionPlan(TensorView float_workspace_buffer,
+                                          TensorView int_workspace_buffer,
+                                          TensorView page_locked_int_workspace_buffer,
+                                          TensorView qo_indptr, TensorView kv_indptr,
+                                          TensorView kv_len, int64_t num_heads, int64_t head_dim_o,
+                                          bool causal) {
   size_t float_workspace_size_in_bytes =
       float_workspace_buffer->shape[0] * get_element_size(float_workspace_buffer);
   size_t int_workspace_size_in_bytes =

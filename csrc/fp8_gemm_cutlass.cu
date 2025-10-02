@@ -57,14 +57,14 @@ CutlassGemmConfig getFp8GemmConfig(int64_t m, int64_t n, int64_t k, int64_t tact
 }
 
 template <typename T>
-void runGemm(Tensor out, Tensor mat1, Tensor mat2, Tensor scale_a, Tensor scale_b, int64_t m,
-             int64_t n, int64_t k, int64_t b, CutlassGemmConfig const& gemmConfig,
-             Tensor workspace_buffer) {
+void runGemm(TensorView out, TensorView mat1, TensorView mat2, TensorView scale_a,
+             TensorView scale_b, int64_t m, int64_t n, int64_t k, int64_t b,
+             CutlassGemmConfig const& gemmConfig, TensorView workspace_buffer) {
   CutlassFp8GemmRunner<T> gemmRunner;
 
   int64_t const required_workspace_size = gemmRunner.getWorkspaceSize(m, n, k);
   int64_t const provided_workspace_size =
-      get_numel(workspace_buffer) * get_element_size(workspace_buffer);
+      workspace_buffer.numel() * get_element_size(workspace_buffer);
 
   auto runKernel = [&](void* workspace) {
     gemmRunner.gemm(static_cast<__nv_fp8_e4m3*>(mat1->data),
@@ -84,8 +84,8 @@ void runGemm(Tensor out, Tensor mat1, Tensor mat2, Tensor scale_a, Tensor scale_
   }
 }
 
-Tensor fp8_bmm_impl(Tensor mat1, Tensor mat2, Tensor scale_a, Tensor scale_b, Tensor out,
-                    Tensor workspace_buffer, int64_t tactic) {
+void fp8_bmm_impl(TensorView mat1, TensorView mat2, TensorView scale_a, TensorView scale_b,
+                  TensorView out, TensorView workspace_buffer, int64_t tactic) {
   CHECK_INPUT(mat1);
   CHECK_INPUT(mat2);
   CHECK_INPUT(scale_a);
@@ -147,14 +147,13 @@ Tensor fp8_bmm_impl(Tensor mat1, Tensor mat2, Tensor scale_a, Tensor scale_b, Te
     default:
       TVM_FFI_LOG_AND_THROW(NotImplementedError) << "out_dtype must be one of fp16/bf16.";
   }
-  return out;
 }
 
 }  // namespace
 
-Tensor fp8_gemm(Tensor mat1, Tensor mat2, Tensor scale_a, Tensor scale_b, Tensor out,
-                Tensor workspace_buffer, int64_t tactic) {
-  return fp8_bmm_impl(mat1, mat2, scale_a, scale_b, out, workspace_buffer, tactic);
+void fp8_gemm(TensorView mat1, TensorView mat2, TensorView scale_a, TensorView scale_b,
+              TensorView out, TensorView workspace_buffer, int64_t tactic) {
+  fp8_bmm_impl(mat1, mat2, scale_a, scale_b, out, workspace_buffer, tactic);
 }
 
 int64_t fp8_gemm_tactic_num() {

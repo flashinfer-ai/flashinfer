@@ -19,9 +19,7 @@
 
 using namespace flashinfer;
 
-using tvm::ffi::Tensor;
-
-void rmsnorm(Tensor output, Tensor input, Tensor weight, double eps, bool enable_pdl) {
+void rmsnorm(TensorView output, TensorView input, TensorView weight, double eps, bool enable_pdl) {
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(weight);
   CHECK_DEVICE(input, weight);
@@ -46,7 +44,8 @@ void rmsnorm(Tensor output, Tensor input, Tensor weight, double eps, bool enable
   });
 }
 
-void fused_add_rmsnorm(Tensor input, Tensor residual, Tensor weight, double eps, bool enable_pdl) {
+void fused_add_rmsnorm(TensorView input, TensorView residual, TensorView weight, double eps,
+                       bool enable_pdl) {
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(residual);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(weight);
@@ -75,7 +74,8 @@ void fused_add_rmsnorm(Tensor input, Tensor residual, Tensor weight, double eps,
   });
 }
 
-void gemma_rmsnorm(Tensor output, Tensor input, Tensor weight, double eps, bool enable_pdl) {
+void gemma_rmsnorm(TensorView output, TensorView input, TensorView weight, double eps,
+                   bool enable_pdl) {
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(weight);
   CHECK_DEVICE(input, weight);
@@ -100,7 +100,7 @@ void gemma_rmsnorm(Tensor output, Tensor input, Tensor weight, double eps, bool 
   });
 }
 
-void gemma_fused_add_rmsnorm(Tensor input, Tensor residual, Tensor weight, double eps,
+void gemma_fused_add_rmsnorm(TensorView input, TensorView residual, TensorView weight, double eps,
                              bool enable_pdl) {
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(residual);

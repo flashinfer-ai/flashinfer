@@ -1043,14 +1043,12 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       return kernels::QuantParams::GroupWise(
           group_size, static_cast<void const*>(fc1_weight_scales->data),
           static_cast<void const*>(fc2_weight_scales->data),
-          static_cast<void const*>(get_numel(fc1_act_scales) > 0 ? fc1_act_scales->data : nullptr),
-          static_cast<void const*>(get_numel(fc2_act_scales) > 0 ? fc2_act_scales->data : nullptr),
-          static_cast<void const*>(get_numel(fc1_weight_zeros) > 0 ? fc1_weight_zeros->data
-                                                                   : nullptr),
-          static_cast<void const*>(get_numel(fc2_weight_zeros) > 0 ? fc2_weight_zeros->data
-                                                                   : nullptr),
-          static_cast<float const*>(get_numel(fc1_alpha) > 0 ? fc1_alpha->data : nullptr),
-          static_cast<float const*>(get_numel(fc2_alpha) > 0 ? fc2_alpha->data : nullptr));
+          static_cast<void const*>(fc1_act_scales.numel() > 0 ? fc1_act_scales->data : nullptr),
+          static_cast<void const*>(fc2_act_scales.numel() > 0 ? fc2_act_scales->data : nullptr),
+          static_cast<void const*>(fc1_weight_zeros.numel() > 0 ? fc1_weight_zeros->data : nullptr),
+          static_cast<void const*>(fc2_weight_zeros.numel() > 0 ? fc2_weight_zeros->data : nullptr),
+          static_cast<float const*>(fc1_alpha.numel() > 0 ? fc1_alpha->data : nullptr),
+          static_cast<float const*>(fc2_alpha.numel() > 0 ? fc2_alpha->data : nullptr));
     } else {
       return kernels::QuantParams{};
     }

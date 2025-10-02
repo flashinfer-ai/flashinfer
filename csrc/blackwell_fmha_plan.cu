@@ -17,10 +17,10 @@
 #include "flashinfer/attention/blackwell/plan.cuh"
 #include "tvm_ffi_utils.h"
 
-void blackwell_fmha_plan(Tensor qo_segment_offsets, Tensor kv_segment_offsets, Tensor work_indptr,
-                         Tensor qo_tile_indices, Tensor head_indices, Tensor batch_indices,
-                         int64_t qo_tile_size, int64_t num_heads, int64_t num_buckets,
-                         bool causal) {
+void blackwell_fmha_plan(TensorView qo_segment_offsets, TensorView kv_segment_offsets,
+                         TensorView work_indptr, TensorView qo_tile_indices,
+                         TensorView head_indices, TensorView batch_indices, int64_t qo_tile_size,
+                         int64_t num_heads, int64_t num_buckets, bool causal) {
   cudaSetDevice(qo_segment_offsets->device.device_id);
   const cudaStream_t stream = get_stream(qo_tile_indices->device);
   int batch_size = qo_segment_offsets->shape[0] - 1;
