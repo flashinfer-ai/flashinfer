@@ -11,14 +11,13 @@ echo "=========================================="
 # MAX_JOBS = min(nproc, max(1, MemAvailable_GB/4))
 MEM_AVAILABLE_GB=$(free -g | awk '/^Mem:/ {print $7}')
 NPROC=$(nproc)
-MAX_JOBS=$(( MEM_AVAILABLE_GB / 4 ))
+MAX_JOBS=$(( MEM_AVAILABLE_GB / $([ "$(uname -m)" = "aarch64" ] && echo 8 || echo 4) ))
 if (( MAX_JOBS < 1 )); then
   MAX_JOBS=1
 elif (( NPROC < MAX_JOBS )); then
   MAX_JOBS=$NPROC
 fi
 
-# Export MAX_JOBS for PyTorch's cpp_extension to use
 export MAX_JOBS
 
 # Display build environment info
@@ -29,7 +28,7 @@ echo "CUDA Minor: ${CUDA_MINOR}"
 echo "CUDA Version Suffix: ${CUDA_VERSION_SUFFIX}"
 echo "CUDA Architectures: ${FLASHINFER_CUDA_ARCH_LIST}"
 echo "MAX_JOBS: ${MAX_JOBS}"
-echo "Python Version: $(python --version)"
+echo "Python Version: $(python3 --version)"
 echo "Working directory: $(pwd)"
 echo ""
 
