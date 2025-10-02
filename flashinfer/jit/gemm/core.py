@@ -387,7 +387,7 @@ def gen_trtllm_gen_gemm_module() -> JitSpec:
     )
 
 
-def gen_gemm_sm100_module_tgv(dtype: torch.dtype = torch.bfloat16) -> JitSpec:
+def gen_tgv_gemm_sm100_module(dtype: torch.dtype = torch.bfloat16) -> JitSpec:
     """
     Generate TGV GEMM module for SM100 architecture.
 
