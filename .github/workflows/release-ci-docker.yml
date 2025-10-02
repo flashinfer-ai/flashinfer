@@ -10,8 +10,9 @@ on:
   pull_request:
     branches:
       - main
-    # paths:
-    #   - 'docker/**'
+    paths:
+      - 'docker/**'
+      - '.github/workflows/release-ci-docker.yml'
 
 jobs:
   generate-tag:
