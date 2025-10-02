@@ -38,28 +38,11 @@ skip = [
 ]
 
 [tool.setuptools]
-packages = [
-    "flashinfer",
-    "flashinfer.cute_dsl",
-    "flashinfer.data",
-    "flashinfer.data.csrc",
-    "flashinfer.data.cutlass",
-    "flashinfer.data.spdlog",
-    "flashinfer.data.include",
-    "flashinfer.fused_moe",
-    "flashinfer.jit",
-    "flashinfer.jit.attention",
-    "flashinfer.jit.cutlass_gemm",
-    "flashinfer.testing",
-    "flashinfer.triton",
-    "flashinfer.tuning_configs",
-    "flashinfer.profiler",
-    "flashinfer.triton.kernels",
-    "flashinfer.comm",
-    "flashinfer.cudnn",
-    "flashinfer.logits_processor",
-]
 include-package-data = false
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["flashinfer*"]
 
 [tool.setuptools.package-dir]
 "flashinfer.data" = "."
