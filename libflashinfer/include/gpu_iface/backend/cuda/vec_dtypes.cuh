@@ -23,7 +23,8 @@
 
 #include <type_traits>
 
-namespace flashinfer {
+namespace detail {
+namespace cuda {
 
 #if (!defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 900))
 #define FLASHINFER_HARDWARE_FP8_CONVERSION_ENABLED
@@ -1388,6 +1389,7 @@ struct vec_t<float, vec_size> {
   }
 };
 
-}  // namespace flashinfer
+}  // namespace cuda
+}  // namespace detail
 
 #endif  // VEC_DTYPES_CUH_

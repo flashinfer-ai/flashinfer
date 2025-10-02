@@ -20,6 +20,7 @@
 
 #define FLASHINFER_INLINE inline __attribute__((always_inline)) __device__
 
+namespace {
 __host__ __device__ inline __hip_bfloat162 __float2bfloat162_rn(const float a) {
   return __hip_bfloat162{__float2bfloat16(a), __float2bfloat16(a)};
 }
@@ -30,6 +31,7 @@ FLASHINFER_INLINE __hip_bfloat162 make_bfloat162(const __hip_bfloat16 x, const _
   t.y = y;
   return t;
 }
+}  // namespace
 
 namespace detail {
 namespace hip {
@@ -1628,6 +1630,5 @@ struct vec_t<float, vec_size> {
     }
   }
 };
-
-}  // namespace flashinfer
+}
 }
