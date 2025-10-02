@@ -20,21 +20,9 @@ from typing import List, Optional, Tuple, Union
 import torch
 
 from .decode import BatchDecodeWithPagedKVCacheWrapper
-from .jit import JitSpec
-from .jit import env as jit_env
-from .jit import gen_jit_spec
+from .jit.cascade import gen_cascade_module
 from .prefill import BatchPrefillWithPagedKVCacheWrapper, single_prefill_with_kv_cache
 from .utils import register_custom_op, register_fake_op
-
-
-def gen_cascade_module() -> JitSpec:
-    return gen_jit_spec(
-        "cascade",
-        [
-            jit_env.FLASHINFER_CSRC_DIR / "cascade.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "flashinfer_cascade_binding.cu",
-        ],
-    )
 
 
 @functools.cache

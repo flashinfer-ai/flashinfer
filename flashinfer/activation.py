@@ -20,8 +20,7 @@ from typing import Optional
 
 import torch
 
-from .jit import JitSpec
-from .jit import gen_act_and_mul_module as gen_act_and_mul_module_impl
+from .jit import gen_act_and_mul_module
 from .utils import (
     device_support_pdl,
     register_custom_op,
@@ -29,37 +28,6 @@ from .utils import (
     get_compute_capability,
 )
 from .fp4_quantization import get_fp4_quantization_module
-
-silu_def_cu_str = r"""
-__device__ __forceinline__ float silu(const float& val) {
-  return val / (1.0f + __expf(-val));
-}
-"""
-
-gelu_def_cu_str = r"""
-__device__ __forceinline__ float gelu(const float& val) {
-  constexpr float kAlpha = M_SQRT1_2;
-  return val * 0.5f * (1.0f + ::erf(val * kAlpha));
-}
-"""
-
-gelu_def_tanh_cu_str = r"""
-__device__ __forceinline__ float gelu_tanh(const float& val) {
-  const float cdf =
-      0.5f * (1.0f + math::tanh((0.7978845608028654f * (val + 0.044715f * val * val * val))));
-  return val * cdf;
-}
-"""
-
-act_func_def_str = {
-    "silu": silu_def_cu_str,
-    "gelu": gelu_def_cu_str,
-    "gelu_tanh": gelu_def_tanh_cu_str,
-}
-
-
-def gen_act_and_mul_module(act_func_name: str) -> JitSpec:
-    return gen_act_and_mul_module_impl(act_func_name, act_func_def_str[act_func_name])
 
 
 @functools.cache

@@ -30,10 +30,9 @@ from typing import List, Tuple, Iterator, Optional
 import torch
 import torch.version
 
-from .activation import act_func_def_str, gen_act_and_mul_module
-from .fp8_quantization import gen_mxfp8_quantization_sm100_module
-from .cascade import gen_cascade_module
-from .fp4_quantization import (
+from .jit.activation import act_func_def_str, gen_act_and_mul_module
+from .jit.cascade import gen_cascade_module
+from .jit.fp4_quantization import (
     gen_fp4_quantization_sm90_module,
     gen_fp4_quantization_sm100_module,
     gen_fp4_quantization_sm103_module,
@@ -41,13 +40,14 @@ from .fp4_quantization import (
     gen_fp4_quantization_sm120_module,
     gen_fp4_quantization_sm121_module,
 )
-from .fused_moe import (
+from .jit.fp8_quantization import gen_mxfp8_quantization_sm100_module
+from .jit.fused_moe import (
     gen_cutlass_fused_moe_sm120_module,
     gen_cutlass_fused_moe_sm100_module,
     gen_cutlass_fused_moe_sm90_module,
     gen_trtllm_gen_fused_moe_sm100_module,
 )
-from .gemm import (
+from .jit.gemm import (
     gen_gemm_module,
     gen_gemm_sm90_module,
     gen_gemm_sm100_module,
@@ -58,6 +58,15 @@ from .gemm import (
     gen_gemm_sm120_module_cutlass_fp4,
     gen_trtllm_gen_gemm_module,
 )
+from .jit.spdlog import gen_spdlog_module
+from .jit.mla import gen_mla_module
+from .jit.norm import gen_norm_module
+from .jit.page import gen_page_module
+from .jit.quantization import gen_quantization_module
+from .jit.rope import gen_rope_module
+from .jit.sampling import gen_sampling_module
+from .jit.tllm_utils import gen_trtllm_utils_module
+from .jit.xqa import gen_xqa_module
 from .jit import JitSpec, build_jit_specs
 from .jit import env as jit_env
 from .jit import (
@@ -71,15 +80,7 @@ from .jit import (
     gen_single_prefill_module,
     gen_trtllm_gen_fmha_module,
 )
-from .mla import gen_mla_module
-from .norm import gen_norm_module
-from .page import gen_page_module
-from .quantization import gen_quantization_module
-from .rope import gen_rope_module
-from .sampling import gen_sampling_module
-from .tllm_utils import gen_trtllm_utils_module
-from .utils import gen_logging_module, version_at_least
-from .xqa import gen_xqa_module
+from .utils import version_at_least
 from .compilation_context import CompilationContext
 
 
@@ -410,7 +411,7 @@ def gen_all_modules(
     add_xqa: bool,
 ) -> List[JitSpec]:
     jit_specs: List[JitSpec] = []
-    jit_specs.append(gen_logging_module())
+    jit_specs.append(gen_spdlog_module())
     has_sm90 = sm_capabilities.get("sm90", False)
     has_sm100 = sm_capabilities.get("sm100", False)
     has_sm103 = sm_capabilities.get("sm103", False)
@@ -468,10 +469,10 @@ def gen_all_modules(
             jit_specs.append(gen_fp4_quantization_sm121_module())
 
     if add_comm:
-        from .jit import gen_trtllm_comm_module, gen_vllm_comm_module
-        from .jit import gen_nvshmem_module
-        from .jit import gen_comm_alltoall_module
-        from .jit import gen_trtllm_mnnvl_comm_module
+        from .jit.comm import gen_trtllm_comm_module, gen_vllm_comm_module
+        from .jit.comm import gen_nvshmem_module
+        from .jit.comm import gen_comm_alltoall_module
+        from .jit.comm import gen_trtllm_mnnvl_comm_module
 
         jit_specs.append(gen_nvshmem_module())
         jit_specs.append(gen_comm_alltoall_module())

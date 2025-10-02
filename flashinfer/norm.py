@@ -19,20 +19,8 @@ from typing import Optional
 
 import torch
 
-from .jit import JitSpec
-from .jit import env as jit_env
-from .jit import gen_jit_spec
+from .jit.norm import gen_norm_module
 from .utils import device_support_pdl, register_custom_op, register_fake_op
-
-
-def gen_norm_module() -> JitSpec:
-    return gen_jit_spec(
-        "norm",
-        [
-            jit_env.FLASHINFER_CSRC_DIR / "norm.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "flashinfer_norm_binding.cu",
-        ],
-    )
 
 
 @functools.cache

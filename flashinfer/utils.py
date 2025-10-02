@@ -24,7 +24,7 @@ import torch.version
 from torch.torch_version import TorchVersion
 from torch.torch_version import __version__ as torch_version
 
-from .jit import gen_jit_spec, env as jit_env
+from .jit.spdlog import gen_spdlog_module
 
 
 class PosEncodingMode(Enum):
@@ -506,22 +506,9 @@ def check_shape_dtype_device(
         )
 
 
-def gen_logging_module():
-    return gen_jit_spec(
-        "logging",
-        [
-            jit_env.FLASHINFER_CSRC_DIR / "logging.cc",
-        ],
-        extra_include_paths=[
-            jit_env.SPDLOG_INCLUDE_DIR,
-            jit_env.FLASHINFER_INCLUDE_DIR,
-        ],
-    )
-
-
 @functools.cache
 def get_logging_module():
-    return gen_logging_module().build_and_load()
+    return gen_spdlog_module().build_and_load()
 
 
 class LogLevel(Enum):
