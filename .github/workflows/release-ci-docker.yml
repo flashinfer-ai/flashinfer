@@ -10,8 +10,8 @@ on:
   pull_request:
     branches:
       - main
-    paths:
-      - 'docker/**'
+    # paths:
+    #   - 'docker/**'
 
 jobs:
   generate-tag:
@@ -72,7 +72,7 @@ jobs:
           tags: |
             flashinfer/flashinfer-ci-${{ matrix.cuda }}:${{ matrix.arch }}-${{ needs.generate-tag.outputs.date_sha }}
           cache-from: type=registry,ref=flashinfer/flashinfer-ci-${{ matrix.cuda }}:buildcache-${{ matrix.arch }}
-          cache-to: type=registry,ref=flashinfer/flashinfer-ci-${{ matrix.cuda }}:buildcache-${{ matrix.arch }},mode=max
+          cache-to: ${{ github.event_name != 'pull_request' && format('type=registry,ref=flashinfer/flashinfer-ci-{0}:buildcache-{1},mode=max', matrix.cuda, matrix.arch) || '' }}
           provenance: false
           sbom: false
 
