@@ -65,6 +65,56 @@ def unpack_lib(name, libs) {
      """
 }
 
+def should_skip_build() {
+  // Skip build if changes are only in documentation/config directories
+  def skip_patterns = [
+    'README.md',
+    '.github/',
+    'docs/',
+    'docker/',
+    'licenses/',
+    'LICENSE',
+    'NOTICE',
+    'version.txt'
+  ]
+
+  if (env.CHANGE_ID) {
+    // This is a PR build, check changed files
+    def changedFiles = []
+    try {
+      changedFiles = sh(
+        script: 'git diff --name-only origin/${CHANGE_TARGET}...HEAD',
+        returnStdout: true
+      ).trim().split('\n')
+    } catch (Exception e) {
+      echo "Could not determine changed files: ${e.toString()}"
+      return false
+    }
+
+    if (changedFiles.size() == 0) {
+      return false
+    }
+
+    // Check if all changed files match skip patterns
+    def allSkippable = changedFiles.every { file ->
+      skip_patterns.any { pattern ->
+        if (pattern.endsWith('/')) {
+          file.startsWith(pattern)
+        } else {
+          file == pattern
+        }
+      }
+    }
+
+    if (allSkippable) {
+      echo "Skipping build - all changes are in documentation/config files: ${changedFiles}"
+      return true
+    }
+  }
+
+  return false
+}
+
 def cancel_previous_build() {
   // cancel previous build if it is not on main.
   if (env.BRANCH_NAME != 'main') {
@@ -243,6 +293,12 @@ def shard_run_unittest_GPU(node_type, shard_id, cuda_version) {
 }
 
 stage('Unittest') {
+  if (should_skip_build()) {
+    echo "Skipping tests - only documentation/config files changed"
+    Utils.markStageSkippedForConditional('Unittest')
+    return
+  }
+
   cancel_previous_build()
   parallel(
     failFast: true,
