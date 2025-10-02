@@ -27,6 +27,7 @@ from ..core import (
     gen_jit_spec,
     sm90a_nvcc_flags,
     sm100a_nvcc_flags,
+    sm100f_nvcc_flags,
     current_compilation_context,
 )
 from ..cubin_loader import get_cubin
@@ -387,12 +388,16 @@ def gen_trtllm_gen_gemm_module() -> JitSpec:
     )
 
 
-def gen_tgv_gemm_sm100_module(dtype: torch.dtype = torch.bfloat16) -> JitSpec:
+def gen_tgv_gemm_sm10x_module(
+    dtype: torch.dtype = torch.bfloat16, use_sm_100f: bool = False
+) -> JitSpec:
     """
     Generate TGV GEMM module for SM100 architecture.
 
     Args:
         dtype: Data type for the GEMM operation (torch.bfloat16 or torch.float16)
+        use_sm_100f: Whether to compile with SM100f flags (default: False), which makes the compiled kernel
+            compatible with both B200 and B300 GPUs. However, it's only available with CUDA 12.9+.
 
     Returns:
         JitSpec for the TGV GEMM module
@@ -444,7 +449,7 @@ def gen_tgv_gemm_sm100_module(dtype: torch.dtype = torch.bfloat16) -> JitSpec:
     return gen_jit_spec(
         module_name,
         source_paths,
-        extra_cuda_cflags=sm100a_nvcc_flags,
+        extra_cuda_cflags=sm100f_nvcc_flags if use_sm_100f else sm100a_nvcc_flags,
         extra_include_paths=[
             jit_env.FLASHINFER_INCLUDE_DIR,
             jit_env.FLASHINFER_CSRC_DIR,

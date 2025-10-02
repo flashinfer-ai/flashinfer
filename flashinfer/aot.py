@@ -53,7 +53,7 @@ from .jit.gemm import (
     gen_gemm_sm100_module,
     gen_gemm_sm100_module_cutlass_fp4,
     gen_gemm_sm100_module_cutlass_fp8,
-    gen_tgv_gemm_sm100_module,
+    gen_tgv_gemm_sm10x_module,
     gen_gemm_sm120_module,
     gen_gemm_sm120_module_cutlass_fp4,
     gen_trtllm_gen_gemm_module,
@@ -414,6 +414,7 @@ def gen_all_modules(
     jit_specs.append(gen_spdlog_module())
     has_sm90 = sm_capabilities.get("sm90", False)
     has_sm100 = sm_capabilities.get("sm100", False)
+    has_sm100f = sm_capabilities.get("sm100f", False)
     has_sm103 = sm_capabilities.get("sm103", False)
     has_sm110 = sm_capabilities.get("sm110", False)
     has_sm120 = sm_capabilities.get("sm120", False)
@@ -451,11 +452,21 @@ def gen_all_modules(
             jit_specs.append(gen_gemm_sm100_module_cutlass_fp4())
             jit_specs.append(gen_gemm_sm100_module_cutlass_fp8())
             # Add TGV GEMM modules for both bf16 and fp16
-            jit_specs.append(gen_tgv_gemm_sm100_module(torch.bfloat16))
-            jit_specs.append(gen_tgv_gemm_sm100_module(torch.float16))
+            jit_specs.append(
+                gen_tgv_gemm_sm10x_module(torch.bfloat16, use_sm_100f=False)
+            )
+            jit_specs.append(
+                gen_tgv_gemm_sm10x_module(torch.float16, use_sm_100f=False)
+            )
             jit_specs.append(gen_mxfp8_quantization_sm100_module())
             jit_specs.append(gen_trtllm_gen_gemm_module())
             jit_specs.append(gen_trtllm_gen_fused_moe_sm100_module())
+        if has_sm100f:
+            # Add TGV GEMM modules compiled with SM100f flags for both bf16 and fp16
+            jit_specs.append(
+                gen_tgv_gemm_sm10x_module(torch.bfloat16, use_sm_100f=True)
+            )
+            jit_specs.append(gen_tgv_gemm_sm10x_module(torch.float16, use_sm_100f=True))
         if has_sm103:
             jit_specs.append(gen_fp4_quantization_sm103_module())
         if has_sm110:
@@ -696,6 +707,7 @@ def detect_sm_capabilities():
     return {
         "sm90": has_sm("compute_90", "12.3"),
         "sm100": has_sm("compute_100", "12.8"),
+        "sm100f": has_sm("compute_100", "12.9"),
         "sm103": has_sm("compute_103", "12.8"),
         "sm110": has_sm("compute_110", "12.9"),
         "sm120": has_sm("compute_120", "13.0"),

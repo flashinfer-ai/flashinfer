@@ -1,18 +1,18 @@
 import dataclasses
 import logging
 import os
-import tvm_ffi
 from contextlib import nullcontext
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Union
-from datetime import datetime
 
+import tvm_ffi
 from filelock import FileLock
 
+from ..compilation_context import CompilationContext
 from . import env as jit_env
 from .cpp_ext import generate_ninja_build_for_op, run_ninja
 from .utils import write_if_different
-from ..compilation_context import CompilationContext
 
 os.makedirs(jit_env.FLASHINFER_WORKSPACE_DIR, exist_ok=True)
 os.makedirs(jit_env.FLASHINFER_CSRC_DIR, exist_ok=True)
@@ -75,6 +75,7 @@ common_nvcc_flags = [
 sm90a_nvcc_flags = ["-gencode=arch=compute_90a,code=sm_90a"] + common_nvcc_flags
 sm100a_nvcc_flags = ["-gencode=arch=compute_100a,code=sm_100a"] + common_nvcc_flags
 sm103a_nvcc_flags = ["-gencode=arch=compute_103a,code=sm_103a"] + common_nvcc_flags
+sm100f_nvcc_flags = ["-gencode=arch=compute_100f,code=sm_100f"] + common_nvcc_flags
 sm110a_nvcc_flags = ["-gencode=arch=compute_110a,code=sm_110a"] + common_nvcc_flags
 sm120a_nvcc_flags = ["-gencode=arch=compute_120a,code=sm_120a"] + common_nvcc_flags
 sm121a_nvcc_flags = ["-gencode=arch=compute_121a,code=sm_121a"] + common_nvcc_flags
@@ -181,6 +182,16 @@ class JitSpec:
         if self.is_aot:
             return self.aot_path
         return self.jit_library_path
+
+    def get_object_paths(self) -> List[Path]:
+        object_paths = []
+        jit_dir = self.jit_library_path.parent
+        for source in self.sources:
+            is_cuda = source.suffix == ".cu"
+            object_suffix = ".cuda.o" if is_cuda else ".o"
+            obj_name = source.with_suffix(object_suffix).name
+            object_paths.append(jit_dir / obj_name)
+        return object_paths
 
     @property
     def aot_path(self) -> Path:

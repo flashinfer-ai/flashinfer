@@ -63,6 +63,7 @@ from .core import clear_cache_dir as clear_cache_dir
 from .core import gen_jit_spec as gen_jit_spec
 from .core import sm90a_nvcc_flags as sm90a_nvcc_flags
 from .core import sm100a_nvcc_flags as sm100a_nvcc_flags
+from .core import sm100f_nvcc_flags as sm100f_nvcc_flags
 from .core import sm103a_nvcc_flags as sm103a_nvcc_flags
 from .core import sm110a_nvcc_flags as sm110a_nvcc_flags
 from .core import sm120a_nvcc_flags as sm120a_nvcc_flags

@@ -6,6 +6,8 @@ from flashinfer import (
     tgv_gemm_sm100,
 )
 
+from flashinfer.gemm import _match_sm_version
+
 
 @pytest.mark.parametrize("m", [1, 8, 16, 32, 64])
 @pytest.mark.parametrize("n", [1024, 2048, 4096])
@@ -16,6 +18,9 @@ def test_tgv_gemm_sm100(m, n, k, dtype):
     A = torch.randn(m, k, device="cuda", dtype=dtype)
     B = torch.randn(n, k, device="cuda", dtype=dtype).t()  # column major
     bias = torch.randn(n, device="cuda", dtype=dtype)
+
+    if not _match_sm_version(A.device, ["100", "103"]):
+        pytest.skip("TGV GEMM requires SM100, SM103 architecture")
 
     print(
         f"Input tensors: A {A.shape}, B {B.shape}, bias {bias.shape}, dtype: {A.dtype}",

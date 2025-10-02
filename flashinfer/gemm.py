@@ -35,6 +35,7 @@ from .fused_moe.utils import (
 )
 from .utils import (
     is_sm100a_supported,
+    is_sm100f_supported,
     is_sm120a_supported,
     is_sm121a_supported,
     LibraryError,
@@ -47,7 +48,7 @@ from .jit.gemm import gen_gemm_sm120_module_cutlass_fp4
 from .jit.gemm import gen_gemm_sm100_module_cutlass_fp4
 from .jit.gemm import gen_gemm_sm100_module_cutlass_fp8
 from .jit.gemm import gen_trtllm_gen_gemm_module
-from .jit.gemm import gen_tgv_gemm_sm100_module
+from .jit.gemm import gen_tgv_gemm_sm10x_module
 from .jit.gemm import gen_deepgemm_sm100_module
 
 
@@ -513,17 +514,21 @@ def get_gemm_sm120_module_cutlass_fp4():
 
 
 @functools.cache
-def get_gemm_sm100_module_tgv(dtype: torch.dtype = torch.bfloat16):
+def get_tgv_gemm_sm10x_module(
+    dtype: torch.dtype = torch.bfloat16, use_sm_100f: bool = False
+):
     """
     Get and build the TGV GEMM module for the specified dtype.
 
     Args:
         dtype: Data type for the GEMM operation (torch.bfloat16 or torch.float16)
+        use_sm_100f: Whether to compile with SM100f flags (default: False), which makes the compiled kernel
+            compatible with both B200 and B300 GPUs. However, it's only available with CUDA 12.9+.
 
     Returns:
         SimpleNamespace with the runner function
     """
-    module = gen_tgv_gemm_sm100_module(dtype).build_and_load()
+    module = gen_tgv_gemm_sm10x_module(dtype, use_sm_100f).build_and_load()
 
     def tgv_gemm_runner():
         class TGVGemmRunner(TunableRunner):
@@ -591,8 +596,8 @@ def tgv_gemm_sm100(
         - Tensor b is expected to be in column-major layout (transposed from typical PyTorch row-major)
     """
     # Verify SM100 architecture support
-    if not _match_sm_version(a.device, ["100", "103", "110"]):
-        raise ValueError("TGV GEMM requires SM100, SM103, or SM110 architecture")
+    if not _match_sm_version(a.device, ["100", "103"]):
+        raise ValueError("TGV GEMM requires SM100, SM103 architecture")
 
     # Verify dtype support
     if a.dtype not in [torch.bfloat16, torch.float16]:
@@ -606,7 +611,8 @@ def tgv_gemm_sm100(
         )
 
     runners = []
-    runners.append(get_gemm_sm100_module_tgv(a.dtype).tgv_gemm_runner())
+    use_sm_100f = is_sm100f_supported(a.device)
+    runners.append(get_tgv_gemm_sm10x_module(a.dtype, use_sm_100f).tgv_gemm_runner())
 
     tuner = AutoTuner.get()
     a_tensor_index = 0
