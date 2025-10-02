@@ -78,6 +78,48 @@ def rmsnorm(
     return out
 
 
+def qk_rmsnorm(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    out: Optional[torch.Tensor] = None,
+    enable_pdl: Optional[bool] = None,
+) -> torch.Tensor:
+    r"""Root mean square normalization.
+
+    ``out[i] = (input[i] / RMS(input)) * weight[i]``
+
+    Parameters
+    ----------
+    input: torch.Tensor
+        Input tensor, shape (batch_size, num_heads, hidden_size).
+    weight: torch.Tensor
+        Weight tensor, shape (hidden_size,).
+    eps: float
+        Epsilon for numerical stability.
+    out: Optional[torch.Tensor]
+        The output tensor, if specified, the kernel will update this tensor inplace.
+    enable_pdl: bool
+        Whether to enable `programmatic dependent launch
+        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
+
+    Returns
+    -------
+    output: torch.Tensor
+        Normalized tensor, shape (batch_size, num_heads, hidden_size).
+    """
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(input.device)
+    if out is None:
+        out = torch.empty(
+            (input.size(0), input.size(1), input.size(2)),
+            device=input.device,
+            dtype=input.dtype,
+        )
+    _qk_rmsnorm(out, input, weight, eps, enable_pdl)
+    return out
+
+
 @register_custom_op("flashinfer::rmsnorm", mutates_args=("out",))
 def _rmsnorm(
     out: torch.Tensor,
@@ -93,6 +135,30 @@ def _rmsnorm(
 
 @register_fake_op("flashinfer::rmsnorm")
 def _rmsnorm_fake(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    enable_pdl: Optional[bool],
+) -> None:
+    pass
+
+
+@register_custom_op("flashinfer::qk_rmsnorm", mutates_args=("out",))
+def _qk_rmsnorm(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    enable_pdl: Optional[bool],
+) -> None:
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(input.device)
+    get_norm_module().qk_rmsnorm(out, input, weight, eps, enable_pdl)
+
+
+@register_fake_op("flashinfer::qk_rmsnorm")
+def _qk_rmsnorm_fake(
     out: torch.Tensor,
     input: torch.Tensor,
     weight: torch.Tensor,

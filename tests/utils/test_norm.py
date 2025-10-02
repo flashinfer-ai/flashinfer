@@ -94,6 +94,37 @@ def test_norm(batch_size, hidden_size, dtype, specify_out, enable_pdl, contiguou
 
 
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
+@pytest.mark.parametrize("num_heads", [4, 7, 16])
+@pytest.mark.parametrize("head_dim", [64, 128, 256, 512])
+@pytest.mark.parametrize("dtype", [torch.float16])
+@pytest.mark.parametrize("specify_out", [True, False])
+@pytest.mark.parametrize("enable_pdl", [True, False])
+@pytest.mark.parametrize("contiguous", [True, False])
+def test_qknorm(
+    batch_size, num_heads, head_dim, dtype, specify_out, enable_pdl, contiguous
+):
+    if contiguous:
+        x = torch.randn(batch_size, num_heads, head_dim).to(0).to(dtype)
+    else:
+        x = torch.randn(batch_size, num_heads * 2, head_dim, device="cuda").to(dtype)
+        x = x[:, :num_heads, :head_dim]
+
+    if enable_pdl and not device_support_pdl(x.device):
+        pytest.skip("PDL is only available for Hopper and later GPUs")
+
+    w = torch.randn(head_dim).to(0).to(dtype)
+
+    y_ref = llama_rms_norm(x, w)
+    if specify_out:
+        y = torch.empty_like(x)
+        flashinfer.norm.qk_rmsnorm(x, w, out=y, enable_pdl=enable_pdl)
+    else:
+        y = flashinfer.norm.qk_rmsnorm(x, w, enable_pdl=enable_pdl)
+
+    torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
 @pytest.mark.parametrize("hidden_size", [111, 500, 1024, 3072, 3584, 4096, 8192, 16384])
 @pytest.mark.parametrize("dtype", [torch.float16])
 @pytest.mark.parametrize("enable_pdl", [True, False])
