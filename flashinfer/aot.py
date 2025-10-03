@@ -28,8 +28,8 @@ from pathlib import Path
 from typing import List, Tuple, Iterator, Optional
 
 import torch
-import torch.version
 
+from packaging.version import Version
 from .jit.activation import act_func_def_str, gen_act_and_mul_module
 from .jit.cascade import gen_cascade_module
 from .jit.fp4_quantization import (
@@ -67,9 +67,7 @@ from .jit.rope import gen_rope_module
 from .jit.sampling import gen_sampling_module
 from .jit.tllm_utils import gen_trtllm_utils_module
 from .jit.xqa import gen_xqa_module
-from .jit import JitSpec, build_jit_specs
-from .jit import env as jit_env
-from .jit import (
+from .jit.attention import (
     gen_batch_attention_module,
     gen_batch_decode_module,
     gen_batch_mla_module,
@@ -80,8 +78,9 @@ from .jit import (
     gen_single_prefill_module,
     gen_trtllm_gen_fmha_module,
 )
+from .jit import JitSpec, build_jit_specs
+from .jit import env as jit_env
 from .jit.cpp_ext import get_cuda_version
-from .utils import version_at_least
 from .compilation_context import CompilationContext
 
 
@@ -699,7 +698,7 @@ def detect_sm_capabilities():
     def has_sm(compute: str, version: str) -> bool:
         if not any(compute in flag for flag in gencode_flags_list):
             return False
-        return version_at_least(get_cuda_version(), version)
+        return get_cuda_version() >= Version(version)
 
     # Check https://docs.nvidia.com/cuda/parallel-thread-execution/#release-notes
     # for CUDA version and SM compatibility
@@ -708,9 +707,9 @@ def detect_sm_capabilities():
         "sm100": has_sm("compute_100", "12.8"),
         "sm100f": has_sm("compute_100", "12.9"),
         "sm103": has_sm("compute_103", "12.9"),
-        "sm110": has_sm("compute_110", "13.0"),
-        "sm120": has_sm("compute_120", "12.8"),
-        "sm121": has_sm("compute_121", "12.9"),
+        "sm110": has_sm("compute_110", "12.9"),
+        "sm120": has_sm("compute_120", "13.0"),
+        "sm121": has_sm("compute_121", "13.0"),
     }
 
 
