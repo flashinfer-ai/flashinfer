@@ -1586,7 +1586,6 @@ def gen_trtllm_gen_fmha_module():
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_fmha_kernel_launcher.cu",
             jit_env.FLASHINFER_CSRC_DIR / "fmhaReduction.cu",
         ],
-        extra_ldflags=["-lcuda"],
         # link "include" sub-directory in cache
         extra_include_paths=[jit_env.FLASHINFER_CUBIN_DIR / include_path],
         extra_cuda_cflags=[
@@ -1691,7 +1690,6 @@ def gen_cudnn_fmha_module():
     return gen_jit_spec(
         "fmha_cudnn_gen",
         [jit_env.FLASHINFER_CSRC_DIR / "cudnn_sdpa_kernel_launcher.cu"],
-        extra_ldflags=["-lcuda"],
         extra_cuda_cflags=[
             f'-DCUDNN_SDPA_CUBIN_PATH=\\"{ArtifactPath.CUDNN_SDPA}\\"',
         ],
