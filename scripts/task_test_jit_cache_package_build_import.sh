@@ -69,7 +69,7 @@ echo "========================================"
 echo "Building flashinfer-jit-cache wheel"
 echo "========================================"
 cd flashinfer-jit-cache
-python -m build --wheel
+# python -m build --wheel
 
 # Get the built wheel file
 WHEEL_FILE=$(ls dist/*.whl | head -n 1)

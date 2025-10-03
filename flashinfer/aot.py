@@ -80,6 +80,7 @@ from .jit import (
     gen_single_prefill_module,
     gen_trtllm_gen_fmha_module,
 )
+from .jit.cpp_ext import get_cuda_version
 from .utils import version_at_least
 from .compilation_context import CompilationContext
 
@@ -690,8 +691,6 @@ def get_default_config():
 
 def detect_sm_capabilities():
     """Detect SM capabilities"""
-    import torch.version
-
     compilation_context = CompilationContext()
     gencode_flags_list = compilation_context.get_nvcc_flags_list(
         supported_major_versions=None
@@ -700,18 +699,18 @@ def detect_sm_capabilities():
     def has_sm(compute: str, version: str) -> bool:
         if not any(compute in flag for flag in gencode_flags_list):
             return False
-        if torch.version.cuda is None:
-            return True
-        return version_at_least(torch.version.cuda, version)
+        return version_at_least(get_cuda_version(), version)
 
+    # Check https://docs.nvidia.com/cuda/parallel-thread-execution/#release-notes
+    # for CUDA version and SM compatibility
     return {
         "sm90": has_sm("compute_90", "12.3"),
         "sm100": has_sm("compute_100", "12.8"),
         "sm100f": has_sm("compute_100", "12.9"),
-        "sm103": has_sm("compute_103", "12.8"),
-        "sm110": has_sm("compute_110", "12.9"),
-        "sm120": has_sm("compute_120", "13.0"),
-        "sm121": has_sm("compute_121", "13.0"),
+        "sm103": has_sm("compute_103", "12.9"),
+        "sm110": has_sm("compute_110", "13.0"),
+        "sm120": has_sm("compute_120", "12.8"),
+        "sm121": has_sm("compute_121", "12.9"),
     }
 
 
