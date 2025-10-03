@@ -23,55 +23,59 @@ using tvm::ffi::Tensor;
 
 void rmsnorm(Tensor output, Tensor input, Tensor weight, double eps, bool enable_pdl) {
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
-  CHECK_LAST_DIM_CONTIGUOUS_INPUT(weight);
-  CHECK_DEVICE(input, weight);
-  CHECK_DIM(2, input);   // input: (batch_size, hidden_size)
-  CHECK_DIM(1, weight);  // weight: (hidden_size)
-  TVM_FFI_ICHECK_EQ(input->shape[1], weight->shape[0]);
-  unsigned int batch_size = input->shape[0];
-  unsigned int hidden_size = input->shape[1];
-  TVM_FFI_ICHECK_EQ(output->shape[0], batch_size);
-  TVM_FFI_ICHECK_EQ(output->shape[1], hidden_size);
-  cudaSetDevice(input->device.device_id);
-  const cudaStream_t stream = get_stream(input->device);
-
-  DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(input->dtype, c_type, [&] {
-    cudaError_t status =
-        norm::RMSNorm(static_cast<c_type*>(input->data), static_cast<c_type*>(weight->data),
-                      static_cast<c_type*>(output->data), batch_size, hidden_size,
-                      input->strides[0], output->strides[0], eps, enable_pdl, stream);
-    TVM_FFI_ICHECK(status == cudaSuccess)
-        << "RMSNorm failed with error code " << cudaGetErrorString(status);
-    return true;
-  });
-}
-
-void qk_rmsnorm(Tensor output, Tensor input, Tensor weight, double eps, bool enable_pdl) {
-  CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(output);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(weight);
-  CHECK_DIM(3, input);   // input: (batch_size, num_heads, hidden_size)
-  CHECK_DIM(3, output);  // output: (batch_size, num_heads, hidden_size)
+  CHECK_DEVICE(input, weight);
   CHECK_DIM(1, weight);  // weight: (hidden_size)
-  TVM_FFI_ICHECK_EQ(input->shape[2], weight->shape[0]);
-  unsigned int batch_size = input->shape[0];
-  unsigned int num_heads = input->shape[1];
-  unsigned int hidden_size = input->shape[2];
-  TVM_FFI_ICHECK_EQ(output->shape[0], batch_size);
-  TVM_FFI_ICHECK_EQ(output->shape[1], num_heads);
-  TVM_FFI_ICHECK_EQ(output->shape[2], hidden_size);
 
-  cudaSetDevice(input->device.device_id);
-  const cudaStream_t stream = get_stream(input->device);
-  DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(input->dtype, c_type, [&] {
-    cudaError_t status = norm::QKRMSNorm(
-        static_cast<c_type*>(input->data), static_cast<c_type*>(weight->data),
-        static_cast<c_type*>(output->data), batch_size, num_heads, hidden_size, input->strides[0],
-        input->strides[1], output->strides[0], output->strides[1], eps, enable_pdl, stream);
-    TVM_FFI_ICHECK(status == cudaSuccess)
-        << "QKRMSNorm failed with error code " << cudaGetErrorString(status);
-    return true;
-  });
+  auto input_ndim = input->ndim;
+  if (input_ndim == 2) {
+    // Normal RMSNorm: [batch_size, hidden_size]
+    // Use CTA parallelization for better parallelism
+    CHECK_DIM(2, output);
+    TVM_FFI_ICHECK_EQ(input->shape[1], weight->shape[0]);
+    unsigned int batch_size = input->shape[0];
+    unsigned int hidden_size = input->shape[1];
+    TVM_FFI_ICHECK_EQ(output->shape[0], batch_size);
+    TVM_FFI_ICHECK_EQ(output->shape[1], hidden_size);
+    cudaSetDevice(input->device.device_id);
+    const cudaStream_t stream = get_stream(input->device);
+
+    DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(input->dtype, c_type, [&] {
+      cudaError_t status =
+          norm::RMSNorm(static_cast<c_type*>(input->data), static_cast<c_type*>(weight->data),
+                        static_cast<c_type*>(output->data), batch_size, hidden_size,
+                        input->strides[0], output->strides[0], eps, enable_pdl, stream);
+      TVM_FFI_ICHECK(status == cudaSuccess)
+          << "RMSNorm failed with error code " << cudaGetErrorString(status);
+      return true;
+    });
+  } else if (input_ndim == 3) {
+    // QK RMSNorm: [batch_size, num_heads, head_dim]
+    // Use warp-level parallization
+    CHECK_DIM(3, output);  // output: (batch_size, num_heads, hidden_size)
+    TVM_FFI_ICHECK_EQ(input->shape[2], weight->shape[0]);
+    unsigned int batch_size = input->shape[0];
+    unsigned int num_heads = input->shape[1];
+    unsigned int hidden_size = input->shape[2];
+    TVM_FFI_ICHECK_EQ(output->shape[0], batch_size);
+    TVM_FFI_ICHECK_EQ(output->shape[1], num_heads);
+    TVM_FFI_ICHECK_EQ(output->shape[2], hidden_size);
+
+    cudaSetDevice(input->device.device_id);
+    const cudaStream_t stream = get_stream(input->device);
+    DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(input->dtype, c_type, [&] {
+      cudaError_t status = norm::QKRMSNorm(
+          static_cast<c_type*>(input->data), static_cast<c_type*>(weight->data),
+          static_cast<c_type*>(output->data), batch_size, num_heads, hidden_size, input->strides[0],
+          input->strides[1], output->strides[0], output->strides[1], eps, enable_pdl, stream);
+      TVM_FFI_ICHECK(status == cudaSuccess)
+          << "QKRMSNorm failed with error code " << cudaGetErrorString(status);
+      return true;
+    });
+  } else {
+    TVM_FFI_ICHECK(false) << "Unsupported input dimension: " << input_ndim;
+  }
 }
 
 void fused_add_rmsnorm(Tensor input, Tensor residual, Tensor weight, double eps, bool enable_pdl) {

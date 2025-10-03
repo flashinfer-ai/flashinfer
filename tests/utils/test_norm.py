@@ -117,9 +117,9 @@ def test_qknorm(
     y_ref = llama_rms_norm(x, w)
     if specify_out:
         y = torch.empty_like(x)
-        flashinfer.norm.qk_rmsnorm(x, w, out=y, enable_pdl=enable_pdl)
+        flashinfer.norm.rmsnorm(x, w, out=y, enable_pdl=enable_pdl)
     else:
-        y = flashinfer.norm.qk_rmsnorm(x, w, enable_pdl=enable_pdl)
+        y = flashinfer.norm.rmsnorm(x, w, enable_pdl=enable_pdl)
 
     torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
 
