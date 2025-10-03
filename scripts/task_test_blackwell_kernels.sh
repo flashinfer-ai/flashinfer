@@ -35,43 +35,44 @@ if [ -f "./pytest.ini" ]; then
     fi
 fi
 
-echo "Finding test subdirectories in tests/ directory..."
+echo "Finding all test_*.py files in tests/ directory..."
 
-# Find all subdirectories that contain test_*.py files
-ALL_TEST_DIRS=$(find tests/ -name "test_*.py" -type f -exec dirname {} \; | sort -u)
+# Find all test_*.py files
+ALL_TEST_FILES=$(find tests/ -name "test_*.py" -type f | sort)
 
-# Filter out excluded directories
-TEST_DIRS=""
-for test_dir in $ALL_TEST_DIRS; do
-    exclude_dir=false
+# Filter out excluded files based on directory exclusions
+TEST_FILES=""
+for test_file in $ALL_TEST_FILES; do
+    exclude_file=false
+    test_dir=$(dirname "$test_file")
+
     for excluded_dir in $EXCLUDED_DIRS; do
         excluded_dir=$(echo "$excluded_dir" | xargs)  # trim whitespace
         if [ -n "$excluded_dir" ]; then
-            # Check if this directory should be excluded
+            # Check if this file's directory should be excluded
             if [[ "$test_dir" == *"/$excluded_dir" ]] || [[ "$test_dir" == "tests/$excluded_dir" ]] || [[ "$test_dir" == *"/$excluded_dir/"* ]]; then
-                exclude_dir=true
+                exclude_file=true
                 break
             fi
         fi
     done
 
-    if [ "$exclude_dir" = false ]; then
-        TEST_DIRS="$TEST_DIRS $test_dir"
+    if [ "$exclude_file" = false ]; then
+        TEST_FILES="$TEST_FILES $test_file"
     fi
 done
 
 # Clean up whitespace
-TEST_DIRS=$(echo "$TEST_DIRS" | xargs)
+TEST_FILES=$(echo "$TEST_FILES" | xargs)
 
-if [ -z "$TEST_DIRS" ]; then
-    echo "No test directories found in tests/ directory (after exclusions)"
+if [ -z "$TEST_FILES" ]; then
+    echo "No test files found in tests/ directory (after exclusions)"
     exit 1
 fi
 
-echo "Found test directories:"
-for test_dir in $TEST_DIRS; do
-    test_count=$(find "$test_dir" -maxdepth 1 -name "test_*.py" -type f | wc -l)
-    echo "  $test_dir ($test_count test files)"
+echo "Found test files:"
+for test_file in $TEST_FILES; do
+    echo "  $test_file"
 done
 echo ""
 
@@ -84,81 +85,44 @@ if [ "$DRY_RUN" == "true" ]; then
     echo "DRY RUN: Tests that would be executed"
     echo "=========================================="
 
-    for test_dir in $TEST_DIRS; do
-        if [ "$test_dir" == "tests/utils" ] || [ "$test_dir" == "tests/comm" ]; then
-            # Run utils and comm tests individually for debugging
-            echo ""
-            echo "📝 NOTE: $test_dir will be run individually for debugging"
-            test_files=$(find "$test_dir" -maxdepth 1 -name "test_*.py" -type f | sort)
-            for test_file in $test_files; do
-                TOTAL_TESTS=$((TOTAL_TESTS + 1))
-                echo "$TOTAL_TESTS. pytest $test_file"
-            done
-        else
-            # Run other directories as groups
-            TOTAL_TESTS=$((TOTAL_TESTS + 1))
-            test_count=$(find "$test_dir" -maxdepth 1 -name "test_*.py" -type f | wc -l)
-            echo "$TOTAL_TESTS. pytest $test_dir  (contains $test_count test files)"
-        fi
+    for test_file in $TEST_FILES; do
+        TOTAL_TESTS=$((TOTAL_TESTS + 1))
+        echo "$TOTAL_TESTS. pytest $PYTEST_FLAGS $test_file"
     done
 
     echo ""
     echo "=========================================="
     echo "DRY RUN SUMMARY"
     echo "=========================================="
-    echo "Total test commands that would be executed: $TOTAL_TESTS"
+    echo "Total test files that would be executed: $TOTAL_TESTS"
     echo ""
     echo "To actually run the tests, execute without --dry-run:"
     echo "  $0"
     echo "Or set DRY_RUN=false $0"
 else
-    for test_dir in $TEST_DIRS; do
-        if [ "$test_dir" == "tests/utils" ] || [ "$test_dir" == "tests/comm" ]; then
-            # Run utils and comm tests individually for debugging
-            echo "=========================================="
-            echo "Running $test_dir individually for debugging"
-            echo "=========================================="
+    for test_file in $TEST_FILES; do
+        echo "=========================================="
+        echo "Running: pytest $PYTEST_FLAGS $test_file"
+        echo "=========================================="
 
-            test_files=$(find "$test_dir" -maxdepth 1 -name "test_*.py" -type f | sort)
-            for test_file in $test_files; do
-                echo "Running: pytest $test_file"
-                TOTAL_TESTS=$((TOTAL_TESTS + 1))
+        TOTAL_TESTS=$((TOTAL_TESTS + 1))
 
-                if pytest "$test_file" $PYTEST_FLAGS; then
-                    echo "✅ PASSED: $test_file"
-                    PASSED_TESTS=$((PASSED_TESTS + 1))
-                else
-                    echo "❌ FAILED: $test_file"
-                    FAILED_TESTS="$FAILED_TESTS\n  - $test_file"
-                    EXIT_CODE=1
-                fi
-                echo ""
-            done
+        if pytest $PYTEST_FLAGS "$test_file"; then
+            echo "✅ PASSED: $test_file"
+            PASSED_TESTS=$((PASSED_TESTS + 1))
         else
-            # Run other directories as groups
-            echo "=========================================="
-            echo "Running: pytest $test_dir"
-            echo "=========================================="
-
-            TOTAL_TESTS=$((TOTAL_TESTS + 1))
-
-            if pytest "$test_dir" $PYTEST_FLAGS; then
-                echo "✅ PASSED: $test_dir"
-                PASSED_TESTS=$((PASSED_TESTS + 1))
-            else
-                echo "❌ FAILED: $test_dir"
-                FAILED_TESTS="$FAILED_TESTS\n  - $test_dir"
-                EXIT_CODE=1
-            fi
-
-            echo ""
+            echo "❌ FAILED: $test_file"
+            FAILED_TESTS="$FAILED_TESTS\n  - $test_file"
+            EXIT_CODE=1
         fi
+
+        echo ""
     done
 
     echo "=========================================="
     echo "TEST SUMMARY"
     echo "=========================================="
-    echo "Total test commands executed: $TOTAL_TESTS"
+    echo "Total test files executed: $TOTAL_TESTS"
     echo "Passed: $PASSED_TESTS"
     echo "Failed: $((TOTAL_TESTS - PASSED_TESTS))"
 

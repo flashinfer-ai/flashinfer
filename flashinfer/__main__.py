@@ -166,10 +166,11 @@ def list_cubins_cmd():
     """List downloaded cubins"""
     status = get_artifacts_status()
     table_data = []
-    for name, exists in status:
+
+    for file_name, exists in status:
         status_str = "Downloaded" if exists else "Missing"
         color = "green" if exists else "red"
-        table_data.append([name, click.style(status_str, fg=color)])
+        table_data.append([file_name, click.style(status_str, fg=color)])
 
     click.echo(tabulate(table_data, headers=["Cubin", "Status"], tablefmt="github"))
     click.secho("", fg="white")
