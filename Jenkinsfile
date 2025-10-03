@@ -38,16 +38,11 @@
 
 import org.jenkinsci.plugins.pipeline.modeldefinition.Utils
 
-// Read docker tags from configuration file
-def dockerTags = readYaml file: 'ci/docker-tags.yml'
-
-// These are set at runtime from data in ci/docker-tags.yml, update
-// image tags in that file
-// Now supports multiple CUDA versions
-docker_run_cu126 = "bash ci/bash.sh flashinfer/flashinfer-ci-cu126:${dockerTags['flashinfer/flashinfer-ci-cu126']}"
-docker_run_cu128 = "bash ci/bash.sh flashinfer/flashinfer-ci-cu128:${dockerTags['flashinfer/flashinfer-ci-cu128']}"
-docker_run_cu129 = "bash ci/bash.sh flashinfer/flashinfer-ci-cu129:${dockerTags['flashinfer/flashinfer-ci-cu129']}"
-docker_run_cu130 = "bash ci/bash.sh flashinfer/flashinfer-ci-cu130:${dockerTags['flashinfer/flashinfer-ci-cu130']}"
+def getDockerRun(cuda_version) {
+  def dockerTags = readYaml file: 'ci/docker-tags.yml'
+  def image_name = "flashinfer/flashinfer-ci-${cuda_version}"
+  return "bash ci/bash.sh ${image_name}:${dockerTags[image_name]}"
+}
 
 def per_exec_ws(folder) {
   return "workspace/exec_${env.EXECUTOR_NUMBER}/" + folder
@@ -185,18 +180,7 @@ def run_with_spot_retry(spot_node_type, on_demand_node_type, test_name, test_clo
 def run_unittest_CPU_AOT_COMPILE(node_type, cuda_version) {
   echo "Running CPU AOT Compile Unittest with CUDA ${cuda_version}"
 
-  def docker_run = ""
-  if (cuda_version == "cu126") {
-    docker_run = docker_run_cu126
-  } else if (cuda_version == "cu128") {
-    docker_run = docker_run_cu128
-  } else if (cuda_version == "cu129") {
-    docker_run = docker_run_cu129
-  } else if (cuda_version == "cu130") {
-    docker_run = docker_run_cu130
-  } else {
-    error("Unknown CUDA version: ${cuda_version}")
-  }
+  def docker_run = getDockerRun(cuda_version)
 
   if (node_type.contains('SPOT')) {
     // Add timeout only for spot instances - node allocation only
@@ -243,16 +227,7 @@ def run_unittest_CPU_AOT_COMPILE(node_type, cuda_version) {
 def shard_run_unittest_GPU(node_type, shard_id, cuda_version) {
   echo "Running unittest on ${node_type}, shard ${shard_id}, CUDA ${cuda_version}"
 
-  def docker_run = ""
-  if (cuda_version == "cu126") {
-    docker_run = docker_run_cu126
-  } else if (cuda_version == "cu128") {
-    docker_run = docker_run_cu128
-  } else if (cuda_version == "cu129") {
-    docker_run = docker_run_cu129
-  } else {
-    error("Unknown CUDA version: ${cuda_version}")
-  }
+  def docker_run = getDockerRun(cuda_version)
 
   if (node_type.contains('SPOT')) {
     // Add timeout only for spot instances - node allocation only
