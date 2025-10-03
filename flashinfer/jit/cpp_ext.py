@@ -171,6 +171,7 @@ def generate_ninja_build_for_op(
         "-L$cuda_home/lib64",
         "-L$cuda_home/lib64/stubs",
         "-lcudart",
+        "-lcuda",
     ]
 
     env_extra_ldflags = parse_env_flags("FLASHINFER_EXTRA_LDFLAGS")

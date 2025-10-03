@@ -148,7 +148,6 @@ def gen_cutlass_fused_moe_module(
         ],
         extra_cuda_cflags=nvcc_flags,
         extra_cflags=["-DFAST_BUILD"] if use_fast_build else [],
-        extra_ldflags=["-lcuda"],
         extra_include_paths=[
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "include",
@@ -214,7 +213,6 @@ def gen_trtllm_gen_fused_moe_sm100_module() -> JitSpec:
             f'-DTLLM_GEN_BMM_CUBIN_PATH=\\"{ArtifactPath.TRTLLM_GEN_BMM}\\"',
         ]
         + nvcc_flags,
-        extra_ldflags=["-lcuda"],
         extra_include_paths=[
             # link "include" sub-directory in cache
             jit_env.FLASHINFER_CUBIN_DIR / include_path,
