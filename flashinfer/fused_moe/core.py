@@ -1298,8 +1298,11 @@ def get_trtllm_moe_sm100_module():
     ) -> torch.Tensor:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(hidden_states.device)
+        output = torch.empty(
+            hidden_states.shape, dtype=torch.bfloat16, device=hidden_states.device
+        )
         # Call the C++ function
-        output = moe_op.trtllm_fp8_per_tensor_scale_moe(
+        moe_op.trtllm_fp8_per_tensor_scale_moe(
             routing_logits,
             routing_bias,
             hidden_states,
@@ -1308,6 +1311,7 @@ def get_trtllm_moe_sm100_module():
             output1_scales_gate_scalar,
             gemm2_weights,
             output2_scales_scalar,
+            output,
             num_experts,
             top_k,
             n_group,
@@ -1576,7 +1580,7 @@ def get_trtllm_moe_sm100_module():
         )
 
         # Call the C++ function for block scale MoE
-        output = moe_op.trtllm_fp4_block_scale_moe(
+        intermediate_output = moe_op.trtllm_fp4_block_scale_moe(
             routing_logits,
             topk_ids,
             expert_weights,
@@ -1611,12 +1615,15 @@ def get_trtllm_moe_sm100_module():
             output,
             tactic,
         )
-        if isinstance(output, tvm_ffi.Array):
-            output = list(output)
-            for i in range(len(output)):
-                if isinstance(output[i], tvm_ffi.Tensor):
-                    output[i] = torch.from_dlpack(output[i])
-        return output
+        if do_finalize:
+            return [output]
+        else:
+            gemm2_output, expanded_idx_to_permuted_idx = intermediate_output
+            return [
+                torch.from_dlpack(gemm2_output),
+                expert_weights,
+                torch.from_dlpack(expanded_idx_to_permuted_idx),
+            ]
 
     @register_fake_op("flashinfer::trtllm_fp4_block_scale_moe")
     def _fake_trtllm_fp4_block_scale_moe(

@@ -37,15 +37,16 @@ using tensorrt_llm::kernels::trtllmgen_moe::Routing::RoutingMethodType;
 using tvm::ffi::Array;
 using tvm::ffi::Optional;
 
-TensorView trtllm_fp8_per_tensor_scale_moe_launcher(
+void trtllm_fp8_per_tensor_scale_moe_launcher(
     TensorView routing_logits, Optional<TensorView> routing_bias, TensorView hidden_states,
     TensorView gemm1_weights, TensorView output1_scales_scalar,
     TensorView output1_scales_gate_scalar, TensorView gemm2_weights,
-    TensorView output2_scales_scalar, int64_t const num_experts, int64_t const top_k,
-    int64_t const n_group, int64_t const topk_group, int64_t const intermediate_size,
-    int64_t const local_expert_offset, int64_t const local_num_experts,
-    double const routed_scaling_factor, bool const use_routing_scales_on_input,
-    int64_t const tile_tokens_dim, int64_t const routing_method_type, bool enable_pdl) {
+    TensorView output2_scales_scalar, TensorView output, int64_t const num_experts,
+    int64_t const top_k, int64_t const n_group, int64_t const topk_group,
+    int64_t const intermediate_size, int64_t const local_expert_offset,
+    int64_t const local_num_experts, double const routed_scaling_factor,
+    bool const use_routing_scales_on_input, int64_t const tile_tokens_dim,
+    int64_t const routing_method_type, bool enable_pdl) {
   static const std::tuple<int, int> device_props = [hidden_states] {
     int major, minor;
     cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor,
@@ -224,8 +225,10 @@ TensorView trtllm_fp8_per_tensor_scale_moe_launcher(
       << "output2_scales_scalar has incorrect dim 0.";
 
   // allocate output
-  Tensor output =
-      alloc_tensor({args.num_tokens, args.hidden_size}, dl_bfloat16, hidden_states->device);
+  TVM_FFI_ICHECK_EQ(output->shape[0], args.num_tokens);
+  TVM_FFI_ICHECK_EQ(output->shape[1], args.hidden_size);
+  CHECK_INPUT_TYPE(output, dl_bfloat16);
+  CHECK_DEVICE(output, hidden_states);
 
   // setup workspace
   workspace.total_num_padded_tokens = static_cast<int*>(total_num_padded_tokens->data);
@@ -272,23 +275,22 @@ TensorView trtllm_fp8_per_tensor_scale_moe_launcher(
   cudaStream_t moe_stream = get_stream(hidden_states->device);
   moe_runner.run(args, workspace, hidden_states->device.device_id, moe_stream, moeConfigIndex,
                  enable_pdl);
-  return output;
 }
 
-TensorView trtllm_fp8_per_tensor_scale_moe(
+void trtllm_fp8_per_tensor_scale_moe(
     TensorView routing_logits, Optional<TensorView> routing_bias, TensorView hidden_states,
     TensorView gemm1_weights, TensorView output1_scales_scalar,
     TensorView output1_scales_gate_scalar, TensorView gemm2_weights,
-    TensorView output2_scales_scalar, int64_t num_experts, int64_t top_k, int64_t n_group,
-    int64_t topk_group, int64_t intermediate_size, int64_t local_expert_offset,
+    TensorView output2_scales_scalar, TensorView output, int64_t num_experts, int64_t top_k,
+    int64_t n_group, int64_t topk_group, int64_t intermediate_size, int64_t local_expert_offset,
     int64_t local_num_experts, double routed_scaling_factor, bool use_routing_scales_on_input,
     int64_t tile_tokens_dim, int64_t routing_method_type, bool enable_pdl) {
   auto dtype = hidden_states->dtype;
   if (dtype == dl_float16 || dtype == dl_bfloat16 || dtype == dl_float8_e4m3fn) {
-    return trtllm_fp8_per_tensor_scale_moe_launcher(
+    trtllm_fp8_per_tensor_scale_moe_launcher(
         routing_logits, routing_bias, hidden_states, gemm1_weights, output1_scales_scalar,
-        output1_scales_gate_scalar, gemm2_weights, output2_scales_scalar, num_experts, top_k,
-        n_group, topk_group, intermediate_size, local_expert_offset, local_num_experts,
+        output1_scales_gate_scalar, gemm2_weights, output2_scales_scalar, output, num_experts,
+        top_k, n_group, topk_group, intermediate_size, local_expert_offset, local_num_experts,
         routed_scaling_factor, use_routing_scales_on_input, tile_tokens_dim, routing_method_type,
         enable_pdl);
   } else {
@@ -591,7 +593,7 @@ void trtllm_fp8_block_scale_moe(TensorView routing_logits, Optional<TensorView> 
     int64_t moeConfigIndex = mRunner->getDefaultValidConfigIndex(
         top_k, hidden_size, intermediate_size, local_num_experts, num_tokens);
 
-    return trtllm_fp8_block_scale_moe_launcher(
+    trtllm_fp8_block_scale_moe_launcher(
         routing_logits, routing_bias, hidden_states, hidden_states_scale, gemm1_weights,
         gemm1_weights_scale, gemm2_weights, gemm2_weights_scale, output, num_experts, top_k,
         n_group, topk_group, intermediate_size, local_expert_offset, local_num_experts,
@@ -604,7 +606,7 @@ void trtllm_fp8_block_scale_moe(TensorView routing_logits, Optional<TensorView> 
 
 // TODO(siyuan): This launcher supports flexible weight and activation types.
 // We should cleanup other launchers and only use this one in the future.
-Array<TensorView> trtllm_fp4_block_scale_moe_launcher(
+Array<Tensor> trtllm_fp4_block_scale_moe_launcher(
     Optional<TensorView> routing_logits, TensorView expert_indices, TensorView expert_weights,
     Optional<TensorView> routing_bias, TensorView hidden_states,
     Optional<TensorView> hidden_states_scale, TensorView gemm1_weights,
@@ -795,7 +797,7 @@ Array<TensorView> trtllm_fp4_block_scale_moe_launcher(
                                      dtype_act == btg::Dtype::Bfloat16 ? dl_bfloat16 : dl_uint8,
                                      hidden_states->device);
 
-  Optional<TensorView> gemm1_output_scale = std::nullopt;
+  Optional<Tensor> gemm1_output_scale = std::nullopt;
   if (dtype_act == btg::Dtype::E2m1 || dtype_act == btg::Dtype::MxE4m3) {
     int64_t sf_size = tensorrt_llm::computeSwizzledLayoutSFSize(max_num_padded_tokens,
                                                                 intermediate_size / sf_vec_size);
@@ -1013,12 +1015,12 @@ Array<TensorView> trtllm_fp4_block_scale_moe_launcher(
                  enable_pdl);
 
   if (!do_finalize) {
-    return {gemm2_output, expert_weights, expanded_idx_to_permuted_idx};
+    return {gemm2_output, expanded_idx_to_permuted_idx};
   }
-  return {output};
+  return {};
 }
 
-Array<TensorView> trtllm_fp4_block_scale_moe(
+Array<Tensor> trtllm_fp4_block_scale_moe(
     Optional<TensorView> routing_logits, TensorView topk_ids, TensorView expert_weights,
     Optional<TensorView> routing_bias, TensorView hidden_states,
     Optional<TensorView> hidden_states_scale, TensorView gemm1_weights,
