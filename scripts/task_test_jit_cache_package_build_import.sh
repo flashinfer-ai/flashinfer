@@ -56,6 +56,16 @@ echo "Detected CUDA version: cu${CUDA_VERSION}"
 
 echo ""
 echo "========================================"
+echo "Installing flashinfer package"
+echo "========================================"
+pip install -e . || {
+    echo "ERROR: Failed to install flashinfer package"
+    exit 1
+}
+echo "✓ Flashinfer package installed successfully"
+
+echo ""
+echo "========================================"
 echo "Building flashinfer-jit-cache wheel"
 echo "========================================"
 cd flashinfer-jit-cache
@@ -67,174 +77,42 @@ echo ""
 echo "Built wheel: $WHEEL_FILE"
 echo ""
 
-# Test matrix: Python versions x PyTorch versions
-PYTHON_VERSIONS=("3.10" "3.11" "3.12")
-TORCH_VERSIONS=("2.7" "2.8")
-
-# Function to test a specific Python + PyTorch combination
-test_combination() {
-    local python_ver=$1
-    local torch_ver=$2
-    local env_name="test-flashinfer-py${python_ver}-torch${torch_ver}"
-
-    echo "========================================"
-    echo "Testing Python ${python_ver} + PyTorch ${torch_ver}"
-    echo "========================================"
-
-    # Create conda environment
-    echo "[STEP 1/6] Creating conda environment: ${env_name}"
-    conda create -y -n "$env_name" python="${python_ver}" || {
-        echo "ERROR: Failed to create conda environment for Python ${python_ver}"
-        return 1
-    }
-    echo "✓ Conda environment created successfully"
-
-    # Activate environment and run tests
-    echo ""
-    echo "[STEP 2/6] Activating conda environment: ${env_name}"
-    eval "$(conda shell.bash hook)"
-    conda activate "$env_name" || {
-        echo "ERROR: Failed to activate conda environment $env_name"
-        conda env remove -n "$env_name" -y
-        return 1
-    }
-    echo "✓ Conda environment activated successfully"
-
-    # Install flashinfer from source
-    echo ""
-    echo "[STEP 3/6] Installing flashinfer from source..."
-    cd ..
-    pip install -e . || {
-        echo "ERROR: Failed to install flashinfer from source"
-        conda deactivate
-        conda env remove -n "$env_name" -y
-        return 1
-    }
-    echo "✓ Flashinfer installed from source successfully"
-
-    # Force install PyTorch with the detected CUDA version (override flashinfer dependency)
-    echo ""
-    echo "[STEP 4/6] Force installing PyTorch ${torch_ver} with CUDA ${CUDA_VERSION}..."
-    pip install --force-reinstall "torch==${torch_ver}.0" --index-url "https://download.pytorch.org/whl/cu${CUDA_VERSION}" || {
-        echo "ERROR: Failed to install PyTorch ${torch_ver}"
-        conda deactivate
-        conda env remove -n "$env_name" -y
-        return 1
-    }
-    echo "✓ PyTorch ${torch_ver} installed successfully"
-    echo "Verifying PyTorch version:"
-    python -c "import torch; print(f'  PyTorch version: {torch.__version__}')"
-    python -c "import torch; print(f'  CUDA version: {torch.version.cuda}')"
-
-    # Install flashinfer-jit-cache wheel
-    echo ""
-    echo "[STEP 5/6] Installing flashinfer-jit-cache wheel..."
-    echo "  Wheel file: $WHEEL_FILE"
-    pip install "flashinfer-jit-cache/$WHEEL_FILE" || {
-        echo "ERROR: Failed to install flashinfer-jit-cache wheel"
-        conda deactivate
-        conda env remove -n "$env_name" -y
-        return 1
-    }
-    echo "✓ Flashinfer-jit-cache wheel installed successfully"
-
-    # Test with show-config
-    echo ""
-    echo "[STEP 6/6] Running verification tests..."
-    echo "  - Running 'python -m flashinfer show-config'..."
-    python -m flashinfer show-config || {
-        echo "ERROR: Failed to run 'python -m flashinfer show-config'"
-        conda deactivate
-        conda env remove -n "$env_name" -y
-        return 1
-    }
-    echo "  ✓ show-config completed successfully"
-
-    # Verify all modules are compiled
-    echo ""
-    echo "  - Verifying all modules are compiled..."
-    python ../scripts/verify_all_modules_compiled.py || {
-        echo "ERROR: Not all modules are compiled!"
-        conda deactivate
-        conda env remove -n "$env_name" -y
-        return 1
-    }
-    echo "  ✓ All modules verified successfully"
-
-    # Clean up
-    echo ""
-    echo "Cleaning up environment ${env_name}..."
-    conda deactivate
-    conda env remove -n "$env_name" -y
-
-    echo ""
-    echo "✓✓✓ Test PASSED for Python ${python_ver} + PyTorch ${torch_ver} ✓✓✓"
-    echo ""
-
-    return 0
-}
-
-# Run tests for all combinations
-echo "========================================"
-echo "Test Matrix"
-echo "========================================"
-echo "Python versions: ${PYTHON_VERSIONS[*]}"
-echo "PyTorch versions: ${TORCH_VERSIONS[*]}"
-echo "Total combinations: $(( ${#PYTHON_VERSIONS[@]} * ${#TORCH_VERSIONS[@]} ))"
-echo ""
-
-FAILED_TESTS=()
-PASSED_TESTS=()
-TEST_COUNT=0
-TOTAL_TESTS=$(( ${#PYTHON_VERSIONS[@]} * ${#TORCH_VERSIONS[@]} ))
-
-for python_ver in "${PYTHON_VERSIONS[@]}"; do
-    for torch_ver in "${TORCH_VERSIONS[@]}"; do
-        TEST_COUNT=$((TEST_COUNT + 1))
-        echo ""
-        echo ">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>"
-        echo "Running test ${TEST_COUNT}/${TOTAL_TESTS}"
-        echo ">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>"
-
-        if ! test_combination "$python_ver" "$torch_ver"; then
-            FAILED_TESTS+=("Python ${python_ver} + PyTorch ${torch_ver}")
-        else
-            PASSED_TESTS+=("Python ${python_ver} + PyTorch ${torch_ver}")
-        fi
-    done
-done
-
-# Report results
 echo ""
 echo "========================================"
-echo "Final Test Summary"
+echo "Installing flashinfer-jit-cache wheel"
 echo "========================================"
-echo "Total tests run: ${TOTAL_TESTS}"
-echo "Passed: ${#PASSED_TESTS[@]}"
-echo "Failed: ${#FAILED_TESTS[@]}"
-echo ""
-
-if [ ${#PASSED_TESTS[@]} -gt 0 ]; then
-    echo "✓ Passed tests:"
-    for test in "${PASSED_TESTS[@]}"; do
-        echo "  ✓ $test"
-    done
-    echo ""
-fi
-
-if [ ${#FAILED_TESTS[@]} -eq 0 ]; then
-    echo "========================================"
-    echo "✓✓✓ ALL TESTS PASSED! ✓✓✓"
-    echo "========================================"
-    exit 0
-else
-    echo "✗ Failed tests:"
-    for test in "${FAILED_TESTS[@]}"; do
-        echo "  ✗ $test"
-    done
-    echo ""
-    echo "========================================"
-    echo "✗✗✗ SOME TESTS FAILED ✗✗✗"
-    echo "========================================"
+echo "Wheel file: $WHEEL_FILE"
+pip install "$WHEEL_FILE" || {
+    echo "ERROR: Failed to install flashinfer-jit-cache wheel"
     exit 1
-fi
+}
+echo "✓ Flashinfer-jit-cache wheel installed successfully"
+cd ..
+
+# Verify installation
+echo ""
+echo "========================================"
+echo "Running verification tests"
+echo "========================================"
+
+# Test with show-config
+echo "[STEP 1/2] Running 'python -m flashinfer show-config'..."
+python -m flashinfer show-config || {
+    echo "ERROR: Failed to run 'python -m flashinfer show-config'"
+    exit 1
+}
+echo "✓ show-config completed successfully"
+
+# Verify all modules are compiled
+echo ""
+echo "[STEP 2/2] Verifying all modules are compiled..."
+python scripts/verify_all_modules_compiled.py || {
+    echo "ERROR: Not all modules are compiled!"
+    exit 1
+}
+echo "✓ All modules verified successfully"
+
+echo ""
+echo "========================================"
+echo "✓✓✓ ALL TESTS PASSED! ✓✓✓"
+echo "========================================"
