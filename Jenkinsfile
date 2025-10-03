@@ -37,13 +37,17 @@
 //
 
 import org.jenkinsci.plugins.pipeline.modeldefinition.Utils
-// These are set at runtime from data in ci/jenkins/docker-images.yml, update
+
+// Read docker tags from configuration file
+def dockerTags = readYaml file: 'ci/docker-tags.yml'
+
+// These are set at runtime from data in ci/docker-tags.yml, update
 // image tags in that file
 // Now supports multiple CUDA versions
-docker_run_cu126 = "bash ci/bash.sh flashinfer/flashinfer-ci-cu126:latest"
-docker_run_cu128 = "bash ci/bash.sh flashinfer/flashinfer-ci-cu128:latest"
-docker_run_cu129 = "bash ci/bash.sh flashinfer/flashinfer-ci-cu129:latest"
-docker_run_cu130 = "bash ci/bash.sh flashinfer/flashinfer-ci-cu130:latest"
+docker_run_cu126 = "bash ci/bash.sh flashinfer/flashinfer-ci-cu126:${dockerTags['flashinfer/flashinfer-ci-cu126']}"
+docker_run_cu128 = "bash ci/bash.sh flashinfer/flashinfer-ci-cu128:${dockerTags['flashinfer/flashinfer-ci-cu128']}"
+docker_run_cu129 = "bash ci/bash.sh flashinfer/flashinfer-ci-cu129:${dockerTags['flashinfer/flashinfer-ci-cu129']}"
+docker_run_cu130 = "bash ci/bash.sh flashinfer/flashinfer-ci-cu130:${dockerTags['flashinfer/flashinfer-ci-cu130']}"
 
 def per_exec_ws(folder) {
   return "workspace/exec_${env.EXECUTOR_NUMBER}/" + folder
