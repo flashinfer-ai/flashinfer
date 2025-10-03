@@ -22,16 +22,15 @@ from setuptools import build_meta as _orig
 # Add parent directory to path to import flashinfer modules
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-# add flashinfer._build_meta if not there, it should exist in Path(__file__).parent.parent / "flashinfer" / "_build_meta.py"
+# add flashinfer._build_meta, always override to ensure version is up-to-date
 build_meta_file = Path(__file__).parent.parent / "flashinfer" / "_build_meta.py"
-if not build_meta_file.exists():
-    version_file = Path(__file__).parent.parent / "version.txt"
-    if version_file.exists():
-        with open(version_file, "r") as f:
-            version = f.read().strip()
-    with open(build_meta_file, "w") as f:
-        f.write('"""Build metadata for flashinfer package."""\n')
-        f.write(f'__version__ = "{version}"\n')
+version_file = Path(__file__).parent.parent / "version.txt"
+if version_file.exists():
+    with open(version_file, "r") as f:
+        version = f.read().strip()
+with open(build_meta_file, "w") as f:
+    f.write('"""Build metadata for flashinfer package."""\n')
+    f.write(f'__version__ = "{version}"\n')
 
 
 def get_version():
@@ -122,35 +121,6 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
     return result
 
 
-def build_sdist(sdist_directory, config_settings=None):
-    """Build source distribution with custom handling."""
-    print("Building flashinfer-jit-cache source distribution...")
-
-    # Compile AOT modules for source distribution
-    aot_package_dir = Path(__file__).parent / "flashinfer_jit_cache" / "jit_cache"
-    aot_package_dir.mkdir(parents=True, exist_ok=True)
-
-    try:
-        compile_jit_cache(aot_package_dir)
-    except Exception as e:
-        print(f"Warning: Failed to compile AOT modules for sdist: {e}")
-        print("The source distribution will not include pre-compiled modules")
-
-    # Create build metadata file with version information
-    package_dir = Path(__file__).parent / "flashinfer_jit_cache"
-    build_meta_file = package_dir / "_build_meta.py"
-    version = get_version()
-
-    with open(build_meta_file, "w") as f:
-        f.write('"""Build metadata for flashinfer-jit-cache package."""\n')
-        f.write(f'__version__ = "{version}"\n')
-
-    print(f"Created build metadata file with version {version}")
-
-    # Build the sdist using setuptools
-    return _orig.build_sdist(sdist_directory, config_settings)
-
-
 def build_editable(wheel_directory, config_settings=None, metadata_directory=None):
     """Build editable install with custom AOT module compilation."""
     print("Building flashinfer-jit-cache in editable mode...")
@@ -169,7 +139,6 @@ def build_editable(wheel_directory, config_settings=None, metadata_directory=Non
 
 # Export the required interface
 get_requires_for_build_wheel = _orig.get_requires_for_build_wheel
-get_requires_for_build_sdist = _orig.get_requires_for_build_sdist
 prepare_metadata_for_build_wheel = _orig.prepare_metadata_for_build_wheel
 get_requires_for_build_editable = getattr(
     _orig, "get_requires_for_build_editable", None
