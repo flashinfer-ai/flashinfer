@@ -26,7 +26,14 @@ from .artifacts import (
 )
 from .jit import clear_cache_dir, jit_spec_registry
 from .jit.cubin_loader import FLASHINFER_CUBINS_REPOSITORY
-from .jit.env import FLASHINFER_CACHE_DIR, FLASHINFER_CUBIN_DIR
+from .jit.env import (
+    FLASHINFER_CACHE_DIR,
+    FLASHINFER_CUBIN_DIR,
+    get_cutlass_include_dirs,
+    get_spdlog_include_dir,
+    get_nvshmem_include_dirs,
+    get_nvshmem_lib_dirs,
+)
 from .jit.core import current_compilation_context
 from .jit.cpp_ext import get_cuda_path, get_cuda_version
 
@@ -76,6 +83,10 @@ env_variables = {
     "FLASHINFER_CUDA_ARCH_LIST": current_compilation_context.TARGET_CUDA_ARCHS,
     "FLASHINFER_CUDA_VERSION": get_cuda_version(),
     "FLASHINFER_CUBINS_REPOSITORY": FLASHINFER_CUBINS_REPOSITORY,
+    "FLASHINFER_CUTLASS_INCLUDE_PATH": get_cutlass_include_dirs(),
+    "FLASHINFER_SPDLOG_INCLUDE_PATH": get_spdlog_include_dir(),
+    "FLASHINFER_NVSHMEM_INCLUDE_PATH": get_nvshmem_include_dirs(),
+    "FLASHINFER_NVSHMEM_LIBRARY_PATH": get_nvshmem_lib_dirs(),
 }
 try:
     env_variables["CUDA_HOME"] = get_cuda_path()

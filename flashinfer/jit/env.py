@@ -74,15 +74,39 @@ FLASHINFER_INCLUDE_DIR = _package_root / "data" / "include"
 FLASHINFER_CSRC_DIR = _package_root / "data" / "csrc"
 # FLASHINFER_SRC_DIR = _package_root / "data" / "src"
 FLASHINFER_AOT_DIR = _package_root / "data" / "aot"
-CUTLASS_INCLUDE_DIRS = [
-    _package_root / "data" / "cutlass" / "include",
-    _package_root / "data" / "cutlass" / "tools" / "util" / "include",
-]
-SPDLOG_INCLUDE_DIR = _package_root / "data" / "spdlog" / "include"
+
+
+def get_cutlass_include_dirs():
+    paths = os.environ.get("FLASHINFER_CUTLASS_INCLUDE_PATH")
+    if paths is not None:
+        return [pathlib.Path(p) for p in paths.split(os.pathsep) if p]
+
+    # Fall back to default paths
+    return [
+        _package_root / "data" / "cutlass" / "include",
+        _package_root / "data" / "cutlass" / "tools" / "util" / "include",
+    ]
+
+
+def get_spdlog_include_dir():
+    path = os.environ.get("FLASHINFER_SPDLOG_INCLUDE_PATH")
+    if path is not None:
+        return pathlib.Path(path)
+
+    # Fall back to default path
+    return _package_root / "data" / "spdlog" / "include"
+
+
+# For backward compatibility, keep these as properties
+CUTLASS_INCLUDE_DIRS = get_cutlass_include_dirs()
+SPDLOG_INCLUDE_DIR = get_spdlog_include_dir()
 
 
 def get_nvshmem_include_dirs():
-    paths = os.environ.get("NVSHMEM_INCLUDE_PATH")
+    # Check new environment variable first, then fall back to old one for backward compatibility
+    paths = os.environ.get("FLASHINFER_NVSHMEM_INCLUDE_PATH") or os.environ.get(
+        "NVSHMEM_INCLUDE_PATH"
+    )
     if paths is not None:
         return [pathlib.Path(p) for p in paths.split(os.pathsep) if p]
 
@@ -93,7 +117,10 @@ def get_nvshmem_include_dirs():
 
 
 def get_nvshmem_lib_dirs():
-    paths = os.environ.get("NVSHMEM_LIBRARY_PATH")
+    # Check new environment variable first, then fall back to old one for backward compatibility
+    paths = os.environ.get("FLASHINFER_NVSHMEM_LIBRARY_PATH") or os.environ.get(
+        "NVSHMEM_LIBRARY_PATH"
+    )
     if paths is not None:
         return [pathlib.Path(p) for p in paths.split(os.pathsep) if p]
 

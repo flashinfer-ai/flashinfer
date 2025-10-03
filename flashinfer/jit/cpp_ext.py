@@ -104,8 +104,8 @@ def generate_ninja_build_for_op(
         jit_env.FLASHINFER_INCLUDE_DIR.resolve(),
         jit_env.FLASHINFER_CSRC_DIR.resolve(),
     ]
-    system_includes += [p.resolve() for p in jit_env.CUTLASS_INCLUDE_DIRS]
-    system_includes.append(jit_env.SPDLOG_INCLUDE_DIR.resolve())
+    system_includes += [p.resolve() for p in jit_env.get_cutlass_include_dirs()]
+    system_includes.append(jit_env.get_spdlog_include_dir().resolve())
 
     cuda_home = get_cuda_path()
     if cuda_home == "/usr":

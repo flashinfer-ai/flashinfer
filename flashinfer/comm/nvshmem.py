@@ -13,10 +13,14 @@ from ..jit import gen_jit_spec
 
 def gen_nvshmem_module() -> JitSpec:
     lib_dirs = jit_env.get_nvshmem_lib_dirs()
+    # Check new environment variable first, then fall back to old one for backward compatibility
+    ldflags_env = os.environ.get("FLASHINFER_NVSHMEM_LDFLAGS") or os.environ.get(
+        "NVSHMEM_LDFLAGS", ""
+    )
     ldflags = (
         [f"-L{lib_dir}" for lib_dir in lib_dirs]
         + ["-lnvshmem_device"]
-        + shlex.split(os.environ.get("NVSHMEM_LDFLAGS", ""))
+        + shlex.split(ldflags_env)
     )
 
     return gen_jit_spec(
