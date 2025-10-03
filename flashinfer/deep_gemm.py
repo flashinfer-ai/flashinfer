@@ -934,8 +934,9 @@ def load_all():
         if cubin_name in RUNTIME_CACHE:
             continue
         symbol, sha256 = KERNEL_MAP[cubin_name]
-        get_cubin(ArtifactPath.DEEPGEMM + cubin_name, sha256)
-        path = FLASHINFER_CUBIN_DIR / f"{ArtifactPath.DEEPGEMM + cubin_name}.cubin"
+        cubin_name = cubin_name + ".cubin"
+        get_cubin(ArtifactPath.DEEPGEMM + "/" + cubin_name, sha256)
+        path = FLASHINFER_CUBIN_DIR / ArtifactPath.DEEPGEMM / cubin_name
         assert path.exists()
         RUNTIME_CACHE[cubin_name] = SM100FP8GemmRuntime(str(path), symbol)
 
@@ -948,9 +949,9 @@ def load(name: str, code: str) -> SM100FP8GemmRuntime:
     if cubin_name in RUNTIME_CACHE:
         return RUNTIME_CACHE[cubin_name]
     symbol, sha256 = KERNEL_MAP[cubin_name]
-    path = f"{ArtifactPath.DEEPGEMM}/{cubin_name}.cubin"
-    assert get_cubin(path, sha256)
-    path = FLASHINFER_CUBIN_DIR / path
+    cubin_name = cubin_name + ".cubin"
+    get_cubin(ArtifactPath.DEEPGEMM + "/" + cubin_name, sha256)
+    path = FLASHINFER_CUBIN_DIR / ArtifactPath.DEEPGEMM / cubin_name
     assert path.exists()
     RUNTIME_CACHE[cubin_name] = SM100FP8GemmRuntime(str(path), symbol)
     return RUNTIME_CACHE[cubin_name]
@@ -1491,7 +1492,7 @@ class KernelMap:
         self.indice = None
 
     def init_indices(self):
-        indice_path = ArtifactPath.DEEPGEMM + "/kernel_map.json"
+        indice_path = ArtifactPath.DEEPGEMM + "/" + "kernel_map.json"
         assert get_cubin(indice_path, self.sha256), (
             "cubin kernel map file not found, nor downloaded with matched sha256"
         )
