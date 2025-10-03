@@ -20,7 +20,6 @@ from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
-import tvm_ffi
 
 from ..artifacts import ArtifactPath, MetaInfoHash
 from ..autotuner import (
