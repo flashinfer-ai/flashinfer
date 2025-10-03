@@ -96,8 +96,12 @@ FLASHINFER_AOT_DIR: pathlib.Path = _get_aot_dir()
 
 def _get_workspace_dir_name() -> pathlib.Path:
     compilation_context = CompilationContext()
+    # NOTE(Zihao): sorted() is crucial here to ensure deterministic directory names.
+    # Without it, the same set of CUDA archs could generate different directory names
+    # across runs (e.g., "75_80_89" vs "89_75_80"), causing cache fragmentation.
     arch = "_".join(
-        f"{major}{minor}" for major, minor in compilation_context.TARGET_CUDA_ARCHS
+        f"{major}{minor}"
+        for major, minor in sorted(compilation_context.TARGET_CUDA_ARCHS)
     )
     return FLASHINFER_CACHE_DIR / arch
 
