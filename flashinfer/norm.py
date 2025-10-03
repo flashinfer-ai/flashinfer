@@ -54,7 +54,7 @@ def rmsnorm(
     Parameters
     ----------
     input: torch.Tensor
-        Input tensor, shape (batch_size, hidden_size).
+        Input tensor, 2D shape (batch_size, hidden_size) or 3D shape (batch_size, num_heads, hidden_size).
     weight: torch.Tensor
         Weight tensor, shape (hidden_size,).
     eps: float
@@ -68,7 +68,7 @@ def rmsnorm(
     Returns
     -------
     output: torch.Tensor
-        Normalized tensor, shape (batch_size, hidden_size).
+        Normalized tensor, 2D shape (batch_size, hidden_size) or 3D shape (batch_size, num_heads, hidden_size).
     """
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)
