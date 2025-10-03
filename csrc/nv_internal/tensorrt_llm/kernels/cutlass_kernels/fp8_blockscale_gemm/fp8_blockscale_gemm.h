@@ -15,10 +15,10 @@
  */
 
 #pragma once
-// #include <cstdint>
 #include <cuda_fp8.h>
 #include <cuda_runtime_api.h>
 
+#include <cstdint>
 #include <vector>
 
 // non-persistent-cooperative GEMM
