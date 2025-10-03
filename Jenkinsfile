@@ -38,8 +38,7 @@
 
 import org.jenkinsci.plugins.pipeline.modeldefinition.Utils
 
-def getDockerRun(cuda_version) {
-  def dockerTags = readYaml file: 'ci/docker-tags.yml'
+def getDockerRun(cuda_version, dockerTags) {
   def image_name = "flashinfer/flashinfer-ci-${cuda_version}"
   return "bash ci/bash.sh ${image_name}:${dockerTags[image_name]}"
 }
@@ -180,8 +179,6 @@ def run_with_spot_retry(spot_node_type, on_demand_node_type, test_name, test_clo
 def run_unittest_CPU_AOT_COMPILE(node_type, cuda_version) {
   echo "Running CPU AOT Compile Unittest with CUDA ${cuda_version}"
 
-  def docker_run = getDockerRun(cuda_version)
-
   if (node_type.contains('SPOT')) {
     // Add timeout only for spot instances - node allocation only
     def node_allocated = false
@@ -200,6 +197,8 @@ def run_unittest_CPU_AOT_COMPILE(node_type, cuda_version) {
       node(node_type) {
         ws(per_exec_ws('flashinfer-aot')) {
           init_git(true)
+          def dockerTags = readYaml file: 'ci/docker-tags.yml'
+          def docker_run = getDockerRun(cuda_version, dockerTags)
           sh(script: "ls -alh", label: 'Show work directory')
           sh(script: "./scripts/task_show_node_info.sh", label: 'Show node info')
           sh(script: "${docker_run} --no-gpu ./scripts/task_test_aot_build_import.sh", label: 'Test AOT Build and Import')
@@ -216,6 +215,8 @@ def run_unittest_CPU_AOT_COMPILE(node_type, cuda_version) {
     node(node_type) {
       ws(per_exec_ws('flashinfer-aot')) {
         init_git(true)
+        def dockerTags = readYaml file: 'ci/docker-tags.yml'
+        def docker_run = getDockerRun(cuda_version, dockerTags)
         sh(script: "ls -alh", label: 'Show work directory')
         sh(script: "./scripts/task_show_node_info.sh", label: 'Show node info')
         sh(script: "${docker_run} --no-gpu ./scripts/task_test_aot_build_import.sh", label: 'Test AOT Build and Import')
@@ -226,8 +227,6 @@ def run_unittest_CPU_AOT_COMPILE(node_type, cuda_version) {
 
 def shard_run_unittest_GPU(node_type, shard_id, cuda_version) {
   echo "Running unittest on ${node_type}, shard ${shard_id}, CUDA ${cuda_version}"
-
-  def docker_run = getDockerRun(cuda_version)
 
   if (node_type.contains('SPOT')) {
     // Add timeout only for spot instances - node allocation only
@@ -247,6 +246,8 @@ def shard_run_unittest_GPU(node_type, shard_id, cuda_version) {
       node(node_type) {
         ws(per_exec_ws('flashinfer-unittest')) {
           init_git(true) // we need cutlass submodule
+          def dockerTags = readYaml file: 'ci/docker-tags.yml'
+          def docker_run = getDockerRun(cuda_version, dockerTags)
           sh(script: "ls -alh", label: 'Show work directory')
           sh(script: "./scripts/task_show_node_info.sh", label: 'Show node info')
           sh(script: "${docker_run} ./scripts/task_jit_run_tests_part${shard_id}.sh", label: 'JIT Unittest Part ${shard_id}')
@@ -263,6 +264,8 @@ def shard_run_unittest_GPU(node_type, shard_id, cuda_version) {
     node(node_type) {
       ws(per_exec_ws('flashinfer-unittest')) {
         init_git(true) // we need cutlass submodule
+        def dockerTags = readYaml file: 'ci/docker-tags.yml'
+        def docker_run = getDockerRun(cuda_version, dockerTags)
         sh(script: "ls -alh", label: 'Show work directory')
         sh(script: "./scripts/task_show_node_info.sh", label: 'Show node info')
         sh(script: "${docker_run} ./scripts/task_jit_run_tests_part${shard_id}.sh", label: 'JIT Unittest Part ${shard_id}')
