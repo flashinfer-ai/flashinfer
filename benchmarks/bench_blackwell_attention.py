@@ -88,28 +88,28 @@ def bench_fmha_blackwell(
             return batch_size * qkv_len * qkv_len * num_heads * head_dim * 4 / ms / 1e9
 
     print(
-        f"bench_fmha_blackwell (batch_size={batch_size}, qkv_len={qkv_len}, num_heads={num_heads}, head_dim={head_dim}, causal={causal}), flops: {flops(ms):.3f} TFLOPs/s"
+        f"bench_fmha_blackwell (batch_size={batch_size}, qkv_len={qkv_len}, num_heads={num_heads}, head_dim={head_dim}, causal={causal}, dtype={dtype}), flops: {flops(ms):.3f} TFLOPs/s"
     )
 
 
 if __name__ == "__main__":
-    # bench_fmha_blackwell(128, 512, 32, 128, False, torch.bfloat16)
-    # bench_fmha_blackwell(64, 1024, 32, 128, False, torch.bfloat16)
-    # bench_fmha_blackwell(32, 2048, 32, 128, False, torch.bfloat16)
-    # bench_fmha_blackwell(16, 4096, 32, 128, False, torch.bfloat16)
-    # bench_fmha_blackwell(8, 8192, 32, 128, False, torch.bfloat16)
-    # bench_fmha_blackwell(4, 16384, 32, 128, False, torch.bfloat16)
-    # bench_fmha_blackwell(2, 32768, 32, 128, False, torch.bfloat16)
-    # bench_fmha_blackwell(1, 65536, 32, 128, False, torch.bfloat16)
+    bench_fmha_blackwell(128, 512, 32, 128, False, torch.bfloat16)
+    bench_fmha_blackwell(64, 1024, 32, 128, False, torch.bfloat16)
+    bench_fmha_blackwell(32, 2048, 32, 128, False, torch.bfloat16)
+    bench_fmha_blackwell(16, 4096, 32, 128, False, torch.bfloat16)
+    bench_fmha_blackwell(8, 8192, 32, 128, False, torch.bfloat16)
+    bench_fmha_blackwell(4, 16384, 32, 128, False, torch.bfloat16)
+    bench_fmha_blackwell(2, 32768, 32, 128, False, torch.bfloat16)
+    bench_fmha_blackwell(1, 65536, 32, 128, False, torch.bfloat16)
 
-    # bench_fmha_blackwell(128, 512, 32, 128, True, torch.bfloat16)
-    # bench_fmha_blackwell(64, 1024, 32, 128, True, torch.bfloat16)
-    # bench_fmha_blackwell(32, 2048, 32, 128, True, torch.bfloat16)
-    # bench_fmha_blackwell(16, 4096, 32, 128, True, torch.bfloat16)
-    # bench_fmha_blackwell(8, 8192, 32, 128, True, torch.bfloat16)
-    # bench_fmha_blackwell(4, 16384, 32, 128, True, torch.bfloat16)
-    # bench_fmha_blackwell(2, 32768, 32, 128, True, torch.bfloat16)
-    # bench_fmha_blackwell(1, 65536, 32, 128, True, torch.bfloat16)
+    bench_fmha_blackwell(128, 512, 32, 128, True, torch.bfloat16)
+    bench_fmha_blackwell(64, 1024, 32, 128, True, torch.bfloat16)
+    bench_fmha_blackwell(32, 2048, 32, 128, True, torch.bfloat16)
+    bench_fmha_blackwell(16, 4096, 32, 128, True, torch.bfloat16)
+    bench_fmha_blackwell(8, 8192, 32, 128, True, torch.bfloat16)
+    bench_fmha_blackwell(4, 16384, 32, 128, True, torch.bfloat16)
+    bench_fmha_blackwell(2, 32768, 32, 128, True, torch.bfloat16)
+    bench_fmha_blackwell(1, 65536, 32, 128, True, torch.bfloat16)
 
     bench_fmha_blackwell(128, 512, 32, 128, False, torch.float8_e4m3fn)
     bench_fmha_blackwell(64, 1024, 32, 128, False, torch.float8_e4m3fn)
