@@ -155,7 +155,7 @@ class BatchAttention:
 
         k_cache, v_cache = _unpack_paged_kv_cache(kv_cache, self._kv_layout)
         if out is None:
-            out = torch.empty_like(q)
+            out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
         if lse is None:
             # lse shape: [batch_size, num_qo_heads]
             lse = torch.empty(
