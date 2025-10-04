@@ -25,6 +25,7 @@ from .jit import gen_jit_spec, sm90a_nvcc_flags
 from .utils import (
     register_custom_op,
     register_fake_op,
+    get_compute_capability,
 )
 
 xqa_nvcc_flags = [
@@ -73,7 +74,7 @@ def gen_xqa_module(
         [
             jit_env.FLASHINFER_CSRC_DIR / "xqa/mha.cu",
             jit_env.FLASHINFER_CSRC_DIR / "xqa/xqa_wrapper.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "flashinfer_xqa_ops.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "flashinfer_xqa_binding.cu",
         ],
         extra_cuda_cflags=xqa_nvcc_flags
         + sm90a_nvcc_flags
@@ -118,7 +119,7 @@ def get_xqa_module(
         semaphores: torch.Tensor,
         scratch: torch.Tensor,
     ) -> None:
-        module.xqa_wrapper.default(
+        module.xqa_wrapper(
             multiProcessorCount,
             nbKHeads,
             slidingWinSize,
@@ -185,6 +186,8 @@ def xqa(
     semaphores: torch.Tensor,
     scratch: torch.Tensor,
 ) -> None:
+    if get_compute_capability(torch.device(device="cuda"))[0] != 9:
+        raise RuntimeError("XQA is only supported on SM90 GPUs")
     xqa_module = get_xqa_module(
         use_fp16, token_per_page, head_size, head_grp_size, use_sliding_window
     )

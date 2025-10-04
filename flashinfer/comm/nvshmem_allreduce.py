@@ -83,29 +83,23 @@ class NVSHMEMAllReduce:
         self.symm_buffer_input = self.nvshmem_module.nvshmem_malloc(
             [max_buffer_elements],
             self.dtype,
-            self.device,
+            self.device.index,
         )
         self.symm_buffer_output = self.nvshmem_module.nvshmem_malloc(
             [max_buffer_elements],
             self.dtype,
-            self.device,
+            self.device.index,
         )
         torch.distributed.barrier(self.group)
 
     def init_nvshmem(self):
-        torch.zeros(
+        uid = torch.zeros(
             self.nvshmem_module.nvshmem_unique_id_size(),
             dtype=torch.uint8,
             device="cpu",
         )
         if self.local_rank == 0:
-            uid = self.nvshmem_module.nvshmem_get_unique_id()
-        else:
-            uid = torch.zeros(
-                self.nvshmem_module.nvshmem_unique_id_size(),
-                dtype=torch.uint8,
-                device="cpu",
-            )
+            self.nvshmem_module.nvshmem_get_unique_id(uid)
         torch.distributed.broadcast(uid, src=0)
         torch.distributed.barrier(self.group)
         init_status = self.nvshmem_module.nvshmem_init(

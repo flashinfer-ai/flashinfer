@@ -20,6 +20,7 @@ from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
+import tvm_ffi
 
 from ..artifacts import ArtifactPath, MetaInfoHash
 from ..autotuner import (
@@ -262,6 +263,23 @@ def convert_to_block_layout(input_tensor: torch.Tensor, blockK: int) -> torch.Te
     return input_tensor.view(M, K // blockK, blockK).permute(1, 0, 2).contiguous()
 
 
+def gen_cutlass_fused_moe_sm120_module(use_fast_build: bool = False) -> JitSpec:
+    nvcc_flags = [
+        "-DCOMPILE_BLACKWELL_TMA_GEMMS",
+        "-DCOMPILE_BLACKWELL_SM120_TMA_GROUPED_GEMMS",
+        "-DENABLE_BF16",
+        "-DENABLE_FP8",
+        "-DENABLE_FP4",
+        "-DUSING_OSS_CUTLASS_MOE_GEMM",
+    ]
+
+    nvcc_flags += current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[12]
+    )
+
+    return gen_cutlass_fused_moe_module(nvcc_flags, "120", use_fast_build)
+
+
 def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool = False) -> JitSpec:
     nvcc_flags = [
         "-DCOMPILE_BLACKWELL_TMA_GEMMS",
@@ -273,7 +291,7 @@ def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool = False) -> JitSpec:
     ]
 
     nvcc_flags += current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[10, 11, 12]
+        supported_major_versions=[10, 11]
     )
 
     return gen_cutlass_fused_moe_module(nvcc_flags, "100", use_fast_build)
@@ -350,7 +368,7 @@ def gen_cutlass_fused_moe_module(
             jit_env.FLASHINFER_CSRC_DIR
             / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm_stub.cu",
             jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_sm100_ops.cu",
+            / "fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_sm100_binding.cu",
             jit_env.FLASHINFER_CSRC_DIR
             / "fused_moe/cutlass_backend/cutlass_fused_moe_instantiation.cu",
             # Add all generated kernels
@@ -369,7 +387,6 @@ def gen_cutlass_fused_moe_module(
         ],
         extra_cuda_cflags=nvcc_flags,
         extra_cflags=["-DFAST_BUILD"] if use_fast_build else [],
-        extra_ldflags=["-lcuda"],
         extra_include_paths=[
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "include",
@@ -395,14 +412,12 @@ def gen_cutlass_fused_moe_module(
 
 @functools.cache
 def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = False):
-    if backend in ("100", "103", "110", "120", "121"):
-        FusedMoeRunner = gen_cutlass_fused_moe_sm100_module(
-            use_fast_build
-        ).build_and_load(class_name="FusedMoeRunner")
+    if backend in ("120", "121"):
+        module = gen_cutlass_fused_moe_sm120_module(use_fast_build).build_and_load()
+    elif backend in ("100", "103", "110"):
+        module = gen_cutlass_fused_moe_sm100_module(use_fast_build).build_and_load()
     elif backend == "90":
-        FusedMoeRunner = gen_cutlass_fused_moe_sm90_module(
-            use_fast_build
-        ).build_and_load(class_name="FusedMoeRunner")
+        module = gen_cutlass_fused_moe_sm90_module(use_fast_build).build_and_load()
     else:
         raise ValueError(f"Invalid backend: {backend}")
 
@@ -467,7 +482,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             )
 
             if instance_key not in MoERunner.runner_dict:
-                MoERunner.runner_dict[instance_key] = FusedMoeRunner(
+                MoERunner.runner_dict[instance_key] = module.init(
                     x_dtype,
                     weight_dtype,
                     output_dtype,
@@ -625,7 +640,29 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             if min_latency_mode
             else moe_runner.fused_moe_runner.run_moe
         )
-        result = run_moe(
+        num_active_experts_per_node = torch.empty(
+            (1,), dtype=torch.int32, device=input.device
+        )
+        experts_to_token_score = torch.empty(
+            (fc2_expert_weights.shape[0], input.shape[0]),
+            dtype=torch.float32,
+            device=input.device,
+        )
+        active_expert_global_ids = torch.empty(
+            (fc2_expert_weights.shape[0],),
+            dtype=torch.int32,
+            device=input.device,
+        )
+        min_latency_output = (
+            [
+                num_active_experts_per_node,
+                experts_to_token_score,
+                active_expert_global_ids,
+            ]
+            if min_latency_mode
+            else []
+        )
+        run_moe(
             output,
             input,
             token_selected_experts,
@@ -639,6 +676,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             swiglu_alpha,
             swiglu_beta,
             swiglu_limit,
+            *min_latency_output,
             tp_size,
             tp_rank,
             ep_size,
@@ -651,7 +689,16 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             enable_pdl,
         )
 
-        return result if min_latency_mode else [result]
+        return (
+            output
+            if min_latency_mode
+            else [
+                output,
+                num_active_experts_per_node,
+                experts_to_token_score,
+                active_expert_global_ids,
+            ]
+        )
 
     @register_fake_op("flashinfer::cutlass_fused_moe")
     def _fake_cutlass_fused_moe(
@@ -928,9 +975,7 @@ def gen_trtllm_gen_fused_moe_sm100_module() -> JitSpec:
     header_name = "flashinferMetaInfo"
 
     # use `get_cubin` to get "flashinferMetaInfo.h"
-    metainfo = get_cubin(
-        f"{include_path}/{header_name}", MetaInfoHash.TRTLLM_GEN_BMM, ".h"
-    )
+    metainfo = get_cubin(f"{include_path}/{header_name}.h", MetaInfoHash.TRTLLM_GEN_BMM)
     # make sure "flashinferMetaInfo.h" is downloaded or cached
     assert metainfo, f"{header_name}.h not found"
 
@@ -964,7 +1009,6 @@ def gen_trtllm_gen_fused_moe_sm100_module() -> JitSpec:
             f'-DTLLM_GEN_BMM_CUBIN_PATH=\\"{ArtifactPath.TRTLLM_GEN_BMM}\\"',
         ]
         + nvcc_flags,
-        extra_ldflags=["-lcuda"],
         extra_include_paths=[
             # link "include" sub-directory in cache
             jit_env.FLASHINFER_CUBIN_DIR / include_path,
@@ -1393,6 +1437,7 @@ def get_trtllm_moe_sm100_module():
         gemm1_weights_scale: torch.Tensor,
         gemm2_weights: torch.Tensor,
         gemm2_weights_scale: torch.Tensor,
+        output: torch.Tensor,
         num_experts: int,
         top_k: int,
         n_group: int,
@@ -1410,7 +1455,7 @@ def get_trtllm_moe_sm100_module():
         if enable_pdl is None:
             enable_pdl = device_support_pdl(hidden_states.device)
         # Call the C++ function for block scale MoE
-        output = moe_op.trtllm_fp8_block_scale_moe(
+        moe_op.trtllm_fp8_block_scale_moe(
             routing_logits,
             routing_bias,
             hidden_states,
@@ -1419,6 +1464,7 @@ def get_trtllm_moe_sm100_module():
             gemm1_weights_scale,
             gemm2_weights,
             gemm2_weights_scale,
+            output,
             num_experts,
             top_k,
             n_group,
@@ -1446,6 +1492,7 @@ def get_trtllm_moe_sm100_module():
         gemm1_weights_scale: torch.Tensor,
         gemm2_weights: torch.Tensor,
         gemm2_weights_scale: torch.Tensor,
+        output: torch.Tensor,
         num_experts: int,
         top_k: int,
         n_group: int,
@@ -1637,7 +1684,11 @@ def get_trtllm_moe_sm100_module():
             output,
             tactic,
         )
-
+        if isinstance(output, tvm_ffi.Array):
+            output = list(output)
+            for i in range(len(output)):
+                if isinstance(output[i], tvm_ffi.Tensor):
+                    output[i] = torch.from_dlpack(output[i])
         return output
 
     @register_fake_op("flashinfer::trtllm_fp4_block_scale_moe")
@@ -1854,6 +1905,9 @@ def trtllm_fp8_block_scale_moe(
     Returns:
         torch.Tensor: Output tensor of shape [seq_len, hidden_size]
     """
+    output = torch.empty(
+        hidden_states.shape, dtype=torch.bfloat16, device=hidden_states.device
+    )
     return get_trtllm_moe_sm100_module().trtllm_fp8_block_scale_moe(
         routing_logits,
         routing_bias,
@@ -1863,6 +1917,7 @@ def trtllm_fp8_block_scale_moe(
         gemm1_weights_scale,
         gemm2_weights,
         gemm2_weights_scale,
+        output,
         num_experts,
         top_k,
         n_group,

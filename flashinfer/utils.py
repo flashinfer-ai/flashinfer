@@ -16,7 +16,6 @@ limitations under the License.
 
 import functools
 import math
-import os
 from enum import Enum
 from typing import Callable, Dict, Iterable, Optional, Sequence, Tuple, Union
 
@@ -26,8 +25,6 @@ from torch.torch_version import TorchVersion
 from torch.torch_version import __version__ as torch_version
 
 from .jit import gen_jit_spec, env as jit_env
-
-IS_BUILDING_DOCS = os.environ.get("FLASHINFER_BUILDING_DOCS") == "1"
 
 
 class PosEncodingMode(Enum):
@@ -49,6 +46,18 @@ class TensorLayout(Enum):
 
 
 log2e = 1.44269504088896340736
+
+
+class GPUArchitectureError(Exception):
+    """Custom exception for GPU architecture-related errors."""
+
+    pass
+
+
+class LibraryError(Exception):
+    """Custom exception for library-related errors."""
+
+    pass
 
 
 def _expand_5d(x: torch.Tensor, kv_layout: str) -> torch.Tensor:
@@ -240,7 +249,7 @@ def _check_cached_qkv_data_type(
         )
 
 
-if IS_BUILDING_DOCS or TorchVersion(torch_version) < TorchVersion("2.4"):
+if TorchVersion(torch_version) < TorchVersion("2.4"):
 
     def register_custom_op(
         name: str,
@@ -441,6 +450,12 @@ def has_cuda_cudart() -> bool:
     return importlib.util.find_spec("cuda.cudart") is not None
 
 
+def get_cuda_python_version() -> str:
+    import cuda
+
+    return cuda.__version__
+
+
 def is_sm90a_supported(device: torch.device) -> bool:
     major, _ = get_compute_capability(device)
     return major == 9 and version_at_least(torch.version.cuda, "12.3")
@@ -449,6 +464,11 @@ def is_sm90a_supported(device: torch.device) -> bool:
 def is_sm100a_supported(device: torch.device) -> bool:
     major, _ = get_compute_capability(device)
     return major == 10 and version_at_least(torch.version.cuda, "12.8")
+
+
+def is_sm100f_supported(device: torch.device) -> bool:
+    major, _ = get_compute_capability(device)
+    return major == 10 and version_at_least(torch.version.cuda, "12.9")
 
 
 def is_sm110a_supported(device: torch.device) -> bool:
@@ -532,6 +552,7 @@ def set_log_level(lvl_str: str) -> None:
     get_logging_module().set_log_level(log_level_map[lvl_str].value)
 
 
+@functools.cache
 def device_support_pdl(device: torch.device) -> bool:
     if device.type != "cuda":
         return False
@@ -558,6 +579,7 @@ def round_up(x: int, y: int) -> int:
     return ceil_div(x, y) * y
 
 
+@functools.cache
 def get_device_sm_count(device: torch.device) -> int:
     return torch.cuda.get_device_properties(device).multi_processor_count
 

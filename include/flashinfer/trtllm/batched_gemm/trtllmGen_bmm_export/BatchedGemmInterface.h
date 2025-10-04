@@ -738,7 +738,7 @@ int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config, void* workspa
     if (!fname_cubin.empty()) {
       fname_cubin[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(fname_cubin[0])));
     }
-    fname_cubin = tllm_gen_bmm_cubin_path + fname_cubin;
+    fname_cubin = tllm_gen_bmm_cubin_path + "/" + fname_cubin + ".cubin";
     std::string cubin = flashinfer::trtllm_cubin_loader::getCubin(fname_cubin, sha256);
     cuModuleLoadData(&cuModule, cubin.c_str());
   };

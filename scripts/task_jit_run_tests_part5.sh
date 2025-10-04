@@ -7,4 +7,4 @@ set -x
 
 pip install -e . -v
 
-pytest -s tests/test_logits_processor.py
+pytest -s tests/utils/test_logits_processor.py

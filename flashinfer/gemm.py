@@ -38,7 +38,13 @@ from .fused_moe.utils import (
     last_positive_power_of_2,
 )
 from .jit.cubin_loader import get_cubin
-from .utils import is_sm100a_supported, is_sm120a_supported, is_sm121a_supported
+from .utils import (
+    is_sm100a_supported,
+    is_sm100f_supported,
+    is_sm120a_supported,
+    is_sm121a_supported,
+    LibraryError,
+)
 
 CUDNN_AVAILABLE = False
 try:
@@ -60,6 +66,7 @@ from .jit import (
     gen_jit_spec,
     sm90a_nvcc_flags,
     sm100a_nvcc_flags,
+    sm100f_nvcc_flags,
     current_compilation_context,
 )
 from .jit.cubin_loader import setup_cubin_loader
@@ -89,7 +96,7 @@ def gen_gemm_module() -> JitSpec:
         [
             jit_env.FLASHINFER_CSRC_DIR / "bmm_fp8.cu",
             jit_env.FLASHINFER_CSRC_DIR / "group_gemm.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "flashinfer_gemm_ops.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "flashinfer_gemm_binding.cu",
         ],
         extra_ldflags=["-lcublas", "-lcublasLt"],
     )
@@ -119,7 +126,7 @@ def get_gemm_module():
             ) -> torch.Tensor:
                 cublas_handle = torch.cuda.current_blas_handle()
                 a, b, scale_a, scale_b, out, workspace_buffer = inputs
-                module.bmm_fp8.default(
+                module.bmm_fp8(
                     a, b, out, scale_a, scale_b, workspace_buffer, cublas_handle
                 )
                 return out
@@ -142,7 +149,7 @@ def get_gemm_module():
         empty_x_data: torch.Tensor,
         weight_column_major: bool,
     ) -> None:
-        module.cutlass_segment_gemm.default(
+        module.cutlass_segment_gemm(
             workspace_buffer,
             all_problems,
             x_data,
@@ -225,7 +232,6 @@ def gen_gemm_sm100_module_cutlass_fp4() -> JitSpec:
         extra_cflags=[
             "-DFAST_BUILD",
         ],
-        extra_ldflags=["-lcuda"],
     )
 
 
@@ -272,7 +278,6 @@ def gen_gemm_sm120_module_cutlass_fp4() -> JitSpec:
         extra_cflags=[
             "-DFAST_BUILD",
         ],
-        extra_ldflags=["-lcuda"],
     )
 
 
@@ -323,7 +328,6 @@ def gen_gemm_sm100_module_cutlass_fp8() -> JitSpec:
         extra_cflags=[
             "-DFAST_BUILD",
         ],
-        extra_ldflags=["-lcuda"],
     )
 
 
@@ -386,8 +390,8 @@ def gen_gemm_sm100_module() -> JitSpec:
         "gemm_groupwise_sm100.cu",
         "group_gemm_fp8_groupwise_sm100.cu",
         "group_gemm_mxfp4_groupwise_sm100.cu",
-        "gemm_sm100_pybind.cu",
-        "group_gemm_sm100_pybind.cu",
+        "gemm_sm100_binding.cu",
+        "group_gemm_sm100_binding.cu",
     ]:
         src_path = jit_env.FLASHINFER_CSRC_DIR / filename
         dest_path = gen_directory / filename
@@ -475,8 +479,8 @@ def gen_gemm_sm120_module() -> JitSpec:
     for filename in [
         "gemm_groupwise_sm120.cu",
         "group_gemm_fp8_groupwise_sm120.cu",
-        "gemm_sm120_pybind.cu",
-        "group_gemm_sm120_pybind.cu",
+        "gemm_sm120_binding.cu",
+        "group_gemm_sm120_binding.cu",
     ]:
         src_path = jit_env.FLASHINFER_CSRC_DIR / filename
         dest_path = gen_directory / filename
@@ -593,7 +597,7 @@ def get_gemm_sm120_module_cutlass_fp8():
                     scale_b_expanded = scale_b
 
                 # Call SM120 gemm_fp8_nt_groupwise (now handles both 2D and 3D)
-                module.gemm_fp8_nt_groupwise.default(
+                module.gemm_fp8_nt_groupwise(
                     workspace_buffer,
                     a,
                     b_col_major,
@@ -624,9 +628,8 @@ def gen_trtllm_gen_gemm_module() -> JitSpec:
 
     # use `get_cubin` to get "flashinferMetaInfo.h"
     metainfo = get_cubin(
-        f"{include_path}/{header_name}",
+        f"{include_path}/{header_name}.h",
         MetaInfoHash.TRTLLM_GEN_GEMM,
-        ".h",
     )
     # make sure "flashinferMetaInfo.h" is downloaded or cached
     assert metainfo, f"{header_name}.h not found"
@@ -643,7 +646,6 @@ def gen_trtllm_gen_gemm_module() -> JitSpec:
         + sm100a_nvcc_flags,
         # link "include" sub-directory in cache
         extra_include_paths=[jit_env.FLASHINFER_CUBIN_DIR / include_path],
-        extra_ldflags=["-lcuda"],
     )
 
 
@@ -676,7 +678,7 @@ def get_gemm_sm100_module_cutlass_fp8():
                 **kwargs,
             ) -> torch.Tensor:
                 a, b, scale_a, scale_b, out, workspace_buffer = inputs
-                module.fp8_gemm.default(
+                module.fp8_gemm(
                     a,
                     b.transpose(-2, -1),
                     scale_a,
@@ -782,7 +784,7 @@ def _create_cutlass_fp4_gemm_module(module, op_name: str, tuner_name: str):
             **kwargs,
         ):
             a, b, a_descale, b_descale, alpha, out, workspace_buffer = inputs
-            module.fp4_gemm.default(
+            module.fp4_gemm(
                 a, b, a_descale, b_descale, alpha, out, workspace_buffer, tactic
             )
             return out
@@ -865,12 +867,16 @@ def get_gemm_sm120_module_cutlass_fp4():
     )
 
 
-def gen_gemm_sm100_module_tgv(dtype: torch.dtype = torch.bfloat16) -> JitSpec:
+def gen_tgv_gemm_sm10x_module(
+    dtype: torch.dtype = torch.bfloat16, use_sm_100f: bool = False
+) -> JitSpec:
     """
     Generate TGV GEMM module for SM100 architecture.
 
     Args:
         dtype: Data type for the GEMM operation (torch.bfloat16 or torch.float16)
+        use_sm_100f: Whether to compile with SM100f flags (default: False), which makes the compiled kernel
+            compatible with both B200 and B300 GPUs. However, it's only available with CUDA 12.9+.
 
     Returns:
         JitSpec for the TGV GEMM module
@@ -922,7 +928,7 @@ def gen_gemm_sm100_module_tgv(dtype: torch.dtype = torch.bfloat16) -> JitSpec:
     return gen_jit_spec(
         module_name,
         source_paths,
-        extra_cuda_cflags=sm100a_nvcc_flags,
+        extra_cuda_cflags=sm100f_nvcc_flags if use_sm_100f else sm100a_nvcc_flags,
         extra_include_paths=[
             jit_env.FLASHINFER_INCLUDE_DIR,
             jit_env.FLASHINFER_CSRC_DIR,
@@ -931,17 +937,21 @@ def gen_gemm_sm100_module_tgv(dtype: torch.dtype = torch.bfloat16) -> JitSpec:
 
 
 @functools.cache
-def get_gemm_sm100_module_tgv(dtype: torch.dtype = torch.bfloat16):
+def get_tgv_gemm_sm10x_module(
+    dtype: torch.dtype = torch.bfloat16, use_sm_100f: bool = False
+):
     """
     Get and build the TGV GEMM module for the specified dtype.
 
     Args:
         dtype: Data type for the GEMM operation (torch.bfloat16 or torch.float16)
+        use_sm_100f: Whether to compile with SM100f flags (default: False), which makes the compiled kernel
+            compatible with both B200 and B300 GPUs. However, it's only available with CUDA 12.9+.
 
     Returns:
         SimpleNamespace with the runner function
     """
-    module = gen_gemm_sm100_module_tgv(dtype).build_and_load()
+    module = gen_tgv_gemm_sm10x_module(dtype, use_sm_100f).build_and_load()
 
     def tgv_gemm_runner():
         class TGVGemmRunner(TunableRunner):
@@ -968,7 +978,7 @@ def get_gemm_sm100_module_tgv(dtype: torch.dtype = torch.bfloat16):
                 # tgv_gemm takes mat1 as weights and mat2 as input tensor
                 # from [m,k]x[k,n]+[n,] to [n,k]x[k,m]+[n,]
                 gemm_fn = module.tgv_gemm
-                out = gemm_fn.default(b.t(), a.t(), bias, tactic, pdl)
+                out = gemm_fn(b.t(), a.t(), bias, tactic, pdl)
                 return out.t()
 
         return TGVGemmRunner()
@@ -1009,8 +1019,8 @@ def tgv_gemm_sm100(
         - Tensor b is expected to be in column-major layout (transposed from typical PyTorch row-major)
     """
     # Verify SM100 architecture support
-    if not _match_sm_version(a.device, ["100", "103", "110"]):
-        raise ValueError("TGV GEMM requires SM100, SM103, or SM110 architecture")
+    if not _match_sm_version(a.device, ["100", "103"]):
+        raise ValueError("TGV GEMM requires SM100, SM103 architecture")
 
     # Verify dtype support
     if a.dtype not in [torch.bfloat16, torch.float16]:
@@ -1024,7 +1034,8 @@ def tgv_gemm_sm100(
         )
 
     runners = []
-    runners.append(get_gemm_sm100_module_tgv(a.dtype).tgv_gemm_runner())
+    use_sm_100f = is_sm100f_supported(a.device)
+    runners.append(get_tgv_gemm_sm10x_module(a.dtype, use_sm_100f).tgv_gemm_runner())
 
     tuner = AutoTuner.get()
     a_tensor_index = 0
@@ -1079,7 +1090,7 @@ def gen_gemm_sm90_module() -> JitSpec:
         write_if_different(dest_path, source)
     for filename in [
         "group_gemm_sm90.cu",
-        "flashinfer_gemm_sm90_ops.cu",
+        "flashinfer_gemm_sm90_binding.cu",
     ]:
         src_path = jit_env.FLASHINFER_CSRC_DIR / filename
         dest_path = gen_directory / filename
@@ -1119,7 +1130,7 @@ def get_gemm_sm90_module():
         empty_y_data: torch.Tensor,
         weight_column_major: bool,
     ) -> None:
-        module.cutlass_segment_gemm_sm90.default(
+        module.cutlass_segment_gemm_sm90(
             workspace_buffer,
             int_workspace_buffer,
             all_problems,
@@ -2005,7 +2016,7 @@ def mm_fp4(
     block_size: int = 16,
     use_8x4_sf_layout: bool = False,
     backend: Literal["cudnn", "trtllm", "cutlass"] = "cudnn",
-    use_nvfp4: bool = False,
+    use_nvfp4: bool = True,
 ) -> torch.Tensor:
     r"""MM FP4
 
@@ -2112,6 +2123,15 @@ def mm_fp4(
         raise ValueError("TRTLLM FP4 GEMM is not supported on SM110.")
     if backend != "cudnn" and not use_nvfp4:
         raise ValueError("Only cudnn FP4 GEMM supports mxfp4 quantization.")
+    if (
+        backend == "cudnn"
+        and not use_nvfp4
+        and _match_sm_version(a.device, ["120"])
+        and cudnn.backend_version() < 91400
+    ):
+        raise LibraryError(
+            "cudnn FP4 GEMM with mxfp4 quantization is not supported on SM120 with cuDNN backend version < 9.14.0."
+        )
 
     # allocate the output tensor if not provided
     if out is None:
@@ -2417,7 +2437,7 @@ def gemm_fp8_nt_groupwise(
         assert scale_major_mode is not None
         if is_sm120a_supported(a.device) or is_sm121a_supported(a.device):
             # SM120/121 doesn't use mma_sm parameter
-            get_gemm_sm120_module().gemm_fp8_nt_groupwise.default(
+            get_gemm_sm120_module().gemm_fp8_nt_groupwise(
                 workspace_buffer,
                 a,
                 b,
@@ -2428,7 +2448,7 @@ def gemm_fp8_nt_groupwise(
                 scale_major_mode,
             )
         elif is_sm100a_supported(a.device):
-            get_gemm_sm100_module().gemm_fp8_nt_groupwise.default(
+            get_gemm_sm100_module().gemm_fp8_nt_groupwise(
                 workspace_buffer,
                 a,
                 b,
@@ -2517,7 +2537,7 @@ def get_trtllm_fp4_gemm_module():
                 alpha,
                 out,
             ) = inputs
-            op.trtllm_gemm.default(
+            op.trtllm_gemm(
                 workspace_buffer,
                 a,
                 b,
@@ -2750,7 +2770,7 @@ def group_gemm_fp8_nt_groupwise(
 
     if is_sm120a_supported(a.device) or is_sm121a_supported(a.device):
         # SM120/121 doesn't use mma_sm parameter
-        get_gemm_sm120_module().group_gemm_fp8_nt_groupwise.default(
+        get_gemm_sm120_module().group_gemm_fp8_nt_groupwise(
             int_workspace_buffer,
             float_workspace_buffer,
             a,
@@ -2765,7 +2785,7 @@ def group_gemm_fp8_nt_groupwise(
             scale_major_mode,
         )
     elif is_sm100a_supported(a.device):
-        get_gemm_sm100_module().group_gemm_fp8_nt_groupwise.default(
+        get_gemm_sm100_module().group_gemm_fp8_nt_groupwise(
             int_workspace_buffer,
             float_workspace_buffer,
             a,
@@ -2901,7 +2921,7 @@ def group_gemm_mxfp8_mxfp4_nt_groupwise(
         assert out.shape == out_shape
         assert out.dtype == out_dtype
 
-    get_gemm_sm100_module().group_gemm_mxfp4_nt_groupwise.default(
+    get_gemm_sm100_module().group_gemm_mxfp4_nt_groupwise(
         int_workspace_buffer,
         float_workspace_buffer,
         a,
@@ -3078,6 +3098,11 @@ def group_deepgemm_fp8_nt_groupwise(
     """
     from flashinfer.deep_gemm import m_grouped_fp8_gemm_nt_contiguous
 
+    if not _match_sm_version(a.device, ["100", "103"]):
+        raise ValueError(
+            "m_grouped_fp8_gemm_nt_contiguous is only supported on SM100, SM100, SM103."
+        )
+
     if out is None:
         out_dtype = out_dtype or torch.bfloat16
         out = torch.empty(a.shape[0], b.shape[1], dtype=out_dtype, device=a.device)
@@ -3205,6 +3230,11 @@ def batch_deepgemm_fp8_nt_groupwise(
     - The block size for scaling is determined by the ``scale_granularity_mnk`` parameter
     """
     from flashinfer.deep_gemm import m_grouped_fp8_gemm_nt_masked
+
+    if not _match_sm_version(a.device, ["100", "103"]):
+        raise ValueError(
+            "m_grouped_fp8_gemm_nt_masked is only supported on SM100, SM103."
+        )
 
     if out is None:
         out_dtype = out_dtype or torch.bfloat16

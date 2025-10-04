@@ -519,7 +519,7 @@ struct BlockBatchReductionPersistent {
 #pragma unroll 1
     for (uint32_t i = worker_id; i < num_packed_qo_len * num_kv_heads; i += num_workers) {
       PROFILER_EVENT_START(profiler_closure, PersistentProfileEventType::kReduction);
-
+      __syncwarp();  // avoid data hazard due to reordering st.cast_store
       // remap workload
       uint32_t packed_qo_idx = i / num_kv_heads;
       uint32_t kv_head_idx = i % num_kv_heads;

@@ -55,7 +55,8 @@ def get_vllm_comm_module():
 
     @register_custom_op("flashinfer::get_graph_buffer_ipc_meta", mutates_args=["fa"])
     def get_graph_buffer_ipc_meta(fa: int) -> Tuple[List[int], List[int]]:
-        return module.get_graph_buffer_ipc_meta(fa)
+        output_bytes, output_offsets = module.get_graph_buffer_ipc_meta(fa)
+        return list(output_bytes), list(output_offsets)
 
     @register_custom_op(
         "flashinfer::register_buffer", mutates_args=["fa", "fake_ipc_ptrs"]

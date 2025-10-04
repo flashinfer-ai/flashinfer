@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 #include "flashinfer/trtllm/fused_moe/RoutingKernel.cuh"
-#include "pytorch_extension_utils.h"
+#include "tvm_ffi_utils.h"
 
 namespace moe::dev::routing {
 namespace routingRenormalize {
@@ -223,32 +223,33 @@ __global__ void __launch_bounds__(NumThreadsHist)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-void run(Data const& data, void* stream) {
-  TORCH_CHECK(data.mPtrExpertIdx != nullptr || data.mPtrScores != nullptr,
-              "Routing kernel requires at least one input parameter");
-  TORCH_CHECK(data.mPtrPermutedIdxSize != nullptr && data.mPtrCtaIdxXyToBatchIdx != nullptr &&
-                  data.mPtrCtaIdxXyToMnLimit != nullptr && data.mPtrNumNonExitingCtas != nullptr,
-              "Llama4 routing kernel expects permuted idx and grouped Gemm launch config buffers");
-  TORCH_CHECK(data.mTopK <= MaxNumTopExperts,
-              "Routing kernel expects topK experts <= ", MaxNumTopExperts, ", got ", data.mTopK);
-  TORCH_CHECK(data.mNumExperts <= MaxNumExperts, "Routing kernel expects #experts ",
-              data.mNumExperts, " to be at most max #experts ", MaxNumExperts);
+void runImpl(Data const& data, void* stream) {
+  TVM_FFI_ICHECK(data.mPtrExpertIdx != nullptr || data.mPtrScores != nullptr)
+      << "Routing kernel requires at least one input parameter";
+  TVM_FFI_ICHECK(data.mPtrPermutedIdxSize != nullptr && data.mPtrCtaIdxXyToBatchIdx != nullptr &&
+                 data.mPtrCtaIdxXyToMnLimit != nullptr && data.mPtrNumNonExitingCtas != nullptr)
+      << "Llama4 routing kernel expects permuted idx and grouped Gemm launch config buffers";
+  TVM_FFI_ICHECK_LE(data.mTopK, MaxNumTopExperts)
+      << "Routing kernel expects topK experts <= " << MaxNumTopExperts << ", got " << data.mTopK;
+  TVM_FFI_ICHECK_LE(data.mNumExperts, MaxNumExperts)
+      << "Routing kernel expects #experts " << data.mNumExperts << " to be at most max #experts "
+      << MaxNumExperts;
   static_assert(MaxNumExperts <= NumThreads, "#experts must be bounded by #threads");
   static_assert(MaxNumExperts <= NumThreadsHist, "#experts must be bounded by #threads");
-  TORCH_CHECK(data.mNumExperts % 4 == 0, "Routing kernel expects #experts ", data.mNumExperts,
-              " to be a multiple of 4.");
-  TORCH_CHECK(data.mPaddingLog2 < 8, "Routing kernel expects padding log2 < 8, got ",
-              data.mPaddingLog2);
+  TVM_FFI_ICHECK_EQ(data.mNumExperts % 4, 0)
+      << "Routing kernel expects #experts " << data.mNumExperts << " to be a multiple of 4.";
+  TVM_FFI_ICHECK_LT(data.mPaddingLog2, 8)
+      << "Routing kernel expects padding log2 < 8, got " << data.mPaddingLog2;
 
   bool const useSingleCluster =
       data.mNumTokens <=
       (data.mPtrScores != nullptr ? MaxNumTokensSingleClusterScores : MaxNumTokensSingleCluster);
 
   if (!useSingleCluster) {
-    TORCH_CHECK(data.mPtrExpertIdx != nullptr,
-                "When #tokens is large, `mPtrExpertIdx` is a required input.");
-    TORCH_CHECK(data.mPtrExpertCounts != nullptr,
-                "When #tokens is large, `mPtrExpertCounts` is a required input.");
+    TVM_FFI_ICHECK(data.mPtrExpertIdx != nullptr)
+        << "When #tokens is large, `mPtrExpertIdx` is a required input.";
+    TVM_FFI_ICHECK(data.mPtrExpertCounts != nullptr)
+        << "When #tokens is large, `mPtrExpertCounts` is a required input.";
   }
 
   if (useSingleCluster) {
@@ -290,6 +291,20 @@ void run(Data const& data, void* stream) {
                                    /*smemSize=*/0,  // No dynamic smem
                                    stream, data.mDoSoftmaxBeforeTopK, /*forceFloatInput=*/false);
   }
+}
+
+void run(Data const& data, void* stream) {
+  TVM_FFI_ICHECK(data.mPtrExpertIdx != nullptr || data.mPtrScores != nullptr)
+      << "Routing kernel requires at least one input parameter";
+  TVM_FFI_ICHECK(data.mPtrPermutedIdxSize != nullptr && data.mPtrCtaIdxXyToBatchIdx != nullptr &&
+                 data.mPtrCtaIdxXyToMnLimit != nullptr && data.mPtrNumNonExitingCtas != nullptr)
+      << "Llama4 routing kernel expects permuted idx and grouped Gemm launch config buffers";
+  TVM_FFI_ICHECK_LE(data.mTopK, MaxNumTopExperts)
+      << "Routing kernel expects topK experts <= " << MaxNumTopExperts << ", got " << data.mTopK;
+  TVM_FFI_ICHECK_LT(data.mPaddingLog2, 8)
+      << "Routing kernel expects padding log2 < 8, got " << data.mPaddingLog2;
+
+  runImpl(data, stream);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

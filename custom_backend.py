@@ -8,7 +8,7 @@ _data_dir = _root / "flashinfer" / "data"
 _aot_ops_dir = _root / "aot-ops"
 _aot_ops_package_dir = _root / "build" / "aot-ops-package-dir"
 
-_requires_for_aot = ["torch", "ninja", "numpy", "requests"]
+_requires_for_aot = ["torch", "ninja", "numpy", "requests", "apache-tvm-ffi"]
 
 
 def _rm_aot_ops_package_dir():
@@ -35,7 +35,6 @@ def _create_data_dir():
     ln("3rdparty/spdlog", "spdlog")
     ln("csrc", "csrc")
     ln("include", "include")
-    ln("tvm_binding", "tvm_binding")
 
 
 def _prepare_for_wheel():

@@ -83,7 +83,7 @@ struct ProfilerEntry {
 
 #define PROFILER_CLOSURE_FUNC_PARAMS , ProfilerClosure& profiler_closure
 
-#define PROFILER_FUNC_PARAMS , at::Tensor profiler_buffer
+#define PROFILER_FUNC_PARAMS , ffi::Tensor profiler_buffer
 #define PROFILER_PARAMS_DECL uint64_t* profiler_buffer;
 
 #define PROFILER_INIT(params, smem_storage, closure, group_idx, num_groups,     \

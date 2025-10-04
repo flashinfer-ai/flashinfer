@@ -20,33 +20,47 @@ limitations under the License.
 
 import os
 import pathlib
-import re
-import warnings
-
-from torch.utils.cpp_extension import _get_cuda_arch_flags
+from ..compilation_context import CompilationContext
 
 FLASHINFER_BASE_DIR = pathlib.Path(
     os.getenv("FLASHINFER_WORKSPACE_BASE", pathlib.Path.home().as_posix())
 )
 
 FLASHINFER_CACHE_DIR = FLASHINFER_BASE_DIR / ".cache" / "flashinfer"
-FLASHINFER_CUBIN_DIR = pathlib.Path(
-    os.getenv("FLASHINFER_CUBIN_DIR", (FLASHINFER_CACHE_DIR / "cubins").as_posix())
-)
+
+
+def _get_cubin_dir():
+    """
+    Get the cubin directory path with the following priority:
+    1. flashinfer-cubin package if installed
+    2. Environment variable FLASHINFER_CUBIN_DIR
+    3. Default cache directory
+    """
+    # First check if flashinfer-cubin package is installed
+    try:
+        import flashinfer_cubin
+
+        return pathlib.Path(flashinfer_cubin.get_cubin_dir())
+    except ImportError:
+        pass
+
+    # Then check environment variable
+    env_dir = os.getenv("FLASHINFER_CUBIN_DIR")
+    if env_dir:
+        return pathlib.Path(env_dir)
+
+    # Fall back to default cache directory
+    return FLASHINFER_CACHE_DIR / "cubins"
+
+
+FLASHINFER_CUBIN_DIR = _get_cubin_dir()
 
 
 def _get_workspace_dir_name() -> pathlib.Path:
-    try:
-        with warnings.catch_warnings():
-            # Ignore the warning for FLASHINFER_CUDA_ARCH_LIST not set
-            warnings.filterwarnings(
-                "ignore", r".*FLASHINFER_CUDA_ARCH_LIST.*", module="torch"
-            )
-            flags = _get_cuda_arch_flags()
-        arch = "_".join(sorted(set(re.findall(r"compute_(\d+)", "".join(flags)))))
-    except Exception:
-        arch = "noarch"
-    # e.g.: $HOME/.cache/flashinfer/75_80_89_90/
+    compilation_context = CompilationContext()
+    arch = "_".join(
+        f"{major}{minor}" for major, minor in compilation_context.TARGET_CUDA_ARCHS
+    )
     return FLASHINFER_CACHE_DIR / arch
 
 
@@ -59,7 +73,6 @@ FLASHINFER_DATA = _package_root / "data"
 FLASHINFER_INCLUDE_DIR = _package_root / "data" / "include"
 FLASHINFER_CSRC_DIR = _package_root / "data" / "csrc"
 # FLASHINFER_SRC_DIR = _package_root / "data" / "src"
-FLASHINFER_TVM_BINDING_DIR = _package_root / "data" / "tvm_binding"
 FLASHINFER_AOT_DIR = _package_root / "data" / "aot"
 CUTLASS_INCLUDE_DIRS = [
     _package_root / "data" / "cutlass" / "include",
