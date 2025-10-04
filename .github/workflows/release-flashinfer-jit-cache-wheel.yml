@@ -122,3 +122,42 @@ jobs:
                   name: ${{ steps.artifact-name.outputs.name }}
                   retention-days: 7
                   path: flashinfer-jit-cache/dist/*
+
+    release:
+        needs: build-wheel
+        runs-on: [self-hosted, Linux, x86_64]
+        steps:
+            - uses: actions/checkout@v4
+              with:
+                  ref: ${{ inputs.tag }}
+
+            - uses: actions/download-artifact@v4
+              with:
+                  path: dist/
+                  merge-multiple: true
+                  pattern: wheel-*
+
+            - run: ls -lah dist/
+
+            - uses: softprops/action-gh-release@v1
+              with:
+                  tag_name: ${{ inputs.tag }}
+                  files: |
+                      dist/flashinfer_jit_cache*.whl
+
+            - name: Clone wheel index
+              run: git clone https://oauth2:${WHL_TOKEN}@github.com/flashinfer-ai/whl.git flashinfer-whl
+              env:
+                  WHL_TOKEN: ${{ secrets.WHL_TOKEN }}
+
+            - name: Update wheel index
+              run: python3 scripts/update_flashinfer_jit_cache_whl_index.py
+
+            - name: Push wheel index
+              run: |
+                  cd flashinfer-whl
+                  git config --local user.name "github-actions[bot]"
+                  git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+                  git add -A
+                  git commit -m "update flashinfer-jit-cache whl"
+                  git push
