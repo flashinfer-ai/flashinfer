@@ -726,20 +726,17 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
       // We allow both tma warp specialized and SM80 configurations to coexist because for some
       // cases with small numbers of tokens SM80 is faster. We check here to see which is selected
       if (inputs.gemm_config.sm_version >= 90) {
-        // Check if the kernel config is compatible with the device architecture
-        // - SM100: compatible with 100/103/110/120/121
-        // - SM120 and SM121: architecturally identical, fully interchangeable
-        auto is_compatible = [](int config_sm, int device_sm) -> bool {
-          if (config_sm == device_sm) return true;
-          if (config_sm == 100 &&
-              (device_sm == 103 || device_sm == 110 || device_sm == 120 || device_sm == 121))
-            return true;
-          // SM120 and SM121 are interchangeable
-          if (config_sm == 120 && device_sm == 121) return true;
-          return false;
-        };
-
-        TLLM_CHECK_WITH_INFO(is_compatible(inputs.gemm_config.sm_version, sm_),
+        bool is_same_sm = inputs.gemm_config.sm_version == sm_;
+        // gemm_config.sm_version indicates the kernel pipeline, which is always 100 for 100, 103,
+        // 110, 120, 121. Below checks confirm the cutlass pipeline matches the device major
+        // version.
+        bool is_sm110 = inputs.gemm_config.sm_version == 100 && sm_ == 110;
+        bool is_sm103 = inputs.gemm_config.sm_version == 100 && sm_ == 103;
+        // SM120 and SM121 are architecturally identical, accept configs from either
+        bool is_sm120 =
+            (inputs.gemm_config.sm_version == 100 || inputs.gemm_config.sm_version == 120) &&
+            (sm_ == 120 || sm_ == 121);
+        TLLM_CHECK_WITH_INFO(is_same_sm || is_sm110 || is_sm103 || is_sm120,
                              "Using SM %d configuration for SM %d device",
                              inputs.gemm_config.sm_version, sm_);
         TLLM_CHECK_WITH_INFO(inputs.biases != nullptr || hopper_inputs.ptr_c == nullptr,
