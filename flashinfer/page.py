@@ -19,9 +19,7 @@ from typing import Optional, Tuple, Union
 
 import torch
 
-from .jit import JitSpec
-from .jit import env as jit_env
-from .jit import gen_jit_spec
+from .jit.page import gen_page_module
 from .utils import (
     TensorLayout,
     _check_kv_layout,
@@ -29,16 +27,6 @@ from .utils import (
     register_custom_op,
     register_fake_op,
 )
-
-
-def gen_page_module() -> JitSpec:
-    return gen_jit_spec(
-        "page",
-        [
-            jit_env.FLASHINFER_CSRC_DIR / "page.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "flashinfer_page_binding.cu",
-        ],
-    )
 
 
 @functools.cache

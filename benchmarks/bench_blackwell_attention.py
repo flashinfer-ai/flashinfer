@@ -81,6 +81,7 @@ def bench_fmha_blackwell(
 
 
 if __name__ == "__main__":
+    print("\n === head_dim=128 ===")
     bench_fmha_blackwell(128, 512, 32, 128, False, torch.bfloat16)
     bench_fmha_blackwell(64, 1024, 32, 128, False, torch.bfloat16)
     bench_fmha_blackwell(32, 2048, 32, 128, False, torch.bfloat16)
@@ -98,3 +99,22 @@ if __name__ == "__main__":
     bench_fmha_blackwell(4, 16384, 32, 128, True, torch.bfloat16)
     bench_fmha_blackwell(2, 32768, 32, 128, True, torch.bfloat16)
     bench_fmha_blackwell(1, 65536, 32, 128, True, torch.bfloat16)
+
+    print("\n === head_dim=64 ===")
+    bench_fmha_blackwell(128, 512, 32, 64, False, torch.bfloat16)
+    bench_fmha_blackwell(64, 1024, 32, 64, False, torch.bfloat16)
+    bench_fmha_blackwell(32, 2048, 32, 64, False, torch.bfloat16)
+    bench_fmha_blackwell(16, 4096, 32, 64, False, torch.bfloat16)
+    bench_fmha_blackwell(8, 8192, 32, 64, False, torch.bfloat16)
+    bench_fmha_blackwell(4, 16384, 32, 64, False, torch.bfloat16)
+    bench_fmha_blackwell(2, 32768, 32, 64, False, torch.bfloat16)
+    bench_fmha_blackwell(1, 65536, 32, 64, False, torch.bfloat16)
+
+    bench_fmha_blackwell(128, 512, 32, 64, True, torch.bfloat16)
+    bench_fmha_blackwell(64, 1024, 32, 64, True, torch.bfloat16)
+    bench_fmha_blackwell(32, 2048, 32, 64, True, torch.bfloat16)
+    bench_fmha_blackwell(16, 4096, 32, 64, True, torch.bfloat16)
+    bench_fmha_blackwell(8, 8192, 32, 64, True, torch.bfloat16)
+    bench_fmha_blackwell(4, 16384, 32, 64, True, torch.bfloat16)
+    bench_fmha_blackwell(2, 32768, 32, 64, True, torch.bfloat16)
+    bench_fmha_blackwell(1, 65536, 32, 64, True, torch.bfloat16)

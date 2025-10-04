@@ -19,20 +19,8 @@ from typing import Optional
 
 import torch
 
-from .jit import JitSpec
-from .jit import env as jit_env
-from .jit import gen_jit_spec
+from .jit.norm import gen_norm_module
 from .utils import device_support_pdl, register_custom_op, register_fake_op
-
-
-def gen_norm_module() -> JitSpec:
-    return gen_jit_spec(
-        "norm",
-        [
-            jit_env.FLASHINFER_CSRC_DIR / "norm.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "flashinfer_norm_binding.cu",
-        ],
-    )
 
 
 @functools.cache
@@ -54,7 +42,7 @@ def rmsnorm(
     Parameters
     ----------
     input: torch.Tensor
-        Input tensor, shape (batch_size, hidden_size).
+        Input tensor, 2D shape (batch_size, hidden_size) or 3D shape (batch_size, num_heads, hidden_size).
     weight: torch.Tensor
         Weight tensor, shape (hidden_size,).
     eps: float
@@ -68,7 +56,7 @@ def rmsnorm(
     Returns
     -------
     output: torch.Tensor
-        Normalized tensor, shape (batch_size, hidden_size).
+        Normalized tensor, 2D shape (batch_size, hidden_size) or 3D shape (batch_size, num_heads, hidden_size).
     """
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)

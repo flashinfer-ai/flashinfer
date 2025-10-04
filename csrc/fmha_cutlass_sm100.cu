@@ -43,6 +43,10 @@ using tvm::ffi::Optional;
       constexpr int HEAD_DIM_QK = 128;                                             \
       constexpr int HEAD_DIM_VO = 128;                                             \
       return __VA_ARGS__();                                                        \
+    } else if (head_dim_qk == 64 && head_dim_vo == 64) {                           \
+      constexpr int HEAD_DIM_QK = 64;                                              \
+      constexpr int HEAD_DIM_VO = 64;                                              \
+      return __VA_ARGS__();                                                        \
     }                                                                              \
     return false;                                                                  \
   }()
@@ -99,7 +103,7 @@ void FMHACutlassSM100Run(ffi::TensorView workspace_buffer, ffi::TensorView q, ff
     using cutlass_type_in = cutlass_dtype_t<DTypeIn>;
     using cutlass_type_out = cutlass_dtype_t<DTypeOut>;
     using TILE_Q = _256;
-    using TILE_KV = _128;
+    using TILE_KV = std::conditional_t<HEAD_DIM_QK == 64, _64, _128>;
     using D_QK = cute::Int<HEAD_DIM_QK>;
     using D_VO = cute::Int<HEAD_DIM_VO>;
     using TileShapeQK = Shape<TILE_Q, TILE_KV, D_QK>;

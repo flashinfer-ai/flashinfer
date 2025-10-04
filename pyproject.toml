@@ -38,33 +38,14 @@ skip = [
 ]
 
 [tool.setuptools]
-packages = [
-    "flashinfer",
-    "flashinfer.cute_dsl",
-    "flashinfer.data",
-    "flashinfer.data.aot",
-    "flashinfer.data.csrc",
-    "flashinfer.data.cutlass",
-    "flashinfer.data.spdlog",
-    "flashinfer.data.include",
-    "flashinfer.fused_moe",
-    "flashinfer.jit",
-    "flashinfer.jit.attention",
-    "flashinfer.jit.cutlass_gemm",
-    "flashinfer.testing",
-    "flashinfer.triton",
-    "flashinfer.tuning_configs",
-    "flashinfer.profiler",
-    "flashinfer.triton.kernels",
-    "flashinfer.comm",
-    "flashinfer.cudnn",
-    "flashinfer.logits_processor",
-]
 include-package-data = false
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["flashinfer*"]
 
 [tool.setuptools.package-dir]
 "flashinfer.data" = "."
-"flashinfer.data.aot" = "build/aot-ops-package-dir"
 "flashinfer.data.cutlass" = "3rdparty/cutlass"
 "flashinfer.data.spdlog" = "3rdparty/spdlog"
 
@@ -73,9 +54,6 @@ include-package-data = false
     "csrc/**",
     "include/**",
     "version.txt"
-]
-"flashinfer.data.aot" = [
-    "**"
 ]
 "flashinfer.data.cutlass" = [
     "include/**",
@@ -95,6 +73,7 @@ ignore_errors = false
 strict_optional = false
 exclude = [
     "flashinfer-cubin/",
+    "flashinfer-jit-cache/",
     "3rdparty/",
     "flashinfer/data/cutlass/",
     "build/",
