@@ -220,6 +220,11 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 
     mProfiler = std::make_shared<kernels::GemmProfilerBackend>();
     mAllProfiles = mKernelRunner->getTactics();
+    TVM_FFI_ICHECK(!mAllProfiles.empty())
+        << "No valid tactics available for fused moe op with the requested input combination "
+           "Activation: "
+        << DLDataTypeToString(mActivationDtype) << ", Weight: " << DLDataTypeToString(mWeightDtype)
+        << ", Output: " << DLDataTypeToString(mOutputDtype);
   }
 
   void runMoe(Tensor output, Tensor input, Tensor token_selected_experts,
