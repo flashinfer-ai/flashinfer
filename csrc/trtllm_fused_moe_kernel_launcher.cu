@@ -173,7 +173,7 @@ class FusedMoeLauncher {
 
     check_routing_logits_shape();
 
-    if (routing_bias.has_value()) {
+    if (routing_bias.defined()) {
       check_routing_bias_shape();
     }
   }
