@@ -728,14 +728,11 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
       if (inputs.gemm_config.sm_version >= 90) {
         bool is_same_sm = inputs.gemm_config.sm_version == sm_;
         // gemm_config.sm_version indicates the kernel pipeline, which is always 100 for 100, 103,
-        // 110, 120, 121. Below checks confirm the cutlass pipeline matches the device major
-        // version.
+        // 110 below logging helps confirming the cutlass pipeline matches the device major version
         bool is_sm110 = inputs.gemm_config.sm_version == 100 && sm_ == 110;
         bool is_sm103 = inputs.gemm_config.sm_version == 100 && sm_ == 103;
-        // SM120 and SM121 are architecturally identical, accept configs from either
-        bool is_sm120 =
-            (inputs.gemm_config.sm_version == 100 || inputs.gemm_config.sm_version == 120) &&
-            (sm_ == 120 || sm_ == 121);
+        // SM120 and SM121 are architecturally identical
+        bool is_sm120 = (inputs.gemm_config.sm_version == 120) && (sm_ == 120 || sm_ == 121);
         TLLM_CHECK_WITH_INFO(is_same_sm || is_sm110 || is_sm103 || is_sm120,
                              "Using SM %d configuration for SM %d device",
                              inputs.gemm_config.sm_version, sm_);
