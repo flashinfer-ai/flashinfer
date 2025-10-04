@@ -67,14 +67,14 @@ Driver calls take place to carry out the gemm operations.
 
 class FusedMoeLauncher {
  protected:
-  Tensor const* routing_logits{};
-  Tensor const* routing_bias{};
-  Tensor const* hidden_states{};
-  Tensor const* gemm1_weights{};
-  Tensor const* output1_scales_scalar{};
-  Tensor const* output1_scales_gate_scalar{};
-  Tensor const* gemm2_weights{};
-  Tensor const* output2_scales_scalar{};
+  Tensor routing_logits{};
+  Tensor routing_bias{};
+  Tensor hidden_states{};
+  Tensor gemm1_weights{};
+  Tensor output1_scales_scalar{};
+  Tensor output1_scales_gate_scalar{};
+  Tensor gemm2_weights{};
+  Tensor output2_scales_scalar{};
 
   int64_t tile_tokens_dim{};
   int64_t routing_method_type{};
@@ -91,9 +91,9 @@ class FusedMoeLauncher {
 
   // Initialize common data necessary for later.
   // May throw exception from TVM_FFI_ICHECK.
-  void init_common(Tensor const* routing_logits, Tensor const* routing_bias,
-                   Tensor const* hidden_states, Tensor const* gemm1_weights,
-                   Tensor const* gemm2_weights,
+  void init_common(Tensor const& routing_logits, Optional<Tensor> const& routing_bias,
+                   Tensor const& hidden_states, Tensor const& gemm1_weights,
+                   Tensor const& gemm2_weights,
                    std::unique_ptr<tensorrt_llm::kernels::trtllmgen_moe::MoE::MoERunnerArgs>&& args,
                    int64_t tile_tokens_dim, int64_t routing_method_type, bool use_shuffled_weight,
                    int64_t weight_layout, int64_t gated_act_type);
@@ -109,7 +109,7 @@ class FusedMoeLauncher {
 
   // Routing bias [num_experts]
   void check_routing_bias_shape() const {
-    if (routing_bias != nullptr) {
+    if (routing_bias.defined()) {
       TVM_FFI_ICHECK_EQ(routing_bias->ndim, 1) << "routing_bias must be 1D.";
       TVM_FFI_ICHECK_EQ(routing_bias->shape[0], args->num_experts)
           << "routing_bias has incorrect shape.";
@@ -125,7 +125,7 @@ class FusedMoeLauncher {
 
   // GEMM1 or GEMM2 weights [num_experts, M, K] or [num_experts, K/block_k, M, block_k]
   void check_weights_shape(std::string which_weights) const {
-    Tensor const* weights{};
+    Tensor weights{};
     if (which_weights == "gemm1") {
       weights = gemm1_weights;
     } else if (which_weights == "gemm2") {
@@ -323,13 +323,12 @@ class FusedMoeLauncher {
 };
 
 void FusedMoeLauncher::init_common(
-    Tensor const* routing_logits, Tensor const* routing_bias, Tensor const* hidden_states,
-    Tensor const* gemm1_weights, Tensor const* gemm2_weights,
+    Tensor const& routing_logits, Optional<Tensor> const& routing_bias, Tensor const& hidden_states,
+    Tensor const& gemm1_weights, Tensor const& gemm2_weights,
     std::unique_ptr<tensorrt_llm::kernels::trtllmgen_moe::MoE::MoERunnerArgs>&& args,
     int64_t tile_tokens_dim, int64_t routing_method_type, bool use_shuffled_weight,
     int64_t weight_layout, int64_t gated_act_type) {
   // Check devicearchitecture: Blackwell (SM 10.x) required
-  TVM_FFI_ICHECK(hidden_states != nullptr) << "hidden_states is required";
   auto device = hidden_states->device.device_id;
   int major = 0, minor = 0;
   cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
@@ -345,7 +344,7 @@ void FusedMoeLauncher::init_common(
   this->gemm2_weights = gemm2_weights;
 
   args->routing_logits = routing_logits->data;
-  args->routing_bias = routing_bias ? routing_bias->data : nullptr;
+  args->routing_bias = routing_bias.has_value() ? routing_bias.value()->data : nullptr;
   args->hidden_states = hidden_states->data;
   args->gemm1_weights = gemm1_weights->data;
   args->gemm2_weights = gemm2_weights->data;
@@ -376,9 +375,8 @@ class Bf16MoeLauncher : public FusedMoeLauncher {
 
     // Do base class init and perform common checks
     FusedMoeLauncher::init_common(
-        &routing_logits, routing_bias.has_value() ? &routing_bias.value() : nullptr, &hidden_states,
-        &gemm1_weights, &gemm2_weights, std::move(args), tile_tokens_dim, routing_method_type,
-        use_shuffled_weight, weight_layout, gated_act_type);
+        routing_logits, routing_bias, hidden_states, gemm1_weights, gemm2_weights, std::move(args),
+        tile_tokens_dim, routing_method_type, use_shuffled_weight, weight_layout, gated_act_type);
   }
 
   void check_routing() const override {
