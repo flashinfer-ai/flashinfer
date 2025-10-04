@@ -31,7 +31,6 @@
 namespace batchedGemm {
 
 namespace batchedGemm {
-
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // TODO: Find a better header to put this in, that we can include from here.
@@ -137,12 +136,11 @@ static auto makeTmaShapeStrideAbc(GemmOptions const& options, int mM, int mN, in
   std::vector<uint64_t> shape = {static_cast<uint64_t>(hiddenSize),
                                  static_cast<uint64_t>(numTokens)};
   if (useTmaOobOpt /* also implies input/output activation */) {
-    // If TMA OOB optimization is used, we use 3D logical shape (M, tileM, K) or (N, tileN, K).
-    // The outer dimension is extended to make room for the possible counterbalance positive
-    // offset from the middle "bound" dimension. The counterbalance should be no more than
-    // ctaTileNumTokens.
+    // If TMA OOB optimization is used:
+    // Shape [hidden, tokens]                      Stride [1, hidden] becomes
+    // Shape [hidden, tileN, TmaDimMax, TmaDimMax] Stride [1, hidden, XLargeN - hidden, hidden]
     shape = {static_cast<uint64_t>(hiddenSize), static_cast<uint64_t>(ctaTileNumTokens),
-             static_cast<uint64_t>(numTokens + ctaTileNumTokens)};
+             static_cast<uint64_t>(tg::TmaDimMax), static_cast<uint64_t>(tg::TmaDimMax)};
   } else if (isWeights) {
     // If the matrix is a weights matrix, we use 3D logical shape (B, M, K) or (B, N, K).
     shape = {static_cast<uint64_t>(hiddenSize), static_cast<uint64_t>(numTokens),
@@ -153,7 +151,8 @@ static auto makeTmaShapeStrideAbc(GemmOptions const& options, int mM, int mN, in
   // Swap the first two dimension as mentioned before.
   std::vector<uint64_t> stride = {1, static_cast<uint64_t>(hiddenSize)};
   if (useTmaOobOpt) {
-    stride = {1, static_cast<uint64_t>(hiddenSize), static_cast<uint64_t>(hiddenSize)};
+    stride = {1, static_cast<uint64_t>(hiddenSize), static_cast<uint64_t>(tg::XLargeN - hiddenSize),
+              static_cast<uint64_t>(hiddenSize)};
   } else if (isWeights) {
     stride = {1, static_cast<uint64_t>(hiddenSize),
               static_cast<uint64_t>(hiddenSize) * static_cast<uint64_t>(numTokens)};

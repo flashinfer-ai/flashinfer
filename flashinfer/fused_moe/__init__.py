@@ -29,6 +29,7 @@ from .core import (
     trtllm_fp4_block_scale_routed_moe,
     trtllm_fp8_block_scale_moe,
     trtllm_fp8_per_tensor_scale_moe,
+    trtllm_bf16_moe,
 )
 
 __all__ = [
@@ -44,4 +45,5 @@ __all__ = [
     "trtllm_fp4_block_scale_moe",
     "trtllm_fp8_block_scale_moe",
     "trtllm_fp8_per_tensor_scale_moe",
+    "trtllm_bf16_moe",
 ]
