@@ -19,6 +19,7 @@ from enum import Enum
 from types import SimpleNamespace
 from typing import List, Literal, Optional, Tuple
 
+from flashinfer.trtllm_low_latency_gemm import trtllm_low_latency_gemm
 import torch
 
 from .autotuner import (
@@ -34,6 +35,7 @@ from .fused_moe.utils import (
     last_positive_power_of_2,
 )
 from .utils import (
+    get_native_fp4_dtype,
     is_sm100a_supported,
     is_sm100f_supported,
     is_sm120a_supported,
@@ -1153,14 +1155,6 @@ def _is_cublas_fp4_available_in_cudnn():
     )
 
 
-def _get_native_fp4_dtype():
-    """get native fp4 datatype if supported in the torch, otherwise return uint8."""
-    if hasattr(torch, "float4_e2m1fn_x2"):
-        return torch.float4_e2m1fn_x2
-    else:
-        return torch.uint8
-
-
 # Global cudnn handle. need to make it per device in future
 _cudnn_handle = None
 
@@ -1299,8 +1293,8 @@ def execute_cudnn_gemm_fp4_graph(
     workspace_buffer,
 ):
     variant_pack = {
-        UIDs.A_UID.value: a.view(_get_native_fp4_dtype()),
-        UIDs.B_UID.value: b.view(_get_native_fp4_dtype()),
+        UIDs.A_UID.value: a.view(get_native_fp4_dtype()),
+        UIDs.B_UID.value: b.view(get_native_fp4_dtype()),
         UIDs.BLOCK_DESCALE_A_UID.value: a_descale,
         UIDs.BLOCK_DESCALE_B_UID.value: b_descale,
         UIDs.O_UID.value: c_final,
@@ -1540,6 +1534,116 @@ def _expand_block_scale_tensor_shape(block_scale_tensor, batch_size):
     return (tuple(block_scale_shape), tuple(block_scale_stride))
 
 
+def mm_fp8(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    alpha: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    out: Optional[torch.Tensor] = None,
+    backend: Literal["trtllm_low_latency"] = "trtllm_low_latency",
+):
+    r"""FP8 matrix multiplication.
+
+    Parameters
+    ----------
+    a: torch.Tensor
+        Input tensor, shape (m, k), fp8 e4m3.
+
+    b: torch.Tensor
+        - When using "trtllm_low_latency" backend,
+          Weight tensor, shape (k // block_size, n, block_size), fp8 e4m3
+          B needs to be pre-processed using `prepare_low_latency_gemm_weights`.
+          block_size is 128 for e4m3.
+
+    alpha: Optional[torch.Tensor]
+        Scale tensor for the output, float. If None, defaults to 1.0 for no scaling.
+
+    out_dtype: torch.dtype
+        Output tensor data type. Default is torch.bfloat16.
+
+    out: Optional[torch.Tensor]
+        Output tensor, shape (m, n). If None, a new tensor will be allocated.
+
+    backend: Literal["trtllm_low_latency"]
+        Backend to use for computation. Default is "trtllm_low_latency".
+        - "trtllm_low_latency": optimized for small M dimension.
+
+    Returns
+    -------
+    torch.Tensor
+        Output tensor of shape (m, n) with dtype `out_dtype`.
+
+    Examples
+    --------
+    >>> import torch
+    >>> from flashinfer import mm_fp8, prepare_low_latency_gemm_weights
+    >>> m = 16
+    >>> n = 2560
+    >>> k = 32768
+    >>> a = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
+    >>> a_fp8, a_inv_s = to_float8(a, dtype=torch.float8_e4m3fn)
+    >>> b = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
+    >>> b_fp8, b_inv_s = to_float8(b, dtype=torch.float8_e4m3fn)
+    >>> prepared_b = prepare_low_latency_gemm_weights(b_fp8)
+    >>> alpha = a_inv_s * b_inv_s
+    >>> out = mm_fp8(a_fp8, prepared_b, alpha)
+    >>> out.shape
+    torch.Size([16, 2560])
+    """
+
+    supported_out_dtypes = (torch.bfloat16,)
+    supported_backends = ("trtllm_low_latency",)
+
+    if backend == "trtllm_low_latency":
+        m = a.shape[0]
+        n = b.shape[1]
+    else:
+        raise ValueError(
+            f"Unsupported backend: {backend}. "
+            f"Only {supported_backends} are supported for FP8 GEMM operations."
+        )
+
+    # allocate the output tensor if not provided
+    if out is None:
+        if out_dtype not in supported_out_dtypes:
+            raise ValueError(
+                f"Unsupported output dtype: {out_dtype}. "
+                f"Only {supported_out_dtypes} are supported for FP8 GEMM operations."
+            )
+        out = torch.empty(
+            (m, n),
+            device=a.device,
+            dtype=out_dtype,
+        )
+    else:
+        if out.dtype not in supported_out_dtypes:
+            raise ValueError(
+                f"Unsupported output dtype: {out.dtype}. "
+                f"Only {supported_out_dtypes} are supported for FP8 GEMM operations."
+            )
+        if out.shape != (a.shape[0], b.shape[1]):
+            raise ValueError(
+                f"Output shape mismatch. Expected {a.shape[0], b.shape[1]}, got {out.shape}."
+            )
+        if out.device != a.device:
+            raise ValueError(
+                f"Output device mismatch. Expected {a.device}, got {out.device}."
+            )
+        if out_dtype is not None and out.dtype != out_dtype:
+            raise ValueError(
+                f"Output dtype mismatch. Expected {out_dtype}, got {out.dtype}."
+            )
+
+    if backend == "trtllm_low_latency":
+        trtllm_low_latency_gemm(a, b, alpha, out)
+    else:
+        raise ValueError(
+            f"Unsupported backend: {backend}. "
+            f"Only {supported_backends} are supported for FP8 GEMM operations."
+        )
+    return out
+
+
 def mm_fp4(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -1621,9 +1725,9 @@ def mm_fp4(
         raise ValueError(
             f"K dimension mismatch in mm_fp4. got a.shape[1] = {a.shape[1]}, b.shape[0] = {b.shape[0]}"
         )
-    if a.dtype not in {torch.uint8, _get_native_fp4_dtype()} or b.dtype not in {
+    if a.dtype not in {torch.uint8, get_native_fp4_dtype()} or b.dtype not in {
         torch.uint8,
-        _get_native_fp4_dtype(),
+        get_native_fp4_dtype(),
     }:
         raise ValueError(
             f"a and b must have float4_e2m1fn_x2 packed into uint8. "

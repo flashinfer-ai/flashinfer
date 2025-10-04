@@ -192,7 +192,7 @@ def _maybe_get_cached_w3_w1_permute_indices(
     return permute_indices
 
 
-def _maybe_get_cached_w2_permute_indices(
+def get_w2_permute_indices_with_cache(
     _cache_permute_indices,
     dst_w2_weight: torch.Tensor,
     epilogue_tile_m: int,
