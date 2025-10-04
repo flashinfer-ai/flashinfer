@@ -24,15 +24,15 @@ CUDA_VERSION=${1:-cu128}
 
 pip3 install torch --index-url https://download.pytorch.org/whl/${CUDA_VERSION}
 pip3 install requests responses ninja pytest numpy scipy build nvidia-ml-py cuda-python einops nvidia-nvshmem-cu12
-pip3 install 'apache-tvm-ffi==0.1.0b11'
+pip3 install 'apache-tvm-ffi==0.1.0b15'
 pip3 install nvidia-cutlass-dsl
 pip3 install 'nvidia-cudnn-frontend>=1.13.0'
 
 # Install cudnn package based on CUDA version
 if [[ "$CUDA_VERSION" == *"cu13"* ]]; then
-    pip3 install --upgrade cuda-python==13.0
-    pip3 install "nvidia-cudnn-cu13>=9.12.0.46"
+  pip3 install --upgrade cuda-python==13.0
+  pip3 install "nvidia-cudnn-cu13>=9.12.0.46"
 else
-    pip3 install --upgrade cuda-python==12.*
-    pip3 install "nvidia-cudnn-cu12>=9.11.0.98"
+  pip3 install --upgrade cuda-python==12.*
+  pip3 install "nvidia-cudnn-cu12>=9.11.0.98"
 fi
