@@ -225,7 +225,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
   void runMoe(TensorView output, TensorView input, TensorView token_selected_experts,
               Optional<TensorView> token_final_scales, TensorView fc1_expert_weights,
               Optional<TensorView> fc1_expert_biases, TensorView fc2_expert_weights,
-              Optional<TensorView> fc2_expert_biases, Optional<Array<TensorView>> quant_scales,
+              Optional<TensorView> fc2_expert_biases, Optional<Array<Tensor>> quant_scales,
               Optional<TensorView> input_sf, Optional<TensorView> swiglu_alpha,
               Optional<TensorView> swiglu_beta, Optional<TensorView> swiglu_limit, int64_t tp_size,
               int64_t tp_rank, int64_t ep_size, int64_t ep_rank, int64_t cluster_size,
@@ -394,7 +394,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                          Optional<TensorView> token_final_scales, TensorView fc1_expert_weights,
                          Optional<TensorView> fc1_expert_biases, TensorView fc2_expert_weights,
                          Optional<TensorView> fc2_expert_biases,
-                         Optional<Array<TensorView>> quant_scales, Optional<TensorView> input_sf,
+                         Optional<Array<Tensor>> quant_scales, Optional<TensorView> input_sf,
                          Optional<TensorView> swiglu_alpha, Optional<TensorView> swiglu_beta,
                          Optional<TensorView> swiglu_limit, TensorView num_active_experts_per_node,
                          TensorView experts_to_token_score, TensorView active_expert_global_ids,
@@ -670,7 +670,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
           [this](TensorView output, TensorView input, TensorView token_selected_experts,
                  Optional<TensorView> token_final_scales, TensorView fc1_expert_weights,
                  Optional<TensorView> fc1_expert_biases, TensorView fc2_expert_weights,
-                 Optional<TensorView> fc2_expert_biases, Optional<Array<TensorView>> quant_scales,
+                 Optional<TensorView> fc2_expert_biases, Optional<Array<Tensor>> quant_scales,
                  Optional<TensorView> input_sf, Optional<TensorView> swiglu_alpha,
                  Optional<TensorView> swiglu_beta, Optional<TensorView> swiglu_limit,
                  int64_t tp_size, int64_t tp_rank, int64_t ep_size, int64_t ep_rank,
@@ -687,7 +687,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
           [this](TensorView output, TensorView input, TensorView token_selected_experts,
                  Optional<TensorView> token_final_scales, TensorView fc1_expert_weights,
                  Optional<TensorView> fc1_expert_biases, TensorView fc2_expert_weights,
-                 Optional<TensorView> fc2_expert_biases, Optional<Array<TensorView>> quant_scales,
+                 Optional<TensorView> fc2_expert_biases, Optional<Array<Tensor>> quant_scales,
                  Optional<TensorView> input_sf, Optional<TensorView> swiglu_alpha,
                  Optional<TensorView> swiglu_beta, Optional<TensorView> swiglu_limit,
                  TensorView num_active_experts_per_node, TensorView experts_to_token_score,
@@ -784,7 +784,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 
   kernels::QuantParams getQuantParams(int64_t num_experts_on_rank, int64_t hidden_size,
                                       int64_t inter_size,
-                                      Optional<Array<TensorView>> quant_scales) const {
+                                      Optional<Array<Tensor>> quant_scales) const {
     if (isFp8Quant()) {
       TVM_FFI_ICHECK(quant_scales.has_value()) << "Expecting quant scales for fp8 quantization";
       TVM_FFI_ICHECK_EQ(quant_scales.value().size(), 4)
