@@ -35,6 +35,8 @@ namespace btg = batchedGemm::trtllm::gen;
 using batchedGemm::gemm::MatrixLayout;
 using tensorrt_llm::kernels::trtllmgen_moe::MoE::GatedActType;
 using tensorrt_llm::kernels::trtllmgen_moe::Routing::RoutingMethodType;
+using tvm::ffi::Array;
+using tvm::ffi::Optional;
 
 /*
 
@@ -481,8 +483,6 @@ Tensor trtllm_bf16_moe(Tensor const& routing_logits, Optional<Tensor> const& rou
   auto data = launcher.run(moe_tactic, enable_pdl)[0];
   return data;
 }
-using tvm::ffi::Array;
-using tvm::ffi::Optional;
 
 Tensor trtllm_fp8_per_tensor_scale_moe_launcher(
     Tensor routing_logits, Optional<Tensor> routing_bias, Tensor hidden_states,
