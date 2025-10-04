@@ -33,7 +33,7 @@ void xqa_wrapper(int64_t multiProcessorCount, int64_t nbKHeads, int64_t slidingW
                  TensorView semaphores, TensorView scratch) {
   auto stream = get_stream(output->device);
   float const* attentionSinksPtr =
-      attentionSinks.defined() ? reinterpret_cast<float const*>(attentionSinks->data) : nullptr;
+      attentionSinks.has_value() ? reinterpret_cast<float const*>(attentionSinks->data) : nullptr;
 
   launchMHAFlashInfer(multiProcessorCount, nbKHeads, slidingWinSize, qScale,
                       reinterpret_cast<OutputHead*>(output->data),
