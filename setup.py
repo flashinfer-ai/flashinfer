@@ -51,7 +51,7 @@ install_requires = [
     "click",
     "tqdm",
     "tabulate",
-    "apache-tvm-ffi==0.1.0b11",
+    "apache-tvm-ffi==0.1.0b15",
     "packaging>=24.2",
     "nvidia-cudnn-frontend>=1.13.0",
     "nvidia-cutlass-dsl>=4.2.1",
