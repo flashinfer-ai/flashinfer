@@ -1838,8 +1838,8 @@ def cache_permute_indices():
 
 
 @pytest.mark.parametrize("num_tokens", [1, 8, 1024])
-@pytest.mark.parametrize("hidden_size", [1024, 8192])
-@pytest.mark.parametrize("intermediate_size", [2048, 1024, 768, 384])
+@pytest.mark.parametrize("hidden_size", [1024, 2048, 8192])
+@pytest.mark.parametrize("intermediate_size", [2048, 1024, 5120, 768, 384])
 @pytest.mark.parametrize(
     "moe_impl",
     [
@@ -1858,8 +1858,8 @@ def cache_permute_indices():
                 "num_experts": 384,
                 "top_k": 8,
                 "padding": 8,
-                "n_groups": 12,
-                "top_k_groups": 4,
+                "n_groups": 1,
+                "top_k_groups": 1,
                 "routed_scaling": 2.5,
                 "has_routing_bias": True,
                 "routing_method_type": RoutingMethodType.DeepSeekV3,
@@ -1906,8 +1906,8 @@ def cache_permute_indices():
         ),
         pytest.param(
             {
-                "num_experts": 128,
-                "top_k": 8,
+                "num_experts": 512,
+                "top_k": 10,
                 "padding": 8,
                 "n_groups": None,
                 "top_k_groups": None,
@@ -1917,21 +1917,21 @@ def cache_permute_indices():
                 "compatible_moe_impls": [FP4Moe, FP8PerTensorMoe, FP8BlockScaleMoe],
             },
             id="Renorm",
-            marks=pytest.mark.skip(
-                reason="Disabled for testing speed - similar to RenormalizeNaive"
-            ),
+            # marks=pytest.mark.skip(
+            #     reason="Disabled for testing speed - similar to RenormalizeNaive"
+            # ),
         ),
         pytest.param(
             {
-                "num_experts": 128,
-                "top_k": 8,
+                "num_experts": 512,
+                "top_k": 10,
                 "padding": 8,
                 "n_groups": None,
                 "top_k_groups": None,
                 "routed_scaling": None,
                 "has_routing_bias": False,
                 "routing_method_type": RoutingMethodType.RenormalizeNaive,
-                "compatible_moe_impls": [FP4Moe],
+                "compatible_moe_impls": [FP4Moe, FP8BlockScaleMoe],
             },
             id="RenormNaive",
         ),
@@ -2034,13 +2034,13 @@ def test_moe_quantization_classes(
         pytest.skip(
             f"Incompatible: {moe_impl.name} + {gated_act_type} + {routing_config['routing_method_type']} + {num_tokens}"
         )
-    elif gated_act_type == GatedActType.SwiGlu and (
-        hidden_size > 1024 or intermediate_size > 1024
-    ):
-        # Skip some tests for SwiGlu for testing speed
-        pytest.skip(
-            f"Skip for testing speed: {gated_act_type} + {hidden_size} + {intermediate_size}"
-        )
+    # elif gated_act_type == GatedActType.SwiGlu and (
+    #     hidden_size > 1024 or intermediate_size > 1024
+    # ):
+    #     # Skip some tests for SwiGlu for testing speed
+    #     pytest.skip(
+    #         f"Skip for testing speed: {gated_act_type} + {hidden_size} + {intermediate_size}"
+    #     )
 
     if type(moe_impl) not in routing_config["compatible_moe_impls"]:
         pytest.skip(
@@ -2079,7 +2079,7 @@ def test_moe_quantization_classes(
 
     # Validation checks
     assert top_k <= num_experts
-    assert top_k <= 8
+    # assert top_k <= 8
     if (top_k_groups is not None) and (n_groups is not None) and (n_groups > 0):
         assert top_k_groups <= 4
         assert num_experts > n_groups
