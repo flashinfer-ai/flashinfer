@@ -17,12 +17,14 @@
 #include "../tvm_ffi_utils.h"
 #include "mha.h"
 
+using tvm::ffi::Optional;
+
 void xqa_wrapper(int64_t multiProcessorCount, int64_t nbKHeads, int64_t slidingWinSize,
                  double qScale, TensorView output,
 #if LOW_PREC_OUTPUT
                  TensorView rcpOutScale,
 #endif
-                 TensorView q, TensorView attentionSinks, TensorView pool,
+                 TensorView q, Optional<TensorView> attentionSinks, TensorView pool,
                  TensorView kvCachePageList, int64_t maxSeqLen, TensorView seqLen,
                  int64_t batchSize, TensorView kvCacheScale,
 #if SPEC_DEC
