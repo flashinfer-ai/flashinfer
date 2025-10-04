@@ -145,7 +145,8 @@ class FusedMoeLauncher {
       int64_t block_k = weights->shape[3];
       K = weights->shape[1] * block_k;
     } else {
-      TVM_FFI_LOG_AND_THROW(NotImplementedError) << "Unsupported weight_layout: " << weight_layout;
+      TVM_FFI_LOG_AND_THROW(NotImplementedError)
+          << "Unsupported weight_layout: " << (int)weight_layout;
     }
     TVM_FFI_ICHECK_EQ(weights->shape[0], args->num_experts)
         << which_weights << " weights expert dimension must match num_experts";
@@ -172,7 +173,7 @@ class FusedMoeLauncher {
 
     check_routing_logits_shape();
 
-    if (routing_bias) {
+    if (routing_bias.has_value()) {
       check_routing_bias_shape();
     }
   }
@@ -338,7 +339,9 @@ void FusedMoeLauncher::init_common(
   this->device_version = std::make_tuple(major, minor);
 
   this->routing_logits = routing_logits;
-  this->routing_bias = routing_bias;
+  if (routing_bias.has_value()) {
+    this->routing_bias = routing_bias.value();
+  }
   this->hidden_states = hidden_states;
   this->gemm1_weights = gemm1_weights;
   this->gemm2_weights = gemm2_weights;
@@ -735,9 +738,9 @@ Tensor trtllm_fp8_per_tensor_scale_moe(
         n_group, topk_group, intermediate_size, local_expert_offset, local_num_experts,
         routed_scaling_factor, use_routing_scales_on_input, tile_tokens_dim, routing_method_type,
         enable_pdl);
-  } else {
-    TVM_FFI_LOG_AND_THROW(NotImplementedError) << "Unsupported input dtype.";
   }
+
+  TVM_FFI_LOG_AND_THROW(NotImplementedError) << "Unsupported input dtype.";
 }
 
 void trtllm_fp8_block_scale_moe_launcher(
