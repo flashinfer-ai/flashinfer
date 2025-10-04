@@ -262,12 +262,12 @@ class JitSpec:
                 self.write_ninja()
             run_ninja(jit_env.FLASHINFER_JIT_DIR, self.ninja_path, verbose)
 
-    def load(self, so_path: Path, class_name: str = None):
+    def load(self, so_path: Path):
         return tvm_ffi.load_module(str(so_path))
 
-    def build_and_load(self, class_name: str = None):
+    def build_and_load(self):
         if self.is_aot:
-            return self.load(self.aot_path, class_name)
+            return self.load(self.aot_path)
 
         # Guard both build and load with the same lock to avoid race condition
         # where another process is building the library and removes the .so file.
@@ -275,7 +275,7 @@ class JitSpec:
             so_path = self.jit_library_path
             verbose = os.environ.get("FLASHINFER_JIT_VERBOSE", "0") == "1"
             self.build(verbose, need_lock=False)
-            result = self.load(so_path, class_name)
+            result = self.load(so_path)
 
         return result
 

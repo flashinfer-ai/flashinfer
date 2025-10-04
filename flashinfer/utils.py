@@ -186,7 +186,7 @@ _cache_buf: Dict[Tuple[str, torch.device], torch.Tensor] = {}
 def _get_cache_buf(name: str, bytes: int, device: torch.device) -> torch.Tensor:
     key = (name, device)
     buf = _cache_buf.get(key)
-    if buf is None:
+    if buf is None or buf.size(0) < bytes:
         buf = torch.empty(bytes, dtype=torch.uint8, device=device)
         _cache_buf[key] = buf
     return buf
@@ -741,3 +741,11 @@ def get_shuffle_matrix_sf_a_row_indices(
     row_indices = get_shuffle_matrix_a_row_indices(input_tensor, epilogue_tile_m)
 
     return row_indices
+
+
+def get_native_fp4_dtype():
+    """get native fp4 datatype if supported in Torch, otherwise return uint8."""
+    if hasattr(torch, "float4_e2m1fn_x2"):
+        return torch.float4_e2m1fn_x2
+    else:
+        return torch.uint8
