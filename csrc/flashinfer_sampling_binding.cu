@@ -17,45 +17,50 @@
 
 using tvm::ffi::Optional;
 
-void softmax(Tensor workspace_buffer, Tensor logits, Tensor output,
-             Optional<Tensor> maybe_temperature_arr, double temperature_val, bool enable_pdl);
+void softmax(TensorView workspace_buffer, TensorView logits, TensorView output,
+             Optional<TensorView> maybe_temperature_arr, double temperature_val, bool enable_pdl);
 
-void sampling_from_probs(Tensor probs, Tensor output, Optional<Tensor> maybe_indices,
+void sampling_from_probs(TensorView probs, TensorView output, Optional<TensorView> maybe_indices,
                          bool deterministic, uint64_t philox_seed, uint64_t philox_offset);
 
-void sampling_from_logits(Tensor logits, Tensor output, Optional<Tensor> maybe_indices,
+void sampling_from_logits(TensorView logits, TensorView output, Optional<TensorView> maybe_indices,
                           bool deterministic, uint64_t philox_seed, uint64_t philox_offset);
 
-void top_p_sampling_from_probs(Tensor probs, Tensor output, Optional<Tensor> maybe_indices,
-                               Optional<Tensor> maybe_top_p_arr, double top_p_val,
+void top_p_sampling_from_probs(TensorView probs, TensorView output,
+                               Optional<TensorView> maybe_indices,
+                               Optional<TensorView> maybe_top_p_arr, double top_p_val,
                                bool deterministic, uint64_t philox_seed, uint64_t philox_offset);
 
-void top_k_sampling_from_probs(Tensor probs, Tensor output, Optional<Tensor> maybe_indices,
-                               Optional<Tensor> maybe_top_k_arr, int64_t top_k_val,
+void top_k_sampling_from_probs(TensorView probs, TensorView output,
+                               Optional<TensorView> maybe_indices,
+                               Optional<TensorView> maybe_top_k_arr, int64_t top_k_val,
                                bool deterministic, uint64_t philox_seed, uint64_t philox_offset);
 
-void min_p_sampling_from_probs(Tensor probs, Tensor output, Optional<Tensor> maybe_indices,
-                               Optional<Tensor> maybe_min_p_arr, double min_p_val,
+void min_p_sampling_from_probs(TensorView probs, TensorView output,
+                               Optional<TensorView> maybe_indices,
+                               Optional<TensorView> maybe_min_p_arr, double min_p_val,
                                bool deterministic, uint64_t philox_seed, uint64_t philox_offset);
 
-void top_k_top_p_sampling_from_probs(Tensor probs, Tensor output, Optional<Tensor> maybe_indices,
-                                     Optional<Tensor> maybe_top_k_arr, double top_k_val,
-                                     Optional<Tensor> maybe_top_p_arr, double top_p_val,
+void top_k_top_p_sampling_from_probs(TensorView probs, TensorView output,
+                                     Optional<TensorView> maybe_indices,
+                                     Optional<TensorView> maybe_top_k_arr, double top_k_val,
+                                     Optional<TensorView> maybe_top_p_arr, double top_p_val,
                                      bool deterministic, uint64_t philox_seed,
                                      uint64_t philox_offset);
 
-void top_p_renorm_probs(Tensor probs, Tensor renorm_probs, Optional<Tensor> maybe_top_p_arr,
-                        double top_p_val);
+void top_p_renorm_probs(TensorView probs, TensorView renorm_probs,
+                        Optional<TensorView> maybe_top_p_arr, double top_p_val);
 
-void top_k_renorm_probs(Tensor probs, Tensor renorm_probs, Optional<Tensor> maybe_top_k_arr,
-                        int64_t top_k_val);
+void top_k_renorm_probs(TensorView probs, TensorView renorm_probs,
+                        Optional<TensorView> maybe_top_k_arr, int64_t top_k_val);
 
-void top_k_mask_logits(Tensor logits, Tensor mask_logits, Optional<Tensor> maybe_top_k_arr,
-                       int64_t top_k_val);
+void top_k_mask_logits(TensorView logits, TensorView mask_logits,
+                       Optional<TensorView> maybe_top_k_arr, int64_t top_k_val);
 
-void chain_speculative_sampling(Tensor draft_probs, Tensor draft_token_ids, Tensor target_probs,
-                                Tensor output_token_ids, Tensor output_accepted_token_num,
-                                Tensor output_emitted_draft_token_num, bool deterministic,
+void chain_speculative_sampling(TensorView draft_probs, TensorView draft_token_ids,
+                                TensorView target_probs, TensorView output_token_ids,
+                                TensorView output_accepted_token_num,
+                                TensorView output_emitted_draft_token_num, bool deterministic,
                                 uint64_t philox_seed, uint64_t philox_offset);
 
 // Softmax

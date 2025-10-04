@@ -24,16 +24,14 @@ using tvm::ffi::Optional;
     }                                                                         \
   }()
 
-void trtllm_moe_allreduce_fusion(int64_t world_size, int64_t world_rank, int64_t token_num,
-                                 int64_t hidden_size, Tensor workspace_ptrs, bool launch_with_pdl,
-                                 Tensor residual_in, Tensor rms_gamma, double rms_eps,
-                                 double scale_factor, int64_t moe_reduction_device_num_experts,
-                                 Tensor moe_reduction_scale_input,
-                                 Tensor moe_reduction_active_experts_token_input,
-                                 Tensor moe_reduction_token_input, Optional<int64_t> layout_code,
-                                 Optional<Tensor> moe_allreduce_out, Optional<Tensor> residual_out,
-                                 Optional<Tensor> norm_out, Optional<Tensor> quant_out,
-                                 Optional<Tensor> scale_out) {
+void trtllm_moe_allreduce_fusion(
+    int64_t world_size, int64_t world_rank, int64_t token_num, int64_t hidden_size,
+    TensorView workspace_ptrs, bool launch_with_pdl, TensorView residual_in, TensorView rms_gamma,
+    double rms_eps, double scale_factor, int64_t moe_reduction_device_num_experts,
+    TensorView moe_reduction_scale_input, TensorView moe_reduction_active_experts_token_input,
+    TensorView moe_reduction_token_input, Optional<int64_t> layout_code,
+    Optional<TensorView> moe_allreduce_out, Optional<TensorView> residual_out,
+    Optional<TensorView> norm_out, Optional<TensorView> quant_out, Optional<TensorView> scale_out) {
   cudaSetDevice(moe_reduction_active_experts_token_input->device.device_id);
   auto stream = get_stream(moe_reduction_active_experts_token_input->device);
 
@@ -81,13 +79,12 @@ void trtllm_moe_allreduce_fusion(int64_t world_size, int64_t world_rank, int64_t
       });
 }
 
-void trtllm_moe_finalize_allreduce_fusion(Tensor allreduce_in, Tensor residual_in,
-                                          Tensor norm_weight, Tensor expanded_idx_to_permuted_idx,
-                                          Tensor norm_out, Tensor residual_out,
-                                          bool launch_with_pdl, Tensor workspace,
-                                          int64_t const world_rank, int64_t const world_size,
-                                          double const eps, Optional<Tensor> shared_expert_output,
-                                          Optional<Tensor> expert_scale_factor) {
+void trtllm_moe_finalize_allreduce_fusion(
+    TensorView allreduce_in, TensorView residual_in, TensorView norm_weight,
+    TensorView expanded_idx_to_permuted_idx, TensorView norm_out, TensorView residual_out,
+    bool launch_with_pdl, TensorView workspace, int64_t const world_rank, int64_t const world_size,
+    double const eps, Optional<TensorView> shared_expert_output,
+    Optional<TensorView> expert_scale_factor) {
   DISPATCH_FLOATING_TYPES_FOR_ALLREDUCE(residual_in->dtype, c_type, [&] {
     MoeFinalizeAllReduceFusionParams<c_type> params;
 
@@ -100,7 +97,7 @@ void trtllm_moe_finalize_allreduce_fusion(Tensor allreduce_in, Tensor residual_i
     params.nranks = static_cast<int>(world_size);
     params.rank = static_cast<int>(world_rank);
     // size: num_token * hidden_dim
-    params.size = get_numel(residual_in);
+    params.size = residual_in.numel();
     params.hidden_dim = hidden_dim;
 
     // workspace: AR scratch space

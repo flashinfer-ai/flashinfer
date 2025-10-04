@@ -32,7 +32,6 @@
 using tvm::ffi::Array;
 using tvm::ffi::Map;
 using tvm::ffi::Optional;
-using tvm::ffi::Tensor;
 
 static int getExp(float v) {
   int vIntRepr;
@@ -141,7 +140,7 @@ int computeSFIndex(int rowIdx, int colIdx, int totalRow, int totalColumn,
 // Interleave (and possibly pad) the weights block scaling factor.
 // blockScale: [num_experts, rows, cols] or [rows, cols]
 // Return: num_experts * pad_up(rows, 128) * pad_up(cols, 4)
-void BlockScaleInterleave(Tensor blockScale, Tensor interleavedBlockScale) {
+void BlockScaleInterleave(TensorView blockScale, TensorView interleavedBlockScale) {
   bool is_cuda = (blockScale->device.device_type == kDLCUDA);
   if (is_cuda) {
     CHECK_CUDA(blockScale);
@@ -195,7 +194,7 @@ void BlockScaleInterleave(Tensor blockScale, Tensor interleavedBlockScale) {
 // blockScale: [num_experts, rows, cols] or [rows, cols]
 // Note: rows and cols are the dimensions of the original unswizzled SFMatrix, so reshape input
 // before passing into this function! Return: The same shape as blockScale
-void BlockScaleInterleaveReverse(Tensor const& blockScale, Tensor reversedBlockScale) {
+void BlockScaleInterleaveReverse(TensorView const& blockScale, TensorView reversedBlockScale) {
   bool is_cuda = (blockScale->device.device_type == kDLCUDA);
   if (is_cuda) {
     CHECK_CUDA(blockScale);
@@ -245,8 +244,9 @@ void BlockScaleInterleaveReverse(Tensor const& blockScale, Tensor reversedBlockS
 }
 
 // Used by the (fp16 -> int4) quant layer + int4 gemm network.
-void E2M1AndUFP8SFScaleToFloatV2(Tensor valueE2M1, Tensor scaleFP8SF, Optional<Tensor> globalScale,
-                                 Tensor floatTensor, int64_t sfVecSize, int64_t sfType,
+void E2M1AndUFP8SFScaleToFloatV2(TensorView valueE2M1, TensorView scaleFP8SF,
+                                 Optional<TensorView> globalScale, TensorView floatTensorView,
+                                 int64_t sfVecSize, int64_t sfType,
                                  bool isSfSwizzledLayout = true) {
   CHECK_CPU_INPUT(valueE2M1, dl_uint8);
   CHECK_CPU_INPUT(scaleFP8SF, dl_uint8);
@@ -271,7 +271,7 @@ void E2M1AndUFP8SFScaleToFloatV2(Tensor valueE2M1, Tensor scaleFP8SF, Optional<T
   for (size_t vIdx = 0; vIdx < static_cast<size_t>(packedShape[0]); ++vIdx) {
     for (int group = 0; group < groupsPerHiddenDim; ++group) {
       float* floatPtr =
-          static_cast<float*>(floatTensor->data) + vIdx * hiddenDim + group * sfVecSize;
+          static_cast<float*>(floatTensorView->data) + vIdx * hiddenDim + group * sfVecSize;
       uint8_t* packedFp4Ptr = static_cast<uint8_t*>(valueE2M1->data) + vIdx * packedFp4HiddenDim +
                               group * sfVecSize / 2;
       uint8_t* scaleFP8SFPtr = static_cast<uint8_t*>(scaleFP8SF->data);
@@ -298,7 +298,8 @@ void E2M1AndUFP8SFScaleToFloatV2(Tensor valueE2M1, Tensor scaleFP8SF, Optional<T
   }
 }
 
-void mxfp4_dequantize_host(Tensor weight, Tensor scale, Tensor dequant_weight, int64_t group_size) {
+void mxfp4_dequantize_host(TensorView weight, TensorView scale, TensorView dequant_weight,
+                           int64_t group_size) {
   // weight (n, k / 2)
   // scale (n, k / group_size)
 

@@ -17,29 +17,33 @@
 
 using tvm::ffi::Tensor;
 
-void apply_rope(Tensor q, Tensor k, Tensor q_rope, Tensor k_rope, Tensor indptr, Tensor offsets,
-                int64_t rotary_dim, bool interleave, double rope_scale, double rope_theta);
+void apply_rope(TensorView q, TensorView k, TensorView q_rope, TensorView k_rope, TensorView indptr,
+                TensorView offsets, int64_t rotary_dim, bool interleave, double rope_scale,
+                double rope_theta);
 
-void apply_llama31_rope(Tensor q, Tensor k, Tensor q_rope, Tensor k_rope, Tensor indptr,
-                        Tensor offsets, int64_t rotary_dim, bool interleave, double rope_scale,
-                        double rope_theta, double low_freq_factor, double high_freq_factor,
-                        double old_context_length);
+void apply_llama31_rope(TensorView q, TensorView k, TensorView q_rope, TensorView k_rope,
+                        TensorView indptr, TensorView offsets, int64_t rotary_dim, bool interleave,
+                        double rope_scale, double rope_theta, double low_freq_factor,
+                        double high_freq_factor, double old_context_length);
 
-void apply_rope_pos_ids(Tensor q, Tensor k, Tensor q_rope, Tensor k_rope, Tensor pos_ids,
-                        int64_t rotary_dim, bool interleave, double rope_scale, double rope_theta);
+void apply_rope_pos_ids(TensorView q, TensorView k, TensorView q_rope, TensorView k_rope,
+                        TensorView pos_ids, int64_t rotary_dim, bool interleave, double rope_scale,
+                        double rope_theta);
 
-void apply_llama31_rope_pos_ids(Tensor q, Tensor k, Tensor q_rope, Tensor k_rope, Tensor pos_ids,
-                                int64_t rotary_dim, bool interleave, double rope_scale,
-                                double rope_theta, double low_freq_factor, double high_freq_factor,
-                                double old_context_length);
+void apply_llama31_rope_pos_ids(TensorView q, TensorView k, TensorView q_rope, TensorView k_rope,
+                                TensorView pos_ids, int64_t rotary_dim, bool interleave,
+                                double rope_scale, double rope_theta, double low_freq_factor,
+                                double high_freq_factor, double old_context_length);
 
-void apply_rope_pos_ids_cos_sin_cache(Tensor q, Tensor k, Tensor q_rope, Tensor k_rope,
-                                      Tensor cos_sin_cache, Tensor pos_ids, bool interleave);
+void apply_rope_pos_ids_cos_sin_cache(TensorView q, TensorView k, TensorView q_rope,
+                                      TensorView k_rope, TensorView cos_sin_cache,
+                                      TensorView pos_ids, bool interleave);
 
-void mla_rope_quantize(Tensor q_rope_in, Tensor k_rope_in, Tensor q_nope_in, Tensor k_nope_in,
-                       Tensor q_rope_out, Tensor k_rope_out, Tensor q_nope_out, Tensor k_nope_out,
-                       Tensor cos_sin_cache, Tensor pos_ids, double quant_scale_q,
-                       double quant_scale_kv, bool interleave);
+void mla_rope_quantize(TensorView q_rope_in, TensorView k_rope_in, TensorView q_nope_in,
+                       TensorView k_nope_in, TensorView q_rope_out, TensorView k_rope_out,
+                       TensorView q_nope_out, TensorView k_nope_out, TensorView cos_sin_cache,
+                       TensorView pos_ids, double quant_scale_q, double quant_scale_kv,
+                       bool interleave);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(apply_rope, apply_rope);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(apply_llama31_rope, apply_llama31_rope);

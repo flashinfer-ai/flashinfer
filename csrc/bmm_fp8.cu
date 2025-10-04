@@ -20,8 +20,8 @@
 
 #include "tvm_ffi_utils.h"
 
-void bmm_fp8(Tensor A, Tensor B, Tensor D, Tensor A_scale, Tensor B_scale, Tensor workspace_buffer,
-             int64_t cublas_handle) {
+void bmm_fp8(TensorView A, TensorView B, TensorView D, TensorView A_scale, TensorView B_scale,
+             TensorView workspace_buffer, int64_t cublas_handle) {
   CHECK_CUDA(A);
   CHECK_CUDA(B);
   CHECK_CUDA(D);
@@ -50,7 +50,7 @@ void bmm_fp8(Tensor A, Tensor B, Tensor D, Tensor A_scale, Tensor B_scale, Tenso
         auto stream = get_stream(A->device);
 
         auto status = flashinfer::bmm_fp8::bmm_fp8_internal_cublaslt(
-            workspace_buffer->data, get_numel(workspace_buffer), static_cast<b_type*>(B->data),
+            workspace_buffer->data, workspace_buffer.numel(), static_cast<b_type*>(B->data),
             static_cast<a_type*>(A->data), static_cast<d_type*>(D->data), batch_size, n, m, k,
             static_cast<float*>(B_scale->data), static_cast<float*>(A_scale->data), lt_handle,
             stream);

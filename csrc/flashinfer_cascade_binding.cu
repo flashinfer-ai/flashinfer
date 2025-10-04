@@ -18,12 +18,13 @@
 
 using tvm::ffi::Optional;
 
-void merge_state(Tensor v_a, Tensor s_a, Tensor v_b, Tensor s_b, Tensor v_merged, Tensor s_merged);
+void merge_state(TensorView v_a, TensorView s_a, TensorView v_b, TensorView s_b,
+                 TensorView v_merged, TensorView s_merged);
 
-void merge_state_in_place(Tensor v, Tensor s, Tensor v_other, Tensor s_other,
-                          Optional<Tensor> mask);
+void merge_state_in_place(TensorView v, TensorView s, TensorView v_other, TensorView s_other,
+                          Optional<TensorView> mask);
 
-void merge_states(Tensor v, Tensor s, Tensor v_merged, Tensor s_merged);
+void merge_states(TensorView v, TensorView s, TensorView v_merged, TensorView s_merged);
 
 // Merge two self-attention states
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(merge_state, merge_state);

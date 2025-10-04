@@ -322,10 +322,13 @@ __global__ static void __launch_bounds__(128)
   }
 }
 
-static void create_packed_tma_desc_kv_prefill(
-    int b, int32_t* actual_seq_lens_kv_data, int64_t d_qk, int64_t d_vo, int64_t h_kv,
-    uint32_t* tensor_traversal_stride_qkv, uint32_t* tensor_box_size_kv,
-    tma::cudaTmaDesc* packed_tma_desc_k, tma::cudaTmaDesc* packed_tma_desc_v, Tensor k, Tensor v) {
+static void create_packed_tma_desc_kv_prefill(int b, int32_t* actual_seq_lens_kv_data, int64_t d_qk,
+                                              int64_t d_vo, int64_t h_kv,
+                                              uint32_t* tensor_traversal_stride_qkv,
+                                              uint32_t* tensor_box_size_kv,
+                                              tma::cudaTmaDesc* packed_tma_desc_k,
+                                              tma::cudaTmaDesc* packed_tma_desc_v, TensorView k,
+                                              TensorView v) {
   int64_t batch_offset_k = 0;
   int64_t batch_offset_v = 0;
   // tma descriptors for packed q and o
@@ -363,8 +366,8 @@ static void create_packed_tma_desc_qo_prefill(int b, int32_t* actual_seq_lens_q_
                                               uint32_t* tensor_traversal_stride_qkv,
                                               uint32_t* tensor_box_size_q,
                                               tma::cudaTmaDesc* packed_tma_desc_q,
-                                              tma::cudaTmaDesc* packed_tma_desc_o, Tensor q,
-                                              Tensor out, int64_t* batch_offset_array) {
+                                              tma::cudaTmaDesc* packed_tma_desc_o, TensorView q,
+                                              TensorView out, int64_t* batch_offset_array) {
   int64_t batch_offset_q = 0;
   int64_t batch_offset_o = 0;
   // tma descriptors for packed q and o
@@ -511,12 +514,13 @@ void setup_decode(CUfunction* hfunc_decode, CUfunction* lean_attn_reduction) {
   }
 };
 
-void prefill(int64_t b, int64_t s_qo, int64_t max_s_kv, Tensor q, Tensor k_cache, Tensor v_cache,
-             double scale, Tensor workspace_buffer, Tensor actual_seq_lens_q,
-             Tensor actual_seq_lens_kv, Tensor actual_seq_lens_q_gpu, Tensor actual_seq_lens_kv_gpu,
-             Tensor block_tables, bool causal, bool return_lse, Tensor out, Tensor lse,
-             Optional<Tensor> batch_offset_q_array, Optional<Tensor> batch_offset_o_array,
-             Optional<Tensor> batch_offset_k_array, Optional<Tensor> batch_offset_v_array,
+void prefill(int64_t b, int64_t s_qo, int64_t max_s_kv, TensorView q, TensorView k_cache,
+             TensorView v_cache, double scale, TensorView workspace_buffer,
+             TensorView actual_seq_lens_q, TensorView actual_seq_lens_kv,
+             TensorView actual_seq_lens_q_gpu, TensorView actual_seq_lens_kv_gpu,
+             TensorView block_tables, bool causal, bool return_lse, TensorView out, TensorView lse,
+             Optional<TensorView> batch_offset_q_array, Optional<TensorView> batch_offset_o_array,
+             Optional<TensorView> batch_offset_k_array, Optional<TensorView> batch_offset_v_array,
              bool is_cuda_graph_compatible) {
   constexpr size_t SMEM_SIZE = 227 * 1024;  // All smem
   constexpr int64_t TILE_M_1 = 128;
@@ -833,9 +837,9 @@ int32_t get_kernel_id(int32_t q_heads_per_kv) {
 }
 
 void setup_tma_desc_decode(int64_t b, int64_t s_kv, int64_t h_qo, int64_t h_kv, int64_t d,
-                           int64_t total_num_pages, Tensor q, Tensor out, Tensor k_cache,
-                           Tensor v_cache, int32_t split_factor, int64_t page_size,
-                           int8_t* partial_o_dev, tma::cudaTmaDesc* tma_desc_q,
+                           int64_t total_num_pages, TensorView q, TensorView out,
+                           TensorView k_cache, TensorView v_cache, int32_t split_factor,
+                           int64_t page_size, int8_t* partial_o_dev, tma::cudaTmaDesc* tma_desc_q,
                            tma::cudaTmaDesc* tma_desc_o, tma::cudaTmaDesc* tma_desc_partial_o,
                            tma::cudaTmaDesc* tma_desc_k, tma::cudaTmaDesc* tma_desc_v) {
   auto kid = get_kernel_id(h_qo / h_kv);
@@ -914,10 +918,11 @@ void setup_tma_desc_decode(int64_t b, int64_t s_kv, int64_t h_qo, int64_t h_kv, 
                                 tma::cudaTmaDescSwizzle::SWIZZLE_128B);
 }
 
-void decode(int64_t max_s_kv, Tensor q, Tensor k_cache, Tensor v_cache, double scale,
-            Tensor workspace_buffer, Tensor actual_seq_lens_kv, Tensor actual_seq_lens_kv_gpu,
-            Tensor block_tables, Tensor out, Optional<Tensor> batch_offset_q_array,
-            Optional<Tensor> batch_offset_o_array, bool is_cuda_graph_compatible) {
+void decode(int64_t max_s_kv, TensorView q, TensorView k_cache, TensorView v_cache, double scale,
+            TensorView workspace_buffer, TensorView actual_seq_lens_kv,
+            TensorView actual_seq_lens_kv_gpu, TensorView block_tables, TensorView out,
+            Optional<TensorView> batch_offset_q_array, Optional<TensorView> batch_offset_o_array,
+            bool is_cuda_graph_compatible) {
   constexpr size_t SMEM_SIZE = 227 * 1024;  // All smem
   constexpr size_t REDUCTION_MEM_SIZE = 128 * 1024;
   constexpr int64_t TILE_N_1 = 128;

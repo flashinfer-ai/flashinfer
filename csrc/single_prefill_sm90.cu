@@ -32,10 +32,10 @@ using namespace flashinfer;
 
 using tvm::ffi::Optional;
 
-void single_prefill_with_kv_cache_sm90(ffi::Tensor q, ffi::Tensor k, ffi::Tensor v, ffi::Tensor tmp,
-                                       ffi::Tensor o, Optional<ffi::Tensor> maybe_lse,
-                                       int64_t mask_mode_code, int64_t layout,
-                                       int64_t window_left ADDITIONAL_FUNC_PARAMS) {
+void single_prefill_with_kv_cache_sm90(ffi::TensorView q, ffi::TensorView k, ffi::TensorView v,
+                                       ffi::TensorView tmp, ffi::TensorView o,
+                                       Optional<ffi::TensorView> maybe_lse, int64_t mask_mode_code,
+                                       int64_t layout, int64_t window_left ADDITIONAL_FUNC_PARAMS) {
   unsigned int head_dim_qk = q->shape[2];
   unsigned int head_dim_vo = v->shape[2];
   unsigned int num_qo_heads = q->shape[1];
