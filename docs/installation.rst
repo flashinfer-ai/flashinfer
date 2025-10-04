@@ -13,7 +13,7 @@ Prerequisites
 
 - OS: Linux only
 
-- Python: 3.8, 3.9, 3.10, 3.11, 3.12
+- Python: 3.9, 3.10, 3.11, 3.12, 3.13
 
 Quick Start
 ^^^^^^^^^^^
@@ -32,18 +32,16 @@ Install from Source
 
 In certain cases, you may want to install FlashInfer from source code to try out the latest features in the main branch, or to customize the library for your specific needs.
 
-FlashInfer offers two installation modes:
+``flashinfer-python`` is a source-only package and by default it will JIT compile/download kernels on-the-fly.
 
-JIT mode
-   - CUDA kernels are compiled at runtime using PyTorch's JIT, with compiled kernels cached for future use.
-   - JIT mode allows fast installation, as no CUDA kernels are pre-compiled, making it ideal for development and testing.
-   - JIT version is also available as a sdist in `PyPI <https://pypi.org/project/flashinfer-python/>`_.
+For fully offline deployment, we also provide two additional packages to pre-compile and download cubins ahead-of-time:
 
-AOT mode
-   - Core CUDA kernels are pre-compiled and included in the library, reducing runtime compilation overhead.
-   - If a required kernel is not pre-compiled, it will be compiled at runtime using JIT. AOT mode is recommended for production environments.
+flashinfer-cubin
+   - Provides pre-compiled CUDA binaries for immediate use without runtime compilation.
 
-JIT mode is the default installation mode. To enable AOT mode, see steps below.
+flashinfer-jit-cache
+   - Pre-compiles kernels for specific CUDA architectures to enable fully offline deployment.
+
 You can follow the steps below to install FlashInfer from source code:
 
 1. Clone the FlashInfer repository:
@@ -58,64 +56,34 @@ You can follow the steps below to install FlashInfer from source code:
 
        python -c "import torch; print(torch.__version__, torch.version.cuda)"
 
-3. Install Ninja build system:
+3. Install FlashInfer:
 
    .. code-block:: bash
 
-       pip install ninja
+       cd flashinfer
+       python -m pip install -v .
 
-4. Install FlashInfer:
+   For development & contribution, install in editable mode:
 
-   .. tabs::
+   .. code-block:: bash
 
-       .. tab:: JIT mode
+       python -m pip install --no-build-isolation -e . -v
 
-           .. code-block:: bash
+4. (Optional) Build additional packages for offline deployment:
 
-               cd flashinfer
-               pip install --no-build-isolation --verbose .
+   To build ``flashinfer-cubin`` package from source:
 
-       .. tab:: AOT mode
+   .. code-block:: bash
 
-           .. code-block:: bash
+       cd flashinfer-cubin
+       python -m build --no-isolation --wheel
+       python -m pip install dist/*.whl
 
-               cd flashinfer
-               export FLASHINFER_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a 10.0a"
-               python -m flashinfer.aot  # Produces AOT kernels in aot-ops/
-               python -m pip install --no-build-isolation --verbose .
+   To build ``flashinfer-jit-cache`` package from source:
 
-5. Create FlashInfer distributions (optional):
+   .. code-block:: bash
 
-   .. tabs::
-
-       .. tab:: Create sdist
-
-           .. code-block:: bash
-
-               cd flashinfer
-               python -m build --no-isolation --sdist
-               ls -la dist/
-
-       .. tab:: Create wheel for JIT mode
-
-           .. code-block:: bash
-
-               cd flashinfer
-               python -m build --no-isolation --wheel
-               ls -la dist/
-
-       .. tab:: Create wheel for AOT mode
-
-           .. code-block:: bash
-
-               cd flashinfer
-               export FLASHINFER_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a 10.0a"
-               python -m flashinfer.aot  # Produces AOT kernels in aot-ops/
-               python -m build --no-isolation --wheel
-               ls -la dist/
-
-C++ API
--------
-
-FlashInfer is a header-only library with only CUDA/C++ standard library dependency
-that can be directly integrated into your C++ project without installation.
+       export FLASHINFER_CUDA_ARCH_LIST="7.5 8.0 8.9 10.0a 10.3a 12.0a"  # user can shrink the list to specific architectures
+       cd flashinfer-jit-cache
+       python -m build --no-isolation --wheel
+       python -m pip install dist/*.whl

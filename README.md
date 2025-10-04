@@ -63,17 +63,26 @@ python -m pip install -v .
 python -m pip install --no-build-isolation -e . -v
 ```
 
-To pre-compile essential kernels ahead-of-time (AOT), run the following command:
+`flashinfer-python` is a source-only package and by default it will JIT compile/download kernels on-the-fly.
+For fully offline deployment, we also provide two additional packages `flashinfer-jit-cache` and `flashinfer-cubin`, to pre-compile and download cubins ahead-of-time.
 
+#### flashinfer-cubin
+
+To build `flashinfer-cubin` package from source:
 ```bash
-# Set target CUDA architectures
-export FLASHINFER_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a 10.0a"
-# Build AOT kernels. Will produce AOT kernels in aot-ops/
-python -m flashinfer.aot
-# Build AOT wheel
+cd flashinfer-cubin
 python -m build --no-isolation --wheel
-# Install AOT wheel
-python -m pip install dist/flashinfer_*.whl
+python -m pip install dist/*.whl
+```
+
+#### flashinfer-jit-cache
+
+To build `flashinfer-jit-cache` package from source:
+```bash
+export FLASHINFER_CUDA_ARCH_LIST="7.5 8.0 8.9 10.0a 10.3a 12.0a" # user can shrink the list to specific architectures
+cd flashinfer-jit-cache
+python -m build --no-isolation --wheel
+python -m pip install dist/*.whl
 ```
 
 For more details, refer to the [Install from Source documentation](https://docs.flashinfer.ai/installation.html#install-from-source).
@@ -118,10 +127,6 @@ Check out [documentation](https://docs.flashinfer.ai/) for usage of batch decode
 ## Custom Attention Variants
 
 Starting from FlashInfer v0.2, users can customize their own attention variants with additional parameters. For more details, refer to our [JIT examples](https://github.com/flashinfer-ai/flashinfer/blob/main/tests/utils/test_jit_example.py).
-
-## C++ API and TVM Bindings
-
-FlashInfer also provides C++ API and TVM bindings, please refer to [documentation](https://docs.flashinfer.ai/) for more details.
 
 ## GPU Support
 

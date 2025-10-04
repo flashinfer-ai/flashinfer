@@ -178,8 +178,8 @@ def run_with_spot_retry(spot_node_type, on_demand_node_type, test_name, test_clo
 //   }
 // }
 
-def run_unittest_CPU_AOT_COMPILE(node_type, cuda_version) {
-  echo "Running CPU AOT Compile Unittest with CUDA ${cuda_version}"
+def run_unittest_CPU_JIT_CACHE_PACKAGE_BUILD_IMPORT(node_type, cuda_version) {
+  echo "Running CPU JIT Cache Package Build and Import Unittest with CUDA ${cuda_version}"
 
   def docker_run = ""
   if (cuda_version == "cu126") {
@@ -210,11 +210,11 @@ def run_unittest_CPU_AOT_COMPILE(node_type, cuda_version) {
       // If we reach here, node allocation was successful
       // Now run the tests without any timeout
       node(node_type) {
-        ws(per_exec_ws('flashinfer-aot')) {
+        ws(per_exec_ws('flashinfer-jit-cache')) {
           init_git(true)
           sh(script: "ls -alh", label: 'Show work directory')
           sh(script: "./scripts/task_show_node_info.sh", label: 'Show node info')
-          sh(script: "${docker_run} --no-gpu ./scripts/task_test_aot_build_import.sh", label: 'Test AOT Build and Import')
+          sh(script: "${docker_run} --no-gpu ./scripts/task_test_jit_cache_package_build_import.sh", label: 'Test JIT Cache Package Build and Import')
         }
       }
     } catch (Exception e) {
@@ -226,11 +226,11 @@ def run_unittest_CPU_AOT_COMPILE(node_type, cuda_version) {
   } else {
     // No timeout for non-spot instances
     node(node_type) {
-      ws(per_exec_ws('flashinfer-aot')) {
+      ws(per_exec_ws('flashinfer-jit-cache')) {
         init_git(true)
         sh(script: "ls -alh", label: 'Show work directory')
         sh(script: "./scripts/task_show_node_info.sh", label: 'Show node info')
-        sh(script: "${docker_run} --no-gpu ./scripts/task_test_aot_build_import.sh", label: 'Test AOT Build and Import')
+        sh(script: "${docker_run} --no-gpu ./scripts/task_test_jit_cache_package_build_import.sh", label: 'Test JIT Cache Package Build and Import')
       }
     }
   }
@@ -305,38 +305,38 @@ stage('Unittest') {
     // CUDA 12.6 AOT Tests
     'AOT-Build-Import-x86-64-cu126': {
       run_with_spot_retry('CPU-LARGE-SPOT', 'CPU-LARGE', 'AOT-Build-Import-x86-64-cu126',
-        { node_type -> run_unittest_CPU_AOT_COMPILE(node_type, 'cu126') })
+        { node_type -> run_unittest_CPU_JIT_CACHE_PACKAGE_BUILD_IMPORT(node_type, 'cu126') })
     },
     'AOT-Build-Import-aarch64-cu126': {
       run_with_spot_retry('ARM-LARGE-SPOT', 'ARM-LARGE', 'AOT-Build-Import-aarch64-cu126',
-        { node_type -> run_unittest_CPU_AOT_COMPILE(node_type, 'cu126') })
+        { node_type -> run_unittest_CPU_JIT_CACHE_PACKAGE_BUILD_IMPORT(node_type, 'cu126') })
     },
     // CUDA 12.8 AOT Tests
     'AOT-Build-Import-x86-64-cu128': {
       run_with_spot_retry('CPU-LARGE-SPOT', 'CPU-LARGE', 'AOT-Build-Import-x86-64-cu128',
-        { node_type -> run_unittest_CPU_AOT_COMPILE(node_type, 'cu128') })
+        { node_type -> run_unittest_CPU_JIT_CACHE_PACKAGE_BUILD_IMPORT(node_type, 'cu128') })
     },
     'AOT-Build-Import-aarch64-cu128': {
       run_with_spot_retry('ARM-LARGE-SPOT', 'ARM-LARGE', 'AOT-Build-Import-aarch64-cu128',
-        { node_type -> run_unittest_CPU_AOT_COMPILE(node_type, 'cu128') })
+        { node_type -> run_unittest_CPU_JIT_CACHE_PACKAGE_BUILD_IMPORT(node_type, 'cu128') })
     },
     // CUDA 12.9 AOT Tests
     'AOT-Build-Import-x86-64-cu129': {
       run_with_spot_retry('CPU-LARGE-SPOT', 'CPU-LARGE', 'AOT-Build-Import-x86-64-cu129',
-        { node_type -> run_unittest_CPU_AOT_COMPILE(node_type, 'cu129') })
+        { node_type -> run_unittest_CPU_JIT_CACHE_PACKAGE_BUILD_IMPORT(node_type, 'cu129') })
     },
     'AOT-Build-Import-aarch64-cu129': {
       run_with_spot_retry('ARM-LARGE-SPOT', 'ARM-LARGE', 'AOT-Build-Import-aarch64-cu129',
-        { node_type -> run_unittest_CPU_AOT_COMPILE(node_type, 'cu129') })
+        { node_type -> run_unittest_CPU_JIT_CACHE_PACKAGE_BUILD_IMPORT(node_type, 'cu129') })
     },
     // CUDA 13.0 AOT Tests
     'AOT-Build-Import-x86-64-cu130': {
       run_with_spot_retry('CPU-LARGE-SPOT', 'CPU-LARGE', 'AOT-Build-Import-x86-64-cu130',
-        { node_type -> run_unittest_CPU_AOT_COMPILE(node_type, 'cu130') })
+        { node_type -> run_unittest_CPU_JIT_CACHE_PACKAGE_BUILD_IMPORT(node_type, 'cu130') })
     },
     'AOT-Build-Import-aarch64-cu130': {
       run_with_spot_retry('ARM-LARGE-SPOT', 'ARM-LARGE', 'AOT-Build-Import-aarch64-cu130',
-        { node_type -> run_unittest_CPU_AOT_COMPILE(node_type, 'cu130') })
+        { node_type -> run_unittest_CPU_JIT_CACHE_PACKAGE_BUILD_IMPORT(node_type, 'cu130') })
     },
     // JIT unittest only for cu129
     'JIT-Unittest-1-cu129': {

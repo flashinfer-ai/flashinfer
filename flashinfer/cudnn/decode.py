@@ -3,7 +3,7 @@ from typing import Optional
 
 import torch
 
-from ..jit import get_cudnn_fmha_gen_module
+from .utils import get_cudnn_fmha_gen_module
 
 try:
     import cudnn

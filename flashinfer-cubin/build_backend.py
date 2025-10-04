@@ -11,16 +11,15 @@ from setuptools.build_meta import *
 # Add parent directory to path to import artifacts module
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-# add flashinfer._build_meta if not there, it should exist in Path(__file__).parent.parent / "flashinfer" / "_build_meta.py"
+# add flashinfer._build_meta, always override to ensure version is up-to-date
 build_meta_file = Path(__file__).parent.parent / "flashinfer" / "_build_meta.py"
-if not build_meta_file.exists():
-    version_file = Path(__file__).parent.parent / "version.txt"
-    if version_file.exists():
-        with open(version_file, "r") as f:
-            version = f.read().strip()
-    with open(build_meta_file, "w") as f:
-        f.write('"""Build metadata for flashinfer package."""\n')
-        f.write(f'__version__ = "{version}"\n')
+version_file = Path(__file__).parent.parent / "version.txt"
+if version_file.exists():
+    with open(version_file, "r") as f:
+        version = f.read().strip()
+with open(build_meta_file, "w") as f:
+    f.write('"""Build metadata for flashinfer package."""\n')
+    f.write(f'__version__ = "{version}"\n')
 
 
 def _download_cubins():
@@ -80,13 +79,6 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
     return _orig.build_wheel(wheel_directory, config_settings, metadata_directory)
 
 
-def build_sdist(sdist_directory, config_settings=None):
-    """Build a source distribution, downloading cubins first."""
-    _download_cubins()
-    _create_build_metadata()
-    return _orig.build_sdist(sdist_directory, config_settings)
-
-
 def build_editable(wheel_directory, config_settings=None, metadata_directory=None):
     """Build an editable install, downloading cubins first."""
     _download_cubins()
@@ -96,7 +88,6 @@ def build_editable(wheel_directory, config_settings=None, metadata_directory=Non
 
 # Pass through all other hooks
 get_requires_for_build_wheel = _orig.get_requires_for_build_wheel
-get_requires_for_build_sdist = _orig.get_requires_for_build_sdist
 get_requires_for_build_editable = _orig.get_requires_for_build_editable
 prepare_metadata_for_build_wheel = _orig.prepare_metadata_for_build_wheel
 prepare_metadata_for_build_editable = _orig.prepare_metadata_for_build_editable
