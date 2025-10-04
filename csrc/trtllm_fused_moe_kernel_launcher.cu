@@ -405,7 +405,7 @@ class Bf16MoeLauncher : public FusedMoeLauncher {
   void check_moe() const override {
     FusedMoeLauncher::check_moe_common();
 
-    TVM_FFI_ICHECK_EQ(weight_layout, MatrixLayout::BlockMajorK)
+    TVM_FFI_ICHECK(weight_layout == MatrixLayout::BlockMajorK)
         << "BF16 Moe: weight_layout must be BlockMajorK";
     check_weights_shape("gemm1");
     check_weights_shape("gemm2");
