@@ -11,6 +11,26 @@ from setuptools.build_meta import *
 # Add parent directory to path to import artifacts module
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+
+def _get_git_version():
+    """Get git commit hash."""
+    import subprocess
+
+    try:
+        git_version = (
+            subprocess.check_output(
+                ["git", "rev-parse", "HEAD"],
+                cwd=Path(__file__).parent.parent,
+                stderr=subprocess.DEVNULL,
+            )
+            .decode("ascii")
+            .strip()
+        )
+        return git_version
+    except Exception:
+        return "unknown"
+
+
 # add flashinfer._build_meta, always override to ensure version is up-to-date
 build_meta_file = Path(__file__).parent.parent / "flashinfer" / "_build_meta.py"
 version_file = Path(__file__).parent.parent / "version.txt"
@@ -51,25 +71,6 @@ def _download_cubins():
             os.environ["FLASHINFER_CUBIN_DIR"] = original_cubin_dir
         else:
             os.environ.pop("FLASHINFER_CUBIN_DIR", None)
-
-
-def _get_git_version():
-    """Get git commit hash."""
-    import subprocess
-
-    try:
-        git_version = (
-            subprocess.check_output(
-                ["git", "rev-parse", "HEAD"],
-                cwd=Path(__file__).parent.parent,
-                stderr=subprocess.DEVNULL,
-            )
-            .decode("ascii")
-            .strip()
-        )
-        return git_version
-    except Exception:
-        return "unknown"
 
 
 def _create_build_metadata():

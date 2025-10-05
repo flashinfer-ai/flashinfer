@@ -77,12 +77,8 @@ jobs:
 
       - name: Verify version and git version
         run: |
-          tar -xzf dist/*.tar.gz -C /tmp
-          EXTRACTED_DIR=$(find /tmp -maxdepth 1 -name "flashinfer-python-*" -type d)
-          cd "$EXTRACTED_DIR"
+          pip install dist/*.tar.gz
           python -c "
-          import sys
-          sys.path.insert(0, '.')
           from flashinfer._build_meta import __version__, __git_version__
           print(f'📦 Package version: {__version__}')
           print(f'🔖 Git version: {__git_version__}')

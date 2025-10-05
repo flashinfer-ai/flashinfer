@@ -24,7 +24,7 @@ dynamic = ["dependencies", "version"]
 license-files = ["LICENSE", "licenses/*"]
 
 [build-system]
-requires = ["setuptools>=77", "packaging>=24", "filelock"]
+requires = ["setuptools>=77", "packaging>=24"]
 build-backend = "custom_backend"
 backend-path = ["."]
 
