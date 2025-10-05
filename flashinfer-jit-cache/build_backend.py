@@ -22,15 +22,37 @@ from setuptools import build_meta as _orig
 # Add parent directory to path to import flashinfer modules
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+
+def _get_git_version():
+    """Get git commit hash."""
+    import subprocess
+
+    try:
+        git_version = (
+            subprocess.check_output(
+                ["git", "rev-parse", "HEAD"],
+                cwd=Path(__file__).parent.parent,
+                stderr=subprocess.DEVNULL,
+            )
+            .decode("ascii")
+            .strip()
+        )
+        return git_version
+    except Exception:
+        return "unknown"
+
+
 # add flashinfer._build_meta, always override to ensure version is up-to-date
 build_meta_file = Path(__file__).parent.parent / "flashinfer" / "_build_meta.py"
 version_file = Path(__file__).parent.parent / "version.txt"
 if version_file.exists():
     with open(version_file, "r") as f:
         version = f.read().strip()
+git_version = _get_git_version()
 with open(build_meta_file, "w") as f:
     f.write('"""Build metadata for flashinfer package."""\n')
     f.write(f'__version__ = "{version}"\n')
+    f.write(f'__git_version__ = "{git_version}"\n')
 
 
 def get_version():

@@ -17,9 +17,11 @@ version_file = Path(__file__).parent.parent / "version.txt"
 if version_file.exists():
     with open(version_file, "r") as f:
         version = f.read().strip()
+git_version = _get_git_version()
 with open(build_meta_file, "w") as f:
     f.write('"""Build metadata for flashinfer package."""\n')
     f.write(f'__version__ = "{version}"\n')
+    f.write(f'__git_version__ = "{git_version}"\n')
 
 
 def _download_cubins():
