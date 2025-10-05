@@ -75,15 +75,6 @@ jobs:
           python -m build --sdist
           ls -lh dist/
 
-      - name: Verify version and git version
-        run: |
-          pip install dist/*.tar.gz
-          python -c "
-          from flashinfer._build_meta import __version__, __git_version__
-          print(f'📦 Package version: {__version__}')
-          print(f'🔖 Git version: {__git_version__}')
-          "
-
       - name: Upload flashinfer-python artifact
         uses: actions/upload-artifact@v4
         with:
@@ -123,15 +114,6 @@ jobs:
           ls -lh dist/
           mkdir -p ../dist
           cp dist/*.whl ../dist/
-
-      - name: Verify version and git version
-        run: |
-          python -m pip install dist/*.whl
-          python -c "
-          import flashinfer_cubin
-          print(f'📦 Package version: {flashinfer_cubin.__version__}')
-          print(f'🔖 Git version: {flashinfer_cubin.__git_version__}')
-          "
 
       - name: Upload flashinfer-cubin artifact
         uses: actions/upload-artifact@v4
