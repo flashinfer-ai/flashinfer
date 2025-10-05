@@ -13,6 +13,9 @@ on:
   pull_request:
     # TODO: Remove this before merging - only for debugging this PR
 
+permissions:
+  contents: write
+
 jobs:
   setup:
     runs-on: ubuntu-latest
