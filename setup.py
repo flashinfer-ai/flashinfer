@@ -30,12 +30,35 @@ def write_if_different(path: Path, content: str) -> None:
 
 
 def get_version():
+    import os
+
     package_version = (root / "version.txt").read_text().strip()
-    return f"{package_version}"
+    dev_suffix = os.environ.get("FLASHINFER_DEV_RELEASE_SUFFIX", "")
+    if dev_suffix:
+        package_version = f"{package_version}.dev{dev_suffix}"
+    return package_version
+
+
+def get_git_version():
+    """Get git commit hash."""
+    import subprocess
+
+    try:
+        git_version = (
+            subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=root, stderr=subprocess.DEVNULL
+            )
+            .decode("ascii")
+            .strip()
+        )
+        return git_version
+    except Exception:
+        return "unknown"
 
 
 def generate_build_meta() -> None:
     build_meta_str = f"__version__ = {get_version()!r}\n"
+    build_meta_str += f"__git_version__ = {get_git_version()!r}\n"
     write_if_different(root / "flashinfer" / "_build_meta.py", build_meta_str)
 
 

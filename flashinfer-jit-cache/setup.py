@@ -16,6 +16,11 @@ def get_version():
     else:
         version = "0.0.0"
 
+    # Add dev suffix if specified
+    dev_suffix = os.environ.get("FLASHINFER_DEV_RELEASE_SUFFIX", "")
+    if dev_suffix:
+        version = f"{version}.dev{dev_suffix}"
+
     # Append CUDA version suffix if available
     cuda_suffix = os.environ.get("CUDA_VERSION_SUFFIX", "")
     if cuda_suffix:
@@ -25,13 +30,34 @@ def get_version():
     return version
 
 
+def get_git_version():
+    """Get git commit hash."""
+    import subprocess
+
+    try:
+        git_version = (
+            subprocess.check_output(
+                ["git", "rev-parse", "HEAD"],
+                cwd=Path(__file__).parent.parent,
+                stderr=subprocess.DEVNULL,
+            )
+            .decode("ascii")
+            .strip()
+        )
+        return git_version
+    except Exception:
+        return "unknown"
+
+
 def generate_build_meta():
     """Generate build metadata file."""
     build_meta_file = Path(__file__).parent / "flashinfer_jit_cache" / "_build_meta.py"
     version = get_version()
+    git_version = get_git_version()
     with open(build_meta_file, "w") as f:
         f.write('"""Build metadata for flashinfer-jit-cache package."""\n')
         f.write(f'__version__ = "{version}"\n')
+        f.write(f'__git_version__ = "{git_version}"\n')
 
 
 class PlatformSpecificBdistWheel(bdist_wheel):

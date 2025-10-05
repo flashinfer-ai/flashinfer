@@ -51,6 +51,25 @@ def _download_cubins():
             os.environ.pop("FLASHINFER_CUBIN_DIR", None)
 
 
+def _get_git_version():
+    """Get git commit hash."""
+    import subprocess
+
+    try:
+        git_version = (
+            subprocess.check_output(
+                ["git", "rev-parse", "HEAD"],
+                cwd=Path(__file__).parent.parent,
+                stderr=subprocess.DEVNULL,
+            )
+            .decode("ascii")
+            .strip()
+        )
+        return git_version
+    except Exception:
+        return "unknown"
+
+
 def _create_build_metadata():
     """Create build metadata file with version information."""
     version_file = Path(__file__).parent.parent / "version.txt"
@@ -60,6 +79,14 @@ def _create_build_metadata():
     else:
         version = "0.0.0+unknown"
 
+    # Add dev suffix if specified
+    dev_suffix = os.environ.get("FLASHINFER_DEV_RELEASE_SUFFIX", "")
+    if dev_suffix:
+        version = f"{version}.dev{dev_suffix}"
+
+    # Get git version
+    git_version = _get_git_version()
+
     # Create build metadata in the source tree
     package_dir = Path(__file__).parent / "flashinfer_cubin"
     build_meta_file = package_dir / "_build_meta.py"
@@ -67,6 +94,7 @@ def _create_build_metadata():
     with open(build_meta_file, "w") as f:
         f.write('"""Build metadata for flashinfer-cubin package."""\n')
         f.write(f'__version__ = "{version}"\n')
+        f.write(f'__git_version__ = "{git_version}"\n')
 
     print(f"Created build metadata file with version {version}")
     return version
