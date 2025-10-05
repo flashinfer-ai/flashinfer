@@ -205,7 +205,7 @@ def _run_attention(
     get_compute_capability(torch.device(device="cuda"))[0] == 12,
     reason="Expected failure for SM120/121 for now since the tile size/number of stages is too large.",
 )
-def test_batch_attention_with_chunked_q():
+def test_batch_attention_with_noncontiguous_q():
     # Pick the first sequence length config's first pair
     seq_len_pairs = _build_seq_len_configs()[0]
     kv_lens = [p[0] for p in seq_len_pairs]
