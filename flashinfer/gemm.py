@@ -2307,6 +2307,11 @@ def group_gemm_fp8_nt_groupwise(
         assert out.dtype == out_dtype
 
     if is_sm120a_supported(a.device) or is_sm121a_supported(a.device):
+        # it has correctness issues for num_groups > 1
+        if num_groups > 1:
+            raise RuntimeError(
+                "group_gemm_fp8_nt_groupwise has correctness issues for num_groups > 1 on SM120/121"
+            )
         # SM120/121 doesn't use mma_sm parameter
         get_gemm_sm120_module().group_gemm_fp8_nt_groupwise(
             int_workspace_buffer,
