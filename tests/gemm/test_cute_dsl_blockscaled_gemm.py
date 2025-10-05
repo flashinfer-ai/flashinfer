@@ -19,6 +19,7 @@ from flashinfer.cute_dsl.blockscaled_gemm import (
 )
 from flashinfer.cute_dsl.utils import (
     get_cutlass_dtype,
+    get_num_sm,
     is_cute_dsl_available,
 )
 
@@ -56,7 +57,6 @@ from flashinfer.cute_dsl.utils import (
 @pytest.mark.parametrize("alpha_dtype", ["float32"])
 @pytest.mark.parametrize("mma_tiler_mn", [(128, 128)])
 @pytest.mark.parametrize("cluster_shape_mn", [(1, 1)])
-@pytest.mark.parametrize("sm_count", [132, None])
 @pytest.mark.parametrize("tolerance", [1e-01])
 @pytest.mark.parametrize("iterations", [3])
 @pytest.mark.parametrize("enable_dst_signals", [False, True])
@@ -74,7 +74,6 @@ def test_blockscaled_gemm_python_interface(
     alpha_dtype: cutlass.dtype,
     mma_tiler_mn: Tuple[int, int],
     cluster_shape_mn: Tuple[int, int],
-    sm_count: int,
     tolerance: float,
     iterations: int,
     enable_dst_signals: int,
@@ -85,11 +84,13 @@ def test_blockscaled_gemm_python_interface(
 
     if not (major == 10 and minor == 0):
         pytest.skip("Cute-dsl backend is only supported on SM100.")
-    if enable_dst_signals and (sm_count is None):
-        pytest.skip("dst_signals require sm_count")
 
     l, m = lm
     k, n = kn
+    if l == 1:
+        pytest.xfail("nvidia-cutlass-dsl has issue when l=1")
+
+    sm_count = get_num_sm(device) if enable_dst_signals else None
 
     print(f"device: {device}")
 
