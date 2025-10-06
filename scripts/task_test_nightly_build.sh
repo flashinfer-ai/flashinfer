@@ -12,6 +12,10 @@ set -x
 : ${DIST_JIT_CACHE_DIR:=dist-jit-cache}
 : ${DIST_PYTHON_DIR:=dist-python}
 
+# Display GPU information (running inside Docker container with GPU access)
+echo "=== GPU Information ==="
+nvidia-smi
+
 # Install flashinfer packages
 echo "Installing flashinfer-cubin from ${DIST_CUBIN_DIR}..."
 pip install ${DIST_CUBIN_DIR}/*.whl

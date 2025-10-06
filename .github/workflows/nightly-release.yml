@@ -293,17 +293,11 @@ jobs:
           echo "RAM: $(free -h | awk '/^Mem:/ {print $7 " available out of " $2}')"
           echo "Disk: $(df -h / | awk 'NR==2 {print $4 " available out of " $2}')"
           echo "Architecture: $(uname -m)"
-          nvidia-smi
 
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           submodules: true
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
 
       - name: Download flashinfer-python artifact
         uses: actions/download-artifact@v4
