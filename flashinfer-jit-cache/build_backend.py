@@ -26,18 +26,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from build_utils import get_git_version
 
-
-# add flashinfer._build_meta, always override to ensure version is up-to-date
-build_meta_file = Path(__file__).parent.parent / "flashinfer" / "_build_meta.py"
-version_file = Path(__file__).parent.parent / "version.txt"
-if version_file.exists():
-    with open(version_file, "r") as f:
-        version = f.read().strip()
-git_version = get_git_version(cwd=Path(__file__).parent.parent)
-with open(build_meta_file, "w") as f:
-    f.write('"""Build metadata for flashinfer package."""\n')
-    f.write(f'__version__ = "{version}"\n')
-    f.write(f'__git_version__ = "{git_version}"\n')
+# Skip version check when building flashinfer-jit-cache package
+os.environ["FLASHINFER_DISABLE_VERSION_CHECK"] = "1"
 
 
 def _create_build_metadata():
