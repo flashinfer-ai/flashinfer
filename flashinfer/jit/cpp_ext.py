@@ -263,6 +263,10 @@ def _get_num_workers() -> Optional[int]:
 
 
 def run_ninja(workdir: Path, ninja_file: Path, verbose: bool) -> None:
+    if os.environ.get("FLASHINFER_DISABLE_JIT"):
+        raise RuntimeError(
+            "JIT compilation is disabled via FLASHINFER_DISABLE_JIT environment variable"
+        )
     workdir.mkdir(parents=True, exist_ok=True)
     command = [
         "ninja",
