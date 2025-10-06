@@ -109,6 +109,10 @@ Tensor trtllm_fp8_per_tensor_scale_moe_launcher(
   args.routing_logits = routing_logits->data;
   auto const routing_bias_dtype =
       routing_bias.has_value() ? routing_bias.value()->dtype : dl_bfloat16;
+  auto bias_dtype = btg::Dtype::Fp32;
+  if (routing_bias_dtype == dl_bfloat16) {
+    bias_dtype = btg::Dtype::Bfloat16;
+  }
   args.routing_bias = routing_bias.has_value() ? routing_bias.value()->data : nullptr;
   args.hidden_states = hidden_states->data;
   args.gemm1_weights = gemm1_weights->data;
@@ -172,20 +176,21 @@ Tensor trtllm_fp8_per_tensor_scale_moe_launcher(
 
   tensorrt_llm::kernels::trtllmgen_moe::Routing::Runner routing_runner(tile_tokens_dim);
   cudaStream_t stream = get_stream(routing_logits->device);
-  routing_runner.run(
-      routing_logits->data, args.routing_bias, args.num_tokens, args.num_experts, args.top_k,
-      args.n_group, args.topk_group, args.local_expert_offset, args.local_num_experts,
-      args.routed_scaling_factor, static_cast<int*>(expert_indexes->data),
-      static_cast<int*>(expert_count_histogram->data),
-      static_cast<int*>(total_num_padded_tokens->data),
-      static_cast<int*>(expanded_idx_to_permuted_idx->data),
-      nullptr /*static_cast<int*>(permuted_idx_to_expanded_idx->data)*/,
-      static_cast<int*>(permuted_idx_to_token_idx->data), expert_weights->data,
-      static_cast<int*>(num_tokens_per_expert->data),
-      static_cast<int*>(cta_idx_xy_to_batch_idx->data),
-      static_cast<int*>(cta_idx_xy_to_mn_limit->data),
-      static_cast<int*>(num_non_exiting_ctas->data), args.mDtypeElt, use_routing_scales_on_input,
-      false /* use_deep_seek_fp8 */, static_cast<RoutingMethodType>(routing_method_type), stream);
+  routing_runner.run(routing_logits->data, args.routing_bias, args.num_tokens, args.num_experts,
+                     args.top_k, args.n_group, args.topk_group, args.local_expert_offset,
+                     args.local_num_experts, args.routed_scaling_factor,
+                     static_cast<int*>(expert_indexes->data),
+                     static_cast<int*>(expert_count_histogram->data),
+                     static_cast<int*>(total_num_padded_tokens->data),
+                     static_cast<int*>(expanded_idx_to_permuted_idx->data),
+                     nullptr /*static_cast<int*>(permuted_idx_to_expanded_idx->data)*/,
+                     static_cast<int*>(permuted_idx_to_token_idx->data), expert_weights->data,
+                     static_cast<int*>(num_tokens_per_expert->data),
+                     static_cast<int*>(cta_idx_xy_to_batch_idx->data),
+                     static_cast<int*>(cta_idx_xy_to_mn_limit->data),
+                     static_cast<int*>(num_non_exiting_ctas->data), args.mDtypeElt, bias_dtype,
+                     use_routing_scales_on_input, false /* use_deep_seek_fp8 */,
+                     static_cast<RoutingMethodType>(routing_method_type), stream);
 
   // MoE kernel except routing
   TVM_FFI_ICHECK_EQ(hidden_states->dtype, dl_float8_e4m3fn) << "hidden_states must be fp8.";
@@ -398,6 +403,7 @@ void trtllm_fp8_block_scale_moe_launcher(
       alloc_tensor({args.num_tokens * args.top_k}, dl_int32, routing_logits->device);
   Tensor permuted_idx_to_token_idx =
       alloc_tensor({max_num_padded_tokens}, dl_int32, routing_logits->device);
+  // routing_bias_dtype,
   Tensor expert_weights =
       alloc_tensor({args.num_tokens, args.top_k}, routing_bias_dtype, routing_logits->device);
   Tensor expert_indexes =
@@ -444,8 +450,8 @@ void trtllm_fp8_block_scale_moe_launcher(
                      static_cast<int*>(num_tokens_per_expert->data),
                      static_cast<int*>(cta_idx_xy_to_batch_idx->data),
                      static_cast<int*>(cta_idx_xy_to_mn_limit->data),
-                     static_cast<int*>(num_non_exiting_ctas->data), args.mDtypeElt, false, true,
-                     static_cast<RoutingMethodType>(routing_method_type), stream);
+                     static_cast<int*>(num_non_exiting_ctas->data), args.mDtypeElt, args.mDtypeExpW,
+                     false, true, static_cast<RoutingMethodType>(routing_method_type), stream);
 
   // MoE kernel except routing
   TVM_FFI_ICHECK_EQ(hidden_states->dtype, dl_float8_e4m3fn) << "hidden_states must be fp8.";
@@ -827,7 +833,7 @@ Array<Tensor> trtllm_fp4_block_scale_moe_launcher(
                      static_cast<int*>(num_tokens_per_expert->data),
                      static_cast<int*>(cta_idx_xy_to_batch_idx->data),
                      static_cast<int*>(cta_idx_xy_to_mn_limit->data),
-                     static_cast<int*>(num_non_exiting_ctas->data), args.mDtypeElt,
+                     static_cast<int*>(num_non_exiting_ctas->data), args.mDtypeElt, args.mDtypeExpW,
                      false /* use_routing_scales_on_input */, false /* use_deep_seek_fp8 */,
                      static_cast<RoutingMethodType>(routing_method_type), stream);
 
