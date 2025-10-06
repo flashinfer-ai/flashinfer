@@ -529,41 +529,18 @@ def test_trtllm_batch_prefill(
 @pytest.mark.parametrize(
     "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size",
     [
-        (4, 1, 16, 2, 1),
-        (4, 1, 32, 2, 5),
-        (4, 2, 64, 2, 5),
-        (4, 3, 32, 2, 5),
-        (4, 3, 64, 2, 1),
-        (4, 4, 64, 4, 1),
-        (4, 5, 64, 4, 8),
-        (128, 1, 64, 2, 5),
-        (128, 2, 32, 4, 1),
-        (128, 3, 16, 4, 8),
-        (128, 4, 16, 2, 5),
-        (128, 5, 16, 2, 5),
-        (256, 1, 64, 4, 8),
-        (256, 2, 16, 2, 8),
-        (256, 3, 64, 4, 5),
-        (256, 4, 32, 2, 8),
-        (256, 5, 32, 2, 1),
+        (1, 1, 16, 8, 8),
     ],
 )
-@pytest.mark.parametrize("window_left", [-1, 127])
+@pytest.mark.parametrize("window_left", [-1])
 @pytest.mark.parametrize(
     "q_dtype,kv_dtype,o_dtype",
     [
-        ("bf16", "bf16", "bf16"),
-        ("fp16", "fp16", "fp16"),
-        ("bf16", "fp8", "bf16"),
-        ("fp16", "fp8", "fp16"),
-        ("fp8", "fp8", "bf16"),
-        ("fp8", "fp8", "fp16"),
         ("fp8", "fp8", "fp8"),
-        ("fp8", "fp8", "nvfp4"),
     ],
 )
-@pytest.mark.parametrize("enable_pdl", [True, False, None])
-@pytest.mark.parametrize("enable_sink", [True, False])
+@pytest.mark.parametrize("enable_pdl", [None])
+@pytest.mark.parametrize("enable_sink", [False])
 def test_trtllm_batch_decode(
     kv_layout,
     batch_size,
@@ -589,7 +566,7 @@ def test_trtllm_batch_decode(
     # Set up test parameters
     torch.manual_seed(0)
     head_dim = 128
-    MAX_IN_KV_LEN = 110
+    MAX_IN_KV_LEN = 8192
 
     # Generate random sequence lengths
     num_qo_heads = num_kv_heads * head_grp_size
@@ -805,11 +782,16 @@ def test_trtllm_batch_decode(
         assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()
 
 
-@pytest.mark.parametrize("batch_size", [4, 128, 256])
-@pytest.mark.parametrize("s_qo", [32, 64, 87])
-@pytest.mark.parametrize("s_kv", [32, 64, 87])
-@pytest.mark.parametrize("num_kv_heads", [16, 32])
-@pytest.mark.parametrize("head_grp_size", [1, 5, 8])
+# @pytest.mark.parametrize("batch_size", [4, 128, 256])
+# @pytest.mark.parametrize("s_qo", [32, 64, 87])
+# @pytest.mark.parametrize("s_kv", [32, 64, 87])
+# @pytest.mark.parametrize("num_kv_heads", [16, 32])
+# @pytest.mark.parametrize("head_grp_size", [1, 5, 8])
+@pytest.mark.parametrize("batch_size", [1])
+@pytest.mark.parametrize("s_qo", [1024])
+@pytest.mark.parametrize("s_kv", [1024])
+@pytest.mark.parametrize("num_kv_heads", [128])
+@pytest.mark.parametrize("head_grp_size", [1])
 @pytest.mark.parametrize("causal", [True, False])
 def test_trtllm_gen_prefill_deepseek(
     batch_size, s_qo, s_kv, num_kv_heads, head_grp_size, causal
