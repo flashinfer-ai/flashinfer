@@ -1,0 +1,32 @@
+#!/bin/bash
+
+set -eo pipefail
+set -x
+
+# This script installs nightly build packages and runs tests
+# Expected dist directories to be in current directory or specified via env vars
+
+: ${TEST_SHARD:=1}
+: ${CUDA_VISIBLE_DEVICES:=0}
+: ${DIST_CUBIN_DIR:=dist-cubin}
+: ${DIST_JIT_CACHE_DIR:=dist-jit-cache}
+: ${DIST_PYTHON_DIR:=dist-python}
+
+# Install flashinfer packages
+echo "Installing flashinfer-cubin from ${DIST_CUBIN_DIR}..."
+pip install ${DIST_CUBIN_DIR}/*.whl
+
+echo "Installing flashinfer-jit-cache from ${DIST_JIT_CACHE_DIR}..."
+pip install ${DIST_JIT_CACHE_DIR}/*.whl
+
+echo "Installing flashinfer-python from ${DIST_PYTHON_DIR}..."
+pip install ${DIST_PYTHON_DIR}/*.tar.gz
+
+# Verify installation
+echo "Verifying installation..."
+python -m flashinfer show-config
+
+# Run test shard
+echo "Running test shard ${TEST_SHARD}..."
+export SKIP_INSTALL=1
+bash scripts/task_jit_run_tests_part${TEST_SHARD}.sh

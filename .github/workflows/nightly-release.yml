@@ -277,8 +277,69 @@ jobs:
             done
           done
 
+  test-nightly-build:
+    needs: [setup, build-flashinfer-python, build-flashinfer-cubin, build-flashinfer-jit-cache]
+    strategy:
+      fail-fast: false
+      matrix:
+        cuda: ["12.9", "13.0"]
+        test-shard: [1, 2, 3, 4, 5]
+    runs-on: [self-hosted, G5, X64]
+
+    steps:
+      - name: Display Machine Information
+        run: |
+          echo "CPU: $(nproc) cores, $(lscpu | grep 'Model name' | cut -d':' -f2 | xargs)"
+          echo "RAM: $(free -h | awk '/^Mem:/ {print $7 " available out of " $2}')"
+          echo "Disk: $(df -h / | awk 'NR==2 {print $4 " available out of " $2}')"
+          echo "Architecture: $(uname -m)"
+          nvidia-smi
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Download flashinfer-python artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: flashinfer-python-sdist
+          path: dist-python/
+
+      - name: Download flashinfer-cubin artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: flashinfer-cubin-wheel
+          path: dist-cubin/
+
+      - name: Download flashinfer-jit-cache artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: jit-cache-cu${{ matrix.cuda == '12.9' && '129' || '130' }}-x86_64
+          path: dist-jit-cache/
+
+      - name: Get Docker image tag
+        id: docker-tag
+        run: |
+          CUDA_VERSION="cu${{ matrix.cuda == '12.9' && '129' || '130' }}"
+          DOCKER_TAG=$(grep "flashinfer/flashinfer-ci-${CUDA_VERSION}" ci/docker-tags.yml | cut -d':' -f2 | tr -d ' ')
+          echo "cuda_version=${CUDA_VERSION}" >> $GITHUB_OUTPUT
+          echo "tag=${DOCKER_TAG}" >> $GITHUB_OUTPUT
+
+      - name: Run nightly build tests in Docker (shard ${{ matrix.test-shard }})
+        env:
+          CUDA_VISIBLE_DEVICES: 0
+        run: |
+          DOCKER_IMAGE="flashinfer/flashinfer-ci-${{ steps.docker-tag.outputs.cuda_version }}:${{ steps.docker-tag.outputs.tag }}"
+          bash ci/bash.sh ${DOCKER_IMAGE} -e TEST_SHARD ${{ matrix.test-shard }} ./scripts/task_test_nightly_build.sh
+
   update-wheel-index:
-    needs: [setup, create-release]
+    needs: [setup, create-release, test-nightly-build]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout flashinfer repo

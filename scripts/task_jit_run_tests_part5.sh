@@ -4,7 +4,10 @@ set -eo pipefail
 set -x
 : ${MAX_JOBS:=$(nproc)}
 : ${CUDA_VISIBLE_DEVICES:=0}
+: ${SKIP_INSTALL:=0}
 
-pip install -e . -v
+if [ "$SKIP_INSTALL" = "0" ]; then
+  pip install -e . -v
+fi
 
 pytest -s tests/utils/test_logits_processor.py
