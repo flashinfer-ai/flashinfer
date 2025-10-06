@@ -56,6 +56,9 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*"]
 "flashinfer.data.spdlog" = "3rdparty/spdlog"
 
 [tool.setuptools.package-data]
+"flashinfer" = [
+    "_build_meta.py"
+]
 "flashinfer.data" = [
     "csrc/**",
     "include/**",
