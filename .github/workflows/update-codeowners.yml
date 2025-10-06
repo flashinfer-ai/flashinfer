@@ -44,16 +44,20 @@ jobs:
       - name: Check for changes
         id: check_changes
         run: |
-          # Check if CODEOWNERS is empty or has changed
-          if [ ! -s .github/CODEOWNERS ]; then
-            echo "changed=true" >> $GITHUB_OUTPUT
-            echo "CODEOWNERS is empty or missing"
-          elif git diff --quiet .github/CODEOWNERS; then
-            echo "changed=false" >> $GITHUB_OUTPUT
-            echo "No changes detected in CODEOWNERS"
+          # Check if CODEOWNERS file is new (unstaged) or has changes
+          if git ls-files --error-unmatch .github/CODEOWNERS >/dev/null 2>&1; then
+            # File is tracked, check for changes
+            if git diff --quiet .github/CODEOWNERS; then
+              echo "changed=false" >> $GITHUB_OUTPUT
+              echo "No changes detected in CODEOWNERS"
+            else
+              echo "changed=true" >> $GITHUB_OUTPUT
+              echo "Changes detected in CODEOWNERS"
+            fi
           else
+            # File is untracked (newly created)
             echo "changed=true" >> $GITHUB_OUTPUT
-            echo "Changes detected in CODEOWNERS"
+            echo "CODEOWNERS file is new"
           fi
 
       - name: Create Pull Request
