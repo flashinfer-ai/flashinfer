@@ -118,7 +118,6 @@ class CheckSumHash:
     TRTLLM_GEN_GEMM: str = (
         "e475e37989eed16418e0e858e2868ff07cb4b650cc48759cc23012f1afea310a"
     )
-
     map_checksums: dict[str, str] = {
         safe_urljoin(ArtifactPath.TRTLLM_GEN_FMHA, "checksums.txt"): TRTLLM_GEN_FMHA,
         safe_urljoin(ArtifactPath.TRTLLM_GEN_BMM, "checksums.txt"): TRTLLM_GEN_BMM,
