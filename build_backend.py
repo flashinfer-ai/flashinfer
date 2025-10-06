@@ -48,7 +48,7 @@ def write_if_different(path: Path, content: str) -> None:
     path.write_text(content)
 
 
-def _create_data_dir():
+def _create_data_dir(use_symlinks=True):
     _data_dir.mkdir(parents=True, exist_ok=True)
 
     def ln(source: str, target: str) -> None:
@@ -58,29 +58,47 @@ def _create_data_dir():
             if dst.is_symlink():
                 dst.unlink()
             elif dst.is_dir():
-                dst.rmdir()
-        dst.symlink_to(src, target_is_directory=True)
+                shutil.rmtree(dst)
+            else:
+                dst.unlink()
+
+        if use_symlinks:
+            dst.symlink_to(src, target_is_directory=True)
+        else:
+            # For wheel/sdist, copy actual files instead of symlinks
+            if src.exists():
+                shutil.copytree(src, dst, symlinks=False, dirs_exist_ok=True)
 
     ln("3rdparty/cutlass", "cutlass")
     ln("3rdparty/spdlog", "spdlog")
     ln("csrc", "csrc")
     ln("include", "include")
 
+    # Always ensure version.txt is present
+    version_file = _data_dir / "version.txt"
+    if not version_file.exists() or not use_symlinks:
+        shutil.copy(_root / "version.txt", version_file)
+
 
 def _prepare_for_wheel():
-    # Remove data directory
+    # For wheel, copy actual files instead of symlinks so they are included in the wheel
     if _data_dir.exists():
         shutil.rmtree(_data_dir)
+    _create_data_dir(use_symlinks=False)
 
 
 def _prepare_for_editable():
-    _create_data_dir()
+    # For editable install, use symlinks so changes are reflected immediately
+    if _data_dir.exists():
+        shutil.rmtree(_data_dir)
+    _create_data_dir(use_symlinks=True)
 
 
 def _prepare_for_sdist():
-    # Remove data directory
+    # For sdist, copy actual files instead of symlinks so they are included in the tarball
     if _data_dir.exists():
         shutil.rmtree(_data_dir)
+    _create_data_dir(use_symlinks=False)
 
 
 def get_requires_for_build_wheel(config_settings=None):
