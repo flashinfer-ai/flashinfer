@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y \
 
 # Install python
 COPY install/install_python.sh /install/install_python.sh
-RUN bash /install/install_python.sh py312
+RUN bash /install/install_python.sh /opt/conda py312
 
 # Set home directory
 WORKDIR /workspace
