@@ -37,8 +37,9 @@ jobs:
           python scripts/codeowner_analyzer.py \
             --output .github/CODEOWNERS \
             --depth 3 \
-            --min-commits 2 \
-            --days-back 365 \
+            --min-commits 1 \
+            --days-back 180 \
+            --top-n 5 \
             --no-api
 
       - name: Check for changes
