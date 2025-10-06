@@ -1,0 +1,43 @@
+# Code Owners File
+# Generated automatically from git history analysis
+# Analysis period: 180 days
+# Minimum commits threshold: 1
+
+benchmarks/ bryu@nvidia.com caiyaxing666@gmail.com yunzheq@nvidia.com @happierpig @fzyzcjy
+benchmarks/routines/ bryu@nvidia.com yunzheq@nvidia.com @stslxg-nv caiyaxing666@gmail.com @nvmbreughe
+ci/ caiyaxing666@gmail.com expye@outlook.com b8zhong@uwaterloo.ca
+ci/scripts/ caiyaxing666@gmail.com b8zhong@uwaterloo.ca
+ci/scripts/jenkins/ caiyaxing666@gmail.com b8zhong@uwaterloo.ca
+csrc/ expye@outlook.com shuw@nvidia.com yowu@nvidia.com @happierpig wtan45@wisc.edu
+csrc/fused_moe/ expye@outlook.com yowu@nvidia.com djm.moss@gmail.com shuw@nvidia.com weiliangl@nvidia.com
+csrc/fused_moe/cutlass_backend/ expye@outlook.com yowu@nvidia.com djm.moss@gmail.com shuw@nvidia.com weiliangl@nvidia.com
+csrc/nv_internal/ shuw@nvidia.com expye@outlook.com djm.moss@gmail.com yowu@nvidia.com julien.debache@hotmail.com
+csrc/nv_internal/cpp/ shuw@nvidia.com yongcale@gmail.com djm.moss@gmail.com liin1211@outlook.com mamini@nvidia.com
+csrc/nv_internal/include/ shuw@nvidia.com
+csrc/nv_internal/tensorrt_llm/ shuw@nvidia.com expye@outlook.com djm.moss@gmail.com yowu@nvidia.com julien.debache@hotmail.com
+csrc/xqa/ @qsang-nv expye@outlook.com
+docs/ expye@outlook.com caiyaxing666@gmail.com shuw@nvidia.com @fzyzcjy yunzheq@nvidia.com
+flashinfer/ expye@outlook.com caiyaxing666@gmail.com @yyihuang shuw@nvidia.com @happierpig
+flashinfer-cubin/ expye@outlook.com caiyaxing666@gmail.com
+flashinfer-cubin/flashinfer_cubin/ expye@outlook.com
+flashinfer-jit-cache/ expye@outlook.com caiyaxing666@gmail.com
+flashinfer-jit-cache/flashinfer_jit_cache/ expye@outlook.com
+flashinfer/comm/ caiyaxing666@gmail.com expye@outlook.com @nvmbreughe luyanfcp@foxmail.com shuw@nvidia.com
+flashinfer/cudnn/ agopal@nvidia.com expye@outlook.com caiyaxing666@gmail.com ane1606@gmail.com
+flashinfer/cute_dsl/ @yyihuang expye@outlook.com kaixih@nvidia.com @fzyzcjy @limin2021
+flashinfer/fused_moe/ expye@outlook.com djm.moss@gmail.com shuw@nvidia.com caiyaxing666@gmail.com fate@eastal.com
+flashinfer/jit/ expye@outlook.com caiyaxing666@gmail.com aleyang@nvidia.com @jimmyzho jdebache@nvidia.com
+flashinfer/jit/attention/ expye@outlook.com n@ndor.email jdebache@nvidia.com @yyihuang ane1606@gmail.com
+flashinfer/jit/gemm/ expye@outlook.com @neurusl
+flashinfer/logits_processor/ me@xsl.sh caiyaxing666@gmail.com expye@outlook.com
+flashinfer/profiler/ caiyaxing666@gmail.com wtan45@wisc.edu
+flashinfer/triton/ caiyaxing666@gmail.com @nvmbreughe expye@outlook.com b8zhong@uwaterloo.ca
+flashinfer/tuning_configs/ @fzyzcjy kaixih@nvidia.com
+include/ expye@outlook.com wtan45@wisc.edu @happierpig mamini@nvidia.com aleyang@nvidia.com
+include/flashinfer/ expye@outlook.com wtan45@wisc.edu @happierpig mamini@nvidia.com aleyang@nvidia.com
+include/flashinfer/attention/ expye@outlook.com wtan45@wisc.edu @happierpig @kahyunnam gau.nernst@yahoo.com.sg
+include/flashinfer/comm/ @yyihuang jullin@nvidia.com zhangkaihong.zkh@antgroup.com yowu@nvidia.com weiliangl@nvidia.com
+include/flashinfer/gemm/ vincenth@nvidia.com yowu@nvidia.com yangs@nvidia.com aleyang@nvidia.com @jinyangyuan-nvidia
+include/flashinfer/trtllm/ mamini@nvidia.com aleyang@nvidia.com expye@outlook.com weiliangl@nvidia.com caiyaxing666@gmail.com
+profiler/ caiyaxing666@gmail.com @happierpig me@xsl.sh
+scripts/ expye@outlook.com @nvmbreughe yowu@nvidia.com bryu@nvidia.com @dierksen
