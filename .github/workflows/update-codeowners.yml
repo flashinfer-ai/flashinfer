@@ -23,7 +23,7 @@ jobs:
         uses: actions/checkout@v4.2.2
         with:
           fetch-depth: 0 # Fetch full history for accurate analysis
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.FLASHINFER_GITHUB_TOKEN }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -32,7 +32,7 @@ jobs:
 
       - name: Run CODEOWNERS analyzer
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.FLASHINFER_GITHUB_TOKEN }}
         run: |
           python scripts/codeowner_analyzer.py \
             --output .github/CODEOWNERS \
@@ -65,7 +65,7 @@ jobs:
         if: steps.check_changes.outputs.changed == 'true'
         uses: peter-evans/create-pull-request@v7
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.FLASHINFER_GITHUB_TOKEN }}
           commit-message: |
             chore: update CODEOWNERS based on git history
 
