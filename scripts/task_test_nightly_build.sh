@@ -28,7 +28,8 @@ pip install ${DIST_PYTHON_DIR}/*.tar.gz
 
 # Verify installation
 echo "Verifying installation..."
-python -m flashinfer show-config
+# Run from /tmp to avoid importing local flashinfer/ source directory
+(cd /tmp && python -m flashinfer show-config)
 
 # Run test shard
 echo "Running test shard ${TEST_SHARD}..."
