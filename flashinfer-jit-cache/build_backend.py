@@ -37,7 +37,7 @@ def _create_build_metadata():
         with open(version_file, "r") as f:
             version = f.read().strip()
     else:
-        version = "0.0.0"
+        version = "0.0.0+unknown"
 
     # Add dev suffix if specified
     dev_suffix = os.environ.get("FLASHINFER_DEV_RELEASE_SUFFIX", "")
@@ -45,7 +45,7 @@ def _create_build_metadata():
         version = f"{version}.dev{dev_suffix}"
 
     # Get git version
-    git_version = get_git_version()
+    git_version = get_git_version(cwd=Path(__file__).parent.parent)
 
     # Append CUDA version suffix if available
     cuda_suffix = os.environ.get("CUDA_VERSION_SUFFIX", "")
@@ -63,7 +63,7 @@ def _create_build_metadata():
     return version
 
 
-def compile_jit_cache(output_dir: Path, verbose: bool = True):
+def _compile_jit_cache(output_dir: Path, verbose: bool = True):
     """Compile AOT modules using flashinfer.aot functions directly."""
     from flashinfer import aot
 
@@ -91,7 +91,7 @@ def _build_aot_modules():
 
     try:
         # Compile AOT modules
-        compile_jit_cache(aot_package_dir)
+        _compile_jit_cache(aot_package_dir)
 
         # Verify that some modules were actually compiled
         so_files = list(aot_package_dir.rglob("*.so"))
@@ -194,6 +194,16 @@ def prepare_metadata_for_build_wheel(metadata_directory, config_settings=None):
 
     with _MonkeyPatchBdistWheel():
         return _orig.prepare_metadata_for_build_wheel(
+            metadata_directory, config_settings
+        )
+
+
+def prepare_metadata_for_build_editable(metadata_directory, config_settings=None):
+    """Prepare metadata for editable install, creating build metadata first."""
+    _create_build_metadata()
+
+    with _MonkeyPatchBdistWheel():
+        return _orig.prepare_metadata_for_build_editable(
             metadata_directory, config_settings
         )
 

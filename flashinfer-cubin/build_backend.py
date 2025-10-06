@@ -6,7 +6,6 @@ import os
 import sys
 from pathlib import Path
 from setuptools import build_meta as _orig
-from setuptools.build_meta import *
 
 # Add parent directory to path to import artifacts module
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -93,5 +92,17 @@ def build_editable(wheel_directory, config_settings=None, metadata_directory=Non
 # Pass through all other hooks
 get_requires_for_build_wheel = _orig.get_requires_for_build_wheel
 get_requires_for_build_editable = _orig.get_requires_for_build_editable
-prepare_metadata_for_build_wheel = _orig.prepare_metadata_for_build_wheel
-prepare_metadata_for_build_editable = _orig.prepare_metadata_for_build_editable
+
+
+def prepare_metadata_for_build_wheel(metadata_directory, config_settings=None):
+    """Prepare metadata for wheel build, creating build metadata first."""
+    _create_build_metadata()
+    return _orig.prepare_metadata_for_build_wheel(metadata_directory, config_settings)
+
+
+def prepare_metadata_for_build_editable(metadata_directory, config_settings=None):
+    """Prepare metadata for editable install, creating build metadata first."""
+    _create_build_metadata()
+    return _orig.prepare_metadata_for_build_editable(
+        metadata_directory, config_settings
+    )
