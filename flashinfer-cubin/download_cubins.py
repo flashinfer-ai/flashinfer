@@ -23,7 +23,7 @@ from pathlib import Path
 # Add parent directory to path to import flashinfer modules
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from flashinfer.artifacts import download_artifacts
+# from flashinfer.artifacts import download_artifacts
 from flashinfer.jit.cubin_loader import FLASHINFER_CUBINS_REPOSITORY
 
 
@@ -69,7 +69,8 @@ def main():
 
     # Use the existing download_artifacts function
     try:
-        download_artifacts()
+        # NOTE(Zihao): just for debugging, remove later
+        # download_artifacts()
         print("Download complete!")
     except Exception as e:
         print(f"Download failed: {e}")
