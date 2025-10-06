@@ -75,6 +75,7 @@ jobs:
 
             Co-Authored-By: Claude <noreply@anthropic.com>
           branch: auto-update-codeowners
+          base: main
           delete-branch: true
           title: 'chore: Update CODEOWNERS'
           body: |
