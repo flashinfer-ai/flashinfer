@@ -310,7 +310,8 @@ jobs:
           python3 scripts/update_whl_index.py \
             --dist-dir dist \
             --output-dir flashinfer-whl \
-            --release-tag "${{ needs.setup.outputs.release_tag }}"
+            --release-tag "${{ needs.setup.outputs.release_tag }}" \
+            --nightly
 
       - name: Push wheel index
         run: |

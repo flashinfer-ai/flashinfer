@@ -25,13 +25,6 @@ _root = Path(__file__).parent.resolve()
 _data_dir = _root / "flashinfer" / "data"
 
 
-def write_if_different(path: Path, content: str) -> None:
-    if path.exists() and path.read_text() == content:
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content)
-
-
 def get_version():
     package_version = (_root / "version.txt").read_text().strip()
     dev_suffix = os.environ.get("FLASHINFER_DEV_RELEASE_SUFFIX", "")
@@ -40,10 +33,19 @@ def get_version():
     return package_version
 
 
-def generate_build_meta() -> None:
-    build_meta_str = f"__version__ = {get_version()!r}\n"
-    build_meta_str += f"__git_version__ = {get_git_version(cwd=_root)!r}\n"
-    write_if_different(_root / "flashinfer" / "_build_meta.py", build_meta_str)
+# Create _build_meta.py at import time so setuptools can read the version
+build_meta_file = _root / "flashinfer" / "_build_meta.py"
+with open(build_meta_file, "w") as f:
+    f.write('"""Build metadata for flashinfer package."""\n')
+    f.write(f'__version__ = "{get_version()}"\n')
+    f.write(f'__git_version__ = "{get_git_version(cwd=_root)}"\n')
+
+
+def write_if_different(path: Path, content: str) -> None:
+    if path.exists() and path.read_text() == content:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content)
 
 
 def _create_data_dir():
@@ -82,19 +84,16 @@ def _prepare_for_sdist():
 
 
 def get_requires_for_build_wheel(config_settings=None):
-    generate_build_meta()
     _prepare_for_wheel()
     return []
 
 
 def get_requires_for_build_sdist(config_settings=None):
-    generate_build_meta()
     _prepare_for_sdist()
     return []
 
 
 def get_requires_for_build_editable(config_settings=None):
-    generate_build_meta()
     _prepare_for_editable()
     return []
 
