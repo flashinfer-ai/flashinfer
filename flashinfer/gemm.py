@@ -584,7 +584,7 @@ def tgv_gemm_sm100(
         pdl: Whether to use PDL (persistent data loader), defaults to False
 
     Returns:
-        Output tensor of shape (M, N)
+        Output tensor of shape (M, N) in row-major layout
 
     Supported dtypes:
         - torch.bfloat16

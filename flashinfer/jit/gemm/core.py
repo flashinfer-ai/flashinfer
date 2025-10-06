@@ -445,7 +445,18 @@ def gen_tgv_gemm_sm10x_module(
     return gen_jit_spec(
         module_name,
         source_paths,
-        extra_cuda_cflags=sm100f_nvcc_flags if use_sm_100f else sm100a_nvcc_flags,
+        extra_cuda_cflags=[
+            "-std=c++20",
+            "-O3",
+            "-lineinfo",
+            "-DCUTLASS_VERSIONS_GENERATED",
+            "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1",
+            "--expt-relaxed-constexpr",
+            "-DCUTLASS_TEST_LEVEL=0",
+            "-DCUTLASS_TEST_ENABLE_CACHED_RESULTS=1",
+            "-DCUTLASS_CONV_UNIT_TEST_RIGOROUS_SIZE_ENABLED=1",
+            "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
+        ] + sm100f_nvcc_flags if use_sm_100f else sm100a_nvcc_flags,
         extra_include_paths=[
             jit_env.FLASHINFER_INCLUDE_DIR,
             jit_env.FLASHINFER_CSRC_DIR,
