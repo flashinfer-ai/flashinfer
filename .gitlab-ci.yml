@@ -1,0 +1,168 @@
+stages:
+  - prepare
+  - test
+
+default:
+  tags:
+    - vm-builder
+  interruptible: true
+
+variables:
+  SOURCE_BRANCH:
+    value: "main"
+    description: "Source branch that contains the proposed change"
+  TARGET_BRANCH:
+    value: "main"
+    description: "Target branch of change"
+  RUN_TO_COMPLETION:
+    value: "1"
+    description: "Continue running the unit test even if one of the tests fails"
+  CONTAINER_IMAGE_TAG:
+    value: "20251002-52089b5"
+    description: "Tag of the container image to use (see https://hub.docker.com/r/flashinfer/)"
+
+.flashinfer_ci_base:
+  variables:
+    CONTAINER_IMAGE: flashinfer/flashinfer-ci-${CUDA_VERSION}:${CONTAINER_IMAGE_TAG}
+  after_script:
+    - 'find . -name "*.xml" -size +30M -print -delete'
+  artifacts:
+    when: always
+    reports:
+      junit: "**/*.xml"
+    paths:
+      - "**/*.xml"
+  parallel:
+    matrix:
+      - CUDA_VERSION: [cu129, cu130]
+
+prepare:
+  variables:
+    REPO: "gitlab-master.nvidia.com/dl/flashinfer/flashinfer"
+  stage: prepare
+  script:
+   - "mkdir ${CI_PIPELINE_ID} && cd ${CI_PIPELINE_ID}"
+   - "git clone https://flashinfer:${MAIN_REPO_ACCESS_TOKEN}@${REPO} --recursive"
+   - "pushd flashinfer && git checkout ${TARGET_BRANCH}"
+   - "git merge remotes/origin/${SOURCE_BRANCH}"
+   - "popd"
+   - "tar -czf ${CI_PIPELINE_ID}.tgz --exclude-vcs flashinfer/*"
+   - 'curl --header "PRIVATE-TOKEN: ${CI_REPO_ACCESS_TOKEN}" --upload-file ${CI_PIPELINE_ID}.tgz "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/unit-test-src/${CI_PIPELINE_ID}/src.tgz"'
+  after_script:
+    - "rm -rf ${CI_PIPELINE_ID}"
+
+.test_on_cluster:
+  stage: test
+  environment: "${CI_JOB_NAME_SLUG}"
+  variables:
+    GPUS: 8
+    SLURM_NODES: 1
+    CUDA_VISIBLE_DEVICES: "0"
+    SLURM_TIMELIMIT: 240
+    CI_ARCH: ${ARCH_AMD64} # default ARCH
+    SLURM_ACCOUNT: "coreai_libraries_cudnn"
+  script:
+    - 'srun -p ${SLURM_PARTITION} -A ${SLURM_ACCOUNT} -N ${SLURM_NODES} --job-name ${JOBNAME} --container-image=${CONTAINER_IMAGE} --container-mounts=${PWD}:/junit /bin/bash -c "curl --retry 3 --max-time 300 --fail --header \"PRIVATE-TOKEN: ${CI_REPO_ACCESS_TOKEN}\" \"${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/unit-test-src/${CI_PIPELINE_ID}/src.tgz\" -o src.tgz && tar xf src.tgz && cd flashinfer && nvidia-smi && export JUNIT_DIR=/junit && bash scripts/task_test_blackwell_kernels.sh"'
+  before_script:
+  # Emulate "enroot login" since enroot is not available on the head node
+  - export ENROOT_CONFIG_PATH="${CI_PROJECT_DIR}/${CI_JOB_ID}/.enroot" && mkdir -p "${ENROOT_CONFIG_PATH}"
+  - echo "machine ${CI_REGISTRY/:5005/} login gitlab-ci-token password ${CI_JOB_TOKEN}" > "${ENROOT_CONFIG_PATH}/.credentials"
+  - export JOBNAME="${SLURM_ACCOUNT}:${CI_PIPELINE_ID}:${GITLAB_USER_ID}:${CI_JOB_NAME_SLUG}:${CI_PROJECT_PATH}:${CI_COMMIT_BRANCH}:${CI_JOB_ID}"
+  - export JOBNAME=${JOBNAME/ /--}
+  - set -x
+  tags:
+  - must_specify_runner
+  allow_failure: false
+  extends:
+    - .flashinfer_ci_base
+
+unit_test_b200_prenyx:
+  stage: test
+  variables:
+    SLURM_PARTITION: "b200-a01r"
+  extends:
+   - .test_on_cluster
+  tags:
+    - prenyx
+
+unit_test_gb300_lyris:
+  stage: test
+  variables:
+    SLURM_PARTITION: "gb300"
+  extends:
+   - .test_on_cluster
+  tags:
+    - lyris
+  allow_failure: true
+
+unit_test_gb200_pretyche:
+  stage: test
+  variables:
+    SLURM_PARTITION: "batch"
+  extends:
+   - .test_on_cluster
+  tags:
+    - ptyche
+
+.dlfw_runners:
+  stage: test
+  variables:
+    CI_SCHEDULER_TYPE: "slurm"
+    CI_SLURM_JOB_NAME: "${SLURM_ACCOUNT}:${CI_PIPELINE_ID}:${GITLAB_USER_ID}:${CI_JOB_NAME}:${CI_PROJECT_PATH}:${CI_COMMIT_BRANCH}:${CI_JOB_ID}"
+    CI_SLURM_TIME: 240
+    CI_SLURM_NODES: 1
+    CI_SLURM_ACCOUNT: "blackwell-ci"
+    CI_ARCH: ${ARCH_AMD64}
+    GIT_STRATEGY: "clone"
+  script:
+    - 'srun --container-image=${CONTAINER_IMAGE} --container-mounts=${PWD}:/junit /bin/bash -c "curl --retry 3 --max-time 300 --fail --header \"PRIVATE-TOKEN: ${CI_REPO_ACCESS_TOKEN}\" \"${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/unit-test-src/${CI_PIPELINE_ID}/src.tgz\" -o src.tgz && tar xf src.tgz && cd flashinfer && nvidia-smi && export JUNIT_DIR=/junit && bash scripts/task_test_blackwell_kernels.sh"'
+  extends:
+    - .flashinfer_ci_base
+
+unit_test_b40_dlcluster:
+  variables:
+    CI_SLURM_PARTITION: "RTXPRO6000_ci"
+  extends:
+    - .dlfw_runners
+  tags:
+    - dlcluster_b40
+  allow_failure: true
+
+unit_test_spark_dlcluster:
+  variables:
+    CI_SLURM_PARTITION: "digits_gb10x_aarch64_ci"
+    CI_ARCH: ${ARCH_AARCH64}
+  extends:
+    - .dlfw_runners
+  tags:
+    - dlcluster_digits
+  allow_failure: true
+
+unit_test_b300_dlcluster:
+  variables:
+    CI_SLURM_PARTITION: "b300@ts4/b300-nvl8@ts3/8gpu-224cpu-2048gb"
+    CI_SLURM_ACCOUNT: "beta-users"
+  extends:
+    - .dlfw_runners
+  tags:
+    - computelab_sc_01_umbriel_b300_nvl8
+  allow_failure: true
+
+unit_test_h100_dlcluster:
+  variables:
+    CI_SLURM_PARTITION: "H100_preprod_ci"
+  extends:
+    - .dlfw_runners
+  tags:
+    - dlcluster_h100
+  allow_failure: true
+
+unit_test_5090_dlcluster:
+  variables:
+    CI_SLURM_PARTITION: "RTX5090"
+    CI_SLURM_ACCOUNT: "blackwell"
+  extends:
+    - .dlfw_runners
+  tags:
+    - dlcluster_rtx5090
+  allow_failure: true
