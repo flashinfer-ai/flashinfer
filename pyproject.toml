@@ -24,7 +24,7 @@ dynamic = ["dependencies", "version"]
 license-files = ["LICENSE", "licenses/*"]
 
 [build-system]
-requires = ["setuptools>=77", "packaging>=24"]
+requires = ["setuptools>=77", "packaging>=24", "apache-tvm-ffi==0.1.0b15"]
 build-backend = "build_backend"
 backend-path = ["."]
 
