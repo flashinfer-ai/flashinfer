@@ -43,10 +43,12 @@ py-modules = ["build_backend", "build_utils"]
 
 [tool.setuptools.dynamic]
 version = {attr = "flashinfer._build_meta.__version__"}
+dependencies = {file = ["requirements.txt"]}
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["flashinfer*"]
+exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*"]
 
 [tool.setuptools.package-dir]
 "flashinfer.data" = "."
