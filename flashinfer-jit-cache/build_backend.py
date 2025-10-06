@@ -40,24 +40,36 @@ with open(build_meta_file, "w") as f:
     f.write(f'__git_version__ = "{git_version}"\n')
 
 
-def get_version():
+def _create_build_metadata():
+    """Create build metadata file with version information."""
     version_file = Path(__file__).parent.parent / "version.txt"
     if version_file.exists():
         with open(version_file, "r") as f:
             version = f.read().strip()
     else:
-        version = "0.0.0+unknown"
+        version = "0.0.0"
+
+    # Add dev suffix if specified
+    dev_suffix = os.environ.get("FLASHINFER_DEV_RELEASE_SUFFIX", "")
+    if dev_suffix:
+        version = f"{version}.dev{dev_suffix}"
+
+    # Get git version
+    git_version = get_git_version()
 
     # Append CUDA version suffix if available
     cuda_suffix = os.environ.get("CUDA_VERSION_SUFFIX", "")
     if cuda_suffix:
-        # Replace + with . for proper version formatting
-        if "+" in version:
-            base_version, local = version.split("+", 1)
-            version = f"{base_version}+{cuda_suffix}.{local}"
-        else:
-            version = f"{version}+{cuda_suffix}"
+        # Use + to create a local version identifier that will appear in wheel name
+        version = f"{version}+{cuda_suffix}"
+    build_meta_file = Path(__file__).parent / "flashinfer_jit_cache" / "_build_meta.py"
 
+    with open(build_meta_file, "w") as f:
+        f.write('"""Build metadata for flashinfer-jit-cache package."""\n')
+        f.write(f'__version__ = "{version}"\n')
+        f.write(f'__git_version__ = "{git_version}"\n')
+
+    print(f"Created build metadata file with version {version}")
     return version
 
 
@@ -82,8 +94,7 @@ def compile_jit_cache(output_dir: Path, verbose: bool = True):
     )
 
 
-def _prepare_build():
-    """Shared preparation logic for both wheel and editable builds."""
+def _build_aot_modules():
     # First, ensure AOT modules are compiled
     aot_package_dir = Path(__file__).parent / "flashinfer_jit_cache" / "jit_cache"
     aot_package_dir.mkdir(parents=True, exist_ok=True)
@@ -103,16 +114,11 @@ def _prepare_build():
         print(f"Failed to compile AOT modules: {e}")
         raise
 
-    # Create build metadata file with version information
-    package_dir = Path(__file__).parent / "flashinfer_jit_cache"
-    build_meta_file = package_dir / "_build_meta.py"
-    version = get_version()
 
-    with open(build_meta_file, "w") as f:
-        f.write('"""Build metadata for flashinfer-jit-cache package."""\n')
-        f.write(f'__version__ = "{version}"\n')
-
-    print(f"Created build metadata file with version {version}")
+def _prepare_build():
+    """Shared preparation logic for both wheel and editable builds."""
+    _create_build_metadata()
+    _build_aot_modules()
 
 
 class PlatformSpecificBdistWheel(bdist_wheel):
