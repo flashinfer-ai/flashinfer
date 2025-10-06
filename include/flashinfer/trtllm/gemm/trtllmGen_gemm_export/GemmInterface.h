@@ -27,6 +27,16 @@
 #include "flashinferMetaInfo.h"
 #endif  // TLLM_GEN_EXPORT_INTERFACE
 
+#ifdef TLLM_GEN_GEMM_CUBIN_PATH
+static const std::string tllm_gen_gemm_cubin_path = std::string(TLLM_GEN_GEMM_CUBIN_PATH);
+#else
+static_assert(false, "TLLM_GEN_GEMM_CUBIN_PATH macro is not defined when compiling");
+#endif
+
+namespace flashinfer::trtllm_cubin_loader {
+std::string getCubin(const std::string& kernelName, const std::string& sha256);
+}  // namespace flashinfer::trtllm_cubin_loader
+
 namespace gemm {
 
 namespace gemm {
@@ -315,7 +325,8 @@ GemmConfig const* GemmInterface::getGemmConfigs() const {
 
 size_t GemmInterface::getNumGemmConfigs() const {
 #ifdef TLLM_GEN_EXPORT_INTERFACE
-  return tensorrt_llm::kernels::tllmGenGemmListLen;
+  return sizeof(tensorrt_llm::kernels::tllmGenGemmList) /
+         sizeof(tensorrt_llm::kernels::tllmGenGemmList[0]);
 #else
   return 0;
 #endif
@@ -480,6 +491,17 @@ int32_t GemmInterface::run(GemmConfig const& config, void* workspace, GemmData c
   CUmodule cuModule;
   CUfunction cuFunction;
 
+  auto fiModuleLoadData = [&](CUmodule* module) {
+    const std::string sha256 = config.mHash ? config.mHash : "";
+    std::string fname_cubin = config.mFunctionName;
+    if (!fname_cubin.empty()) {
+      fname_cubin[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(fname_cubin[0])));
+    }
+    fname_cubin = tllm_gen_gemm_cubin_path + "/" + fname_cubin + ".cubin";
+    std::string cubin = flashinfer::trtllm_cubin_loader::getCubin(fname_cubin, sha256);
+    cuModuleLoadData(&cuModule, cubin.c_str());
+  };
+
   if (moduleCache.has_value()) {
     ModuleCache& moduleCacheRef = moduleCache.value().get();
 
@@ -501,12 +523,12 @@ int32_t GemmInterface::run(GemmConfig const& config, void* workspace, GemmData c
     if (module != moduleCacheRef.end()) {
       cuFunction = std::get<1>(module->second);
     } else {
-      cuModuleLoadData(&cuModule, config.mData);
+      fiModuleLoadData(&cuModule);
       cuModuleGetFunction(&cuFunction, cuModule, config.mFunctionName);
       moduleCacheRef.insert(std::make_pair(moduleKey, std::make_tuple(cuModule, cuFunction)));
     }
   } else {
-    cuModuleLoadData(&cuModule, config.mData);
+    fiModuleLoadData(&cuModule);
     cuModuleGetFunction(&cuFunction, cuModule, config.mFunctionName);
   }
 
@@ -534,9 +556,7 @@ int32_t GemmInterface::run(GemmConfig const& config, void* workspace, GemmData c
     return -1;
   }
 #else
-  config.mCudaRunner->run((void*)&kernelParams, (void*)cudaStream, grid,
-                          /*cluster*/ {},
-                          /*instanceId*/ config.mInstanceIdx);
+  config.mCudaRunner->run((void*)&kernelParams, (void*)cudaStream, grid);
 #endif
 
   return 0;
