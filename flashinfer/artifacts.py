@@ -23,7 +23,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Generator
 import requests  # type: ignore[import-untyped]
 import shutil
-import hashlib
 
 # Create logger for artifacts module to avoid circular import with jit.core
 logger = logging.getLogger("flashinfer.artifacts")
@@ -91,6 +90,7 @@ class ArtifactPath:
     CUDNN_SDPA: str = "a72d85b019dc125b9f711300cb989430f762f5a6/fmha/cudnn/"
     DEEPGEMM: str = "a72d85b019dc125b9f711300cb989430f762f5a6/deep-gemm/"
 
+
 # TODO: Should be deprecated
 @dataclass(frozen=True)
 class MetaInfoHash:
@@ -108,12 +108,18 @@ class MetaInfoHash:
 
 # @dataclass(frozen=True)
 class CheckSumHash:
-    TRTLLM_GEN_FMHA: str = "b2d9d40db550ef85585e980bee651ac19d3e416f10b0c8bf9de0a7f9d0bee3d4"
-    TRTLLM_GEN_BMM: str = "efb9379c924193f6d3cb792bafb12b0811cab8eaa12bf324c7c410636c7769cd"
-    DEEPGEMM: str = "1a2a166839042dbd2a57f48051c82cd1ad032815927c753db269a4ed10d0ffbf"  
-    TRTLLM_GEN_GEMM: str = "e475e37989eed16418e0e858e2868ff07cb4b650cc48759cc23012f1afea310a"
+    TRTLLM_GEN_FMHA: str = (
+        "b2d9d40db550ef85585e980bee651ac19d3e416f10b0c8bf9de0a7f9d0bee3d4"
+    )
+    TRTLLM_GEN_BMM: str = (
+        "efb9379c924193f6d3cb792bafb12b0811cab8eaa12bf324c7c410636c7769cd"
+    )
+    DEEPGEMM: str = "1a2a166839042dbd2a57f48051c82cd1ad032815927c753db269a4ed10d0ffbf"
+    TRTLLM_GEN_GEMM: str = (
+        "e475e37989eed16418e0e858e2868ff07cb4b650cc48759cc23012f1afea310a"
+    )
 
-    map_checksums: [dict[str, str]] = {
+    map_checksums: dict[str, str] = {
         safe_urljoin(ArtifactPath.TRTLLM_GEN_FMHA, "checksums.txt"): TRTLLM_GEN_FMHA,
         safe_urljoin(ArtifactPath.TRTLLM_GEN_BMM, "checksums.txt"): TRTLLM_GEN_BMM,
         safe_urljoin(ArtifactPath.DEEPGEMM, "checksums.txt"): DEEPGEMM,
@@ -124,7 +130,9 @@ class CheckSumHash:
 def get_checksums(subdirs):
     checksums = {}
     for subdir in subdirs:
-        uri = safe_urljoin(FLASHINFER_CUBINS_REPOSITORY, safe_urljoin(subdir, "checksums.txt"))
+        uri = safe_urljoin(
+            FLASHINFER_CUBINS_REPOSITORY, safe_urljoin(subdir, "checksums.txt")
+        )
         checksum_path = FLASHINFER_CUBIN_DIR / safe_urljoin(subdir, "checksums.txt")
         download_file(uri, checksum_path)
         with open(checksum_path, "r") as f:
@@ -138,7 +146,7 @@ def get_checksums(subdirs):
     return checksums
 
 
-def get_subdir_file_list():
+def get_subdir_file_list() -> Generator[tuple[str, str], None, None]:
     base = FLASHINFER_CUBINS_REPOSITORY
 
     cubin_dirs = [
@@ -152,9 +160,24 @@ def get_subdir_file_list():
     checksums = get_checksums(cubin_dirs)
 
     # The meta info header files first.
-    yield (safe_urljoin(ArtifactPath.TRTLLM_GEN_FMHA, "include/flashInferMetaInfo.h"), checksums[safe_urljoin(ArtifactPath.TRTLLM_GEN_FMHA, "include/flashInferMetaInfo.h")])
-    yield (safe_urljoin(ArtifactPath.TRTLLM_GEN_GEMM, "include/flashinferMetaInfo.h"), checksums[safe_urljoin(ArtifactPath.TRTLLM_GEN_GEMM, "include/flashinferMetaInfo.h")])
-    yield (safe_urljoin(ArtifactPath.TRTLLM_GEN_BMM, "include/flashinferMetaInfo.h"), checksums[safe_urljoin(ArtifactPath.TRTLLM_GEN_BMM, "include/flashinferMetaInfo.h")])
+    yield (
+        safe_urljoin(ArtifactPath.TRTLLM_GEN_FMHA, "include/flashInferMetaInfo.h"),
+        checksums[
+            safe_urljoin(ArtifactPath.TRTLLM_GEN_FMHA, "include/flashInferMetaInfo.h")
+        ],
+    )
+    yield (
+        safe_urljoin(ArtifactPath.TRTLLM_GEN_GEMM, "include/flashinferMetaInfo.h"),
+        checksums[
+            safe_urljoin(ArtifactPath.TRTLLM_GEN_GEMM, "include/flashinferMetaInfo.h")
+        ],
+    )
+    yield (
+        safe_urljoin(ArtifactPath.TRTLLM_GEN_BMM, "include/flashinferMetaInfo.h"),
+        checksums[
+            safe_urljoin(ArtifactPath.TRTLLM_GEN_BMM, "include/flashinferMetaInfo.h")
+        ],
+    )
 
     # All the actual kernel cubin's.
     for cubin_dir in cubin_dirs:
