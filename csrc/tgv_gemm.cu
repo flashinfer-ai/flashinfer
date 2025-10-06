@@ -148,7 +148,7 @@ Tensor tgv_gemm(Tensor const& mat1, Tensor const& mat2, Optional<Tensor> bias, i
   int K = mat1->shape[1];
   int N = mat2->shape[1];
 
-  int64_t element_size = 2;  // bytes per element (fp16/bf16)
+  int64_t element_size = get_element_size(mat1);
   TVM_FFI_ICHECK(int64_t(M) * N * element_size < std::numeric_limits<int32_t>::max())
       << "TMA plane stride (M * N * element_size) exceeds INT32_MAX; tensor too large for TMA";
   TVM_FFI_ICHECK(int64_t(M) * K * element_size < std::numeric_limits<int32_t>::max())
