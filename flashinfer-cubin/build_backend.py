@@ -75,34 +75,24 @@ def _create_build_metadata():
     return version
 
 
+# Create build metadata as soon as this module is imported
+_create_build_metadata()
+
+
 def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
     """Build a wheel, downloading cubins first."""
     _download_cubins()
-    _create_build_metadata()
     return _orig.build_wheel(wheel_directory, config_settings, metadata_directory)
 
 
 def build_editable(wheel_directory, config_settings=None, metadata_directory=None):
     """Build an editable install, downloading cubins first."""
     _download_cubins()
-    _create_build_metadata()
     return _orig.build_editable(wheel_directory, config_settings, metadata_directory)
 
 
 # Pass through all other hooks
 get_requires_for_build_wheel = _orig.get_requires_for_build_wheel
 get_requires_for_build_editable = _orig.get_requires_for_build_editable
-
-
-def prepare_metadata_for_build_wheel(metadata_directory, config_settings=None):
-    """Prepare metadata for wheel build, creating build metadata first."""
-    _create_build_metadata()
-    return _orig.prepare_metadata_for_build_wheel(metadata_directory, config_settings)
-
-
-def prepare_metadata_for_build_editable(metadata_directory, config_settings=None):
-    """Prepare metadata for editable install, creating build metadata first."""
-    _create_build_metadata()
-    return _orig.prepare_metadata_for_build_editable(
-        metadata_directory, config_settings
-    )
+prepare_metadata_for_build_wheel = _orig.prepare_metadata_for_build_wheel
+prepare_metadata_for_build_editable = _orig.prepare_metadata_for_build_editable

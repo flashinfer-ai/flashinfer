@@ -63,6 +63,10 @@ def _create_build_metadata():
     return version
 
 
+# Create build metadata as soon as this module is imported
+_create_build_metadata()
+
+
 def _compile_jit_cache(output_dir: Path, verbose: bool = True):
     """Compile AOT modules using flashinfer.aot functions directly."""
     from flashinfer import aot
@@ -107,7 +111,6 @@ def _build_aot_modules():
 
 def _prepare_build():
     """Shared preparation logic for both wheel and editable builds."""
-    _create_build_metadata()
     _build_aot_modules()
 
 
@@ -190,8 +193,6 @@ def build_editable(wheel_directory, config_settings=None, metadata_directory=Non
 
 def prepare_metadata_for_build_wheel(metadata_directory, config_settings=None):
     """Prepare metadata with platform-specific wheel tags."""
-    _create_build_metadata()
-
     with _MonkeyPatchBdistWheel():
         return _orig.prepare_metadata_for_build_wheel(
             metadata_directory, config_settings
@@ -199,9 +200,7 @@ def prepare_metadata_for_build_wheel(metadata_directory, config_settings=None):
 
 
 def prepare_metadata_for_build_editable(metadata_directory, config_settings=None):
-    """Prepare metadata for editable install, creating build metadata first."""
-    _create_build_metadata()
-
+    """Prepare metadata for editable install."""
     with _MonkeyPatchBdistWheel():
         return _orig.prepare_metadata_for_build_editable(
             metadata_directory, config_settings
