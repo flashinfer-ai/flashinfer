@@ -20,40 +20,14 @@ from typing import Optional
 
 import torch
 
-from .jit import JitSpec
-from .jit import gen_act_and_mul_module as gen_act_and_mul_module_impl
-from .utils import device_support_pdl, register_custom_op, register_fake_op
-
-silu_def_cu_str = r"""
-__device__ __forceinline__ float silu(const float& val) {
-  return val / (1.0f + __expf(-val));
-}
-"""
-
-gelu_def_cu_str = r"""
-__device__ __forceinline__ float gelu(const float& val) {
-  constexpr float kAlpha = M_SQRT1_2;
-  return val * 0.5f * (1.0f + ::erf(val * kAlpha));
-}
-"""
-
-gelu_def_tanh_cu_str = r"""
-__device__ __forceinline__ float gelu_tanh(const float& val) {
-  const float cdf =
-      0.5f * (1.0f + math::tanh((0.7978845608028654f * (val + 0.044715f * val * val * val))));
-  return val * cdf;
-}
-"""
-
-act_func_def_str = {
-    "silu": silu_def_cu_str,
-    "gelu": gelu_def_cu_str,
-    "gelu_tanh": gelu_def_tanh_cu_str,
-}
-
-
-def gen_act_and_mul_module(act_func_name: str) -> JitSpec:
-    return gen_act_and_mul_module_impl(act_func_name, act_func_def_str[act_func_name])
+from .jit import gen_act_and_mul_module
+from .utils import (
+    device_support_pdl,
+    register_custom_op,
+    register_fake_op,
+    get_compute_capability,
+)
+from .fp4_quantization import get_fp4_quantization_module
 
 
 @functools.cache
@@ -134,6 +108,39 @@ def silu_and_mul(
         enable_pdl,
     )
     return out
+
+
+def silu_and_mul_nvfp4_batched_quantize(
+    a,
+    mask,
+    a_global_sf,
+    sf_vec_size=16,
+):
+    """
+    Silu and multiply and quantize batched input tensor to NVFP4 format with mask.
+
+    Parameters:
+        a (torch.Tensor): Input tensor of shape [B, M, K] with dtype fp16/bf16.
+        a_global_sf (torch.Tensor): Global scale factor of shape [1] with dtype float32.
+        mask (torch.Tensor): Mask tensor to apply before quantization.
+        sf_vec_size (int, optional): Scale factor vector size. Defaults to 16.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
+            - Quantized tensor of shape [B, M, K/2] with dtype FLOAT4_E2M1X2
+            - Scale factors tensor with shape determined by layout and sf_vec_size
+    """
+    major, minor = get_compute_capability(a.device)
+    device_arch = f"{major * 10 + minor}"
+    a_fp4, a_sf = get_fp4_quantization_module(
+        device_arch
+    ).silu_and_mul_nvfp4_batched_quantize_sm100(
+        a,
+        mask,
+        a_global_sf,
+        sf_vec_size,
+    )
+    return a_fp4, a_sf
 
 
 def gelu_tanh_and_mul(

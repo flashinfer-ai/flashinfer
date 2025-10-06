@@ -24,7 +24,7 @@ import torch.version
 from torch.torch_version import TorchVersion
 from torch.torch_version import __version__ as torch_version
 
-from .jit import gen_jit_spec, env as jit_env
+from .jit.spdlog import gen_spdlog_module
 
 
 class PosEncodingMode(Enum):
@@ -466,6 +466,11 @@ def is_sm100a_supported(device: torch.device) -> bool:
     return major == 10 and version_at_least(torch.version.cuda, "12.8")
 
 
+def is_sm100f_supported(device: torch.device) -> bool:
+    major, _ = get_compute_capability(device)
+    return major == 10 and version_at_least(torch.version.cuda, "12.9")
+
+
 def is_sm110a_supported(device: torch.device) -> bool:
     major, _ = get_compute_capability(device)
     return major == 11 and version_at_least(torch.version.cuda, "13.0")
@@ -506,22 +511,9 @@ def check_shape_dtype_device(
         )
 
 
-def gen_logging_module():
-    return gen_jit_spec(
-        "logging",
-        [
-            jit_env.FLASHINFER_CSRC_DIR / "logging.cc",
-        ],
-        extra_include_paths=[
-            jit_env.SPDLOG_INCLUDE_DIR,
-            jit_env.FLASHINFER_INCLUDE_DIR,
-        ],
-    )
-
-
 @functools.cache
 def get_logging_module():
-    return gen_logging_module().build_and_load()
+    return gen_spdlog_module().build_and_load()
 
 
 class LogLevel(Enum):
@@ -547,6 +539,7 @@ def set_log_level(lvl_str: str) -> None:
     get_logging_module().set_log_level(log_level_map[lvl_str].value)
 
 
+@functools.cache
 def device_support_pdl(device: torch.device) -> bool:
     if device.type != "cuda":
         return False
@@ -573,6 +566,7 @@ def round_up(x: int, y: int) -> int:
     return ceil_div(x, y) * y
 
 
+@functools.cache
 def get_device_sm_count(device: torch.device) -> int:
     return torch.cuda.get_device_properties(device).multi_processor_count
 

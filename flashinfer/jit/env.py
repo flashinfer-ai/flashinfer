@@ -20,13 +20,16 @@ limitations under the License.
 
 import os
 import pathlib
+import importlib.util
 from ..compilation_context import CompilationContext
+from .. import __version__ as flashinfer_version
 
-FLASHINFER_BASE_DIR = pathlib.Path(
+FLASHINFER_BASE_DIR: pathlib.Path = pathlib.Path(
     os.getenv("FLASHINFER_WORKSPACE_BASE", pathlib.Path.home().as_posix())
 )
 
-FLASHINFER_CACHE_DIR = FLASHINFER_BASE_DIR / ".cache" / "flashinfer"
+FLASHINFER_CACHE_DIR: pathlib.Path = FLASHINFER_BASE_DIR / ".cache" / "flashinfer"
+_package_root: pathlib.Path = pathlib.Path(__file__).resolve().parents[1]
 
 
 def _get_cubin_dir():
@@ -37,12 +40,18 @@ def _get_cubin_dir():
     3. Default cache directory
     """
     # First check if flashinfer-cubin package is installed
-    try:
+    if importlib.util.find_spec("flashinfer_cubin"):
         import flashinfer_cubin
 
+        flashinfer_cubin_version = flashinfer_cubin.__version__
+        if flashinfer_version != flashinfer_cubin_version:
+            raise RuntimeError(
+                f"flashinfer-cubin version ({flashinfer_cubin_version}) does not match "
+                f"flashinfer version ({flashinfer_version}). "
+                "Please install the same version of both packages."
+            )
+
         return pathlib.Path(flashinfer_cubin.get_cubin_dir())
-    except ImportError:
-        pass
 
     # Then check environment variable
     env_dir = os.getenv("FLASHINFER_CUBIN_DIR")
@@ -53,32 +62,63 @@ def _get_cubin_dir():
     return FLASHINFER_CACHE_DIR / "cubins"
 
 
-FLASHINFER_CUBIN_DIR = _get_cubin_dir()
+FLASHINFER_CUBIN_DIR: pathlib.Path = _get_cubin_dir()
+
+
+def _get_aot_dir():
+    """
+    Get the AOT directory path with the following priority:
+    1. flashinfer-jit-cache package if installed
+    2. Default fallback to _package_root / "data" / "aot"
+    """
+    # First check if flashinfer-jit-cache package is installed
+    if importlib.util.find_spec("flashinfer_jit_cache"):
+        import flashinfer_jit_cache
+
+        flashinfer_jit_cache_version = flashinfer_jit_cache.__version__
+        # NOTE(Zihao): we don't use exact version match here because the version of flashinfer-jit-cache
+        # contains the CUDA version suffix: e.g. 0.3.1+cu129.
+        if not flashinfer_jit_cache_version.startswith(flashinfer_version):
+            raise RuntimeError(
+                f"flashinfer-jit-cache version ({flashinfer_jit_cache_version}) does not match "
+                f"flashinfer version ({flashinfer_version}). "
+                "Please install the same version of both packages."
+            )
+
+        return pathlib.Path(flashinfer_jit_cache.get_jit_cache_dir())
+
+    # Fall back to default directory
+    return _package_root / "data" / "aot"
+
+
+FLASHINFER_AOT_DIR: pathlib.Path = _get_aot_dir()
 
 
 def _get_workspace_dir_name() -> pathlib.Path:
     compilation_context = CompilationContext()
+    # NOTE(Zihao): sorted() is crucial here to ensure deterministic directory names.
+    # Without it, the same set of CUDA archs could generate different directory names
+    # across runs (e.g., "75_80_89" vs "89_75_80"), causing cache fragmentation.
     arch = "_".join(
-        f"{major}{minor}" for major, minor in compilation_context.TARGET_CUDA_ARCHS
+        f"{major}{minor}"
+        for major, minor in sorted(compilation_context.TARGET_CUDA_ARCHS)
     )
     return FLASHINFER_CACHE_DIR / arch
 
 
 # use pathlib
-FLASHINFER_WORKSPACE_DIR = _get_workspace_dir_name()
-FLASHINFER_JIT_DIR = FLASHINFER_WORKSPACE_DIR / "cached_ops"
-FLASHINFER_GEN_SRC_DIR = FLASHINFER_WORKSPACE_DIR / "generated"
-_package_root = pathlib.Path(__file__).resolve().parents[1]
-FLASHINFER_DATA = _package_root / "data"
-FLASHINFER_INCLUDE_DIR = _package_root / "data" / "include"
-FLASHINFER_CSRC_DIR = _package_root / "data" / "csrc"
+FLASHINFER_WORKSPACE_DIR: pathlib.Path = _get_workspace_dir_name()
+FLASHINFER_JIT_DIR: pathlib.Path = FLASHINFER_WORKSPACE_DIR / "cached_ops"
+FLASHINFER_GEN_SRC_DIR: pathlib.Path = FLASHINFER_WORKSPACE_DIR / "generated"
+FLASHINFER_DATA: pathlib.Path = _package_root / "data"
+FLASHINFER_INCLUDE_DIR: pathlib.Path = _package_root / "data" / "include"
+FLASHINFER_CSRC_DIR: pathlib.Path = _package_root / "data" / "csrc"
 # FLASHINFER_SRC_DIR = _package_root / "data" / "src"
-FLASHINFER_AOT_DIR = _package_root / "data" / "aot"
-CUTLASS_INCLUDE_DIRS = [
+CUTLASS_INCLUDE_DIRS: list[pathlib.Path] = [
     _package_root / "data" / "cutlass" / "include",
     _package_root / "data" / "cutlass" / "tools" / "util" / "include",
 ]
-SPDLOG_INCLUDE_DIR = _package_root / "data" / "spdlog" / "include"
+SPDLOG_INCLUDE_DIR: pathlib.Path = _package_root / "data" / "spdlog" / "include"
 
 
 def get_nvshmem_include_dirs():

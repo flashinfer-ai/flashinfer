@@ -37,13 +37,11 @@
 //
 
 import org.jenkinsci.plugins.pipeline.modeldefinition.Utils
-// These are set at runtime from data in ci/jenkins/docker-images.yml, update
-// image tags in that file
-// Now supports multiple CUDA versions
-docker_run_cu126 = "bash ci/bash.sh flashinfer/flashinfer-ci-cu126:latest"
-docker_run_cu128 = "bash ci/bash.sh flashinfer/flashinfer-ci-cu128:latest"
-docker_run_cu129 = "bash ci/bash.sh flashinfer/flashinfer-ci-cu129:latest"
-docker_run_cu130 = "bash ci/bash.sh flashinfer/flashinfer-ci-cu130:latest"
+
+def getDockerRun(cuda_version, dockerTags) {
+  def image_name = "flashinfer/flashinfer-ci-${cuda_version}"
+  return "bash ci/bash.sh ${image_name}:${dockerTags[image_name]}"
+}
 
 def per_exec_ws(folder) {
   return "workspace/exec_${env.EXECUTOR_NUMBER}/" + folder
@@ -63,6 +61,56 @@ def unpack_lib(name, libs) {
      echo "Unpacked ${libs} from ${name}"
      echo ${libs} | sed -e 's/,/ /g' | xargs md5sum
      """
+}
+
+def should_skip_build() {
+  // Skip build if changes are only in documentation/config directories
+  def skip_patterns = [
+    'README.md',
+    '.github/',
+    'docs/',
+    'docker/',
+    'licenses/',
+    'LICENSE',
+    'NOTICE',
+    'version.txt'
+  ]
+
+  if (env.CHANGE_ID) {
+    // This is a PR build, check changed files
+    def changedFiles = []
+    try {
+      changedFiles = sh(
+        script: 'git diff --name-only origin/${CHANGE_TARGET}...HEAD',
+        returnStdout: true
+      ).trim().split('\n')
+    } catch (Exception e) {
+      echo "Could not determine changed files: ${e.toString()}"
+      return false
+    }
+
+    if (changedFiles.size() == 0) {
+      return false
+    }
+
+    // Check if all changed files match skip patterns
+    def allSkippable = changedFiles.every { file ->
+      skip_patterns.any { pattern ->
+        if (pattern.endsWith('/')) {
+          file.startsWith(pattern)
+        } else {
+          file == pattern
+        }
+      }
+    }
+
+    if (allSkippable) {
+      echo "Skipping build - all changes are in documentation/config files: ${changedFiles}"
+      return true
+    }
+  }
+
+  return false
 }
 
 def cancel_previous_build() {
@@ -128,21 +176,8 @@ def run_with_spot_retry(spot_node_type, on_demand_node_type, test_name, test_clo
 //   }
 // }
 
-def run_unittest_CPU_AOT_COMPILE(node_type, cuda_version) {
-  echo "Running CPU AOT Compile Unittest with CUDA ${cuda_version}"
-
-  def docker_run = ""
-  if (cuda_version == "cu126") {
-    docker_run = docker_run_cu126
-  } else if (cuda_version == "cu128") {
-    docker_run = docker_run_cu128
-  } else if (cuda_version == "cu129") {
-    docker_run = docker_run_cu129
-  } else if (cuda_version == "cu130") {
-    docker_run = docker_run_cu130
-  } else {
-    error("Unknown CUDA version: ${cuda_version}")
-  }
+def run_unittest_CPU_JIT_CACHE_PACKAGE_BUILD_IMPORT(node_type, cuda_version) {
+  echo "Running CPU JIT Cache Package Build and Import Unittest with CUDA ${cuda_version}"
 
   if (node_type.contains('SPOT')) {
     // Add timeout only for spot instances - node allocation only
@@ -160,11 +195,13 @@ def run_unittest_CPU_AOT_COMPILE(node_type, cuda_version) {
       // If we reach here, node allocation was successful
       // Now run the tests without any timeout
       node(node_type) {
-        ws(per_exec_ws('flashinfer-aot')) {
+        ws(per_exec_ws('flashinfer-jit-cache')) {
           init_git(true)
+          def dockerTags = readYaml file: 'ci/docker-tags.yml'
+          def docker_run = getDockerRun(cuda_version, dockerTags)
           sh(script: "ls -alh", label: 'Show work directory')
           sh(script: "./scripts/task_show_node_info.sh", label: 'Show node info')
-          sh(script: "${docker_run} --no-gpu ./scripts/task_test_aot_build_import.sh", label: 'Test AOT Build and Import')
+          sh(script: "${docker_run} --no-gpu ./scripts/task_test_jit_cache_package_build_import.sh", label: 'Test JIT Cache Package Build and Import')
         }
       }
     } catch (Exception e) {
@@ -176,11 +213,13 @@ def run_unittest_CPU_AOT_COMPILE(node_type, cuda_version) {
   } else {
     // No timeout for non-spot instances
     node(node_type) {
-      ws(per_exec_ws('flashinfer-aot')) {
+      ws(per_exec_ws('flashinfer-jit-cache')) {
         init_git(true)
+        def dockerTags = readYaml file: 'ci/docker-tags.yml'
+        def docker_run = getDockerRun(cuda_version, dockerTags)
         sh(script: "ls -alh", label: 'Show work directory')
         sh(script: "./scripts/task_show_node_info.sh", label: 'Show node info')
-        sh(script: "${docker_run} --no-gpu ./scripts/task_test_aot_build_import.sh", label: 'Test AOT Build and Import')
+        sh(script: "${docker_run} --no-gpu ./scripts/task_test_jit_cache_package_build_import.sh", label: 'Test JIT Cache Package Build and Import')
       }
     }
   }
@@ -188,17 +227,6 @@ def run_unittest_CPU_AOT_COMPILE(node_type, cuda_version) {
 
 def shard_run_unittest_GPU(node_type, shard_id, cuda_version) {
   echo "Running unittest on ${node_type}, shard ${shard_id}, CUDA ${cuda_version}"
-
-  def docker_run = ""
-  if (cuda_version == "cu126") {
-    docker_run = docker_run_cu126
-  } else if (cuda_version == "cu128") {
-    docker_run = docker_run_cu128
-  } else if (cuda_version == "cu129") {
-    docker_run = docker_run_cu129
-  } else {
-    error("Unknown CUDA version: ${cuda_version}")
-  }
 
   if (node_type.contains('SPOT')) {
     // Add timeout only for spot instances - node allocation only
@@ -218,6 +246,8 @@ def shard_run_unittest_GPU(node_type, shard_id, cuda_version) {
       node(node_type) {
         ws(per_exec_ws('flashinfer-unittest')) {
           init_git(true) // we need cutlass submodule
+          def dockerTags = readYaml file: 'ci/docker-tags.yml'
+          def docker_run = getDockerRun(cuda_version, dockerTags)
           sh(script: "ls -alh", label: 'Show work directory')
           sh(script: "./scripts/task_show_node_info.sh", label: 'Show node info')
           sh(script: "${docker_run} ./scripts/task_jit_run_tests_part${shard_id}.sh", label: 'JIT Unittest Part ${shard_id}')
@@ -234,6 +264,8 @@ def shard_run_unittest_GPU(node_type, shard_id, cuda_version) {
     node(node_type) {
       ws(per_exec_ws('flashinfer-unittest')) {
         init_git(true) // we need cutlass submodule
+        def dockerTags = readYaml file: 'ci/docker-tags.yml'
+        def docker_run = getDockerRun(cuda_version, dockerTags)
         sh(script: "ls -alh", label: 'Show work directory')
         sh(script: "./scripts/task_show_node_info.sh", label: 'Show node info')
         sh(script: "${docker_run} ./scripts/task_jit_run_tests_part${shard_id}.sh", label: 'JIT Unittest Part ${shard_id}')
@@ -243,44 +275,50 @@ def shard_run_unittest_GPU(node_type, shard_id, cuda_version) {
 }
 
 stage('Unittest') {
+  if (should_skip_build()) {
+    echo "Skipping tests - only documentation/config files changed"
+    Utils.markStageSkippedForConditional('Unittest')
+    return
+  }
+
   cancel_previous_build()
   parallel(
     failFast: true,
     // CUDA 12.6 AOT Tests
     'AOT-Build-Import-x86-64-cu126': {
       run_with_spot_retry('CPU-LARGE-SPOT', 'CPU-LARGE', 'AOT-Build-Import-x86-64-cu126',
-        { node_type -> run_unittest_CPU_AOT_COMPILE(node_type, 'cu126') })
+        { node_type -> run_unittest_CPU_JIT_CACHE_PACKAGE_BUILD_IMPORT(node_type, 'cu126') })
     },
     'AOT-Build-Import-aarch64-cu126': {
       run_with_spot_retry('ARM-LARGE-SPOT', 'ARM-LARGE', 'AOT-Build-Import-aarch64-cu126',
-        { node_type -> run_unittest_CPU_AOT_COMPILE(node_type, 'cu126') })
+        { node_type -> run_unittest_CPU_JIT_CACHE_PACKAGE_BUILD_IMPORT(node_type, 'cu126') })
     },
     // CUDA 12.8 AOT Tests
     'AOT-Build-Import-x86-64-cu128': {
       run_with_spot_retry('CPU-LARGE-SPOT', 'CPU-LARGE', 'AOT-Build-Import-x86-64-cu128',
-        { node_type -> run_unittest_CPU_AOT_COMPILE(node_type, 'cu128') })
+        { node_type -> run_unittest_CPU_JIT_CACHE_PACKAGE_BUILD_IMPORT(node_type, 'cu128') })
     },
     'AOT-Build-Import-aarch64-cu128': {
       run_with_spot_retry('ARM-LARGE-SPOT', 'ARM-LARGE', 'AOT-Build-Import-aarch64-cu128',
-        { node_type -> run_unittest_CPU_AOT_COMPILE(node_type, 'cu128') })
+        { node_type -> run_unittest_CPU_JIT_CACHE_PACKAGE_BUILD_IMPORT(node_type, 'cu128') })
     },
     // CUDA 12.9 AOT Tests
     'AOT-Build-Import-x86-64-cu129': {
       run_with_spot_retry('CPU-LARGE-SPOT', 'CPU-LARGE', 'AOT-Build-Import-x86-64-cu129',
-        { node_type -> run_unittest_CPU_AOT_COMPILE(node_type, 'cu129') })
+        { node_type -> run_unittest_CPU_JIT_CACHE_PACKAGE_BUILD_IMPORT(node_type, 'cu129') })
     },
     'AOT-Build-Import-aarch64-cu129': {
       run_with_spot_retry('ARM-LARGE-SPOT', 'ARM-LARGE', 'AOT-Build-Import-aarch64-cu129',
-        { node_type -> run_unittest_CPU_AOT_COMPILE(node_type, 'cu129') })
+        { node_type -> run_unittest_CPU_JIT_CACHE_PACKAGE_BUILD_IMPORT(node_type, 'cu129') })
     },
     // CUDA 13.0 AOT Tests
     'AOT-Build-Import-x86-64-cu130': {
       run_with_spot_retry('CPU-LARGE-SPOT', 'CPU-LARGE', 'AOT-Build-Import-x86-64-cu130',
-        { node_type -> run_unittest_CPU_AOT_COMPILE(node_type, 'cu130') })
+        { node_type -> run_unittest_CPU_JIT_CACHE_PACKAGE_BUILD_IMPORT(node_type, 'cu130') })
     },
     'AOT-Build-Import-aarch64-cu130': {
       run_with_spot_retry('ARM-LARGE-SPOT', 'ARM-LARGE', 'AOT-Build-Import-aarch64-cu130',
-        { node_type -> run_unittest_CPU_AOT_COMPILE(node_type, 'cu130') })
+        { node_type -> run_unittest_CPU_JIT_CACHE_PACKAGE_BUILD_IMPORT(node_type, 'cu130') })
     },
     // JIT unittest only for cu129
     'JIT-Unittest-1-cu129': {

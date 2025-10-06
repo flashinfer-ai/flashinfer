@@ -19,20 +19,8 @@ from typing import Optional, Tuple
 
 import torch
 
-from .jit import JitSpec
-from .jit import env as jit_env
-from .jit import gen_jit_spec
+from .jit.rope import gen_rope_module
 from .utils import register_custom_op, register_fake_op
-
-
-def gen_rope_module() -> JitSpec:
-    return gen_jit_spec(
-        "rope",
-        [
-            jit_env.FLASHINFER_CSRC_DIR / "rope.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "flashinfer_rope_binding.cu",
-        ],
-    )
 
 
 @functools.cache

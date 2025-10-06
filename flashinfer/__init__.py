@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import importlib.util
+
 try:
     from ._build_meta import __version__ as __version__
 except ModuleNotFoundError:
@@ -24,6 +26,9 @@ from . import jit as jit
 from .activation import gelu_and_mul as gelu_and_mul
 from .activation import gelu_tanh_and_mul as gelu_tanh_and_mul
 from .activation import silu_and_mul as silu_and_mul
+from .activation import (
+    silu_and_mul_nvfp4_batched_quantize as silu_and_mul_nvfp4_batched_quantize,
+)
 from .attention import BatchAttention as BatchAttention
 from .attention import (
     BatchAttentionWithAttentionSinkWrapper as BatchAttentionWithAttentionSinkWrapper,
@@ -140,19 +145,3 @@ from .sparse import (
 )
 from .utils import next_positive_power_of_2 as next_positive_power_of_2
 from .xqa import xqa as xqa
-
-try:
-    import flashinfer_cubin
-
-    flashinfer_cubin_version = flashinfer_cubin.__version__
-
-    print("__version__", __version__)
-    if __version__ != flashinfer_cubin_version:
-        raise RuntimeError(
-            f"flashinfer-cubin version ({flashinfer_cubin_version}) does not match "
-            f"flashinfer version ({__version__}). "
-            "Please install the same version of both packages."
-        )
-except ImportError:
-    # flashinfer-cubin is not installed
-    pass

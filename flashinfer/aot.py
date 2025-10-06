@@ -25,15 +25,14 @@ import os
 import shutil
 from itertools import product
 from pathlib import Path
-from typing import List, Tuple, Iterator
+from typing import List, Tuple, Iterator, Optional
 
 import torch
-import torch.version
 
-from .activation import act_func_def_str, gen_act_and_mul_module
-from .fp8_quantization import gen_mxfp8_quantization_sm100_module
-from .cascade import gen_cascade_module
-from .fp4_quantization import (
+from packaging.version import Version
+from .jit.activation import act_func_def_str, gen_act_and_mul_module
+from .jit.cascade import gen_cascade_module
+from .jit.fp4_quantization import (
     gen_fp4_quantization_sm90_module,
     gen_fp4_quantization_sm100_module,
     gen_fp4_quantization_sm103_module,
@@ -41,26 +40,34 @@ from .fp4_quantization import (
     gen_fp4_quantization_sm120_module,
     gen_fp4_quantization_sm121_module,
 )
-from .fused_moe import (
+from .jit.fp8_quantization import gen_mxfp8_quantization_sm100_module
+from .jit.fused_moe import (
     gen_cutlass_fused_moe_sm120_module,
     gen_cutlass_fused_moe_sm100_module,
     gen_cutlass_fused_moe_sm90_module,
     gen_trtllm_gen_fused_moe_sm100_module,
 )
-from .gemm import (
+from .jit.gemm import (
     gen_gemm_module,
     gen_gemm_sm90_module,
     gen_gemm_sm100_module,
     gen_gemm_sm100_module_cutlass_fp4,
     gen_gemm_sm100_module_cutlass_fp8,
-    gen_gemm_sm100_module_tgv,
+    gen_tgv_gemm_sm10x_module,
     gen_gemm_sm120_module,
     gen_gemm_sm120_module_cutlass_fp4,
     gen_trtllm_gen_gemm_module,
 )
-from .jit import JitSpec, build_jit_specs
-from .jit import env as jit_env
-from .jit import (
+from .jit.spdlog import gen_spdlog_module
+from .jit.mla import gen_mla_module
+from .jit.norm import gen_norm_module
+from .jit.page import gen_page_module
+from .jit.quantization import gen_quantization_module
+from .jit.rope import gen_rope_module
+from .jit.sampling import gen_sampling_module
+from .jit.tllm_utils import gen_trtllm_utils_module
+from .jit.xqa import gen_xqa_module
+from .jit.attention import (
     gen_batch_attention_module,
     gen_batch_decode_module,
     gen_batch_mla_module,
@@ -71,15 +78,9 @@ from .jit import (
     gen_single_prefill_module,
     gen_trtllm_gen_fmha_module,
 )
-from .mla import gen_mla_module
-from .norm import gen_norm_module
-from .page import gen_page_module
-from .quantization import gen_quantization_module
-from .rope import gen_rope_module
-from .sampling import gen_sampling_module
-from .tllm_utils import gen_trtllm_utils_module
-from .utils import gen_logging_module, version_at_least
-from .xqa import gen_xqa_module
+from .jit import JitSpec, build_jit_specs
+from .jit import env as jit_env
+from .jit.cpp_ext import get_cuda_version
 from .compilation_context import CompilationContext
 
 
@@ -410,8 +411,10 @@ def gen_all_modules(
     add_xqa: bool,
 ) -> List[JitSpec]:
     jit_specs: List[JitSpec] = []
+    jit_specs.append(gen_spdlog_module())
     has_sm90 = sm_capabilities.get("sm90", False)
     has_sm100 = sm_capabilities.get("sm100", False)
+    has_sm100f = sm_capabilities.get("sm100f", False)
     has_sm103 = sm_capabilities.get("sm103", False)
     has_sm110 = sm_capabilities.get("sm110", False)
     has_sm120 = sm_capabilities.get("sm120", False)
@@ -449,11 +452,21 @@ def gen_all_modules(
             jit_specs.append(gen_gemm_sm100_module_cutlass_fp4())
             jit_specs.append(gen_gemm_sm100_module_cutlass_fp8())
             # Add TGV GEMM modules for both bf16 and fp16
-            jit_specs.append(gen_gemm_sm100_module_tgv(torch.bfloat16))
-            jit_specs.append(gen_gemm_sm100_module_tgv(torch.float16))
+            jit_specs.append(
+                gen_tgv_gemm_sm10x_module(torch.bfloat16, use_sm_100f=False)
+            )
+            jit_specs.append(
+                gen_tgv_gemm_sm10x_module(torch.float16, use_sm_100f=False)
+            )
             jit_specs.append(gen_mxfp8_quantization_sm100_module())
             jit_specs.append(gen_trtllm_gen_gemm_module())
             jit_specs.append(gen_trtllm_gen_fused_moe_sm100_module())
+        if has_sm100f:
+            # Add TGV GEMM modules compiled with SM100f flags for both bf16 and fp16
+            jit_specs.append(
+                gen_tgv_gemm_sm10x_module(torch.bfloat16, use_sm_100f=True)
+            )
+            jit_specs.append(gen_tgv_gemm_sm10x_module(torch.float16, use_sm_100f=True))
         if has_sm103:
             jit_specs.append(gen_fp4_quantization_sm103_module())
         if has_sm110:
@@ -467,10 +480,10 @@ def gen_all_modules(
             jit_specs.append(gen_fp4_quantization_sm121_module())
 
     if add_comm:
-        from .comm import gen_trtllm_comm_module, gen_vllm_comm_module
-        from .comm.nvshmem import gen_nvshmem_module
-        from .comm.trtllm_alltoall import gen_comm_alltoall_module
-        from .comm.trtllm_mnnvl_ar import gen_trtllm_mnnvl_comm_module
+        from .jit.comm import gen_trtllm_comm_module, gen_vllm_comm_module
+        from .jit.comm import gen_nvshmem_module
+        from .jit.comm import gen_comm_alltoall_module
+        from .jit.comm import gen_trtllm_mnnvl_comm_module
 
         jit_specs.append(gen_nvshmem_module())
         jit_specs.append(gen_comm_alltoall_module())
@@ -536,6 +549,112 @@ def copy_built_kernels(
         shutil.copy2(src, dst)
 
 
+def compile_and_package_modules(
+    out_dir: Optional[Path],
+    build_dir: Path,
+    project_root: Path,
+    config: dict = None,
+    verbose: bool = False,
+    skip_prebuilt: bool = True,
+) -> None:
+    """
+    Compile and package modules based on the provided configuration.
+
+    Args:
+        out_dir: Output directory for packaged modules
+        build_dir: Build directory for compilation
+        project_root: Project root directory
+        config: Configuration dictionary to override defaults (optional)
+        verbose: Whether to print verbose build output
+        skip_prebuilt: Whether to skip pre-built modules
+    """
+    # Start with default config and override with user config
+    final_config = get_default_config()
+    if config is not None:
+        final_config.update(config)
+    config = final_config
+    # Cuda Arch
+    if "FLASHINFER_CUDA_ARCH_LIST" not in os.environ:
+        raise RuntimeError("Please explicitly set env var FLASHINFER_CUDA_ARCH_LIST.")
+
+    sm_capabilities = detect_sm_capabilities()
+
+    # Update data dir
+    jit_env.FLASHINFER_CSRC_DIR = project_root / "csrc"
+    jit_env.FLASHINFER_INCLUDE_DIR = project_root / "include"
+    jit_env.CUTLASS_INCLUDE_DIRS = [
+        project_root / "3rdparty" / "cutlass" / "include",
+        project_root / "3rdparty" / "cutlass" / "tools" / "util" / "include",
+    ]
+    jit_env.SPDLOG_INCLUDE_DIR = project_root / "3rdparty" / "spdlog" / "include"
+
+    # Update workdir
+    jit_env.FLASHINFER_WORKSPACE_DIR = build_dir
+    jit_env.FLASHINFER_JIT_DIR = build_dir / "cached_ops"
+    jit_env.FLASHINFER_GEN_SRC_DIR = build_dir / "generated"
+    jit_env.FLASHINFER_JIT_DIR.mkdir(parents=True, exist_ok=True)
+    jit_env.FLASHINFER_GEN_SRC_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Print summary
+    if verbose:
+        print("AOT build summary:")
+        if out_dir is not None:
+            print("  out_dir:", out_dir)
+        print("  build_dir:", build_dir)
+        print("  fa2_head_dim:", config["fa2_head_dim"])
+        print("  fa3_head_dim:", config["fa3_head_dim"])
+        print("  f16_dtype:", config["f16_dtype"])
+        print("  f8_dtype:", config["f8_dtype"])
+        print("  use_sliding_window:", config["use_sliding_window"])
+        print("  use_logits_soft_cap:", config["use_logits_soft_cap"])
+        print("  FLASHINFER_CUDA_ARCH_LIST:", os.environ["FLASHINFER_CUDA_ARCH_LIST"])
+        print("  SM capabilities detected:")
+        for sm_name, has_sm in sm_capabilities.items():
+            if has_sm:
+                print(f"    {sm_name}: True")
+        for key in [
+            "add_comm",
+            "add_gemma",
+            "add_oai_oss",
+            "add_moe",
+            "add_act",
+            "add_misc",
+            "add_xqa",
+        ]:
+            print(f"  {key}:", config[key])
+
+    # Generate JIT specs
+    if verbose:
+        print("Generating JIT specs...")
+    jit_specs = gen_all_modules(
+        config["f16_dtype"],
+        config["f8_dtype"],
+        config["fa2_head_dim"],
+        config["fa3_head_dim"],
+        config["use_sliding_window"],
+        config["use_logits_soft_cap"],
+        sm_capabilities,
+        config["add_comm"],
+        config["add_gemma"],
+        config["add_oai_oss"],
+        config["add_moe"],
+        config["add_act"],
+        config["add_misc"],
+        config["add_xqa"],
+    )
+    if verbose:
+        print("Total ops:", len(jit_specs))
+
+    # Build
+    build_jit_specs(jit_specs, verbose=verbose, skip_prebuilt=skip_prebuilt)
+
+    # Copy built kernels
+    if out_dir is not None:
+        copy_built_kernels(jit_specs, out_dir)
+    if verbose:
+        print("AOT kernels saved to:", out_dir)
+
+
 def parse_bool(s: str) -> bool:
     if s.lower() in ("true", "1"):
         return True
@@ -571,8 +690,6 @@ def get_default_config():
 
 def detect_sm_capabilities():
     """Detect SM capabilities"""
-    import torch.version
-
     compilation_context = CompilationContext()
     gencode_flags_list = compilation_context.get_nvcc_flags_list(
         supported_major_versions=None
@@ -581,14 +698,15 @@ def detect_sm_capabilities():
     def has_sm(compute: str, version: str) -> bool:
         if not any(compute in flag for flag in gencode_flags_list):
             return False
-        if torch.version.cuda is None:
-            return True
-        return version_at_least(torch.version.cuda, version)
+        return get_cuda_version() >= Version(version)
 
+    # Check https://docs.nvidia.com/cuda/parallel-thread-execution/#release-notes
+    # for CUDA version and SM compatibility
     return {
         "sm90": has_sm("compute_90", "12.3"),
         "sm100": has_sm("compute_100", "12.8"),
-        "sm103": has_sm("compute_103", "12.8"),
+        "sm100f": has_sm("compute_100", "12.9"),
+        "sm103": has_sm("compute_103", "12.9"),
         "sm110": has_sm("compute_110", "12.9"),
         "sm120": has_sm("compute_120", "13.0"),
         "sm121": has_sm("compute_121", "13.0"),
@@ -677,8 +795,8 @@ def main():
     # Start with default configuration
     project_root = Path(__file__).resolve().parents[1]
     config = get_default_config()
-    out_dir = project_root / "aot-ops"
-    build_dir = project_root / "build" / "aot"
+    build_dir = jit_env.FLASHINFER_WORKSPACE_DIR
+    out_dir: Optional[Path] = None
 
     # Override with command line arguments
     if args.out_dir:
@@ -713,81 +831,15 @@ def main():
         if arg_value is not None:
             config[key] = arg_value
 
-    # Cuda Arch
-    if "FLASHINFER_CUDA_ARCH_LIST" not in os.environ:
-        raise RuntimeError("Please explicitly set env var FLASHINFER_CUDA_ARCH_LIST.")
-
-    sm_capabilities = detect_sm_capabilities()
-
-    # Update data dir
-    jit_env.FLASHINFER_CSRC_DIR = project_root / "csrc"
-    jit_env.FLASHINFER_INCLUDE_DIR = project_root / "include"
-    jit_env.CUTLASS_INCLUDE_DIRS = [
-        project_root / "3rdparty" / "cutlass" / "include",
-        project_root / "3rdparty" / "cutlass" / "tools" / "util" / "include",
-    ]
-    jit_env.SPDLOG_INCLUDE_DIR = project_root / "3rdparty" / "spdlog" / "include"
-
-    # Update workdir
-    jit_env.FLASHINFER_WORKSPACE_DIR = build_dir
-    jit_env.FLASHINFER_JIT_DIR = build_dir / "cached_ops"
-    jit_env.FLASHINFER_GEN_SRC_DIR = build_dir / "generated"
-    jit_env.FLASHINFER_JIT_DIR.mkdir(parents=True, exist_ok=True)
-    jit_env.FLASHINFER_GEN_SRC_DIR.mkdir(parents=True, exist_ok=True)
-
-    # Print summary
-    print("AOT build summary:")
-    print("  out_dir:", out_dir)
-    print("  build_dir:", build_dir)
-    print("  fa2_head_dim:", config["fa2_head_dim"])
-    print("  fa3_head_dim:", config["fa3_head_dim"])
-    print("  f16_dtype:", config["f16_dtype"])
-    print("  f8_dtype:", config["f8_dtype"])
-    print("  use_sliding_window:", config["use_sliding_window"])
-    print("  use_logits_soft_cap:", config["use_logits_soft_cap"])
-    print("  FLASHINFER_CUDA_ARCH_LIST:", os.environ["FLASHINFER_CUDA_ARCH_LIST"])
-    print("  SM capabilities detected:")
-    for sm_name, has_sm in sm_capabilities.items():
-        if has_sm:
-            print(f"    {sm_name}: True")
-    for key in [
-        "add_comm",
-        "add_gemma",
-        "add_oai_oss",
-        "add_moe",
-        "add_act",
-        "add_misc",
-        "add_xqa",
-    ]:
-        print(f"  {key}:", config[key])
-
-    # Generate JIT specs
-    print("Generating JIT specs...")
-    jit_specs = [gen_logging_module()]
-    jit_specs += gen_all_modules(
-        config["f16_dtype"],
-        config["f8_dtype"],
-        config["fa2_head_dim"],
-        config["fa3_head_dim"],
-        config["use_sliding_window"],
-        config["use_logits_soft_cap"],
-        sm_capabilities,
-        config["add_comm"],
-        config["add_gemma"],
-        config["add_oai_oss"],
-        config["add_moe"],
-        config["add_act"],
-        config["add_misc"],
-        config["add_xqa"],
+    # Use the reusable compile_and_package_modules function
+    compile_and_package_modules(
+        out_dir=out_dir,
+        build_dir=build_dir,
+        project_root=project_root,
+        config=config,
+        verbose=True,
+        skip_prebuilt=False,
     )
-    print("Total ops:", len(jit_specs))
-
-    # Build
-    build_jit_specs(jit_specs, verbose=True, skip_prebuilt=False)
-
-    # Copy built kernels
-    copy_built_kernels(jit_specs, out_dir)
-    print("AOT kernels saved to:", out_dir)
 
 
 if __name__ == "__main__":

@@ -1,18 +1,18 @@
 import dataclasses
 import logging
 import os
-import tvm_ffi
 from contextlib import nullcontext
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Union
-from datetime import datetime
 
+import tvm_ffi
 from filelock import FileLock
 
+from ..compilation_context import CompilationContext
 from . import env as jit_env
 from .cpp_ext import generate_ninja_build_for_op, run_ninja
 from .utils import write_if_different
-from ..compilation_context import CompilationContext
 
 os.makedirs(jit_env.FLASHINFER_WORKSPACE_DIR, exist_ok=True)
 os.makedirs(jit_env.FLASHINFER_CSRC_DIR, exist_ok=True)
@@ -76,6 +76,7 @@ common_nvcc_flags = [
 sm90a_nvcc_flags = ["-gencode=arch=compute_90a,code=sm_90a"] + common_nvcc_flags
 sm100a_nvcc_flags = ["-gencode=arch=compute_100a,code=sm_100a"] + common_nvcc_flags
 sm103a_nvcc_flags = ["-gencode=arch=compute_103a,code=sm_103a"] + common_nvcc_flags
+sm100f_nvcc_flags = ["-gencode=arch=compute_100f,code=sm_100f"] + common_nvcc_flags
 sm110a_nvcc_flags = ["-gencode=arch=compute_110a,code=sm_110a"] + common_nvcc_flags
 sm120a_nvcc_flags = ["-gencode=arch=compute_120a,code=sm_120a"] + common_nvcc_flags
 sm121a_nvcc_flags = ["-gencode=arch=compute_121a,code=sm_121a"] + common_nvcc_flags
@@ -89,15 +90,10 @@ class JitSpecStatus:
 
     name: str
     created_at: datetime
-    is_aot: bool
     is_compiled: bool
     library_path: Optional[Path]
     sources: List[Path]
     needs_device_linking: bool
-
-    @property
-    def compilation_type(self) -> str:
-        return "AOT" if self.is_aot else "JIT"
 
     @property
     def status(self) -> str:
@@ -130,17 +126,12 @@ class JitSpecRegistry:
             return None
 
         spec = self._specs[name]
-        library_path = (
-            spec.get_library_path()
-            if (spec.is_aot or spec.jit_library_path.exists())
-            else None
-        )
+        library_path = spec.get_library_path() if spec.is_compiled else None
 
         return JitSpecStatus(
             name=spec.name,
             created_at=self._creation_times[name],
-            is_aot=spec.is_aot,
-            is_compiled=spec.is_aot or spec.jit_library_path.exists(),
+            is_compiled=spec.is_compiled,
             library_path=library_path,
             sources=spec.sources,
             needs_device_linking=spec.needs_device_linking,
@@ -160,8 +151,7 @@ class JitSpecRegistry:
         statuses = self.get_all_statuses()
         return {
             "total": len(statuses),
-            "aot_compiled": sum(1 for s in statuses if s.is_aot),
-            "jit_compiled": sum(1 for s in statuses if not s.is_aot and s.is_compiled),
+            "compiled": sum(1 for s in statuses if s.is_compiled),
             "not_compiled": sum(1 for s in statuses if not s.is_compiled),
         }
 
@@ -194,6 +184,16 @@ class JitSpec:
             return self.aot_path
         return self.jit_library_path
 
+    def get_object_paths(self) -> List[Path]:
+        object_paths = []
+        jit_dir = self.jit_library_path.parent
+        for source in self.sources:
+            is_cuda = source.suffix == ".cu"
+            object_suffix = ".cuda.o" if is_cuda else ".o"
+            obj_name = source.with_suffix(object_suffix).name
+            object_paths.append(jit_dir / obj_name)
+        return object_paths
+
     @property
     def aot_path(self) -> Path:
         return jit_env.FLASHINFER_AOT_DIR / self.name / f"{self.name}.so"
@@ -201,6 +201,10 @@ class JitSpec:
     @property
     def is_aot(self) -> bool:
         return self.aot_path.exists()
+
+    @property
+    def is_compiled(self) -> bool:
+        return self.get_library_path().exists()
 
     @property
     def lock_path(self) -> Path:

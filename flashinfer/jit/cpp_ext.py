@@ -107,6 +107,11 @@ def generate_ninja_build_for_op(
     system_includes += [p.resolve() for p in jit_env.CUTLASS_INCLUDE_DIRS]
     system_includes.append(jit_env.SPDLOG_INCLUDE_DIR.resolve())
 
+    cuda_home = get_cuda_path()
+    if cuda_home == "/usr":
+        # NOTE: this will resolve to /usr/include, which will mess up includes. See #1793
+        system_includes.remove("$cuda_home/include")
+
     common_cflags = []
     if not sysconfig.get_config_var("Py_GIL_DISABLED"):
         common_cflags.append("-DPy_LIMITED_API=0x03090000")
@@ -166,9 +171,13 @@ def generate_ninja_build_for_op(
         "-L$cuda_home/lib64",
         "-L$cuda_home/lib64/stubs",
         "-lcudart",
+        "-lcuda",
     ]
 
-    extra_ldflags = parse_env_flags("FLASHINFER_EXTRA_LDFLAGS")
+    env_extra_ldflags = parse_env_flags("FLASHINFER_EXTRA_LDFLAGS")
+    if env_extra_ldflags is not None:
+        ldflags += env_extra_ldflags
+
     if extra_ldflags is not None:
         ldflags += extra_ldflags
 
@@ -181,7 +190,6 @@ def generate_ninja_build_for_op(
         cuda_cflags += extra_cuda_cflags
 
     cxx = os.environ.get("CXX", "c++")
-    cuda_home = get_cuda_path()
     nvcc = os.environ.get("FLASHINFER_NVCC", "$cuda_home/bin/nvcc")
 
     lines = [

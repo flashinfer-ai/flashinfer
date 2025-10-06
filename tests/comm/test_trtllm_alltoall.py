@@ -702,6 +702,8 @@ def test_moe_alltoall_prepare(
     )
 
     stream = torch.cuda.Stream()
+    cur_stream = torch.cuda.current_stream()
+    stream.wait_stream(cur_stream)
     with torch.cuda.stream(stream):
         tllm_alltoall.moe_prepare(
             expert_ids_all_ranks[0],
@@ -715,7 +717,7 @@ def test_moe_alltoall_prepare(
             slot_count,
             top_k,
         )
-    stream.wait_stream(torch.cuda.current_stream())
+    cur_stream.wait_stream(stream)
 
     # Make torch alloc tensor to avoid cuda sync
     prepared_local_experts = []
@@ -776,8 +778,11 @@ def test_moe_alltoall_prepare(
     )
 
     # do prepare in parallel
+    cur_stream = torch.cuda.current_stream()
     for rank in range(ep_size):
-        with torch.cuda.stream(cuda_streams_all_ranks[rank]):
+        s = cuda_streams_all_ranks[rank]
+        s.wait_stream(cur_stream)
+        with torch.cuda.stream(s):
             if rank == ep_rank:
                 (
                     prepared_local_experts,

@@ -38,9 +38,6 @@ class CompilationContext:
             for arch in os.environ["FLASHINFER_CUDA_ARCH_LIST"].split(" "):
                 major, minor = arch.split(".")
                 major = int(major)
-                if major >= 9:
-                    if minor.isdigit():
-                        minor = str(minor) + "a"
                 self.TARGET_CUDA_ARCHS.add((int(major), str(minor)))
         else:
             try:

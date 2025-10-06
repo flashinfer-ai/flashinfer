@@ -17,7 +17,7 @@ from .cutlass_library import (
     EpilogueScheduleTag,
     EpilogueScheduleSuffixes,
 )
-from ..cpp_ext import is_cuda_version_at_least
+from ...cpp_ext import is_cuda_version_at_least
 
 
 ################################################################################

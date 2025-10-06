@@ -24,10 +24,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-from ..jit import JitSpec
-from ..jit import env as jit_env
-from ..jit import gen_jit_spec
-from ..jit import current_compilation_context
+from ..jit.comm import gen_trtllm_comm_module
 from ..utils import register_custom_op, round_up
 from .cuda_ipc import create_shared_buffer, cudart, free_shared_buffer
 
@@ -95,21 +92,6 @@ class QuantizationSFLayout:
     # Block scale factors are stored in linear layout (row-major). This is used in some trtllm-gen
     # kernels standard.
     LINEAR = 2
-
-
-def gen_trtllm_comm_module() -> JitSpec:
-    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[9, 10]
-    )
-    return gen_jit_spec(
-        "trtllm_comm",
-        [
-            jit_env.FLASHINFER_CSRC_DIR / "trtllm_allreduce.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "trtllm_allreduce_fusion.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "trtllm_moe_allreduce_fusion.cu",
-        ],
-        extra_cuda_cflags=nvcc_flags,
-    )
 
 
 @functools.cache
