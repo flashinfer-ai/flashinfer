@@ -446,15 +446,7 @@ def gen_tgv_gemm_sm10x_module(
         module_name,
         source_paths,
         extra_cuda_cflags=[
-            "-std=c++20",
-            "-O3",
-            "-lineinfo",
-            "-DCUTLASS_VERSIONS_GENERATED",
-            "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1",
             "--expt-relaxed-constexpr",
-            "-DCUTLASS_TEST_LEVEL=0",
-            "-DCUTLASS_TEST_ENABLE_CACHED_RESULTS=1",
-            "-DCUTLASS_CONV_UNIT_TEST_RIGOROUS_SIZE_ENABLED=1",
             "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
         ]
         + sm100f_nvcc_flags
