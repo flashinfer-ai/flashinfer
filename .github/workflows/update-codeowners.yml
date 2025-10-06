@@ -44,7 +44,11 @@ jobs:
       - name: Check for changes
         id: check_changes
         run: |
-          if git diff --quiet .github/CODEOWNERS; then
+          # Check if CODEOWNERS is empty or has changed
+          if [ ! -s .github/CODEOWNERS ]; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+            echo "CODEOWNERS is empty or missing"
+          elif git diff --quiet .github/CODEOWNERS; then
             echo "changed=false" >> $GITHUB_OUTPUT
             echo "No changes detected in CODEOWNERS"
           else
