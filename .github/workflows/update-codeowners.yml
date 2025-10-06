@@ -34,7 +34,8 @@ jobs:
             --output .github/CODEOWNERS \
             --depth 3 \
             --min-commits 2 \
-            --days-back 365
+            --days-back 365 \
+            --no-api
 
       - name: Check for changes
         id: check_changes
