@@ -5,10 +5,6 @@ on:
     # Run weekly on Monday at 00:00 UTC
     - cron: '0 0 * * 1'
   workflow_dispatch: # Allow manual triggering
-  # NOTE(Zihao): debugging only, remove later
-  pull_request:
-    branches:
-      - main
 
 permissions:
   contents: write
@@ -65,7 +61,7 @@ jobs:
         if: steps.check_changes.outputs.changed == 'true'
         uses: peter-evans/create-pull-request@v7
         with:
-          token: ${{ secrets.FLASHINFER_GITHUB_TOKEN }}
+          token: ${{ secrets.GITHUB_TOKEN }}
           commit-message: |
             chore: update CODEOWNERS based on git history
 
