@@ -70,6 +70,40 @@ def compute_sha256(file_path: pathlib.Path) -> str:
         return hashlib.sha256(f.read()).hexdigest()
 
 
+def generate_directory_index(directory: pathlib.Path):
+    """Generate index.html for a directory listing its subdirectories."""
+    # Get all subdirectories
+    subdirs = sorted([d for d in directory.iterdir() if d.is_dir()])
+
+    if not subdirs:
+        return
+
+    index_file = directory / "index.html"
+
+    # Generate HTML for directory listing
+    with index_file.open("w") as f:
+        f.write("<!DOCTYPE html>\n")
+        f.write("<html>\n")
+        f.write(f"<head><title>Index of {directory.name or 'root'}</title></head>\n")
+        f.write("<body>\n")
+        f.write(f"<h1>Index of {directory.name or 'root'}</h1>\n")
+
+        for subdir in subdirs:
+            f.write(f'<a href="{subdir.name}/">{subdir.name}/</a><br>\n')
+
+        f.write("</body>\n")
+        f.write("</html>\n")
+
+
+def update_parent_indices(leaf_dir: pathlib.Path, root_dir: pathlib.Path):
+    """Recursively update index.html for all parent directories."""
+    current = leaf_dir.parent
+
+    while current >= root_dir and current != current.parent:
+        generate_directory_index(current)
+        current = current.parent
+
+
 def update_index(
     dist_dir: str = "dist",
     output_dir: str = "whl",
@@ -85,7 +119,7 @@ def update_index(
         output_dir: Output directory for index files
         base_url: Base URL for wheel downloads
         release_tag: GitHub release tag (e.g., 'nightly' or 'v0.3.1')
-        nightly: If True, update index to whl/nightly subdirectory
+        nightly: If True, update index to whl/nightly subdirectory for nightly releases
     """
     dist_path = pathlib.Path(dist_dir)
     if not dist_path.exists():
@@ -98,6 +132,9 @@ def update_index(
         sys.exit(1)
 
     print(f"Found {len(wheels)} wheel file(s)")
+
+    # Track all directories that need parent index updates
+    created_dirs = set()
 
     for wheel_path in wheels:
         print(f"\nProcessing: {wheel_path.name}")
@@ -128,6 +165,7 @@ def update_index(
             index_dir = base_output / package
 
         index_dir.mkdir(parents=True, exist_ok=True)
+        created_dirs.add(index_dir)
 
         # Construct download URL
         tag = release_tag or f"v{info['version'].split('+')[0].split('.dev')[0]}"
@@ -170,6 +208,13 @@ def update_index(
         if cuda:
             print(f"  🎮 CUDA: cu{cuda}")
         print(f"  📍 URL: {download_url}")
+
+    # Update parent directory indices
+    print("\n📂 Updating parent directory indices...")
+    root_output = pathlib.Path(output_dir)
+    for leaf_dir in created_dirs:
+        update_parent_indices(leaf_dir, root_output)
+    print("  ✅ Parent indices updated")
 
 
 def main():
