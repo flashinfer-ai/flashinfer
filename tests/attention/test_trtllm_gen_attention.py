@@ -782,11 +782,6 @@ def test_trtllm_batch_decode(
         assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()
 
 
-# @pytest.mark.parametrize("batch_size", [4, 128, 256])
-# @pytest.mark.parametrize("s_qo", [32, 64, 87])
-# @pytest.mark.parametrize("s_kv", [32, 64, 87])
-# @pytest.mark.parametrize("num_kv_heads", [16, 32])
-# @pytest.mark.parametrize("head_grp_size", [1, 5, 8])
 @pytest.mark.parametrize("batch_size", [1])
 @pytest.mark.parametrize("s_qo", [1024])
 @pytest.mark.parametrize("s_kv", [1024])
