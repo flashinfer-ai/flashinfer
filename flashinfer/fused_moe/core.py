@@ -29,6 +29,7 @@ from ..autotuner import (
     TunableRunner,
     TuningConfig,
 )
+from ..jit.cpp_ext import is_cuda_version_at_least
 from ..jit.core import logger
 from ..jit import (
     setup_cubin_loader,
