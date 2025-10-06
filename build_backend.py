@@ -19,7 +19,7 @@ import shutil
 from pathlib import Path
 
 from setuptools import build_meta as orig
-from flashinfer.build_utils import get_git_version
+from build_utils import get_git_version
 
 _root = Path(__file__).parent.resolve()
 _data_dir = _root / "flashinfer" / "data"

@@ -24,7 +24,7 @@ from wheel.bdist_wheel import bdist_wheel
 # Add parent directory to path to import flashinfer modules
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from flashinfer.build_utils import get_git_version
+from build_utils import get_git_version
 
 
 # add flashinfer._build_meta, always override to ensure version is up-to-date
