@@ -129,30 +129,34 @@ def update_index(
         # Update index.html
         index_file = index_dir / "index.html"
 
-        # Read existing content to avoid duplicates
-        existing_links = set()
+        # Read existing links to avoid duplicates
+        links = set()
         if index_file.exists():
             with index_file.open("r") as f:
-                existing_links = set(f.readlines())
-        else:
-            # Create new index file with HTML header
+                content = f.read()
+                # Simple regex to extract the <a> tags
+                links.update(re.findall(r'<a href=".*?">.*?</a><br>\n', content))
+
+        # Create and add new link
+        new_link = f'<a href="{download_url}">{wheel_path.name}</a><br>\n'
+        is_new = new_link not in links
+        if is_new:
+            links.add(new_link)
+
+            # Write the complete, valid HTML file
             with index_file.open("w") as f:
                 f.write("<!DOCTYPE html>\n")
                 f.write("<html>\n")
                 f.write(f"<head><title>Links for {package}</title></head>\n")
                 f.write("<body>\n")
                 f.write(f"<h1>Links for {package}</h1>\n")
-            print(f"  📝 Created new index file: {index_dir}/index.html")
-
-        # Create new link
-        new_link = f'<a href="{download_url}">{wheel_path.name}</a><br>\n'
-
-        if new_link in existing_links:
-            print(f"  ℹ️  Already in index: {index_dir}/index.html")
-        else:
-            with index_file.open("a") as f:
-                f.write(new_link)
+                for link in sorted(list(links)):
+                    f.write(link)
+                f.write("</body>\n")
+                f.write("</html>\n")
             print(f"  ✅ Added to index: {index_dir}/index.html")
+        else:
+            print(f"  ℹ️  Already in index: {index_dir}/index.html")
 
         print(f"  📦 Package: {package}")
         print(f"  🔖 Version: {info['version']}")

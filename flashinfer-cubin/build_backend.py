@@ -11,24 +11,7 @@ from setuptools.build_meta import *
 # Add parent directory to path to import artifacts module
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-
-def _get_git_version():
-    """Get git commit hash."""
-    import subprocess
-
-    try:
-        git_version = (
-            subprocess.check_output(
-                ["git", "rev-parse", "HEAD"],
-                cwd=Path(__file__).parent.parent,
-                stderr=subprocess.DEVNULL,
-            )
-            .decode("ascii")
-            .strip()
-        )
-        return git_version
-    except Exception:
-        return "unknown"
+from flashinfer.build_utils import get_git_version
 
 
 # add flashinfer._build_meta, always override to ensure version is up-to-date
@@ -37,7 +20,7 @@ version_file = Path(__file__).parent.parent / "version.txt"
 if version_file.exists():
     with open(version_file, "r") as f:
         version = f.read().strip()
-git_version = _get_git_version()
+git_version = get_git_version(cwd=Path(__file__).parent.parent)
 with open(build_meta_file, "w") as f:
     f.write('"""Build metadata for flashinfer package."""\n')
     f.write(f'__version__ = "{version}"\n')
@@ -88,7 +71,7 @@ def _create_build_metadata():
         version = f"{version}.dev{dev_suffix}"
 
     # Get git version
-    git_version = _get_git_version()
+    git_version = get_git_version(cwd=Path(__file__).parent.parent)
 
     # Create build metadata in the source tree
     package_dir = Path(__file__).parent / "flashinfer_cubin"

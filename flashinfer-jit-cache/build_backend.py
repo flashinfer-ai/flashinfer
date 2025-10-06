@@ -16,30 +16,15 @@ limitations under the License.
 
 import sys
 import os
+import platform
 from pathlib import Path
 from setuptools import build_meta as _orig
+from wheel.bdist_wheel import bdist_wheel
 
 # Add parent directory to path to import flashinfer modules
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-
-def _get_git_version():
-    """Get git commit hash."""
-    import subprocess
-
-    try:
-        git_version = (
-            subprocess.check_output(
-                ["git", "rev-parse", "HEAD"],
-                cwd=Path(__file__).parent.parent,
-                stderr=subprocess.DEVNULL,
-            )
-            .decode("ascii")
-            .strip()
-        )
-        return git_version
-    except Exception:
-        return "unknown"
+from flashinfer.build_utils import get_git_version
 
 
 # add flashinfer._build_meta, always override to ensure version is up-to-date
@@ -48,7 +33,7 @@ version_file = Path(__file__).parent.parent / "version.txt"
 if version_file.exists():
     with open(version_file, "r") as f:
         version = f.read().strip()
-git_version = _get_git_version()
+git_version = get_git_version(cwd=Path(__file__).parent.parent)
 with open(build_meta_file, "w") as f:
     f.write('"""Build metadata for flashinfer package."""\n')
     f.write(f'__version__ = "{version}"\n')
@@ -130,15 +115,61 @@ def _prepare_build():
     print(f"Created build metadata file with version {version}")
 
 
+class PlatformSpecificBdistWheel(bdist_wheel):
+    """Custom wheel builder that uses py_limited_api for cp39+."""
+
+    def finalize_options(self):
+        super().finalize_options()
+        # Force platform-specific wheel (not pure Python)
+        self.root_is_pure = False
+        # Use py_limited_api for cp39 (Python 3.9+)
+        self.py_limited_api = "cp39"
+
+    def get_tag(self):
+        # Use py_limited_api tags
+        python_tag = "cp39"
+        abi_tag = "abi3"  # Stable ABI tag
+
+        # Get platform tag
+        machine = platform.machine()
+        if platform.system() == "Linux":
+            # Use manylinux_2_28 as specified
+            if machine == "x86_64":
+                plat_tag = "manylinux_2_28_x86_64"
+            elif machine == "aarch64":
+                plat_tag = "manylinux_2_28_aarch64"
+            else:
+                plat_tag = f"linux_{machine}"
+        else:
+            # For non-Linux platforms, use the default
+            import distutils.util
+
+            plat_tag = distutils.util.get_platform().replace("-", "_").replace(".", "_")
+
+        return python_tag, abi_tag, plat_tag
+
+
 def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
     """Build wheel with custom AOT module compilation."""
     print("Building flashinfer-jit-cache wheel...")
 
     _prepare_build()
 
-    # Now build the wheel using setuptools
-    # The setup.py file will handle the platform-specific wheel naming
-    result = _orig.build_wheel(wheel_directory, config_settings, metadata_directory)
+    # Inject custom bdist_wheel class
+    import setuptools
+
+    original_cmdclass = getattr(setuptools, "_GLOBAL_CMDCLASS", {})
+    setuptools._GLOBAL_CMDCLASS = {
+        **original_cmdclass,
+        "bdist_wheel": PlatformSpecificBdistWheel,
+    }
+
+    try:
+        # Now build the wheel using setuptools
+        result = _orig.build_wheel(wheel_directory, config_settings, metadata_directory)
+    finally:
+        # Restore original cmdclass
+        setuptools._GLOBAL_CMDCLASS = original_cmdclass
 
     return result
 

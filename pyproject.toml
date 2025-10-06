@@ -25,7 +25,7 @@ license-files = ["LICENSE", "licenses/*"]
 
 [build-system]
 requires = ["setuptools>=77", "packaging>=24"]
-build-backend = "custom_backend"
+build-backend = "build_backend"
 backend-path = ["."]
 
 [tool.codespell]
