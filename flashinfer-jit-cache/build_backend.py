@@ -155,29 +155,31 @@ class PlatformSpecificBdistWheel(bdist_wheel):
         return python_tag, abi_tag, plat_tag
 
 
+class _MonkeyPatchBdistWheel:
+    """Context manager to temporarily replace bdist_wheel with our custom class."""
+
+    def __enter__(self):
+        from setuptools.command import bdist_wheel as setuptools_bdist_wheel
+
+        self.original_bdist_wheel = setuptools_bdist_wheel.bdist_wheel
+        setuptools_bdist_wheel.bdist_wheel = PlatformSpecificBdistWheel
+
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        from setuptools.command import bdist_wheel as setuptools_bdist_wheel
+
+        setuptools_bdist_wheel.bdist_wheel = self.original_bdist_wheel
+
+
 def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
     """Build wheel with custom AOT module compilation."""
     print("Building flashinfer-jit-cache wheel...")
 
     _prepare_build()
 
-    # Inject custom bdist_wheel class
-    import setuptools
-
-    original_cmdclass = getattr(setuptools, "_GLOBAL_CMDCLASS", {})
-    setuptools._GLOBAL_CMDCLASS = {
-        **original_cmdclass,
-        "bdist_wheel": PlatformSpecificBdistWheel,
-    }
-
-    try:
-        # Now build the wheel using setuptools
-        result = _orig.build_wheel(wheel_directory, config_settings, metadata_directory)
-    finally:
-        # Restore original cmdclass
-        setuptools._GLOBAL_CMDCLASS = original_cmdclass
-
-    return result
+    with _MonkeyPatchBdistWheel():
+        return _orig.build_wheel(wheel_directory, config_settings, metadata_directory)
 
 
 def build_editable(wheel_directory, config_settings=None, metadata_directory=None):
@@ -196,9 +198,18 @@ def build_editable(wheel_directory, config_settings=None, metadata_directory=Non
     return result
 
 
+def prepare_metadata_for_build_wheel(metadata_directory, config_settings=None):
+    """Prepare metadata with platform-specific wheel tags."""
+    _create_build_metadata()
+
+    with _MonkeyPatchBdistWheel():
+        return _orig.prepare_metadata_for_build_wheel(
+            metadata_directory, config_settings
+        )
+
+
 # Export the required interface
 get_requires_for_build_wheel = _orig.get_requires_for_build_wheel
-prepare_metadata_for_build_wheel = _orig.prepare_metadata_for_build_wheel
 get_requires_for_build_editable = getattr(
     _orig, "get_requires_for_build_editable", None
 )

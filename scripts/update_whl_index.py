@@ -75,6 +75,7 @@ def update_index(
     output_dir: str = "whl",
     base_url: str = "https://github.com/flashinfer-ai/flashinfer/releases/download",
     release_tag: Optional[str] = None,
+    nightly: bool = False,
 ):
     """
     Update wheel index from dist directory.
@@ -84,6 +85,7 @@ def update_index(
         output_dir: Output directory for index files
         base_url: Base URL for wheel downloads
         release_tag: GitHub release tag (e.g., 'nightly' or 'v0.3.1')
+        nightly: If True, update index to whl/nightly subdirectory
     """
     dist_path = pathlib.Path(dist_dir)
     if not dist_path.exists():
@@ -113,12 +115,17 @@ def update_index(
         package = info["package"]
         cuda = info["cuda"]
 
+        # Add nightly subdirectory if nightly flag is set
+        base_output = pathlib.Path(output_dir)
+        if nightly:
+            base_output = base_output / "nightly"
+
         if cuda:
-            # CUDA-specific index for jit-cache: whl/cu130/flashinfer-jit-cache/
-            index_dir = pathlib.Path(output_dir) / f"cu{cuda}" / package
+            # CUDA-specific index for jit-cache: whl/nightly/cu130/flashinfer-jit-cache/
+            index_dir = base_output / f"cu{cuda}" / package
         else:
-            # No CUDA version for python/cubin: whl/flashinfer-python/
-            index_dir = pathlib.Path(output_dir) / package
+            # No CUDA version for python/cubin: whl/nightly/flashinfer-python/
+            index_dir = base_output / package
 
         index_dir.mkdir(parents=True, exist_ok=True)
 
@@ -188,6 +195,11 @@ def main():
         "--release-tag",
         help="GitHub release tag (e.g., 'nightly' or 'v0.3.1'). If not specified, will be derived from version.",
     )
+    parser.add_argument(
+        "--nightly",
+        action="store_true",
+        help="Update index to whl/nightly subdirectory for nightly releases",
+    )
 
     args = parser.parse_args()
 
@@ -196,6 +208,7 @@ def main():
         output_dir=args.output_dir,
         base_url=args.base_url,
         release_tag=args.release_tag,
+        nightly=args.nightly,
     )
 
 
