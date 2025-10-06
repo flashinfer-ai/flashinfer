@@ -39,6 +39,7 @@ skip = [
 
 [tool.setuptools]
 include-package-data = false
+py-modules = ["build_backend", "build_utils"]
 
 [tool.setuptools.dynamic]
 version = {attr = "flashinfer._build_meta.__version__"}
