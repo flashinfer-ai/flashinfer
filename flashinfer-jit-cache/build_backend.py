@@ -54,6 +54,16 @@ def _create_build_metadata():
         version = f"{version}+{cuda_suffix}"
     build_meta_file = Path(__file__).parent / "flashinfer_jit_cache" / "_build_meta.py"
 
+    # Check if we're in a git repository
+    git_dir = Path(__file__).parent.parent / ".git"
+    in_git_repo = git_dir.exists()
+
+    # If file exists and not in git repo (installing from sdist), keep existing file
+    if build_meta_file.exists() and not in_git_repo:
+        print("Build metadata file already exists (not in git repo), keeping it")
+        return version
+
+    # In git repo (editable) or file doesn't exist, create/update it
     with open(build_meta_file, "w") as f:
         f.write('"""Build metadata for flashinfer-jit-cache package."""\n')
         f.write(f'__version__ = "{version}"\n')

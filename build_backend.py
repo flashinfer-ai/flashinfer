@@ -25,20 +25,48 @@ _root = Path(__file__).parent.resolve()
 _data_dir = _root / "flashinfer" / "data"
 
 
-def get_version():
-    package_version = (_root / "version.txt").read_text().strip()
+def _create_build_metadata():
+    """Create build metadata file with version information."""
+    version_file = _root / "version.txt"
+    if version_file.exists():
+        with open(version_file, "r") as f:
+            version = f.read().strip()
+    else:
+        version = "0.0.0+unknown"
+
+    # Add dev suffix if specified
     dev_suffix = os.environ.get("FLASHINFER_DEV_RELEASE_SUFFIX", "")
     if dev_suffix:
-        package_version = f"{package_version}.dev{dev_suffix}"
-    return package_version
+        version = f"{version}.dev{dev_suffix}"
+
+    # Get git version
+    git_version = get_git_version(cwd=_root)
+
+    # Create build metadata in the source tree
+    package_dir = Path(__file__).parent / "flashinfer"
+    build_meta_file = package_dir / "_build_meta.py"
+
+    # Check if we're in a git repository
+    git_dir = Path(__file__).parent / ".git"
+    in_git_repo = git_dir.exists()
+
+    # If file exists and not in git repo (installing from sdist), keep existing file
+    if build_meta_file.exists() and not in_git_repo:
+        print("Build metadata file already exists (not in git repo), keeping it")
+        return version
+
+    # In git repo (editable) or file doesn't exist, create/update it
+    with open(build_meta_file, "w") as f:
+        f.write('"""Build metadata for flashinfer package."""\n')
+        f.write(f'__version__ = "{version}"\n')
+        f.write(f'__git_version__ = "{git_version}"\n')
+
+    print(f"Created build metadata file with version {version}")
+    return version
 
 
-# Create _build_meta.py at import time so setuptools can read the version
-build_meta_file = _root / "flashinfer" / "_build_meta.py"
-with open(build_meta_file, "w") as f:
-    f.write('"""Build metadata for flashinfer package."""\n')
-    f.write(f'__version__ = "{get_version()}"\n')
-    f.write(f'__git_version__ = "{get_git_version(cwd=_root)}"\n')
+# Create build metadata as soon as this module is imported
+_create_build_metadata()
 
 
 def write_if_different(path: Path, content: str) -> None:
@@ -73,11 +101,6 @@ def _create_data_dir(use_symlinks=True):
     ln("3rdparty/spdlog", "spdlog")
     ln("csrc", "csrc")
     ln("include", "include")
-
-    # Always ensure version.txt is present
-    version_file = _data_dir / "version.txt"
-    if not version_file.exists() or not use_symlinks:
-        shutil.copy(_root / "version.txt", version_file)
 
 
 def _prepare_for_wheel():

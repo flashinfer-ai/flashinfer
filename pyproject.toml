@@ -61,8 +61,7 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*"]
 ]
 "flashinfer.data" = [
     "csrc/**",
-    "include/**",
-    "version.txt"
+    "include/**"
 ]
 "flashinfer.data.cutlass" = [
     "include/**",
