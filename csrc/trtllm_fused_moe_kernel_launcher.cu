@@ -371,7 +371,8 @@ void trtllm_fp8_block_scale_moe_launcher(
 
   auto const routing_bias_dtype =
       routing_bias.has_value() ? routing_bias.value()->dtype : dl_bfloat16;
-  args.mDtypeExpW = routing_bias_dtype == dl_bfloat16 ? btg::Dtype::Bfloat16 : btg::Dtype::Fp32;
+  args.mDtypeExpW = btg::Dtype::Bfloat16 ;
+  //routing_bias_dtype == dl_bfloat16 ? btg::Dtype::Bfloat16 : btg::Dtype::Fp32;
   args.routing_logits = static_cast<float*>(routing_logits->data);
   args.routing_bias = routing_bias.has_value() ? routing_bias.value()->data : nullptr;
   args.hidden_states = hidden_states->data;

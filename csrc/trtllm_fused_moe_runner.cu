@@ -62,7 +62,8 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     FLASHINFER_CHECK(topK <= 8, "For DeepSeek routing method, must have topK <= 8");
     FLASHINFER_CHECK(topkGroup <= 4, "For DeepSeek routing method, must have topkGroup <= 4");
     moe::dev::routing::routingDeepSeek::Data routingData;
-    routingData.mDtypeExpW = dtypeBias, routingData.mUsePdl = true;
+    routingData.mDtypeExpW = btg::Dtype::Bfloat16; 
+    routingData.mUsePdl = true;
 
     // output:
     routingData.mPtrExpertIdx = routingExpertIndexes;
