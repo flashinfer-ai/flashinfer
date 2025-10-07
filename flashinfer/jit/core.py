@@ -268,7 +268,6 @@ def gen_jit_spec(
     check_cuda_arch()
     verbose = os.environ.get("FLASHINFER_JIT_VERBOSE", "0") == "1"
 
-    cuda_major, cuda_minor = current_compilation_context.get_cuda_version()
     cflags = ["-std=c++17", "-Wno-switch-bool"]
     cuda_cflags = [
         "-std=c++17",
