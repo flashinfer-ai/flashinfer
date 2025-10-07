@@ -294,7 +294,7 @@ def gen_jit_spec(
         cflags += ["-O3"]
 
     # useful for ncu
-    if bool(os.environ.get("FLASHINFER_JIT_LINEINFO", "0")):
+    if os.environ.get("FLASHINFER_JIT_LINEINFO", "0") == "1":
         cuda_cflags += ["-lineinfo"]
 
     if extra_cflags is not None:
