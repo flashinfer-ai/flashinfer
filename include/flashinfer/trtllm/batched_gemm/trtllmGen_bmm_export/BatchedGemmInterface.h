@@ -506,11 +506,26 @@ class BatchedGemmInterface {
       throw std::invalid_argument("Invalid combination of options");
     }
 
-    int32_t const numCtasTile =
+    if (batchM) {
+      numCtasBatch = gemm::divUpMul(numCtasBatch, options.mClusterDimX);
+    } else {
+      numCtasBatch = gemm::divUpMul(numCtasBatch, options.mClusterDimY);
+    }
+
+    int32_t numCtasTile =
         batchM ? gemm::divUp(options.mN, options.mTileN) : gemm::divUp(options.mM, options.mTileM);
+    if (batchM) {
+      numCtasTile = gemm::divUpMul(numCtasTile, options.mClusterDimY);
+    } else {
+      numCtasTile = gemm::divUpMul(numCtasTile, options.mClusterDimX);
+    }
     int32_t const numCtasInner = options.mNumSlicesForSplitK;
     return std::make_tuple(numCtasBatch, numCtasTile, numCtasInner);
   }
+
+  // Creates GemmOptions from kernel and data.
+  BatchedGemmOptions getOptionsFromConfigAndData(BatchedGemmConfig const& config,
+                                                 BatchedGemmData const& data) const;
 
   // Returns the number of CTAs of the current kernel.
   int32_t getNumCtas(BatchedGemmOptions const& options,
@@ -521,10 +536,6 @@ class BatchedGemmInterface {
 
   // Returns true if the configuration of the cubin can be executed for the given params.
   bool isValidConfig(BatchedGemmConfig const& config, BatchedGemmData const& data) const;
-
-  // Creates GemmOptions from kernel and data.
-  BatchedGemmOptions getOptionsFromConfigAndData(BatchedGemmConfig const& config,
-                                                 BatchedGemmData const& data) const;
 
  private:
   // Aligns the pointer to the alignment
@@ -781,6 +792,7 @@ int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config, void* workspa
   if (result != CUDA_SUCCESS) {
     return -1;
   }
+
   // If a module cache has not been given, unload the module to avoid leaking
   if (!moduleCache.has_value()) {
     cuModuleUnload(cuModule);
