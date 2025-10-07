@@ -102,9 +102,8 @@ struct GemmOptions {
               bool gridWaitForPrimaryA, bool gridWaitForPrimaryB, bool hoistLoadTaskInit,
               bool hoistMmaTaskTryWaits, int k, KernelTraits kernelTraits, MatrixLayout layoutA,
               MatrixLayout layoutB, int m, int mmaK, tg::MmaKind mmaKind, int mmaM, int mmaN,
-              bool mockAllReduce, int n, int numRegsCastAWarps, int numRegsCopySfLdsSttm,
-              int numRegsPerThreadEpilogueWarp, int numRegsPerThreadNonEpilogueWarp,
-              int numSlicesForSplitK, int numSlicesForSliceK, int numStages, int numStagesMma,
+              bool mockAllReduce, int n, int numRegsCopySfLdsSttm, int numSlicesForSplitK,
+              int numSlicesForSliceK, int numStages, int numStagesMma,
               int numStagesMmaWithinWorkTile, int numStagesMmaAcrossWorkTile, int numStagesWorkId,
               bool outputDebugTensors, bool patchF2fp, std::optional<int32_t> sfBlockSizeA,
               tg::SfLayout sfLayoutA, tg::SfLayout sfLayoutB, tg::SfLayout sfLayoutC,
@@ -152,10 +151,7 @@ struct GemmOptions {
         mMmaN{mmaN},
         mMockAllReduce{mockAllReduce},
         mN{n},
-        mNumRegsCastAWarps(numRegsCastAWarps),
         mNumRegsCopySfLdsSttm(numRegsCopySfLdsSttm),
-        mNumRegsPerThreadEpilogueWarp(numRegsPerThreadEpilogueWarp),
-        mNumRegsPerThreadNonEpilogueWarp(numRegsPerThreadNonEpilogueWarp),
         mNumSlicesForSplitK{numSlicesForSplitK},
         mNumSlicesForSliceK{numSlicesForSliceK},
         mNumStages{numStages},
@@ -273,14 +269,8 @@ struct GemmOptions {
   bool mMockAllReduce{false};
   // The N dimension of GEMM.
   int mN{64 * 4};
-  // Number of registers for the cast A warps.
-  int mNumRegsCastAWarps{0};
   // Number of registers for the LDS+STTM warps.
   int mNumRegsCopySfLdsSttm{0};
-  // Number of registers per thread for epilogue warps
-  int mNumRegsPerThreadEpilogueWarp{0};
-  // Number of registers per thread for non-epilogue warps
-  int mNumRegsPerThreadNonEpilogueWarp{0};
   // Number of partitions along the K dimension. When mNumSlicesForSplitK > 1,
   // the problem is distributed across several SMs, where each CTA works on its local K slice.
   // Partial results are accumulated afterwards using either GMEM or DSMEM (in CGA)
@@ -387,7 +377,6 @@ struct GemmConfig {
   char const* mHash{nullptr};
 #else
   trtllm::gen::CudaRunner* mCudaRunner{nullptr};
-  int32_t mInstanceIdx{0};
 #endif
 
   GemmOptions mOptions{};
@@ -481,12 +470,7 @@ inline std::string dumpOptions(GemmOptions const& options) {
   ss << "mMmaN=" << options.mMmaN << "," << std::endl;
   ss << "mMockAllReduce=" << options.mMockAllReduce << "," << std::endl;
   ss << "mN=" << options.mN << "," << std::endl;
-  ss << "mNumRegsCastAWarps=" << options.mNumRegsCastAWarps << "," << std::endl;
   ss << "mNumRegsCopySfLdsSttm=" << options.mNumRegsCopySfLdsSttm << "," << std::endl;
-  ss << "mNumRegsPerThreadEpilogueWarp=" << options.mNumRegsPerThreadEpilogueWarp << ","
-     << std::endl;
-  ss << "mNumRegsPerThreadNonEpilogueWarp=" << options.mNumRegsPerThreadNonEpilogueWarp << ","
-     << std::endl;
   ss << "mNumSlicesForSplitK=" << options.mNumSlicesForSplitK << "," << std::endl;
   ss << "mNumSlicesForSliceK=" << options.mNumSlicesForSliceK << "," << std::endl;
   ss << "mNumStages=" << options.mNumStages << "," << std::endl;

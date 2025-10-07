@@ -125,7 +125,6 @@ def calculate_tile_tokens_dim(
         tile_tokens_dim = 192
     # Cap to 8-max_tile_tokens_dim tokens per CTA tile as it's the range supported by the kernel.
     tile_tokens_dim = min(max(tile_tokens_dim, 8), max_tile_tokens_dim)
-
     return tile_tokens_dim
 
 

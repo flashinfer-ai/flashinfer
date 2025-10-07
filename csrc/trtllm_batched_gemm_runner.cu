@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include <cstring>
 #include <vector>
 
 #include "flashinfer/trtllm/batched_gemm/KernelRunner.h"
@@ -100,17 +101,9 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
         options.mTransposeMmaOutput == mOptions.transposeMmaOutput &&
         (!doesRouteImplUseNoRoute(options.mRouteImpl)) == mOptions.routeAct &&
         options.mFusedAct == mOptions.fusedAct && options.mIsStaticBatch == mOptions.staticBatch &&
-        tileSize == mOptions.tileSize) {
-      auto sm = configs[i].mSm;
-      if (sm != SmVersion::Sm100f) {
-        int smVersion = tensorrt_llm::common::getSMVersion();
-        if (smVersion == 100 && sm != SmVersion::Sm100a) {
-          continue;
-        } else if (smVersion == 103 && sm != SmVersion::Sm103a) {
-          continue;
-        }
-      }
-
+        tileSize == mOptions.tileSize &&
+        options.mUseShuffledMatrixA == mOptions.useShuffledMatrixA &&
+        options.mLayoutA == mOptions.weightLayout) {
       if (options.mFusedAct) {
         if (options.mActType != static_cast<batchedGemm::gemmGatedAct::ActType>(mOptions.actType)) {
           continue;
@@ -123,7 +116,14 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
     }
   }
 
-  FLASHINFER_CHECK(!mPassingConfigIndices.empty(), "No kernel found for the given options");
+  FLASHINFER_CHECK(
+      !mPassingConfigIndices.empty(),
+      "No kernel found for the given options: mDtypeA: %s, mDtypeB: %s, mDtypeC: %s, "
+      "mUseDeepSeekFp8: %d, "
+      "mTransposeMmaOutput: %d, mRouteAct: %d, mFusedAct: %d, mIsStaticBatch: %d, mTileSize: %d",
+      tg::dtypeToString(mOptions.dtypeA).c_str(), tg::dtypeToString(mOptions.dtypeB).c_str(),
+      tg::dtypeToString(mOptions.dtypeC).c_str(), mOptions.deepSeekFp8, mOptions.transposeMmaOutput,
+      mOptions.routeAct, mOptions.fusedAct, mOptions.staticBatch, mOptions.tileSize);
 }
 
 size_t TrtllmGenBatchedGemmRunner::getWorkspaceSizeInBytes(
@@ -169,7 +169,6 @@ void TrtllmGenBatchedGemmRunner::run(
   auto const configs = bmm.getBatchedGemmConfigs();
 
   auto const& config = configs[configIndex];
-  std::cout << "config function name: " << config.mFunctionName << std::endl;
 
   FLASHINFER_CHECK(numBatches > 0, "Batched GEMM requires numBatches > 0");
   if (!mOptions.staticBatch) {
@@ -391,13 +390,6 @@ std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(
     auto const& config = configs[configIndex];
     auto isValidConfig = bmm.isValidConfig(config, gemmData);
     if (isValidConfig) {
-      // if (static_cast<int32_t>(config.mOptions.mLayoutA) == 0 ){
-      //   std::cout << "config.mLayoutA: " << static_cast<int32_t>(config.mOptions.mLayoutA) <<
-      //   std::endl; std::cout << "config.mLayoutB: " <<
-      //   static_cast<int32_t>(config.mOptions.mLayoutB)  << std::endl; std::cout <<
-      //   "config.mFunctionName: " << config.mFunctionName << std::endl;
-      //   validConfigIndices.push_back(configIndex);
-      // }
       validConfigIndices.push_back(configIndex);
     }
   }

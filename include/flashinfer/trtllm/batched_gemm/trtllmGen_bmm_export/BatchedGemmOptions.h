@@ -107,12 +107,11 @@ struct BatchedGemmOptions : public gemmGatedAct::GemmGatedActOptions {
                 epilogueLdtmBits, epilogueTileM, epilogueTileN, gridTriggerSecondaryA,
                 gridTriggerSecondaryB, gridWaitForPrimaryEarlyExit, gridWaitForPrimaryA,
                 gridWaitForPrimaryB, hoistLoadTaskInit, hoistMmaTaskTryWaits, k, kernelTraits,
-                layoutA, layoutB, m, mmaK, mmaKind, mmaM, mmaN, mockAllReduce, n, numRegsCastAWarps,
-                numRegsCopySfLdsSttm, numRegsPerThreadEpilogueWarp, numRegsPerThreadNonEpilogueWarp,
-                numSlicesForSplitK, numSlicesForSliceK, numStages, numStagesMma,
-                numStagesMmaWithinWorkTile, numStagesMmaAcrossWorkTile, numStagesWorkId,
-                outputDebugTensors, patchF2fp, sfBlockSizeA, sfLayoutA, sfLayoutB, sfLayoutC,
-                sfReshapeFactor, sliceK, splitK, tileK, tileM, tileN, tileScheduler,
+                layoutA, layoutB, m, mmaK, mmaKind, mmaM, mmaN, mockAllReduce, n,
+                numRegsCopySfLdsSttm, numSlicesForSplitK, numSlicesForSliceK, numStages,
+                numStagesMma, numStagesMmaWithinWorkTile, numStagesMmaAcrossWorkTile,
+                numStagesWorkId, outputDebugTensors, patchF2fp, sfBlockSizeA, sfLayoutA, sfLayoutB,
+                sfLayoutC, sfReshapeFactor, sliceK, splitK, tileK, tileM, tileN, tileScheduler,
                 transposeMmaOutput, useCustomMmaSchedule, useDeepSeekFp8,
                 useHoistTryWaitForCustomMmaSchedule, usePerTokenSfA, usePerTokenSfB,
                 useShuffledMatrixA, useTmaStore, useTwoTmaLoadWarps, useTwoMmaWarps,
@@ -125,6 +124,9 @@ struct BatchedGemmOptions : public gemmGatedAct::GemmGatedActOptions {
         mGridWaitForPrimaryRouting(gridWaitForPrimaryRouting),
         mIsStaticBatch(isStaticBatch),
         mNumBatches(numBatches),
+        mNumRegsPerThreadNonEpilogueWarp(numRegsPerThreadNonEpilogueWarp),
+        mNumRegsPerThreadEpilogueWarp(numRegsPerThreadEpilogueWarp),
+        mNumRegsCastAWarps(numRegsCastAWarps),
         mNumTokens(numTokens),
         mRouteImpl(routeImpl),
         mRouteSfsImpl(routeSfsImpl),
@@ -145,6 +147,12 @@ struct BatchedGemmOptions : public gemmGatedAct::GemmGatedActOptions {
   bool mIsStaticBatch{true};
   // Number of Gemm batches.
   int mNumBatches;
+  // Number of registers per thread for non-epilogue warps
+  int mNumRegsPerThreadNonEpilogueWarp{0};
+  // Number of registers per thread for epilogue warps
+  int mNumRegsPerThreadEpilogueWarp{0};
+  // Number of registers for the cast A warps.
+  int mNumRegsCastAWarps{0};
   // Total number of tokens.
   int mNumTokens{32};
   // Whether load the input tokens and do routing.
@@ -340,7 +348,6 @@ struct BatchedGemmConfig {
   char const* mHash{nullptr};
 #else
   trtllm::gen::CudaRunner* mCudaRunner{nullptr};
-  int32_t mInstanceIdx{0};
 #endif
 
   BatchedGemmOptions mOptions;
@@ -365,6 +372,11 @@ inline std::string dumpOptions(BatchedGemmOptions const& options) {
      << static_cast<int32_t>(options.mRouteSfsImpl.value()) << ")}," << std::endl;
   ss << "mGridWaitForPrimaryRouting=" << options.mGridWaitForPrimaryRouting << "," << std::endl;
   ss << "mFusedAct=" << options.mFusedAct << "," << std::endl;
+  ss << "mNumRegsPerThreadNonEpilogueWarp=" << options.mNumRegsPerThreadNonEpilogueWarp << ","
+     << std::endl;
+  ss << "mNumRegsPerThreadEpilogueWarp=" << options.mNumRegsPerThreadEpilogueWarp << ","
+     << std::endl;
+  ss << "mNumRegsCastAWarps=" << options.mNumRegsCastAWarps << "," << std::endl;
   ss << "mUseTmaOobOpt=" << options.mUseTmaOobOpt << std::endl;
   return ss.str();
 }

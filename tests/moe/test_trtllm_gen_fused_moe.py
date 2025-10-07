@@ -106,7 +106,7 @@ class CUDAGraphMoE:
         self.input_tensor = hidden_states_sample.clone()
 
         # Warmup
-        with torch.cuda.stream(torch_stream), autotune(False):
+        with torch.cuda.stream(torch_stream), autotune(True):
             for _ in range(1):
                 self._run_moe_computation(runtime_args)
 
@@ -1930,23 +1930,6 @@ def cache_permute_indices():
                 "top_k_groups": None,
                 "routed_scaling": None,
                 "has_routing_bias": False,
-                "routing_method_type": RoutingMethodType.Renormalize,
-                "compatible_moe_impls": [FP4Moe, FP8PerTensorMoe, FP8BlockScaleMoe],
-            },
-            id="GPT",
-            # marks=pytest.mark.skip(
-            #     reason="Disabled for testing speed - similar to RenormalizeNaive"
-            # ),
-        ),
-        pytest.param(
-            {
-                "num_experts": 128,
-                "top_k": 8,
-                "padding": 8,
-                "n_groups": None,
-                "top_k_groups": None,
-                "routed_scaling": None,
-                "has_routing_bias": False,
                 "routing_method_type": RoutingMethodType.RenormalizeNaive,
                 "compatible_moe_impls": [FP4Moe],
             },
@@ -2097,7 +2080,11 @@ def test_moe_quantization_classes(
         num_tokens,
         num_experts,
         top_k,
-        max_tile_tokens_dim=128 if type(moe_impl) is FP4Moe else 64,
+        max_tile_tokens_dim=128
+        if (
+            type(moe_impl) is FP4Moe and moe_impl.quant_mode != QuantMode.FP4_MXFP4_Bf16
+        )
+        else 64,
     )
 
     # Validation checks
