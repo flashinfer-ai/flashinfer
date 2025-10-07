@@ -18,6 +18,24 @@ os.makedirs(jit_env.FLASHINFER_WORKSPACE_DIR, exist_ok=True)
 os.makedirs(jit_env.FLASHINFER_CSRC_DIR, exist_ok=True)
 
 
+class MissingJITCacheError(RuntimeError):
+    """
+    Exception raised when JIT compilation is disabled and the JIT cache
+    does not contain the required precompiled module.
+
+    This error indicates that a module needs to be added to the JIT cache
+    build configuration.
+
+    Attributes:
+        spec: JitSpec of the missing module
+        message: Error message
+    """
+
+    def __init__(self, message: str, spec: Optional["JitSpec"] = None):
+        self.spec = spec
+        super().__init__(message)
+
+
 class FlashInferJITLogger(logging.Logger):
     def __init__(self, name):
         super().__init__(name)
@@ -228,6 +246,13 @@ class JitSpec:
         return self.ninja_path.exists()
 
     def build(self, verbose: bool, need_lock: bool = True) -> None:
+        if os.environ.get("FLASHINFER_DISABLE_JIT"):
+            raise MissingJITCacheError(
+                "JIT compilation is disabled via FLASHINFER_DISABLE_JIT environment variable, "
+                "but the required module is not found in the JIT cache. "
+                "Please add the missing module to the JIT cache build configuration.",
+                spec=self,
+            )
         lock = (
             FileLock(self.lock_path, thread_local=False) if need_lock else nullcontext()
         )

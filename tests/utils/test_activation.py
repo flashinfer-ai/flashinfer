@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import importlib.util
+
 import pytest
 import torch
 
@@ -23,14 +25,16 @@ from flashinfer.utils import get_compute_capability
 
 @pytest.fixture(autouse=True, scope="module")
 def warmup_jit():
-    flashinfer.jit.build_jit_specs(
-        [
-            flashinfer.activation.gen_act_and_mul_module("silu"),
-            flashinfer.activation.gen_act_and_mul_module("gelu"),
-            flashinfer.activation.gen_act_and_mul_module("gelu_tanh"),
-        ],
-        verbose=False,
-    )
+    # Skip warmup if flashinfer_jit_cache package is installed
+    if importlib.util.find_spec("flashinfer_jit_cache") is None:
+        flashinfer.jit.build_jit_specs(
+            [
+                flashinfer.activation.gen_act_and_mul_module("silu"),
+                flashinfer.activation.gen_act_and_mul_module("gelu"),
+                flashinfer.activation.gen_act_and_mul_module("gelu_tanh"),
+            ],
+            verbose=False,
+        )
     yield
 
 

@@ -10,10 +10,12 @@ if [ "$SKIP_INSTALL" = "0" ]; then
   pip install -e . -v
 fi
 
-pytest -s tests/utils/test_block_sparse.py
-pytest -s tests/utils/test_jit_example.py
-pytest -s tests/utils/test_jit_warmup.py
-pytest -s tests/utils/test_norm.py
-pytest -s tests/attention/test_rope.py
-pytest -s tests/attention/test_mla_page.py
-pytest -s tests/utils/test_quantization.py
+# Run all tests in a single pytest session for better coverage reporting
+pytest -s \
+  tests/utils/test_block_sparse.py \
+  tests/utils/test_jit_example.py \
+  tests/utils/test_jit_warmup.py \
+  tests/utils/test_norm.py \
+  tests/attention/test_rope.py \
+  tests/attention/test_mla_page.py \
+  tests/utils/test_quantization.py

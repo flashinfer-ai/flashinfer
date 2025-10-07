@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import importlib.util
+
 import pytest
 import torch
 
@@ -26,10 +28,12 @@ CUDA_DEVICES = ["cuda:0"]
 
 @pytest.fixture(autouse=True, scope="module")
 def warmup_jit():
-    jit_specs = [flashinfer.gemm.gen_gemm_module()]
-    if is_sm90a_supported(torch.device("cuda:0")):
-        jit_specs.append(flashinfer.gemm.gen_gemm_sm90_module())
-    flashinfer.jit.build_jit_specs(jit_specs, verbose=False)
+    # Skip warmup if flashinfer_jit_cache package is installed
+    if importlib.util.find_spec("flashinfer_jit_cache") is None:
+        jit_specs = [flashinfer.gemm.gen_gemm_module()]
+        if is_sm90a_supported(torch.device("cuda:0")):
+            jit_specs.append(flashinfer.gemm.gen_gemm_sm90_module())
+        flashinfer.jit.build_jit_specs(jit_specs, verbose=False)
     yield
 
 

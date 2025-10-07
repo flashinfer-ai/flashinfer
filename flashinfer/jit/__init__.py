@@ -61,6 +61,7 @@ from .core import jit_spec_registry as jit_spec_registry
 from .core import build_jit_specs as build_jit_specs
 from .core import clear_cache_dir as clear_cache_dir
 from .core import gen_jit_spec as gen_jit_spec
+from .core import MissingJITCacheError as MissingJITCacheError
 from .core import sm90a_nvcc_flags as sm90a_nvcc_flags
 from .core import sm100a_nvcc_flags as sm100a_nvcc_flags
 from .core import sm100f_nvcc_flags as sm100f_nvcc_flags

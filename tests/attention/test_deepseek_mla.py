@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import importlib.util
 import math
 
 import pytest
@@ -37,64 +38,66 @@ from flashinfer.utils import (
 @pytest.fixture(autouse=True, scope="module")
 def warmup_jit():
     try:
-        modules = []
-        for backend in ["fa2", "fa3"]:
-            if backend == "fa3" and not is_sm90a_supported(torch.device("cuda")):
-                continue
+        # Skip warmup if flashinfer_jit_cache package is installed
+        if importlib.util.find_spec("flashinfer_jit_cache") is None:
+            modules = []
+            for backend in ["fa2", "fa3"]:
+                if backend == "fa3" and not is_sm90a_supported(torch.device("cuda")):
+                    continue
 
-            modules.append(
-                gen_single_prefill_module(
-                    backend,
-                    torch.float16,
-                    torch.float16,
-                    torch.float16,
-                    192,
-                    128,
-                    0,
-                    False,
-                    False,
-                    False,
+                modules.append(
+                    gen_single_prefill_module(
+                        backend,
+                        torch.float16,
+                        torch.float16,
+                        torch.float16,
+                        192,
+                        128,
+                        0,
+                        False,
+                        False,
+                        False,
+                    )
                 )
-            )
 
-        for backend in ["fa2", "fa3"]:
-            if backend == "fa3" and not is_sm90a_supported(torch.device("cuda")):
-                continue
+            for backend in ["fa2", "fa3"]:
+                if backend == "fa3" and not is_sm90a_supported(torch.device("cuda")):
+                    continue
 
-            modules.append(
-                gen_batch_prefill_module(
-                    backend,
-                    torch.float16,
-                    torch.float16,
-                    torch.float16,
-                    torch.int32,
-                    192,
-                    128,
-                    0,
-                    False,
-                    False,
-                    False,
+                modules.append(
+                    gen_batch_prefill_module(
+                        backend,
+                        torch.float16,
+                        torch.float16,
+                        torch.float16,
+                        torch.int32,
+                        192,
+                        128,
+                        0,
+                        False,
+                        False,
+                        False,
+                    )
                 )
-            )
 
-        for backend in ["fa2", "fa3"]:
-            if backend == "fa3" and not is_sm90a_supported(torch.device("cuda")):
-                continue
+            for backend in ["fa2", "fa3"]:
+                if backend == "fa3" and not is_sm90a_supported(torch.device("cuda")):
+                    continue
 
-            modules.append(
-                gen_batch_mla_module(
-                    backend,
-                    torch.float16,
-                    torch.float16,
-                    torch.float16,
-                    torch.int32,
-                    512,
-                    64,
-                    False,
+                modules.append(
+                    gen_batch_mla_module(
+                        backend,
+                        torch.float16,
+                        torch.float16,
+                        torch.float16,
+                        torch.int32,
+                        512,
+                        64,
+                        False,
+                    )
                 )
-            )
 
-        build_jit_specs(modules, verbose=False)
+            build_jit_specs(modules, verbose=False)
     except Exception as e:
         # abort the test session if warmup fails
         pytest.exit(str(e))

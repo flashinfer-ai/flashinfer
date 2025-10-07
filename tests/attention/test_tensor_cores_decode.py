@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import importlib.util
+
 import pytest
 import torch
 from tests.test_helpers.jit_utils import (
@@ -26,26 +28,28 @@ import flashinfer
 
 @pytest.fixture(autouse=True, scope="module")
 def warmup_jit():
-    flashinfer.jit.build_jit_specs(
-        gen_decode_attention_modules(
-            [torch.float16],  # q_dtypes
-            [torch.float16],  # kv_dtypes
-            [64, 128, 256],  # head_dims
-            [0, 1],  # pos_encoding_modes
-            [False],  # use_sliding_windows
-            [False],  # use_logits_soft_caps
+    # Skip warmup if flashinfer_jit_cache package is installed
+    if importlib.util.find_spec("flashinfer_jit_cache") is None:
+        flashinfer.jit.build_jit_specs(
+            gen_decode_attention_modules(
+                [torch.float16],  # q_dtypes
+                [torch.float16],  # kv_dtypes
+                [64, 128, 256],  # head_dims
+                [0, 1],  # pos_encoding_modes
+                [False],  # use_sliding_windows
+                [False],  # use_logits_soft_caps
+            )
+            + gen_prefill_attention_modules(
+                [torch.float16],  # q_dtypes
+                [torch.float16],  # kv_dtypes
+                [64, 128, 256],  # head_dims
+                [0, 1],  # pos_encoding_modes
+                [False],  # use_sliding_windows
+                [False],  # use_logits_soft_caps
+                [False],  # use_fp16_qk_reductions
+            ),
+            verbose=False,
         )
-        + gen_prefill_attention_modules(
-            [torch.float16],  # q_dtypes
-            [torch.float16],  # kv_dtypes
-            [64, 128, 256],  # head_dims
-            [0, 1],  # pos_encoding_modes
-            [False],  # use_sliding_windows
-            [False],  # use_logits_soft_caps
-            [False],  # use_fp16_qk_reductions
-        ),
-        verbose=False,
-    )
     yield
 
 
