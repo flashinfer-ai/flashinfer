@@ -1,4 +1,5 @@
 from typing import Dict
+from flashinfer.utils import get_compute_capability
 import pytest
 import torch
 import torch.nn.functional as F
@@ -24,6 +25,10 @@ def test_mm_fp8(
     mat2_dtype: torch.dtype,
     res_dtype: torch.dtype,
 ):
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] not in [10]:
+        pytest.skip("mm_fp8 is only supported on Blackwell GPUs.")
+
     torch.manual_seed(123)
     input = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
     input_fp8, input_inv_s = to_float8(input, dtype=input_dtype)

@@ -124,6 +124,7 @@ def trtllm_low_latency_gemm(
     out: torch.Tensor,
 ) -> None:
     r"""GEMM optimized for low M dimension. B needs to be shuffled and its layout needs to be adjusted.
+    Only supported on Blackwell GPUs.
 
     Parameters
     ----------
