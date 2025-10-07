@@ -57,7 +57,8 @@ pip install flashinfer-python
 
 **For faster initialization and offline usage**, install the optional packages to have most kernels pre-compiled:
 ```bash
-pip install flashinfer-python flashinfer-cubin flashinfer-jit-cache
+pip install flashinfer-python flashinfer-cubin
+pip install flashinfer-jit-cache --index-url https://flashinfer.ai/whl/
 ```
 
 This eliminates compilation and downloading overhead at runtime.

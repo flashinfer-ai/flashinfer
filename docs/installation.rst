@@ -37,7 +37,8 @@ FlashInfer provides three packages:
 
 .. code-block:: bash
 
-    pip install flashinfer-python flashinfer-cubin flashinfer-jit-cache
+    pip install flashinfer-python flashinfer-cubin
+    pip install flashinfer-jit-cache --index-url https://flashinfer.ai/whl/
 
 This eliminates compilation and downloading overhead at runtime.
 

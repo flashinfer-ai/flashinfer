@@ -66,20 +66,20 @@ jobs:
           python -m pip install --upgrade pip
           pip install build wheel
 
-      - name: Build flashinfer-python sdist
+      - name: Build flashinfer-python wheel and sdist
         env:
           FLASHINFER_DEV_RELEASE_SUFFIX: ${{ needs.setup.outputs.dev_suffix }}
         run: |
           echo "Building flashinfer-python with dev suffix: ${FLASHINFER_DEV_RELEASE_SUFFIX}"
           echo "Git commit: $(git rev-parse HEAD)"
-          python -m build --sdist
+          python -m build
           ls -lh dist/
 
       - name: Upload flashinfer-python artifact
         uses: actions/upload-artifact@v4
         with:
-          name: flashinfer-python-sdist
-          path: dist/*.tar.gz
+          name: flashinfer-python-dist
+          path: dist/*
           retention-days: 7
 
   build-flashinfer-cubin:
@@ -226,7 +226,7 @@ jobs:
       - name: Download flashinfer-python artifact
         uses: actions/download-artifact@v4
         with:
-          name: flashinfer-python-sdist
+          name: flashinfer-python-dist
           path: dist-python/
 
       - name: Upload flashinfer-python to release
@@ -302,7 +302,7 @@ jobs:
       - name: Download flashinfer-python artifact
         uses: actions/download-artifact@v4
         with:
-          name: flashinfer-python-sdist
+          name: flashinfer-python-dist
           path: dist-python/
 
       - name: Download flashinfer-cubin artifact
