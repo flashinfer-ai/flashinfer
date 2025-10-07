@@ -102,7 +102,7 @@ void FMHACutlassSM100Run(ffi::Tensor workspace_buffer, ffi::Tensor q, ffi::Tenso
     using cutlass_type_in = cutlass_dtype_t<DTypeIn>;
     using cutlass_type_out = cutlass_dtype_t<DTypeOut>;
     using TILE_Q = _256;
-    using TILE_KV = std::conditional_t<HEAD_DIM_QK == 64, _64, _128>;
+    using TILE_KV = _128;
     using D_QK = cute::Int<HEAD_DIM_QK>;
     using D_VO = cute::Int<HEAD_DIM_VO>;
     using TileShapeQK = Shape<TILE_Q, TILE_KV, D_QK>;
