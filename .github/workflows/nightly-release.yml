@@ -344,10 +344,11 @@ jobs:
         with:
           path: artifacts/
 
-      - name: Collect wheels
+      - name: Collect wheels and sdist
         run: |
           mkdir -p dist
           find artifacts/ -name "*.whl" -exec cp {} dist/ \;
+          find artifacts/ -name "*.tar.gz" -exec cp {} dist/ \;
           ls -lh dist/
 
       - name: Clone wheel index
