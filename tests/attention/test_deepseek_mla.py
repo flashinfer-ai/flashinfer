@@ -28,13 +28,17 @@ from flashinfer.jit.attention import (
     gen_single_prefill_module,
 )
 from flashinfer.utils import (
+    has_flashinfer_jit_cache,
     is_sm90a_supported,
     is_sm100a_supported,
     is_sm110a_supported,
 )
 
 
-@pytest.fixture(autouse=True, scope="module")
+@pytest.fixture(
+    autouse=not has_flashinfer_jit_cache(),
+    scope="module",
+)
 def warmup_jit():
     try:
         modules = []

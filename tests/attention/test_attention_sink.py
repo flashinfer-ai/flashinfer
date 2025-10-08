@@ -24,10 +24,13 @@ import flashinfer
 from flashinfer.jit.utils import filename_safe_dtype_map
 from flashinfer.jit.attention import gen_batch_prefill_attention_sink_module
 from flashinfer.jit.attention.variants import attention_sink_decl
-from flashinfer.utils import is_sm90a_supported
+from flashinfer.utils import has_flashinfer_jit_cache, is_sm90a_supported
 
 
-@pytest.fixture(autouse=True, scope="module")
+@pytest.fixture(
+    autouse=not has_flashinfer_jit_cache(),
+    scope="module",
+)
 def warmup_jit():
     jit_specs = []
     for dtype in [torch.float16, torch.bfloat16]:

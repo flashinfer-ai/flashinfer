@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 from dataclasses import dataclass
+import logging
 import os
 import re
 import time
@@ -23,10 +24,15 @@ from typing import Generator
 import requests  # type: ignore[import-untyped]
 import shutil
 
-from .jit.core import logger
+# Create logger for artifacts module to avoid circular import with jit.core
+logger = logging.getLogger("flashinfer.artifacts")
+logger.setLevel(os.getenv("FLASHINFER_LOGGING_LEVEL", "INFO").upper())
+if not logger.handlers:
+    logger.addHandler(logging.StreamHandler())
+
 from .jit.cubin_loader import (
     FLASHINFER_CUBINS_REPOSITORY,
-    get_cubin,
+    download_file,
     safe_urljoin,
     FLASHINFER_CUBIN_DIR,
 )
@@ -125,26 +131,31 @@ def download_artifacts() -> None:
     # HTTPS connections.
     session = requests.Session()
 
-    with temp_env_var("FLASHINFER_CUBIN_CHECKSUM_DISABLED", "1"):
-        cubin_files = list(get_cubin_file_list())
-        num_threads = int(os.environ.get("FLASHINFER_CUBIN_DOWNLOAD_THREADS", "4"))
-        with tqdm_logging_redirect(
-            total=len(cubin_files), desc="Downloading cubins"
-        ) as pbar:
+    cubin_files = list(get_cubin_file_list())
+    num_threads = int(os.environ.get("FLASHINFER_CUBIN_DOWNLOAD_THREADS", "4"))
+    with tqdm_logging_redirect(
+        total=len(cubin_files), desc="Downloading cubins"
+    ) as pbar:
 
-            def update_pbar_cb(_) -> None:
-                pbar.update(1)
+        def update_pbar_cb(_) -> None:
+            pbar.update(1)
 
-            with ThreadPoolExecutor(num_threads) as pool:
-                futures = []
-                for name in cubin_files:
-                    fut = pool.submit(get_cubin, name, "", session)
-                    fut.add_done_callback(update_pbar_cb)
-                    futures.append(fut)
+        with ThreadPoolExecutor(num_threads) as pool:
+            futures = []
+            for name in cubin_files:
+                source = safe_urljoin(FLASHINFER_CUBINS_REPOSITORY, name)
+                local_path = FLASHINFER_CUBIN_DIR / name
+                # Ensure parent directory exists
+                local_path.parent.mkdir(parents=True, exist_ok=True)
+                fut = pool.submit(
+                    download_file, source, str(local_path), session=session
+                )
+                fut.add_done_callback(update_pbar_cb)
+                futures.append(fut)
 
-                results = [fut.result() for fut in as_completed(futures)]
+            results = [fut.result() for fut in as_completed(futures)]
 
-        all_success = all(results)
+    all_success = all(results)
     if not all_success:
         raise RuntimeError("Failed to download cubins")
 

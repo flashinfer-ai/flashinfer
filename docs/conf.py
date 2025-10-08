@@ -1,4 +1,3 @@
-from pathlib import Path
 from typing import Any, List
 
 import flashinfer  # noqa: F401
@@ -12,7 +11,6 @@ import flashinfer  # noqa: F401
 # -- Project information -----------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
 
-root = Path(__file__).parents[1].resolve()
 # FlashInfer is installed via pip before building docs
 autodoc_mock_imports = [
     "torch",
@@ -28,9 +26,8 @@ project = "FlashInfer"
 author = "FlashInfer Contributors"
 copyright = f"2023-2025, {author}"
 
-package_version = (root / "version.txt").read_text().strip()
-version = package_version
-release = package_version
+version = flashinfer.__version__
+release = flashinfer.__version__
 
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration

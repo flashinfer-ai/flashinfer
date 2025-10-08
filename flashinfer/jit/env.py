@@ -20,9 +20,33 @@ limitations under the License.
 
 import os
 import pathlib
-import importlib.util
 from ..compilation_context import CompilationContext
-from .. import __version__ as flashinfer_version
+from ..version import __version__ as flashinfer_version
+
+
+def has_flashinfer_jit_cache() -> bool:
+    """
+    Check if flashinfer_jit_cache module is available.
+
+    Returns:
+        True if flashinfer_jit_cache exists, False otherwise
+    """
+    import importlib.util
+
+    return importlib.util.find_spec("flashinfer_jit_cache") is not None
+
+
+def has_flashinfer_cubin() -> bool:
+    """
+    Check if flashinfer_cubin module is available.
+
+    Returns:
+        True if flashinfer_cubin exists, False otherwise
+    """
+    import importlib.util
+
+    return importlib.util.find_spec("flashinfer_cubin") is not None
+
 
 FLASHINFER_BASE_DIR: pathlib.Path = pathlib.Path(
     os.getenv("FLASHINFER_WORKSPACE_BASE", pathlib.Path.home().as_posix())
@@ -40,15 +64,20 @@ def _get_cubin_dir():
     3. Default cache directory
     """
     # First check if flashinfer-cubin package is installed
-    if importlib.util.find_spec("flashinfer_cubin"):
+    if has_flashinfer_cubin():
         import flashinfer_cubin
 
         flashinfer_cubin_version = flashinfer_cubin.__version__
-        if flashinfer_version != flashinfer_cubin_version:
+        # Allow bypassing version check with environment variable
+        if (
+            not os.getenv("FLASHINFER_DISABLE_VERSION_CHECK")
+            and flashinfer_version != flashinfer_cubin_version
+        ):
             raise RuntimeError(
                 f"flashinfer-cubin version ({flashinfer_cubin_version}) does not match "
                 f"flashinfer version ({flashinfer_version}). "
-                "Please install the same version of both packages."
+                "Please install the same version of both packages. "
+                "Set FLASHINFER_DISABLE_VERSION_CHECK=1 to bypass this check."
             )
 
         return pathlib.Path(flashinfer_cubin.get_cubin_dir())
@@ -72,17 +101,21 @@ def _get_aot_dir():
     2. Default fallback to _package_root / "data" / "aot"
     """
     # First check if flashinfer-jit-cache package is installed
-    if importlib.util.find_spec("flashinfer_jit_cache"):
+    if has_flashinfer_jit_cache():
         import flashinfer_jit_cache
 
         flashinfer_jit_cache_version = flashinfer_jit_cache.__version__
         # NOTE(Zihao): we don't use exact version match here because the version of flashinfer-jit-cache
         # contains the CUDA version suffix: e.g. 0.3.1+cu129.
-        if not flashinfer_jit_cache_version.startswith(flashinfer_version):
+        # Allow bypassing version check with environment variable
+        if not os.getenv(
+            "FLASHINFER_DISABLE_VERSION_CHECK"
+        ) and not flashinfer_jit_cache_version.startswith(flashinfer_version):
             raise RuntimeError(
                 f"flashinfer-jit-cache version ({flashinfer_jit_cache_version}) does not match "
                 f"flashinfer version ({flashinfer_version}). "
-                "Please install the same version of both packages."
+                "Please install the same version of both packages. "
+                "Set FLASHINFER_DISABLE_VERSION_CHECK=1 to bypass this check."
             )
 
         return pathlib.Path(flashinfer_jit_cache.get_jit_cache_dir())
