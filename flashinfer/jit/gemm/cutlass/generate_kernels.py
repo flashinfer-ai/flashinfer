@@ -277,6 +277,11 @@ GroupedGemmInput<{act_tag}, {weight_tag}, {out_tag}, {out_tag}>inputs, TmaWarpSp
             }
             guard_act = guard_map.get(operation.act_type, "1")
             guard_weight = guard_map.get(operation.weight_type, "1")
+
+            is_mx_fpx = str(operation.is_mx_fpx).lower()
+            use_dynamic_cga = str(operation.dynamic_cga).lower()
+            use_bias = str(False).lower()
+            swap_ab = str(operation.swap_ab).lower()
             # TODO Revert this once compiler bug is fixed so we can use template instead of macro again
             #         instantiation = f"""
             #         template void tma_warp_specialized_generic_moe_gemm_kernelLauncher<{arch_tag}, {act_tag}, {weight_tag}, {out_tag},
@@ -285,7 +290,10 @@ GroupedGemmInput<{act_tag}, {weight_tag}, {out_tag}, {out_tag}>inputs, TmaWarpSp
             # """
             instantiation = f"""
 #if {guard_act} && {guard_weight}
-        INSTANTIATE_TMA_WARP_SPECIALIZED_MOE_GEMM({arch_tag}, {act_tag}, {weight_tag}, {out_tag}, {epi_sched}, {epi_tag}, {epi_fusion}, {operation.cta_shape[0]}, {operation.cta_shape[1]}, {operation.cta_shape[2]}, {operation.cga_shape[0]}, {operation.cga_shape[1]}, {operation.cga_shape[2]}, {"true" if operation.is_mx_fpx else "false"}, {"true" if operation.dynamic_cga else "false"}, false, {"true" if operation.swap_ab else "false"});
+        INSTANTIATE_TMA_WARP_SPECIALIZED_MOE_GEMM({arch_tag}, {act_tag}, {weight_tag}, {out_tag},
+        {epi_sched}, {epi_tag}, {epi_fusion},
+        {operation.cta_shape[0]}, {operation.cta_shape[1]}, {operation.cta_shape[2]}, {operation.cga_shape[0]}, {operation.cga_shape[1]}, {operation.cga_shape[2]},
+        {is_mx_fpx}, {use_dynamic_cga}, {use_bias}, {swap_ab});
 #endif"""
     return instantiation
 
