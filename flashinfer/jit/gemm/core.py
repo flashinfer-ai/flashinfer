@@ -20,7 +20,7 @@ from itertools import product
 import jinja2
 import torch
 
-from ...artifacts import ArtifactPath, MetaInfoHash
+from ...artifacts import ArtifactPath
 from .. import env as jit_env
 from ..core import (
     JitSpec,
@@ -30,7 +30,7 @@ from ..core import (
     sm100f_nvcc_flags,
     current_compilation_context,
 )
-from ..cubin_loader import get_cubin
+from ..cubin_loader import get_cubin, get_meta_hash
 from ..utils import dtype_cutlass_map, filename_safe_dtype_map, write_if_different
 
 
@@ -364,7 +364,7 @@ def gen_trtllm_gen_gemm_module() -> JitSpec:
     # use `get_cubin` to get "flashinferMetaInfo.h"
     metainfo = get_cubin(
         f"{include_path}/{header_name}.h",
-        MetaInfoHash.TRTLLM_GEN_GEMM,
+        get_meta_hash(f"{ArtifactPath.TRTLLM_GEN_GEMM}/checksums.txt"),
     )
     # make sure "flashinferMetaInfo.h" is downloaded or cached
     assert metainfo, f"{header_name}.h not found"

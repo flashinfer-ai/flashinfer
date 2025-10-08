@@ -91,7 +91,7 @@ class ArtifactPath:
     DEEPGEMM: str = "a72d85b019dc125b9f711300cb989430f762f5a6/deep-gemm/"
 
 
-# TODO: Should be deprecated
+# TODO (jimmyzho): Should be deprecated except DEEPGEMM
 @dataclass(frozen=True)
 class MetaInfoHash:
     TRTLLM_GEN_FMHA: str = (

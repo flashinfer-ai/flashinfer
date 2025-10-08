@@ -127,6 +127,19 @@ def download_file(
         return False
 
 
+def get_meta_hash(checksum_path: str) -> str:
+    """
+    Load the file from local cache (checksums.txt)
+    and get the hash of corresponding flashinferMetaInfo.h file
+    """
+    with open(checksum_path, "r") as f:
+        for line in f:
+            sha256, filename = line.strip().split()
+            if ".h" in filename:
+                return sha256
+    raise ValueError(f"Invalid path: checksums.txt not found in {checksum_path}")
+
+
 def load_cubin(cubin_path: str, sha256: str) -> bytes:
     """
     Load a cubin from the provide local path and
