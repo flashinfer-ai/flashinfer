@@ -112,4 +112,5 @@ def test_load_cubin_race_condition(num_iterations, num_processes):
 
 
 if __name__ == "__main__":
+    # NOTE(Zihao): do not use pytest to run this test
     test_load_cubin_race_condition(100, 10)
