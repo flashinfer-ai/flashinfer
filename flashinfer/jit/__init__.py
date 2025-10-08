@@ -61,6 +61,7 @@ from .core import jit_spec_registry as jit_spec_registry
 from .core import build_jit_specs as build_jit_specs
 from .core import clear_cache_dir as clear_cache_dir
 from .core import gen_jit_spec as gen_jit_spec
+from .core import MissingJITCacheError as MissingJITCacheError
 from .core import sm90a_nvcc_flags as sm90a_nvcc_flags
 from .core import sm100a_nvcc_flags as sm100a_nvcc_flags
 from .core import sm100f_nvcc_flags as sm100f_nvcc_flags
@@ -70,14 +71,11 @@ from .core import sm120a_nvcc_flags as sm120a_nvcc_flags
 from .core import sm121a_nvcc_flags as sm121a_nvcc_flags
 from .core import current_compilation_context as current_compilation_context
 from .cubin_loader import setup_cubin_loader
-
-
-@functools.cache
-def get_cudnn_fmha_gen_module():
-    mod = gen_cudnn_fmha_module()
-    op = mod.build_and_load()
-    setup_cubin_loader(mod.get_library_path())
-    return op
+from .comm import gen_comm_alltoall_module as gen_comm_alltoall_module
+from .comm import gen_trtllm_mnnvl_comm_module as gen_trtllm_mnnvl_comm_module
+from .comm import gen_trtllm_comm_module as gen_trtllm_comm_module
+from .comm import gen_vllm_comm_module as gen_vllm_comm_module
+from .comm import gen_nvshmem_module as gen_nvshmem_module
 
 
 cuda_lib_path = os.environ.get(

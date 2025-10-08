@@ -1,31 +1,11 @@
 import ctypes
 import functools
-import os
-import shlex
 from typing import Sequence
 
 import torch
 
-from ..jit import JitSpec
 from ..jit import env as jit_env
-from ..jit import gen_jit_spec
-
-
-def gen_nvshmem_module() -> JitSpec:
-    lib_dirs = jit_env.get_nvshmem_lib_dirs()
-    ldflags = (
-        [f"-L{lib_dir}" for lib_dir in lib_dirs]
-        + ["-lnvshmem_device"]
-        + shlex.split(os.environ.get("NVSHMEM_LDFLAGS", ""))
-    )
-
-    return gen_jit_spec(
-        "nvshmem",
-        [jit_env.FLASHINFER_CSRC_DIR / "nvshmem_binding.cu"],
-        extra_include_paths=[str(p) for p in jit_env.get_nvshmem_include_dirs()],
-        extra_ldflags=ldflags,
-        needs_device_linking=True,
-    )
+from ..jit.comm import gen_nvshmem_module
 
 
 @functools.cache

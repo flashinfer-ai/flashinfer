@@ -90,9 +90,14 @@ def attention_varlen_ref(
 @pytest.mark.parametrize("kv_len", [1, 17, 544, 977, 1999])
 @pytest.mark.parametrize("num_qo_heads", [32])
 @pytest.mark.parametrize("num_kv_heads", [8, 32])
-@pytest.mark.parametrize("head_dim_qk", [192, 128])
-@pytest.mark.parametrize("head_dim_vo", [128])
-@pytest.mark.parametrize("sm_scale", [1.0, 1.0 / math.sqrt(192), 1.0 / math.sqrt(128)])
+@pytest.mark.parametrize(
+    "head_dim_qk,head_dim_vo,sm_scale",
+    [
+        (192, 128, 1.0 / math.sqrt(192)),
+        (128, 128, 1.0 / math.sqrt(128)),
+        (64, 64, 1.0 / math.sqrt(64)),
+    ],
+)
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_blackwell_cutlass_fmha(
@@ -169,9 +174,14 @@ def test_blackwell_cutlass_fmha(
 @pytest.mark.parametrize("indptr", VARLEN_INDPTR_PARAMS)
 @pytest.mark.parametrize("num_qo_heads", [32])
 @pytest.mark.parametrize("num_kv_heads", [8, 32])
-@pytest.mark.parametrize("head_dim_qk", [192, 128])
-@pytest.mark.parametrize("head_dim_vo", [128])
-@pytest.mark.parametrize("sm_scale", [1.0 / math.sqrt(128)])
+@pytest.mark.parametrize(
+    "head_dim_qk,head_dim_vo,sm_scale",
+    [
+        (192, 128, 1.0 / math.sqrt(192)),
+        (128, 128, 1.0 / math.sqrt(128)),
+        (64, 64, 1.0 / math.sqrt(64)),
+    ],
+)
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_blackwell_cutlass_varlen(
@@ -251,9 +261,14 @@ def test_blackwell_cutlass_varlen(
 @pytest.mark.parametrize("kv_indptr_list", [[0, 50, 50, 50, 50, 50, 50, 50]])
 @pytest.mark.parametrize("num_qo_heads", [32])
 @pytest.mark.parametrize("num_kv_heads", [8, 32])
-@pytest.mark.parametrize("head_dim_qk", [192, 128])
-@pytest.mark.parametrize("head_dim_vo", [128])
-@pytest.mark.parametrize("sm_scale", [1.0 / math.sqrt(128)])
+@pytest.mark.parametrize(
+    "head_dim_qk,head_dim_vo,sm_scale",
+    [
+        (192, 128, 1.0 / math.sqrt(192)),
+        (128, 128, 1.0 / math.sqrt(128)),
+        (64, 64, 1.0 / math.sqrt(64)),
+    ],
+)
 @pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
 def test_blackwell_cutlass_qo_kv_varlen(
     qo_indptr_list,

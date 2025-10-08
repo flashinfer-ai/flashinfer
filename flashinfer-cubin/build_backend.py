@@ -6,21 +6,14 @@ import os
 import sys
 from pathlib import Path
 from setuptools import build_meta as _orig
-from setuptools.build_meta import *
 
 # Add parent directory to path to import artifacts module
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-# add flashinfer._build_meta if not there, it should exist in Path(__file__).parent.parent / "flashinfer" / "_build_meta.py"
-build_meta_file = Path(__file__).parent.parent / "flashinfer" / "_build_meta.py"
-if not build_meta_file.exists():
-    version_file = Path(__file__).parent.parent / "version.txt"
-    if version_file.exists():
-        with open(version_file, "r") as f:
-            version = f.read().strip()
-    with open(build_meta_file, "w") as f:
-        f.write('"""Build metadata for flashinfer package."""\n')
-        f.write(f'__version__ = "{version}"\n')
+from build_utils import get_git_version
+
+# Skip version check when building flashinfer-cubin package
+os.environ["FLASHINFER_DISABLE_VERSION_CHECK"] = "1"
 
 
 def _download_cubins():
@@ -61,42 +54,55 @@ def _create_build_metadata():
     else:
         version = "0.0.0+unknown"
 
+    # Add dev suffix if specified
+    dev_suffix = os.environ.get("FLASHINFER_DEV_RELEASE_SUFFIX", "")
+    if dev_suffix:
+        version = f"{version}.dev{dev_suffix}"
+
+    # Get git version
+    git_version = get_git_version(cwd=Path(__file__).parent.parent)
+
     # Create build metadata in the source tree
     package_dir = Path(__file__).parent / "flashinfer_cubin"
     build_meta_file = package_dir / "_build_meta.py"
 
+    # Check if we're in a git repository
+    git_dir = Path(__file__).parent.parent / ".git"
+    in_git_repo = git_dir.exists()
+
+    # If file exists and not in git repo (installing from sdist), keep existing file
+    if build_meta_file.exists() and not in_git_repo:
+        print("Build metadata file already exists (not in git repo), keeping it")
+        return version
+
+    # In git repo (editable) or file doesn't exist, create/update it
     with open(build_meta_file, "w") as f:
         f.write('"""Build metadata for flashinfer-cubin package."""\n')
         f.write(f'__version__ = "{version}"\n')
+        f.write(f'__git_version__ = "{git_version}"\n')
 
     print(f"Created build metadata file with version {version}")
     return version
 
 
+# Create build metadata as soon as this module is imported
+_create_build_metadata()
+
+
 def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
     """Build a wheel, downloading cubins first."""
     _download_cubins()
-    _create_build_metadata()
     return _orig.build_wheel(wheel_directory, config_settings, metadata_directory)
-
-
-def build_sdist(sdist_directory, config_settings=None):
-    """Build a source distribution, downloading cubins first."""
-    _download_cubins()
-    _create_build_metadata()
-    return _orig.build_sdist(sdist_directory, config_settings)
 
 
 def build_editable(wheel_directory, config_settings=None, metadata_directory=None):
     """Build an editable install, downloading cubins first."""
     _download_cubins()
-    _create_build_metadata()
     return _orig.build_editable(wheel_directory, config_settings, metadata_directory)
 
 
 # Pass through all other hooks
 get_requires_for_build_wheel = _orig.get_requires_for_build_wheel
-get_requires_for_build_sdist = _orig.get_requires_for_build_sdist
 get_requires_for_build_editable = _orig.get_requires_for_build_editable
 prepare_metadata_for_build_wheel = _orig.prepare_metadata_for_build_wheel
 prepare_metadata_for_build_editable = _orig.prepare_metadata_for_build_editable

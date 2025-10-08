@@ -7,6 +7,7 @@ on:
       - main
     paths:
       - 'docker/**'
+      - '.github/workflows/release-ci-docker.yml'
   pull_request:
     branches:
       - main
@@ -66,7 +67,7 @@ jobs:
       - name: Build and push ${{ matrix.cuda }} ${{ matrix.arch }} image
         uses: docker/build-push-action@v5
         with:
-          context: docker
+          context: .
           file: docker/Dockerfile.${{ matrix.cuda }}
           platforms: linux/${{ matrix.arch }}
           push: ${{ github.event_name != 'pull_request' }}

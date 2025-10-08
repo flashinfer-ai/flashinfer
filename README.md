@@ -42,41 +42,86 @@ FlashInfer supports PyTorch, TVM and C++ (header-only) APIs, and can be easily i
 
 Using our PyTorch API is the easiest way to get started:
 
-### Install from PIP
+### Install from PyPI
 
-FlashInfer is available as a Python package for Linux on PyPI. You can install it with the following command:
+FlashInfer is available as a Python package for Linux. Install the core package with:
 
 ```bash
 pip install flashinfer-python
 ```
 
+**Package Options:**
+- **flashinfer-python**: Core package that compiles/downloads kernels on first use
+- **flashinfer-cubin**: Pre-compiled kernel binaries for all supported GPU architectures
+- **flashinfer-jit-cache**: Pre-built kernel cache for specific CUDA versions
+
+**For faster initialization and offline usage**, install the optional packages to have most kernels pre-compiled:
+```bash
+pip install flashinfer-python flashinfer-cubin
+pip install flashinfer-jit-cache --index-url https://flashinfer.ai/whl/
+```
+
+This eliminates compilation and downloading overhead at runtime.
+
 ### Install from Source
 
-Alternatively, build FlashInfer from source:
+Build the core package from source:
 
 ```bash
 git clone https://github.com/flashinfer-ai/flashinfer.git --recursive
 cd flashinfer
 python -m pip install -v .
+```
 
-# for development & contribution, install in editable mode
+**For development**, install in editable mode:
+```bash
 python -m pip install --no-build-isolation -e . -v
 ```
 
-To pre-compile essential kernels ahead-of-time (AOT), run the following command:
+**Build optional packages:**
 
+`flashinfer-cubin`:
 ```bash
-# Set target CUDA architectures
-export FLASHINFER_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a 10.0a"
-# Build AOT kernels. Will produce AOT kernels in aot-ops/
-python -m flashinfer.aot
-# Build AOT wheel
+cd flashinfer-cubin
 python -m build --no-isolation --wheel
-# Install AOT wheel
-python -m pip install dist/flashinfer_*.whl
+python -m pip install dist/*.whl
 ```
 
-For more details, refer to the [Install from Source documentation](https://docs.flashinfer.ai/installation.html#install-from-source).
+`flashinfer-jit-cache` (customize `FLASHINFER_CUDA_ARCH_LIST` for your target GPUs):
+```bash
+export FLASHINFER_CUDA_ARCH_LIST="7.5 8.0 8.9 10.0a 10.3a 12.0a"
+cd flashinfer-jit-cache
+python -m build --no-isolation --wheel
+python -m pip install dist/*.whl
+```
+
+For more details, see the [Install from Source documentation](https://docs.flashinfer.ai/installation.html#install-from-source).
+
+### Install Nightly Build
+
+Nightly builds are available for testing the latest features:
+
+```bash
+# Core and cubin packages
+pip install -U --pre flashinfer-python --extra-index-url https://flashinfer.ai/whl/nightly/
+pip install -U --pre flashinfer-cubin --index-url https://flashinfer.ai/whl/nightly/
+# JIT cache package (replace cu129 with your CUDA version: cu128, cu129, or cu130)
+pip install -U --pre flashinfer-jit-cache --index-url https://flashinfer.ai/whl/nightly/cu129
+```
+
+### Verify Installation
+
+After installation, verify that FlashInfer is correctly installed and configured:
+
+```bash
+flashinfer show-config
+```
+
+This command displays:
+- FlashInfer version and installed packages (flashinfer-python, flashinfer-cubin, flashinfer-jit-cache)
+- PyTorch and CUDA version information
+- Environment variables and artifact paths
+- Downloaded cubin status and module compilation status
 
 ### Trying it out
 
@@ -117,11 +162,7 @@ Check out [documentation](https://docs.flashinfer.ai/) for usage of batch decode
 
 ## Custom Attention Variants
 
-Starting from FlashInfer v0.2, users can customize their own attention variants with additional parameters. For more details, refer to our [JIT examples](https://github.com/flashinfer-ai/flashinfer/blob/main/tests/test_jit_example.py).
-
-## C++ API and TVM Bindings
-
-FlashInfer also provides C++ API and TVM bindings, please refer to [documentation](https://docs.flashinfer.ai/) for more details.
+Starting from FlashInfer v0.2, users can customize their own attention variants with additional parameters. For more details, refer to our [JIT examples](https://github.com/flashinfer-ai/flashinfer/blob/main/tests/utils/test_jit_example.py).
 
 ## GPU Support
 

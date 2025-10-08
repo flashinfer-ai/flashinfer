@@ -18,6 +18,24 @@ os.makedirs(jit_env.FLASHINFER_WORKSPACE_DIR, exist_ok=True)
 os.makedirs(jit_env.FLASHINFER_CSRC_DIR, exist_ok=True)
 
 
+class MissingJITCacheError(RuntimeError):
+    """
+    Exception raised when JIT compilation is disabled and the JIT cache
+    does not contain the required precompiled module.
+
+    This error indicates that a module needs to be added to the JIT cache
+    build configuration.
+
+    Attributes:
+        spec: JitSpec of the missing module
+        message: Error message
+    """
+
+    def __init__(self, message: str, spec: Optional["JitSpec"] = None):
+        self.spec = spec
+        super().__init__(message)
+
+
 class FlashInferJITLogger(logging.Logger):
     def __init__(self, name):
         super().__init__(name)
@@ -89,15 +107,10 @@ class JitSpecStatus:
 
     name: str
     created_at: datetime
-    is_aot: bool
     is_compiled: bool
     library_path: Optional[Path]
     sources: List[Path]
     needs_device_linking: bool
-
-    @property
-    def compilation_type(self) -> str:
-        return "AOT" if self.is_aot else "JIT"
 
     @property
     def status(self) -> str:
@@ -130,17 +143,12 @@ class JitSpecRegistry:
             return None
 
         spec = self._specs[name]
-        library_path = (
-            spec.get_library_path()
-            if (spec.is_aot or spec.jit_library_path.exists())
-            else None
-        )
+        library_path = spec.get_library_path() if spec.is_compiled else None
 
         return JitSpecStatus(
             name=spec.name,
             created_at=self._creation_times[name],
-            is_aot=spec.is_aot,
-            is_compiled=spec.is_aot or spec.jit_library_path.exists(),
+            is_compiled=spec.is_compiled,
             library_path=library_path,
             sources=spec.sources,
             needs_device_linking=spec.needs_device_linking,
@@ -160,8 +168,7 @@ class JitSpecRegistry:
         statuses = self.get_all_statuses()
         return {
             "total": len(statuses),
-            "aot_compiled": sum(1 for s in statuses if s.is_aot),
-            "jit_compiled": sum(1 for s in statuses if not s.is_aot and s.is_compiled),
+            "compiled": sum(1 for s in statuses if s.is_compiled),
             "not_compiled": sum(1 for s in statuses if not s.is_compiled),
         }
 
@@ -213,6 +220,10 @@ class JitSpec:
         return self.aot_path.exists()
 
     @property
+    def is_compiled(self) -> bool:
+        return self.get_library_path().exists()
+
+    @property
     def lock_path(self) -> Path:
         return get_tmpdir() / f"{self.name}.lock"
 
@@ -235,6 +246,13 @@ class JitSpec:
         return self.ninja_path.exists()
 
     def build(self, verbose: bool, need_lock: bool = True) -> None:
+        if os.environ.get("FLASHINFER_DISABLE_JIT"):
+            raise MissingJITCacheError(
+                "JIT compilation is disabled via FLASHINFER_DISABLE_JIT environment variable, "
+                "but the required module is not found in the JIT cache. "
+                "Please add the missing module to the JIT cache build configuration.",
+                spec=self,
+            )
         lock = (
             FileLock(self.lock_path, thread_local=False) if need_lock else nullcontext()
         )
@@ -301,7 +319,7 @@ def gen_jit_spec(
         cflags += ["-O3"]
 
     # useful for ncu
-    if bool(os.environ.get("FLASHINFER_JIT_LINEINFO", "0")):
+    if os.environ.get("FLASHINFER_JIT_LINEINFO", "0") == "1":
         cuda_cflags += ["-lineinfo"]
 
     if extra_cflags is not None:

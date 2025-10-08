@@ -43,6 +43,10 @@ using tvm::ffi::Optional;
       constexpr int HEAD_DIM_QK = 128;                                             \
       constexpr int HEAD_DIM_VO = 128;                                             \
       return __VA_ARGS__();                                                        \
+    } else if (head_dim_qk == 64 && head_dim_vo == 64) {                           \
+      constexpr int HEAD_DIM_QK = 64;                                              \
+      constexpr int HEAD_DIM_VO = 64;                                              \
+      return __VA_ARGS__();                                                        \
     }                                                                              \
     return false;                                                                  \
   }()

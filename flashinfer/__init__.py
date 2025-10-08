@@ -14,10 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-try:
-    from ._build_meta import __version__ as __version__
-except ModuleNotFoundError:
-    __version__ = "0.0.0+unknown"
+import importlib.util
+
+from .version import __version__ as __version__
+from .version import __git_version__ as __git_version__
 
 
 from . import jit as jit
@@ -143,19 +143,3 @@ from .sparse import (
 )
 from .utils import next_positive_power_of_2 as next_positive_power_of_2
 from .xqa import xqa as xqa
-
-try:
-    import flashinfer_cubin
-
-    flashinfer_cubin_version = flashinfer_cubin.__version__
-
-    print("__version__", __version__)
-    if __version__ != flashinfer_cubin_version:
-        raise RuntimeError(
-            f"flashinfer-cubin version ({flashinfer_cubin_version}) does not match "
-            f"flashinfer version ({__version__}). "
-            "Please install the same version of both packages."
-        )
-except ImportError:
-    # flashinfer-cubin is not installed
-    pass

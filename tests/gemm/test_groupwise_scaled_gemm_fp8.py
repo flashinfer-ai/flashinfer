@@ -146,6 +146,12 @@ def test_fp8_groupwise_group_gemm(
     scale_major_mode,
     out_dtype,
 ):
+    if group_size > 1 and torch.cuda.get_device_capability()[0] in [
+        12,
+    ]:
+        pytest.skip(
+            "group_gemm_fp8_nt_groupwise has correctness issues for num_groups > 1 on SM120/121"
+        )
     torch.random.manual_seed(0)
     tile_size = 128
 

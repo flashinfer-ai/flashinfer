@@ -74,7 +74,36 @@ def get_act_and_mul_cu_str(act_func_name: str, act_func_def: str) -> str:
     return template.render(act_func_name=act_func_name, act_func_def=act_func_def)
 
 
-def gen_act_and_mul_module(act_func_name: str, act_func_def: str) -> JitSpec:
+silu_def_cu_str = r"""
+__device__ __forceinline__ float silu(const float& val) {
+  return val / (1.0f + __expf(-val));
+}
+"""
+
+gelu_def_cu_str = r"""
+__device__ __forceinline__ float gelu(const float& val) {
+  constexpr float kAlpha = M_SQRT1_2;
+  return val * 0.5f * (1.0f + ::erf(val * kAlpha));
+}
+"""
+
+gelu_def_tanh_cu_str = r"""
+__device__ __forceinline__ float gelu_tanh(const float& val) {
+  const float cdf =
+      0.5f * (1.0f + math::tanh((0.7978845608028654f * (val + 0.044715f * val * val * val))));
+  return val * cdf;
+}
+"""
+
+act_func_def_str = {
+    "silu": silu_def_cu_str,
+    "gelu": gelu_def_cu_str,
+    "gelu_tanh": gelu_def_tanh_cu_str,
+}
+
+
+def gen_act_and_mul_module(act_func_name: str) -> JitSpec:
+    act_func_def = act_func_def_str[act_func_name]
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR
     os.makedirs(gen_directory, exist_ok=True)
     sources = [gen_directory / f"{act_func_name}_and_mul.cu"]

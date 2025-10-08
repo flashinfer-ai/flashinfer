@@ -64,8 +64,9 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
   using Mask = Mask_;
 
   static constexpr int StageCountQ = 2;
-  static constexpr int StageCountKV =
-      get<2>(TileShapeQK{}) == 128 ? 2 : 1;  // sizeof(Element_) == 1 ? 2 : 2;
+  static constexpr int StageCountKV = (get<2>(TileShapeQK{}) == 128 || get<2>(TileShapeQK{}) == 64)
+                                          ? 2
+                                          : 1;  // sizeof(Element_) == 1 ? 2 : 2;
 
   using StagesQ = cutlass::gemm::collective::StageCount<StageCountQ>;
   using StagesKV = cutlass::gemm::collective::StageCount<StageCountKV>;
@@ -857,8 +858,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
     float2 scale_f32x2 = make_float2(scale, scale);
 
-    Tensor tTMrO =
-        make_tensor<ElementPV>(make_shape(shape(tTMEM_LOADcO), Int<128 / kCorrectionTileSize>{}));
+    Tensor tTMrO = make_tensor<ElementPV>(
+        make_shape(shape(tTMEM_LOADcO), Int<get<1>(TileShapePV{}) / kCorrectionTileSize>{}));
 
     auto copy_in = [&](int i) {
       Tensor tTMEM_LOADtO_i = tTMEM_LOADtO;

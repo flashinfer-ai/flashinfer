@@ -23,9 +23,12 @@ urls = { Homepage = "https://github.com/flashinfer-ai/flashinfer" }
 dynamic = ["dependencies", "version"]
 license-files = ["LICENSE", "licenses/*"]
 
+[project.scripts]
+flashinfer = "flashinfer.__main__:cli"
+
 [build-system]
-requires = ["setuptools>=77", "packaging>=24"]
-build-backend = "custom_backend"
+requires = ["setuptools>=77", "packaging>=24", "apache-tvm-ffi==0.1.0b15"]
+build-backend = "build_backend"
 backend-path = ["."]
 
 [tool.codespell]
@@ -38,44 +41,30 @@ skip = [
 ]
 
 [tool.setuptools]
-packages = [
-    "flashinfer",
-    "flashinfer.cute_dsl",
-    "flashinfer.data",
-    "flashinfer.data.aot",
-    "flashinfer.data.csrc",
-    "flashinfer.data.cutlass",
-    "flashinfer.data.spdlog",
-    "flashinfer.data.include",
-    "flashinfer.fused_moe",
-    "flashinfer.jit",
-    "flashinfer.jit.attention",
-    "flashinfer.jit.cutlass_gemm",
-    "flashinfer.testing",
-    "flashinfer.triton",
-    "flashinfer.tuning_configs",
-    "flashinfer.profiler",
-    "flashinfer.triton.kernels",
-    "flashinfer.comm",
-    "flashinfer.cudnn",
-    "flashinfer.logits_processor",
-]
 include-package-data = false
+py-modules = ["build_backend", "build_utils"]
+
+[tool.setuptools.dynamic]
+version = {attr = "flashinfer._build_meta.__version__"}
+dependencies = {file = ["requirements.txt"]}
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["flashinfer*"]
+exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*"]
 
 [tool.setuptools.package-dir]
 "flashinfer.data" = "."
-"flashinfer.data.aot" = "build/aot-ops-package-dir"
 "flashinfer.data.cutlass" = "3rdparty/cutlass"
 "flashinfer.data.spdlog" = "3rdparty/spdlog"
 
 [tool.setuptools.package-data]
+"flashinfer" = [
+    "_build_meta.py"
+]
 "flashinfer.data" = [
     "csrc/**",
-    "include/**",
-    "version.txt"
-]
-"flashinfer.data.aot" = [
-    "**"
+    "include/**"
 ]
 "flashinfer.data.cutlass" = [
     "include/**",
@@ -95,6 +84,7 @@ ignore_errors = false
 strict_optional = false
 exclude = [
     "flashinfer-cubin/",
+    "flashinfer-jit-cache/",
     "3rdparty/",
     "flashinfer/data/cutlass/",
     "build/",

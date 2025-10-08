@@ -4,9 +4,13 @@ set -eo pipefail
 set -x
 : ${MAX_JOBS:=$(nproc)}
 : ${CUDA_VISIBLE_DEVICES:=0}
+: ${SKIP_INSTALL:=0}
 
-pip install -e . -v
+if [ "$SKIP_INSTALL" = "0" ]; then
+  pip install -e . -v
+fi
 
+# Run each test file separately to isolate CUDA memory issues
 pytest -s tests/utils/test_block_sparse.py
 pytest -s tests/utils/test_jit_example.py
 pytest -s tests/utils/test_jit_warmup.py

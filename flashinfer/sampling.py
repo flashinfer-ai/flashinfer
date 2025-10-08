@@ -19,9 +19,7 @@ from types import SimpleNamespace
 from typing import Any, Optional, Tuple, Union
 import torch
 
-from .jit import JitSpec
-from .jit import env as jit_env
-from .jit import gen_jit_spec
+from .jit.sampling import gen_sampling_module
 from .utils import (
     _get_cache_buf,
     device_support_pdl,
@@ -44,17 +42,6 @@ def get_seed_and_offset(
         torch.tensor([seed, offset], dtype=torch.int64).view(torch.uint8)
     )
     return int(seed), int(offset)
-
-
-def gen_sampling_module() -> JitSpec:
-    return gen_jit_spec(
-        "sampling",
-        [
-            jit_env.FLASHINFER_CSRC_DIR / "sampling.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "renorm.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "flashinfer_sampling_binding.cu",
-        ],
-    )
 
 
 @functools.cache
