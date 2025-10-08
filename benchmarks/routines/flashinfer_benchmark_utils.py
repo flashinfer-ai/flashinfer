@@ -197,8 +197,8 @@ routine_cc_to_supported_backends = {
         "8.6": ["fa2"],
         "8.9": ["fa2"],
         "9.0": ["fa2", "fa3"],
-        "10.0": ["fa2", "trtllm-gen-native"],
-        "10.3": ["fa2", "trtllm-gen-native"],
+        "10.0": ["fa2", "cutlass", "trtllm-gen-native"],
+        "10.3": ["fa2", "cutlass", "trtllm-gen-native"],
         "12.0": ["fa2"],
     },
     # GEMM
