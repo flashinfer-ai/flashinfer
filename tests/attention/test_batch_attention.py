@@ -14,8 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import importlib.util
-
 import numpy as np
 import pytest
 import torch
@@ -25,11 +23,11 @@ from tests.test_helpers.jit_utils import (
     gen_persistent_batch_attention_modules,
     gen_prefill_attention_modules,
 )
-from flashinfer.utils import get_compute_capability
+from flashinfer.utils import get_compute_capability, has_flashinfer_jit_cache
 
 
 @pytest.fixture(
-    autouse=importlib.util.find_spec("flashinfer_jit_cache") is None,
+    autouse=not has_flashinfer_jit_cache(),
     scope="module",
 )
 def warmup_jit():

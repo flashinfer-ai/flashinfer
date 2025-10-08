@@ -14,20 +14,22 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import importlib.util
-
 import pytest
 import torch
 
 import flashinfer
-from flashinfer.utils import determine_gemm_backend, is_sm90a_supported
+from flashinfer.utils import (
+    determine_gemm_backend,
+    has_flashinfer_jit_cache,
+    is_sm90a_supported,
+)
 
 DTYPES = [torch.float16]
 CUDA_DEVICES = ["cuda:0"]
 
 
 @pytest.fixture(
-    autouse=importlib.util.find_spec("flashinfer_jit_cache") is None,
+    autouse=not has_flashinfer_jit_cache(),
     scope="module",
 )
 def warmup_jit():

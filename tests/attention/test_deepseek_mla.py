@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import importlib.util
 import math
 
 import pytest
@@ -29,6 +28,7 @@ from flashinfer.jit.attention import (
     gen_single_prefill_module,
 )
 from flashinfer.utils import (
+    has_flashinfer_jit_cache,
     is_sm90a_supported,
     is_sm100a_supported,
     is_sm110a_supported,
@@ -36,7 +36,7 @@ from flashinfer.utils import (
 
 
 @pytest.fixture(
-    autouse=importlib.util.find_spec("flashinfer_jit_cache") is None,
+    autouse=not has_flashinfer_jit_cache(),
     scope="module",
 )
 def warmup_jit():

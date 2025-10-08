@@ -14,8 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import importlib.util
-
 import numpy as np
 import pytest
 import scipy as sp
@@ -26,10 +24,11 @@ from tests.test_helpers.jit_utils import (
 )
 
 import flashinfer
+from flashinfer.utils import has_flashinfer_jit_cache
 
 
 @pytest.fixture(
-    autouse=importlib.util.find_spec("flashinfer_jit_cache") is None,
+    autouse=not has_flashinfer_jit_cache(),
     scope="module",
 )
 def warmup_jit():

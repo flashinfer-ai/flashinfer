@@ -20,9 +20,9 @@ limitations under the License.
 
 import os
 import pathlib
-import importlib.util
 from ..compilation_context import CompilationContext
 from ..version import __version__ as flashinfer_version
+from ..utils import has_flashinfer_jit_cache, has_flashinfer_cubin
 
 FLASHINFER_BASE_DIR: pathlib.Path = pathlib.Path(
     os.getenv("FLASHINFER_WORKSPACE_BASE", pathlib.Path.home().as_posix())
@@ -40,7 +40,7 @@ def _get_cubin_dir():
     3. Default cache directory
     """
     # First check if flashinfer-cubin package is installed
-    if importlib.util.find_spec("flashinfer_cubin"):
+    if has_flashinfer_cubin():
         import flashinfer_cubin
 
         flashinfer_cubin_version = flashinfer_cubin.__version__
@@ -77,7 +77,7 @@ def _get_aot_dir():
     2. Default fallback to _package_root / "data" / "aot"
     """
     # First check if flashinfer-jit-cache package is installed
-    if importlib.util.find_spec("flashinfer_jit_cache"):
+    if has_flashinfer_jit_cache():
         import flashinfer_jit_cache
 
         flashinfer_jit_cache_version = flashinfer_jit_cache.__version__
