@@ -689,14 +689,19 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
 
     if "trtllm-gen" in backends:
         remove_trtllm = False
-        if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2] or kv_dtype in [
-            torch.float8_e4m3fn,
-            torch.float8_e5m2,
-        ]:
-            print("[INFO] trtllm-gen backend does not support FP8. Skipping.")
-            remove_trtllm = True
         if remove_trtllm:
             backends.remove("trtllm-gen")
+    if "trtllm-gen-native" in backends:
+        remove_trtllm_native = False
+        if batch_size == 1:
+            # TO-DO: trtllm-gen-native hits IMA on batch size 1. Investigate and fix.
+            print("[INFO] trtllm-gen-native backend currently requires batch size > 1")
+        # remove_trtllm_native = True # TO-DO: Uncomment before checking in
+        if not causal:
+            print("[INFO] trtllm-gen-native backend currently requires causal = True")
+            remove_trtllm_native = True
+        if remove_trtllm_native:
+            backends.remove("trtllm-gen-native")
 
     if "cutlass" in backends:
         print("[INFO] CUTLASS backend does not support prefill. Skipping.")
@@ -1129,6 +1134,13 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
 
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
     # Check for backend-specific constraints
+    if "fa2" in backends:
+        remove_fa2 = False
+        if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+            print("[INFO] FA2 backend does not support FP8. Skipping.")
+            remove_fa2 = True
+        if remove_fa2:
+            backends.remove("fa2")
     if "cudnn" in backends:
         remove_cudnn = False
         if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2] or kv_dtype in [
@@ -1161,6 +1173,15 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
         remove_trtllm = True
         if remove_trtllm:
             backends.remove("trtllm-gen")
+    if "trtllm-gen-native" in backends:
+        remove_trtllm_native = False
+        if not (head_dim_qk == 192 and head_dim_vo == 128):
+            print(
+                "[INFO] trtllm-gen-native backend requires head_dim_qk == 192 and head_dim_vo == 128"
+            )
+            remove_trtllm_native = True
+        if remove_trtllm_native:
+            backends.remove("trtllm-gen-native")
 
     if len(backends) == 0:
         print("[ERROR] No backends to test. Exiting.")
@@ -1371,6 +1392,26 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 batch_offsets_o=o_indptr,
                 batch_offsets_stats=batch_offsets_stats,
                 is_cuda_graph_compatible=True,
+            )[0]
+        elif backend == "trtllm-gen-native":
+            return flashinfer.prefill.trtllm_ragged_attention_deepseek(
+                query=q,
+                key=k,
+                value=v,
+                workspace_buffer=workspace_buffer,
+                seq_lens=actual_seq_lens_kv_device,
+                max_q_len=s_qo,
+                max_kv_len=s_kv,
+                bmm1_scale=scale,
+                bmm2_scale=1.0,
+                o_sf_scale=-1,
+                batch_size=batch_size,
+                window_left=-1,
+                cum_seq_lens_q=qo_indptr,
+                cum_seq_lens_kv=kv_indptr,
+                enable_pdl=False,
+                is_causal=causal,
+                return_lse=True,
             )[0]
         else:
             print(f"[ERROR] Backend {backend} not supported")

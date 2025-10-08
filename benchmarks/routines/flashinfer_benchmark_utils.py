@@ -177,8 +177,8 @@ routine_cc_to_supported_backends = {
         "8.6": ["fa2", "cudnn"],
         "8.9": ["fa2", "cudnn"],
         "9.0": ["fa2", "fa3", "cudnn"],
-        "10.0": ["fa2", "cudnn", "trtllm-gen"],
-        "10.3": ["fa2", "cudnn", "trtllm-gen"],
+        "10.0": ["fa2", "cudnn", "trtllm-gen", "trtllm-gen-native"],
+        "10.3": ["fa2", "cudnn", "trtllm-gen", "trtllm-gen-native"],
         "12.0": ["fa2", "cudnn"],
     },
     "BatchPrefillWithRaggedKVCacheWrapper": {
@@ -187,8 +187,8 @@ routine_cc_to_supported_backends = {
         "8.6": ["fa2", "cudnn"],
         "8.9": ["fa2", "cudnn"],
         "9.0": ["fa2", "fa3", "cudnn"],
-        "10.0": ["fa2", "cudnn", "cutlass"],
-        "10.3": ["fa2", "cudnn", "cutlass"],
+        "10.0": ["fa2", "cudnn", "cutlass", "trtllm-gen", "trtllm-gen-native"],
+        "10.3": ["fa2", "cudnn", "cutlass", "trtllm-gen", "trtllm-gen-native"],
         "12.0": ["fa2", "cudnn"],
     },
     "BatchMLAPagedAttentionWrapper": {
