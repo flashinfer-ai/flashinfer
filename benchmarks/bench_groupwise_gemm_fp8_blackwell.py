@@ -170,7 +170,9 @@ def bench_groupwise_gemm_fp8_blackwell(m, n, k, in_dtype, out_dtype):
     gemm_fp8_nt_groupwise(a, b, a_scale, b_scale, out=out, scale_major_mode="MN")
 
     measurements = bench_gpu_time(
-        lambda: gemm_fp8_nt_groupwise(a, b, a_scale, b_scale, out=out, scale_major_mode="MN")
+        lambda: gemm_fp8_nt_groupwise(
+            a, b, a_scale, b_scale, out=out, scale_major_mode="MN"
+        )
     )
     ms = np.median(measurements)
     tflops_per_second = 2 * m * n * k * 1e-9 / ms

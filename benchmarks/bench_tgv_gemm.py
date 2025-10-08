@@ -99,7 +99,9 @@ def test_tgv_gemm_bf16_sm100_perf():
         torch.cuda.synchronize()
         end_time = time.time()
         cublas_avg_time = (end_time - start_time) / 100
-        print(f"CUBLAS average time: {cublas_avg_time * 1000:.6f} ms, {flops/cublas_avg_time:.3f} TFLOPS")
+        print(
+            f"CUBLAS average time: {cublas_avg_time * 1000:.6f} ms, {flops / cublas_avg_time:.3f} TFLOPS"
+        )
 
         # Warmup
         with autotune(tune_mode=True):
@@ -128,7 +130,7 @@ def test_tgv_gemm_bf16_sm100_perf():
 
         tgv_avg_time = (end_time - start_time) / 100
         print(
-            f"TGV average time: {tgv_avg_time * 1000:.6f} ms, {flops/tgv_avg_time:.3f} TFLOPS, speedup: {cublas_avg_time / tgv_avg_time:.2f}x"
+            f"TGV average time: {tgv_avg_time * 1000:.6f} ms, {flops / tgv_avg_time:.3f} TFLOPS, speedup: {cublas_avg_time / tgv_avg_time:.2f}x"
         )
 
         # Test with PDL
@@ -151,7 +153,7 @@ def test_tgv_gemm_bf16_sm100_perf():
 
         pdl_avg_time = (end_time - start_time) / 100
         print(
-            f"PDL average time: {pdl_avg_time * 1000:.6f} ms, {flops/pdl_avg_time:.3f} TFLOPS, speedup: {cublas_avg_time / pdl_avg_time:.2f}x"
+            f"PDL average time: {pdl_avg_time * 1000:.6f} ms, {flops / pdl_avg_time:.3f} TFLOPS, speedup: {cublas_avg_time / pdl_avg_time:.2f}x"
         )
 
         # Store results for CSV
