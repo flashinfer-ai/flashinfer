@@ -10,8 +10,6 @@ on:
         description: 'Date suffix for dev version (YYYYMMDD, leave empty for today)'
         required: false
         type: string
-  pull_request:
-    # TODO: Remove this before merging - only for debugging this PR
 
 jobs:
   setup:
