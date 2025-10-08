@@ -41,21 +41,21 @@ def generate_build_meta() -> None:
 
 ext_modules: List[setuptools.Extension] = []
 cmdclass: Mapping[str, type[setuptools.Command]] = {}
-install_requires = [
-    "numpy",
-    "torch",
-    "ninja",
-    "requests",
-    "nvidia-ml-py",
-    "einops",
-    "click",
-    "tqdm",
-    "tabulate",
-    "apache-tvm-ffi==0.1.0b15",
-    "packaging>=24.2",
-    "nvidia-cudnn-frontend>=1.13.0",
-    "nvidia-cutlass-dsl>=4.2.1",
-]
+
+
+def get_install_requires() -> List[str]:
+    """Read install requirements from requirements.txt."""
+    requirements_file = root / "requirements.txt"
+    if not requirements_file.exists():
+        return []
+    return [
+        line.strip()
+        for line in requirements_file.read_text().splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+
+
+install_requires = get_install_requires()
 generate_build_meta()
 
 
