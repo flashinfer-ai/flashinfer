@@ -8,13 +8,16 @@ on:
     paths:
       - 'docker/**'
       - '.github/workflows/release-ci-docker.yml'
+      - 'requirements.txt'
+      - '.github/workflows/release-ci-docker.yml'
   pull_request:
     branches:
       - main
     paths:
       - 'docker/**'
       - '.github/workflows/release-ci-docker.yml'
-
+      - 'requirements.txt'
+      - '.github/workflows/release-ci-docker.yml'
 jobs:
   generate-tag:
     runs-on: ubuntu-latest
