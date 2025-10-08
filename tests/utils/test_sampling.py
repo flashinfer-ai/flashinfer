@@ -379,7 +379,7 @@ def test_top_k_top_p_sampling_from_probs_logits_alignment(batch_size, vocab_size
     )
 
     num_matches = (samples == samples_ref).sum().item()
-    match_rate = num_matches / batch_size
+    match_rate = num_matches / samples.numel()
 
     # NOTE(Zihao): Applying softmax followed by top_k_renorm (softmax -> top_k_renorm)
     # does not guarantee bitwise-identical results compared to top_k_mask followed by softmax (top_k_mask -> softmax).
@@ -389,7 +389,6 @@ def test_top_k_top_p_sampling_from_probs_logits_alignment(batch_size, vocab_size
         f"Sample match rate {match_rate:.2%} is below threshold "
         f"({batch_size - num_matches}/{batch_size} mismatches, expected <=1%)"
     )
-    assert torch.all(samples == samples_ref)
 
 
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
