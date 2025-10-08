@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,13 +18,13 @@
 #include <cuda.h>
 #include <cuda_fp16.h>
 
+#include "../../include/moe_gemm_kernels.h"
 #include "../moe_tma_warp_specialized_traits.h"
 #include "cute/tensor.hpp"
 #include "cutlass/array.h"
 #include "cutlass/cutlass.h"
 #include "cutlass/epilogue/collective/collective_builder.hpp"
-#include "cutlass/epilogue/collective/default_epilogue.hpp"
-#include "cutlass/epilogue/thread/linear_combination.h"
+#include "cutlass/epilogue/fusion/operations.hpp"
 #include "cutlass/gemm/collective/collective_builder.hpp"
 #include "cutlass/gemm/device/gemm_grouped.h"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
@@ -33,14 +33,7 @@
 #include "cutlass/gemm/kernel/default_gemm_grouped.h"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
 #include "cutlass/numeric_conversion.h"
-#include "cutlass/tensor_ref.h"
-#include "cutlass_extensions/compute_occupancy.h"
-#include "cutlass_extensions/epilogue/collective/epilogue_moe_finalize.hpp"
-#include "cutlass_extensions/epilogue_helpers.h"
-#include "cutlass_extensions/gemm/kernel/default_fpA_intB_traits.h"
-#include "cutlass_extensions/gemm/kernel/moe_cutlass_kernel.h"
-#include "cutlass_extensions/gemm/threadblock/default_mma.h"
-#include "moe_gemm_kernels.h"
+#include "cutlass_extensions/epilogue/fusion/sm90_visitor_scatter.hpp"
 #include "moe_gemm_tma_ws_launcher.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -58,7 +51,8 @@
 
 namespace tensorrt_llm {
 namespace kernels {
-namespace cutlass_kernels {
+namespace cutlass_kernels_oss {
+using namespace tensorrt_llm::kernels::cutlass_kernels;
 using EpilogueFusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion;
 
 // Constructs an object with specific arguments only if flag is true
@@ -76,8 +70,18 @@ ReturnType construct_if_true(Args&&... args) {
 template <bool FLAG, class GemmGrouped, bool A>
 auto deduce_layout_sf() {
   if constexpr (FLAG && A) {
+    // In moe_kernels.cu we rely on these two types being the same. This is not necessarily
+    // guaranteed by cutlass so we have a sanity check here.
+    static_assert(std::is_same_v<typename GemmGrouped::GemmKernel::CollectiveMainloop::LayoutSFA,
+                                 typename GemmGrouped::GemmKernel::CollectiveMainloop::LayoutSFB>,
+                  "Deduced layout SF does not match for A and B");
     return typename GemmGrouped::GemmKernel::CollectiveMainloop::LayoutSFA{};
   } else if constexpr (FLAG && !A) {
+    // In moe_kernels.cu we rely on these two types being the same. This is not necessarily
+    // guaranteed by cutlass so we have a sanity check here.
+    static_assert(std::is_same_v<typename GemmGrouped::GemmKernel::CollectiveMainloop::LayoutSFA,
+                                 typename GemmGrouped::GemmKernel::CollectiveMainloop::LayoutSFB>,
+                  "Deduced layout SF does not match for A and B");
     return typename GemmGrouped::GemmKernel::CollectiveMainloop::LayoutSFB{};
   } else {
     return (void*)nullptr;
@@ -85,18 +89,21 @@ auto deduce_layout_sf() {
 }
 
 template <typename ArchTag, typename T, typename WeightType, typename OutputType,
-          typename EpilogueTag, EpilogueFusion FUSION, typename TileShape, typename ClusterShape,
-          bool IsMXFPX, bool BIAS>
+          typename EpilogueSchedule, typename EpilogueTag, EpilogueFusion FUSION,
+          typename TileShape, typename ClusterShape, bool IsMXFPX, bool DYNAMIC_CGA, bool BIAS,
+          bool SwapAB>
 struct DispatchToTmaWSFunction {};
 
 // TMA WS specialized version
 template <typename ArchTag, typename T, typename WeightType, typename OutputType,
-          typename EpilogueTag, EpilogueFusion FUSION, typename TileShape, typename ClusterShape,
-          bool IsMXFPX, bool BIAS>
+          typename EpilogueSchedule, typename EpilogueTag, EpilogueFusion FUSION,
+          typename TileShape, typename ClusterShape, bool IsMXFPX, bool DYNAMIC_CGA, bool BIAS,
+          bool SwapAB>
 void tma_warp_specialized_generic_moe_gemm_kernelLauncher(
     TmaWarpSpecializedGroupedGemmInput tma_ws_input, int num_experts,
     int const multi_processor_count, cudaStream_t stream, int* kernel_occupancy,
-    size_t* workspace_size) {
+    size_t* workspace_size, cute::Shape<int32_t, int32_t, cute::_1> dynamic_cluster_shape,
+    cute::Shape<int32_t, int32_t, cute::_1> fallback_cluster_shape) {
   if constexpr (ArchTag::kMinComputeCapability < 90) {
     TLLM_THROW("Invalid architecture instantiated");
   }
@@ -115,6 +122,14 @@ void tma_warp_specialized_generic_moe_gemm_kernelLauncher(
         "build_wheel.py.");
   }
 #endif
+#ifndef COMPILE_BLACKWELL_SM103_TMA_GROUPED_GEMMS
+  else if constexpr (ArchTag::kMinComputeCapability == 103) {
+    // fallback sm100f logic is done in dispatchMoeGemmFinalDispatchTmaWarpSpecialized
+    TLLM_THROW(
+        "Please recompile with support for blackwell by passing 103-real as an arch to "
+        "build_wheel.py.");
+  }
+#endif
 #ifndef COMPILE_BLACKWELL_SM120_TMA_GROUPED_GEMMS
   else if constexpr (ArchTag::kMinComputeCapability >= 120) {
     TLLM_THROW(
@@ -123,10 +138,13 @@ void tma_warp_specialized_generic_moe_gemm_kernelLauncher(
   }
 #endif
   else {
-    return DispatchToTmaWSFunction<ArchTag, T, WeightType, OutputType, EpilogueTag, FUSION,
-                                   TileShape, ClusterShape, IsMXFPX,
-                                   BIAS>::op(tma_ws_input, num_experts, multi_processor_count,
-                                             stream, kernel_occupancy, workspace_size);
+    return DispatchToTmaWSFunction<ArchTag, T, WeightType, OutputType, EpilogueSchedule,
+                                   EpilogueTag, FUSION, TileShape, ClusterShape, IsMXFPX,
+                                   DYNAMIC_CGA, BIAS, SwapAB>::op(tma_ws_input, num_experts,
+                                                                  multi_processor_count, stream,
+                                                                  kernel_occupancy, workspace_size,
+                                                                  dynamic_cluster_shape,
+                                                                  fallback_cluster_shape);
   }
 }
 
@@ -163,6 +181,8 @@ using SafeBF16 = __nv_bfloat16;
 #else
 using SafeBF16 = void;
 #endif
+
+using namespace cutlass::epilogue;
 
 // TODO Revert this back to a template instantiation once compiler bug is resolved
 #define INSTANTIATE_TMA_WARP_SPECIALIZED_MOE_GEMM(                                                                                                                                                                                                                                                                      \
@@ -286,10 +306,15 @@ using SafeBF16 = void;
       using ElementSF = std::conditional_t<                                                                                                                                                                                                                                                                             \
           IsMXFPX, cutlass::float_ue8m0_t,                                                                                                                                                                                                                                                                              \
           cutlass::float_ue4m3_t>; /*TmaWarpSpecializedGroupedGemmInput::ElementSF;*/                                                                                                                                                                                                                                   \
-      using ElementActBlockScaled = std::conditional_t<IsSM120, cutlass::nv_float4_t<ElementAct>,                                                                                                                                                                                                                       \
-                                                       cute::tuple<ElementAct, ElementSF>>;                                                                                                                                                                                                                             \
+      using ElementActBlockScaled =                                                                                                                                                                                                                                                                                     \
+          std::conditional_t<IsSM120,                                                                                                                                                                                                                                                                                   \
+                             std::conditional_t<IsMXFPX, cutlass::mx_float8_t<ElementAct>,                                                                                                                                                                                                                              \
+                                                cutlass::nv_float4_t<ElementAct>>,                                                                                                                                                                                                                                      \
+                             cute::tuple<ElementAct, ElementSF>>;                                                                                                                                                                                                                                                       \
       using ElementWeightBlockScaled =                                                                                                                                                                                                                                                                                  \
-          std::conditional_t<IsSM120, cutlass::nv_float4_t<ElementWeight>,                                                                                                                                                                                                                                              \
+          std::conditional_t<IsSM120,                                                                                                                                                                                                                                                                                   \
+                             std::conditional_t<IsMXFPX, cutlass::mx_float4_t<ElementWeight>,                                                                                                                                                                                                                           \
+                                                cutlass::nv_float4_t<ElementWeight>>,                                                                                                                                                                                                                                   \
                              cute::tuple<ElementWeight, ElementSF>>;                                                                                                                                                                                                                                                    \
                                                                                                                                                                                                                                                                                                                         \
       /* Activation matrix alignment */                                                                                                                                                                                                                                                                                 \
@@ -704,6 +729,6 @@ using SafeBF16 = void;
                        cute::Shape<int32_t, int32_t, cute::_1> dynamic_cluster_shape,                                                                                                                                                                                                                                   \
                        cute::Shape<int32_t, int32_t, cute::_1> fallback_cluster_shape);
 
-}  // namespace cutlass_kernels
+}  // namespace cutlass_kernels_oss
 }  // namespace kernels
 }  // namespace tensorrt_llm
