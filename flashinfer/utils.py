@@ -450,28 +450,11 @@ def has_cuda_cudart() -> bool:
     return importlib.util.find_spec("cuda.cudart") is not None
 
 
-def has_flashinfer_jit_cache() -> bool:
-    """
-    Check if flashinfer_jit_cache module is available.
-
-    Returns:
-        True if flashinfer_jit_cache exists, False otherwise
-    """
-    import importlib.util
-
-    return importlib.util.find_spec("flashinfer_jit_cache") is not None
-
-
-def has_flashinfer_cubin() -> bool:
-    """
-    Check if flashinfer_cubin module is available.
-
-    Returns:
-        True if flashinfer_cubin exists, False otherwise
-    """
-    import importlib.util
-
-    return importlib.util.find_spec("flashinfer_cubin") is not None
+# Re-export from jit.env to avoid circular dependency
+from .jit.env import (
+    has_flashinfer_jit_cache as has_flashinfer_jit_cache,
+    has_flashinfer_cubin as has_flashinfer_cubin,
+)
 
 
 def get_cuda_python_version() -> str:

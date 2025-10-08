@@ -22,7 +22,31 @@ import os
 import pathlib
 from ..compilation_context import CompilationContext
 from ..version import __version__ as flashinfer_version
-from ..utils import has_flashinfer_jit_cache, has_flashinfer_cubin
+
+
+def has_flashinfer_jit_cache() -> bool:
+    """
+    Check if flashinfer_jit_cache module is available.
+
+    Returns:
+        True if flashinfer_jit_cache exists, False otherwise
+    """
+    import importlib.util
+
+    return importlib.util.find_spec("flashinfer_jit_cache") is not None
+
+
+def has_flashinfer_cubin() -> bool:
+    """
+    Check if flashinfer_cubin module is available.
+
+    Returns:
+        True if flashinfer_cubin exists, False otherwise
+    """
+    import importlib.util
+
+    return importlib.util.find_spec("flashinfer_cubin") is not None
+
 
 FLASHINFER_BASE_DIR: pathlib.Path = pathlib.Path(
     os.getenv("FLASHINFER_WORKSPACE_BASE", pathlib.Path.home().as_posix())
