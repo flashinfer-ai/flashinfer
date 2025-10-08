@@ -513,7 +513,7 @@ def gen_trtllm_low_latency_gemm_module() -> JitSpec:
     # make sure "flashinferMetaInfo.h" is downloaded or cached
     assert metainfo, f"{header_name}.h not found"
     return gen_jit_spec(
-        "trtllm_gemm",
+        "trtllm_low_latency_gemm",
         [
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_low_latency_gemm_runner.cu",
         ],
