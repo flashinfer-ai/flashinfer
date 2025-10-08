@@ -105,7 +105,23 @@ Nightly builds are available for testing the latest features:
 .. code-block:: bash
 
     # Core and cubin packages
-    pip install -U --pre flashinfer-python flashinfer-cubin --index-url https://flashinfer.ai/whl/nightly/
-
+    pip install -U --pre flashinfer-python --extra-index-url https://flashinfer.ai/whl/nightly/
+    pip install -U --pre flashinfer-cubin --index-url https://flashinfer.ai/whl/nightly/
     # JIT cache package (replace cu129 with your CUDA version: cu128, cu129, or cu130)
     pip install -U --pre flashinfer-jit-cache --index-url https://flashinfer.ai/whl/nightly/cu129
+
+Verify Installation
+^^^^^^^^^^^^^^^^^^^
+
+After installation, verify that FlashInfer is correctly installed and configured:
+
+.. code-block:: bash
+
+    flashinfer show-config
+
+This command displays:
+
+- FlashInfer version and installed packages (flashinfer-python, flashinfer-cubin, flashinfer-jit-cache)
+- PyTorch and CUDA version information
+- Environment variables and artifact paths
+- Downloaded cubin status and module compilation status

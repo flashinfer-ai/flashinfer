@@ -29,7 +29,9 @@ from .jit.cubin_loader import FLASHINFER_CUBINS_REPOSITORY
 from .jit.env import FLASHINFER_CACHE_DIR, FLASHINFER_CUBIN_DIR
 from .jit.core import current_compilation_context
 from .jit.cpp_ext import get_cuda_path, get_cuda_version
-from . import __version__
+
+# Import __version__ from centralized version module
+from .version import __version__
 
 
 def _download_cubin():

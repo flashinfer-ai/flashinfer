@@ -22,7 +22,7 @@ import os
 import pathlib
 import importlib.util
 from ..compilation_context import CompilationContext
-from .. import __version__ as flashinfer_version
+from ..version import __version__ as flashinfer_version
 
 FLASHINFER_BASE_DIR: pathlib.Path = pathlib.Path(
     os.getenv("FLASHINFER_WORKSPACE_BASE", pathlib.Path.home().as_posix())

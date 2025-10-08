@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 from dataclasses import dataclass
+import logging
 import os
 import re
 import time
@@ -23,7 +24,12 @@ from typing import Generator
 import requests  # type: ignore[import-untyped]
 import shutil
 
-from .jit.core import logger
+# Create logger for artifacts module to avoid circular import with jit.core
+logger = logging.getLogger("flashinfer.artifacts")
+logger.setLevel(os.getenv("FLASHINFER_LOGGING_LEVEL", "INFO").upper())
+if not logger.handlers:
+    logger.addHandler(logging.StreamHandler())
+
 from .jit.cubin_loader import (
     FLASHINFER_CUBINS_REPOSITORY,
     download_file,

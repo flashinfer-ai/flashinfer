@@ -23,6 +23,9 @@ urls = { Homepage = "https://github.com/flashinfer-ai/flashinfer" }
 dynamic = ["dependencies", "version"]
 license-files = ["LICENSE", "licenses/*"]
 
+[project.scripts]
+flashinfer = "flashinfer.__main__:cli"
+
 [build-system]
 requires = ["setuptools>=77", "packaging>=24", "apache-tvm-ffi==0.1.0b15"]
 build-backend = "build_backend"
