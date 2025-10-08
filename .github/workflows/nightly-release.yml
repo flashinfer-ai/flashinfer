@@ -331,8 +331,8 @@ jobs:
         run: |
           DOCKER_IMAGE="flashinfer/flashinfer-ci-${{ steps.docker-tag.outputs.cuda_version }}:${{ steps.docker-tag.outputs.tag }}"
           bash ci/bash.sh ${DOCKER_IMAGE} \
-            -e TEST_SHARD=${{ matrix.test-shard }} \
-            -e FLASHINFER_JIT_CACHE_REPORT_FILE=/workspace/jit_cache_report_shard${{ matrix.test-shard }}_cuda${{ matrix.cuda }}.json \
+            -e TEST_SHARD ${{ matrix.test-shard }} \
+            -e FLASHINFER_JIT_CACHE_REPORT_FILE /workspace/jit_cache_report_shard${{ matrix.test-shard }}_cuda${{ matrix.cuda }}.json \
             ./scripts/task_test_nightly_build.sh
 
       - name: Upload JIT cache report
