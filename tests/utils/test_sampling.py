@@ -377,6 +377,17 @@ def test_top_k_top_p_sampling_from_probs_logits_alignment(batch_size, vocab_size
         filter_apply_order="top_k_first",
         generator=generator_probs,
     )
+
+    num_matches = (samples == samples_ref).sum().item()
+    match_rate = num_matches / batch_size
+
+    # NOTE(Zihao): the softmax -> top_k_renorm vs top_k_mask -> softmax
+    # might have slight difference thus rendering the next top-p sampling
+    # to be slightly different. We allow up to 1% mismatch rate.
+    assert match_rate >= 0.99, (
+        f"Sample match rate {match_rate:.2%} is below threshold "
+        f"({batch_size - num_matches}/{batch_size} mismatches, expected <=1%)"
+    )
     assert torch.all(samples == samples_ref)
 
 
