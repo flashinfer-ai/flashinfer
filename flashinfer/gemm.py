@@ -1198,7 +1198,7 @@ def build_cudnn_gemm_block_scale_dequantize_graph(
     o_type,
     block_size,
     device,
-    alpha,
+    alpha_is_not_none,
     use_nvfp4,
 ):
     _check_cudnn_availability()
@@ -1251,7 +1251,7 @@ def build_cudnn_gemm_block_scale_dequantize_graph(
 
         c_final_cudnn_tensor = c_tensor
 
-        if alpha is not None:
+        if alpha_is_not_none:
             global_scale_cudnn_tensor = graph.tensor(
                 name="global_scale",
                 dim=(1, 1, 1),
@@ -1280,7 +1280,7 @@ def build_cudnn_gemm_block_scale_dequantize_graph(
 
         # WAR: The alpha (contains the global scale) is not supported by the cuBLAS backend (eng0)
         # in older cuDNN versions, so we deselect it.
-        if (alpha is not None) and (not _is_cublas_fp4_available_in_cudnn()):
+        if (alpha_is_not_none) and (not _is_cublas_fp4_available_in_cudnn()):
             graph.deselect_engines(["eng0"])
         graph.check_support()
         graph.build_plans()
@@ -1710,7 +1710,7 @@ def mm_fp4(
             _torch_data_type_to_cudnn_data_type(out_dtype),
             block_size,
             a.device,
-            alpha,
+            alpha is not None,
             use_nvfp4,
         )
 
