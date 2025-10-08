@@ -17,7 +17,6 @@ limitations under the License.
 from abc import ABC, abstractmethod
 from enum import IntEnum
 from typing import Dict
-
 import pytest
 import torch
 from cuda.bindings import runtime
@@ -1839,7 +1838,7 @@ def cache_permute_indices():
 
 @pytest.mark.parametrize("num_tokens", [1, 8, 1024])
 @pytest.mark.parametrize("hidden_size", [1024, 8192])
-@pytest.mark.parametrize("intermediate_size", [2048, 1024, 768, 384])
+@pytest.mark.parametrize("intermediate_size", [384, 768, 1024, 2048])
 @pytest.mark.parametrize(
     "moe_impl",
     [
@@ -2243,36 +2242,4 @@ def test_moe_quantization_classes(
         atol=tolerances["atol"],
         rtol=tolerances["rtol"],
         percent=tolerances["percent"],
-    )
-
-
-if __name__ == "__main__":
-    # pytest.main([__file__, "-v"])
-    routing_config = {
-        "num_experts": 256,
-        "top_k": 8,
-        "padding": 8,
-        "n_groups": 8,
-        "top_k_groups": 4,
-        "routed_scaling": 2.5,
-        "has_routing_bias": True,
-        "routing_method_type": RoutingMethodType.DeepSeekV3,
-        "compatible_moe_impls": [
-            FP8BlockScaleMoe,
-        ],
-    }
-    weight_processing = {
-        "use_shuffled_weight": False,
-        "layout": WeightLayout.MajorK,
-        "compatible_moe_impls": [FP8BlockScaleMoe],
-    }
-    test_moe_quantization_classes(
-        num_tokens=4,
-        hidden_size=1024,
-        intermediate_size=1024,
-        moe_impl=FP8BlockScaleMoe(),
-        routing_config=routing_config,
-        weight_processing=weight_processing,
-        gated_act_type=GatedActType.SwiGlu,
-        cache_permute_indices=cache_permute_indices,
     )
