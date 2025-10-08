@@ -23,18 +23,19 @@ import flashinfer
 from flashinfer.utils import get_compute_capability
 
 
-@pytest.fixture(autouse=True, scope="module")
+@pytest.fixture(
+    autouse=importlib.util.find_spec("flashinfer_jit_cache") is None,
+    scope="module",
+)
 def warmup_jit():
-    # Skip warmup if flashinfer_jit_cache package is installed
-    if importlib.util.find_spec("flashinfer_jit_cache") is None:
-        flashinfer.jit.build_jit_specs(
-            [
-                flashinfer.activation.gen_act_and_mul_module("silu"),
-                flashinfer.activation.gen_act_and_mul_module("gelu"),
-                flashinfer.activation.gen_act_and_mul_module("gelu_tanh"),
-            ],
-            verbose=False,
-        )
+    flashinfer.jit.build_jit_specs(
+        [
+            flashinfer.activation.gen_act_and_mul_module("silu"),
+            flashinfer.activation.gen_act_and_mul_module("gelu"),
+            flashinfer.activation.gen_act_and_mul_module("gelu_tanh"),
+        ],
+        verbose=False,
+    )
     yield
 
 

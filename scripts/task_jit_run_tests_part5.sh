@@ -10,6 +10,5 @@ if [ "$SKIP_INSTALL" = "0" ]; then
   pip install -e . -v
 fi
 
-# Run all tests in a single pytest session for better coverage reporting
-pytest -s \
-  tests/utils/test_logits_processor.py
+# Run each test file separately to isolate CUDA memory issues
+pytest -s tests/utils/test_logits_processor.py

@@ -26,14 +26,15 @@ DTYPES = [torch.float16]
 CUDA_DEVICES = ["cuda:0"]
 
 
-@pytest.fixture(autouse=True, scope="module")
+@pytest.fixture(
+    autouse=importlib.util.find_spec("flashinfer_jit_cache") is None,
+    scope="module",
+)
 def warmup_jit():
-    # Skip warmup if flashinfer_jit_cache package is installed
-    if importlib.util.find_spec("flashinfer_jit_cache") is None:
-        jit_specs = [flashinfer.gemm.gen_gemm_module()]
-        if is_sm90a_supported(torch.device("cuda:0")):
-            jit_specs.append(flashinfer.gemm.gen_gemm_sm90_module())
-        flashinfer.jit.build_jit_specs(jit_specs, verbose=False)
+    jit_specs = [flashinfer.gemm.gen_gemm_module()]
+    if is_sm90a_supported(torch.device("cuda:0")):
+        jit_specs.append(flashinfer.gemm.gen_gemm_sm90_module())
+    flashinfer.jit.build_jit_specs(jit_specs, verbose=False)
     yield
 
 

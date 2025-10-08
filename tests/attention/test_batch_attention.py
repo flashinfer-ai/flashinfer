@@ -28,28 +28,29 @@ from tests.test_helpers.jit_utils import (
 from flashinfer.utils import get_compute_capability
 
 
-@pytest.fixture(autouse=True, scope="module")
+@pytest.fixture(
+    autouse=importlib.util.find_spec("flashinfer_jit_cache") is None,
+    scope="module",
+)
 def warmup_jit():
-    # Skip warmup if flashinfer_jit_cache package is installed
-    if importlib.util.find_spec("flashinfer_jit_cache") is None:
-        flashinfer.jit.build_jit_specs(
-            gen_persistent_batch_attention_modules(
-                [torch.float16, torch.bfloat16],  # q_dtypes
-                [torch.float16, torch.bfloat16],  # kv_dtypes
-                [64, 128, 256],  # head_dims
-                [False, True],  # use_logits_soft_cap
-            )
-            + gen_prefill_attention_modules(
-                [torch.float16, torch.bfloat16],  # q_dtypes
-                [torch.float16, torch.bfloat16],  # kv_dtypes
-                [64, 128, 256],  # head_dims
-                [0],  # pos_encoding_modes
-                [False],  # use_sliding_windows
-                [False, True],  # use_logits_soft_caps
-                [False],  # use_fp16_qk_reductions
-            ),
-            verbose=False,
+    flashinfer.jit.build_jit_specs(
+        gen_persistent_batch_attention_modules(
+            [torch.float16, torch.bfloat16],  # q_dtypes
+            [torch.float16, torch.bfloat16],  # kv_dtypes
+            [64, 128, 256],  # head_dims
+            [False, True],  # use_logits_soft_cap
         )
+        + gen_prefill_attention_modules(
+            [torch.float16, torch.bfloat16],  # q_dtypes
+            [torch.float16, torch.bfloat16],  # kv_dtypes
+            [64, 128, 256],  # head_dims
+            [0],  # pos_encoding_modes
+            [False],  # use_sliding_windows
+            [False, True],  # use_logits_soft_caps
+            [False],  # use_fp16_qk_reductions
+        ),
+        verbose=False,
+    )
 
 
 # -------------------------  Configuration generation function  ----------------------------- #

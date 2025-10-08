@@ -10,11 +10,10 @@ if [ "$SKIP_INSTALL" = "0" ]; then
   pip install -e . -v
 fi
 
-# Run all tests in a single pytest session for better coverage reporting
-pytest -s \
-  tests/attention/test_logits_cap.py \
-  tests/attention/test_sliding_window.py \
-  tests/attention/test_tensor_cores_decode.py \
-  tests/attention/test_batch_decode_kernels.py
+# Run each test file separately to isolate CUDA memory issues
+pytest -s tests/attention/test_logits_cap.py
+pytest -s tests/attention/test_sliding_window.py
+pytest -s tests/attention/test_tensor_cores_decode.py
+pytest -s tests/attention/test_batch_decode_kernels.py
 # pytest -s tests/gemm/test_group_gemm.py
 # pytest -s tests/attention/test_alibi.py

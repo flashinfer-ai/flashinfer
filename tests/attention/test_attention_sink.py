@@ -28,30 +28,31 @@ from flashinfer.jit.attention.variants import attention_sink_decl
 from flashinfer.utils import is_sm90a_supported
 
 
-@pytest.fixture(autouse=True, scope="module")
+@pytest.fixture(
+    autouse=importlib.util.find_spec("flashinfer_jit_cache") is None,
+    scope="module",
+)
 def warmup_jit():
-    # Skip warmup if flashinfer_jit_cache package is installed
-    if importlib.util.find_spec("flashinfer_jit_cache") is None:
-        jit_specs = []
-        for dtype in [torch.float16, torch.bfloat16]:
-            for backend in ["fa2", "fa3"]:
-                for use_swa in [True, False]:
-                    for head_dim in [128]:
-                        jit_specs.append(
-                            gen_batch_prefill_attention_sink_module(
-                                backend=backend,
-                                dtype_q=dtype,
-                                dtype_kv=dtype,
-                                dtype_o=dtype,
-                                dtype_idx=torch.int32,
-                                head_dim_qk=head_dim,
-                                head_dim_vo=head_dim,
-                                pos_encoding_mode=0,
-                                use_sliding_window=use_swa,
-                            )
+    jit_specs = []
+    for dtype in [torch.float16, torch.bfloat16]:
+        for backend in ["fa2", "fa3"]:
+            for use_swa in [True, False]:
+                for head_dim in [128]:
+                    jit_specs.append(
+                        gen_batch_prefill_attention_sink_module(
+                            backend=backend,
+                            dtype_q=dtype,
+                            dtype_kv=dtype,
+                            dtype_o=dtype,
+                            dtype_idx=torch.int32,
+                            head_dim_qk=head_dim,
+                            head_dim_vo=head_dim,
+                            pos_encoding_mode=0,
+                            use_sliding_window=use_swa,
                         )
+                    )
 
-        flashinfer.jit.build_jit_specs(jit_specs)
+    flashinfer.jit.build_jit_specs(jit_specs)
     yield
 
 

@@ -1,5 +1,7 @@
+import json
 import os
 import types
+from pathlib import Path
 from typing import Any, Dict, Set
 
 import pytest
@@ -13,6 +15,9 @@ from flashinfer.jit import MissingJITCacheError
 # Global tracking for JIT cache coverage
 # Store tuples of (test_name, module_name, spec_info)
 _MISSING_JIT_CACHE_MODULES: Set[tuple] = set()
+
+# File path for aggregating JIT cache info across multiple pytest runs
+_JIT_CACHE_REPORT_FILE = os.environ.get("FLASHINFER_JIT_CACHE_REPORT_FILE", None)
 
 TORCH_COMPILE_FNS = [
     flashinfer.activation.silu_and_mul,
@@ -167,6 +172,26 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
     if not _MISSING_JIT_CACHE_MODULES:
         return  # No missing modules
 
+    # If report file is specified, write to file for later aggregation
+    # Otherwise, print summary directly
+    if _JIT_CACHE_REPORT_FILE:
+        from filelock import FileLock
+
+        # Convert set to list for JSON serialization
+        data = [
+            {"test_name": test_name, "module_name": module_name, "spec_info": spec_info}
+            for test_name, module_name, spec_info in _MISSING_JIT_CACHE_MODULES
+        ]
+
+        # Use file locking to handle concurrent writes from multiple pytest processes
+        Path(_JIT_CACHE_REPORT_FILE).parent.mkdir(parents=True, exist_ok=True)
+        lock_file = _JIT_CACHE_REPORT_FILE + ".lock"
+        with FileLock(lock_file), open(_JIT_CACHE_REPORT_FILE, "a") as f:
+            for entry in data:
+                f.write(json.dumps(entry) + "\n")
+        return
+
+    # Single pytest run - print summary directly
     terminalreporter.section("flashinfer-jit-cache Package Coverage Report")
     terminalreporter.write_line("")
     terminalreporter.write_line(

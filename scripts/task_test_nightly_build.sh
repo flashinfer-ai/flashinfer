@@ -39,4 +39,10 @@ echo "Verifying installation..."
 # Run test shard
 echo "Running test shard ${TEST_SHARD}..."
 export SKIP_INSTALL=1
+
+# Pass through JIT cache report file if set
+if [ -n "${FLASHINFER_JIT_CACHE_REPORT_FILE}" ]; then
+  export FLASHINFER_JIT_CACHE_REPORT_FILE
+fi
+
 bash scripts/task_jit_run_tests_part${TEST_SHARD}.sh

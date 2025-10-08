@@ -330,7 +330,52 @@ jobs:
           CUDA_VISIBLE_DEVICES: 0
         run: |
           DOCKER_IMAGE="flashinfer/flashinfer-ci-${{ steps.docker-tag.outputs.cuda_version }}:${{ steps.docker-tag.outputs.tag }}"
-          bash ci/bash.sh ${DOCKER_IMAGE} -e TEST_SHARD ${{ matrix.test-shard }} ./scripts/task_test_nightly_build.sh
+          bash ci/bash.sh ${DOCKER_IMAGE} \
+            -e TEST_SHARD=${{ matrix.test-shard }} \
+            -e FLASHINFER_JIT_CACHE_REPORT_FILE=/workspace/jit_cache_report_shard${{ matrix.test-shard }}_cuda${{ matrix.cuda }}.json \
+            ./scripts/task_test_nightly_build.sh
+
+      - name: Upload JIT cache report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jit-cache-report-shard${{ matrix.test-shard }}-cuda${{ matrix.cuda }}
+          path: jit_cache_report_shard${{ matrix.test-shard }}_cuda${{ matrix.cuda }}.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+  jit-cache-summary:
+    needs: test-nightly-build
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Download all JIT cache reports
+        uses: actions/download-artifact@v4
+        with:
+          pattern: jit-cache-report-*
+          path: jit-reports/
+          merge-multiple: true
+
+      - name: Merge and print JIT cache summary
+        run: |
+          # Merge all report files into one
+          mkdir -p merged-reports
+          cat jit-reports/*.json > merged-reports/all_reports.json 2>/dev/null || echo "No JIT cache reports found"
+
+          # Print summary
+          if [ -f merged-reports/all_reports.json ] && [ -s merged-reports/all_reports.json ]; then
+            python scripts/print_jit_cache_summary.py merged-reports/all_reports.json
+          else
+            echo "✅ No missing JIT cache modules - all tests passed!"
+          fi
 
   update-wheel-index:
     needs: [setup, create-release, test-nightly-build]
