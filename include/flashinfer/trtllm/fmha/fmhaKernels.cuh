@@ -191,6 +191,8 @@ class TllmGenFmhaKernel {
       // Prepare the kernel parameters.
       auto kernelParams =
           KernelParams::setKernelParams(params, kernelMeta, maxNumCtasQ, maxNumCtasKv);
+      std::cout << "params.ptrCumSeqLensQ:" << kernelParams.ptrCumSeqLensQ << std::endl;
+      std::cout << "params.ptrCumSeqLensKv:" << kernelParams.ptrCumSeqLensKv << std::endl;
 
       // Prepare kernel parameters list for cuLaunchKernelEx.
       void* kernelParamsList[] = {&kernelParams};
