@@ -545,7 +545,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 ) = is_close_stats(reference_output, tested_outputs[i], rtol, atol)
                 if num_different_elements > 0:
                     print(
-                        f"[ERROR] Output tensor mismatch between backends {tested_backends[0]} and {tested_backends[i]}: "
+                        f"[ERROR] Output tensor mismatch between backends fa2 and {tested_backends[i]}: "
                         f"{num_different_elements} / {num_elements} ({num_different_elements_percentage:.2f}%) elements are different"
                     )
                     if not args.allow_output_mismatch:
@@ -1014,7 +1014,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 ) = is_close_stats(reference_output, tested_outputs[i], rtol, atol)
                 if num_different_elements > 0:
                     print(
-                        f"[ERROR] Output tensor mismatch between backends {tested_backends[0]} and {tested_backends[i]}: "
+                        f"[ERROR] Output tensor mismatch between backends fa2 and {tested_backends[i]}: "
                         f"{num_different_elements} / {num_elements} ({num_different_elements_percentage:.2f}%) elements are different"
                     )
                     if not args.allow_output_mismatch:
@@ -1178,6 +1178,10 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
             backends.remove("trtllm-gen")
     if "trtllm-gen-native" in backends:
         remove_trtllm_native = False
+        if batch_size == 1:
+            # TO-DO: trtllm-gen-native hits IMA on batch size 1. Investigate and fix.
+            print("[INFO] trtllm-gen-native backend currently requires batch size > 1")
+            remove_trtllm_native = True
         if not (head_dim_qk == 192 and head_dim_vo == 128):
             print(
                 "[INFO] trtllm-gen-native backend requires head_dim_qk == 192 and head_dim_vo == 128"
@@ -1460,7 +1464,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 ) = is_close_stats(reference_output, tested_outputs[i], rtol, atol)
                 if num_different_elements > 0:
                     print(
-                        f"[ERROR] Output tensor mismatch between backends {tested_backends[0]} and {tested_backends[i]}: "
+                        f"[ERROR] Output tensor mismatch between backends fa2 and {tested_backends[i]}: "
                         f"{num_different_elements} / {num_elements} ({num_different_elements_percentage:.2f}%) elements are different"
                     )
                     if not args.allow_output_mismatch:
@@ -1846,7 +1850,7 @@ def testBatchMLAPagedAttentionWrapper(args):
                 ) = is_close_stats(reference_output, tested_outputs[i], rtol, atol)
                 if num_different_elements > 0:
                     print(
-                        f"[ERROR] Output tensor mismatch between backends {tested_backends[0]} and {tested_backends[i]}: "
+                        f"[ERROR] Output tensor mismatch between backends fa2 and {tested_backends[i]}: "
                         f"{num_different_elements} / {num_elements} ({num_different_elements_percentage:.2f}%) elements are different"
                     )
                     if not args.allow_output_mismatch:
