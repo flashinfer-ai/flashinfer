@@ -77,10 +77,13 @@ def download_file(
         with lock:
             logger.info(f"Acquired lock for {local_path}")
 
+            temp_path = f"{local_path}.tmp"
+
             # Handle local file copy
             if os.path.exists(source):
                 try:
-                    shutil.copy(source, local_path)
+                    shutil.copy(source, temp_path)
+                    os.replace(temp_path, local_path)  # Atomic rename
                     logger.info(f"File copied successfully: {local_path}")
                     return True
                 except Exception as e:
@@ -93,8 +96,11 @@ def download_file(
                     response = session.get(source, timeout=timeout)
                     response.raise_for_status()
 
-                    with open(local_path, "wb") as file:
+                    with open(temp_path, "wb") as file:
                         file.write(response.content)
+
+                    # Atomic rename to prevent readers from seeing partial writes
+                    os.replace(temp_path, local_path)
 
                     logger.info(
                         f"File downloaded successfully: {source} -> {local_path}"
