@@ -3282,6 +3282,8 @@ def trtllm_ragged_attention_deepseek(
         )
 
     workspace_size = workspace_buffer.numel() * workspace_buffer.element_size()
+    print(f"cum_seq_lens_q: {cum_seq_lens_q}")
+    print(f"cum_seq_lens_kv: {cum_seq_lens_kv}")
     run_func(
         out,
         query,

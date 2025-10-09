@@ -375,6 +375,9 @@ void trtllm_ragged_attention_launcher(
   runner_params.ptrAttentionSinks = attention_sinks;
   runner_params.enable_pdl = enable_pdl;
 
+  std::cout << "mMaxSeqLenQ, mMaxSeqLenKv:" << runner_params.mMaxSeqLenQ << ", " << runner_params.mMaxSeqLenKv << std::endl;
+  std::cout << "runner_params.cumSeqLensQPtr, runner_params.cumSeqLensKvPtr:" << runner_params.cumSeqLensQPtr << ", " << runner_params.cumSeqLensKvPtr << std::endl;
+
   runner_params.kStrideKeysValues = k_stride_keys_values;
   runner_params.kStrideHeads = k_stride_heads;
   runner_params.kStrideBatch = k_stride_batch;
