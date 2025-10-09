@@ -116,14 +116,23 @@ def next_positive_power_of_2(x: int) -> int:
 def calculate_tile_tokens_dim(
     num_tokens: int, num_experts: int, top_k: int, max_tile_tokens_dim: int = 128
 ) -> int:
-    # Guess tokens per expert assuming perfect expert distribution first.
-    num_tokens_per_expert = num_tokens * top_k // num_experts
-
+    # Factor to account for the imbalance of the experts.
+    # factor equals to the
+    # max_real_num_tokens_per_expert / perfect_num_tokens_per_expert
+    # - 1.0 means perfect expert distribution.
+    # - > 1.0 means some experts have more
+    #     tokens than the perfect distribution.
+    # - < 1.0 does not make sense.
+    imbalance_factor = 1.3
+    # Calculate the number of tokens per expert
+    # assuming perfect distribution.
+    num_tokens_per_expert = (num_tokens * top_k) // num_experts
+    # Apply the imbalance factor.
+    num_tokens_per_expert = int(num_tokens_per_expert * imbalance_factor)
     # And pad the number to the next power of 2.
     tile_tokens_dim = next_positive_power_of_2(num_tokens_per_expert)
-    if num_tokens_per_expert > 128 and num_tokens_per_expert < 256:
-        tile_tokens_dim = 192
-    # Cap to 8-max_tile_tokens_dim tokens per CTA tile as it's the range supported by the kernel.
+    # Cap to 8-max_tile_tokens_dim tokens per CTA tile
+    # as it's the range supported by the kernel.
     tile_tokens_dim = min(max(tile_tokens_dim, 8), max_tile_tokens_dim)
     return tile_tokens_dim
 

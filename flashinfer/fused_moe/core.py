@@ -44,13 +44,13 @@ from ..utils import (
     device_support_pdl,
     get_shuffle_matrix_a_row_indices,
     get_shuffle_matrix_sf_a_row_indices,
+    calculate_tile_tokens_dim,
     register_custom_op,
     register_fake_op,
 )
 from .utils import (
     get_last_power_of_2_num_tokens_buckets,
     last_positive_power_of_2,
-    next_positive_power_of_2,
 )
 
 
@@ -894,30 +894,6 @@ def get_trtllm_moe_sm100_module():
             self.gated_act_type = gated_act_type
             self.tile_tokens_dim = tile_tokens_dim
 
-        def get_tile_tokens_dim(
-            self, num_tokens: int, top_k: int, max_tile_tokens_dim: int = 128
-        ):
-            # Factor to account for the imbalance of the experts.
-            # factor equals to the
-            # max_real_num_tokens_per_expert / perfect_num_tokens_per_expert
-            # - 1.0 means perfect expert distribution.
-            # - > 1.0 means some experts have more
-            #     tokens than the perfect distribution.
-            # - < 1.0 does not make sense.
-            imbalance_factor = 1.3
-            # Calculate the number of tokens per expert
-            # assuming perfect distribution.
-            num_tokens_per_expert = (num_tokens * top_k) // self.num_local_experts
-            # Apply the imbalance factor.
-            num_tokens_per_expert = int(num_tokens_per_expert * imbalance_factor)
-            # And pad the number to the next power of 2.
-            tile_tokens_dim = next_positive_power_of_2(num_tokens_per_expert)
-            if num_tokens_per_expert > 128 and num_tokens_per_expert < 256:
-                tile_tokens_dim = 192
-            # Cap to 8-max_tile_tokens_dim tokens per CTA tile as it's the range supported by the kernel.
-            tile_tokens_dim = min(max(tile_tokens_dim, 8), max_tile_tokens_dim)
-            return tile_tokens_dim
-
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
@@ -933,7 +909,12 @@ def get_trtllm_moe_sm100_module():
             ) = inputs
             num_tokens = routing_logits.shape[0]
             tile_tokens_dim = (
-                self.get_tile_tokens_dim(num_tokens, self.top_k, 128)
+                calculate_tile_tokens_dim(
+                    num_tokens,
+                    self.num_local_experts,
+                    self.top_k,
+                    64 if self.dtype_act == DtypeTrtllmGen.Bfloat16 else 128,
+                )
                 if self.tile_tokens_dim is None
                 else self.tile_tokens_dim
             )
@@ -977,7 +958,12 @@ def get_trtllm_moe_sm100_module():
             ) = inputs
             num_tokens = routing_logits.shape[0]
             tile_tokens_dim = (
-                self.get_tile_tokens_dim(num_tokens, self.top_k, 128)
+                calculate_tile_tokens_dim(
+                    num_tokens,
+                    self.num_local_experts,
+                    self.top_k,
+                    64 if self.dtype_act == DtypeTrtllmGen.Bfloat16 else 128,
+                )
                 if self.tile_tokens_dim is None
                 else self.tile_tokens_dim
             )
@@ -1005,7 +991,6 @@ def get_trtllm_moe_sm100_module():
                 hidden_states_scale.dim() == 2
                 and hidden_states_scale.shape[0] == num_tokens
             ), "hidden_states_scale's first dimension must be batch size"
-
             # TODO(siyuan): support fp8
             moe_op.trtllm_fp4_block_scale_moe(
                 routing_logits,

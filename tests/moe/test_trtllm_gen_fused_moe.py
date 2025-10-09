@@ -1838,7 +1838,7 @@ def cache_permute_indices():
 
 @pytest.mark.parametrize("num_tokens", [1, 8, 1024])
 @pytest.mark.parametrize("hidden_size", [1024, 8192])
-@pytest.mark.parametrize("intermediate_size", [384, 768, 1024, 2048])
+@pytest.mark.parametrize("intermediate_size", [2048, 1024, 768, 384])
 @pytest.mark.parametrize(
     "moe_impl",
     [
