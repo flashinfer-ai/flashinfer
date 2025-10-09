@@ -106,7 +106,8 @@ Nightly builds are available for testing the latest features:
 .. code-block:: bash
 
     # Core and cubin packages
-    pip install -U --pre flashinfer-python --index-url https://flashinfer.ai/whl/nightly/
+    pip install -U --pre flashinfer-python --index-url https://flashinfer.ai/whl/nightly/ --no-deps # Install the nightly package from custom index, without installing dependencies
+    pip install flashinfer-python  # Install flashinfer-python's dependencies from PyPI
     pip install -U --pre flashinfer-cubin --index-url https://flashinfer.ai/whl/nightly/
     # JIT cache package (replace cu129 with your CUDA version: cu128, cu129, or cu130)
     pip install -U --pre flashinfer-jit-cache --index-url https://flashinfer.ai/whl/nightly/cu129
