@@ -104,7 +104,7 @@ def get_open_port() -> int:
             return s.getsockname()[1]
 
 
-def _run_graph_buffer_ipc_meta_worker(world_size, rank, distributed_init_port):
+def _run_graph_buffer_ipc_meta_worker(world_size: int, rank: int, distributed_init_port: int):
     """Test get_graph_buffer_ipc_meta function with CUDA graph capture."""
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
