@@ -132,12 +132,27 @@ def get_meta_hash(checksum_path: str) -> str:
     Load the file from local cache (checksums.txt)
     and get the hash of corresponding flashinferMetaInfo.h file
     """
-    with open(checksum_path, "r") as f:
+    with open(checksum_path + "/checksums.txt", "r") as f:
         for line in f:
             sha256, filename = line.strip().split()
             if ".h" in filename:
                 return sha256
     raise ValueError(f"Invalid path: checksums.txt not found in {checksum_path}")
+
+
+def verify_cubin(cubin_path: str, expected_sha256: str) -> bool:
+    """
+    Verify the cubin file against the sha256 checksum.
+    """
+    with open(cubin_path, "rb") as f:
+        data = f.read()
+    actual_sha256 = hashlib.sha256(data).hexdigest()
+    if actual_sha256 != expected_sha256:
+        logger.warning(
+            f"sha256 mismatch (expected {expected_sha256} actual {actual_sha256}) for {cubin_path}"
+        )
+        return False
+    return True
 
 
 def load_cubin(cubin_path: str, sha256: str) -> bytes:

@@ -32,10 +32,10 @@ if not logger.handlers:
 
 from .jit.cubin_loader import (
     FLASHINFER_CUBINS_REPOSITORY,
-    download_file,
     safe_urljoin,
     FLASHINFER_CUBIN_DIR,
     download_file,
+    verify_cubin,
 )
 
 
@@ -91,22 +91,11 @@ class ArtifactPath:
     DEEPGEMM: str = "a72d85b019dc125b9f711300cb989430f762f5a6/deep-gemm/"
 
 
-# TODO (jimmyzho): Should be deprecated except DEEPGEMM
 @dataclass(frozen=True)
 class MetaInfoHash:
-    TRTLLM_GEN_FMHA: str = (
-        "2f605255e71d673768f5bece66dde9e2e9f4c873347bfe8fefcffbf86a3c847d"
-    )
-    TRTLLM_GEN_BMM: str = (
-        "9490085267aed30a387bfff024a0605e1ca4d39dfe06a5abc159d7d7e129bdf4"
-    )
     DEEPGEMM: str = "b4374f857c3066089c4ec6b5e79e785559fa2c05ce2623710b0b04bf86414a48"
-    TRTLLM_GEN_GEMM: str = (
-        "7d8ef4e6d89b6990e3e90a3d3a21e96918824d819f8f897a9bfd994925b9ea67"
-    )
 
 
-# @dataclass(frozen=True)
 class CheckSumHash:
     TRTLLM_GEN_FMHA: str = (
         "b2d9d40db550ef85585e980bee651ac19d3e416f10b0c8bf9de0a7f9d0bee3d4"
@@ -197,12 +186,13 @@ def download_artifacts() -> None:
     with tqdm_logging_redirect(
         total=len(cubin_files), desc="Downloading cubins"
     ) as pbar:
+
         def update_pbar_cb(_) -> None:
             pbar.update(1)
 
         with ThreadPoolExecutor(num_threads) as pool:
             futures = []
-            for name in cubin_files:
+            for name, _ in cubin_files:
                 source = safe_urljoin(FLASHINFER_CUBINS_REPOSITORY, name)
                 local_path = FLASHINFER_CUBIN_DIR / name
                 # Ensure parent directory exists
@@ -218,6 +208,12 @@ def download_artifacts() -> None:
     all_success = all(results)
     if not all_success:
         raise RuntimeError("Failed to download cubins")
+
+    # Check checksums of all downloaded cubins
+    for name, checksum in cubin_files:
+        local_path = FLASHINFER_CUBIN_DIR / name
+        if not verify_cubin(str(local_path), checksum):
+            raise RuntimeError("Failed to download cubins: checksum mismatch")
 
 
 def get_artifacts_status() -> tuple[tuple[str, bool], ...]:

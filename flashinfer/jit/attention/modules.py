@@ -1568,7 +1568,7 @@ def gen_fmha_cutlass_sm100a_module(
 
 
 def gen_trtllm_gen_fmha_module():
-    from ...artifacts import ArtifactPath, MetaInfoHash
+    from ...artifacts import ArtifactPath
 
     include_path = f"{ArtifactPath.TRTLLM_GEN_FMHA}/include"
     header_name = "flashInferMetaInfo"
@@ -1576,7 +1576,7 @@ def gen_trtllm_gen_fmha_module():
     # use `get_cubin` to get "flashinferMetaInfo.h"
     metainfo = get_cubin(
         f"{include_path}/{header_name}.h",
-        get_meta_hash(f"{ArtifactPath.TRTLLM_GEN_FMHA}/checksums.txt"),
+        get_meta_hash(ArtifactPath.TRTLLM_GEN_FMHA),
     )
 
     # make sure "flashinferMetaInfo.h" is downloaded or cached

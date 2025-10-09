@@ -181,7 +181,7 @@ def gen_trtllm_gen_fused_moe_sm100_module() -> JitSpec:
     # use `get_cubin` to get "flashinferMetaInfo.h"
     metainfo = get_cubin(
         f"{include_path}/{header_name}.h",
-        get_meta_hash(f"{ArtifactPath.TRTLLM_GEN_BMM}/checksums.txt"),
+        get_meta_hash(ArtifactPath.TRTLLM_GEN_BMM),
     )
     # make sure "flashinferMetaInfo.h" is downloaded or cached
     assert metainfo, f"{header_name}.h not found"
