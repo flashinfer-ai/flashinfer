@@ -58,7 +58,8 @@ pip install flashinfer-python
 **For faster initialization and offline usage**, install the optional packages to have most kernels pre-compiled:
 ```bash
 pip install flashinfer-python flashinfer-cubin
-pip install flashinfer-jit-cache --index-url https://flashinfer.ai/whl/
+# JIT cache package (replace cu129 with your CUDA version: cu128, cu129, or cu130)
+pip install flashinfer-jit-cache --index-url https://flashinfer.ai/whl/cu129
 ```
 
 This eliminates compilation and downloading overhead at runtime.
@@ -103,7 +104,7 @@ Nightly builds are available for testing the latest features:
 
 ```bash
 # Core and cubin packages
-pip install -U --pre flashinfer-python --extra-index-url https://flashinfer.ai/whl/nightly/
+pip install -U --pre flashinfer-python --index-url https://flashinfer.ai/whl/nightly/
 pip install -U --pre flashinfer-cubin --index-url https://flashinfer.ai/whl/nightly/
 # JIT cache package (replace cu129 with your CUDA version: cu128, cu129, or cu130)
 pip install -U --pre flashinfer-jit-cache --index-url https://flashinfer.ai/whl/nightly/cu129
