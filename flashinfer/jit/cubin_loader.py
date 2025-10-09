@@ -132,7 +132,8 @@ def get_meta_hash(checksum_path: str) -> str:
     Load the file from local cache (checksums.txt)
     and get the hash of corresponding flashinferMetaInfo.h file
     """
-    with open(checksum_path + "/checksums.txt", "r") as f:
+    local_path = FLASHINFER_CUBIN_DIR / safe_urljoin(checksum_path, "checksums.txt")
+    with open(local_path, "r") as f:
         for line in f:
             sha256, filename = line.strip().split()
             if ".h" in filename:
