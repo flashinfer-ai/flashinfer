@@ -244,7 +244,7 @@ def test_vllm_custom_allreduce(world_size):
 
 
 @pytest.mark.parametrize("world_size", [2, 4])
-def test_get_graph_buffer_ipc_meta(world_size):
+def test_get_graph_buffer_ipc_meta(world_size: int):
     """Test get_graph_buffer_ipc_meta function with CUDA graph capture."""
     available_gpus = torch.cuda.device_count()
     if world_size > available_gpus:
