@@ -4,20 +4,18 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - main
+      - refined_docker_sha
     paths:
       - 'docker/**'
       - '.github/workflows/release-ci-docker.yml'
       - 'requirements.txt'
-      - '.github/workflows/release-ci-docker.yml'
   pull_request:
     branches:
-      - main
+      - refined_docker_sha
     paths:
       - 'docker/**'
       - '.github/workflows/release-ci-docker.yml'
       - 'requirements.txt'
-      - '.github/workflows/release-ci-docker.yml'
 jobs:
   generate-tag:
     runs-on: ubuntu-latest
@@ -109,7 +107,7 @@ jobs:
             flashinfer/flashinfer-ci-${{ matrix.cuda }}:arm64-${DATE_SHA}
 
   update-docker-tags:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/refined_docker_sha'
     runs-on: ubuntu-latest
     needs: [generate-tag, create-manifests]
     steps:
