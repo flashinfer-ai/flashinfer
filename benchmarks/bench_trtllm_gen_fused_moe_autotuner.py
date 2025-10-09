@@ -137,7 +137,7 @@ def bench_trtllm_gen_fused_moe_autotuner(
         num_experts,
         None,  # routed_scaling_factor
         tile_tokens_dim,
-        RoutingMethodType.Renormalize.value[0],
+        RoutingMethodType.Renormalize.value,
         True,
         enable_pdl,
         GatedActType.SwiGlu.value,  # gated_act_type

@@ -1254,7 +1254,7 @@ def get_trtllm_moe_sm100_module():
         local_expert_offset: int,
         num_local_experts: int,
         routed_scaling_factor: Optional[float],
-        tile_tokens_dim: int,
+        tile_tokens_dim: Optional[int],
         routing_method_type: int,
         do_finalize: bool,
         enable_pdl: Optional[bool] = None,
@@ -1300,6 +1300,13 @@ def get_trtllm_moe_sm100_module():
         dtype_weights = deduce_trtllm_gen_tensor_dtype(
             gemm1_weights, gemm1_weights_scale
         )
+        if tile_tokens_dim is None:
+            tile_tokens_dim = calculate_tile_tokens_dim(
+                num_tokens,
+                num_experts,
+                top_k,
+                max_tile_tokens_dim=128 if dtype_act == DtypeTrtllmGen.Bfloat16 else 64,
+            )
         moe_runner = MoERunner(
             top_k=top_k,
             num_local_experts=num_local_experts,
@@ -1430,7 +1437,7 @@ def get_trtllm_moe_sm100_module():
         local_expert_offset: int,
         local_num_experts: int,
         routed_scaling_factor: Optional[float],
-        tile_tokens_dim: int,
+        tile_tokens_dim: Optional[int],
         routing_method_type: int,
         do_finalize: bool,
         enable_pdl: bool,
@@ -1625,7 +1632,7 @@ def trtllm_fp4_block_scale_moe(
     local_expert_offset: int,
     local_num_experts: int,
     routed_scaling_factor: Optional[float],
-    tile_tokens_dim: int = 8,
+    tile_tokens_dim: Optional[int] = None,
     routing_method_type: int = 0,
     do_finalize: bool = True,
     enable_pdl: Optional[bool] = None,
@@ -1757,7 +1764,7 @@ def trtllm_fp4_block_scale_routed_moe(
     local_expert_offset: int,
     local_num_experts: int,
     routed_scaling_factor: Optional[float],
-    tile_tokens_dim: int = 8,
+    tile_tokens_dim: Optional[int] = None,
     routing_method_type: int = 0,
     do_finalize: bool = True,
     enable_pdl: Optional[bool] = None,
