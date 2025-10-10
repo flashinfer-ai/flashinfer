@@ -557,6 +557,8 @@ def test_trtllm_batch_prefill_bs1(
     kv_dtype,
     enable_pdl,
     enable_sink,
+    max_q_len,
+    max_kv_len,
 ):
     test_trtllm_batch_prefill(
         kv_layout,
@@ -570,6 +572,8 @@ def test_trtllm_batch_prefill_bs1(
         kv_dtype,
         enable_pdl,
         enable_sink,
+        max_q_len,
+        max_kv_len,
     )
 
 
