@@ -1,5 +1,5 @@
 """
-Copyright (c) 2025 by FlashInfer team.
+Copyright (c) 2023 by FlashInfer team.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,27 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import os
-from pathlib import Path
-from typing import List, Optional
-
-# Get the path to the AOT modules directory within this package
-jit_cache_dir = Path(__file__).parent / "jit_cache"
-
-
-def get_jit_cache_dir() -> str:
-    """Get the directory containing the AOT compiled modules."""
-    return str(jit_cache_dir)
-
-
+# Centralized version information to avoid circular imports
 try:
     from ._build_meta import __version__ as __version__
     from ._build_meta import __git_version__ as __git_version__
 except ModuleNotFoundError:
     __version__ = "0.0.0+unknown"
     __git_version__ = "unknown"
-
-
-__all__ = [
-    "get_jit_cache_dir",
-]

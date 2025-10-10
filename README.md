@@ -42,50 +42,88 @@ FlashInfer supports PyTorch, TVM and C++ (header-only) APIs, and can be easily i
 
 Using our PyTorch API is the easiest way to get started:
 
-### Install from PIP
+### Install from PyPI
 
-FlashInfer is available as a Python package for Linux on PyPI. You can install it with the following command:
+FlashInfer is available as a Python package for Linux. Install the core package with:
 
 ```bash
 pip install flashinfer-python
 ```
 
+**Package Options:**
+- **flashinfer-python**: Core package that compiles/downloads kernels on first use
+- **flashinfer-cubin**: Pre-compiled kernel binaries for all supported GPU architectures
+- **flashinfer-jit-cache**: Pre-built kernel cache for specific CUDA versions
+
+**For faster initialization and offline usage**, install the optional packages to have most kernels pre-compiled:
+```bash
+pip install flashinfer-python flashinfer-cubin
+# JIT cache package (replace cu129 with your CUDA version: cu128, cu129, or cu130)
+pip install flashinfer-jit-cache --index-url https://flashinfer.ai/whl/cu129
+```
+
+This eliminates compilation and downloading overhead at runtime.
+
 ### Install from Source
 
-Alternatively, build FlashInfer from source:
+Build the core package from source:
 
 ```bash
 git clone https://github.com/flashinfer-ai/flashinfer.git --recursive
 cd flashinfer
 python -m pip install -v .
+```
 
-# for development & contribution, install in editable mode
+**For development**, install in editable mode:
+```bash
 python -m pip install --no-build-isolation -e . -v
 ```
 
-`flashinfer-python` is a source-only package and by default it will JIT compile/download kernels on-the-fly.
-For fully offline deployment, we also provide two additional packages `flashinfer-jit-cache` and `flashinfer-cubin`, to pre-compile and download cubins ahead-of-time.
+**Build optional packages:**
 
-#### flashinfer-cubin
-
-To build `flashinfer-cubin` package from source:
+`flashinfer-cubin`:
 ```bash
 cd flashinfer-cubin
 python -m build --no-isolation --wheel
 python -m pip install dist/*.whl
 ```
 
-#### flashinfer-jit-cache
-
-To build `flashinfer-jit-cache` package from source:
+`flashinfer-jit-cache` (customize `FLASHINFER_CUDA_ARCH_LIST` for your target GPUs):
 ```bash
-export FLASHINFER_CUDA_ARCH_LIST="7.5 8.0 8.9 10.0a 10.3a 12.0a" # user can shrink the list to specific architectures
+export FLASHINFER_CUDA_ARCH_LIST="7.5 8.0 8.9 10.0a 10.3a 12.0a"
 cd flashinfer-jit-cache
 python -m build --no-isolation --wheel
 python -m pip install dist/*.whl
 ```
 
-For more details, refer to the [Install from Source documentation](https://docs.flashinfer.ai/installation.html#install-from-source).
+For more details, see the [Install from Source documentation](https://docs.flashinfer.ai/installation.html#install-from-source).
+
+### Install Nightly Build
+
+Nightly builds are available for testing the latest features:
+
+```bash
+# Core and cubin packages
+pip install -U --pre flashinfer-python --index-url https://flashinfer.ai/whl/nightly/ --no-deps # Install the nightly package from custom index, without installing dependencies
+pip install flashinfer-python  # Install flashinfer-python's dependencies from PyPI
+pip install -U --pre flashinfer-cubin --index-url https://flashinfer.ai/whl/nightly/
+# JIT cache package (replace cu129 with your CUDA version: cu128, cu129, or cu130)
+pip install -U --pre flashinfer-jit-cache --index-url https://flashinfer.ai/whl/nightly/cu129
+```
+
+### Verify Installation
+
+After installation, verify that FlashInfer is correctly installed and configured:
+
+```bash
+flashinfer show-config
+```
+
+This command displays:
+- FlashInfer version and installed packages (flashinfer-python, flashinfer-cubin, flashinfer-jit-cache)
+- PyTorch and CUDA version information
+- Environment variables and artifact paths
+- Downloaded cubin status and module compilation status
 
 ### Trying it out
 

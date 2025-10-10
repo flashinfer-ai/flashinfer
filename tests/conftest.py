@@ -1,6 +1,8 @@
+import json
 import os
 import types
-from typing import Any, Dict
+from pathlib import Path
+from typing import Any, Dict, Set
 
 import pytest
 import torch
@@ -8,6 +10,14 @@ from torch.torch_version import TorchVersion
 from torch.torch_version import __version__ as torch_version
 
 import flashinfer
+from flashinfer.jit import MissingJITCacheError
+
+# Global tracking for JIT cache coverage
+# Store tuples of (test_name, module_name, spec_info)
+_MISSING_JIT_CACHE_MODULES: Set[tuple] = set()
+
+# File path for aggregating JIT cache info across multiple pytest runs
+_JIT_CACHE_REPORT_FILE = os.environ.get("FLASHINFER_JIT_CACHE_REPORT_FILE", None)
 
 TORCH_COMPILE_FNS = [
     flashinfer.activation.silu_and_mul,
@@ -129,11 +139,92 @@ def is_cuda_oom_error_str(e: str) -> bool:
 
 @pytest.hookimpl(tryfirst=True)
 def pytest_runtest_call(item):
-    # skip OOM error
+    # skip OOM error and missing JIT cache errors
     try:
         item.runtest()
     except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
         if isinstance(e, torch.cuda.OutOfMemoryError) or is_cuda_oom_error_str(str(e)):
             pytest.skip("Skipping due to OOM")
+        elif isinstance(e, MissingJITCacheError):
+            # Record the test that was skipped due to missing JIT cache
+            test_name = item.nodeid
+            spec = e.spec
+            module_name = spec.name if spec else "unknown"
+
+            # Create a dict with module info for reporting
+            spec_info = None
+            if spec:
+                spec_info = {
+                    "name": spec.name,
+                    "sources": [str(s) for s in spec.sources],
+                    "needs_device_linking": spec.needs_device_linking,
+                    "aot_path": str(spec.aot_path),
+                }
+
+            _MISSING_JIT_CACHE_MODULES.add((test_name, module_name, str(spec_info)))
+            pytest.skip(f"Skipping due to missing JIT cache for module: {module_name}")
         else:
             raise
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    """Generate JIT cache coverage report at the end of test session"""
+    if not _MISSING_JIT_CACHE_MODULES:
+        return  # No missing modules
+
+    # If report file is specified, write to file for later aggregation
+    # Otherwise, print summary directly
+    if _JIT_CACHE_REPORT_FILE:
+        from filelock import FileLock
+
+        # Convert set to list for JSON serialization
+        data = [
+            {"test_name": test_name, "module_name": module_name, "spec_info": spec_info}
+            for test_name, module_name, spec_info in _MISSING_JIT_CACHE_MODULES
+        ]
+
+        # Use file locking to handle concurrent writes from multiple pytest processes
+        Path(_JIT_CACHE_REPORT_FILE).parent.mkdir(parents=True, exist_ok=True)
+        lock_file = _JIT_CACHE_REPORT_FILE + ".lock"
+        with FileLock(lock_file), open(_JIT_CACHE_REPORT_FILE, "a") as f:
+            for entry in data:
+                f.write(json.dumps(entry) + "\n")
+        return
+
+    # Single pytest run - print summary directly
+    terminalreporter.section("flashinfer-jit-cache Package Coverage Report")
+    terminalreporter.write_line("")
+    terminalreporter.write_line(
+        "This report shows the coverage of the flashinfer-jit-cache package."
+    )
+    terminalreporter.write_line(
+        "Tests are skipped when required modules are not found in the installed JIT cache."
+    )
+    terminalreporter.write_line("")
+    terminalreporter.write_line(
+        f"⚠️  {len(_MISSING_JIT_CACHE_MODULES)} test(s) skipped due to missing JIT cache modules:"
+    )
+    terminalreporter.write_line("")
+
+    # Group by module name
+    module_to_tests = {}
+    for test_name, module_name, spec_info in _MISSING_JIT_CACHE_MODULES:
+        if module_name not in module_to_tests:
+            module_to_tests[module_name] = {"tests": [], "spec_info": spec_info}
+        module_to_tests[module_name]["tests"].append(test_name)
+
+    for module_name in sorted(module_to_tests.keys()):
+        info = module_to_tests[module_name]
+        terminalreporter.write_line(f"Module: {module_name}")
+        terminalreporter.write_line(f"  Spec: {info['spec_info']}")
+        terminalreporter.write_line(f"  Affected tests ({len(info['tests'])}):")
+        for test in sorted(info["tests"]):
+            terminalreporter.write_line(f"    - {test}")
+        terminalreporter.write_line("")
+
+    terminalreporter.write_line(
+        "These tests require JIT compilation but FLASHINFER_DISABLE_JIT=1 was set."
+    )
+    terminalreporter.write_line(
+        "To improve coverage, add the missing modules to the flashinfer-jit-cache build configuration."
+    )

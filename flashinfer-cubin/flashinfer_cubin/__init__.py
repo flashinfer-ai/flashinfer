@@ -63,5 +63,18 @@ def _get_version():
     return "0.0.0"
 
 
+def _get_git_version():
+    # First try to read from build metadata (for wheel distributions)
+    try:
+        from . import _build_meta
+
+        return _build_meta.__git_version__
+    except (ImportError, AttributeError):
+        pass
+
+    return "unknown"
+
+
 __version__ = _get_version()
+__git_version__ = _get_git_version()
 __all__ = ["get_cubin_dir", "list_cubins", "get_cubin_path", "CUBIN_DIR"]
