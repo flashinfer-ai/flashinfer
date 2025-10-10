@@ -1575,7 +1575,8 @@ def gen_trtllm_gen_fmha_module():
 
     # use `get_cubin` to get "flashinferMetaInfo.h"
     metainfo = get_cubin(
-        f"{include_path}/{header_name}.h", MetaInfoHash.TRTLLM_GEN_FMHA
+        f"{include_path}/{header_name}.h",
+        MetaInfoHash.TRTLLM_GEN_FMHA,
     )
 
     # make sure "flashinferMetaInfo.h" is downloaded or cached
