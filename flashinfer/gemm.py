@@ -1748,7 +1748,7 @@ def _check_mm_fp4_problem_size(
 
 
 @supported_compute_capability(["100", "103", "110", "120"])
-def cudnn_gemm_fp4_requirement(
+def _cudnn_gemm_fp4_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
     a_descale: torch.Tensor,
@@ -1808,7 +1808,7 @@ def cudnn_gemm_fp4_requirement(
 
 
 @supported_compute_capability(["100", "103", "120"])
-def trtllm_gemm_fp4_requirement(
+def _trtllm_gemm_fp4_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
     a_descale: torch.Tensor,
@@ -1830,7 +1830,7 @@ def trtllm_gemm_fp4_requirement(
 
 
 @supported_compute_capability(["100", "103", "120"])
-def cutlass_gemm_fp4_requirement(
+def _cutlass_gemm_fp4_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
     a_descale: torch.Tensor,
@@ -1854,9 +1854,9 @@ def cutlass_gemm_fp4_requirement(
 # )
 @backend_requirement(
     {
-        "cudnn": cudnn_gemm_fp4_requirement,
-        "trtllm": trtllm_gemm_fp4_requirement,
-        "cutlass": cutlass_gemm_fp4_requirement,
+        "cudnn": _cudnn_gemm_fp4_requirement,
+        "trtllm": _trtllm_gemm_fp4_requirement,
+        "cutlass": _cutlass_gemm_fp4_requirement,
     },
     common_check=_check_mm_fp4_problem_size,
 )

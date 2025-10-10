@@ -881,18 +881,18 @@ def backend_requirement(backend_checks, common_check=None):
     Examples
     --------
     >>> @supported_compute_capability([80, 86, 89, 90])
-    ... def cutlass_check(q, k, v, backend):
+    ... def _cutlass_check(q, k, v, backend):
     ...     # Validate problem size constraints for CUTLASS backend
     ...     return q.shape[-1] <= 256
     ...
     >>> @supported_compute_capability([75, 80, 86, 89, 90])
-    ... def cudnn_check(q, k, v, backend):
+    ... def _cudnn_check(q, k, v, backend):
     ...     # Validate problem size constraints for cuDNN backend
     ...     return True
     ...
     >>> @backend_requirement({
-    ...     "cutlass": cutlass_check,
-    ...     "cudnn": cudnn_check
+    ...     "cutlass": _cutlass_check,
+    ...     "cudnn": _cudnn_check
     ... })
     ... def my_attention_kernel(q, k, v, backend="cutlass"):
     ...     # Backend invocation
