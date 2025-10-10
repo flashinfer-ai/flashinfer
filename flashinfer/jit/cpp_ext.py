@@ -168,6 +168,8 @@ def generate_ninja_build_for_op(
 
     ldflags = [
         "-shared",
+        "-L/usr/lib/wsl/lib",
+        "-L$cuda_home/lib",
         "-L$cuda_home/lib64",
         "-L$cuda_home/lib64/stubs",
         "-lcudart",
