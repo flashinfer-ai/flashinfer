@@ -44,7 +44,7 @@ struct cuda_error : public std::runtime_error {
 namespace vllm {
 
 constexpr int kMaxBlocks = 36;
-CUpointer_attribute rangeStartAddrAttr = CU_POINTER_ATTRIBUTE_RANGE_START_ADDR;
+constexpr CUpointer_attribute rangeStartAddrAttr = CU_POINTER_ATTRIBUTE_RANGE_START_ADDR;
 
 // Counter may overflow, but it's fine since unsigned int overflow is
 // well-defined behavior.

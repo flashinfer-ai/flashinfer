@@ -18,7 +18,7 @@ import flashinfer.comm as comm
 logger = logging.getLogger(__name__)
 
 
-def _run_correctness_worker(world_size, rank, distributed_init_port):
+def _initialize_process_group(world_size, rank, distributed_init_port):
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
     distributed_init_method = f"tcp://localhost:{distributed_init_port}"
@@ -29,8 +29,12 @@ def _run_correctness_worker(world_size, rank, distributed_init_port):
         world_size=world_size,
     )
     group = dist.group.WORLD
+    return group
 
+
+def _run_correctness_worker(world_size, rank, distributed_init_port):
     try:
+        group = _initialize_process_group(world_size, rank, distributed_init_port)
         device = torch.device(f"cuda:{rank}")
         max_size = 8192 * 1024
         meta_ptrs = comm.create_shared_buffer(
@@ -104,24 +108,18 @@ def get_open_port() -> int:
             return s.getsockname()[1]
 
 
-def _run_graph_buffer_ipc_meta_worker(world_size: int, rank: int, distributed_init_port: int):
+def _run_graph_buffer_ipc_meta_worker(
+    world_size: int, rank: int, distributed_init_port: int
+):
     """Test get_graph_buffer_ipc_meta function with CUDA graph capture."""
-    device = torch.device(f"cuda:{rank}")
-    torch.cuda.set_device(device)
-    distributed_init_method = f"tcp://localhost:{distributed_init_port}"
-    dist.init_process_group(
-        backend="nccl",
-        init_method=distributed_init_method,
-        rank=rank,
-        world_size=world_size,
-    )
-    group = dist.group.WORLD
 
     custom_ptr = None
     meta_ptrs = None
 
     try:
         # Setup
+        group = _initialize_process_group(world_size, rank, distributed_init_port)
+        device = torch.device(f"cuda:{rank}")
         max_size = 8192 * 1024
         meta_ptrs = comm.create_shared_buffer(
             comm.vllm_meta_size() + max_size, group=group
