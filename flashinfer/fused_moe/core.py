@@ -1305,7 +1305,7 @@ def get_trtllm_moe_sm100_module():
                 num_tokens,
                 num_experts,
                 top_k,
-                max_tile_tokens_dim=128 if dtype_act == DtypeTrtllmGen.Bfloat16 else 64,
+                max_tile_tokens_dim=64 if dtype_act == DtypeTrtllmGen.Bfloat16 else 128,
             )
         moe_runner = MoERunner(
             top_k=top_k,
