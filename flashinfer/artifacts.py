@@ -97,6 +97,12 @@ class MetaInfoHash:
     TRTLLM_GEN_FMHA: str = (
         "d26dbf837f40ff2dcd964094ab6e1b3f2424edda5979c313f5262655161fce98"
     )
+    TRTLLM_GEN_BMM: str = (
+        "8c5f97d582df0e4fd9f69ddeb3b72cc3a37915c6c20b4d0905fec69702310b63"
+    )
+    TRTLLM_GEN_GEMM: str = (
+        "941228df669b82c785e6b5c5d069caad99016ab155f96ff22bf8f090d925e4b5"
+    )
 
 
 class CheckSumHash:

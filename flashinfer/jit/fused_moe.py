@@ -17,10 +17,10 @@ limitations under the License.
 from typing import List
 
 from . import env as jit_env
-from ..artifacts import ArtifactPath
+from ..artifacts import ArtifactPath, MetaInfoHash
 from .core import JitSpec, gen_jit_spec, current_compilation_context, sm90a_nvcc_flags
 from .cpp_ext import is_cuda_version_at_least
-from .cubin_loader import get_cubin, get_meta_hash
+from .cubin_loader import get_cubin
 from .gemm.cutlass.generate_kernels import generate_gemm_operations
 
 
@@ -181,7 +181,7 @@ def gen_trtllm_gen_fused_moe_sm100_module() -> JitSpec:
     # use `get_cubin` to get "flashinferMetaInfo.h"
     metainfo = get_cubin(
         f"{include_path}/{header_name}.h",
-        get_meta_hash(ArtifactPath.TRTLLM_GEN_BMM),
+        MetaInfoHash.TRTLLM_GEN_BMM,
     )
     # make sure "flashinferMetaInfo.h" is downloaded or cached
     assert metainfo, f"{header_name}.h not found"
