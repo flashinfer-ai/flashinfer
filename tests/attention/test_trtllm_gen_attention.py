@@ -331,6 +331,8 @@ def unpack_compare_nvfp4(
 )
 @pytest.mark.parametrize("enable_pdl", [True, False, None])
 @pytest.mark.parametrize("enable_sink", [True, False])
+@pytest.mark.parametrize("max_q_len", [511])
+@pytest.mark.parametrize("max_kv_len", [2047])
 def test_trtllm_batch_prefill(
     kv_layout,
     batch_size,
@@ -343,6 +345,8 @@ def test_trtllm_batch_prefill(
     kv_dtype,
     enable_pdl,
     enable_sink,
+    max_q_len,
+    max_kv_len,
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] in [11, 12]:
@@ -350,13 +354,11 @@ def test_trtllm_batch_prefill(
     # Set up test parameters
     torch.manual_seed(0)
     head_dim = 128
-    MAX_Q_LEN = 511
-    MAX_IN_KV_LEN = 2047
 
     # Generate random sequence lengths
     num_qo_heads = num_kv_heads * head_grp_size
     q_lens, in_kv_lens, seq_lens = generate_seq_lens_prefill(
-        batch_size, MAX_Q_LEN, MAX_IN_KV_LEN
+        batch_size, max_q_len, max_kv_len
     )
 
     # Create query tensor and related data
@@ -541,6 +543,8 @@ def test_trtllm_batch_prefill(
 )
 @pytest.mark.parametrize("enable_pdl", [None])
 @pytest.mark.parametrize("enable_sink", [False])
+@pytest.mark.parametrize("max_q_len", [8192])
+@pytest.mark.parametrize("max_kv_len", [8192])
 def test_trtllm_batch_prefill_bs1(
     kv_layout,
     batch_size,
@@ -560,6 +564,12 @@ def test_trtllm_batch_prefill_bs1(
         page_size,
         num_kv_heads,
         head_grp_size,
+        window_left,
+        q_dtype,
+        o_dtype,
+        kv_dtype,
+        enable_pdl,
+        enable_sink,
     )
 
 
