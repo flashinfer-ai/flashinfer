@@ -79,7 +79,6 @@ env_variables = {
     "FLASHINFER_CUDA_ARCH_LIST": current_compilation_context.TARGET_CUDA_ARCHS,
     "FLASHINFER_CUDA_VERSION": get_cuda_version(),
     "FLASHINFER_CUBINS_REPOSITORY": FLASHINFER_CUBINS_REPOSITORY,
-    "CUDA_HOME": get_cuda_path(),
     "CUDA_VERSION": get_cuda_version(),
 }
 try:
