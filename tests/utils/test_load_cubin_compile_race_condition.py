@@ -55,7 +55,7 @@ def worker_process(temp_dir):
     return content
 
 
-def test_load_cubin_race_condition(num_iterations, num_processes):
+def _test_load_cubin_race_condition(num_iterations, num_processes):
     """
     Test race condition when multiple processes concurrently call get_cubin
     for the same file.
@@ -113,4 +113,4 @@ def test_load_cubin_race_condition(num_iterations, num_processes):
 
 if __name__ == "__main__":
     # NOTE(Zihao): do not use pytest to run this test
-    test_load_cubin_race_condition(100, 10)
+    _test_load_cubin_race_condition(100, 10)
