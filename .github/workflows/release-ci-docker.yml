@@ -32,7 +32,7 @@ jobs:
           echo "Generated version tag: ${DATE_SHA}"
 
   build:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, x86_64]
     needs: generate-tag
     strategy:
       matrix:
@@ -40,17 +40,6 @@ jobs:
         arch: [amd64, arm64]
     steps:
       - uses: actions/checkout@v4
-
-      - name: Free Disk Space
-        uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: false
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          docker-images: true
-          swap-storage: true
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
