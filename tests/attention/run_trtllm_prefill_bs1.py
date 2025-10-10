@@ -1,10 +1,8 @@
-import math
-
 import pytest
 import torch
 
 import flashinfer
-from flashinfer.utils import FP4Tensor, ceil_div, round_up, get_compute_capability
+from flashinfer.utils import get_compute_capability
 
 global_workspace_buffer = None  # can.be empty initialized
 global_trtllm_gen_fmha_workspace_buffer = None  # must be zero initialized
@@ -150,6 +148,7 @@ def test_trtllm_gen_prefill_deepseek(
     # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
     # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
     assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()
+
 
 if __name__ == "__main__":
     test_trtllm_gen_prefill_deepseek(
