@@ -929,7 +929,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
         kv_cache = torch.cat([k_fp8, v_fp8], dim=1)
 
     if batch_size == 1:
-        # trtllm kernel requires max_q_len and max_kv_len to be the same as cum_seq_lens_q and cum_seq_lens_kv when batch_size=1
+        # trtllm kernel requires max_q_len to be the same as cum_seq_lens_q when batch_size=1
         s_qo_trtllm = qo_indptr[-1].item()
     else:
         s_qo_trtllm = s_qo
@@ -1381,7 +1381,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
         v = (v / v_scale).to(kv_dtype)
 
     if batch_size == 1:
-        # trtllm kernel requires max_q_len and max_kv_len to be the same as cum_seq_lens_q and cum_seq_lens_kv when batch_size=1
+        # trtllm kernel requires max_q_len to be the same as cum_seq_lens_q when batch_size=1
         s_qo_trtllm = qo_indptr[-1].item()
     else:
         s_qo_trtllm = s_qo

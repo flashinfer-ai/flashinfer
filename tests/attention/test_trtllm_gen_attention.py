@@ -527,6 +527,44 @@ def test_trtllm_batch_prefill(
 
 @pytest.mark.parametrize("kv_layout", ["HND"])  # trtllm-gen only support HND
 @pytest.mark.parametrize(
+    "batch_size,page_size,num_kv_heads,head_grp_size",
+    [
+        (1, 16, 8, 8),
+    ],
+)
+@pytest.mark.parametrize("window_left", [-1])  # todo(Siyuan): add 127 window_left
+@pytest.mark.parametrize(
+    "q_dtype,kv_dtype,o_dtype",
+    [
+        ("bf16", "bf16", "bf16"),
+    ],
+)
+@pytest.mark.parametrize("enable_pdl", [None])
+@pytest.mark.parametrize("enable_sink", [False])
+def test_trtllm_batch_prefill_bs1(
+    kv_layout,
+    batch_size,
+    page_size,
+    num_kv_heads,
+    head_grp_size,
+    window_left,
+    q_dtype,
+    o_dtype,
+    kv_dtype,
+    enable_pdl,
+    enable_sink,
+):
+    test_trtllm_batch_prefill(
+        kv_layout,
+        batch_size,
+        page_size,
+        num_kv_heads,
+        head_grp_size,
+    )
+
+
+@pytest.mark.parametrize("kv_layout", ["HND"])  # trtllm-gen only support HND
+@pytest.mark.parametrize(
     "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size",
     [
         (4, 1, 16, 2, 1),
