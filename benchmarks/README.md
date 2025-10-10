@@ -16,6 +16,7 @@ Currently supports testing most attention, gemm, and fused MOE APIs:
     - `BatchPrefillWithPagedKVCacheWrapper` - Prefill attention with paged KV cache.
         - Also supports computationally similar `cudnn_batch_prefill_with_kv_cache` and  `trtllm_batch_context_with_kv_cache`.
     - `BatchPrefillWithRaggedKVCacheWrapper` - Prefill attention with ragged KV cache.
+        - Also supports computationally similar `cudnn_batch_prefill_with_kv_cache` and  `trtllm_ragged_attention_deepseek`.
     - `BatchMLAPagedAttentionWrapper` - MLA attention proposed in DeepSeek series of models.
         - Also supports computationally similar `trtllm_batch_decode_with_kv_cache_mla`.
 - GEMM:
