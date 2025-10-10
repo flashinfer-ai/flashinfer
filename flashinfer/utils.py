@@ -819,33 +819,39 @@ def backend_requirement(backend_checks, common_check=None):
 
         def wrapper(*args, **kwargs):
             backend = kwargs.get("backend")
-            capability = None
+            # skip_check is an optional argument that the decorator adds to any API function.
+            # It prevents the performance overhead of checking.
+            skip_check = kwargs.pop("skip_check", False)
 
-            # Find the first tensor argument.
-            # Assume all tensors are on the same device/capability.
-            # We could consider check all tensors at a performance cost.
-            tensor_arg = None
-            for arg in args:
-                if isinstance(arg, torch.Tensor):
-                    tensor_arg = arg
-            if tensor_arg is None:
-                for value in kwargs.values():
-                    if isinstance(value, torch.Tensor):
-                        tensor_arg = value
+            if not skip_check:
+                capability = None
+                # Find the first tensor argument.
+                # Assume all tensors are on the same device/capability.
+                # We could consider check all tensors at a performance cost.
+                tensor_arg = None
+                for arg in args:
+                    if isinstance(arg, torch.Tensor):
+                        tensor_arg = arg
+                if tensor_arg is None:
+                    for value in kwargs.values():
+                        if isinstance(value, torch.Tensor):
+                            tensor_arg = value
 
-            if tensor_arg is not None:
-                # Get compute capability from the first tensor
-                # Assume all tensors are on the same device/capability
-                major, minor = get_compute_capability(tensor_arg.device)
-                capability = f"{major * 10 + minor}"
+                if tensor_arg is not None:
+                    # Get compute capability from the first tensor
+                    # Assume all tensors are on the same device/capability
+                    major, minor = get_compute_capability(tensor_arg.device)
+                    capability = f"{major * 10 + minor}"
 
-            if not is_backend_supported(backend, capability):
-                extra = f" with capability {capability}" if capability else ""
-                raise BackendSupportedError(
-                    f"{func.__name__} does not support backend '{backend}'{extra}"
-                )
-            if not is_problem_size_supported(*args, **kwargs):
-                raise ValueError(f"Problem size is not supported for {func.__name__}")
+                if not is_backend_supported(backend, capability):
+                    extra = f" with capability {capability}" if capability else ""
+                    raise BackendSupportedError(
+                        f"{func.__name__} does not support backend '{backend}'{extra}"
+                    )
+                if not is_problem_size_supported(*args, **kwargs):
+                    raise ValueError(
+                        f"Problem size is not supported for {func.__name__}"
+                    )
             return func(*args, **kwargs)
 
         wrapper.is_backend_supported = is_backend_supported

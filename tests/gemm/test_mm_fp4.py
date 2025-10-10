@@ -85,6 +85,7 @@ def test_mm_fp4(
                 use_8x4_sf_layout=not use_128x4_sf_layout,
                 backend=backend,
                 use_nvfp4=use_nvfp4,
+                skip_check=False,
             )
 
         cos_sim = F.cosine_similarity(reference.reshape(-1), res.reshape(-1), dim=0)
