@@ -123,6 +123,55 @@ namespace moe::dev {
     FLASHINFER_WARN("Unsupported dtypeExpW");                                                 \
   }
 
+#define LAUNCH_ROUTING_DEEPSEEK_WITH_EXTRA_FLAG(data, coopLaunch, kernel, numBlocks, numThreads,  \
+                                                smemSize, stream, extraFlag)                      \
+  if (data.mDtypeScore == tg::Dtype::Fp32 && data.mDtypeBias == tg::Dtype::Fp32 &&                \
+      data.mDtypeExpW == tg::Dtype::Fp32) {                                                       \
+    LAUNCH_PDL(data, coopLaunch, LAUNCH_ESC(float, float, float, extraFlag), kernel, numBlocks,   \
+               numThreads, smemSize, stream);                                                     \
+  } else if (data.mDtypeScore == tg::Dtype::Fp32 && data.mDtypeBias == tg::Dtype::Fp32 &&         \
+             data.mDtypeExpW == tg::Dtype::Bfloat16) {                                            \
+    LAUNCH_PDL(data, coopLaunch, LAUNCH_ESC(float, float, __nv_bfloat16, extraFlag), kernel,      \
+               numBlocks, numThreads, smemSize, stream);                                          \
+  } else if (data.mDtypeScore == tg::Dtype::Fp32 && data.mDtypeBias == tg::Dtype::Bfloat16 &&     \
+             data.mDtypeExpW == tg::Dtype::Fp32) {                                                \
+    LAUNCH_PDL(data, coopLaunch, LAUNCH_ESC(float, __nv_bfloat16, float, extraFlag), kernel,      \
+               numBlocks, numThreads, smemSize, stream);                                          \
+  } else if (data.mDtypeScore == tg::Dtype::Fp32 && data.mDtypeBias == tg::Dtype::Bfloat16 &&     \
+             data.mDtypeExpW == tg::Dtype::Bfloat16) {                                            \
+    LAUNCH_PDL(data, coopLaunch, LAUNCH_ESC(float, __nv_bfloat16, __nv_bfloat16, extraFlag),      \
+               kernel, numBlocks, numThreads, smemSize, stream);                                  \
+  } else if (data.mDtypeScore == tg::Dtype::Bfloat16 && data.mDtypeBias == tg::Dtype::Fp32 &&     \
+             data.mDtypeExpW == tg::Dtype::Fp32) {                                                \
+    LAUNCH_PDL(data, coopLaunch, LAUNCH_ESC(__nv_bfloat16, float, float, extraFlag), kernel,      \
+               numBlocks, numThreads, smemSize, stream);                                          \
+  } else if (data.mDtypeScore == tg::Dtype::Bfloat16 && data.mDtypeBias == tg::Dtype::Fp32 &&     \
+             data.mDtypeExpW == tg::Dtype::Bfloat16) {                                            \
+    LAUNCH_PDL(data, coopLaunch, LAUNCH_ESC(__nv_bfloat16, float, __nv_bfloat16, extraFlag),      \
+               kernel, numBlocks, numThreads, smemSize, stream);                                  \
+  } else if (data.mDtypeScore == tg::Dtype::Bfloat16 && data.mDtypeBias == tg::Dtype::Bfloat16 && \
+             data.mDtypeExpW == tg::Dtype::Fp32) {                                                \
+    LAUNCH_PDL(data, coopLaunch, LAUNCH_ESC(__nv_bfloat16, __nv_bfloat16, float, extraFlag),      \
+               kernel, numBlocks, numThreads, smemSize, stream);                                  \
+  } else if (data.mDtypeScore == tg::Dtype::Bfloat16 && data.mDtypeBias == tg::Dtype::Bfloat16 && \
+             data.mDtypeExpW == tg::Dtype::Bfloat16) {                                            \
+    LAUNCH_PDL(data, coopLaunch,                                                                  \
+               LAUNCH_ESC(__nv_bfloat16, __nv_bfloat16, __nv_bfloat16, extraFlag), kernel,        \
+               numBlocks, numThreads, smemSize, stream);                                          \
+  } else {                                                                                        \
+    FLASHINFER_WARN("Unsupported dtypeExpW");                                                     \
+  }
+
+#define LAUNCH_ROUTING_DEEPSEEK(data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream, \
+                                extraFlag)                                                         \
+  if (extraFlag) {                                                                                 \
+    LAUNCH_ROUTING_DEEPSEEK_WITH_EXTRA_FLAG(data, coopLaunch, kernel, numBlocks, numThreads,       \
+                                            smemSize, stream, true);                               \
+  } else {                                                                                         \
+    LAUNCH_ROUTING_DEEPSEEK_WITH_EXTRA_FLAG(data, coopLaunch, kernel, numBlocks, numThreads,       \
+                                            smemSize, stream, false);                              \
+  }
+
 #define LAUNCH_ROUTING_WITH_EXTRA_FLAG(data, coopLaunch, kernel, numBlocks, numThreads, smemSize, \
                                        stream, extraFlag, forceFloatInput)                        \
   if (data.mDtypeExpW == tg::Dtype::Fp32 && extraFlag) {                                          \

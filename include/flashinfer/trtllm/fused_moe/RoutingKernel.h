@@ -146,7 +146,8 @@ namespace routingDeepSeek {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 struct Data : public DataBase {
   tg::Dtype mDtypeExpW{tg::Dtype::Bfloat16};
-
+  tg::Dtype mDtypeBias{tg::Dtype::Bfloat16};
+  tg::Dtype mDtypeScore{tg::Dtype::Fp32};
   //
   // Grouped Gemm Launch Config Buffers
   //
@@ -160,9 +161,10 @@ struct Data : public DataBase {
   bool mUseRoutingSoftmax;
 };
 
-template <typename InputT_, typename OutputT_, bool UseGroups_, bool UsePdl_>
+template <typename InputT_, typename BiasT_, typename OutputT_, bool UseGroups_, bool UsePdl_>
 struct KernelParams : public KernelParamsBase<InputT_, OutputT_, UsePdl_> {
   using InputT = InputT_;
+  using BiasT = BiasT_;
   using OutputT = OutputT_;
 
   static constexpr bool UseGroups = UseGroups_;
@@ -173,7 +175,7 @@ struct KernelParams : public KernelParamsBase<InputT_, OutputT_, UsePdl_> {
   // Note: this variable(mPtrExpertWeightsFull) might need to be added back for the low-latency
   // kernels for MoE in tllm-gen in the future
 
-  OutputT const* mPtrRoutingBias = nullptr;
+  BiasT const* mPtrRoutingBias = nullptr;
 
   int32_t mNumExpertGroups = 0;
   int32_t mNumExpertsPerGroup = 0;
@@ -189,7 +191,7 @@ struct KernelParams : public KernelParamsBase<InputT_, OutputT_, UsePdl_> {
     params.mPtrExpertIdx = (PackedScoreIdx<OutputT>*)data.mPtrExpertIdx;
 
     // params.mPtrExpertWeightsFull = static_cast<OutputT*>(data.mPtrExpertWeightsFull);
-    params.mPtrRoutingBias = static_cast<OutputT const*>(data.mPtrRoutingBias);
+    params.mPtrRoutingBias = static_cast<BiasT const*>(data.mPtrRoutingBias);
 
     params.mNumExpertGroups = data.mNumExpertGroups;
     params.mNumExpertsPerGroup = data.mNumExperts / data.mNumExpertGroups;
