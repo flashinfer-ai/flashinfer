@@ -3221,9 +3221,9 @@ def trtllm_ragged_attention_deepseek(
     seq_lens : torch.Tensor
         sequence lengths
     max_q_len : int
-        max query length
+        max query length. If batch_size == 1, must be equal to cum_seq_lens_q[-1]
     max_kv_len : int
-        max key/value length
+        max key/value length. If batch_size == 1, must be equal to cum_seq_lens_kv[-1]
     bmm1_scale : float
         scale for bmm1, scale_q * scale_k * 1.0 / (head_dim_qk ** 0.5)
     bmm2_scale : float
@@ -3282,8 +3282,6 @@ def trtllm_ragged_attention_deepseek(
         )
 
     workspace_size = workspace_buffer.numel() * workspace_buffer.element_size()
-    print(f"cum_seq_lens_q: {cum_seq_lens_q}")
-    print(f"cum_seq_lens_kv: {cum_seq_lens_kv}")
     run_func(
         out,
         query,
