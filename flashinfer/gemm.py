@@ -1743,16 +1743,6 @@ def _check_mm_fp4_problem_size(
         raise ValueError("Only TRTLLM FP4 GEMM supports 8x4 scale factor layout.")
     if backend != "cudnn" and not use_nvfp4:
         raise ValueError("Only cudnn FP4 GEMM supports mxfp4 quantization.")
-
-    elif backend == "trtllm":
-        if out_dtype != torch.bfloat16:
-            raise ValueError(
-                f"Unsupported output dtype: {out_dtype}. "
-                f"Only torch.bfloat16 is supported for TRTLLM FP4 GEMM operations."
-            )
-    elif backend == "cutlass":
-        # No additional checks for cutlass
-        pass
     return True
 
 
@@ -1816,6 +1806,45 @@ def cudnn_gemm_fp4_requirement(
     return True
 
 
+@supported_compute_capability(["100", "103", "120"])
+def trtllm_gemm_fp4_requirement(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_descale: torch.Tensor,
+    b_descale: torch.Tensor,
+    alpha: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    out: Optional[torch.Tensor] = None,
+    block_size: int = 16,
+    use_8x4_sf_layout: bool = False,
+    backend: Literal["cudnn", "trtllm", "cutlass"] = "cudnn",
+    use_nvfp4: bool = True,
+):
+    if out_dtype != torch.bfloat16:
+        raise ValueError(
+            f"Unsupported output dtype: {out_dtype}. "
+            f"Only torch.bfloat16 is supported for TRTLLM FP4 GEMM operations."
+        )
+    return True
+
+
+@supported_compute_capability(["100", "103", "120"])
+def cutlass_gemm_fp4_requirement(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_descale: torch.Tensor,
+    b_descale: torch.Tensor,
+    alpha: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    out: Optional[torch.Tensor] = None,
+    block_size: int = 16,
+    use_8x4_sf_layout: bool = False,
+    backend: Literal["cudnn", "trtllm", "cutlass"] = "cudnn",
+    use_nvfp4: bool = True,
+):
+    return True
+
+
 # @supports_backends(
 #     ["cudnn", "trtllm", "cutlass"],
 #     anti_capabilities={"trtllm": ["110"]},
@@ -1823,7 +1852,11 @@ def cudnn_gemm_fp4_requirement(
 #     problem_size_check=_check_mm_fp4_backend_supported,
 # )
 @backend_requirement(
-    {"cudnn": cudnn_gemm_fp4_requirement},
+    {
+        "cudnn": cudnn_gemm_fp4_requirement,
+        "trtllm": trtllm_gemm_fp4_requirement,
+        "cutlass": cutlass_gemm_fp4_requirement,
+    },
     common_check=_check_mm_fp4_problem_size,
 )
 def mm_fp4(

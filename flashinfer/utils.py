@@ -808,7 +808,7 @@ def backend_requirement(backend_checks, common_check=None):
         def is_problem_size_supported(*args, **kwargs):
             backend = kwargs.get("backend")
             if backend not in backend_checks:
-                raise ValueError(
+                raise BackendSupportedError(
                     f"Backend '{backend}' is not supported for {func.__name__}"
                 )
             req_checker = backend_checks[backend]
