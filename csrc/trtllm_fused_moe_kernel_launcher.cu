@@ -455,8 +455,9 @@ void trtllm_fp8_block_scale_moe_launcher(
       static_cast<int*>(num_tokens_per_expert->data),
       static_cast<int*>(cta_idx_xy_to_batch_idx->data),
       static_cast<int*>(cta_idx_xy_to_mn_limit->data),
-      static_cast<int*>(num_non_exiting_ctas->data), args.mDtypeElt, btg_routing_bias_dtype, false,
-      true, static_cast<RoutingMethodType>(routing_method_type), stream);
+      static_cast<int*>(num_non_exiting_ctas->data), args.mDtypeElt, btg_routing_bias_dtype,
+      false /* use_routing_scales_on_input */, true  /* use_deep_seek_fp8 */,
+      static_cast<RoutingMethodType>(routing_method_type), stream);
 
   // MoE kernel except routing
   TVM_FFI_ICHECK_EQ(hidden_states->dtype, dl_float8_e4m3fn) << "hidden_states must be fp8.";
