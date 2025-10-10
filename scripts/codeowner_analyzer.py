@@ -31,6 +31,8 @@ class CodeOwnersAnalyzer:
         github_token: Optional[str] = None,
         use_api: bool = True,
         allowed_users: Optional[List[str]] = None,
+        max_depth: int = 3,
+        top_n_owners: int = 3,
     ):
         """
         Initialize the code owners analyzer.
@@ -43,10 +45,14 @@ class CodeOwnersAnalyzer:
             github_token: Optional GitHub API token for higher rate limits
             use_api: Whether to use GitHub API for email lookups (default: True)
             allowed_users: Optional list of GitHub usernames to include (filters out others)
+            max_depth: Maximum directory depth for module detection (default: 3)
+            top_n_owners: Number of top owners to include in CODEOWNERS file (default: 3)
         """
         self.repo_path = Path(repo_path).resolve()
         self.min_commits = min_commits
         self.days_back = days_back
+        self.max_depth = max_depth
+        self.top_n_owners = top_n_owners
         self.module_owners: DefaultDict[str, DefaultDict[str, int]] = defaultdict(
             lambda: defaultdict(int)
         )
@@ -439,8 +445,10 @@ class CodeOwnersAnalyzer:
 
             if file_ext in relevant_extensions:
                 # Add the directory and all parent directories as modules
+                # Limited by max_depth
                 path_parts = Path(dir_path).parts
-                for i in range(1, len(path_parts) + 1):
+                max_parts = min(len(path_parts), self.max_depth)
+                for i in range(1, max_parts + 1):
                     module = "/".join(path_parts[:i])
                     if not self.should_exclude(module):
                         modules.add(module)
@@ -654,10 +662,10 @@ class CodeOwnersAnalyzer:
 
             for module, data in results.items():
                 if data["owners"]:
-                    # Take top 3 owners or those with ownership score > 0.1
+                    # Take top N owners or those with ownership score > 0.1
                     top_owners = [
                         owner
-                        for owner in data["owners"][:3]
+                        for owner in data["owners"][: self.top_n_owners]
                         if owner["ownership_score"] > 0.1
                     ]
 
@@ -773,6 +781,18 @@ Examples:
         "--allowed-users-file",
         help="File containing allowed GitHub usernames, one per line",
     )
+    parser.add_argument(
+        "--depth",
+        type=int,
+        default=3,
+        help="Maximum directory depth for module detection (default: 3)",
+    )
+    parser.add_argument(
+        "--top-n",
+        type=int,
+        default=3,
+        help="Number of top owners to include in CODEOWNERS file (default: 3)",
+    )
 
     args = parser.parse_args()
 
@@ -811,6 +831,8 @@ Examples:
             github_token=args.github_token,
             use_api=not args.no_api,
             allowed_users=allowed_users,
+            max_depth=args.depth,
+            top_n_owners=args.top_n,
         )
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
