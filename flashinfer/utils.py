@@ -770,6 +770,50 @@ def get_native_fp4_dtype():
 
 
 def supported_compute_capability(supported_ccs):
+    """
+    Decorator to mark functions with their supported CUDA compute capabilities.
+
+    This decorator annotates a function with metadata about which CUDA compute
+    capabilities (CC) it supports. It adds a `_supported_ccs` attribute containing
+    the set of supported compute capabilities and an `is_compute_capability_supported`
+    method to check if a specific compute capability is supported.
+
+    Parameters
+    ----------
+    supported_ccs : list or iterable
+        A list of supported CUDA compute capability versions (e.g., [75, 80, 86, 89, 90, 100 , 103, 110, 120]).
+
+    Returns
+    -------
+    decorator : callable
+        A decorator function that adds compute capability metadata to the decorated function.
+
+    Attributes Added to Decorated Function
+    ---------------------------------------
+    _supported_ccs : set
+        A set of integers representing the supported compute capabilities.
+    is_compute_capability_supported : callable
+        A method that takes a compute capability (int) and returns True if it's
+        supported, False otherwise.
+
+    Examples
+    --------
+    >>> @supported_compute_capability([80, 86, 89, 90])
+    ... def my_kernel_function():
+    ...     pass
+    ...
+    >>> my_kernel_function._supported_ccs
+    {80, 86, 89, 90}
+    >>> my_kernel_function.is_compute_capability_supported(80)
+    True
+    >>> my_kernel_function.is_compute_capability_supported(75)
+    False
+
+    Notes
+    -----
+    This decorator is useful in conjunction with the backend_requirement decorator to mark functions with their supported CUDA compute capabilities.
+    """
+
     def decorator(func):
         func._supported_ccs = set(supported_ccs)
 
@@ -783,6 +827,100 @@ def supported_compute_capability(supported_ccs):
 
 
 def backend_requirement(backend_checks, common_check=None):
+    """
+    Decorator to enforce backend and problem size requirements for kernel functions.
+
+    This decorator validates that a function is called with a supported backend and
+    compute capability, and optionally validates problem size constraints. It performs
+    runtime checks before executing the function and raises appropriate errors if
+    requirements are not met. If checking overheads are a concern, you can pass a
+    `skip_check` keyword argument to the function to bypass the validation.
+
+    Parameters
+    ----------
+    backend_checks : dict
+        A dictionary mapping backend names (str) to requirement checker functions.
+        Each checker function should accept the same arguments as the decorated function
+        and return True if the problem size is supported, False otherwise.
+        Checkers can be decorated with @supported_compute_capability to specify
+        which compute capabilities they support.
+    common_check : callable, optional
+        An optional function that performs additional validation checks common to all
+        backends. Should accept the same arguments as the decorated function and return
+        True if requirements are met, False otherwise.
+
+    Returns
+    -------
+    decorator : callable
+        A decorator function that wraps the target function with validation logic, and inserts
+        the "skip_check" keyword argument to the function.
+
+    Attributes Added to Decorated Function
+    ---------------------------------------
+    is_backend_supported : callable
+        Method with signature `is_backend_supported(backend, cc=None)` that returns
+        True if the specified backend is supported, optionally for a specific compute
+        capability (cc).
+    is_compute_capability_supported : callable
+        Method with signature `is_compute_capability_supported(cc)` that returns True
+        if any backend supports the given compute capability.
+
+    Keyword Arguments Added to Decorated Function
+    ---------------------------------------------
+    skip_check : bool
+        (Defaults to False)
+        If True, the function will not be validated. This is useful for performance-critical code paths.
+
+    Raises
+    ------
+    BackendSupportedError
+        If the function is called with an unsupported backend or compute capability.
+    ValueError
+        If the problem size is not supported for the given backend.
+
+    Examples
+    --------
+    >>> @supported_compute_capability([80, 86, 89, 90])
+    ... def cutlass_check(q, k, v, backend):
+    ...     # Validate problem size constraints for CUTLASS backend
+    ...     return q.shape[-1] <= 256
+    ...
+    >>> @supported_compute_capability([75, 80, 86, 89, 90])
+    ... def cudnn_check(q, k, v, backend):
+    ...     # Validate problem size constraints for cuDNN backend
+    ...     return True
+    ...
+    >>> @backend_requirement({
+    ...     "cutlass": cutlass_check,
+    ...     "cudnn": cudnn_check
+    ... })
+    ... def my_attention_kernel(q, k, v, backend="cutlass"):
+    ...     # Backend invocation
+    ...     pass
+    ...
+    >>> # Check if backend is supported
+    >>> my_attention_kernel.is_backend_supported("cutlass")
+    True
+    >>> # Check if backend supports specific compute capability
+    >>> my_attention_kernel.is_backend_supported("cutlass", 75)
+    False
+    >>> my_attention_kernel.is_backend_supported("cutlass", 80)
+    True
+    >>> # Check if any backend supports a compute capability
+    >>> my_attention_kernel.is_compute_capability_supported(75)
+    True
+
+    Notes
+    -----
+    - The decorator automatically extracts compute capability from tensor arguments
+      by finding the first torch.Tensor in args or kwargs.
+    - A `skip_check=True` keyword argument can be passed to bypass validation for
+      performance-critical code paths.
+    - All validation is performed before the wrapped function executes.
+    - Works in conjunction with the @supported_compute_capability decorator to
+      provide fine-grained control over backend and architecture support.
+    """
+
     def decorator(func):
         def is_backend_supported(backend, cc=None):
             # Is this backend present?
