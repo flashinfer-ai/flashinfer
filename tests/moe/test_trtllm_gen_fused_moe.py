@@ -17,7 +17,6 @@ limitations under the License.
 from abc import ABC, abstractmethod
 from enum import IntEnum
 from typing import Dict
-
 import pytest
 import torch
 from cuda.bindings import runtime
@@ -2075,7 +2074,17 @@ def test_moe_quantization_classes(
     routed_scaling = routing_config["routed_scaling"]
     num_experts = routing_config["num_experts"]
     routing_method_type = routing_config["routing_method_type"]
-    tile_tokens_dim = calculate_tile_tokens_dim(num_tokens, num_experts, top_k)
+
+    tile_tokens_dim = calculate_tile_tokens_dim(
+        num_tokens,
+        num_experts,
+        top_k,
+        max_tile_tokens_dim=128
+        if (
+            type(moe_impl) is FP4Moe and moe_impl.quant_mode != QuantMode.FP4_MXFP4_Bf16
+        )
+        else 64,
+    )
 
     # Validation checks
     assert top_k <= num_experts
@@ -2233,36 +2242,4 @@ def test_moe_quantization_classes(
         atol=tolerances["atol"],
         rtol=tolerances["rtol"],
         percent=tolerances["percent"],
-    )
-
-
-if __name__ == "__main__":
-    # pytest.main([__file__, "-v"])
-    routing_config = {
-        "num_experts": 256,
-        "top_k": 8,
-        "padding": 8,
-        "n_groups": 8,
-        "top_k_groups": 4,
-        "routed_scaling": 2.5,
-        "has_routing_bias": True,
-        "routing_method_type": RoutingMethodType.DeepSeekV3,
-        "compatible_moe_impls": [
-            FP8BlockScaleMoe,
-        ],
-    }
-    weight_processing = {
-        "use_shuffled_weight": False,
-        "layout": WeightLayout.MajorK,
-        "compatible_moe_impls": [FP8BlockScaleMoe],
-    }
-    test_moe_quantization_classes(
-        num_tokens=4,
-        hidden_size=1024,
-        intermediate_size=1024,
-        moe_impl=FP8BlockScaleMoe(),
-        routing_config=routing_config,
-        weight_processing=weight_processing,
-        gated_act_type=GatedActType.SwiGlu,
-        cache_permute_indices=cache_permute_indices,
     )

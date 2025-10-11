@@ -393,6 +393,12 @@ void trtllm_fp8_block_scale_moe_launcher(
   int32_t max_num_padded_tokens =
       tensorrt_llm::kernels::trtllmgen_moe::Routing::getMaxPermutedPaddedCount(
           args.num_tokens, top_k, num_experts, tile_tokens_dim);
+  int32_t max_num_padded_tokens_gemm1 =
+      tensorrt_llm::kernels::trtllmgen_moe::Routing::maybeGetMinTokenCount(
+          max_num_padded_tokens, args.intermediate_size, btg::dtypeGetNumBits(args.mDtypeElt));
+  int32_t max_num_padded_tokens_gemm2 =
+      tensorrt_llm::kernels::trtllmgen_moe::Routing::maybeGetMinTokenCount(
+          max_num_padded_tokens, args.hidden_size, btg::dtypeGetNumBits(args.mDtypeOut));
   Tensor total_num_padded_tokens = alloc_tensor({1}, dl_int32, routing_logits->device);
   Tensor expanded_idx_to_permuted_idx =
       alloc_tensor({args.num_tokens * args.top_k}, dl_int32, routing_logits->device);
@@ -413,16 +419,16 @@ void trtllm_fp8_block_scale_moe_launcher(
   //                                    dl_float8_e4m3fn, hidden_states->device);
   // Tensor activation_output = alloc_tensor({max_num_padded_tokens, intermediate_size},
   //                                         dl_float8_e4m3fn, hidden_states->device);
-  Tensor gemm1_output =
-      alloc_tensor({max_num_padded_tokens, 2 * intermediate_size}, dl_uint8, hidden_states->device);
+  Tensor gemm1_output = alloc_tensor({max_num_padded_tokens_gemm1, 2 * intermediate_size}, dl_uint8,
+                                     hidden_states->device);
   Tensor gemm1_output_scale = alloc_tensor({2 * intermediate_size / 128, max_num_padded_tokens},
                                            dl_float32, hidden_states->device);
-  Tensor activation_output =
-      alloc_tensor({max_num_padded_tokens, intermediate_size}, dl_uint8, hidden_states->device);
-  Tensor activation_output_scale = alloc_tensor({intermediate_size / 128, max_num_padded_tokens},
-                                                dl_float32, hidden_states->device);
-  Tensor gemm2_output =
-      alloc_tensor({max_num_padded_tokens, args.hidden_size}, dl_bfloat16, hidden_states->device);
+  Tensor activation_output = alloc_tensor({max_num_padded_tokens_gemm1, intermediate_size},
+                                          dl_uint8, hidden_states->device);
+  Tensor activation_output_scale = alloc_tensor(
+      {intermediate_size / 128, max_num_padded_tokens_gemm1}, dl_float32, hidden_states->device);
+  Tensor gemm2_output = alloc_tensor({max_num_padded_tokens_gemm2, args.hidden_size}, dl_bfloat16,
+                                     hidden_states->device);
 
   int32_t max_num_ctas = tensorrt_llm::kernels::trtllmgen_moe::Routing::getMaxNumCtasInBatchDim(
       args.num_tokens, args.top_k, args.num_experts, tile_tokens_dim);
@@ -519,7 +525,8 @@ void trtllm_fp8_block_scale_moe_launcher(
 
   // setup workspace
   workspace.total_num_padded_tokens = static_cast<int*>(total_num_padded_tokens->data);
-  workspace.total_max_padded_tokens = max_num_padded_tokens;
+  workspace.total_max_padded_tokens =
+      std::max(max_num_padded_tokens_gemm1, max_num_padded_tokens_gemm2);
   workspace.ProjUpTileN = tile_tokens_dim;
   workspace.routing_expert_indexes = static_cast<int*>(expert_indexes->data);
   workspace.permuted_idx_size = static_cast<int*>(total_num_padded_tokens->data);
@@ -764,6 +771,12 @@ Array<Tensor> trtllm_fp4_block_scale_moe_launcher(
   int32_t max_num_padded_tokens =
       tensorrt_llm::kernels::trtllmgen_moe::Routing::getMaxPermutedPaddedCount(
           args.num_tokens, top_k, num_experts, tile_tokens_dim);
+  int32_t max_num_padded_tokens_gemm1 =
+      tensorrt_llm::kernels::trtllmgen_moe::Routing::maybeGetMinTokenCount(
+          max_num_padded_tokens, args.intermediate_size, btg::dtypeGetNumBits(args.mDtypeElt));
+  int32_t max_num_padded_tokens_gemm2 =
+      tensorrt_llm::kernels::trtllmgen_moe::Routing::maybeGetMinTokenCount(
+          max_num_padded_tokens, args.hidden_size, btg::dtypeGetNumBits(args.mDtypeOut));
   Tensor total_num_padded_tokens = alloc_tensor({1}, dl_int32, hidden_states->device);
   Tensor expanded_idx_to_permuted_idx =
       alloc_tensor({args.num_tokens, args.top_k}, dl_int32, hidden_states->device);
@@ -788,20 +801,20 @@ Array<Tensor> trtllm_fp4_block_scale_moe_launcher(
   // Tensor gemm1_output = alloc_tensor(
   //     {max_num_padded_tokens, gemm1_output_hidden},
   //     dtype_act == btg::Dtype::Bfloat16 ? dl_bfloat16 : dl_float8_e4m3fn, hidden_states->device);
-  Tensor gemm1_output = alloc_tensor({max_num_padded_tokens, gemm1_output_hidden},
+  Tensor gemm1_output = alloc_tensor({max_num_padded_tokens_gemm1, gemm1_output_hidden},
                                      dtype_act == btg::Dtype::Bfloat16 ? dl_bfloat16 : dl_uint8,
                                      hidden_states->device);
 
   Optional<Tensor> gemm1_output_scale = std::nullopt;
   if (dtype_act == btg::Dtype::E2m1 || dtype_act == btg::Dtype::MxE4m3) {
-    int64_t sf_size = tensorrt_llm::computeSwizzledLayoutSFSize(max_num_padded_tokens,
+    int64_t sf_size = tensorrt_llm::computeSwizzledLayoutSFSize(max_num_padded_tokens_gemm1,
                                                                 intermediate_size / sf_vec_size);
     // gemm1_output_scale = alloc_tensor({sf_size}, dl_float8_e4m3fn, hidden_states->device);
     gemm1_output_scale = alloc_tensor({sf_size}, dl_uint8, hidden_states->device);
   }
 
-  Tensor gemm2_output =
-      alloc_tensor({max_num_padded_tokens, args.hidden_size}, dl_bfloat16, hidden_states->device);
+  Tensor gemm2_output = alloc_tensor({max_num_padded_tokens_gemm2, args.hidden_size}, dl_bfloat16,
+                                     hidden_states->device);
 
   int32_t max_num_ctas = tensorrt_llm::kernels::trtllmgen_moe::Routing::getMaxNumCtasInBatchDim(
       args.num_tokens, args.top_k, args.num_experts, tile_tokens_dim);
@@ -958,7 +971,8 @@ Array<Tensor> trtllm_fp4_block_scale_moe_launcher(
 
   // setup workspace
   workspace.total_num_padded_tokens = static_cast<int*>(total_num_padded_tokens->data);
-  workspace.total_max_padded_tokens = max_num_padded_tokens;
+  workspace.total_max_padded_tokens =
+      std::max(max_num_padded_tokens_gemm1, max_num_padded_tokens_gemm2);
   workspace.ProjUpTileN = tile_tokens_dim;
   workspace.routing_expert_indexes = static_cast<int*>(expert_indices->data);
   workspace.permuted_idx_size = static_cast<int*>(total_num_padded_tokens->data);

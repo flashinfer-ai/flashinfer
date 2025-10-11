@@ -7,34 +7,11 @@ from flashinfer import (
     GatedActType,
     fp4_quantize,
     mxfp8_quantize,
-    next_positive_power_of_2,
 )
 from flashinfer.fused_moe import trtllm_fp4_block_scale_moe
 from flashinfer.autotuner import autotune
 from flashinfer.testing.utils import bench_gpu_time
-from flashinfer.utils import device_support_pdl
-
-
-def get_tile_tokens_dim(num_tokens, num_experts, top_k):
-    # Factor to account for the imbalance of the experts.
-    # factor equals to the
-    # max_real_num_tokens_per_expert / perfect_num_tokens_per_expert
-    # - 1.0 means perfect expert distribution.
-    # - > 1.0 means some experts have more
-    #     tokens than the perfect distribution.
-    # - < 1.0 does not make sense.
-    imbalance_factor = 1.3
-    # Calculate the number of tokens per expert
-    # assuming perfect distribution.
-    num_tokens_per_expert = (num_tokens * top_k) // num_experts
-    # Apply the imbalance factor.
-    num_tokens_per_expert = int(num_tokens_per_expert * imbalance_factor)
-    # And pad the number to the next power of 2.
-    tile_tokens_dim = next_positive_power_of_2(num_tokens_per_expert)
-    # Cap to 8-64 tokens per CTA tile
-    # as it's the range supported by the kernel.
-    tile_tokens_dim = min(max(tile_tokens_dim, 8), 64)
-    return tile_tokens_dim
+from flashinfer.utils import device_support_pdl, calculate_tile_tokens_dim
 
 
 def bench_trtllm_gen_fused_moe_autotuner(
@@ -122,7 +99,9 @@ def bench_trtllm_gen_fused_moe_autotuner(
     bias13 = torch.randn(num_experts, intermediate_size * 2, device=device) * 10
     bias2 = torch.randn(num_experts, intermediate_size * 2, device=device) * 10
 
-    tile_tokens_dim = get_tile_tokens_dim(num_tokens, num_experts, top_k)
+    tile_tokens_dim = calculate_tile_tokens_dim(
+        num_tokens, num_experts, top_k, 64 if quant_mode == "MxFP4xBf16" else 128
+    )
     output1_scale_scalar = torch.tensor(
         [hidden_states_global_scale * w13_global_scale] * num_experts, device=device
     )
@@ -158,7 +137,7 @@ def bench_trtllm_gen_fused_moe_autotuner(
         num_experts,
         None,  # routed_scaling_factor
         tile_tokens_dim,
-        RoutingMethodType.Renormalize.value[0],
+        RoutingMethodType.Renormalize.value,
         True,
         enable_pdl,
         GatedActType.SwiGlu.value,  # gated_act_type
