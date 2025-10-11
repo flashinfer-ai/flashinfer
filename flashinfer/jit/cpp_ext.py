@@ -166,7 +166,7 @@ def generate_ninja_build_for_op(
         # No module flags, use global flags
         cuda_cflags += global_flags
 
-    #/usr/lib/wsl/lib is for WSL2 users, their cuda.so is there
+    # /usr/lib/wsl/lib is for WSL2 users, their cuda.so is there
     ldflags = [
         "-shared",
         "-L/usr/lib/wsl/lib",
