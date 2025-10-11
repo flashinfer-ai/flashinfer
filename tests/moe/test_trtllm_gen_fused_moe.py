@@ -42,7 +42,7 @@ from flashinfer.fused_moe import (
     trtllm_fp8_per_tensor_scale_moe,
 )
 from flashinfer.fused_moe.core import (
-    _maybe_get_cached_w2_permute_indices,
+    get_w2_permute_indices_with_cache,
     _maybe_get_cached_w3_w1_permute_indices,
 )
 from flashinfer.utils import calculate_tile_tokens_dim, get_compute_capability
@@ -467,7 +467,7 @@ class FP4Moe(Moe):
                 )
             )
 
-            permute_indices = _maybe_get_cached_w2_permute_indices(
+            permute_indices = get_w2_permute_indices_with_cache(
                 self._cache_permute_indices,
                 gemm2_weights_fp4[i].view(torch.uint8),
                 epilogue_tile_m,
@@ -478,7 +478,7 @@ class FP4Moe(Moe):
                 .contiguous()
             )
 
-            permute_sf_indices = _maybe_get_cached_w2_permute_indices(
+            permute_sf_indices = get_w2_permute_indices_with_cache(
                 self._cache_permute_indices,
                 gemm2_scales_linear_fp4[i].view(torch.uint8),
                 epilogue_tile_m,
