@@ -19,12 +19,12 @@
 
 using namespace flashinfer;
 
-void packbits(Tensor x, const std::string& bitorder, Tensor y) {
+void packbits(TensorView x, const std::string& bitorder, TensorView y) {
   CHECK_INPUT(x);
   auto device = x->device;
   TVM_FFI_ICHECK(bitorder == "big" || bitorder == "little") << "bitorder must be 'big' or 'little'";
 
-  int64_t num_elements = get_numel(x);
+  int64_t num_elements = x.numel();
   auto stream = get_stream(x->device);
   cudaError_t status = quantization::PackBits(
       static_cast<bool*>(x->data), static_cast<uint8_t*>(y->data), num_elements,
@@ -34,8 +34,8 @@ void packbits(Tensor x, const std::string& bitorder, Tensor y) {
       << "PackBits failed with error code " << cudaGetErrorString(status);
 }
 
-void segment_packbits(Tensor x, Tensor input_indptr, Tensor output_indptr,
-                      const std::string& bitorder, Tensor y) {
+void segment_packbits(TensorView x, TensorView input_indptr, TensorView output_indptr,
+                      const std::string& bitorder, TensorView y) {
   CHECK_INPUT(x);
   CHECK_INPUT(input_indptr);
   CHECK_INPUT(output_indptr);

@@ -33,9 +33,9 @@ using namespace flashinfer;
 
 {{ act_func_def }}
 
-void {{ func_name }}(Tensor out, Tensor input, bool enable_pdl) {
+void {{ func_name }}(TensorView out, TensorView input, bool enable_pdl) {
   int d = input->shape[input->ndim -1] / 2;
-  int64_t num_tokens = get_numel(input) / input->shape[input->ndim -1];
+  int64_t num_tokens = input.numel() / input->shape[input->ndim -1];
   dim3 grid(num_tokens);
 
   cudaSetDevice(out->device.device_id);

@@ -17,20 +17,24 @@
 #include "../tvm_ffi_utils.h"
 #include "mha.h"
 
+using tvm::ffi::Optional;
+
 void xqa_wrapper(int64_t multiProcessorCount, int64_t nbKHeads, int64_t slidingWinSize,
-                 double qScale, Tensor output,
+                 double qScale, TensorView output,
 #if LOW_PREC_OUTPUT
-                 Tensor rcpOutScale,
+                 TensorView rcpOutScale,
 #endif
-                 Tensor q, Tensor attentionSinks, Tensor pool, Tensor kvCachePageList,
-                 int64_t maxSeqLen, Tensor seqLen, int64_t batchSize, Tensor kvCacheScale,
+                 TensorView q, Optional<TensorView> attentionSinks, TensorView pool,
+                 TensorView kvCachePageList, int64_t maxSeqLen, TensorView seqLen,
+                 int64_t batchSize, TensorView kvCacheScale,
 #if SPEC_DEC
-                 int64_t qSeqLen, Tensor qCuSeqLens, Tensor mask,
+                 int64_t qSeqLen, TensorView qCuSeqLens, TensorView mask,
 #endif
-                 Tensor semaphores, Tensor scratch) {
+                 TensorView semaphores, TensorView scratch) {
   auto stream = get_stream(output->device);
   float const* attentionSinksPtr =
-      attentionSinks.defined() ? reinterpret_cast<float const*>(attentionSinks->data) : nullptr;
+      attentionSinks.has_value() ? reinterpret_cast<float const*>(attentionSinks.value()->data)
+                                 : nullptr;
 
   launchMHAFlashInfer(multiProcessorCount, nbKHeads, slidingWinSize, qScale,
                       reinterpret_cast<OutputHead*>(output->data),

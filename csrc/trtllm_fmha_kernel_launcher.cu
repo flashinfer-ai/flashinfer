@@ -194,13 +194,14 @@ inline Data_type dl_dtype_to_tllm_data_type(const DLDataType dtype) {
 
 inline bool is_4bit(Data_type data_type) { return data_type == Data_type::DATA_TYPE_E2M1; }
 
-void trtllm_paged_attention_decode(Tensor out, Optional<Tensor> out_scale_factor, Tensor query,
-                                   Tensor key_cache, Tensor value_cache, Tensor workspace_buffer,
-                                   Tensor block_tables, Tensor seq_lens, int64_t max_kv_len,
-                                   double bmm1_scale, double bmm2_scale, double o_sf_scale,
-                                   int64_t o_sf_vec_size, int64_t o_sf_start_index,
-                                   int64_t window_left, int64_t sm_count, bool enable_pdl,
-                                   int64_t workspace_size, Optional<Tensor> attention_sinks) {
+void trtllm_paged_attention_decode(TensorView out, Optional<TensorView> out_scale_factor,
+                                   TensorView query, TensorView key_cache, TensorView value_cache,
+                                   TensorView workspace_buffer, TensorView block_tables,
+                                   TensorView seq_lens, int64_t max_kv_len, double bmm1_scale,
+                                   double bmm2_scale, double o_sf_scale, int64_t o_sf_vec_size,
+                                   int64_t o_sf_start_index, int64_t window_left, int64_t sm_count,
+                                   bool enable_pdl, int64_t workspace_size,
+                                   Optional<TensorView> attention_sinks) {
   auto q_data_type = dl_dtype_to_tllm_data_type(query->dtype);
   auto kv_data_type = dl_dtype_to_tllm_data_type(key_cache->dtype);
   TVM_FFI_ICHECK_EQ(key_cache->ndim, value_cache->ndim);
@@ -263,15 +264,16 @@ void trtllm_paged_attention_decode(Tensor out, Optional<Tensor> out_scale_factor
       enable_pdl, workspace_size, stream);
 }
 
-void trtllm_paged_attention_context(Tensor out, Optional<Tensor> out_scale_factor, Tensor query,
-                                    Tensor key_cache, Tensor value_cache, Tensor workspace_buffer,
-                                    Tensor block_tables, Tensor seq_lens, int64_t max_q_len,
-                                    int64_t max_kv_len, double bmm1_scale, double bmm2_scale,
-                                    double o_sf_scale, int64_t o_sf_vec_size,
-                                    int64_t o_sf_start_index, int64_t batch_size,
-                                    int64_t window_left, Tensor cum_seq_lens_q,
-                                    Tensor cum_seq_lens_kv, int64_t sm_count, bool enable_pdl,
-                                    int64_t workspace_size, Optional<Tensor> attention_sinks) {
+void trtllm_paged_attention_context(TensorView out, Optional<TensorView> out_scale_factor,
+                                    TensorView query, TensorView key_cache, TensorView value_cache,
+                                    TensorView workspace_buffer, TensorView block_tables,
+                                    TensorView seq_lens, int64_t max_q_len, int64_t max_kv_len,
+                                    double bmm1_scale, double bmm2_scale, double o_sf_scale,
+                                    int64_t o_sf_vec_size, int64_t o_sf_start_index,
+                                    int64_t batch_size, int64_t window_left,
+                                    TensorView cum_seq_lens_q, TensorView cum_seq_lens_kv,
+                                    int64_t sm_count, bool enable_pdl, int64_t workspace_size,
+                                    Optional<TensorView> attention_sinks) {
   auto q_data_type = dl_dtype_to_tllm_data_type(query->dtype);
   auto kv_data_type = dl_dtype_to_tllm_data_type(key_cache->dtype);
   auto o_data_type = dl_dtype_to_tllm_data_type(out->dtype);
@@ -411,13 +413,14 @@ void trtllm_ragged_attention_launcher(
   fmha_runner->run(runner_params);
 }
 
-void trtllm_ragged_attention(Tensor out, Tensor query, Tensor key, Tensor value,
-                             Tensor workspace_buffer, Tensor seq_lens, int64_t max_q_len,
+void trtllm_ragged_attention(TensorView out, TensorView query, TensorView key, TensorView value,
+                             TensorView workspace_buffer, TensorView seq_lens, int64_t max_q_len,
                              int64_t max_kv_len, double bmm1_scale, double bmm2_scale,
                              double o_sf_scale, int64_t batch_size, int64_t window_left,
-                             Tensor cum_seq_lens_q, Tensor cum_seq_lens_kv, int64_t sm_count,
-                             bool enable_pdl, bool is_causal, int64_t workspace_size,
-                             Optional<Tensor> attention_sinks, Optional<Tensor> lse) {
+                             TensorView cum_seq_lens_q, TensorView cum_seq_lens_kv,
+                             int64_t sm_count, bool enable_pdl, bool is_causal,
+                             int64_t workspace_size, Optional<TensorView> attention_sinks,
+                             Optional<TensorView> lse) {
   float* attention_sinks_ptr = nullptr;
   if (attention_sinks.has_value()) {
     TVM_FFI_ICHECK_EQ(attention_sinks.value()->dtype, dl_float32)
@@ -446,10 +449,10 @@ void trtllm_ragged_attention(Tensor out, Tensor query, Tensor key, Tensor value,
   int head_dim_v = value->shape[2];
   int k_stride_keys_values = key->strides[0];
   int k_stride_heads = key->strides[1];
-  int k_stride_batch = get_numel(key);
+  int k_stride_batch = key.numel();
   int v_stride_keys_values = value->strides[0];
   int v_stride_heads = value->strides[1];
-  int v_stride_batch = get_numel(value);
+  int v_stride_batch = value.numel();
 
   trtllm_ragged_attention_launcher(
       out->data, query->data, key->data, value->data, workspace_buffer->data,

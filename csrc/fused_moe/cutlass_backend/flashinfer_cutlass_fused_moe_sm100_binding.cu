@@ -227,12 +227,12 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         << ", Output: " << DLDataTypeToString(mOutputDtype);
   }
 
-  void runMoe(Tensor output, Tensor input, Tensor token_selected_experts,
-              Optional<Tensor> token_final_scales, Tensor fc1_expert_weights,
-              Optional<Tensor> fc1_expert_biases, Tensor fc2_expert_weights,
-              Optional<Tensor> fc2_expert_biases, Optional<Array<Tensor>> quant_scales,
-              Optional<Tensor> input_sf, Optional<Tensor> swiglu_alpha,
-              Optional<Tensor> swiglu_beta, Optional<Tensor> swiglu_limit, int64_t tp_size,
+  void runMoe(TensorView output, TensorView input, TensorView token_selected_experts,
+              Optional<TensorView> token_final_scales, TensorView fc1_expert_weights,
+              Optional<TensorView> fc1_expert_biases, TensorView fc2_expert_weights,
+              Optional<TensorView> fc2_expert_biases, Optional<Array<Tensor>> quant_scales,
+              Optional<TensorView> input_sf, Optional<TensorView> swiglu_alpha,
+              Optional<TensorView> swiglu_beta, Optional<TensorView> swiglu_limit, int64_t tp_size,
               int64_t tp_rank, int64_t ep_size, int64_t ep_rank, int64_t cluster_size,
               int64_t cluster_rank, bool enable_alltoall, bool min_latency_mode,
               Optional<Array<int64_t>> profile_ids, bool enable_pdl) {
@@ -395,17 +395,18 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 #endif
   }
 
-  void runMoeMinLantency(Tensor output, Tensor input, Tensor token_selected_experts,
-                         Optional<Tensor> token_final_scales, Tensor fc1_expert_weights,
-                         Optional<Tensor> fc1_expert_biases, Tensor fc2_expert_weights,
-                         Optional<Tensor> fc2_expert_biases, Optional<Array<Tensor>> quant_scales,
-                         Optional<Tensor> input_sf, Optional<Tensor> swiglu_alpha,
-                         Optional<Tensor> swiglu_beta, Optional<Tensor> swiglu_limit,
-                         Tensor num_active_experts_per_node, Tensor experts_to_token_score,
-                         Tensor active_expert_global_ids, int64_t tp_size, int64_t tp_rank,
-                         int64_t ep_size, int64_t ep_rank, int64_t cluster_size,
-                         int64_t cluster_rank, bool enable_alltoall, bool min_latency_mode,
-                         Optional<Array<int64_t>> profile_ids, bool enable_pdl) {
+  void runMoeMinLantency(TensorView output, TensorView input, TensorView token_selected_experts,
+                         Optional<TensorView> token_final_scales, TensorView fc1_expert_weights,
+                         Optional<TensorView> fc1_expert_biases, TensorView fc2_expert_weights,
+                         Optional<TensorView> fc2_expert_biases,
+                         Optional<Array<Tensor>> quant_scales, Optional<TensorView> input_sf,
+                         Optional<TensorView> swiglu_alpha, Optional<TensorView> swiglu_beta,
+                         Optional<TensorView> swiglu_limit, TensorView num_active_experts_per_node,
+                         TensorView experts_to_token_score, TensorView active_expert_global_ids,
+                         int64_t tp_size, int64_t tp_rank, int64_t ep_size, int64_t ep_rank,
+                         int64_t cluster_size, int64_t cluster_rank, bool enable_alltoall,
+                         bool min_latency_mode, Optional<Array<int64_t>> profile_ids,
+                         bool enable_pdl) {
     std::lock_guard<std::mutex> lock(mMutex);
 
     CHECK_INPUT_TYPE(input, mActivationDtype)
@@ -569,12 +570,12 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     return mAllProfiles.size();
   }
 
-  void runGemmProfile(Tensor input, Tensor fc1_expert_weights, Optional<Tensor> fc1_expert_biases,
-                      Tensor fc2_expert_weights, Optional<Tensor> fc2_expert_biases, int64_t top_k,
-                      int64_t tp_size, int64_t tp_rank, int64_t ep_size, int64_t ep_rank,
-                      int64_t cluster_size, int64_t cluster_rank, bool enable_alltoall,
-                      bool min_latency_mode, int64_t gemm_idx, int64_t profile_id,
-                      bool do_preparation, bool enable_pdl) {
+  void runGemmProfile(TensorView input, TensorView fc1_expert_weights,
+                      Optional<TensorView> fc1_expert_biases, TensorView fc2_expert_weights,
+                      Optional<TensorView> fc2_expert_biases, int64_t top_k, int64_t tp_size,
+                      int64_t tp_rank, int64_t ep_size, int64_t ep_rank, int64_t cluster_size,
+                      int64_t cluster_rank, bool enable_alltoall, bool min_latency_mode,
+                      int64_t gemm_idx, int64_t profile_id, bool do_preparation, bool enable_pdl) {
     std::lock_guard<std::mutex> lock(mMutex);
 
     // TODO: support profiling under fp8 block scaling in the future
@@ -656,12 +657,12 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
   Optional<Function> GetFunction(const tvm::ffi::String& name) final {
     if (name == "run_gemm_profile") {
       return Function::FromTyped(
-          [this](Tensor input, Tensor fc1_expert_weights, Optional<Tensor> fc1_expert_biases,
-                 Tensor fc2_expert_weights, Optional<Tensor> fc2_expert_biases, int64_t top_k,
-                 int64_t tp_size, int64_t tp_rank, int64_t ep_size, int64_t ep_rank,
-                 int64_t cluster_size, int64_t cluster_rank, bool enable_alltoall,
-                 bool min_latency_mode, int64_t gemm_idx, int64_t profile_id, bool do_preparation,
-                 bool enable_pdl) {
+          [this](TensorView input, TensorView fc1_expert_weights,
+                 Optional<TensorView> fc1_expert_biases, TensorView fc2_expert_weights,
+                 Optional<TensorView> fc2_expert_biases, int64_t top_k, int64_t tp_size,
+                 int64_t tp_rank, int64_t ep_size, int64_t ep_rank, int64_t cluster_size,
+                 int64_t cluster_rank, bool enable_alltoall, bool min_latency_mode,
+                 int64_t gemm_idx, int64_t profile_id, bool do_preparation, bool enable_pdl) {
             runGemmProfile(input, fc1_expert_weights, fc1_expert_biases, fc2_expert_weights,
                            fc2_expert_biases, top_k, tp_size, tp_rank, ep_size, ep_rank,
                            cluster_size, cluster_rank, enable_alltoall, min_latency_mode, gemm_idx,
@@ -671,15 +672,15 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       return Function::FromTyped([this]() -> int64_t { return getTacticNum(); });
     } else if (name == "run_moe") {
       return Function::FromTyped(
-          [this](Tensor output, Tensor input, Tensor token_selected_experts,
-                 Optional<Tensor> token_final_scales, Tensor fc1_expert_weights,
-                 Optional<Tensor> fc1_expert_biases, Tensor fc2_expert_weights,
-                 Optional<Tensor> fc2_expert_biases, Optional<Array<Tensor>> quant_scales,
-                 Optional<Tensor> input_sf, Optional<Tensor> swiglu_alpha,
-                 Optional<Tensor> swiglu_beta, Optional<Tensor> swiglu_limit, int64_t tp_size,
-                 int64_t tp_rank, int64_t ep_size, int64_t ep_rank, int64_t cluster_size,
-                 int64_t cluster_rank, bool enable_alltoall, bool min_latency_mode,
-                 Optional<Array<int64_t>> profile_ids, bool enable_pdl) {
+          [this](TensorView output, TensorView input, TensorView token_selected_experts,
+                 Optional<TensorView> token_final_scales, TensorView fc1_expert_weights,
+                 Optional<TensorView> fc1_expert_biases, TensorView fc2_expert_weights,
+                 Optional<TensorView> fc2_expert_biases, Optional<Array<Tensor>> quant_scales,
+                 Optional<TensorView> input_sf, Optional<TensorView> swiglu_alpha,
+                 Optional<TensorView> swiglu_beta, Optional<TensorView> swiglu_limit,
+                 int64_t tp_size, int64_t tp_rank, int64_t ep_size, int64_t ep_rank,
+                 int64_t cluster_size, int64_t cluster_rank, bool enable_alltoall,
+                 bool min_latency_mode, Optional<Array<int64_t>> profile_ids, bool enable_pdl) {
             runMoe(output, input, token_selected_experts, token_final_scales, fc1_expert_weights,
                    fc1_expert_biases, fc2_expert_weights, fc2_expert_biases, quant_scales, input_sf,
                    swiglu_alpha, swiglu_beta, swiglu_limit, tp_size, tp_rank, ep_size, ep_rank,
@@ -688,16 +689,17 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
           });
     } else if (name == "run_moe_min_latency") {
       return Function::FromTyped(
-          [this](Tensor output, Tensor input, Tensor token_selected_experts,
-                 Optional<Tensor> token_final_scales, Tensor fc1_expert_weights,
-                 Optional<Tensor> fc1_expert_biases, Tensor fc2_expert_weights,
-                 Optional<Tensor> fc2_expert_biases, Optional<Array<Tensor>> quant_scales,
-                 Optional<Tensor> input_sf, Optional<Tensor> swiglu_alpha,
-                 Optional<Tensor> swiglu_beta, Optional<Tensor> swiglu_limit,
-                 Tensor num_active_experts_per_node, Tensor experts_to_token_score,
-                 Tensor active_expert_global_ids, int64_t tp_size, int64_t tp_rank, int64_t ep_size,
-                 int64_t ep_rank, int64_t cluster_size, int64_t cluster_rank, bool enable_alltoall,
-                 bool min_latency_mode, Optional<Array<int64_t>> profile_ids, bool enable_pdl) {
+          [this](TensorView output, TensorView input, TensorView token_selected_experts,
+                 Optional<TensorView> token_final_scales, TensorView fc1_expert_weights,
+                 Optional<TensorView> fc1_expert_biases, TensorView fc2_expert_weights,
+                 Optional<TensorView> fc2_expert_biases, Optional<Array<Tensor>> quant_scales,
+                 Optional<TensorView> input_sf, Optional<TensorView> swiglu_alpha,
+                 Optional<TensorView> swiglu_beta, Optional<TensorView> swiglu_limit,
+                 TensorView num_active_experts_per_node, TensorView experts_to_token_score,
+                 TensorView active_expert_global_ids, int64_t tp_size, int64_t tp_rank,
+                 int64_t ep_size, int64_t ep_rank, int64_t cluster_size, int64_t cluster_rank,
+                 bool enable_alltoall, bool min_latency_mode, Optional<Array<int64_t>> profile_ids,
+                 bool enable_pdl) {
             runMoeMinLantency(output, input, token_selected_experts, token_final_scales,
                               fc1_expert_weights, fc1_expert_biases, fc2_expert_weights,
                               fc2_expert_biases, quant_scales, input_sf, swiglu_alpha, swiglu_beta,
@@ -892,10 +894,10 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       TVM_FFI_ICHECK_EQ(quant_scales.value().size(), 4)
       "Expecting 4 quant scales for W4A8_MXFP4_MXFP8 quantization";
 
-      Tensor fc1_weight_block = quant_scales.value()[0];
-      Tensor fc1_global = quant_scales.value()[1];
-      Tensor fc2_weight_block = quant_scales.value()[2];
-      Tensor fc2_global = quant_scales.value()[3];
+      TensorView fc1_weight_block = quant_scales.value()[0];
+      TensorView fc1_global = quant_scales.value()[1];
+      TensorView fc2_weight_block = quant_scales.value()[2];
+      TensorView fc2_global = quant_scales.value()[3];
 
       // The input for scale fc1_weight_block / fc2_weight_block is packed into INT32
       constexpr int FP8_PER_INT32 = 4;
@@ -951,12 +953,12 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       TVM_FFI_ICHECK_EQ(quant_scales.value().size(), 6)
           << "Expecting 6 quant scales for nvfp4 quantization";
 
-      Tensor fc1_act_global = quant_scales.value()[0];
-      Tensor fc1_weight_block = quant_scales.value()[1];
-      Tensor fc1_global = quant_scales.value()[2];
-      Tensor fc2_act_global = quant_scales.value()[3];
-      Tensor fc2_weight_block = quant_scales.value()[4];
-      Tensor fc2_global = quant_scales.value()[5];
+      TensorView fc1_act_global = quant_scales.value()[0];
+      TensorView fc1_weight_block = quant_scales.value()[1];
+      TensorView fc1_global = quant_scales.value()[2];
+      TensorView fc2_act_global = quant_scales.value()[3];
+      TensorView fc2_weight_block = quant_scales.value()[4];
+      TensorView fc2_global = quant_scales.value()[5];
 
       // The input for scale fc1_weight_block / fc2_weight_block is packed into INT32
       constexpr int FP8_PER_INT32 = 4;
@@ -1016,8 +1018,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
           static_cast<float const*>(fc2_global->data), fc1_act_global->ndim == 1,
           fc2_act_global->ndim == 1);
     } else if (mUseDeepSeekFP8BlockScaling) {
-      Tensor fc1_scales = quant_scales.value()[0];
-      Tensor fc2_scales = quant_scales.value()[1];
+      TensorView fc1_scales = quant_scales.value()[0];
+      TensorView fc2_scales = quant_scales.value()[1];
       return kernels::QuantParams::FP8BlockScaling(static_cast<float const*>(fc1_scales->data),
                                                    static_cast<float const*>(fc2_scales->data));
     } else if (isWFP4A16Quant()) {
@@ -1025,8 +1027,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       TVM_FFI_ICHECK_EQ(quant_scales.value().size(), 2)
           << "Expecting 2 quant scales for W4A16 quantization";
 
-      Tensor fc1_weight_scales = quant_scales.value()[0];
-      Tensor fc2_weight_scales = quant_scales.value()[1];
+      TensorView fc1_weight_scales = quant_scales.value()[0];
+      TensorView fc2_weight_scales = quant_scales.value()[1];
       int group_size = TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::wfp4a16_group_size;
       return kernels::QuantParams::GroupWise(group_size,
                                              static_cast<void const*>(fc1_weight_scales->data),
@@ -1036,26 +1038,24 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       TVM_FFI_ICHECK(quant_scales.has_value()) << "Expecting quant scales for INT4 quantization";
       TVM_FFI_ICHECK_EQ(quant_scales.value().size(), 8)
           << "Expecting 8 quant scales for INT4 quantization";
-      Tensor fc1_weight_scales = quant_scales.value()[0];
-      Tensor fc2_weight_scales = quant_scales.value()[1];
-      Tensor fc1_act_scales = quant_scales.value()[2];
-      Tensor fc2_act_scales = quant_scales.value()[3];
-      Tensor fc1_weight_zeros = quant_scales.value()[4];
-      Tensor fc2_weight_zeros = quant_scales.value()[5];
-      Tensor fc1_alpha = quant_scales.value()[6];
-      Tensor fc2_alpha = quant_scales.value()[7];
+      TensorView fc1_weight_scales = quant_scales.value()[0];
+      TensorView fc2_weight_scales = quant_scales.value()[1];
+      TensorView fc1_act_scales = quant_scales.value()[2];
+      TensorView fc2_act_scales = quant_scales.value()[3];
+      TensorView fc1_weight_zeros = quant_scales.value()[4];
+      TensorView fc2_weight_zeros = quant_scales.value()[5];
+      TensorView fc1_alpha = quant_scales.value()[6];
+      TensorView fc2_alpha = quant_scales.value()[7];
       int group_size = TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::int4_group_size;
       return kernels::QuantParams::GroupWise(
           group_size, static_cast<void const*>(fc1_weight_scales->data),
           static_cast<void const*>(fc2_weight_scales->data),
-          static_cast<void const*>(get_numel(fc1_act_scales) > 0 ? fc1_act_scales->data : nullptr),
-          static_cast<void const*>(get_numel(fc2_act_scales) > 0 ? fc2_act_scales->data : nullptr),
-          static_cast<void const*>(get_numel(fc1_weight_zeros) > 0 ? fc1_weight_zeros->data
-                                                                   : nullptr),
-          static_cast<void const*>(get_numel(fc2_weight_zeros) > 0 ? fc2_weight_zeros->data
-                                                                   : nullptr),
-          static_cast<float const*>(get_numel(fc1_alpha) > 0 ? fc1_alpha->data : nullptr),
-          static_cast<float const*>(get_numel(fc2_alpha) > 0 ? fc2_alpha->data : nullptr));
+          static_cast<void const*>(fc1_act_scales.numel() > 0 ? fc1_act_scales->data : nullptr),
+          static_cast<void const*>(fc2_act_scales.numel() > 0 ? fc2_act_scales->data : nullptr),
+          static_cast<void const*>(fc1_weight_zeros.numel() > 0 ? fc1_weight_zeros->data : nullptr),
+          static_cast<void const*>(fc2_weight_zeros.numel() > 0 ? fc2_weight_zeros->data : nullptr),
+          static_cast<float const*>(fc1_alpha.numel() > 0 ? fc1_alpha->data : nullptr),
+          static_cast<float const*>(fc2_alpha.numel() > 0 ? fc2_alpha->data : nullptr));
     } else {
       return kernels::QuantParams{};
     }

@@ -26,10 +26,11 @@ using namespace flashinfer;
 using tvm::ffi::Array;
 using tvm::ffi::Optional;
 
-void BatchMLAPagedAttentionSM90Run(Tensor float_workspace_buffer, Tensor int_workspace_buffer,
-                                   Array<int64_t> plan_info_vec, Tensor q_nope, Tensor q_pe,
-                                   Tensor ckv_cache, Tensor kpe_cache, Tensor kv_indices, Tensor o,
-                                   Optional<Tensor> maybe_lse, int64_t mask_mode_code,
+void BatchMLAPagedAttentionSM90Run(TensorView float_workspace_buffer,
+                                   TensorView int_workspace_buffer, Array<int64_t> plan_info_vec,
+                                   TensorView q_nope, TensorView q_pe, TensorView ckv_cache,
+                                   TensorView kpe_cache, TensorView kv_indices, TensorView o,
+                                   Optional<TensorView> maybe_lse, int64_t mask_mode_code,
                                    int64_t num_heads, int64_t page_size,
                                    double sm_scale ADDITIONAL_FUNC_PARAMS) {
   // q_nope: [n, num_heads, head_dim_ckv]

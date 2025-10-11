@@ -11,10 +11,10 @@ using namespace flashinfer;
 using tvm::ffi::Array;
 using tvm::ffi::Optional;
 
-Array<int64_t> BatchDecodeWithPagedKVCachePlanMLA(ffi::Tensor float_workspace_buffer,
-                                                  ffi::Tensor int_workspace_buffer,
-                                                  ffi::Tensor page_locked_int_workspace_buffer,
-                                                  ffi::Tensor indptr, int64_t batch_size,
+Array<int64_t> BatchDecodeWithPagedKVCachePlanMLA(ffi::TensorView float_workspace_buffer,
+                                                  ffi::TensorView int_workspace_buffer,
+                                                  ffi::TensorView page_locked_int_workspace_buffer,
+                                                  ffi::TensorView indptr, int64_t batch_size,
                                                   int64_t num_qo_heads, int64_t page_size,
                                                   bool enable_cuda_graph) {
   size_t float_workspace_size_in_bytes =
@@ -43,11 +43,13 @@ Array<int64_t> BatchDecodeWithPagedKVCachePlanMLA(ffi::Tensor float_workspace_bu
 }
 
 void BatchDecodeWithPagedKVCacheRunMLA(
-    ffi::Tensor float_workspace_buffer, ffi::Tensor int_workspace_buffer,
-    Array<int64_t> plan_info_vec, ffi::Tensor q_nope, ffi::Tensor q_pe, ffi::Tensor paged_ckv_cache,
-    ffi::Tensor paged_kpe_cache, ffi::Tensor paged_kv_indptr, ffi::Tensor paged_kv_indices,
-    ffi::Tensor paged_kv_last_page_len, ffi::Tensor o, double sm_scale, int64_t window_left,
-    double logits_soft_cap, double rope_scale, double rope_theta, Optional<ffi::Tensor> maybe_lse,
+    ffi::TensorView float_workspace_buffer, ffi::TensorView int_workspace_buffer,
+    Array<int64_t> plan_info_vec, ffi::TensorView q_nope, ffi::TensorView q_pe,
+    ffi::TensorView paged_ckv_cache, ffi::TensorView paged_kpe_cache,
+    ffi::TensorView paged_kv_indptr, ffi::TensorView paged_kv_indices,
+    ffi::TensorView paged_kv_last_page_len, ffi::TensorView o, double sm_scale, int64_t window_left,
+    double logits_soft_cap, double rope_scale, double rope_theta,
+    Optional<ffi::TensorView> maybe_lse,
     bool enable_pdl  // fake placeholder, sm80 does not support pdl
 ) {
   DecodePlanInfo plan_info;

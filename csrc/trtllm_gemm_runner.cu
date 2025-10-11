@@ -257,8 +257,9 @@ class TrtllmGenGemmRunner {
 using tvm::ffi::Array;
 using tvm::ffi::Optional;
 
-void trtllm_gemm(Tensor workspace_buffer, Tensor a, Tensor b, Tensor a_scale, Tensor b_scale,
-                 Optional<Tensor> globalScale, Tensor out, bool use_8x4_sf_layout, int64_t tactic) {
+void trtllm_gemm(TensorView workspace_buffer, TensorView a, TensorView b, TensorView a_scale,
+                 TensorView b_scale, Optional<TensorView> globalScale, TensorView out,
+                 bool use_8x4_sf_layout, int64_t tactic) {
   CHECK_DEVICE(a, b);
   CHECK_DEVICE(a, out);
   CHECK_INPUT(a);
@@ -310,7 +311,7 @@ void trtllm_gemm(Tensor workspace_buffer, Tensor a, Tensor b, Tensor a_scale, Te
 
   int64_t const required_workspace_size = runner.getWorkspaceSizeInBytes(m, n, k, tactic);
   int64_t const provided_workspace_size =
-      get_numel(workspace_buffer) * get_element_size(workspace_buffer);
+      workspace_buffer.numel() * get_element_size(workspace_buffer);
   if (provided_workspace_size < required_workspace_size) {
     Tensor new_workspace = alloc_tensor({required_workspace_size}, dl_int8, a->device);
     runKernel(new_workspace->data);

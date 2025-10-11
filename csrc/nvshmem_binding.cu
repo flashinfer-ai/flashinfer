@@ -28,9 +28,9 @@ constexpr int nvshmemx_uniqueid_t_size = sizeof(nvshmemx_uniqueid_t);
 using tvm::ffi::Array;
 using tvm::ffi::Shape;
 
-void get_unique_id(Tensor uid) {
+void get_unique_id(TensorView uid) {
   CHECK_CONTIGUOUS(uid);
-  TVM_FFI_ICHECK_EQ(get_numel(uid) * get_element_size(uid), nvshmemx_uniqueid_t_size);
+  TVM_FFI_ICHECK_EQ(uid.numel() * get_element_size(uid), nvshmemx_uniqueid_t_size);
   TVM_FFI_ICHECK_EQ(uid->device.device_type, kDLCPU);
   nvshmemx_uniqueid_t* uid_ptr = reinterpret_cast<nvshmemx_uniqueid_t*>(uid->data);
   *uid_ptr = NVSHMEMX_UNIQUEID_INITIALIZER;
@@ -39,9 +39,9 @@ void get_unique_id(Tensor uid) {
 
 int64_t unique_id_size() { return nvshmemx_uniqueid_t_size; }
 
-int64_t init(Tensor uid, int64_t rank, int64_t world_size) {
+int64_t init(TensorView uid, int64_t rank, int64_t world_size) {
   CHECK_CONTIGUOUS(uid);
-  TVM_FFI_ICHECK_EQ(get_numel(uid) * get_element_size(uid), nvshmemx_uniqueid_t_size);
+  TVM_FFI_ICHECK_EQ(uid.numel() * get_element_size(uid), nvshmemx_uniqueid_t_size);
   TVM_FFI_ICHECK_EQ(uid->device.device_type, kDLCPU);
   nvshmemx_uniqueid_t* uid_ptr = reinterpret_cast<nvshmemx_uniqueid_t*>(uid->data);
   nvshmemx_init_attr_t attr = NVSHMEMX_INIT_ATTR_INITIALIZER;
@@ -76,20 +76,20 @@ void barrier_all_on_current_stream() {
   nvshmemx_barrier_all_on_stream(stream);
 }
 
-void alltoall(Tensor dest, Tensor source) {
+void alltoall(TensorView dest, TensorView source) {
   CHECK_CONTIGUOUS(dest);
   CHECK_CONTIGUOUS(source);
   TVM_FFI_ICHECK_EQ(dest->dtype, source->dtype) << "dest and source must have the same dtype";
 
-  size_t nbytes = get_numel(dest) * get_element_size(dest) / dest->shape[0];
+  size_t nbytes = dest.numel() * get_element_size(dest) / dest->shape[0];
   cudaStream_t stream = get_stream(dest->device);
   NVSHMEMCHECK(nvshmemx_alltoallmem_on_stream(NVSHMEM_TEAM_WORLD, static_cast<uint8_t*>(dest->data),
                                               static_cast<uint8_t*>(source->data), nbytes, stream));
 }
 
-void fake_alltoall(Tensor dest, Tensor source) {}
+void fake_alltoall(TensorView dest, TensorView source) {}
 
-void sum_reduce(Tensor dest, Tensor source, int64_t nelems) {
+void sum_reduce(TensorView dest, TensorView source, int64_t nelems) {
   CHECK_CONTIGUOUS(dest);
   CHECK_CONTIGUOUS(source);
   TVM_FFI_ICHECK_EQ(dest->dtype, source->dtype) << "dest and source must have the same dtype";
@@ -124,10 +124,10 @@ void sum_reduce(Tensor dest, Tensor source, int64_t nelems) {
   }
 }
 
-void fake_sum_reduce(Tensor dest, Tensor source, int64_t nelems) {}
+void fake_sum_reduce(TensorView dest, TensorView source, int64_t nelems) {}
 
-void allreduce_on_stream_with_copy(Tensor dest_symm, Tensor source_symm, Tensor dest_local,
-                                   Tensor source_local, int64_t nelems) {
+void allreduce_on_stream_with_copy(TensorView dest_symm, TensorView source_symm,
+                                   TensorView dest_local, TensorView source_local, int64_t nelems) {
   CHECK_CONTIGUOUS(dest_symm);
   CHECK_CONTIGUOUS(source_symm);
   CHECK_CONTIGUOUS(dest_local);
@@ -150,8 +150,9 @@ void allreduce_on_stream_with_copy(Tensor dest_symm, Tensor source_symm, Tensor 
   cudaStreamSynchronize(stream);
 }
 
-void fake_allreduce_on_stream_with_copy(Tensor dest_symm, Tensor source_symm, Tensor dest_local,
-                                        Tensor source_local, int64_t nelems) {}
+void fake_allreduce_on_stream_with_copy(TensorView dest_symm, TensorView source_symm,
+                                        TensorView dest_local, TensorView source_local,
+                                        int64_t nelems) {}
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvshmem_get_unique_id, get_unique_id);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvshmem_unique_id_size, unique_id_size);

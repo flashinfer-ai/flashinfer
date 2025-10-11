@@ -19,8 +19,8 @@
 
 using tvm::ffi::Optional;
 
-void single_decode_with_kv_cache(Tensor q, Tensor k, Tensor v, Tensor tmp, Tensor o,
-                                 Optional<Tensor> maybe_lse, int64_t layout,
+void single_decode_with_kv_cache(TensorView q, TensorView k, TensorView v, TensorView tmp,
+                                 TensorView o, Optional<TensorView> maybe_lse, int64_t layout,
                                  int64_t window_left ADDITIONAL_FUNC_PARAMS);
 
 // Single-request decode with KV-Cache operator

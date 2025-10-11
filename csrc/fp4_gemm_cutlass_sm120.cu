@@ -50,14 +50,15 @@ CutlassGemmConfig getFp4GemmConfig(int64_t m, int64_t n, int64_t k, int64_t tact
 }
 
 template <typename T>
-void runGemm(Tensor& out, Tensor const& mat1, Tensor const& mat2, Tensor const& mat1Scale,
-             Tensor const& mat2Scale, Tensor const& globalScale, int64_t m, int64_t n, int64_t k,
-             int64_t batch_count, CutlassGemmConfig const& gemmConfig, Tensor workspace_buffer) {
+void runGemm(TensorView out, TensorView mat1, TensorView mat2, TensorView mat1Scale,
+             TensorView mat2Scale, TensorView globalScale, int64_t m, int64_t n, int64_t k,
+             int64_t batch_count, CutlassGemmConfig const& gemmConfig,
+             TensorView workspace_buffer) {
   CutlassFp4GemmRunner<T, FP4GemmType::W4A4_NVFP4_NVFP4> gemmRunner;
 
   int64_t const required_workspace_size = gemmRunner.getWorkspaceSize(m, n, k, batch_count);
   int64_t const provided_workspace_size =
-      get_numel(workspace_buffer) * get_element_size(workspace_buffer);
+      workspace_buffer.numel() * get_element_size(workspace_buffer);
 
   auto runKernel = [&](void* workspace) {
     gemmRunner.gemm(out->data, mat1->data, mat2->data, mat1Scale->data, mat2Scale->data,
@@ -78,9 +79,9 @@ void runGemm(Tensor& out, Tensor const& mat1, Tensor const& mat2, Tensor const& 
 constexpr auto FLOAT4_E2M1X2 = dl_uint8;  // uint8_t
 constexpr auto SF_DTYPE = dl_uint8;       // uint8_t
 
-Tensor fp4_bmm_impl(Tensor const& mat1, Tensor const& mat2, Tensor const& mat1Scale,
-                    Tensor const& mat2Scale, Tensor const& globalScale, Tensor out,
-                    Tensor workspace_buffer, int64_t tactic) {
+void fp4_bmm_impl(TensorView mat1, TensorView mat2, TensorView mat1Scale, TensorView mat2Scale,
+                  TensorView globalScale, TensorView out, TensorView workspace_buffer,
+                  int64_t tactic) {
   // Validate inputs
   TVM_FFI_ICHECK_EQ(mat1->dtype, FLOAT4_E2M1X2) << "mat1 must be FLOAT4_E2M1X2 (uint8)";
   TVM_FFI_ICHECK_EQ(mat2->dtype, FLOAT4_E2M1X2) << "mat2 must be FLOAT4_E2M1X2 (uint8)";
@@ -134,7 +135,7 @@ Tensor fp4_bmm_impl(Tensor const& mat1, Tensor const& mat2, Tensor const& mat1Sc
   // k_packed stores 2 FP4 values per byte
   int64_t k = k_packed * 2;
 
-  TVM_FFI_ICHECK_EQ(get_numel(globalScale), 1) << "globalScale must be a scalar tensor";
+  TVM_FFI_ICHECK_EQ(globalScale.numel(), 1) << "globalScale must be a scalar tensor";
 
   // Configure the kernel
   CutlassGemmConfig config =
@@ -165,15 +166,13 @@ Tensor fp4_bmm_impl(Tensor const& mat1, Tensor const& mat2, Tensor const& mat1Sc
     default:
       TVM_FFI_ICHECK(false) << "out_dtype must be one of fp16/bf16.";
   }
-  return out;
 }
 
 }  // namespace
 
-Tensor fp4_gemm(Tensor const& mat1, Tensor const& mat2, Tensor const& mat1Scale,
-                Tensor const& mat2Scale, Tensor const& globalScale, Tensor out,
-                Tensor workspace_buffer, int64_t tactic) {
-  return fp4_bmm_impl(mat1, mat2, mat1Scale, mat2Scale, globalScale, out, workspace_buffer, tactic);
+void fp4_gemm(TensorView mat1, TensorView mat2, TensorView mat1Scale, TensorView mat2Scale,
+              TensorView globalScale, TensorView out, TensorView workspace_buffer, int64_t tactic) {
+  fp4_bmm_impl(mat1, mat2, mat1Scale, mat2Scale, globalScale, out, workspace_buffer, tactic);
 }
 
 int64_t fp4_gemm_tactic_num() {

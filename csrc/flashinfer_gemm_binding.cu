@@ -16,12 +16,12 @@
 
 #include "tvm_ffi_utils.h"
 
-void bmm_fp8(Tensor A, Tensor B, Tensor D, Tensor A_scale, Tensor B_scale, Tensor workspace_buffer,
-             int64_t cublas_handle);
+void bmm_fp8(TensorView A, TensorView B, TensorView D, TensorView A_scale, TensorView B_scale,
+             TensorView workspace_buffer, int64_t cublas_handle);
 
-void CutlassSegmentGEMM(Tensor workspace_buffer, Tensor all_problems, Tensor x_ptr, Tensor w_ptr,
-                        Tensor y_ptr, Tensor x_ld, Tensor w_ld, Tensor y_ld, Tensor empty_x_data,
-                        bool weight_column_major);
+void CutlassSegmentGEMM(TensorView workspace_buffer, TensorView all_problems, TensorView x_ptr,
+                        TensorView w_ptr, TensorView y_ptr, TensorView x_ld, TensorView w_ld,
+                        TensorView y_ld, TensorView empty_x_data, bool weight_column_major);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(cutlass_segment_gemm, CutlassSegmentGEMM);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(bmm_fp8, bmm_fp8);

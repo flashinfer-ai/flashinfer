@@ -58,14 +58,15 @@ CutlassGemmConfig getFp4GemmConfig(int64_t m, int64_t n, int64_t k, int64_t tact
 }
 
 template <typename T>
-void runGemm(Tensor& out, Tensor const& mat1, Tensor const& mat2, Tensor const& mat1Scale,
-             Tensor const& mat2Scale, Tensor const& globalScale, int64_t m, int64_t n, int64_t k,
-             int64_t batch_count, CutlassGemmConfig const& gemmConfig, Tensor workspace_buffer) {
+void runGemm(TensorView out, TensorView mat1, TensorView mat2, TensorView mat1Scale,
+             TensorView mat2Scale, TensorView globalScale, int64_t m, int64_t n, int64_t k,
+             int64_t batch_count, CutlassGemmConfig const& gemmConfig,
+             TensorView workspace_buffer) {
   CutlassFp4GemmRunner<T, FP4GemmType::W4A4_NVFP4_NVFP4> gemmRunner;
 
   int64_t const required_workspace_size = gemmRunner.getWorkspaceSize(m, n, k, batch_count);
   int64_t const provided_workspace_size =
-      get_numel(workspace_buffer) * get_element_size(workspace_buffer);
+      workspace_buffer.numel() * get_element_size(workspace_buffer);
 
   auto runKernel = [&](void* workspace) {
     gemmRunner.gemm(out->data, mat1->data, mat2->data, mat1Scale->data, mat2Scale->data,
@@ -93,9 +94,9 @@ constexpr auto SF_DTYPE = dl_uint8;       // uint8_t
 // mat2Scale: ceil(N / 128) * 128 * ceil(K / sfVecSize / 4) * 4, SF_DTYPE (UE4M3 or UE8M0)
 // globalScale: [1], 1 / (((448 * 6) / mat1.abs().max()) * ((448 * 6) / mat2.abs().max()))
 // B = 1 for GEMM op as a special case
-Tensor fp4_bmm_impl(Tensor const& mat1, Tensor const& mat2, Tensor const& mat1Scale,
-                    Tensor const& mat2Scale, Tensor const& globalScale, Tensor out,
-                    Tensor workspace_buffer, int64_t tactic) {
+void fp4_bmm_impl(TensorView mat1, TensorView mat2, TensorView mat1Scale, TensorView mat2Scale,
+                  TensorView globalScale, TensorView out, TensorView workspace_buffer,
+                  int64_t tactic) {
   CHECK_INPUT_AND_TYPE(mat1, FLOAT4_E2M1X2);
   CHECK_INPUT_AND_TYPE(mat2, FLOAT4_E2M1X2);
 
@@ -169,15 +170,13 @@ Tensor fp4_bmm_impl(Tensor const& mat1, Tensor const& mat2, Tensor const& mat1Sc
     default:
       TVM_FFI_ICHECK(false) << "out_dtype must be one of fp16/bf16.";
   }
-  return out;
 }
 
 }  // namespace
 
-Tensor fp4_gemm(Tensor const& mat1, Tensor const& mat2, Tensor const& mat1Scale,
-                Tensor const& mat2Scale, Tensor const& globalScale, Tensor out,
-                Tensor workspace_buffer, int64_t tactic) {
-  return fp4_bmm_impl(mat1, mat2, mat1Scale, mat2Scale, globalScale, out, workspace_buffer, tactic);
+void fp4_gemm(TensorView mat1, TensorView mat2, TensorView mat1Scale, TensorView mat2Scale,
+              TensorView globalScale, TensorView out, TensorView workspace_buffer, int64_t tactic) {
+  fp4_bmm_impl(mat1, mat2, mat1Scale, mat2Scale, globalScale, out, workspace_buffer, tactic);
 }
 
 int64_t fp4_gemm_tactic_num() {

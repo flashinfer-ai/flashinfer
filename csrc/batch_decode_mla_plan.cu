@@ -9,10 +9,10 @@ using namespace flashinfer;
 
 using tvm::ffi::Array;
 
-Array<int64_t> BatchDecodeWithPagedKVCachePlanMLA(Tensor float_workspace_buffer,
-                                                  Tensor int_workspace_buffer,
-                                                  Tensor page_locked_int_workspace_buffer,
-                                                  Tensor indptr, int64_t batch_size,
+Array<int64_t> BatchDecodeWithPagedKVCachePlanMLA(TensorView float_workspace_buffer,
+                                                  TensorView int_workspace_buffer,
+                                                  TensorView page_locked_int_workspace_buffer,
+                                                  TensorView indptr, int64_t batch_size,
                                                   int64_t num_qo_heads, int64_t page_size,
                                                   bool enable_cuda_graph) {
   cudaSetDevice(float_workspace_buffer->device.device_id);
