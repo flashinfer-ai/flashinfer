@@ -333,18 +333,18 @@ void trtllm_fp8_block_scale_moe_launcher(
         << "routing_bias has incorrect shape.";
   }
 
-  if (n_group <= 0 || topk_group <= 0) {
-    TVM_FFI_ICHECK_EQ(top_k, 1) << "Current routing kernel (no groups) only supports top_k=1.";
-  } else {
-    TVM_FFI_ICHECK_LE(top_k, 8) << "Current routing kernel (with groups) only supports top_k<=8.";
-    TVM_FFI_ICHECK_LE(topk_group, 4)
-        << "Current routing kernel (with groups) only supports topk_group<=4.";
-    TVM_FFI_ICHECK_LE(topk_group, n_group) << "n_group must not be smaller than topk_group.";
-    TVM_FFI_ICHECK_EQ(num_experts % n_group, 0) << "num_experts must be divisible by n_group";
-    // This check ensures we have enough experts in the selected groups to handle the top_k routing
-    TVM_FFI_ICHECK_LT(top_k, (topk_group * num_experts / n_group))
-        << "top_k must be less than total number of experts in selected groups";
-  }
+  //   if (n_group <= 0 || topk_group <= 0) {
+  //     TVM_FFI_ICHECK_EQ(top_k, 1) << "Current routing kernel (no groups) only supports top_k=1.";
+  //   } else {
+  //     TVM_FFI_ICHECK_LE(top_k, 8) << "Current routing kernel (with groups) only supports
+  //     top_k<=8."; TVM_FFI_ICHECK_LE(topk_group, 4)
+  //         << "Current routing kernel (with groups) only supports topk_group<=4.";
+  //     TVM_FFI_ICHECK_LE(topk_group, n_group) << "n_group must not be smaller than topk_group.";
+  //     TVM_FFI_ICHECK_EQ(num_experts % n_group, 0) << "num_experts must be divisible by n_group";
+  //     // This check ensures we have enough experts in the selected groups to handle the top_k
+  //     routing TVM_FFI_ICHECK_LT(top_k, (topk_group * num_experts / n_group))
+  //         << "top_k must be less than total number of experts in selected groups";
+  //   }
   TVM_FFI_ICHECK_EQ(num_experts % 4, 0)
       << "Routing kernel expects that num_experts must be divisible by 4";
   TVM_FFI_ICHECK_GT(num_experts, top_k) << "num_experts must be greater than top_k";
@@ -691,8 +691,8 @@ Array<Tensor> trtllm_fp4_block_scale_moe_launcher(
     TVM_FFI_ICHECK(topk_group.has_value()) << "if n_group is given, topk_group must be given";
     TVM_FFI_ICHECK_EQ(num_experts % n_group.value(), 0)
         << "num_experts must be divisible by n_group";
-    TVM_FFI_ICHECK(top_k <= 8 && top_k > 0)
-        << "Current routing kernel (with groups) only supports top_k<=8 && top_k>0.";
+    // TVM_FFI_ICHECK(top_k <= 8 && top_k > 0)
+    //     << "Current routing kernel (with groups) only supports top_k<=8 && top_k>0.";
     TVM_FFI_ICHECK(topk_group.value() <= 4 && topk_group.value() > 0)
         << "Current routing kernel only (with groups) supports topk_group<=4 && topk_group > 0.";
     TVM_FFI_ICHECK_LE(topk_group.value(), n_group.value())
@@ -705,9 +705,9 @@ Array<Tensor> trtllm_fp4_block_scale_moe_launcher(
              static_cast<RoutingMethodType>(routing_method_type) ==
                  RoutingMethodType::RenormalizeNaive ||
              static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::TopK) {
-    TVM_FFI_ICHECK(top_k <= 8 && top_k > 0)
-        << "Current routing kernel (no groups, renormalize/topk) only supports top_k<=8 && "
-           "top_k>0.";
+    // TVM_FFI_ICHECK(top_k <= 8 && top_k > 0)
+    //     << "Current routing kernel (no groups, renormalize/topk) only supports top_k<=8 && "
+    //        "top_k>0.";
   } else if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Llama4) {
     TVM_FFI_ICHECK_EQ(top_k, 1)
         << "Current routing kernel (no groups, Llama4) only supports top_k=1.";
