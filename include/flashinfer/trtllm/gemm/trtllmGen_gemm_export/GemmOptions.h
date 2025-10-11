@@ -92,16 +92,18 @@ struct GemmOptions {
 
   GemmOptions() = default;
   GemmOptions(AllReduceAlgo allReduceAlgo, BiasType biasType, int blockK, int clusterDimX,
-              int clusterDimY, int clusterDimZ, tg::Dtype dtypeAcc, tg::Dtype dtypeA,
-              tg::Dtype dtypeB, tg::Dtype dtypeC, tg::Dtype dtypeMmaA, tg::Dtype dtypeMmaB,
-              bool enablesEarlyExit, bool enablesDelayedEarlyExit, bool enablesGlobalPtxKnobs,
-              int epilogueLdtmDps, int epilogueLdtmBits, int epilogueTileM, int epilogueTileN,
-              bool gridTriggerSecondaryA, bool gridTriggerSecondaryB,
-              bool gridWaitForPrimaryEarlyExit, bool gridWaitForPrimaryA, bool gridWaitForPrimaryB,
-              bool hoistLoadTaskInit, bool hoistMmaTaskTryWaits, int k, KernelTraits kernelTraits,
-              MatrixLayout layoutA, MatrixLayout layoutB, int m, int mmaK, tg::MmaKind mmaKind,
-              int mmaM, int mmaN, bool mockAllReduce, int n, int numSlicesForSplitK,
-              int numSlicesForSliceK, int numStages, int numStagesMma,
+              int clusterDimY, int clusterDimZ, CtaSwizzleType ctaSwizzleType, tg::Dtype dtypeAcc,
+              tg::Dtype dtypeA, tg::Dtype dtypeB, tg::Dtype dtypeC, tg::Dtype dtypeMmaA,
+              tg::Dtype dtypeMmaB, bool enablesEarlyExit, bool enablesDelayedEarlyExit,
+              bool enablesGlobalPtxKnobs, int epilogueLdtmDps, int epilogueLdtmBits,
+              int epilogueTileM, int epilogueTileN, bool gridTriggerSecondaryA,
+              bool gridTriggerSecondaryB, bool gridWaitForPrimaryEarlyExit,
+              bool gridWaitForPrimaryA, bool gridWaitForPrimaryB, bool hoistLoadTaskInit,
+              bool hoistMmaTaskTryWaits, int k, KernelTraits kernelTraits, MatrixLayout layoutA,
+              MatrixLayout layoutB, int m, int mmaK, tg::MmaKind mmaKind, int mmaM, int mmaN,
+              bool mockAllReduce, int n, int numRegsCastAWarps, int numRegsCopySfLdsSttm,
+              int numRegsPerThreadEpilogueWarp, int numRegsPerThreadNonEpilogueWarp,
+              int numSlicesForSplitK, int numSlicesForSliceK, int numStages, int numStagesMma,
               int numStagesMmaWithinWorkTile, int numStagesMmaAcrossWorkTile, int numStagesWorkId,
               bool outputDebugTensors, bool patchF2fp, std::optional<int32_t> sfBlockSizeA,
               tg::SfLayout sfLayoutA, tg::SfLayout sfLayoutB, tg::SfLayout sfLayoutC,
@@ -117,6 +119,7 @@ struct GemmOptions {
         mClusterDimX{clusterDimX},
         mClusterDimY{clusterDimY},
         mClusterDimZ{clusterDimZ},
+        mCtaSwizzleType{ctaSwizzleType},
         mDtypeAcc{dtypeAcc},
         mDtypeA{dtypeA},
         mDtypeB{dtypeB},
@@ -148,6 +151,10 @@ struct GemmOptions {
         mMmaN{mmaN},
         mMockAllReduce{mockAllReduce},
         mN{n},
+        mNumRegsCastAWarps(numRegsCastAWarps),
+        mNumRegsCopySfLdsSttm(numRegsCopySfLdsSttm),
+        mNumRegsPerThreadEpilogueWarp(numRegsPerThreadEpilogueWarp),
+        mNumRegsPerThreadNonEpilogueWarp(numRegsPerThreadNonEpilogueWarp),
         mNumSlicesForSplitK{numSlicesForSplitK},
         mNumSlicesForSliceK{numSlicesForSliceK},
         mNumStages{numStages},
@@ -193,6 +200,8 @@ struct GemmOptions {
   int mClusterDimY{1};
   // Cluster size in Z dim.
   int mClusterDimZ{1};
+  // The type of CTA swizzle.
+  CtaSwizzleType mCtaSwizzleType{CtaSwizzleType::RasterizeAlongM};
   // Data type of the accumulators.
   tg::Dtype mDtypeAcc{tg::Dtype::Fp32};
   // Data type of the A matrix.
@@ -263,6 +272,14 @@ struct GemmOptions {
   bool mMockAllReduce{false};
   // The N dimension of GEMM.
   int mN{64 * 4};
+  // Number of registers for the cast A warps.
+  int mNumRegsCastAWarps{0};
+  // Number of registers for the LDS+STTM warps.
+  int mNumRegsCopySfLdsSttm{0};
+  // Number of registers per thread for epilogue warps
+  int mNumRegsPerThreadEpilogueWarp{0};
+  // Number of registers per thread for non-epilogue warps
+  int mNumRegsPerThreadNonEpilogueWarp{0};
   // Number of partitions along the K dimension. When mNumSlicesForSplitK > 1,
   // the problem is distributed across several SMs, where each CTA works on its local K slice.
   // Partial results are accumulated afterwards using either GMEM or DSMEM (in CGA)
@@ -369,6 +386,7 @@ struct GemmConfig {
   char const* mHash{nullptr};
 #else
   trtllm::gen::CudaRunner* mCudaRunner{nullptr};
+  int32_t mInstanceIdx{0};
 #endif
 
   GemmOptions mOptions{};
@@ -409,6 +427,8 @@ inline std::string dumpOptions(GemmOptions const& options) {
   ss << "mClusterDimX=" << options.mClusterDimX << "," << std::endl;
   ss << "mClusterDimY=" << options.mClusterDimY << "," << std::endl;
   ss << "mClusterDimZ=" << options.mClusterDimZ << "," << std::endl;
+  ss << "mCtaSwizzleType=" << "gemm::CtaSwizzleType("
+     << static_cast<int32_t>(options.mCtaSwizzleType) << ")" << "," << std::endl;
   ss << "mDtypeAcc=" << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mDtypeAcc) << ")"
      << "," << std::endl;
   ss << "mDtypeA=" << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mDtypeA) << ")" << ","
@@ -449,6 +469,12 @@ inline std::string dumpOptions(GemmOptions const& options) {
   ss << "mMmaN=" << options.mMmaN << "," << std::endl;
   ss << "mMockAllReduce=" << options.mMockAllReduce << "," << std::endl;
   ss << "mN=" << options.mN << "," << std::endl;
+  ss << "mNumRegsCastAWarps=" << options.mNumRegsCastAWarps << "," << std::endl;
+  ss << "mNumRegsCopySfLdsSttm=" << options.mNumRegsCopySfLdsSttm << "," << std::endl;
+  ss << "mNumRegsPerThreadEpilogueWarp=" << options.mNumRegsPerThreadEpilogueWarp << ","
+     << std::endl;
+  ss << "mNumRegsPerThreadNonEpilogueWarp=" << options.mNumRegsPerThreadNonEpilogueWarp << ","
+     << std::endl;
   ss << "mNumSlicesForSplitK=" << options.mNumSlicesForSplitK << "," << std::endl;
   ss << "mNumSlicesForSliceK=" << options.mNumSlicesForSliceK << "," << std::endl;
   ss << "mNumStages=" << options.mNumStages << "," << std::endl;
@@ -673,17 +699,26 @@ inline bool checkAndUpdateGemmOptions(GemmOptions& options, bool isBlackwell, in
   if ((options.mMmaKind == tg::MmaKind::MxFp4NvFp4 ||
        options.mMmaKind == tg::MmaKind::MxFp8Fp6Fp4 || options.mDtypeC == tg::Dtype::MxE4m3) &&
       options.mMmaM != 128) {
-    // MMA M must be 128 when the input uses block scaling, or when the output is an Mx format.
-    int newTileM = 128 * divUp(options.mTileM, 128);
-    TLLM_LOG_WARNING("Unsupported MmaM (", options.mMmaM,
-                     ") for MmaKind=", gemm::toString(options.mMmaKind),
-                     ". Setting MmaM to 128 and TileM to ", newTileM);
-    if (updateOptions) {
-      options.mMmaM = 128;
-      options.mTileM = newTileM;
+    if (options.mClusterDimX == 1) {
+      // MMA M must be 128 when the input uses block scaling, or when the output is an Mx format.
+      int newTileM = 128 * divUp(options.mTileM, 128);
+      TLLM_LOG_WARNING("Unsupported MmaM (", options.mMmaM,
+                       ") for MmaKind=", gemm::toString(options.mMmaKind),
+                       ". Setting MmaM to 128 and TileM to ", newTileM);
+      if (updateOptions) {
+        options.mMmaM = 128;
+        options.mTileM = newTileM;
+      } else {
+        return false;
+      }
     } else {
-      return false;
+      TLLM_CHECK_ERROR(options.mMmaM == 256 && options.mTileM == 128,
+                       "2CTA UTCxMMA only supports mmaM = 256 and tileM = 128.");
     }
+  }
+  if (options.mClusterDimX > 1) {
+    TLLM_CHECK_ERROR(options.mLayoutB != MatrixLayout::BlockMajorK,
+                     "layoutB == MatrixLayout::BlockMajorK is not supported for now");
   }
   if (options.mMmaKind == tg::MmaKind::MxFp4NvFp4 || options.mMmaKind == tg::MmaKind::MxFp8Fp6Fp4) {
     TLLM_CHECK_ERROR(isBlackwell, "Block scaling is only supported on Blackwell");
@@ -869,14 +904,26 @@ inline bool checkAndUpdateGemmOptions(GemmOptions& options, bool isBlackwell, in
   }
 
   if (!options.mSliceK) {
-    TLLM_CHECK_ERROR(options.mMmaM <= options.mEpilogueTileM,
+    TLLM_CHECK_ERROR(options.mMmaM / options.mClusterDimX <= options.mEpilogueTileM,
                      "EpilogueTileM must be larger or equal than mmaM.");
+  } else {
+    // FIXME: this is not necessary limitation. Simply fixing num repeats in TmemSliceKA should be
+    // enough.
+    TLLM_CHECK_ERROR((options.mTileN & (options.mTileN - 1)) == 0,
+                     "For Slice-K TileN is required to be a power of 2");
   }
+
+  if (options.mClusterDimX == 2) {
+    TLLM_CHECK_ERROR(options.mMmaM == 256, "Only mmaM = 256 is supported for 2CTA UTCMMA.");
+    TLLM_CHECK_ERROR(options.mMmaN % 16 == 0, "mmaN needs to be multiple of 16 for 2CTA UTCMMA.");
+  }
+
   TLLM_CHECK_ERROR(
       options.mTileM % options.mEpilogueTileM == 0 && options.mTileN % options.mEpilogueTileN == 0,
       "TileM and TileN must be divisible by EpilogueTileM and EpilogueTileN respectively.");
-  TLLM_CHECK_ERROR(options.mClusterDimX == 1 && options.mClusterDimY == 1,
-                   "GEMM does not support cluster in X and Y dimensions.");
+  TLLM_CHECK_ERROR(
+      (options.mClusterDimX == 1 || options.mClusterDimX == 2) && options.mClusterDimY == 1,
+      "GEMM does not support cluster in X and Y dimensions.");
   TLLM_CHECK_ERROR(options.mClusterDimZ == 1 || options.mNumSlicesForSplitK > 1,
                    "Cluster DimZ is only allowed for split-k.");
   TLLM_CHECK_ERROR(options.mTileM <= 128, "GEMM does not support TileM > 128.");
@@ -1004,6 +1051,9 @@ inline bool checkAndUpdateGemmOptions(GemmOptions& options, bool isBlackwell, in
     }
   }
   if (options.mUseDeepSeekFp8) {
+    TLLM_CHECK_ERROR(options.mClusterDimX == 1, "2CTA Gemm is not supported for DeepSeekFp8");
+  }
+  if (options.mUseDeepSeekFp8) {
     TLLM_CHECK_ERROR(options.mDtypeA == tg::Dtype::E4m3 && options.mDtypeB == tg::Dtype::E4m3,
                      "A and B dtype must be E4m3 for DeepSeek Fp8. Found dtypeA=",
                      tg::dtypeToString(options.mDtypeA),
@@ -1085,22 +1135,34 @@ inline bool checkAndUpdateGemmOptions(GemmOptions& options, bool isBlackwell, in
                      ")");
   }
 
+  // Number of iterations in K dimension after padding.
+  // Note the perCtaK in each CTA in the splitK group are padded to the same number of iterations.
+  // E.g., K = 512, TileK = 128, numSlicesForSplitK = 3. Then the padded K is
+  //
+  //   ceil(512 / (128*3)) * (128*3) = 768
+  //
+  int const paddedK = divUpMul(options.mK, options.mTileK * options.mNumSlicesForSplitK);
+  int const perCtaK = paddedK / options.mNumSlicesForSplitK;
+  // However, number of iterations is clamped to multiples of tileK within individual CTAs
+  // E.g., K = 448, TileK = 64, numSlicesForSplitK = 4.
+  //
+  //   paddedK                        = 512
+  //   perCtaK                        = 128
+  //   clampedPerCtaK for CTA 0, 1, 2 = 128
+  //   clampedPerCtaK for CTA 3       = 64
+  int const paddingForK = paddedK - options.mK;
+  int const clampedAndPaddedPerCtaK = divUpMul(perCtaK - paddingForK, options.mTileK);
   if (options.mUseUnrollLoop2xForMma) {
-    // Number of iterations in K dimension after padding.
-    // Note the perCtaK in each CTA in the splitK group are padded to the same number of iterations.
-    // E.g., K = 512, TileK = 128, numSlicesForSplitK = 3. Then the padded K is
+    // Check that the padded K and clamped padded K (K rounded to next multiple of tileK) is a
+    // multiple of 2*TileK when UnrollLoop2x is enabled. This is to avoid deadlock when mma runs
+    // even-numbered loop while the other warps run odd-numbered loop.
     //
-    //   ceil(512 / (128*3)) * (128*3) = 768
-    //
-    int paddedK = divUpMul(options.mK, options.mTileK * options.mNumSlicesForSplitK);
-    // Check that the padded K (K rounded to next multiple of tileK) is a multiple of 2*TileK when
-    // UnrollLoop2x is enabled. This is to avoid deadlock when mma runs even-numbered loop while the
-    // other warps run odd-numbered loop.
-    //
-    bool notSupported = (paddedK / options.mNumSlicesForSplitK) % (options.mTileK * 2) != 0;
+    bool notSupported = (perCtaK % (options.mTileK * 2) != 0) ||
+                        (clampedAndPaddedPerCtaK % (options.mTileK * 2) != 0);
     if (notSupported) {
       TLLM_LOG_WARNING("Size K / splitK must be a multiple of TileK * 2. Found TileK=",
                        options.mTileK, " and K=", options.mK, " (paddedK=", paddedK,
+                       " clampedAndPaddedPerCtaK=", clampedAndPaddedPerCtaK,
                        ") and numSlicesForSplitK=", options.mNumSlicesForSplitK,
                        ". Disabling unrollLoop2xForMma.");
       if (updateOptions) {
@@ -1109,6 +1171,11 @@ inline bool checkAndUpdateGemmOptions(GemmOptions& options, bool isBlackwell, in
         return false;
       }
     }
+  }
+  if (options.mNumSlicesForSplitK > 1) {
+    TLLM_CHECK_ERROR(
+        perCtaK * (options.mNumSlicesForSplitK - 1) < options.mK,
+        "K must be greater than perCtaK * (numSlicesForSplitK - 1) to ensure each CTA has work");
   }
 
   if (!isBlackwell && options.mTileScheduler == TileScheduler::Persistent) {
@@ -1242,7 +1309,8 @@ inline bool checkAndUpdateGemmOptions(GemmOptions& options, bool isBlackwell, in
         options.mNumStagesMma, options.mNumSlicesForSplitK, options.mNumSlicesForSliceK,
         options.mSplitK, options.mUseTmaStore, options.mTransposeMmaOutput, options.mAllReduceAlgo,
         options.mTileScheduler == TileScheduler::Persistent, options.mUseDeepSeekFp8,
-        options.mUsePerTokenSfA, options.mUsePerTokenSfB, options.mBiasType);
+        options.mUsePerTokenSfA, options.mUsePerTokenSfB,
+        /* useTwoCtas*/ options.mClusterDimX == 2, options.mBiasType);
   }
 
   return true;

@@ -506,8 +506,19 @@ class BatchedGemmInterface {
       throw std::invalid_argument("Invalid combination of options");
     }
 
-    int32_t const numCtasTile =
+    if (batchM) {
+      numCtasBatch = gemm::divUpMul(numCtasBatch, options.mClusterDimX);
+    } else {
+      numCtasBatch = gemm::divUpMul(numCtasBatch, options.mClusterDimY);
+    }
+
+    int32_t numCtasTile =
         batchM ? gemm::divUp(options.mN, options.mTileN) : gemm::divUp(options.mM, options.mTileM);
+    if (batchM) {
+      numCtasTile = gemm::divUpMul(numCtasTile, options.mClusterDimY);
+    } else {
+      numCtasTile = gemm::divUpMul(numCtasTile, options.mClusterDimX);
+    }
     int32_t const numCtasInner = options.mNumSlicesForSplitK;
     return std::make_tuple(numCtasBatch, numCtasTile, numCtasInner);
   }
