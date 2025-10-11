@@ -149,7 +149,7 @@ def gen_cutlass_fused_moe_module(
         ],
         extra_cuda_cflags=nvcc_flags,
         extra_cflags=["-DFAST_BUILD"] if use_fast_build else [],
-        extra_ldflags=["-lcuda", "-lnvrtc"],
+        extra_ldflags=["-lnvrtc"],
         extra_include_paths=[
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "include",
