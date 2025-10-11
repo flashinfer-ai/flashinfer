@@ -3221,9 +3221,9 @@ def trtllm_ragged_attention_deepseek(
     seq_lens : torch.Tensor
         sequence lengths
     max_q_len : int
-        max query length
+        max query length. If batch_size == 1, must be equal to cum_seq_lens_q[-1]
     max_kv_len : int
-        max key/value length
+        max key/value length.
     bmm1_scale : float
         scale for bmm1, scale_q * scale_k * 1.0 / (head_dim_qk ** 0.5)
     bmm2_scale : float
@@ -3347,7 +3347,7 @@ def trtllm_batch_context_with_kv_cache(
     seq_lens : torch.Tensor
         A uint32 1D tensor indicating the kv sequence length of each prompt. shape: ``[batch_size]``
     max_q_len : int
-        max sequence length for query
+        max sequence length for query. If batch_size == 1, must be equal to cum_seq_lens_q[-1]
     max_kv_len : int
         max sequence length for kv_cache
     bmm1_scale : float
