@@ -244,3 +244,43 @@ def _gemma_fused_add_rmsnorm_fake(
     enable_pdl: Optional[bool] = None,
 ) -> None:
     pass
+
+
+@register_custom_op("flashinfer::layernorm", mutates_args=())
+def layernorm(
+    input: torch.Tensor,
+    gemma: torch.Tensor,
+    beta: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    r"""Layer normalization.
+    Parameters
+    ----------
+    input: torch.Tensor
+        Input tensor, shape (batch_size, hidden_size). Need to be bfloat16.
+    gemma: torch.Tensor
+        Gemma tensor, shape (hidden_size,). Need to be float32.
+    beta: torch.Tensor
+        Beta tensor, shape (hidden_size,). Need to be float32.
+    eps: float
+        Epsilon for numerical stability.
+
+    Returns
+    -------
+    output: torch.Tensor
+        Layer Normalized tensor, shape (batch_size, hidden_size). Same dtype as input.
+    """
+    out = torch.empty_like(input)
+    get_norm_module().layernorm(out, input, gemma, beta, eps)
+    return out
+
+
+@register_fake_op("flashinfer::layernorm")
+def _layernorm_fake(
+    input: torch.Tensor,
+    gemma: torch.Tensor,
+    beta: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    b, k = input.shape
+    return input.new_empty([b, k])
