@@ -242,8 +242,8 @@ class TrtllmLowLatencyGemmRunner {
   std::vector<int64_t> mPassingConfigIndices;
 };
 
-void trtllm_low_latency_gemm(Tensor workspace_buffer, Tensor a, Tensor b, Tensor globalScale,
-                             Tensor out, int64_t tactic) {
+void trtllm_low_latency_gemm(TensorView workspace_buffer, TensorView a, TensorView b,
+                             TensorView globalScale, TensorView out, int64_t tactic) {
   CHECK_DEVICE(a, b);
   CHECK_DEVICE(a, out);
   CHECK_INPUT(a);
