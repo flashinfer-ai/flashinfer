@@ -22,11 +22,10 @@ set -u
 # Accept CUDA version as parameter (e.g., cu126, cu128, cu129)
 CUDA_VERSION=${1:-cu128}
 
-pip3 install torch --index-url https://download.pytorch.org/whl/${CUDA_VERSION}
-pip3 install requests responses ninja pytest numpy scipy build nvidia-ml-py cuda-python einops nvidia-nvshmem-cu12
-pip3 install 'apache-tvm-ffi==0.1.0b15'
-pip3 install nvidia-cutlass-dsl
-pip3 install 'nvidia-cudnn-frontend>=1.13.0'
+# Install requirements.txt first, so we can override any versions later for docker image
+pip3 install -r /install/requirements.txt
+pip3 install --force-reinstall torch --index-url https://download.pytorch.org/whl/${CUDA_VERSION}
+pip3 install responses pytest scipy build cuda-python nvidia-nvshmem-cu12
 
 # Install cudnn package based on CUDA version
 if [[ "$CUDA_VERSION" == *"cu13"* ]]; then

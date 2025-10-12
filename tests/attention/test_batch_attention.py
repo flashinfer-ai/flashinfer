@@ -23,10 +23,13 @@ from tests.test_helpers.jit_utils import (
     gen_persistent_batch_attention_modules,
     gen_prefill_attention_modules,
 )
-from flashinfer.utils import get_compute_capability
+from flashinfer.utils import get_compute_capability, has_flashinfer_jit_cache
 
 
-@pytest.fixture(autouse=True, scope="module")
+@pytest.fixture(
+    autouse=not has_flashinfer_jit_cache(),
+    scope="module",
+)
 def warmup_jit():
     flashinfer.jit.build_jit_specs(
         gen_persistent_batch_attention_modules(
@@ -97,6 +100,7 @@ def _run_attention(
     logits_soft_cap=0.0,
     device="cuda",
     causal=True,
+    is_chunked_q=False,
 ):
     """
     Run both implementations and return (output_old, lse_old, output_new, lse_new)
@@ -116,9 +120,19 @@ def _run_attention(
 
     num_blocks = kv_indptr[-1].item()
 
-    q = torch.rand(
-        q_indptr[-1].item(), num_qo_heads, head_dim, dtype=test_dtype, device=dev
-    )
+    if is_chunked_q:
+        q_base = torch.rand(
+            q_indptr[-1].item(),
+            num_qo_heads,
+            head_dim * 2,
+            dtype=test_dtype,
+            device=dev,
+        )
+        q = torch.chunk(q_base, 2, dim=-1)[0]
+    else:
+        q = torch.rand(
+            q_indptr[-1].item(), num_qo_heads, head_dim, dtype=test_dtype, device=dev
+        )
     if layout == "NHD":
         kv_data = torch.randn(
             num_blocks,
@@ -190,6 +204,45 @@ def _run_attention(
 
 
 # -------------------------  PyTest test case  ----------------------------- #
+@pytest.mark.xfail(
+    get_compute_capability(torch.device(device="cuda"))[0] == 12,
+    reason="Expected failure for SM120/121 for now since the tile size/number of stages is too large.",
+)
+def test_batch_attention_with_noncontiguous_q():
+    # Pick the first sequence length config's first pair
+    seq_len_pairs = _build_seq_len_configs()[0]
+    kv_lens = [p[0] for p in seq_len_pairs]
+    qo_lens = [p[1] for p in seq_len_pairs]
+
+    # Fixed single-case parameters
+    page_block_size = 1
+    num_kv_heads = 1
+    gqa_group_size = 1
+    num_qo_heads = num_kv_heads * gqa_group_size
+    head_dim = 64
+    test_dtype = torch.bfloat16
+    layout = "NHD"
+    logits_soft_cap = 0.0
+    v_scale = None
+    causal = True
+
+    _run_attention(
+        kv_lens=kv_lens,
+        qo_lens=qo_lens,
+        page_block_size=page_block_size,
+        num_kv_heads=num_kv_heads,
+        num_qo_heads=num_qo_heads,
+        head_dim=head_dim,
+        v_scale=v_scale,
+        causal=causal,
+        layout=layout,
+        test_dtype=test_dtype,
+        logits_soft_cap=logits_soft_cap,
+        device="cuda",
+        is_chunked_q=True,
+    )
+
+
 @pytest.mark.xfail(
     get_compute_capability(torch.device(device="cuda"))[0] == 12,
     reason="Expected failure for SM120/121 for now since the tile size/number of stages is too large.",

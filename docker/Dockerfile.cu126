@@ -9,8 +9,8 @@ RUN apt-get update && apt-get install -y \
     wget
 
 # Install python
-COPY install/install_python.sh /install/install_python.sh
-RUN bash /install/install_python.sh py312
+COPY docker/install/install_python.sh /install/install_python.sh
+RUN bash /install/install_python.sh /opt/conda py312
 
 # Set home directory
 WORKDIR /workspace
@@ -20,7 +20,8 @@ ENV PATH="/opt/conda/bin:$PATH"
 ENV PATH="/opt/conda/envs/py312/bin:$PATH"
 
 # Install torch and other python packages
-COPY install/install_python_packages.sh /install/install_python_packages.sh
+COPY requirements.txt /install/requirements.txt
+COPY docker/install/install_python_packages.sh /install/install_python_packages.sh
 RUN bash /install/install_python_packages.sh cu126
 
 # Install mpi4py in the conda environment

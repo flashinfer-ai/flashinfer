@@ -58,6 +58,10 @@ static auto makeTmaShapeStrideAb(GemmOptions const& options, MatrixType matrixTy
 
   // Assemble the box shape
   std::vector<int32_t> tileShape = {options.mTileK, tileMn};
+  // When using 2CTA MMA, we only need to load half of the tile in each CTA for B.
+  if (matrixType == MatrixType::MatrixB && options.mClusterDimX == 2) {
+    tileShape[1] /= 2;
+  }
 
   MatrixLayout layout = (matrixType == MatrixType::MatrixA) ? options.mLayoutA : options.mLayoutB;
   if (layout == MatrixLayout::MajorMn) {
@@ -66,6 +70,7 @@ static auto makeTmaShapeStrideAb(GemmOptions const& options, MatrixType matrixTy
     stride[1] = numTokens;
     std::swap(tileShape[0], tileShape[1]);
   } else if (layout == MatrixLayout::BlockMajorK) {
+    // FIXME: fix for the 2CTA MMA case
     // Set shapes based on blocking layout
     shape = {static_cast<uint64_t>(options.mBlockK), static_cast<uint64_t>(numTokens),
              static_cast<uint64_t>(options.mK / options.mBlockK)};

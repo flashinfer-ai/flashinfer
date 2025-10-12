@@ -18,6 +18,24 @@ os.makedirs(jit_env.FLASHINFER_WORKSPACE_DIR, exist_ok=True)
 os.makedirs(jit_env.FLASHINFER_CSRC_DIR, exist_ok=True)
 
 
+class MissingJITCacheError(RuntimeError):
+    """
+    Exception raised when JIT compilation is disabled and the JIT cache
+    does not contain the required precompiled module.
+
+    This error indicates that a module needs to be added to the JIT cache
+    build configuration.
+
+    Attributes:
+        spec: JitSpec of the missing module
+        message: Error message
+    """
+
+    def __init__(self, message: str, spec: Optional["JitSpec"] = None):
+        self.spec = spec
+        super().__init__(message)
+
+
 class FlashInferJITLogger(logging.Logger):
     def __init__(self, name):
         super().__init__(name)
@@ -228,6 +246,13 @@ class JitSpec:
         return self.ninja_path.exists()
 
     def build(self, verbose: bool, need_lock: bool = True) -> None:
+        if os.environ.get("FLASHINFER_DISABLE_JIT"):
+            raise MissingJITCacheError(
+                "JIT compilation is disabled via FLASHINFER_DISABLE_JIT environment variable, "
+                "but the required module is not found in the JIT cache. "
+                "Please add the missing module to the JIT cache build configuration.",
+                spec=self,
+            )
         lock = (
             FileLock(self.lock_path, thread_local=False) if need_lock else nullcontext()
         )
@@ -237,12 +262,12 @@ class JitSpec:
                 self.write_ninja()
             run_ninja(jit_env.FLASHINFER_JIT_DIR, self.ninja_path, verbose)
 
-    def load(self, so_path: Path, class_name: str = None):
+    def load(self, so_path: Path):
         return tvm_ffi.load_module(str(so_path))
 
-    def build_and_load(self, class_name: str = None):
+    def build_and_load(self):
         if self.is_aot:
-            return self.load(self.aot_path, class_name)
+            return self.load(self.aot_path)
 
         # Guard both build and load with the same lock to avoid race condition
         # where another process is building the library and removes the .so file.
@@ -250,7 +275,7 @@ class JitSpec:
             so_path = self.jit_library_path
             verbose = os.environ.get("FLASHINFER_JIT_VERBOSE", "0") == "1"
             self.build(verbose, need_lock=False)
-            result = self.load(so_path, class_name)
+            result = self.load(so_path)
 
         return result
 
@@ -294,7 +319,7 @@ def gen_jit_spec(
         cflags += ["-O3"]
 
     # useful for ncu
-    if bool(os.environ.get("FLASHINFER_JIT_LINEINFO", "0")):
+    if os.environ.get("FLASHINFER_JIT_LINEINFO", "0") == "1":
         cuda_cflags += ["-lineinfo"]
 
     if extra_cflags is not None:

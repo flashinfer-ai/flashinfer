@@ -408,10 +408,13 @@ struct BlockBatchPagedAttentionPersistent {
                           warp_idx, lane_idx, tid);
       } else {
         // write through
+        // o_stride_n = num_qo_heads* head_dim
+        const uint32_t o_stride_n = num_kv_heads * gqa_group_size * HEAD_DIM_VO,
+                       o_stride_h = HEAD_DIM_VO;
         DTypeO* o_ptr_base =
-            params.final_o + q_indptr * q_stride_n + (kv_head_idx * gqa_group_size) * q_stride_h;
+            params.final_o + q_indptr * o_stride_n + (kv_head_idx * gqa_group_size) * o_stride_h;
         write_o_reg_gmem<KTraits>(o_frag, &q_smem, o_ptr_base, qo_packed_idx_base, q_len,
-                                  q_stride_n, q_stride_h, gqa_group_size, tid);
+                                  o_stride_n, o_stride_h, gqa_group_size, tid);
       }
 
       if constexpr (variant.use_softmax) {

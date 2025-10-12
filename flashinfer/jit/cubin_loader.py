@@ -44,7 +44,7 @@ def safe_urljoin(base, path):
 def download_file(
     source: str,
     local_path: str,
-    retries: int = 3,
+    retries: int = 4,
     delay: int = 5,
     timeout: int = 10,
     lock_timeout: int = 30,
@@ -57,7 +57,7 @@ def download_file(
     - source (str): The URL or local file path of the file to download.
     - local_path (str): The local file path to save the downloaded/copied file.
     - retries (int): Number of retry attempts for URL downloads (default: 3).
-    - delay (int): Delay in seconds between retries (default: 5).
+    - delay (int): Initial delay in seconds for exponential backoff (default: 5).
     - timeout (int): Timeout for the HTTP request in seconds (default: 10).
     - lock_timeout (int): Timeout in seconds for the file lock (default: 30).
 
@@ -77,24 +77,30 @@ def download_file(
         with lock:
             logger.info(f"Acquired lock for {local_path}")
 
+            temp_path = f"{local_path}.tmp"
+
             # Handle local file copy
             if os.path.exists(source):
                 try:
-                    shutil.copy(source, local_path)
+                    shutil.copy(source, temp_path)
+                    os.replace(temp_path, local_path)  # Atomic rename
                     logger.info(f"File copied successfully: {local_path}")
                     return True
                 except Exception as e:
                     logger.error(f"Failed to copy local file: {e}")
                     return False
 
-            # Handle URL downloads
+            # Handle URL downloads with exponential backoff
             for attempt in range(1, retries + 1):
                 try:
                     response = session.get(source, timeout=timeout)
                     response.raise_for_status()
 
-                    with open(local_path, "wb") as file:
+                    with open(temp_path, "wb") as file:
                         file.write(response.content)
+
+                    # Atomic rename to prevent readers from seeing partial writes
+                    os.replace(temp_path, local_path)
 
                     logger.info(
                         f"File downloaded successfully: {source} -> {local_path}"
@@ -107,8 +113,9 @@ def download_file(
                     )
 
                     if attempt < retries:
-                        logger.info(f"Retrying in {delay} seconds...")
-                        time.sleep(delay)
+                        backoff_delay = delay * (2 ** (attempt - 1))
+                        logger.info(f"Retrying in {backoff_delay} seconds...")
+                        time.sleep(backoff_delay)
                     else:
                         logger.error("Max retries reached. Download failed.")
                         return False

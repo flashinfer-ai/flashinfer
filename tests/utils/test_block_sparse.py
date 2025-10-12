@@ -24,9 +24,13 @@ from tests.test_helpers.jit_utils import (
 )
 
 import flashinfer
+from flashinfer.utils import has_flashinfer_jit_cache
 
 
-@pytest.fixture(autouse=True, scope="module")
+@pytest.fixture(
+    autouse=not has_flashinfer_jit_cache(),
+    scope="module",
+)
 def warmup_jit():
     flashinfer.jit.build_jit_specs(
         gen_decode_attention_modules(

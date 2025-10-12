@@ -545,7 +545,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 ) = is_close_stats(reference_output, tested_outputs[i], rtol, atol)
                 if num_different_elements > 0:
                     print(
-                        f"[ERROR] Output tensor mismatch between backends {tested_backends[0]} and {tested_backends[i]}: "
+                        f"[ERROR] Output tensor mismatch between backends fa2 and {tested_backends[i]}: "
                         f"{num_different_elements} / {num_elements} ({num_different_elements_percentage:.2f}%) elements are different"
                     )
                     if not args.allow_output_mismatch:
@@ -689,14 +689,22 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
 
     if "trtllm-gen" in backends:
         remove_trtllm = False
-        if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2] or kv_dtype in [
-            torch.float8_e4m3fn,
-            torch.float8_e5m2,
-        ]:
-            print("[INFO] trtllm-gen backend does not support FP8. Skipping.")
+        if not causal:
+            print("[INFO] trtllm-gen backend currently requires causal = True")
             remove_trtllm = True
         if remove_trtllm:
             backends.remove("trtllm-gen")
+    if "trtllm-gen-native" in backends:
+        remove_trtllm_native = False
+        if batch_size == 1:
+            # TO-DO: trtllm-gen-native hits IMA on batch size 1. Investigate and fix.
+            print("[INFO] trtllm-gen-native backend currently requires batch size > 1")
+            remove_trtllm_native = True
+        if not causal:
+            print("[INFO] trtllm-gen-native backend currently requires causal = True")
+            remove_trtllm_native = True
+        if remove_trtllm_native:
+            backends.remove("trtllm-gen-native")
 
     if "cutlass" in backends:
         print("[INFO] CUTLASS backend does not support prefill. Skipping.")
@@ -1006,7 +1014,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 ) = is_close_stats(reference_output, tested_outputs[i], rtol, atol)
                 if num_different_elements > 0:
                     print(
-                        f"[ERROR] Output tensor mismatch between backends {tested_backends[0]} and {tested_backends[i]}: "
+                        f"[ERROR] Output tensor mismatch between backends fa2 and {tested_backends[i]}: "
                         f"{num_different_elements} / {num_elements} ({num_different_elements_percentage:.2f}%) elements are different"
                     )
                     if not args.allow_output_mismatch:
@@ -1129,6 +1137,13 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
 
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
     # Check for backend-specific constraints
+    if "fa2" in backends:
+        remove_fa2 = False
+        if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+            print("[INFO] FA2 backend does not support FP8. Skipping.")
+            remove_fa2 = True
+        if remove_fa2:
+            backends.remove("fa2")
     if "cudnn" in backends:
         remove_cudnn = False
         if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2] or kv_dtype in [
@@ -1161,6 +1176,25 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
         remove_trtllm = True
         if remove_trtllm:
             backends.remove("trtllm-gen")
+    if "trtllm-gen-native" in backends:
+        remove_trtllm_native = False
+        if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2] or kv_dtype in [
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+        ]:
+            print("[INFO] trtllm-gen-native backend does not support FP8. Skipping.")
+            remove_trtllm_native = True
+        if batch_size == 1:
+            # TO-DO: trtllm-gen-native hits IMA on batch size 1. Investigate and fix.
+            print("[INFO] trtllm-gen-native backend currently requires batch size > 1")
+            remove_trtllm_native = True
+        if not (head_dim_qk == 192 and head_dim_vo == 128):
+            print(
+                "[INFO] trtllm-gen-native backend requires head_dim_qk == 192 and head_dim_vo == 128"
+            )
+            remove_trtllm_native = True
+        if remove_trtllm_native:
+            backends.remove("trtllm-gen-native")
 
     if len(backends) == 0:
         print("[ERROR] No backends to test. Exiting.")
@@ -1372,6 +1406,26 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 batch_offsets_stats=batch_offsets_stats,
                 is_cuda_graph_compatible=True,
             )[0]
+        elif backend == "trtllm-gen-native":
+            return flashinfer.prefill.trtllm_ragged_attention_deepseek(
+                query=q,
+                key=k,
+                value=v,
+                workspace_buffer=workspace_buffer,
+                seq_lens=actual_seq_lens_kv_device,
+                max_q_len=s_qo,
+                max_kv_len=s_kv,
+                bmm1_scale=scale,
+                bmm2_scale=1.0,
+                o_sf_scale=-1,
+                batch_size=batch_size,
+                window_left=-1,
+                cum_seq_lens_q=qo_indptr,
+                cum_seq_lens_kv=kv_indptr,
+                enable_pdl=False,
+                is_causal=causal,
+                return_lse=True,
+            )[0]
         else:
             print(f"[ERROR] Backend {backend} not supported")
             return res
@@ -1416,7 +1470,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 ) = is_close_stats(reference_output, tested_outputs[i], rtol, atol)
                 if num_different_elements > 0:
                     print(
-                        f"[ERROR] Output tensor mismatch between backends {tested_backends[0]} and {tested_backends[i]}: "
+                        f"[ERROR] Output tensor mismatch between backends fa2 and {tested_backends[i]}: "
                         f"{num_different_elements} / {num_elements} ({num_different_elements_percentage:.2f}%) elements are different"
                     )
                     if not args.allow_output_mismatch:
@@ -1484,7 +1538,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
 def testBatchMLAPagedAttentionWrapper(args):
     """
     Test BatchMLAPagedAttentionWrapper and equivalent APIs.
-    Supports fa2. and trtllm-gen-native.
+    Supports fa2, fa3, cutlass, and trtllm-gen-native.
 
     This test:
     1. Creates paged query and key-value cache tensors
@@ -1565,6 +1619,30 @@ def testBatchMLAPagedAttentionWrapper(args):
             remove_fa3 = True
         if remove_fa3:
             backends.remove("fa3")
+    if "cutlass" in backends:
+        remove_cutlass = False
+        if page_size not in [32, 64]:
+            print(
+                "[INFO] Cutlass MLA backend only supports page size 32 or 64. Skipping."
+            )
+            remove_cutlass = True
+        if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2] or kv_dtype in [
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+        ]:
+            print("[INFO] Cutlass MLA backend does not support FP8. Skipping.")
+            remove_cutlass = True
+        if remove_cutlass:
+            backends.remove("cutlass")
+    if "trtllm-gen-native" in backends:
+        remove_trtllm_native = False
+        if page_size not in [32, 64]:
+            print(
+                "[INFO] trtllm-gen-native backend only supports page size 32 or 64. Skipping."
+            )
+            remove_trtllm_native = True
+        if remove_trtllm_native:
+            backends.remove("trtllm-gen-native")
     if len(backends) == 0:
         print("[ERROR] No backends to test. Exiting.")
         return res
@@ -1629,7 +1707,7 @@ def testBatchMLAPagedAttentionWrapper(args):
         page_size,
         head_dim_kpe,
     )
-    kpe_cache = torch.randn(size=kpe_cache_shape, dtype=q_init_dtype, device=device)
+    kpe_cache = torch.randn(size=kpe_cache_shape, dtype=kv_init_dtype, device=device)
     kv_cache = torch.cat([ckv_cache, kpe_cache], dim=2)
 
     qo_indptr = torch.arange(0, batch_size + 1, device=device).int()
@@ -1657,7 +1735,7 @@ def testBatchMLAPagedAttentionWrapper(args):
             device=device,
         )
 
-    sm_scale = 1.0 / ((head_dim_ckv + head_dim_kpe) ** 0.5)
+    sm_scale = 1.0 / ((128 + 64) ** 0.5)  # For DeepSeek-R1
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
 
     if args.verbose >= 2:
@@ -1674,7 +1752,7 @@ def testBatchMLAPagedAttentionWrapper(args):
     # Create wrapper
     backend_wrappers = {}
     for backend in backends:
-        if backend in ["fa2", "fa3"]:
+        if backend in ["fa2", "fa3", "cutlass"]:
             backend_wrappers[backend] = flashinfer.mla.BatchMLAPagedAttentionWrapper(
                 float_workspace_buffer=workspace_buffer,
                 use_cuda_graph=is_cuda_graph_compatible,
@@ -1684,20 +1762,21 @@ def testBatchMLAPagedAttentionWrapper(args):
                 kv_len_arr=actual_seq_lens_kv,
                 backend=backend,
             )
-            backend_wrappers[backend].plan(
-                qo_indptr=qo_indptr,
-                kv_indptr=kv_indptr,
-                kv_indices=kv_indices,
-                kv_len_arr=actual_seq_lens_kv,
-                num_heads=num_qo_heads,
-                head_dim_ckv=head_dim_ckv,
-                head_dim_kpe=head_dim_kpe,
-                page_size=page_size,
-                causal=causal,
-                sm_scale=sm_scale,
-                q_data_type=q_dtype,
-                kv_data_type=kv_dtype,
-            )
+            if backend != "cutlass":
+                backend_wrappers[backend].plan(
+                    qo_indptr=qo_indptr,
+                    kv_indptr=kv_indptr,
+                    kv_indices=kv_indices,
+                    kv_len_arr=actual_seq_lens_kv,
+                    num_heads=num_qo_heads,
+                    head_dim_ckv=head_dim_ckv,
+                    head_dim_kpe=head_dim_kpe,
+                    page_size=page_size,
+                    causal=causal,
+                    sm_scale=sm_scale,
+                    q_data_type=q_dtype,
+                    kv_data_type=kv_dtype,
+                )
 
     if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
         q = q.to(q_dtype)
@@ -1712,6 +1791,16 @@ def testBatchMLAPagedAttentionWrapper(args):
         if backend in ["fa2", "fa3"]:
             return backend_wrappers[backend].run(
                 q_nope, q_pe, ckv_cache, kpe_cache, return_lse=False
+            )
+        elif backend == "cutlass":
+            return backend_wrappers[backend].run(
+                q_nope,
+                q_pe,
+                ckv_cache,
+                kpe_cache,
+                kv_len=actual_seq_lens_kv.flatten(),
+                page_table=block_tables,
+                return_lse=False,
             )
         if backend == "trtllm-gen-native":
             return flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
@@ -1767,7 +1856,7 @@ def testBatchMLAPagedAttentionWrapper(args):
                 ) = is_close_stats(reference_output, tested_outputs[i], rtol, atol)
                 if num_different_elements > 0:
                     print(
-                        f"[ERROR] Output tensor mismatch between backends {tested_backends[0]} and {tested_backends[i]}: "
+                        f"[ERROR] Output tensor mismatch between backends fa2 and {tested_backends[i]}: "
                         f"{num_different_elements} / {num_elements} ({num_different_elements_percentage:.2f}%) elements are different"
                     )
                     if not args.allow_output_mismatch:

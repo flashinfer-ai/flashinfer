@@ -113,15 +113,27 @@ def next_positive_power_of_2(x: int) -> int:
     return n + 1
 
 
-def calculate_tile_tokens_dim(num_tokens: int, num_experts: int, top_k: int) -> int:
-    # Guess tokens per expert assuming perfect expert distribution first.
-    num_tokens_per_expert = num_tokens * top_k // num_experts
-
+def calculate_tile_tokens_dim(
+    num_tokens: int, num_experts: int, top_k: int, max_tile_tokens_dim: int = 128
+) -> int:
+    # Factor to account for the imbalance of the experts.
+    # factor equals to the
+    # max_real_num_tokens_per_expert / perfect_num_tokens_per_expert
+    # - 1.0 means perfect expert distribution.
+    # - > 1.0 means some experts have more
+    #     tokens than the perfect distribution.
+    # - < 1.0 does not make sense.
+    imbalance_factor = 1.3
+    # Calculate the number of tokens per expert
+    # assuming perfect distribution.
+    num_tokens_per_expert = (num_tokens * top_k) // num_experts
+    # Apply the imbalance factor.
+    num_tokens_per_expert = int(num_tokens_per_expert * imbalance_factor)
     # And pad the number to the next power of 2.
     tile_tokens_dim = next_positive_power_of_2(num_tokens_per_expert)
-    # Cap to 8-64 tokens per CTA tile as it's the range supported by the kernel.
-    tile_tokens_dim = min(max(tile_tokens_dim, 8), 64)
-
+    # Cap to 8-max_tile_tokens_dim tokens per CTA tile
+    # as it's the range supported by the kernel.
+    tile_tokens_dim = min(max(tile_tokens_dim, 8), max_tile_tokens_dim)
     return tile_tokens_dim
 
 
@@ -186,7 +198,7 @@ _cache_buf: Dict[Tuple[str, torch.device], torch.Tensor] = {}
 def _get_cache_buf(name: str, bytes: int, device: torch.device) -> torch.Tensor:
     key = (name, device)
     buf = _cache_buf.get(key)
-    if buf is None:
+    if buf is None or buf.size(0) < bytes:
         buf = torch.empty(bytes, dtype=torch.uint8, device=device)
         _cache_buf[key] = buf
     return buf
@@ -448,6 +460,13 @@ def has_cuda_cudart() -> bool:
     import importlib.util
 
     return importlib.util.find_spec("cuda.cudart") is not None
+
+
+# Re-export from jit.env to avoid circular dependency
+from .jit.env import (
+    has_flashinfer_jit_cache as has_flashinfer_jit_cache,
+    has_flashinfer_cubin as has_flashinfer_cubin,
+)
 
 
 def get_cuda_python_version() -> str:
@@ -734,3 +753,11 @@ def get_shuffle_matrix_sf_a_row_indices(
     row_indices = get_shuffle_matrix_a_row_indices(input_tensor, epilogue_tile_m)
 
     return row_indices
+
+
+def get_native_fp4_dtype():
+    """get native fp4 datatype if supported in Torch, otherwise return uint8."""
+    if hasattr(torch, "float4_e2m1fn_x2"):
+        return torch.float4_e2m1fn_x2
+    else:
+        return torch.uint8

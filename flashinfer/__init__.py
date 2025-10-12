@@ -16,10 +16,8 @@ limitations under the License.
 
 import importlib.util
 
-try:
-    from ._build_meta import __version__ as __version__
-except ModuleNotFoundError:
-    __version__ = "0.0.0+unknown"
+from .version import __version__ as __version__
+from .version import __git_version__ as __git_version__
 
 
 from . import jit as jit
@@ -88,6 +86,7 @@ from .fused_moe import (
 from .gemm import SegmentGEMMWrapper as SegmentGEMMWrapper
 from .gemm import bmm_fp8 as bmm_fp8
 from .gemm import mm_fp4 as mm_fp4
+from .gemm import mm_fp8 as mm_fp8
 from .gemm import tgv_gemm_sm100 as tgv_gemm_sm100
 from .mla import BatchMLAPagedAttentionWrapper as BatchMLAPagedAttentionWrapper
 from .norm import fused_add_rmsnorm as fused_add_rmsnorm
@@ -142,6 +141,9 @@ from .sampling import top_p_sampling_from_probs as top_p_sampling_from_probs
 from .sparse import BlockSparseAttentionWrapper as BlockSparseAttentionWrapper
 from .sparse import (
     VariableBlockSparseAttentionWrapper as VariableBlockSparseAttentionWrapper,
+)
+from .trtllm_low_latency_gemm import (
+    prepare_low_latency_gemm_weights as prepare_low_latency_gemm_weights,
 )
 from .utils import next_positive_power_of_2 as next_positive_power_of_2
 from .xqa import xqa as xqa
