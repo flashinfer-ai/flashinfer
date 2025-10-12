@@ -245,7 +245,7 @@ __device__ __forceinline__ void DeterministicInclusiveSum(
 template <uint32_t VEC_SIZE, uint32_t BLOCK_THREADS, BlockReduceAlgorithm REDUCE_ALGORITHM,
           typename TempStorage>
 __device__ __forceinline__ std::tuple<float, float> GetMinMaxValue(float* in_data, uint32_t row_idx,
-                                                                   uint32_t d,
+                                                                   uint32_t d, uint32_t stride,
                                                                    TempStorage& temp_storage) {
   const uint32_t tx = threadIdx.x;
   vec_t<float, VEC_SIZE> in_data_vec;
@@ -254,7 +254,7 @@ __device__ __forceinline__ std::tuple<float, float> GetMinMaxValue(float* in_dat
   for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
     in_data_vec.fill(0);
     if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
-      in_data_vec.cast_load(in_data + row_idx * d + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
+      in_data_vec.cast_load(in_data + row_idx * stride + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
     }
     float in_data_[VEC_SIZE];
 #pragma unroll
@@ -1747,7 +1747,7 @@ __global__ void TopPRenormProbKernel(DType* probs, DType* renormed_prob, float* 
 template <uint32_t BLOCK_THREADS, BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE,
           typename DType, typename IdType>
 __global__ void TopKMaskLogitsKernel(DType* logits, DType* masked_logits, IdType* top_k_arr,
-                                     uint32_t top_k_val, uint32_t d) {
+                                     uint32_t top_k_val, uint32_t d, uint32_t stride) {
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
   const uint32_t row_idx = bx;
   uint32_t k = top_k_arr == nullptr ? top_k_val : top_k_arr[bx];
@@ -1762,7 +1762,7 @@ __global__ void TopKMaskLogitsKernel(DType* logits, DType* masked_logits, IdType
 
     auto [min_val, max_val] = GetMinMaxValue<VEC_SIZE, BLOCK_THREADS, REDUCE_ALGORITHM,
                                              RenormTempStorage<BLOCK_THREADS, REDUCE_ALGORITHM>>(
-        logits, row_idx, d, temp_storage);
+        logits, row_idx, d, stride, temp_storage);
 
     double low = (min_val == -cuda::std::numeric_limits<float>::infinity())
                      ? cuda::std::numeric_limits<float>::lowest()
@@ -1787,7 +1787,7 @@ __global__ void TopKMaskLogitsKernel(DType* logits, DType* masked_logits, IdType
       for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
         logits_vec.fill(0);
         if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
-          logits_vec.cast_load(logits + row_idx * d + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
+          logits_vec.cast_load(logits + row_idx * stride + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
         }
         int probs_gt_pivot_0_count[VEC_SIZE], probs_gt_pivot_1_count[VEC_SIZE];
 #pragma unroll
@@ -1851,7 +1851,7 @@ __global__ void TopKMaskLogitsKernel(DType* logits, DType* masked_logits, IdType
   for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
     logits_vec.fill(0);
     if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
-      logits_vec.cast_load(logits + row_idx * d + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
+      logits_vec.cast_load(logits + row_idx * stride + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
     }
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
@@ -1859,7 +1859,7 @@ __global__ void TopKMaskLogitsKernel(DType* logits, DType* masked_logits, IdType
           (logits_vec[j] > pivot) ? logits_vec[j] : -cuda::std::numeric_limits<float>::infinity();
     }
     if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
-      logits_vec.store(masked_logits + row_idx * d + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
+      logits_vec.store(masked_logits + row_idx * stride + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
     }
   }
 }
@@ -2033,7 +2033,7 @@ cudaError_t TopKRenormProb(DType* probs, DType* renormed_prob, IdType* top_k_arr
 
 template <typename DType, typename IdType>
 cudaError_t TopKMaskLogits(DType* logits, DType* masked_logits, IdType* top_k_arr,
-                           uint32_t batch_size, uint32_t top_k_val, uint32_t d,
+                           uint32_t batch_size, uint32_t top_k_val, uint32_t d, uint32_t stride,
                            cudaStream_t stream = 0) {
   const uint32_t vec_size = std::gcd(16 / sizeof(DType), d);
 
@@ -2042,7 +2042,7 @@ cudaError_t TopKMaskLogits(DType* logits, DType* masked_logits, IdType* top_k_ar
     const uint32_t smem_size = sizeof(RenormTempStorage<BLOCK_THREADS, REDUCE_ALGO>);
     dim3 nblks(batch_size);
     dim3 nthrs(BLOCK_THREADS);
-    void* args[] = {&logits, &masked_logits, &top_k_arr, &top_k_val, &d};
+    void* args[] = {&logits, &masked_logits, &top_k_arr, &top_k_val, &d, &stride};
     DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
       auto kernel = TopKMaskLogitsKernel<BLOCK_THREADS, REDUCE_ALGO, VEC_SIZE, DType, IdType>;
       FLASHINFER_CUDA_CALL(

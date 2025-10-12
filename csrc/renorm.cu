@@ -60,7 +60,8 @@ void top_k_renorm_probs(Tensor probs, Tensor renorm_probs, Optional<Tensor> mayb
 
 void top_k_mask_logits(Tensor logits, Tensor mask_logits, Optional<Tensor> maybe_top_k_arr,
                        int64_t top_k_val) {
-  CHECK_INPUT(logits);
+  CHECK_CUDA(logits);
+  CHECK_LAST_DIM_CONTIGUOUS(logits);
   CHECK_DIM(2, logits);  // logits: (batch_size, vocab_size)
   unsigned int batch_size = logits->shape[0];
   unsigned int vocab_size = logits->shape[1];
@@ -71,7 +72,7 @@ void top_k_mask_logits(Tensor logits, Tensor mask_logits, Optional<Tensor> maybe
   cudaError_t status = sampling::TopKMaskLogits<float>(
       static_cast<float*>(logits->data), static_cast<float*>(mask_logits->data),
       has_top_k_arr ? static_cast<int*>(maybe_top_k_arr.value()->data) : nullptr, batch_size,
-      top_k_val, vocab_size, stream);
+      top_k_val, vocab_size, logits->strides[0], stream);
 
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "TopKMaskLogits failed with error code " << cudaGetErrorString(status);
