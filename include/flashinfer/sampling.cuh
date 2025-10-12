@@ -254,7 +254,8 @@ __device__ __forceinline__ std::tuple<float, float> GetMinMaxValue(float* in_dat
   for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
     in_data_vec.fill(0);
     if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
-      in_data_vec.cast_load(in_data + row_idx * stride + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
+      in_data_vec.cast_load(in_data + row_idx * stride + i * BLOCK_THREADS * VEC_SIZE +
+                            tx * VEC_SIZE);
     }
     float in_data_[VEC_SIZE];
 #pragma unroll
@@ -1787,7 +1788,8 @@ __global__ void TopKMaskLogitsKernel(DType* logits, DType* masked_logits, IdType
       for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
         logits_vec.fill(0);
         if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
-          logits_vec.cast_load(logits + row_idx * stride + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
+          logits_vec.cast_load(logits + row_idx * stride + i * BLOCK_THREADS * VEC_SIZE +
+                               tx * VEC_SIZE);
         }
         int probs_gt_pivot_0_count[VEC_SIZE], probs_gt_pivot_1_count[VEC_SIZE];
 #pragma unroll
@@ -1851,7 +1853,8 @@ __global__ void TopKMaskLogitsKernel(DType* logits, DType* masked_logits, IdType
   for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
     logits_vec.fill(0);
     if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
-      logits_vec.cast_load(logits + row_idx * stride + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
+      logits_vec.cast_load(logits + row_idx * stride + i * BLOCK_THREADS * VEC_SIZE +
+                           tx * VEC_SIZE);
     }
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
@@ -1859,7 +1862,8 @@ __global__ void TopKMaskLogitsKernel(DType* logits, DType* masked_logits, IdType
           (logits_vec[j] > pivot) ? logits_vec[j] : -cuda::std::numeric_limits<float>::infinity();
     }
     if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
-      logits_vec.store(masked_logits + row_idx * stride + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
+      logits_vec.store(masked_logits + row_idx * stride + i * BLOCK_THREADS * VEC_SIZE +
+                       tx * VEC_SIZE);
     }
   }
 }
