@@ -1073,7 +1073,7 @@ __global__ void MinPSamplingFromProbKernel(DType* probs, float* min_p_arr, IdTyp
 
   float max_val = GetMaxValue<VEC_SIZE, BLOCK_THREADS, REDUCE_ALGORITHM,
                               SamplingTempStorage<BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>>(
-      probs, row_idx, d, temp_storage);
+      probs, row_idx, d, d, temp_storage);
   float pivot = max_val * p;
 
   vec_t<float, VEC_SIZE> probs_vec;
@@ -1645,7 +1645,7 @@ __global__ void TopPRenormProbKernel(DType* probs, DType* renormed_prob, float* 
   temp_storage.max_val = 0;
   float max_val = GetMaxValue<VEC_SIZE, BLOCK_THREADS, REDUCE_ALGORITHM,
                               RenormTempStorage<BLOCK_THREADS, REDUCE_ALGORITHM>>(probs, row_idx, d,
-                                                                                  temp_storage);
+                                                                                  d, temp_storage);
 
   double low = 0, high = max_val;
   float min_gt_low, max_le_high;
@@ -1886,7 +1886,7 @@ __global__ void TopKRenormProbKernel(DType* probs, DType* renormed_prob, IdType*
 
     float max_val = GetMaxValue<VEC_SIZE, BLOCK_THREADS, REDUCE_ALGORITHM,
                                 RenormTempStorage<BLOCK_THREADS, REDUCE_ALGORITHM>>(
-        probs, row_idx, d, temp_storage);
+        probs, row_idx, d, stride, temp_storage);
 
     double low = 0, high = max_val;
     float min_gt_low, max_le_high;

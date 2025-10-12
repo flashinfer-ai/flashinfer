@@ -53,7 +53,7 @@ void top_k_renorm_probs(Tensor probs, Tensor renorm_probs, Optional<Tensor> mayb
   cudaError_t status = sampling::TopKRenormProb<float>(
       static_cast<float*>(probs->data), static_cast<float*>(renorm_probs->data),
       has_top_k_arr ? static_cast<int*>(maybe_top_k_arr.value()->data) : nullptr, batch_size,
-      top_k_val, vocab_size, logits->strides[0], stream);
+      top_k_val, vocab_size, probs->strides[0], stream);
 
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "TopKRenormProb failed with error code " << cudaGetErrorString(status);
