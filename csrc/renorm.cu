@@ -21,8 +21,8 @@ using namespace flashinfer;
 
 using tvm::ffi::Optional;
 
-void top_p_renorm_probs(Tensor probs, Tensor renorm_probs, Optional<Tensor> maybe_top_p_arr,
-                        double top_p_val) {
+void top_p_renorm_probs(TensorView probs, TensorView renorm_probs,
+                        Optional<TensorView> maybe_top_p_arr, double top_p_val) {
   CHECK_INPUT(probs);
   CHECK_DIM(2, probs);  // probs: (batch_size, vocab_size)
   unsigned int batch_size = probs->shape[0];
@@ -39,8 +39,8 @@ void top_p_renorm_probs(Tensor probs, Tensor renorm_probs, Optional<Tensor> mayb
       << "TopPRenormProb failed with error code " << cudaGetErrorString(status);
 }
 
-void top_k_renorm_probs(Tensor probs, Tensor renorm_probs, Optional<Tensor> maybe_top_k_arr,
-                        int64_t top_k_val) {
+void top_k_renorm_probs(TensorView probs, TensorView renorm_probs,
+                        Optional<TensorView> maybe_top_k_arr, int64_t top_k_val) {
   CHECK_CUDA(probs);
   CHECK_LAST_DIM_CONTIGUOUS(probs);
   CHECK_DIM(2, probs);  // probs: (batch_size, vocab_size)
@@ -59,8 +59,8 @@ void top_k_renorm_probs(Tensor probs, Tensor renorm_probs, Optional<Tensor> mayb
       << "TopKRenormProb failed with error code " << cudaGetErrorString(status);
 }
 
-void top_k_mask_logits(Tensor logits, Tensor mask_logits, Optional<Tensor> maybe_top_k_arr,
-                       int64_t top_k_val) {
+void top_k_mask_logits(TensorView logits, TensorView mask_logits,
+                       Optional<TensorView> maybe_top_k_arr, int64_t top_k_val) {
   CHECK_CUDA(logits);
   CHECK_LAST_DIM_CONTIGUOUS(logits);
   CHECK_DIM(2, logits);  // logits: (batch_size, vocab_size)

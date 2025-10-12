@@ -37,11 +37,11 @@ using tvm::ffi::Array;
 using tvm::ffi::Optional;
 
 Array<int64_t> BatchDecodeWithPagedKVCachePlan(
-    Tensor float_workspace_buffer, Tensor int_workspace_buffer,
-    Tensor page_locked_int_workspace_buffer, Tensor indptr, int64_t batch_size,
+    TensorView float_workspace_buffer, TensorView int_workspace_buffer,
+    TensorView page_locked_int_workspace_buffer, TensorView indptr, int64_t batch_size,
     int64_t num_qo_heads, int64_t num_kv_heads, int64_t page_size, bool enable_cuda_graph,
     int64_t window_left, double logits_soft_cap, int64_t head_dim_qk, int64_t head_dim_vo,
-    Tensor empty_q_data, Tensor empty_kv_data) {
+    TensorView empty_q_data, TensorView empty_kv_data) {
   size_t float_workspace_size_in_bytes =
       float_workspace_buffer->shape[0] * get_element_size(float_workspace_buffer);
   size_t int_workspace_size_in_bytes =
@@ -78,12 +78,14 @@ Array<int64_t> BatchDecodeWithPagedKVCachePlan(
   return Array(plan_info.ToVector());
 }
 
-void BatchDecodeWithPagedKVCacheRun(Tensor float_workspace_buffer, Tensor int_workspace_buffer,
-                                    Array<int64_t> plan_info_vec, Tensor q, Tensor paged_k_cache,
-                                    Tensor paged_v_cache, Tensor paged_kv_indptr,
-                                    Tensor paged_kv_indices, Tensor paged_kv_last_page_len,
-                                    Tensor o, Optional<Tensor> maybe_lse, int64_t kv_layout_code,
-                                    int64_t window_left, bool enable_pdl ADDITIONAL_FUNC_PARAMS) {
+void BatchDecodeWithPagedKVCacheRun(TensorView float_workspace_buffer,
+                                    TensorView int_workspace_buffer, Array<int64_t> plan_info_vec,
+                                    TensorView q, TensorView paged_k_cache,
+                                    TensorView paged_v_cache, TensorView paged_kv_indptr,
+                                    TensorView paged_kv_indices, TensorView paged_kv_last_page_len,
+                                    TensorView o, Optional<TensorView> maybe_lse,
+                                    int64_t kv_layout_code, int64_t window_left,
+                                    bool enable_pdl ADDITIONAL_FUNC_PARAMS) {
   DecodePlanInfo plan_info;
   plan_info.FromVector(std::vector<int64_t>(plan_info_vec.begin(), plan_info_vec.end()));
   QKVLayout kv_layout = static_cast<QKVLayout>(kv_layout_code);

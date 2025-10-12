@@ -20,7 +20,6 @@ from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
-import tvm_ffi
 
 from ..autotuner import (
     AutoTuner,
@@ -29,6 +28,7 @@ from ..autotuner import (
     TunableRunner,
     TuningConfig,
 )
+from ..jit.cpp_ext import is_cuda_version_at_least
 from ..jit.core import logger
 from ..jit import (
     setup_cubin_loader,
@@ -746,8 +746,6 @@ def cutlass_fused_moe(
     ------
     NotImplementedError:
         If any of the following features are requested but not implemented:
-            - FP8 Block Scaling
-            - W4A8 Group Scaling
             - Minimum Latency Mode
 
     Note
@@ -757,12 +755,21 @@ def cutlass_fused_moe(
     - Currently, some advanced features like FP8 block scaling and minimum latency mode
         are not implemented for Blackwell architecture.
     """
-    if use_deepseek_fp8_block_scale:
-        raise NotImplementedError(
-            "DeepSeek FP8 Block Scaling is not yet implemented in CUTLASS for Blackwell."
-        )
+    major, minor = torch.cuda.get_device_capability()
+    device_arch = f"{major * 10 + minor}"
+
     if min_latency_mode:
         raise NotImplementedError("min latency mode not yet implemented for Blackwell.")
+
+    if use_deepseek_fp8_block_scale:
+        if device_arch != "90":
+            raise NotImplementedError(
+                "FP8 block scaling not yet implemented for Blackwell."
+            )
+        elif not is_cuda_version_at_least("12.8"):
+            raise NotImplementedError(
+                "FP8 block scaling not implemented for CUDA 12.6 or lower."
+            )
 
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)
@@ -779,9 +786,6 @@ def cutlass_fused_moe(
         check_shape_dtype_device(
             output, output_shape, output_dtype, input.device, "output"
         )
-
-    major, minor = torch.cuda.get_device_capability()
-    device_arch = f"{major * 10 + minor}"
 
     return get_cutlass_fused_moe_module(device_arch).cutlass_fused_moe(
         output,
@@ -1082,8 +1086,11 @@ def get_trtllm_moe_sm100_module():
     ) -> torch.Tensor:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(hidden_states.device)
+        output = torch.empty(
+            hidden_states.shape, dtype=torch.bfloat16, device=hidden_states.device
+        )
         # Call the C++ function
-        output = moe_op.trtllm_fp8_per_tensor_scale_moe(
+        moe_op.trtllm_fp8_per_tensor_scale_moe(
             routing_logits,
             routing_bias,
             hidden_states,
@@ -1092,6 +1099,7 @@ def get_trtllm_moe_sm100_module():
             output1_scales_gate_scalar,
             gemm2_weights,
             output2_scales_scalar,
+            output,
             num_experts,
             top_k,
             n_group,
@@ -1367,7 +1375,7 @@ def get_trtllm_moe_sm100_module():
         )
 
         # Call the C++ function for block scale MoE
-        output = moe_op.trtllm_fp4_block_scale_moe(
+        intermediate_output = moe_op.trtllm_fp4_block_scale_moe(
             routing_logits,
             topk_ids,
             expert_weights,
@@ -1402,12 +1410,15 @@ def get_trtllm_moe_sm100_module():
             output,
             tactic,
         )
-        if isinstance(output, tvm_ffi.Array):
-            output = list(output)
-            for i in range(len(output)):
-                if isinstance(output[i], tvm_ffi.Tensor):
-                    output[i] = torch.from_dlpack(output[i])
-        return output
+        if do_finalize:
+            return [output]
+        else:
+            gemm2_output, expanded_idx_to_permuted_idx = intermediate_output
+            return [
+                torch.from_dlpack(gemm2_output),
+                expert_weights,
+                torch.from_dlpack(expanded_idx_to_permuted_idx),
+            ]
 
     @register_fake_op("flashinfer::trtllm_fp4_block_scale_moe")
     def _fake_trtllm_fp4_block_scale_moe(

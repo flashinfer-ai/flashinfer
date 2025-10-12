@@ -21,9 +21,9 @@ using namespace flashinfer;
 
 using tvm::ffi::Tensor;
 
-void append_paged_kv_cache(Tensor append_key, Tensor append_value, Tensor batch_indices,
-                           Tensor positions, Tensor paged_k_cache, Tensor paged_v_cache,
-                           Tensor kv_indices, Tensor kv_indptr, Tensor kv_last_page_len,
+void append_paged_kv_cache(TensorView append_key, TensorView append_value, TensorView batch_indices,
+                           TensorView positions, TensorView paged_k_cache, TensorView paged_v_cache,
+                           TensorView kv_indices, TensorView kv_indptr, TensorView kv_last_page_len,
                            int64_t layout) {
   CHECK_LAST_DIM_CONTIGUOUS(append_key);
   CHECK_LAST_DIM_CONTIGUOUS(append_value);
@@ -109,12 +109,10 @@ void append_paged_kv_cache(Tensor append_key, Tensor append_value, Tensor batch_
                           << paged_k_cache->dtype;
 }
 
-void block_sparse_indices_to_vector_sparse_offsets(Tensor block_sparse_indices,
-                                                   Tensor block_sparse_indptr,
-                                                   Tensor vector_sparse_offsets,
-                                                   Tensor vector_sparse_indptr, Tensor kv_len_arr,
-                                                   int64_t stride_block, int64_t stride_n,
-                                                   int64_t batch_size, int64_t block_size) {
+void block_sparse_indices_to_vector_sparse_offsets(
+    TensorView block_sparse_indices, TensorView block_sparse_indptr,
+    TensorView vector_sparse_offsets, TensorView vector_sparse_indptr, TensorView kv_len_arr,
+    int64_t stride_block, int64_t stride_n, int64_t batch_size, int64_t block_size) {
   CHECK_INPUT(block_sparse_indices);
   CHECK_INPUT(block_sparse_indptr);
   CHECK_INPUT(vector_sparse_offsets);
@@ -135,9 +133,10 @@ void block_sparse_indices_to_vector_sparse_offsets(Tensor block_sparse_indices,
       << "BlockSparseIndicesToVectorSparseOffset failed with error: " << cudaGetErrorString(status);
 }
 
-void append_paged_mla_kv_cache(Tensor append_ckv, Tensor append_kpe, Tensor batch_indices,
-                               Tensor positions, Tensor ckv_cache, Tensor kpe_cache,
-                               Tensor kv_indices, Tensor kv_indptr, Tensor kv_last_page_len) {
+void append_paged_mla_kv_cache(TensorView append_ckv, TensorView append_kpe,
+                               TensorView batch_indices, TensorView positions, TensorView ckv_cache,
+                               TensorView kpe_cache, TensorView kv_indices, TensorView kv_indptr,
+                               TensorView kv_last_page_len) {
   CHECK_LAST_DIM_CONTIGUOUS(append_ckv);
   CHECK_LAST_DIM_CONTIGUOUS(append_kpe);
   CHECK_INPUT(batch_indices);

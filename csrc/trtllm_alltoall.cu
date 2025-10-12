@@ -26,11 +26,12 @@ using namespace flashinfer::trtllm_alltoall;
 using tvm::ffi::Optional;
 using tvm::ffi::Tuple;
 
-void moeCommPrepareIndicesOp(Tensor gatheredTargetRankIds,
-                             Optional<Tensor> realRankTokenCountCumSum, Tensor localGatherIndices,
-                             Tensor sendRankCountCumSum, Tensor sendRankLocalIndices,
-                             Tensor recvRankCountCumSum, Tensor recvRankLocalIndices,
-                             Tensor backwardRecvRankLocalIndices, int64_t maxTokenCountPerRank,
+void moeCommPrepareIndicesOp(TensorView gatheredTargetRankIds,
+                             Optional<TensorView> realRankTokenCountCumSum,
+                             TensorView localGatherIndices, TensorView sendRankCountCumSum,
+                             TensorView sendRankLocalIndices, TensorView recvRankCountCumSum,
+                             TensorView recvRankLocalIndices,
+                             TensorView backwardRecvRankLocalIndices, int64_t maxTokenCountPerRank,
                              int64_t expertCount, int64_t topK, int64_t epRank, int64_t epSize) {
   CHECK_INPUT_TYPE(gatheredTargetRankIds, dl_int32);
   TVM_FFI_ICHECK_EQ(gatheredTargetRankIds->ndim, 2) << "gatheredTargetRankIds must be a 2D tensor";
@@ -102,8 +103,9 @@ void moeCommPrepareIndicesOp(Tensor gatheredTargetRankIds,
       << "CUDA error in moeAllToAllPrepareIndices: " << cudaGetErrorString(cudaResult);
 }
 
-void moeLocalGatherOp(Tensor recvRankCumSum, Tensor localGatherIndices, Tensor gatheredExpertIds,
-                      Tensor gatheredScales, Tensor localExpertIds, Tensor localScales,
+void moeLocalGatherOp(TensorView recvRankCumSum, TensorView localGatherIndices,
+                      TensorView gatheredExpertIds, TensorView gatheredScales,
+                      TensorView localExpertIds, TensorView localScales,
                       int64_t maxTokenCountPerRank, int64_t expertCount, int64_t topK,
                       int64_t epRank, int64_t epSize) {
   CHECK_INPUT_TYPE(recvRankCumSum, dl_int32);
@@ -153,9 +155,9 @@ void moeLocalGatherOp(Tensor recvRankCumSum, Tensor localGatherIndices, Tensor g
       static_cast<int*>(localExpertIds->data), static_cast<float*>(localScales->data), stream);
 }
 
-void moeCommOp(Tensor input, Tensor sendRankCumSum, Tensor sendIndices, Tensor output,
-               Tensor recvRankCumSum, Tensor recvIndices, Tensor allWorkspaces, int64_t epRank,
-               int64_t epSize) {
+void moeCommOp(TensorView input, TensorView sendRankCumSum, TensorView sendIndices,
+               TensorView output, TensorView recvRankCumSum, TensorView recvIndices,
+               TensorView allWorkspaces, int64_t epRank, int64_t epSize) {
   CHECK_INPUT_TYPE(sendRankCumSum, dl_int32);
   CHECK_INPUT_TYPE(sendIndices, dl_int32);
   CHECK_INPUT_TYPE(recvRankCumSum, dl_int32);
@@ -221,14 +223,16 @@ int64_t getPrepareWorkspaceSizePerRank(int64_t epSize) {
   return flashinfer::trtllm_alltoall::moe_prepare::getMoePrepareWorkspaceSize(epSize32);
 }
 
-void moePrepareOp(Tensor expertsIds, Optional<Tensor> scales, Optional<Tensor> expertsStatics,
-                  Tensor allWorkspaces, Tensor preparedLocalExpertIds, Tensor sendRankCountCumSum,
-                  Tensor recvRankCountCumSum, Tensor gatherRecvRankIndices, Tensor recvRankIndices,
-                  Tensor gatherBackwardRecvRankIndices, Tensor backwardRecvRankIndices,
-                  Tensor gatherSendRankIndices, Tensor sendRankIndices,
-                  Optional<Tensor> preparedLocalScales, Optional<Tensor> gatheredExpertStatics,
-                  int64_t maxTokenCountPerRank, int64_t epRank, int64_t epSize, int64_t expertCount,
-                  int64_t slotCount, int64_t topK) {
+void moePrepareOp(TensorView expertsIds, Optional<TensorView> scales,
+                  Optional<TensorView> expertsStatics, TensorView allWorkspaces,
+                  TensorView preparedLocalExpertIds, TensorView sendRankCountCumSum,
+                  TensorView recvRankCountCumSum, TensorView gatherRecvRankIndices,
+                  TensorView recvRankIndices, TensorView gatherBackwardRecvRankIndices,
+                  TensorView backwardRecvRankIndices, TensorView gatherSendRankIndices,
+                  TensorView sendRankIndices, Optional<TensorView> preparedLocalScales,
+                  Optional<TensorView> gatheredExpertStatics, int64_t maxTokenCountPerRank,
+                  int64_t epRank, int64_t epSize, int64_t expertCount, int64_t slotCount,
+                  int64_t topK) {
   CHECK_INPUT_TYPE(expertsIds, dl_int32);
   TVM_FFI_ICHECK_EQ(expertCount % 4, 0) << "expertCount must be divisible by 4";
   TVM_FFI_ICHECK_EQ(slotCount % 4, 0) << "slotCount must be divisible by 4";

@@ -242,8 +242,8 @@ class TrtllmLowLatencyGemmRunner {
   std::vector<int64_t> mPassingConfigIndices;
 };
 
-void trtllm_low_latency_gemm(Tensor workspace_buffer, Tensor a, Tensor b, Tensor globalScale,
-                             Tensor out, int64_t tactic) {
+void trtllm_low_latency_gemm(TensorView workspace_buffer, TensorView a, TensorView b,
+                             TensorView globalScale, TensorView out, int64_t tactic) {
   CHECK_DEVICE(a, b);
   CHECK_DEVICE(a, out);
   CHECK_INPUT(a);
@@ -278,7 +278,7 @@ void trtllm_low_latency_gemm(Tensor workspace_buffer, Tensor a, Tensor b, Tensor
 
   int64_t const required_workspace_size = getWorkspaceSizeInBytes(m, n, k, tactic);
   int64_t const provided_workspace_size =
-      get_numel(workspace_buffer) * get_element_size(workspace_buffer);
+      workspace_buffer.numel() * get_element_size(workspace_buffer);
   if (provided_workspace_size < required_workspace_size) {
     TVM_FFI_LOG_AND_THROW(RuntimeError)
         << "The size of the provided workspace to the TRTLLM-GEN low latency GEMM is too small. "
