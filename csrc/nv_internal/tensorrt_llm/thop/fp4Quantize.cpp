@@ -72,8 +72,7 @@ void fp4_quantize(TensorView self, Optional<TensorView> const& globalScale, Tens
   tensorrt_llm::kernels::invokeFP4Quantization<T, SF_VEC_SIZE>(                                  \
       1, m, k, reinterpret_cast<T*>(self->data), globalScalePtr,                                 \
       reinterpret_cast<int64_t*>(valueE2M1->data), reinterpret_cast<int32_t*>(scaleFP8SF->data), \
-      sfUseUE8M0, layout, mMultiProcessorCount, /*mask=*/nullptr, enable_pdl,                    \
-      get_stream(self->device));
+      sfUseUE8M0, layout, mMultiProcessorCount, enable_pdl, get_stream(self->device));
 
   if (sfUseUE8M0) {
     if (self->dtype == dl_float16) {
@@ -131,9 +130,8 @@ void fp4_quantize(TensorView self, Optional<TensorView> const& globalScale, Tens
 // self_fp4: [B, M, K / 2], FLOAT4_E2M1X2
 // self_block_scale_factors:
 //   [B, ceil(M / 128) * 128 * ceil(K / sfVecSize / 4) * 4], SF_DTYPE (UE4M3 or UE8M0)
-void fp4_batched_quantize(TensorView self, Optional<TensorView> const& mask, TensorView globalScale,
-                          TensorView valueE2M1, TensorView scaleFP8SF, int64_t sfVecSize,
-                          bool sfUseUE8M0) {
+void fp4_batched_quantize(Tensor self, Tensor globalScale, Tensor valueE2M1, Tensor scaleFP8SF,
+                          int64_t sfVecSize, bool sfUseUE8M0) {
   CHECK_CUDA(self);
   CHECK_CONTIGUOUS(self);
   auto fp32_dtype = DLDataType{kDLFloat, 32, 1};
@@ -150,12 +148,6 @@ void fp4_batched_quantize(TensorView self, Optional<TensorView> const& mask, Ten
   int64_t k = inputShape[2];
 
   TVM_FFI_ICHECK_EQ(k % sfVecSize, 0);
-  bool use_mask = mask.has_value();
-  if (use_mask) {
-    auto const& mask_rank = mask.value().shape().size();
-    TVM_FFI_ICHECK_EQ(mask_rank, 1) << "Mask should be 1D tensor.";
-    TVM_FFI_ICHECK_EQ(mask.value().shape()[0], b);
-  }
 
   std::vector<int64_t> outputShape(inputShape.begin(), inputShape.end());
   outputShape[rank - 1] = k / 2;
@@ -167,9 +159,7 @@ void fp4_batched_quantize(TensorView self, Optional<TensorView> const& mask, Ten
   tensorrt_llm::kernels::invokeFP4Quantization<T, SF_VEC_SIZE>(                                  \
       b, m, k, reinterpret_cast<T*>(self->data), static_cast<float*>(globalScale->data),         \
       reinterpret_cast<int64_t*>(valueE2M1->data), reinterpret_cast<int32_t*>(scaleFP8SF->data), \
-      sfUseUE8M0, layout, mMultiProcessorCount,                                                  \
-      use_mask ? static_cast<int32_t*>(mask.value()->data) : nullptr, /*enable_pdl=*/false,      \
-      get_stream(self->device));
+      sfUseUE8M0, layout, mMultiProcessorCount, get_stream(self->device));
 
   if (self->dtype == dl_float16) {
     LAUNCH_FP4_QUANTIZE_KERNEL(half, 16)
@@ -195,62 +185,87 @@ void fp4_batched_quantize(TensorView self, Optional<TensorView> const& mask, Ten
 #undef LAUNCH_FP4_QUANTIZE_KERNEL
 }
 
-void silu_and_mul_nvfp4_batched_quantize(TensorView const& self, TensorView const& mask,
-                                         TensorView const& globalScale, TensorView valueE2M1,
-                                         TensorView scaleFP8SF, int64_t sfVecSize) {
-  // TODO(shuw): mask can be none
-  CHECK_CUDA(self);
-  CHECK_CONTIGUOUS(self);
+void silu_and_mul_scaled_nvfp4_experts_quantize(
+    Tensor output,
+    Tensor output_scale,
+    Tensor const input,
+    Tensor const input_global_scale,  
+    Tensor const mask,
+    bool use_silu_and_mul) {
   auto fp32_dtype = DLDataType{kDLFloat, 32, 1};
-  CHECK_INPUT_TYPE(globalScale, fp32_dtype);
-  TVM_FFI_ICHECK_EQ(sfVecSize, 16) << "sfVecSize can only be 16";
+  auto int32_dtype = DLDataType{kDLInt, 32, 1};
+  auto uint8_dtype = DLDataType{kDLUInt, 8, 1};
+  CHECK_CUDA(output);
+  CHECK_CUDA(output_scale);
+  CHECK_CUDA(input);
+  CHECK_CUDA(input_global_scale);
+  CHECK_CUDA(mask);
 
-  auto const& inputShape = self.shape();
-  auto const& rank = inputShape.size();
-  auto const& mask_rank = mask.shape().size();
+  TVM_FFI_ICHECK_EQ(output.ndim() , 2);
+  TVM_FFI_ICHECK_EQ(output_scale.ndim() , 2);
+  TVM_FFI_ICHECK_EQ(input.ndim() , 2);
+  TVM_FFI_ICHECK_EQ(input_global_scale.ndim() , 1);
+  
+  CHECK_INPUT_TYPE(input_global_scale, fp32_dtype);
+  CHECK_INPUT_TYPE(mask , int32_dtype);
+  // output is uint8 (two nvfp4 values are packed into one uint8)
+  // output_scale is int32 (four fp8 values are packed into one int32)
+  CHECK_INPUT_TYPE(output , uint8_dtype);
+  CHECK_INPUT_TYPE(output_scale , int32_dtype);
 
-  TVM_FFI_ICHECK_EQ(rank, 3) << "Input should be 3D tensor.";
-  TVM_FFI_ICHECK_EQ(mask_rank, 1) << "Mask should be 1D tensor.";
+  const int BLOCK_SIZE = 16;
+  auto m_topk = input.shape()[0];
+  auto k_by_2 = input.shape()[1];
+  auto k = k_by_2;
+  if (use_silu_and_mul) {
+    TVM_FFI_ICHECK_EQ(k_by_2 % 2 , 0) << "k must be a multiple of 2";
+    k = k_by_2 / 2;
+  }
+  auto n_experts = input_global_scale.shape()[0];
+  TVM_FFI_ICHECK_EQ(mask.shape()[0], n_experts);
+  TVM_FFI_ICHECK_EQ(output.shape()[0] , m_topk);
+  TVM_FFI_ICHECK_EQ(output.shape()[1] , k / 2);
+  int scales_k = k / BLOCK_SIZE;
+  // 4 means the swizzle requirement by nvidia nvfp4.
+  int padded_k = (scales_k + (4 - 1)) / 4 * 4;
+  // 4 means 4 fp8 values are packed into one int32
+  TVM_FFI_ICHECK_EQ(output_scale.shape()[1] * 4 , padded_k);
 
-  int64_t b = inputShape[0];
-  int64_t m = inputShape[1];
-  int64_t k_by_2 = inputShape[2];
-  int64_t k = k_by_2 / 2;
-
-  TVM_FFI_ICHECK_EQ(k % sfVecSize, 0);
-  TVM_FFI_ICHECK_EQ(mask.shape()[0], b);
-
-  std::vector<int64_t> outputShape(inputShape.begin(), inputShape.end());
-  outputShape[rank - 1] = k / 2;
-
-  const thread_local int mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
-  auto layout = tensorrt_llm::QuantizationSFLayout::SWIZZLED_128x4;
-
-#define LAUNCH_SILU_AND_MUL_NVFP4_QUANTIZE_KERNEL(T, SF_VEC_SIZE)                             \
-  tensorrt_llm::kernels::invokeSiluAndMulFP4Quantization<T, SF_VEC_SIZE>(                     \
-      b, m, k_by_2, reinterpret_cast<T*>(self->data), static_cast<float*>(globalScale->data), \
-      static_cast<int32_t*>(mask->data), reinterpret_cast<int64_t*>(valueE2M1->data),         \
-      reinterpret_cast<int32_t*>(scaleFP8SF->data), layout, mMultiProcessorCount,             \
-      get_stream(self->device));
-
-  if (self->dtype == dl_float16) {
-    LAUNCH_SILU_AND_MUL_NVFP4_QUANTIZE_KERNEL(half, 16)
-  } else if (self->dtype == dl_bfloat16) {
-#ifdef ENABLE_BF16
-    LAUNCH_SILU_AND_MUL_NVFP4_QUANTIZE_KERNEL(__nv_bfloat16, 16)
-#else
-    TVM_FFI_LOG_AND_THROW(NotImplementedError)
-        << "BFloat16 must be enabled to quantize an bf16 tensor to fp4.";
-#endif
+  auto in_dtype = input->dtype;
+  const cudaStream_t stream = get_stream(input->device);
+  if (in_dtype == dl_float16) {
+    tensorrt_llm::kernels::invokeSiluAndMulNVFP4Quantization<half>(
+        output->data,
+        output_scale->data,
+        input->data,
+        input_global_scale->data,
+        nullptr,  // input_offset_by_experts
+        nullptr,  // output_scale_offset_by_experts
+        mask->data,
+        use_silu_and_mul,
+        m_topk,
+        k,
+        n_experts,
+        stream);
+  } else if (in_dtype == dl_bfloat16) {
+    tensorrt_llm::kernels::invokeSiluAndMulNVFP4Quantization<__nv_bfloat16>(
+        output->data,
+        output_scale->data,
+        input->data,
+        input_global_scale->data,
+        nullptr,  // input_offset_by_experts
+        nullptr,  // output_scale_offset_by_experts
+        mask->data,
+        use_silu_and_mul,
+        m_topk,
+        k,
+        n_experts,
+        stream);
   } else {
     TVM_FFI_LOG_AND_THROW(NotImplementedError)
-        << "fp4_quantize only supports input tensor with dtypes fp16/bf16.";
-  }
-
-#undef LAUNCH_SILU_AND_MUL_NVFP4_QUANTIZE_KERNEL
+        << "silu_and_mul_scaled_nvfp4_experts_quantize only supports input tensor with dtypes fp16/bf16.";  }
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp4_quantize, fp4_quantize);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp4_batched_quantize, fp4_batched_quantize);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(silu_and_mul_nvfp4_batched_quantize,
-                              silu_and_mul_nvfp4_batched_quantize);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(silu_and_mul_scaled_nvfp4_experts_quantize, silu_and_mul_scaled_nvfp4_experts_quantize);

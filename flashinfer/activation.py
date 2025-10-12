@@ -20,15 +20,10 @@ from typing import Optional
 
 import torch
 
+from .jit import JitSpec
 from .jit import gen_act_and_mul_module
-from .utils import (
-    device_support_pdl,
-    register_custom_op,
-    register_fake_op,
-    get_compute_capability,
-)
+from .utils import device_support_pdl, register_custom_op, register_fake_op, get_compute_capability
 from .fp4_quantization import get_fp4_quantization_module
-
 
 @functools.cache
 def get_act_and_mul_module(act_func_name: str):
@@ -110,39 +105,6 @@ def silu_and_mul(
     return out
 
 
-def silu_and_mul_nvfp4_batched_quantize(
-    a,
-    mask,
-    a_global_sf,
-    sf_vec_size=16,
-):
-    """
-    Silu and multiply and quantize batched input tensor to NVFP4 format with mask.
-
-    Parameters:
-        a (torch.Tensor): Input tensor of shape [B, M, K] with dtype fp16/bf16.
-        a_global_sf (torch.Tensor): Global scale factor of shape [1] with dtype float32.
-        mask (torch.Tensor): Mask tensor to apply before quantization.
-        sf_vec_size (int, optional): Scale factor vector size. Defaults to 16.
-
-    Returns:
-        Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
-            - Quantized tensor of shape [B, M, K/2] with dtype FLOAT4_E2M1X2
-            - Scale factors tensor with shape determined by layout and sf_vec_size
-    """
-    major, minor = get_compute_capability(a.device)
-    device_arch = f"{major * 10 + minor}"
-    a_fp4, a_sf = get_fp4_quantization_module(
-        device_arch
-    ).silu_and_mul_nvfp4_batched_quantize_sm100(
-        a,
-        mask,
-        a_global_sf,
-        sf_vec_size,
-    )
-    return a_fp4, a_sf
-
-
 def gelu_tanh_and_mul(
     input: torch.Tensor, out: torch.Tensor = None, enable_pdl: Optional[bool] = None
 ) -> torch.Tensor:
@@ -221,3 +183,31 @@ def gelu_and_mul(
         )
     get_act_and_mul_module("gelu").gelu_and_mul(out, input, enable_pdl)
     return out
+
+def silu_and_mul_scaled_nvfp4_experts_quantize(
+    a,
+    mask,
+    a_global_sf,
+):
+    """
+    Silu and multiply and quantize batched input tensor to NVFP4 format with mask.
+    Parameters:
+        a (torch.Tensor): Input tensor of shape [B, M, K] with dtype fp16/bf16.
+        a_global_sf (torch.Tensor): Global scale factor of shape [1] with dtype float32.
+        mask (torch.Tensor): Mask tensor to apply before quantization.
+        sf_vec_size (int, optional): Scale factor vector size. Defaults to 16.
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
+            - Quantized tensor of shape [B, M, K/2] with dtype FLOAT4_E2M1X2
+            - Scale factors tensor with shape determined by layout and sf_vec_size
+    """
+    major, minor = get_compute_capability(a.device)
+    device_arch = f"{major * 10 + minor}"
+    a_fp4, a_sf = get_fp4_quantization_module(
+        device_arch
+    ).silu_and_mul_scaled_nvfp4_experts_quantize_sm100(
+        a,
+        mask,
+        a_global_sf,
+    )
+    return a_fp4, a_sf

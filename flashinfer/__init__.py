@@ -24,9 +24,7 @@ from . import jit as jit
 from .activation import gelu_and_mul as gelu_and_mul
 from .activation import gelu_tanh_and_mul as gelu_tanh_and_mul
 from .activation import silu_and_mul as silu_and_mul
-from .activation import (
-    silu_and_mul_nvfp4_batched_quantize as silu_and_mul_nvfp4_batched_quantize,
-)
+from .activation import silu_and_mul_scaled_nvfp4_experts_quantize as silu_and_mul_scaled_nvfp4_experts_quantize
 from .attention import BatchAttention as BatchAttention
 from .attention import (
     BatchAttentionWithAttentionSinkWrapper as BatchAttentionWithAttentionSinkWrapper,
@@ -71,6 +69,7 @@ from .fp4_quantization import (
     nvfp4_batched_quantize,
     shuffle_matrix_a,
     shuffle_matrix_sf_a,
+    scaled_fp4_grouped_quantize,
 )
 from .fp8_quantization import mxfp8_dequantize_host, mxfp8_quantize
 from .fused_moe import (
