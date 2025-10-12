@@ -20,9 +20,9 @@
 using namespace flashinfer;
 using namespace flashinfer::group_gemm;
 
-void CutlassSegmentGEMM(Tensor workspace_buffer, Tensor all_problems, Tensor x_ptr, Tensor w_ptr,
-                        Tensor y_ptr, Tensor x_ld, Tensor w_ld, Tensor y_ld, Tensor empty_x_data,
-                        bool weight_column_major) {
+void CutlassSegmentGEMM(TensorView workspace_buffer, TensorView all_problems, TensorView x_ptr,
+                        TensorView w_ptr, TensorView y_ptr, TensorView x_ld, TensorView w_ld,
+                        TensorView y_ld, TensorView empty_x_data, bool weight_column_major) {
   unsigned int batch_size = x_ptr->shape[0];
 
   cudaSetDevice(workspace_buffer->device.device_id);

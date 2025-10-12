@@ -116,8 +116,8 @@ void tgv_gemm_impl(input_type* mat1_ptr, input_type* mat2_ptr, output_type* outp
 
 }  // namespace
 
-Tensor tgv_gemm(Tensor const& mat1, Tensor const& mat2, Optional<Tensor> bias, int64_t tactic,
-                bool pdl) {
+void tgv_gemm(TensorView mat1, TensorView mat2, Optional<TensorView> bias, int64_t tactic,
+              TensorView out, bool pdl) {
   // Input validation
   TVM_FFI_ICHECK_EQ(mat1->device.device_type, kDLCUDA) << "mat1 tensor must be on CUDA";
   TVM_FFI_ICHECK_EQ(mat2->device.device_type, kDLCUDA) << "mat2 tensor must be on CUDA";
@@ -167,7 +167,9 @@ Tensor tgv_gemm(Tensor const& mat1, Tensor const& mat2, Optional<Tensor> bias, i
   }
 
   // Create output tensor [N, M] row major
-  Tensor C = alloc_tensor({N, M}, mat1->dtype, mat1->device);
+  TVM_FFI_ICHECK_EQ(out->shape[0], N);
+  TVM_FFI_ICHECK_EQ(out->shape[1], M);
+  TVM_FFI_ICHECK_EQ(out->dtype, mat1->dtype);
 
   // manually calculate the L stride
   // A [M, K] row major
@@ -179,12 +181,12 @@ Tensor tgv_gemm(Tensor const& mat1, Tensor const& mat2, Optional<Tensor> bias, i
   int stride_B_K = mat2->strides[0];
   int stride_B_L = N * K;
   // original C [N, M] row major
-  int stride_C_M = C->strides[1];
-  int stride_C_N = C->strides[0];
+  int stride_C_M = out->strides[1];
+  int stride_C_N = out->strides[0];
   int stride_C_L = M * N;
 
   // Get CUDA stream
-  cudaStream_t stream = get_stream(C->device);
+  cudaStream_t stream = get_stream(out->device);
 
   // Dispatch based on dtype
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(mat1->dtype, c_type, [&] {
@@ -193,7 +195,7 @@ Tensor tgv_gemm(Tensor const& mat1, Tensor const& mat2, Optional<Tensor> bias, i
 
     cutlass_input_type* mat1_ptr = static_cast<cutlass_input_type*>(mat1->data);
     cutlass_input_type* mat2_ptr = static_cast<cutlass_input_type*>(mat2->data);
-    cutlass_output_type* output_ptr = static_cast<cutlass_output_type*>(C->data);
+    cutlass_output_type* output_ptr = static_cast<cutlass_output_type*>(out->data);
     cutlass_output_type* bias_ptr =
         bias.has_value() ? static_cast<cutlass_output_type*>(bias.value()->data) : nullptr;
 
@@ -207,18 +209,17 @@ Tensor tgv_gemm(Tensor const& mat1, Tensor const& mat2, Optional<Tensor> bias, i
   // original C is [N, M] row major
   // after transpose, it's [M, N] column major
   // the storage is unchanged, only the logical coordinates are changed
-  std::swap(C->shape[0], C->shape[1]);
-  std::swap(C->strides[0], C->strides[1]);
-  return C;
+  std::swap(out->shape[0], out->shape[1]);
+  std::swap(out->strides[0], out->strides[1]);
 }
 
 // Keep backward compatibility functions
-Tensor bf16_gemm(Tensor const& mat1, Tensor const& mat2, std::optional<Tensor> bias, int64_t tactic,
-                 bool pdl) {
+void bf16_gemm(TensorView mat1, TensorView mat2, std::optional<TensorView> bias, int64_t tactic,
+               TensorView out, bool pdl) {
   // Check that inputs are bfloat16 for backward compatibility
   TVM_FFI_ICHECK_EQ(mat1->dtype, dl_bfloat16) << "mat1 tensor must be bfloat16";
   TVM_FFI_ICHECK_EQ(mat2->dtype, dl_bfloat16) << "mat2 tensor must be bfloat16";
-  return tgv_gemm(mat1, mat2, bias, tactic, pdl);
+  tgv_gemm(mat1, mat2, bias, tactic, out, pdl);
 }
 
 int64_t tgv_gemm_tactic_num() {
