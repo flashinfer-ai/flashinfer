@@ -1862,8 +1862,7 @@ __global__ void TopKMaskLogitsKernel(DType* logits, DType* masked_logits, IdType
           (logits_vec[j] > pivot) ? logits_vec[j] : -cuda::std::numeric_limits<float>::infinity();
     }
     if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
-      logits_vec.store(masked_logits + row_idx * stride + i * BLOCK_THREADS * VEC_SIZE +
-                       tx * VEC_SIZE);
+      logits_vec.store(masked_logits + row_idx * d + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
     }
   }
 }
@@ -1987,8 +1986,7 @@ __global__ void TopKRenormProbKernel(DType* probs, DType* renormed_prob, IdType*
       probs_vec[j] = (probs_vec[j] > pivot) ? probs_vec[j] * normalizer : 0;
     }
     if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
-      probs_vec.store(renormed_prob + row_idx * stride + i * BLOCK_THREADS * VEC_SIZE +
-                      tx * VEC_SIZE);
+      probs_vec.store(renormed_prob + row_idx * d + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
     }
   }
 }
