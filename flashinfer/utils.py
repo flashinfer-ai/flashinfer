@@ -18,8 +18,6 @@ import functools
 import math
 from enum import Enum
 from typing import Callable, Dict, Iterable, Optional, Sequence, Tuple, Union
-import inspect
-
 
 import torch
 import torch.version
@@ -771,118 +769,76 @@ def get_native_fp4_dtype():
         return torch.uint8
 
 
-def supports_backends(
-    backends,
-    capabilities=None,
-    anti_capabilities=None,
-    capability_tensor_arg=None,
-    problem_size_check=None,
-):
-    """Decorator to validate backend and capability support for functions.
-
-    This decorator wraps functions to ensure they are only called with supported
-    backends and optionally validates compute capabilities for specific tensor arguments.
-
-    Args:
-        backends (list): List of supported backend strings (e.g., ['cudnn', 'trtllm', 'cutlass']).
-        capabilities (dict, optional): Dictionary mapping backends to lists of supported
-            capabilities. Format: {'backend': ['capability1', 'capability2']}.
-            If provided, only listed capabilities are allowed for each backend.
-        anti_capabilities (dict, optional): Dictionary mapping backends to lists of
-            unsupported capabilities. Format: {'backend': ['capability1', 'capability2']}.
-            Takes precedence over capabilities - if a capability is in anti_capabilities,
-            it will be rejected even if listed in capabilities.
-        capability_tensor_arg (str, optional): Name of the tensor argument to use for
-            automatic compute capability detection. The tensor's device compute capability
-            will be extracted and used for validation.
-        problem_size_check (callable, optional): Function to check if the problem size is supported.
-    Returns:
-        callable: Decorator function that wraps the target function.
-
-    Raises:
-        BackendSupportedError: If the function is called with an unsupported backend
-            or backend/capability combination.
-        ValueError: If capability_tensor_arg is specified but the tensor is None.
-
-    Added Attributes:
-        The decorated function gains two additional methods:
-        - is_compute_capability_supported(capability): Returns True if any backend supports the capability.
-        - is_backend_supported(backend, capability=None): Returns True if the specific
-          backend supports the given capability.
-        - is_problem_size_supported(args, kwargs): Returns True if the problem size is supported.
-
-    Example:
-        >>> def simple_problem_size_check(input_tensor, backend):
-        ...     return True
-        >>> @supports_backends(["cudnn", "trtllm"],
-        ...                   problem_size_check=simple_problem_size_check,
-        ...                   capabilities={'cudnn': ['100', '110', '102']},
-        ...                   anti_capabilities={"trtllm": ["110"]},
-        ...                   capability_tensor_arg='input_tensor')
-        ... def my_function(input_tensor, backend):
-        ...     return f"Processing on {backend}"
-
-        >>> # Check support without calling
-        >>> my_function.is_compute_capability_supported('110')  # True
-        >>> my_function.is_backend_supported('cudnn', '110')  # True
-        >>> my_function.is_backend_supported('trtllm', '110')   # False (anti-capability)
-
-        >>> # Function calls with validation
-        >>> tensor = torch.tensor([1, 2, 3]).cuda()  # Assume SM_100
-        >>> result = my_function(tensor, backend='cudnn')  # OK
-        >>> result = my_function(tensor, backend='cutlass')  # Raises BackendSupportedError
-    """
-
+def supported_compute_capability(supported_ccs):
     def decorator(func):
-        # Returns True if backend is supported; with capability, also checks if backend specifically supports it
-        def is_backend_supported(backend, capability=None):
-            if backend not in backends:
-                return False
-            if capability:
-                # Anti-capabilities take precedence
-                if anti_capabilities and backend in anti_capabilities:
-                    if capability in anti_capabilities[backend]:
-                        return False
-                # Capabilities allow-list
-                if capabilities and backend in capabilities:
-                    return capability in capabilities[backend]
-            return True
+        func._supported_ccs = set(supported_ccs)
 
-        # Returns True if any backend supports this capability
-        def is_compute_capability_supported(capability):
-            for backend in backends:
-                if capabilities and backend in capabilities:
-                    if capability in capabilities[backend]:
-                        return True
-                elif anti_capabilities and backend in anti_capabilities:
-                    if capability in anti_capabilities[backend]:
-                        return False
-                else:
-                    return True
+        def is_cc_supported(cc):
+            return cc in func._supported_ccs
+
+        func.is_compute_capability_supported = is_cc_supported
+        return func
+
+    return decorator
+
+
+def backend_requirement(backend_checks, common_check=None):
+    def decorator(func):
+        def is_backend_supported(backend, cc=None):
+            # Is this backend present?
+            if backend not in backend_checks:
+                return False
+            req_checker = backend_checks[backend]
+            # If user just wants to check if the backend is supported (regardless of compute capability), return True
+            if cc is None:
+                return True
+            # Check compute capability support via attribute on requirement function
+            elif hasattr(req_checker, "is_compute_capability_supported"):
+                return req_checker.is_compute_capability_supported(cc)
             return False
 
+        def is_compute_capability_supported(cc):
+            # True if any backend requirement supports this cc
+            return any(
+                hasattr(checker, "is_compute_capability_supported")
+                and checker.is_compute_capability_supported(cc)
+                for checker in backend_checks.values()
+            )
+
         def is_problem_size_supported(*args, **kwargs):
-            if not problem_size_check:
+            backend = kwargs.get("backend")
+            if backend not in backend_checks:
                 raise ValueError(
-                    f"Problem size check function is not provided for {func.__name__}"
+                    f"Backend '{backend}' is not supported for {func.__name__}"
                 )
+            req_checker = backend_checks[backend]
+            if common_check is not None:
+                return common_check(*args, **kwargs) and req_checker(*args, **kwargs)
             else:
-                return problem_size_check(*args, **kwargs)
+                return req_checker(*args, **kwargs)
 
         def wrapper(*args, **kwargs):
             backend = kwargs.get("backend")
             capability = None
-            if capability_tensor_arg:
-                tensor = kwargs.get(capability_tensor_arg)
-                # When it wasn't provided as a keyword argument, try to get it from the arguments
-                if tensor is None:
-                    params = list(inspect.signature(func).parameters)
-                    idx = params.index(capability_tensor_arg)
-                    tensor = args[idx]
-                if tensor is None:
-                    raise ValueError("Invalid tensor on capability support check")
-                major, minor = get_compute_capability(tensor.device)
+
+            # Find the first tensor argument.
+            # Assume all tensors are on the same device/capability.
+            # We could consider check all tensors at a performance cost.
+            tensor_arg = None
+            for arg in args:
+                if isinstance(arg, torch.Tensor):
+                    tensor_arg = arg
+            if tensor_arg is None:
+                for value in kwargs.values():
+                    if isinstance(value, torch.Tensor):
+                        tensor_arg = value
+
+            if tensor_arg is not None:
+                # Get compute capability from the first tensor
+                # Assume all tensors are on the same device/capability
+                major, minor = get_compute_capability(tensor_arg.device)
                 capability = f"{major * 10 + minor}"
+
             if not is_backend_supported(backend, capability):
                 extra = f" with capability {capability}" if capability else ""
                 raise BackendSupportedError(
@@ -892,11 +848,8 @@ def supports_backends(
                 raise ValueError(f"Problem size is not supported for {func.__name__}")
             return func(*args, **kwargs)
 
-        wrapper.is_compute_capability_supported = is_compute_capability_supported
         wrapper.is_backend_supported = is_backend_supported
-        wrapper.is_problem_size_supported = is_problem_size_supported
-        wrapper.__name__ = func.__name__
-        wrapper.__doc__ = func.__doc__
+        wrapper.is_compute_capability_supported = is_compute_capability_supported
         return wrapper
 
     return decorator

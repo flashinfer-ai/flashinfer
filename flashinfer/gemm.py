@@ -41,7 +41,8 @@ from .utils import (
     is_sm120a_supported,
     is_sm121a_supported,
     LibraryError,
-    supports_backends,
+    backend_requirement,
+    supported_compute_capability,
 )
 from .jit.gemm import gen_gemm_sm90_module
 from .jit.gemm import gen_gemm_module
@@ -1685,7 +1686,7 @@ def mm_fp8(
     return out
 
 
-def _check_mm_fp4_backend_supported(
+def _check_mm_fp4_problem_size(
     a: torch.Tensor,
     b: torch.Tensor,
     a_descale: torch.Tensor,
@@ -1743,51 +1744,6 @@ def _check_mm_fp4_backend_supported(
     if backend != "cudnn" and not use_nvfp4:
         raise ValueError("Only cudnn FP4 GEMM supports mxfp4 quantization.")
 
-    # Backend specific checks
-    if backend == "cudnn":
-        if (
-            not use_nvfp4
-            and _match_sm_version(a.device, ["120"])
-            and cudnn.backend_version() < 91400
-        ):
-            raise LibraryError(
-                "cudnn FP4 GEMM with mxfp4 quantization is not supported on SM120 with cuDNN backend version < 9.14.0."
-            )
-
-        _check_cudnn_fp4_availability()
-
-        # the fp4 cudnn graph will be shared for both mm and bmm, so
-        # here we need to get the 3d shape and stride including the
-        # batch dimension for both input and block scale tensors.
-        real_a_shape, real_a_stride = _get_real_fp4_shape_from_packed_uint8(a)
-        real_b_shape, real_b_stride = _get_real_fp4_shape_from_packed_uint8(b)
-        batch = real_a_shape[0]
-        expanded_a_descale_shape, expanded_a_descale_stride = (
-            _expand_block_scale_tensor_shape(a_descale, batch)
-        )
-        expanded_b_descale_shape, expanded_b_descale_stride = (
-            _expand_block_scale_tensor_shape(b_descale, batch)
-        )
-
-        # build the fp4 cudnn graph
-        graph = create_cudnn_execution_plans_fp4_gemm(
-            real_a_shape,
-            real_a_stride,
-            real_b_shape,
-            real_b_stride,
-            expanded_a_descale_shape,
-            expanded_a_descale_stride,
-            expanded_b_descale_shape,
-            expanded_b_descale_stride,
-            cudnn.data_type.FP4_E2M1,
-            _torch_data_type_to_cudnn_data_type(out_dtype),
-            block_size,
-            a.device,
-            alpha,
-            use_nvfp4,
-        )
-        graph.check_support()
-
     elif backend == "trtllm":
         if out_dtype != torch.bfloat16:
             raise ValueError(
@@ -1800,11 +1756,75 @@ def _check_mm_fp4_backend_supported(
     return True
 
 
-@supports_backends(
-    ["cudnn", "trtllm", "cutlass"],
-    anti_capabilities={"trtllm": ["110"]},
-    capability_tensor_arg="a",
-    problem_size_check=_check_mm_fp4_backend_supported,
+@supported_compute_capability(["100", "103", "110", "120"])
+def cudnn_gemm_fp4_requirement(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_descale: torch.Tensor,
+    b_descale: torch.Tensor,
+    alpha: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    out: Optional[torch.Tensor] = None,
+    block_size: int = 16,
+    use_8x4_sf_layout: bool = False,
+    backend: Literal["cudnn", "trtllm", "cutlass"] = "cudnn",
+    use_nvfp4: bool = True,
+):
+    if (
+        not use_nvfp4
+        and _match_sm_version(a.device, ["120"])
+        and cudnn.backend_version() < 91400
+    ):
+        raise LibraryError(
+            "cudnn FP4 GEMM with mxfp4 quantization is not supported on SM120 with cuDNN backend version < 9.14.0."
+        )
+
+    _check_cudnn_fp4_availability()
+
+    # the fp4 cudnn graph will be shared for both mm and bmm, so
+    # here we need to get the 3d shape and stride including the
+    # batch dimension for both input and block scale tensors.
+    real_a_shape, real_a_stride = _get_real_fp4_shape_from_packed_uint8(a)
+    real_b_shape, real_b_stride = _get_real_fp4_shape_from_packed_uint8(b)
+    batch = real_a_shape[0]
+    expanded_a_descale_shape, expanded_a_descale_stride = (
+        _expand_block_scale_tensor_shape(a_descale, batch)
+    )
+    expanded_b_descale_shape, expanded_b_descale_stride = (
+        _expand_block_scale_tensor_shape(b_descale, batch)
+    )
+
+    # build the fp4 cudnn graph
+    graph = create_cudnn_execution_plans_fp4_gemm(
+        real_a_shape,
+        real_a_stride,
+        real_b_shape,
+        real_b_stride,
+        expanded_a_descale_shape,
+        expanded_a_descale_stride,
+        expanded_b_descale_shape,
+        expanded_b_descale_stride,
+        cudnn.data_type.FP4_E2M1,
+        _torch_data_type_to_cudnn_data_type(out_dtype),
+        block_size,
+        a.device,
+        alpha,
+        use_nvfp4,
+    )
+    graph.check_support()
+
+    return True
+
+
+# @supports_backends(
+#     ["cudnn", "trtllm", "cutlass"],
+#     anti_capabilities={"trtllm": ["110"]},
+#     capability_tensor_arg="a",
+#     problem_size_check=_check_mm_fp4_backend_supported,
+# )
+@backend_requirement(
+    {"cudnn": cudnn_gemm_fp4_requirement},
+    common_check=_check_mm_fp4_problem_size,
 )
 def mm_fp4(
     a: torch.Tensor,
