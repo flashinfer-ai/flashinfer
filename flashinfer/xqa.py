@@ -17,7 +17,7 @@ limitations under the License.
 import functools
 from types import SimpleNamespace
 from typing import Optional
-
+from .utils import get_compute_capability
 import torch
 
 from .jit.xqa import gen_xqa_module
@@ -139,8 +139,8 @@ def xqa(
     semaphores: torch.Tensor,
     scratch: torch.Tensor,
 ) -> None:
-    if get_compute_capability(torch.device(device="cuda"))[0] != 9:
-        raise RuntimeError("XQA is only supported on SM90 GPUs")
+    if get_compute_capability(torch.device(device="cuda"))[0] not in [9, 10, 12]:
+        raise RuntimeError("XQA is only supported on SM90, SM100, SM120 GPUs")
     xqa_module = get_xqa_module(
         fp16_input,
         fp8_kv_cache,

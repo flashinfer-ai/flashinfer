@@ -149,8 +149,8 @@ def ref_attention(
 
 
 @pytest.mark.skipif(
-    get_compute_capability(torch.device(device="cuda"))[0] != 9,
-    reason="XQA is only supported on SM90 GPUs",
+    get_compute_capability(torch.device(device="cuda"))[0] not in [9, 10, 12],
+    reason="XQA is only supported on SM90, SM100, SM120 GPUs",
 )
 @pytest.mark.parametrize("use_sliding_window", [True, False])
 @pytest.mark.parametrize("fp16_input", [True, False])
@@ -177,8 +177,8 @@ def test_xqa(
     use_sliding_window,
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
-    if compute_capability[0] != 9:
-        pytest.skip("XQA only supports on Hopper at this moment")
+    if compute_capability[0] != 9 and run_fp8_mha:
+        pytest.skip("XQA supports fp8 mha only on Hopper GPUs")
     set_random_seed(42)
 
     nb_v_heads = nb_k_heads
