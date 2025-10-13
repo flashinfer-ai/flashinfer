@@ -83,46 +83,62 @@ class FlashInferRotaryEmbedding(nn.Module):
             return torch.stack((o1, o2), dim=-1).flatten(-2)
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["num_tokens"],
-        x_vals=[768] if mode_ncu else [1, 2, 4, 8, 16, 32, 64, 128, 256, 384, 512, 768],
-        line_arg="provider",
-        line_vals=["flashinfer"],
-        line_names=["FlashInfer"],
-        styles=[("blue", "-")],
-        ylabel="Latency (ms)",
-        plot_name="rope-latency",
-        args={},
-    )
-)
-def benchmark(
-    provider,
-    num_tokens,
-):
+def benchmark_config(config_name, num_tokens):
+    """Benchmark a specific attention configuration."""
     input_dtype = torch.bfloat16
     device = "cuda"
     quant_dtype = torch.float8_e4m3fn
 
-    num_qo_heads = 128
+    # Configuration-specific parameters
+    if config_name == "mla":
+        # MLA: Original configuration for regression testing
+        num_qo_heads, num_kv_heads = 128, 1
+        rope_dim, no_rope_dim = 64, 512
+    elif config_name == "gqa":
+        # GQA: Realistic grouped-query attention
+        num_qo_heads, num_kv_heads = 32, 8
+        rope_dim, no_rope_dim = 64, 64
+    elif config_name == "mha":
+        # MHA: Standard multi-head attention
+        num_qo_heads, num_kv_heads = 32, 32
+        rope_dim, no_rope_dim = 64, 64
+    else:
+        raise ValueError(f"Unknown config: {config_name}")
+
+    total_dim = rope_dim + no_rope_dim
+
+    # Create tensors based on configuration
     q_rope = torch.randn(
-        num_tokens, num_qo_heads, 192, dtype=input_dtype, device=device
-    )[:, :, :64]
-    # TODO not 1:1 mimic yet
-    k_rope = torch.randn(num_tokens, 64, dtype=input_dtype, device=device)
+        num_tokens, num_qo_heads, rope_dim, dtype=input_dtype, device=device
+    )
     q_nope = torch.randn(
-        num_qo_heads, num_tokens, 512, dtype=input_dtype, device=device
-    ).permute(1, 0, 2)
-    k_nope = torch.randn(num_tokens, 512, dtype=input_dtype, device=device)
+        num_tokens, num_qo_heads, no_rope_dim, dtype=input_dtype, device=device
+    )
+
+    if config_name == "mla":
+        # MLA: 2D K tensors (shared)
+        k_rope = torch.randn(num_tokens, rope_dim, dtype=input_dtype, device=device)
+        k_nope = torch.randn(num_tokens, no_rope_dim, dtype=input_dtype, device=device)
+    else:
+        # GQA/MHA: 3D K tensors (multiple heads)
+        k_rope = torch.randn(
+            num_tokens, num_kv_heads, rope_dim, dtype=input_dtype, device=device
+        )
+        k_nope = torch.randn(
+            num_tokens, num_kv_heads, no_rope_dim, dtype=input_dtype, device=device
+        )
+
     pos_ids = torch.arange(num_tokens, device=device)
 
-    q_out = torch.empty(num_tokens, num_qo_heads, 576, dtype=quant_dtype, device=device)
-    k_rope_out = torch.empty(num_tokens, 64, dtype=quant_dtype, device=device)
-    k_nope_out = torch.empty(num_tokens, 512, dtype=quant_dtype, device=device)
+    # Create output tensors
+    q_rope_out = torch.empty_like(q_rope, dtype=quant_dtype)
+    q_nope_out = torch.empty_like(q_nope, dtype=quant_dtype)
+    k_rope_out = torch.empty_like(k_rope, dtype=quant_dtype)
+    k_nope_out = torch.empty_like(k_nope, dtype=quant_dtype)
 
     rope_flashinfer = FlashInferRotaryEmbedding(
-        head_size=576,
-        rotary_dim=64,
+        head_size=total_dim,
+        rotary_dim=rope_dim,
         max_position_embeddings=4096,
         base=10000,
         is_neox_style=False,
@@ -139,26 +155,16 @@ def benchmark(
             torch.cuda.cudart().cudaProfilerStart()
 
         flashinfer.rope.mla_rope_quantize_fp8(
-            # (bs, 128, 64), bf16, stride=(128 * 192, 192, 1)
             q_rope=q_rope,
-            # (bs, 64), bf16, stride=(2112, 1)
             k_rope=k_rope,
-            # shape=(bs, 128, 512), bf16, stride=(512, 512 * bs, 1)
             q_nope=q_nope,
-            # (bs, 512), bf16, stride=(512, 1)
             k_nope=k_nope,
             cos_sin_cache=rope_flashinfer.cos_sin_cache,
             pos_ids=pos_ids,
             is_neox=False,
-            # q_out: (bs, 128, 576), e4m3fn, stride=(128 * 576, 576, 1)
-            # q_rope_out=q_out[..., self.kv_lora_rank:]
-            # q_nope_out=q_out[..., :self.kv_lora_rank]
-            q_rope_out=q_out[..., 512:],
-            # (bs, 64), e4m3fn, stride=(64, 1)
+            q_rope_out=q_rope_out,
             k_rope_out=k_rope_out,
-            # see above
-            q_nope_out=q_out[..., :512],
-            # (bs, 512), stride=(512, 1)
+            q_nope_out=q_nope_out,
             k_nope_out=k_nope_out,
             quant_scale_q=1.0,
             quant_scale_kv=1.0,
@@ -179,5 +185,89 @@ def benchmark(
     return ms, min_ms, max_ms
 
 
+# Create separate benchmark functions for each architecture
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=["num_tokens"],
+        x_vals=[768] if mode_ncu else [1, 2, 4, 8, 16, 32, 64, 128, 256, 384, 512, 768],
+        line_arg="provider",
+        line_vals=["flashinfer"],
+        line_names=["FlashInfer"],
+        styles=[("blue", "-")],
+        ylabel="Latency (ms)",
+        plot_name="mla-rope-benchmark",
+        args={},
+    )
+)
+def benchmark_mla(provider, num_tokens):
+    return benchmark_config("mla", num_tokens)
+
+
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=["num_tokens"],
+        x_vals=[768] if mode_ncu else [1, 2, 4, 8, 16, 32, 64, 128, 256, 384, 512, 768],
+        line_arg="provider",
+        line_vals=["flashinfer"],
+        line_names=["FlashInfer"],
+        styles=[("red", "--")],
+        ylabel="Latency (ms)",
+        plot_name="gqa-rope-benchmark",
+        args={},
+    )
+)
+def benchmark_gqa(provider, num_tokens):
+    return benchmark_config("gqa", num_tokens)
+
+
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=["num_tokens"],
+        x_vals=[768] if mode_ncu else [1, 2, 4, 8, 16, 32, 64, 128, 256, 384, 512, 768],
+        line_arg="provider",
+        line_vals=["flashinfer"],
+        line_names=["FlashInfer"],
+        styles=[("green", ":")],
+        ylabel="Latency (ms)",
+        plot_name="mha-rope-benchmark",
+        args={},
+    )
+)
+def benchmark_mha(provider, num_tokens):
+    return benchmark_config("mha", num_tokens)
+
+
 if __name__ == "__main__":
-    benchmark.run(print_data=True, show_plots=True, save_path="rope_benchmark.png")
+    # Run all benchmarks and generate individual plots
+    print("Running MLA benchmark...")
+    benchmark_mla.run(print_data=False, show_plots=True, save_path=".")
+
+    print("Running GQA benchmark...")
+    benchmark_gqa.run(print_data=False, show_plots=True, save_path=".")
+
+    print("Running MHA benchmark...")
+    benchmark_mha.run(print_data=False, show_plots=True, save_path=".")
+
+    # Collect results for summary table
+    token_counts = (
+        [1, 2, 4, 8, 16, 32, 64, 128, 256, 384, 512, 768] if not mode_ncu else [768]
+    )
+
+    print("\n=== Summary Table ===")
+    print(f"{'Tokens':<8} {'MLA (ms)':<10} {'GQA (ms)':<10} {'MHA (ms)':<10}")
+    print("-" * 40)
+    for num_tokens in token_counts:
+        mla_ms, _, _ = benchmark_config("mla", num_tokens)
+        gqa_ms, _, _ = benchmark_config("gqa", num_tokens)
+        mha_ms, _, _ = benchmark_config("mha", num_tokens)
+        print(f"{num_tokens:<8} {mla_ms:<10.5f} {gqa_ms:<10.5f} {mha_ms:<10.5f}")
+
+    print("\nConfiguration details:")
+    print("  MLA: 128 Q heads, 1 K head, 64+512 dims")
+    print("  GQA: 32 Q heads, 8 K heads, 64+64 dims")
+    print("  MHA: 32 Q heads, 32 K heads, 64+64 dims")
+
+    print("\nPlot files saved to current directory:")
+    print("  mla-rope-benchmark.png")
+    print("  gqa-rope-benchmark.png")
+    print("  mha-rope-benchmark.png")

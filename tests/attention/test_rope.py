@@ -413,6 +413,128 @@ def test_mla_rope_quantize(
     )
 
 
+@pytest.mark.parametrize(
+    "attention_type,num_qo_heads,num_kv_heads,rope_dim,no_rope_dim",
+    [
+        # MLA: Multiple Q heads, single shared K/V head
+        ("mla", 128, 1, 64, 512),
+        ("mla", 64, 1, 128, 256),
+        ("mla", 32, 1, 32, 96),
+        # GQA: Multiple Q heads, fewer K/V heads (grouped)
+        ("gqa", 32, 8, 64, 64),  # 4 Q heads per K/V head
+        ("gqa", 64, 16, 128, 128),  # 4 Q heads per K/V head
+        ("gqa", 24, 6, 32, 96),  # 4 Q heads per K/V head
+        # MHA: Equal Q and K/V heads
+        ("mha", 32, 32, 64, 64),
+        ("mha", 16, 16, 128, 128),
+        ("mha", 8, 8, 32, 96),
+        # # Edge cases: Different rope/no-rope dimension ratios
+        # ("mla", 32, 1, 128, 64),   # More RoPE than non-RoPE
+        # ("gqa", 16, 4, 256, 256),  # Large dimensions
+        # ("mha", 4, 4, 16, 16),     # Small dimensions
+    ],
+)
+@pytest.mark.parametrize("num_tokens", [1, 19, 128, 199])
+@pytest.mark.parametrize("input_dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("quant_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+def test_generalized_rope_quantize(
+    attention_type,
+    num_qo_heads,
+    num_kv_heads,
+    rope_dim,
+    no_rope_dim,
+    num_tokens,
+    input_dtype,
+    quant_dtype,
+):
+    """Test generalized rope + quantization for MLA, GQA, and MHA architectures."""
+    device = "cuda:0"
+    total_dim = rope_dim + no_rope_dim
+
+    # Create input tensors based on attention type
+    q_in = torch.randn(
+        num_tokens, num_qo_heads, total_dim, dtype=input_dtype, device=device
+    )
+
+    if attention_type == "mla":
+        # MLA: K tensor is 2D (shared across all Q heads)
+        k_in = torch.randn(num_tokens, total_dim, dtype=input_dtype, device=device)
+    else:
+        # GQA/MHA: K tensor is 3D (multiple K heads)
+        k_in = torch.randn(
+            num_tokens, num_kv_heads, total_dim, dtype=input_dtype, device=device
+        )
+
+    pos_ids = torch.arange(num_tokens, device=device)
+
+    # Create reference implementation using FlashInferRotaryEmbedding
+    rope_flashinfer = FlashInferRotaryEmbedding(
+        total_dim,
+        rope_dim,
+        4096,  # max_position_embeddings
+        10000,  # base
+        False,  # is_neox_style
+        input_dtype,
+        device,
+    )
+
+    # Compute reference output
+    q_out_f16_ref, k_out_f16_ref = rope_flashinfer.forward_native(pos_ids, q_in, k_in)
+    q_out_f8_ref, k_out_f8_ref = map(
+        lambda x: x.to(quant_dtype),
+        (q_out_f16_ref, k_out_f16_ref),
+    )
+
+    # Prepare output tensors
+    q_out = torch.empty_like(q_in, dtype=quant_dtype)
+    k_out = torch.empty_like(k_in, dtype=quant_dtype)
+
+    # Split input tensors into rope and nope parts
+    q_rope_in = q_in[..., :rope_dim]
+    q_nope_in = q_in[..., rope_dim:]
+    k_rope_in = k_in[..., :rope_dim]
+    k_nope_in = k_in[..., rope_dim:]
+
+    # Prepare output tensor slices
+    q_rope_out = q_out[..., :rope_dim]
+    q_nope_out = q_out[..., rope_dim:]
+    k_rope_out = k_out[..., :rope_dim]
+    k_nope_out = k_out[..., rope_dim:]
+
+    # Call the generalized function
+    flashinfer.rope.mla_rope_quantize_fp8(
+        q_rope_in,
+        k_rope_in,
+        q_nope_in,
+        k_nope_in,
+        rope_flashinfer.cos_sin_cache,
+        pos_ids,
+        is_neox=False,
+        q_rope_out=q_rope_out,
+        k_rope_out=k_rope_out,
+        q_nope_out=q_nope_out,
+        k_nope_out=k_nope_out,
+        quant_scale_q=1.0,
+        quant_scale_kv=1.0,
+    )
+
+    # Verify results
+    torch.testing.assert_close(
+        q_out_f8_ref.float(),
+        q_out.float(),
+        atol=1e-2,
+        rtol=2e-1,
+        msg=f"Q output mismatch for {attention_type} with {num_qo_heads}/{num_kv_heads} heads, {rope_dim}/{no_rope_dim} dims",
+    )
+    torch.testing.assert_close(
+        k_out_f8_ref.float(),
+        k_out.float(),
+        atol=1e-2,
+        rtol=2e-1,
+        msg=f"K output mismatch for {attention_type} with {num_qo_heads}/{num_kv_heads} heads, {rope_dim}/{no_rope_dim} dims",
+    )
+
+
 if __name__ == "__main__":
     # test_rope(2, 1, 8, 8, 1, 128, "llama", 1.0, False)
     # test_rope_pos_ids(2, 1, 8, 8, 1, 128, "llama31", 1.0, False)

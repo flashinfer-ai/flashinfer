@@ -167,7 +167,7 @@ def _fake_apply_rope_pos_ids(
     "flashinfer::mla_rope_quantize",
     mutates_args=("q_rope_out", "k_rope_out", "q_nope_out", "k_nope_out"),
 )
-def _mla_rope_quantize(
+def _mla_rope_quantize(  # kahyun
     q_rope_in: torch.Tensor,
     k_rope_in: torch.Tensor,
     q_nope_in: torch.Tensor,
@@ -1139,7 +1139,7 @@ def apply_rope_with_cos_sin_cache_inplace(
     )
 
 
-def mla_rope_quantize_fp8(
+def mla_rope_quantize_fp8(  # kahyun
     q_rope: torch.Tensor,
     k_rope: torch.Tensor,
     q_nope: torch.Tensor,

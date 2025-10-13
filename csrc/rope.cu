@@ -21,9 +21,8 @@ using namespace flashinfer;
 
 using tvm::ffi::Tensor;
 
-void apply_rope(TensorView q, TensorView k, TensorView q_rope, TensorView k_rope, TensorView indptr,
-                TensorView offsets, int64_t rotary_dim, bool interleave, double rope_scale,
-                double rope_theta) {
+void apply_rope(Tensor q, Tensor k, Tensor q_rope, Tensor k_rope, Tensor indptr, Tensor offsets,
+                int64_t rotary_dim, bool interleave, double rope_scale, double rope_theta) {
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(q);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(k);
   CHECK_INPUT(indptr);
@@ -69,9 +68,8 @@ void apply_rope(TensorView q, TensorView k, TensorView q_rope, TensorView k_rope
   });
 }
 
-void apply_rope_pos_ids(TensorView q, TensorView k, TensorView q_rope, TensorView k_rope,
-                        TensorView pos_ids, int64_t rotary_dim, bool interleave, double rope_scale,
-                        double rope_theta) {
+void apply_rope_pos_ids(Tensor q, Tensor k, Tensor q_rope, Tensor k_rope, Tensor pos_ids,
+                        int64_t rotary_dim, bool interleave, double rope_scale, double rope_theta) {
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(q);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(k);
   CHECK_INPUT(pos_ids);
@@ -113,9 +111,8 @@ void apply_rope_pos_ids(TensorView q, TensorView k, TensorView q_rope, TensorVie
   });
 }
 
-void apply_rope_pos_ids_cos_sin_cache(TensorView q, TensorView k, TensorView q_rope,
-                                      TensorView k_rope, TensorView cos_sin_cache,
-                                      TensorView pos_ids, bool interleave) {
+void apply_rope_pos_ids_cos_sin_cache(Tensor q, Tensor k, Tensor q_rope, Tensor k_rope,
+                                      Tensor cos_sin_cache, Tensor pos_ids, bool interleave) {
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(q);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(k);
   CHECK_INPUT(cos_sin_cache);
@@ -164,10 +161,10 @@ void apply_rope_pos_ids_cos_sin_cache(TensorView q, TensorView k, TensorView q_r
   });
 }
 
-void apply_llama31_rope(TensorView q, TensorView k, TensorView q_rope, TensorView k_rope,
-                        TensorView indptr, TensorView offsets, int64_t rotary_dim, bool interleave,
-                        double rope_scale, double rope_theta, double low_freq_factor,
-                        double high_freq_factor, double old_context_length) {
+void apply_llama31_rope(Tensor q, Tensor k, Tensor q_rope, Tensor k_rope, Tensor indptr,
+                        Tensor offsets, int64_t rotary_dim, bool interleave, double rope_scale,
+                        double rope_theta, double low_freq_factor, double high_freq_factor,
+                        double old_context_length) {
   CHECK_CUDA(q);  // not necessarily contiguous
   CHECK_CUDA(k);  // not necessarily contiguous
   CHECK_INPUT(indptr);
@@ -216,10 +213,10 @@ void apply_llama31_rope(TensorView q, TensorView k, TensorView q_rope, TensorVie
   });
 }
 
-void apply_llama31_rope_pos_ids(TensorView q, TensorView k, TensorView q_rope, TensorView k_rope,
-                                TensorView pos_ids, int64_t rotary_dim, bool interleave,
-                                double rope_scale, double rope_theta, double low_freq_factor,
-                                double high_freq_factor, double old_context_length) {
+void apply_llama31_rope_pos_ids(Tensor q, Tensor k, Tensor q_rope, Tensor k_rope, Tensor pos_ids,
+                                int64_t rotary_dim, bool interleave, double rope_scale,
+                                double rope_theta, double low_freq_factor, double high_freq_factor,
+                                double old_context_length) {
   CHECK_CUDA(q);  // not necessarily contiguous
   CHECK_CUDA(k);  // not necessarily contiguous
   CHECK_INPUT(pos_ids);
@@ -262,11 +259,10 @@ void apply_llama31_rope_pos_ids(TensorView q, TensorView k, TensorView q_rope, T
   });
 }
 
-void mla_rope_quantize(TensorView q_rope_in, TensorView k_rope_in, TensorView q_nope_in,
-                       TensorView k_nope_in, TensorView q_rope_out, TensorView k_rope_out,
-                       TensorView q_nope_out, TensorView k_nope_out, TensorView cos_sin_cache,
-                       TensorView pos_ids, double quant_scale_q, double quant_scale_kv,
-                       bool interleave) {
+void rope_quantize(TensorView q_rope_in, TensorView k_rope_in, TensorView q_nope_in, TensorView k_nope_in,
+  TensorView q_rope_out, TensorView k_rope_out, TensorView q_nope_out, TensorView k_nope_out,
+  TensorView cos_sin_cache, TensorView pos_ids, double quant_scale_q,
+                   double quant_scale_kv, bool interleave) {
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(q_rope_in);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(k_rope_in);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(q_nope_in);
@@ -278,14 +274,17 @@ void mla_rope_quantize(TensorView q_rope_in, TensorView k_rope_in, TensorView q_
   CHECK_INPUT(cos_sin_cache);
   CHECK_INPUT(pos_ids);
 
-  TVM_FFI_ICHECK_EQ(q_rope_in->shape[q_rope_in->ndim - 1], 64);
-  TVM_FFI_ICHECK_EQ(k_rope_in->shape[k_rope_in->ndim - 1], 64);
-  TVM_FFI_ICHECK_EQ(q_nope_in->shape[q_nope_in->ndim - 1], 512);
-  TVM_FFI_ICHECK_EQ(k_nope_in->shape[k_nope_in->ndim - 1], 512);
-  TVM_FFI_ICHECK_EQ(q_rope_out->shape[q_rope_out->ndim - 1], 64);
-  TVM_FFI_ICHECK_EQ(k_rope_out->shape[k_rope_out->ndim - 1], 64);
-  TVM_FFI_ICHECK_EQ(q_nope_out->shape[q_nope_out->ndim - 1], 512);
-  TVM_FFI_ICHECK_EQ(k_nope_out->shape[k_nope_out->ndim - 1], 512);
+  // Extract dimensions from tensor shapes (flexible)
+  uint32_t rope_dim = q_rope_in->shape[q_rope_in->ndim - 1];
+  uint32_t no_rope_dim = q_nope_in->shape[q_nope_in->ndim - 1];
+
+  // Validate rope and no_rope dimensions are consistent
+  TVM_FFI_ICHECK_EQ(k_rope_in->shape[k_rope_in->ndim - 1], rope_dim);
+  TVM_FFI_ICHECK_EQ(k_nope_in->shape[k_nope_in->ndim - 1], no_rope_dim);
+  TVM_FFI_ICHECK_EQ(q_rope_out->shape[q_rope_out->ndim - 1], rope_dim);
+  TVM_FFI_ICHECK_EQ(k_rope_out->shape[k_rope_out->ndim - 1], rope_dim);
+  TVM_FFI_ICHECK_EQ(q_nope_out->shape[q_nope_out->ndim - 1], no_rope_dim);
+  TVM_FFI_ICHECK_EQ(k_nope_out->shape[k_nope_out->ndim - 1], no_rope_dim);
   TVM_FFI_ICHECK_EQ(q_rope_in->dtype, k_rope_in->dtype);
   TVM_FFI_ICHECK_EQ(q_rope_in->dtype, q_nope_in->dtype);
   TVM_FFI_ICHECK_EQ(q_rope_in->dtype, k_nope_in->dtype);
@@ -293,26 +292,52 @@ void mla_rope_quantize(TensorView q_rope_in, TensorView k_rope_in, TensorView q_
   TVM_FFI_ICHECK_EQ(q_rope_out->dtype, q_nope_out->dtype);
   TVM_FFI_ICHECK_EQ(q_rope_out->dtype, k_nope_out->dtype);
 
-  CHECK_DIM(3, q_rope_in);   // q_rope_in: (nnz, H_Q, 64)
-  CHECK_DIM(3, q_nope_in);   // q_nope_in: (nnz, H_Q, 512)
-  CHECK_DIM(2, k_rope_in);   // k_rope_in: (nnz, 64)
-  CHECK_DIM(2, k_nope_in);   // k_nope_in: (nnz, 512)
-  CHECK_DIM(3, q_rope_out);  // q_rope_out: (nnz, H_Q, 64)
-  CHECK_DIM(3, q_nope_out);  // q_nope_out: (nnz, H_Q, 512)
-  CHECK_DIM(2, k_rope_out);  // k_rope_out: (nnz, 64)
-  CHECK_DIM(2, k_nope_out);  // k_nope_out: (nnz, 512)
+  // Q tensors are always 3D: (nnz, num_qo_heads, rope_dim/no_rope_dim)
+  CHECK_DIM(3, q_rope_in);
+  CHECK_DIM(3, q_nope_in);
+  CHECK_DIM(3, q_rope_out);
+  CHECK_DIM(3, q_nope_out);
+
+  // K tensors can be 2D (MLA) or 3D (GQA/MHA)
+  uint32_t num_kv_heads;
+  if (k_rope_in->ndim == 2) {
+    // MLA case: k_rope_in: (nnz, rope_dim), k_nope_in: (nnz, no_rope_dim)
+    CHECK_DIM(2, k_rope_in);
+    CHECK_DIM(2, k_nope_in);
+    CHECK_DIM(2, k_rope_out);
+    CHECK_DIM(2, k_nope_out);
+    num_kv_heads = 1;  // Shared K/V head
+  } else {
+    // GQA/MHA case: k_rope_in: (nnz, num_kv_heads, rope_dim)
+    CHECK_DIM(3, k_rope_in);
+    CHECK_DIM(3, k_nope_in);
+    CHECK_DIM(3, k_rope_out);
+    CHECK_DIM(3, k_nope_out);
+    num_kv_heads = k_rope_in->shape[1];
+  }
   uint32_t nnz = q_rope_in->shape[0];
+  uint32_t num_qo_heads = q_rope_in->shape[1];
+
+  // Validate consistent dimensions across all tensors
   TVM_FFI_ICHECK_EQ(q_nope_in->shape[0], nnz);
+  TVM_FFI_ICHECK_EQ(k_rope_in->shape[0], nnz);
   TVM_FFI_ICHECK_EQ(k_nope_in->shape[0], nnz);
   TVM_FFI_ICHECK_EQ(q_rope_out->shape[0], nnz);
   TVM_FFI_ICHECK_EQ(k_rope_out->shape[0], nnz);
   TVM_FFI_ICHECK_EQ(q_nope_out->shape[0], nnz);
   TVM_FFI_ICHECK_EQ(k_nope_out->shape[0], nnz);
-  uint32_t num_heads = q_rope_in->shape[1];
-  TVM_FFI_ICHECK_EQ(q_rope_in->shape[1], num_heads);
-  TVM_FFI_ICHECK_EQ(q_nope_in->shape[1], num_heads);
-  TVM_FFI_ICHECK_EQ(q_rope_out->shape[1], num_heads);
-  TVM_FFI_ICHECK_EQ(q_nope_out->shape[1], num_heads);
+
+  // Validate Q tensor head dimensions are consistent
+  TVM_FFI_ICHECK_EQ(q_nope_in->shape[1], num_qo_heads);
+  TVM_FFI_ICHECK_EQ(q_rope_out->shape[1], num_qo_heads);
+  TVM_FFI_ICHECK_EQ(q_nope_out->shape[1], num_qo_heads);
+
+  // Validate K tensor head dimensions (if 3D)
+  if (k_rope_in->ndim == 3) {
+    TVM_FFI_ICHECK_EQ(k_nope_in->shape[1], num_kv_heads);
+    TVM_FFI_ICHECK_EQ(k_rope_out->shape[1], num_kv_heads);
+    TVM_FFI_ICHECK_EQ(k_nope_out->shape[1], num_kv_heads);
+  }
 
   const uint32_t q_rope_in_stride_n = q_rope_in->strides[0];
   const uint32_t q_rope_in_stride_h = q_rope_in->strides[1];
@@ -322,32 +347,55 @@ void mla_rope_quantize(TensorView q_rope_in, TensorView k_rope_in, TensorView q_
   const uint32_t q_rope_out_stride_h = q_rope_out->strides[1];
   const uint32_t q_nope_out_stride_n = q_nope_out->strides[0];
   const uint32_t q_nope_out_stride_h = q_nope_out->strides[1];
-  const uint32_t k_rope_in_stride = k_rope_in->strides[0];
-  const uint32_t k_nope_in_stride = k_nope_in->strides[0];
-  const uint32_t k_rope_out_stride = k_rope_out->strides[0];
-  const uint32_t k_nope_out_stride = k_nope_out->strides[0];
+
+  // K tensor strides depend on dimensionality
+  uint32_t k_rope_in_stride, k_nope_in_stride, k_rope_out_stride, k_nope_out_stride;
+  uint32_t k_rope_in_stride_h, k_nope_in_stride_h, k_rope_out_stride_h, k_nope_out_stride_h;
+
+  if (k_rope_in->ndim == 2) {
+    // 2D K tensors (MLA): only have batch stride
+    k_rope_in_stride = k_rope_in->strides[0];
+    k_nope_in_stride = k_nope_in->strides[0];
+    k_rope_out_stride = k_rope_out->strides[0];
+    k_nope_out_stride = k_nope_out->strides[0];
+    // For 2D tensors, head stride is the same as batch stride (shared K/V)
+    k_rope_in_stride_h = k_rope_in_stride;
+    k_nope_in_stride_h = k_nope_in_stride;
+    k_rope_out_stride_h = k_rope_out_stride;
+    k_nope_out_stride_h = k_nope_out_stride;
+  } else {
+    // 3D K tensors (GQA/MHA): have both batch and head strides
+    k_rope_in_stride = k_rope_in->strides[0];
+    k_rope_in_stride_h = k_rope_in->strides[1];
+    k_nope_in_stride = k_nope_in->strides[0];
+    k_nope_in_stride_h = k_nope_in->strides[1];
+    k_rope_out_stride = k_rope_out->strides[0];
+    k_rope_out_stride_h = k_rope_out->strides[1];
+    k_nope_out_stride = k_nope_out->strides[0];
+    k_nope_out_stride_h = k_nope_out->strides[1];
+  }
 
   cudaSetDevice(q_rope_in->device.device_id);
   const cudaStream_t stream = get_stream(q_rope_in->device);
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(q_rope_in->dtype, c_type, [&] {
     return DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP8(q_rope_out->dtype, c_quant_type, [&] {
       return DISPATCH_DLPACK_IDTYPE_TO_CTYPE(pos_ids->dtype, c_idtype, [&] {
-        cudaError_t status = MLARopeQuantize(
+        cudaError_t status = RopeQuantize(
             static_cast<c_type*>(q_rope_in->data), static_cast<c_type*>(k_rope_in->data),
             static_cast<c_type*>(q_nope_in->data), static_cast<c_type*>(k_nope_in->data),
             static_cast<c_quant_type*>(q_rope_out->data),
             static_cast<c_quant_type*>(k_rope_out->data),
             static_cast<c_quant_type*>(q_nope_out->data),
             static_cast<c_quant_type*>(k_nope_out->data), static_cast<float*>(cos_sin_cache->data),
-            static_cast<c_idtype*>(pos_ids->data), nnz, num_heads, q_rope_in_stride_n,
-            q_rope_in_stride_h, q_nope_in_stride_n, q_nope_in_stride_h, q_rope_out_stride_n,
-            q_rope_out_stride_h, q_nope_out_stride_n, q_nope_out_stride_h, k_rope_in_stride,
-            k_nope_in_stride, k_rope_out_stride, k_nope_out_stride, quant_scale_q, quant_scale_kv,
-            interleave, stream);
+            static_cast<c_idtype*>(pos_ids->data), nnz, num_qo_heads, num_kv_heads, rope_dim,
+            no_rope_dim, q_rope_in_stride_n, q_rope_in_stride_h, q_nope_in_stride_n,
+            q_nope_in_stride_h, q_rope_out_stride_n, q_rope_out_stride_h, q_nope_out_stride_n,
+            q_nope_out_stride_h, k_rope_in_stride, k_rope_in_stride_h, k_nope_in_stride,
+            k_nope_in_stride_h, k_rope_out_stride, k_rope_out_stride_h, k_nope_out_stride,
+            k_nope_out_stride_h, quant_scale_q, quant_scale_kv, interleave, stream);
 
         TVM_FFI_ICHECK(status == cudaSuccess)
-            << "BatchQKApplyRotaryPosIdsCosSinCache failed with error code "
-            << cudaGetErrorString(status);
+            << "RopeQuantize failed with error code " << cudaGetErrorString(status);
         return true;
       });
     });
