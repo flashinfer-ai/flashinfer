@@ -47,10 +47,11 @@ cudaError_t CutlassSegmentGEMMSM90Run(void* float_buffer, size_t float_buffer_si
 }  // namespace group_gemm
 }  // namespace flashinfer
 
-void CutlassSegmentGEMMSM90(Tensor float_workspace_buffer, Tensor int_workspace_buffer,
-                            Tensor all_problems, Tensor x_ptr, Tensor w_ptr, Tensor y_ptr,
-                            Tensor x_stride, Tensor weight_stride, Tensor y_stride,
-                            Tensor empty_x_data, Tensor empty_y_data, bool weight_column_major) {
+void CutlassSegmentGEMMSM90(TensorView float_workspace_buffer, TensorView int_workspace_buffer,
+                            TensorView all_problems, TensorView x_ptr, TensorView w_ptr,
+                            TensorView y_ptr, TensorView x_stride, TensorView weight_stride,
+                            TensorView y_stride, TensorView empty_x_data, TensorView empty_y_data,
+                            bool weight_column_major) {
   unsigned int batch_size = x_ptr->shape[0];
   cudaSetDevice(float_workspace_buffer->device.device_id);
   const cudaStream_t stream = get_stream(float_workspace_buffer->device);

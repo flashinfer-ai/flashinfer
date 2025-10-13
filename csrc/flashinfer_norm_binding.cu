@@ -15,15 +15,15 @@
  */
 #include "tvm_ffi_utils.h"
 
-using tvm::ffi::Tensor;
+void rmsnorm(TensorView out, TensorView input, TensorView weight, double eps, bool enable_pdl);
 
-void rmsnorm(Tensor out, Tensor input, Tensor weight, double eps, bool enable_pdl);
+void fused_add_rmsnorm(TensorView input, TensorView residual, TensorView weight, double eps,
+                       bool enable_pdl);
 
-void fused_add_rmsnorm(Tensor input, Tensor residual, Tensor weight, double eps, bool enable_pdl);
+void gemma_rmsnorm(TensorView out, TensorView input, TensorView weight, double eps,
+                   bool enable_pdl);
 
-void gemma_rmsnorm(Tensor out, Tensor input, Tensor weight, double eps, bool enable_pdl);
-
-void gemma_fused_add_rmsnorm(Tensor input, Tensor residual, Tensor weight, double eps,
+void gemma_fused_add_rmsnorm(TensorView input, TensorView residual, TensorView weight, double eps,
                              bool enable_pdl);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(rmsnorm, rmsnorm);

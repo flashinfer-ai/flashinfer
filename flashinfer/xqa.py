@@ -16,6 +16,7 @@ limitations under the License.
 
 import functools
 from types import SimpleNamespace
+from typing import Optional
 
 import torch
 
@@ -50,7 +51,7 @@ def get_xqa_module(
         qScale: float,
         output: torch.Tensor,
         q: torch.Tensor,
-        attentionSinks: torch.Tensor,
+        attentionSinks: Optional[torch.Tensor],
         pool: torch.Tensor,
         kvCachePageList: torch.Tensor,
         maxSeqLen: int,
@@ -88,7 +89,7 @@ def get_xqa_module(
         qScale: float,
         output: torch.Tensor,
         q: torch.Tensor,
-        attentionSinks: torch.Tensor,
+        attentionSinks: Optional[torch.Tensor],
         pool: torch.Tensor,
         kvCachePageList: torch.Tensor,
         maxSeqLen: int,
@@ -117,7 +118,7 @@ def xqa(
     qScale: float,
     output: torch.Tensor,
     q: torch.Tensor,
-    attentionSinks: torch.Tensor,
+    attentionSinks: Optional[torch.Tensor],
     pool: torch.Tensor,
     kvCachePageList: torch.Tensor,
     maxSeqLen: int,

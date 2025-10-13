@@ -28,15 +28,15 @@ using tvm::ffi::Optional;
     }                                                                         \
   }()
 
-void trtllm_allreduce_fusion(Tensor allreduce_in, int64_t world_size, int64_t world_rank,
-                             int64_t token_num, int64_t hidden_size, Tensor workspace_ptrs,
+void trtllm_allreduce_fusion(TensorView allreduce_in, int64_t world_size, int64_t world_rank,
+                             int64_t token_num, int64_t hidden_size, TensorView workspace_ptrs,
                              bool launch_with_pdl, bool use_oneshot, bool trigger_completion_at_end,
-                             bool fp32_acc, int64_t pattern_code, Optional<Tensor> allreduce_out,
-                             Optional<Tensor> residual_in, Optional<Tensor> residual_out,
-                             Optional<Tensor> norm_out, Optional<Tensor> quant_out,
-                             Optional<Tensor> scale_out, Optional<Tensor> rms_gamma,
-                             Optional<double> rms_eps, Optional<Tensor> scale_factor,
-                             Optional<int64_t> layout_code) {
+                             bool fp32_acc, int64_t pattern_code,
+                             Optional<TensorView> allreduce_out, Optional<TensorView> residual_in,
+                             Optional<TensorView> residual_out, Optional<TensorView> norm_out,
+                             Optional<TensorView> quant_out, Optional<TensorView> scale_out,
+                             Optional<TensorView> rms_gamma, Optional<double> rms_eps,
+                             Optional<TensorView> scale_factor, Optional<int64_t> layout_code) {
   cudaSetDevice(allreduce_in->device.device_id);
   // todo(Yingyi): add dispatch for float and bfloat16
 

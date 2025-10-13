@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include <cstring>
 #include <vector>
 
 #include "flashinfer/trtllm/batched_gemm/KernelRunner.h"
@@ -115,7 +116,14 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
     }
   }
 
-  FLASHINFER_CHECK(!mPassingConfigIndices.empty(), "No kernel found for the given options");
+  FLASHINFER_CHECK(
+      !mPassingConfigIndices.empty(),
+      "No kernel found for the given options: mDtypeA: %s, mDtypeB: %s, mDtypeC: %s, "
+      "mUseDeepSeekFp8: %d, "
+      "mTransposeMmaOutput: %d, mRouteAct: %d, mFusedAct: %d, mIsStaticBatch: %d, mTileSize: %d",
+      tg::dtypeToString(mOptions.dtypeA).c_str(), tg::dtypeToString(mOptions.dtypeB).c_str(),
+      tg::dtypeToString(mOptions.dtypeC).c_str(), mOptions.deepSeekFp8, mOptions.transposeMmaOutput,
+      mOptions.routeAct, mOptions.fusedAct, mOptions.staticBatch, mOptions.tileSize);
 }
 
 size_t TrtllmGenBatchedGemmRunner::getWorkspaceSizeInBytes(
@@ -367,6 +375,7 @@ std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(
 
     return false;
   };
+
   // Sort configs by options.
   std::vector<int64_t> sortedIndices = mPassingConfigIndices;
   std::sort(sortedIndices.begin(), sortedIndices.end(), cmpFunc);

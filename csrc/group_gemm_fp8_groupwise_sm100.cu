@@ -86,13 +86,11 @@ cudaError_t CutlassFP8GroupwiseScaledGroupGEMMSM100(
 }  // namespace group_gemm
 }  // namespace flashinfer
 
-void CutlassGroupGemmFP8GroupwiseScaledSM100(Tensor int_workspace_buffer,
-                                             Tensor float_workspace_buffer, Tensor A, Tensor B,
-                                             Tensor SFA, Tensor SFB, Tensor D, Tensor m_indptr,
-                                             int64_t n, int64_t k, int64_t scale_granularity_m,
-                                             int64_t scale_granularity_n,
-                                             int64_t scale_granularity_k,
-                                             std::string scale_major_mode, int64_t mma_sm) {
+void CutlassGroupGemmFP8GroupwiseScaledSM100(
+    TensorView int_workspace_buffer, TensorView float_workspace_buffer, TensorView A, TensorView B,
+    TensorView SFA, TensorView SFB, TensorView D, TensorView m_indptr, int64_t n, int64_t k,
+    int64_t scale_granularity_m, int64_t scale_granularity_n, int64_t scale_granularity_k,
+    std::string scale_major_mode, int64_t mma_sm) {
   cudaSetDevice(float_workspace_buffer->device.device_id);
   auto stream = get_stream(D->device);
   int num_groups = m_indptr->shape[0] - 1;

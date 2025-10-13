@@ -564,6 +564,7 @@ def test_trtllm_batch_prefill(
 )
 @pytest.mark.parametrize("enable_pdl", [True, False, None])
 @pytest.mark.parametrize("enable_sink", [True, False])
+@pytest.mark.parametrize("max_in_kv_len", [110])
 def test_trtllm_batch_decode(
     kv_layout,
     batch_size,
@@ -577,6 +578,7 @@ def test_trtllm_batch_decode(
     kv_dtype,
     enable_pdl,
     enable_sink,
+    max_in_kv_len,
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] != 10:
@@ -589,12 +591,11 @@ def test_trtllm_batch_decode(
     # Set up test parameters
     torch.manual_seed(0)
     head_dim = 128
-    MAX_IN_KV_LEN = 110
 
     # Generate random sequence lengths
     num_qo_heads = num_kv_heads * head_grp_size
     q_lens, in_kv_lens, seq_lens = generate_seq_lens_decode(
-        batch_size, q_len_per_req, MAX_IN_KV_LEN
+        batch_size, q_len_per_req, max_in_kv_len
     )
 
     # Create query tensor and related data
@@ -805,6 +806,56 @@ def test_trtllm_batch_decode(
         assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()
 
 
+@pytest.mark.parametrize("kv_layout", ["HND"])  # trtllm-gen only support HND
+@pytest.mark.parametrize(
+    "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size",
+    [
+        (1, 1, 16, 8, 8),
+    ],
+)
+@pytest.mark.parametrize("window_left", [-1])
+@pytest.mark.parametrize(
+    "q_dtype,kv_dtype,o_dtype",
+    [
+        ("fp8", "fp8", "fp8"),
+    ],
+)
+@pytest.mark.parametrize("enable_pdl", [None])
+@pytest.mark.parametrize("enable_sink", [False])
+@pytest.mark.parametrize("max_in_kv_len", [8192])
+def test_trtllm_batch_decode_bs1(
+    kv_layout,
+    batch_size,
+    q_len_per_req,
+    page_size,
+    num_kv_heads,
+    head_grp_size,
+    window_left,
+    q_dtype,
+    o_dtype,
+    kv_dtype,
+    enable_pdl,
+    enable_sink,
+    max_in_kv_len,
+):
+    pytest.xfail("trtllm-gen decode gets incorrect output with bs1")
+    test_trtllm_batch_decode(
+        kv_layout,
+        batch_size,
+        q_len_per_req,
+        page_size,
+        num_kv_heads,
+        head_grp_size,
+        window_left,
+        q_dtype,
+        o_dtype,
+        kv_dtype,
+        enable_pdl,
+        enable_sink,
+        max_in_kv_len,
+    )
+
+
 @pytest.mark.parametrize("batch_size", [4, 128, 256])
 @pytest.mark.parametrize("s_qo", [32, 64, 87])
 @pytest.mark.parametrize("s_kv", [32, 64, 87])
@@ -936,6 +987,21 @@ def test_trtllm_gen_prefill_deepseek(
     # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
     # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
     assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()
+
+
+@pytest.mark.parametrize("batch_size", [1])
+@pytest.mark.parametrize("s_qo", [1024])
+@pytest.mark.parametrize("s_kv", [1024])
+@pytest.mark.parametrize("num_kv_heads", [128])
+@pytest.mark.parametrize("head_grp_size", [1])
+@pytest.mark.parametrize("causal", [True, False])
+def test_trtllm_gen_prefill_deepseek_bs1(
+    batch_size, s_qo, s_kv, num_kv_heads, head_grp_size, causal
+):
+    pytest.xfail("trtllm-gen prefill triggers an IMA with bs1")
+    test_trtllm_gen_prefill_deepseek(
+        batch_size, s_qo, s_kv, num_kv_heads, head_grp_size, causal
+    )
 
 
 if __name__ == "__main__":

@@ -163,7 +163,7 @@ class KernelTraits {
                int32_t numSlicesForSplitK, int32_t numSlicesForSliceK, SplitK splitK,
                bool useTmaStore, bool transposeMmaOutput, AllReduceAlgo allReduceAlgo,
                bool usePersistentScheduler, bool useDeepSeekFp8, bool usePerTokenSfA,
-               bool usePerTokenSfB, BiasType biasType)
+               bool usePerTokenSfB, bool useTwoCtas, BiasType biasType)
       : mMmaKind{mmaKind} {
     //
     // SMEM
@@ -213,8 +213,8 @@ class KernelTraits {
       // LoadB
       {
         // Number of bytes in load B shared memory.
-        auto const numSmemBytesLoadB =
-            numStages * tileN * tileK * getNumSmemBitsPerElt(dtypeB, mMmaKind) / 8 /* bits */;
+        auto const numSmemBytesLoadB = numStages * (useTwoCtas ? tileN / 2 : tileN) * tileK *
+                                       getNumSmemBitsPerElt(dtypeB, mMmaKind) / 8 /* bits */;
         // Number of bytes for load B alignment for TMA load.
         auto const numBytesAlignmentLoadB = 1024;
         // No need to reuse the first chunk.

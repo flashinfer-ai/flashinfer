@@ -16,6 +16,7 @@ limitations under the License.
 
 import os
 import tempfile
+import pytest
 from pathlib import Path
 from multiprocessing import Pool
 
@@ -50,6 +51,7 @@ def worker_process(temp_dir):
     return content
 
 
+@pytest.mark.skip(reason="Incompatible with pytest due to multiprocessing usage.")
 def test_load_cubin_race_condition(num_iterations, num_processes):
     """
     Test race condition when multiple processes concurrently call get_cubin

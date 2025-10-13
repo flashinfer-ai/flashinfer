@@ -82,10 +82,10 @@ def get_available_cubin_files(
 class ArtifactPath:
     TRTLLM_GEN_FMHA: str = "a72d85b019dc125b9f711300cb989430f762f5a6/fmha/trtllm-gen/"
     TRTLLM_GEN_BMM: str = (
-        "a72d85b019dc125b9f711300cb989430f762f5a6/batched_gemm-145d1b1-9e1d49a/"
+        "56fea80cb22f8b2ef2a2c6a822a075fb20b36803/batched_gemm-074aec4-cc00b23"
     )
     TRTLLM_GEN_GEMM: str = (
-        "a72d85b019dc125b9f711300cb989430f762f5a6/gemm-145d1b1-f91dc9e/"
+        "1fddc48b7b48af33914d040051b3e2ee9ba4701e/gemm-145d1b1-9b113e3"
     )
     CUDNN_SDPA: str = "a72d85b019dc125b9f711300cb989430f762f5a6/fmha/cudnn/"
     DEEPGEMM: str = "a72d85b019dc125b9f711300cb989430f762f5a6/deep-gemm/"
@@ -98,10 +98,10 @@ class MetaInfoHash:
         "d26dbf837f40ff2dcd964094ab6e1b3f2424edda5979c313f5262655161fce98"
     )
     TRTLLM_GEN_BMM: str = (
-        "8c5f97d582df0e4fd9f69ddeb3b72cc3a37915c6c20b4d0905fec69702310b63"
+        "4a8ceeb356fc5339021acf884061e97e49e01da5c75dbf0f7cf4932c37a70152"
     )
     TRTLLM_GEN_GEMM: str = (
-        "941228df669b82c785e6b5c5d069caad99016ab155f96ff22bf8f090d925e4b5"
+        "bd5c3227bec4f8d7a7d3a27fd7628e010d99a5c42651d0a6b97e146803e63340"
     )
 
 
@@ -110,11 +110,11 @@ class CheckSumHash:
         "b2d9d40db550ef85585e980bee651ac19d3e416f10b0c8bf9de0a7f9d0bee3d4"
     )
     TRTLLM_GEN_BMM: str = (
-        "efb9379c924193f6d3cb792bafb12b0811cab8eaa12bf324c7c410636c7769cd"
+        "efb9379c924193f6d3cb792bafb12b0811cab8eaa12bf324c7c410636c7769cd" // need update
     )
     DEEPGEMM: str = "1a2a166839042dbd2a57f48051c82cd1ad032815927c753db269a4ed10d0ffbf"
     TRTLLM_GEN_GEMM: str = (
-        "e475e37989eed16418e0e858e2868ff07cb4b650cc48759cc23012f1afea310a"
+        "e475e37989eed16418e0e858e2868ff07cb4b650cc48759cc23012f1afea310a" // need update
     )
     map_checksums: dict[str, str] = {
         safe_urljoin(ArtifactPath.TRTLLM_GEN_FMHA, "checksums.txt"): TRTLLM_GEN_FMHA,

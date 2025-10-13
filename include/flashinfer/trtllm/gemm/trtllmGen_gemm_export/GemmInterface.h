@@ -285,6 +285,12 @@ class GemmInterface {
   template <typename Dtype>
   inline Dtype* alignPtr(Dtype* ptr, int64_t alignment) const;
 
+  // Returns the number of tiles and number of CTAs for Z dimension.
+  std::tuple<int32_t, int32_t, int32_t> getGridSize(int32_t M, int32_t N, int32_t tileM,
+                                                    int32_t tileN, int32_t clusterDimX,
+                                                    int32_t clusterDimY,
+                                                    int32_t numSlicesForSplitK) const;
+
   // Creates GemmOptions from kernel and data.
   GemmOptions getOptionsFromConfigAndData(GemmConfig const& config, GemmData const& data) const;
 
@@ -328,6 +334,20 @@ size_t GemmInterface::getNumGemmConfigs() const {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+std::tuple<int32_t, int32_t, int32_t> GemmInterface::getGridSize(int32_t M, int32_t N,
+                                                                 int32_t tileM, int32_t tileN,
+                                                                 int32_t clusterDimX,
+                                                                 int32_t clusterDimY,
+                                                                 int32_t numSlicesForSplitK) const {
+  // The number of tiles in the M dimension.
+  auto numTilesM = gemm::divUpMul(gemm::divUp(M, tileM), clusterDimX);
+  // The number of tiles in the N dimension.
+  auto numTilesN = gemm::divUpMul(gemm::divUp(N, tileN), clusterDimY);
+  return std::make_tuple(numTilesM, numTilesN, numSlicesForSplitK);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 GemmOptions GemmInterface::getOptionsFromConfigAndData(GemmConfig const& config,
                                                        GemmData const& data) const {
   // Create options from config and data.
@@ -363,10 +383,10 @@ std::vector<size_t> GemmInterface::getWorkspaceSizesInBytes(GemmConfig const& co
   // Get options from config.
   auto& options = config.mOptions;
 
-  // The number of tiles in the M dimension.
-  int32_t numTilesM = gemm::divUp(data.mProblemDimensions.mM, options.mTileM);
-  // The number of tiles in the N dimension.
-  int32_t numTilesN = gemm::divUp(data.mProblemDimensions.mN, options.mTileN);
+  // Get the number of tiles and cluster dimension Z.
+  auto [numTilesM, numTilesN, gridDimZ] = getGridSize(
+      data.mProblemDimensions.mM, data.mProblemDimensions.mN, options.mTileM, options.mTileN,
+      options.mClusterDimX, options.mClusterDimY, options.mNumSlicesForSplitK);
 
   std::vector<size_t> workspaceSizes;
 
@@ -439,10 +459,10 @@ int32_t GemmInterface::run(GemmConfig const& config, void* workspace, GemmData c
     }
   }
 
-  // The number of tiles in the M dimension.
-  int numTilesM = gemm::divUp(options.mM, options.mTileM);
-  // The number of tiles in the N dimension.
-  int numTilesN = gemm::divUp(options.mN, options.mTileN);
+  // Get the number of tiles and number of CTAs for Z dimension.
+  auto [numTilesM, numTilesN, gridDimZ] =
+      getGridSize(options.mM, options.mN, options.mTileM, options.mTileN, options.mClusterDimX,
+                  options.mClusterDimY, options.mNumSlicesForSplitK);
 
   // Create kernel params.
   auto kernelParams = gemm::KernelParamsSetup::setKernelParams(
@@ -455,9 +475,8 @@ int32_t GemmInterface::run(GemmConfig const& config, void* workspace, GemmData c
       data.mAllReduceBuffers.mPtrMultiMemCompletionBars, dPtrSplitKCompletionBars,
       /* dPtrNumNonExitingCtas */ nullptr, data.mProblemDimensions.mRank,
       data.mProblemDimensions.mWorldSize);
-
   // The size of the grid.
-  std::vector<int32_t> grid{numTilesM, numTilesN, options.mNumSlicesForSplitK};
+  std::vector<int32_t> grid{numTilesM, numTilesN, gridDimZ};
 
   // When split-k is enabled and to guarantee the forward progress, we must ensure that the number
   // of tiles is less than number of SMs. This way, at least one CTA in the grid can make forward.
@@ -482,6 +501,7 @@ int32_t GemmInterface::run(GemmConfig const& config, void* workspace, GemmData c
     std::string cubin = flashinfer::trtllm_cubin_loader::getCubin(fname_cubin, sha256);
     cuModuleLoadData(&cuModule, cubin.c_str());
   };
+
   if (moduleCache.has_value()) {
     ModuleCache& moduleCacheRef = moduleCache.value().get();
 
@@ -564,10 +584,11 @@ int32_t GemmInterface::runInitBeforeWorldSync(GemmConfig const& config, GemmData
         return 1;
       }
     }
-    // The number of tiles in the M dimension.
-    int numTilesM = gemm::divUp(options.mM, options.mTileM);
-    // The number of tiles in the N dimension.
-    int numTilesN = gemm::divUp(options.mN, options.mTileN);
+
+    // Get the number of tiles and number of CTAs for Z dimension.
+    auto [numTilesM, numTilesN, gridDimZ] =
+        getGridSize(options.mM, options.mN, options.mTileM, options.mTileN, options.mClusterDimX,
+                    options.mClusterDimY, options.mNumSlicesForSplitK);
     // The number of bytes for the tile barriers.
     int32_t numBytesTileBars = numTilesM * numTilesN * sizeof(uint32_t);
     // Sanitize system barriers.
