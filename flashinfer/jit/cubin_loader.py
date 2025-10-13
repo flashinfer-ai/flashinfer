@@ -20,6 +20,7 @@ import os
 from urllib.parse import urljoin
 import shutil
 import time
+import uuid
 
 import filelock
 
@@ -43,7 +44,7 @@ def safe_urljoin(base, path):
 
 def download_file(
     source: str,
-    local_path: str,
+    destination: str,
     retries: int = 4,
     delay: int = 5,
     timeout: int = 10,
@@ -52,10 +53,12 @@ def download_file(
 ):
     """
     Downloads a file from a URL or copies from a local path to a destination.
+    If the filesystem supports atomic file rename operations, the destination file is
+    either written completely or not at all with respect to concurrent access.
 
     Parameters:
     - source (str): The URL or local file path of the file to download.
-    - local_path (str): The local file path to save the downloaded/copied file.
+    - destination (str): The local file path to save the downloaded/copied file.
     - retries (int): Number of retry attempts for URL downloads (default: 3).
     - delay (int): Initial delay in seconds for exponential backoff (default: 5).
     - timeout (int): Timeout for the HTTP request in seconds (default: 10).
@@ -70,25 +73,28 @@ def download_file(
     if session is None:
         session = requests.Session()
 
-    lock_path = f"{local_path}.lock"  # Lock file path
+    lock_path = f"{destination}.lock"  # Lock file path
     lock = filelock.FileLock(lock_path, timeout=lock_timeout)
 
     try:
         with lock:
-            logger.info(f"Acquired lock for {local_path}")
+            logger.info(f"Acquired lock for {destination}")
 
-            temp_path = f"{local_path}.tmp"
+            temp_path = f"{destination}.{uuid.uuid4().hex}.tmp"
 
             # Handle local file copy
             if os.path.exists(source):
                 try:
                     shutil.copy(source, temp_path)
-                    os.replace(temp_path, local_path)  # Atomic rename
-                    logger.info(f"File copied successfully: {local_path}")
+                    os.replace(temp_path, destination)  # Atomic rename
+                    logger.info(f"File copied successfully: {destination}")
                     return True
                 except Exception as e:
                     logger.error(f"Failed to copy local file: {e}")
                     return False
+                finally:
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
 
             # Handle URL downloads with exponential backoff
             for attempt in range(1, retries + 1):
@@ -100,10 +106,10 @@ def download_file(
                         file.write(response.content)
 
                     # Atomic rename to prevent readers from seeing partial writes
-                    os.replace(temp_path, local_path)
+                    os.replace(temp_path, destination)
 
                     logger.info(
-                        f"File downloaded successfully: {source} -> {local_path}"
+                        f"File downloaded successfully: {source} -> {destination}"
                     )
                     return True
 
@@ -119,10 +125,13 @@ def download_file(
                     else:
                         logger.error("Max retries reached. Download failed.")
                         return False
+                finally:
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
 
     except filelock.Timeout:
         logger.error(
-            f"Failed to acquire lock for {local_path} within {lock_timeout} seconds."
+            f"Failed to acquire lock for {destination} within {lock_timeout} seconds."
         )
         return False
 
