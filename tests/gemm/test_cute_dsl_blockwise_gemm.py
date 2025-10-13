@@ -21,35 +21,54 @@ def create_tensors(
 
     a_torch_cpu = cutlass_torch.matrix(
         l, m, k, a_major == "m", get_cutlass_dtype(ab_dtype), device=device
-        )
+    )
     b_torch_cpu = cutlass_torch.matrix(
         l, n, k, b_major == "n", get_cutlass_dtype(ab_dtype), device=device
-        )
+    )
     c_torch_cpu = cutlass_torch.matrix(
         l, m, n, cd_major == "m", get_cutlass_dtype(c_dtype), device=device
-        )
+    )
     sfa_torch_cpu = cutlass_torch.matrix(
         l, m, math.ceil(k / 128), True, get_cutlass_dtype(scale_dtype), device=device
-        )
+    )
     sfb_torch_cpu = cutlass_torch.matrix(
-        l, math.ceil(n / 128), math.ceil(k / 128), False,
-        get_cutlass_dtype(scale_dtype), device=device,
+        l,
+        math.ceil(n / 128),
+        math.ceil(k / 128),
+        False,
+        get_cutlass_dtype(scale_dtype),
+        device=device,
     )
 
     a_tensor, a_torch = cutlass_torch.cute_tensor_like(
-        a_torch_cpu, get_cutlass_dtype(ab_dtype), is_dynamic_layout=True, assumed_align=16
+        a_torch_cpu,
+        get_cutlass_dtype(ab_dtype),
+        is_dynamic_layout=True,
+        assumed_align=16,
     )
     b_tensor, b_torch = cutlass_torch.cute_tensor_like(
-        b_torch_cpu, get_cutlass_dtype(ab_dtype), is_dynamic_layout=True, assumed_align=16
+        b_torch_cpu,
+        get_cutlass_dtype(ab_dtype),
+        is_dynamic_layout=True,
+        assumed_align=16,
     )
     c_tensor, c_torch = cutlass_torch.cute_tensor_like(
-        c_torch_cpu, get_cutlass_dtype(c_dtype), is_dynamic_layout=True, assumed_align=16
+        c_torch_cpu,
+        get_cutlass_dtype(c_dtype),
+        is_dynamic_layout=True,
+        assumed_align=16,
     )
     sfa_tensor, sfa_torch = cutlass_torch.cute_tensor_like(
-        sfa_torch_cpu, get_cutlass_dtype(scale_dtype), is_dynamic_layout=True, assumed_align=16
+        sfa_torch_cpu,
+        get_cutlass_dtype(scale_dtype),
+        is_dynamic_layout=True,
+        assumed_align=16,
     )
     sfb_tensor, sfb_torch = cutlass_torch.cute_tensor_like(
-        sfb_torch_cpu, get_cutlass_dtype(scale_dtype), is_dynamic_layout=True, assumed_align=16
+        sfb_torch_cpu,
+        get_cutlass_dtype(scale_dtype),
+        is_dynamic_layout=True,
+        assumed_align=16,
     )
 
     return (
@@ -138,7 +157,7 @@ def test_blockwise_gemm_python_interface(
         pytest.skip(
             f"Unsupported testcase {ab_dtype}, {sf_dtype}, {c_dtype}, {acc_dtype}, {use_2cta_instrs} ,{mma_tiler_mn}, {cluster_shape_mn}, {m}, {n}, {k}, {l}, {a_major}, {b_major}, {c_major}"
         )
-    
+
     (
         a_tensor,
         a_torch,
@@ -161,22 +180,23 @@ def test_blockwise_gemm_python_interface(
 
     for _ in range(iterations):
         blockwise_gemm(
-          a_torch,
-          sfa_torch,
-          b_torch,
-          sfb_torch,
-          c_torch,
-          ab_dtype=ab_dtype,
-          sf_dtype=sf_dtype,
-          c_dtype=c_dtype,
-          acc_dtype=acc_dtype,
-          sm_count=sm_count,
-          mma_tiler_mn=mma_tiler_mn,
-          cluster_shape_mn=cluster_shape_mn,
-          use_2cta_instrs=use_2cta_instrs,
+            a_torch,
+            sfa_torch,
+            b_torch,
+            sfb_torch,
+            c_torch,
+            ab_dtype=ab_dtype,
+            sf_dtype=sf_dtype,
+            c_dtype=c_dtype,
+            acc_dtype=acc_dtype,
+            sm_count=sm_count,
+            mma_tiler_mn=mma_tiler_mn,
+            cluster_shape_mn=cluster_shape_mn,
+            use_2cta_instrs=use_2cta_instrs,
         )
 
     torch.cuda.synchronize()
+
     def pad_and_multiply(scale, tensor):
         cm, ck, _ = scale.shape
         m, k, _ = tensor.shape

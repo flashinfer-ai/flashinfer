@@ -34,7 +34,6 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync, tcgen05
-from cutlass.cute.runtime import from_dlpack
 import cutlass.torch as cutlass_torch
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
@@ -620,7 +619,7 @@ class BlockwiseGemmKernel:
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
             cluster=(*self.cluster_shape_mn, 1),
-            smem=self.shared_storage.size_in_bytes(),
+            smem=self.shared_storage.size_in_bytes(),  # type: ignore[attr-defined]
             stream=stream,
             min_blocks_per_mp=1,
         )
@@ -1095,7 +1094,7 @@ class BlockwiseGemmKernel:
                 #
                 # Tma load loop
                 #
-                for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):  # noqa: B007
                     tAgA_k = tAgA_slice[(None, ab_producer_state.count)]
                     tBgB_k = tBgB_slice[(None, ab_producer_state.count)]
                     tAsA_pipe = tAsA[(None, ab_producer_state.index)]
@@ -1187,7 +1186,6 @@ class BlockwiseGemmKernel:
             is_valid_tile = tile_info[3] == 1
 
             while is_valid_tile:
-
                 #
                 # Prepare the mask for scaleA/scaleB
                 #
@@ -1219,7 +1217,7 @@ class BlockwiseGemmKernel:
                 #
                 # load loop
                 #
-                for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):  # noqa: B007
                     #
                     # Slice to per mma tile index
                     #
@@ -1390,7 +1388,6 @@ class BlockwiseGemmKernel:
             is_valid_tile = tile_info[3] == 1
 
             while is_valid_tile:
-
                 # Peek (try_wait) AB buffer full for k_tile = 0
                 ab_consumer_state.reset_count()
                 peek_ab_full_status = cutlass.Boolean(1)
@@ -1410,7 +1407,7 @@ class BlockwiseGemmKernel:
                 #
                 # Mma mainloop
                 #
-                for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):  # noqa: B007
                     # Set tensor memory buffer for current tile
                     # (MMA, MMA_M, MMA_N)
                     tCtAcc = tCtAcc_base[(None, None, None, acc_producer_state.index)]
@@ -1591,7 +1588,6 @@ class BlockwiseGemmKernel:
             is_valid_tile = tile_info[3] == 1
 
             while is_valid_tile:
-
                 # initialize the final accumulator
                 tTR_rAcc_final.fill(0.0)
 
@@ -1618,7 +1614,7 @@ class BlockwiseGemmKernel:
                         acc_consumer_state
                     )
 
-                for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):  # noqa: B007
                     # Set tensor memory buffer for current tile
                     # (T2R, T2R_M, T2R_N, EPI_M, EPI_M)
                     tTR_tAcc = tTR_tAcc_base[
@@ -1794,7 +1790,6 @@ class BlockwiseGemmKernel:
 
             tTR_rC = None
             tiled_copy_r2s = None
-            simt_atom = None
             tRS_rC = None
             tRS_sC = None
             bSG_sC = None
@@ -2301,7 +2296,7 @@ class BlockwiseGemmKernel:
         sfb_count: int,
         num_smem_capacity: int,
         occupancy: int,
-    ) -> Tuple[int, int, int]:
+    ) -> Tuple[int, int, int, int, int]:
         """Computes the number of stages for A/B/C operands based on heuristics.
 
         :param tiled_mma: The tiled MMA object defining the core computation.
@@ -2687,7 +2682,7 @@ class BlockwiseGemmCuteDSL:
         self._use_2cta_instrs = use_2cta_instrs
         self._mma_tiler_mn = mma_tiler_mn
         self._cluster_shape_mn = cluster_shape_mn
-    
+
         if not BlockwiseGemmKernel.can_implement(
             ab_dtype,
             acc_dtype,
@@ -2709,13 +2704,13 @@ class BlockwiseGemmCuteDSL:
 
         hardware_info = cutlass.utils.HardwareInfo()
         self._max_active_clusters = min(
-                hardware_info.get_max_active_clusters(
-                    self._cluster_shape_mn[0] * self._cluster_shape_mn[1]
-                ),
-                sm_count,
+            hardware_info.get_max_active_clusters(
+                self._cluster_shape_mn[0] * self._cluster_shape_mn[1]
+            ),
+            sm_count,
         )
         self._sm_version = sm_version
-    
+
     @cute.jit
     def __call__(
         self,
@@ -2726,7 +2721,6 @@ class BlockwiseGemmCuteDSL:
         c_ptr: cute.Pointer,
         current_stream: cuda.CUstream,
     ):
-        #TODO(asamani): double check the shapes and layouts
         a_tensor = cute.make_tensor(
             a_ptr,
             layout=cute.make_ordered_layout(
@@ -2752,14 +2746,14 @@ class BlockwiseGemmCuteDSL:
             sfa_ptr,
             layout=cute.make_ordered_layout(
                 (self._m, math.ceil(self._k / 128), self._l),
-                order=(0, 1, 2), #if self._a_major == "m" else (1, 0, 2)
+                order=(0, 1, 2),
             ),
         )
         sfb_tensor = cute.make_tensor(
             sfb_ptr,
             layout=cute.make_ordered_layout(
-                (math.ceil(self._n / 128), math.ceil(self._k / 128),self._l),
-                order=(1, 0, 2), #if self._b_major == "n" else (1, 0, 2),
+                (math.ceil(self._n / 128), math.ceil(self._k / 128), self._l),
+                order=(1, 0, 2),
             ),
         )
 
@@ -2777,7 +2771,7 @@ class BlockwiseGemmCuteDSL:
             self._max_active_clusters,
             current_stream,
         )
-        
+
 
 @functools.cache
 def get_cute_dsl_compiled_blockwise_gemm_kernel(
@@ -2831,7 +2825,7 @@ def get_cute_dsl_compiled_blockwise_gemm_kernel(
                 sfb_tensor_gpu.data_ptr(),
                 c_tensor_gpu.data_ptr(),
             )
-        
+
         a_ptr = make_ptr(
             ab_dtype,
             a_data_ptr,
@@ -2863,7 +2857,7 @@ def get_cute_dsl_compiled_blockwise_gemm_kernel(
             assumed_align=16,
         )
         return [a_ptr, b_ptr, sfa_ptr, sfb_ptr, c_ptr]
-    
+
     kernel = cute.compile(
         BlockwiseGemmCuteDSL(
             m=m,
@@ -2887,7 +2881,6 @@ def get_cute_dsl_compiled_blockwise_gemm_kernel(
         cutlass_torch.current_stream(),
     )
 
-    
     def tensor_api(
         a_tensor_gpu: torch.Tensor,
         b_tensor_gpu: torch.Tensor,
@@ -2907,7 +2900,13 @@ def get_cute_dsl_compiled_blockwise_gemm_kernel(
         nonlocal kernel
         kernel(
             *get_cute_pointers(
-                [a_tensor_gpu, b_tensor_gpu, sfa_tensor_gpu, sfb_tensor_gpu, c_tensor_gpu]
+                [
+                    a_tensor_gpu,
+                    b_tensor_gpu,
+                    sfa_tensor_gpu,
+                    sfb_tensor_gpu,
+                    c_tensor_gpu,
+                ]
             ),
             current_stream,
         )
@@ -2932,7 +2931,7 @@ def blockwise_gemm(
 ):
     m, k, l = a_torch.shape
     n, _, _ = b_torch.shape
-    
+
     mma_tiler_mn = kwargs.pop("mma_tiler_mn", (128, 128))
     cluster_shape_mn = kwargs.pop("cluster_shape_mn", (1, 1))
     if sm_count is None:
@@ -2943,28 +2942,28 @@ def blockwise_gemm(
     major, minor = get_compute_capability(a_torch.device)
     if major == 11 and minor == 0:
         raise ValueError("SM110 is not supported for cute-dsl backend.")
-    
+
     return get_cute_dsl_compiled_blockwise_gemm_kernel(
-          m=m,
-          n=n,
-          k=k,
-          l=l,
-          a_major="k",
-          b_major="k",
-          c_major="n",
-          ab_dtype=get_cutlass_dtype(ab_dtype),
-          sf_dtype=get_cutlass_dtype(sf_dtype),
-          c_dtype=get_cutlass_dtype(c_dtype),
-          acc_dtype=get_cutlass_dtype(acc_dtype),
-          use_2cta_instrs = use_2cta_instrs,
-          mma_tiler_mn=mma_tiler_mn,
-          cluster_shape_mn=cluster_shape_mn,
-          sm_count=sm_count,
-          sm_version=f"sm_{major}{minor}",
-      )(
-          a_tensor_gpu=a_torch,
-          b_tensor_gpu=b_torch,
-          sfa_tensor_gpu=sfa_torch,
-          sfb_tensor_gpu=sfb_torch,
-          c_tensor_gpu=c_torch,
-      )
+        m=m,
+        n=n,
+        k=k,
+        l=l,
+        a_major="k",
+        b_major="k",
+        c_major="n",
+        ab_dtype=get_cutlass_dtype(ab_dtype),
+        sf_dtype=get_cutlass_dtype(sf_dtype),
+        c_dtype=get_cutlass_dtype(c_dtype),
+        acc_dtype=get_cutlass_dtype(acc_dtype),
+        use_2cta_instrs=use_2cta_instrs,
+        mma_tiler_mn=mma_tiler_mn,
+        cluster_shape_mn=cluster_shape_mn,
+        sm_count=sm_count,
+        sm_version=f"sm_{major}{minor}",
+    )(
+        a_tensor_gpu=a_torch,
+        b_tensor_gpu=b_torch,
+        sfa_tensor_gpu=sfa_torch,
+        sfb_tensor_gpu=sfb_torch,
+        c_tensor_gpu=c_torch,
+    )
