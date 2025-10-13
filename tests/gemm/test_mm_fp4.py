@@ -89,7 +89,7 @@ def test_mm_fp4(
 
         cos_sim = F.cosine_similarity(reference.reshape(-1), res.reshape(-1), dim=0)
         assert cos_sim > 0.97
-    except LibraryError:
+    except LibraryError as e:
         # TODO: Remove this check once cuDNN backend version is updated to 9.14.0
         if (
             backend == "cudnn"
@@ -100,7 +100,7 @@ def test_mm_fp4(
                 "cudnn FP4 GEMM with mxfp4 quantization is not supported on SM120 with cuDNN backend version < 9.14.0."
             )
         else:
-            pytest.fail("Unexpected LibraryError")
+            pytest.fail(str(e))
 
 
 if __name__ == "__main__":

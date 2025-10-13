@@ -772,7 +772,11 @@ def get_native_fp4_dtype():
 
 
 def supports_backends(
-    backends, capabilities=None, anti_capabilities=None, capability_tensor_arg=None
+    backends,
+    capabilities=None,
+    anti_capabilities=None,
+    capability_tensor_arg=None,
+    problem_size_check=None,
 ):
     """Decorator to validate backend and capability support for functions.
 
@@ -791,7 +795,7 @@ def supports_backends(
         capability_tensor_arg (str, optional): Name of the tensor argument to use for
             automatic compute capability detection. The tensor's device compute capability
             will be extracted and used for validation.
-
+        problem_size_check (callable, optional): Function to check if the problem size is supported.
     Returns:
         callable: Decorator function that wraps the target function.
 
@@ -802,12 +806,16 @@ def supports_backends(
 
     Added Attributes:
         The decorated function gains two additional methods:
-        - is_supported(capability): Returns True if any backend supports the capability.
+        - is_compute_capability_supported(capability): Returns True if any backend supports the capability.
         - is_backend_supported(backend, capability=None): Returns True if the specific
           backend supports the given capability.
+        - is_problem_size_supported(args, kwargs): Returns True if the problem size is supported.
 
     Example:
+        >>> def simple_problem_size_check(input_tensor, backend):
+        ...     return True
         >>> @supports_backends(["cudnn", "trtllm"],
+        ...                   problem_size_check=simple_problem_size_check,
         ...                   capabilities={'cudnn': ['100', '110', '102']},
         ...                   anti_capabilities={"trtllm": ["110"]},
         ...                   capability_tensor_arg='input_tensor')
@@ -815,7 +823,7 @@ def supports_backends(
         ...     return f"Processing on {backend}"
 
         >>> # Check support without calling
-        >>> my_function.is_supported('110')  # True
+        >>> my_function.is_compute_capability_supported('110')  # True
         >>> my_function.is_backend_supported('cudnn', '110')  # True
         >>> my_function.is_backend_supported('trtllm', '110')   # False (anti-capability)
 
@@ -841,7 +849,7 @@ def supports_backends(
             return True
 
         # Returns True if any backend supports this capability
-        def is_supported(capability):
+        def is_compute_capability_supported(capability):
             for backend in backends:
                 if capabilities and backend in capabilities:
                     if capability in capabilities[backend]:
@@ -852,6 +860,14 @@ def supports_backends(
                 else:
                     return True
             return False
+
+        def is_problem_size_supported(*args, **kwargs):
+            if not problem_size_check:
+                raise ValueError(
+                    f"Problem size check function is not provided for {func.__name__}"
+                )
+            else:
+                return problem_size_check(*args, **kwargs)
 
         def wrapper(*args, **kwargs):
             backend = kwargs.get("backend")
@@ -872,10 +888,13 @@ def supports_backends(
                 raise BackendSupportedError(
                     f"{func.__name__} does not support backend '{backend}'{extra}"
                 )
+            if not is_problem_size_supported(*args, **kwargs):
+                raise ValueError(f"Problem size is not supported for {func.__name__}")
             return func(*args, **kwargs)
 
-        wrapper.is_supported = is_supported
+        wrapper.is_compute_capability_supported = is_compute_capability_supported
         wrapper.is_backend_supported = is_backend_supported
+        wrapper.is_problem_size_supported = is_problem_size_supported
         wrapper.__name__ = func.__name__
         wrapper.__doc__ = func.__doc__
         return wrapper
