@@ -814,10 +814,34 @@ def supported_compute_capability(supported_ccs):
     Notes
     -----
     This decorator is useful in conjunction with the backend_requirement decorator to mark functions with their supported CUDA compute capabilities.
+
+    Raises
+    ------
+    TypeError
+        If supported_ccs is not iterable or contains non-integer values.
     """
+    # Validate that supported_ccs is iterable
+    try:
+        ccs_list = list(supported_ccs)
+    except TypeError:
+        raise TypeError(
+            f"supported_ccs must be an iterable, got {type(supported_ccs).__name__}"
+        ) from None
+
+    # Validate and convert all elements to integers
+    validated_ccs = []
+    for i, cc in enumerate(ccs_list):
+        if isinstance(cc, bool):
+            # Reject booleans (which are technically ints in Python)
+            raise TypeError(f"supported_ccs[{i}] must be an integer, got bool: {cc}")
+        if not isinstance(cc, int):
+            raise TypeError(
+                f"supported_ccs[{i}] must be an integer, got {type(cc).__name__}: {cc}"
+            )
+        validated_ccs.append(cc)
 
     def decorator(func):
-        func._supported_ccs = set(supported_ccs)
+        func._supported_ccs = set(validated_ccs)
 
         def is_cc_supported(cc):
             return cc in func._supported_ccs
