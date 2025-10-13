@@ -981,6 +981,7 @@ def backend_requirement(backend_checks, common_check=None):
             else:
                 return req_checker(*args, **kwargs)
 
+        @functools.wraps(func)
         def wrapper(*args, **kwargs):
             backend = kwargs.get("backend")
             # skip_check is an optional argument that the decorator adds to any API function.

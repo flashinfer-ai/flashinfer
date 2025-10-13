@@ -171,3 +171,24 @@ def test_common_check():
     # 3D should fail validation
     with pytest.raises(ValueError, match="Problem size is not supported"):
         my_kernel(x_3d, backend="backend1")
+
+
+def test_functools_wraps_preserves_metadata():
+    """Test that backend_requirement preserves function metadata with functools.wraps."""
+
+    @supported_compute_capability([80, 86, 89, 90])
+    def _check(x, backend):
+        return True
+
+    @backend_requirement({"backend": _check})
+    def my_documented_function(x, backend="backend"):
+        """This is my function's docstring."""
+        return x * 2
+
+    # Verify that function metadata is preserved
+    assert my_documented_function.__name__ == "my_documented_function"
+    assert my_documented_function.__doc__ == "This is my function's docstring."
+
+    # Verify that added methods still exist
+    assert hasattr(my_documented_function, "is_backend_supported")
+    assert hasattr(my_documented_function, "is_compute_capability_supported")
