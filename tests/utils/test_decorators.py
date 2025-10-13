@@ -72,15 +72,22 @@ def test_backend_requirement_support_checks():
     """Test the backend_requirement decorator support checks."""
 
     @supported_compute_capability([80, 86, 89, 90])
-    def _cutlass_check(x, backend):
-        return x.shape[0] > 0
+    def _cudnn_check_my_kernel(x, backend):
+        return True
 
     @supported_compute_capability([75, 80, 86, 89, 90])
-    def _cudnn_check(x, backend):
-        return x.shape[0] > 0
+    def _cutlass_check_my_kernel(x, backend):
+        return True
 
-    @backend_requirement({"cutlass": _cutlass_check, "cudnn": _cudnn_check})
-    def my_kernel(x, backend="cutlass"):
+    def _common_check(x, backend):
+        # Common requirement: must be 2D
+        return x.dim() == 2
+
+    @backend_requirement(
+        {"cudnn": _cudnn_check_my_kernel, "cutlass": _cutlass_check_my_kernel},
+        common_check=_common_check,
+    )
+    def my_kernel(x, backend="cudnn"):
         return x * 2
 
     # Check methods added
@@ -96,11 +103,14 @@ def test_backend_requirement_support_checks():
 
     # Check compute capability support
     assert my_kernel.is_backend_supported("cutlass", 80) is True
-    assert my_kernel.is_backend_supported("cutlass", 75) is False
-    assert my_kernel.is_backend_supported("cudnn", 75) is True
+    assert my_kernel.is_backend_supported("cutlass", 75) is True  # cutlass supports 75
+    assert (
+        my_kernel.is_backend_supported("cudnn", 75) is False
+    )  # cudnn does NOT support 75
+    assert my_kernel.is_backend_supported("cudnn", 80) is True
 
     # Check cross-backend compute capability
-    assert my_kernel.is_compute_capability_supported(75) is True  # cudnn has it
+    assert my_kernel.is_compute_capability_supported(75) is True  # cutlass has it
     assert my_kernel.is_compute_capability_supported(80) is True  # both have it
     assert my_kernel.is_compute_capability_supported(70) is False  # neither has it
 
@@ -110,11 +120,16 @@ def test_backend_requirement_wrapped_function():
     if not torch.cuda.is_available():
         pytest.skip("Skipping CUDA tests (no GPU available)")
 
-    @supported_compute_capability([80, 86, 89, 90])
+    # Get actual device capability
+    x = torch.randn(1, 1, device="cuda")
+    major, minor = torch.cuda.get_device_capability(x.device)
+    actual_capability = major * 10 + minor
+
+    @supported_compute_capability([80, 86, 89, 90, actual_capability])
     def _cutlass_check(x, backend):
         return x.shape[0] > 0
 
-    @supported_compute_capability([75, 80, 86, 89, 90])
+    @supported_compute_capability([75, 80, 86, 89, 90, actual_capability])
     def _cudnn_check(x, backend):
         return x.shape[0] > 0
 
@@ -124,8 +139,11 @@ def test_backend_requirement_wrapped_function():
 
     x = torch.randn(10, 10, device="cuda")
 
-    # Test unsupported backend
-    with pytest.raises(BackendSupportedError, match="trtllm"):
+    # Test unsupported backend raises error
+    # The error message may include capability info, so use a flexible pattern
+    with pytest.raises(
+        BackendSupportedError, match="does not support backend 'trtllm'"
+    ):
         my_kernel(x, backend="trtllm")
 
     # Test supported backend works
@@ -143,11 +161,11 @@ def test_common_check():
     actual_capability = major * 10 + minor
 
     @supported_compute_capability([80, 86, 89, 90, actual_capability])
-    def _backend1_check(x, backend):
+    def _cudnn_check_my_kernel(x, backend):
         return True
 
     @supported_compute_capability([75, 80, 86, 89, 90, actual_capability])
-    def _backend2_check(x, backend):
+    def _cutlass_check_my_kernel(x, backend):
         return True
 
     def _common_check(x, backend):
@@ -155,22 +173,22 @@ def test_common_check():
         return x.dim() == 2
 
     @backend_requirement(
-        {"backend1": _backend1_check, "backend2": _backend2_check},
+        {"cudnn": _cudnn_check_my_kernel, "cutlass": _cutlass_check_my_kernel},
         common_check=_common_check,
     )
-    def my_kernel(x, backend="backend1"):
+    def my_kernel(x, backend="cudnn"):
         return x * 2
 
     x_2d = torch.randn(10, 10, device="cuda")
     x_3d = torch.randn(10, 10, 10, device="cuda")
 
     # 2D should work with skip_check
-    result = my_kernel(x_2d, backend="backend1", skip_check=True)
+    result = my_kernel(x_2d, backend="cudnn", skip_check=True)
     assert result.shape == x_2d.shape
 
     # 3D should fail validation
     with pytest.raises(ValueError, match="Problem size is not supported"):
-        my_kernel(x_3d, backend="backend1")
+        my_kernel(x_3d, backend="cudnn")
 
 
 def test_functools_wraps_preserves_metadata():
