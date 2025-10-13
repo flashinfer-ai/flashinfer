@@ -984,7 +984,7 @@ __device__ auto quantizePackedFPXValue(
       cvt_quant_get_sf_out_offset<TmaWarpSpecializedGroupedGemmInput::ElementSF, NumThreadsPerSF>(
           std::nullopt /* batchIdx */, token_id - num_tokens_before_expert, elem_idx,
           std::nullopt /* numRows */, num_cols / VecSize, act_sf_expert,
-          QuantizationSFLayout::SWIZZLED);
+          QuantizationSFLayout::SWIZZLED_128x4);
 
   // Do the conversion and set the output and scaling factor
   auto func = [&]() {
@@ -1026,7 +1026,7 @@ __device__ void writeSF(int64_t num_tokens_before_expert, int64_t expert_id,
       cvt_quant_get_sf_out_offset<TmaWarpSpecializedGroupedGemmInput::ElementSF, NumThreadsPerSF>(
           std::nullopt /* batchIdx */, token_id - num_tokens_before_expert, elem_idx,
           std::nullopt /* numRows */, num_cols / VecSize, act_sf_expert,
-          QuantizationSFLayout::SWIZZLED);
+          QuantizationSFLayout::SWIZZLED_128x4);
   if (sf_out) {
     if (input_sf) {
       if (swizzled_input_sf) {
@@ -1036,7 +1036,7 @@ __device__ void writeSF(int64_t num_tokens_before_expert, int64_t expert_id,
                 std::nullopt /* batchIdx */, source_token_id, elem_idx, std::nullopt /* numRows */,
                 num_cols / VecSize,
                 const_cast<TmaWarpSpecializedGroupedGemmInput::ElementSF*>(input_sf),
-                QuantizationSFLayout::SWIZZLED);
+                QuantizationSFLayout::SWIZZLED_128x4);
         *sf_out = *sf_in;
       } else {
         auto const sf_in =
@@ -3870,8 +3870,8 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
         TmaWarpSpecializedGroupedGemmInput::ElementSF const* fp4_act_flat1,
         TmaWarpSpecializedGroupedGemmInput::ElementSF const* fp4_act_flat2,
         QuantParams quant_params, ScaleBiasType const* bias1, ScaleBiasType const* bias2,
-        UnfusedGemmOutputType* gemm1_output, UnfusedGemmOutputType* gemm2_output, bool enable_pdl,
-        float const* router_scales, int const* permuted_row_to_unpermuted_row,
+        UnfusedGemmOutputType* gemm1_output, UnfusedGemmOutputType* gemm2_output,
+        float const* router_scales, int const* permuted_row_to_unpermuted_row, bool enable_pdl,
         cudaStream_t stream) {
   // Always nullptr
   layout_info1.ptr_c = nullptr;
@@ -4722,7 +4722,7 @@ size_t GemmProfilerBackend::getWorkspaceSize(int maxM) {
 
 void GemmProfilerBackend::runProfiler(int original_num_tokens, Config const& tactic,
                                       char* workspace_ptr_char, void const* expert_weights,
-                                      cudaStream_t const& stream) {
+                                      bool enable_pdl, cudaStream_t const& stream) {
   int64_t expanded_num_tokens = original_num_tokens * mK;
   int64_t num_experts_per_node = mNumExpertsPerNode;
 
