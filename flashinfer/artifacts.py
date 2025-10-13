@@ -110,11 +110,11 @@ class CheckSumHash:
         "b2d9d40db550ef85585e980bee651ac19d3e416f10b0c8bf9de0a7f9d0bee3d4"
     )
     TRTLLM_GEN_BMM: str = (
-        "efb9379c924193f6d3cb792bafb12b0811cab8eaa12bf324c7c410636c7769cd" // need update
+        "8df2aae8f3aa39d64d2c723e775640beb4ac602a6cbb02e497c2a7316e349934"
     )
     DEEPGEMM: str = "1a2a166839042dbd2a57f48051c82cd1ad032815927c753db269a4ed10d0ffbf"
     TRTLLM_GEN_GEMM: str = (
-        "e475e37989eed16418e0e858e2868ff07cb4b650cc48759cc23012f1afea310a" // need update
+        "15cb8c85dfb5eddd4f121d64cb5a718321fb55b85aa19df10ddc1329d4a726b9"
     )
     map_checksums: dict[str, str] = {
         safe_urljoin(ArtifactPath.TRTLLM_GEN_FMHA, "checksums.txt"): TRTLLM_GEN_FMHA,
