@@ -769,7 +769,7 @@ def get_native_fp4_dtype():
         return torch.uint8
 
 
-def supported_compute_capability(supported_ccs):
+def supported_compute_capability(supported_ccs: Iterable[int]) -> Callable:
     """
     Decorator to mark functions with their supported CUDA compute capabilities.
 
@@ -852,7 +852,9 @@ def supported_compute_capability(supported_ccs):
     return decorator
 
 
-def backend_requirement(backend_checks, common_check=None):
+def backend_requirement(
+    backend_checks: Dict[str, Callable], common_check: Optional[Callable] = None
+) -> Callable:
     """
     Decorator to enforce backend and problem size requirements for kernel functions.
 
