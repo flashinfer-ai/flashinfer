@@ -780,8 +780,10 @@ def supported_compute_capability(supported_ccs):
 
     Parameters
     ----------
-    supported_ccs : list or iterable
-        A list of supported CUDA compute capability versions (e.g., [75, 80, 86, 89, 90, 100 , 103, 110, 120]).
+    supported_ccs : list or iterable of int
+        A list of supported CUDA compute capability versions as integers
+        (e.g., [75, 80, 86, 89, 90, 100, 103, 110, 120]).
+        These are computed as major * 10 + minor (e.g., SM 8.0 = 80, SM 9.0 = 90).
 
     Returns
     -------
@@ -790,7 +792,7 @@ def supported_compute_capability(supported_ccs):
 
     Attributes Added to Decorated Function
     ---------------------------------------
-    _supported_ccs : set
+    _supported_ccs : set of int
         A set of integers representing the supported compute capabilities.
     is_compute_capability_supported : callable
         A method that takes a compute capability (int) and returns True if it's
@@ -979,7 +981,7 @@ def backend_requirement(backend_checks, common_check=None):
                     # Get compute capability from the first tensor
                     # Assume all tensors are on the same device/capability
                     major, minor = get_compute_capability(tensor_arg.device)
-                    capability = f"{major * 10 + minor}"
+                    capability = major * 10 + minor
 
                 if not is_backend_supported(backend, capability):
                     extra = f" with capability {capability}" if capability else ""

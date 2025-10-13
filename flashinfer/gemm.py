@@ -1747,7 +1747,7 @@ def _check_mm_fp4_problem_size(
     return True
 
 
-@supported_compute_capability(["100", "103", "110", "120"])
+@supported_compute_capability([100, 103, 110, 120])
 def _cudnn_gemm_fp4_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -1807,7 +1807,7 @@ def _cudnn_gemm_fp4_requirement(
     return True
 
 
-@supported_compute_capability(["100", "103", "120"])
+@supported_compute_capability([100, 103, 120])
 def _trtllm_gemm_fp4_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -1829,7 +1829,7 @@ def _trtllm_gemm_fp4_requirement(
     return True
 
 
-@supported_compute_capability(["100", "103", "120"])
+@supported_compute_capability([100, 103, 120])
 def _cutlass_gemm_fp4_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
