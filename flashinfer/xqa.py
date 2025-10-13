@@ -17,7 +17,6 @@ limitations under the License.
 import functools
 from types import SimpleNamespace
 from typing import Optional
-from .utils import get_compute_capability
 import torch
 
 from .jit.xqa import gen_xqa_module

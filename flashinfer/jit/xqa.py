@@ -15,8 +15,15 @@ limitations under the License.
 """
 
 from . import env as jit_env
-from .core import JitSpec, gen_jit_spec, sm90a_nvcc_flags, sm100a_nvcc_flags, sm120a_nvcc_flags
+from .core import (
+    JitSpec,
+    gen_jit_spec,
+    sm90a_nvcc_flags,
+    sm100a_nvcc_flags,
+    sm120a_nvcc_flags,
+)
 from ..utils import get_compute_capability
+import torch
 
 xqa_nvcc_flags = [
     "-DNDEBUG=1",
@@ -64,7 +71,7 @@ def gen_xqa_module(
         flag_sliding_window = ["-DSLIDING_WINDOW=1"]
     else:
         flag_sliding_window = ["-DSLIDING_WINDOW=0"]
-    
+
     if get_compute_capability(torch.device(device="cuda"))[0] == 10:
         sm_nvcc_flags = sm100a_nvcc_flags
     elif get_compute_capability(torch.device(device="cuda"))[0] == 12:
@@ -73,13 +80,13 @@ def gen_xqa_module(
         sm_nvcc_flags = sm90a_nvcc_flags
 
     return gen_jit_spec(
-        f"xqa_fp16_input_{fp16_input}_fp8_kv_cache_{fp8_kv_cache}_token_per_page_{token_per_page}_head_size_{head_size}_head_grp_size_{head_grp_size}_use_sliding_window_{use_sliding_window}_sm_{get_compute_capability(torch.device(device="cuda"))[0]}0",
+        f"xqa_fp16_input_{fp16_input}_fp8_kv_cache_{fp8_kv_cache}_token_per_page_{token_per_page}_head_size_{head_size}_head_grp_size_{head_grp_size}_use_sliding_window_{use_sliding_window}_sm_{get_compute_capability(torch.device(device='cuda'))[0]}0",
         [
             jit_env.FLASHINFER_CSRC_DIR / "xqa/mha.cu",
             jit_env.FLASHINFER_CSRC_DIR / "xqa/mha_sm90.cu",
             jit_env.FLASHINFER_CSRC_DIR / "xqa/tensorMap.cpp",
             jit_env.FLASHINFER_CSRC_DIR / "xqa/xqa_wrapper.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "flashinfer_xqa_ops.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "flashinfer_xqa_binding.cu",
         ],
         extra_cuda_cflags=xqa_nvcc_flags
         + sm_nvcc_flags

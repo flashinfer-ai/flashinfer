@@ -19,8 +19,8 @@
 
 using tvm::ffi::Optional;
 
-void xqa_wrapper(bool run_fp8_mha, int64_t multiProcessorCount, int64_t nbKHeads, int64_t slidingWinSize,
-                 double qScale, TensorView output,
+void xqa_wrapper(bool run_fp8_mha, int64_t multiProcessorCount, int64_t nbKHeads,
+                 int64_t slidingWinSize, double qScale, TensorView output,
 #if LOW_PREC_OUTPUT
                  TensorView rcpOutScale,
 #endif
@@ -38,19 +38,19 @@ void xqa_wrapper(bool run_fp8_mha, int64_t multiProcessorCount, int64_t nbKHeads
   auto const mha_func = run_fp8_mha ? &launchHopperF8MHAFlashInfer : &launchMHAFlashInfer;
 
   mha_func(multiProcessorCount, nbKHeads, slidingWinSize, qScale,
-                      reinterpret_cast<OutputHead*>(output->data),
+           reinterpret_cast<OutputHead*>(output->data),
 #if LOW_PREC_OUTPUT
-                      reinterpret_cast<float const*>(rcpOutScale->data),
+           reinterpret_cast<float const*>(rcpOutScale->data),
 #endif
-                      reinterpret_cast<InputHead const*>(q->data), attentionSinksPtr,
-                      reinterpret_cast<GMemCacheHead*>(pool->data),
-                      reinterpret_cast<KVCachePageIndex const*>(kvCachePageList->data), maxSeqLen,
-                      reinterpret_cast<uint32_t const*>(seqLen->data), batchSize,
-                      reinterpret_cast<float const*>(kvCacheScale->data),
+           reinterpret_cast<InputHead const*>(q->data), attentionSinksPtr,
+           reinterpret_cast<GMemCacheHead*>(pool->data),
+           reinterpret_cast<KVCachePageIndex const*>(kvCachePageList->data), maxSeqLen,
+           reinterpret_cast<uint32_t const*>(seqLen->data), batchSize,
+           reinterpret_cast<float const*>(kvCacheScale->data),
 #if SPEC_DEC
-                      qSeqLen, reinterpret_cast<uint32_t const*>(qCuSeqLens->data),
-                      reinterpret_cast<MaskType const*>(mask->data),
+           qSeqLen, reinterpret_cast<uint32_t const*>(qCuSeqLens->data),
+           reinterpret_cast<MaskType const*>(mask->data),
 #endif
-                      reinterpret_cast<uint32_t*>(semaphores->data),
-                      reinterpret_cast<void*>(scratch->data), stream);
+           reinterpret_cast<uint32_t*>(semaphores->data), reinterpret_cast<void*>(scratch->data),
+           stream);
 }
