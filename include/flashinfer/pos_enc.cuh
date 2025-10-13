@@ -714,6 +714,26 @@ __global__ void BatchQKApplyRotaryKernel(
     __VA_ARGS__                                          \
   }
 
+#define DISPATCH_ROPE_DIM(rope_dim, vec_size, ...)                                    \
+  if (rope_dim == 16) {                                                               \
+    constexpr uint32_t bdx = 16 / vec_size;                                           \
+    __VA_ARGS__                                                                       \
+  } else if (rope_dim == 32) {                                                        \
+    constexpr uint32_t bdx = 32 / vec_size;                                           \
+    __VA_ARGS__                                                                       \
+  } else if (rope_dim == 64) {                                                        \
+    constexpr uint32_t bdx = 64 / vec_size;                                           \
+    __VA_ARGS__                                                                       \
+  } else if (rope_dim == 128) {                                                       \
+    constexpr uint32_t bdx = 128 / vec_size;                                          \
+    __VA_ARGS__                                                                       \
+  } else if (rope_dim == 256) {                                                       \
+    constexpr uint32_t bdx = 256 / vec_size;                                          \
+    __VA_ARGS__                                                                       \
+  } else {                                                                            \
+    FLASHINFER_ERROR("Unsupported rope_dim. Supported values: 16, 32, 64, 128, 256"); \
+  }
+
 // Removed problematic macro - using explicit dispatch instead
 
 template <typename DType, typename IdType, typename QuantType>
@@ -736,8 +756,8 @@ cudaError_t MLARopeQuantize(
   // Dispatch rope_dim first, then interleave to avoid macro expansion issues
   constexpr uint32_t vec_size = 32 / sizeof(DType);
 
-  if (rope_dim == 16) {
-    constexpr uint32_t bdx = 16 / vec_size;
+  // Use nested macros for runtime->compile-time dispatch
+  DISPATCH_ROPE_DIM(rope_dim, vec_size, {
     DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
       uint32_t num_threads = 128U;
       uint32_t bdy = num_threads / bdx;
@@ -785,205 +805,7 @@ cudaError_t MLARopeQuantize(
       dim3 nthrs(bdx, bdy);
       FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
     });
-  } else if (rope_dim == 32) {
-    constexpr uint32_t bdx = 32 / vec_size;
-    DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
-      uint32_t num_threads = 128U;
-      uint32_t bdy = num_threads / bdx;
-      uint32_t nblks_x = (nnz + bdy - 1) / bdy;
-      uint32_t rope_chunk_size = rope_dim;
-      uint32_t rope_chunks = (rope_dim + rope_chunk_size - 1) / rope_chunk_size;
-      uint32_t no_rope_chunks = (no_rope_dim + rope_chunk_size - 1) / rope_chunk_size;
-      uint32_t total_blocks_y = num_qo_heads * rope_chunks + num_kv_heads * rope_chunks +
-                                num_kv_heads * no_rope_chunks + num_qo_heads * no_rope_chunks;
-      void* args[] = {(void*)&q_rope_in,
-                      (void*)&k_rope_in,
-                      (void*)&q_nope_in,
-                      (void*)&k_nope_in,
-                      (void*)&q_rope_out,
-                      (void*)&k_rope_out,
-                      (void*)&q_nope_out,
-                      (void*)&k_nope_out,
-                      (void*)&cos_sin_cache,
-                      (void*)&pos_ids,
-                      (void*)&nnz,
-                      (void*)&num_qo_heads,
-                      (void*)&num_kv_heads,
-                      (void*)&rope_dim,
-                      (void*)&no_rope_dim,
-                      (void*)&q_rope_in_stride_n,
-                      (void*)&q_rope_in_stride_h,
-                      (void*)&q_nope_in_stride_n,
-                      (void*)&q_nope_in_stride_h,
-                      (void*)&q_rope_out_stride_n,
-                      (void*)&q_rope_out_stride_h,
-                      (void*)&q_nope_out_stride_n,
-                      (void*)&q_nope_out_stride_h,
-                      (void*)&k_rope_in_stride,
-                      (void*)&k_rope_in_stride_h,
-                      (void*)&k_nope_in_stride,
-                      (void*)&k_nope_in_stride_h,
-                      (void*)&k_rope_out_stride,
-                      (void*)&k_rope_out_stride_h,
-                      (void*)&k_nope_out_stride,
-                      (void*)&k_nope_out_stride_h,
-                      (void*)&quant_scale_q,
-                      (void*)&quant_scale_kv};
-      auto kernel = MLARopeQuantizeKernel<INTERLEAVE, vec_size, bdx, DType, IdType, QuantType>;
-      dim3 nblks(nblks_x, total_blocks_y);
-      dim3 nthrs(bdx, bdy);
-      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
-    });
-  } else if (rope_dim == 64) {
-    DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
-      constexpr uint32_t bdx = 64 / vec_size;
-      uint32_t num_threads = 128U;
-      uint32_t bdy = num_threads / bdx;
-      uint32_t nblks_x = (nnz + bdy - 1) / bdy;
-      uint32_t rope_chunk_size = rope_dim;
-      uint32_t rope_chunks = (rope_dim + rope_chunk_size - 1) / rope_chunk_size;
-      uint32_t no_rope_chunks = (no_rope_dim + rope_chunk_size - 1) / rope_chunk_size;
-      uint32_t total_blocks_y = num_qo_heads * rope_chunks + num_kv_heads * rope_chunks +
-                                num_kv_heads * no_rope_chunks + num_qo_heads * no_rope_chunks;
-      void* args[] = {(void*)&q_rope_in,
-                      (void*)&k_rope_in,
-                      (void*)&q_nope_in,
-                      (void*)&k_nope_in,
-                      (void*)&q_rope_out,
-                      (void*)&k_rope_out,
-                      (void*)&q_nope_out,
-                      (void*)&k_nope_out,
-                      (void*)&cos_sin_cache,
-                      (void*)&pos_ids,
-                      (void*)&nnz,
-                      (void*)&num_qo_heads,
-                      (void*)&num_kv_heads,
-                      (void*)&rope_dim,
-                      (void*)&no_rope_dim,
-                      (void*)&q_rope_in_stride_n,
-                      (void*)&q_rope_in_stride_h,
-                      (void*)&q_nope_in_stride_n,
-                      (void*)&q_nope_in_stride_h,
-                      (void*)&q_rope_out_stride_n,
-                      (void*)&q_rope_out_stride_h,
-                      (void*)&q_nope_out_stride_n,
-                      (void*)&q_nope_out_stride_h,
-                      (void*)&k_rope_in_stride,
-                      (void*)&k_rope_in_stride_h,
-                      (void*)&k_nope_in_stride,
-                      (void*)&k_nope_in_stride_h,
-                      (void*)&k_rope_out_stride,
-                      (void*)&k_rope_out_stride_h,
-                      (void*)&k_nope_out_stride,
-                      (void*)&k_nope_out_stride_h,
-                      (void*)&quant_scale_q,
-                      (void*)&quant_scale_kv};
-      auto kernel = MLARopeQuantizeKernel<INTERLEAVE, vec_size, bdx, DType, IdType, QuantType>;
-      dim3 nblks(nblks_x, total_blocks_y);
-      dim3 nthrs(bdx, bdy);
-      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
-    });
-  } else if (rope_dim == 128) {
-    DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
-      constexpr uint32_t bdx = 128 / vec_size;
-      uint32_t num_threads = 128U;
-      uint32_t bdy = num_threads / bdx;
-      uint32_t nblks_x = (nnz + bdy - 1) / bdy;
-      uint32_t rope_chunk_size = rope_dim;
-      uint32_t rope_chunks = (rope_dim + rope_chunk_size - 1) / rope_chunk_size;
-      uint32_t no_rope_chunks = (no_rope_dim + rope_chunk_size - 1) / rope_chunk_size;
-      uint32_t total_blocks_y = num_qo_heads * rope_chunks + num_kv_heads * rope_chunks +
-                                num_kv_heads * no_rope_chunks + num_qo_heads * no_rope_chunks;
-      void* args[] = {(void*)&q_rope_in,
-                      (void*)&k_rope_in,
-                      (void*)&q_nope_in,
-                      (void*)&k_nope_in,
-                      (void*)&q_rope_out,
-                      (void*)&k_rope_out,
-                      (void*)&q_nope_out,
-                      (void*)&k_nope_out,
-                      (void*)&cos_sin_cache,
-                      (void*)&pos_ids,
-                      (void*)&nnz,
-                      (void*)&num_qo_heads,
-                      (void*)&num_kv_heads,
-                      (void*)&rope_dim,
-                      (void*)&no_rope_dim,
-                      (void*)&q_rope_in_stride_n,
-                      (void*)&q_rope_in_stride_h,
-                      (void*)&q_nope_in_stride_n,
-                      (void*)&q_nope_in_stride_h,
-                      (void*)&q_rope_out_stride_n,
-                      (void*)&q_rope_out_stride_h,
-                      (void*)&q_nope_out_stride_n,
-                      (void*)&q_nope_out_stride_h,
-                      (void*)&k_rope_in_stride,
-                      (void*)&k_rope_in_stride_h,
-                      (void*)&k_nope_in_stride,
-                      (void*)&k_nope_in_stride_h,
-                      (void*)&k_rope_out_stride,
-                      (void*)&k_rope_out_stride_h,
-                      (void*)&k_nope_out_stride,
-                      (void*)&k_nope_out_stride_h,
-                      (void*)&quant_scale_q,
-                      (void*)&quant_scale_kv};
-      auto kernel = MLARopeQuantizeKernel<INTERLEAVE, vec_size, bdx, DType, IdType, QuantType>;
-      dim3 nblks(nblks_x, total_blocks_y);
-      dim3 nthrs(bdx, bdy);
-      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
-    });
-  } else if (rope_dim == 256) {
-    DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
-      constexpr uint32_t bdx = 256 / vec_size;
-      uint32_t num_threads = 128U;
-      uint32_t bdy = num_threads / bdx;
-      uint32_t nblks_x = (nnz + bdy - 1) / bdy;
-      uint32_t rope_chunk_size = rope_dim;
-      uint32_t rope_chunks = (rope_dim + rope_chunk_size - 1) / rope_chunk_size;
-      uint32_t no_rope_chunks = (no_rope_dim + rope_chunk_size - 1) / rope_chunk_size;
-      uint32_t total_blocks_y = num_qo_heads * rope_chunks + num_kv_heads * rope_chunks +
-                                num_kv_heads * no_rope_chunks + num_qo_heads * no_rope_chunks;
-      void* args[] = {(void*)&q_rope_in,
-                      (void*)&k_rope_in,
-                      (void*)&q_nope_in,
-                      (void*)&k_nope_in,
-                      (void*)&q_rope_out,
-                      (void*)&k_rope_out,
-                      (void*)&q_nope_out,
-                      (void*)&k_nope_out,
-                      (void*)&cos_sin_cache,
-                      (void*)&pos_ids,
-                      (void*)&nnz,
-                      (void*)&num_qo_heads,
-                      (void*)&num_kv_heads,
-                      (void*)&rope_dim,
-                      (void*)&no_rope_dim,
-                      (void*)&q_rope_in_stride_n,
-                      (void*)&q_rope_in_stride_h,
-                      (void*)&q_nope_in_stride_n,
-                      (void*)&q_nope_in_stride_h,
-                      (void*)&q_rope_out_stride_n,
-                      (void*)&q_rope_out_stride_h,
-                      (void*)&q_nope_out_stride_n,
-                      (void*)&q_nope_out_stride_h,
-                      (void*)&k_rope_in_stride,
-                      (void*)&k_rope_in_stride_h,
-                      (void*)&k_nope_in_stride,
-                      (void*)&k_nope_in_stride_h,
-                      (void*)&k_rope_out_stride,
-                      (void*)&k_rope_out_stride_h,
-                      (void*)&k_nope_out_stride,
-                      (void*)&k_nope_out_stride_h,
-                      (void*)&quant_scale_q,
-                      (void*)&quant_scale_kv};
-      auto kernel = MLARopeQuantizeKernel<INTERLEAVE, vec_size, bdx, DType, IdType, QuantType>;
-      dim3 nblks(nblks_x, total_blocks_y);
-      dim3 nthrs(bdx, bdy);
-      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
-    });
-  } else {
-    FLASHINFER_ERROR("Unsupported rope_dim. Supported values: 16, 32, 64, 128, 256");
-  }
+  });
 
   return cudaSuccess;
 }
