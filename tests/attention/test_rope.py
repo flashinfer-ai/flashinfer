@@ -356,63 +356,6 @@ def test_rope_cos_sin_cache(
     torch.testing.assert_close(key_ref_out, key_flashinfer_out, atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.parametrize("num_tokens", [1, 19, 128, 199, 899, 2047])
-@pytest.mark.parametrize("input_dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("quant_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
-def test_mla_rope_quantize(
-    num_tokens,
-    input_dtype,
-    quant_dtype,
-):
-    device = "cuda:0"
-    num_qo_heads = 128
-    q_in = torch.randn(num_tokens, num_qo_heads, 576, dtype=input_dtype, device=device)
-    k_in = torch.randn(num_tokens, 576, dtype=input_dtype, device=device)
-    pos_ids = torch.arange(num_tokens, device=device)
-
-    # baseline
-    rope_flashinfer = FlashInferRotaryEmbedding(
-        576,
-        64,
-        4096,
-        10000,
-        False,  # is_neox_style
-        input_dtype,
-        device,
-    )
-
-    q_out_f16_ref, k_out_f16_ref = rope_flashinfer.forward_native(pos_ids, q_in, k_in)
-    q_out_f8_ref, k_out_f8_ref = map(
-        lambda x: x.to(quant_dtype),
-        (q_out_f16_ref, k_out_f16_ref),
-    )
-
-    q_out = torch.empty_like(q_in, dtype=quant_dtype)
-    k_out = torch.empty_like(k_in, dtype=quant_dtype)
-    flashinfer.rope.mla_rope_quantize_fp8(
-        q_in[..., :64],
-        k_in[..., :64],
-        q_in[..., 64:],
-        k_in[..., 64:],
-        rope_flashinfer.cos_sin_cache,
-        pos_ids,
-        is_neox=False,
-        q_rope_out=q_out[..., :64],
-        k_rope_out=k_out[..., :64],
-        q_nope_out=q_out[..., 64:],
-        k_nope_out=k_out[..., 64:],
-        quant_scale_q=1.0,
-        quant_scale_kv=1.0,
-    )
-
-    torch.testing.assert_close(
-        q_out_f8_ref.float(), q_out.float(), atol=1e-2, rtol=2e-1
-    )
-    torch.testing.assert_close(
-        k_out_f8_ref.float(), k_out.float(), atol=1e-2, rtol=2e-1
-    )
-
-
 @pytest.mark.parametrize(
     "attention_type,num_qo_heads,num_kv_heads,rope_dim,no_rope_dim",
     [
@@ -428,13 +371,9 @@ def test_mla_rope_quantize(
         ("mha", 32, 32, 64, 64),
         ("mha", 16, 16, 128, 128),
         ("mha", 8, 8, 32, 96),
-        # # Edge cases: Different rope/no-rope dimension ratios
-        # ("mla", 32, 1, 128, 64),   # More RoPE than non-RoPE
-        # ("gqa", 16, 4, 256, 256),  # Large dimensions
-        # ("mha", 4, 4, 16, 16),     # Small dimensions
     ],
 )
-@pytest.mark.parametrize("num_tokens", [1, 19, 128, 199])
+@pytest.mark.parametrize("num_tokens", [1, 19, 128, 199, 899, 2047])
 @pytest.mark.parametrize("input_dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("quant_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 def test_generalized_rope_quantize(
@@ -541,4 +480,4 @@ if __name__ == "__main__":
     # test_rope_cos_sin_cache(
     #     64, 64, 32, 8000, True, torch.bfloat16, "cuda", 32, 32, 1, 1
     # )
-    test_mla_rope_quantize(1, torch.float16, torch.float8_e4m3fn)
+    test_generalized_rope_quantize(1, torch.float16, torch.float8_e4m3fn)
