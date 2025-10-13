@@ -18,6 +18,8 @@ import functools
 import math
 from enum import Enum
 from typing import Callable, Dict, Iterable, Optional, Sequence, Tuple, Union
+import inspect
+
 
 import torch
 import torch.version
@@ -56,6 +58,12 @@ class GPUArchitectureError(Exception):
 
 class LibraryError(Exception):
     """Custom exception for library-related errors."""
+
+    pass
+
+
+class BackendSupportedError(Exception):
+    """Custom exception for backend-related errors."""
 
     pass
 
@@ -761,3 +769,64 @@ def get_native_fp4_dtype():
         return torch.float4_e2m1fn_x2
     else:
         return torch.uint8
+
+
+def supports_backends(
+    backends, capabilities=None, anti_capabilities=None, capability_tensor_arg=None
+):
+    def decorator(func):
+        # Returns True if backend is supported; with capability, also checks if backend specifically supports it
+        def is_backend_supported(backend, capability=None):
+            if backend not in backends:
+                return False
+            if capability:
+                # Anti-capabilities take precedence
+                if anti_capabilities and backend in anti_capabilities:
+                    if capability in anti_capabilities[backend]:
+                        return False
+                # Capabilities allow-list
+                if capabilities and backend in capabilities:
+                    return capability in capabilities[backend]
+            return True
+
+        # Returns True if any backend supports this capability
+        def is_supported(capability):
+            for backend in backends:
+                if capabilities and backend in capabilities:
+                    if capability in capabilities[backend]:
+                        return True
+                elif anti_capabilities and backend in anti_capabilities:
+                    if capability in anti_capabilities[backend]:
+                        return False
+                else:
+                    return True
+            return False
+
+        def wrapper(*args, **kwargs):
+            backend = kwargs.get("backend")
+            capability = None
+            if capability_tensor_arg:
+                tensor = kwargs.get(capability_tensor_arg)
+                # When it wasn't provided as a keyword argument, try to get it from the arguments
+                if tensor is None:
+                    params = list(inspect.signature(func).parameters)
+                    idx = params.index(capability_tensor_arg)
+                    tensor = args[idx]
+                if tensor is None:
+                    raise ValueError("Invalid tensor on capability support check")
+                major, minor = get_compute_capability(tensor.device)
+                capability = f"{major * 10 + minor}"
+            if not is_backend_supported(backend, capability):
+                extra = f" with capability {capability}" if capability else ""
+                raise BackendSupportedError(
+                    f"{func.__name__} does not support backend '{backend}'{extra}"
+                )
+            return func(*args, **kwargs)
+
+        wrapper.is_supported = is_supported
+        wrapper.is_backend_supported = is_backend_supported
+        wrapper.__name__ = func.__name__
+        wrapper.__doc__ = func.__doc__
+        return wrapper
+
+    return decorator
