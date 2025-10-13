@@ -1846,19 +1846,13 @@ def _cutlass_gemm_fp4_requirement(
     return True
 
 
-# @supports_backends(
-#     ["cudnn", "trtllm", "cutlass"],
-#     anti_capabilities={"trtllm": ["110"]},
-#     capability_tensor_arg="a",
-#     problem_size_check=_check_mm_fp4_backend_supported,
-# )
 @backend_requirement(
     {
-        "cudnn": _cudnn_gemm_fp4_requirement,
+        "cudnn": _cudnn_gemm_fp4_requirement,  # Each backend has its own requirement function
         "trtllm": _trtllm_gemm_fp4_requirement,
         "cutlass": _cutlass_gemm_fp4_requirement,
     },
-    common_check=_check_mm_fp4_problem_size,
+    common_check=_check_mm_fp4_problem_size,  # Shape checks common to all backends
 )
 def mm_fp4(
     a: torch.Tensor,
