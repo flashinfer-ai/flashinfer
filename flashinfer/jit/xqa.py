@@ -22,8 +22,6 @@ from .core import (
     sm100a_nvcc_flags,
     sm120a_nvcc_flags,
 )
-from ..utils import get_compute_capability
-import torch
 
 xqa_nvcc_flags = [
     "-DNDEBUG=1",
@@ -42,6 +40,7 @@ def gen_xqa_module(
     head_size: int,
     head_grp_size: int,
     use_sliding_window: bool,
+    sm_version: int = 90,
 ) -> JitSpec:
     if fp16_input:
         flag_data_type = ["-DINPUT_FP16=1", "-DDTYPE=__half"]
@@ -72,15 +71,15 @@ def gen_xqa_module(
     else:
         flag_sliding_window = ["-DSLIDING_WINDOW=0"]
 
-    if get_compute_capability(torch.device(device="cuda"))[0] == 10:
+    if sm_version == 100:
         sm_nvcc_flags = sm100a_nvcc_flags
-    elif get_compute_capability(torch.device(device="cuda"))[0] == 12:
+    elif sm_version == 120:
         sm_nvcc_flags = sm120a_nvcc_flags
     else:
         sm_nvcc_flags = sm90a_nvcc_flags
 
     return gen_jit_spec(
-        f"xqa_fp16_input_{fp16_input}_fp8_kv_cache_{fp8_kv_cache}_token_per_page_{token_per_page}_head_size_{head_size}_head_grp_size_{head_grp_size}_use_sliding_window_{use_sliding_window}_sm_{get_compute_capability(torch.device(device='cuda'))[0]}0",
+        f"xqa_fp16_input_{fp16_input}_fp8_kv_cache_{fp8_kv_cache}_token_per_page_{token_per_page}_head_size_{head_size}_head_grp_size_{head_grp_size}_use_sliding_window_{use_sliding_window}_sm_{sm_version}",
         [
             jit_env.FLASHINFER_CSRC_DIR / "xqa/mha.cu",
             jit_env.FLASHINFER_CSRC_DIR / "xqa/mha_sm90.cu",
