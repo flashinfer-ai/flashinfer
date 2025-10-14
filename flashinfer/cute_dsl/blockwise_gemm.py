@@ -36,8 +36,18 @@ import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.torch as cutlass_torch
 import cutlass.utils as utils
+import cutlass.utils.distributed_helpers as distributed_helpers
 import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils
+from cutlass.cute.typing import (
+    Int32,
+    Float16,
+    BFloat16,
+    Float32,
+    Float8E4M3FN,
+    Float8E5M2,
+    Tensor,
+)
 import torch
 
 from flashinfer.utils import get_compute_capability
@@ -153,6 +163,7 @@ class BlockwiseGemmKernel:
         use_2cta_instrs: bool,
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
+        all_reduce="none",
     ):
         """Initializes the configuration for a Blackwell blockwise dense GEMM kernel.
 
@@ -182,6 +193,7 @@ class BlockwiseGemmKernel:
         self.cluster_shape_mn = cluster_shape_mn
         # K dimension is deferred in _setup_attributes
         self.mma_tiler = (*mma_tiler_mn, 1)
+        self.all_reduce = all_reduce
 
         self.cta_group = (
             tcgen05.CtaGroup.TWO if use_2cta_instrs else tcgen05.CtaGroup.ONE
@@ -205,6 +217,9 @@ class BlockwiseGemmKernel:
         self.tma_warp_id = 9
         self.scale_warp_id = 10
         self.sched_warp_id = 11
+        self.all_reduce_warp_id: Tuple[int, ...] = ()
+        if all_reduce != "none":
+            self.all_reduce_warp_id = (12, 13, 14, 15)
         self.threads_per_warp = 32
         self.threads_per_cta = self.threads_per_warp * len(
             (
@@ -214,6 +229,7 @@ class BlockwiseGemmKernel:
                 self.tma_warp_id,
                 self.scale_warp_id,
                 self.sched_warp_id,
+                *self.all_reduce_warp_id,
             )
         )
         self.threads_wo_sched = self.threads_per_warp * len(
@@ -235,9 +251,15 @@ class BlockwiseGemmKernel:
         self.epilog_sync_bar_id = 1
         self.tmem_ptr_sync_bar_id = 2
         self.sched_sync_bar_id = 3
+        self.all_reduce_sync_bar_id = 4
         self.num_smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
         # TMEM offset for final accumulator
         self.tmem_final_offset = 384
+        self.num_ranks = 1
+        self.rank_id = 0
+        if all_reduce != "none":
+            self.num_ranks = torch.distributed.get_world_size()
+            self.rank_id = torch.distributed.get_rank()
 
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
@@ -283,9 +305,7 @@ class BlockwiseGemmKernel:
             (tiled_mma.thr_id.shape,),
         )
 
-        # {$nv-internal-release begin}
         # TODO: get from args
-        # {$nv-internal-release end}
         self.scale_granularity_m = 1
         self.scale_granularity_n = 128
         self.scale_granularity_k = 128
@@ -395,6 +415,9 @@ class BlockwiseGemmKernel:
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
+        c_mc: cute.Tensor = None,
+        barrier_flag: cute.Tensor = None,
+        barrier_flag_mc: cute.Tensor = None,
     ):
         """Execute the GEMM operation in steps:
         - Setup static attributes before smem/grid/tma computation
@@ -420,6 +443,12 @@ class BlockwiseGemmKernel:
         :param epilogue_op: Optional elementwise lambda function to apply to the output tensor
         :type epilogue_op: cutlass.Constexpr
         :raises TypeError: If input data types are incompatible with the MMA instruction.
+        :param c_mc: Output symmetric tensor C_mc, any write or read to a multicast tensor will be broadcasted to all GPUs
+        :type c_mc: cute.Tensor
+        :param barrier_flag: Barrier flag to sync between peers
+        :type barrier_flag: cute.Tensor
+        :param barrier_flag_mc: Multicast barrier flag to sync between peers
+        :type barrier_flag_mc: cute.Tensor
         """
         # Setup static attributes before smem/grid/tma computation
         self.a_dtype: Type[cutlass.Numeric] = a.element_type
@@ -615,6 +644,9 @@ class BlockwiseGemmKernel:
             self.epi_tile,
             self.tile_sched_params,
             epilogue_op,
+            c_mc,
+            barrier_flag,
+            barrier_flag_mc,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -647,6 +679,9 @@ class BlockwiseGemmKernel:
         epi_tile: cute.Tile,
         tile_sched_params: utils.PersistentTileSchedulerParams,
         epilogue_op: cutlass.Constexpr,
+        c_mc: cute.Tensor,
+        barrier_flag: cute.Tensor,
+        barrier_flag_mc: cute.Tensor,
     ):
         """
         GPU device kernel performing the Persistent batched GEMM computation.
@@ -654,7 +689,6 @@ class BlockwiseGemmKernel:
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
         lane_idx = cute.arch.lane_idx()
-
         #
         # Prefetch tma desc
         #
@@ -984,7 +1018,7 @@ class BlockwiseGemmKernel:
         # Specialized Schedule warp
         #
         if warp_idx == self.sched_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_sched_warps)
+            # cute.arch.warpgroup_reg_dealloc(self.num_regs_sched_warps)
             #
             # Persistent tile scheduling loop
             #
@@ -1035,7 +1069,7 @@ class BlockwiseGemmKernel:
         # Specialized TMA load warp
         #
         if warp_idx == self.tma_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_uniform_warps)
+            # cute.arch.warpgroup_reg_dealloc(self.num_regs_uniform_warps)
             #
             # Persistent tile scheduling loop
             #
@@ -1154,7 +1188,7 @@ class BlockwiseGemmKernel:
         # Specialized Scale load warp
         #
         if warp_idx == self.scale_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_uniform_warps)
+            # cute.arch.warpgroup_reg_dealloc(self.num_regs_uniform_warps)
             #
             # Persistent tile scheduling loop
             #
@@ -1278,9 +1312,7 @@ class BlockwiseGemmKernel:
                             ),
                         )
                     )
-                    # {$nv-internal-release begin}
                     # TODO: Skip more unnecessary load
-                    # {$nv-internal-release end}
                     for i in cutlass.range_constexpr(cute.size(tApSFA, mode=[1])):
                         tApSFA[((0, 0), i, (0, 0))] = cute.elem_less(
                             tAcSFA_compact[(i)][0], mSFA_mkl.shape[0]
@@ -1332,7 +1364,7 @@ class BlockwiseGemmKernel:
         # Specialized MMA warp
         #
         if warp_idx == self.mma_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_uniform_warps)
+            # cute.arch.warpgroup_reg_dealloc(self.num_regs_uniform_warps)
             #
             # Bar sync for retrieve tensor memory ptr from shared mem
             #
@@ -1500,7 +1532,7 @@ class BlockwiseGemmKernel:
         # Specialized acc update warps
         #
         if warp_idx <= self.acc_update_warp_id[-1]:
-            cute.arch.warpgroup_reg_alloc(self.num_regs_acc_update_warps)
+            # cute.arch.warpgroup_reg_alloc(self.num_regs_acc_update_warps)
             #
             # Bar sync for retrieve tensor memory ptr from shared memory
             #
@@ -1742,7 +1774,7 @@ class BlockwiseGemmKernel:
         # Specialized epilogue warps
         #
         if warp_idx <= self.epilog_warp_id[-1] and warp_idx >= self.epilog_warp_id[0]:
-            cute.arch.warpgroup_reg_alloc(self.num_regs_epilogue_warps)
+            # cute.arch.warpgroup_reg_alloc(self.num_regs_epilogue_warps)
             #
             # Alloc tensor memory buffer
             #
@@ -1946,8 +1978,26 @@ class BlockwiseGemmKernel:
                 epi_consumer_state.advance()
 
                 #
+                # Allreduce
+                #
+                if cutlass.const_expr(self.all_reduce == "two_shot"):
+                    tile_id = Int32(
+                        tile_sched._current_work_linear_idx
+                        * cute.size(self.cluster_shape_mn)
+                        + cute.arch.block_idx_in_cluster()
+                    )
+                    if warp_idx == self.epilog_warp_id[0]:
+                        cute.arch.cp_async_bulk_wait_group(0, read=False)
+                        # System barrier to make sure that data from each GPU is in memory before allreduce
+                        with cute.arch.elect_one():
+                            flag = barrier_flag_mc.iterator + tile_id
+                            cute.arch.fence_acq_rel_gpu()
+                            distributed_helpers.spin_lock_multimem_arrive(flag)
+                            cute.arch.fence_proxy(cute.arch.ProxyKind.alias)
+                #
                 # Advance to next tile
                 #
+                tile_sched.advance_to_next_work()
                 tile_info_pipeline.consumer_wait(tile_info_consumer_state)
                 for idx in cutlass.range(4, unroll_full=True):
                     tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
@@ -1981,6 +2031,167 @@ class BlockwiseGemmKernel:
             # Wait for C store complete
             #
             c_pipeline.producer_tail()
+        #
+        #  Allreduce warps
+        #
+        if cutlass.const_expr(self.all_reduce == "two_shot"):
+            if warp_idx >= self.all_reduce_warp_id[0]:
+                # cute.arch.warpgroup_reg_alloc(self.num_regs_acc_update_warps)
+                #
+                # Add persistent tile loop
+                #
+                rank_id = self.rank_id
+                num_ranks = Int32(self.num_ranks)
+                lane_id = cute.arch.lane_idx()  # noqa
+
+                tile_sched = utils.StaticPersistentTileScheduler.create(
+                    tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+                )
+                work_tile = tile_sched.initial_work_tile_info()
+
+                # get the first tile info
+                tile_info = cute.make_fragment(
+                    cute.make_layout((4,)).shape, cutlass.Int32
+                )
+                # Get tile coord from tile scheduler
+                cur_tile_coord = work_tile.tile_idx
+                # initialize the tile info
+                tile_info[0] = cur_tile_coord[0]
+                tile_info[1] = cur_tile_coord[1]
+                tile_info[2] = cur_tile_coord[2]
+                tile_info[3] = work_tile.is_valid_tile
+
+                is_valid_tile = cutlass.Boolean(1)
+                is_valid_tile = tile_info[3] == 1
+
+                num_prev_subtiles = cutlass.Int32(0)
+
+                # we want 128bit ld/st for better performance
+                atom_val = 128 // c_mc.element_type.width
+                atom_thr_n = self.mma_tiler[1] // atom_val
+                atom_thr_m = len(self.all_reduce_warp_id) * (
+                    cute.arch.WARP_SIZE // atom_thr_n
+                )
+                thr_layout = cute.make_layout(
+                    (atom_thr_m, atom_thr_n), stride=(atom_thr_n, 1)
+                )
+                val_layout = cute.make_layout((1, atom_val), stride=(atom_val, 1))
+
+                copy_atom_load = cute.make_copy_atom(
+                    cute.nvgpu.CopyUniversalOp(), c_mc.element_type
+                )
+                tiled_copy_fake = cute.make_tiled_copy_tv(
+                    copy_atom_load, thr_layout, val_layout
+                )
+                thr_copy_fake = tiled_copy_fake.get_slice(
+                    tidx - self.all_reduce_warp_id[0] * 32
+                )
+
+                while is_valid_tile:
+                    # cur_tile_coord = work_tile.tile_idx
+                    tile_id = Int32(
+                        tile_sched._current_work_linear_idx
+                        * cute.size(self.cluster_shape_mn)
+                        + cute.arch.block_idx_in_cluster()
+                    )
+                    mma_tile_coord_mnl = (
+                        tile_info[0] // cute.size(tiled_mma.thr_id.shape),
+                        tile_info[1],
+                        tile_info[2],
+                    )
+
+                    # System barrier to make sure that data from each GPU is in memory before allreduce
+                    if warp_idx == self.all_reduce_warp_id[0]:
+                        with cute.arch.elect_one():
+                            flag = barrier_flag.iterator + tile_id
+                            # TODO: we may use LDG+STG for spin lock instead of ATOMIC_CAS for better performance.
+                            distributed_helpers.spin_lock_wait(flag, num_ranks)
+
+                    cute.arch.barrier(
+                        barrier_id=self.all_reduce_sync_bar_id,
+                        number_of_threads=32 * len(self.all_reduce_warp_id),
+                    )
+                    # partition and slice at tile level
+                    gC_mc = cute.local_tile(
+                        c_mc,
+                        cute.slice_(self.mma_tiler, (None, None, 0)),
+                        (None, None, None),
+                    )
+                    tCgC_mc = thr_mma.partition_C(gC_mc)
+                    tCgC_mc_slice = tCgC_mc[((None, None), 0, 0, *mma_tile_coord_mnl)]
+
+                    # partition based on the number of GPUs
+                    cta_mma_tile_m = self.mma_tiler[0] // cute.size(
+                        tiled_mma.thr_id.shape
+                    )
+                    m_local_rank = int(cta_mma_tile_m / self.num_ranks)
+                    tCgC_mc_slice_partitioned = cute.zipped_divide(
+                        tCgC_mc_slice, (m_local_rank, self.mma_tiler[1])
+                    )
+                    tCgC_mc_local_rank = cute.slice_(
+                        tCgC_mc_slice_partitioned, ((None, None), (rank_id, 0))
+                    )
+
+                    # partition at thread level
+                    frgC_mc = thr_copy_fake.partition_S(tCgC_mc_local_rank)
+                    atom, loop_m, loop_n = frgC_mc.shape
+                    for i in cutlass.range_constexpr(loop_m):
+                        for j in cutlass.range_constexpr(loop_n):
+                            mc_ptr = frgC_mc[None, i, j].iterator
+                            x, y, z, w = 0, 0, 0, 0
+                            if cutlass.const_expr(self.c_dtype == Float16):
+                                x, y, z, w = (
+                                    distributed_helpers.multimem_ld_reduce_8xf16(mc_ptr)
+                                )
+                            elif cutlass.const_expr(self.c_dtype == Float32):
+                                x, y, z, w = (
+                                    distributed_helpers.multimem_ld_reduce_4xf32(mc_ptr)
+                                )
+                            elif cutlass.const_expr(self.c_dtype == BFloat16):
+                                x, y, z, w = (
+                                    distributed_helpers.multimem_ld_reduce_8xbf16(
+                                        mc_ptr
+                                    )
+                                )
+                            elif cutlass.const_expr(self.c_dtype == Float8E4M3FN):
+                                x, y, z, w = (
+                                    distributed_helpers.multimem_ld_reduce_16xe4m3(
+                                        mc_ptr
+                                    )
+                                )
+                            elif cutlass.const_expr(self.c_dtype == Float8E5M2):
+                                x, y, z, w = (
+                                    distributed_helpers.multimem_ld_reduce_16xe5m2(
+                                        mc_ptr
+                                    )
+                                )
+                            distributed_helpers.multimem_st_4xb32(mc_ptr, x, y, z, w)
+                    # Advance to next tile
+                    tile_sched.advance_to_next_work()
+                    work_tile = tile_sched.get_current_work()
+                    cur_tile_coord = work_tile.tile_idx
+                    # for idx in cutlass.range(4, unroll_full=True):
+                    # tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
+                    tile_info[0] = cur_tile_coord[0]
+                    tile_info[1] = cur_tile_coord[1]
+                    tile_info[2] = cur_tile_coord[2]
+                    tile_info[3] = work_tile.is_valid_tile
+                    is_valid_tile = tile_info[3] == 1
+                cute.arch.barrier(
+                    barrier_id=self.all_reduce_sync_bar_id,
+                    number_of_threads=32 * len(self.all_reduce_warp_id),
+                )
+                # System barrier to make sure all the peer memory transfers are completed.
+                last_flag_idx = cute.size(
+                    tile_sched.params.problem_layout_ncluster_mnl
+                ) * cute.size(self.cluster_shape_mn)
+                if warp_idx == self.all_reduce_warp_id[0]:
+                    with cute.arch.elect_one():
+                        distributed_helpers.sm_wise_inter_gpu_multimem_barrier(
+                            barrier_flag.iterator + last_flag_idx,
+                            barrier_flag_mc.iterator + last_flag_idx,
+                            self.num_ranks,
+                        )
 
     def acc_update_tmem_copy_and_partition(
         self,
@@ -2456,6 +2667,7 @@ class BlockwiseGemmKernel:
         ab_dtype: Type[cutlass.Numeric],
         acc_dtype: Type[cutlass.Numeric],
         c_dtype: Type[cutlass.Numeric],
+        all_reduce: str = "none",
     ) -> bool:
         """
         Check if the dtypes are valid
@@ -2479,6 +2691,19 @@ class BlockwiseGemmKernel:
         if acc_dtype not in {cutlass.Float32}:
             is_valid = False
         if c_dtype not in {cutlass.Float32, cutlass.Float16, cutlass.BFloat16}:
+            is_valid = False
+        # check if c_dtype is supported by multimem all-reduce
+        if cutlass.const_expr(
+            all_reduce != "none"
+            and c_dtype
+            not in {
+                cutlass.Float16,
+                cutlass.Float32,
+                cutlass.BFloat16,
+                cutlass.Float8E4M3FN,
+                cutlass.Float8E5M2,
+            }
+        ):
             is_valid = False
         return is_valid
 
@@ -2537,6 +2762,7 @@ class BlockwiseGemmKernel:
         a_major: str,
         b_major: str,
         c_major: str,
+        all_reduce: str = "none",
     ) -> bool:
         """
         Check if the tensor alignment is valid
@@ -2577,7 +2803,60 @@ class BlockwiseGemmKernel:
             or not check_contigous_16B_alignment(c_dtype, c_major == "m", (m, n, l))
         ):
             is_valid = False
+        if all_reduce != "none" and m % 128 != 0 and n % 128 != 0:
+            is_valid = False
         return is_valid
+
+    @staticmethod
+    def compute_barrier_flag_size(
+        m: int,
+        n: int,
+        l: int,
+        mma_tiler_mn: Tuple[int, int],
+        cluster_shape_mn: Tuple[int, int],
+        use_2cta_instrs: bool,
+        sm_count: int,
+    ) -> int:
+        """
+        Compute the required size for barrier flag tensors used in all-reduce synchronization.
+        The barrier flags are used for:
+        1. Per-tile synchronization during the all-reduce phase
+        2. Final inter-GPU synchronization barrier
+        :param m: Number of rows in the output matrix
+        :type m: int
+        :param n: Number of columns in the output matrix
+        :type n: int
+        :param l: Batch size
+        :type l: int
+        :param mma_tiler_mn: Shape of the MMA tiler (M, N)
+        :type mma_tiler_mn: Tuple[int, int]
+        :param cluster_shape_mn: Cluster dimensions (M, N)
+        :type cluster_shape_mn: Tuple[int, int]
+        :param sm_count: Number of SMs available
+        :type sm_count: int
+        :return: Total number of barrier flags needed
+        :rtype: int
+        """
+        # Calculate CTA tile shape accounting for 2-CTA instructions
+        cta_tile_shape_m = mma_tiler_mn[0] // (2 if use_2cta_instrs else 1)
+        cta_tile_shape_n = mma_tiler_mn[1]
+
+        # Calculate number of tiles per batch
+        num_tiles_m = (m + cta_tile_shape_m - 1) // cta_tile_shape_m
+        num_tiles_n = (n + cta_tile_shape_n - 1) // cta_tile_shape_n
+        num_tiles_per_batch = num_tiles_m * num_tiles_n
+
+        # Calculate number of clusters per batch
+        cluster_size = cluster_shape_mn[0] * cluster_shape_mn[1]
+        num_ctas_per_tile = cluster_size
+
+        # Total tiles across all batches and clusters
+        num_tiles = num_tiles_per_batch * l * num_ctas_per_tile
+
+        # Add extra space for final barrier (one per SM)
+        total_barrier_size = num_tiles + sm_count
+
+        return total_barrier_size
 
     @staticmethod
     def can_implement(
@@ -2594,6 +2873,8 @@ class BlockwiseGemmKernel:
         a_major: str,
         b_major: str,
         c_major: str,
+        all_reduce: str = "none",
+        process_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> bool:
         """
         Check if the gemm can be implemented
@@ -2624,13 +2905,17 @@ class BlockwiseGemmKernel:
         :type b_major: str
         :param c_major: The major axis of the C tensor
         :type c_major: str
+        :param all_reduce: All-reduce mode, can be "none", "two_shot"
+        :type all_reduce: str
 
         :return: True if the gemm can be implemented, False otherwise
         :rtype: bool
         """
         can_implement = True
         # Skip unsupported types
-        if not BlockwiseGemmKernel.is_valid_dtypes(ab_dtype, acc_dtype, c_dtype):
+        if not BlockwiseGemmKernel.is_valid_dtypes(
+            ab_dtype, acc_dtype, c_dtype, all_reduce
+        ):
             can_implement = False
         # Skip invalid mma tile shape and cluster shape
         if not BlockwiseGemmKernel.is_valid_mma_tiler_and_cluster_shape(
@@ -2639,12 +2924,17 @@ class BlockwiseGemmKernel:
             can_implement = False
         # Skip illegal problem shape for load/store alignment
         if not BlockwiseGemmKernel.is_valid_tensor_alignment(
-            m, n, k, l, ab_dtype, c_dtype, a_major, b_major, c_major
+            m, n, k, l, ab_dtype, c_dtype, a_major, b_major, c_major, all_reduce
         ):
             can_implement = False
         # Skip unsupported A/B layout
         if not (a_major == "k" and b_major == "k"):
             can_implement = False
+        # Check for all reduce constraints
+        if all_reduce != "none":
+            # TODO: expand the logic for mnnvl support
+            if torch.distributed.get_world_size(process_group) not in [2, 4, 8]:
+                can_implement = False
         return can_implement
 
 
@@ -2667,6 +2957,8 @@ class BlockwiseGemmCuteDSL:
         cluster_shape_mn: Tuple[int, int],
         sm_count: int,
         sm_version: str,
+        all_reduce: str = "none",
+        process_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         self._m = m
         self._n = n
@@ -2682,6 +2974,8 @@ class BlockwiseGemmCuteDSL:
         self._use_2cta_instrs = use_2cta_instrs
         self._mma_tiler_mn = mma_tiler_mn
         self._cluster_shape_mn = cluster_shape_mn
+        self._all_reduce = all_reduce
+        self._process_group = process_group
 
         if not BlockwiseGemmKernel.can_implement(
             ab_dtype,
@@ -2697,9 +2991,11 @@ class BlockwiseGemmCuteDSL:
             a_major,
             b_major,
             c_major,
+            all_reduce,
+            process_group,
         ):
             raise TypeError(
-                f"Unsupported testcase {ab_dtype}, {acc_dtype}, {c_dtype}, {use_2cta_instrs}, {mma_tiler_mn}, {cluster_shape_mn}, {m}, {n}, {k}, {l}, {a_major}, {b_major}, {c_major}"
+                f"Unsupported testcase {ab_dtype}, {acc_dtype}, {c_dtype}, {use_2cta_instrs}, {mma_tiler_mn}, {cluster_shape_mn}, {m}, {n}, {k}, {l}, {a_major}, {b_major}, {c_major}, {all_reduce}"
             )
 
         hardware_info = cutlass.utils.HardwareInfo()
@@ -2719,8 +3015,23 @@ class BlockwiseGemmCuteDSL:
         sfa_ptr: cute.Pointer,
         sfb_ptr: cute.Pointer,
         c_ptr: cute.Pointer,
+        c_mc_ptr: Optional[cute.Pointer],
+        barrier_flag_ptr: Optional[cute.Pointer],
+        barrier_flag_mc_ptr: Optional[cute.Pointer],
         current_stream: cuda.CUstream,
     ):
+        if cutlass.const_expr(self._all_reduce != "none"):
+            barrier_flag_size = BlockwiseGemmKernel.compute_barrier_flag_size(
+                self._m,
+                self._n,
+                self._l,
+                self._mma_tiler_mn,
+                self._cluster_shape_mn,
+                self._use_2cta_instrs,
+                self._max_active_clusters,
+            )
+        else:
+            barrier_flag_size = 1  # Dummy size when not used
         a_tensor = cute.make_tensor(
             a_ptr,
             layout=cute.make_ordered_layout(
@@ -2756,12 +3067,40 @@ class BlockwiseGemmCuteDSL:
                 order=(1, 0, 2),
             ),
         )
+        c_mc_tensor = (
+            cute.make_tensor(
+                c_mc_ptr,
+                layout=cute.make_ordered_layout(
+                    (self._m, self._n, self._l),
+                    order=(0, 1, 2) if self._c_major == "m" else (1, 0, 2),
+                ),
+            )
+            if c_mc_ptr is not None
+            else None
+        )
+        barrier_flag_tensor = (
+            cute.make_tensor(
+                barrier_flag_ptr,
+                layout=cute.make_ordered_layout((barrier_flag_size,), order=(0,)),
+            )
+            if barrier_flag_ptr is not None
+            else None
+        )
+        barrier_flag_mc_tensor = (
+            cute.make_tensor(
+                barrier_flag_mc_ptr,
+                layout=cute.make_ordered_layout((barrier_flag_size,), order=(0,)),
+            )
+            if barrier_flag_mc_ptr is not None
+            else None
+        )
 
         BlockwiseGemmKernel(
             acc_dtype=self._acc_dtype,
             use_2cta_instrs=self._use_2cta_instrs,
             mma_tiler_mn=self._mma_tiler_mn,
             cluster_shape_mn=self._cluster_shape_mn,
+            all_reduce=self._all_reduce,
         )(
             a_tensor,
             b_tensor,
@@ -2770,6 +3109,10 @@ class BlockwiseGemmCuteDSL:
             sfb_tensor,
             self._max_active_clusters,
             current_stream,
+            lambda x: x,
+            c_mc_tensor,
+            barrier_flag_tensor,
+            barrier_flag_mc_tensor,
         )
 
 
@@ -2791,6 +3134,8 @@ def get_cute_dsl_compiled_blockwise_gemm_kernel(
     cluster_shape_mn: Tuple[int, int],
     sm_count: int,
     sm_version: str,
+    all_reduce: str = "none",
+    process_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> Callable:
     def get_cute_pointers(
         input_tensors: Optional[List[torch.tensor]],
@@ -2802,7 +3147,14 @@ def get_cute_dsl_compiled_blockwise_gemm_kernel(
                 sfa_data_ptr,
                 sfb_data_ptr,
                 c_data_ptr,
-            ) = [16 for _ in range(5)]
+                c_mc_data_ptr,
+                barrier_flag_data_ptr,
+                barrier_flag_mc_data_ptr,
+            ) = [16 for _ in range(8)]
+            if all_reduce == "none":
+                c_mc_data_ptr = None
+                barrier_flag_data_ptr = None
+                barrier_flag_mc_data_ptr = None
         else:
             (
                 a_tensor_gpu,
@@ -2810,6 +3162,9 @@ def get_cute_dsl_compiled_blockwise_gemm_kernel(
                 sfa_tensor_gpu,
                 sfb_tensor_gpu,
                 c_tensor_gpu,
+                c_mc_gpu,
+                barrier_flag_gpu,
+                barrier_flag_mc_gpu,
             ) = input_tensors
 
             (
@@ -2818,12 +3173,20 @@ def get_cute_dsl_compiled_blockwise_gemm_kernel(
                 sfa_data_ptr,
                 sfb_data_ptr,
                 c_data_ptr,
+                c_mc_data_ptr,
+                barrier_flag_data_ptr,
+                barrier_flag_mc_data_ptr,
             ) = (
                 a_tensor_gpu.data_ptr(),
                 b_tensor_gpu.data_ptr(),
                 sfa_tensor_gpu.data_ptr(),
                 sfb_tensor_gpu.data_ptr(),
                 c_tensor_gpu.data_ptr(),
+                c_mc_gpu.data_ptr() if c_mc_gpu is not None else None,
+                barrier_flag_gpu.data_ptr() if barrier_flag_gpu is not None else None,
+                barrier_flag_mc_gpu.data_ptr()
+                if barrier_flag_mc_gpu is not None
+                else None,
             )
 
         a_ptr = make_ptr(
@@ -2856,7 +3219,46 @@ def get_cute_dsl_compiled_blockwise_gemm_kernel(
             cute.AddressSpace.gmem,
             assumed_align=16,
         )
-        return [a_ptr, b_ptr, sfa_ptr, sfb_ptr, c_ptr]
+        c_mc_ptr = (
+            make_ptr(
+                c_dtype,
+                c_mc_data_ptr,
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            if c_mc_data_ptr is not None
+            else None
+        )
+        barrier_flag_ptr = (
+            make_ptr(
+                cutlass.Int32,
+                barrier_flag_data_ptr,
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            if barrier_flag_data_ptr is not None
+            else None
+        )
+        barrier_flag_mc_ptr = (
+            make_ptr(
+                cutlass.Int32,
+                barrier_flag_mc_data_ptr,
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            if barrier_flag_mc_data_ptr is not None
+            else None
+        )
+        return [
+            a_ptr,
+            b_ptr,
+            sfa_ptr,
+            sfb_ptr,
+            c_ptr,
+            c_mc_ptr,
+            barrier_flag_ptr,
+            barrier_flag_mc_ptr,
+        ]
 
     kernel = cute.compile(
         BlockwiseGemmCuteDSL(
@@ -2876,6 +3278,8 @@ def get_cute_dsl_compiled_blockwise_gemm_kernel(
             cluster_shape_mn=cluster_shape_mn,
             sm_count=sm_count,
             sm_version=sm_version,
+            all_reduce=all_reduce,
+            process_group=process_group,
         ),
         *get_cute_pointers(None),
         cutlass_torch.current_stream(),
@@ -2887,6 +3291,12 @@ def get_cute_dsl_compiled_blockwise_gemm_kernel(
         sfa_tensor_gpu: torch.Tensor,
         sfb_tensor_gpu: torch.Tensor,
         c_tensor_gpu: Optional[torch.Tensor] = None,
+        c_mc_gpu: Optional[Tensor] = None,
+        c_mc_torch: Optional[torch.Tensor] = None,
+        barrier_flag_gpu: Optional[Tensor] = None,
+        barrier_flag_torch: Optional[torch.Tensor] = None,
+        barrier_flag_mc_gpu: Optional[Tensor] = None,
+        barrier_flag_mc_torch: Optional[torch.Tensor] = None,
     ):
         if c_tensor_gpu is None:
             c_tensor_gpu = torch.empty(
@@ -2906,6 +3316,9 @@ def get_cute_dsl_compiled_blockwise_gemm_kernel(
                     sfa_tensor_gpu,
                     sfb_tensor_gpu,
                     c_tensor_gpu,
+                    c_mc_torch,
+                    barrier_flag_torch,
+                    barrier_flag_mc_torch,
                 ]
             ),
             current_stream,
@@ -2927,6 +3340,14 @@ def blockwise_gemm(
     c_dtype: str,
     acc_dtype: str,
     sm_count: Optional[int] = None,
+    all_reduce: str = "none",
+    out_mc: Optional[Tensor] = None,
+    out_mc_torch: Optional[torch.Tensor] = None,
+    barrier_flag: Optional[Tensor] = None,
+    barrier_flag_mc: Optional[Tensor] = None,
+    barrier_flag_torch: Optional[torch.Tensor] = None,
+    barrier_flag_mc_torch: Optional[torch.Tensor] = None,
+    process_group: Optional[torch.distributed.ProcessGroup] = None,
     **kwargs,
 ):
     m, k, l = a_torch.shape
@@ -2960,10 +3381,18 @@ def blockwise_gemm(
         cluster_shape_mn=cluster_shape_mn,
         sm_count=sm_count,
         sm_version=f"sm_{major}{minor}",
+        all_reduce=all_reduce,
+        process_group=process_group,
     )(
         a_tensor_gpu=a_torch,
         b_tensor_gpu=b_torch,
         sfa_tensor_gpu=sfa_torch,
         sfb_tensor_gpu=sfb_torch,
         c_tensor_gpu=c_torch,
+        c_mc_gpu=out_mc,
+        c_mc_torch=out_mc_torch,
+        barrier_flag_gpu=barrier_flag,
+        barrier_flag_torch=barrier_flag_torch,
+        barrier_flag_mc_gpu=barrier_flag_mc,
+        barrier_flag_mc_torch=barrier_flag_mc_torch,
     )
