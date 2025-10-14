@@ -262,9 +262,8 @@ def gen_jit_spec(
     check_cuda_arch()
     verbose = os.environ.get("FLASHINFER_JIT_VERBOSE", "0") == "1"
 
-    cflags = ["-O3", "-std=c++17", "-Wno-switch-bool"]
+    cflags = ["-std=c++17", "-Wno-switch-bool"]
     cuda_cflags = [
-        "-O3",
         "-std=c++17",
         f"--threads={os.environ.get('FLASHINFER_NVCC_THREADS', '1')}",
         "-use_fast_math",
@@ -274,8 +273,11 @@ def gen_jit_spec(
         "-DFLASHINFER_ENABLE_FP8_E5M2",
     ]
     if verbose:
+        cflags += ["-O0", "-g"]
         cuda_cflags += [
             "-g",
+            "-O0",
+            "-G",
             "-lineinfo",
             "--ptxas-options=-v",
             "--ptxas-options=--verbose,--register-usage-level=10,--warn-on-local-memory-usage",
@@ -283,7 +285,8 @@ def gen_jit_spec(
         ]
     else:
         # non debug mode
-        cuda_cflags += ["-DNDEBUG"]
+        cuda_cflags += ["-DNDEBUG", "-O3"]
+        cflags += ["-O3"]
 
     # useful for ncu
     if bool(os.environ.get("FLASHINFER_JIT_LINEINFO", "0")):
