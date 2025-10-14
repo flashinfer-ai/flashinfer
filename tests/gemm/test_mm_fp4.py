@@ -9,6 +9,7 @@ from flashinfer import (
     mxfp4_quantize,
 )
 from flashinfer.utils import get_compute_capability, LibraryError
+from flashinfer.gemm import CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR
 
 
 # TODO: Consdier splitting this function up for the various backends
@@ -92,14 +93,8 @@ def test_mm_fp4(
         assert cos_sim > 0.97
     except LibraryError as e:
         # TODO: Remove this check once cuDNN backend version is updated to 9.14.0
-        if (
-            backend == "cudnn"
-            and not use_nvfp4
-            and (compute_capability[0] == 12 and compute_capability[1] == 0)
-        ):
-            pytest.xfail(
-                "cudnn FP4 GEMM with mxfp4 quantization is not supported on SM120 with cuDNN backend version < 9.14.0."
-            )
+        if str(e) == CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR:
+            pytest.xfail(str(e))
         else:
             pytest.fail(str(e))
 

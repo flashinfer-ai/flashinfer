@@ -83,6 +83,9 @@ from .utils import (
 
 DEFAULT_WORKSPACE_SIZE = 32 * 1024 * 1024
 
+# Error messages
+CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR = "cudnn FP4 GEMM with mxfp4 quantization is not supported on SM120 with cuDNN backend version < 9.14.0."
+
 
 def _match_sm_version(device: torch.device, sm_version: list[str]):
     major, minor = get_compute_capability(device)
@@ -1766,9 +1769,7 @@ def _cudnn_gemm_fp4_requirement(
         and _match_sm_version(a.device, ["120"])
         and cudnn.backend_version() < 91400
     ):
-        raise LibraryError(
-            "cudnn FP4 GEMM with mxfp4 quantization is not supported on SM120 with cuDNN backend version < 9.14.0."
-        )
+        raise LibraryError(CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR)
 
     _check_cudnn_fp4_availability()
 
