@@ -441,7 +441,7 @@ def test_generalized_rope_quantize(
     k_nope_out = k_out[..., rope_dim:]
 
     # Call the generalized function
-    flashinfer.rope.mla_rope_quantize_fp8(
+    flashinfer.rope.rope_quantize_fp8(
         q_rope_in,
         k_rope_in,
         q_nope_in,

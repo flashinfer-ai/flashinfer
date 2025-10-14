@@ -164,10 +164,10 @@ def _fake_apply_rope_pos_ids(
 
 
 @register_custom_op(
-    "flashinfer::mla_rope_quantize",
+    "flashinfer::rope_quantize",
     mutates_args=("q_rope_out", "k_rope_out", "q_nope_out", "k_nope_out"),
 )
-def _mla_rope_quantize(  # kahyun
+def _rope_quantize(
     q_rope_in: torch.Tensor,
     k_rope_in: torch.Tensor,
     q_nope_in: torch.Tensor,
@@ -182,7 +182,7 @@ def _mla_rope_quantize(  # kahyun
     quant_scale_kv: float,
     interleave: bool,
 ) -> None:
-    get_rope_module().mla_rope_quantize(
+    get_rope_module().rope_quantize(
         q_rope_in,
         k_rope_in,
         q_nope_in,
@@ -199,8 +199,8 @@ def _mla_rope_quantize(  # kahyun
     )
 
 
-@register_fake_op("flashinfer::mla_rope_quantize")
-def _fake_mla_rope_quantize(
+@register_fake_op("flashinfer::rope_quantize")
+def _fake_rope_quantize(
     q_rope_in: torch.Tensor,
     k_rope_in: torch.Tensor,
     q_nope_in: torch.Tensor,
@@ -1139,7 +1139,7 @@ def apply_rope_with_cos_sin_cache_inplace(
     )
 
 
-def mla_rope_quantize_fp8(  # kahyun
+def rope_quantize_fp8(
     q_rope: torch.Tensor,
     k_rope: torch.Tensor,
     q_nope: torch.Tensor,
@@ -1189,7 +1189,7 @@ def mla_rope_quantize_fp8(  # kahyun
         else torch.empty_like(k_nope, dtype=quantize_dtype)
     )
 
-    _mla_rope_quantize(
+    _rope_quantize(
         q_rope,
         k_rope,
         q_nope,

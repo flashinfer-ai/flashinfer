@@ -154,7 +154,7 @@ def benchmark_config(config_name, num_tokens):
         if mode_ncu and run_idx == 20:
             torch.cuda.cudart().cudaProfilerStart()
 
-        flashinfer.rope.mla_rope_quantize_fp8(
+        flashinfer.rope.rope_quantize_fp8(
             q_rope=q_rope,
             k_rope=k_rope,
             q_nope=q_nope,

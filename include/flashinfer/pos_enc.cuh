@@ -344,7 +344,7 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheKernel(
 
 template <bool interleave, uint32_t vec_size, uint32_t bdx, typename DType, typename IdType,
           typename QuantType>
-__global__ void MLARopeQuantizeKernel(
+__global__ void RopeQuantizeKernel(
     DType* q_rope_in, DType* k_rope_in, DType* q_nope_in, DType* k_nope_in, QuantType* q_rope_out,
     QuantType* k_rope_out, QuantType* q_nope_out, QuantType* k_nope_out,
     float* __restrict__ cos_sin_cache, IdType* __restrict__ pos_ids, uint32_t nnz,
@@ -375,13 +375,19 @@ __global__ void MLARopeQuantizeKernel(
 
     const int half_rope_dim = rope_dim / 2;
     // Load cos/sin for RoPE processing blocks only
+    // 1. if interleave:
+    //  - cos = cos_sin_cache[pos_id][tx * vec_size // 2]
+    //  - sin = cos_sin_cache[pos_id][(rot_dim // 2) + tx * vec_size // 2]
+    // 2. if not interleave
+    //  - cos = cos_cache[pos_id][(tx * vec_size) % (rot_dim // 2)]
+    //  - sin = sin_cache[pos_id][(rot_dim // 2) + (tx * vec_size) % (rot_dim // 2)]
     if ((tx * vec_size < rope_dim) and (by < k_rope_end)) {
       int sin_offset = rope_dim / 2;
       int vec_idx;
       if constexpr (interleave) {
         vec_idx = (tx * vec_size) / 2;  // Force integer division
       } else {
-        vec_idx = (tx * vec_size) % half_rope_dim;
+        vec_idx = (tx * vec_size) % half_rope_dim;  // Use half_rotary_dim
       }
       cos.load(cos_sin_cache + (pos * rope_dim) + vec_idx);
       sin.load(cos_sin_cache + (pos * rope_dim) + (sin_offset + vec_idx));
@@ -734,29 +740,28 @@ __global__ void BatchQKApplyRotaryKernel(
     FLASHINFER_ERROR("Unsupported rope_dim. Supported values: 16, 32, 64, 128, 256"); \
   }
 
-// Removed problematic macro - using explicit dispatch instead
-
 template <typename DType, typename IdType, typename QuantType>
-cudaError_t MLARopeQuantize(
-    DType* q_rope_in, DType* k_rope_in, DType* q_nope_in, DType* k_nope_in, QuantType* q_rope_out,
-    QuantType* k_rope_out, QuantType* q_nope_out, QuantType* k_nope_out, float* cos_sin_cache,
-    IdType* pos_ids, uint32_t nnz, uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t rope_dim,
-    uint32_t no_rope_dim, size_t q_rope_in_stride_n, size_t q_rope_in_stride_h,
-    size_t q_nope_in_stride_n, size_t q_nope_in_stride_h, size_t q_rope_out_stride_n,
-    size_t q_rope_out_stride_h, size_t q_nope_out_stride_n, size_t q_nope_out_stride_h,
-    size_t k_rope_in_stride, size_t k_rope_in_stride_h, size_t k_nope_in_stride,
-    size_t k_nope_in_stride_h, size_t k_rope_out_stride, size_t k_rope_out_stride_h,
-    size_t k_nope_out_stride, size_t k_nope_out_stride_h, float quant_scale_q, float quant_scale_kv,
-    bool interleave, cudaStream_t stream = nullptr) {  // generalized host-side caller
+cudaError_t RopeQuantize(DType* q_rope_in, DType* k_rope_in, DType* q_nope_in, DType* k_nope_in,
+                         QuantType* q_rope_out, QuantType* k_rope_out, QuantType* q_nope_out,
+                         QuantType* k_nope_out, float* cos_sin_cache, IdType* pos_ids, uint32_t nnz,
+                         uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t rope_dim,
+                         uint32_t no_rope_dim, size_t q_rope_in_stride_n, size_t q_rope_in_stride_h,
+                         size_t q_nope_in_stride_n, size_t q_nope_in_stride_h,
+                         size_t q_rope_out_stride_n, size_t q_rope_out_stride_h,
+                         size_t q_nope_out_stride_n, size_t q_nope_out_stride_h,
+                         size_t k_rope_in_stride, size_t k_rope_in_stride_h,
+                         size_t k_nope_in_stride, size_t k_nope_in_stride_h,
+                         size_t k_rope_out_stride, size_t k_rope_out_stride_h,
+                         size_t k_nope_out_stride, size_t k_nope_out_stride_h, float quant_scale_q,
+                         float quant_scale_kv, bool interleave, cudaStream_t stream = nullptr) {
   int dev_id = 0;
   int num_sms = 0;
   FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
   FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev_id));
 
-  // Dispatch rope_dim first, then interleave to avoid macro expansion issues
   constexpr uint32_t vec_size = 32 / sizeof(DType);
 
-  // Use nested macros for runtime->compile-time dispatch
+  // Use nested macros for runtime->compile-time dispatch for required constexpr values
   DISPATCH_ROPE_DIM(rope_dim, vec_size, {
     DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
       uint32_t num_threads = 128U;
@@ -800,7 +805,7 @@ cudaError_t MLARopeQuantize(
                       (void*)&k_nope_out_stride_h,
                       (void*)&quant_scale_q,
                       (void*)&quant_scale_kv};
-      auto kernel = MLARopeQuantizeKernel<INTERLEAVE, vec_size, bdx, DType, IdType, QuantType>;
+      auto kernel = RopeQuantizeKernel<INTERLEAVE, vec_size, bdx, DType, IdType, QuantType>;
       dim3 nblks(nblks_x, total_blocks_y);
       dim3 nthrs(bdx, bdy);
       FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
