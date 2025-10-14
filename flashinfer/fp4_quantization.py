@@ -420,7 +420,7 @@ def get_fp4_quantization_module(backend: str = "100"):
         output_scales = torch.empty(
             l, padded_m, padded_k_int32, device=device, dtype=torch.int32
         )
-     
+
         module.silu_and_mul_scaled_nvfp4_experts_quantize(
             output.view(l * m, k // 2),
             output_scales.view(l * padded_m, padded_k_int32),
@@ -434,8 +434,7 @@ def get_fp4_quantization_module(backend: str = "100"):
             l, padded_m // 128, padded_k // 4, 32, 4, 4
         )
         output_scales = output_scales.permute(3, 4, 1, 5, 2, 0)
-        return output, output_scales        
-
+        return output, output_scales
 
     @register_fake_op("flashinfer::silu_and_mul_scaled_nvfp4_experts_quantize_sm100")
     def _fake_silu_and_mul_scaled_nvfp4_experts_quantize_sm100(
@@ -467,7 +466,7 @@ def get_fp4_quantization_module(backend: str = "100"):
     @register_custom_op(
         "flashinfer::scaled_fp4_grouped_quant_sm100",
         mutates_args=("",),
-    )    
+    )
     def scaled_fp4_grouped_quant_sm100(
         input_tensor: torch.Tensor,
         input_global_scale: torch.Tensor,
@@ -552,7 +551,6 @@ def get_fp4_quantization_module(backend: str = "100"):
         )
         output_scales = output_scales.permute(3, 4, 1, 5, 2, 0)
         return output, output_scales
-
 
     @register_custom_op(
         "flashinfer::e2m1_and_ufp8sf_scale_to_float_sm100",

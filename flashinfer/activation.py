@@ -20,10 +20,15 @@ from typing import Optional
 
 import torch
 
-from .jit import JitSpec
 from .jit import gen_act_and_mul_module
-from .utils import device_support_pdl, register_custom_op, register_fake_op, get_compute_capability
+from .utils import (
+    device_support_pdl,
+    register_custom_op,
+    register_fake_op,
+    get_compute_capability,
+)
 from .fp4_quantization import get_fp4_quantization_module
+
 
 @functools.cache
 def get_act_and_mul_module(act_func_name: str):
@@ -183,6 +188,7 @@ def gelu_and_mul(
         )
     get_act_and_mul_module("gelu").gelu_and_mul(out, input, enable_pdl)
     return out
+
 
 def silu_and_mul_scaled_nvfp4_experts_quantize(
     a,

@@ -50,7 +50,8 @@ __device__ uint32_t cvt_warp_fp16_to_fp4(PackedVec<Type>& vec, float SFScaleVal,
   // Recipe: final_scale = reciprocal(fp32(fp8(SFValue * SFScaleVal))) *
   //                       reciprocal(SFScaleVal))
   float outputScale =
-      SFValue != 0 ? reciprocal_approximate_ftz(SFValue * reciprocal_approximate_ftz(SFScaleVal)) : 0.0f;
+      SFValue != 0 ? reciprocal_approximate_ftz(SFValue * reciprocal_approximate_ftz(SFScaleVal))
+                   : 0.0f;
 
   if (SFout) {
     // Write the SF to global memory (STG.8).
@@ -81,9 +82,7 @@ __device__ uint32_t cvt_warp_fp16_to_fp4(PackedVec<Type>& vec, float SFScaleVal,
 #endif
 }
 
-__device__ __forceinline__ float silu(const float& val) {
-  return val / (1.0f + __expf(-val));
-}
+__device__ __forceinline__ float silu(const float& val) { return val / (1.0f + __expf(-val)); }
 
 template <class Type>
 inline __device__ void silu_and_mul(PackedVec<Type>& x_vec, const PackedVec<Type>& y_vec) {
@@ -116,21 +115,14 @@ __launch_bounds__(512, 4) cvt_fp16_to_fp4(
 #else
 cvt_fp16_to_fp4(
 #endif
-    int32_t numRows,
-    int32_t numCols,
-    Type const* in,
-    float const* SFScale,
-    uint32_t* out,
-    uint32_t* SFout,
-    uint32_t* input_offset_by_experts,
-    uint32_t* output_scale_offset_by_experts,
-    int32_t* mask,
-    int n_experts,
-    bool low_latency) {
+    int32_t numRows, int32_t numCols, Type const* in, float const* SFScale, uint32_t* out,
+    uint32_t* SFout, uint32_t* input_offset_by_experts, uint32_t* output_scale_offset_by_experts,
+    int32_t* mask, int n_experts, bool low_latency) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   using PackedVec = PackedVec<Type>;
   static constexpr int CVT_FP4_NUM_THREADS_PER_SF = (CVT_FP4_SF_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD);
-  static_assert(sizeof(PackedVec) == sizeof(Type) * CVT_FP4_ELTS_PER_THREAD, "Vec size is not matched.");
+  static_assert(sizeof(PackedVec) == sizeof(Type) * CVT_FP4_ELTS_PER_THREAD,
+                "Vec size is not matched.");
 
   // Input tensor row/col loops.
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -233,19 +225,13 @@ __launch_bounds__(512, 4) cvt_fp16_to_fp4_expert(
 #else
 cvt_fp16_to_fp4_expert(
 #endif
-    int32_t numRows,
-    int32_t numCols,
-    Type const* in,
-    float const* SFScale,
-    uint32_t* out,
-    uint32_t* SFout,
-    int32_t* mask,
-    bool use_silu_and_mul,
-    int n_experts) {
+    int32_t numRows, int32_t numCols, Type const* in, float const* SFScale, uint32_t* out,
+    uint32_t* SFout, int32_t* mask, bool use_silu_and_mul, int n_experts) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   using PackedVec = PackedVec<Type>;
   static constexpr int CVT_FP4_NUM_THREADS_PER_SF = (CVT_FP4_SF_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD);
-  static_assert(sizeof(PackedVec) == sizeof(Type) * CVT_FP4_ELTS_PER_THREAD, "Vec size is not matched.");
+  static_assert(sizeof(PackedVec) == sizeof(Type) * CVT_FP4_ELTS_PER_THREAD,
+                "Vec size is not matched.");
 
   // Input tensor row/col loops.
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -281,8 +267,8 @@ cvt_fp16_to_fp4_expert(
   int actualColsPerRow = use_silu_and_mul ? colsPerRow * 2 : colsPerRow;
 
   // Each global thread processes one element
-  for (int globalIdx = tid_in_expert + expert_idx * m * colsPerRow; globalIdx < (expert_idx + 1) * m * colsPerRow;
-       globalIdx += actual_stride) {
+  for (int globalIdx = tid_in_expert + expert_idx * m * colsPerRow;
+       globalIdx < (expert_idx + 1) * m * colsPerRow; globalIdx += actual_stride) {
     // Calculate which row and column this global thread should process
     int rowIdx = globalIdx / colsPerRow;
     int colIdx = globalIdx % colsPerRow;
@@ -347,9 +333,10 @@ cvt_fp16_to_fp4_expert(
 //     int n_experts) {
 // #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 //   using PackedVec = PackedVec<Type>;
-//   static constexpr int CVT_FP4_NUM_THREADS_PER_SF = (CVT_FP4_SF_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD);
-//   static_assert(sizeof(PackedVec) == sizeof(Type) * CVT_FP4_ELTS_PER_THREAD, "Vec size is not matched.");
-//   extern __shared__ uint32_t shared_input_offsets[];
+//   static constexpr int CVT_FP4_NUM_THREADS_PER_SF = (CVT_FP4_SF_VEC_SIZE /
+//   CVT_FP4_ELTS_PER_THREAD); static_assert(sizeof(PackedVec) == sizeof(Type) *
+//   CVT_FP4_ELTS_PER_THREAD, "Vec size is not matched."); extern __shared__ uint32_t
+//   shared_input_offsets[];
 
 //   // Load input offsets into shared memory.
 //   // If n_experts is larger than 4, use vectorized int4 to save instructions.
@@ -360,7 +347,8 @@ cvt_fp16_to_fp4_expert(
 //     }
 //   } else {
 //     for (int i = threadIdx.x * 4; i < n_experts; i += blockDim.x * 4) {
-//       *reinterpret_cast<int4*>(&shared_input_offsets[i]) = *reinterpret_cast<const int4*>(&input_offset_by_experts[i]);
+//       *reinterpret_cast<int4*>(&shared_input_offsets[i]) = *reinterpret_cast<const
+//       int4*>(&input_offset_by_experts[i]);
 //     }
 //     if (threadIdx.x == 0) {
 //       shared_input_offsets[n_experts] = input_offset_by_experts[n_experts];
@@ -375,7 +363,8 @@ cvt_fp16_to_fp4_expert(
 //   int actualColsPerRow = use_mask ? colsPerRow * 2 : colsPerRow;
 
 //   // Each global thread processes one element
-//   for (int globalIdx = tid; globalIdx < numRows * colsPerRow; globalIdx += gridDim.x * blockDim.x) {
+//   for (int globalIdx = tid; globalIdx < numRows * colsPerRow; globalIdx += gridDim.x *
+//   blockDim.x) {
 //     // Calculate which row and column this global thread should process
 //     int rowIdx = globalIdx / colsPerRow;
 //     int colIdx = globalIdx % colsPerRow;
@@ -424,7 +413,8 @@ cvt_fp16_to_fp4_expert(
 //     int factor = CVT_FP4_SF_VEC_SIZE * 4;
 //     int32_t numCols_padded = (numCols + factor - 1) / factor * factor;
 //     int numCols_SFout = numCols_padded / CVT_FP4_SF_VEC_SIZE / 4;
-//     uint32_t* SFout_in_expert = SFout + output_scale_offset_by_experts[expert_idx] * numCols_SFout;
+//     uint32_t* SFout_in_expert = SFout + output_scale_offset_by_experts[expert_idx] *
+//     numCols_SFout;
 
 //     auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, CVT_FP4_NUM_THREADS_PER_SF>(
 //         rowIdx_in_expert, colIdx, numCols, SFout_in_expert);
@@ -461,14 +451,16 @@ constexpr auto UINT8 = at::ScalarType::Byte;
 //     torch::Tensor const& input_offset_by_experts,
 //     torch::Tensor const& output_scale_offset_by_experts) {
 //   auto sm_version = getSMVersion();
-//   TORCH_CHECK(sm_version == 100 || sm_version == 103, "fp4_quant is only supported on sm100a/sm103a");
+//   TORCH_CHECK(sm_version == 100 || sm_version == 103, "fp4_quant is only supported on
+//   sm100a/sm103a");
 
 //   CHECK_INPUT(output, "output must be a CUDA tensor");
 //   CHECK_INPUT(output_scale, "output_scale must be a CUDA tensor");
 //   CHECK_INPUT(input, "input must be a CUDA tensor");
 //   CHECK_INPUT(input_global_scale, "input_global_scale must be a CUDA tensor");
 //   CHECK_INPUT(input_offset_by_experts, "input_offset_by_experts must be a CUDA tensor");
-//   CHECK_INPUT(output_scale_offset_by_experts, "output_scale_offset_by_experts must be a CUDA tensor");
+//   CHECK_INPUT(output_scale_offset_by_experts, "output_scale_offset_by_experts must be a CUDA
+//   tensor");
 
 //   TORCH_CHECK(output.dim() == 2);
 //   TORCH_CHECK(output_scale.dim() == 2);
@@ -545,7 +537,8 @@ constexpr auto UINT8 = at::ScalarType::Byte;
 //     torch::Tensor const& mask,
 //     bool use_silu_and_mul) {
 //   auto sm_version = getSMVersion();
-//   TORCH_CHECK(sm_version == 100 || sm_version == 103, "fp4_quant is only supported on sm100a/sm103a");
+//   TORCH_CHECK(sm_version == 100 || sm_version == 103, "fp4_quant is only supported on
+//   sm100a/sm103a");
 
 //   CHECK_INPUT(output, "output must be a CUDA tensor");
 //   CHECK_INPUT(output_scale, "output_scale must be a CUDA tensor");

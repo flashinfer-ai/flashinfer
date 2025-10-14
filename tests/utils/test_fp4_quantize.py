@@ -379,9 +379,7 @@ def test_scaled_fp4_grouped_quantize(
     x = torch.randn(batch_shape, dtype=dtype)
     tensor_amax = torch.abs(x).amax(dim=(1, 2)).to(torch.float32)
     global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax
-    mask = torch.randint(
-        low=1, high=m + 1, size=(b,), dtype=torch.int32, device=device
-    )
+    mask = torch.randint(low=1, high=m + 1, size=(b,), dtype=torch.int32, device=device)
     out, out_scale = scaled_fp4_grouped_quantize(x, mask, global_scale)
     out = out.permute(2, 0, 1)
     out_scale = out_scale.permute(5, 2, 4, 0, 1, 3)
@@ -392,7 +390,9 @@ def test_scaled_fp4_grouped_quantize(
         n // 2,
     ), f"Expected shape {(b, m, n // 2)}, got {out.shape}"
     assert out.dtype == torch.uint8, f"Expected uint8, got {out.dtype}"
-    assert out_scale.dtype == torch.float8_e4m3fn, f"Expected uint8, got {out_scale.dtype}"
+    assert out_scale.dtype == torch.float8_e4m3fn, (
+        f"Expected uint8, got {out_scale.dtype}"
+    )
 
     # Compare with single tensor quantization for each batch
     for i in range(b):
@@ -403,7 +403,6 @@ def test_scaled_fp4_grouped_quantize(
         scale_ref = unswizzle_sf(single_scale.view(torch.float8_e4m3fn), m, n)
         scale_ans = unswizzle_sf(out_scale[i], m, n)
         torch.testing.assert_close(scale_ref[: mask[i]], scale_ans[: mask[i]])
-
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -443,7 +442,9 @@ def test_silu_and_mul_scaled_nvfp4_experts_quantize(
     out_scale = out_scale.permute(5, 2, 4, 0, 1, 3)
     assert out.shape == (b, m, n // 2), f"Expected shape {(b, m, n)}, got {out.shape}"
     assert out.dtype == torch.uint8, f"Expected uint8, got {out.dtype}"
-    assert out_scale.dtype == torch.float8_e4m3fn, f"Expected uint8, got {out_scale.dtype}"
+    assert out_scale.dtype == torch.float8_e4m3fn, (
+        f"Expected uint8, got {out_scale.dtype}"
+    )
 
     # Compare with single tensor quantization for each batch
     for i in range(b):
@@ -460,9 +461,7 @@ def test_silu_and_mul_scaled_nvfp4_experts_quantize(
 
         scale_ref = unswizzle_sf(single_scale.view(torch.float8_e4m3fn), m, n)
         scale_ans = unswizzle_sf(out_scale[i], m, n)
-        torch.testing.assert_close(
-            scale_ref[: mask[i]], scale_ans[: mask[i]]
-        )        
+        torch.testing.assert_close(scale_ref[: mask[i]], scale_ans[: mask[i]])
         # ref_out_scale_expert = unswizzle_sf(ref_out_scale[i], m, n)
 
         # torch.testing.assert_close(

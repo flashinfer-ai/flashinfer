@@ -838,7 +838,8 @@ quantize_with_block_size(
 }
 
 template <class SFType, int CVT_FP4_NUM_THREADS_PER_SF>
-__device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(int rowIdx, int colIdx, int numCols, SFType* SFout) {
+__device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(int rowIdx, int colIdx, int numCols,
+                                                       SFType* SFout) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   static_assert(CVT_FP4_NUM_THREADS_PER_SF == 1 || CVT_FP4_NUM_THREADS_PER_SF == 2);
 
@@ -882,9 +883,7 @@ __device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(int rowIdx, int colIdx, i
   return nullptr;
 }
 
-__device__ __forceinline__ float silu(const float& val) {
-  return val / (1.0f + __expf(-val));
-}
+__device__ __forceinline__ float silu(const float& val) { return val / (1.0f + __expf(-val)); }
 
 template <class Type>
 inline __device__ void silu_and_mul(PackedVec<Type>& x_vec, const PackedVec<Type>& y_vec) {
@@ -917,19 +916,13 @@ __launch_bounds__(512, 4) cvt_fp16_to_fp4_expert(
 #else
 cvt_fp16_to_fp4_expert(
 #endif
-    int32_t numRows,
-    int32_t numCols,
-    Type const* in,
-    float const* SFScale,
-    uint32_t* out,
-    uint32_t* SFout,
-    int32_t* mask,
-    bool use_silu_and_mul,
-    int n_experts) {
+    int32_t numRows, int32_t numCols, Type const* in, float const* SFScale, uint32_t* out,
+    uint32_t* SFout, int32_t* mask, bool use_silu_and_mul, int n_experts) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   using PackedVec = PackedVec<Type>;
   static constexpr int CVT_FP4_NUM_THREADS_PER_SF = (CVT_FP4_SF_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD);
-  static_assert(sizeof(PackedVec) == sizeof(Type) * CVT_FP4_ELTS_PER_THREAD, "Vec size is not matched.");
+  static_assert(sizeof(PackedVec) == sizeof(Type) * CVT_FP4_ELTS_PER_THREAD,
+                "Vec size is not matched.");
 
   // Input tensor row/col loops.
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -965,8 +958,8 @@ cvt_fp16_to_fp4_expert(
   int actualColsPerRow = use_silu_and_mul ? colsPerRow * 2 : colsPerRow;
 
   // Each global thread processes one element
-  for (int globalIdx = tid_in_expert + expert_idx * m * colsPerRow; globalIdx < (expert_idx + 1) * m * colsPerRow;
-       globalIdx += actual_stride) {
+  for (int globalIdx = tid_in_expert + expert_idx * m * colsPerRow;
+       globalIdx < (expert_idx + 1) * m * colsPerRow; globalIdx += actual_stride) {
     // Calculate which row and column this global thread should process
     int rowIdx = globalIdx / colsPerRow;
     int colIdx = globalIdx % colsPerRow;

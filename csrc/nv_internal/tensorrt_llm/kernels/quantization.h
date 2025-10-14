@@ -63,19 +63,11 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* glo
                            bool enable_pdl = false, cudaStream_t stream = 0);
 
 template <typename T>
-void invokeSiluAndMulNVFP4Quantization(void* output,
-    void* output_scale,
-    void* input,
-    void* input_global_scale,
-    void* input_offset_by_experts,
-    void* output_scale_offset_by_experts,
-    void* mask,
-    bool use_silu_and_mul,
-    int m_topk,
-    int k,
-    int n_experts,
-    cudaStream_t stream);
-                                  
+void invokeSiluAndMulNVFP4Quantization(void* output, void* output_scale, void* input,
+                                       void* input_global_scale, void* input_offset_by_experts,
+                                       void* output_scale_offset_by_experts, void* mask,
+                                       bool use_silu_and_mul, int m_topk, int k, int n_experts,
+                                       cudaStream_t stream);
 
 void invokeBlockScaleInterleave(int b, int m, int m_padded, int n, int n_padded,
                                 uint8_t const* SFIn, uint8_t* SFOutput, int multiProcessorCount,

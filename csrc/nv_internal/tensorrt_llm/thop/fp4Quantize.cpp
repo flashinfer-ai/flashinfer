@@ -185,13 +185,9 @@ void fp4_batched_quantize(Tensor self, Tensor globalScale, Tensor valueE2M1, Ten
 #undef LAUNCH_FP4_QUANTIZE_KERNEL
 }
 
-void silu_and_mul_scaled_nvfp4_experts_quantize(
-    Tensor output,
-    Tensor output_scale,
-    Tensor const input,
-    Tensor const input_global_scale,  
-    Tensor const mask,
-    bool use_silu_and_mul) {
+void silu_and_mul_scaled_nvfp4_experts_quantize(Tensor output, Tensor output_scale,
+                                                Tensor const input, Tensor const input_global_scale,
+                                                Tensor const mask, bool use_silu_and_mul) {
   auto fp32_dtype = DLDataType{kDLFloat, 32, 1};
   auto int32_dtype = DLDataType{kDLInt, 32, 1};
   auto uint8_dtype = DLDataType{kDLUInt, 8, 1};
@@ -201,71 +197,57 @@ void silu_and_mul_scaled_nvfp4_experts_quantize(
   CHECK_CUDA(input_global_scale);
   CHECK_CUDA(mask);
 
-  TVM_FFI_ICHECK_EQ(output.ndim() , 2);
-  TVM_FFI_ICHECK_EQ(output_scale.ndim() , 2);
-  TVM_FFI_ICHECK_EQ(input.ndim() , 2);
-  TVM_FFI_ICHECK_EQ(input_global_scale.ndim() , 1);
-  
+  TVM_FFI_ICHECK_EQ(output.ndim(), 2);
+  TVM_FFI_ICHECK_EQ(output_scale.ndim(), 2);
+  TVM_FFI_ICHECK_EQ(input.ndim(), 2);
+  TVM_FFI_ICHECK_EQ(input_global_scale.ndim(), 1);
+
   CHECK_INPUT_TYPE(input_global_scale, fp32_dtype);
-  CHECK_INPUT_TYPE(mask , int32_dtype);
+  CHECK_INPUT_TYPE(mask, int32_dtype);
   // output is uint8 (two nvfp4 values are packed into one uint8)
   // output_scale is int32 (four fp8 values are packed into one int32)
-  CHECK_INPUT_TYPE(output , uint8_dtype);
-  CHECK_INPUT_TYPE(output_scale , int32_dtype);
+  CHECK_INPUT_TYPE(output, uint8_dtype);
+  CHECK_INPUT_TYPE(output_scale, int32_dtype);
 
   const int BLOCK_SIZE = 16;
   auto m_topk = input.shape()[0];
   auto k_by_2 = input.shape()[1];
   auto k = k_by_2;
   if (use_silu_and_mul) {
-    TVM_FFI_ICHECK_EQ(k_by_2 % 2 , 0) << "k must be a multiple of 2";
+    TVM_FFI_ICHECK_EQ(k_by_2 % 2, 0) << "k must be a multiple of 2";
     k = k_by_2 / 2;
   }
   auto n_experts = input_global_scale.shape()[0];
   TVM_FFI_ICHECK_EQ(mask.shape()[0], n_experts);
-  TVM_FFI_ICHECK_EQ(output.shape()[0] , m_topk);
-  TVM_FFI_ICHECK_EQ(output.shape()[1] , k / 2);
+  TVM_FFI_ICHECK_EQ(output.shape()[0], m_topk);
+  TVM_FFI_ICHECK_EQ(output.shape()[1], k / 2);
   int scales_k = k / BLOCK_SIZE;
   // 4 means the swizzle requirement by nvidia nvfp4.
   int padded_k = (scales_k + (4 - 1)) / 4 * 4;
   // 4 means 4 fp8 values are packed into one int32
-  TVM_FFI_ICHECK_EQ(output_scale.shape()[1] * 4 , padded_k);
+  TVM_FFI_ICHECK_EQ(output_scale.shape()[1] * 4, padded_k);
 
   auto in_dtype = input->dtype;
   const cudaStream_t stream = get_stream(input->device);
   if (in_dtype == dl_float16) {
     tensorrt_llm::kernels::invokeSiluAndMulNVFP4Quantization<half>(
-        output->data,
-        output_scale->data,
-        input->data,
-        input_global_scale->data,
+        output->data, output_scale->data, input->data, input_global_scale->data,
         nullptr,  // input_offset_by_experts
         nullptr,  // output_scale_offset_by_experts
-        mask->data,
-        use_silu_and_mul,
-        m_topk,
-        k,
-        n_experts,
-        stream);
+        mask->data, use_silu_and_mul, m_topk, k, n_experts, stream);
   } else if (in_dtype == dl_bfloat16) {
     tensorrt_llm::kernels::invokeSiluAndMulNVFP4Quantization<__nv_bfloat16>(
-        output->data,
-        output_scale->data,
-        input->data,
-        input_global_scale->data,
+        output->data, output_scale->data, input->data, input_global_scale->data,
         nullptr,  // input_offset_by_experts
         nullptr,  // output_scale_offset_by_experts
-        mask->data,
-        use_silu_and_mul,
-        m_topk,
-        k,
-        n_experts,
-        stream);
+        mask->data, use_silu_and_mul, m_topk, k, n_experts, stream);
   } else {
-    TVM_FFI_LOG_AND_THROW(NotImplementedError)
-        << "silu_and_mul_scaled_nvfp4_experts_quantize only supports input tensor with dtypes fp16/bf16.";  }
+    TVM_FFI_LOG_AND_THROW(NotImplementedError) << "silu_and_mul_scaled_nvfp4_experts_quantize only "
+                                                  "supports input tensor with dtypes fp16/bf16.";
+  }
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp4_quantize, fp4_quantize);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp4_batched_quantize, fp4_batched_quantize);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(silu_and_mul_scaled_nvfp4_experts_quantize, silu_and_mul_scaled_nvfp4_experts_quantize);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(silu_and_mul_scaled_nvfp4_experts_quantize,
+                              silu_and_mul_scaled_nvfp4_experts_quantize);
