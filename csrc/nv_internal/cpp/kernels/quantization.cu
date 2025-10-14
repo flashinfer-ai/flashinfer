@@ -23,7 +23,6 @@
 #include "tensorrt_llm/common/quantTypeUtils.cuh"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include "tensorrt_llm/kernels/quantization.cuh"
-// #include "tensorrt_llm/kernels/nvfp4_expert_quant.cuh"
 #include "tensorrt_llm/kernels/quantization.h"
 
 using namespace tensorrt_llm::common;

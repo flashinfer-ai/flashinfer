@@ -432,11 +432,7 @@ def test_silu_and_mul_scaled_nvfp4_experts_quantize(
     global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax
 
     out, out_scale = silu_and_mul_scaled_nvfp4_experts_quantize(x, mask, global_scale)
-    # ref_out, ref_out_scale = nvfp4_batched_quantize(
-    #     ref_y,
-    #     global_scale,
-    #     mask=mask,
-    # )
+
     # Basic shape checks
     out = out.permute(2, 0, 1)
     out_scale = out_scale.permute(5, 2, 4, 0, 1, 3)
@@ -455,18 +451,10 @@ def test_silu_and_mul_scaled_nvfp4_experts_quantize(
         torch.testing.assert_close(
             out[i][: mask[i]], single_out[: mask[i]], rtol=1e-5, atol=1e-5
         )
-        # torch.testing.assert_close(
-        #     out[i][: mask[i]], ref_out[i][: mask[i]], rtol=1e-5, atol=1e-5
-        # )
 
         scale_ref = unswizzle_sf(single_scale.view(torch.float8_e4m3fn), m, n)
         scale_ans = unswizzle_sf(out_scale[i], m, n)
         torch.testing.assert_close(scale_ref[: mask[i]], scale_ans[: mask[i]])
-        # ref_out_scale_expert = unswizzle_sf(ref_out_scale[i], m, n)
-
-        # torch.testing.assert_close(
-        #     ref_out_scale_expert[: mask[i]], scale_ans[: mask[i]]
-        # )
 
 
 if __name__ == "__main__":
