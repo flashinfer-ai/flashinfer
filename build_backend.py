@@ -115,7 +115,7 @@ def _prepare_for_wheel():
         for license_file in licenses_dir.glob("*.txt"):
             shutil.copy2(
                 license_file,
-                _root / f"LICENSE.{license_file.stem.replace('LICENSE.', '')}.txt",
+                _root / f"LICENSE.{license_file.stem.removeprefix('LICENSE.')}.txt",
             )
 
 
