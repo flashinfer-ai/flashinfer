@@ -730,4 +730,4 @@ cudaError_t LayerNorm(T* input, Tw* gemma, Tw* beta, T* out, uint32_t tokens, ui
 
 }  // namespace flashinfer
 
-#endif  // FLAHSINFER_NORM_CUH_
+#endif  // FLASHINFER_NORM_CUH_

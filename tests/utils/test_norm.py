@@ -232,11 +232,11 @@ def test_layernorm(batch_size, hidden_size, dtype):
     eps = 1e-6
 
     x = torch.randn(batch_size, hidden_size, dtype=dtype, device="cuda")
-    gemma = torch.randn(hidden_size, dtype=torch.float32, device="cuda")
+    gamma = torch.randn(hidden_size, dtype=torch.float32, device="cuda")
     beta = torch.randn(hidden_size, dtype=torch.float32, device="cuda")
 
-    out = flashinfer.layernorm(x, gemma, beta, eps)
-    out_ref = F.layer_norm(x.float(), (hidden_size,), gemma, beta, eps).to(dtype)
+    out = flashinfer.layernorm(x, gamma, beta, eps)
+    out_ref = F.layer_norm(x.float(), (hidden_size,), gamma, beta, eps).to(dtype)
 
     torch.testing.assert_close(out, out_ref, rtol=1e-2, atol=1e-2)
 
