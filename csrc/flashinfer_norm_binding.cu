@@ -26,7 +26,10 @@ void gemma_rmsnorm(TensorView out, TensorView input, TensorView weight, double e
 void gemma_fused_add_rmsnorm(TensorView input, TensorView residual, TensorView weight, double eps,
                              bool enable_pdl);
 
+void layernorm(Tensor out, Tensor input, Tensor gamma, Tensor beta, double eps);
+
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(rmsnorm, rmsnorm);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fused_add_rmsnorm, fused_add_rmsnorm);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(gemma_rmsnorm, gemma_rmsnorm);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(gemma_fused_add_rmsnorm, gemma_fused_add_rmsnorm);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(layernorm, layernorm);

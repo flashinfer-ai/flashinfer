@@ -160,3 +160,36 @@ void gemma_fused_add_rmsnorm(TensorView input, TensorView residual, TensorView w
     return true;
   });
 }
+
+void layernorm(Tensor output, Tensor input, Tensor gamma, Tensor beta, double eps) {
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(gamma);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(beta);
+  CHECK_DEVICE(input, gamma);
+  CHECK_DEVICE(input, beta);
+  CHECK_DIM(2, input);  // input: (batch_size, hidden_size)
+  CHECK_DIM(1, gamma);  // gamma: (hidden_size)
+  CHECK_DIM(1, beta);   // beta: (hidden_size)
+  TVM_FFI_ICHECK_EQ(input->shape[1], gamma->shape[0]);
+  TVM_FFI_ICHECK_EQ(input->shape[1], beta->shape[0]);
+  unsigned int batch_size = input->shape[0];
+  unsigned int hidden_size = input->shape[1];
+  TVM_FFI_ICHECK_EQ(output->shape[0], batch_size);
+  TVM_FFI_ICHECK_EQ(output->shape[1], hidden_size);
+  cudaSetDevice(input->device.device_id);
+  const cudaStream_t stream = get_stream(input->device);
+  // TODO(kaixih): This is currently our only use case; Add more if needed.
+  TVM_FFI_ICHECK_EQ(input->dtype, dl_bfloat16) << "input must be bfloat16";
+  TVM_FFI_ICHECK_EQ(gamma->dtype, dl_float32) << "gamma must be float32";
+  TVM_FFI_ICHECK_EQ(beta->dtype, dl_float32) << "beta must be float32";
+
+  DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(input->dtype, c_type, [&] {
+    cudaError_t status =
+        norm::LayerNorm(static_cast<c_type*>(input->data), static_cast<float*>(gamma->data),
+                        static_cast<float*>(beta->data), static_cast<c_type*>(output->data),
+                        batch_size, hidden_size, eps, stream);
+    TVM_FFI_ICHECK(status == cudaSuccess)
+        << "LayerNorm failed with error code " << cudaGetErrorString(status);
+    return true;
+  });
+}
