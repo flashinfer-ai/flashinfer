@@ -21,8 +21,9 @@ using namespace flashinfer;
 
 using tvm::ffi::Tensor;
 
-void apply_rope(Tensor q, Tensor k, Tensor q_rope, Tensor k_rope, Tensor indptr, Tensor offsets,
-                int64_t rotary_dim, bool interleave, double rope_scale, double rope_theta) {
+void apply_rope(TensorView q, TensorView k, TensorView q_rope, TensorView k_rope, TensorView indptr,
+                TensorView offsets, int64_t rotary_dim, bool interleave, double rope_scale,
+                double rope_theta) {
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(q);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(k);
   CHECK_INPUT(indptr);
@@ -68,8 +69,9 @@ void apply_rope(Tensor q, Tensor k, Tensor q_rope, Tensor k_rope, Tensor indptr,
   });
 }
 
-void apply_rope_pos_ids(Tensor q, Tensor k, Tensor q_rope, Tensor k_rope, Tensor pos_ids,
-                        int64_t rotary_dim, bool interleave, double rope_scale, double rope_theta) {
+void apply_rope_pos_ids(TensorView q, TensorView k, TensorView q_rope, TensorView k_rope,
+                        TensorView pos_ids, int64_t rotary_dim, bool interleave, double rope_scale,
+                        double rope_theta) {
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(q);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(k);
   CHECK_INPUT(pos_ids);
@@ -111,8 +113,9 @@ void apply_rope_pos_ids(Tensor q, Tensor k, Tensor q_rope, Tensor k_rope, Tensor
   });
 }
 
-void apply_rope_pos_ids_cos_sin_cache(Tensor q, Tensor k, Tensor q_rope, Tensor k_rope,
-                                      Tensor cos_sin_cache, Tensor pos_ids, bool interleave) {
+void apply_rope_pos_ids_cos_sin_cache(TensorView q, TensorView k, TensorView q_rope,
+                                      TensorView k_rope, TensorView cos_sin_cache,
+                                      TensorView pos_ids, bool interleave) {
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(q);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(k);
   CHECK_INPUT(cos_sin_cache);
@@ -161,10 +164,10 @@ void apply_rope_pos_ids_cos_sin_cache(Tensor q, Tensor k, Tensor q_rope, Tensor 
   });
 }
 
-void apply_llama31_rope(Tensor q, Tensor k, Tensor q_rope, Tensor k_rope, Tensor indptr,
-                        Tensor offsets, int64_t rotary_dim, bool interleave, double rope_scale,
-                        double rope_theta, double low_freq_factor, double high_freq_factor,
-                        double old_context_length) {
+void apply_llama31_rope(TensorView q, TensorView k, TensorView q_rope, TensorView k_rope,
+                        TensorView indptr, TensorView offsets, int64_t rotary_dim, bool interleave,
+                        double rope_scale, double rope_theta, double low_freq_factor,
+                        double high_freq_factor, double old_context_length) {
   CHECK_CUDA(q);  // not necessarily contiguous
   CHECK_CUDA(k);  // not necessarily contiguous
   CHECK_INPUT(indptr);
@@ -213,10 +216,10 @@ void apply_llama31_rope(Tensor q, Tensor k, Tensor q_rope, Tensor k_rope, Tensor
   });
 }
 
-void apply_llama31_rope_pos_ids(Tensor q, Tensor k, Tensor q_rope, Tensor k_rope, Tensor pos_ids,
-                                int64_t rotary_dim, bool interleave, double rope_scale,
-                                double rope_theta, double low_freq_factor, double high_freq_factor,
-                                double old_context_length) {
+void apply_llama31_rope_pos_ids(TensorView q, TensorView k, TensorView q_rope, TensorView k_rope,
+                                TensorView pos_ids, int64_t rotary_dim, bool interleave,
+                                double rope_scale, double rope_theta, double low_freq_factor,
+                                double high_freq_factor, double old_context_length) {
   CHECK_CUDA(q);  // not necessarily contiguous
   CHECK_CUDA(k);  // not necessarily contiguous
   CHECK_INPUT(pos_ids);
@@ -259,10 +262,11 @@ void apply_llama31_rope_pos_ids(Tensor q, Tensor k, Tensor q_rope, Tensor k_rope
   });
 }
 
-void rope_quantize(TensorView q_rope_in, TensorView k_rope_in, TensorView q_nope_in, TensorView k_nope_in,
-  TensorView q_rope_out, TensorView k_rope_out, TensorView q_nope_out, TensorView k_nope_out,
-  TensorView cos_sin_cache, TensorView pos_ids, double quant_scale_q,
-                   double quant_scale_kv, bool interleave) {
+void rope_quantize(TensorView q_rope_in, TensorView k_rope_in, TensorView q_nope_in,
+                   TensorView k_nope_in, TensorView q_rope_out, TensorView k_rope_out,
+                   TensorView q_nope_out, TensorView k_nope_out, TensorView cos_sin_cache,
+                   TensorView pos_ids, double quant_scale_q, double quant_scale_kv,
+                   bool interleave) {
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(q_rope_in);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(k_rope_in);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(q_nope_in);
