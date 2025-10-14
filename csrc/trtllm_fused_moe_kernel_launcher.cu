@@ -456,7 +456,7 @@ void trtllm_fp8_block_scale_moe_launcher(
       static_cast<int*>(cta_idx_xy_to_batch_idx->data),
       static_cast<int*>(cta_idx_xy_to_mn_limit->data),
       static_cast<int*>(num_non_exiting_ctas->data), args.mDtypeElt, btg_routing_bias_dtype,
-      false /* use_routing_scales_on_input */, true  /* use_deep_seek_fp8 */,
+      false /* use_routing_scales_on_input */, true /* use_deep_seek_fp8 */,
       static_cast<RoutingMethodType>(routing_method_type), stream);
 
   // MoE kernel except routing
