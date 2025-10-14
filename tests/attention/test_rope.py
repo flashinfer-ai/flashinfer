@@ -362,11 +362,15 @@ def test_rope_cos_sin_cache(
         # MLA: Multiple Q heads, single shared K/V head
         ("mla", 128, 1, 64, 512),
         ("mla", 64, 1, 128, 256),
+        ("mla", 128, 1, 64, 128),  # Explicit DeepSeek R1 MLA config case
         ("mla", 32, 1, 32, 96),
         # GQA: Multiple Q heads, fewer K/V heads (grouped)
-        ("gqa", 32, 8, 64, 64),  # 4 Q heads per K/V head
-        ("gqa", 64, 16, 128, 128),  # 4 Q heads per K/V head
-        ("gqa", 24, 6, 32, 96),  # 4 Q heads per K/V head
+        ("gqa", 32, 8, 64, 64),
+        ("gqa", 64, 16, 128, 128),
+        ("gqa", 24, 6, 32, 96),
+        ("gqa", 32, 8, 128, 0),  # Llama3 8B standard config
+        ("gqa", 64, 8, 128, 0),  # Llama3 70B standard config
+        ("gqa", 64, 8, 64, 0),  # (plausible) GPT-OSS config
         # MHA: Equal Q and K/V heads
         ("mha", 32, 32, 64, 64),
         ("mha", 16, 16, 128, 128),
