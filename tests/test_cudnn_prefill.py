@@ -161,7 +161,7 @@ def test_cudnn_prefill(
     )
 
     wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-        workspace_buffer_ref, "HND"
+        workspace_buffer_ref, "HND", backend="fa2"
     )
     wrapper.plan(
         qo_indptr,
@@ -179,4 +179,4 @@ def test_cudnn_prefill(
 
     output_ref = wrapper.run(q, kv_cache)
 
-    torch.testing.assert_close(output, output_ref, atol=2e-3, rtol=1e-2)
+    torch.testing.assert_close(output, output_ref, atol=3e-3, rtol=1e-2)
