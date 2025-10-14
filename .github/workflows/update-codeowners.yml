@@ -5,6 +5,7 @@ on:
     # Run weekly on Monday at 00:00 UTC
     - cron: '0 0 * * 1'
   workflow_dispatch: # Allow manual triggering
+  pull_request:
 
 permissions:
   contents: write
@@ -36,7 +37,7 @@ jobs:
             --min-commits 1 \
             --days-back 180 \
             --top-n 5 \
-            --no-api
+            --allowed-users-file scripts/authorized_codeowner.txt
 
       - name: Check for changes
         id: check_changes
@@ -65,7 +66,7 @@ jobs:
           commit-message: |
             chore: update CODEOWNERS based on git history
 
-            Auto-generated CODEOWNERS update based on commit activity over the last 365 days.
+            Auto-generated CODEOWNERS update based on commit activity over the last 180 days.
 
             🤖 Generated with [Claude Code](https://claude.com/claude-code)
 
@@ -77,7 +78,7 @@ jobs:
           body: |
             ## Summary
 
-            This PR updates the CODEOWNERS file based on git commit history analysis from the last 365 days.
+            This PR updates the CODEOWNERS file based on git commit history analysis from the last 180 days.
 
             ## Changes
 
@@ -95,9 +96,10 @@ jobs:
             ## Notes
 
             - This is an automated PR generated weekly
-            - Minimum commits threshold: 2
-            - Analysis period: 365 days
+            - Minimum commits threshold: 1
+            - Analysis period: 180 days
             - Directory depth: 3 levels
+            - Top N owners per module: 5
 
             ---
 
