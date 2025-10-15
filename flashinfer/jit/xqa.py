@@ -15,12 +15,20 @@ limitations under the License.
 """
 
 from . import env as jit_env
-from .core import JitSpec, gen_jit_spec, sm90a_nvcc_flags
+from .core import (
+    JitSpec,
+    gen_jit_spec,
+    sm90a_nvcc_flags,
+    sm100a_nvcc_flags,
+    sm120a_nvcc_flags,
+)
 
 xqa_nvcc_flags = [
     "-DNDEBUG=1",
+    "-DUSE_PAGED_KV_CACHE=1",
+    "-DPAGED_KV_CACHE_LAYOUT=1",
     "-DBEAM_WIDTH=1",
-    "-DCACHE_ELEM_ENUM=0",
+    "-DUSE_INPUT_KV=0",
     "-DUSE_CUSTOM_BARRIER=1",
     "-DLOW_PREC_OUTPUT=0",
     "-DSPEC_DEC=0",
@@ -28,16 +36,23 @@ xqa_nvcc_flags = [
 
 
 def gen_xqa_module(
-    use_fp16: bool,
+    fp16_input: bool,
+    fp8_kv_cache: bool,
     token_per_page: int,
     head_size: int,
     head_grp_size: int,
     use_sliding_window: bool,
+    sm_version: int = 90,
 ) -> JitSpec:
-    if use_fp16:
-        flag_use_fp16 = ["-DINPUT_FP16=1", "-DDTYPE=__half"]
+    if fp16_input:
+        flag_data_type = ["-DINPUT_FP16=1", "-DDTYPE=__half"]
     else:
-        flag_use_fp16 = ["-DINPUT_FP16=0", "-DDTYPE=__nv_bfloat16"]
+        flag_data_type = ["-DINPUT_FP16=0", "-DDTYPE=__nv_bfloat16"]
+
+    if fp8_kv_cache:
+        flag_data_type.append("-DCACHE_ELEM_ENUM=2")
+    else:
+        flag_data_type.append("-DCACHE_ELEM_ENUM=0")
 
     if token_per_page not in [16, 32, 64, 128]:
         raise ValueError(
@@ -58,18 +73,28 @@ def gen_xqa_module(
     else:
         flag_sliding_window = ["-DSLIDING_WINDOW=0"]
 
+    if sm_version == 100:
+        sm_nvcc_flags = sm100a_nvcc_flags
+    elif sm_version == 120:
+        sm_nvcc_flags = sm120a_nvcc_flags
+    else:
+        sm_nvcc_flags = sm90a_nvcc_flags
+
     return gen_jit_spec(
-        f"xqa_use_fp16_{use_fp16}_token_per_page_{token_per_page}_head_size_{head_size}_head_grp_size_{head_grp_size}_use_sliding_window_{use_sliding_window}",
+        f"xqa_fp16_input_{fp16_input}_fp8_kv_cache_{fp8_kv_cache}_token_per_page_{token_per_page}_head_size_{head_size}_head_grp_size_{head_grp_size}_use_sliding_window_{use_sliding_window}_sm_{sm_version}",
         [
             jit_env.FLASHINFER_CSRC_DIR / "xqa/mha.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "xqa/mha_sm90.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "xqa/tensorMap.cpp",
             jit_env.FLASHINFER_CSRC_DIR / "xqa/xqa_wrapper.cu",
             jit_env.FLASHINFER_CSRC_DIR / "flashinfer_xqa_binding.cu",
         ],
         extra_cuda_cflags=xqa_nvcc_flags
-        + sm90a_nvcc_flags
+        + sm_nvcc_flags
         + flag_tokens_per_page
         + flag_head_size
-        + flag_use_fp16
+        + flag_data_type
         + flag_head_grp_size
         + flag_sliding_window,
+        extra_ldflags=["-lcuda"],  # Add CUDA Driver API library
     )
