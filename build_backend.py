@@ -115,6 +115,15 @@ def _prepare_for_wheel():
         shutil.rmtree(_data_dir)
     _create_data_dir(use_symlinks=False)
 
+    # Copy license files from licenses/ to root to avoid nested path in wheel
+    licenses_dir = _root / "licenses"
+    if licenses_dir.exists():
+        for license_file in licenses_dir.glob("*.txt"):
+            shutil.copy2(
+                license_file,
+                _root / f"LICENSE.{license_file.stem.removeprefix('LICENSE.')}.txt",
+            )
+
 
 def _prepare_for_editable():
     # For editable install, use symlinks so changes are reflected immediately

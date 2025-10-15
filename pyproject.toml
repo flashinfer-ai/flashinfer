@@ -21,7 +21,7 @@ license = "Apache-2.0"
 readme = "README.md"
 urls = { Homepage = "https://github.com/flashinfer-ai/flashinfer" }
 dynamic = ["dependencies", "version"]
-license-files = ["LICENSE", "licenses/*"]
+license-files = ["LICENSE", "LICENSE*.txt"]
 
 [project.scripts]
 flashinfer = "flashinfer.__main__:cli"
