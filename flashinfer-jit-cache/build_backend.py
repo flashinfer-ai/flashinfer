@@ -47,11 +47,11 @@ def _create_build_metadata():
     # Get git version
     git_version = get_git_version(cwd=Path(__file__).parent.parent)
 
-    # Append CUDA version suffix if available
-    cuda_suffix = os.environ.get("CUDA_VERSION_SUFFIX", "")
-    if cuda_suffix:
+    # Append local version suffix if available
+    local_version = os.environ.get("FLASHINFER_LOCAL_VERSION")
+    if local_version:
         # Use + to create a local version identifier that will appear in wheel name
-        version = f"{version}+{cuda_suffix}"
+        version = f"{version}+{local_version}"
     build_meta_file = Path(__file__).parent / "flashinfer_jit_cache" / "_build_meta.py"
 
     # Check if we're in a git repository

@@ -190,7 +190,7 @@ jobs:
           CUDA_MINOR=$(echo "${{ matrix.cuda }}" | cut -d'.' -f2)
           export CUDA_MAJOR
           export CUDA_MINOR
-          export CUDA_VERSION_SUFFIX="cu${CUDA_MAJOR}${CUDA_MINOR}"
+          export FLASHINFER_LOCAL_VERSION="cu${CUDA_MAJOR}${CUDA_MINOR}"
 
           chown -R $(id -u):$(id -g) ${{ github.workspace }}
           mkdir -p ${{ github.workspace }}/ci-cache
@@ -204,7 +204,7 @@ jobs:
             -e CUDA_VERSION="${{ matrix.cuda }}" \
             -e CUDA_MAJOR="$CUDA_MAJOR" \
             -e CUDA_MINOR="$CUDA_MINOR" \
-            -e CUDA_VERSION_SUFFIX="$CUDA_VERSION_SUFFIX" \
+            -e FLASHINFER_LOCAL_VERSION="$FLASHINFER_LOCAL_VERSION" \
             -e ARCH="${{ matrix.arch }}" \
             -e FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST}" \
             --user $(id -u):$(id -g) \
