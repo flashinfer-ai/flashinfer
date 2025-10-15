@@ -25,6 +25,8 @@ from .core import (
 
 xqa_nvcc_flags = [
     "-DNDEBUG=1",
+    "-DUSE_PAGED_KV_CACHE=1",
+    "-DPAGED_KV_CACHE_LAYOUT=1",
     "-DBEAM_WIDTH=1",
     "-DUSE_INPUT_KV=0",
     "-DUSE_CUSTOM_BARRIER=1",

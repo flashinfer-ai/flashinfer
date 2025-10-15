@@ -24,7 +24,12 @@ void xqa_wrapper(bool run_fp8_mha, int64_t multiProcessorCount, int64_t nbKHeads
 #if LOW_PREC_OUTPUT
                  TensorView rcpOutScale,
 #endif
-                 TensorView q, Optional<TensorView> attentionSinks, TensorView pool,
+                 TensorView q, Optional<TensorView> attentionSinks,
+#if PAGED_KV_CACHE_LAYOUT == 1
+                 TensorView kCacheVLLM, TensorView vCacheVLLM,
+#else
+                 TensorView pool,
+#endif
                  TensorView kvCachePageList, int64_t maxSeqLen, TensorView seqLen,
                  int64_t batchSize, TensorView kvCacheScale,
 #if SPEC_DEC
@@ -43,7 +48,12 @@ void xqa_wrapper(bool run_fp8_mha, int64_t multiProcessorCount, int64_t nbKHeads
            reinterpret_cast<float const*>(rcpOutScale->data),
 #endif
            reinterpret_cast<InputHead const*>(q->data), attentionSinksPtr,
+#if PAGED_KV_CACHE_LAYOUT == 1
+           reinterpret_cast<GMemCacheHead*>(kCacheVLLM->data),
+           reinterpret_cast<GMemCacheHead*>(vCacheVLLM->data),
+#else
            reinterpret_cast<GMemCacheHead*>(pool->data),
+#endif
            reinterpret_cast<KVCachePageIndex const*>(kvCachePageList->data), maxSeqLen,
            reinterpret_cast<uint32_t const*>(seqLen->data), batchSize,
            reinterpret_cast<float const*>(kvCacheScale->data),

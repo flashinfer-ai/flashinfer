@@ -49,10 +49,11 @@ class CacheSeq:
 
     def __getitem__(self, i: int) -> torch.Tensor:
         page_idx = self.page_indices[i // self.tokens_per_page].to(torch.int32)
+        # VLLM layout (PAGED_KV_CACHE_LAYOUT=1): [page_idx][token_in_page][nb_heads][head_dim]
         idx_head = (
-            self.tokens_per_page * self.nb_heads * page_idx
-            + self.tokens_per_page * self.idx_head
-            + i % self.tokens_per_page
+            page_idx * self.tokens_per_page * self.nb_heads
+            + (i % self.tokens_per_page) * self.nb_heads
+            + self.idx_head
         )
         return self.pool[idx_head]
 
@@ -181,7 +182,6 @@ def test_xqa(
         pytest.skip("XQA supports fp8 mha only on Hopper GPUs")
     set_random_seed(42)
 
-    nb_v_heads = nb_k_heads
     nb_q_heads = nb_k_heads * head_grp_size
 
     output = torch.zeros(
@@ -217,29 +217,44 @@ def test_xqa(
         sliding_win_size = 0
 
     max_seq_len = round_up(seq_len, tokens_per_page)
-    total_nb_cache_heads = (
-        (nb_k_heads + nb_v_heads) * max_seq_len * beam_width * batch_size
-    )
-    cache_heads = torch.zeros(
+    nb_pages_per_seq = div_up(max_seq_len, tokens_per_page)
+    # Layout 1: K and V share page indices
+    # Total cache heads = nb_k_heads * max_seq_len * batch_size
+    total_nb_cache_heads = nb_k_heads * max_seq_len * batch_size
+
+    cache_k_heads = torch.zeros(
         total_nb_cache_heads,
         valid_elems_per_head,
         dtype=torch.bfloat16 if not fp16_input else torch.float16,
         device="cuda",
     )
-    cache_heads.normal_(0, 1)
+    cache_k_heads.normal_(0, 1)
+
+    cache_v_heads = torch.zeros(
+        total_nb_cache_heads,
+        valid_elems_per_head,
+        dtype=torch.bfloat16 if not fp16_input else torch.float16,
+        device="cuda",
+    )
+    cache_v_heads.normal_(0, 1)
+
     if fp8_kv_cache:
         # Scale down the cache heads to keep values within the representable range of FP8
         # and prevent overflow during computation. The factor 4.0 is chosen empirically.
-        cache_heads /= 4.0
-
-    nb_pages_per_seq = div_up(max_seq_len, tokens_per_page)
-    total_nb_pages = nb_pages_per_seq * 2 * beam_width * batch_size
+        cache_k_heads /= 4.0
+        cache_v_heads /= 4.0
     page_list_arg = torch.zeros(
-        batch_size, beam_width, 2, nb_pages_per_seq, dtype=torch.uint32, device="cuda"
+        batch_size, nb_pages_per_seq, dtype=torch.uint32, device="cuda"
     )
-    page_list_arg.view(-1)[:total_nb_pages] = torch.arange(
-        total_nb_pages, dtype=torch.int32, device="cuda"
-    ).to(torch.uint32)
+
+    # Initialize page list sequentially
+    page_idx = 0
+    for batch in range(batch_size):
+        for page in range(nb_pages_per_seq):
+            page_list_arg[batch, page] = page_idx
+            page_idx += 1
+
+    # Shuffle pages FIRST (like TensorRT-LLM line 503)
     flattened = page_list_arg.flatten()
     indices = torch.randperm(flattened.numel())
     shuffled_flat = flattened.to(torch.int32)[indices].to(torch.uint32)
@@ -250,25 +265,24 @@ def test_xqa(
         is_k,
         idx_kv_head,
         pos,
-        cache_heads,
+        cache_k_heads,
+        cache_v_heads,
         page_list,
         beam_width,
         nb_k_heads,
         tokens_per_page,
     ):
-        beam = 0
-        kv = 0 if is_k else 1
+        # Layout 1: K and V share page indices
+        page_idx = page_list[batch][pos // tokens_per_page].to(torch.int32)
 
-        page_idx = page_list_arg[batch][beam][kv][pos // tokens_per_page].to(
-            torch.int32
-        )
-
+        # VLLM layout: [page_idx][token_in_page][nb_heads][head_dim]
         idx_head = (
-            tokens_per_page * (nb_k_heads * page_idx + idx_kv_head)
-            + pos % tokens_per_page
+            page_idx * tokens_per_page * nb_k_heads
+            + (pos % tokens_per_page) * nb_k_heads
+            + idx_kv_head
         )
 
-        return cache_heads[idx_head]
+        return cache_k_heads[idx_head] if is_k else cache_v_heads[idx_head]
 
     for batch in range(batch_size):
         for kv in range(2):
@@ -279,7 +293,8 @@ def test_xqa(
                         kv == 0,
                         idx_kv_head,
                         pos,
-                        cache_heads,
+                        cache_k_heads,
+                        cache_v_heads,
                         page_list_arg,
                         beam_width,
                         nb_k_heads,
@@ -317,7 +332,9 @@ def test_xqa(
         output,
         q_heads,
         attention_sinks,
-        cache_heads.to(torch.float8_e4m3fn) if fp8_kv_cache else cache_heads,
+        # Layout 1: Pass separate K and V caches
+        cache_k_heads.to(torch.float8_e4m3fn) if fp8_kv_cache else cache_k_heads,
+        cache_v_heads.to(torch.float8_e4m3fn) if fp8_kv_cache else cache_v_heads,
         page_list_arg,
         max_seq_len,
         seq_len_list,
@@ -330,55 +347,58 @@ def test_xqa(
     for req in range(batch_size):
         for b in range(beam_width):
             for idx_k_head in range(nb_k_heads):
+                # Layout 1: K and V use separate pools but share page indices
                 k_cache_seq = CacheSeq(
-                    pool=cache_heads,
-                    page_indices=page_list_arg[req][b][0],
+                    pool=cache_k_heads,
+                    page_indices=page_list_arg[req],
                     nb_heads=nb_k_heads,
                     idx_head=idx_k_head,
                     tokens_per_page=tokens_per_page,
                 )
                 v_cache_seq = CacheSeq(
-                    pool=cache_heads,
-                    page_indices=page_list_arg[req][b][1],
+                    pool=cache_v_heads,
+                    page_indices=page_list_arg[req],
                     nb_heads=nb_k_heads,
                     idx_head=idx_k_head,
                     tokens_per_page=tokens_per_page,
                 )
 
-        ref_output = ref_attention(
-            q=q_heads[req][b][
-                idx_k_head * head_grp_size : (idx_k_head + 1) * head_grp_size
-            ],
-            k_cache_seq=k_cache_seq,
-            v_cache_seq=v_cache_seq,
-            seq_len=seq_len,
-            q_scale=q_scale,
-            kv_scale=kv_cache_scale[0],
-            x_scale=1.0,
-            attention_sinks=attention_sinks[idx_k_head, :]
-            if use_attention_sinks
-            else None,
-            sliding_win_size=sliding_win_size if use_sliding_window else 0,
-            valid_elems_per_head=valid_elems_per_head,
-        )
-        kernel_output = output[req][b][
-            idx_k_head * head_grp_size : (idx_k_head + 1) * head_grp_size
-        ].to(torch.float32)
-        if fp8_kv_cache or run_fp8_mha:
-            atol = 0.05
-            rtol = 0.05
-        else:
-            atol = 0.01
-            rtol = 0.01
+                ref_output = ref_attention(
+                    q=q_heads[req][b][
+                        idx_k_head * head_grp_size : (idx_k_head + 1) * head_grp_size
+                    ],
+                    k_cache_seq=k_cache_seq,
+                    v_cache_seq=v_cache_seq,
+                    seq_len=seq_len,
+                    q_scale=q_scale,
+                    kv_scale=kv_cache_scale[0],
+                    x_scale=1.0,
+                    attention_sinks=attention_sinks[idx_k_head, :]
+                    if use_attention_sinks
+                    else None,
+                    sliding_win_size=sliding_win_size if use_sliding_window else 0,
+                    valid_elems_per_head=valid_elems_per_head,
+                )
+                kernel_output = output[req][b][
+                    idx_k_head * head_grp_size : (idx_k_head + 1) * head_grp_size
+                ].to(torch.float32)
+                if fp8_kv_cache or run_fp8_mha:
+                    atol = 0.05
+                    rtol = 0.05
+                else:
+                    atol = 0.01
+                    rtol = 0.01
 
-        diff_abs = torch.abs(ref_output - kernel_output)
-        diff_rel = diff_abs / (torch.abs(ref_output) + 1e-8)
+                diff_abs = torch.abs(ref_output - kernel_output)
+                diff_rel = diff_abs / (torch.abs(ref_output) + 1e-8)
 
-        within_tolerance = (diff_abs <= atol) | (diff_rel <= rtol)
+                within_tolerance = (diff_abs <= atol) | (diff_rel <= rtol)
 
-        pass_ratio = within_tolerance.float().mean().item()
+                pass_ratio = within_tolerance.float().mean().item()
 
-        required_ratio = 0.99
-        assert pass_ratio >= required_ratio, (
-            f"Total {ref_output.numel()} elements, only {pass_ratio:.1%} meet tolerance criteria, require at least {required_ratio:.1%}"
-        )
+                required_ratio = 0.99
+                assert pass_ratio >= required_ratio, (
+                    f"req={req}, b={b}, idx_k_head={idx_k_head}: "
+                    f"Total {ref_output.numel()} elements, only {pass_ratio:.1%} meet tolerance criteria, "
+                    f"require at least {required_ratio:.1%}"
+                )

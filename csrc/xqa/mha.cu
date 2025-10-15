@@ -2659,7 +2659,12 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
 #if LOW_PREC_OUTPUT
                          float const* rcpOutScale,
 #endif
-                         InputHead const* q, float const* attentionSinks, GMemCacheHead* pool,
+                         InputHead const* q, float const* attentionSinks,
+#if PAGED_KV_CACHE_LAYOUT == 1
+                         GMemCacheHead* kCacheVLLM, GMemCacheHead* vCacheVLLM,
+#else
+                         GMemCacheHead* pool,
+#endif
                          KVCachePageIndex const* kvCachePageList, uint32_t maxSeqLen,
                          uint32_t const* seqLen, uint32_t batchSize,
                          float const* __restrict__ kvCacheScale,
@@ -2691,7 +2696,12 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
   auto const launchCfg = makeLaunchConfig(dimGrid, dimCta, hostSmemSize, stream, ENABLE_PDL != 0);
 #if USE_PAGED_KV_CACHE
   uint32_t const maxNbPagesPerSeq = exactDiv(maxSeqLen, tokensPerPage);
+#if PAGED_KV_CACHE_LAYOUT == 1
+  KVCacheList<true> const cacheList{kCacheVLLM, vCacheVLLM, kvCachePageList, seqLen,
+                                    maxNbPagesPerSeq};
+#else
   KVCacheList<true> const cacheList{pool, kvCachePageList, seqLen, maxNbPagesPerSeq};
+#endif
   cudaLaunchKernelEx(&launchCfg, kernel_mha,
 #if SPEC_DEC
                      qSeqLen, nbKHeads, headGrpSize, qCuSeqLens,
