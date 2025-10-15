@@ -296,6 +296,14 @@ void rope_quantize(TensorView q_rope_in, TensorView k_rope_in, TensorView q_nope
   TVM_FFI_ICHECK_EQ(q_rope_out->dtype, q_nope_out->dtype);
   TVM_FFI_ICHECK_EQ(q_rope_out->dtype, k_nope_out->dtype);
 
+  // Validate supported input data types (float16 or bfloat16)
+  TVM_FFI_ICHECK(q_rope_in->dtype == dl_float16 || q_rope_in->dtype == dl_bfloat16)
+      << "Input dtype must be float16 or bfloat16";
+
+  // Validate supported output quantization data types (float8_e4m3fn or float8_e5m2)
+  TVM_FFI_ICHECK(q_rope_out->dtype == dl_float8_e4m3fn || q_rope_out->dtype == dl_float8_e5m2)
+      << "Output dtype must be float8_e4m3fn or float8_e5m2";
+
   // Q tensors are always 3D: (nnz, num_qo_heads, rope_dim/no_rope_dim)
   CHECK_DIM(3, q_rope_in);
   CHECK_DIM(3, q_nope_in);
