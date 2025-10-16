@@ -35,21 +35,21 @@ void merge_state(TensorView v_a, TensorView s_a, TensorView v_b, TensorView s_b,
   CHECK_DIM(2, s_b);
   CHECK_SHAPE(v_a, v_b);
   CHECK_SHAPE(s_a, s_b);
-  TVM_FFI_ICHECK_EQ(v_a->shape[0], s_a->shape[0]);
-  TVM_FFI_ICHECK_EQ(v_a->shape[1], s_b->shape[1]);
-  unsigned int seq_len = v_a->shape[0];
-  unsigned int num_heads = v_a->shape[1];
-  unsigned int head_dim = v_a->shape[2];
+  TVM_FFI_ICHECK_EQ(v_a.size(0), s_a.size(0));
+  TVM_FFI_ICHECK_EQ(v_a.size(1), s_b.size(1));
+  unsigned int seq_len = v_a.size(0);
+  unsigned int num_heads = v_a.size(1);
+  unsigned int head_dim = v_a.size(2);
 
-  cudaSetDevice(v_a->device.device_id);
-  auto stream = get_stream(v_a->device);
+  cudaSetDevice(v_a.device().device_id);
+  auto stream = get_stream(v_a.device());
 
-  bool success = DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(v_a->dtype, c_type, [&] {
+  bool success = DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(v_a.dtype(), c_type, [&] {
     cudaError_t status =
-        MergeState(static_cast<c_type*>(v_a->data), static_cast<float*>(s_a->data),
-                   static_cast<c_type*>(v_b->data), static_cast<float*>(s_b->data),
-                   static_cast<c_type*>(v_merged->data), static_cast<float*>(s_merged->data),
-                   seq_len, num_heads, head_dim, stream);
+        MergeState(static_cast<c_type*>(v_a.data_ptr()), static_cast<float*>(s_a.data_ptr()),
+                   static_cast<c_type*>(v_b.data_ptr()), static_cast<float*>(s_b.data_ptr()),
+                   static_cast<c_type*>(v_merged.data_ptr()),
+                   static_cast<float*>(s_merged.data_ptr()), seq_len, num_heads, head_dim, stream);
     TVM_FFI_ICHECK(status == cudaSuccess)
         << "MergeState kernel launch failed: " << cudaGetErrorString(status);
     return true;
@@ -72,26 +72,26 @@ void merge_state_in_place(TensorView v, TensorView s, TensorView v_other, Tensor
   CHECK_DIM(2, s_other);
   CHECK_SHAPE(v, v_other);
   CHECK_SHAPE(s, s_other);
-  TVM_FFI_ICHECK_EQ(v->shape[0], s->shape[0]);
-  TVM_FFI_ICHECK_EQ(v->shape[1], s->shape[1]);
+  TVM_FFI_ICHECK_EQ(v.size(0), s.size(0));
+  TVM_FFI_ICHECK_EQ(v.size(1), s.size(1));
   uint8_t* mask_ptr = nullptr;
   if (mask.has_value()) {
     CHECK_DIM(1, mask.value());
-    TVM_FFI_ICHECK_EQ(v->shape[0], mask.value()->shape[0]);
+    TVM_FFI_ICHECK_EQ(v.size(0), mask.value().size(0));
     CHECK_DEVICE(mask.value(), v);
-    mask_ptr = static_cast<uint8_t*>(mask.value()->data);
+    mask_ptr = static_cast<uint8_t*>(mask.value().data_ptr());
   }
-  unsigned int seq_len = v->shape[0];
-  unsigned int num_heads = v->shape[1];
-  unsigned int head_dim = v->shape[2];
+  unsigned int seq_len = v.size(0);
+  unsigned int num_heads = v.size(1);
+  unsigned int head_dim = v.size(2);
 
-  cudaSetDevice(v->device.device_id);
-  auto stream = get_stream(v->device);
-  bool success = DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(v->dtype, c_type, [&] {
-    cudaError_t status =
-        MergeStateInPlace(static_cast<c_type*>(v->data), static_cast<float*>(s->data),
-                          static_cast<c_type*>(v_other->data), static_cast<float*>(s_other->data),
-                          seq_len, num_heads, head_dim, mask_ptr, stream);
+  cudaSetDevice(v.device().device_id);
+  auto stream = get_stream(v.device());
+  bool success = DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(v.dtype(), c_type, [&] {
+    cudaError_t status = MergeStateInPlace(
+        static_cast<c_type*>(v.data_ptr()), static_cast<float*>(s.data_ptr()),
+        static_cast<c_type*>(v_other.data_ptr()), static_cast<float*>(s_other.data_ptr()), seq_len,
+        num_heads, head_dim, mask_ptr, stream);
     TVM_FFI_ICHECK(status == cudaSuccess)
         << "MergeStateInPlace kernel launch failed: " << cudaGetErrorString(status);
     return true;
@@ -106,21 +106,21 @@ void merge_states(TensorView v, TensorView s, TensorView v_merged, TensorView s_
   CHECK_DEVICE(s, v);
   CHECK_DIM(4, v);
   CHECK_DIM(3, s);
-  TVM_FFI_ICHECK_EQ(v->shape[0], s->shape[0]);
-  TVM_FFI_ICHECK_EQ(v->shape[1], s->shape[1]);
-  TVM_FFI_ICHECK_EQ(v->shape[2], s->shape[2]);
-  unsigned int seq_len = v->shape[0];
-  unsigned int num_index_sets = v->shape[1];
-  unsigned int num_heads = v->shape[2];
-  unsigned int head_dim = v->shape[3];
+  TVM_FFI_ICHECK_EQ(v.size(0), s.size(0));
+  TVM_FFI_ICHECK_EQ(v.size(1), s.size(1));
+  TVM_FFI_ICHECK_EQ(v.size(2), s.size(2));
+  unsigned int seq_len = v.size(0);
+  unsigned int num_index_sets = v.size(1);
+  unsigned int num_heads = v.size(2);
+  unsigned int head_dim = v.size(3);
 
-  cudaSetDevice(v->device.device_id);
-  auto stream = get_stream(v->device);
-  bool success = DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(v->dtype, c_type, [&] {
-    cudaError_t status =
-        MergeStates(static_cast<c_type*>(v->data), static_cast<float*>(s->data),
-                    static_cast<c_type*>(v_merged->data), static_cast<float*>(s_merged->data),
-                    num_index_sets, seq_len, num_heads, head_dim, stream);
+  cudaSetDevice(v.device().device_id);
+  auto stream = get_stream(v.device());
+  bool success = DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(v.dtype(), c_type, [&] {
+    cudaError_t status = MergeStates(
+        static_cast<c_type*>(v.data_ptr()), static_cast<float*>(s.data_ptr()),
+        static_cast<c_type*>(v_merged.data_ptr()), static_cast<float*>(s_merged.data_ptr()),
+        num_index_sets, seq_len, num_heads, head_dim, stream);
     TVM_FFI_ICHECK(status == cudaSuccess)
         << "MergeStates kernel launch failed: " << cudaGetErrorString(status);
     return true;

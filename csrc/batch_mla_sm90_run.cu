@@ -40,39 +40,39 @@ void BatchMLAPagedAttentionSM90Run(TensorView float_workspace_buffer,
   MLAPlanInfo plan_info;
   plan_info.FromVector(std::vector<int64_t>(plan_info_vec.begin(), plan_info_vec.end()));
 
-  void* float_buffer_ptr = float_workspace_buffer->data;
-  void* int_buffer_ptr = int_workspace_buffer->data;
+  void* float_buffer_ptr = float_workspace_buffer.data_ptr();
+  void* int_buffer_ptr = int_workspace_buffer.data_ptr();
 
   const MaskMode mask_mode = static_cast<MaskMode>(mask_mode_code);
 
-  unsigned int q_nope_stride_n = q_nope->strides[0];
-  unsigned int q_nope_stride_h = q_nope->strides[1];
-  unsigned int q_pe_stride_n = q_pe->strides[0];
-  unsigned int q_pe_stride_h = q_pe->strides[1];
-  unsigned int ckv_stride_page = ckv_cache->strides[0];
-  unsigned int ckv_stride_n = ckv_cache->strides[1];
-  unsigned int kpe_stride_page = kpe_cache->strides[0];
-  unsigned int kpe_stride_n = kpe_cache->strides[1];
-  unsigned int o_stride_n = o->strides[0];
-  unsigned int o_stride_h = o->strides[1];
+  unsigned int q_nope_stride_n = q_nope.stride(0);
+  unsigned int q_nope_stride_h = q_nope.stride(1);
+  unsigned int q_pe_stride_n = q_pe.stride(0);
+  unsigned int q_pe_stride_h = q_pe.stride(1);
+  unsigned int ckv_stride_page = ckv_cache.stride(0);
+  unsigned int ckv_stride_n = ckv_cache.stride(1);
+  unsigned int kpe_stride_page = kpe_cache.stride(0);
+  unsigned int kpe_stride_n = kpe_cache.stride(1);
+  unsigned int o_stride_n = o.stride(0);
+  unsigned int o_stride_h = o.stride(1);
 
-  cudaSetDevice(q_nope->device.device_id);
-  const cudaStream_t stream = get_stream(q_nope->device);
+  cudaSetDevice(q_nope.device().device_id);
+  const cudaStream_t stream = get_stream(q_nope.device());
 
   DISPATCH_context(
       DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM_CKV, HEAD_DIM_KPE, Params, [&] {
         Params params;
 
-        params.q_nope = static_cast<DTypeQ*>(q_nope->data);
-        params.q_pe = static_cast<DTypeQ*>(q_pe->data);
-        params.ckv = static_cast<DTypeKV*>(ckv_cache->data);
-        params.kpe = static_cast<DTypeKV*>(kpe_cache->data);
+        params.q_nope = static_cast<DTypeQ*>(q_nope.data_ptr());
+        params.q_pe = static_cast<DTypeQ*>(q_pe.data_ptr());
+        params.ckv = static_cast<DTypeKV*>(ckv_cache.data_ptr());
+        params.kpe = static_cast<DTypeKV*>(kpe_cache.data_ptr());
 
         params.q_indptr = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.q_indptr_offset);
         params.kv_indptr = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.kv_indptr_offset);
         params.partial_indptr =
             GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.partial_indptr_offset);
-        params.kv_indices = static_cast<IdType*>(kv_indices->data);
+        params.kv_indices = static_cast<IdType*>(kv_indices.data_ptr());
         params.q_len = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.q_len_offset);
         params.kv_len = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.kv_len_offset);
         params.q_start = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.q_start_offset);
@@ -90,9 +90,9 @@ void BatchMLAPagedAttentionSM90Run(TensorView float_workspace_buffer,
             int_buffer_ptr, plan_info.merge_partial_packed_offset_end_offset);
         params.merge_partial_stride =
             GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.merge_partial_stride_offset);
-        params.final_o = static_cast<DTypeO*>(o->data);
+        params.final_o = static_cast<DTypeO*>(o.data_ptr());
         params.final_lse =
-            maybe_lse.has_value() ? static_cast<float*>(maybe_lse.value()->data) : nullptr;
+            maybe_lse.has_value() ? static_cast<float*>(maybe_lse.value().data_ptr()) : nullptr;
         params.partial_o =
             GetPtrFromBaseOffset<DTypeO>(float_buffer_ptr, plan_info.partial_o_offset);
         params.partial_lse =

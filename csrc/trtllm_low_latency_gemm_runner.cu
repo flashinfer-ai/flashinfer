@@ -251,18 +251,18 @@ void trtllm_low_latency_gemm(TensorView workspace_buffer, TensorView a, TensorVi
   CHECK_INPUT(out);
   CHECK_INPUT(workspace_buffer);
   CHECK_DIM(2, a);
-  TVM_FFI_ICHECK(b->ndim == 3) << "b must be a block layout matrix (3D tensor with "
-                                  "dims [N/BLOCK_SIZE, K, BLOCK_SIZE])";
-  TVM_FFI_ICHECK_EQ(a->dtype, b->dtype);
-  TVM_FFI_ICHECK(a->dtype == dl_float8_e4m3fn) << "a must be a Float8 tensor";
+  TVM_FFI_ICHECK(b.ndim() == 3) << "b must be a block layout matrix (3D tensor with "
+                                   "dims [N/BLOCK_SIZE, K, BLOCK_SIZE])";
+  TVM_FFI_ICHECK_EQ(a.dtype(), b.dtype());
+  TVM_FFI_ICHECK(a.dtype() == dl_float8_e4m3fn) << "a must be a Float8 tensor";
 
-  int32_t m = a->shape[0];
-  int32_t k = a->shape[1];
-  int32_t n = b->shape[1];
-  auto const blockSize = b->shape[2];
-  auto const kFromB = b->shape[0] * blockSize;
-  TVM_FFI_ICHECK(kFromB == a->shape[1]) << "Matrix dimensions don't match for multiplication";
-  TVM_FFI_ICHECK(out->shape[0] == m && out->shape[1] == n) << "Output tensor has wrong dimensions";
+  int32_t m = a.size(0);
+  int32_t k = a.size(1);
+  int32_t n = b.size(1);
+  auto const blockSize = b.size(2);
+  auto const kFromB = b.size(0) * blockSize;
+  TVM_FFI_ICHECK(kFromB == a.size(1)) << "Matrix dimensions don't match for multiplication";
+  TVM_FFI_ICHECK(out.size(0) == m && out.size(1) == n) << "Output tensor has wrong dimensions";
 
   if (tactic == -1) {
     tactic = select_kernel(m, n, k, gemm::gemm::GemmInterface());
@@ -274,7 +274,7 @@ void trtllm_low_latency_gemm(TensorView workspace_buffer, TensorView a, TensorVi
           .outputType = gemm::trtllm::gen::Dtype::Bfloat16,
       });
 
-  auto stream = get_stream(a->device);
+  auto stream = get_stream(a.device());
 
   int64_t const required_workspace_size = getWorkspaceSizeInBytes(m, n, k, tactic);
   int64_t const provided_workspace_size =
@@ -286,8 +286,8 @@ void trtllm_low_latency_gemm(TensorView workspace_buffer, TensorView a, TensorVi
            "workspace.";
   }
 
-  runner.run(m, n, k, a->data, b->data, out->data, globalScale->data, workspace_buffer->data,
-             stream, a->device.device_id, tactic);
+  runner.run(m, n, k, a.data_ptr(), b.data_ptr(), out.data_ptr(), globalScale.data_ptr(),
+             workspace_buffer.data_ptr(), stream, a.device().device_id, tactic);
 }
 
 enum class Dtype : int64_t {

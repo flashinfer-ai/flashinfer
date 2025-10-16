@@ -82,22 +82,22 @@ void FMHACutlassSM100Run(ffi::TensorView workspace_buffer, ffi::TensorView q, ff
                          Optional<ffi::TensorView> maybe_lse, int64_t mask_mode_code,
                          double sm_scale, int64_t num_qo_heads, int64_t num_kv_heads,
                          int64_t head_dim_qk, int64_t head_dim_vo, int64_t max_qo_len) {
-  TVM_FFI_ICHECK_EQ(q->dtype, k->dtype);
-  auto scalar_type_in = q->dtype;
-  auto scalar_type_out = o->dtype;
+  TVM_FFI_ICHECK_EQ(q.dtype(), k.dtype());
+  auto scalar_type_in = q.dtype();
+  auto scalar_type_out = o.dtype();
   MaskMode mask_mode = static_cast<MaskMode>(mask_mode_code);
-  int total_qo_len = q->shape[0];
-  int total_kv_len = k->shape[0];
-  int batch_size = qo_segment_offsets->shape[0] - 1;
-  int q_stride_n = q->strides[0];
-  int q_stride_h = q->strides[1];
-  int k_stride_n = k->strides[0];
-  int k_stride_h = k->strides[1];
-  int v_stride_n = v->strides[0];
-  int v_stride_h = v->strides[1];
+  int total_qo_len = q.size(0);
+  int total_kv_len = k.size(0);
+  int batch_size = qo_segment_offsets.size(0) - 1;
+  int q_stride_n = q.stride(0);
+  int q_stride_h = q.stride(1);
+  int k_stride_n = k.stride(0);
+  int k_stride_h = k.stride(1);
+  int v_stride_n = v.stride(0);
+  int v_stride_h = v.stride(1);
 
-  cudaSetDevice(qo_segment_offsets->device.device_id);
-  const cudaStream_t stream = get_stream(o->device);
+  cudaSetDevice(qo_segment_offsets.device().device_id);
+  const cudaStream_t stream = get_stream(o.device());
 
   DISPATCH_context(DTypeIn, DTypeOut, HEAD_DIM_QK, HEAD_DIM_VO, MASK_MODE, [&] {
     using cutlass_type_in = cutlass_dtype_t<DTypeIn>;
@@ -112,13 +112,14 @@ void FMHACutlassSM100Run(ffi::TensorView workspace_buffer, ffi::TensorView q, ff
         typename std::conditional<MASK_MODE == MaskMode::kCausal, CausalMask, ResidualMask>::type;
     auto status = run_fmha_fwd<cutlass_type_in, cutlass_type_out, int32_t, TileShapeQK, TileShapePV,
                                CutlassMaskMode>(
-        workspace_buffer->data, static_cast<cutlass_type_in*>(q->data),
-        static_cast<cutlass_type_in*>(k->data), static_cast<cutlass_type_in*>(v->data),
-        static_cast<int*>(qo_segment_offsets->data), static_cast<int*>(kv_segment_offsets->data),
-        static_cast<int*>(work_indptr->data), static_cast<int*>(qo_tile_indices->data),
-        static_cast<int*>(qo_head_indices->data), static_cast<int*>(batch_indices->data),
-        static_cast<cutlass_type_out*>(o->data),
-        maybe_lse.has_value() ? static_cast<float*>(maybe_lse.value()->data) : nullptr,
+        workspace_buffer.data_ptr(), static_cast<cutlass_type_in*>(q.data_ptr()),
+        static_cast<cutlass_type_in*>(k.data_ptr()), static_cast<cutlass_type_in*>(v.data_ptr()),
+        static_cast<int*>(qo_segment_offsets.data_ptr()),
+        static_cast<int*>(kv_segment_offsets.data_ptr()), static_cast<int*>(work_indptr.data_ptr()),
+        static_cast<int*>(qo_tile_indices.data_ptr()),
+        static_cast<int*>(qo_head_indices.data_ptr()), static_cast<int*>(batch_indices.data_ptr()),
+        static_cast<cutlass_type_out*>(o.data_ptr()),
+        maybe_lse.has_value() ? static_cast<float*>(maybe_lse.value().data_ptr()) : nullptr,
         mask_mode_code, sm_scale, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, q_stride_n,
         q_stride_h, k_stride_n, k_stride_h, v_stride_n, v_stride_h, batch_size, total_qo_len,
         total_kv_len, max_qo_len, stream);

@@ -20,33 +20,34 @@ void BatchDecodeWithPagedKVCacheRunMLA(
   DecodePlanInfo plan_info;
   plan_info.FromVector(std::vector<int64_t>(plan_info_vec.begin(), plan_info_vec.end()));
 
-  int64_t batch_size = q_nope->shape[0];
-  int64_t num_qo_heads = q_nope->shape[1];
-  int64_t page_size = paged_ckv_cache->shape[1];
+  int64_t batch_size = q_nope.size(0);
+  int64_t num_qo_heads = q_nope.size(1);
+  int64_t page_size = paged_ckv_cache.size(1);
 
   if (maybe_lse.has_value()) {
     const auto& lse = maybe_lse.value();
-    TVM_FFI_ICHECK_EQ(lse->shape[0], batch_size);
-    TVM_FFI_ICHECK_EQ(lse->shape[1], num_qo_heads);
+    TVM_FFI_ICHECK_EQ(lse.size(0), batch_size);
+    TVM_FFI_ICHECK_EQ(lse.size(1), num_qo_heads);
   }
 
   TVM_FFI_ICHECK_GE(logits_soft_cap, 0.f) << "logits_soft_cap must be non-negative";
 
-  void* float_buffer = static_cast<void*>(float_workspace_buffer->data);
-  void* int_buffer = static_cast<void*>(int_workspace_buffer->data);
+  void* float_buffer = static_cast<void*>(float_workspace_buffer.data_ptr());
+  void* int_buffer = static_cast<void*>(int_workspace_buffer.data_ptr());
 
-  cudaSetDevice(q_nope->device.device_id);
-  const cudaStream_t stream = get_stream(q_nope->device);
+  cudaSetDevice(q_nope.device().device_id);
+  const cudaStream_t stream = get_stream(q_nope.device());
 
   paged_kv_mla_t<DTypeKV, IdType> paged_kv(
       page_size, HEAD_DIM_CKV, HEAD_DIM_KPE, batch_size,
-      static_cast<DTypeKV*>(paged_ckv_cache->data), paged_ckv_cache.strides().data(),
-      static_cast<DTypeKV*>(paged_kpe_cache->data), paged_kpe_cache.strides().data(),
-      static_cast<IdType*>(paged_kv_indices->data), static_cast<IdType*>(paged_kv_indptr->data),
-      static_cast<IdType*>(paged_kv_last_page_len->data));
-  Params params(static_cast<DTypeQ*>(q_nope->data), static_cast<DTypeQ*>(q_pe->data),
-                /*q_offset=*/nullptr, paged_kv, static_cast<DTypeO*>(o->data),
-                /*lse=*/(maybe_lse ? static_cast<float*>(maybe_lse.value()->data) : nullptr),
+      static_cast<DTypeKV*>(paged_ckv_cache.data_ptr()), paged_ckv_cache.strides().data(),
+      static_cast<DTypeKV*>(paged_kpe_cache.data_ptr()), paged_kpe_cache.strides().data(),
+      static_cast<IdType*>(paged_kv_indices.data_ptr()),
+      static_cast<IdType*>(paged_kv_indptr.data_ptr()),
+      static_cast<IdType*>(paged_kv_last_page_len.data_ptr()));
+  Params params(static_cast<DTypeQ*>(q_nope.data_ptr()), static_cast<DTypeQ*>(q_pe.data_ptr()),
+                /*q_offset=*/nullptr, paged_kv, static_cast<DTypeO*>(o.data_ptr()),
+                /*lse=*/(maybe_lse ? static_cast<float*>(maybe_lse.value().data_ptr()) : nullptr),
                 num_qo_heads, window_left, logits_soft_cap, sm_scale, rope_scale, rope_theta);
 
   DTypeO* tmp_v = nullptr;

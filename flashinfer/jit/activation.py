@@ -34,13 +34,13 @@ using namespace flashinfer;
 {{ act_func_def }}
 
 void {{ func_name }}(TensorView out, TensorView input, bool enable_pdl) {
-  int d = input->shape[input->ndim -1] / 2;
-  int64_t num_tokens = input.numel() / input->shape[input->ndim -1];
+  int d = input.size(input.ndim() -1) / 2;
+  int64_t num_tokens = input.numel() / input.size(input.ndim() -1);
   dim3 grid(num_tokens);
 
-  cudaSetDevice(out->device.device_id);
-  const cudaStream_t stream = get_stream(out->device);
-  DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(input->dtype, c_type, [&] {
+  cudaSetDevice(out.device().device_id);
+  const cudaStream_t stream = get_stream(out.device());
+  DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(input.dtype(), c_type, [&] {
     uint32_t vec_size = 16 / sizeof(c_type);
     cudaLaunchConfig_t config;
     config.gridDim = num_tokens;
@@ -55,8 +55,8 @@ void {{ func_name }}(TensorView out, TensorView input, bool enable_pdl) {
 
     auto kernel = flashinfer::activation::act_and_mul_kernel<c_type, {{ act_func_name }}>;
 
-    cudaLaunchKernelEx(&config, kernel, static_cast<c_type*>(out->data),
-                       static_cast<c_type*>(input->data), d);
+    cudaLaunchKernelEx(&config, kernel, static_cast<c_type*>(out.data_ptr()),
+                       static_cast<c_type*>(input.data_ptr()), d);
 
     cudaError_t err = cudaGetLastError();
     TVM_FFI_ICHECK(err == cudaSuccess) << "Failed to launch kernel: " << cudaGetErrorString(err);

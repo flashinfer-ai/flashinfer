@@ -21,13 +21,13 @@ using namespace flashinfer;
 
 void packbits(TensorView x, const std::string& bitorder, TensorView y) {
   CHECK_INPUT(x);
-  auto device = x->device;
+  auto device = x.device();
   TVM_FFI_ICHECK(bitorder == "big" || bitorder == "little") << "bitorder must be 'big' or 'little'";
 
   int64_t num_elements = x.numel();
-  auto stream = get_stream(x->device);
+  auto stream = get_stream(x.device());
   cudaError_t status = quantization::PackBits(
-      static_cast<bool*>(x->data), static_cast<uint8_t*>(y->data), num_elements,
+      static_cast<bool*>(x.data_ptr()), static_cast<uint8_t*>(y.data_ptr()), num_elements,
       bitorder == "big" ? quantization::BitOrder::kBig : quantization::BitOrder::kLittle, stream);
 
   TVM_FFI_ICHECK(status == cudaSuccess)
@@ -42,14 +42,14 @@ void segment_packbits(TensorView x, TensorView input_indptr, TensorView output_i
   CHECK_DEVICE(input_indptr, x);
   CHECK_DEVICE(output_indptr, x);
   TVM_FFI_ICHECK(bitorder == "big" || bitorder == "little") << "bitorder must be 'big' or 'little'";
-  unsigned int batch_size = input_indptr->shape[0] - 1;
-  TVM_FFI_ICHECK_EQ(output_indptr->shape[0], batch_size + 1)
+  unsigned int batch_size = input_indptr.size(0) - 1;
+  TVM_FFI_ICHECK_EQ(output_indptr.size(0), batch_size + 1)
       << "output_indptr must be on the same device as x";
 
-  auto stream = get_stream(x->device);
+  auto stream = get_stream(x.device());
   cudaError_t status = quantization::SegmentPackBits(
-      static_cast<bool*>(x->data), static_cast<uint8_t*>(y->data),
-      static_cast<int32_t*>(input_indptr->data), static_cast<int32_t*>(output_indptr->data),
-      batch_size,
+      static_cast<bool*>(x.data_ptr()), static_cast<uint8_t*>(y.data_ptr()),
+      static_cast<int32_t*>(input_indptr.data_ptr()),
+      static_cast<int32_t*>(output_indptr.data_ptr()), batch_size,
       bitorder == "big" ? quantization::BitOrder::kBig : quantization::BitOrder::kLittle, stream);
 }
