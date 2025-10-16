@@ -87,7 +87,7 @@ if [ "$DRY_RUN" == "true" ]; then
 
     for test_file in $TEST_FILES; do
         TOTAL_TESTS=$((TOTAL_TESTS + 1))
-        echo "$TOTAL_TESTS. pytest $PYTEST_FLAGS $test_file"
+        echo "$TOTAL_TESTS. pytest $PYTEST_FLAGS --junitxml=${JUNIT_DIR}/${test_file}.xml $test_file"
     done
 
     echo ""
@@ -102,12 +102,12 @@ if [ "$DRY_RUN" == "true" ]; then
 else
     for test_file in $TEST_FILES; do
         echo "=========================================="
-        echo "Running: pytest $PYTEST_FLAGS $test_file"
+        echo "Running: pytest $PYTEST_FLAGS --junitxml=${JUNIT_DIR}/${test_file}.xml $test_file"
         echo "=========================================="
 
         TOTAL_TESTS=$((TOTAL_TESTS + 1))
 
-        if pytest $PYTEST_FLAGS "$test_file"; then
+        if pytest $PYTEST_FLAGS --junitxml=${JUNIT_DIR}/${test_file}.xml "$test_file"; then
             echo "✅ PASSED: $test_file"
             PASSED_TESTS=$((PASSED_TESTS + 1))
         else
