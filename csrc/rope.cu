@@ -262,6 +262,12 @@ void apply_llama31_rope_pos_ids(TensorView q, TensorView k, TensorView q_rope, T
   });
 }
 
+/*!
+ * TVM FFI binding for RoPE + quantization kernel
+ *
+ * Validates tensor shapes, dimensions, and data types, then dispatches to the templated
+ * RopeQuantize CUDA kernel implementation.
+ */
 void rope_quantize(TensorView q_rope_in, TensorView k_rope_in, TensorView q_nope_in,
                    TensorView k_nope_in, TensorView q_rope_out, TensorView k_rope_out,
                    TensorView q_nope_out, TensorView k_nope_out, TensorView cos_sin_cache,
