@@ -349,7 +349,7 @@ def get_gemm_sm100_module_cutlass_fp8():
         cutlass_fp8_gemm_runner=cutlass_fp8_gemm_runner,
     )
 
-
+# This is just helper for bmm_fp8
 def fp8_gemm_sm100(
     a: torch.Tensor,
     b: torch.Tensor,
