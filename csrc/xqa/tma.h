@@ -206,21 +206,21 @@ __device__ inline void storeAsync(CUtensorMap const& tensorMap, DimsLE<nbDims> c
         : "memory");
   } else if constexpr (nbDims == 3) {
     asm volatile(
-        "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group.tile [%0, {%1, %2, %3}], [%4];\n"
+        "cp.async.bulk.tensor.3d.global.shared::cta.bulk_group.tile [%0, {%1, %2, %3}], [%4];\n"
         :
         : "l"(reinterpret_cast<uint64_t>(&tensorMap)), "r"(offset[0]), "r"(offset[1]),
           "r"(offset[2]), "l"(__cvta_generic_to_shared(src))
         : "memory");
   } else if constexpr (nbDims == 4) {
     asm volatile(
-        "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group.tile [%0, {%1, %2, %3, %4}], [%5];\n"
+        "cp.async.bulk.tensor.4d.global.shared::cta.bulk_group.tile [%0, {%1, %2, %3, %4}], [%5];\n"
         :
         : "l"(reinterpret_cast<uint64_t>(&tensorMap)), "r"(offset[0]), "r"(offset[1]),
           "r"(offset[2]), "r"(offset[3]), "l"(__cvta_generic_to_shared(src))
         : "memory");
   } else if constexpr (nbDims == 5) {
     asm volatile(
-        "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group.tile [%0, {%1, %2, %3, %4, %5}], "
+        "cp.async.bulk.tensor.5d.global.shared::cta.bulk_group.tile [%0, {%1, %2, %3, %4, %5}], "
         "[%6];\n"
         :
         : "l"(reinterpret_cast<uint64_t>(&tensorMap)), "r"(offset[0]), "r"(offset[1]),
