@@ -53,15 +53,16 @@ void mxfp8_quantize(TensorView input, TensorView valMxFP8, TensorView scaleFP8SF
   auto const layout = isSfSwizzledLayout ? tensorrt_llm::QuantizationSFLayout::SWIZZLED_128x4
                                          : tensorrt_llm::QuantizationSFLayout::LINEAR;
 
-#define LAUNCH_MXFP8_QUANTIZE_KERNEL(T)                                                         \
-  tensorrt_llm::kernels::invokeMxFP8Quantization(                                               \
-      1, m, k, padded_k, reinterpret_cast<T*>(input->data),                                     \
-      reinterpret_cast<int64_t*>(valMxFP8->data), reinterpret_cast<int32_t*>(scaleFP8SF->data), \
-      layout, mMultiProcessorCount, enable_pdl, get_stream(input->device));
+#define LAUNCH_MXFP8_QUANTIZE_KERNEL(T)                                                            \
+  tensorrt_llm::kernels::invokeMxFP8Quantization(                                                  \
+      1, m, k, padded_k, reinterpret_cast<T*>(input.data_ptr()),                                   \
+      reinterpret_cast<int64_t*>(valMxFP8.data_ptr()),                                             \
+      reinterpret_cast<int32_t*>(scaleFP8SF.data_ptr()), layout, mMultiProcessorCount, enable_pdl, \
+      get_stream(input.device()));
 
-  if (input->dtype == dl_float16) {
+  if (input.dtype() == dl_float16) {
     LAUNCH_MXFP8_QUANTIZE_KERNEL(half)
-  } else if (input->dtype == dl_bfloat16) {
+  } else if (input.dtype() == dl_bfloat16) {
 #ifdef ENABLE_BF16
     LAUNCH_MXFP8_QUANTIZE_KERNEL(__nv_bfloat16)
 #else
@@ -109,11 +110,12 @@ void mxfp8_quantize_host(TensorView x_fp32, TensorView fp8_tensor, TensorView sc
 
   for (size_t ti = 0; ti < static_cast<size_t>(data_shape[0]); ++ti) {
     for (int group = 0; group < groups_per_hidden_dim; ++group) {
-      float* fp32_ptr = static_cast<float*>(x_fp32->data) + ti * hidden_dim + group * sf_vec_size;
+      float* fp32_ptr =
+          static_cast<float*>(x_fp32.data_ptr()) + ti * hidden_dim + group * sf_vec_size;
       uint8_t* fp8_ptr =
-          static_cast<uint8_t*>(fp8_tensor->data) + ti * hidden_dim + group * sf_vec_size;
+          static_cast<uint8_t*>(fp8_tensor.data_ptr()) + ti * hidden_dim + group * sf_vec_size;
 
-      uint8_t* scale_ue8m08sf_ptr = static_cast<uint8_t*>(scale_tensor->data);
+      uint8_t* scale_ue8m08sf_ptr = static_cast<uint8_t*>(scale_tensor.data_ptr());
 
       float local_amax = 0.0f;
       for (int ki = 0; ki < sf_vec_size; ++ki) {
@@ -157,10 +159,10 @@ void mxfp8_dequantize_host(TensorView value_e4m3, TensorView scale_ue8m08sf,
   for (size_t ti = 0; ti < static_cast<size_t>(data_shape[0]); ++ti) {
     for (int group = 0; group < groups_per_hidden_dim; ++group) {
       float* float_ptr =
-          static_cast<float*>(float_tensor->data) + ti * hidden_dim + group * sf_vec_size;
+          static_cast<float*>(float_tensor.data_ptr()) + ti * hidden_dim + group * sf_vec_size;
       uint8_t* fp8_ptr =
-          static_cast<uint8_t*>(value_e4m3->data) + ti * hidden_dim + group * sf_vec_size;
-      uint8_t* scale_ue8m08sf_ptr = static_cast<uint8_t*>(scale_ue8m08sf->data);
+          static_cast<uint8_t*>(value_e4m3.data_ptr()) + ti * hidden_dim + group * sf_vec_size;
+      uint8_t* scale_ue8m08sf_ptr = static_cast<uint8_t*>(scale_ue8m08sf.data_ptr());
       uint8_t fp8_scale = scale_ue8m08sf_ptr[computeSFIndex(ti, group, data_shape[0],
                                                             groups_per_hidden_dim, layout)];
 

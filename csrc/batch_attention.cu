@@ -42,21 +42,21 @@ Array<int64_t> BatchPagedAttentionPlan(TensorView float_workspace_buffer,
                                        TensorView kv_len, int64_t batch_size, int64_t num_qo_heads,
                                        int64_t num_kv_heads, int64_t head_dim_o, bool causal) {
   size_t float_workspace_size_in_bytes =
-      float_workspace_buffer->shape[0] * get_element_size(float_workspace_buffer);
+      float_workspace_buffer.size(0) * get_element_size(float_workspace_buffer);
   size_t int_workspace_size_in_bytes =
-      int_workspace_buffer->shape[0] * get_element_size(int_workspace_buffer);
+      int_workspace_buffer.size(0) * get_element_size(int_workspace_buffer);
 
   HolisticPlanInfo<2> plan_info;
 
-  cudaSetDevice(float_workspace_buffer->device.device_id);
-  const cudaStream_t stream = get_stream(float_workspace_buffer->device);
+  cudaSetDevice(float_workspace_buffer.device().device_id);
+  const cudaStream_t stream = get_stream(float_workspace_buffer.device());
 
   cudaError_t status = TwoStageHolisticPlan<IdType>(
-      float_workspace_buffer->data, float_workspace_size_in_bytes, int_workspace_buffer->data,
-      page_locked_int_workspace_buffer->data, int_workspace_size_in_bytes, plan_info,
-      static_cast<IdType*>(qo_indptr->data), static_cast<IdType*>(kv_indptr->data),
-      static_cast<IdType*>(kv_len->data), batch_size, num_qo_heads, num_kv_heads, head_dim_o,
-      causal, stream);
+      float_workspace_buffer.data_ptr(), float_workspace_size_in_bytes,
+      int_workspace_buffer.data_ptr(), page_locked_int_workspace_buffer.data_ptr(),
+      int_workspace_size_in_bytes, plan_info, static_cast<IdType*>(qo_indptr.data_ptr()),
+      static_cast<IdType*>(kv_indptr.data_ptr()), static_cast<IdType*>(kv_len.data_ptr()),
+      batch_size, num_qo_heads, num_kv_heads, head_dim_o, causal, stream);
 
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "Failed to plan persistent paged attention, error: " << cudaGetErrorString(status);
@@ -76,34 +76,34 @@ void BatchPagedAttentionRun(TensorView float_workspace_buffer, TensorView int_wo
   HolisticPlanInfo<2> plan_info;
   plan_info.FromVector(std::vector<int64_t>(plan_info_vec.begin(), plan_info_vec.end()));
 
-  void* float_buffer_ptr = float_workspace_buffer->data;
-  void* int_buffer_ptr = int_workspace_buffer->data;
+  void* float_buffer_ptr = float_workspace_buffer.data_ptr();
+  void* int_buffer_ptr = int_workspace_buffer.data_ptr();
 
   const MaskMode mask_mode = static_cast<MaskMode>(mask_mode_code);
 
   // NOTE (Yilong): assume both q and o are NHD
-  unsigned int q_stride_n = q->strides[0];
-  unsigned int q_stride_h = q->strides[1];
+  unsigned int q_stride_n = q.stride(0);
+  unsigned int q_stride_h = q.stride(1);
 
   // layout only constraint paged KV
   const QKVLayout kv_layout = static_cast<QKVLayout>(layout_code);
-  unsigned int k_stride_page = k_cache->strides[0];
-  unsigned int v_stride_page = v_cache->strides[0];
+  unsigned int k_stride_page = k_cache.stride(0);
+  unsigned int v_stride_page = v_cache.stride(0);
   unsigned int k_stride_n, k_stride_h, v_stride_n, v_stride_h;
   if (kv_layout == QKVLayout::kNHD) {
-    k_stride_h = k_cache->strides[2];
-    k_stride_n = k_cache->strides[1];
-    v_stride_h = v_cache->strides[2];
-    v_stride_n = v_cache->strides[1];
+    k_stride_h = k_cache.stride(2);
+    k_stride_n = k_cache.stride(1);
+    v_stride_h = v_cache.stride(2);
+    v_stride_n = v_cache.stride(1);
   } else {
-    k_stride_h = k_cache->strides[1];
-    k_stride_n = k_cache->strides[2];
-    v_stride_h = v_cache->strides[1];
-    v_stride_n = v_cache->strides[2];
+    k_stride_h = k_cache.stride(1);
+    k_stride_n = k_cache.stride(2);
+    v_stride_h = v_cache.stride(1);
+    v_stride_n = v_cache.stride(2);
   }
 
-  cudaSetDevice(q->device.device_id);
-  const cudaStream_t stream = get_stream(q->device);
+  cudaSetDevice(q.device().device_id);
+  const cudaStream_t stream = get_stream(q.device());
 
   DISPATCH_context(
       DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
@@ -112,9 +112,9 @@ void BatchPagedAttentionRun(TensorView float_workspace_buffer, TensorView int_wo
         IdType* len_kv_chunk =
             GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.len_kv_chunk_offset);
         for (int i = 0; i < 2; i++) {
-          params[i].q = static_cast<DTypeQ*>(q->data);
-          params[i].k = static_cast<DTypeKV*>(k_cache->data);
-          params[i].v = static_cast<DTypeKV*>(v_cache->data);
+          params[i].q = static_cast<DTypeQ*>(q.data_ptr());
+          params[i].k = static_cast<DTypeKV*>(k_cache.data_ptr());
+          params[i].v = static_cast<DTypeKV*>(v_cache.data_ptr());
 
           params[i].q_indptr =
               GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.tasks[i].q_indptr_offset);
@@ -122,7 +122,7 @@ void BatchPagedAttentionRun(TensorView float_workspace_buffer, TensorView int_wo
               GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.tasks[i].kv_indptr_offset);
           params[i].partial_indptr = GetPtrFromBaseOffset<IdType>(
               int_buffer_ptr, plan_info.tasks[i].partial_indptr_offset);
-          params[i].kv_indices = static_cast<int*>(kv_indices->data);
+          params[i].kv_indices = static_cast<int*>(kv_indices.data_ptr());
           params[i].q_len =
               GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.tasks[i].q_len_offset);
           params[i].kv_len =
@@ -139,9 +139,9 @@ void BatchPagedAttentionRun(TensorView float_workspace_buffer, TensorView int_wo
               GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.tasks[i].work_indptr_offset);
           params[i].len_kv_chunk = len_kv_chunk + i;
 
-          params[i].final_o = static_cast<DTypeO*>(o->data);
+          params[i].final_o = static_cast<DTypeO*>(o.data_ptr());
           params[i].final_lse =
-              maybe_lse.has_value() ? static_cast<float*>(maybe_lse.value()->data) : nullptr;
+              maybe_lse.has_value() ? static_cast<float*>(maybe_lse.value().data_ptr()) : nullptr;
           params[i].partial_o =
               GetPtrFromBaseOffset<DTypeO>(float_buffer_ptr, plan_info.partial_o_offset);
           params[i].partial_lse =

@@ -15,13 +15,13 @@ Array<int64_t> BatchDecodeWithPagedKVCachePlanMLA(TensorView float_workspace_buf
                                                   TensorView indptr, int64_t batch_size,
                                                   int64_t num_qo_heads, int64_t page_size,
                                                   bool enable_cuda_graph) {
-  cudaSetDevice(float_workspace_buffer->device.device_id);
-  const cudaStream_t stream = get_stream(float_workspace_buffer->device);
+  cudaSetDevice(float_workspace_buffer.device().device_id);
+  const cudaStream_t stream = get_stream(float_workspace_buffer.device());
 
   size_t float_workspace_size_in_bytes =
-      float_workspace_buffer->shape[0] * get_element_size(float_workspace_buffer);
+      float_workspace_buffer.size(0) * get_element_size(float_workspace_buffer);
   size_t int_workspace_size_in_bytes =
-      int_workspace_buffer->shape[0] * get_element_size(int_workspace_buffer);
+      int_workspace_buffer.size(0) * get_element_size(int_workspace_buffer);
 
   DecodePlanInfo plan_info;
 
@@ -30,11 +30,12 @@ Array<int64_t> BatchDecodeWithPagedKVCachePlanMLA(TensorView float_workspace_buf
                                                              AttentionVariant, Params>;
   cudaError_t status =
       DecodePlan<HEAD_DIM_CKV, flashinfer::PosEncodingMode::kRoPELlama, AttentionVariant, Params>(
-          static_cast<void*>(float_workspace_buffer->data), float_workspace_size_in_bytes,
-          static_cast<void*>(int_workspace_buffer->data),
-          static_cast<void*>(page_locked_int_workspace_buffer->data), int_workspace_size_in_bytes,
-          plan_info, static_cast<IdType*>(indptr->data), batch_size, num_qo_heads, page_size,
-          enable_cuda_graph, /*stream=*/stream, work_estimation_func);
+          static_cast<void*>(float_workspace_buffer.data_ptr()), float_workspace_size_in_bytes,
+          static_cast<void*>(int_workspace_buffer.data_ptr()),
+          static_cast<void*>(page_locked_int_workspace_buffer.data_ptr()),
+          int_workspace_size_in_bytes, plan_info, static_cast<IdType*>(indptr.data_ptr()),
+          batch_size, num_qo_heads, page_size, enable_cuda_graph, /*stream=*/stream,
+          work_estimation_func);
 
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "BatchDecodeWithPagedKVCachePlanMLA failed with error: " << cudaGetErrorString(status);

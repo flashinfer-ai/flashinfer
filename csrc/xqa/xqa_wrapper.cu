@@ -31,25 +31,25 @@ void xqa_wrapper(int64_t multiProcessorCount, int64_t nbKHeads, int64_t slidingW
                  int64_t qSeqLen, TensorView qCuSeqLens, TensorView mask,
 #endif
                  TensorView semaphores, TensorView scratch) {
-  auto stream = get_stream(output->device);
+  auto stream = get_stream(output.device());
   float const* attentionSinksPtr =
-      attentionSinks.has_value() ? reinterpret_cast<float const*>(attentionSinks.value()->data)
+      attentionSinks.has_value() ? reinterpret_cast<float const*>(attentionSinks.value().data_ptr())
                                  : nullptr;
 
   launchMHAFlashInfer(multiProcessorCount, nbKHeads, slidingWinSize, qScale,
-                      reinterpret_cast<OutputHead*>(output->data),
+                      reinterpret_cast<OutputHead*>(output.data_ptr()),
 #if LOW_PREC_OUTPUT
-                      reinterpret_cast<float const*>(rcpOutScale->data),
+                      reinterpret_cast<float const*>(rcpOutScale.data_ptr()),
 #endif
-                      reinterpret_cast<InputHead const*>(q->data), attentionSinksPtr,
-                      reinterpret_cast<GMemCacheHead*>(pool->data),
-                      reinterpret_cast<KVCachePageIndex const*>(kvCachePageList->data), maxSeqLen,
-                      reinterpret_cast<uint32_t const*>(seqLen->data), batchSize,
-                      reinterpret_cast<float const*>(kvCacheScale->data),
+                      reinterpret_cast<InputHead const*>(q.data_ptr()), attentionSinksPtr,
+                      reinterpret_cast<GMemCacheHead*>(pool.data_ptr()),
+                      reinterpret_cast<KVCachePageIndex const*>(kvCachePageList.data_ptr()), maxSeqLen,
+                      reinterpret_cast<uint32_t const*>(seqLen.data_ptr()), batchSize,
+                      reinterpret_cast<float const*>(kvCacheScale.data_ptr()),
 #if SPEC_DEC
-                      qSeqLen, reinterpret_cast<uint32_t const*>(qCuSeqLens->data),
-                      reinterpret_cast<MaskType const*>(mask->data),
+                      qSeqLen, reinterpret_cast<uint32_t const*>(qCuSeqLens.data_ptr()),
+                      reinterpret_cast<MaskType const*>(mask.data_ptr()),
 #endif
-                      reinterpret_cast<uint32_t*>(semaphores->data),
-                      reinterpret_cast<void*>(scratch->data), stream);
+                      reinterpret_cast<uint32_t*>(semaphores.data_ptr()),
+                      reinterpret_cast<void*>(scratch.data_ptr()), stream);
 }

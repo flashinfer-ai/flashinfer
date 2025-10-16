@@ -340,7 +340,7 @@ struct alignas(mha::min<uint32_t>(maxArrayAlign<T>(rows_* cols_), cacheLineSize)
                      rowBytes % cacheLineSize == 0 ? cacheLineSize : rowBytes % cacheLineSize);
         constexpr uint32_t swizzleRowsRepeat = exactDiv(cacheLineSize, sizeof(Elem));
         auto const runtimeBaseOffset =
-            static_cast<uint32_t>(__cvta_generic_to_shared(this->data)) / rowBytes % rows;
+            static_cast<uint32_t>(__cvta_generic_to_shared(this.data_ptr())) / rowBytes % rows;
         uint32_t const baseOffset =
             alignedForSwizzle
                 ? 0

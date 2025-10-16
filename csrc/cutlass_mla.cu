@@ -23,21 +23,21 @@ using namespace flashinfer::attention;
 void CutlassMLAPagedAttention(ffi::TensorView workspace, ffi::TensorView out, ffi::TensorView lse,
                               ffi::TensorView q_nope_pe, ffi::TensorView ckv_kpe_cache,
                               ffi::TensorView kv_lens, ffi::TensorView page_table) {
-  cudaSetDevice(q_nope_pe->device.device_id);
-  const cudaStream_t stream = get_stream(q_nope_pe->device);
+  cudaSetDevice(q_nope_pe.device().device_id);
+  const cudaStream_t stream = get_stream(q_nope_pe.device());
 
-  int device_index = q_nope_pe->device.device_id;
-  int batches = q_nope_pe->shape[0];
-  int page_count_per_seq = page_table->shape[1];
-  int page_count_total = ckv_kpe_cache->shape[0];
-  int page_size = ckv_kpe_cache->shape[1];
+  int device_index = q_nope_pe.device().device_id;
+  int batches = q_nope_pe.size(0);
+  int page_count_per_seq = page_table.size(1);
+  int page_count_total = ckv_kpe_cache.size(0);
+  int page_size = ckv_kpe_cache.size(1);
 
-  DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(q_nope_pe->dtype, c_type, [&] {
+  DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(q_nope_pe.dtype(), c_type, [&] {
     using cutlass_t = cutlass_dtype_t<c_type>;
-    auto status =
-        runMla<cutlass_t>(workspace->data, out->data, lse->data, q_nope_pe->data,
-                          ckv_kpe_cache->data, kv_lens->data, page_table->data, batches,
-                          page_count_per_seq, page_count_total, page_size, device_index, stream);
+    auto status = runMla<cutlass_t>(
+        workspace.data_ptr(), out.data_ptr(), lse.data_ptr(), q_nope_pe.data_ptr(),
+        ckv_kpe_cache.data_ptr(), kv_lens.data_ptr(), page_table.data_ptr(), batches,
+        page_count_per_seq, page_count_total, page_size, device_index, stream);
 
     TVM_FFI_ICHECK(status == cudaSuccess)
         << "Failed to run CutlassMLAPagedAttention: " << cudaGetErrorString(status);
