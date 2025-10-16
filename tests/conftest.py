@@ -137,11 +137,11 @@ def is_cuda_oom_error_str(e: str) -> bool:
     return "CUDA" in e and "out of memory" in e
 
 
-@pytest.hookimpl(tryfirst=True)
+@pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_call(item):
-    # skip OOM error and missing JIT cache errors
+    # Wrap the test call so we don't invoke item.runtest() ourselves; yield lets pytest run it.
     try:
-        item.runtest()
+        yield
     except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
         if isinstance(e, torch.cuda.OutOfMemoryError) or is_cuda_oom_error_str(str(e)):
             pytest.skip("Skipping due to OOM")
