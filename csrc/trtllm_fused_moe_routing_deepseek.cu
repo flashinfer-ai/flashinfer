@@ -79,8 +79,8 @@ __global__ void routingMainKernel(KernelParams params) {
     expertSelected = laneIdx < params.mNumExpertsPerGroup;
   }
   auto scoreIdx = int64_t{blockIdx.x} * int64_t{params.mNumExperts} + threadExpert;
-  auto biasVal = expertSelected ? params.mPtrRoutingBias[threadExpert] : invalidScore;
-
+  auto biasVal =
+      expertSelected ? static_cast<float>(params.mPtrRoutingBias[threadExpert]) : invalidScoreFloat;
   // initialize the mPtrExpertCounts
   if (params.mPtrExpertCounts) {
     int32_t globalThreadIdx = blockIdx.x * NumThreads + threadIdx.x;
@@ -496,24 +496,24 @@ void runImpl(Data& data, void* stream) {
 
   // Maximum number of tokens supported by the kernel using a cooperative launch.
   int const maxTokensCoop = (numBlocksCoop * NumThreads * 64) / data.mTopK;
-  LAUNCH_ROUTING_WITH_EXTRA_FLAG(data,
-                                 /*coopLaunch=*/false, routingMainKernel, numBlocks, NumThreads,
-                                 /*smemSize=*/0,  // No dynamic smem
-                                 stream, data.mNumExpertGroups > 1, /*forceFloatInput=*/true);
+  LAUNCH_ROUTING_DEEPSEEK(data,
+                          /*coopLaunch=*/false, routingMainKernel, numBlocks, NumThreads,
+                          /*smemSize=*/0,  // No dynamic smem
+                          stream, data.mNumExpertGroups > 1);
 
   if (data.mPtrPermutedIdxSize != nullptr) {
     if (useSingleCluster) {
-      LAUNCH_ROUTING_WITH_EXTRA_FLAG(data,
-                                     /*coopLaunch=*/false, routingIndicesClusterKernel,
-                                     NumBlocksPerCluster, NumThreads,
-                                     /*smemSize=*/0,  // No dynamic smem
-                                     stream, data.mNumExpertGroups > 1, /*forceFloatInput=*/true);
+      LAUNCH_ROUTING_DEEPSEEK(data,
+                              /*coopLaunch=*/false, routingIndicesClusterKernel,
+                              NumBlocksPerCluster, NumThreads,
+                              /*smemSize=*/0,  // No dynamic smem
+                              stream, data.mNumExpertGroups > 1);
     } else if (data.mNumTokens <= maxTokensCoop) {
-      LAUNCH_ROUTING_WITH_EXTRA_FLAG(data,
-                                     /*coopLaunch=*/true, routingIndicesCoopKernel, numBlocksCoop,
-                                     NumThreads,
-                                     /*smemSize=*/0,  // No dynamic smem
-                                     stream, data.mNumExpertGroups > 1, /*forceFloatInput=*/true);
+      LAUNCH_ROUTING_DEEPSEEK(data,
+                              /*coopLaunch=*/true, routingIndicesCoopKernel, numBlocksCoop,
+                              NumThreads,
+                              /*smemSize=*/0,  // No dynamic smem
+                              stream, data.mNumExpertGroups > 1);
     } else {
       const int32_t expandedIdxSize = data.mNumTokens * data.mTopK;
 
@@ -528,16 +528,16 @@ void runImpl(Data& data, void* stream) {
       int const numBlocksOffsets =
           std::min((expandedIdxSize + offsetEltsPerBlock - 1) / offsetEltsPerBlock, maxNumBlocks);
 
-      LAUNCH_ROUTING_WITH_EXTRA_FLAG(data,
-                                     /*coopLaunch=*/false, routingIndicesHistogramKernel,
-                                     numBlocksHistogram, NumThreads,
-                                     /*smemSize=*/0,  // No dynamic smem
-                                     stream, data.mNumExpertGroups > 1, /*forceFloatInput=*/true);
-      LAUNCH_ROUTING_WITH_EXTRA_FLAG(data,
-                                     /*coopLaunch=*/false, routingIndicesOffsetsKernel,
-                                     numBlocksOffsets, NumThreads,
-                                     /*smemSize=*/0,  // No dynamic smem
-                                     stream, data.mNumExpertGroups > 1, /*forceFloatInput=*/true);
+      LAUNCH_ROUTING_DEEPSEEK(data,
+                              /*coopLaunch=*/false, routingIndicesHistogramKernel,
+                              numBlocksHistogram, NumThreads,
+                              /*smemSize=*/0,  // No dynamic smem
+                              stream, data.mNumExpertGroups > 1);
+      LAUNCH_ROUTING_DEEPSEEK(data,
+                              /*coopLaunch=*/false, routingIndicesOffsetsKernel, numBlocksOffsets,
+                              NumThreads,
+                              /*smemSize=*/0,  // No dynamic smem
+                              stream, data.mNumExpertGroups > 1);
     }
   }
 }
