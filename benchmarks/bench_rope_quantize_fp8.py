@@ -183,6 +183,20 @@ def benchmark_config(config_name, num_tokens, provider):
                 torch.cuda.cudart().cudaProfilerStop()
 
     elif provider == "torch":
+        # Create compiled version for better performance
+        @torch.compile
+        def torch_rope_quantize(q_in, k_in, pos_ids):
+            # Apply RoPE using reference implementation
+            q_out_f16, k_out_f16 = rope_ref.forward_native(pos_ids, q_in, k_in)
+
+            # Quantize to FP8 (PyTorch native)
+            q_out_f8 = q_out_f16.to(quant_dtype)
+            k_out_f8 = k_out_f16.to(quant_dtype)
+            return q_out_f8, k_out_f8
+
+        # Warmup the compiled function
+        _ = torch_rope_quantize(q_in, k_in, pos_ids)
+        torch.cuda.synchronize()
 
         def execute():
             nonlocal run_idx
@@ -191,12 +205,7 @@ def benchmark_config(config_name, num_tokens, provider):
             if mode_ncu and run_idx == 20:
                 torch.cuda.cudart().cudaProfilerStart()
 
-            # Apply RoPE using reference implementation
-            q_out_f16, k_out_f16 = rope_ref.forward_native(pos_ids, q_in, k_in)
-
-            # Quantize to FP8 (PyTorch native)
-            _ = q_out_f16.to(quant_dtype)
-            _ = k_out_f16.to(quant_dtype)
+            _ = torch_rope_quantize(q_in, k_in, pos_ids)
 
             if mode_ncu and run_idx == 20:
                 torch.cuda.cudart().cudaProfilerStop()
@@ -224,7 +233,7 @@ def benchmark_config(config_name, num_tokens, provider):
         x_vals=[768] if mode_ncu else [1, 2, 4, 8, 16, 32, 64, 128, 256, 384, 512, 768],
         line_arg="provider",
         line_vals=["flashinfer", "torch"],
-        line_names=["FlashInfer", "PyTorch"],
+        line_names=["FlashInfer", "PyTorch Compiled"],
         styles=[("blue", "-"), ("blue", "--")],
         ylabel="Latency (ms)",
         plot_name="mla-rope-benchmark",
@@ -241,7 +250,7 @@ def benchmark_mla(provider, num_tokens):
         x_vals=[768] if mode_ncu else [1, 2, 4, 8, 16, 32, 64, 128, 256, 384, 512, 768],
         line_arg="provider",
         line_vals=["flashinfer", "torch"],
-        line_names=["FlashInfer", "PyTorch"],
+        line_names=["FlashInfer", "PyTorch Compiled"],
         styles=[("red", "-"), ("red", "--")],
         ylabel="Latency (ms)",
         plot_name="gqa-rope-benchmark",
@@ -258,7 +267,7 @@ def benchmark_gqa(provider, num_tokens):
         x_vals=[768] if mode_ncu else [1, 2, 4, 8, 16, 32, 64, 128, 256, 384, 512, 768],
         line_arg="provider",
         line_vals=["flashinfer", "torch"],
-        line_names=["FlashInfer", "PyTorch"],
+        line_names=["FlashInfer", "PyTorch Compiled"],
         styles=[("green", "-"), ("green", "--")],
         ylabel="Latency (ms)",
         plot_name="mha-rope-benchmark",
