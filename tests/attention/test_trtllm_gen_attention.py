@@ -1004,9 +1004,6 @@ def test_trtllm_gen_prefill_deepseek(
 
     bmm1_scale = scale
     bmm2_scale = 1.0
-    if batch_size == 1:
-        # trtllm kernel requires max_q_len to be the same as cum_seq_lens_q when batch_size=1
-        s_qo = qo_indptr[-1].item()
     output_trtllm, lse_trtllm = flashinfer.prefill.trtllm_ragged_attention_deepseek(
         q,
         k_cache,

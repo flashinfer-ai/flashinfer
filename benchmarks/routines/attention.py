@@ -928,12 +928,6 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
         v_fp8 = (v_data / v_scale).to(kv_dtype)
         kv_cache = torch.cat([k_fp8, v_fp8], dim=1)
 
-    if batch_size == 1:
-        # trtllm kernel requires max_q_len to be the same as the seqlen of the query when batch_size=1
-        s_qo_trtllm = qo_indptr[-1].item()
-    else:
-        s_qo_trtllm = s_qo
-
     def run_backend_wrapper(backend):
         if backend in ["fa2", "fa3", "trtllm-gen"]:
             return backend_wrappers[backend].run(
@@ -964,7 +958,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 workspace_buffer=workspace_buffer,
                 block_tables=block_tables,
                 seq_lens=actual_seq_lens_kv_device,
-                max_q_len=s_qo_trtllm,
+                max_q_len=s_qo,
                 max_kv_len=s_kv,
                 bmm1_scale=scale if k_scale is None else k_scale * scale,
                 bmm2_scale=1.0 if v_scale is None else v_scale,
@@ -1380,12 +1374,6 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
         k = (k / k_scale).to(kv_dtype)
         v = (v / v_scale).to(kv_dtype)
 
-    if batch_size == 1:
-        # trtllm kernel requires max_q_len to be the same as the seqlen of the query when batch_size=1
-        s_qo_trtllm = qo_indptr[-1].item()
-    else:
-        s_qo_trtllm = s_qo
-
     def run_backend_wrapper(backend):
         if backend in ["cutlass", "fa2", "fa3", "trtllm-gen"]:
             return backend_wrappers[backend].run_return_lse(q, k, v)[0]
@@ -1417,7 +1405,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 value=v,
                 workspace_buffer=workspace_buffer,
                 seq_lens=actual_seq_lens_kv_device,
-                max_q_len=s_qo_trtllm,
+                max_q_len=s_qo,
                 max_kv_len=s_kv,
                 bmm1_scale=scale,
                 bmm2_scale=1.0,
