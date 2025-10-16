@@ -1,4 +1,5 @@
 import os
+import sys
 from typing import Union
 
 from torch import nn
@@ -7,6 +8,10 @@ import numpy as np
 import torch
 import triton
 from flashinfer.testing.utils import bench_gpu_time, bench_gpu_time_with_cudagraph
+
+# Add the project root to Python path to import test helpers
+sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
+from tests.test_helpers.rope_reference import RotaryEmbedding
 
 mode_ncu = bool(int(os.environ.get("FLASHINFER_MODE_NCU", "0")))
 
@@ -83,7 +88,7 @@ class FlashInferRotaryEmbedding(nn.Module):
             return torch.stack((o1, o2), dim=-1).flatten(-2)
 
 
-def benchmark_config(config_name, num_tokens):
+def benchmark_config(config_name, num_tokens, provider):
     """Benchmark a specific attention configuration."""
     input_dtype = torch.bfloat16
     device = "cuda"
@@ -107,77 +112,104 @@ def benchmark_config(config_name, num_tokens):
 
     total_dim = rope_dim + no_rope_dim
 
-    # Create tensors based on configuration
-    q_rope = torch.randn(
-        num_tokens, num_qo_heads, rope_dim, dtype=input_dtype, device=device
-    )
-    q_nope = torch.randn(
-        num_tokens, num_qo_heads, no_rope_dim, dtype=input_dtype, device=device
-    )
-
+    # Create input tensors for both implementations
     if config_name == "mla":
         # MLA: 2D K tensors (shared)
-        k_rope = torch.randn(num_tokens, rope_dim, dtype=input_dtype, device=device)
-        k_nope = torch.randn(num_tokens, no_rope_dim, dtype=input_dtype, device=device)
+        q_in = torch.randn(
+            num_tokens, num_qo_heads, total_dim, dtype=input_dtype, device=device
+        )
+        k_in = torch.randn(num_tokens, total_dim, dtype=input_dtype, device=device)
     else:
         # GQA/MHA: 3D K tensors (multiple heads)
-        k_rope = torch.randn(
-            num_tokens, num_kv_heads, rope_dim, dtype=input_dtype, device=device
+        q_in = torch.randn(
+            num_tokens, num_qo_heads, total_dim, dtype=input_dtype, device=device
         )
-        k_nope = torch.randn(
-            num_tokens, num_kv_heads, no_rope_dim, dtype=input_dtype, device=device
+        k_in = torch.randn(
+            num_tokens, num_kv_heads, total_dim, dtype=input_dtype, device=device
         )
 
     pos_ids = torch.arange(num_tokens, device=device)
 
-    # Create output tensors
-    q_rope_out = torch.empty_like(q_rope, dtype=quant_dtype)
-    q_nope_out = torch.empty_like(q_nope, dtype=quant_dtype)
-    k_rope_out = torch.empty_like(k_rope, dtype=quant_dtype)
-    k_nope_out = torch.empty_like(k_nope, dtype=quant_dtype)
-
-    rope_flashinfer = FlashInferRotaryEmbedding(
+    # Create reference implementation
+    rope_ref = RotaryEmbedding(
         head_size=total_dim,
         rotary_dim=rope_dim,
         max_position_embeddings=4096,
         base=10000,
         is_neox_style=False,
         dtype=input_dtype,
-    ).to(device)
+        device=device,
+    )
 
     run_idx = 0
 
-    def execute():
-        nonlocal run_idx
-        run_idx += 1
+    if provider == "flashinfer":
+        # Split tensors for FlashInfer
+        q_rope = q_in[..., :rope_dim]
+        q_nope = q_in[..., rope_dim:]
+        k_rope = k_in[..., :rope_dim]
+        k_nope = k_in[..., rope_dim:]
 
-        if mode_ncu and run_idx == 20:
-            torch.cuda.cudart().cudaProfilerStart()
+        # Create output tensors
+        q_rope_out = torch.empty_like(q_rope, dtype=quant_dtype)
+        q_nope_out = torch.empty_like(q_nope, dtype=quant_dtype)
+        k_rope_out = torch.empty_like(k_rope, dtype=quant_dtype)
+        k_nope_out = torch.empty_like(k_nope, dtype=quant_dtype)
 
-        flashinfer.rope.rope_quantize_fp8(
-            q_rope=q_rope,
-            k_rope=k_rope,
-            q_nope=q_nope,
-            k_nope=k_nope,
-            cos_sin_cache=rope_flashinfer.cos_sin_cache,
-            pos_ids=pos_ids,
-            is_neox=False,
-            q_rope_out=q_rope_out,
-            k_rope_out=k_rope_out,
-            q_nope_out=q_nope_out,
-            k_nope_out=k_nope_out,
-            quant_scale_q=1.0,
-            quant_scale_kv=1.0,
-        )
+        def execute():
+            nonlocal run_idx
+            run_idx += 1
 
-        if mode_ncu and run_idx == 20:
-            torch.cuda.cudart().cudaProfilerStop()
+            if mode_ncu and run_idx == 20:
+                torch.cuda.cudart().cudaProfilerStart()
+
+            flashinfer.rope.rope_quantize_fp8(
+                q_rope=q_rope,
+                k_rope=k_rope,
+                q_nope=q_nope,
+                k_nope=k_nope,
+                cos_sin_cache=rope_ref.cos_sin_cache,
+                pos_ids=pos_ids,
+                is_neox=False,
+                q_rope_out=q_rope_out,
+                k_rope_out=k_rope_out,
+                q_nope_out=q_nope_out,
+                k_nope_out=k_nope_out,
+                quant_scale_q=1.0,
+                quant_scale_kv=1.0,
+            )
+
+            if mode_ncu and run_idx == 20:
+                torch.cuda.cudart().cudaProfilerStop()
+
+    elif provider == "torch":
+
+        def execute():
+            nonlocal run_idx
+            run_idx += 1
+
+            if mode_ncu and run_idx == 20:
+                torch.cuda.cudart().cudaProfilerStart()
+
+            # Apply RoPE using reference implementation
+            q_out_f16, k_out_f16 = rope_ref.forward_native(pos_ids, q_in, k_in)
+
+            # Quantize to FP8 (PyTorch native)
+            _ = q_out_f16.to(quant_dtype)
+            _ = k_out_f16.to(quant_dtype)
+
+            if mode_ncu and run_idx == 20:
+                torch.cuda.cudart().cudaProfilerStop()
+
+    else:
+        raise ValueError(f"Unknown provider: {provider}")
 
     if mode_ncu:
         measurements = bench_gpu_time(execute)
     else:
         measurements = bench_gpu_time_with_cudagraph(execute)
-    # Calculate statistics to match original return values
+
+    # Calculate statistics
     ms = np.median(measurements)
     min_ms = np.percentile(measurements, 20)
     max_ms = np.percentile(measurements, 80)
@@ -191,16 +223,16 @@ def benchmark_config(config_name, num_tokens):
         x_names=["num_tokens"],
         x_vals=[768] if mode_ncu else [1, 2, 4, 8, 16, 32, 64, 128, 256, 384, 512, 768],
         line_arg="provider",
-        line_vals=["flashinfer"],
-        line_names=["FlashInfer"],
-        styles=[("blue", "-")],
+        line_vals=["flashinfer", "torch"],
+        line_names=["FlashInfer", "PyTorch"],
+        styles=[("blue", "-"), ("blue", "--")],
         ylabel="Latency (ms)",
         plot_name="mla-rope-benchmark",
         args={},
     )
 )
 def benchmark_mla(provider, num_tokens):
-    return benchmark_config("mla", num_tokens)
+    return benchmark_config("mla", num_tokens, provider)
 
 
 @triton.testing.perf_report(
@@ -208,16 +240,16 @@ def benchmark_mla(provider, num_tokens):
         x_names=["num_tokens"],
         x_vals=[768] if mode_ncu else [1, 2, 4, 8, 16, 32, 64, 128, 256, 384, 512, 768],
         line_arg="provider",
-        line_vals=["flashinfer"],
-        line_names=["FlashInfer"],
-        styles=[("red", "--")],
+        line_vals=["flashinfer", "torch"],
+        line_names=["FlashInfer", "PyTorch"],
+        styles=[("red", "-"), ("red", "--")],
         ylabel="Latency (ms)",
         plot_name="gqa-rope-benchmark",
         args={},
     )
 )
 def benchmark_gqa(provider, num_tokens):
-    return benchmark_config("gqa", num_tokens)
+    return benchmark_config("gqa", num_tokens, provider)
 
 
 @triton.testing.perf_report(
@@ -225,16 +257,16 @@ def benchmark_gqa(provider, num_tokens):
         x_names=["num_tokens"],
         x_vals=[768] if mode_ncu else [1, 2, 4, 8, 16, 32, 64, 128, 256, 384, 512, 768],
         line_arg="provider",
-        line_vals=["flashinfer"],
-        line_names=["FlashInfer"],
-        styles=[("green", ":")],
+        line_vals=["flashinfer", "torch"],
+        line_names=["FlashInfer", "PyTorch"],
+        styles=[("green", "-"), ("green", "--")],
         ylabel="Latency (ms)",
         plot_name="mha-rope-benchmark",
         args={},
     )
 )
 def benchmark_mha(provider, num_tokens):
-    return benchmark_config("mha", num_tokens)
+    return benchmark_config("mha", num_tokens, provider)
 
 
 if __name__ == "__main__":
@@ -254,13 +286,20 @@ if __name__ == "__main__":
     )
 
     print("\n=== Summary Table ===")
-    print(f"{'Tokens':<8} {'MLA (ms)':<10} {'GQA (ms)':<10} {'MHA (ms)':<10}")
-    print("-" * 40)
+    print(
+        f"{'Tokens':<8} {'MLA-FI (ms)':<12} {'MLA-Torch (ms)':<14} {'GQA-FI (ms)':<12} {'GQA-Torch (ms)':<14} {'MHA-FI (ms)':<12} {'MHA-Torch (ms)':<14}"
+    )
+    print("-" * 90)
     for num_tokens in token_counts:
-        mla_ms, _, _ = benchmark_config("mla", num_tokens)
-        gqa_ms, _, _ = benchmark_config("gqa", num_tokens)
-        mha_ms, _, _ = benchmark_config("mha", num_tokens)
-        print(f"{num_tokens:<8} {mla_ms:<10.5f} {gqa_ms:<10.5f} {mha_ms:<10.5f}")
+        mla_fi_ms, _, _ = benchmark_config("mla", num_tokens, "flashinfer")
+        mla_torch_ms, _, _ = benchmark_config("mla", num_tokens, "torch")
+        gqa_fi_ms, _, _ = benchmark_config("gqa", num_tokens, "flashinfer")
+        gqa_torch_ms, _, _ = benchmark_config("gqa", num_tokens, "torch")
+        mha_fi_ms, _, _ = benchmark_config("mha", num_tokens, "flashinfer")
+        mha_torch_ms, _, _ = benchmark_config("mha", num_tokens, "torch")
+        print(
+            f"{num_tokens:<8} {mla_fi_ms:<12.5f} {mla_torch_ms:<14.5f} {gqa_fi_ms:<12.5f} {gqa_torch_ms:<14.5f} {mha_fi_ms:<12.5f} {mha_torch_ms:<14.5f}"
+        )
 
     print("\nConfiguration details:")
     print("  MLA: 128 Q heads, 1 K head, 64+512 dims")
@@ -268,6 +307,6 @@ if __name__ == "__main__":
     print("  MHA: 32 Q heads, 32 K heads, 64+64 dims")
 
     print("\nPlot files saved to current directory:")
-    print("  mla-rope-benchmark.png")
-    print("  gqa-rope-benchmark.png")
-    print("  mha-rope-benchmark.png")
+    print("  mla-rope-benchmark.png (FlashInfer vs PyTorch)")
+    print("  gqa-rope-benchmark.png (FlashInfer vs PyTorch)")
+    print("  mha-rope-benchmark.png (FlashInfer vs PyTorch)")
