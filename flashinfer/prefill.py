@@ -3223,7 +3223,7 @@ def trtllm_ragged_attention_deepseek(
     max_q_len : int
         max query length
     max_kv_len : int
-        max key/value length.
+        max key/value length
     bmm1_scale : float
         scale for bmm1, scale_q * scale_k * 1.0 / (head_dim_qk ** 0.5)
     bmm2_scale : float
