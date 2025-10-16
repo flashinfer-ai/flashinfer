@@ -362,21 +362,22 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     // TODO: support lora in the future
     ::tensorrt_llm::kernels::LoraParams lora_params{};
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
-    mKernelRunner->runMoe(input.data_ptr(), input_sf.has_value() ? input_sf.value().data_ptr() : nullptr,
-                          reinterpret_cast<int const*>(token_selected_experts.data_ptr()),
-                          token_final_scales.has_value()
-                              ? reinterpret_cast<float const*>(token_final_scales.value().data_ptr())
-                              : nullptr,
-                          fc1_expert_weights.data_ptr(),
-                          fc1_expert_biases.has_value() ? fc1_expert_biases.value().data_ptr() : nullptr,
-                          activation_params, fc2_expert_weights.data_ptr(),
-                          fc2_expert_biases.has_value() ? fc2_expert_biases.value().data_ptr() : nullptr,
-                          quant_params, num_rows, hidden_size, inter_size, num_experts_total,
-                          static_cast<int>(experts_per_token),
-                          static_cast<char*>(workspace_info.workspace.data_ptr()), output.data_ptr(),
-                          static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config,
-                          enable_alltoall, false, lora_params, mUseDeepSeekFP8BlockScaling,
-                          min_latency_mode, min_latency_params, enable_pdl, stream);
+    mKernelRunner->runMoe(
+        input.data_ptr(), input_sf.has_value() ? input_sf.value().data_ptr() : nullptr,
+        reinterpret_cast<int const*>(token_selected_experts.data_ptr()),
+        token_final_scales.has_value()
+            ? reinterpret_cast<float const*>(token_final_scales.value().data_ptr())
+            : nullptr,
+        fc1_expert_weights.data_ptr(),
+        fc1_expert_biases.has_value() ? fc1_expert_biases.value().data_ptr() : nullptr,
+        activation_params, fc2_expert_weights.data_ptr(),
+        fc2_expert_biases.has_value() ? fc2_expert_biases.value().data_ptr() : nullptr,
+        quant_params, num_rows, hidden_size, inter_size, num_experts_total,
+        static_cast<int>(experts_per_token),
+        static_cast<char*>(workspace_info.workspace.data_ptr()), output.data_ptr(),
+        static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, enable_alltoall,
+        false, lora_params, mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params,
+        enable_pdl, stream);
 #else
     mKernelRunner->runMoe(
         input.data_ptr(), input_sf.has_value() ? input_sf.value().data_ptr() : nullptr,
@@ -387,11 +388,12 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         fc1_expert_weights.data_ptr(),
         fc1_expert_biases.has_value() ? fc1_expert_biases.value().data_ptr() : nullptr,
         activation_params, fc2_expert_weights.data_ptr(),
-        fc2_expert_biases.has_value() ? fc2_expert_biases.value().data_ptr() : nullptr, quant_params,
-        num_rows, hidden_size, inter_size, num_experts_total, static_cast<int>(experts_per_token),
-        static_cast<char*>(workspace_info.workspace), output.data_ptr(),
-        static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, false, lora_params,
-        mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, enable_pdl, stream);
+        fc2_expert_biases.has_value() ? fc2_expert_biases.value().data_ptr() : nullptr,
+        quant_params, num_rows, hidden_size, inter_size, num_experts_total,
+        static_cast<int>(experts_per_token), static_cast<char*>(workspace_info.workspace),
+        output.data_ptr(), static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config,
+        false, lora_params, mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params,
+        enable_pdl, stream);
 #endif
   }
 
@@ -519,8 +521,10 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     kernels::MoeMinLatencyParams min_latency_params{};
     min_latency_params.num_active_experts_per_node =
         static_cast<int*>(num_active_experts_per_node.data_ptr());
-    min_latency_params.experts_to_token_score = static_cast<float*>(experts_to_token_score.data_ptr());
-    min_latency_params.active_expert_global_ids = static_cast<int*>(active_expert_global_ids.data_ptr());
+    min_latency_params.experts_to_token_score =
+        static_cast<float*>(experts_to_token_score.data_ptr());
+    min_latency_params.active_expert_global_ids =
+        static_cast<int*>(active_expert_global_ids.data_ptr());
 
     WorkspaceInfo workspace_info = getWorkspaceInfo(
         num_rows, hidden_size, inter_size, num_experts_total, static_cast<int>(experts_per_token),
@@ -532,21 +536,22 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     // TODO: support lora in the future
     ::tensorrt_llm::kernels::LoraParams lora_params{};
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
-    mKernelRunner->runMoe(input.data_ptr(), input_sf.has_value() ? input_sf.value().data_ptr() : nullptr,
-                          reinterpret_cast<int const*>(token_selected_experts.data_ptr()),
-                          token_final_scales.has_value()
-                              ? reinterpret_cast<float const*>(token_final_scales.value().data_ptr())
-                              : nullptr,
-                          fc1_expert_weights.data_ptr(),
-                          fc1_expert_biases.has_value() ? fc1_expert_biases.value().data_ptr() : nullptr,
-                          activation_params, fc2_expert_weights.data_ptr(),
-                          fc2_expert_biases.has_value() ? fc2_expert_biases.value().data_ptr() : nullptr,
-                          quant_params, num_rows, hidden_size, inter_size, num_experts_total,
-                          static_cast<int>(experts_per_token),
-                          static_cast<char*>(workspace_info.workspace.data_ptr()), output.data_ptr(),
-                          static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config,
-                          enable_alltoall, false, lora_params, mUseDeepSeekFP8BlockScaling,
-                          min_latency_mode, min_latency_params, enable_pdl, stream);
+    mKernelRunner->runMoe(
+        input.data_ptr(), input_sf.has_value() ? input_sf.value().data_ptr() : nullptr,
+        reinterpret_cast<int const*>(token_selected_experts.data_ptr()),
+        token_final_scales.has_value()
+            ? reinterpret_cast<float const*>(token_final_scales.value().data_ptr())
+            : nullptr,
+        fc1_expert_weights.data_ptr(),
+        fc1_expert_biases.has_value() ? fc1_expert_biases.value().data_ptr() : nullptr,
+        activation_params, fc2_expert_weights.data_ptr(),
+        fc2_expert_biases.has_value() ? fc2_expert_biases.value().data_ptr() : nullptr,
+        quant_params, num_rows, hidden_size, inter_size, num_experts_total,
+        static_cast<int>(experts_per_token),
+        static_cast<char*>(workspace_info.workspace.data_ptr()), output.data_ptr(),
+        static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, enable_alltoall,
+        false, lora_params, mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params,
+        enable_pdl, stream);
 #else
     mKernelRunner->runMoe(
         input.data_ptr(), input_sf.has_value() ? input_sf.value().data_ptr() : nullptr,
@@ -557,11 +562,12 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         fc1_expert_weights.data_ptr(),
         fc1_expert_biases.has_value() ? fc1_expert_biases.value().data_ptr() : nullptr,
         activation_params, fc2_expert_weights.data_ptr(),
-        fc2_expert_biases.has_value() ? fc2_expert_biases.value().data_ptr() : nullptr, quant_params,
-        num_rows, hidden_size, inter_size, num_experts_total, static_cast<int>(experts_per_token),
-        static_cast<char*>(workspace_info.workspace), output.data_ptr(),
-        static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, false, lora_params,
-        mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, enable_pdl, stream);
+        fc2_expert_biases.has_value() ? fc2_expert_biases.value().data_ptr() : nullptr,
+        quant_params, num_rows, hidden_size, inter_size, num_experts_total,
+        static_cast<int>(experts_per_token), static_cast<char*>(workspace_info.workspace),
+        output.data_ptr(), static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config,
+        false, lora_params, mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params,
+        enable_pdl, stream);
 #endif
   }
 
@@ -644,8 +650,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       mProfileWorkspace = alloc_tensor({static_cast<int64_t>(profile_workspace_size)}, dl_int8,
                                        DLDevice{kDLCUDA, device_id});
 
-      mProfiler->prepare(num_rows, static_cast<char*>(mProfileWorkspace.data_ptr()), expert_weights_ptr,
-                         enable_pdl, stream);
+      mProfiler->prepare(num_rows, static_cast<char*>(mProfileWorkspace.data_ptr()),
+                         expert_weights_ptr, enable_pdl, stream);
     }
 
     // Profile specific tactic. Assuming at least one preparation phase has been executed already.
@@ -781,8 +787,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     cudaGetDevice(&device_id);
     info.workspace = alloc_tensor({static_cast<int64_t>(total_workspace_size)}, dl_int8,
                                   DLDevice{kDLCUDA, device_id});
-    info.src_to_dest_map =
-        common::nextWorkspacePtr(static_cast<int8_t*>(info.workspace.data_ptr()), moe_workspace_size);
+    info.src_to_dest_map = common::nextWorkspacePtr(static_cast<int8_t*>(info.workspace.data_ptr()),
+                                                    moe_workspace_size);
 
     return info;
   }
@@ -818,11 +824,12 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       TVM_FFI_ICHECK_EQ(fc2_dequant.size(0), num_experts_on_rank)
           << "fc2 dequant size must be (num_experts_on_rank,)";
 
-      return kernels::QuantParams::FP8(
-          static_cast<float const*>(fc1_dequant.data_ptr()), static_cast<float const*>(fc2_quant.data_ptr()),
-          static_cast<float const*>(fc2_dequant.data_ptr()),
-          /* fp8 output quant scale */ nullptr, static_cast<float const*>(fc1_input_dequant.data_ptr()),
-          fc2_quant.ndim() == 1);
+      return kernels::QuantParams::FP8(static_cast<float const*>(fc1_dequant.data_ptr()),
+                                       static_cast<float const*>(fc2_quant.data_ptr()),
+                                       static_cast<float const*>(fc2_dequant.data_ptr()),
+                                       /* fp8 output quant scale */ nullptr,
+                                       static_cast<float const*>(fc1_input_dequant.data_ptr()),
+                                       fc2_quant.ndim() == 1);
     } else if (isWMxfp4AFp8Quant()) {
       TVM_FFI_ICHECK(quant_scales.has_value())
           << "Expecting quant scales for W4A8_MXFP4_MXF8 quantization";
@@ -846,7 +853,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       // Check ranks
       CHECK_DIM(3, fc1_weight_block);
       CHECK_DIM(1, fc1_global);
-      TVM_FFI_ICHECK_LE(fc2_act_global.ndim(), 1) << "fc2 act global must be a scalar or 1-D tensor";
+      TVM_FFI_ICHECK_LE(fc2_act_global.ndim(), 1)
+          << "fc2 act global must be a scalar or 1-D tensor";
       CHECK_DIM(3, fc2_weight_block);
       CHECK_DIM(1, fc2_global);
       // Check shapes
@@ -970,10 +978,12 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       CHECK_INPUT_TYPE(fc2_weight_block, dl_int32);
       CHECK_INPUT_TYPE(fc2_global, dl_float32);
       // Check ranks
-      TVM_FFI_ICHECK_LE(fc1_act_global.ndim(), 1) << "fc1 act global must be a scalar or 1-D tensor";
+      TVM_FFI_ICHECK_LE(fc1_act_global.ndim(), 1)
+          << "fc1 act global must be a scalar or 1-D tensor";
       CHECK_DIM(3, fc1_weight_block);
       CHECK_DIM(1, fc1_global);
-      TVM_FFI_ICHECK_LE(fc2_act_global.ndim(), 1) << "fc2 act global must be a scalar or 1-D tensor";
+      TVM_FFI_ICHECK_LE(fc2_act_global.ndim(), 1)
+          << "fc2 act global must be a scalar or 1-D tensor";
       CHECK_DIM(3, fc2_weight_block);
       CHECK_DIM(1, fc2_global);
       // Check shapes
@@ -1020,8 +1030,9 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     } else if (mUseDeepSeekFP8BlockScaling) {
       TensorView fc1_scales = quant_scales.value()[0];
       TensorView fc2_scales = quant_scales.value()[1];
-      return kernels::QuantParams::FP8BlockScaling(static_cast<float const*>(fc1_scales.data_ptr()),
-                                                   static_cast<float const*>(fc2_scales.data_ptr()));
+      return kernels::QuantParams::FP8BlockScaling(
+          static_cast<float const*>(fc1_scales.data_ptr()),
+          static_cast<float const*>(fc2_scales.data_ptr()));
     } else if (isWFP4A16Quant()) {
       TVM_FFI_ICHECK(quant_scales.has_value()) << "Expecting quant scales for W4 quantization";
       TVM_FFI_ICHECK_EQ(quant_scales.value().size(), 2)
@@ -1050,10 +1061,14 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       return kernels::QuantParams::GroupWise(
           group_size, static_cast<void const*>(fc1_weight_scales.data_ptr()),
           static_cast<void const*>(fc2_weight_scales.data_ptr()),
-          static_cast<void const*>(fc1_act_scales.numel() > 0 ? fc1_act_scales.data_ptr() : nullptr),
-          static_cast<void const*>(fc2_act_scales.numel() > 0 ? fc2_act_scales.data_ptr() : nullptr),
-          static_cast<void const*>(fc1_weight_zeros.numel() > 0 ? fc1_weight_zeros.data_ptr() : nullptr),
-          static_cast<void const*>(fc2_weight_zeros.numel() > 0 ? fc2_weight_zeros.data_ptr() : nullptr),
+          static_cast<void const*>(fc1_act_scales.numel() > 0 ? fc1_act_scales.data_ptr()
+                                                              : nullptr),
+          static_cast<void const*>(fc2_act_scales.numel() > 0 ? fc2_act_scales.data_ptr()
+                                                              : nullptr),
+          static_cast<void const*>(fc1_weight_zeros.numel() > 0 ? fc1_weight_zeros.data_ptr()
+                                                                : nullptr),
+          static_cast<void const*>(fc2_weight_zeros.numel() > 0 ? fc2_weight_zeros.data_ptr()
+                                                                : nullptr),
           static_cast<float const*>(fc1_alpha.numel() > 0 ? fc1_alpha.data_ptr() : nullptr),
           static_cast<float const*>(fc2_alpha.numel() > 0 ? fc2_alpha.data_ptr() : nullptr));
     } else {

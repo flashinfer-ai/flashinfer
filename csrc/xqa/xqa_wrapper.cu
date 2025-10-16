@@ -43,8 +43,8 @@ void xqa_wrapper(int64_t multiProcessorCount, int64_t nbKHeads, int64_t slidingW
 #endif
                       reinterpret_cast<InputHead const*>(q.data_ptr()), attentionSinksPtr,
                       reinterpret_cast<GMemCacheHead*>(pool.data_ptr()),
-                      reinterpret_cast<KVCachePageIndex const*>(kvCachePageList.data_ptr()), maxSeqLen,
-                      reinterpret_cast<uint32_t const*>(seqLen.data_ptr()), batchSize,
+                      reinterpret_cast<KVCachePageIndex const*>(kvCachePageList.data_ptr()),
+                      maxSeqLen, reinterpret_cast<uint32_t const*>(seqLen.data_ptr()), batchSize,
                       reinterpret_cast<float const*>(kvCacheScale.data_ptr()),
 #if SPEC_DEC
                       qSeqLen, reinterpret_cast<uint32_t const*>(qCuSeqLens.data_ptr()),
