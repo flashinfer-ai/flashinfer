@@ -70,8 +70,12 @@ auto getDispatchFunctionForSM100(cutlass_extensions::EpilogueScheduleType epilog
                                  bool dynamic_cga, bool swap_ab) {
   auto select_swap_ab = [dynamic_cga, epilogue_schedule](auto swap_ab_t) {
     auto select_dynamic_cga = [epilogue_schedule](auto dynamic_cga_t) {
+#if defined(ENABLE_FP4)
       constexpr bool is_block_scaled =
           std::is_same_v<T, __nv_fp4_e2m1> || std::is_same_v<WeightType, __nv_fp4_e2m1>;
+#else
+      constexpr bool is_block_scaled = false;
+#endif
       if constexpr ((!is_block_scaled || Arch::kMinComputeCapability == 103) &&
                     FUSION != EpilogueFusion::FINALIZE) {
         auto func_map = std::array{
@@ -156,8 +160,12 @@ void dispatchMoeGemmFinalDispatchTmaWarpSpecialized(
   }
 #endif
   else {
+#if defined(ENABLE_FP4)
     constexpr static bool is_wfp4afp8 =
         std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<WeightType, __nv_fp4_e2m1>;
+#else
+    constexpr static bool is_wfp4afp8 = false;
+#endif
     if constexpr (is_wfp4afp8) {
       TLLM_CHECK_WITH_INFO(hopper_input.fpX_block_scaling_type ==
                                TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX,
@@ -220,8 +228,12 @@ constexpr bool are_tile_shapes_supported_sm100() {
   constexpr auto TileN = size<1>(CtaShape{});
 
   if constexpr (Arch::kMinComputeCapability == 103) {
+#if defined(ENABLE_FP4)
     return std::is_same_v<DataType, __nv_fp4_e2m1> && std::is_same_v<WeightType, __nv_fp4_e2m1> &&
            TileM == 128 && (TileN == 128 || TileN == 256);
+#else
+    return false;
+#endif
   }
 
   if constexpr (TileM != 64 && TileM != 128) {
