@@ -35,7 +35,7 @@ void top_p_renorm_probs(TensorView probs, TensorView renorm_probs,
   cudaError_t status = sampling::TopPRenormProb<float>(
       static_cast<float*>(probs->data), static_cast<float*>(renorm_probs->data),
       has_top_p_arr ? static_cast<float*>(maybe_top_p_arr.value()->data) : nullptr, batch_size,
-      top_p_val, vocab_size, probs_strides[0], stream);
+      top_p_val, vocab_size, probs->strides[0], stream);
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "TopPRenormProb failed with error code " << cudaGetErrorString(status);
 }
