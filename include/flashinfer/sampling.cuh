@@ -746,7 +746,8 @@ template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
           typename DType, typename IdType>
 __global__ void SamplingFromLogitsKernel(DType* logits, IdType* output, IdType* indices, uint32_t d,
-                                         uint64_t philox_seed, uint64_t philox_offset) {
+                                         uint32_t stride, uint64_t philox_seed,
+                                         uint64_t philox_offset) {
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
   const uint32_t row_idx = indices == nullptr ? bx : indices[bx];
   using SharedMem = typename BlockReduce<DataAndIndex<DType, IdType>, BLOCK_THREADS,
@@ -759,7 +760,8 @@ __global__ void SamplingFromLogitsKernel(DType* logits, IdType* output, IdType* 
   for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
     logits_vec.fill(-cuda::std::numeric_limits<DType>::infinity());
     if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
-      logits_vec.cast_load(logits + row_idx * d + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
+      logits_vec.cast_load(logits + row_idx * stride + i * BLOCK_THREADS * VEC_SIZE +
+                           tx * VEC_SIZE);
     }
 
     vec_t<DType, VEC_SIZE> gumbel_noise = GenerateGumbelNoise<DType, VEC_SIZE>(
@@ -787,7 +789,8 @@ template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
           typename DType, typename IdType>
 __global__ void SamplingFromProbKernel(DType* probs, IdType* output, IdType* indices, uint32_t d,
-                                       uint64_t philox_seed, uint64_t philox_offset) {
+                                       uint32_t stride, uint64_t philox_seed,
+                                       uint64_t philox_offset) {
   curandStatePhilox4_32_10_t state;
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
   curand_init(philox_seed, bx, philox_offset, &state);
@@ -810,7 +813,7 @@ __global__ void SamplingFromProbKernel(DType* probs, IdType* output, IdType* ind
   for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
     probs_vec.fill(0);
     if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
-      probs_vec.cast_load(probs + row_idx * d + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
+      probs_vec.cast_load(probs + row_idx * stride + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
     }
 
     DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM,
@@ -835,7 +838,8 @@ template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           typename DType, typename IdType>
 __global__ void TopKSamplingFromProbKernel(DType* probs, IdType* output, IdType* indices,
                                            IdType* top_k_arr, uint32_t top_k_val, uint32_t d,
-                                           uint64_t philox_seed, uint64_t philox_offset) {
+                                           uint32_t stride, uint64_t philox_seed,
+                                           uint64_t philox_offset) {
   const uint32_t batch_size = gridDim.x;
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
   curandStatePhilox4_32_10_t state;
@@ -866,7 +870,7 @@ __global__ void TopKSamplingFromProbKernel(DType* probs, IdType* output, IdType*
     for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
       probs_vec.fill(0);
       if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
-        probs_vec.cast_load(probs + row_idx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
+        probs_vec.cast_load(probs + row_idx * stride + (i * BLOCK_THREADS + tx) * VEC_SIZE);
       }
 
       DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM,
@@ -884,7 +888,7 @@ __global__ void TopKSamplingFromProbKernel(DType* probs, IdType* output, IdType*
       // In this case, we use the last valid index as the sampled id
       sampled_id = temp_storage.last_valid_id;
     }
-    double pivot_0 = probs[row_idx * d + sampled_id];
+    double pivot_0 = probs[row_idx * stride + sampled_id];
     double pivot_1 = (pivot_0 + high) / 2;
 
     ValueCount<float> aggregate_gt_pivot_0{0, 0}, aggregate_gt_pivot_1{0, 0};
@@ -892,7 +896,7 @@ __global__ void TopKSamplingFromProbKernel(DType* probs, IdType* output, IdType*
     for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
       probs_vec.fill(0);
       if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
-        probs_vec.cast_load(probs + row_idx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
+        probs_vec.cast_load(probs + row_idx * stride + (i * BLOCK_THREADS + tx) * VEC_SIZE);
       }
 
       ValueCount<float> probs_gt_pivot_0[VEC_SIZE], probs_gt_pivot_1[VEC_SIZE];
@@ -950,7 +954,8 @@ template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           typename DType, typename IdType>
 __global__ void TopPSamplingFromProbKernel(DType* probs, IdType* output, IdType* indices,
                                            float* top_p_arr, float top_p_val, uint32_t d,
-                                           uint64_t philox_seed, uint64_t philox_offset) {
+                                           uint32_t stride, uint64_t philox_seed,
+                                           uint64_t philox_offset) {
   const uint32_t batch_size = gridDim.x;
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
   curandStatePhilox4_32_10_t state;
@@ -979,7 +984,7 @@ __global__ void TopPSamplingFromProbKernel(DType* probs, IdType* output, IdType*
     for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
       probs_vec.fill(0);
       if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
-        probs_vec.cast_load(probs + row_idx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
+        probs_vec.cast_load(probs + row_idx * stride + (i * BLOCK_THREADS + tx) * VEC_SIZE);
       }
 
       DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM,
@@ -997,7 +1002,7 @@ __global__ void TopPSamplingFromProbKernel(DType* probs, IdType* output, IdType*
       // In this case, we use the last valid index as the sampled id
       sampled_id = temp_storage.last_valid_id;
     }
-    double pivot_0 = probs[row_idx * d + sampled_id];
+    double pivot_0 = probs[row_idx * stride + sampled_id];
     double pivot_1 = (pivot_0 + high) / 2;
 
     float aggregate_gt_pivot_0 = 0, aggregate_gt_pivot_1 = 0;
@@ -1005,7 +1010,7 @@ __global__ void TopPSamplingFromProbKernel(DType* probs, IdType* output, IdType*
     for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
       probs_vec.fill(0);
       if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
-        probs_vec.cast_load(probs + row_idx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
+        probs_vec.cast_load(probs + row_idx * stride + (i * BLOCK_THREADS + tx) * VEC_SIZE);
       }
 
       float probs_gt_pivot_0[VEC_SIZE], probs_gt_pivot_1[VEC_SIZE];
@@ -1057,7 +1062,8 @@ template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           typename DType, typename IdType>
 __global__ void MinPSamplingFromProbKernel(DType* probs, float* min_p_arr, IdType* output,
                                            IdType* indices, float min_p_val, uint32_t d,
-                                           uint64_t philox_seed, uint64_t philox_offset) {
+                                           uint32_t stride, uint64_t philox_seed,
+                                           uint64_t philox_offset) {
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
   float p = (min_p_arr == nullptr) ? min_p_val : min_p_arr[bx];
   curandStatePhilox4_32_10_t state;
@@ -1073,7 +1079,7 @@ __global__ void MinPSamplingFromProbKernel(DType* probs, float* min_p_arr, IdTyp
 
   float max_val = GetMaxValue<VEC_SIZE, BLOCK_THREADS, REDUCE_ALGORITHM,
                               SamplingTempStorage<BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>>(
-      probs, row_idx, d, d, temp_storage);
+      probs, row_idx, d, stride, temp_storage);
   float pivot = max_val * p;
 
   vec_t<float, VEC_SIZE> probs_vec;
@@ -1082,7 +1088,7 @@ __global__ void MinPSamplingFromProbKernel(DType* probs, float* min_p_arr, IdTyp
   for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
     probs_vec.fill(0);
     if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
-      probs_vec.cast_load(probs + row_idx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
+      probs_vec.cast_load(probs + row_idx * stride + (i * BLOCK_THREADS + tx) * VEC_SIZE);
     }
 
     float probs_gt_pivot[VEC_SIZE];
@@ -1110,7 +1116,7 @@ __global__ void MinPSamplingFromProbKernel(DType* probs, float* min_p_arr, IdTyp
   for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
     probs_vec.fill(0);
     if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
-      probs_vec.cast_load(probs + row_idx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
+      probs_vec.cast_load(probs + row_idx * stride + (i * BLOCK_THREADS + tx) * VEC_SIZE);
     }
 
     DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM,
@@ -1135,8 +1141,8 @@ template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           typename DType, typename IdType>
 __global__ void TopKTopPSamplingFromProbKernel(DType* probs, IdType* top_k_arr, float* top_p_arr,
                                                IdType* output, IdType* indices, IdType top_k_val,
-                                               float top_p_val, uint32_t d, uint64_t philox_seed,
-                                               uint64_t philox_offset) {
+                                               float top_p_val, uint32_t d, uint32_t stride,
+                                               uint64_t philox_seed, uint64_t philox_offset) {
   const uint32_t batch_size = gridDim.x;
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
   curandStatePhilox4_32_10_t state;
@@ -1166,7 +1172,7 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs, IdType* top_k_arr, 
     for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
       probs_vec.fill(0);
       if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
-        probs_vec.cast_load(probs + row_idx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
+        probs_vec.cast_load(probs + row_idx * stride + (i * BLOCK_THREADS + tx) * VEC_SIZE);
       }
 
       DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM,
@@ -1184,7 +1190,7 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs, IdType* top_k_arr, 
       // In this case, we use the last valid index as the sampled id
       sampled_id = temp_storage.last_valid_id;
     }
-    double pivot_0 = probs[row_idx * d + sampled_id];
+    double pivot_0 = probs[row_idx * stride + sampled_id];
     double pivot_1 = (pivot_0 + high) / 2;
 
     ValueCount<float> aggregate_gt_pivot_0{0, 0}, aggregate_gt_pivot_1{0, 0};
@@ -1192,7 +1198,7 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs, IdType* top_k_arr, 
     for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
       probs_vec.fill(0);
       if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
-        probs_vec.cast_load(probs + row_idx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
+        probs_vec.cast_load(probs + row_idx * stride + (i * BLOCK_THREADS + tx) * VEC_SIZE);
       }
 
       ValueCount<float> probs_gt_pivot_0[VEC_SIZE], probs_gt_pivot_1[VEC_SIZE];
@@ -1390,15 +1396,16 @@ cudaError_t OnlineSoftmax(DType* logits, DType* output, uint32_t batch_size, uin
 
 template <typename T, typename IdType>
 cudaError_t SamplingFromLogits(T* logits, IdType* output, IdType* indices, uint32_t batch_size,
-                               uint32_t d, bool deterministic, uint64_t philox_seed,
-                               uint64_t philox_offset, cudaStream_t stream = 0) {
+                               uint32_t d, uint32_t stride, bool deterministic,
+                               uint64_t philox_seed, uint64_t philox_offset,
+                               cudaStream_t stream = 0) {
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
   auto compute_capacity = GetCudaComputeCapability();
   DISPATCH_COMPUTE_CAP_NUM_THREADS(compute_capacity, BLOCK_THREADS, {
     dim3 nblks(batch_size);
     dim3 nthrs(BLOCK_THREADS);
-    void* args[] = {&logits, &output, &indices, &d, &philox_seed, &philox_offset};
+    void* args[] = {&logits, &output, &indices, &d, &stride, &philox_seed, &philox_offset};
     const uint32_t smem_size = sizeof(
         typename BlockReduce<DataAndIndex<T, IdType>, BLOCK_THREADS, REDUCE_ALGO>::TempStorage);
 
@@ -1415,7 +1422,7 @@ cudaError_t SamplingFromLogits(T* logits, IdType* output, IdType* indices, uint3
 
 template <typename T, typename IdType>
 cudaError_t SamplingFromProb(T* probs, IdType* output, IdType* indices, uint32_t batch_size,
-                             uint32_t d, bool deterministic, uint64_t philox_seed,
+                             uint32_t d, uint32_t stride, bool deterministic, uint64_t philox_seed,
                              uint64_t philox_offset, cudaStream_t stream = 0) {
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
@@ -1423,7 +1430,7 @@ cudaError_t SamplingFromProb(T* probs, IdType* output, IdType* indices, uint32_t
   DISPATCH_COMPUTE_CAP_NUM_THREADS(compute_capacity, BLOCK_THREADS, {
     dim3 nblks(batch_size);
     dim3 nthrs(BLOCK_THREADS);
-    void* args[] = {&probs, &output, &indices, &d, &philox_seed, &philox_offset};
+    void* args[] = {&probs, &output, &indices, &d, &stride, &philox_seed, &philox_offset};
     const uint32_t smem_size = sizeof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
 
     DISPATCH_ALIGNED_VEC_SIZE(
@@ -1440,8 +1447,8 @@ cudaError_t SamplingFromProb(T* probs, IdType* output, IdType* indices, uint32_t
 template <typename T, typename IdType>
 cudaError_t TopKSamplingFromProb(T* probs, IdType* output, IdType* indices, T* top_k_arr,
                                  uint32_t batch_size, uint32_t top_k_val, uint32_t d,
-                                 bool deterministic, uint64_t philox_seed, uint64_t philox_offset,
-                                 cudaStream_t stream = 0) {
+                                 uint32_t stride, bool deterministic, uint64_t philox_seed,
+                                 uint64_t philox_offset, cudaStream_t stream = 0) {
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
   auto compute_capacity = GetCudaComputeCapability();
@@ -1449,8 +1456,8 @@ cudaError_t TopKSamplingFromProb(T* probs, IdType* output, IdType* indices, T* t
     const uint32_t smem_size = sizeof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
     dim3 nblks(batch_size);
     dim3 nthrs(BLOCK_THREADS);
-    void* args[] = {&probs,     &output, &indices,     &top_k_arr,
-                    &top_k_val, &d,      &philox_seed, &philox_offset};
+    void* args[] = {&probs, &output, &indices,     &top_k_arr,    &top_k_val,
+                    &d,     &stride, &philox_seed, &philox_offset};
 
     DISPATCH_ALIGNED_VEC_SIZE(
         vec_size, VEC_SIZE, {DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, {
@@ -1467,8 +1474,8 @@ cudaError_t TopKSamplingFromProb(T* probs, IdType* output, IdType* indices, T* t
 
 template <typename T, typename IdType>
 cudaError_t TopPSamplingFromProb(T* probs, IdType* output, IdType* indices, T* top_p_arr,
-                                 uint32_t batch_size, T top_p_val, uint32_t d, bool deterministic,
-                                 uint64_t philox_seed, uint64_t philox_offset,
+                                 uint32_t batch_size, T top_p_val, uint32_t d, uint32_t stride,
+                                 bool deterministic, uint64_t philox_seed, uint64_t philox_offset,
                                  cudaStream_t stream = 0) {
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
@@ -1477,8 +1484,8 @@ cudaError_t TopPSamplingFromProb(T* probs, IdType* output, IdType* indices, T* t
     const uint32_t smem_size = sizeof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
     dim3 nblks(batch_size);
     dim3 nthrs(BLOCK_THREADS);
-    void* args[] = {&probs,     &output, &indices,     &top_p_arr,
-                    &top_p_val, &d,      &philox_seed, &philox_offset};
+    void* args[] = {&probs, &output, &indices,     &top_p_arr,    &top_p_val,
+                    &d,     &stride, &philox_seed, &philox_offset};
 
     DISPATCH_ALIGNED_VEC_SIZE(
         vec_size, VEC_SIZE, {DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, {
@@ -1495,7 +1502,7 @@ cudaError_t TopPSamplingFromProb(T* probs, IdType* output, IdType* indices, T* t
 
 template <typename T, typename IdType>
 cudaError_t MinPSamplingFromProb(T* probs, T* min_p_arr, IdType* output, IdType* indices,
-                                 uint32_t batch_size, float min_p_val, uint32_t d,
+                                 uint32_t batch_size, float min_p_val, uint32_t d, uint32_t stride,
                                  bool deterministic, uint64_t philox_seed, uint64_t philox_offset,
                                  cudaStream_t stream = 0) {
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
@@ -1505,8 +1512,8 @@ cudaError_t MinPSamplingFromProb(T* probs, T* min_p_arr, IdType* output, IdType*
     const uint32_t smem_size = sizeof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
     dim3 nblks(batch_size);
     dim3 nthrs(BLOCK_THREADS);
-    void* args[] = {&probs,     &min_p_arr, &output,      &indices,
-                    &min_p_val, &d,         &philox_seed, &philox_offset};
+    void* args[] = {&probs, &min_p_arr, &output,      &indices,      &min_p_val,
+                    &d,     &stride,    &philox_seed, &philox_offset};
 
     DISPATCH_ALIGNED_VEC_SIZE(
         vec_size, VEC_SIZE, {DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, {
@@ -1524,7 +1531,7 @@ cudaError_t MinPSamplingFromProb(T* probs, T* min_p_arr, IdType* output, IdType*
 template <typename T, typename IdType>
 cudaError_t TopKTopPSamplingFromProb(T* probs, IdType* top_k_arr, T* top_p_arr, IdType* output,
                                      IdType* indices, uint32_t batch_size, IdType top_k_val,
-                                     T top_p_val, uint32_t d, bool deterministic,
+                                     T top_p_val, uint32_t d, uint32_t stride, bool deterministic,
                                      uint64_t philox_seed, uint64_t philox_offset,
                                      cudaStream_t stream = 0) {
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
@@ -1534,8 +1541,8 @@ cudaError_t TopKTopPSamplingFromProb(T* probs, IdType* top_k_arr, T* top_p_arr, 
     const uint32_t smem_size = sizeof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
     dim3 nblks(batch_size);
     dim3 nthrs(BLOCK_THREADS);
-    void* args[] = {&probs,     &top_k_arr, &top_p_arr, &output,      &indices,
-                    &top_k_val, &top_p_val, &d,         &philox_seed, &philox_offset};
+    void* args[] = {&probs,     &top_k_arr, &top_p_arr, &output,      &indices,      &top_k_val,
+                    &top_p_val, &d,         &stride,    &philox_seed, &philox_offset};
 
     DISPATCH_ALIGNED_VEC_SIZE(
         vec_size, VEC_SIZE, {DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, {
@@ -1579,7 +1586,7 @@ struct RenormTempStorage {
 template <uint32_t BLOCK_THREADS, BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE,
           typename DType>
 __global__ void TopPRenormProbKernel(DType* probs, DType* renormed_prob, float* top_p_arr,
-                                     float top_p_val, uint32_t d) {
+                                     float top_p_val, uint32_t d, uint32_t stride) {
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
   const uint32_t row_idx = bx;
   float p = top_p_arr == nullptr ? top_p_val : top_p_arr[bx];
@@ -1599,7 +1606,7 @@ __global__ void TopPRenormProbKernel(DType* probs, DType* renormed_prob, float* 
       probs_vec.fill(0.0f);
       const uint32_t base_idx = (i * BLOCK_THREADS + tx) * VEC_SIZE;
       if (base_idx < d) {
-        probs_vec.cast_load(probs + row_idx * d + base_idx);
+        probs_vec.cast_load(probs + row_idx * stride + base_idx);
       }
 #pragma unroll
       for (uint32_t j = 0; j < VEC_SIZE; ++j) {
@@ -1626,7 +1633,7 @@ __global__ void TopPRenormProbKernel(DType* probs, DType* renormed_prob, float* 
       probs_vec.fill(0.0f);
       const uint32_t base_idx = (i * BLOCK_THREADS + tx) * VEC_SIZE;
       if (base_idx < d) {
-        probs_vec.cast_load(probs + row_idx * d + base_idx);
+        probs_vec.cast_load(probs + row_idx * stride + base_idx);
       }
 #pragma unroll
       for (uint32_t j = 0; j < VEC_SIZE; ++j) {
@@ -1644,8 +1651,8 @@ __global__ void TopPRenormProbKernel(DType* probs, DType* renormed_prob, float* 
   // Original Top-P renormalization logic
   temp_storage.max_val = 0;
   float max_val = GetMaxValue<VEC_SIZE, BLOCK_THREADS, REDUCE_ALGORITHM,
-                              RenormTempStorage<BLOCK_THREADS, REDUCE_ALGORITHM>>(probs, row_idx, d,
-                                                                                  d, temp_storage);
+                              RenormTempStorage<BLOCK_THREADS, REDUCE_ALGORITHM>>(
+      probs, row_idx, d, stride, temp_storage);
 
   double low = 0, high = max_val;
   float min_gt_low, max_le_high;
@@ -1668,7 +1675,8 @@ __global__ void TopPRenormProbKernel(DType* probs, DType* renormed_prob, float* 
     for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
       probs_vec.fill(0);
       if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
-        probs_vec.cast_load(probs + row_idx * d + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
+        probs_vec.cast_load(probs + row_idx * stride + i * BLOCK_THREADS * VEC_SIZE +
+                            tx * VEC_SIZE);
       }
 
       float probs_gt_pivot_0[VEC_SIZE], probs_gt_pivot_1[VEC_SIZE];
@@ -1732,7 +1740,7 @@ __global__ void TopPRenormProbKernel(DType* probs, DType* renormed_prob, float* 
   for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
     probs_vec.fill(0);
     if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
-      probs_vec.cast_load(probs + row_idx * d + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
+      probs_vec.cast_load(probs + row_idx * stride + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
     }
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
@@ -1993,7 +2001,7 @@ __global__ void TopKRenormProbKernel(DType* probs, DType* renormed_prob, IdType*
 
 template <typename DType>
 cudaError_t TopPRenormProb(DType* probs, DType* renormed_prob, float* top_p_arr,
-                           uint32_t batch_size, float top_p_val, uint32_t d,
+                           uint32_t batch_size, float top_p_val, uint32_t d, uint32_t stride,
                            cudaStream_t stream = 0) {
   const uint32_t vec_size = std::gcd(16 / sizeof(DType), d);
 
@@ -2002,7 +2010,7 @@ cudaError_t TopPRenormProb(DType* probs, DType* renormed_prob, float* top_p_arr,
     const uint32_t smem_size = sizeof(RenormTempStorage<BLOCK_THREADS, REDUCE_ALGO>);
     dim3 nblks(batch_size);
     dim3 nthrs(BLOCK_THREADS);
-    void* args[] = {&probs, &renormed_prob, &top_p_arr, &top_p_val, &d};
+    void* args[] = {&probs, &renormed_prob, &top_p_arr, &top_p_val, &d, &stride};
     DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
       auto kernel = TopPRenormProbKernel<BLOCK_THREADS, REDUCE_ALGO, VEC_SIZE, DType>;
       FLASHINFER_CUDA_CALL(

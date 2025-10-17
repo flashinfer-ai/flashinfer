@@ -23,7 +23,8 @@ using tvm::ffi::Optional;
 
 void top_p_renorm_probs(TensorView probs, TensorView renorm_probs,
                         Optional<TensorView> maybe_top_p_arr, double top_p_val) {
-  CHECK_INPUT(probs);
+  CHECK_CUDA(probs);
+  CHECK_LAST_DIM_CONTIGUOUS(probs);
   CHECK_DIM(2, probs);  // probs: (batch_size, vocab_size)
   unsigned int batch_size = probs->shape[0];
   unsigned int vocab_size = probs->shape[1];
@@ -34,7 +35,7 @@ void top_p_renorm_probs(TensorView probs, TensorView renorm_probs,
   cudaError_t status = sampling::TopPRenormProb<float>(
       static_cast<float*>(probs->data), static_cast<float*>(renorm_probs->data),
       has_top_p_arr ? static_cast<float*>(maybe_top_p_arr.value()->data) : nullptr, batch_size,
-      top_p_val, vocab_size, stream);
+      top_p_val, vocab_size, probs_strides[0], stream);
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "TopPRenormProb failed with error code " << cudaGetErrorString(status);
 }
