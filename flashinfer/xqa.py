@@ -17,7 +17,6 @@ limitations under the License.
 import functools
 from types import SimpleNamespace
 from typing import Optional
-
 import torch
 
 from .jit.xqa import gen_xqa_module
@@ -30,21 +29,30 @@ from .utils import (
 
 @functools.cache
 def get_xqa_module(
-    use_fp16: bool,
+    fp16_input: bool,
+    fp8_kv_cache: bool,
     token_per_page: int,
     head_size: int,
     head_grp_size: int,
     use_sliding_window: bool,
+    sm_version: int = 90,
 ):
     module = gen_xqa_module(
-        use_fp16, token_per_page, head_size, head_grp_size, use_sliding_window
+        fp16_input,
+        fp8_kv_cache,
+        token_per_page,
+        head_size,
+        head_grp_size,
+        use_sliding_window,
+        sm_version,
     ).build_and_load()
 
     @register_custom_op(
-        f"flashinfer::xqa_use_fp16_{use_fp16}_token_per_page_{token_per_page}_head_size_{head_size}_head_grp_size_{head_grp_size}_use_sliding_window_{use_sliding_window}",
+        f"flashinfer::xqa_fp16_input_{fp16_input}_fp8_kv_cache_{fp8_kv_cache}_token_per_page_{token_per_page}_head_size_{head_size}_head_grp_size_{head_grp_size}_use_sliding_window_{use_sliding_window}_sm_{sm_version}",
         mutates_args=("output", "scratch"),
     )
     def xqa(
+        run_fp8_mha: bool,
         multiProcessorCount: int,
         nbKHeads: int,
         slidingWinSize: int,
@@ -52,7 +60,8 @@ def get_xqa_module(
         output: torch.Tensor,
         q: torch.Tensor,
         attentionSinks: Optional[torch.Tensor],
-        pool: torch.Tensor,
+        kCacheVLLM: torch.Tensor,
+        vCacheVLLM: torch.Tensor,
         kvCachePageList: torch.Tensor,
         maxSeqLen: int,
         seqLen: torch.Tensor,
@@ -62,6 +71,7 @@ def get_xqa_module(
         scratch: torch.Tensor,
     ) -> None:
         module.xqa_wrapper(
+            run_fp8_mha,
             multiProcessorCount,
             nbKHeads,
             slidingWinSize,
@@ -69,7 +79,8 @@ def get_xqa_module(
             output,
             q,
             attentionSinks,
-            pool,
+            kCacheVLLM,
+            vCacheVLLM,
             kvCachePageList,
             maxSeqLen,
             seqLen,
@@ -80,9 +91,10 @@ def get_xqa_module(
         )
 
     @register_fake_op(
-        f"flashinfer::xqa_use_fp16_{use_fp16}_token_per_page_{token_per_page}_head_size_{head_size}_head_grp_size_{head_grp_size}_use_sliding_window_{use_sliding_window}"
+        f"flashinfer::xqa_fp16_input_{fp16_input}_fp8_kv_cache_{fp8_kv_cache}_token_per_page_{token_per_page}_head_size_{head_size}_head_grp_size_{head_grp_size}_use_sliding_window_{use_sliding_window}_sm_{sm_version}"
     )
     def _fake_xqa(
+        run_fp8_mha: bool,
         multiProcessorCount: int,
         nbKHeads: int,
         slidingWinSize: int,
@@ -90,7 +102,8 @@ def get_xqa_module(
         output: torch.Tensor,
         q: torch.Tensor,
         attentionSinks: Optional[torch.Tensor],
-        pool: torch.Tensor,
+        kCacheVLLM: torch.Tensor,
+        vCacheVLLM: torch.Tensor,
         kvCachePageList: torch.Tensor,
         maxSeqLen: int,
         seqLen: torch.Tensor,
@@ -107,7 +120,9 @@ def get_xqa_module(
 
 
 def xqa(
-    use_fp16: bool,
+    fp16_input: bool,
+    fp8_kv_cache: bool,
+    run_fp8_mha: bool,
     token_per_page: int,
     head_size: int,
     head_grp_size: int,
@@ -119,7 +134,8 @@ def xqa(
     output: torch.Tensor,
     q: torch.Tensor,
     attentionSinks: Optional[torch.Tensor],
-    pool: torch.Tensor,
+    kCacheVLLM: torch.Tensor,
+    vCacheVLLM: torch.Tensor,
     kvCachePageList: torch.Tensor,
     maxSeqLen: int,
     seqLen: torch.Tensor,
@@ -128,12 +144,20 @@ def xqa(
     semaphores: torch.Tensor,
     scratch: torch.Tensor,
 ) -> None:
-    if get_compute_capability(torch.device(device="cuda"))[0] != 9:
-        raise RuntimeError("XQA is only supported on SM90 GPUs")
+    if get_compute_capability(torch.device(device="cuda"))[0] not in [9, 10, 12]:
+        raise RuntimeError("XQA is only supported on SM90, SM100, SM120 GPUs")
+    sm_version = int(get_compute_capability(torch.device(device="cuda"))[0] * 10)
     xqa_module = get_xqa_module(
-        use_fp16, token_per_page, head_size, head_grp_size, use_sliding_window
+        fp16_input,
+        fp8_kv_cache,
+        token_per_page,
+        head_size,
+        head_grp_size,
+        use_sliding_window,
+        sm_version,
     )
     xqa_module.xqa(
+        run_fp8_mha,
         multiProcessorCount,
         nbKHeads,
         sliding_win_size if use_sliding_window else 0,
@@ -141,7 +165,8 @@ def xqa(
         output,
         q,
         attentionSinks,
-        pool,
+        kCacheVLLM,
+        vCacheVLLM,
         kvCachePageList,
         maxSeqLen,
         seqLen,
