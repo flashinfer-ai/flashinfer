@@ -741,19 +741,17 @@ __global__ void BatchQKApplyRotaryKernel(
   }
 
 template <typename DType, typename IdType, typename QuantType>
-cudaError_t RopeQuantize(DType* q_rope_in, DType* k_rope_in, DType* q_nope_in, DType* k_nope_in,
-                         QuantType* q_rope_out, QuantType* k_rope_out, QuantType* q_nope_out,
-                         QuantType* k_nope_out, float* cos_sin_cache, IdType* pos_ids, uint32_t nnz,
-                         uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t rope_dim,
-                         uint32_t no_rope_dim, size_t q_rope_in_stride_n, size_t q_rope_in_stride_h,
-                         size_t q_nope_in_stride_n, size_t q_nope_in_stride_h,
-                         size_t q_rope_out_stride_n, size_t q_rope_out_stride_h,
-                         size_t q_nope_out_stride_n, size_t q_nope_out_stride_h,
-                         size_t k_rope_in_stride, size_t k_rope_in_stride_h,
-                         size_t k_nope_in_stride, size_t k_nope_in_stride_h,
-                         size_t k_rope_out_stride, size_t k_rope_out_stride_h,
-                         size_t k_nope_out_stride, size_t k_nope_out_stride_h, float quant_scale_q,
-                         float quant_scale_kv, bool interleave, cudaStream_t stream = nullptr) {
+cudaError_t RopeQuantize(
+    DType* q_rope_in, DType* k_rope_in, DType* q_nope_in, DType* k_nope_in, QuantType* q_rope_out,
+    QuantType* k_rope_out, QuantType* q_nope_out, QuantType* k_nope_out, float* cos_sin_cache,
+    IdType* pos_ids, uint32_t nnz, uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t rope_dim,
+    uint32_t no_rope_dim, size_t q_rope_in_stride_n, size_t q_rope_in_stride_h,
+    size_t q_nope_in_stride_n, size_t q_nope_in_stride_h, size_t q_rope_out_stride_n,
+    size_t q_rope_out_stride_h, size_t q_nope_out_stride_n, size_t q_nope_out_stride_h,
+    size_t k_rope_in_stride, size_t k_rope_in_stride_h, size_t k_nope_in_stride,
+    size_t k_nope_in_stride_h, size_t k_rope_out_stride, size_t k_rope_out_stride_h,
+    size_t k_nope_out_stride, size_t k_nope_out_stride_h, float quant_scale_q, float quant_scale_kv,
+    bool interleave, bool enable_pdl = false, cudaStream_t stream = nullptr) {
   int dev_id = 0;
   int num_sms = 0;
   FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
@@ -808,7 +806,34 @@ cudaError_t RopeQuantize(DType* q_rope_in, DType* k_rope_in, DType* q_nope_in, D
       auto kernel = RopeQuantizeKernel<INTERLEAVE, vec_size, bdx, DType, IdType, QuantType>;
       dim3 nblks(nblks_x, total_blocks_y);
       dim3 nthrs(bdx, bdy);
-      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
+
+      cudaLaunchConfig_t config;
+      config.gridDim = nblks;
+      config.blockDim = nthrs;
+      config.dynamicSmemBytes = 0;
+      config.stream = stream;
+
+      if (enable_pdl) {
+        // PDL launch config
+        cudaLaunchAttribute attribute[1];
+        attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attribute[0].val.programmaticStreamSerializationAllowed = 1;
+        config.attrs = attribute;
+        config.numAttrs = 1;
+      } else {
+        // Regular launch config
+        config.attrs = nullptr;
+        config.numAttrs = 0;
+      }
+
+      FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
+          &config, kernel, q_rope_in, k_rope_in, q_nope_in, k_nope_in, q_rope_out, k_rope_out,
+          q_nope_out, k_nope_out, cos_sin_cache, pos_ids, nnz, num_qo_heads, num_kv_heads, rope_dim,
+          no_rope_dim, q_rope_in_stride_n, q_rope_in_stride_h, q_nope_in_stride_n,
+          q_nope_in_stride_h, q_rope_out_stride_n, q_rope_out_stride_h, q_nope_out_stride_n,
+          q_nope_out_stride_h, k_rope_in_stride, k_rope_in_stride_h, k_nope_in_stride,
+          k_nope_in_stride_h, k_rope_out_stride, k_rope_out_stride_h, k_nope_out_stride,
+          k_nope_out_stride_h, quant_scale_q, quant_scale_kv));
     });
   });
 
