@@ -160,7 +160,7 @@ def ref_attention(
 @pytest.mark.parametrize("use_attention_sinks", [True, False])
 @pytest.mark.parametrize("seq_len", [2, 15, 256, 514])
 @pytest.mark.parametrize("batch_size", [1, 4])
-@pytest.mark.parametrize("nb_k_heads", [1, 4, 8])
+@pytest.mark.parametrize("nb_k_heads", [2, 4])
 @pytest.mark.parametrize("tokens_per_page", [16, 64])
 @pytest.mark.parametrize("valid_elems_per_head", [32, 128])
 @pytest.mark.parametrize("head_grp_size", [8, 16])

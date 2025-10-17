@@ -97,4 +97,5 @@ def gen_xqa_module(
         + flag_head_grp_size
         + flag_sliding_window,
         extra_ldflags=["-lcuda"],  # Add CUDA Driver API library
+        extra_cflags=["-DPAGED_KV_CACHE_LAYOUT=1"],
     )
