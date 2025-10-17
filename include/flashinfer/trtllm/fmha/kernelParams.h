@@ -152,6 +152,8 @@ struct KernelParams {
   int32_t mStartTokenIdxSfO;
   // The sum of sequence lengths for Q and K/V.
   int32_t mSumOfSeqLensQ, mSumOfSeqLensKv;
+  // The flag to use block sparse attention.
+  bool mUseBlockSparseAttention;
 
   // Create the TMA shape/stride for Q.
   template <class FmhaOptions>
@@ -699,6 +701,8 @@ struct KernelParams {
     params.mStartTokenIdxSfO = options.mSfStartTokenIdx;
     params.mScaleSfKv = options.mScaleSfKv;
     params.ptrSoftmaxStats = options.softmaxStatsPtr;
+    // TODO: Integrate trtllm block-sparse attention kernels when needed.
+    params.mUseBlockSparseAttention = false;
     return params;
   }
 };
