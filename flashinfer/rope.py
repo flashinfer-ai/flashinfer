@@ -1144,6 +1144,40 @@ def apply_rope_with_cos_sin_cache_inplace(
     )
 
 
+def mla_rope_quantize_fp8(
+    q_rope: torch.Tensor,
+    k_rope: torch.Tensor,
+    q_nope: torch.Tensor,
+    k_nope: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    pos_ids: torch.Tensor,
+    is_neox: bool = True,
+    quantize_dtype: Optional[torch.dtype] = None,
+    quant_scale_q: float = 1.0,
+    quant_scale_kv: float = 1.0,
+    q_rope_out: Optional[torch.Tensor] = None,
+    k_rope_out: Optional[torch.Tensor] = None,
+    q_nope_out: Optional[torch.Tensor] = None,
+    k_nope_out: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return rope_quantize_fp8(
+        q_rope,
+        k_rope,
+        q_nope,
+        k_nope,
+        cos_sin_cache,
+        pos_ids,
+        is_neox,
+        quantize_dtype,
+        quant_scale_q,
+        quant_scale_kv,
+        q_rope_out,
+        k_rope_out,
+        q_nope_out,
+        k_nope_out,
+    )
+
+
 def rope_quantize_fp8(
     q_rope: torch.Tensor,
     k_rope: torch.Tensor,
