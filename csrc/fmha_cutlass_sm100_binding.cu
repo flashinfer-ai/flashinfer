@@ -17,16 +17,18 @@
 
 using tvm::ffi::Optional;
 
-void FMHACutlassSM100Run(Tensor workspace_buffer, Tensor q, Tensor k, Tensor v,
-                         Tensor qo_segment_offsets, Tensor kv_segment_offsets, Tensor work_indptr,
-                         Tensor qo_tile_indices, Tensor qo_head_indices, Tensor batch_indices,
-                         Tensor o, Optional<Tensor> maybe_lse, int64_t mask_mode_code,
-                         double sm_scale, int64_t num_qo_heads, int64_t num_kv_heads,
-                         int64_t head_dim_qk, int64_t head_dim_vo, int64_t max_qo_len);
+void FMHACutlassSM100Run(TensorView workspace_buffer, TensorView q, TensorView k, TensorView v,
+                         TensorView qo_segment_offsets, TensorView kv_segment_offsets,
+                         TensorView work_indptr, TensorView qo_tile_indices,
+                         TensorView qo_head_indices, TensorView batch_indices, TensorView o,
+                         Optional<TensorView> maybe_lse, int64_t mask_mode_code, double sm_scale,
+                         int64_t num_qo_heads, int64_t num_kv_heads, int64_t head_dim_qk,
+                         int64_t head_dim_vo, int64_t max_qo_len);
 
-void blackwell_fmha_plan(Tensor qo_segment_offsets, Tensor kv_segment_offsets, Tensor work_indptr,
-                         Tensor qo_tile_indices, Tensor head_indices, Tensor batch_indices,
-                         int64_t qo_tile_size, int64_t num_heads, int64_t num_buckets, bool causal);
+void blackwell_fmha_plan(TensorView qo_segment_offsets, TensorView kv_segment_offsets,
+                         TensorView work_indptr, TensorView qo_tile_indices,
+                         TensorView head_indices, TensorView batch_indices, int64_t qo_tile_size,
+                         int64_t num_heads, int64_t num_buckets, bool causal);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, FMHACutlassSM100Run);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(plan, blackwell_fmha_plan);

@@ -74,13 +74,14 @@ using tvm::ffi::Optional;
 
 using namespace flashinfer;
 
-void FMHACutlassSM100Run(ffi::Tensor workspace_buffer, ffi::Tensor q, ffi::Tensor k, ffi::Tensor v,
-                         ffi::Tensor qo_segment_offsets, ffi::Tensor kv_segment_offsets,
-                         ffi::Tensor work_indptr, ffi::Tensor qo_tile_indices,
-                         ffi::Tensor qo_head_indices, ffi::Tensor batch_indices, ffi::Tensor o,
-                         Optional<ffi::Tensor> maybe_lse, int64_t mask_mode_code, double sm_scale,
-                         int64_t num_qo_heads, int64_t num_kv_heads, int64_t head_dim_qk,
-                         int64_t head_dim_vo, int64_t max_qo_len) {
+void FMHACutlassSM100Run(ffi::TensorView workspace_buffer, ffi::TensorView q, ffi::TensorView k,
+                         ffi::TensorView v, ffi::TensorView qo_segment_offsets,
+                         ffi::TensorView kv_segment_offsets, ffi::TensorView work_indptr,
+                         ffi::TensorView qo_tile_indices, ffi::TensorView qo_head_indices,
+                         ffi::TensorView batch_indices, ffi::TensorView o,
+                         Optional<ffi::TensorView> maybe_lse, int64_t mask_mode_code,
+                         double sm_scale, int64_t num_qo_heads, int64_t num_kv_heads,
+                         int64_t head_dim_qk, int64_t head_dim_vo, int64_t max_qo_len) {
   TVM_FFI_ICHECK_EQ(q->dtype, k->dtype);
   auto scalar_type_in = q->dtype;
   auto scalar_type_out = o->dtype;

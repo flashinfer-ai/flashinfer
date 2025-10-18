@@ -7,10 +7,10 @@ echo "========================================"
 echo "Starting flashinfer-jit-cache test script"
 echo "========================================"
 
-# MAX_JOBS = min(nproc, max(1, MemAvailable_GB/4))
+# MAX_JOBS = min(nproc, max(1, MemAvailable_GB/(8 on aarch64, 4 otherwise)))
 MEM_AVAILABLE_GB=$(free -g | awk '/^Mem:/ {print $7}')
 NPROC=$(nproc)
-MAX_JOBS=$(( MEM_AVAILABLE_GB / 4 ))
+MAX_JOBS=$(( MEM_AVAILABLE_GB / $([ "$(uname -m)" = "aarch64" ] && echo 8 || echo 4) ))
 if (( MAX_JOBS < 1 )); then
   MAX_JOBS=1
 elif (( NPROC < MAX_JOBS )); then

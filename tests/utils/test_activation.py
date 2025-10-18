@@ -18,10 +18,13 @@ import pytest
 import torch
 
 import flashinfer
-from flashinfer.utils import get_compute_capability
+from flashinfer.utils import get_compute_capability, has_flashinfer_jit_cache
 
 
-@pytest.fixture(autouse=True, scope="module")
+@pytest.fixture(
+    autouse=not has_flashinfer_jit_cache(),
+    scope="module",
+)
 def warmup_jit():
     flashinfer.jit.build_jit_specs(
         [

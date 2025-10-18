@@ -37,10 +37,11 @@ using tensorrt_llm::kernels::trtllmgen_moe::Routing::RoutingMethodType;
 using tvm::ffi::Array;
 using tvm::ffi::Optional;
 
-Tensor trtllm_fp8_per_tensor_scale_moe_launcher(
-    Tensor routing_logits, Optional<Tensor> routing_bias, Tensor hidden_states,
-    Tensor gemm1_weights, Tensor output1_scales_scalar, Tensor output1_scales_gate_scalar,
-    Tensor gemm2_weights, Tensor output2_scales_scalar, int64_t const num_experts,
+void trtllm_fp8_per_tensor_scale_moe_launcher(
+    TensorView routing_logits, Optional<TensorView> routing_bias, TensorView hidden_states,
+    TensorView gemm1_weights, TensorView output1_scales_scalar,
+    TensorView output1_scales_gate_scalar, TensorView gemm2_weights,
+    TensorView output2_scales_scalar, TensorView output, int64_t const num_experts,
     int64_t const top_k, int64_t const n_group, int64_t const topk_group,
     int64_t const intermediate_size, int64_t const local_expert_offset,
     int64_t const local_num_experts, double const routed_scaling_factor,
@@ -224,8 +225,10 @@ Tensor trtllm_fp8_per_tensor_scale_moe_launcher(
       << "output2_scales_scalar has incorrect dim 0.";
 
   // allocate output
-  Tensor output =
-      alloc_tensor({args.num_tokens, args.hidden_size}, dl_bfloat16, hidden_states->device);
+  TVM_FFI_ICHECK_EQ(output->shape[0], args.num_tokens);
+  TVM_FFI_ICHECK_EQ(output->shape[1], args.hidden_size);
+  CHECK_INPUT_TYPE(output, dl_bfloat16);
+  CHECK_DEVICE(output, hidden_states);
 
   // setup workspace
   workspace.total_num_padded_tokens = static_cast<int*>(total_num_padded_tokens->data);
@@ -272,22 +275,22 @@ Tensor trtllm_fp8_per_tensor_scale_moe_launcher(
   cudaStream_t moe_stream = get_stream(hidden_states->device);
   moe_runner.run(args, workspace, hidden_states->device.device_id, moe_stream, moeConfigIndex,
                  enable_pdl);
-  return output;
 }
 
-Tensor trtllm_fp8_per_tensor_scale_moe(
-    Tensor routing_logits, Optional<Tensor> routing_bias, Tensor hidden_states,
-    Tensor gemm1_weights, Tensor output1_scales_scalar, Tensor output1_scales_gate_scalar,
-    Tensor gemm2_weights, Tensor output2_scales_scalar, int64_t num_experts, int64_t top_k,
+void trtllm_fp8_per_tensor_scale_moe(
+    TensorView routing_logits, Optional<TensorView> routing_bias, TensorView hidden_states,
+    TensorView gemm1_weights, TensorView output1_scales_scalar,
+    TensorView output1_scales_gate_scalar, TensorView gemm2_weights,
+    TensorView output2_scales_scalar, TensorView output, int64_t num_experts, int64_t top_k,
     int64_t n_group, int64_t topk_group, int64_t intermediate_size, int64_t local_expert_offset,
     int64_t local_num_experts, double routed_scaling_factor, bool use_routing_scales_on_input,
     int64_t tile_tokens_dim, int64_t routing_method_type, bool enable_pdl) {
   auto dtype = hidden_states->dtype;
   if (dtype == dl_float16 || dtype == dl_bfloat16 || dtype == dl_float8_e4m3fn) {
-    return trtllm_fp8_per_tensor_scale_moe_launcher(
+    trtllm_fp8_per_tensor_scale_moe_launcher(
         routing_logits, routing_bias, hidden_states, gemm1_weights, output1_scales_scalar,
-        output1_scales_gate_scalar, gemm2_weights, output2_scales_scalar, num_experts, top_k,
-        n_group, topk_group, intermediate_size, local_expert_offset, local_num_experts,
+        output1_scales_gate_scalar, gemm2_weights, output2_scales_scalar, output, num_experts,
+        top_k, n_group, topk_group, intermediate_size, local_expert_offset, local_num_experts,
         routed_scaling_factor, use_routing_scales_on_input, tile_tokens_dim, routing_method_type,
         enable_pdl);
   } else {
@@ -296,10 +299,10 @@ Tensor trtllm_fp8_per_tensor_scale_moe(
 }
 
 void trtllm_fp8_block_scale_moe_launcher(
-    Tensor routing_logits, Optional<Tensor> routing_bias, Tensor hidden_states,
-    Tensor hidden_states_scale, Tensor gemm1_weights, Tensor gemm1_weights_scale,
-    Tensor gemm2_weights, Tensor gemm2_weights_scale, Tensor output, int64_t const num_experts,
-    int64_t const top_k, int64_t const n_group, int64_t const topk_group,
+    TensorView routing_logits, Optional<TensorView> routing_bias, TensorView hidden_states,
+    TensorView hidden_states_scale, TensorView gemm1_weights, TensorView gemm1_weights_scale,
+    TensorView gemm2_weights, TensorView gemm2_weights_scale, TensorView output,
+    int64_t const num_experts, int64_t const top_k, int64_t const n_group, int64_t const topk_group,
     int64_t const intermediate_size, int64_t const local_expert_offset,
     int64_t const local_num_experts, double const routed_scaling_factor,
     int64_t const tile_tokens_dim, int64_t const routing_method_type,
@@ -393,6 +396,12 @@ void trtllm_fp8_block_scale_moe_launcher(
   int32_t max_num_padded_tokens =
       tensorrt_llm::kernels::trtllmgen_moe::Routing::getMaxPermutedPaddedCount(
           args.num_tokens, top_k, num_experts, tile_tokens_dim);
+  int32_t max_num_padded_tokens_gemm1 =
+      tensorrt_llm::kernels::trtllmgen_moe::Routing::maybeGetMinTokenCount(
+          max_num_padded_tokens, args.intermediate_size, btg::dtypeGetNumBits(args.mDtypeElt));
+  int32_t max_num_padded_tokens_gemm2 =
+      tensorrt_llm::kernels::trtllmgen_moe::Routing::maybeGetMinTokenCount(
+          max_num_padded_tokens, args.hidden_size, btg::dtypeGetNumBits(args.mDtypeOut));
   Tensor total_num_padded_tokens = alloc_tensor({1}, dl_int32, routing_logits->device);
   Tensor expanded_idx_to_permuted_idx =
       alloc_tensor({args.num_tokens * args.top_k}, dl_int32, routing_logits->device);
@@ -413,16 +422,16 @@ void trtllm_fp8_block_scale_moe_launcher(
   //                                    dl_float8_e4m3fn, hidden_states->device);
   // Tensor activation_output = alloc_tensor({max_num_padded_tokens, intermediate_size},
   //                                         dl_float8_e4m3fn, hidden_states->device);
-  Tensor gemm1_output =
-      alloc_tensor({max_num_padded_tokens, 2 * intermediate_size}, dl_uint8, hidden_states->device);
+  Tensor gemm1_output = alloc_tensor({max_num_padded_tokens_gemm1, 2 * intermediate_size}, dl_uint8,
+                                     hidden_states->device);
   Tensor gemm1_output_scale = alloc_tensor({2 * intermediate_size / 128, max_num_padded_tokens},
                                            dl_float32, hidden_states->device);
-  Tensor activation_output =
-      alloc_tensor({max_num_padded_tokens, intermediate_size}, dl_uint8, hidden_states->device);
-  Tensor activation_output_scale = alloc_tensor({intermediate_size / 128, max_num_padded_tokens},
-                                                dl_float32, hidden_states->device);
-  Tensor gemm2_output =
-      alloc_tensor({max_num_padded_tokens, args.hidden_size}, dl_bfloat16, hidden_states->device);
+  Tensor activation_output = alloc_tensor({max_num_padded_tokens_gemm1, intermediate_size},
+                                          dl_uint8, hidden_states->device);
+  Tensor activation_output_scale = alloc_tensor(
+      {intermediate_size / 128, max_num_padded_tokens_gemm1}, dl_float32, hidden_states->device);
+  Tensor gemm2_output = alloc_tensor({max_num_padded_tokens_gemm2, args.hidden_size}, dl_bfloat16,
+                                     hidden_states->device);
 
   int32_t max_num_ctas = tensorrt_llm::kernels::trtllmgen_moe::Routing::getMaxNumCtasInBatchDim(
       args.num_tokens, args.top_k, args.num_experts, tile_tokens_dim);
@@ -519,7 +528,8 @@ void trtllm_fp8_block_scale_moe_launcher(
 
   // setup workspace
   workspace.total_num_padded_tokens = static_cast<int*>(total_num_padded_tokens->data);
-  workspace.total_max_padded_tokens = max_num_padded_tokens;
+  workspace.total_max_padded_tokens =
+      std::max(max_num_padded_tokens_gemm1, max_num_padded_tokens_gemm2);
   workspace.ProjUpTileN = tile_tokens_dim;
   workspace.routing_expert_indexes = static_cast<int*>(expert_indexes->data);
   workspace.permuted_idx_size = static_cast<int*>(total_num_padded_tokens->data);
@@ -558,12 +568,12 @@ void trtllm_fp8_block_scale_moe_launcher(
                  enable_pdl);
 }
 
-void trtllm_fp8_block_scale_moe(Tensor routing_logits, Optional<Tensor> routing_bias,
-                                Tensor hidden_states, Tensor hidden_states_scale,
-                                Tensor gemm1_weights, Tensor gemm1_weights_scale,
-                                Tensor gemm2_weights, Tensor gemm2_weights_scale, Tensor output,
-                                int64_t num_experts, int64_t top_k, int64_t n_group,
-                                int64_t topk_group, int64_t intermediate_size,
+void trtllm_fp8_block_scale_moe(TensorView routing_logits, Optional<TensorView> routing_bias,
+                                TensorView hidden_states, TensorView hidden_states_scale,
+                                TensorView gemm1_weights, TensorView gemm1_weights_scale,
+                                TensorView gemm2_weights, TensorView gemm2_weights_scale,
+                                TensorView output, int64_t num_experts, int64_t top_k,
+                                int64_t n_group, int64_t topk_group, int64_t intermediate_size,
                                 int64_t local_expert_offset, int64_t local_num_experts,
                                 double routed_scaling_factor, int64_t tile_tokens_dim,
                                 int64_t routing_method_type, bool use_shuffled_weight,
@@ -590,7 +600,7 @@ void trtllm_fp8_block_scale_moe(Tensor routing_logits, Optional<Tensor> routing_
     int64_t moeConfigIndex = mRunner->getDefaultValidConfigIndex(
         top_k, hidden_size, intermediate_size, local_num_experts, num_tokens);
 
-    return trtllm_fp8_block_scale_moe_launcher(
+    trtllm_fp8_block_scale_moe_launcher(
         routing_logits, routing_bias, hidden_states, hidden_states_scale, gemm1_weights,
         gemm1_weights_scale, gemm2_weights, gemm2_weights_scale, output, num_experts, top_k,
         n_group, topk_group, intermediate_size, local_expert_offset, local_num_experts,
@@ -604,19 +614,21 @@ void trtllm_fp8_block_scale_moe(Tensor routing_logits, Optional<Tensor> routing_
 // TODO(siyuan): This launcher supports flexible weight and activation types.
 // We should cleanup other launchers and only use this one in the future.
 Array<Tensor> trtllm_fp4_block_scale_moe_launcher(
-    Optional<Tensor> routing_logits, Tensor expert_indices, Tensor expert_weights,
-    Optional<Tensor> routing_bias, Tensor hidden_states, Optional<Tensor> hidden_states_scale,
-    Tensor gemm1_weights, Tensor gemm1_weights_scale, Optional<Tensor> gemm1_bias,
-    Optional<Tensor> gemm1_alpha, Optional<Tensor> gemm1_beta, Optional<Tensor> gemm1_clamp_limit,
-    Tensor gemm2_weights, Tensor gemm2_weights_scale, Optional<Tensor> gemm2_bias,
-    Optional<Tensor> output1_scales_scalar, Optional<Tensor> output1_scales_gate_scalar,
-    Optional<Tensor> output2_scales_scalar, int64_t const num_experts, int64_t const top_k,
+    Optional<TensorView> routing_logits, TensorView expert_indices, TensorView expert_weights,
+    Optional<TensorView> routing_bias, TensorView hidden_states,
+    Optional<TensorView> hidden_states_scale, TensorView gemm1_weights,
+    TensorView gemm1_weights_scale, Optional<TensorView> gemm1_bias,
+    Optional<TensorView> gemm1_alpha, Optional<TensorView> gemm1_beta,
+    Optional<TensorView> gemm1_clamp_limit, TensorView gemm2_weights,
+    TensorView gemm2_weights_scale, Optional<TensorView> gemm2_bias,
+    Optional<TensorView> output1_scales_scalar, Optional<TensorView> output1_scales_gate_scalar,
+    Optional<TensorView> output2_scales_scalar, int64_t const num_experts, int64_t const top_k,
     Optional<int64_t> const n_group, Optional<int64_t> const topk_group,
     int64_t const intermediate_size, int64_t const local_expert_offset,
     int64_t const local_num_experts, Optional<double> const routed_scaling_factor,
     int64_t const tile_tokens_dim, int64_t const routing_method_type, bool const do_finalize,
     tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner& moe_runner, btg::Dtype dtype_act,
-    btg::Dtype dtype_weights, int64_t const moeConfigIndex, bool enable_pdl, Tensor output) {
+    btg::Dtype dtype_weights, int64_t const moeConfigIndex, bool enable_pdl, TensorView output) {
   static const std::tuple<int, int> device_props = [hidden_states] {
     int major, minor;
     cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor,
@@ -764,6 +776,12 @@ Array<Tensor> trtllm_fp4_block_scale_moe_launcher(
   int32_t max_num_padded_tokens =
       tensorrt_llm::kernels::trtllmgen_moe::Routing::getMaxPermutedPaddedCount(
           args.num_tokens, top_k, num_experts, tile_tokens_dim);
+  int32_t max_num_padded_tokens_gemm1 =
+      tensorrt_llm::kernels::trtllmgen_moe::Routing::maybeGetMinTokenCount(
+          max_num_padded_tokens, args.intermediate_size, btg::dtypeGetNumBits(args.mDtypeElt));
+  int32_t max_num_padded_tokens_gemm2 =
+      tensorrt_llm::kernels::trtllmgen_moe::Routing::maybeGetMinTokenCount(
+          max_num_padded_tokens, args.hidden_size, btg::dtypeGetNumBits(args.mDtypeOut));
   Tensor total_num_padded_tokens = alloc_tensor({1}, dl_int32, hidden_states->device);
   Tensor expanded_idx_to_permuted_idx =
       alloc_tensor({args.num_tokens, args.top_k}, dl_int32, hidden_states->device);
@@ -788,20 +806,20 @@ Array<Tensor> trtllm_fp4_block_scale_moe_launcher(
   // Tensor gemm1_output = alloc_tensor(
   //     {max_num_padded_tokens, gemm1_output_hidden},
   //     dtype_act == btg::Dtype::Bfloat16 ? dl_bfloat16 : dl_float8_e4m3fn, hidden_states->device);
-  Tensor gemm1_output = alloc_tensor({max_num_padded_tokens, gemm1_output_hidden},
+  Tensor gemm1_output = alloc_tensor({max_num_padded_tokens_gemm1, gemm1_output_hidden},
                                      dtype_act == btg::Dtype::Bfloat16 ? dl_bfloat16 : dl_uint8,
                                      hidden_states->device);
 
   Optional<Tensor> gemm1_output_scale = std::nullopt;
   if (dtype_act == btg::Dtype::E2m1 || dtype_act == btg::Dtype::MxE4m3) {
-    int64_t sf_size = tensorrt_llm::computeSwizzledLayoutSFSize(max_num_padded_tokens,
+    int64_t sf_size = tensorrt_llm::computeSwizzledLayoutSFSize(max_num_padded_tokens_gemm1,
                                                                 intermediate_size / sf_vec_size);
     // gemm1_output_scale = alloc_tensor({sf_size}, dl_float8_e4m3fn, hidden_states->device);
     gemm1_output_scale = alloc_tensor({sf_size}, dl_uint8, hidden_states->device);
   }
 
-  Tensor gemm2_output =
-      alloc_tensor({max_num_padded_tokens, args.hidden_size}, dl_bfloat16, hidden_states->device);
+  Tensor gemm2_output = alloc_tensor({max_num_padded_tokens_gemm2, args.hidden_size}, dl_bfloat16,
+                                     hidden_states->device);
 
   int32_t max_num_ctas = tensorrt_llm::kernels::trtllmgen_moe::Routing::getMaxNumCtasInBatchDim(
       args.num_tokens, args.top_k, args.num_experts, tile_tokens_dim);
@@ -850,7 +868,7 @@ Array<Tensor> trtllm_fp4_block_scale_moe_launcher(
         << "hidden_states_scale must be fp8.";
 
     TVM_FFI_ICHECK_EQ(
-        get_numel(hidden_states_scale.value()),
+        hidden_states_scale.value().numel(),
         tensorrt_llm::computeLinearLayoutSFSize(args.num_tokens, args.hidden_size / sf_vec_size))
         << "hidden_states_scale has incorrect size";
   }
@@ -958,7 +976,8 @@ Array<Tensor> trtllm_fp4_block_scale_moe_launcher(
 
   // setup workspace
   workspace.total_num_padded_tokens = static_cast<int*>(total_num_padded_tokens->data);
-  workspace.total_max_padded_tokens = max_num_padded_tokens;
+  workspace.total_max_padded_tokens =
+      std::max(max_num_padded_tokens_gemm1, max_num_padded_tokens_gemm2);
   workspace.ProjUpTileN = tile_tokens_dim;
   workspace.routing_expert_indexes = static_cast<int*>(expert_indices->data);
   workspace.permuted_idx_size = static_cast<int*>(total_num_padded_tokens->data);
@@ -1010,23 +1029,25 @@ Array<Tensor> trtllm_fp4_block_scale_moe_launcher(
                  enable_pdl);
 
   if (!do_finalize) {
-    return {gemm2_output, expert_weights, expanded_idx_to_permuted_idx};
+    return {gemm2_output, expanded_idx_to_permuted_idx};
   }
-  return {output};
+  return {};
 }
 
 Array<Tensor> trtllm_fp4_block_scale_moe(
-    Optional<Tensor> routing_logits, Tensor topk_ids, Tensor expert_weights,
-    Optional<Tensor> routing_bias, Tensor hidden_states, Optional<Tensor> hidden_states_scale,
-    Tensor gemm1_weights, Tensor gemm1_weights_scale, Optional<Tensor> gemm1_bias,
-    Optional<Tensor> gemm1_alpha, Optional<Tensor> gemm1_beta, Optional<Tensor> gemm1_clamp_limit,
-    Tensor gemm2_weights, Tensor gemm2_weights_scale, Optional<Tensor> gemm2_bias,
-    Optional<Tensor> output1_scales_scalar, Optional<Tensor> output1_scales_gate_scalar,
-    Optional<Tensor> output2_scales_scalar, int64_t num_experts, int64_t top_k,
+    Optional<TensorView> routing_logits, TensorView topk_ids, TensorView expert_weights,
+    Optional<TensorView> routing_bias, TensorView hidden_states,
+    Optional<TensorView> hidden_states_scale, TensorView gemm1_weights,
+    TensorView gemm1_weights_scale, Optional<TensorView> gemm1_bias,
+    Optional<TensorView> gemm1_alpha, Optional<TensorView> gemm1_beta,
+    Optional<TensorView> gemm1_clamp_limit, TensorView gemm2_weights,
+    TensorView gemm2_weights_scale, Optional<TensorView> gemm2_bias,
+    Optional<TensorView> output1_scales_scalar, Optional<TensorView> output1_scales_gate_scalar,
+    Optional<TensorView> output2_scales_scalar, int64_t num_experts, int64_t top_k,
     Optional<int64_t> n_group, Optional<int64_t> topk_group, int64_t intermediate_size,
     int64_t local_expert_offset, int64_t local_num_experts, Optional<double> routed_scaling_factor,
     int64_t tile_tokens_dim, int64_t routing_method_type, bool do_finalize, bool enable_pdl,
-    int64_t gated_act_type, Tensor output, int64_t config_index) {
+    int64_t gated_act_type, TensorView output, int64_t config_index) {
   using RunnerType = tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner;
 
   int const num_tokens = hidden_states->shape[0];
@@ -1034,11 +1055,10 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
   if (hidden_states->dtype == dl_uint8) hidden_size *= 2;
   int hidden_states_scale_vec_size = -1;
   if (hidden_states_scale.has_value()) {
-    hidden_states_scale_vec_size =
-        (num_tokens * hidden_size) / get_numel(hidden_states_scale.value());
+    hidden_states_scale_vec_size = (num_tokens * hidden_size) / hidden_states_scale.value().numel();
   }
   int weight_scale_vec_size =
-      (local_num_experts * intermediate_size * 2 * hidden_size) / get_numel(gemm1_weights_scale);
+      (local_num_experts * intermediate_size * 2 * hidden_size) / gemm1_weights_scale.numel();
   TVM_FFI_ICHECK(weight_scale_vec_size == 16 || weight_scale_vec_size == 32)
       << "unsupported weight_scale_vec_size.";
   auto mDtypeWeights = weight_scale_vec_size == 16 ? btg::Dtype::E2m1 : btg::Dtype::MxE2m1;

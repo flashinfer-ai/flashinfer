@@ -21,17 +21,19 @@ using tvm::ffi::Optional;
 
 void pod_with_kv_cache_tensor(
     // Prefill params
-    Tensor q_p, Tensor k_p, Tensor v_p, Tensor tmp_p, Tensor o_p, Optional<Tensor> maybe_lse_p,
-    int64_t mask_mode_code_p, int64_t layout_p, int64_t window_left_p,
-    Optional<Tensor> maybe_custom_mask_p, Optional<Tensor> maybe_alibi_slopes_p,
-    double logits_soft_cap_p, double sm_scale_p, double rope_rcp_scale_p, double rope_rcp_theta_p,
+    TensorView q_p, TensorView k_p, TensorView v_p, TensorView tmp_p, TensorView o_p,
+    Optional<TensorView> maybe_lse_p, int64_t mask_mode_code_p, int64_t layout_p,
+    int64_t window_left_p, Optional<TensorView> maybe_custom_mask_p,
+    Optional<TensorView> maybe_alibi_slopes_p, double logits_soft_cap_p, double sm_scale_p,
+    double rope_rcp_scale_p, double rope_rcp_theta_p,
     // Decode params
-    Tensor float_workspace_buffer_d, Tensor int_workspace_buffer_d, Array<int64_t> plan_info_vec,
-    Tensor q_d, Tensor paged_k_cache_d, Tensor paged_v_cache_d, Tensor qo_indptr_d,
-    Tensor paged_kv_indptr_d, Tensor paged_kv_indices_d, Tensor paged_kv_last_page_len_d,
-    Tensor o_d, Optional<Tensor> maybe_lse_d, int64_t mask_mode_code_d, int64_t layout_d,
-    int64_t window_left_d, Optional<Tensor> maybe_custom_mask_d,
-    Optional<Tensor> maybe_mask_indptr_d, Optional<Tensor> maybe_alibi_slopes_d,
+    TensorView float_workspace_buffer_d, TensorView int_workspace_buffer_d,
+    Array<int64_t> plan_info_vec, TensorView q_d, TensorView paged_k_cache_d,
+    TensorView paged_v_cache_d, TensorView qo_indptr_d, TensorView paged_kv_indptr_d,
+    TensorView paged_kv_indices_d, TensorView paged_kv_last_page_len_d, TensorView o_d,
+    Optional<TensorView> maybe_lse_d, int64_t mask_mode_code_d, int64_t layout_d,
+    int64_t window_left_d, Optional<TensorView> maybe_custom_mask_d,
+    Optional<TensorView> maybe_mask_indptr_d, Optional<TensorView> maybe_alibi_slopes_d,
     double logits_soft_cap_d, double sm_scale_d, double rope_rcp_scale_d, double rope_rcp_theta_d,
     bool enable_pdl);
 

@@ -20,7 +20,6 @@ from typing import List
 import jinja2
 import torch
 
-from ...artifacts import ArtifactPath, MetaInfoHash
 from .. import env as jit_env
 from ..core import (
     JitSpec,
@@ -1569,12 +1568,15 @@ def gen_fmha_cutlass_sm100a_module(
 
 
 def gen_trtllm_gen_fmha_module():
+    from ...artifacts import ArtifactPath, MetaInfoHash
+
     include_path = f"{ArtifactPath.TRTLLM_GEN_FMHA}/include"
     header_name = "flashInferMetaInfo"
 
     # use `get_cubin` to get "flashinferMetaInfo.h"
     metainfo = get_cubin(
-        f"{include_path}/{header_name}.h", MetaInfoHash.TRTLLM_GEN_FMHA
+        f"{include_path}/{header_name}.h",
+        MetaInfoHash.TRTLLM_GEN_FMHA,
     )
 
     # make sure "flashinferMetaInfo.h" is downloaded or cached
@@ -1687,6 +1689,8 @@ def gen_customize_batch_attention_module(
 
 
 def gen_cudnn_fmha_module():
+    from ...artifacts import ArtifactPath
+
     return gen_jit_spec(
         "fmha_cudnn_gen",
         [jit_env.FLASHINFER_CSRC_DIR / "cudnn_sdpa_kernel_launcher.cu"],

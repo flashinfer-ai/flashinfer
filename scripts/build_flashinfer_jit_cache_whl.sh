@@ -25,10 +25,12 @@ echo "CUDA Version: ${CUDA_VERSION}"
 echo "CPU Architecture: ${ARCH}"
 echo "CUDA Major: ${CUDA_MAJOR}"
 echo "CUDA Minor: ${CUDA_MINOR}"
-echo "CUDA Version Suffix: ${CUDA_VERSION_SUFFIX}"
+echo "FlashInfer Local Version: ${FLASHINFER_LOCAL_VERSION}"
 echo "CUDA Architectures: ${FLASHINFER_CUDA_ARCH_LIST}"
+echo "Dev Release Suffix: ${FLASHINFER_DEV_RELEASE_SUFFIX}"
 echo "MAX_JOBS: ${MAX_JOBS}"
 echo "Python Version: $(python3 --version)"
+echo "Git commit: $(git rev-parse HEAD 2>/dev/null || echo 'unknown')"
 echo "Working directory: $(pwd)"
 echo ""
 
@@ -61,6 +63,16 @@ echo "✓ Build completed successfully"
 echo ""
 echo "Built wheels:"
 ls -lh dist/
+
+# Verify version and git version
+echo ""
+echo "Verifying version and git version..."
+pip install dist/*.whl
+python -c "
+import flashinfer_jit_cache
+print(f'📦 Package version: {flashinfer_jit_cache.__version__}')
+print(f'🔖 Git version: {flashinfer_jit_cache.__git_version__}')
+"
 
 # Copy wheels to output directory if specified
 if [ -n "${OUTPUT_DIR}" ]; then

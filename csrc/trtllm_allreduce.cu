@@ -84,17 +84,17 @@ void trtllm_lamport_initialize_all(int64_t buffer_0_ptr, int64_t buffer_1_ptr, i
 }
 
 // refer to cpp/tests/unit_tests/kernels/allReduce/allReduceFusionTest.cu:L268
-void trtllm_custom_all_reduce(Tensor in, Tensor out, int64_t tp_size, int64_t tp_rank,
+void trtllm_custom_all_reduce(TensorView in, TensorView out, int64_t tp_size, int64_t tp_rank,
                               int64_t token_num, int64_t fusion_op_code, int64_t strategy_code,
                               int64_t config_code, bool launch_with_pdl, int64_t flag_value,
-                              Tensor peer_comm_buffer_ptrs, Tensor peer_barrier_ptrs_in,
-                              Tensor peer_barrier_ptrs_out, Optional<Tensor> bias,
-                              Optional<Tensor> residual, Optional<Tensor> weight,
-                              Optional<Tensor> weight_pre_residual_norm, Optional<double> eps,
-                              Optional<Tensor> intermediate_buffer,
-                              Optional<Tensor> lamport_peer_comm_buffer_ptrs_0,
-                              Optional<Tensor> lamport_peer_comm_buffer_ptrs_1,
-                              Optional<Tensor> lamport_peer_comm_buffer_ptrs_2) {
+                              TensorView peer_comm_buffer_ptrs, TensorView peer_barrier_ptrs_in,
+                              TensorView peer_barrier_ptrs_out, Optional<TensorView> bias,
+                              Optional<TensorView> residual, Optional<TensorView> weight,
+                              Optional<TensorView> weight_pre_residual_norm, Optional<double> eps,
+                              Optional<TensorView> intermediate_buffer,
+                              Optional<TensorView> lamport_peer_comm_buffer_ptrs_0,
+                              Optional<TensorView> lamport_peer_comm_buffer_ptrs_1,
+                              Optional<TensorView> lamport_peer_comm_buffer_ptrs_2) {
   AllReduceFusionOp fusion_op = static_cast<AllReduceFusionOp>(fusion_op_code);
   cudaSetDevice(in->device.device_id);
   auto stream = get_stream(in->device);
@@ -102,8 +102,8 @@ void trtllm_custom_all_reduce(Tensor in, Tensor out, int64_t tp_size, int64_t tp
   // TODO(zihao): review dispatch type - support fp16, bf16 only
   DISPATCH_FLOATING_TYPES_FOR_ALLREDUCE(in->dtype, c_type, [&] {
     // TODO(yingyi): remove type template here (used to check if lamport is supported)
-    int64_t message_size = get_numel(in);
-    int64_t hidden_size = get_numel(in) / token_num;
+    int64_t message_size = in.numel();
+    int64_t hidden_size = in.numel() / token_num;
 
     AllReduceParams<c_type> params;
     params.elts_total = message_size;

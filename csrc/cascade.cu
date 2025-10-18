@@ -20,7 +20,8 @@
 using namespace flashinfer;
 using tvm::ffi::Optional;
 
-void merge_state(Tensor v_a, Tensor s_a, Tensor v_b, Tensor s_b, Tensor v_merged, Tensor s_merged) {
+void merge_state(TensorView v_a, TensorView s_a, TensorView v_b, TensorView s_b,
+                 TensorView v_merged, TensorView s_merged) {
   CHECK_INPUT(v_a);
   CHECK_INPUT(s_a);
   CHECK_INPUT(v_b);
@@ -56,8 +57,8 @@ void merge_state(Tensor v_a, Tensor s_a, Tensor v_b, Tensor s_b, Tensor v_merged
   TVM_FFI_ICHECK(success) << "MergeState kernel launch failed: unsupported data type.";
 }
 
-void merge_state_in_place(Tensor v, Tensor s, Tensor v_other, Tensor s_other,
-                          Optional<Tensor> mask) {
+void merge_state_in_place(TensorView v, TensorView s, TensorView v_other, TensorView s_other,
+                          Optional<TensorView> mask) {
   CHECK_INPUT(v);
   CHECK_INPUT(s);
   CHECK_INPUT(v_other);
@@ -99,7 +100,7 @@ void merge_state_in_place(Tensor v, Tensor s, Tensor v_other, Tensor s_other,
   TVM_FFI_ICHECK(success) << "MergeStateInPlace kernel launch failed: unsupported data type.";
 }
 
-void merge_states(Tensor v, Tensor s, Tensor v_merged, Tensor s_merged) {
+void merge_states(TensorView v, TensorView s, TensorView v_merged, TensorView s_merged) {
   CHECK_INPUT(v);
   CHECK_INPUT(s);
   CHECK_DEVICE(s, v);

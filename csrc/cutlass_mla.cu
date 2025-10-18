@@ -20,9 +20,9 @@
 using namespace flashinfer;
 using namespace flashinfer::attention;
 
-void CutlassMLAPagedAttention(ffi::Tensor workspace, ffi::Tensor out, ffi::Tensor lse,
-                              ffi::Tensor q_nope_pe, ffi::Tensor ckv_kpe_cache, ffi::Tensor kv_lens,
-                              ffi::Tensor page_table) {
+void CutlassMLAPagedAttention(ffi::TensorView workspace, ffi::TensorView out, ffi::TensorView lse,
+                              ffi::TensorView q_nope_pe, ffi::TensorView ckv_kpe_cache,
+                              ffi::TensorView kv_lens, ffi::TensorView page_table) {
   cudaSetDevice(q_nope_pe->device.device_id);
   const cudaStream_t stream = get_stream(q_nope_pe->device);
 

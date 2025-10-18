@@ -23,10 +23,13 @@ from tests.test_helpers.jit_utils import (
     gen_persistent_batch_attention_modules,
     gen_prefill_attention_modules,
 )
-from flashinfer.utils import get_compute_capability
+from flashinfer.utils import get_compute_capability, has_flashinfer_jit_cache
 
 
-@pytest.fixture(autouse=True, scope="module")
+@pytest.fixture(
+    autouse=not has_flashinfer_jit_cache(),
+    scope="module",
+)
 def warmup_jit():
     flashinfer.jit.build_jit_specs(
         gen_persistent_batch_attention_modules(

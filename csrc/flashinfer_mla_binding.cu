@@ -15,7 +15,8 @@
  */
 #include "tvm_ffi_utils.h"
 
-void CutlassMLAPagedAttention(Tensor workspace, Tensor out, Tensor lse, Tensor q_nope_pe,
-                              Tensor ckv_kpe_cache, Tensor kv_lens, Tensor page_table);
+void CutlassMLAPagedAttention(TensorView workspace, TensorView out, TensorView lse,
+                              TensorView q_nope_pe, TensorView ckv_kpe_cache, TensorView kv_lens,
+                              TensorView page_table);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(cutlass_mla_paged_attention, CutlassMLAPagedAttention);
