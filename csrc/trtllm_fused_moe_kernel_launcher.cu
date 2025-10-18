@@ -167,8 +167,9 @@ void trtllm_fp8_per_tensor_scale_moe_launcher(
       alloc_tensor({args.num_tokens, args.top_k}, dl_bfloat16, routing_logits->device);
   Tensor expert_indexes =
       alloc_tensor({args.num_tokens, args.top_k}, dl_int32, routing_logits->device);
+  int64_t const size_of_expert_count_histogram = std::max(num_experts * 2, int64_t(256 * 2));
   Tensor expert_count_histogram = alloc_tensor(
-      {2 * 256},
+      {size_of_expert_count_histogram},
       dl_int32,  // 256 is the max number of threads per block and max number of experts
       routing_logits->device);
 
