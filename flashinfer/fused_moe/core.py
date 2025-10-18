@@ -171,7 +171,9 @@ def _maybe_get_cached_w3_w1_permute_indices(
     epilogue_tile_m: int,
     num_elts_per_sf: Union[None, int] = None,
 ) -> torch.Tensor:
-    if dst_w3_w1_weight.shape not in _cache_permute_indices:
+    # Create a unique cache key that includes all parameters affecting the permutation
+    cache_key = ("w3_w1", dst_w3_w1_weight.shape)
+    if cache_key not in _cache_permute_indices:
         # Get permute indices and chain them together
         permute0 = get_reorder_rows_for_gated_act_gemm_row_indices(dst_w3_w1_weight)
         if num_elts_per_sf is None:
@@ -185,10 +187,10 @@ def _maybe_get_cached_w3_w1_permute_indices(
                 num_elts_per_sf=num_elts_per_sf,
             )
         # Memoize permute indices as recompute is **very** costly
-        _cache_permute_indices[dst_w3_w1_weight.shape] = permute0[permute1].to(
+        _cache_permute_indices[cache_key] = permute0[permute1].to(
             dst_w3_w1_weight.device
         )
-    permute_indices = _cache_permute_indices[dst_w3_w1_weight.shape]
+    permute_indices = _cache_permute_indices[cache_key]
     return permute_indices
 
 
@@ -198,7 +200,9 @@ def get_w2_permute_indices_with_cache(
     epilogue_tile_m: int,
     num_elts_per_sf: Union[None, int] = None,
 ) -> torch.Tensor:
-    if dst_w2_weight.shape not in _cache_permute_indices:
+    # Create a unique cache key that includes all parameters affecting the permutation
+    cache_key = ("w2", dst_w2_weight.shape)
+    if cache_key not in _cache_permute_indices:
         if num_elts_per_sf is None:
             permute_indices = get_shuffle_matrix_a_row_indices(
                 dst_w2_weight, epilogue_tile_m
@@ -210,8 +214,8 @@ def get_w2_permute_indices_with_cache(
                 num_elts_per_sf=num_elts_per_sf,
             ).to(dst_w2_weight.device)
         # Memoize permute indices as recompute is **very** costly
-        _cache_permute_indices[dst_w2_weight.shape] = permute_indices
-    permute_indices = _cache_permute_indices[dst_w2_weight.shape]
+        _cache_permute_indices[cache_key] = permute_indices
+    permute_indices = _cache_permute_indices[cache_key]
     return permute_indices
 
 
