@@ -1715,7 +1715,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             self._max_q_len = max_token_per_sequence
         else:
             qo_indptr_host = qo_indptr.to("cpu")
-            self._max_q_len = max(qo_indptr_host).item()
+            self._max_q_len = max(qo_indptr_host[1:] - qo_indptr_host[:-1]).item()
             total_num_rows = int(qo_indptr_host[-1])
 
         if max_sequence_kv is not None:
