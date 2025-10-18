@@ -15,6 +15,11 @@ jobs:
   update-codeowners:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      DEPTH: 3
+      MIN_COMMITS: 1
+      DAYS_BACK: 180
+      TOP_N: 5
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4.2.2
@@ -33,10 +38,10 @@ jobs:
         run: |
           python scripts/codeowner_analyzer.py \
             --output .github/CODEOWNERS \
-            --depth 3 \
-            --min-commits 1 \
-            --days-back 180 \
-            --top-n 5 \
+            --depth ${{ env.DEPTH }} \
+            --min-commits ${{ env.MIN_COMMITS }} \
+            --days-back ${{ env.DAYS_BACK }} \
+            --top-n ${{ env.TOP_N }} \
             --allowed-users-file scripts/authorized_codeowner.txt
 
       - name: Check for changes
@@ -68,7 +73,7 @@ jobs:
           commit-message: |
             chore: update CODEOWNERS based on git history
 
-            Auto-generated CODEOWNERS update based on commit activity over the last 180 days.
+            Auto-generated CODEOWNERS update based on commit activity over the last ${{ env.DAYS_BACK }} days.
 
             🤖 Generated with [Claude Code](https://claude.com/claude-code)
 
@@ -80,7 +85,7 @@ jobs:
           body: |
             ## Summary
 
-            This PR updates the CODEOWNERS file based on git commit history analysis from the last 180 days.
+            This PR updates the CODEOWNERS file based on git commit history analysis from the last ${{ env.DAYS_BACK }} days.
 
             ## Changes
 
@@ -98,10 +103,10 @@ jobs:
             ## Notes
 
             - This is an automated PR generated weekly
-            - Minimum commits threshold: 1
-            - Analysis period: 180 days
-            - Directory depth: 3 levels
-            - Top N owners per module: 5
+            - Minimum commits threshold: ${{ env.MIN_COMMITS }}
+            - Analysis period: ${{ env.DAYS_BACK }} days
+            - Directory depth: ${{ env.DEPTH }} levels
+            - Top N owners per module: ${{ env.TOP_N }}
 
             ---
 
