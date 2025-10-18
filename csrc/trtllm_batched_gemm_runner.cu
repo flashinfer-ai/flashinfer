@@ -169,6 +169,7 @@ void TrtllmGenBatchedGemmRunner::run(
   auto const configs = bmm.getBatchedGemmConfigs();
 
   auto const& config = configs[configIndex];
+
   FLASHINFER_CHECK(numBatches > 0, "Batched GEMM requires numBatches > 0");
   if (!mOptions.staticBatch) {
     FLASHINFER_CHECK(totalNumPaddedTokens,
