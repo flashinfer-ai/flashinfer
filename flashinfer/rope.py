@@ -164,10 +164,10 @@ def _fake_apply_rope_pos_ids(
 
 
 @register_custom_op(
-    "flashinfer::mla_rope_quantize",
+    "flashinfer::rope_quantize",
     mutates_args=("q_rope_out", "k_rope_out", "q_nope_out", "k_nope_out"),
 )
-def _mla_rope_quantize(
+def _rope_quantize(
     q_rope_in: torch.Tensor,
     k_rope_in: torch.Tensor,
     q_nope_in: torch.Tensor,
@@ -182,7 +182,12 @@ def _mla_rope_quantize(
     quant_scale_kv: float,
     interleave: bool,
 ) -> None:
-    get_rope_module().mla_rope_quantize(
+    r"""Custom operator that routes to the CUDA kernel implementation.
+
+    Converts is_neox parameter to interleave format and dispatches to the underlying
+    CUDA kernel via the JIT-compiled module.
+    """
+    get_rope_module().rope_quantize(
         q_rope_in,
         k_rope_in,
         q_nope_in,
@@ -199,8 +204,8 @@ def _mla_rope_quantize(
     )
 
 
-@register_fake_op("flashinfer::mla_rope_quantize")
-def _fake_mla_rope_quantize(
+@register_fake_op("flashinfer::rope_quantize")
+def _fake_rope_quantize(
     q_rope_in: torch.Tensor,
     k_rope_in: torch.Tensor,
     q_nope_in: torch.Tensor,
@@ -1155,6 +1160,89 @@ def mla_rope_quantize_fp8(
     q_nope_out: Optional[torch.Tensor] = None,
     k_nope_out: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return rope_quantize_fp8(
+        q_rope,
+        k_rope,
+        q_nope,
+        k_nope,
+        cos_sin_cache,
+        pos_ids,
+        is_neox,
+        quantize_dtype,
+        quant_scale_q,
+        quant_scale_kv,
+        q_rope_out,
+        k_rope_out,
+        q_nope_out,
+        k_nope_out,
+    )
+
+
+def rope_quantize_fp8(
+    q_rope: torch.Tensor,
+    k_rope: torch.Tensor,
+    q_nope: torch.Tensor,
+    k_nope: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    pos_ids: torch.Tensor,
+    is_neox: bool = True,
+    quantize_dtype: Optional[torch.dtype] = None,
+    quant_scale_q: float = 1.0,
+    quant_scale_kv: float = 1.0,
+    q_rope_out: Optional[torch.Tensor] = None,
+    k_rope_out: Optional[torch.Tensor] = None,
+    q_nope_out: Optional[torch.Tensor] = None,
+    k_nope_out: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    r"""Apply RoPE (Rotary Positional Embeddings) and quantize to FP8 format.
+
+    This function takes pre-split query/key tensors (rotary and non-rotary dimensions separated),
+    applies RoPE to the rotary dimension tensors, and quantizes both rotary and non-rotary
+    tensors to FP8 format. Supports MLA, GQA, and MHA architectures.
+
+    Parameters
+    ----------
+    q_rope : torch.Tensor
+        Query tensor (rotary dimensions), shape: ``(nnz, num_qo_heads, rope_dim)``.
+        Must be float16 or bfloat16.
+    k_rope : torch.Tensor
+        Key tensor (rotary dimensions). For GQA/MHA: ``(nnz, num_kv_heads, rope_dim)``.
+        For MLA: ``(nnz, rope_dim)``. Must be float16 or bfloat16.
+    q_nope : torch.Tensor
+        Query tensor (non-rotary dimensions), shape: ``(nnz, num_qo_heads, no_rope_dim)``.
+        Must be float16 or bfloat16.
+    k_nope : torch.Tensor
+        Key tensor (non-rotary dimensions). For GQA/MHA: ``(nnz, num_kv_heads, no_rope_dim)``.
+        For MLA: ``(nnz, no_rope_dim)``. Must be float16 or bfloat16.
+    cos_sin_cache : torch.Tensor
+        Precomputed cosine and sine values, shape: ``(max_seq_len, rope_dim)``.
+        First half contains cosine values, second half contains sine values. Must be float32.
+    pos_ids : torch.Tensor
+        Position indices for each token, shape: ``(nnz,)``.
+    is_neox : bool
+        RoPE layout style. If ``True`` (default), use non-interleaved layout (first/second half).
+        If ``False``, use interleaved layout (even/odd dimensions).
+    quantize_dtype : Optional[torch.dtype]
+        Target quantization dtype. If ``None``, inferred from output tensors or defaults to
+        ``torch.float8_e4m3fn``. Must be ``torch.float8_e4m3fn`` or ``torch.float8_e5m2``.
+    quant_scale_q : float
+        Quantization scaling factor for query tensors, default: ``1.0``.
+    quant_scale_kv : float
+        Quantization scaling factor for key tensors, default: ``1.0``.
+    q_rope_out : Optional[torch.Tensor]
+        Pre-allocated output tensor for quantized query (rotary). If ``None``, allocated automatically.
+    k_rope_out : Optional[torch.Tensor]
+        Pre-allocated output tensor for quantized key (rotary). If ``None``, allocated automatically.
+    q_nope_out : Optional[torch.Tensor]
+        Pre-allocated output tensor for quantized query (non-rotary). If ``None``, allocated automatically.
+    k_nope_out : Optional[torch.Tensor]
+        Pre-allocated output tensor for quantized key (non-rotary). If ``None``, allocated automatically.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+        Quantized tensors: (q_rope_out, k_rope_out, q_nope_out, k_nope_out).
+    """
     if cos_sin_cache.dtype != torch.float32:
         raise ValueError("cos_sin_cache should be float32")
 
@@ -1189,7 +1277,7 @@ def mla_rope_quantize_fp8(
         else torch.empty_like(k_nope, dtype=quantize_dtype)
     )
 
-    _mla_rope_quantize(
+    _rope_quantize(
         q_rope,
         k_rope,
         q_nope,

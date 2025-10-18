@@ -42,6 +42,12 @@ def _create_build_metadata():
     # Get git version
     git_version = get_git_version(cwd=_root)
 
+    # Append local version suffix if available
+    local_version = os.environ.get("FLASHINFER_LOCAL_VERSION")
+    if local_version:
+        # Use + to create a local version identifier that will appear in wheel name
+        version = f"{version}+{local_version}"
+
     # Create build metadata in the source tree
     package_dir = Path(__file__).parent / "flashinfer"
     build_meta_file = package_dir / "_build_meta.py"
@@ -108,6 +114,15 @@ def _prepare_for_wheel():
     if _data_dir.exists():
         shutil.rmtree(_data_dir)
     _create_data_dir(use_symlinks=False)
+
+    # Copy license files from licenses/ to root to avoid nested path in wheel
+    licenses_dir = _root / "licenses"
+    if licenses_dir.exists():
+        for license_file in licenses_dir.glob("*.txt"):
+            shutil.copy2(
+                license_file,
+                _root / f"LICENSE.{license_file.stem.removeprefix('LICENSE.')}.txt",
+            )
 
 
 def _prepare_for_editable():

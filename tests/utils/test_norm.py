@@ -16,6 +16,7 @@ limitations under the License.
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 import flashinfer
 from flashinfer.utils import device_support_pdl
@@ -222,6 +223,22 @@ def test_gemma_fused_add_rmsnorm(
 
     torch.testing.assert_close(x_fused, x_native, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(residual_fused, residual_native, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("batch_size", [1, 2, 3, 128])
+@pytest.mark.parametrize("hidden_size", [128, 129, 1024, 16384])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_layernorm(batch_size, hidden_size, dtype):
+    eps = 1e-6
+
+    x = torch.randn(batch_size, hidden_size, dtype=dtype, device="cuda")
+    gamma = torch.randn(hidden_size, dtype=torch.float32, device="cuda")
+    beta = torch.randn(hidden_size, dtype=torch.float32, device="cuda")
+
+    out = flashinfer.layernorm(x, gamma, beta, eps)
+    out_ref = F.layer_norm(x.float(), (hidden_size,), gamma, beta, eps).to(dtype)
+
+    torch.testing.assert_close(out, out_ref, rtol=1e-2, atol=1e-2)
 
 
 if __name__ == "__main__":
