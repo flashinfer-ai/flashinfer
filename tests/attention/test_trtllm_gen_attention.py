@@ -331,6 +331,8 @@ def unpack_compare_nvfp4(
 )
 @pytest.mark.parametrize("enable_pdl", [True, False, None])
 @pytest.mark.parametrize("enable_sink", [True, False])
+@pytest.mark.parametrize("max_q_len", [511])
+@pytest.mark.parametrize("max_kv_len", [2047])
 def test_trtllm_batch_prefill(
     kv_layout,
     batch_size,
@@ -343,6 +345,8 @@ def test_trtllm_batch_prefill(
     kv_dtype,
     enable_pdl,
     enable_sink,
+    max_q_len,
+    max_kv_len,
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] in [11, 12]:
@@ -350,13 +354,11 @@ def test_trtllm_batch_prefill(
     # Set up test parameters
     torch.manual_seed(0)
     head_dim = 128
-    MAX_Q_LEN = 511
-    MAX_IN_KV_LEN = 2047
 
     # Generate random sequence lengths
     num_qo_heads = num_kv_heads * head_grp_size
     q_lens, in_kv_lens, seq_lens = generate_seq_lens_prefill(
-        batch_size, MAX_Q_LEN, MAX_IN_KV_LEN
+        batch_size, max_q_len, max_kv_len
     )
 
     # Create query tensor and related data
@@ -523,6 +525,56 @@ def test_trtllm_batch_prefill(
         # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
         # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
         assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()
+
+
+@pytest.mark.parametrize("kv_layout", ["HND"])  # trtllm-gen only support HND
+@pytest.mark.parametrize(
+    "batch_size,page_size,num_kv_heads,head_grp_size",
+    [
+        (1, 16, 8, 8),
+    ],
+)
+@pytest.mark.parametrize("window_left", [-1])  # todo(Siyuan): add 127 window_left
+@pytest.mark.parametrize(
+    "q_dtype,kv_dtype,o_dtype",
+    [
+        ("bf16", "bf16", "bf16"),
+    ],
+)
+@pytest.mark.parametrize("enable_pdl", [None])
+@pytest.mark.parametrize("enable_sink", [False])
+@pytest.mark.parametrize("max_q_len", [8192])
+@pytest.mark.parametrize("max_kv_len", [8192])
+def test_trtllm_batch_prefill_bs1(
+    kv_layout,
+    batch_size,
+    page_size,
+    num_kv_heads,
+    head_grp_size,
+    window_left,
+    q_dtype,
+    o_dtype,
+    kv_dtype,
+    enable_pdl,
+    enable_sink,
+    max_q_len,
+    max_kv_len,
+):
+    test_trtllm_batch_prefill(
+        kv_layout,
+        batch_size,
+        page_size,
+        num_kv_heads,
+        head_grp_size,
+        window_left,
+        q_dtype,
+        o_dtype,
+        kv_dtype,
+        enable_pdl,
+        enable_sink,
+        max_q_len,
+        max_kv_len,
+    )
 
 
 @pytest.mark.parametrize("kv_layout", ["HND"])  # trtllm-gen only support HND
@@ -998,7 +1050,6 @@ def test_trtllm_gen_prefill_deepseek(
 def test_trtllm_gen_prefill_deepseek_bs1(
     batch_size, s_qo, s_kv, num_kv_heads, head_grp_size, causal
 ):
-    pytest.xfail("trtllm-gen prefill triggers an IMA with bs1")
     test_trtllm_gen_prefill_deepseek(
         batch_size, s_qo, s_kv, num_kv_heads, head_grp_size, causal
     )

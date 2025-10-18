@@ -696,10 +696,6 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
             backends.remove("trtllm-gen")
     if "trtllm-gen-native" in backends:
         remove_trtllm_native = False
-        if batch_size == 1:
-            # TO-DO: trtllm-gen-native hits IMA on batch size 1. Investigate and fix.
-            print("[INFO] trtllm-gen-native backend currently requires batch size > 1")
-            remove_trtllm_native = True
         if not causal:
             print("[INFO] trtllm-gen-native backend currently requires causal = True")
             remove_trtllm_native = True
@@ -1183,10 +1179,6 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
             torch.float8_e5m2,
         ]:
             print("[INFO] trtllm-gen-native backend does not support FP8. Skipping.")
-            remove_trtllm_native = True
-        if batch_size == 1:
-            # TO-DO: trtllm-gen-native hits IMA on batch size 1. Investigate and fix.
-            print("[INFO] trtllm-gen-native backend currently requires batch size > 1")
             remove_trtllm_native = True
         if not (head_dim_qk == 192 and head_dim_vo == 128):
             print(
