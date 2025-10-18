@@ -5,6 +5,7 @@ on:
     # Run weekly on Monday at 00:00 UTC
     - cron: '0 0 * * 1'
   workflow_dispatch: # Allow manual triggering
+  pull_request:
 
 permissions:
   contents: write
@@ -61,7 +62,9 @@ jobs:
         if: steps.check_changes.outputs.changed == 'true'
         uses: peter-evans/create-pull-request@v7
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.FLASHINFER_BOT_TOKEN }}
+          committer: flashinfer-bot <flashinfer-bot@users.noreply.github.com>
+          author: flashinfer-bot <flashinfer-bot@users.noreply.github.com>
           commit-message: |
             chore: update CODEOWNERS based on git history
 
