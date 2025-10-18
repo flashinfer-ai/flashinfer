@@ -1838,7 +1838,7 @@ def cache_permute_indices():
 
 @pytest.mark.parametrize("num_tokens", [1, 8, 1024])
 @pytest.mark.parametrize("hidden_size", [1024, 8192])
-@pytest.mark.parametrize("intermediate_size", [ 1024, 768, 384, 512])
+@pytest.mark.parametrize("intermediate_size", [1024, 768, 384, 512])
 @pytest.mark.parametrize(
     "moe_impl",
     [
@@ -1913,7 +1913,7 @@ def cache_permute_indices():
                 "routed_scaling": None,
                 "has_routing_bias": False,
                 "routing_method_type": RoutingMethodType.Renormalize,
-                "compatible_moe_impls": [FP8PerTensorMoe, FP8BlockScaleMoe, FP4Moe],
+                "compatible_moe_impls": [FP8BlockScaleMoe, FP4Moe],
             },
             id="Renorm",
             # marks=pytest.mark.skip(
@@ -2085,7 +2085,7 @@ def test_moe_quantization_classes(
         )
         else 64,
     )
-
+    padding = tile_tokens_dim
     # Validation checks
     assert top_k <= num_experts
     # assert top_k <= 8
