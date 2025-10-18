@@ -39,15 +39,15 @@ void apply_rope_pos_ids_cos_sin_cache(TensorView q, TensorView k, TensorView q_r
                                       TensorView k_rope, TensorView cos_sin_cache,
                                       TensorView pos_ids, bool interleave);
 
-void mla_rope_quantize(TensorView q_rope_in, TensorView k_rope_in, TensorView q_nope_in,
-                       TensorView k_nope_in, TensorView q_rope_out, TensorView k_rope_out,
-                       TensorView q_nope_out, TensorView k_nope_out, TensorView cos_sin_cache,
-                       TensorView pos_ids, double quant_scale_q, double quant_scale_kv,
-                       bool interleave);
+void rope_quantize(TensorView q_rope_in, TensorView k_rope_in, TensorView q_nope_in,
+                   TensorView k_nope_in, TensorView q_rope_out, TensorView k_rope_out,
+                   TensorView q_nope_out, TensorView k_nope_out, TensorView cos_sin_cache,
+                   TensorView pos_ids, double quant_scale_q, double quant_scale_kv,
+                   bool interleave);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(apply_rope, apply_rope);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(apply_llama31_rope, apply_llama31_rope);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(apply_rope_pos_ids, apply_rope_pos_ids);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(apply_llama31_rope_pos_ids, apply_llama31_rope_pos_ids);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(apply_rope_pos_ids_cos_sin_cache, apply_rope_pos_ids_cos_sin_cache);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(mla_rope_quantize, mla_rope_quantize);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(rope_quantize, rope_quantize);
