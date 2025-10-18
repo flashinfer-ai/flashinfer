@@ -355,6 +355,9 @@ __global__ void RopeQuantizeKernel(
     size_t k_rope_in_stride_h, size_t k_nope_in_stride, size_t k_nope_in_stride_h,
     size_t k_rope_out_stride, size_t k_rope_out_stride_h, size_t k_nope_out_stride,
     size_t k_nope_out_stride_h, float quant_scale_q, float quant_scale_kv) {  // generalized kernel
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.wait;");
+#endif
   uint32_t bx = blockIdx.x, tx = threadIdx.x, ty = threadIdx.y;
   uint32_t by = blockIdx.y;
   uint32_t bdy = blockDim.y;
@@ -486,6 +489,9 @@ __global__ void RopeQuantizeKernel(
       q_nope_vec.cast_store(q_nope_out_ptr + tx * vec_size);
     }
   }
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.launch_dependents;");
+#endif
 }
 
 template <bool interleave, uint32_t head_dim, uint32_t vec_size, uint32_t bdx, typename DType,
