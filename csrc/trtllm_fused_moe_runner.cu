@@ -65,12 +65,12 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mUsePdl = true;
 
     // output:
-    routingData.mPtrExpertIdx = routingExpertIndexes;
+    routingData.mPtrTopKPacked = routingExpertIndexes;
     routingData.mPtrExpertCounts = expertCountHistogram;
     routingData.mPtrPermutedIdxSize = permutedIdxSize;
     routingData.mPtrExpandedIdxToPermutedIdx = expandedIdxToPermutedIdx;
     routingData.mPtrPermutedIdxToTokenIdx = permutedIdxToTokenIdx;
-    routingData.mPtrExpertWeights = expertWeights;
+    routingData.mPtrTopKWeights = expertWeights;
 
     routingData.mPtrCtaIdxXyToBatchIdx = ctaIdxXyToBatchIdx;
     routingData.mPtrCtaIdxXyToMnLimit = ctaIdxXyToMnLimit;
@@ -102,12 +102,12 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mUsePdl = true;
 
     // output:
-    routingData.mPtrExpertIdx = routingExpertIndexes;
+    routingData.mPtrTopKPacked = routingExpertIndexes;
     routingData.mPtrExpertCounts = expertCountHistogram;
     routingData.mPtrPermutedIdxSize = permutedIdxSize;
     routingData.mPtrExpandedIdxToPermutedIdx = expandedIdxToPermutedIdx;
     routingData.mPtrPermutedIdxToTokenIdx = permutedIdxToTokenIdx;
-    routingData.mPtrExpertWeights = expertWeights;
+    routingData.mPtrTopKWeights = expertWeights;
 
     routingData.mPtrCtaIdxXyToBatchIdx = ctaIdxXyToBatchIdx;
     routingData.mPtrCtaIdxXyToMnLimit = ctaIdxXyToMnLimit;
@@ -144,12 +144,12 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     //
     // Outputs
     //
-    routingData.mPtrExpertIdx = routingExpertIndexes;
+    routingData.mPtrTopKPacked = routingExpertIndexes;
     routingData.mPtrExpertCounts = expertCountHistogram;
     routingData.mPtrPermutedIdxSize = permutedIdxSize;
     routingData.mPtrExpandedIdxToPermutedIdx = expandedIdxToPermutedIdx;
     routingData.mPtrPermutedIdxToTokenIdx = permutedIdxToTokenIdx;
-    routingData.mPtrExpertWeights = expertWeights;
+    routingData.mPtrTopKWeights = expertWeights;
 
     //
     // Grouped Gemm Launch Config Buffers

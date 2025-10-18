@@ -31,6 +31,8 @@ namespace cg = cooperative_groups;
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 static constexpr int WarpSize = 32;
+static constexpr int MaxNumExpertsUnit = 128;
+static constexpr int MaxNumTopK = 10;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -136,160 +138,6 @@ struct Sort<4, RedType> {
   }
 };
 
-// For N > 4, use a generic bubble sort approach for simplicity
-// This is not the most efficient but adequate for small N
-template <typename RedType>
-struct Sort<5, RedType> {
-  static __device__ void run(RedType* topK) {
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-#pragma unroll
-      for (int j = 0; j < 4 - i; ++j) {
-        TOPK_SWAP(j, j + 1);
-      }
-    }
-  }
-};
-
-template <typename RedType>
-struct Sort<6, RedType> {
-  static __device__ void run(RedType* topK) {
-#pragma unroll
-    for (int i = 0; i < 5; ++i) {
-#pragma unroll
-      for (int j = 0; j < 5 - i; ++j) {
-        TOPK_SWAP(j, j + 1);
-      }
-    }
-  }
-};
-
-template <typename RedType>
-struct Sort<7, RedType> {
-  static __device__ void run(RedType* topK) {
-#pragma unroll
-    for (int i = 0; i < 6; ++i) {
-#pragma unroll
-      for (int j = 0; j < 6 - i; ++j) {
-        TOPK_SWAP(j, j + 1);
-      }
-    }
-  }
-};
-
-template <typename RedType>
-struct Sort<8, RedType> {
-  static __device__ void run(RedType* topK) {
-#pragma unroll
-    for (int i = 0; i < 7; ++i) {
-#pragma unroll
-      for (int j = 0; j < 7 - i; ++j) {
-        TOPK_SWAP(j, j + 1);
-      }
-    }
-  }
-};
-
-template <typename RedType>
-struct Sort<9, RedType> {
-  static __device__ void run(RedType* topK) {
-#pragma unroll
-    for (int i = 0; i < 8; ++i) {
-#pragma unroll
-      for (int j = 0; j < 8 - i; ++j) {
-        TOPK_SWAP(j, j + 1);
-      }
-    }
-  }
-};
-
-template <typename RedType>
-struct Sort<10, RedType> {
-  static __device__ void run(RedType* topK) {
-#pragma unroll
-    for (int i = 0; i < 9; ++i) {
-#pragma unroll
-      for (int j = 0; j < 9 - i; ++j) {
-        TOPK_SWAP(j, j + 1);
-      }
-    }
-  }
-};
-
-template <typename RedType>
-struct Sort<11, RedType> {
-  static __device__ void run(RedType* topK) {
-#pragma unroll
-    for (int i = 0; i < 10; ++i) {
-#pragma unroll
-      for (int j = 0; j < 10 - i; ++j) {
-        TOPK_SWAP(j, j + 1);
-      }
-    }
-  }
-};
-
-template <typename RedType>
-struct Sort<12, RedType> {
-  static __device__ void run(RedType* topK) {
-#pragma unroll
-    for (int i = 0; i < 11; ++i) {
-#pragma unroll
-      for (int j = 0; j < 11 - i; ++j) {
-        TOPK_SWAP(j, j + 1);
-      }
-    }
-  }
-};
-template <typename RedType>
-struct Sort<13, RedType> {
-  static __device__ void run(RedType* topK) {
-#pragma unroll
-    for (int i = 0; i < 12; ++i) {
-#pragma unroll
-      for (int j = 0; j < 12 - i; ++j) {
-        TOPK_SWAP(j, j + 1);
-      }
-    }
-  }
-};
-template <typename RedType>
-struct Sort<14, RedType> {
-  static __device__ void run(RedType* topK) {
-#pragma unroll
-    for (int i = 0; i < 13; ++i) {
-#pragma unroll
-      for (int j = 0; j < 13 - i; ++j) {
-        TOPK_SWAP(j, j + 1);
-      }
-    }
-  }
-};
-template <typename RedType>
-struct Sort<15, RedType> {
-  static __device__ void run(RedType* topK) {
-#pragma unroll
-    for (int i = 0; i < 14; ++i) {
-#pragma unroll
-      for (int j = 0; j < 14 - i; ++j) {
-        TOPK_SWAP(j, j + 1);
-      }
-    }
-  }
-};
-template <typename RedType>
-struct Sort<16, RedType> {
-  static __device__ void run(RedType* topK) {
-#pragma unroll
-    for (int i = 0; i < 15; ++i) {
-#pragma unroll
-      for (int j = 0; j < 15 - i; ++j) {
-        TOPK_SWAP(j, j + 1);
-      }
-    }
-  }
-};
-
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <int K, typename Type>
@@ -312,14 +160,14 @@ __forceinline__ __device__ void reduceTopK(cg::thread_block_tile<WarpSize> const
 };
 
 template <int K, typename Type, int N>
-__forceinline__ __device__ void reduceTopK(cg::thread_block_tile<WarpSize> const& warp,
-                                           Type (&out)[K], int32_t (&outIdx)[K], Type (&value)[N],
-                                           int32_t (&idx)[N], Type const minValue,
-                                           int actualK = K) {
+__forceinline__ __device__ void reduceTopKFunc(cg::thread_block_tile<WarpSize> const& warp,
+                                               Type (&out)[K], int32_t (&outIdx)[K],
+                                               Type (&value)[N], int32_t (&idx)[N],
+                                               Type const minValue, int actualK = K) {
   static_assert(K > 0, "Top K must have K > 0");
   static_assert(K < WarpSize, "Top K must have K < WarpSize");
   static_assert(N > 0, "Top K must have N > 0");
-  static_assert(N <= 16, "Only support candidates number less than or equal to 128");
+  static_assert(N < 5, "Only support candidates number less than or equal to 128");
   using RedType = TopKRedType<Type>;
   RedType topK[N];
 #pragma unroll
@@ -343,6 +191,58 @@ __forceinline__ __device__ void reduceTopK(cg::thread_block_tile<WarpSize> const
     // get the next largest value
     packedMax = topK[0].reduce(warp);
     RedType::unpack(out[kk], outIdx[kk], packedMax);
+  }
+};
+
+template <int K, typename Type, int N>
+__forceinline__ __device__ void reduceTopK(cg::thread_block_tile<WarpSize> const& warp,
+                                           Type (&out)[K], int32_t (&outIdx)[K], Type (&value)[N],
+                                           int32_t (&idx)[N], Type const minValue,
+                                           int actualK = K) {
+  static_assert(K > 0, "Top K must have K > 0");
+  static_assert(K < WarpSize, "Top K must have K < WarpSize");
+  static_assert(N > 0, "Top K must have N > 0");
+  static_assert(N <= 16, "Only support candidates number less than or equal to 16*32=512");
+  using RedType = TopKRedType<Type>;
+
+  if constexpr (N <= 4) {
+    reduceTopKFunc<K, Type, N>(warp, out, outIdx, value, idx, minValue, actualK);
+  } else {
+    constexpr int numLoops = (N - 1) / 4 + 1;
+    constexpr int numResults = (numLoops * K - 1) / WarpSize + 1;
+
+    Type topKBufferValue[numResults];
+    int32_t topKBufferIdx[numResults];
+    int32_t laneIdx = threadIdx.x % WarpSize;
+
+    for (int ii = 0; ii < numResults; ++ii) {
+      topKBufferValue[ii] = minValue;
+      topKBufferIdx[ii] = ii * WarpSize - 1;
+    }
+    for (int loop = 0; loop < numLoops; ++loop) {
+      int start = loop * 4;
+      Type topKValue[K];
+      int32_t topKIdx[K];
+      Type inValue[4];
+      int32_t inIdx[4];
+      for (int i = 0; i < 4; ++i) {
+        inValue[i] = value[start + i];
+        inIdx[i] = idx[start + i];
+      }
+      reduceTopKFunc<K, Type, 4>(warp, topKValue, topKIdx, inValue, inIdx, minValue, actualK);
+      int inOffset = laneIdx % K;
+      if (laneIdx >= loop * K && laneIdx < (loop + 1) * K) {
+        topKBufferValue[0] = topKValue[inOffset];
+        topKBufferIdx[0] = topKIdx[inOffset];
+      }
+      if (loop == numLoops - 1 && (laneIdx < (numLoops * K - WarpSize))) {
+        topKBufferValue[1] = topKValue[inOffset];
+        topKBufferIdx[1] = topKIdx[inOffset];
+      }
+    }
+
+    reduceTopKFunc<K, Type, numResults>(warp, out, outIdx, topKBufferValue, topKBufferIdx, minValue,
+                                        actualK);
   }
 };
 
