@@ -139,7 +139,7 @@ def is_cuda_oom_error_str(e: str) -> bool:
 
 @pytest.hookimpl(tryfirst=True)
 def pytest_runtest_call(item):
-    # Wrap the test call so we don't invoke item.runtest() ourselves; yield lets pytest run it.
+    # skip OOM error and missing JIT cache errors
     try:
         item.runtest()
     except (torch.cuda.OutOfMemoryError, RuntimeError) as e:

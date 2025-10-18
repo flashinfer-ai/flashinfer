@@ -463,20 +463,6 @@ void run(Data const& data, void* stream) {
   }
 }
 
-// void run(Data const& data, void* stream) {
-//   TVM_FFI_ICHECK(data.mPtrExpertIdx != nullptr || data.mPtrScores != nullptr)
-//       << "Routing kernel requires at least one input parameter";
-//   TVM_FFI_ICHECK(data.mPtrPermutedIdxSize != nullptr && data.mPtrCtaIdxXyToBatchIdx != nullptr &&
-//                  data.mPtrCtaIdxXyToMnLimit != nullptr && data.mPtrNumNonExitingCtas != nullptr)
-//       << "Llama4 routing kernel expects permuted idx and grouped Gemm launch config buffers";
-//   TVM_FFI_ICHECK_LE(data.mTopK, MaxNumTopExperts)
-//       << "Routing kernel expects topK experts <= " << MaxNumTopExperts << ", got " << data.mTopK;
-//   TVM_FFI_ICHECK_LT(data.mPaddingLog2, 8)
-//       << "Routing kernel expects padding log2 < 8, got " << data.mPaddingLog2;
-
-//   runImpl(data, stream);
-// }
-
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 }  // namespace routingRenormalize
