@@ -344,98 +344,121 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheKernel(
 
 template <bool interleave, uint32_t vec_size, uint32_t bdx, typename DType, typename IdType,
           typename QuantType>
-__global__ void MLARopeQuantizeKernel(
+__global__ void RopeQuantizeKernel(
     DType* q_rope_in, DType* k_rope_in, DType* q_nope_in, DType* k_nope_in, QuantType* q_rope_out,
     QuantType* k_rope_out, QuantType* q_nope_out, QuantType* k_nope_out,
     float* __restrict__ cos_sin_cache, IdType* __restrict__ pos_ids, uint32_t nnz,
-    uint32_t num_heads, size_t q_rope_in_stride_n, size_t q_rope_in_stride_h,
-    size_t q_nope_in_stride_n, size_t q_nope_in_stride_h, size_t q_rope_out_stride_n,
-    size_t q_rope_out_stride_h, size_t q_nope_out_stride_n, size_t q_nope_out_stride_h,
-    size_t k_rope_in_stride, size_t k_nope_in_stride, size_t k_rope_out_stride,
-    size_t k_nope_out_stride, float quant_scale_q, float quant_scale_kv) {
+    uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t rope_dim, uint32_t no_rope_dim,
+    size_t q_rope_in_stride_n, size_t q_rope_in_stride_h, size_t q_nope_in_stride_n,
+    size_t q_nope_in_stride_h, size_t q_rope_out_stride_n, size_t q_rope_out_stride_h,
+    size_t q_nope_out_stride_n, size_t q_nope_out_stride_h, size_t k_rope_in_stride,
+    size_t k_rope_in_stride_h, size_t k_nope_in_stride, size_t k_nope_in_stride_h,
+    size_t k_rope_out_stride, size_t k_rope_out_stride_h, size_t k_nope_out_stride,
+    size_t k_nope_out_stride_h, float quant_scale_q, float quant_scale_kv) {  // generalized kernel
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.wait;");
+#endif
   uint32_t bx = blockIdx.x, tx = threadIdx.x, ty = threadIdx.y;
   uint32_t by = blockIdx.y;
   uint32_t bdy = blockDim.y;
-  constexpr uint32_t rotary_dim = 64;
+
+  // Calculate flexible boundaries for block allocation
+  uint32_t rope_chunk_size = rope_dim;  // Process entire rope_dim per chunk
+  uint32_t rope_chunks = (rope_dim + rope_chunk_size - 1) / rope_chunk_size;
+  uint32_t no_rope_chunks = (no_rope_dim + rope_chunk_size - 1) / rope_chunk_size;
+
+  uint32_t q_rope_end = num_qo_heads * rope_chunks;
+  uint32_t k_rope_end = q_rope_end + num_kv_heads * rope_chunks;
+  uint32_t k_nope_end = k_rope_end + num_kv_heads * no_rope_chunks;
 
   vec_t<float, vec_size> cos, sin;
   if (bx * bdy + ty < nnz) {
     const uint32_t idx = bx * bdy + ty;
     const IdType pos = pos_ids[idx];
 
-    const int half_rotary_dim = rotary_dim / 2;
+    const int half_rope_dim = rope_dim / 2;
+    // Load cos/sin for RoPE processing blocks only
     // 1. if interleave:
     //  - cos = cos_sin_cache[pos_id][tx * vec_size // 2]
     //  - sin = cos_sin_cache[pos_id][(rot_dim // 2) + tx * vec_size // 2]
     // 2. if not interleave
     //  - cos = cos_cache[pos_id][(tx * vec_size) % (rot_dim // 2)]
     //  - sin = sin_cache[pos_id][(rot_dim // 2) + (tx * vec_size) % (rot_dim // 2)]
-    if ((tx * vec_size < rotary_dim) and (by <= num_heads)) {
-      int sin_offset = rotary_dim / 2;
+    if ((tx * vec_size < rope_dim) and (by < k_rope_end)) {
+      int sin_offset = rope_dim / 2;
       int vec_idx;
       if constexpr (interleave) {
         vec_idx = (tx * vec_size) / 2;  // Force integer division
       } else {
-        vec_idx = (tx * vec_size) % half_rotary_dim;  // Use half_rotary_dim
+        vec_idx = (tx * vec_size) % half_rope_dim;  // Use half_rotary_dim
       }
-      cos.load(cos_sin_cache + (pos * rotary_dim) + vec_idx);
-      sin.load(cos_sin_cache + (pos * rotary_dim) + (sin_offset + vec_idx));
+      cos.load(cos_sin_cache + (pos * rope_dim) + vec_idx);
+      sin.load(cos_sin_cache + (pos * rope_dim) + (sin_offset + vec_idx));
     }
 
-    if (by < num_heads) {
-      // Query RoPE, 64 dim
-      // allocate (num_heads,) blocks on blockDim.y
-      uint32_t q_head_idx = by;
+    if (by < q_rope_end) {
+      // Q RoPE processing: num_qo_heads * rope_chunks blocks
+      uint32_t q_head_idx = by / rope_chunks;
+      uint32_t rope_chunk_idx = by % rope_chunks;
+      uint32_t elem_offset = rope_chunk_idx * rope_chunk_size;
+
       DType* q_rope_in_ptr =
-          q_rope_in + get_elem_offset_impl(idx, q_head_idx, /*elem_idx=*/0, q_rope_in_stride_n,
+          q_rope_in + get_elem_offset_impl(idx, q_head_idx, elem_offset, q_rope_in_stride_n,
                                            q_rope_in_stride_h);
       QuantType* q_rope_out_ptr =
-          q_rope_out + get_elem_offset_impl(idx, q_head_idx, /*elem_idx=*/0, q_rope_out_stride_n,
+          q_rope_out + get_elem_offset_impl(idx, q_head_idx, elem_offset, q_rope_out_stride_n,
                                             q_rope_out_stride_h);
+
       vec_t<float, vec_size> q_rope_vec;
       if constexpr (interleave) {
         q_rope_vec = vec_apply_llama_rope_cos_sin_interleave_reuse_half<vec_size, bdx>(
-            q_rope_in_ptr, cos, sin, rotary_dim);
+            q_rope_in_ptr, cos, sin, rope_dim);
       } else {
-        q_rope_vec =
-            vec_apply_llama_rope_cos_sin<vec_size, bdx>(q_rope_in_ptr, cos, sin, rotary_dim);
+        q_rope_vec = vec_apply_llama_rope_cos_sin<vec_size, bdx>(q_rope_in_ptr, cos, sin, rope_dim);
       }
 #pragma unroll
       for (uint32_t i = 0; i < vec_size; ++i) {
         q_rope_vec[i] = q_rope_vec[i] * quant_scale_q;
       }
       q_rope_vec.cast_store(q_rope_out_ptr + tx * vec_size);
-    } else if (by == num_heads) {
-      // k/v RoPE, 64 dim
-      // allocate (1,) blocks on blockDim.y
-      DType* k_rope_in_ptr = k_rope_in + get_elem_offset_impl(idx, /*head_idx=*/0, /*elem_idx=*/0,
-                                                              k_rope_in_stride, k_rope_in_stride);
+
+    } else if (by < k_rope_end) {
+      // K RoPE processing: num_kv_heads * rope_chunks blocks
+      uint32_t k_head_idx = (by - q_rope_end) / rope_chunks;
+      uint32_t rope_chunk_idx = (by - q_rope_end) % rope_chunks;
+      uint32_t elem_offset = rope_chunk_idx * rope_chunk_size;
+
+      DType* k_rope_in_ptr = k_rope_in + get_elem_offset_impl(idx, k_head_idx, elem_offset,
+                                                              k_rope_in_stride, k_rope_in_stride_h);
       QuantType* k_rope_out_ptr =
-          k_rope_out + get_elem_offset_impl(idx, /*head_idx=*/0, /*elem_idx=*/0, k_rope_out_stride,
-                                            k_rope_out_stride);
+          k_rope_out + get_elem_offset_impl(idx, k_head_idx, elem_offset, k_rope_out_stride,
+                                            k_rope_out_stride_h);
+
       vec_t<float, vec_size> k_rope_vec;
       if constexpr (interleave) {
         k_rope_vec = vec_apply_llama_rope_cos_sin_interleave_reuse_half<vec_size, bdx>(
-            k_rope_in_ptr, cos, sin, rotary_dim);
+            k_rope_in_ptr, cos, sin, rope_dim);
       } else {
-        k_rope_vec =
-            vec_apply_llama_rope_cos_sin<vec_size, bdx>(k_rope_in_ptr, cos, sin, rotary_dim);
+        k_rope_vec = vec_apply_llama_rope_cos_sin<vec_size, bdx>(k_rope_in_ptr, cos, sin, rope_dim);
       }
 #pragma unroll
       for (uint32_t i = 0; i < vec_size; ++i) {
         k_rope_vec[i] = k_rope_vec[i] * quant_scale_kv;
       }
       k_rope_vec.cast_store(k_rope_out_ptr + tx * vec_size);
-    } else if (by <= num_heads + 8) {
-      // K/v Non-RoPE part, 512 dim
-      // allocate (8,) blocks on blockDim.y
-      uint32_t chunk_idx = (by - num_heads - 1);
-      DType* k_nope_in_ptr =
-          k_nope_in + get_elem_offset_impl(idx, /*head_idx=*/0, /*elem_idx=*/64 * chunk_idx,
-                                           k_nope_in_stride, k_nope_in_stride);
+
+    } else if (by < k_nope_end) {
+      // K Non-RoPE processing: num_kv_heads * no_rope_chunks blocks
+      uint32_t k_head_idx = (by - k_rope_end) / no_rope_chunks;
+      uint32_t nope_chunk_idx = (by - k_rope_end) % no_rope_chunks;
+      uint32_t elem_offset = nope_chunk_idx * rope_chunk_size;  // Use same chunk size
+
+      DType* k_nope_in_ptr = k_nope_in + get_elem_offset_impl(idx, k_head_idx, elem_offset,
+                                                              k_nope_in_stride, k_nope_in_stride_h);
       QuantType* k_nope_out_ptr =
-          k_nope_out + get_elem_offset_impl(idx, /*head_idx=*/0, /*elem_idx=*/64 * chunk_idx,
-                                            k_nope_out_stride, k_nope_out_stride);
+          k_nope_out + get_elem_offset_impl(idx, k_head_idx, elem_offset, k_nope_out_stride,
+                                            k_nope_out_stride_h);
+
       vec_t<float, vec_size> k_nope_vec;
       k_nope_vec.cast_load(k_nope_in_ptr + tx * vec_size);
 #pragma unroll
@@ -443,17 +466,20 @@ __global__ void MLARopeQuantizeKernel(
         k_nope_vec[i] = k_nope_vec[i] * quant_scale_kv;
       }
       k_nope_vec.cast_store(k_nope_out_ptr + tx * vec_size);
+
     } else {
-      // Query Non-RoPE part, 512 dim
-      // allocate (num_heads * 8,) blocks on blockDim.y
-      uint32_t q_head_idx = (by - num_heads - 8 - 1) / 8;
-      uint32_t chunk_idx = (by - num_heads - 8 - 1) % 8;
+      // Q Non-RoPE processing: num_qo_heads * no_rope_chunks blocks
+      uint32_t q_head_idx = (by - k_nope_end) / no_rope_chunks;
+      uint32_t nope_chunk_idx = (by - k_nope_end) % no_rope_chunks;
+      uint32_t elem_offset = nope_chunk_idx * rope_chunk_size;  // Use same chunk size
+
       DType* q_nope_in_ptr =
-          q_nope_in + get_elem_offset_impl(idx, q_head_idx, /*elem_idx=*/64 * chunk_idx,
-                                           q_nope_in_stride_n, q_nope_in_stride_h);
+          q_nope_in + get_elem_offset_impl(idx, q_head_idx, elem_offset, q_nope_in_stride_n,
+                                           q_nope_in_stride_h);
       QuantType* q_nope_out_ptr =
-          q_nope_out + get_elem_offset_impl(idx, q_head_idx, /*elem_idx=*/64 * chunk_idx,
-                                            q_nope_out_stride_n, q_nope_out_stride_h);
+          q_nope_out + get_elem_offset_impl(idx, q_head_idx, elem_offset, q_nope_out_stride_n,
+                                            q_nope_out_stride_h);
+
       vec_t<float, vec_size> q_nope_vec;
       q_nope_vec.cast_load(q_nope_in_ptr + tx * vec_size);
 #pragma unroll
@@ -463,6 +489,9 @@ __global__ void MLARopeQuantizeKernel(
       q_nope_vec.cast_store(q_nope_out_ptr + tx * vec_size);
     }
   }
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.launch_dependents;");
+#endif
 }
 
 template <bool interleave, uint32_t head_dim, uint32_t vec_size, uint32_t bdx, typename DType,
@@ -697,61 +726,121 @@ __global__ void BatchQKApplyRotaryKernel(
     __VA_ARGS__                                          \
   }
 
+#define DISPATCH_ROPE_DIM(rope_dim, vec_size, ...)                                    \
+  if (rope_dim == 16) {                                                               \
+    constexpr uint32_t bdx = 16 / vec_size;                                           \
+    __VA_ARGS__                                                                       \
+  } else if (rope_dim == 32) {                                                        \
+    constexpr uint32_t bdx = 32 / vec_size;                                           \
+    __VA_ARGS__                                                                       \
+  } else if (rope_dim == 64) {                                                        \
+    constexpr uint32_t bdx = 64 / vec_size;                                           \
+    __VA_ARGS__                                                                       \
+  } else if (rope_dim == 128) {                                                       \
+    constexpr uint32_t bdx = 128 / vec_size;                                          \
+    __VA_ARGS__                                                                       \
+  } else if (rope_dim == 256) {                                                       \
+    constexpr uint32_t bdx = 256 / vec_size;                                          \
+    __VA_ARGS__                                                                       \
+  } else {                                                                            \
+    FLASHINFER_ERROR("Unsupported rope_dim. Supported values: 16, 32, 64, 128, 256"); \
+  }
+
 template <typename DType, typename IdType, typename QuantType>
-cudaError_t MLARopeQuantize(DType* q_rope_in, DType* k_rope_in, DType* q_nope_in, DType* k_nope_in,
-                            QuantType* q_rope_out, QuantType* k_rope_out, QuantType* q_nope_out,
-                            QuantType* k_nope_out, float* cos_sin_cache, IdType* pos_ids,
-                            uint32_t nnz, uint32_t num_heads, size_t q_rope_in_stride_n,
-                            size_t q_rope_in_stride_h, size_t q_nope_in_stride_n,
-                            size_t q_nope_in_stride_h, size_t q_rope_out_stride_n,
-                            size_t q_rope_out_stride_h, size_t q_nope_out_stride_n,
-                            size_t q_nope_out_stride_h, size_t k_rope_in_stride,
-                            size_t k_nope_in_stride, size_t k_rope_out_stride,
-                            size_t k_nope_out_stride, float quant_scale_q, float quant_scale_kv,
-                            bool interleave, cudaStream_t stream = nullptr) {
+cudaError_t RopeQuantize(
+    DType* q_rope_in, DType* k_rope_in, DType* q_nope_in, DType* k_nope_in, QuantType* q_rope_out,
+    QuantType* k_rope_out, QuantType* q_nope_out, QuantType* k_nope_out, float* cos_sin_cache,
+    IdType* pos_ids, uint32_t nnz, uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t rope_dim,
+    uint32_t no_rope_dim, size_t q_rope_in_stride_n, size_t q_rope_in_stride_h,
+    size_t q_nope_in_stride_n, size_t q_nope_in_stride_h, size_t q_rope_out_stride_n,
+    size_t q_rope_out_stride_h, size_t q_nope_out_stride_n, size_t q_nope_out_stride_h,
+    size_t k_rope_in_stride, size_t k_rope_in_stride_h, size_t k_nope_in_stride,
+    size_t k_nope_in_stride_h, size_t k_rope_out_stride, size_t k_rope_out_stride_h,
+    size_t k_nope_out_stride, size_t k_nope_out_stride_h, float quant_scale_q, float quant_scale_kv,
+    bool interleave, bool enable_pdl = false, cudaStream_t stream = nullptr) {
   int dev_id = 0;
   int num_sms = 0;
   FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
   FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev_id));
 
-  DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
-    constexpr uint32_t rotary_dim = 64;
-    constexpr uint32_t vec_size = 32 / sizeof(DType);
-    constexpr uint32_t bdx = rotary_dim / vec_size;
-    uint32_t num_threads = 128U;
-    uint32_t bdy = num_threads / bdx;
-    uint32_t nblks_x = (nnz + bdy - 1) / bdy;
+  constexpr uint32_t vec_size = 32 / sizeof(DType);
 
-    void* args[] = {(void*)&q_rope_in,
-                    (void*)&k_rope_in,
-                    (void*)&q_nope_in,
-                    (void*)&k_nope_in,
-                    (void*)&q_rope_out,
-                    (void*)&k_rope_out,
-                    (void*)&q_nope_out,
-                    (void*)&k_nope_out,
-                    (void*)&cos_sin_cache,
-                    (void*)&pos_ids,
-                    (void*)&nnz,
-                    (void*)&num_heads,
-                    (void*)&q_rope_in_stride_n,
-                    (void*)&q_rope_in_stride_h,
-                    (void*)&q_nope_in_stride_n,
-                    (void*)&q_nope_in_stride_h,
-                    (void*)&q_rope_out_stride_n,
-                    (void*)&q_rope_out_stride_h,
-                    (void*)&q_nope_out_stride_n,
-                    (void*)&q_nope_out_stride_h,
-                    (void*)&k_rope_in_stride,
-                    (void*)&k_nope_in_stride,
-                    (void*)&k_rope_out_stride,
-                    (void*)&k_nope_out_stride,
-                    (void*)&quant_scale_q,
-                    (void*)&quant_scale_kv};
-    auto kernel = MLARopeQuantizeKernel<INTERLEAVE, vec_size, bdx, DType, IdType, QuantType>;
-    dim3 nblks(nblks_x, num_heads + 8 + 1 + num_heads * 8);
-    dim3 nthrs(bdx, bdy);
-    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
+  // Use nested macros for runtime->compile-time dispatch for required constexpr values
+  DISPATCH_ROPE_DIM(rope_dim, vec_size, {
+    DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
+      uint32_t num_threads = 128U;
+      uint32_t bdy = num_threads / bdx;
+      uint32_t nblks_x = (nnz + bdy - 1) / bdy;
+      uint32_t rope_chunk_size = rope_dim;
+      uint32_t rope_chunks = (rope_dim + rope_chunk_size - 1) / rope_chunk_size;
+      uint32_t no_rope_chunks = (no_rope_dim + rope_chunk_size - 1) / rope_chunk_size;
+      uint32_t total_blocks_y = num_qo_heads * rope_chunks + num_kv_heads * rope_chunks +
+                                num_kv_heads * no_rope_chunks + num_qo_heads * no_rope_chunks;
+      void* args[] = {(void*)&q_rope_in,
+                      (void*)&k_rope_in,
+                      (void*)&q_nope_in,
+                      (void*)&k_nope_in,
+                      (void*)&q_rope_out,
+                      (void*)&k_rope_out,
+                      (void*)&q_nope_out,
+                      (void*)&k_nope_out,
+                      (void*)&cos_sin_cache,
+                      (void*)&pos_ids,
+                      (void*)&nnz,
+                      (void*)&num_qo_heads,
+                      (void*)&num_kv_heads,
+                      (void*)&rope_dim,
+                      (void*)&no_rope_dim,
+                      (void*)&q_rope_in_stride_n,
+                      (void*)&q_rope_in_stride_h,
+                      (void*)&q_nope_in_stride_n,
+                      (void*)&q_nope_in_stride_h,
+                      (void*)&q_rope_out_stride_n,
+                      (void*)&q_rope_out_stride_h,
+                      (void*)&q_nope_out_stride_n,
+                      (void*)&q_nope_out_stride_h,
+                      (void*)&k_rope_in_stride,
+                      (void*)&k_rope_in_stride_h,
+                      (void*)&k_nope_in_stride,
+                      (void*)&k_nope_in_stride_h,
+                      (void*)&k_rope_out_stride,
+                      (void*)&k_rope_out_stride_h,
+                      (void*)&k_nope_out_stride,
+                      (void*)&k_nope_out_stride_h,
+                      (void*)&quant_scale_q,
+                      (void*)&quant_scale_kv};
+      auto kernel = RopeQuantizeKernel<INTERLEAVE, vec_size, bdx, DType, IdType, QuantType>;
+      dim3 nblks(nblks_x, total_blocks_y);
+      dim3 nthrs(bdx, bdy);
+
+      cudaLaunchConfig_t config;
+      config.gridDim = nblks;
+      config.blockDim = nthrs;
+      config.dynamicSmemBytes = 0;
+      config.stream = stream;
+
+      if (enable_pdl) {
+        // PDL launch config
+        cudaLaunchAttribute attribute[1];
+        attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attribute[0].val.programmaticStreamSerializationAllowed = 1;
+        config.attrs = attribute;
+        config.numAttrs = 1;
+      } else {
+        // Regular launch config
+        config.attrs = nullptr;
+        config.numAttrs = 0;
+      }
+
+      FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
+          &config, kernel, q_rope_in, k_rope_in, q_nope_in, k_nope_in, q_rope_out, k_rope_out,
+          q_nope_out, k_nope_out, cos_sin_cache, pos_ids, nnz, num_qo_heads, num_kv_heads, rope_dim,
+          no_rope_dim, q_rope_in_stride_n, q_rope_in_stride_h, q_nope_in_stride_n,
+          q_nope_in_stride_h, q_rope_out_stride_n, q_rope_out_stride_h, q_nope_out_stride_n,
+          q_nope_out_stride_h, k_rope_in_stride, k_rope_in_stride_h, k_nope_in_stride,
+          k_nope_in_stride_h, k_rope_out_stride, k_rope_out_stride_h, k_nope_out_stride,
+          k_nope_out_stride_h, quant_scale_q, quant_scale_kv));
+    });
   });
 
   return cudaSuccess;
