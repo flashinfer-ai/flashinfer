@@ -217,7 +217,7 @@ __forceinline__ __device__ void reduceTopK(cg::thread_block_tile<WarpSize> const
 
     for (int ii = 0; ii < numResults; ++ii) {
       topKBufferValue[ii] = minValue;
-      topKBufferIdx[ii] = ii * WarpSize - 1;  //@todo: check if this is correct
+      topKBufferIdx[ii] = ii * WarpSize - 1;
     }
     for (int loop = 0; loop < numLoops; ++loop) {
       int start = loop * 4;

@@ -1914,7 +1914,7 @@ def cache_permute_indices():
                 "routed_scaling": None,
                 "has_routing_bias": False,
                 "routing_method_type": RoutingMethodType.Renormalize,
-                "compatible_moe_impls": [FP8BlockScaleMoe, FP4Moe],
+                "compatible_moe_impls": [FP8BlockScaleMoe, FP8PerTensorMoe, FP4Moe],
             },
             id="Renorm",
             marks=pytest.mark.skip(
