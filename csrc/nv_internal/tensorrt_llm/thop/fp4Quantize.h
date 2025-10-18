@@ -30,10 +30,9 @@ void fp4_quantize(TensorView self, Optional<TensorView> const& globalScale, Tens
                   TensorView scaleFP8SF, int64_t sfVecSize, bool sfUseUE8M0,
                   bool isSfSwizzledLayout, bool isSf8x4Layout, bool enable_pdl);
 
-void fp4_batched_quantize(TensorView self, Optional<TensorView> const& mask, TensorView globalScale,
-                          TensorView valueE2M1, TensorView scaleFP8SF, int64_t sfVecSize,
-                          bool sfUseUE8M0);
+void fp4_batched_quantize(Tensor self, Tensor globalScale, Tensor valueE2M1, Tensor scaleFP8SF,
+                          int64_t sfVecSize, bool sfUseUE8M0);
 
-void silu_and_mul_nvfp4_batched_quantize(TensorView const& self, TensorView const& mask,
-                                         TensorView const& globalScale, TensorView valueE2M1,
-                                         TensorView scaleFP8SF, int64_t sfVecSize);
+void silu_and_mul_scaled_nvfp4_experts_quantize(Tensor output, Tensor output_scale,
+                                                Tensor const input, Tensor const input_global_scale,
+                                                Tensor const mask, bool use_silu_and_mul);
