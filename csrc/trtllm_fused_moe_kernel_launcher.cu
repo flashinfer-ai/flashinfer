@@ -62,8 +62,7 @@ void trtllm_fp8_per_tensor_scale_moe_launcher(
 
   if (use_routing_scales_on_input) {
     TVM_FFI_ICHECK_EQ(routing_logits->dtype, dl_bfloat16) << "routing_logits must be bfloat16.";
-  } else if (static_cast<RoutingMethodType>(routing_method_type) ==
-             RoutingMethodType::DeepSeekV3) {
+  } else if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3) {
     TVM_FFI_ICHECK_EQ(routing_logits->dtype, dl_float32) << "routing_logits must be float.";
   } else {
     TVM_FFI_ICHECK_EQ(routing_logits->dtype, dl_bfloat16) << "routing_logits must be bfloat16.";
@@ -101,8 +100,7 @@ void trtllm_fp8_per_tensor_scale_moe_launcher(
                  RoutingMethodType::RenormalizeNaive) {
     TVM_FFI_LOG_AND_THROW(NotImplementedError)
         << "Don't support routing method type Renormalize(Naive).";
-  } else if (static_cast<RoutingMethodType>(routing_method_type) ==
-             RoutingMethodType::Llama4) {
+  } else if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Llama4) {
     TVM_FFI_ICHECK_EQ(top_k, 1)
         << "Current routing kernel (no groups, Llama4) only supports top_k=1.";
   }
@@ -150,7 +148,8 @@ void trtllm_fp8_per_tensor_scale_moe_launcher(
   args.topk_group = topk_group.has_value() ? topk_group.value() : 0;
   args.local_expert_offset = local_expert_offset;
   args.local_num_experts = local_num_experts;
-  args.routed_scaling_factor = routed_scaling_factor.has_value() ? routed_scaling_factor.value() : 1.0;
+  args.routed_scaling_factor =
+      routed_scaling_factor.has_value() ? routed_scaling_factor.value() : 1.0;
   args.intermediate_size = intermediate_size;
   args.mUseRoutingScalesOnInput = use_routing_scales_on_input;
 
@@ -307,9 +306,10 @@ void trtllm_fp8_per_tensor_scale_moe(
     TensorView gemm1_weights, TensorView output1_scales_scalar,
     TensorView output1_scales_gate_scalar, TensorView gemm2_weights,
     TensorView output2_scales_scalar, TensorView output, int64_t num_experts, int64_t top_k,
-    Optional<int64_t> n_group, Optional<int64_t> topk_group,  int64_t intermediate_size, int64_t local_expert_offset,
-    int64_t local_num_experts, Optional<double> routed_scaling_factor, bool use_routing_scales_on_input,
-    int64_t tile_tokens_dim, int64_t routing_method_type, bool enable_pdl) {
+    Optional<int64_t> n_group, Optional<int64_t> topk_group, int64_t intermediate_size,
+    int64_t local_expert_offset, int64_t local_num_experts, Optional<double> routed_scaling_factor,
+    bool use_routing_scales_on_input, int64_t tile_tokens_dim, int64_t routing_method_type,
+    bool enable_pdl) {
   auto dtype = hidden_states->dtype;
   if (dtype == dl_float16 || dtype == dl_bfloat16 || dtype == dl_float8_e4m3fn) {
     trtllm_fp8_per_tensor_scale_moe_launcher(
@@ -327,10 +327,11 @@ void trtllm_fp8_block_scale_moe_launcher(
     TensorView routing_logits, Optional<TensorView> routing_bias, TensorView hidden_states,
     TensorView hidden_states_scale, TensorView gemm1_weights, TensorView gemm1_weights_scale,
     TensorView gemm2_weights, TensorView gemm2_weights_scale, TensorView output,
-    int64_t const num_experts, int64_t const top_k, Optional<int64_t> const n_group, Optional<int64_t> const topk_group,
-    int64_t const intermediate_size, int64_t const local_expert_offset,
-    int64_t const local_num_experts, Optional<double> const routed_scaling_factor,
-    int64_t const tile_tokens_dim, int64_t const routing_method_type,
+    int64_t const num_experts, int64_t const top_k, Optional<int64_t> const n_group,
+    Optional<int64_t> const topk_group, int64_t const intermediate_size,
+    int64_t const local_expert_offset, int64_t const local_num_experts,
+    Optional<double> const routed_scaling_factor, int64_t const tile_tokens_dim,
+    int64_t const routing_method_type,
     tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner& moe_runner, int64_t moeConfigIndex,
     bool enable_pdl) {
   static const std::tuple<int, int> device_props = [hidden_states] {
@@ -387,8 +388,7 @@ void trtllm_fp8_block_scale_moe_launcher(
                  RoutingMethodType::RenormalizeNaive) {
     TVM_FFI_ICHECK(top_k <= 10 && top_k > 0)
         << "Current routing kernel (no groups, renormalize) only supports top_k<=10 && top_k>0.";
-  } else if (static_cast<RoutingMethodType>(routing_method_type) ==
-             RoutingMethodType::Llama4) {
+  } else if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Llama4) {
     TVM_FFI_ICHECK_EQ(top_k, 1)
         << "Current routing kernel (no groups, Llama4) only supports top_k=1.";
   }
@@ -433,7 +433,8 @@ void trtllm_fp8_block_scale_moe_launcher(
   args.topk_group = topk_group.has_value() ? topk_group.value() : 0;
   args.local_expert_offset = local_expert_offset;
   args.local_num_experts = local_num_experts;
-  args.routed_scaling_factor = routed_scaling_factor.has_value() ? routed_scaling_factor.value() : 1.0;
+  args.routed_scaling_factor =
+      routed_scaling_factor.has_value() ? routed_scaling_factor.value() : 1.0;
   args.intermediate_size = intermediate_size;
   args.mUseDeepSeekFp8 = true;
 
@@ -622,11 +623,11 @@ void trtllm_fp8_block_scale_moe(TensorView routing_logits, Optional<TensorView> 
                                 TensorView gemm1_weights, TensorView gemm1_weights_scale,
                                 TensorView gemm2_weights, TensorView gemm2_weights_scale,
                                 TensorView output, int64_t num_experts, int64_t top_k,
-                                Optional<int64_t> n_group, Optional<int64_t> topk_group, int64_t intermediate_size,
-                                int64_t local_expert_offset, int64_t local_num_experts,
-                                Optional<double> routed_scaling_factor, int64_t tile_tokens_dim,
-                                int64_t routing_method_type, bool use_shuffled_weight,
-                                int64_t weight_layout, bool enable_pdl) {
+                                Optional<int64_t> n_group, Optional<int64_t> topk_group,
+                                int64_t intermediate_size, int64_t local_expert_offset,
+                                int64_t local_num_experts, Optional<double> routed_scaling_factor,
+                                int64_t tile_tokens_dim, int64_t routing_method_type,
+                                bool use_shuffled_weight, int64_t weight_layout, bool enable_pdl) {
   auto dtype = hidden_states->dtype;
   if (dtype == dl_float16 || dtype == dl_bfloat16 || dtype == dl_float8_e4m3fn) {
     using RunnerType = tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner;
@@ -843,11 +844,9 @@ Array<Tensor> trtllm_fp4_block_scale_moe_launcher(
   //     {args.num_tokens, args.top_k}, dl_bfloat16, hidden_states->device);
   // Tensor expert_indexes = alloc_tensor(
   //     {args.num_tokens, args.top_k}, dl_int32, hidden_states->device);
-  int constexpr MAX_NUM_EXPERTS = 384;
-  Tensor expert_count_histogram = alloc_tensor(
-      {2 * MAX_NUM_EXPERTS},
-      dl_int32,  // 256 is the max number of threads per block and max number of experts
-      hidden_states->device);
+  int64_t const size_of_expert_count_histogram = std::max(num_experts * 2, int64_t(256 * 2));
+  Tensor expert_count_histogram =
+      alloc_tensor({size_of_expert_count_histogram}, dl_int32, hidden_states->device);
 
   auto const sf_vec_size = dtype_weights == btg::Dtype::MxE2m1 ? 32 : 16;
 
@@ -1049,7 +1048,6 @@ Array<Tensor> trtllm_fp4_block_scale_moe_launcher(
   workspace.gemm1_output_scale = gemm1_output_scale.has_value()
                                      ? static_cast<float*>(gemm1_output_scale.value()->data)
                                      : nullptr;
-
   // gemm2 intermediate ws
   workspace.gemm2_output = gemm2_output->data;
   workspace.gemm2_output_scale = nullptr;

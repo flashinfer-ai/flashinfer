@@ -122,7 +122,7 @@ namespace moe::dev {
                LAUNCH_ESC(__nv_bfloat16, __nv_bfloat16, 128 /* Always 128 for llama4*/), kernel,   \
                numBlocks, numThreads, smemSize, stream);                                           \
   } else {                                                                                         \
-    FLASHINFER_WARN("Unsupported dtypeExpW");                                                       \
+    FLASHINFER_WARN("Unsupported dtypeExpW");                                                      \
   }
 
 #define LAUNCH_ROUTING_DEEPSEEK_WITH_EXTRA_FLAG(data, coopLaunch, kernel, numBlocks, numThreads,  \
@@ -196,7 +196,7 @@ namespace moe::dev {
     LAUNCH_PDL(data, coopLaunch, LAUNCH_ESC(__nv_bfloat16, __nv_bfloat16, numExperts, false),      \
                kernel, numBlocks, numThreads, smemSize, stream);                                   \
   } else {                                                                                         \
-    FLASHINFER_WARN("Unsupported dtypeExpW");                                                       \
+    FLASHINFER_WARN("Unsupported dtypeExpW");                                                      \
   }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -216,7 +216,7 @@ namespace moe::dev {
     LAUNCH_PDL(data, coopLaunch, LAUNCH_ESC(__nv_bfloat16, __nv_bfloat16, numExperts, false),      \
                kernel, numBlocks, numThreads, smemSize, stream);                                   \
   } else {                                                                                         \
-    FLASHINFER_WARN("Unsupported dtypeExpW");                                                       \
+    FLASHINFER_WARN("Unsupported dtypeExpW");                                                      \
   }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
