@@ -198,8 +198,8 @@ jobs:
           fi
 
           # Generate PR body
-          cat > /tmp/pr_body.md << EOF
-## Version Bump: v${CURRENT_VERSION} → v${NEW_VERSION}
+          cat > /tmp/pr_body.md << 'EOF'
+## Version Bump: v${CURRENT_VERSION} -> v${NEW_VERSION}
 
 This PR bumps the version from **v${CURRENT_VERSION}** to **v${NEW_VERSION}** (${BUMP_TYPE_UPPER} bump).
 
@@ -218,7 +218,7 @@ EOF
             done < /tmp/key_changes.txt
           fi
 
-          cat >> /tmp/pr_body.md << EOF
+          cat >> /tmp/pr_body.md << 'EOF'
 
 ### Semantic Versioning Rules
 
