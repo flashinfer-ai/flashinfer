@@ -50,7 +50,7 @@ def get_latest_tag() -> str:
         return ""
 
 
-def get_commits_since_tag(tag: str, max_commits: int = 100) -> list[dict]:
+def get_commits_since_tag(tag: str) -> list[dict]:
     """Get commit messages and diffs since the given tag."""
     try:
         if tag:
@@ -59,10 +59,9 @@ def get_commits_since_tag(tag: str, max_commits: int = 100) -> list[dict]:
                 "log",
                 f"{tag}..HEAD",
                 "--pretty=format:%H|||%s|||%b",
-                f"-{max_commits}",
             ]
         else:
-            cmd = ["git", "log", "--pretty=format:%H|||%s|||%b", f"-{max_commits}"]
+            cmd = ["git", "log", "--pretty=format:%H|||%s|||%b"]
 
         result = subprocess.run(cmd, capture_output=True, text=True, check=True)
 
@@ -299,7 +298,7 @@ def analyze_with_ai(commits: list[dict], current_version: str) -> dict:
             f"Subject: {c['subject']}\n"
             f"Body: {c['body']}\n"
             f"Files changed:\n{c['files_changed'][:500]}"  # Limit file changes to avoid token limit
-            for c in commits[:50]  # Limit to 50 commits
+            for c in commits
         ]
     )
 
@@ -469,12 +468,6 @@ def main():
         help="Analyze commits since this tag (if not provided, uses latest tag)",
     )
     parser.add_argument(
-        "--max-commits",
-        type=int,
-        default=100,
-        help="Maximum number of commits to analyze",
-    )
-    parser.add_argument(
         "--output-format",
         choices=["simple", "json"],
         default="simple",
@@ -514,7 +507,7 @@ def main():
             f"Analyzing commits since: {tag if tag else 'beginning'}", file=sys.stderr
         )
 
-    commits = get_commits_since_tag(tag, args.max_commits)
+    commits = get_commits_since_tag(tag)
 
     if not commits:
         if args.verbose:
