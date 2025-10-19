@@ -1923,7 +1923,7 @@ def cache_permute_indices():
         ),
         pytest.param(
             {
-                "num_experts": 512,
+                "num_experts": 128,
                 "top_k": 10,
                 "padding": 8,
                 "n_groups": None,
@@ -1937,7 +1937,7 @@ def cache_permute_indices():
         ),
         pytest.param(
             {
-                "num_experts": 256,
+                "num_experts": 128,
                 "top_k": 8,
                 "padding": 8,
                 "n_groups": None,
@@ -2058,14 +2058,6 @@ def test_moe_quantization_classes(
 
     # Skip large intermediate sizes for configurations with many experts
     if routing_config["num_experts"] >= 512 and intermediate_size > 512:
-        pytest.skip(
-            f"Skipping for testing speed: intermediate_size={intermediate_size} with {routing_config['num_experts']} experts"
-        )
-
-    # Skip large intermediate size and hidden size for configurations with small epxerts
-    if routing_config["num_experts"] < 512 and (
-        intermediate_size > 512 or hidden_size > 1024
-    ):
         pytest.skip(
             f"Skipping for testing speed: intermediate_size={intermediate_size} with {routing_config['num_experts']} experts"
         )
