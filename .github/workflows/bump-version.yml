@@ -12,6 +12,15 @@ on:
           - major
           - minor
           - patch
+      ai_provider:
+        description: 'AI provider to use for analysis (default: gemini)'
+        required: false
+        type: choice
+        default: 'gemini'
+        options:
+          - gemini
+          - openai
+          - anthropic
   schedule:
     # Run weekly on Monday at 9:00 AM UTC
     - cron: '0 9 * * 1'
@@ -37,7 +46,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install google-generativeai
+          pip install google-generativeai openai anthropic
 
       - name: Get current version
         id: current-version
@@ -67,11 +76,23 @@ jobs:
         if: steps.check-existing-pr.outputs.has_existing_pr == 'false'
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
+          # Determine which AI provider to use
+          # Priority: manual input > default (gemini)
+          if [ -n "${{ inputs.ai_provider }}" ]; then
+            AI_PROVIDER="${{ inputs.ai_provider }}"
+          else
+            AI_PROVIDER="gemini"
+          fi
+
+          echo "Using AI provider: ${AI_PROVIDER}"
           echo "Analyzing commits to determine version bump..."
 
-          # Run AI analysis
+          # Run AI analysis with specified provider
           python scripts/ai_determine_version_bump.py \
+            --provider ${AI_PROVIDER} \
             --output-format json \
             --verbose > /tmp/analysis.json 2>&1
 
@@ -82,12 +103,13 @@ jobs:
 
           echo "bump_type=${BUMP_TYPE}" >> $GITHUB_OUTPUT
           echo "new_version=${NEW_VERSION}" >> $GITHUB_OUTPUT
+          echo "ai_provider=${AI_PROVIDER}" >> $GITHUB_OUTPUT
 
           # Save reasoning and key changes for PR body
           jq -r '.reasoning' /tmp/analysis.json > /tmp/reasoning.txt
           jq -r '.key_changes[]' /tmp/analysis.json > /tmp/key_changes.txt || echo "" > /tmp/key_changes.txt
 
-          echo "AI Analysis Result:"
+          echo "AI Analysis Result (${AI_PROVIDER}):"
           echo "  Bump type: ${BUMP_TYPE}"
           echo "  New version: ${NEW_VERSION}"
           echo "  Reasoning: ${REASONING}"
@@ -159,6 +181,7 @@ jobs:
           BUMP_TYPE="${{ steps.final-decision.outputs.bump_type }}"
           NEW_VERSION="${{ steps.final-decision.outputs.new_version }}"
           CURRENT_VERSION="${{ steps.current-version.outputs.version }}"
+          AI_PROVIDER="${{ steps.analyze.outputs.ai_provider }}"
 
           # Read AI reasoning
           REASONING=$(cat /tmp/reasoning.txt || echo "Manual version bump")
@@ -172,7 +195,7 @@ jobs:
 
 This PR bumps the version from **v$CURRENT_VERSION** to **v$NEW_VERSION** ($BUMP_TYPE_UPPER bump).
 
-### AI Analysis
+### AI Analysis$AI_PROVIDER_TEXT
 
 $REASONING
 
@@ -215,6 +238,13 @@ EOF
           sed -i "s|\$REASONING|$REASONING|g" /tmp/pr_body.md
           sed -i "s/\$RUN_ID/${{ github.run_id }}/g" /tmp/pr_body.md
 
+          # Add AI provider info if available
+          if [ -n "$AI_PROVIDER" ]; then
+            sed -i "s/\$AI_PROVIDER_TEXT/ (using $AI_PROVIDER)/g" /tmp/pr_body.md
+          else
+            sed -i "s/\$AI_PROVIDER_TEXT//g" /tmp/pr_body.md
+          fi
+
           cat /tmp/pr_body.md
 
       - name: Create Pull Request
@@ -246,6 +276,11 @@ EOF
             echo "- **Current version**: ${{ steps.current-version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
             echo "- **New version**: ${{ steps.final-decision.outputs.new_version }}" >> $GITHUB_STEP_SUMMARY
             echo "- **Bump type**: ${{ steps.final-decision.outputs.bump_type }}" >> $GITHUB_STEP_SUMMARY
+
+            # Add AI provider info if available
+            if [ -n "${{ steps.analyze.outputs.ai_provider }}" ]; then
+              echo "- **AI provider**: ${{ steps.analyze.outputs.ai_provider }}" >> $GITHUB_STEP_SUMMARY
+            fi
           else
             echo "ℹ️ No version bump needed" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY

@@ -1,14 +1,25 @@
 #!/usr/bin/env python3
 """
-Use AI (Google Gemini API) to analyze git commits and determine semantic version bump type.
+Use AI (Gemini, Claude, or OpenAI) to analyze git commits and determine semantic version bump type.
 
 According to CONTRIBUTING.md:
 - major increment: incompatible API changes
 - minor increment: added functionality that is backwards-compatible
 - patch increment: backwards-compatible bug fixes
 
-Requires: GEMINI_API_KEY environment variable to be set.
-Install: pip install google-generativeai
+Requires one of the following environment variables to be set:
+- GEMINI_API_KEY for Google Gemini
+- ANTHROPIC_API_KEY for Claude
+- OPENAI_API_KEY for OpenAI
+
+Optional environment variables:
+- OPENAI_MODEL (default: gpt-4o) - specify which OpenAI model to use
+- CLAUDE_MODEL (default: claude-3-5-sonnet-20241022) - specify which Claude model to use
+- GEMINI_MODEL (default: gemini-2.0-flash-exp) - specify which Gemini model to use
+
+The script will try providers in order: OpenAI -> Claude -> Gemini -> Fallback
+
+Install: pip install openai anthropic google-generativeai
 """
 
 import argparse
@@ -84,39 +95,19 @@ def get_commits_since_tag(tag: str, max_commits: int = 100) -> list[dict]:
         return []
 
 
-def analyze_with_ai(commits: list[dict], current_version: str) -> dict:
-    """
-    Use AI to analyze commits and determine version bump.
-
-    This function uses Google Gemini API to perform semantic analysis.
-    """
-    # Try to use Gemini API
-    api_key = os.getenv("GEMINI_API_KEY")
-
+def analyze_with_openai(commits_summary: str, current_version: str) -> dict:
+    """Use OpenAI to analyze commits."""
+    api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
-        print(
-            "Warning: GEMINI_API_KEY not set, falling back to basic analysis",
-            file=sys.stderr,
-        )
-        return fallback_analysis(commits)
+        raise ValueError("OPENAI_API_KEY not set")
 
-    try:
-        import google.generativeai as genai
+    model = os.getenv("OPENAI_MODEL", "gpt-4o")
 
-        genai.configure(api_key=api_key)
+    from openai import OpenAI
 
-        # Prepare the prompt
-        commits_summary = "\n\n".join(
-            [
-                f"Commit {c['hash']}:\n"
-                f"Subject: {c['subject']}\n"
-                f"Body: {c['body']}\n"
-                f"Files changed:\n{c['files_changed'][:500]}"  # Limit file changes to avoid token limit
-                for c in commits[:50]  # Limit to 50 commits
-            ]
-        )
+    client = OpenAI(api_key=api_key)
 
-        prompt = f"""You are analyzing git commits for a CUDA kernel library called FlashInfer to determine the appropriate semantic version bump.
+    prompt = f"""You are analyzing git commits for a CUDA kernel library called FlashInfer to determine the appropriate semantic version bump.
 
 Current version: {current_version}
 
@@ -150,37 +141,231 @@ Important considerations:
 - Focus on changes that affect users of the library, not internal changes
 """
 
-        # Use Gemini model
-        model = genai.GenerativeModel("gemini-2.5-pro")
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {
+                "role": "system",
+                "content": "You are a helpful assistant that analyzes git commits to determine semantic version bumps. Always respond with valid JSON.",
+            },
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.3,
+        response_format={"type": "json_object"},
+    )
 
-        response = model.generate_content(
-            prompt,
-            generation_config=genai.types.GenerationConfig(
-                temperature=0.3,  # Lower temperature for more deterministic results
-            ),
-        )
+    result_text = response.choices[0].message.content.strip()
+    return json.loads(result_text)
 
-        result_text = response.text.strip()
 
-        # Extract JSON from response (might be wrapped in markdown code blocks)
-        json_match = re.search(
-            r"```(?:json)?\s*(\{.*?\})\s*```", result_text, re.DOTALL
-        )
-        if json_match:
-            result_text = json_match.group(1)
+def analyze_with_claude(commits_summary: str, current_version: str) -> dict:
+    """Use Anthropic Claude to analyze commits."""
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise ValueError("ANTHROPIC_API_KEY not set")
 
-        result = json.loads(result_text)
-        return result
+    model = os.getenv("CLAUDE_MODEL", "claude-3-5-sonnet-20241022")
 
-    except ImportError:
+    from anthropic import Anthropic
+
+    client = Anthropic(api_key=api_key)
+
+    prompt = f"""You are analyzing git commits for a CUDA kernel library called FlashInfer to determine the appropriate semantic version bump.
+
+Current version: {current_version}
+
+Semantic versioning rules for this project (from CONTRIBUTING.md):
+- MAJOR increment: incompatible API changes (breaking changes to public APIs)
+- MINOR increment: added functionality that is backwards-compatible (new kernels, new features, new SM support, etc.)
+- PATCH increment: backwards-compatible bug fixes (both functional and performance fixes)
+
+Here are the commits since the last release:
+
+{commits_summary}
+
+Please analyze these commits and determine:
+1. Whether there are any breaking API changes (MAJOR bump needed)
+2. Whether there are new features or backwards-compatible functionality additions (MINOR bump needed)
+3. Whether there are only bug fixes without new features (PATCH bump needed)
+4. If no significant changes, return "none"
+
+Respond in JSON format:
+{{
+    "bump_type": "major|minor|patch|none",
+    "reasoning": "Detailed explanation of your decision",
+    "key_changes": ["list of most important changes that influenced the decision"]
+}}
+
+Important considerations:
+- Internal refactoring, test updates, documentation changes alone don't warrant a version bump
+- Performance improvements are considered bug fixes (PATCH)
+- New kernel implementations or new features are MINOR bumps
+- API signature changes or removed functionality are MAJOR bumps
+- Focus on changes that affect users of the library, not internal changes
+"""
+
+    response = client.messages.create(
+        model=model,
+        max_tokens=2048,
+        temperature=0.3,
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    result_text = response.content[0].text.strip()
+
+    # Extract JSON from response (might be wrapped in markdown code blocks)
+    json_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", result_text, re.DOTALL)
+    if json_match:
+        result_text = json_match.group(1)
+
+    return json.loads(result_text)
+
+
+def analyze_with_gemini(commits_summary: str, current_version: str) -> dict:
+    """Use Google Gemini to analyze commits."""
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY not set")
+
+    model_name = os.getenv("GEMINI_MODEL", "gemini-2.0-flash-exp")
+
+    import google.generativeai as genai
+
+    genai.configure(api_key=api_key)
+
+    prompt = f"""You are analyzing git commits for a CUDA kernel library called FlashInfer to determine the appropriate semantic version bump.
+
+Current version: {current_version}
+
+Semantic versioning rules for this project (from CONTRIBUTING.md):
+- MAJOR increment: incompatible API changes (breaking changes to public APIs)
+- MINOR increment: added functionality that is backwards-compatible (new kernels, new features, new SM support, etc.)
+- PATCH increment: backwards-compatible bug fixes (both functional and performance fixes)
+
+Here are the commits since the last release:
+
+{commits_summary}
+
+Please analyze these commits and determine:
+1. Whether there are any breaking API changes (MAJOR bump needed)
+2. Whether there are new features or backwards-compatible functionality additions (MINOR bump needed)
+3. Whether there are only bug fixes without new features (PATCH bump needed)
+4. If no significant changes, return "none"
+
+Respond in JSON format:
+{{
+    "bump_type": "major|minor|patch|none",
+    "reasoning": "Detailed explanation of your decision",
+    "key_changes": ["list of most important changes that influenced the decision"]
+}}
+
+Important considerations:
+- Internal refactoring, test updates, documentation changes alone don't warrant a version bump
+- Performance improvements are considered bug fixes (PATCH)
+- New kernel implementations or new features are MINOR bumps
+- API signature changes or removed functionality are MAJOR bumps
+- Focus on changes that affect users of the library, not internal changes
+"""
+
+    model = genai.GenerativeModel(model_name)
+
+    response = model.generate_content(
+        prompt,
+        generation_config=genai.types.GenerationConfig(
+            temperature=0.3,
+        ),
+    )
+
+    result_text = response.text.strip()
+
+    # Extract JSON from response (might be wrapped in markdown code blocks)
+    json_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", result_text, re.DOTALL)
+    if json_match:
+        result_text = json_match.group(1)
+
+    return json.loads(result_text)
+
+
+def analyze_with_ai(commits: list[dict], current_version: str) -> dict:
+    """
+    Use AI to analyze commits and determine version bump.
+
+    Tries providers in order: OpenAI -> Claude -> Gemini -> Fallback
+    """
+    # Prepare the commits summary once
+    commits_summary = "\n\n".join(
+        [
+            f"Commit {c['hash']}:\n"
+            f"Subject: {c['subject']}\n"
+            f"Body: {c['body']}\n"
+            f"Files changed:\n{c['files_changed'][:500]}"  # Limit file changes to avoid token limit
+            for c in commits[:50]  # Limit to 50 commits
+        ]
+    )
+
+    # Try OpenAI first
+    try:
+        print("Trying OpenAI...", file=sys.stderr)
+        result = analyze_with_openai(commits_summary, current_version)
         print(
-            "Error: google-generativeai package not installed. Install with: pip install google-generativeai",
+            f"Successfully used OpenAI (model: {os.getenv('OPENAI_MODEL', 'gpt-4o')})",
             file=sys.stderr,
         )
-        return fallback_analysis(commits)
+        return result
+    except ImportError:
+        print(
+            "OpenAI package not installed. Install with: pip install openai",
+            file=sys.stderr,
+        )
+    except ValueError as e:
+        print(f"OpenAI not available: {e}", file=sys.stderr)
+    except Exception as e:
+        print(f"Error calling OpenAI API: {e}", file=sys.stderr)
+
+    # Try Claude second
+    try:
+        print("Trying Anthropic Claude...", file=sys.stderr)
+        result = analyze_with_claude(commits_summary, current_version)
+        print(
+            f"Successfully used Anthropic Claude (model: {os.getenv('CLAUDE_MODEL', 'claude-3-5-sonnet-20241022')})",
+            file=sys.stderr,
+        )
+        return result
+    except ImportError:
+        print(
+            "Anthropic package not installed. Install with: pip install anthropic",
+            file=sys.stderr,
+        )
+    except ValueError as e:
+        print(f"Claude not available: {e}", file=sys.stderr)
+    except Exception as e:
+        print(f"Error calling Claude API: {e}", file=sys.stderr)
+
+    # Try Gemini third
+    try:
+        print("Trying Google Gemini...", file=sys.stderr)
+        result = analyze_with_gemini(commits_summary, current_version)
+        print(
+            f"Successfully used Google Gemini (model: {os.getenv('GEMINI_MODEL', 'gemini-2.0-flash-exp')})",
+            file=sys.stderr,
+        )
+        return result
+    except ImportError:
+        print(
+            "Gemini package not installed. Install with: pip install google-generativeai",
+            file=sys.stderr,
+        )
+    except ValueError as e:
+        print(f"Gemini not available: {e}", file=sys.stderr)
     except Exception as e:
         print(f"Error calling Gemini API: {e}", file=sys.stderr)
-        return fallback_analysis(commits)
+
+    # Fallback to basic analysis
+    print(
+        "Warning: No AI providers available, falling back to basic analysis",
+        file=sys.stderr,
+    )
+    return fallback_analysis(commits)
 
 
 def fallback_analysis(commits: list[dict]) -> dict:
