@@ -23,7 +23,6 @@
 #include "flashinfer/trtllm/fused_moe/DevKernel.h"
 #include "flashinfer/trtllm/fused_moe/RoutingKernel.h"
 #include "flashinfer/trtllm/fused_moe/runner.h"
-// #include <tensorrt_llm/common/assert.h>
 
 namespace tensorrt_llm {
 namespace kernels {
@@ -39,7 +38,9 @@ inline int32_t computeLog2(int32_t val, std::string const& name = "") {
   while (n >>= 1) {
     ++out;
   }
-  FLASHINFER_CHECK((1 << out) == val, "Expected ", name, " to be a power of 2, got ", val);
+  if ((1 << out) != val) {
+    out = -1;
+  }
   return out;
 }
 }  // namespace
@@ -90,6 +91,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mNumLimitedGroups = topkGroup;
     routingData.mTopK = topK;
     routingData.mPaddingLog2 = computeLog2(mTileTokensDim);
+    routingData.mTileTokensDim = mTileTokensDim;
     routingData.mLocalExpertsStartIdx = localExpertOffset;
     routingData.mLocalExpertsStrideLog2 = 0;
     routingData.mNumLocalExperts = localNumExperts;
@@ -124,6 +126,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mNumExperts = numExperts;
     routingData.mTopK = topK;
     routingData.mPaddingLog2 = computeLog2(mTileTokensDim);
+    routingData.mTileTokensDim = mTileTokensDim;
     routingData.mLocalExpertsStartIdx = localExpertOffset;
     routingData.mLocalExpertsStrideLog2 = 0;
     routingData.mNumLocalExperts = localNumExperts;
@@ -170,6 +173,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mNumExperts = numExperts;
     routingData.mTopK = topK;
     routingData.mPaddingLog2 = computeLog2(mTileTokensDim);
+    routingData.mTileTokensDim = mTileTokensDim;
     routingData.mLocalExpertsStartIdx = localExpertOffset;
     routingData.mLocalExpertsStrideLog2 = 0;
     routingData.mNumLocalExperts = localNumExperts;
