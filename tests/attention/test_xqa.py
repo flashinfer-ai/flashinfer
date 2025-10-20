@@ -156,7 +156,6 @@ def ref_attention(
 @pytest.mark.parametrize("use_sliding_window", [True, False])
 @pytest.mark.parametrize("fp16_input", [True, False])
 @pytest.mark.parametrize("fp8_kv_cache", [True, False])
-@pytest.mark.parametrize("run_fp8_mha", [True, False])
 @pytest.mark.parametrize("use_attention_sinks", [True, False])
 @pytest.mark.parametrize("seq_len", [2, 15, 256, 514])
 @pytest.mark.parametrize("batch_size", [1, 4])
@@ -171,15 +170,11 @@ def test_xqa(
     tokens_per_page,
     fp16_input,
     fp8_kv_cache,
-    run_fp8_mha,
     valid_elems_per_head,
     head_grp_size,
     use_attention_sinks,
     use_sliding_window,
 ):
-    compute_capability = get_compute_capability(torch.device(device="cuda"))
-    if compute_capability[0] != 9 and run_fp8_mha:
-        pytest.skip("XQA supports fp8 mha only on Hopper GPUs")
     set_random_seed(42)
 
     nb_q_heads = nb_k_heads * head_grp_size
@@ -254,7 +249,6 @@ def test_xqa(
             page_list_arg[batch, page] = page_idx
             page_idx += 1
 
-    # Shuffle pages FIRST (like TensorRT-LLM line 503)
     flattened = page_list_arg.flatten()
     indices = torch.randperm(flattened.numel())
     shuffled_flat = flattened.to(torch.int32)[indices].to(torch.uint32)
@@ -318,30 +312,21 @@ def test_xqa(
     scratch_buf = torch.zeros(scratch_size, dtype=torch.uint8, device="cuda")
 
     xqa(
-        fp16_input,
-        fp8_kv_cache,
-        run_fp8_mha,
-        tokens_per_page,
-        valid_elems_per_head,
-        head_grp_size,
-        use_sliding_window,
-        sliding_win_size,
-        sm_count,
-        nb_k_heads,
-        q_scale,
-        output,
         q_heads,
-        attention_sinks,
-        # Layout 1: Pass separate K and V caches
         cache_k_heads.to(torch.float8_e4m3fn) if fp8_kv_cache else cache_k_heads,
         cache_v_heads.to(torch.float8_e4m3fn) if fp8_kv_cache else cache_v_heads,
         page_list_arg,
-        max_seq_len,
         seq_len_list,
-        batch_size,
-        kv_cache_scale,
-        semaphores,
+        output,
         scratch_buf,
+        semaphores,
+        nb_k_heads,
+        tokens_per_page,
+        sinks=attention_sinks,
+        q_scale=q_scale,
+        kv_scale=kv_cache_scale,
+        sliding_win_size=sliding_win_size,
+        sm_count=sm_count,
     )
 
     for req in range(batch_size):
@@ -382,7 +367,7 @@ def test_xqa(
                 kernel_output = output[req][b][
                     idx_k_head * head_grp_size : (idx_k_head + 1) * head_grp_size
                 ].to(torch.float32)
-                if fp8_kv_cache or run_fp8_mha:
+                if fp8_kv_cache:
                     atol = 0.05
                     rtol = 0.05
                 else:

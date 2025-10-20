@@ -15,12 +15,15 @@ limitations under the License.
 """
 
 from . import env as jit_env
+import torch
+from .utils import filename_safe_dtype_map
 from .core import (
     JitSpec,
     gen_jit_spec,
     sm90a_nvcc_flags,
-    sm100a_nvcc_flags,
+    sm100f_nvcc_flags,
     sm120a_nvcc_flags,
+    sm121a_nvcc_flags,
 )
 
 xqa_nvcc_flags = [
@@ -36,37 +39,43 @@ xqa_nvcc_flags = [
 
 
 def gen_xqa_module(
-    fp16_input: bool,
-    fp8_kv_cache: bool,
-    token_per_page: int,
-    head_size: int,
-    head_grp_size: int,
+    input_dtype: torch.dtype,
+    kv_cache_dtype: torch.dtype,
+    page_size: int,
+    head_dim: int,
+    head_group_ratio: int,
     use_sliding_window: bool,
     sm_version: int = 90,
 ) -> JitSpec:
-    if fp16_input:
-        flag_data_type = ["-DINPUT_FP16=1", "-DDTYPE=__half"]
+    if input_dtype == torch.float16:
+        flag_input_dtype = ["-DINPUT_FP16=1", "-DDTYPE=__half"]
+    elif input_dtype == torch.bfloat16:
+        flag_input_dtype = ["-DINPUT_FP16=0", "-DDTYPE=__nv_bfloat16"]
     else:
-        flag_data_type = ["-DINPUT_FP16=0", "-DDTYPE=__nv_bfloat16"]
+        raise ValueError(
+            f"Invalid dtype: {input_dtype} for XQA, only float16 and bfloat16 input are supported"
+        )
 
-    if fp8_kv_cache:
-        flag_data_type.append("-DCACHE_ELEM_ENUM=2")
+    if kv_cache_dtype == torch.float8_e4m3fn:
+        flag_kv_cache_dtype = ["-DCACHE_ELEM_ENUM=2"]
+    elif kv_cache_dtype == torch.int8:
+        flag_kv_cache_dtype = ["-DCACHE_ELEM_ENUM=1"]
     else:
-        flag_data_type.append("-DCACHE_ELEM_ENUM=0")
+        flag_kv_cache_dtype = ["-DCACHE_ELEM_ENUM=0"]
 
-    if token_per_page not in [16, 32, 64, 128]:
+    if page_size not in [16, 32, 64, 128]:
         raise ValueError(
-            f"Invalid token_per_page: {token_per_page}, only 16, 32, 64, 128 are supported"
+            f"Invalid page_size: {page_size}, only 16, 32, 64, 128 are supported"
         )
-    flag_tokens_per_page = [f"-DTOKENS_PER_PAGE={token_per_page}"]
+    flag_tokens_per_page = [f"-DTOKENS_PER_PAGE={page_size}"]
 
-    if head_size % 16 != 0 or head_size > 256 or head_size < 16:
+    if head_dim % 16 != 0 or head_dim > 256 or head_dim < 16:
         raise ValueError(
-            f"Invalid head_size: {head_size}, must be divisible by 16 and in range [16, 256]"
+            f"Invalid head_dim: {head_dim}, must be divisible by 16 and in range [16, 256]"
         )
-    flag_head_size = [f"-DHEAD_ELEMS={head_size}"]
+    flag_head_dim = [f"-DHEAD_ELEMS={head_dim}"]
 
-    flag_head_grp_size = [f"-DHEAD_GRP_SIZE={head_grp_size}"]
+    flag_head_group_ratio = [f"-DHEAD_GRP_SIZE={head_group_ratio}"]
 
     if use_sliding_window:
         flag_sliding_window = ["-DSLIDING_WINDOW=1"]
@@ -74,14 +83,16 @@ def gen_xqa_module(
         flag_sliding_window = ["-DSLIDING_WINDOW=0"]
 
     if sm_version == 100:
-        sm_nvcc_flags = sm100a_nvcc_flags
+        sm_nvcc_flags = sm100f_nvcc_flags
     elif sm_version == 120:
         sm_nvcc_flags = sm120a_nvcc_flags
+    elif sm_version == 121:
+        sm_nvcc_flags = sm121a_nvcc_flags
     else:
         sm_nvcc_flags = sm90a_nvcc_flags
 
     return gen_jit_spec(
-        f"xqa_fp16_input_{fp16_input}_fp8_kv_cache_{fp8_kv_cache}_token_per_page_{token_per_page}_head_size_{head_size}_head_grp_size_{head_grp_size}_use_sliding_window_{use_sliding_window}_sm_{sm_version}",
+        f"xqa_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}_sm_{sm_version}",
         [
             jit_env.FLASHINFER_CSRC_DIR / "xqa/mha.cu",
             jit_env.FLASHINFER_CSRC_DIR / "xqa/mha_sm90.cu",
@@ -92,9 +103,10 @@ def gen_xqa_module(
         extra_cuda_cflags=xqa_nvcc_flags
         + sm_nvcc_flags
         + flag_tokens_per_page
-        + flag_head_size
-        + flag_data_type
-        + flag_head_grp_size
+        + flag_head_dim
+        + flag_input_dtype
+        + flag_kv_cache_dtype
+        + flag_head_group_ratio
         + flag_sliding_window,
         extra_ldflags=["-lcuda"],  # Add CUDA Driver API library
         extra_cflags=["-DPAGED_KV_CACHE_LAYOUT=1"],

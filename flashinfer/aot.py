@@ -401,12 +401,18 @@ def gen_xqa(
         if token_per_page not in [16, 32, 64, 128]:
             continue
 
+        if fp8_kv_cache:
+            kv_cache_dtype = torch.float8_e4m3fn
+        elif fp16_input:
+            kv_cache_dtype = torch.float16
+        else:
+            kv_cache_dtype = torch.bfloat16
         yield gen_xqa_module(
-            fp16_input=fp16_input,
-            fp8_kv_cache=fp8_kv_cache,
-            token_per_page=token_per_page,
-            head_size=head_size,
-            head_grp_size=head_grp_size,
+            input_dtype=torch.float16 if fp16_input else torch.bfloat16,
+            kv_cache_dtype=kv_cache_dtype,
+            page_size=token_per_page,
+            head_dim=head_size,
+            head_group_ratio=head_grp_size,
             use_sliding_window=use_sliding_window,
             sm_version=sm_version,
         )

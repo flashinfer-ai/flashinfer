@@ -16,7 +16,7 @@
 
 #include "tvm_ffi_utils.h"
 
-void xqa_wrapper(bool run_fp8_mha, int64_t multiProcessorCount, int64_t nbKHeads,
+void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbKHeads,
                  int64_t slidingWinSize, double qScale, TensorView output,
 #if LOW_PREC_OUTPUT
                  TensorView rcpOutScale,

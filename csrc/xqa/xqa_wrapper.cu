@@ -19,7 +19,7 @@
 
 using tvm::ffi::Optional;
 
-void xqa_wrapper(bool run_fp8_mha, int64_t multiProcessorCount, int64_t nbKHeads,
+void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbKHeads,
                  int64_t slidingWinSize, double qScale, TensorView output,
 #if LOW_PREC_OUTPUT
                  TensorView rcpOutScale,
@@ -40,7 +40,7 @@ void xqa_wrapper(bool run_fp8_mha, int64_t multiProcessorCount, int64_t nbKHeads
   float const* attentionSinksPtr =
       attentionSinks.has_value() ? reinterpret_cast<float const*>(attentionSinks.value()->data)
                                  : nullptr;
-  auto const mha_func = run_fp8_mha ? &launchHopperF8MHAFlashInfer : &launchMHAFlashInfer;
+  auto const mha_func = run_sm90_fp8_mha ? &launchHopperF8MHAFlashInfer : &launchMHAFlashInfer;
 
   mha_func(multiProcessorCount, nbKHeads, slidingWinSize, qScale,
            reinterpret_cast<OutputHead*>(output->data),
