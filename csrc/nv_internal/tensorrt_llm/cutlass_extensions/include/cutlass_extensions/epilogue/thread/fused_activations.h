@@ -54,6 +54,32 @@ __forceinline__ __device__ float tanh_opt(float x) {
 #endif
 }
 
+template <typename T>
+struct Relu2 {
+  static const bool kIsHeavy = false;
+
+  CUTLASS_HOST_DEVICE
+  T operator()(T threshold, T value) const {
+    constexpr bool PropagateNaN = true;
+    maximum<T, PropagateNaN> mx;
+    ReLu<T> relu_op;
+    multiplies<T> mul;
+    T val = relu_op(threshold, value);
+    return mul(val, val);
+  }
+
+  CUTLASS_HOST_DEVICE
+  T operator()(T value) const {
+    constexpr bool PropagateNaN = true;
+    maximum<T, PropagateNaN> mx;
+    ReLu<T> relu_op;
+    multiplies<T> mul;
+    T val = relu_op(value);
+    cutlass::constants::zero<T>();
+    return mul(val, val);
+  }
+};
+
 }  // namespace thread
 }  // namespace epilogue
 }  // namespace cutlass
