@@ -1,7 +1,7 @@
 from flashinfer.artifacts import (
     ArtifactPath,
     get_available_cubin_files,
-    get_cubin_file_list,
+    get_subdir_file_list,
 )
 
 import responses
@@ -279,37 +279,104 @@ def test_get_available_cubin_files_non_200_response():
 
 
 @responses.activate
-def test_get_cubin_file_list(monkeypatch):
+def test_get_subdir_file_list(monkeypatch, tmp_path):
     _mock_file_index_responses()
     from flashinfer import artifacts
+
+    # Set up temporary directory for downloading checksums
+    temp_cubin_dir = tmp_path / "cubins"
+    temp_cubin_dir.mkdir(exist_ok=True)
 
     monkeypatch.setattr(
         artifacts, "FLASHINFER_CUBINS_REPOSITORY", test_cubin_repository
     )
-    cubin_files = list(get_cubin_file_list())
+    monkeypatch.setattr(artifacts, "FLASHINFER_CUBIN_DIR", temp_cubin_dir)
+
+    # Mock checksums.txt files for each subdirectory
+    checksums_fmha = """d26dbf837f40ff2dcd964094ab6e1b3f2424edda5979c313f5262655161fce98 include/flashInferMetaInfo.h
+a1b2c3d4e5f6 fmhaSm100aKernel_QE4m3KvE2m1OE4m3H128PagedKvCausalP32VarSeqQ128Kv128PersistentContext.cubin
+b2c3d4e5f6a7 fmhaSm100aKernel_QE4m3KvE2m1OE4m3H128PagedKvCausalP32VarSeqQ128Kv128StaticContext.cubin
+c3d4e5f6a7b8 fmhaSm100aKernel_QE4m3KvE2m1OE4m3H128PagedKvCausalP64VarSeqQ128Kv128PersistentContext.cubin
+"""
+
+    checksums_gemm = """bd5c3227bec4f8d7a7d3a27fd7628e010d99a5c42651d0a6b97e146803e63340 include/flashinferMetaInfo.h
+d1e2f3a4b5c6 Gemm_Bfloat16_E2m1E2m1_Fp32_t128x128x128_s3_et128x128_m128x128x64_cga1x1x1_16dp256b_TN_transOut_schedS_sm100f.cubin
+e2f3a4b5c6d7 Gemm_Bfloat16_E2m1E2m1_Fp32_t128x128x128_s6_et128x128_m128x128x64_cga1x1x1_16dp256b_TN_transOut_schedS_sm100f.cubin
+f3a4b5c6d7e8 Gemm_Bfloat16_E2m1E2m1_Fp32_t128x128x128u2_s3_et128x128_m128x128x64_cga1x1x1_16dp256b_TN_transOut_schedS_sm100f.cubin
+"""
+
+    checksums_bmm = """4a8ceeb356fc5339021acf884061e97e49e01da5c75dbf0f7cf4932c37a70152 include/flashinferMetaInfo.h
+a4b5c6d7e8f9 Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256_s6_et128x16_m128x16x64_cga1x1x1_16dp256b_TN_transOut_schedP2x1x2x3_bN_clmp_dynBatch_sm100f.cubin
+b5c6d7e8f9a0 Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256_s6_et128x16_m128x16x64_cga1x1x1_16dp256b_TN_transOut_schedS_bN_clmp_dynBatch_sm100f.cubin
+c6d7e8f9a0b1 Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256u2_s6_et128x16_m128x16x64_cga1x1x1_16dp256b_TN_transOut_schedP2x1x2x3_bN_clmp_dynBatch_sm100f.cubin
+"""
+
+    checksums_deepgemm = """b4374f857c3066089c4ec6b5e79e785559fa2c05ce2623710b0b04bf86414a48 kernel_map.json
+a0b1c2d3e4f5 kernel.fp8_m_grouped_gemm.007404769193.cubin
+d7e8f9a0b1c2 kernel.fp8_m_grouped_gemm.007d9ebdca7e.cubin
+e8f9a0b1c2d3 kernel.fp8_m_grouped_gemm.02acb2ba71fd.cubin
+f9a0b1c2d3e4 kernel.fp8_m_grouped_gemm.0457375eb02f.cubin
+"""
+
+    # Add mock responses for checksums.txt files
+    fmha_checksums_url = safe_urljoin(
+        test_cubin_repository,
+        safe_urljoin(artifact_paths.TRTLLM_GEN_FMHA, "checksums.txt"),
+    )
+    responses.add(responses.GET, fmha_checksums_url, body=checksums_fmha, status=200)
+
+    gemm_checksums_url = safe_urljoin(
+        test_cubin_repository,
+        safe_urljoin(artifact_paths.TRTLLM_GEN_GEMM, "checksums.txt"),
+    )
+    responses.add(responses.GET, gemm_checksums_url, body=checksums_gemm, status=200)
+
+    bmm_checksums_url = safe_urljoin(
+        test_cubin_repository,
+        safe_urljoin(artifact_paths.TRTLLM_GEN_BMM, "checksums.txt"),
+    )
+    responses.add(responses.GET, bmm_checksums_url, body=checksums_bmm, status=200)
+
+    deepgemm_checksums_url = safe_urljoin(
+        test_cubin_repository, safe_urljoin(artifact_paths.DEEPGEMM, "checksums.txt")
+    )
+    responses.add(
+        responses.GET, deepgemm_checksums_url, body=checksums_deepgemm, status=200
+    )
+
+    cubin_files = list(get_subdir_file_list())
+
+    # Extract just the file paths from the (path, checksum) tuples
+    cubin_file_paths = [path for path, _ in cubin_files]
 
     # Check that all the cubin's are in there.
     for expected_file_name in expected_gemm_cubin_files:
-        expected_file_path = artifact_paths.TRTLLM_GEN_GEMM + "/" + expected_file_name
-        assert any(expected_file_path in url for url in cubin_files), (
+        expected_file_path = safe_urljoin(
+            artifact_paths.TRTLLM_GEN_GEMM, expected_file_name
+        )
+        assert any(expected_file_path in url for url in cubin_file_paths), (
             f"Expected cubin file '{expected_file_path}' not found in cubin file list"
         )
 
     for expected_file_name in expected_fmha_cubin_files:
-        expected_file_path = artifact_paths.TRTLLM_GEN_FMHA + "/" + expected_file_name
-        assert any(expected_file_path in url for url in cubin_files), (
+        expected_file_path = safe_urljoin(
+            artifact_paths.TRTLLM_GEN_FMHA, expected_file_name
+        )
+        assert any(expected_file_path in url for url in cubin_file_paths), (
             f"Expected cubin file '{expected_file_path}' not found in cubin file list"
         )
 
     for expected_file_name in expected_bmm_cubin_files:
-        expected_file_path = artifact_paths.TRTLLM_GEN_BMM + "/" + expected_file_name
-        assert any(expected_file_path in url for url in cubin_files), (
+        expected_file_path = safe_urljoin(
+            artifact_paths.TRTLLM_GEN_BMM, expected_file_name
+        )
+        assert any(expected_file_path in url for url in cubin_file_paths), (
             f"Expected cubin file '{expected_file_path}' not found in cubin file list"
         )
 
     for expected_file_name in expected_deepgemm_cubin_files:
-        expected_file_path = artifact_paths.DEEPGEMM + "/" + expected_file_name
-        assert any(expected_file_path in url for url in cubin_files), (
+        expected_file_path = safe_urljoin(artifact_paths.DEEPGEMM, expected_file_name)
+        assert any(expected_file_path in url for url in cubin_file_paths), (
             f"Expected cubin file '{expected_file_path}' not found in cubin file list"
         )
 
@@ -317,7 +384,7 @@ def test_get_cubin_file_list(monkeypatch):
     # Capitalization is inconsistent in the actual filenames, so we check for both variants.
     meta_info_headers = [
         url
-        for url in cubin_files
+        for url in cubin_file_paths
         if "include/flashInferMetaInfo.h" in url
         or "include/flashinferMetaInfo.h" in url
     ]
