@@ -476,19 +476,16 @@ int constexpr getMaxNumExperts(int32_t numExperts) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 #define LAUNCH_ROUTING_DEEPSEEK(data, coopLaunch, kernel, numBlocks, numThreads, smemSize, stream, \
-                                extraFlag1, forceFloatInput)                                       \
+                                extraFlag)                                                         \
   if (data.mNumExperts <= topk::MaxNumExpertsUnit) {                                               \
-    LAUNCH_ROUTING_WITH_NUM_EXPERTS_FORCE_FLOAT_INPUT(data, coopLaunch, kernel, numBlocks,         \
-                                                      numThreads, smemSize, stream, extraFlag1,    \
-                                                      forceFloatInput, topk::MaxNumExpertsUnit);   \
+    LAUNCH_ROUTING_DEEPSEEK_IMPL(data, coopLaunch, kernel, numBlocks, numThreads, smemSize,        \
+                                 stream, extraFlag, topk::MaxNumExpertsUnit);                      \
   } else if (data.mNumExperts <= NumDeepseekExperts) {                                             \
-    LAUNCH_ROUTING_WITH_NUM_EXPERTS_FORCE_FLOAT_INPUT(data, coopLaunch, kernel, numBlocks,         \
-                                                      numThreads, smemSize, stream, extraFlag1,    \
-                                                      forceFloatInput, NumDeepseekExperts);        \
+    LAUNCH_ROUTING_DEEPSEEK_IMPL(data, coopLaunch, kernel, numBlocks, numThreads, smemSize,        \
+                                 stream, extraFlag, NumDeepseekExperts);                           \
   } else if (data.mNumExperts <= NumKimiK2Experts) {                                               \
-    LAUNCH_ROUTING_WITH_NUM_EXPERTS_FORCE_FLOAT_INPUT(data, coopLaunch, kernel, numBlocks,         \
-                                                      numThreads, smemSize, stream, extraFlag1,    \
-                                                      forceFloatInput, NumKimiK2Experts);          \
+    LAUNCH_ROUTING_DEEPSEEK_IMPL(data, coopLaunch, kernel, numBlocks, numThreads, smemSize,        \
+                                 stream, extraFlag, NumKimiK2Experts);                             \
   } else {                                                                                         \
     TLLM_LOG_ERROR("Unsupported numExperts");                                                      \
   }

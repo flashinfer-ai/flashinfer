@@ -172,7 +172,8 @@ struct Data : public DataBase {
   bool mUseRoutingSoftmax;
 };
 
-template <typename InputT_, typename BiasT_, typename OutputT_, int MaxNumExperts_, bool UseGroups_, bool UsePdl_>
+template <typename InputT_, typename BiasT_, typename OutputT_, int MaxNumExperts_, bool UseGroups_,
+          bool UsePdl_>
 struct KernelParams : public KernelParamsBase<InputT_, OutputT_, MaxNumExperts_, UsePdl_> {
   using InputT = InputT_;
   using BiasT = BiasT_;
