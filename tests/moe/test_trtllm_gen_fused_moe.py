@@ -1832,7 +1832,7 @@ def _compute_moe_actual_unified(moe_impl, args_dequant, args, **kwargs):
 
 @pytest.fixture(scope="module")
 def cache_permute_indices():
-    # The cache key is now a tuple of (weight_type, shape, epilogue_tile_m, num_elts_per_sf)
+    # The cache key is now a tuple of (weight_type, shape)
     _cache_permute_indices: Dict[tuple, torch.Tensor] = {}
     return _cache_permute_indices
 
