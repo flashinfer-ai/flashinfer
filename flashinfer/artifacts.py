@@ -93,7 +93,7 @@ class ArtifactPath:
 
 @dataclass(frozen=True)
 class MetaInfoHash:
-    DEEPGEMM: str = "b4374f857c3066089c4ec6b5e79e785559fa2c05ce2623710b0b04bf86414a48"
+    DEEPGEMM: str = "f161e031826adb8c4f0d31ddbd2ed77e4909e4e43cdfc9728918162a62fcccfb"
     TRTLLM_GEN_FMHA: str = (
         "d26dbf837f40ff2dcd964094ab6e1b3f2424edda5979c313f5262655161fce98"
     )
