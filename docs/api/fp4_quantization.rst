@@ -15,6 +15,7 @@ Core Quantization Functions
 
     fp4_quantize
     nvfp4_quantize
+    nvfp4_batched_quantize
     nvfp4_block_scale_interleave
     e2m1_and_ufp8sf_scale_to_float
     scaled_fp4_grouped_quantize

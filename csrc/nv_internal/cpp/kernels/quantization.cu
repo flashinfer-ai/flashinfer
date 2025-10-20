@@ -296,10 +296,8 @@ void invokeBlockScaleInterleaveReverse(int b, int m, int n, uint8_t const* SFIn,
 
 template <typename T>
 void invokeSiluAndMulNVFP4Quantization(void* output, void* output_scale, void* input,
-                                       void* input_global_scale, void* input_offset_by_experts,
-                                       void* output_scale_offset_by_experts, void* mask,
-                                       bool use_silu_and_mul, int m_topk, int k, int n_experts,
-                                       cudaStream_t stream) {
+                                       void* input_global_scale, void* mask, bool use_silu_and_mul,
+                                       int m_topk, int k, int n_experts, cudaStream_t stream) {
   int device;
   cudaGetDevice(&device);
   int multiProcessorCount;
@@ -322,14 +320,12 @@ void invokeSiluAndMulNVFP4Quantization(void* output, void* output_scale, void* i
   // TODO(kaixih@nvidia): Should relax this to allow any grid size.
   // shuw@nvidia.com: only deal with mask case
   assert(mask != nullptr);
-  // if (mask != nullptr) {
   grid.x = (grid.x + n_experts - 1) / n_experts * n_experts;
   cvt_fp16_to_fp4_expert<T, false><<<grid, block, 0, stream>>>(
       m_topk, k, reinterpret_cast<T*>(input), reinterpret_cast<float*>(input_global_scale),
       reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(output_scale),
       reinterpret_cast<int32_t*>(mask), use_silu_and_mul, n_experts);
   return;
-  // }
 }
 
 // Instantiate the function.
@@ -348,11 +344,9 @@ template void invokeMxFP8Quantization<half>(int b, int m, int n, int padded_n, h
                                             QuantizationSFLayout layout, int multiProcessorCount,
                                             bool enable_pdl, cudaStream_t stream);
 template void invokeSiluAndMulNVFP4Quantization<half>(void* output, void* output_scale, void* input,
-                                                      void* input_global_scale,
-                                                      void* input_offset_by_experts,
-                                                      void* output_scale_offset_by_experts,
-                                                      void* mask, bool use_silu_and_mul, int m_topk,
-                                                      int k, int n_experts, cudaStream_t stream);
+                                                      void* input_global_scale, void* mask,
+                                                      bool use_silu_and_mul, int m_topk, int k,
+                                                      int n_experts, cudaStream_t stream);
 
 #ifdef ENABLE_BF16
 template void invokeFP4Quantization<__nv_bfloat16, 16>(
@@ -369,8 +363,7 @@ template void invokeMxFP8Quantization<__nv_bfloat16>(int b, int m, int n, int pa
                                                      int multiProcessorCount, bool enable_pdl,
                                                      cudaStream_t stream);
 template void invokeSiluAndMulNVFP4Quantization<__nv_bfloat16>(
-    void* output, void* output_scale, void* input, void* input_global_scale,
-    void* input_offset_by_experts, void* output_scale_offset_by_experts, void* mask,
+    void* output, void* output_scale, void* input, void* input_global_scale, void* mask,
     bool use_silu_and_mul, int m_topk, int k, int n_experts, cudaStream_t stream);
 
 #endif

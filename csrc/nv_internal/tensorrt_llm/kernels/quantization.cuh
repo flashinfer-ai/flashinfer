@@ -998,7 +998,7 @@ cvt_fp16_to_fp4_expert(
     auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, CVT_FP4_NUM_THREADS_PER_SF>(
         rowIdx_in_expert, colIdx, numCols, SFout_in_expert);
 
-    out_pos = cvt_warp_fp16_to_fp4<Type, 16, UE8M0_SF>(in_vec, SFScaleVal, sf_out);
+    out_pos = cvt_warp_fp16_to_fp4<Type, CVT_FP4_SF_VEC_SIZE, UE8M0_SF>(in_vec, SFScaleVal, sf_out);
   }
 #endif
 }
