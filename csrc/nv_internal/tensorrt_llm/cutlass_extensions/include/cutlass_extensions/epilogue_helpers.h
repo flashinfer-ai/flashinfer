@@ -94,7 +94,7 @@ struct Epilogue<ElementType, ElementsPerVectorAccess, ElementAccumulator, Epilog
                                                               ElementAccumulator,
                                                               ElementAccumulator, DefaultScaleMode>;
 };
-  
+
 template <typename ElementType, int ElementsPerVectorAccess, typename ElementAccumulator>
 struct Epilogue<ElementType, ElementsPerVectorAccess, ElementAccumulator, EpilogueOpDefaultReLU> {
   using Op = cutlass::epilogue::thread::LinearCombinationRelu<ElementType, ElementsPerVectorAccess,

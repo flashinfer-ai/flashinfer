@@ -60,8 +60,6 @@ struct Relu2 {
 
   CUTLASS_HOST_DEVICE
   T operator()(T threshold, T value) const {
-    constexpr bool PropagateNaN = true;
-    maximum<T, PropagateNaN> mx;
     ReLu<T> relu_op;
     multiplies<T> mul;
     T val = relu_op(threshold, value);
@@ -70,8 +68,6 @@ struct Relu2 {
 
   CUTLASS_HOST_DEVICE
   T operator()(T value) const {
-    constexpr bool PropagateNaN = true;
-    maximum<T, PropagateNaN> mx;
     ReLu<T> relu_op;
     multiplies<T> mul;
     T val = relu_op(value);
