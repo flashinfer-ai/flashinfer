@@ -389,7 +389,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
                 tactic,
                 do_preparation,
                 self.enable_pdl,
-                self.activation_type.value,
+                self.activation_type,
             )
 
         @classmethod
@@ -463,7 +463,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             use_mxfp8_act_scaling=use_mxfp8_act_scaling,
             min_latency_mode=min_latency_mode,
             enable_pdl=enable_pdl,
-            base_activation_type=activation_type.value,
+            activation_type=activation_type,
         )
 
         _, gemm_tactic_1 = tuner.choose_one(
@@ -829,7 +829,7 @@ def cutlass_fused_moe(
         min_latency_mode=min_latency_mode,
         tune_max_num_tokens=tune_max_num_tokens,
         enable_pdl=enable_pdl,
-        activation_type=activation_type.value,
+        activation_type=activation_type,
     )
 
 

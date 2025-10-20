@@ -586,8 +586,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                       Optional<TensorView> fc2_expert_biases, int64_t top_k, int64_t tp_size,
                       int64_t tp_rank, int64_t ep_size, int64_t ep_rank, int64_t cluster_size,
                       int64_t cluster_rank, bool enable_alltoall, bool min_latency_mode,
-                      int64_t gemm_idx, int64_t profile_id, bool do_preparation, bool enable_pdl, int64_t activation_type_val) {
-    ActivationType activation_type = static_cast<ActivationType>(activation_type_val);
+                      int64_t gemm_idx, int64_t profile_id, bool do_preparation, bool enable_pdl, AcitvationType activation_type) {
     std::lock_guard<std::mutex> lock(mMutex);
 
     // TODO: support profiling under fp8 block scaling in the future
@@ -675,11 +674,11 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                  int64_t tp_rank, int64_t ep_size, int64_t ep_rank, int64_t cluster_size,
                  int64_t cluster_rank, bool enable_alltoall, bool min_latency_mode,
                  int64_t gemm_idx, int64_t profile_id, bool do_preparation, bool enable_pdl,
-                 int64_t activation_type = ) {
+                 int64_t activation_type) {
             runGemmProfile(input, fc1_expert_weights, fc1_expert_biases, fc2_expert_weights,
                            fc2_expert_biases, top_k, tp_size, tp_rank, ep_size, ep_rank,
                            cluster_size, cluster_rank, enable_alltoall, min_latency_mode, gemm_idx,
-                           profile_id, do_preparation, enable_pdl, activation_type);
+                           profile_id, do_preparation, enable_pdl, static_cast<ActivationType>(activation_type));
           });
     } else if (name == "get_tactic_num") {
       return Function::FromTyped([this]() -> int64_t { return getTacticNum(); });

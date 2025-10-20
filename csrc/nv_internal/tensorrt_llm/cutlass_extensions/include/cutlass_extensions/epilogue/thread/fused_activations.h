@@ -75,7 +75,6 @@ struct Relu2 {
     ReLu<T> relu_op;
     multiplies<T> mul;
     T val = relu_op(value);
-    cutlass::constants::zero<T>();
     return mul(val, val);
   }
 };
