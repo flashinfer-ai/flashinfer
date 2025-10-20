@@ -2,6 +2,26 @@ import pytest
 import torch
 
 import flashinfer.green_ctx as green_ctx
+from flashinfer.utils import get_compute_capability, get_device_sm_count, round_up
+
+
+def calculate_required_sms(num_groups: int, min_count: int, device: str) -> int:
+    """Calculate total SM count required for the test."""
+    dev = torch.device(device)
+    min_sm, alignment = green_ctx.get_sm_count_constraint(*get_compute_capability(dev))
+    rounded_min = round_up(max(min_count, min_sm), alignment)
+    return num_groups * rounded_min
+
+
+def calculate_required_sms_by_counts(sm_counts: list, device: str) -> int:
+    """Calculate total SM count required for the test with specific SM counts."""
+    dev = torch.device(device)
+    min_sm, alignment = green_ctx.get_sm_count_constraint(*get_compute_capability(dev))
+    total = 0
+    for sm_count in sm_counts:
+        rounded = round_up(max(sm_count, min_sm), alignment)
+        total += rounded
+    return total
 
 
 @pytest.mark.parametrize("device", ["cuda:0"])
@@ -12,6 +32,13 @@ def test_green_ctx_creation(
     num_groups: int,
     min_count: int,
 ):
+    required_sms = calculate_required_sms(num_groups, min_count, device)
+    available_sms = get_device_sm_count(torch.device(device))
+    if required_sms > available_sms:
+        pytest.skip(
+            f"Test requires {required_sms} SMs but device only has {available_sms} SMs"
+        )
+
     streams, resources = green_ctx.split_device_green_ctx(
         torch.device(device), num_groups, min_count
     )
@@ -30,6 +57,13 @@ def test_green_ctx_kernel_execution(
     num_groups: int,
     min_count: int,
 ):
+    required_sms = calculate_required_sms(num_groups, min_count, device)
+    available_sms = get_device_sm_count(torch.device(device))
+    if required_sms > available_sms:
+        pytest.skip(
+            f"Test requires {required_sms} SMs but device only has {available_sms} SMs"
+        )
+
     streams, resources = green_ctx.split_device_green_ctx(
         torch.device(device), num_groups, min_count
     )
@@ -59,6 +93,13 @@ def test_split_device_green_ctx_by_sm_count_creation(
     device: str,
     sm_counts: list,
 ):
+    required_sms = calculate_required_sms_by_counts(sm_counts, device)
+    available_sms = get_device_sm_count(torch.device(device))
+    if required_sms > available_sms:
+        pytest.skip(
+            f"Test requires {required_sms} SMs but device only has {available_sms} SMs"
+        )
+
     streams, resources = green_ctx.split_device_green_ctx_by_sm_count(
         torch.device(device), sm_counts
     )
@@ -85,6 +126,13 @@ def test_split_device_green_ctx_by_sm_count_kernel_execution(
     device: str,
     sm_counts: list,
 ):
+    required_sms = calculate_required_sms_by_counts(sm_counts, device)
+    available_sms = get_device_sm_count(torch.device(device))
+    if required_sms > available_sms:
+        pytest.skip(
+            f"Test requires {required_sms} SMs but device only has {available_sms} SMs"
+        )
+
     streams, resources = green_ctx.split_device_green_ctx_by_sm_count(
         torch.device(device), sm_counts
     )
@@ -113,6 +161,13 @@ def test_split_device_green_ctx_by_sm_count_alignment(
     device: str,
     sm_counts: list,
 ):
+    required_sms = calculate_required_sms_by_counts(sm_counts, device)
+    available_sms = get_device_sm_count(torch.device(device))
+    if required_sms > available_sms:
+        pytest.skip(
+            f"Test requires {required_sms} SMs but device only has {available_sms} SMs"
+        )
+
     _, resources = green_ctx.split_device_green_ctx_by_sm_count(
         torch.device(device), sm_counts
     )
