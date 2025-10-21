@@ -36,7 +36,7 @@ void mxfp8_quantize(TensorView input, TensorView valMxFP8, TensorView scaleFP8SF
   TVM_FFI_ICHECK_EQ(alignment % SF_VEC_SIZE, 0)
       << "alignment must be divisible by SF_VEC_SIZE = 32";
 
-  auto const& inputShape = input.shape();
+  auto const& inputShape = input.sizes();
   auto const& rank = inputShape.size();
 
   TVM_FFI_ICHECK_GE(rank, 2) << "Input should be >=2D tensor.";
@@ -98,7 +98,7 @@ void mxfp8_quantize_host(TensorView x_fp32, TensorView fp8_tensor, TensorView sc
   int32_t const sf_vec_size = 32;
   auto fp32_dtype = DLDataType{kDLFloat, 32, 1};
   CHECK_INPUT_TYPE(x_fp32, fp32_dtype);
-  auto data_shape = x_fp32.shape();
+  auto data_shape = x_fp32.sizes();
   TVM_FFI_ICHECK_EQ(data_shape.size(), 2) << "x_fp32 should be 2D tensor.";
   int num_tokens = data_shape[0];
   int hidden_dim = data_shape[1];
@@ -145,8 +145,8 @@ void mxfp8_dequantize_host(TensorView value_e4m3, TensorView scale_ue8m08sf,
   int32_t const sf_vec_size = 32;
   CHECK_INPUT_TYPE(value_e4m3, dl_uint8);
   CHECK_INPUT_TYPE(scale_ue8m08sf, dl_uint8);
-  auto data_shape = value_e4m3.shape();
-  auto scale_shape = scale_ue8m08sf.shape();
+  auto data_shape = value_e4m3.sizes();
+  auto scale_shape = scale_ue8m08sf.sizes();
   TVM_FFI_ICHECK_EQ(data_shape.size(), 2) << "value_e4m3 should be 2D tensor.";
   TVM_FFI_ICHECK_EQ(scale_shape.size(), 1) << "scale_ue8m08sf should be 1D tensor.";
 

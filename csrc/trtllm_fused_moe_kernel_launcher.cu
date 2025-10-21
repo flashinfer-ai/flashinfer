@@ -68,11 +68,11 @@ void trtllm_fp8_per_tensor_scale_moe_launcher(
   TVM_FFI_ICHECK_EQ(routing_logits.ndim(), 2) << "routing_logits must be 2D.";
   TVM_FFI_ICHECK_EQ(routing_logits.size(1), num_experts) << "routing_logits has incorrect shape.";
   if (routing_bias.has_value()) {
-    TVM_FFI_ICHECK(routing_bias.value()->dtype == dl_bfloat16 ||
-                   routing_bias.value()->dtype == dl_float32)
+    TVM_FFI_ICHECK(routing_bias.value().dtype() == dl_bfloat16 ||
+                   routing_bias.value().dtype() == dl_float32)
         << "routing_bias must be bfloat16 or float.";
-    TVM_FFI_ICHECK_EQ(routing_bias.value()->ndim, 1) << "routing_bias must be 1D.";
-    TVM_FFI_ICHECK_EQ(routing_bias.value()->shape[0], num_experts)
+    TVM_FFI_ICHECK_EQ(routing_bias.value().ndim(), 1) << "routing_bias must be 1D.";
+    TVM_FFI_ICHECK_EQ(routing_bias.value().size(0), num_experts)
         << "routing_bias has incorrect shape.";
   }
 
@@ -111,19 +111,19 @@ void trtllm_fp8_per_tensor_scale_moe_launcher(
 
   args.routing_logits = routing_logits.data_ptr();
   auto const routing_bias_dtype =
-      routing_bias.has_value() ? routing_bias.value()->dtype : dl_bfloat16;
+      routing_bias.has_value() ? routing_bias.value().dtype() : dl_bfloat16;
   auto btg_routing_bias_dtype = btg::Dtype::Fp32;
   if (routing_bias_dtype == dl_bfloat16) {
     btg_routing_bias_dtype = btg::Dtype::Bfloat16;
   }
-  args.routing_bias = routing_bias.has_value() ? routing_bias.value()->data : nullptr;
-  args.hidden_states = hidden_states->data;
-  args.gemm1_weights = gemm1_weights->data;
-  args.output1_scales_scalar = static_cast<float*>(output1_scales_scalar->data);
-  args.output1_scales_gate_scalar = static_cast<float*>(output1_scales_gate_scalar->data);
-  args.gemm2_weights = gemm2_weights->data;
-  args.output2_scales_scalar = static_cast<float*>(output2_scales_scalar->data);
-  args.num_tokens = hidden_states->shape[0];
+  args.routing_bias = routing_bias.has_value() ? routing_bias.value().data_ptr() : nullptr;
+  args.hidden_states = hidden_states.data_ptr();
+  args.gemm1_weights = gemm1_weights.data_ptr();
+  args.output1_scales_scalar = static_cast<float*>(output1_scales_scalar.data_ptr());
+  args.output1_scales_gate_scalar = static_cast<float*>(output1_scales_gate_scalar.data_ptr());
+  args.gemm2_weights = gemm2_weights.data_ptr();
+  args.output2_scales_scalar = static_cast<float*>(output2_scales_scalar.data_ptr());
+  args.num_tokens = hidden_states.size(0);
   args.num_experts = num_experts;
   args.hidden_size = hidden_states.size(1);
   args.hidden_size_output = args.hidden_size;
@@ -147,7 +147,7 @@ void trtllm_fp8_per_tensor_scale_moe_launcher(
   Tensor permuted_idx_to_token_idx =
       alloc_tensor({max_num_padded_tokens}, dl_int32, routing_logits.device());
   Tensor expert_weights =
-      alloc_tensor({args.num_tokens, args.top_k}, dl_bfloat16, routing_logits->device);
+      alloc_tensor({args.num_tokens, args.top_k}, dl_bfloat16, routing_logits.device());
   Tensor expert_indexes =
       alloc_tensor({args.num_tokens, args.top_k}, dl_int32, routing_logits.device());
   Tensor expert_count_histogram = alloc_tensor(
@@ -178,20 +178,20 @@ void trtllm_fp8_per_tensor_scale_moe_launcher(
   Tensor num_non_exiting_ctas = alloc_tensor({1}, dl_int32, routing_logits.device());
 
   tensorrt_llm::kernels::trtllmgen_moe::Routing::Runner routing_runner(tile_tokens_dim);
-  cudaStream_t stream = get_stream(routing_logits->device);
+  cudaStream_t stream = get_stream(routing_logits.device());
   routing_runner.run(
-      routing_logits->data, args.routing_bias, args.num_tokens, args.num_experts, args.top_k,
+      routing_logits.data_ptr(), args.routing_bias, args.num_tokens, args.num_experts, args.top_k,
       args.n_group, args.topk_group, args.local_expert_offset, args.local_num_experts,
-      args.routed_scaling_factor, static_cast<int*>(expert_indexes->data),
-      static_cast<int*>(expert_count_histogram->data),
-      static_cast<int*>(total_num_padded_tokens->data),
-      static_cast<int*>(expanded_idx_to_permuted_idx->data),
-      nullptr /*static_cast<int*>(permuted_idx_to_expanded_idx->data)*/,
-      static_cast<int*>(permuted_idx_to_token_idx->data), expert_weights->data,
-      static_cast<int*>(num_tokens_per_expert->data),
-      static_cast<int*>(cta_idx_xy_to_batch_idx->data),
-      static_cast<int*>(cta_idx_xy_to_mn_limit->data),
-      static_cast<int*>(num_non_exiting_ctas->data), args.mDtypeElt, btg_routing_bias_dtype,
+      args.routed_scaling_factor, static_cast<int*>(expert_indexes.data_ptr()),
+      static_cast<int*>(expert_count_histogram.data_ptr()),
+      static_cast<int*>(total_num_padded_tokens.data_ptr()),
+      static_cast<int*>(expanded_idx_to_permuted_idx.data_ptr()),
+      nullptr /*static_cast<int*>(permuted_idx_to_expanded_idx.data_ptr())*/,
+      static_cast<int*>(permuted_idx_to_token_idx.data_ptr()), expert_weights.data_ptr(),
+      static_cast<int*>(num_tokens_per_expert.data_ptr()),
+      static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr()),
+      static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr()),
+      static_cast<int*>(num_non_exiting_ctas.data_ptr()), args.mDtypeElt, btg_routing_bias_dtype,
       use_routing_scales_on_input, false /* use_deep_seek_fp8 */,
       static_cast<RoutingMethodType>(routing_method_type), stream);
 
@@ -375,19 +375,19 @@ void trtllm_fp8_block_scale_moe_launcher(
   }
 
   auto const routing_bias_dtype =
-      routing_bias.has_value() ? routing_bias.value()->dtype : dl_bfloat16;
+      routing_bias.has_value() ? routing_bias.value().dtype() : dl_bfloat16;
   auto btg_routing_bias_dtype =
       routing_bias_dtype == dl_bfloat16 ? btg::Dtype::Bfloat16 : btg::Dtype::Fp32;
 
-  args.routing_logits = static_cast<float*>(routing_logits->data);
-  args.routing_bias = routing_bias.has_value() ? routing_bias.value()->data : nullptr;
-  args.hidden_states = hidden_states->data;
-  args.hidden_states_scale = static_cast<float*>(hidden_states_scale->data);
-  args.gemm1_weights = gemm1_weights->data;
-  args.gemm1_weights_scale = static_cast<float*>(gemm1_weights_scale->data);
-  args.gemm2_weights = gemm2_weights->data;
-  args.gemm2_weights_scale = static_cast<float*>(gemm2_weights_scale->data);
-  args.num_tokens = hidden_states->shape[0];
+  args.routing_logits = static_cast<float*>(routing_logits.data_ptr());
+  args.routing_bias = routing_bias.has_value() ? routing_bias.value().data_ptr() : nullptr;
+  args.hidden_states = hidden_states.data_ptr();
+  args.hidden_states_scale = static_cast<float*>(hidden_states_scale.data_ptr());
+  args.gemm1_weights = gemm1_weights.data_ptr();
+  args.gemm1_weights_scale = static_cast<float*>(gemm1_weights_scale.data_ptr());
+  args.gemm2_weights = gemm2_weights.data_ptr();
+  args.gemm2_weights_scale = static_cast<float*>(gemm2_weights_scale.data_ptr());
+  args.num_tokens = hidden_states.size(0);
   args.num_experts = num_experts;
   args.hidden_size = hidden_states.size(1);
   args.hidden_size_output = args.hidden_size;
@@ -415,10 +415,10 @@ void trtllm_fp8_block_scale_moe_launcher(
   Tensor expanded_idx_to_permuted_idx =
       alloc_tensor({args.num_tokens * args.top_k}, dl_int32, routing_logits.device());
   Tensor permuted_idx_to_token_idx =
-      alloc_tensor({max_num_padded_tokens}, dl_int32, routing_logits->device);
+      alloc_tensor({max_num_padded_tokens}, dl_int32, routing_logits.device());
 
   Tensor expert_weights =
-      alloc_tensor({args.num_tokens, args.top_k}, dl_bfloat16, routing_logits->device);
+      alloc_tensor({args.num_tokens, args.top_k}, dl_bfloat16, routing_logits.device());
   // NOTE: the output type of routing kernel is currently always bfloat16
   Tensor expert_indexes =
       alloc_tensor({args.num_tokens, args.top_k}, dl_int32, routing_logits.device());
@@ -451,22 +451,23 @@ void trtllm_fp8_block_scale_moe_launcher(
   Tensor num_non_exiting_ctas = alloc_tensor({1}, dl_int32, routing_logits.device());
 
   tensorrt_llm::kernels::trtllmgen_moe::Routing::Runner routing_runner(tile_tokens_dim);
-  cudaStream_t stream = get_stream(routing_logits->device);
-  routing_runner.run(
-      static_cast<float*>(routing_logits->data), args.routing_bias, args.num_tokens,
-      args.num_experts, args.top_k, args.n_group, args.topk_group, args.local_expert_offset,
-      args.local_num_experts, args.routed_scaling_factor, static_cast<int*>(expert_indexes->data),
-      static_cast<int*>(expert_count_histogram->data),
-      static_cast<int*>(total_num_padded_tokens->data),
-      static_cast<int*>(expanded_idx_to_permuted_idx->data),
-      nullptr /*static_cast<int*>(permuted_idx_to_expanded_idx->data)*/,
-      static_cast<int*>(permuted_idx_to_token_idx->data), expert_weights->data,
-      static_cast<int*>(num_tokens_per_expert->data),
-      static_cast<int*>(cta_idx_xy_to_batch_idx->data),
-      static_cast<int*>(cta_idx_xy_to_mn_limit->data),
-      static_cast<int*>(num_non_exiting_ctas->data), args.mDtypeElt, btg_routing_bias_dtype,
-      false /* use_routing_scales_on_input */, true /* use_deep_seek_fp8 */,
-      static_cast<RoutingMethodType>(routing_method_type), stream);
+  cudaStream_t stream = get_stream(routing_logits.device());
+  routing_runner.run(static_cast<float*>(routing_logits.data_ptr()), args.routing_bias,
+                     args.num_tokens, args.num_experts, args.top_k, args.n_group, args.topk_group,
+                     args.local_expert_offset, args.local_num_experts, args.routed_scaling_factor,
+                     static_cast<int*>(expert_indexes.data_ptr()),
+                     static_cast<int*>(expert_count_histogram.data_ptr()),
+                     static_cast<int*>(total_num_padded_tokens.data_ptr()),
+                     static_cast<int*>(expanded_idx_to_permuted_idx.data_ptr()),
+                     nullptr /*static_cast<int*>(permuted_idx_to_expanded_idx.data_ptr())*/,
+                     static_cast<int*>(permuted_idx_to_token_idx.data_ptr()),
+                     expert_weights.data_ptr(), static_cast<int*>(num_tokens_per_expert.data_ptr()),
+                     static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr()),
+                     static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr()),
+                     static_cast<int*>(num_non_exiting_ctas.data_ptr()), args.mDtypeElt,
+                     btg_routing_bias_dtype, false /* use_routing_scales_on_input */,
+                     true /* use_deep_seek_fp8 */,
+                     static_cast<RoutingMethodType>(routing_method_type), stream);
 
   // MoE kernel except routing
   TVM_FFI_ICHECK_EQ(hidden_states.dtype(), dl_float8_e4m3fn) << "hidden_states must be fp8.";
@@ -698,12 +699,12 @@ Array<Tensor> trtllm_fp4_block_scale_moe_launcher(
         << "routing_logits has incorrect shape.";
   }
   if (routing_bias.has_value()) {
-    TVM_FFI_ICHECK(routing_bias.value()->dtype == dl_bfloat16 ||
-                   routing_bias.value()->dtype == dl_float32)
+    TVM_FFI_ICHECK(routing_bias.value().dtype() == dl_bfloat16 ||
+                   routing_bias.value().dtype() == dl_float32)
         << "routing_bias must be bfloat16 or float.";
 
-    TVM_FFI_ICHECK_EQ(routing_bias.value()->ndim, 1) << "routing_bias must be 1D.";
-    TVM_FFI_ICHECK_EQ(routing_bias.value()->shape[0], num_experts)
+    TVM_FFI_ICHECK_EQ(routing_bias.value().ndim(), 1) << "routing_bias must be 1D.";
+    TVM_FFI_ICHECK_EQ(routing_bias.value().size(0), num_experts)
         << "routing_bias has incorrect shape.";
   }
 
@@ -746,15 +747,15 @@ Array<Tensor> trtllm_fp4_block_scale_moe_launcher(
   // setup args
   args.mDtypeElt = dtype_act;
   // note: the assumption is that output data type is always Bfloat16 (the default)
-  auto routing_bias_dtype = routing_bias.has_value() ? routing_bias.value()->dtype : dl_bfloat16;
+  auto routing_bias_dtype = routing_bias.has_value() ? routing_bias.value().dtype() : dl_bfloat16;
   auto btg_routing_bias_dtype =
       routing_bias_dtype == dl_bfloat16 ? btg::Dtype::Bfloat16 : btg::Dtype::Fp32;
   // We shouln't use args.mDtypeExpW since it indicates the output data type of routing kernel,
   // which is currently always bfloat16 for routing kernel while the data type of routing bias now
   // can be fp32
-  args.routing_logits = routing_logits.has_value() ? routing_logits.value()->data : nullptr;
-  args.routing_bias = routing_bias.has_value() ? routing_bias.value()->data : nullptr;
-  args.hidden_states = hidden_states->data;
+  args.routing_logits = routing_logits.has_value() ? routing_logits.value().data_ptr() : nullptr;
+  args.routing_bias = routing_bias.has_value() ? routing_bias.value().data_ptr() : nullptr;
+  args.hidden_states = hidden_states.data_ptr();
   args.hidden_states_scale =
       hidden_states_scale.has_value() ? hidden_states_scale.value().data_ptr() : nullptr;
   args.gemm1_weights = gemm1_weights.data_ptr();
@@ -806,7 +807,7 @@ Array<Tensor> trtllm_fp4_block_scale_moe_launcher(
   Tensor permuted_idx_to_token_idx =
       alloc_tensor({max_num_padded_tokens}, dl_int32, hidden_states.device());
   // Tensor expert_weights = alloc_tensor(
-  //     {args.num_tokens, args.top_k}, dl_bfloat16, hidden_states->device);
+  //     {args.num_tokens, args.top_k}, dl_bfloat16, hidden_states.device());
   // Tensor expert_indexes = alloc_tensor(
   //     {args.num_tokens, args.top_k}, dl_int32, hidden_states.device());
   int constexpr MAX_NUM_EXPERTS = 384;
@@ -850,20 +851,20 @@ Array<Tensor> trtllm_fp4_block_scale_moe_launcher(
   //
 
   tensorrt_llm::kernels::trtllmgen_moe::Routing::Runner routing_runner(tile_tokens_dim);
-  cudaStream_t stream = get_stream(hidden_states->device);
+  cudaStream_t stream = get_stream(hidden_states.device());
   routing_runner.run(
       args.routing_logits, args.routing_bias, args.num_tokens, args.num_experts, args.top_k,
       args.n_group, args.topk_group, args.local_expert_offset, args.local_num_experts,
-      args.routed_scaling_factor, static_cast<int*>(expert_indices->data),
-      static_cast<int*>(expert_count_histogram->data),
-      static_cast<int*>(total_num_padded_tokens->data),
-      static_cast<int*>(expanded_idx_to_permuted_idx->data),
-      nullptr, /*static_cast<int*>(permuted_idx_to_expanded_idx->data),*/
-      static_cast<int*>(permuted_idx_to_token_idx->data), expert_weights->data,
-      static_cast<int*>(num_tokens_per_expert->data),
-      static_cast<int*>(cta_idx_xy_to_batch_idx->data),
-      static_cast<int*>(cta_idx_xy_to_mn_limit->data),
-      static_cast<int*>(num_non_exiting_ctas->data), args.mDtypeElt, btg_routing_bias_dtype,
+      args.routed_scaling_factor, static_cast<int*>(expert_indices.data_ptr()),
+      static_cast<int*>(expert_count_histogram.data_ptr()),
+      static_cast<int*>(total_num_padded_tokens.data_ptr()),
+      static_cast<int*>(expanded_idx_to_permuted_idx.data_ptr()),
+      nullptr, /*static_cast<int*>(permuted_idx_to_expanded_idx.data_ptr()),*/
+      static_cast<int*>(permuted_idx_to_token_idx.data_ptr()), expert_weights.data_ptr(),
+      static_cast<int*>(num_tokens_per_expert.data_ptr()),
+      static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr()),
+      static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr()),
+      static_cast<int*>(num_non_exiting_ctas.data_ptr()), args.mDtypeElt, btg_routing_bias_dtype,
       false /* use_routing_scales_on_input */, false /* use_deep_seek_fp8 */,
       static_cast<RoutingMethodType>(routing_method_type), stream);
 

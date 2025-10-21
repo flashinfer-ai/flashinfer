@@ -218,28 +218,25 @@ void trtllm_paged_attention_decode(TensorView out, Optional<TensorView> out_scal
   int sum_seq_q = batch_size * q_len_per_request;
   int num_qo_heads = query.size(2);
   // Multiply by two for FP4 tensor as it is stored as UINT8 dtype. Assume the dim is even.
-  int head_dim_k = is_4bit(kv_data_type) ? key_cache.size(key_cache.ndim() - 1) * 2
-                                         : key_cache.size(key_cache.ndim() - 1);
-  int head_dim_q =
-      is_4bit(q_data_type) ? query.size(query.ndim() - 1) * 2 : query.size(query.ndim() - 1);
-  int head_dim_v = is_4bit(kv_data_type) ? value_cache.size(value_cache.ndim() - 1) * 2
-                                         : value_cache.size(value_cache.ndim() - 1);
-  int head_dim_o = is_4bit(o_data_type) ? out.size(out.ndim() - 1) * 2 : out.size(out.ndim() - 1);
+  int head_dim_k = is_4bit(kv_data_type) ? key_cache.size(-1) * 2 : key_cache.size(-1);
+  int head_dim_q = is_4bit(q_data_type) ? query.size(-1) * 2 : query.size(-1);
+  int head_dim_v = is_4bit(kv_data_type) ? value_cache.size(-1) * 2 : value_cache.size(-1);
+  int head_dim_o = is_4bit(o_data_type) ? out.size(-1) * 2 : out.size(-1);
   TVM_FFI_ICHECK_EQ(head_dim_k, head_dim_q)
       << "head_dim_k and head_dim_q must be the same, got " << std::to_string(head_dim_k) << " and "
       << std::to_string(head_dim_q);
   TVM_FFI_ICHECK((head_dim_v == 576 && head_dim_o == 512) || head_dim_v == head_dim_o)
       << "head_dim_v and head_dim_o must be the same for non-MLA attention, got "
       << std::to_string(head_dim_v) << " and " << std::to_string(head_dim_o);
-  int page_size = key_cache.size(key_cache.ndim() - 2);
-  int num_kv_heads = key_cache.size(key_cache.ndim() - 3);
-  int max_num_blocks_per_seq = block_tables.size(block_tables.ndim() - 1);
+  int page_size = key_cache.size(-2);
+  int num_kv_heads = key_cache.size(-3);
+  int max_num_blocks_per_seq = block_tables.size(-1);
   bool is_shared_kv = key_cache.data_ptr() == value_cache.data_ptr();
   int num_pages_in_mem_pool = is_shared_kv ? key_cache.size(0) : key_cache.size(0) * 2;
 
-  int kv_stride_keys_values = key_cache.stride(key_cache.ndim() - 2);  // key/values
-  int kv_stride_heads = key_cache.stride(key_cache.ndim() - 3);        // head
-  int kv_stride_batch = key_cache.stride(0);                           // batch
+  int kv_stride_keys_values = key_cache.stride(-2);  // key/values
+  int kv_stride_heads = key_cache.stride(-3);        // head
+  int kv_stride_batch = key_cache.stride(0);         // batch
 
   const auto stream = get_stream(query.device());
   void* output_sf_ptr =
@@ -281,28 +278,25 @@ void trtllm_paged_attention_context(TensorView out, Optional<TensorView> out_sca
   int num_qo_heads = query.size(1);
   int sum_seq_q = query.size(0);
   // Multiply by two for FP4 tensor as it is stored as UINT8 dtype. Assume the dim is even.
-  int head_dim_k = is_4bit(kv_data_type) ? key_cache.size(key_cache.ndim() - 1) * 2
-                                         : key_cache.size(key_cache.ndim() - 1);
-  int head_dim_q =
-      is_4bit(q_data_type) ? query.size(query.ndim() - 1) * 2 : query.size(query.ndim() - 1);
-  int head_dim_v = is_4bit(kv_data_type) ? value_cache.size(value_cache.ndim() - 1) * 2
-                                         : value_cache.size(value_cache.ndim() - 1);
-  int head_dim_o = is_4bit(o_data_type) ? out.size(out.ndim() - 1) * 2 : out.size(out.ndim() - 1);
+  int head_dim_k = is_4bit(kv_data_type) ? key_cache.size(-1) * 2 : key_cache.size(-1);
+  int head_dim_q = is_4bit(q_data_type) ? query.size(-1) * 2 : query.size(-1);
+  int head_dim_v = is_4bit(kv_data_type) ? value_cache.size(-1) * 2 : value_cache.size(-1);
+  int head_dim_o = is_4bit(o_data_type) ? out.size(-1) * 2 : out.size(-1);
   TVM_FFI_ICHECK_EQ(head_dim_k, head_dim_q)
       << "head_dim_k and head_dim_q must be the same, got " << std::to_string(head_dim_k) << " and "
       << std::to_string(head_dim_q);
   TVM_FFI_ICHECK_EQ(head_dim_v, head_dim_o)
       << "head_dim_v and head_dim_o must be the same, got " << std::to_string(head_dim_v) << " and "
       << std::to_string(head_dim_o);
-  int max_num_blocks_per_seq = block_tables.size(block_tables.ndim() - 1);
+  int max_num_blocks_per_seq = block_tables.size(-1);
   bool is_shared_kv = key_cache.data_ptr() == value_cache.data_ptr();
   int num_pages_in_mem_pool = is_shared_kv ? key_cache.size(0) : key_cache.size(0) * 2;
-  int page_size = key_cache.size(key_cache.ndim() - 2);
-  int num_kv_heads = key_cache.size(key_cache.ndim() - 3);
+  int page_size = key_cache.size(-2);
+  int num_kv_heads = key_cache.size(-3);
 
-  int kv_stride_keys_values = key_cache.stride(key_cache.ndim() - 2);  // key/values
-  int kv_stride_heads = key_cache.stride(key_cache.ndim() - 3);        // head
-  int kv_stride_batch = key_cache.stride(0);                           // batch
+  int kv_stride_keys_values = key_cache.stride(-2);  // key/values
+  int kv_stride_heads = key_cache.stride(-3);        // head
+  int kv_stride_batch = key_cache.stride(0);         // batch
 
   const auto stream = get_stream(query.device());
   void* output_sf_ptr =

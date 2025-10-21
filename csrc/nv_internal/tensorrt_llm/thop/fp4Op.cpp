@@ -149,7 +149,7 @@ void BlockScaleInterleave(TensorView blockScale, TensorView interleavedBlockScal
   }
   CHECK_CONTIGUOUS(blockScale);
   CHECK_INPUT_TYPE(blockScale, dl_uint8);
-  auto blockScaleShape = blockScale.shape();
+  auto blockScaleShape = blockScale.sizes();
   TVM_FFI_ICHECK(blockScaleShape.size() == 2 || blockScaleShape.size() == 3)
       << "Block Scale should be 2D or 3D tensor.";
   auto num_experts = blockScaleShape.size() == 3 ? blockScaleShape[0] : 1;
@@ -204,7 +204,7 @@ void BlockScaleInterleaveReverse(TensorView const& blockScale, TensorView revers
   }
   CHECK_CONTIGUOUS(blockScale);
   CHECK_INPUT_TYPE(blockScale, dl_uint8);
-  auto blockScaleShape = blockScale.shape();
+  auto blockScaleShape = blockScale.sizes();
   TVM_FFI_ICHECK(blockScaleShape.size() == 2 || blockScaleShape.size() == 3)
       << "Block Scale should be 2D or 3D tensor.";
   auto num_experts = blockScaleShape.size() == 3 ? blockScaleShape[0] : 1;
@@ -251,8 +251,8 @@ void E2M1AndUFP8SFScaleToFloatV2(TensorView valueE2M1, TensorView scaleFP8SF,
                                  bool isSfSwizzledLayout = true) {
   CHECK_CPU_INPUT(valueE2M1, dl_uint8);
   CHECK_CPU_INPUT(scaleFP8SF, dl_uint8);
-  auto packedShape = valueE2M1.shape();
-  auto scaleShape = scaleFP8SF.shape();
+  auto packedShape = valueE2M1.sizes();
+  auto scaleShape = scaleFP8SF.sizes();
   TVM_FFI_ICHECK_EQ(packedShape.size(), 2) << "valueE2M1 should be 2D tensor.";
   TVM_FFI_ICHECK_EQ(scaleShape.size(), 1) << "scaleFP8SF should be 1D tensor.";
 

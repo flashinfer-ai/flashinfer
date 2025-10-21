@@ -1,4 +1,4 @@
-apache-tvm-ffi==0.1.0b19
+apache-tvm-ffi>=0.1,<0.2
 click
 einops
 ninja

@@ -50,7 +50,7 @@ void fp4_quantize(TensorView self, Optional<TensorView> const& globalScale, Tens
     globalScalePtr = static_cast<float*>(globalScale.value().data_ptr());
   }
 
-  auto const& inputShape = self.shape();
+  auto const& inputShape = self.sizes();
   auto const& rank = inputShape.size();
 
   TVM_FFI_ICHECK_GE(rank, 2) << "Input should be >=2D tensor.";
@@ -140,7 +140,7 @@ void fp4_batched_quantize(TensorView self, Optional<TensorView> const& mask, Ten
   CHECK_INPUT_TYPE(globalScale, fp32_dtype);
   TVM_FFI_ICHECK_EQ(sfVecSize, 16) << "sfVecSize can only be 16";
 
-  auto const& inputShape = self.shape();
+  auto const& inputShape = self.sizes();
   auto const& rank = inputShape.size();
 
   TVM_FFI_ICHECK_EQ(rank, 3) << "Input should be 3D tensor.";
@@ -205,7 +205,7 @@ void silu_and_mul_nvfp4_batched_quantize(TensorView const& self, TensorView cons
   CHECK_INPUT_TYPE(globalScale, fp32_dtype);
   TVM_FFI_ICHECK_EQ(sfVecSize, 16) << "sfVecSize can only be 16";
 
-  auto const& inputShape = self.shape();
+  auto const& inputShape = self.sizes();
   auto const& rank = inputShape.size();
   auto const& mask_rank = mask.ndim();
 

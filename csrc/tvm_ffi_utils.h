@@ -242,8 +242,8 @@ inline void check_shape(const tvm::ffi::TensorView& a, const tvm::ffi::TensorVie
 #define CHECK_CPU(x) \
   TVM_FFI_ICHECK_EQ(x.device().device_type, kDLCPU) << #x " must be a host tensor";
 #define CHECK_CONTIGUOUS(x) TVM_FFI_ICHECK(x.IsContiguous()) << #x " must be contiguous";
-#define CHECK_LAST_DIM_CONTIGUOUS(x)           \
-  TVM_FFI_ICHECK_EQ(x.stride(x.ndim() - 1), 1) \
+#define CHECK_LAST_DIM_CONTIGUOUS(x) \
+  TVM_FFI_ICHECK_EQ(x.stride(-1), 1) \
   #x "must be contiguous at last dimension";
 #define CHECK_INPUT(x) \
   CHECK_CUDA(x);       \
