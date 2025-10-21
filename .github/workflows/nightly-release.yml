@@ -98,7 +98,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install build twine wheel
-          pip install setuptools>=61.0 requests filelock torch tqdm numpy "apache-tvm-ffi>=0.1,<0.2"
+          pip install setuptools requests filelock torch tqdm numpy apache-tvm-ffi
 
       - name: Build flashinfer-cubin wheel
         env:
