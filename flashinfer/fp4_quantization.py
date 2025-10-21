@@ -362,10 +362,13 @@ def get_fp4_quantization_module(backend: str = "100"):
         sf_vec_size: int = 16,
         sf_use_ue8m0: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        m, k = input.shape
+        b, m, k = input.shape
         return (
-            input.new_empty([m, k // 2], dtype=torch.int64),  # float4_e2m1_x2
-            input.new_empty([m * k // sf_vec_size], dtype=torch.int32),  # Scale factors
+            input.new_empty([b, m, k // 2], dtype=torch.uint8),  # FLOAT4_E2M1X2
+            input.new_empty(
+                [b, _compute_swizzled_layout_sf_size(m, k // sf_vec_size, 128)],
+                dtype=torch.uint8,
+            ),  # swizzled SF buffer
         )
 
     @register_custom_op(

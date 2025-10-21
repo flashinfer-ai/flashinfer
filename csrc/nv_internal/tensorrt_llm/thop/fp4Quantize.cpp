@@ -159,7 +159,7 @@ void fp4_batched_quantize(Tensor self, Tensor globalScale, Tensor valueE2M1, Ten
   tensorrt_llm::kernels::invokeFP4Quantization<T, SF_VEC_SIZE>(                                  \
       b, m, k, reinterpret_cast<T*>(self->data), static_cast<float*>(globalScale->data),         \
       reinterpret_cast<int64_t*>(valueE2M1->data), reinterpret_cast<int32_t*>(scaleFP8SF->data), \
-      sfUseUE8M0, layout, mMultiProcessorCount, get_stream(self->device));
+      sfUseUE8M0, layout, mMultiProcessorCount, /*enable_pdl=*/false, get_stream(self->device));
 
   if (self->dtype == dl_float16) {
     LAUNCH_FP4_QUANTIZE_KERNEL(half, 16)
@@ -197,6 +197,7 @@ void silu_and_mul_scaled_nvfp4_experts_quantize(Tensor output, Tensor output_sca
   CHECK_CUDA(input_global_scale);
   CHECK_CUDA(mask);
 
+  TVM_FFI_ICHECK_EQ(mask.ndim(), 1);
   TVM_FFI_ICHECK_EQ(output.ndim(), 2);
   TVM_FFI_ICHECK_EQ(output_scale.ndim(), 2);
   TVM_FFI_ICHECK_EQ(input.ndim(), 2);

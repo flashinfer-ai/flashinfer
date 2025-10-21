@@ -19,7 +19,6 @@ Core Quantization Functions
     nvfp4_block_scale_interleave
     e2m1_and_ufp8sf_scale_to_float
     scaled_fp4_grouped_quantize
-    silu_and_mul_scaled_nvfp4_experts_quantize
 
 Matrix Shuffling Utilities
 --------------------------

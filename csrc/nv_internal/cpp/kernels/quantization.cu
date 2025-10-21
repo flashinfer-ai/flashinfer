@@ -319,7 +319,7 @@ void invokeSiluAndMulNVFP4Quantization(void* output, void* output_scale, void* i
 
   // TODO(kaixih@nvidia): Should relax this to allow any grid size.
   // shuw@nvidia.com: only deal with mask case
-  assert(mask != nullptr);
+  TLLM_CHECK_WITH_INFO(mask != nullptr, "mask must be non-null for expert NVFP4 path");
   grid.x = (grid.x + n_experts - 1) / n_experts * n_experts;
   cvt_fp16_to_fp4_expert<T, false><<<grid, block, 0, stream>>>(
       m_topk, k, reinterpret_cast<T*>(input), reinterpret_cast<float*>(input_global_scale),
