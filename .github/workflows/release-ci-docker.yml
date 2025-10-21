@@ -116,6 +116,7 @@ jobs:
       - name: Create Pull Request
         uses: peter-evans/create-pull-request@v6
         with:
+          token: ${{ secrets.FLASHINFER_BOT_TOKEN }}
           commit-message: "Update Docker tags to ${{ needs.generate-tag.outputs.date_sha }}"
           title: "Update Docker CI tags to ${{ needs.generate-tag.outputs.date_sha }}"
           body: |
