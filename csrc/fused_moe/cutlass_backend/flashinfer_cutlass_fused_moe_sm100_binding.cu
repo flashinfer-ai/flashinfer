@@ -291,8 +291,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     TVM_FFI_ICHECK_EQ(fc1_expert_weights.size(0), fc2_expert_weights.size(0))
         << "fc1_expert_weights and fc2_expert_weights must have the same number of experts.";
     if (isGatedActivation(base_activation_type)) {
-      TVM_FFI_ICHECK_EQ(fc1_expert_weights.size(1) fc2_expert_weights.size(2) *
-                        mInnerDimMultiplier * 2)
+      TVM_FFI_ICHECK_EQ(fc1_expert_weights.size(1),
+                        fc2_expert_weights.size(2) * mInnerDimMultiplier * 2)
           << "fc1_expert_weights inter size must be 2 times fc2_expert_weights inter size.";
     } else {
       TVM_FFI_ICHECK_EQ(fc1_expert_weights.size(1),
