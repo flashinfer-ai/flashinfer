@@ -55,13 +55,18 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
                  int32_t* expandedIdxToPermutedIdx, int32_t* permutedIdxToExpandedIdx,
                  int32_t* permutedIdxToTokenIdx, void* expertWeights, int32_t* numTokensPerExpert,
                  int32_t* ctaIdxXyToBatchIdx, int32_t* ctaIdxXyToMnLimit,
-                 int32_t* numNonExitingCtas, btg::Dtype dtypeElt, bool useRoutingScalesOnInput,
-                 bool useDeepSeekFp8, RoutingMethodType routingMethodType, cudaStream_t stream) {
+                 int32_t* numNonExitingCtas, btg::Dtype dtypeElt, btg::Dtype dtypeBias,
+                 bool useRoutingScalesOnInput, bool useDeepSeekFp8,
+                 RoutingMethodType routingMethodType, cudaStream_t stream) {
   if (routingMethodType == RoutingMethodType::DeepSeekV3) {
     FLASHINFER_CHECK(topK <= 8, "For DeepSeek routing method, must have topK <= 8");
     FLASHINFER_CHECK(topkGroup <= 4, "For DeepSeek routing method, must have topkGroup <= 4");
     moe::dev::routing::routingDeepSeek::Data routingData;
-    routingData.mDtypeExpW = btg::Dtype::Bfloat16;
+    routingData.mDtypeExpW =
+        btg::Dtype::Bfloat16;            // for DeepSeek, the expW is currently always bfloat16
+    routingData.mDtypeBias = dtypeBias;  // for DeepSeek, the bias can be bfloat16 or fp32
+
+    routingData.mDtypeScore = btg::Dtype::Fp32;  // for DeepSeek, the score is currently always fp32
     routingData.mUsePdl = true;
 
     // output:

@@ -73,6 +73,19 @@ class RoutingMethodType(IntEnum):
     Unspecified = 6
 
 
+# Copied from csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/common.h
+class ActivationType(IntEnum):
+    Gelu = 0
+    Relu = 1
+    Silu = 2
+    Swiglu = 3
+    Geglu = 4
+    SwigluBias = 5
+    Relu2 = 6
+    Identity = 7
+    InvalidType = 8
+
+
 class DtypeTrtllmGen(IntEnum):
     def __new__(cls, block_format_bit, signed_bit, integer_bit, num_bits, uid):
         value = (
@@ -305,6 +318,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             use_mxfp8_act_scaling: bool,
             min_latency_mode: bool,
             enable_pdl: bool,
+            activation_type: ActivationType,
         ):
             self.x_dtype = x_dtype
             self.weight_dtype = weight_dtype
@@ -330,6 +344,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
                 use_w4_group_scaling,
                 use_mxfp8_act_scaling,
             )
+            self.activation_type = activation_type
 
             if instance_key not in MoERunner.runner_dict:
                 MoERunner.runner_dict[instance_key] = module.init(
@@ -383,6 +398,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
                 tactic,
                 do_preparation,
                 self.enable_pdl,
+                self.activation_type,
             )
 
         @classmethod
@@ -431,6 +447,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
         min_latency_mode: bool = False,
         tune_max_num_tokens: int = 8192,
         enable_pdl: Optional[bool] = None,
+        activation_type: ActivationType = ActivationType.Swiglu,
     ) -> List[torch.Tensor]:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(input.device)
@@ -455,6 +472,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             use_mxfp8_act_scaling=use_mxfp8_act_scaling,
             min_latency_mode=min_latency_mode,
             enable_pdl=enable_pdl,
+            activation_type=activation_type,
         )
 
         _, gemm_tactic_1 = tuner.choose_one(
@@ -537,6 +555,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             min_latency_mode,
             [gemm_tactic_1, gemm_tactic_2],
             enable_pdl,
+            activation_type,
         )
 
         return (
@@ -632,6 +651,7 @@ def cutlass_fused_moe(
     min_latency_mode: bool = False,
     tune_max_num_tokens: int = 8192,
     enable_pdl: Optional[bool] = None,
+    activation_type: ActivationType = ActivationType.Swiglu,
 ) -> torch.Tensor:
     """Compute a Mixture of Experts (MoE) layer using CUTLASS backend.
 
@@ -736,6 +756,9 @@ def cutlass_fused_moe(
     tune_max_num_tokens : int = 8192
         Maximum number of tokens for tuning. Defaults to 8192.
 
+    activation_type: ActivationType = ActivationType.Swiglu
+        Activation to apply on for GEMM1, note that Relu2 means non-gated GEMM1
+
     Returns
     -------
     out: torch.Tensor
@@ -815,6 +838,7 @@ def cutlass_fused_moe(
         min_latency_mode=min_latency_mode,
         tune_max_num_tokens=tune_max_num_tokens,
         enable_pdl=enable_pdl,
+        activation_type=activation_type,
     )
 
 
