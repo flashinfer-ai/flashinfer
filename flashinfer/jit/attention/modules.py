@@ -28,7 +28,7 @@ from ..core import (
     sm90a_nvcc_flags,
     current_compilation_context,
 )
-from ...jit.cubin_loader import get_cubin
+from ...jit.cubin_loader import get_cubin, get_meta_hash,
 from ..utils import (
     dtype_map,
     filename_safe_dtype_map,
@@ -1568,15 +1568,21 @@ def gen_fmha_cutlass_sm100a_module(
 
 
 def gen_trtllm_gen_fmha_module():
-    from ...artifacts import ArtifactPath, MetaInfoHash
+    from ...artifacts import ArtifactPath, CheckSumHash
 
     include_path = f"{ArtifactPath.TRTLLM_GEN_FMHA}/include"
     header_name = "flashInferMetaInfo"
 
+    # Check if checksums.txt exists in the cubin directory
+    checksum_path = f"{ArtifactPath.TRTLLM_GEN_FMHA}/checksums.txt"
+    checksum = get_cubin(checksum_path, CheckSumHash.TRTLLM_GEN_FMHA)
+    assert checksum, f"Failed to get checksums.txt from {checksum_path}"
+
+    meta_hash = get_meta_hash(checksum)
     # use `get_cubin` to get "flashinferMetaInfo.h"
     metainfo = get_cubin(
         f"{include_path}/{header_name}.h",
-        MetaInfoHash.TRTLLM_GEN_FMHA,
+        meta_hash,
     )
 
     # make sure "flashinferMetaInfo.h" is downloaded or cached
@@ -1592,7 +1598,7 @@ def gen_trtllm_gen_fmha_module():
         extra_include_paths=[jit_env.FLASHINFER_CUBIN_DIR / include_path],
         extra_cuda_cflags=[
             f'-DTLLM_GEN_FMHA_CUBIN_PATH=\\"{ArtifactPath.TRTLLM_GEN_FMHA}\\"',
-            f'-DTLLM_GEN_FMHA_METAINFO_HASH=\\"{MetaInfoHash.TRTLLM_GEN_FMHA}\\"',
+            f'-DTLLM_GEN_FMHA_METAINFO_HASH=\\"{meta_hash}\\"',
         ],
     )
 

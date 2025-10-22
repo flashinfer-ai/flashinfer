@@ -79,7 +79,13 @@ def get_available_cubin_files(
     return tuple()
 
 
+@dataclass(frozen=True)
 class ArtifactPath:
+    """
+    This class is used to store the paths of the cubin files in artifactory.
+    The paths are generated in cubin publishing script logs (accessible by codeowners).
+    When compiling new cubins for backend directories, update the corresponding path.
+    """
     TRTLLM_GEN_FMHA: str = "463def7494c9fc6792b5aa5b5beef34025e247ac/fmha/trtllm-gen/"
     TRTLLM_GEN_BMM: str = (
         "56fea80cb22f8b2ef2a2c6a822a075fb20b36803/batched_gemm-074aec4-cc00b23"
@@ -93,19 +99,18 @@ class ArtifactPath:
 
 @dataclass(frozen=True)
 class MetaInfoHash:
+    """
+    Encode sha256 hash of kernel_map.json for DEEPGEMM
+    """
     DEEPGEMM: str = "b4374f857c3066089c4ec6b5e79e785559fa2c05ce2623710b0b04bf86414a48"
-    TRTLLM_GEN_FMHA: str = (
-        "2b8a485f2af84768bc769e678eb6014a8181ad95a7ea9e699de5efca4b18ec6a"
-    )
-    TRTLLM_GEN_BMM: str = (
-        "4a8ceeb356fc5339021acf884061e97e49e01da5c75dbf0f7cf4932c37a70152"
-    )
-    TRTLLM_GEN_GEMM: str = (
-        "bd5c3227bec4f8d7a7d3a27fd7628e010d99a5c42651d0a6b97e146803e63340"
-    )
 
 
 class CheckSumHash:
+    """
+    This class is used to store the checksums of the cubin files in artifactory.
+    The sha256 hashes are generated in cubin publishing script logs (accessible by codeowners).
+    When updating the ArtifactPath for backend directories, update the corresponding hash.
+    """
     TRTLLM_GEN_FMHA: str = (
         "639c534614e9fdf5a9cfa91f7ea8f53989613019c0e1f8b755f461e1fcc7546f"
     )
