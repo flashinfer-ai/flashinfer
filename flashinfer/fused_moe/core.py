@@ -184,7 +184,9 @@ def _maybe_get_cached_w3_w1_permute_indices(
     epilogue_tile_m: int,
     num_elts_per_sf: Union[None, int] = None,
 ) -> torch.Tensor:
-    if dst_w3_w1_weight.shape not in _cache_permute_indices:
+    # Create a unique cache key (weight_type, weight_shape)
+    cache_key = ("w3_w1", dst_w3_w1_weight.shape)
+    if cache_key not in _cache_permute_indices:
         # Get permute indices and chain them together
         permute0 = get_reorder_rows_for_gated_act_gemm_row_indices(dst_w3_w1_weight)
         if num_elts_per_sf is None:
@@ -198,10 +200,10 @@ def _maybe_get_cached_w3_w1_permute_indices(
                 num_elts_per_sf=num_elts_per_sf,
             )
         # Memoize permute indices as recompute is **very** costly
-        _cache_permute_indices[dst_w3_w1_weight.shape] = permute0[permute1].to(
+        _cache_permute_indices[cache_key] = permute0[permute1].to(
             dst_w3_w1_weight.device
         )
-    permute_indices = _cache_permute_indices[dst_w3_w1_weight.shape]
+    permute_indices = _cache_permute_indices[cache_key]
     return permute_indices
 
 
@@ -211,7 +213,9 @@ def get_w2_permute_indices_with_cache(
     epilogue_tile_m: int,
     num_elts_per_sf: Union[None, int] = None,
 ) -> torch.Tensor:
-    if dst_w2_weight.shape not in _cache_permute_indices:
+    # Create a unique cache key (weight_type, weight_shape)
+    cache_key = ("w2", dst_w2_weight.shape)
+    if cache_key not in _cache_permute_indices:
         if num_elts_per_sf is None:
             permute_indices = get_shuffle_matrix_a_row_indices(
                 dst_w2_weight, epilogue_tile_m
@@ -223,8 +227,8 @@ def get_w2_permute_indices_with_cache(
                 num_elts_per_sf=num_elts_per_sf,
             ).to(dst_w2_weight.device)
         # Memoize permute indices as recompute is **very** costly
-        _cache_permute_indices[dst_w2_weight.shape] = permute_indices
-    permute_indices = _cache_permute_indices[dst_w2_weight.shape]
+        _cache_permute_indices[cache_key] = permute_indices
+    permute_indices = _cache_permute_indices[cache_key]
     return permute_indices
 
 
@@ -1097,12 +1101,12 @@ def get_trtllm_moe_sm100_module():
         output2_scales_scalar: torch.Tensor,
         num_experts: int,
         top_k: int,
-        n_group: int,
-        topk_group: int,
+        n_group: Optional[int],
+        topk_group: Optional[int],
         intermediate_size: int,
         local_expert_offset: int,
         local_num_experts: int,
-        routed_scaling_factor: float,
+        routed_scaling_factor: Optional[float],
         use_routing_scales_on_input: bool,
         tile_tokens_dim: int = 8,
         routing_method_type: int = 0,
@@ -1151,12 +1155,12 @@ def get_trtllm_moe_sm100_module():
         output2_scales_scalar: torch.Tensor,
         num_experts: int,
         top_k: int,
-        n_group: int,
-        topk_group: int,
+        n_group: Optional[int],
+        topk_group: Optional[int],
         intermediate_size: int,
         local_expert_offset: int,
         local_num_experts: int,
-        routed_scaling_factor: float,
+        routed_scaling_factor: Optional[float],
         use_routing_scales_on_input: bool,
         tile_tokens_dim: int = 8,
         routing_method_type: int = 0,
@@ -1183,12 +1187,12 @@ def get_trtllm_moe_sm100_module():
         output: torch.Tensor,
         num_experts: int,
         top_k: int,
-        n_group: int,
-        topk_group: int,
+        n_group: Optional[int],
+        topk_group: Optional[int],
         intermediate_size: int,
         local_expert_offset: int,
         local_num_experts: int,
-        routed_scaling_factor: float,
+        routed_scaling_factor: Optional[float],
         tile_tokens_dim: int,
         routing_method_type: int,
         use_shuffled_weight: bool = False,
@@ -1197,6 +1201,7 @@ def get_trtllm_moe_sm100_module():
     ) -> torch.Tensor:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(hidden_states.device)
+
         # Call the C++ function for block scale MoE
         moe_op.trtllm_fp8_block_scale_moe(
             routing_logits,
@@ -1238,12 +1243,12 @@ def get_trtllm_moe_sm100_module():
         output: torch.Tensor,
         num_experts: int,
         top_k: int,
-        n_group: int,
-        topk_group: int,
+        n_group: Optional[int],
+        topk_group: Optional[int],
         intermediate_size: int,
         local_expert_offset: int,
         local_num_experts: int,
-        routed_scaling_factor: float,
+        routed_scaling_factor: Optional[float],
         tile_tokens_dim: int = 8,
         routing_method_type: int = 0,
         use_shuffled_weight: bool = False,
@@ -1503,12 +1508,12 @@ def trtllm_fp8_per_tensor_scale_moe(
     output2_scales_scalar: torch.Tensor,
     num_experts: int,
     top_k: int,
-    n_group: int,
-    topk_group: int,
+    n_group: Optional[int],
+    topk_group: Optional[int],
     intermediate_size: int,
     local_expert_offset: int,
     local_num_experts: int,
-    routed_scaling_factor: float,
+    routed_scaling_factor: Optional[float],
     use_routing_scales_on_input: bool,
     tile_tokens_dim: int = 8,
     routing_method_type: int = 0,
@@ -1576,12 +1581,12 @@ def trtllm_fp8_block_scale_moe(
     gemm2_weights_scale: torch.Tensor,
     num_experts: int,
     top_k: int,
-    n_group: int,
-    topk_group: int,
+    n_group: Optional[int],
+    topk_group: Optional[int],
     intermediate_size: int,
     local_expert_offset: int,
     local_num_experts: int,
-    routed_scaling_factor: float,
+    routed_scaling_factor: Optional[float],
     tile_tokens_dim: int = 8,
     routing_method_type: int = 0,
     use_shuffled_weight: bool = False,
