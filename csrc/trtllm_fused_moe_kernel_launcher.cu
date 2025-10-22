@@ -42,9 +42,9 @@ void trtllm_fp8_per_tensor_scale_moe_launcher(
     TensorView gemm1_weights, TensorView output1_scales_scalar,
     TensorView output1_scales_gate_scalar, TensorView gemm2_weights,
     TensorView output2_scales_scalar, TensorView output, int64_t const num_experts,
-    int64_t const top_k, int64_t const n_group, int64_t const topk_group,
+    int64_t const top_k, Optional<int64_t> const n_group, Optional<int64_t> const topk_group,
     int64_t const intermediate_size, int64_t const local_expert_offset,
-    int64_t const local_num_experts, double const routed_scaling_factor,
+    int64_t const local_num_experts, Optional<double> const routed_scaling_factor,
     bool const use_routing_scales_on_input, int64_t const tile_tokens_dim,
     int64_t const routing_method_type, bool enable_pdl) {
   static const std::tuple<int, int> device_props = [hidden_states] {
@@ -62,8 +62,10 @@ void trtllm_fp8_per_tensor_scale_moe_launcher(
 
   if (use_routing_scales_on_input) {
     TVM_FFI_ICHECK_EQ(routing_logits.dtype(), dl_bfloat16) << "routing_logits must be bfloat16.";
-  } else {
+  } else if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3) {
     TVM_FFI_ICHECK_EQ(routing_logits.dtype(), dl_float32) << "routing_logits must be float.";
+  } else {
+    TVM_FFI_ICHECK_EQ(routing_logits.dtype(), dl_bfloat16) << "routing_logits must be bfloat16.";
   }
   TVM_FFI_ICHECK_EQ(routing_logits.ndim(), 2) << "routing_logits must be 2D.";
   TVM_FFI_ICHECK_EQ(routing_logits.size(1), num_experts) << "routing_logits has incorrect shape.";
@@ -76,17 +78,31 @@ void trtllm_fp8_per_tensor_scale_moe_launcher(
         << "routing_bias has incorrect shape.";
   }
 
-  if (n_group <= 0 || topk_group <= 0) {
-    TVM_FFI_ICHECK_EQ(top_k, 1) << "Current routing kernel (no groups) only supports top_k=1.";
-  } else {
-    TVM_FFI_ICHECK_LE(top_k, 8) << "Current routing kernel (with groups) only supports top_k<=8.";
-    TVM_FFI_ICHECK_LE(topk_group, 4)
-        << "Current routing kernel (with groups) only supports topk_group<=4.";
-    TVM_FFI_ICHECK_LE(topk_group, n_group) << "n_group must not be smaller than topk_group.";
-    TVM_FFI_ICHECK_EQ(num_experts % n_group, 0) << "num_experts must be divisible by n_group";
+  if (n_group.has_value() && n_group.value() != 0) {
+    TVM_FFI_ICHECK(static_cast<RoutingMethodType>(routing_method_type) ==
+                   RoutingMethodType::DeepSeekV3)
+        << "Routing kernel with groups implies DeepSeekV3 routing method.";
+    TVM_FFI_ICHECK(topk_group.has_value()) << "if n_group is given, topk_group must be given";
+    TVM_FFI_ICHECK_EQ(num_experts % n_group.value(), 0)
+        << "num_experts must be divisible by n_group";
+    TVM_FFI_ICHECK(top_k <= 8 && top_k > 0)
+        << "Current routing kernel (with groups) only supports top_k<=8 && top_k>0.";
+    TVM_FFI_ICHECK(topk_group.value() <= 4 && topk_group.value() > 0)
+        << "Current routing kernel only (with groups) supports topk_group<=4 && topk_group > 0.";
+    TVM_FFI_ICHECK_LE(topk_group.value(), n_group.value())
+        << "n_group must not be smaller than topk_group.";
     // This check ensures we have enough experts in the selected groups to handle the top_k routing
-    TVM_FFI_ICHECK_LT(top_k, (topk_group * num_experts / n_group))
+    TVM_FFI_ICHECK_LT(top_k, (topk_group.value() * num_experts / n_group.value()))
         << "top_k must be less than total number of experts in selected groups";
+  } else if (static_cast<RoutingMethodType>(routing_method_type) ==
+                 RoutingMethodType::Renormalize ||
+             static_cast<RoutingMethodType>(routing_method_type) ==
+                 RoutingMethodType::RenormalizeNaive) {
+    TVM_FFI_LOG_AND_THROW(NotImplementedError)
+        << "Don't support routing method type Renormalize(Naive).";
+  } else if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Llama4) {
+    TVM_FFI_ICHECK_EQ(top_k, 1)
+        << "Current routing kernel (no groups, Llama4) only supports top_k=1.";
   }
   TVM_FFI_ICHECK_EQ(num_experts % 4, 0)
       << "Routing kernel expects that num_experts must be divisible by 4";
@@ -128,11 +144,12 @@ void trtllm_fp8_per_tensor_scale_moe_launcher(
   args.hidden_size = hidden_states.size(1);
   args.hidden_size_output = args.hidden_size;
   args.top_k = top_k;
-  args.n_group = n_group;
-  args.topk_group = topk_group;
+  args.n_group = n_group.has_value() ? n_group.value() : 0;
+  args.topk_group = topk_group.has_value() ? topk_group.value() : 0;
   args.local_expert_offset = local_expert_offset;
   args.local_num_experts = local_num_experts;
-  args.routed_scaling_factor = routed_scaling_factor;
+  args.routed_scaling_factor =
+      routed_scaling_factor.has_value() ? routed_scaling_factor.value() : 1.0;
   args.intermediate_size = intermediate_size;
   args.mUseRoutingScalesOnInput = use_routing_scales_on_input;
 
@@ -150,8 +167,9 @@ void trtllm_fp8_per_tensor_scale_moe_launcher(
       alloc_tensor({args.num_tokens, args.top_k}, dl_bfloat16, routing_logits.device());
   Tensor expert_indexes =
       alloc_tensor({args.num_tokens, args.top_k}, dl_int32, routing_logits.device());
+  int64_t const size_of_expert_count_histogram = std::max(num_experts * 2, int64_t(256 * 2));
   Tensor expert_count_histogram = alloc_tensor(
-      {2 * 256},
+      {size_of_expert_count_histogram},
       dl_int32,  // 256 is the max number of threads per block and max number of experts
       routing_logits.device());
 
@@ -289,9 +307,10 @@ void trtllm_fp8_per_tensor_scale_moe(
     TensorView gemm1_weights, TensorView output1_scales_scalar,
     TensorView output1_scales_gate_scalar, TensorView gemm2_weights,
     TensorView output2_scales_scalar, TensorView output, int64_t num_experts, int64_t top_k,
-    int64_t n_group, int64_t topk_group, int64_t intermediate_size, int64_t local_expert_offset,
-    int64_t local_num_experts, double routed_scaling_factor, bool use_routing_scales_on_input,
-    int64_t tile_tokens_dim, int64_t routing_method_type, bool enable_pdl) {
+    Optional<int64_t> n_group, Optional<int64_t> topk_group, int64_t intermediate_size,
+    int64_t local_expert_offset, int64_t local_num_experts, Optional<double> routed_scaling_factor,
+    bool use_routing_scales_on_input, int64_t tile_tokens_dim, int64_t routing_method_type,
+    bool enable_pdl) {
   auto dtype = hidden_states.dtype();
   if (dtype == dl_float16 || dtype == dl_bfloat16 || dtype == dl_float8_e4m3fn) {
     trtllm_fp8_per_tensor_scale_moe_launcher(
@@ -309,10 +328,11 @@ void trtllm_fp8_block_scale_moe_launcher(
     TensorView routing_logits, Optional<TensorView> routing_bias, TensorView hidden_states,
     TensorView hidden_states_scale, TensorView gemm1_weights, TensorView gemm1_weights_scale,
     TensorView gemm2_weights, TensorView gemm2_weights_scale, TensorView output,
-    int64_t const num_experts, int64_t const top_k, int64_t const n_group, int64_t const topk_group,
-    int64_t const intermediate_size, int64_t const local_expert_offset,
-    int64_t const local_num_experts, double const routed_scaling_factor,
-    int64_t const tile_tokens_dim, int64_t const routing_method_type,
+    int64_t const num_experts, int64_t const top_k, Optional<int64_t> const n_group,
+    Optional<int64_t> const topk_group, int64_t const intermediate_size,
+    int64_t const local_expert_offset, int64_t const local_num_experts,
+    Optional<double> const routed_scaling_factor, int64_t const tile_tokens_dim,
+    int64_t const routing_method_type,
     tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner& moe_runner, int64_t moeConfigIndex,
     bool enable_pdl) {
   static const std::tuple<int, int> device_props = [hidden_states] {
@@ -328,7 +348,11 @@ void trtllm_fp8_block_scale_moe_launcher(
       << "This kernel requires 10.x architecture. Current device has SM "
       << std::get<0>(device_props) << std::get<1>(device_props);
 
-  TVM_FFI_ICHECK_EQ(routing_logits.dtype(), dl_float32) << "routing_logits must be float.";
+  if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3) {
+    TVM_FFI_ICHECK_EQ(routing_logits.dtype(), dl_float32) << "routing_logits must be float.";
+  } else {
+    TVM_FFI_ICHECK_EQ(routing_logits.dtype(), dl_bfloat16) << "routing_logits must be bfloat16.";
+  }
   TVM_FFI_ICHECK_EQ(routing_logits.ndim(), 2) << "routing_logits must be 2D.";
   TVM_FFI_ICHECK_EQ(routing_logits.size(0), hidden_states.size(0))
       << "routing_logits and hidden_states must have the same number of tokens.";
@@ -343,17 +367,31 @@ void trtllm_fp8_block_scale_moe_launcher(
         << "routing_bias has incorrect shape.";
   }
 
-  if (n_group <= 0 || topk_group <= 0) {
-    TVM_FFI_ICHECK_EQ(top_k, 1) << "Current routing kernel (no groups) only supports top_k=1.";
-  } else {
-    TVM_FFI_ICHECK_LE(top_k, 8) << "Current routing kernel (with groups) only supports top_k<=8.";
-    TVM_FFI_ICHECK_LE(topk_group, 4)
-        << "Current routing kernel (with groups) only supports topk_group<=4.";
-    TVM_FFI_ICHECK_LE(topk_group, n_group) << "n_group must not be smaller than topk_group.";
-    TVM_FFI_ICHECK_EQ(num_experts % n_group, 0) << "num_experts must be divisible by n_group";
+  if (n_group.has_value() && n_group.value() != 0) {
+    TVM_FFI_ICHECK(static_cast<RoutingMethodType>(routing_method_type) ==
+                   RoutingMethodType::DeepSeekV3)
+        << "Routing kernel with groups implies DeepSeekV3 routing method.";
+    TVM_FFI_ICHECK(topk_group.has_value()) << "if n_group is given, topk_group must be given";
+    TVM_FFI_ICHECK_EQ(num_experts % n_group.value(), 0)
+        << "num_experts must be divisible by n_group";
+    TVM_FFI_ICHECK(top_k <= 8 && top_k > 0)
+        << "Current routing kernel (with groups) only supports top_k<=8 && top_k>0.";
+    TVM_FFI_ICHECK(topk_group.value() <= 4 && topk_group.value() > 0)
+        << "Current routing kernel only (with groups) supports topk_group<=4 && topk_group > 0.";
+    TVM_FFI_ICHECK_LE(topk_group.value(), n_group.value())
+        << "n_group must not be smaller than topk_group.";
     // This check ensures we have enough experts in the selected groups to handle the top_k routing
-    TVM_FFI_ICHECK_LT(top_k, (topk_group * num_experts / n_group))
+    TVM_FFI_ICHECK_LT(top_k, (topk_group.value() * num_experts / n_group.value()))
         << "top_k must be less than total number of experts in selected groups";
+  } else if (static_cast<RoutingMethodType>(routing_method_type) ==
+                 RoutingMethodType::Renormalize ||
+             static_cast<RoutingMethodType>(routing_method_type) ==
+                 RoutingMethodType::RenormalizeNaive) {
+    TVM_FFI_ICHECK(top_k <= 10 && top_k > 0)
+        << "Current routing kernel (no groups, renormalize) only supports top_k<=10 && top_k>0.";
+  } else if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Llama4) {
+    TVM_FFI_ICHECK_EQ(top_k, 1)
+        << "Current routing kernel (no groups, Llama4) only supports top_k=1.";
   }
   TVM_FFI_ICHECK_EQ(num_experts % 4, 0)
       << "Routing kernel expects that num_experts must be divisible by 4";
@@ -392,11 +430,12 @@ void trtllm_fp8_block_scale_moe_launcher(
   args.hidden_size = hidden_states.size(1);
   args.hidden_size_output = args.hidden_size;
   args.top_k = top_k;
-  args.n_group = n_group;
-  args.topk_group = topk_group;
+  args.n_group = n_group.has_value() ? n_group.value() : 0;
+  args.topk_group = topk_group.has_value() ? topk_group.value() : 0;
   args.local_expert_offset = local_expert_offset;
   args.local_num_experts = local_num_experts;
-  args.routed_scaling_factor = routed_scaling_factor;
+  args.routed_scaling_factor =
+      routed_scaling_factor.has_value() ? routed_scaling_factor.value() : 1.0;
   args.intermediate_size = intermediate_size;
   args.mUseDeepSeekFp8 = true;
 
@@ -589,11 +628,11 @@ void trtllm_fp8_block_scale_moe(TensorView routing_logits, Optional<TensorView> 
                                 TensorView gemm1_weights, TensorView gemm1_weights_scale,
                                 TensorView gemm2_weights, TensorView gemm2_weights_scale,
                                 TensorView output, int64_t num_experts, int64_t top_k,
-                                int64_t n_group, int64_t topk_group, int64_t intermediate_size,
-                                int64_t local_expert_offset, int64_t local_num_experts,
-                                double routed_scaling_factor, int64_t tile_tokens_dim,
-                                int64_t routing_method_type, bool use_shuffled_weight,
-                                int64_t weight_layout, bool enable_pdl) {
+                                Optional<int64_t> n_group, Optional<int64_t> topk_group,
+                                int64_t intermediate_size, int64_t local_expert_offset,
+                                int64_t local_num_experts, Optional<double> routed_scaling_factor,
+                                int64_t tile_tokens_dim, int64_t routing_method_type,
+                                bool use_shuffled_weight, int64_t weight_layout, bool enable_pdl) {
   auto dtype = hidden_states.dtype();
   if (dtype == dl_float16 || dtype == dl_bfloat16 || dtype == dl_float8_e4m3fn) {
     using RunnerType = tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner;
@@ -715,8 +754,8 @@ Array<Tensor> trtllm_fp4_block_scale_moe_launcher(
     TVM_FFI_ICHECK(topk_group.has_value()) << "if n_group is given, topk_group must be given";
     TVM_FFI_ICHECK_EQ(num_experts % n_group.value(), 0)
         << "num_experts must be divisible by n_group";
-    TVM_FFI_ICHECK(top_k <= 8 && top_k > 0)
-        << "Current routing kernel (with groups) only supports top_k<=8 && top_k>0.";
+    TVM_FFI_ICHECK(top_k <= 10 && top_k > 0)
+        << "Current routing kernel (with groups) only supports top_k<=10 && top_k>0.";
     TVM_FFI_ICHECK(topk_group.value() <= 4 && topk_group.value() > 0)
         << "Current routing kernel only (with groups) supports topk_group<=4 && topk_group > 0.";
     TVM_FFI_ICHECK_LE(topk_group.value(), n_group.value())
@@ -729,8 +768,8 @@ Array<Tensor> trtllm_fp4_block_scale_moe_launcher(
              static_cast<RoutingMethodType>(routing_method_type) ==
                  RoutingMethodType::RenormalizeNaive ||
              static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::TopK) {
-    TVM_FFI_ICHECK(top_k <= 8 && top_k > 0)
-        << "Current routing kernel (no groups, renormalize/topk) only supports top_k<=8 && "
+    TVM_FFI_ICHECK(top_k <= 10 && top_k > 0)
+        << "Current routing kernel (no groups, renormalize/topk) only supports top_k<=10 && "
            "top_k>0.";
   } else if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Llama4) {
     TVM_FFI_ICHECK_EQ(top_k, 1)
@@ -809,12 +848,10 @@ Array<Tensor> trtllm_fp4_block_scale_moe_launcher(
   // Tensor expert_weights = alloc_tensor(
   //     {args.num_tokens, args.top_k}, dl_bfloat16, hidden_states.device());
   // Tensor expert_indexes = alloc_tensor(
-  //     {args.num_tokens, args.top_k}, dl_int32, hidden_states.device());
-  int constexpr MAX_NUM_EXPERTS = 384;
-  Tensor expert_count_histogram = alloc_tensor(
-      {2 * MAX_NUM_EXPERTS},
-      dl_int32,  // 256 is the max number of threads per block and max number of experts
-      hidden_states.device());
+  //     {args.num_tokens, args.top_k}, dl_int32, hidden_states.device();
+  int64_t const size_of_expert_count_histogram = std::max(num_experts * 2, int64_t(256 * 2));
+  Tensor expert_count_histogram =
+      alloc_tensor({size_of_expert_count_histogram}, dl_int32, hidden_states.device());
 
   auto const sf_vec_size = dtype_weights == btg::Dtype::MxE2m1 ? 32 : 16;
 
@@ -1017,7 +1054,6 @@ Array<Tensor> trtllm_fp4_block_scale_moe_launcher(
   workspace.gemm1_output_scale = gemm1_output_scale.has_value()
                                      ? static_cast<float*>(gemm1_output_scale.value().data_ptr())
                                      : nullptr;
-
   // gemm2 intermediate ws
   workspace.gemm2_output = gemm2_output.data_ptr();
   workspace.gemm2_output_scale = nullptr;
