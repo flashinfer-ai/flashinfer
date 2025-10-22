@@ -28,7 +28,7 @@ from ..core import (
     sm90a_nvcc_flags,
     current_compilation_context,
 )
-from ...jit.cubin_loader import get_cubin, get_meta_hash,
+from ...jit.cubin_loader import get_cubin, get_meta_hash
 from ..utils import (
     dtype_map,
     filename_safe_dtype_map,

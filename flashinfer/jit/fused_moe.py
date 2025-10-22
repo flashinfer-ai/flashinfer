@@ -185,7 +185,7 @@ def gen_trtllm_gen_fused_moe_sm100_module() -> JitSpec:
     checksum = get_cubin(checksum_path, CheckSumHash.TRTLLM_GEN_BMM)
     assert checksum, f"Failed to get checksums.txt from {checksum_path}"
     meta_hash = get_meta_hash(checksum)
-    
+
     # use `get_cubin` to get "flashinferMetaInfo.h"
     metainfo = get_cubin(
         f"{include_path}/{header_name}.h",

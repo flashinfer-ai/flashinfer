@@ -140,11 +140,12 @@ def get_meta_hash(checksums_bytes: bytes) -> str:
     """
     Parse the checksums.txt file and get the hash of corresponding flashinferMetaInfo.h file
     """
-    for line in checksums_bytes.splitlines():
+    checksums_lines = checksums_bytes.decode("utf-8").splitlines()
+    for line in checksums_lines:
         sha256, filename = line.strip().split()
         if ".h" in filename:
             return sha256
-    raise ValueError(f"Invalid checksums.txt, no flashinferMetaInfo.h found")
+    raise ValueError("Invalid checksums.txt, no flashinferMetaInfo.h found")
 
 
 def verify_cubin(cubin_path: str, expected_sha256: str) -> bool:
