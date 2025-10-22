@@ -299,13 +299,15 @@ void invokeSiluAndMulNVFP4Quantization(void* output, void* output_scale, void* i
                                        void* input_global_scale, void* mask, bool use_silu_and_mul,
                                        int m_topk, int k, int n_experts, cudaStream_t stream) {
   int device;
-  cudaGetDevice(&device);
+  TLLM_CUDA_CHECK(cudaGetDevice(&device));
   int multiProcessorCount;
-  cudaDeviceGetAttribute(&multiProcessorCount, cudaDevAttrMultiProcessorCount, device);
+  TLLM_CUDA_CHECK(
+      cudaDeviceGetAttribute(&multiProcessorCount, cudaDevAttrMultiProcessorCount, device));
 
   // Grid, Block size.
   // Each thread converts 8 values.
-  int const workSizePerRow = k / CVT_ELTS_PER_THREAD;
+  TLLM_CHECK_WITH_INFO(k > 0, "k must be > 0");
+  int const workSizePerRow = max(1, k / CVT_ELTS_PER_THREAD);
   int const totalWorkSize = m_topk * workSizePerRow;
   dim3 block(std::min(workSizePerRow, 512));
   // Get number of blocks per SM (assume we can fully utilize the SM).
@@ -320,6 +322,7 @@ void invokeSiluAndMulNVFP4Quantization(void* output, void* output_scale, void* i
   // TODO(kaixih@nvidia): Should relax this to allow any grid size.
   // shuw@nvidia.com: only deal with mask case
   TLLM_CHECK_WITH_INFO(mask != nullptr, "mask must be non-null for expert NVFP4 path");
+  TLLM_CHECK_WITH_INFO(n_experts > 0, "n_experts must be > 0");
   grid.x = (grid.x + n_experts - 1) / n_experts * n_experts;
   cvt_fp16_to_fp4_expert<T, false><<<grid, block, 0, stream>>>(
       m_topk, k, reinterpret_cast<T*>(input), reinterpret_cast<float*>(input_global_scale),

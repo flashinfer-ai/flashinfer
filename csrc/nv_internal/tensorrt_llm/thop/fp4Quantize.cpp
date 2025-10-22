@@ -196,6 +196,11 @@ void silu_and_mul_scaled_nvfp4_experts_quantize(Tensor output, Tensor output_sca
   CHECK_CUDA(input);
   CHECK_CUDA(input_global_scale);
   CHECK_CUDA(mask);
+  CHECK_CONTIGUOUS(output);
+  CHECK_CONTIGUOUS(output_scale);
+  CHECK_CONTIGUOUS(input);
+  CHECK_CONTIGUOUS(input_global_scale);
+  CHECK_CONTIGUOUS(mask);
 
   TVM_FFI_ICHECK_EQ(mask.ndim(), 1);
   TVM_FFI_ICHECK_EQ(output.ndim(), 2);
@@ -210,7 +215,7 @@ void silu_and_mul_scaled_nvfp4_experts_quantize(Tensor output, Tensor output_sca
   CHECK_INPUT_TYPE(output, uint8_dtype);
   CHECK_INPUT_TYPE(output_scale, int32_dtype);
 
-  const int BLOCK_SIZE = 16;
+  constexpr int BLOCK_SIZE = 16;
   auto m_topk = input.shape()[0];
   auto k_by_2 = input.shape()[1];
   auto k = k_by_2;
@@ -218,6 +223,7 @@ void silu_and_mul_scaled_nvfp4_experts_quantize(Tensor output, Tensor output_sca
     TVM_FFI_ICHECK_EQ(k_by_2 % 2, 0) << "k must be a multiple of 2";
     k = k_by_2 / 2;
   }
+  TVM_FFI_ICHECK_EQ(k % BLOCK_SIZE, 0) << "k must be a multiple of 16";
   auto n_experts = input_global_scale.shape()[0];
   TVM_FFI_ICHECK_EQ(mask.shape()[0], n_experts);
   TVM_FFI_ICHECK_EQ(output.shape()[0], m_topk);
