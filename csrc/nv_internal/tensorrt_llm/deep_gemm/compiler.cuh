@@ -178,7 +178,7 @@ std::vector<std::filesystem::path> getJitIncludeDirs() {
                               "nv_internal" / "tensorrt_llm");
       }
     } else {
-      TLLM_LOG_WARNING("Failed to find TensorRT LLM installation, DeepGEMM will be disabled.");
+      TLLM_LOG_WARNING("Failed to find FlashInfer installation, DeepGEMM will be disabled.");
     }
   }
   return includeDirs;
