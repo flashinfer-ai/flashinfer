@@ -174,7 +174,8 @@ std::vector<std::filesystem::path> getJitIncludeDirs() {
         location.erase(location.find_last_not_of(" \n\r\t") + 1);
 
         // Set the include directory based on the package location
-        includeDirs.push_back(std::filesystem::path(location) / "flashinfer" / "data" / "csrc" / "nv_internal" / "tensorrt_llm");
+        includeDirs.push_back(std::filesystem::path(location) / "flashinfer" / "data" / "csrc" /
+                              "nv_internal" / "tensorrt_llm");
       }
     } else {
       TLLM_LOG_WARNING("Failed to find TensorRT LLM installation, DeepGEMM will be disabled.");
