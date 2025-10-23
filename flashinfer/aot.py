@@ -67,7 +67,7 @@ from .jit.quantization import gen_quantization_module
 from .jit.rope import gen_rope_module
 from .jit.sampling import gen_sampling_module
 from .jit.tllm_utils import gen_trtllm_utils_module
-from .jit.xqa import gen_xqa_module
+from .jit.xqa import gen_xqa_module, gen_xqa_module_mla
 from .jit.attention import (
     gen_batch_attention_module,
     gen_batch_decode_module,
@@ -365,9 +365,10 @@ def gen_xqa(
     has_sm90: bool,
     has_sm100: bool,
     has_sm120: bool,
+    has_sm121: bool,
 ) -> Iterator[JitSpec]:
     """Generate XQA modules for various configurations."""
-    if not has_sm90 and not has_sm100 and not has_sm120:
+    if not has_sm90 and not has_sm100 and not has_sm120 and not has_sm121:
         return  # XQA requires SM90+
 
     sm_versions = []
@@ -377,6 +378,8 @@ def gen_xqa(
         sm_versions.append(100)
     if has_sm120:
         sm_versions.append(120)
+    if has_sm121:
+        sm_versions.append(121)
 
     for (
         fp16_input,
@@ -416,6 +419,30 @@ def gen_xqa(
             use_sliding_window=use_sliding_window,
             sm_version=sm_version,
         )
+
+    if has_sm120:
+        for token_per_page in token_per_page_:
+            yield gen_xqa_module_mla(
+                input_dtype=torch.float8_e4m3fn,
+                kv_cache_dtype=torch.float8_e4m3fn,
+                page_size=token_per_page,
+                head_dim=576,
+                head_group_ratio=128,
+                use_sliding_window=False,
+                sm_version=120,
+            )
+
+    if has_sm121:
+        for token_per_page in token_per_page_:
+            yield gen_xqa_module_mla(
+                input_dtype=torch.float8_e4m3fn,
+                kv_cache_dtype=torch.float8_e4m3fn,
+                page_size=token_per_page,
+                head_dim=576,
+                head_group_ratio=128,
+                use_sliding_window=False,
+                sm_version=121,
+            )
 
 
 def gen_all_modules(
@@ -548,6 +575,7 @@ def gen_all_modules(
                 has_sm90,
                 has_sm100,
                 has_sm120,
+                has_sm121,
             )
         )
 

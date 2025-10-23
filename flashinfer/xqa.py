@@ -19,7 +19,7 @@ from types import SimpleNamespace
 from typing import Optional
 import torch
 
-from .jit.xqa import gen_xqa_module
+from .jit.xqa import gen_xqa_module, gen_xqa_module_mla
 from .jit.utils import filename_safe_dtype_map
 from .utils import (
     get_device_sm_count,
@@ -255,6 +255,203 @@ def xqa(
         output,
         q,
         sinks,
+        k_cache,
+        v_cache,
+        page_table,
+        max_seq_len,
+        seq_lens,
+        batch_size,
+        kv_scale,
+        semaphores,
+        workspace_buffer,
+    )
+
+
+@functools.cache
+def get_xqa_module_mla(
+    input_dtype: torch.dtype,
+    kv_cache_dtype: torch.dtype,
+    page_size: int,
+    head_dim: int,
+    head_group_ratio: int,
+    use_sliding_window: bool = False,
+    sm_version: int = 120,
+):
+    module = gen_xqa_module_mla(
+        input_dtype,
+        kv_cache_dtype,
+        page_size,
+        head_dim,
+        head_group_ratio,
+        use_sliding_window,
+        sm_version,
+    ).build_and_load()
+
+    @register_custom_op(
+        f"flashinfer::xqa_mla_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}_sm_{sm_version}",
+        mutates_args=("output", "workspace_buffer"),
+    )
+    def xqa_mla(
+        sm_count: int,
+        q_scale: float,
+        output: torch.Tensor,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        page_table: torch.Tensor,
+        max_seq_len: int,
+        seq_lens: torch.Tensor,
+        batch_size: int,
+        kv_scale: torch.Tensor,
+        semaphores: torch.Tensor,
+        workspace_buffer: torch.Tensor,
+    ) -> None:
+        module.xqa_wrapper_mla(
+            sm_count,
+            q_scale,
+            output,
+            q,
+            k_cache,
+            v_cache,
+            page_table,
+            max_seq_len,
+            seq_lens,
+            batch_size,
+            kv_scale,
+            semaphores,
+            workspace_buffer,
+        )
+
+    @register_fake_op(
+        f"flashinfer::xqa_mla_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}_sm_{sm_version}"
+    )
+    def _fake_xqa_mla(
+        sm_count: int,
+        q_scale: float,
+        output: torch.Tensor,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        page_table: torch.Tensor,
+        max_seq_len: int,
+        seq_lens: torch.Tensor,
+        batch_size: int,
+        kv_scale: torch.Tensor,
+        semaphores: torch.Tensor,
+        workspace_buffer: torch.Tensor,
+    ) -> None:
+        pass
+
+    return SimpleNamespace(
+        xqa_mla=xqa_mla,
+    )
+
+
+def xqa_mla(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    output: torch.Tensor,
+    workspace_buffer: torch.Tensor,
+    semaphores: torch.Tensor,
+    page_size: int,
+    q_scale: float = 1.0,
+    kv_scale: Optional[torch.Tensor] = None,
+    sm_count: Optional[int] = None,
+) -> None:
+    r"""Apply attention with paged KV cache using XQA kernel.
+    Parameters
+    ----------
+    q : torch.Tensor
+        Query tensor with shape ``[batch_size, beam_width, num_q_heads, head_dim]``.
+        Data type should be torch.float16 or torch.bfloat16.
+        Now only beam_width 1 is supported.
+    k_cache: torch.Tensor
+        Paged K cache tensor with shape ``[total_num_cache_heads, head_dim]``.
+        Data type should match query tensor or be torch.float8_e4m3fn, in which case xqa will run fp8 calculation.
+        Should be the same data type as v_cache.
+    v_cache: torch.Tensor
+        Paged V cache tensor with shape ``[total_num_cache_heads, head_dim]``.
+        Data type should match query tensor or be torch.float8_e4m3fn, in which case xqa will run fp8 calculation.
+        Should be the same data type as k_cache.
+    page_table : torch.Tensor
+        Page table tensor with shape ``batch_size, nb_pages_per_seq``.
+        Data type should be torch.uint32.
+        K and V share the same table.
+    seq_lens : torch.Tensor
+        Sequence lengths tensor with shape ``[batch_size, beam_width]``.
+        Data type should be torch.uint32.
+    output : torch.Tensor
+        Output tensor with shape ``[batch_size, beam_width, num_q_heads, head_dim]``.
+        Data type should match query tensor. This tensor will be modified in-place.
+    workspace_buffer : torch.Tensor
+        Workspace buffer for temporary computations.
+        Data type should be torch.uint8.
+    semaphores : torch.Tensor
+        Semaphore buffer for synchronization.
+        Data type should be torch.uint32.
+    page_size : int
+        Size of each page in the paged KV cache. Must be one of [16, 32, 64, 128].
+    q_scale : float, default=1.0
+        Scale factor for query tensor.
+    kv_scale : Optional[torch.Tensor], default=None
+        Scale factor for KV cache with shape ``[1]``.
+        Data type should be torch.float32.
+        If None, defaults to 1.0.
+    sm_count : Optional[int], default=None
+        Number of streaming multiprocessors to use.
+        If None, will be inferred from the device.
+    Note
+    ----
+    The function automatically infers several parameters from tensor shapes:
+    - batch_size from q.shape[0]
+    - head_dim from q.shape[-1]
+    - input_dtype from q.dtype
+    - kv_cache_dtype from k.dtype
+    """
+    # Handle optional parameters
+    if sm_count is None:
+        sm_count = get_device_sm_count(q.device)
+
+    if kv_scale is None:
+        kv_scale = torch.ones(1, dtype=torch.float32, device=q.device)
+
+    # Infer parameters from tensors
+    batch_size = q.shape[0]
+    head_dim = q.shape[-1]
+
+    # Calculate head_group_ratio
+    head_group_ratio = 128
+
+    # Calculate max_seq_len from page_table and page_size
+    num_pages_per_seq = page_table.shape[-1]
+    max_seq_len = num_pages_per_seq * page_size
+
+    assert k_cache.dtype == v_cache.dtype, "K and V cache must have the same dtype"
+
+    if get_compute_capability(torch.device(device="cuda"))[0] not in [12]:
+        raise RuntimeError("XQA is only supported on SM120 GPUs")
+    sm_version = int(
+        get_compute_capability(torch.device(device="cuda"))[0] * 10
+        + get_compute_capability(torch.device(device="cuda"))[1]
+    )
+
+    xqa_module = get_xqa_module_mla(
+        q.dtype,
+        k_cache.dtype,
+        page_size,
+        head_dim,
+        head_group_ratio,
+        False,
+        sm_version,
+    )
+    xqa_module.xqa_mla(
+        sm_count,
+        q_scale,
+        output,
+        q,
         k_cache,
         v_cache,
         page_table,

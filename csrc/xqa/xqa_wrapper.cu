@@ -19,6 +19,34 @@
 
 using tvm::ffi::Optional;
 
+#if MLA_WRAPPER
+void xqa_wrapper_mla(int64_t multiProcessorCount, double qScale, TensorView output, TensorView q,
+#if PAGED_KV_CACHE_LAYOUT == 1
+                     TensorView kCacheVLLM, TensorView vCacheVLLM,
+#else
+                     TensorView pool,
+#endif
+                     TensorView kvCachePageList, int64_t maxSeqLen, TensorView seqLen,
+                     int64_t batchSize, TensorView kvCacheScale, TensorView semaphores,
+                     TensorView scratch) {
+  auto stream = get_stream(output->device);
+
+  launchMLAFlashInfer(multiProcessorCount, 1, qScale, reinterpret_cast<OutputHead*>(output->data),
+                      reinterpret_cast<InputHead const*>(q->data),
+#if PAGED_KV_CACHE_LAYOUT == 1
+                      reinterpret_cast<GMemCacheHead*>(kCacheVLLM->data),
+                      reinterpret_cast<GMemCacheHead*>(vCacheVLLM->data),
+#else
+                      reinterpret_cast<GMemCacheHead*>(pool->data),
+#endif
+                      reinterpret_cast<KVCachePageIndex const*>(kvCachePageList->data), maxSeqLen,
+                      reinterpret_cast<uint32_t const*>(seqLen->data), batchSize,
+                      reinterpret_cast<float const*>(kvCacheScale->data),
+                      reinterpret_cast<uint32_t*>(semaphores->data),
+                      reinterpret_cast<void*>(scratch->data), stream);
+}
+#else
+
 void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbKHeads,
                  int64_t slidingWinSize, double qScale, TensorView output,
 #if LOW_PREC_OUTPUT
@@ -64,3 +92,4 @@ void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbK
            reinterpret_cast<uint32_t*>(semaphores->data), reinterpret_cast<void*>(scratch->data),
            stream);
 }
+#endif
