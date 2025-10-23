@@ -689,27 +689,24 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
 #endif
   } else if (sm_ >= 80 && sm_ < 90) {
 #ifdef ENABLE_FP4
-    if constexpr (!std::is_same_v<WeightType, __nv_fp4_e2m1>) {
-      if constexpr (use_fp8 || use_w4afp8) {
-#if defined(ENABLE_FP8)
-        static_assert(!std::is_same_v<OutputType, __nv_fp8_e4m3> &&
-                          !std::is_same_v<OutputType, __nv_fp8_e5m2>,
-                      "FP8 GEMM Output not supported");
-#endif
-        TLLM_CHECK_WITH_INFO(sm_ == 89,
-                             "For sm >= 80 and < 90, fp8 is only supported with sm == 89");
-        dispatchMoeGemmToCutlass<T, WeightType, ScaleBiasType, cutlass::arch::Sm89, EpilogueTag>(
-            inputs, multi_processor_count_);
-      } else {
-        dispatchMoeGemmToCutlass<T, WeightType, ScaleBiasType, cutlass::arch::Sm80, EpilogueTag>(
-            inputs, multi_processor_count_);
-      }
-    } else {
+    if constexpr (std::is_same_v<WeightType, __nv_fp4_e2m1>) {
       TLLM_THROW("FP4 data type is not supported on SM < 90");
     }
-#else
-    TLLM_THROW("FP4 data type is not supported on SM < 90");
 #endif
+    if constexpr (use_fp8 || use_w4afp8) {
+#if defined(ENABLE_FP8)
+      static_assert(
+          !std::is_same_v<OutputType, __nv_fp8_e4m3> && !std::is_same_v<OutputType, __nv_fp8_e5m2>,
+          "FP8 GEMM Output not supported");
+#endif
+
+      TLLM_CHECK_WITH_INFO(sm_ == 89, "For sm >= 80 and < 90, fp8 is only supported with sm == 89");
+      dispatchMoeGemmToCutlass<T, WeightType, ScaleBiasType, cutlass::arch::Sm89, EpilogueTag>(
+          inputs, multi_processor_count_);
+    } else {
+      dispatchMoeGemmToCutlass<T, WeightType, ScaleBiasType, cutlass::arch::Sm80, EpilogueTag>(
+          inputs, multi_processor_count_);
+    }
   } else if (sm_ >= 90) {
     // For SM120+ FP8 MoE, redirect to SM89 (Ada) FP8 kernel implementations.
     if constexpr (use_fp8) {

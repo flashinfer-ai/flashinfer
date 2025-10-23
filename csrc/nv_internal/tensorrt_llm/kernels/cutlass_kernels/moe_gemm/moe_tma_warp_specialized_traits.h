@@ -32,7 +32,8 @@ template <typename T, typename WeightType,
           TmaWarpSpecializedGroupedGemmInput::EpilogueFusion Fusion =
               TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE>
 constexpr bool isValidSM120MOESpecialisation() {
-#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED)  // TODO Is there a better choice
+#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) && \
+    defined(ENABLED_FP4)  // TODO Is there a better choice
   return cutlass::platform::is_same<T, __nv_fp4_e2m1>::value &&
          cutlass::platform::is_same<T, WeightType>::value &&
          cutlass::platform::is_same<EpilogueTag, cutlass_extensions::EpilogueOpDefault>::value &&
@@ -47,7 +48,8 @@ template <typename T, typename WeightType,
           TmaWarpSpecializedGroupedGemmInput::EpilogueFusion Fusion =
               TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE>
 constexpr bool isValidBlackwellMOESpecialisation() {
-#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)  // TODO Is there a better choice
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED) && \
+    defined(ENABLED_FP4)  // TODO Is there a better choice
   return (cutlass::platform::is_same<T, WeightType>::value ||
           (cutlass::platform::is_same<T, __nv_fp8_e4m3>::value &&
            cutlass::platform::is_same<WeightType, __nv_fp4_e2m1>::value)) &&
