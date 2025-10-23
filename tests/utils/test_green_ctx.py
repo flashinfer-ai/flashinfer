@@ -32,15 +32,16 @@ def test_green_ctx_creation(
     num_groups: int,
     min_count: int,
 ):
+    dev = torch.device(device)
     required_sms = calculate_required_sms(num_groups, min_count, device)
-    available_sms = get_device_sm_count(torch.device(device))
+    available_sms = get_device_sm_count(dev)
     if required_sms > available_sms:
         pytest.skip(
             f"Test requires {required_sms} SMs but device only has {available_sms} SMs"
         )
 
     streams, resources = green_ctx.split_device_green_ctx(
-        torch.device(device), num_groups, min_count
+        dev, num_groups, min_count
     )
 
     assert len(resources) == num_groups + 1
