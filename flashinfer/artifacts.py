@@ -79,7 +79,14 @@ def get_available_cubin_files(
     return tuple()
 
 
+@dataclass(frozen=True)
 class ArtifactPath:
+    """
+    This class is used to store the paths of the cubin files in artifactory.
+    The paths are generated in cubin publishing script logs (accessible by codeowners).
+    When compiling new cubins for backend directories, update the corresponding path.
+    """
+
     TRTLLM_GEN_FMHA: str = "463def7494c9fc6792b5aa5b5beef34025e247ac/fmha/trtllm-gen/"
     TRTLLM_GEN_BMM: str = (
         "56fea80cb22f8b2ef2a2c6a822a075fb20b36803/batched_gemm-074aec4-cc00b23"
@@ -106,6 +113,12 @@ class MetaInfoHash:
 
 
 class CheckSumHash:
+    """
+    This class is used to store the checksums of the cubin files in artifactory.
+    The sha256 hashes are generated in cubin publishing script logs (accessible by codeowners).
+    When updating the ArtifactPath for backend directories, update the corresponding hash.
+    """
+
     TRTLLM_GEN_FMHA: str = (
         "639c534614e9fdf5a9cfa91f7ea8f53989613019c0e1f8b755f461e1fcc7546f"
     )
