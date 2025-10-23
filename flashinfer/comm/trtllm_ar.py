@@ -753,7 +753,7 @@ def trtllm_custom_all_reduce(
 # Heuristics based on all configs of trtllm_allreduce_fusion on B200.
 # Empirically, the fusion pattern and fp32_acc are irrelevant to the decision.
 _use_oneshot_heuristics: dict[int, int] = {
-    2: 2048,
+    2: 512,
     4: 64,
     8: 42,
 }
