@@ -29,6 +29,7 @@ from .core import (
     trtllm_fp4_block_scale_routed_moe,
     trtllm_fp8_block_scale_moe,
     trtllm_fp8_per_tensor_scale_moe,
+    trtllm_bf16_moe,
 )
 
 __all__ = [
@@ -40,8 +41,11 @@ __all__ = [
     "gen_cutlass_fused_moe_sm120_module",
     "gen_cutlass_fused_moe_sm100_module",
     "gen_cutlass_fused_moe_sm90_module",
+    "gen_trtllm_gen_fused_moe_sm100_module",
     "reorder_rows_for_gated_act_gemm",
+    "trtllm_bf16_moe",
     "trtllm_fp4_block_scale_moe",
+    "trtllm_fp4_block_scale_routed_moe",
     "trtllm_fp8_block_scale_moe",
     "trtllm_fp8_per_tensor_scale_moe",
 ]

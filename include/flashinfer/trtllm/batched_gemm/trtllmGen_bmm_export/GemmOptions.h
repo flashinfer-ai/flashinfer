@@ -377,6 +377,7 @@ struct GemmConfig {
   char const* mHash{nullptr};
 #else
   trtllm::gen::CudaRunner* mCudaRunner{nullptr};
+  int32_t mInstanceIdx{0};
 #endif
 
   GemmOptions mOptions{};
