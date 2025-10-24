@@ -1871,7 +1871,6 @@ def _auto_gemm_fp4_requirement(
             checker, "is_compute_capability_supported"
         ) and checker.is_compute_capability_supported(cc_arch):
             # At least one backend is supported
-            print(f"Backend {candidate} is supported on this device.")
             return True
 
     # No backend is supported on this device
@@ -1978,8 +1977,9 @@ def mm_fp4(
     if backend == "auto":
         cuda_major, _ = get_cuda_version(a.device)
         cc_major, cc_minor = get_compute_capability(a.device)
-        # If cuda version is 13 or greater AND cudnn version is 9.X or greater, prioritize cudnn.
-        if cuda_major >= 13:  # to-do add cudnn version threshold
+        # If cuda version is 13 or greater:
+        # cudnn is more performant if cudnn version is 9.14 or greater.
+        if cuda_major >= 13 and cudnn.backend_version() >= 91400:
             candidate_backends = ("cudnn", "cutlass")
         # Otherwise, prioritize cutlass
         else:
@@ -2010,11 +2010,7 @@ def mm_fp4(
                 supported_backends.append(candidate)
             except Exception:
                 pass
-        print(f"Supported backends: {supported_backends}")
         selected_backend = supported_backends[0]
-        print(
-            f"Selected backend: {selected_backend} for cuda version {cuda_major} and compute capability {cc_major}{cc_minor}"
-        )
     else:
         selected_backend = backend
     if selected_backend == "cudnn":
