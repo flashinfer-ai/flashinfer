@@ -47,10 +47,10 @@ void fp4_quantize(TensorView self, Optional<TensorView> const& globalScale, Tens
 
   float* globalScalePtr{nullptr};
   if (globalScale.has_value()) {
-    globalScalePtr = static_cast<float*>(globalScale.value()->data);
+    globalScalePtr = static_cast<float*>(globalScale.value().data_ptr());
   }
 
-  auto const& inputShape = self.shape();
+  auto const& inputShape = self.sizes();
   auto const& rank = inputShape.size();
 
   TVM_FFI_ICHECK_GE(rank, 2) << "Input should be >=2D tensor.";
@@ -68,23 +68,24 @@ void fp4_quantize(TensorView self, Optional<TensorView> const& globalScale, Tens
                                                : tensorrt_llm::QuantizationSFLayout::SWIZZLED_128x4)
                               : tensorrt_llm::QuantizationSFLayout::LINEAR;
 
-#define LAUNCH_FP4_QUANTIZE_KERNEL(T, SF_VEC_SIZE)                                               \
-  tensorrt_llm::kernels::invokeFP4Quantization<T, SF_VEC_SIZE>(                                  \
-      1, m, k, reinterpret_cast<T*>(self->data), globalScalePtr,                                 \
-      reinterpret_cast<int64_t*>(valueE2M1->data), reinterpret_cast<int32_t*>(scaleFP8SF->data), \
-      sfUseUE8M0, layout, mMultiProcessorCount, enable_pdl, get_stream(self->device));
+#define LAUNCH_FP4_QUANTIZE_KERNEL(T, SF_VEC_SIZE)                                                 \
+  tensorrt_llm::kernels::invokeFP4Quantization<T, SF_VEC_SIZE>(                                    \
+      1, m, k, reinterpret_cast<T*>(self.data_ptr()), globalScalePtr,                              \
+      reinterpret_cast<int64_t*>(valueE2M1.data_ptr()),                                            \
+      reinterpret_cast<int32_t*>(scaleFP8SF.data_ptr()), sfUseUE8M0, layout, mMultiProcessorCount, \
+      enable_pdl, get_stream(self.device()));
 
   if (sfUseUE8M0) {
-    if (self->dtype == dl_float16) {
+    if (self.dtype() == dl_float16) {
       LAUNCH_FP4_QUANTIZE_KERNEL(half, 32)
-    } else if (self->dtype == dl_bfloat16) {
+    } else if (self.dtype() == dl_bfloat16) {
 #ifdef ENABLE_BF16
       LAUNCH_FP4_QUANTIZE_KERNEL(__nv_bfloat16, 32)
 #else
       TVM_FFI_LOG_AND_THROW(NotImplementedError)
           << "BFloat16 must be enabled to quantize an bf16 tensor to fp4.";
 #endif
-    } else if (self->dtype == dl_float8_e4m3fn) {
+    } else if (self.dtype() == dl_float8_e4m3fn) {
 #ifdef ENABLE_FP8
       LAUNCH_FP4_QUANTIZE_KERNEL(__nv_fp8_e4m3, 32)
 #else
@@ -96,16 +97,16 @@ void fp4_quantize(TensorView self, Optional<TensorView> const& globalScale, Tens
           << "fp4_quantize only supports input tensor with dtypes fp16/bf16/e4m3.";
     }
   } else {
-    if (self->dtype == dl_float16) {
+    if (self.dtype() == dl_float16) {
       LAUNCH_FP4_QUANTIZE_KERNEL(half, 16)
-    } else if (self->dtype == dl_bfloat16) {
+    } else if (self.dtype() == dl_bfloat16) {
 #ifdef ENABLE_BF16
       LAUNCH_FP4_QUANTIZE_KERNEL(__nv_bfloat16, 16)
 #else
       TVM_FFI_LOG_AND_THROW(NotImplementedError)
           << "BFloat16 must be enabled to quantize an bf16 tensor to fp4.";
 #endif
-    } else if (self->dtype == dl_float8_e4m3fn) {
+    } else if (self.dtype() == dl_float8_e4m3fn) {
 #ifdef ENABLE_FP8
       LAUNCH_FP4_QUANTIZE_KERNEL(__nv_fp8_e4m3, 16)
 #else
@@ -138,7 +139,7 @@ void fp4_batched_quantize(Tensor self, Tensor globalScale, Tensor valueE2M1, Ten
   CHECK_INPUT_TYPE(globalScale, fp32_dtype);
   TVM_FFI_ICHECK_EQ(sfVecSize, 16) << "sfVecSize can only be 16";
 
-  auto const& inputShape = self.shape();
+  auto const& inputShape = self.sizes();
   auto const& rank = inputShape.size();
 
   TVM_FFI_ICHECK_EQ(rank, 3) << "Input should be 3D tensor.";
@@ -155,22 +156,23 @@ void fp4_batched_quantize(Tensor self, Tensor globalScale, Tensor valueE2M1, Ten
   const thread_local int mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
   auto layout = tensorrt_llm::QuantizationSFLayout::SWIZZLED_128x4;
 
-#define LAUNCH_FP4_QUANTIZE_KERNEL(T, SF_VEC_SIZE)                                               \
-  tensorrt_llm::kernels::invokeFP4Quantization<T, SF_VEC_SIZE>(                                  \
-      b, m, k, reinterpret_cast<T*>(self->data), static_cast<float*>(globalScale->data),         \
-      reinterpret_cast<int64_t*>(valueE2M1->data), reinterpret_cast<int32_t*>(scaleFP8SF->data), \
-      sfUseUE8M0, layout, mMultiProcessorCount, /*enable_pdl=*/false, get_stream(self->device));
+#define LAUNCH_FP4_QUANTIZE_KERNEL(T, SF_VEC_SIZE)                                                 \
+  tensorrt_llm::kernels::invokeFP4Quantization<T, SF_VEC_SIZE>(                                    \
+      b, m, k, reinterpret_cast<T*>(self.data_ptr()), static_cast<float*>(globalScale.data_ptr()), \
+      reinterpret_cast<int64_t*>(valueE2M1.data_ptr()),                                            \
+      reinterpret_cast<int32_t*>(scaleFP8SF.data_ptr()), sfUseUE8M0, layout, mMultiProcessorCount, \
+      /*enable_pdl=*/false, get_stream(self.device()));
 
-  if (self->dtype == dl_float16) {
+  if (self.dtype() == dl_float16) {
     LAUNCH_FP4_QUANTIZE_KERNEL(half, 16)
-  } else if (self->dtype == dl_bfloat16) {
+  } else if (self.dtype() == dl_bfloat16) {
 #ifdef ENABLE_BF16
     LAUNCH_FP4_QUANTIZE_KERNEL(__nv_bfloat16, 16)
 #else
     TVM_FFI_LOG_AND_THROW(NotImplementedError)
         << "BFloat16 must be enabled to quantize an bf16 tensor to fp4.";
 #endif
-  } else if (self->dtype == dl_float8_e4m3fn) {
+  } else if (self.dtype() == dl_float8_e4m3fn) {
 #ifdef ENABLE_FP8
     LAUNCH_FP4_QUANTIZE_KERNEL(__nv_fp8_e4m3, 16)
 #else
@@ -234,16 +236,16 @@ void silu_and_mul_scaled_nvfp4_experts_quantize(Tensor output, Tensor output_sca
   // 4 means 4 fp8 values are packed into one int32
   TVM_FFI_ICHECK_EQ(output_scale.shape()[1] * 4, padded_k);
 
-  auto in_dtype = input->dtype;
-  const cudaStream_t stream = get_stream(input->device);
+  auto in_dtype = input.dtype();
+  const cudaStream_t stream = get_stream(input.device());
   if (in_dtype == dl_float16) {
     tensorrt_llm::kernels::invokeSiluAndMulNVFP4Quantization<half>(
-        output->data, output_scale->data, input->data, input_global_scale->data, mask->data,
-        use_silu_and_mul, m_topk, k, n_experts, stream);
+        output.data_ptr(), output_scale.data_ptr(), input.data_ptr(), input_global_scale.data_ptr(),
+        mask.data_ptr(), use_silu_and_mul, m_topk, k, n_experts, stream);
   } else if (in_dtype == dl_bfloat16) {
     tensorrt_llm::kernels::invokeSiluAndMulNVFP4Quantization<__nv_bfloat16>(
-        output->data, output_scale->data, input->data, input_global_scale->data, mask->data,
-        use_silu_and_mul, m_topk, k, n_experts, stream);
+        output.data_ptr(), output_scale.data_ptr(), input.data_ptr(), input_global_scale.data_ptr(),
+        mask.data_ptr(), use_silu_and_mul, m_topk, k, n_experts, stream);
   } else {
     TVM_FFI_LOG_AND_THROW(NotImplementedError) << "silu_and_mul_scaled_nvfp4_experts_quantize only "
                                                   "supports input tensor with dtypes fp16/bf16.";

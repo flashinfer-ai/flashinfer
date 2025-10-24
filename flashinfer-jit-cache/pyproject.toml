@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=77", "packaging>=24", "wheel", "torch", "ninja", "requests", "numpy", "nvidia-ml-py", "nvidia-nvshmem-cu12", "apache-tvm-ffi==0.1.0b15"]
+requires = ["setuptools>=77", "packaging>=24", "wheel", "torch", "ninja", "requests", "numpy", "nvidia-ml-py", "nvidia-nvshmem-cu12", "apache-tvm-ffi>=0.1,<0.2"]
 build-backend = "build_backend"
 backend-path = ["."]
 

@@ -221,35 +221,35 @@ constexpr DLDevice cpu = DLDevice{kDLCPU, 0};
 
 inline void check_shape(const tvm::ffi::Tensor& a, const tvm::ffi::Tensor& b, const char* a_name,
                         const char* b_name) {
-  TVM_FFI_ICHECK_EQ(a->ndim, b->ndim) << a_name << "->ndim and " << b_name << "->ndim mismatch";
-  for (int i = 0; i < a->ndim; ++i) {
-    TVM_FFI_ICHECK_EQ(a->shape[i], b->shape[i])
-        << a_name << "->shape[" << i << "] and " << b_name << "->shape[" << i << "] mismatch";
+  TVM_FFI_ICHECK_EQ(a.ndim(), b.ndim()) << a_name << ".ndim() and " << b_name << ".ndim() mismatch";
+  for (int i = 0; i < a.ndim(); ++i) {
+    TVM_FFI_ICHECK_EQ(a.size(i), b.size(i))
+        << a_name << ".size(" << i << ") and " << b_name << ".size(" << i << ") mismatch";
   }
 }
 
 inline void check_shape(const tvm::ffi::TensorView& a, const tvm::ffi::TensorView& b,
                         const char* a_name, const char* b_name) {
-  TVM_FFI_ICHECK_EQ(a->ndim, b->ndim) << a_name << "->ndim and " << b_name << "->ndim mismatch";
-  for (int i = 0; i < a->ndim; ++i) {
-    TVM_FFI_ICHECK_EQ(a->shape[i], b->shape[i])
-        << a_name << "->shape[" << i << "] and " << b_name << "->shape[" << i << "] mismatch";
+  TVM_FFI_ICHECK_EQ(a.ndim(), b.ndim()) << a_name << ".ndim() and " << b_name << ".ndim() mismatch";
+  for (int i = 0; i < a.ndim(); ++i) {
+    TVM_FFI_ICHECK_EQ(a.size(i), b.size(i))
+        << a_name << ".size(" << i << ") and " << b_name << ".size(" << i << ") mismatch";
   }
 }
 
 #define CHECK_CUDA(x) \
-  TVM_FFI_ICHECK_EQ(x->device.device_type, kDLCUDA) << #x " must be a CUDA tensor";
+  TVM_FFI_ICHECK_EQ(x.device().device_type, kDLCUDA) << #x " must be a CUDA tensor";
 #define CHECK_CPU(x) \
-  TVM_FFI_ICHECK_EQ(x->device.device_type, kDLCPU) << #x " must be a host tensor";
+  TVM_FFI_ICHECK_EQ(x.device().device_type, kDLCPU) << #x " must be a host tensor";
 #define CHECK_CONTIGUOUS(x) TVM_FFI_ICHECK(x.IsContiguous()) << #x " must be contiguous";
-#define CHECK_LAST_DIM_CONTIGUOUS(x)            \
-  TVM_FFI_ICHECK_EQ(x->strides[x->ndim - 1], 1) \
+#define CHECK_LAST_DIM_CONTIGUOUS(x) \
+  TVM_FFI_ICHECK_EQ(x.stride(-1), 1) \
   #x "must be contiguous at last dimension";
 #define CHECK_INPUT(x) \
   CHECK_CUDA(x);       \
   CHECK_CONTIGUOUS(x)
 #define CHECK_INPUT_TYPE(x, st) \
-  TVM_FFI_ICHECK_EQ(x->dtype, st) << "Inconsistency of Tensor type: " #x;
+  TVM_FFI_ICHECK_EQ(x.dtype(), st) << "Inconsistency of Tensor type: " #x;
 #define CHECK_INPUT_AND_TYPE(x, st) \
   CHECK_CUDA(x);                    \
   CHECK_CONTIGUOUS(x);              \
@@ -257,11 +257,11 @@ inline void check_shape(const tvm::ffi::TensorView& a, const tvm::ffi::TensorVie
 #define CHECK_LAST_DIM_CONTIGUOUS_INPUT(x) \
   CHECK_CUDA(x);                           \
   CHECK_LAST_DIM_CONTIGUOUS(x)
-#define CHECK_DIM(d, x) TVM_FFI_ICHECK_EQ(x->ndim, d) << #x " must be a " #d "D tensor";
+#define CHECK_DIM(d, x) TVM_FFI_ICHECK_EQ(x.ndim(), d) << #x " must be a " #d "D tensor";
 #define CHECK_SHAPE(a, b) check_shape(a, b, #a, #b)
-#define CHECK_DEVICE(a, b)                                         \
-  TVM_FFI_ICHECK_EQ(a->device.device_type, b->device.device_type); \
-  TVM_FFI_ICHECK_EQ(a->device.device_id, b->device.device_id);
+#define CHECK_DEVICE(a, b)                                           \
+  TVM_FFI_ICHECK_EQ(a.device().device_type, b.device().device_type); \
+  TVM_FFI_ICHECK_EQ(a.device().device_id, b.device().device_id);
 
 inline cudaStream_t get_current_stream() {
   int device;
@@ -273,10 +273,12 @@ inline cudaStream_t get_stream(DLDevice device) {
   return static_cast<cudaStream_t>(TVMFFIEnvGetStream(device.device_type, device.device_id));
 }
 
-inline int64_t get_element_size(ffi::Tensor x) { return (x->dtype.bits * x->dtype.lanes) / 8; }
+inline int64_t get_element_size(ffi::Tensor x) { return (x.dtype().bits * x.dtype().lanes) / 8; }
 
-inline int64_t get_element_size(ffi::TensorView x) { return (x->dtype.bits * x->dtype.lanes) / 8; }
+inline int64_t get_element_size(ffi::TensorView x) {
+  return (x.dtype().bits * x.dtype().lanes) / 8;
+}
 
 inline ffi::Tensor alloc_tensor(tvm::ffi::Shape shape, DLDataType dtype, DLDevice device) {
-  return ffi::Tensor::FromDLPackAlloc(TVMFFIEnvGetTensorAllocator(), shape, dtype, device);
+  return ffi::Tensor::FromEnvAlloc(TVMFFIEnvTensorAlloc, shape, dtype, device);
 }

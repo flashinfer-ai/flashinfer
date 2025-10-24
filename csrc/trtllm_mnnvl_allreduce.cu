@@ -30,13 +30,13 @@ void trtllm_mnnvl_all_reduce(TensorView in, int64_t multicast_buffer_ptr, int64_
                              int64_t buffer_M, TensorView buffer_flags_mnnvl, int64_t nranks,
                              int64_t rank, bool wait_for_results, bool launch_with_pdl,
                              Optional<TensorView> out) {
-  cudaSetDevice(in->device.device_id);
-  auto stream = get_stream(in->device);
+  cudaSetDevice(in.device().device_id);
+  auto stream = get_stream(in.device());
 
-  DISPATCH_FLOATING_TYPES_FOR_MNNVL_ALLREDUCE(in->dtype, c_type, [&] {
+  DISPATCH_FLOATING_TYPES_FOR_MNNVL_ALLREDUCE(in.dtype(), c_type, [&] {
     // Extract parameters from tensors
-    int64_t num_tokens = in->shape[0];
-    int64_t token_dim = in->shape[1];
+    int64_t num_tokens = in.size(0);
+    int64_t token_dim = in.size(1);
 
     // Validate input parameters
     TVM_FFI_ICHECK_EQ(token_dim % (sizeof(float2) / sizeof(c_type)), 0)
@@ -57,11 +57,11 @@ void trtllm_mnnvl_all_reduce(TensorView in, int64_t multicast_buffer_ptr, int64_
     params.token_dim = token_dim;
     params.buffer_ptrs_dev = reinterpret_cast<void**>(buffer_ptrs_dev);
     params.multicast_ptr = reinterpret_cast<void*>(multicast_buffer_ptr);
-    params.buffer_flags = buffer_flags_mnnvl->data;
+    params.buffer_flags = buffer_flags_mnnvl.data_ptr();
     params.wait_for_results = wait_for_results;
     params.launch_with_pdl = launch_with_pdl;
-    params.input = in->data;
-    params.output = out.has_value() ? out.value()->data : nullptr;
+    params.input = in.data_ptr();
+    params.output = out.has_value() ? out.value().data_ptr() : nullptr;
     params.stream = stream;
 
     auto status = twoshot_allreduce_dispatch_world_size<c_type>(params);
@@ -74,21 +74,21 @@ void trtllm_mnnvl_all_reduce(TensorView in, int64_t multicast_buffer_ptr, int64_
 void trtllm_mnnvl_rmsnorm(int64_t multicast_buffer_ptr, TensorView prenorm_output,
                           TensorView normed_output, TensorView gamma, double epsilon,
                           TensorView residual, TensorView buffer_flags, bool launch_with_pdl) {
-  cudaSetDevice(prenorm_output->device.device_id);
-  auto stream = get_stream(prenorm_output->device);
+  cudaSetDevice(prenorm_output.device().device_id);
+  auto stream = get_stream(prenorm_output.device());
 
-  DISPATCH_FLOATING_TYPES_FOR_MNNVL_ALLREDUCE(prenorm_output->dtype, c_type, [&] {
+  DISPATCH_FLOATING_TYPES_FOR_MNNVL_ALLREDUCE(prenorm_output.dtype(), c_type, [&] {
     // Create the parameters struct
     RMSNormParams<c_type> params;
-    params.residual_output = prenorm_output->data;
-    params.output = normed_output->data;
+    params.residual_output = prenorm_output.data_ptr();
+    params.output = normed_output.data_ptr();
     params.input = reinterpret_cast<void const*>(multicast_buffer_ptr);
-    params.gamma = gamma->data;
+    params.gamma = gamma.data_ptr();
     params.epsilon = epsilon;
-    params.residual = residual->data;
-    params.buffer_flags = reinterpret_cast<uint32_t*>(buffer_flags->data);
-    params.batch = normed_output->shape[0];
-    params.hidden_dim = normed_output->shape[1];
+    params.residual = residual.data_ptr();
+    params.buffer_flags = reinterpret_cast<uint32_t*>(buffer_flags.data_ptr());
+    params.batch = normed_output.size(0);
+    params.hidden_dim = normed_output.size(1);
     params.stream = stream;
     params.launch_with_pdl = launch_with_pdl;
     auto status = twoshot_rmsnorm_dispatch_hidden_dim<c_type>(params);
