@@ -750,6 +750,7 @@ def trtllm_custom_all_reduce(
         lamport_peer_comm_buffer_ptrs_2,
     )
 
+
 # Heuristics based on all configs of trtllm_allreduce_fusion on B200.
 # Empirically, the fusion pattern and fp32_acc are irrelevant to the decision.
 _use_oneshot_heuristics: dict[int, int] = {
@@ -758,8 +759,13 @@ _use_oneshot_heuristics: dict[int, int] = {
     8: 42,
 }
 
-def _should_use_oneshot(token_num: int, hidden_dim: int, dtype: torch.dtype, world_size: int) -> bool:
-    comm_size_mb = token_num * hidden_dim * 2 * world_size * dtype.itemsize / 1024 / 1024
+
+def _should_use_oneshot(
+    token_num: int, hidden_dim: int, dtype: torch.dtype, world_size: int
+) -> bool:
+    comm_size_mb = (
+        token_num * hidden_dim * 2 * world_size * dtype.itemsize / 1024 / 1024
+    )
     return comm_size_mb <= _use_oneshot_heuristics[world_size]
 
 
@@ -795,7 +801,7 @@ def trtllm_allreduce_fusion(
     - hidden_dim: the dimension of the hidden states.
     - workspace_ptrs: the workspace pointers.
     - launch_with_pdl: whether to launch with pdl.
-    - use_oneshot: whether to use oneshot. If None, internal heuristics will be used. 
+    - use_oneshot: whether to use oneshot. If None, internal heuristics will be used.
     - trigger_completion_at_end: whether to trigger completion at the end.
     - fp32_acc: whether to use fp32 accumulation.
     - pattern_code: the pattern code.
@@ -812,7 +818,9 @@ def trtllm_allreduce_fusion(
     """
 
     if use_oneshot is None:
-        use_oneshot = _should_use_oneshot(token_num, hidden_dim, allreduce_in.dtype, world_size)
+        use_oneshot = _should_use_oneshot(
+            token_num, hidden_dim, allreduce_in.dtype, world_size
+        )
 
     if not use_oneshot:
         assert token_num > world_size, "sequence length should be larger than tp_size"
