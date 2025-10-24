@@ -17,7 +17,7 @@ limitations under the License.
 import functools
 from enum import Enum
 from types import SimpleNamespace
-from typing import List, Literal, Optional, Tuple
+from typing import List, Literal, Optional, Tuple, cast
 
 from flashinfer.trtllm_low_latency_gemm import trtllm_low_latency_gemm
 import torch
@@ -1691,7 +1691,7 @@ def _check_mm_fp4_problem_size(
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
     use_8x4_sf_layout: bool = False,
-    backend: Literal["cudnn", "trtllm", "cutlass"] = "cudnn",
+    backend: Literal["cudnn", "trtllm", "cutlass", "auto"] = "auto",
     use_nvfp4: bool = True,
 ):
     # Generic checks
@@ -1731,8 +1731,8 @@ def _check_mm_fp4_problem_size(
 
     if backend != "trtllm" and use_8x4_sf_layout:
         raise ValueError("Only TRTLLM FP4 GEMM supports 8x4 scale factor layout.")
-    if backend != "cudnn" and not use_nvfp4:
-        raise ValueError("Only cudnn FP4 GEMM supports mxfp4 quantization.")
+    if backend not in ["cudnn", "auto"] and not use_nvfp4:
+        raise ValueError("Only cudnn and auto FP4 GEMM supports mxfp4 quantization.")
 
     if use_nvfp4 and block_size != 16:
         raise ValueError("nvfp4 only supports block_size = 16.")
@@ -1753,7 +1753,7 @@ def _cudnn_gemm_fp4_requirement(
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
     use_8x4_sf_layout: bool = False,
-    backend: Literal["cudnn", "trtllm", "cutlass"] = "cudnn",
+    backend: Literal["cudnn", "trtllm", "cutlass", "auto"] = "auto",
     use_nvfp4: bool = True,
 ):
     if (
@@ -1811,7 +1811,7 @@ def _trtllm_gemm_fp4_requirement(
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
     use_8x4_sf_layout: bool = False,
-    backend: Literal["cudnn", "trtllm", "cutlass"] = "cudnn",
+    backend: Literal["cudnn", "trtllm", "cutlass", "auto"] = "auto",
     use_nvfp4: bool = True,
 ):
     if out_dtype != torch.bfloat16:
@@ -1833,10 +1833,49 @@ def _cutlass_gemm_fp4_requirement(
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
     use_8x4_sf_layout: bool = False,
-    backend: Literal["cudnn", "trtllm", "cutlass"] = "cudnn",
+    backend: Literal["cudnn", "trtllm", "cutlass", "auto"] = "auto",
     use_nvfp4: bool = True,
 ):
     return True
+
+
+@supported_compute_capability([100, 103, 110, 120])
+def _auto_gemm_fp4_requirement(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_descale: torch.Tensor,
+    b_descale: torch.Tensor,
+    alpha: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    out: Optional[torch.Tensor] = None,
+    block_size: int = 16,
+    use_8x4_sf_layout: bool = False,
+    backend: Literal["cudnn", "trtllm", "cutlass", "auto"] = "auto",
+    use_nvfp4: bool = True,
+):
+    # Auto backend requires at least one backend to be supported on the current device
+    cc_major, cc_minor = get_compute_capability(a.device)
+    cc_arch = cc_major * 10 + cc_minor
+
+    # Check if at least one backend is supported for this compute capability
+    candidate_backends = ["cudnn", "cutlass", "trtllm"]
+    backend_checkers = {
+        "cudnn": _cudnn_gemm_fp4_requirement,
+        "cutlass": _cutlass_gemm_fp4_requirement,
+        # Does not consider trtllm due to different interface.
+    }
+
+    for candidate in candidate_backends:
+        checker = backend_checkers[candidate]
+        if hasattr(
+            checker, "is_compute_capability_supported"
+        ) and checker.is_compute_capability_supported(cc_arch):
+            # At least one backend is supported
+            print(f"Backend {candidate} is supported on this device.")
+            return True
+
+    # No backend is supported on this device
+    return False
 
 
 @backend_requirement(
@@ -1844,6 +1883,7 @@ def _cutlass_gemm_fp4_requirement(
         "cudnn": _cudnn_gemm_fp4_requirement,  # Each backend has its own requirement function
         "trtllm": _trtllm_gemm_fp4_requirement,
         "cutlass": _cutlass_gemm_fp4_requirement,
+        "auto": _auto_gemm_fp4_requirement,  # Auto backend requires at least one backend to be supported on the current device
     },
     common_check=_check_mm_fp4_problem_size,  # Shape checks common to all backends
 )
@@ -1938,22 +1978,40 @@ def mm_fp4(
     if backend == "auto":
         cuda_major, _ = get_cuda_version(a.device)
         cc_major, cc_minor = get_compute_capability(a.device)
-        cc_arch = cc_major * 10 + cc_minor
         # If cuda version is 13 or greater AND cudnn version is 9.X or greater, prioritize cudnn.
         if cuda_major >= 13:  # to-do add cudnn version threshold
-            candidate_backends = ["cudnn", "cutlass"]
+            candidate_backends = ("cudnn", "cutlass")
         # Otherwise, prioritize cutlass
         else:
-            candidate_backends = ["cutlass", "cudnn"]
+            candidate_backends = ("cutlass", "cudnn")
 
-        # Support check
-        backends_to_delete = []
-        for candidate_backend in candidate_backends:
-            if not mm_fp4.is_backend_supported(candidate_backend, cc_arch):
-                backends_to_delete.append(candidate_backend)
-        for backend_to_delete in backends_to_delete:
-            candidate_backends.remove(backend_to_delete)
-        selected_backend = candidate_backends[0]
+        # Filter to only supported backends for this compute capability
+        # Note: The requirement function already validated that at least one backend is supported
+        supported_backends = []
+        for candidate in candidate_backends:
+            # mypy requires explicit type casting for the backend literal
+            backend_literal = cast(
+                Literal["cudnn", "trtllm", "cutlass", "auto"], candidate
+            )
+            try:
+                _check_mm_fp4_problem_size(
+                    a,
+                    b,
+                    a_descale,
+                    b_descale,
+                    alpha,
+                    out_dtype,
+                    out,
+                    block_size,
+                    use_8x4_sf_layout,
+                    backend_literal,
+                    use_nvfp4,
+                )
+                supported_backends.append(candidate)
+            except Exception:
+                pass
+        print(f"Supported backends: {supported_backends}")
+        selected_backend = supported_backends[0]
         print(
             f"Selected backend: {selected_backend} for cuda version {cuda_major} and compute capability {cc_major}{cc_minor}"
         )

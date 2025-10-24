@@ -241,10 +241,10 @@ routine_cc_to_supported_backends = {
         "8.6": [],
         "8.9": [],
         "9.0": [],
-        "10.0": ["cudnn", "trtllm", "cutlass"],
-        "10.3": ["cudnn", "trtllm", "cutlass"],
-        "12.0": ["cudnn", "cutlass"],
-        "12.1": ["cudnn", "cutlass"],
+        "10.0": ["cudnn", "trtllm", "cutlass", "auto"],
+        "10.3": ["cudnn", "trtllm", "cutlass", "auto"],
+        "12.0": ["cudnn", "cutlass", "auto"],
+        "12.1": ["cudnn", "cutlass", "auto"],
     },
     # MOE
     "trtllm_fp4_block_scale_moe": {
