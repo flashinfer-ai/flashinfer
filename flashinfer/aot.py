@@ -556,7 +556,9 @@ def gen_all_modules(
         if has_sm90:
             jit_specs.append(gen_trtllm_utils_module())
 
-    if add_xqa:
+    if (
+        add_xqa and get_cuda_version() > Version("12.8")
+    ):  # TODO: Earlier cuda versions have compile issues, will be fixed in future releases
         # Define XQA configurations to iterate over
         xqa_fp16_input_ = [True, False]  # fp16 and bf16
         xqa_fp8_kv_cache_ = [True, False]
