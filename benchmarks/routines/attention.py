@@ -451,6 +451,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 page_size,
                 q_data_type=q_dtype,
                 data_type=kv_dtype,
+                block_tables=block_tables,
             )
 
     ## If FP8, prepare
@@ -915,6 +916,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 causal=causal,
                 q_data_type=q_dtype,
                 kv_data_type=kv_dtype,
+                block_tables=block_tables,
             )
 
     k_scale, v_scale = None, None
@@ -1782,7 +1784,12 @@ def testBatchMLAPagedAttentionWrapper(args):
     def run_backend_wrapper(backend):
         if backend in ["fa2", "fa3"]:
             return backend_wrappers[backend].run(
-                q_nope, q_pe, ckv_cache, kpe_cache, return_lse=False
+                q_nope,
+                q_pe,
+                ckv_cache,
+                kpe_cache,
+                page_table=block_tables,
+                return_lse=False,
             )
         elif backend == "cutlass":
             return backend_wrappers[backend].run(
