@@ -93,6 +93,10 @@ def _match_sm_version(device: torch.device, sm_version: list[str]):
     return device_arch in sm_version
 
 
+def get_cuda_version(device: torch.device):
+    return tuple(map(int, torch.version.cuda.split(".")))  # (major, minor)
+
+
 @functools.cache
 def get_gemm_module():
     module = gen_gemm_module().build_and_load()
@@ -1853,7 +1857,7 @@ def mm_fp4(
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
     use_8x4_sf_layout: bool = False,
-    backend: Literal["cudnn", "trtllm", "cutlass"] = "cudnn",
+    backend: Literal["cudnn", "trtllm", "cutlass", "auto"] = "auto",
     use_nvfp4: bool = True,
 ) -> torch.Tensor:
     r"""MM FP4
@@ -1887,8 +1891,8 @@ def mm_fp4(
     use_8x4_sf_layout: bool
         Whether to use 8x4 scale factor layout or 128x4 scale factor layout, defaults to False.
 
-    backend: Literal["cudnn", "trtllm", "cutlass"]
-        Backend to use, defaults to "cudnn".
+    backend: Literal["cudnn", "trtllm", "cutlass", "auto"]
+        Backend to use, defaults to "auto", which automatically selects the best backend between cudnn and cutlass.
 
     use_nvfp4: bool
         Whether to use nvfp4 quantization or mxfp4 quantization, defaults to False.
@@ -1930,7 +1934,32 @@ def mm_fp4(
         "mm_fp4_workspace", DEFAULT_WORKSPACE_SIZE, a.device
     )
 
-    if backend == "cudnn":
+    # Auto-select the best backend
+    if backend == "auto":
+        cuda_major, _ = get_cuda_version(a.device)
+        cc_major, cc_minor = get_compute_capability(a.device)
+        cc_arch = cc_major * 10 + cc_minor
+        # If cuda version is 13 or greater AND cudnn version is 9.X or greater, prioritize cudnn.
+        if cuda_major >= 13:  # to-do add cudnn version threshold
+            candidate_backends = ["cudnn", "cutlass"]
+        # Otherwise, prioritize cutlass
+        else:
+            candidate_backends = ["cutlass", "cudnn"]
+
+        # Support check
+        backends_to_delete = []
+        for candidate_backend in candidate_backends:
+            if not mm_fp4.is_backend_supported(candidate_backend, cc_arch):
+                backends_to_delete.append(candidate_backend)
+        for backend_to_delete in backends_to_delete:
+            candidate_backends.remove(backend_to_delete)
+        selected_backend = candidate_backends[0]
+        print(
+            f"Selected backend: {selected_backend} for cuda version {cuda_major} and compute capability {cc_major}{cc_minor}"
+        )
+    else:
+        selected_backend = backend
+    if selected_backend == "cudnn":
         # the fp4 cudnn graph will be shared for both mm and bmm, so
         # here we need to get the 3d shape and stride including the
         # batch dimension for both input and block scale tensors.
@@ -1966,7 +1995,7 @@ def mm_fp4(
         execute_cudnn_gemm_fp4_graph(
             graph, a, b, a_descale, b_descale, alpha, out, workspace_buffer
         )
-    elif backend == "trtllm":
+    elif selected_backend == "trtllm":
         get_trtllm_fp4_gemm_module().trtllm_fp4_gemm(
             a,
             b.T,
@@ -1977,7 +2006,7 @@ def mm_fp4(
             use_8x4_sf_layout=use_8x4_sf_layout,
             workspace_buffer=workspace_buffer,
         )
-    elif backend == "cutlass":
+    elif selected_backend == "cutlass":
         # cutlass require uint8 scale when a/b is fp4 packed uint8.
         if a.dtype == torch.uint8 and a_descale.dtype == torch.float8_e4m3fn:
             a_descale = a_descale.view(torch.uint8)
