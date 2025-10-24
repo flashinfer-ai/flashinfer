@@ -31,7 +31,13 @@
 #include "barriers.cuh"
 
 inline constexpr float log2e = 1.4426950408889634;  // std::log2(M_E)
-inline constexpr float safeInitRowMax = -1e+30F;
+// we used an optimization where exp(x-rowMax) is computed as:
+/*  bias = rowMax * log2e  // shared for the whole row
+    exp(x-rowMax) = exp2f(x * log2e - bias)
+*/
+// But this optimization is not numerically stable when (x * log2e - bias) is computed with FMA and
+// x is too large. For this reason, don't set safeInitRowMax with a huge absolute value.
+inline constexpr float safeInitRowMax = -1e+5F;
 inline constexpr int32_t kBAD_PAGE_INDEX = -1;
 __constant__ constexpr float kE4M3_MAX = 448.F;
 
@@ -40,7 +46,7 @@ __constant__ constexpr float kE4M3_MAX = 448.F;
 constexpr uint32_t kMAX_SMEM_SIZE = (99u << 10);
 #elif __CUDA_ARCH__ == 800 || __CUDA_ARCH__ == 870
 constexpr uint32_t kMAX_SMEM_SIZE = (163u << 10);
-#elif __CUDA_ARCH__ == 900
+#elif __CUDA_ARCH__ == 900 || __CUDA_ARCH__ == 1000
 constexpr uint32_t kMAX_SMEM_SIZE = (227u << 10);
 #endif
 #endif

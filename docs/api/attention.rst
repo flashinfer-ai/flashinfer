@@ -38,6 +38,16 @@ Batch Decoding
     .. automethod:: __init__
 
 
+XQA
+---
+
+.. currentmodule:: flashinfer.xqa
+
+.. autosummary::
+    :toctree: ../generated
+
+    xqa
+
 flashinfer.prefill
 ==================
 

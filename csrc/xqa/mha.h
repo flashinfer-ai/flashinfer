@@ -135,7 +135,12 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
 #if LOW_PREC_OUTPUT
                          float const* rcpOutScale,
 #endif
-                         InputHead const* q, float const* attentionSinks, GMemCacheHead* pool,
+                         InputHead const* q, float const* attentionSinks,
+#if PAGED_KV_CACHE_LAYOUT == 1
+                         GMemCacheHead* kCacheVLLM, GMemCacheHead* vCacheVLLM,
+#else
+                         GMemCacheHead* pool,
+#endif
                          KVCachePageIndex const* kvCachePageList, uint32_t maxSeqLen,
                          uint32_t const* seqLen, uint32_t batchSize,
                          float const* __restrict__ kvCacheScale,
@@ -186,18 +191,60 @@ void launchHopperF8MHA(
 #endif
     uint32_t* semaphores, void* scratch, cudaStream_t stream);
 
+void launchHopperF8MHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads,
+                                 uint32_t slidingWinSize, float qScale, OutputHead* output,
+#if LOW_PREC_OUTPUT
+                                 float const* rcpOutScale,
+#endif
+                                 InputHead const* q, float const* attentionSinks,
+#if PAGED_KV_CACHE_LAYOUT == 1
+                                 GMemCacheHead* kCacheVLLM, GMemCacheHead* vCacheVLLM,
+#else
+                                 GMemCacheHead* pool,
+#endif
+                                 KVCachePageIndex const* kvCachePageList, uint32_t maxSeqLen,
+                                 uint32_t const* seqLen, uint32_t batchSize,
+                                 float const* __restrict__ kvCacheScale,
+#if SPEC_DEC
+                                 uint32_t qSeqLen, uint32_t const* qCuSeqLens, MaskType const* mask,
+#endif
+                                 uint32_t* semaphores, void* scratch, cudaStream_t stream);
+
 void launchMLA(
     cudaDeviceProp const& prop,
     uint32_t inputSeqLen,  // uniform for all requests and causal mask is assumed
     float qScale, OutputHead* output, InputHead const* q,
 #if USE_PAGED_KV_CACHE
+#if PAGED_KV_CACHE_LAYOUT == 1
+    GMemCacheHead* kCacheVLLM, GMemCacheHead* vCacheVLLM,
+#else
     GMemCacheHead* pool,  // global pool of pages
+#endif
     KVCachePageIndex const*
         kvCachePageList,  // device pointer. shape:
-                          // KVCachePage[batchSize][beamWidth][2][maxNbPagesPerSeq]
+                          // KVCachePage[batchSize][beamWidth][2][maxNbPagesPerSeq] (Layout 0) or
+                          // [batchSize][maxNbPagesPerSeq] (Layout 1)
 #else
     GMemKVCacheHead* kvCacheData,
 #endif
+    uint32_t maxSeqLen, uint32_t const* seqLen, uint32_t batchSize,
+    float const* __restrict__ kvCacheScale,  // Device memory scalar. Same scale for K and V cache.
+                                             // Used only for int8/fp8 KV cache.
+    uint32_t* semaphores, void* scratch, cudaStream_t stream);
+
+void launchMLAFlashInfer(
+    uint32_t multiProcessorCount,
+    uint32_t inputSeqLen,  // uniform for all requests and causal mask is assumed
+    float qScale, OutputHead* output, InputHead const* q,
+#if PAGED_KV_CACHE_LAYOUT == 1
+    GMemCacheHead* kCacheVLLM, GMemCacheHead* vCacheVLLM,
+#else
+    GMemCacheHead* pool,  // global pool of pages
+#endif
+    KVCachePageIndex const*
+        kvCachePageList,  // device pointer. shape:
+                          // KVCachePage[batchSize][beamWidth][2][maxNbPagesPerSeq] (Layout 0) or
+                          // [batchSize][maxNbPagesPerSeq] (Layout 1)
     uint32_t maxSeqLen, uint32_t const* seqLen, uint32_t batchSize,
     float const* __restrict__ kvCacheScale,  // Device memory scalar. Same scale for K and V cache.
                                              // Used only for int8/fp8 KV cache.
