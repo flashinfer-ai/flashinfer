@@ -30,22 +30,23 @@ Array<int64_t> BatchMLAPagedAttentionSM90Plan(TensorView float_workspace_buffer,
                                               TensorView kv_len, int64_t num_heads,
                                               int64_t head_dim_o, bool causal) {
   size_t float_workspace_size_in_bytes =
-      float_workspace_buffer->shape[0] * get_element_size(float_workspace_buffer);
+      float_workspace_buffer.size(0) * get_element_size(float_workspace_buffer);
   size_t int_workspace_size_in_bytes =
-      int_workspace_buffer->shape[0] * get_element_size(int_workspace_buffer);
+      int_workspace_buffer.size(0) * get_element_size(int_workspace_buffer);
 
   MLAPlanInfo plan_info;
 
-  int batch_size = kv_len->shape[0];
+  int batch_size = kv_len.size(0);
 
-  cudaSetDevice(float_workspace_buffer->device.device_id);
-  const cudaStream_t stream = get_stream(float_workspace_buffer->device);
+  cudaSetDevice(float_workspace_buffer.device().device_id);
+  const cudaStream_t stream = get_stream(float_workspace_buffer.device());
 
-  cudaError_t status = MLAPlan(
-      float_workspace_buffer->data, float_workspace_size_in_bytes, int_workspace_buffer->data,
-      page_locked_int_workspace_buffer->data, int_workspace_size_in_bytes, plan_info,
-      static_cast<IdType*>(qo_indptr->data), static_cast<IdType*>(kv_indptr->data),
-      static_cast<IdType*>(kv_len->data), batch_size, num_heads, head_dim_o, causal, stream);
+  cudaError_t status =
+      MLAPlan(float_workspace_buffer.data_ptr(), float_workspace_size_in_bytes,
+              int_workspace_buffer.data_ptr(), page_locked_int_workspace_buffer.data_ptr(),
+              int_workspace_size_in_bytes, plan_info, static_cast<IdType*>(qo_indptr.data_ptr()),
+              static_cast<IdType*>(kv_indptr.data_ptr()), static_cast<IdType*>(kv_len.data_ptr()),
+              batch_size, num_heads, head_dim_o, causal, stream);
 
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "Failed to plan MLA, error: " << cudaGetErrorString(status);

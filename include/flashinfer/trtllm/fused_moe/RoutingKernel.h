@@ -56,15 +56,23 @@ struct DataBase {
   int32_t* mPtrPermutedIdxToTokenIdx{nullptr};
   // optional: if `nullptr`, it is not filled
   // dim: [mNumTokens, mTopK]
-  void* mPtrExpertWeights{nullptr};
+  // When mPtrTopKIds is provided, mPtrTopKWeights must be also provided as inputs.
+  // Otherwise, mPtrTopKWeights is the output scores of the topK experts.
+  void* mPtrTopKWeights{nullptr};
+  // optional: if `nullptr`, it is not filled
+  // dim: [mNumTokens, mTopK]
+  // mPtrTopKIds[i] is the index of the expert for the i-th token in the top-k experts
+  // Together with mPtrTopKWeights, they form the top-k experts for each token
+  int32_t* mPtrTopKIds{nullptr};
+
   // optional: if `nullptr`, scores are used directly as input.
   // If it is given, it must represent a packed value s.t. the most significant
   // 16/32 bits represent the score without sigmoid activation and
   // the least significant 16 bits represent the index of the chosen expert (unsigned).
   // note: this is required if the number of tokens is large.
   // dim: [mNumTokens, mTopK]
-  void* mPtrExpertIdx{nullptr};
-  // optional: if `nullptr`, `mPtrExpertIdx` must be provided.
+  void* mPtrTopKPacked{nullptr};
+  // optional: if `nullptr`, `mPtrTopKPacked` must be provided.
   // If it is given, it represents the scores without sigmoid activation for
   // each token and expert.
   // note: if it is provided, we always re-compute the top1 scores
@@ -92,10 +100,11 @@ struct DataBase {
   int32_t mNumLocalExperts;
 };
 
-template <typename InputT_, typename OutputT_, bool UsePdl_>
+template <typename InputT_, typename OutputT_, int MaxNumExperts_, bool UsePdl_>
 struct KernelParamsBase {
   using InputT = InputT_;
   using OutputT = OutputT_;
+  static constexpr int MaxNumExperts = MaxNumExperts_;
   static constexpr bool UsePdl = UsePdl_;
 
   // Public pointer members
@@ -106,7 +115,8 @@ struct KernelParamsBase {
   int32_t* mPtrCtaIdxXyToBatchIdx = nullptr;
   int32_t* mPtrCtaIdxXyToMnLimit = nullptr;
   int32_t* mPtrNumNonExitingCtas = nullptr;
-  OutputT* mPtrExpertWeights = nullptr;
+  OutputT* mPtrTopKWeights = nullptr;
+  int32_t* mPtrTopKIds = nullptr;
   InputT const* mPtrScores = nullptr;
 
   // Public scalar members
@@ -128,7 +138,8 @@ struct KernelParamsBase {
     mPtrCtaIdxXyToBatchIdx = data.mPtrCtaIdxXyToBatchIdx;
     mPtrCtaIdxXyToMnLimit = data.mPtrCtaIdxXyToMnLimit;
     mPtrNumNonExitingCtas = data.mPtrNumNonExitingCtas;
-    mPtrExpertWeights = static_cast<OutputT*>(data.mPtrExpertWeights);
+    mPtrTopKWeights = static_cast<OutputT*>(data.mPtrTopKWeights);
+    mPtrTopKIds = static_cast<int32_t*>(data.mPtrTopKIds);
     mPtrScores = (InputT const*)data.mPtrScores;
 
     mNumTokens = data.mNumTokens;
@@ -146,7 +157,8 @@ namespace routingDeepSeek {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 struct Data : public DataBase {
   tg::Dtype mDtypeExpW{tg::Dtype::Bfloat16};
-
+  tg::Dtype mDtypeBias{tg::Dtype::Bfloat16};
+  tg::Dtype mDtypeScore{tg::Dtype::Fp32};
   //
   // Grouped Gemm Launch Config Buffers
   //
@@ -160,20 +172,22 @@ struct Data : public DataBase {
   bool mUseRoutingSoftmax;
 };
 
-template <typename InputT_, typename OutputT_, bool UseGroups_, bool UsePdl_>
-struct KernelParams : public KernelParamsBase<InputT_, OutputT_, UsePdl_> {
+template <typename InputT_, typename BiasT_, typename OutputT_, int MaxNumExperts_, bool UseGroups_,
+          bool UsePdl_>
+struct KernelParams : public KernelParamsBase<InputT_, OutputT_, MaxNumExperts_, UsePdl_> {
   using InputT = InputT_;
+  using BiasT = BiasT_;
   using OutputT = OutputT_;
 
   static constexpr bool UseGroups = UseGroups_;
 
-  PackedScoreIdx<OutputT>* mPtrExpertIdx = nullptr;
+  PackedScoreIdx<OutputT>* mPtrTopKPacked = nullptr;
 
-  // OutputT* mPtrExpertWeightsFull = nullptr;
-  // Note: this variable(mPtrExpertWeightsFull) might need to be added back for the low-latency
+  // OutputT* mPtrTopKWeightsFull = nullptr;
+  // Note: this variable(mPtrTopKWeightsFull) might need to be added back for the low-latency
   // kernels for MoE in tllm-gen in the future
 
-  OutputT const* mPtrRoutingBias = nullptr;
+  BiasT const* mPtrRoutingBias = nullptr;
 
   int32_t mNumExpertGroups = 0;
   int32_t mNumExpertsPerGroup = 0;
@@ -186,10 +200,10 @@ struct KernelParams : public KernelParamsBase<InputT_, OutputT_, UsePdl_> {
     KernelParams params;
     params.setBaseParams(data);
 
-    params.mPtrExpertIdx = (PackedScoreIdx<OutputT>*)data.mPtrExpertIdx;
+    params.mPtrTopKPacked = (PackedScoreIdx<OutputT>*)data.mPtrTopKPacked;
 
-    // params.mPtrExpertWeightsFull = static_cast<OutputT*>(data.mPtrExpertWeightsFull);
-    params.mPtrRoutingBias = static_cast<OutputT const*>(data.mPtrRoutingBias);
+    // params.mPtrTopKWeightsFull = static_cast<OutputT*>(data.mPtrTopKWeightsFull);
+    params.mPtrRoutingBias = static_cast<BiasT const*>(data.mPtrRoutingBias);
 
     params.mNumExpertGroups = data.mNumExpertGroups;
     params.mNumExpertsPerGroup = data.mNumExperts / data.mNumExpertGroups;
@@ -215,12 +229,12 @@ struct Data : public DataBase {
   tg::Dtype mDtypeExpW{tg::Dtype::Bfloat16};
 };
 
-template <typename InputT_, typename OutputT_, bool UsePdl_>
-struct KernelParams : public KernelParamsBase<InputT_, OutputT_, UsePdl_> {
+template <typename InputT_, typename OutputT_, int MaxNumExperts_, bool UsePdl_>
+struct KernelParams : public KernelParamsBase<InputT_, OutputT_, MaxNumExperts_, UsePdl_> {
   using InputT = InputT_;
   using OutputT = OutputT_;
 
-  PackedScoreIdx<OutputT>* mPtrExpertIdx = nullptr;
+  PackedScoreIdx<OutputT>* mPtrTopKPacked = nullptr;
 
   int32_t mTopK;
 
@@ -228,7 +242,7 @@ struct KernelParams : public KernelParamsBase<InputT_, OutputT_, UsePdl_> {
     KernelParams params;
     params.setBaseParams(data);
 
-    params.mPtrExpertIdx = (PackedScoreIdx<OutputT>*)data.mPtrExpertIdx;
+    params.mPtrTopKPacked = (PackedScoreIdx<OutputT>*)data.mPtrTopKPacked;
     params.mTopK = data.mTopK;
     return params;
   }
@@ -253,14 +267,15 @@ struct Data : public DataBase {
   bool mApplySoftmaxAfterTopK{false};
 };
 
-template <typename InputT_, typename OutputT_, bool DoSoftmaxBeforeTopK_, bool UsePdl_>
-struct KernelParams : public KernelParamsBase<InputT_, OutputT_, UsePdl_> {
+template <typename InputT_, typename OutputT_, int MaxNumExperts_, bool DoSoftmaxBeforeTopK_,
+          bool UsePdl_>
+struct KernelParams : public KernelParamsBase<InputT_, OutputT_, MaxNumExperts_, UsePdl_> {
   using InputT = InputT_;
   using OutputT = OutputT_;
 
   static constexpr bool DoSoftmaxBeforeTopK = DoSoftmaxBeforeTopK_;
 
-  PackedScoreIdx<OutputT>* mPtrExpertIdx = nullptr;
+  PackedScoreIdx<OutputT>* mPtrTopKPacked = nullptr;
 
   int32_t mTopK = 0;
 
@@ -271,7 +286,7 @@ struct KernelParams : public KernelParamsBase<InputT_, OutputT_, UsePdl_> {
     KernelParams params;
     params.setBaseParams(data);
 
-    params.mPtrExpertIdx = (PackedScoreIdx<OutputT>*)data.mPtrExpertIdx;
+    params.mPtrTopKPacked = (PackedScoreIdx<OutputT>*)data.mPtrTopKPacked;
     params.mNormTopkProb = data.mNormTopkProb;
     params.mApplySoftmaxAfterTopK = data.mApplySoftmaxAfterTopK;
     params.mTopK = data.mTopK;

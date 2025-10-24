@@ -67,20 +67,20 @@ void runGemm(TensorView out, TensorView mat1, TensorView mat2, TensorView scale_
       workspace_buffer.numel() * get_element_size(workspace_buffer);
 
   auto runKernel = [&](void* workspace) {
-    gemmRunner.gemm(static_cast<__nv_fp8_e4m3*>(mat1->data),
-                    static_cast<__nv_fp8_e4m3*>(mat2->data), static_cast<float*>(scale_a->data),
-                    static_cast<float*>(scale_b->data), out->data, m, n, k, b, gemmConfig,
-                    static_cast<char*>(workspace), required_workspace_size,
-                    get_stream(mat1->device));
+    gemmRunner.gemm(
+        static_cast<__nv_fp8_e4m3*>(mat1.data_ptr()), static_cast<__nv_fp8_e4m3*>(mat2.data_ptr()),
+        static_cast<float*>(scale_a.data_ptr()), static_cast<float*>(scale_b.data_ptr()),
+        out.data_ptr(), m, n, k, b, gemmConfig, static_cast<char*>(workspace),
+        required_workspace_size, get_stream(mat1.device()));
   };
 
   if (provided_workspace_size < required_workspace_size) {
     Tensor new_workspace =
-        alloc_tensor({required_workspace_size}, DLDataType{kDLInt, 8, 1}, mat1->device);
+        alloc_tensor({required_workspace_size}, DLDataType{kDLInt, 8, 1}, mat1.device());
 
-    runKernel(new_workspace->data);
+    runKernel(new_workspace.data_ptr());
   } else {
-    runKernel(workspace_buffer->data);
+    runKernel(workspace_buffer.data_ptr());
   }
 }
 
@@ -94,27 +94,26 @@ void fp8_bmm_impl(TensorView mat1, TensorView mat2, TensorView scale_a, TensorVi
   int mat2_k_scale = 1;
 
   int64_t m, n, k, b;
-  if (mat1->ndim == 2) {
-    TVM_FFI_ICHECK_EQ(mat2->ndim, 2) << "mat2 must be a matrix";
-    TVM_FFI_ICHECK_EQ(mat1->shape[1], mat2->shape[1] * mat2_k_scale)
-        << "mat1 and mat2 shapes cannot be multiplied (" << mat1->shape[0] << "x" << mat1->shape[1]
-        << " and " << mat2->shape[0] << "x" << mat2->shape[1] << ")";
-    m = mat1->shape[0];
-    n = mat2->shape[0];
-    k = mat2->shape[1];
+  if (mat1.ndim() == 2) {
+    TVM_FFI_ICHECK_EQ(mat2.ndim(), 2) << "mat2 must be a matrix";
+    TVM_FFI_ICHECK_EQ(mat1.size(1), mat2.size(1) * mat2_k_scale)
+        << "mat1 and mat2 shapes cannot be multiplied (" << mat1.size(0) << "x" << mat1.size(1)
+        << " and " << mat2.size(0) << "x" << mat2.size(1) << ")";
+    m = mat1.size(0);
+    n = mat2.size(0);
+    k = mat2.size(1);
     b = 1;
-  } else if (mat1->ndim == 3) {
-    TVM_FFI_ICHECK_EQ(mat2->ndim, 3) << "mat2 must be a batch of matrices";
-    TVM_FFI_ICHECK_EQ(mat1->shape[0], mat2->shape[0])
-        << "mat1 and mat2 must have the same batch size (" << mat1->shape[0] << " and "
-        << mat2->shape[0] << ")";
-    TVM_FFI_ICHECK_EQ(mat1->shape[2], mat2->shape[2] * mat2_k_scale)
-        << "mat1 and mat2 shapes cannot be multiplied (" << mat1->shape[1] << "x" << mat1->shape[2]
-        << " and " << mat2->shape[1] << "x" << mat2->shape[2] << ")";
-    m = mat1->shape[1];
-    n = mat2->shape[1];
-    k = mat2->shape[2];
-    b = mat1->shape[0];
+  } else if (mat1.ndim() == 3) {
+    TVM_FFI_ICHECK_EQ(mat2.ndim(), 3) << "mat2 must be a batch of matrices";
+    TVM_FFI_ICHECK_EQ(mat1.size(0), mat2.size(0)) << "mat1 and mat2 must have the same batch size ("
+                                                  << mat1.size(0) << " and " << mat2.size(0) << ")";
+    TVM_FFI_ICHECK_EQ(mat1.size(2), mat2.size(2) * mat2_k_scale)
+        << "mat1 and mat2 shapes cannot be multiplied (" << mat1.size(1) << "x" << mat1.size(2)
+        << " and " << mat2.size(1) << "x" << mat2.size(2) << ")";
+    m = mat1.size(1);
+    n = mat2.size(1);
+    k = mat2.size(2);
+    b = mat1.size(0);
   } else {
     TVM_FFI_LOG_AND_THROW(NotImplementedError) << "mat1 must be a matrix or a batch of matrices";
   }
@@ -127,16 +126,16 @@ void fp8_bmm_impl(TensorView mat1, TensorView mat2, TensorView scale_a, TensorVi
 
   // Validate out dimensions
   std::vector<int64_t> out_shape =
-      mat1->ndim == 2 ? std::vector<int64_t>{m, n} : std::vector<int64_t>{b, m, n};
-  TVM_FFI_ICHECK_EQ(out->ndim, out_shape.size())
-      << "out must have " << out_shape.size() << " dimensions, but got " << out->ndim;
+      mat1.ndim() == 2 ? std::vector<int64_t>{m, n} : std::vector<int64_t>{b, m, n};
+  TVM_FFI_ICHECK_EQ(out.ndim(), out_shape.size())
+      << "out must have " << out_shape.size() << " dimensions, but got " << out.ndim();
   for (int i = 0; i < out_shape.size(); ++i) {
-    TVM_FFI_ICHECK_EQ(out->shape[i], out_shape[i])
+    TVM_FFI_ICHECK_EQ(out.size(i), out_shape[i])
         << "out shape mismatch at dimension " << i << ": expected " << out_shape[i] << ", got "
-        << out->shape[i];
+        << out.size(i);
   }
 
-  switch (encode_dlpack_dtype(out->dtype)) {
+  switch (encode_dlpack_dtype(out.dtype())) {
     case float16_code:
       runGemm<half>(out, mat1, mat2, scale_a, scale_b, m, n, k, b, config, workspace_buffer);
       break;

@@ -266,13 +266,13 @@ void trtllm_gemm(TensorView workspace_buffer, TensorView a, TensorView b, Tensor
   CHECK_INPUT(b);
   CHECK_INPUT(out);
   CHECK_INPUT(workspace_buffer);
-  TVM_FFI_ICHECK_EQ(workspace_buffer->ndim, 1);
+  TVM_FFI_ICHECK_EQ(workspace_buffer.ndim(), 1);
   CHECK_DIM(2, a);
   CHECK_DIM(2, b);
-  TVM_FFI_ICHECK_EQ(a->dtype, b->dtype);
-  TVM_FFI_ICHECK(a->dtype == dl_float8_e4m3fn || a->dtype == dl_uint8)
+  TVM_FFI_ICHECK_EQ(a.dtype(), b.dtype());
+  TVM_FFI_ICHECK(a.dtype() == dl_float8_e4m3fn || a.dtype() == dl_uint8)
       << "a must be a Float8 or Byte(e2m1) tensor";
-  bool is_fp8 = a->dtype == dl_float8_e4m3fn;
+  bool is_fp8 = a.dtype() == dl_float8_e4m3fn;
   if (is_fp8) {
     TVM_FFI_ICHECK(!globalScale.has_value()) << "globalScale must be a none tensor";
   } else {
@@ -283,11 +283,11 @@ void trtllm_gemm(TensorView workspace_buffer, TensorView a, TensorView b, Tensor
     }
   }
 
-  int32_t m = a->shape[0];
-  int32_t k = is_fp8 ? a->shape[1] : a->shape[1] * 2;
-  int32_t n = b->shape[0];
-  TVM_FFI_ICHECK_EQ(b->shape[1], a->shape[1]) << "Matrix dimensions don't match for multiplication";
-  TVM_FFI_ICHECK(out->shape[0] == m && out->shape[1] == n) << "Output tensor has wrong dimensions";
+  int32_t m = a.size(0);
+  int32_t k = is_fp8 ? a.size(1) : a.size(1) * 2;
+  int32_t n = b.size(0);
+  TVM_FFI_ICHECK_EQ(b.size(1), a.size(1)) << "Matrix dimensions don't match for multiplication";
+  TVM_FFI_ICHECK(out.size(0) == m && out.size(1) == n) << "Output tensor has wrong dimensions";
 
   auto runner = flashinfer::TrtllmGenGemmRunner(flashinfer::TrtllmGenGemmRunnerOptions{
       .eltType = is_fp8 ? gemm::trtllm::gen::Dtype::E4m3 : gemm::trtllm::gen::Dtype::E2m1,
@@ -301,22 +301,22 @@ void trtllm_gemm(TensorView workspace_buffer, TensorView a, TensorView b, Tensor
     tactic = runner.selectHeuristic(m, n, k);
   }
 
-  auto stream = get_stream(a->device);
+  auto stream = get_stream(a.device());
 
   auto runKernel = [&](void* workspace) {
-    runner.run(m, n, k, a->data, a_scale->data, b->data, b_scale->data, out->data,
-               globalScale.has_value() ? globalScale.value()->data : nullptr, nullptr, workspace,
-               stream, a->device.device_id, tactic);
+    runner.run(m, n, k, a.data_ptr(), a_scale.data_ptr(), b.data_ptr(), b_scale.data_ptr(),
+               out.data_ptr(), globalScale.has_value() ? globalScale.value().data_ptr() : nullptr,
+               nullptr, workspace, stream, a.device().device_id, tactic);
   };
 
   int64_t const required_workspace_size = runner.getWorkspaceSizeInBytes(m, n, k, tactic);
   int64_t const provided_workspace_size =
       workspace_buffer.numel() * get_element_size(workspace_buffer);
   if (provided_workspace_size < required_workspace_size) {
-    Tensor new_workspace = alloc_tensor({required_workspace_size}, dl_int8, a->device);
-    runKernel(new_workspace->data);
+    Tensor new_workspace = alloc_tensor({required_workspace_size}, dl_int8, a.device());
+    runKernel(new_workspace.data_ptr());
   } else {
-    runKernel(workspace_buffer->data);
+    runKernel(workspace_buffer.data_ptr());
   }
 }
 

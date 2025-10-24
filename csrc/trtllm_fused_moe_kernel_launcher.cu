@@ -42,17 +42,17 @@ void trtllm_fp8_per_tensor_scale_moe_launcher(
     TensorView gemm1_weights, TensorView output1_scales_scalar,
     TensorView output1_scales_gate_scalar, TensorView gemm2_weights,
     TensorView output2_scales_scalar, TensorView output, int64_t const num_experts,
-    int64_t const top_k, int64_t const n_group, int64_t const topk_group,
+    int64_t const top_k, Optional<int64_t> const n_group, Optional<int64_t> const topk_group,
     int64_t const intermediate_size, int64_t const local_expert_offset,
-    int64_t const local_num_experts, double const routed_scaling_factor,
+    int64_t const local_num_experts, Optional<double> const routed_scaling_factor,
     bool const use_routing_scales_on_input, int64_t const tile_tokens_dim,
     int64_t const routing_method_type, bool enable_pdl) {
   static const std::tuple<int, int> device_props = [hidden_states] {
     int major, minor;
     cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor,
-                           hidden_states->device.device_id);
+                           hidden_states.device().device_id);
     cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor,
-                           hidden_states->device.device_id);
+                           hidden_states.device().device_id);
     return std::make_tuple(major, minor);
   }();
 
@@ -61,30 +61,48 @@ void trtllm_fp8_per_tensor_scale_moe_launcher(
       << std::get<0>(device_props) << std::get<1>(device_props);
 
   if (use_routing_scales_on_input) {
-    TVM_FFI_ICHECK_EQ(routing_logits->dtype, dl_bfloat16) << "routing_logits must be bfloat16.";
+    TVM_FFI_ICHECK_EQ(routing_logits.dtype(), dl_bfloat16) << "routing_logits must be bfloat16.";
+  } else if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3) {
+    TVM_FFI_ICHECK_EQ(routing_logits.dtype(), dl_float32) << "routing_logits must be float.";
   } else {
-    TVM_FFI_ICHECK_EQ(routing_logits->dtype, dl_float32) << "routing_logits must be float.";
+    TVM_FFI_ICHECK_EQ(routing_logits.dtype(), dl_bfloat16) << "routing_logits must be bfloat16.";
   }
-  TVM_FFI_ICHECK_EQ(routing_logits->ndim, 2) << "routing_logits must be 2D.";
-  TVM_FFI_ICHECK_EQ(routing_logits->shape[1], num_experts) << "routing_logits has incorrect shape.";
+  TVM_FFI_ICHECK_EQ(routing_logits.ndim(), 2) << "routing_logits must be 2D.";
+  TVM_FFI_ICHECK_EQ(routing_logits.size(1), num_experts) << "routing_logits has incorrect shape.";
   if (routing_bias.has_value()) {
-    TVM_FFI_ICHECK_EQ(routing_bias.value()->dtype, dl_bfloat16) << "routing_bias must be bfloat16.";
-    TVM_FFI_ICHECK_EQ(routing_bias.value()->ndim, 1) << "routing_bias must be 1D.";
-    TVM_FFI_ICHECK_EQ(routing_bias.value()->shape[0], num_experts)
+    TVM_FFI_ICHECK(routing_bias.value().dtype() == dl_bfloat16 ||
+                   routing_bias.value().dtype() == dl_float32)
+        << "routing_bias must be bfloat16 or float.";
+    TVM_FFI_ICHECK_EQ(routing_bias.value().ndim(), 1) << "routing_bias must be 1D.";
+    TVM_FFI_ICHECK_EQ(routing_bias.value().size(0), num_experts)
         << "routing_bias has incorrect shape.";
   }
 
-  if (n_group <= 0 || topk_group <= 0) {
-    TVM_FFI_ICHECK_EQ(top_k, 1) << "Current routing kernel (no groups) only supports top_k=1.";
-  } else {
-    TVM_FFI_ICHECK_LE(top_k, 8) << "Current routing kernel (with groups) only supports top_k<=8.";
-    TVM_FFI_ICHECK_LE(topk_group, 4)
-        << "Current routing kernel (with groups) only supports topk_group<=4.";
-    TVM_FFI_ICHECK_LE(topk_group, n_group) << "n_group must not be smaller than topk_group.";
-    TVM_FFI_ICHECK_EQ(num_experts % n_group, 0) << "num_experts must be divisible by n_group";
+  if (n_group.has_value() && n_group.value() != 0) {
+    TVM_FFI_ICHECK(static_cast<RoutingMethodType>(routing_method_type) ==
+                   RoutingMethodType::DeepSeekV3)
+        << "Routing kernel with groups implies DeepSeekV3 routing method.";
+    TVM_FFI_ICHECK(topk_group.has_value()) << "if n_group is given, topk_group must be given";
+    TVM_FFI_ICHECK_EQ(num_experts % n_group.value(), 0)
+        << "num_experts must be divisible by n_group";
+    TVM_FFI_ICHECK(top_k <= 8 && top_k > 0)
+        << "Current routing kernel (with groups) only supports top_k<=8 && top_k>0.";
+    TVM_FFI_ICHECK(topk_group.value() <= 4 && topk_group.value() > 0)
+        << "Current routing kernel only (with groups) supports topk_group<=4 && topk_group > 0.";
+    TVM_FFI_ICHECK_LE(topk_group.value(), n_group.value())
+        << "n_group must not be smaller than topk_group.";
     // This check ensures we have enough experts in the selected groups to handle the top_k routing
-    TVM_FFI_ICHECK_LT(top_k, (topk_group * num_experts / n_group))
+    TVM_FFI_ICHECK_LT(top_k, (topk_group.value() * num_experts / n_group.value()))
         << "top_k must be less than total number of experts in selected groups";
+  } else if (static_cast<RoutingMethodType>(routing_method_type) ==
+                 RoutingMethodType::Renormalize ||
+             static_cast<RoutingMethodType>(routing_method_type) ==
+                 RoutingMethodType::RenormalizeNaive) {
+    TVM_FFI_LOG_AND_THROW(NotImplementedError)
+        << "Don't support routing method type Renormalize(Naive).";
+  } else if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Llama4) {
+    TVM_FFI_ICHECK_EQ(top_k, 1)
+        << "Current routing kernel (no groups, Llama4) only supports top_k=1.";
   }
   TVM_FFI_ICHECK_EQ(num_experts % 4, 0)
       << "Routing kernel expects that num_experts must be divisible by 4";
@@ -96,7 +114,7 @@ void trtllm_fp8_per_tensor_scale_moe_launcher(
   tensorrt_llm::kernels::trtllmgen_moe::MoE::MoEWorkspace workspace;
 
   // Convert PyTorch dtype to TensorRT-LLM dtype
-  auto dtype = hidden_states->dtype;
+  auto dtype = hidden_states.dtype();
   if (dtype == dl_float16) {
     args.mDtypeElt = btg::Dtype::Fp16;
   } else if (dtype == dl_bfloat16) {
@@ -107,155 +125,162 @@ void trtllm_fp8_per_tensor_scale_moe_launcher(
     TVM_FFI_LOG_AND_THROW(NotImplementedError) << "Unsupported input dtype for MoE.";
   }
 
-  args.routing_logits = routing_logits->data;
+  args.routing_logits = routing_logits.data_ptr();
   auto const routing_bias_dtype =
-      routing_bias.has_value() ? routing_bias.value()->dtype : dl_bfloat16;
-  args.routing_bias = routing_bias.has_value() ? routing_bias.value()->data : nullptr;
-  args.hidden_states = hidden_states->data;
-  args.gemm1_weights = gemm1_weights->data;
-  args.output1_scales_scalar = static_cast<float*>(output1_scales_scalar->data);
-  args.output1_scales_gate_scalar = static_cast<float*>(output1_scales_gate_scalar->data);
-  args.gemm2_weights = gemm2_weights->data;
-  args.output2_scales_scalar = static_cast<float*>(output2_scales_scalar->data);
-  args.num_tokens = hidden_states->shape[0];
+      routing_bias.has_value() ? routing_bias.value().dtype() : dl_bfloat16;
+  auto btg_routing_bias_dtype = btg::Dtype::Fp32;
+  if (routing_bias_dtype == dl_bfloat16) {
+    btg_routing_bias_dtype = btg::Dtype::Bfloat16;
+  }
+  args.routing_bias = routing_bias.has_value() ? routing_bias.value().data_ptr() : nullptr;
+  args.hidden_states = hidden_states.data_ptr();
+  args.gemm1_weights = gemm1_weights.data_ptr();
+  args.output1_scales_scalar = static_cast<float*>(output1_scales_scalar.data_ptr());
+  args.output1_scales_gate_scalar = static_cast<float*>(output1_scales_gate_scalar.data_ptr());
+  args.gemm2_weights = gemm2_weights.data_ptr();
+  args.output2_scales_scalar = static_cast<float*>(output2_scales_scalar.data_ptr());
+  args.num_tokens = hidden_states.size(0);
   args.num_experts = num_experts;
-  args.hidden_size = hidden_states->shape[1];
+  args.hidden_size = hidden_states.size(1);
   args.hidden_size_output = args.hidden_size;
   args.top_k = top_k;
-  args.n_group = n_group;
-  args.topk_group = topk_group;
+  args.n_group = n_group.has_value() ? n_group.value() : 0;
+  args.topk_group = topk_group.has_value() ? topk_group.value() : 0;
   args.local_expert_offset = local_expert_offset;
   args.local_num_experts = local_num_experts;
-  args.routed_scaling_factor = routed_scaling_factor;
+  args.routed_scaling_factor =
+      routed_scaling_factor.has_value() ? routed_scaling_factor.value() : 1.0;
   args.intermediate_size = intermediate_size;
   args.mUseRoutingScalesOnInput = use_routing_scales_on_input;
 
   // allocate workspace for routing kernel
-  Tensor num_tokens_per_expert = alloc_tensor({num_experts}, dl_int32, routing_logits->device);
+  Tensor num_tokens_per_expert = alloc_tensor({num_experts}, dl_int32, routing_logits.device());
   int32_t max_num_padded_tokens =
       tensorrt_llm::kernels::trtllmgen_moe::Routing::getMaxPermutedPaddedCount(
           args.num_tokens, top_k, num_experts, tile_tokens_dim);
-  Tensor total_num_padded_tokens = alloc_tensor({1}, dl_int32, routing_logits->device);
+  Tensor total_num_padded_tokens = alloc_tensor({1}, dl_int32, routing_logits.device());
   Tensor expanded_idx_to_permuted_idx =
-      alloc_tensor({args.num_tokens * args.top_k}, dl_int32, routing_logits->device);
+      alloc_tensor({args.num_tokens * args.top_k}, dl_int32, routing_logits.device());
   Tensor permuted_idx_to_token_idx =
-      alloc_tensor({max_num_padded_tokens}, dl_int32, routing_logits->device);
+      alloc_tensor({max_num_padded_tokens}, dl_int32, routing_logits.device());
   Tensor expert_weights =
-      alloc_tensor({args.num_tokens, args.top_k}, routing_bias_dtype, routing_logits->device);
+      alloc_tensor({args.num_tokens, args.top_k}, dl_bfloat16, routing_logits.device());
   Tensor expert_indexes =
-      alloc_tensor({args.num_tokens, args.top_k}, dl_int32, routing_logits->device);
+      alloc_tensor({args.num_tokens, args.top_k}, dl_int32, routing_logits.device());
+  int64_t const size_of_expert_count_histogram = std::max(num_experts * 2, int64_t(256 * 2));
   Tensor expert_count_histogram = alloc_tensor(
-      {2 * 256},
+      {size_of_expert_count_histogram},
       dl_int32,  // 256 is the max number of threads per block and max number of experts
-      routing_logits->device);
+      routing_logits.device());
 
   // allocate workspace for activation/gemm/finalize kernels
   // Tensor gemm1_output = alloc_tensor({max_num_padded_tokens, 2 * intermediate_size},
-  //                                    dl_float8_e4m3fn, hidden_states->device);
+  //                                    dl_float8_e4m3fn, hidden_states.device());
   // Tensor activation_output = alloc_tensor({max_num_padded_tokens, intermediate_size},
-  //                                         dl_float8_e4m3fn, hidden_states->device);
-  Tensor gemm1_output =
-      alloc_tensor({max_num_padded_tokens, 2 * intermediate_size}, dl_uint8, hidden_states->device);
+  //                                         dl_float8_e4m3fn, hidden_states.device());
+  Tensor gemm1_output = alloc_tensor({max_num_padded_tokens, 2 * intermediate_size}, dl_uint8,
+                                     hidden_states.device());
   Tensor gemm1_output_scale = alloc_tensor({2 * intermediate_size / 128, max_num_padded_tokens},
-                                           dl_float32, hidden_states->device);
+                                           dl_float32, hidden_states.device());
   Tensor activation_output =
-      alloc_tensor({max_num_padded_tokens, intermediate_size}, dl_uint8, hidden_states->device);
+      alloc_tensor({max_num_padded_tokens, intermediate_size}, dl_uint8, hidden_states.device());
   Tensor activation_output_scale = alloc_tensor({intermediate_size / 128, max_num_padded_tokens},
-                                                dl_float32, hidden_states->device);
+                                                dl_float32, hidden_states.device());
   Tensor gemm2_output =
-      alloc_tensor({max_num_padded_tokens, args.hidden_size}, dl_bfloat16, hidden_states->device);
+      alloc_tensor({max_num_padded_tokens, args.hidden_size}, dl_bfloat16, hidden_states.device());
 
   int32_t max_num_ctas = tensorrt_llm::kernels::trtllmgen_moe::Routing::getMaxNumCtasInBatchDim(
       args.num_tokens, args.top_k, args.num_experts, tile_tokens_dim);
-  Tensor cta_idx_xy_to_batch_idx = alloc_tensor({max_num_ctas}, dl_int32, routing_logits->device);
-  Tensor cta_idx_xy_to_mn_limit = alloc_tensor({max_num_ctas}, dl_int32, routing_logits->device);
-  Tensor num_non_exiting_ctas = alloc_tensor({1}, dl_int32, routing_logits->device);
+  Tensor cta_idx_xy_to_batch_idx = alloc_tensor({max_num_ctas}, dl_int32, routing_logits.device());
+  Tensor cta_idx_xy_to_mn_limit = alloc_tensor({max_num_ctas}, dl_int32, routing_logits.device());
+  Tensor num_non_exiting_ctas = alloc_tensor({1}, dl_int32, routing_logits.device());
 
   tensorrt_llm::kernels::trtllmgen_moe::Routing::Runner routing_runner(tile_tokens_dim);
-  cudaStream_t stream = get_stream(routing_logits->device);
+  cudaStream_t stream = get_stream(routing_logits.device());
   routing_runner.run(
-      routing_logits->data, args.routing_bias, args.num_tokens, args.num_experts, args.top_k,
+      routing_logits.data_ptr(), args.routing_bias, args.num_tokens, args.num_experts, args.top_k,
       args.n_group, args.topk_group, args.local_expert_offset, args.local_num_experts,
-      args.routed_scaling_factor, static_cast<int*>(expert_indexes->data),
-      static_cast<int*>(expert_count_histogram->data),
-      static_cast<int*>(total_num_padded_tokens->data),
-      static_cast<int*>(expanded_idx_to_permuted_idx->data),
-      nullptr /*static_cast<int*>(permuted_idx_to_expanded_idx->data)*/,
-      static_cast<int*>(permuted_idx_to_token_idx->data), expert_weights->data,
-      static_cast<int*>(num_tokens_per_expert->data),
-      static_cast<int*>(cta_idx_xy_to_batch_idx->data),
-      static_cast<int*>(cta_idx_xy_to_mn_limit->data),
-      static_cast<int*>(num_non_exiting_ctas->data), args.mDtypeElt, use_routing_scales_on_input,
-      false /* use_deep_seek_fp8 */, static_cast<RoutingMethodType>(routing_method_type), stream);
+      args.routed_scaling_factor, static_cast<int*>(expert_indexes.data_ptr()),
+      static_cast<int*>(expert_count_histogram.data_ptr()),
+      static_cast<int*>(total_num_padded_tokens.data_ptr()),
+      static_cast<int*>(expanded_idx_to_permuted_idx.data_ptr()),
+      nullptr /*static_cast<int*>(permuted_idx_to_expanded_idx.data_ptr())*/,
+      static_cast<int*>(permuted_idx_to_token_idx.data_ptr()), expert_weights.data_ptr(),
+      static_cast<int*>(num_tokens_per_expert.data_ptr()),
+      static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr()),
+      static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr()),
+      static_cast<int*>(num_non_exiting_ctas.data_ptr()), args.mDtypeElt, btg_routing_bias_dtype,
+      use_routing_scales_on_input, false /* use_deep_seek_fp8 */,
+      static_cast<RoutingMethodType>(routing_method_type), stream);
 
   // MoE kernel except routing
-  TVM_FFI_ICHECK_EQ(hidden_states->dtype, dl_float8_e4m3fn) << "hidden_states must be fp8.";
-  TVM_FFI_ICHECK_EQ(gemm1_weights->dtype, dl_float8_e4m3fn) << "gemm1_weights must be fp8.";
-  TVM_FFI_ICHECK_EQ(gemm1_weights->ndim, 3) << "gemm1_weights must be 3D.";
-  TVM_FFI_ICHECK_EQ(gemm1_weights->shape[1] % 2, 0)
+  TVM_FFI_ICHECK_EQ(hidden_states.dtype(), dl_float8_e4m3fn) << "hidden_states must be fp8.";
+  TVM_FFI_ICHECK_EQ(gemm1_weights.dtype(), dl_float8_e4m3fn) << "gemm1_weights must be fp8.";
+  TVM_FFI_ICHECK_EQ(gemm1_weights.ndim(), 3) << "gemm1_weights must be 3D.";
+  TVM_FFI_ICHECK_EQ(gemm1_weights.size(1) % 2, 0)
       << "the second dimension of weights must be even.";
-  TVM_FFI_ICHECK_EQ(intermediate_size, gemm1_weights->shape[1] / 2)
+  TVM_FFI_ICHECK_EQ(intermediate_size, gemm1_weights.size(1) / 2)
       << "intermediate_size has incorrect shape.";
-  TVM_FFI_ICHECK_EQ(gemm1_weights->shape[2], hidden_states->shape[1])
+  TVM_FFI_ICHECK_EQ(gemm1_weights.size(2), hidden_states.size(1))
       << "the third dimension of weights must be equal to hidden_size.";
   TVM_FFI_ICHECK_EQ(intermediate_size % 128, 0)
       << "the second dimension of weights must be a multiple of 128.";
 
-  TVM_FFI_ICHECK_EQ(output1_scales_scalar->dtype, dl_float32)
+  TVM_FFI_ICHECK_EQ(output1_scales_scalar.dtype(), dl_float32)
       << "output1_scales_scalar must be float.";
-  TVM_FFI_ICHECK_EQ(output1_scales_scalar->ndim, 1) << "output1_scales_scalar must be 1D.";
-  TVM_FFI_ICHECK_EQ(output1_scales_scalar->shape[0], local_num_experts)
+  TVM_FFI_ICHECK_EQ(output1_scales_scalar.ndim(), 1) << "output1_scales_scalar must be 1D.";
+  TVM_FFI_ICHECK_EQ(output1_scales_scalar.size(0), local_num_experts)
       << "output1_scales_scalar has incorrect dim 0.";
-  TVM_FFI_ICHECK_EQ(output1_scales_gate_scalar->dtype, dl_float32)
+  TVM_FFI_ICHECK_EQ(output1_scales_gate_scalar.dtype(), dl_float32)
       << "output1_scales_gate_scalar must be float.";
-  TVM_FFI_ICHECK_EQ(output1_scales_gate_scalar->ndim, 1)
+  TVM_FFI_ICHECK_EQ(output1_scales_gate_scalar.ndim(), 1)
       << "output1_scales_gate_scalar must be 1D.";
-  TVM_FFI_ICHECK_EQ(output1_scales_gate_scalar->shape[0], local_num_experts)
+  TVM_FFI_ICHECK_EQ(output1_scales_gate_scalar.size(0), local_num_experts)
       << "output1_scales_gate_scalar has incorrect dim 0.";
 
-  TVM_FFI_ICHECK_EQ(gemm2_weights->dtype, dl_float8_e4m3fn) << "gemm2_weights must be fp8.";
-  TVM_FFI_ICHECK_EQ(gemm2_weights->ndim, 3) << "gemm2_weights must be 3D.";
-  TVM_FFI_ICHECK_EQ(gemm2_weights->shape[2], intermediate_size)
+  TVM_FFI_ICHECK_EQ(gemm2_weights.dtype(), dl_float8_e4m3fn) << "gemm2_weights must be fp8.";
+  TVM_FFI_ICHECK_EQ(gemm2_weights.ndim(), 3) << "gemm2_weights must be 3D.";
+  TVM_FFI_ICHECK_EQ(gemm2_weights.size(2), intermediate_size)
       << "the third dimension of weights must be equal to intermediate_size.";
 
-  TVM_FFI_ICHECK_EQ(output2_scales_scalar->dtype, dl_float32)
+  TVM_FFI_ICHECK_EQ(output2_scales_scalar.dtype(), dl_float32)
       << "output2_scales_scalar must be float.";
-  TVM_FFI_ICHECK_EQ(output2_scales_scalar->ndim, 1) << "output2_scales_scalar must be 1D.";
-  TVM_FFI_ICHECK_EQ(output2_scales_scalar->shape[0], local_num_experts)
+  TVM_FFI_ICHECK_EQ(output2_scales_scalar.ndim(), 1) << "output2_scales_scalar must be 1D.";
+  TVM_FFI_ICHECK_EQ(output2_scales_scalar.size(0), local_num_experts)
       << "output2_scales_scalar has incorrect dim 0.";
 
   // allocate output
-  TVM_FFI_ICHECK_EQ(output->shape[0], args.num_tokens);
-  TVM_FFI_ICHECK_EQ(output->shape[1], args.hidden_size);
+  TVM_FFI_ICHECK_EQ(output.size(0), args.num_tokens);
+  TVM_FFI_ICHECK_EQ(output.size(1), args.hidden_size);
   CHECK_INPUT_TYPE(output, dl_bfloat16);
   CHECK_DEVICE(output, hidden_states);
 
   // setup workspace
-  workspace.total_num_padded_tokens = static_cast<int*>(total_num_padded_tokens->data);
+  workspace.total_num_padded_tokens = static_cast<int*>(total_num_padded_tokens.data_ptr());
   workspace.total_max_padded_tokens = max_num_padded_tokens;
   workspace.ProjUpTileN = tile_tokens_dim;
-  workspace.routing_expert_indexes = static_cast<int*>(expert_indexes->data);
-  workspace.permuted_idx_size = static_cast<int*>(total_num_padded_tokens->data);
+  workspace.routing_expert_indexes = static_cast<int*>(expert_indexes.data_ptr());
+  workspace.permuted_idx_size = static_cast<int*>(total_num_padded_tokens.data_ptr());
   workspace.expanded_idx_to_permuted_idx = static_cast<int*>(
-      expanded_idx_to_permuted_idx->data);  // Needed by activation/finalize kernels
+      expanded_idx_to_permuted_idx.data_ptr());  // Needed by activation/finalize kernels
   workspace.permuted_idx_to_token_idx =
-      static_cast<int*>(permuted_idx_to_token_idx->data);  // Needed by permuteGemm1 kernel
-  workspace.expert_weights = expert_weights->data;         // Consumed by finalize kernel
+      static_cast<int*>(permuted_idx_to_token_idx.data_ptr());  // Needed by permuteGemm1 kernel
+  workspace.expert_weights = expert_weights.data_ptr();         // Consumed by finalize kernel
 
-  workspace.cta_idx_xy_to_batch_idx = static_cast<int*>(cta_idx_xy_to_batch_idx->data);
-  workspace.cta_idx_xy_to_mn_limit = static_cast<int*>(cta_idx_xy_to_mn_limit->data);
-  workspace.num_non_exiting_ctas = static_cast<int*>(num_non_exiting_ctas->data);
+  workspace.cta_idx_xy_to_batch_idx = static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr());
+  workspace.cta_idx_xy_to_mn_limit = static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr());
+  workspace.num_non_exiting_ctas = static_cast<int*>(num_non_exiting_ctas.data_ptr());
 
   // gemm1 intermediate ws
-  workspace.gemm1_output = gemm1_output->data;
-  workspace.gemm1_output_scale = static_cast<float*>(gemm1_output_scale->data);
+  workspace.gemm1_output = gemm1_output.data_ptr();
+  workspace.gemm1_output_scale = static_cast<float*>(gemm1_output_scale.data_ptr());
   // activation intermediate ws
-  workspace.activation_output = activation_output->data;
-  workspace.activation_output_scale = static_cast<float*>(activation_output_scale->data);
+  workspace.activation_output = activation_output.data_ptr();
+  workspace.activation_output_scale = static_cast<float*>(activation_output_scale.data_ptr());
   // gemm2 intermediate ws
-  workspace.gemm2_output = gemm2_output->data;
+  workspace.gemm2_output = gemm2_output.data_ptr();
   workspace.gemm2_output_scale = nullptr;
-  args.output = output->data;
+  args.output = output.data_ptr();
   args.output_scale = nullptr;
 
   tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner moe_runner(
@@ -267,13 +292,13 @@ void trtllm_fp8_per_tensor_scale_moe_launcher(
 
   auto workspace_sizes = moe_runner.getWorkspaceSizeInBytes(args, moeConfigIndex);
   Tensor workspace_fc1 =
-      alloc_tensor({std::get<0>(workspace_sizes)}, dl_int8, hidden_states->device);
+      alloc_tensor({std::get<0>(workspace_sizes)}, dl_int8, hidden_states.device());
   Tensor workspace_fc2 =
-      alloc_tensor({std::get<1>(workspace_sizes)}, dl_int8, hidden_states->device);
-  workspace.bmm1_workspace = workspace_fc1->data;
-  workspace.bmm2_workspace = workspace_fc2->data;
-  cudaStream_t moe_stream = get_stream(hidden_states->device);
-  moe_runner.run(args, workspace, hidden_states->device.device_id, moe_stream, moeConfigIndex,
+      alloc_tensor({std::get<1>(workspace_sizes)}, dl_int8, hidden_states.device());
+  workspace.bmm1_workspace = workspace_fc1.data_ptr();
+  workspace.bmm2_workspace = workspace_fc2.data_ptr();
+  cudaStream_t moe_stream = get_stream(hidden_states.device());
+  moe_runner.run(args, workspace, hidden_states.device().device_id, moe_stream, moeConfigIndex,
                  enable_pdl);
 }
 
@@ -282,10 +307,11 @@ void trtllm_fp8_per_tensor_scale_moe(
     TensorView gemm1_weights, TensorView output1_scales_scalar,
     TensorView output1_scales_gate_scalar, TensorView gemm2_weights,
     TensorView output2_scales_scalar, TensorView output, int64_t num_experts, int64_t top_k,
-    int64_t n_group, int64_t topk_group, int64_t intermediate_size, int64_t local_expert_offset,
-    int64_t local_num_experts, double routed_scaling_factor, bool use_routing_scales_on_input,
-    int64_t tile_tokens_dim, int64_t routing_method_type, bool enable_pdl) {
-  auto dtype = hidden_states->dtype;
+    Optional<int64_t> n_group, Optional<int64_t> topk_group, int64_t intermediate_size,
+    int64_t local_expert_offset, int64_t local_num_experts, Optional<double> routed_scaling_factor,
+    bool use_routing_scales_on_input, int64_t tile_tokens_dim, int64_t routing_method_type,
+    bool enable_pdl) {
+  auto dtype = hidden_states.dtype();
   if (dtype == dl_float16 || dtype == dl_bfloat16 || dtype == dl_float8_e4m3fn) {
     trtllm_fp8_per_tensor_scale_moe_launcher(
         routing_logits, routing_bias, hidden_states, gemm1_weights, output1_scales_scalar,
@@ -302,18 +328,19 @@ void trtllm_fp8_block_scale_moe_launcher(
     TensorView routing_logits, Optional<TensorView> routing_bias, TensorView hidden_states,
     TensorView hidden_states_scale, TensorView gemm1_weights, TensorView gemm1_weights_scale,
     TensorView gemm2_weights, TensorView gemm2_weights_scale, TensorView output,
-    int64_t const num_experts, int64_t const top_k, int64_t const n_group, int64_t const topk_group,
-    int64_t const intermediate_size, int64_t const local_expert_offset,
-    int64_t const local_num_experts, double const routed_scaling_factor,
-    int64_t const tile_tokens_dim, int64_t const routing_method_type,
+    int64_t const num_experts, int64_t const top_k, Optional<int64_t> const n_group,
+    Optional<int64_t> const topk_group, int64_t const intermediate_size,
+    int64_t const local_expert_offset, int64_t const local_num_experts,
+    Optional<double> const routed_scaling_factor, int64_t const tile_tokens_dim,
+    int64_t const routing_method_type,
     tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner& moe_runner, int64_t moeConfigIndex,
     bool enable_pdl) {
   static const std::tuple<int, int> device_props = [hidden_states] {
     int major, minor;
     cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor,
-                           hidden_states->device.device_id);
+                           hidden_states.device().device_id);
     cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor,
-                           hidden_states->device.device_id);
+                           hidden_states.device().device_id);
     return std::make_tuple(major, minor);
   }();
 
@@ -321,32 +348,50 @@ void trtllm_fp8_block_scale_moe_launcher(
       << "This kernel requires 10.x architecture. Current device has SM "
       << std::get<0>(device_props) << std::get<1>(device_props);
 
-  TVM_FFI_ICHECK_EQ(routing_logits->dtype, dl_float32) << "routing_logits must be float.";
-  TVM_FFI_ICHECK_EQ(routing_logits->ndim, 2) << "routing_logits must be 2D.";
-  TVM_FFI_ICHECK_EQ(routing_logits->shape[0], hidden_states->shape[0])
+  if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3) {
+    TVM_FFI_ICHECK_EQ(routing_logits.dtype(), dl_float32) << "routing_logits must be float.";
+  } else {
+    TVM_FFI_ICHECK_EQ(routing_logits.dtype(), dl_bfloat16) << "routing_logits must be bfloat16.";
+  }
+  TVM_FFI_ICHECK_EQ(routing_logits.ndim(), 2) << "routing_logits must be 2D.";
+  TVM_FFI_ICHECK_EQ(routing_logits.size(0), hidden_states.size(0))
       << "routing_logits and hidden_states must have the same number of tokens.";
-  TVM_FFI_ICHECK_EQ(routing_logits->shape[1], num_experts)
+  TVM_FFI_ICHECK_EQ(routing_logits.size(1), num_experts)
       << "routing_logits dim1 must match num_experts.";
   if (routing_bias.has_value()) {
-    TVM_FFI_ICHECK(routing_bias.value()->dtype == dl_bfloat16 ||
-                   routing_bias.value()->dtype == dl_float32)
+    TVM_FFI_ICHECK(routing_bias.value().dtype() == dl_bfloat16 ||
+                   routing_bias.value().dtype() == dl_float32)
         << "routing_bias must be bfloat16 or float.";
-    TVM_FFI_ICHECK_EQ(routing_bias.value()->ndim, 1) << "routing_bias must be 1D.";
-    TVM_FFI_ICHECK_EQ(routing_bias.value()->shape[0], num_experts)
+    TVM_FFI_ICHECK_EQ(routing_bias.value().ndim(), 1) << "routing_bias must be 1D.";
+    TVM_FFI_ICHECK_EQ(routing_bias.value().size(0), num_experts)
         << "routing_bias has incorrect shape.";
   }
 
-  if (n_group <= 0 || topk_group <= 0) {
-    TVM_FFI_ICHECK_EQ(top_k, 1) << "Current routing kernel (no groups) only supports top_k=1.";
-  } else {
-    TVM_FFI_ICHECK_LE(top_k, 8) << "Current routing kernel (with groups) only supports top_k<=8.";
-    TVM_FFI_ICHECK_LE(topk_group, 4)
-        << "Current routing kernel (with groups) only supports topk_group<=4.";
-    TVM_FFI_ICHECK_LE(topk_group, n_group) << "n_group must not be smaller than topk_group.";
-    TVM_FFI_ICHECK_EQ(num_experts % n_group, 0) << "num_experts must be divisible by n_group";
+  if (n_group.has_value() && n_group.value() != 0) {
+    TVM_FFI_ICHECK(static_cast<RoutingMethodType>(routing_method_type) ==
+                   RoutingMethodType::DeepSeekV3)
+        << "Routing kernel with groups implies DeepSeekV3 routing method.";
+    TVM_FFI_ICHECK(topk_group.has_value()) << "if n_group is given, topk_group must be given";
+    TVM_FFI_ICHECK_EQ(num_experts % n_group.value(), 0)
+        << "num_experts must be divisible by n_group";
+    TVM_FFI_ICHECK(top_k <= 8 && top_k > 0)
+        << "Current routing kernel (with groups) only supports top_k<=8 && top_k>0.";
+    TVM_FFI_ICHECK(topk_group.value() <= 4 && topk_group.value() > 0)
+        << "Current routing kernel only (with groups) supports topk_group<=4 && topk_group > 0.";
+    TVM_FFI_ICHECK_LE(topk_group.value(), n_group.value())
+        << "n_group must not be smaller than topk_group.";
     // This check ensures we have enough experts in the selected groups to handle the top_k routing
-    TVM_FFI_ICHECK_LT(top_k, (topk_group * num_experts / n_group))
+    TVM_FFI_ICHECK_LT(top_k, (topk_group.value() * num_experts / n_group.value()))
         << "top_k must be less than total number of experts in selected groups";
+  } else if (static_cast<RoutingMethodType>(routing_method_type) ==
+                 RoutingMethodType::Renormalize ||
+             static_cast<RoutingMethodType>(routing_method_type) ==
+                 RoutingMethodType::RenormalizeNaive) {
+    TVM_FFI_ICHECK(top_k <= 10 && top_k > 0)
+        << "Current routing kernel (no groups, renormalize) only supports top_k<=10 && top_k>0.";
+  } else if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Llama4) {
+    TVM_FFI_ICHECK_EQ(top_k, 1)
+        << "Current routing kernel (no groups, Llama4) only supports top_k=1.";
   }
   TVM_FFI_ICHECK_EQ(num_experts % 4, 0)
       << "Routing kernel expects that num_experts must be divisible by 4";
@@ -356,7 +401,7 @@ void trtllm_fp8_block_scale_moe_launcher(
   tensorrt_llm::kernels::trtllmgen_moe::MoE::MoEWorkspace workspace;
 
   // Convert PyTorch dtype to TensorRT-LLM dtype
-  auto dtype = hidden_states->dtype;
+  auto dtype = hidden_states.dtype();
   if (dtype == dl_float16) {
     args.mDtypeElt = btg::Dtype::Fp16;
   } else if (dtype == dl_bfloat16) {
@@ -368,31 +413,34 @@ void trtllm_fp8_block_scale_moe_launcher(
   }
 
   auto const routing_bias_dtype =
-      routing_bias.has_value() ? routing_bias.value()->dtype : dl_bfloat16;
-  args.mDtypeExpW = routing_bias_dtype == dl_bfloat16 ? btg::Dtype::Bfloat16 : btg::Dtype::Fp32;
-  args.routing_logits = static_cast<float*>(routing_logits->data);
-  args.routing_bias = routing_bias.has_value() ? routing_bias.value()->data : nullptr;
-  args.hidden_states = hidden_states->data;
-  args.hidden_states_scale = static_cast<float*>(hidden_states_scale->data);
-  args.gemm1_weights = gemm1_weights->data;
-  args.gemm1_weights_scale = static_cast<float*>(gemm1_weights_scale->data);
-  args.gemm2_weights = gemm2_weights->data;
-  args.gemm2_weights_scale = static_cast<float*>(gemm2_weights_scale->data);
-  args.num_tokens = hidden_states->shape[0];
+      routing_bias.has_value() ? routing_bias.value().dtype() : dl_bfloat16;
+  auto btg_routing_bias_dtype =
+      routing_bias_dtype == dl_bfloat16 ? btg::Dtype::Bfloat16 : btg::Dtype::Fp32;
+
+  args.routing_logits = static_cast<float*>(routing_logits.data_ptr());
+  args.routing_bias = routing_bias.has_value() ? routing_bias.value().data_ptr() : nullptr;
+  args.hidden_states = hidden_states.data_ptr();
+  args.hidden_states_scale = static_cast<float*>(hidden_states_scale.data_ptr());
+  args.gemm1_weights = gemm1_weights.data_ptr();
+  args.gemm1_weights_scale = static_cast<float*>(gemm1_weights_scale.data_ptr());
+  args.gemm2_weights = gemm2_weights.data_ptr();
+  args.gemm2_weights_scale = static_cast<float*>(gemm2_weights_scale.data_ptr());
+  args.num_tokens = hidden_states.size(0);
   args.num_experts = num_experts;
-  args.hidden_size = hidden_states->shape[1];
+  args.hidden_size = hidden_states.size(1);
   args.hidden_size_output = args.hidden_size;
   args.top_k = top_k;
-  args.n_group = n_group;
-  args.topk_group = topk_group;
+  args.n_group = n_group.has_value() ? n_group.value() : 0;
+  args.topk_group = topk_group.has_value() ? topk_group.value() : 0;
   args.local_expert_offset = local_expert_offset;
   args.local_num_experts = local_num_experts;
-  args.routed_scaling_factor = routed_scaling_factor;
+  args.routed_scaling_factor =
+      routed_scaling_factor.has_value() ? routed_scaling_factor.value() : 1.0;
   args.intermediate_size = intermediate_size;
   args.mUseDeepSeekFp8 = true;
 
   // allocate workspace for routing kernel
-  Tensor num_tokens_per_expert = alloc_tensor({num_experts}, dl_int32, routing_logits->device);
+  Tensor num_tokens_per_expert = alloc_tensor({num_experts}, dl_int32, routing_logits.device());
   int32_t max_num_padded_tokens =
       tensorrt_llm::kernels::trtllmgen_moe::Routing::getMaxPermutedPaddedCount(
           args.num_tokens, top_k, num_experts, tile_tokens_dim);
@@ -402,169 +450,176 @@ void trtllm_fp8_block_scale_moe_launcher(
   int32_t max_num_padded_tokens_gemm2 =
       tensorrt_llm::kernels::trtllmgen_moe::Routing::maybeGetMinTokenCount(
           max_num_padded_tokens, args.hidden_size, btg::dtypeGetNumBits(args.mDtypeOut));
-  Tensor total_num_padded_tokens = alloc_tensor({1}, dl_int32, routing_logits->device);
+  Tensor total_num_padded_tokens = alloc_tensor({1}, dl_int32, routing_logits.device());
   Tensor expanded_idx_to_permuted_idx =
-      alloc_tensor({args.num_tokens * args.top_k}, dl_int32, routing_logits->device);
+      alloc_tensor({args.num_tokens * args.top_k}, dl_int32, routing_logits.device());
   Tensor permuted_idx_to_token_idx =
-      alloc_tensor({max_num_padded_tokens}, dl_int32, routing_logits->device);
+      alloc_tensor({max_num_padded_tokens}, dl_int32, routing_logits.device());
+
   Tensor expert_weights =
-      alloc_tensor({args.num_tokens, args.top_k}, routing_bias_dtype, routing_logits->device);
+      alloc_tensor({args.num_tokens, args.top_k}, dl_bfloat16, routing_logits.device());
+  // NOTE: the output type of routing kernel is currently always bfloat16
   Tensor expert_indexes =
-      alloc_tensor({args.num_tokens, args.top_k}, dl_int32, routing_logits->device);
+      alloc_tensor({args.num_tokens, args.top_k}, dl_int32, routing_logits.device());
   int64_t const size_of_expert_count_histogram = std::max(num_experts * 2, int64_t(256 * 2));
   Tensor expert_count_histogram = alloc_tensor(
       {size_of_expert_count_histogram},
       dl_int32,  // 256 is the max number of threads per block and max number of experts
-      routing_logits->device);
+      routing_logits.device());
 
   // allocate workspace for activation/gemm/finalize kernels
   // Tensor gemm1_output = alloc_tensor({max_num_padded_tokens, 2 * intermediate_size},
-  //                                    dl_float8_e4m3fn, hidden_states->device);
+  //                                    dl_float8_e4m3fn, hidden_states.device());
   // Tensor activation_output = alloc_tensor({max_num_padded_tokens, intermediate_size},
-  //                                         dl_float8_e4m3fn, hidden_states->device);
+  //                                         dl_float8_e4m3fn, hidden_states.device());
   Tensor gemm1_output = alloc_tensor({max_num_padded_tokens_gemm1, 2 * intermediate_size}, dl_uint8,
-                                     hidden_states->device);
+                                     hidden_states.device());
   Tensor gemm1_output_scale = alloc_tensor({2 * intermediate_size / 128, max_num_padded_tokens},
-                                           dl_float32, hidden_states->device);
+                                           dl_float32, hidden_states.device());
   Tensor activation_output = alloc_tensor({max_num_padded_tokens_gemm1, intermediate_size},
-                                          dl_uint8, hidden_states->device);
+                                          dl_uint8, hidden_states.device());
   Tensor activation_output_scale = alloc_tensor(
-      {intermediate_size / 128, max_num_padded_tokens_gemm1}, dl_float32, hidden_states->device);
+      {intermediate_size / 128, max_num_padded_tokens_gemm1}, dl_float32, hidden_states.device());
   Tensor gemm2_output = alloc_tensor({max_num_padded_tokens_gemm2, args.hidden_size}, dl_bfloat16,
-                                     hidden_states->device);
+                                     hidden_states.device());
 
   int32_t max_num_ctas = tensorrt_llm::kernels::trtllmgen_moe::Routing::getMaxNumCtasInBatchDim(
       args.num_tokens, args.top_k, args.num_experts, tile_tokens_dim);
-  Tensor cta_idx_xy_to_batch_idx = alloc_tensor({max_num_ctas}, dl_int32, routing_logits->device);
-  Tensor cta_idx_xy_to_mn_limit = alloc_tensor({max_num_ctas}, dl_int32, routing_logits->device);
-  Tensor num_non_exiting_ctas = alloc_tensor({1}, dl_int32, routing_logits->device);
+  Tensor cta_idx_xy_to_batch_idx = alloc_tensor({max_num_ctas}, dl_int32, routing_logits.device());
+  Tensor cta_idx_xy_to_mn_limit = alloc_tensor({max_num_ctas}, dl_int32, routing_logits.device());
+  Tensor num_non_exiting_ctas = alloc_tensor({1}, dl_int32, routing_logits.device());
 
   tensorrt_llm::kernels::trtllmgen_moe::Routing::Runner routing_runner(tile_tokens_dim);
-  cudaStream_t stream = get_stream(routing_logits->device);
-  routing_runner.run(static_cast<float*>(routing_logits->data), args.routing_bias, args.num_tokens,
-                     args.num_experts, args.top_k, args.n_group, args.topk_group,
+  cudaStream_t stream = get_stream(routing_logits.device());
+  routing_runner.run(static_cast<float*>(routing_logits.data_ptr()), args.routing_bias,
+                     args.num_tokens, args.num_experts, args.top_k, args.n_group, args.topk_group,
                      args.local_expert_offset, args.local_num_experts, args.routed_scaling_factor,
-                     static_cast<int*>(expert_indexes->data),
-                     static_cast<int*>(expert_count_histogram->data),
-                     static_cast<int*>(total_num_padded_tokens->data),
-                     static_cast<int*>(expanded_idx_to_permuted_idx->data),
-                     nullptr /*static_cast<int*>(permuted_idx_to_expanded_idx->data)*/,
-                     static_cast<int*>(permuted_idx_to_token_idx->data), expert_weights->data,
-                     static_cast<int*>(num_tokens_per_expert->data),
-                     static_cast<int*>(cta_idx_xy_to_batch_idx->data),
-                     static_cast<int*>(cta_idx_xy_to_mn_limit->data),
-                     static_cast<int*>(num_non_exiting_ctas->data), args.mDtypeElt, false, true,
+                     static_cast<int*>(expert_indexes.data_ptr()),
+                     static_cast<int*>(expert_count_histogram.data_ptr()),
+                     static_cast<int*>(total_num_padded_tokens.data_ptr()),
+                     static_cast<int*>(expanded_idx_to_permuted_idx.data_ptr()),
+                     nullptr /*static_cast<int*>(permuted_idx_to_expanded_idx.data_ptr())*/,
+                     static_cast<int*>(permuted_idx_to_token_idx.data_ptr()),
+                     expert_weights.data_ptr(), static_cast<int*>(num_tokens_per_expert.data_ptr()),
+                     static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr()),
+                     static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr()),
+                     static_cast<int*>(num_non_exiting_ctas.data_ptr()), args.mDtypeElt,
+                     btg_routing_bias_dtype, false /* use_routing_scales_on_input */,
+                     true /* use_deep_seek_fp8 */,
                      static_cast<RoutingMethodType>(routing_method_type), stream);
 
   // MoE kernel except routing
-  TVM_FFI_ICHECK_EQ(hidden_states->dtype, dl_float8_e4m3fn) << "hidden_states must be fp8.";
-  TVM_FFI_ICHECK_EQ(hidden_states_scale->dtype, dl_float32) << "hidden_states_scale must be float.";
-  TVM_FFI_ICHECK_EQ(hidden_states_scale->ndim, 2) << "hidden_states_scale must be 2D.";
-  TVM_FFI_ICHECK_EQ(hidden_states_scale->shape[0], hidden_states->shape[1] / 128)
+  TVM_FFI_ICHECK_EQ(hidden_states.dtype(), dl_float8_e4m3fn) << "hidden_states must be fp8.";
+  TVM_FFI_ICHECK_EQ(hidden_states_scale.dtype(), dl_float32)
+      << "hidden_states_scale must be float.";
+  TVM_FFI_ICHECK_EQ(hidden_states_scale.ndim(), 2) << "hidden_states_scale must be 2D.";
+  TVM_FFI_ICHECK_EQ(hidden_states_scale.size(0), hidden_states.size(1) / 128)
       << "hidden_states_scale dim0 must match hidden_states dim1 / 128.";
-  TVM_FFI_ICHECK_EQ(hidden_states_scale->shape[1], args.num_tokens)
+  TVM_FFI_ICHECK_EQ(hidden_states_scale.size(1), args.num_tokens)
       << "hidden_states_scale dim1 must match num_tokens.";
-  TVM_FFI_ICHECK_EQ(gemm1_weights->dtype, dl_float8_e4m3fn) << "gemm1_weights must be fp8.";
+  TVM_FFI_ICHECK_EQ(gemm1_weights.dtype(), dl_float8_e4m3fn) << "gemm1_weights must be fp8.";
 
-  TVM_FFI_ICHECK(gemm1_weights->ndim == 3 || gemm1_weights->ndim == 4)
+  TVM_FFI_ICHECK(gemm1_weights.ndim() == 3 || gemm1_weights.ndim() == 4)
       << "gemm1_weights must be 3D or 4D.";
   {
     int64_t Mn = 0, K = 0;
-    if (gemm1_weights->ndim == 3) {
+    if (gemm1_weights.ndim() == 3) {
       // MajorK [num_experts, M, K]
-      Mn = gemm1_weights->shape[1];
-      K = gemm1_weights->shape[2];
-    } else if (gemm1_weights->ndim == 4) {
+      Mn = gemm1_weights.size(1);
+      K = gemm1_weights.size(2);
+    } else if (gemm1_weights.ndim() == 4) {
       // BlockMajorK [num_experts, K/block_k, M, block_k]
-      Mn = gemm1_weights->shape[2];
-      int64_t block_k = gemm1_weights->shape[3];
-      K = gemm1_weights->shape[1] * block_k;
+      Mn = gemm1_weights.size(2);
+      int64_t block_k = gemm1_weights.size(3);
+      K = gemm1_weights.size(1) * block_k;
     }
     TVM_FFI_ICHECK_EQ(Mn % 2, 0) << "the second dimension of weights must be even.";
     TVM_FFI_ICHECK_EQ(intermediate_size, Mn / 2) << "intermediate_size has incorrect shape.";
-    TVM_FFI_ICHECK_EQ(K, hidden_states->shape[1])
+    TVM_FFI_ICHECK_EQ(K, hidden_states.size(1))
         << "the third dimension of weights must be equal to hidden_size.";
   }
-  TVM_FFI_ICHECK_EQ(gemm1_weights_scale->dtype, dl_float32) << "gemm1_weights_scale must be float.";
-  TVM_FFI_ICHECK_EQ(gemm1_weights_scale->ndim, 3) << "gemm1_weights_scale must be 3D.";
+  TVM_FFI_ICHECK_EQ(gemm1_weights_scale.dtype(), dl_float32)
+      << "gemm1_weights_scale must be float.";
+  TVM_FFI_ICHECK_EQ(gemm1_weights_scale.ndim(), 3) << "gemm1_weights_scale must be 3D.";
 
-  TVM_FFI_ICHECK_EQ(gemm1_weights_scale->shape[0], local_num_experts)
+  TVM_FFI_ICHECK_EQ(gemm1_weights_scale.size(0), local_num_experts)
       << "gemm1_weights_scale has incorrect shape.";
   TVM_FFI_ICHECK_EQ(intermediate_size % 128, 0)
       << "the second dimension of weights must be a multiple of 128.";
-  TVM_FFI_ICHECK_EQ(gemm1_weights_scale->shape[1], 2 * intermediate_size / 128)
+  TVM_FFI_ICHECK_EQ(gemm1_weights_scale.size(1), 2 * intermediate_size / 128)
       << "gemm1_weights_scale has incorrect shape.";
-  TVM_FFI_ICHECK_EQ(gemm1_weights_scale->shape[2], args.hidden_size / 128)
+  TVM_FFI_ICHECK_EQ(gemm1_weights_scale.size(2), args.hidden_size / 128)
       << "gemm1_weights_scale has incorrect shape.";
-  TVM_FFI_ICHECK_EQ(gemm2_weights->dtype, dl_float8_e4m3fn) << "gemm2_weights must be fp8.";
+  TVM_FFI_ICHECK_EQ(gemm2_weights.dtype(), dl_float8_e4m3fn) << "gemm2_weights must be fp8.";
 
-  TVM_FFI_ICHECK(gemm2_weights->ndim == 3 || gemm2_weights->ndim == 4)
+  TVM_FFI_ICHECK(gemm2_weights.ndim() == 3 || gemm2_weights.ndim() == 4)
       << "gemm2_weights must be 3D or 4D.";
   {
     int64_t K = 0;
-    if (gemm2_weights->ndim == 3) {
+    if (gemm2_weights.ndim() == 3) {
       // MajorK [num_experts, M, K]
-      K = gemm2_weights->shape[2];
-    } else if (gemm2_weights->ndim == 4) {
+      K = gemm2_weights.size(2);
+    } else if (gemm2_weights.ndim() == 4) {
       // BlockMajorK [num_experts, K/block_k, M, block_k]
-      int64_t block_k = gemm2_weights->shape[3];
-      K = gemm2_weights->shape[1] * block_k;
+      int64_t block_k = gemm2_weights.size(3);
+      K = gemm2_weights.size(1) * block_k;
     }
     TVM_FFI_ICHECK_EQ(K, intermediate_size)
         << "the third dimension of weights must be equal to intermediate_size.";
   }
-  TVM_FFI_ICHECK_EQ(gemm2_weights_scale->dtype, dl_float32) << "gemm2_weights_scale must be float.";
-  TVM_FFI_ICHECK_EQ(gemm2_weights_scale->ndim, 3) << "gemm2_weights_scale must be 3D.";
-  TVM_FFI_ICHECK_EQ(gemm2_weights_scale->shape[0], local_num_experts)
+  TVM_FFI_ICHECK_EQ(gemm2_weights_scale.dtype(), dl_float32)
+      << "gemm2_weights_scale must be float.";
+  TVM_FFI_ICHECK_EQ(gemm2_weights_scale.ndim(), 3) << "gemm2_weights_scale must be 3D.";
+  TVM_FFI_ICHECK_EQ(gemm2_weights_scale.size(0), local_num_experts)
       << "gemm2_weights_scale has incorrect shape.";
-  TVM_FFI_ICHECK_EQ(gemm2_weights_scale->shape[1], args.hidden_size / 128)
+  TVM_FFI_ICHECK_EQ(gemm2_weights_scale.size(1), args.hidden_size / 128)
       << "gemm2_weights_scale has incorrect shape.";
-  TVM_FFI_ICHECK_EQ(gemm2_weights_scale->shape[2], intermediate_size / 128)
+  TVM_FFI_ICHECK_EQ(gemm2_weights_scale.size(2), intermediate_size / 128)
       << "gemm2_weights_scale has incorrect shape.";
 
-  TVM_FFI_ICHECK_EQ(output->shape[0], args.num_tokens) << "output has incorrect shape.";
-  TVM_FFI_ICHECK_EQ(output->shape[1], args.hidden_size) << "output has incorrect shape.";
-  TVM_FFI_ICHECK_EQ(output->dtype, dl_bfloat16) << "output must be bf16.";
+  TVM_FFI_ICHECK_EQ(output.size(0), args.num_tokens) << "output has incorrect shape.";
+  TVM_FFI_ICHECK_EQ(output.size(1), args.hidden_size) << "output has incorrect shape.";
+  TVM_FFI_ICHECK_EQ(output.dtype(), dl_bfloat16) << "output must be bf16.";
 
   // setup workspace
-  workspace.total_num_padded_tokens = static_cast<int*>(total_num_padded_tokens->data);
+  workspace.total_num_padded_tokens = static_cast<int*>(total_num_padded_tokens.data_ptr());
   workspace.total_max_padded_tokens =
       std::max(max_num_padded_tokens_gemm1, max_num_padded_tokens_gemm2);
   workspace.ProjUpTileN = tile_tokens_dim;
-  workspace.routing_expert_indexes = static_cast<int*>(expert_indexes->data);
-  workspace.permuted_idx_size = static_cast<int*>(total_num_padded_tokens->data);
+  workspace.routing_expert_indexes = static_cast<int*>(expert_indexes.data_ptr());
+  workspace.permuted_idx_size = static_cast<int*>(total_num_padded_tokens.data_ptr());
   workspace.expanded_idx_to_permuted_idx = static_cast<int*>(
-      expanded_idx_to_permuted_idx->data);  // Needed by activation/finalize kernels
+      expanded_idx_to_permuted_idx.data_ptr());  // Needed by activation/finalize kernels
   workspace.permuted_idx_to_token_idx =
-      static_cast<int*>(permuted_idx_to_token_idx->data);  // Needed by permuteGemm1 kernel
-  workspace.expert_weights = expert_weights->data;         // Consumed by finalize kernel
+      static_cast<int*>(permuted_idx_to_token_idx.data_ptr());  // Needed by permuteGemm1 kernel
+  workspace.expert_weights = expert_weights.data_ptr();         // Consumed by finalize kernel
 
-  workspace.cta_idx_xy_to_batch_idx = static_cast<int*>(cta_idx_xy_to_batch_idx->data);
-  workspace.cta_idx_xy_to_mn_limit = static_cast<int*>(cta_idx_xy_to_mn_limit->data);
-  workspace.num_non_exiting_ctas = static_cast<int*>(num_non_exiting_ctas->data);
+  workspace.cta_idx_xy_to_batch_idx = static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr());
+  workspace.cta_idx_xy_to_mn_limit = static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr());
+  workspace.num_non_exiting_ctas = static_cast<int*>(num_non_exiting_ctas.data_ptr());
 
   // gemm1 intermediate ws
-  workspace.gemm1_output = gemm1_output->data;
-  workspace.gemm1_output_scale = static_cast<float*>(gemm1_output_scale->data);
+  workspace.gemm1_output = gemm1_output.data_ptr();
+  workspace.gemm1_output_scale = static_cast<float*>(gemm1_output_scale.data_ptr());
   // activation intermediate ws
-  workspace.activation_output = activation_output->data;
-  workspace.activation_output_scale = static_cast<float*>(activation_output_scale->data);
+  workspace.activation_output = activation_output.data_ptr();
+  workspace.activation_output_scale = static_cast<float*>(activation_output_scale.data_ptr());
   // gemm2 intermediate ws
-  workspace.gemm2_output = gemm2_output->data;
+  workspace.gemm2_output = gemm2_output.data_ptr();
   workspace.gemm2_output_scale = nullptr;
-  args.output = output->data;
+  args.output = output.data_ptr();
   args.output_scale = nullptr;
 
   auto workspace_sizes = moe_runner.getWorkspaceSizeInBytes(args, moeConfigIndex);
   Tensor workspace_fc1 =
-      alloc_tensor({std::get<0>(workspace_sizes)}, dl_int8, hidden_states->device);
+      alloc_tensor({std::get<0>(workspace_sizes)}, dl_int8, hidden_states.device());
   Tensor workspace_fc2 =
-      alloc_tensor({std::get<1>(workspace_sizes)}, dl_int8, hidden_states->device);
-  workspace.bmm1_workspace = workspace_fc1->data;
-  workspace.bmm2_workspace = workspace_fc2->data;
+      alloc_tensor({std::get<1>(workspace_sizes)}, dl_int8, hidden_states.device());
+  workspace.bmm1_workspace = workspace_fc1.data_ptr();
+  workspace.bmm2_workspace = workspace_fc2.data_ptr();
 
-  cudaStream_t moe_stream = get_stream(hidden_states->device);
-  moe_runner.run(args, workspace, hidden_states->device.device_id, moe_stream, moeConfigIndex,
+  cudaStream_t moe_stream = get_stream(hidden_states.device());
+  moe_runner.run(args, workspace, hidden_states.device().device_id, moe_stream, moeConfigIndex,
                  enable_pdl);
 }
 
@@ -573,12 +628,12 @@ void trtllm_fp8_block_scale_moe(TensorView routing_logits, Optional<TensorView> 
                                 TensorView gemm1_weights, TensorView gemm1_weights_scale,
                                 TensorView gemm2_weights, TensorView gemm2_weights_scale,
                                 TensorView output, int64_t num_experts, int64_t top_k,
-                                int64_t n_group, int64_t topk_group, int64_t intermediate_size,
-                                int64_t local_expert_offset, int64_t local_num_experts,
-                                double routed_scaling_factor, int64_t tile_tokens_dim,
-                                int64_t routing_method_type, bool use_shuffled_weight,
-                                int64_t weight_layout, bool enable_pdl) {
-  auto dtype = hidden_states->dtype;
+                                Optional<int64_t> n_group, Optional<int64_t> topk_group,
+                                int64_t intermediate_size, int64_t local_expert_offset,
+                                int64_t local_num_experts, Optional<double> routed_scaling_factor,
+                                int64_t tile_tokens_dim, int64_t routing_method_type,
+                                bool use_shuffled_weight, int64_t weight_layout, bool enable_pdl) {
+  auto dtype = hidden_states.dtype();
   if (dtype == dl_float16 || dtype == dl_bfloat16 || dtype == dl_float8_e4m3fn) {
     using RunnerType = tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner;
 
@@ -594,8 +649,8 @@ void trtllm_fp8_block_scale_moe(TensorView routing_logits, Optional<TensorView> 
         static_cast<batchedGemm::gemm::MatrixLayout>(weight_layout));
 
     // Always use fallback config (equivalent to moeConfigIndex == -1 case from original code)
-    auto const num_tokens = hidden_states->shape[0];
-    auto const hidden_size = hidden_states->shape[1];
+    auto const num_tokens = hidden_states.size(0);
+    auto const hidden_size = hidden_states.size(1);
 
     int64_t moeConfigIndex = mRunner->getDefaultValidConfigIndex(
         top_k, hidden_size, intermediate_size, local_num_experts, num_tokens);
@@ -632,9 +687,9 @@ Array<Tensor> trtllm_fp4_block_scale_moe_launcher(
   static const std::tuple<int, int> device_props = [hidden_states] {
     int major, minor;
     cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor,
-                           hidden_states->device.device_id);
+                           hidden_states.device().device_id);
     cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor,
-                           hidden_states->device.device_id);
+                           hidden_states.device().device_id);
     return std::make_tuple(major, minor);
   }();
 
@@ -675,17 +730,20 @@ Array<Tensor> trtllm_fp4_block_scale_moe_launcher(
   }
 
   if (routing_logits.has_value()) {
-    TVM_FFI_ICHECK(routing_logits.value()->dtype == dl_float32 ||
-                   routing_logits.value()->dtype == dl_bfloat16)
+    TVM_FFI_ICHECK(routing_logits.value().dtype() == dl_float32 ||
+                   routing_logits.value().dtype() == dl_bfloat16)
         << "routing_logits must be float or bfloat16.";
-    TVM_FFI_ICHECK_EQ(routing_logits.value()->ndim, 2) << "routing_logits must be 2D.";
-    TVM_FFI_ICHECK_EQ(routing_logits.value()->shape[1], num_experts)
+    TVM_FFI_ICHECK_EQ(routing_logits.value().ndim(), 2) << "routing_logits must be 2D.";
+    TVM_FFI_ICHECK_EQ(routing_logits.value().size(1), num_experts)
         << "routing_logits has incorrect shape.";
   }
   if (routing_bias.has_value()) {
-    TVM_FFI_ICHECK_EQ(routing_bias.value()->dtype, dl_bfloat16) << "routing_bias must be bfloat16.";
-    TVM_FFI_ICHECK_EQ(routing_bias.value()->ndim, 1) << "routing_bias must be 1D.";
-    TVM_FFI_ICHECK_EQ(routing_bias.value()->shape[0], num_experts)
+    TVM_FFI_ICHECK(routing_bias.value().dtype() == dl_bfloat16 ||
+                   routing_bias.value().dtype() == dl_float32)
+        << "routing_bias must be bfloat16 or float.";
+
+    TVM_FFI_ICHECK_EQ(routing_bias.value().ndim(), 1) << "routing_bias must be 1D.";
+    TVM_FFI_ICHECK_EQ(routing_bias.value().size(0), num_experts)
         << "routing_bias has incorrect shape.";
   }
 
@@ -696,8 +754,8 @@ Array<Tensor> trtllm_fp4_block_scale_moe_launcher(
     TVM_FFI_ICHECK(topk_group.has_value()) << "if n_group is given, topk_group must be given";
     TVM_FFI_ICHECK_EQ(num_experts % n_group.value(), 0)
         << "num_experts must be divisible by n_group";
-    TVM_FFI_ICHECK(top_k <= 8 && top_k > 0)
-        << "Current routing kernel (with groups) only supports top_k<=8 && top_k>0.";
+    TVM_FFI_ICHECK(top_k <= 10 && top_k > 0)
+        << "Current routing kernel (with groups) only supports top_k<=10 && top_k>0.";
     TVM_FFI_ICHECK(topk_group.value() <= 4 && topk_group.value() > 0)
         << "Current routing kernel only (with groups) supports topk_group<=4 && topk_group > 0.";
     TVM_FFI_ICHECK_LE(topk_group.value(), n_group.value())
@@ -710,8 +768,8 @@ Array<Tensor> trtllm_fp4_block_scale_moe_launcher(
              static_cast<RoutingMethodType>(routing_method_type) ==
                  RoutingMethodType::RenormalizeNaive ||
              static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::TopK) {
-    TVM_FFI_ICHECK(top_k <= 8 && top_k > 0)
-        << "Current routing kernel (no groups, renormalize/topk) only supports top_k<=8 && "
+    TVM_FFI_ICHECK(top_k <= 10 && top_k > 0)
+        << "Current routing kernel (no groups, renormalize/topk) only supports top_k<=10 && "
            "top_k>0.";
   } else if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Llama4) {
     TVM_FFI_ICHECK_EQ(top_k, 1)
@@ -726,41 +784,40 @@ Array<Tensor> trtllm_fp4_block_scale_moe_launcher(
   tensorrt_llm::kernels::trtllmgen_moe::MoE::MoEWorkspace workspace;
 
   // setup args
-  // note: the assumption is that output data type is always Bfloat16 (the default)
-  auto routing_bias_dtype = dl_bfloat16;
-  if (routing_bias.has_value()) {
-    routing_bias_dtype = routing_bias.value()->dtype;
-  } else if (routing_logits.has_value()) {
-    routing_bias_dtype = routing_logits.value()->dtype;
-  }
   args.mDtypeElt = dtype_act;
-  args.mDtypeExpW = routing_bias_dtype == dl_float32 ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16;
-  args.routing_logits = routing_logits.has_value() ? routing_logits.value()->data : nullptr;
-  args.routing_bias = routing_bias.has_value() ? routing_bias.value()->data : nullptr;
-  args.hidden_states = hidden_states->data;
+  // note: the assumption is that output data type is always Bfloat16 (the default)
+  auto routing_bias_dtype = routing_bias.has_value() ? routing_bias.value().dtype() : dl_bfloat16;
+  auto btg_routing_bias_dtype =
+      routing_bias_dtype == dl_bfloat16 ? btg::Dtype::Bfloat16 : btg::Dtype::Fp32;
+  // We shouln't use args.mDtypeExpW since it indicates the output data type of routing kernel,
+  // which is currently always bfloat16 for routing kernel while the data type of routing bias now
+  // can be fp32
+  args.routing_logits = routing_logits.has_value() ? routing_logits.value().data_ptr() : nullptr;
+  args.routing_bias = routing_bias.has_value() ? routing_bias.value().data_ptr() : nullptr;
+  args.hidden_states = hidden_states.data_ptr();
   args.hidden_states_scale =
-      hidden_states_scale.has_value() ? hidden_states_scale.value()->data : nullptr;
-  args.gemm1_weights = gemm1_weights->data;
-  args.gemm1_weights_scale = gemm1_weights_scale->data;
+      hidden_states_scale.has_value() ? hidden_states_scale.value().data_ptr() : nullptr;
+  args.gemm1_weights = gemm1_weights.data_ptr();
+  args.gemm1_weights_scale = gemm1_weights_scale.data_ptr();
   args.gemm1_bias =
-      gemm1_bias.has_value() ? static_cast<float*>(gemm1_bias.value()->data) : nullptr;
+      gemm1_bias.has_value() ? static_cast<float*>(gemm1_bias.value().data_ptr()) : nullptr;
   args.gemm1_alpha =
-      gemm1_alpha.has_value() ? static_cast<float*>(gemm1_alpha.value()->data) : nullptr;
+      gemm1_alpha.has_value() ? static_cast<float*>(gemm1_alpha.value().data_ptr()) : nullptr;
   args.gemm1_beta =
-      gemm1_beta.has_value() ? static_cast<float*>(gemm1_beta.value()->data) : nullptr;
+      gemm1_beta.has_value() ? static_cast<float*>(gemm1_beta.value().data_ptr()) : nullptr;
   args.gemm1_clamp_limit = gemm1_clamp_limit.has_value()
-                               ? static_cast<float*>(gemm1_clamp_limit.value()->data)
+                               ? static_cast<float*>(gemm1_clamp_limit.value().data_ptr())
                                : nullptr;
-  args.gemm2_weights = gemm2_weights->data;
-  args.gemm2_weights_scale = gemm2_weights_scale->data;
+  args.gemm2_weights = gemm2_weights.data_ptr();
+  args.gemm2_weights_scale = gemm2_weights_scale.data_ptr();
   args.gemm2_bias =
-      gemm2_bias.has_value() ? static_cast<float*>(gemm2_bias.value()->data) : nullptr;
-  args.num_tokens = hidden_states->shape[0];
+      gemm2_bias.has_value() ? static_cast<float*>(gemm2_bias.value().data_ptr()) : nullptr;
+  args.num_tokens = hidden_states.size(0);
   args.num_experts = num_experts;
   // * 2 to compensate for the fact that sizeof(hidden_states.dtype) is 1 because we pack 2 e2m1
   // into 1 byte.
   auto const hidden_states_hidden_size =
-      dtype_act == btg::Dtype::E2m1 ? hidden_states->shape[1] * 2 : hidden_states->shape[1];
+      dtype_act == btg::Dtype::E2m1 ? hidden_states.size(1) * 2 : hidden_states.size(1);
   args.hidden_size = hidden_states_hidden_size;
   args.hidden_size_output = args.hidden_size;
   args.top_k = top_k;
@@ -772,7 +829,7 @@ Array<Tensor> trtllm_fp4_block_scale_moe_launcher(
   args.intermediate_size = intermediate_size;
 
   // allocate workspace for routing kernel
-  Tensor num_tokens_per_expert = alloc_tensor({num_experts}, dl_int32, hidden_states->device);
+  Tensor num_tokens_per_expert = alloc_tensor({num_experts}, dl_int32, hidden_states.device());
   int32_t max_num_padded_tokens =
       tensorrt_llm::kernels::trtllmgen_moe::Routing::getMaxPermutedPaddedCount(
           args.num_tokens, top_k, num_experts, tile_tokens_dim);
@@ -782,21 +839,19 @@ Array<Tensor> trtllm_fp4_block_scale_moe_launcher(
   int32_t max_num_padded_tokens_gemm2 =
       tensorrt_llm::kernels::trtllmgen_moe::Routing::maybeGetMinTokenCount(
           max_num_padded_tokens, args.hidden_size, btg::dtypeGetNumBits(args.mDtypeOut));
-  Tensor total_num_padded_tokens = alloc_tensor({1}, dl_int32, hidden_states->device);
+  Tensor total_num_padded_tokens = alloc_tensor({1}, dl_int32, hidden_states.device());
   Tensor expanded_idx_to_permuted_idx =
-      alloc_tensor({args.num_tokens, args.top_k}, dl_int32, hidden_states->device);
+      alloc_tensor({args.num_tokens, args.top_k}, dl_int32, hidden_states.device());
 
   Tensor permuted_idx_to_token_idx =
-      alloc_tensor({max_num_padded_tokens}, dl_int32, hidden_states->device);
+      alloc_tensor({max_num_padded_tokens}, dl_int32, hidden_states.device());
   // Tensor expert_weights = alloc_tensor(
-  //     {args.num_tokens, args.top_k}, routing_bias_dtype, hidden_states->device);
+  //     {args.num_tokens, args.top_k}, dl_bfloat16, hidden_states.device());
   // Tensor expert_indexes = alloc_tensor(
-  //     {args.num_tokens, args.top_k}, dl_int32, hidden_states->device);
-  int constexpr MAX_NUM_EXPERTS = 384;
-  Tensor expert_count_histogram = alloc_tensor(
-      {2 * MAX_NUM_EXPERTS},
-      dl_int32,  // 256 is the max number of threads per block and max number of experts
-      hidden_states->device);
+  //     {args.num_tokens, args.top_k}, dl_int32, hidden_states.device();
+  int64_t const size_of_expert_count_histogram = std::max(num_experts * 2, int64_t(256 * 2));
+  Tensor expert_count_histogram =
+      alloc_tensor({size_of_expert_count_histogram}, dl_int32, hidden_states.device());
 
   auto const sf_vec_size = dtype_weights == btg::Dtype::MxE2m1 ? 32 : 16;
 
@@ -805,66 +860,67 @@ Array<Tensor> trtllm_fp4_block_scale_moe_launcher(
       dtype_act == btg::Dtype::E2m1 ? intermediate_size / 2 : intermediate_size;
   // Tensor gemm1_output = alloc_tensor(
   //     {max_num_padded_tokens, gemm1_output_hidden},
-  //     dtype_act == btg::Dtype::Bfloat16 ? dl_bfloat16 : dl_float8_e4m3fn, hidden_states->device);
+  //     dtype_act == btg::Dtype::Bfloat16 ? dl_bfloat16 : dl_float8_e4m3fn,
+  //     hidden_states.device());
   Tensor gemm1_output = alloc_tensor({max_num_padded_tokens_gemm1, gemm1_output_hidden},
                                      dtype_act == btg::Dtype::Bfloat16 ? dl_bfloat16 : dl_uint8,
-                                     hidden_states->device);
+                                     hidden_states.device());
 
   Optional<Tensor> gemm1_output_scale = std::nullopt;
   if (dtype_act == btg::Dtype::E2m1 || dtype_act == btg::Dtype::MxE4m3) {
     int64_t sf_size = tensorrt_llm::computeSwizzledLayoutSFSize(max_num_padded_tokens_gemm1,
                                                                 intermediate_size / sf_vec_size);
-    // gemm1_output_scale = alloc_tensor({sf_size}, dl_float8_e4m3fn, hidden_states->device);
-    gemm1_output_scale = alloc_tensor({sf_size}, dl_uint8, hidden_states->device);
+    // gemm1_output_scale = alloc_tensor({sf_size}, dl_float8_e4m3fn, hidden_states.device());
+    gemm1_output_scale = alloc_tensor({sf_size}, dl_uint8, hidden_states.device());
   }
 
   Tensor gemm2_output = alloc_tensor({max_num_padded_tokens_gemm2, args.hidden_size}, dl_bfloat16,
-                                     hidden_states->device);
+                                     hidden_states.device());
 
   int32_t max_num_ctas = tensorrt_llm::kernels::trtllmgen_moe::Routing::getMaxNumCtasInBatchDim(
       args.num_tokens, args.top_k, args.num_experts, tile_tokens_dim);
-  Tensor cta_idx_xy_to_batch_idx = alloc_tensor({max_num_ctas}, dl_int32, hidden_states->device);
-  Tensor cta_idx_xy_to_mn_limit = alloc_tensor({max_num_ctas}, dl_int32, hidden_states->device);
-  Tensor num_non_exiting_ctas = alloc_tensor({1}, dl_int32, hidden_states->device);
+  Tensor cta_idx_xy_to_batch_idx = alloc_tensor({max_num_ctas}, dl_int32, hidden_states.device());
+  Tensor cta_idx_xy_to_mn_limit = alloc_tensor({max_num_ctas}, dl_int32, hidden_states.device());
+  Tensor num_non_exiting_ctas = alloc_tensor({1}, dl_int32, hidden_states.device());
 
   //
   // TopK routing
   //
 
   tensorrt_llm::kernels::trtllmgen_moe::Routing::Runner routing_runner(tile_tokens_dim);
-  cudaStream_t stream = get_stream(hidden_states->device);
-  routing_runner.run(args.routing_logits, args.routing_bias, args.num_tokens, args.num_experts,
-                     args.top_k, args.n_group, args.topk_group, args.local_expert_offset,
-                     args.local_num_experts, args.routed_scaling_factor,
-                     static_cast<int*>(expert_indices->data),
-                     static_cast<int*>(expert_count_histogram->data),
-                     static_cast<int*>(total_num_padded_tokens->data),
-                     static_cast<int*>(expanded_idx_to_permuted_idx->data),
-                     nullptr, /*static_cast<int*>(permuted_idx_to_expanded_idx->data),*/
-                     static_cast<int*>(permuted_idx_to_token_idx->data), expert_weights->data,
-                     static_cast<int*>(num_tokens_per_expert->data),
-                     static_cast<int*>(cta_idx_xy_to_batch_idx->data),
-                     static_cast<int*>(cta_idx_xy_to_mn_limit->data),
-                     static_cast<int*>(num_non_exiting_ctas->data), args.mDtypeElt,
-                     false /* use_routing_scales_on_input */, false /* use_deep_seek_fp8 */,
-                     static_cast<RoutingMethodType>(routing_method_type), stream);
+  cudaStream_t stream = get_stream(hidden_states.device());
+  routing_runner.run(
+      args.routing_logits, args.routing_bias, args.num_tokens, args.num_experts, args.top_k,
+      args.n_group, args.topk_group, args.local_expert_offset, args.local_num_experts,
+      args.routed_scaling_factor, static_cast<int*>(expert_indices.data_ptr()),
+      static_cast<int*>(expert_count_histogram.data_ptr()),
+      static_cast<int*>(total_num_padded_tokens.data_ptr()),
+      static_cast<int*>(expanded_idx_to_permuted_idx.data_ptr()),
+      nullptr, /*static_cast<int*>(permuted_idx_to_expanded_idx.data_ptr()),*/
+      static_cast<int*>(permuted_idx_to_token_idx.data_ptr()), expert_weights.data_ptr(),
+      static_cast<int*>(num_tokens_per_expert.data_ptr()),
+      static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr()),
+      static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr()),
+      static_cast<int*>(num_non_exiting_ctas.data_ptr()), args.mDtypeElt, btg_routing_bias_dtype,
+      false /* use_routing_scales_on_input */, false /* use_deep_seek_fp8 */,
+      static_cast<RoutingMethodType>(routing_method_type), stream);
 
   //
   // FC13 (gemm1) + FC2 (gemm2)
   //
 
   if (dtype_act == btg::Dtype::E2m1) {
-    TVM_FFI_ICHECK_EQ(hidden_states->dtype, dl_uint8) << "hidden_states must be byte.";
+    TVM_FFI_ICHECK_EQ(hidden_states.dtype(), dl_uint8) << "hidden_states must be byte.";
   } else if (dtype_act == btg::Dtype::E4m3 || dtype_act == btg::Dtype::MxE4m3) {
-    TVM_FFI_ICHECK_EQ(hidden_states->dtype, dl_float8_e4m3fn) << "hidden_states must be fp8.";
+    TVM_FFI_ICHECK_EQ(hidden_states.dtype(), dl_float8_e4m3fn) << "hidden_states must be fp8.";
   } else if (dtype_act == btg::Dtype::Bfloat16) {
-    TVM_FFI_ICHECK_EQ(hidden_states->dtype, dl_bfloat16) << "hidden_states must be bfloat16.";
+    TVM_FFI_ICHECK_EQ(hidden_states.dtype(), dl_bfloat16) << "hidden_states must be bfloat16.";
   } else {
     TVM_FFI_LOG_AND_THROW(NotImplementedError) << "Unsupported act dtype.";
   }
 
   if (hidden_states_scale.has_value()) {
-    TVM_FFI_ICHECK_EQ(hidden_states_scale.value()->dtype, dl_float8_e4m3fn)
+    TVM_FFI_ICHECK_EQ(hidden_states_scale.value().dtype(), dl_float8_e4m3fn)
         << "hidden_states_scale must be fp8.";
 
     TVM_FFI_ICHECK_EQ(
@@ -873,159 +929,158 @@ Array<Tensor> trtllm_fp4_block_scale_moe_launcher(
         << "hidden_states_scale has incorrect size";
   }
 
-  TVM_FFI_ICHECK_EQ(gemm1_weights->dtype, dl_uint8) << "gemm1_weights must be byte.";
+  TVM_FFI_ICHECK_EQ(gemm1_weights.dtype(), dl_uint8) << "gemm1_weights must be byte.";
 
-  TVM_FFI_ICHECK_EQ(gemm1_weights->ndim, 3) << "gemm1_weights must be 3D.";
-  TVM_FFI_ICHECK_EQ(gemm1_weights->shape[1] % 2, 0)
+  TVM_FFI_ICHECK_EQ(gemm1_weights.ndim(), 3) << "gemm1_weights must be 3D.";
+  TVM_FFI_ICHECK_EQ(gemm1_weights.size(1) % 2, 0)
       << "the second dimension of weights must be even.";
-  TVM_FFI_ICHECK_EQ(intermediate_size, gemm1_weights->shape[1] / 2)
+  TVM_FFI_ICHECK_EQ(intermediate_size, gemm1_weights.size(1) / 2)
       << "intermediate_size has incorrect dim 1.";
   // This check passes even though the actual shape of the weights[2] and hidden_states[1] is
   // 2 times larger due to the fact that 2 e2m1 are packed into 1 byte.
   TVM_FFI_ICHECK_EQ(
-      gemm1_weights->shape[2],
-      (dtype_act == btg::Dtype::E2m1 ? hidden_states->shape[1] : hidden_states->shape[1] / 2))
+      gemm1_weights.size(2),
+      (dtype_act == btg::Dtype::E2m1 ? hidden_states.size(1) : hidden_states.size(1) / 2))
       << "the third dimension of weights must be equal to hidden_size.";
 
-  TVM_FFI_ICHECK_EQ(gemm1_weights_scale->dtype, dl_float8_e4m3fn)
+  TVM_FFI_ICHECK_EQ(gemm1_weights_scale.dtype(), dl_float8_e4m3fn)
       << "gemm1_weights_scale must be fp8.";
 
-  TVM_FFI_ICHECK_EQ(gemm1_weights_scale->ndim, 3) << "gemm1_weights_scale must be 3D.";
-  TVM_FFI_ICHECK_EQ(gemm1_weights_scale->shape[0], local_num_experts)
+  TVM_FFI_ICHECK_EQ(gemm1_weights_scale.ndim(), 3) << "gemm1_weights_scale must be 3D.";
+  TVM_FFI_ICHECK_EQ(gemm1_weights_scale.size(0), local_num_experts)
       << "gemm1_weights_scale has incorrect dim 0.";
   TVM_FFI_ICHECK_EQ(intermediate_size % sf_vec_size, 0)
       << "the second dimension of weights must be a multiple of ",
       sf_vec_size;
-  TVM_FFI_ICHECK_EQ(gemm1_weights_scale->shape[1], 2 * intermediate_size)
+  TVM_FFI_ICHECK_EQ(gemm1_weights_scale.size(1), 2 * intermediate_size)
       << "gemm1_weights_scale has incorrect dim 1.";
-  TVM_FFI_ICHECK_EQ(gemm1_weights_scale->shape[2], args.hidden_size / sf_vec_size)
+  TVM_FFI_ICHECK_EQ(gemm1_weights_scale.size(2), args.hidden_size / sf_vec_size)
       << "gemm1_weights_scale has incorrect dim 2.";
 
   if (gemm1_bias.has_value()) {
-    TVM_FFI_ICHECK_EQ(gemm1_bias.value()->dtype, dl_float32)
+    TVM_FFI_ICHECK_EQ(gemm1_bias.value().dtype(), dl_float32)
         << "gemm1_bias must be float, got "
-        << tvm::ffi::DLDataTypeToString(gemm1_bias.value()->dtype);
-    TVM_FFI_ICHECK_EQ(gemm1_bias.value()->ndim, 2) << "gemm1_bias must be 2D.";
-    TVM_FFI_ICHECK_EQ(gemm1_bias.value()->shape[0], local_num_experts)
+        << tvm::ffi::DLDataTypeToString(gemm1_bias.value().dtype());
+    TVM_FFI_ICHECK_EQ(gemm1_bias.value().ndim(), 2) << "gemm1_bias must be 2D.";
+    TVM_FFI_ICHECK_EQ(gemm1_bias.value().size(0), local_num_experts)
         << "gemm1_bias has incorrect dim 0.";
-    TVM_FFI_ICHECK_EQ(gemm1_bias.value()->shape[1], 2 * intermediate_size)
+    TVM_FFI_ICHECK_EQ(gemm1_bias.value().size(1), 2 * intermediate_size)
         << "gemm1_bias has incorrect dim 1.";
   }
 
   if (gemm1_alpha.has_value()) {
-    TVM_FFI_ICHECK_EQ(gemm1_alpha.value()->dtype, dl_float32)
+    TVM_FFI_ICHECK_EQ(gemm1_alpha.value().dtype(), dl_float32)
         << "gemm1_alpha must be float, got "
-        << tvm::ffi::DLDataTypeToString(gemm1_alpha.value()->dtype);
-    TVM_FFI_ICHECK_EQ(gemm1_alpha.value()->ndim, 1) << "gemm1_alpha must be 1D.";
-    TVM_FFI_ICHECK_EQ(gemm1_alpha.value()->shape[0], local_num_experts)
+        << tvm::ffi::DLDataTypeToString(gemm1_alpha.value().dtype());
+    TVM_FFI_ICHECK_EQ(gemm1_alpha.value().ndim(), 1) << "gemm1_alpha must be 1D.";
+    TVM_FFI_ICHECK_EQ(gemm1_alpha.value().size(0), local_num_experts)
         << "gemm1_alpha has incorrect dim 0.";
   }
   if (gemm1_beta.has_value()) {
-    TVM_FFI_ICHECK_EQ(gemm1_beta.value()->dtype, dl_float32)
+    TVM_FFI_ICHECK_EQ(gemm1_beta.value().dtype(), dl_float32)
         << "gemm1_beta must be float, got "
-        << tvm::ffi::DLDataTypeToString(gemm1_beta.value()->dtype);
-    TVM_FFI_ICHECK_EQ(gemm1_beta.value()->ndim, 1) << "gemm1_beta must be 1D.";
-    TVM_FFI_ICHECK_EQ(gemm1_beta.value()->shape[0], local_num_experts)
+        << tvm::ffi::DLDataTypeToString(gemm1_beta.value().dtype());
+    TVM_FFI_ICHECK_EQ(gemm1_beta.value().ndim(), 1) << "gemm1_beta must be 1D.";
+    TVM_FFI_ICHECK_EQ(gemm1_beta.value().size(0), local_num_experts)
         << "gemm1_beta has incorrect dim 0.";
   }
 
-  TVM_FFI_ICHECK_EQ(gemm2_weights->dtype, dl_uint8) << "gemm2_weights must be byte.";
+  TVM_FFI_ICHECK_EQ(gemm2_weights.dtype(), dl_uint8) << "gemm2_weights must be byte.";
 
-  TVM_FFI_ICHECK_EQ(gemm2_weights->ndim, 3) << "gemm2_weights must be 3D.";
+  TVM_FFI_ICHECK_EQ(gemm2_weights.ndim(), 3) << "gemm2_weights must be 3D.";
   // / 2 to compensate for the fact that we pack 2 e2m1 into 1 byte.
-  TVM_FFI_ICHECK_EQ(gemm2_weights->shape[2], intermediate_size / 2)
+  TVM_FFI_ICHECK_EQ(gemm2_weights.size(2), intermediate_size / 2)
       << "the third dimension of weights must be equal to intermediate_size.";
 
-  TVM_FFI_ICHECK_EQ(gemm2_weights_scale->dtype, dl_float8_e4m3fn)
+  TVM_FFI_ICHECK_EQ(gemm2_weights_scale.dtype(), dl_float8_e4m3fn)
       << "gemm2_weights_scale must be fp8.";
 
-  TVM_FFI_ICHECK_EQ(gemm2_weights_scale->ndim, 3) << "gemm2_weights_scale must be 3D.";
-  TVM_FFI_ICHECK_EQ(gemm2_weights_scale->shape[0], local_num_experts)
+  TVM_FFI_ICHECK_EQ(gemm2_weights_scale.ndim(), 3) << "gemm2_weights_scale must be 3D.";
+  TVM_FFI_ICHECK_EQ(gemm2_weights_scale.size(0), local_num_experts)
       << "gemm2_weights_scale has incorrect dim 0.";
-  TVM_FFI_ICHECK_EQ(gemm2_weights_scale->shape[1], args.hidden_size)
+  TVM_FFI_ICHECK_EQ(gemm2_weights_scale.size(1), args.hidden_size)
       << "gemm2_weights_scale has incorrect dim 1.";
-  TVM_FFI_ICHECK_EQ(gemm2_weights_scale->shape[2], intermediate_size / sf_vec_size)
+  TVM_FFI_ICHECK_EQ(gemm2_weights_scale.size(2), intermediate_size / sf_vec_size)
       << "gemm2_weights_scale has incorrect dim 2.";
 
   if (output1_scales_scalar.has_value()) {
-    TVM_FFI_ICHECK_EQ(output1_scales_scalar.value()->dtype, dl_float32)
+    TVM_FFI_ICHECK_EQ(output1_scales_scalar.value().dtype(), dl_float32)
         << "output1_scales_scalar must be float.";
-    TVM_FFI_ICHECK_EQ(output1_scales_scalar.value()->ndim, 1)
+    TVM_FFI_ICHECK_EQ(output1_scales_scalar.value().ndim(), 1)
         << "output1_scales_scalar must be 1D.";
-    TVM_FFI_ICHECK_EQ(output1_scales_scalar.value()->shape[0], local_num_experts)
+    TVM_FFI_ICHECK_EQ(output1_scales_scalar.value().size(0), local_num_experts)
         << "output1_scales_scalar has incorrect dim 0.";
   }
 
   if (output1_scales_gate_scalar.has_value()) {
-    TVM_FFI_ICHECK_EQ(output1_scales_gate_scalar.value()->dtype, dl_float32)
+    TVM_FFI_ICHECK_EQ(output1_scales_gate_scalar.value().dtype(), dl_float32)
         << "output1_scales_gate_scalar must be float.";
-    TVM_FFI_ICHECK_EQ(output1_scales_gate_scalar.value()->ndim, 1)
+    TVM_FFI_ICHECK_EQ(output1_scales_gate_scalar.value().ndim(), 1)
         << "output1_scales_gate_scalar must be 1D.";
-    TVM_FFI_ICHECK_EQ(output1_scales_gate_scalar.value()->shape[0], local_num_experts)
+    TVM_FFI_ICHECK_EQ(output1_scales_gate_scalar.value().size(0), local_num_experts)
         << "output1_scales_gate_scalar has incorrect dim 0.";
   }
 
   if (output2_scales_scalar.has_value()) {
-    TVM_FFI_ICHECK_EQ(output2_scales_scalar.value()->dtype, dl_float32)
+    TVM_FFI_ICHECK_EQ(output2_scales_scalar.value().dtype(), dl_float32)
         << "output2_scales_scalar must be float.";
-    TVM_FFI_ICHECK_EQ(output2_scales_scalar.value()->ndim, 1)
+    TVM_FFI_ICHECK_EQ(output2_scales_scalar.value().ndim(), 1)
         << "output2_scales_scalar must be 1D.";
-    TVM_FFI_ICHECK_EQ(output2_scales_scalar.value()->shape[0], local_num_experts)
+    TVM_FFI_ICHECK_EQ(output2_scales_scalar.value().size(0), local_num_experts)
         << "output2_scales_scalar has incorrect dim 0.";
   }
 
   // setup workspace
-  workspace.total_num_padded_tokens = static_cast<int*>(total_num_padded_tokens->data);
+  workspace.total_num_padded_tokens = static_cast<int*>(total_num_padded_tokens.data_ptr());
   workspace.total_max_padded_tokens =
       std::max(max_num_padded_tokens_gemm1, max_num_padded_tokens_gemm2);
   workspace.ProjUpTileN = tile_tokens_dim;
-  workspace.routing_expert_indexes = static_cast<int*>(expert_indices->data);
-  workspace.permuted_idx_size = static_cast<int*>(total_num_padded_tokens->data);
-  workspace.expanded_idx_to_permuted_idx =
-      static_cast<int*>(expanded_idx_to_permuted_idx->data);  // Needed by permute/finalize kernels
+  workspace.routing_expert_indexes = static_cast<int*>(expert_indices.data_ptr());
+  workspace.permuted_idx_size = static_cast<int*>(total_num_padded_tokens.data_ptr());
+  workspace.expanded_idx_to_permuted_idx = static_cast<int*>(
+      expanded_idx_to_permuted_idx.data_ptr());  // Needed by permute/finalize kernels
   workspace.permuted_idx_to_token_idx =
-      static_cast<int*>(permuted_idx_to_token_idx->data);  // Needed by permuteGemm1 kernel
-  workspace.expert_weights = expert_weights->data;         // Consumed by finalize kernel
+      static_cast<int*>(permuted_idx_to_token_idx.data_ptr());  // Needed by permuteGemm1 kernel
+  workspace.expert_weights = expert_weights.data_ptr();         // Consumed by finalize kernel
 
-  workspace.cta_idx_xy_to_batch_idx = static_cast<int*>(cta_idx_xy_to_batch_idx->data);
-  workspace.cta_idx_xy_to_mn_limit = static_cast<int*>(cta_idx_xy_to_mn_limit->data);
-  workspace.num_non_exiting_ctas = static_cast<int*>(num_non_exiting_ctas->data);
+  workspace.cta_idx_xy_to_batch_idx = static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr());
+  workspace.cta_idx_xy_to_mn_limit = static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr());
+  workspace.num_non_exiting_ctas = static_cast<int*>(num_non_exiting_ctas.data_ptr());
 
   workspace.hidden_states_scale_linear = nullptr;
 
   // gemm1 intermediate ws
-  workspace.gemm1_output = gemm1_output->data;
+  workspace.gemm1_output = gemm1_output.data_ptr();
   workspace.gemm1_output_scale = gemm1_output_scale.has_value()
-                                     ? static_cast<float*>(gemm1_output_scale.value()->data)
+                                     ? static_cast<float*>(gemm1_output_scale.value().data_ptr())
                                      : nullptr;
-
   // gemm2 intermediate ws
-  workspace.gemm2_output = gemm2_output->data;
+  workspace.gemm2_output = gemm2_output.data_ptr();
   workspace.gemm2_output_scale = nullptr;
-  args.output = output->data;
+  args.output = output.data_ptr();
   args.output_scale = nullptr;
   args.output1_scales_scalar = output1_scales_scalar.has_value()
-                                   ? static_cast<float*>(output1_scales_scalar.value()->data)
+                                   ? static_cast<float*>(output1_scales_scalar.value().data_ptr())
                                    : nullptr;
   args.output1_scales_gate_scalar =
       output1_scales_gate_scalar.has_value()
-          ? static_cast<float*>(output1_scales_gate_scalar.value()->data)
+          ? static_cast<float*>(output1_scales_gate_scalar.value().data_ptr())
           : nullptr;
   args.output2_scales_scalar = output2_scales_scalar.has_value()
-                                   ? static_cast<float*>(output2_scales_scalar.value()->data)
+                                   ? static_cast<float*>(output2_scales_scalar.value().data_ptr())
                                    : nullptr;
   args.do_finalize = do_finalize;
 
   auto const workspace_sizes = moe_runner.getWorkspaceSizeInBytes(args, moeConfigIndex);
 
   Tensor workspace_fc1 =
-      alloc_tensor({std::get<0>(workspace_sizes)}, dl_int8, hidden_states->device);
+      alloc_tensor({std::get<0>(workspace_sizes)}, dl_int8, hidden_states.device());
   Tensor workspace_fc2 =
-      alloc_tensor({std::get<1>(workspace_sizes)}, dl_int8, hidden_states->device);
-  workspace.bmm1_workspace = workspace_fc1->data;
-  workspace.bmm2_workspace = workspace_fc2->data;
-  cudaStream_t moe_stream = get_stream(hidden_states->device);
-  moe_runner.run(args, workspace, hidden_states->device.device_id, moe_stream, moeConfigIndex,
+      alloc_tensor({std::get<1>(workspace_sizes)}, dl_int8, hidden_states.device());
+  workspace.bmm1_workspace = workspace_fc1.data_ptr();
+  workspace.bmm2_workspace = workspace_fc2.data_ptr();
+  cudaStream_t moe_stream = get_stream(hidden_states.device());
+  moe_runner.run(args, workspace, hidden_states.device().device_id, moe_stream, moeConfigIndex,
                  enable_pdl);
 
   if (!do_finalize) {
@@ -1050,9 +1105,9 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
     int64_t gated_act_type, TensorView output, int64_t config_index) {
   using RunnerType = tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner;
 
-  int const num_tokens = hidden_states->shape[0];
-  int hidden_size = hidden_states->shape[1];
-  if (hidden_states->dtype == dl_uint8) hidden_size *= 2;
+  int const num_tokens = hidden_states.size(0);
+  int hidden_size = hidden_states.size(1);
+  if (hidden_states.dtype() == dl_uint8) hidden_size *= 2;
   int hidden_states_scale_vec_size = -1;
   if (hidden_states_scale.has_value()) {
     hidden_states_scale_vec_size = (num_tokens * hidden_size) / hidden_states_scale.value().numel();
@@ -1063,15 +1118,15 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
       << "unsupported weight_scale_vec_size.";
   auto mDtypeWeights = weight_scale_vec_size == 16 ? btg::Dtype::E2m1 : btg::Dtype::MxE2m1;
 
-  TVM_FFI_ICHECK(gemm1_weights->dtype == dl_uint8 && gemm2_weights->dtype == dl_uint8)
+  TVM_FFI_ICHECK(gemm1_weights.dtype() == dl_uint8 && gemm2_weights.dtype() == dl_uint8)
       << "weights must be fp4 packed in uint8.";
-  TVM_FFI_ICHECK(hidden_states->dtype == dl_uint8 || hidden_states->dtype == dl_bfloat16 ||
-                 hidden_states->dtype == dl_float8_e4m3fn)
+  TVM_FFI_ICHECK(hidden_states.dtype() == dl_uint8 || hidden_states.dtype() == dl_bfloat16 ||
+                 hidden_states.dtype() == dl_float8_e4m3fn)
       << "hidden_states must be bf16, fp8 or uint8 (packed fp4).";
   auto mDtypeAct = btg::Dtype::Bfloat16;
-  if (hidden_states->dtype == dl_uint8) {
+  if (hidden_states.dtype() == dl_uint8) {
     TVM_FFI_ICHECK(hidden_states_scale.has_value() &&
-                   hidden_states_scale.value()->dtype == dl_float8_e4m3fn)
+                   hidden_states_scale.value().dtype() == dl_float8_e4m3fn)
         << "hidden_states_scale must be provided for fp4 activation.";
     if (hidden_states_scale_vec_size == 16) {
       mDtypeAct = btg::Dtype::E2m1;
@@ -1080,7 +1135,7 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
     } else {
       TVM_FFI_LOG_AND_THROW(NotImplementedError) << "Unsupported hidden state scale shape.";
     }
-  } else if (hidden_states->dtype == dl_float8_e4m3fn) {
+  } else if (hidden_states.dtype() == dl_float8_e4m3fn) {
     if (hidden_states_scale.has_value()) {
       if (hidden_states_scale_vec_size == 32) {
         mDtypeAct = btg::Dtype::MxE4m3;

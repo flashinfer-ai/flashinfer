@@ -55,9 +55,9 @@ def generate_additional_params(
         additional_params_setter = " \\\n".join(
             [
                 (
-                    f"params.additional_params.{var} = {var} ? static_cast<{dtype}*>({var}.value()->data): nullptr;"
+                    f"params.additional_params.{var} = {var} ? static_cast<{dtype}*>({var}.value().data_ptr()): nullptr;"
                     if var.startswith("maybe")
-                    else f"params.additional_params.{var} = static_cast<{dtype}*>({var}->data);"
+                    else f"params.additional_params.{var} = static_cast<{dtype}*>({var}.data_ptr());"
                 )
                 for dtype, var in zip(additional_tensor_dtypes, additional_tensor_names)
             ]
@@ -70,9 +70,9 @@ def generate_additional_params(
         additional_params_setter = " \\\n".join(
             [
                 (
-                    f"params.{var} = {var} ? static_cast<{dtype}*>({var}.value()->data): nullptr;"
+                    f"params.{var} = {var} ? static_cast<{dtype}*>({var}.value().data_ptr()): nullptr;"
                     if var.startswith("maybe")
-                    else f"params.{var} = static_cast<{dtype}*>({var}->data);"
+                    else f"params.{var} = static_cast<{dtype}*>({var}.data_ptr());"
                 )
                 for dtype, var in zip(additional_tensor_dtypes, additional_tensor_names)
             ]

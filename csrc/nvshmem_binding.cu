@@ -31,8 +31,8 @@ using tvm::ffi::Shape;
 void get_unique_id(TensorView uid) {
   CHECK_CONTIGUOUS(uid);
   TVM_FFI_ICHECK_EQ(uid.numel() * get_element_size(uid), nvshmemx_uniqueid_t_size);
-  TVM_FFI_ICHECK_EQ(uid->device.device_type, kDLCPU);
-  nvshmemx_uniqueid_t* uid_ptr = reinterpret_cast<nvshmemx_uniqueid_t*>(uid->data);
+  TVM_FFI_ICHECK_EQ(uid.device().device_type, kDLCPU);
+  nvshmemx_uniqueid_t* uid_ptr = reinterpret_cast<nvshmemx_uniqueid_t*>(uid.data_ptr());
   *uid_ptr = NVSHMEMX_UNIQUEID_INITIALIZER;
   nvshmemx_get_uniqueid(uid_ptr);
 }
@@ -42,8 +42,8 @@ int64_t unique_id_size() { return nvshmemx_uniqueid_t_size; }
 int64_t init(TensorView uid, int64_t rank, int64_t world_size) {
   CHECK_CONTIGUOUS(uid);
   TVM_FFI_ICHECK_EQ(uid.numel() * get_element_size(uid), nvshmemx_uniqueid_t_size);
-  TVM_FFI_ICHECK_EQ(uid->device.device_type, kDLCPU);
-  nvshmemx_uniqueid_t* uid_ptr = reinterpret_cast<nvshmemx_uniqueid_t*>(uid->data);
+  TVM_FFI_ICHECK_EQ(uid.device().device_type, kDLCPU);
+  nvshmemx_uniqueid_t* uid_ptr = reinterpret_cast<nvshmemx_uniqueid_t*>(uid.data_ptr());
   nvshmemx_init_attr_t attr = NVSHMEMX_INIT_ATTR_INITIALIZER;
   nvshmemx_set_attr_uniqueid_args(rank, world_size, uid_ptr, &attr);
   return nvshmemx_init_attr(NVSHMEMX_INIT_WITH_UNIQUEID, &attr);
@@ -79,12 +79,13 @@ void barrier_all_on_current_stream() {
 void alltoall(TensorView dest, TensorView source) {
   CHECK_CONTIGUOUS(dest);
   CHECK_CONTIGUOUS(source);
-  TVM_FFI_ICHECK_EQ(dest->dtype, source->dtype) << "dest and source must have the same dtype";
+  TVM_FFI_ICHECK_EQ(dest.dtype(), source.dtype()) << "dest and source must have the same dtype";
 
-  size_t nbytes = dest.numel() * get_element_size(dest) / dest->shape[0];
-  cudaStream_t stream = get_stream(dest->device);
-  NVSHMEMCHECK(nvshmemx_alltoallmem_on_stream(NVSHMEM_TEAM_WORLD, static_cast<uint8_t*>(dest->data),
-                                              static_cast<uint8_t*>(source->data), nbytes, stream));
+  size_t nbytes = dest.numel() * get_element_size(dest) / dest.size(0);
+  cudaStream_t stream = get_stream(dest.device());
+  NVSHMEMCHECK(
+      nvshmemx_alltoallmem_on_stream(NVSHMEM_TEAM_WORLD, static_cast<uint8_t*>(dest.data_ptr()),
+                                     static_cast<uint8_t*>(source.data_ptr()), nbytes, stream));
 }
 
 void fake_alltoall(TensorView dest, TensorView source) {}
@@ -92,35 +93,35 @@ void fake_alltoall(TensorView dest, TensorView source) {}
 void sum_reduce(TensorView dest, TensorView source, int64_t nelems) {
   CHECK_CONTIGUOUS(dest);
   CHECK_CONTIGUOUS(source);
-  TVM_FFI_ICHECK_EQ(dest->dtype, source->dtype) << "dest and source must have the same dtype";
+  TVM_FFI_ICHECK_EQ(dest.dtype(), source.dtype()) << "dest and source must have the same dtype";
 
   // Add validation and conversion
   TVM_FFI_ICHECK_GE(nelems, 0) << "nelems must be non-negative, got " << nelems;
   TVM_FFI_ICHECK_LE(nelems, SIZE_MAX) << "nelems too large: " << nelems << " > " << SIZE_MAX;
   size_t nelems_size_t = static_cast<size_t>(nelems);
 
-  cudaStream_t stream = get_stream(dest->device);
+  cudaStream_t stream = get_stream(dest.device());
 
-  switch (encode_dlpack_dtype(dest->dtype)) {
+  switch (encode_dlpack_dtype(dest.dtype())) {
     case float16_code:  // float16
       NVSHMEMCHECK(nvshmemx_half_sum_reduce_on_stream(
-          NVSHMEM_TEAM_WORLD, static_cast<nv_half*>(dest->data),
-          static_cast<nv_half*>(source->data), nelems_size_t, stream));
+          NVSHMEM_TEAM_WORLD, static_cast<nv_half*>(dest.data_ptr()),
+          static_cast<nv_half*>(source.data_ptr()), nelems_size_t, stream));
       break;
     case float32_code:  // float32
       NVSHMEMCHECK(nvshmemx_float_sum_reduce_on_stream(
-          NVSHMEM_TEAM_WORLD, static_cast<float*>(dest->data), static_cast<float*>(source->data),
-          nelems_size_t, stream));
+          NVSHMEM_TEAM_WORLD, static_cast<float*>(dest.data_ptr()),
+          static_cast<float*>(source.data_ptr()), nelems_size_t, stream));
       break;
     case bfloat16_code:  // bfloat16
       NVSHMEMCHECK(nvshmemx_bfloat16_sum_reduce_on_stream(
-          NVSHMEM_TEAM_WORLD, static_cast<nv_bfloat16*>(dest->data),
-          static_cast<nv_bfloat16*>(source->data), nelems_size_t, stream));
+          NVSHMEM_TEAM_WORLD, static_cast<nv_bfloat16*>(dest.data_ptr()),
+          static_cast<nv_bfloat16*>(source.data_ptr()), nelems_size_t, stream));
       break;
 
     default:
       TVM_FFI_LOG_AND_THROW(NotImplementedError)
-          << "Unsupported dtype for nvshmem_sum_reduce: " << dest->dtype;
+          << "Unsupported dtype for nvshmem_sum_reduce: " << dest.dtype();
   }
 }
 
@@ -132,21 +133,21 @@ void allreduce_on_stream_with_copy(TensorView dest_symm, TensorView source_symm,
   CHECK_CONTIGUOUS(source_symm);
   CHECK_CONTIGUOUS(dest_local);
   CHECK_CONTIGUOUS(source_local);
-  TVM_FFI_ICHECK_EQ(dest_symm->dtype, source_symm->dtype)
+  TVM_FFI_ICHECK_EQ(dest_symm.dtype(), source_symm.dtype())
       << "dest_symm and source_symm must have the same dtype";
-  TVM_FFI_ICHECK_EQ(dest_symm->dtype, source_local->dtype)
+  TVM_FFI_ICHECK_EQ(dest_symm.dtype(), source_local.dtype())
       << "dest_symm and source_local must have the same dtype";
-  TVM_FFI_ICHECK_EQ(dest_local->dtype, source_local->dtype)
+  TVM_FFI_ICHECK_EQ(dest_local.dtype(), source_local.dtype())
       << "dest_local and source_local must have the same dtype";
 
-  cudaStream_t stream = get_stream(source_symm->device);
+  cudaStream_t stream = get_stream(source_symm.device());
 
-  cudaMemcpyAsync(source_symm->data, source_local->data, nelems * get_element_size(source_local),
-                  cudaMemcpyDefault, stream);
+  cudaMemcpyAsync(source_symm.data_ptr(), source_local.data_ptr(),
+                  nelems * get_element_size(source_local), cudaMemcpyDefault, stream);
   nvshmemx_barrier_on_stream(NVSHMEM_TEAM_WORLD, stream);
   sum_reduce(dest_symm, source_symm, nelems);
-  cudaMemcpyAsync(dest_local->data, dest_symm->data, nelems * get_element_size(dest_local),
-                  cudaMemcpyDefault, stream);
+  cudaMemcpyAsync(dest_local.data_ptr(), dest_symm.data_ptr(),
+                  nelems * get_element_size(dest_local), cudaMemcpyDefault, stream);
   cudaStreamSynchronize(stream);
 }
 

@@ -98,7 +98,6 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install build twine wheel
-          pip install setuptools>=61.0 requests filelock torch tqdm numpy apache-tvm-ffi==0.1.0b15
 
       - name: Build flashinfer-cubin wheel
         env:
@@ -154,7 +153,7 @@ jobs:
           CUDA_MINOR=$(echo "${{ matrix.cuda }}" | cut -d'.' -f2)
           export CUDA_MAJOR
           export CUDA_MINOR
-          export CUDA_VERSION_SUFFIX="cu${CUDA_MAJOR}${CUDA_MINOR}"
+          export FLASHINFER_LOCAL_VERSION="cu${CUDA_MAJOR}${CUDA_MINOR}"
 
           chown -R $(id -u):$(id -g) ${{ github.workspace }}
           mkdir -p ${{ github.workspace }}/ci-cache
@@ -168,7 +167,7 @@ jobs:
             -e CUDA_VERSION="${{ matrix.cuda }}" \
             -e CUDA_MAJOR="$CUDA_MAJOR" \
             -e CUDA_MINOR="$CUDA_MINOR" \
-            -e CUDA_VERSION_SUFFIX="$CUDA_VERSION_SUFFIX" \
+            -e FLASHINFER_LOCAL_VERSION="$FLASHINFER_LOCAL_VERSION" \
             -e FLASHINFER_DEV_RELEASE_SUFFIX="${FLASHINFER_DEV_RELEASE_SUFFIX}" \
             -e ARCH="${{ matrix.arch }}" \
             -e FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST}" \

@@ -25,7 +25,7 @@ from .activation import gelu_and_mul as gelu_and_mul
 from .activation import gelu_tanh_and_mul as gelu_tanh_and_mul
 from .activation import silu_and_mul as silu_and_mul
 from .activation import (
-    silu_and_mul_nvfp4_batched_quantize as silu_and_mul_nvfp4_batched_quantize,
+    silu_and_mul_scaled_nvfp4_experts_quantize as silu_and_mul_scaled_nvfp4_experts_quantize,
 )
 from .attention import BatchAttention as BatchAttention
 from .attention import (
@@ -71,6 +71,7 @@ from .fp4_quantization import (
     nvfp4_batched_quantize,
     shuffle_matrix_a,
     shuffle_matrix_sf_a,
+    scaled_fp4_grouped_quantize,
 )
 from .fp8_quantization import mxfp8_dequantize_host, mxfp8_quantize
 from .fused_moe import (
@@ -90,6 +91,7 @@ from .gemm import mm_fp8 as mm_fp8
 from .gemm import tgv_gemm_sm100 as tgv_gemm_sm100
 from .mla import BatchMLAPagedAttentionWrapper as BatchMLAPagedAttentionWrapper
 from .norm import fused_add_rmsnorm as fused_add_rmsnorm
+from .norm import layernorm as layernorm
 from .norm import gemma_fused_add_rmsnorm as gemma_fused_add_rmsnorm
 from .norm import gemma_rmsnorm as gemma_rmsnorm
 from .norm import rmsnorm as rmsnorm

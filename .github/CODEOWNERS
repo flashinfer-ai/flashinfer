@@ -1,0 +1,43 @@
+# Code Owners File
+# Generated automatically from git history analysis
+# Analysis period: 180 days
+# Minimum commits threshold: 1
+
+benchmarks/ @bkryu @cyx-6 @nv-yunzheq @kahyunnam @nvmbreughe
+benchmarks/routines/ @bkryu @nv-yunzheq @cyx-6 @nvmbreughe @Anerudhan
+ci/ @cyx-6 @yzh119 @nvmbreughe
+ci/scripts/ @cyx-6
+ci/scripts/jenkins/ @cyx-6
+csrc/ @yzh119 @wenscarl @cyx-6 @yongwww @kahyunnam
+csrc/fused_moe/ @yzh119 @yongwww @wenscarl @cyx-6 @yongwww
+csrc/fused_moe/cutlass_backend/ @yzh119 @yongwww @wenscarl @cyx-6 @yongwww
+csrc/nv_internal/ @wenscarl @yzh119 @cyx-6 @yongwww @aleozlx
+csrc/nv_internal/cpp/ @wenscarl @yongwww @joker-eph @ttyio @azhurkevich
+csrc/nv_internal/include/ @wenscarl
+csrc/nv_internal/tensorrt_llm/ @wenscarl @yzh119 @cyx-6 @yongwww @aleozlx
+csrc/xqa/ @yzh119 @cyx-6
+docs/ @yzh119 @cyx-6 @wenscarl @nv-yunzheq @aleozlx
+flashinfer/ @yzh119 @cyx-6 @nvmbreughe @wenscarl @yongwww
+flashinfer-cubin/ @yzh119 @cyx-6
+flashinfer-cubin/flashinfer_cubin/ @yzh119
+flashinfer-jit-cache/ @yzh119 @cyx-6
+flashinfer-jit-cache/flashinfer_jit_cache/ @yzh119
+flashinfer/comm/ @yzh119 @cyx-6 @nvmbreughe @wenscarl @aleozlx
+flashinfer/cudnn/ @Anerudhan @yzh119 @cyx-6 @Anerudhan
+flashinfer/cute_dsl/ @yzh119 @kaixih @Amir-19 @aleozlx
+flashinfer/fused_moe/ @yzh119 @cyx-6 @wenscarl @IwakuraRein @joker-eph
+flashinfer/jit/ @yzh119 @cyx-6 @aleozlx @yongwww @bkryu
+flashinfer/jit/attention/ @yzh119 @Anerudhan @joker-eph
+flashinfer/jit/gemm/ @yzh119
+flashinfer/logits_processor/ @cyx-6 @yzh119
+flashinfer/profiler/ @cyx-6
+flashinfer/triton/ @cyx-6 @nvmbreughe @yzh119
+flashinfer/tuning_configs/ @kaixih
+include/ @yzh119 @cyx-6 @kahyunnam @joker-eph @aleozlx
+include/flashinfer/ @yzh119 @cyx-6 @kahyunnam @joker-eph @aleozlx
+include/flashinfer/attention/ @yzh119 @kahyunnam @joker-eph
+include/flashinfer/comm/ @yongwww @nvmbreughe @yzh119 @cyx-6
+include/flashinfer/gemm/ @ttyio @yongwww @aleozlx @cyx-6
+include/flashinfer/trtllm/ @joker-eph @aleozlx @yzh119 @cyx-6 @aleozlx
+profiler/ @cyx-6
+scripts/ @yzh119 @nvmbreughe @yongwww @bkryu @dierksen

@@ -16,3 +16,4 @@ Up/Gate output activation
     silu_and_mul
     gelu_tanh_and_mul
     gelu_and_mul
+    silu_and_mul_scaled_nvfp4_experts_quantize

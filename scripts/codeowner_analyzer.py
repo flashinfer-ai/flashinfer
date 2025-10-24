@@ -14,11 +14,8 @@ import sys
 from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple, Any, Set, DefaultDict
+from typing import List, Dict, Optional, Tuple, Any, DefaultDict
 import re
-import urllib.request
-import urllib.error
-import time
 
 
 class CodeOwnersAnalyzer:
@@ -28,9 +25,9 @@ class CodeOwnersAnalyzer:
         min_commits: int = 2,
         days_back: int = 365,
         exclude_patterns: Optional[List[str]] = None,
-        github_token: Optional[str] = None,
-        use_api: bool = True,
         allowed_users: Optional[List[str]] = None,
+        max_depth: int = 3,
+        top_n_owners: int = 3,
     ):
         """
         Initialize the code owners analyzer.
@@ -40,24 +37,18 @@ class CodeOwnersAnalyzer:
             min_commits: Minimum commits required to be considered an owner
             days_back: How many days back to analyze (default: 1 year)
             exclude_patterns: List of path patterns to exclude from analysis
-            github_token: Optional GitHub API token for higher rate limits
-            use_api: Whether to use GitHub API for email lookups (default: True)
             allowed_users: Optional list of GitHub usernames to include (filters out others)
+            max_depth: Maximum directory depth for module detection (default: 3)
+            top_n_owners: Number of top owners to include in CODEOWNERS file (default: 3)
         """
         self.repo_path = Path(repo_path).resolve()
         self.min_commits = min_commits
         self.days_back = days_back
-        self.module_owners: DefaultDict[str, DefaultDict[str, int]] = defaultdict(
-            lambda: defaultdict(int)
-        )
-        self.module_files: DefaultDict[str, Set[str]] = defaultdict(set)
+        self.max_depth = max_depth
+        self.top_n_owners = top_n_owners
         self.email_to_github: Dict[
             str, str
         ] = {}  # Cache for email to GitHub username mappings
-        self.github_token = github_token or os.environ.get("GITHUB_TOKEN")
-        self.use_api = use_api
-        self.api_call_count = 0
-        self.last_api_call_time: float = 0
         # Convert allowed users to lowercase for case-insensitive comparison
         self.allowed_users = (
             set(u.lower() for u in allowed_users) if allowed_users else None
@@ -90,15 +81,28 @@ class CodeOwnersAnalyzer:
         if not (self.repo_path / ".git").exists():
             raise ValueError(f"Not a git repository: {self.repo_path}")
 
+        # Check if gh CLI is available
+        try:
+            subprocess.run(
+                ["gh", "--version"], capture_output=True, check=True, timeout=5
+            )
+        except (
+            subprocess.CalledProcessError,
+            FileNotFoundError,
+            subprocess.TimeoutExpired,
+        ) as e:
+            raise ValueError(
+                "GitHub CLI (gh) is not installed or not available in PATH.\n"
+                "Please install it from: https://cli.github.com/\n"
+                "Or use package manager: brew install gh / apt install gh / etc."
+            ) from e
+
     def extract_github_username_from_email(self, email: str) -> Optional[str]:
         """
         Extract GitHub username from email address.
 
-        Common patterns:
-        - username@users.noreply.github.com
-        - 12345+username@users.noreply.github.com
-        - username@github.com
-        - For other emails, try to use the local part as a potential username
+        For GitHub noreply emails, extract directly from email pattern.
+        For all other emails, use GitHub CLI to lookup the username.
         """
         email = email.strip().lower()
 
@@ -108,7 +112,7 @@ class CodeOwnersAnalyzer:
 
         username = None
 
-        # GitHub noreply email patterns
+        # GitHub noreply email patterns - can extract directly
         if "users.noreply.github.com" in email:
             # Pattern: username@users.noreply.github.com
             match = re.match(r"^([^@+]+)@users\.noreply\.github\.com$", email)
@@ -119,40 +123,21 @@ class CodeOwnersAnalyzer:
                 match = re.match(r"^\d+\+([^@]+)@users\.noreply\.github\.com$", email)
                 if match:
                     username = match.group(1)
-
-        # GitHub.com email
-        elif "@github.com" in email:
-            match = re.match(r"^([^@]+)@github\.com$", email)
-            if match:
-                username = match.group(1)
-
-        # For other emails, try multiple lookup methods
         else:
-            # First, try GitHub API lookup if enabled
-            if self.use_api:
-                username = self.lookup_github_username_via_api(email)
-            else:
-                username = None
-
-            # If API lookup fails or is disabled, try to get from commit history
-            if not username:
-                username = self.lookup_github_username_from_commits(email)
-
-            # If still not found, use local part of email as a last resort fallback
-            # but don't return it as a username (return None instead)
-            if not username:
-                # We don't want to guess usernames from email local parts
-                # as they're often incorrect
-                username = None
+            # For all other emails, use GitHub CLI to lookup
+            username = self.lookup_github_username_via_gh_cli(email)
 
         # Cache the result (including None to avoid repeated failed lookups)
         self.email_to_github[email] = username
 
         return username
 
-    def lookup_github_username_via_api(self, email: str) -> Optional[str]:
+    def lookup_github_username_via_gh_cli(self, email: str) -> Optional[str]:
         """
-        Look up GitHub username via GitHub API search.
+        Look up GitHub username using the GitHub CLI tool (gh).
+
+        This queries the GitHub repository commits to find commits by the given email
+        and extracts the author's GitHub login name.
 
         Args:
             email: Email address to search for
@@ -160,170 +145,51 @@ class CodeOwnersAnalyzer:
         Returns:
             GitHub username if found, None otherwise
         """
-        # Rate limiting based on GitHub API limits:
-        # - Authenticated: 5000 requests/hour = 1.39 req/sec
-        # - Unauthenticated: 60 requests/hour = 1 req/60sec
-        current_time = time.time()
+        try:
+            # Extract repository owner and name from git remote
+            remote_url = self.run_git_command(
+                ["git", "config", "--get", "remote.origin.url"]
+            )
 
-        if self.api_call_count > 0:
-            time_since_last = current_time - self.last_api_call_time
-
-            if self.github_token:
-                # With token: 5000/hour = 0.72 seconds between calls (with buffer)
-                min_delay = 0.8
-            else:
-                # Without token: 60/hour = 60 seconds between calls
-                min_delay = 60.1
-
-            if time_since_last < min_delay:
-                time.sleep(min_delay - time_since_last)
-
-        retry_count = 0
-        max_retries = 3
-        base_delay = 1
-
-        while retry_count < max_retries:
-            try:
-                # Search for users by email
-                search_url = f"https://api.github.com/search/users?q={email}+in:email"
-
-                req = urllib.request.Request(search_url)
-                req.add_header("Accept", "application/vnd.github.v3+json")
-                req.add_header("User-Agent", "flashinfer-codeowner-analyzer")
-
-                if self.github_token:
-                    req.add_header("Authorization", f"Bearer {self.github_token}")
-
-                self.api_call_count += 1
-                self.last_api_call_time = time.time()
-
-                with urllib.request.urlopen(req, timeout=10) as response:
-                    data = json.loads(response.read().decode())
-
-                    if data.get("total_count", 0) > 0 and "items" in data:
-                        # Return the first matching user's login
-                        login = data["items"][0].get("login")
-                        result = login if isinstance(login, str) else None
-                        # Cache the API result
-                        self.email_to_github[email] = result
-                        return result
-
-                    # Cache the failed lookup to avoid retrying
-                    self.email_to_github[email] = None
-                    return None
-
-            except urllib.error.HTTPError as e:
-                if e.code == 403:
-                    # Rate limit exceeded - implement exponential backoff
-                    retry_delay = base_delay * (2**retry_count)
-                    if retry_count < max_retries - 1:
-                        print(
-                            f"GitHub API rate limit hit, retrying in {retry_delay}s... (attempt {retry_count + 1}/{max_retries})"
-                        )
-                        time.sleep(retry_delay)
-                        retry_count += 1
-                        continue
-                    else:
-                        print(
-                            f"Warning: GitHub API rate limit exceeded for email lookup: {email}"
-                        )
-                        # Cache the failed lookup to avoid retrying
-                        self.email_to_github[email] = None
-                        return None
-                elif e.code == 401:
-                    print(
-                        "Warning: GitHub API authentication failed. Check your token."
-                    )
-                    # Cache the failed lookup to avoid retrying
-                    self.email_to_github[email] = None
-                    return None
-                else:
-                    # Other HTTP errors - don't retry but report them
-                    print(
-                        f"Warning: GitHub API HTTP error for {email}: {e.code} {e.reason}"
-                    )
-                    # Cache the failed lookup to avoid retrying
-                    self.email_to_github[email] = None
-                    return None
-            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
-                # Network or parsing errors - retry with backoff
-                retry_delay = base_delay * (2**retry_count)
-                retry_count += 1
-                if retry_count < max_retries:
-                    print(
-                        f"GitHub API network error for {email}, retrying in {retry_delay}s... (attempt {retry_count}/{max_retries}): {type(e).__name__}"
-                    )
-                    time.sleep(retry_delay)
-                    continue
-                # Cache the failed lookup after all retries exhausted
-                print(
-                    f"Warning: GitHub API lookup failed for {email} after {max_retries} retries: {type(e).__name__}: {e}"
-                )
-                self.email_to_github[email] = None
-                return None
-            except Exception as e:
-                # Any other errors - don't retry but report them
-                print(
-                    f"Warning: Unexpected error during GitHub API lookup for {email}: {type(e).__name__}: {e}"
-                )
-                # Cache the failed lookup to avoid retrying
-                self.email_to_github[email] = None
+            if not remote_url:
                 return None
 
-        # Cache the failed lookup after all retries exhausted
-        self.email_to_github[email] = None
-        return None
+            # Parse GitHub repo from URL (supports both HTTPS and SSH formats)
+            # HTTPS: https://github.com/owner/repo.git
+            # SSH: git@github.com:owner/repo.git
+            repo_match = re.search(
+                r"github\.com[:/]([^/]+)/([^/\s]+?)(?:\.git)?$", remote_url
+            )
+            if not repo_match:
+                return None
 
-    def lookup_github_username_from_commits(self, email: str) -> Optional[str]:
-        """
-        Try to find GitHub username from commit metadata.
+            repo_owner = repo_match.group(1)
+            repo_name = repo_match.group(2)
+            repo_full = f"{repo_owner}/{repo_name}"
 
-        This looks for commits by this email that might have been made via GitHub
-        which often includes the username in the commit message or author field.
-        """
-        # Look for recent commits by this author
-        command = [
-            "git",
-            "log",
-            "--author",
-            email,
-            "--format=%an|%cn|%s",  # author name, committer name, subject
-            "--max-count=10",
-        ]
-        output = self.run_git_command(command)
+            # Use gh CLI to search for commits by this author email
+            # Use author filter in URL query string
+            gh_command = [
+                "gh",
+                "api",
+                f"repos/{repo_full}/commits?author={email}&per_page=1",
+                "--jq",
+                ".[0].author.login // empty",
+            ]
 
-        if not output:
+            result = subprocess.run(
+                gh_command, capture_output=True, text=True, timeout=10
+            )
+
+            if result.returncode == 0 and result.stdout.strip():
+                username = result.stdout.strip()
+                return username if username else None
+
             return None
 
-        # Check if any commits were made via GitHub (often have specific patterns)
-        for line in output.split("\n"):
-            if line.strip():
-                parts = line.split("|")
-                if len(parts) >= 3:
-                    # Check commit message for GitHub PR patterns
-                    subject = parts[2]
-                    # Pattern: "Merge pull request #123 from username/branch"
-                    match = re.search(r"from ([^/\s]+)/", subject)
-                    if match:
-                        username = match.group(1)
-                        # Cache the result
-                        self.email_to_github[email] = username
-                        return username
-
-                    # Pattern: "Co-authored-by: Name <email>"
-                    match = re.search(r"Co-authored-by:.*<([^>]+)>", subject)
-                    if match and "users.noreply.github.com" in match.group(1):
-                        username = self.extract_github_username_from_email(
-                            match.group(1)
-                        )
-                        if username:
-                            # Cache the result
-                            self.email_to_github[email] = username
-                            return username
-
-        # Cache the failed lookup
-        self.email_to_github[email] = None
-        return None
+        except (subprocess.TimeoutExpired, subprocess.CalledProcessError, Exception):
+            # If gh CLI fails or is not available, return None
+            return None
 
     def should_include_contributor(self, author_string: str) -> bool:
         """
@@ -439,8 +305,10 @@ class CodeOwnersAnalyzer:
 
             if file_ext in relevant_extensions:
                 # Add the directory and all parent directories as modules
+                # Limited by max_depth
                 path_parts = Path(dir_path).parts
-                for i in range(1, len(path_parts) + 1):
+                max_parts = min(len(path_parts), self.max_depth)
+                for i in range(1, max_parts + 1):
                     module = "/".join(path_parts[:i])
                     if not self.should_exclude(module):
                         modules.add(module)
@@ -654,10 +522,10 @@ class CodeOwnersAnalyzer:
 
             for module, data in results.items():
                 if data["owners"]:
-                    # Take top 3 owners or those with ownership score > 0.1
+                    # Take top N owners or those with ownership score > 0.1
                     top_owners = [
                         owner
-                        for owner in data["owners"][:3]
+                        for owner in data["owners"][: self.top_n_owners]
                         if owner["ownership_score"] > 0.1
                     ]
 
@@ -726,8 +594,6 @@ Examples:
   %(prog)s --exclude vendor/ deps/  # Exclude additional directories
   %(prog)s --days-back 180          # Analyze last 6 months
   %(prog)s --json-output owners.json # Export detailed JSON
-  %(prog)s --github-token TOKEN     # Use GitHub API for email lookups
-  GITHUB_TOKEN=TOKEN %(prog)s       # Or set via environment variable
   %(prog)s --allowed-users user1 user2 # Only include specific GitHub users
   %(prog)s --allowed-users-file team.txt # Load allowed users from file
         """,
@@ -756,15 +622,6 @@ Examples:
         help="Additional path patterns to exclude (e.g., vendor/ deps/)",
     )
     parser.add_argument(
-        "--github-token",
-        help="GitHub API token for email lookups (or set GITHUB_TOKEN env var)",
-    )
-    parser.add_argument(
-        "--no-api",
-        action="store_true",
-        help="Disable GitHub API lookups for faster processing",
-    )
-    parser.add_argument(
         "--allowed-users",
         nargs="*",
         help="Only include these GitHub users in analysis (e.g., user1 user2)",
@@ -772,6 +629,18 @@ Examples:
     parser.add_argument(
         "--allowed-users-file",
         help="File containing allowed GitHub usernames, one per line",
+    )
+    parser.add_argument(
+        "--depth",
+        type=int,
+        default=3,
+        help="Maximum directory depth for module detection (default: 3)",
+    )
+    parser.add_argument(
+        "--top-n",
+        type=int,
+        default=3,
+        help="Number of top owners to include in CODEOWNERS file (default: 3)",
     )
 
     args = parser.parse_args()
@@ -808,9 +677,9 @@ Examples:
             min_commits=args.min_commits,
             days_back=args.days_back,
             exclude_patterns=args.exclude,
-            github_token=args.github_token,
-            use_api=not args.no_api,
             allowed_users=allowed_users,
+            max_depth=args.depth,
+            top_n_owners=args.top_n,
         )
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)

@@ -73,6 +73,19 @@ class RoutingMethodType(IntEnum):
     Unspecified = 6
 
 
+# Copied from csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/common.h
+class ActivationType(IntEnum):
+    Gelu = 0
+    Relu = 1
+    Silu = 2
+    Swiglu = 3
+    Geglu = 4
+    SwigluBias = 5
+    Relu2 = 6
+    Identity = 7
+    InvalidType = 8
+
+
 class DtypeTrtllmGen(IntEnum):
     def __new__(cls, block_format_bit, signed_bit, integer_bit, num_bits, uid):
         value = (
@@ -171,7 +184,9 @@ def _maybe_get_cached_w3_w1_permute_indices(
     epilogue_tile_m: int,
     num_elts_per_sf: Union[None, int] = None,
 ) -> torch.Tensor:
-    if dst_w3_w1_weight.shape not in _cache_permute_indices:
+    # Create a unique cache key (weight_type, weight_shape)
+    cache_key = ("w3_w1", dst_w3_w1_weight.shape)
+    if cache_key not in _cache_permute_indices:
         # Get permute indices and chain them together
         permute0 = get_reorder_rows_for_gated_act_gemm_row_indices(dst_w3_w1_weight)
         if num_elts_per_sf is None:
@@ -185,10 +200,10 @@ def _maybe_get_cached_w3_w1_permute_indices(
                 num_elts_per_sf=num_elts_per_sf,
             )
         # Memoize permute indices as recompute is **very** costly
-        _cache_permute_indices[dst_w3_w1_weight.shape] = permute0[permute1].to(
+        _cache_permute_indices[cache_key] = permute0[permute1].to(
             dst_w3_w1_weight.device
         )
-    permute_indices = _cache_permute_indices[dst_w3_w1_weight.shape]
+    permute_indices = _cache_permute_indices[cache_key]
     return permute_indices
 
 
@@ -198,7 +213,9 @@ def get_w2_permute_indices_with_cache(
     epilogue_tile_m: int,
     num_elts_per_sf: Union[None, int] = None,
 ) -> torch.Tensor:
-    if dst_w2_weight.shape not in _cache_permute_indices:
+    # Create a unique cache key (weight_type, weight_shape)
+    cache_key = ("w2", dst_w2_weight.shape)
+    if cache_key not in _cache_permute_indices:
         if num_elts_per_sf is None:
             permute_indices = get_shuffle_matrix_a_row_indices(
                 dst_w2_weight, epilogue_tile_m
@@ -210,8 +227,8 @@ def get_w2_permute_indices_with_cache(
                 num_elts_per_sf=num_elts_per_sf,
             ).to(dst_w2_weight.device)
         # Memoize permute indices as recompute is **very** costly
-        _cache_permute_indices[dst_w2_weight.shape] = permute_indices
-    permute_indices = _cache_permute_indices[dst_w2_weight.shape]
+        _cache_permute_indices[cache_key] = permute_indices
+    permute_indices = _cache_permute_indices[cache_key]
     return permute_indices
 
 
@@ -305,6 +322,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             use_mxfp8_act_scaling: bool,
             min_latency_mode: bool,
             enable_pdl: bool,
+            activation_type: ActivationType,
         ):
             self.x_dtype = x_dtype
             self.weight_dtype = weight_dtype
@@ -330,6 +348,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
                 use_w4_group_scaling,
                 use_mxfp8_act_scaling,
             )
+            self.activation_type = activation_type
 
             if instance_key not in MoERunner.runner_dict:
                 MoERunner.runner_dict[instance_key] = module.init(
@@ -383,6 +402,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
                 tactic,
                 do_preparation,
                 self.enable_pdl,
+                self.activation_type,
             )
 
         @classmethod
@@ -431,6 +451,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
         min_latency_mode: bool = False,
         tune_max_num_tokens: int = 8192,
         enable_pdl: Optional[bool] = None,
+        activation_type: ActivationType = ActivationType.Swiglu,
     ) -> List[torch.Tensor]:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(input.device)
@@ -455,6 +476,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             use_mxfp8_act_scaling=use_mxfp8_act_scaling,
             min_latency_mode=min_latency_mode,
             enable_pdl=enable_pdl,
+            activation_type=activation_type,
         )
 
         _, gemm_tactic_1 = tuner.choose_one(
@@ -537,6 +559,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             min_latency_mode,
             [gemm_tactic_1, gemm_tactic_2],
             enable_pdl,
+            activation_type,
         )
 
         return (
@@ -632,6 +655,7 @@ def cutlass_fused_moe(
     min_latency_mode: bool = False,
     tune_max_num_tokens: int = 8192,
     enable_pdl: Optional[bool] = None,
+    activation_type: ActivationType = ActivationType.Swiglu,
 ) -> torch.Tensor:
     """Compute a Mixture of Experts (MoE) layer using CUTLASS backend.
 
@@ -736,6 +760,9 @@ def cutlass_fused_moe(
     tune_max_num_tokens : int = 8192
         Maximum number of tokens for tuning. Defaults to 8192.
 
+    activation_type: ActivationType = ActivationType.Swiglu
+        Activation to apply on for GEMM1, note that Relu2 means non-gated GEMM1
+
     Returns
     -------
     out: torch.Tensor
@@ -815,6 +842,7 @@ def cutlass_fused_moe(
         min_latency_mode=min_latency_mode,
         tune_max_num_tokens=tune_max_num_tokens,
         enable_pdl=enable_pdl,
+        activation_type=activation_type,
     )
 
 
@@ -1073,12 +1101,12 @@ def get_trtllm_moe_sm100_module():
         output2_scales_scalar: torch.Tensor,
         num_experts: int,
         top_k: int,
-        n_group: int,
-        topk_group: int,
+        n_group: Optional[int],
+        topk_group: Optional[int],
         intermediate_size: int,
         local_expert_offset: int,
         local_num_experts: int,
-        routed_scaling_factor: float,
+        routed_scaling_factor: Optional[float],
         use_routing_scales_on_input: bool,
         tile_tokens_dim: int = 8,
         routing_method_type: int = 0,
@@ -1127,12 +1155,12 @@ def get_trtllm_moe_sm100_module():
         output2_scales_scalar: torch.Tensor,
         num_experts: int,
         top_k: int,
-        n_group: int,
-        topk_group: int,
+        n_group: Optional[int],
+        topk_group: Optional[int],
         intermediate_size: int,
         local_expert_offset: int,
         local_num_experts: int,
-        routed_scaling_factor: float,
+        routed_scaling_factor: Optional[float],
         use_routing_scales_on_input: bool,
         tile_tokens_dim: int = 8,
         routing_method_type: int = 0,
@@ -1159,12 +1187,12 @@ def get_trtllm_moe_sm100_module():
         output: torch.Tensor,
         num_experts: int,
         top_k: int,
-        n_group: int,
-        topk_group: int,
+        n_group: Optional[int],
+        topk_group: Optional[int],
         intermediate_size: int,
         local_expert_offset: int,
         local_num_experts: int,
-        routed_scaling_factor: float,
+        routed_scaling_factor: Optional[float],
         tile_tokens_dim: int,
         routing_method_type: int,
         use_shuffled_weight: bool = False,
@@ -1173,6 +1201,7 @@ def get_trtllm_moe_sm100_module():
     ) -> torch.Tensor:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(hidden_states.device)
+
         # Call the C++ function for block scale MoE
         moe_op.trtllm_fp8_block_scale_moe(
             routing_logits,
@@ -1214,12 +1243,12 @@ def get_trtllm_moe_sm100_module():
         output: torch.Tensor,
         num_experts: int,
         top_k: int,
-        n_group: int,
-        topk_group: int,
+        n_group: Optional[int],
+        topk_group: Optional[int],
         intermediate_size: int,
         local_expert_offset: int,
         local_num_experts: int,
-        routed_scaling_factor: float,
+        routed_scaling_factor: Optional[float],
         tile_tokens_dim: int = 8,
         routing_method_type: int = 0,
         use_shuffled_weight: bool = False,
@@ -1479,12 +1508,12 @@ def trtllm_fp8_per_tensor_scale_moe(
     output2_scales_scalar: torch.Tensor,
     num_experts: int,
     top_k: int,
-    n_group: int,
-    topk_group: int,
+    n_group: Optional[int],
+    topk_group: Optional[int],
     intermediate_size: int,
     local_expert_offset: int,
     local_num_experts: int,
-    routed_scaling_factor: float,
+    routed_scaling_factor: Optional[float],
     use_routing_scales_on_input: bool,
     tile_tokens_dim: int = 8,
     routing_method_type: int = 0,
@@ -1552,12 +1581,12 @@ def trtllm_fp8_block_scale_moe(
     gemm2_weights_scale: torch.Tensor,
     num_experts: int,
     top_k: int,
-    n_group: int,
-    topk_group: int,
+    n_group: Optional[int],
+    topk_group: Optional[int],
     intermediate_size: int,
     local_expert_offset: int,
     local_num_experts: int,
-    routed_scaling_factor: float,
+    routed_scaling_factor: Optional[float],
     tile_tokens_dim: int = 8,
     routing_method_type: int = 0,
     use_shuffled_weight: bool = False,

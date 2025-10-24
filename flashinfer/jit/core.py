@@ -290,7 +290,10 @@ def gen_jit_spec(
     needs_device_linking: bool = False,
 ) -> JitSpec:
     check_cuda_arch()
-    verbose = os.environ.get("FLASHINFER_JIT_VERBOSE", "0") == "1"
+    # Use FLASHINFER_JIT_DEBUG if set, otherwise use FLASHINFER_JIT_VERBOSE (for backward compatibility)
+    debug_env = os.environ.get("FLASHINFER_JIT_DEBUG")
+    verbose_env = os.environ.get("FLASHINFER_JIT_VERBOSE", "0")
+    debug = (debug_env if debug_env is not None else verbose_env) == "1"
 
     cflags = ["-std=c++17", "-Wno-switch-bool"]
     cuda_cflags = [
@@ -302,7 +305,7 @@ def gen_jit_spec(
         "-DFLASHINFER_ENABLE_FP8_E4M3",
         "-DFLASHINFER_ENABLE_FP8_E5M2",
     ]
-    if verbose:
+    if debug:
         cflags += ["-O0", "-g"]
         cuda_cflags += [
             "-g",
@@ -310,7 +313,6 @@ def gen_jit_spec(
             "-G",
             "-lineinfo",
             "--ptxas-options=-v",
-            "--ptxas-options=--verbose,--register-usage-level=10,--warn-on-local-memory-usage",
             "-DCUTLASS_DEBUG_TRACE_LEVEL=2",
         ]
     else:
