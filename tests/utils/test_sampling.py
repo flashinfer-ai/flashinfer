@@ -72,7 +72,7 @@ def test_softmax(
 
     probs_ref = torch.softmax(logits_scaled, dim=-1)
 
-    assert torch.allclose(probs, probs_ref, atol=1e-5)
+    assert torch.allclose(probs, probs_ref, rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])

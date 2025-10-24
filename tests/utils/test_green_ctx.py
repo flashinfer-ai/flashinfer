@@ -12,9 +12,15 @@ def test_green_ctx_creation(
     num_groups: int,
     min_count: int,
 ):
-    streams, resources = green_ctx.split_device_green_ctx(
-        torch.device(device), num_groups, min_count
-    )
+    dev = torch.device(device)
+    try:
+        streams, resources = green_ctx.split_device_green_ctx(
+            dev, num_groups, min_count
+        )
+    except RuntimeError as e:
+        if "Insufficient SMs" in str(e):
+            pytest.skip(str(e))
+        raise
 
     assert len(resources) == num_groups + 1
     for resource in resources[:-1]:
@@ -30,9 +36,14 @@ def test_green_ctx_kernel_execution(
     num_groups: int,
     min_count: int,
 ):
-    streams, resources = green_ctx.split_device_green_ctx(
-        torch.device(device), num_groups, min_count
-    )
+    try:
+        streams, resources = green_ctx.split_device_green_ctx(
+            torch.device(device), num_groups, min_count
+        )
+    except RuntimeError as e:
+        if "Insufficient SMs" in str(e):
+            pytest.skip(str(e))
+        raise
     num_partitions = num_groups + 1
     assert len(streams) == num_partitions
     assert len(resources) == num_partitions
@@ -59,9 +70,14 @@ def test_split_device_green_ctx_by_sm_count_creation(
     device: str,
     sm_counts: list,
 ):
-    streams, resources = green_ctx.split_device_green_ctx_by_sm_count(
-        torch.device(device), sm_counts
-    )
+    try:
+        streams, resources = green_ctx.split_device_green_ctx_by_sm_count(
+            torch.device(device), sm_counts
+        )
+    except RuntimeError as e:
+        if "Insufficient SMs" in str(e):
+            pytest.skip(str(e))
+        raise
     num_partitions = len(sm_counts) + 1
     assert len(resources) == num_partitions
     assert len(streams) == num_partitions
@@ -85,9 +101,14 @@ def test_split_device_green_ctx_by_sm_count_kernel_execution(
     device: str,
     sm_counts: list,
 ):
-    streams, resources = green_ctx.split_device_green_ctx_by_sm_count(
-        torch.device(device), sm_counts
-    )
+    try:
+        streams, resources = green_ctx.split_device_green_ctx_by_sm_count(
+            torch.device(device), sm_counts
+        )
+    except RuntimeError as e:
+        if "Insufficient SMs" in str(e):
+            pytest.skip(str(e))
+        raise
     num_partitions = len(sm_counts) + 1
     assert len(streams) == num_partitions
     assert len(resources) == num_partitions
@@ -113,9 +134,14 @@ def test_split_device_green_ctx_by_sm_count_alignment(
     device: str,
     sm_counts: list,
 ):
-    _, resources = green_ctx.split_device_green_ctx_by_sm_count(
-        torch.device(device), sm_counts
-    )
+    try:
+        _, resources = green_ctx.split_device_green_ctx_by_sm_count(
+            torch.device(device), sm_counts
+        )
+    except RuntimeError as e:
+        if "Insufficient SMs" in str(e):
+            pytest.skip(str(e))
+        raise
 
     for resource in resources[:-1]:  # Exclude remaining SMs
         sm_count = resource.sm.smCount
