@@ -236,16 +236,16 @@ void silu_and_mul_scaled_nvfp4_experts_quantize(Tensor output, Tensor output_sca
   // 4 means 4 fp8 values are packed into one int32
   TVM_FFI_ICHECK_EQ(output_scale.shape()[1] * 4, padded_k);
 
-  auto in_dtype = input->dtype;
-  const cudaStream_t stream = get_stream(input->device);
+  auto in_dtype = input.dtype();
+  const cudaStream_t stream = get_stream(input.device());
   if (in_dtype == dl_float16) {
     tensorrt_llm::kernels::invokeSiluAndMulNVFP4Quantization<half>(
-        output->data, output_scale->data, input->data, input_global_scale->data, mask->data,
-        use_silu_and_mul, m_topk, k, n_experts, stream);
+        output.data_ptr(), output_scale.data_ptr(), input.data_ptr(), input_global_scale.data_ptr(),
+        mask.data_ptr(), use_silu_and_mul, m_topk, k, n_experts, stream);
   } else if (in_dtype == dl_bfloat16) {
     tensorrt_llm::kernels::invokeSiluAndMulNVFP4Quantization<__nv_bfloat16>(
-        output->data, output_scale->data, input->data, input_global_scale->data, mask->data,
-        use_silu_and_mul, m_topk, k, n_experts, stream);
+        output.data_ptr(), output_scale.data_ptr(), input.data_ptr(), input_global_scale.data_ptr(),
+        mask.data_ptr(), use_silu_and_mul, m_topk, k, n_experts, stream);
   } else {
     TVM_FFI_LOG_AND_THROW(NotImplementedError) << "silu_and_mul_scaled_nvfp4_experts_quantize only "
                                                   "supports input tensor with dtypes fp16/bf16.";
