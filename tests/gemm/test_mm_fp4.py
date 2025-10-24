@@ -105,5 +105,20 @@ def test_mm_fp4(
             pytest.fail(str(e))
 
 
+# Split tests for checking auto functionality
+@pytest.mark.parametrize("m", [1, 48, 256, 512])
+@pytest.mark.parametrize("n", [256, 512])
+@pytest.mark.parametrize("k", [256, 512])
+@pytest.mark.parametrize("res_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("backend", ["auto"])
+@pytest.mark.parametrize("use_128x4_sf_layout", [False, True])
+@pytest.mark.parametrize("auto_tuning", [False, True])
+@pytest.mark.parametrize("fp4_type", ["nvfp4", "mxfp4", "mxfp4_alpha"])
+def test_mm_fp4_backend_auto(
+    m, n, k, res_dtype, backend, use_128x4_sf_layout, auto_tuning, fp4_type
+):
+    test_mm_fp4(m, n, k, res_dtype, "auto", use_128x4_sf_layout, auto_tuning, fp4_type)
+
+
 if __name__ == "__main__":
     pytest.main([__file__])
