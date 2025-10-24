@@ -478,11 +478,18 @@ def test_top_k_renorm_probs(batch_size, vocab_size, k):
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("k", [10, 100, 500])
 @pytest.mark.parametrize("neginf_input", [False, True])
-def test_top_k_mask_logits(batch_size, vocab_size, k, neginf_input):
+@pytest.mark.parametrize("contiguous", [False, True])
+def test_top_k_mask_logits(batch_size, vocab_size, k, neginf_input, contiguous):
     if k > vocab_size:
         pytest.skip("k should be less than vocab_size")
     torch.manual_seed(42)
-    logits = torch.randn(batch_size, vocab_size, device="cuda:0") * 5
+
+    if contiguous:
+        logits = torch.randn(batch_size, vocab_size, device="cuda:0") * 5
+    else:
+        logits = torch.randn(batch_size * 2, vocab_size, device="cuda:0") * 5
+        logits = logits[::2, :]
+
     if neginf_input:
         num_neginf = torch.randint(1, vocab_size * batch_size, (1,)).item()
         idxs = torch.randperm(batch_size * vocab_size, device="cuda:0")[:num_neginf]

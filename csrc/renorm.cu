@@ -23,7 +23,8 @@ using tvm::ffi::Optional;
 
 void top_p_renorm_probs(TensorView probs, TensorView renorm_probs,
                         Optional<TensorView> maybe_top_p_arr, double top_p_val) {
-  CHECK_INPUT(probs);
+  CHECK_CUDA(probs);
+  CHECK_LAST_DIM_CONTIGUOUS(probs);
   CHECK_DIM(2, probs);  // probs: (batch_size, vocab_size)
   unsigned int batch_size = probs->shape[0];
   unsigned int vocab_size = probs->shape[1];
@@ -34,14 +35,15 @@ void top_p_renorm_probs(TensorView probs, TensorView renorm_probs,
   cudaError_t status = sampling::TopPRenormProb<float>(
       static_cast<float*>(probs->data), static_cast<float*>(renorm_probs->data),
       has_top_p_arr ? static_cast<float*>(maybe_top_p_arr.value()->data) : nullptr, batch_size,
-      top_p_val, vocab_size, stream);
+      top_p_val, vocab_size, probs->strides[0], stream);
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "TopPRenormProb failed with error code " << cudaGetErrorString(status);
 }
 
 void top_k_renorm_probs(TensorView probs, TensorView renorm_probs,
                         Optional<TensorView> maybe_top_k_arr, int64_t top_k_val) {
-  CHECK_INPUT(probs);
+  CHECK_CUDA(probs);
+  CHECK_LAST_DIM_CONTIGUOUS(probs);
   CHECK_DIM(2, probs);  // probs: (batch_size, vocab_size)
   unsigned int batch_size = probs->shape[0];
   unsigned int vocab_size = probs->shape[1];
@@ -52,7 +54,7 @@ void top_k_renorm_probs(TensorView probs, TensorView renorm_probs,
   cudaError_t status = sampling::TopKRenormProb<float>(
       static_cast<float*>(probs->data), static_cast<float*>(renorm_probs->data),
       has_top_k_arr ? static_cast<int*>(maybe_top_k_arr.value()->data) : nullptr, batch_size,
-      top_k_val, vocab_size, stream);
+      top_k_val, vocab_size, probs->strides[0], stream);
 
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "TopKRenormProb failed with error code " << cudaGetErrorString(status);
@@ -60,7 +62,8 @@ void top_k_renorm_probs(TensorView probs, TensorView renorm_probs,
 
 void top_k_mask_logits(TensorView logits, TensorView mask_logits,
                        Optional<TensorView> maybe_top_k_arr, int64_t top_k_val) {
-  CHECK_INPUT(logits);
+  CHECK_CUDA(logits);
+  CHECK_LAST_DIM_CONTIGUOUS(logits);
   CHECK_DIM(2, logits);  // logits: (batch_size, vocab_size)
   unsigned int batch_size = logits->shape[0];
   unsigned int vocab_size = logits->shape[1];
@@ -71,7 +74,7 @@ void top_k_mask_logits(TensorView logits, TensorView mask_logits,
   cudaError_t status = sampling::TopKMaskLogits<float>(
       static_cast<float*>(logits->data), static_cast<float*>(mask_logits->data),
       has_top_k_arr ? static_cast<int*>(maybe_top_k_arr.value()->data) : nullptr, batch_size,
-      top_k_val, vocab_size, stream);
+      top_k_val, vocab_size, logits->strides[0], stream);
 
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "TopKMaskLogits failed with error code " << cudaGetErrorString(status);
