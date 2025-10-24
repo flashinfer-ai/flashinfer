@@ -131,7 +131,7 @@ def parse_gemm_args(line, parser):
         required=False,
         nargs="+",
         default=["cudnn"],
-        choices=["cudnn", "cublas", "trtllm", "cutlass"],
+        choices=["cudnn", "cublas", "trtllm", "cutlass", "auto"],
         help="Kernel backends to test. Default: cudnn",
     )
     parser.add_argument(
@@ -823,7 +823,7 @@ def testMmFp4(args):
             print(
                 "[INFO] cutlass backend does not support mxfp4 quantization (use_nvfp4=False)"
             )
-            backends.remove("cutlass")
+            remove_cutlass = True
         if remove_cutlass:
             backends.remove("cutlass")
     if "cudnn" in backends:
@@ -833,6 +833,13 @@ def testMmFp4(args):
             remove_cudnn = True
         if remove_cudnn:
             backends.remove("cudnn")
+    if "auto" in backends:
+        remove_auto = False
+        if not use_128x4_sf_layout:
+            print("[INFO] auto backend does not support use_128x4_sf_layout=False")
+            remove_auto = True
+        if remove_auto:
+            backends.remove("auto")
     if getattr(args, "autotune", False):
         backends_to_remove = []
         for cur_backend in backends:
@@ -889,7 +896,7 @@ def testMmFp4(args):
     # res = torch.empty([m, n], device="cuda", dtype=res_dtype)
 
     def run_backend(backend):
-        if backend in ["cudnn", "trtllm", "cutlass"]:
+        if backend in ["cudnn", "trtllm", "cutlass", "auto"]:
             return flashinfer.gemm.mm_fp4(
                 a=input_fp4,
                 b=mat2_fp4.T if backend != "trtllm" else mat2_fp4_trtllm.T,
