@@ -50,7 +50,7 @@ struct DataBase {
   // dim: [mNumTokens * mTopK]
   int32_t* mPtrExpandedIdxToPermutedIdx{nullptr};
   // optional: if `nullptr`, it is not filled
-  // dim: [mNumTokens * mTopK + (mNumExperts << mPaddingLog2) - mNumExperts]
+  // dim: [mTileTokensDim * mTopK + (mNumExperts × mTileTokensDim) - mNumExperts]
   // Note: this array (mPtrPermutedIdxToTokenIdx) is uninitialized
   // Any out-of-bounds values are undefined.
   int32_t* mPtrPermutedIdxToTokenIdx{nullptr};
@@ -93,6 +93,7 @@ struct DataBase {
   int32_t mNumExperts;
   int32_t mTopK;
   int32_t mPaddingLog2;
+  int32_t mTileTokensDim;
 
   /// For expert parallelization
   int32_t mLocalExpertsStartIdx;
@@ -100,11 +101,12 @@ struct DataBase {
   int32_t mNumLocalExperts;
 };
 
-template <typename InputT_, typename OutputT_, int MaxNumExperts_, bool UsePdl_>
+template <typename InputT_, typename OutputT_, int MaxNumExperts_, bool isPow2_, bool UsePdl_>
 struct KernelParamsBase {
   using InputT = InputT_;
   using OutputT = OutputT_;
   static constexpr int MaxNumExperts = MaxNumExperts_;
+  static constexpr bool isPow2 = isPow2_;
   static constexpr bool UsePdl = UsePdl_;
 
   // Public pointer members
@@ -123,7 +125,8 @@ struct KernelParamsBase {
   int32_t mNumTokens = 0;
   int32_t mNumExperts = 0;
 
-  int32_t mPaddingLog2 = 0;
+  int32_t mPaddingLog2 = -1;
+  int32_t mTileTokensDim = 0;
   int32_t mLocalExpertsStartIdx = 0;
   int32_t mLocalExpertsStrideLog2 = 0;
   int32_t mNumLocalExperts = 0;
@@ -146,6 +149,7 @@ struct KernelParamsBase {
     mNumExperts = data.mNumExperts;
 
     mPaddingLog2 = data.mPaddingLog2;
+    mTileTokensDim = data.mTileTokensDim;
     mLocalExpertsStartIdx = data.mLocalExpertsStartIdx;
     mLocalExpertsStrideLog2 = data.mLocalExpertsStrideLog2;
     mNumLocalExperts = data.mNumLocalExperts;
@@ -173,8 +177,8 @@ struct Data : public DataBase {
 };
 
 template <typename InputT_, typename BiasT_, typename OutputT_, int MaxNumExperts_, bool UseGroups_,
-          bool UsePdl_>
-struct KernelParams : public KernelParamsBase<InputT_, OutputT_, MaxNumExperts_, UsePdl_> {
+          bool isPow2_, bool UsePdl_>
+struct KernelParams : public KernelParamsBase<InputT_, OutputT_, MaxNumExperts_, isPow2_, UsePdl_> {
   using InputT = InputT_;
   using BiasT = BiasT_;
   using OutputT = OutputT_;
@@ -229,8 +233,8 @@ struct Data : public DataBase {
   tg::Dtype mDtypeExpW{tg::Dtype::Bfloat16};
 };
 
-template <typename InputT_, typename OutputT_, int MaxNumExperts_, bool UsePdl_>
-struct KernelParams : public KernelParamsBase<InputT_, OutputT_, MaxNumExperts_, UsePdl_> {
+template <typename InputT_, typename OutputT_, int MaxNumExperts_, bool isPow2_, bool UsePdl_>
+struct KernelParams : public KernelParamsBase<InputT_, OutputT_, MaxNumExperts_, isPow2_, UsePdl_> {
   using InputT = InputT_;
   using OutputT = OutputT_;
 
@@ -268,8 +272,8 @@ struct Data : public DataBase {
 };
 
 template <typename InputT_, typename OutputT_, int MaxNumExperts_, bool DoSoftmaxBeforeTopK_,
-          bool UsePdl_>
-struct KernelParams : public KernelParamsBase<InputT_, OutputT_, MaxNumExperts_, UsePdl_> {
+          bool isPow2_, bool UsePdl_>
+struct KernelParams : public KernelParamsBase<InputT_, OutputT_, MaxNumExperts_, isPow2_, UsePdl_> {
   using InputT = InputT_;
   using OutputT = OutputT_;
 
