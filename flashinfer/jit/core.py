@@ -90,6 +90,10 @@ common_nvcc_flags = [
     "-DFLASHINFER_ENABLE_FP8_E8M0",
     "-DFLASHINFER_ENABLE_FP4_E2M1",
 ]
+sm89_nvcc_flags = [
+    "-gencode=arch=compute_89,code=sm_89",
+    "-DFLASHINFER_ENABLE_FP8_E8M0",
+]
 sm90a_nvcc_flags = ["-gencode=arch=compute_90a,code=sm_90a"] + common_nvcc_flags
 sm100a_nvcc_flags = ["-gencode=arch=compute_100a,code=sm_100a"] + common_nvcc_flags
 sm103a_nvcc_flags = ["-gencode=arch=compute_103a,code=sm_103a"] + common_nvcc_flags
