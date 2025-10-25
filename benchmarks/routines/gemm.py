@@ -790,7 +790,7 @@ def testMmFp4(args):
     run_refcheck = args.refcheck
     use_128x4_sf_layout = args.use_128x4_sf_layout
     use_nvfp4 = args.use_nvfp4
-    autotune_supported_backends = ["cutlass", "trtllm", "auto"]
+    autotune_supported_backends = ["cudnn", "cutlass", "trtllm", "auto"]
     res = []
 
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
