@@ -45,7 +45,6 @@ from ..utils import (
     device_support_pdl,
     get_shuffle_matrix_a_row_indices,
     get_shuffle_matrix_sf_a_row_indices,
-    calculate_tile_tokens_dim,
     register_custom_op,
     register_fake_op,
 )
@@ -916,7 +915,6 @@ def get_trtllm_moe_sm100_module():
             hidden_size: int,
             intermediate_size: int,
             gated_act_type: int,
-            tile_tokens_dim: Optional[int] = None,
         ):
             self.num_local_experts = num_local_experts
             self.top_k = top_k
@@ -927,7 +925,6 @@ def get_trtllm_moe_sm100_module():
             self.hidden_size = hidden_size
             self.intermediate_size = intermediate_size
             self.gated_act_type = gated_act_type
-            self.tile_tokens_dim = tile_tokens_dim
 
         def get_valid_tactics(
             self,
@@ -943,18 +940,17 @@ def get_trtllm_moe_sm100_module():
                 *extra_inputs,
             ) = inputs
             num_tokens = routing_logits.shape[0]
-            tile_tokens_dim = (
-                calculate_tile_tokens_dim(
-                    num_tokens,
-                    self.num_local_experts,
-                    self.top_k,
-                    64 if self.dtype_act == DtypeTrtllmGen.Bfloat16 else 128,
-                )
-                if self.tile_tokens_dim is None
-                else self.tile_tokens_dim
-            )
+            # tile_tokens_dim = (
+            #     calculate_tile_tokens_dim(
+            #         num_tokens,
+            #         self.num_local_experts,
+            #         self.top_k,
+            #         64 if self.dtype_act == DtypeTrtllmGen.Bfloat16 else 128,
+            #     )
+            #     if self.tile_tokens_dim is None
+            #     else self.tile_tokens_dim
+            # )
             instance_key = (
-                tile_tokens_dim,
                 self.dtype_act,
                 self.dtype_weights,
                 self.use_deepseek_fp8,
@@ -992,16 +988,16 @@ def get_trtllm_moe_sm100_module():
                 *extra_inputs,
             ) = inputs
             num_tokens = routing_logits.shape[0]
-            tile_tokens_dim = (
-                calculate_tile_tokens_dim(
-                    num_tokens,
-                    self.num_local_experts,
-                    self.top_k,
-                    64 if self.dtype_act == DtypeTrtllmGen.Bfloat16 else 128,
-                )
-                if self.tile_tokens_dim is None
-                else self.tile_tokens_dim
-            )
+            # tile_tokens_dim = (
+            #     calculate_tile_tokens_dim(
+            #         num_tokens,
+            #         self.num_local_experts,
+            #         self.top_k,
+            #         64 if self.dtype_act == DtypeTrtllmGen.Bfloat16 else 128,
+            #     )
+            #     if self.tile_tokens_dim is None
+            #     else self.tile_tokens_dim
+            # )
 
             extra_input_idx = 0
             if trtllm_gen_dtype_has_scale(self.dtype_act):
@@ -1054,13 +1050,12 @@ def get_trtllm_moe_sm100_module():
                 kwargs["local_expert_offset"],
                 self.num_local_experts,
                 kwargs["routed_scaling_factor"],
-                tile_tokens_dim,
                 kwargs["routing_method_type"],
                 kwargs["enable_pdl"],
                 kwargs["do_finalize"],
                 self.gated_act_type,
                 output,
-                tactic,
+                [-1, -1] if tactic == -1 else tactic,
             )
 
         @classmethod
@@ -1294,7 +1289,6 @@ def get_trtllm_moe_sm100_module():
         local_expert_offset: int,
         num_local_experts: int,
         routed_scaling_factor: Optional[float],
-        tile_tokens_dim: Optional[int],
         routing_method_type: int,
         do_finalize: bool,
         enable_pdl: Optional[bool] = None,
@@ -1340,13 +1334,6 @@ def get_trtllm_moe_sm100_module():
         dtype_weights = deduce_trtllm_gen_tensor_dtype(
             gemm1_weights, gemm1_weights_scale
         )
-        if tile_tokens_dim is None:
-            tile_tokens_dim = calculate_tile_tokens_dim(
-                num_tokens,
-                num_experts,
-                top_k,
-                max_tile_tokens_dim=64 if dtype_act == DtypeTrtllmGen.Bfloat16 else 128,
-            )
         moe_runner = MoERunner(
             top_k=top_k,
             num_local_experts=num_local_experts,
@@ -1405,7 +1392,6 @@ def get_trtllm_moe_sm100_module():
             do_finalize=do_finalize,
             gated_act_type=gated_act_type,
         )
-
         # Call the C++ function for block scale MoE
         intermediate_output = moe_op.trtllm_fp4_block_scale_moe(
             routing_logits,
@@ -1434,13 +1420,12 @@ def get_trtllm_moe_sm100_module():
             local_expert_offset,
             num_local_experts,
             routed_scaling_factor,
-            tile_tokens_dim,
             routing_method_type,
             do_finalize,
             enable_pdl,
             gated_act_type,
             output,
-            tactic,
+            [-1, -1] if tactic == -1 else tactic,
         )
         if do_finalize:
             return [output]
@@ -1480,7 +1465,6 @@ def get_trtllm_moe_sm100_module():
         local_expert_offset: int,
         local_num_experts: int,
         routed_scaling_factor: Optional[float],
-        tile_tokens_dim: Optional[int],
         routing_method_type: int,
         do_finalize: bool,
         enable_pdl: bool,
@@ -1675,7 +1659,6 @@ def trtllm_fp4_block_scale_moe(
     local_expert_offset: int,
     local_num_experts: int,
     routed_scaling_factor: Optional[float],
-    tile_tokens_dim: Optional[int] = None,
     routing_method_type: int = 0,
     do_finalize: bool = True,
     enable_pdl: Optional[bool] = None,
@@ -1726,7 +1709,6 @@ def trtllm_fp4_block_scale_moe(
         local_expert_offset (int): Offset of local experts in global expert space
         local_num_experts (int): Number of experts handled by this device
         routed_scaling_factor (Optional[float]): Scaling factor for routing (can be None for some routing methods)
-        tile_tokens_dim (int): Tile dimension for tokens (default: 8)
         routing_method_type (int): Type of routing method to use (default: 0)
             - 0: Default (Softmax -> TopK)
             - 1: Renormalize (TopK -> Softmax)
@@ -1772,7 +1754,6 @@ def trtllm_fp4_block_scale_moe(
         local_expert_offset,
         local_num_experts,
         routed_scaling_factor,
-        tile_tokens_dim,
         routing_method_type,
         do_finalize,
         enable_pdl,
@@ -1807,7 +1788,6 @@ def trtllm_fp4_block_scale_routed_moe(
     local_expert_offset: int,
     local_num_experts: int,
     routed_scaling_factor: Optional[float],
-    tile_tokens_dim: Optional[int] = None,
     routing_method_type: int = 0,
     do_finalize: bool = True,
     enable_pdl: Optional[bool] = None,
@@ -1860,7 +1840,6 @@ def trtllm_fp4_block_scale_routed_moe(
         local_expert_offset (int): Offset of local experts in global expert space
         local_num_experts (int): Number of experts handled by this device
         routed_scaling_factor (Optional[float]): Scaling factor for routing (can be None for some routing methods)
-        tile_tokens_dim (int): Tile dimension for tokens (default: 8)
         routing_method_type (int): Type of routing method to use (default: 0)
             - 0: Default (Softmax -> TopK)
             - 1: Renormalize (TopK -> Softmax)
@@ -1906,7 +1885,6 @@ def trtllm_fp4_block_scale_routed_moe(
         local_expert_offset,
         local_num_experts,
         routed_scaling_factor,
-        tile_tokens_dim,
         routing_method_type,
         do_finalize,
         enable_pdl,

@@ -202,7 +202,6 @@ class CUDAGraphMoE:
             local_expert_offset=0,
             local_num_experts=self.config["num_experts"],
             routed_scaling_factor=self.config["routed_scaling"],
-            tile_tokens_dim=self.config["tile_tokens_dim"],
             routing_method_type=self.config["routing_method_type"],
             gated_act_type=self.config["gated_act_type"],
             do_finalize=True,
@@ -549,7 +548,7 @@ class FP4Moe(Moe):
         routed_scaling = kwargs["routed_scaling"]
         gated_act_type = kwargs["gated_act_type"]
         routing_method_type = kwargs["routing_method_type"]
-        tile_tokens_dim = kwargs["tile_tokens_dim"]
+        # tile_tokens_dim = kwargs["tile_tokens_dim"]
 
         # Create CUDA graph configuration
         config = {
@@ -560,7 +559,7 @@ class FP4Moe(Moe):
             "top_k_groups": top_k_groups,
             "intermediate_size": intermediate_size,
             "routed_scaling": routed_scaling,
-            "tile_tokens_dim": tile_tokens_dim,
+            # "tile_tokens_dim": tile_tokens_dim,
             "gated_act_type": gated_act_type,
             "routing_method_type": routing_method_type,
         }
@@ -1867,6 +1866,7 @@ def cache_permute_indices():
                     FP4Moe,
                     FP8BlockScaleMoe,
                 ],
+                "compatible_intermediate_size": [512, 1024, 2048],
             },
             id="kimi_k2",
         ),
@@ -1884,6 +1884,7 @@ def cache_permute_indices():
                     FP4Moe,
                     FP8BlockScaleMoe,
                 ],
+                "compatible_intermediate_size": [512, 1024, 2048],
             },
             id="DSv3",
         ),
@@ -1901,6 +1902,7 @@ def cache_permute_indices():
                     FP4Moe,
                     FP8BlockScaleMoe,
                 ],
+                "compatible_intermediate_size": [384, 768],
             },
             id="DSLite",
         ),
@@ -1915,11 +1917,9 @@ def cache_permute_indices():
                 "has_routing_bias": False,
                 "routing_method_type": RoutingMethodType.Renormalize,
                 "compatible_moe_impls": [FP8BlockScaleMoe, FP8PerTensorMoe, FP4Moe],
+                "compatible_intermediate_size": [384, 768, 1024, 2048],
             },
             id="Renorm",
-            marks=pytest.mark.skip(
-                reason="Disabled for testing speed - similar to RenormalizeNaive"
-            ),
         ),
         pytest.param(
             {
@@ -1932,6 +1932,7 @@ def cache_permute_indices():
                 "has_routing_bias": False,
                 "routing_method_type": RoutingMethodType.Renormalize,
                 "compatible_moe_impls": [FP8BlockScaleMoe, FP4Moe],
+                "compatible_intermediate_size": [512],
             },
             id="Qwen3_next",
         ),
@@ -1946,8 +1947,12 @@ def cache_permute_indices():
                 "has_routing_bias": False,
                 "routing_method_type": RoutingMethodType.RenormalizeNaive,
                 "compatible_moe_impls": [FP4Moe, FP8BlockScaleMoe],
+                "compatible_intermediate_size": [384, 768],
             },
             id="RenormNaive",
+            marks=pytest.mark.skip(
+                reason="Disabled for testing speed - similar to RenormalizeNaive"
+            ),
         ),
         pytest.param(
             {
@@ -1960,6 +1965,7 @@ def cache_permute_indices():
                 "has_routing_bias": False,
                 "routing_method_type": RoutingMethodType.TopK,
                 "compatible_moe_impls": [FP4Moe],
+                "compatible_intermediate_size": [384, 512, 768, 1024],
             },
             id="TopK",
         ),
@@ -1974,6 +1980,7 @@ def cache_permute_indices():
                 "has_routing_bias": True,
                 "routing_method_type": RoutingMethodType.Llama4,
                 "compatible_moe_impls": [FP8PerTensorMoe],
+                "compatible_intermediate_size": [1024, 2048],
             },
             id="Llama4",
         ),
@@ -2069,6 +2076,10 @@ def test_moe_quantization_classes(
     if type(moe_impl) not in weight_processing["compatible_moe_impls"]:
         pytest.skip(
             f"Incompatible: {moe_impl.name} + {weight_processing['use_shuffled_weight']} + {weight_processing['layout']}"
+        )
+    if intermediate_size not in routing_config["compatible_intermediate_size"]:
+        pytest.skip(
+            f"Incompatible: intermediate_size={intermediate_size} with {routing_config['routing_method_type'].name} routing ({routing_config['num_experts']} experts)"
         )
 
     # TODO(jimmzhou): enable MxFP4xBf16 on SM103
