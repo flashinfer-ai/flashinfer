@@ -125,7 +125,7 @@ std::vector<std::filesystem::path> getJitIncludeDirs() {
   static std::vector<std::filesystem::path> includeDirs;
   if (includeDirs.empty()) {
     // Command to execute
-    char const* cmd = "pip show tensorrt_llm 2>/dev/null";
+    char const* cmd = "pip show flashinfer-python 2>/dev/null";
 
     // Buffer to store the output
     std::array<char, 128> buffer;
@@ -174,15 +174,11 @@ std::vector<std::filesystem::path> getJitIncludeDirs() {
         location.erase(location.find_last_not_of(" \n\r\t") + 1);
 
         // Set the include directory based on the package location
-        includeDirs.push_back(std::filesystem::path(location) / "tensorrt_llm" / "include");
-
-        if (!kJitUseNvcc) {
-          includeDirs.push_back(std::filesystem::path(location) / "tensorrt_llm" / "include" /
-                                "cuda" / "include");
-        }
+        includeDirs.push_back(std::filesystem::path(location) / "flashinfer" / "data" / "csrc" /
+                              "nv_internal" / "tensorrt_llm");
       }
     } else {
-      TLLM_LOG_WARNING("Failed to find TensorRT LLM installation, DeepGEMM will be disabled.");
+      TLLM_LOG_WARNING("Failed to find FlashInfer installation, DeepGEMM will be disabled.");
     }
   }
   return includeDirs;
