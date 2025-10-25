@@ -1255,6 +1255,7 @@ def build_plans_cudnn_fp4_gemm_graph(
     device,
     alpha,
     use_nvfp4,
+    tactic: int = -1,
 ):
     graph = create_cudnn_execution_plans_fp4_gemm(
         a_shape,
@@ -1274,7 +1275,10 @@ def build_plans_cudnn_fp4_gemm_graph(
     )
 
     graph.check_support()
-    graph.build_plans()
+    if tactic != -1:
+        graph.build_plan_at_index(tactic)
+    else:
+        graph.build_plans()
     return graph
 
 
@@ -1287,6 +1291,7 @@ def execute_cudnn_gemm_fp4_graph(
     alpha,
     c_final,
     workspace_buffer,
+    tactic: int = -1,
 ):
     variant_pack = {
         UIDs.A_UID.value: a.view(get_native_fp4_dtype()),
@@ -1306,7 +1311,12 @@ def execute_cudnn_gemm_fp4_graph(
 
     stream = torch.cuda.current_stream(a.device)
 
-    graph.execute(variant_pack, workspace_buffer, handle=_get_cudnn_handle(stream))
+    if tactic == -1:
+        graph.execute(variant_pack, workspace_buffer, handle=_get_cudnn_handle(stream))
+    else:
+        graph.execute_plan_at_index(
+            variant_pack, workspace_buffer, tactic, handle=_get_cudnn_handle(stream)
+        )
 
 
 @functools.cache
@@ -1651,6 +1661,7 @@ def _cudnn_gemm_fp4(
     block_size: int = 16,
     use_nvfp4: bool = True,
     workspace_buffer: torch.Tensor = None,
+    tactic: int = -1,
 ):
     _check_cudnn_availability()
     # the fp4 cudnn graph will be shared for both mm and bmm, so
@@ -1682,11 +1693,12 @@ def _cudnn_gemm_fp4(
         a.device,
         alpha is not None,
         use_nvfp4,
+        tactic=tactic,
     )
 
     # execute the fp4 cudnn graph
     execute_cudnn_gemm_fp4_graph(
-        graph, a, b, a_descale, b_descale, alpha, out, workspace_buffer
+        graph, a, b, a_descale, b_descale, alpha, out, workspace_buffer, tactic=tactic
     )
 
 
@@ -1698,7 +1710,48 @@ def _cudnn_gemm_fp4_runner():
             profile: OptimizationProfile,
         ) -> List[int]:
             # cudnn has heuristic for fp4 gemm, so we only need to use the default tactic
-            return [0]
+            _check_cudnn_availability()
+            (
+                a,
+                b,
+                a_descale,
+                b_descale,
+                alpha,
+                out_dtype,
+                out,
+                block_size,
+                use_nvfp4,
+                workspace_buffer,
+            ) = inputs
+
+            real_a_shape, real_a_stride = _get_real_fp4_shape_from_packed_uint8(a)
+            real_b_shape, real_b_stride = _get_real_fp4_shape_from_packed_uint8(b)
+            batch = real_a_shape[0]
+            expanded_a_descale_shape, expanded_a_descale_stride = (
+                _expand_block_scale_tensor_shape(a_descale, batch)
+            )
+            expanded_b_descale_shape, expanded_b_descale_stride = (
+                _expand_block_scale_tensor_shape(b_descale, batch)
+            )
+
+            graph = build_plans_cudnn_fp4_gemm_graph(
+                real_a_shape,
+                real_a_stride,
+                real_b_shape,
+                real_b_stride,
+                expanded_a_descale_shape,
+                expanded_a_descale_stride,
+                expanded_b_descale_shape,
+                expanded_b_descale_stride,
+                cudnn.data_type.FP4_E2M1,
+                _torch_data_type_to_cudnn_data_type(out_dtype),
+                block_size,
+                a.device,
+                alpha is not None,
+                use_nvfp4,
+            )
+            num_plans = graph.get_execution_plan_count()
+            return list(range(num_plans))
 
         def forward(
             self,
@@ -1730,6 +1783,7 @@ def _cudnn_gemm_fp4_runner():
                 block_size,
                 use_nvfp4,
                 workspace_buffer,
+                tactic=tactic,
             )
 
     return CudnnFp4GemmRunner()

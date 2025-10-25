@@ -40,8 +40,6 @@ def test_mm_fp4(
             pytest.skip("trtllm gemm does not support SM110/SM120/SM121 GPUs.")
     if not use_128x4_sf_layout and backend != "trtllm":
         pytest.skip("Skipping test for non-trtllm fp4 with use_128x4_sf_layout=False")
-    if auto_tuning and backend == "cudnn":
-        pytest.skip("Skipping test for cudnn fp4 with auto_tuning=True")
     if not use_nvfp4 and backend != "cudnn":
         pytest.skip("mx_fp4 is only supported for cudnn backend")
 
