@@ -88,7 +88,7 @@ class FlashInferRotaryEmbedding(nn.Module):
             return torch.stack((o1, o2), dim=-1).flatten(-2)
 
 
-def benchmark_config(config_name, num_tokens, provider):
+def benchmark_config(config_name, num_tokens, provider, enable_pdl=False):
     """Benchmark a specific attention configuration."""
     input_dtype = torch.bfloat16
     device = "cuda"
@@ -177,6 +177,7 @@ def benchmark_config(config_name, num_tokens, provider):
                 k_nope_out=k_nope_out,
                 quant_scale_q=1.0,
                 quant_scale_kv=1.0,
+                enable_pdl=enable_pdl,
             )
 
             if mode_ncu and run_idx == 20:
@@ -278,6 +279,23 @@ def benchmark_mha(provider, num_tokens):
     return benchmark_config("mha", num_tokens, provider)
 
 
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=["num_tokens"],
+        x_vals=[768] if mode_ncu else [1, 2, 4, 8, 16, 32, 64, 128, 256, 384, 512, 768],
+        line_arg="enable_pdl",
+        line_vals=[False, True],
+        line_names=["enable_pdl=False", "enable_pdl=True"],
+        styles=[("blue", "-"), ("red", "-")],
+        ylabel="Latency (ms)",
+        plot_name="rope-pdl-benchmark",
+        args={},
+    )
+)
+def benchmark_pdl(enable_pdl, num_tokens):
+    return benchmark_config("mla", num_tokens, "flashinfer", enable_pdl=enable_pdl)
+
+
 if __name__ == "__main__":
     # Run all benchmarks and generate individual plots
     print("Running MLA benchmark...")
@@ -288,6 +306,9 @@ if __name__ == "__main__":
 
     print("Running MHA benchmark...")
     benchmark_mha.run(print_data=False, show_plots=True, save_path=".")
+
+    print("Running PDL benchmark...")
+    benchmark_pdl.run(print_data=False, show_plots=True, save_path=".")
 
     # Collect results for summary table
     token_counts = (
@@ -319,3 +340,4 @@ if __name__ == "__main__":
     print("  mla-rope-benchmark.png (FlashInfer vs PyTorch)")
     print("  gqa-rope-benchmark.png (FlashInfer vs PyTorch)")
     print("  mha-rope-benchmark.png (FlashInfer vs PyTorch)")
+    print("  rope-pdl-benchmark.png (enable_pdl=False vs enable_pdl=True)")

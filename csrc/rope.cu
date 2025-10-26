@@ -271,8 +271,8 @@ void apply_llama31_rope_pos_ids(TensorView q, TensorView k, TensorView q_rope, T
 void rope_quantize(TensorView q_rope_in, TensorView k_rope_in, TensorView q_nope_in,
                    TensorView k_nope_in, TensorView q_rope_out, TensorView k_rope_out,
                    TensorView q_nope_out, TensorView k_nope_out, TensorView cos_sin_cache,
-                   TensorView pos_ids, double quant_scale_q, double quant_scale_kv,
-                   bool interleave) {
+                   TensorView pos_ids, double quant_scale_q, double quant_scale_kv, bool interleave,
+                   bool enable_pdl) {
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(q_rope_in);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(k_rope_in);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(q_nope_in);
@@ -411,7 +411,7 @@ void rope_quantize(TensorView q_rope_in, TensorView k_rope_in, TensorView q_nope
             q_nope_in_stride_h, q_rope_out_stride_n, q_rope_out_stride_h, q_nope_out_stride_n,
             q_nope_out_stride_h, k_rope_in_stride, k_rope_in_stride_h, k_nope_in_stride,
             k_nope_in_stride_h, k_rope_out_stride, k_rope_out_stride_h, k_nope_out_stride,
-            k_nope_out_stride_h, quant_scale_q, quant_scale_kv, interleave, stream);
+            k_nope_out_stride_h, quant_scale_q, quant_scale_kv, interleave, enable_pdl, stream);
 
         TVM_FFI_ICHECK(status == cudaSuccess)
             << "RopeQuantize failed with error code " << cudaGetErrorString(status);
