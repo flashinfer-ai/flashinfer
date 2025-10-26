@@ -813,24 +813,16 @@ cudaError_t RopeQuantize(
       dim3 nblks(nblks_x, total_blocks_y);
       dim3 nthrs(bdx, bdy);
 
+      cudaLaunchAttribute attribute[1];
+      attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+      attribute[0].val.programmaticStreamSerializationAllowed = enable_pdl ? 1 : 0;
       cudaLaunchConfig_t config;
       config.gridDim = nblks;
       config.blockDim = nthrs;
-      config.dynamicSmemBytes = 0;
       config.stream = stream;
-
-      if (enable_pdl) {
-        // PDL launch config
-        cudaLaunchAttribute attribute[1];
-        attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        attribute[0].val.programmaticStreamSerializationAllowed = 1;
-        config.attrs = attribute;
-        config.numAttrs = 1;
-      } else {
-        // Regular launch config
-        config.attrs = nullptr;
-        config.numAttrs = 0;
-      }
+      config.dynamicSmemBytes = 0;
+      config.attrs = attribute;
+      config.numAttrs = 1;
 
       FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
           &config, kernel, q_rope_in, k_rope_in, q_nope_in, k_nope_in, q_rope_out, k_rope_out,

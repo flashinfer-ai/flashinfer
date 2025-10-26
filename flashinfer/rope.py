@@ -181,6 +181,7 @@ def _rope_quantize(
     quant_scale_q: float,
     quant_scale_kv: float,
     interleave: bool,
+    enable_pdl: bool,
 ) -> None:
     r"""Custom operator that routes to the CUDA kernel implementation.
 
@@ -201,6 +202,7 @@ def _rope_quantize(
         quant_scale_q,
         quant_scale_kv,
         interleave,
+        enable_pdl,
     )
 
 
@@ -219,6 +221,7 @@ def _fake_rope_quantize(
     quant_scale_q: float,
     quant_scale_kv: float,
     interleave: bool,
+    enable_pdl: bool,
 ) -> None:
     pass
 
@@ -1159,6 +1162,7 @@ def mla_rope_quantize_fp8(
     k_rope_out: Optional[torch.Tensor] = None,
     q_nope_out: Optional[torch.Tensor] = None,
     k_nope_out: Optional[torch.Tensor] = None,
+    enable_pdl: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     return rope_quantize_fp8(
         q_rope,
@@ -1175,6 +1179,7 @@ def mla_rope_quantize_fp8(
         k_rope_out,
         q_nope_out,
         k_nope_out,
+        enable_pdl,
     )
 
 
@@ -1193,6 +1198,7 @@ def rope_quantize_fp8(
     k_rope_out: Optional[torch.Tensor] = None,
     q_nope_out: Optional[torch.Tensor] = None,
     k_nope_out: Optional[torch.Tensor] = None,
+    enable_pdl: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     r"""Apply RoPE (Rotary Positional Embeddings) and quantize to FP8 format.
 
@@ -1237,6 +1243,8 @@ def rope_quantize_fp8(
         Pre-allocated output tensor for quantized query (non-rotary). If ``None``, allocated automatically.
     k_nope_out : Optional[torch.Tensor]
         Pre-allocated output tensor for quantized key (non-rotary). If ``None``, allocated automatically.
+    enable_pdl : bool
+        Whether to enable PDL (Programmatic Dependent Launch). Default: ``False``.
 
     Returns
     -------
@@ -1291,6 +1299,7 @@ def rope_quantize_fp8(
         quant_scale_q,
         quant_scale_kv,
         not is_neox,  # interleave
+        enable_pdl,
     )
 
     return q_rope_out, k_rope_out, q_nope_out, k_nope_out
