@@ -803,7 +803,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       TVM_FFI_ICHECK(fc1_dequant.get() != nullptr) << "Expecting fc1_dequant to be non null";
       TVM_FFI_ICHECK(fc2_quant.get() != nullptr) << "Expecting fc2_quant to be non null";
       TVM_FFI_ICHECK(fc2_dequant.get() != nullptr)
-          << "Expecting fc1fc2_dequant_dequant to be non null";
+          << "Expecting fc2_dequant_dequant to be non null";
       TVM_FFI_ICHECK(fc1_input_dequant.get() != nullptr)
           << "Expecting fc1_input_dequant to be non null";
 
