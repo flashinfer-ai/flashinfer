@@ -940,16 +940,7 @@ def get_trtllm_moe_sm100_module():
                 *extra_inputs,
             ) = inputs
             num_tokens = routing_logits.shape[0]
-            # tile_tokens_dim = (
-            #     calculate_tile_tokens_dim(
-            #         num_tokens,
-            #         self.num_local_experts,
-            #         self.top_k,
-            #         64 if self.dtype_act == DtypeTrtllmGen.Bfloat16 else 128,
-            #     )
-            #     if self.tile_tokens_dim is None
-            #     else self.tile_tokens_dim
-            # )
+
             instance_key = (
                 self.dtype_act,
                 self.dtype_weights,
@@ -988,16 +979,6 @@ def get_trtllm_moe_sm100_module():
                 *extra_inputs,
             ) = inputs
             num_tokens = routing_logits.shape[0]
-            # tile_tokens_dim = (
-            #     calculate_tile_tokens_dim(
-            #         num_tokens,
-            #         self.num_local_experts,
-            #         self.top_k,
-            #         64 if self.dtype_act == DtypeTrtllmGen.Bfloat16 else 128,
-            #     )
-            #     if self.tile_tokens_dim is None
-            #     else self.tile_tokens_dim
-            # )
 
             extra_input_idx = 0
             if trtllm_gen_dtype_has_scale(self.dtype_act):
@@ -1659,6 +1640,7 @@ def trtllm_fp4_block_scale_moe(
     local_expert_offset: int,
     local_num_experts: int,
     routed_scaling_factor: Optional[float],
+    tile_tokens_dim: Optional[int],
     routing_method_type: int = 0,
     do_finalize: bool = True,
     enable_pdl: Optional[bool] = None,
@@ -1709,6 +1691,7 @@ def trtllm_fp4_block_scale_moe(
         local_expert_offset (int): Offset of local experts in global expert space
         local_num_experts (int): Number of experts handled by this device
         routed_scaling_factor (Optional[float]): Scaling factor for routing (can be None for some routing methods)
+        tile_tokens_dim (Optional[int]): Tile dimension for tokens (default: None, will be deprecated in the future)
         routing_method_type (int): Type of routing method to use (default: 0)
             - 0: Default (Softmax -> TopK)
             - 1: Renormalize (TopK -> Softmax)
@@ -1727,6 +1710,12 @@ def trtllm_fp4_block_scale_moe(
         List[torch.Tensor]: List of output tensors. If do_finalize=True, returns the final MoE output.
             Otherwise, returns intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
     """
+    if tile_tokens_dim is not None:
+        logger.info(
+            "tile_tokens_dim in trtllm_fp4_block_scale_moe is planned for deprecation "
+            "in a future release. Please remove it from your code as tile_tokens_dim will no "
+            "longer be supported after v0.5.0."
+        )
     return get_trtllm_moe_sm100_module().trtllm_fp4_block_scale_moe(
         routing_logits,
         None,
@@ -1788,6 +1777,7 @@ def trtllm_fp4_block_scale_routed_moe(
     local_expert_offset: int,
     local_num_experts: int,
     routed_scaling_factor: Optional[float],
+    tile_tokens_dim: Optional[int],
     routing_method_type: int = 0,
     do_finalize: bool = True,
     enable_pdl: Optional[bool] = None,
@@ -1840,6 +1830,7 @@ def trtllm_fp4_block_scale_routed_moe(
         local_expert_offset (int): Offset of local experts in global expert space
         local_num_experts (int): Number of experts handled by this device
         routed_scaling_factor (Optional[float]): Scaling factor for routing (can be None for some routing methods)
+        tile_tokens_dim (Optional[int]): Tile dimension for tokens (default: None, will be deprecated in the future)
         routing_method_type (int): Type of routing method to use (default: 0)
             - 0: Default (Softmax -> TopK)
             - 1: Renormalize (TopK -> Softmax)
@@ -1858,6 +1849,12 @@ def trtllm_fp4_block_scale_routed_moe(
         List[torch.Tensor]: List of output tensors. If do_finalize=True, returns the final MoE output.
             Otherwise, returns intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
     """
+    if tile_tokens_dim is not None:
+        logger.info(
+            "tile_tokens_dim in trtllm_fp4_block_scale_routed_moe is planned for deprecation "
+            "in a future release. Please remove it from your code as tile_tokens_dim will no "
+            "longer be supported after v0.5.0."
+        )
     return get_trtllm_moe_sm100_module().trtllm_fp4_block_scale_moe(
         None,
         topk_ids,

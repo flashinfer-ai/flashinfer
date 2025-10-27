@@ -58,6 +58,21 @@ inline int32_t nextPowerOfTwo(float value) {
   return n;
 }
 
+std::set<int32_t> computeSelectedTileNums(std::vector<int32_t> const& supported_tile_nums,
+                                          int64_t const num_tokens, int64_t const top_k,
+                                          int64_t const num_local_experts) {
+  float const avg_tokens_per_expert = static_cast<float>(num_tokens * top_k) / num_local_experts;
+  int32_t tile_tokens_dim = std::clamp(nextPowerOfTwo(avg_tokens_per_expert),
+                                       supported_tile_nums.front(), supported_tile_nums.back());
+
+  std::set<int32_t> selected_tile_nums = {
+      std::max(supported_tile_nums.front(), tile_tokens_dim / 2), tile_tokens_dim,
+      std::min(supported_tile_nums.back(), tile_tokens_dim * 2),
+      std::min(supported_tile_nums.back(), tile_tokens_dim * 4)};
+
+  return selected_tile_nums;
+}
+
 void trtllm_fp8_per_tensor_scale_moe_launcher(
     TensorView routing_logits, Optional<TensorView> routing_bias, TensorView hidden_states,
     TensorView gemm1_weights, TensorView output1_scales_scalar,
@@ -1165,10 +1180,11 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
   if (mDtypeAct != btg::Dtype::Bfloat16) {
     mSupportedTileN.push_back(128);
   }
-
+  std::set<int32_t> selected_tile_nums =
+      computeSelectedTileNums(mSupportedTileN, num_tokens, top_k, local_num_experts);
   // Build runners for all supported tile sizes
   std::unordered_map<int32_t, std::unique_ptr<RunnerType>> mRunners;
-  for (int32_t tileN : mSupportedTileN) {
+  for (int32_t tileN : selected_tile_nums) {
     mRunners.emplace(tileN,
                      std::make_unique<RunnerType>(mDtypeAct, mDtypeWeights, mUseDeepSeekFp8, tileN,
                                                   static_cast<GatedActType>(gated_act_type),
@@ -1178,18 +1194,10 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
   // moeConfigIndex corresponds to pair (tileN, config)
   int64_t tileN = config_index[0];
   int64_t config = config_index[1];
-
   // Autotuner has requested a default or 'fallback' config index
   if (tileN == -1 || config == -1) {
     auto const num_tokens = hidden_states->shape[0];
-
-    // 2x FP4 per byte element
-    auto const hidden_size = 2 * hidden_states->shape[1];
-
-    float const avg_tokens_per_expert = static_cast<float>(num_tokens * top_k) / local_num_experts;
-    tileN = std::clamp(nextPowerOfTwo(avg_tokens_per_expert), mSupportedTileN.front(),
-                       mSupportedTileN.back());
-
+    tileN = *selected_tile_nums.begin();
     config = mRunners[tileN]->getDefaultValidConfigIndex(top_k, hidden_size, intermediate_size,
                                                          local_num_experts, num_tokens);
   }
@@ -1203,16 +1211,21 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
       enable_pdl, output);
 }
 
-int64_t trtllm_get_default_moe_configs(int64_t const tile_tokens_dim, int64_t const dtype_act_,
-                                       int64_t const dtype_weights_, bool const useDeepSeekFp8,
-                                       int64_t const top_k, int64_t const hidden_size,
-                                       int64_t const intermediate_size,
+int64_t trtllm_get_default_moe_configs(int64_t const dtype_act_, int64_t const dtype_weights_,
+                                       bool const useDeepSeekFp8, int64_t const top_k,
+                                       int64_t const hidden_size, int64_t const intermediate_size,
                                        int64_t const num_local_experts,
                                        int64_t const gated_act_type, int64_t const num_tokens) {
   auto dtype_act = static_cast<btg::Dtype>(dtype_act_);
   auto dtype_weights = static_cast<btg::Dtype>(dtype_weights_);
+  std::vector<int32_t> supported_tile_nums = {8, 16, 32, 64};
+  if (dtype_act != btg::Dtype::Bfloat16) {
+    supported_tile_nums.push_back(128);
+  }
+  std::set<int32_t> selected_tile_nums =
+      computeSelectedTileNums(supported_tile_nums, num_tokens, top_k, num_local_experts);
   tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner moe_runner(
-      dtype_act, dtype_weights, useDeepSeekFp8, (int32_t)tile_tokens_dim,
+      dtype_act, dtype_weights, useDeepSeekFp8, *selected_tile_nums.begin(),
       static_cast<GatedActType>(gated_act_type), /*useShuffledMatrixA*/ true);
   return moe_runner.getDefaultValidConfigIndex(top_k, hidden_size, intermediate_size,
                                                num_local_experts, num_tokens);
@@ -1230,7 +1243,10 @@ Array<Array<int64_t>> trtllm_get_valid_moe_configs(
   if (dtype_act != btg::Dtype::Bfloat16) {
     supported_tile_nums.push_back(128);
   }
-  for (int32_t tileN : supported_tile_nums) {
+  std::set<int32_t> selected_tile_nums =
+      computeSelectedTileNums(supported_tile_nums, num_tokens, top_k, num_local_experts);
+
+  for (int32_t tileN : selected_tile_nums) {
     tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner moe_runner(
         dtype_act, dtype_weights, useDeepSeekFp8, tileN, static_cast<GatedActType>(gated_act_type),
         /*useShuffledMatrixA*/ true);
