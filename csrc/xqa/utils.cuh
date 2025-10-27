@@ -46,7 +46,7 @@ __constant__ constexpr float kE4M3_MAX = 448.F;
 constexpr uint32_t kMAX_SMEM_SIZE = (99u << 10);
 #elif __CUDA_ARCH__ == 800 || __CUDA_ARCH__ == 870
 constexpr uint32_t kMAX_SMEM_SIZE = (163u << 10);
-#elif __CUDA_ARCH__ == 900 || __CUDA_ARCH__ == 1000
+#elif __CUDA_ARCH__ == 900 || __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030
 constexpr uint32_t kMAX_SMEM_SIZE = (227u << 10);
 #endif
 #endif

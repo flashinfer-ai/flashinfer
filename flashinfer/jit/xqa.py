@@ -17,13 +17,10 @@ limitations under the License.
 from . import env as jit_env
 import torch
 from .utils import filename_safe_dtype_map
+from ..compilation_context import CompilationContext
 from .core import (
     JitSpec,
     gen_jit_spec,
-    sm90a_nvcc_flags,
-    sm100f_nvcc_flags,
-    sm120a_nvcc_flags,
-    sm121a_nvcc_flags,
 )
 
 xqa_nvcc_flags = [
@@ -45,7 +42,6 @@ def gen_xqa_module(
     head_dim: int,
     head_group_ratio: int,
     use_sliding_window: bool,
-    sm_version: int = 90,
 ) -> JitSpec:
     if input_dtype == torch.float16:
         flag_input_dtype = ["-DINPUT_FP16=1", "-DDTYPE=__half"]
@@ -82,19 +78,16 @@ def gen_xqa_module(
     else:
         flag_sliding_window = ["-DSLIDING_WINDOW=0"]
 
-    if sm_version == 100:
-        sm_nvcc_flags = sm100f_nvcc_flags
-    elif sm_version == 120:
-        sm_nvcc_flags = sm120a_nvcc_flags
-    elif sm_version == 121:
-        sm_nvcc_flags = sm121a_nvcc_flags
-    else:
-        sm_nvcc_flags = sm90a_nvcc_flags
+    compilation_context = CompilationContext()
+    nvcc_flags = compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[9, 10, 11, 12]
+    )
+    sm_nvcc_flags = nvcc_flags
 
     flag_mla_wrapper = ["-DMLA_WRAPPER=0"]
 
     return gen_jit_spec(
-        f"xqa_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}_sm_{sm_version}",
+        f"xqa_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}",
         [
             jit_env.FLASHINFER_CSRC_DIR / "xqa/mha.cu",
             jit_env.FLASHINFER_CSRC_DIR / "xqa/mha_sm90.cu",
@@ -123,11 +116,7 @@ def gen_xqa_module_mla(
     head_dim: int,
     head_group_ratio: int,
     use_sliding_window: bool = False,
-    sm_version: int = 120,
 ) -> JitSpec:
-    assert sm_version == 120 or sm_version == 121, (
-        "Only SM 120 and 121 are supported for xqa MLA"
-    )
     assert head_group_ratio == 128, "Only head group ratio 128 is supported for xqa MLA"
     assert head_dim == 576, "Only head dim 576 is supported for xqa_module_mla"
     assert input_dtype == torch.float8_e4m3fn, (
@@ -152,15 +141,14 @@ def gen_xqa_module_mla(
 
     flag_sliding_window = ["-DSLIDING_WINDOW=0"]
 
-    if sm_version == 120:
-        sm_nvcc_flags = sm120a_nvcc_flags
-    elif sm_version == 121:
-        sm_nvcc_flags = sm121a_nvcc_flags
+    compilation_context = CompilationContext()
+    nvcc_flags = compilation_context.get_nvcc_flags_list(supported_major_versions=[12])
+    sm_nvcc_flags = nvcc_flags
 
     flag_mla_wrapper = ["-DMLA_WRAPPER=1"]
 
     return gen_jit_spec(
-        f"xqa_mla_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}_sm_{sm_version}",
+        f"xqa_mla_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}",
         [
             jit_env.FLASHINFER_CSRC_DIR / "xqa/mla_sm120.cu",
             jit_env.FLASHINFER_CSRC_DIR / "xqa/tensorMap.cpp",

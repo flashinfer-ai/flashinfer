@@ -356,7 +356,7 @@ def gen_attention(
 
 
 def gen_xqa(
-    fp16_input_: List[bool],
+    input_type_: List[torch.dtype],
     fp8_kv_cache_: List[bool],
     token_per_page_: List[int],
     head_size_: List[int],
@@ -371,32 +371,20 @@ def gen_xqa(
     if not has_sm90 and not has_sm100 and not has_sm120 and not has_sm121:
         return  # XQA requires SM90+
 
-    sm_versions = []
-    if has_sm90:
-        sm_versions.append(90)
-    if has_sm100:
-        sm_versions.append(100)
-    if has_sm120:
-        sm_versions.append(120)
-    if has_sm121:
-        sm_versions.append(121)
-
     for (
-        fp16_input,
+        input_type,
         fp8_kv_cache,
         token_per_page,
         head_size,
         head_grp_size,
         use_sliding_window,
-        sm_version,
     ) in product(
-        fp16_input_,
+        input_type_,
         fp8_kv_cache_,
         token_per_page_,
         head_size_,
         head_grp_size_,
         use_sliding_window_,
-        sm_versions,
     ):
         # Skip invalid configurations
         if head_size % 16 != 0 or head_size > 256 or head_size < 16:
@@ -406,21 +394,19 @@ def gen_xqa(
 
         if fp8_kv_cache:
             kv_cache_dtype = torch.float8_e4m3fn
-        elif fp16_input:
-            kv_cache_dtype = torch.float16
         else:
-            kv_cache_dtype = torch.bfloat16
+            kv_cache_dtype = input_type
+
         yield gen_xqa_module(
-            input_dtype=torch.float16 if fp16_input else torch.bfloat16,
+            input_dtype=input_type,
             kv_cache_dtype=kv_cache_dtype,
             page_size=token_per_page,
             head_dim=head_size,
             head_group_ratio=head_grp_size,
             use_sliding_window=use_sliding_window,
-            sm_version=sm_version,
         )
 
-    if has_sm120:
+    if has_sm120 or has_sm121:
         for token_per_page in token_per_page_:
             yield gen_xqa_module_mla(
                 input_dtype=torch.float8_e4m3fn,
@@ -429,19 +415,6 @@ def gen_xqa(
                 head_dim=576,
                 head_group_ratio=128,
                 use_sliding_window=False,
-                sm_version=120,
-            )
-
-    if has_sm121:
-        for token_per_page in token_per_page_:
-            yield gen_xqa_module_mla(
-                input_dtype=torch.float8_e4m3fn,
-                kv_cache_dtype=torch.float8_e4m3fn,
-                page_size=token_per_page,
-                head_dim=576,
-                head_group_ratio=128,
-                use_sliding_window=False,
-                sm_version=121,
             )
 
 
@@ -560,7 +533,7 @@ def gen_all_modules(
         add_xqa and get_cuda_version() > Version("12.8")
     ):  # TODO: Earlier cuda versions have compile issues, will be fixed in future releases
         # Define XQA configurations to iterate over
-        xqa_fp16_input_ = [True, False]  # fp16 and bf16
+        xqa_input_type_ = [torch.float16, torch.bfloat16]
         xqa_fp8_kv_cache_ = [True, False]
         xqa_token_per_page_ = [16, 32, 64, 128]
         xqa_head_size_ = [64, 128, 256]
@@ -568,7 +541,7 @@ def gen_all_modules(
 
         jit_specs += list(
             gen_xqa(
-                xqa_fp16_input_,
+                xqa_input_type_,
                 xqa_fp8_kv_cache_,
                 xqa_token_per_page_,
                 xqa_head_size_,

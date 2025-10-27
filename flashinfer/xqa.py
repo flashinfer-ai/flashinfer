@@ -37,7 +37,6 @@ def get_xqa_module(
     head_dim: int,
     head_group_ratio: int,
     use_sliding_window: bool,
-    sm_version: int = 90,
 ):
     module = gen_xqa_module(
         input_dtype,
@@ -46,11 +45,10 @@ def get_xqa_module(
         head_dim,
         head_group_ratio,
         use_sliding_window,
-        sm_version,
     ).build_and_load()
 
     @register_custom_op(
-        f"flashinfer::xqa_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}_sm_{sm_version}",
+        f"flashinfer::xqa_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}",
         mutates_args=("output", "workspace_buffer"),
     )
     def xqa(
@@ -93,7 +91,7 @@ def get_xqa_module(
         )
 
     @register_fake_op(
-        f"flashinfer::xqa_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}_sm_{sm_version}"
+        f"flashinfer::xqa_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}"
     )
     def _fake_xqa(
         run_sm90_fp8_mha: bool,
@@ -232,10 +230,6 @@ def xqa(
 
     if get_compute_capability(torch.device(device="cuda"))[0] not in [9, 10, 12]:
         raise RuntimeError("XQA is only supported on SM90, SM100, SM120 GPUs")
-    sm_version = int(
-        get_compute_capability(torch.device(device="cuda"))[0] * 10
-        + get_compute_capability(torch.device(device="cuda"))[1]
-    )
 
     xqa_module = get_xqa_module(
         q.dtype,
@@ -244,7 +238,6 @@ def xqa(
         head_dim,
         head_group_ratio,
         use_sliding_window,
-        sm_version,
     )
     xqa_module.xqa(
         run_sm90_fp8_mha,
@@ -275,7 +268,6 @@ def get_xqa_module_mla(
     head_dim: int,
     head_group_ratio: int,
     use_sliding_window: bool = False,
-    sm_version: int = 120,
 ):
     module = gen_xqa_module_mla(
         input_dtype,
@@ -284,11 +276,10 @@ def get_xqa_module_mla(
         head_dim,
         head_group_ratio,
         use_sliding_window,
-        sm_version,
     ).build_and_load()
 
     @register_custom_op(
-        f"flashinfer::xqa_mla_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}_sm_{sm_version}",
+        f"flashinfer::xqa_mla_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}",
         mutates_args=("output", "workspace_buffer"),
     )
     def xqa_mla(
@@ -323,7 +314,7 @@ def get_xqa_module_mla(
         )
 
     @register_fake_op(
-        f"flashinfer::xqa_mla_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}_sm_{sm_version}"
+        f"flashinfer::xqa_mla_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}"
     )
     def _fake_xqa_mla(
         sm_count: int,
@@ -433,10 +424,6 @@ def xqa_mla(
 
     if get_compute_capability(torch.device(device="cuda"))[0] not in [12]:
         raise RuntimeError("XQA is only supported on SM120 GPUs")
-    sm_version = int(
-        get_compute_capability(torch.device(device="cuda"))[0] * 10
-        + get_compute_capability(torch.device(device="cuda"))[1]
-    )
 
     xqa_module = get_xqa_module_mla(
         q.dtype,
@@ -445,7 +432,6 @@ def xqa_mla(
         head_dim,
         head_group_ratio,
         False,
-        sm_version,
     )
     xqa_module.xqa_mla(
         sm_count,

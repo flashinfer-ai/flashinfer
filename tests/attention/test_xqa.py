@@ -168,7 +168,7 @@ def ref_attention(
     reason="XQA is only supported on SM90, SM100, SM120 GPUs",
 )
 @pytest.mark.parametrize("use_sliding_window", [True, False])
-@pytest.mark.parametrize("fp16_input", [True, False])
+@pytest.mark.parametrize("input_type", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("fp8_kv_cache", [True, False])
 @pytest.mark.parametrize("use_attention_sinks", [True, False])
 @pytest.mark.parametrize("seq_len", [2, 15, 256, 514])
@@ -182,7 +182,7 @@ def test_xqa(
     nb_k_heads,
     seq_len,
     tokens_per_page,
-    fp16_input,
+    input_type,
     fp8_kv_cache,
     valid_elems_per_head,
     head_grp_size,
@@ -198,7 +198,7 @@ def test_xqa(
         beam_width,
         nb_q_heads,
         valid_elems_per_head,
-        dtype=torch.bfloat16 if not fp16_input else torch.float16,
+        dtype=input_type,
         device="cuda",
     )
     output.fill_(float("nan"))
@@ -207,7 +207,7 @@ def test_xqa(
         beam_width,
         nb_q_heads,
         valid_elems_per_head,
-        dtype=torch.bfloat16 if not fp16_input else torch.float16,
+        dtype=input_type,
         device="cuda",
     )
     q_heads.normal_(0, 1)
@@ -234,7 +234,7 @@ def test_xqa(
     cache_k_heads = torch.zeros(
         total_nb_cache_heads,
         valid_elems_per_head,
-        dtype=torch.bfloat16 if not fp16_input else torch.float16,
+        dtype=input_type,
         device="cuda",
     )
     cache_k_heads.normal_(0, 1)
@@ -242,7 +242,7 @@ def test_xqa(
     cache_v_heads = torch.zeros(
         total_nb_cache_heads,
         valid_elems_per_head,
-        dtype=torch.bfloat16 if not fp16_input else torch.float16,
+        dtype=input_type,
         device="cuda",
     )
     cache_v_heads.normal_(0, 1)
