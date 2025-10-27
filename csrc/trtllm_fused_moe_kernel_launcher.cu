@@ -58,7 +58,7 @@ inline int32_t nextPowerOfTwo(float value) {
   return n;
 }
 
-std::set<int32_t> computeSelectedTileNums(std::vector<int32_t> const& supported_tile_nums,
+std::set<int32_t> computeSelectedTileN(std::vector<int32_t> const& supported_tile_nums,
                                           int64_t const num_tokens, int64_t const top_k,
                                           int64_t const num_local_experts) {
   float const avg_tokens_per_expert = static_cast<float>(num_tokens * top_k) / num_local_experts;
@@ -1181,7 +1181,7 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
     mSupportedTileN.push_back(128);
   }
   std::set<int32_t> selected_tile_nums =
-      computeSelectedTileNums(mSupportedTileN, num_tokens, top_k, local_num_experts);
+      computeSelectedTileN(mSupportedTileN, num_tokens, top_k, local_num_experts);
   // Build runners for all supported tile sizes
   std::unordered_map<int32_t, std::unique_ptr<RunnerType>> mRunners;
   for (int32_t tileN : selected_tile_nums) {
@@ -1223,7 +1223,7 @@ int64_t trtllm_get_default_moe_configs(int64_t const dtype_act_, int64_t const d
     supported_tile_nums.push_back(128);
   }
   std::set<int32_t> selected_tile_nums =
-      computeSelectedTileNums(supported_tile_nums, num_tokens, top_k, num_local_experts);
+      computeSelectedTileN(supported_tile_nums, num_tokens, top_k, num_local_experts);
   tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner moe_runner(
       dtype_act, dtype_weights, useDeepSeekFp8, *selected_tile_nums.begin(),
       static_cast<GatedActType>(gated_act_type), /*useShuffledMatrixA*/ true);
@@ -1244,7 +1244,7 @@ Array<Array<int64_t>> trtllm_get_valid_moe_configs(
     supported_tile_nums.push_back(128);
   }
   std::set<int32_t> selected_tile_nums =
-      computeSelectedTileNums(supported_tile_nums, num_tokens, top_k, num_local_experts);
+      computeSelectedTileN(supported_tile_nums, num_tokens, top_k, num_local_experts);
 
   for (int32_t tileN : selected_tile_nums) {
     tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner moe_runner(
