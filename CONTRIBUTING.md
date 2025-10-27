@@ -36,7 +36,7 @@ Code Contribution Procedure
 
 # Release Versioning
 
-When incrementing a version and creating a release, follow a "right-shifted" versioning scheme similar to [vLLM Release Versioning](https://github.com/vllm-project/vllm/blob/main/RELEASE.md)[^1]. In particular, versions follow _major.minor.patch[.post1]_, where:
+When incrementing a version and creating a release, follow a "right-shifted" versioning scheme similar to [vLLM Release Versioning](https://github.com/vllm-project/vllm/blob/main/RELEASE.md) (`major.minor.patch[.post1]`) [^1]. In particular:
 
 * _major_ increment signals architectural milestone and/or when incompatible API changes are made, similar to PyTorch 2.0.
 * _minor_ increment signals significant backwards-compatible new features
