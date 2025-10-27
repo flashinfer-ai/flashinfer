@@ -43,4 +43,4 @@ When incrementing a version and creating a release, follow a "right-shifted" ver
 * _patch_ increment signals small backwards-compatible features (e.g. new kernels, new SM support, etc) and backwards-compatible bug fixes
 * _post1_ is an optional suffix for a quick follow up release with just backwards-compatible bug fixes
 
-[^1]: We have not followed this strictly through v0.4.0. But after v0.4.0, the versioning should follow this "right shifted" versioning scheme.
+[^1]: We have not followed this strictly through v0.4.0. But after v0.4.0, the versioning should follow this "right-shifted" versioning scheme.
