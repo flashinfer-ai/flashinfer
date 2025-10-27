@@ -19,6 +19,7 @@ import logging
 from ctypes import c_void_p, cast
 from types import SimpleNamespace
 from typing import List, Optional, Tuple, Union
+from typing_extensions import deprecated
 
 import torch
 import torch.distributed as dist
@@ -121,6 +122,9 @@ def get_trtllm_comm_module():
             buffer_0_ptr, buffer_1_ptr, buffer_2_ptr, size, dtype
         )
 
+    @deprecated(
+        "trtllm_create_ipc_workspace_for_all_reduce and trtllm_custom_all_reduce are deprecated, use trtllm_create_ipc_workspace_for_all_reduce_fusion and trtllm_allreduce_fusion instead"
+    )
     @register_custom_op(
         "flashinfer::trtllm_custom_all_reduce",
         mutates_args=[
@@ -393,6 +397,9 @@ MAX_ALL_REDUCE_BLOCKS = 24
 LamportTokenNumThreshold = 16
 
 
+@deprecated(
+    "trtllm_create_ipc_workspace_for_all_reduce and trtllm_custom_all_reduce are deprecated, use trtllm_create_ipc_workspace_for_all_reduce_fusion and trtllm_allreduce_fusion instead"
+)
 def trtllm_create_ipc_workspace_for_all_reduce(
     rank: int,
     tp_size: int,
@@ -699,6 +706,9 @@ def trtllm_lamport_initialize_all(
     )
 
 
+@deprecated(
+    "trtllm_create_ipc_workspace_for_all_reduce and trtllm_custom_all_reduce are deprecated, use trtllm_create_ipc_workspace_for_all_reduce_fusion and trtllm_allreduce_fusion instead"
+)
 def trtllm_custom_all_reduce(
     inp: torch.Tensor,
     out: torch.Tensor,
