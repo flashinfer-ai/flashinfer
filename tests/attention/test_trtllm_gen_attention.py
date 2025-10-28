@@ -349,8 +349,8 @@ def test_trtllm_batch_prefill(
     max_kv_len,
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
-    if compute_capability[0] in [11, 12]:
-        pytest.skip("trtllm-gen does not support SM110/SM120/SM121 GPUs.")
+    if compute_capability[0] != 10:
+        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
     # Set up test parameters
     torch.manual_seed(0)
     head_dim = 128
@@ -918,8 +918,8 @@ def test_trtllm_gen_prefill_deepseek(
     batch_size, s_qo, s_kv, num_kv_heads, head_grp_size, causal
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
-    if compute_capability[0] in [11, 12]:
-        pytest.skip("trtllm-gen does not support SM110/SM120/SM121 GPUs.")
+    if compute_capability[0] != 10:
+        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
     if s_qo > s_kv:
         pytest.skip("s_qo > s_kv, skipping test as causal")
 
