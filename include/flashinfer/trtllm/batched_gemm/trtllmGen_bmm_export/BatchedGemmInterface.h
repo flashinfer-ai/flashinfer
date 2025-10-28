@@ -539,7 +539,7 @@ class BatchedGemmInterface {
       }
       fname_cubin = tllm_gen_bmm_cubin_path + "/" + fname_cubin + ".cubin";
       std::string cubin = flashinfer::trtllm_cubin_loader::getCubin(fname_cubin, sha256);
-      cuModuleLoadData(&cuModule, cubin.c_str());
+      cuModuleLoadData(module, cubin.c_str());
     };
 
     if (batchedGemmConfig.mData != nullptr) {
@@ -567,12 +567,12 @@ class BatchedGemmInterface {
         if (module != moduleCacheRef.end()) {
           cuFunction = std::get<1>(module->second);
         } else {
-          fiModuleLoadData(&cuModule, batchedGemmConfig.mData);
+          fiModuleLoadData(&cuModule);
           cuModuleGetFunction(&cuFunction, cuModule, batchedGemmConfig.mFunctionName);
           moduleCacheRef.insert(std::make_pair(moduleKey, std::make_tuple(cuModule, cuFunction)));
         }
       } else {
-        fiModuleLoadData(&cuModule, batchedGemmConfig.mData);
+        fiModuleLoadData(&cuModule);
         cuModuleGetFunction(&cuFunction, cuModule, batchedGemmConfig.mFunctionName);
       }
 
