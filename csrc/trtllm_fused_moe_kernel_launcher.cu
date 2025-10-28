@@ -369,7 +369,7 @@ void trtllm_fp8_per_tensor_scale_moe(
     auto const hidden_size = hidden_states.size(1);
     bool mUseDeepSeekFp8{false};  // FP8 per-tensor doesn't use DeepSeek FP8
 
-    std::vector<int32_t> mSupportedTileN = {8, 16, 32, 64};
+    std::vector<int32_t> mSupportedTileN = {8, 16, 32, 64, 128};
     std::set<int32_t> selected_tile_nums =
         computeSelectedTileN(mSupportedTileN, num_tokens, top_k, local_num_experts);
 
@@ -929,10 +929,6 @@ Array<Tensor> trtllm_fp4_block_scale_moe_launcher(
 
   Tensor permuted_idx_to_token_idx =
       alloc_tensor({max_num_padded_tokens}, dl_int32, hidden_states.device());
-  // Tensor expert_weights = alloc_tensor(
-  //     {args.num_tokens, args.top_k}, dl_bfloat16, hidden_states.device());
-  // Tensor expert_indexes = alloc_tensor(
-  //     {args.num_tokens, args.top_k}, dl_int32, hidden_states.device();
   int64_t const size_of_expert_count_histogram = std::max(num_experts * 2, int64_t(256 * 2));
   Tensor expert_count_histogram =
       alloc_tensor({size_of_expert_count_histogram}, dl_int32, hidden_states.device());
@@ -942,10 +938,6 @@ Array<Tensor> trtllm_fp4_block_scale_moe_launcher(
   // allocate workspace for activation/gemm/finalize kernels
   auto const gemm1_output_hidden =
       dtype_act == btg::Dtype::E2m1 ? intermediate_size / 2 : intermediate_size;
-  // Tensor gemm1_output = alloc_tensor(
-  //     {max_num_padded_tokens, gemm1_output_hidden},
-  //     dtype_act == btg::Dtype::Bfloat16 ? dl_bfloat16 : dl_float8_e4m3fn,
-  //     hidden_states.device());
   Tensor gemm1_output = alloc_tensor({max_num_padded_tokens_gemm1, gemm1_output_hidden},
                                      dtype_act == btg::Dtype::Bfloat16 ? dl_bfloat16 : dl_uint8,
                                      hidden_states.device());
@@ -1274,8 +1266,14 @@ int64_t trtllm_get_default_moe_configs(int64_t const dtype_act_, int64_t const d
   auto dtype_act = static_cast<btg::Dtype>(dtype_act_);
   auto dtype_weights = static_cast<btg::Dtype>(dtype_weights_);
   std::vector<int32_t> supported_tile_nums = {8, 16, 32, 64};
-  if ((dtype_weights == btg::Dtype::E2m1 || dtype_weights == btg::Dtype::MxE2m1) &&
-      dtype_act != btg::Dtype::Bfloat16) {
+  // Check if we should add tile size 128
+  bool is_fp4_without_bf16_act =
+      (dtype_weights == btg::Dtype::E2m1 || dtype_weights == btg::Dtype::MxE2m1) &&
+      dtype_act != btg::Dtype::Bfloat16;
+  bool is_fp8_per_tensor =
+      dtype_weights == btg::Dtype::E4m3 && dtype_act == btg::Dtype::E4m3 && !useDeepSeekFp8;
+
+  if (is_fp4_without_bf16_act || is_fp8_per_tensor) {
     supported_tile_nums.push_back(128);
   }
   std::set<int32_t> selected_tile_nums =
@@ -1300,8 +1298,14 @@ Array<Array<int64_t>> trtllm_get_valid_moe_configs(
   auto dtype_act = static_cast<btg::Dtype>(dtype_act_);
   auto dtype_weights = static_cast<btg::Dtype>(dtype_weights_);
   std::vector<int32_t> supported_tile_nums = {8, 16, 32, 64};
-  if ((dtype_weights == btg::Dtype::E2m1 || dtype_weights == btg::Dtype::MxE2m1) &&
-      dtype_act != btg::Dtype::Bfloat16) {
+  // Check if we should add tile size 128
+  bool is_fp4_without_bf16_act =
+      (dtype_weights == btg::Dtype::E2m1 || dtype_weights == btg::Dtype::MxE2m1) &&
+      dtype_act != btg::Dtype::Bfloat16;
+  bool is_fp8_per_tensor =
+      dtype_weights == btg::Dtype::E4m3 && dtype_act == btg::Dtype::E4m3 && !useDeepSeekFp8;
+
+  if (is_fp4_without_bf16_act || is_fp8_per_tensor) {
     supported_tile_nums.push_back(128);
   }
   std::set<int32_t> selected_tile_nums =
