@@ -891,7 +891,7 @@ def trtllm_allreduce_fusion(
             )
 
         # Check 4: use_fp32_lamport must match
-        if metadata["use_fp32_lamport"] == (allreduce_in.dtype == torch.float32):
+        if metadata["use_fp32_lamport"] != (allreduce_in.dtype == torch.float32):
             errors.append(
                 f"use_fp32_lamport ({metadata['use_fp32_lamport']}) does not match allreduce_in.dtype ({allreduce_in.dtype}). "
                 f"Workspace was created for use_fp32_lamport={metadata['use_fp32_lamport']}."
