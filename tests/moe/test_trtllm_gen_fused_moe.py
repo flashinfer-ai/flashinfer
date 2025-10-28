@@ -2297,104 +2297,142 @@ def test_renormalize_routing(
     )
 
 
-# # Test: TopK routing
-# @pytest.mark.parametrize("num_tokens", [1, 8, 128])  # Limited for GeGlu
-# @pytest.mark.parametrize("hidden_size", [1024])
-# @pytest.mark.parametrize("intermediate_size", [384, 512, 768, 1024])
-# @pytest.mark.parametrize(
-#     "moe_impl",
-#     [
-#         pytest.param(FP4Moe(quant_mode=QuantMode.FP4_NVFP4_NVFP4), id="NvFP4xNvFP4"),
-#         pytest.param(FP4Moe(quant_mode=QuantMode.FP4_MXFP4_MXFP8), id="MxFP4xMxFP8"),
-#         pytest.param(FP4Moe(quant_mode=QuantMode.FP4_MXFP4_Bf16), id="MxFP4xBf16"),
-#     ],
-# )
-# @pytest.mark.parametrize(
-#     "routing_config",
-#     [
-#         {
-#             "num_experts": 16,
-#             "top_k": 2,
-#             "padding": 8,
-#             "n_groups": None,
-#             "top_k_groups": None,
-#             "routed_scaling": None,
-#             "has_routing_bias": False,
-#             "routing_method_type": RoutingMethodType.TopK,
-#             "compatible_moe_impls": [FP4Moe],
-#             "compatible_intermediate_size": [384, 512, 768, 1024],
-#         },
-#     ],
-# )
-# @pytest.mark.parametrize(
-#     "weight_processing",
-#     [
-#         pytest.param({
-#             "use_shuffled_weight": True,
-#             "layout": WeightLayout.MajorK,
-#             "compatible_moe_impls": [FP4Moe, FP8PerTensorMoe, FP8BlockScaleMoe],
-#         }, id="Shuffled_MajorK"),
-#     ],
-# )
-# @pytest.mark.parametrize(
-#     "gated_act_type",
-#     [
-#         pytest.param(GatedActType.SwiGlu, id="SwiGlu"),
-#         pytest.param(GatedActType.GeGlu, id="GeGlu"),
-#     ],
-# )
-# def test_topk_routing(num_tokens, hidden_size, intermediate_size, moe_impl,
-#                      routing_config, weight_processing, gated_act_type, cache_permute_indices):
-#     """Test TopK routing configuration."""
-#     run_moe_test(num_tokens, hidden_size, intermediate_size, moe_impl,
-#                  routing_config, weight_processing, gated_act_type, cache_permute_indices)
+# Test: TopK routing
+@pytest.mark.parametrize("num_tokens", [1, 8, 128])  # Limited for GeGlu
+@pytest.mark.parametrize("hidden_size", [1024])
+@pytest.mark.parametrize("intermediate_size", [384, 512, 768, 1024])
+@pytest.mark.parametrize(
+    "moe_impl",
+    [
+        pytest.param(FP4Moe(quant_mode=QuantMode.FP4_NVFP4_NVFP4), id="NvFP4xNvFP4"),
+        pytest.param(FP4Moe(quant_mode=QuantMode.FP4_MXFP4_MXFP8), id="MxFP4xMxFP8"),
+        pytest.param(FP4Moe(quant_mode=QuantMode.FP4_MXFP4_Bf16), id="MxFP4xBf16"),
+    ],
+)
+@pytest.mark.parametrize(
+    "routing_config",
+    [
+        {
+            "num_experts": 16,
+            "top_k": 2,
+            "padding": 8,
+            "n_groups": None,
+            "top_k_groups": None,
+            "routed_scaling": None,
+            "has_routing_bias": False,
+            "routing_method_type": RoutingMethodType.TopK,
+            "compatible_moe_impls": [FP4Moe],
+            "compatible_intermediate_size": [384, 512, 768, 1024],
+        },
+    ],
+)
+@pytest.mark.parametrize(
+    "weight_processing",
+    [
+        pytest.param(
+            {
+                "use_shuffled_weight": True,
+                "layout": WeightLayout.MajorK,
+                "compatible_moe_impls": [FP4Moe, FP8PerTensorMoe, FP8BlockScaleMoe],
+            },
+            id="Shuffled_MajorK",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "gated_act_type",
+    [
+        pytest.param(GatedActType.SwiGlu, id="SwiGlu"),
+        pytest.param(GatedActType.GeGlu, id="GeGlu"),
+    ],
+)
+def test_topk_routing(
+    num_tokens,
+    hidden_size,
+    intermediate_size,
+    moe_impl,
+    routing_config,
+    weight_processing,
+    gated_act_type,
+    cache_permute_indices,
+):
+    """Test TopK routing configuration."""
+    run_moe_test(
+        num_tokens,
+        hidden_size,
+        intermediate_size,
+        moe_impl,
+        routing_config,
+        weight_processing,
+        gated_act_type,
+        cache_permute_indices,
+    )
 
 
-# # Test: Llama4 routing
-# @pytest.mark.parametrize("num_tokens", [1, 8, 1024])
-# @pytest.mark.parametrize("hidden_size", [1024])
-# @pytest.mark.parametrize("intermediate_size", [1024, 2048])
-# @pytest.mark.parametrize(
-#     "moe_impl",
-#     [
-#         pytest.param(FP8PerTensorMoe(), id="FP8_Tensor"),
-#     ],
-# )
-# @pytest.mark.parametrize(
-#     "routing_config",
-#     [
-#         {
-#             "num_experts": 128,
-#             "top_k": 1,
-#             "padding": 8,
-#             "n_groups": 0,
-#             "top_k_groups": 0,
-#             "routed_scaling": 2.5,
-#             "has_routing_bias": True,
-#             "routing_method_type": RoutingMethodType.Llama4,
-#             "compatible_moe_impls": [FP8PerTensorMoe],
-#             "compatible_intermediate_size": [1024, 2048],
-#         },
-#     ],
-# )
-# @pytest.mark.parametrize(
-#     "weight_processing",
-#     [
-#         pytest.param({
-#             "use_shuffled_weight": True,
-#             "layout": WeightLayout.MajorK,
-#             "compatible_moe_impls": [FP4Moe, FP8PerTensorMoe, FP8BlockScaleMoe],
-#         }, id="Shuffled_MajorK"),
-#     ],
-# )
-# @pytest.mark.parametrize(
-#     "gated_act_type",
-#     [
-#         pytest.param(GatedActType.SwiGlu, id="SwiGlu"),
-#     ],
-# )
-# def test_llama4_routing(num_tokens, hidden_size, intermediate_size, moe_impl,
-#                        routing_config, weight_processing, gated_act_type, cache_permute_indices):
-#     """Test Llama4 routing configuration with FP8 per-tensor."""
-#     run_moe_test(num_tokens, hidden_size, intermediate_size, moe_impl,
-#                  routing_config, weight_processing, gated_act_type, cache_permute_indices)
+# Test: Llama4 routing
+@pytest.mark.parametrize("num_tokens", [1, 8, 1024])
+@pytest.mark.parametrize("hidden_size", [1024])
+@pytest.mark.parametrize("intermediate_size", [1024, 2048])
+@pytest.mark.parametrize(
+    "moe_impl",
+    [
+        pytest.param(FP8PerTensorMoe(), id="FP8_Tensor"),
+    ],
+)
+@pytest.mark.parametrize(
+    "routing_config",
+    [
+        {
+            "num_experts": 128,
+            "top_k": 1,
+            "padding": 8,
+            "n_groups": 0,
+            "top_k_groups": 0,
+            "routed_scaling": 2.5,
+            "has_routing_bias": True,
+            "routing_method_type": RoutingMethodType.Llama4,
+            "compatible_moe_impls": [FP8PerTensorMoe],
+            "compatible_intermediate_size": [1024, 2048],
+        },
+    ],
+)
+@pytest.mark.parametrize(
+    "weight_processing",
+    [
+        pytest.param(
+            {
+                "use_shuffled_weight": True,
+                "layout": WeightLayout.MajorK,
+                "compatible_moe_impls": [FP4Moe, FP8PerTensorMoe, FP8BlockScaleMoe],
+            },
+            id="Shuffled_MajorK",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "gated_act_type",
+    [
+        pytest.param(GatedActType.SwiGlu, id="SwiGlu"),
+    ],
+)
+def test_llama4_routing(
+    num_tokens,
+    hidden_size,
+    intermediate_size,
+    moe_impl,
+    routing_config,
+    weight_processing,
+    gated_act_type,
+    cache_permute_indices,
+):
+    """Test Llama4 routing configuration with FP8 per-tensor."""
+    run_moe_test(
+        num_tokens,
+        hidden_size,
+        intermediate_size,
+        moe_impl,
+        routing_config,
+        weight_processing,
+        gated_act_type,
+        cache_permute_indices,
+    )
