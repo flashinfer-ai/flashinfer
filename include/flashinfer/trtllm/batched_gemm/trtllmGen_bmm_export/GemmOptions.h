@@ -74,6 +74,13 @@ void printArgs(T first, Args... args) {
 
 namespace batchedGemm {
 
+namespace trtllm {
+namespace gen {
+class CudaRunner;
+class GenCfg;
+}  // namespace gen
+}  // namespace trtllm
+
 namespace gemm {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -91,28 +98,29 @@ struct GemmOptions {
 #endif
 
   GemmOptions() = default;
-
   GemmOptions(AllReduceAlgo allReduceAlgo, BiasType biasType, int blockK, int clusterDimX,
               int clusterDimY, int clusterDimZ, CtaSwizzleType ctaSwizzleType, tg::Dtype dtypeAcc,
               tg::Dtype dtypeA, tg::Dtype dtypeB, tg::Dtype dtypeC, tg::Dtype dtypeMmaA,
               tg::Dtype dtypeMmaB, bool enablesEarlyExit, bool enablesDelayedEarlyExit,
               bool enablesGlobalPtxKnobs, int epilogueLdtmDps, int epilogueLdtmBits,
-              int epilogueTileM, int epilogueTileN, bool gridTriggerSecondaryA,
-              bool gridTriggerSecondaryB, bool gridWaitForPrimaryEarlyExit,
-              bool gridWaitForPrimaryA, bool gridWaitForPrimaryB, bool hoistLoadTaskInit,
-              bool hoistMmaTaskTryWaits, int k, KernelTraits kernelTraits, MatrixLayout layoutA,
-              MatrixLayout layoutB, int m, int mmaK, tg::MmaKind mmaKind, int mmaM, int mmaN,
-              bool mockAllReduce, int n, int numRegsCopySfLdsSttm, int numSlicesForSplitK,
-              int numSlicesForSliceK, int numStages, int numStagesMma,
-              int numStagesMmaWithinWorkTile, int numStagesMmaAcrossWorkTile, int numStagesWorkId,
-              bool outputDebugTensors, bool patchF2fp, std::optional<int32_t> sfBlockSizeA,
-              tg::SfLayout sfLayoutA, tg::SfLayout sfLayoutB, tg::SfLayout sfLayoutC,
-              int sfReshapeFactor, bool sliceK, SplitK splitK, int tileK, int tileM, int tileN,
-              TileScheduler tileScheduler, bool transposeMmaOutput, bool useCustomMmaSchedule,
-              bool useDeepSeekFp8, bool useHoistTryWaitForCustomMmaSchedule, bool usePerTokenSfA,
+              int epilogueTileM, int epilogueTileN, bool fuseUtccpWithUtcmma,
+              bool gridTriggerSecondaryA, bool gridTriggerSecondaryB,
+              bool gridWaitForPrimaryEarlyExit, bool gridWaitForPrimaryA, bool gridWaitForPrimaryB,
+              bool hoistLoadTaskInit, bool hoistMmaTaskTryWaits, int k, KernelTraits kernelTraits,
+              MatrixLayout layoutA, MatrixLayout layoutB, int m, int mmaK, tg::MmaKind mmaKind,
+              int mmaM, int mmaN, bool mockAllReduce, int n, int numEpilogueWarps,
+              int numRegsCastAWarps, int numRegsCopySfLdsSttm, int numRegsPerThreadEpilogueWarp,
+              int numRegsPerThreadNonEpilogueWarp, int numSlicesForSplitK, int numSlicesForSliceK,
+              int numStages, int numStagesMma, int numStagesMmaWithinWorkTile,
+              int numStagesMmaAcrossWorkTile, int numStagesWorkId, bool outputDebugTensors,
+              bool patchF2fp, std::optional<int32_t> sfBlockSizeA, tg::SfLayout sfLayoutA,
+              tg::SfLayout sfLayoutB, tg::SfLayout sfLayoutC, int sfReshapeFactor, bool sliceK,
+              SplitK splitK, int tileK, int tileM, int tileN, TileScheduler tileScheduler,
+              bool transposeMmaOutput, bool useCustomMmaSchedule, bool useDeepSeekFp8,
+              bool useHoistTryWaitForCustomMmaSchedule, bool useMaxTmemOverlap, bool usePerTokenSfA,
               bool usePerTokenSfB, bool useShuffledMatrixA, bool useTmaStore,
-              bool useTwoTmaLoadWarps, bool useTwoMmaWarps, bool useUnrollLoop2xForMma,
-              int worldSize)
+              bool useTwoTmaLoadWarps, bool useTwoMmaWarps, bool useUnrollLoop2xForMma, int validM,
+              int validN, int validK, int worldSize)
       : mAllReduceAlgo{allReduceAlgo},
         mBiasType{biasType},
         mBlockK(blockK),
@@ -133,6 +141,7 @@ struct GemmOptions {
         mEpilogueLdtmBits{epilogueLdtmBits},
         mEpilogueTileM{epilogueTileM},
         mEpilogueTileN{epilogueTileN},
+        mFuseUtccpWithUtcmma{fuseUtccpWithUtcmma},
         mGridTriggerSecondaryA{gridTriggerSecondaryA},
         mGridTriggerSecondaryB{gridTriggerSecondaryB},
         mGridWaitForPrimaryEarlyExit{gridWaitForPrimaryEarlyExit},
@@ -151,7 +160,11 @@ struct GemmOptions {
         mMmaN{mmaN},
         mMockAllReduce{mockAllReduce},
         mN{n},
+        mNumEpilogueWarps{numEpilogueWarps},
+        mNumRegsCastAWarps(numRegsCastAWarps),
         mNumRegsCopySfLdsSttm(numRegsCopySfLdsSttm),
+        mNumRegsPerThreadEpilogueWarp(numRegsPerThreadEpilogueWarp),
+        mNumRegsPerThreadNonEpilogueWarp(numRegsPerThreadNonEpilogueWarp),
         mNumSlicesForSplitK{numSlicesForSplitK},
         mNumSlicesForSliceK{numSlicesForSliceK},
         mNumStages{numStages},
@@ -176,6 +189,7 @@ struct GemmOptions {
         mUseCustomMmaSchedule{useCustomMmaSchedule},
         mUseDeepSeekFp8{useDeepSeekFp8},
         mUseHoistTryWaitForCustomMmaSchedule{useHoistTryWaitForCustomMmaSchedule},
+        mUseMaxTmemOverlap{useMaxTmemOverlap},
         mUsePerTokenSfA{usePerTokenSfA},
         mUsePerTokenSfB{usePerTokenSfB},
         mUseShuffledMatrixA{useShuffledMatrixA},
@@ -183,6 +197,9 @@ struct GemmOptions {
         mUseTwoTmaLoadWarps{useTwoTmaLoadWarps},
         mUseTwoMmaWarps{useTwoMmaWarps},
         mUseUnrollLoop2xForMma{useUnrollLoop2xForMma},
+        mValidM{validM},
+        mValidN{validN},
+        mValidK{validK},
         mWorldSize{worldSize} {}
 
   // The all-reduce algorithm.
@@ -233,6 +250,8 @@ struct GemmOptions {
   int mEpilogueTileM{128};
   // Tile size for the epilogue in N dimension.
   int mEpilogueTileN{32};
+  // Whether fuse UTCCP with UTC*MMA.
+  bool mFuseUtccpWithUtcmma{false};
   // Whether load task A triggers the next grid.
   bool mGridTriggerSecondaryA{false};
   // Whether load task B triggers the next grid.
@@ -269,8 +288,16 @@ struct GemmOptions {
   bool mMockAllReduce{false};
   // The N dimension of GEMM.
   int mN{64 * 4};
+  // Number of Epilogue Warps
+  int mNumEpilogueWarps{4};
+  // Number of registers for the cast A warps.
+  int mNumRegsCastAWarps{0};
   // Number of registers for the LDS+STTM warps.
   int mNumRegsCopySfLdsSttm{0};
+  // Number of registers per thread for epilogue warps
+  int mNumRegsPerThreadEpilogueWarp{0};
+  // Number of registers per thread for non-epilogue warps
+  int mNumRegsPerThreadNonEpilogueWarp{0};
   // Number of partitions along the K dimension. When mNumSlicesForSplitK > 1,
   // the problem is distributed across several SMs, where each CTA works on its local K slice.
   // Partial results are accumulated afterwards using either GMEM or DSMEM (in CGA)
@@ -329,6 +356,8 @@ struct GemmOptions {
   // k-block. It benefits when the next k-block is already available and thus sustaining the
   // momentum, but it adds latency to the first k-block for smaller k-loop.
   bool mUseHoistTryWaitForCustomMmaSchedule{false};
+  // Whether use the max Tmem overlap trick.
+  bool mUseMaxTmemOverlap{false};
   // Apply per-token scales from A
   bool mUsePerTokenSfA{false};
   // Apply per-token scales from B
@@ -343,6 +372,15 @@ struct GemmOptions {
   bool mUseTwoMmaWarps{false};
   // Whether to unroll the loop by 2x.
   bool mUseUnrollLoop2xForMma{true};
+  // The valid range of M/N/K dimension of GEMM without padding values.
+  // Used to opportunistically remove memory traffic from the padding due to rigid SF shape
+  // constraint or TMA constraint. Such as:
+  // 1. outputDim % (4 * sfBlockSize) == 0; as 4x SFs are packed into 4 bytes
+  // 2. MxFp4 x Fp8 mmaType requires bespoke TMA load which requires hiddenDim % 128 == 0
+  // 3. TMA requires 16B alignment for each row
+  int mValidM{-1};
+  int mValidN{-1};
+  int mValidK{-1};
   // World size for all-reduce.
   int mWorldSize{1};
 };
@@ -365,19 +403,17 @@ inline bool isSmVersionBlackwell(SmVersion smVersion) {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 struct GemmConfig {
-  // When TRT-LLM Gen is exported to the other frameworks, the TLLM_GEN_EXPORT_INTERFACE must be
-  // defined. In this case, the cubins will be loaded from the provided data and function name.
-  // Otherwise, the kernel will be loaded from the CudaRunner.
-#ifdef TLLM_GEN_EXPORT_INTERFACE
   uint8_t const* mData{nullptr};
-  uint32_t const mSize{0};
-  uint32_t const mSharedMemSize{0};
+  uint32_t mSize{0};
+  uint32_t mSharedMemSize{0};
   char const* mFunctionName{nullptr};
-  uint32_t const mNumThreadsPerCTA{0};
+  uint32_t mNumThreadsPerCTA{0};
   char const* mHash{nullptr};
-#else
+  std::string mGenCfgJsonStr{""};
+  char const* mExecPath{nullptr};
   trtllm::gen::CudaRunner* mCudaRunner{nullptr};
-#endif
+  trtllm::gen::GenCfg* mGenCfg{nullptr};
+  int32_t mInstanceIdx{0};
 
   GemmOptions mOptions{};
   SmVersion mSm{SmVersion::Sm100a};
@@ -447,6 +483,7 @@ inline std::string dumpOptions(GemmOptions const& options) {
   ss << "mEpilogueLdtmBits=" << options.mEpilogueLdtmBits << "," << std::endl;
   ss << "mEpilogueTileM=" << options.mEpilogueTileM << "," << std::endl;
   ss << "mEpilogueTileN=" << options.mEpilogueTileN << "," << std::endl;
+  ss << "mFuseUtccpWithUtcmma=" << options.mFuseUtccpWithUtcmma << "," << std::endl;
   ss << "mGridTriggerSecondaryA=" << options.mGridTriggerSecondaryA << "," << std::endl;
   ss << "mGridTriggerSecondaryB=" << options.mGridTriggerSecondaryB << "," << std::endl;
   ss << "mGridWaitForPrimaryEarlyExit=" << options.mGridWaitForPrimaryEarlyExit << "," << std::endl;
@@ -470,7 +507,13 @@ inline std::string dumpOptions(GemmOptions const& options) {
   ss << "mMmaN=" << options.mMmaN << "," << std::endl;
   ss << "mMockAllReduce=" << options.mMockAllReduce << "," << std::endl;
   ss << "mN=" << options.mN << "," << std::endl;
+  ss << "mNumEpilogueWarps=" << options.mNumEpilogueWarps << "," << std::endl;
+  ss << "mNumRegsCastAWarps=" << options.mNumRegsCastAWarps << "," << std::endl;
   ss << "mNumRegsCopySfLdsSttm=" << options.mNumRegsCopySfLdsSttm << "," << std::endl;
+  ss << "mNumRegsPerThreadEpilogueWarp=" << options.mNumRegsPerThreadEpilogueWarp << ","
+     << std::endl;
+  ss << "mNumRegsPerThreadNonEpilogueWarp=" << options.mNumRegsPerThreadNonEpilogueWarp << ","
+     << std::endl;
   ss << "mNumSlicesForSplitK=" << options.mNumSlicesForSplitK << "," << std::endl;
   ss << "mNumSlicesForSliceK=" << options.mNumSlicesForSliceK << "," << std::endl;
   ss << "mNumStages=" << options.mNumStages << "," << std::endl;
@@ -512,6 +555,7 @@ inline std::string dumpOptions(GemmOptions const& options) {
   ss << "mUseDeepSeekFp8=" << options.mUseDeepSeekFp8 << "," << std::endl;
   ss << "mUseHoistTryWaitForCustomMmaSchedule=" << options.mUseHoistTryWaitForCustomMmaSchedule
      << "," << std::endl;
+  ss << "mUseMaxTmemOverlap=" << options.mUseMaxTmemOverlap << "," << std::endl;
   ss << "mUsePerTokenSfA=" << options.mUsePerTokenSfA << "," << std::endl;
   ss << "mUsePerTokenSfB=" << options.mUsePerTokenSfB << "," << std::endl;
   ss << "mUseShuffledMatrixA=" << options.mUseShuffledMatrixA << "," << std::endl;
@@ -519,6 +563,9 @@ inline std::string dumpOptions(GemmOptions const& options) {
   ss << "mUseTwoTmaLoadWarps=" << options.mUseTwoTmaLoadWarps << "," << std::endl;
   ss << "mUseTwoMmaWarps=" << options.mUseTwoMmaWarps << "," << std::endl;
   ss << "mUseUnrollLoop2xForMma=" << options.mUseUnrollLoop2xForMma << "," << std::endl;
+  ss << "mValidM=" << options.mValidM << "," << std::endl;
+  ss << "mValidN=" << options.mValidN << "," << std::endl;
+  ss << "mValidK=" << options.mValidK << "," << std::endl;
   ss << "mWorldSize=" << options.mWorldSize << std::endl;
   return ss.str();
 }
@@ -578,6 +625,45 @@ inline bool checkAndUpdateGemmOptions(GemmOptions& options, bool isBlackwell, in
     }
   }
 
+  // If validM/N/K is not specified, then assume the full range of the dimension is valid.
+  if (options.mValidM == -1) {
+    options.mValidM = options.mM;
+  }
+  if (options.mValidN == -1) {
+    options.mValidN = options.mN;
+  }
+  if (options.mValidK == -1) {
+    options.mValidK = options.mK;
+  }
+
+  // It must not exceed the padded dimensions.
+  if (options.mValidM > options.mM || options.mValidN > options.mN ||
+      options.mValidK > options.mK) {
+    TLLM_LOG_WARNING(
+        options.mValidK <= options.mK,
+        "ValidM, ValidN, and ValidK must be less than or equal to M, N, and K respectively.");
+    if (updateOptions) {
+      options.mValidM = std::min(options.mValidM, options.mM);
+      options.mValidN = std::min(options.mValidN, options.mN);
+      options.mValidK = std::min(options.mValidK, options.mK);
+    } else {
+      return false;
+    }
+  }
+
+  // BlockMajorK layout does not support validM, validN, validK parameters
+  if (options.mLayoutA == gemm::MatrixLayout::BlockMajorK ||
+      options.mLayoutB == gemm::MatrixLayout::BlockMajorK) {
+    bool hasValidParams = (options.mValidM != -1 && options.mValidM != options.mM) ||
+                          (options.mValidN != -1 && options.mValidN != options.mN) ||
+                          (options.mValidK != -1 && options.mValidK != options.mK);
+    TLLM_CHECK_ERROR(!hasValidParams,
+                     "BlockMajorK layout does not support validM/validN/validK parameters due to "
+                     "swizzled layout. "
+                     "Found validM=",
+                     options.mValidM, " validN=", options.mValidN, " validK=", options.mValidK);
+  }
+
   // Check that the A cast is supported.
   // Currently, we only support {MxFp4, NvFp4} -> Bf16.
   TLLM_CHECK_ERROR(
@@ -607,6 +693,9 @@ inline bool checkAndUpdateGemmOptions(GemmOptions& options, bool isBlackwell, in
         options.mDtypeA == tg::Dtype::MxE2m1 && options.mDtypeMmaA == tg::Dtype::Bfloat16,
         "PatchF2fp is only supported for MxFp4 to Bf16 casts.");
   }
+#ifdef TLLM_PUBLIC_RELEASE
+  options.mPatchF2fp = false;
+#endif  // TLLM_PUBLIC_RELEASE
 
   // FIXME: We do not support different dtypes for A and B when not on Blackwell.
   if (!isBlackwell) {
@@ -819,7 +908,7 @@ inline bool checkAndUpdateGemmOptions(GemmOptions& options, bool isBlackwell, in
       (padMultiplierB * tg::dtypeGetNumBits(options.mDtypeB) * options.mK / 8) % 16 == 0,
       "K dimension of B must be aligned to 16 bytes.");
 
-  if (options.mDtypeC == tg::Dtype::E2m1 || options.mDtypeC == tg::Dtype::MxE4m3) {
+  if (tg::dtypeIsBlockFmt(options.mDtypeC)) {
     TLLM_CHECK_ERROR(isBlackwell, "Block scaling is only supported on Blackwell");
 
     TLLM_CHECK_ERROR(
@@ -836,6 +925,10 @@ inline bool checkAndUpdateGemmOptions(GemmOptions& options, bool isBlackwell, in
     int const hiddenGranularity = 4 * tg::dtypeNumEltsPerSf(options.mDtypeC);
     TLLM_CHECK_ERROR(hiddenDim % hiddenGranularity == 0, "Hidden dim (", hiddenDim,
                      ") must be a multiple of ", hiddenGranularity, " for block-scaled outputs.");
+    int const validHiddenDim = options.mTransposeMmaOutput ? options.mValidM : options.mValidN;
+    TLLM_CHECK_ERROR(validHiddenDim % tg::dtypeNumEltsPerSf(options.mDtypeC) == 0,
+                     "Valid hidden dim (", validHiddenDim, ") must be a multiple of ",
+                     tg::dtypeNumEltsPerSf(options.mDtypeC), " for block-scaled outputs.");
     TLLM_CHECK_ERROR(!options.mTransposeMmaOutput || options.mUseShuffledMatrixA,
                      "Transposing block-scaled outputs requires shuffled A.");
   }
@@ -901,8 +994,8 @@ inline bool checkAndUpdateGemmOptions(GemmOptions& options, bool isBlackwell, in
 
   if (options.mUseShuffledMatrixA) {
     auto const shuffleBlockSize = getShuffleBlockSize(options.mEpilogueTileM);
-    TLLM_CHECK_ERROR(options.mM % shuffleBlockSize == 0,
-                     "M must be a multiple of shuffle block size (", shuffleBlockSize,
+    TLLM_CHECK_ERROR(options.mM % shuffleBlockSize == 0 && options.mValidM % shuffleBlockSize == 0,
+                     "M/validM must be a multiple of shuffle block size (", shuffleBlockSize,
                      ") when useShuffledMatrixA");
   }
 
@@ -1084,9 +1177,9 @@ inline bool checkAndUpdateGemmOptions(GemmOptions& options, bool isBlackwell, in
     // options.mUseTwoMmaWarps = true;
 
     // Make sure the GEMM-K dimension is a multiple of 128 when using DeepSeek FP8.
-    TLLM_CHECK_ERROR(options.mK % 128 == 0,
-                     "GEMM-K must be a multiple of 128 when using DeepSeek Fp8. Found ",
-                     options.mK);
+    TLLM_CHECK_ERROR(options.mK % 128 == 0 && options.mValidK % 128 == 0,
+                     "GEMM-K and validK must be a multiple of 128 when using DeepSeek Fp8. Found ",
+                     options.mK, " and validK=", options.mValidK);
 
     // Check that the output tile N can be processed with the epilogue tile granularity.
     TLLM_CHECK_ERROR((hiddenDimPerOutputTile / 2) % hiddenDimPerEpilogueTile == 0,
@@ -1099,6 +1192,9 @@ inline bool checkAndUpdateGemmOptions(GemmOptions& options, bool isBlackwell, in
                      hiddenDimPerOutputTile / 2, ") being a multiple of mma", hiddenDimName, " (",
                      hiddenDimPerMma, ")");
   }
+
+  TLLM_CHECK_ERROR(options.mNumEpilogueWarps == 4 || options.mNumEpilogueWarps == 8,
+                   "mNumEpilogueWarps has to be either 4 or 8.");
 
   if (options.mSliceK) {
     TLLM_CHECK_ERROR(isBlackwell, "Slice-K is not supported on Hopper");
@@ -1253,7 +1349,7 @@ inline bool checkAndUpdateGemmOptions(GemmOptions& options, bool isBlackwell, in
       "At least one matrix must be in k-major layout");
 
   // Some features are currently only support when both matrices are in K-major format
-  if (options.mLayoutB != MatrixLayout::MajorK || options.mLayoutB != MatrixLayout::MajorK) {
+  if (options.mLayoutA != MatrixLayout::MajorK || options.mLayoutB != MatrixLayout::MajorK) {
     TLLM_CHECK_ERROR(isBlackwell, "Non K-major layouts are only supported on Blackwell");
     TLLM_CHECK_ERROR(options.mSplitK == SplitK::None, "Non K-major layouts do not support split K");
   }
@@ -1303,6 +1399,31 @@ inline bool checkAndUpdateGemmOptions(GemmOptions& options, bool isBlackwell, in
                      "Bias is not supported for Meta Fp8");
   }
 
+  if (options.mUseMaxTmemOverlap) {
+    TLLM_CHECK_ERROR(options.mUseTmaStore, "mUseMaxTmemOverlap only works with TMA store");
+    TLLM_CHECK_ERROR(options.mFuseUtccpWithUtcmma,
+                     "mUseMaxTmemOverlap only works with mFuseUtccpWithUtcmma");
+    TLLM_CHECK_ERROR(options.mNumSlicesForSplitK == 1,
+                     "mUseMaxTmemOverlap does not work with splitK");
+    TLLM_CHECK_ERROR(options.mNumSlicesForSliceK == 1,
+                     "mUseMaxTmemOverlap does not work with sliceK");
+    TLLM_CHECK_ERROR(!options.mUseDeepSeekFp8,
+                     "mUseMaxTmemOverlap does not work with mUseDeepSeekFp8");
+    TLLM_CHECK_ERROR(!options.mUseUnrollLoop2xForMma,
+                     "mUseMaxTmemOverlap does not work with mUseUnrollLoop2xForMma");
+  }
+
+  if (options.mNumEpilogueWarps > 4) {
+    TLLM_CHECK_ERROR(options.mUseTmaStore,
+                     "Using more than 4 warps for epilogue only works with TMA store");
+    TLLM_CHECK_ERROR(options.mNumSlicesForSplitK == 1,
+                     "Using more than 4 warps for epilogue does not work with splitK");
+    TLLM_CHECK_ERROR(options.mNumSlicesForSliceK == 1,
+                     "Using more than 4 warps for epilogue does not work with sliceK");
+    TLLM_CHECK_ERROR(!options.mUseDeepSeekFp8,
+                     "Using more than 4 warps for epilogue does not work with mUseDeepSeekFp8");
+  }
+
   if (updateOptions) {
     // Init kernel traits.
     options.mKernelTraits = KernelTraits(
@@ -1311,12 +1432,41 @@ inline bool checkAndUpdateGemmOptions(GemmOptions& options, bool isBlackwell, in
         options.mTileK, options.mEpilogueTileM, options.mEpilogueTileN, options.mNumStages,
         options.mNumStagesMma, options.mNumSlicesForSplitK, options.mNumSlicesForSliceK,
         options.mSplitK, options.mUseTmaStore, options.mTransposeMmaOutput, options.mAllReduceAlgo,
+        options.mFuseUtccpWithUtcmma, options.mUseMaxTmemOverlap, options.mNumEpilogueWarps,
         options.mTileScheduler == TileScheduler::Persistent, options.mUseDeepSeekFp8,
         options.mUsePerTokenSfA, options.mUsePerTokenSfB,
         /* useTwoCtas*/ options.mClusterDimX == 2, options.mBiasType);
   }
 
   return true;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline bool getDoesScaleC(tg::Dtype dtypeC) {
+  // Need to scale/quantize the output C matrix when the output type is Fp8 or NvFp4.
+  return dtypeC == tg::Dtype::E4m3 || dtypeC == tg::Dtype::E2m1;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline bool getDoesScaleAb(tg::Dtype dtypeA, tg::Dtype dtypeB, bool useDeepSeekFp8) {
+  // Need to scale/dequantize the input A/B matrices when the input type is Fp8 or NvFp4 and
+  // DeepSeekFp8 is not used.
+  bool const doesScaleAb{
+      dtypeA == tg::Dtype::E2m1 || dtypeB == tg::Dtype::E2m1 ||
+      ((dtypeA == tg::Dtype::E4m3 || dtypeB == tg::Dtype::E4m3) && !useDeepSeekFp8)};
+  return doesScaleAb;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline bool getKernelDoesScaleC(tg::Dtype dtypeA, tg::Dtype dtypeB, tg::Dtype dtypeC,
+                                bool useDeepSeekFp8) {
+  // In the Gemm/BatchedGemm kernels, dequantScaleAb and quantScaleC are combined into one single
+  // scaling factor (called scaleC). As a result, we combine the logic for getDoesScaleAb and
+  // getDoesScaleC.
+  return getDoesScaleC(dtypeC) || getDoesScaleAb(dtypeA, dtypeB, useDeepSeekFp8);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

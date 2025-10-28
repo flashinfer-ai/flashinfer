@@ -82,8 +82,18 @@ bool useTmaOobOptC(BatchedGemmOptions const& options) {
 
 // Create the TMA shape/stride for A/B/C.
 template <class GemmOptions>
-static auto makeTmaShapeStrideAbc(GemmOptions const& options, int mM, int mN, int mK, int tileM,
-                                  int tileN, int tileK, MatrixType matrixType) {
+static auto makeTmaShapeStrideAbc(GemmOptions const& options, int sizeM, int sizeN, int sizeK,
+                                  int tileM, int tileN, int tileK, MatrixType matrixType,
+                                  int validM = -1, int validN = -1, int validK = -1) {
+  if (validM == -1) {
+    validM = sizeM;
+  }
+  if (validN == -1) {
+    validN = sizeN;
+  }
+  if (validK == -1) {
+    validK = sizeK;
+  }
   // Weights matrix is A if we transpose the output of MMA (to have it M-major).
   // Otherwise, it is B, when the output of MMA is K-major.
   bool const isWeights = (matrixType == MatrixType::MatrixA && options.mTransposeMmaOutput) ||
@@ -96,9 +106,11 @@ static auto makeTmaShapeStrideAbc(GemmOptions const& options, int mM, int mN, in
                             : matrixType == MatrixType::MatrixC ? useTmaOobOptC(options)
                                                                 : false;
 
-  // The outer dimension.
+  // The outer dimension. Uses padded dimensions for strides and valid dimensions for shapes.
   auto numTokens =
-      (matrixType == MatrixType::MatrixA || matrixType == MatrixType::MatrixC) ? mM : mN;
+      (matrixType == MatrixType::MatrixA || matrixType == MatrixType::MatrixC) ? sizeM : sizeN;
+  auto numTokensValid =
+      (matrixType == MatrixType::MatrixA || matrixType == MatrixType::MatrixC) ? validM : validN;
   // The outer dimension tile size.
   auto ctaTileNumTokens =
       (matrixType == MatrixType::MatrixA || matrixType == MatrixType::MatrixC) ? tileM : tileN;
@@ -107,7 +119,8 @@ static auto makeTmaShapeStrideAbc(GemmOptions const& options, int mM, int mN, in
       (matrixType == MatrixType::MatrixC) ? options.mEpilogueTileM : ctaTileNumTokens;
 
   // The inner dimension.
-  auto hiddenSize = (matrixType == MatrixType::MatrixC) ? mN : mK;
+  auto hiddenSize = (matrixType == MatrixType::MatrixC) ? sizeN : sizeK;
+  auto hiddenSizeValid = (matrixType == MatrixType::MatrixC) ? validN : validK;
   // The inner dimension tile size.
   auto ctaTileHiddenSize = (matrixType == MatrixType::MatrixC) ? tileN : tileK;
   // The inner dimension of TMA box shape.
@@ -117,6 +130,7 @@ static auto makeTmaShapeStrideAbc(GemmOptions const& options, int mM, int mN, in
   // Swap matrix C sizes if output is transposed.
   if (matrixType == MatrixType::MatrixC && options.mTransposeMmaOutput) {
     std::swap(numTokens, hiddenSize);
+    std::swap(numTokensValid, hiddenSizeValid);
     std::swap(ctaTileNumTokens, ctaTileHiddenSize);
     std::swap(tileNumTokens, tileHiddenSize);
   }
@@ -125,6 +139,7 @@ static auto makeTmaShapeStrideAbc(GemmOptions const& options, int mM, int mN, in
   // gated activations but not regular activations.
   if (options.mFusedAct && matrixType == MatrixType::MatrixC) {
     hiddenSize /= 2;
+    hiddenSizeValid /= 2;
     tileHiddenSize /= 2;
     ctaTileHiddenSize /= 2;
   }
@@ -134,17 +149,18 @@ static auto makeTmaShapeStrideAbc(GemmOptions const& options, int mM, int mN, in
   // 1, so swap the first two dimension so that the hiddenSize dimension comes first.
 
   // Activations matrix is 2D (sum(divUpMul(M[bi], tileM) for bi in B), K).
-  std::vector<uint64_t> shape = {static_cast<uint64_t>(hiddenSize),
-                                 static_cast<uint64_t>(numTokens)};
+  // Use valid dimensions for shape.
+  std::vector<uint64_t> shape = {static_cast<uint64_t>(hiddenSizeValid),
+                                 static_cast<uint64_t>(numTokensValid)};
   if (useTmaOobOpt /* also implies input/output activation */) {
     // If TMA OOB optimization is used:
     // Shape [hidden, tokens]                      Stride [1, hidden] becomes
     // Shape [hidden, tileN, TmaDimMax, TmaDimMax] Stride [1, hidden, XLargeN - hidden, hidden]
-    shape = {static_cast<uint64_t>(hiddenSize), static_cast<uint64_t>(ctaTileNumTokens),
+    shape = {static_cast<uint64_t>(hiddenSizeValid), static_cast<uint64_t>(ctaTileNumTokens),
              static_cast<uint64_t>(tg::TmaDimMax), static_cast<uint64_t>(tg::TmaDimMax)};
   } else if (isWeights) {
     // If the matrix is a weights matrix, we use 3D logical shape (B, M, K) or (B, N, K).
-    shape = {static_cast<uint64_t>(hiddenSize), static_cast<uint64_t>(numTokens),
+    shape = {static_cast<uint64_t>(hiddenSizeValid), static_cast<uint64_t>(numTokensValid),
              static_cast<uint64_t>(options.mNumBatches)};
   }
 
@@ -177,10 +193,11 @@ static auto makeTmaShapeStrideAbc(GemmOptions const& options, int mM, int mN, in
       stride[1] = numTokens;
       std::swap(tileShape[0], tileShape[1]);
     } else if (layout == gemm::MatrixLayout::BlockMajorK) {
-      // Set shapes based on blocking layout
+      // Set shapes based on blocking layout.
       shape = {static_cast<uint64_t>(options.mBlockK), static_cast<uint64_t>(numTokens),
-               static_cast<uint64_t>(mK / options.mBlockK),
+               static_cast<uint64_t>(sizeK / options.mBlockK),
                static_cast<uint64_t>(options.mNumBatches)};
+      // Strides use padded dimensions
       stride = {1, static_cast<uint64_t>(options.mBlockK),
                 static_cast<uint64_t>(numTokens * options.mBlockK),
                 static_cast<uint64_t>(hiddenSize * numTokens)};
@@ -209,17 +226,6 @@ static auto makeTmaShapeStrideSfAb(int mM, int mN, int mK, MatrixType matrixType
 
   switch (layout) {
     case tg::SfLayout::R128c4: {
-      // The scaling factor tensor packs 128x4 tiles into contiguous 512B blocks.
-      // The 512B block maps to a 32x16B (32x128b) block in TMEM.
-      // See https://nvbugspro.nvidia.com/bug/4165523
-      //
-      // Additionally, we have to meet constraints of TMA that the box dimensions are less
-      // than 256 and boxDim[0] is a multiple of 16B.
-      //
-      // The "logical" tensor is:      [outer,       inner / numEltsPerSf]
-      // The aforementioned format is: [outer / 128, inner / numEltsPerSf / 4,    512]
-      // The shape we use for TMA is:  [outer / 128, inner / numEltsPerSf / 4, 2, 256]
-
       auto shape = std::vector<uint64_t>{
           256, 2, static_cast<uint64_t>(ceilDiv(hiddenSize, numEltsPerSf * 4)),
           static_cast<uint64_t>(ceilDiv(numTokens, 128))};
@@ -294,7 +300,6 @@ static auto makeTmaShapeStrideSfAb(int mM, int mN, int mK, MatrixType matrixType
   }
   return std::make_tuple(std::vector<uint64_t>{}, std::vector<uint64_t>{}, std::vector<uint32_t>{});
 }
-
 template <class GemmOptions_>
 static KernelParams setKernelParams(
     GemmOptions_ const& options, bool const batchM, void const* ptrA, void const* ptrB, void* ptrC,
@@ -390,9 +395,9 @@ static KernelParams setKernelParams(
     params.tileStridePerBatch = options.mM / options.mTileM;
     params.nm = options.mM;
     // Shape/stride for gmem tensor A.
-    auto [shapeA, strideA, tileShapeA] =
-        makeTmaShapeStrideAbc(options, options.mM, options.mN, options.mK, options.mTileM,
-                              options.mTileN, options.mTileK, MatrixType::MatrixA);
+    auto [shapeA, strideA, tileShapeA] = makeTmaShapeStrideAbc(
+        options, options.mM, options.mN, options.mK, options.mTileM, options.mTileN, options.mTileK,
+        MatrixType::MatrixA, options.mValidM, options.mValidN, options.mValidK);
     // Build tma descriptor for A.
     params.tmaA[0] = gemm::buildNdTmaDescriptor(options.mDtypeA, options.mMmaKind, shapeA, strideA,
                                                 tileShapeA, const_cast<void*>(ptrA));
@@ -469,15 +474,17 @@ static KernelParams setKernelParams(
     // C is the output activation
     if (options.mUseTmaStore) {
       // Shape/stride for gmem tensor C.
-      auto [shapeC, strideC, tileShapeC] = makeTmaShapeStrideAbc(
-          options, options.mM, ctaOffset * options.mTileN, options.mK, options.mTileM,
-          options.mTileN, options.mTileK, MatrixType::MatrixC);
+      auto [shapeC, strideC, tileShapeC] =
+          makeTmaShapeStrideAbc(options, options.mM, ctaOffset * options.mTileN, options.mK,
+                                options.mTileM, options.mTileN, options.mTileK, MatrixType::MatrixC,
+                                options.mValidM, ctaOffset * options.mTileN, options.mValidK);
       // Build tma descriptor for C.
       params.tmaC[0] = gemm::buildNdTmaDescriptor(options.mDtypeC, tg::MmaKind::Auto, shapeC,
                                                   strideC, tileShapeC, ptrC);
     } else {
       params.ptrC = ptrC;
     }
+
   } else {
     // B is the expert
     if (0 != options.mN % options.mTileN) {
@@ -486,9 +493,9 @@ static KernelParams setKernelParams(
     params.tileStridePerBatch = options.mN / options.mTileN;
     params.nm = options.mN;
     // Shape/stride for gmem tensor B.
-    auto [shapeB, strideB, tileShapeB] =
-        makeTmaShapeStrideAbc(options, options.mM, options.mN, options.mK, options.mTileM,
-                              options.mTileN, options.mTileK, MatrixType::MatrixB);
+    auto [shapeB, strideB, tileShapeB] = makeTmaShapeStrideAbc(
+        options, options.mM, options.mN, options.mK, options.mTileM, options.mTileN, options.mTileK,
+        MatrixType::MatrixB, options.mValidM, options.mValidN, options.mValidK);
     // Build tma descriptor for B.
     params.tmaB[0] = gemm::buildNdTmaDescriptor(options.mDtypeB, options.mMmaKind, shapeB, strideB,
                                                 tileShapeB, const_cast<void*>(ptrB));
@@ -544,9 +551,10 @@ static KernelParams setKernelParams(
     // C is the output activation
     if (options.mUseTmaStore) {
       // Shape/stride for gmem tensor C.
-      auto [shapeC, strideC, tileShapeC] = makeTmaShapeStrideAbc(
-          options, ctaOffset * options.mTileM, options.mN, options.mK, options.mTileM,
-          options.mTileN, options.mTileK, MatrixType::MatrixC);
+      auto [shapeC, strideC, tileShapeC] =
+          makeTmaShapeStrideAbc(options, ctaOffset * options.mTileM, options.mN, options.mK,
+                                options.mTileM, options.mTileN, options.mTileK, MatrixType::MatrixC,
+                                ctaOffset * options.mTileM, options.mValidN, options.mValidK);
       // Build tma descriptor for C.
       params.tmaC[0] = gemm::buildNdTmaDescriptor(options.mDtypeC, tg::MmaKind::Auto, shapeC,
                                                   strideC, tileShapeC, ptrC);
