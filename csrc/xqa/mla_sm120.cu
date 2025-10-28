@@ -1835,6 +1835,15 @@ void launchMLA(
 #endif
 }
 
+static uint32_t configureKernel() {
+  uint32_t size;
+  cudaMemcpyFromSymbol(&size, smemSize, sizeof(smemSize));
+  cudaFuncSetAttribute(kernel_mha, cudaFuncAttributeMaxDynamicSharedMemorySize, size);
+  return size;
+}
+
+static uint32_t const hostSmemSize = configureKernel();
+
 void launchMLAFlashInfer(
     uint32_t multiProcessorCount,
     uint32_t inputSeqLen,  // uniform for all requests and causal mask is assumed
@@ -1860,13 +1869,6 @@ void launchMLAFlashInfer(
   if (beamWidth != 1) {
     throw std::runtime_error("not implemented");
   }
-  static uint32_t const hostSmemSize = [&]() {
-    // printf("smemSize = %u\n", smemSize);
-    uint32_t size;
-    checkCuda(cudaMemcpyFromSymbol(&size, smemSize, sizeof(smemSize)));
-    checkCuda(cudaFuncSetAttribute(kernel_mha, cudaFuncAttributeMaxDynamicSharedMemorySize, size));
-    return size;
-  }();
   uint32_t const nbKHeads = 1;
   uint32_t const nbVHeads = nbKHeads;
   uint32_t const nbQHeads = nbKHeads * headGrpSize;
