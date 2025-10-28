@@ -500,6 +500,7 @@ BarrierFlagCount = 256
 MAX_COMM_SIZE = 2147483647 & ~((1 << 21) - 1)  # MAX_INT32 rounded down to 2MB
 
 
+# @TODO(nvmbreughe): on a next major bump, remove create_metadata and make create_metadata=True the default behavior
 def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     tp_rank: int,
     tp_size: int,
