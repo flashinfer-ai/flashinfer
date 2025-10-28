@@ -211,7 +211,7 @@ void trtllm_fp8_per_tensor_scale_moe_launcher(
 
   // allocate workspace for activation/gemm/finalize kernels
   Tensor gemm1_output =
-      alloc_tensor({max_num_padded_tokens, 2 * intermediate_size}, dl_uint8, hidden_states->device);
+      alloc_tensor({max_num_padded_tokens, 2 * intermediate_size}, dl_uint8, hidden_states.device());
   Tensor gemm1_output_scale = alloc_tensor({2 * intermediate_size / 128, max_num_padded_tokens},
                                            dl_float32, hidden_states.device());
   Tensor activation_output =
@@ -1196,7 +1196,6 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
   int64_t config = config_index[1];
   // Autotuner has requested a default or 'fallback' config index
   if (tileN == -1 || config == -1) {
-    auto const num_tokens = hidden_states->shape[0];
     tileN = *selected_tile_nums.begin();
     config = mRunners[tileN]->getDefaultValidConfigIndex(top_k, hidden_size, intermediate_size,
                                                          local_num_experts, num_tokens);
