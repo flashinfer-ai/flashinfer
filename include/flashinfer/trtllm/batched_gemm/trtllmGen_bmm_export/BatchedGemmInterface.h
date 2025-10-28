@@ -27,6 +27,7 @@
 #include "flashinferMetaInfo.h"
 #endif  // TLLM_GEN_EXPORT_INTERFACE
 
+#include "flashinfer/trtllm/common.h"
 #ifdef TLLM_GEN_BMM_CUBIN_PATH
 static const std::string tllm_gen_bmm_cubin_path = std::string(TLLM_GEN_BMM_CUBIN_PATH);
 #else
@@ -539,75 +540,66 @@ class BatchedGemmInterface {
       }
       fname_cubin = tllm_gen_bmm_cubin_path + "/" + fname_cubin + ".cubin";
       std::string cubin = flashinfer::trtllm_cubin_loader::getCubin(fname_cubin, sha256);
-      cuModuleLoadData(module, cubin.c_str());
+      cuErrCheck(cuModuleLoadData(module, cubin.c_str()));
     };
 
-    if (batchedGemmConfig.mData != nullptr) {
-      CUmodule cuModule;
-      CUfunction cuFunction;
+    CUmodule cuModule;
+    CUfunction cuFunction;
 
-      if (moduleCache.has_value()) {
-        ModuleCache& moduleCacheRef = moduleCache.value().get();
+    if (moduleCache.has_value()) {
+      ModuleCache& moduleCacheRef = moduleCache.value().get();
 
-        // Modules are associated with a specific context, so the context is included in the key
-        CUcontext ctx;
-        unsigned long long ctxId;
-        cuCtxGetCurrent(&ctx);
-        cuCtxGetId(ctx, &ctxId);
+      // Modules are associated with a specific context, so the context is included in the key
+      CUcontext ctx;
+      unsigned long long ctxId;
+      cuCtxGetCurrent(&ctx);
+      cuCtxGetId(ctx, &ctxId);
 
-        // Reinterpret the ctxId as a string to avoid needing a custom hash or converting it to a
-        // string in decimal representation.
-        std::string const ctxName =
-            std::string(reinterpret_cast<char*>(&ctxId), sizeof(unsigned long long) / sizeof(char));
-        std::string const funcName = std::string(batchedGemmConfig.mFunctionName);
-        auto const moduleKey = ctxName + funcName;
-        auto module = moduleCacheRef.find(moduleKey);
+      // Reinterpret the ctxId as a string to avoid needing a custom hash or converting it to a
+      // string in decimal representation.
+      std::string const ctxName =
+          std::string(reinterpret_cast<char*>(&ctxId), sizeof(unsigned long long) / sizeof(char));
+      std::string const funcName = std::string(batchedGemmConfig.mFunctionName);
+      auto const moduleKey = ctxName + funcName;
+      auto module = moduleCacheRef.find(moduleKey);
 
-        // Use cache if module is found, otherwise load and insert into cache
-        if (module != moduleCacheRef.end()) {
-          cuFunction = std::get<1>(module->second);
-        } else {
-          fiModuleLoadData(&cuModule);
-          cuModuleGetFunction(&cuFunction, cuModule, batchedGemmConfig.mFunctionName);
-          moduleCacheRef.insert(std::make_pair(moduleKey, std::make_tuple(cuModule, cuFunction)));
-        }
+      // Use cache if module is found, otherwise load and insert into cache
+      if (module != moduleCacheRef.end()) {
+        cuFunction = std::get<1>(module->second);
       } else {
         fiModuleLoadData(&cuModule);
         cuModuleGetFunction(&cuFunction, cuModule, batchedGemmConfig.mFunctionName);
-      }
-
-      // Prepare the grid/block.
-      dim3 block3{static_cast<uint32_t>(batchedGemmConfig.mNumThreadsPerCTA),
-                  static_cast<uint32_t>(1), static_cast<uint32_t>(1)};
-      dim3 grid3{(grid.size() > 0 ? static_cast<uint32_t>(grid[0]) : 1u),
-                 (grid.size() > 1 ? static_cast<uint32_t>(grid[1]) : 1u),
-                 (grid.size() > 2 ? static_cast<uint32_t>(grid[2]) : 1u)};
-      // Prepare the cluster size.
-      dim3 cluster3{static_cast<uint32_t>(options.mClusterDimX),
-                    static_cast<uint32_t>(options.mClusterDimY),
-                    static_cast<uint32_t>(options.mClusterDimZ)};
-
-      // Run the kernel.
-      auto result = trtllm::gen::launchKernel(
-          (void*)&kernelParams, cudaStream, batchedGemmConfig.mSharedMemSize, cuFunction, block3,
-          grid3, cluster3,
-          usePdl && (batchedGemmConfig.mOptions.mGridWaitForPrimaryEarlyExit |
-                     batchedGemmConfig.mOptions.mGridWaitForPrimaryA |
-                     batchedGemmConfig.mOptions.mGridWaitForPrimaryB));
-      if (result != CUDA_SUCCESS) {
-        return -1;
-      }
-      // If a module cache has not been given, unload the module to avoid leaking
-      if (!moduleCache.has_value()) {
-        cuModuleUnload(cuModule);
+        moduleCacheRef.insert(std::make_pair(moduleKey, std::make_tuple(cuModule, cuFunction)));
       }
     } else {
-#ifndef TLLM_GEN_EXPORT_INTERFACE
-      TLLM_CHECK_ERROR(batchedGemmConfig.mCudaRunner != nullptr, "CudaRunner is not set");
-      batchedGemmConfig.mCudaRunner->run((void*)&kernelParams, (void*)cudaStream, grid,
-                                         /* cluster */ {},
-                                         /* instanceId */ batchedGemmConfig.mInstanceIdx);
-#endif
+      fiModuleLoadData(&cuModule);
+      cuModuleGetFunction(&cuFunction, cuModule, batchedGemmConfig.mFunctionName);
+    }
+
+    // Prepare the grid/block.
+    dim3 block3{static_cast<uint32_t>(batchedGemmConfig.mNumThreadsPerCTA),
+                static_cast<uint32_t>(1), static_cast<uint32_t>(1)};
+    dim3 grid3{(grid.size() > 0 ? static_cast<uint32_t>(grid[0]) : 1u),
+               (grid.size() > 1 ? static_cast<uint32_t>(grid[1]) : 1u),
+               (grid.size() > 2 ? static_cast<uint32_t>(grid[2]) : 1u)};
+    // Prepare the cluster size.
+    dim3 cluster3{static_cast<uint32_t>(options.mClusterDimX),
+                  static_cast<uint32_t>(options.mClusterDimY),
+                  static_cast<uint32_t>(options.mClusterDimZ)};
+
+    // Run the kernel.
+    auto result = trtllm::gen::launchKernel(
+        (void*)&kernelParams, cudaStream, batchedGemmConfig.mSharedMemSize, cuFunction, block3,
+        grid3, cluster3,
+        usePdl && (batchedGemmConfig.mOptions.mGridWaitForPrimaryEarlyExit |
+                   batchedGemmConfig.mOptions.mGridWaitForPrimaryA |
+                   batchedGemmConfig.mOptions.mGridWaitForPrimaryB));
+    if (result != CUDA_SUCCESS) {
+      return -1;
+    }
+    // If a module cache has not been given, unload the module to avoid leaking
+    if (!moduleCache.has_value()) {
+      cuModuleUnload(cuModule);
     }
     return 0;
   }
