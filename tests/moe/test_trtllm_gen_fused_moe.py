@@ -769,29 +769,31 @@ class FP8BlockScaleMoe(Moe):
             "NaN detected in hidden_states_fp8"
         )
 
-        output = trtllm_fp8_block_scale_moe(
-            expert_logits,
-            routing_bias,
-            hidden_states_fp8,
-            hidden_states_scale,
-            static_data["gemm1_weights"],
-            static_data["gemm1_scales"],
-            static_data["gemm2_weights"],
-            static_data["gemm2_scales"],
-            num_experts,
-            top_k,
-            n_groups,
-            top_k_groups,
-            intermediate_size,
-            0,
-            num_experts,
-            routed_scaling,
-            None,
-            routing_method_type,
-            use_shuffled_weight=static_data["use_shuffled_weight"],
-            weight_layout=static_data["weight_layout"],
-            enable_pdl=enable_pdl,
-        )
+        # Use autotuner for optimal kernel selection
+        with autotune(True):
+            output = trtllm_fp8_block_scale_moe(
+                expert_logits,
+                routing_bias,
+                hidden_states_fp8,
+                hidden_states_scale,
+                static_data["gemm1_weights"],
+                static_data["gemm1_scales"],
+                static_data["gemm2_weights"],
+                static_data["gemm2_scales"],
+                num_experts,
+                top_k,
+                n_groups,
+                top_k_groups,
+                intermediate_size,
+                0,
+                num_experts,
+                routed_scaling,
+                None,
+                routing_method_type,
+                use_shuffled_weight=static_data["use_shuffled_weight"],
+                weight_layout=static_data["weight_layout"],
+                enable_pdl=enable_pdl,
+            )
 
         return output.to(torch.float)
 
@@ -940,32 +942,34 @@ class FP8PerTensorMoe(Moe):
             hidden_states_orig, hidden_states_scale_global
         )
 
-        output = trtllm_fp8_per_tensor_scale_moe(
-            (
-                expert_logits.to(torch.bfloat16)
-                if routing_method_type == RoutingMethodType.Llama4
-                else expert_logits
-            ),
-            routing_bias,
-            hidden_states_fp8,
-            static_data["gemm1_weights"],
-            static_data["scale_c_fc1"],
-            static_data["scale_gate_fc1"],
-            static_data["gemm2_weights"],
-            static_data["scale_c_fc2"],
-            num_experts,
-            top_k,
-            n_groups,
-            top_k_groups,
-            intermediate_size,
-            0,
-            num_experts,
-            routed_scaling,
-            routing_method_type
-            == RoutingMethodType.Llama4,  # Use_routing_scales_on_input
-            None,
-            routing_method_type,
-        )
+        # Use autotuner for optimal kernel selection
+        with autotune(True):
+            output = trtllm_fp8_per_tensor_scale_moe(
+                (
+                    expert_logits.to(torch.bfloat16)
+                    if routing_method_type == RoutingMethodType.Llama4
+                    else expert_logits
+                ),
+                routing_bias,
+                hidden_states_fp8,
+                static_data["gemm1_weights"],
+                static_data["scale_c_fc1"],
+                static_data["scale_gate_fc1"],
+                static_data["gemm2_weights"],
+                static_data["scale_c_fc2"],
+                num_experts,
+                top_k,
+                n_groups,
+                top_k_groups,
+                intermediate_size,
+                0,
+                num_experts,
+                routed_scaling,
+                routing_method_type
+                == RoutingMethodType.Llama4,  # Use_routing_scales_on_input
+                None,
+                routing_method_type,
+            )
 
         return output.to(torch.float)
 

@@ -929,6 +929,15 @@ def get_trtllm_moe_sm100_module():
             self.gated_act_type = GatedActType(gated_act_type)
             self.use_shuffled_weight = use_shuffled_weight
             self.weight_layout = WeightLayout(weight_layout)
+            if (
+                not self.use_shuffled_weight
+                or self.weight_layout != WeightLayout.MajorK
+            ):
+                assert (
+                    self.use_deepseek_fp8 and self.dtype_weights == DtypeTrtllmGen.E4m3
+                ), (
+                    "use_shuffled_weight is False or weight_layout is not MajorK is only supported for FP8 block scale"
+                )
 
         def get_valid_tactics(
             self,
@@ -1025,7 +1034,7 @@ def get_trtllm_moe_sm100_module():
                         dtype=torch.float,
                         device=hidden_states.device,
                     )
-                    return moe_op.trtllm_fp8_block_scale_moe(
+                    moe_op.trtllm_fp8_block_scale_moe(
                         routing_logits,
                         kwargs["routing_bias"],
                         hidden_states,
@@ -1034,6 +1043,7 @@ def get_trtllm_moe_sm100_module():
                         kwargs["gemm1_weights_scale"],
                         kwargs["gemm2_weights"],
                         kwargs["gemm2_weights_scale"],
+                        output,
                         kwargs["num_experts"],
                         self.top_k,
                         kwargs["n_group"],
@@ -1050,7 +1060,7 @@ def get_trtllm_moe_sm100_module():
                     )
                 else:
                     # FP8 per tensor scale
-                    return moe_op.trtllm_fp8_per_tensor_scale_moe(
+                    moe_op.trtllm_fp8_per_tensor_scale_moe(
                         routing_logits,
                         kwargs["routing_bias"],
                         hidden_states,
@@ -1059,6 +1069,7 @@ def get_trtllm_moe_sm100_module():
                         kwargs["output1_scales_gate_scalar"],
                         kwargs["gemm2_weights"],
                         kwargs["output2_scales_scalar"],
+                        output,
                         kwargs["num_experts"],
                         self.top_k,
                         kwargs["n_group"],
@@ -1191,6 +1202,8 @@ def get_trtllm_moe_sm100_module():
             use_deepseek_fp8=False,  # per_tensor mode
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
+            weight_layout=WeightLayout.MajorK,
+            use_shuffled_weight=True,
         )
 
         inputs = [output, routing_logits, topk_ids, expert_weights, hidden_states]
@@ -1206,6 +1219,7 @@ def get_trtllm_moe_sm100_module():
             output1_scales_gate_scalar=output1_scales_gate_scalar,
             gemm2_weights=gemm2_weights,
             output2_scales_scalar=output2_scales_scalar,
+            num_experts=num_experts,
             n_group=n_group,
             topk_group=topk_group,
             local_expert_offset=local_expert_offset,
@@ -1328,6 +1342,8 @@ def get_trtllm_moe_sm100_module():
             use_deepseek_fp8=True,  # block_scale mode
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
+            weight_layout=weight_layout,
+            use_shuffled_weight=use_shuffled_weight,
         )
 
         inputs = [
@@ -1349,6 +1365,7 @@ def get_trtllm_moe_sm100_module():
             gemm1_weights_scale=gemm1_weights_scale,
             gemm2_weights=gemm2_weights,
             gemm2_weights_scale=gemm2_weights_scale,
+            num_experts=num_experts,
             n_group=n_group,
             topk_group=topk_group,
             local_expert_offset=local_expert_offset,
@@ -1501,9 +1518,8 @@ def get_trtllm_moe_sm100_module():
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             gated_act_type=gated_act_type,
-            # NOTE(siyuan): do not fix the tile_tokens_dim to let tunnable runner decide the tile_tokens_dim itself.
-            # however, when the user chooses a different heuristic for tile_tokens_dim, the autotuner will fail to find the correct cached tactics.
-            # tile_tokens_dim=tile_tokens_dim,
+            weight_layout=WeightLayout.MajorK,
+            use_shuffled_weight=True,
         )
         tunning_config = (
             MoERunner.tuning_config_no_hidden_states_scales
