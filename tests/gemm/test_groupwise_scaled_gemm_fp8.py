@@ -43,6 +43,11 @@ def test_fp8_blockscale_gemm(
     scale_major_mode,
     out_dtype,
 ):
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] not in [10, 11, 12]:
+        pytest.skip(
+            "gemm_fp8_nt_blockscaled is only supported on SM100/103, SM110, and SM120/121 GPUs."
+        )
     torch.random.manual_seed(0)
     tile_size = 128
 
@@ -83,8 +88,8 @@ def test_fp8_groupwise_gemm(
     scale_major_mode,
     backend,
 ):
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
     if backend == "trtllm":
-        compute_capability = get_compute_capability(torch.device(device="cuda"))
         if compute_capability[0] != 10:
             pytest.skip(
                 "gemm_fp8_nt_groupwise is only supported on SM100, SM103 in trtllm backend."
@@ -93,7 +98,10 @@ def test_fp8_groupwise_gemm(
             pytest.skip("trtllm only supports MN scale_major_mode")
         if k < 256:
             pytest.skip("k < 256")
-
+    if backend == "cutlass" and compute_capability[0] not in [10, 11, 12]:
+        pytest.skip(
+            "gemm_fp8_nt_groupwise with cutlass backend is only supported on SM100/103, SM110, and SM120/121 GPUs."
+        )
     torch.random.manual_seed(0)
     tile_size = 128
     out_dtype = torch.bfloat16
@@ -146,11 +154,16 @@ def test_fp8_groupwise_group_gemm(
     scale_major_mode,
     out_dtype,
 ):
-    if group_size > 1 and torch.cuda.get_device_capability()[0] in [
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if group_size > 1 and compute_capability[0] in [
         12,
     ]:
         pytest.skip(
             "group_gemm_fp8_nt_groupwise has correctness issues for num_groups > 1 on SM120/121"
+        )
+    if compute_capability[0] not in [10, 12]:
+        pytest.skip(
+            "group_gemm_fp8_nt_groupwise is only supported on SM100/103, and SM120/121 GPUs."
         )
     torch.random.manual_seed(0)
     tile_size = 128

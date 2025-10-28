@@ -17,13 +17,18 @@ from tests.utils_fp8 import to_float8
 @pytest.mark.parametrize("backend", ["cudnn", "cublas", "cutlass", "auto"])
 @pytest.mark.parametrize("auto_tuning", [True, False])
 def test_bmm_fp8(b, m, n, k, input_dtype, mat2_dtype, res_dtype, backend, auto_tuning):
-    if get_compute_capability(torch.device("cuda"))[0] == 12 and backend in [
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    if compute_capability[0] == 12 and backend in [
         "cutlass",
         "auto",
     ]:
         # TODO(yongwwww): enable all test cases for SM120/121 CUTLASS bmm_fp8 backend
         pytest.xfail(
             "Not all test cases for CUTLASS bmm_fp8 on SM120/121 are passing at this moment"
+        )
+    if backend == "cutlass" and compute_capability[0] not in [10, 11, 12]:
+        pytest.skip(
+            "bmm_fp8 with cutlass backend is only supported on SM100, SM110, and SM120/121 GPUs."
         )
     if input_dtype == torch.float8_e5m2 and mat2_dtype == torch.float8_e5m2:
         pytest.skip("Invalid combination: both input and mat2 are e5m2")
