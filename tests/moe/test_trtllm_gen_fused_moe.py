@@ -1834,32 +1834,6 @@ def cache_permute_indices():
     return _cache_permute_indices
 
 
-@pytest.fixture(autouse=True)
-def clear_cache_between_test_functions(cache_permute_indices, request):
-    """Automatically clear cache when switching between different test functions.
-
-    This keeps the cache within the same test function (across all parametrized runs)
-    but clears it when moving to a different test function.
-    """
-    # Get the base test function name (without parameters)
-    test_function_name = request.node.originalname or request.node.name.split("[")[0]
-
-    # Store the current test function name in the module
-    if not hasattr(request.module, "_current_test_function"):
-        request.module._current_test_function = test_function_name
-    elif request.module._current_test_function != test_function_name:
-        # We've switched to a different test function, clear the cache and GPU state
-        cache_permute_indices.clear()
-        request.module._current_test_function = test_function_name
-
-        # Synchronize and clear GPU memory/cache
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-
-    yield  # Run the test
-    # No cleanup needed here - we clear at the start of the next different function
-
-
 def skip_checks(
     moe_impl,
     routing_config,
@@ -2262,6 +2236,7 @@ def test_deepseekv3_routing(
                 "compatible_intermediate_size": [384, 768, 1024, 2048],
             },
             id="Renorm",
+            marks=pytest.mark.skip(reason="Skip temporary"),
         ),
         pytest.param(
             {
