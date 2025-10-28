@@ -534,8 +534,8 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     where:
     - buffer_size: tp_size * max_token_num * hidden_dim * sizeof(half)
     - flag_size: tp_size * BarrierFlagCount * sizeof(int)
-    - lamport_buffer_size: tp_size * max(max_token_num, OneShotMaxToken) * tp_size * hidden_dim * sizeof(half)
-
+    - lamport_buffer_size: tp_size * max_token_num * tp_size * hidden_dim * sizeof(half)
+      where sizeof(elem) = 2 (fp16/bf16) or 4 (fp32 when use_fp32_lamport=True)
     The workspace is passed as workspace field in AllReduceFusionParams.
 
     We use tp_size and world_size here interchangeably (allReduceFusion).
@@ -858,6 +858,15 @@ def trtllm_allreduce_fusion(
     # Validate against workspace metadata if provided
     if metadata is not None:
         errors = []
+        required_keys = ["max_token_num", "tp_size", "hidden_dim", "use_fp32_lamport"]
+        for key in required_keys:
+            if key not in metadata:
+                errors.append(f"Workspace metadata is missing required key: {key}")
+        if errors:
+            error_msg = "Workspace metadata validation failed:\n" + "\n".join(
+                f"  - {e}" for e in errors
+            )
+            raise ValueError(error_msg)
 
         # Check 1: token_num must not exceed max_token_num
         if token_num > metadata["max_token_num"]:
@@ -878,6 +887,13 @@ def trtllm_allreduce_fusion(
             errors.append(
                 f"hidden_dim ({hidden_dim}) does not match workspace hidden_dim ({metadata['hidden_dim']}). "
                 f"Workspace was created for hidden_dim={metadata['hidden_dim']}."
+            )
+
+        # Check 4: use_fp32_lamport must match
+        if metadata["use_fp32_lamport"] == (allreduce_in.dtype == torch.float32):
+            errors.append(
+                f"use_fp32_lamport ({metadata['use_fp32_lamport']}) does not match allreduce_in.dtype ({allreduce_in.dtype}). "
+                f"Workspace was created for use_fp32_lamport={metadata['use_fp32_lamport']}."
             )
 
         if errors:
@@ -905,7 +921,6 @@ def trtllm_allreduce_fusion(
             f"required_lamport_comm_size {required_lamport_comm_size} is greater than MAX_COMM_SIZE {MAX_COMM_SIZE}. Cannot use oneshot in this case."
         )
         use_oneshot = False
-
     if scale_factor is not None:
         if isinstance(scale_factor, torch.Tensor):
             scale_factor = scale_factor.to(torch.float32)
