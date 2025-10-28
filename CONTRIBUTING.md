@@ -36,12 +36,11 @@ Code Contribution Procedure
 
 # Release Versioning
 
-When incrementing a version and creating a release, follow [Semantic Versioning](https://packaging.python.org/en/latest/discussions/versioning/) (`major.minor.patch`) [^1]. In particular:
+When incrementing a version and creating a release, follow a "right-shifted" versioning scheme similar to [vLLM Release Versioning](https://github.com/vllm-project/vllm/blob/main/RELEASE.md) (`major.minor.patch[.post1]`) [^1]. In particular:
 
-* major increment signals incompatible API changes
-* minor increment signals added functionality that is backwards-compatible (e.g. new kernels, new SM support, etc)
-* patch increment signals backwards-compatible bug fixes (both for functional and performance issues)
+* _major_ increment signals architectural milestone and/or when incompatible API changes are made, similar to PyTorch 2.0.
+* _minor_ increment signals significant backwards-compatible new features
+* _patch_ increment signals small backwards-compatible features (e.g. new kernels, new SM support, etc) and backwards-compatible bug fixes
+* _post1_ is an optional suffix for a quick follow up release with just backwards-compatible bug fixes
 
-Optionally, use post-releases (e.g., `X.Y.Z.post1`) for minor changes, like a documentation change.
-
-[^1]: We have not followed this strictly through v0.2.14.post1. But after v0.2.14.post1, the versioning should follow SemVer.
+[^1]: We have not followed this strictly through v0.4.0. But after v0.4.0, the versioning should follow this "right-shifted" versioning scheme.
