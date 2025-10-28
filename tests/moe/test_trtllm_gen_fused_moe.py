@@ -45,7 +45,7 @@ from flashinfer.fused_moe.core import (
     get_w2_permute_indices_with_cache,
     _maybe_get_cached_w3_w1_permute_indices,
 )
-from flashinfer.utils import calculate_tile_tokens_dim, get_compute_capability
+from flashinfer.utils import get_compute_capability
 
 
 def check_cuda(err):
@@ -549,7 +549,6 @@ class FP4Moe(Moe):
         routed_scaling = kwargs["routed_scaling"]
         gated_act_type = kwargs["gated_act_type"]
         routing_method_type = kwargs["routing_method_type"]
-        # tile_tokens_dim = kwargs["tile_tokens_dim"]
 
         # Create CUDA graph configuration
         config = {
@@ -560,7 +559,6 @@ class FP4Moe(Moe):
             "top_k_groups": top_k_groups,
             "intermediate_size": intermediate_size,
             "routed_scaling": routed_scaling,
-            # "tile_tokens_dim": tile_tokens_dim,
             "gated_act_type": gated_act_type,
             "routing_method_type": routing_method_type,
         }
@@ -761,7 +759,6 @@ class FP8BlockScaleMoe(Moe):
         intermediate_size = kwargs["intermediate_size"]
         routed_scaling = kwargs["routed_scaling"]
         routing_method_type = kwargs["routing_method_type"]
-        tile_tokens_dim = kwargs["tile_tokens_dim"]
         enable_pdl = kwargs.get("enable_pdl")
         hidden_states_scale = kwargs["hidden_states_scale"]
         hidden_states_quant = kwargs["hidden_states_quant"]
@@ -789,7 +786,7 @@ class FP8BlockScaleMoe(Moe):
             0,
             num_experts,
             routed_scaling,
-            tile_tokens_dim,
+            None,
             routing_method_type,
             use_shuffled_weight=static_data["use_shuffled_weight"],
             weight_layout=static_data["weight_layout"],
@@ -937,7 +934,6 @@ class FP8PerTensorMoe(Moe):
         intermediate_size = kwargs["intermediate_size"]
         routed_scaling = kwargs["routed_scaling"]
         routing_method_type = kwargs["routing_method_type"]
-        tile_tokens_dim = kwargs["tile_tokens_dim"]
 
         # Quantize to FP8 per-tensor using pre-computed global scale factor
         hidden_states_fp8, _ = quant_fp8_per_tensor(
@@ -967,7 +963,7 @@ class FP8PerTensorMoe(Moe):
             routed_scaling,
             routing_method_type
             == RoutingMethodType.Llama4,  # Use_routing_scales_on_input
-            tile_tokens_dim,
+            None,
             routing_method_type,
         )
 
@@ -1815,7 +1811,6 @@ def _compute_moe_actual_unified(moe_impl, args_dequant, args, **kwargs):
         "intermediate_size": args.intermediate_size,
         "routed_scaling": kwargs["routed_scaling"],
         "routing_method_type": kwargs["routing_method_type"],
-        "tile_tokens_dim": kwargs["tile_tokens_dim"],
         "do_finalize": True,
         "gated_act_type": args.gated_act_type,
         "hidden_states_scale": args.hidden_states_scale,
@@ -2108,17 +2103,6 @@ def test_moe_quantization_classes(
     num_experts = routing_config["num_experts"]
     routing_method_type = routing_config["routing_method_type"]
 
-    tile_tokens_dim = calculate_tile_tokens_dim(
-        num_tokens,
-        num_experts,
-        top_k,
-        max_tile_tokens_dim=128
-        if (
-            type(moe_impl) is FP4Moe and moe_impl.quant_mode != QuantMode.FP4_MXFP4_Bf16
-        )
-        else 64,
-    )
-
     # Validation checks
     assert top_k <= num_experts
     assert top_k <= 10
@@ -2259,7 +2243,6 @@ def test_moe_quantization_classes(
         top_k_groups=top_k_groups,
         routed_scaling=routed_scaling,
         routing_method_type=routing_method_type,
-        tile_tokens_dim=tile_tokens_dim,
         weight_processing=weight_processing,
         enable_pdl=True,
         hidden_states_quant=inputs_data[
