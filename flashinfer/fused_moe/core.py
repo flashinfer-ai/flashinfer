@@ -18,7 +18,6 @@ import functools
 from enum import IntEnum
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple, Union
-from typing_extensions import deprecated
 import torch
 
 from ..autotuner import (
@@ -1659,9 +1658,6 @@ def get_trtllm_moe_sm100_module():
     )
 
 
-@deprecated(
-    "tile_tokens_dim is deprecated and will be removed in trtllm_fp8_per_tensor_scale_moe after v0.5.0"
-)
 def trtllm_fp8_per_tensor_scale_moe(
     routing_logits: torch.Tensor,
     routing_bias: Optional[torch.Tensor],
@@ -1711,6 +1707,12 @@ def trtllm_fp8_per_tensor_scale_moe(
     Returns:
         torch.Tensor: Output tensor of shape [seq_len, hidden_size]
     """
+    if tile_tokens_dim is not None:
+        logger.warning_once(
+            "tile_tokens_dim in trtllm_fp8_per_tensor_scale_moe is planned for deprecation "
+            "in a future release. Please remove it from your code as tile_tokens_dim will no "
+            "longer be supported after v0.5.0."
+        )
     return get_trtllm_moe_sm100_module().trtllm_fp8_per_tensor_scale_moe(
         routing_logits,
         routing_bias,
@@ -1734,9 +1736,6 @@ def trtllm_fp8_per_tensor_scale_moe(
     )
 
 
-@deprecated(
-    "tile_tokens_dim is deprecated and will be removed in trtllm_fp8_block_scale_moe after v0.5.0"
-)
 def trtllm_fp8_block_scale_moe(
     routing_logits: torch.Tensor,
     routing_bias: Optional[torch.Tensor],
@@ -1785,6 +1784,12 @@ def trtllm_fp8_block_scale_moe(
     Returns:
         torch.Tensor: Output tensor of shape [seq_len, hidden_size]
     """
+    if tile_tokens_dim is not None:
+        logger.warning_once(
+            "tile_tokens_dim in trtllm_fp8_block_scale_moe is planned for deprecation "
+            "in a future release. Please remove it from your code as tile_tokens_dim will no "
+            "longer be supported after v0.5.0."
+        )
     output = torch.empty(
         hidden_states.shape, dtype=torch.bfloat16, device=hidden_states.device
     )
@@ -1813,9 +1818,6 @@ def trtllm_fp8_block_scale_moe(
     )
 
 
-@deprecated(
-    "tile_tokens_dim is deprecated and will be removed in trtllm_fp4_block_scale_moe after v0.5.0"
-)
 def trtllm_fp4_block_scale_moe(
     routing_logits: torch.Tensor,
     routing_bias: Optional[torch.Tensor],
@@ -1911,7 +1913,12 @@ def trtllm_fp4_block_scale_moe(
         List[torch.Tensor]: List of output tensors. If do_finalize=True, returns the final MoE output.
             Otherwise, returns intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
     """
-
+    if tile_tokens_dim is not None:
+        logger.warning_once(
+            "tile_tokens_dim in trtllm_fp4_block_scale_moe is planned for deprecation "
+            "in a future release. Please remove it from your code as tile_tokens_dim will no "
+            "longer be supported after v0.5.0."
+        )
     return get_trtllm_moe_sm100_module().trtllm_fp4_block_scale_moe(
         routing_logits,
         None,
@@ -1948,9 +1955,6 @@ def trtllm_fp4_block_scale_moe(
     )
 
 
-@deprecated(
-    "tile_tokens_dim is deprecated and will be removed in trtllm_fp4_block_scale_routed_moe after v0.5.0"
-)
 def trtllm_fp4_block_scale_routed_moe(
     topk_ids: torch.Tensor,
     routing_bias: Optional[torch.Tensor],
@@ -2049,7 +2053,7 @@ def trtllm_fp4_block_scale_routed_moe(
             Otherwise, returns intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
     """
     if tile_tokens_dim is not None:
-        logger.info(
+        logger.warning_once(
             "tile_tokens_dim in trtllm_fp4_block_scale_routed_moe is planned for deprecation "
             "in a future release. Please remove it from your code as tile_tokens_dim will no "
             "longer be supported after v0.5.0."
