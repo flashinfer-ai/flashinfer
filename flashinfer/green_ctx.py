@@ -28,7 +28,7 @@ except ImportError as e:
     ) from e
 
 from .cuda_utils import checkCudaErrors
-from .utils import get_compute_capability, get_device_sm_count, round_up
+from .utils import get_compute_capability, round_up
 
 
 def get_sm_count_constraint(major: int, minor: int) -> Tuple[int, int]:
@@ -170,24 +170,23 @@ def split_device_green_ctx(
         RuntimeError: when requested SM allocation exceeds device capacity:
         ``num_groups * rounded_min_count > total_device_sms``
     """
-    # Check if device has enough SMs
-    min_sm, alignment = get_sm_count_constraint(*get_compute_capability(dev))
-    rounded_min = round_up(max(min_count, min_sm), alignment)
-    required_sms = num_groups * rounded_min
-    available_sms = get_device_sm_count(dev)
-
-    if required_sms > available_sms:
-        raise RuntimeError(
-            f"Insufficient SMs: requested {num_groups} groups with {rounded_min} SMs each "
-            f"(total: {required_sms} SMs), but device only has {available_sms} SMs available"
-        )
-
-    cu_dev = get_cudevice(dev)
-    resource = get_device_resource(cu_dev)
-    results, remaining = split_resource(resource, num_groups, min_count)
-    resources = results + [remaining]
-    streams = create_green_ctx_streams(cu_dev, resources)
-    return streams, resources
+    try:
+        cu_dev = get_cudevice(dev)
+        resource = get_device_resource(cu_dev)
+        results, remaining = split_resource(resource, num_groups, min_count)
+        resources = results + [remaining]
+        streams = create_green_ctx_streams(cu_dev, resources)
+        return streams, resources
+    except RuntimeError as e:
+        if "CUDA error code=914" in str(e) or "CUDA_ERROR_INVALID_RESOURCE_TYPE" in str(e) or \
+           "CUDA error code=915" in str(e) or "CUDA_ERROR_INVALID_RESOURCE_CONFIGURATION" in str(e):
+            raise RuntimeError(
+                f"{e}\n"
+                f"Failed to split device into {num_groups} groups with min_count={min_count}. "
+                f"This is likely due to insufficient number of SMs available on the device. "
+                f"Please reduce the number of groups or the minimum SM count per group."
+            ) from e
+        raise
 
 
 def split_device_green_ctx_by_sm_count(
@@ -253,29 +252,32 @@ def split_device_green_ctx_by_sm_count(
         See `CUDA Green Contexts <https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__GREEN__CONTEXTS.html>`_
         for more details.
     """
-    cu_dev = get_cudevice(dev)
-    resource = get_device_resource(cu_dev)
+    try:
+        cu_dev = get_cudevice(dev)
+        resource = get_device_resource(cu_dev)
 
-    # Round sm counts to meet the alignment and granularity requirements
-    rounded_sm_counts = []
-    min_sm_count, sm_alignment = get_sm_count_constraint(*get_compute_capability(dev))
-    for sm_count in sm_counts:
-        if sm_count <= 0:
-            raise ValueError(f"SM count must be positive, got {sm_count}")
-        rounded_sm_counts.append(round_up(max(sm_count, min_sm_count), sm_alignment))
+        # Round sm counts to meet the alignment and granularity requirements
+        rounded_sm_counts = []
+        for sm_count in sm_counts:
+            min_sm_count, sm_alignment = get_sm_count_constraint(
+                *get_compute_capability(dev)
+            )
+            if sm_count <= 0:
+                raise ValueError(f"SM count must be positive, got {sm_count}")
+            rounded_sm_counts.append(round_up(max(sm_count, min_sm_count), sm_alignment))
 
-    # Check if device has enough SMs
-    required_sms = sum(rounded_sm_counts)
-    available_sms = get_device_sm_count(dev)
-
-    if required_sms > available_sms:
-        raise RuntimeError(
-            f"Insufficient SMs: requested {rounded_sm_counts} SMs "
-            f"(total: {required_sms} SMs), but device only has {available_sms} SMs available"
-        )
-
-    # Split the device into multiple green contexts
-    results, remaining = split_resource_by_sm_count(cu_dev, resource, rounded_sm_counts)
-    resources = results + [remaining]
-    streams = create_green_ctx_streams(cu_dev, resources)
-    return streams, resources
+        # Split the device into multiple green contexts
+        results, remaining = split_resource_by_sm_count(cu_dev, resource, rounded_sm_counts)
+        resources = results + [remaining]
+        streams = create_green_ctx_streams(cu_dev, resources)
+        return streams, resources
+    except RuntimeError as e:
+        if "CUDA error code=914" in str(e) or "CUDA_ERROR_INVALID_RESOURCE_TYPE" in str(e) or \
+           "CUDA error code=915" in str(e) or "CUDA_ERROR_INVALID_RESOURCE_CONFIGURATION" in str(e):
+            raise RuntimeError(
+                f"{e}\n"
+                f"Failed to split device with SM counts {sm_counts} (rounded to {rounded_sm_counts}). "
+                f"This is likely due to insufficient number of SMs available on the device. "
+                f"Please reduce the requested SM counts or use fewer partitions."
+            ) from e
+        raise
