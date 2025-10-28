@@ -1018,6 +1018,64 @@ def test_trtllm_batch_decode_head_dim_256(
     )
 
 
+@pytest.mark.parametrize("kv_layout", ["HND"])  # trtllm-gen only support HND
+@pytest.mark.parametrize(
+    "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size",
+    [
+        (1, 1, 16, 2, 1),
+        (1, 1, 32, 2, 5),
+        (1, 3, 64, 2, 1),
+        (1, 4, 64, 4, 1),
+    ],
+)
+@pytest.mark.parametrize("window_left", [-1])
+@pytest.mark.parametrize(
+    "q_dtype,kv_dtype,o_dtype",
+    [
+        ("bf16", "bf16", "bf16"),
+        ("fp8", "fp8", "fp8"),
+    ],
+)
+@pytest.mark.parametrize("enable_pdl", [None])
+@pytest.mark.parametrize("enable_sink", [False])
+@pytest.mark.parametrize("max_in_kv_len", [4096, 8192, 16384, 32768, 65536, 131072])
+@pytest.mark.parametrize("head_dim", [128])
+def test_trtllm_batch_decode_long_sequence_length(
+    kv_layout,
+    batch_size,
+    q_len_per_req,
+    page_size,
+    num_kv_heads,
+    head_grp_size,
+    window_left,
+    q_dtype,
+    o_dtype,
+    kv_dtype,
+    enable_pdl,
+    enable_sink,
+    max_in_kv_len,
+    head_dim,
+):
+    # Small number of test cases for long sequence length
+    pytest.xfail("trtllm-gen decode gets incorrect output with Long sequence length")
+    _test_trtllm_batch_decode(
+        kv_layout,
+        batch_size,
+        q_len_per_req,
+        page_size,
+        num_kv_heads,
+        head_grp_size,
+        window_left,
+        q_dtype,
+        o_dtype,
+        kv_dtype,
+        enable_pdl,
+        enable_sink,
+        max_in_kv_len,
+        head_dim,
+    )
+
+
 @pytest.mark.parametrize("batch_size", [4, 128, 256])
 @pytest.mark.parametrize("s_qo", [32, 64, 87])
 @pytest.mark.parametrize("s_kv", [32, 64, 87])
