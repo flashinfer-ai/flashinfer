@@ -3165,6 +3165,15 @@ void launchHopperF8MHA(
 }
 #endif
 
+static uint32_t configureKernel() {
+  uint32_t size;
+  cudaMemcpyFromSymbol(&size, smemSize, sizeof(smemSize));
+  cudaFuncSetAttribute(kernel_mha, cudaFuncAttributeMaxDynamicSharedMemorySize, size);
+  return size;
+}
+
+static uint32_t const hostSmemSize = configureKernel();
+
 void launchHopperF8MHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads,
                                  uint32_t slidingWinSize, float qScale, OutputHead* output,
 #if LOW_PREC_OUTPUT
@@ -3183,12 +3192,6 @@ void launchHopperF8MHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads
                                  uint32_t qSeqLen, uint32_t const* qCuSeqLens, MaskType const* mask,
 #endif
                                  uint32_t* semaphores, void* scratch, cudaStream_t stream) {
-  static uint32_t const hostSmemSize = [&]() {
-    uint32_t size;
-    checkCuda(cudaMemcpyFromSymbol(&size, smemSize, sizeof(smemSize)));
-    checkCuda(cudaFuncSetAttribute(kernel_mha, cudaFuncAttributeMaxDynamicSharedMemorySize, size));
-    return size;
-  }();
   uint32_t const nbSubSeqPerSeq = [&]() -> uint32_t {
     float const factor = 0.25f;
     return mha::min<uint32_t>(

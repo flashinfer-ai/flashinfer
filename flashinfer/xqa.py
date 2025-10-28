@@ -153,7 +153,7 @@ def xqa(
         Should be the same data type as k_cache.
     page_table : torch.Tensor
         Page table tensor with shape ``batch_size, nb_pages_per_seq``.
-        Data type should be torch.uint32.
+        Data type should be torch.int32.
         K and V share the same table.
     seq_lens : torch.Tensor
         Sequence lengths tensor with shape ``[batch_size, beam_width]``.
@@ -195,6 +195,7 @@ def xqa(
     - input_dtype from q.dtype
     - kv_cache_dtype from k.dtype
     - head_group_ratio from num_q_heads // num_kv_heads
+    - max_seq_len from page_table.shape[-1] * page_size
     """
     # Handle optional parameters
     if sm_count is None:
@@ -352,31 +353,29 @@ def xqa_mla(
     kv_scale: Optional[torch.Tensor] = None,
     sm_count: Optional[int] = None,
 ) -> None:
-    r"""Apply attention with paged KV cache using XQA kernel.
+    r"""Apply attention with paged KV cache using XQA MLA (Multi-Head Latent Attention) kernel.
     Parameters
     ----------
     q : torch.Tensor
         Query tensor with shape ``[batch_size, beam_width, num_q_heads, head_dim]``.
-        Data type should be torch.float16 or torch.bfloat16.
+        Data type should be torch.float8_e4m3fn.
         Now only beam_width 1 is supported.
     k_cache: torch.Tensor
         Paged K cache tensor with shape ``[total_num_cache_heads, head_dim]``.
-        Data type should match query tensor or be torch.float8_e4m3fn, in which case xqa will run fp8 calculation.
-        Should be the same data type as v_cache.
+        Data type should be torch.float8_e4m3fn
     v_cache: torch.Tensor
         Paged V cache tensor with shape ``[total_num_cache_heads, head_dim]``.
-        Data type should match query tensor or be torch.float8_e4m3fn, in which case xqa will run fp8 calculation.
-        Should be the same data type as k_cache.
+        Data type should be torch.float8_e4m3fn
     page_table : torch.Tensor
         Page table tensor with shape ``batch_size, nb_pages_per_seq``.
-        Data type should be torch.uint32.
+        Data type should be torch.int32.
         K and V share the same table.
     seq_lens : torch.Tensor
         Sequence lengths tensor with shape ``[batch_size, beam_width]``.
         Data type should be torch.uint32.
     output : torch.Tensor
         Output tensor with shape ``[batch_size, beam_width, num_q_heads, head_dim]``.
-        Data type should match query tensor. This tensor will be modified in-place.
+        Data type should be torch.bfloat16. This tensor will be modified in-place.
     workspace_buffer : torch.Tensor
         Workspace buffer for temporary computations.
         Data type should be torch.uint8.
@@ -399,8 +398,8 @@ def xqa_mla(
     The function automatically infers several parameters from tensor shapes:
     - batch_size from q.shape[0]
     - head_dim from q.shape[-1]
-    - input_dtype from q.dtype
-    - kv_cache_dtype from k.dtype
+    - head_group_ratio is fixed to 128 for MLA
+    - max_seq_len from page_table.shape[-1] * page_size
     """
     # Handle optional parameters
     if sm_count is None:
@@ -423,7 +422,7 @@ def xqa_mla(
     assert k_cache.dtype == v_cache.dtype, "K and V cache must have the same dtype"
 
     if get_compute_capability(torch.device(device="cuda"))[0] not in [12]:
-        raise RuntimeError("XQA is only supported on SM120 GPUs")
+        raise RuntimeError("XQA MLA is only supported on SM120 GPUs")
 
     xqa_module = get_xqa_module_mla(
         q.dtype,

@@ -253,7 +253,7 @@ def test_xqa(
         cache_k_heads /= 4.0
         cache_v_heads /= 4.0
     page_list_arg = torch.zeros(
-        batch_size, nb_pages_per_seq, dtype=torch.uint32, device="cuda"
+        batch_size, nb_pages_per_seq, dtype=torch.int32, device="cuda"
     )
 
     # Initialize page list sequentially
@@ -265,7 +265,7 @@ def test_xqa(
 
     flattened = page_list_arg.flatten()
     indices = torch.randperm(flattened.numel())
-    shuffled_flat = flattened.to(torch.int32)[indices].to(torch.uint32)
+    shuffled_flat = flattened[indices]
     page_list_arg = shuffled_flat.view(page_list_arg.shape)
 
     def cache_head_at(
@@ -470,7 +470,7 @@ def test_xqa_mla(
     cache_v_heads /= 4.0
 
     page_list_arg = torch.zeros(
-        batch_size, nb_pages_per_seq, dtype=torch.uint32, device="cuda"
+        batch_size, nb_pages_per_seq, dtype=torch.int32, device="cuda"
     )
 
     # Initialize page list sequentially
@@ -482,7 +482,7 @@ def test_xqa_mla(
 
     flattened = page_list_arg.flatten()
     indices = torch.randperm(flattened.numel())
-    shuffled_flat = flattened.to(torch.int32)[indices].to(torch.uint32)
+    shuffled_flat = flattened[indices]
     page_list_arg = shuffled_flat.view(page_list_arg.shape)
 
     def cache_head_at(
