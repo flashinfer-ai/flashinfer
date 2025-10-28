@@ -826,7 +826,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
           << "Expecting fc1_dequant to be non null";
       TVM_FFI_ICHECK(fc2_quant.GetDLTensorPtr() != nullptr) << "Expecting fc2_quant to be non null";
       TVM_FFI_ICHECK(fc2_dequant.GetDLTensorPtr() != nullptr)
-          << "Expecting fc2_dequant_dequant to be non null";
+          << "Expecting fc2_dequant to be non null";
       TVM_FFI_ICHECK(fc1_input_dequant.GetDLTensorPtr() != nullptr)
           << "Expecting fc1_input_dequant to be non null";
 
