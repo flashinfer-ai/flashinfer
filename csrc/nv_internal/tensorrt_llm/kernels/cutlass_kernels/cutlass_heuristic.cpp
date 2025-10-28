@@ -158,21 +158,14 @@ std::vector<CutlassTileConfig> get_candidate_tiles(
               CutlassTileConfig::CtaShape256x128x64_WarpShape64x64x64};
     case CutlassGemmType::Fp8:
       if (config_type_param & CutlassGemmConfig::GROUPED_GEMM) {
-        if (sm == 89) {
+        if (sm == 89 || sm == 120) {
           return {CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64,
                   CutlassTileConfig::CtaShape64x128x64_WarpShape64x32x64,
                   CutlassTileConfig::CtaShape64x64x128_WarpShape32x64x64,
                   CutlassTileConfig::CtaShape128x64x64_WarpShape64x32x64,
                   CutlassTileConfig::CtaShape128x256x64_WarpShape64x64x64,
-                  CutlassTileConfig::CtaShape256x128x64_WarpShape64x64x64};
-        } else if (sm >= 120) {
-          return {CutlassTileConfig::CtaShape16x256x128_WarpShape16x64x128,
-                  CutlassTileConfig::CtaShape32x128x64_WarpShape32x32x64,
-                  CutlassTileConfig::CtaShape64x128x64_WarpShape64x32x64,
-                  CutlassTileConfig::CtaShape64x64x128_WarpShape32x64x64,
-                  CutlassTileConfig::CtaShape128x64x64_WarpShape64x32x64,
-                  CutlassTileConfig::CtaShape128x256x64_WarpShape64x64x64,
-                  CutlassTileConfig::CtaShape256x128x64_WarpShape64x64x64};
+                  CutlassTileConfig::CtaShape256x128x64_WarpShape64x64x64,
+                  CutlassTileConfig::CtaShape16x256x128_WarpShape16x64x128};
         } else {
           // no valid ampere style fp8 configs for sm90
           return {};
