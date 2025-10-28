@@ -617,6 +617,7 @@ def test_trtllm_batch_prefill_bs1(
 @pytest.mark.parametrize("enable_pdl", [True, False, None])
 @pytest.mark.parametrize("enable_sink", [True, False])
 @pytest.mark.parametrize("max_in_kv_len", [110])
+@pytest.mark.parametrize("head_dim", [128])
 def test_trtllm_batch_decode(
     kv_layout,
     batch_size,
@@ -631,6 +632,7 @@ def test_trtllm_batch_decode(
     enable_pdl,
     enable_sink,
     max_in_kv_len,
+    head_dim,
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] != 10:
@@ -642,7 +644,6 @@ def test_trtllm_batch_decode(
 
     # Set up test parameters
     torch.manual_seed(0)
-    head_dim = 128
 
     # Generate random sequence lengths
     num_qo_heads = num_kv_heads * head_grp_size
@@ -875,6 +876,7 @@ def test_trtllm_batch_decode(
 @pytest.mark.parametrize("enable_pdl", [None])
 @pytest.mark.parametrize("enable_sink", [False])
 @pytest.mark.parametrize("max_in_kv_len", [8192])
+@pytest.mark.parametrize("head_dim", [128])
 def test_trtllm_batch_decode_bs1(
     kv_layout,
     batch_size,
@@ -889,6 +891,7 @@ def test_trtllm_batch_decode_bs1(
     enable_pdl,
     enable_sink,
     max_in_kv_len,
+    head_dim,
 ):
     pytest.xfail("trtllm-gen decode gets incorrect output with bs1")
     test_trtllm_batch_decode(
@@ -905,6 +908,71 @@ def test_trtllm_batch_decode_bs1(
         enable_pdl,
         enable_sink,
         max_in_kv_len,
+        head_dim,
+    )
+
+
+@pytest.mark.parametrize("kv_layout", ["HND"])  # trtllm-gen only support HND
+@pytest.mark.parametrize(
+    "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size",
+    [
+        (4, 1, 16, 2, 1),
+        (4, 1, 32, 2, 5),
+        (4, 3, 64, 2, 1),
+        (4, 4, 64, 4, 1),
+        (128, 3, 16, 4, 8),
+        (128, 4, 16, 2, 5),
+        (256, 4, 32, 2, 8),
+        (256, 5, 32, 2, 1),
+    ],
+)
+@pytest.mark.parametrize("window_left", [-1])
+@pytest.mark.parametrize(
+    "q_dtype,kv_dtype,o_dtype",
+    [
+        ("bf16", "bf16", "bf16"),
+        ("fp16", "fp16", "fp16"),
+        ("fp8", "fp8", "fp16"),
+        ("fp8", "fp8", "fp8"),
+        ("fp8", "fp8", "nvfp4"),
+    ],
+)
+@pytest.mark.parametrize("enable_pdl", [None])
+@pytest.mark.parametrize("enable_sink", [False])
+@pytest.mark.parametrize("max_in_kv_len", [110])
+@pytest.mark.parametrize("head_dim", [256])
+def test_trtllm_batch_decode_head_dim_256(
+    kv_layout,
+    batch_size,
+    q_len_per_req,
+    page_size,
+    num_kv_heads,
+    head_grp_size,
+    window_left,
+    q_dtype,
+    o_dtype,
+    kv_dtype,
+    enable_pdl,
+    enable_sink,
+    max_in_kv_len,
+    head_dim,
+):
+    pytest.xfail("trtllm-gen decode gets incorrect output with head_dim = 256")
+    test_trtllm_batch_decode(
+        kv_layout,
+        batch_size,
+        q_len_per_req,
+        page_size,
+        num_kv_heads,
+        head_grp_size,
+        window_left,
+        q_dtype,
+        o_dtype,
+        kv_dtype,
+        enable_pdl,
+        enable_sink,
+        max_in_kv_len,
+        head_dim,
     )
 
 
@@ -1053,8 +1121,3 @@ def test_trtllm_gen_prefill_deepseek_bs1(
     test_trtllm_gen_prefill_deepseek(
         batch_size, s_qo, s_kv, num_kv_heads, head_grp_size, causal
     )
-
-
-if __name__ == "__main__":
-    test_trtllm_batch_prefill("HND", 128, 32, 2, 5, -1, "fp16", "fp16", "fp16", False)
-    test_trtllm_batch_decode("HND", 256, 3, 64, 4, 5, -1, "fp8", "fp8", "fp8", True)
