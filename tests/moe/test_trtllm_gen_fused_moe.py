@@ -1834,6 +1834,32 @@ def cache_permute_indices():
     return _cache_permute_indices
 
 
+@pytest.fixture(autouse=True)
+def clear_cache_between_test_functions(cache_permute_indices, request):
+    """Automatically clear cache when switching between different test functions.
+
+    This keeps the cache within the same test function (across all parametrized runs)
+    but clears it when moving to a different test function.
+    """
+    # Get the base test function name (without parameters)
+    test_function_name = request.node.originalname or request.node.name.split("[")[0]
+
+    # Store the current test function name in the module
+    if not hasattr(request.module, "_current_test_function"):
+        request.module._current_test_function = test_function_name
+    elif request.module._current_test_function != test_function_name:
+        # We've switched to a different test function, clear the cache and GPU state
+        cache_permute_indices.clear()
+        request.module._current_test_function = test_function_name
+
+        # Synchronize and clear GPU memory/cache
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+    yield  # Run the test
+    # No cleanup needed here - we clear at the start of the next different function
+
+
 def skip_checks(
     moe_impl,
     routing_config,
@@ -2312,18 +2338,21 @@ def test_renormalize_routing(
 @pytest.mark.parametrize(
     "routing_config",
     [
-        {
-            "num_experts": 16,
-            "top_k": 2,
-            "padding": 8,
-            "n_groups": None,
-            "top_k_groups": None,
-            "routed_scaling": None,
-            "has_routing_bias": False,
-            "routing_method_type": RoutingMethodType.TopK,
-            "compatible_moe_impls": [FP4Moe],
-            "compatible_intermediate_size": [384, 512, 768, 1024],
-        },
+        pytest.param(
+            {
+                "num_experts": 16,
+                "top_k": 2,
+                "padding": 8,
+                "n_groups": None,
+                "top_k_groups": None,
+                "routed_scaling": None,
+                "has_routing_bias": False,
+                "routing_method_type": RoutingMethodType.TopK,
+                "compatible_moe_impls": [FP4Moe],
+                "compatible_intermediate_size": [384, 512, 768, 1024],
+            },
+            id="TopK",
+        ),
     ],
 )
 @pytest.mark.parametrize(
@@ -2382,18 +2411,21 @@ def test_topk_routing(
 @pytest.mark.parametrize(
     "routing_config",
     [
-        {
-            "num_experts": 128,
-            "top_k": 1,
-            "padding": 8,
-            "n_groups": 0,
-            "top_k_groups": 0,
-            "routed_scaling": 2.5,
-            "has_routing_bias": True,
-            "routing_method_type": RoutingMethodType.Llama4,
-            "compatible_moe_impls": [FP8PerTensorMoe],
-            "compatible_intermediate_size": [1024, 2048],
-        },
+        pytest.param(
+            {
+                "num_experts": 128,
+                "top_k": 1,
+                "padding": 8,
+                "n_groups": 0,
+                "top_k_groups": 0,
+                "routed_scaling": 2.5,
+                "has_routing_bias": True,
+                "routing_method_type": RoutingMethodType.Llama4,
+                "compatible_moe_impls": [FP8PerTensorMoe],
+                "compatible_intermediate_size": [1024, 2048],
+            },
+            id="Llama4",
+        ),
     ],
 )
 @pytest.mark.parametrize(
