@@ -1988,7 +1988,7 @@ def get_trtllm_gen_decode_module(*args):
             q.contiguous(),  # NOTE(Siyuan): without contiguous, the result is incorrect
             paged_k_cache,
             paged_v_cache,
-            int_workspace_buffer,
+            float_workspace_buffer,
             block_tables,
             kv_lens_buffer,
             max_kv_len,
