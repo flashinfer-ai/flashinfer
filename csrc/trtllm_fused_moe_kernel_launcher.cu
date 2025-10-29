@@ -18,6 +18,8 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <set>
+#include <unordered_map>
 #include <vector>
 
 #include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/GemmGatedActOptions.h"
@@ -37,6 +39,41 @@ using tensorrt_llm::kernels::trtllmgen_moe::Routing::RoutingMethodType;
 using tvm::ffi::Array;
 using tvm::ffi::Optional;
 
+// Utility function to compute the next power of two
+inline int32_t nextPowerOfTwo(float value) {
+  int32_t n = static_cast<int32_t>(std::ceil(value));
+  if (n <= 1) return 1;
+
+  // If n is already a power of 2, return it
+  if ((n & (n - 1)) == 0) return n;
+
+  // Find the next power of 2
+  n--;
+  n |= n >> 1;
+  n |= n >> 2;
+  n |= n >> 4;
+  n |= n >> 8;
+  n |= n >> 16;
+  n++;
+
+  return n;
+}
+
+std::set<int32_t> computeSelectedTileN(std::vector<int32_t> const& supported_tile_nums,
+                                       int64_t const num_tokens, int64_t const top_k,
+                                       int64_t const num_local_experts) {
+  float const avg_tokens_per_expert = static_cast<float>(num_tokens * top_k) / num_local_experts;
+  int32_t tile_tokens_dim = std::clamp(nextPowerOfTwo(avg_tokens_per_expert),
+                                       supported_tile_nums.front(), supported_tile_nums.back());
+
+  std::set<int32_t> selected_tile_nums = {
+      std::max(supported_tile_nums.front(), tile_tokens_dim / 2), tile_tokens_dim,
+      std::min(supported_tile_nums.back(), tile_tokens_dim * 2),
+      std::min(supported_tile_nums.back(), tile_tokens_dim * 4)};
+
+  return selected_tile_nums;
+}
+
 void trtllm_fp8_per_tensor_scale_moe_launcher(
     TensorView routing_logits, Optional<TensorView> routing_bias, TensorView hidden_states,
     TensorView gemm1_weights, TensorView output1_scales_scalar,
@@ -46,7 +83,9 @@ void trtllm_fp8_per_tensor_scale_moe_launcher(
     int64_t const intermediate_size, int64_t const local_expert_offset,
     int64_t const local_num_experts, Optional<double> const routed_scaling_factor,
     bool const use_routing_scales_on_input, int64_t const tile_tokens_dim,
-    int64_t const routing_method_type, bool enable_pdl) {
+    int64_t const routing_method_type,
+    tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner& moe_runner, int64_t moeConfigIndex,
+    bool enable_pdl) {
   static const std::tuple<int, int> device_props = [hidden_states] {
     int major, minor;
     cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor,
@@ -124,6 +163,7 @@ void trtllm_fp8_per_tensor_scale_moe_launcher(
   } else {
     TVM_FFI_LOG_AND_THROW(NotImplementedError) << "Unsupported input dtype for MoE.";
   }
+  args.mDtypeOut = btg::Dtype::Bfloat16;  // Output is always bfloat16 for fp8 per-tensor scale
 
   args.routing_logits = routing_logits.data_ptr();
   auto const routing_bias_dtype =
@@ -158,6 +198,13 @@ void trtllm_fp8_per_tensor_scale_moe_launcher(
   int32_t max_num_padded_tokens =
       tensorrt_llm::kernels::trtllmgen_moe::Routing::getMaxPermutedPaddedCount(
           args.num_tokens, top_k, num_experts, tile_tokens_dim);
+  int32_t max_num_padded_tokens_gemm1 =
+      tensorrt_llm::kernels::trtllmgen_moe::Routing::maybeGetMinTokenCount(
+          max_num_padded_tokens, args.intermediate_size, btg::dtypeGetNumBits(args.mDtypeElt));
+  int32_t max_num_padded_tokens_gemm2 =
+      tensorrt_llm::kernels::trtllmgen_moe::Routing::maybeGetMinTokenCount(
+          max_num_padded_tokens, args.hidden_size, btg::dtypeGetNumBits(args.mDtypeOut));
+
   Tensor total_num_padded_tokens = alloc_tensor({1}, dl_int32, routing_logits.device());
   Tensor expanded_idx_to_permuted_idx =
       alloc_tensor({args.num_tokens * args.top_k}, dl_int32, routing_logits.device());
@@ -174,20 +221,17 @@ void trtllm_fp8_per_tensor_scale_moe_launcher(
       routing_logits.device());
 
   // allocate workspace for activation/gemm/finalize kernels
-  // Tensor gemm1_output = alloc_tensor({max_num_padded_tokens, 2 * intermediate_size},
-  //                                    dl_float8_e4m3fn, hidden_states.device());
-  // Tensor activation_output = alloc_tensor({max_num_padded_tokens, intermediate_size},
-  //                                         dl_float8_e4m3fn, hidden_states.device());
-  Tensor gemm1_output = alloc_tensor({max_num_padded_tokens, 2 * intermediate_size}, dl_uint8,
+  Tensor gemm1_output = alloc_tensor({max_num_padded_tokens_gemm1, 2 * intermediate_size}, dl_uint8,
                                      hidden_states.device());
-  Tensor gemm1_output_scale = alloc_tensor({2 * intermediate_size / 128, max_num_padded_tokens},
-                                           dl_float32, hidden_states.device());
-  Tensor activation_output =
-      alloc_tensor({max_num_padded_tokens, intermediate_size}, dl_uint8, hidden_states.device());
-  Tensor activation_output_scale = alloc_tensor({intermediate_size / 128, max_num_padded_tokens},
-                                                dl_float32, hidden_states.device());
-  Tensor gemm2_output =
-      alloc_tensor({max_num_padded_tokens, args.hidden_size}, dl_bfloat16, hidden_states.device());
+  Tensor gemm1_output_scale =
+      alloc_tensor({2 * intermediate_size / 128, max_num_padded_tokens_gemm1}, dl_float32,
+                   hidden_states.device());
+  Tensor activation_output = alloc_tensor({max_num_padded_tokens_gemm1, intermediate_size},
+                                          dl_uint8, hidden_states.device());
+  Tensor activation_output_scale = alloc_tensor(
+      {intermediate_size / 128, max_num_padded_tokens_gemm1}, dl_float32, hidden_states.device());
+  Tensor gemm2_output = alloc_tensor({max_num_padded_tokens_gemm2, args.hidden_size}, dl_bfloat16,
+                                     hidden_states.device());
 
   int32_t max_num_ctas = tensorrt_llm::kernels::trtllmgen_moe::Routing::getMaxNumCtasInBatchDim(
       args.num_tokens, args.top_k, args.num_experts, tile_tokens_dim);
@@ -257,7 +301,8 @@ void trtllm_fp8_per_tensor_scale_moe_launcher(
 
   // setup workspace
   workspace.total_num_padded_tokens = static_cast<int*>(total_num_padded_tokens.data_ptr());
-  workspace.total_max_padded_tokens = max_num_padded_tokens;
+  workspace.total_max_padded_tokens =
+      std::max(max_num_padded_tokens_gemm1, max_num_padded_tokens_gemm2);
   workspace.ProjUpTileN = tile_tokens_dim;
   workspace.routing_expert_indexes = static_cast<int*>(expert_indexes.data_ptr());
   workspace.permuted_idx_size = static_cast<int*>(total_num_padded_tokens.data_ptr());
@@ -283,13 +328,6 @@ void trtllm_fp8_per_tensor_scale_moe_launcher(
   args.output = output.data_ptr();
   args.output_scale = nullptr;
 
-  tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner moe_runner(
-      args.mDtypeElt, args.mUseDeepSeekFp8, tile_tokens_dim, /*useShuffledMatrixA*/ true);
-
-  auto const moeConfigIndex =
-      moe_runner.getDefaultValidConfigIndex(args.top_k, args.hidden_size, args.intermediate_size,
-                                            args.local_num_experts, args.num_tokens);
-
   auto workspace_sizes = moe_runner.getWorkspaceSizeInBytes(args, moeConfigIndex);
   Tensor workspace_fc1 =
       alloc_tensor({std::get<0>(workspace_sizes)}, dl_int8, hidden_states.device());
@@ -309,16 +347,56 @@ void trtllm_fp8_per_tensor_scale_moe(
     TensorView output2_scales_scalar, TensorView output, int64_t num_experts, int64_t top_k,
     Optional<int64_t> n_group, Optional<int64_t> topk_group, int64_t intermediate_size,
     int64_t local_expert_offset, int64_t local_num_experts, Optional<double> routed_scaling_factor,
-    bool use_routing_scales_on_input, int64_t tile_tokens_dim, int64_t routing_method_type,
-    bool enable_pdl) {
+    bool use_routing_scales_on_input, int64_t routing_method_type, bool enable_pdl,
+    Array<int64_t> config_index) {
   auto dtype = hidden_states.dtype();
   if (dtype == dl_float16 || dtype == dl_bfloat16 || dtype == dl_float8_e4m3fn) {
+    using RunnerType = tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner;
+
+    // Convert PyTorch dtype to TensorRT-LLM dtype
+    btg::Dtype mDtypeElt;
+    if (dtype == dl_float16) {
+      mDtypeElt = btg::Dtype::Fp16;
+    } else if (dtype == dl_bfloat16) {
+      mDtypeElt = btg::Dtype::Bfloat16;
+    } else if (dtype == dl_float8_e4m3fn) {
+      mDtypeElt = btg::Dtype::E4m3;
+    } else {
+      TVM_FFI_LOG_AND_THROW(NotImplementedError) << "Unsupported input dtype for MoE.";
+    }
+
+    auto const num_tokens = hidden_states.size(0);
+    auto const hidden_size = hidden_states.size(1);
+    bool mUseDeepSeekFp8{false};  // FP8 per-tensor doesn't use DeepSeek FP8
+
+    std::vector<int32_t> mSupportedTileN = {8, 16, 32, 64, 128};
+    std::set<int32_t> selected_tile_nums =
+        computeSelectedTileN(mSupportedTileN, num_tokens, top_k, local_num_experts);
+
+    // Build runners for all supported tile sizes
+    std::unordered_map<int32_t, std::unique_ptr<RunnerType>> mRunners;
+    for (int32_t tile_N : selected_tile_nums) {
+      // Always use the two-parameter constructor for consistency
+      mRunners.emplace(tile_N, std::make_unique<RunnerType>(mDtypeElt, mUseDeepSeekFp8, tile_N,
+                                                            /*useShuffledMatrixA*/ true));
+    }
+
+    // moeConfigIndex corresponds to pair (tile_N, config)
+    int64_t tile_N = config_index[0];
+    int64_t config = config_index[1];
+    // Autotuner has requested a default or 'fallback' config index
+    if (tile_N == -1 || config == -1) {
+      tile_N = *selected_tile_nums.begin();
+      config = mRunners[tile_N]->getDefaultValidConfigIndex(top_k, hidden_size, intermediate_size,
+                                                            local_num_experts, num_tokens);
+    }
+
     trtllm_fp8_per_tensor_scale_moe_launcher(
         routing_logits, routing_bias, hidden_states, gemm1_weights, output1_scales_scalar,
         output1_scales_gate_scalar, gemm2_weights, output2_scales_scalar, output, num_experts,
         top_k, n_group, topk_group, intermediate_size, local_expert_offset, local_num_experts,
-        routed_scaling_factor, use_routing_scales_on_input, tile_tokens_dim, routing_method_type,
-        enable_pdl);
+        routed_scaling_factor, use_routing_scales_on_input, tile_N, routing_method_type,
+        *mRunners[tile_N], config, enable_pdl);
   } else {
     TVM_FFI_LOG_AND_THROW(NotImplementedError) << "Unsupported input dtype.";
   }
@@ -468,10 +546,6 @@ void trtllm_fp8_block_scale_moe_launcher(
       routing_logits.device());
 
   // allocate workspace for activation/gemm/finalize kernels
-  // Tensor gemm1_output = alloc_tensor({max_num_padded_tokens, 2 * intermediate_size},
-  //                                    dl_float8_e4m3fn, hidden_states.device());
-  // Tensor activation_output = alloc_tensor({max_num_padded_tokens, intermediate_size},
-  //                                         dl_float8_e4m3fn, hidden_states.device());
   Tensor gemm1_output = alloc_tensor({max_num_padded_tokens_gemm1, 2 * intermediate_size}, dl_uint8,
                                      hidden_states.device());
   Tensor gemm1_output_scale = alloc_tensor({2 * intermediate_size / 128, max_num_padded_tokens},
@@ -623,16 +697,14 @@ void trtllm_fp8_block_scale_moe_launcher(
                  enable_pdl);
 }
 
-void trtllm_fp8_block_scale_moe(TensorView routing_logits, Optional<TensorView> routing_bias,
-                                TensorView hidden_states, TensorView hidden_states_scale,
-                                TensorView gemm1_weights, TensorView gemm1_weights_scale,
-                                TensorView gemm2_weights, TensorView gemm2_weights_scale,
-                                TensorView output, int64_t num_experts, int64_t top_k,
-                                Optional<int64_t> n_group, Optional<int64_t> topk_group,
-                                int64_t intermediate_size, int64_t local_expert_offset,
-                                int64_t local_num_experts, Optional<double> routed_scaling_factor,
-                                int64_t tile_tokens_dim, int64_t routing_method_type,
-                                bool use_shuffled_weight, int64_t weight_layout, bool enable_pdl) {
+void trtllm_fp8_block_scale_moe(
+    TensorView routing_logits, Optional<TensorView> routing_bias, TensorView hidden_states,
+    TensorView hidden_states_scale, TensorView gemm1_weights, TensorView gemm1_weights_scale,
+    TensorView gemm2_weights, TensorView gemm2_weights_scale, TensorView output,
+    int64_t num_experts, int64_t top_k, Optional<int64_t> n_group, Optional<int64_t> topk_group,
+    int64_t intermediate_size, int64_t local_expert_offset, int64_t local_num_experts,
+    Optional<double> routed_scaling_factor, int64_t routing_method_type, bool use_shuffled_weight,
+    int64_t weight_layout, bool enable_pdl, Array<int64_t> config_index) {
   auto dtype = hidden_states.dtype();
   if (dtype == dl_float16 || dtype == dl_bfloat16 || dtype == dl_float8_e4m3fn) {
     using RunnerType = tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner;
@@ -643,24 +715,36 @@ void trtllm_fp8_block_scale_moe(TensorView routing_logits, Optional<TensorView> 
     TVM_FFI_ICHECK(0 <= weight_layout && weight_layout <= 2)
         << "the value of weight_layout is not recognized";
 
-    // Properly initialize the runner using make_unique like in the original code
-    auto mRunner = std::make_unique<RunnerType>(
-        mDtypeElt, mUseDeepSeekFp8, tile_tokens_dim, use_shuffled_weight,
-        static_cast<batchedGemm::gemm::MatrixLayout>(weight_layout));
-
-    // Always use fallback config (equivalent to moeConfigIndex == -1 case from original code)
     auto const num_tokens = hidden_states.size(0);
     auto const hidden_size = hidden_states.size(1);
 
-    int64_t moeConfigIndex = mRunner->getDefaultValidConfigIndex(
-        top_k, hidden_size, intermediate_size, local_num_experts, num_tokens);
+    std::vector<int32_t> mSupportedTileN = {8, 16, 32, 64};
+    std::set<int32_t> selected_tile_nums =
+        computeSelectedTileN(mSupportedTileN, num_tokens, top_k, local_num_experts);
+
+    // Build runners for all supported tile sizes
+    std::unordered_map<int32_t, std::unique_ptr<RunnerType>> mRunners;
+    for (int32_t tile_N : selected_tile_nums) {
+      mRunners.emplace(tile_N, std::make_unique<RunnerType>(
+                                   mDtypeElt, mUseDeepSeekFp8, tile_N, use_shuffled_weight,
+                                   static_cast<batchedGemm::gemm::MatrixLayout>(weight_layout)));
+    }
+
+    // moeConfigIndex corresponds to pair (tile_N, config)
+    int64_t tile_N = config_index[0];
+    int64_t config = config_index[1];
+    // Autotuner has requested a default or 'fallback' config index
+    if (tile_N == -1 || config == -1) {
+      tile_N = *selected_tile_nums.begin();
+      config = mRunners[tile_N]->getDefaultValidConfigIndex(top_k, hidden_size, intermediate_size,
+                                                            local_num_experts, num_tokens);
+    }
 
     trtllm_fp8_block_scale_moe_launcher(
         routing_logits, routing_bias, hidden_states, hidden_states_scale, gemm1_weights,
         gemm1_weights_scale, gemm2_weights, gemm2_weights_scale, output, num_experts, top_k,
         n_group, topk_group, intermediate_size, local_expert_offset, local_num_experts,
-        routed_scaling_factor, tile_tokens_dim, routing_method_type, *mRunner, moeConfigIndex,
-        enable_pdl);
+        routed_scaling_factor, tile_N, routing_method_type, *mRunners[tile_N], config, enable_pdl);
   } else {
     TVM_FFI_LOG_AND_THROW(NotImplementedError) << "Unsupported hidden state dtype.";
   }
@@ -845,10 +929,6 @@ Array<Tensor> trtllm_fp4_block_scale_moe_launcher(
 
   Tensor permuted_idx_to_token_idx =
       alloc_tensor({max_num_padded_tokens}, dl_int32, hidden_states.device());
-  // Tensor expert_weights = alloc_tensor(
-  //     {args.num_tokens, args.top_k}, dl_bfloat16, hidden_states.device());
-  // Tensor expert_indexes = alloc_tensor(
-  //     {args.num_tokens, args.top_k}, dl_int32, hidden_states.device();
   int64_t const size_of_expert_count_histogram = std::max(num_experts * 2, int64_t(256 * 2));
   Tensor expert_count_histogram =
       alloc_tensor({size_of_expert_count_histogram}, dl_int32, hidden_states.device());
@@ -858,10 +938,6 @@ Array<Tensor> trtllm_fp4_block_scale_moe_launcher(
   // allocate workspace for activation/gemm/finalize kernels
   auto const gemm1_output_hidden =
       dtype_act == btg::Dtype::E2m1 ? intermediate_size / 2 : intermediate_size;
-  // Tensor gemm1_output = alloc_tensor(
-  //     {max_num_padded_tokens, gemm1_output_hidden},
-  //     dtype_act == btg::Dtype::Bfloat16 ? dl_bfloat16 : dl_float8_e4m3fn,
-  //     hidden_states.device());
   Tensor gemm1_output = alloc_tensor({max_num_padded_tokens_gemm1, gemm1_output_hidden},
                                      dtype_act == btg::Dtype::Bfloat16 ? dl_bfloat16 : dl_uint8,
                                      hidden_states.device());
@@ -1101,8 +1177,8 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
     Optional<TensorView> output2_scales_scalar, int64_t num_experts, int64_t top_k,
     Optional<int64_t> n_group, Optional<int64_t> topk_group, int64_t intermediate_size,
     int64_t local_expert_offset, int64_t local_num_experts, Optional<double> routed_scaling_factor,
-    int64_t tile_tokens_dim, int64_t routing_method_type, bool do_finalize, bool enable_pdl,
-    int64_t gated_act_type, TensorView output, int64_t config_index) {
+    int64_t routing_method_type, bool do_finalize, bool enable_pdl, int64_t gated_act_type,
+    TensorView output, Array<int64_t> config_index) {
   using RunnerType = tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner;
 
   int const num_tokens = hidden_states.size(0);
@@ -1148,55 +1224,115 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
   }
   bool mUseDeepSeekFp8{false};  // FP4 doesn't use DeepSeek FP8
 
-  // Properly initialize the runner using make_unique like in the original code
-  auto mRunner = std::make_unique<RunnerType>(
-      mDtypeAct, mDtypeWeights, mUseDeepSeekFp8, (int32_t)tile_tokens_dim,
-      static_cast<GatedActType>(gated_act_type), /*useShuffledMatrixA*/ true);
-
-  if (config_index == -1) {
-    config_index = mRunner->getDefaultValidConfigIndex(top_k, hidden_size, intermediate_size,
-                                                       local_num_experts, num_tokens);
+  std::vector<int32_t> mSupportedTileN = {8, 16, 32, 64};
+  if (mDtypeAct != btg::Dtype::Bfloat16) {
+    mSupportedTileN.push_back(128);
+  }
+  std::set<int32_t> selected_tile_nums =
+      computeSelectedTileN(mSupportedTileN, num_tokens, top_k, local_num_experts);
+  // Build runners for all supported tile sizes
+  std::unordered_map<int32_t, std::unique_ptr<RunnerType>> mRunners;
+  for (int32_t tile_N : selected_tile_nums) {
+    mRunners.emplace(tile_N,
+                     std::make_unique<RunnerType>(mDtypeAct, mDtypeWeights, mUseDeepSeekFp8, tile_N,
+                                                  static_cast<GatedActType>(gated_act_type),
+                                                  /*useShuffledMatrixA*/ true));
   }
 
+  // moeConfigIndex corresponds to pair (tile_N, config)
+  int64_t tile_N = config_index[0];
+  int64_t config = config_index[1];
+  // Autotuner has requested a default or 'fallback' config index
+  if (tile_N == -1 || config == -1) {
+    tile_N = *selected_tile_nums.begin();
+    config = mRunners[tile_N]->getDefaultValidConfigIndex(top_k, hidden_size, intermediate_size,
+                                                          local_num_experts, num_tokens);
+  }
   return trtllm_fp4_block_scale_moe_launcher(
       routing_logits, topk_ids, expert_weights, routing_bias, hidden_states, hidden_states_scale,
       gemm1_weights, gemm1_weights_scale, gemm1_bias, gemm1_alpha, gemm1_beta, gemm1_clamp_limit,
       gemm2_weights, gemm2_weights_scale, gemm2_bias, output1_scales_scalar,
       output1_scales_gate_scalar, output2_scales_scalar, num_experts, top_k, n_group, topk_group,
-      intermediate_size, local_expert_offset, local_num_experts, routed_scaling_factor,
-      tile_tokens_dim, routing_method_type, do_finalize, *mRunner, mDtypeAct, mDtypeWeights,
-      config_index, enable_pdl, output);
+      intermediate_size, local_expert_offset, local_num_experts, routed_scaling_factor, tile_N,
+      routing_method_type, do_finalize, *mRunners[tile_N], mDtypeAct, mDtypeWeights, config,
+      enable_pdl, output);
 }
 
-int64_t trtllm_get_default_moe_configs(int64_t const tile_tokens_dim, int64_t const dtype_act_,
-                                       int64_t const dtype_weights_, bool const useDeepSeekFp8,
-                                       int64_t const top_k, int64_t const hidden_size,
-                                       int64_t const intermediate_size,
+int64_t trtllm_get_default_moe_configs(int64_t const dtype_act_, int64_t const dtype_weights_,
+                                       bool const useDeepSeekFp8, int64_t const top_k,
+                                       int64_t const hidden_size, int64_t const intermediate_size,
                                        int64_t const num_local_experts,
                                        int64_t const gated_act_type, int64_t const num_tokens) {
   auto dtype_act = static_cast<btg::Dtype>(dtype_act_);
   auto dtype_weights = static_cast<btg::Dtype>(dtype_weights_);
-  tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner moe_runner(
-      dtype_act, dtype_weights, useDeepSeekFp8, (int32_t)tile_tokens_dim,
-      static_cast<GatedActType>(gated_act_type), /*useShuffledMatrixA*/ true);
-  return moe_runner.getDefaultValidConfigIndex(top_k, hidden_size, intermediate_size,
-                                               num_local_experts, num_tokens);
+  std::vector<int32_t> supported_tile_nums = {8, 16, 32, 64};
+  // Check if we should add tile size 128
+  bool is_fp4_without_bf16_act =
+      (dtype_weights == btg::Dtype::E2m1 || dtype_weights == btg::Dtype::MxE2m1) &&
+      dtype_act != btg::Dtype::Bfloat16;
+  bool is_fp8_per_tensor =
+      dtype_weights == btg::Dtype::E4m3 && dtype_act == btg::Dtype::E4m3 && !useDeepSeekFp8;
+
+  if (is_fp4_without_bf16_act || is_fp8_per_tensor) {
+    supported_tile_nums.push_back(128);
+  }
+  std::set<int32_t> selected_tile_nums =
+      computeSelectedTileN(supported_tile_nums, num_tokens, top_k, num_local_experts);
+
+  std::unique_ptr<tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner> moe_runner =
+      std::make_unique<tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner>(
+          dtype_act, dtype_weights, useDeepSeekFp8, *selected_tile_nums.begin(),
+          static_cast<GatedActType>(gated_act_type), /*useShuffledMatrixA*/ true);
+
+  return moe_runner->getDefaultValidConfigIndex(top_k, hidden_size, intermediate_size,
+                                                num_local_experts, num_tokens);
 }
 
-Array<int64_t> trtllm_get_valid_moe_configs(int64_t const tile_tokens_dim, int64_t const dtype_act_,
-                                            int64_t const dtype_weights_, bool const useDeepSeekFp8,
-                                            int64_t const top_k, int64_t const hidden_size,
-                                            int64_t const intermediate_size,
-                                            int64_t const num_local_experts,
-                                            int64_t const gated_act_type,
-                                            int64_t const num_tokens) {
+Array<Array<int64_t>> trtllm_get_valid_moe_configs(
+    int64_t const dtype_act_, int64_t const dtype_weights_, bool const useDeepSeekFp8,
+    int64_t const top_k, int64_t const hidden_size, int64_t const intermediate_size,
+    int64_t const num_local_experts, int64_t const gated_act_type, bool const use_shuffled_weight,
+    int64_t const weight_layout, int64_t const num_tokens) {
+  // returns (tile_N, config)
+  Array<Array<int64_t>> valid_configs;
   auto dtype_act = static_cast<btg::Dtype>(dtype_act_);
   auto dtype_weights = static_cast<btg::Dtype>(dtype_weights_);
-  tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner moe_runner(
-      dtype_act, dtype_weights, useDeepSeekFp8, (int32_t)tile_tokens_dim,
-      static_cast<GatedActType>(gated_act_type), /*useShuffledMatrixA*/ true);
-  return moe_runner.getValidConfigIndices(top_k, hidden_size, intermediate_size, num_local_experts,
-                                          num_tokens);
+  std::vector<int32_t> supported_tile_nums = {8, 16, 32, 64};
+  // Check if we should add tile size 128
+  bool is_fp4_without_bf16_act =
+      (dtype_weights == btg::Dtype::E2m1 || dtype_weights == btg::Dtype::MxE2m1) &&
+      dtype_act != btg::Dtype::Bfloat16;
+  bool is_fp8_per_tensor =
+      dtype_weights == btg::Dtype::E4m3 && dtype_act == btg::Dtype::E4m3 && !useDeepSeekFp8;
+
+  if (is_fp4_without_bf16_act || is_fp8_per_tensor) {
+    supported_tile_nums.push_back(128);
+  }
+  std::set<int32_t> selected_tile_nums =
+      computeSelectedTileN(supported_tile_nums, num_tokens, top_k, num_local_experts);
+
+  for (int32_t tile_N : selected_tile_nums) {
+    std::unique_ptr<tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner> moe_runner;
+
+    if (dtype_weights == btg::Dtype::E4m3 && dtype_act == btg::Dtype::E4m3) {
+      // FP8 block scale MOE runner
+      moe_runner = std::make_unique<tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner>(
+          dtype_weights, useDeepSeekFp8, tile_N, use_shuffled_weight,
+          static_cast<batchedGemm::gemm::MatrixLayout>(weight_layout));
+    } else {
+      // FP4 block scale MOE runner
+      moe_runner = std::make_unique<tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner>(
+          dtype_act, dtype_weights, useDeepSeekFp8, tile_N,
+          static_cast<GatedActType>(gated_act_type),
+          /*useShuffledMatrixA*/ true);
+    }
+    auto cfgs = moe_runner->getValidConfigIndices(top_k, hidden_size, intermediate_size,
+                                                  num_local_experts, num_tokens);
+    for (auto cfg : cfgs) {
+      valid_configs.push_back({tile_N, cfg});
+    }
+  }
+  return valid_configs;
 }
 
 namespace trtllm_cubin_loader {
