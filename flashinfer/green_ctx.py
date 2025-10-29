@@ -178,8 +178,12 @@ def split_device_green_ctx(
         streams = create_green_ctx_streams(cu_dev, resources)
         return streams, resources
     except RuntimeError as e:
-        if "CUDA error code=914" in str(e) or "CUDA_ERROR_INVALID_RESOURCE_TYPE" in str(e) or \
-           "CUDA error code=915" in str(e) or "CUDA_ERROR_INVALID_RESOURCE_CONFIGURATION" in str(e):
+        if (
+            "CUDA error code=914" in str(e)
+            or "CUDA_ERROR_INVALID_RESOURCE_TYPE" in str(e)
+            or "CUDA error code=915" in str(e)
+            or "CUDA_ERROR_INVALID_RESOURCE_CONFIGURATION" in str(e)
+        ):
             raise RuntimeError(
                 f"{e}\n"
                 f"Failed to split device into {num_groups} groups with min_count={min_count}. "
@@ -264,16 +268,24 @@ def split_device_green_ctx_by_sm_count(
             )
             if sm_count <= 0:
                 raise ValueError(f"SM count must be positive, got {sm_count}")
-            rounded_sm_counts.append(round_up(max(sm_count, min_sm_count), sm_alignment))
+            rounded_sm_counts.append(
+                round_up(max(sm_count, min_sm_count), sm_alignment)
+            )
 
         # Split the device into multiple green contexts
-        results, remaining = split_resource_by_sm_count(cu_dev, resource, rounded_sm_counts)
+        results, remaining = split_resource_by_sm_count(
+            cu_dev, resource, rounded_sm_counts
+        )
         resources = results + [remaining]
         streams = create_green_ctx_streams(cu_dev, resources)
         return streams, resources
     except RuntimeError as e:
-        if "CUDA error code=914" in str(e) or "CUDA_ERROR_INVALID_RESOURCE_TYPE" in str(e) or \
-           "CUDA error code=915" in str(e) or "CUDA_ERROR_INVALID_RESOURCE_CONFIGURATION" in str(e):
+        if (
+            "CUDA error code=914" in str(e)
+            or "CUDA_ERROR_INVALID_RESOURCE_TYPE" in str(e)
+            or "CUDA error code=915" in str(e)
+            or "CUDA_ERROR_INVALID_RESOURCE_CONFIGURATION" in str(e)
+        ):
             raise RuntimeError(
                 f"{e}\n"
                 f"Failed to split device with SM counts {sm_counts} (rounded to {rounded_sm_counts}). "

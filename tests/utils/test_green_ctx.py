@@ -22,13 +22,19 @@ def test_green_ctx_creation(
             sm_count = resource.sm.smCount
             assert sm_count >= min_count
     except RuntimeError as e:
-        if "CUDA error code=914" in str(e) or "CUDA_ERROR_INVALID_RESOURCE_TYPE" in str(e) or \
-           "CUDA error code=915" in str(e) or "CUDA_ERROR_INVALID_RESOURCE_CONFIGURATION" in str(e):
+        if (
+            "CUDA error code=914" in str(e)
+            or "CUDA_ERROR_INVALID_RESOURCE_TYPE" in str(e)
+            or "CUDA error code=915" in str(e)
+            or "CUDA_ERROR_INVALID_RESOURCE_CONFIGURATION" in str(e)
+        ):
             # Get total SM count on the device
             cu_dev = green_ctx.get_cudevice(torch.device(device))
             device_resource = green_ctx.get_device_resource(cu_dev)
             total_sms = device_resource.sm.smCount
-            pytest.skip(f"Insufficient SMs on device. Total SMs available: {total_sms}, requested: num_groups={num_groups}, min_count={min_count}")
+            pytest.skip(
+                f"Insufficient SMs on device. Total SMs available: {total_sms}, requested: num_groups={num_groups}, min_count={min_count}"
+            )
         raise
 
 
@@ -55,13 +61,19 @@ def test_green_ctx_kernel_execution(
                 z = x @ y
                 print(z.shape)
     except RuntimeError as e:
-        if "CUDA error code=914" in str(e) or "CUDA_ERROR_INVALID_RESOURCE_TYPE" in str(e) or \
-           "CUDA error code=915" in str(e) or "CUDA_ERROR_INVALID_RESOURCE_CONFIGURATION" in str(e):
+        if (
+            "CUDA error code=914" in str(e)
+            or "CUDA_ERROR_INVALID_RESOURCE_TYPE" in str(e)
+            or "CUDA error code=915" in str(e)
+            or "CUDA_ERROR_INVALID_RESOURCE_CONFIGURATION" in str(e)
+        ):
             # Get total SM count on the device
             cu_dev = green_ctx.get_cudevice(torch.device(device))
             device_resource = green_ctx.get_device_resource(cu_dev)
             total_sms = device_resource.sm.smCount
-            pytest.skip(f"Insufficient SMs on device. Total SMs available: {total_sms}, requested: num_groups={num_groups}, min_count={min_count}")
+            pytest.skip(
+                f"Insufficient SMs on device. Total SMs available: {total_sms}, requested: num_groups={num_groups}, min_count={min_count}"
+            )
         raise
 
 
@@ -92,13 +104,19 @@ def test_split_device_green_ctx_by_sm_count_creation(
             actual_sm_count = resources[i].sm.smCount
             assert actual_sm_count >= expected_sm_count
     except RuntimeError as e:
-        if "CUDA error code=914" in str(e) or "CUDA_ERROR_INVALID_RESOURCE_TYPE" in str(e) or \
-           "CUDA error code=915" in str(e) or "CUDA_ERROR_INVALID_RESOURCE_CONFIGURATION" in str(e):
+        if (
+            "CUDA error code=914" in str(e)
+            or "CUDA_ERROR_INVALID_RESOURCE_TYPE" in str(e)
+            or "CUDA error code=915" in str(e)
+            or "CUDA_ERROR_INVALID_RESOURCE_CONFIGURATION" in str(e)
+        ):
             # Get total SM count on the device
             cu_dev = green_ctx.get_cudevice(torch.device(device))
             device_resource = green_ctx.get_device_resource(cu_dev)
             total_sms = device_resource.sm.smCount
-            pytest.skip(f"Insufficient SMs on device. Total SMs available: {total_sms}, requested SM counts: {sm_counts}")
+            pytest.skip(
+                f"Insufficient SMs on device. Total SMs available: {total_sms}, requested SM counts: {sm_counts}"
+            )
         raise
 
 
@@ -130,13 +148,19 @@ def test_split_device_green_ctx_by_sm_count_kernel_execution(
                 z = x @ y
                 print(f"Partition {i}: {z.shape}")
     except RuntimeError as e:
-        if "CUDA error code=914" in str(e) or "CUDA_ERROR_INVALID_RESOURCE_TYPE" in str(e) or \
-           "CUDA error code=915" in str(e) or "CUDA_ERROR_INVALID_RESOURCE_CONFIGURATION" in str(e):
+        if (
+            "CUDA error code=914" in str(e)
+            or "CUDA_ERROR_INVALID_RESOURCE_TYPE" in str(e)
+            or "CUDA error code=915" in str(e)
+            or "CUDA_ERROR_INVALID_RESOURCE_CONFIGURATION" in str(e)
+        ):
             # Get total SM count on the device
             cu_dev = green_ctx.get_cudevice(torch.device(device))
             device_resource = green_ctx.get_device_resource(cu_dev)
             total_sms = device_resource.sm.smCount
-            pytest.skip(f"Insufficient SMs on device. Total SMs available: {total_sms}, requested SM counts: {sm_counts}")
+            pytest.skip(
+                f"Insufficient SMs on device. Total SMs available: {total_sms}, requested SM counts: {sm_counts}"
+            )
         raise
 
 
@@ -168,11 +192,17 @@ def test_split_device_green_ctx_by_sm_count_alignment(
             assert sm_count >= min_sm_count
             assert sm_count % sm_alignment == 0
     except RuntimeError as e:
-        if "CUDA error code=914" in str(e) or "CUDA_ERROR_INVALID_RESOURCE_TYPE" in str(e) or \
-           "CUDA error code=915" in str(e) or "CUDA_ERROR_INVALID_RESOURCE_CONFIGURATION" in str(e):
+        if (
+            "CUDA error code=914" in str(e)
+            or "CUDA_ERROR_INVALID_RESOURCE_TYPE" in str(e)
+            or "CUDA error code=915" in str(e)
+            or "CUDA_ERROR_INVALID_RESOURCE_CONFIGURATION" in str(e)
+        ):
             # Get total SM count on the device
             cu_dev = green_ctx.get_cudevice(torch.device(device))
             device_resource = green_ctx.get_device_resource(cu_dev)
             total_sms = device_resource.sm.smCount
-            pytest.skip(f"Insufficient SMs on device. Total SMs available: {total_sms}, requested SM counts: {sm_counts}")
+            pytest.skip(
+                f"Insufficient SMs on device. Total SMs available: {total_sms}, requested SM counts: {sm_counts}"
+            )
         raise
