@@ -37,6 +37,7 @@ from ..jit.fused_moe import (
     gen_cutlass_fused_moe_sm120_module,
     gen_cutlass_fused_moe_sm100_module,
     gen_cutlass_fused_moe_sm90_module,
+    gen_cutlass_fused_moe_sm89_module,
     gen_trtllm_gen_fused_moe_sm100_module,
 )
 from ..utils import (
@@ -285,6 +286,8 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
         module = gen_cutlass_fused_moe_sm100_module(use_fast_build).build_and_load()
     elif backend == "90":
         module = gen_cutlass_fused_moe_sm90_module(use_fast_build).build_and_load()
+    elif backend == "89":
+        module = gen_cutlass_fused_moe_sm89_module(use_fast_build).build_and_load()
     else:
         raise ValueError(f"Invalid backend: {backend}")
 
