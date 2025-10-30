@@ -94,7 +94,7 @@ Driver calls take place to carry out the gemm operations.
 */
 
 class FusedMoeLauncher {
- protected:
+  protected:
   Tensor routing_logits{};
   Tensor routing_bias{};
   Tensor hidden_states{};
@@ -1781,6 +1781,7 @@ namespace trtllm_cubin_loader {
 #include <flashinfer/cubin_loader.h>
 }
 
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_bf16_moe, trtllm_bf16_moe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_fp8_per_tensor_scale_moe, trtllm_fp8_per_tensor_scale_moe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_fp8_block_scale_moe, trtllm_fp8_block_scale_moe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_fp4_block_scale_moe, trtllm_fp4_block_scale_moe);
