@@ -72,6 +72,7 @@ std::set<int32_t> computeSelectedTileN(std::vector<int32_t> const& supported_til
       std::min(supported_tile_nums.back(), tile_tokens_dim * 4)};
 
   return selected_tile_nums;
+}
 /*
 Abstraction layers:
 1. TORCH_LIBRARY_FRAGMENT bindings
@@ -106,7 +107,7 @@ class FusedMoeLauncher {
   int64_t tile_tokens_dim{};
   int64_t routing_method_type{};
   bool use_shuffled_weight{};
-  MatrixLayout weight_layout{MatrixLayout::MajorK};
+  batchedGemm::gemm::MatrixLayout weight_layout{batchedGemm::gemm::MatrixLayout::MajorK};
 
   std::tuple<int, int> device_version;
   std::unique_ptr<tensorrt_llm::kernels::trtllmgen_moe::MoE::MoERunnerArgs> args;
@@ -127,26 +128,26 @@ class FusedMoeLauncher {
 
   // Routing logits [num_tokens, num_experts]
   void check_routing_logits_shape() const {
-    TVM_FFI_ICHECK_EQ(routing_logits->ndim, 2) << "routing_logits must be 2D.";
-    TVM_FFI_ICHECK_EQ(routing_logits->shape[0], hidden_states->shape[0])
+    TVM_FFI_ICHECK_EQ(routing_logits.ndim(), 2) << "routing_logits must be 2D.";
+    TVM_FFI_ICHECK_EQ(routing_logits.size(0), hidden_states.size(0))
         << "routing_logits and hidden_states must have the same number of tokens.";
-    TVM_FFI_ICHECK_EQ(routing_logits->shape[1], args->num_experts)
+    TVM_FFI_ICHECK_EQ(routing_logits.size(1), args->num_experts)
         << "routing_logits dim1 must match num_experts.";
   }
 
   // Routing bias [num_experts]
   void check_routing_bias_shape() const {
     if (routing_bias.defined()) {
-      TVM_FFI_ICHECK_EQ(routing_bias->ndim, 1) << "routing_bias must be 1D.";
-      TVM_FFI_ICHECK_EQ(routing_bias->shape[0], args->num_experts)
+      TVM_FFI_ICHECK_EQ(routing_bias.ndim(), 1) << "routing_bias must be 1D.";
+      TVM_FFI_ICHECK_EQ(routing_bias.size(0), args->num_experts)
           << "routing_bias has incorrect shape.";
     }
   }
 
   // Hidden states [num_tokens, hidden_size]
   void check_hidden_states_shape() const {
-    TVM_FFI_ICHECK_EQ(hidden_states->ndim, 2) << "hidden_states must be 2D.";
-    TVM_FFI_ICHECK_EQ(hidden_states->shape[1], args->intermediate_size)
+    TVM_FFI_ICHECK_EQ(hidden_states.ndim(), 2) << "hidden_states must be 2D.";
+    TVM_FFI_ICHECK_EQ(hidden_states.size(1), args->intermediate_size)
         << "hidden_states has incorrect shape.";
   }
 
@@ -162,26 +163,26 @@ class FusedMoeLauncher {
     }
 
     int64_t Mn = 0, K = 0;
-    if (weight_layout == MatrixLayout::MajorK) {
+    if (weight_layout == batchedGemm::gemm::MatrixLayout::MajorK) {
       // MajorK [num_experts, M, K]
-      Mn = weights->shape[1];
-      K = weights->shape[2];
-    } else if (weight_layout == MatrixLayout::BlockMajorK) {
+      Mn = weights.size(1);
+      K = weights.size(2);
+    } else if (weight_layout == batchedGemm::gemm::MatrixLayout::BlockMajorK) {
       // BlockMajorK [num_experts, K/block_k, M, block_k]
-      Mn = weights->shape[2];
-      int64_t block_k = weights->shape[3];
-      K = weights->shape[1] * block_k;
+      Mn = weights.size(2);
+      int64_t block_k = weights.size(3);
+      K = weights.size(1) * block_k;
     } else {
       TVM_FFI_LOG_AND_THROW(NotImplementedError)
           << "Unsupported weight_layout: " << (int)weight_layout;
     }
-    TVM_FFI_ICHECK_EQ(weights->shape[0], args->num_experts)
+    TVM_FFI_ICHECK_EQ(weights.size(0), args->num_experts)
         << which_weights << " weights expert dimension must match num_experts";
     if (which_weights == "gemm1") {
       TVM_FFI_ICHECK_EQ(Mn % 2, 0) << which_weights << " weights Mn dimension must be even.";
       TVM_FFI_ICHECK_EQ(args->intermediate_size, Mn / 2)
           << "intermediate_size has incorrect shape.";
-      TVM_FFI_ICHECK_EQ(K, hidden_states->shape[1])
+      TVM_FFI_ICHECK_EQ(K, hidden_states.size(1))
           << which_weights << " weights K dimension must be equal to hidden_size.";
     } else if (which_weights == "gemm2") {
       TVM_FFI_ICHECK_EQ(K, args->intermediate_size)
@@ -224,18 +225,18 @@ class FusedMoeLauncher {
             args->num_tokens, args->top_k, args->num_experts, tile_tokens_dim);
 
     // Common routing workspace tensors allocation
-    num_tokens_per_expert = alloc_tensor({args->num_experts}, dl_int32, routing_logits->device);
+    num_tokens_per_expert = alloc_tensor({args->num_experts}, dl_int32, routing_logits.device());
 
-    total_num_padded_tokens = alloc_tensor({1}, dl_int32, routing_logits->device);
+    total_num_padded_tokens = alloc_tensor({1}, dl_int32, routing_logits.device());
 
     expanded_idx_to_permuted_idx =
-        alloc_tensor({args->num_tokens * args->top_k}, dl_int32, routing_logits->device);
+        alloc_tensor({args->num_tokens * args->top_k}, dl_int32, routing_logits.device());
 
     permuted_idx_to_token_idx =
-        alloc_tensor({max_num_padded_tokens}, dl_int32, routing_logits->device);
+        alloc_tensor({max_num_padded_tokens}, dl_int32, routing_logits.device());
 
     expert_indexes =
-        alloc_tensor({args->num_tokens, args->top_k}, dl_int32, routing_logits->device);
+        alloc_tensor({args->num_tokens, args->top_k}, dl_int32, routing_logits.device());
 
     // expert_weights allocation should be done by derived class since data type could vary
 
@@ -243,33 +244,34 @@ class FusedMoeLauncher {
     expert_count_histogram = alloc_tensor({size_of_expert_count_histogram},
                                           dl_int32,  // 256 is the max number of threads per block
                                                      // and max number of experts
-                                          routing_logits->device);
+                                          routing_logits.device());
 
     int32_t max_num_ctas = tensorrt_llm::kernels::trtllmgen_moe::Routing::getMaxNumCtasInBatchDim(
         args->num_tokens, args->top_k, args->num_experts, tile_tokens_dim);
 
-    cta_idx_xy_to_batch_idx = alloc_tensor({max_num_ctas}, dl_int32, routing_logits->device);
+    cta_idx_xy_to_batch_idx = alloc_tensor({max_num_ctas}, dl_int32, routing_logits.device());
 
-    cta_idx_xy_to_mn_limit = alloc_tensor({max_num_ctas}, dl_int32, routing_logits->device);
+    cta_idx_xy_to_mn_limit = alloc_tensor({max_num_ctas}, dl_int32, routing_logits.device());
 
-    num_non_exiting_ctas = alloc_tensor({1}, dl_int32, routing_logits->device);
+    num_non_exiting_ctas = alloc_tensor({1}, dl_int32, routing_logits.device());
 
-    workspace.total_num_padded_tokens = static_cast<int*>(total_num_padded_tokens->data);
+    workspace.total_num_padded_tokens = static_cast<int*>(total_num_padded_tokens.data_ptr());
     workspace.total_max_padded_tokens = max_num_padded_tokens;
     workspace.ProjUpTileN = tile_tokens_dim;
-    workspace.routing_expert_indexes = static_cast<int*>(expert_indexes->data);
-    workspace.permuted_idx_size = static_cast<int*>(total_num_padded_tokens->data);
-    workspace.expanded_idx_to_permuted_idx = static_cast<int*>(expanded_idx_to_permuted_idx->data);
-    workspace.permuted_idx_to_token_idx = static_cast<int*>(permuted_idx_to_token_idx->data);
+    workspace.routing_expert_indexes = static_cast<int*>(expert_indexes.data_ptr());
+    workspace.permuted_idx_size = static_cast<int*>(total_num_padded_tokens.data_ptr());
+    workspace.expanded_idx_to_permuted_idx =
+        static_cast<int*>(expanded_idx_to_permuted_idx.data_ptr());
+    workspace.permuted_idx_to_token_idx = static_cast<int*>(permuted_idx_to_token_idx.data_ptr());
     // workspace.expert_weights will be set by derived class after expert_weights allocation
-    workspace.cta_idx_xy_to_batch_idx = static_cast<int*>(cta_idx_xy_to_batch_idx->data);
-    workspace.cta_idx_xy_to_mn_limit = static_cast<int*>(cta_idx_xy_to_mn_limit->data);
-    workspace.num_non_exiting_ctas = static_cast<int*>(num_non_exiting_ctas->data);
+    workspace.cta_idx_xy_to_batch_idx = static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr());
+    workspace.cta_idx_xy_to_mn_limit = static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr());
+    workspace.num_non_exiting_ctas = static_cast<int*>(num_non_exiting_ctas.data_ptr());
   }
 
   void check_moe_common() const {
     // Hidden states [num_tokens, hidden_size]
-    TVM_FFI_ICHECK_EQ(hidden_states->ndim, 2) << "hidden_states must be 2D.";
+    TVM_FFI_ICHECK_EQ(hidden_states.ndim(), 2) << "hidden_states must be 2D.";
   }
 
   // MoE computation phase workspace tensors (allocated in prepare_moe() or prepare_moe_common())
@@ -297,10 +299,10 @@ class FusedMoeLauncher {
     this->moe_tactic = moe_tactic;
 
     auto workspace_sizes = moe_runner->getWorkspaceSizeInBytes(*args, moe_tactic);
-    workspace_fc1 = alloc_tensor({std::get<0>(workspace_sizes)}, dl_int8, hidden_states->device);
-    workspace_fc2 = alloc_tensor({std::get<1>(workspace_sizes)}, dl_int8, hidden_states->device);
-    workspace.bmm1_workspace = workspace_fc1->data;
-    workspace.bmm2_workspace = workspace_fc2->data;
+    workspace_fc1 = alloc_tensor({std::get<0>(workspace_sizes)}, dl_int8, hidden_states.device());
+    workspace_fc2 = alloc_tensor({std::get<1>(workspace_sizes)}, dl_int8, hidden_states.device());
+    workspace.bmm1_workspace = workspace_fc1.data_ptr();
+    workspace.bmm2_workspace = workspace_fc2.data_ptr();
   }
 
  public:
@@ -318,29 +320,31 @@ class FusedMoeLauncher {
 
     // Execute routing
     tensorrt_llm::kernels::trtllmgen_moe::Routing::Runner routing_runner(tile_tokens_dim);
-    cudaStream_t routing_stream = get_stream(routing_logits->device);
-    routing_runner.run(routing_logits->data, args->routing_bias, args->num_tokens,
-                       args->num_experts, args->top_k, args->n_group, args->topk_group,
-                       args->local_expert_offset, args->local_num_experts,
-                       args->routed_scaling_factor, static_cast<int*>(expert_indexes->data),
-                       static_cast<int*>(expert_count_histogram->data),
-                       static_cast<int*>(total_num_padded_tokens->data),
-                       static_cast<int*>(expanded_idx_to_permuted_idx->data),
-                       nullptr /*permuted_idx_to_expanded_idx->data*/,
-                       static_cast<int*>(permuted_idx_to_token_idx->data), expert_weights->data,
-                       static_cast<int*>(num_tokens_per_expert->data),
-                       static_cast<int*>(cta_idx_xy_to_batch_idx->data),
-                       static_cast<int*>(cta_idx_xy_to_mn_limit->data),
-                       static_cast<int*>(num_non_exiting_ctas->data), args->mDtypeElt, false, true,
-                       static_cast<RoutingMethodType>(routing_method_type), routing_stream);
+    cudaStream_t routing_stream = get_stream(routing_logits.device());
+    routing_runner.run(
+        routing_logits.data_ptr(), args->routing_bias, args->num_tokens, args->num_experts,
+        args->top_k, args->n_group, args->topk_group, args->local_expert_offset,
+        args->local_num_experts, args->routed_scaling_factor,
+        static_cast<int*>(expert_indexes.data_ptr()),
+        static_cast<int*>(expert_count_histogram.data_ptr()),
+        static_cast<int*>(total_num_padded_tokens.data_ptr()),
+        static_cast<int*>(expanded_idx_to_permuted_idx.data_ptr()),
+        nullptr /*permuted_idx_to_expanded_idx.data_ptr()*/,
+        static_cast<int*>(permuted_idx_to_token_idx.data_ptr()), expert_weights.data_ptr(),
+        static_cast<int*>(num_tokens_per_expert.data_ptr()),
+        static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr()),
+        static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr()),
+        static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt, args->mDtypeExpW,
+        false /* use_routing_scales_on_input */, false /* use_deep_seek_fp8 */,
+        static_cast<RoutingMethodType>(routing_method_type), routing_stream);
 
     check_moe();
     // if moe_tactic is -1, it will be set to the default valid config index
     prepare_moe(moe_tactic);
 
     // Execute MoE
-    cudaStream_t moe_stream = get_stream(hidden_states->device);
-    moe_runner->run(*args, workspace, hidden_states->device.device_id, moe_stream, moe_tactic,
+    cudaStream_t moe_stream = get_stream(hidden_states.device());
+    moe_runner->run(*args, workspace, hidden_states.device().device_id, moe_stream, moe_tactic,
                     enable_pdl);
 
     if (args->do_finalize) {
@@ -357,7 +361,7 @@ void FusedMoeLauncher::init_common(
     int64_t tile_tokens_dim, int64_t routing_method_type, bool use_shuffled_weight,
     int64_t weight_layout, int64_t gated_act_type) {
   // Check devicearchitecture: Blackwell (SM 10.x) required
-  auto device = hidden_states->device.device_id;
+  auto device = hidden_states.device().device_id;
   int major = 0, minor = 0;
   cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
   cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device);
@@ -373,11 +377,11 @@ void FusedMoeLauncher::init_common(
   this->gemm1_weights = gemm1_weights;
   this->gemm2_weights = gemm2_weights;
 
-  args->routing_logits = routing_logits->data;
-  args->routing_bias = routing_bias.has_value() ? routing_bias.value()->data : nullptr;
-  args->hidden_states = hidden_states->data;
-  args->gemm1_weights = gemm1_weights->data;
-  args->gemm2_weights = gemm2_weights->data;
+  args->routing_logits = routing_logits.data_ptr();
+  args->routing_bias = routing_bias.has_value() ? routing_bias.value().data_ptr() : nullptr;
+  args->hidden_states = hidden_states.data_ptr();
+  args->gemm1_weights = gemm1_weights.data_ptr();
+  args->gemm2_weights = gemm2_weights.data_ptr();
 
   this->args = std::move(args);
   this->tile_tokens_dim = tile_tokens_dim;
@@ -385,7 +389,7 @@ void FusedMoeLauncher::init_common(
   this->use_shuffled_weight = use_shuffled_weight;
   TVM_FFI_ICHECK(0 <= weight_layout && weight_layout <= 2)
       << "the value of weight_layout is not recognized";
-  this->weight_layout = static_cast<MatrixLayout>(weight_layout);
+  this->weight_layout = static_cast<batchedGemm::gemm::MatrixLayout>(weight_layout);
   TVM_FFI_ICHECK(0 <= gated_act_type && gated_act_type <= 1)
       << "the value of gated_act_type is not recognized";
   this->gated_act_type = static_cast<GatedActType>(gated_act_type);
@@ -424,15 +428,15 @@ class Bf16MoeLauncher : public FusedMoeLauncher {
 
     auto const routing_bias_dtype = dl_bfloat16;
     expert_weights =
-        alloc_tensor({args->num_tokens, args->top_k}, routing_bias_dtype, routing_logits->device);
+        alloc_tensor({args->num_tokens, args->top_k}, routing_bias_dtype, routing_logits.device());
 
-    workspace.expert_weights = expert_weights->data;
+    workspace.expert_weights = expert_weights.data_ptr();
   }
 
   void check_moe() const override {
     FusedMoeLauncher::check_moe_common();
 
-    TVM_FFI_ICHECK(weight_layout == MatrixLayout::BlockMajorK)
+    TVM_FFI_ICHECK(weight_layout == batchedGemm::gemm::MatrixLayout::BlockMajorK)
         << "BF16 Moe: weight_layout must be BlockMajorK";
     check_weights_shape("gemm1");
     check_weights_shape("gemm2");
@@ -448,23 +452,23 @@ class Bf16MoeLauncher : public FusedMoeLauncher {
 
     int32_t max_num_padded_tokens = workspace.total_max_padded_tokens;
     gemm1_output = alloc_tensor({max_num_padded_tokens, args->intermediate_size}, dl_bfloat16,
-                                hidden_states->device);
+                                hidden_states.device());
     activation_output = alloc_tensor({max_num_padded_tokens, args->intermediate_size}, dl_bfloat16,
-                                     hidden_states->device);
+                                     hidden_states.device());
     gemm2_output = alloc_tensor({max_num_padded_tokens, args->hidden_size}, dl_bfloat16,
-                                hidden_states->device);
+                                hidden_states.device());
 
     workspace.hidden_states_scale_linear = nullptr;
-    workspace.gemm1_output = gemm1_output->data;
+    workspace.gemm1_output = gemm1_output.data_ptr();
     workspace.gemm1_output_scale = nullptr;  // BF16 doesn't use scale tensors
-    workspace.activation_output = activation_output->data;
+    workspace.activation_output = activation_output.data_ptr();
     workspace.activation_output_scale = nullptr;  // BF16 doesn't use scale tensors
-    workspace.gemm2_output = gemm2_output->data;
+    workspace.gemm2_output = gemm2_output.data_ptr();
     workspace.gemm2_output_scale = nullptr;
 
     output =
-        alloc_tensor({args->num_tokens, args->hidden_size}, dl_bfloat16, hidden_states->device);
-    args->output = output->data;
+        alloc_tensor({args->num_tokens, args->hidden_size}, dl_bfloat16, hidden_states.device());
+    args->output = output.data_ptr();
     args->output_scale = nullptr;
   }
 };
@@ -478,24 +482,24 @@ Tensor trtllm_bf16_moe(Tensor const& routing_logits, Optional<Tensor> const& rou
                        bool use_shuffled_weight, int64_t weight_layout, int64_t moe_tactic,
                        bool enable_pdl) {
   // Just some basic type validation first and leave more checks to the launcher
-  TVM_FFI_ICHECK(routing_logits->dtype == dl_float32 || routing_logits->dtype == dl_bfloat16)
+  TVM_FFI_ICHECK(routing_logits.dtype() == dl_float32 || routing_logits.dtype() == dl_bfloat16)
       << "BF16 MoE: routing_logits must be bfloat16 or float.";
   if (routing_bias.has_value()) {
-    TVM_FFI_ICHECK_EQ(routing_bias.value()->dtype, dl_bfloat16)
+    TVM_FFI_ICHECK_EQ(routing_bias.value().dtype(), dl_bfloat16)
         << "BF16 MoE: routing_bias must be bfloat16.";
   }
-  TVM_FFI_ICHECK_EQ(hidden_states->dtype, dl_bfloat16)
+  TVM_FFI_ICHECK_EQ(hidden_states.dtype(), dl_bfloat16)
       << "BF16 MoE: hidden_states must be bfloat16.";
-  TVM_FFI_ICHECK_EQ(gemm1_weights->dtype, dl_bfloat16)
+  TVM_FFI_ICHECK_EQ(gemm1_weights.dtype(), dl_bfloat16)
       << "BF16 MoE: gemm1_weights must be bfloat16.";
-  TVM_FFI_ICHECK_EQ(gemm2_weights->dtype, dl_bfloat16)
+  TVM_FFI_ICHECK_EQ(gemm2_weights.dtype(), dl_bfloat16)
       << "BF16 MoE: gemm2_weights must be bfloat16.";
 
   // Save params to MoE arguments
   auto args = std::make_unique<tensorrt_llm::kernels::trtllmgen_moe::MoE::MoERunnerArgs>();
-  args->num_tokens = hidden_states->shape[0];
+  args->num_tokens = hidden_states.size(0);
   args->num_experts = num_experts;
-  args->hidden_size = hidden_states->shape[1];
+  args->hidden_size = hidden_states.size(1);
   args->hidden_size_output = args->hidden_size;
   args->top_k = top_k;
   args->n_group = n_group;
