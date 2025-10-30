@@ -167,6 +167,7 @@ def ref_attention(
     get_compute_capability(torch.device(device="cuda"))[0] not in [9, 10, 12],
     reason="XQA is only supported on SM90, SM100, SM120 GPUs",
 )
+@pytest.mark.parametrize("enable_pdl", [True, False])
 @pytest.mark.parametrize("use_sliding_window", [True, False])
 @pytest.mark.parametrize("input_type", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("fp8_kv_cache", [True, False])
@@ -188,6 +189,7 @@ def test_xqa(
     head_grp_size,
     use_attention_sinks,
     use_sliding_window,
+    enable_pdl,
 ):
     set_random_seed(42)
 
@@ -341,6 +343,7 @@ def test_xqa(
         kv_scale=kv_cache_scale,
         sliding_win_size=sliding_win_size,
         sm_count=sm_count,
+        enable_pdl=enable_pdl,
     )
 
     for req in range(batch_size):
@@ -407,6 +410,7 @@ def test_xqa(
     get_compute_capability(torch.device(device="cuda"))[0] not in [12],
     reason="XQA mla is only supported on SM120 GPUs",
 )
+@pytest.mark.parametrize("enable_pdl", [True, False])
 @pytest.mark.parametrize("seq_len", [2, 15, 256, 514, 2048])
 @pytest.mark.parametrize("batch_size", [1, 2])
 @pytest.mark.parametrize("tokens_per_page", [32, 64])
@@ -414,6 +418,7 @@ def test_xqa_mla(
     batch_size,
     seq_len,
     tokens_per_page,
+    enable_pdl,
 ):
     set_random_seed(42)
 
@@ -555,6 +560,7 @@ def test_xqa_mla(
         q_scale=q_scale,
         kv_scale=kv_cache_scale,
         sm_count=sm_count,
+        enable_pdl=enable_pdl,
     )
 
     for req in range(batch_size):

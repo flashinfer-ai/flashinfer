@@ -2216,6 +2216,122 @@ def trtllm_batch_decode_with_kv_cache(
     else:
         raise ValueError(f"Invalid out_dtype: {out_dtype}")
 
+    run_func(
+        out,
+        out_scale_factor,
+        query.view(
+            query.size(0) // q_len_per_req,
+            q_len_per_req,
+            query.size(1),
+            query.size(2),
+        ),
+        k_cache,
+        v_cache,
+        workspace_buffer,
+        block_tables,
+        seq_lens,
+        max_seq_len,
+        bmm1_scale,
+        bmm2_scale,
+        o_sf_scale or -1.0,
+        o_sf_vec_size or -1,
+        o_sf_start_index,
+        window_left,
+        sm_count,
+        enable_pdl,
+        workspace_buffer.numel() * workspace_buffer.element_size(),
+        sinks,
+    )
+
+    return (
+        out
+        if out_dtype != "nvfp4"
+        else FP4Tensor(out, out_scale_factor, o_sf_start_index, query.shape)
+    )
+
+
+# xqa uses NHD layout
+def xqa_batch_decode_with_kv_cache(
+    query: torch.Tensor,
+    kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+    workspace_buffer: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_seq_len: int,
+    bmm1_scale: float,
+    bmm2_scale: float,
+    window_left: int = -1,
+    out: Optional[torch.Tensor] = None,
+    sinks: Optional[torch.Tensor] = None,
+    enable_pdl: bool = None,
+    q_len_per_req: Optional[int] = 1,
+) -> torch.Tensor:
+    """
+    Parameters
+    ----------
+    query : torch.Tensor
+        query tensor with shape [num_tokens, num_heads, head_dim], num_tokens = batch_size * q_len_per_request
+
+    kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        If kv_cache is a single tensor, it should be a tensor with shape [num_pages, 1 or 2, page_size, num_kv_heads, head_dim]
+        If kv_cache is a tuple of two tensors, it should be a tuple of two tensors with shape [num_pages, page_size, num_kv_heads, head_dim]
+
+    workspace_buffer : torch.Tensor. Must be initialized to 0 for its first use.
+        workspace
+
+    block_tables : torch.Tensor
+        page_table of kv cache, [batch_size, num_pages]
+
+    seq_lens : torch.Tensor
+        A uint32 1D tensor indicating the kv sequence length of each prompt. shape: ``[batch_size]``
+
+    max_seq_len : int
+        max sequence length for kv_cache
+
+    bmm1_scale : float
+        fused scale for bmm1 input.
+
+    bmm2_scale : float
+        fused scale for bmm2 input.
+
+    window_left : int = -1
+        The left (inclusive) window size for the attention window, when set to ``-1``, the window
+        size will be set to the full length of the sequence. Defaults to ``-1``.
+
+    out :  Optional[torch.Tensor] = None
+        output tensor, if not provided, will be allocated with ``query.dtype``.
+
+    sinks : Optional[torch.Tensor] = None
+        additional value per head in the denominator of the softmax.
+
+    enable_pdl : bool
+        Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
+        Only supported for >= sm90, and currently only for FA2, CUDA core, and trtllm-gen decode.
+
+    Returns
+    -------
+    out : torch.Tensor
+        output torch.Tensor.
+    """
+    enable_pdl = device_support_pdl(query.device) if enable_pdl is None else enable_pdl
+
+    assert q_len_per_req == 1, "xqa not support speculative decoding yet"
+
+    if isinstance(kv_cache, tuple):
+        k_cache, v_cache = kv_cache
+    else:
+        if kv_cache.shape[1] == 1:
+            k_cache, v_cache = kv_cache, kv_cache
+        else:
+            assert kv_cache.shape[1] == 2, (
+                "When kv_cache is a single tensor, the second dimension must be 1 or 2"
+            )
+            # NOTE(Zihao): unbind transforms [num_pages, 2, ...] to ([num_pages, ...], [num_pages, ...])
+            # it doesn't change underlying storage
+            k_cache, v_cache = kv_cache.unbind(dim=1)
+
+    sm_count = get_device_sm_count(query.device)
+
     bmm1_scale = (
         bmm1_scale.item() if isinstance(bmm1_scale, torch.Tensor) else bmm1_scale
     )
@@ -2223,70 +2339,42 @@ def trtllm_batch_decode_with_kv_cache(
         bmm2_scale.item() if isinstance(bmm2_scale, torch.Tensor) else bmm2_scale
     )
 
-    # To decide if using xqa to decode
-    if (
-        get_compute_capability(torch.device(device="cuda"))[0] in [9, 12]
-        and out_dtype != "nvfp4"
-        and query.dtype in [torch.float16, torch.bfloat16]
-    ):
-        num_kv_heads = k_cache.shape[1]
-        page_size = k_cache.shape[2]
-        head_dim = k_cache.shape[3]
-        workspace_0, workspace_1 = torch.chunk(workspace_buffer, 2, dim=0)
-        kv_scale_value = bmm2_scale
-        q_scale_value = bmm1_scale / kv_scale_value * (head_dim**0.5)
-        xqa(
-            query,
-            k_cache.reshape(-1, head_dim),
-            v_cache.reshape(-1, head_dim),
-            block_tables,
-            seq_lens,
-            out,
-            workspace_0,
-            workspace_1,
-            num_kv_heads,
-            page_size,
-            sinks=sinks,
-            q_scale=q_scale_value,
-            kv_scale=torch.tensor(
-                [kv_scale_value], dtype=torch.float32, device=query.device
-            ),
-            sliding_win_size=window_left + 1 if window_left >= 0 else 0,
-            sm_count=sm_count,
-        )
-    else:
-        run_func(
-            out,
-            out_scale_factor,
-            query.view(
-                query.size(0) // q_len_per_req,
-                q_len_per_req,
-                query.size(1),
-                query.size(2),
-            ),
-            k_cache,
-            v_cache,
-            workspace_buffer,
-            block_tables,
-            seq_lens,
-            max_seq_len,
-            bmm1_scale,
-            bmm2_scale,
-            o_sf_scale or -1.0,
-            o_sf_vec_size or -1,
-            o_sf_start_index,
-            window_left,
-            sm_count,
-            enable_pdl,
-            workspace_buffer.numel() * workspace_buffer.element_size(),
-            sinks,
-        )
+    num_kv_heads = k_cache.shape[2]
+    page_size = k_cache.shape[1]
+    head_dim = k_cache.shape[3]
+    workspace_0, workspace_1 = torch.chunk(workspace_buffer, 2, dim=0)
+    kv_scale_value = bmm2_scale
+    q_scale_value = bmm1_scale / kv_scale_value * (head_dim**0.5)
 
-    return (
-        out
-        if out_dtype != "nvfp4"
-        else FP4Tensor(out, out_scale_factor, o_sf_start_index, query.shape)
+    k_cache_new = k_cache.reshape(-1, head_dim).contiguous()
+    v_cache_new = v_cache.reshape(-1, head_dim).contiguous()
+    query_new = query.unsqueeze(1).contiguous()
+    seq_lens_new = seq_lens.unsqueeze(1).contiguous()
+    sinks_new = (
+        sinks.reshape(num_kv_heads, -1).contiguous() if sinks is not None else None
     )
+
+    xqa(
+        query_new,
+        k_cache_new,
+        v_cache_new,
+        block_tables,
+        seq_lens_new,
+        out,
+        workspace_0,
+        workspace_1,
+        num_kv_heads,
+        page_size,
+        sinks=sinks_new,
+        q_scale=q_scale_value,
+        kv_scale=torch.tensor(
+            [kv_scale_value], dtype=torch.float32, device=query.device
+        ),
+        sliding_win_size=window_left + 1 if window_left >= 0 else 0,
+        sm_count=sm_count,
+    )
+
+    return out
 
 
 def _check_trtllm_gen_mla_shape(
@@ -2425,7 +2513,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
                 "Dynamic scale factors bmm1_scale_tensor and bmm2_scale_tensor are only supported for fp8 tensor core operation"
             )
 
-    # To decide if using xqa_mla to decode
+    # To decide if using xqa_mla to decode, not verified yet
     if (
         get_compute_capability(torch.device(device="cuda"))[0] == 12
         and query.dtype == torch.float8_e4m3fn
@@ -2464,6 +2552,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
                 [kv_scale_value], dtype=torch.float32, device=query.device
             ),
             sm_count=sm_count,
+            enable_pdl=enable_pdl,
         )
     else:
         run_func(
