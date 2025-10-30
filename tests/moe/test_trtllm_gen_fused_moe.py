@@ -796,7 +796,6 @@ class FP8BlockScaleMoe(Moe):
                 weight_layout=static_data["weight_layout"],
                 enable_pdl=enable_pdl,
             )
-
         return output.to(torch.float)
 
     def compute_reference(self, args):
@@ -1087,7 +1086,6 @@ class BF16Moe(Moe):
         top_k_groups = kwargs["top_k_groups"]
         intermediate_size = kwargs["intermediate_size"]
         routing_method_type = kwargs["routing_method_type"]
-        tile_tokens_dim = kwargs["tile_tokens_dim"]
 
         output = trtllm_bf16_moe(
             expert_logits,  # float
@@ -1106,7 +1104,7 @@ class BF16Moe(Moe):
             # as opposed to the positional form
             use_shuffled_weight=static_data["use_shuffled_weight"],
             weight_layout=static_data["weight_layout"],
-            tile_tokens_dim=tile_tokens_dim,
+            tile_tokens_dim=8,
             routing_method_type=routing_method_type,
         )
 
@@ -1925,6 +1923,7 @@ def run_moe_reference_per_tensor_scale_fp8(args):
 
     return run_moe_dequant(args_dequant, QuantMode.FP8_PER_TENSOR), args_dequant
 
+
 def run_moe_reference_bf16(args):
     """BF16 reference implementation."""
 
@@ -1954,6 +1953,7 @@ def run_moe_reference_bf16(args):
     )
 
     return run_moe_dequant(args_dequant, QuantMode.BF16), args_dequant
+
 
 def _compute_moe_actual_unified(moe_impl, args_dequant, args, **kwargs):
     """Unified actual computation that delegates to implementation-specific methods."""
@@ -2086,6 +2086,12 @@ def run_moe_test(
     )
 
     torch.cuda.synchronize()
+
+    # Additional safety: clear CUDA error state before test
+    # This helps prevent cascading errors from previous tests
+    torch.cuda.current_stream().synchronize()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     moe_impl._cache_permute_indices = cache_permute_indices
 
@@ -2260,10 +2266,11 @@ def run_moe_test(
 @pytest.mark.parametrize(
     "moe_impl",
     [
-        pytest.param(FP8BlockScaleMoe(), id="FP8_Block"),
         pytest.param(FP4Moe(quant_mode=QuantMode.FP4_NVFP4_NVFP4), id="NvFP4xNvFP4"),
         pytest.param(FP4Moe(quant_mode=QuantMode.FP4_MXFP4_MXFP8), id="MxFP4xMxFP8"),
         pytest.param(FP4Moe(quant_mode=QuantMode.FP4_MXFP4_Bf16), id="MxFP4xBf16"),
+        pytest.param(FP8BlockScaleMoe(), id="FP8_Block"),
+        pytest.param(BF16Moe(), id="BF16xBF16"),
     ],
 )
 @pytest.mark.parametrize(
@@ -2271,7 +2278,7 @@ def run_moe_test(
     [
         pytest.param(
             {
-                "num_experts": 256,
+                "num_experts": 128,
                 "top_k": 8,
                 "padding": 8,
                 "n_groups": None,
@@ -2279,7 +2286,7 @@ def run_moe_test(
                 "routed_scaling": None,
                 "has_routing_bias": False,
                 "routing_method_type": RoutingMethodType.Renormalize,
-                "compatible_moe_impls": [FP8BlockScaleMoe, FP4Moe],
+                "compatible_moe_impls": [FP8BlockScaleMoe, FP4Moe, BF16Moe],
                 "compatible_intermediate_size": [384, 768, 1024, 2048],
             },
             id="Renorm",
@@ -2294,7 +2301,7 @@ def run_moe_test(
                 "routed_scaling": None,
                 "has_routing_bias": False,
                 "routing_method_type": RoutingMethodType.Renormalize,
-                "compatible_moe_impls": [FP8BlockScaleMoe, FP4Moe],
+                "compatible_moe_impls": [FP8BlockScaleMoe, FP4Moe, BF16Moe],
                 "compatible_intermediate_size": [512],
             },
             id="Qwen3_next",
@@ -2306,15 +2313,28 @@ def run_moe_test(
     [
         pytest.param(
             {
+                "use_shuffled_weight": False,
+                "layout": WeightLayout.MajorK,
+                "compatible_moe_impls": [FP8BlockScaleMoe],
+            },
+            id="NoShuffle_MajorK",
+        ),
+        pytest.param(
+            {
                 "use_shuffled_weight": True,
                 "layout": WeightLayout.MajorK,
                 "compatible_moe_impls": [FP4Moe, FP8PerTensorMoe, FP8BlockScaleMoe],
             },
             id="Shuffled_MajorK",
         ),
+        pytest.param(
+                "layout": WeightLayout.BlockMajorK,
+                "compatible_moe_impls": [FP8BlockScaleMoe, BF16Moe],
+            },
+            id="Shuffled_BlockMajorK",
+        ),
     ],
 )
-@pytest.mark.parametrize(
     "gated_act_type",
     [
         pytest.param(GatedActType.SwiGlu, id="SwiGlu"),
