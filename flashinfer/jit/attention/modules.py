@@ -1869,3 +1869,18 @@ def gen_cudnn_fmha_module():
             f'-DCUDNN_SDPA_CUBIN_PATH=\\"{ArtifactPath.CUDNN_SDPA}\\"',
         ],
     )
+
+
+# WIP
+def gen_trtllm_fmha_v2_module():
+    source_paths = [
+        jit_env.FLASHINFER_CSRC_DIR / "trtllm_fmha_v2_kernel_launcher.cu",
+    ]
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[10, 11, 12]
+    )
+    return gen_jit_spec(
+        "fmha_v2_gen",
+        source_paths,
+        extra_cuda_cflags=nvcc_flags,
+    )
