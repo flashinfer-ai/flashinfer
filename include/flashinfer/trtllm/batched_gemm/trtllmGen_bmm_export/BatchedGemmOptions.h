@@ -260,8 +260,10 @@ inline bool checkAndUpdateBatchedGemmOptions(BatchedGemmOptions& options, bool i
 
   if (options.mRouteSfsImpl.has_value() && options.mRouteSfsImpl.value() != options.mRouteImpl) {
     TLLM_CHECK_ERROR(
-        options.mRouteSfsImpl.value() == RouteImpl::Ldgsts && options.mRouteImpl == RouteImpl::Tma,
-        "RouteSfsImpl must be equal to RouteImpl, or Ldgsts, when RouteImpl is Tma");
+        (options.mRouteSfsImpl.value() == RouteImpl::Ldgsts ||
+         options.mRouteSfsImpl.value() == RouteImpl::LdgPlusSts) &&
+            options.mRouteImpl == RouteImpl::Tma,
+        "RouteSfsImpl must be equal to RouteImpl, or Ldgsts/LdgPlusSts, when RouteImpl is Tma");
   } else if (!options.mRouteSfsImpl.has_value()) {
     if (updateOptions) {
       options.mRouteSfsImpl = options.mRouteImpl;
@@ -269,6 +271,15 @@ inline bool checkAndUpdateBatchedGemmOptions(BatchedGemmOptions& options, bool i
       TLLM_LOG_ERROR("RouteSfsImpl must be specified");
       return false;
     }
+  }
+
+  TLLM_CHECK_ERROR(options.mRouteImpl != RouteImpl::LdgPlusSts,
+                   "LdgPlusSts does not support routing the tokens");
+
+  if (options.mRouteSfsImpl.has_value() && options.mRouteSfsImpl.value() == RouteImpl::LdgPlusSts) {
+    TLLM_CHECK_ERROR(!batchM, "LdgPlusSts only supports batch N");
+    TLLM_CHECK_ERROR(options.mTileK <= 512 && options.mTileK >= 128,
+                     "LdgPlusSts only supports 128 <= tileK <= 512");
   }
 
   if (batchM) {

@@ -24,29 +24,22 @@
 #include "trtllm/gen/CudaKernelLauncher.h"
 
 #ifdef TLLM_GEN_EXPORT_INTERFACE
+#ifdef TLLM_GEN_EXPORT_FLASHINFER
 #include "flashinferMetaInfo.h"
+#else
+#include "KernelMetaInfo.h"
+#endif  // TLLM_GEN_EXPORT_FLASHINFER
 #endif  // TLLM_GEN_EXPORT_INTERFACE
 
-#include "flashinfer/trtllm/common.h"
-#ifdef TLLM_GEN_BMM_CUBIN_PATH
-static const std::string tllm_gen_bmm_cubin_path = std::string(TLLM_GEN_BMM_CUBIN_PATH);
-#else
-static_assert(false, "TLLM_GEN_BMM_CUBIN_PATH macro is not defined when compiling");
-#endif
-
-namespace flashinfer::trtllm_cubin_loader {
-std::string getCubin(const std::string& kernelName, const std::string& sha256);
-}
-
 namespace batchedGemm {
 
 namespace batchedGemm {
 
-//////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
 //
 // BatchedGemmData
 //
-//////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
 
 struct BatchedGemmData {
   struct ProblemDimensions {
@@ -448,11 +441,11 @@ struct BatchedGemmData {
   OutputBuffers mOutputBuffers;
 };
 
-//////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
 //
 // BatchedGemmInterface
 //
-//////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
 
 class BatchedGemmInterface {
  public:
@@ -530,18 +523,12 @@ class BatchedGemmInterface {
     if (config.mData == nullptr) {
       batchedGemmConfig = generateAndCompileKernel(batchedGemmConfig);
     }
+    TLLM_CHECK_ERROR(batchedGemmConfig.mCudaRunner != nullptr, "CudaRunner is not set");
+    batchedGemmConfig.mCudaRunner->run((void*)&kernelParams, (void*)cudaStream, grid,
+                                       /* cluster */ {},
+                                       /* instanceId */ batchedGemmConfig.mInstanceIdx);
+    return 0;
 #endif
-    auto fiModuleLoadData = [&](CUmodule* module) {
-      const std::string sha256 = config.mHash ? config.mHash : "";
-      std::string fname_cubin = config.mFunctionName;
-      if (!fname_cubin.empty()) {
-        fname_cubin[0] =
-            static_cast<char>(std::toupper(static_cast<unsigned char>(fname_cubin[0])));
-      }
-      fname_cubin = tllm_gen_bmm_cubin_path + "/" + fname_cubin + ".cubin";
-      std::string cubin = flashinfer::trtllm_cubin_loader::getCubin(fname_cubin, sha256);
-      cuErrCheck(cuModuleLoadData(module, cubin.c_str()));
-    };
 
     CUmodule cuModule;
     CUfunction cuFunction;
@@ -567,12 +554,12 @@ class BatchedGemmInterface {
       if (module != moduleCacheRef.end()) {
         cuFunction = std::get<1>(module->second);
       } else {
-        fiModuleLoadData(&cuModule);
+        gemm::loadCubinData(&cuModule, batchedGemmConfig);
         cuModuleGetFunction(&cuFunction, cuModule, batchedGemmConfig.mFunctionName);
         moduleCacheRef.insert(std::make_pair(moduleKey, std::make_tuple(cuModule, cuFunction)));
       }
     } else {
-      fiModuleLoadData(&cuModule);
+      gemm::loadCubinData(&cuModule, batchedGemmConfig);
       cuModuleGetFunction(&cuFunction, cuModule, batchedGemmConfig.mFunctionName);
     }
 
@@ -808,10 +795,10 @@ class BatchedGemmInterface {
   int32_t mNumRotations;
 };
 
-//////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
 
 }  // namespace batchedGemm
 
-//////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
 
 }  // namespace batchedGemm

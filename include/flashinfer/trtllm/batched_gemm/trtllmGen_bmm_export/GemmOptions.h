@@ -30,7 +30,14 @@
 #include "trtllm/gen/CudaRunner.h"
 #include "trtllm/gen/GenCtx.h"
 #else
+#ifdef TLLM_GEN_EXPORT_FLASHINFER
+#include <string>
+namespace flashinfer::trtllm_cubin_loader {
+std::string getCubin(const std::string& kernelName, const std::string& sha256);
+}
+#endif  // TLLM_GEN_EXPORT_FLASHINFER
 #include <iostream>
+namespace batchedGemm {
 
 template <typename T>
 void printArgs(T arg) {
@@ -71,8 +78,6 @@ void printArgs(T first, Args... args) {
 #define TLLM_LOG_INFO(...) TLLM_CHECK_WARNING(false, __VA_ARGS__)
 
 #endif  // TLLM_GEN_EXPORT_INTERFACE
-
-namespace batchedGemm {
 
 namespace trtllm {
 namespace gen {
@@ -1467,6 +1472,31 @@ inline bool getKernelDoesScaleC(tg::Dtype dtypeA, tg::Dtype dtypeB, tg::Dtype dt
   // scaling factor (called scaleC). As a result, we combine the logic for getDoesScaleAb and
   // getDoesScaleC.
   return getDoesScaleC(dtypeC) || getDoesScaleAb(dtypeA, dtypeB, useDeepSeekFp8);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename Config>
+inline CUresult loadCubinData(CUmodule* module, Config const& config) {
+  // Trtllm links the cubin into the executable while Flashinfer loads the cubin from storage.
+#ifdef TLLM_GEN_EXPORT_FLASHINFER
+#ifdef TLLM_GEN_GEMM_CUBIN_PATH
+  static const std::string tllm_gen_gemm_cubin_path = std::string(TLLM_GEN_GEMM_CUBIN_PATH);
+  const std::string sha256 = config.mHash ? config.mHash : "";
+  std::string fileName = config.mFunctionName;
+  if (!fileName.empty()) {
+    fileName[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(fileName[0])));
+  }
+  const std::string& data = flashinfer::trtllm_cubin_loader::getCubin(
+      tllm_gen_gemm_cubin_path + "/" + fileName + ".cubin", sha256);
+  CUresult result = cuModuleLoadData(module, data.c_str());
+#else
+  static_assert(false, "TLLM_GEN_GEMM_CUBIN_PATH macro is not defined when compiling");
+#endif  // TLLM_GEN_GEMM_CUBIN_PATH
+#else
+  CUresult result = cuModuleLoadData(module, config.mData);
+#endif  // TLLM_GEN_EXPORT_FLASHINFER
+  return result;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
