@@ -877,6 +877,7 @@ def backend_requirement(
         An optional function that performs additional validation checks common to all
         backends. Should accept the same arguments as the decorated function and return
         True if requirements are met, False otherwise.
+        In the case where the kernel function does not have any specific backends, this can be decorated with @supported_compute_capability to specify the function's supported compute capabilities.
 
     Returns
     -------
@@ -927,17 +928,17 @@ def backend_requirement(
     ...     # Backend invocation
     ...     pass
     ...
-    >>> # Check if backend is supported
-    >>> my_attention_kernel.is_backend_supported("cutlass")
-    True
-    >>> # Check if backend supports specific compute capability
-    >>> my_attention_kernel.is_backend_supported("cutlass", 75)
-    False
-    >>> my_attention_kernel.is_backend_supported("cutlass", 80)
-    True
-    >>> # Check if any backend supports a compute capability
-    >>> my_attention_kernel.is_compute_capability_supported(75)
-    True
+    >>> # Example with kernel function with no backend requirements
+    >>> @supported_compute_capability([80, 86, 89, 90])
+    ... def _common_size_check(q, k, v):
+    ...     return True
+    ...
+    >>> @backend_requirement(
+    ...     backend_checks={}, # Empty backend_checks
+    ...     common_check=_common_size_check
+    ... )
+    ... def backend_agnostic_kernel(q, k, v):
+    ...     pass
 
     Notes
     -----
@@ -955,6 +956,14 @@ def backend_requirement(
         sig = inspect.signature(func)
 
         def is_backend_supported(backend, cc=None):
+            # No backend-specific checks
+            if not backend_checks:
+                if common_check is not None and hasattr(
+                    common_check, "is_compute_capability_supported"
+                ):
+                    return common_check.is_compute_capability_supported(cc)
+                return True
+
             # Is this backend present?
             if backend not in backend_checks:
                 return False
@@ -968,6 +977,15 @@ def backend_requirement(
             return False
 
         def is_compute_capability_supported(cc):
+            # Handle empty backend_checks case
+            if not backend_checks:
+                # No backend-specific checks, only check common_check
+                if common_check is not None and hasattr(
+                    common_check, "is_compute_capability_supported"
+                ):
+                    return common_check.is_compute_capability_supported(cc)
+                return True  # No restrictions at all
+
             # True if any backend requirement supports this cc
             return any(
                 hasattr(checker, "is_compute_capability_supported")
@@ -979,6 +997,13 @@ def backend_requirement(
         def _is_problem_size_supported(*args, **kwargs):
             # At this point, kwargs should have defaults applied, so backend should be present
             backend = kwargs.get("backend")
+
+            # Handle empty backend_checks case
+            if not backend_checks:
+                if common_check is not None:
+                    return common_check(*args, **kwargs)
+                return True  # No checks at all
+
             if backend not in backend_checks:
                 raise BackendSupportedError(
                     f"Backend '{backend}' is not supported for {func.__name__}"
