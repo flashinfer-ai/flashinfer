@@ -380,6 +380,7 @@ def test_rope_cos_sin_cache(
 @pytest.mark.parametrize("num_tokens", [1, 19, 128, 199, 899, 2047])
 @pytest.mark.parametrize("input_dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("quant_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+@pytest.mark.parametrize("enable_pdl", [True, False])
 def test_generalized_rope_quantize(
     attention_type,
     num_qo_heads,
@@ -389,6 +390,7 @@ def test_generalized_rope_quantize(
     num_tokens,
     input_dtype,
     quant_dtype,
+    enable_pdl,
 ):
     """Test generalized rope + quantization for MLA, GQA, and MHA architectures."""
     device = "cuda:0"
@@ -459,6 +461,7 @@ def test_generalized_rope_quantize(
         k_nope_out=k_nope_out,
         quant_scale_q=1.0,
         quant_scale_kv=1.0,
+        enable_pdl=enable_pdl,
     )
 
     # Verify results
@@ -481,10 +484,12 @@ def test_generalized_rope_quantize(
 @pytest.mark.parametrize("num_tokens", [1, 19, 128, 199, 899, 2047])
 @pytest.mark.parametrize("input_dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("quant_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+@pytest.mark.parametrize("enable_pdl", [True, False])
 def test_mla_rope_quantize(
     num_tokens,
     input_dtype,
     quant_dtype,
+    enable_pdl,
 ):
     device = "cuda:0"
     num_qo_heads = 128
@@ -525,6 +530,7 @@ def test_mla_rope_quantize(
         k_nope_out=k_out[..., 64:],
         quant_scale_q=1.0,
         quant_scale_kv=1.0,
+        enable_pdl=enable_pdl,
     )
 
     torch.testing.assert_close(

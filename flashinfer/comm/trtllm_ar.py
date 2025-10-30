@@ -19,6 +19,7 @@ import logging
 from ctypes import c_void_p, cast
 from types import SimpleNamespace
 from typing import List, Optional, Tuple, Union
+from typing_extensions import deprecated
 
 import torch
 import torch.distributed as dist
@@ -121,6 +122,9 @@ def get_trtllm_comm_module():
             buffer_0_ptr, buffer_1_ptr, buffer_2_ptr, size, dtype
         )
 
+    @deprecated(
+        "trtllm_create_ipc_workspace_for_all_reduce and trtllm_custom_all_reduce are deprecated, use trtllm_create_ipc_workspace_for_all_reduce_fusion and trtllm_allreduce_fusion instead"
+    )
     @register_custom_op(
         "flashinfer::trtllm_custom_all_reduce",
         mutates_args=[
@@ -393,6 +397,9 @@ MAX_ALL_REDUCE_BLOCKS = 24
 LamportTokenNumThreshold = 16
 
 
+@deprecated(
+    "trtllm_create_ipc_workspace_for_all_reduce and trtllm_custom_all_reduce are deprecated, use trtllm_create_ipc_workspace_for_all_reduce_fusion and trtllm_allreduce_fusion instead"
+)
 def trtllm_create_ipc_workspace_for_all_reduce(
     rank: int,
     tp_size: int,
@@ -493,6 +500,7 @@ BarrierFlagCount = 256
 MAX_COMM_SIZE = 2147483647 & ~((1 << 21) - 1)  # MAX_INT32 rounded down to 2MB
 
 
+# @TODO(nvmbreughe): on a next major bump, remove create_metadata and make create_metadata=True the default behavior
 def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     tp_rank: int,
     tp_size: int,
@@ -500,7 +508,10 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     hidden_dim,
     use_fp32_lamport: bool = False,
     group: Optional[ProcessGroup] = None,
-) -> Tuple[List[List[int]], torch.Tensor]:
+    create_metadata: bool = False,
+) -> Union[
+    Tuple[List[List[int]], torch.Tensor], Tuple[List[List[int]], torch.Tensor, dict]
+]:
     """
     Parameters:
     - tp_rank: the rank of the current process.
@@ -509,6 +520,13 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     - hidden_dim: the dimension of the hidden states.
     - use_fp32_lamport: if True, we will use fp32 datatype in allreduce fusion.
     - group: the process group to use.
+    - create_metadata: if True, return metadata dict as third element (default: False).
+
+    Returns:
+    - If create_metadata=False: (ipc_handles, workspace_tensor)
+    - If create_metadata=True: (ipc_handles, workspace_tensor, metadata)
+      where metadata contains: tp_rank, tp_size, max_token_num, hidden_dim,
+      use_fp32_lamport, buffer_size, flag_size, lamport_comm_size, lamport_buffer_size
 
     Note:
     We would init 3 IPC buffers for trtllm_custom_all_reduce_fusion.
@@ -517,8 +535,8 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     where:
     - buffer_size: tp_size * max_token_num * hidden_dim * sizeof(half)
     - flag_size: tp_size * BarrierFlagCount * sizeof(int)
-    - lamport_buffer_size: tp_size * max(max_token_num, OneShotMaxToken) * tp_size * hidden_dim * sizeof(half)
-
+    - lamport_buffer_size: tp_size * max_token_num * tp_size * hidden_dim * sizeof(half)
+      where sizeof(elem) = 2 (fp16/bf16) or 4 (fp32 when use_fp32_lamport=True)
     The workspace is passed as workspace field in AllReduceFusionParams.
 
     We use tp_size and world_size here interchangeably (allReduceFusion).
@@ -608,7 +626,21 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
 
     dist.barrier(group=group)  # must sync after create_workspace
 
-    return ipc_handles, workspace_tensor
+    if create_metadata:
+        metadata = {
+            "tp_rank": tp_rank,
+            "tp_size": tp_size,
+            "max_token_num": max_token_num,
+            "hidden_dim": hidden_dim,
+            "use_fp32_lamport": use_fp32_lamport,
+            "buffer_size": buffer_size,
+            "flag_size": flag_size,
+            "lamport_comm_size": lamport_comm_size,
+            "lamport_buffer_size": lamport_buffer_size,
+        }
+        return ipc_handles, workspace_tensor, metadata
+    else:
+        return ipc_handles, workspace_tensor
 
 
 def trtllm_destroy_ipc_workspace_for_all_reduce_fusion(
@@ -675,6 +707,9 @@ def trtllm_lamport_initialize_all(
     )
 
 
+@deprecated(
+    "trtllm_create_ipc_workspace_for_all_reduce and trtllm_custom_all_reduce are deprecated, use trtllm_create_ipc_workspace_for_all_reduce_fusion and trtllm_allreduce_fusion instead"
+)
 def trtllm_custom_all_reduce(
     inp: torch.Tensor,
     out: torch.Tensor,
@@ -751,6 +786,24 @@ def trtllm_custom_all_reduce(
     )
 
 
+# Heuristics based on all configs of trtllm_allreduce_fusion on B200.
+# Empirically, the fusion pattern and fp32_acc are irrelevant to the decision.
+_use_oneshot_heuristics: dict[int, int] = {
+    2: 512,
+    4: 64,
+    8: 42,
+}
+
+
+def _should_use_oneshot(
+    token_num: int, hidden_dim: int, dtype: torch.dtype, world_size: int
+) -> bool:
+    comm_size_mb = (
+        token_num * hidden_dim * 2 * world_size * dtype.itemsize / 1024 / 1024
+    )
+    return comm_size_mb <= _use_oneshot_heuristics[world_size]
+
+
 def trtllm_allreduce_fusion(
     allreduce_in: torch.Tensor,
     world_size: int,
@@ -773,6 +826,7 @@ def trtllm_allreduce_fusion(
     rms_eps: Optional[float],
     scale_factor: Optional[Union[torch.Tensor, float]],
     layout_code: Optional[QuantizationSFLayout],
+    metadata: Optional[dict] = None,
 ) -> None:
     """
     Parameters:
@@ -783,7 +837,7 @@ def trtllm_allreduce_fusion(
     - hidden_dim: the dimension of the hidden states.
     - workspace_ptrs: the workspace pointers.
     - launch_with_pdl: whether to launch with pdl.
-    - use_oneshot: whether to use oneshot.
+    - use_oneshot: whether to use oneshot. If None, internal heuristics will be used.
     - trigger_completion_at_end: whether to trigger completion at the end.
     - fp32_acc: whether to use fp32 accumulation.
     - pattern_code: the pattern code.
@@ -797,14 +851,62 @@ def trtllm_allreduce_fusion(
     - rms_eps: the rms epsilon value.
     - scale_factor: the scale factor. For cudaGraphs safety, it should be a tensor.
     - layout_code: the layout code.
-
-    Note:
-    Regarding the `use_oneshot` parameter, you could force to use the one-shot strategy based on your use case.
-    Otherwise, it would be enabled if token_num is less than the one-shot max token number (currently 128) for min-latency mode.
+    - metadata: optional workspace metadata dict from create_ipc_workspace_for_all_reduce_fusion.
+                If provided, validates that token_num <= max_token_num, world_size == tp_size,
+                and hidden_dim == workspace hidden_dim. Raises ValueError if validation fails.
     """
 
+    # Validate against workspace metadata if provided
+    if metadata is not None:
+        errors = []
+        required_keys = ["max_token_num", "tp_size", "hidden_dim", "use_fp32_lamport"]
+        for key in required_keys:
+            if key not in metadata:
+                errors.append(f"Workspace metadata is missing required key: {key}")
+        if errors:
+            error_msg = "Workspace metadata validation failed:\n" + "\n".join(
+                f"  - {e}" for e in errors
+            )
+            raise ValueError(error_msg)
+
+        # Check 1: token_num must not exceed max_token_num
+        if token_num > metadata["max_token_num"]:
+            errors.append(
+                f"token_num ({token_num}) exceeds workspace max_token_num ({metadata['max_token_num']}). "
+                f"This may cause Illegal Memory Access."
+            )
+
+        # Check 2: world_size must match tp_size
+        if world_size != metadata["tp_size"]:
+            errors.append(
+                f"world_size ({world_size}) does not match workspace tp_size ({metadata['tp_size']}). "
+                f"Workspace was created for tp_size={metadata['tp_size']}."
+            )
+
+        # Check 3: hidden_dim must match
+        if hidden_dim != metadata["hidden_dim"]:
+            errors.append(
+                f"hidden_dim ({hidden_dim}) does not match workspace hidden_dim ({metadata['hidden_dim']}). "
+                f"Workspace was created for hidden_dim={metadata['hidden_dim']}."
+            )
+
+        # Check 4: use_fp32_lamport must match
+        if metadata["use_fp32_lamport"] != (allreduce_in.dtype == torch.float32):
+            errors.append(
+                f"use_fp32_lamport ({metadata['use_fp32_lamport']}) does not match allreduce_in.dtype ({allreduce_in.dtype}). "
+                f"Workspace was created for use_fp32_lamport={metadata['use_fp32_lamport']}."
+            )
+
+        if errors:
+            error_msg = "Workspace validation failed:\n" + "\n".join(
+                f"  - {e}" for e in errors
+            )
+            raise ValueError(error_msg)
+
     if use_oneshot is None:
-        use_oneshot = token_num <= 128
+        use_oneshot = _should_use_oneshot(
+            token_num, hidden_dim, allreduce_in.dtype, world_size
+        )
 
     if not use_oneshot:
         assert token_num > world_size, "sequence length should be larger than tp_size"

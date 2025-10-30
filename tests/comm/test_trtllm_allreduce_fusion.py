@@ -57,8 +57,8 @@ def _run_correctness_worker(world_size, rank, dtype, hidden_dim, distributed_ini
 
         lamport_use_fp32 = dtype == torch.float32
 
-        # create workspace for allreduce fusion
-        ipc_handles, workspace_tensor = (
+        # create workspace for allreduce fusion with metadata
+        ipc_handles, workspace_tensor, workspace_metadata = (
             comm.trtllm_create_ipc_workspace_for_all_reduce_fusion(
                 rank,
                 world_size,
@@ -66,6 +66,7 @@ def _run_correctness_worker(world_size, rank, dtype, hidden_dim, distributed_ini
                 hidden_dim,
                 group=group,
                 use_fp32_lamport=lamport_use_fp32,
+                create_metadata=True,  # Get metadata for validation
             )
         )
 
@@ -184,6 +185,7 @@ def _run_correctness_worker(world_size, rank, dtype, hidden_dim, distributed_ini
                                                 rms_eps=rms_eps,
                                                 scale_factor=scale_factor,
                                                 layout_code=swizzled_layout_code,
+                                                metadata=workspace_metadata,
                                             )
 
                                     # NOTE: in real case, you dont have to set all optional params. You could set those required by fusion pattern.
@@ -213,6 +215,7 @@ def _run_correctness_worker(world_size, rank, dtype, hidden_dim, distributed_ini
                                                 rms_eps=rms_eps,
                                                 scale_factor=scale_factor,
                                                 layout_code=swizzled_layout_code,
+                                                metadata=workspace_metadata,
                                             )
                                     # replay
                                     g.replay()
@@ -304,7 +307,9 @@ def _run_correctness_worker(world_size, rank, dtype, hidden_dim, distributed_ini
     finally:
         dist.barrier(group=group)
 
-        comm.trtllm_destroy_ipc_workspace_for_all_reduce(ipc_handles, group=group)
+        comm.trtllm_destroy_ipc_workspace_for_all_reduce_fusion(
+            ipc_handles, group=group
+        )
 
         dist.destroy_process_group(group=group)
 

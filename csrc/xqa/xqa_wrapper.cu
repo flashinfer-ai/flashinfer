@@ -19,37 +19,78 @@
 
 using tvm::ffi::Optional;
 
-void xqa_wrapper(int64_t multiProcessorCount, int64_t nbKHeads, int64_t slidingWinSize,
-                 double qScale, TensorView output,
+#if MLA_WRAPPER
+void xqa_wrapper_mla(int64_t multiProcessorCount, double qScale, TensorView output, TensorView q,
+#if PAGED_KV_CACHE_LAYOUT == 1
+                     TensorView kCacheVLLM, TensorView vCacheVLLM,
+#else
+                     TensorView pool,
+#endif
+                     TensorView kvCachePageList, int64_t maxSeqLen, TensorView seqLen,
+                     int64_t batchSize, TensorView kvCacheScale, TensorView semaphores,
+                     TensorView scratch) {
+  auto stream = get_stream(output.device());
+
+  launchMLAFlashInfer(multiProcessorCount, 1, qScale,
+                      reinterpret_cast<OutputHead*>(output.data_ptr()),
+                      reinterpret_cast<InputHead const*>(q.data_ptr()),
+#if PAGED_KV_CACHE_LAYOUT == 1
+                      reinterpret_cast<GMemCacheHead*>(kCacheVLLM.data_ptr()),
+                      reinterpret_cast<GMemCacheHead*>(vCacheVLLM.data_ptr()),
+#else
+                      reinterpret_cast<GMemCacheHead*>(pool.data_ptr()),
+#endif
+                      reinterpret_cast<KVCachePageIndex const*>(kvCachePageList.data_ptr()),
+                      maxSeqLen, reinterpret_cast<uint32_t const*>(seqLen.data_ptr()), batchSize,
+                      reinterpret_cast<float const*>(kvCacheScale.data_ptr()),
+                      reinterpret_cast<uint32_t*>(semaphores.data_ptr()),
+                      reinterpret_cast<void*>(scratch.data_ptr()), stream);
+}
+#else
+
+void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbKHeads,
+                 int64_t slidingWinSize, double qScale, TensorView output,
 #if LOW_PREC_OUTPUT
                  TensorView rcpOutScale,
 #endif
-                 TensorView q, Optional<TensorView> attentionSinks, TensorView pool,
+                 TensorView q, Optional<TensorView> attentionSinks,
+#if PAGED_KV_CACHE_LAYOUT == 1
+                 TensorView kCacheVLLM, TensorView vCacheVLLM,
+#else
+                 TensorView pool,
+#endif
                  TensorView kvCachePageList, int64_t maxSeqLen, TensorView seqLen,
                  int64_t batchSize, TensorView kvCacheScale,
 #if SPEC_DEC
                  int64_t qSeqLen, TensorView qCuSeqLens, TensorView mask,
 #endif
                  TensorView semaphores, TensorView scratch) {
-  auto stream = get_stream(output->device);
+  auto stream = get_stream(output.device());
   float const* attentionSinksPtr =
-      attentionSinks.has_value() ? reinterpret_cast<float const*>(attentionSinks.value()->data)
+      attentionSinks.has_value() ? reinterpret_cast<float const*>(attentionSinks.value().data_ptr())
                                  : nullptr;
+  auto const mha_func = run_sm90_fp8_mha ? &launchHopperF8MHAFlashInfer : &launchMHAFlashInfer;
 
-  launchMHAFlashInfer(multiProcessorCount, nbKHeads, slidingWinSize, qScale,
-                      reinterpret_cast<OutputHead*>(output->data),
+  mha_func(multiProcessorCount, nbKHeads, slidingWinSize, qScale,
+           reinterpret_cast<OutputHead*>(output.data_ptr()),
 #if LOW_PREC_OUTPUT
-                      reinterpret_cast<float const*>(rcpOutScale->data),
+           reinterpret_cast<float const*>(rcpOutScale.data_ptr()),
 #endif
-                      reinterpret_cast<InputHead const*>(q->data), attentionSinksPtr,
-                      reinterpret_cast<GMemCacheHead*>(pool->data),
-                      reinterpret_cast<KVCachePageIndex const*>(kvCachePageList->data), maxSeqLen,
-                      reinterpret_cast<uint32_t const*>(seqLen->data), batchSize,
-                      reinterpret_cast<float const*>(kvCacheScale->data),
+           reinterpret_cast<InputHead const*>(q.data_ptr()), attentionSinksPtr,
+#if PAGED_KV_CACHE_LAYOUT == 1
+           reinterpret_cast<GMemCacheHead*>(kCacheVLLM.data_ptr()),
+           reinterpret_cast<GMemCacheHead*>(vCacheVLLM.data_ptr()),
+#else
+           reinterpret_cast<GMemCacheHead*>(pool.data_ptr()),
+#endif
+           reinterpret_cast<KVCachePageIndex const*>(kvCachePageList.data_ptr()), maxSeqLen,
+           reinterpret_cast<uint32_t const*>(seqLen.data_ptr()), batchSize,
+           reinterpret_cast<float const*>(kvCacheScale.data_ptr()),
 #if SPEC_DEC
-                      qSeqLen, reinterpret_cast<uint32_t const*>(qCuSeqLens->data),
-                      reinterpret_cast<MaskType const*>(mask->data),
+           qSeqLen, reinterpret_cast<uint32_t const*>(qCuSeqLens.data_ptr()),
+           reinterpret_cast<MaskType const*>(mask.data_ptr()),
 #endif
-                      reinterpret_cast<uint32_t*>(semaphores->data),
-                      reinterpret_cast<void*>(scratch->data), stream);
+           reinterpret_cast<uint32_t*>(semaphores.data_ptr()),
+           reinterpret_cast<void*>(scratch.data_ptr()), stream);
 }
+#endif

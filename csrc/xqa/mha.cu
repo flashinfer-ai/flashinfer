@@ -92,7 +92,8 @@ __constant__ constexpr uint32_t cacheVTileSeqLen = 32;
 #if __CUDA_ARCH__ == 860 || __CUDA_ARCH__ == 890 || __CUDA_ARCH__ == 1200
 constexpr uint32_t preferedKHeadPartBytes = 64;
 __constant__ constexpr uint32_t cacheVTileSeqLen = 32;
-#elif __CUDA_ARCH__ == 800 || __CUDA_ARCH__ == 870 || __CUDA_ARCH__ == 900
+#elif __CUDA_ARCH__ == 800 || __CUDA_ARCH__ == 870 || __CUDA_ARCH__ == 900 || \
+    __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030
 constexpr uint32_t preferedKHeadPartBytes = 128;
 __constant__ constexpr uint32_t cacheVTileSeqLen = 64;
 #else
@@ -476,7 +477,7 @@ __device__ inline void applyMaskFromInput(Warp const& warp, WarpAcc& acc, MaskTy
                 col + actualQSeqLen < nbValidCols
                     ? true
                     : packedMask & (1u << ((col + actualQSeqLen - nbValidCols) - maskPosStart));
-            acc(m, n)(i, j) = maskFlag && col < nbValidCols ? acc(m, n)(i, j) : -INFINITY;
+            acc(m, n)(i, j) = maskFlag && col < nbValidCols ? acc(m, n)(i, j) : safeInitRowMax;
           }
         }
       }
@@ -2654,12 +2655,26 @@ void launchMHA(
 }
 #endif
 
+static uint32_t configureKernel() {
+  uint32_t size;
+  cudaMemcpyFromSymbol(&size, smemSize, sizeof(smemSize));
+  cudaFuncSetAttribute(kernel_mha, cudaFuncAttributeMaxDynamicSharedMemorySize, size);
+  return size;
+}
+
+static uint32_t const hostSmemSize = configureKernel();
+
 void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32_t slidingWinSize,
                          float qScale, OutputHead* output,
 #if LOW_PREC_OUTPUT
                          float const* rcpOutScale,
 #endif
-                         InputHead const* q, float const* attentionSinks, GMemCacheHead* pool,
+                         InputHead const* q, float const* attentionSinks,
+#if PAGED_KV_CACHE_LAYOUT == 1
+                         GMemCacheHead* kCacheVLLM, GMemCacheHead* vCacheVLLM,
+#else
+                         GMemCacheHead* pool,
+#endif
                          KVCachePageIndex const* kvCachePageList, uint32_t maxSeqLen,
                          uint32_t const* seqLen, uint32_t batchSize,
                          float const* __restrict__ kvCacheScale,
@@ -2667,13 +2682,6 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
                          uint32_t qSeqLen, uint32_t const* qCuSeqLens, MaskType const* mask,
 #endif
                          uint32_t* semaphores, void* scratch, cudaStream_t stream) {
-  static uint32_t const hostSmemSize = [&]() {
-    uint32_t size;
-    checkCuda(cudaMemcpyFromSymbol(&size, smemSize, sizeof(smemSize)));
-    checkCuda(cudaFuncSetAttribute(kernel_mha, cudaFuncAttributeMaxDynamicSharedMemorySize, size));
-    return size;
-  }();
-
   uint32_t const nbSubSeqPerSeq = [&]() -> uint32_t {
     if (!allowMultiBlockMode) {
       return 1;
@@ -2691,7 +2699,12 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
   auto const launchCfg = makeLaunchConfig(dimGrid, dimCta, hostSmemSize, stream, ENABLE_PDL != 0);
 #if USE_PAGED_KV_CACHE
   uint32_t const maxNbPagesPerSeq = exactDiv(maxSeqLen, tokensPerPage);
+#if PAGED_KV_CACHE_LAYOUT == 1
+  KVCacheList<true> const cacheList{kCacheVLLM, vCacheVLLM, kvCachePageList, seqLen,
+                                    maxNbPagesPerSeq};
+#else
   KVCacheList<true> const cacheList{pool, kvCachePageList, seqLen, maxNbPagesPerSeq};
+#endif
   cudaLaunchKernelEx(&launchCfg, kernel_mha,
 #if SPEC_DEC
                      qSeqLen, nbKHeads, headGrpSize, qCuSeqLens,
@@ -2709,11 +2722,7 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
 #if SPEC_DEC
                      mask,
 #endif
-                     attentionSinks, cacheList,
-#if BEAM_WIDTH > 1
-                     beamSearchParams,
-#endif
-                     batchSize, kvCacheScale, semaphores, scratch);
+                     attentionSinks, cacheList, batchSize, kvCacheScale, semaphores, scratch);
 #else
   KVCacheList<false> const cacheList{kvCacheData, seqLen, maxSeqLen};
 #ifndef NDEBUG
