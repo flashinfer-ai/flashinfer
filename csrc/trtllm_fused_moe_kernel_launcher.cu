@@ -369,7 +369,7 @@ void trtllm_fp8_per_tensor_scale_moe(
     auto const hidden_size = hidden_states.size(1);
     bool mUseDeepSeekFp8{false};  // FP8 per-tensor doesn't use DeepSeek FP8
 
-    std::vector<int32_t> mSupportedTileN = {8, 16, 32, 64, 128};
+    std::vector<int32_t> mSupportedTileN = {8, 16, 32, 64, 128, 192, 256};
     std::set<int32_t> selected_tile_nums =
         computeSelectedTileN(mSupportedTileN, num_tokens, top_k, local_num_experts);
 
@@ -718,7 +718,7 @@ void trtllm_fp8_block_scale_moe(
     auto const num_tokens = hidden_states.size(0);
     auto const hidden_size = hidden_states.size(1);
 
-    std::vector<int32_t> mSupportedTileN = {8, 16, 32, 64};
+    std::vector<int32_t> mSupportedTileN = {8, 16, 32, 64, 128};
     std::set<int32_t> selected_tile_nums =
         computeSelectedTileN(mSupportedTileN, num_tokens, top_k, local_num_experts);
 
@@ -1228,6 +1228,11 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
   if (mDtypeAct != btg::Dtype::Bfloat16) {
     mSupportedTileN.push_back(128);
   }
+  if ((mDtypeAct == btg::Dtype::MxE4m3 && mDtypeWeights == btg::Dtype::MxE2m1) ||
+      (mDtypeAct == btg::Dtype::E2m1 && mDtypeWeights == btg::Dtype::E2m1)) {
+    // MxFP4 x MxFP4 or NvFP4 x NvFP4
+    mSupportedTileN.push_back(256);
+  }
   std::set<int32_t> selected_tile_nums =
       computeSelectedTileN(mSupportedTileN, num_tokens, top_k, local_num_experts);
   // Build runners for all supported tile sizes
@@ -1305,8 +1310,20 @@ Array<Array<int64_t>> trtllm_get_valid_moe_configs(
   bool is_fp8_per_tensor =
       dtype_weights == btg::Dtype::E4m3 && dtype_act == btg::Dtype::E4m3 && !useDeepSeekFp8;
 
-  if (is_fp4_without_bf16_act || is_fp8_per_tensor) {
+  if (useDeepSeekFp8) {
     supported_tile_nums.push_back(128);
+  } else if (is_fp8_per_tensor) {
+    supported_tile_nums.push_back(128);
+    supported_tile_nums.push_back(192);
+    supported_tile_nums.push_back(256);
+  } else if (is_fp4_without_bf16_act) {
+    supported_tile_nums.push_back(128);
+  }
+
+  if ((dtype_act == btg::Dtype::MxE4m3 && dtype_weights == btg::Dtype::MxE2m1) ||
+      (dtype_act == btg::Dtype::E2m1 && dtype_weights == btg::Dtype::E2m1)) {
+    // MxFP4 x MxFP4 or NvFP4 x NvFP4
+    supported_tile_nums.push_back(256);
   }
   std::set<int32_t> selected_tile_nums =
       computeSelectedTileN(supported_tile_nums, num_tokens, top_k, num_local_experts);
