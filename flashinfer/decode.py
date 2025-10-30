@@ -2216,14 +2216,18 @@ def trtllm_batch_decode_with_kv_cache(
     else:
         raise ValueError(f"Invalid out_dtype: {out_dtype}")
 
+    bmm1_scale = (
+        bmm1_scale.item() if isinstance(bmm1_scale, torch.Tensor) else bmm1_scale
+    )
+    bmm2_scale = (
+        bmm2_scale.item() if isinstance(bmm2_scale, torch.Tensor) else bmm2_scale
+    )
+
     run_func(
         out,
         out_scale_factor,
         query.view(
-            query.size(0) // q_len_per_req,
-            q_len_per_req,
-            query.size(1),
-            query.size(2),
+            query.size(0) // q_len_per_req, q_len_per_req, query.size(1), query.size(2)
         ),
         k_cache,
         v_cache,
