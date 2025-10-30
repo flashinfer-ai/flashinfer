@@ -12,13 +12,7 @@ def get_dsv3_router_gemm_module():
 
     @register_custom_op(
         "flashinfer::dsv3_router_gemm_op",
-        mutates_args=[
-            "mat_a",
-            "mat_b",
-            "out",
-            "launch_with_pdl",
-            "bias",
-        ],
+        mutates_args=["out"],
     )
     def dsv3_router_gemm_op(
         mat_a: torch.Tensor,

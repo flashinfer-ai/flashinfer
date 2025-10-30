@@ -149,4 +149,7 @@ void dsv3_router_gemm_op(TensorView mat_a, TensorView mat_b, TensorView out, boo
   }
 }
 
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(dsv3_router_gemm_op,
+                              flashinfer::trtllm_dsv3_router_gemm::dsv3_router_gemm_op);
+
 }  // namespace flashinfer::trtllm_dsv3_router_gemm
