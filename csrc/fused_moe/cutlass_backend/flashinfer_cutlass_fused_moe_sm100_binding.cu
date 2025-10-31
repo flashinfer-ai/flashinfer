@@ -566,7 +566,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
     mKernelRunner->runMoe(
         input.data_ptr(), input_sf.has_value() ? input_sf.value().data_ptr() : nullptr,
-        swizzled_input_sf, reinterpret_cast<int const*>(token_selected_experts.data_ptr()),
+        swizzled_input_sf_ml, reinterpret_cast<int const*>(token_selected_experts.data_ptr()),
         token_final_scales.has_value()
             ? reinterpret_cast<float const*>(token_final_scales.value().data_ptr())
             : nullptr,

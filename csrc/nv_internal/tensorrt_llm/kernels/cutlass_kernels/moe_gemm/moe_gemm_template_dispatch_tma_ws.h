@@ -190,12 +190,13 @@ void dispatchMoeGemmFinalDispatchTmaWarpSpecialized(
           std::get<0>(cluster_shape_fallback), std::get<1>(cluster_shape_fallback), cute::_1{}};
 
       // HACK debug the gemm_config used to produce selected_func
-      std::cout << "[SM100 gemm_config] sm_version=" << gemm_config.sm_version
-                << ", tile_config_sm100=" << static_cast<int>(gemm_config.tile_config_sm100)
-                << ", epilogue_schedule=" << static_cast<int>(gemm_config.epilogue_schedule)
-                << ", dynamic_cluster_shape=" << static_cast<int>(gemm_config.dynamic_cluster_shape)
-                << ", fallback_cluster_shape="
-                << static_cast<int>(gemm_config.fallback_cluster_shape) << std::endl;
+      // std::cout << "[SM100 gemm_config] sm_version=" << gemm_config.sm_version
+      //           << ", tile_config_sm100=" << static_cast<int>(gemm_config.tile_config_sm100)
+      //           << ", epilogue_schedule=" << static_cast<int>(gemm_config.epilogue_schedule)
+      //           << ", dynamic_cluster_shape=" <<
+      //           static_cast<int>(gemm_config.dynamic_cluster_shape)
+      //           << ", fallback_cluster_shape="
+      << static_cast<int>(gemm_config.fallback_cluster_shape) << std::endl;
 
       auto selected_func =
           getDispatchFunctionForSM100<Arch, T, WeightType, OutputType, EpilogueTag, FUSION,
