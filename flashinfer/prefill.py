@@ -1860,7 +1860,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         self._block_tables = block_tables
         if self._backend == "trtllm-gen":
-            assert self._kv_layout == "HND"
             assert logits_soft_cap == 0.0
             if self._block_tables is None:
                 blocks_per_seq = [

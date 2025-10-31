@@ -91,7 +91,14 @@ def create_query_tensor(q_lens, num_qo_heads, head_dim, q_dtype):
 
 
 def create_kv_cache(
-    batch_size, seq_lens, page_size, num_kv_heads, head_dim, kv_dtype, ref_kv_dtype
+    batch_size,
+    seq_lens,
+    page_size,
+    num_kv_heads,
+    head_dim,
+    kv_dtype,
+    ref_kv_dtype,
+    kv_layout="HND",
 ):
     # Create separate K and V caches
     max_seq_len = torch.max(seq_lens).item()
@@ -103,22 +110,43 @@ def create_kv_cache(
             "kv_dtype and ref_kv_dtype must be the same for non-fp8 kv_cache"
         )
 
-    k_cache = torch.randn(
-        num_pages,
-        num_kv_heads,
-        page_size,
-        head_dim,
-        dtype=ref_kv_dtype_torch,
-        device=GPU_DEVICE,
-    )
-    v_cache = torch.randn(
-        num_pages,
-        num_kv_heads,
-        page_size,
-        head_dim,
-        dtype=ref_kv_dtype_torch,
-        device=GPU_DEVICE,
-    )
+    # Create cache with appropriate layout
+    if kv_layout == "HND":
+        # HND layout: [num_pages, num_kv_heads, page_size, head_dim]
+        k_cache = torch.randn(
+            num_pages,
+            num_kv_heads,
+            page_size,
+            head_dim,
+            dtype=ref_kv_dtype_torch,
+            device=GPU_DEVICE,
+        )
+        v_cache = torch.randn(
+            num_pages,
+            num_kv_heads,
+            page_size,
+            head_dim,
+            dtype=ref_kv_dtype_torch,
+            device=GPU_DEVICE,
+        )
+    else:  # NHD layout
+        # NHD layout: [num_pages, page_size, num_kv_heads, head_dim]
+        k_cache = torch.randn(
+            num_pages,
+            page_size,
+            num_kv_heads,
+            head_dim,
+            dtype=ref_kv_dtype_torch,
+            device=GPU_DEVICE,
+        )
+        v_cache = torch.randn(
+            num_pages,
+            page_size,
+            num_kv_heads,
+            head_dim,
+            dtype=ref_kv_dtype_torch,
+            device=GPU_DEVICE,
+        )
 
     # Convert K and V separately to fp8 if needed
     if kv_dtype == "fp8":
@@ -173,6 +201,7 @@ def flatten_paged_kv(
     seq_lens: torch.Tensor,
     page_size: int,
     kv_last_page_len: torch.Tensor,
+    kv_layout: str = "HND",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build flat K/V and token-level indptr from paged KV cache and page table."""
     device = ref_kv_cache.device
@@ -192,11 +221,20 @@ def flatten_paged_kv(
             page_id = int(page_table_cpu[i, j].item())
             k_page = ref_kv_cache[page_id, 0]
             v_page = ref_kv_cache[page_id, 1]
-            if j == pages_i - 1:
-                k_page = k_page[:, :last_len_i, :]
-                v_page = v_page[:, :last_len_i, :]
-            k_list.append(einops.rearrange(k_page, "h p d -> p h d"))
-            v_list.append(einops.rearrange(v_page, "h p d -> p h d"))
+            if kv_layout == "HND":
+                # HND layout: [num_kv_heads, page_size, head_dim]
+                if j == pages_i - 1:
+                    k_page = k_page[:, :last_len_i, :]
+                    v_page = v_page[:, :last_len_i, :]
+                k_list.append(einops.rearrange(k_page, "h p d -> p h d"))
+                v_list.append(einops.rearrange(v_page, "h p d -> p h d"))
+            else:  # NHD layout
+                # NHD layout: [page_size, num_kv_heads, head_dim]
+                if j == pages_i - 1:
+                    k_page = k_page[:last_len_i, :, :]
+                    v_page = v_page[:last_len_i, :, :]
+                k_list.append(einops.rearrange(k_page, "p h d -> p h d"))
+                v_list.append(einops.rearrange(v_page, "p h d -> p h d"))
     k_flat = torch.cat(k_list, dim=0)
     v_flat = torch.cat(v_list, dim=0)
     kv_indptr_tokens = torch.cat(
@@ -301,7 +339,7 @@ def unpack_compare_nvfp4(
     return output_unpacked, output_ref
 
 
-@pytest.mark.parametrize("kv_layout", ["HND"])  # trtllm-gen only support HND
+@pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
 @pytest.mark.parametrize(
     "batch_size,page_size,num_kv_heads,head_grp_size",
     [
@@ -374,6 +412,7 @@ def test_trtllm_batch_prefill(
         head_dim,
         kv_dtype,
         "bf16" if q_dtype == "fp8" else q_dtype,
+        kv_layout,
     )
     page_table, all_page_ids, page_per_seq = create_page_table(
         batch_size, seq_lens, page_size
@@ -428,6 +467,7 @@ def test_trtllm_batch_prefill(
             seq_lens.to(GPU_DEVICE),
             page_size,
             kv_last_page_len,
+            kv_layout,
         )
         sink = torch.rand(num_qo_heads, device=GPU_DEVICE, dtype=torch.float32) * 5
         output_ref = sink_attention_unified(
@@ -463,6 +503,7 @@ def test_trtllm_batch_prefill(
         out_dtype=out_dtype,
         o_sf_scale=o_sf_scale,
         o_sf_vec_size=o_sf_vec_size,
+        kv_layout=kv_layout,
         enable_pdl=enable_pdl,
         sinks=(sink if enable_sink else None),
     )
@@ -527,7 +568,7 @@ def test_trtllm_batch_prefill(
         assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()
 
 
-@pytest.mark.parametrize("kv_layout", ["HND"])  # trtllm-gen only support HND
+@pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
 @pytest.mark.parametrize(
     "batch_size,page_size,num_kv_heads,head_grp_size",
     [
@@ -577,7 +618,7 @@ def test_trtllm_batch_prefill_bs1(
     )
 
 
-@pytest.mark.parametrize("kv_layout", ["HND"])  # trtllm-gen only support HND
+@pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
 @pytest.mark.parametrize(
     "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size",
     [
@@ -663,6 +704,7 @@ def test_trtllm_batch_decode(
         head_dim,
         kv_dtype,
         "bf16" if q_dtype == "fp8" else q_dtype,
+        kv_layout,
     )
     page_table, all_page_ids, page_per_seq = create_page_table(
         batch_size, seq_lens, page_size
@@ -735,6 +777,7 @@ def test_trtllm_batch_decode(
             seq_lens.to(GPU_DEVICE),
             page_size,
             kv_last_page_len,
+            kv_layout,
         )
         sink = torch.rand(num_qo_heads, device=GPU_DEVICE, dtype=torch.float32) * 5
         output_ref = sink_attention_unified(
@@ -858,7 +901,7 @@ def test_trtllm_batch_decode(
         assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()
 
 
-@pytest.mark.parametrize("kv_layout", ["HND"])  # trtllm-gen only support HND
+@pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
 @pytest.mark.parametrize(
     "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size",
     [
