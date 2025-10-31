@@ -228,17 +228,20 @@ void trtllm_paged_attention_decode(TensorView out, Optional<TensorView> out_scal
   TVM_FFI_ICHECK((head_dim_v == 576 && head_dim_o == 512) || head_dim_v == head_dim_o)
       << "head_dim_v and head_dim_o must be the same for non-MLA attention, got "
       << std::to_string(head_dim_v) << " and " << std::to_string(head_dim_o);
-  int page_size = key_cache.size(-2);
-  int num_kv_heads = key_cache.size(-3);
   int max_num_blocks_per_seq = block_tables.size(-1);
   bool is_shared_kv = key_cache.data_ptr() == value_cache.data_ptr();
   int num_pages_in_mem_pool = is_shared_kv ? key_cache.size(0) : key_cache.size(0) * 2;
 
+  int page_size, num_kv_heads;
   int kv_stride_keys_values, kv_stride_heads;
-  if (kv_layout == 0) {                            // nhd
+  if (kv_layout == 0) {  // nhd
+    page_size = key_cache.size(-3);
+    num_kv_heads = key_cache.size(-2);
     kv_stride_keys_values = key_cache.stride(-3);  // key/values
     kv_stride_heads = key_cache.stride(-2);        // head
   } else {                                         // kv_layout == 1, hnd
+    page_size = key_cache.size(-2);
+    num_kv_heads = key_cache.size(-3);
     kv_stride_keys_values = key_cache.stride(-2);  // key/values
     kv_stride_heads = key_cache.stride(-3);        // head
   }
@@ -298,14 +301,17 @@ void trtllm_paged_attention_context(TensorView out, Optional<TensorView> out_sca
   int max_num_blocks_per_seq = block_tables.size(-1);
   bool is_shared_kv = key_cache.data_ptr() == value_cache.data_ptr();
   int num_pages_in_mem_pool = is_shared_kv ? key_cache.size(0) : key_cache.size(0) * 2;
-  int page_size = key_cache.size(-2);
-  int num_kv_heads = key_cache.size(-3);
 
+  int page_size, num_kv_heads;
   int kv_stride_keys_values, kv_stride_heads;
-  if (kv_layout == 0) {                            // nhd
+  if (kv_layout == 0) {  // nhd
+    page_size = key_cache.size(-3);
+    num_kv_heads = key_cache.size(-2);
     kv_stride_keys_values = key_cache.stride(-3);  // key/values
     kv_stride_heads = key_cache.stride(-2);        // head
   } else {                                         // kv_layout == 1, hnd
+    page_size = key_cache.size(-2);
+    num_kv_heads = key_cache.size(-3);
     kv_stride_keys_values = key_cache.stride(-2);  // key/values
     kv_stride_heads = key_cache.stride(-3);        // head
   }
