@@ -17,6 +17,15 @@ def _dvs3_router_gemm_shape_checks(mat_a, mat_b, out, launch_with_pdl, bias):
         raise ValueError("out must be a 2D tensor")
     if bias is not None:
         raise ValueError("bias is not supported yet")
+
+    # Stride checks (check these before dimension checks to give better error messages)
+    if mat_a.stride(1) != 1:
+        raise ValueError("mat_a must be row-major")
+    if out.stride(1) != 1:
+        raise ValueError("out must be row-major")
+    if mat_b.stride(0) != 1:
+        raise ValueError("mat_b must be column-major")
+
     if mat_a.shape[1] != mat_b.shape[0]:
         raise ValueError("mat_a.shape[1] must be equal to mat_b.shape[0]")
     if out.shape[0] != mat_a.shape[0]:
@@ -50,16 +59,6 @@ def _dvs3_router_gemm_shape_checks(mat_a, mat_b, out, launch_with_pdl, bias):
     if out.dtype != torch.float32:
         raise ValueError("out must be a float32 tensor")
 
-    # Stride checks
-    if mat_a.stride(1) != 1:
-        raise ValueError("mat_a must be row-major")
-    if out.stride(1) != 1:
-        raise ValueError("out must be row-major")
-    if mat_b.stride(0) != 1:
-        raise ValueError("mat_b must be column-major")
-    if bias is not None:
-        raise ValueError("bias is not supported yet")
-
     return True
 
 
@@ -86,6 +85,7 @@ def get_dsv3_router_gemm_module():
 
 
 # TODO: Add decorator for support checks: compute capability and type checks
+# TODO: wait for Jimmy's fix to enable this: https://github.com/flashinfer-ai/flashinfer/pull/2015
 # @backend_requirement({}, common_check=_dvs3_router_gemm_shape_checks)
 def dsv3_router_gemm_op(
     mat_a: torch.Tensor,
