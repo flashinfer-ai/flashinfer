@@ -143,7 +143,6 @@ void BatchDecodeWithPagedKVCacheRun(TensorView float_workspace_buffer,
             static_cast<IdType*>(paged_kv_indices.data_ptr()),
             static_cast<IdType*>(paged_kv_indptr.data_ptr()),
             static_cast<IdType*>(paged_kv_last_page_len.data_ptr()));
-
         Params params;
         params.q = static_cast<DTypeQ*>(q.data_ptr());
         params.paged_kv = paged_kv;

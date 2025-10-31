@@ -19,23 +19,29 @@
 using tvm::ffi::Array;
 using tvm::ffi::Optional;
 
-void pod_with_kv_cache_tensor(
-    // Prefill params
-    TensorView q_p, TensorView k_p, TensorView v_p, TensorView tmp_p, TensorView o_p,
-    Optional<TensorView> maybe_lse_p, int64_t mask_mode_code_p, int64_t layout_p,
-    int64_t window_left_p, Optional<TensorView> maybe_custom_mask_p,
-    Optional<TensorView> maybe_alibi_slopes_p, double logits_soft_cap_p, double sm_scale_p,
-    double rope_rcp_scale_p, double rope_rcp_theta_p,
-    // Decode params
+Array<int64_t> PODWithKVCachePlan(
+    TensorView float_workspace_buffer, TensorView int_workspace_buffer,
+    TensorView page_locked_int_workspace_buffer, TensorView qo_indptr_p, TensorView kv_indptr_p,
+    int64_t total_num_rows_p, int64_t batch_size_p, TensorView qo_indptr_d, TensorView kv_indptr_d,
+    int64_t total_num_rows_d, int64_t batch_size_d, int64_t num_qo_heads, int64_t num_kv_heads,
+    int64_t head_dim_qk, int64_t head_dim_vo, int64_t page_size, bool enable_cuda_graph);
+
+void PODWithKVCacheTensorRun(
+    // Shared params (match implementation in pod.cu)
     TensorView float_workspace_buffer_d, TensorView int_workspace_buffer_d,
-    Array<int64_t> plan_info_vec, TensorView q_d, TensorView paged_k_cache_d,
-    TensorView paged_v_cache_d, TensorView qo_indptr_d, TensorView paged_kv_indptr_d,
-    TensorView paged_kv_indices_d, TensorView paged_kv_last_page_len_d, TensorView o_d,
-    Optional<TensorView> maybe_lse_d, int64_t mask_mode_code_d, int64_t layout_d,
-    int64_t window_left_d, Optional<TensorView> maybe_custom_mask_d,
-    Optional<TensorView> maybe_mask_indptr_d, Optional<TensorView> maybe_alibi_slopes_d,
-    double logits_soft_cap_d, double sm_scale_d, double rope_rcp_scale_d, double rope_rcp_theta_d,
-    bool enable_pdl);
+    Array<int64_t> plan_info_vec, TensorView paged_k_cache, TensorView paged_v_cache,
+    TensorView qo_indptr, TensorView paged_kv_indptr, TensorView paged_kv_indices,
+    TensorView paged_kv_last_page_len, TensorView o, Optional<TensorView> maybe_lse, int64_t layout,
+    // Prefill params
+    TensorView q_p, int64_t mask_mode_code_p, int64_t window_left_p,
+    Optional<TensorView> maybe_custom_mask_p, Optional<TensorView> maybe_alibi_slopes_p,
+    double logits_soft_cap_p, double sm_scale_p, double rope_rcp_scale_p, double rope_rcp_theta_p,
+    // Decode params
+    TensorView q_d, int64_t mask_mode_code_d, int64_t window_left_d,
+    Optional<TensorView> maybe_custom_mask_d, Optional<TensorView> maybe_mask_indptr_d,
+    Optional<TensorView> maybe_alibi_slopes_d, double logits_soft_cap_d, double sm_scale_d,
+    double rope_rcp_scale_d, double rope_rcp_theta_d, bool enable_pdl);
 
 // Batch-request prefill attention with KV-Cache operator
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(pod_with_kv_cache_tensor, pod_with_kv_cache_tensor);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(PODWithKVCachePlan, PODWithKVCachePlan);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(PODWithKVCacheTensorRun, PODWithKVCacheTensorRun);

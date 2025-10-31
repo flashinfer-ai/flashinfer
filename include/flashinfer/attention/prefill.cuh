@@ -2103,6 +2103,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     AttentionVariant variant(params, /*batch_idx=*/request_idx, smem);
     const uint32_t qo_len = variant.qo_len, kv_len = variant.kv_len,
                    window_left = variant.window_left;
+
     const uint32_t kv_len_safe = kv_len > 0 ? kv_len : 1;
     const uint32_t qo_upper_bound =
         min(qo_len, ceil_div((qo_tile_idx + 1) * CTA_TILE_Q, group_size));
@@ -2114,7 +2115,13 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
         partition_kv ? min(kv_tile_idx * max_chunk_size + kv_start_idx, kv_len) : kv_start_idx;
     const uint32_t chunk_end =
         partition_kv ? min((kv_tile_idx + 1) * max_chunk_size + kv_start_idx, kv_len) : kv_len;
+    if (chunk_end < chunk_start) {
+      FLASHINFER_RUNTIME_ASSERT("chunk_end must >= chunk_start. Check your paged kv indices.");
+    }
     const uint32_t chunk_size = chunk_end - chunk_start;
+    if (chunk_size == 0) {
+      return;  // no kv data
+    }
     DTypeQKAccum s_frag[NUM_MMA_Q][NUM_MMA_KV][8];
     alignas(16) float o_frag[NUM_MMA_Q][NUM_MMA_D_VO][8];
     DTypeQKAccum m[NUM_MMA_Q][2];
@@ -2221,6 +2228,17 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                          chunk_start))
                : chunk_size),
           CTA_TILE_KV);
+      if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0 && num_iterations > 100000) {
+        uint32_t seq_len = kv_len - qo_len + ceil_div(((qo_tile_idx + 1) * CTA_TILE_Q), group_size);
+        printf(
+            "Debug: num_iterations: %d, request_idx: %d, chunk_size: %d, chunk_start: %d, "
+            "chunk_end: %d, max_chunk_size: %d, partition_kv: %d, qo_len: %d, kv_len: %d, "
+            "sub_if_greater_or_zero: %d, divided by CTA_TILE_KV: %d\n",
+            num_iterations, request_idx, chunk_size, chunk_start, chunk_end, max_chunk_size,
+            partition_kv, qo_len, kv_len, sub_if_greater_or_zero(seq_len, chunk_start),
+            sub_if_greater_or_zero(seq_len, chunk_start) / CTA_TILE_KV);
+      }
+
     } else if constexpr (MASK_MODE == MaskMode::kMultiItemScoring) {
       num_iterations_prefix = ceil_div(
           min(min(chunk_size,
@@ -2247,7 +2265,12 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                            chunk_start)),
                    CTA_TILE_KV));
     }
-
+    if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
+      printf(
+          "Debug: block %d request_idx: %d num_iterations: %d, qo_len: %d, kv_len: %d, "
+          "chunk_size:%d\n",
+          blockIdx.x, request_idx, num_iterations, qo_len, kv_len, chunk_size);
+    }
     const uint32_t window_iteration = ceil_div(
         sub_if_greater_or_zero(kv_len + ceil_div((qo_tile_idx + 1) * CTA_TILE_Q, group_size),
                                qo_len + window_left + chunk_start),
@@ -2566,7 +2589,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
     // this won't happen in CUDAGraph mode because we fixed the padded_batch_size
     return cudaSuccess;
   }
-
+  // bs = num_qo_tiles * num_kv_tiles * gqa_group_size
   dim3 nblks(padded_batch_size, 1, num_kv_heads);
   dim3 nthrs(32, NUM_WARPS_Q, NUM_WARPS_KV);
 

@@ -121,6 +121,12 @@ def generate_ninja_build_for_op(
     if not sysconfig.get_config_var("Py_GIL_DISABLED"):
         common_cflags.append("-DPy_LIMITED_API=0x03090000")
     common_cflags += _get_glibcxx_abi_build_flags()
+
+    # Add debug flags if FLASHINFER_DEBUG is set
+    debug = os.environ.get("FLASHINFER_DEBUG", "0") == "1"
+    if debug:
+        common_cflags.append("-g")
+
     if extra_include_dirs is not None:
         for extra_dir in extra_include_dirs:
             common_cflags.append(f"-I{extra_dir.resolve()}")
