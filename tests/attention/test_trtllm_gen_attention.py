@@ -809,8 +809,9 @@ def test_trtllm_batch_decode(
         out_dtype=out_dtype,
         o_sf_scale=o_sf_scale,
         o_sf_vec_size=o_sf_vec_size,
-        enable_pdl=enable_pdl,
         sinks=(sink if enable_sink else None),
+        kv_layout=kv_layout,
+        enable_pdl=enable_pdl,
         q_len_per_req=q_len_per_req,
     )
     # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero

@@ -984,7 +984,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
         else:
             kv_lens_arr_host = seq_lens.cpu()
         if self._backend == "trtllm-gen":
-            assert self._kv_layout == "HND"
             assert logits_soft_cap == 0.0
             self._max_kv_len = max(kv_lens_arr_host).item()
             self._kv_lens_buffer[: len(kv_lens_arr_host)].copy_(
@@ -1227,6 +1226,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
         k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
+
         if self._kv_layout == "NHD":
             page_size = k_cache.shape[1]
         else:
@@ -1234,6 +1234,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
         _check_cached_qkv_data_type(
             q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
         )
+
+        # Convert HND layout to NHD for trtllm-gen backend
+        if self._backend == "trtllm-gen" and self._kv_layout == "HND":
+            # For HND: [..., H, N, D] -> NHD: [..., N, H, D]
+            k_cache = k_cache.transpose(-3, -2)
+            v_cache = v_cache.transpose(-3, -2)
 
         pos_encoding_mode = self._pos_encoding_mode
         window_left = self._window_left if window_left is None else window_left
@@ -1997,7 +2003,6 @@ def get_trtllm_gen_decode_module(*args):
             1.0,  # NOTE(Siyuan): update this to expose bmm2 scale
             workspace_size,
             window_left,
-            layout,
             enable_pdl,
             out=o,
             sinks=sinks,

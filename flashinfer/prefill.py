@@ -582,7 +582,6 @@ def get_batch_prefill_module(backend, *args):
                 batch_size,
                 cum_seq_lens_q,
                 cum_seq_lens_kv,
-                layout,
                 enable_pdl,
                 workspace_size,
                 window_left,
@@ -2041,6 +2040,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         _check_cached_qkv_data_type(
             q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
         )
+
         stride_block = k_cache.stride(0)
         if self._kv_layout == "NHD":
             page_size = k_cache.shape[1]
@@ -2087,6 +2087,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
             check_shape_dtype_device(
                 out, q.shape[:-1] + v_cache.shape[-1:], q.dtype, q.device, "out"
             )
+
+        # Convert HND layout to NHD for trtllm-gen backend
+        if self._backend == "trtllm-gen" and self._kv_layout == "HND":
+            # For HND: [..., H, N, D] -> NHD: [..., N, H, D]
+            k_cache = k_cache.transpose(-3, -2)
+            v_cache = v_cache.transpose(-3, -2)
 
         if self._custom_mask_buf is not None:
             mask_mode = MaskMode.CUSTOM.value
