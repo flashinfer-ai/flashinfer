@@ -115,6 +115,63 @@ def test_backend_requirement_support_checks():
     assert my_kernel.is_compute_capability_supported(70) is False  # neither has it
 
 
+def test_backend_requirement_empty_backends_with_common_check_cc():
+    """Test backend_requirement with empty backend_checks but common_check with compute capability."""
+
+    # Made up compute capability
+    @supported_compute_capability([42])
+    def _common_check(x):
+        # Common check with compute capability restrictions
+        return x.shape[0] <= 1024
+
+    @backend_requirement(
+        {},  # Empty backend_checks
+        common_check=_common_check,
+    )
+    def unsupported_kernel(x):
+        return x * 2
+
+    # Check methods
+    assert hasattr(unsupported_kernel, "is_backend_supported")
+    assert hasattr(unsupported_kernel, "is_compute_capability_supported")
+
+    # Check compute capability support (only common_check)
+    assert unsupported_kernel.is_compute_capability_supported(42) is True
+    assert unsupported_kernel.is_compute_capability_supported(75) is False
+    assert unsupported_kernel.is_backend_supported(None, 42) is True
+    assert unsupported_kernel.is_backend_supported(None, 75) is False
+
+    # Test compute capability support during kernel runtime
+    x = torch.randn(10, 10, device="cuda")
+
+    # Will always raise error because no real compute capability is supported
+    with pytest.raises(BackendSupportedError, match="does not support backend"):
+        unsupported_kernel(x)
+
+    actual_capability = torch.cuda.get_device_capability(x.device)
+    major, minor = actual_capability
+    actual_capability = major * 10 + minor
+
+    @supported_compute_capability([actual_capability])
+    def _common_check(x):
+        return True
+
+    @backend_requirement(
+        {},
+        common_check=_common_check,
+    )
+    def supported_kernel(x):
+        return x * 2
+
+    assert supported_kernel.is_compute_capability_supported(actual_capability) is True
+    assert supported_kernel.is_backend_supported(None, actual_capability) is True
+    assert (
+        supported_kernel.is_backend_supported("any_backend", actual_capability) is True
+    )
+    result = supported_kernel(x)
+    assert result.shape == x.shape
+
+
 def test_backend_requirement_wrapped_function():
     """Test the backend_requirement decorator's wrapped function."""
     if not torch.cuda.is_available():
