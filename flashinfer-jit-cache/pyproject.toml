@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=77", "packaging>=24", "wheel", "torch", "ninja", "requests", "numpy", "nvidia-ml-py", "nvidia-nvshmem-cu12", "apache-tvm-ffi>=0.1,<0.2"]
+build-backend = "build_backend"
+backend-path = ["."]
+
+[project]
+name = "flashinfer-jit-cache"
+dynamic = ["version"]
+description = "Pre-compiled JIT Cache for FlashInfer"
+readme = {text = "This package contains pre-compiled JIT Cache for FlashInfer. It provides most of the necessary shared libraries (.so files) of FlashInfer.", content-type = "text/plain"}
+requires-python = ">=3.9"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "FlashInfer team"},
+]
+maintainers = [
+    {name = "FlashInfer team"},
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/flashinfer-ai/flashinfer"
+Documentation = "https://github.com/flashinfer-ai/flashinfer"
+Repository = "https://github.com/flashinfer-ai/flashinfer"
+"Issue Tracker" = "https://github.com/flashinfer-ai/flashinfer/issues"
+
+[tool.setuptools]
+packages = ["flashinfer_jit_cache"]
+include-package-data = true
+
+[tool.setuptools.dynamic]
+version = {attr = "flashinfer_jit_cache.__version__"}
+
+[tool.setuptools.package-data]
+flashinfer_jit_cache = ["jit_cache/**/*.so"]

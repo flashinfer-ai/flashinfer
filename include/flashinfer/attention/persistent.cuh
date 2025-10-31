@@ -35,7 +35,7 @@ __device__ __forceinline__ auto get_block_coord(const Params& params, const uint
                     params.partial_indptr[work_idx], params.q_len[work_idx],
                     params.kv_len[work_idx], params.q_start[work_idx], params.kv_start[work_idx],
                     params.kv_end[work_idx], params.kv_head_idx_arr[work_idx],
-                    params.len_kv_chunk[work_idx]);
+                    *params.len_kv_chunk);
 }
 
 template <typename KTraits>
@@ -138,6 +138,41 @@ __device__ __forceinline__ void write_o_(float (*o_frag)[KTraits::NUM_MMA_D_VO][
   }
 }
 
+template <typename KTraits>
+__device__ __forceinline__ void normalize_d(float (*o_frag)[KTraits::NUM_MMA_D_VO][8],
+                                            typename KTraits::DTypeQKAccum (*m)[2], float (*d)[2],
+                                            float v_scale = 1.0f) {
+  using AttentionVariant = typename KTraits::AttentionVariant;
+  if constexpr (AttentionVariant::use_softmax) {
+    float d_rcp[KTraits::NUM_MMA_Q][2];
+    // compute reciprocal of d
+#pragma unroll
+    for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
+#pragma unroll
+      for (uint32_t j = 0; j < 2; ++j) {
+        d_rcp[mma_q][j] = (m[mma_q][j] != typename KTraits::DTypeQKAccum(-math::inf))
+                              ? math::ptx_rcp(d[mma_q][j])
+                              : 0.f;
+      }
+    }
+
+#pragma unroll
+    for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
+#pragma unroll
+      for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_VO; ++mma_d) {
+#pragma unroll
+        for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
+          o_frag[mma_q][mma_d][reg_id] =
+              o_frag[mma_q][mma_d][reg_id] * d_rcp[mma_q][(reg_id >> 1) & 1];
+          if (v_scale != 1.0f) {
+            o_frag[mma_q][mma_d][reg_id] *= v_scale;
+          }
+        }
+      }
+    }
+  }
+}
+
 template <typename KTraits_, typename Params_>
 struct BlockBatchPagedAttentionPersistent {
   using KTraits = KTraits_;
@@ -235,13 +270,13 @@ struct BlockBatchPagedAttentionPersistent {
       const auto [q_indptr, kv_indptr, o_indptr, q_len, kv_len, packed_qo_start, kv_start, kv_end,
                   kv_head_idx, len_kv_chunk] = get_block_coord(params, work_idx);
 
-      const uint32_t kv_chunk_idx = ceil_div(kv_start, len_kv_chunk);
+      const uint32_t kv_chunk_idx = kv_start / len_kv_chunk;
       const uint32_t num_kv_chunks = ceil_div(
           CAUSAL
-              ? min((kv_len - q_len) + (packed_qo_start + cluster_tile_q) / gqa_group_size, kv_len)
+              ? min((kv_len - q_len) + ceil_div(packed_qo_start + cluster_tile_q, gqa_group_size),
+                    kv_len)
               : kv_len,
           len_kv_chunk);
-
       const uint32_t qo_packed_idx_base = packed_qo_start + blockIdx.x * CTA_TILE_Q +
                                           get_warp_idx_q<KTraits>(tid.y) * NUM_MMA_Q * 16;
       const uint32_t qo_upperbound =
@@ -298,6 +333,13 @@ struct BlockBatchPagedAttentionPersistent {
             __syncthreads();
 
             compute_qk<KTraits>(&q_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag);
+            if constexpr (AttentionVariant::use_logits_soft_cap) {
+              logits_transform<KTraits>(
+                  params, variant, /*batch_idx=*/0, qo_packed_idx_base,
+                  kv_start + (kv_tile_idx * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) *
+                                 NUM_MMA_KV * 16,
+                  q_len, kv_len, gqa_group_size, s_frag, tid, kv_head_idx);
+            }
             if constexpr (WITH_MASK) {
               logits_mask<KTraits>(
                   params, variant, /*batch_idx=*/0, qo_packed_idx_base,
@@ -329,6 +371,13 @@ struct BlockBatchPagedAttentionPersistent {
 #pragma unroll
       for (; kv_tile_idx >= 0; --kv_tile_idx) {
         compute_qk<KTraits>(&q_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag);
+        if constexpr (AttentionVariant::use_logits_soft_cap) {
+          logits_transform<KTraits>(
+              params, variant, /*batch_idx=*/0, qo_packed_idx_base,
+              kv_start +
+                  (kv_tile_idx * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16,
+              q_len, kv_len, gqa_group_size, s_frag, tid, kv_head_idx);
+        }
         logits_mask<KTraits>(
             params, variant, /*batch_idx=*/0, qo_packed_idx_base,
             kv_start +
@@ -346,7 +395,7 @@ struct BlockBatchPagedAttentionPersistent {
       threadblock_sync_mdo_states<KTraits>(o_frag, smem_storage, m, d, warp_idx, lane_idx, tid);
 
       // normalize d
-      normalize_d<KTraits>(o_frag, m, d);
+      normalize_d<KTraits>(o_frag, m, d, params.v_scale);
 
       // write back to global memory
       // o_indptr (partial_o): [packed_qo_len * num_kv_chunks, num_kv_heads, head_dim]
@@ -359,10 +408,13 @@ struct BlockBatchPagedAttentionPersistent {
                           warp_idx, lane_idx, tid);
       } else {
         // write through
+        // o_stride_n = num_qo_heads* head_dim
+        const uint32_t o_stride_n = num_kv_heads * gqa_group_size * HEAD_DIM_VO,
+                       o_stride_h = HEAD_DIM_VO;
         DTypeO* o_ptr_base =
-            params.final_o + q_indptr * q_stride_n + (kv_head_idx * gqa_group_size) * q_stride_h;
+            params.final_o + q_indptr * o_stride_n + (kv_head_idx * gqa_group_size) * o_stride_h;
         write_o_reg_gmem<KTraits>(o_frag, &q_smem, o_ptr_base, qo_packed_idx_base, q_len,
-                                  q_stride_n, q_stride_h, gqa_group_size, tid);
+                                  o_stride_n, o_stride_h, gqa_group_size, tid);
       }
 
       if constexpr (variant.use_softmax) {
@@ -414,9 +466,8 @@ struct StateReductionKernelTraits {
   static constexpr uint32_t NUM_THREADS = NUM_THREADS_;
   static constexpr uint32_t NUM_WARPS = NUM_THREADS / 32;
 
-  static constexpr uint32_t vec_size = (16U / sizeof(DTypeIn)) > (HEAD_DIM_VO / 32U)
-                                           ? (16U / sizeof(DTypeIn))
-                                           : (HEAD_DIM_VO / 32U);
+  static constexpr uint32_t vec_size =
+      std::max<uint32_t>(16U / static_cast<uint32_t>(sizeof(DTypeIn)), HEAD_DIM_VO / 32U);
   static constexpr uint32_t bdx = HEAD_DIM_VO / vec_size;
 
   // gridDim is accessed by runtime variable and should be set by core attention
@@ -440,6 +491,7 @@ struct BlockBatchReductionPersistent {
       const typename KTraits::IdType num_to_merge_qo_len, const uint_fastdiv gqa_group_size,
       const uint32_t num_kv_heads, const typename KTraits::IdType* indptr,
       const typename KTraits::IdType* o_indices, uint8_t* smem PROFILER_CLOSURE_FUNC_PARAMS) {
+    __syncthreads();  // NOTE(Zihao): required for guarantee correctness on blackwell
     using DTypeIn = typename KTraits::DTypeIn;
     using DTypeO = typename KTraits::DTypeO;
     using IdType = typename KTraits::IdType;
@@ -470,29 +522,27 @@ struct BlockBatchReductionPersistent {
 #pragma unroll 1
     for (uint32_t i = worker_id; i < num_to_merge_qo_len * num_kv_heads; i += num_workers) {
       PROFILER_EVENT_START(profiler_closure, PersistentProfileEventType::kReduction);
-
+      __syncwarp();  // avoid data hazard due to reordering st.cast_store
       // remap workload
       uint32_t packed_qo_idx = i / num_kv_heads;
       uint32_t kv_head_idx = i % num_kv_heads;
-      uint32_t qo_head_idx = packed_qo_idx % gqa_group_size;
+      const uint32_t num_index_sets = indptr[packed_qo_idx + 1] - indptr[packed_qo_idx];
+      if (num_index_sets == 0 || num_index_sets == 1) {
+        // already write through, bypass
+        PROFILER_EVENT_END(profiler_closure, PersistentProfileEventType::kReduction);
+        continue;
+      }
 
       // index calculation
       auto partial_idx_to_offset = [&](uint32_t off) {
         return (indptr[packed_qo_idx] + off) * num_kv_heads + kv_head_idx;
       };
       auto merge_idx_to_offset = [&]() {
-        return (o_indices[packed_qo_idx] * num_kv_heads + kv_head_idx) * gqa_group_size +
-               qo_head_idx;
+        // NOTE (Yilong): qo_head_idx has been calculated in schedule.plan
+        return o_indices[packed_qo_idx] + kv_head_idx * gqa_group_size;
       };
 
       state_t<vec_size> st;
-      const uint32_t num_index_sets = indptr[packed_qo_idx + 1] - indptr[packed_qo_idx];
-
-      if (num_index_sets == 0 || num_index_sets == 1) {
-        // already write through, bypass
-        PROFILER_EVENT_END(profiler_closure, PersistentProfileEventType::kReduction);
-        continue;
-      }
 
 #pragma unroll
       for (uint32_t iter = 0; iter < num_smem_stages; ++iter) {

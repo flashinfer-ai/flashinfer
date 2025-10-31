@@ -1,0 +1,13 @@
+apache-tvm-ffi>=0.1,<0.2
+click
+einops
+ninja
+numpy
+nvidia-cudnn-frontend>=1.13.0
+nvidia-cutlass-dsl>=4.2.1
+nvidia-ml-py
+packaging>=24.2
+requests
+tabulate
+torch
+tqdm

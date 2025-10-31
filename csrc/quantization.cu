@@ -15,40 +15,38 @@
  */
 #include <flashinfer/quantization.cuh>
 
-#include "pytorch_extension_utils.h"
+#include "tvm_ffi_utils.h"
 
 using namespace flashinfer;
 
-void packbits(at::Tensor x, const std::string& bitorder, at::Tensor y) {
+void packbits(TensorView x, const std::string& bitorder, TensorView y) {
   CHECK_INPUT(x);
   auto device = x.device();
-  TORCH_CHECK(bitorder == "big" || bitorder == "little", "bitorder must be 'big' or 'little'");
+  TVM_FFI_ICHECK(bitorder == "big" || bitorder == "little") << "bitorder must be 'big' or 'little'";
 
   int64_t num_elements = x.numel();
-  const c10::cuda::OptionalCUDAGuard device_guard(device);
-  auto stream = at::cuda::getCurrentCUDAStream();
+  auto stream = get_stream(x.device());
   cudaError_t status = quantization::PackBits(
       static_cast<bool*>(x.data_ptr()), static_cast<uint8_t*>(y.data_ptr()), num_elements,
       bitorder == "big" ? quantization::BitOrder::kBig : quantization::BitOrder::kLittle, stream);
 
-  TORCH_CHECK(status == cudaSuccess,
-              "PackBits failed with error code " + std::string(cudaGetErrorString(status)));
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "PackBits failed with error code " << cudaGetErrorString(status);
 }
 
-void segment_packbits(at::Tensor x, at::Tensor input_indptr, at::Tensor output_indptr,
-                      const std::string& bitorder, at::Tensor y) {
+void segment_packbits(TensorView x, TensorView input_indptr, TensorView output_indptr,
+                      const std::string& bitorder, TensorView y) {
   CHECK_INPUT(x);
   CHECK_INPUT(input_indptr);
   CHECK_INPUT(output_indptr);
-  auto device = x.device();
-  CHECK_EQ(input_indptr.device(), device);
-  CHECK_EQ(output_indptr.device(), device);
-  TORCH_CHECK(bitorder == "big" || bitorder == "little", "bitorder must be 'big' or 'little'");
+  CHECK_DEVICE(input_indptr, x);
+  CHECK_DEVICE(output_indptr, x);
+  TVM_FFI_ICHECK(bitorder == "big" || bitorder == "little") << "bitorder must be 'big' or 'little'";
   unsigned int batch_size = input_indptr.size(0) - 1;
-  CHECK_EQ(output_indptr.size(0), batch_size + 1);
+  TVM_FFI_ICHECK_EQ(output_indptr.size(0), batch_size + 1)
+      << "output_indptr must be on the same device as x";
 
-  const c10::cuda::OptionalCUDAGuard device_guard(device);
-  auto stream = at::cuda::getCurrentCUDAStream();
+  auto stream = get_stream(x.device());
   cudaError_t status = quantization::SegmentPackBits(
       static_cast<bool*>(x.data_ptr()), static_cast<uint8_t*>(y.data_ptr()),
       static_cast<int32_t*>(input_indptr.data_ptr()),

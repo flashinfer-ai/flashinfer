@@ -1,29 +1,29 @@
 #include <flashinfer/attention/decode.cuh>
 #include <flashinfer/attention/scheduler.cuh>
-#include <optional>
 
 #include "mla_config.inc"
-#include "pytorch_conversion_utils.h"
-#include "pytorch_extension_utils.h"
+#include "tvm/ffi/container/array.h"
+#include "tvm_ffi_utils.h"
 
 using namespace flashinfer;
 
-at::Tensor BatchDecodeWithPagedKVCachePlanMLA(at::Tensor float_workspace_buffer,
-                                              at::Tensor int_workspace_buffer,
-                                              at::Tensor page_locked_int_workspace_buffer,
-                                              at::Tensor indptr, int64_t batch_size,
-                                              int64_t num_qo_heads, int64_t page_size,
-                                              bool enable_cuda_graph) {
-  const c10::cuda::OptionalCUDAGuard device_guard(float_workspace_buffer.device());
-  const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+using tvm::ffi::Array;
+
+Array<int64_t> BatchDecodeWithPagedKVCachePlanMLA(TensorView float_workspace_buffer,
+                                                  TensorView int_workspace_buffer,
+                                                  TensorView page_locked_int_workspace_buffer,
+                                                  TensorView indptr, int64_t batch_size,
+                                                  int64_t num_qo_heads, int64_t page_size,
+                                                  bool enable_cuda_graph) {
+  cudaSetDevice(float_workspace_buffer.device().device_id);
+  const cudaStream_t stream = get_stream(float_workspace_buffer.device());
 
   size_t float_workspace_size_in_bytes =
-      float_workspace_buffer.size(0) * float_workspace_buffer.element_size();
+      float_workspace_buffer.size(0) * get_element_size(float_workspace_buffer);
   size_t int_workspace_size_in_bytes =
-      int_workspace_buffer.size(0) * int_workspace_buffer.element_size();
+      int_workspace_buffer.size(0) * get_element_size(int_workspace_buffer);
 
   DecodePlanInfo plan_info;
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
 
   auto work_estimation_func =
       BatchDecodeWithPagedKVCacheWorkEstimationDispatchedMLA<HEAD_DIM_CKV, HEAD_DIM_KPE,
@@ -37,8 +37,8 @@ at::Tensor BatchDecodeWithPagedKVCachePlanMLA(at::Tensor float_workspace_buffer,
           batch_size, num_qo_heads, page_size, enable_cuda_graph, /*stream=*/stream,
           work_estimation_func);
 
-  TORCH_CHECK(status == cudaSuccess, "BatchDecodeWithPagedKVCachePlanMLA failed with error ",
-              cudaGetErrorString(status));
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "BatchDecodeWithPagedKVCachePlanMLA failed with error: " << cudaGetErrorString(status);
 
-  return vec_to_tensor(plan_info.ToVector());
+  return Array(plan_info.ToVector());
 }

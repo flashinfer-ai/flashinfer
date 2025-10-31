@@ -20,19 +20,8 @@ from typing import List, Tuple
 
 import torch
 
-from ..jit import JitSpec
-from ..jit import env as jit_env
-from ..jit import gen_jit_spec
+from ..jit.comm import gen_vllm_comm_module
 from ..utils import register_custom_op
-
-
-def gen_vllm_comm_module() -> JitSpec:
-    return gen_jit_spec(
-        "vllm_comm",
-        [
-            jit_env.FLASHINFER_CSRC_DIR / "vllm_custom_all_reduce.cu",
-        ],
-    )
 
 
 @functools.cache
@@ -55,7 +44,8 @@ def get_vllm_comm_module():
 
     @register_custom_op("flashinfer::get_graph_buffer_ipc_meta", mutates_args=["fa"])
     def get_graph_buffer_ipc_meta(fa: int) -> Tuple[List[int], List[int]]:
-        return module.get_graph_buffer_ipc_meta(fa)
+        output_bytes, output_offsets = module.get_graph_buffer_ipc_meta(fa)
+        return list(output_bytes), list(output_offsets)
 
     @register_custom_op(
         "flashinfer::register_buffer", mutates_args=["fa", "fake_ipc_ptrs"]

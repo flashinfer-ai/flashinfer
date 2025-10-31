@@ -21,18 +21,18 @@ from typing import Any, List, Literal, Optional, Tuple, Union, overload
 
 import torch
 
-from .cudnn import cudnn_batch_decode_with_kv_cache
+from .cudnn import cudnn_batch_decode_with_kv_cache as cudnn_batch_decode_with_kv_cache
 from .jit import (
-    cudnn_fmha_gen_module,
     gen_batch_decode_mla_module,
     gen_batch_decode_module,
     gen_customize_batch_decode_module,
     gen_customize_batch_prefill_module,
     gen_single_decode_module,
     get_batch_decode_uri,
+    get_batch_prefill_uri,
     get_single_decode_uri,
     setup_cubin_loader,
-    trtllm_fmha_gen_module,
+    gen_trtllm_gen_fmha_module,
 )
 from .page import get_seq_lens
 from .prefill import (
@@ -41,21 +41,28 @@ from .prefill import (
     get_single_prefill_module,
 )
 from .utils import (
+    FP4Tensor,
     MaskMode,
     PosEncodingMode,
     TensorLayout,
     _check_cached_qkv_data_type,
     _check_kv_layout,
     _check_pos_encoding_mode,
-    _check_shape_dtype_device,
+    check_shape_dtype_device,
     _get_cache_alibi_slopes_buf,
     _get_cache_buf,
     _get_range_buf,
     _unpack_paged_kv_cache,
     canonicalize_torch_dtype,
     device_support_pdl,
+    get_device_sm_count,
+    is_float8,
     register_custom_op,
     register_fake_op,
+    ceil_div,
+    round_up,
+    get_compute_capability,
+    GPUArchitectureError,
 )
 
 
@@ -63,7 +70,7 @@ from .utils import (
 def get_single_decode_module(*args):
     uri = get_single_decode_uri(*args)
     module = gen_single_decode_module(*args).build_and_load()
-    run_func = module.run.default
+    run_func = module.run
 
     # torch library for single_decode_with_kv_cache
 
@@ -123,8 +130,8 @@ def get_single_decode_module(*args):
 
 @functools.cache
 def get_batch_decode_jit_module(module_name: str, jit_module: Any):
-    plan_func = jit_module.plan.default
-    run_func = jit_module.run.default
+    plan_func = jit_module.plan
+    run_func = jit_module.run
 
     @register_custom_op(
         f"flashinfer::{module_name}_run",
@@ -202,8 +209,8 @@ def get_batch_decode_jit_module(module_name: str, jit_module: Any):
 def get_batch_decode_module(*args):
     uri = get_batch_decode_uri(*args)
     mod = gen_batch_decode_module(*args).build_and_load()
-    plan_func = mod.plan.default
-    run_func = mod.run.default
+    plan_func = mod.plan
+    run_func = mod.run
 
     # torch library for batch_decode_with_paged_kv_cache_run
 
@@ -296,8 +303,8 @@ def get_batch_decode_module(*args):
 
 
 @functools.cache
-def get_trtllm_fmha_gen_module():
-    mod = trtllm_fmha_gen_module()
+def get_trtllm_gen_fmha_module():
+    mod = gen_trtllm_gen_fmha_module()
     op = mod.build_and_load()
     setup_cubin_loader(mod.get_library_path())
     return op
@@ -320,7 +327,7 @@ def single_decode_with_kv_cache_with_jit_module(
         lse = torch.empty((q.size(0)), dtype=torch.float32, device=device)
     else:
         lse = None
-    jit_module.run.default(
+    jit_module.run(
         q,
         k,
         v,
@@ -560,7 +567,11 @@ def single_decode_with_kv_cache(
         )
 
     if v_scale is not None:
-        out *= v_scale
+        # TODO(Zihao): fused into kernel
+        if out.itemsize == 1:
+            out = (out.to(float) * v_scale).to(out.dtype)
+        else:
+            out *= v_scale
     if return_lse:
         return out, lse
     else:
@@ -584,7 +595,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
     >>> max_num_pages = 128
     >>> page_size = 16
     >>> # allocate 128MB workspace buffer
-    >>> workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
+    >>> workspace_buffer = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
     >>> decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
     ...     workspace_buffer, "NHD"
     ... )
@@ -642,13 +653,14 @@ class BatchDecodeWithPagedKVCacheWrapper:
         paged_kv_indptr_buffer: Optional[torch.Tensor] = None,
         paged_kv_indices_buffer: Optional[torch.Tensor] = None,
         paged_kv_last_page_len_buffer: Optional[torch.Tensor] = None,
+        backend: str = "auto",
         jit_args: Optional[List[Any]] = None,
     ) -> None:
         r"""Constructor of :class:`BatchDecodeWithPagedKVCacheWrapper`.
 
         Parameters
         ----------
-        float_workspace_buffer : torch.Tensor
+        float_workspace_buffer : torch.Tensor. Must be initialized to 0 for its first use.
             The user reserved float workspace buffer used to store intermediate attention results
             in the split-k algorithm. The recommended size is 128MB, the device of the workspace
             buffer should be the same as the device of the input tensors.
@@ -680,6 +692,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
             The user reserved buffer on GPU to store the number of entries in the last page, the
             size of the buffer should be ``[batch_size]``.
             Only needed when ``use_cuda_graph`` is ``True``.
+
+        backend : str
+            The implementation backend, could be ``auto``/``fa2`` or ``trtllm-gen``. Defaults to ``auto``.
+            If set to ``auto``, the wrapper will automatically choose the backend based on the
+            device architecture and kernel availability.
 
         jit_args : Optional[List[Any]]
             If provided, the wrapper will use the provided arguments to create the JIT module,
@@ -715,6 +732,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
             pin_memory=True,
             device="cpu",
         )
+        self._kv_lens_buffer: Optional[torch.Tensor] = None
+        if backend == "trtllm-gen":
+            self._kv_lens_buffer = torch.empty(
+                (32768,), dtype=torch.int32, device=self.device
+            )
 
         if use_cuda_graph:
             if not torch.is_tensor(paged_kv_indptr_buffer):
@@ -740,7 +762,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         self._paged_kv_indptr_buf = paged_kv_indptr_buffer
         self._paged_kv_indices_buf = paged_kv_indices_buffer
         self._paged_kv_last_page_len_buf = paged_kv_last_page_len_buffer
-        self._use_tensor_cores = use_tensor_cores
+        self._use_tensor_cores = use_tensor_cores or backend == "trtllm-gen"
         self._use_cuda_graph = use_cuda_graph
 
         if use_tensor_cores:
@@ -751,6 +773,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     dtype=torch.int32,
                     device=float_workspace_buffer.device,
                 )
+        self._backend = backend
 
     @property
     def use_tensor_cores(self) -> bool:
@@ -803,18 +826,22 @@ class BatchDecodeWithPagedKVCacheWrapper:
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
         non_blocking: bool = True,
+        block_tables: Optional[torch.Tensor] = None,
+        seq_lens: Optional[torch.Tensor] = None,
+        fixed_split_size: Optional[int] = None,
+        disable_split_kv: bool = False,
     ) -> None:
         r"""Plan batch decode for given problem specification.
 
         Parameters
         ----------
         indptr : torch.Tensor
-            The indptr of the paged kv cache, shape: ``[batch_size + 1]``
+            The indptr of the paged kv cache, shape: ``[batch_size + 1]``, dtype: ``torch.int32``
         indices : torch.Tensor
-            The page indices of the paged kv cache, shape: ``[qo_indptr[-1]]``
+            The page indices of the paged kv cache, shape: ``[kv_indptr[-1]]``, dtype: ``torch.int32``
         last_page_len : torch.Tensor
             The number of entries in the last page of each request in the paged kv
-            cache, shape: ``[batch_size]``
+            cache, shape: ``[batch_size]``, dtype: ``torch.int32``
         num_qo_heads : int
             The number of query/output heads
         num_kv_heads : int
@@ -846,8 +873,18 @@ class BatchDecodeWithPagedKVCacheWrapper:
             data_type is deprecated, please use q_data_type and kv_data_type instead.
         non_blocking : bool
             Whether to copy the input tensors to the device asynchronously, defaults to ``True``.
-
-
+        seq_lens: Optional[torch.Tensor]
+            A uint32 1D tensor indicating the kv sequence length of each prompt. shape: ``[batch_size]``.
+        block_tables: Optional[torch.Tensor]
+            A uint32 2D tensor indicating the block table of each prompt. shape: ``[batch_size, max_num_blocks_per_seq]``.
+        fixed_split_size : Optional[int],
+            The fixed split size for FA2 split-kv decode, in pages. Only supported by tensor core decode for now. Recommend setting to the average sequence length of your workload.
+            When enabled, will lead to deterministic softmax score reduction in the merge_states kernel, and therefore
+            batch-size invariant outputs. See https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/
+            Note that compatibility with CUDA graph is NOT guaranteed, as even when bs is fixed, kv seq len can change
+            and lead to a varied number of launched CTAs.
+        disable_split_kv : bool,
+            Whether to disable the split-kv for determinism in CUDA Graph, defaults to ``False``.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -860,6 +897,21 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         The :meth:`plan` method cannot be used in Cuda Graph or in ``torch.compile``.
         """
+        for tensor, name in [
+            (indptr, "indptr"),
+            (indices, "indices"),
+            (last_page_len, "last_page_len"),
+        ]:
+            if tensor.dtype != torch.int32:
+                raise ValueError(
+                    f"{name} must have dtype torch.int32, got {tensor.dtype}"
+                )
+
+        self._workspace_size = (
+            self._float_workspace_buffer.numel()
+            * self._float_workspace_buffer.element_size()
+        )
+
         batch_size = len(last_page_len)
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
@@ -911,11 +963,67 @@ class BatchDecodeWithPagedKVCacheWrapper:
         if kv_data_type is None:
             kv_data_type = q_data_type
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
+        if fixed_split_size is not None and not self.use_tensor_cores:
+            raise ValueError(
+                "fixed_split_size is only supported by tensor core decode for now."
+            )
+        if fixed_split_size is None:
+            fixed_split_size = -1
 
         self._cached_q_data_type = q_data_type
         self._cached_kv_data_type = kv_data_type
-        if self.use_tensor_cores:
+        self._batch_size = batch_size
+        self._num_qo_heads = num_qo_heads
+        self._num_kv_heads = num_kv_heads
+        self._block_tables: Optional[torch.Tensor] = block_tables
+        self._max_kv_len: Optional[int] = None
+
+        if seq_lens is None:
             kv_lens_arr_host = get_seq_lens(indptr_host, last_page_len_host, page_size)
+        else:
+            kv_lens_arr_host = seq_lens.cpu()
+        if self._backend == "trtllm-gen":
+            assert self._kv_layout == "HND"
+            assert logits_soft_cap == 0.0
+            self._max_kv_len = max(kv_lens_arr_host).item()
+            self._kv_lens_buffer[: len(kv_lens_arr_host)].copy_(
+                kv_lens_arr_host, non_blocking=non_blocking
+            )
+            if self._block_tables is None:
+                blocks_per_seq = [
+                    (seq_len + page_size - 1) // page_size
+                    for seq_len in kv_lens_arr_host
+                ]
+                max_num_blocks_per_seq = max(blocks_per_seq)
+                self._block_tables = torch.zeros(
+                    (batch_size, max_num_blocks_per_seq),
+                    dtype=torch.int,
+                    device=self.device,
+                )
+                block_id = indptr[0]
+                for i in range(batch_size):
+                    num_blocks_needed = blocks_per_seq[i]
+                    self._block_tables[i, :num_blocks_needed] = (
+                        self._paged_kv_indices_buf[
+                            block_id : block_id + num_blocks_needed
+                        ]
+                    )
+                    block_id += num_blocks_needed
+            self._cached_module = get_trtllm_gen_decode_module(
+                q_data_type,
+                kv_data_type,
+                q_data_type,
+                indptr.dtype,
+                head_dim,
+                head_dim,
+                PosEncodingMode[pos_encoding_mode].value,
+                window_left >= 0,  # use_sliding_window
+                logits_soft_cap > 0,  # use_logits_soft_cap
+                False,  # use_fp16_qk_reduction
+            )
+            self._plan_info = self._cached_module.plan()  # None
+        elif self.use_tensor_cores:
+            self._max_kv_len = max(kv_lens_arr_host).item()
             if self._jit_module is not None:
                 self._cached_module = self._jit_module
             else:
@@ -949,6 +1057,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 head_dim,
                 head_dim,
                 False,  # causal
+                window_left,
+                fixed_split_size,
+                disable_split_kv,
             )
         else:
             if self._jit_module is not None:
@@ -965,7 +1076,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     window_left != -1,  # use_sliding_window
                     logits_soft_cap > 0,  # use_logits_soft_cap
                 )
-
             self._plan_info = self._cached_module.plan(
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
@@ -1031,6 +1141,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         lse: Optional[torch.Tensor] = None,
         return_lse: Literal[False] = False,
         enable_pdl: Optional[bool] = None,
+        window_left: Optional[int] = None,
     ) -> torch.Tensor: ...
 
     @overload
@@ -1046,6 +1157,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         lse: Optional[torch.Tensor] = None,
         return_lse: Literal[True] = True,
         enable_pdl: Optional[bool] = None,
+        window_left: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
     def run(
@@ -1060,6 +1172,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
         lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
         enable_pdl: Optional[bool] = None,
+        window_left: Optional[int] = None,
+        sinks: Optional[torch.Tensor] = None,
+        q_len_per_req: Optional[int] = 1,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch decode attention between query and paged kv cache.
 
@@ -1097,6 +1212,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         enable_pdl : bool
             Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
             Only supported for >= sm90, and currently only for FA2 and CUDA core decode.
+        q_len_per_req : int
+            The number of query tokens per request, if not provided, will be set to ``1``.
         Returns
         -------
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -1109,12 +1226,20 @@ class BatchDecodeWithPagedKVCacheWrapper:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
         k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
+        if self._kv_layout == "NHD":
+            page_size = k_cache.shape[1]
+        else:
+            page_size = k_cache.shape[2]
         _check_cached_qkv_data_type(
             q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
         )
 
         pos_encoding_mode = self._pos_encoding_mode
-        window_left = self._window_left
+        window_left = self._window_left if window_left is None else window_left
+        if self._backend != "trtllm-gen":
+            # NOTE(Siyuan): since window_left is appeared in the plan function, we need to make sure it is the same as the one in the plan function.
+            # Remove this check if the backend supports dynamic window_left.
+            assert window_left == self._window_left
         logits_soft_cap = self._logits_soft_cap
         sm_scale = self._sm_scale
         rope_scale = self._rope_scale
@@ -1140,14 +1265,17 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     (q.size(0), q.size(1)), dtype=torch.float32, device=q.device
                 )
             else:
-                _check_shape_dtype_device(
+                check_shape_dtype_device(
                     lse, (q.size(0), q.size(1)), torch.float32, q.device, "lse"
                 )
 
         if out is None:
             out = torch.empty_like(q)
         else:
-            _check_shape_dtype_device(out, q.shape, q.dtype, q.device, "out")
+            check_shape_dtype_device(out, q.shape, q.dtype, q.device, "out")
+
+        if self._backend == "trtllm-gen":
+            q = q.view(q.size(0) // q_len_per_req, q_len_per_req, q.size(1), q.size(2))
 
         if self.use_tensor_cores:
             run_args = [
@@ -1187,10 +1315,26 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     rope_scale,
                     rope_theta,
                     0,  # token_pos_in_items_len
+                    self._workspace_size,
+                    paged_kv_cache,
+                    self._num_qo_heads,
+                    self._num_kv_heads,
+                    self._block_tables,
+                    self._kv_lens_buffer,
+                    page_size,
+                    self._max_kv_len,
+                    sinks,
                 ]
 
             self._cached_module.paged_run(*run_args)
         else:
+            # trtllm-gen does not need plan info
+            if self._backend == "trtllm-gen" and self._plan_info is None:
+                plan_info: List[int] = []
+            else:
+                plan_info = self._plan_info
+            assert plan_info is not None, "plan info is not initialized"
+
             run_args = [
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
@@ -1221,7 +1365,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
             self._cached_module.run(*run_args)
         if v_scale is not None:
-            out *= v_scale
+            # TODO(Zihao): fused into kernel
+            if is_float8(out):
+                out = (out.to(torch.float32) * v_scale).to(out.dtype)
+            else:
+                out *= v_scale
 
         return (out, lse) if return_lse else out
 
@@ -1473,12 +1621,12 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
         Parameters
         ----------
         indptr : torch.Tensor
-            The indptr of the paged kv cache, shape: ``[batch_size + 1]``
+            The indptr of the paged kv cache, shape: ``[batch_size + 1]``, dtype: ``torch.int32``
         indices : torch.Tensor
-            The page indices of the paged kv cache, shape: ``[qo_indptr[-1]]``
+            The page indices of the paged kv cache, shape: ``[qo_indptr[-1]]``, dtype: ``torch.int32``
         last_page_len : torch.Tensor
             The number of entries in the last page of each request in the paged kv
-            cache, shape: ``[batch_size]``
+            cache, shape: ``[batch_size]``, dtype: ``torch.int32``
         num_qo_heads : int
             The number of query/output heads
         head_dim_compressed_kv : int
@@ -1508,6 +1656,16 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
         :meth:`run_return_lse` calls, auxiliary data structures will be created
         during this call and cached for multiple run calls.
         """
+        for tensor, name in [
+            (indptr, "indptr"),
+            (indices, "indices"),
+            (last_page_len, "last_page_len"),
+        ]:
+            if tensor.dtype != torch.int32:
+                raise ValueError(
+                    f"{name} must have dtype torch.int32, got {tensor.dtype}"
+                )
+
         batch_size = len(last_page_len)
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
@@ -1619,6 +1777,15 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
             * attention output, shape: ``[batch_size, num_qo_heads, head_dim]``
             * logsumexp of attention scores, shape: ``[batch_size, num_qo_heads]``.
         """
+
+        # MLA decode kernel supports SM80 only
+        major, minor = get_compute_capability(q_nope.device)
+        device_arch = major * 10 + minor
+        if device_arch != 80:
+            raise GPUArchitectureError(
+                f"MLA decode kernel is not supported on this GPU (SM{device_arch}). "
+                "Supported architecture: SM80."
+            )
         window_left = self._window_left
         logits_soft_cap = self._logits_soft_cap
         sm_scale = self._sm_scale
@@ -1639,7 +1806,7 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
         if out is None:
             out = torch.empty_like(q_nope, device=device)
         else:
-            _check_shape_dtype_device(
+            check_shape_dtype_device(
                 out, q_nope.shape, q_nope.dtype, q_nope.device, "out"
             )
 
@@ -1651,7 +1818,7 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
                     device=device,
                 )
             else:
-                _check_shape_dtype_device(
+                check_shape_dtype_device(
                     lse,
                     (q_nope.size(0), q_nope.size(1)),
                     q_nope.dtype,
@@ -1687,43 +1854,726 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
     run_return_lse = functools.partialmethod(run, return_lse=True)
 
 
+class TrtllmGenDecodeModule:
+    def __init__(self) -> None:
+        self._sm_count: Optional[int] = None
+        self._mod = gen_trtllm_gen_fmha_module()
+        self._op = self._mod.build_and_load()
+        from flashinfer.jit.cubin_loader import setup_cubin_loader
+
+        setup_cubin_loader(self._mod.get_library_path())
+
+    def _paged_run(
+        self,
+        query: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        workspace_buffer: torch.Tensor,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        max_seq_len: int,
+        bmm1_scale: float,  # todo(Yingyi): add dynamic scale tensor later
+        bmm2_scale: float,
+        workspace_size: int,
+        window_left: int = -1,
+        enable_pdl: bool = None,
+        out: Optional[torch.Tensor] = None,
+        sinks: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if out is None:
+            out = torch.empty_like(query)
+        if self._sm_count is None:
+            self._sm_count = get_device_sm_count(query.device)
+
+        bmm1_scale = (
+            bmm1_scale.item() if isinstance(bmm1_scale, torch.Tensor) else bmm1_scale
+        )
+        bmm2_scale = (
+            bmm2_scale.item() if isinstance(bmm2_scale, torch.Tensor) else bmm2_scale
+        )
+
+        self._op.trtllm_paged_attention_decode(
+            out,
+            None,  # fp4 output not supported in wrapper api yet.
+            query,  # [B, S, H, D], w/ MTP here so second dim is S
+            k_cache,
+            v_cache,
+            workspace_buffer,
+            block_tables,
+            seq_lens,
+            max_seq_len,
+            bmm1_scale,
+            bmm2_scale,
+            -1,  # o_sf_scale
+            -1,  # o_sf_vec_size
+            0,  # o_sf_start_index
+            window_left,
+            self._sm_count,
+            enable_pdl,
+            workspace_size,
+            sinks,
+        )
+        return out
+
+    def _plan(self, *args, **kwargs):
+        pass
+
+
+@functools.cache
+def get_trtllm_gen_decode_module(*args):
+    uri = get_batch_prefill_uri("trtllm-gen", *args)
+    module = TrtllmGenDecodeModule()
+
+    @register_custom_op(
+        f"flashinfer::{uri}_ragged_run",
+        mutates_args=(
+            "float_workspace_buffer",
+            "int_workspace_buffer",
+            "o",
+            "maybe_lse",
+        ),
+    )
+    def paged_run(
+        float_workspace_buffer: torch.Tensor,
+        int_workspace_buffer: torch.Tensor,
+        plan_info_vec: List[int],
+        q: torch.Tensor,
+        paged_k_cache: torch.Tensor,
+        paged_v_cache: torch.Tensor,
+        qo_indptr: torch.Tensor,
+        paged_kv_indptr: torch.Tensor,
+        paged_kv_indices: torch.Tensor,
+        paged_kv_last_page_len: torch.Tensor,
+        o: torch.Tensor,
+        maybe_lse: Optional[torch.Tensor],
+        mask_mode: int,
+        layout: int,
+        window_left: int,
+        enable_pdl: bool,
+        maybe_custom_mask: Optional[torch.Tensor],
+        maybe_mask_indptr: Optional[torch.Tensor],
+        maybe_alibi_slopes: Optional[torch.Tensor],
+        maybe_prefix_len_ptr: Optional[torch.Tensor],
+        maybe_token_pos_in_items_ptr: Optional[torch.Tensor],
+        maybe_max_item_len_ptr: Optional[torch.Tensor],
+        logits_soft_cap: float,
+        sm_scale: float,
+        scale_q: Optional[torch.Tensor],
+        scale_k: Optional[torch.Tensor],
+        scale_v: Optional[torch.Tensor],
+        rope_scale: float,
+        rope_theta: float,
+        token_pos_in_items_len: int,
+        workspace_size: int,
+        paged_kv_cache: Optional[torch.Tensor] = None,
+        num_qo_heads: Optional[int] = None,
+        num_kv_heads: Optional[int] = None,
+        block_tables: Optional[torch.Tensor] = None,
+        kv_lens_buffer: Optional[torch.Tensor] = None,
+        page_size: Optional[int] = None,
+        max_kv_len: Optional[int] = None,
+        sinks: Optional[torch.Tensor] = None,
+    ) -> None:
+        assert maybe_lse is None
+        assert paged_kv_cache is not None
+        assert num_qo_heads is not None
+        assert num_kv_heads is not None
+        assert block_tables is not None
+        assert kv_lens_buffer is not None
+        assert page_size is not None
+        assert max_kv_len is not None
+        assert enable_pdl is not None
+        assert workspace_size > 0, "workspace_size must be greater than 0"
+        o = module._paged_run(
+            q.contiguous(),  # NOTE(Siyuan): without contiguous, the result is incorrect
+            paged_k_cache,
+            paged_v_cache,
+            float_workspace_buffer,
+            block_tables,
+            kv_lens_buffer,
+            max_kv_len,
+            sm_scale,
+            1.0,  # NOTE(Siyuan): update this to expose bmm2 scale
+            workspace_size,
+            window_left,
+            enable_pdl,
+            out=o,
+            sinks=sinks,
+        )
+
+    @register_fake_op(f"flashinfer::{uri}_paged_run")
+    def _fake_paged_run(
+        float_workspace_buffer: torch.Tensor,
+        int_workspace_buffer: torch.Tensor,
+        plan_info_vec: List[int],
+        q: torch.Tensor,
+        paged_k_cache: torch.Tensor,
+        paged_v_cache: torch.Tensor,
+        qo_indptr: torch.Tensor,
+        paged_kv_indptr: torch.Tensor,
+        paged_kv_indices: torch.Tensor,
+        paged_kv_last_page_len: torch.Tensor,
+        o: torch.Tensor,
+        maybe_lse: Optional[torch.Tensor],
+        mask_mode: int,
+        layout: int,
+        window_left: int,
+        enable_pdl: bool,
+        maybe_custom_mask: Optional[torch.Tensor],
+        maybe_mask_indptr: Optional[torch.Tensor],
+        maybe_alibi_slopes: Optional[torch.Tensor],
+        maybe_prefix_len_ptr: Optional[torch.Tensor],
+        maybe_token_pos_in_items_ptr: Optional[torch.Tensor],
+        maybe_max_item_len_ptr: Optional[torch.Tensor],
+        logits_soft_cap: float,
+        sm_scale: float,
+        rope_scale: float,
+        rope_theta: float,
+        token_pos_in_items_len: int,
+        paged_kv_cache: Optional[torch.Tensor] = None,
+        num_qo_heads: Optional[int] = None,
+        num_kv_heads: Optional[int] = None,
+        block_tables: Optional[torch.Tensor] = None,
+        kv_lens_buffer: Optional[torch.Tensor] = None,
+        page_size: Optional[int] = None,
+        max_kv_len: Optional[int] = None,
+        sinks: Optional[torch.Tensor] = None,
+    ) -> None:
+        pass
+
+    # Register the module.
+    #
+    # Note that plan is not part of model logic. It should not be included in
+    # Cuda Graph or torch.compile. So, we don't provide a torch library for plan.
+    return SimpleNamespace(
+        plan=module._plan,
+        paged_run=paged_run,
+    )
+
+
 def trtllm_batch_decode_with_kv_cache(
     query: torch.Tensor,
-    kv_cache: torch.Tensor,
+    kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
     workspace_buffer: torch.Tensor,
-    num_heads: int,
-    num_kv_heads: int,
-    scale: float,
     block_tables: torch.Tensor,
     seq_lens: torch.Tensor,
-    block_size: int,
     max_seq_len: int,
-    kv_cache_dtype: str,
-    k_scale: float,
-    v_scale: float,
-    out: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    run_func = get_trtllm_fmha_gen_module().trtllm_paged_attention
+    bmm1_scale: float,
+    bmm2_scale: float,  # todo(Yingyi): add dynamic scale tensor later
+    window_left: int = -1,
+    out: Optional[Union[torch.Tensor, FP4Tensor]] = None,
+    out_dtype: Optional[Union[torch.dtype, str]] = None,
+    o_sf_scale: Optional[float] = None,
+    o_sf_vec_size: Optional[int] = None,
+    sinks: Optional[List[torch.Tensor]] = None,
+    enable_pdl: bool = None,
+    q_len_per_req: Optional[int] = 1,
+) -> Union[torch.Tensor, FP4Tensor]:
+    """
+    Parameters
+    ----------
+    query : torch.Tensor
+        query tensor with shape [num_tokens, num_heads, head_dim], num_tokens = batch_size * q_len_per_request
 
-    if out is None:
-        out = torch.empty_like(query)
+    kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        If kv_cache is a single tensor, it should be a tensor with shape [num_pages, 1 or 2, num_kv_heads, page_size, head_dim]
+        If kv_cache is a tuple of two tensors, it should be a tuple of two tensors with shape [num_pages, num_kv_heads, page_size, head_dim]
+
+    workspace_buffer : torch.Tensor. Must be initialized to 0 for its first use.
+        workspace
+
+    block_tables : torch.Tensor
+        page_table of kv cache, [batch_size, num_pages]
+
+    seq_lens : torch.Tensor
+        A uint32 1D tensor indicating the kv sequence length of each prompt. shape: ``[batch_size]``
+
+    max_seq_len : int
+        max sequence length for kv_cache
+
+    bmm1_scale : float
+        fused scale for bmm1 input.
+
+    bmm2_scale : float
+        fused scale for bmm2 input.
+
+    window_left : int = -1
+        The left (inclusive) window size for the attention window, when set to ``-1``, the window
+        size will be set to the full length of the sequence. Defaults to ``-1``.
+
+    out :  Optional[Union[torch.Tensor, FP4Tensor]] = None
+        output tensor, if not provided, will be allocated with ``out_dtype``, if ``out_dtype`` is not provided, will use the type of ``query``.
+
+    out_dtype : Optional[Union[torch.dtype, str]] = None
+        output dtype, if not provided, will use the type of ``out``. For nvfp4, use string ``nvfp4``.
+
+    o_sf_scale : Optional[float] = None
+        scale for nvfp4 output tensor scale factor.
+
+    o_sf_vec_size : Optional[int] = None
+        vector size for nvfp4 output tensor scale factor.
+
+    sinks : Optional[List[torch.Tensor]] = None
+        additional value per head in the denominator of the softmax.
+
+    enable_pdl : bool
+        Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
+        Only supported for >= sm90, and currently only for FA2, CUDA core, and trtllm-gen decode.
+
+    Returns
+    -------
+    out : Union[torch.Tensor, FP4Tensor]
+        output torch.Tensor or FP4Tensor.
+    """
+    enable_pdl = device_support_pdl(query.device) if enable_pdl is None else enable_pdl
+
+    if isinstance(kv_cache, tuple):
+        k_cache, v_cache = kv_cache
     else:
-        _check_shape_dtype_device(out, query.shape, query.dtype, query.device, "out")
+        if kv_cache.shape[1] == 1:
+            k_cache, v_cache = kv_cache, kv_cache
+        else:
+            assert kv_cache.shape[1] == 2, (
+                "When kv_cache is a single tensor, the second dimension must be 1 or 2"
+            )
+            # NOTE(Zihao): unbind transforms [num_pages, 2, ...] to ([num_pages, ...], [num_pages, ...])
+            # it doesn't change underlying storage
+            k_cache, v_cache = kv_cache.unbind(dim=1)
+
+    run_func = get_trtllm_gen_fmha_module().trtllm_paged_attention_decode
+    sm_count = get_device_sm_count(query.device)
+
+    if out_dtype == "nvfp4" or (out_dtype is None and isinstance(out, FP4Tensor)):
+        assert query.dtype == torch.float8_e4m3fn, (
+            "query must be fp8 when out_dtype is nvfp4."
+        )
+        assert o_sf_scale is not None
+        assert o_sf_vec_size in [None, 16], "only o_sf_vec_size = 16 is supported"
+        o_sf_vec_size = o_sf_vec_size or 16
+
+        fp4_out_shape = query.shape[:-1] + (ceil_div(query.shape[-1], 2),)
+
+        if isinstance(out, FP4Tensor):
+            fp4_out_scale_shape = (
+                out.scale.shape[0],
+                round_up(query.shape[1] * query.shape[2] // o_sf_vec_size, 4),
+            )
+            out_scale_factor = out.scale
+            o_sf_start_index = out.scale_start_index
+            out = out.data
+            # out_dtype may be None
+            out_dtype = out_dtype or "nvfp4"
+        elif out is None:
+            fp4_out_scale_shape = (
+                round_up(query.shape[0], 128),
+                round_up(query.shape[1] * query.shape[2] // o_sf_vec_size, 4),
+            )
+            out_scale_factor = torch.empty(
+                fp4_out_scale_shape, dtype=torch.float8_e4m3fn, device=query.device
+            )
+            o_sf_start_index = 0
+            out = torch.empty(fp4_out_shape, dtype=torch.uint8, device=query.device)
+        else:
+            raise ValueError(f"Invalid out: {out}")
+
+        assert out_dtype == "nvfp4"
+        assert isinstance(out, torch.Tensor)
+
+        # Use uint8 as the container dtype to compliant with next fp4 gemm.
+        check_shape_dtype_device(out, fp4_out_shape, torch.uint8, query.device, "out")
+
+        check_shape_dtype_device(
+            out_scale_factor,
+            fp4_out_scale_shape,
+            torch.float8_e4m3fn,
+            query.device,
+            "out_scale_factor",
+        )
+
+        # Check o_sf_start_index is valid
+        if (
+            o_sf_start_index < 0
+            or o_sf_start_index + out.shape[0] > out_scale_factor.shape[0]
+        ):
+            raise ValueError(
+                f"o_sf_start_index is out of the valid range of out_scale_factor. "
+                f"o_sf_start_index={o_sf_start_index}, out.shape[0]={out.shape[0]}, "
+                f"out_scale_factor.shape[0]={out_scale_factor.shape[0]}"
+            )
+
+    elif isinstance(out_dtype, torch.dtype) or out_dtype is None:
+        assert o_sf_scale is None
+        assert o_sf_vec_size is None
+        out_scale_factor = None
+        o_sf_start_index = 0
+        if out_dtype is None:
+            out_dtype = out.dtype if out is not None else query.dtype
+        out = out if out is not None else torch.empty_like(query, dtype=out_dtype)
+        if out_dtype not in (query.dtype, torch.float16, torch.bfloat16):
+            raise ValueError(f"Unsupported out_dtype: {out_dtype}")
+        check_shape_dtype_device(out, query.shape, out_dtype, query.device, "out")
+    else:
+        raise ValueError(f"Invalid out_dtype: {out_dtype}")
+
+    bmm1_scale = (
+        bmm1_scale.item() if isinstance(bmm1_scale, torch.Tensor) else bmm1_scale
+    )
+    bmm2_scale = (
+        bmm2_scale.item() if isinstance(bmm2_scale, torch.Tensor) else bmm2_scale
+    )
 
     run_func(
         out,
-        query,
-        kv_cache,
+        out_scale_factor,
+        query.view(
+            query.size(0) // q_len_per_req, q_len_per_req, query.size(1), query.size(2)
+        ),
+        k_cache,
+        v_cache,
         workspace_buffer,
-        num_heads,
-        num_kv_heads,
-        scale,
         block_tables,
         seq_lens,
-        block_size,
         max_seq_len,
-        kv_cache_dtype,
-        k_scale,
-        v_scale,
+        bmm1_scale,
+        bmm2_scale,
+        o_sf_scale or -1.0,
+        o_sf_vec_size or -1,
+        o_sf_start_index,
+        window_left,
+        sm_count,
+        enable_pdl,
+        workspace_buffer.numel() * workspace_buffer.element_size(),
+        sinks,
+    )
+
+    return (
+        out
+        if out_dtype != "nvfp4"
+        else FP4Tensor(out, out_scale_factor, o_sf_start_index, query.shape)
+    )
+
+
+def _check_trtllm_gen_mla_shape(
+    query,
+    kv_cache,
+    qk_nope_head_dim,
+    kv_lora_rank,
+    qk_rope_head_dim,
+    page_table,
+    page_size,
+):
+    if query.ndim != 4:
+        raise ValueError(f"Expected query.ndim == 4, got {query.ndim}")
+    if kv_cache.ndim != 4:
+        raise ValueError(f"Expected kv_cache.ndim == 4, got {kv_cache.ndim}")
+    if qk_nope_head_dim != 128:
+        raise ValueError(f"Expected qk_nope_head_dim == 128, got {qk_nope_head_dim}")
+    if kv_lora_rank != 512:
+        raise ValueError(f"Expected kv_lora_rank == 512, got {kv_lora_rank}")
+    if qk_rope_head_dim != 64:
+        raise ValueError(f"Expected qk_rope_head_dim == 64, got {qk_rope_head_dim}")
+
+    B_q, Q_len, H, D_q = query.shape
+    D_ckv = kv_cache.shape[3]
+    # if H != 128:
+    #     raise ValueError(f"Expected 128 heads for query, got {H}")
+    # todo(Yingyi): should we check num_heads == 128? Is this deepseek only?
+    if D_q != D_ckv or D_q != 576:
+        raise ValueError(
+            f"Expected head dim 576 for query and kv_cache, got {D_q} and {D_ckv}"
+        )
+
+    B_block_table, block_num = page_table.shape
+    block_size = page_size
+    if B_q != B_block_table:
+        raise ValueError(
+            f"Expected batch size {B_q} for query and block_table, got {B_q} and {B_block_table}"
+        )
+    if block_num % (128 / block_size) != 0:
+        raise ValueError(
+            f"Expected block_num % (128 / block_size) == 0, got {block_num=} and {block_size=}"
+        )
+
+
+def trtllm_batch_decode_with_kv_cache_mla(
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    workspace_buffer: torch.Tensor,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_seq_len: int,
+    out: Optional[torch.Tensor] = None,
+    bmm1_scale: Optional[float] = 1.0,
+    bmm2_scale: Optional[float] = 1.0,
+    bmm1_scale_log2_tensor: Optional[torch.Tensor] = None,
+    bmm2_scale_tensor: Optional[torch.Tensor] = None,
+    sinks: Optional[List[torch.Tensor]] = None,
+    enable_pdl: bool = None,
+) -> torch.Tensor:
+    """
+    Parameters:
+    query: [batch_size, q_len_per_request, num_heads, head_dim_qk], head_dim_qk = qk_nope_head_dim (kv_lora_rank) + qk_rope_head_dim, should be concated q_nope + q_rope; q_len_per_request is the MTP query length.
+    kv_cache: [num_pages, page_size, head_dim_ckv + head_dim_kpe], should be concated ckv_cache + kpe_cache
+    workspace_buffer: [num_semaphores, 4], used for multi_block mode. Must be initialized to 0 for its first use.
+    qk_nope_head_dim: qk_nope_head_dim, must be 128
+    kv_lora_rank: kv_lora_rank, must be 512
+    qk_rope_head_dim: qk_rope_head_dim, must be 64
+    block_tables: page_table of kv cache, [batch_size, num_pages]
+    seq_lens: query_len
+    max_seq_len: max sequence length for kv_cache
+    out: output tensor, if not provided, will be allocated internally
+    bmm1_scale: fused scale for mla bmm1 input.
+    bmm2_scale: fused scale for mla bmm2 input.
+    bmm1_scale_log2_tensor: On-device fused scale tensor for mla bmm1 input. Must be fused with * M_LOG2E before passing in.
+    bmm2_scale_tensor: On-device fused scale tensor for mla bmm2 input.
+    sinks: additional value per head in the denominator of the softmax.
+
+    Note:
+    In MLA, the actual BMM1 and BMM2 scales applied would be fused as:
+    bmm1_scale = q_scale * k_scale * sm_scale / (head_dim_qk ** 0.5)
+    bmm2_scale = v_scale * o_scale
+    or,
+    bmm1_scale_log2_tensor = [q_scale * k_scale * sm_scale / (head_dim_qk ** 0.5) * M_LOG2E]
+    bmm2_scale_tensor = [v_scale * o_scale]
+
+    The two scale factors should be static constant for cuda graph capture.
+    Either (bmm1_scale, bmm2_scale) or (bmm1_scale_log2_tensor, bmm2_scale_tensor) should be provided.
+
+    For static constant scale factors, the scale factors should be provided as float.
+        - (bmm1_scale, bmm2_scale)
+    For on-device fused scale tensors, which could dynamically change, the scale factors should be provided as torch.Tensor.
+        - (bmm1_scale_log2_tensor, bmm2_scale_tensor)
+        - Currently, only fp8 tensor core operation supports this mode.
+    When both are provided, the dynamic scale factor tensors will be used.
+    """
+    enable_pdl = device_support_pdl(query.device) if enable_pdl is None else enable_pdl
+    run_func = get_trtllm_gen_fmha_module().trtllm_paged_attention_decode
+    sm_count = get_device_sm_count(query.device)
+
+    block_size = kv_cache.size(-2)
+    if (
+        block_size != 32 and block_size != 64
+    ):  # todo(Yingyi): add support for more block sizes?
+        raise ValueError(f"Supported block_size are 32 and 64, got {block_size}")
+
+    _check_trtllm_gen_mla_shape(
+        query,
+        kv_cache,
+        qk_nope_head_dim,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        block_tables,
+        block_size,
+    )
+
+    if out is None:
+        out_shape = query.shape[:-1] + (kv_lora_rank,)
+        out = torch.empty(out_shape, dtype=torch.bfloat16, device=query.device)
+    else:
+        batch_size, _, num_q_heads, _ = query.shape
+        check_shape_dtype_device(
+            out,
+            [batch_size, num_q_heads, kv_lora_rank],
+            torch.bfloat16,
+            query.device,
+            "out",
+        )
+
+    if bmm1_scale_log2_tensor is not None and bmm2_scale_tensor is not None:
+        # dynamic scale factors
+        if query.dtype != torch.float8_e4m3fn or kv_cache.dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                "Dynamic scale factors bmm1_scale_tensor and bmm2_scale_tensor are only supported for fp8 tensor core operation"
+            )
+
+    run_func(
+        out,
+        None,  # fp4 output not supported in wrapper api yet.
+        query,
+        kv_cache,
+        kv_cache,
+        workspace_buffer,
+        block_tables,
+        seq_lens,
+        max_seq_len,
+        bmm1_scale,
+        bmm2_scale,
+        -1,  # o_sf_scale
+        -1,  # o_sf_vec_size
+        0,  # o_sf_start_index
+        -1,  # window_left
+        sm_count,
+        enable_pdl,
+        workspace_buffer.numel() * workspace_buffer.element_size(),
+        sinks,
     )
     return out
+
+
+def fast_decode_plan(
+    self,
+    indptr: torch.Tensor,
+    indices: torch.Tensor,
+    last_page_len: torch.Tensor,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    page_size: int,
+    pos_encoding_mode: str = "NONE",
+    window_left: int = -1,
+    logits_soft_cap: Optional[float] = None,
+    q_data_type: Optional[Union[str, torch.dtype]] = None,
+    kv_data_type: Optional[Union[str, torch.dtype]] = None,
+    data_type: Optional[Union[str, torch.dtype]] = None,
+    sm_scale: Optional[float] = None,
+    rope_scale: Optional[float] = None,
+    rope_theta: Optional[float] = None,
+    non_blocking: bool = True,
+    fixed_split_size: Optional[int] = None,
+    disable_split_kv: bool = False,
+    global_override_indptr_cpu: Optional[torch.Tensor] = None,
+) -> None:
+    """
+    A faster version of BatchDecodeWithPagedKVCacheWrapper::plan used for FlashInferMultiStepDraftBackend.
+    Modifications:
+    - Remove unnecessary device-to-device copy for the cuda graph buffers.
+    - Remove unnecessary host-to-device copy for the metadata buffers.
+    """
+    batch_size = len(last_page_len)
+    if logits_soft_cap is None:
+        logits_soft_cap = 0.0
+
+    # Handle data types consistently
+    if data_type is not None:
+        if q_data_type is None:
+            q_data_type = data_type
+        if kv_data_type is None:
+            kv_data_type = data_type
+    elif q_data_type is None:
+        q_data_type = "float16"
+
+    if kv_data_type is None:
+        kv_data_type = q_data_type
+
+    if self.use_tensor_cores:
+        qo_indptr_host = _get_range_buf(batch_size + 1, "cpu")
+        # Here we set fixed_split_size to -1 to avoid the assertion error in flashinfer's plan function
+        if fixed_split_size is None:
+            fixed_split_size = -1
+
+    if self.is_cuda_graph_enabled:
+        if batch_size != self._fixed_batch_size:
+            raise ValueError(
+                "The batch size should be fixed in cudagraph mode, the runtime batch size {} "
+                " mismatches the batch size set during initialization {}".format(
+                    batch_size, self._fixed_batch_size
+                )
+            )
+        if len(indices) > len(self._paged_kv_indices_buf):
+            raise ValueError(
+                "The size of indices should be less than or equal to the allocated buffer"
+            )
+    else:
+        self._paged_kv_indptr_buf = indptr
+        self._paged_kv_indices_buf = indices
+        self._paged_kv_last_page_len_buf = last_page_len
+        if self.use_tensor_cores:
+            self._qo_indptr_buf = qo_indptr_host.to(
+                self.device, non_blocking=non_blocking
+            )
+
+    # Create empty tensors for dtype info if needed
+    empty_q_data = torch.empty(
+        0,
+        dtype=(
+            getattr(torch, q_data_type) if isinstance(q_data_type, str) else q_data_type
+        ),
+        device=self.device,
+    )
+
+    empty_kv_cache = torch.empty(
+        0,
+        dtype=(
+            getattr(torch, kv_data_type)
+            if isinstance(kv_data_type, str)
+            else kv_data_type
+        ),
+        device=self.device,
+    )
+
+    indptr_host = (
+        global_override_indptr_cpu
+        if global_override_indptr_cpu is not None
+        else indptr.cpu()
+    )
+
+    with torch.cuda.device(self.device):
+        if self.use_tensor_cores:
+            # ALSO convert last_page_len to CPU
+            if page_size == 1:
+                # When page size is 1, last_page_len is always 1.
+                # Directly construct the host tensor rather than executing a device-to-host copy.
+                last_page_len_host = torch.ones(
+                    (batch_size,), dtype=torch.int32, device="cpu"
+                )
+            else:
+                last_page_len_host = last_page_len.cpu()
+
+            kv_lens_arr_host = get_seq_lens(indptr_host, last_page_len_host, page_size)
+
+            try:
+                # Make sure we pass exactly 15 arguments for tensor core version
+                self._plan_info = self._cached_module.plan(
+                    self._float_workspace_buffer,
+                    self._int_workspace_buffer,
+                    self._pin_memory_int_workspace_buffer,
+                    qo_indptr_host,
+                    indptr_host,
+                    kv_lens_arr_host,
+                    batch_size,  # total_num_rows
+                    batch_size,
+                    num_qo_heads,
+                    num_kv_heads,
+                    page_size,
+                    self.is_cuda_graph_enabled,
+                    head_dim,
+                    head_dim,
+                    False,  # causal
+                    window_left,
+                    fixed_split_size,
+                    disable_split_kv,
+                )
+            except Exception as e:
+                raise RuntimeError(f"Error in standard plan: {e}") from e
+        else:
+            try:
+                # Make sure we pass exactly 15 arguments for standard version
+                self._plan_info = self._cached_module.plan(
+                    self._float_workspace_buffer,
+                    self._int_workspace_buffer,
+                    self._pin_memory_int_workspace_buffer,
+                    indptr_host,
+                    batch_size,
+                    num_qo_heads,
+                    num_kv_heads,
+                    page_size,
+                    self.is_cuda_graph_enabled,
+                    window_left,
+                    logits_soft_cap,
+                    head_dim,
+                    head_dim,
+                    empty_q_data,
+                    empty_kv_cache,
+                )
+            except Exception as e:
+                raise RuntimeError(f"Error in standard plan: {e}") from e
+
+    self._pos_encoding_mode = pos_encoding_mode
+    self._window_left = window_left
+    self._logits_soft_cap = logits_soft_cap
+    self._sm_scale = sm_scale
+    self._rope_scale = rope_scale
+    self._rope_theta = rope_theta

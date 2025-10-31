@@ -13,7 +13,6 @@ Kernel Library for LLM Serving
 </p>
 
 [![Build Status](https://ci.tlcpack.ai/job/flashinfer-ci/job/main/badge/icon)](https://ci.tlcpack.ai/job/flashinfer-ci/job/main/)
-[![Release](https://github.com/flashinfer-ai/flashinfer/actions/workflows/release_wheel.yml/badge.svg)](https://github.com/flashinfer-ai/flashinfer/actions/workflows/release_wheel.yml)
 [![Documentation](https://github.com/flashinfer-ai/flashinfer/actions/workflows/build-doc.yml/badge.svg)](https://github.com/flashinfer-ai/flashinfer/actions/workflows/build-doc.yml)
 
 
@@ -43,31 +42,31 @@ FlashInfer supports PyTorch, TVM and C++ (header-only) APIs, and can be easily i
 
 Using our PyTorch API is the easiest way to get started:
 
-### Install from PIP
+### Install from PyPI
 
-We provide prebuilt python wheels for Linux. Install FlashInfer with the following command:
-
-```bash
-# For CUDA 12.6 & torch 2.6
-pip install flashinfer-python -i https://flashinfer.ai/whl/cu126/torch2.6
-# For other CUDA & torch versions, check https://docs.flashinfer.ai/installation.html
-```
-
-To try the latest features from the main branch, use our nightly-built wheels:
-
-```bash
-pip install flashinfer-python -i https://flashinfer.ai/whl/nightly/cu126/torch2.6
-```
-
-For a JIT version (compiling every kernel from scratch, [NVCC](https://developer.nvidia.com/cuda-downloads) is required), install from [PyPI](https://pypi.org/project/flashinfer-python/):
+FlashInfer is available as a Python package for Linux. Install the core package with:
 
 ```bash
 pip install flashinfer-python
 ```
 
+**Package Options:**
+- **flashinfer-python**: Core package that compiles/downloads kernels on first use
+- **flashinfer-cubin**: Pre-compiled kernel binaries for all supported GPU architectures
+- **flashinfer-jit-cache**: Pre-built kernel cache for specific CUDA versions
+
+**For faster initialization and offline usage**, install the optional packages to have most kernels pre-compiled:
+```bash
+pip install flashinfer-python flashinfer-cubin
+# JIT cache package (replace cu129 with your CUDA version: cu128, cu129, or cu130)
+pip install flashinfer-jit-cache --index-url https://flashinfer.ai/whl/cu129
+```
+
+This eliminates compilation and downloading overhead at runtime.
+
 ### Install from Source
 
-Alternatively, build FlashInfer from source:
+Build the core package from source:
 
 ```bash
 git clone https://github.com/flashinfer-ai/flashinfer.git --recursive
@@ -75,20 +74,56 @@ cd flashinfer
 python -m pip install -v .
 ```
 
-To pre-compile essential kernels ahead-of-time (AOT), run the following command:
-
+**For development**, install in editable mode:
 ```bash
-# Set target CUDA architectures
-export TORCH_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a 10.0a"
-# Build AOT kernels. Will produce AOT kernels in aot-ops/
-python -m flashinfer.aot
-# Build AOT wheel
-python -m build --no-isolation --wheel
-# Install AOT wheel
-python -m pip install dist/flashinfer-*.whl
+python -m pip install --no-build-isolation -e . -v
 ```
 
-For more details, refer to the [Install from Source documentation](https://docs.flashinfer.ai/installation.html#install-from-source).
+**Build optional packages:**
+
+`flashinfer-cubin`:
+```bash
+cd flashinfer-cubin
+python -m build --no-isolation --wheel
+python -m pip install dist/*.whl
+```
+
+`flashinfer-jit-cache` (customize `FLASHINFER_CUDA_ARCH_LIST` for your target GPUs):
+```bash
+export FLASHINFER_CUDA_ARCH_LIST="7.5 8.0 8.9 10.0a 10.3a 12.0a"
+cd flashinfer-jit-cache
+python -m build --no-isolation --wheel
+python -m pip install dist/*.whl
+```
+
+For more details, see the [Install from Source documentation](https://docs.flashinfer.ai/installation.html#install-from-source).
+
+### Install Nightly Build
+
+Nightly builds are available for testing the latest features:
+
+```bash
+# Core and cubin packages
+pip install -U --pre flashinfer-python --index-url https://flashinfer.ai/whl/nightly/ --no-deps # Install the nightly package from custom index, without installing dependencies
+pip install flashinfer-python  # Install flashinfer-python's dependencies from PyPI
+pip install -U --pre flashinfer-cubin --index-url https://flashinfer.ai/whl/nightly/
+# JIT cache package (replace cu129 with your CUDA version: cu128, cu129, or cu130)
+pip install -U --pre flashinfer-jit-cache --index-url https://flashinfer.ai/whl/nightly/cu129
+```
+
+### Verify Installation
+
+After installation, verify that FlashInfer is correctly installed and configured:
+
+```bash
+flashinfer show-config
+```
+
+This command displays:
+- FlashInfer version and installed packages (flashinfer-python, flashinfer-cubin, flashinfer-jit-cache)
+- PyTorch and CUDA version information
+- Environment variables and artifact paths
+- Downloaded cubin status and module compilation status
 
 ### Trying it out
 
@@ -129,25 +164,11 @@ Check out [documentation](https://docs.flashinfer.ai/) for usage of batch decode
 
 ## Custom Attention Variants
 
-Starting from FlashInfer v0.2, users can customize their own attention variants with additional parameters. For more details, refer to our [JIT examples](https://github.com/flashinfer-ai/flashinfer/blob/main/tests/test_jit_example.py).
+Starting from FlashInfer v0.2, users can customize their own attention variants with additional parameters. For more details, refer to our [JIT examples](https://github.com/flashinfer-ai/flashinfer/blob/main/tests/utils/test_jit_example.py).
 
-## Run Benchmarks
+## GPU Support
 
-We profile FlashInfer kernel performance with [nvbench](https://github.com/NVIDIA/nvbench) and you can compile and run the benchmarks with the following commands:
-
-```bash
-mkdir build
-cp cmake/config.cmake build # you can modify the config.cmake to enable/disable benchmarks and change CUDA architectures
-cd build
-cmake ..
-make -j12
-```
-
-You can run `./bench_{single/batch}_{prefill/decode}` to benchmark the performance (e.g. `./bench_single_prefill` for single-request prefill attention). `./bench_{single/batch}_{prefill/decode} --help` will show you the available options.
-
-## C++ API and TVM Bindings
-
-FlashInfer also provides C++ API and TVM bindings, please refer to [documentation](https://docs.flashinfer.ai/) for more details.
+FlashInfer currently provides support for NVIDIA SM architectures 75 and higher and beta support for 103, 110, 120, and 121.
 
 ## Adoption
 

@@ -15,24 +15,12 @@ limitations under the License.
 """
 
 import functools
-from typing import Any, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 
-from .jit import JitSpec
-from .jit import env as jit_env
-from .jit import gen_jit_spec
+from .jit.rope import gen_rope_module
 from .utils import register_custom_op, register_fake_op
-
-
-def gen_rope_module() -> JitSpec:
-    return gen_jit_spec(
-        "rope",
-        [
-            jit_env.FLASHINFER_CSRC_DIR / "rope.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "flashinfer_rope_ops.cu",
-        ],
-    )
 
 
 @functools.cache
@@ -171,6 +159,69 @@ def _fake_apply_rope_pos_ids(
     interleave: bool,
     rope_scale: float,
     rope_theta: float,
+) -> None:
+    pass
+
+
+@register_custom_op(
+    "flashinfer::rope_quantize",
+    mutates_args=("q_rope_out", "k_rope_out", "q_nope_out", "k_nope_out"),
+)
+def _rope_quantize(
+    q_rope_in: torch.Tensor,
+    k_rope_in: torch.Tensor,
+    q_nope_in: torch.Tensor,
+    k_nope_in: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    pos_ids: torch.Tensor,
+    q_rope_out: torch.Tensor,
+    k_rope_out: torch.Tensor,
+    q_nope_out: torch.Tensor,
+    k_nope_out: torch.Tensor,
+    quant_scale_q: float,
+    quant_scale_kv: float,
+    interleave: bool,
+    enable_pdl: bool,
+) -> None:
+    r"""Custom operator that routes to the CUDA kernel implementation.
+
+    Converts is_neox parameter to interleave format and dispatches to the underlying
+    CUDA kernel via the JIT-compiled module.
+    """
+    get_rope_module().rope_quantize(
+        q_rope_in,
+        k_rope_in,
+        q_nope_in,
+        k_nope_in,
+        q_rope_out,
+        k_rope_out,
+        q_nope_out,
+        k_nope_out,
+        cos_sin_cache,
+        pos_ids,
+        quant_scale_q,
+        quant_scale_kv,
+        interleave,
+        enable_pdl,
+    )
+
+
+@register_fake_op("flashinfer::rope_quantize")
+def _fake_rope_quantize(
+    q_rope_in: torch.Tensor,
+    k_rope_in: torch.Tensor,
+    q_nope_in: torch.Tensor,
+    k_nope_in: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    pos_ids: torch.Tensor,
+    q_rope_out: torch.Tensor,
+    k_rope_out: torch.Tensor,
+    q_nope_out: torch.Tensor,
+    k_nope_out: torch.Tensor,
+    quant_scale_q: float,
+    quant_scale_kv: float,
+    interleave: bool,
+    enable_pdl: bool,
 ) -> None:
     pass
 
@@ -1094,3 +1145,161 @@ def apply_rope_with_cos_sin_cache_inplace(
         pos_ids=positions,
         interleave=(not is_neox),
     )
+
+
+def mla_rope_quantize_fp8(
+    q_rope: torch.Tensor,
+    k_rope: torch.Tensor,
+    q_nope: torch.Tensor,
+    k_nope: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    pos_ids: torch.Tensor,
+    is_neox: bool = True,
+    quantize_dtype: Optional[torch.dtype] = None,
+    quant_scale_q: float = 1.0,
+    quant_scale_kv: float = 1.0,
+    q_rope_out: Optional[torch.Tensor] = None,
+    k_rope_out: Optional[torch.Tensor] = None,
+    q_nope_out: Optional[torch.Tensor] = None,
+    k_nope_out: Optional[torch.Tensor] = None,
+    enable_pdl: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return rope_quantize_fp8(
+        q_rope,
+        k_rope,
+        q_nope,
+        k_nope,
+        cos_sin_cache,
+        pos_ids,
+        is_neox,
+        quantize_dtype,
+        quant_scale_q,
+        quant_scale_kv,
+        q_rope_out,
+        k_rope_out,
+        q_nope_out,
+        k_nope_out,
+        enable_pdl,
+    )
+
+
+def rope_quantize_fp8(
+    q_rope: torch.Tensor,
+    k_rope: torch.Tensor,
+    q_nope: torch.Tensor,
+    k_nope: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    pos_ids: torch.Tensor,
+    is_neox: bool = True,
+    quantize_dtype: Optional[torch.dtype] = None,
+    quant_scale_q: float = 1.0,
+    quant_scale_kv: float = 1.0,
+    q_rope_out: Optional[torch.Tensor] = None,
+    k_rope_out: Optional[torch.Tensor] = None,
+    q_nope_out: Optional[torch.Tensor] = None,
+    k_nope_out: Optional[torch.Tensor] = None,
+    enable_pdl: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    r"""Apply RoPE (Rotary Positional Embeddings) and quantize to FP8 format.
+
+    This function takes pre-split query/key tensors (rotary and non-rotary dimensions separated),
+    applies RoPE to the rotary dimension tensors, and quantizes both rotary and non-rotary
+    tensors to FP8 format. Supports MLA, GQA, and MHA architectures.
+
+    Parameters
+    ----------
+    q_rope : torch.Tensor
+        Query tensor (rotary dimensions), shape: ``(nnz, num_qo_heads, rope_dim)``.
+        Must be float16 or bfloat16.
+    k_rope : torch.Tensor
+        Key tensor (rotary dimensions). For GQA/MHA: ``(nnz, num_kv_heads, rope_dim)``.
+        For MLA: ``(nnz, rope_dim)``. Must be float16 or bfloat16.
+    q_nope : torch.Tensor
+        Query tensor (non-rotary dimensions), shape: ``(nnz, num_qo_heads, no_rope_dim)``.
+        Must be float16 or bfloat16.
+    k_nope : torch.Tensor
+        Key tensor (non-rotary dimensions). For GQA/MHA: ``(nnz, num_kv_heads, no_rope_dim)``.
+        For MLA: ``(nnz, no_rope_dim)``. Must be float16 or bfloat16.
+    cos_sin_cache : torch.Tensor
+        Precomputed cosine and sine values, shape: ``(max_seq_len, rope_dim)``.
+        First half contains cosine values, second half contains sine values. Must be float32.
+    pos_ids : torch.Tensor
+        Position indices for each token, shape: ``(nnz,)``.
+    is_neox : bool
+        RoPE layout style. If ``True`` (default), use non-interleaved layout (first/second half).
+        If ``False``, use interleaved layout (even/odd dimensions).
+    quantize_dtype : Optional[torch.dtype]
+        Target quantization dtype. If ``None``, inferred from output tensors or defaults to
+        ``torch.float8_e4m3fn``. Must be ``torch.float8_e4m3fn`` or ``torch.float8_e5m2``.
+    quant_scale_q : float
+        Quantization scaling factor for query tensors, default: ``1.0``.
+    quant_scale_kv : float
+        Quantization scaling factor for key tensors, default: ``1.0``.
+    q_rope_out : Optional[torch.Tensor]
+        Pre-allocated output tensor for quantized query (rotary). If ``None``, allocated automatically.
+    k_rope_out : Optional[torch.Tensor]
+        Pre-allocated output tensor for quantized key (rotary). If ``None``, allocated automatically.
+    q_nope_out : Optional[torch.Tensor]
+        Pre-allocated output tensor for quantized query (non-rotary). If ``None``, allocated automatically.
+    k_nope_out : Optional[torch.Tensor]
+        Pre-allocated output tensor for quantized key (non-rotary). If ``None``, allocated automatically.
+    enable_pdl : bool
+        Whether to enable PDL (Programmatic Dependent Launch). Default: ``False``.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+        Quantized tensors: (q_rope_out, k_rope_out, q_nope_out, k_nope_out).
+    """
+    if cos_sin_cache.dtype != torch.float32:
+        raise ValueError("cos_sin_cache should be float32")
+
+    # Infer quantize_dtype from output tensors or default to float8_e4m3fn
+    if quantize_dtype is None:
+        for out in (q_rope_out, k_rope_out, q_nope_out, k_nope_out):
+            if out is not None:
+                quantize_dtype = out.dtype
+                break
+        else:
+            quantize_dtype = torch.float8_e4m3fn
+
+    # Allocate output tensors if not provided
+    q_rope_out = (
+        q_rope_out
+        if q_rope_out is not None
+        else torch.empty_like(q_rope, dtype=quantize_dtype)
+    )
+    k_rope_out = (
+        k_rope_out
+        if k_rope_out is not None
+        else torch.empty_like(k_rope, dtype=quantize_dtype)
+    )
+    q_nope_out = (
+        q_nope_out
+        if q_nope_out is not None
+        else torch.empty_like(q_nope, dtype=quantize_dtype)
+    )
+    k_nope_out = (
+        k_nope_out
+        if k_nope_out is not None
+        else torch.empty_like(k_nope, dtype=quantize_dtype)
+    )
+
+    _rope_quantize(
+        q_rope,
+        k_rope,
+        q_nope,
+        k_nope,
+        cos_sin_cache,
+        pos_ids,
+        q_rope_out,
+        k_rope_out,
+        q_nope_out,
+        k_nope_out,
+        quant_scale_q,
+        quant_scale_kv,
+        not is_neox,  # interleave
+        enable_pdl,
+    )
+
+    return q_rope_out, k_rope_out, q_nope_out, k_nope_out

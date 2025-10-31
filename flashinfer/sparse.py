@@ -28,7 +28,7 @@ from .utils import (
     PosEncodingMode,
     TensorLayout,
     _check_pos_encoding_mode,
-    _check_shape_dtype_device,
+    check_shape_dtype_device,
     _get_cache_alibi_slopes_buf,
     canonicalize_torch_dtype,
     determine_attention_backend,
@@ -127,13 +127,17 @@ class BlockSparseAttentionWrapper:
         """
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
+        self._workspace_size = (
+            float_workspace_buffer.numel() * float_workspace_buffer.element_size()
+        )
         self._int_workspace_buffer = torch.empty(
             (8 * 1024 * 1024,), dtype=torch.uint8, device=self.device
         )
         if backend in ["fa3", "auto"]:
-            # NOTE(Zihao): assume maximum accumulate kv length is 4M
+            # NOTE(Zihao): assume maximum accumulate kv length is 128M
+            # NOTE(Yilong): 128M is required by video DiT models
             self._vector_sparse_indices_buffer = torch.empty(
-                (4 * 1024 * 1024,), dtype=torch.int32, device=self.device
+                (128 * 1024 * 1024,), dtype=torch.int32, device=self.device
             )
             # NOTE(Zihao): assume maximum batch size is 32768
             self._vector_sparse_indptr_buffer = torch.empty(
@@ -164,7 +168,11 @@ class BlockSparseAttentionWrapper:
         self._backend = backend
 
     def reset_workspace_buffer(
-        self, float_workspace_buffer: torch.Tensor, int_workspace_buffer: torch.Tensor
+        self,
+        float_workspace_buffer: torch.Tensor,
+        int_workspace_buffer: torch.Tensor,
+        vector_sparse_indices_buffer: Optional[torch.Tensor] = None,
+        vector_sparse_indptr_buffer: Optional[torch.Tensor] = None,
     ) -> None:
         r"""Reset the workspace buffer.
 
@@ -180,11 +188,20 @@ class BlockSparseAttentionWrapper:
         """
         self._float_workspace_buffer = float_workspace_buffer
         self._int_workspace_buffer = int_workspace_buffer
+        self._workspace_size = (
+            float_workspace_buffer.numel() * float_workspace_buffer.element_size()
+        )
         self._pin_memory_int_workspace_buffer = torch.empty(
             self._int_workspace_buffer.shape,
             dtype=self._int_workspace_buffer.dtype,
             pin_memory=True,
         )
+
+        # Enable user-defined size
+        if vector_sparse_indices_buffer is not None:
+            self._vector_sparse_indices_buffer = vector_sparse_indices_buffer
+        if vector_sparse_indptr_buffer is not None:
+            self._vector_sparse_indptr_buffer = vector_sparse_indptr_buffer
 
     def plan(
         self,
@@ -435,7 +452,7 @@ class BlockSparseAttentionWrapper:
                     ].copy_(vector_sparse_indptr_host, non_blocking=non_blocking)
                     kv_indptr_host = vector_sparse_indptr_host
 
-            self._plan_info = self._cached_module.plan(
+            args = [
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
                 self._pin_memory_int_workspace_buffer,
@@ -451,6 +468,13 @@ class BlockSparseAttentionWrapper:
                 head_dim,
                 head_dim,
                 causal,
+                -1,  # window_left
+            ]
+            if self._backend == "fa2":
+                args.append(-1)  # fixed_split_size
+                args.append(False)  # disable_split_kv
+            self._plan_info = self._cached_module.plan(
+                *args,
             )
 
         self._pos_encoding_mode = pos_encoding_mode
@@ -566,14 +590,14 @@ class BlockSparseAttentionWrapper:
                     (q.size(0), q.size(1)), dtype=torch.float32, device=q.device
                 )
             else:
-                _check_shape_dtype_device(
+                check_shape_dtype_device(
                     lse, (q.size(0), q.size(1)), torch.float32, q.device, "lse"
                 )
 
         if out is None:
             out = torch.empty_like(q, dtype=self._o_dtype)
         else:
-            _check_shape_dtype_device(out, q.shape, self._o_dtype, q.device, "out")
+            check_shape_dtype_device(out, q.shape, self._o_dtype, q.device, "out")
 
         if is_float8(q):
             assert q.dtype == k.dtype == v.dtype
@@ -589,6 +613,14 @@ class BlockSparseAttentionWrapper:
 
         if self._use_tensor_cores:
             if self._backend == "fa3":
+                if (
+                    self._vector_sparse_indices_buffer.numel()
+                    <= self._paged_kv_indices_buf.numel() * self.C
+                ):
+                    raise ValueError(
+                        "_vector_sparse_indices_buffer is not large enough. Please increase the size."
+                    )
+
                 sparse_indices = block_sparse_indices_to_vector_sparse_offsets(
                     self._paged_kv_indices_buf,
                     self._paged_kv_indptr_buf,
@@ -636,6 +668,7 @@ class BlockSparseAttentionWrapper:
                 rope_scale,
                 rope_theta,
                 0,  # token_pos_in_items_len
+                self._workspace_size,  # workspace_size
             )
         else:
             self._cached_module.run(
@@ -721,15 +754,16 @@ class VariableBlockSparseAttentionWrapper:
         """
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
+        self._workspace_size = (
+            float_workspace_buffer.numel() * float_workspace_buffer.element_size()
+        )
         self._int_workspace_buffer = torch.empty(
             (8 * 1024 * 1024,), dtype=torch.uint8, device=self.device
         )
         if backend in ["fa3", "auto"]:
-            # NOTE(Zihao): assume maximum accumulate kv length is 4M
             self._vector_sparse_indices_buffer = torch.empty(
-                (4 * 1024 * 1024,), dtype=torch.int32, device=self.device
+                (128 * 1024 * 1024,), dtype=torch.int32, device=self.device
             )
-            # NOTE(Zihao): assume maximum batch size is 32768
             self._vector_sparse_indptr_buffer = torch.empty(
                 (32768,), dtype=torch.int32, device=self.device
             )
@@ -752,7 +786,11 @@ class VariableBlockSparseAttentionWrapper:
         self._backend = backend
 
     def reset_workspace_buffer(
-        self, float_workspace_buffer: torch.Tensor, int_workspace_buffer: torch.Tensor
+        self,
+        float_workspace_buffer: torch.Tensor,
+        int_workspace_buffer: torch.Tensor,
+        vector_sparse_indices_buffer: Optional[torch.Tensor] = None,
+        vector_sparse_indptr_buffer: Optional[torch.Tensor] = None,
     ) -> None:
         r"""Reset the workspace buffer.
 
@@ -768,11 +806,20 @@ class VariableBlockSparseAttentionWrapper:
         """
         self._float_workspace_buffer = float_workspace_buffer
         self._int_workspace_buffer = int_workspace_buffer
+        self._workspace_size = (
+            float_workspace_buffer.numel() * float_workspace_buffer.element_size()
+        )
         self._pin_memory_int_workspace_buffer = torch.empty(
             self._int_workspace_buffer.shape,
             dtype=self._int_workspace_buffer.dtype,
             pin_memory=True,
         )
+
+        # Enable user-defined size
+        if vector_sparse_indices_buffer is not None:
+            self._vector_sparse_indices_buffer = vector_sparse_indices_buffer
+        if vector_sparse_indptr_buffer is not None:
+            self._vector_sparse_indptr_buffer = vector_sparse_indptr_buffer
 
     def plan(
         self,
@@ -860,14 +907,14 @@ class VariableBlockSparseAttentionWrapper:
 
         # q layout: [seq_len, num_kv_heads, gqa_group_size, head_dim]
         # padded into: [seq_len * num_kv_heads, 1, gqa_group_size, head_dim]
-        qo_indptr_host = torch.cat(
+        qo_indptr = torch.cat(
             [
                 torch.zeros(1, dtype=torch.int32, device=block_row_sz.device),
                 torch.cumsum(block_row_sz.flatten(), dim=0, dtype=torch.int32),
             ],
             dim=0,
         )
-        qo_indptr = qo_indptr_host.to(block_mask_map.device, non_blocking=non_blocking)
+        qo_indptr_host = qo_indptr.to("cpu", non_blocking=non_blocking)
         last_block_len = torch.full(
             (num_blocks_row * num_kv_heads,),
             1,
@@ -926,35 +973,36 @@ class VariableBlockSparseAttentionWrapper:
                 dtype=dtype_i, device=device
             )
 
-        kv_indptr_host, kv_indices_host = _block_mask_map_to_expanded_indices(
+        kv_indptr, kv_indices = _block_mask_map_to_expanded_indices(
             block_mask_map, block_col_sz
         )
+        kv_indptr_host = kv_indptr.to("cpu", non_blocking=non_blocking)
+        kv_indices_host = kv_indices.to("cpu", non_blocking=non_blocking)
 
         self._qo_indptr = qo_indptr.to(self.device, non_blocking=non_blocking)
-        self._paged_kv_indptr_buf = kv_indptr_host.to(
-            self.device, non_blocking=non_blocking
-        )
-        self._paged_kv_indices_buf = kv_indices_host.to(
+        self._paged_kv_indptr_buf = kv_indptr.to(self.device, non_blocking=non_blocking)
+        self._paged_kv_indices_buf = kv_indices.to(
             self.device, non_blocking=non_blocking
         )
         self._paged_kv_last_page_len = last_block_len.to(
             self.device, non_blocking=non_blocking
         )
+        torch.cuda.synchronize()  # for non-blocking copy
         self._mask_mode = MaskMode.CAUSAL.value if causal else MaskMode.NON_CAUSAL.value
 
         # Sanity check
-        assert (
-            num_qo_heads % num_kv_heads == 0
-        ), "num_qo_heads must be a multiple of num_kv_heads"
+        assert num_qo_heads % num_kv_heads == 0, (
+            "num_qo_heads must be a multiple of num_kv_heads"
+        )
         assert num_blocks_row * num_kv_heads + 1 == kv_indptr_host.shape[0]
-        assert kv_indptr_host[-1].item() == kv_indices_host.shape[0]
+        assert kv_indptr_host[-1].item() == kv_indices_host.shape[0], (
+            f"{kv_indptr_host[-1].item()} != {kv_indices_host.shape[0]}"
+        )
         assert num_kv_heads == block_mask_map.shape[0]
         assert num_kv_heads == block_row_sz.shape[0]
         assert num_kv_heads == block_col_sz.shape[0]
         assert num_blocks_row == block_mask_map.shape[1]
         assert num_blocks_col == block_mask_map.shape[2]
-
-        kv_indptr_host = kv_indptr_host.to("cpu")
 
         if self._backend == "auto":
             self._backend = determine_attention_backend(
@@ -986,11 +1034,14 @@ class VariableBlockSparseAttentionWrapper:
         )
 
         if self._backend == "fa3":
-            self._vector_sparse_indptr_buffer[: len(kv_indptr_host)].copy_(
-                kv_indptr_host, non_blocking=non_blocking
+            if self._vector_sparse_indptr_buffer.numel() <= kv_indptr.numel():
+                raise ValueError(
+                    "_vector_sparse_indptr_buffer is not large enough. Please increase the buffer size."
+                )
+            self._vector_sparse_indptr_buffer[: len(kv_indptr)].copy_(
+                kv_indptr, non_blocking=non_blocking
             )
-
-        self._plan_info = self._cached_module.plan(
+        args = [
             self._float_workspace_buffer,
             self._int_workspace_buffer,
             self._pin_memory_int_workspace_buffer,
@@ -1006,6 +1057,13 @@ class VariableBlockSparseAttentionWrapper:
             head_dim,
             head_dim,
             causal,
+            -1,  # window_left
+        ]
+        if self._backend == "fa2":
+            args.append(-1)  # fixed_split_size
+            args.append(False)  # disable_split_kv
+        self._plan_info = self._cached_module.plan(
+            *args,
         )
 
         self._pos_encoding_mode = pos_encoding_mode
@@ -1125,16 +1183,24 @@ class VariableBlockSparseAttentionWrapper:
                     (q.size(0), q.size(1)), dtype=torch.float32, device=q.device
                 )
             else:
-                _check_shape_dtype_device(
+                check_shape_dtype_device(
                     lse, (q.size(0), q.size(1)), torch.float32, q.device, "lse"
                 )
 
         if out is None:
             out = torch.empty_like(q, dtype=self._o_dtype)
         else:
-            _check_shape_dtype_device(out, q.shape, self._o_dtype, q.device, "out")
+            check_shape_dtype_device(out, q.shape, self._o_dtype, q.device, "out")
 
         if self._backend == "fa3":
+            if (
+                self._vector_sparse_indices_buffer.numel()
+                <= self._paged_kv_indices_buf.numel()
+            ):
+                raise ValueError(
+                    "_vector_sparse_indices_buffer is not large enough. Please increase the buffer size."
+                )
+
             sparse_indices = block_sparse_indices_to_vector_sparse_offsets(
                 self._paged_kv_indices_buf,
                 self._paged_kv_indptr_buf,
@@ -1183,6 +1249,7 @@ class VariableBlockSparseAttentionWrapper:
             rope_scale,
             rope_theta,
             0,  # token_pos_in_items_len
+            self._workspace_size,
         )
 
         # [qo_len * num_kv_heads, gqa_group_size, head_dim] -> HND

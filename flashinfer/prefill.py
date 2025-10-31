@@ -18,11 +18,10 @@ import functools
 import logging
 import math
 from types import SimpleNamespace
-from typing import Any, List, Literal, Optional, Tuple, Union, overload
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union, overload
 
 import torch
 
-from .cudnn import cudnn_batch_prefill_with_kv_cache
 from .jit import (
     gen_batch_prefill_module,
     gen_customize_batch_prefill_module,
@@ -30,27 +29,37 @@ from .jit import (
     gen_single_prefill_module,
     get_batch_prefill_uri,
     get_single_prefill_uri,
+    setup_cubin_loader,
+    gen_trtllm_gen_fmha_module,
 )
+from .cudnn import cudnn_batch_prefill_with_kv_cache
 from .page import block_sparse_indices_to_vector_sparse_offsets, get_seq_lens
 from .quantization import packbits, segment_packbits
 from .utils import (
+    FP4Tensor,
     MaskMode,
     PosEncodingMode,
     TensorLayout,
     _check_cached_qkv_data_type,
     _check_kv_layout,
     _check_pos_encoding_mode,
-    _check_shape_dtype_device,
+    check_shape_dtype_device,
     _get_cache_alibi_slopes_buf,
     _get_cache_buf,
     _unpack_paged_kv_cache,
     canonicalize_torch_dtype,
     determine_attention_backend,
     device_support_pdl,
+    get_device_sm_count,
     is_float8,
     is_sm100a_supported,
+    is_sm110a_supported,
+    is_sm120a_supported,
+    is_sm121a_supported,
     register_custom_op,
     register_fake_op,
+    ceil_div,
+    round_up,
 )
 
 
@@ -62,12 +71,18 @@ def get_fmha_module(
     dtype_idx: torch.dtype,
     head_dim_qk: int,
     head_dim_vo: int,
-    pos_encoding_mode: PosEncodingMode,
+    pos_encoding_mode: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
+    device: torch.device,
     use_fp16_qk_reduction: bool = False,
 ):
-    if is_sm100a_supported(torch.device("cuda")):
+    if (
+        is_sm100a_supported(device)
+        or is_sm110a_supported(device)
+        or is_sm120a_supported(device)
+        or is_sm121a_supported(device)
+    ):
         return gen_fmha_cutlass_sm100a_module(
             dtype_q,
             dtype_kv,
@@ -83,11 +98,167 @@ def get_fmha_module(
         raise ValueError("SM100A is not supported on this device")
 
 
+def make_hashable_cache(func):
+    """
+    Decorator that converts unhashable arguments (like lists) to hashable ones (tuples)
+    before applying functools.cache.
+    """
+
+    @functools.cache
+    def cached_wrapper(*args, **kwargs):
+        return func(*args, **kwargs)
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        # Convert unhashable arguments to hashable ones
+        hashable_args = []
+        for arg in args:
+            if isinstance(arg, list):
+                hashable_args.append(tuple(arg))
+            else:
+                hashable_args.append(arg)
+
+        hashable_kwargs = {}
+        for key, value in kwargs.items():
+            if isinstance(value, list):
+                hashable_kwargs[key] = tuple(value)
+            else:
+                hashable_kwargs[key] = value
+
+        return cached_wrapper(*hashable_args, **hashable_kwargs)
+
+    return wrapper
+
+
+@make_hashable_cache
+def get_customize_batch_prefill_module(
+    backend: str,
+    uri: str,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    idtype: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    additional_tensor_names: List[str],
+    additional_tensor_dtypes: List[str],
+    additional_scalar_names: List[str],
+    additional_scalar_dtypes: List[str],
+    variant_name: str,
+    variant_decl: str,
+    pos_encoding_mode: int = 0,
+    use_sliding_window: bool = False,
+    use_logits_soft_cap: bool = False,
+    use_fp16_qk_reduction: bool = False,
+    fp8_enabled: bool = False,
+):
+    return gen_customize_batch_prefill_module(
+        backend,
+        uri,
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        idtype,
+        head_dim_qk,
+        head_dim_vo,
+        additional_tensor_names,
+        additional_tensor_dtypes,
+        additional_scalar_names,
+        additional_scalar_dtypes,
+        variant_name,
+        variant_decl,
+        pos_encoding_mode,
+        use_sliding_window,
+        use_logits_soft_cap,
+        use_fp16_qk_reduction,
+        fp8_enabled,
+    ).build_and_load()
+
+
+@functools.cache
+def get_trtllm_gen_prefill_module():
+    mod = gen_trtllm_gen_fmha_module()
+    op = mod.build_and_load()
+    setup_cubin_loader(mod.get_library_path())
+
+    def _paged_run(
+        query: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        workspace_buffer: torch.Tensor,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        max_q_len: int,
+        max_kv_len: int,
+        bmm1_scale: float,
+        bmm2_scale: float,
+        batch_size: int,
+        cum_seq_lens_q: torch.Tensor,
+        cum_seq_lens_kv: torch.Tensor,
+        enable_pdl: bool,
+        workspace_size: int,
+        window_left: int = -1,
+        out: Optional[torch.Tensor] = None,
+        sinks: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        sm_count = get_device_sm_count(query.device)
+        if out is None:
+            out = torch.empty_like(query)
+        bmm1_scale = (
+            bmm1_scale.item() if isinstance(bmm1_scale, torch.Tensor) else bmm1_scale
+        )
+        bmm2_scale = (
+            bmm2_scale.item() if isinstance(bmm2_scale, torch.Tensor) else bmm2_scale
+        )
+        op.trtllm_paged_attention_context(
+            out,
+            None,  # fp4 output not supported in wrapper api yet.
+            query,
+            k_cache,
+            v_cache,
+            workspace_buffer,
+            block_tables,
+            seq_lens,
+            max_q_len,
+            max_kv_len,
+            bmm1_scale,
+            bmm2_scale,
+            -1,  # o_sf_scale
+            -1,  # o_sf_vec_size
+            0,  # o_sf_start_index
+            batch_size,
+            window_left,
+            cum_seq_lens_q,
+            cum_seq_lens_kv,
+            sm_count,
+            enable_pdl,
+            workspace_size,
+            sinks,
+        )
+        return out
+
+    def _ragged_run(*args, **kwargs):
+        # TODO(Zihao): trtllm-gen backend already supports variable length attention,
+        # but not integrated into flashinfer yet.
+        raise NotImplementedError(
+            "Variable length is not implemented for trtllm-gen backend yet."
+        )
+
+    def _plan(*args, **kwargs):
+        pass
+
+    return SimpleNamespace(
+        paged_run=_paged_run,
+        ragged_run=_ragged_run,
+        plan=_plan,
+    )
+
+
 @functools.cache
 def get_single_prefill_module(backend, *args):
     uri = get_single_prefill_uri(backend, *args)
     module = gen_single_prefill_module(backend, *args).build_and_load()
-    run_func = module.run.default
+    run_func = module.run
 
     # torch library for single_prefill_with_kv_cache
 
@@ -192,11 +363,18 @@ def get_single_prefill_module(backend, *args):
 
 @functools.cache
 def get_batch_prefill_module(backend, *args):
-    uri = get_batch_prefill_uri(backend, *args)
-    module = gen_batch_prefill_module(backend, *args).build_and_load()
-    plan_func = module.plan.default
-    ragged_run_func = module.ragged_run.default
-    paged_run_func = module.paged_run.default
+    if backend == "trtllm-gen":
+        uri = "trtllm_gen_context"
+        module = get_trtllm_gen_prefill_module()
+        plan_func = module.plan
+        ragged_run_func = module.ragged_run
+        paged_run_func = module.paged_run
+    else:
+        uri = get_batch_prefill_uri(backend, *args)
+        module = gen_batch_prefill_module(backend, *args).build_and_load()
+        plan_func = module.plan
+        ragged_run_func = module.ragged_run
+        paged_run_func = module.paged_run
 
     # torch library for ragged_run
 
@@ -364,8 +542,53 @@ def get_batch_prefill_module(backend, *args):
         rope_scale: float,
         rope_theta: float,
         token_pos_in_items_len: int,
+        workspace_size: int,
+        num_qo_heads: Optional[int] = None,
+        num_kv_heads: Optional[int] = None,
+        block_tables: Optional[torch.Tensor] = None,
+        kv_lens_buffer: Optional[torch.Tensor] = None,
+        page_size: Optional[int] = None,
+        max_q_len: Optional[int] = None,
+        max_kv_len: Optional[int] = None,
+        batch_size: Optional[int] = None,
+        cum_seq_lens_q: Optional[torch.Tensor] = None,
+        cum_seq_lens_kv: Optional[torch.Tensor] = None,
+        sinks: Optional[torch.Tensor] = None,
     ) -> None:
-        if backend == "fa2":
+        if backend == "trtllm-gen":
+            assert maybe_lse is None
+            assert num_qo_heads is not None
+            assert num_kv_heads is not None
+            assert block_tables is not None
+            assert kv_lens_buffer is not None
+            assert page_size is not None
+            assert max_kv_len is not None
+            assert batch_size is not None
+            assert cum_seq_lens_q is not None
+            assert cum_seq_lens_kv is not None
+            assert enable_pdl is not None
+            assert workspace_size > 0, "workspace_size must be greater than 0"
+            o = paged_run_func(
+                q.contiguous(),  # NOTE(Siyuan): without contiguous, the result is incorrect
+                paged_k_cache,
+                paged_v_cache,
+                int_workspace_buffer,
+                block_tables,
+                kv_lens_buffer,
+                max_q_len,
+                max_kv_len,
+                sm_scale,
+                1.0,  # NOTE(Siyuan): update this to expose bmm2 scale
+                batch_size,
+                cum_seq_lens_q,
+                cum_seq_lens_kv,
+                enable_pdl,
+                workspace_size,
+                window_left,
+                out=o,
+                sinks=sinks,
+            )
+        elif backend == "fa2":
             assert not is_float8(q)
             paged_run_func(
                 float_workspace_buffer,
@@ -476,6 +699,17 @@ def get_batch_prefill_module(backend, *args):
         rope_scale: float,
         rope_theta: float,
         token_pos_in_items_len: int,
+        workspace_size: int,
+        num_qo_heads: Optional[int] = None,
+        num_kv_heads: Optional[int] = None,
+        block_tables: Optional[torch.Tensor] = None,
+        kv_lens_buffer: Optional[torch.Tensor] = None,
+        page_size: Optional[int] = None,
+        max_q_len: Optional[int] = None,
+        max_kv_len: Optional[int] = None,
+        batch_size: Optional[int] = None,
+        cum_seq_lens_q: Optional[torch.Tensor] = None,
+        cum_seq_lens_kv: Optional[torch.Tensor] = None,
     ) -> None:
         pass
 
@@ -492,9 +726,9 @@ def get_batch_prefill_module(backend, *args):
 
 @functools.cache
 def get_batch_prefill_jit_module(module_name: str, jit_module: Any):
-    plan_func = jit_module.plan.default
-    ragged_run_func = jit_module.ragged_run.default
-    paged_run_func = jit_module.paged_run.default
+    plan_func = jit_module.plan
+    ragged_run_func = jit_module.ragged_run
+    paged_run_func = jit_module.paged_run
 
     # torch library for ragged_run
     @register_custom_op(
@@ -658,7 +892,7 @@ def single_prefill_with_kv_cache_with_jit_module(
     lse = None
     if return_lse:
         lse = torch.empty((q.size(0), q.size(1)), dtype=torch.float32, device=device)
-    jit_module.run.default(
+    jit_module.run(
         q,
         k,
         v,
@@ -1006,7 +1240,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
     >>> max_num_pages = 128
     >>> page_size = 16
     >>> # allocate 128MB workspace buffer
-    >>> workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
+    >>> workspace_buffer = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
     >>> prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
     ...     workspace_buffer, "NHD"
     ... )
@@ -1104,6 +1338,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         mask_indptr_buf: Optional[torch.Tensor] = None,
         backend: str = "auto",
         jit_args: Optional[List[Any]] = None,
+        jit_kwargs: Optional[Dict[str, Any]] = None,
     ) -> None:
         r"""Constructor of :class:`BatchPrefillWithPagedKVCacheWrapper`.
 
@@ -1156,28 +1391,41 @@ class BatchPrefillWithPagedKVCacheWrapper:
             mask will be used in attention computation.
 
         backend : str
-            The implementation backend, could be ``auto``/``fa2`` or ``fa3``. Defaults to ``auto``.
+            The implementation backend, could be ``auto``/``fa2``,``fa3`` or ``cudnn``. Defaults to ``auto``.
             If set to ``auto``, the wrapper will automatically choose the backend based on the
             device architecture and kernel availability.
 
         jit_args : Optional[List[Any]]
             If provided, the wrapper will use the provided arguments to create the JIT module,
             otherwise, the wrapper will use default attention implementation.
+
+        jit_kwargs : Optional[Dict[str, Any]]
+            The keyword arguments to create the JIT module, defaults to None.
         """
         _check_kv_layout(kv_layout)
 
         if jit_args is not None:
+            if jit_kwargs is None:
+                jit_kwargs = {}
             self._jit_module = get_batch_prefill_jit_module(
                 jit_args[0],
-                gen_customize_batch_prefill_module(backend, *jit_args).build_and_load(),
+                get_customize_batch_prefill_module(backend, *jit_args, **jit_kwargs),
             )
         else:
             self._jit_module = None
 
         self._kv_layout = kv_layout
+        if backend == "cudnn":
+            assert kv_layout == "NHD", "CUDNN backend only supports NHD layout"
+
         self._float_workspace_buffer = float_workspace_buffer
+        self._workspace_size = (
+            self._float_workspace_buffer.numel()
+            * self._float_workspace_buffer.element_size()
+        )
         self.device = float_workspace_buffer.device
-        if backend in ["fa3", "auto"]:
+        self._vector_sparse_indptr_buffer: Optional[torch.Tensor] = None
+        if backend in ["fa3", "auto", "trtllm-gen"]:
             # NOTE(Zihao): assume maximum accumulate kv length is 16M
             self._vector_sparse_indices_buffer = torch.empty(
                 (16 * 1024 * 1024,), dtype=torch.int32, device=self.device
@@ -1236,8 +1484,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._paged_kv_last_page_len_buf = paged_kv_last_page_len_buf
         self._custom_mask_buf = custom_mask_buf
         self._mask_indptr_buf = mask_indptr_buf
-        self._max_total_num_rows = None
+        self._max_total_num_rows: Optional[int] = None
         self._backend = backend
+        self._plan_info = None
+        self._cached_module = None
+        self._seq_lens_kv = None
+        self._seq_lens_q = None
+        self._block_tables = None
 
     @property
     def is_cuda_graph_enabled(self) -> bool:
@@ -1295,6 +1548,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
         token_pos_in_items_ptr: Optional[torch.Tensor] = None,
         token_pos_in_items_len: int = 0,
         max_item_len_ptr: Optional[torch.Tensor] = None,
+        seq_lens: Optional[torch.Tensor] = None,
+        seq_lens_q: Optional[torch.Tensor] = None,
+        block_tables: Optional[torch.Tensor] = None,
+        max_token_per_sequence: Optional[int] = None,
+        max_sequence_kv: Optional[int] = None,
+        fixed_split_size: Optional[int] = None,
+        disable_split_kv: bool = False,
     ) -> None:
         r"""Plan batch prefill/append attention on Paged KV-Cache for given problem specification.
 
@@ -1305,7 +1565,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         paged_kv_indptr : torch.Tensor
             The indptr of the paged kv-cache, shape: ``[batch_size + 1]``.
         paged_kv_indices : torch.Tensor
-            The page indices of the paged kv-cache, shape: ``[kv_indptr[-1]]``.
+            The page indices of the paged kv-cache, shape: ``[paged_kv_indptr[-1]]``.
         paged_kv_last_page_len : torch.Tensor
             The number of entries in the last page of each request in the paged
             kv-cache, shape: ``[batch_size]``.
@@ -1383,7 +1643,25 @@ class BatchPrefillWithPagedKVCacheWrapper:
             with 7 padded zeros. (note there're 8 zeros in the end where the first one is the delimiter token 0 in the end of the prompt)
         max_item_len_ptr : Optional[float]
             a uint16 vector contains the max token length of all items for each prompt
-
+        seq_lens: Optional[torch.Tensor]
+            A uint32 1D tensor indicating the kv sequence length of each prompt. shape: ``[batch_size]``.
+        seq_lens_q: Optional[torch.Tensor]
+            A uint32 1D tensor indicating the q sequence length of each prompt. shape: ``[batch_size]``.
+            If not provided, will be set to the same value as ``seq_lens``.
+        block_tables: Optional[torch.Tensor]
+            A uint32 2D tensor indicating the block table of each prompt. shape: ``[batch_size, max_num_blocks_per_seq]``.
+        max_token_per_sequence: Optional[int],
+            Required for cudnn backend. This is the scalar max token length of each sequence.
+        max_sequence_kv: Optional[int],
+            Required for cudnn backend. This is the scalar max sequence length of each sequence in kv cache.
+        fixed_split_size : Optional[int],
+            The fixed split size for FA2 split-kv prefill/decode in pages. Recommend setting to the average sequence length of your workload.
+            When enabled, will lead to deterministic softmax score reduction in the merge_states kernel, and therefore
+            batch-size invariant outputs. See https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/
+            Note that compatibility with CUDA graph is NOT guaranteed, as even when bs is fixed, kv seq len can change
+            and lead to a varied number of launched CTAs.
+        disable_split_kv : bool,
+            Whether to disable the split-kv for determinism in CUDA Graph, defaults to ``False``.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -1405,8 +1683,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
             logits_soft_cap = 0.0
         if head_dim_vo is None:
             head_dim_vo = head_dim_qk
+        if fixed_split_size is None:
+            fixed_split_size = -1
 
         batch_size = len(qo_indptr) - 1
+        self._batch_size = batch_size
+        self._num_qo_heads = num_qo_heads
+        self._num_kv_heads = num_kv_heads
         if custom_mask is not None or packed_custom_mask is not None:
             mask_indptr = _compute_page_mask_indptr(
                 qo_indptr,
@@ -1428,17 +1711,28 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._max_item_len_ptr = max_item_len_ptr
 
         # NOTE(Zihao): only required if qo_indptr/paged_kv_indptr are device tensors
-        qo_indptr_host = qo_indptr.to("cpu")
-        paged_kv_indptr_host = paged_kv_indptr.to("cpu")
-        paged_kv_last_page_len_host = paged_kv_last_page_len.to("cpu")
-        kv_lens_arr_host = get_seq_lens(
-            paged_kv_indptr_host, paged_kv_last_page_len_host, page_size
-        )
-        self._kv_lens_buffer[: len(kv_lens_arr_host)].copy_(
-            kv_lens_arr_host, non_blocking=non_blocking
-        )
+        if max_token_per_sequence is not None:
+            self._max_q_len = max_token_per_sequence
+        else:
+            qo_indptr_host = qo_indptr.to("cpu")
+            self._max_q_len = max(qo_indptr_host[1:] - qo_indptr_host[:-1]).item()
+            total_num_rows = int(qo_indptr_host[-1])
 
-        total_num_rows = qo_indptr_host[-1]
+        if max_sequence_kv is not None:
+            self._max_kv_len = max_sequence_kv
+        else:
+            paged_kv_indptr_host = paged_kv_indptr.to("cpu")
+            paged_kv_last_page_len_host = paged_kv_last_page_len.to("cpu")
+            if seq_lens is None:
+                kv_lens_arr_host = get_seq_lens(
+                    paged_kv_indptr_host, paged_kv_last_page_len_host, page_size
+                )
+            else:
+                kv_lens_arr_host = seq_lens.cpu().flatten()
+            self._kv_lens_buffer[: len(kv_lens_arr_host)].copy_(
+                kv_lens_arr_host, non_blocking=non_blocking
+            )
+            self._max_kv_len = max(kv_lens_arr_host).item()
 
         if self.is_cuda_graph_enabled:
             if self._max_total_num_rows is None:
@@ -1527,25 +1821,25 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     q_data_type,
                     kv_data_type,
                 )
+            if self._backend != "cudnn":
+                get_module_args = (
+                    q_data_type,
+                    kv_data_type,
+                    q_data_type,
+                    paged_kv_indptr.dtype,
+                    head_dim_qk,
+                    head_dim_vo,
+                    PosEncodingMode[pos_encoding_mode].value,
+                    window_left >= 0,  # use_sliding_window
+                    logits_soft_cap > 0,  # use_logits_soft_cap
+                    use_fp16_qk_reduction,
+                )
 
-            get_module_args = (
-                q_data_type,
-                kv_data_type,
-                q_data_type,
-                paged_kv_indptr.dtype,
-                head_dim_qk,
-                head_dim_vo,
-                PosEncodingMode[pos_encoding_mode].value,
-                window_left >= 0,  # use_sliding_window
-                logits_soft_cap > 0,  # use_logits_soft_cap
-                use_fp16_qk_reduction,
-            )
+                self._cached_module = get_batch_prefill_module(
+                    self._backend, *get_module_args
+                )
 
-            self._cached_module = get_batch_prefill_module(
-                self._backend, *get_module_args
-            )
-
-        if self._backend == "fa3":
+        if self._backend == "fa3" or self._backend == "trtllm-gen":
             if page_size != 1:
                 vector_sparse_indptr_host = torch.cat(
                     [
@@ -1561,23 +1855,57 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 ].copy_(vector_sparse_indptr_host, non_blocking=non_blocking)
                 paged_kv_indptr_host = vector_sparse_indptr_host
 
-        self._plan_info = self._cached_module.plan(
-            self._float_workspace_buffer,
-            self._int_workspace_buffer,
-            self._pin_memory_int_workspace_buffer,
-            qo_indptr_host,
-            paged_kv_indptr_host,
-            kv_lens_arr_host,
-            self._max_total_num_rows or total_num_rows,
-            batch_size,
-            num_qo_heads,
-            num_kv_heads,
-            page_size,
-            self.is_cuda_graph_enabled,
-            head_dim_qk,
-            head_dim_vo,
-            causal,
-        )
+        self._block_tables = block_tables
+        if self._backend == "trtllm-gen":
+            assert self._kv_layout == "HND"
+            assert logits_soft_cap == 0.0
+            if self._block_tables is None:
+                blocks_per_seq = [
+                    (seq_len + page_size - 1) // page_size
+                    for seq_len in kv_lens_arr_host
+                ]
+                max_num_blocks_per_seq = max(blocks_per_seq)
+                self._block_tables = torch.zeros(
+                    (batch_size, max_num_blocks_per_seq),
+                    dtype=torch.int,
+                    device=self.device,
+                )
+                block_id = paged_kv_indptr_host[0]
+                for i in range(batch_size):
+                    num_blocks_needed = blocks_per_seq[i]
+                    assert self._block_tables is not None, (
+                        "block_tables is not initialized"
+                    )
+                    self._block_tables[i, :num_blocks_needed] = paged_kv_indices[
+                        block_id : block_id + num_blocks_needed
+                    ]
+                    block_id += num_blocks_needed
+
+        if self._cached_module is not None:
+            args = [
+                self._float_workspace_buffer,
+                self._int_workspace_buffer,
+                self._pin_memory_int_workspace_buffer,
+                qo_indptr_host,
+                paged_kv_indptr_host,
+                kv_lens_arr_host,
+                self._max_total_num_rows or total_num_rows,
+                batch_size,
+                num_qo_heads,
+                num_kv_heads,
+                page_size,
+                self.is_cuda_graph_enabled,
+                head_dim_qk,
+                head_dim_vo,
+                causal,
+                window_left,
+            ]
+            if self._backend == "fa2":
+                args.append(fixed_split_size or -1)  # fixed_split_size
+                args.append(disable_split_kv)  # disable_split_kv
+            self._plan_info = self._cached_module.plan(
+                *args,
+            )
 
         self._causal = causal
         self._pos_encoding_mode = pos_encoding_mode
@@ -1587,6 +1915,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._sm_scale = sm_scale
         self._rope_scale = rope_scale
         self._rope_theta = rope_theta
+        self._seq_lens_kv = seq_lens
+        self._seq_lens_q = seq_lens_q if seq_lens_q is not None else seq_lens
 
     begin_forward = plan
 
@@ -1628,6 +1958,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         lse: Optional[torch.Tensor] = None,
         return_lse: Literal[False] = False,
         enable_pdl: Optional[bool] = None,
+        window_left: Optional[int] = None,
     ) -> torch.Tensor: ...
 
     @overload
@@ -1642,6 +1973,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         lse: Optional[torch.Tensor] = None,
         return_lse: Literal[True] = True,
         enable_pdl: Optional[bool] = None,
+        window_left: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
     def run(
@@ -1649,12 +1981,15 @@ class BatchPrefillWithPagedKVCacheWrapper:
         q: torch.Tensor,
         paged_kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
         *args,
+        q_scale: Optional[float] = None,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
         enable_pdl: Optional[bool] = None,
+        window_left: Optional[int] = None,
+        sinks: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch prefill/append attention between query and paged kv-cache.
 
@@ -1713,7 +2048,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
         else:
             page_size = k_cache.shape[2]
             stride_n = k_cache.stride(2)
-        window_left = self._window_left
+        window_left = self._window_left if window_left is None else window_left
+        if self._backend != "trtllm-gen":
+            # NOTE(Siyuan): since window_left is appeared in the plan function, we need to make sure it is the same as the one in the plan function.
+            # Remove this check if the backend supports dynamic window_left.
+            assert window_left == self._window_left
         logits_soft_cap = self._logits_soft_cap
         sm_scale = self._sm_scale
         rope_scale = self._rope_scale
@@ -1722,6 +2061,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
             logits_soft_cap = 0.0
         if sm_scale is None:
             sm_scale = 1.0 / math.sqrt(q.size(-1))
+        if q_scale is not None:
+            sm_scale *= q_scale
         if k_scale is not None:
             sm_scale *= k_scale
         if rope_scale is None:
@@ -1734,7 +2075,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     (q.size(0), q.size(1)), dtype=torch.float32, device=q.device
                 )
             else:
-                _check_shape_dtype_device(
+                check_shape_dtype_device(
                     lse, (q.size(0), q.size(1)), torch.float32, q.device, "lse"
                 )
 
@@ -1743,7 +2084,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 q.shape[:-1] + v_cache.shape[-1:], dtype=q.dtype, device=q.device
             )
         else:
-            _check_shape_dtype_device(
+            check_shape_dtype_device(
                 out, q.shape[:-1] + v_cache.shape[-1:], q.dtype, q.device, "out"
             )
 
@@ -1776,49 +2117,92 @@ class BatchPrefillWithPagedKVCacheWrapper:
             sparse_indices = self._paged_kv_indices_buf
             sparse_indptr = self._paged_kv_indptr_buf
 
-        run_args = [
-            self._float_workspace_buffer,
-            self._int_workspace_buffer,
-            self._plan_info,
-            q,
-            k_cache,
-            v_cache,
-            self._qo_indptr_buf,
-            sparse_indptr,
-            sparse_indices,
-            self._paged_kv_last_page_len_buf,
-            out,
-            lse,
-            mask_mode,
-            TensorLayout[self._kv_layout].value,
-            window_left,
-            enable_pdl,
-        ]
+        if self._backend == "cudnn":
+            if self._seq_lens_q is not None and self._seq_lens_q.dim() == 1:
+                self._seq_lens_q = self._seq_lens_q.reshape(self._batch_size, 1, 1, 1)
 
-        if self._jit_module is not None:
-            run_args.extend(list(args))
+            if self._seq_lens_kv is not None and self._seq_lens_kv.dim() == 1:
+                self._seq_lens_kv = self._seq_lens_kv.reshape(self._batch_size, 1, 1, 1)
+
+            cudnn_batch_prefill_with_kv_cache(
+                q,
+                k_cache,  # Need to be changed
+                v_cache,  # Need to be changed
+                self._sm_scale,
+                self._float_workspace_buffer,
+                actual_seq_lens_q=self._seq_lens_q,
+                actual_seq_lens_kv=self._seq_lens_kv,
+                max_token_per_sequence=self._max_q_len,
+                max_sequence_kv=self._max_kv_len,
+                block_tables=self._block_tables,
+                causal=self._causal,
+                return_lse=return_lse,
+                batch_offsets_q=self._qo_indptr_buf,
+                batch_offsets_o=self._qo_indptr_buf,
+                out=out,
+                lse=lse,
+            )
         else:
-            run_args += [
-                self._custom_mask_buf,
-                self._mask_indptr_buf,
-                _get_cache_alibi_slopes_buf(q.shape[1], q.device),
-                self._prefix_len_ptr,
-                self._token_pos_in_items_ptr,
-                self._max_item_len_ptr,
-                logits_soft_cap,
-                sm_scale,
-                None,  # scale_q, not supported yet
-                None,  # scale_k
-                None,  # scale_v
-                rope_scale,
-                rope_theta,
-                self._token_pos_in_items_len,
+            if self._backend != "trtllm-gen":
+                assert self._plan_info is not None, "plan info is not initialized"
+            run_args = [
+                self._float_workspace_buffer,
+                self._int_workspace_buffer,
+                self._plan_info,
+                q,
+                k_cache,
+                v_cache,
+                self._qo_indptr_buf,
+                sparse_indptr,
+                sparse_indices,
+                self._paged_kv_last_page_len_buf,
+                out,
+                lse,
+                mask_mode,
+                TensorLayout[self._kv_layout].value,
+                window_left,
+                enable_pdl,
             ]
+            if self._jit_module is not None:
+                run_args.extend(list(args))
+            else:
+                run_args += [
+                    self._custom_mask_buf,
+                    self._mask_indptr_buf,
+                    _get_cache_alibi_slopes_buf(q.shape[1], q.device),
+                    self._prefix_len_ptr,
+                    self._token_pos_in_items_ptr,
+                    self._max_item_len_ptr,
+                    logits_soft_cap,
+                    sm_scale,
+                    None,  # scale_q, not supported yet
+                    None,  # scale_k
+                    None,  # scale_v
+                    rope_scale,
+                    rope_theta,
+                    self._token_pos_in_items_len,
+                    self._workspace_size,
+                    self._num_qo_heads,
+                    self._num_kv_heads,
+                    self._block_tables,
+                    self._kv_lens_buffer,
+                    page_size,
+                    self._max_q_len,
+                    self._max_kv_len,
+                    self._batch_size,
+                    self._qo_indptr_buf,
+                    self._vector_sparse_indptr_buffer,
+                    sinks,
+                ]
 
-        self._cached_module.paged_run(*run_args)
-        if v_scale is not None:
-            out *= v_scale
-
+            assert self._cached_module is not None, "cached module is not initialized"
+            self._cached_module.paged_run(*run_args)
+            if v_scale is not None:
+                # TODO(Zihao): fused into kernel
+                if is_float8(out):
+                    out = (out.to(torch.float32) * v_scale).to(out.dtype)
+                else:
+                    out *= v_scale
         return (out, lse) if return_lse else out
 
     run_return_lse = functools.partialmethod(run, return_lse=True)
@@ -1847,7 +2231,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._sm_scale = sm_scale
         self._rope_scale = rope_scale
         self._rope_theta = rope_theta
-        return self.run_return_lse(q, paged_kv_cache, k_scale, v_scale)
+        return self.run_return_lse(q, paged_kv_cache, k_scale=k_scale, v_scale=v_scale)
 
     def end_forward(self) -> None:
         r"""Warning: this function is deprecated and has no effect."""
@@ -1970,6 +2354,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         mask_indptr_buf: Optional[torch.Tensor] = None,
         backend: str = "auto",
         jit_args: Optional[List[Any]] = None,
+        jit_kwargs: Optional[Dict[str, Any]] = None,
     ) -> None:
         r"""Constructor of :class:`BatchPrefillWithRaggedKVCacheWrapper`.
 
@@ -2010,19 +2395,25 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             will be used in attention computation.
 
         backend : str
-            The implementation backend, could be ``auto``/``fa2`` or ``fa3``. Defaults to ``auto``.
+            The implementation backend, could be ``auto``/``fa2``/``fa3`` or ``trtllm-gen``.
+            Defaults to ``auto``.
             If set to ``auto``, the wrapper will automatically choose the backend based on the
             device architecture and kernel availability.
 
         jit_args : Optional[List[Any]]
             If provided, the wrapper will use the provided arguments to create the JIT module,
             otherwise, the wrapper will use default attention implementation.
+
+        jit_kwargs : Optional[Dict[str, Any]]
+            The keyword arguments to create the JIT module, defaults to None.
         """
         _check_kv_layout(kv_layout)
         if jit_args is not None:
+            if jit_kwargs is None:
+                jit_kwargs = {}
             self._jit_module = get_batch_prefill_jit_module(
                 jit_args[0],
-                gen_customize_batch_prefill_module(backend, *jit_args).build_and_load(),
+                get_customize_batch_prefill_module(backend, *jit_args, **jit_kwargs),
             )
         else:
             self._jit_module = None
@@ -2063,8 +2454,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._kv_indptr_buf = kv_indptr_buf
         self._custom_mask_buf = custom_mask_buf
         self._mask_indptr_buf = mask_indptr_buf
-        self._max_total_num_rows = None
+        self._max_total_num_rows: Optional[int] = None
         self._backend = backend
+        self._cached_module = None
 
     @property
     def is_cuda_graph_enabled(self) -> bool:
@@ -2119,6 +2511,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         token_pos_in_items_ptr: Optional[torch.Tensor] = None,
         token_pos_in_items_len: int = 0,
         max_item_len_ptr: Optional[torch.Tensor] = None,
+        fixed_split_size: Optional[int] = None,
+        disable_split_kv: bool = False,
     ) -> None:
         r"""Plan batch prefill/append attention on Ragged KV-Cache for given problem specification.
 
@@ -2202,7 +2596,14 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             with 7 padded zeros. (note there're 8 zeros in the end where the first one is the delimiter token 0 in the end of the prompt)
         max_item_len_ptr : Optional[float]
             a uint16 vector contains the max token length of all items for each prompt
-
+        fixed_split_size : Optional[int],
+            The fixed split size for split-kv FA2 prefill/decode, in pages. Recommend setting to the average sequence length of your workload.
+            When enabled, will lead to deterministic softmax score reduction in the merge_states kernel, and therefore
+            batch-size invariant outputs. See https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/
+            Note that compatibility with CUDA graph is NOT guaranteed, as even when bs is fixed, kv seq len can change
+            and lead to a varied number of launched CTAs.
+        disable_split_kv : bool,
+            Whether to disable the split-kv for determinism in CUDA Graph, defaults to ``False``.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -2221,7 +2622,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
         if head_dim_vo is None:
             head_dim_vo = head_dim_qk
-
+        if fixed_split_size is None:
+            fixed_split_size = -1
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
 
@@ -2244,7 +2646,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         qo_indptr_host = qo_indptr.to("cpu")
         kv_indptr_host = kv_indptr.to("cpu")
 
-        total_num_rows = qo_indptr_host[-1]
+        total_num_rows = int(qo_indptr_host[-1])
 
         if self.is_cuda_graph_enabled:
             if self._max_total_num_rows is None:
@@ -2323,7 +2725,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 use_fp16_qk_reduction,
             )
             if self._backend == "cutlass":
-                self._cached_module = get_fmha_module(*get_module_args)
+                # insert qo_indptr.device to 9th position (0-indexed) of get_module_args
+                new_get_module_args = (
+                    get_module_args[:9] + (qo_indptr.device,) + get_module_args[9:]
+                )
+                self._cached_module = get_fmha_module(*new_get_module_args)
             else:
                 self._cached_module = get_batch_prefill_module(
                     self._backend, *get_module_args
@@ -2335,7 +2741,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             )
             self._max_qo_len = torch.max(qo_indptr[1:] - qo_indptr[:-1]).item()
         else:
-            self._plan_info = self._cached_module.plan(
+            assert self._cached_module is not None, "cached module is not initialized"
+            args = [
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
                 self._pin_memory_int_workspace_buffer,
@@ -2351,6 +2758,13 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 head_dim_qk,
                 head_dim_vo,
                 causal,
+                window_left,
+            ]
+            if self._backend == "fa2":
+                args.append(fixed_split_size or -1)  # fixed_split_size
+                args.append(disable_split_kv)  # disable_split_kv
+            self._plan_info = self._cached_module.plan(
+                *args,
             )
 
         self._causal = causal
@@ -2482,7 +2896,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     (q.size(0), q.size(1)), dtype=torch.float32, device=q.device
                 )
             else:
-                _check_shape_dtype_device(
+                check_shape_dtype_device(
                     lse, (q.size(0), q.size(1)), torch.float32, q.device, "lse"
                 )
         if out is None:
@@ -2490,7 +2904,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 q.shape[:-1] + v.shape[-1:], dtype=q.dtype, device=q.device
             )
         else:
-            _check_shape_dtype_device(
+            check_shape_dtype_device(
                 out, q.shape[:-1] + v.shape[-1:], q.dtype, q.device, "out"
             )
         if self._backend == "cutlass":
@@ -2559,6 +2973,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self._token_pos_in_items_len,
             ]
 
+        assert self._cached_module is not None, "cached module is not initialized"
         self._cached_module.ragged_run(*run_args)
         return (out, lse) if return_lse else out
 
@@ -2697,6 +3112,7 @@ def fmha_varlen(
         PosEncodingMode.NONE.value,
         False,  # use_sliding_window
         False,  # use_logits_soft_cap
+        q.device,
     )
 
     nnz_qo, num_qo_heads, head_dim_qk = q.shape
@@ -2759,3 +3175,337 @@ def fmha_varlen(
     )
 
     return out, lse
+
+
+@functools.cache
+def get_trtllm_gen_fmha_module():
+    mod = gen_trtllm_gen_fmha_module()
+    op = mod.build_and_load()
+    setup_cubin_loader(mod.get_library_path())
+    return op
+
+
+def trtllm_ragged_attention_deepseek(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    workspace_buffer: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_q_len: int,
+    max_kv_len: int,
+    bmm1_scale: float,
+    bmm2_scale: float,
+    o_sf_scale: float,
+    batch_size: int,
+    window_left: int,
+    cum_seq_lens_q: torch.Tensor,
+    cum_seq_lens_kv: torch.Tensor,
+    enable_pdl: bool,
+    is_causal: bool,
+    return_lse: bool,
+    attention_sinks: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    lse: Optional[torch.Tensor] = None,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    """
+    Parameters
+    ----------
+    query : torch.Tensor
+        query tensor with shape [num_tokens, num_heads, head_dim]
+    key : torch.Tensor
+        key tensor with shape [num_tokens, num_heads, head_dim]
+    value : torch.Tensor
+        value tensor with shape [num_tokens, num_heads, head_dim]
+    workspace_buffer : torch.Tensor
+        workspace buffer
+    seq_lens : torch.Tensor
+        sequence lengths
+    max_q_len : int
+        max query length
+    max_kv_len : int
+        max key/value length
+    bmm1_scale : float
+        scale for bmm1, scale_q * scale_k * 1.0 / (head_dim_qk ** 0.5)
+    bmm2_scale : float
+        scale for bmm2, scale_v
+    o_sf_scale : float
+        scale for output
+    batch_size : int
+        batch size
+    window_left : int
+        window left
+    cum_seq_lens_q : torch.Tensor
+        cumulative sequence lengths for query
+    cum_seq_lens_kv : torch.Tensor
+        cumulative sequence lengths for key/value
+    enable_pdl : bool
+        enable pdl
+    is_causal : bool
+        is causal
+    attention_sinks : Optional[torch.Tensor]
+        attention sinks
+    out : Optional[torch.Tensor]
+        output tensor, if not provided, will be allocated with shape [query.shape[0], query.shape[1], value.shape[2]]
+    lse : Optional[torch.Tensor]
+        lse tensor, if not provided, will be allocated with shape [query.shape[0], query.shape[1]]
+
+    Returns
+    -------
+    out: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        output torch.Tensor or Tuple[torch.Tensor, torch.Tensor].
+        If return_lse is True, the output will be a tuple of two tensors, the first is the output tensor, the second is the lse tensor.
+        If return_lse is False, the output will be a single tensor.
+    """
+    assert query.shape[2] == 192 and key.shape[2] == 192 and value.shape[2] == 128, (
+        "currently only support deepseek r1 192 query and 128 value"
+    )
+
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(query.device)
+
+    run_func = get_trtllm_gen_fmha_module().trtllm_ragged_attention
+    sm_count = get_device_sm_count(query.device)
+    if out is None:
+        out = torch.empty(
+            query.shape[0],
+            query.shape[1],
+            value.shape[2],
+            device=query.device,
+            dtype=query.dtype,
+        )
+    if return_lse and lse is None:
+        lse = torch.empty(
+            query.shape[0],
+            query.shape[1],
+            device=query.device,
+            dtype=torch.float32,
+        )
+
+    workspace_size = workspace_buffer.numel() * workspace_buffer.element_size()
+    run_func(
+        out,
+        query,
+        key,
+        value,
+        workspace_buffer,
+        seq_lens,
+        max_q_len,
+        max_kv_len,
+        bmm1_scale,
+        bmm2_scale,
+        o_sf_scale,
+        batch_size,
+        window_left,
+        cum_seq_lens_q,
+        cum_seq_lens_kv,
+        sm_count,
+        enable_pdl,
+        is_causal,
+        workspace_size,
+        attention_sinks,
+        lse,
+    )
+    if return_lse:
+        return out, lse
+    else:
+        return out
+
+
+def trtllm_batch_context_with_kv_cache(
+    query: torch.Tensor,
+    kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+    workspace_buffer: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_q_len: int,
+    max_kv_len: int,
+    bmm1_scale: float,
+    bmm2_scale: float,
+    batch_size: int,
+    cum_seq_lens_q: torch.Tensor,
+    cum_seq_lens_kv: torch.Tensor,
+    window_left: int = -1,
+    out: Optional[Union[torch.Tensor, FP4Tensor]] = None,
+    out_dtype: Optional[Union[torch.dtype, str]] = None,
+    o_sf_scale: Optional[float] = None,
+    o_sf_vec_size: Optional[int] = None,
+    enable_pdl: Optional[bool] = None,
+    sinks: Optional[List[torch.Tensor]] = None,
+) -> Union[torch.Tensor, FP4Tensor]:
+    """
+    Parameters
+    ----------
+    query : torch.Tensor
+        query tensor with shape [num_tokens, num_heads, head_dim]
+    kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        If kv_cache is a single tensor, it should be a tensor with shape [num_pages, 1 or 2, num_kv_heads, page_size, head_dim]
+        If kv_cache is a tuple of two tensors, it should be a tuple of two tensors with shape [num_pages, num_kv_heads, page_size, head_dim]
+    workspace_buffer : torch.Tensor. Must be initialized to 0 for its first use.
+        workspace
+    block_tables : torch.Tensor
+        page_table of kv cache, [batch_size, num_pages]
+    seq_lens : torch.Tensor
+        A uint32 1D tensor indicating the kv sequence length of each prompt. shape: ``[batch_size]``
+    max_q_len : int
+        max sequence length for query
+    max_kv_len : int
+        max sequence length for kv_cache
+    bmm1_scale : float
+        fused scale for bmm1 input.
+    bmm2_scale : float
+        fused scale for bmm2 input.
+    batch_size : int
+        batch size
+    cum_seq_lens_q : torch.Tensor
+        cumulative sequence length for query. shape: ``[batch_size + 1]``
+    cum_seq_lens_kv : torch.Tensor
+        cumulative sequence length for kv_cache. shape: ``[batch_size + 1]``
+    window_left : int = -1
+        The left (inclusive) window size for the attention window, when set to ``-1``, the window
+        size will be set to the full length of the sequence. Defaults to ``-1``.
+    out : Optional[Union[torch.Tensor, FP4Tensor]] = None
+        output tensor, if not provided, will be allocated with ``out_dtype``, if ``out_dtype`` is not provided, will use the type of ``query``.
+    out_dtype : Optional[Union[torch.dtype, str]] = None
+        output dtype, if not provided, will use the type of ``out``. For nvfp4, use string ``nvfp4``.
+    o_sf_scale : Optional[float] = None
+        scale for nvfp4 output tensor scale factor.
+    o_sf_vec_size : Optional[int] = None
+        vector size for nvfp4 output tensor scale factor.
+    sinks : Optional[List[torch.Tensor]] = None
+        additional value per head in the denominator of the softmax.
+
+    Returns
+    -------
+    out: Union[torch.Tensor, FP4Tensor]
+        output torch.Tensor or FP4Tensor.
+    """
+
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(query.device)
+
+    if isinstance(kv_cache, tuple):
+        k_cache, v_cache = kv_cache
+    else:
+        if kv_cache.shape[1] == 1:
+            k_cache, v_cache = kv_cache, kv_cache
+        else:
+            assert kv_cache.shape[1] == 2, (
+                "When kv_cache is a single tensor, the second dimension must be 1 or 2"
+            )
+            # NOTE(Zihao): unbind transforms [num_pages, 2, ...] to ([num_pages, ...], [num_pages, ...])
+            # it doesn't change underlying storage
+            k_cache, v_cache = kv_cache.unbind(dim=1)
+
+    run_func = get_trtllm_gen_fmha_module().trtllm_paged_attention_context
+    sm_count = get_device_sm_count(query.device)
+
+    if out_dtype == "nvfp4" or (out_dtype is None and isinstance(out, FP4Tensor)):
+        assert query.dtype == torch.float8_e4m3fn, (
+            "query must be fp8 when out_dtype is nvfp4."
+        )
+        assert o_sf_scale is not None
+        assert o_sf_vec_size in [None, 16], "only o_sf_vec_size = 16 is supported"
+        o_sf_vec_size = o_sf_vec_size or 16
+
+        fp4_out_shape = query.shape[:-1] + (ceil_div(query.shape[-1], 2),)
+
+        if isinstance(out, FP4Tensor):
+            fp4_out_scale_shape = (
+                out.scale.shape[0],
+                round_up(query.shape[1] * query.shape[2] // o_sf_vec_size, 4),
+            )
+            out_scale_factor = out.scale
+            o_sf_start_index = out.scale_start_index
+            out = out.data
+            # out_dtype may be None
+            out_dtype = out_dtype or "nvfp4"
+        elif out is None:
+            fp4_out_scale_shape = (
+                round_up(query.shape[0], 128),
+                round_up(query.shape[1] * query.shape[2] // o_sf_vec_size, 4),
+            )
+            out_scale_factor = torch.empty(
+                fp4_out_scale_shape, dtype=torch.float8_e4m3fn, device=query.device
+            )
+            o_sf_start_index = 0
+            out = torch.empty(fp4_out_shape, dtype=torch.uint8, device=query.device)
+        else:
+            raise ValueError(f"Invalid out: {out}")
+
+        assert out_dtype == "nvfp4"
+        assert isinstance(out, torch.Tensor)
+
+        # Use uint8 as the container dtype to compliant with next fp4 gemm.
+        check_shape_dtype_device(out, fp4_out_shape, torch.uint8, query.device, "out")
+
+        check_shape_dtype_device(
+            out_scale_factor,
+            fp4_out_scale_shape,
+            torch.float8_e4m3fn,
+            query.device,
+            "out_scale_factor",
+        )
+
+        # Check o_sf_start_index is valid
+        if (
+            o_sf_start_index < 0
+            or o_sf_start_index + out.shape[0] > out_scale_factor.shape[0]
+        ):
+            raise ValueError(
+                f"o_sf_start_index is out of the valid range of out_scale_factor. "
+                f"o_sf_start_index={o_sf_start_index}, out.shape[0]={out.shape[0]}, "
+                f"out_scale_factor.shape[0]={out_scale_factor.shape[0]}"
+            )
+
+    elif isinstance(out_dtype, torch.dtype) or out_dtype is None:
+        assert o_sf_scale is None
+        assert o_sf_vec_size is None
+        out_scale_factor = None
+        o_sf_start_index = 0
+        if out_dtype is None:
+            out_dtype = out.dtype if out is not None else query.dtype
+        out = out if out is not None else torch.empty_like(query, dtype=out_dtype)
+        if out_dtype not in (query.dtype, torch.float16, torch.bfloat16):
+            raise ValueError(f"Unsupported out_dtype: {out_dtype}")
+        check_shape_dtype_device(out, query.shape, out_dtype, query.device, "out")
+    else:
+        raise ValueError(f"Invalid out_dtype: {out_dtype}")
+
+    bmm1_scale = (
+        bmm1_scale.item() if isinstance(bmm1_scale, torch.Tensor) else bmm1_scale
+    )
+    bmm2_scale = (
+        bmm2_scale.item() if isinstance(bmm2_scale, torch.Tensor) else bmm2_scale
+    )
+
+    workspace_size = workspace_buffer.numel() * workspace_buffer.element_size()
+    run_func(
+        out,
+        out_scale_factor,
+        query,
+        k_cache,
+        v_cache,
+        workspace_buffer,
+        block_tables,
+        seq_lens,
+        max_q_len,
+        max_kv_len,
+        bmm1_scale,
+        bmm2_scale,
+        o_sf_scale or -1.0,
+        o_sf_vec_size or -1,
+        o_sf_start_index,
+        batch_size,
+        window_left,
+        cum_seq_lens_q,
+        cum_seq_lens_kv,
+        sm_count,
+        enable_pdl,
+        workspace_size,
+        sinks,
+    )
+    return (
+        out
+        if out_dtype != "nvfp4"
+        else FP4Tensor(out, out_scale_factor, o_sf_start_index, query.shape)
+    )

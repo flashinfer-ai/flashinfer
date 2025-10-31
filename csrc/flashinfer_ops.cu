@@ -147,9 +147,9 @@ at::Tensor PODWithKVCachePlan(at::Tensor float_workspace_buffer, at::Tensor int_
                               at::Tensor page_locked_int_workspace_buffer, at::Tensor qo_indptr_p,
                               at::Tensor kv_indptr_p, int64_t total_num_rows_p,
                               int64_t batch_size_p, at::Tensor qo_indptr_d, at::Tensor kv_indptr_d,
-                              int64_t total_num_rows_d, int64_t batch_size_d,
-                              int64_t num_qo_heads_p, int64_t num_kv_heads, int64_t head_dim_qk,
-                              int64_t head_dim_vo, int64_t page_size, bool enable_cuda_graph);
+                              int64_t total_num_rows_d, int64_t batch_size_d, int64_t num_qo_heads,
+                              int64_t num_kv_heads, int64_t head_dim_qk, int64_t head_dim_vo,
+                              int64_t page_size, bool enable_cuda_graph);
 //========== quantization ==========
 
 void packbits(at::Tensor x, const std::string& bitorder, at::Tensor y);

@@ -24,7 +24,7 @@ We can also generalize the value on index :math:`i` to index set :math:`I`:
     \mathbf{v}(I) = \sum_{i\in I}\textrm{softmax}(s_i) \mathbf{v}_i = \frac{\sum_{i\in I}\exp\left(s_i\right)\mathbf{v}_i}{\exp(s(I))}
 
 The :math:`softmax` function is restricted to the index set :math:`I`. Note that :math:`\mathbf{v}(\{1,2,\cdots, n\})` is the self-attention output of the entire sequence.
-The *attention state* of the index set :math:`i` can be defined as a tuple :math:`(s(I), \mathbf{v}(I))`, then we can define a binary **merge** operator :math:`\oplus` of two attention states as ((in practice we will minus $s$ with maximum value to guarantee numerical stability and here we omit them for simplicity):
+The *attention state* of the index set :math:`I` can be defined as a tuple :math:`(s(I), \mathbf{v}(I))`, then we can define a binary **merge** operator :math:`\oplus` of two attention states as ((in practice we will minus :math:`s` with maximum value to guarantee numerical stability and here we omit them for simplicity):
 
 .. math::
 
@@ -78,5 +78,5 @@ Related APIs
 FlashInfer exposes several APIs to facilitate the recursive attention computation:
 
 - :ref:`api-merge-states` defines the operators to merge attention states.
-- :ref:`apiprefill` and :ref:`apidecode` defines operators that returns attention states (APIs
+- :ref:`apiattention` defines operators that returns attention states (APIs
   with suffix ``_return_lse`` returns both attention output :math:`v` and score :math:`s`).

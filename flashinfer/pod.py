@@ -22,8 +22,6 @@ from typing import Any, List, Optional, Tuple, Union
 import torch
 
 from .jit import gen_pod_module, get_pod_uri
-from .page import get_seq_lens
-from .prefill import get_batch_prefill_module
 from .quantization import packbits
 from .utils import (
     MaskMode,
@@ -33,7 +31,6 @@ from .utils import (
     _check_kv_layout,
     _check_pos_encoding_mode,
     _get_cache_alibi_slopes_buf,
-    _get_cache_buf,
     _get_range_buf,
     _unpack_paged_kv_cache,
     canonicalize_torch_dtype,
@@ -49,8 +46,8 @@ def get_pod_module(*args):
     # Use the proper JIT compilation system like batch prefill
     uri = get_pod_uri(*args)
     module = gen_pod_module(*args).build_and_load()
-    plan_func = module.PODWithKVCachePlan.default
-    run_tensor_func = module.PODWithKVCacheTensor.default
+    plan_func = module.PODWithKVCachePlan
+    run_tensor_func = module.PODWithKVCacheTensorRun
 
     # Register custom op for POD tensor run
     @register_custom_op(
@@ -139,20 +136,21 @@ def get_pod_module(*args):
     def _fake_pod_run(*args) -> None:
         pass
 
-    # Create a simple namespace that wraps the JIT module functions
-    class PODModule:
-        def __init__(self):
-            pass
+    # # Create a simple namespace that wraps the JIT module functions
+    # class PODModule:
+    #     def __init__(self):
+    #         pass
 
-        def plan(self, *args):
-            """Call the POD plan function."""
-            return plan_func(*args)
+    #     def plan(self, *args):
+    #         """Call the POD plan function."""
+    #         return plan_func(*args)
 
-        def run_tensor(self, *args):
-            """Call the POD tensor run function."""
-            return pod_run(*args)
+    #     def run_tensor(self, *args):
+    #         """Call the POD tensor run function."""
+    #         return pod_run(*args)
 
-    return PODModule()
+    # return PODModule()
+    return SimpleNamespace(run_tensor=pod_run, plan=plan_func)
 
 
 class PODWithPagedKVCacheWrapper:
@@ -291,10 +289,10 @@ class PODWithPagedKVCacheWrapper:
         """
         # Override options. Only tensor core version is performant.
         use_tensor_cores = True
-        self._jit_module = None
-        assert (
-            custom_mask_buf_p is None and mask_indptr_buf_p is None
-        ), "custom_mask_buf_p and mask_indptr_buf_p are not supported yet"
+        self._jit_module: SimpleNamespace = None
+        assert custom_mask_buf_p is None and mask_indptr_buf_p is None, (
+            "custom_mask_buf_p and mask_indptr_buf_p are not supported yet"
+        )
 
         self._kv_layout = kv_layout
         self._float_workspace_buffer = float_workspace_buffer
@@ -405,6 +403,7 @@ class PODWithPagedKVCacheWrapper:
         kv_data_type: Optional[Union[str, torch.dtype]] = None,
         data_type: Optional[Union[str, torch.dtype]] = None,
         sm_scale: Optional[float] = None,
+        logits_soft_cap: Optional[float] = 0.0,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
         non_blocking: bool = True,
@@ -468,13 +467,11 @@ class PODWithPagedKVCacheWrapper:
 
         The :meth:`plan` method cannot be used in Cuda Graph or in ``torch.compile``.
         """
-        # Logits soft cap is not supported currently
-        logits_soft_cap = False
+        # Logits soft cap is not supported currently; keep a float for typing
         batch_size_p = len(last_page_len_p)
         batch_size_d = len(last_page_len_d)
         batch_size = batch_size_p + batch_size_d
-        if logits_soft_cap is None:
-            logits_soft_cap = 0.0
+        # keep logits_soft_cap as float consistently
 
         qo_indptr_host_p = qo_indptr_p.to("cpu", non_blocking=True)
         qo_indptr_host_d = _get_range_buf(batch_size_d + 1, "cpu")
@@ -577,11 +574,11 @@ class PODWithPagedKVCacheWrapper:
             self._pin_memory_int_workspace_buffer,
             qo_indptr_host_p,
             kv_indptr_host_p,
-            qo_indptr_host_p[-1],  # total_num_rows_p
+            int(qo_indptr_host_p[-1]),  # total_num_rows_p
             batch_size_p,
             qo_indptr_host_d,
             kv_indptr_host_d,
-            qo_indptr_host_d[-1],  # total_num_rows_d
+            int(qo_indptr_host_d[-1]),  # total_num_rows_d
             batch_size_d,
             num_qo_heads,
             num_kv_heads,

@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <cute/tensor.hpp>
 
+#include "../../utils.cuh"
 #include "../common.h"
 #include "fmhaRunnerParams.h"
 
@@ -49,10 +50,16 @@ struct KernelParams {
   // TMA descriptor for V scaling factor.
   CUtensorMap tmaVSf_;
 
+  // grid dimensions, these might differ from actual grid the kernel is launched with
+  // for persistent kernels on Hopper GPUs.
+  int32_t logicalGridDimX, logicalGridDimY, logicalGridDimZ;
+
   // The output pointer (used by STG for last tile).
   void* ptrO;
   // The output SF pointer (used for FP4 output).
   void* ptrSfO;
+  // The attention sinks pointer (additional value per head in the denominator of the softmax).
+  float const* ptrAttentionSinks;
 
   // The cumulative sequence lengths for Q.
   int32_t const* ptrCumSeqLensQ;
@@ -130,9 +137,6 @@ struct KernelParams {
   int32_t mNumHeadsQPerKv;
   // The hidden size of O.
   int64_t mNumHiddenEltsO;
-  // The number of MTP tokens per sequence. Assume that all requests have the same numMtpTokens
-  // without paddings.
-  int32_t mNumMtpTokens;
   // The total number of pages in the paged-kv memory pool.
   int32_t mNumPagesInMemPool;
   // The output scale for FP8 quantization.
@@ -148,6 +152,8 @@ struct KernelParams {
   int32_t mStartTokenIdxSfO;
   // The sum of sequence lengths for Q and K/V.
   int32_t mSumOfSeqLensQ, mSumOfSeqLensKv;
+  // The flag to use block sparse attention.
+  bool mUseBlockSparseAttention;
 
   // Create the TMA shape/stride for Q.
   template <class FmhaOptions>
@@ -170,7 +176,7 @@ struct KernelParams {
       numHeads /= numGroupedHeads;
     }
     // Make sure the math works.
-    TORCH_CHECK(numHeads * numGroupedHeads == options.mNumHeadsQ, "internal error");
+    FLASHINFER_CHECK(numHeads * numGroupedHeads == options.mNumHeadsQ, "internal error");
 
     // The number of tokens.
     int32_t numTokens{options.mSumOfSeqLensQ};
@@ -186,7 +192,7 @@ struct KernelParams {
     // The hidden dimension when the Q, K and V tensors are packed.
     int32_t hiddenDimQkv{hiddenDimQ};
     if (isPackedQkv(options.mQkvLayout)) {
-      TORCH_CHECK(!groupsHeadsQ, "internal error");
+      FLASHINFER_CHECK(!groupsHeadsQ, "internal error");
       hiddenDimQkv += options.mNumHeadsKv * (options.mHeadDimQk + options.mHeadDimV);
     }
 
@@ -210,7 +216,7 @@ struct KernelParams {
                                             static_cast<uint32_t>(tileSizeQ)};
     if (groupsHeadsQ) {
       if (isSpecDecodingGenerationKernel(options.mKernelType)) {
-        TORCH_CHECK((tileSizeQ % numGroupedHeads == 0), "internal error");
+        FLASHINFER_CHECK((tileSizeQ % numGroupedHeads == 0), "internal error");
         tileShapes = std::vector<uint32_t>{static_cast<uint32_t>(numEltsInClampedHeadDimQ),
                                            static_cast<uint32_t>(numGroupedHeads), 1,
                                            static_cast<uint32_t>(tileSizeQ / numGroupedHeads)};
@@ -304,43 +310,19 @@ struct KernelParams {
   // Compute the strides for K and V.
   template <class FmhaOptions>
   static auto makeStrideKv(FmhaOptions const& options, bool isK) {
-    // The maximum headDim of K and V.
-    // Note that contiguousKv or pagedKv will pad K and V to maxHeadDimKv.
-    int32_t const maxHeadDimKv{std::max(options.mHeadDimQk, options.mHeadDimV)};
-    // The hidden dimension for the keys/vals.
-    int32_t const hiddenDimK{options.mNumHeadsKv * maxHeadDimKv};
-    // The hidden dimension when Q, K and V are packed together.
-    int32_t const hiddenDimQkv{options.mNumHeadsQ * options.mHeadDimQk +
-                               options.mNumHeadsKv * (options.mHeadDimQk + options.mHeadDimV)};
+    int strideKeysVals = 0;
+    int strideHeads = 0;
+    int strideBatch = 0;
 
-    // The stride between the different keys/vals.
-    int32_t strideKeysVals{hiddenDimK};
-    if (isPagedKv(options.mQkvLayout)) {
-      strideKeysVals = maxHeadDimKv;
-    } else if (isPackedQkv(options.mQkvLayout)) {
-      strideKeysVals = hiddenDimQkv;
-    } else if (isContiguousKv(options.mQkvLayout)) {
-      strideKeysVals = maxHeadDimKv;
-    }
-
-    // The stride between heads.
-    int32_t strideHeads{isK ? options.mHeadDimQk : options.mHeadDimV};
-    if (isPagedKv(options.mQkvLayout)) {
-      strideHeads = options.mNumTokensPerPage * maxHeadDimKv;
-    } else if (isContiguousKv(options.mQkvLayout)) {
-      strideHeads = options.mMaxSeqLenCacheKv * maxHeadDimKv;
-    }
-
-    // The stride between batch items. WARNING: The order of if/else-if matters.
-    int32_t strideBatch{options.mMaxSeqLenKv * hiddenDimK};
-    if (isPagedKv(options.mQkvLayout)) {
-      strideBatch = options.mNumTokensPerPage * hiddenDimK;
-    } else if (isContiguousKv(options.mQkvLayout)) {
-      strideBatch = 2 * options.mNumHeadsKv * options.mMaxSeqLenCacheKv * maxHeadDimKv;
+    if (isK) {
+      strideKeysVals = options.kStrideKeysValues;
+      strideHeads = options.kStrideHeads;
+      strideBatch = options.kStrideBatch;
     } else {
-      strideBatch = 0;
+      strideKeysVals = options.vStrideKeysValues;
+      strideHeads = options.vStrideHeads;
+      strideBatch = options.vStrideBatch;
     }
-
     // The 3 strides (the other ones are 1 and 0).
     return std::make_tuple(strideKeysVals, strideHeads, strideBatch);
   }
@@ -354,9 +336,12 @@ struct KernelParams {
     // The stride elements.
     auto [strideKeys, strideHeads, strideBatch] = makeStrideKv(options, isK);
 
-    // The maximum headDim of K and V.
+    // The headDim.
     // Note that contiguousKv or pagedKv will pad K and V to maxHeadDimKv.
-    int32_t const maxHeadDimKv{std::max(options.mHeadDimQk, options.mHeadDimV)};
+    int32_t headDim = isK ? options.mHeadDimQk : options.mHeadDimV;
+    if (isPagedKv(options.mQkvLayout) || isContiguousKv(options.mQkvLayout)) {
+      headDim = std::max(options.mHeadDimQk, options.mHeadDimV);
+    }
 
     // For K, the cute layout: (numKeys, headDim, ((numHeadsQPerKv, numHeadsKv),
     // batchSize)):(strideKeys, _1, _0, strideHeads, strideBatch). Cute swaps the first two
@@ -371,7 +356,7 @@ struct KernelParams {
     // The column index and strides needs to divide by 2.
     auto const colIdxDivisor = dtypeKv == DATA_TYPE_E2M1 ? 2 : 1;
     auto shape = std::vector<uint64_t>{
-        static_cast<uint64_t>(maxHeadDimKv / colIdxDivisor), static_cast<uint64_t>(numKeys),
+        static_cast<uint64_t>(headDim / colIdxDivisor), static_cast<uint64_t>(numKeys),
         static_cast<uint64_t>(options.mNumHeadsKv), static_cast<uint64_t>(batchSize)};
     auto stride = std::vector<uint64_t>{1, static_cast<uint64_t>(strideKeys / colIdxDivisor),
                                         static_cast<uint64_t>(strideHeads / colIdxDivisor),
@@ -389,10 +374,12 @@ struct KernelParams {
     // The stride elements.
     auto [strideKeys, strideHeads, strideBatch] = makeStrideKv(options, isK);
 
-    // The maximum headDim of K and V.
+    // The headDim.
     // Note that contiguousKv or pagedKv will pad K and V to maxHeadDimKv.
-    int32_t const maxHeadDimKv{std::max(options.mHeadDimQk, options.mHeadDimV)};
-
+    int32_t headDim = isK ? options.mHeadDimQk : options.mHeadDimV;
+    if (isPagedKv(options.mQkvLayout) || isContiguousKv(options.mQkvLayout)) {
+      headDim = std::max(options.mHeadDimQk, options.mHeadDimV);
+    }
     // The number of elements per SF.
     int32_t NumEltsPerSf = 16;
 
@@ -403,10 +390,10 @@ struct KernelParams {
     // numHeadsKv, batchSize)
 
     // Note that it only works for pagedKv layout.
-    TORCH_CHECK(isPagedKv(options.mQkvLayout), "The qkvLayout is not supported.");
+    FLASHINFER_CHECK(isPagedKv(options.mQkvLayout), "The qkvLayout is not supported.");
 
     auto shape = std::vector<uint64_t>{
-        16, static_cast<uint64_t>(numKeys * maxHeadDimKv / NumEltsPerSf / 16),
+        16, static_cast<uint64_t>(numKeys * headDim / NumEltsPerSf / 16),
         static_cast<uint64_t>(options.mNumHeadsKv), static_cast<uint64_t>(batchSize)};
     auto stride = std::vector<uint64_t>{1, 16, static_cast<uint64_t>(strideHeads / NumEltsPerSf),
                                         static_cast<uint64_t>(strideBatch / NumEltsPerSf)};
@@ -418,7 +405,7 @@ struct KernelParams {
   static std::tuple<void const*, void const*, void const*> getDevicePtrs(
       TllmGenFmhaRunnerParams const& runnerParams, int32_t bytesPerElt) {
     // Declare the q, k, v ptrs.
-    void const *qPtr{runnerParams.qPtr}, *kPtr, *vPtr;
+    void const *qPtr{runnerParams.qPtr}, *kPtr{runnerParams.kPtr}, *vPtr{runnerParams.vPtr};
 
     // Set Q, K and V pointer from packed QKV tensor.
     if (isPackedQkv(runnerParams.mQkvLayout)) {
@@ -433,8 +420,8 @@ struct KernelParams {
     // Set K and V pointer from pagedKv tensor.
     else if (isPagedKv(runnerParams.mQkvLayout)) {
       // Note that the offsets will be fully handled by the pageIdx buffer.
-      kPtr = runnerParams.kvPtr;
-      vPtr = runnerParams.kvPtr;
+      kPtr = runnerParams.kPtr;
+      vPtr = runnerParams.vPtr;
     }
     // Set K and V pointer from contiguousQAnddKv tensor.
     else if (isContiguousKv(runnerParams.mQkvLayout)) {
@@ -445,9 +432,8 @@ struct KernelParams {
       vPtr = reinterpret_cast<void const*>(
           reinterpret_cast<char const*>(runnerParams.kvPtr) +
           runnerParams.mNumHeadsKv * runnerParams.mMaxSeqLenCacheKv * maxHeadDimKv * bytesPerElt);
-    } else {
-      TORCH_CHECK(false, "Unexpected qkv layout %d", static_cast<int32_t>(runnerParams.mQkvLayout));
     }
+
     // Return the pointers.
     return std::make_tuple(qPtr, kPtr, vPtr);
   }
@@ -469,7 +455,7 @@ struct KernelParams {
     } else if (dtypeElt == DATA_TYPE_BF16) {
       tmaDataFormat = CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
     } else {
-      TORCH_CHECK(false, "Unexpected dtype %d", static_cast<int32_t>(dtypeElt));
+      FLASHINFER_CHECK(false, "Unexpected dtype %d", static_cast<int32_t>(dtypeElt));
     }
 
     // The swizzle type.
@@ -484,25 +470,25 @@ struct KernelParams {
     } else if ((numBytesInLeadingDim % 32) == 0) {
       swizzleType = CU_TENSOR_MAP_SWIZZLE_32B;
     } else {
-      TORCH_CHECK(false, "Unexpected numBytesInLeadingDim %d", numBytesInLeadingDim);
+      FLASHINFER_CHECK(false, "Unexpected numBytesInLeadingDim %d", numBytesInLeadingDim);
     }
 
     // Check gmem address must be 16B-aligned
-    TORCH_CHECK((reinterpret_cast<uint64_t>(gmemAddr) & 0b1111) == 0);
+    FLASHINFER_CHECK((reinterpret_cast<uint64_t>(gmemAddr) & 0b1111) == 0);
 
     // Check shape must be in range [1, 2^32]
     int32_t dim = shapes.size();
     // Max five dimension and min 3 dimension.
-    TORCH_CHECK((dim <= 5) && (dim >= 3));
+    FLASHINFER_CHECK((dim <= 5) && (dim >= 3));
     // Check shape range.
     for (int32_t ii = 0; ii < dim; ++ii) {
-      TORCH_CHECK(shapes[ii] >= (uint64_t(1)));        // Size must be min 1
-      TORCH_CHECK(shapes[ii] <= (uint64_t(1) << 32));  // Size must be max 2^32
+      FLASHINFER_CHECK(shapes[ii] >= (uint64_t(1)));        // Size must be min 1
+      FLASHINFER_CHECK(shapes[ii] <= (uint64_t(1) << 32));  // Size must be max 2^32
     }
 
     // TMA descriptor does not store the zeroth stride and assumes it is 1.
-    TORCH_CHECK(static_cast<int32_t>(strides.size()) == dim);
-    TORCH_CHECK(strides[0] == 1);
+    FLASHINFER_CHECK(static_cast<int32_t>(strides.size()) == dim);
+    FLASHINFER_CHECK(strides[0] == 1);
 
     // Build strides in bytes.
     // cuTensorMapEncodeTiled ignores the stride of the first dimension (implicitly 1).
@@ -539,7 +525,7 @@ struct KernelParams {
       std::cerr << "tileStrides: " << tileStrides[0] << " " << tileStrides[1] << " "
                 << tileStrides[2] << " " << tileStrides[3] << " " << tileStrides[4] << std::endl;
       std::cerr << "swizzleType: " << int(swizzleType) << std::endl;
-      TORCH_CHECK(false);
+      FLASHINFER_CHECK(false);
     }
 
     return desc;
@@ -547,7 +533,8 @@ struct KernelParams {
 
   // Setup the kernel parameters.
   template <class FmhaOptions_, class KernelMeta>
-  static KernelParams setKernelParams(FmhaOptions_ const& options, KernelMeta const& kernelMeta) {
+  static KernelParams setKernelParams(FmhaOptions_ const& options, KernelMeta const& kernelMeta,
+                                      int32_t maxNumCtasQ, int32_t maxNumCtasKv) {
     // Create the return struct.
     KernelParams params;
 
@@ -667,6 +654,9 @@ struct KernelParams {
     // The sequence lengths for Kv.
     params.ptrSeqLensKv = options.seqLensKvPtr;
 
+    // Attention sink
+    params.ptrAttentionSinks = options.ptrAttentionSinks;
+
     // The partial buffers' pointers when the multiCtasKv mode is enabled.
     int64_t partialStatsBufferSize = options.mMultiProcessorCount * kernelMeta.mStepQ;
     params.ptrMultiCtasKvCounter = options.multiCtasKvCounterPtr;
@@ -678,17 +668,25 @@ struct KernelParams {
 
     params.ptrScaleSfKv = options.kvSfScalePtr;
     params.ptrScaleSfO = options.oSfScalePtr;
+    params.mScaleSfO = options.mScaleSfO;
 
     params.mAttentionWindowSize = options.mAttentionWindowSize;
+    if (isSlidingOrChunkedCausalMask(
+            static_cast<TrtllmGenAttentionMaskType>(kernelMeta.mMaskType)) &&
+        options.mChunkedAttentionSize != INT_MAX) {
+      FLASHINFER_CHECK((options.mChunkedAttentionSize & (options.mChunkedAttentionSize - 1)) == 0,
+                       "Chunked attention size must be a power of 2");
+      params.mChunkedAttentionSizeLog2 = std::log2(options.mChunkedAttentionSize);
+    } else {
+      // Default 0 means that chunked attention is disabled.
+      params.mChunkedAttentionSizeLog2 = 0;
+    }
     params.mMaxSeqLenQ = options.mMaxSeqLenQ;
     params.mMaxSeqLenKv = options.mMaxSeqLenKv;
-
-    // For CGA reductions
-    params.mMaxNumCtasQ = 1;
-    params.mMaxNumCtasKv = 1;
+    params.mMaxNumCtasQ = maxNumCtasQ;
+    params.mMaxNumCtasKv = maxNumCtasKv;
     params.mMaxNumPagesPerSeqKv = options.mMaxNumPagesPerSeqKv;
     // TODO: just use mMaxSeqLenQ for number of MTP tokens.
-    params.mNumMtpTokens = options.mMaxSeqLenQ;
     params.mSumOfSeqLensQ = options.mSumOfSeqLensQ;
     params.mSumOfSeqLensKv = options.mSumOfSeqLensKv;
     params.mBatchSize = options.mBatchSize;
@@ -697,13 +695,14 @@ struct KernelParams {
     params.mNumHeadsKv = options.mNumHeadsKv;
     params.mNumHeadsQPerKv = options.mNumHeadsQPerKv;
     params.mNumHiddenEltsO = options.mNumHeadsQ * options.mHeadDimQk;
-    params.mOutputScale = 1.f;
-    params.mScaleSoftmaxLog2 =
-        (1.f / (std::sqrt((float)(options.mHeadDimQk)) * options.mScaleQ)) * M_LOG2E;
+    // todo(Yingyi): might take a scalar tensor later
+    params.mOutputScale = options.outputScale;
+    params.mScaleSoftmaxLog2 = options.scaleSoftmaxLog2;
     params.mStartTokenIdxSfO = options.mSfStartTokenIdx;
     params.mScaleSfKv = options.mScaleSfKv;
-    params.ptrSoftmaxStats = nullptr;
-
+    params.ptrSoftmaxStats = options.softmaxStatsPtr;
+    // TODO: Integrate trtllm block-sparse attention kernels when needed.
+    params.mUseBlockSparseAttention = false;
     return params;
   }
 };

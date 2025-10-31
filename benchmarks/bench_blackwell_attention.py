@@ -14,10 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import numpy as np
 import torch
-from triton.testing import do_bench
 
 import flashinfer
+from flashinfer.testing.utils import bench_gpu_time
 
 
 def bench_fmha_blackwell(
@@ -60,12 +61,13 @@ def bench_fmha_blackwell(
         q_data_type=dtype,
         kv_data_type=dtype,
     )
-    o = wrapper.run(q, k, v)
-    ms = do_bench(
+    _o = wrapper.run(q, k, v)
+    measurements = bench_gpu_time(
         lambda: wrapper.run(q, k, v),
-        warmup=100,
-        rep=1000,
+        dry_run_time_ms=100,
+        repeat_time_ms=1000,
     )
+    ms = np.median(measurements)
 
     def flops(ms):
         if causal:
@@ -79,6 +81,7 @@ def bench_fmha_blackwell(
 
 
 if __name__ == "__main__":
+    print("\n === head_dim=128 ===")
     bench_fmha_blackwell(128, 512, 32, 128, False, torch.bfloat16)
     bench_fmha_blackwell(64, 1024, 32, 128, False, torch.bfloat16)
     bench_fmha_blackwell(32, 2048, 32, 128, False, torch.bfloat16)
@@ -96,3 +99,22 @@ if __name__ == "__main__":
     bench_fmha_blackwell(4, 16384, 32, 128, True, torch.bfloat16)
     bench_fmha_blackwell(2, 32768, 32, 128, True, torch.bfloat16)
     bench_fmha_blackwell(1, 65536, 32, 128, True, torch.bfloat16)
+
+    print("\n === head_dim=64 ===")
+    bench_fmha_blackwell(128, 512, 32, 64, False, torch.bfloat16)
+    bench_fmha_blackwell(64, 1024, 32, 64, False, torch.bfloat16)
+    bench_fmha_blackwell(32, 2048, 32, 64, False, torch.bfloat16)
+    bench_fmha_blackwell(16, 4096, 32, 64, False, torch.bfloat16)
+    bench_fmha_blackwell(8, 8192, 32, 64, False, torch.bfloat16)
+    bench_fmha_blackwell(4, 16384, 32, 64, False, torch.bfloat16)
+    bench_fmha_blackwell(2, 32768, 32, 64, False, torch.bfloat16)
+    bench_fmha_blackwell(1, 65536, 32, 64, False, torch.bfloat16)
+
+    bench_fmha_blackwell(128, 512, 32, 64, True, torch.bfloat16)
+    bench_fmha_blackwell(64, 1024, 32, 64, True, torch.bfloat16)
+    bench_fmha_blackwell(32, 2048, 32, 64, True, torch.bfloat16)
+    bench_fmha_blackwell(16, 4096, 32, 64, True, torch.bfloat16)
+    bench_fmha_blackwell(8, 8192, 32, 64, True, torch.bfloat16)
+    bench_fmha_blackwell(4, 16384, 32, 64, True, torch.bfloat16)
+    bench_fmha_blackwell(2, 32768, 32, 64, True, torch.bfloat16)
+    bench_fmha_blackwell(1, 65536, 32, 64, True, torch.bfloat16)

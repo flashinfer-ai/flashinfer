@@ -1,0 +1,26 @@
+{
+    "name": "CUDA Development Container",
+    "build": {
+        "dockerfile": "../../docker/Dockerfile.cu128.dev",
+        "context": "../../"
+    },
+    "runArgs": [
+        "--gpus=all"
+    ],
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "llvm-vs-code-extensions.vscode-clangd",
+                "ms-python.python",
+                "nvidia.nsight-vscode-edition",
+                "xaver.clang-format",
+                "charliermarsh.ruff",
+                "matangover.mypy"
+            ]
+        }
+    },
+    "mounts": [
+        "type=bind,source=${localEnv:HOME}/.ssh,target=/home/devuser/.ssh,readonly"
+    ],
+    "remoteUser": "devuser"
+}

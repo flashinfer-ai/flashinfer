@@ -15,27 +15,14 @@ limitations under the License.
 """
 
 import functools
-from functools import cache
-from typing import Any, List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import torch
 
 from .decode import BatchDecodeWithPagedKVCacheWrapper
-from .jit import JitSpec
-from .jit import env as jit_env
-from .jit import gen_jit_spec
+from .jit.cascade import gen_cascade_module
 from .prefill import BatchPrefillWithPagedKVCacheWrapper, single_prefill_with_kv_cache
 from .utils import register_custom_op, register_fake_op
-
-
-def gen_cascade_module() -> JitSpec:
-    return gen_jit_spec(
-        "cascade",
-        [
-            jit_env.FLASHINFER_CSRC_DIR / "cascade.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "flashinfer_cascade_ops.cu",
-        ],
-    )
 
 
 @functools.cache
@@ -92,7 +79,6 @@ def merge_state(
     >>> s_merged.shape
     torch.Size([2048, 32])
     """
-    device = v_a.device
     s_a = s_a.to(torch.float32)
     s_b = s_b.to(torch.float32)
     v_merged = torch.empty_like(v_a)
@@ -418,6 +404,7 @@ class MultiLevelCascadeAttentionWrapper:
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
         q_data_type: str = "float16",
+        kv_data_type: Optional[Union[str, torch.dtype]] = None,
     ):
         r"""Create auxiliary data structures for multi-level cascade attention for multiple
         forward calls within the same decode step. Please check
@@ -476,6 +463,8 @@ class MultiLevelCascadeAttentionWrapper:
             The theta used in RoPE, if not provided, will be set to ``1e4``.
         q_data_type : Optional[Union[str, torch.dtype]]
             The data type of the query tensor. If None, will be set to torch.float16.
+        kv_data_type : Optional[Union[str, torch.dtype]]
+            The data type of the key/value tensor. If None, will be set to :attr:`q_data_type`.
         """
         for i, (
             wrapper,
@@ -510,6 +499,7 @@ class MultiLevelCascadeAttentionWrapper:
                 rope_scale=rope_scale,
                 rope_theta=rope_theta,
                 q_data_type=q_data_type,
+                kv_data_type=kv_data_type,
             )
 
     begin_forward = plan

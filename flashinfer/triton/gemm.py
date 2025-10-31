@@ -36,7 +36,6 @@ def compute_sm80_group_gemm_args(
     d_out,
     w_column_major,
 ):
-
     pid = tl.program_id(0)
 
     m = tl.load(xy_indptr + pid + 1) - tl.load(xy_indptr + pid)
@@ -79,7 +78,6 @@ def compute_sm90_group_gemm_args(
     d_out,
     w_column_major,
 ):
-
     pid = tl.program_id(0)
 
     m = tl.load(xy_indptr + pid + 1) - tl.load(xy_indptr + pid)

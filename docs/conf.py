@@ -1,6 +1,6 @@
-import os
-import sys
-from pathlib import Path
+from typing import Any, List
+
+import flashinfer  # noqa: F401
 
 # import tlcpack_sphinx_addon
 # Configuration file for the Sphinx documentation builder.
@@ -11,23 +11,23 @@ from pathlib import Path
 # -- Project information -----------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
 
-root = Path(__file__).parents[1].resolve()
-sys.path.append(str(root))
-os.environ["BUILD_DOC"] = "1"
+# FlashInfer is installed via pip before building docs
 autodoc_mock_imports = [
     "torch",
     "triton",
     "flashinfer._build_meta",
     "cuda",
+    "numpy",
+    "einops",
+    "mpi4py",
 ]
 
 project = "FlashInfer"
 author = "FlashInfer Contributors"
 copyright = f"2023-2025, {author}"
 
-package_version = (root / "version.txt").read_text().strip()
-version = package_version
-release = package_version
+version = flashinfer.__version__
+release = flashinfer.__version__
 
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
@@ -60,16 +60,12 @@ todo_include_todos = False
 
 html_theme = "furo"  # "sphinx_rtd_theme"
 
-templates_path = []
+templates_path: List[Any] = []
 
-html_static_path = []
+html_static_path = ["_static"]
 
 html_theme_options = {
     "logo_only": True,
-}
-
-html_static_path = ["_static"]
-html_theme_options = {
     "light_logo": "FlashInfer-white-background.png",
     "dark_logo": "FlashInfer-black-background.png",
 }

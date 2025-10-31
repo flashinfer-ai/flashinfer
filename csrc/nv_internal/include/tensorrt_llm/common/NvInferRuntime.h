@@ -1,7 +1,7 @@
 
 #pragma once
 #include <cstdint>
-
+#ifndef NV_INFER_RUNTIME_BASE_H
 namespace nvinfer1 {
 enum class DataType : int32_t {
   //! 32-bit floating point format.
@@ -53,3 +53,4 @@ enum class DataType : int32_t {
 };
 
 }  // namespace nvinfer1
+#endif

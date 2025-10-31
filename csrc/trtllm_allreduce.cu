@@ -13,93 +13,94 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <cstdint>
 #include <string>
 
 #include "flashinfer/comm/trtllm_allreduce.cuh"
-#include "pytorch_extension_utils.h"
+#include "tvm_ffi_utils.h"
 
 using namespace flashinfer::trtllm_allreduce;
+using tvm::ffi::Optional;
 
-#define DISPATCH_ALLREDUCE_DTYPE(scalar_type, C_TYPE, ...)                           \
-  [&]() {                                                                            \
-    if (scalar_type == at::ScalarType::Float) {                                      \
-      using C_TYPE = float;                                                          \
-      __VA_ARGS__                                                                    \
-    } else if (scalar_type == at::ScalarType::Half) {                                \
-      using C_TYPE = half;                                                           \
-      __VA_ARGS__                                                                    \
-    } else if (scalar_type == at::ScalarType::BFloat16) {                            \
-      using C_TYPE = __nv_bfloat16;                                                  \
-      __VA_ARGS__                                                                    \
-    } else {                                                                         \
-      TORCH_CHECK(false, "Unsupported DType for custom op dispatch: ", scalar_type); \
-    }                                                                                \
+#define DISPATCH_ALLREDUCE_DTYPE(dtype, C_TYPE, ...)                                             \
+  [&]() {                                                                                        \
+    if (dtype == dl_float32) {                                                                   \
+      using C_TYPE = float;                                                                      \
+      __VA_ARGS__                                                                                \
+    } else if (dtype == dl_float16) {                                                            \
+      using C_TYPE = half;                                                                       \
+      __VA_ARGS__                                                                                \
+    } else if (dtype == dl_bfloat16) {                                                           \
+      using C_TYPE = __nv_bfloat16;                                                              \
+      __VA_ARGS__                                                                                \
+    } else {                                                                                     \
+      TVM_FFI_LOG_AND_THROW(NotImplementedError) << "Unsupported DType for custom op dispatch."; \
+    }                                                                                            \
   }()
 
-#define DISPATCH_FLOATING_TYPES_FOR_ALLREDUCE(scalar_type, c_type, ...)                           \
-  [&] {                                                                                           \
-    switch (scalar_type) {                                                                        \
-      case at::ScalarType::Float: {                                                               \
-        using c_type = float;                                                                     \
-        return __VA_ARGS__();                                                                     \
-      }                                                                                           \
-      /* Requires nv_half to be defined somewhere */                                              \
-      case at::ScalarType::Half: {                                                                \
-        using c_type = half;                                                                      \
-        return __VA_ARGS__();                                                                     \
-      }                                                                                           \
-      /* Requires nv_bfloat16 to be defined somewhere */                                          \
-      case at::ScalarType::BFloat16: {                                                            \
-        using c_type = __nv_bfloat16;                                                             \
-        return __VA_ARGS__();                                                                     \
-      }                                                                                           \
-      default:                                                                                    \
-        TORCH_CHECK(false,                                                                        \
-                    "Unsupported dtype in DISPATCH_FLOATING_TYPES_FOR_ALLREDUCE: ", scalar_type); \
-    }                                                                                             \
+#define DISPATCH_FLOATING_TYPES_FOR_ALLREDUCE(dtype, c_type, ...)             \
+  [&] {                                                                       \
+    switch (encode_dlpack_dtype(dtype)) {                                     \
+      case float32_code: {                                                    \
+        using c_type = float;                                                 \
+        return __VA_ARGS__();                                                 \
+      }                                                                       \
+      /* Requires nv_half to be defined somewhere */                          \
+      case float16_code: {                                                    \
+        using c_type = half;                                                  \
+        return __VA_ARGS__();                                                 \
+      }                                                                       \
+      /* Requires nv_bfloat16 to be defined somewhere */                      \
+      case bfloat16_code: {                                                   \
+        using c_type = __nv_bfloat16;                                         \
+        return __VA_ARGS__();                                                 \
+      }                                                                       \
+      default:                                                                \
+        TVM_FFI_LOG_AND_THROW(NotImplementedError)                            \
+            << "Unsupported dtype in DISPATCH_FLOATING_TYPES_FOR_ALLREDUCE."; \
+    }                                                                         \
   }()
 
-void trtllm_lamport_initialize(int64_t buffer_ptr, int64_t size, at::ScalarType dtype) {
+void trtllm_lamport_initialize(int64_t buffer_ptr, int64_t size, DLDataType dtype) {
   DISPATCH_ALLREDUCE_DTYPE(dtype, c_type, {
-    cudaStream_t raw_stream = at::cuda::getCurrentCUDAStream().stream();
+    cudaStream_t raw_stream = get_current_stream();
     auto status = lamportInitialize<c_type>(reinterpret_cast<void*>(buffer_ptr),
                                             static_cast<size_t>(size), raw_stream);
-    TORCH_CHECK(status == cudaSuccess, "lamportInitialize failed with error code ",
-                cudaGetErrorString(status));
+    TVM_FFI_ICHECK(status == cudaSuccess)
+        << "lamportInitialize failed with error code " << cudaGetErrorString(status);
   });
 }
 
 void trtllm_lamport_initialize_all(int64_t buffer_0_ptr, int64_t buffer_1_ptr, int64_t buffer_2_ptr,
-                                   int64_t size, at::ScalarType dtype) {
+                                   int64_t size, DLDataType dtype) {
   DISPATCH_ALLREDUCE_DTYPE(dtype, c_type, {
-    cudaStream_t raw_stream = at::cuda::getCurrentCUDAStream().stream();
+    cudaStream_t raw_stream = get_current_stream();
     auto status = lamportInitializeAll<c_type>(
         reinterpret_cast<void*>(buffer_0_ptr), reinterpret_cast<void*>(buffer_1_ptr),
         reinterpret_cast<void*>(buffer_2_ptr), static_cast<size_t>(size), raw_stream);
-    TORCH_CHECK(status == cudaSuccess, "lamportInitializeAll failed with error code ",
-                cudaGetErrorString(status));
+    TVM_FFI_ICHECK(status == cudaSuccess)
+        << "lamportInitializeAll failed with error code " << cudaGetErrorString(status);
   });
 }
 
 // refer to cpp/tests/unit_tests/kernels/allReduce/allReduceFusionTest.cu:L268
-void trtllm_custom_all_reduce(at::Tensor& in, at::Tensor& out, int64_t tp_size, int64_t tp_rank,
+void trtllm_custom_all_reduce(TensorView in, TensorView out, int64_t tp_size, int64_t tp_rank,
                               int64_t token_num, int64_t fusion_op_code, int64_t strategy_code,
                               int64_t config_code, bool launch_with_pdl, int64_t flag_value,
-                              at::Tensor peer_comm_buffer_ptrs, at::Tensor peer_barrier_ptrs_in,
-                              at::Tensor peer_barrier_ptrs_out, std::optional<at::Tensor> bias,
-                              std::optional<at::Tensor> residual, std::optional<at::Tensor> weight,
-                              std::optional<at::Tensor> weight_pre_residual_norm,
-                              std::optional<double> eps,
-                              std::optional<at::Tensor> intermediate_buffer,
-                              std::optional<at::Tensor> lamport_peer_comm_buffer_ptrs_0,
-                              std::optional<at::Tensor> lamport_peer_comm_buffer_ptrs_1,
-                              std::optional<at::Tensor> lamport_peer_comm_buffer_ptrs_2) {
+                              TensorView peer_comm_buffer_ptrs, TensorView peer_barrier_ptrs_in,
+                              TensorView peer_barrier_ptrs_out, Optional<TensorView> bias,
+                              Optional<TensorView> residual, Optional<TensorView> weight,
+                              Optional<TensorView> weight_pre_residual_norm, Optional<double> eps,
+                              Optional<TensorView> intermediate_buffer,
+                              Optional<TensorView> lamport_peer_comm_buffer_ptrs_0,
+                              Optional<TensorView> lamport_peer_comm_buffer_ptrs_1,
+                              Optional<TensorView> lamport_peer_comm_buffer_ptrs_2) {
   AllReduceFusionOp fusion_op = static_cast<AllReduceFusionOp>(fusion_op_code);
-  const c10::cuda::OptionalCUDAGuard device_guard(in.device());
-  auto stream = at::cuda::getCurrentCUDAStream();
+  cudaSetDevice(in.device().device_id);
+  auto stream = get_stream(in.device());
 
   // TODO(zihao): review dispatch type - support fp16, bf16 only
-  DISPATCH_FLOATING_TYPES_FOR_ALLREDUCE(in.scalar_type(), c_type, [&] {
+  DISPATCH_FLOATING_TYPES_FOR_ALLREDUCE(in.dtype(), c_type, [&] {
     // TODO(yingyi): remove type template here (used to check if lamport is supported)
     int64_t message_size = in.numel();
     int64_t hidden_size = in.numel() / token_num;
@@ -128,27 +129,28 @@ void trtllm_custom_all_reduce(at::Tensor& in, at::Tensor& out, int64_t tp_size, 
     // add ipc buffer pointers
     for (int i = 0; i < tp_size; ++i) {
       params.peer_comm_buffer_ptrs[i] =
-          reinterpret_cast<void*>(peer_comm_buffer_ptrs.data_ptr<int64_t>()[i]);
+          reinterpret_cast<void*>(static_cast<int64_t*>(peer_comm_buffer_ptrs.data_ptr())[i]);
       params.peer_barrier_ptrs_in[i] =
-          reinterpret_cast<uint32_t*>(peer_barrier_ptrs_in.data_ptr<int64_t>()[i]);
+          reinterpret_cast<uint32_t*>(static_cast<int64_t*>(peer_barrier_ptrs_in.data_ptr())[i]);
       params.peer_barrier_ptrs_out[i] =
-          reinterpret_cast<uint32_t*>(peer_barrier_ptrs_out.data_ptr<int64_t>()[i]);
+          reinterpret_cast<uint32_t*>(static_cast<int64_t*>(peer_barrier_ptrs_out.data_ptr())[i]);
     }
 
     if (lamport_peer_comm_buffer_ptrs_0.has_value()) {
-      TORCH_CHECK(lamport_peer_comm_buffer_ptrs_1.has_value(),
-                  "lamport_peer_comm_buffer_ptrs_1 is required if lamport_peer_comm_buffer_ptrs_0 "
-                  "is provided");
-      TORCH_CHECK(lamport_peer_comm_buffer_ptrs_2.has_value(),
-                  "lamport_peer_comm_buffer_ptrs_2 is required if lamport_peer_comm_buffer_ptrs_0 "
-                  "is provided");
+      TVM_FFI_ICHECK(lamport_peer_comm_buffer_ptrs_1.has_value())
+          << "lamport_peer_comm_buffer_ptrs_1 is required if lamport_peer_comm_buffer_ptrs_0 is "
+             "provided";
+      TVM_FFI_ICHECK(lamport_peer_comm_buffer_ptrs_2.has_value())
+          << "lamport_peer_comm_buffer_ptrs_2 is required if lamport_peer_comm_buffer_ptrs_0 "
+             "is provided";
       for (int i = 0; i < tp_size; ++i) {
-        params.fusion_params.lamport_peer_comm_buffer_ptrs[i] =
-            reinterpret_cast<void*>(lamport_peer_comm_buffer_ptrs_0.value().data_ptr<int64_t>()[i]);
-        params.fusion_params.lamport_peer_comm_buffer_ptrs[i + tp_size] =
-            reinterpret_cast<void*>(lamport_peer_comm_buffer_ptrs_1.value().data_ptr<int64_t>()[i]);
+        params.fusion_params.lamport_peer_comm_buffer_ptrs[i] = reinterpret_cast<void*>(
+            static_cast<int64_t*>(lamport_peer_comm_buffer_ptrs_0.value().data_ptr())[i]);
+        params.fusion_params.lamport_peer_comm_buffer_ptrs[i + tp_size] = reinterpret_cast<void*>(
+            static_cast<int64_t*>(lamport_peer_comm_buffer_ptrs_1.value().data_ptr())[i]);
         params.fusion_params.lamport_peer_comm_buffer_ptrs[i + tp_size * 2] =
-            reinterpret_cast<void*>(lamport_peer_comm_buffer_ptrs_2.value().data_ptr<int64_t>()[i]);
+            reinterpret_cast<void*>(
+                static_cast<int64_t*>(lamport_peer_comm_buffer_ptrs_2.value().data_ptr())[i]);
       }
     }
 
@@ -156,13 +158,11 @@ void trtllm_custom_all_reduce(at::Tensor& in, at::Tensor& out, int64_t tp_size, 
     auto config = static_cast<AllReduceStrategyConfig>(config_code);
 
     auto status = customAllReduce(params, strategy, config, fusion_op, launch_with_pdl, stream);
-    TORCH_CHECK(status == cudaSuccess, "customAllReduce failed with error code ",
-                cudaGetErrorString(status));
+    TVM_FFI_ICHECK(status == cudaSuccess)
+        << "customAllReduce failed with error code " << cudaGetErrorString(status);
   });
 }
 
-TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
-  m.def("trtllm_lamport_initialize", &trtllm_lamport_initialize);
-  m.def("trtllm_lamport_initialize_all", &trtllm_lamport_initialize_all);
-  m.def("trtllm_custom_all_reduce", &trtllm_custom_all_reduce);
-}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_lamport_initialize, trtllm_lamport_initialize);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_lamport_initialize_all, trtllm_lamport_initialize_all);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_custom_all_reduce, trtllm_custom_all_reduce);

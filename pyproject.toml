@@ -17,14 +17,18 @@ name = "flashinfer-python"
 description = "FlashInfer: Kernel Library for LLM Serving"
 requires-python = ">=3.9,<4.0"
 authors = [{ name = "FlashInfer team" }]
-# license = "Apache-2.0"
+license = "Apache-2.0"
 readme = "README.md"
 urls = { Homepage = "https://github.com/flashinfer-ai/flashinfer" }
 dynamic = ["dependencies", "version"]
+license-files = ["LICENSE", "LICENSE*.txt"]
+
+[project.scripts]
+flashinfer = "flashinfer.__main__:cli"
 
 [build-system]
-requires = ["setuptools>=77", "packaging>=24"]
-build-backend = "custom_backend"
+requires = ["setuptools>=77", "packaging>=24", "apache-tvm-ffi>=0.1,<0.2"]
+build-backend = "build_backend"
 backend-path = ["."]
 
 [tool.codespell]
@@ -37,39 +41,30 @@ skip = [
 ]
 
 [tool.setuptools]
-packages = [
-    "flashinfer",
-    "flashinfer.data",
-    "flashinfer.data.aot",
-    "flashinfer.data.csrc",
-    "flashinfer.data.cutlass",
-    "flashinfer.data.spdlog",
-    "flashinfer.data.tvm_binding",
-    "flashinfer.data.include",
-    "flashinfer.jit",
-    "flashinfer.jit.attention",
-    "flashinfer.triton",
-    "flashinfer.triton.kernels",
-    "flashinfer.comm",
-    "flashinfer.cudnn",
-]
 include-package-data = false
+py-modules = ["build_backend", "build_utils"]
+
+[tool.setuptools.dynamic]
+version = {attr = "flashinfer._build_meta.__version__"}
+dependencies = {file = ["requirements.txt"]}
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["flashinfer*"]
+exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*"]
 
 [tool.setuptools.package-dir]
 "flashinfer.data" = "."
-"flashinfer.data.aot" = "build/aot-ops-package-dir"
 "flashinfer.data.cutlass" = "3rdparty/cutlass"
 "flashinfer.data.spdlog" = "3rdparty/spdlog"
 
 [tool.setuptools.package-data]
+"flashinfer" = [
+    "_build_meta.py"
+]
 "flashinfer.data" = [
     "csrc/**",
-    "include/**",
-    "tvm_binding/**",
-    "version.txt"
-]
-"flashinfer.data.aot" = [
-    "**"
+    "include/**"
 ]
 "flashinfer.data.cutlass" = [
     "include/**",
@@ -80,12 +75,20 @@ include-package-data = false
 ]
 
 [tool.mypy]
-ignore_missing_imports = false
+files = ["flashinfer"]
+ignore_missing_imports = true
 show_column_numbers = true
 show_error_context = true
 follow_imports = "skip"
 ignore_errors = false
 strict_optional = false
+exclude = [
+    "flashinfer-cubin/",
+    "flashinfer-jit-cache/",
+    "3rdparty/",
+    "flashinfer/data/cutlass/",
+    "build/",
+]
 
 
 [tool.ruff.lint]
@@ -128,4 +131,8 @@ ignore = [
     "B020",
     # Return te negated condition directly
     "SIM103",
+    # Function definition does not bind loop variable
+    "B023",
 ]
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]

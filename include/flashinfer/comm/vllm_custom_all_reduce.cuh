@@ -44,6 +44,8 @@ struct cuda_error : public std::runtime_error {
 namespace vllm {
 
 constexpr int kMaxBlocks = 36;
+constexpr CUpointer_attribute rangeStartAddrAttr = CU_POINTER_ATTRIBUTE_RANGE_START_ADDR;
+
 // Counter may overflow, but it's fine since unsigned int overflow is
 // well-defined behavior.
 using FlagType = uint32_t;
@@ -58,7 +60,7 @@ struct Signal {
 };
 
 struct __align__(16) RankData {
-  const void* __restrict__ ptrs[8];
+  void* ptrs[8];
 };
 
 struct __align__(16) RankSignals {
@@ -366,6 +368,9 @@ class CustomAllreduce {
       void* base_ptr;
       // note: must share the base address of each allocation, or we get wrong
       // address
+      if (cuPointerGetAttribute(&base_ptr, rangeStartAddrAttr, (CUdeviceptr)ptr) != CUDA_SUCCESS)
+        throw std::runtime_error("failed to get pointer attr");
+
       CHECK_CUDA_SUCCESS(
           cudaIpcGetMemHandle((cudaIpcMemHandle_t*)&handles[i * handle_sz], base_ptr));
       offsets[i] = ((char*)ptr) - ((char*)base_ptr);

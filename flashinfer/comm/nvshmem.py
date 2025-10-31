@@ -1,44 +1,32 @@
 import ctypes
 import functools
-import os
 from typing import Sequence
 
 import torch
 
-from ..jit import JitSpec
 from ..jit import env as jit_env
-from ..jit import gen_jit_spec
-
-
-def gen_nvshmem_module() -> JitSpec:
-    return gen_jit_spec(
-        "nvshmem",
-        [jit_env.FLASHINFER_CSRC_DIR / "nvshmem_binding.cu"],
-        extra_include_paths=[jit_env.get_nvshmem_include_dir()],
-        extra_ldflags=[
-            f"-L{jit_env.get_nvshmem_lib_dir()}",
-            "-lnvshmem_device",
-        ],
-        needs_device_linking=True,
-    )
+from ..jit.comm import gen_nvshmem_module
 
 
 @functools.cache
 def get_nvshmem_module():
-    from pathlib import Path
-
-    import nvidia.nvshmem
-
     # Try to find libnvshmem_host.so first, fallback to libnvshmem_host.so.3
-    nvshmem_lib_path = Path(nvidia.nvshmem.__path__[0]) / "lib"
-    lib_path = nvshmem_lib_path / "libnvshmem_host.so"
+    lib_dirs = jit_env.get_nvshmem_lib_dirs()
+    lib_path = None
 
-    if not lib_path.exists():
-        lib_path = nvshmem_lib_path / "libnvshmem_host.so.3"
+    lib_names = ["libnvshmem_host.so", "libnvshmem_host.so.3"]
+    for lib_dir in lib_dirs:
+        for lib_name in lib_names:
+            candidate_path = lib_dir / lib_name
+            if candidate_path.exists():
+                lib_path = candidate_path
+                break
+        if lib_path is not None:
+            break
 
-    if not lib_path.exists():
+    if lib_path is None:
         raise FileNotFoundError(
-            f"Could not find libnvshmem_host.so or libnvshmem_host.so.3 in {nvshmem_lib_path}"
+            f"Could not find libnvshmem_host.so or libnvshmem_host.so.3 in {lib_dirs}"
         )
 
     ctypes.CDLL(lib_path, mode=ctypes.RTLD_GLOBAL)
@@ -48,7 +36,9 @@ def get_nvshmem_module():
 
 
 def get_unique_id() -> torch.Tensor:
-    return get_nvshmem_module().nvshmem_get_unique_id()
+    uid = alloc_empty_unique_id()
+    get_nvshmem_module().nvshmem_get_unique_id(uid)
+    return uid
 
 
 def unique_id_size() -> int:
@@ -107,7 +97,8 @@ def malloc(
         https://docs.nvidia.com/nvshmem/api/gen/api/memory.html#nvshmem-malloc-nvshmem-free-nvshmem-align
     """
 
-    return get_nvshmem_module().nvshmem_malloc(shape, dtype, device)
+    output = get_nvshmem_module().nvshmem_malloc(shape, dtype, device)
+    return torch.from_dlpack(output)
 
 
 def barrier_all() -> None:

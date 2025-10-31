@@ -385,6 +385,9 @@ __global__ void PersistentVariableLengthMergeStatesKernel(
 #endif
 #pragma unroll 1
   for (uint32_t i = cta_id; i < seq_len * num_heads; i += num_ctas) {
+    // NOTE (Yilong): necessary to prevent hazard on smaller `num_index_sets`
+    __syncthreads();
+
     uint32_t pos = i / num_heads;
     uint32_t head_idx = i % num_heads;
     state_t<vec_size> st;
@@ -487,6 +490,8 @@ __global__ void PersistentVariableLengthAttentionSumKernel(
 
 #pragma unroll 1
   for (uint32_t i = cta_id; i < seq_len * num_heads; i += num_ctas) {
+    __syncthreads();
+
     uint32_t pos = i / num_heads;
     uint32_t head_idx = i % num_heads;
     const uint32_t num_index_sets = merge_indptr[pos + 1] - merge_indptr[pos];

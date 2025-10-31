@@ -16,10 +16,9 @@
 #include <flashinfer/attention/mask.cuh>
 #include <flashinfer/layout.cuh>
 #include <flashinfer/math.cuh>
-#include <optional>
 
-#include "pytorch_extension_utils.h"
 #include "single_prefill_sm90_config.inc"
+#include "tvm_ffi_utils.h"
 
 namespace flashinfer {
 
@@ -31,21 +30,20 @@ cudaError_t SingleFP8PrefillWithKVCacheDispatched(Params& params, cudaStream_t s
 
 using namespace flashinfer;
 
-void single_prefill_with_kv_cache_sm90(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor tmp,
-                                       at::Tensor o, std::optional<at::Tensor> maybe_lse,
-                                       int64_t mask_mode_code, int64_t layout,
-                                       int64_t window_left ADDITIONAL_FUNC_PARAMS) {
+using tvm::ffi::Optional;
+
+void single_prefill_with_kv_cache_sm90(ffi::TensorView q, ffi::TensorView k, ffi::TensorView v,
+                                       ffi::TensorView tmp, ffi::TensorView o,
+                                       Optional<ffi::TensorView> maybe_lse, int64_t mask_mode_code,
+                                       int64_t layout, int64_t window_left ADDITIONAL_FUNC_PARAMS) {
   unsigned int head_dim_qk = q.size(2);
   unsigned int head_dim_vo = v.size(2);
   unsigned int num_qo_heads = q.size(1);
   unsigned int qo_len = q.size(0);
 
-  auto q_scalar_type = q.scalar_type();
-  auto kv_scalar_type = k.scalar_type();
-
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
-  const c10::cuda::OptionalCUDAGuard device_guard(q.device());
-  const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+  cudaSetDevice(q.device().device_id);
+  const cudaStream_t stream = get_stream(q.device());
   const MaskMode mask_mode = static_cast<MaskMode>(mask_mode_code);
 
   DISPATCH_context(
@@ -56,7 +54,8 @@ void single_prefill_with_kv_cache_sm90(at::Tensor q, at::Tensor k, at::Tensor v,
         params.k_ptr = static_cast<DTypeKV*>(k.data_ptr());
         params.v_ptr = static_cast<DTypeKV*>(v.data_ptr());
         params.o_ptr = static_cast<DTypeO*>(o.data_ptr());
-        params.lse_ptr = maybe_lse ? (static_cast<float*>(maybe_lse->data_ptr())) : nullptr;
+        params.lse_ptr =
+            maybe_lse.has_value() ? (static_cast<float*>(maybe_lse.value().data_ptr())) : nullptr;
         params.q_stride_n = q.stride(0);
         params.q_stride_h = q.stride(1);
         params.o_stride_n = o.stride(0);
@@ -94,8 +93,9 @@ void single_prefill_with_kv_cache_sm90(at::Tensor q, at::Tensor k, at::Tensor v,
         cudaError_t status =
             SingleFP8PrefillWithKVCacheDispatched<HEAD_DIM_QK, MASK_MODE, USE_SLIDING_WINDOW,
                                                   AttentionVariant>(params, stream);
-        TORCH_CHECK(status == cudaSuccess, "single_prefill_with_kv_cache_sm90 failed with error: " +
-                                               std::string(cudaGetErrorString(status)));
+        TVM_FFI_ICHECK(status == cudaSuccess)
+            << "single_prefill_with_kv_cache_sm90 failed with error: "
+            << cudaGetErrorString(status);
         return true;
       });
 }
