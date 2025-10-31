@@ -195,7 +195,6 @@ def get_trtllm_gen_prefill_module():
         batch_size: int,
         cum_seq_lens_q: torch.Tensor,
         cum_seq_lens_kv: torch.Tensor,
-        kv_layout_code: int,
         enable_pdl: bool,
         workspace_size: int,
         window_left: int = -1,
@@ -232,7 +231,6 @@ def get_trtllm_gen_prefill_module():
             cum_seq_lens_q,
             cum_seq_lens_kv,
             sm_count,
-            kv_layout_code,
             enable_pdl,
             workspace_size,
             sinks,
@@ -3407,6 +3405,12 @@ def trtllm_batch_context_with_kv_cache(
             # it doesn't change underlying storage
             k_cache, v_cache = kv_cache.unbind(dim=1)
 
+    # Convert HND layout to NHD if necessary (transpose only changes stride, not data)
+    if kv_layout == "HND":
+        # For HND: [..., H, N, D] -> NHD: [..., N, H, D]
+        k_cache = k_cache.transpose(-3, -2)
+        v_cache = v_cache.transpose(-3, -2)
+
     run_func = get_trtllm_gen_fmha_module().trtllm_paged_attention_context
     sm_count = get_device_sm_count(query.device)
 
@@ -3511,7 +3515,6 @@ def trtllm_batch_context_with_kv_cache(
         cum_seq_lens_q,
         cum_seq_lens_kv,
         sm_count,
-        TensorLayout[kv_layout].value,
         enable_pdl,
         workspace_size,
         sinks,

@@ -1877,7 +1877,6 @@ class TrtllmGenDecodeModule:
         bmm2_scale: float,
         workspace_size: int,
         window_left: int = -1,
-        kv_layout_code: int = TensorLayout.HND.value,
         enable_pdl: bool = None,
         out: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
@@ -1911,7 +1910,6 @@ class TrtllmGenDecodeModule:
             0,  # o_sf_start_index
             window_left,
             self._sm_count,
-            kv_layout_code,
             enable_pdl,
             workspace_size,
             sinks,
@@ -2152,6 +2150,12 @@ def trtllm_batch_decode_with_kv_cache(
             # it doesn't change underlying storage
             k_cache, v_cache = kv_cache.unbind(dim=1)
 
+    # Convert HND layout to NHD if necessary (transpose only changes stride, not data)
+    if kv_layout == "HND":
+        # For HND: [..., H, N, D] -> NHD: [..., N, H, D]
+        k_cache = k_cache.transpose(-3, -2)
+        v_cache = v_cache.transpose(-3, -2)
+
     run_func = get_trtllm_gen_fmha_module().trtllm_paged_attention_decode
     sm_count = get_device_sm_count(query.device)
 
@@ -2253,7 +2257,6 @@ def trtllm_batch_decode_with_kv_cache(
         o_sf_start_index,
         window_left,
         sm_count,
-        TensorLayout[kv_layout].value,
         enable_pdl,
         workspace_buffer.numel() * workspace_buffer.element_size(),
         sinks,

@@ -200,7 +200,7 @@ void trtllm_paged_attention_decode(TensorView out, Optional<TensorView> out_scal
                                    TensorView seq_lens, int64_t max_kv_len, double bmm1_scale,
                                    double bmm2_scale, double o_sf_scale, int64_t o_sf_vec_size,
                                    int64_t o_sf_start_index, int64_t window_left, int64_t sm_count,
-                                   int64_t kv_layout, bool enable_pdl, int64_t workspace_size,
+                                   bool enable_pdl, int64_t workspace_size,
                                    Optional<TensorView> attention_sinks) {
   auto q_data_type = dl_dtype_to_tllm_data_type(query.dtype());
   auto kv_data_type = dl_dtype_to_tllm_data_type(key_cache.dtype());
@@ -232,19 +232,11 @@ void trtllm_paged_attention_decode(TensorView out, Optional<TensorView> out_scal
   bool is_shared_kv = key_cache.data_ptr() == value_cache.data_ptr();
   int num_pages_in_mem_pool = is_shared_kv ? key_cache.size(0) : key_cache.size(0) * 2;
 
-  int page_size, num_kv_heads;
-  int kv_stride_keys_values, kv_stride_heads;
-  if (kv_layout == 0) {  // nhd
-    page_size = key_cache.size(-3);
-    num_kv_heads = key_cache.size(-2);
-    kv_stride_keys_values = key_cache.stride(-3);  // key/values
-    kv_stride_heads = key_cache.stride(-2);        // head
-  } else {                                         // kv_layout == 1, hnd
-    page_size = key_cache.size(-2);
-    num_kv_heads = key_cache.size(-3);
-    kv_stride_keys_values = key_cache.stride(-2);  // key/values
-    kv_stride_heads = key_cache.stride(-3);        // head
-  }
+  // Assume NHD layout: [..., N, H, D]
+  int page_size = key_cache.size(-3);
+  int num_kv_heads = key_cache.size(-2);
+  int kv_stride_keys_values = key_cache.stride(-3);  // key/values
+  int kv_stride_heads = key_cache.stride(-2);        // head
 
   int kv_stride_batch = key_cache.stride(0);  // batch
 
@@ -280,8 +272,8 @@ void trtllm_paged_attention_context(TensorView out, Optional<TensorView> out_sca
                                     int64_t o_sf_vec_size, int64_t o_sf_start_index,
                                     int64_t batch_size, int64_t window_left,
                                     TensorView cum_seq_lens_q, TensorView cum_seq_lens_kv,
-                                    int64_t sm_count, int64_t kv_layout, bool enable_pdl,
-                                    int64_t workspace_size, Optional<TensorView> attention_sinks) {
+                                    int64_t sm_count, bool enable_pdl, int64_t workspace_size,
+                                    Optional<TensorView> attention_sinks) {
   auto q_data_type = dl_dtype_to_tllm_data_type(query.dtype());
   auto kv_data_type = dl_dtype_to_tllm_data_type(key_cache.dtype());
   auto o_data_type = dl_dtype_to_tllm_data_type(out.dtype());
@@ -302,20 +294,12 @@ void trtllm_paged_attention_context(TensorView out, Optional<TensorView> out_sca
   bool is_shared_kv = key_cache.data_ptr() == value_cache.data_ptr();
   int num_pages_in_mem_pool = is_shared_kv ? key_cache.size(0) : key_cache.size(0) * 2;
 
-  int page_size, num_kv_heads;
-  int kv_stride_keys_values, kv_stride_heads;
-  if (kv_layout == 0) {  // nhd
-    page_size = key_cache.size(-3);
-    num_kv_heads = key_cache.size(-2);
-    kv_stride_keys_values = key_cache.stride(-3);  // key/values
-    kv_stride_heads = key_cache.stride(-2);        // head
-  } else {                                         // kv_layout == 1, hnd
-    page_size = key_cache.size(-2);
-    num_kv_heads = key_cache.size(-3);
-    kv_stride_keys_values = key_cache.stride(-2);  // key/values
-    kv_stride_heads = key_cache.stride(-3);        // head
-  }
-  int kv_stride_batch = key_cache.stride(0);  // batch
+  // Assume NHD layout: [..., N, H, D]
+  int page_size = key_cache.size(-3);
+  int num_kv_heads = key_cache.size(-2);
+  int kv_stride_keys_values = key_cache.stride(-3);  // key/values
+  int kv_stride_heads = key_cache.stride(-2);        // head
+  int kv_stride_batch = key_cache.stride(0);         // batch
 
   const auto stream = get_stream(query.device());
   void* output_sf_ptr =
