@@ -259,11 +259,10 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
   // of registers
   auto localExpertExtent = params.mNumLocalExperts << params.mLocalExpertsStrideLog2;
   int32_t finalExpertOffset[ExpertsPerThread];
-  int32_t finalExpertOffset0;
   if constexpr (KernelParams::isPow2) {
-    finalExpertOffset0 = mulLog2<int32_t>(ctaOffset, params.mPaddingLog2);
+    finalExpertOffset[0] = mulLog2<int32_t>(ctaOffset, params.mPaddingLog2);
   } else {
-    finalExpertOffset0 = mulTileN<int32_t>(ctaOffset, params.mTileTokensDim);
+    finalExpertOffset[0] = mulTileN<int32_t>(ctaOffset, params.mTileTokensDim);
   }
 #pragma unroll
   for (int ii = 1; ii < ExpertsPerThread; ++ii) {
