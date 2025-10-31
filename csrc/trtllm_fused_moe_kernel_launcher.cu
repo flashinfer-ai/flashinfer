@@ -65,11 +65,19 @@ std::set<int32_t> computeSelectedTileN(std::vector<int32_t> const& supported_til
   float const avg_tokens_per_expert = static_cast<float>(num_tokens * top_k) / num_local_experts;
   int32_t tile_tokens_dim = std::clamp(nextPowerOfTwo(avg_tokens_per_expert),
                                        supported_tile_nums.front(), supported_tile_nums.back());
-
-  std::set<int32_t> selected_tile_nums = {
-      std::max(supported_tile_nums.front(), tile_tokens_dim / 2), tile_tokens_dim,
-      std::min(supported_tile_nums.back(), tile_tokens_dim * 2),
-      std::min(supported_tile_nums.back(), tile_tokens_dim * 4)};
+  // assume supported_tile_nums is sorted
+  auto it = std::find(supported_tile_nums.begin(), supported_tile_nums.end(), tile_tokens_dim);
+  if (it == supported_tile_nums.end()) {
+    TVM_FFI_LOG_AND_THROW(NotImplementedError) << "Unsupported tile tokens dim.";
+  }
+  std::set<int32_t> selected_tile_nums;
+  selected_tile_nums.insert(tile_tokens_dim);
+  if (std::next(it) != supported_tile_nums.end()) {
+    selected_tile_nums.insert(*std::next(it));
+  }
+  if (it != supported_tile_nums.begin()) {
+    selected_tile_nums.insert(*std::prev(it));
+  }
 
   return selected_tile_nums;
 }
