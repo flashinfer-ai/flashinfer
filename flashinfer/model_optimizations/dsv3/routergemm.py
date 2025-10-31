@@ -75,7 +75,7 @@ def get_dsv3_router_gemm_module():
         mat_b: torch.Tensor,
         out: torch.Tensor,
         launch_with_pdl: bool,
-        bias: Optional[torch.Tensor],
+        bias: Optional[torch.Tensor] = None,
     ) -> None:
         module.dsv3_router_gemm_op(mat_a, mat_b, out, launch_with_pdl, bias)
 
@@ -92,7 +92,7 @@ def dsv3_router_gemm_op(
     mat_b: torch.Tensor,
     out: torch.Tensor,
     launch_with_pdl: bool,
-    bias: Optional[torch.Tensor],
+    bias: Optional[torch.Tensor] = None,
 ) -> None:
     _dvs3_router_gemm_shape_checks(mat_a, mat_b, out, launch_with_pdl, bias)
     get_dsv3_router_gemm_module().dsv3_router_gemm_op(

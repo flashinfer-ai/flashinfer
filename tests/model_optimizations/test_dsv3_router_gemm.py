@@ -15,7 +15,7 @@ def test_dsv3_router_gemm_op(num_tokens, num_experts, hidden_dim):
     ).t()  # column major
     out = torch.randn(num_tokens, num_experts, device="cuda", dtype=torch.float32)
     # TODO: We shouldn't need to pass bias here, but just for testing
-    dsv3_router_gemm.dsv3_router_gemm_op(mat_a, mat_b, out, False, None)
+    dsv3_router_gemm.dsv3_router_gemm_op(mat_a, mat_b, out, False)
     ref = mat_a @ mat_b
 
     cos_sim = F.cosine_similarity(ref.reshape(-1), out.reshape(-1), dim=0)
