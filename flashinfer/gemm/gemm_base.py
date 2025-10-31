@@ -441,6 +441,10 @@ def _create_cutlass_fp4_gemm_module(module, op_name: str, tuner_name: str):
                     _,
                     workspace_buffer,
                 ) = inputs
+                if a.dtype == torch.uint8 and a_descale.dtype == torch.float8_e4m3fn:
+                    a_descale = a_descale.view(torch.uint8)
+                if b.dtype == torch.uint8 and b_descale.dtype == torch.float8_e4m3fn:
+                    b_descale = b_descale.view(torch.uint8)
                 module.fp4_gemm(
                     a, b.T, a_descale, b_descale.T, alpha, out, workspace_buffer, tactic
                 )
@@ -1947,7 +1951,7 @@ def _cutlass_gemm_fp4_requirement(
     return True
 
 
-@supported_compute_capability([100, 103, 110, 120])
+@supported_compute_capability([100, 103, 110, 120, 121])
 def _auto_gemm_fp4_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -1985,14 +1989,16 @@ def _auto_gemm_fp4_requirement(
     return False
 
 
+_mm_fp4_backend_checkers = {
+    "cudnn": _cudnn_gemm_fp4_requirement,
+    "trtllm": _trtllm_gemm_fp4_requirement,
+    "cutlass": _cutlass_gemm_fp4_requirement,
+    "auto": _auto_gemm_fp4_requirement,
+}
+
+
 @backend_requirement(
-    {
-        "cudnn": _cudnn_gemm_fp4_requirement,  # Each backend has its own requirement function
-        "trtllm": _trtllm_gemm_fp4_requirement,
-        "cutlass": _cutlass_gemm_fp4_requirement,
-        "auto": _auto_gemm_fp4_requirement,  # Auto backend requires at least one backend to be supported on the current device
-    },
-    common_check=_check_mm_fp4_problem_size,  # Shape checks common to all backends
+    backend_checks=_mm_fp4_backend_checkers, common_check=_check_mm_fp4_problem_size
 )
 def mm_fp4(
     a: torch.Tensor,
@@ -2087,7 +2093,7 @@ def mm_fp4(
         cc_major, cc_minor = get_compute_capability(a.device)
         # If cuda version is 13 or greater:
         # cudnn is more performant if cudnn version is 9.14 or greater.
-        if cuda_major >= 13 and cudnn.backend_version() >= 91400:
+        if CUDNN_AVAILABLE and cuda_major >= 13 and cudnn.backend_version() >= 91400:
             candidate_backends = ("cudnn", "cutlass")
         # Otherwise, prioritize cutlass
         else:
@@ -2098,11 +2104,11 @@ def mm_fp4(
         backends = []
         for candidate in candidate_backends:
             # mypy requires explicit type casting for the backend literal
-            backend_literal = cast(
-                Literal["cudnn", "trtllm", "cutlass", "auto"], candidate
-            )
+            backend_literal = cast(Literal["cudnn", "trtllm", "cutlass"], candidate)
             try:
-                _check_mm_fp4_problem_size(
+                # Check both common constraints and backend-specific requirements
+                # to find all compatible backends for this problem instance
+                if _check_mm_fp4_problem_size(
                     a,
                     b,
                     a_descale,
@@ -2114,41 +2120,39 @@ def mm_fp4(
                     use_8x4_sf_layout,
                     backend_literal,
                     use_nvfp4,
-                )
-                backends.append(candidate)
+                ) and _mm_fp4_backend_checkers[candidate](
+                    a,
+                    b,
+                    a_descale,
+                    b_descale,
+                    alpha,
+                    out_dtype,
+                    out,
+                    block_size,
+                    use_8x4_sf_layout,
+                    backend_literal,
+                    use_nvfp4,
+                ):
+                    backends.append(candidate)
             except Exception:
                 pass
     else:
         backends = [backend]
 
     # At this point, backends contains a supported backend if specified, or all supported backends if backend='auto'.
-    runners = []
-    for cur_backend in backends:
-        if cur_backend == "cudnn":
-            runners.append(_cudnn_gemm_fp4_runner())
-        elif cur_backend == "trtllm":
-            runners.append(
-                get_trtllm_fp4_gemm_module().trtllm_fp4_gemm_runner(use_8x4_sf_layout)
-            )
-        elif cur_backend == "cutlass":
-            if a.dtype == torch.uint8 and a_descale.dtype == torch.float8_e4m3fn:
-                a_descale = a_descale.view(torch.uint8)
-            if b.dtype == torch.uint8 and b_descale.dtype == torch.float8_e4m3fn:
-                b_descale = b_descale.view(torch.uint8)
+    # Lazy initialization of runners to avoid overhead of creating a new runner that will not be used
+    major, _ = get_compute_capability(a.device)
 
-            # Dispatch to the correct module based on device architecture
-            major, _ = get_compute_capability(a.device)
-            if major == 12:
-                runners.append(
-                    get_gemm_sm120_module_cutlass_fp4().cutlass_fp4_gemm_runner()
-                )
-            else:
-                runners.append(
-                    get_gemm_sm100_module_cutlass_fp4().cutlass_fp4_gemm_runner()
-                )
-        else:
-            # Should not reach this
-            raise ValueError(f"Unsupported backend: {cur_backend}")
+    backend_to_runner_factory = {
+        "cudnn": lambda: _cudnn_gemm_fp4_runner(),
+        "trtllm": lambda: get_trtllm_fp4_gemm_module().trtllm_fp4_gemm_runner(
+            use_8x4_sf_layout
+        ),
+        "cutlass": lambda: get_gemm_sm120_module_cutlass_fp4().cutlass_fp4_gemm_runner()
+        if major == 12
+        else get_gemm_sm100_module_cutlass_fp4().cutlass_fp4_gemm_runner(),
+    }
+    runners = [backend_to_runner_factory[cur_backend]() for cur_backend in backends]
 
     # Now we have a list of runners for desired & supported backends.
     tuner = AutoTuner.get()

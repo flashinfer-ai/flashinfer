@@ -793,65 +793,11 @@ def testMmFp4(args):
     autotune_supported_backends = ["cudnn", "cutlass", "trtllm", "auto"]
     res = []
 
-    backends = filter_backends_by_compute_capability(backends, args.routine, device)
-
     res_dtype = dtype_str_to_torch_dtype(args.out_dtype)
     if res_dtype not in [torch.bfloat16, torch.float16]:
         raise ValueError(
             f"Unsupported res dtype: {res_dtype}. Supported dtypes are bfloat16 and float16."
         )
-    ## Done parsing input arguments
-
-    if "trtllm" in backends:
-        remove_trtllm = False
-        if res_dtype == torch.float16:
-            print("[INFO] trtllm backend does not support float16 output")
-            remove_trtllm = True
-        if remove_trtllm:
-            backends.remove("trtllm")
-        if not use_nvfp4:
-            print(
-                "[INFO] trtllm backend does not support mxfp4 quantization (use_nvfp4=False)"
-            )
-            backends.remove("trtllm")
-    if "cutlass" in backends:
-        remove_cutlass = False
-        if not use_128x4_sf_layout:
-            print("[INFO] cutlass backend does not support use_128x4_sf_layout=False")
-            remove_cutlass = True
-        if not use_nvfp4:
-            print(
-                "[INFO] cutlass backend does not support mxfp4 quantization (use_nvfp4=False)"
-            )
-            remove_cutlass = True
-        if remove_cutlass:
-            backends.remove("cutlass")
-    if "cudnn" in backends:
-        remove_cudnn = False
-        if not use_128x4_sf_layout:
-            print("[INFO] cudnn backend does not support use_128x4_sf_layout=False")
-            remove_cudnn = True
-        if remove_cudnn:
-            backends.remove("cudnn")
-    if "auto" in backends:
-        remove_auto = False
-        if not use_128x4_sf_layout:
-            print("[INFO] auto backend does not support use_128x4_sf_layout=False")
-            remove_auto = True
-        if remove_auto:
-            backends.remove("auto")
-    if getattr(args, "autotune", False):
-        backends_to_remove = []
-        for cur_backend in backends:
-            if cur_backend not in autotune_supported_backends:
-                print(f"[INFO] {cur_backend} backend does not support autotune")
-                backends_to_remove.append(cur_backend)
-        for cur_backend in backends_to_remove:
-            backends.remove(cur_backend)
-
-    if len(backends) == 0:
-        print("[ERROR] No backends to test. Exiting.")
-        return
 
     input = torch.randn([m, k], device=device, dtype=torch.bfloat16)
     mat2 = torch.randn([n, k], device=device, dtype=torch.bfloat16)
@@ -893,7 +839,77 @@ def testMmFp4(args):
         print(f"[VVERBOSE] {mat2_fp4.dtype = }")
 
     alpha = 1.0 / (global_sf_input * global_sf_mat2) if use_nvfp4 else None
-    # res = torch.empty([m, n], device="cuda", dtype=res_dtype)
+    # Completed preparing inputs. Now programmatically filter backends
+    block_size = 16 if use_nvfp4 else 32
+    backends_to_remove = []
+
+    for backend in backends:
+        # Skip autotune check for now (handled separately below)
+        if (
+            getattr(args, "autotune", False)
+            and backend not in autotune_supported_backends
+        ):
+            print(f"[INFO] {backend} backend does not support autotune")
+            backends_to_remove.append(backend)
+            continue
+
+        try:
+            from flashinfer.gemm import (
+                _mm_fp4_backend_checkers,
+                _check_mm_fp4_problem_size,
+            )
+
+            # Choose correct tensors for this backend
+            if backend == "trtllm":
+                b_tensor = mat2_fp4_trtllm.T
+                b_descale = mat2_inv_s_trtllm.T
+            else:
+                b_tensor = mat2_fp4.T
+                b_descale = mat2_inv_s.T
+
+            # Validate common requirements
+            _check_mm_fp4_problem_size(
+                input_fp4,
+                b_tensor,
+                input_inv_s,
+                b_descale,
+                alpha,
+                res_dtype,
+                None,  # out
+                block_size,
+                not use_128x4_sf_layout,  # use_8x4_sf_layout
+                backend,
+                use_nvfp4,
+            )
+
+            # Validate backend-specific requirements
+            if backend in _mm_fp4_backend_checkers:
+                _mm_fp4_backend_checkers[backend](
+                    input_fp4,
+                    b_tensor,
+                    input_inv_s,
+                    b_descale,
+                    alpha,
+                    res_dtype,
+                    None,  # out
+                    block_size,
+                    not use_128x4_sf_layout,
+                    backend,
+                    use_nvfp4,
+                )
+        except Exception as e:
+            print(
+                f"[INFO] {backend} backend does not support this configuration: {type(e).__name__}: {e}"
+            )
+            backends_to_remove.append(backend)
+
+    # Remove unsupported backends
+    for backend in backends_to_remove:
+        backends.remove(backend)
+
+    if len(backends) == 0:
+        print("[ERROR] No backends passed validation. Exiting.")
+        return
 
     def run_backend(backend):
         if backend in ["cudnn", "trtllm", "cutlass", "auto"]:
@@ -924,12 +940,11 @@ def testMmFp4(args):
             args.dry_run_iters if args.dry_run_iters and args.dry_run_iters > 0 else 10
         )
         for cur_backend in backends:
-            if cur_backend in autotune_supported_backends:
-                if args.verbose >= 1:
-                    print(f"[INFO] Autotune warmup for mm_fp4: {warmup_iters} iters")
-                with autotune(True):
-                    for _ in range(warmup_iters):
-                        run_backend(cur_backend)
+            if args.verbose >= 1:
+                print(f"[INFO] Autotune warmup for mm_fp4: {warmup_iters} iters")
+            with autotune(True):
+                for _ in range(warmup_iters):
+                    run_backend(cur_backend)
 
     # Storage for timing results and outputs
     backend_times = {backend: [] for backend in backends}
