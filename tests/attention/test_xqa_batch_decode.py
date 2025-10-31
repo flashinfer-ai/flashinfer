@@ -228,8 +228,8 @@ def get_last_page_len(seq_lens, page_size):
 @pytest.mark.parametrize(
     "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size",
     [
-        (4, 1, 16, 2, 2),
-        (4, 1, 32, 2, 4),
+        (4, 1, 16, 2, 1),
+        (4, 1, 32, 2, 5),
         (128, 1, 64, 2, 6),
         (256, 1, 64, 4, 8),
     ],

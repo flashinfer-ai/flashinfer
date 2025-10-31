@@ -21,7 +21,7 @@ from typing import Any, List, Literal, Optional, Tuple, Union, overload
 
 import torch
 
-from .xqa import xqa, xqa_mla
+from .xqa import xqa
 from .cudnn import cudnn_batch_decode_with_kv_cache as cudnn_batch_decode_with_kv_cache
 from .jit import (
     gen_batch_decode_mla_module,
@@ -2517,69 +2517,28 @@ def trtllm_batch_decode_with_kv_cache_mla(
                 "Dynamic scale factors bmm1_scale_tensor and bmm2_scale_tensor are only supported for fp8 tensor core operation"
             )
 
-    # To decide if using xqa_mla to decode, not verified yet
-    if (
-        get_compute_capability(torch.device(device="cuda"))[0] == 12
-        and query.dtype == torch.float8_e4m3fn
-        and kv_cache.dtype == torch.float8_e4m3fn
-        and sinks is None
-    ):
-        workspace_0, workspace_1 = torch.chunk(workspace_buffer, 2, dim=0)
-        if bmm1_scale_log2_tensor is not None and bmm2_scale_tensor is not None:
-            kv_scale_value = bmm2_scale_tensor.item()
-            q_scale_value = (
-                bmm1_scale_log2_tensor.item()
-                / kv_scale_value
-                * ((128 + 64) ** 0.5)
-                * math.log2(math.e)
-            )
-        else:
-            kv_scale_value = bmm2_scale if bmm2_scale is not None else 1.0
-            q_scale_value = (
-                bmm1_scale / kv_scale_value * ((128 + 64) ** 0.5)
-                if bmm1_scale is not None
-                else 1.0
-            )
+    run_func(
+        out,
+        None,  # fp4 output not supported in wrapper api yet.
+        query,
+        kv_cache,
+        kv_cache,
+        workspace_buffer,
+        block_tables,
+        seq_lens,
+        max_seq_len,
+        bmm1_scale,
+        bmm2_scale,
+        -1,  # o_sf_scale
+        -1,  # o_sf_vec_size
+        0,  # o_sf_start_index
+        -1,  # window_left
+        sm_count,
+        enable_pdl,
+        workspace_buffer.numel() * workspace_buffer.element_size(),
+        sinks,
+    )
 
-        xqa_mla(
-            query,
-            kv_cache,
-            kv_cache,
-            block_tables,
-            seq_lens,
-            out,
-            workspace_0,
-            workspace_1,
-            block_size,
-            q_scale=q_scale_value,
-            kv_scale=torch.tensor(
-                [kv_scale_value], dtype=torch.float32, device=query.device
-            ),
-            sm_count=sm_count,
-            enable_pdl=enable_pdl,
-        )
-    else:
-        run_func(
-            out,
-            None,  # fp4 output not supported in wrapper api yet.
-            query,
-            kv_cache,
-            kv_cache,
-            workspace_buffer,
-            block_tables,
-            seq_lens,
-            max_seq_len,
-            bmm1_scale,
-            bmm2_scale,
-            -1,  # o_sf_scale
-            -1,  # o_sf_vec_size
-            0,  # o_sf_start_index
-            -1,  # window_left
-            sm_count,
-            enable_pdl,
-            workspace_buffer.numel() * workspace_buffer.element_size(),
-            sinks,
-        )
     return out
 
 
