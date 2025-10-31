@@ -28,7 +28,7 @@ void xqa_wrapper_mla(int64_t multiProcessorCount, double qScale, TensorView outp
 #endif
                      TensorView kvCachePageList, int64_t maxSeqLen, TensorView seqLen,
                      int64_t batchSize, TensorView kvCacheScale, TensorView semaphores,
-                     TensorView scratch) {
+                     TensorView scratch, bool enable_pdl) {
   auto stream = get_stream(output.device());
 
   launchMLAFlashInfer(multiProcessorCount, 1, qScale,
@@ -44,7 +44,7 @@ void xqa_wrapper_mla(int64_t multiProcessorCount, double qScale, TensorView outp
                       maxSeqLen, reinterpret_cast<uint32_t const*>(seqLen.data_ptr()), batchSize,
                       reinterpret_cast<float const*>(kvCacheScale.data_ptr()),
                       reinterpret_cast<uint32_t*>(semaphores.data_ptr()),
-                      reinterpret_cast<void*>(scratch.data_ptr()), stream);
+                      reinterpret_cast<void*>(scratch.data_ptr()), enable_pdl, stream);
 }
 #else
 
@@ -64,7 +64,7 @@ void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbK
 #if SPEC_DEC
                  int64_t qSeqLen, TensorView qCuSeqLens, TensorView mask,
 #endif
-                 TensorView semaphores, TensorView scratch) {
+                 TensorView semaphores, TensorView scratch, bool enable_pdl) {
   auto stream = get_stream(output.device());
   float const* attentionSinksPtr =
       attentionSinks.has_value() ? reinterpret_cast<float const*>(attentionSinks.value().data_ptr())
@@ -91,6 +91,6 @@ void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbK
            reinterpret_cast<MaskType const*>(mask.data_ptr()),
 #endif
            reinterpret_cast<uint32_t*>(semaphores.data_ptr()),
-           reinterpret_cast<void*>(scratch.data_ptr()), stream);
+           reinterpret_cast<void*>(scratch.data_ptr()), enable_pdl, stream);
 }
 #endif

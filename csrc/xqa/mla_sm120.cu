@@ -1724,7 +1724,7 @@ void launchMLA(
     uint32_t maxSeqLen, uint32_t const* seqLen, uint32_t batchSize,
     float const* __restrict__ kvCacheScale,  // Device memory scalar. Same scale for K and V cache.
                                              // Used only for int8/fp8 KV cache.
-    uint32_t* semaphores, void* scratch, cudaStream_t stream) {
+    uint32_t* semaphores, void* scratch, bool enable_pdl, cudaStream_t stream) {
 #if IS_MLA
   static_assert(
       SLIDING_WINDOW == 0 && LOW_PREC_OUTPUT == 0 && USE_INPUT_KV == 0 && USE_BEAM_SEARCH == 0,
@@ -1762,7 +1762,7 @@ void launchMLA(
   // nbInputSeqSplit
   dim3 const dimGrid{4 * inputSeqLen, nbSubSeqPerSeq, nbKHeads * batchSize};
   dim3 const dimCta{warp_size * 4 * 3, 1, 1};
-  auto const launchCfg = makeLaunchConfig(dimGrid, dimCta, hostSmemSize, stream, ENABLE_PDL != 0);
+  auto const launchCfg = makeLaunchConfig(dimGrid, dimCta, hostSmemSize, stream, enable_pdl);
 #if USE_PAGED_KV_CACHE
   uint32_t const maxNbPagesPerSeq = exactDiv(maxSeqLen, tokensPerPage);
 #if PAGED_KV_CACHE_LAYOUT == 1
@@ -1861,7 +1861,7 @@ void launchMLAFlashInfer(
     uint32_t maxSeqLen, uint32_t const* seqLen, uint32_t batchSize,
     float const* __restrict__ kvCacheScale,  // Device memory scalar. Same scale for K and V cache.
                                              // Used only for int8/fp8 KV cache.
-    uint32_t* semaphores, void* scratch, cudaStream_t stream) {
+    uint32_t* semaphores, void* scratch, bool enable_pdl, cudaStream_t stream) {
 #if IS_MLA
   static_assert(
       SLIDING_WINDOW == 0 && LOW_PREC_OUTPUT == 0 && USE_INPUT_KV == 0 && USE_BEAM_SEARCH == 0,
@@ -1885,7 +1885,7 @@ void launchMLAFlashInfer(
   // nbInputSeqSplit
   dim3 const dimGrid{4 * inputSeqLen, nbSubSeqPerSeq, nbKHeads * batchSize};
   dim3 const dimCta{warp_size * 4 * 3, 1, 1};
-  auto const launchCfg = makeLaunchConfig(dimGrid, dimCta, hostSmemSize, stream, ENABLE_PDL != 0);
+  auto const launchCfg = makeLaunchConfig(dimGrid, dimCta, hostSmemSize, stream, enable_pdl);
 #if USE_PAGED_KV_CACHE
   uint32_t const maxNbPagesPerSeq = exactDiv(maxSeqLen, tokensPerPage);
 #if PAGED_KV_CACHE_LAYOUT == 1

@@ -26,6 +26,7 @@ from .utils import (
     register_custom_op,
     register_fake_op,
     get_compute_capability,
+    device_support_pdl,
 )
 
 
@@ -37,7 +38,6 @@ def get_xqa_module(
     head_dim: int,
     head_group_ratio: int,
     use_sliding_window: bool,
-    enable_pdl: bool,
 ):
     module = gen_xqa_module(
         input_dtype,
@@ -46,11 +46,10 @@ def get_xqa_module(
         head_dim,
         head_group_ratio,
         use_sliding_window,
-        enable_pdl,
     ).build_and_load()
 
     @register_custom_op(
-        f"flashinfer::xqa_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}_enable_pdl_{enable_pdl}",
+        f"flashinfer::xqa_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}",
         mutates_args=("output", "workspace_buffer"),
     )
     def xqa(
@@ -71,6 +70,7 @@ def get_xqa_module(
         kv_scale: torch.Tensor,
         semaphores: torch.Tensor,
         workspace_buffer: torch.Tensor,
+        enable_pdl: bool,
     ) -> None:
         module.xqa_wrapper(
             run_sm90_fp8_mha,
@@ -90,10 +90,11 @@ def get_xqa_module(
             kv_scale,
             semaphores,
             workspace_buffer,
+            enable_pdl,
         )
 
     @register_fake_op(
-        f"flashinfer::xqa_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}_enable_pdl_{enable_pdl}"
+        f"flashinfer::xqa_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}"
     )
     def _fake_xqa(
         run_sm90_fp8_mha: bool,
@@ -137,7 +138,7 @@ def xqa(
     kv_scale: Optional[torch.Tensor] = None,
     sliding_win_size: int = 0,
     sm_count: Optional[int] = None,
-    enable_pdl: bool = True,
+    enable_pdl: Optional[bool] = None,
 ) -> None:
     r"""Apply attention with paged KV cache using XQA kernel.
     Parameters
@@ -189,6 +190,10 @@ def xqa(
     sm_count : Optional[int], default=None
         Number of streaming multiprocessors to use.
         If None, will be inferred from the device.
+    enable_pdl : Optional[bool], default=None
+        Whether to enable PDL (Persistent Data Loader) optimization.
+        If None, will be set to True if hardware supports it.
+
     Note
     ----
     The function automatically infers several parameters from tensor shapes:
@@ -206,6 +211,8 @@ def xqa(
 
     if kv_scale is None:
         kv_scale = torch.ones(1, dtype=torch.float32, device=q.device)
+
+    enable_pdl = enable_pdl if enable_pdl is not None else device_support_pdl(q.device)
 
     # Infer parameters from tensors
     batch_size = q.shape[0]
@@ -242,7 +249,6 @@ def xqa(
         head_dim,
         head_group_ratio,
         use_sliding_window,
-        enable_pdl,
     )
     xqa_module.xqa(
         run_sm90_fp8_mha,
@@ -262,6 +268,7 @@ def xqa(
         kv_scale,
         semaphores,
         workspace_buffer,
+        enable_pdl,
     )
 
 
@@ -273,7 +280,6 @@ def get_xqa_module_mla(
     head_dim: int,
     head_group_ratio: int,
     use_sliding_window: bool = False,
-    enable_pdl: bool = True,
 ):
     module = gen_xqa_module_mla(
         input_dtype,
@@ -282,11 +288,10 @@ def get_xqa_module_mla(
         head_dim,
         head_group_ratio,
         use_sliding_window,
-        enable_pdl,
     ).build_and_load()
 
     @register_custom_op(
-        f"flashinfer::xqa_mla_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}_enable_pdl_{enable_pdl}",
+        f"flashinfer::xqa_mla_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}",
         mutates_args=("output", "workspace_buffer"),
     )
     def xqa_mla(
@@ -303,6 +308,7 @@ def get_xqa_module_mla(
         kv_scale: torch.Tensor,
         semaphores: torch.Tensor,
         workspace_buffer: torch.Tensor,
+        enable_pdl: bool,
     ) -> None:
         module.xqa_wrapper_mla(
             sm_count,
@@ -318,10 +324,11 @@ def get_xqa_module_mla(
             kv_scale,
             semaphores,
             workspace_buffer,
+            enable_pdl,
         )
 
     @register_fake_op(
-        f"flashinfer::xqa_mla_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}_enable_pdl_{enable_pdl}"
+        f"flashinfer::xqa_mla_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}"
     )
     def _fake_xqa_mla(
         sm_count: int,
@@ -337,6 +344,7 @@ def get_xqa_module_mla(
         kv_scale: torch.Tensor,
         semaphores: torch.Tensor,
         workspace_buffer: torch.Tensor,
+        enable_pdl: bool,
     ) -> None:
         pass
 
@@ -358,7 +366,7 @@ def xqa_mla(
     q_scale: float = 1.0,
     kv_scale: Optional[torch.Tensor] = None,
     sm_count: Optional[int] = None,
-    enable_pdl: bool = True,
+    enable_pdl: Optional[bool] = None,
 ) -> None:
     r"""Apply attention with paged KV cache using XQA MLA (Multi-Head Latent Attention) kernel.
     Parameters
@@ -400,6 +408,10 @@ def xqa_mla(
     sm_count : Optional[int], default=None
         Number of streaming multiprocessors to use.
         If None, will be inferred from the device.
+    enable_pdl : Optional[bool], default=None
+        Whether to enable PDL (Persistent Data Loader) optimization.
+        If None, will be set to True if hardware supports it.
+
     Note
     ----
     The function automatically infers several parameters from tensor shapes:
@@ -414,6 +426,8 @@ def xqa_mla(
 
     if kv_scale is None:
         kv_scale = torch.ones(1, dtype=torch.float32, device=q.device)
+
+    enable_pdl = enable_pdl if enable_pdl is not None else device_support_pdl(q.device)
 
     # Infer parameters from tensors
     batch_size = q.shape[0]
@@ -438,7 +452,6 @@ def xqa_mla(
         head_dim,
         head_group_ratio,
         False,
-        enable_pdl,
     )
     xqa_module.xqa_mla(
         sm_count,
@@ -454,4 +467,5 @@ def xqa_mla(
         kv_scale,
         semaphores,
         workspace_buffer,
+        enable_pdl,
     )

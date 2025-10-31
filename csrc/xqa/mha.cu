@@ -2548,7 +2548,7 @@ void launchMHA(
 #if SPEC_DEC
     SpecDecParams const& specDecParams,
 #endif
-    uint32_t* semaphores, void* scratch, cudaStream_t stream) {
+    uint32_t* semaphores, void* scratch, bool enable_pdl, cudaStream_t stream) {
 #if SPEC_DEC
   auto const qSeqLen = specDecParams.qSeqLen;
   auto const qCuSeqLens = specDecParams.qCuSeqLens;
@@ -2590,7 +2590,7 @@ void launchMHA(
   dim3 const dimGrid{nbSubSeqPerSeq, nbKHeads, batchSize};
 #endif
   dim3 const dimCta{warp_size * ctaShapeInWarps.x, ctaShapeInWarps.y, ctaShapeInWarps.z};
-  auto const launchCfg = makeLaunchConfig(dimGrid, dimCta, hostSmemSize, stream, ENABLE_PDL != 0);
+  auto const launchCfg = makeLaunchConfig(dimGrid, dimCta, hostSmemSize, stream, enable_pdl);
 #if USE_PAGED_KV_CACHE
   uint32_t const maxNbPagesPerSeq = exactDiv(maxSeqLen, tokensPerPage);
 #if PAGED_KV_CACHE_LAYOUT == 1
@@ -2681,7 +2681,8 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
 #if SPEC_DEC
                          uint32_t qSeqLen, uint32_t const* qCuSeqLens, MaskType const* mask,
 #endif
-                         uint32_t* semaphores, void* scratch, cudaStream_t stream) {
+                         uint32_t* semaphores, void* scratch, bool enable_pdl,
+                         cudaStream_t stream) {
   uint32_t const nbSubSeqPerSeq = [&]() -> uint32_t {
     if (!allowMultiBlockMode) {
       return 1;
@@ -2696,7 +2697,7 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
   dim3 const dimGrid{nbSubSeqPerSeq, nbKHeads, batchSize};
 #endif
   dim3 const dimCta{warp_size * ctaShapeInWarps.x, ctaShapeInWarps.y, ctaShapeInWarps.z};
-  auto const launchCfg = makeLaunchConfig(dimGrid, dimCta, hostSmemSize, stream, ENABLE_PDL != 0);
+  auto const launchCfg = makeLaunchConfig(dimGrid, dimCta, hostSmemSize, stream, enable_pdl);
 #if USE_PAGED_KV_CACHE
   uint32_t const maxNbPagesPerSeq = exactDiv(maxSeqLen, tokensPerPage);
 #if PAGED_KV_CACHE_LAYOUT == 1

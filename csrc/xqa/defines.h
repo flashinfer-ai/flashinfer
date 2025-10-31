@@ -129,7 +129,16 @@ static_assert(SPEC_DEC, "SPEC_Q_SEQ_LEN should only be used when SPEC_DEC is ena
 // 1 - naive PDL
 // 2 - aggressive PDL (implemented only in mha_sm90.cu for now)
 #ifndef ENABLE_PDL
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#if __CUDA_ARCH__ == 900
 #define ENABLE_PDL 2
+#else
+#define ENABLE_PDL 1
+#endif
+#else
+/* default for host or older architectures */
+#define ENABLE_PDL 0
+#endif
 #endif
 
 #ifndef USE_INPUT_KV

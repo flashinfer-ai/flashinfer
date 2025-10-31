@@ -128,7 +128,7 @@ void launchMHA(
 #if SPEC_DEC
     SpecDecParams const& specDecParams,
 #endif
-    uint32_t* semaphores, void* scratch, cudaStream_t stream);
+    uint32_t* semaphores, void* scratch, bool enable_pdl, cudaStream_t stream);
 
 void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32_t slidingWinSize,
                          float qScale, OutputHead* output,
@@ -147,7 +147,7 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
 #if SPEC_DEC
                          uint32_t qSeqLen, uint32_t const* qCuSeqLens, MaskType const* mask,
 #endif
-                         uint32_t* semaphores, void* scratch, cudaStream_t stream);
+                         uint32_t* semaphores, void* scratch, bool enable_pdl, cudaStream_t stream);
 
 void launchHopperF8MHA(
     cudaDeviceProp const& prop, uint32_t nbKHeads,
@@ -189,7 +189,7 @@ void launchHopperF8MHA(
 #if SPEC_DEC
     SpecDecParams const& specDecParams,
 #endif
-    uint32_t* semaphores, void* scratch, cudaStream_t stream);
+    uint32_t* semaphores, void* scratch, bool enable_pdl, cudaStream_t stream);
 
 void launchHopperF8MHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads,
                                  uint32_t slidingWinSize, float qScale, OutputHead* output,
@@ -208,7 +208,8 @@ void launchHopperF8MHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads
 #if SPEC_DEC
                                  uint32_t qSeqLen, uint32_t const* qCuSeqLens, MaskType const* mask,
 #endif
-                                 uint32_t* semaphores, void* scratch, cudaStream_t stream);
+                                 uint32_t* semaphores, void* scratch, bool enable_pdl,
+                                 cudaStream_t stream);
 
 void launchMLA(
     cudaDeviceProp const& prop,
@@ -230,7 +231,7 @@ void launchMLA(
     uint32_t maxSeqLen, uint32_t const* seqLen, uint32_t batchSize,
     float const* __restrict__ kvCacheScale,  // Device memory scalar. Same scale for K and V cache.
                                              // Used only for int8/fp8 KV cache.
-    uint32_t* semaphores, void* scratch, cudaStream_t stream);
+    uint32_t* semaphores, void* scratch, bool enable_pdl, cudaStream_t stream);
 
 void launchMLAFlashInfer(
     uint32_t multiProcessorCount,
@@ -248,7 +249,7 @@ void launchMLAFlashInfer(
     uint32_t maxSeqLen, uint32_t const* seqLen, uint32_t batchSize,
     float const* __restrict__ kvCacheScale,  // Device memory scalar. Same scale for K and V cache.
                                              // Used only for int8/fp8 KV cache.
-    uint32_t* semaphores, void* scratch, cudaStream_t stream);
+    uint32_t* semaphores, void* scratch, bool enable_pdl, cudaStream_t stream);
 
 #if STATIC_NB_K_HEADS
 constexpr uint32_t nbKHeads = NB_K_HEADS;

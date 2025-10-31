@@ -25,7 +25,7 @@ void xqa_wrapper_mla(int64_t multiProcessorCount, double qScale, TensorView outp
 #endif
                      TensorView kvCachePageList, int64_t maxSeqLen, TensorView seqLen,
                      int64_t batchSize, TensorView kvCacheScale, TensorView semaphores,
-                     TensorView scratch);
+                     TensorView scratch, bool enable_pdl);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(xqa_wrapper_mla, xqa_wrapper_mla);
 
@@ -47,7 +47,7 @@ void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbK
 #if SPEC_DEC
                  int64_t qSeqLen, TensorView qCuSeqLens, TensorView mask,
 #endif
-                 TensorView semaphores, TensorView scratch);
+                 TensorView semaphores, TensorView scratch, bool enable_pdl);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(xqa_wrapper, xqa_wrapper);
 

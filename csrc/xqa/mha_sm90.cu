@@ -3036,7 +3036,7 @@ void launchHopperF8MHA(
 #if SPEC_DEC
     SpecDecParams const& specDecParams,
 #endif
-    uint32_t* semaphores, void* scratch, cudaStream_t stream) {
+    uint32_t* semaphores, void* scratch, bool enable_pdl, cudaStream_t stream) {
   if (beamWidth != 1) {
     throw std::runtime_error("not implemented");
   }
@@ -3073,7 +3073,7 @@ void launchHopperF8MHA(
   // nbInputSeqSplit
   dim3 const dimGrid{divUp(qSeqLen, inputTokensPerCta), nbSubSeqPerSeq, nbKHeads * batchSize};
   dim3 const dimCta{warp_size * gmmaWarpsPerGrp, 1, 3};
-  auto const launchCfg = makeLaunchConfig(dimGrid, dimCta, hostSmemSize, stream, ENABLE_PDL != 0);
+  auto const launchCfg = makeLaunchConfig(dimGrid, dimCta, hostSmemSize, stream, enable_pdl);
 #if USE_PAGED_KV_CACHE
   uint32_t const maxNbPagesPerSeq = exactDiv(maxSeqLen, tokensPerPage);
   auto const dtype = [] {
@@ -3194,7 +3194,8 @@ void launchHopperF8MHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads
 #if SPEC_DEC
                                  uint32_t qSeqLen, uint32_t const* qCuSeqLens, MaskType const* mask,
 #endif
-                                 uint32_t* semaphores, void* scratch, cudaStream_t stream) {
+                                 uint32_t* semaphores, void* scratch, bool enable_pdl,
+                                 cudaStream_t stream) {
   uint32_t const nbSubSeqPerSeq = [&]() -> uint32_t {
     float const factor = 0.25f;
     return mha::min<uint32_t>(
@@ -3210,7 +3211,7 @@ void launchHopperF8MHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads
 #endif
   dim3 const dimGrid{divUp(qLen, inputTokensPerCta), nbSubSeqPerSeq, nbKHeads * batchSize};
   dim3 const dimCta{warp_size * gmmaWarpsPerGrp, 1, 3};
-  auto const launchCfg = makeLaunchConfig(dimGrid, dimCta, hostSmemSize, stream, ENABLE_PDL != 0);
+  auto const launchCfg = makeLaunchConfig(dimGrid, dimCta, hostSmemSize, stream, enable_pdl);
 #if USE_PAGED_KV_CACHE
   uint32_t const maxNbPagesPerSeq = exactDiv(maxSeqLen, tokensPerPage);
   auto const dtype = [] {
