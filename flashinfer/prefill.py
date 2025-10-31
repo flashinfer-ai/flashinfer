@@ -195,6 +195,7 @@ def get_trtllm_gen_prefill_module():
         batch_size: int,
         cum_seq_lens_q: torch.Tensor,
         cum_seq_lens_kv: torch.Tensor,
+        kv_layout_code: int,
         enable_pdl: bool,
         workspace_size: int,
         window_left: int = -1,
@@ -231,6 +232,7 @@ def get_trtllm_gen_prefill_module():
             cum_seq_lens_q,
             cum_seq_lens_kv,
             sm_count,
+            kv_layout_code,
             enable_pdl,
             workspace_size,
             sinks,
@@ -3329,6 +3331,7 @@ def trtllm_batch_context_with_kv_cache(
     out_dtype: Optional[Union[torch.dtype, str]] = None,
     o_sf_scale: Optional[float] = None,
     o_sf_vec_size: Optional[int] = None,
+    kv_layout: str = "HND",
     enable_pdl: Optional[bool] = None,
     sinks: Optional[List[torch.Tensor]] = None,
 ) -> Union[torch.Tensor, FP4Tensor]:
@@ -3338,8 +3341,11 @@ def trtllm_batch_context_with_kv_cache(
     query : torch.Tensor
         query tensor with shape [num_tokens, num_heads, head_dim]
     kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
-        If kv_cache is a single tensor, it should be a tensor with shape [num_pages, 1 or 2, num_kv_heads, page_size, head_dim]
-        If kv_cache is a tuple of two tensors, it should be a tuple of two tensors with shape [num_pages, num_kv_heads, page_size, head_dim]
+        If kv_cache is a single tensor, it should be a tensor with shape [num_pages, 1 or 2, num_kv_heads, page_size, head_dim] if :attr:`kv_layout` is "HND",
+        or [num_pages, 1 or 2, page_size, num_kv_heads, head_dim] if :attr:`kv_layout` is "NHD".
+        If kv_cache is a tuple of two tensors, it should be a tuple of two tensors with shape [num_pages, num_kv_heads, page_size, head_dim] if :attr:`kv_layout` is "HND",
+        or [num_pages, page_size, num_kv_heads, head_dim] if :attr:`kv_layout` is "NHD".
+        The first tensor is the key cache, the second tensor is the value cache.
     workspace_buffer : torch.Tensor. Must be initialized to 0 for its first use.
         workspace
     block_tables : torch.Tensor
@@ -3371,6 +3377,11 @@ def trtllm_batch_context_with_kv_cache(
         scale for nvfp4 output tensor scale factor.
     o_sf_vec_size : Optional[int] = None
         vector size for nvfp4 output tensor scale factor.
+    enable_pdl : Optional[bool] = None
+        Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
+        Defaults to ``None``, which means it will be enabled if the device supports PDL.
+    kv_layout : str = "HND"
+        Layout of kv-cache, can be "HND" or "NHD", default is "HND".
     sinks : Optional[List[torch.Tensor]] = None
         additional value per head in the denominator of the softmax.
 
@@ -3500,6 +3511,7 @@ def trtllm_batch_context_with_kv_cache(
         cum_seq_lens_q,
         cum_seq_lens_kv,
         sm_count,
+        kv_layout,
         enable_pdl,
         workspace_size,
         sinks,

@@ -1877,6 +1877,7 @@ class TrtllmGenDecodeModule:
         bmm2_scale: float,
         workspace_size: int,
         window_left: int = -1,
+        kv_layout_code: int = TensorLayout.HND.value,
         enable_pdl: bool = None,
         out: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
@@ -1910,6 +1911,7 @@ class TrtllmGenDecodeModule:
             0,  # o_sf_start_index
             window_left,
             self._sm_count,
+            kv_layout_code,
             enable_pdl,
             workspace_size,
             sinks,
@@ -1997,6 +1999,7 @@ def get_trtllm_gen_decode_module(*args):
             1.0,  # NOTE(Siyuan): update this to expose bmm2 scale
             workspace_size,
             window_left,
+            layout,
             enable_pdl,
             out=o,
             sinks=sinks,
@@ -2067,6 +2070,7 @@ def trtllm_batch_decode_with_kv_cache(
     o_sf_scale: Optional[float] = None,
     o_sf_vec_size: Optional[int] = None,
     sinks: Optional[List[torch.Tensor]] = None,
+    kv_layout: str = "HND",
     enable_pdl: bool = None,
     q_len_per_req: Optional[int] = 1,
 ) -> Union[torch.Tensor, FP4Tensor]:
@@ -2077,8 +2081,11 @@ def trtllm_batch_decode_with_kv_cache(
         query tensor with shape [num_tokens, num_heads, head_dim], num_tokens = batch_size * q_len_per_request
 
     kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
-        If kv_cache is a single tensor, it should be a tensor with shape [num_pages, 1 or 2, num_kv_heads, page_size, head_dim]
-        If kv_cache is a tuple of two tensors, it should be a tuple of two tensors with shape [num_pages, num_kv_heads, page_size, head_dim]
+        If kv_cache is a single tensor, it should be a tensor with shape [num_pages, 1 or 2, num_kv_heads, page_size, head_dim] if :attr:`kv_layout` is ``HND``,
+        or [num_pages, 1 or 2, page_size, num_kv_heads, head_dim] if :attr:`kv_layout` is ``NHD``.
+        If kv_cache is a tuple of two tensors, it should be a tuple of two tensors with shape [num_pages, num_kv_heads, page_size, head_dim] if :attr:`kv_layout` is ``HND``,
+        or [num_pages, page_size, num_kv_heads, head_dim] if :attr:`kv_layout` is ``NHD``.
+        The first tensor is the key cache, and the second tensor is the value cache.
 
     workspace_buffer : torch.Tensor. Must be initialized to 0 for its first use.
         workspace
@@ -2116,6 +2123,10 @@ def trtllm_batch_decode_with_kv_cache(
 
     sinks : Optional[List[torch.Tensor]] = None
         additional value per head in the denominator of the softmax.
+
+    kv_layout : str = "HND"
+        The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
+        Defaults to ``HND``.
 
     enable_pdl : bool
         Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
@@ -2242,6 +2253,7 @@ def trtllm_batch_decode_with_kv_cache(
         o_sf_start_index,
         window_left,
         sm_count,
+        TensorLayout[kv_layout].value,
         enable_pdl,
         workspace_buffer.numel() * workspace_buffer.element_size(),
         sinks,
