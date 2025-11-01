@@ -618,6 +618,7 @@ def test_trtllm_batch_prefill_bs1(
     )
 
 
+@pytest.mark.parametrize("backend", ["trtllm-gen", "xqa"])
 @pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
 @pytest.mark.parametrize(
     "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size",
@@ -659,6 +660,7 @@ def test_trtllm_batch_prefill_bs1(
 @pytest.mark.parametrize("enable_sink", [True, False])
 @pytest.mark.parametrize("max_in_kv_len", [110])
 def test_trtllm_batch_decode(
+    backend,
     kv_layout,
     batch_size,
     q_len_per_req,
@@ -674,8 +676,25 @@ def test_trtllm_batch_decode(
     max_in_kv_len,
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
-    if compute_capability[0] != 10:
-        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+
+    # Check GPU architecture requirements for different backends
+    if backend == "trtllm-gen" and compute_capability[0] != 10:
+        pytest.skip("trtllm-gen backend requires SM100 and SM103 GPUs.")
+    if backend == "xqa" and compute_capability[0] < 9:
+        pytest.skip("xqa backend requires SM90+ GPUs.")
+
+    # xqa backend doesn't support nvfp4 output
+    if backend == "xqa" and o_dtype == "nvfp4":
+        pytest.skip("xqa backend does not support nvfp4 output")
+
+    if backend == "xqa" and q_dtype == "fp8":
+        pytest.skip("xqa backend only supports fp16 and bf16 query")
+
+    # xqa backend doesn't support speculative decoding yet
+    if backend == "xqa" and q_len_per_req > 1:
+        pytest.skip(
+            "xqa backend does not support speculative decoding (q_len_per_req > 1) yet"
+        )
 
     if o_dtype == "nvfp4" and q_len_per_req > 1:
         # todo(Yingyi): add support for nvfp4 with speculative decoding
@@ -794,7 +813,7 @@ def test_trtllm_batch_decode(
             kv_indptr=kv_indptr_tokens,
         )
 
-    # Run trtllm-gen function call
+    # Run decode function call with specified backend
     output = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
         q.contiguous(),
         kv_cache,
@@ -812,11 +831,13 @@ def test_trtllm_batch_decode(
         sinks=(sink if enable_sink else None),
         kv_layout=kv_layout,
         enable_pdl=enable_pdl,
+        backend=backend,
         q_len_per_req=q_len_per_req,
     )
-    # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
-    # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
-    assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()
+    if backend == "trtllm-gen":
+        # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
+        # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
+        assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()
 
     if o_dtype == "nvfp4":
         output, output_ref = unpack_compare_nvfp4(
@@ -830,6 +851,10 @@ def test_trtllm_batch_decode(
         rtol, atol = 4e-2, 7e-2
     else:
         rtol, atol = 1e-2, 1e-2
+
+    if backend == "xqa" and kv_dtype == "fp8":
+        atol = 1e-1
+        rtol = 1e-1
 
     # convert to float32 for fp8 is not supported by assert_close
     # relax rtol and atol for speculative decoding test
@@ -850,7 +875,10 @@ def test_trtllm_batch_decode(
         max_mismatched_elements=max_mismatched_elements,
     )
 
-    if o_dtype != "nvfp4":  # wrapper api does not support fp4 output yet.
+    # Only test wrapper with trtllm-gen backend
+    if (
+        o_dtype != "nvfp4" and backend == "trtllm-gen"
+    ):  # wrapper api does not support fp4 output yet.
         # test wrapper with trtllm-gen backend
         wrapper_trtllm_gen = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
             workspace_buffer, kv_layout, backend="trtllm-gen"

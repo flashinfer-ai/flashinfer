@@ -2074,7 +2074,8 @@ def trtllm_batch_decode_with_kv_cache(
     o_sf_vec_size: Optional[int] = None,
     sinks: Optional[List[torch.Tensor]] = None,
     kv_layout: str = "HND",
-    enable_pdl: bool = None,
+    enable_pdl: Optional[bool] = None,
+    backend: str = "auto",
     q_len_per_req: Optional[int] = 1,
 ) -> Union[torch.Tensor, FP4Tensor]:
     """
@@ -2131,9 +2132,15 @@ def trtllm_batch_decode_with_kv_cache(
         The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
         Defaults to ``HND``.
 
-    enable_pdl : bool
+    enable_pdl : Optional[bool] = None
         Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
-        Only supported for >= sm90, and currently only for FA2, CUDA core, and trtllm-gen decode.
+        When set to ``None``, the backend will be chosen based on the device architecture and kernel availability.
+
+    backend : str = "auto"
+        The implementation backend, could be ``auto``/``xqa`` or ``trtllm-gen``. Defaults to ``auto``.
+        When set to ``auto``, the backend will be chosen based on the device architecture and kernel availability.
+        For sm_100 and sm_103 (blackwell architecture), ``auto`` will choose ``trtllm-gen`` backend.
+        For sm_90 and sm_91 (ampere architecture), ``auto`` will choose ``xqa`` backend.
 
     Returns
     -------
@@ -2155,123 +2162,166 @@ def trtllm_batch_decode_with_kv_cache(
             # it doesn't change underlying storage
             k_cache, v_cache = kv_cache.unbind(dim=1)
 
-    # Convert HND layout to NHD if necessary (transpose only changes stride, not data)
-    if kv_layout == "HND":
-        # For HND: [..., H, N, D] -> NHD: [..., N, H, D]
-        k_cache = k_cache.transpose(-3, -2)
-        v_cache = v_cache.transpose(-3, -2)
-
-    run_func = get_trtllm_gen_fmha_module().trtllm_paged_attention_decode
-    sm_count = get_device_sm_count(query.device)
-
-    if out_dtype == "nvfp4" or (out_dtype is None and isinstance(out, FP4Tensor)):
-        assert query.dtype == torch.float8_e4m3fn, (
-            "query must be fp8 when out_dtype is nvfp4."
-        )
-        assert o_sf_scale is not None
-        assert o_sf_vec_size in [None, 16], "only o_sf_vec_size = 16 is supported"
-        o_sf_vec_size = o_sf_vec_size or 16
-
-        fp4_out_shape = query.shape[:-1] + (ceil_div(query.shape[-1], 2),)
-
-        if isinstance(out, FP4Tensor):
-            fp4_out_scale_shape = (
-                out.scale.shape[0],
-                round_up(query.shape[1] * query.shape[2] // o_sf_vec_size, 4),
-            )
-            out_scale_factor = out.scale
-            o_sf_start_index = out.scale_start_index
-            out = out.data
-            # out_dtype may be None
-            out_dtype = out_dtype or "nvfp4"
-        elif out is None:
-            fp4_out_scale_shape = (
-                round_up(query.shape[0], 128),
-                round_up(query.shape[1] * query.shape[2] // o_sf_vec_size, 4),
-            )
-            out_scale_factor = torch.empty(
-                fp4_out_scale_shape, dtype=torch.float8_e4m3fn, device=query.device
-            )
-            o_sf_start_index = 0
-            out = torch.empty(fp4_out_shape, dtype=torch.uint8, device=query.device)
-        else:
-            raise ValueError(f"Invalid out: {out}")
-
-        assert out_dtype == "nvfp4"
-        assert isinstance(out, torch.Tensor)
-
-        # Use uint8 as the container dtype to compliant with next fp4 gemm.
-        check_shape_dtype_device(out, fp4_out_shape, torch.uint8, query.device, "out")
-
-        check_shape_dtype_device(
-            out_scale_factor,
-            fp4_out_scale_shape,
-            torch.float8_e4m3fn,
-            query.device,
-            "out_scale_factor",
+    if backend == "auto":
+        backend = (
+            "trtllm-gen" if get_compute_capability(query.device)[0] == 10 else "xqa"
         )
 
-        # Check o_sf_start_index is valid
-        if (
-            o_sf_start_index < 0
-            or o_sf_start_index + out.shape[0] > out_scale_factor.shape[0]
-        ):
-            raise ValueError(
-                f"o_sf_start_index is out of the valid range of out_scale_factor. "
-                f"o_sf_start_index={o_sf_start_index}, out.shape[0]={out.shape[0]}, "
-                f"out_scale_factor.shape[0]={out_scale_factor.shape[0]}"
-            )
+    if backend == "xqa":
+        # xqa backend doesn't support nvfp4 output
+        if out_dtype == "nvfp4" or (out_dtype is None and isinstance(out, FP4Tensor)):
+            raise ValueError("xqa backend does not support nvfp4 output")
+        if o_sf_scale is not None or o_sf_vec_size is not None:
+            raise ValueError("xqa backend does not support o_sf_scale or o_sf_vec_size")
 
-    elif isinstance(out_dtype, torch.dtype) or out_dtype is None:
-        assert o_sf_scale is None
-        assert o_sf_vec_size is None
-        out_scale_factor = None
-        o_sf_start_index = 0
+        # Handle out and out_dtype
         if out_dtype is None:
             out_dtype = out.dtype if out is not None else query.dtype
-        out = out if out is not None else torch.empty_like(query, dtype=out_dtype)
-        if out_dtype not in (query.dtype, torch.float16, torch.bfloat16):
-            raise ValueError(f"Unsupported out_dtype: {out_dtype}")
-        check_shape_dtype_device(out, query.shape, out_dtype, query.device, "out")
+        if out is None:
+            out = torch.empty_like(query, dtype=out_dtype)
+
+        # Call xqa_batch_decode_with_kv_cache
+        return xqa_batch_decode_with_kv_cache(
+            query=query,
+            kv_cache=(k_cache, v_cache),
+            workspace_buffer=workspace_buffer,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            max_seq_len=max_seq_len,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            window_left=window_left,
+            out=out,
+            sinks=sinks,
+            kv_layout=kv_layout,
+            enable_pdl=enable_pdl,
+            q_len_per_req=q_len_per_req,
+        )
+    elif backend == "trtllm-gen":
+        # Convert HND layout to NHD if necessary (transpose only changes stride, not data)
+        if kv_layout == "HND":
+            # For HND: [..., H, N, D] -> NHD: [..., N, H, D]
+            k_cache = k_cache.transpose(-3, -2)
+            v_cache = v_cache.transpose(-3, -2)
+
+        run_func = get_trtllm_gen_fmha_module().trtllm_paged_attention_decode
+        sm_count = get_device_sm_count(query.device)
+
+        if out_dtype == "nvfp4" or (out_dtype is None and isinstance(out, FP4Tensor)):
+            assert query.dtype == torch.float8_e4m3fn, (
+                "query must be fp8 when out_dtype is nvfp4."
+            )
+            assert o_sf_scale is not None
+            assert o_sf_vec_size in [None, 16], "only o_sf_vec_size = 16 is supported"
+            o_sf_vec_size = o_sf_vec_size or 16
+
+            fp4_out_shape = query.shape[:-1] + (ceil_div(query.shape[-1], 2),)
+
+            if isinstance(out, FP4Tensor):
+                fp4_out_scale_shape = (
+                    out.scale.shape[0],
+                    round_up(query.shape[1] * query.shape[2] // o_sf_vec_size, 4),
+                )
+                out_scale_factor = out.scale
+                o_sf_start_index = out.scale_start_index
+                out = out.data
+                # out_dtype may be None
+                out_dtype = out_dtype or "nvfp4"
+            elif out is None:
+                fp4_out_scale_shape = (
+                    round_up(query.shape[0], 128),
+                    round_up(query.shape[1] * query.shape[2] // o_sf_vec_size, 4),
+                )
+                out_scale_factor = torch.empty(
+                    fp4_out_scale_shape, dtype=torch.float8_e4m3fn, device=query.device
+                )
+                o_sf_start_index = 0
+                out = torch.empty(fp4_out_shape, dtype=torch.uint8, device=query.device)
+            else:
+                raise ValueError(f"Invalid out: {out}")
+
+            assert out_dtype == "nvfp4"
+            assert isinstance(out, torch.Tensor)
+
+            # Use uint8 as the container dtype to compliant with next fp4 gemm.
+            check_shape_dtype_device(
+                out, fp4_out_shape, torch.uint8, query.device, "out"
+            )
+
+            check_shape_dtype_device(
+                out_scale_factor,
+                fp4_out_scale_shape,
+                torch.float8_e4m3fn,
+                query.device,
+                "out_scale_factor",
+            )
+
+            # Check o_sf_start_index is valid
+            if (
+                o_sf_start_index < 0
+                or o_sf_start_index + out.shape[0] > out_scale_factor.shape[0]
+            ):
+                raise ValueError(
+                    f"o_sf_start_index is out of the valid range of out_scale_factor. "
+                    f"o_sf_start_index={o_sf_start_index}, out.shape[0]={out.shape[0]}, "
+                    f"out_scale_factor.shape[0]={out_scale_factor.shape[0]}"
+                )
+
+        elif isinstance(out_dtype, torch.dtype) or out_dtype is None:
+            assert o_sf_scale is None
+            assert o_sf_vec_size is None
+            out_scale_factor = None
+            o_sf_start_index = 0
+            if out_dtype is None:
+                out_dtype = out.dtype if out is not None else query.dtype
+            out = out if out is not None else torch.empty_like(query, dtype=out_dtype)
+            if out_dtype not in (query.dtype, torch.float16, torch.bfloat16):
+                raise ValueError(f"Unsupported out_dtype: {out_dtype}")
+            check_shape_dtype_device(out, query.shape, out_dtype, query.device, "out")
+        else:
+            raise ValueError(f"Invalid out_dtype: {out_dtype}")
+
+        bmm1_scale = (
+            bmm1_scale.item() if isinstance(bmm1_scale, torch.Tensor) else bmm1_scale
+        )
+        bmm2_scale = (
+            bmm2_scale.item() if isinstance(bmm2_scale, torch.Tensor) else bmm2_scale
+        )
+
+        run_func(
+            out,
+            out_scale_factor,
+            query.view(
+                query.size(0) // q_len_per_req,
+                q_len_per_req,
+                query.size(1),
+                query.size(2),
+            ),
+            k_cache,
+            v_cache,
+            workspace_buffer,
+            block_tables,
+            seq_lens,
+            max_seq_len,
+            bmm1_scale,
+            bmm2_scale,
+            o_sf_scale or -1.0,
+            o_sf_vec_size or -1,
+            o_sf_start_index,
+            window_left,
+            sm_count,
+            enable_pdl,
+            workspace_buffer.numel() * workspace_buffer.element_size(),
+            sinks,
+        )
+
+        return (
+            out
+            if out_dtype != "nvfp4"
+            else FP4Tensor(out, out_scale_factor, o_sf_start_index, query.shape)
+        )
     else:
-        raise ValueError(f"Invalid out_dtype: {out_dtype}")
-
-    bmm1_scale = (
-        bmm1_scale.item() if isinstance(bmm1_scale, torch.Tensor) else bmm1_scale
-    )
-    bmm2_scale = (
-        bmm2_scale.item() if isinstance(bmm2_scale, torch.Tensor) else bmm2_scale
-    )
-
-    run_func(
-        out,
-        out_scale_factor,
-        query.view(
-            query.size(0) // q_len_per_req, q_len_per_req, query.size(1), query.size(2)
-        ),
-        k_cache,
-        v_cache,
-        workspace_buffer,
-        block_tables,
-        seq_lens,
-        max_seq_len,
-        bmm1_scale,
-        bmm2_scale,
-        o_sf_scale or -1.0,
-        o_sf_vec_size or -1,
-        o_sf_start_index,
-        window_left,
-        sm_count,
-        enable_pdl,
-        workspace_buffer.numel() * workspace_buffer.element_size(),
-        sinks,
-    )
-
-    return (
-        out
-        if out_dtype != "nvfp4"
-        else FP4Tensor(out, out_scale_factor, o_sf_start_index, query.shape)
-    )
+        raise KeyError(f"Backend {backend} not supported")
 
 
 # xqa uses NHD layout
