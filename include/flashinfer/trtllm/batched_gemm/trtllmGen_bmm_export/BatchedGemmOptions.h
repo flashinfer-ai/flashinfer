@@ -385,20 +385,26 @@ struct BatchedGemmConfig {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-inline std::string dumpOptions(BatchedGemmOptions const& options) {
+inline std::string dumpOptions(BatchedGemmOptions const& options, bool dumpRuntimeParams = true) {
   std::stringstream ss;
-  ss << gemmGatedAct::dumpOptions(options) << ", ";
-  ss << "mBatchedM={}," << std::endl;
-  ss << "mBatchedN={}," << std::endl;
+  ss << gemmGatedAct::dumpOptions(options, dumpRuntimeParams) << ", ";
+  if (dumpRuntimeParams) {
+    ss << "mBatchedM={}," << std::endl;
+    ss << "mBatchedN={}," << std::endl;
+  }
   ss << "mBatchMode=batchedGemm::BatchedGemmOptions::BatchMode("
      << static_cast<int32_t>(options.mBatchMode) << ")," << std::endl;
   ss << "mFusedAct=" << options.mFusedAct << "," << std::endl;
   ss << "mGridWaitForPrimaryRouting=" << options.mGridWaitForPrimaryRouting << "," << std::endl;
   ss << "mIsStaticBatch=" << options.mIsStaticBatch << "," << std::endl;
-  ss << "mNumBatches=" << options.mNumBatches << "," << std::endl;
+  if (dumpRuntimeParams) {
+    ss << "mNumBatches=" << options.mNumBatches << "," << std::endl;
+  }
   ss << "mNumRegsPerThreadLoadB=" << options.mNumRegsPerThreadLoadB << "," << std::endl;
   ss << "mNumRegsPerThreadLoadSfB=" << options.mNumRegsPerThreadLoadSfB << "," << std::endl;
-  ss << "mNumTokens=" << options.mNumTokens << "," << std::endl;
+  if (dumpRuntimeParams) {
+    ss << "mNumTokens=" << options.mNumTokens << "," << std::endl;
+  }
   ss << "mNumWarpsLoadB=" << options.mNumWarpsLoadB << "," << std::endl;
   ss << "mNumWarpsLoadSfB=" << options.mNumWarpsLoadSfB << "," << std::endl;
   ss << "mRouteImpl=batchedGemm::RouteImpl(" << static_cast<int32_t>(options.mRouteImpl) << "),"

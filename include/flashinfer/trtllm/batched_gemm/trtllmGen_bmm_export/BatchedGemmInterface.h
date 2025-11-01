@@ -625,8 +625,7 @@ class BatchedGemmInterface {
   // Returns the number of available cubin configurations
   size_t getNumBatchedGemmConfigs() const {
 #ifdef TLLM_GEN_EXPORT_INTERFACE
-    return sizeof(tensorrt_llm::kernels::tllmGenBatchedGemmList) /
-           sizeof(tensorrt_llm::kernels::tllmGenBatchedGemmList[0]);
+    return tensorrt_llm::kernels::tllmGenBatchedGemmListLen;
 #else
     return 0;
 #endif

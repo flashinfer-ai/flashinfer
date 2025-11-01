@@ -448,7 +448,7 @@ inline std::string toString(trtllm::gen::MmaKind e) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-inline std::string dumpOptions(GemmOptions const& options) {
+inline std::string dumpOptions(GemmOptions const& options, bool dumpRuntimeParams = true) {
   std::stringstream ss;
   ss << "mAllReduceAlgo="
      << "gemm::AllReduceAlgo(" << static_cast<int32_t>(options.mAllReduceAlgo) << ")"
@@ -496,14 +496,18 @@ inline std::string dumpOptions(GemmOptions const& options) {
   ss << "mGridWaitForPrimaryB=" << options.mGridWaitForPrimaryB << "," << std::endl;
   ss << "mHoistLoadTaskInit=" << options.mHoistLoadTaskInit << "," << std::endl;
   ss << "mHoistMmaTaskTryWaits=" << options.mHoistMmaTaskTryWaits << "," << std::endl;
-  ss << "mK=" << options.mK << "," << std::endl;
+  if (dumpRuntimeParams) {
+    ss << "mK=" << options.mK << "," << std::endl;
+  }
   ss << "mKernelTraits={}"
      << "," << std::endl;
   ss << "mLayoutA=gemm::MatrixLayout(" << static_cast<int32_t>(options.mLayoutA) << ")"
      << "," << std::endl;
   ss << "mLayoutB=gemm::MatrixLayout(" << static_cast<int32_t>(options.mLayoutB) << ")"
      << "," << std::endl;
-  ss << "mM=" << options.mM << "," << std::endl;
+  if (dumpRuntimeParams) {
+    ss << "mM=" << options.mM << "," << std::endl;
+  }
   ss << "mMmaK=" << options.mMmaK << "," << std::endl;
   ss << "mMmaKind="
      << "trtllm::gen::MmaKind(" << static_cast<int32_t>(options.mMmaKind) << ")"
@@ -511,7 +515,9 @@ inline std::string dumpOptions(GemmOptions const& options) {
   ss << "mMmaM=" << options.mMmaM << "," << std::endl;
   ss << "mMmaN=" << options.mMmaN << "," << std::endl;
   ss << "mMockAllReduce=" << options.mMockAllReduce << "," << std::endl;
-  ss << "mN=" << options.mN << "," << std::endl;
+  if (dumpRuntimeParams) {
+    ss << "mN=" << options.mN << "," << std::endl;
+  }
   ss << "mNumEpilogueWarps=" << options.mNumEpilogueWarps << "," << std::endl;
   ss << "mNumRegsCastAWarps=" << options.mNumRegsCastAWarps << "," << std::endl;
   ss << "mNumRegsCopySfLdsSttm=" << options.mNumRegsCopySfLdsSttm << "," << std::endl;
@@ -568,10 +574,12 @@ inline std::string dumpOptions(GemmOptions const& options) {
   ss << "mUseTwoTmaLoadWarps=" << options.mUseTwoTmaLoadWarps << "," << std::endl;
   ss << "mUseTwoMmaWarps=" << options.mUseTwoMmaWarps << "," << std::endl;
   ss << "mUseUnrollLoop2xForMma=" << options.mUseUnrollLoop2xForMma << "," << std::endl;
-  ss << "mValidM=" << options.mValidM << "," << std::endl;
-  ss << "mValidN=" << options.mValidN << "," << std::endl;
-  ss << "mValidK=" << options.mValidK << "," << std::endl;
-  ss << "mWorldSize=" << options.mWorldSize << std::endl;
+  if (dumpRuntimeParams) {
+    ss << "mValidM=" << options.mValidM << "," << std::endl;
+    ss << "mValidN=" << options.mValidN << "," << std::endl;
+    ss << "mValidK=" << options.mValidK << "," << std::endl;
+    ss << "mWorldSize=" << options.mWorldSize << std::endl;
+  }
   return ss.str();
 }
 
@@ -668,6 +676,12 @@ inline bool checkAndUpdateGemmOptions(GemmOptions& options, bool isBlackwell, in
                      "Found validM=",
                      options.mValidM, " validN=", options.mValidN, " validK=", options.mValidK);
   }
+
+#ifdef TLLM_PUBLIC_RELEASE
+  if (options.mDtypeA == tg::Dtype::E2m1 && options.mDtypeMmaA == tg::Dtype::E4m3) {
+    TLLM_CHECK_ERROR(false, "E2m1 x E4m3 is not supported for JIT compile. Use cubins instead.");
+  }
+#endif  // TLLM_PUBLIC_RELEASE
 
   // Check that the A cast is supported.
   // Currently, we only support {MxFp4, NvFp4} -> Bf16.
