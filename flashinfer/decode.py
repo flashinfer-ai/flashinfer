@@ -2287,6 +2287,7 @@ def xqa_batch_decode_with_kv_cache(
     window_left: int = -1,
     out: Optional[torch.Tensor] = None,
     sinks: Optional[torch.Tensor] = None,
+    kv_layout: str = "NHD",
     enable_pdl: bool = None,
     q_len_per_req: Optional[int] = 1,
 ) -> torch.Tensor:
@@ -2297,8 +2298,10 @@ def xqa_batch_decode_with_kv_cache(
         query tensor with shape [num_tokens, num_heads, head_dim], num_tokens = batch_size * q_len_per_request
 
     kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
-        If kv_cache is a single tensor, it should be a tensor with shape [num_pages, 1 or 2, page_size, num_kv_heads, head_dim]
-        If kv_cache is a tuple of two tensors, it should be a tuple of two tensors with shape [num_pages, page_size, num_kv_heads, head_dim]
+        If kv_cache is a single tensor, it should be a tensor with shape [num_pages, 1 or 2, page_size, num_kv_heads, head_dim] if :attr:`kv_layout` is ``NHD``,
+        or [num_pages, 1 or 2, num_kv_heads, page_size, head_dim] if :attr:`kv_layout` is ``HND``.
+        If kv_cache is a tuple of two tensors, it should be a tuple of two tensors with shape [num_pages, page_size, num_kv_heads, head_dim] if :attr:`kv_layout` is ``NHD``,
+        or [num_pages, num_kv_heads, page_size, head_dim] if :attr:`kv_layout` is ``HND``.
 
     workspace_buffer : torch.Tensor. Must be initialized to 0 for its first use.
         workspace
@@ -2327,6 +2330,9 @@ def xqa_batch_decode_with_kv_cache(
 
     sinks : Optional[torch.Tensor] = None
         additional value per head in the denominator of the softmax.
+
+    kv_layout : str
+        The layout of the kv cache. Can be either ``NHD`` or ``HND``. Defaults to ``NHD``.
 
     enable_pdl : bool
         Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
@@ -2363,9 +2369,18 @@ def xqa_batch_decode_with_kv_cache(
         bmm2_scale.item() if isinstance(bmm2_scale, torch.Tensor) else bmm2_scale
     )
 
-    num_kv_heads = k_cache.shape[2]
-    page_size = k_cache.shape[1]
-    head_dim = k_cache.shape[3]
+    # Extract shape parameters based on layout
+    if kv_layout == "NHD":
+        # NHD: [num_pages, page_size, num_kv_heads, head_dim]
+        page_size = k_cache.shape[1]
+        num_kv_heads = k_cache.shape[2]
+        head_dim = k_cache.shape[3]
+    else:  # HND
+        # HND: [num_pages, num_kv_heads, page_size, head_dim]
+        num_kv_heads = k_cache.shape[1]
+        page_size = k_cache.shape[2]
+        head_dim = k_cache.shape[3]
+
     workspace_0, workspace_1 = torch.chunk(workspace_buffer, 2, dim=0)
     kv_scale_value = bmm2_scale
     q_scale_value = bmm1_scale / kv_scale_value * (head_dim**0.5)
@@ -2393,6 +2408,7 @@ def xqa_batch_decode_with_kv_cache(
             [kv_scale_value], dtype=torch.float32, device=query.device
         ),
         sliding_win_size=window_left + 1 if window_left >= 0 else 0,
+        kv_layout=kv_layout,
         sm_count=sm_count,
     )
 

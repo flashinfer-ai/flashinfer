@@ -40,18 +40,24 @@ class CacheSeq:
         nb_heads: int,
         idx_head: int,
         tokens_per_page: int = 32,
+        kv_layout: str = "NHD",
     ):
         self.pool = pool
         self.page_indices = page_indices
         self.nb_heads = nb_heads
         self.idx_head = idx_head
         self.tokens_per_page = tokens_per_page
+        self.kv_layout = kv_layout
 
     def __getitem__(self, i: int) -> torch.Tensor:
         page_idx = self.page_indices[i // self.tokens_per_page].to(torch.int32)
         token_in_page = i % self.tokens_per_page
-        # NHD layout: [page_idx, token_in_page, idx_head, :]
-        return self.pool[page_idx, token_in_page, self.idx_head, :]
+        if self.kv_layout == "NHD":
+            # NHD layout: [page_idx, token_in_page, idx_head, :]
+            return self.pool[page_idx, token_in_page, self.idx_head, :]
+        else:  # HND
+            # HND layout: [page_idx, idx_head, token_in_page, :]
+            return self.pool[page_idx, self.idx_head, token_in_page, :]
 
 
 def ref_attention(
@@ -174,6 +180,7 @@ def ref_attention(
 @pytest.mark.parametrize("tokens_per_page", [16, 64])
 @pytest.mark.parametrize("valid_elems_per_head", [32, 128])
 @pytest.mark.parametrize("head_grp_size", [8, 16])
+@pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
 def test_xqa(
     batch_size,
     nb_k_heads,
@@ -186,6 +193,7 @@ def test_xqa(
     use_attention_sinks,
     use_sliding_window,
     enable_pdl,
+    kv_layout,
 ):
     set_random_seed(42)
 
@@ -228,25 +236,45 @@ def test_xqa(
     # Total number of pages needed for all sequences
     total_num_pages = nb_pages_per_seq * batch_size
 
-    # NHD layout: [num_pages, page_size, num_kv_heads, head_dim]
-    cache_k_heads = torch.zeros(
-        total_num_pages,
-        tokens_per_page,
-        nb_k_heads,
-        valid_elems_per_head,
-        dtype=input_type,
-        device="cuda",
-    )
-    cache_k_heads.normal_(0, 1)
+    # Create cache with specified layout
+    if kv_layout == "NHD":
+        # NHD layout: [num_pages, page_size, num_kv_heads, head_dim]
+        cache_k_heads = torch.zeros(
+            total_num_pages,
+            tokens_per_page,
+            nb_k_heads,
+            valid_elems_per_head,
+            dtype=input_type,
+            device="cuda",
+        )
+        cache_v_heads = torch.zeros(
+            total_num_pages,
+            tokens_per_page,
+            nb_k_heads,
+            valid_elems_per_head,
+            dtype=input_type,
+            device="cuda",
+        )
+    else:  # HND layout
+        # HND layout: [num_pages, num_kv_heads, page_size, head_dim]
+        cache_k_heads = torch.zeros(
+            total_num_pages,
+            nb_k_heads,
+            tokens_per_page,
+            valid_elems_per_head,
+            dtype=input_type,
+            device="cuda",
+        )
+        cache_v_heads = torch.zeros(
+            total_num_pages,
+            nb_k_heads,
+            tokens_per_page,
+            valid_elems_per_head,
+            dtype=input_type,
+            device="cuda",
+        )
 
-    cache_v_heads = torch.zeros(
-        total_num_pages,
-        tokens_per_page,
-        nb_k_heads,
-        valid_elems_per_head,
-        dtype=input_type,
-        device="cuda",
-    )
+    cache_k_heads.normal_(0, 1)
     cache_v_heads.normal_(0, 1)
 
     if fp8_kv_cache:
@@ -281,14 +309,19 @@ def test_xqa(
         beam_width,
         nb_k_heads,
         tokens_per_page,
+        kv_layout,
     ):
         # K and V share page indices
         page_idx = page_list[batch][pos // tokens_per_page].to(torch.int32)
         token_in_page = pos % tokens_per_page
 
-        # NHD layout: [page_idx, token_in_page, idx_kv_head, :]
         cache = cache_k_heads if is_k else cache_v_heads
-        return cache[page_idx, token_in_page, idx_kv_head, :]
+        if kv_layout == "NHD":
+            # NHD layout: [page_idx, token_in_page, idx_kv_head, :]
+            return cache[page_idx, token_in_page, idx_kv_head, :]
+        else:  # HND
+            # HND layout: [page_idx, idx_kv_head, token_in_page, :]
+            return cache[page_idx, idx_kv_head, token_in_page, :]
 
     for batch in range(batch_size):
         for kv in range(2):
@@ -305,6 +338,7 @@ def test_xqa(
                         beam_width,
                         nb_k_heads,
                         tokens_per_page,
+                        kv_layout,
                     )
                     cache_head.fill_(0.0)
 
@@ -338,6 +372,7 @@ def test_xqa(
         q_scale=q_scale,
         kv_scale=kv_cache_scale,
         sliding_win_size=sliding_win_size,
+        kv_layout=kv_layout,
         sm_count=sm_count,
         enable_pdl=enable_pdl,
     )
@@ -352,6 +387,7 @@ def test_xqa(
                     nb_heads=nb_k_heads,
                     idx_head=idx_k_head,
                     tokens_per_page=tokens_per_page,
+                    kv_layout=kv_layout,
                 )
                 v_cache_seq = CacheSeq(
                     pool=cache_v_heads,
@@ -359,6 +395,7 @@ def test_xqa(
                     nb_heads=nb_k_heads,
                     idx_head=idx_k_head,
                     tokens_per_page=tokens_per_page,
+                    kv_layout=kv_layout,
                 )
 
                 ref_output = ref_attention(
@@ -525,6 +562,7 @@ def test_xqa_mla(
                         beam_width,
                         nb_k_heads,
                         tokens_per_page,
+                        "NHD",  # MLA only supports NHD layout
                     )
                     cache_head.fill_(0.0)
 

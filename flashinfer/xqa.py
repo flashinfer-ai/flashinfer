@@ -137,6 +137,7 @@ def xqa(
     q_scale: float = 1.0,
     kv_scale: Optional[torch.Tensor] = None,
     sliding_win_size: int = 0,
+    kv_layout: str = "NHD",
     sm_count: Optional[int] = None,
     enable_pdl: Optional[bool] = None,
 ) -> None:
@@ -148,11 +149,13 @@ def xqa(
         Data type should be torch.float16 or torch.bfloat16.
         Now only beam_width 1 is supported.
     k_cache: torch.Tensor
-        Paged K cache tensor with shape ``[num_pages, page_size, num_kv_heads, head_dim]`` (NHD layout).
+        Paged K cache tensor with shape ``[num_pages, page_size, num_kv_heads, head_dim]`` if :attr:`kv_layout` is ``NHD``,
+        or ``[num_pages, num_kv_heads, page_size, head_dim]`` if :attr:`kv_layout` is ``HND``.
         Data type should match query tensor or be torch.float8_e4m3fn, in which case xqa will run fp8 calculation.
         Should be the same data type as v_cache.
     v_cache: torch.Tensor
-        Paged V cache tensor with shape ``[num_pages, page_size, num_kv_heads, head_dim]`` (NHD layout).
+        Paged V cache tensor with shape ``[num_pages, page_size, num_kv_heads, head_dim]`` if :attr:`kv_layout` is ``NHD``,
+        or ``[num_pages, num_kv_heads, page_size, head_dim]`` if :attr:`kv_layout` is ``HND``.
         Data type should match query tensor or be torch.float8_e4m3fn, in which case xqa will run fp8 calculation.
         Should be the same data type as k_cache.
     page_table : torch.Tensor
@@ -187,6 +190,8 @@ def xqa(
         If None, defaults to 1.0.
     sliding_win_size : int, default=0
         Sliding window size for attention. If 0, no sliding window is used.
+    kv_layout : str, default="NHD"
+        The layout of the KV cache. Can be either ``NHD`` or ``HND``.
     sm_count : Optional[int], default=None
         Number of streaming multiprocessors to use.
         If None, will be inferred from the device.
@@ -230,6 +235,12 @@ def xqa(
     use_sliding_window = sliding_win_size > 0
 
     assert k_cache.dtype == v_cache.dtype, "K and V cache must have the same dtype"
+
+    # Convert HND layout to NHD if necessary (transpose only changes stride, not data)
+    if kv_layout == "HND":
+        # For HND: [..., H, N, D] -> NHD: [..., N, H, D]
+        k_cache = k_cache.transpose(-3, -2)
+        v_cache = v_cache.transpose(-3, -2)
 
     if (
         k_cache.dtype == torch.float8_e4m3fn

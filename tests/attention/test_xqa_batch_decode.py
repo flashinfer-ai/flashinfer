@@ -64,9 +64,16 @@ def create_query_tensor(q_lens, num_qo_heads, head_dim, q_dtype):
 
 
 def create_kv_cache(
-    batch_size, seq_lens, page_size, num_kv_heads, head_dim, kv_dtype, ref_kv_dtype
+    batch_size,
+    seq_lens,
+    page_size,
+    num_kv_heads,
+    head_dim,
+    kv_dtype,
+    ref_kv_dtype,
+    kv_layout="NHD",
 ):
-    # Create separate K and V caches with NHD layout
+    # Create separate K and V caches with specified layout (NHD or HND)
     max_seq_len = torch.max(seq_lens).item()
     num_tokens = max_seq_len * batch_size
     num_pages = (num_tokens + page_size - 1) // page_size
@@ -76,23 +83,43 @@ def create_kv_cache(
             "kv_dtype and ref_kv_dtype must be the same for non-fp8 kv_cache"
         )
 
-    # NHD layout: [num_pages, page_size, num_kv_heads, head_dim]
-    k_cache = torch.randn(
-        num_pages,
-        page_size,
-        num_kv_heads,
-        head_dim,
-        dtype=ref_kv_dtype_torch,
-        device=GPU_DEVICE,
-    )
-    v_cache = torch.randn(
-        num_pages,
-        page_size,
-        num_kv_heads,
-        head_dim,
-        dtype=ref_kv_dtype_torch,
-        device=GPU_DEVICE,
-    )
+    # Create cache with specified layout
+    if kv_layout == "NHD":
+        # NHD layout: [num_pages, page_size, num_kv_heads, head_dim]
+        k_cache = torch.randn(
+            num_pages,
+            page_size,
+            num_kv_heads,
+            head_dim,
+            dtype=ref_kv_dtype_torch,
+            device=GPU_DEVICE,
+        )
+        v_cache = torch.randn(
+            num_pages,
+            page_size,
+            num_kv_heads,
+            head_dim,
+            dtype=ref_kv_dtype_torch,
+            device=GPU_DEVICE,
+        )
+    else:  # HND layout
+        # HND layout: [num_pages, num_kv_heads, page_size, head_dim]
+        k_cache = torch.randn(
+            num_pages,
+            num_kv_heads,
+            page_size,
+            head_dim,
+            dtype=ref_kv_dtype_torch,
+            device=GPU_DEVICE,
+        )
+        v_cache = torch.randn(
+            num_pages,
+            num_kv_heads,
+            page_size,
+            head_dim,
+            dtype=ref_kv_dtype_torch,
+            device=GPU_DEVICE,
+        )
 
     # Convert K and V separately to fp8 if needed
     if kv_dtype == "fp8":
@@ -147,10 +174,11 @@ def flatten_paged_kv(
     seq_lens: torch.Tensor,
     page_size: int,
     kv_last_page_len: torch.Tensor,
+    kv_layout: str = "NHD",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build flat K/V and token-level indptr from paged KV cache and page table.
 
-    This version is specifically for NHD layout.
+    Supports both NHD and HND layouts.
     """
     device = ref_kv_cache.device
     batch_size = int(page_table.shape[0])
@@ -167,13 +195,23 @@ def flatten_paged_kv(
         last_len_i = int(kv_last_page_len_cpu[i].item())
         for j in range(pages_i):
             page_id = int(page_table_cpu[i, j].item())
-            k_page = ref_kv_cache[page_id, 0]  # NHD: [page_size, num_heads, head_dim]
-            v_page = ref_kv_cache[page_id, 1]
-            if j == pages_i - 1:
-                # NHD layout: truncate first dimension
-                k_page = k_page[:last_len_i, :, :]
-                v_page = v_page[:last_len_i, :, :]
-            # NHD layout: already in "p h d" format, no need to rearrange
+            if kv_layout == "NHD":
+                # NHD: [page_id, 0/1, page_size, num_heads, head_dim]
+                k_page = ref_kv_cache[page_id, 0]  # [page_size, num_heads, head_dim]
+                v_page = ref_kv_cache[page_id, 1]
+                if j == pages_i - 1:
+                    k_page = k_page[:last_len_i, :, :]
+                    v_page = v_page[:last_len_i, :, :]
+            else:  # HND
+                # HND: [page_id, 0/1, num_heads, page_size, head_dim]
+                k_page = ref_kv_cache[page_id, 0]  # [num_heads, page_size, head_dim]
+                v_page = ref_kv_cache[page_id, 1]
+                if j == pages_i - 1:
+                    k_page = k_page[:, :last_len_i, :]
+                    v_page = v_page[:, :last_len_i, :]
+                # Transpose to NHD: [num_heads, page_size, head_dim] -> [page_size, num_heads, head_dim]
+                k_page = k_page.transpose(0, 1)
+                v_page = v_page.transpose(0, 1)
             k_list.append(k_page)
             v_list.append(v_page)
     k_flat = torch.cat(k_list, dim=0)
@@ -247,6 +285,7 @@ def get_last_page_len(seq_lens, page_size):
 @pytest.mark.parametrize("enable_pdl", [True, False, None])
 @pytest.mark.parametrize("enable_sink", [True, False])
 @pytest.mark.parametrize("max_in_kv_len", [110])
+@pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
 def test_xqa_batch_decode(
     batch_size,
     q_len_per_req,
@@ -260,10 +299,11 @@ def test_xqa_batch_decode(
     enable_pdl,
     enable_sink,
     max_in_kv_len,
+    kv_layout,
 ):
     """Test xqa_batch_decode_with_kv_cache function.
 
-    This test is specifically for xqa which only supports NHD layout.
+    This test supports both NHD and HND layouts.
     """
     if q_len_per_req > 1:
         pytest.skip("xqa does not support speculative decoding yet")
@@ -282,7 +322,7 @@ def test_xqa_batch_decode(
     q, q_scale, ref_q = create_query_tensor(q_lens, num_qo_heads, head_dim, q_dtype)
     q_indptr = generate_cumsum_lens(q_lens)
 
-    # Create KV cache and related data (NHD layout)
+    # Create KV cache and related data
     kv_cache, k_scale, v_scale, ref_kv_cache = create_kv_cache(
         batch_size,
         seq_lens,
@@ -291,6 +331,7 @@ def test_xqa_batch_decode(
         head_dim,
         kv_dtype,
         "bf16" if q_dtype == "fp8" else q_dtype,
+        kv_layout,
     )
     page_table, all_page_ids, page_per_seq = create_page_table(
         batch_size, seq_lens, page_size
@@ -306,7 +347,6 @@ def test_xqa_batch_decode(
     sm_scale = float(1.0 / (head_dim**0.5))
 
     # Build reference output
-    kv_layout = "NHD"  # xqa only supports NHD
     plan_params = {
         "indptr": kv_indptr,
         "indices": all_page_ids,
@@ -347,13 +387,14 @@ def test_xqa_batch_decode(
             wrapper_ref.plan(**plan_params_prefill)
             output_ref = wrapper_ref.run(ref_q, ref_kv_cache)
     else:
-        # Construct flat K/V via helper (NHD layout)
+        # Construct flat K/V via helper
         k_flat, v_flat, kv_indptr_tokens = flatten_paged_kv(
             ref_kv_cache,
             page_table,
             seq_lens.to(GPU_DEVICE),
             page_size,
             kv_last_page_len,
+            kv_layout,
         )
         sink = torch.rand(num_qo_heads, device=GPU_DEVICE, dtype=torch.float32) * 5
         output_ref = sink_attention_unified(
@@ -384,6 +425,7 @@ def test_xqa_batch_decode(
         out=out,
         enable_pdl=enable_pdl,
         sinks=(sink if enable_sink else None),
+        kv_layout=kv_layout,
         q_len_per_req=q_len_per_req,
     )
 
@@ -411,4 +453,5 @@ if __name__ == "__main__":
         enable_pdl=True,
         enable_sink=True,
         max_in_kv_len=110,
+        kv_layout="NHD",
     )
