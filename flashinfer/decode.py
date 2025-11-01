@@ -1235,9 +1235,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
             q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
         )
 
-        # Convert HND layout to NHD for trtllm-gen backend
-        if self._backend == "trtllm-gen" and self._kv_layout == "HND":
-            # For HND: [..., H, N, D] -> NHD: [..., N, H, D]
+        # Convert NHD layout to HND for trtllm-gen backend
+        if self._backend == "trtllm-gen" and self._kv_layout == "NHD":
+            # For NHD: [..., N, H, D] -> HND: [..., H, N, D]
             k_cache = k_cache.transpose(-3, -2)
             v_cache = v_cache.transpose(-3, -2)
 
@@ -2198,9 +2198,9 @@ def trtllm_batch_decode_with_kv_cache(
             q_len_per_req=q_len_per_req,
         )
     elif backend == "trtllm-gen":
-        # Convert HND layout to NHD if necessary (transpose only changes stride, not data)
-        if kv_layout == "HND":
-            # For HND: [..., H, N, D] -> NHD: [..., N, H, D]
+        # Convert NHD layout to HND if necessary (transpose only changes stride, not data)
+        if kv_layout == "NHD":
+            # For NHD: [..., N, H, D] -> HND: [..., H, N, D]
             k_cache = k_cache.transpose(-3, -2)
             v_cache = v_cache.transpose(-3, -2)
 
@@ -2431,7 +2431,9 @@ def xqa_batch_decode_with_kv_cache(
         page_size = k_cache.shape[2]
         head_dim = k_cache.shape[3]
 
-    workspace_0, workspace_1 = torch.chunk(workspace_buffer, 2, dim=0)
+    workspace_u8 = workspace_buffer.view(torch.uint8)
+    semaphore = workspace_u8[: round_up(4 * sm_count, 16)]
+    scratch = workspace_u8[round_up(4 * sm_count, 16) :]
     kv_scale_value = bmm2_scale
     q_scale_value = bmm1_scale / kv_scale_value * (head_dim**0.5)
 
@@ -2448,8 +2450,8 @@ def xqa_batch_decode_with_kv_cache(
         block_tables,
         seq_lens_new,
         out,
-        workspace_0,
-        workspace_1,
+        scratch,
+        semaphore,
         num_kv_heads,
         page_size,
         sinks=sinks_new,
@@ -2570,6 +2572,10 @@ def trtllm_batch_decode_with_kv_cache_mla(
         block_size != 32 and block_size != 64
     ):  # todo(Yingyi): add support for more block sizes?
         raise ValueError(f"Supported block_size are 32 and 64, got {block_size}")
+
+    print(
+        f"Running TRTLLM batch decode with KV cache: {query.shape}, {kv_cache.shape}, {workspace_buffer.shape}"
+    )
 
     _check_trtllm_gen_mla_shape(
         query,

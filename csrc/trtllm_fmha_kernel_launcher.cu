@@ -232,11 +232,11 @@ void trtllm_paged_attention_decode(TensorView out, Optional<TensorView> out_scal
   bool is_shared_kv = key_cache.data_ptr() == value_cache.data_ptr();
   int num_pages_in_mem_pool = is_shared_kv ? key_cache.size(0) : key_cache.size(0) * 2;
 
-  // Assume NHD layout: [..., N, H, D]
-  int page_size = key_cache.size(-3);
-  int num_kv_heads = key_cache.size(-2);
-  int kv_stride_keys_values = key_cache.stride(-3);  // key/values
-  int kv_stride_heads = key_cache.stride(-2);        // head
+  // Assume NHD layout: [..., H, N, D]
+  int page_size = key_cache.size(-2);
+  int num_kv_heads = key_cache.size(-3);
+  int kv_stride_keys_values = key_cache.stride(-2);  // key/values
+  int kv_stride_heads = key_cache.stride(-3);        // head
 
   int kv_stride_batch = key_cache.stride(0);  // batch
 
@@ -294,11 +294,11 @@ void trtllm_paged_attention_context(TensorView out, Optional<TensorView> out_sca
   bool is_shared_kv = key_cache.data_ptr() == value_cache.data_ptr();
   int num_pages_in_mem_pool = is_shared_kv ? key_cache.size(0) : key_cache.size(0) * 2;
 
-  // Assume NHD layout: [..., N, H, D]
-  int page_size = key_cache.size(-3);
-  int num_kv_heads = key_cache.size(-2);
-  int kv_stride_keys_values = key_cache.stride(-3);  // key/values
-  int kv_stride_heads = key_cache.stride(-2);        // head
+  // Assume NHD layout: [..., H, N, D]
+  int page_size = key_cache.size(-2);
+  int num_kv_heads = key_cache.size(-3);
+  int kv_stride_keys_values = key_cache.stride(-2);  // key/values
+  int kv_stride_heads = key_cache.stride(-3);        // head
   int kv_stride_batch = key_cache.stride(0);         // batch
 
   const auto stream = get_stream(query.device());

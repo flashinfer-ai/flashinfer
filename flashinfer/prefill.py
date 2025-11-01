@@ -2088,9 +2088,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 out, q.shape[:-1] + v_cache.shape[-1:], q.dtype, q.device, "out"
             )
 
-        # Convert HND layout to NHD for trtllm-gen backend
-        if self._backend == "trtllm-gen" and self._kv_layout == "HND":
-            # For HND: [..., H, N, D] -> NHD: [..., N, H, D]
+        # Convert NHD layout to HND for trtllm-gen backend
+        if self._backend == "trtllm-gen" and self._kv_layout == "NHD":
+            # For NHD: [..., N, H, D] -> HND: [..., H, N, D]
             k_cache = k_cache.transpose(-3, -2)
             v_cache = v_cache.transpose(-3, -2)
 
@@ -3411,9 +3411,9 @@ def trtllm_batch_context_with_kv_cache(
             # it doesn't change underlying storage
             k_cache, v_cache = kv_cache.unbind(dim=1)
 
-    # Convert HND layout to NHD if necessary (transpose only changes stride, not data)
-    if kv_layout == "HND":
-        # For HND: [..., H, N, D] -> NHD: [..., N, H, D]
+    # Convert NHD layout to HND if necessary (transpose only changes stride, not data)
+    if kv_layout == "NHD":
+        # For NHD: [..., N, H, D] -> HND: [..., H, N, D]
         k_cache = k_cache.transpose(-3, -2)
         v_cache = v_cache.transpose(-3, -2)
 
