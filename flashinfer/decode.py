@@ -2140,7 +2140,7 @@ def trtllm_batch_decode_with_kv_cache(
         The implementation backend, could be ``auto``/``xqa`` or ``trtllm-gen``. Defaults to ``auto``.
         When set to ``auto``, the backend will be chosen based on the device architecture and kernel availability.
         For sm_100 and sm_103 (blackwell architecture), ``auto`` will choose ``trtllm-gen`` backend.
-        For sm_90 and sm_91 (ampere architecture), ``auto`` will choose ``xqa`` backend.
+        For sm_90 (hopper architecture) and sm_120 (blackwell architecture), ``auto`` will choose ``xqa`` backend.
 
     Returns
     -------
@@ -2443,13 +2443,18 @@ def xqa_batch_decode_with_kv_cache(
         sinks.reshape(num_kv_heads, -1).contiguous() if sinks is not None else None
     )
 
+    # Ensure 4D output for xqa
+    if out is None:
+        out = torch.empty_like(query)
+    out_4d = out.unsqueeze(1)
+
     xqa(
         query_new,
         k_cache,
         v_cache,
         block_tables,
         seq_lens_new,
-        out,
+        out_4d,
         scratch,
         semaphore,
         num_kv_heads,
@@ -2462,6 +2467,7 @@ def xqa_batch_decode_with_kv_cache(
         sliding_win_size=window_left + 1 if window_left >= 0 else 0,
         kv_layout=kv_layout,
         sm_count=sm_count,
+        enable_pdl=enable_pdl,
     )
 
     return out
