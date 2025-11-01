@@ -1304,7 +1304,7 @@ def get_trtllm_moe_sm100_module():
             enable_pdl=enable_pdl,
         )
         # Call the C++ function
-        moe_op.trtllm_fp8_per_tensor_scale_moe(
+        result = moe_op.trtllm_fp8_per_tensor_scale_moe(
             routing_logits,
             routing_bias,
             hidden_states,
@@ -1327,7 +1327,8 @@ def get_trtllm_moe_sm100_module():
             enable_pdl,
             [-1, -1] if tactic == -1 else tactic,
         )
-        return output
+
+        return result
 
     @register_fake_op("flashinfer::trtllm_fp8_per_tensor_scale_moe")
     def _fake_trtllm_fp8_per_tensor_scale_moe(

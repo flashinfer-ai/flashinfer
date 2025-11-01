@@ -313,6 +313,8 @@ __device__ void routingPermutation(KernelParams params,
       params.mPtrCtaIdxXyToMnLimit[ctaOffset + cta] =
           min(mulLog2<int32_t>(ctaOffset + cta + 1, params.mPaddingLog2),
               mulLog2<int32_t>(ctaOffset, params.mPaddingLog2) + count);
+      printf("fp8block, ctaOffset+cta,%d,localExpertIdx,%d params.mPtrCtaIdxXyToBatchIdx[ctaOffset + cta]:%d\n",
+        ctaOffset + cta, localExpertIdx, params.mPtrCtaIdxXyToBatchIdx[ctaOffset + cta]);
     }
 
     // get the padded offset associated with this expert
@@ -546,6 +548,8 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts)
       params.mPtrCtaIdxXyToMnLimit[ctaOffset + cta] =
           min(mulLog2<int32_t>(ctaOffset + cta + 1, params.mPaddingLog2),
               mulLog2<int32_t>(ctaOffset, params.mPaddingLog2) + count);
+      printf("fp8block, ctaOffset+cta,%d,localExpertIdx,%d params.mPtrCtaIdxXyToBatchIdx[ctaOffset + cta]:%d\n",
+        ctaOffset + cta, localExpertIdx, params.mPtrCtaIdxXyToBatchIdx[ctaOffset + cta]);
     }
   }
 

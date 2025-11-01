@@ -773,7 +773,7 @@ class FP8BlockScaleMoe(Moe):
         )
 
         # Use autotuner for optimal kernel selection
-        with autotune(True):
+        with autotune(False):
             output = trtllm_fp8_block_scale_moe(
                 expert_logits,
                 routing_bias,
