@@ -1659,7 +1659,8 @@ void launchMLA(
     uint32_t maxSeqLen, uint32_t const* seqLen, uint32_t batchSize,
     float const* __restrict__ kvCacheScale,  // Device memory scalar. Same scale for K and V cache.
                                              // Used only for int8/fp8 KV cache.
-    uint32_t* semaphores, void* scratch, bool enable_pdl, cudaStream_t stream) {
+    uint32_t* semaphores, void* scratch, bool enable_pdl, uint64_t kv_stride_page,
+    uint64_t kv_stride_token, uint64_t kv_stride_head, cudaStream_t stream) {
 #if IS_MLA
   static_assert(
       SLIDING_WINDOW == 0 && LOW_PREC_OUTPUT == 0 && USE_INPUT_KV == 0 && USE_BEAM_SEARCH == 0,
@@ -1838,4 +1839,3 @@ void launchMLAFlashInfer(
   checkCuda(err);
 #endif
 }
-#endif
