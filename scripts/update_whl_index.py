@@ -31,7 +31,11 @@ def get_package_info(wheel_path: pathlib.Path) -> Optional[dict]:
     wheel_name = wheel_path.name
 
     # Try flashinfer-python pattern
-    match = re.match(r"flashinfer_python-([0-9.]+(?:\.dev\d+)?)-", wheel_name)
+    # Supports PEP 440: base_version[{a|b|rc}N][.postN][.devN]
+    match = re.match(
+        r"flashinfer_python-([0-9.]+(?:(?:a|b|rc)\d+)?(?:\.post\d+)?(?:\.dev\d+)?)-",
+        wheel_name,
+    )
     if match:
         version = match.group(1)
         return {
@@ -41,7 +45,11 @@ def get_package_info(wheel_path: pathlib.Path) -> Optional[dict]:
         }
 
     # Try flashinfer-cubin pattern
-    match = re.match(r"flashinfer_cubin-([0-9.]+(?:\.dev\d+)?)-", wheel_name)
+    # Supports PEP 440: base_version[{a|b|rc}N][.postN][.devN]
+    match = re.match(
+        r"flashinfer_cubin-([0-9.]+(?:(?:a|b|rc)\d+)?(?:\.post\d+)?(?:\.dev\d+)?)-",
+        wheel_name,
+    )
     if match:
         version = match.group(1)
         return {
@@ -51,7 +59,11 @@ def get_package_info(wheel_path: pathlib.Path) -> Optional[dict]:
         }
 
     # Try flashinfer-jit-cache pattern (has CUDA suffix in version)
-    match = re.match(r"flashinfer_jit_cache-([0-9.]+(?:\.dev\d+)?\+cu\d+)-", wheel_name)
+    # Supports PEP 440: base_version[{a|b|rc}N][.postN][.devN]+cuXXX
+    match = re.match(
+        r"flashinfer_jit_cache-([0-9.]+(?:(?:a|b|rc)\d+)?(?:\.post\d+)?(?:\.dev\d+)?\+cu\d+)-",
+        wheel_name,
+    )
     if match:
         version = match.group(1)
         cuda_ver = get_cuda_version(wheel_name)

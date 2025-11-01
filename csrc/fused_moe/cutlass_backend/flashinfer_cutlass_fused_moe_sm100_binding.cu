@@ -361,8 +361,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         num_rows, hidden_size, inter_size, num_experts_total, static_cast<int>(experts_per_token),
         base_activation_type, parallelism_config, min_latency_mode);
 
-    auto const quant_params =
-        getQuantParams(num_experts_on_rank, hidden_size, inter_size, quant_scales);
+    auto const quant_params = getQuantParams(num_experts_on_rank, hidden_size, inter_size,
+                                             quant_scales, base_activation_type);
     kernels::MoeMinLatencyParams min_latency_params{};
 
     // TODO: support lora in the future
@@ -542,8 +542,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         num_rows, hidden_size, inter_size, num_experts_total, static_cast<int>(experts_per_token),
         base_activation_type, parallelism_config, min_latency_mode);
 
-    auto const quant_params =
-        getQuantParams(num_experts_on_rank, hidden_size, inter_size, quant_scales);
+    auto const quant_params = getQuantParams(num_experts_on_rank, hidden_size, inter_size,
+                                             quant_scales, base_activation_type);
 
     // TODO: support lora in the future
     ::tensorrt_llm::kernels::LoraParams lora_params{};
@@ -809,9 +809,10 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     return info;
   }
 
-  kernels::QuantParams getQuantParams(int64_t num_experts_on_rank, int64_t hidden_size,
-                                      int64_t inter_size,
-                                      Optional<Array<Tensor>> quant_scales) const {
+  kernels::QuantParams getQuantParams(
+      int64_t num_experts_on_rank, int64_t hidden_size, int64_t inter_size,
+      Optional<Array<Tensor>> quant_scales,
+      ActivationType base_activation_type = ActivationType::Swiglu) const {
     if (isFp8Quant()) {
       TVM_FFI_ICHECK(quant_scales.has_value()) << "Expecting quant scales for fp8 quantization";
       TVM_FFI_ICHECK_EQ(quant_scales.value().size(), 4)
@@ -1013,18 +1014,34 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       // Check shapes
       TVM_FFI_ICHECK(fc1_act_global.ndim() == 0 || fc1_act_global.size(0) == num_experts_on_rank)
           << "fc1 act global must be scalar or (num_experts_on_rank,)";
-      TVM_FFI_ICHECK(
-          fc1_weight_block.size(0) == num_experts_on_rank &&
-          fc1_weight_block.size(1) ==
-              TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
-                  inter_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentNVFP4) *
-                  2 &&
-          fc1_weight_block.size(2) * FP8_PER_INT32 *
-                  TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize ==
-              TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
-                  hidden_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentNVFP4))
-          << "fc1 weight block size must be (num_experts_on_rank, inter_size * 2, hidden_size // 4 "
-             "// block_scale_vector_size)";
+      if (isGatedActivation(base_activation_type)) {
+        TVM_FFI_ICHECK(
+            fc1_weight_block.size(0) == num_experts_on_rank &&
+            fc1_weight_block.size(1) ==
+                TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
+                    inter_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentNVFP4) *
+                    2 &&
+            fc1_weight_block.size(2) * FP8_PER_INT32 *
+                    TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize ==
+                TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
+                    hidden_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentNVFP4))
+            << "fc1 weight block size must be (num_experts_on_rank, inter_size * 2, hidden_size // "
+               "4 "
+               "// block_scale_vector_size)";
+      } else {
+        TVM_FFI_ICHECK(
+            fc1_weight_block.size(0) == num_experts_on_rank &&
+            fc1_weight_block.size(1) ==
+                TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
+                    inter_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentNVFP4) &&
+            fc1_weight_block.size(2) * FP8_PER_INT32 *
+                    TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize ==
+                TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
+                    hidden_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentNVFP4))
+            << "fc1 weight block size must be (num_experts_on_rank, inter_size, hidden_size // 4 "
+               "// block_scale_vector_size)";
+      }
+
       TVM_FFI_ICHECK_EQ(fc1_global.size(0), num_experts_on_rank)
           << "fc1 global size must be (num_experts_on_rank,)";
       TVM_FFI_ICHECK(fc2_act_global.ndim() == 0 || fc2_act_global.size(0) == num_experts_on_rank)
