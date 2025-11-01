@@ -239,17 +239,23 @@ void TrtllmGenBatchedGemmRunner::run(
   int32_t multiProcessorCount;
   cudaDeviceGetAttribute(&multiProcessorCount, cudaDevAttrMultiProcessorCount, device);
 
+  // FIXME: this is a WAR to solve the perf regression and should be removed once
+  // trtllm-gen fixes the issue.
+  auto myConfig = config;
+  myConfig.mOptions.mValidK = k;
+  myConfig.mOptions.mValidN = gemmData.mProblemDimensions.mN;
+  myConfig.mOptions.mValidM = gemmData.mProblemDimensions.mM;
   // FIXME once we start using all-reduce in the epilogue of the bmm this can be moved elsewhere
-  bmm.runInitBeforeWorldSync(config, gemmData, static_cast<void*>(stream));
+  bmm.runInitBeforeWorldSync(myConfig, gemmData, static_cast<void*>(stream));
 
-  auto const err = bmm.run(config, workspace, gemmData, static_cast<void*>(stream),
+  auto const err = bmm.run(myConfig, workspace, gemmData, static_cast<void*>(stream),
                            multiProcessorCount, enable_pdl, globalTrtllmGenBatchedGemmModuleCache);
 
   FLASHINFER_CHECK(err == 0,
                    "Error occurred when running GEMM!"
                    " (numBatches: ",
-                   numBatches, ", GemmMNK: ", m, " ", n, " ", k, ", Kernel: ", config.mFunctionName,
-                   ")");
+                   numBatches, ", GemmMNK: ", m, " ", n, " ", k,
+                   ", Kernel: ", myConfig.mFunctionName, ")");
 }
 
 void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k,
@@ -387,8 +393,13 @@ std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(
   // Filter out invalid configs.
   std::vector<int64_t> validConfigIndices;
   for (auto const& configIndex : prioritizedIndices) {
-    auto const& config = configs[configIndex];
-    auto isValidConfig = bmm.isValidConfig(config, gemmData);
+    // FIXME: this is a WAR to solve the perf regression and should be removed once
+    // trtllm-gen fixes the issue.
+    auto myConfig = configs[configIndex];
+    myConfig.mOptions.mValidK = k;
+    myConfig.mOptions.mValidN = gemmData.mProblemDimensions.mN;
+    myConfig.mOptions.mValidM = gemmData.mProblemDimensions.mM;
+    auto isValidConfig = bmm.isValidConfig(myConfig, gemmData);
     if (isValidConfig) {
       validConfigIndices.push_back(configIndex);
     }
