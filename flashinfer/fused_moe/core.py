@@ -184,7 +184,7 @@ def _maybe_get_cached_w3_w1_permute_indices(
     num_elts_per_sf: Union[None, int] = None,
 ) -> torch.Tensor:
     # Create a unique cache key (weight_type, weight_shape)
-    cache_key = ("w3_w1", dst_w3_w1_weight.shape)
+    cache_key = ("w3_w1", dst_w3_w1_weight.shape, epilogue_tile_m, num_elts_per_sf)
     if cache_key not in _cache_permute_indices:
         # Get permute indices and chain them together
         permute0 = get_reorder_rows_for_gated_act_gemm_row_indices(dst_w3_w1_weight)
@@ -213,7 +213,7 @@ def get_w2_permute_indices_with_cache(
     num_elts_per_sf: Union[None, int] = None,
 ) -> torch.Tensor:
     # Create a unique cache key (weight_type, weight_shape)
-    cache_key = ("w2", dst_w2_weight.shape)
+    cache_key = ("w2", dst_w2_weight.shape, epilogue_tile_m, num_elts_per_sf)
     if cache_key not in _cache_permute_indices:
         if num_elts_per_sf is None:
             permute_indices = get_shuffle_matrix_a_row_indices(
@@ -1145,6 +1145,81 @@ def get_trtllm_moe_sm100_module():
             )
 
     @register_custom_op(
+        "flashinfer::trtllm_bf16_moe",
+        mutates_args=(""),
+    )
+    def trtllm_bf16_moe_op(
+        routing_logits: torch.Tensor,
+        routing_bias: Optional[torch.Tensor],
+        hidden_states: torch.Tensor,
+        gemm1_weights: torch.Tensor,
+        gemm2_weights: torch.Tensor,
+        num_experts: int,
+        top_k: int,
+        n_group: int,
+        topk_group: int,
+        intermediate_size: int,
+        local_expert_offset: int,
+        local_num_experts: int,
+        tile_tokens_dim: int,
+        routing_method_type: int,
+        use_shuffled_weight: bool,
+        weight_layout: int,
+        moe_tactic: int,
+        enable_pdl: Optional[bool] = None,
+    ) -> torch.Tensor:
+        if enable_pdl is None:
+            enable_pdl = device_support_pdl(hidden_states.device)
+        # Call the C++ function for block scale MoE
+        output = moe_op.trtllm_bf16_moe(
+            routing_logits,
+            routing_bias,
+            hidden_states,
+            gemm1_weights,
+            gemm2_weights,
+            num_experts,
+            top_k,
+            n_group,
+            topk_group,
+            intermediate_size,
+            local_expert_offset,
+            local_num_experts,
+            tile_tokens_dim,
+            routing_method_type,
+            use_shuffled_weight,
+            weight_layout,
+            moe_tactic,
+            enable_pdl,
+        )
+        return output
+
+    @register_fake_op("flashinfer::trtllm_bf16_moe")
+    def _fake_trtllm_bf16_moe(
+        routing_logits: torch.Tensor,
+        routing_bias: Optional[torch.Tensor],
+        hidden_states: torch.Tensor,
+        gemm1_weights: torch.Tensor,
+        gemm2_weights: torch.Tensor,
+        num_experts: int,
+        top_k: int,
+        n_group: int,
+        topk_group: int,
+        intermediate_size: int,
+        local_expert_offset: int,
+        local_num_experts: int,
+        tile_tokens_dim: int,
+        routing_method_type: int,
+        use_shuffled_weight: bool,
+        weight_layout: int,
+        moe_tactic: int,
+        enable_pdl: Optional[bool] = None,
+    ):
+        seq_len = hidden_states.shape[0]
+        hidden_size = hidden_states.shape[1]
+
+        return [hidden_states.new_empty([seq_len, hidden_size], dtype=torch.bfloat16)]
+
+    @register_custom_op(
         "flashinfer::trtllm_fp8_per_tensor_scale_moe",
         mutates_args=(""),
     )
@@ -1229,7 +1304,7 @@ def get_trtllm_moe_sm100_module():
             enable_pdl=enable_pdl,
         )
         # Call the C++ function
-        moe_op.trtllm_fp8_per_tensor_scale_moe(
+        result = moe_op.trtllm_fp8_per_tensor_scale_moe(
             routing_logits,
             routing_bias,
             hidden_states,
@@ -1252,7 +1327,8 @@ def get_trtllm_moe_sm100_module():
             enable_pdl,
             [-1, -1] if tactic == -1 else tactic,
         )
-        return output
+
+        return result
 
     @register_fake_op("flashinfer::trtllm_fp8_per_tensor_scale_moe")
     def _fake_trtllm_fp8_per_tensor_scale_moe(
@@ -1652,9 +1728,54 @@ def get_trtllm_moe_sm100_module():
         return [hidden_states.new_empty([seq_len, hidden_size], dtype=torch.bfloat16)]
 
     return SimpleNamespace(
+        trtllm_bf16_moe=trtllm_bf16_moe_op,
         trtllm_fp8_per_tensor_scale_moe=trtllm_fp8_per_tensor_scale_moe_op,
         trtllm_fp8_block_scale_moe=trtllm_fp8_block_scale_moe_op,
         trtllm_fp4_block_scale_moe=trtllm_fp4_block_scale_moe_op,
+    )
+
+
+def trtllm_bf16_moe(
+    routing_logits: torch.Tensor,
+    routing_bias: Optional[torch.Tensor],
+    hidden_states: torch.Tensor,
+    gemm1_weights: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+    n_group: int,
+    topk_group: int,
+    intermediate_size: int,
+    local_expert_offset: int,
+    local_num_experts: int,
+    *,
+    tile_tokens_dim: int = 8,
+    routing_method_type: int = 0,
+    use_shuffled_weight: bool = True,
+    weight_layout: int = WeightLayout.BlockMajorK,
+    moe_tactic: int = -1,
+    enable_pdl: bool = True,
+) -> torch.Tensor:
+    """BF16 block scale MoE operation."""
+    return get_trtllm_moe_sm100_module().trtllm_bf16_moe(
+        routing_logits,
+        routing_bias,
+        hidden_states,
+        gemm1_weights,
+        gemm2_weights,
+        num_experts,
+        top_k,
+        n_group or 0,  # may receive None from test configs, convert to 0
+        topk_group or 0,
+        intermediate_size,
+        local_expert_offset,
+        local_num_experts,
+        tile_tokens_dim,
+        routing_method_type,
+        use_shuffled_weight,
+        weight_layout,
+        moe_tactic,
+        enable_pdl,
     )
 
 
