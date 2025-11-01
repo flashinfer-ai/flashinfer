@@ -2573,10 +2573,6 @@ def trtllm_batch_decode_with_kv_cache_mla(
     ):  # todo(Yingyi): add support for more block sizes?
         raise ValueError(f"Supported block_size are 32 and 64, got {block_size}")
 
-    print(
-        f"Running TRTLLM batch decode with KV cache: {query.shape}, {kv_cache.shape}, {workspace_buffer.shape}"
-    )
-
     _check_trtllm_gen_mla_shape(
         query,
         kv_cache,
