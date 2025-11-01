@@ -201,11 +201,9 @@ struct alignas(128) SharedMem {
   ShmQWiseVec gemm1AccColMax;
   ShmQWiseVec gemm1AccColSum;
 
-#if USE_PAGED_KV_CACHE
   static constexpr uint32_t nbPagesPerTile =
       gemm0CtaTileNbTokens >= tokensPerPage ? exactDiv(gemm0CtaTileNbTokens, tokensPerPage) : 1;
   Vec<KVCachePageIndex, nbPagesPerTile> pages[2];  // one for K and one for V
-#endif
 
   // mem barriers
 
@@ -271,11 +269,9 @@ struct KVTilePartLoader {
   static constexpr uint32_t nbParts = cacheHeadNbParts;
   static constexpr uint32_t partElems = exactDiv(headElems, nbParts);
 
-#if USE_PAGED_KV_CACHE
   static_assert(gemm0CtaTileNbTokens % tokensPerPage == 0 ||
                 tokensPerPage % gemm0CtaTileNbTokens == 0);
   static constexpr uint32_t nbPagesPerTile = SharedMem::nbPagesPerTile;
-#endif
 
   uint32_t const nbKHeads;
   KVCacheList<usePagedKVCache> const& cacheList;
@@ -283,21 +279,15 @@ struct KVTilePartLoader {
   uint32_t const idxHeadGrp;
 
   CUtensorMap const& tensorMap;
-#if USE_PAGED_KV_CACHE
   uint32_t const nbPages;  // for bound check
   Vec<KVCachePageIndex, nbPagesPerTile>& pages;
   uint32_t idxTileRef;  // idxTile used to load the pages
-#endif
   uint32_t const baseOffset;
 
   __device__ KVTilePartLoader(bool isK, uint32_t nbKHeads,
                               KVCacheList<usePagedKVCache> const& cacheList, uint32_t idxReq,
-                              uint32_t idxHeadGrp, CUtensorMap const& tensorMap
-#if USE_PAGED_KV_CACHE
-                              ,
-                              uint32_t nbPages, Vec<KVCachePageIndex, nbPagesPerTile>& pageBuf
-#endif
-  );
+                              uint32_t idxHeadGrp, CUtensorMap const& tensorMap, uint32_t nbPages,
+                              Vec<KVCachePageIndex, nbPagesPerTile>& pageBuf);
   // tensorMap is for one whole page ([nbKHeads*tokensPerPage][headElems]) or whole cache
   template <uint32_t nbTokens, bool alignedForSwizzle>
   __device__ void loadData(
@@ -638,12 +628,8 @@ __launch_bounds__(128 * 3)
         uint32_t const batchSize,
         float const* __restrict__ const kvCacheScale,  // Device memory scalar. Same scale for K and
                                                        // V cache. Used only for int8/fp8 KV cache.
-#if PAGED_KV_CACHE_LAYOUT == 1
         __grid_constant__ CUtensorMap const tensorMapVLLMK,
         __grid_constant__ CUtensorMap const tensorMapVLLMV,
-#else
-            __grid_constant__ CUtensorMap const tensorMap,
-#endif
 #if SPEC_DEC
         SpecDecParams const specDecParams,
 #endif
@@ -733,16 +719,10 @@ __launch_bounds__(128 * 3)
   uint32_t const ctaInputTokBeg = reqInputTokBeg + ctaTokOffset;
   auto const warpIdx = getWarpIdx(uint3{128, 1, 3});
   auto const wid = warpIdx.z * 4 + warpIdx.x;
-#if PAGED_KV_CACHE_LAYOUT == 1
   if (wid == 0 && warpElectSync()) {
     tma::prefetchTensorMap(tensorMapVLLMK);
     tma::prefetchTensorMap(tensorMapVLLMV);
   }
-#else
-  if (wid == 0 && warpElectSync()) {
-    tma::prefetchTensorMap(tensorMap);
-  }
-#endif
   extern __shared__ char smemByteBuf[];
   assert(dynamicSmemSize() >= sizeof(SharedMem));
   SharedMem& smem = *reinterpret_cast<SharedMem*>(&smemByteBuf[0]);
@@ -768,9 +748,7 @@ __launch_bounds__(128 * 3)
   }
   __syncthreads();
 
-#if USE_PAGED_KV_CACHE
   uint32_t const nbPages = divUp(cacheSeqLen, tokensPerPage);
-#endif
 
   constexpr bool isKVCacheQuantized = (cacheElemSize < 2);
   assert(idxKTileInit < nbTiles);
@@ -1316,18 +1294,8 @@ __launch_bounds__(128 * 3)
       asm volatile("fence.proxy.async.shared::cta;\n");
       unused(smem.qBar.produced.arrive());
     } else if (warpIdx.x == nbQLdWarps) {  // load k
-      KVTilePartLoader kTilePartLoader{true,           nbKHeads,     cacheList, idxReq, idxHeadGrp,
-#if USE_PAGED_KV_CACHE
-#if PAGED_KV_CACHE_LAYOUT == 1
-                                       tensorMapVLLMK,
-#else
-                                       tensorMap,
-#endif
-                                       nbPages,        smem.pages[0]
-#else
-                                       tensorMap
-#endif
-      };
+      KVTilePartLoader kTilePartLoader{true,       nbKHeads,       cacheList, idxReq,
+                                       idxHeadGrp, tensorMapVLLMK, nbPages,   smem.pages[0]};
       for (uint32_t idxIter = 0; idxIter < nbIters; idxIter++) {
         uint32_t const idxKTile = idxKTileInit + idxIter * nbSubSeq;
         kTilePartLoader.loadPages(idxKTile);
@@ -1385,18 +1353,8 @@ __launch_bounds__(128 * 3)
         }
       }
     } else if (warpIdx.x == nbQLdWarps + 1) {  // load v
-      KVTilePartLoader vTileLoader{false,          nbKHeads,     cacheList, idxReq, idxHeadGrp,
-#if USE_PAGED_KV_CACHE
-#if PAGED_KV_CACHE_LAYOUT == 1
-                                   tensorMapVLLMV,
-#else
-                                   tensorMap,
-#endif
-                                   nbPages,        smem.pages[1]
-#else
-                                   tensorMap
-#endif
-      };
+      KVTilePartLoader vTileLoader{false,      nbKHeads,       cacheList, idxReq,
+                                   idxHeadGrp, tensorMapVLLMV, nbPages,   smem.pages[1]};
       for (uint32_t idxIter = 0; idxIter < nbIters; idxIter++) {
         uint32_t const idxVTile = idxVTileInit + idxIter * nbSubSeq;
         vTileLoader.loadPages(idxVTile);
@@ -1730,35 +1688,16 @@ __device__ inline void F16QToF8Converter<nbThrds, beamWidth>::store(
 __device__ inline KVTilePartLoader::KVTilePartLoader(bool isK, uint32_t nbKHeads,
                                                      KVCacheList<usePagedKVCache> const& cacheList,
                                                      uint32_t idxReq, uint32_t idxHeadGrp,
-                                                     CUtensorMap const& tensorMap
-#if USE_PAGED_KV_CACHE
-                                                     ,
-                                                     uint32_t nbPages,
-                                                     Vec<KVCachePageIndex, nbPagesPerTile>& pageBuf
-#endif
-                                                     )
+                                                     CUtensorMap const& tensorMap, uint32_t nbPages,
+                                                     Vec<KVCachePageIndex, nbPagesPerTile>& pageBuf)
     : nbKHeads{nbKHeads},
       cacheList{cacheList},
       idxReq{idxReq},
       idxHeadGrp{idxHeadGrp},
-      tensorMap{tensorMap}
-#if USE_PAGED_KV_CACHE
-      ,
+      tensorMap{tensorMap},
       nbPages{nbPages},
-      pages{pageBuf}
-#if PAGED_KV_CACHE_LAYOUT == 1
-      ,
-      baseOffset{idxReq * cacheList.maxNbPagesPerSeq}
-#else
-      ,
-      baseOffset{((idxReq * beamWidth) * 2 + (isK ? 0 : 1)) * cacheList.maxNbPagesPerSeq}
-#endif
-#else
-      ,
-      baseOffset{(idxReq * beamWidth) * 2 + (isK ? 0 : 1)}
-#endif
-{
-}
+      pages{pageBuf},
+      baseOffset{idxReq * cacheList.maxNbPagesPerSeq} {}
 
 // tensorMap is for one whole page ([nbKHeads*tokensPerPage][headElems]) or whole cache
 template <uint32_t nbTokens, bool alignedForSwizzle>
@@ -1766,38 +1705,22 @@ __device__ inline void KVTilePartLoader::loadData(
     Array2D<LdGrain, nbTokens, exactDiv(cacheHeadPartBytes, grainBytes), alignedForSwizzle>& dst,
     uint32_t idxTile, uint32_t idxPart, CtaBarrier& bar) {
   static_assert(nbTokens == gemm0CtaTileNbTokens);
-#if USE_PAGED_KV_CACHE
   assert(idxTile == idxTileRef);
   if constexpr (nbTokens < tokensPerPage) {
     assert(nbPagesPerTile == 1);
     uint32_t const offset = nbTokens * (idxTile % exactDiv(tokensPerPage, nbTokens));
-#if PAGED_KV_CACHE_LAYOUT == 1
     tma::loadAsync(&dst, tensorMap,
                    DimsLE<4>{partElems * idxPart, idxHeadGrp, offset, (uint32_t)pages[0]}, bar);
-#else
-    tma::loadAsync(&dst, tensorMap,
-                   DimsLE<4>{partElems * idxPart, offset, idxHeadGrp, (uint32_t)pages[0]}, bar);
-#endif
   } else {
 #pragma unroll
     for (uint32_t i = 0; i < nbPagesPerTile; i++) {
-#if PAGED_KV_CACHE_LAYOUT == 1
       tma::loadAsync(&dst(tokensPerPage * i, 0), tensorMap,
                      DimsLE<4>{partElems * idxPart, idxHeadGrp, 0, (uint32_t)pages[i]}, bar);
-#else
-      tma::loadAsync(&dst(tokensPerPage * i, 0), tensorMap,
-                     DimsLE<4>{partElems * idxPart, 0, idxHeadGrp, (uint32_t)pages[i]}, bar);
-#endif
     }
   }
-#else
-  tma::loadAsync(&dst, tensorMap,
-                 DimsLE<4>{partElems * idxPart, nbTokens * idxTile, idxHeadGrp, baseOffset}, bar);
-#endif
 }
 
 __device__ inline void KVTilePartLoader::loadPages(uint32_t idxTile) {
-#if USE_PAGED_KV_CACHE
   uint32_t const idxPageBeg = gemm0CtaTileNbTokens >= tokensPerPage
                                   ? nbPagesPerTile * idxTile
                                   : idxTile / exactDiv(tokensPerPage, gemm0CtaTileNbTokens);
@@ -1812,28 +1735,13 @@ __device__ inline void KVTilePartLoader::loadPages(uint32_t idxTile) {
   }
   idxTileRef = idxTile;
   __syncwarp();
-#endif
 }
 
 __device__ inline GMemKVCacheHead& KVTilePartLoader::getHead(uint32_t pos) {
   constexpr uint32_t nbTokens = gemm0CtaTileNbTokens;
-#if USE_PAGED_KV_CACHE
-#if PAGED_KV_CACHE_LAYOUT == 1
   // Raise a runtime error indicating not implemented
-  assert(false && "KVTilePartLoader::getHead is not implemented for PAGED_KV_CACHE_LAYOUT == 1");
+  assert(false && "KVTilePartLoader::getHead is not implemented");
   __trap();
-#else
-  uint32_t const idxTile = pos / nbTokens;
-  assert(idxTile == idxTileRef);
-  uint32_t const offset = pos % tokensPerPage;
-  return cacheList
-      .pool[tokensPerPage * (nbKHeads * pages[pos % nbTokens / tokensPerPage] + idxHeadGrp) +
-            offset];
-#endif
-#else
-  // shape: KVCacheHead[batchSize][beamWidth][2][nbKHeads][capacity]
-  return cacheList.data[cacheList.capacity * (baseOffset * nbKHeads + idxHeadGrp) + pos];
-#endif
 }
 
 #if SWAP_AB
@@ -3014,18 +2922,10 @@ void launchHopperF8MHA(
     InputHead const* q,
 #endif
     float const* attentionSinks,  // [headGrpSize]
-#if USE_PAGED_KV_CACHE
-#if PAGED_KV_CACHE_LAYOUT == 1
     GMemCacheHead* kCacheVLLM, GMemCacheHead* vCacheVLLM,
-#else
-    GMemCacheHead* pool,  // global pool of pages
-#endif
     KVCachePageIndex const*
         kvCachePageList,  // device pointer. shape:
                           // KVCachePage[batchSize][beamWidth][2][maxNbPagesPerSeq]
-#else
-    GMemKVCacheHead* kvCacheData,
-#endif
     uint32_t maxSeqLen, uint32_t const* seqLen,
 #if USE_BEAM_SEARCH
     BeamSearchParams const& beamSearchParams,
@@ -3036,7 +2936,8 @@ void launchHopperF8MHA(
 #if SPEC_DEC
     SpecDecParams const& specDecParams,
 #endif
-    uint32_t* semaphores, void* scratch, bool enable_pdl, cudaStream_t stream) {
+    uint32_t* semaphores, void* scratch, bool enable_pdl, uint64_t kv_stride_page,
+    uint64_t kv_stride_token, uint64_t kv_stride_head, cudaStream_t stream) {
   if (beamWidth != 1) {
     throw std::runtime_error("not implemented");
   }
@@ -3074,7 +2975,6 @@ void launchHopperF8MHA(
   dim3 const dimGrid{divUp(qSeqLen, inputTokensPerCta), nbSubSeqPerSeq, nbKHeads * batchSize};
   dim3 const dimCta{warp_size * gmmaWarpsPerGrp, 1, 3};
   auto const launchCfg = makeLaunchConfig(dimGrid, dimCta, hostSmemSize, stream, enable_pdl);
-#if USE_PAGED_KV_CACHE
   uint32_t const maxNbPagesPerSeq = exactDiv(maxSeqLen, tokensPerPage);
   auto const dtype = [] {
     if (std::is_same_v<CacheElem, half>) {
@@ -3087,62 +2987,18 @@ void launchHopperF8MHA(
     throw std::runtime_error("unsupported cache element type");
   }();
 
-#if PAGED_KV_CACHE_LAYOUT == 1
   KVCacheList<true> const cacheList{kCacheVLLM, vCacheVLLM, kvCachePageList, seqLen,
                                     maxNbPagesPerSeq};
 
-  auto const tensorMapVLLMK =
-      makeTensorMapForPagedKVCache(kCacheVLLM, dtype, validElemsPerHead, nbKHeads, tokensPerPage,
-                                   cacheHeadPartElems, gemm0CtaTileNbTokens);
-  auto const tensorMapVLLMV =
-      makeTensorMapForPagedKVCache(vCacheVLLM, dtype, validElemsPerHead, nbKHeads, tokensPerPage,
-                                   cacheHeadPartElems, gemm0CtaTileNbTokens);
-#else
-  KVCacheList<true> const cacheList{pool, kvCachePageList, seqLen, maxNbPagesPerSeq};
-  auto const tensorMap =
-      makeTensorMapForPagedKVCache(pool, dtype, validElemsPerHead, nbKHeads, tokensPerPage,
-                                   cacheHeadPartElems, gemm0CtaTileNbTokens);
-#endif
+  auto const tensorMapVLLMK = makeTensorMapForPagedKVCache(
+      kCacheVLLM, dtype, validElemsPerHead, nbKHeads, tokensPerPage, cacheHeadPartElems,
+      gemm0CtaTileNbTokens, kv_stride_page, kv_stride_token, kv_stride_head);
+  auto const tensorMapVLLMV = makeTensorMapForPagedKVCache(
+      vCacheVLLM, dtype, validElemsPerHead, nbKHeads, tokensPerPage, cacheHeadPartElems,
+      gemm0CtaTileNbTokens, kv_stride_page, kv_stride_token, kv_stride_head);
 
-  cudaError_t const err = cudaLaunchKernelEx(&launchCfg, &kernel_mha, nbKHeads,
-#if SLIDING_WINDOW
-                                             slidingWinSize,
-#endif
-                                             qScale, output,
-#if LOW_PREC_OUTPUT
-                                             rcpOutScale,
-#endif
-#if USE_INPUT_KV
-                                             qkv,
-#if ROPE_STYLE != 0
-                                             ropeCosSin,
-#endif
-#else
-                                             q,
-#endif
-                                             attentionSinks, cacheList,
-#if USE_BEAM_SEARCH
-                                             beamSearchParams,
-#endif
-                                             batchSize, kvCacheScale,
-#if PAGED_KV_CACHE_LAYOUT == 1
-                                             tensorMapVLLMK, tensorMapVLLMV,
-#else
-                                             tensorMap,
-#endif
-#if SPEC_DEC
-                                             specDecParams,
-#endif
-                                             semaphores, scratch);
-#else
-  KVCacheList<false> const cacheList{kvCacheData, seqLen, maxSeqLen};
-  static_assert(!usePagedKVCache);
-  assert(gemm0CtaTileNbTokens == gemm1CtaTileNbTokens);
-  auto const tensorMap = makeTensorMapForContiguousKVCache(
-      kvCacheData, CU_TENSOR_MAP_DATA_TYPE_UINT8, validElemsPerHead, nbKHeads, maxSeqLen, beamWidth,
-      batchSize, cacheHeadPartElems, gemm0CtaTileNbTokens);
   cudaError_t const err =
-      cudaLaunchKernelEx(&launchCfg, kernel_mha, nbKHeads,
+      cudaLaunchKernelEx(&launchCfg, &kernel_mha, nbKHeads,
 #if SLIDING_WINDOW
                          slidingWinSize,
 #endif
@@ -3162,8 +3018,11 @@ void launchHopperF8MHA(
 #if USE_BEAM_SEARCH
                          beamSearchParams,
 #endif
-                         batchSize, kvCacheScale, tensorMap, semaphores, scratch);
+                         batchSize, kvCacheScale, tensorMapVLLMK, tensorMapVLLMV,
+#if SPEC_DEC
+                         specDecParams,
 #endif
+                         semaphores, scratch);
   checkCuda(err);
 }
 #endif
@@ -3183,11 +3042,7 @@ void launchHopperF8MHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads
                                  float const* rcpOutScale,
 #endif
                                  InputHead const* q, float const* attentionSinks,
-#if PAGED_KV_CACHE_LAYOUT == 1
                                  GMemCacheHead* kCacheVLLM, GMemCacheHead* vCacheVLLM,
-#else
-                                 GMemCacheHead* pool,
-#endif
                                  KVCachePageIndex const* kvCachePageList, uint32_t maxSeqLen,
                                  uint32_t const* seqLen, uint32_t batchSize,
                                  float const* __restrict__ kvCacheScale,
@@ -3195,7 +3050,8 @@ void launchHopperF8MHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads
                                  uint32_t qSeqLen, uint32_t const* qCuSeqLens, MaskType const* mask,
 #endif
                                  uint32_t* semaphores, void* scratch, bool enable_pdl,
-                                 cudaStream_t stream) {
+                                 uint64_t kv_stride_page, uint64_t kv_stride_token,
+                                 uint64_t kv_stride_head, cudaStream_t stream) {
   uint32_t const nbSubSeqPerSeq = [&]() -> uint32_t {
     float const factor = 0.25f;
     return mha::min<uint32_t>(
@@ -3212,7 +3068,6 @@ void launchHopperF8MHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads
   dim3 const dimGrid{divUp(qLen, inputTokensPerCta), nbSubSeqPerSeq, nbKHeads * batchSize};
   dim3 const dimCta{warp_size * gmmaWarpsPerGrp, 1, 3};
   auto const launchCfg = makeLaunchConfig(dimGrid, dimCta, hostSmemSize, stream, enable_pdl);
-#if USE_PAGED_KV_CACHE
   uint32_t const maxNbPagesPerSeq = exactDiv(maxSeqLen, tokensPerPage);
   auto const dtype = [] {
     if (std::is_same_v<CacheElem, half>) {
@@ -3225,22 +3080,15 @@ void launchHopperF8MHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads
     throw std::runtime_error("unsupported cache element type");
   }();
 
-#if PAGED_KV_CACHE_LAYOUT == 1
   KVCacheList<true> const cacheList{kCacheVLLM, vCacheVLLM, kvCachePageList, seqLen,
                                     maxNbPagesPerSeq};
 
-  auto const tensorMapVLLMK =
-      makeTensorMapForPagedKVCache(kCacheVLLM, dtype, validElemsPerHead, nbKHeads, tokensPerPage,
-                                   cacheHeadPartElems, gemm0CtaTileNbTokens);
-  auto const tensorMapVLLMV =
-      makeTensorMapForPagedKVCache(vCacheVLLM, dtype, validElemsPerHead, nbKHeads, tokensPerPage,
-                                   cacheHeadPartElems, gemm0CtaTileNbTokens);
-#else
-  KVCacheList<true> const cacheList{pool, kvCachePageList, seqLen, maxNbPagesPerSeq};
-  auto const tensorMap =
-      makeTensorMapForPagedKVCache(pool, dtype, validElemsPerHead, nbKHeads, tokensPerPage,
-                                   cacheHeadPartElems, gemm0CtaTileNbTokens);
-#endif
+  auto const tensorMapVLLMK = makeTensorMapForPagedKVCache(
+      kCacheVLLM, dtype, validElemsPerHead, nbKHeads, tokensPerPage, cacheHeadPartElems,
+      gemm0CtaTileNbTokens, kv_stride_page, kv_stride_token, kv_stride_head);
+  auto const tensorMapVLLMV = makeTensorMapForPagedKVCache(
+      vCacheVLLM, dtype, validElemsPerHead, nbKHeads, tokensPerPage, cacheHeadPartElems,
+      gemm0CtaTileNbTokens, kv_stride_page, kv_stride_token, kv_stride_head);
 
   cudaError_t const err = cudaLaunchKernelEx(&launchCfg, &kernel_mha, nbKHeads,
 #if SLIDING_WINDOW
@@ -3251,33 +3099,11 @@ void launchHopperF8MHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads
                                              rcpOutScale,
 #endif
                                              q, attentionSinks, cacheList, batchSize, kvCacheScale,
-#if PAGED_KV_CACHE_LAYOUT == 1
                                              tensorMapVLLMK, tensorMapVLLMV,
-#else
-                                             tensorMap,
-#endif
 #if SPEC_DEC
                                              specDecParams,
 #endif
                                              semaphores, scratch);
-#else
-  KVCacheList<false> const cacheList{kvCacheData, seqLen, maxSeqLen};
-  static_assert(!usePagedKVCache);
-  assert(gemm0CtaTileNbTokens == gemm1CtaTileNbTokens);
-  auto const tensorMap = makeTensorMapForContiguousKVCache(
-      kvCacheData, CU_TENSOR_MAP_DATA_TYPE_UINT8, validElemsPerHead, nbKHeads, maxSeqLen, beamWidth,
-      batchSize, cacheHeadPartElems, gemm0CtaTileNbTokens);
-  cudaError_t const err = cudaLaunchKernelEx(&launchCfg, kernel_mha, nbKHeads,
-#if SLIDING_WINDOW
-                                             slidingWinSize,
-#endif
-                                             qScale, output,
-#if LOW_PREC_OUTPUT
-                                             rcpOutScale,
-#endif
-                                             q, attentionSinks, cacheList, batchSize, kvCacheScale,
-                                             tensorMap, semaphores, scratch);
-#endif
   checkCuda(err);
 }
 #endif

@@ -148,11 +148,11 @@ def xqa(
         Data type should be torch.float16 or torch.bfloat16.
         Now only beam_width 1 is supported.
     k_cache: torch.Tensor
-        Paged K cache tensor with shape ``[total_num_cache_heads, head_dim]``.
+        Paged K cache tensor with shape ``[num_pages, page_size, num_kv_heads, head_dim]`` (NHD layout).
         Data type should match query tensor or be torch.float8_e4m3fn, in which case xqa will run fp8 calculation.
         Should be the same data type as v_cache.
     v_cache: torch.Tensor
-        Paged V cache tensor with shape ``[total_num_cache_heads, head_dim]``.
+        Paged V cache tensor with shape ``[num_pages, page_size, num_kv_heads, head_dim]`` (NHD layout).
         Data type should match query tensor or be torch.float8_e4m3fn, in which case xqa will run fp8 calculation.
         Should be the same data type as k_cache.
     page_table : torch.Tensor

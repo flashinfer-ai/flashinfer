@@ -49,13 +49,9 @@ class CacheSeq:
 
     def __getitem__(self, i: int) -> torch.Tensor:
         page_idx = self.page_indices[i // self.tokens_per_page].to(torch.int32)
-        # VLLM layout (PAGED_KV_CACHE_LAYOUT=1): [page_idx][token_in_page][nb_heads][head_dim]
-        idx_head = (
-            page_idx * self.tokens_per_page * self.nb_heads
-            + (i % self.tokens_per_page) * self.nb_heads
-            + self.idx_head
-        )
-        return self.pool[idx_head]
+        token_in_page = i % self.tokens_per_page
+        # NHD layout: [page_idx, token_in_page, idx_head, :]
+        return self.pool[page_idx, token_in_page, self.idx_head, :]
 
 
 def ref_attention(
@@ -229,12 +225,14 @@ def test_xqa(
 
     max_seq_len = round_up(seq_len, tokens_per_page)
     nb_pages_per_seq = div_up(max_seq_len, tokens_per_page)
-    # Layout 1: K and V share page indices
-    # Total cache heads = nb_k_heads * max_seq_len * batch_size
-    total_nb_cache_heads = nb_k_heads * max_seq_len * batch_size
+    # Total number of pages needed for all sequences
+    total_num_pages = nb_pages_per_seq * batch_size
 
+    # NHD layout: [num_pages, page_size, num_kv_heads, head_dim]
     cache_k_heads = torch.zeros(
-        total_nb_cache_heads,
+        total_num_pages,
+        tokens_per_page,
+        nb_k_heads,
         valid_elems_per_head,
         dtype=input_type,
         device="cuda",
@@ -242,7 +240,9 @@ def test_xqa(
     cache_k_heads.normal_(0, 1)
 
     cache_v_heads = torch.zeros(
-        total_nb_cache_heads,
+        total_num_pages,
+        tokens_per_page,
+        nb_k_heads,
         valid_elems_per_head,
         dtype=input_type,
         device="cuda",
@@ -282,17 +282,13 @@ def test_xqa(
         nb_k_heads,
         tokens_per_page,
     ):
-        # Layout 1: K and V share page indices
+        # K and V share page indices
         page_idx = page_list[batch][pos // tokens_per_page].to(torch.int32)
+        token_in_page = pos % tokens_per_page
 
-        # VLLM layout: [page_idx][token_in_page][nb_heads][head_dim]
-        idx_head = (
-            page_idx * tokens_per_page * nb_k_heads
-            + (pos % tokens_per_page) * nb_k_heads
-            + idx_kv_head
-        )
-
-        return cache_k_heads[idx_head] if is_k else cache_v_heads[idx_head]
+        # NHD layout: [page_idx, token_in_page, idx_kv_head, :]
+        cache = cache_k_heads if is_k else cache_v_heads
+        return cache[page_idx, token_in_page, idx_kv_head, :]
 
     for batch in range(batch_size):
         for kv in range(2):
@@ -349,7 +345,7 @@ def test_xqa(
     for req in range(batch_size):
         for b in range(beam_width):
             for idx_k_head in range(nb_k_heads):
-                # Layout 1: K and V use separate pools but share page indices
+                # K and V use separate pools but share page indices
                 k_cache_seq = CacheSeq(
                     pool=cache_k_heads,
                     page_indices=page_list_arg[req],
@@ -451,12 +447,14 @@ def test_xqa_mla(
 
     max_seq_len = round_up(seq_len, tokens_per_page)
     nb_pages_per_seq = div_up(max_seq_len, tokens_per_page)
-    # Layout 1: K and V share page indices
-    # Total cache heads = nb_k_heads * max_seq_len * batch_size
-    total_nb_cache_heads = nb_k_heads * max_seq_len * batch_size
+    # Total number of pages needed for all sequences
+    total_num_pages = nb_pages_per_seq * batch_size
 
+    # NHD layout: [num_pages, page_size, num_kv_heads, head_dim]
     cache_k_heads = torch.zeros(
-        total_nb_cache_heads,
+        total_num_pages,
+        tokens_per_page,
+        nb_k_heads,
         valid_elems_per_head_qk,  # K dimension is 576
         dtype=torch.float32,
         device="cuda",
@@ -464,7 +462,9 @@ def test_xqa_mla(
     cache_k_heads.normal_(0, 1)
 
     cache_v_heads = torch.zeros(
-        total_nb_cache_heads,
+        total_num_pages,
+        tokens_per_page,
+        nb_k_heads,
         valid_elems_per_head_qk,  # V storage is 576 (but only 512 used)
         dtype=torch.float32,
         device="cuda",
@@ -502,17 +502,13 @@ def test_xqa_mla(
         nb_k_heads,
         tokens_per_page,
     ):
-        # Layout 1: K and V share page indices
+        # K and V share page indices
         page_idx = page_list[batch][pos // tokens_per_page].to(torch.int32)
+        token_in_page = pos % tokens_per_page
 
-        # VLLM layout: [page_idx][token_in_page][nb_heads][head_dim]
-        idx_head = (
-            page_idx * tokens_per_page * nb_k_heads
-            + (pos % tokens_per_page) * nb_k_heads
-            + idx_kv_head
-        )
-
-        return cache_k_heads[idx_head] if is_k else cache_v_heads[idx_head]
+        # NHD layout: [page_idx, token_in_page, idx_kv_head, :]
+        cache = cache_k_heads if is_k else cache_v_heads
+        return cache[page_idx, token_in_page, idx_kv_head, :]
 
     for batch in range(batch_size):
         for kv in range(2):
@@ -566,7 +562,7 @@ def test_xqa_mla(
     for req in range(batch_size):
         for b in range(beam_width):
             for idx_k_head in range(nb_k_heads):
-                # Layout 1: K and V use separate pools but share page indices
+                # K and V use separate pools but share page indices
                 k_cache_seq = CacheSeq(
                     pool=cache_k_heads,
                     page_indices=page_list_arg[req],

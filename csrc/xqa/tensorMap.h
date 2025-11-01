@@ -13,4 +13,5 @@ CUtensorMap makeTensorMapForContiguousKVCache(void const* addr, CUtensorMapDataT
 CUtensorMap makeTensorMapForPagedKVCache(void const* addr, CUtensorMapDataType_enum dataType,
                                          uint32_t headElems, uint32_t nbKHeads,
                                          uint32_t tokensPerPage, uint32_t partElems,
-                                         uint32_t nbTokensPerTile);
+                                         uint32_t nbTokensPerTile, uint64_t stride_page,
+                                         uint64_t stride_token, uint64_t stride_head);

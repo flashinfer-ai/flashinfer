@@ -2370,8 +2370,6 @@ def xqa_batch_decode_with_kv_cache(
     kv_scale_value = bmm2_scale
     q_scale_value = bmm1_scale / kv_scale_value * (head_dim**0.5)
 
-    k_cache_new = k_cache.reshape(-1, head_dim).contiguous()
-    v_cache_new = v_cache.reshape(-1, head_dim).contiguous()
     query_new = query.unsqueeze(1).contiguous()
     seq_lens_new = seq_lens.unsqueeze(1).contiguous()
     sinks_new = (
@@ -2380,8 +2378,8 @@ def xqa_batch_decode_with_kv_cache(
 
     xqa(
         query_new,
-        k_cache_new,
-        v_cache_new,
+        k_cache,
+        v_cache,
         block_tables,
         seq_lens_new,
         out,
