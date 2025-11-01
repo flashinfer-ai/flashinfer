@@ -562,7 +562,6 @@ def test_xqa_mla(
                         beam_width,
                         nb_k_heads,
                         tokens_per_page,
-                        "NHD",  # MLA only supports NHD layout
                     )
                     cache_head.fill_(0.0)
 
