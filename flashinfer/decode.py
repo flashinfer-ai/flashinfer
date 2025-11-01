@@ -2432,8 +2432,8 @@ def xqa_batch_decode_with_kv_cache(
         head_dim = k_cache.shape[3]
 
     workspace_u8 = workspace_buffer.view(torch.uint8)
-    semaphore = workspace_u8[: round_up(4 * sm_count, 16)]
-    scratch = workspace_u8[round_up(4 * sm_count, 16) :]
+    semaphore = workspace_u8[: 8 * 1024 * 1024]  # reserve 8MB for semaphore
+    scratch = workspace_u8[8 * 1024 * 1024 :]
     kv_scale_value = bmm2_scale
     q_scale_value = bmm1_scale / kv_scale_value * (head_dim**0.5)
 
