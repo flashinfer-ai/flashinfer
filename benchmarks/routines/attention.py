@@ -508,6 +508,8 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
     has_reference_output = False
     # Iterate over each backend:
     for cur_backend in backends:
+        # Clear workspace buffer to prevent unexpected interactions between backends.
+        workspace_buffer.zero_()
         if run_refcheck:
             outputs[cur_backend] = run_backend_wrapper(cur_backend).detach().clone()
             if cur_backend == "fa2":
@@ -975,6 +977,8 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
     has_reference_output = False
     # Iterate over each backend:
     for cur_backend in backends:
+        # Clear workspace buffer to prevent unexpected interactions between backends.
+        workspace_buffer.zero_()
         if run_refcheck:
             outputs[cur_backend] = run_backend_wrapper(cur_backend).detach().clone()
             if cur_backend == "fa2":
@@ -1427,6 +1431,8 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
     has_reference_output = False
     # Iterate over each backend:
     for cur_backend in backends:
+        # Clear workspace buffer to prevent unexpected interactions between backends.
+        workspace_buffer.zero_()
         if run_refcheck:
             outputs[cur_backend] = run_backend_wrapper(cur_backend).detach().clone()
             if cur_backend == "fa2":
@@ -1822,6 +1828,8 @@ def testBatchMLAPagedAttentionWrapper(args):
     has_reference_output = False
     # Iterate over each backend:
     for cur_backend in backends:
+        # Clear workspace buffer to prevent unexpected interactions between backends.
+        workspace_buffer.zero_()
         if run_refcheck:
             outputs[cur_backend] = run_backend_wrapper(cur_backend).detach().clone()
             if cur_backend == "fa2":

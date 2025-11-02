@@ -1133,7 +1133,6 @@ def test_trtllm_batch_decode_long_sequence_length(
     head_dim,
 ):
     # Small number of test cases for long sequence length
-    pytest.xfail("trtllm-gen decode gets incorrect output with Long sequence length")
     _test_trtllm_batch_decode(
         "trtllm-gen",
         kv_layout,
