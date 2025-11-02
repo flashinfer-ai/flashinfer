@@ -21,6 +21,7 @@ from typing import Any, List, Literal, Optional, Tuple, Union, overload
 
 import torch
 
+from .xqa import xqa
 from .cudnn import cudnn_batch_decode_with_kv_cache as cudnn_batch_decode_with_kv_cache
 from .jit import (
     gen_batch_decode_mla_module,
@@ -983,7 +984,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
         else:
             kv_lens_arr_host = seq_lens.cpu()
         if self._backend == "trtllm-gen":
-            assert self._kv_layout == "HND"
             assert logits_soft_cap == 0.0
             self._max_kv_len = max(kv_lens_arr_host).item()
             self._kv_lens_buffer[: len(kv_lens_arr_host)].copy_(
@@ -1226,6 +1226,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
         k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
+
         if self._kv_layout == "NHD":
             page_size = k_cache.shape[1]
         else:
@@ -1233,6 +1234,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
         _check_cached_qkv_data_type(
             q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
         )
+
+        # Convert NHD layout to HND for trtllm-gen backend
+        if self._backend == "trtllm-gen" and self._kv_layout == "NHD":
+            # For NHD: [..., N, H, D] -> HND: [..., H, N, D]
+            k_cache = k_cache.transpose(-3, -2)
+            v_cache = v_cache.transpose(-3, -2)
 
         pos_encoding_mode = self._pos_encoding_mode
         window_left = self._window_left if window_left is None else window_left
@@ -2066,7 +2073,9 @@ def trtllm_batch_decode_with_kv_cache(
     o_sf_scale: Optional[float] = None,
     o_sf_vec_size: Optional[int] = None,
     sinks: Optional[List[torch.Tensor]] = None,
-    enable_pdl: bool = None,
+    kv_layout: str = "HND",
+    enable_pdl: Optional[bool] = None,
+    backend: str = "auto",
     q_len_per_req: Optional[int] = 1,
 ) -> Union[torch.Tensor, FP4Tensor]:
     """
@@ -2076,8 +2085,11 @@ def trtllm_batch_decode_with_kv_cache(
         query tensor with shape [num_tokens, num_heads, head_dim], num_tokens = batch_size * q_len_per_request
 
     kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
-        If kv_cache is a single tensor, it should be a tensor with shape [num_pages, 1 or 2, num_kv_heads, page_size, head_dim]
-        If kv_cache is a tuple of two tensors, it should be a tuple of two tensors with shape [num_pages, num_kv_heads, page_size, head_dim]
+        If kv_cache is a single tensor, it should be a tensor with shape [num_pages, 1 or 2, num_kv_heads, page_size, head_dim] if :attr:`kv_layout` is ``HND``,
+        or [num_pages, 1 or 2, page_size, num_kv_heads, head_dim] if :attr:`kv_layout` is ``NHD``.
+        If kv_cache is a tuple of two tensors, it should be a tuple of two tensors with shape [num_pages, num_kv_heads, page_size, head_dim] if :attr:`kv_layout` is ``HND``,
+        or [num_pages, page_size, num_kv_heads, head_dim] if :attr:`kv_layout` is ``NHD``.
+        The first tensor is the key cache, and the second tensor is the value cache.
 
     workspace_buffer : torch.Tensor. Must be initialized to 0 for its first use.
         workspace
@@ -2116,9 +2128,19 @@ def trtllm_batch_decode_with_kv_cache(
     sinks : Optional[List[torch.Tensor]] = None
         additional value per head in the denominator of the softmax.
 
-    enable_pdl : bool
+    kv_layout : str = "HND"
+        The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
+        Defaults to ``HND``.
+
+    enable_pdl : Optional[bool] = None
         Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
-        Only supported for >= sm90, and currently only for FA2, CUDA core, and trtllm-gen decode.
+        When set to ``None``, the backend will be chosen based on the device architecture and kernel availability.
+
+    backend : str = "auto"
+        The implementation backend, could be ``auto``/``xqa`` or ``trtllm-gen``. Defaults to ``auto``.
+        When set to ``auto``, the backend will be chosen based on the device architecture and kernel availability.
+        For sm_100 and sm_103 (blackwell architecture), ``auto`` will choose ``trtllm-gen`` backend.
+        For sm_90 (hopper architecture) and sm_120 (blackwell architecture), ``auto`` will choose ``xqa`` backend.
 
     Returns
     -------
@@ -2140,80 +2162,255 @@ def trtllm_batch_decode_with_kv_cache(
             # it doesn't change underlying storage
             k_cache, v_cache = kv_cache.unbind(dim=1)
 
-    run_func = get_trtllm_gen_fmha_module().trtllm_paged_attention_decode
-    sm_count = get_device_sm_count(query.device)
-
-    if out_dtype == "nvfp4" or (out_dtype is None and isinstance(out, FP4Tensor)):
-        assert query.dtype == torch.float8_e4m3fn, (
-            "query must be fp8 when out_dtype is nvfp4."
-        )
-        assert o_sf_scale is not None
-        assert o_sf_vec_size in [None, 16], "only o_sf_vec_size = 16 is supported"
-        o_sf_vec_size = o_sf_vec_size or 16
-
-        fp4_out_shape = query.shape[:-1] + (ceil_div(query.shape[-1], 2),)
-
-        if isinstance(out, FP4Tensor):
-            fp4_out_scale_shape = (
-                out.scale.shape[0],
-                round_up(query.shape[1] * query.shape[2] // o_sf_vec_size, 4),
-            )
-            out_scale_factor = out.scale
-            o_sf_start_index = out.scale_start_index
-            out = out.data
-            # out_dtype may be None
-            out_dtype = out_dtype or "nvfp4"
-        elif out is None:
-            fp4_out_scale_shape = (
-                round_up(query.shape[0], 128),
-                round_up(query.shape[1] * query.shape[2] // o_sf_vec_size, 4),
-            )
-            out_scale_factor = torch.empty(
-                fp4_out_scale_shape, dtype=torch.float8_e4m3fn, device=query.device
-            )
-            o_sf_start_index = 0
-            out = torch.empty(fp4_out_shape, dtype=torch.uint8, device=query.device)
-        else:
-            raise ValueError(f"Invalid out: {out}")
-
-        assert out_dtype == "nvfp4"
-        assert isinstance(out, torch.Tensor)
-
-        # Use uint8 as the container dtype to compliant with next fp4 gemm.
-        check_shape_dtype_device(out, fp4_out_shape, torch.uint8, query.device, "out")
-
-        check_shape_dtype_device(
-            out_scale_factor,
-            fp4_out_scale_shape,
-            torch.float8_e4m3fn,
-            query.device,
-            "out_scale_factor",
+    if backend == "auto":
+        backend = (
+            "trtllm-gen" if get_compute_capability(query.device)[0] == 10 else "xqa"
         )
 
-        # Check o_sf_start_index is valid
-        if (
-            o_sf_start_index < 0
-            or o_sf_start_index + out.shape[0] > out_scale_factor.shape[0]
-        ):
-            raise ValueError(
-                f"o_sf_start_index is out of the valid range of out_scale_factor. "
-                f"o_sf_start_index={o_sf_start_index}, out.shape[0]={out.shape[0]}, "
-                f"out_scale_factor.shape[0]={out_scale_factor.shape[0]}"
-            )
+    if backend == "xqa":
+        # xqa backend doesn't support nvfp4 output
+        if out_dtype == "nvfp4" or (out_dtype is None and isinstance(out, FP4Tensor)):
+            raise ValueError("xqa backend does not support nvfp4 output")
+        if o_sf_scale is not None or o_sf_vec_size is not None:
+            raise ValueError("xqa backend does not support o_sf_scale or o_sf_vec_size")
 
-    elif isinstance(out_dtype, torch.dtype) or out_dtype is None:
-        assert o_sf_scale is None
-        assert o_sf_vec_size is None
-        out_scale_factor = None
-        o_sf_start_index = 0
+        # Handle out and out_dtype
         if out_dtype is None:
             out_dtype = out.dtype if out is not None else query.dtype
-        out = out if out is not None else torch.empty_like(query, dtype=out_dtype)
-        if out_dtype not in (query.dtype, torch.float16, torch.bfloat16):
-            raise ValueError(f"Unsupported out_dtype: {out_dtype}")
-        check_shape_dtype_device(out, query.shape, out_dtype, query.device, "out")
+        if out is None:
+            out = torch.empty_like(query, dtype=out_dtype)
+
+        # Call xqa_batch_decode_with_kv_cache
+        return xqa_batch_decode_with_kv_cache(
+            query=query,
+            kv_cache=(k_cache, v_cache),
+            workspace_buffer=workspace_buffer,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            max_seq_len=max_seq_len,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            window_left=window_left,
+            out=out,
+            sinks=sinks,
+            kv_layout=kv_layout,
+            enable_pdl=enable_pdl,
+            q_len_per_req=q_len_per_req,
+        )
+    elif backend == "trtllm-gen":
+        # Convert NHD layout to HND if necessary (transpose only changes stride, not data)
+        if kv_layout == "NHD":
+            # For NHD: [..., N, H, D] -> HND: [..., H, N, D]
+            k_cache = k_cache.transpose(-3, -2)
+            v_cache = v_cache.transpose(-3, -2)
+
+        run_func = get_trtllm_gen_fmha_module().trtllm_paged_attention_decode
+        sm_count = get_device_sm_count(query.device)
+
+        if out_dtype == "nvfp4" or (out_dtype is None and isinstance(out, FP4Tensor)):
+            assert query.dtype == torch.float8_e4m3fn, (
+                "query must be fp8 when out_dtype is nvfp4."
+            )
+            assert o_sf_scale is not None
+            assert o_sf_vec_size in [None, 16], "only o_sf_vec_size = 16 is supported"
+            o_sf_vec_size = o_sf_vec_size or 16
+
+            fp4_out_shape = query.shape[:-1] + (ceil_div(query.shape[-1], 2),)
+
+            if isinstance(out, FP4Tensor):
+                fp4_out_scale_shape = (
+                    out.scale.shape[0],
+                    round_up(query.shape[1] * query.shape[2] // o_sf_vec_size, 4),
+                )
+                out_scale_factor = out.scale
+                o_sf_start_index = out.scale_start_index
+                out = out.data
+                # out_dtype may be None
+                out_dtype = out_dtype or "nvfp4"
+            elif out is None:
+                fp4_out_scale_shape = (
+                    round_up(query.shape[0], 128),
+                    round_up(query.shape[1] * query.shape[2] // o_sf_vec_size, 4),
+                )
+                out_scale_factor = torch.empty(
+                    fp4_out_scale_shape, dtype=torch.float8_e4m3fn, device=query.device
+                )
+                o_sf_start_index = 0
+                out = torch.empty(fp4_out_shape, dtype=torch.uint8, device=query.device)
+            else:
+                raise ValueError(f"Invalid out: {out}")
+
+            assert out_dtype == "nvfp4"
+            assert isinstance(out, torch.Tensor)
+
+            # Use uint8 as the container dtype to compliant with next fp4 gemm.
+            check_shape_dtype_device(
+                out, fp4_out_shape, torch.uint8, query.device, "out"
+            )
+
+            check_shape_dtype_device(
+                out_scale_factor,
+                fp4_out_scale_shape,
+                torch.float8_e4m3fn,
+                query.device,
+                "out_scale_factor",
+            )
+
+            # Check o_sf_start_index is valid
+            if (
+                o_sf_start_index < 0
+                or o_sf_start_index + out.shape[0] > out_scale_factor.shape[0]
+            ):
+                raise ValueError(
+                    f"o_sf_start_index is out of the valid range of out_scale_factor. "
+                    f"o_sf_start_index={o_sf_start_index}, out.shape[0]={out.shape[0]}, "
+                    f"out_scale_factor.shape[0]={out_scale_factor.shape[0]}"
+                )
+
+        elif isinstance(out_dtype, torch.dtype) or out_dtype is None:
+            assert o_sf_scale is None
+            assert o_sf_vec_size is None
+            out_scale_factor = None
+            o_sf_start_index = 0
+            if out_dtype is None:
+                out_dtype = out.dtype if out is not None else query.dtype
+            out = out if out is not None else torch.empty_like(query, dtype=out_dtype)
+            if out_dtype not in (query.dtype, torch.float16, torch.bfloat16):
+                raise ValueError(f"Unsupported out_dtype: {out_dtype}")
+            check_shape_dtype_device(out, query.shape, out_dtype, query.device, "out")
+        else:
+            raise ValueError(f"Invalid out_dtype: {out_dtype}")
+
+        bmm1_scale = (
+            bmm1_scale.item() if isinstance(bmm1_scale, torch.Tensor) else bmm1_scale
+        )
+        bmm2_scale = (
+            bmm2_scale.item() if isinstance(bmm2_scale, torch.Tensor) else bmm2_scale
+        )
+
+        run_func(
+            out,
+            out_scale_factor,
+            query.view(
+                query.size(0) // q_len_per_req,
+                q_len_per_req,
+                query.size(1),
+                query.size(2),
+            ),
+            k_cache,
+            v_cache,
+            workspace_buffer,
+            block_tables,
+            seq_lens,
+            max_seq_len,
+            bmm1_scale,
+            bmm2_scale,
+            o_sf_scale or -1.0,
+            o_sf_vec_size or -1,
+            o_sf_start_index,
+            window_left,
+            sm_count,
+            enable_pdl,
+            workspace_buffer.numel() * workspace_buffer.element_size(),
+            sinks,
+        )
+
+        return (
+            out
+            if out_dtype != "nvfp4"
+            else FP4Tensor(out, out_scale_factor, o_sf_start_index, query.shape)
+        )
     else:
-        raise ValueError(f"Invalid out_dtype: {out_dtype}")
+        raise KeyError(f"Backend {backend} not supported")
+
+
+# xqa uses NHD layout
+def xqa_batch_decode_with_kv_cache(
+    query: torch.Tensor,
+    kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+    workspace_buffer: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_seq_len: int,
+    bmm1_scale: float,
+    bmm2_scale: float,
+    window_left: int = -1,
+    out: Optional[torch.Tensor] = None,
+    sinks: Optional[torch.Tensor] = None,
+    kv_layout: str = "NHD",
+    enable_pdl: bool = None,
+    q_len_per_req: Optional[int] = 1,
+) -> torch.Tensor:
+    """
+    Parameters
+    ----------
+    query : torch.Tensor
+        query tensor with shape [num_tokens, num_heads, head_dim], num_tokens = batch_size * q_len_per_request
+
+    kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        If kv_cache is a single tensor, it should be a tensor with shape [num_pages, 1 or 2, page_size, num_kv_heads, head_dim] if :attr:`kv_layout` is ``NHD``,
+        or [num_pages, 1 or 2, num_kv_heads, page_size, head_dim] if :attr:`kv_layout` is ``HND``.
+        If kv_cache is a tuple of two tensors, it should be a tuple of two tensors with shape [num_pages, page_size, num_kv_heads, head_dim] if :attr:`kv_layout` is ``NHD``,
+        or [num_pages, num_kv_heads, page_size, head_dim] if :attr:`kv_layout` is ``HND``.
+
+    workspace_buffer : torch.Tensor. Must be initialized to 0 for its first use.
+        workspace
+
+    block_tables : torch.Tensor
+        page_table of kv cache, [batch_size, num_pages]
+
+    seq_lens : torch.Tensor
+        A uint32 1D tensor indicating the kv sequence length of each prompt. shape: ``[batch_size]``
+
+    max_seq_len : int
+        max sequence length for kv_cache
+
+    bmm1_scale : float
+        fused scale for bmm1 input.
+
+    bmm2_scale : float
+        fused scale for bmm2 input.
+
+    window_left : int = -1
+        The left (inclusive) window size for the attention window, when set to ``-1``, the window
+        size will be set to the full length of the sequence. Defaults to ``-1``.
+
+    out :  Optional[torch.Tensor] = None
+        output tensor, if not provided, will be allocated with ``query.dtype``.
+
+    sinks : Optional[torch.Tensor] = None
+        additional value per head in the denominator of the softmax.
+
+    kv_layout : str
+        The layout of the kv cache. Can be either ``NHD`` or ``HND``. Defaults to ``NHD``.
+
+    enable_pdl : bool
+        Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
+        Only supported for >= sm90, and currently only for FA2, CUDA core, and trtllm-gen decode.
+
+    Returns
+    -------
+    out : torch.Tensor
+        output torch.Tensor.
+    """
+    enable_pdl = device_support_pdl(query.device) if enable_pdl is None else enable_pdl
+
+    assert q_len_per_req == 1, "xqa not support speculative decoding yet"
+
+    if isinstance(kv_cache, tuple):
+        k_cache, v_cache = kv_cache
+    else:
+        if kv_cache.shape[1] == 1:
+            k_cache, v_cache = kv_cache, kv_cache
+        else:
+            assert kv_cache.shape[1] == 2, (
+                "When kv_cache is a single tensor, the second dimension must be 1 or 2"
+            )
+            # NOTE(Zihao): unbind transforms [num_pages, 2, ...] to ([num_pages, ...], [num_pages, ...])
+            # it doesn't change underlying storage
+            k_cache, v_cache = kv_cache.unbind(dim=1)
+
+    sm_count = get_device_sm_count(query.device)
 
     bmm1_scale = (
         bmm1_scale.item() if isinstance(bmm1_scale, torch.Tensor) else bmm1_scale
@@ -2222,35 +2419,58 @@ def trtllm_batch_decode_with_kv_cache(
         bmm2_scale.item() if isinstance(bmm2_scale, torch.Tensor) else bmm2_scale
     )
 
-    run_func(
-        out,
-        out_scale_factor,
-        query.view(
-            query.size(0) // q_len_per_req, q_len_per_req, query.size(1), query.size(2)
-        ),
-        k_cache,
-        v_cache,
-        workspace_buffer,
-        block_tables,
-        seq_lens,
-        max_seq_len,
-        bmm1_scale,
-        bmm2_scale,
-        o_sf_scale or -1.0,
-        o_sf_vec_size or -1,
-        o_sf_start_index,
-        window_left,
-        sm_count,
-        enable_pdl,
-        workspace_buffer.numel() * workspace_buffer.element_size(),
-        sinks,
+    # Extract shape parameters based on layout
+    if kv_layout == "NHD":
+        # NHD: [num_pages, page_size, num_kv_heads, head_dim]
+        page_size = k_cache.shape[1]
+        num_kv_heads = k_cache.shape[2]
+        head_dim = k_cache.shape[3]
+    else:  # HND
+        # HND: [num_pages, num_kv_heads, page_size, head_dim]
+        num_kv_heads = k_cache.shape[1]
+        page_size = k_cache.shape[2]
+        head_dim = k_cache.shape[3]
+
+    workspace_u8 = workspace_buffer.view(torch.uint8)
+    semaphore = workspace_u8[: 8 * 1024 * 1024]  # reserve 8MB for semaphore
+    scratch = workspace_u8[8 * 1024 * 1024 :]
+    kv_scale_value = bmm2_scale
+    q_scale_value = bmm1_scale / kv_scale_value * (head_dim**0.5)
+
+    query_new = query.unsqueeze(1).contiguous()
+    seq_lens_new = seq_lens.unsqueeze(1).contiguous()
+    sinks_new = (
+        sinks.reshape(num_kv_heads, -1).contiguous() if sinks is not None else None
     )
 
-    return (
-        out
-        if out_dtype != "nvfp4"
-        else FP4Tensor(out, out_scale_factor, o_sf_start_index, query.shape)
+    # Ensure 4D output for xqa
+    if out is None:
+        out = torch.empty_like(query)
+    out_4d = out.unsqueeze(1)
+
+    xqa(
+        query_new,
+        k_cache,
+        v_cache,
+        block_tables,
+        seq_lens_new,
+        out_4d,
+        scratch,
+        semaphore,
+        num_kv_heads,
+        page_size,
+        sinks=sinks_new,
+        q_scale=q_scale_value,
+        kv_scale=torch.tensor(
+            [kv_scale_value], dtype=torch.float32, device=query.device
+        ),
+        sliding_win_size=window_left + 1 if window_left >= 0 else 0,
+        kv_layout=kv_layout,
+        sm_count=sm_count,
+        enable_pdl=enable_pdl,
     )
+
+    return out
 
 
 def _check_trtllm_gen_mla_shape(
@@ -2410,6 +2630,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
         workspace_buffer.numel() * workspace_buffer.element_size(),
         sinks,
     )
+
     return out
 
 

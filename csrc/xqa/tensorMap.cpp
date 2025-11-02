@@ -75,28 +75,19 @@ CUtensorMap makeTensorMapForContiguousKVCache(void const* addr, CUtensorMapDataT
 CUtensorMap makeTensorMapForPagedKVCache(void const* addr, CUtensorMapDataType_enum dataType,
                                          uint32_t headElems, uint32_t nbKHeads,
                                          uint32_t tokensPerPage, uint32_t partElems,
-                                         uint32_t nbTokensPerTile) {
+                                         uint32_t nbTokensPerTile, uint64_t stride_page,
+                                         uint64_t stride_token, uint64_t stride_head) {
   CUtensorMap tensorMap{};
   uint32_t elemBytes = getElemBytes(dataType);
-// VLLM Layout
-#if PAGED_KV_CACHE_LAYOUT == 1
+  // VLLM Layout
   uint64_t const globalDims[] = {headElems, nbKHeads, tokensPerPage, 1U << 31};
   uint32_t const headBytes = elemBytes * headElems;
-  uint64_t const globalStrides[] = {headBytes, headBytes * nbKHeads,
-                                    headBytes * nbKHeads * tokensPerPage};
+  // Use provided strides (in elements) and convert to bytes
+  uint64_t const globalStrides[] = {stride_head * elemBytes, stride_token * elemBytes,
+                                    stride_page * elemBytes};
   uint32_t const partBytes = partElems * elemBytes;
   uint32_t const boxDims[] = {partElems, 1, mha::min(tokensPerPage, nbTokensPerTile), 1};
   uint32_t const elemStrides[] = {1, 1, 1, 1};
-  // XQA Original Layout
-#else
-  uint64_t const globalDims[] = {headElems, tokensPerPage, nbKHeads, 1U << 31};
-  uint32_t const headBytes = elemBytes * headElems;
-  uint64_t const globalStrides[] = {headBytes, headBytes * tokensPerPage,
-                                    headBytes * tokensPerPage * nbKHeads};
-  uint32_t const partBytes = partElems * elemBytes;
-  uint32_t const boxDims[] = {partElems, mha::min(tokensPerPage, nbTokensPerTile), 1, 1};
-  uint32_t const elemStrides[] = {1, 1, 1, 1};
-#endif
 
   auto const swizzle = [&] {
     switch (partBytes) {
