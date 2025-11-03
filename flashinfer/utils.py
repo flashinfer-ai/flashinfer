@@ -23,6 +23,7 @@ import torch
 import torch.version
 from torch.torch_version import TorchVersion
 from torch.torch_version import __version__ as torch_version
+import inspect
 
 from .jit.spdlog import gen_spdlog_module
 
@@ -950,6 +951,19 @@ def backend_requirement(
     """
 
     def decorator(func):
+        def get_backend(args, kwargs):
+            # backend may not be specified, but could have a default value
+            sig = inspect.signature(func)
+            backend_parameter = sig.parameters.get("backend")
+            if (
+                backend_parameter
+                and backend_parameter.default != inspect.Parameter.empty
+            ):
+                backend = kwargs.get("backend", backend_parameter.default)
+            else:
+                backend = kwargs.get("backend")
+            return backend
+
         def is_backend_supported(backend, cc=None):
             # Is this backend present?
             if backend not in backend_checks:
@@ -972,7 +986,7 @@ def backend_requirement(
             )
 
         def is_problem_size_supported(*args, **kwargs):
-            backend = kwargs.get("backend")
+            backend = get_backend(args, kwargs)
             if backend not in backend_checks:
                 raise BackendSupportedError(
                     f"Backend '{backend}' is not supported for {func.__name__}"
@@ -985,12 +999,13 @@ def backend_requirement(
 
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
-            backend = kwargs.get("backend")
             # skip_check is an optional argument that the decorator adds to any API function.
             # It prevents the performance overhead of checking.
             skip_check = kwargs.pop("skip_check", False)
 
             if not skip_check:
+                backend = get_backend(args, kwargs)
+
                 capability = None
                 # Find the first tensor argument.
                 # Assume all tensors are on the same device/capability.
