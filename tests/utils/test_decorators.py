@@ -138,14 +138,21 @@ def test_backend_requirement_empty_backends_with_common_check_cc():
     # Check compute capability support (only common_check)
     assert unsupported_kernel.is_compute_capability_supported(42) is True
     assert unsupported_kernel.is_compute_capability_supported(75) is False
-    assert unsupported_kernel.is_backend_supported(None, 42) is True
-    assert unsupported_kernel.is_backend_supported(None, 75) is False
+    # Undefined behaviour: is_backend_supported with no backend choices
+    with pytest.raises(
+        ValueError,
+        match="Invalid is_backend_supported call: no backend choices for unsupported_kernel",
+    ):
+        unsupported_kernel.is_backend_supported(None, 42)
+        unsupported_kernel.is_backend_supported(None, 75)
 
     # Test compute capability support during kernel runtime
     x = torch.randn(10, 10, device="cuda")
 
     # Will always raise error because no real compute capability is supported
-    with pytest.raises(BackendSupportedError, match="does not support backend"):
+    with pytest.raises(
+        BackendSupportedError, match="does not support compute capability"
+    ):
         unsupported_kernel(x)
 
     actual_capability = torch.cuda.get_device_capability(x.device)
@@ -164,12 +171,75 @@ def test_backend_requirement_empty_backends_with_common_check_cc():
         return x * 2
 
     assert supported_kernel.is_compute_capability_supported(actual_capability) is True
-    assert supported_kernel.is_backend_supported(None, actual_capability) is True
-    assert (
-        supported_kernel.is_backend_supported("any_backend", actual_capability) is True
-    )
+    # Undefined behaviour: is_backend_supported with no backend choices
+    with pytest.raises(
+        ValueError,
+        match="Invalid is_backend_supported call: no backend choices for supported_kernel",
+    ):
+        supported_kernel.is_backend_supported(None, actual_capability)
+    assert supported_kernel.has_backend("random_backend") is False
+
     result = supported_kernel(x)
     assert result.shape == x.shape
+
+
+def test_has_backend():
+    """Test the has_backend method."""
+
+    @backend_requirement({"cudnn": lambda x: True, "cutlass": lambda x: True})
+    def my_kernel(x, backend="cudnn"):
+        return x * 2
+
+    assert my_kernel.has_backend("cudnn") is True
+    assert my_kernel.has_backend("cutlass") is True
+    assert my_kernel.has_backend("random_backend") is False
+
+
+def test_has_backend_choices():
+    """Test the has_backend_choices method."""
+
+    @backend_requirement({"cudnn": lambda x: True, "cutlass": lambda x: True})
+    def my_kernel(x, backend="cudnn"):
+        return x * 2
+
+    @backend_requirement({})
+    def my_kernel_no_backend(x):
+        return x * 2
+
+    assert my_kernel.has_backend_choices() is True
+    assert my_kernel_no_backend.has_backend_choices() is False
+
+
+# def test_backend_requirement_suitable_auto_backends():
+#     """Test the backend_requirement decorator's suitable_auto_backends method."""
+#     if not torch.cuda.is_available():
+#         pytest.skip("Skipping CUDA tests (no GPU available)")
+
+#     @supported_compute_capability([80, 86, 89, 90])
+#     def _cutlass_check(x, backend):
+#         return True
+
+#     @supported_compute_capability([75, 80, 86, 89, 90])
+#     def _cudnn_check(x, backend):
+#         return True
+
+#     @supported_compute_capability([75, 80, 86, 89, 90])
+#     def _cublas_check(x):
+#         if x.shape[0] > 2:
+#             return False
+#         return True
+
+#     @backend_requirement(
+#         {"cutlass": _cutlass_check, "cudnn": _cudnn_check, "cublas": _cublas_check},
+#     )
+#     def my_kernel(x, backend):
+#         assert my_kernel.suitable_auto_backends() == [backend]
+#         return x * 2
+
+#     x = torch.randn(10, 10, device="cuda")
+#     test_capability = 75 # only cudnn supports 75
+#     suitable_auto_backends = my_kernel.suitable_auto_backends(test_capability)
+#     assert suitable_auto_backends == ["cudnn"]
 
 
 def test_backend_requirement_wrapped_function():

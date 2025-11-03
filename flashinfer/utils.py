@@ -957,41 +957,39 @@ def backend_requirement(
 
         def is_backend_supported(backend, cc=None):
             # No backend-specific checks
-            if not backend_checks:
-                if common_check is not None and hasattr(
-                    common_check, "is_compute_capability_supported"
-                ):
-                    return common_check.is_compute_capability_supported(cc)
-                return True
-
-            # Is this backend present?
-            if backend not in backend_checks:
+            if not has_backend_choices():
+                raise ValueError(
+                    f"Invalid is_backend_supported call: no backend choices for {func.__name__}"
+                )
+            else:
+                # Is this backend present?
+                if backend not in backend_checks:
+                    return False
+                req_checker = backend_checks[backend]
+                # If user just wants to check if the backend is supported (regardless of compute capability), return True
+                if cc is None:
+                    return True
+                # Check compute capability support via attribute on requirement function
+                elif hasattr(req_checker, "is_compute_capability_supported"):
+                    return req_checker.is_compute_capability_supported(cc)
                 return False
-            req_checker = backend_checks[backend]
-            # If user just wants to check if the backend is supported (regardless of compute capability), return True
-            if cc is None:
-                return True
-            # Check compute capability support via attribute on requirement function
-            elif hasattr(req_checker, "is_compute_capability_supported"):
-                return req_checker.is_compute_capability_supported(cc)
-            return False
 
         def is_compute_capability_supported(cc):
             # Handle empty backend_checks case
-            if not backend_checks:
+            if not has_backend_choices():
                 # No backend-specific checks, only check common_check
-                if common_check is not None and hasattr(
-                    common_check, "is_compute_capability_supported"
-                ):
-                    return common_check.is_compute_capability_supported(cc)
-                return True  # No restrictions at all
-
-            # True if any backend requirement supports this cc
-            return any(
-                hasattr(checker, "is_compute_capability_supported")
-                and checker.is_compute_capability_supported(cc)
-                for checker in backend_checks.values()
-            )
+                if not hasattr(common_check, "is_compute_capability_supported"):
+                    raise ValueError(
+                        f"Invalid is_compute_capability_supported call: {common_check.__name__} does not have is_compute_capability_supported method"
+                    )
+                return common_check.is_compute_capability_supported(cc)
+            else:
+                # True if any backend requirement supports this cc
+                return any(
+                    hasattr(checker, "is_compute_capability_supported")
+                    and checker.is_compute_capability_supported(cc)
+                    for checker in backend_checks.values()
+                )
 
         # @note: this function does not automatically apply defaults to the arguments.
         def _is_problem_size_supported(*args, **kwargs):
@@ -999,10 +997,8 @@ def backend_requirement(
             backend = kwargs.get("backend")
 
             # Handle empty backend_checks case
-            if not backend_checks:
-                if common_check is not None:
-                    return common_check(*args, **kwargs)
-                return True  # No checks at all
+            if not has_backend_choices():
+                return common_check(*args, **kwargs)
 
             if backend not in backend_checks:
                 raise BackendSupportedError(
@@ -1014,6 +1010,14 @@ def backend_requirement(
             else:
                 return req_checker(*args, **kwargs)
 
+        def has_backend_choices() -> bool:
+            # Whether there are any backend choices to make
+            return bool(backend_checks)
+
+        def has_backend(backend: str) -> bool:
+            # Whether the given backend exists in the API
+            return backend in backend_checks
+        
         # @brief: Wrapper function that calls the orignal, decorated function, after applying a number of checks.
         # @note that here we manually apply defaults to the arguments in the wrapper function when doing validation.
         @functools.wraps(func)
@@ -1049,11 +1053,22 @@ def backend_requirement(
                     major, minor = get_compute_capability(tensor_arg.device)
                     capability = major * 10 + minor
 
-                if not is_backend_supported(backend, capability):
-                    extra = f" with capability {capability}" if capability else ""
-                    raise BackendSupportedError(
-                        f"{func.__name__} does not support backend '{backend}'{extra}"
+                if not has_backend_choices() and common_check is None:
+                    raise ValueError(
+                        f"Invalid @backend_requirement decorator usage: no backend choices and no common_check for {func.__name__}"
                     )
+
+                if has_backend_choices():
+                    if not is_backend_supported(backend, capability):
+                        extra = f" with capability {capability}" if capability else ""
+                        raise BackendSupportedError(
+                            f"{func.__name__} does not support backend '{backend}'{extra}"
+                        )
+                else:
+                    if not is_compute_capability_supported(capability):
+                        raise BackendSupportedError(
+                            f"{func.__name__} does not support compute capability {capability}"
+                        )
                 if not _is_problem_size_supported(**kwargs_with_defaults):
                     raise ValueError(
                         f"Problem size is not supported for {func.__name__}"
@@ -1063,6 +1078,8 @@ def backend_requirement(
 
         wrapper.is_backend_supported = is_backend_supported
         wrapper.is_compute_capability_supported = is_compute_capability_supported
+        wrapper.has_backend = has_backend
+        wrapper.has_backend_choices = has_backend_choices
         return wrapper
 
     return decorator
