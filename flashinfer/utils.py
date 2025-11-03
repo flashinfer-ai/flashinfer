@@ -1018,6 +1018,17 @@ def backend_requirement(
             # Whether the given backend exists in the API
             return backend in backend_checks
 
+        def suitable_auto_backends(*args, **kwargs):
+            suitable_backends = [
+                backend
+                for backend in backend_checks
+                if backend_checks[backend](*args, **kwargs)
+            ]
+            if not suitable_backends:
+                return False
+            wrapper.suitable_auto_backends = suitable_backends
+            return True
+
         # @brief: Wrapper function that calls the orignal, decorated function, after applying a number of checks.
         # @note that here we manually apply defaults to the arguments in the wrapper function when doing validation.
         @functools.wraps(func)
@@ -1059,11 +1070,17 @@ def backend_requirement(
                     )
 
                 if has_backend_choices():
-                    if not is_backend_supported(backend, capability):
-                        extra = f" with capability {capability}" if capability else ""
-                        raise BackendSupportedError(
-                            f"{func.__name__} does not support backend '{backend}'{extra}"
-                        )
+                    if backend == "auto":
+                        if not suitable_auto_backends(*args, **kwargs):
+                            raise BackendSupportedError(
+                                f"No suitable auto backends found for {func.__name__}"
+                            )
+                    else:
+                        if not is_backend_supported(backend, capability):
+                            extra = f" with capability {capability}" if capability else ""
+                            raise BackendSupportedError(
+                                f"{func.__name__} does not support backend '{backend}'{extra}"
+                            )
                 else:
                     if not is_compute_capability_supported(capability):
                         raise BackendSupportedError(

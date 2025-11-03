@@ -327,6 +327,43 @@ def test_common_check():
         my_kernel(x_3d, backend="cudnn")
 
 
+def test_suitable_auto_backends():
+    """Test the suitable_auto_backends method."""
+    if not torch.cuda.is_available():
+        pytest.skip("Skipping CUDA tests (no GPU available)")
+
+    x = torch.randn(1, 1, device="cuda")
+    major, minor = torch.cuda.get_device_capability(x.device)
+    actual_capability = major * 10 + minor
+
+    @supported_compute_capability([80, 86, 89, 90, actual_capability])
+    def _cutlass_check(x, backend):
+        return x.shape[0] > 10
+
+    @supported_compute_capability([75, 80, 86, 89, 90, actual_capability])
+    def _cudnn_check(x, backend):
+        return x.shape[0] > 5
+
+    @backend_requirement({"cutlass": _cutlass_check, "cudnn": _cudnn_check})
+    def my_kernel(x, backend="auto"):
+        backends = my_kernel.suitable_auto_backends
+        if x.shape[0] > 5:
+            assert "cudnn" in backends
+        if x.shape[0] > 10:
+            assert "cutlass" in backends
+        return x * 2
+
+    x = torch.randn(6, 10, device="cuda")
+    result = my_kernel(x, backend="auto")
+    assert result.shape == x.shape
+
+    with pytest.raises(
+        BackendSupportedError, match="No suitable auto backends found for my_kernel"
+    ):
+        x = torch.randn(1, 1, device="cuda")
+        my_kernel(x, backend="auto")
+
+
 def test_functools_wraps_preserves_metadata():
     """Test that backend_requirement preserves function metadata with functools.wraps."""
 
