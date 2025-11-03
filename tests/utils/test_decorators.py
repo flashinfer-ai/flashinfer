@@ -210,3 +210,39 @@ def test_functools_wraps_preserves_metadata():
     # Verify that added methods still exist
     assert hasattr(my_documented_function, "is_backend_supported")
     assert hasattr(my_documented_function, "is_compute_capability_supported")
+
+
+def test_backend_default_parameter():
+    """Test that backend_requirement correctly uses default backend parameter when not specified."""
+    if not torch.cuda.is_available():
+        pytest.skip("Skipping CUDA tests (no GPU available)")
+
+    # Get actual device capability
+    x = torch.randn(1, 1, device="cuda")
+    major, minor = torch.cuda.get_device_capability(x.device)
+    actual_capability = major * 10 + minor
+
+    @supported_compute_capability([80, 86, 89, 90, actual_capability])
+    def _cutlass_check(x, backend):
+        return x.shape[0] > 0
+
+    @supported_compute_capability([75, 80, 86, 89, 90, actual_capability])
+    def _cudnn_check(x, backend):
+        return x.shape[0] > 0
+
+    @backend_requirement({"cutlass": _cutlass_check, "cudnn": _cudnn_check})
+    def my_kernel(x, backend="cudnn"):
+        return x * 2
+
+    x = torch.randn(10, 10, device="cuda")
+
+    # Test that calling without backend argument uses the default "cudnn"
+    # This should work without raising an error
+    result = my_kernel(x)
+    assert result.shape == x.shape
+    assert torch.allclose(result, x * 2)
+
+    # Test that explicitly passing a different backend also works
+    result2 = my_kernel(x, backend="cutlass")
+    assert result2.shape == x.shape
+    assert torch.allclose(result2, x * 2)

@@ -23,6 +23,7 @@ import torch
 import torch.version
 from torch.torch_version import TorchVersion
 from torch.torch_version import __version__ as torch_version
+import inspect
 
 from .jit.spdlog import gen_spdlog_module
 
@@ -950,6 +951,9 @@ def backend_requirement(
     """
 
     def decorator(func):
+        # Get the function signature once for reuse
+        sig = inspect.signature(func)
+
         def is_backend_supported(backend, cc=None):
             # Is this backend present?
             if backend not in backend_checks:
@@ -971,7 +975,9 @@ def backend_requirement(
                 for checker in backend_checks.values()
             )
 
-        def is_problem_size_supported(*args, **kwargs):
+        # @note: this function does not automatically apply defaults to the arguments.
+        def _is_problem_size_supported(*args, **kwargs):
+            # At this point, kwargs should have defaults applied, so backend should be present
             backend = kwargs.get("backend")
             if backend not in backend_checks:
                 raise BackendSupportedError(
@@ -983,26 +989,34 @@ def backend_requirement(
             else:
                 return req_checker(*args, **kwargs)
 
+        # @brief: Wrapper function that calls the orignal, decorated function, after applying a number of checks.
+        # @note that here we manually apply defaults to the arguments in the wrapper function when doing validation.
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
-            backend = kwargs.get("backend")
             # skip_check is an optional argument that the decorator adds to any API function.
             # It prevents the performance overhead of checking.
             skip_check = kwargs.pop("skip_check", False)
 
             if not skip_check:
+                # Apply defaults from the function signature for validation
+                # This ensures that all parameters (including backend) have their default values
+                # if not explicitly provided by the caller
+                bound_args = sig.bind(*args, **kwargs)
+                bound_args.apply_defaults()
+                # Convert to kwargs for validation functions
+                kwargs_with_defaults = dict(bound_args.arguments)
+
+                backend = kwargs_with_defaults.get("backend")
+
                 capability = None
                 # Find the first tensor argument.
                 # Assume all tensors are on the same device/capability.
                 # We could consider check all tensors at a performance cost.
                 tensor_arg = None
-                for arg in args:
-                    if isinstance(arg, torch.Tensor):
-                        tensor_arg = arg
-                if tensor_arg is None:
-                    for value in kwargs.values():
-                        if isinstance(value, torch.Tensor):
-                            tensor_arg = value
+                for value in kwargs_with_defaults.values():
+                    if isinstance(value, torch.Tensor):
+                        tensor_arg = value
+                        break
 
                 if tensor_arg is not None:
                     # Get compute capability from the first tensor
@@ -1015,10 +1029,11 @@ def backend_requirement(
                     raise BackendSupportedError(
                         f"{func.__name__} does not support backend '{backend}'{extra}"
                     )
-                if not is_problem_size_supported(*args, **kwargs):
+                if not _is_problem_size_supported(**kwargs_with_defaults):
                     raise ValueError(
                         f"Problem size is not supported for {func.__name__}"
                     )
+
             return func(*args, **kwargs)
 
         wrapper.is_backend_supported = is_backend_supported
