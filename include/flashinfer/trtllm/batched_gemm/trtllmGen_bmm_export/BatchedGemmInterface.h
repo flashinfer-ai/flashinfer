@@ -73,13 +73,18 @@ struct BatchedGemmData {
     // The M dimension.
     // It is the total number of tokens if A is the activation matrix.
     // It is the total number of output channels if A is the weight matrix.
+    // ValidM/N/K by default assumes to be full range of M/N/K respectively. If we pad M/N/K due to
+    // alignment of other constraints, then we can specify ValidM/N/K to indicate the valid range.
     int32_t mM{0};
+    int32_t mValidM{0};
     // The N dimension.
     // It is the total number of tokens if B is the activation matrix.
     // It is the total number of output channels if B is the weight matrix.
     int32_t mN{0};
+    int32_t mValidN{0};
     // The K dimension. It is the hidden dimension of the input matrices.
     int32_t mK{0};
+    int32_t mValidK{0};
     // The rank id of the current device in the multi-gpu space.
     int32_t mRank{0};
     // The number of devices in tensor-parallel group.
@@ -695,6 +700,9 @@ class BatchedGemmInterface {
     options.mM = data.mProblemDimensions.mM;
     options.mN = data.mProblemDimensions.mN;
     options.mK = data.mProblemDimensions.mK;
+    options.mValidM = data.mProblemDimensions.mValidM;
+    options.mValidN = data.mProblemDimensions.mValidN;
+    options.mValidK = data.mProblemDimensions.mValidK;
     options.mBatchedM = data.mProblemDimensions.mBatchedM;
     options.mBatchedN = data.mProblemDimensions.mBatchedN;
     options.mBatchMode = data.mProblemDimensions.mBatchM ? BatchedGemmOptions::BatchMode::BatchM

@@ -144,6 +144,10 @@ size_t TrtllmGenBatchedGemmRunner::getWorkspaceSizeInBytes(
   gemmData.mProblemDimensions.mWorldSize = 1;
   gemmData.mProblemDimensions.mMaxNumCtasInTokenDim = maxNumCtasInBatchDim;
 
+  gemmData.mProblemDimensions.mValidM = gemmData.mProblemDimensions.mM;
+  gemmData.mProblemDimensions.mValidN = gemmData.mProblemDimensions.mN;
+  gemmData.mProblemDimensions.mValidK = gemmData.mProblemDimensions.mK;
+
   auto bmm = BatchedGemmInterface();
 
   auto const configs = bmm.getBatchedGemmConfigs();
@@ -239,23 +243,21 @@ void TrtllmGenBatchedGemmRunner::run(
   int32_t multiProcessorCount;
   cudaDeviceGetAttribute(&multiProcessorCount, cudaDevAttrMultiProcessorCount, device);
 
-  // FIXME: this is a WAR to solve the perf regression and should be removed once
-  // trtllm-gen fixes the issue.
-  auto myConfig = config;
-  myConfig.mOptions.mValidK = k;
-  myConfig.mOptions.mValidN = gemmData.mProblemDimensions.mN;
-  myConfig.mOptions.mValidM = gemmData.mProblemDimensions.mM;
-  // FIXME once we start using all-reduce in the epilogue of the bmm this can be moved elsewhere
-  bmm.runInitBeforeWorldSync(myConfig, gemmData, static_cast<void*>(stream));
+  gemmData.mProblemDimensions.mValidM = gemmData.mProblemDimensions.mM;
+  gemmData.mProblemDimensions.mValidN = gemmData.mProblemDimensions.mN;
+  gemmData.mProblemDimensions.mValidK = gemmData.mProblemDimensions.mK;
 
-  auto const err = bmm.run(myConfig, workspace, gemmData, static_cast<void*>(stream),
+  // FIXME once we start using all-reduce in the epilogue of the bmm this can be moved elsewhere
+  bmm.runInitBeforeWorldSync(config, gemmData, static_cast<void*>(stream));
+
+  auto const err = bmm.run(config, workspace, gemmData, static_cast<void*>(stream),
                            multiProcessorCount, enable_pdl, globalTrtllmGenBatchedGemmModuleCache);
 
   FLASHINFER_CHECK(err == 0,
                    "Error occurred when running GEMM!"
                    " (numBatches: ",
-                   numBatches, ", GemmMNK: ", m, " ", n, " ", k,
-                   ", Kernel: ", myConfig.mFunctionName, ")");
+                   numBatches, ", GemmMNK: ", m, " ", n, " ", k, ", Kernel: ", config.mFunctionName,
+                   ")");
 }
 
 void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k,
@@ -333,6 +335,10 @@ std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(
   gemmData.mProblemDimensions.mWorldSize = 1;
   gemmData.mProblemDimensions.mMaxNumCtasInTokenDim = maxNumCtasInBatchDim;
 
+  gemmData.mProblemDimensions.mValidM = gemmData.mProblemDimensions.mM;
+  gemmData.mProblemDimensions.mValidN = gemmData.mProblemDimensions.mN;
+  gemmData.mProblemDimensions.mValidK = gemmData.mProblemDimensions.mK;
+
   auto cmpFunc = [&configs, &gemmData, &bmm, &multiProcessorCount](int64_t idx0, int64_t idx1) {
     auto const& optionsA = configs[idx0].mOptions;
     auto const& optionsB = configs[idx1].mOptions;
@@ -393,13 +399,7 @@ std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(
   // Filter out invalid configs.
   std::vector<int64_t> validConfigIndices;
   for (auto const& configIndex : prioritizedIndices) {
-    // FIXME: this is a WAR to solve the perf regression and should be removed once
-    // trtllm-gen fixes the issue.
-    auto myConfig = configs[configIndex];
-    myConfig.mOptions.mValidK = k;
-    myConfig.mOptions.mValidN = gemmData.mProblemDimensions.mN;
-    myConfig.mOptions.mValidM = gemmData.mProblemDimensions.mM;
-    auto isValidConfig = bmm.isValidConfig(myConfig, gemmData);
+    auto isValidConfig = bmm.isValidConfig(configs[configIndex], gemmData);
     if (isValidConfig) {
       validConfigIndices.push_back(configIndex);
     }
