@@ -1012,6 +1012,7 @@ def backend_requirement(
             else:
                 return req_checker(*args, **kwargs)
 
+<<<<<<< HEAD
         def has_backend_choices() -> bool:
             # Whether there are any backend choices to make
             return bool(backend_checks)
@@ -1025,14 +1026,20 @@ def backend_requirement(
                 return False
 
             # Check for each backend support
+=======
+        def suitable_auto_backends(*args, **kwargs):
+>>>>>>> f85c63d7 (inital)
             suitable_backends = [
                 backend
                 for backend in backend_checks
                 if backend_checks[backend](*args, **kwargs)
             ]
+<<<<<<< HEAD
             # If a heuristic function is provided, filter the suitable backends based on the heuristic function
             if heuristic_func is not None:
                 suitable_backends = heuristic_func(suitable_backends, *args, **kwargs)
+=======
+>>>>>>> f85c63d7 (inital)
             if not suitable_backends:
                 return False
             wrapper.suitable_auto_backends = suitable_backends
@@ -1080,7 +1087,7 @@ def backend_requirement(
 
                 if has_backend_choices():
                     if backend == "auto":
-                        if not suitable_auto_backends(*args, **kwargs):
+                        if not suitable_auto_backends(**kwargs_with_defaults):
                             raise BackendSupportedError(
                                 f"No suitable auto backends found for {func.__name__}"
                             )
