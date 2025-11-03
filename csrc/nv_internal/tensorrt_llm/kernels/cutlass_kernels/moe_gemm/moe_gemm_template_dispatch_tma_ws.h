@@ -196,7 +196,7 @@ void dispatchMoeGemmFinalDispatchTmaWarpSpecialized(
       //           << ", dynamic_cluster_shape=" <<
       //           static_cast<int>(gemm_config.dynamic_cluster_shape)
       //           << ", fallback_cluster_shape="
-      << static_cast<int>(gemm_config.fallback_cluster_shape) << std::endl;
+      // << static_cast<int>(gemm_config.fallback_cluster_shape) << std::endl;
 
       auto selected_func =
           getDispatchFunctionForSM100<Arch, T, WeightType, OutputType, EpilogueTag, FUSION,
