@@ -71,6 +71,24 @@ template void invokeQuantization<__nv_bfloat16>(int8_t* dst, __nv_bfloat16 const
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+// Helper function for grid configuration with swizzled layouts
+
+inline int computeEffectiveRows(int m, QuantizationSFLayout layout, int multiProcessorCount,
+                                int numBlocksPerSM) {
+  int effectiveRows = m;
+  bool isSfSwizzledLayout = (layout == QuantizationSFLayout::SWIZZLED_128x4 ||
+                             layout == QuantizationSFLayout::SWIZZLED_8x4);
+  if (isSfSwizzledLayout) {
+    int rowTile = (layout == QuantizationSFLayout::SWIZZLED_128x4) ? 128 : 8;
+    int numPaddedRows = (m + rowTile - 1) / rowTile * rowTile;  // Round up to rowTile
+    // Use padded rows for grid calculation, but cap at reasonable limit
+    // to balance parallelism with occupancy
+    effectiveRows = std::min(numPaddedRows, multiProcessorCount * numBlocksPerSM);
+  }
+  return effectiveRows;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
 // MXFP8 Quantization
 
 template <typename T>
@@ -85,20 +103,7 @@ void invokeMxFP8Quantization(int b, int m, int n, int padded_n, T const* input, 
   dim3 block(std::min(int(padded_n / CVT_ELTS_PER_THREAD), 512));
   // Get number of blocks per SM (assume we can fully utilize the SM).
   int const numBlocksPerSM = std::max(1u, 2048u / block.x);
-
-  // For swizzled layout, we need to consider padded rows to avoid sequential processing
-  // This is critical for small batch sizes where m << padding
-  int effectiveRows = m;
-  bool isSfSwizzledLayout = (layout == QuantizationSFLayout::SWIZZLED_128x4 ||
-                             layout == QuantizationSFLayout::SWIZZLED_8x4);
-  if (isSfSwizzledLayout) {
-    int rowTile = (layout == QuantizationSFLayout::SWIZZLED_128x4) ? 128 : 8;
-    int numPaddedRows = (m + rowTile - 1) / rowTile * rowTile;  // Round up to rowTile
-    // Use padded rows for grid calculation, but cap at reasonable limit
-    // to balance parallelism with occupancy
-    effectiveRows = std::min(numPaddedRows, multiProcessorCount * numBlocksPerSM);
-  }
-
+  int effectiveRows = computeEffectiveRows(m, layout, multiProcessorCount, numBlocksPerSM);
   dim3 grid(std::min(effectiveRows, multiProcessorCount * numBlocksPerSM));
 
   // Launch the cvt kernel.
@@ -191,20 +196,7 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
     dim3 block(std::min(int(n / CVT_FP8_TO_FP4_ELTS_PER_THREAD), 512));
     // Get number of blocks per SM (assume we can fully utilize the SM).
     int const numBlocksPerSM = std::max(1u, 2048u / block.x);
-
-    // For swizzled layout, we need to consider padded rows to avoid sequential processing
-    // This is critical for small batch sizes where m << padding
-    int effectiveRows = m;
-    bool isSfSwizzledLayout = (layout == QuantizationSFLayout::SWIZZLED_128x4 ||
-                               layout == QuantizationSFLayout::SWIZZLED_8x4);
-    if (isSfSwizzledLayout) {
-      int rowTile = (layout == QuantizationSFLayout::SWIZZLED_128x4) ? 128 : 8;
-      int numPaddedRows = (m + rowTile - 1) / rowTile * rowTile;  // Round up to rowTile
-      // Use padded rows for grid calculation, but cap at reasonable limit
-      // to balance parallelism with occupancy
-      effectiveRows = std::min(numPaddedRows, multiProcessorCount * numBlocksPerSM);
-    }
-
+    int effectiveRows = computeEffectiveRows(m, layout, multiProcessorCount, numBlocksPerSM);
     dim3 grid(std::min(effectiveRows, multiProcessorCount * numBlocksPerSM));
 
     // Launch the cvt kernel.
@@ -225,20 +217,7 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
     dim3 block(std::min(int(n / CVT_ELTS_PER_THREAD), 512));
     // Get number of blocks per SM (assume we can fully utilize the SM).
     int const numBlocksPerSM = std::max(1u, 2048u / block.x);
-
-    // For swizzled layout, we need to consider padded rows to avoid sequential processing
-    // This is critical for small batch sizes where m << padding
-    int effectiveRows = m;
-    bool isSfSwizzledLayout = (layout == QuantizationSFLayout::SWIZZLED_128x4 ||
-                               layout == QuantizationSFLayout::SWIZZLED_8x4);
-    if (isSfSwizzledLayout) {
-      int rowTile = (layout == QuantizationSFLayout::SWIZZLED_128x4) ? 128 : 8;
-      int numPaddedRows = (m + rowTile - 1) / rowTile * rowTile;  // Round up to rowTile
-      // Use padded rows for grid calculation, but cap at reasonable limit
-      // to balance parallelism with occupancy
-      effectiveRows = std::min(numPaddedRows, multiProcessorCount * numBlocksPerSM);
-    }
-
+    int effectiveRows = computeEffectiveRows(m, layout, multiProcessorCount, numBlocksPerSM);
     dim3 grid(std::min(effectiveRows, multiProcessorCount * numBlocksPerSM));
 
     // Launch the cvt kernel.
