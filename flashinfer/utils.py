@@ -980,7 +980,8 @@ def backend_requirement(
                 # No backend-specific checks, only check common_check
                 if not hasattr(common_check, "is_compute_capability_supported"):
                     raise ValueError(
-                        f"Invalid is_compute_capability_supported call: {common_check.__name__} does not have is_compute_capability_supported method"
+                        f"Invalid is_compute_capability_supported call: {common_check.__name__} \
+                        does not have is_compute_capability_supported decorator"
                     )
                 return common_check.is_compute_capability_supported(cc)
             else:

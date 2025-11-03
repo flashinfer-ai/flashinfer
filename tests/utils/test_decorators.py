@@ -182,6 +182,35 @@ def test_backend_requirement_empty_backends_with_common_check_cc():
     result = supported_kernel(x)
     assert result.shape == x.shape
 
+    def _bad_common_check(x):
+        return True
+
+    @backend_requirement(
+        {},
+        common_check=_bad_common_check,
+    )
+    def bad_kernel(x):
+        return x * 2
+
+    with pytest.raises(
+        ValueError,
+        match="Invalid is_compute_capability_supported call: _bad_common_check \
+        does not have is_compute_capability_supported decorator",
+    ):
+        bad_kernel.is_compute_capability_supported(42)
+
+    @backend_requirement({})
+    def kernel_no_common_check(x):
+        return x * 2
+
+    with pytest.raises(
+        ValueError,
+        match="Invalid @backend_requirement decorator usage: no backend choices \
+            and no common_check for kernel_no_common_check",
+    ):
+        x = torch.randn(10, 10, device="cuda")
+        kernel_no_common_check(x)
+
 
 def test_has_backend():
     """Test the has_backend method."""
@@ -208,38 +237,6 @@ def test_has_backend_choices():
 
     assert my_kernel.has_backend_choices() is True
     assert my_kernel_no_backend.has_backend_choices() is False
-
-
-# def test_backend_requirement_suitable_auto_backends():
-#     """Test the backend_requirement decorator's suitable_auto_backends method."""
-#     if not torch.cuda.is_available():
-#         pytest.skip("Skipping CUDA tests (no GPU available)")
-
-#     @supported_compute_capability([80, 86, 89, 90])
-#     def _cutlass_check(x, backend):
-#         return True
-
-#     @supported_compute_capability([75, 80, 86, 89, 90])
-#     def _cudnn_check(x, backend):
-#         return True
-
-#     @supported_compute_capability([75, 80, 86, 89, 90])
-#     def _cublas_check(x):
-#         if x.shape[0] > 2:
-#             return False
-#         return True
-
-#     @backend_requirement(
-#         {"cutlass": _cutlass_check, "cudnn": _cudnn_check, "cublas": _cublas_check},
-#     )
-#     def my_kernel(x, backend):
-#         assert my_kernel.suitable_auto_backends() == [backend]
-#         return x * 2
-
-#     x = torch.randn(10, 10, device="cuda")
-#     test_capability = 75 # only cudnn supports 75
-#     suitable_auto_backends = my_kernel.suitable_auto_backends(test_capability)
-#     assert suitable_auto_backends == ["cudnn"]
 
 
 def test_backend_requirement_wrapped_function():
