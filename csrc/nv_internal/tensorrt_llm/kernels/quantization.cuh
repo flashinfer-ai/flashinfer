@@ -788,7 +788,9 @@ quantize_with_block_size(
     bool isRowPadding = (rowIdx >= numRows);
 
     if (isRowPadding) {
-      // Fast path: This row is entirely padding, zero out both quantized output and scale factors
+      // Fast path: This row is entirely padding, only zero out scale factors.
+      // Note: Padding rows do NOT exist in the output tensor (which is sized [numRows, K]),
+      // they only exist in the swizzled scale factor layout. Do NOT write to output buffer here.
       for (int batchIdx = 0; batchIdx < numbatches; batchIdx++) {
         for (int colIdx = threadIdx.x; colIdx < numColThreadsForSf; colIdx += blockDim.x) {
           std::optional<int> optionalBatchIdx = batchIdx;
@@ -798,18 +800,6 @@ quantize_with_block_size(
           auto sf_out = cvt_quant_get_sf_out_offset<uint32_t, CVT_NUM_THREADS_PER_SF>(
               optionalBatchIdx, rowIdx, colIdx, optionalNumRows, numPaddedCols / SF_VEC_SIZE, SFout,
               layout);
-
-          // Zero the quantized output for all columns (both actual and padded column range)
-          if (colIdx < numPaddedColThreads) {
-            int64_t outOffset =
-                static_cast<int64_t>(batchIdx * numRows + rowIdx) * numPaddedColThreads + colIdx;
-            if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_FP4) {
-              reinterpret_cast<uint32_t*>(out)[outOffset] = 0u;
-            } else if constexpr (quantization_type == BlockScaleQuantizationType::FP8_TO_FP4 ||
-                                 quantization_type == BlockScaleQuantizationType::FP16_TO_MXFP8) {
-              reinterpret_cast<uint64_t*>(out)[outOffset] = 0ull;
-            }
-          }
 
           // Set the SF padding to 0.
           if (sf_out != nullptr) {
