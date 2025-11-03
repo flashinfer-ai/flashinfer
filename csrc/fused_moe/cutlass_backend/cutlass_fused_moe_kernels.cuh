@@ -3002,7 +3002,6 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
   if (using_tma_ws_gemm1) {
     TLLM_CHECK(config.is_tma_warp_specialized);
     TLLM_CHECK(!use_ampere_activation_fusion);
-
     TLLM_CHECK(!use_fp4 || fc1_fp4_act_flat);
     TLLM_CHECK(!use_fp4 || fc2_fp4_act_flat);
 
