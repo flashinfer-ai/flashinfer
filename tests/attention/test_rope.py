@@ -394,6 +394,10 @@ def test_generalized_rope_quantize(
 ):
     """Test generalized rope + quantization for MLA, GQA, and MHA architectures."""
     device = "cuda:0"
+    # Fixed seed for reproducibility across tests
+    torch.manual_seed(0)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(0)
     total_dim = rope_dim + no_rope_dim
 
     # Create input tensors based on attention type
@@ -481,6 +485,312 @@ def test_generalized_rope_quantize(
     )
 
 
+@pytest.mark.parametrize(
+    "attention_type,num_qo_heads,num_kv_heads,rope_dim,no_rope_dim",
+    [
+        # MLA: Multiple Q heads, single shared K/V head
+        ("mla", 128, 1, 64, 512),
+        ("mla", 64, 1, 128, 256),
+        ("mla", 128, 1, 64, 128),  # Explicit DeepSeek R1 MLA config case
+        ("mla", 32, 1, 32, 96),
+        # GQA: Multiple Q heads, fewer K/V heads (grouped)
+        ("gqa", 32, 8, 64, 64),
+        ("gqa", 64, 16, 128, 128),
+        ("gqa", 24, 6, 32, 96),
+        ("gqa", 32, 8, 128, 0),  # Llama3 8B standard config
+        ("gqa", 64, 8, 128, 0),  # Llama3 70B standard config
+        ("gqa", 64, 8, 64, 0),  # (plausible) GPT-OSS config
+        # MHA: Equal Q and K/V heads
+        ("mha", 32, 32, 64, 64),
+        ("mha", 16, 16, 128, 128),
+        ("mha", 8, 8, 32, 96),
+    ],
+)
+@pytest.mark.parametrize("num_tokens", [1, 19, 128, 199, 899, 2047])
+@pytest.mark.parametrize("input_dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("quant_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+@pytest.mark.parametrize("enable_pdl", [True, False])
+@pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
+def test_generalized_rope_quantize_append_kv_cache(
+    attention_type,
+    num_qo_heads,
+    num_kv_heads,
+    rope_dim,
+    no_rope_dim,
+    num_tokens,
+    input_dtype,
+    quant_dtype,
+    enable_pdl,
+    kv_layout,
+):
+    device = "cuda:0"
+    # Fixed seed for reproducibility
+    torch.manual_seed(0)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(0)
+
+    head_dim = rope_dim + no_rope_dim
+    page_size = 16
+    batch_size = 4
+
+    # Build inputs following the same pattern used elsewhere
+    if attention_type == "mla":
+        # Q: (N, Hq, *), K: 2D (N, *)x
+        q_rope = torch.randn(
+            num_tokens, num_qo_heads, rope_dim, dtype=input_dtype, device=device
+        )
+        q_nope = torch.randn(
+            num_tokens, num_qo_heads, no_rope_dim, dtype=input_dtype, device=device
+        )
+        k_rope = torch.randn(num_tokens, rope_dim, dtype=input_dtype, device=device)
+        k_nope = torch.randn(num_tokens, no_rope_dim, dtype=input_dtype, device=device)
+        v = None
+    else:
+        # GQA/MHA: K/V are 3D
+        q_rope = torch.randn(
+            num_tokens, num_qo_heads, rope_dim, dtype=input_dtype, device=device
+        )
+        q_nope = torch.randn(
+            num_tokens, num_qo_heads, no_rope_dim, dtype=input_dtype, device=device
+        )
+        k_rope = torch.randn(
+            num_tokens, num_kv_heads, rope_dim, dtype=input_dtype, device=device
+        )
+        k_nope = torch.randn(
+            num_tokens, num_kv_heads, no_rope_dim, dtype=input_dtype, device=device
+        )
+        v = torch.randn(
+            num_tokens, num_kv_heads, head_dim, dtype=input_dtype, device=device
+        )
+
+    # Cos/sin and positions
+    max_seq_len = 4096
+    rope_ref = FlashInferRotaryEmbedding(
+        head_dim, rope_dim, max_seq_len, 10000, False, input_dtype, device
+    )
+    pos_ids = torch.arange(num_tokens, device=device, dtype=torch.int32)
+
+    # Build paged metadata
+    kv_append_length = torch.tensor(
+        [num_tokens] + [0] * (batch_size - 1), dtype=torch.int32, device=device
+    )
+    kv_append_indptr = torch.cat(
+        [
+            torch.zeros(1, dtype=torch.int32, device=device),
+            torch.cumsum(kv_append_length, dim=0),
+        ]
+    )
+    num_pages_per_req = torch.tensor(
+        [(num_tokens + page_size - 1) // page_size] + [0] * (batch_size - 1),
+        dtype=torch.int32,
+        device=device,
+    )
+    kv_page_indptr = torch.cat(
+        [
+            torch.zeros(1, dtype=torch.int32, device=device),
+            torch.cumsum(num_pages_per_req, dim=0),
+        ]
+    )
+    kv_page_indices = torch.arange(
+        kv_page_indptr[-1].item(), dtype=torch.int32, device=device
+    )
+    kv_last_page_len = torch.tensor(
+        [num_tokens % page_size if num_tokens % page_size != 0 else page_size]
+        + [0] * (batch_size - 1),
+        dtype=torch.int32,
+        device=device,
+    )
+    # Allocate caches sized by required pages
+    max_pages = kv_page_indptr[-1].item()
+
+    # Get batch_indices and positions
+    seq_lens = flashinfer.get_seq_lens(kv_page_indptr, kv_last_page_len, page_size)
+    batch_indices, positions = flashinfer.get_batch_indices_positions(
+        kv_append_indptr, seq_lens, num_tokens
+    )
+
+    # Fused call + cache allocation
+    if attention_type == "mla":
+        ckv_cache = torch.zeros(
+            max_pages, page_size, no_rope_dim, dtype=quant_dtype, device=device
+        )
+        kpe_cache = torch.zeros(
+            max_pages, page_size, rope_dim, dtype=quant_dtype, device=device
+        )
+        q_rope_out_fused, q_nope_out_fused = (
+            flashinfer.rope.rope_quantize_fp8_append_paged_kv_cache(
+                q_rope,
+                k_rope,
+                q_nope,
+                k_nope,
+                None,
+                rope_ref.cos_sin_cache,
+                pos_ids,
+                (ckv_cache, kpe_cache),
+                kv_page_indices,
+                kv_page_indptr,
+                batch_indices,
+                positions,
+                page_size=page_size,
+                quantize_dtype=quant_dtype,
+                quant_scale_q=1.0,
+                quant_scale_kv=1.0,
+                is_neox=False,
+                enable_pdl=enable_pdl,
+            )
+        )
+    else:
+        # Allocate cache based on layout
+        if kv_layout == "NHD":
+            k_cache = torch.zeros(
+                max_pages,
+                page_size,
+                num_kv_heads,
+                head_dim,
+                dtype=quant_dtype,
+                device=device,
+            )
+            v_cache = torch.zeros(
+                max_pages,
+                page_size,
+                num_kv_heads,
+                head_dim,
+                dtype=quant_dtype,
+                device=device,
+            )
+        else:  # HND
+            k_cache = torch.zeros(
+                max_pages,
+                num_kv_heads,
+                page_size,
+                head_dim,
+                dtype=quant_dtype,
+                device=device,
+            )
+            v_cache = torch.zeros(
+                max_pages,
+                num_kv_heads,
+                page_size,
+                head_dim,
+                dtype=quant_dtype,
+                device=device,
+            )
+        q_rope_out_fused, q_nope_out_fused = (
+            flashinfer.rope.rope_quantize_fp8_append_paged_kv_cache(
+                q_rope,
+                k_rope,
+                q_nope,
+                k_nope,
+                v,
+                rope_ref.cos_sin_cache,
+                pos_ids,
+                (k_cache, v_cache),
+                kv_page_indices,
+                kv_page_indptr,
+                batch_indices,
+                positions,
+                page_size=page_size,
+                kv_layout=kv_layout,
+                quantize_dtype=quant_dtype,
+                quant_scale_q=1.0,
+                quant_scale_kv=1.0,
+                is_neox=False,
+                enable_pdl=enable_pdl,
+            )
+        )
+    # Compute reference output
+    q_in = torch.cat([q_rope, q_nope], dim=-1)
+    k_in = torch.cat([k_rope, k_nope], dim=-1)
+    q_out_f16_ref, k_out_f16_ref = rope_ref.forward_native(pos_ids, q_in, k_in)
+    q_out_f8_ref, k_out_f8_ref = map(
+        lambda x: x.to(quant_dtype),
+        (q_out_f16_ref, k_out_f16_ref),
+    )
+
+    # Fused vs Pytorch reference Q checks
+    torch.testing.assert_close(
+        q_out_f8_ref[..., :rope_dim].float(),
+        q_rope_out_fused.float(),
+        rtol=2e-1,
+        atol=1e-2,
+    )
+    torch.testing.assert_close(
+        q_out_f8_ref[..., rope_dim:].float(),
+        q_nope_out_fused.float(),
+        rtol=2e-1,
+        atol=1e-2,
+    )
+
+    # expect 1-ULP differences between FP8 device rounding and PyTorch .to(fp8)
+    if quant_dtype == torch.float8_e4m3fn:
+        rtol_val, atol_val = 0.25, 0.5
+    else:  # quant_dtype == torch.float8_e5m2:
+        rtol_val, atol_val = 0.25, 1.0
+
+    # if MLA: check ckv_cache, kpe_cache
+    if attention_type == "mla":
+        # Split K reference
+        k_rope_ref = k_out_f8_ref[..., :rope_dim]
+        k_nope_ref = k_out_f8_ref[..., rope_dim:]
+
+        ckv_ref = torch.zeros_like(ckv_cache)
+        kpe_ref = torch.zeros_like(kpe_cache)
+
+        for i in range(num_tokens):
+            b = batch_indices[i].item()
+            pos = positions[i].item()
+            page_iter = (kv_page_indptr[b].item() * page_size + pos) // page_size
+            entry_idx = (kv_page_indptr[b].item() * page_size + pos) % page_size
+            page_idx = kv_page_indices[page_iter].item()
+            ckv_ref[page_idx, entry_idx, :] = k_nope_ref[i]
+            kpe_ref[page_idx, entry_idx, :] = k_rope_ref[i]
+
+        torch.testing.assert_close(
+            ckv_cache.float(), ckv_ref.float(), rtol=rtol_val, atol=atol_val
+        )
+        torch.testing.assert_close(
+            kpe_cache.float(), kpe_ref.float(), rtol=rtol_val, atol=atol_val
+        )
+
+    # if GQA/MHA: check k_cache, v_cache
+    if attention_type == "gqa" or attention_type == "mha":
+        # K reference
+        k_ref = torch.zeros_like(k_cache)
+        for i in range(num_tokens):
+            b = batch_indices[i].item()
+            pos = positions[i].item()
+            page_iter = (kv_page_indptr[b].item() * page_size + pos) // page_size
+            entry_idx = (kv_page_indptr[b].item() * page_size + pos) % page_size
+            page_idx = kv_page_indices[page_iter].item()
+            if kv_layout == "NHD":
+                k_ref[page_idx, entry_idx, :, :] = k_out_f8_ref[i]  # [Hkv, head_dim]
+            else:  # HND
+                k_ref[page_idx, :, entry_idx, :] = k_out_f8_ref[i]  # [Hkv, head_dim]
+
+        torch.testing.assert_close(
+            k_cache.float(), k_ref.float(), rtol=rtol_val, atol=atol_val
+        )
+
+        # V reference (no RoPE on V; same quant scale as KV)
+        quant_scale_kv = 1.0  # match fused call
+        v_ref_tokens = (v * quant_scale_kv).to(quant_dtype)
+        v_ref = torch.zeros_like(v_cache)
+        for i in range(num_tokens):
+            b = batch_indices[i].item()
+            pos = positions[i].item()
+            page_iter = (kv_page_indptr[b].item() * page_size + pos) // page_size
+            entry_idx = (kv_page_indptr[b].item() * page_size + pos) % page_size
+            page_idx = kv_page_indices[page_iter].item()
+            if kv_layout == "NHD":
+                v_ref[page_idx, entry_idx, :, :] = v_ref_tokens[i]
+            else:  # HND
+                v_ref[page_idx, :, entry_idx, :] = v_ref_tokens[i]
+
+        torch.testing.assert_close(
+            v_cache.float(), v_ref.float(), rtol=rtol_val, atol=atol_val
+        )
+
+
 @pytest.mark.parametrize("num_tokens", [1, 19, 128, 199, 899, 2047])
 @pytest.mark.parametrize("input_dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("quant_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
@@ -492,6 +802,10 @@ def test_mla_rope_quantize(
     enable_pdl,
 ):
     device = "cuda:0"
+    # Fixed seed for reproducibility across tests
+    torch.manual_seed(0)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(0)
     num_qo_heads = 128
     q_in = torch.randn(num_tokens, num_qo_heads, 576, dtype=input_dtype, device=device)
     k_in = torch.randn(num_tokens, 576, dtype=input_dtype, device=device)

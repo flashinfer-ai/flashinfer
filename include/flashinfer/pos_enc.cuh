@@ -23,6 +23,7 @@
 
 #include "layout.cuh"
 #include "math.cuh"
+#include "page.cuh"
 #include "utils.cuh"
 #include "vec_dtypes.cuh"
 
@@ -746,6 +747,217 @@ __global__ void BatchQKApplyRotaryKernel(
     FLASHINFER_ERROR("Unsupported rope_dim. Supported values: 16, 32, 64, 128, 256"); \
   }
 
+/*!
+ * \brief Unified CUDA kernel to apply RoPE, quantize to FP8, and append to paged cache.
+ *
+ * Templated on CacheT to support both GQA/MHA (paged_kv_t) and MLA (paged_kv_mla_t).
+ * Cache-only behaviors are selected with constexpr on the CacheT.
+ */
+template <bool interleave, uint32_t vec_size, uint32_t bdx, typename DType, typename IdType,
+          typename QuantType, bool IS_MLA, typename CacheT>
+__global__ void RopeQuantizeAppendPagedKVCacheKernel(
+    DType* q_rope_in, DType* k_rope_in, DType* q_nope_in, DType* k_nope_in, DType* v_in,
+    QuantType* q_rope_out, QuantType* q_nope_out, CacheT paged_kv_like,
+    IdType* __restrict__ batch_indices, IdType* __restrict__ positions,
+    float* __restrict__ cos_sin_cache, IdType* __restrict__ pos_ids, uint32_t nnz,
+    uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t rope_dim, uint32_t no_rope_dim,
+    size_t q_rope_in_stride_n, size_t q_rope_in_stride_h, size_t q_nope_in_stride_n,
+    size_t q_nope_in_stride_h, size_t q_rope_out_stride_n, size_t q_rope_out_stride_h,
+    size_t q_nope_out_stride_n, size_t q_nope_out_stride_h, size_t k_rope_in_stride,
+    size_t k_rope_in_stride_h, size_t k_nope_in_stride, size_t k_nope_in_stride_h,
+    size_t v_in_stride, size_t v_in_stride_h, float quant_scale_q, float quant_scale_kv) {
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.wait;");
+#endif
+  uint32_t bx = blockIdx.x, tx = threadIdx.x, ty = threadIdx.y;
+  uint32_t by = blockIdx.y;
+  uint32_t bdy = blockDim.y;
+
+  // Calculate flexible boundaries for block allocation
+  uint32_t rope_chunk_size = rope_dim;
+  uint32_t rope_chunks = (rope_dim + rope_chunk_size - 1) / rope_chunk_size;
+  uint32_t no_rope_chunks = (no_rope_dim + rope_chunk_size - 1) / rope_chunk_size;
+
+  uint32_t q_rope_end = num_qo_heads * rope_chunks;
+  // For MLA, num_kv_heads is effectively 1
+  uint32_t k_rope_end = q_rope_end + num_kv_heads * rope_chunks;
+  uint32_t k_nope_end = k_rope_end + num_kv_heads * no_rope_chunks;
+
+  vec_t<float, vec_size> cos, sin;
+  if (bx * bdy + ty < nnz) {
+    const uint32_t idx = bx * bdy + ty;
+    const IdType pos = pos_ids[idx];
+
+    // Compute page location for this token
+    uint32_t page_iter, entry_idx;
+    paged_kv_like.page_size.divmod(
+        paged_kv_like.indptr[batch_indices[idx]] * paged_kv_like.page_size + positions[idx],
+        page_iter, entry_idx);
+
+    const int half_rope_dim = rope_dim / 2;
+    // Load cos/sin for RoPE processing blocks only
+    if ((tx * vec_size < rope_dim) and (by < k_rope_end)) {
+      int sin_offset = rope_dim / 2;
+      int vec_idx;
+      if constexpr (interleave) {
+        vec_idx = (tx * vec_size) / 2;  // Force integer division
+      } else {
+        vec_idx = (tx * vec_size) % half_rope_dim;
+      }
+      cos.load(cos_sin_cache + (pos * rope_dim) + vec_idx);
+      sin.load(cos_sin_cache + (pos * rope_dim) + (sin_offset + vec_idx));
+    }
+
+    if (by < q_rope_end) {
+      // ============ Q RoPE processing ============
+      uint32_t q_head_idx = by / rope_chunks;
+      uint32_t rope_chunk_idx = by % rope_chunks;
+      uint32_t elem_offset = rope_chunk_idx * rope_chunk_size;
+
+      DType* q_rope_in_ptr =
+          q_rope_in + get_elem_offset_impl(idx, q_head_idx, elem_offset, q_rope_in_stride_n,
+                                           q_rope_in_stride_h);
+      QuantType* q_rope_out_ptr =
+          q_rope_out + get_elem_offset_impl(idx, q_head_idx, elem_offset, q_rope_out_stride_n,
+                                            q_rope_out_stride_h);
+
+      vec_t<float, vec_size> q_rope_vec;
+      if constexpr (interleave) {
+        q_rope_vec = vec_apply_llama_rope_cos_sin_interleave_reuse_half<vec_size, bdx>(
+            q_rope_in_ptr, cos, sin, rope_dim);
+      } else {
+        q_rope_vec = vec_apply_llama_rope_cos_sin<vec_size, bdx>(q_rope_in_ptr, cos, sin, rope_dim);
+      }
+#pragma unroll
+      for (uint32_t i = 0; i < vec_size; ++i) {
+        q_rope_vec[i] = q_rope_vec[i] * quant_scale_q;
+      }
+      q_rope_vec.cast_store(q_rope_out_ptr + tx * vec_size);
+
+    } else if (by < k_rope_end) {
+      // ============ K RoPE processing & Cache Append ============
+      uint32_t k_head_idx = (by - q_rope_end) / rope_chunks;
+      uint32_t rope_chunk_idx = (by - q_rope_end) % rope_chunks;
+      uint32_t elem_offset = rope_chunk_idx * rope_chunk_size;
+
+      DType* k_rope_in_ptr;
+      if constexpr (IS_MLA) {
+        // MLA: 2D K
+        k_rope_in_ptr = k_rope_in + idx * k_rope_in_stride + elem_offset;
+      } else {
+        // GQA/MHA: 3D K
+        k_rope_in_ptr = k_rope_in + get_elem_offset_impl(idx, k_head_idx, elem_offset,
+                                                         k_rope_in_stride, k_rope_in_stride_h);
+      }
+
+      vec_t<float, vec_size> k_rope_vec;
+      if constexpr (interleave) {
+        k_rope_vec = vec_apply_llama_rope_cos_sin_interleave_reuse_half<vec_size, bdx>(
+            k_rope_in_ptr, cos, sin, rope_dim);
+      } else {
+        k_rope_vec = vec_apply_llama_rope_cos_sin<vec_size, bdx>(k_rope_in_ptr, cos, sin, rope_dim);
+      }
+#pragma unroll
+      for (uint32_t i = 0; i < vec_size; ++i) {
+        k_rope_vec[i] = k_rope_vec[i] * quant_scale_kv;
+      }
+
+      if constexpr (IS_MLA) {
+        QuantType* kpe_ptr =
+            paged_kv_like.get_kpe_ptr(page_iter, entry_idx, elem_offset + tx * vec_size);
+        k_rope_vec.cast_store(kpe_ptr);
+      } else {
+        QuantType* k_ptr = paged_kv_like.get_k_ptr(page_iter, k_head_idx, entry_idx, tx * vec_size);
+        k_rope_vec.cast_store(k_ptr);
+      }
+
+    } else if (by < k_nope_end) {
+      // ============ K Non-RoPE processing & Cache Append ============
+      uint32_t k_head_idx = (by - k_rope_end) / no_rope_chunks;
+      uint32_t nope_chunk_idx = (by - k_rope_end) % no_rope_chunks;
+      uint32_t elem_offset = nope_chunk_idx * rope_chunk_size;
+
+      DType* k_nope_in_ptr;
+      if constexpr (IS_MLA) {
+        k_nope_in_ptr = k_nope_in + idx * k_nope_in_stride + elem_offset;
+      } else {
+        k_nope_in_ptr = k_nope_in + get_elem_offset_impl(idx, k_head_idx, elem_offset,
+                                                         k_nope_in_stride, k_nope_in_stride_h);
+      }
+
+      vec_t<float, vec_size> k_nope_vec;
+      k_nope_vec.cast_load(k_nope_in_ptr + tx * vec_size);
+#pragma unroll
+      for (uint32_t i = 0; i < vec_size; ++i) {
+        k_nope_vec[i] = k_nope_vec[i] * quant_scale_kv;
+      }
+
+      if constexpr (IS_MLA) {
+        QuantType* ckv_ptr =
+            paged_kv_like.get_ckv_ptr(page_iter, entry_idx, elem_offset + tx * vec_size);
+        k_nope_vec.cast_store(ckv_ptr);
+      } else {
+        QuantType* k_ptr = paged_kv_like.get_k_ptr(page_iter, k_head_idx, entry_idx,
+                                                   rope_dim + elem_offset + tx * vec_size);
+        k_nope_vec.cast_store(k_ptr);
+      }
+
+    } else if (by < k_nope_end + (IS_MLA ? 0u : num_kv_heads)) {
+      // ============ V processing & Cache Append (GQA/MHA only) ============
+      if constexpr (!IS_MLA) {
+        uint32_t kv_head_idx = by - k_nope_end;
+        DType* v_in_ptr =
+            v_in + get_elem_offset_impl(idx, kv_head_idx, 0, v_in_stride, v_in_stride_h);
+        // Cover the full head dimension (rope_dim + no_rope_dim) in chunks of rope_chunk_size
+        uint32_t head_dim_total = rope_dim + no_rope_dim;
+        uint32_t v_chunks = (head_dim_total + rope_chunk_size - 1) / rope_chunk_size;
+#pragma unroll 1
+        for (uint32_t j = 0; j < v_chunks; ++j) {
+          uint32_t v_elem_offset = j * rope_chunk_size;
+          if (v_elem_offset + tx * vec_size < head_dim_total) {
+            vec_t<float, vec_size> v_vec;
+            v_vec.cast_load(v_in_ptr + v_elem_offset + tx * vec_size);
+#pragma unroll
+            for (uint32_t i = 0; i < vec_size; ++i) {
+              v_vec[i] = v_vec[i] * quant_scale_kv;
+            }
+            QuantType* v_ptr = paged_kv_like.get_v_ptr(page_iter, kv_head_idx, entry_idx,
+                                                       v_elem_offset + tx * vec_size);
+            v_vec.cast_store(v_ptr);
+          }
+        }
+      }
+
+    } else {
+      // ============ Q Non-RoPE processing ============
+      // MLA has no V section, so Q-nope starts immediately after K-nope.
+      // GQA/MHA has a V section of length num_kv_heads blocks.
+      uint32_t q_nope_start = k_nope_end + (IS_MLA ? 0u : num_kv_heads);
+      uint32_t q_head_idx = (by - q_nope_start) / no_rope_chunks;
+      uint32_t nope_chunk_idx = (by - q_nope_start) % no_rope_chunks;
+      uint32_t elem_offset = nope_chunk_idx * rope_chunk_size;
+
+      DType* q_nope_in_ptr =
+          q_nope_in + get_elem_offset_impl(idx, q_head_idx, elem_offset, q_nope_in_stride_n,
+                                           q_nope_in_stride_h);
+      QuantType* q_nope_out_ptr =
+          q_nope_out + get_elem_offset_impl(idx, q_head_idx, elem_offset, q_nope_out_stride_n,
+                                            q_nope_out_stride_h);
+
+      vec_t<float, vec_size> q_nope_vec;
+      q_nope_vec.cast_load(q_nope_in_ptr + tx * vec_size);
+#pragma unroll
+      for (uint32_t i = 0; i < vec_size; ++i) {
+        q_nope_vec[i] = q_nope_vec[i] * quant_scale_q;
+      }
+      q_nope_vec.cast_store(q_nope_out_ptr + tx * vec_size);
+    }
+  }
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.launch_dependents;");
+#endif
+}
+
 template <typename DType, typename IdType, typename QuantType>
 cudaError_t RopeQuantize(
     DType* q_rope_in, DType* k_rope_in, DType* q_nope_in, DType* k_nope_in, QuantType* q_rope_out,
@@ -832,6 +1044,159 @@ cudaError_t RopeQuantize(
           q_nope_out_stride_h, k_rope_in_stride, k_rope_in_stride_h, k_nope_in_stride,
           k_nope_in_stride_h, k_rope_out_stride, k_rope_out_stride_h, k_nope_out_stride,
           k_nope_out_stride_h, quant_scale_q, quant_scale_kv));
+    });
+  });
+
+  return cudaSuccess;
+}
+
+/*!
+ * \brief Host function to apply RoPE, quantize to FP8, and append K/V to paged cache (GQA/MHA)
+ */
+template <typename DType, typename IdType, typename QuantType>
+cudaError_t RopeQuantizeAppendPagedKVCache(
+    DType* q_rope_in, DType* k_rope_in, DType* q_nope_in, DType* k_nope_in, DType* v_in,
+    QuantType* q_rope_out, QuantType* q_nope_out, paged_kv_t<QuantType, IdType> paged_kv,
+    IdType* batch_indices, IdType* positions, float* cos_sin_cache, IdType* pos_ids, uint32_t nnz,
+    uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t rope_dim, uint32_t no_rope_dim,
+    size_t q_rope_in_stride_n, size_t q_rope_in_stride_h, size_t q_nope_in_stride_n,
+    size_t q_nope_in_stride_h, size_t q_rope_out_stride_n, size_t q_rope_out_stride_h,
+    size_t q_nope_out_stride_n, size_t q_nope_out_stride_h, size_t k_rope_in_stride,
+    size_t k_rope_in_stride_h, size_t k_nope_in_stride, size_t k_nope_in_stride_h,
+    size_t v_in_stride, size_t v_in_stride_h, float quant_scale_q, float quant_scale_kv,
+    bool interleave, bool enable_pdl = false, cudaStream_t stream = nullptr) {
+  constexpr uint32_t vec_size = 32 / sizeof(DType);
+
+  DISPATCH_ROPE_DIM(rope_dim, vec_size, {
+    DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
+      uint32_t num_threads = 128U;
+      uint32_t bdy = num_threads / bdx;
+      uint32_t nblks_x = (nnz + bdy - 1) / bdy;
+      uint32_t rope_chunks = 1;
+      uint32_t no_rope_chunks = (no_rope_dim + rope_dim - 1) / rope_dim;
+
+      // GQA/MHA: Q rope + K rope + K nope + V + Q nope
+      uint32_t total_blocks_y = num_qo_heads * rope_chunks + num_kv_heads * rope_chunks +
+                                num_kv_heads * no_rope_chunks + num_kv_heads +
+                                num_qo_heads * no_rope_chunks;
+
+      dim3 nblks(nblks_x, total_blocks_y);
+      dim3 nthrs(bdx, bdy);
+
+      cudaLaunchAttribute attribute[1];
+      attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+      attribute[0].val.programmaticStreamSerializationAllowed = enable_pdl ? 1 : 0;
+      cudaLaunchConfig_t config;
+      config.gridDim = nblks;
+      config.blockDim = nthrs;
+      config.stream = stream;
+      config.dynamicSmemBytes = 0;
+      config.attrs = attribute;
+      config.numAttrs = 1;
+
+      auto kernel =
+          RopeQuantizeAppendPagedKVCacheKernel<INTERLEAVE, vec_size, bdx, DType, IdType, QuantType,
+                                               false, paged_kv_t<QuantType, IdType>>;
+      FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
+          &config, kernel,
+          // inputs
+          q_rope_in, k_rope_in, q_nope_in, k_nope_in, v_in,
+          // q outputs
+          q_rope_out, q_nope_out,
+          // cache + indices
+          paged_kv, batch_indices, positions,
+          // rope tables
+          cos_sin_cache, pos_ids,
+          // sizes
+          nnz, num_qo_heads, num_kv_heads, rope_dim, no_rope_dim,
+          // Q strides (in/out)
+          q_rope_in_stride_n, q_rope_in_stride_h, q_nope_in_stride_n, q_nope_in_stride_h,
+          q_rope_out_stride_n, q_rope_out_stride_h, q_nope_out_stride_n, q_nope_out_stride_h,
+          // K strides
+          k_rope_in_stride, k_rope_in_stride_h, k_nope_in_stride, k_nope_in_stride_h,
+          // V strides
+          v_in_stride, v_in_stride_h,
+          // scales
+          quant_scale_q, quant_scale_kv));
+    });
+  });
+
+  return cudaSuccess;
+}
+
+/*!
+ * \brief Host function to apply RoPE, quantize to FP8, and append to MLA paged cache
+ */
+template <typename DType, typename IdType, typename QuantType>
+cudaError_t RopeQuantizeAppendPagedMLACache(
+    DType* q_rope_in, DType* k_rope_in, DType* q_nope_in, DType* k_nope_in, QuantType* q_rope_out,
+    QuantType* q_nope_out, paged_kv_mla_t<QuantType, IdType> paged_kv_mla, IdType* batch_indices,
+    IdType* positions, float* cos_sin_cache, IdType* pos_ids, uint32_t nnz, uint32_t num_qo_heads,
+    uint32_t rope_dim, uint32_t no_rope_dim, size_t q_rope_in_stride_n, size_t q_rope_in_stride_h,
+    size_t q_nope_in_stride_n, size_t q_nope_in_stride_h, size_t q_rope_out_stride_n,
+    size_t q_rope_out_stride_h, size_t q_nope_out_stride_n, size_t q_nope_out_stride_h,
+    size_t k_rope_in_stride, size_t k_nope_in_stride, float quant_scale_q, float quant_scale_kv,
+    bool interleave, bool enable_pdl = false, cudaStream_t stream = nullptr) {
+  constexpr uint32_t vec_size = 32 / sizeof(DType);
+
+  DISPATCH_ROPE_DIM(rope_dim, vec_size, {
+    DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
+      uint32_t num_threads = 128U;
+      uint32_t bdy = num_threads / bdx;
+      uint32_t nblks_x = (nnz + bdy - 1) / bdy;
+      uint32_t rope_chunks = 1;
+      uint32_t no_rope_chunks = (no_rope_dim + rope_dim - 1) / rope_dim;
+
+      // MLA: Q rope + K rope + K nope + Q nope (no V)
+      constexpr uint32_t num_kv_heads = 1;
+      uint32_t total_blocks_y = num_qo_heads * rope_chunks + num_kv_heads * rope_chunks +
+                                num_kv_heads * no_rope_chunks + num_qo_heads * no_rope_chunks;
+
+      dim3 nblks(nblks_x, total_blocks_y);
+      dim3 nthrs(bdx, bdy);
+
+      cudaLaunchAttribute attribute[1];
+      attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+      attribute[0].val.programmaticStreamSerializationAllowed = enable_pdl ? 1 : 0;
+      cudaLaunchConfig_t config;
+      config.gridDim = nblks;
+      config.blockDim = nthrs;
+      config.stream = stream;
+      config.dynamicSmemBytes = 0;
+      config.attrs = attribute;
+      config.numAttrs = 1;
+
+      auto kernel =
+          RopeQuantizeAppendPagedKVCacheKernel<INTERLEAVE, vec_size, bdx, DType, IdType, QuantType,
+                                               true, paged_kv_mla_t<QuantType, IdType>>;
+      // For MLA: pass v_in as nullptr, num_kv_heads=1, duplicate 2D K strides for head strides, and
+      // 0 V strides
+      DType* v_in_nullptr = nullptr;
+      uint32_t num_kv_heads_1 = 1;
+      size_t k_rope_in_stride_h_dup = k_rope_in_stride;
+      size_t k_nope_in_stride_h_dup = k_nope_in_stride;
+      size_t v_in_stride_zero = 0, v_in_stride_h_zero = 0;
+      FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
+          &config, kernel,
+          // inputs
+          q_rope_in, k_rope_in, q_nope_in, k_nope_in, v_in_nullptr,
+          // q outputs
+          q_rope_out, q_nope_out,
+          // cache + indices
+          paged_kv_mla, batch_indices, positions,
+          // rope tables
+          cos_sin_cache, pos_ids,
+          // sizes
+          nnz, num_qo_heads, num_kv_heads_1, rope_dim, no_rope_dim,
+          // Q strides (in/out)
+          q_rope_in_stride_n, q_rope_in_stride_h, q_nope_in_stride_n, q_nope_in_stride_h,
+          q_rope_out_stride_n, q_rope_out_stride_h, q_nope_out_stride_n, q_nope_out_stride_h,
+          // K strides (2D: duplicate for head stride)
+          k_rope_in_stride, k_rope_in_stride_h_dup, k_nope_in_stride, k_nope_in_stride_h_dup,
+          // V strides (unused for MLA)
+          v_in_stride_zero, v_in_stride_h_zero,
+          // scales
+          quant_scale_q, quant_scale_kv));
     });
   });
 
