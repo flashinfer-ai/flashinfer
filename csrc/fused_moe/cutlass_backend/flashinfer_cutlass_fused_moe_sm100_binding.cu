@@ -376,7 +376,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     // TODO: support lora in the future
     ::tensorrt_llm::kernels::LoraParams lora_params{};
     // HACK Define default values for parameters we don't have good values for
-    bool const swizzled_input_sf = true;              // Assume input_sf is swizzled by default
+    bool const swizzled_input_sf = true;               // Assume input_sf is swizzled by default
     int64_t const unpadded_hidden_size = hidden_size;  // Assume no padding by default
     bool const use_lora = false;                       // No lora support yet
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
@@ -560,7 +560,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     // TODO: support lora in the future
     ::tensorrt_llm::kernels::LoraParams lora_params{};
     // HACK Define default values for parameters we don't have good values for
-    bool const swizzled_input_sf_ml = true;  // Assume input_sf is swizzled by default
+    bool const swizzled_input_sf_ml = true;               // Assume input_sf is swizzled by default
     int64_t const unpadded_hidden_size_ml = hidden_size;  // Assume no padding by default
     bool const use_lora_ml = false;                       // No lora support yet
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
