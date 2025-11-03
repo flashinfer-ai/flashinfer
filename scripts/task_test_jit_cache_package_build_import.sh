@@ -37,6 +37,9 @@ arches = ["7.5", "8.0", "8.9", "9.0a"]
 if cuda_ver is not None:
     try:
         major, minor = map(int, cuda_ver.split(".")[:2])
+        if (major, minor) >= (13, 0):
+            arches.append("11.0a")
+            arches.append("12.1a")
         if (major, minor) >= (12, 8):
             arches.append("10.0a")
             arches.append("12.0a")
