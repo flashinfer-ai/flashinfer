@@ -854,7 +854,9 @@ def supported_compute_capability(supported_ccs: Iterable[int]) -> Callable:
 
 
 def backend_requirement(
-    backend_checks: Dict[str, Callable], common_check: Optional[Callable] = None
+    backend_checks: Dict[str, Callable],
+    common_check: Optional[Callable] = None,
+    heuristic_func: Optional[Callable] = None,
 ) -> Callable:
     """
     Decorator to enforce backend and problem size requirements for kernel functions.
@@ -1019,11 +1021,18 @@ def backend_requirement(
             return backend in backend_checks
 
         def suitable_auto_backends(*args, **kwargs):
+            if common_check is not None and not common_check(*args, **kwargs):
+                return False
+
+            # Check for each backend support
             suitable_backends = [
                 backend
                 for backend in backend_checks
                 if backend_checks[backend](*args, **kwargs)
             ]
+            # If a heuristic function is provided, filter the suitable backends based on the heuristic function
+            if heuristic_func is not None:
+                suitable_backends = heuristic_func(suitable_backends, *args, **kwargs)
             if not suitable_backends:
                 return False
             wrapper.suitable_auto_backends = suitable_backends
@@ -1091,6 +1100,10 @@ def backend_requirement(
                         f"Problem size is not supported for {func.__name__}"
                     )
 
+            elif skip_check and heuristic_func is not None:
+                # This needs to be called for heuristic function
+                suitable_auto_backends(*args, **kwargs)
+            
             return func(*args, **kwargs)
 
         wrapper.is_backend_supported = is_backend_supported

@@ -364,6 +364,40 @@ def test_suitable_auto_backends():
         my_kernel(x, backend="auto")
 
 
+def test_heuristic_func():
+    """Test the heuristic_func parameter."""
+    if not torch.cuda.is_available():
+        pytest.skip("Skipping CUDA tests (no GPU available)")
+
+    x = torch.randn(1, 1, device="cuda")
+    major, minor = torch.cuda.get_device_capability(x.device)
+    actual_capability = major * 10 + minor
+
+    @supported_compute_capability([80, 86, 89, 90, actual_capability])
+    def _cutlass_check(x, backend):
+        return x.shape[0] > 10
+
+    @supported_compute_capability([75, 80, 86, 89, 90, actual_capability])
+    def _cudnn_check(x, backend):
+        return x.shape[0] > 5
+
+    def _heuristic_func(suitable_backends, x, backend):
+        return ["cudnn", "cutlass"]
+
+    @backend_requirement(
+        {"cutlass": _cutlass_check, "cudnn": _cudnn_check},
+        heuristic_func=_heuristic_func,
+    )
+    def my_kernel(x, backend="auto"):
+        assert my_kernel.suitable_auto_backends[0] == "cudnn"
+        assert my_kernel.suitable_auto_backends[1] == "cutlass"
+        return x * 2
+
+    x = torch.randn(6, 10, device="cuda")
+    result = my_kernel(x, backend="auto")
+    assert result.shape == x.shape
+
+
 def test_functools_wraps_preserves_metadata():
     """Test that backend_requirement preserves function metadata with functools.wraps."""
 
