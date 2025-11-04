@@ -350,6 +350,8 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
                 use_mxfp8_act_scaling,
             )
             self.activation_type = activation_type
+            # Set by tuning flow to indicate which GEMM stage (1 or 2) to filter tactics for
+            self.gemm_idx_for_tuning: Optional[int] = None
 
             if instance_key not in MoERunner.runner_dict:
                 MoERunner.runner_dict[instance_key] = module.init(

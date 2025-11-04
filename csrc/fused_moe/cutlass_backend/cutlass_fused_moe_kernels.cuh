@@ -4780,12 +4780,11 @@ void GemmProfilerBackend::runProfiler(int original_num_tokens, Config const& tac
         ((mDType == nvinfer1::DataType::kHALF || mDType == nvinfer1::DataType::kBF16) &&
          mWType == nvinfer1::DataType::kUINT8);
     bool use_w4_groupwise = use_w4afp8 || use_wfp4a16;
-    bool finalize_supported_this_gemm =
-        (mGemmToProfile == GemmToProfile::GEMM_2) && mInterface->use_fused_finalize_ &&
-        !mMinLatencyMode && !use_w4_groupwise;
-    bool request_finalize =
-        tactic.epilogue_fusion_type ==
-        cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE;
+    bool finalize_supported_this_gemm = (mGemmToProfile == GemmToProfile::GEMM_2) &&
+                                        mInterface->use_fused_finalize_ && !mMinLatencyMode &&
+                                        !use_w4_groupwise;
+    bool request_finalize = tactic.epilogue_fusion_type ==
+                            cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE;
     bool use_finalize_index = request_finalize && finalize_supported_this_gemm;
 
     tma_ws_input_template = mTmaInputCache[use_finalize_index][tactic.swap_ab][mSampleIndex];
