@@ -1627,9 +1627,9 @@ def rope_quantize_fp8_append_paged_kv_cache(
                 f"GQA/MHA cache dtype mismatch: expected {quantize_dtype}, "
                 f"got k={k_cache.dtype}, v={v_cache.dtype}"
             )
-        if k_cache.ndim not in [4, 5] or v_cache.ndim not in [4, 5]:
+        if k_cache.ndim != 4 or v_cache.ndim != 4:
             raise ValueError(
-                f"GQA/MHA cache must be 4D or 5D, got k={k_cache.ndim}D, v={v_cache.ndim}D"
+                f"GQA/MHA cache must be 4D, got k={k_cache.ndim}D, v={v_cache.ndim}D"
             )
         # Create dummy tensors for MLA cache (not used)
         ckv_cache = torch.empty(0, dtype=quantize_dtype, device=q_rope.device)
