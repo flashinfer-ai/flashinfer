@@ -1026,20 +1026,29 @@ def backend_requirement(
                 return False
 
             # Check for each backend support
+<<<<<<< HEAD
 =======
         def suitable_auto_backends(*args, **kwargs):
 >>>>>>> f85c63d7 (inital)
+=======
+>>>>>>> 7e3c47de (heuristic function)
             suitable_backends = [
                 backend
                 for backend in backend_checks
                 if backend_checks[backend](*args, **kwargs)
             ]
 <<<<<<< HEAD
+<<<<<<< HEAD
             # If a heuristic function is provided, filter the suitable backends based on the heuristic function
             if heuristic_func is not None:
                 suitable_backends = heuristic_func(suitable_backends, *args, **kwargs)
 =======
 >>>>>>> f85c63d7 (inital)
+=======
+            # If a heuristic function is provided, filter the suitable backends based on the heuristic function
+            if heuristic_func is not None:
+                suitable_backends = heuristic_func(suitable_backends, *args, **kwargs)
+>>>>>>> 7e3c47de (heuristic function)
             if not suitable_backends:
                 return False
             wrapper.suitable_auto_backends = suitable_backends
@@ -1102,11 +1111,11 @@ def backend_requirement(
                         raise BackendSupportedError(
                             f"{func.__name__} does not support compute capability {capability}"
                         )
+
                 if not _is_problem_size_supported(**kwargs_with_defaults):
                     raise ValueError(
                         f"Problem size is not supported for {func.__name__}"
                     )
-
             elif skip_check and heuristic_func is not None:
                 # This needs to be called for heuristic function
                 suitable_auto_backends(*args, **kwargs)
