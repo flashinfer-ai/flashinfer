@@ -296,7 +296,7 @@ def _rope_quantize_fp8_append_paged_kv_cache(
     )
 
 
-@register_fake_op("flashinfer::rope_quantize_fp8_append_paged_kv_cache")
+@register_fake_op("flashinfer::rope_quantize_append_paged_kv_cache")
 def _fake_rope_quantize_fp8_append_paged_kv_cache(
     q_rope_in: torch.Tensor,
     k_rope_in: torch.Tensor,
