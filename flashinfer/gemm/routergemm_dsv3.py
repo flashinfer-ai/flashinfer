@@ -70,7 +70,7 @@ def get_dsv3_router_gemm_module():
         "flashinfer::dsv3_router_gemm_op",
         mutates_args=["out"],
     )
-    def dsv3_router_gemm_op(
+    def routergemm_dsv3_hidden_7168_experts_256_tokens_lt16(
         mat_a: torch.Tensor,
         mat_b: torch.Tensor,
         out: torch.Tensor,
@@ -80,14 +80,14 @@ def get_dsv3_router_gemm_module():
         module.dsv3_router_gemm_op(mat_a, mat_b, out, launch_with_pdl, bias)
 
     return SimpleNamespace(
-        dsv3_router_gemm_op=dsv3_router_gemm_op,
+        routergemm_dsv3_hidden_7168_experts_256_tokens_lt16=routergemm_dsv3_hidden_7168_experts_256_tokens_lt16,
     )
 
 
 # TODO: Add decorator for support checks: compute capability and type checks
 # TODO: wait for Jimmy's fix to enable this: https://github.com/flashinfer-ai/flashinfer/pull/2015
 # @backend_requirement({}, common_check=_dvs3_router_gemm_shape_checks)
-def dsv3_router_gemm_op(
+def routergemm_dsv3_hidden_7168_experts_256_tokens_lt16(
     mat_a: torch.Tensor,
     mat_b: torch.Tensor,
     out: torch.Tensor,
@@ -95,6 +95,6 @@ def dsv3_router_gemm_op(
     bias: Optional[torch.Tensor] = None,
 ) -> None:
     _dvs3_router_gemm_shape_checks(mat_a, mat_b, out, launch_with_pdl, bias)
-    get_dsv3_router_gemm_module().dsv3_router_gemm_op(
+    get_dsv3_router_gemm_module().routergemm_dsv3_hidden_7168_experts_256_tokens_lt16(
         mat_a, mat_b, out, launch_with_pdl, bias
     )
