@@ -45,16 +45,13 @@ void rope_quantize(TensorView q_rope_in, TensorView k_rope_in, TensorView q_nope
                    TensorView pos_ids, double quant_scale_q, double quant_scale_kv, bool interleave,
                    bool enable_pdl);
 
-// Fused RoPE + Quantize + Append Paged KV Cache (MLA/GQA/MHA)
 void rope_quantize_append_paged_kv_cache(
     TensorView q_rope_in, TensorView k_rope_in, TensorView q_nope_in, TensorView k_nope_in,
     TensorView v_in, TensorView q_rope_out, TensorView q_nope_out, TensorView cos_sin_cache,
-    TensorView pos_ids,
-    // Paged cache tensors
-    TensorView k_cache, TensorView v_cache, TensorView ckv_cache, TensorView kpe_cache,
-    TensorView kv_indices, TensorView kv_indptr, TensorView batch_indices, TensorView positions,
-    int64_t kv_layout_code, int64_t page_size, double quant_scale_q, double quant_scale_kv,
-    bool interleave, bool enable_pdl);
+    TensorView pos_ids, TensorView k_cache, TensorView v_cache, TensorView ckv_cache,
+    TensorView kpe_cache, TensorView kv_indices, TensorView kv_indptr, TensorView batch_indices,
+    TensorView positions, int64_t kv_layout_code, int64_t page_size, double quant_scale_q,
+    double quant_scale_kv, bool interleave, bool enable_pdl);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(apply_rope, apply_rope);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(apply_llama31_rope, apply_llama31_rope);
