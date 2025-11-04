@@ -226,6 +226,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     // Get tactics for both GEMM1 and GEMM2, combine them
     auto gemm1_tactics = mKernelRunner->getTactics(kernels::MoeGemmId::GEMM_1);
     auto gemm2_tactics = mKernelRunner->getTactics(kernels::MoeGemmId::GEMM_2);
+    mGemm1TacticCount = static_cast<int64_t>(gemm1_tactics.size());
+    mGemm2TacticCount = static_cast<int64_t>(gemm2_tactics.size());
     mAllProfiles = gemm1_tactics;
     mAllProfiles.insert(mAllProfiles.end(), gemm2_tactics.begin(), gemm2_tactics.end());
     TVM_FFI_ICHECK(!mAllProfiles.empty())
@@ -709,6 +711,10 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
           });
     } else if (name == "get_tactic_num") {
       return Function::FromTyped([this]() -> int64_t { return getTacticNum(); });
+    } else if (name == "get_gemm1_tactic_count") {
+      return Function::FromTyped([this]() -> int64_t { return mGemm1TacticCount; });
+    } else if (name == "get_gemm2_tactic_count") {
+      return Function::FromTyped([this]() -> int64_t { return mGemm2TacticCount; });
     } else if (name == "run_moe") {
       return Function::FromTyped(
           [this](TensorView output, TensorView input, TensorView token_selected_experts,
@@ -776,6 +782,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 
   using Profile = tensorrt_llm::cutlass_extensions::CutlassGemmConfig;
   std::vector<Profile> mAllProfiles;
+  int64_t mGemm1TacticCount{0};
+  int64_t mGemm2TacticCount{0};
 
   void setRunnerProfiles(Optional<Array<int64_t>> profile_ids) {
     if (mUseDeepSeekFP8BlockScaling) {

@@ -4774,10 +4774,21 @@ void GemmProfilerBackend::runProfiler(int original_num_tokens, Config const& tac
 
   TmaWarpSpecializedGroupedGemmInput tma_ws_input_template;
   if (tactic.is_tma_warp_specialized) {
-    tma_ws_input_template =
-        mTmaInputCache[tactic.epilogue_fusion_type ==
-                       cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE]
-                      [tactic.swap_ab][mSampleIndex];
+    // Use non-finalize cache when finalize fusion is not supported for the current GEMM
+    bool use_w4afp8 = (mDType == nvinfer1::DataType::kFP8 && mWType == nvinfer1::DataType::kINT4);
+    bool use_wfp4a16 =
+        ((mDType == nvinfer1::DataType::kHALF || mDType == nvinfer1::DataType::kBF16) &&
+         mWType == nvinfer1::DataType::kUINT8);
+    bool use_w4_groupwise = use_w4afp8 || use_wfp4a16;
+    bool finalize_supported_this_gemm =
+        (mGemmToProfile == GemmToProfile::GEMM_2) && mInterface->use_fused_finalize_ &&
+        !mMinLatencyMode && !use_w4_groupwise;
+    bool request_finalize =
+        tactic.epilogue_fusion_type ==
+        cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE;
+    bool use_finalize_index = request_finalize && finalize_supported_this_gemm;
+
+    tma_ws_input_template = mTmaInputCache[use_finalize_index][tactic.swap_ab][mSampleIndex];
     TLLM_CHECK_WITH_INFO(tma_ws_input_template.isValid(),
                          "TMA WS input template is not initialized");
   }

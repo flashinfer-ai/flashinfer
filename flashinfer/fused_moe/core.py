@@ -368,7 +368,20 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             inputs: List[torch.Tensor],
             profile: OptimizationProfile,
         ) -> List[int]:
-            return list(range(self.fused_moe_runner.get_tactic_num()))
+            # Prefer filtering tactics by GEMM stage to avoid invalid combos during tuning
+            try:
+                gemm1_count = self.fused_moe_runner.get_gemm1_tactic_count()
+                gemm2_count = self.fused_moe_runner.get_gemm2_tactic_count()
+                total = gemm1_count + gemm2_count
+            except Exception:
+                return list(range(self.fused_moe_runner.get_tactic_num()))
+
+            stage = getattr(self, "gemm_idx_for_tuning", None)
+            if stage == 1:
+                return list(range(gemm1_count))
+            if stage == 2:
+                return list(range(gemm1_count, gemm1_count + gemm2_count))
+            return list(range(total))
 
         def forward(
             self,
@@ -480,6 +493,8 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             activation_type=activation_type,
         )
 
+        # Limit tactics to GEMM1 during tuning
+        moe_runner.gemm_idx_for_tuning = 1
         _, gemm_tactic_1 = tuner.choose_one(
             "trtllm::fused_moe::gemm1",
             [moe_runner],
@@ -494,6 +509,8 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             gemm_idx=1,
         )
 
+        # Limit tactics to GEMM2 during tuning
+        moe_runner.gemm_idx_for_tuning = 2
         _, gemm_tactic_2 = tuner.choose_one(
             "trtllm::fused_moe::gemm2",
             [moe_runner],
