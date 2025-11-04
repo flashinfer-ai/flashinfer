@@ -58,6 +58,11 @@ using tvm::ffi::Optional;
         using c_type_out = c_type_in;                                          \
         return __VA_ARGS__();                                                  \
       });                                                                      \
+    } else {                                                                   \
+      return DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(in_dtype, c_type_in, [&] {    \
+        using c_type_out = nv_bfloat16;                                        \
+        return __VA_ARGS__();                                                  \
+      });                                                                      \
     }                                                                          \
     return false;                                                              \
   }()
@@ -80,14 +85,17 @@ void FMHACutlassSM100Run(ffi::TensorView workspace_buffer, ffi::TensorView q, ff
                          ffi::TensorView qo_tile_indices, ffi::TensorView qo_head_indices,
                          ffi::TensorView batch_indices, ffi::TensorView o,
                          Optional<ffi::TensorView> maybe_lse, int64_t mask_mode_code,
-                         double sm_scale, int64_t num_qo_heads, int64_t num_kv_heads,
-                         int64_t head_dim_qk, int64_t head_dim_vo, int64_t max_qo_len) {
+                         double sm_scale, int64_t max_qo_len) {
   TVM_FFI_ICHECK_EQ(q.dtype(), k.dtype());
   auto scalar_type_in = q.dtype();
   auto scalar_type_out = o.dtype();
   MaskMode mask_mode = static_cast<MaskMode>(mask_mode_code);
   int total_qo_len = q.size(0);
   int total_kv_len = k.size(0);
+  int num_qo_heads = q.size(1);
+  int num_kv_heads = k.size(1);
+  int head_dim_qk = q.size(2);
+  int head_dim_vo = v.size(2);
   int batch_size = qo_segment_offsets.size(0) - 1;
   int q_stride_n = q.stride(0);
   int q_stride_h = q.stride(1);
