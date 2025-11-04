@@ -18,7 +18,6 @@ import pytest
 import torch
 
 import flashinfer
-from flashinfer.utils import get_compute_capability
 
 
 @pytest.mark.parametrize("batch_size", [12, 17])
@@ -41,9 +40,6 @@ def test_batch_prefill_with_paged_kv_cache_fp8_calibration_scale(
     kv_layout,
     dtype,
 ):
-    compute_capability = get_compute_capability(torch.device(device="cuda"))
-    if compute_capability[0] == 9:
-        pytest.xfail("SM90 tests are currently not passing at this moment")
     torch.manual_seed(42)
     q = torch.randn(
         batch_size * qo_len, num_qo_heads, head_dim, dtype=torch.float16
@@ -70,7 +66,7 @@ def test_batch_prefill_with_paged_kv_cache_fp8_calibration_scale(
 
     workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(0)
     wrapper_f16 = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-        workspace_buffer, kv_layout
+        workspace_buffer, kv_layout, backend="fa2"
     )
     wrapper_f16.plan(
         qo_indptr,
@@ -94,7 +90,7 @@ def test_batch_prefill_with_paged_kv_cache_fp8_calibration_scale(
     kv_data_fp8 = torch.cat([k_fp8, v_fp8], dim=1)
 
     wrapper_f8 = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-        workspace_buffer, kv_layout
+        workspace_buffer, kv_layout, backend="fa2"
     )
     wrapper_f8.plan(
         qo_indptr,
@@ -136,9 +132,6 @@ def test_batch_decode_with_prefill_with_paged_kv_cache(
     kv_layout,
     dtype,
 ):
-    compute_capability = get_compute_capability(torch.device(device="cuda"))
-    if compute_capability[0] == 9:
-        pytest.xfail("SM90 tests are currently not passing at this moment")
     torch.manual_seed(42)
     q = torch.randn(batch_size, num_qo_heads, head_dim, dtype=torch.float16).to(0)
     num_pages_per_seq = (kv_len + page_size - 1) // page_size
@@ -163,7 +156,7 @@ def test_batch_decode_with_prefill_with_paged_kv_cache(
 
     workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(0)
     wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-        workspace_buffer, kv_layout
+        workspace_buffer, kv_layout, backend="fa2"
     )
     wrapper.plan(
         qo_indptr,
@@ -180,7 +173,7 @@ def test_batch_decode_with_prefill_with_paged_kv_cache(
     o_fp8 = wrapper.run(q, kv_data)
 
     decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-        workspace_buffer, kv_layout
+        workspace_buffer, kv_layout, backend="fa2"
     )
     decode_wrapper.plan(
         kv_indptr,
