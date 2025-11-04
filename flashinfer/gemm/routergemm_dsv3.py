@@ -3,11 +3,10 @@ import functools
 from types import SimpleNamespace
 import torch
 from flashinfer.utils import register_custom_op
-from typing import Optional
 # from flashinfer.utils import backend_requirement
 
 
-def _dvs3_router_gemm_shape_checks(mat_a, mat_b, out, launch_with_pdl, bias):
+def _dvs3_router_gemm_shape_checks(mat_a, mat_b, out, launch_with_pdl):
     # Dimension checks
     if mat_a.dim() != 2:
         raise ValueError("mat_a must be a 2D tensor")
@@ -15,8 +14,6 @@ def _dvs3_router_gemm_shape_checks(mat_a, mat_b, out, launch_with_pdl, bias):
         raise ValueError("mat_b must be a 2D tensor")
     if out.dim() != 2:
         raise ValueError("out must be a 2D tensor")
-    if bias is not None:
-        raise ValueError("bias is not supported yet")
 
     # Stride checks (check these before dimension checks to give better error messages)
     if mat_a.stride(1) != 1:
@@ -74,10 +71,9 @@ def get_dsv3_router_gemm_module():
         mat_a: torch.Tensor,
         mat_b: torch.Tensor,
         out: torch.Tensor,
-        launch_with_pdl: bool,
-        bias: Optional[torch.Tensor] = None,
+        launch_with_pdl: bool = False,
     ) -> None:
-        module.dsv3_router_gemm_op(mat_a, mat_b, out, launch_with_pdl, bias)
+        module.dsv3_router_gemm_op(mat_a, mat_b, out, launch_with_pdl)
 
     return SimpleNamespace(
         routergemm_dsv3_hidden_7168_experts_256_tokens_lt16=routergemm_dsv3_hidden_7168_experts_256_tokens_lt16,
@@ -91,10 +87,9 @@ def routergemm_dsv3_hidden_7168_experts_256_tokens_lt16(
     mat_a: torch.Tensor,
     mat_b: torch.Tensor,
     out: torch.Tensor,
-    launch_with_pdl: bool,
-    bias: Optional[torch.Tensor] = None,
+    launch_with_pdl: bool = False,
 ) -> None:
-    _dvs3_router_gemm_shape_checks(mat_a, mat_b, out, launch_with_pdl, bias)
+    _dvs3_router_gemm_shape_checks(mat_a, mat_b, out, launch_with_pdl)
     get_dsv3_router_gemm_module().routergemm_dsv3_hidden_7168_experts_256_tokens_lt16(
-        mat_a, mat_b, out, launch_with_pdl, bias
+        mat_a, mat_b, out, launch_with_pdl
     )

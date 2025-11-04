@@ -8,13 +8,16 @@ import torch.nn.functional as F
 @pytest.mark.parametrize("num_tokens", [1, 2, 3, 5, 8, 13, 16])
 @pytest.mark.parametrize("num_experts", [256])
 @pytest.mark.parametrize("hidden_dim", [7168])
-def test_dsv3_router_gemm_op(num_tokens, num_experts, hidden_dim):
+@pytest.mark.parametrize("launch_with_pdl", [True, False])
+def test_dsv3_router_gemm_op(num_tokens, num_experts, hidden_dim, launch_with_pdl):
     mat_a = torch.randn(num_tokens, hidden_dim, device="cuda", dtype=torch.bfloat16)
     mat_b = torch.randn(
         num_experts, hidden_dim, device="cuda", dtype=torch.bfloat16
     ).t()  # column major
     out = torch.randn(num_tokens, num_experts, device="cuda", dtype=torch.float32)
-    routergemm_dsv3_hidden_7168_experts_256_tokens_lt16(mat_a, mat_b, out, False)
+    routergemm_dsv3_hidden_7168_experts_256_tokens_lt16(
+        mat_a, mat_b, out, launch_with_pdl=launch_with_pdl
+    )
     ref = mat_a @ mat_b
 
     cos_sim = F.cosine_similarity(ref.reshape(-1), out.reshape(-1), dim=0)
@@ -123,5 +126,5 @@ def test_dsv3_router_gemm_op_negative(
 
     with pytest.raises(ValueError, match=expected_error):
         routergemm_dsv3_hidden_7168_experts_256_tokens_lt16(
-            mat_a, mat_b, out, False, None
+            mat_a, mat_b, out, launch_with_pdl=False
         )

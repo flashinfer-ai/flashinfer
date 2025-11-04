@@ -1,6 +1,5 @@
 #include "flashinfer/gemm/dsv3_router_gemm.cuh"
 #include "tvm_ffi_utils.h"
-using tvm::ffi::Optional;
 
 namespace flashinfer::trtllm_dsv3_router_gemm {
 template <typename T, int kNumTokens, int kNumExperts, int kHiddenDim>
@@ -92,13 +91,13 @@ template void invokeRouterGemm<__nv_bfloat16, 16, 256, 7168>(float*, __nv_bfloat
 template <int kBegin, int kEnd, int kNumExperts, int kHiddenDim>
 struct LoopUnroller {
   static void unroll(int num_tokens, float* output, __nv_bfloat16 const* input,
-                     __nv_bfloat16 const* weights, cudaStream_t stream) {
+                     __nv_bfloat16 const* weights, cudaStream_t stream, bool launch_with_pdl) {
     if (num_tokens == kBegin) {
       invokeRouterGemm<__nv_bfloat16, kBegin, kNumExperts, kHiddenDim>(output, input, weights,
-                                                                       stream);
+                                                                       stream, launch_with_pdl);
     } else {
-      LoopUnroller<kBegin + 1, kEnd, kNumExperts, kHiddenDim>::unroll(num_tokens, output, input,
-                                                                      weights, stream);
+      LoopUnroller<kBegin + 1, kEnd, kNumExperts, kHiddenDim>::unroll(
+          num_tokens, output, input, weights, stream, launch_with_pdl);
     }
   }
 };
@@ -106,18 +105,17 @@ struct LoopUnroller {
 template <int kEnd, int kNumExperts, int kHiddenDim>
 struct LoopUnroller<kEnd, kEnd, kNumExperts, kHiddenDim> {
   static void unroll(int num_tokens, float* output, __nv_bfloat16 const* input,
-                     __nv_bfloat16 const* weights, cudaStream_t stream) {
+                     __nv_bfloat16 const* weights, cudaStream_t stream, bool launch_with_pdl) {
     if (num_tokens == kEnd) {
-      invokeRouterGemm<__nv_bfloat16, kEnd, kNumExperts, kHiddenDim>(output, input, weights,
-                                                                     stream);
+      invokeRouterGemm<__nv_bfloat16, kEnd, kNumExperts, kHiddenDim>(output, input, weights, stream,
+                                                                     launch_with_pdl);
     } else {
       throw std::invalid_argument("Invalid num_tokens, only supports 1 to 16");
     }
   }
 };
 
-void dsv3_router_gemm_op(TensorView mat_a, TensorView mat_b, TensorView out, bool launch_with_pdl,
-                         Optional<TensorView> bias) {
+void dsv3_router_gemm_op(TensorView mat_a, TensorView mat_b, TensorView out, bool launch_with_pdl) {
   int const num_tokens = mat_a.sizes()[0];
   int const num_experts = mat_b.sizes()[1];
   int const hidden_dim = mat_a.sizes()[1];
@@ -130,7 +128,6 @@ void dsv3_router_gemm_op(TensorView mat_a, TensorView mat_b, TensorView out, boo
   TVM_FFI_ICHECK(mat_a.strides()[1] == 1 && out.strides()[1] == 1)
       << "mat_a and out must be row-major";
   TVM_FFI_ICHECK(mat_b.strides()[0] == 1) << "mat_b must be column-major";
-  TVM_FFI_ICHECK(!bias.has_value()) << "bias is not support yet";
   auto stream = get_stream(mat_a.device());
   bool use_custom_kernel = false;
   if (num_tokens >= 1 && num_tokens <= 16 && num_experts == kNumExperts &&
@@ -143,7 +140,7 @@ void dsv3_router_gemm_op(TensorView mat_a, TensorView mat_b, TensorView out, boo
     LoopUnroller<1, 16, kNumExperts, kHiddenDim>::unroll(
         num_tokens, reinterpret_cast<float*>(out.data_ptr()),
         reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
-        reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr()), stream);
+        reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr()), stream, launch_with_pdl);
   } else {
     TVM_FFI_LOG_AND_THROW(NotImplementedError) << "Unsupported input tensor size";
   }
