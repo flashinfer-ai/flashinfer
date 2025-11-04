@@ -2,10 +2,17 @@ from flashinfer.jit import gen_dsv3_router_gemm_module
 import functools
 from types import SimpleNamespace
 import torch
-from flashinfer.utils import register_custom_op
+from flashinfer.utils import (
+    register_custom_op,
+    supported_compute_capability,
+    get_compute_capability,
+    BackendSupportedError,
+)
 # from flashinfer.utils import backend_requirement
 
 
+# TODO: other compute capabilities may be supported but are untested
+@supported_compute_capability([100])
 def _dvs3_router_gemm_shape_checks(mat_a, mat_b, out, launch_with_pdl):
     # Dimension checks
     if mat_a.dim() != 2:
@@ -80,8 +87,7 @@ def get_dsv3_router_gemm_module():
     )
 
 
-# TODO: Add decorator for support checks: compute capability and type checks
-# TODO: wait for Jimmy's fix to enable this: https://github.com/flashinfer-ai/flashinfer/pull/2015
+# TODO: wait for Jimmy's fix to enable decorator support checks: https://github.com/flashinfer-ai/flashinfer/pull/2015
 # @backend_requirement({}, common_check=_dvs3_router_gemm_shape_checks)
 def routergemm_dsv3_hidden_7168_experts_256_tokens_lt16(
     mat_a: torch.Tensor,
@@ -89,6 +95,12 @@ def routergemm_dsv3_hidden_7168_experts_256_tokens_lt16(
     out: torch.Tensor,
     launch_with_pdl: bool = False,
 ) -> None:
+    major, minor = get_compute_capability(mat_a.device)
+    capability = major * 10 + minor
+    if not _dvs3_router_gemm_shape_checks.is_compute_capability_supported(capability):
+        raise BackendSupportedError(
+            f"DSv3 Router GEMM is not supported on compute capability {capability}"
+        )
     _dvs3_router_gemm_shape_checks(mat_a, mat_b, out, launch_with_pdl)
     get_dsv3_router_gemm_module().routergemm_dsv3_hidden_7168_experts_256_tokens_lt16(
         mat_a, mat_b, out, launch_with_pdl

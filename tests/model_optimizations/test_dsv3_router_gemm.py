@@ -2,6 +2,7 @@ import torch
 import pytest
 from flashinfer.dsv3_ops import routergemm_dsv3_hidden_7168_experts_256_tokens_lt16
 import torch.nn.functional as F
+from flashinfer.utils import get_compute_capability
 
 
 # Positive tests
@@ -10,6 +11,11 @@ import torch.nn.functional as F
 @pytest.mark.parametrize("hidden_dim", [7168])
 @pytest.mark.parametrize("launch_with_pdl", [True, False])
 def test_dsv3_router_gemm_op(num_tokens, num_experts, hidden_dim, launch_with_pdl):
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    compute_capability_number = compute_capability[0] * 10 + compute_capability[1]
+    if compute_capability_number != 100:
+        pytest.skip("DSv3 Router GEMM is only supported on SM100")
+
     mat_a = torch.randn(num_tokens, hidden_dim, device="cuda", dtype=torch.bfloat16)
     mat_b = torch.randn(
         num_experts, hidden_dim, device="cuda", dtype=torch.bfloat16
@@ -118,6 +124,11 @@ def test_dsv3_router_gemm_op_negative(
     mat_b_transpose,
     expected_error,
 ):
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    compute_capability_number = compute_capability[0] * 10 + compute_capability[1]
+    if compute_capability_number != 100:
+        pytest.skip("DSv3 Router GEMM is only supported on SM100")
+
     mat_a = torch.randn(num_tokens, hidden_dim, device="cuda", dtype=mat_a_dtype)
     mat_b = torch.randn(num_experts, hidden_dim, device="cuda", dtype=mat_b_dtype)
     if mat_b_transpose:
