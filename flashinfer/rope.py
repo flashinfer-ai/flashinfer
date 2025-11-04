@@ -1501,63 +1501,6 @@ def rope_quantize_fp8_append_paged_kv_cache(
         Quantized query tensors: (q_rope_out, q_nope_out).
         K/V are written directly to the paged cache and not returned.
 
-    Examples
-    --------
-    MLA example:
-
-    >>> import torch
-    >>> import flashinfer
-    >>> # MLA setup: 2D K tensors
-    >>> num_tokens, num_qo_heads, rope_dim, no_rope_dim = 32, 128, 64, 512
-    >>> q_rope = torch.randn(num_tokens, num_qo_heads, rope_dim, dtype=torch.float16, device="cuda")
-    >>> q_nope = torch.randn(num_tokens, num_qo_heads, no_rope_dim, dtype=torch.float16, device="cuda")
-    >>> k_rope = torch.randn(num_tokens, rope_dim, dtype=torch.float16, device="cuda")
-    >>> k_nope = torch.randn(num_tokens, no_rope_dim, dtype=torch.float16, device="cuda")
-    >>> # Allocate MLA paged cache
-    >>> max_pages, page_size = 10, 16
-    >>> ckv_cache = torch.zeros(max_pages, page_size, no_rope_dim, dtype=torch.float8_e4m3fn, device="cuda")
-    >>> kpe_cache = torch.zeros(max_pages, page_size, rope_dim, dtype=torch.float8_e4m3fn, device="cuda")
-    >>> # Setup RoPE and metadata
-    >>> rope_emb = flashinfer.rope.FlashInferRotaryEmbedding(rope_dim + no_rope_dim, rope_dim, 4096, 10000, False, torch.float16, "cuda")
-    >>> pos_ids = torch.arange(num_tokens, device="cuda", dtype=torch.int32)
-    >>> kv_page_indices = torch.arange(max_pages, device="cuda", dtype=torch.int32)
-    >>> kv_page_indptr = torch.tensor([0, max_pages], device="cuda", dtype=torch.int32)
-    >>> batch_indices = torch.zeros(num_tokens, device="cuda", dtype=torch.int32)
-    >>> positions = torch.arange(num_tokens, device="cuda", dtype=torch.int32)
-    >>> # Fused call
-    >>> q_rope_out, q_nope_out = flashinfer.rope.rope_quantize_fp8_append_paged_kv_cache(
-    ...     q_rope, k_rope, q_nope, k_nope, None,
-    ...     rope_emb.cos_sin_cache, pos_ids,
-    ...     (ckv_cache, kpe_cache),
-    ...     kv_page_indices, kv_page_indptr, batch_indices, positions,
-    ...     is_neox=False, quantize_dtype=torch.float8_e4m3fn,
-    ...     page_size=page_size
-    ... )
-
-    GQA example:
-
-    >>> # GQA setup: 3D K/V tensors
-    >>> num_tokens, num_qo_heads, num_kv_heads, rope_dim, no_rope_dim = 32, 32, 8, 64, 64
-    >>> head_dim = rope_dim + no_rope_dim
-    >>> q_rope = torch.randn(num_tokens, num_qo_heads, rope_dim, dtype=torch.float16, device="cuda")
-    >>> q_nope = torch.randn(num_tokens, num_qo_heads, no_rope_dim, dtype=torch.float16, device="cuda")
-    >>> k_rope = torch.randn(num_tokens, num_kv_heads, rope_dim, dtype=torch.float16, device="cuda")
-    >>> k_nope = torch.randn(num_tokens, num_kv_heads, no_rope_dim, dtype=torch.float16, device="cuda")
-    >>> v = torch.randn(num_tokens, num_kv_heads, head_dim, dtype=torch.float16, device="cuda")
-    >>> # Allocate GQA paged cache (NHD layout)
-    >>> max_pages, page_size = 10, 16
-    >>> k_cache = torch.zeros(max_pages, page_size, num_kv_heads, head_dim, dtype=torch.float8_e4m3fn, device="cuda")
-    >>> v_cache = torch.zeros(max_pages, page_size, num_kv_heads, head_dim, dtype=torch.float8_e4m3fn, device="cuda")
-    >>> # Fused call
-    >>> q_rope_out, q_nope_out = flashinfer.rope.rope_quantize_fp8_append_paged_kv_cache(
-    ...     q_rope, k_rope, q_nope, k_nope, v,
-    ...     rope_emb.cos_sin_cache, pos_ids,
-    ...     (k_cache, v_cache),
-    ...     kv_page_indices, kv_page_indptr, batch_indices, positions,
-    ...     is_neox=False, quantize_dtype=torch.float8_e4m3fn,
-    ...     page_size=page_size, kv_layout="NHD"
-    ... )
-
     Notes
     -----
     - Architecture detection: Automatically distinguishes MLA (2D K tensors) from GQA/MHA (3D K tensors).
@@ -1622,6 +1565,12 @@ def rope_quantize_fp8_append_paged_kv_cache(
         # GQA/MHA: Expect (k_cache, v_cache)
         k_cache = cache_0
         v_cache = cache_1
+        # Validate V input is provided for GQA/MHA
+        if v is None:
+            raise ValueError(
+                "GQA/MHA expects a V tensor, but got None. "
+                "Only MLA uses None for V (compressed KV representation)."
+            )
         if k_cache.dtype != quantize_dtype or v_cache.dtype != quantize_dtype:
             raise ValueError(
                 f"GQA/MHA cache dtype mismatch: expected {quantize_dtype}, "
