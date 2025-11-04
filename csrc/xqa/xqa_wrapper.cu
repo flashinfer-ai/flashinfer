@@ -22,9 +22,8 @@ using tvm::ffi::Optional;
 #if MLA_WRAPPER
 void xqa_wrapper_mla(int64_t multiProcessorCount, double qScale, TensorView output, TensorView q,
                      TensorView kCacheVLLM, TensorView vCacheVLLM, TensorView kvCachePageList,
-                     int64_t maxSeqLen, TensorView seqLen, int64_t batchSize,
-                     TensorView kvCacheScale, TensorView semaphores, TensorView scratch,
-                     bool enable_pdl) {
+                     int64_t maxSeqLen, TensorView seqLen, int64_t batchSize, double kvCacheScale,
+                     TensorView semaphores, TensorView scratch, bool enable_pdl) {
   auto stream = get_stream(output.device());
 
   // Extract strides from TensorView (in elements, not bytes)
@@ -39,8 +38,7 @@ void xqa_wrapper_mla(int64_t multiProcessorCount, double qScale, TensorView outp
                       reinterpret_cast<GMemCacheHead*>(vCacheVLLM.data_ptr()),
                       reinterpret_cast<KVCachePageIndex const*>(kvCachePageList.data_ptr()),
                       maxSeqLen, reinterpret_cast<uint32_t const*>(seqLen.data_ptr()), batchSize,
-                      reinterpret_cast<float const*>(kvCacheScale.data_ptr()),
-                      reinterpret_cast<uint32_t*>(semaphores.data_ptr()),
+                      kvCacheScale, reinterpret_cast<uint32_t*>(semaphores.data_ptr()),
                       reinterpret_cast<void*>(scratch.data_ptr()), enable_pdl, kv_stride_page,
                       kv_stride_token, kv_stride_head, stream);
 }
@@ -53,7 +51,7 @@ void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbK
 #endif
                  TensorView q, Optional<TensorView> attentionSinks, TensorView kCacheVLLM,
                  TensorView vCacheVLLM, TensorView kvCachePageList, int64_t maxSeqLen,
-                 TensorView seqLen, int64_t batchSize, TensorView kvCacheScale,
+                 TensorView seqLen, int64_t batchSize, double kvCacheScale,
 #if SPEC_DEC
                  int64_t qSeqLen, TensorView qCuSeqLens, TensorView mask,
 #endif
@@ -78,8 +76,7 @@ void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbK
            reinterpret_cast<GMemCacheHead*>(kCacheVLLM.data_ptr()),
            reinterpret_cast<GMemCacheHead*>(vCacheVLLM.data_ptr()),
            reinterpret_cast<KVCachePageIndex const*>(kvCachePageList.data_ptr()), maxSeqLen,
-           reinterpret_cast<uint32_t const*>(seqLen.data_ptr()), batchSize,
-           reinterpret_cast<float const*>(kvCacheScale.data_ptr()),
+           reinterpret_cast<uint32_t const*>(seqLen.data_ptr()), batchSize, kvCacheScale,
 #if SPEC_DEC
            qSeqLen, reinterpret_cast<uint32_t const*>(qCuSeqLens.data_ptr()),
            reinterpret_cast<MaskType const*>(mask.data_ptr()),
