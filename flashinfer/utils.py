@@ -1025,8 +1025,6 @@ def backend_requirement(
                 return False
             suitable_backends = []
             # Check for each backend support
-
-        def suitable_auto_backends(*args, **kwargs):
             for backend in backend_checks:
                 try:
                     if backend_checks[backend](*args, **kwargs):
@@ -1088,15 +1086,16 @@ def backend_requirement(
                             )
                     else:
                         if not is_backend_supported(backend, capability):
-                            extra = f" with capability {capability}" if capability else ""
+                            extra = (
+                                f" with capability {capability}" if capability else ""
+                            )
                             raise BackendSupportedError(
                                 f"{func.__name__} does not support backend '{backend}'{extra}"
                             )
-                if backend == "auto":
-                    if not suitable_auto_backends(**kwargs_with_defaults):
-                        raise BackendSupportedError(
-                            f"No suitable auto backends found for {func.__name__}"
-                        )
+                        if not _is_problem_size_supported(**kwargs_with_defaults):
+                            raise ValueError(
+                                f"Problem size is not supported for {func.__name__}"
+                            )
                 else:
                     if not is_compute_capability_supported(capability):
                         raise BackendSupportedError(
@@ -1106,11 +1105,6 @@ def backend_requirement(
                         raise ValueError(
                             f"Problem size is not supported for {func.__name__}"
                         )
-
-                if not _is_problem_size_supported(**kwargs_with_defaults):
-                    raise ValueError(
-                        f"Problem size is not supported for {func.__name__}"
-                    )
             elif skip_check and heuristic_func is not None:
                 bound_args = sig.bind(*args, **kwargs)
                 bound_args.apply_defaults()
