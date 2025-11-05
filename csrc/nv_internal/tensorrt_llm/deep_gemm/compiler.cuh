@@ -124,8 +124,9 @@ std::string getNvccCompiler() {
 std::vector<std::filesystem::path> getJitIncludeDirs() {
   static std::vector<std::filesystem::path> includeDirs;
   if (includeDirs.empty()) {
-    // Command to execute
-    char const* cmd = "pip show flashinfer-python 2>/dev/null";
+    // Command to execute - try pip first, fallback to uv pip
+    char const* cmd =
+        "pip show flashinfer-python 2>/dev/null || uv pip show flashinfer-python 2>/dev/null";
 
     // Buffer to store the output
     std::array<char, 128> buffer;
