@@ -975,13 +975,12 @@ def backend_requirement(
                 return False
 
         def is_compute_capability_supported(cc):
-            # Handle empty backend_checks case
+            # In case there is only 1 implicit backend, the compute capability support needs to be added to the common check
             if not has_backend_choices():
                 # No backend-specific checks, only check common_check
                 if not hasattr(common_check, "is_compute_capability_supported"):
                     raise ValueError(
-                        f"Invalid is_compute_capability_supported call: {common_check.__name__} \
-                        does not have is_compute_capability_supported decorator"
+                        f"Invalid is_compute_capability_supported call: {common_check.__name__} does not have is_compute_capability_supported decorator"
                     )
                 return common_check.is_compute_capability_supported(cc)
             else:
@@ -1018,7 +1017,7 @@ def backend_requirement(
         def has_backend(backend: str) -> bool:
             # Whether the given backend exists in the API
             return backend in backend_checks
-        
+
         # @brief: Wrapper function that calls the orignal, decorated function, after applying a number of checks.
         # @note that here we manually apply defaults to the arguments in the wrapper function when doing validation.
         @functools.wraps(func)

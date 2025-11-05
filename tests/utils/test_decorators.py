@@ -138,18 +138,29 @@ def test_backend_requirement_empty_backends_with_common_check_cc():
     # Check compute capability support (only common_check)
     assert unsupported_kernel.is_compute_capability_supported(42) is True
     assert unsupported_kernel.is_compute_capability_supported(75) is False
-    # Undefined behaviour: is_backend_supported with no backend choices
-    with pytest.raises(
-        ValueError,
-        match="Invalid is_backend_supported call: no backend choices for unsupported_kernel",
-    ):
-        unsupported_kernel.is_backend_supported(None, 42)
-        unsupported_kernel.is_backend_supported(None, 75)
+
+    # The following tests are for when no backend choices are provided, where
+    # `is_backend_supported` is undefined behaviour and will raise error.
+    # We also enforce the `common_check` function when using `@backend_requirement` decorator.
+    # It must also be decorated with `@supported_compute_capability`.
+
+    # Raise error: is_backend_supported cannot be called with no backend choices.
+    for backend in [
+        ("random_backend", 42),
+        ("random_backend", 75),
+        (None, 42),
+        (None, 75),
+    ]:
+        with pytest.raises(
+            ValueError,
+            match="Invalid is_backend_supported call: no backend choices for unsupported_kernel",
+        ):
+            unsupported_kernel.is_backend_supported(backend[0], backend[1])
 
     # Test compute capability support during kernel runtime
     x = torch.randn(10, 10, device="cuda")
 
-    # Will always raise error because no real compute capability is supported
+    # Error: no real compute capability is supported
     with pytest.raises(
         BackendSupportedError, match="does not support compute capability"
     ):
@@ -171,7 +182,8 @@ def test_backend_requirement_empty_backends_with_common_check_cc():
         return x * 2
 
     assert supported_kernel.is_compute_capability_supported(actual_capability) is True
-    # Undefined behaviour: is_backend_supported with no backend choices
+
+    # Raise error: is_backend_supported cannot be called with no backend choices.
     with pytest.raises(
         ValueError,
         match="Invalid is_backend_supported call: no backend choices for supported_kernel",
@@ -182,6 +194,7 @@ def test_backend_requirement_empty_backends_with_common_check_cc():
     result = supported_kernel(x)
     assert result.shape == x.shape
 
+    # Enforce the `common_check` function to have `is_compute_capability_supported` decorator.
     def _bad_common_check(x):
         return True
 
@@ -194,19 +207,18 @@ def test_backend_requirement_empty_backends_with_common_check_cc():
 
     with pytest.raises(
         ValueError,
-        match="Invalid is_compute_capability_supported call: _bad_common_check \
-        does not have is_compute_capability_supported decorator",
+        match="Invalid is_compute_capability_supported call: _bad_common_check does not have is_compute_capability_supported decorator",
     ):
         bad_kernel.is_compute_capability_supported(42)
 
+    # Enforce `common_check` function in @backend_requirement decorator.
     @backend_requirement({})
     def kernel_no_common_check(x):
         return x * 2
 
     with pytest.raises(
         ValueError,
-        match="Invalid @backend_requirement decorator usage: no backend choices \
-            and no common_check for kernel_no_common_check",
+        match="Invalid @backend_requirement decorator usage: no backend choices and no common_check for kernel_no_common_check",
     ):
         x = torch.randn(10, 10, device="cuda")
         kernel_no_common_check(x)
