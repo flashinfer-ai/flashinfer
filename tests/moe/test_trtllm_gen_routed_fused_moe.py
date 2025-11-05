@@ -140,8 +140,6 @@ def test_trtllm_gen_routed_fused_moe(
         )
         w13_global_scale = 1.0
         w2_global_scale = 1.0
-    bias13 = torch.randn(num_experts, intermediate_size * 2, device=device) * 10
-    bias2 = torch.randn(num_experts, intermediate_size * 2, device=device) * 10
 
     output1_scale_scalar = torch.tensor(
         [hidden_states_global_scale * w13_global_scale] * num_experts, device=device
@@ -160,13 +158,13 @@ def test_trtllm_gen_routed_fused_moe(
         hidden_states_scale,
         w13,
         w13_scale,
-        bias13,
+        None,
         None,  # gemm1_alpha
         None,  # gemm1_beta
         None,  # gemm1_clamp_limit
         w2,
         w2_scale,
-        bias2,
+        None,
         output1_scale_scalar,
         output1_scale_gate_scalar,
         output2_scale_scalar,
@@ -209,19 +207,18 @@ def test_trtllm_gen_routed_fused_moe(
 
     output = trtllm_fp4_block_scale_routed_moe(
         packed_tensor,
-        expert_weights,
         None,  # routing_bias
         hidden_states,
         hidden_states_scale,
         w13,
         w13_scale,
-        bias13,
+        None,
         None,  # gemm1_alpha
         None,  # gemm1_beta
         None,  # gemm1_clamp_limit
         w2,
         w2_scale,
-        bias2,
+        None,
         output1_scale_scalar,
         output1_scale_gate_scalar,
         output2_scale_scalar,
