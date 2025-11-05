@@ -455,7 +455,7 @@ def multi_process_parallel(
 @pytest.mark.parametrize("tolerance", [1e-01])
 @pytest.mark.parametrize("iterations", [3])
 @pytest.mark.parametrize("all_reduce", ["two_shot"])
-def test_cute_dsl_blockscaled_gemm_allreduce_two_shot(
+def test_cute_dsl_blockwise_gemm_allreduce_two_shot(
     world_size,
     lm: Tuple[int, int],
     kn: Tuple[int, int],
