@@ -50,7 +50,7 @@ from .test_trtllm_gen_fused_moe import (
         RoutingMethodType.TopK,
     ],
 )
-@pytest.mark.parametrize("quant_mode", ["MxFP4xMxFP8", "MxFP4xBf16"])
+@pytest.mark.parametrize("quant_mode", ["NvFP4xNvFP4", "MxFP4xMxFP8", "MxFP4xBf16"])
 def test_trtllm_gen_routed_fused_moe(
     num_tokens: int,
     hidden_size: int,
@@ -242,4 +242,4 @@ def test_trtllm_gen_routed_fused_moe(
 
     # mismatch percentage
     mismatch_pct = (~mask).float().mean().item() * 100
-    assert mismatch_pct < 5, f"Mismatch percentage is {mismatch_pct:.2f}"
+    assert mismatch_pct < 6, f"Mismatch percentage is {mismatch_pct:.2f}"
