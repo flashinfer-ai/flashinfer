@@ -115,6 +115,142 @@ def test_backend_requirement_support_checks():
     assert my_kernel.is_compute_capability_supported(70) is False  # neither has it
 
 
+def test_backend_requirement_empty_backends_with_common_check_cc():
+    """Test backend_requirement with empty backend_checks but common_check with compute capability."""
+
+    # Made up compute capability
+    @supported_compute_capability([42])
+    def _common_check(x):
+        # Common check with compute capability restrictions
+        return x.shape[0] <= 1024
+
+    @backend_requirement(
+        {},  # Empty backend_checks
+        common_check=_common_check,
+    )
+    def unsupported_kernel(x):
+        return x * 2
+
+    # Check methods
+    assert hasattr(unsupported_kernel, "is_backend_supported")
+    assert hasattr(unsupported_kernel, "is_compute_capability_supported")
+
+    # Check compute capability support (only common_check)
+    assert unsupported_kernel.is_compute_capability_supported(42) is True
+    assert unsupported_kernel.is_compute_capability_supported(75) is False
+
+    # The following tests are for when no backend choices are provided, where
+    # `is_backend_supported` is undefined behaviour and will raise error.
+    # We also enforce the `common_check` function when using `@backend_requirement` decorator.
+    # It must also be decorated with `@supported_compute_capability`.
+
+    # Raise error: is_backend_supported cannot be called with no backend choices.
+    for backend in [
+        ("random_backend", 42),
+        ("random_backend", 75),
+        (None, 42),
+        (None, 75),
+    ]:
+        with pytest.raises(
+            ValueError,
+            match="Invalid is_backend_supported call: no backend choices for unsupported_kernel",
+        ):
+            unsupported_kernel.is_backend_supported(backend[0], backend[1])
+
+    # Test compute capability support during kernel runtime
+    x = torch.randn(10, 10, device="cuda")
+
+    # Error: no real compute capability is supported
+    with pytest.raises(
+        BackendSupportedError, match="does not support compute capability"
+    ):
+        unsupported_kernel(x)
+
+    actual_capability = torch.cuda.get_device_capability(x.device)
+    major, minor = actual_capability
+    actual_capability = major * 10 + minor
+
+    @supported_compute_capability([actual_capability])
+    def _common_check(x):
+        return True
+
+    @backend_requirement(
+        {},
+        common_check=_common_check,
+    )
+    def supported_kernel(x):
+        return x * 2
+
+    assert supported_kernel.is_compute_capability_supported(actual_capability) is True
+
+    # Raise error: is_backend_supported cannot be called with no backend choices.
+    with pytest.raises(
+        ValueError,
+        match="Invalid is_backend_supported call: no backend choices for supported_kernel",
+    ):
+        supported_kernel.is_backend_supported(None, actual_capability)
+    assert supported_kernel.has_backend("random_backend") is False
+
+    result = supported_kernel(x)
+    assert result.shape == x.shape
+
+    # Enforce the `common_check` function to have `is_compute_capability_supported` decorator.
+    def _bad_common_check(x):
+        return True
+
+    @backend_requirement(
+        {},
+        common_check=_bad_common_check,
+    )
+    def bad_kernel(x):
+        return x * 2
+
+    with pytest.raises(
+        ValueError,
+        match="Invalid is_compute_capability_supported call: _bad_common_check does not have is_compute_capability_supported decorator",
+    ):
+        bad_kernel.is_compute_capability_supported(42)
+
+    # Enforce `common_check` function in @backend_requirement decorator.
+    @backend_requirement({})
+    def kernel_no_common_check(x):
+        return x * 2
+
+    with pytest.raises(
+        ValueError,
+        match="Invalid @backend_requirement decorator usage: no backend choices and no common_check for kernel_no_common_check",
+    ):
+        x = torch.randn(10, 10, device="cuda")
+        kernel_no_common_check(x)
+
+
+def test_has_backend():
+    """Test the has_backend method."""
+
+    @backend_requirement({"cudnn": lambda x: True, "cutlass": lambda x: True})
+    def my_kernel(x, backend="cudnn"):
+        return x * 2
+
+    assert my_kernel.has_backend("cudnn") is True
+    assert my_kernel.has_backend("cutlass") is True
+    assert my_kernel.has_backend("random_backend") is False
+
+
+def test_has_backend_choices():
+    """Test the has_backend_choices method."""
+
+    @backend_requirement({"cudnn": lambda x: True, "cutlass": lambda x: True})
+    def my_kernel(x, backend="cudnn"):
+        return x * 2
+
+    @backend_requirement({})
+    def my_kernel_no_backend(x):
+        return x * 2
+
+    assert my_kernel.has_backend_choices() is True
+    assert my_kernel_no_backend.has_backend_choices() is False
+
+
 def test_backend_requirement_wrapped_function():
     """Test the backend_requirement decorator's wrapped function."""
     if not torch.cuda.is_available():
