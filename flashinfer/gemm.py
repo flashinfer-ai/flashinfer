@@ -372,7 +372,7 @@ def fp8_gemm_sm100(
         runners.append(get_gemm_module().cublas_fp8_gemm_runner())
     if "cudnn" in runner_names:
         runners.append(_cudnn_gemm_fp8_runner())
-
+    assert runners, "No suitable runners found"
     tuner = AutoTuner.get()
     a_tensor_index = 0
     out_tensor_index = 4
@@ -1997,7 +1997,7 @@ def mm_fp4(
     return out
 
 
-@supported_compute_capability([89, 90, 100, 103, 120])
+@supported_compute_capability([89, 90, 100, 103, 120, 121])
 def _cudnn_bmm_fp8_requirement(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -2011,7 +2011,7 @@ def _cudnn_bmm_fp8_requirement(
     return True
 
 
-@supported_compute_capability([89, 90, 100, 103, 120])
+@supported_compute_capability([89, 90, 100, 103, 120, 121])
 def _cublas_bmm_fp8_requirement(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -2170,6 +2170,12 @@ def bmm_fp8(
 
     if backend == "auto":
         backends = bmm_fp8.suitable_auto_backends
+    elif backend == "cutlass":
+        backends = _heuristic_func_bmm_fp8(
+            ["cutlass"], A, B, A_scale, B_scale, dtype, out, backend
+        )
+    elif backend == "cudnn" and CUDNN_AVAILABLE:
+        backends = ["cudnn"]
     else:
         backends = [backend]
 

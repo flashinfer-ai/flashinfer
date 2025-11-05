@@ -1012,7 +1012,6 @@ def backend_requirement(
             else:
                 return req_checker(*args, **kwargs)
 
-<<<<<<< HEAD
         def has_backend_choices() -> bool:
             # Whether there are any backend choices to make
             return bool(backend_checks)
@@ -1024,31 +1023,19 @@ def backend_requirement(
         def suitable_auto_backends(*args, **kwargs):
             if common_check is not None and not common_check(*args, **kwargs):
                 return False
-
+            suitable_backends = []
             # Check for each backend support
-<<<<<<< HEAD
-=======
+
         def suitable_auto_backends(*args, **kwargs):
->>>>>>> f85c63d7 (inital)
-=======
->>>>>>> 7e3c47de (heuristic function)
-            suitable_backends = [
-                backend
-                for backend in backend_checks
-                if backend_checks[backend](*args, **kwargs)
-            ]
-<<<<<<< HEAD
-<<<<<<< HEAD
+            for backend in backend_checks:
+                try:
+                    if backend_checks[backend](*args, **kwargs):
+                        suitable_backends.append(backend)
+                except ValueError:
+                    continue
             # If a heuristic function is provided, filter the suitable backends based on the heuristic function
             if heuristic_func is not None:
                 suitable_backends = heuristic_func(suitable_backends, *args, **kwargs)
-=======
->>>>>>> f85c63d7 (inital)
-=======
-            # If a heuristic function is provided, filter the suitable backends based on the heuristic function
-            if heuristic_func is not None:
-                suitable_backends = heuristic_func(suitable_backends, *args, **kwargs)
->>>>>>> 7e3c47de (heuristic function)
             if not suitable_backends:
                 return False
             wrapper.suitable_auto_backends = suitable_backends
