@@ -1298,9 +1298,6 @@ __global__ void computeStridesTmaWarpSpecializedKernel(
   setupIfSelected(TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaledConfig{},
                   quant_params.mxfp8_mxfp4);
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.launch_dependents;");
-#endif
   assert(gemm_m <= INT32_MAX);
   assert(gemm1_n > 0 && gemm1_n <= INT32_MAX);
   assert(gemm1_k > 0 && gemm1_k <= INT32_MAX);
@@ -1319,6 +1316,9 @@ __global__ void computeStridesTmaWarpSpecializedKernel(
       reinterpret_cast<TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::SFA const*>(
           quant_params.groupwise.fc2.weight_scales),
       bias2, gemm2_output, router_scales, permuted_row_to_unpermuted_row, expert);
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.launch_dependents;");
+#endif
 }
 
 // ========================== Permutation things =======================================

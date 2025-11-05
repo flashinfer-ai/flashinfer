@@ -808,8 +808,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       // default
       auto id1 = profile_ids.value()[0];
       if (id1 != -1) {
-        TVM_FFI_ICHECK(id1 >= 0 && id1 < static_cast<int64_t>(mAllProfiles.size()))
-            << "Invalid gemm1 profile id: " << id1;
+        TVM_FFI_ICHECK(id1 >= 0 && id1 < mGemm1TacticCount) << "Invalid gemm1 profile id: " << id1;
         best_gemm1_profile = mAllProfiles.at(id1);
       }
 
