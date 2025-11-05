@@ -116,12 +116,6 @@ def create_tensors(
         is_dynamic_layout=True,
         assumed_align=16,
     )
-    # c_tensor, c_torch = cutlass_torch.cute_tensor_like(
-    #     c_torch_cpu,
-    #     get_cutlass_dtype(c_dtype),
-    #     is_dynamic_layout=True,
-    #     assumed_align=16,
-    # )
     c_tensor, c_tensor_mc, c_torch, c_torch_mc = create_mc_tensor(
         c_torch_cpu,
         get_cutlass_dtype(c_dtype),
@@ -296,12 +290,9 @@ def run_blockwise_gemm_all_reduce_python_interface(
             cluster_shape_mn=cluster_shape_mn,
             use_2cta_instrs=use_2cta_instrs,
             all_reduce="two_shot",
-            out_mc=c_tensor_mc,
-            out_mc_torch=c_torch_mc,
-            barrier_flag=barrier_flag_memref,
-            barrier_flag_mc=barrier_flag_mc_memref,
-            barrier_flag_torch=barrier_flag_torch,
-            barrier_flag_mc_torch=barrier_flag_mc_torch,
+            out_mc=c_torch_mc,
+            barrier_flag=barrier_flag_torch,
+            barrier_flag_mc=barrier_flag_mc_torch,
             process_group=group,
         )
 
@@ -339,10 +330,7 @@ def run_blockwise_gemm_all_reduce_python_interface(
     )
 
     ref = torch.einsum("mkl,nkl->mnl", updated_a, updated_b)
-    # .to(
-    #     cutlass_torch.dtype(get_cutlass_dtype(c_dtype))
-    # )
-    # ref = ref.contiguous()
+
     torch.distributed.all_reduce(
         ref, op=torch.distributed.ReduceOp.SUM, group=dist.group.WORLD
     )
