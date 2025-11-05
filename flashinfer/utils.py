@@ -1088,7 +1088,6 @@ def backend_requirement(
                     # Assume all tensors are on the same device/capability
                     major, minor = get_compute_capability(tensor_arg.device)
                     capability = major * 10 + minor
-
                 if not has_backend_choices() and common_check is None:
                     raise ValueError(
                         f"Invalid @backend_requirement decorator usage: no backend choices and no common_check for {func.__name__}"
@@ -1106,10 +1105,19 @@ def backend_requirement(
                             raise BackendSupportedError(
                                 f"{func.__name__} does not support backend '{backend}'{extra}"
                             )
+                if backend == "auto":
+                    if not suitable_auto_backends(**kwargs_with_defaults):
+                        raise BackendSupportedError(
+                            f"No suitable auto backends found for {func.__name__}"
+                        )
                 else:
                     if not is_compute_capability_supported(capability):
                         raise BackendSupportedError(
                             f"{func.__name__} does not support compute capability {capability}"
+                        )
+                    if not _is_problem_size_supported(**kwargs_with_defaults):
+                        raise ValueError(
+                            f"Problem size is not supported for {func.__name__}"
                         )
 
                 if not _is_problem_size_supported(**kwargs_with_defaults):
@@ -1117,9 +1125,12 @@ def backend_requirement(
                         f"Problem size is not supported for {func.__name__}"
                     )
             elif skip_check and heuristic_func is not None:
+                bound_args = sig.bind(*args, **kwargs)
+                bound_args.apply_defaults()
+                kwargs_with_defaults = dict(bound_args.arguments)
                 # This needs to be called for heuristic function
                 suitable_auto_backends(*args, **kwargs)
-            
+
             return func(*args, **kwargs)
 
         wrapper.is_backend_supported = is_backend_supported
