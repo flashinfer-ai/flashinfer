@@ -626,8 +626,7 @@ __launch_bounds__(128 * 3)
         BeamSearchParams const beamSearchParams,
 #endif
         uint32_t const batchSize,
-        float kvCacheScale,  // Device memory scalar. Same scale for K and
-                             // V cache. Used only for int8/fp8 KV cache.
+        float kvCacheScale,  // Same scale for K and V cache. Used only for int8/fp8 KV cache.
         __grid_constant__ CUtensorMap const tensorMapVLLMK,
         __grid_constant__ CUtensorMap const tensorMapVLLMV,
 #if SPEC_DEC
@@ -2931,8 +2930,7 @@ void launchHopperF8MHA(
     BeamSearchParams const& beamSearchParams,
 #endif
     uint32_t batchSize,
-    float kvCacheScale,  // Device memory scalar. Same scale for K and V cache.
-                         // Used only for int8/fp8 KV cache.
+    float kvCacheScale,  // Same scale for K and V cache. Used only for int8/fp8 KV cache.
 #if SPEC_DEC
     SpecDecParams const& specDecParams,
 #endif

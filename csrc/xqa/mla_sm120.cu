@@ -395,8 +395,7 @@ struct KernelArgs {
   OutputHead* __restrict__ const& output;  // [totalNbIntputTokens][nbQHeads]
   KVCacheList<usePagedKVCache> const& cacheList;
   uint32_t const& batchSize;
-  float kvCacheScale;  // Device memory scalar. Same scale for K and V
-                       // cache. Used only for int8/fp8 KV cache.
+  float kvCacheScale;  // Same scale for K and V cache. Used only for int8/fp8 KV cache.
   Vec<CgaXBuffer, nbProducerCtasPerCga>* __restrict__ const&
       cgaXBuf;                                        // [totalNbInputTokens][maxNbSubSeq]
   uint32_t* __restrict__ const& semaphores;           // [totalNbInputTokens]
@@ -1553,8 +1552,7 @@ __launch_bounds__(32 * 4 * 3, 1) __cluster_dims__(cgaSize, 1, 1) void kernel_mha
     float const qScale,
     OutputHead* __restrict__ const output,  // [totalNbIntputTokens][nbQHeads]
     KVCacheList<usePagedKVCache> const cacheList, uint32_t const batchSize,
-    float kvCacheScale,  // Device memory scalar. Same scale for K and V
-                         // cache. Used only for int8/fp8 KV cache.
+    float kvCacheScale,  // Same scale for K and V cache. Used only for int8/fp8 KV cache.
     Vec<CgaXBuffer,
         nbProducerCtasPerCga>* __restrict__ const cgaXBuf,  // [totalNbInputTokens][maxNbSubSeq]
     uint32_t* __restrict__ const semaphores = nullptr,      // [totalNbInputTokens]
@@ -1648,18 +1646,18 @@ CUtensorMap makeTensorMapForQ(void const* addr, CUtensorMapDataType_enum dataTyp
 }
 #endif  // IS_MLA
 
-void launchMLA(cudaDeviceProp const& prop,
-               uint32_t inputSeqLen,  // uniform for all requests and causal mask is assumed
-               float qScale, OutputHead* output, InputHead const* q,
-               GMemCacheHead* kCacheVLLM,                // K cache pool for VLLM layout
-               GMemCacheHead* vCacheVLLM,                // V cache pool for VLLM layout
-               KVCachePageIndex const* kvCachePageList,  // device pointer. shape:
-                                                         // [batchSize][maxNbPagesPerSeq] (Layout 1)
-               uint32_t maxSeqLen, uint32_t const* seqLen, uint32_t batchSize,
-               float kvCacheScale,  // Device memory scalar. Same scale for K and V cache.
-                                    // Used only for int8/fp8 KV cache.
-               uint32_t* semaphores, void* scratch, bool enable_pdl, uint64_t kv_stride_page,
-               uint64_t kv_stride_token, uint64_t kv_stride_head, cudaStream_t stream) {
+void launchMLA(
+    cudaDeviceProp const& prop,
+    uint32_t inputSeqLen,  // uniform for all requests and causal mask is assumed
+    float qScale, OutputHead* output, InputHead const* q,
+    GMemCacheHead* kCacheVLLM,                // K cache pool for VLLM layout
+    GMemCacheHead* vCacheVLLM,                // V cache pool for VLLM layout
+    KVCachePageIndex const* kvCachePageList,  // device pointer. shape:
+                                              // [batchSize][maxNbPagesPerSeq] (Layout 1)
+    uint32_t maxSeqLen, uint32_t const* seqLen, uint32_t batchSize,
+    float kvCacheScale,  // Same scale for K and V cache. Used only for int8/fp8 KV cache.
+    uint32_t* semaphores, void* scratch, bool enable_pdl, uint64_t kv_stride_page,
+    uint64_t kv_stride_token, uint64_t kv_stride_head, cudaStream_t stream) {
 #if IS_MLA
   static_assert(
       SLIDING_WINDOW == 0 && LOW_PREC_OUTPUT == 0 && USE_INPUT_KV == 0 && USE_BEAM_SEARCH == 0,
@@ -1778,8 +1776,7 @@ void launchMLAFlashInfer(
     KVCachePageIndex const* kvCachePageList,  // device pointer. shape:
                                               // [batchSize][maxNbPagesPerSeq] (Layout 1)
     uint32_t maxSeqLen, uint32_t const* seqLen, uint32_t batchSize,
-    float kvCacheScale,  // Device memory scalar. Same scale for K and V cache.
-                         // Used only for int8/fp8 KV cache.
+    float kvCacheScale,  // Same scale for K and V cache. Used only for int8/fp8 KV cache.
     uint32_t* semaphores, void* scratch, bool enable_pdl, uint64_t kv_stride_page,
     uint64_t kv_stride_token, uint64_t kv_stride_head, cudaStream_t stream) {
 #if IS_MLA
