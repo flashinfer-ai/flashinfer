@@ -243,9 +243,9 @@ class BlockwiseGemmKernel:
         )
         self.num_regs_uniform_warps = 64
         self.num_regs_sched_warps = 64
-        self.num_regs_epilogue_warps = 144
-        self.num_regs_acc_update_warps = 144
-        self.num_regs_all_reduce_warps = 144
+        self.num_regs_epilogue_warps = 216 if all_reduce == "none" else 144
+        self.num_regs_acc_update_warps = 216 if all_reduce == "none" else 144
+        self.num_regs_all_reduce_warps = 0 if all_reduce == "none" else 144
 
         # Set barrier id for cta sync, epilogue sync and tmem ptr sync
         self.cta_sync_bar_id = 0
