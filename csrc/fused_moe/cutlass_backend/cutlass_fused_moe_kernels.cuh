@@ -2923,8 +2923,9 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Ena
   finalizeMoeRoutingKernelLauncher<OutputType, UnfusedGemmOutputType>(
       static_cast<UnfusedGemmOutputType const*>(gemm_output), final_output, fc2_expert_biases,
       unpermuted_final_scales, unpermuted_row_to_permuted_row, permuted_row_to_unpermuted_row,
-      token_selected_experts, expert_first_token_offset, num_rows, hidden_size, k,
-      num_experts_per_node, parallelism_config, enable_alltoall, enable_pdl, stream);
+      token_selected_experts, expert_first_token_offset, num_rows, hidden_size,
+      unpadded_hidden_size, k, num_experts_per_node, parallelism_config, enable_alltoall,
+      enable_pdl, stream);
 }
 
 template <class T, class WeightType, class OutputType, class InputType, class ScaleBiasType,
