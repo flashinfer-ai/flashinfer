@@ -333,6 +333,7 @@ __global__ void OnlineSoftmaxFusedKernel(DType* logits, DType* output, DType* te
 
   float running_max = -cuda::std::numeric_limits<float>::infinity();
   float running_denominator = 0.0f;
+  float threadlocal_running_denominator = 0.0f;
 
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   asm volatile("griddepcontrol.wait;");
@@ -368,38 +369,31 @@ __global__ void OnlineSoftmaxFusedKernel(DType* logits, DType* output, DType* te
     }
     __syncthreads();
     block_max = temp_storage.shared_state.max_val;
-
     // if block_max is -inf, then this block contains all -inf values, so we can skip updating
     if (!isinf(block_max)) {
-      float thread_sum = 0.0f;
+      float threadlocal_sum = 0.0f;
 #pragma unroll
       for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-        thread_sum += __expf(logits_vec[j] - block_max);
+        threadlocal_sum += __expf(logits_vec[j] - block_max);
       }
-
-      float block_sum =
-          cub::BlockReduce<float, BLOCK_THREADS>(temp_storage.block_prim.reduce).Sum(thread_sum);
-      __syncthreads();
-
-      if (tx == 0) {
-        float new_max = max(running_max, block_max);
-        running_denominator = running_denominator * __expf(running_max - new_max) +
-                              block_sum * __expf(block_max - new_max);
-        running_max = new_max;
-
-        temp_storage.shared_state.max_val = running_max;
-        temp_storage.shared_state.denominator = running_denominator;
-      }
-      __syncthreads();
-      running_max = temp_storage.shared_state.max_val;
-      running_denominator = temp_storage.shared_state.denominator;
+      float new_max = max(running_max, block_max);
+      threadlocal_running_denominator =
+          threadlocal_running_denominator * __expf(running_max - new_max) +
+          threadlocal_sum * __expf(block_max - new_max);
+      running_max = new_max;
     }
   }
 
+  running_denominator = cub::BlockReduce<float, BLOCK_THREADS>(temp_storage.block_prim.reduce)
+                            .Sum(threadlocal_running_denominator);
+  if (tx == 0) {
+    temp_storage.shared_state.denominator = running_denominator;
+  }
+  __syncthreads();
+  running_denominator = temp_storage.shared_state.denominator;
+
   const float final_max = running_max;
   const float inv_denominator = 1.0f / running_denominator;
-
-  __syncthreads();
 
   // Pass 2: Normalize in place
   vec_t<DType, VEC_SIZE> prob_vec;
@@ -458,6 +452,7 @@ __global__ void OnlineSoftmaxMapKernel(DType* logits, PartialSoftmaxResult* part
   vec_t<DType, VEC_SIZE> logits_vec;
   float running_max = -cuda::std::numeric_limits<float>::infinity();
   float running_denominator = 0.0f;
+  float threadlocal_running_denominator = 0.0f;
 
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   asm volatile("griddepcontrol.wait;");
@@ -489,30 +484,26 @@ __global__ void OnlineSoftmaxMapKernel(DType* logits, PartialSoftmaxResult* part
 
     // if block_max is -inf, then this block contains all -inf values, so we can skip updating
     if (!isinf(block_max)) {
-      float thread_sum = 0.0f;
+      float threadlocal_sum = 0.0f;
 #pragma unroll
       for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-        thread_sum += __expf(logits_vec[j] - block_max);
+        threadlocal_sum += __expf(logits_vec[j] - block_max);
       }
-
-      float block_sum =
-          cub::BlockReduce<float, BLOCK_THREADS>(temp_storage.block_prim.reduce).Sum(thread_sum);
-      __syncthreads();
-
-      if (tx == 0) {
-        float new_max = max(running_max, block_max);
-        running_denominator = running_denominator * __expf(running_max - new_max) +
-                              block_sum * __expf(block_max - new_max);
-        running_max = new_max;
-
-        temp_storage.shared_state.max_val = running_max;
-        temp_storage.shared_state.denominator = running_denominator;
-      }
-      __syncthreads();
-      running_max = temp_storage.shared_state.max_val;
-      running_denominator = temp_storage.shared_state.denominator;
+      float new_max = max(running_max, block_max);
+      threadlocal_running_denominator =
+          threadlocal_running_denominator * __expf(running_max - new_max) +
+          threadlocal_sum * __expf(block_max - new_max);
+      running_max = new_max;
     }
   }
+
+  running_denominator = cub::BlockReduce<float, BLOCK_THREADS>(temp_storage.block_prim.reduce)
+                            .Sum(threadlocal_running_denominator);
+  if (tx == 0) {
+    temp_storage.shared_state.denominator = running_denominator;
+  }
+  __syncthreads();
+  running_denominator = temp_storage.shared_state.denominator;
 
   if (tx == 0) {
     partial_results[bx * num_slices + by] = {running_max, running_denominator};
