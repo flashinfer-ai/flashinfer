@@ -2461,9 +2461,7 @@ def xqa_batch_decode_with_kv_cache(
         page_size,
         sinks=sinks_new,
         q_scale=q_scale_value,
-        kv_scale=torch.tensor(
-            [kv_scale_value], dtype=torch.float32, device=query.device
-        ),
+        kv_scale=kv_scale_value,
         sliding_win_size=window_left + 1 if window_left >= 0 else 0,
         kv_layout=kv_layout,
         sm_count=sm_count,

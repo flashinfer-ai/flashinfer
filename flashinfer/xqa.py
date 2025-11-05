@@ -67,7 +67,7 @@ def get_xqa_module(
         max_seq_len: int,
         seq_lens: torch.Tensor,
         batch_size: int,
-        kv_scale: torch.Tensor,
+        kv_scale: float,
         semaphores: torch.Tensor,
         workspace_buffer: torch.Tensor,
         enable_pdl: bool,
@@ -111,7 +111,7 @@ def get_xqa_module(
         max_seq_len: int,
         seq_lens: torch.Tensor,
         batch_size: int,
-        kv_scale: torch.Tensor,
+        kv_scale: float,
         semaphores: torch.Tensor,
         workspace_buffer: torch.Tensor,
     ) -> None:
@@ -135,7 +135,7 @@ def xqa(
     page_size: int,
     sinks: Optional[torch.Tensor] = None,
     q_scale: float = 1.0,
-    kv_scale: Optional[torch.Tensor] = None,
+    kv_scale: float = 1.0,
     sliding_win_size: int = 0,
     kv_layout: str = "NHD",
     sm_count: Optional[int] = None,
@@ -184,10 +184,8 @@ def xqa(
         If None, no attention sinks are used.
     q_scale : float, default=1.0
         Scale factor for query tensor.
-    kv_scale : Optional[torch.Tensor], default=None
-        Scale factor for KV cache with shape ``[1]``.
-        Data type should be torch.float32.
-        If None, defaults to 1.0.
+    kv_scale : float, default=1.0
+        Scale factor for KV cache.
     sliding_win_size : int, default=0
         Sliding window size for attention. If 0, no sliding window is used.
     kv_layout : str, default="NHD"
@@ -213,9 +211,6 @@ def xqa(
     # Handle optional parameters
     if sm_count is None:
         sm_count = get_device_sm_count(q.device)
-
-    if kv_scale is None:
-        kv_scale = torch.ones(1, dtype=torch.float32, device=q.device)
 
     enable_pdl = enable_pdl if enable_pdl is not None else device_support_pdl(q.device)
 
@@ -316,7 +311,7 @@ def get_xqa_module_mla(
         max_seq_len: int,
         seq_lens: torch.Tensor,
         batch_size: int,
-        kv_scale: torch.Tensor,
+        kv_scale: float,
         semaphores: torch.Tensor,
         workspace_buffer: torch.Tensor,
         enable_pdl: bool,
@@ -352,7 +347,7 @@ def get_xqa_module_mla(
         max_seq_len: int,
         seq_lens: torch.Tensor,
         batch_size: int,
-        kv_scale: torch.Tensor,
+        kv_scale: float,
         semaphores: torch.Tensor,
         workspace_buffer: torch.Tensor,
         enable_pdl: bool,
@@ -375,7 +370,7 @@ def xqa_mla(
     semaphores: torch.Tensor,
     page_size: int,
     q_scale: float = 1.0,
-    kv_scale: Optional[torch.Tensor] = None,
+    kv_scale: float = 1.0,
     sm_count: Optional[int] = None,
     enable_pdl: Optional[bool] = None,
 ) -> None:
@@ -412,10 +407,8 @@ def xqa_mla(
         Size of each page in the paged KV cache. Must be one of [16, 32, 64, 128].
     q_scale : float, default=1.0
         Scale factor for query tensor.
-    kv_scale : Optional[torch.Tensor], default=None
-        Scale factor for KV cache with shape ``[1]``.
-        Data type should be torch.float32.
-        If None, defaults to 1.0.
+    kv_scale : float, default=1.0
+        Scale factor for KV cache.
     sm_count : Optional[int], default=None
         Number of streaming multiprocessors to use.
         If None, will be inferred from the device.
@@ -434,9 +427,6 @@ def xqa_mla(
     # Handle optional parameters
     if sm_count is None:
         sm_count = get_device_sm_count(q.device)
-
-    if kv_scale is None:
-        kv_scale = torch.ones(1, dtype=torch.float32, device=q.device)
 
     enable_pdl = enable_pdl if enable_pdl is not None else device_support_pdl(q.device)
 
