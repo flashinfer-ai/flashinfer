@@ -243,8 +243,9 @@ class BlockwiseGemmKernel:
         )
         self.num_regs_uniform_warps = 64
         self.num_regs_sched_warps = 64
-        self.num_regs_epilogue_warps = 216
-        self.num_regs_acc_update_warps = 216
+        self.num_regs_epilogue_warps = 144
+        self.num_regs_acc_update_warps = 144
+        self.num_regs_all_reduce_warps = 144
 
         # Set barrier id for cta sync, epilogue sync and tmem ptr sync
         self.cta_sync_bar_id = 0
@@ -1018,7 +1019,7 @@ class BlockwiseGemmKernel:
         # Specialized Schedule warp
         #
         if warp_idx == self.sched_warp_id:
-            # cute.arch.warpgroup_reg_dealloc(self.num_regs_sched_warps)
+            cute.arch.warpgroup_reg_dealloc(self.num_regs_sched_warps)
             #
             # Persistent tile scheduling loop
             #
@@ -1069,7 +1070,7 @@ class BlockwiseGemmKernel:
         # Specialized TMA load warp
         #
         if warp_idx == self.tma_warp_id:
-            # cute.arch.warpgroup_reg_dealloc(self.num_regs_uniform_warps)
+            cute.arch.warpgroup_reg_dealloc(self.num_regs_uniform_warps)
             #
             # Persistent tile scheduling loop
             #
@@ -1188,7 +1189,7 @@ class BlockwiseGemmKernel:
         # Specialized Scale load warp
         #
         if warp_idx == self.scale_warp_id:
-            # cute.arch.warpgroup_reg_dealloc(self.num_regs_uniform_warps)
+            cute.arch.warpgroup_reg_dealloc(self.num_regs_uniform_warps)
             #
             # Persistent tile scheduling loop
             #
@@ -1364,7 +1365,7 @@ class BlockwiseGemmKernel:
         # Specialized MMA warp
         #
         if warp_idx == self.mma_warp_id:
-            # cute.arch.warpgroup_reg_dealloc(self.num_regs_uniform_warps)
+            cute.arch.warpgroup_reg_dealloc(self.num_regs_uniform_warps)
             #
             # Bar sync for retrieve tensor memory ptr from shared mem
             #
@@ -1532,7 +1533,7 @@ class BlockwiseGemmKernel:
         # Specialized acc update warps
         #
         if warp_idx <= self.acc_update_warp_id[-1]:
-            # cute.arch.warpgroup_reg_alloc(self.num_regs_acc_update_warps)
+            cute.arch.warpgroup_reg_alloc(self.num_regs_acc_update_warps)
             #
             # Bar sync for retrieve tensor memory ptr from shared memory
             #
@@ -1774,7 +1775,7 @@ class BlockwiseGemmKernel:
         # Specialized epilogue warps
         #
         if warp_idx <= self.epilog_warp_id[-1] and warp_idx >= self.epilog_warp_id[0]:
-            # cute.arch.warpgroup_reg_alloc(self.num_regs_epilogue_warps)
+            cute.arch.warpgroup_reg_alloc(self.num_regs_epilogue_warps)
             #
             # Alloc tensor memory buffer
             #
@@ -2036,7 +2037,7 @@ class BlockwiseGemmKernel:
         #
         if cutlass.const_expr(self.all_reduce == "two_shot"):
             if warp_idx >= self.all_reduce_warp_id[0]:
-                # cute.arch.warpgroup_reg_alloc(self.num_regs_acc_update_warps)
+                cute.arch.warpgroup_reg_alloc(self.num_regs_all_reduce_warps)
                 #
                 # Add persistent tile loop
                 #
