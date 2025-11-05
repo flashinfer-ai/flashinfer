@@ -446,7 +446,9 @@ bool TrtllmGenBatchedGemmRunner::isValidConfigIndex(int32_t configIndex, int32_t
 
   auto const& config = configs[configIndex];
 
-  return bmm.isValidConfig(config, gemmData);
+  // FIXME: temporarily disable split-k as renormalize routing plus expert number 256 failed in
+  // trtllm-gen ac83afb
+  return bmm.isValidConfig(config, gemmData) && config.mOptions.mClusterDimZ == 1;
 }
 
 }  // namespace kernels
