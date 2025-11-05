@@ -25,7 +25,6 @@ __all__ = [
     "mm_fp8",
     "tgv_gemm_sm100",
     "group_gemm_mxfp4_nt_groupwise",
-    "CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR",
     "batch_deepgemm_fp8_nt_groupwise",
     "group_deepgemm_fp8_nt_groupwise",
     "gemm_fp8_nt_blockscaled",
