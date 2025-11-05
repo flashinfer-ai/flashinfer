@@ -46,7 +46,6 @@ from cutlass.cute.typing import (
     Float32,
     Float8E4M3FN,
     Float8E5M2,
-    Tensor,
 )
 import torch
 
