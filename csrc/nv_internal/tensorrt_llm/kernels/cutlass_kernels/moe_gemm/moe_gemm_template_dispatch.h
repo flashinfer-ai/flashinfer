@@ -96,7 +96,9 @@ struct genericMoeGemmKernelLauncher {
 
     static_assert(cutlass::platform::is_same<T, WeightType>::value ||
                   cutlass::platform::is_same<WeightType, uint8_t>::value ||
+#if defined(ENABLE_FP4)
                   cutlass::platform::is_same<WeightType, __nv_fp4_e2m1>::value ||
+#endif
                   cutlass::platform::is_same<WeightType, cutlass::uint4b_t>::value);
 
     static_assert(arch::kMinComputeCapability < 90,
@@ -737,7 +739,12 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
                        "Hopper configuration provided for non-Hopper architecture");
 
   if (sm_ >= 75 && sm_ < 80) {
-    if constexpr (!std::is_same_v<WeightType, __nv_fp4_e2m1>) {
+#if defined(ENABLE_FP4)
+    constexpr bool is_fp4 = std::is_same_v<WeightType, __nv_fp4_e2m1>;
+#else
+    constexpr bool is_fp4 = false;
+#endif
+    if constexpr (!is_fp4) {
       cutlass_kernels_oss::dispatchMoeGemmToCutlass<T, WeightType, ScaleBiasType,
                                                     cutlass::arch::Sm75, EpilogueTag>(
           inputs, multi_processor_count_);
@@ -745,7 +752,12 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
       TLLM_THROW("FP4 data type is not supported on SM < 90");
     }
   } else if (sm_ >= 80 && sm_ < 90) {
-    if constexpr (!std::is_same_v<WeightType, __nv_fp4_e2m1>) {
+#if defined(ENABLE_FP4)
+    constexpr bool is_fp4 = std::is_same_v<WeightType, __nv_fp4_e2m1>;
+#else
+    constexpr bool is_fp4 = false;
+#endif
+    if constexpr (!is_fp4) {
       if constexpr (use_fp8 || use_w4afp8) {
 #if defined(ENABLE_FP8)
         static_assert(!std::is_same_v<OutputType, __nv_fp8_e4m3> &&
