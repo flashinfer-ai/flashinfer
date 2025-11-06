@@ -1020,14 +1020,17 @@ def backend_requirement(
             # Whether the given backend exists in the API
             return backend in backend_checks
 
-        def suitable_auto_backends(*args, **kwargs):
+        def suitable_auto_backends(cc, *args, **kwargs):
             if common_check is not None and not common_check(*args, **kwargs):
                 return False
             suitable_backends = []
             # Check for each backend support
             for backend in backend_checks:
+                req_checker = backend_checks[backend]
                 try:
-                    if backend_checks[backend](*args, **kwargs):
+                    if req_checker(
+                        *args, **kwargs
+                    ) and req_checker.is_compute_capability_supported(cc):
                         suitable_backends.append(backend)
                 except ValueError:
                     continue
@@ -1038,6 +1041,25 @@ def backend_requirement(
                 return False
             wrapper.suitable_auto_backends = suitable_backends
             return True
+
+        def _get_capability(*args, **kwargs):
+            capability = None
+            # Find the first tensor argument.
+            # Assume all tensors are on the same device/capability.
+            # We could consider check all tensors at a performance cost.
+            tensor_arg = None
+            all_args = args + tuple(kwargs.values())
+            for value in all_args:
+                if isinstance(value, torch.Tensor):
+                    tensor_arg = value
+                    break
+
+            if tensor_arg is not None:
+                # Get compute capability from the first tensor
+                # Assume all tensors are on the same device/capability
+                major, minor = get_compute_capability(tensor_arg.device)
+                capability = major * 10 + minor
+            return capability
 
         # @brief: Wrapper function that calls the orignal, decorated function, after applying a number of checks.
         # @note that here we manually apply defaults to the arguments in the wrapper function when doing validation.
@@ -1055,24 +1077,8 @@ def backend_requirement(
                 bound_args.apply_defaults()
                 # Convert to kwargs for validation functions
                 kwargs_with_defaults = dict(bound_args.arguments)
-
                 backend = kwargs_with_defaults.get("backend")
-
-                capability = None
-                # Find the first tensor argument.
-                # Assume all tensors are on the same device/capability.
-                # We could consider check all tensors at a performance cost.
-                tensor_arg = None
-                for value in kwargs_with_defaults.values():
-                    if isinstance(value, torch.Tensor):
-                        tensor_arg = value
-                        break
-
-                if tensor_arg is not None:
-                    # Get compute capability from the first tensor
-                    # Assume all tensors are on the same device/capability
-                    major, minor = get_compute_capability(tensor_arg.device)
-                    capability = major * 10 + minor
+                capability = _get_capability(*args, **kwargs)
                 if not has_backend_choices() and common_check is None:
                     raise ValueError(
                         f"Invalid @backend_requirement decorator usage: no backend choices and no common_check for {func.__name__}"
@@ -1080,7 +1086,9 @@ def backend_requirement(
 
                 if has_backend_choices():
                     if backend == "auto":
-                        if not suitable_auto_backends(**kwargs_with_defaults):
+                        if not suitable_auto_backends(
+                            capability, **kwargs_with_defaults
+                        ):
                             raise BackendSupportedError(
                                 f"No suitable auto backends found for {func.__name__}"
                             )
@@ -1109,7 +1117,8 @@ def backend_requirement(
             elif skip_check and heuristic_func is not None:
                 if kwargs.get("backend") == "auto":
                     # This needs to be called for heuristic function
-                    suitable_auto_backends(*args, **kwargs)
+                    capability = _get_capability(*args, **kwargs)
+                    suitable_auto_backends(capability, *args, **kwargs)
 
             return func(*args, **kwargs)
 
