@@ -2,6 +2,7 @@ import pytest
 import torch
 
 from flashinfer import mxfp8_dequantize_host, mxfp8_quantize
+from flashinfer.utils import get_compute_capability
 
 
 @pytest.mark.parametrize("m", [1, 1024])
@@ -10,6 +11,13 @@ from flashinfer import mxfp8_dequantize_host, mxfp8_quantize
 @pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
 @pytest.mark.parametrize("device", ["cuda", "cpu"])
 def test_mxfp8_quantize_torch(m, k, dtype, is_sf_swizzled_layout, device):
+    if device == "cuda":
+        major, _ = get_compute_capability(torch.device(device))
+        if major < 10:
+            pytest.skip(
+                "mxfp8 quantization is not supported on compute capability < 10"
+            )
+
     a = 16 * torch.randn([m, k], dtype=dtype).to(device).contiguous()
 
     if device == "cpu":
@@ -90,6 +98,10 @@ def test_mxfp8_quantize_torch_host(m, k, dtype, is_sf_swizzled_layout):
 @pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
 @pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
 def test_mxfp8_quantize_torch_device(m, k, dtype, is_sf_swizzled_layout):
+    major, _ = get_compute_capability(torch.device("cuda:0"))
+    if major < 10:
+        pytest.skip("mxfp8 quantization is not supported on compute capability < 10")
+
     torch.random.manual_seed(0)
     a = (torch.randn([m, k], dtype=torch.float) * 16).to(dtype).cuda().contiguous()
 
@@ -114,6 +126,10 @@ def test_mxfp8_quantize_torch_device(m, k, dtype, is_sf_swizzled_layout):
 def test_mxfp8_quantize_alignment_torch_device(
     m, k, dtype, is_sf_swizzled_layout, alignment
 ):
+    major, _ = get_compute_capability(torch.device("cuda:0"))
+    if major < 10:
+        pytest.skip("mxfp8 quantization is not supported on compute capability < 10")
+
     torch.random.manual_seed(0)
     a = (torch.randn([m, k], dtype=torch.float) * 16).to(dtype).cuda().contiguous()
     padded_k = ((k + alignment - 1) // alignment) * alignment
