@@ -94,6 +94,53 @@ def get_commits_since_tag(tag: str) -> list[dict]:
         return []
 
 
+def build_analysis_prompt(commits_summary: str, current_version: str) -> str:
+    """Build the AI analysis prompt (shared by all AI providers)."""
+    return f"""You are analyzing git commits for a CUDA kernel library called FlashInfer to determine the appropriate semantic version bump.
+
+Current version: {current_version}
+
+Versioning rules for this project (from CONTRIBUTING.md):
+FlashInfer follows a "right-shifted" versioning scheme (major.minor.patch[.post1]):
+- MAJOR increment: architectural milestones and/or incompatible API changes (breaking changes to public APIs), similar to PyTorch 2.0
+- MINOR increment: significant backwards-compatible new features (major functionality additions)
+- PATCH increment: small backwards-compatible features (e.g. new kernels, new SM support, etc.) and backwards-compatible bug fixes
+- POST (e.g. .post1): optional suffix for quick follow-up release with just backwards-compatible bug fixes (not used in this analysis)
+
+Here are the commits since the last release:
+
+{commits_summary}
+
+Please analyze these commits and determine:
+1. Whether there are any breaking API changes or architectural milestones (MAJOR bump needed)
+2. Whether there are significant new features (MINOR bump needed)
+3. Whether there are small features or bug fixes (PATCH bump needed)
+4. If no significant changes, return "none"
+
+Respond in JSON format:
+{{
+    "bump_type": "major|minor|patch|none",
+    "reasoning": "Detailed explanation of your decision",
+    "key_changes": ["list of most important changes that influenced the decision"]
+}}
+
+Important considerations:
+- New kernel implementations, new SM support, performance improvements are PATCH-level changes
+- MINOR bumps are for significant/major feature additions only, not incremental improvements
+- Internal refactoring, test updates, documentation changes alone don't warrant a version bump
+- API signature changes or removed functionality are MAJOR bumps
+- Focus on changes that affect users of the library, not internal changes
+"""
+
+
+def extract_json_from_response(text: str) -> str:
+    """Extract JSON from response that might be wrapped in markdown code blocks."""
+    json_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if json_match:
+        return json_match.group(1)
+    return text
+
+
 def analyze_with_openai(commits_summary: str, current_version: str) -> dict:
     """Use OpenAI to analyze commits."""
     api_key = os.getenv("OPENAI_API_KEY")
@@ -105,40 +152,7 @@ def analyze_with_openai(commits_summary: str, current_version: str) -> dict:
     from openai import OpenAI
 
     client = OpenAI(api_key=api_key)
-
-    prompt = f"""You are analyzing git commits for a CUDA kernel library called FlashInfer to determine the appropriate semantic version bump.
-
-Current version: {current_version}
-
-Semantic versioning rules for this project (from CONTRIBUTING.md):
-- MAJOR increment: incompatible API changes (breaking changes to public APIs)
-- MINOR increment: added functionality that is backwards-compatible (new kernels, new features, new SM support, etc.)
-- PATCH increment: backwards-compatible bug fixes (both functional and performance fixes)
-
-Here are the commits since the last release:
-
-{commits_summary}
-
-Please analyze these commits and determine:
-1. Whether there are any breaking API changes (MAJOR bump needed)
-2. Whether there are new features or backwards-compatible functionality additions (MINOR bump needed)
-3. Whether there are only bug fixes without new features (PATCH bump needed)
-4. If no significant changes, return "none"
-
-Respond in JSON format:
-{{
-    "bump_type": "major|minor|patch|none",
-    "reasoning": "Detailed explanation of your decision",
-    "key_changes": ["list of most important changes that influenced the decision"]
-}}
-
-Important considerations:
-- Internal refactoring, test updates, documentation changes alone don't warrant a version bump
-- Performance improvements are considered bug fixes (PATCH)
-- New kernel implementations or new features are MINOR bumps
-- API signature changes or removed functionality are MAJOR bumps
-- Focus on changes that affect users of the library, not internal changes
-"""
+    prompt = build_analysis_prompt(commits_summary, current_version)
 
     response = client.chat.completions.create(
         model=model,
@@ -168,40 +182,7 @@ def analyze_with_claude(commits_summary: str, current_version: str) -> dict:
     from anthropic import Anthropic
 
     client = Anthropic(api_key=api_key)
-
-    prompt = f"""You are analyzing git commits for a CUDA kernel library called FlashInfer to determine the appropriate semantic version bump.
-
-Current version: {current_version}
-
-Semantic versioning rules for this project (from CONTRIBUTING.md):
-- MAJOR increment: incompatible API changes (breaking changes to public APIs)
-- MINOR increment: added functionality that is backwards-compatible (new kernels, new features, new SM support, etc.)
-- PATCH increment: backwards-compatible bug fixes (both functional and performance fixes)
-
-Here are the commits since the last release:
-
-{commits_summary}
-
-Please analyze these commits and determine:
-1. Whether there are any breaking API changes (MAJOR bump needed)
-2. Whether there are new features or backwards-compatible functionality additions (MINOR bump needed)
-3. Whether there are only bug fixes without new features (PATCH bump needed)
-4. If no significant changes, return "none"
-
-Respond in JSON format:
-{{
-    "bump_type": "major|minor|patch|none",
-    "reasoning": "Detailed explanation of your decision",
-    "key_changes": ["list of most important changes that influenced the decision"]
-}}
-
-Important considerations:
-- Internal refactoring, test updates, documentation changes alone don't warrant a version bump
-- Performance improvements are considered bug fixes (PATCH)
-- New kernel implementations or new features are MINOR bumps
-- API signature changes or removed functionality are MAJOR bumps
-- Focus on changes that affect users of the library, not internal changes
-"""
+    prompt = build_analysis_prompt(commits_summary, current_version)
 
     response = client.messages.create(
         model=model,
@@ -211,11 +192,7 @@ Important considerations:
     )
 
     result_text = response.content[0].text.strip()
-
-    # Extract JSON from response (might be wrapped in markdown code blocks)
-    json_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", result_text, re.DOTALL)
-    if json_match:
-        result_text = json_match.group(1)
+    result_text = extract_json_from_response(result_text)
 
     return json.loads(result_text)
 
@@ -232,39 +209,7 @@ def analyze_with_gemini(commits_summary: str, current_version: str) -> dict:
 
     genai.configure(api_key=api_key)
 
-    prompt = f"""You are analyzing git commits for a CUDA kernel library called FlashInfer to determine the appropriate semantic version bump.
-
-Current version: {current_version}
-
-Semantic versioning rules for this project (from CONTRIBUTING.md):
-- MAJOR increment: incompatible API changes (breaking changes to public APIs)
-- MINOR increment: added functionality that is backwards-compatible (new kernels, new features, new SM support, etc.)
-- PATCH increment: backwards-compatible bug fixes (both functional and performance fixes)
-
-Here are the commits since the last release:
-
-{commits_summary}
-
-Please analyze these commits and determine:
-1. Whether there are any breaking API changes (MAJOR bump needed)
-2. Whether there are new features or backwards-compatible functionality additions (MINOR bump needed)
-3. Whether there are only bug fixes without new features (PATCH bump needed)
-4. If no significant changes, return "none"
-
-Respond in JSON format:
-{{
-    "bump_type": "major|minor|patch|none",
-    "reasoning": "Detailed explanation of your decision",
-    "key_changes": ["list of most important changes that influenced the decision"]
-}}
-
-Important considerations:
-- Internal refactoring, test updates, documentation changes alone don't warrant a version bump
-- Performance improvements are considered bug fixes (PATCH)
-- New kernel implementations or new features are MINOR bumps
-- API signature changes or removed functionality are MAJOR bumps
-- Focus on changes that affect users of the library, not internal changes
-"""
+    prompt = build_analysis_prompt(commits_summary, current_version)
 
     model = genai.GenerativeModel(model_name)
 
@@ -276,13 +221,42 @@ Important considerations:
     )
 
     result_text = response.text.strip()
-
-    # Extract JSON from response (might be wrapped in markdown code blocks)
-    json_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", result_text, re.DOTALL)
-    if json_match:
-        result_text = json_match.group(1)
+    result_text = extract_json_from_response(result_text)
 
     return json.loads(result_text)
+
+
+def try_ai_provider(
+    provider_name: str,
+    analyzer_func,
+    commits_summary: str,
+    current_version: str,
+    model_env_var: str,
+    default_model: str,
+    install_package: str,
+):
+    """
+    Try to use an AI provider with standardized error handling.
+
+    Returns: (success: bool, result: dict or None)
+    """
+    try:
+        print(f"Trying {provider_name}...", file=sys.stderr)
+        result = analyzer_func(commits_summary, current_version)
+        model = os.getenv(model_env_var, default_model)
+        print(f"Successfully used {provider_name} (model: {model})", file=sys.stderr)
+        return True, result
+    except ImportError:
+        print(
+            f"{provider_name} package not installed. Install with: pip install {install_package}",
+            file=sys.stderr,
+        )
+    except ValueError as e:
+        print(f"{provider_name} not available: {e}", file=sys.stderr)
+    except Exception as e:
+        print(f"Error calling {provider_name} API: {e}", file=sys.stderr)
+
+    return False, None
 
 
 def analyze_with_ai(commits: list[dict], current_version: str) -> dict:
@@ -302,62 +276,38 @@ def analyze_with_ai(commits: list[dict], current_version: str) -> dict:
         ]
     )
 
-    # Try OpenAI first
-    try:
-        print("Trying OpenAI...", file=sys.stderr)
-        result = analyze_with_openai(commits_summary, current_version)
-        print(
-            f"Successfully used OpenAI (model: {os.getenv('OPENAI_MODEL', 'gpt-4o')})",
-            file=sys.stderr,
-        )
-        return result
-    except ImportError:
-        print(
-            "OpenAI package not installed. Install with: pip install openai",
-            file=sys.stderr,
-        )
-    except ValueError as e:
-        print(f"OpenAI not available: {e}", file=sys.stderr)
-    except Exception as e:
-        print(f"Error calling OpenAI API: {e}", file=sys.stderr)
+    # Define AI providers to try in order
+    providers = [
+        ("OpenAI", analyze_with_openai, "OPENAI_MODEL", "gpt-4o", "openai"),
+        (
+            "Anthropic Claude",
+            analyze_with_claude,
+            "CLAUDE_MODEL",
+            "claude-3-5-sonnet-20241022",
+            "anthropic",
+        ),
+        (
+            "Google Gemini",
+            analyze_with_gemini,
+            "GEMINI_MODEL",
+            "gemini-2.0-flash-exp",
+            "google-generativeai",
+        ),
+    ]
 
-    # Try Claude second
-    try:
-        print("Trying Anthropic Claude...", file=sys.stderr)
-        result = analyze_with_claude(commits_summary, current_version)
-        print(
-            f"Successfully used Anthropic Claude (model: {os.getenv('CLAUDE_MODEL', 'claude-3-5-sonnet-20241022')})",
-            file=sys.stderr,
+    # Try each provider in order
+    for name, analyzer, model_env, default_model, package in providers:
+        success, result = try_ai_provider(
+            name,
+            analyzer,
+            commits_summary,
+            current_version,
+            model_env,
+            default_model,
+            package,
         )
-        return result
-    except ImportError:
-        print(
-            "Anthropic package not installed. Install with: pip install anthropic",
-            file=sys.stderr,
-        )
-    except ValueError as e:
-        print(f"Claude not available: {e}", file=sys.stderr)
-    except Exception as e:
-        print(f"Error calling Claude API: {e}", file=sys.stderr)
-
-    # Try Gemini third
-    try:
-        print("Trying Google Gemini...", file=sys.stderr)
-        result = analyze_with_gemini(commits_summary, current_version)
-        print(
-            f"Successfully used Google Gemini (model: {os.getenv('GEMINI_MODEL', 'gemini-2.0-flash-exp')})",
-            file=sys.stderr,
-        )
-        return result
-    except ImportError:
-        print(
-            "Gemini package not installed. Install with: pip install google-generativeai",
-            file=sys.stderr,
-        )
-    except ValueError as e:
-        print(f"Gemini not available: {e}", file=sys.stderr)
-    except Exception as e:
-        print(f"Error calling Gemini API: {e}", file=sys.stderr)
+        if success:
+            return result
 
     # Fallback to basic analysis
     print(
