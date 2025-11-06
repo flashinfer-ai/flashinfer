@@ -157,13 +157,13 @@ def test_trtllm_gen_routed_fused_moe(
         hidden_states_scale,
         w13,
         w13_scale,
-        None,
+        None,  # w13_bias
         None,  # gemm1_alpha
         None,  # gemm1_beta
         None,  # gemm1_clamp_limit
         w2,
         w2_scale,
-        None,
+        None,  # w2_bias
         output1_scale_scalar,
         output1_scale_gate_scalar,
         output2_scale_scalar,
@@ -177,7 +177,7 @@ def test_trtllm_gen_routed_fused_moe(
         None,  # routed_scaling_factor
         None,  # tile_tokens_dim
         routing_method_type.value,
-        True,
+        True,  # do_finalize
         enable_pdl,
         GatedActType.SwiGlu.value,  # gated_act_type
         None,
@@ -211,13 +211,13 @@ def test_trtllm_gen_routed_fused_moe(
         hidden_states_scale,
         w13,
         w13_scale,
-        None,
+        None,  # w13_bias
         None,  # gemm1_alpha
         None,  # gemm1_beta
         None,  # gemm1_clamp_limit
         w2,
         w2_scale,
-        None,
+        None,  # w2_bias
         output1_scale_scalar,
         output1_scale_gate_scalar,
         output2_scale_scalar,
@@ -231,7 +231,7 @@ def test_trtllm_gen_routed_fused_moe(
         None,  # routed_scaling_factor
         None,  # tile_tokens_dim
         routing_method_type.value,
-        True,
+        True,  # do_finalize
         enable_pdl,
         GatedActType.SwiGlu.value,  # gated_act_type
         None,
