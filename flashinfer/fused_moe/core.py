@@ -1676,9 +1676,10 @@ def trtllm_fp8_per_tensor_scale_moe(
     local_num_experts: int,
     routed_scaling_factor: Optional[float],
     use_routing_scales_on_input: bool,
-    tile_tokens_dim: int = 8,
+    tile_tokens_dim: Optional[int] = None,
     routing_method_type: int = 0,
     enable_pdl: Optional[bool] = None,
+    tune_max_num_tokens: int = 8192,
 ) -> torch.Tensor:
     """FP8 per tensor scale MoE operation.
 
@@ -1700,9 +1701,10 @@ def trtllm_fp8_per_tensor_scale_moe(
         local_num_experts: Number of experts handled by this device
         routed_scaling_factor: Scaling factor for routing
         use_routing_scales_on_input: Whether to use routing scales on input
-        tile_tokens_dim: Tile dimension for tokens (default: 8)
+        tile_tokens_dim: Tile dimension for tokens (default: None, will be deprecated in the future)
         routing_method_type: Type of routing method to use (default: 0)
         enable_pdl: Whether to enable Programmatic Dependent Launch (PDL). Auto-enabled for >= sm90.
+        tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 8192)
 
     Returns:
         torch.Tensor: Output tensor of shape [seq_len, hidden_size]
@@ -1733,6 +1735,7 @@ def trtllm_fp8_per_tensor_scale_moe(
         use_routing_scales_on_input,
         routing_method_type,
         enable_pdl,
+        tune_max_num_tokens,
     )
 
 
@@ -1758,6 +1761,7 @@ def trtllm_fp8_block_scale_moe(
     use_shuffled_weight: bool = False,
     weight_layout: int = 0,
     enable_pdl: Optional[bool] = None,
+    tune_max_num_tokens: int = 8192,
 ) -> torch.Tensor:
     """FP8 block scale MoE operation.
 
@@ -1778,9 +1782,10 @@ def trtllm_fp8_block_scale_moe(
         local_expert_offset: Offset of local experts in global expert space
         local_num_experts: Number of experts handled by this device
         routed_scaling_factor: Scaling factor for routing
-        tile_tokens_dim: Tile dimension for tokens (default: 8)
+        tile_tokens_dim: Tile dimension for tokens (default: None, will be deprecated in the future)
         routing_method_type: Type of routing method to use (default: 0)
         enable_pdl: Whether to enable Programmatic Dependent Launch (PDL). Auto-enabled for >= sm90.
+        tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 8192)
     Returns:
         torch.Tensor: Output tensor of shape [seq_len, hidden_size]
     """
@@ -1815,6 +1820,7 @@ def trtllm_fp8_block_scale_moe(
         use_shuffled_weight,
         weight_layout,
         enable_pdl,
+        tune_max_num_tokens,
     )
 
 
