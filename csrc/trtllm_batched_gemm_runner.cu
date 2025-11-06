@@ -116,14 +116,16 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
     }
   }
 
-  FLASHINFER_CHECK(
-      !mPassingConfigIndices.empty(),
-      "No kernel found for the given options: mDtypeA: %s, mDtypeB: %s, mDtypeC: %s, "
-      "mUseDeepSeekFp8: %d, "
-      "mTransposeMmaOutput: %d, mRouteAct: %d, mFusedAct: %d, mIsStaticBatch: %d, mTileSize: %d",
-      tg::dtypeToString(mOptions.dtypeA).c_str(), tg::dtypeToString(mOptions.dtypeB).c_str(),
-      tg::dtypeToString(mOptions.dtypeC).c_str(), mOptions.deepSeekFp8, mOptions.transposeMmaOutput,
-      mOptions.routeAct, mOptions.fusedAct, mOptions.staticBatch, mOptions.tileSize);
+  std::ostringstream error_msg;
+  error_msg << "No kernel found for the given options: "
+            << "mDtypeA: " << tg::dtypeToString(mOptions.dtypeA)
+            << ", mDtypeB: " << tg::dtypeToString(mOptions.dtypeB)
+            << ", mDtypeC: " << tg::dtypeToString(mOptions.dtypeC)
+            << ", mUseDeepSeekFp8: " << mOptions.deepSeekFp8
+            << ", mTransposeMmaOutput: " << mOptions.transposeMmaOutput
+            << ", mRouteAct: " << mOptions.routeAct << ", mFusedAct: " << mOptions.fusedAct
+            << ", mIsStaticBatch: " << mOptions.staticBatch << ", mTileSize: " << mOptions.tileSize;
+  FLASHINFER_CHECK(!mPassingConfigIndices.empty(), error_msg.str());
 }
 
 size_t TrtllmGenBatchedGemmRunner::getWorkspaceSizeInBytes(

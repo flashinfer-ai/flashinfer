@@ -1087,27 +1087,25 @@ class BF16Moe(Moe):
         intermediate_size = kwargs["intermediate_size"]
         routing_method_type = kwargs["routing_method_type"]
 
-        output = trtllm_bf16_moe(
-            expert_logits,  # float
-            routing_bias,
-            hidden_states_orig,
-            static_data["gemm1_weights"],
-            static_data["gemm2_weights"],
-            num_experts,
-            top_k,
-            n_groups,
-            top_k_groups,
-            intermediate_size,
-            0,
-            num_experts,
-            # the rest are enforced by the api to be passed in the keyword form
-            # as opposed to the positional form
-            use_shuffled_weight=static_data["use_shuffled_weight"],
-            weight_layout=static_data["weight_layout"],
-            tile_tokens_dim=8,
-            routing_method_type=routing_method_type,
-        )
-
+        # Use autotuner for optimal kernel selection
+        with autotune(True):
+            output = trtllm_bf16_moe(
+                expert_logits,  # float
+                routing_bias,
+                hidden_states_orig,
+                static_data["gemm1_weights"],
+                static_data["gemm2_weights"],
+                num_experts,
+                top_k,
+                n_groups,
+                top_k_groups,
+                intermediate_size,
+                0,
+                num_experts,
+                use_shuffled_weight=static_data["use_shuffled_weight"],
+                weight_layout=static_data["weight_layout"],
+                routing_method_type=routing_method_type,
+            )
         return output.to(torch.float)
 
     def compute_reference(self, args):
