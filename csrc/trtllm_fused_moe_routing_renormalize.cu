@@ -434,9 +434,7 @@ void run(Data const& data, void* stream) {
   TVM_FFI_ICHECK_EQ(data.mNumExperts % 4, 0)
       << "Routing kernel expects #experts " << data.mNumExperts << " to be a multiple of 4.";
 
-  // FIXME: routingIndicesBlockKernel currently does not support the packed topk-id format.
   bool const useSingleBlock = data.mNumTokens <= BlockKernelMaxNumTokens;
-  // bool const useSingleBlock = false;
 
   bool const useSingleCluster =
       data.mNumTokens <= ((data.mPtrScores != nullptr || data.mPtrTopKIds != nullptr)

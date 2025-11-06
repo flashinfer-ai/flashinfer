@@ -60,8 +60,6 @@ def test_trtllm_gen_routed_fused_moe(
     routing_method_type: RoutingMethodType,
     quant_mode: Literal["NvFP4xNvFP4", "MxFP4xMxFP8", "MxFP4xBf16"],
 ):
-    # if num_tokens == 1 or num_tokens == 8 and quant_mode == "NvFP4xNvFP4":
-    #     pytest.skip()
     torch.manual_seed(42)
     device = torch.device("cuda:0")
     enable_pdl = device_support_pdl(device)
@@ -77,6 +75,7 @@ def test_trtllm_gen_routed_fused_moe(
             torch.tensor([448.0 * 6.0], device=device),
             sf_vec_size=16,
             sf_use_ue8m0=False,
+            is_sf_swizzled_layout=False,
         )
         hidden_states_scale = hidden_states_scale.view(torch.float8_e4m3fn).reshape(
             num_tokens, -1
