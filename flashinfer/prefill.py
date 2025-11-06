@@ -31,6 +31,7 @@ from .jit import (
     get_single_prefill_uri,
     setup_cubin_loader,
     gen_trtllm_gen_fmha_module,
+    get_trtllm_fmha_v2_module,
 )
 from .cudnn import cudnn_batch_prefill_with_kv_cache
 from .page import block_sparse_indices_to_vector_sparse_offsets, get_seq_lens
@@ -3540,3 +3541,22 @@ def trtllm_batch_context_with_kv_cache(
         if out_dtype != "nvfp4"
         else FP4Tensor(out, out_scale_factor, o_sf_start_index, query.shape)
     )
+
+
+# WIP (jimmyzho)
+def trtllm_fmha_v2_attention() -> torch.Tensor:
+    # Get compiled module
+    q = torch.randn(1024, 128, 192, dtype=torch.float16, device="cuda")
+    k = torch.randn(1024, 128, 192, dtype=torch.float16, device="cuda")
+    v = torch.randn(1024, 128, 128, dtype=torch.float16, device="cuda")
+    o = torch.randn(1024, 128, 128, dtype=torch.float16, device="cuda")
+    lse = torch.randn(1024, 128, dtype=torch.float32, device="cuda")
+    sm_scale = 1.0
+    num_heads = 128
+    head_dim = 192
+    seq_len = 1024
+
+    module = get_trtllm_fmha_v2_module()
+    module.run(q, k, v, o, lse, sm_scale, num_heads, head_dim, seq_len)
+
+    return o

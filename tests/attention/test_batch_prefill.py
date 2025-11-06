@@ -2,6 +2,7 @@ import pytest
 import torch
 
 from flashinfer import BatchPrefillWithPagedKVCacheWrapper
+from flashinfer.prefill import trtllm_fmha_v2_attention
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -118,3 +119,9 @@ def test_kv_scale_forwarding_math_property(dtype: torch.dtype):
     )
     out3_ref, _ = wrapper.forward_return_lse(q * k_scale, paged_kv_cache)
     torch.testing.assert_close(out3, out3_ref * v_scale, rtol=1e-2, atol=1e-3)
+
+
+# WIP (jimmyzho)
+def test_trtllm_fmha_v2_attention():
+
+    out = trtllm_fmha_v2_attention()
