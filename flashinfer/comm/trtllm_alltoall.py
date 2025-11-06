@@ -236,7 +236,9 @@ def get_comm_alltoall_module():
         )
         if scales is not None:
             prepared_local_scales = torch.empty(
-                (max_token_count_per_rank * ep_size, top_k), **attrs
+                (max_token_count_per_rank * ep_size, top_k),
+                dtype=torch.float32,
+                device=attrs["device"],
             )
         else:
             prepared_local_scales = None
