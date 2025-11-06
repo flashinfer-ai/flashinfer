@@ -60,8 +60,8 @@ def test_trtllm_gen_routed_fused_moe(
     routing_method_type: RoutingMethodType,
     quant_mode: Literal["NvFP4xNvFP4", "MxFP4xMxFP8", "MxFP4xBf16"],
 ):
-    if num_tokens == 1 or num_tokens == 8 and quant_mode == "NvFP4xNvFP4":
-        pytest.skip()
+    # if num_tokens == 1 or num_tokens == 8 and quant_mode == "NvFP4xNvFP4":
+    #     pytest.skip()
     torch.manual_seed(42)
     device = torch.device("cuda:0")
     enable_pdl = device_support_pdl(device)
