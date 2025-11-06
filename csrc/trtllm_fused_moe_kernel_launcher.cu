@@ -711,7 +711,7 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
 
 class Fp8BlockScaleLauncher : public FusedMoeLauncher {
  public:
-  static constexpr std::array<int32_t, 4> mSupportedTileNums = {8, 16, 32, 64};
+  static constexpr std::array<int32_t, 4> mSupportedTileNums = {8, 16, 32, 64, 128};
 
   Fp8BlockScaleLauncher(TensorView const& routing_logits, Optional<TensorView> const& routing_bias,
                         TensorView const& hidden_states, TensorView const& hidden_states_scale,
@@ -945,6 +945,7 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     std::vector<int32_t> tiles(mBaseSupportedTileNums.begin(), mBaseSupportedTileNums.end());
     if (dtype_act != btg::Dtype::Bfloat16) {
       tiles.push_back(128);
+      tiles.push_back(256);
     }
     return tiles;
   }

@@ -2326,6 +2326,7 @@ def run_moe_test(
             id="Shuffled_MajorK",
         ),
         pytest.param(
+            {
                 "layout": WeightLayout.BlockMajorK,
                 "compatible_moe_impls": [FP8BlockScaleMoe, BF16Moe],
             },
@@ -2333,6 +2334,7 @@ def run_moe_test(
         ),
     ],
 )
+@pytest.mark.parametrize(
     "gated_act_type",
     [
         pytest.param(GatedActType.SwiGlu, id="SwiGlu"),
