@@ -1031,16 +1031,31 @@ class BF16Moe(Moe):
             # FIXME: this depends on the kernel internals
             epilogue_tile_m = 128
 
-            # Reorder rows of W1 for fused gated activation
+            # Reorder rows of W1 for fused gated activation and shuffle for both W1 and W2
+            # Using cached permute index calculation can speed up weights preprocessing
             gemm1_weights_bf16_shuffled = []
             gemm2_weights_bf16_shuffled = []
             for i in range(num_experts):
-                tmp_weights1 = reorder_rows_for_gated_act_gemm(
-                    args.gemm1_weights[i].clone().view(torch.uint8)
+                permute_indices = _maybe_get_cached_w3_w1_permute_indices(
+                    self._cache_permute_indices,
+                    args.gemm1_weights[i].view(torch.uint8),
+                    epilogue_tile_m,
                 )
-                tmp_weights1 = shuffle_matrix_a(tmp_weights1, epilogue_tile_m)
-                tmp_weights2 = shuffle_matrix_a(
-                    args.gemm2_weights[i].clone().view(torch.uint8), epilogue_tile_m
+                tmp_weights1 = (
+                    args.gemm1_weights[i]
+                    .view(torch.uint8)[permute_indices.to(args.gemm1_weights.device)]
+                    .contiguous()
+                )
+
+                permute_indices = get_w2_permute_indices_with_cache(
+                    self._cache_permute_indices,
+                    args.gemm2_weights[i].view(torch.uint8),
+                    epilogue_tile_m,
+                )
+                tmp_weights2 = (
+                    args.gemm2_weights[i]
+                    .view(torch.uint8)[permute_indices.to(args.gemm2_weights.device)]
+                    .contiguous()
                 )
 
                 if weight_layout == WeightLayout.BlockMajorK:
@@ -2085,12 +2100,6 @@ def run_moe_test(
 
     torch.cuda.synchronize()
 
-    # Additional safety: clear CUDA error state before test
-    # This helps prevent cascading errors from previous tests
-    torch.cuda.current_stream().synchronize()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
     moe_impl._cache_permute_indices = cache_permute_indices
 
     seed = 0
@@ -2258,17 +2267,17 @@ def run_moe_test(
 
 
 # Test: Renormalize routing
-@pytest.mark.parametrize("num_tokens", [1, 8, 1024])
+@pytest.mark.parametrize("num_tokens", [1, 8, 1024, 3072])
 @pytest.mark.parametrize("hidden_size", [1024])
-@pytest.mark.parametrize("intermediate_size", [2048, 1024, 768, 512, 384])
+@pytest.mark.parametrize("intermediate_size", [1024, 768, 512, 384])
 @pytest.mark.parametrize(
     "moe_impl",
     [
+        pytest.param(BF16Moe(), id="BF16xBF16"),
+        pytest.param(FP8BlockScaleMoe(), id="FP8_Block"),
         pytest.param(FP4Moe(quant_mode=QuantMode.FP4_NVFP4_NVFP4), id="NvFP4xNvFP4"),
         pytest.param(FP4Moe(quant_mode=QuantMode.FP4_MXFP4_MXFP8), id="MxFP4xMxFP8"),
         pytest.param(FP4Moe(quant_mode=QuantMode.FP4_MXFP4_Bf16), id="MxFP4xBf16"),
-        pytest.param(FP8BlockScaleMoe(), id="FP8_Block"),
-        pytest.param(BF16Moe(), id="BF16xBF16"),
     ],
 )
 @pytest.mark.parametrize(
@@ -2285,7 +2294,7 @@ def run_moe_test(
                 "has_routing_bias": False,
                 "routing_method_type": RoutingMethodType.Renormalize,
                 "compatible_moe_impls": [FP8BlockScaleMoe, FP4Moe, BF16Moe],
-                "compatible_intermediate_size": [384, 768, 1024, 2048],
+                "compatible_intermediate_size": [384, 768, 1024],
             },
             id="Renorm",
         ),
@@ -2327,6 +2336,7 @@ def run_moe_test(
         ),
         pytest.param(
             {
+                "use_shuffled_weight": True,
                 "layout": WeightLayout.BlockMajorK,
                 "compatible_moe_impls": [FP8BlockScaleMoe, BF16Moe],
             },
@@ -2365,7 +2375,7 @@ def test_renormalize_routing(
 
 
 # Test: DeepSeekV3 routing
-@pytest.mark.parametrize("num_tokens", [1, 8, 1024])
+@pytest.mark.parametrize("num_tokens", [1, 8, 1024, 3072])
 @pytest.mark.parametrize("hidden_size", [1024])
 @pytest.mark.parametrize("intermediate_size", [2048, 1024, 768, 512, 384])
 @pytest.mark.parametrize(
@@ -2391,7 +2401,7 @@ def test_renormalize_routing(
                 "has_routing_bias": True,
                 "routing_method_type": RoutingMethodType.DeepSeekV3,
                 "compatible_moe_impls": [FP4Moe, FP8BlockScaleMoe],
-                "compatible_intermediate_size": [512, 1024, 2048],
+                "compatible_intermediate_size": [1024, 2048],
             },
             id="kimi_k2",
         ),

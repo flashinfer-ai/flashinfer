@@ -711,7 +711,7 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
 
 class Fp8BlockScaleLauncher : public FusedMoeLauncher {
  public:
-  static constexpr std::array<int32_t, 4> mSupportedTileNums = {8, 16, 32, 64, 128};
+  static constexpr std::array<int32_t, 5> mSupportedTileNums = {8, 16, 32, 64, 128};
 
   Fp8BlockScaleLauncher(TensorView const& routing_logits, Optional<TensorView> const& routing_bias,
                         TensorView const& hidden_states, TensorView const& hidden_states_scale,
