@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import csv
 import numpy as np
 import torch
 
@@ -27,31 +28,33 @@ from flashinfer.testing.utils import (
 def bench_fmha_blackwell(
     batch_size,
     qkv_len,
-    num_heads,
-    head_dim,
+    num_qo_heads,
+    num_kv_heads,
+    head_dim_qk,
+    head_dim_vo,
     causal,
     dtype,
 ):
     # if sizeof(dtype) == 1, create randn from half and then convert to dtype
     if dtype.itemsize == 1:
         q = torch.randn(
-            batch_size * qkv_len, num_heads, head_dim, dtype=torch.half, device="cuda"
+            batch_size * qkv_len, num_qo_heads, head_dim_qk, dtype=torch.half, device="cuda"
         ).to(dtype)
         k = torch.randn(
-            batch_size * qkv_len, num_heads, head_dim, dtype=torch.half, device="cuda"
+            batch_size * qkv_len, num_kv_heads, head_dim_qk, dtype=torch.half, device="cuda"
         ).to(dtype)
         v = torch.randn(
-            batch_size * qkv_len, num_heads, head_dim, dtype=torch.half, device="cuda"
+            batch_size * qkv_len, num_kv_heads, head_dim_vo, dtype=torch.half, device="cuda"
         ).to(dtype)
     else:
         q = torch.randn(
-            batch_size * qkv_len, num_heads, head_dim, dtype=dtype, device="cuda"
+            batch_size * qkv_len, num_qo_heads, head_dim_qk, dtype=dtype, device="cuda"
         )
         k = torch.randn(
-            batch_size * qkv_len, num_heads, head_dim, dtype=dtype, device="cuda"
+            batch_size * qkv_len, num_kv_heads, head_dim_qk, dtype=dtype, device="cuda"
         )
         v = torch.randn(
-            batch_size * qkv_len, num_heads, head_dim, dtype=dtype, device="cuda"
+            batch_size * qkv_len, num_kv_heads, head_dim_vo, dtype=dtype, device="cuda"
         )
 
     qo_segment_offsets = (
@@ -68,10 +71,10 @@ def bench_fmha_blackwell(
     wrapper.plan(
         qo_segment_offsets,
         kv_segment_offsets,
-        num_heads,
-        num_heads,
-        head_dim,
-        head_dim_vo=head_dim,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim_qk,
+        head_dim_vo=head_dim_vo,
         causal=causal,
         q_data_type=dtype,
         kv_data_type=dtype,
@@ -95,63 +98,61 @@ def bench_fmha_blackwell(
     )
     print(
         f"bench_fmha_blackwell (batch_size={batch_size}, qkv_len={qkv_len}, num_heads={num_heads}, head_dim={head_dim}, causal={causal}), flops: {TFLOPS:.3f} TFLOPs/s"
-    )
-
 
 if __name__ == "__main__":
-    print("\n === head_dim=128, bfloat16 ===")
-    bench_fmha_blackwell(128, 512, 32, 128, False, torch.bfloat16)
-    bench_fmha_blackwell(64, 1024, 32, 128, False, torch.bfloat16)
-    bench_fmha_blackwell(32, 2048, 32, 128, False, torch.bfloat16)
-    bench_fmha_blackwell(16, 4096, 32, 128, False, torch.bfloat16)
-    bench_fmha_blackwell(8, 8192, 32, 128, False, torch.bfloat16)
-    bench_fmha_blackwell(4, 16384, 32, 128, False, torch.bfloat16)
-    bench_fmha_blackwell(2, 32768, 32, 128, False, torch.bfloat16)
-    bench_fmha_blackwell(1, 65536, 32, 128, False, torch.bfloat16)
-
-    bench_fmha_blackwell(128, 512, 32, 128, True, torch.bfloat16)
-    bench_fmha_blackwell(64, 1024, 32, 128, True, torch.bfloat16)
-    bench_fmha_blackwell(32, 2048, 32, 128, True, torch.bfloat16)
-    bench_fmha_blackwell(16, 4096, 32, 128, True, torch.bfloat16)
-    bench_fmha_blackwell(8, 8192, 32, 128, True, torch.bfloat16)
-    bench_fmha_blackwell(4, 16384, 32, 128, True, torch.bfloat16)
-    bench_fmha_blackwell(2, 32768, 32, 128, True, torch.bfloat16)
-    bench_fmha_blackwell(1, 65536, 32, 128, True, torch.bfloat16)
-
-    print("\n === head_dim=128, float8_e4m3fn ===")
-    bench_fmha_blackwell(128, 512, 32, 128, False, torch.float8_e4m3fn)
-    bench_fmha_blackwell(64, 1024, 32, 128, False, torch.float8_e4m3fn)
-    bench_fmha_blackwell(32, 2048, 32, 128, False, torch.float8_e4m3fn)
-    bench_fmha_blackwell(16, 4096, 32, 128, False, torch.float8_e4m3fn)
-    bench_fmha_blackwell(8, 8192, 32, 128, False, torch.float8_e4m3fn)
-    bench_fmha_blackwell(4, 16384, 32, 128, False, torch.float8_e4m3fn)
-    bench_fmha_blackwell(2, 32768, 32, 128, False, torch.float8_e4m3fn)
-    bench_fmha_blackwell(1, 65536, 32, 128, False, torch.float8_e4m3fn)
-
-    bench_fmha_blackwell(128, 512, 32, 128, True, torch.float8_e4m3fn)
-    bench_fmha_blackwell(64, 1024, 32, 128, True, torch.float8_e4m3fn)
-    bench_fmha_blackwell(32, 2048, 32, 128, True, torch.float8_e4m3fn)
-    bench_fmha_blackwell(16, 4096, 32, 128, True, torch.float8_e4m3fn)
-    bench_fmha_blackwell(8, 8192, 32, 128, True, torch.float8_e4m3fn)
-    bench_fmha_blackwell(4, 16384, 32, 128, True, torch.float8_e4m3fn)
-    bench_fmha_blackwell(2, 32768, 32, 128, True, torch.float8_e4m3fn)
-    bench_fmha_blackwell(1, 65536, 32, 128, True, torch.float8_e4m3fn)
-
-    print("\n === head_dim=64 ===")
-    bench_fmha_blackwell(128, 512, 32, 64, False, torch.bfloat16)
-    bench_fmha_blackwell(64, 1024, 32, 64, False, torch.bfloat16)
-    bench_fmha_blackwell(32, 2048, 32, 64, False, torch.bfloat16)
-    bench_fmha_blackwell(16, 4096, 32, 64, False, torch.bfloat16)
-    bench_fmha_blackwell(8, 8192, 32, 64, False, torch.bfloat16)
-    bench_fmha_blackwell(4, 16384, 32, 64, False, torch.bfloat16)
-    bench_fmha_blackwell(2, 32768, 32, 64, False, torch.bfloat16)
-    bench_fmha_blackwell(1, 65536, 32, 64, False, torch.bfloat16)
-
-    bench_fmha_blackwell(128, 512, 32, 64, True, torch.bfloat16)
-    bench_fmha_blackwell(64, 1024, 32, 64, True, torch.bfloat16)
-    bench_fmha_blackwell(32, 2048, 32, 64, True, torch.bfloat16)
-    bench_fmha_blackwell(16, 4096, 32, 64, True, torch.bfloat16)
-    bench_fmha_blackwell(8, 8192, 32, 64, True, torch.bfloat16)
-    bench_fmha_blackwell(4, 16384, 32, 64, True, torch.bfloat16)
-    bench_fmha_blackwell(2, 32768, 32, 64, True, torch.bfloat16)
-    bench_fmha_blackwell(1, 65536, 32, 64, True, torch.bfloat16)
+    results = []
+    
+    # Define configurations: (batch_size, qkv_len, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, config_name)
+    # DeepSeek-R1 uses MLA (Multi-head Latent Attention) with 128 heads
+    # head_dim_qk=192 (128 nope + 64 rope), head_dim_vo=128
+    configs = [
+        (16, 512, 128, 128, 192, 128, "DeepSeek-R1"),
+        (8, 1024, 128, 128, 192, 128, "DeepSeek-R1"),
+        (4, 2048, 128, 128, 192, 128, "DeepSeek-R1"),
+        (2, 4096, 128, 128, 192, 128, "DeepSeek-R1"),
+        (1, 8192, 128, 128, 192, 128, "DeepSeek-R1"),
+    ]
+    
+    # Run benchmarks: Causal first, then non-causal
+    # For each config: bfloat16 then fp8
+    for causal in [True, False]:
+        print(f"\n{'='*80}")
+        print(f"Running {'CAUSAL' if causal else 'NON-CAUSAL'} benchmarks")
+        print(f"{'='*80}")
+        
+        for batch_size, qkv_len, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, config_name in configs:
+            # Run bfloat16
+            print(f"\n[{config_name}] BS={batch_size}, SeqLen={qkv_len}, Causal={causal}, BF16")
+            result_bf16 = bench_fmha_blackwell(
+                batch_size, qkv_len, num_qo_heads, num_kv_heads, 
+                head_dim_qk, head_dim_vo, causal, torch.bfloat16
+            )
+            result_bf16["config_name"] = config_name
+            results.append(result_bf16)
+            print(f"  → {result_bf16['tflops']:.2f} TFLOPs/s, {result_bf16['time_ms']:.3f} ms")
+            
+            # Run fp8
+            print(f"[{config_name}] BS={batch_size}, SeqLen={qkv_len}, Causal={causal}, FP8")
+            result_fp8 = bench_fmha_blackwell(
+                batch_size, qkv_len, num_qo_heads, num_kv_heads,
+                head_dim_qk, head_dim_vo, causal, torch.float8_e4m3fn
+            )
+            result_fp8["config_name"] = config_name
+            results.append(result_fp8)
+            speedup = result_fp8['tflops'] / result_bf16['tflops']
+            print(f"  → {result_fp8['tflops']:.2f} TFLOPs/s, {result_fp8['time_ms']:.3f} ms (speedup: {speedup:.2f}x)")
+    
+    # Write results to CSV
+    csv_filename = "/workspace/logs/fp8_attention_deepseek_benchmark.csv"
+    fieldnames = ["config_name", "batch_size", "qkv_len", "num_qo_heads", "num_kv_heads", 
+                  "head_dim_qk", "head_dim_vo", "causal", "dtype", "time_ms", "tflops"]
+    
+    with open(csv_filename, 'w', newline='') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        for result in results:
+            writer.writerow(result)
+    
+    print(f"\n{'='*80}")
+    print(f"Results saved to: {csv_filename}")
+    print(f"{'='*80}")
