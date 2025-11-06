@@ -733,7 +733,7 @@ def launch_compute_sm80_group_gemm_args(
     w_stride_data = torch.empty(batch_size, dtype=ld_type, device=device)
     y_stride_data = torch.empty(batch_size, dtype=ld_type, device=device)
 
-    from .triton.gemm import compute_sm80_group_gemm_args
+    from ..triton.gemm import compute_sm80_group_gemm_args
 
     compute_sm80_group_gemm_args[(batch_size,)](
         all_problems,
@@ -795,7 +795,7 @@ def launch_compute_sm90_group_gemm_args(
     w_stride_data = torch.empty(batch_size, dtype=stride_type, device=device)
     y_stride_data = torch.empty(batch_size, dtype=stride_type, device=device)
 
-    from .triton.gemm import compute_sm90_group_gemm_args
+    from ..triton.gemm import compute_sm90_group_gemm_args
 
     compute_sm90_group_gemm_args[(batch_size,)](
         all_problems,
@@ -2822,7 +2822,7 @@ group_gemm_mxfp4_nt_groupwise = group_gemm_mxfp8_mxfp4_nt_groupwise
 def pad_indptr_to_multiple_of_4(
     m_indptr: torch.Tensor,
 ):
-    from .triton.gemm import compute_padding_mapping
+    from ..triton.gemm import compute_padding_mapping
 
     batch_size = m_indptr.shape[0] - 1
     m = m_indptr[1:] - m_indptr[:-1]
