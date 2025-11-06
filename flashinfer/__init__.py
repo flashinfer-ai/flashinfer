@@ -25,7 +25,7 @@ from .activation import gelu_and_mul as gelu_and_mul
 from .activation import gelu_tanh_and_mul as gelu_tanh_and_mul
 from .activation import silu_and_mul as silu_and_mul
 from .activation import (
-    silu_and_mul_nvfp4_batched_quantize as silu_and_mul_nvfp4_batched_quantize,
+    silu_and_mul_scaled_nvfp4_experts_quantize as silu_and_mul_scaled_nvfp4_experts_quantize,
 )
 from .attention import BatchAttention as BatchAttention
 from .attention import (
@@ -71,6 +71,7 @@ from .fp4_quantization import (
     nvfp4_batched_quantize,
     shuffle_matrix_a,
     shuffle_matrix_sf_a,
+    scaled_fp4_grouped_quantize,
 )
 from .fp8_quantization import mxfp8_dequantize_host, mxfp8_quantize
 from .fused_moe import (
@@ -148,3 +149,4 @@ from .trtllm_low_latency_gemm import (
 )
 from .utils import next_positive_power_of_2 as next_positive_power_of_2
 from .xqa import xqa as xqa
+from .xqa import xqa_mla as xqa_mla

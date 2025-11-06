@@ -259,8 +259,10 @@ def get_gemm_sm120_module_cutlass_fp8():
                     scale_k_count = (
                         k_dim + scale_gran_k - 1
                     ) // scale_gran_k  # k dimension
-                    scale_a_expanded = scale_a.view(1, 1).expand(
-                        scale_m_count, scale_k_count
+                    scale_a_expanded = (
+                        scale_a.view(1, 1)
+                        .expand(scale_m_count, scale_k_count)
+                        .contiguous()
                     )
                 else:
                     scale_a_expanded = scale_a
@@ -273,8 +275,10 @@ def get_gemm_sm120_module_cutlass_fp8():
                     scale_k_count = (
                         k_dim + scale_gran_k - 1
                     ) // scale_gran_k  # k dimension
-                    scale_b_expanded = scale_b.view(1, 1).expand(
-                        scale_n_count, scale_k_count
+                    scale_b_expanded = (
+                        scale_b.view(1, 1)
+                        .expand(scale_n_count, scale_k_count)
+                        .contiguous()
                     )
                 else:
                     scale_b_expanded = scale_b
@@ -566,7 +570,7 @@ def get_tgv_gemm_sm10x_module(
                     (a.shape[0], b.shape[1]), dtype=a.dtype, device=a.device
                 )
                 gemm_fn(b.t(), a.t(), bias, tactic, c, pdl)
-                return c.t()
+                return c
 
         return TGVGemmRunner()
 
@@ -1750,7 +1754,7 @@ def _check_mm_fp4_problem_size(
     return True
 
 
-@supported_compute_capability([100, 103, 110, 120])
+@supported_compute_capability([100, 103, 110, 120, 121])
 def _cudnn_gemm_fp4_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -1808,7 +1812,7 @@ def _cudnn_gemm_fp4_requirement(
     return True
 
 
-@supported_compute_capability([100, 103, 120])
+@supported_compute_capability([100, 103])
 def _trtllm_gemm_fp4_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -1830,7 +1834,7 @@ def _trtllm_gemm_fp4_requirement(
     return True
 
 
-@supported_compute_capability([100, 103, 120])
+@supported_compute_capability([100, 103, 110, 120, 121])
 def _cutlass_gemm_fp4_requirement(
     a: torch.Tensor,
     b: torch.Tensor,

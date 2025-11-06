@@ -28,8 +28,6 @@ using namespace tensorrt_llm::common;
 namespace tensorrt_llm {
 namespace kernels {
 
-__device__ __forceinline__ float silu(const float& val) { return val / (1.0f + __expf(-val)); }
-
 __global__ static void quantizedKernel(char4* dst, float4 const* src, int64_t const sizeDiv4,
                                        float const* scalePtr) {
   for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < sizeDiv4;
@@ -399,29 +397,6 @@ struct PackedVec<__nv_fp8_e4m3> {
                 "Vector size should match the number of elements per thread.");
 };
 
-template <class Type>
-inline __device__ void silu_and_mul(PackedVec<Type>& x_vec, const PackedVec<Type>& y_vec) {
-  float2 x[CVT_ELTS_PER_THREAD / 2];
-  float2 y[CVT_ELTS_PER_THREAD / 2];
-
-#pragma unroll
-  for (int i = 0; i < CVT_ELTS_PER_THREAD / 2; i++) {
-    if constexpr (std::is_same_v<Type, half>) {
-      x[i] = __half22float2(x_vec.elts[i]);
-      y[i] = __half22float2(y_vec.elts[i]);
-      x[i].x = silu(x[i].x) * y[i].x;
-      x[i].y = silu(x[i].y) * y[i].y;
-      x_vec.elts[i] = __float22half2_rn(x[i]);
-    } else {
-      x[i] = __bfloat1622float2(x_vec.elts[i]);
-      y[i] = __bfloat1622float2(y_vec.elts[i]);
-      x[i].x = silu(x[i].x) * y[i].x;
-      x[i].y = silu(x[i].y) * y[i].y;
-      x_vec.elts[i] = __float22bfloat162_rn(x[i]);
-    }
-  }
-}
-
 // Quantizes the provided PackedVec into the uint32_t output
 template <class Type, int SF_VEC_SIZE, bool UE8M0_SF>
 __device__ uint32_t cvt_warp_fp16_to_fp4(PackedVec<Type>& vec, float SFScaleVal, uint8_t* SFout) {
@@ -763,131 +738,298 @@ __device__ uint8_t* cvt_quant_get_sf_out_offset(std::optional<int> batchIdx, int
   return nullptr;
 }
 
-struct NoSiluPolicy {
-  static constexpr bool run_silu = false;
-  template <typename PackedVec>
-  __device__ static void maybe_silu(PackedVec&, const PackedVec&, bool) {}
-};
+template <BlockScaleQuantizationType quantization_type, class Type, int SF_VEC_SIZE, bool UE8M0_SF>
+__global__ void
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+__launch_bounds__(512, 4) quantize_with_block_size(
+#else
+quantize_with_block_size(
+#endif
+    int32_t numbatches, int32_t numRows, int32_t numCols, int32_t numPaddedCols, Type const* in,
+    float const* SFScale, uint32_t* out, uint32_t* SFout, QuantizationSFLayout layout) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 
-struct SiluPolicy {
-  static constexpr bool run_silu = true;
-  template <typename PackedVec>
-  __device__ static void maybe_silu(PackedVec& in_vec, const PackedVec& in_vec_mul, bool is_fp8) {
-    assert(!is_fp8);
-    silu_and_mul(in_vec, in_vec_mul);
-  }
-};
-template <BlockScaleQuantizationType quantization_type, class Type, int SF_VEC_SIZE, bool UE8M0_SF,
-          class Policy>
-__device__ inline void quantize_with_block_size_impl(int32_t numbatches, int32_t numRows,
-                                                     int32_t numCols, int32_t numPaddedCols,
-                                                     const Type* in, const float* SFScale,
-                                                     uint32_t* out, uint32_t* SFout,
-                                                     QuantizationSFLayout layout,
-                                                     const int32_t* mask) {
-  bool use_mask = mask != nullptr;
-  bool use_silu = Policy::run_silu;
+  // The elements per thread.
   static constexpr int ELTS_PER_THREAD = quantization_type == BlockScaleQuantizationType::FP8_TO_FP4
                                              ? CVT_FP8_TO_FP4_ELTS_PER_THREAD
                                              : CVT_ELTS_PER_THREAD;
 
   using PackedVec = PackedVec<Type>;
-  static constexpr int CVT_NUM_THREADS_PER_SF = SF_VEC_SIZE / ELTS_PER_THREAD;
+  static constexpr int CVT_NUM_THREADS_PER_SF = SF_VEC_SIZE / ELTS_PER_THREAD;  // 2 or 4
   static_assert(sizeof(PackedVec) == sizeof(Type) * ELTS_PER_THREAD, "Vec size is not matched.");
 
+  // Get the global scaling factor, which will be applied to the SF.
+  // Note SFScale is the same as next GEMM's alpha, which is (448.f / (Alpha_A / 6.f)).
+  float const SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[0];
+
+  // Is it swizzled layout?
   bool isSfSwizzledLayout = layout == QuantizationSFLayout::SWIZZLED_128x4 ||
                             layout == QuantizationSFLayout::SWIZZLED_8x4;
+
+  // The number of padded rows considering 128x4 or 8x4 SF layout.
   int rowTile = (layout == QuantizationSFLayout::SWIZZLED_128x4) ? 128 : 8;
   int numPaddedRowsForSf = isSfSwizzledLayout ? PadUpFn(numRows, rowTile) : numRows;
   int numColsForSf = isSfSwizzledLayout ? PadUpFn(numPaddedCols, 4 * SF_VEC_SIZE) : numPaddedCols;
 
+  // The number of threads in the column dimension。
+  // Note that numCols/numPaddedCols/numColsForSf are guaranteed to be multiples of ELTS_PER_THREAD.
   int numColThreads = numCols / ELTS_PER_THREAD;
-  int actualColsThreads = use_silu ? numColThreads * 2 : numColThreads;
   int numPaddedColThreads = numPaddedCols / ELTS_PER_THREAD;
   int numColThreadsForSf = numColsForSf / ELTS_PER_THREAD;
 
   asm volatile("griddepcontrol.wait;");
+
+  // Input tensor batch/row/col loops.
+  // Optimization: Iterate over actual rows first (hot path), then padding rows (cold path)
+  // This improves performance for small batch sizes with swizzled layout
   for (int rowIdx = blockIdx.x; rowIdx < numPaddedRowsForSf; rowIdx += gridDim.x) {
-    for (int batchIdx = 0; batchIdx < numbatches; batchIdx++) {
-      float const SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[batchIdx];
-      for (int colIdx = threadIdx.x; colIdx < numColThreadsForSf; colIdx += blockDim.x) {
-        std::optional<int> optionalBatchIdx = batchIdx;
-        std::optional<int> optionalNumRows = numRows;
+    // Early exit for padding-only blocks: if this block only processes padding rows,
+    // we can skip the batch loop and just zero out the scale factors
+    bool isRowPadding = (rowIdx >= numRows);
 
-        auto sf_out = cvt_quant_get_sf_out_offset<uint32_t, CVT_NUM_THREADS_PER_SF>(
-            optionalBatchIdx, rowIdx, colIdx, optionalNumRows, numPaddedCols / SF_VEC_SIZE, SFout,
-            layout);
+    if (isRowPadding) {
+      // Fast path: This row is entirely padding, only zero out scale factors.
+      // Note: Padding rows do NOT exist in the output tensor (which is sized [numRows, K]),
+      // they only exist in the swizzled scale factor layout. Do NOT write to output buffer here.
+      for (int batchIdx = 0; batchIdx < numbatches; batchIdx++) {
+        for (int colIdx = threadIdx.x; colIdx < numColThreadsForSf; colIdx += blockDim.x) {
+          std::optional<int> optionalBatchIdx = batchIdx;
+          std::optional<int> optionalNumRows = numRows;
 
-        int64_t inOffset =
-            static_cast<int64_t>(batchIdx * numRows + rowIdx) * actualColsThreads + colIdx;
-        int64_t outOffset =
-            static_cast<int64_t>(batchIdx * numRows + rowIdx) * numPaddedColThreads + colIdx;
+          // The SF output pointer.
+          auto sf_out = cvt_quant_get_sf_out_offset<uint32_t, CVT_NUM_THREADS_PER_SF>(
+              optionalBatchIdx, rowIdx, colIdx, optionalNumRows, numColsForSf / SF_VEC_SIZE, SFout,
+              layout);
 
-        if (rowIdx < numRows && colIdx >= numColThreads && colIdx < numPaddedColThreads) {
-          if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_FP4) {
-            reinterpret_cast<uint32_t*>(out)[outOffset] = 0u;
-          } else if constexpr (quantization_type == BlockScaleQuantizationType::FP8_TO_FP4 ||
-                               quantization_type == BlockScaleQuantizationType::FP16_TO_MXFP8) {
-            reinterpret_cast<uint64_t*>(out)[outOffset] = 0ull;
+          // Set the SF padding to 0.
+          if (sf_out != nullptr) {
+            sf_out[0] = 0x00;
           }
         }
+      }
+    } else {
+      // Normal path: This row contains actual data
+      for (int batchIdx = 0; batchIdx < numbatches; batchIdx++) {
+        for (int colIdx = threadIdx.x; colIdx < numColThreadsForSf; colIdx += blockDim.x) {
+          std::optional<int> optionalBatchIdx = batchIdx;
+          std::optional<int> optionalNumRows = numRows;
 
-        if (rowIdx >= numRows || colIdx >= numColThreads) {
-          if (sf_out != nullptr) sf_out[0] = 0x00;
-        } else {
-          if (use_mask && rowIdx >= mask[batchIdx]) continue;
+          // The SF output pointer.
+          auto sf_out = cvt_quant_get_sf_out_offset<uint32_t, CVT_NUM_THREADS_PER_SF>(
+              optionalBatchIdx, rowIdx, colIdx, optionalNumRows, numColsForSf / SF_VEC_SIZE, SFout,
+              layout);
 
-          PackedVec in_vec = reinterpret_cast<PackedVec const*>(in)[inOffset];
-          if (use_silu) {
-            PackedVec in_vec_mul = reinterpret_cast<PackedVec const*>(in)[inOffset + numColThreads];
-            Policy::maybe_silu(in_vec, in_vec_mul, std::is_same_v<Type, __nv_fp8_e4m3>);
+          // The input tensor offset.
+          int64_t inOffset =
+              static_cast<int64_t>(batchIdx * numRows + rowIdx) * numColThreads + colIdx;
+          int64_t outOffset =
+              static_cast<int64_t>(batchIdx * numRows + rowIdx) * numPaddedColThreads + colIdx;
+
+          // Set the values to 0 of those are padded columns.
+          if (colIdx >= numColThreads && colIdx < numPaddedColThreads) {
+            // Dispatch the quantization kernel.
+            if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_FP4) {
+              reinterpret_cast<uint32_t*>(out)[outOffset] = 0u;
+            } else if constexpr (quantization_type == BlockScaleQuantizationType::FP8_TO_FP4 ||
+                                 quantization_type == BlockScaleQuantizationType::FP16_TO_MXFP8) {
+              reinterpret_cast<uint64_t*>(out)[outOffset] = 0ull;
+            }
           }
 
-          if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_FP4) {
-            reinterpret_cast<uint32_t*>(out)[outOffset] =
-                cvt_warp_fp16_to_fp4<Type, SF_VEC_SIZE, UE8M0_SF>(in_vec, SFScaleVal, sf_out);
-          } else if constexpr (quantization_type == BlockScaleQuantizationType::FP8_TO_FP4) {
-            reinterpret_cast<uint64_t*>(out)[outOffset] =
-                cvt_warp_fp8_to_fp4<__nv_fp8_e4m3, SF_VEC_SIZE, UE8M0_SF>(in_vec, SFScaleVal,
-                                                                          sf_out);
-          } else if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_MXFP8) {
-            reinterpret_cast<uint64_t*>(out)[outOffset] =
-                cvt_warp_fp16_to_mxfp8<Type, SF_VEC_SIZE>(in_vec, sf_out);
+          // Process actual data or padding
+          if (colIdx >= numColThreads) {
+            // Column padding: Set the SF padding to 0.
+            if (sf_out != nullptr) {
+              sf_out[0] = 0x00;
+            }
+          } else {
+            // Load the input vector.
+            PackedVec in_vec = reinterpret_cast<PackedVec const*>(in)[inOffset];
+
+            // Dispatch the quantization kernel.
+            if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_FP4) {
+              reinterpret_cast<uint32_t*>(out)[outOffset] =
+                  cvt_warp_fp16_to_fp4<Type, SF_VEC_SIZE, UE8M0_SF>(in_vec, SFScaleVal, sf_out);
+            } else if constexpr (quantization_type == BlockScaleQuantizationType::FP8_TO_FP4) {
+              reinterpret_cast<uint64_t*>(out)[outOffset] =
+                  cvt_warp_fp8_to_fp4<__nv_fp8_e4m3, SF_VEC_SIZE, UE8M0_SF>(in_vec, SFScaleVal,
+                                                                            sf_out);
+            } else if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_MXFP8) {
+              reinterpret_cast<uint64_t*>(out)[outOffset] =
+                  cvt_warp_fp16_to_mxfp8<Type, SF_VEC_SIZE>(in_vec, sf_out);
+            }
           }
         }
       }
     }
   }
   asm volatile("griddepcontrol.launch_dependents;");
-}
-
-template <BlockScaleQuantizationType quantization_type, class Type, int SF_VEC_SIZE, bool UE8M0_SF>
-__global__ void
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-__launch_bounds__(512, 4)
-#endif
-    quantize_with_block_size(int32_t numbatches, int32_t numRows, int32_t numCols,
-                             int32_t numPaddedCols, const Type* in, const float* SFScale,
-                             uint32_t* out, uint32_t* SFout, QuantizationSFLayout layout,
-                             const int32_t* mask) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-  quantize_with_block_size_impl<quantization_type, Type, SF_VEC_SIZE, UE8M0_SF, NoSiluPolicy>(
-      numbatches, numRows, numCols, numPaddedCols, in, SFScale, out, SFout, layout, mask);
 #endif
 }
 
-template <BlockScaleQuantizationType quantization_type, class Type, int SF_VEC_SIZE, bool UE8M0_SF>
+template <class SFType, int CVT_FP4_NUM_THREADS_PER_SF>
+__device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(int rowIdx, int colIdx, int numCols,
+                                                       SFType* SFout) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  static_assert(CVT_FP4_NUM_THREADS_PER_SF == 1 || CVT_FP4_NUM_THREADS_PER_SF == 2);
+
+  // One pair of threads write one SF to global memory.
+  // TODO: stage through smem for packed STG.32
+  // is it better than STG.8 from 4 threads ?
+  if (threadIdx.x % CVT_FP4_NUM_THREADS_PER_SF == 0) {
+    // SF vector index (16 elements share one SF in the K dimension).
+    int32_t kIdx = colIdx / CVT_FP4_NUM_THREADS_PER_SF;
+    int32_t mIdx = rowIdx;
+
+    // SF layout [numMTiles, numKTiles, 32 (mTile), 4 (mTile), 4(kTile)]
+    // --> index [mTileIdx, kTileIdx, outerMIdx, innerMIdx, innerKIdx]
+
+    int32_t mTileIdx = mIdx / (32 * 4);
+    // SF vector size 16.
+    int factor = CVT_FP4_SF_VEC_SIZE * 4;
+    int32_t numKTiles = (numCols + factor - 1) / factor;
+    int64_t mTileStride = numKTiles * 32 * 4 * 4;
+
+    int32_t kTileIdx = (kIdx / 4);
+    int64_t kTileStride = 32 * 4 * 4;
+
+    // M tile layout [32, 4] is column-major.
+    int32_t outerMIdx = (mIdx % 32);
+    int64_t outerMStride = 4 * 4;
+
+    int32_t innerMIdx = (mIdx % (32 * 4)) / 32;
+    int64_t innerMStride = 4;
+
+    int32_t innerKIdx = (kIdx % 4);
+    int64_t innerKStride = 1;
+
+    // Compute the global offset.
+    int64_t SFOffset = mTileIdx * mTileStride + kTileIdx * kTileStride + outerMIdx * outerMStride +
+                       innerMIdx * innerMStride + innerKIdx * innerKStride;
+
+    return reinterpret_cast<uint8_t*>(SFout) + SFOffset;
+  }
+#endif
+  return nullptr;
+}
+
+__device__ __forceinline__ float silu(const float& val) { return val / (1.0f + __expf(-val)); }
+
+template <class Type>
+inline __device__ void silu_and_mul(PackedVec<Type>& x_vec, const PackedVec<Type>& y_vec) {
+  float2 x[CVT_FP4_ELTS_PER_THREAD / 2];
+  float2 y[CVT_FP4_ELTS_PER_THREAD / 2];
+
+#pragma unroll
+  for (int i = 0; i < CVT_FP4_ELTS_PER_THREAD / 2; i++) {
+    if constexpr (std::is_same_v<Type, half>) {
+      x[i] = __half22float2(x_vec.elts[i]);
+      y[i] = __half22float2(y_vec.elts[i]);
+      x[i].x = silu(x[i].x) * y[i].x;
+      x[i].y = silu(x[i].y) * y[i].y;
+      x_vec.elts[i] = __float22half2_rn(x[i]);
+    } else {
+      x[i] = __bfloat1622float2(x_vec.elts[i]);
+      y[i] = __bfloat1622float2(y_vec.elts[i]);
+      x[i].x = silu(x[i].x) * y[i].x;
+      x[i].y = silu(x[i].y) * y[i].y;
+      x_vec.elts[i] = __float22bfloat162_rn(x[i]);
+    }
+  }
+}
+
+// Use UE4M3 by default.
+template <class Type, bool UE8M0_SF = false>
 __global__ void
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-__launch_bounds__(512, 4)
+__launch_bounds__(512, 4) cvt_fp16_to_fp4_expert(
+#else
+cvt_fp16_to_fp4_expert(
 #endif
-    silu_mul_quantize_with_block_size(int32_t numbatches, int32_t numRows, int32_t numCols,
-                                      int32_t numPaddedCols, const Type* in, const float* SFScale,
-                                      uint32_t* out, uint32_t* SFout, QuantizationSFLayout layout,
-                                      const int32_t* mask) {
+    int32_t numRows, int32_t numCols, Type const* in, float const* SFScale, uint32_t* out,
+    uint32_t* SFout, int32_t* mask, bool use_silu_and_mul, int n_experts) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-  quantize_with_block_size_impl<quantization_type, Type, SF_VEC_SIZE, UE8M0_SF, SiluPolicy>(
-      numbatches, numRows, numCols, numPaddedCols, in, SFScale, out, SFout, layout, mask);
+  using PackedVec = PackedVec<Type>;
+  static constexpr int CVT_FP4_NUM_THREADS_PER_SF = (CVT_FP4_SF_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD);
+  static_assert(sizeof(PackedVec) == sizeof(Type) * CVT_FP4_ELTS_PER_THREAD,
+                "Vec size is not matched.");
+
+  // Input tensor row/col loops.
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  int stride = (gridDim.x * blockDim.x) / n_experts;
+  int remainder = (gridDim.x * blockDim.x) % n_experts;
+  int expert_idx;
+  int tid_in_expert;
+  int actual_stride;
+  if (remainder > 0) {
+    int bound = remainder * (stride + 1);
+    if (tid < bound) {
+      expert_idx = tid / (stride + 1);
+      tid_in_expert = tid % (stride + 1);
+      actual_stride = stride + 1;
+    } else {
+      expert_idx = remainder + (tid - bound) / stride;
+      tid_in_expert = (tid - bound) % stride;
+      actual_stride = stride;
+    }
+  } else {
+    expert_idx = tid / stride;
+    tid_in_expert = tid % stride;
+    actual_stride = stride;
+  }
+  int m = numRows / n_experts;
+  int padded_m = (m + (128 - 1)) / 128 * 128;
+
+  int colsPerRow = numCols / CVT_FP4_ELTS_PER_THREAD;
+  // TODO(kaixih@nvidia): For now, we assume mask is used together with
+  // silu_and_mal. Maybe we want a more general behavior of mask later. In the
+  // silu case, the input last dim doubles.
+  bool use_mask = mask != nullptr;
+  int actualColsPerRow = use_silu_and_mul ? colsPerRow * 2 : colsPerRow;
+
+  // Each global thread processes one element
+  for (int globalIdx = tid_in_expert + expert_idx * m * colsPerRow;
+       globalIdx < (expert_idx + 1) * m * colsPerRow; globalIdx += actual_stride) {
+    // Calculate which row and column this global thread should process
+    int rowIdx = globalIdx / colsPerRow;
+    int colIdx = globalIdx % colsPerRow;
+
+    // Find index within the experts
+    int rowIdx_in_expert = rowIdx - expert_idx * m;
+
+    // Early exit when using masks.
+    if (use_mask && rowIdx_in_expert >= mask[expert_idx]) {
+      break;
+    }
+
+    int64_t inOffset = rowIdx * actualColsPerRow + colIdx;
+    PackedVec in_vec = reinterpret_cast<PackedVec const*>(in)[inOffset];
+    if (use_silu_and_mul) {
+      PackedVec in_vec_mul = reinterpret_cast<PackedVec const*>(in)[inOffset + colsPerRow];
+      silu_and_mul(in_vec, in_vec_mul);
+    }
+
+    // Get the output tensor offset.
+    // Same as inOffset because 8 elements are packed into one uint32_t.
+    int64_t outOffset = rowIdx * colsPerRow + colIdx;
+    auto& out_pos = out[outOffset];
+
+    // Get the global scaling factor, which will be applied to the SF.
+    // Note SFScale is the same as next GEMM's alpha, which is
+    // (448.f / (Alpha_A / 6.f)).
+    float const SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[expert_idx];
+
+    int factor = CVT_FP4_SF_VEC_SIZE * 4;
+    // The actual output_scales dim is computed from the padded numCols.
+    int32_t numCols_padded = (numCols + factor - 1) / factor * factor;
+    int numCols_SFout = numCols_padded / CVT_FP4_SF_VEC_SIZE / 4;
+    uint32_t* SFout_in_expert = SFout + expert_idx * padded_m * numCols_SFout;
+
+    auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, CVT_FP4_NUM_THREADS_PER_SF>(
+        rowIdx_in_expert, colIdx, numCols, SFout_in_expert);
+
+    out_pos = cvt_warp_fp16_to_fp4<Type, CVT_FP4_SF_VEC_SIZE, UE8M0_SF>(in_vec, SFScaleVal, sf_out);
+  }
 #endif
 }
 

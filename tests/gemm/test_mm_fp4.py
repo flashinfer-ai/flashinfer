@@ -27,6 +27,12 @@ def test_mm_fp4(
     use_nvfp4 = fp4_type == "nvfp4"
 
     compute_capability = get_compute_capability(torch.device(device="cuda"))
+    compute_capability_number = compute_capability[0] * 10 + compute_capability[1]
+    if not mm_fp4.is_backend_supported(backend, compute_capability_number):
+        pytest.skip(
+            f"Skipping test for {backend} because it is not supported on compute capability {compute_capability_number}."
+        )
+
     if backend == "trtllm":
         if res_dtype == torch.float16:
             pytest.skip("Skipping test for trtllm fp4 with float16")

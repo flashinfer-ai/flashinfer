@@ -23,7 +23,6 @@
 #include "flashinfer/trtllm/fused_moe/DevKernel.h"
 #include "flashinfer/trtllm/fused_moe/RoutingKernel.h"
 #include "flashinfer/trtllm/fused_moe/runner.h"
-// #include <tensorrt_llm/common/assert.h>
 
 namespace tensorrt_llm {
 namespace kernels {
@@ -39,7 +38,9 @@ inline int32_t computeLog2(int32_t val, std::string const& name = "") {
   while (n >>= 1) {
     ++out;
   }
-  FLASHINFER_CHECK((1 << out) == val, "Expected ", name, " to be a power of 2, got ", val);
+  if ((1 << out) != val) {
+    out = -1;
+  }
   return out;
 }
 }  // namespace
@@ -55,22 +56,27 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
                  int32_t* expandedIdxToPermutedIdx, int32_t* permutedIdxToExpandedIdx,
                  int32_t* permutedIdxToTokenIdx, void* expertWeights, int32_t* numTokensPerExpert,
                  int32_t* ctaIdxXyToBatchIdx, int32_t* ctaIdxXyToMnLimit,
-                 int32_t* numNonExitingCtas, btg::Dtype dtypeElt, bool useRoutingScalesOnInput,
-                 bool useDeepSeekFp8, RoutingMethodType routingMethodType, cudaStream_t stream) {
+                 int32_t* numNonExitingCtas, btg::Dtype dtypeElt, btg::Dtype dtypeBias,
+                 bool useRoutingScalesOnInput, bool useDeepSeekFp8,
+                 RoutingMethodType routingMethodType, cudaStream_t stream) {
   if (routingMethodType == RoutingMethodType::DeepSeekV3) {
     FLASHINFER_CHECK(topK <= 8, "For DeepSeek routing method, must have topK <= 8");
     FLASHINFER_CHECK(topkGroup <= 4, "For DeepSeek routing method, must have topkGroup <= 4");
     moe::dev::routing::routingDeepSeek::Data routingData;
-    routingData.mDtypeExpW = btg::Dtype::Bfloat16;
+    routingData.mDtypeExpW =
+        btg::Dtype::Bfloat16;            // for DeepSeek, the expW is currently always bfloat16
+    routingData.mDtypeBias = dtypeBias;  // for DeepSeek, the bias can be bfloat16 or fp32
+
+    routingData.mDtypeScore = btg::Dtype::Fp32;  // for DeepSeek, the score is currently always fp32
     routingData.mUsePdl = true;
 
     // output:
-    routingData.mPtrExpertIdx = routingExpertIndexes;
+    routingData.mPtrTopKPacked = routingExpertIndexes;
     routingData.mPtrExpertCounts = expertCountHistogram;
     routingData.mPtrPermutedIdxSize = permutedIdxSize;
     routingData.mPtrExpandedIdxToPermutedIdx = expandedIdxToPermutedIdx;
     routingData.mPtrPermutedIdxToTokenIdx = permutedIdxToTokenIdx;
-    routingData.mPtrExpertWeights = expertWeights;
+    routingData.mPtrTopKWeights = expertWeights;
 
     routingData.mPtrCtaIdxXyToBatchIdx = ctaIdxXyToBatchIdx;
     routingData.mPtrCtaIdxXyToMnLimit = ctaIdxXyToMnLimit;
@@ -85,6 +91,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mNumLimitedGroups = topkGroup;
     routingData.mTopK = topK;
     routingData.mPaddingLog2 = computeLog2(mTileTokensDim);
+    routingData.mTileTokensDim = mTileTokensDim;
     routingData.mLocalExpertsStartIdx = localExpertOffset;
     routingData.mLocalExpertsStrideLog2 = 0;
     routingData.mNumLocalExperts = localNumExperts;
@@ -102,12 +109,12 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mUsePdl = true;
 
     // output:
-    routingData.mPtrExpertIdx = routingExpertIndexes;
+    routingData.mPtrTopKPacked = routingExpertIndexes;
     routingData.mPtrExpertCounts = expertCountHistogram;
     routingData.mPtrPermutedIdxSize = permutedIdxSize;
     routingData.mPtrExpandedIdxToPermutedIdx = expandedIdxToPermutedIdx;
     routingData.mPtrPermutedIdxToTokenIdx = permutedIdxToTokenIdx;
-    routingData.mPtrExpertWeights = expertWeights;
+    routingData.mPtrTopKWeights = expertWeights;
 
     routingData.mPtrCtaIdxXyToBatchIdx = ctaIdxXyToBatchIdx;
     routingData.mPtrCtaIdxXyToMnLimit = ctaIdxXyToMnLimit;
@@ -119,6 +126,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mNumExperts = numExperts;
     routingData.mTopK = topK;
     routingData.mPaddingLog2 = computeLog2(mTileTokensDim);
+    routingData.mTileTokensDim = mTileTokensDim;
     routingData.mLocalExpertsStartIdx = localExpertOffset;
     routingData.mLocalExpertsStrideLog2 = 0;
     routingData.mNumLocalExperts = localNumExperts;
@@ -144,12 +152,12 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     //
     // Outputs
     //
-    routingData.mPtrExpertIdx = routingExpertIndexes;
+    routingData.mPtrTopKPacked = routingExpertIndexes;
     routingData.mPtrExpertCounts = expertCountHistogram;
     routingData.mPtrPermutedIdxSize = permutedIdxSize;
     routingData.mPtrExpandedIdxToPermutedIdx = expandedIdxToPermutedIdx;
     routingData.mPtrPermutedIdxToTokenIdx = permutedIdxToTokenIdx;
-    routingData.mPtrExpertWeights = expertWeights;
+    routingData.mPtrTopKWeights = expertWeights;
 
     //
     // Grouped Gemm Launch Config Buffers
@@ -165,6 +173,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mNumExperts = numExperts;
     routingData.mTopK = topK;
     routingData.mPaddingLog2 = computeLog2(mTileTokensDim);
+    routingData.mTileTokensDim = mTileTokensDim;
     routingData.mLocalExpertsStartIdx = localExpertOffset;
     routingData.mLocalExpertsStrideLog2 = 0;
     routingData.mNumLocalExperts = localNumExperts;

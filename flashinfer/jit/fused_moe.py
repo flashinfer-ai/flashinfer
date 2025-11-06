@@ -17,10 +17,16 @@ limitations under the License.
 from typing import List
 
 from . import env as jit_env
-from ..artifacts import ArtifactPath, MetaInfoHash
-from .core import JitSpec, gen_jit_spec, current_compilation_context, sm90a_nvcc_flags
+from ..artifacts import ArtifactPath, CheckSumHash
+from .core import (
+    JitSpec,
+    gen_jit_spec,
+    current_compilation_context,
+    sm90a_nvcc_flags,
+    sm89_nvcc_flags,
+)
 from .cpp_ext import is_cuda_version_at_least
-from .cubin_loader import get_cubin
+from .cubin_loader import get_cubin, get_meta_hash
 from .gemm.cutlass.generate_kernels import generate_gemm_operations
 
 
@@ -69,6 +75,16 @@ def gen_cutlass_fused_moe_sm90_module(use_fast_build: bool = False) -> JitSpec:
         "-DUSING_OSS_CUTLASS_MOE_GEMM",
     ]
     return gen_cutlass_fused_moe_module(nvcc_flags, "90", use_fast_build)
+
+
+def gen_cutlass_fused_moe_sm89_module(use_fast_build: bool = False) -> JitSpec:
+    nvcc_flags = sm89_nvcc_flags + [
+        "-DENABLE_BF16",
+        "-DENABLE_FP8",
+        "-DENABLE_FP8_BLOCK_SCALE" if is_cuda_version_at_least("12.8") else "",
+        "-DUSING_OSS_CUTLASS_MOE_GEMM",
+    ]
+    return gen_cutlass_fused_moe_module(nvcc_flags, "89", use_fast_build)
 
 
 def gen_cutlass_fused_moe_module(
@@ -180,10 +196,16 @@ def gen_trtllm_gen_fused_moe_sm100_module() -> JitSpec:
     include_path = f"{ArtifactPath.TRTLLM_GEN_BMM}/include"
     header_name = "flashinferMetaInfo"
 
+    # Check if checksums.txt exists in the cubin directory
+    checksum_path = f"{ArtifactPath.TRTLLM_GEN_BMM}/checksums.txt"
+    checksum = get_cubin(checksum_path, CheckSumHash.TRTLLM_GEN_BMM)
+    assert checksum, f"Failed to get checksums.txt from {checksum_path}"
+    meta_hash = get_meta_hash(checksum)
+
     # use `get_cubin` to get "flashinferMetaInfo.h"
     metainfo = get_cubin(
         f"{include_path}/{header_name}.h",
-        MetaInfoHash.TRTLLM_GEN_BMM,
+        meta_hash,
     )
     # make sure "flashinferMetaInfo.h" is downloaded or cached
     assert metainfo, f"{header_name}.h not found"
@@ -211,11 +233,12 @@ def gen_trtllm_gen_fused_moe_sm100_module() -> JitSpec:
         ],
         extra_cuda_cflags=[
             "-DTLLM_GEN_EXPORT_INTERFACE",
+            "-DTLLM_GEN_EXPORT_FLASHINFER",
             "-DTLLM_ENABLE_CUDA",
             "-DENABLE_BF16",
             "-DENABLE_FP8",
             "-DENABLE_FP4",
-            f'-DTLLM_GEN_BMM_CUBIN_PATH=\\"{ArtifactPath.TRTLLM_GEN_BMM}\\"',
+            f'-DTLLM_GEN_GEMM_CUBIN_PATH=\\"{ArtifactPath.TRTLLM_GEN_BMM}\\"',
         ]
         + nvcc_flags,
         extra_include_paths=[

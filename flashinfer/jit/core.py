@@ -1,10 +1,11 @@
 import dataclasses
+import functools
 import logging
 import os
 from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Union
+from typing import Dict, List, Optional, Sequence, Union, Hashable
 
 import tvm_ffi
 from filelock import FileLock
@@ -60,6 +61,33 @@ class FlashInferJITLogger(logging.Logger):
             )
         )
 
+    def debug_once(self, msg: str, *args: Hashable) -> None:
+        """
+        As [`debug`][logging.Logger.debug], but subsequent calls with
+        the same message are silently dropped.
+        """
+        self._print_once(self.debug, msg, *args)
+
+    def info_once(self, msg: str, *args: Hashable) -> None:
+        """
+        As [`info`][logging.Logger.info], but subsequent calls with
+        the same message are silently dropped.
+        """
+        self._print_once(self.info, msg, *args)
+
+    def warning_once(self, msg: str, *args: Hashable) -> None:
+        """
+        As [`warning`][logging.Logger.warning], but subsequent calls with
+        the same message are silently dropped.
+        """
+        self._print_once(self.warning, msg, *args)
+
+    @functools.lru_cache(maxsize=None)
+    def _print_once(self, log_method, msg: str, *args: Hashable) -> None:
+        """Helper method to log messages only once per unique (msg, args) combination."""
+        # Note: stacklevel=3 to show the caller's location, not this helper method
+        log_method(msg, *args, stacklevel=3)
+
 
 logger = FlashInferJITLogger("flashinfer.jit")
 
@@ -89,6 +117,10 @@ def clear_cache_dir():
 common_nvcc_flags = [
     "-DFLASHINFER_ENABLE_FP8_E8M0",
     "-DFLASHINFER_ENABLE_FP4_E2M1",
+]
+sm89_nvcc_flags = [
+    "-gencode=arch=compute_89,code=sm_89",
+    "-DFLASHINFER_ENABLE_FP8_E8M0",
 ]
 sm90a_nvcc_flags = ["-gencode=arch=compute_90a,code=sm_90a"] + common_nvcc_flags
 sm100a_nvcc_flags = ["-gencode=arch=compute_100a,code=sm_100a"] + common_nvcc_flags
@@ -290,7 +322,10 @@ def gen_jit_spec(
     needs_device_linking: bool = False,
 ) -> JitSpec:
     check_cuda_arch()
-    verbose = os.environ.get("FLASHINFER_JIT_VERBOSE", "0") == "1"
+    # Use FLASHINFER_JIT_DEBUG if set, otherwise use FLASHINFER_JIT_VERBOSE (for backward compatibility)
+    debug_env = os.environ.get("FLASHINFER_JIT_DEBUG")
+    verbose_env = os.environ.get("FLASHINFER_JIT_VERBOSE", "0")
+    debug = (debug_env if debug_env is not None else verbose_env) == "1"
 
     cflags = ["-std=c++17", "-Wno-switch-bool"]
     cuda_cflags = [
@@ -302,7 +337,7 @@ def gen_jit_spec(
         "-DFLASHINFER_ENABLE_FP8_E4M3",
         "-DFLASHINFER_ENABLE_FP8_E5M2",
     ]
-    if verbose:
+    if debug:
         cflags += ["-O0", "-g"]
         cuda_cflags += [
             "-g",
@@ -310,7 +345,6 @@ def gen_jit_spec(
             "-G",
             "-lineinfo",
             "--ptxas-options=-v",
-            "--ptxas-options=--verbose,--register-usage-level=10,--warn-on-local-memory-usage",
             "-DCUTLASS_DEBUG_TRACE_LEVEL=2",
         ]
     else:

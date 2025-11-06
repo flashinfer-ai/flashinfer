@@ -61,6 +61,7 @@ def test_softmax(
         num_inf = torch.randint(0, logits.numel() - 1, (), device=logits.device).item()
         inf_idx = torch.randperm(logits.numel(), device=logits.device)[:num_inf]
         logits.view(-1).index_fill_(0, inf_idx, float("-inf"))
+        torch.cuda.synchronize()  # wait for the index_fill_ to finish because it can overlap with the softmax kernel
 
     if temperature_arr:
         temperature_arr = torch.full((batch_size,), temperature, device="cuda:0")

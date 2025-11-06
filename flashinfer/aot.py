@@ -67,7 +67,7 @@ from .jit.quantization import gen_quantization_module
 from .jit.rope import gen_rope_module
 from .jit.sampling import gen_sampling_module
 from .jit.tllm_utils import gen_trtllm_utils_module
-from .jit.xqa import gen_xqa_module
+from .jit.xqa import gen_xqa_module, gen_xqa_module_mla
 from .jit.attention import (
     gen_batch_attention_module,
     gen_batch_decode_module,
@@ -356,25 +356,31 @@ def gen_attention(
 
 
 def gen_xqa(
-    use_fp16_: List[bool],
+    input_type_: List[torch.dtype],
+    fp8_kv_cache_: List[bool],
     token_per_page_: List[int],
     head_size_: List[int],
     head_grp_size_: List[int],
     use_sliding_window_: List[bool],
     has_sm90: bool,
+    has_sm100: bool,
+    has_sm120: bool,
+    has_sm121: bool,
 ) -> Iterator[JitSpec]:
     """Generate XQA modules for various configurations."""
-    if not has_sm90:
+    if not has_sm90 and not has_sm100 and not has_sm120 and not has_sm121:
         return  # XQA requires SM90+
 
     for (
-        use_fp16,
+        input_type,
+        fp8_kv_cache,
         token_per_page,
         head_size,
         head_grp_size,
         use_sliding_window,
     ) in product(
-        use_fp16_,
+        input_type_,
+        fp8_kv_cache_,
         token_per_page_,
         head_size_,
         head_grp_size_,
@@ -386,13 +392,30 @@ def gen_xqa(
         if token_per_page not in [16, 32, 64, 128]:
             continue
 
+        if fp8_kv_cache:
+            kv_cache_dtype = torch.float8_e4m3fn
+        else:
+            kv_cache_dtype = input_type
+
         yield gen_xqa_module(
-            use_fp16=use_fp16,
-            token_per_page=token_per_page,
-            head_size=head_size,
-            head_grp_size=head_grp_size,
+            input_dtype=input_type,
+            kv_cache_dtype=kv_cache_dtype,
+            page_size=token_per_page,
+            head_dim=head_size,
+            head_group_ratio=head_grp_size,
             use_sliding_window=use_sliding_window,
         )
+
+    if has_sm120 or has_sm121:
+        for token_per_page in token_per_page_:
+            yield gen_xqa_module_mla(
+                input_dtype=torch.float8_e4m3fn,
+                kv_cache_dtype=torch.float8_e4m3fn,
+                page_size=token_per_page,
+                head_dim=576,
+                head_group_ratio=128,
+                use_sliding_window=False,
+            )
 
 
 def gen_all_modules(
@@ -506,21 +529,28 @@ def gen_all_modules(
         if has_sm90:
             jit_specs.append(gen_trtllm_utils_module())
 
-    if add_xqa:
+    if (
+        add_xqa and get_cuda_version() > Version("12.8")
+    ):  # TODO: Earlier cuda versions have compile issues, will be fixed in future releases
         # Define XQA configurations to iterate over
-        xqa_use_fp16_ = [True, False]  # fp16 and bf16
+        xqa_input_type_ = [torch.float16, torch.bfloat16]
+        xqa_fp8_kv_cache_ = [True, False]
         xqa_token_per_page_ = [16, 32, 64, 128]
         xqa_head_size_ = [64, 128, 256]
         xqa_head_grp_size_ = [1, 2, 4, 8]  # Different group sizes for MQA/GQA
 
         jit_specs += list(
             gen_xqa(
-                xqa_use_fp16_,
+                xqa_input_type_,
+                xqa_fp8_kv_cache_,
                 xqa_token_per_page_,
                 xqa_head_size_,
                 xqa_head_grp_size_,
                 use_sliding_window_,
                 has_sm90,
+                has_sm100,
+                has_sm120,
+                has_sm121,
             )
         )
 
