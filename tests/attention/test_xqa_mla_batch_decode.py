@@ -13,13 +13,11 @@ workspace_size = 128 * 1024 * 1024
     "batch_size",
     [1, 2, 4, 16, 32, 64, 128, 256, 512, 768, 1024],
 )
-@pytest.mark.parametrize("max_seq_len", [16, 256, 1024, 2048])
 @pytest.mark.parametrize("scale", [1.0, 0.5])
 @pytest.mark.parametrize("page_size", [32, 64, 128])
 @pytest.mark.parametrize("enable_pdl", [True, False, None])
 def test_xqa_mla_batch_decode(
     batch_size: int,
-    max_seq_len: int,
     scale: float,
     page_size: int,
     enable_pdl: bool,
