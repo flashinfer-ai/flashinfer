@@ -2312,12 +2312,14 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
       };
       return fn_list[static_cast<int>(activation_type.activation_type)];
     };
+#ifdef ENABLE_FP4
     auto NVFP4 = tensorrt_llm::common::ConstExprWrapper<
         TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType,
         TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4>{};
     auto MXFPX = tensorrt_llm::common::ConstExprWrapper<
         TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType,
         TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX>{};
+#endif
     auto NONE = tensorrt_llm::common::ConstExprWrapper<
         TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType,
         TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE>{};
