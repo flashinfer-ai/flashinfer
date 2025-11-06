@@ -547,7 +547,6 @@ class MnnvlMemory:  # type: ignore[no-redef]
 
 class McastDeviceMemory:
     """Python port of McastDeviceMemory from TensorRT-LLM"""
-
     def __init__(
         self,
         buf_size: int,
@@ -555,6 +554,7 @@ class McastDeviceMemory:
         group_rank: int,
         device_idx: int,
         is_multi_node: bool = True,
+        comm: Optional[CommBackend] = None,
     ):
         cu_device = checkCudaErrors(cuda.cuDeviceGet(device_idx))
 
@@ -631,7 +631,7 @@ class McastDeviceMemory:
                     "[McastDeviceMemory] Device does not support fabric handle."
                 )
 
-            self._alloc_mn_mcast_mem(buf_size)
+            self._alloc_mn_mcast_mem(buf_size, comm)
         else:
             # For single-node NVLS, would need to implement _alloc_nvls_mcast_mem
             raise NotImplementedError("Single-node NVLS allocation not implemented yet")
@@ -753,7 +753,7 @@ class McastDeviceMemory:
         """Get the total number of devices in the group"""
         return self.group_size
 
-    def _alloc_mn_mcast_mem(self, buf_size: int):
+    def _alloc_mn_mcast_mem(self, buf_size: int, comm: Any=MpiComm()):
         """Allocate multi-node multicast memory using MNNVL"""
 
         # Verify CUDA context
@@ -766,9 +766,6 @@ class McastDeviceMemory:
                 )
         except Exception as e:
             print(f"Error checking CUDA context: {e}")
-
-        # Get MPI communicator
-        comm = MpiComm()
 
         # Set up allocation properties
         handle_type = cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
@@ -969,6 +966,7 @@ class McastGPUBuffer:
         group_rank: int,
         device: torch.device,
         mn_nvlink: bool = True,
+        comm: Optional[CommBackend] = None,
     ):
         """
         Constructor for McastGpuBuffer.
@@ -981,7 +979,7 @@ class McastGPUBuffer:
             mn_nvlink: Flag indicating if multi-node NVLink is used
         """
         self.mcast_device_memory = McastDeviceMemory(
-            buf_size, group_size, group_rank, device.index, mn_nvlink
+            buf_size, group_size, group_rank, device.index, mn_nvlink, comm
         )
         self.buf_size = buf_size
         self.local_device = device
