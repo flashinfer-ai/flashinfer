@@ -33,7 +33,7 @@ CUDA_DEVICES = ["cuda:0"]
     scope="module",
 )
 def warmup_jit():
-    jit_specs = [flashinfer.gemm.gen_gemm_module()]
+    jit_specs = [flashinfer.jit.gemm.gen_gemm_module()]
     if is_sm90a_supported(torch.device("cuda:0")):
         jit_specs.append(flashinfer.gemm.gen_gemm_sm90_module())
     flashinfer.jit.build_jit_specs(jit_specs, verbose=False)
