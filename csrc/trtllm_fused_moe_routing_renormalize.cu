@@ -434,7 +434,7 @@ void run(Data const& data, void* stream) {
   TVM_FFI_ICHECK_EQ(data.mNumExperts % 4, 0)
       << "Routing kernel expects #experts " << data.mNumExperts << " to be a multiple of 4.";
 
-  // FIXME: routingIndicesBlockKernel brreaks the vllm + gpt-oss DeepEP
+  // FIXME: routingIndicesBlockKernel breaks the vllm + gpt-oss DeepEP
   // bool const useSingleBlock = data.mNumTokens <= BlockKernelMaxNumTokens;
   bool const useSingleBlock = false;
 
