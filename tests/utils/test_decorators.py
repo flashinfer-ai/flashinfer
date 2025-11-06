@@ -381,19 +381,39 @@ def test_heuristic_func():
     def _cudnn_check(x, backend):
         return x.shape[0] > 5
 
+    @supported_compute_capability([75, 80, 86, 89, 90, actual_capability])
+    def _trtllm_check(x, backend):
+        return x.shape[0] > 0
+
     def _heuristic_func(suitable_backends, x, backend):
-        return ["cudnn", "cutlass"]
+        # Cutlass fails check
+        assert "cutlass" not in suitable_backends
+
+        # Example: out of the supported backends in suitable_backends,
+        # cudnn is preferred over trtllm when shape[0] > 5
+        if x.shape[0] > 5:
+            return ["cudnn", "trtllm"]
+        else:
+            return ["trtllm", "cudnn"]
 
     @backend_requirement(
-        {"cutlass": _cutlass_check, "cudnn": _cudnn_check},
+        {"cutlass": _cutlass_check, "cudnn": _cudnn_check, "trtllm": _trtllm_check},
         heuristic_func=_heuristic_func,
     )
     def my_kernel(x, backend="auto"):
-        assert my_kernel.suitable_auto_backends[0] == "cudnn"
-        assert my_kernel.suitable_auto_backends[1] == "cutlass"
+        if x.shape[0] > 5:
+            assert my_kernel.suitable_auto_backends[0] == "cudnn"
+            assert my_kernel.suitable_auto_backends[1] == "trtllm"
+        else:
+            assert my_kernel.suitable_auto_backends[0] == "trtllm"
+            assert my_kernel.suitable_auto_backends[1] == "cudnn"
         return x * 2
 
-    x = torch.randn(6, 10, device="cuda")
+    x = torch.randn(8, 10, device="cuda")
+    result = my_kernel(x, backend="auto")
+    assert result.shape == x.shape
+
+    x = torch.randn(2, 10, device="cuda")
     result = my_kernel(x, backend="auto")
     assert result.shape == x.shape
 

@@ -1097,6 +1097,7 @@ def backend_requirement(
                                 f"Problem size is not supported for {func.__name__}"
                             )
                 else:
+                    # If the function doesnt have backends (i.e., there is only 1, implicit backend), run the following checks.
                     if not is_compute_capability_supported(capability):
                         raise BackendSupportedError(
                             f"{func.__name__} does not support compute capability {capability}"
@@ -1106,11 +1107,9 @@ def backend_requirement(
                             f"Problem size is not supported for {func.__name__}"
                         )
             elif skip_check and heuristic_func is not None:
-                bound_args = sig.bind(*args, **kwargs)
-                bound_args.apply_defaults()
-                kwargs_with_defaults = dict(bound_args.arguments)
-                # This needs to be called for heuristic function
-                suitable_auto_backends(*args, **kwargs)
+                if kwargs.get("backend") == "auto":
+                    # This needs to be called for heuristic function
+                    suitable_auto_backends(*args, **kwargs)
 
             return func(*args, **kwargs)
 
