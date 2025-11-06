@@ -71,7 +71,6 @@ void trtllm_allreduce_fusion(TensorView allreduce_in, int64_t world_size, int64_
     params.scale_factor = scale_factor.has_value()
                               ? reinterpret_cast<float*>(scale_factor.value().data_ptr())
                               : nullptr;
-    int token_num = params.size / params.hidden_dim;
     params.use_oneshot = use_oneshot;
     params.layout = layout_code.has_value() ? static_cast<QuantizationSFLayout>(layout_code.value())
                                             : QuantizationSFLayout::SWIZZLED_128x4;

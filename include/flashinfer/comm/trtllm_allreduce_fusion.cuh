@@ -1346,7 +1346,7 @@ int get_registers_per_thread_twoshot() {
   return attr.numRegs;
 }
 
-bool should_use_oneshot(int token_num) { return token_num <= details::kOneShotMaxToken; }
+bool use_oneshot(int token_num) { return token_num <= details::kOneShotMaxToken; }
 
 template <AllReduceFusionPattern Pattern, typename T, int NRanks, bool Fp32Acc>
 cudaError_t allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const& params,
