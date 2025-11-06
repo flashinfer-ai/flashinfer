@@ -30,8 +30,8 @@ using tvm::ffi::Optional;
 
 void trtllm_allreduce_fusion(TensorView allreduce_in, int64_t world_size, int64_t world_rank,
                              int64_t token_num, int64_t hidden_size, TensorView workspace_ptrs,
-                             bool launch_with_pdl, bool use_oneshot, bool trigger_completion_at_end,
-                             bool fp32_acc, int64_t pattern_code,
+                             bool launch_with_pdl, bool trigger_completion_at_end, bool fp32_acc,
+                             int64_t pattern_code, Optional<bool> use_oneshot,
                              Optional<TensorView> allreduce_out, Optional<TensorView> residual_in,
                              Optional<TensorView> residual_out, Optional<TensorView> norm_out,
                              Optional<TensorView> quant_out, Optional<TensorView> scale_out,
@@ -71,7 +71,8 @@ void trtllm_allreduce_fusion(TensorView allreduce_in, int64_t world_size, int64_
     params.scale_factor = scale_factor.has_value()
                               ? reinterpret_cast<float*>(scale_factor.value().data_ptr())
                               : nullptr;
-    params.use_oneshot = use_oneshot;
+    int token_num = params.size / params.hidden_dim;
+    params.use_oneshot = use_oneshot if use_oneshot.has_value() else should_use_oneshot(token_num);
     params.layout = layout_code.has_value() ? static_cast<QuantizationSFLayout>(layout_code.value())
                                             : QuantizationSFLayout::SWIZZLED_128x4;
     params.pattern = static_cast<AllReduceFusionPattern>(pattern_code);
