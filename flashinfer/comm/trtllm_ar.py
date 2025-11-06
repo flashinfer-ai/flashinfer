@@ -250,6 +250,10 @@ def get_trtllm_comm_module():
         scale_factor: Optional[Union[torch.Tensor, float]],
         layout_code: Optional[QuantizationSFLayout],
     ) -> None:
+        OneShotMaxToken = 128
+        if use_oneshot is None:
+            use_oneshot = token_num <= OneShotMaxToken
+
         module.trtllm_allreduce_fusion(
             allreduce_in,
             world_size,
@@ -258,10 +262,10 @@ def get_trtllm_comm_module():
             hidden_dim,
             workspace_ptrs,
             launch_with_pdl,
+            use_oneshot,
             trigger_completion_at_end,
             fp32_acc,
             pattern_code,
-            use_oneshot,
             allreduce_out,
             residual_in,
             residual_out,
