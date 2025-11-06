@@ -162,16 +162,18 @@ def dtype_str_to_torch_dtype(dtype_str):
 routine_cc_to_supported_backends = {
     # ATTENTION
     "BatchDecodeWithPagedKVCacheWrapper": {
+        # NOTE: trtllm-gen-native calls trtllm_batch_decode_with_kv_cache
         "7.5": ["fa2"],
         "8.0": ["fa2", "fa2_tc", "cudnn"],
         "8.6": ["fa2", "fa2_tc", "cudnn"],
         "8.9": ["fa2", "fa2_tc", "cudnn"],
-        "9.0": ["fa2", "fa2_tc", "cudnn"],
+        "9.0": ["fa2", "fa2_tc", "cudnn", "trtllm-gen-native"],
         "10.0": ["fa2", "fa2_tc", "cudnn", "trtllm-gen", "trtllm-gen-native"],
         "10.3": ["fa2", "fa2_tc", "cudnn", "trtllm-gen", "trtllm-gen-native"],
-        "12.0": ["fa2", "fa2_tc", "cudnn"],
+        "12.0": ["fa2", "fa2_tc", "cudnn", "trtllm-gen-native"],
     },
     "BatchPrefillWithPagedKVCacheWrapper": {
+        # NOTE: trtllm-gen-native calls trtllm_batch_context_with_kv_cache
         "7.5": [],
         "8.0": ["fa2", "cudnn"],
         "8.6": ["fa2", "cudnn"],
@@ -182,6 +184,7 @@ routine_cc_to_supported_backends = {
         "12.0": ["fa2", "cudnn"],
     },
     "BatchPrefillWithRaggedKVCacheWrapper": {
+        # NOTE: trtllm-gen-native calls trtllm_ragged_attention_deepseek
         "7.5": [],
         "8.0": ["fa2", "cudnn"],
         "8.6": ["fa2", "cudnn"],
@@ -192,6 +195,7 @@ routine_cc_to_supported_backends = {
         "12.0": ["fa2", "cudnn"],
     },
     "BatchMLAPagedAttentionWrapper": {
+        # NOTE: trtllm-gen-native calls trtllm_batch_decode_with_kv_cache_mla
         "7.5": [],
         "8.0": ["fa2"],
         "8.6": ["fa2"],
