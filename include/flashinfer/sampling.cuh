@@ -249,27 +249,31 @@ __device__ __forceinline__ std::tuple<float, float> GetMinMaxValue(float* in_dat
                                                                    TempStorage& temp_storage) {
   const uint32_t tx = threadIdx.x;
   vec_t<float, VEC_SIZE> in_data_vec;
-  float max_val = -cuda::std::numeric_limits<float>::infinity(),
-        min_val = cuda::std::numeric_limits<float>::infinity();
+  // Thread-local min/max accumulation (deferred reduction)
+  float thread_max = -cuda::std::numeric_limits<float>::infinity();
+  float thread_min = cuda::std::numeric_limits<float>::infinity();
+
   for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
     in_data_vec.fill(0);
     if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
       in_data_vec.cast_load(in_data + row_idx * d + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
     }
-    float in_data_[VEC_SIZE];
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-      in_data_[j] = in_data_vec[j];
+      thread_max = max(thread_max, static_cast<float>(in_data_vec[j]));
+      thread_min = min(thread_min, static_cast<float>(in_data_vec[j]));
     }
-    max_val = max(
-        max_val, BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
-                     .Reduce<VEC_SIZE>(in_data_, MaxReduceOp{}));
-    __syncthreads();
-    min_val = min(
-        min_val, BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
-                     .Reduce<VEC_SIZE>(in_data_, MinReduceOp{}));
-    __syncthreads();
   }
+
+  // Single block reduction after loop completes
+  float max_val =
+      BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
+          .Reduce(thread_max, MaxReduceOp{});
+  __syncthreads();
+  float min_val =
+      BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
+          .Reduce(thread_min, MinReduceOp{});
+
   if (tx == 0) {
     temp_storage.max_val = max_val;
     temp_storage.min_val = min_val;
@@ -288,22 +292,23 @@ __device__ __forceinline__ float GetMaxValue(float* in_data, uint32_t row_idx, u
   const uint32_t tx = threadIdx.x;
   vec_t<float, VEC_SIZE> in_data_vec;
 
-  float max_val = 0;
+  // Thread-local max accumulation (deferred reduction)
+  float thread_max = 0.0f;
   for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
     in_data_vec.fill(0);
     if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
       in_data_vec.cast_load(in_data + row_idx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
     }
-    float in_data_[VEC_SIZE];
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-      in_data_[j] = in_data_vec[j];
+      thread_max = max(thread_max, static_cast<float>(in_data_vec[j]));
     }
-    max_val = max(
-        max_val, BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
-                     .template Reduce<VEC_SIZE>(in_data_, MaxReduceOp{}));
-    __syncthreads();
   }
+
+  // Single block reduction after loop completes
+  float max_val =
+      BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
+          .Reduce(thread_max, MaxReduceOp{});
   if (tx == 0) {
     temp_storage.max_val = max_val;
   }
