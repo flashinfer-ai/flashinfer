@@ -364,31 +364,15 @@ def fp8_gemm_sm100(
     runner_names: List[str],
 ) -> None:
     runners = []
-    # No e5m2 for cutlass
-    is_e5m2 = a.dtype == torch.float8_e5m2 or b.dtype == torch.float8_e5m2
-    is_sm_supported = _match_sm_version(a.device, ["100", "103", "110"])
-    is_sm120_supported = _match_sm_version(a.device, ["120", "121"])
-
-    if "cutlass" in runner_names and not is_e5m2:
-        if is_sm_supported:
-            runners.append(
-                get_gemm_sm100_module_cutlass_fp8().cutlass_fp8_gemm_runner()
-            )
-        elif is_sm120_supported:
-            k_dim = a.shape[-1] if a.dim() == 2 else a.shape[2]
-            if k_dim >= 128:
-                runners.append(
-                    get_gemm_sm120_module_cutlass_fp8().cutlass_fp8_gemm_runner()
-                )
+    if "cutlass_sm10x" in runner_names:
+        runners.append(get_gemm_sm100_module_cutlass_fp8().cutlass_fp8_gemm_runner())
+    if "cutlass_sm12x" in runner_names:
+        runners.append(get_gemm_sm120_module_cutlass_fp8().cutlass_fp8_gemm_runner())
     if "cublas" in runner_names:
         runners.append(get_gemm_module().cublas_fp8_gemm_runner())
-    if CUDNN_AVAILABLE and "cudnn" in runner_names:
+    if "cudnn" in runner_names:
         runners.append(_cudnn_gemm_fp8_runner())
-
-    if len(runners) == 0:
-        major, minor = get_compute_capability(torch.device("cuda"))
-        raise ValueError(f"No valid runner found for current device sm{major}{minor}")
-
+    assert runners, "No suitable runners found"
     tuner = AutoTuner.get()
     a_tensor_index = 0
     out_tensor_index = 4
@@ -2013,6 +1997,101 @@ def mm_fp4(
     return out
 
 
+@supported_compute_capability([89, 90, 100, 103, 120, 121])
+def _cudnn_bmm_fp8_requirement(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    dtype: torch.dtype,
+    out: Optional[torch.Tensor] = None,
+    backend: Literal["cudnn", "cublas", "cutlass", "auto"] = "cublas",
+):
+    _check_cudnn_availability()
+    return True
+
+
+@supported_compute_capability([89, 90, 100, 103, 120, 121])
+def _cublas_bmm_fp8_requirement(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    dtype: torch.dtype,
+    out: Optional[torch.Tensor] = None,
+    backend: Literal["cudnn", "cublas", "cutlass", "auto"] = "cublas",
+):
+    return True
+
+
+@supported_compute_capability([100, 103, 110, 120, 121])
+def _cutlass_bmm_fp8_requirement(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    dtype: torch.dtype,
+    out: Optional[torch.Tensor] = None,
+    backend: Literal["cudnn", "cublas", "cutlass", "auto"] = "cublas",
+):
+    if A.dtype == torch.float8_e5m2 or B.dtype == torch.float8_e5m2:
+        raise ValueError("e5m2 is not supported for bmm_fp8 with cutlass backend")
+    return True
+
+
+def _check_bmm_fp8_problem_size(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    dtype: torch.dtype,
+    out: Optional[torch.Tensor] = None,
+    backend: Literal["cudnn", "cublas", "cutlass", "auto"] = "cublas",
+):
+    _validate_fp8_output_dtype(dtype)
+    return True
+
+
+def _heuristic_func_bmm_fp8(
+    suitable_backends: List[str],
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    dtype: torch.dtype,
+    out: Optional[torch.Tensor] = None,
+    backend: Literal["cudnn", "cublas", "cutlass", "auto"] = "cublas",
+):
+    # No e5m2 for cutlass
+    is_e5m2 = A.dtype == torch.float8_e5m2 or B.dtype == torch.float8_e5m2
+    is_sm_supported = _match_sm_version(A.device, ["100", "103", "110"])
+    is_sm120_supported = _match_sm_version(A.device, ["120", "121"])
+
+    # preserve order of ["cudnn", "cublas", "cutlass"]
+    heuristic_backends = []
+    if "cutlass" in suitable_backends and not is_e5m2:
+        if is_sm_supported:
+            heuristic_backends.append("cutlass_sm10x")
+        elif is_sm120_supported:
+            k_dim = A.shape[-1] if A.dim() == 2 else A.shape[2]
+            if k_dim >= 128:
+                heuristic_backends.append("cutlass_sm12x")
+    if "cublas" in suitable_backends:
+        heuristic_backends.append("cublas")
+    if CUDNN_AVAILABLE and "cudnn" in suitable_backends:
+        heuristic_backends.append("cudnn")
+    return heuristic_backends
+
+
+@backend_requirement(
+    {
+        "cudnn": _cudnn_bmm_fp8_requirement,
+        "cublas": _cublas_bmm_fp8_requirement,
+        "cutlass": _cutlass_bmm_fp8_requirement,
+    },
+    common_check=_check_bmm_fp8_problem_size,
+    heuristic_func=_heuristic_func_bmm_fp8,
+)
 def bmm_fp8(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -2077,7 +2156,6 @@ def bmm_fp8(
     >>> out.dtype
     torch.bfloat16
     """
-    _validate_fp8_output_dtype(dtype)
 
     if out is None:
         out = torch.empty(
@@ -2090,18 +2168,16 @@ def bmm_fp8(
         "bmm_fp8_workspace", DEFAULT_WORKSPACE_SIZE, A.device
     )
 
-    if backend == "cudnn":
-        backends = ["cudnn"]
-    elif backend == "cublas":
-        backends = ["cublas"]
+    if backend == "auto":
+        backends = bmm_fp8.suitable_auto_backends
     elif backend == "cutlass":
-        if A.dtype == torch.float8_e5m2 or B.dtype == torch.float8_e5m2:
-            raise ValueError("e5m2 is not supported for cutlass backend")
-        backends = ["cutlass"]
-    elif backend == "auto":
-        backends = ["cutlass", "cublas", "cudnn"]
+        backends = _heuristic_func_bmm_fp8(
+            ["cutlass"], A, B, A_scale, B_scale, dtype, out, backend
+        )
+    elif backend == "cudnn" and CUDNN_AVAILABLE:
+        backends = ["cudnn"]
     else:
-        raise ValueError(f"Unsupported backend: {backend}")
+        backends = [backend]
 
     fp8_gemm_sm100(A, B, A_scale, B_scale, out, workspace_buffer, backends)
     return out
