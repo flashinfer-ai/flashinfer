@@ -35,7 +35,7 @@ def normalize_backends(backends):
     for backend in backends:
         if backend == "trtllm-gen-native":
             print(
-                "[WARNING] Backend name 'trtllm-gen-native' has be renamed to 'trtllm-native' and will be removed in a future release. "
+                "[WARNING] Backend name 'trtllm-gen-native' has been renamed to 'trtllm-native' and will be removed in a future release. "
             )
             normalized.append("trtllm-native")
         else:
