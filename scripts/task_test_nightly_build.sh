@@ -12,6 +12,13 @@ set -x
 : ${DIST_JIT_CACHE_DIR:=dist-jit-cache}
 : ${DIST_PYTHON_DIR:=dist-python}
 
+# Clean Python bytecode cache to avoid stale imports (e.g., after module refactoring)
+echo "Cleaning Python bytecode cache..."
+find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+find . -type f -name '*.pyc' -delete 2>/dev/null || true
+echo "Cache cleaned."
+echo ""
+
 # Display GPU information (running inside Docker container with GPU access)
 echo "=== GPU Information ==="
 nvidia-smi

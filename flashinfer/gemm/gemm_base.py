@@ -22,7 +22,7 @@ from typing import List, Literal, Optional, Tuple
 from flashinfer.trtllm_low_latency_gemm import trtllm_low_latency_gemm
 import torch
 
-from .autotuner import (
+from ..autotuner import (
     AutoTuner,
     ConstraintSpec,
     DynamicTensorSpec,
@@ -30,11 +30,11 @@ from .autotuner import (
     TunableRunner,
     TuningConfig,
 )
-from .fused_moe.utils import (
+from ..fused_moe.utils import (
     get_last_power_of_2_num_tokens_buckets,
     last_positive_power_of_2,
 )
-from .utils import (
+from ..utils import (
     get_native_fp4_dtype,
     is_sm100a_supported,
     is_sm100f_supported,
@@ -44,16 +44,16 @@ from .utils import (
     backend_requirement,
     supported_compute_capability,
 )
-from .jit.gemm import gen_gemm_sm90_module
-from .jit.gemm import gen_gemm_module
-from .jit.gemm import gen_gemm_sm100_module
-from .jit.gemm import gen_gemm_sm120_module
-from .jit.gemm import gen_gemm_sm120_module_cutlass_fp4
-from .jit.gemm import gen_gemm_sm100_module_cutlass_fp4
-from .jit.gemm import gen_gemm_sm100_module_cutlass_fp8
-from .jit.gemm import gen_trtllm_gen_gemm_module
-from .jit.gemm import gen_tgv_gemm_sm10x_module
-from .jit.gemm import gen_deepgemm_sm100_module
+from ..jit.gemm import gen_gemm_sm90_module
+from ..jit.gemm import gen_gemm_module
+from ..jit.gemm import gen_gemm_sm100_module
+from ..jit.gemm import gen_gemm_sm120_module
+from ..jit.gemm import gen_gemm_sm120_module_cutlass_fp4
+from ..jit.gemm import gen_gemm_sm100_module_cutlass_fp4
+from ..jit.gemm import gen_gemm_sm100_module_cutlass_fp8
+from ..jit.gemm import gen_trtllm_gen_gemm_module
+from ..jit.gemm import gen_tgv_gemm_sm10x_module
+from ..jit.gemm import gen_deepgemm_sm100_module
 
 
 CUDNN_AVAILABLE = False
@@ -70,8 +70,8 @@ except OSError as e:
         raise
 
 
-from .jit.cubin_loader import setup_cubin_loader
-from .utils import (
+from ..jit.cubin_loader import setup_cubin_loader
+from ..utils import (
     _get_cache_buf,
     determine_gemm_backend,
     get_indptr,
@@ -733,7 +733,7 @@ def launch_compute_sm80_group_gemm_args(
     w_stride_data = torch.empty(batch_size, dtype=ld_type, device=device)
     y_stride_data = torch.empty(batch_size, dtype=ld_type, device=device)
 
-    from .triton.gemm import compute_sm80_group_gemm_args
+    from ..triton.gemm import compute_sm80_group_gemm_args
 
     compute_sm80_group_gemm_args[(batch_size,)](
         all_problems,
@@ -795,7 +795,7 @@ def launch_compute_sm90_group_gemm_args(
     w_stride_data = torch.empty(batch_size, dtype=stride_type, device=device)
     y_stride_data = torch.empty(batch_size, dtype=stride_type, device=device)
 
-    from .triton.gemm import compute_sm90_group_gemm_args
+    from ..triton.gemm import compute_sm90_group_gemm_args
 
     compute_sm90_group_gemm_args[(batch_size,)](
         all_problems,
@@ -2822,7 +2822,7 @@ group_gemm_mxfp4_nt_groupwise = group_gemm_mxfp8_mxfp4_nt_groupwise
 def pad_indptr_to_multiple_of_4(
     m_indptr: torch.Tensor,
 ):
-    from .triton.gemm import compute_padding_mapping
+    from ..triton.gemm import compute_padding_mapping
 
     batch_size = m_indptr.shape[0] - 1
     m = m_indptr[1:] - m_indptr[:-1]
