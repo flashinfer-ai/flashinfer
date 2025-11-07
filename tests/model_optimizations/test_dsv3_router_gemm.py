@@ -1,6 +1,6 @@
 import torch
 import pytest
-from flashinfer.dsv3_ops import routergemm_dsv3_hidden_7168_experts_256_tokens_lt16
+from flashinfer.dsv3_ops import mm_M1_16_K7168_N256
 import torch.nn.functional as F
 from flashinfer.utils import get_compute_capability
 
@@ -21,9 +21,7 @@ def test_dsv3_router_gemm_op(num_tokens, num_experts, hidden_dim, launch_with_pd
         num_experts, hidden_dim, device="cuda", dtype=torch.bfloat16
     ).t()  # column major
     out = torch.randn(num_tokens, num_experts, device="cuda", dtype=torch.float32)
-    routergemm_dsv3_hidden_7168_experts_256_tokens_lt16(
-        mat_a, mat_b, out, launch_with_pdl=launch_with_pdl
-    )
+    mm_M1_16_K7168_N256(mat_a, mat_b, out, launch_with_pdl=launch_with_pdl)
     ref = mat_a @ mat_b
 
     cos_sim = F.cosine_similarity(ref.reshape(-1), out.reshape(-1), dim=0)
@@ -136,6 +134,4 @@ def test_dsv3_router_gemm_op_negative(
     out = torch.randn(num_tokens, num_experts, device="cuda", dtype=out_dtype)
 
     with pytest.raises(ValueError, match=expected_error):
-        routergemm_dsv3_hidden_7168_experts_256_tokens_lt16(
-            mat_a, mat_b, out, launch_with_pdl=False
-        )
+        mm_M1_16_K7168_N256(mat_a, mat_b, out, launch_with_pdl=False)

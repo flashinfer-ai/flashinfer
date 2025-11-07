@@ -15,7 +15,7 @@ from .gemm_base import gemm_fp8_nt_groupwise as gemm_fp8_nt_groupwise
 from .gemm_base import group_gemm_fp8_nt_groupwise as group_gemm_fp8_nt_groupwise
 
 from .routergemm_dsv3 import (
-    routergemm_dsv3_hidden_7168_experts_256_tokens_lt16 as routergemm_dsv3_hidden_7168_experts_256_tokens_lt16,
+    mm_M1_16_K7168_N256 as mm_M1_16_K7168_N256,
 )
 
 __all__ = [
@@ -30,5 +30,5 @@ __all__ = [
     "gemm_fp8_nt_blockscaled",
     "gemm_fp8_nt_groupwise",
     "group_gemm_fp8_nt_groupwise",
-    "routergemm_dsv3_hidden_7168_experts_256_tokens_lt16",
+    "mm_M1_16_K7168_N256",
 ]

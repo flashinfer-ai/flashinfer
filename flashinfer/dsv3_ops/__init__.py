@@ -1,1 +1,5 @@
-from flashinfer.gemm import routergemm_dsv3_hidden_7168_experts_256_tokens_lt16
+from flashinfer.gemm import mm_M1_16_K7168_N256
+
+__all__ = [
+    "mm_M1_16_K7168_N256",
+]
