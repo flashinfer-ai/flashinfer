@@ -191,8 +191,6 @@ class FusedMoeLauncher {
       TVM_FFI_LOG_AND_THROW(NotImplementedError)
           << "Unsupported weight_layout: " << (int)weight_layout;
     }
-    TVM_FFI_ICHECK_EQ(weights.size(0), args->num_experts)
-        << which_weights << " weights expert dimension must match num_experts";
     if (which_weights == "gemm1") {
       TVM_FFI_ICHECK_EQ(Mn % 2, 0) << which_weights << " weights Mn dimension must be even.";
       TVM_FFI_ICHECK_EQ(args->intermediate_size, Mn / 2)

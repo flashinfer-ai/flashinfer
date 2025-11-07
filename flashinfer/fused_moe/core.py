@@ -46,6 +46,7 @@ from ..utils import (
     get_shuffle_matrix_sf_a_row_indices,
     register_custom_op,
     register_fake_op,
+    get_compute_capability,
 )
 from .utils import (
     get_last_power_of_2_num_tokens_buckets,
@@ -175,6 +176,39 @@ class GatedActType(IntEnum):
     SwiGlu = 0
     # GeGlu
     GeGlu = 1
+
+
+def is_flashinfer_trtllm_moe_supported(
+    dtype_weights: DtypeTrtllmGen,
+    dtype_act: DtypeTrtllmGen,
+    quant_method: Optional[str] = None,
+) -> bool:
+    arch = get_compute_capability(torch.cuda.current_device())
+    if arch[0] < 10:
+        return False
+    if dtype_weights not in [
+        DtypeTrtllmGen.Bfloat16,
+        DtypeTrtllmGen.E4m3,
+        DtypeTrtllmGen.E2m1,
+        DtypeTrtllmGen.MxE2m1,
+    ]:
+        return False
+    if (
+        dtype_weights == DtypeTrtllmGen.Bfloat16
+        and dtype_act != DtypeTrtllmGen.Bfloat16
+    ):
+        return False
+    if dtype_weights == DtypeTrtllmGen.E4m3 and dtype_act != DtypeTrtllmGen.E4m3:
+        return False
+    if dtype_weights == DtypeTrtllmGen.E2m1 and dtype_act != DtypeTrtllmGen.E2m1:
+        return False
+    if dtype_weights == DtypeTrtllmGen.MxE2m1 and dtype_act not in [
+        DtypeTrtllmGen.MxE2m1,
+        DtypeTrtllmGen.MxE4m3,
+        DtypeTrtllmGen.Bfloat16,
+    ]:
+        return False
+    return True
 
 
 def _maybe_get_cached_w3_w1_permute_indices(
