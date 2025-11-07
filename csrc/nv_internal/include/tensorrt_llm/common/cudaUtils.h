@@ -1181,6 +1181,9 @@ using Int = ConstExprWrapper<int, VALUE>;
 template <bool VALUE>
 using Bool = ConstExprWrapper<bool, VALUE>;
 
+template <bool VALUE>
+using ConstBool = ConstExprWrapper<bool, VALUE>;
+
 template <typename T>
 struct TmaDescType;
 
