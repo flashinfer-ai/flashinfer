@@ -66,19 +66,35 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
         hidden_states, hidden_states_scale = fp8_quantize(hidden_states)
         w13, w13_scale = fp8_quantize(w13)
         w2, w2_scale = fp8_quantize(w2)
-        hidden_states_scale = torch.full((hidden_size // 128, num_tokens), hidden_states_scale.item(), device=device)
-        w13_scale = torch.full((num_experts, intermediate_size * 2 // 128, hidden_size // 128), w13_scale.item(), device=device)
-        w2_scale = torch.full((num_experts, hidden_size // 128, intermediate_size // 128), w2_scale.item(), device=device)
+        hidden_states_scale = torch.full(
+            (hidden_size // 128, num_tokens), hidden_states_scale.item(), device=device
+        )
+        w13_scale = torch.full(
+            (num_experts, intermediate_size * 2 // 128, hidden_size // 128),
+            w13_scale.item(),
+            device=device,
+        )
+        w2_scale = torch.full(
+            (num_experts, hidden_size // 128, intermediate_size // 128),
+            w2_scale.item(),
+            device=device,
+        )
 
-    output1_scale_scalar = torch.tensor(
-        [hidden_states_scale * w13_scale] * num_experts, device=device
-    ) if not is_block_scale else None
-    output1_scales_gate_scalar = torch.ones(
-        num_experts, device=device, dtype=torch.float32
-    ) if not is_block_scale else None
-    output2_scale_scalar = torch.tensor(
-        [hidden_states_scale * w2_scale] * num_experts, device=device
-    ) if not is_block_scale else None
+    output1_scale_scalar = (
+        torch.tensor([hidden_states_scale * w13_scale] * num_experts, device=device)
+        if not is_block_scale
+        else None
+    )
+    output1_scales_gate_scalar = (
+        torch.ones(num_experts, device=device, dtype=torch.float32)
+        if not is_block_scale
+        else None
+    )
+    output2_scale_scalar = (
+        torch.tensor([hidden_states_scale * w2_scale] * num_experts, device=device)
+        if not is_block_scale
+        else None
+    )
 
     if is_block_scale:
         fn = lambda: trtllm_fp8_block_scale_moe(
@@ -101,9 +117,11 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
             None,  # tile_tokens_dim
             RoutingMethodType.DeepSeekV3.value,
             True,  # use_shuffled_weight
-            WeightLayout.BlockMajorK.value, # weight_layout
+            WeightLayout.BlockMajorK.value,  # weight_layout
             enable_pdl=enable_pdl,
-            tune_max_num_tokens=num_tokens if tune_max_num_tokens is None else tune_max_num_tokens,
+            tune_max_num_tokens=num_tokens
+            if tune_max_num_tokens is None
+            else tune_max_num_tokens,
         )
     else:
         fn = lambda: trtllm_fp8_per_tensor_scale_moe(
@@ -303,7 +321,13 @@ if __name__ == "__main__":
         "--quant-mode",
         type=str,
         default="MxFP4xMxFP8",
-        choices=["NvFP4xNvFP4", "MxFP4xMxFP8", "MxFP4xBf16", "Fp8-Per-Tensor", "Fp8-Block"],
+        choices=[
+            "NvFP4xNvFP4",
+            "MxFP4xMxFP8",
+            "MxFP4xBf16",
+            "Fp8-Per-Tensor",
+            "Fp8-Block",
+        ],
         help="Quantization mode",
     )
     parser.add_argument("--num-tokens", type=int, default=512, help="Number of tokens")
