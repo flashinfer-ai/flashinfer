@@ -19,6 +19,7 @@
 #include <cutlass/numeric_conversion.h>
 #include <cutlass/numeric_types.h>
 
+#include <algorithm>
 #include <cub/cub.cuh>
 #include <cuda/functional>
 #include <cuda/std/functional>
@@ -26,6 +27,7 @@
 
 #include "flashinfer/exception.h"
 #include "flashinfer/trtllm/fused_moe/DevKernel.h"
+#include "flashinfer/utils.cuh"
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -328,9 +330,10 @@ void run(Data const& data, void* stream) {
     constexpr int NUM_ELTS_PER_SF = 128;
     int const NUM_THREADS_PER_CTA = 128;
 
-    int const deviceId = 0;
+    int device{-1};
+    cudaGetDevice(&device);
     int numSms = 0;
-    cudaDeviceGetAttribute(&numSms, cudaDevAttrMultiProcessorCount, deviceId);
+    cudaDeviceGetAttribute(&numSms, cudaDevAttrMultiProcessorCount, device);
 
     // Output dimension is innerDim / 2, and each scale block is 128 elements
     int const outputDim = data.innerDim / 2;
@@ -348,7 +351,7 @@ void run(Data const& data, void* stream) {
       numTokensPerCta = 1;
     }
 
-    int const gridSizeY = (data.numTokens + numTokensPerCta - 1) / numTokensPerCta;
+    int const gridSizeY = std::min(8192, (data.numTokens + numTokensPerCta - 1) / numTokensPerCta);
 
     const dim3 grid(gridSizeX, gridSizeY, data.topK);
 
