@@ -2307,7 +2307,7 @@ def run_moe_test(
                 "top_k_groups": None,
                 "routed_scaling": None,
                 "has_routing_bias": False,
-                "routing_method_type": RoutingMethodType.RenormalizeNaive,
+                "routing_method_type": RoutingMethodType.Renormalize,
                 "compatible_moe_impls": [FP8BlockScaleMoe, FP4Moe, BF16Moe],
                 "compatible_intermediate_size": [384, 1024],
             },
