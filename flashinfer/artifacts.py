@@ -98,20 +98,6 @@ class ArtifactPath:
     DEEPGEMM: str = "a72d85b019dc125b9f711300cb989430f762f5a6/deep-gemm/"
 
 
-@dataclass(frozen=True)
-class MetaInfoHash:
-    DEEPGEMM: str = "f161e031826adb8c4f0d31ddbd2ed77e4909e4e43cdfc9728918162a62fcccfb"
-    TRTLLM_GEN_FMHA: str = (
-        "2b8a485f2af84768bc769e678eb6014a8181ad95a7ea9e699de5efca4b18ec6a"
-    )
-    TRTLLM_GEN_BMM: str = (
-        "6cfade1395f9648aba5dcf2c329114619e175c0f238882555178f98c8f5c1968"
-    )
-    TRTLLM_GEN_GEMM: str = (
-        "bd5c3227bec4f8d7a7d3a27fd7628e010d99a5c42651d0a6b97e146803e63340"
-    )
-
-
 class CheckSumHash:
     """
     This class is used to store the checksums of the cubin files in artifactory.
