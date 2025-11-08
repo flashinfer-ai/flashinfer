@@ -102,7 +102,7 @@ class ArtifactPath:
 class MetaInfoHash:
     DEEPGEMM: str = "f161e031826adb8c4f0d31ddbd2ed77e4909e4e43cdfc9728918162a62fcccfb"
     TRTLLM_GEN_FMHA: str = (
-        "bf45e2c21de9fbf5209bec3975b5ffe24b1d7a2e00aa40c548c992281864009f"
+        "4dfdcb9ec22a6cbf57e064048d755b00f5c086044f27b59ca4671a67c8f4f457"
     )
     TRTLLM_GEN_BMM: str = (
         "6cfade1395f9648aba5dcf2c329114619e175c0f238882555178f98c8f5c1968"
