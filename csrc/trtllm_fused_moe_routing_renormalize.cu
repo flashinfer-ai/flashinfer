@@ -143,6 +143,18 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts)
         }
       }
     }  // end if (validToken)
+  } else if (params.mPtrTopKPacked != nullptr) {
+    if (validToken) {
+      if (laneIdx < params.mTopK) {
+        int offset = warpIdx * MaxNumExperts +
+                     static_cast<int>(params.mPtrTopKPacked[warpIdx * params.mTopK + laneIdx].idx);
+        smemKIdx[offset] = static_cast<int8_t>(laneIdx);
+        if (params.mPtrTopKWeights != nullptr) {
+          params.mPtrTopKWeights[warpIdx * params.mTopK + laneIdx] =
+              static_cast<OutputT>(params.mPtrTopKPacked[warpIdx * params.mTopK + laneIdx].score);
+        }
+      }
+    }
   }
   __syncthreads();
 
@@ -165,14 +177,24 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts)
   }
   __syncthreads();
   // Get the number of CTAs and the offset for each CTA
-  const int32_t numCta = divUpLog2<int32_t>(accExpertCount, params.mPaddingLog2);
+  int32_t numCta;
+  if constexpr (KernelParams::isPow2) {
+    numCta = divUpLog2<int32_t>(accExpertCount, params.mPaddingLog2);
+  } else {
+    numCta = divUpTileN<int32_t>(accExpertCount, params.mTileTokensDim);
+  }
   int32_t ctaOffset = 0;
   int32_t numNonExitingCtas;
   Scan(tempStorage).ExclusiveSum(numCta, ctaOffset, numNonExitingCtas);
 
   int32_t expertScanCounts = 0;
-  Scan(tempStorage)
-      .ExclusiveSum(divUpMulLog2(accExpertCount, params.mPaddingLog2), expertScanCounts);
+  int32_t tmpCount;
+  if constexpr (KernelParams::isPow2) {
+    tmpCount = divUpMulLog2<int32_t>(accExpertCount, params.mPaddingLog2);
+  } else {
+    tmpCount = divUpMulTileN<int32_t>(accExpertCount, params.mTileTokensDim);
+  }
+  Scan(tempStorage).ExclusiveSum(tmpCount, expertScanCounts);
   __syncthreads();
 
   if (isLocalExpert) {
@@ -180,15 +202,27 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts)
       const int32_t localExpertIdx =
           (expert - params.mLocalExpertsStartIdx) >> params.mLocalExpertsStrideLog2;
       params.mPtrCtaIdxXyToBatchIdx[ctaOffset + cta] = localExpertIdx;
-      params.mPtrCtaIdxXyToMnLimit[ctaOffset + cta] =
-          min(mulLog2<int32_t>(ctaOffset + cta + 1, params.mPaddingLog2),
-              mulLog2<int32_t>(ctaOffset, params.mPaddingLog2) + accExpertCount);
+      int32_t mnLimit1;
+      int32_t mnLimit2;
+      if constexpr (KernelParams::isPow2) {
+        mnLimit1 = mulLog2<int32_t>(ctaOffset + cta + 1, params.mPaddingLog2);
+        mnLimit2 = mulLog2<int32_t>(ctaOffset, params.mPaddingLog2) + accExpertCount;
+      } else {
+        mnLimit1 = mulTileN<int32_t>(ctaOffset + cta + 1, params.mTileTokensDim);
+        mnLimit2 = mulTileN<int32_t>(ctaOffset, params.mTileTokensDim) + accExpertCount;
+      }
+      params.mPtrCtaIdxXyToMnLimit[ctaOffset + cta] = min(mnLimit1, mnLimit2);
     }
   }
 
   // at this point, we can write out padded count
   if (threadIdx.x == 0) {
-    const int32_t permutedIdxSize = mulLog2<int32_t>(numNonExitingCtas, params.mPaddingLog2);
+    int32_t permutedIdxSize;
+    if constexpr (KernelParams::isPow2) {
+      permutedIdxSize = mulLog2<int32_t>(numNonExitingCtas, params.mPaddingLog2);
+    } else {
+      permutedIdxSize = mulTileN<int32_t>(numNonExitingCtas, params.mTileTokensDim);
+    }
     params.mPtrPermutedIdxSize[0] = permutedIdxSize;
     params.mPtrNumNonExitingCtas[0] = numNonExitingCtas;
   }
@@ -399,10 +433,10 @@ void run(Data const& data, void* stream) {
       << NumExpertsLimit << ".";
   TVM_FFI_ICHECK_EQ(data.mNumExperts % 4, 0)
       << "Routing kernel expects #experts " << data.mNumExperts << " to be a multiple of 4.";
-  TVM_FFI_ICHECK_LE(data.mPaddingLog2, 8)
-      << "Routing kernel expects padding log2 < 8, got " << data.mPaddingLog2;
 
-  bool const useSingleBlock = data.mNumTokens <= BlockKernelMaxNumTokens;
+  // FIXME: routingIndicesBlockKernel breaks the vllm + gpt-oss DeepEP
+  bool const useSingleBlock =
+      data.mNumTokens <= BlockKernelMaxNumTokens && data.mPtrTopKPacked == nullptr;
 
   bool const useSingleCluster =
       data.mNumTokens <= ((data.mPtrScores != nullptr || data.mPtrTopKIds != nullptr)

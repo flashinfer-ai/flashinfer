@@ -296,7 +296,7 @@ void moePrepareOp(TensorView expertsIds, Optional<TensorView> scales,
     CHECK_INPUT_TYPE(scales.value(), dl_float32);
     scalesPtr = static_cast<float*>(scales.value().data_ptr());
     CHECK_DEVICE(preparedLocalScales.value(), expertsIds);
-    CHECK_INPUT_TYPE(preparedLocalScales.value(), dl_int32);
+    CHECK_INPUT_TYPE(preparedLocalScales.value(), dl_float32);
     TVM_FFI_ICHECK_EQ(preparedLocalScales.value().ndim(), 2);
     TVM_FFI_ICHECK_EQ(preparedLocalScales.value().size(0), maxTokenCountPerRank * epSize);
     TVM_FFI_ICHECK_EQ(preparedLocalScales.value().size(1), topK);

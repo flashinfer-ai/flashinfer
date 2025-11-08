@@ -115,8 +115,7 @@ void launchMHA(
     BeamSearchParams const& beamSearchParams,
 #endif
     uint32_t batchSize,
-    float const* __restrict__ kvCacheScale,  // Device memory scalar. Same scale for K and V cache.
-                                             // Used only for int8/fp8 KV cache.
+    float kvCacheScale,  // Same scale for K and V cache. Used only for int8/fp8 KV cache.
 #if SPEC_DEC
     SpecDecParams const& specDecParams,
 #endif
@@ -131,7 +130,7 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
                          InputHead const* q, float const* attentionSinks, GMemCacheHead* kCacheVLLM,
                          GMemCacheHead* vCacheVLLM, KVCachePageIndex const* kvCachePageList,
                          uint32_t maxSeqLen, uint32_t const* seqLen, uint32_t batchSize,
-                         float const* __restrict__ kvCacheScale,
+                         float kvCacheScale,
 #if SPEC_DEC
                          uint32_t qSeqLen, uint32_t const* qCuSeqLens, MaskType const* mask,
 #endif
@@ -166,8 +165,7 @@ void launchHopperF8MHA(
     BeamSearchParams const& beamSearchParams,
 #endif
     uint32_t batchSize,
-    float const* __restrict__ kvCacheScale,  // Device memory scalar. Same scale for K and V cache.
-                                             // Used only for int8/fp8 KV cache.
+    float kvCacheScale,  // Same scale for K and V cache. Used only for int8/fp8 KV cache.
 #if SPEC_DEC
     SpecDecParams const& specDecParams,
 #endif
@@ -181,8 +179,7 @@ void launchHopperF8MHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads
                                  InputHead const* q, float const* attentionSinks,
                                  GMemCacheHead* kCacheVLLM, GMemCacheHead* vCacheVLLM,
                                  KVCachePageIndex const* kvCachePageList, uint32_t maxSeqLen,
-                                 uint32_t const* seqLen, uint32_t batchSize,
-                                 float const* __restrict__ kvCacheScale,
+                                 uint32_t const* seqLen, uint32_t batchSize, float kvCacheScale,
 #if SPEC_DEC
                                  uint32_t qSeqLen, uint32_t const* qCuSeqLens, MaskType const* mask,
 #endif
@@ -197,11 +194,10 @@ void launchMLA(
     GMemCacheHead* vCacheVLLM,
     KVCachePageIndex const*
         kvCachePageList,  // device pointer. shape:
-                          // KVCachePage[batchSize][beamWidth][2][maxNbPagesPerSeq] (Layout 0) or
-                          // [batchSize][maxNbPagesPerSeq] (Layout 1)
+                          // KVCachePage[batchSize][beamWidth][2][maxNbPagesPerSeq]
+                          // (Layout 0) or [batchSize][maxNbPagesPerSeq] (Layout 1)
     uint32_t maxSeqLen, uint32_t const* seqLen, uint32_t batchSize,
-    float const* __restrict__ kvCacheScale,  // Device memory scalar. Same scale for K and V cache.
-                                             // Used only for int8/fp8 KV cache.
+    float kvCacheScale,  // Same scale for K and V cache. Used only for int8/fp8 KV cache.
     uint32_t* semaphores, void* scratch, bool enable_pdl, cudaStream_t stream);
 
 void launchMLAFlashInfer(
@@ -214,8 +210,7 @@ void launchMLAFlashInfer(
                           // KVCachePage[batchSize][beamWidth][2][maxNbPagesPerSeq] (Layout 0) or
                           // [batchSize][maxNbPagesPerSeq] (Layout 1)
     uint32_t maxSeqLen, uint32_t const* seqLen, uint32_t batchSize,
-    float const* __restrict__ kvCacheScale,  // Device memory scalar. Same scale for K and V cache.
-                                             // Used only for int8/fp8 KV cache.
+    float kvCacheScale,  // Same scale for K and V cache. Used only for int8/fp8 KV cache.
     uint32_t* semaphores, void* scratch, bool enable_pdl, uint64_t kv_stride_page,
     uint64_t kv_stride_token, uint64_t kv_stride_head, cudaStream_t stream);
 

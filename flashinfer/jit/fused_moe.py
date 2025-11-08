@@ -233,11 +233,12 @@ def gen_trtllm_gen_fused_moe_sm100_module() -> JitSpec:
         ],
         extra_cuda_cflags=[
             "-DTLLM_GEN_EXPORT_INTERFACE",
+            "-DTLLM_GEN_EXPORT_FLASHINFER",
             "-DTLLM_ENABLE_CUDA",
             "-DENABLE_BF16",
             "-DENABLE_FP8",
             "-DENABLE_FP4",
-            f'-DTLLM_GEN_BMM_CUBIN_PATH=\\"{ArtifactPath.TRTLLM_GEN_BMM}\\"',
+            f'-DTLLM_GEN_GEMM_CUBIN_PATH=\\"{ArtifactPath.TRTLLM_GEN_BMM}\\"',
         ]
         + nvcc_flags,
         extra_include_paths=[

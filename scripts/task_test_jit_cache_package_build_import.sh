@@ -28,6 +28,12 @@ export MAX_JOBS
 : ${CUDA_VISIBLE_DEVICES:=""}
 echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES}"
 
+# Clean Python bytecode cache to avoid stale imports (e.g., after module refactoring)
+echo "Cleaning Python bytecode cache..."
+find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+find . -type f -name '*.pyc' -delete 2>/dev/null || true
+echo "Cache cleaned."
+
 echo ""
 echo "Detecting CUDA architecture list..."
 export FLASHINFER_CUDA_ARCH_LIST=$(python3 -c '

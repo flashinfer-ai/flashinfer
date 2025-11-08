@@ -29,7 +29,6 @@ props = torch.cuda.get_device_properties(0)
 sm_count = props.multi_processor_count
 
 beam_width = 1
-q_scale = 1.0
 
 
 class CacheSeq:
@@ -181,6 +180,8 @@ def ref_attention(
 @pytest.mark.parametrize("valid_elems_per_head", [32, 128])
 @pytest.mark.parametrize("head_grp_size", [8, 16])
 @pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
+@pytest.mark.parametrize("kv_scale", [1.0, 0.5])
+@pytest.mark.parametrize("q_scale", [1.0, 0.5])
 def test_xqa(
     batch_size,
     nb_k_heads,
@@ -194,7 +195,11 @@ def test_xqa(
     use_sliding_window,
     enable_pdl,
     kv_layout,
+    kv_scale,
+    q_scale,
 ):
+    if kv_scale != 1.0 and fp8_kv_cache is False:
+        pytest.skip("kv cache scale works only for fp8 kv cache")
     set_random_seed(42)
 
     nb_q_heads = nb_k_heads * head_grp_size
@@ -347,7 +352,7 @@ def test_xqa(
     )
     seq_len_list.fill_(seq_len)
 
-    kv_cache_scale = torch.ones(1, dtype=torch.float32, device="cuda")
+    kv_cache_scale = kv_scale
 
     nb_seq = nb_k_heads * batch_size
     nb_semaphores = round_up(nb_seq, 2) + 2 + nb_seq + 2
@@ -406,7 +411,7 @@ def test_xqa(
                     v_cache_seq=v_cache_seq,
                     seq_len=seq_len,
                     q_scale=q_scale,
-                    kv_scale=kv_cache_scale[0],
+                    kv_scale=kv_cache_scale,
                     x_scale=1.0,
                     attention_sinks=attention_sinks[idx_k_head, :]
                     if use_attention_sinks
@@ -443,6 +448,8 @@ def test_xqa(
     get_compute_capability(torch.device(device="cuda"))[0] not in [12],
     reason="XQA mla is only supported on SM120 GPUs",
 )
+@pytest.mark.parametrize("kv_scale", [1.0, 0.5])
+@pytest.mark.parametrize("q_scale", [1.0, 0.5])
 @pytest.mark.parametrize("enable_pdl", [True, False])
 @pytest.mark.parametrize("seq_len", [2, 15, 256, 514, 2048])
 @pytest.mark.parametrize("batch_size", [1, 2])
@@ -451,6 +458,8 @@ def test_xqa_mla(
     batch_size,
     seq_len,
     tokens_per_page,
+    kv_scale,
+    q_scale,
     enable_pdl,
 ):
     set_random_seed(42)
@@ -570,7 +579,7 @@ def test_xqa_mla(
     )
     seq_len_list.fill_(seq_len)
 
-    kv_cache_scale = torch.ones(1, dtype=torch.float32, device="cuda")
+    kv_cache_scale = kv_scale
 
     nb_seq = nb_k_heads * batch_size
     nb_semaphores = round_up(nb_seq, 2) + 2 + nb_seq + 2
@@ -623,7 +632,7 @@ def test_xqa_mla(
                     v_cache_seq=v_cache_seq,
                     seq_len=seq_len,
                     q_scale=q_scale * math.sqrt(576),
-                    kv_scale=kv_cache_scale[0],
+                    kv_scale=kv_cache_scale,
                     x_scale=1.0,
                     attention_sinks=None,
                     sliding_win_size=0,

@@ -1301,8 +1301,7 @@ CUBIN_EXPORT __global__
 #endif
 #endif
         uint32_t const batchSize,
-        float const* __restrict__ kvCacheScale,  // Device memory scalar. Same scale for K and V
-                                                 // cache. Used only for int8/fp8 KV cache.
+        float kvCacheScale,  // Same scale for K and V cache. Used only for int8/fp8 KV cache.
         uint32_t kv_stride_page, uint32_t kv_stride_token, uint32_t kv_stride_head,
         uint32_t* __restrict__ semaphores = nullptr, void* __restrict__ scratch = nullptr) {
   assert(allowMultiBlockMode || gridDim.x == 1);
@@ -1503,7 +1502,7 @@ CUBIN_EXPORT __global__
   };
   if (warpIdx.z == 0) {
     float const qkScale =
-        qScale * (isKVCacheQuantized ? kvCacheScale[0] : 1.f) *
+        qScale * (isKVCacheQuantized ? kvCacheScale : 1.f) *
         rsqrtf(validElemsPerHead);  // qkScale is applied onto Q*K.T before softmax.
     CircIdx<nbKBuffers> idxCurrSMemKBuf{nbKBuffers - 1};
     auto const getSMemKTile = [&](uint32_t idx) -> SharedMem::KSmemBuffer& {
@@ -2156,7 +2155,7 @@ CUBIN_EXPORT __global__
       }
     }
 
-    float voScale = (isKVCacheQuantized ? kvCacheScale[0] : 1.F);
+    float voScale = (isKVCacheQuantized ? kvCacheScale : 1.F);
     if (seqIterInit < nbSeqIters) {  // otherwise rcpRowSum will be NAN.
       // The attention sinks are moved to the multi-block reduction part if the multi-block is
       // enabled.
@@ -2410,8 +2409,7 @@ CUBIN_EXPORT __global__ __launch_bounds__(256, nbCtaPerSM) void kernel_mha(
     BeamSearchParams const beamSearchParams,
 #endif
     uint32_t const batchSize,
-    float const* __restrict__ kvCacheScale,  // Device memory scalar. Same scale for K and V cache.
-                                             // Used only for int8/fp8 KV cache.
+    float kvCacheScale,  // Same scale for K and V cache. Used only for int8/fp8 KV cache.
     uint32_t kv_stride_page, uint32_t kv_stride_token, uint32_t kv_stride_head,
     uint32_t* __restrict__ semaphores = nullptr, void* __restrict__ scratch = nullptr) {
 #if SPEC_DEC
@@ -2469,8 +2467,7 @@ void launchMHA(
     BeamSearchParams const& beamSearchParams,
 #endif
     uint32_t batchSize,
-    float const* __restrict__ kvCacheScale,  // Device memory scalar. Same scale for K and V cache.
-                                             // Used only for int8/fp8 KV cache.
+    float kvCacheScale,  // Same scale for K and V cache. Used only for int8/fp8 KV cache.
 #if SPEC_DEC
     SpecDecParams const& specDecParams,
 #endif
@@ -2571,7 +2568,7 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
                          InputHead const* q, float const* attentionSinks, GMemCacheHead* kCacheVLLM,
                          GMemCacheHead* vCacheVLLM, KVCachePageIndex const* kvCachePageList,
                          uint32_t maxSeqLen, uint32_t const* seqLen, uint32_t batchSize,
-                         float const* __restrict__ kvCacheScale,
+                         float kvCacheScale,
 #if SPEC_DEC
                          uint32_t qSeqLen, uint32_t const* qCuSeqLens, MaskType const* mask,
 #endif
