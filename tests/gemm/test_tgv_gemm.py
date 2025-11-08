@@ -6,7 +6,7 @@ from flashinfer import (
     tgv_gemm_sm100,
 )
 
-from flashinfer.gemm import _match_sm_version
+from flashinfer.gemm.gemm_base import _match_sm_version
 
 
 @pytest.mark.parametrize("m", [1, 8, 16, 32, 64])

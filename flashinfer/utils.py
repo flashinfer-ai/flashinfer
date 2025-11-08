@@ -854,7 +854,9 @@ def supported_compute_capability(supported_ccs: Iterable[int]) -> Callable:
 
 
 def backend_requirement(
-    backend_checks: Dict[str, Callable], common_check: Optional[Callable] = None
+    backend_checks: Dict[str, Callable],
+    common_check: Optional[Callable] = None,
+    heuristic_func: Optional[Callable] = None,
 ) -> Callable:
     """
     Decorator to enforce backend and problem size requirements for kernel functions.
@@ -1018,6 +1020,47 @@ def backend_requirement(
             # Whether the given backend exists in the API
             return backend in backend_checks
 
+        def suitable_auto_backends(cc, *args, **kwargs):
+            if common_check is not None and not common_check(*args, **kwargs):
+                return False
+            suitable_backends = []
+            # Check for each backend support
+            for backend in backend_checks:
+                req_checker = backend_checks[backend]
+                try:
+                    if req_checker(
+                        *args, **kwargs
+                    ) and req_checker.is_compute_capability_supported(cc):
+                        suitable_backends.append(backend)
+                except ValueError:
+                    continue
+            # If a heuristic function is provided, filter the suitable backends based on the heuristic function
+            if heuristic_func is not None:
+                suitable_backends = heuristic_func(suitable_backends, *args, **kwargs)
+            if not suitable_backends:
+                return False
+            wrapper.suitable_auto_backends = suitable_backends
+            return True
+
+        def _get_capability(*args, **kwargs):
+            capability = None
+            # Find the first tensor argument.
+            # Assume all tensors are on the same device/capability.
+            # We could consider check all tensors at a performance cost.
+            tensor_arg = None
+            all_args = args + tuple(kwargs.values())
+            for value in all_args:
+                if isinstance(value, torch.Tensor):
+                    tensor_arg = value
+                    break
+
+            if tensor_arg is not None:
+                # Get compute capability from the first tensor
+                # Assume all tensors are on the same device/capability
+                major, minor = get_compute_capability(tensor_arg.device)
+                capability = major * 10 + minor
+            return capability
+
         # @brief: Wrapper function that calls the orignal, decorated function, after applying a number of checks.
         # @note that here we manually apply defaults to the arguments in the wrapper function when doing validation.
         @functools.wraps(func)
@@ -1034,45 +1077,48 @@ def backend_requirement(
                 bound_args.apply_defaults()
                 # Convert to kwargs for validation functions
                 kwargs_with_defaults = dict(bound_args.arguments)
-
                 backend = kwargs_with_defaults.get("backend")
-
-                capability = None
-                # Find the first tensor argument.
-                # Assume all tensors are on the same device/capability.
-                # We could consider check all tensors at a performance cost.
-                tensor_arg = None
-                for value in kwargs_with_defaults.values():
-                    if isinstance(value, torch.Tensor):
-                        tensor_arg = value
-                        break
-
-                if tensor_arg is not None:
-                    # Get compute capability from the first tensor
-                    # Assume all tensors are on the same device/capability
-                    major, minor = get_compute_capability(tensor_arg.device)
-                    capability = major * 10 + minor
-
+                capability = _get_capability(*args, **kwargs)
                 if not has_backend_choices() and common_check is None:
                     raise ValueError(
                         f"Invalid @backend_requirement decorator usage: no backend choices and no common_check for {func.__name__}"
                     )
 
                 if has_backend_choices():
-                    if not is_backend_supported(backend, capability):
-                        extra = f" with capability {capability}" if capability else ""
-                        raise BackendSupportedError(
-                            f"{func.__name__} does not support backend '{backend}'{extra}"
-                        )
+                    if backend == "auto":
+                        if not suitable_auto_backends(
+                            capability, **kwargs_with_defaults
+                        ):
+                            raise BackendSupportedError(
+                                f"No suitable auto backends found for {func.__name__}"
+                            )
+                    else:
+                        if not is_backend_supported(backend, capability):
+                            extra = (
+                                f" with capability {capability}" if capability else ""
+                            )
+                            raise BackendSupportedError(
+                                f"{func.__name__} does not support backend '{backend}'{extra}"
+                            )
+                        if not _is_problem_size_supported(**kwargs_with_defaults):
+                            raise ValueError(
+                                f"Problem size is not supported for {func.__name__}"
+                            )
                 else:
+                    # If the function doesnt have backends (i.e., there is only 1, implicit backend), run the following checks.
                     if not is_compute_capability_supported(capability):
                         raise BackendSupportedError(
                             f"{func.__name__} does not support compute capability {capability}"
                         )
-                if not _is_problem_size_supported(**kwargs_with_defaults):
-                    raise ValueError(
-                        f"Problem size is not supported for {func.__name__}"
-                    )
+                    if not _is_problem_size_supported(**kwargs_with_defaults):
+                        raise ValueError(
+                            f"Problem size is not supported for {func.__name__}"
+                        )
+            elif skip_check and heuristic_func is not None:
+                if kwargs.get("backend") == "auto":
+                    # This needs to be called for heuristic function
+                    capability = _get_capability(*args, **kwargs)
+                    suitable_auto_backends(capability, *args, **kwargs)
 
             return func(*args, **kwargs)
 

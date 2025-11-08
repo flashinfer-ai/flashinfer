@@ -36,6 +36,8 @@ from .test_trtllm_gen_fused_moe import (
     routing_reference_topk,
 )
 
+from flashinfer.utils import get_compute_capability
+
 
 @pytest.mark.parametrize("num_tokens", [1, 8, 1024])
 @pytest.mark.parametrize("hidden_size", [1024, 2048, 3072, 4096])
@@ -60,6 +62,9 @@ def test_trtllm_gen_routed_fused_moe(
     routing_method_type: RoutingMethodType,
     quant_mode: Literal["NvFP4xNvFP4", "MxFP4xMxFP8", "MxFP4xBf16"],
 ):
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] not in [10]:
+        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
     torch.manual_seed(42)
     device = torch.device("cuda:0")
     enable_pdl = device_support_pdl(device)
