@@ -178,7 +178,8 @@ class GatedActType(IntEnum):
     GeGlu = 1
 
 
-def is_flashinfer_trtllm_moe_supported(
+@functools.cache
+def is_trtllm_moe_supported(
     dtype_weights: DtypeTrtllmGen,
     dtype_act: DtypeTrtllmGen,
     quant_method: Optional[str] = None,

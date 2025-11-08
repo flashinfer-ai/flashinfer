@@ -2296,6 +2296,21 @@ def run_moe_test(
                 "compatible_moe_impls": [FP8BlockScaleMoe, FP4Moe, BF16Moe],
                 "compatible_intermediate_size": [384, 768, 1024],
             },
+            id="Qwen3",
+        ),
+        pytest.param(
+            {
+                "num_experts": 256,
+                "top_k": 8,
+                "padding": 8,
+                "n_groups": None,
+                "top_k_groups": None,
+                "routed_scaling": None,
+                "has_routing_bias": False,
+                "routing_method_type": RoutingMethodType.RenormalizeNaive,
+                "compatible_moe_impls": [FP8BlockScaleMoe, FP4Moe, BF16Moe],
+                "compatible_intermediate_size": [384, 1024],
+            },
             id="Renorm",
         ),
         pytest.param(
