@@ -90,6 +90,32 @@ namespace moe::dev {
     FLASHINFER_WARN("Unsupported dtypeElt");                                                       \
   }
 
+#define LAUNCH_NUM_TOKENS_PER_CTA(data, type, numTokensPerCta, kernel, numBlocks, numThreads,      \
+                                  smemSize, stream)                                                \
+  if (numTokensPerCta == 4) {                                                                      \
+    LAUNCH_PDL(data, false, LAUNCH_ESC(type, 4), kernel, numBlocks, numThreads, smemSize, stream); \
+  } else if (numTokensPerCta == 2) {                                                               \
+    LAUNCH_PDL(data, false, LAUNCH_ESC(type, 2), kernel, numBlocks, numThreads, smemSize, stream); \
+  } else if (numTokensPerCta == 1) {                                                               \
+    LAUNCH_PDL(data, false, LAUNCH_ESC(type, 1), kernel, numBlocks, numThreads, smemSize, stream); \
+  } else {                                                                                         \
+    FLASHINFER_WARN("Unsupported numTokensPerCta");                                                \
+  }
+
+#define LAUNCH_ACTIVATION(data, kernel, numTokensPerCta, numBlocks, numThreads, smemSize, stream) \
+  if (data.mDtypeElt == tg::Dtype::Fp16) {                                                        \
+    LAUNCH_NUM_TOKENS_PER_CTA(data, cutlass::half_t, numTokensPerCta, kernel, numBlocks,          \
+                              numThreads, smemSize, stream);                                      \
+  } else if (data.mDtypeElt == tg::Dtype::E4m3) {                                                 \
+    LAUNCH_NUM_TOKENS_PER_CTA(data, cutlass::float_e4m3_t, numTokensPerCta, kernel, numBlocks,    \
+                              numThreads, smemSize, stream);                                      \
+  } else if (data.mDtypeElt == tg::Dtype::Bfloat16) {                                             \
+    LAUNCH_NUM_TOKENS_PER_CTA(data, cutlass::bfloat16_t, numTokensPerCta, kernel, numBlocks,      \
+                              numThreads, smemSize, stream);                                      \
+  } else {                                                                                        \
+    FLASHINFER_WARN("Unsupported dtypeElt");                                                      \
+  }
+
 #define LAUNCH_EXPW(data, kernel, numBlocks, numThreads, smemSize, stream)                         \
   if (data.mDtypeElt == tg::Dtype::Fp16 && data.mDtypeExpW == tg::Dtype::Fp32) {                   \
     LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::half_t, float), kernel, numBlocks, numThreads,     \
@@ -234,9 +260,10 @@ struct Data {
   int32_t const* totalNumPaddedTokens;
 };
 
-template <typename Type_, bool UsePdl_>
+template <typename Type_, int32_t NumTokensPerCta_, bool UsePdl_>
 struct KernelParams {
   using Type = Type_;
+  static constexpr int32_t NumTokensPerCta = NumTokensPerCta_;
   static constexpr bool UsePdl = UsePdl_;
 
   Type const* inPtr;
