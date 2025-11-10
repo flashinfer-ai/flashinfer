@@ -277,6 +277,10 @@ def attention_flops(
     Returns:
         total_flops (int): Total FLOPs for the layer.
     """
+    # Causal attention requires kv_len >= q_len
+    if qo_seqlen > kv_seqlen:
+        causal = False
+
     if causal:
         bmm1_flops = (
             batch_size
@@ -323,7 +327,7 @@ def attention_flops_with_actual_seq_lens(
     Returns:
         total_flops (int): Total FLOPs for the layer.
     """
-    # If any q_len > kv_len, causal attention is invalid, treat as non-causal
+    # Causal attention requires kv_len >= q_len
     # Otherwise right align if kv_len > q_len
     if causal and (actual_seq_lens_q > actual_seq_lens_kv).any():
         causal = False
