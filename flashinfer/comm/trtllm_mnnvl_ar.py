@@ -223,6 +223,12 @@ def trtllm_mnnvl_all_reduce(
         [Optional] out: Output tensor to store the result (required if wait_for_results is True)
 
     """
+
+    if inp.shape[0] > buffer_M:
+        raise ValueError(
+            f"The number of tokens in the input tensor {inp.shape[0]} is greater than the buffer_M {buffer_M}. This is not supported. Please increase the workspace size, or decrease the amount of tokens to at most {buffer_M}."
+        )
+
     module = get_trtllm_mnnvl_comm_module()
     module.trtllm_mnnvl_all_reduce(
         inp,
