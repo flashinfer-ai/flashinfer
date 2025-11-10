@@ -278,9 +278,6 @@ class FusedMoeLauncher {
     workspace.cta_idx_xy_to_batch_idx = static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr());
     workspace.cta_idx_xy_to_mn_limit = static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr());
     workspace.num_non_exiting_ctas = static_cast<int*>(num_non_exiting_ctas.data_ptr());
-    if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Llama4) {
-      workspace.token_scales = expert_weights.data_ptr();  // Consumed by permuteGemm1 kernel
-    }
   }
 
   void check_moe_common() const {
@@ -587,6 +584,9 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
         alloc_tensor({args->num_tokens, args->top_k}, dl_bfloat16, hidden_states.device());
 
     workspace.expert_weights = expert_weights.data_ptr();
+    if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Llama4) {
+      workspace.token_scales = expert_weights.data_ptr();  // Consumed by permuteGemm1 kernel
+    }
   }
 
   void check_moe() const override {
@@ -1045,9 +1045,6 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     workspace.cta_idx_xy_to_batch_idx = static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr());
     workspace.cta_idx_xy_to_mn_limit = static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr());
     workspace.num_non_exiting_ctas = static_cast<int*>(num_non_exiting_ctas.data_ptr());
-    if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Llama4) {
-      workspace.token_scales = expert_weights.data_ptr();  // Consumed by permuteGemm1 kernel
-    }
 
     args->mDtypeElt = mDtypeAct;
     auto routing_bias_dtype = routing_bias.has_value() ? routing_bias.value().dtype() : dl_bfloat16;
