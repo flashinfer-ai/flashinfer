@@ -44,17 +44,17 @@ from ..utils import (
     backend_requirement,
     supported_compute_capability,
 )
-from .jit.gemm import gen_gemm_sm90_module
-from .jit.gemm import gen_gemm_module
-from .jit.gemm import gen_gemm_sm100_module
-from .jit.gemm import gen_gemm_sm120_module
-from .jit.gemm import gen_gemm_sm120_module_cutlass_fp4
-from .jit.gemm import gen_gemm_sm100_module_cutlass_fp4
-from .jit.gemm import gen_gemm_sm100_module_cutlass_fp8
-from .jit.gemm import gen_gemm_sm100_module_cutlass_bf16
-from .jit.gemm import gen_trtllm_gen_gemm_module
-from .jit.gemm import gen_tgv_gemm_sm10x_module
-from .jit.gemm import gen_deepgemm_sm100_module
+from ..jit.gemm import gen_gemm_sm90_module
+from ..jit.gemm import gen_gemm_module
+from ..jit.gemm import gen_gemm_sm100_module
+from ..jit.gemm import gen_gemm_sm120_module
+from ..jit.gemm import gen_gemm_sm120_module_cutlass_fp4
+from ..jit.gemm import gen_gemm_sm100_module_cutlass_fp4
+from ..jit.gemm import gen_gemm_sm100_module_cutlass_fp8
+from ..jit.gemm import gen_gemm_sm100_module_cutlass_bf16
+from ..jit.gemm import gen_trtllm_gen_gemm_module
+from ..jit.gemm import gen_tgv_gemm_sm10x_module
+from ..jit.gemm import gen_deepgemm_sm100_module
 
 
 CUDNN_AVAILABLE = False
