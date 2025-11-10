@@ -73,8 +73,8 @@ def bench_fmha_blackwell(
     ms = np.median(measurements)
 
     TFLOPS = attention_tflops_per_sec_with_actual_seq_lens(
-        torch.tensor([batch_size * qkv_len]),
-        torch.tensor([batch_size * qkv_len]),
+        torch.full((batch_size,), qkv_len),
+        torch.full((batch_size,), qkv_len),
         head_dim,
         head_dim,
         num_heads,
