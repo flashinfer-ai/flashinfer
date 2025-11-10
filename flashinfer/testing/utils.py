@@ -412,7 +412,7 @@ def attention_tflops_per_sec_with_actual_seq_lens(
     head_dim_vo,
     num_qo_heads,
     causal,
-    time,
+    ms,
 ):
     """
     Calculate TFLOPS per second for a given attention layer with actual sequence lengths.
@@ -425,7 +425,7 @@ def attention_tflops_per_sec_with_actual_seq_lens(
         head_dim_vo (int): Head dimension of the value.
         num_qo_heads (int): Number of query heads.
         causal (bool): Whether to use causal masking.
-        time (float): Execution time in milliseconds.
+        ms (float): Execution time in milliseconds.
 
     Returns:
         tflops_per_sec (float): TFLOPS per second for the layer.
@@ -438,7 +438,7 @@ def attention_tflops_per_sec_with_actual_seq_lens(
         num_qo_heads,
         causal,
     )
-    return f.item() / time / 1e9 if not math.isnan(time) else 0.0
+    return f.item() / ms / 1e9 if not math.isnan(ms) else 0.0
 
 
 def attention_tb_per_sec(
