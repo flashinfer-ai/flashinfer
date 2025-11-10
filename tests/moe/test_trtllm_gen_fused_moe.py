@@ -32,7 +32,7 @@ from flashinfer import (
     reorder_rows_for_gated_act_gemm,
     shuffle_matrix_a,
 )
-from flashinfer.autotuner import AutoTuner, autotune
+from flashinfer.autotuner import autotune
 from flashinfer.fp4_quantization import block_scale_interleave
 from flashinfer.fused_moe import (
     WeightLayout,
@@ -2108,9 +2108,6 @@ def run_moe_test(
     )
 
     torch.cuda.synchronize()
-
-    # Clear autotuner cache to avoid cross-configuration tactic reuse between runs.
-    AutoTuner.get().clear_cache()
 
     moe_impl._cache_permute_indices = cache_permute_indices
 
