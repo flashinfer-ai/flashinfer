@@ -68,7 +68,6 @@ size_t dispatchGemmClusterShapeSm100(__nv_fp8_e4m3 const* A, __nv_fp8_e4m3 const
                                                _1SM>(
           A, B, scale_a, scale_b, D, m, n, k, b, gemmConfig, workspacePtr, workspaceBytes, stream);
       break;
-
     case ClusterShape::ClusterShape_2x1x1:
       return genericFp8GemmKernelLauncherSm100<T, arch, CTA_M_, CTA_N_, CTA_K_, Shape<_2, _1, _1>,
                                                _2SM>(
