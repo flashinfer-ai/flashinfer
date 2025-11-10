@@ -106,8 +106,8 @@ def bench_batch_ragged_prefill(batch_size, num_heads, seq_len, causal, head_dim)
 
     def flops(ms):
         return attention_tflops_per_sec_with_actual_seq_lens(
-            torch.tensor([batch_size * seq_len]),
-            torch.tensor([batch_size * seq_len]),
+            torch.full((batch_size,), seq_len),
+            torch.full((batch_size,), seq_len),
             head_dim,
             head_dim,
             num_qo_heads,
@@ -186,8 +186,8 @@ def bench_batch_paged_prefill(
 
     def flops(ms):
         return attention_tflops_per_sec_with_actual_seq_lens(
-            torch.tensor([batch_size * seq_len]),
-            torch.tensor([batch_size * seq_len]),
+            torch.full((batch_size,), seq_len),
+            torch.full((batch_size,), seq_len),
             head_dim,
             head_dim,
             num_qo_heads,
