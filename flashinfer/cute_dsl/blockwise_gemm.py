@@ -2925,8 +2925,13 @@ def blockwise_gemm(
     sm_count: Optional[int] = None,
     **kwargs,
 ):
-    m, k, l = a_torch.shape
-    n, _, _ = b_torch.shape
+    if len(a_torch.shape) == 3 and len(b_torch.shape) == 3:
+        m, k, l = a_torch.shape
+        n, _, _ = b_torch.shape
+    else:
+        m, k = a_torch.shape
+        n, _ = b_torch.shape
+        l = 1
 
     mma_tiler_mn = kwargs.pop("mma_tiler_mn", (128, 128))
     cluster_shape_mn = kwargs.pop("cluster_shape_mn", (1, 1))
