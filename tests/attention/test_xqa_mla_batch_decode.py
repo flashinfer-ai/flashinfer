@@ -62,7 +62,7 @@ def test_xqa_mla_batch_decode(
     max_num_blocks_per_seq = blocks_per_seq.max().item()
 
     # Generate random but unique block IDs for all sequences
-    total_blocks_needed = sum(blocks_per_seq)
+    total_blocks_needed = int(blocks_per_seq.sum().item())
     all_block_ids = torch.randperm(
         total_blocks_needed, device=device
     )  # Random permutation
@@ -76,7 +76,7 @@ def test_xqa_mla_batch_decode(
     # Populate block tables and track block assignments
     block_id = 0
     for i in range(batch_size):
-        num_blocks_needed = blocks_per_seq[i]
+        num_blocks_needed = int(blocks_per_seq[i].item())
         block_tables[i, :num_blocks_needed] = all_block_ids[
             block_id : block_id + num_blocks_needed
         ]

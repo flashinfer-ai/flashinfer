@@ -2437,11 +2437,9 @@ def xqa_batch_decode_with_kv_cache(
     kv_scale_value = bmm2_scale
     q_scale_value = bmm1_scale / kv_scale_value * (head_dim**0.5)
 
-    query_new = query.unsqueeze(1).contiguous()
-    seq_lens_new = seq_lens.unsqueeze(1).contiguous()
-    sinks_new = (
-        sinks.reshape(num_kv_heads, -1).contiguous() if sinks is not None else None
-    )
+    query_new = query.unsqueeze(1)
+    seq_lens_new = seq_lens.unsqueeze(1)
+    sinks_new = sinks.reshape(num_kv_heads, -1) if sinks is not None else None
 
     # Ensure 4D output for xqa
     if out is None:
@@ -2703,7 +2701,7 @@ def xqa_batch_decode_with_kv_cache_mla(
     Parameters:
     query: [batch_size, q_len_per_request, num_heads, head_dim_qk], head_dim_qk = qk_nope_head_dim (kv_lora_rank) + qk_rope_head_dim, should be concated q_nope + q_rope; q_len_per_request is the MTP query length.
     kv_cache: [num_pages, page_size, head_dim_ckv + head_dim_kpe], should be concated ckv_cache + kpe_cache
-    workspace_buffer: [num_semaphores, 4], used for multi_block mode. Must be initialized to 0 for its first use.
+    workspace_buffer: torch.Tensor. Must be initialized to 0 for its first use.
     qk_nope_head_dim: qk_nope_head_dim, must be 128
     kv_lora_rank: kv_lora_rank, must be 512
     qk_rope_head_dim: qk_rope_head_dim, must be 64
@@ -2777,8 +2775,9 @@ def xqa_batch_decode_with_kv_cache_mla(
     workspace_u8 = workspace_buffer.view(torch.uint8)
     semaphore = workspace_u8[: 8 * 1024 * 1024]  # reserve 8MB for semaphore
     scratch = workspace_u8[8 * 1024 * 1024 :]
-    kv_cache_new = kv_cache.squeeze(1).unsqueeze(2).contiguous()
-    seq_lens_new = seq_lens.unsqueeze(1).contiguous()
+    # This can not be replaced by kv_cache.transpose(1, 2) because the stride is not the same
+    kv_cache_new = kv_cache.squeeze(1).unsqueeze(2)
+    seq_lens_new = seq_lens.unsqueeze(1)
 
     xqa_mla(
         query,
