@@ -295,18 +295,21 @@ def run_mnnvl_ar_full(
         rank_failed = True
         failure_message = f"FAILED[rank={rank}]: seq_lens={seq_lens}, fusion={fusion}, dtype={dtype} failed: {e}"
         print(failure_message)
-        # Gather failure status from all ranks
+
+        # Gather failure status from all ranks for logging
         all_failures = MPI.COMM_WORLD.allgather(rank_failed)
 
-        # If any rank failed, fail the test
         if any(all_failures):
             failed_ranks = [i for i, failed in enumerate(all_failures) if failed]
             if rank == 0:
                 print(f"Test failed on ranks: {failed_ranks}")
 
-            # Fail the test on all ranks
-            pytest.fail(f"Test failed on ranks {failed_ranks}")
-            trtllm_mnnvl_ar.mpi_barrier()
+        # Cleanup before re-raising
+        if "mcast_buffer_mnnvl" in locals():
+            del mcast_buffer_mnnvl
+
+        # Re-raise the original exception so it can be caught by pytest.raises in negative tests
+        raise
 
     finally:
         # Ensure cleanup happens for this list's workspace
