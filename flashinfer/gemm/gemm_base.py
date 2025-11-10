@@ -603,6 +603,45 @@ def get_gemm_sm100_module_cutlass_bf16():
     )
 
 
+_BF16_GEMM_SM100_TUNING_CONFIG = TuningConfig(
+    dynamic_tensor_specs=(
+        DynamicTensorSpec(
+            (0,),  # a_tensor_index
+            (-2,),
+            get_last_power_of_2_num_tokens_buckets,
+            last_positive_power_of_2,
+        ),
+    ),
+    constraint_specs=(
+        ConstraintSpec(
+            2,  # out_tensor_index
+            -2,
+            lambda shapes: shapes[0][-2],
+        ),
+    ),
+)
+
+
+def bf16_gemm_sm100(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    out: torch.Tensor,
+    workspace_buffer: torch.Tensor,
+) -> None:
+    runner = get_gemm_sm100_module_cutlass_bf16().cutlass_bf16_gemm_runner()
+    tuner = AutoTuner.get()
+
+    inputs = [a, b, out, workspace_buffer]
+    runner, tactic = tuner.choose_one(
+        "bf16_gemm",
+        [runner],
+        _BF16_GEMM_SM100_TUNING_CONFIG,
+        inputs,
+    )
+
+    runner(inputs=inputs, tactic=tactic)
+
+
 def fp8_gemm_sm100(
     a: torch.Tensor,
     b: torch.Tensor,
