@@ -635,52 +635,6 @@ def fp8_gemm_sm100(
     runner(inputs=inputs, tactic=tactic)
 
 
-def bf16_gemm_sm100(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    out: torch.Tensor,
-    workspace_buffer: torch.Tensor,
-) -> None:
-    runners = []
-    is_sm_supported = _match_sm_version(a.device, ["100"])
-
-    if is_sm_supported:
-        runners.append(get_gemm_sm100_module_cutlass_bf16().cutlass_bf16_gemm_runner())
-
-    if len(runners) == 0:
-        major, minor = get_compute_capability(torch.device("cuda"))
-        raise ValueError(f"No valid runner found for current device sm{major}{minor}")
-
-    tuner = AutoTuner.get()
-    a_tensor_index = 0
-    out_tensor_index = 2
-    tuning_config = TuningConfig(
-        dynamic_tensor_specs=(
-            DynamicTensorSpec(
-                (a_tensor_index,),
-                (-2,),
-                get_last_power_of_2_num_tokens_buckets,
-                last_positive_power_of_2,
-            ),
-        ),
-        constraint_specs=(
-            ConstraintSpec(
-                out_tensor_index, -2, lambda shapes: shapes[a_tensor_index][-2]
-            ),
-        ),
-    )
-
-    inputs = [a, b, out, workspace_buffer]
-    runner, tactic = tuner.choose_one(
-        "bf16_gemm",
-        runners,
-        tuning_config,
-        inputs,
-    )
-
-    runner(inputs=inputs, tactic=tactic)
-
-
 def _create_cutlass_fp4_gemm_module(module, op_name: str, tuner_name: str):
     """Helper function to create cutlass FP4 GEMM module."""
 
