@@ -854,49 +854,20 @@ def testMmFp4(args):
             continue
 
         try:
-            from flashinfer.gemm import (
-                _mm_fp4_backend_checkers,
-                _check_mm_fp4_problem_size,
+            flashinfer.gemm.mm_fp4(
+                a=input_fp4,
+                b=mat2_fp4.T if backend != "trtllm" else mat2_fp4_trtllm.T,
+                a_descale=input_inv_s,
+                b_descale=mat2_inv_s.T if backend != "trtllm" else mat2_inv_s_trtllm.T,
+                alpha=alpha,
+                out_dtype=res_dtype,
+                block_size=16
+                if use_nvfp4
+                else 32,  # nvfp4 only supports 16; mxfp4 only supports 32.
+                use_8x4_sf_layout=not use_128x4_sf_layout,
+                backend=backend,
+                use_nvfp4=use_nvfp4,
             )
-
-            # Choose correct tensors for this backend
-            if backend == "trtllm":
-                b_tensor = mat2_fp4_trtllm.T
-                b_descale = mat2_inv_s_trtllm.T
-            else:
-                b_tensor = mat2_fp4.T
-                b_descale = mat2_inv_s.T
-
-            # Validate common requirements
-            _check_mm_fp4_problem_size(
-                input_fp4,
-                b_tensor,
-                input_inv_s,
-                b_descale,
-                alpha,
-                res_dtype,
-                None,  # out
-                block_size,
-                not use_128x4_sf_layout,  # use_8x4_sf_layout
-                backend,
-                use_nvfp4,
-            )
-
-            # Validate backend-specific requirements
-            if backend in _mm_fp4_backend_checkers:
-                _mm_fp4_backend_checkers[backend](
-                    input_fp4,
-                    b_tensor,
-                    input_inv_s,
-                    b_descale,
-                    alpha,
-                    res_dtype,
-                    None,  # out
-                    block_size,
-                    not use_128x4_sf_layout,
-                    backend,
-                    use_nvfp4,
-                )
         except Exception as e:
             print(
                 f"[INFO] {backend} backend does not support this configuration: {type(e).__name__}: {e}"
