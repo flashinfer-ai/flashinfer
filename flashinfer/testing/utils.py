@@ -279,7 +279,9 @@ def attention_flops(
     """
     # Causal attention requires kv_len >= q_len
     if qo_seqlen > kv_seqlen:
-        causal = False
+        raise ValueError(
+            "qo_seqlen must be less than or equal to kv_seqlen for causal attention"
+        )
 
     if causal:
         bmm1_flops = (
@@ -330,7 +332,9 @@ def attention_flops_with_actual_seq_lens(
     # Causal attention requires kv_len >= q_len
     # Otherwise right align if kv_len > q_len
     if causal and (actual_seq_lens_q > actual_seq_lens_kv).any():
-        causal = False
+        raise ValueError(
+            "actual_seq_lens_q must be less than or equal to actual_seq_lens_kv for causal attention"
+        )
 
     if causal:
         bmm1_flops = (
