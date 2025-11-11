@@ -92,7 +92,7 @@ You can follow the steps below to install FlashInfer from source code:
 
    .. code-block:: bash
 
-       export FLASHINFER_CUDA_ARCH_LIST="7.5 8.0 8.9 10.0f 11.0f 12.0f"
+       export FLASHINFER_CUDA_ARCH_LIST="7.5 8.0 8.9 10.0a 10.3a 11.0f 12.0f"
        cd flashinfer-jit-cache
        python -m build --no-isolation --wheel
        python -m pip install dist/*.whl
