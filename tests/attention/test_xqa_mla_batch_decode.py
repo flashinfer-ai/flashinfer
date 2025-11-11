@@ -1,5 +1,3 @@
-import math
-
 import pytest
 import torch
 
@@ -7,7 +5,7 @@ import flashinfer
 from flashinfer.utils import get_compute_capability
 
 global_workspace_buffer = None  # can.be empty initialized
-global_trtllm_gen_fmha_workspace_buffer = None  # must be zero initialized
+global_xqa_workspace_buffer = None  # must be zero initialized
 workspace_size = 128 * 1024 * 1024
 
 
@@ -16,43 +14,25 @@ workspace_size = 128 * 1024 * 1024
     [1, 2, 4, 16, 32, 64, 128, 256, 512, 768, 1024],
 )
 @pytest.mark.parametrize("scale", [1.0, 0.5])
-@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.bfloat16])
-@pytest.mark.parametrize("page_size", [32, 64])
-@pytest.mark.parametrize(
-    "q_len_per_request", [1, 2]
-)  # todo(Yingyi): verify larger q_len_per_request
-@pytest.mark.parametrize("dynamic_scale", [False])
+@pytest.mark.parametrize("page_size", [32, 64, 128])
 @pytest.mark.parametrize("enable_pdl", [True, False, None])
-@pytest.mark.parametrize("backend", ["trtllm-gen", "xqa"])
-def test_trtllm_batch_decode_mla(
+def test_xqa_mla_batch_decode(
     batch_size: int,
     scale: float,
-    dtype: torch.dtype,
     page_size: int,
-    q_len_per_request: int,
-    dynamic_scale: bool,
     enable_pdl: bool,
-    backend: str,
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
-    if backend == "xqa":
-        if compute_capability[0] != 12:
-            pytest.skip("XQA MLA only supports SM120 GPUs")
-        if q_len_per_request != 1 or dtype != torch.float8_e4m3fn:
-            pytest.skip(
-                "XQA MLA only supports q_len_per_request == 1 and dtype == torch.float8_e4m3fn"
-            )
-    if backend == "trtllm-gen":
-        if compute_capability[0] != 10:
-            pytest.skip("TRTLLM-GEN MLA only supports SM100 and SM103 GPUs")
-    if dynamic_scale and dtype != torch.float8_e4m3fn:
-        pytest.skip("Dynamic scale is not supported for non-fp8 dtype")
+    if compute_capability[0] != 12:
+        pytest.skip("These tests are only guaranteed to work on SM120 GPUs.")
 
     torch.manual_seed(42)
+    dtype = torch.float8_e4m3fn
+    q_len_per_request = 1
     device = "cuda:0"
 
     # Fixed max sequence length
-    MAX_SEQ_LEN = 1024
+    max_seq_len = 1024
 
     # Deepseek attention config (decode-MLA)
     num_q_heads = 128
@@ -69,12 +49,12 @@ def test_trtllm_batch_decode_mla(
         device=device,
     ).to(dtype)
 
-    num_tokens = MAX_SEQ_LEN * batch_size
+    num_tokens = max_seq_len * batch_size
     num_blocks = (num_tokens + page_size - 1) // page_size
 
     # Sequence lengths and block tables
-    seq_lens = [torch.randint(1, MAX_SEQ_LEN, (1,)).item() for _ in range(batch_size)]
-    seq_lens[-1] = MAX_SEQ_LEN
+    seq_lens = [torch.randint(1, max_seq_len, (1,)).item() for _ in range(batch_size)]
+    seq_lens[-1] = max_seq_len
     max_seq_len = max(seq_lens)
     seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int, device=device)
 
@@ -109,37 +89,20 @@ def test_trtllm_batch_decode_mla(
     ).to(dtype)
     # (num_blocks, 1, page_size, kv_lora_rank + qk_rope_head_dim)
 
-    # Allocate workspace buffer
-    # todo(Yingyi): calculate the actual size of workspace buffer
-    global global_workspace_buffer, global_trtllm_gen_fmha_workspace_buffer
+    global global_workspace_buffer, global_xqa_workspace_buffer
     if global_workspace_buffer is None:
         global_workspace_buffer = torch.empty(
             workspace_size, dtype=torch.int8, device=device
         )
-    if global_trtllm_gen_fmha_workspace_buffer is None:
-        global_trtllm_gen_fmha_workspace_buffer = torch.zeros(
+    if global_xqa_workspace_buffer is None:
+        global_xqa_workspace_buffer = torch.zeros(
             workspace_size, dtype=torch.int8, device=device
         )
-    workspace_buffer = global_trtllm_gen_fmha_workspace_buffer
+    workspace_buffer = global_xqa_workspace_buffer
     workspace_buffer_ref = global_workspace_buffer
 
-    bmm1_log2_scale_tensor = (
-        torch.tensor(
-            [scale / ((128 + 64) ** 0.5 * math.log2(math.e))],
-            dtype=torch.float32,
-            device=device,
-        )
-        if dynamic_scale
-        else None
-    )
-    bmm2_scale_tensor = (
-        torch.tensor([1.0], dtype=torch.float32, device=device)
-        if dynamic_scale
-        else None
-    )
-
     # Run decode-MLA
-    output = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+    output = flashinfer.decode.xqa_batch_decode_with_kv_cache_mla(
         query=query,
         kv_cache=kv_cache.unsqueeze(1),
         workspace_buffer=workspace_buffer,
@@ -151,14 +114,8 @@ def test_trtllm_batch_decode_mla(
         max_seq_len=max_seq_len,
         bmm1_scale=scale / ((128 + 64) ** 0.5),
         bmm2_scale=1.0,
-        bmm1_scale_log2_tensor=bmm1_log2_scale_tensor,
-        bmm2_scale_tensor=bmm2_scale_tensor,
         enable_pdl=enable_pdl,
-        backend=backend,
     )
-    # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
-    # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
-    assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()
 
     # Run reference attention and align output
     sm_scale = scale / (
@@ -209,52 +166,22 @@ def test_trtllm_batch_decode_mla(
 
     o_ref = wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=False)
 
-    if backend == "trtllm-gen":
-        # check is nan
-        assert not torch.isnan(o_ref).any(), "o_ref is nan"
-        assert not torch.isnan(output).any(), "output is nan"
+    atol = 0.05
+    rtol = 0.05
 
-        if dtype == torch.float8_e4m3fn:
-            try:
-                torch.testing.assert_close(
-                    output,
-                    o_ref.view(batch_size, q_len_per_request, num_q_heads, -1),
-                    rtol=1e-1,
-                    atol=1e-1,
-                )  # todo: do reference with normal attention?
-            except AssertionError as e:
-                print("output:", output)
-                print("o_ref:", o_ref)
-                raise e
-        else:
-            try:
-                torch.testing.assert_close(
-                    output,
-                    o_ref.view(batch_size, q_len_per_request, num_q_heads, -1),
-                    rtol=1e-2,
-                    atol=1e-2,
-                )
-            except AssertionError as e:
-                print("output:", output)
-                print("o_ref:", o_ref)
-                raise e
-    elif backend == "xqa":
-        atol = 0.05
-        rtol = 0.05
+    diff_abs = torch.abs(
+        o_ref.view(batch_size, q_len_per_request, num_q_heads, -1) - output
+    )
+    diff_rel = diff_abs / (
+        torch.abs(o_ref.view(batch_size, q_len_per_request, num_q_heads, -1)) + 1e-8
+    )
 
-        diff_abs = torch.abs(
-            o_ref.view(batch_size, q_len_per_request, num_q_heads, -1) - output
-        )
-        diff_rel = diff_abs / (
-            torch.abs(o_ref.view(batch_size, q_len_per_request, num_q_heads, -1)) + 1e-8
-        )
+    within_tolerance = (diff_abs <= atol) | (diff_rel <= rtol)
 
-        within_tolerance = (diff_abs <= atol) | (diff_rel <= rtol)
+    pass_ratio = within_tolerance.float().mean().item()
 
-        pass_ratio = within_tolerance.float().mean().item()
-
-        required_ratio = 0.95
-        assert pass_ratio >= required_ratio, (
-            f"Total {o_ref.numel()} elements, only {pass_ratio:.1%} meet tolerance criteria, "
-            f"require at least {required_ratio:.1%}"
-        )
+    required_ratio = 0.95
+    assert pass_ratio >= required_ratio, (
+        f"Total {o_ref.numel()} elements, only {pass_ratio:.1%} meet tolerance criteria, "
+        f"require at least {required_ratio:.1%}"
+    )
