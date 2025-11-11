@@ -66,8 +66,8 @@ struct Sm100FmhaCtxKernelWarpspecializedSchedule {
 
   static const bool kDebugUsingPrintf = false;
   static const int NumRegsSoftmax = 192;
-  static const int NumRegsCorrection = 96 - (kDebugUsingPrintf ? 16 : 0);
-  static const int NumRegsOther = 32 + (kDebugUsingPrintf ? 16 : 0);
+  static const int NumRegsCorrection = 64;  // 96 - (kDebugUsingPrintf ? 16 : 0);
+  static const int NumRegsOther = 64;       // 32 + (kDebugUsingPrintf ? 16 : 0);
   static const int NumRegsEmpty = 24;
 
   static const int NumWarps = 16;
