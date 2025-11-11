@@ -891,9 +891,7 @@ def testMmFp4(args):
                 b_descale=mat2_inv_s.T if backend != "trtllm" else mat2_inv_s_trtllm.T,
                 alpha=alpha,
                 out_dtype=res_dtype,
-                block_size=16
-                if use_nvfp4
-                else 32,  # nvfp4 only supports 16; mxfp4 only supports 32.
+                block_size=block_size,
                 use_8x4_sf_layout=not use_128x4_sf_layout,
                 backend=backend,
                 use_nvfp4=use_nvfp4,
