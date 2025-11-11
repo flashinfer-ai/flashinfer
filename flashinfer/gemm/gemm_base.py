@@ -93,7 +93,7 @@ def _match_sm_version(device: torch.device, sm_version: list[str]):
     return device_arch in sm_version
 
 
-def get_cuda_version(device: torch.device):
+def get_cuda_version():
     return tuple(map(int, torch.version.cuda.split(".")))  # (major, minor)
 
 
@@ -1951,44 +1951,6 @@ def _cutlass_gemm_fp4_requirement(
     return True
 
 
-@supported_compute_capability([100, 103, 110, 120, 121])
-def _auto_gemm_fp4_requirement(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    a_descale: torch.Tensor,
-    b_descale: torch.Tensor,
-    alpha: Optional[torch.Tensor] = None,
-    out_dtype: torch.dtype = torch.bfloat16,
-    out: Optional[torch.Tensor] = None,
-    block_size: int = 16,
-    use_8x4_sf_layout: bool = False,
-    backend: Literal["cudnn", "trtllm", "cutlass", "auto"] = "auto",
-    use_nvfp4: bool = True,
-):
-    # Auto backend requires at least one backend to be supported on the current device
-    cc_major, cc_minor = get_compute_capability(a.device)
-    cc_arch = cc_major * 10 + cc_minor
-
-    # Check if at least one backend is supported for this compute capability
-    candidate_backends = ["cudnn", "cutlass", "trtllm"]
-    backend_checkers = {
-        "cudnn": _cudnn_gemm_fp4_requirement,
-        "cutlass": _cutlass_gemm_fp4_requirement,
-        # Does not consider trtllm due to different interface.
-    }
-
-    for candidate in candidate_backends:
-        checker = backend_checkers[candidate]
-        if hasattr(
-            checker, "is_compute_capability_supported"
-        ) and checker.is_compute_capability_supported(cc_arch):
-            # At least one backend is supported
-            return True
-
-    # No backend is supported on this device
-    return False
-
-
 def _heuristic_func_mm_fp4(
     suitable_backends: List[str],
     a: torch.Tensor,
@@ -2003,8 +1965,16 @@ def _heuristic_func_mm_fp4(
     backend: Literal["cudnn", "trtllm", "cutlass", "auto"] = "cudnn",
     use_nvfp4: bool = True,
 ):
-    cuda_major, _ = get_cuda_version(a.device)
-    cc_major, cc_minor = get_compute_capability(a.device)
+    r"""
+    Heuristic function for mm_fp4 backend selection. Routes to either cudnn or cutlass, but not trtllm.
+
+    Logic for which comes first:
+    - If cuda version is 12 - use cutlass.
+    - If cuda version is 13 and cudnn version is less than 9.14 - use cutlass.
+    - If cuda version is 13 and cudnn version is 9.14 or greater - use cudnn.
+
+    """
+    cuda_major, _ = get_cuda_version()
     # If cuda version is 13 or greater:
     # cudnn is more performant if cudnn version is 9.14 or greater.
     if CUDNN_AVAILABLE and cuda_major >= 13 and cudnn.backend_version() >= 91400:
@@ -2042,7 +2012,7 @@ def mm_fp4(
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
     use_8x4_sf_layout: bool = False,
-    backend: Literal["cudnn", "trtllm", "cutlass", "auto"] = "cudnn",
+    backend: Literal["cudnn", "trtllm", "cutlass", "auto"] = "auto",
     use_nvfp4: bool = True,
 ) -> torch.Tensor:
     r"""MM FP4
