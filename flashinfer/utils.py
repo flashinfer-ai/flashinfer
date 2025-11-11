@@ -1069,9 +1069,17 @@ def backend_requirement(
             for backend in backend_checks:
                 req_checker = backend_checks[backend]
                 try:
-                    if req_checker(
-                        *args, **kwargs
-                    ) and req_checker.is_compute_capability_supported(cc):
+                    # Remove 'backend' from kwargs to explicitly pass it to the common check.
+                    kwargs_without_backend = {
+                        k: v for k, v in kwargs.items() if k != "backend"
+                    }
+                    if (
+                        req_checker(*args, **kwargs)
+                        and common_check(
+                            *args, backend=backend, **kwargs_without_backend
+                        )
+                        and req_checker.is_compute_capability_supported(cc)
+                    ):
                         suitable_backends.append(backend)
                 except ValueError:
                     continue
