@@ -152,6 +152,7 @@ size_t CutlassBf16GemmRunner<T>::getWorkspaceSizeImpl(int m, int n, int k) {
           dispatchToArch<T>(nullptr, nullptr, nullptr, m, n, k, 1, gemmConfig, nullptr, 0, nullptr);
       workspace_size = std::max(workspace_size, curr_workspace_size);
     } catch (std::runtime_error&) {
+      // Swallow errors when SMEM exceeds maximum allowed
       continue;
     }
   }
