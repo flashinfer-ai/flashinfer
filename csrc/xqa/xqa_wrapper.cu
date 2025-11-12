@@ -45,10 +45,7 @@ void xqa_wrapper_mla(int64_t multiProcessorCount, double qScale, TensorView outp
 #else
 
 void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbKHeads,
-                 int64_t slidingWinSize, double qScale, TensorView output,
-#if LOW_PREC_OUTPUT
-                 TensorView rcpOutScale,
-#endif
+                 int64_t slidingWinSize, double qScale, TensorView output, double rcpOutScale,
                  TensorView q, Optional<TensorView> attentionSinks, TensorView kCacheVLLM,
                  TensorView vCacheVLLM, TensorView kvCachePageList, int64_t maxSeqLen,
                  TensorView seqLen, int64_t batchSize, double kvCacheScale,
@@ -70,7 +67,7 @@ void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbK
   mha_func(multiProcessorCount, nbKHeads, slidingWinSize, qScale,
            reinterpret_cast<OutputHead*>(output.data_ptr()),
 #if LOW_PREC_OUTPUT
-           reinterpret_cast<float const*>(rcpOutScale.data_ptr()),
+           rcpOutScale,
 #endif
            reinterpret_cast<InputHead const*>(q.data_ptr()), attentionSinksPtr,
            reinterpret_cast<GMemCacheHead*>(kCacheVLLM.data_ptr()),

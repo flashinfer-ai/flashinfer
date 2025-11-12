@@ -610,7 +610,7 @@ __launch_bounds__(128 * 3)
         float const qScale,
         OutputHead* __restrict__ const output,  // [nbReq][beamWidth][nbQHeads]
 #if LOW_PREC_OUTPUT
-        float const* const rcpOutScale,
+        float rcpOutScale,
 #endif
 #if USE_INPUT_KV
         IOHead const* __restrict__ const qkv,  // [nbReq][beamWidth][nbQHeads+nbKHeads+nbVHeads],
@@ -957,7 +957,7 @@ __launch_bounds__(128 * 3)
 
     constexpr float xScale = 1.f / kE4M3_MAX;
 #if LOW_PREC_OUTPUT
-    float const oScale = rcpOutScale[0];
+    float const oScale = rcpOutScale;
 #else
     constexpr float oScale = 1.F;
 #endif
@@ -2910,7 +2910,7 @@ void launchHopperF8MHA(
 #endif
     float qScale, OutputHead* output,
 #if LOW_PREC_OUTPUT
-    float const* rcpOutScale,
+    float rcpOutScale,
 #endif
 #if USE_INPUT_KV
     InputHead const* qkv,
@@ -3037,7 +3037,7 @@ static uint32_t const hostSmemSize = configureKernel();
 void launchHopperF8MHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads,
                                  uint32_t slidingWinSize, float qScale, OutputHead* output,
 #if LOW_PREC_OUTPUT
-                                 float const* rcpOutScale,
+                                 float rcpOutScale,
 #endif
                                  InputHead const* q, float const* attentionSinks,
                                  GMemCacheHead* kCacheVLLM, GMemCacheHead* vCacheVLLM,

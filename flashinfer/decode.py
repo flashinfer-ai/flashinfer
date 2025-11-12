@@ -2077,6 +2077,7 @@ def trtllm_batch_decode_with_kv_cache(
     enable_pdl: Optional[bool] = None,
     backend: str = "auto",
     q_len_per_req: Optional[int] = 1,
+    o_scale: Optional[float] = 1.0,
 ) -> Union[torch.Tensor, FP4Tensor]:
     """
     Parameters
@@ -2142,6 +2143,9 @@ def trtllm_batch_decode_with_kv_cache(
         For sm_100 and sm_103 (blackwell architecture), ``auto`` will choose ``trtllm-gen`` backend.
         For sm_90 (hopper architecture) and sm_120 (blackwell architecture), ``auto`` will choose ``xqa`` backend.
 
+    o_scale : Optional[float] = 1.0
+        output scale factor for xqa fp8 output.
+
     Returns
     -------
     out : Union[torch.Tensor, FP4Tensor]
@@ -2196,6 +2200,7 @@ def trtllm_batch_decode_with_kv_cache(
             kv_layout=kv_layout,
             enable_pdl=enable_pdl,
             q_len_per_req=q_len_per_req,
+            o_scale=o_scale,
         )
     elif backend == "trtllm-gen":
         # Convert NHD layout to HND if necessary (transpose only changes stride, not data)
@@ -2340,6 +2345,7 @@ def xqa_batch_decode_with_kv_cache(
     kv_layout: str = "NHD",
     enable_pdl: bool = None,
     q_len_per_req: Optional[int] = 1,
+    o_scale: Optional[float] = 1.0,
 ) -> torch.Tensor:
     """
     Parameters
@@ -2388,6 +2394,9 @@ def xqa_batch_decode_with_kv_cache(
         Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
         Only supported for >= sm90, and currently only for FA2, CUDA core, and trtllm-gen decode.
 
+    o_scale : Optional[float] = 1.0
+        output scale factor for fp8 output.
+
     Returns
     -------
     out : torch.Tensor
@@ -2434,7 +2443,7 @@ def xqa_batch_decode_with_kv_cache(
     workspace_u8 = workspace_buffer.view(torch.uint8)
     semaphore = workspace_u8[: 8 * 1024 * 1024]  # reserve 8MB for semaphore
     scratch = workspace_u8[8 * 1024 * 1024 :]
-    kv_scale_value = bmm2_scale
+    kv_scale_value = bmm2_scale * o_scale
     q_scale_value = bmm1_scale / kv_scale_value * (head_dim**0.5)
 
     query_new = query.unsqueeze(1)
@@ -2464,6 +2473,7 @@ def xqa_batch_decode_with_kv_cache(
         kv_layout=kv_layout,
         sm_count=sm_count,
         enable_pdl=enable_pdl,
+        rcp_out_scale=1.0 / o_scale,
     )
 
     return out
