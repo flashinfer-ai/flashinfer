@@ -46,10 +46,12 @@ def get_pod_module(*args):
     module = gen_pod_module(*args).build_and_load()
     return SimpleNamespace(run_tensor=module.pod_with_kv_cache_tensor)
 
+
 @functools.cache
 def get_batch_pod_module(*args):
     module = gen_batch_pod_module(*args).build_and_load()
     return SimpleNamespace(run_tensor=module.batch_pod_with_kv_cache_tensor)
+
 
 class PODWithPagedKVCacheWrapper:
     r"""Wrapper class for POD-Attention with paged kv-cache (first proposed in
@@ -615,6 +617,7 @@ class PODWithPagedKVCacheWrapper:
         r"""Warning: this function is deprecated and has no effect."""
         pass
 
+
 class BatchPODWithPagedKVCacheWrapper:
     r"""Wrapper class for POD-Attention with paged kv-cache (first proposed in
     `<https://arxiv.org/abs/2410.18038>`_) for batch of requests.
@@ -837,12 +840,8 @@ class BatchPODWithPagedKVCacheWrapper:
         batch_size_p = len(last_page_len_p)
         qo_indptr_host_p = qo_indptr_p.to("cpu")
         total_num_rows_p = int(qo_indptr_host_p[-1])
-        self._kv_indptr_buf_p = kv_indptr_p.to(
-            self.device, non_blocking=non_blocking
-        )
-        self._kv_indices_buf_p = kv_indices_p.to(
-            self.device, non_blocking=non_blocking
-        )
+        self._kv_indptr_buf_p = kv_indptr_p.to(self.device, non_blocking=non_blocking)
+        self._kv_indices_buf_p = kv_indices_p.to(self.device, non_blocking=non_blocking)
         self._kv_last_page_len_buf_p = last_page_len_p.to(
             self.device, non_blocking=non_blocking
         )
@@ -851,7 +850,9 @@ class BatchPODWithPagedKVCacheWrapper:
         )
         kv_indptr_host_p = kv_indptr_p.to("cpu")
         last_page_len_host_p = last_page_len_p.to("cpu")
-        kv_lens_arr_host_p = get_seq_lens(kv_indptr_host_p, last_page_len_host_p, page_size)
+        kv_lens_arr_host_p = get_seq_lens(
+            kv_indptr_host_p, last_page_len_host_p, page_size
+        )
 
         if data_type is not None:
             if q_data_type is None:
@@ -908,12 +909,8 @@ class BatchPODWithPagedKVCacheWrapper:
         batch_size_d = len(last_page_len_d)
         qo_indptr_host_d = qo_indptr_d.to("cpu")
         total_num_rows_d = int(qo_indptr_host_d[-1])
-        self._kv_indptr_buf_d = kv_indptr_d.to(
-            self.device, non_blocking=non_blocking
-        )
-        self._kv_indices_buf_d = kv_indices_d.to(
-            self.device, non_blocking=non_blocking
-        )
+        self._kv_indptr_buf_d = kv_indptr_d.to(self.device, non_blocking=non_blocking)
+        self._kv_indices_buf_d = kv_indices_d.to(self.device, non_blocking=non_blocking)
         self._kv_last_page_len_buf_d = last_page_len_d.to(
             self.device, non_blocking=non_blocking
         )
@@ -922,7 +919,9 @@ class BatchPODWithPagedKVCacheWrapper:
         )
         kv_indptr_host_d = kv_indptr_d.to("cpu")
         last_page_len_host_d = last_page_len_d.to("cpu")
-        kv_lens_arr_host_d = get_seq_lens(kv_indptr_host_d, last_page_len_host_d, page_size)
+        kv_lens_arr_host_d = get_seq_lens(
+            kv_indptr_host_d, last_page_len_host_d, page_size
+        )
 
         self._plan_info_d = self._cached_module.plan(
             self._float_workspace_buffer_d,

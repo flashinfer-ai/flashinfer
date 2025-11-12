@@ -34,15 +34,14 @@ enum Operation {
   DECODE = 1,
 };
 
-template <typename KTraits_P, typename KTraits_D, typename PrefillParams,
-          typename DecodeParams>
+template <typename KTraits_P, typename KTraits_D, typename PrefillParams, typename DecodeParams>
 __global__ __launch_bounds__(std::max(
     KTraits_P::NUM_THREADS,
-    KTraits_D::NUM_THREADS)) void BatchPODWithKVCacheTensorKernel(const __grid_constant__ PrefillParams
-                                                                 prefill_params,
-                                                             const __grid_constant__ DecodeParams
-                                                                 decode_params,
-                                                             int* tbAssign) {
+    KTraits_D::NUM_THREADS)) void BatchPODWithKVCacheTensorKernel(const __grid_constant__
+                                                                      PrefillParams prefill_params,
+                                                                  const __grid_constant__
+                                                                      DecodeParams decode_params,
+                                                                  int* tbAssign) {
   extern __shared__ uint8_t smem[];
   // PREFILL VARS
   const uint32_t padded_bsize_p = prefill_params.padded_batch_size;
@@ -136,8 +135,8 @@ __global__ __launch_bounds__(std::max(
     const dim3 tid = dim3(linear_tid % 32, (linear_tid / 32) % KTraits_P::NUM_WARPS_Q,
                           (linear_tid / 32) / KTraits_P::NUM_WARPS_Q);
 
-    BatchPrefillWithPagedKVCacheDevice<KTraits_P>(prefill_params, smem_storage, tid, bx, kv_head_idx,
-                                                  num_kv_heads_p);
+    BatchPrefillWithPagedKVCacheDevice<KTraits_P>(prefill_params, smem_storage, tid, bx,
+                                                  kv_head_idx, num_kv_heads_p);
   } else /* OP == DECODE */ {
     auto& smem_storage = reinterpret_cast<typename KTraits_D::SharedStorage&>(smem);
     // dim3 nblks_d(padded_batch_size_d, 1, num_kv_heads);
@@ -160,14 +159,15 @@ __global__ __launch_bounds__(std::max(
 }
 
 template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, PosEncodingMode POS_ENCODING_MODE,
-          bool USE_FP16_QK_REDUCTION, uint32_t CTA_TILE_Q_P, MaskMode MASK_MODE_P, uint32_t CTA_TILE_Q_D,
-          MaskMode MASK_MODE_D, typename PrefillAttentionVariant, typename DecodeAttentionVariant,
-          typename PrefillParams, typename DecodeParams>
+          bool USE_FP16_QK_REDUCTION, uint32_t CTA_TILE_Q_P, MaskMode MASK_MODE_P,
+          uint32_t CTA_TILE_Q_D, MaskMode MASK_MODE_D, typename PrefillAttentionVariant,
+          typename DecodeAttentionVariant, typename PrefillParams, typename DecodeParams>
 cudaError_t BatchPODWithKVCacheTensorDispatched(PrefillParams prefill_params,
-                                           typename PrefillParams::DTypeO* tmp_v_p, float* tmp_s_p,
-                                           DecodeParams decode_params,
-                                           typename DecodeParams::DTypeO* tmp_v_d, float* tmp_s_d,
-                                           bool enable_pdl, cudaStream_t stream) {
+                                                typename PrefillParams::DTypeO* tmp_v_p,
+                                                float* tmp_s_p, DecodeParams decode_params,
+                                                typename DecodeParams::DTypeO* tmp_v_d,
+                                                float* tmp_s_d, bool enable_pdl,
+                                                cudaStream_t stream) {
   static_assert(std::is_same<typename PrefillParams::DTypeQ, typename DecodeParams::DTypeQ>::value);
   static_assert(
       std::is_same<typename PrefillParams::DTypeKV, typename DecodeParams::DTypeKV>::value);
@@ -254,11 +254,10 @@ cudaError_t BatchPODWithKVCacheTensorDispatched(PrefillParams prefill_params,
 
   // control NUM_MMA_KV for maximum warp occupancy
   DISPATCH_NUM_MMA_KV(min(max_num_mma_kv_smem_p, max_num_mma_kv_reg_p), NUM_MMA_KV_P, {
-    using KTraits_P =
-        KernelTraits<MASK_MODE_P, CTA_TILE_Q_P, NUM_MMA_Q_P, NUM_MMA_KV_P, NUM_MMA_D_QK,
-                      NUM_MMA_D_VO, NUM_WARPS_Q_P, NUM_WARPS_KV_P, POS_ENCODING_MODE, DTypeQ_P,
-                      DTypeKV_P, DTypeO_P, DTypeQKAccum_P, typename PrefillParams::IdType,
-                      PrefillAttentionVariant>;
+    using KTraits_P = KernelTraits<MASK_MODE_P, CTA_TILE_Q_P, NUM_MMA_Q_P, NUM_MMA_KV_P,
+                                   NUM_MMA_D_QK, NUM_MMA_D_VO, NUM_WARPS_Q_P, NUM_WARPS_KV_P,
+                                   POS_ENCODING_MODE, DTypeQ_P, DTypeKV_P, DTypeO_P, DTypeQKAccum_P,
+                                   typename PrefillParams::IdType, PrefillAttentionVariant>;
 
     if constexpr (KTraits_P::IsInvalid()) {
       // Invalid configuration, skip
@@ -268,7 +267,7 @@ cudaError_t BatchPODWithKVCacheTensorDispatched(PrefillParams prefill_params,
               << " NUM_MMA_KV=" << NUM_MMA_KV_P << " NUM_WARPS_Q=" << NUM_WARPS_Q_P
               << " NUM_WARPS_KV=" << NUM_WARPS_KV_P
               << " please create an issue (https://github.com/flashinfer-ai/flashinfer/issues)"
-                  " and report the issue to the developers.";
+                 " and report the issue to the developers.";
       FLASHINFER_ERROR(err_msg.str());
     } else {
       // Decode stuff
@@ -276,19 +275,18 @@ cudaError_t BatchPODWithKVCacheTensorDispatched(PrefillParams prefill_params,
       DISPATCH_NUM_MMA_KV(min(max_num_mma_kv_smem_d, max_num_mma_kv_reg_d), NUM_MMA_KV_D, {
         using KTraits_D =
             KernelTraits<MASK_MODE_D, CTA_TILE_Q_D, NUM_MMA_Q_D, NUM_MMA_KV_D, NUM_MMA_D_QK,
-                          NUM_MMA_D_VO, NUM_WARPS_Q_D, NUM_WARPS_KV_D, POS_ENCODING_MODE, DTypeQ_D,
-                          DTypeKV_D, DTypeO_D, DTypeQKAccum_D, typename DecodeParams::IdType,
-                          DecodeAttentionVariant>;
+                         NUM_MMA_D_VO, NUM_WARPS_Q_D, NUM_WARPS_KV_D, POS_ENCODING_MODE, DTypeQ_D,
+                         DTypeKV_D, DTypeO_D, DTypeQKAccum_D, typename DecodeParams::IdType,
+                         DecodeAttentionVariant>;
         if constexpr (KTraits_D::IsInvalid()) {
           // Invalid configuration, skip
           std::ostringstream err_msg;
-          err_msg
-              << "FlashInfer Internal Error: Invalid configuration : NUM_MMA_Q=" << NUM_MMA_Q_D
-              << " NUM_MMA_D_QK=" << NUM_MMA_D_QK << " NUM_MMA_D_VO=" << NUM_MMA_D_VO
-              << " NUM_MMA_KV=" << NUM_MMA_KV_D << " NUM_WARPS_Q=" << NUM_WARPS_Q_D
-              << " NUM_WARPS_KV=" << NUM_WARPS_KV_D
-              << " please create an issue (https://github.com/flashinfer-ai/flashinfer/issues)"
-                  " and report the issue to the developers.";
+          err_msg << "FlashInfer Internal Error: Invalid configuration : NUM_MMA_Q=" << NUM_MMA_Q_D
+                  << " NUM_MMA_D_QK=" << NUM_MMA_D_QK << " NUM_MMA_D_VO=" << NUM_MMA_D_VO
+                  << " NUM_MMA_KV=" << NUM_MMA_KV_D << " NUM_WARPS_Q=" << NUM_WARPS_Q_D
+                  << " NUM_WARPS_KV=" << NUM_WARPS_KV_D
+                  << " please create an issue (https://github.com/flashinfer-ai/flashinfer/issues)"
+                     " and report the issue to the developers.";
           FLASHINFER_ERROR(err_msg.str());
         } else {
           // End decode stuff
@@ -350,8 +348,8 @@ cudaError_t BatchPODWithKVCacheTensorDispatched(PrefillParams prefill_params,
 
           // Setup kernel arguments
           void* args[] = {(void*)&prefill_params, (void*)&decode_params, (void*)&tbAssign};
-          FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
-              kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+          FLASHINFER_CUDA_CALL(
+              cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
           // Launch kernel
           if (enable_pdl) {
@@ -365,8 +363,8 @@ cudaError_t BatchPODWithKVCacheTensorDispatched(PrefillParams prefill_params,
             config.blockDim = nthrs;
             config.dynamicSmemBytes = smem_size;
             config.stream = stream;
-            FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, prefill_params,
-                                                    decode_params, tbAssign));
+            FLASHINFER_CUDA_CALL(
+                cudaLaunchKernelEx(&config, kernel, prefill_params, decode_params, tbAssign));
           } else {
             FLASHINFER_CUDA_CALL(
                 cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));

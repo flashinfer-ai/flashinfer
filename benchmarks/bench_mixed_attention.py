@@ -107,12 +107,8 @@ def run_bench(
     kv_d = kv_data[: d_kv_indptr[-1]].unbind(1)
     q_p = q[d_q_indptr[-1] :]
     kv_p = kv_data[d_kv_indptr[-1] :].unbind(1)
-    kv_indices_d = torch.arange(
-        0, d_kv_indptr[-1], device=device, dtype=torch.int32
-    )
-    kv_indices_p = torch.arange(
-        0, p_kv_indptr[-1], device=device, dtype=torch.int32
-    )
+    kv_indices_d = torch.arange(0, d_kv_indptr[-1], device=device, dtype=torch.int32)
+    kv_indices_p = torch.arange(0, p_kv_indptr[-1], device=device, dtype=torch.int32)
 
     last_page_len_d = (d_seq_lens_blocks - 1) % page_block_size + 1
     last_page_len_p = (p_seq_lens_blocks - 1) % page_block_size + 1
@@ -266,7 +262,9 @@ def run_bench(
 
     print(f"Memory bandwidth (Batched Prefill): {bandwidth_old_gb_s:.2f} GB/s")
     bandwidth_batch_pod_gb_s = total_bytes / (ms_batch_pod * 1e-3) / (1024**3)
-    print(f"Memory bandwidth (Batched POD Attention): {bandwidth_batch_pod_gb_s:.2f} GB/s")
+    print(
+        f"Memory bandwidth (Batched POD Attention): {bandwidth_batch_pod_gb_s:.2f} GB/s"
+    )
     if len(p_kv_lens) == 1:
         bandwidth_pod_gb_s = total_bytes / (ms_pod * 1e-3) / (1024**3)
         print(f"Memory bandwidth (POD Attention): {bandwidth_pod_gb_s:.2f} GB/s")
@@ -286,7 +284,13 @@ if __name__ == "__main__":
 
     # Irregular sequence lengths for prefill and decode
     d_q_len_configs = [[1] * 128, [1] * 128, [1] * 128, [1] * 128, [1] * 128]
-    d_kv_len_configs = [[2048] * 128, [2048] * 128, [4096] * 128, [8192] * 128, [8192] * 128]
+    d_kv_len_configs = [
+        [2048] * 128,
+        [2048] * 128,
+        [4096] * 128,
+        [8192] * 128,
+        [8192] * 128,
+    ]
     p_q_configs = [[2048] * 2, [2048], [4096], [4096], [6000]]
     p_kv_configs = [[2048] * 2, [2048], [4096], [4096], [7000]]
 

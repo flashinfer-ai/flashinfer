@@ -629,6 +629,7 @@ def gen_pod_module(
         use_fp16_qk_reduction=use_fp16_qk_reduction,
     )
 
+
 def gen_batch_pod_module(
     dtype_q: torch.dtype,
     dtype_kv: torch.dtype,
@@ -643,7 +644,7 @@ def gen_batch_pod_module(
     use_sliding_window_d: bool,
     use_logits_soft_cap_d: bool,
 ) -> JitSpec:
-    uri = 'batch_' + get_pod_uri(
+    uri = "batch_" + get_pod_uri(
         dtype_q,
         dtype_kv,
         dtype_o,
@@ -692,6 +693,7 @@ def gen_batch_pod_module(
         use_logits_soft_cap_d=use_logits_soft_cap_d,
         use_fp16_qk_reduction=use_fp16_qk_reduction,
     )
+
 
 def gen_customize_pod_module(
     uri: str,
@@ -792,6 +794,7 @@ def gen_customize_pod_module(
 
     return gen_jit_spec(uri, source_paths)
 
+
 def gen_customize_batch_pod_module(
     uri: str,
     dtype_q: torch.dtype,
@@ -890,6 +893,7 @@ def gen_customize_batch_pod_module(
         write_if_different(dest_path, source)
 
     return gen_jit_spec(uri, source_paths)
+
 
 def gen_batch_decode_module(
     dtype_q: torch.dtype,

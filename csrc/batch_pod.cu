@@ -21,14 +21,15 @@
 
 namespace flashinfer {
 template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, PosEncodingMode POS_ENCODING_MODE,
-          bool USE_FP16_QK_REDUCTION, uint32_t CTA_TILE_Q_P, MaskMode MASK_MODE_P, uint32_t CTA_TILE_Q_D,
-          MaskMode MASK_MODE_D, typename PrefillAttentionVariant, typename DecodeAttentionVariant,
-          typename PrefillParams, typename DecodeParams>
+          bool USE_FP16_QK_REDUCTION, uint32_t CTA_TILE_Q_P, MaskMode MASK_MODE_P,
+          uint32_t CTA_TILE_Q_D, MaskMode MASK_MODE_D, typename PrefillAttentionVariant,
+          typename DecodeAttentionVariant, typename PrefillParams, typename DecodeParams>
 cudaError_t BatchPODWithKVCacheTensorDispatched(PrefillParams prefill_params,
-                                           typename PrefillParams::DTypeO* tmp_v_p, float* tmp_s_p,
-                                           DecodeParams decode_params,
-                                           typename DecodeParams::DTypeO* tmp_v_d, float* tmp_s_d,
-                                           bool enable_pdl, cudaStream_t stream);
+                                                typename PrefillParams::DTypeO* tmp_v_p,
+                                                float* tmp_s_p, DecodeParams decode_params,
+                                                typename DecodeParams::DTypeO* tmp_v_d,
+                                                float* tmp_s_d, bool enable_pdl,
+                                                cudaStream_t stream);
 
 }  // namespace flashinfer
 
@@ -122,8 +123,8 @@ void batch_pod_with_kv_cache_tensor(
     num_kv_heads_d = paged_k_cache_d.size(2);
   }
   TVM_FFI_ICHECK_EQ(num_kv_heads_p, num_kv_heads_d)
-      << "POD currently requires same # KV heads for prefill and decode; Prefill: " << num_kv_heads_p
-      << ", Decode: " << num_kv_heads_d;
+      << "POD currently requires same # KV heads for prefill and decode; Prefill: "
+      << num_kv_heads_p << ", Decode: " << num_kv_heads_d;
 
   if (maybe_lse_d.has_value()) {
     const auto& lse = maybe_lse_d.value();
@@ -151,8 +152,8 @@ void batch_pod_with_kv_cache_tensor(
   kv_cache_strides_d = k_strides_d.data();
 
   // Already handled by prefill
-  //cudaSetDevice(float_workspace_buffer_d.device().device_id);
-  //const cudaStream_t stream = get_stream(float_workspace_buffer_d.device());
+  // cudaSetDevice(float_workspace_buffer_d.device().device_id);
+  // const cudaStream_t stream = get_stream(float_workspace_buffer_d.device());
 
   DISPATCH_context(
       MASK_MODE_P, MASK_MODE_D, DTypeQ, DTypeKV, HEAD_DIM_QK, USE_SLIDING_WINDOW_P,
@@ -213,7 +214,8 @@ void batch_pod_with_kv_cache_tensor(
               GetPtrFromBaseOffset<IdType>(int_buffer_ptr_p, plan_info_p.qo_tile_indices_offset);
           params.kv_tile_indices =
               GetPtrFromBaseOffset<IdType>(int_buffer_ptr_p, plan_info_p.kv_tile_indices_offset);
-          params.o_indptr = GetPtrFromBaseOffset<IdType>(int_buffer_ptr_p, plan_info_p.o_indptr_offset);
+          params.o_indptr =
+              GetPtrFromBaseOffset<IdType>(int_buffer_ptr_p, plan_info_p.o_indptr_offset);
           params.kv_chunk_size_ptr =
               GetPtrFromBaseOffset<IdType>(int_buffer_ptr_p, plan_info_p.kv_chunk_size_ptr_offset);
           if (plan_info_p.split_kv) {
@@ -290,7 +292,8 @@ void batch_pod_with_kv_cache_tensor(
               GetPtrFromBaseOffset<IdType>(int_buffer_ptr_d, plan_info_d.qo_tile_indices_offset);
           params.kv_tile_indices =
               GetPtrFromBaseOffset<IdType>(int_buffer_ptr_d, plan_info_d.kv_tile_indices_offset);
-          params.o_indptr = GetPtrFromBaseOffset<IdType>(int_buffer_ptr_d, plan_info_d.o_indptr_offset);
+          params.o_indptr =
+              GetPtrFromBaseOffset<IdType>(int_buffer_ptr_d, plan_info_d.o_indptr_offset);
           params.kv_chunk_size_ptr =
               GetPtrFromBaseOffset<IdType>(int_buffer_ptr_d, plan_info_d.kv_chunk_size_ptr_offset);
           if (plan_info_d.split_kv) {
@@ -322,10 +325,10 @@ void batch_pod_with_kv_cache_tensor(
         DISPATCH_CTA_TILE_Q(plan_info_p.cta_tile_q, CTA_TILE_Q_P, {
           constexpr size_t CTA_TILE_Q_D = 16;
           cudaError_t status = flashinfer::BatchPODWithKVCacheTensorDispatched<
-              HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE, USE_FP16_QK_REDUCTION, CTA_TILE_Q_P, MASK_MODE_P,
-              CTA_TILE_Q_D, MASK_MODE_D, PrefillAttentionVariant, DecodeAttentionVariant>(
-              prefill_params, tmp_v_p, tmp_s_p, decode_params, tmp_v_d, tmp_s_d,
-              enable_pdl, stream);
+              HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE, USE_FP16_QK_REDUCTION, CTA_TILE_Q_P,
+              MASK_MODE_P, CTA_TILE_Q_D, MASK_MODE_D, PrefillAttentionVariant,
+              DecodeAttentionVariant>(prefill_params, tmp_v_p, tmp_s_p, decode_params, tmp_v_d,
+                                      tmp_s_d, enable_pdl, stream);
           TVM_FFI_ICHECK(status == cudaSuccess)
               << "BatchPODWithKVCache kernel launch failed, error: " << cudaGetErrorString(status);
         });
