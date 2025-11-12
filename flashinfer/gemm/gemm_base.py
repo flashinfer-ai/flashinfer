@@ -251,8 +251,8 @@ def mm_bf16(
 
 @supported_compute_capability([100])
 def bmm_bf16(
-    a: torch.Tensor,
-    b: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
     backend: Literal["cutlass"] = "cutlass",
@@ -261,10 +261,10 @@ def bmm_bf16(
 
     Parameters
     ----------
-    a: torch.Tensor
+    A: torch.Tensor
         Input tensor, shape (b, m, k), bf16.
 
-    b: torch.Tensor
+    B: torch.Tensor
         Weight tensor, shape (b, k, n), bf16.
 
     out: Optional[torch.Tensor]
@@ -288,11 +288,11 @@ def bmm_bf16(
     if out_dtype not in (torch.bfloat16, torch.float16):
         raise ValueError("Only bf16 and fp16 outputs are supported.")
 
-    expected_shape = (a.shape[0], a.shape[1], b.shape[2])
+    expected_shape = (A.shape[0], A.shape[1], B.shape[2])
     if out is None:
         out = torch.empty(
             expected_shape,
-            device=a.device,
+            device=A.device,
             dtype=out_dtype,
         )
     else:
@@ -300,9 +300,9 @@ def bmm_bf16(
             raise ValueError(
                 f"Output shape mismatch. Expected {expected_shape}, got {out.shape}."
             )
-        if out.device != a.device:
+        if out.device != A.device:
             raise ValueError(
-                f"Output device mismatch. Expected {a.device}, got {out.device}."
+                f"Output device mismatch. Expected {A.device}, got {out.device}."
             )
         if out.dtype != out_dtype:
             raise ValueError(
@@ -310,9 +310,9 @@ def bmm_bf16(
             )
 
     workspace_buffer = _get_cache_buf(
-        "bmm_bf16_workspace", DEFAULT_WORKSPACE_SIZE, a.device
+        "bmm_bf16_workspace", DEFAULT_WORKSPACE_SIZE, A.device
     )
-    bf16_gemm_sm100(a, b, out, workspace_buffer)
+    bf16_gemm_sm100(A, B, out, workspace_buffer)
     return out
 
 
