@@ -636,7 +636,7 @@ class BatchPODWithPagedKVCacheWrapper:
     >>> page_size = 16
     >>> # allocate 128MB workspace buffer
     >>> workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
-    >>> decode_wrapper = flashinfer.PODWithPagedKVCacheWrapper(
+    >>> wrapper = flashinfer.BatchPODWithPagedKVCacheWrapper(
     ...     workspace_buffer, "NHD"
     ... )
     >>> batch_size = 7
@@ -654,7 +654,7 @@ class BatchPODWithPagedKVCacheWrapper:
     ...     ) for _ in range(num_layers)
     ... ]
     >>> # create auxiliary data structures for batch decode attention
-    >>> decode_wrapper.plan(
+    >>> wrapper.plan(
     ...     kv_page_indptr,
     ...     kv_page_indices,
     ...     kv_last_page_len,
@@ -689,7 +689,7 @@ class BatchPODWithPagedKVCacheWrapper:
         float_workspace_buffer: torch.Tensor,
         kv_layout: str = "NHD",
     ) -> None:
-        r"""Constructor of :class:`PODWithPagedKVCacheWrapper`.
+        r"""Constructor of :class:`BatchPODWithPagedKVCacheWrapper`.
 
         Parameters
         ----------
@@ -701,9 +701,6 @@ class BatchPODWithPagedKVCacheWrapper:
         kv_layout : str
             The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
 
-        jit_args : Optional[List[Any]]
-            If provided, the wrapper will use the provided arguments to create the JIT module,
-            otherwise, the wrapper will use default attention implementation.
         """
         _check_kv_layout(kv_layout)
         # Override options. Only tensor core version is performant.
@@ -768,7 +765,6 @@ class BatchPODWithPagedKVCacheWrapper:
         num_kv_heads: int,
         head_dim: int,
         page_size: int,
-        causal_p: bool = False,
         pos_encoding_mode: str = "NONE",
         window_left: int = -1,
         q_data_type: Optional[Union[str, torch.dtype]] = "float16",
@@ -789,7 +785,7 @@ class BatchPODWithPagedKVCacheWrapper:
             The prefill indptr of the paged kv-cache, shape: ``[batch_size + 1]``.
         kv_indices_p : torch.Tensor
             The prefill page indices of the paged kv-cache, shape: ``[kv_indptr[-1]]``.
-        kv_last_page_len_p : torch.Tensor
+        last_page_len_p : torch.Tensor
             The number of entries in the last page of each prefill request in the paged
             kv-cache, shape: ``[batch_size]``.
         qo_indptr_d : torch.Tensor
@@ -798,7 +794,7 @@ class BatchPODWithPagedKVCacheWrapper:
             The decode indptr of the paged kv-cache, shape: ``[batch_size + 1]``.
         kv_indices_d : torch.Tensor
             The decode page indices of the paged kv-cache, shape: ``[kv_indptr[-1]]``.
-        kv_last_page_len_d : torch.Tensor
+        last_page_len_d : torch.Tensor
             The number of entries in the last page of each decode request in the paged
             kv-cache, shape: ``[batch_size]``.
         num_qo_heads : int
@@ -824,6 +820,14 @@ class BatchPODWithPagedKVCacheWrapper:
         data_type: Optional[Union[str, torch.dtype]]
             The data type of both the query and key/value tensors. Defaults to torch.float16.
             data_type is deprecated, please use q_data_type and kv_data_type instead.
+        sm_scale : Optional[float]
+            The scale used in softmax, if not provided, will be set to
+            ``1.0 / sqrt(head_dim_qk)``.
+        rope_scale : Optional[float]
+            The scale used in RoPE interpolation, if not provided, will be set to
+            ``1.0``.
+        rope_theta : Optional[float]
+            The theta used in RoPE, if not provided, will be set to ``1e4``.
         non_blocking : bool
             Whether to copy the input tensors to the device asynchronously, defaults to ``True``.
 
@@ -979,7 +983,6 @@ class BatchPODWithPagedKVCacheWrapper:
         return_lse: bool = False,
         use_fp16_qk_reduction: bool = False,
         enable_pdl: Optional[bool] = None,
-        *args,
     ) -> Union[
         Tuple[torch.Tensor, torch.Tensor],
         Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]],

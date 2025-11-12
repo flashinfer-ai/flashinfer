@@ -28,4 +28,4 @@ template cudaError_t BatchPODWithKVCacheTensorDispatched<
             DecodeParams decode_params, {{ dtype_o }}* tmp_v_d, float *tmp_s_d,
             bool enable_pdl, cudaStream_t stream, int* sm_aware_sched);
 {% endfor %}
-};
+}
