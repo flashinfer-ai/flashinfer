@@ -331,15 +331,17 @@ void batch_pod_with_kv_cache_tensor(
         // SM-aware scheduling buffer uses num_sm + 2 entries
         // num_sm entries for counters for each SM, and
         // 2 entries for keeping track of blockIds for prefill and decode
-        assert(sm_aware_sched.ndim() == 1 && sm_aware_sched.size(0) == num_sm + 2 &&
-               "sm_aware_sched tensor has incorrect shape or type, should be (num_sm + 2,) of int32");
+        assert(
+            sm_aware_sched.ndim() == 1 && sm_aware_sched.size(0) == num_sm + 2 &&
+            "sm_aware_sched tensor has incorrect shape or type, should be (num_sm + 2,) of int32");
         DISPATCH_CTA_TILE_Q(plan_info_p.cta_tile_q, CTA_TILE_Q_P, {
           constexpr size_t CTA_TILE_Q_D = 16;
           cudaError_t status = flashinfer::BatchPODWithKVCacheTensorDispatched<
               HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE, USE_FP16_QK_REDUCTION, CTA_TILE_Q_P,
               MASK_MODE_P, CTA_TILE_Q_D, MASK_MODE_D, PrefillAttentionVariant,
               DecodeAttentionVariant>(prefill_params, tmp_v_p, tmp_s_p, decode_params, tmp_v_d,
-                                      tmp_s_d, enable_pdl, stream, static_cast<int*>(sm_aware_sched.data_ptr()));
+                                      tmp_s_d, enable_pdl, stream,
+                                      static_cast<int*>(sm_aware_sched.data_ptr()));
           TVM_FFI_ICHECK(status == cudaSuccess)
               << "BatchPODWithKVCache kernel launch failed, error: " << cudaGetErrorString(status);
           return status;

@@ -335,7 +335,8 @@ cudaError_t BatchPODWithKVCacheTensorDispatched(PrefillParams prefill_params,
           int num_sm = 0;
           FLASHINFER_CUDA_CALL(
               cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
-          FLASHINFER_CUDA_CALL(cudaMemsetAsync(sm_aware_sched, 0, sizeof(int) * (num_sm + 2), stream));
+          FLASHINFER_CUDA_CALL(
+              cudaMemsetAsync(sm_aware_sched, 0, sizeof(int) * (num_sm + 2), stream));
 
           // Setup kernel arguments
           void* args[] = {(void*)&prefill_params, (void*)&decode_params, (void*)&sm_aware_sched};
