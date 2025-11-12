@@ -253,6 +253,10 @@ def run_bench(
         print(f"Elapsed time (POD Attention): {ms_pod:.2f} ms")
         print(f"Elapsed time (Sequential two kernels): {ms_seq_two_kernels:.2f} ms")
     print(f"Elapsed time (Persistent BatchAttention): {ms_persistent:.2f} ms")
+    print(
+        f"Batch POD speedup over Persistent BatchAttention: {ms_persistent / ms_batch_pod:.2f}x"
+    )
+
     total_bytes = (
         q.numel() * q.element_size() + kv_data.numel() * kv_data.element_size()
     )

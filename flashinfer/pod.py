@@ -965,26 +965,18 @@ class BatchPODWithPagedKVCacheWrapper:
         custom_mask_p: Optional[torch.Tensor] = None,
         packed_custom_mask_p: Optional[torch.Tensor] = None,
         causal_p: bool = False,
-        pos_encoding_mode_p: str = "NONE",
-        sm_scale_p: Optional[float] = None,
-        window_left_p: int = -1,
-        rope_scale_p: Optional[float] = None,
-        rope_theta_p: Optional[float] = None,
-        return_lse_p: bool = False,
-        # Decode options
-        pos_encoding_mode_d: str = "NONE",
-        sm_scale_d: Optional[float] = None,
-        window_left_d: int = -1,
-        rope_scale_d: Optional[float] = None,
-        rope_theta_d: Optional[float] = None,
+        # Common options
+        return_lse: bool = False,
         q_scale: Optional[float] = None,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
-        return_lse_d: bool = False,
         use_fp16_qk_reduction: bool = False,
         enable_pdl: Optional[bool] = None,
         *args,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    ) -> Union[
+        Tuple[torch.Tensor, torch.Tensor],
+        Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]],
+    ]:
         r"""Compute POD-attention for a batch of requests."""
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q_p.device)
@@ -997,7 +989,7 @@ class BatchPODWithPagedKVCacheWrapper:
         _check_cached_qkv_data_type(
             q_p, k_cache_p, self._cached_q_data_type, self._cached_kv_data_type
         )
-        # TODO_AK: Where are these coming from?
+        # Get params from plan
         pos_encoding_mode_p = self._pos_encoding_mode
         window_left_p = self._window_left
         logits_soft_cap_p = self._logits_soft_cap
@@ -1005,7 +997,6 @@ class BatchPODWithPagedKVCacheWrapper:
         rope_scale_p = self._rope_scale
         rope_theta_p = self._rope_theta
         _check_pos_encoding_mode(pos_encoding_mode_p)
-        # What are the above for and what are the below?
         if logits_soft_cap_p is None:
             logits_soft_cap_p = 0.0
         if sm_scale_p is None:
@@ -1035,7 +1026,7 @@ class BatchPODWithPagedKVCacheWrapper:
                 mask_mode_p = MaskMode.NON_CAUSAL.value
 
         lse_p = None
-        if return_lse_p:
+        if return_lse:
             lse_p = torch.empty(
                 (q_p.size(0), q_p.size(1)), dtype=torch.float32, device=q_p.device
             )
@@ -1046,7 +1037,7 @@ class BatchPODWithPagedKVCacheWrapper:
         _check_cached_qkv_data_type(
             q_d, k_cache_d, self._cached_q_data_type, self._cached_kv_data_type
         )
-        # TODO_AK: Where are these coming from?
+        # Get params from plan
         pos_encoding_mode_d = self._pos_encoding_mode
         window_left_d = self._window_left
         logits_soft_cap_d = self._logits_soft_cap
@@ -1054,7 +1045,6 @@ class BatchPODWithPagedKVCacheWrapper:
         rope_scale_d = self._rope_scale
         rope_theta_d = self._rope_theta
         _check_pos_encoding_mode(pos_encoding_mode_d)
-        # What are the above for and what are the below?
         if logits_soft_cap_d is None:
             logits_soft_cap_d = 0.0
         if sm_scale_d is None:
@@ -1070,7 +1060,7 @@ class BatchPODWithPagedKVCacheWrapper:
             rope_theta_d = 1e4
 
         lse_d = None
-        if return_lse_d:
+        if return_lse:
             lse_d = torch.empty(
                 (q_d.size(0), q_d.size(1)), dtype=torch.float32, device=q_d.device
             )
@@ -1114,7 +1104,7 @@ class BatchPODWithPagedKVCacheWrapper:
             mask_mode_p,
             TensorLayout[self._kv_layout].value,
             window_left_p,
-            None,  # packed_custom_mask
+            packed_custom_mask_p,  # packed_custom_mask
             None,  # mask_indptr_buf
             _get_cache_alibi_slopes_buf(q_p.shape[1], q_p.device),
             logits_soft_cap_p,
@@ -1150,7 +1140,7 @@ class BatchPODWithPagedKVCacheWrapper:
         if v_scale is not None:
             out_d *= v_scale
 
-        return (out_p, out_d)
+        return ((out_p, out_d), (lse_p, lse_d)) if return_lse else (out_p, out_d)
 
     def end_forward(self) -> None:
         r"""Warning: this function is deprecated and has no effect."""
