@@ -404,6 +404,7 @@ def gen_xqa(
             head_dim=head_size,
             head_group_ratio=head_grp_size,
             use_sliding_window=use_sliding_window,
+            output_dtype=input_type,
         )
 
     if has_sm120 or has_sm121:

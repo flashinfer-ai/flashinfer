@@ -38,7 +38,7 @@ def get_xqa_module(
     head_dim: int,
     head_group_ratio: int,
     use_sliding_window: bool,
-    use_fp8_output: bool,
+    output_dtype: torch.dtype,
 ):
     module = gen_xqa_module(
         input_dtype,
@@ -47,11 +47,11 @@ def get_xqa_module(
         head_dim,
         head_group_ratio,
         use_sliding_window,
-        use_fp8_output,
+        output_dtype,
     ).build_and_load()
 
     @register_custom_op(
-        f"flashinfer::xqa_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}_use_fp8_output_{use_fp8_output}",
+        f"flashinfer::xqa_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_output_{filename_safe_dtype_map[output_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}",
         mutates_args=("output", "workspace_buffer"),
     )
     def xqa(
@@ -98,7 +98,7 @@ def get_xqa_module(
         )
 
     @register_fake_op(
-        f"flashinfer::xqa_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}_use_fp8_output_{use_fp8_output}"
+        f"flashinfer::xqa_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_output_{filename_safe_dtype_map[output_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}"
     )
     def _fake_xqa(
         run_sm90_fp8_mha: bool,
@@ -243,9 +243,8 @@ def xqa(
         assert k_cache.dtype == torch.float8_e4m3fn, (
             "KV cache must be fp8 when output is fp8"
         )
-        use_fp8_output = True
     else:
-        use_fp8_output = False
+        assert output.dtype == q.dtype, "Output and query must have the same dtype"
 
     # Convert HND layout to NHD if necessary (transpose only changes stride, not data)
     if kv_layout == "HND":
@@ -271,7 +270,7 @@ def xqa(
         head_dim,
         head_group_ratio,
         use_sliding_window,
-        use_fp8_output,
+        output.dtype,
     )
     xqa_module.xqa(
         run_sm90_fp8_mha,
