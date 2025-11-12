@@ -414,7 +414,7 @@ class MnnvlMemory:  # type: ignore[no-redef]
                 pidfds.append(pidfd)
 
             remote_fds = []
-            for pidfd, fd in zip(pidfds, all_handles_data):
+            for pidfd, fd in zip(pidfds, all_handles_data, strict=False):
                 remote_fd = syscall(SYS_pidfd_getfd, pidfd, fd, 0)
                 if remote_fd < 0:
                     err = ctypes.get_errno()
