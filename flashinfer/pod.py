@@ -17,7 +17,7 @@ limitations under the License.
 import functools
 import math
 from types import SimpleNamespace
-from typing import Any, List, Optional, Tuple, Union, overload
+from typing import Any, List, Optional, Tuple, Union
 
 import torch
 
