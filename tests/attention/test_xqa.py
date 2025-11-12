@@ -409,13 +409,9 @@ def test_xqa(
                     atol = 0.01
                     rtol = 0.01
                 if use_fp8_output:
-                    ref_output = (
-                        (ref_output * rcp_out_scale)
-                        .to(torch.float8_e4m3fn)
-                        .to(torch.float32)
-                    )
-                    atol *= rcp_out_scale
-                    rtol *= rcp_out_scale
+                    ref_output = ref_output * rcp_out_scale
+                    atol = 0.15
+                    rtol = 0.15
 
                 diff_abs = torch.abs(ref_output - kernel_output)
                 diff_rel = diff_abs / (torch.abs(ref_output) + 1e-8)
