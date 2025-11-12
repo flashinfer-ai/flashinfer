@@ -349,6 +349,7 @@ class MultiLevelCascadeAttentionWrapper:
                     paged_kv_indptr_buf_arr,
                     paged_kv_indices_buf_arr,
                     paged_kv_last_page_len_buf_arr,
+                    strict=True,
                 )
             ]
         else:
@@ -381,7 +382,7 @@ class MultiLevelCascadeAttentionWrapper:
             be the same as the device of the input tensors.
         """
         for wrapper, int_workspace_buffer in zip(
-            self._batch_prefill_wrappers, int_workspace_buffers
+            self._batch_prefill_wrappers, int_workspace_buffers, strict=True
         ):
             wrapper.reset_workspace_buffer(float_workspace_buffer, int_workspace_buffer)
 
@@ -479,6 +480,7 @@ class MultiLevelCascadeAttentionWrapper:
                 paged_kv_indptr_arr,
                 paged_kv_indices_arr,
                 paged_kv_last_page_len,
+                strict=True,
             )
         ):
             wrapper.plan(
