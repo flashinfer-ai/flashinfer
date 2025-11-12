@@ -511,6 +511,7 @@ def test_generalized_rope_quantize(
 @pytest.mark.parametrize("quant_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 @pytest.mark.parametrize("enable_pdl", [True, False])
 @pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
+@pytest.mark.parametrize("page_size", [16, 32])
 def test_generalized_rope_quantize_append_kv_cache(
     attention_type,
     num_qo_heads,
@@ -522,6 +523,7 @@ def test_generalized_rope_quantize_append_kv_cache(
     quant_dtype,
     enable_pdl,
     kv_layout,
+    page_size,
 ):
     device = "cuda:0"
     # Fixed seed for reproducibility
@@ -530,7 +532,6 @@ def test_generalized_rope_quantize_append_kv_cache(
         torch.cuda.manual_seed_all(0)
 
     head_dim = rope_dim + no_rope_dim
-    page_size = 16
     batch_size = 4
 
     # Build inputs following the same pattern used elsewhere
@@ -811,6 +812,7 @@ def test_generalized_rope_quantize_append_kv_cache(
 @pytest.mark.parametrize("quant_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 @pytest.mark.parametrize("enable_pdl", [True, False])
 @pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
+@pytest.mark.parametrize("page_size", [16, 32])
 def test_rope_quantize_fp8_append_paged_kv_cache_decode(
     attention_type,
     num_qo_heads,
@@ -823,6 +825,7 @@ def test_rope_quantize_fp8_append_paged_kv_cache_decode(
     quant_dtype,
     enable_pdl,
     kv_layout,
+    page_size,
 ):
     """Test append to non-empty cache (decode/continuation scenario)."""
     device = "cuda:0"
@@ -831,7 +834,6 @@ def test_rope_quantize_fp8_append_paged_kv_cache_decode(
         torch.cuda.manual_seed_all(42)
 
     head_dim = rope_dim + no_rope_dim
-    page_size = 16
     batch_size = 2
 
     # Step 1: Pre-populate cache with existing tokens
