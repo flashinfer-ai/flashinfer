@@ -95,7 +95,7 @@ void launchMHA(
 #endif
     float qScale, OutputHead* output,
 #if LOW_PREC_OUTPUT
-    float const* rcpOutScale,
+    float rcpOutScale,
 #endif
 #if USE_INPUT_KV
     InputHead const* qkv,
@@ -125,7 +125,7 @@ void launchMHA(
 void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32_t slidingWinSize,
                          float qScale, OutputHead* output,
 #if LOW_PREC_OUTPUT
-                         float const* rcpOutScale,
+                         float rcpOutScale,
 #endif
                          InputHead const* q, float const* attentionSinks, GMemCacheHead* kCacheVLLM,
                          GMemCacheHead* vCacheVLLM, KVCachePageIndex const* kvCachePageList,
@@ -145,7 +145,7 @@ void launchHopperF8MHA(
 #endif
     float qScale, OutputHead* output,
 #if LOW_PREC_OUTPUT
-    float const* rcpOutScale,
+    float rcpOutScale,
 #endif
 #if USE_INPUT_KV
     InputHead const* qkv,
@@ -174,7 +174,7 @@ void launchHopperF8MHA(
 void launchHopperF8MHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads,
                                  uint32_t slidingWinSize, float qScale, OutputHead* output,
 #if LOW_PREC_OUTPUT
-                                 float const* rcpOutScale,
+                                 float rcpOutScale,
 #endif
                                  InputHead const* q, float const* attentionSinks,
                                  GMemCacheHead* kCacheVLLM, GMemCacheHead* vCacheVLLM,

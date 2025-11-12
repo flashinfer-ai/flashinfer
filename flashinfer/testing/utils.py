@@ -277,6 +277,12 @@ def attention_flops(
     Returns:
         total_flops (int): Total FLOPs for the layer.
     """
+    # Causal attention requires kv_len >= q_len
+    if qo_seqlen > kv_seqlen:
+        raise ValueError(
+            "qo_seqlen must be less than or equal to kv_seqlen for causal attention"
+        )
+
     if causal:
         bmm1_flops = (
             batch_size
@@ -323,6 +329,13 @@ def attention_flops_with_actual_seq_lens(
     Returns:
         total_flops (int): Total FLOPs for the layer.
     """
+    # Causal attention requires kv_len >= q_len
+    # Otherwise right align if kv_len > q_len
+    if causal and (actual_seq_lens_q > actual_seq_lens_kv).any():
+        raise ValueError(
+            "actual_seq_lens_q must be less than or equal to actual_seq_lens_kv for causal attention"
+        )
+
     if causal:
         bmm1_flops = (
             torch.dot(
@@ -412,7 +425,7 @@ def attention_tflops_per_sec_with_actual_seq_lens(
     head_dim_vo,
     num_qo_heads,
     causal,
-    time,
+    ms,
 ):
     """
     Calculate TFLOPS per second for a given attention layer with actual sequence lengths.
@@ -425,7 +438,7 @@ def attention_tflops_per_sec_with_actual_seq_lens(
         head_dim_vo (int): Head dimension of the value.
         num_qo_heads (int): Number of query heads.
         causal (bool): Whether to use causal masking.
-        time (float): Execution time in milliseconds.
+        ms (float): Execution time in milliseconds.
 
     Returns:
         tflops_per_sec (float): TFLOPS per second for the layer.
@@ -438,7 +451,7 @@ def attention_tflops_per_sec_with_actual_seq_lens(
         num_qo_heads,
         causal,
     )
-    return f.item() / time / 1e9 if not math.isnan(time) else 0.0
+    return f.item() / ms / 1e9 if not math.isnan(ms) else 0.0
 
 
 def attention_tb_per_sec(

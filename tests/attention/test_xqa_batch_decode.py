@@ -311,6 +311,8 @@ def get_last_page_len(seq_lens, page_size):
         ("fp16", "fp16", "fp16"),
         ("bf16", "fp8", "bf16"),
         ("fp16", "fp8", "fp16"),
+        ("bf16", "fp8", "fp8"),
+        ("fp16", "fp8", "fp8"),
     ],
 )
 @pytest.mark.parametrize("enable_pdl", [True, False, None])
@@ -458,12 +460,13 @@ def test_xqa_batch_decode(
         sinks=(sink if enable_sink else None),
         kv_layout=kv_layout,
         q_len_per_req=q_len_per_req,
+        o_scale=o_scale,
     )
 
     # Verification
     torch.testing.assert_close(
-        output,
-        output_ref,
+        output.float(),
+        output_ref.float() / o_scale,
         rtol=1e-1 if kv_dtype == "fp8" else 1e-2,
         atol=1e-1 if kv_dtype == "fp8" else 1e-2,
     )
