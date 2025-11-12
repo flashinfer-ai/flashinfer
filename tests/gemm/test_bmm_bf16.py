@@ -22,7 +22,7 @@ def test_bmm_bf16(b, m, n, k, res_dtype):
         )
     torch.manual_seed(7)
     input = torch.randn([b, m, k], device="cuda", dtype=torch.bfloat16)
-    mat2 = torch.randn([b, n, k], device="cuda", dtype=torch.bfloat16).tranpose(-2, -1)
+    mat2 = torch.randn([b, n, k], device="cuda", dtype=torch.bfloat16).transpose(-2, -1)
     reference = torch.bmm(input, mat2)
 
     out = torch.empty([b, m, n], device="cuda", dtype=res_dtype)

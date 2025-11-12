@@ -22,7 +22,8 @@ def test_mm_bf16(m: int, n: int, k: int, res_dtype: torch.dtype):
 
     torch.manual_seed(42)
     input = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
-    mat2 = torch.randn([k, n], device="cuda", dtype=torch.bfloat16)
+    mat2 = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
+
     reference = torch.mm(input, mat2.T)
 
     out = torch.empty([m, n], device="cuda", dtype=res_dtype)

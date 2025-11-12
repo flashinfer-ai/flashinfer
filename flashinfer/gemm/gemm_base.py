@@ -195,11 +195,10 @@ def mm_bf16(
     Parameters
     ----------
     a: torch.Tensor
-        Input tensor, shape (m, k), bf16 row-major.
+        Input tensor, shape (m, k), bf16.
 
     b: torch.Tensor
-        Weight tensor, shape (k, n), bf16 row-major. This tensor is interpreted
-        as a column-major (n, k) matrix internally.
+        Weight tensor, shape (k, n), bf16.
 
     out: Optional[torch.Tensor]
         Out tensor, shape (m, n), bf16 or fp16, defaults to ``None``.
