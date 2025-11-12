@@ -23,10 +23,10 @@ def run_bench(
     q_lens = torch.tensor(d_qo_lens + p_qo_lens, dtype=torch.int32)
 
     seq_lens_blocks = torch.ceil(seq_lens / page_block_size).int()
-    p_seq_lens_blocks = (
+    p_seq_lens_blocks = torch.ceil(
         torch.tensor(p_kv_lens, dtype=torch.int32) / page_block_size
     ).int()
-    d_seq_lens_blocks = (
+    d_seq_lens_blocks = torch.ceil(
         torch.tensor(d_kv_lens, dtype=torch.int32) / page_block_size
     ).int()
 
