@@ -1077,12 +1077,7 @@ class BatchPODWithPagedKVCacheWrapper:
             logits_soft_cap_p > 0,  # use_logits_soft_cap
             use_fp16_qk_reduction,
             # Decode params
-            # q_d.dtype,
-            # self._cached_kv_data_type,
-            # self._cached_q_data_type,
             self._indptr_type,
-            # head_dim,  # head_dim_qk
-            # head_dim,  # head_dim_vo
             PosEncodingMode[pos_encoding_mode_d].value,
             window_left_d != -1,  # use_sliding_window
             logits_soft_cap_d > 0,  # use_logits_soft_cap
