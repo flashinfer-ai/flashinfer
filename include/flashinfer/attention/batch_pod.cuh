@@ -296,16 +296,6 @@ cudaError_t BatchPODWithKVCacheTensorDispatched(PrefillParams prefill_params,
 
           auto kernel =
               BatchPODWithKVCacheTensorKernel<KTraits_P, KTraits_D, PrefillParams, DecodeParams>;
-          // Prefill: decide num_splits for split-kv
-          int num_blocks_per_sm = 0;
-          int num_sm = 0;
-          FLASHINFER_CUDA_CALL(
-              cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
-          // FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-          //     &num_blocks_per_sm, kernel, num_threads_p, smem_size_p));
-          //  Above function returns 0 for some reason, so we use a workaround
-          num_blocks_per_sm = std::max(
-              1, std::min((int)(max_smem_per_sm / smem_size_p), (int)(256 / num_threads_p)));
 
           // Setup new prefill params if (not) split
           auto o_p = prefill_params.o;
@@ -342,6 +332,9 @@ cudaError_t BatchPODWithKVCacheTensorDispatched(PrefillParams prefill_params,
           int nthrs = max(nthrs_p, nthrs_d);
           //  ************************************************ /
 
+          int num_sm = 0;
+          FLASHINFER_CUDA_CALL(
+              cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
           static int* tbAssign = nullptr;
           if (tbAssign == nullptr) cudaMalloc(&tbAssign, sizeof(int) * (num_sm + 2));
           cudaMemset(tbAssign, 0, sizeof(int) * (num_sm + 2));
