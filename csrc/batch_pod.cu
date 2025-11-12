@@ -29,7 +29,7 @@ cudaError_t BatchPODWithKVCacheTensorDispatched(PrefillParams prefill_params,
                                                 float* tmp_s_p, DecodeParams decode_params,
                                                 typename DecodeParams::DTypeO* tmp_v_d,
                                                 float* tmp_s_d, bool enable_pdl,
-                                                cudaStream_t stream);
+                                                cudaStream_t stream, int* sm_aware_sched);
 
 }  // namespace flashinfer
 
@@ -57,7 +57,7 @@ void batch_pod_with_kv_cache_tensor(
     int64_t window_left_d, Optional<TensorView> maybe_custom_mask_d,
     Optional<TensorView> maybe_mask_indptr_d, Optional<TensorView> maybe_alibi_slopes_d,
     double logits_soft_cap_d, double sm_scale_d, double rope_rcp_scale_d, double rope_rcp_theta_d,
-    bool enable_pdl) {
+    bool enable_pdl, TensorView sm_aware_sched) {
   // Prefill setup
   PrefillPlanInfo plan_info_p;
   plan_info_p.FromVector(std::vector<int64_t>(plan_info_vec_p.begin(), plan_info_vec_p.end()));
@@ -322,15 +322,27 @@ void batch_pod_with_kv_cache_tensor(
         using DecodeAttentionVariant =
             DefaultAttention</*use_custom_mask=*/use_custom_mask_d, USE_SLIDING_WINDOW_D,
                              USE_LOGITS_SOFT_CAP, /*use_alibi_bias=*/false>;
+
+        int dev_id = 0;
+        FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
+        int num_sm = 0;
+        FLASHINFER_CUDA_CALL(
+            cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
+        // SM-aware scheduling buffer uses num_sm + 2 entries
+        // num_sm entries for counters for each SM, and
+        // 2 entries for keeping track of blockIds for prefill and decode
+        assert(sm_aware_sched.ndim() == 1 && sm_aware_sched.size(0) == num_sm + 2 &&
+               "sm_aware_sched tensor has incorrect shape or type, should be (num_sm + 2,) of int32");
         DISPATCH_CTA_TILE_Q(plan_info_p.cta_tile_q, CTA_TILE_Q_P, {
           constexpr size_t CTA_TILE_Q_D = 16;
           cudaError_t status = flashinfer::BatchPODWithKVCacheTensorDispatched<
               HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE, USE_FP16_QK_REDUCTION, CTA_TILE_Q_P,
               MASK_MODE_P, CTA_TILE_Q_D, MASK_MODE_D, PrefillAttentionVariant,
               DecodeAttentionVariant>(prefill_params, tmp_v_p, tmp_s_p, decode_params, tmp_v_d,
-                                      tmp_s_d, enable_pdl, stream);
+                                      tmp_s_d, enable_pdl, stream, static_cast<int*>(sm_aware_sched.data_ptr()));
           TVM_FFI_ICHECK(status == cudaSuccess)
               << "BatchPODWithKVCache kernel launch failed, error: " << cudaGetErrorString(status);
+          return status;
         });
       });
 }

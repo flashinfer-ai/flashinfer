@@ -736,6 +736,12 @@ class BatchPODWithPagedKVCacheWrapper:
             device="cpu",
         )
 
+        # SM aware scheduling buffer, requires SMs count + 2 entries
+        dev_prop = torch.cuda.get_device_properties(self.device)
+        self._sm_aware_sched = torch.empty(
+            (dev_prop.multi_processor_count + 2), dtype=torch.int, device=self.device
+        )
+
         self._fixed_batch_size = 0
 
         self._paged_kv_indptr_buf = None
@@ -965,11 +971,12 @@ class BatchPODWithPagedKVCacheWrapper:
         custom_mask_p: Optional[torch.Tensor] = None,
         packed_custom_mask_p: Optional[torch.Tensor] = None,
         causal_p: bool = False,
-        # Common options
-        return_lse: bool = False,
+        # Decode options
         q_scale: Optional[float] = None,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
+        # Common options
+        return_lse: bool = False,
         use_fp16_qk_reduction: bool = False,
         enable_pdl: Optional[bool] = None,
         *args,
@@ -1002,10 +1009,6 @@ class BatchPODWithPagedKVCacheWrapper:
         if sm_scale_p is None:
             head_dim = q_p.shape[-1]
             sm_scale_p = 1.0 / math.sqrt(head_dim)
-        if q_scale is not None:
-            sm_scale_p *= q_scale
-        if k_scale is not None:
-            sm_scale_p *= k_scale
         if rope_scale_p is None:
             rope_scale_p = 1.0
         if rope_theta_p is None:
@@ -1130,6 +1133,7 @@ class BatchPODWithPagedKVCacheWrapper:
             1.0 / rope_scale_d,
             1.0 / rope_theta_d,
             enable_pdl,
+            self._sm_aware_sched,
         )
 
         if v_scale is not None:

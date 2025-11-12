@@ -41,7 +41,7 @@ __global__ __launch_bounds__(std::max(
                                                                       PrefillParams prefill_params,
                                                                   const __grid_constant__
                                                                       DecodeParams decode_params,
-                                                                  int* tbAssign) {
+                                                                  int* sm_aware_sched) {
   extern __shared__ uint8_t smem[];
   // PREFILL VARS
   const uint32_t padded_bsize_p = prefill_params.padded_batch_size;
@@ -79,7 +79,7 @@ __global__ __launch_bounds__(std::max(
       // = 1 + decode / prefill; when prefill < decode
       const int total_tags = decode_slots / prefill_slots + 1;
       // For this SM, what's the next operation we want to run?
-      op = (atomicAdd(&tbAssign[linear_bid], 1) % total_tags);
+      op = (atomicAdd(&sm_aware_sched[linear_bid], 1) % total_tags);
       if (op > 0) {
         op = 1;
       }
@@ -89,7 +89,7 @@ __global__ __launch_bounds__(std::max(
       const int pref_tags = prefill_slots / decode_slots;
 
       // For this SM, what's the next operation we want to run?
-      op = (atomicAdd(&tbAssign[linear_bid], 1) % (pref_tags + 1));
+      op = (atomicAdd(&sm_aware_sched[linear_bid], 1) % (pref_tags + 1));
       if (op < pref_tags) {
         op = 0;
       } else {
@@ -98,14 +98,14 @@ __global__ __launch_bounds__(std::max(
     }
 
     // Get the next blockId for that operation
-    linear_bid = atomicAdd(&tbAssign[num_SMs + op], 1);
+    linear_bid = atomicAdd(&sm_aware_sched[num_SMs + op], 1);
     // If the blockId obtained exceeds the max blockIds for that op, switch to the other op
     if (op == 0 && linear_bid >= prefill_slots) {
-      linear_bid = atomicAdd(&tbAssign[num_SMs + 1], 1);
+      linear_bid = atomicAdd(&sm_aware_sched[num_SMs + 1], 1);
       op = !op;
     } else if (op == 1 && linear_bid >= decode_slots) {
       op = !op;
-      linear_bid = atomicAdd(&tbAssign[num_SMs + 0], 1);
+      linear_bid = atomicAdd(&sm_aware_sched[num_SMs + 0], 1);
     }
     // Write the blockId and operation to shared memory
     ((int*)smem)[0] = linear_bid;
@@ -167,7 +167,7 @@ cudaError_t BatchPODWithKVCacheTensorDispatched(PrefillParams prefill_params,
                                                 float* tmp_s_p, DecodeParams decode_params,
                                                 typename DecodeParams::DTypeO* tmp_v_d,
                                                 float* tmp_s_d, bool enable_pdl,
-                                                cudaStream_t stream) {
+                                                cudaStream_t stream, int* sm_aware_sched) {
   static_assert(std::is_same<typename PrefillParams::DTypeQ, typename DecodeParams::DTypeQ>::value);
   static_assert(
       std::is_same<typename PrefillParams::DTypeKV, typename DecodeParams::DTypeKV>::value);
@@ -335,12 +335,10 @@ cudaError_t BatchPODWithKVCacheTensorDispatched(PrefillParams prefill_params,
           int num_sm = 0;
           FLASHINFER_CUDA_CALL(
               cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
-          static int* tbAssign = nullptr;
-          if (tbAssign == nullptr) cudaMalloc(&tbAssign, sizeof(int) * (num_sm + 2));
-          cudaMemset(tbAssign, 0, sizeof(int) * (num_sm + 2));
+          FLASHINFER_CUDA_CALL(cudaMemsetAsync(sm_aware_sched, 0, sizeof(int) * (num_sm + 2), stream));
 
           // Setup kernel arguments
-          void* args[] = {(void*)&prefill_params, (void*)&decode_params, (void*)&tbAssign};
+          void* args[] = {(void*)&prefill_params, (void*)&decode_params, (void*)&sm_aware_sched};
           FLASHINFER_CUDA_CALL(
               cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
@@ -357,7 +355,7 @@ cudaError_t BatchPODWithKVCacheTensorDispatched(PrefillParams prefill_params,
             config.dynamicSmemBytes = smem_size;
             config.stream = stream;
             FLASHINFER_CUDA_CALL(
-                cudaLaunchKernelEx(&config, kernel, prefill_params, decode_params, tbAssign));
+                cudaLaunchKernelEx(&config, kernel, prefill_params, decode_params, sm_aware_sched));
           } else {
             FLASHINFER_CUDA_CALL(
                 cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));

@@ -38,7 +38,7 @@ void batch_pod_with_kv_cache_tensor(
     int64_t window_left_d, Optional<TensorView> maybe_custom_mask_d,
     Optional<TensorView> maybe_mask_indptr_d, Optional<TensorView> maybe_alibi_slopes_d,
     double logits_soft_cap_d, double sm_scale_d, double rope_rcp_scale_d, double rope_rcp_theta_d,
-    bool enable_pdl);
+    bool enable_pdl, TensorView sm_aware_sched);
 
 // Batch-request prefill attention with KV-Cache operator
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(batch_pod_with_kv_cache_tensor, batch_pod_with_kv_cache_tensor);
