@@ -89,12 +89,11 @@ constexpr uint32_t cvtExpansion = exactDiv(inputElemSize, cacheElemSize);
 constexpr uint32_t preferedKHeadPartBytes = 64;
 __constant__ constexpr uint32_t cacheVTileSeqLen = 32;
 #else
-#if __CUDA_ARCH__ == 860 || __CUDA_ARCH__ == 890 || \
-    __CUDA_ARCH__ == 1100 | __CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 1210
+#if __CUDA_ARCH__ == 860 || __CUDA_ARCH__ == 890 || __CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 1210
 constexpr uint32_t preferedKHeadPartBytes = 64;
 __constant__ constexpr uint32_t cacheVTileSeqLen = 32;
 #elif __CUDA_ARCH__ == 800 || __CUDA_ARCH__ == 870 || __CUDA_ARCH__ == 900 || \
-    __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030
+    __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030 || __CUDA_ARCH__ == 1100
 constexpr uint32_t preferedKHeadPartBytes = 128;
 __constant__ constexpr uint32_t cacheVTileSeqLen = 64;
 #else
