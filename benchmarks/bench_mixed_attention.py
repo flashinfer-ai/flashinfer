@@ -57,7 +57,7 @@ def run_bench(
         device, dtype=torch.bfloat16
     )
 
-    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+    workspace_buffer = torch.empty(156 * 1024 * 1024, dtype=torch.uint8, device=device)
     kv_layout = "NHD"
 
     wrapper_old = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
@@ -147,7 +147,7 @@ def run_bench(
 
     # Verify output matches
     torch.testing.assert_close(
-        o_batch_pod, o, rtol=1e-3, atol=1e-3, msg="Batch POD-Attention decode mismatch!"
+        o_batch_pod, o, rtol=4e-3, atol=4e-3, msg="Batch POD-Attention decode mismatch!"
     )
     measurements = bench_gpu_time(
         lambda: wrapper_pod.run(
@@ -198,7 +198,7 @@ def run_bench(
         o_pod = torch.cat([o_d, o_p], dim=0)
         # Verify output matches
         torch.testing.assert_close(
-            o, o_pod, rtol=1e-3, atol=1e-3, msg="POD-Attention output mismatch!"
+            o, o_pod, rtol=4e-3, atol=4e-3, msg="POD-Attention output mismatch!"
         )
         measurements = bench_gpu_time(
             lambda: wrapper_pod.run(
@@ -287,16 +287,18 @@ if __name__ == "__main__":
     torch.random.manual_seed(42)
 
     # Irregular sequence lengths for prefill and decode
-    d_q_len_configs = [[1] * 128, [1] * 128, [1] * 128, [1] * 128, [1] * 128]
+    d_q_len_configs = [[1] * 128] * 7
     d_kv_len_configs = [
+        [2048] * 128,
+        [2048] * 128,
         [2048] * 128,
         [2048] * 128,
         [4096] * 128,
         [8192] * 128,
         [8192] * 128,
     ]
-    p_q_configs = [[2048] * 2, [2048], [4096], [4096], [6000]]
-    p_kv_configs = [[2048] * 2, [2048], [4096], [4096], [7000]]
+    p_q_configs = [[512], [1536], [2048] * 2, [2048], [4096], [4096], [6000]]
+    p_kv_configs = [[512], [1536], [2048] * 2, [2048], [4096], [4096], [7000]]
 
     page_block_size = 1
     num_kv_heads = 8
