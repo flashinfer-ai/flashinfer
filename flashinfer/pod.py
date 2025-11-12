@@ -419,6 +419,7 @@ class PODWithPagedKVCacheWrapper:
             window_left,
             -1,  # fixed_split_size
             False,  # disable_split_kv
+            0,  # num_colocated_ctas
         )
 
         self._indptr_type = indptr.dtype
@@ -894,27 +895,6 @@ class BatchPODWithPagedKVCacheWrapper:
                 False,  # use_fp16_qk_reduction
             )
 
-        self._plan_info_p = self._cached_module.plan(
-            self._float_workspace_buffer_p,
-            self._int_workspace_buffer_p,
-            self._pin_memory_int_workspace_buffer_p,
-            qo_indptr_host_p,
-            kv_indptr_host_p,
-            kv_lens_arr_host_p,
-            total_num_rows_p,  # total_num_rows
-            batch_size_p,
-            num_qo_heads,
-            num_kv_heads,
-            page_size,
-            self.is_cuda_graph_enabled,
-            head_dim,
-            head_dim,
-            False,  # causal
-            window_left,
-            -1,  # fixed_split_size
-            False,  # disable_split_kv
-        )
-
         # Setup decode params
         batch_size_d = len(last_page_len_d)
         qo_indptr_host_d = qo_indptr_d.to("cpu")
@@ -952,8 +932,34 @@ class BatchPODWithPagedKVCacheWrapper:
             window_left,
             -1,  # fixed_split_size
             False,  # disable_split_kv
+            0,  # num_colocated_ctas
         )
 
+        num_colocated_ctas = self._plan_info_d[0]
+        # Splitting small prefill causes unecessary bandwidth contention
+        if qo_indptr_host_p.sum() > 1536:
+            num_colocated_ctas = 0
+        self._plan_info_p = self._cached_module.plan(
+            self._float_workspace_buffer_p,
+            self._int_workspace_buffer_p,
+            self._pin_memory_int_workspace_buffer_p,
+            qo_indptr_host_p,
+            kv_indptr_host_p,
+            kv_lens_arr_host_p,
+            total_num_rows_p,  # total_num_rows
+            batch_size_p,
+            num_qo_heads,
+            num_kv_heads,
+            page_size,
+            self.is_cuda_graph_enabled,
+            head_dim,
+            head_dim,
+            False,  # causal
+            window_left,
+            -1,  # fixed_split_size
+            False,  # disable_split_kv
+            num_colocated_ctas,
+        )
         self._indptr_type = kv_indptr_p.dtype
         self._pos_encoding_mode = pos_encoding_mode
         self._window_left = window_left

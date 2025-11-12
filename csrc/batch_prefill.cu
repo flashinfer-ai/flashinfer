@@ -50,7 +50,7 @@ Array<int64_t> BatchPrefillWithKVCachePlan(
     TensorView kv_len_arr, int64_t total_num_rows, int64_t batch_size, int64_t num_qo_heads,
     int64_t num_kv_heads, int64_t page_size, bool enable_cuda_graph, int64_t head_dim_qk,
     int64_t head_dim_vo, bool causal, int64_t window_left, int64_t fixed_split_size,
-    bool disable_split_kv) {
+    bool disable_split_kv, int64_t num_colocated_ctas = 0) {
   size_t float_workspace_size_in_bytes =
       float_workspace_buffer.size(0) * get_element_size(float_workspace_buffer);
   size_t int_workspace_size_in_bytes =
@@ -66,7 +66,8 @@ Array<int64_t> BatchPrefillWithKVCachePlan(
       int_workspace_size_in_bytes, plan_info, static_cast<IdType*>(qo_indptr.data_ptr()),
       static_cast<IdType*>(kv_indptr.data_ptr()), total_num_rows, batch_size, num_qo_heads,
       num_kv_heads, head_dim_qk, head_dim_vo, page_size, enable_cuda_graph,
-      /*sizeof_dtype_o=*/2, window_left, fixed_split_size, disable_split_kv, stream);
+      /*sizeof_dtype_o=*/2, window_left, fixed_split_size, disable_split_kv, num_colocated_ctas,
+      stream);
 
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "Failed to plan prefill with error: " << cudaGetErrorString(status);

@@ -25,7 +25,7 @@ Array<int64_t> BatchPrefillWithKVCachePlan(
     TensorView kv_len_arr, int64_t total_num_rows, int64_t batch_size, int64_t num_qo_heads,
     int64_t num_kv_heads, int64_t page_size, bool enable_cuda_graph, int64_t head_dim_qk,
     int64_t head_dim_vo, bool causal, int64_t window_left, int64_t fixed_split_size,
-    bool disable_split_kv);
+    bool disable_split_kv, int64_t num_colocated_ctas);
 
 void BatchPrefillWithRaggedKVCacheRun(TensorView float_workspace_buffer,
                                       TensorView int_workspace_buffer, Array<int64_t> plan_info_vec,
