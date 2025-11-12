@@ -43,6 +43,7 @@ from .jit.fp4_quantization import (
 from .jit.fp8_quantization import gen_mxfp8_quantization_sm100_module
 from .jit.fused_moe import (
     gen_cutlass_fused_moe_sm120_module,
+    gen_cutlass_fused_moe_sm103_module,
     gen_cutlass_fused_moe_sm100_module,
     gen_cutlass_fused_moe_sm90_module,
     gen_trtllm_gen_fused_moe_sm100_module,
@@ -494,6 +495,7 @@ def gen_all_modules(
             jit_specs.append(gen_tgv_gemm_sm10x_module(torch.float16, use_sm_100f=True))
         if has_sm103:
             jit_specs.append(gen_fp4_quantization_sm103_module())
+            jit_specs.append(gen_cutlass_fused_moe_sm103_module())
         if has_sm110:
             jit_specs.append(gen_fp4_quantization_sm110_module())
         if has_sm120:
