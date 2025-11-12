@@ -28,7 +28,6 @@ xqa_nvcc_flags = [
     "-DBEAM_WIDTH=1",
     "-DUSE_INPUT_KV=0",
     "-DUSE_CUSTOM_BARRIER=1",
-    "-DLOW_PREC_OUTPUT=0",
     "-DSPEC_DEC=0",
 ]
 
@@ -40,6 +39,7 @@ def gen_xqa_module(
     head_dim: int,
     head_group_ratio: int,
     use_sliding_window: bool,
+    output_dtype: torch.dtype,
 ) -> JitSpec:
     if input_dtype == torch.float16:
         flag_input_dtype = ["-DINPUT_FP16=1", "-DDTYPE=__half"]
@@ -76,6 +76,11 @@ def gen_xqa_module(
     else:
         flag_sliding_window = ["-DSLIDING_WINDOW=0"]
 
+    if output_dtype == torch.float8_e4m3fn:
+        flag_low_prec_output = ["-DLOW_PREC_OUTPUT=1"]
+    else:
+        flag_low_prec_output = ["-DLOW_PREC_OUTPUT=0"]
+
     compilation_context = CompilationContext()
     nvcc_flags = compilation_context.get_nvcc_flags_list(
         supported_major_versions=[9, 10, 11, 12]
@@ -85,7 +90,7 @@ def gen_xqa_module(
     flag_mla_wrapper = ["-DMLA_WRAPPER=0"]
 
     return gen_jit_spec(
-        f"xqa_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}",
+        f"xqa_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_output_{filename_safe_dtype_map[output_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}",
         [
             jit_env.FLASHINFER_CSRC_DIR / "xqa/mha.cu",
             jit_env.FLASHINFER_CSRC_DIR / "xqa/mha_sm90.cu",
@@ -101,6 +106,7 @@ def gen_xqa_module(
         + flag_kv_cache_dtype
         + flag_head_group_ratio
         + flag_sliding_window
+        + flag_low_prec_output
         + flag_mla_wrapper,
         extra_ldflags=["-lcuda"],  # Add CUDA Driver API library
     )

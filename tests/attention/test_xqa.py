@@ -137,7 +137,6 @@ def ref_attention(
 @pytest.mark.parametrize("enable_pdl", [True, False])
 @pytest.mark.parametrize("use_sliding_window", [True, False])
 @pytest.mark.parametrize("input_type", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("fp8_kv_cache", [True, False])
 @pytest.mark.parametrize("use_attention_sinks", [True, False])
 @pytest.mark.parametrize("seq_len", [2, 15, 256, 514])
 @pytest.mark.parametrize("batch_size", [1, 4])
@@ -146,8 +145,17 @@ def ref_attention(
 @pytest.mark.parametrize("valid_elems_per_head", [32, 128])
 @pytest.mark.parametrize("head_grp_size", [8, 16])
 @pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
-@pytest.mark.parametrize("kv_scale", [1.0, 0.5])
 @pytest.mark.parametrize("q_scale", [1.0, 0.5])
+@pytest.mark.parametrize(
+    "fp8_kv_cache,kv_scale,use_fp8_output",
+    [
+        (False, 1.0, False),  # Non-FP8 KV cache: kv_scale=1.0, no FP8 output
+        (True, 1.0, False),  # FP8 KV cache: kv_scale=1.0, no FP8 output
+        (True, 1.0, True),  # FP8 KV cache: kv_scale=1.0, with FP8 output
+        (True, 0.5, False),  # FP8 KV cache: kv_scale=0.5, no FP8 output
+        (True, 0.5, True),  # FP8 KV cache: kv_scale=0.5, with FP8 output
+    ],
+)
 def test_xqa(
     batch_size,
     nb_k_heads,
@@ -163,9 +171,8 @@ def test_xqa(
     kv_layout,
     kv_scale,
     q_scale,
+    use_fp8_output,
 ):
-    if kv_scale != 1.0 and fp8_kv_cache is False:
-        pytest.skip("kv cache scale works only for fp8 kv cache")
     set_random_seed(42)
 
     nb_q_heads = nb_k_heads * head_grp_size
@@ -175,7 +182,7 @@ def test_xqa(
         beam_width,
         nb_q_heads,
         valid_elems_per_head,
-        dtype=input_type,
+        dtype=torch.float8_e4m3fn if use_fp8_output else input_type,
         device="cuda",
     )
     output.fill_(float("nan"))
@@ -326,6 +333,8 @@ def test_xqa(
     scratch_size = 256 << 20
     scratch_buf = torch.zeros(scratch_size, dtype=torch.uint8, device="cuda")
 
+    rcp_out_scale = 4.0 if use_fp8_output else 1.0
+
     xqa(
         q_heads,
         cache_k_heads.to(torch.float8_e4m3fn) if fp8_kv_cache else cache_k_heads,
@@ -344,6 +353,7 @@ def test_xqa(
         kv_layout=kv_layout,
         sm_count=sm_count,
         enable_pdl=enable_pdl,
+        rcp_out_scale=rcp_out_scale,
     )
 
     for req in range(batch_size):
@@ -398,6 +408,10 @@ def test_xqa(
                 else:
                     atol = 0.01
                     rtol = 0.01
+                if use_fp8_output:
+                    ref_output = ref_output * rcp_out_scale
+                    atol = 0.15
+                    rtol = 0.15
 
                 diff_abs = torch.abs(ref_output - kernel_output)
                 diff_rel = diff_abs / (torch.abs(ref_output) + 1e-8)

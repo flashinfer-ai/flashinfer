@@ -1281,7 +1281,7 @@ CUBIN_EXPORT __global__
         float qScale,
         OutputHead* __restrict__ const output,  // [nbReq][beamWidth][nbQHeads]
 #if LOW_PREC_OUTPUT
-        float const* rcpOutScale,
+        float rcpOutScale,
 #endif
         // NOTE: the input is actually Q buffer when integrated to TRT-LLM.
         IOHead const* __restrict__ const q,  // [nbReq][beamWidth][nbQHeads],
@@ -2165,7 +2165,7 @@ CUBIN_EXPORT __global__
       }
       ThrdRegRowMax const rcpRowSum = __frcp_rn(globalRowSum);
 #if LOW_PREC_OUTPUT
-      voScale *= rcpOutScale[0];
+      voScale *= rcpOutScale;
 #endif
       rescaleAcc(warp, acc, fullRescaleMask, rcpRowSum * ThrdRegRowMax::filled(voScale));
     }
@@ -2396,7 +2396,7 @@ CUBIN_EXPORT __global__ __launch_bounds__(256, nbCtaPerSM) void kernel_mha(
     float qScale,
     OutputHead* __restrict__ const output,  // [nbReq][beamWidth][nbQHeads]
 #if LOW_PREC_OUTPUT
-    float const* rcpOutScale,
+    float rcpOutScale,
 #endif
     IOHead const* __restrict__ const q,  // [nbReq][beamWidth][nbQHeads],
 #if SPEC_DEC
@@ -2447,7 +2447,7 @@ void launchMHA(
 #endif
     float qScale, OutputHead* output,
 #if LOW_PREC_OUTPUT
-    float const* rcpOutScale,
+    float rcpOutScale,
 #endif
 #if USE_INPUT_KV
     InputHead const* qkv,
@@ -2563,7 +2563,7 @@ static uint32_t const hostSmemSize = configureKernel();
 void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32_t slidingWinSize,
                          float qScale, OutputHead* output,
 #if LOW_PREC_OUTPUT
-                         float const* rcpOutScale,
+                         float rcpOutScale,
 #endif
                          InputHead const* q, float const* attentionSinks, GMemCacheHead* kCacheVLLM,
                          GMemCacheHead* vCacheVLLM, KVCachePageIndex const* kvCachePageList,

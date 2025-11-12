@@ -27,10 +27,7 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(xqa_wrapper_mla, xqa_wrapper_mla);
 #else
 
 void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbKHeads,
-                 int64_t slidingWinSize, double qScale, TensorView output,
-#if LOW_PREC_OUTPUT
-                 TensorView rcpOutScale,
-#endif
+                 int64_t slidingWinSize, double qScale, TensorView output, double rcpOutScale,
                  TensorView q, tvm::ffi::Optional<TensorView> attentionSinks, TensorView kCacheVLLM,
                  TensorView vCacheVLLM, TensorView kvCachePageList, int64_t maxSeqLen,
                  TensorView seqLen, int64_t batchSize, double kvCacheScale,
