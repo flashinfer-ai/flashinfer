@@ -246,12 +246,6 @@ cudaError_t BatchPODWithKVCacheTensorDispatched(PrefillParams prefill_params,
        NUM_MMA_Q_D * NUM_WARPS_Q_D) /
       (2 * NUM_WARPS_KV_D);
 
-  // we expect each sm execute two threadblocks
-  // TODO(Zihao): fix the following computation
-  const int num_ctas_per_sm_p =
-      max_smem_per_sm > (16 * HEAD_DIM_QK * sizeof(DTypeQ_P) * 16) ? 2 : 1;
-  const int max_smem_per_threadblock_p = max_smem_per_sm / num_ctas_per_sm_p;
-
   // control NUM_MMA_KV for maximum warp occupancy
   DISPATCH_NUM_MMA_KV(min(max_num_mma_kv_smem_p, max_num_mma_kv_reg_p), NUM_MMA_KV_P, {
     using KTraits_P = KernelTraits<MASK_MODE_P, CTA_TILE_Q_P, NUM_MMA_Q_P, NUM_MMA_KV_P,
