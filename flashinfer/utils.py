@@ -1075,10 +1075,13 @@ def backend_requirement(
                     }
                     if (
                         req_checker(*args, **kwargs)
-                        and common_check(
-                            *args, backend=backend, **kwargs_without_backend
-                        )
                         and req_checker.is_compute_capability_supported(cc)
+                        and (
+                            (common_check is None)
+                            or common_check(
+                                *args, backend=backend, **kwargs_without_backend
+                            )
+                        )
                     ):
                         suitable_backends.append(backend)
                 except ValueError:
