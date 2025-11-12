@@ -477,17 +477,21 @@ void rope_quantize_append_paged_kv_cache(
   CHECK_DIM(3, q_rope_out);
   CHECK_DIM(3, q_nope_out);
 
-  // Detect architecture: MLA (2D K) vs GQA/MHA (3D K)
-  bool is_mla = (k_rope_in.ndim() == 2);
+  // Detect architecture based on cache presence/layout (not K dimensionality)
+  QKVLayout kv_layout = QKVLayout(kv_layout_code);
+  bool has_mla_caches = (ckv_cache.data_ptr() != nullptr && kpe_cache.data_ptr() != nullptr);
+  bool has_gqa_caches = (k_cache.data_ptr() != nullptr && v_cache.data_ptr() != nullptr);
+  bool is_mla = has_mla_caches && !has_gqa_caches;
   uint32_t num_kv_heads;
   uint32_t batch_size = kv_indptr.size(0) - 1;
-  QKVLayout kv_layout = QKVLayout(kv_layout_code);
 
+  // Require 3D K tensors in both paths; for MLA head dim must be 1
+  CHECK_DIM(3, k_rope_in);
+  CHECK_DIM(3, k_nope_in);
   if (is_mla) {
-    // MLA: K tensors are 2D
-    CHECK_DIM(2, k_rope_in);
-    CHECK_DIM(2, k_nope_in);
     num_kv_heads = 1;
+    TVM_FFI_ICHECK_EQ(k_rope_in.size(1), 1) << "MLA expects K rope head dim == 1";
+    TVM_FFI_ICHECK_EQ(k_nope_in.size(1), 1) << "MLA expects K nope head dim == 1";
     // V can be empty for MLA
     TVM_FFI_ICHECK(v_in.data_ptr() == nullptr || v_in.size(0) == 0)
         << "MLA should not have V input (or it should be empty)";
@@ -499,9 +503,7 @@ void rope_quantize_append_paged_kv_cache(
     TVM_FFI_ICHECK_EQ(ckv_cache.size(2), no_rope_dim);
     TVM_FFI_ICHECK_EQ(kpe_cache.size(2), rope_dim);
   } else {
-    // GQA/MHA: K tensors are 3D
-    CHECK_DIM(3, k_rope_in);
-    CHECK_DIM(3, k_nope_in);
+    // GQA/MHA validation
     num_kv_heads = k_rope_in.size(1);
     TVM_FFI_ICHECK_EQ(k_nope_in.size(1), num_kv_heads);
     // V is required for GQA/MHA
@@ -526,23 +528,16 @@ void rope_quantize_append_paged_kv_cache(
   const uint32_t q_nope_out_stride_n = q_nope_out.stride(0);
   const uint32_t q_nope_out_stride_h = q_nope_out.stride(1);
 
-  // Extract K strides (architecture dependent)
+  // Extract K strides
   uint32_t k_rope_in_stride, k_nope_in_stride;
   uint32_t k_rope_in_stride_h, k_nope_in_stride_h;
   uint32_t v_in_stride = 0, v_in_stride_h = 0;
 
-  if (is_mla) {
-    // MLA: 2D K tensors
-    k_rope_in_stride = k_rope_in.stride(0);
-    k_nope_in_stride = k_nope_in.stride(0);
-    k_rope_in_stride_h = k_rope_in_stride;  // Same as batch stride for 2D
-    k_nope_in_stride_h = k_nope_in_stride;
-  } else {
-    // GQA/MHA: 3D K tensors
-    k_rope_in_stride = k_rope_in.stride(0);
-    k_rope_in_stride_h = k_rope_in.stride(1);
-    k_nope_in_stride = k_nope_in.stride(0);
-    k_nope_in_stride_h = k_nope_in.stride(1);
+  k_rope_in_stride = k_rope_in.stride(0);
+  k_nope_in_stride = k_nope_in.stride(0);
+  k_rope_in_stride_h = k_rope_in.stride(1);
+  k_nope_in_stride_h = k_nope_in.stride(1);
+  if (!is_mla) {
     v_in_stride = v_in.stride(0);
     v_in_stride_h = v_in.stride(1);
   }

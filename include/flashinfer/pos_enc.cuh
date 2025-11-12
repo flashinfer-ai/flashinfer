@@ -385,7 +385,7 @@ __global__ void RopeQuantizeKernel(
     // 2. if not interleave
     //  - cos = cos_cache[pos_id][(tx * vec_size) % (rot_dim // 2)]
     //  - sin = sin_cache[pos_id][(rot_dim // 2) + (tx * vec_size) % (rot_dim // 2)]
-    if ((tx * vec_size < rope_dim) and (by < k_rope_end)) {
+    if ((tx * vec_size < rope_dim) && (by < k_rope_end)) {
       int sin_offset = rope_dim / 2;
       int vec_idx;
       if constexpr (interleave) {
@@ -796,7 +796,7 @@ __global__ void RopeQuantizeAppendPagedKVCacheKernel(
 
     const int half_rope_dim = rope_dim / 2;
     // Load cos/sin for RoPE processing blocks only
-    if ((tx * vec_size < rope_dim) and (by < k_rope_end)) {
+    if ((tx * vec_size < rope_dim) && (by < k_rope_end)) {
       int sin_offset = rope_dim / 2;
       int vec_idx;
       if constexpr (interleave) {

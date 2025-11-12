@@ -1531,8 +1531,13 @@ def rope_quantize_fp8_append_paged_kv_cache(
     if q_nope_out is None:
         q_nope_out = torch.empty_like(q_nope, dtype=quantize_dtype)
 
-    # Handle V input for MLA (create empty dummy tensor, not used)
+    # Handle MLA normalization and V (create empty dummy tensor, not used)
     if is_mla:
+        # Normalize MLA K tensors to 3D (nnz, 1, dim) so C++ binding can always assume 3D
+        if k_rope.ndim == 2:
+            k_rope = k_rope.unsqueeze(1)
+        if k_nope.ndim == 2:
+            k_nope = k_nope.unsqueeze(1)
         if v is None:
             v = torch.empty(0, dtype=q_rope.dtype, device=q_rope.device)
         else:
