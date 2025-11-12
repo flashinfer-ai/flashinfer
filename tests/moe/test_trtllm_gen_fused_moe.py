@@ -49,6 +49,10 @@ from flashinfer.fused_moe.core import (
 from flashinfer.utils import get_compute_capability
 
 
+# Max num tokens to tune for trtllm-gen fused moe
+TUNE_MAX_NUM_TOKENS = 4096
+
+
 def check_cuda(err):
     """Unified CUDA error checking function used throughout the file."""
     if err != runtime.cudaError_t.cudaSuccess:
@@ -208,7 +212,7 @@ class CUDAGraphMoE:
             routing_method_type=self.config["routing_method_type"],
             gated_act_type=self.config["gated_act_type"],
             do_finalize=True,
-            tune_max_num_tokens=4096,
+            tune_max_num_tokens=TUNE_MAX_NUM_TOKENS,
         )
         return output  # Extract tensor from tuple
 
@@ -800,7 +804,7 @@ class FP8BlockScaleMoe(Moe):
                 use_shuffled_weight=static_data["use_shuffled_weight"],
                 weight_layout=static_data["weight_layout"],
                 enable_pdl=enable_pdl,
-                tune_max_num_tokens=4096,
+                tune_max_num_tokens=TUNE_MAX_NUM_TOKENS,
             )
         return output.to(torch.float)
 
@@ -977,7 +981,7 @@ class FP8PerTensorMoe(Moe):
                 == RoutingMethodType.Llama4,  # Use_routing_scales_on_input
                 None,
                 routing_method_type,
-                tune_max_num_tokens=4096,
+                tune_max_num_tokens=TUNE_MAX_NUM_TOKENS,
             )
 
         return output.to(torch.float)
@@ -1129,7 +1133,7 @@ class BF16Moe(Moe):
                 use_shuffled_weight=static_data["use_shuffled_weight"],
                 weight_layout=static_data["weight_layout"],
                 routing_method_type=routing_method_type,
-                tune_max_num_tokens=4096,
+                tune_max_num_tokens=TUNE_MAX_NUM_TOKENS,
             )
         return output.to(torch.float)
 
