@@ -649,7 +649,7 @@ class AutoTuner:
             opt_shapes_max = {
                 v1: v2
                 for v1, v2 in zip(
-                    opt_shapes, tuple(opt_shapes[1:]) + (float("inf"),), strict=False
+                    opt_shapes, tuple(opt_shapes[1:]) + (float("inf"),), strict=True
                 )
             }
             dynamic_dims.append(

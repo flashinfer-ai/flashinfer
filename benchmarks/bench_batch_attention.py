@@ -436,7 +436,7 @@ def main(args: argparse.Namespace) -> None:
     records_new = []
     records_separate = []
     for cfg_id, (decode_case, prefill_case) in enumerate(
-        zip(decode_lens, prefill_lens, strict=False), start=1
+        zip(decode_lens, prefill_lens, strict=True), start=1
     ):
         prefill_kv_lens = [p[0] for p in prefill_case]
         prefill_qo_lens = [p[1] for p in prefill_case]
