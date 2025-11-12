@@ -110,8 +110,8 @@ def run_bench(
     kv_indices_d = torch.arange(0, d_kv_indptr[-1], device=device, dtype=torch.int32)
     kv_indices_p = torch.arange(0, p_kv_indptr[-1], device=device, dtype=torch.int32)
 
-    last_page_len_d = (d_seq_lens_blocks - 1) % page_block_size + 1
-    last_page_len_p = (p_seq_lens_blocks - 1) % page_block_size + 1
+    last_page_len_d = (torch.tensor(d_kv_lens, device=device) - 1) % page_block_size + 1
+    last_page_len_p = (torch.tensor(p_kv_lens, device=device) - 1) % page_block_size + 1
     wrapper_pod = flashinfer.BatchPODWithPagedKVCacheWrapper(
         workspace_buffer,
         kv_layout=kv_layout,
