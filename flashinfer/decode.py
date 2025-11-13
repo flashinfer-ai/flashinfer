@@ -42,6 +42,7 @@ from .prefill import (
     get_single_prefill_module,
 )
 from .utils import (
+    log2e,
     FP4Tensor,
     MaskMode,
     PosEncodingMode,
@@ -1265,8 +1266,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
             rope_scale = 1.0
         if rope_theta is None:
             rope_theta = 1e4
-        if isinstance(sm_scale, torch.Tensor) and self._backend == "trtllm-gen":
-            sm_scale *= math.log2(math.e)
 
         if return_lse:
             if lse is None:
@@ -1894,6 +1893,12 @@ class TrtllmGenDecodeModule:
         if self._sm_count is None:
             self._sm_count = get_device_sm_count(query.device)
 
+        if isinstance(bmm1_scale, torch.Tensor):
+            assert bmm1_scale.dtype == torch.float32
+            bmm1_scale *= log2e
+        if isinstance(bmm2_scale, torch.Tensor):
+            assert bmm2_scale.dtype == torch.float32
+
         self._op.trtllm_paged_attention_decode(
             out,
             None,  # fp4 output not supported in wrapper api yet.
@@ -2101,7 +2106,7 @@ def trtllm_batch_decode_with_kv_cache(
 
     bmm1_scale : Union[float, torch.Tensor]
         fused scale for bmm1 input.
-        when using trtllm-gen backend, it can be a torch.Tensor with dtype torch.float32 and must be fused with M_LOG2E
+        when using trtllm-gen backend, it can be a torch.Tensor with dtype torch.float32.
 
     bmm2_scale : Union[float, torch.Tensor]
         fused scale for bmm2 input.
@@ -2169,6 +2174,7 @@ def trtllm_batch_decode_with_kv_cache(
         )
 
     if backend == "xqa":
+        # TODO(Siyuan): support device scale factors, which was removed in #2033
         assert isinstance(bmm1_scale, float) and isinstance(bmm2_scale, float), (
             "XQA MLA only supports float scale factors"
         )
@@ -2203,8 +2209,6 @@ def trtllm_batch_decode_with_kv_cache(
             o_scale=o_scale,
         )
     elif backend == "trtllm-gen":
-        print(f"{bmm1_scale=}")
-        print(f"{bmm2_scale=}")
         # Convert NHD layout to HND if necessary (transpose only changes stride, not data)
         if kv_layout == "NHD":
             # For NHD: [..., N, H, D] -> HND: [..., H, N, D]
@@ -2287,6 +2291,12 @@ def trtllm_batch_decode_with_kv_cache(
             check_shape_dtype_device(out, query.shape, out_dtype, query.device, "out")
         else:
             raise ValueError(f"Invalid out_dtype: {out_dtype}")
+
+        if isinstance(bmm1_scale, torch.Tensor):
+            assert bmm1_scale.dtype == torch.float32
+            bmm1_scale *= log2e
+        if isinstance(bmm2_scale, torch.Tensor):
+            assert bmm2_scale.dtype == torch.float32
 
         run_func(
             out,
@@ -2546,9 +2556,9 @@ def trtllm_batch_decode_with_kv_cache_mla(
     max_seq_len: max sequence length for kv_cache
     out: output tensor, if not provided, will be allocated internally
     bmm1_scale: fused scale for mla bmm1 input.
-        when using trtllm-gen backend, it can be a torch.Tensor with dtype torch.float32 and must be fused with M_LOG2E
+        when using trtllm-gen backend, it can be a torch.Tensor with dtype torch.float32.
     bmm2_scale: fused scale for mla bmm2 input.
-        when using trtllm-gen backend, it can be a torch.Tensor with dtype torch.float32 and must be fused with M_LOG2E
+        when using trtllm-gen backend, it can be a torch.Tensor with dtype torch.float32.
     sinks: additional value per head in the denominator of the softmax.
     backend : str = "auto"
         The implementation backend, could be ``auto``/``xqa`` or ``trtllm-gen``. Defaults to ``auto``.
@@ -2579,6 +2589,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
             "trtllm-gen" if get_compute_capability(query.device)[0] == 10 else "xqa"
         )
     if backend == "xqa":
+        # TODO(Siyuan): support device scale factors, which was removed in #2033
         assert isinstance(bmm1_scale, float) and isinstance(bmm2_scale, float), (
             "XQA MLA only supports float scale factors"
         )
@@ -2648,6 +2659,12 @@ def trtllm_batch_decode_with_kv_cache_mla(
                 "out",
             )
 
+        if isinstance(bmm1_scale, torch.Tensor):
+            assert bmm1_scale.dtype == torch.float32
+            bmm1_scale *= log2e
+        if isinstance(bmm2_scale, torch.Tensor):
+            assert bmm2_scale.dtype == torch.float32
+
         run_func(
             out,
             None,  # fp4 output not supported in wrapper api yet.
@@ -2686,6 +2703,7 @@ def xqa_batch_decode_with_kv_cache_mla(
     seq_lens: torch.Tensor,
     max_seq_len: int,
     out: Optional[torch.Tensor] = None,
+    # TODO(Siyuan): support device scale factors, which was removed in #2033
     bmm1_scale: Optional[float] = 1.0,
     bmm2_scale: Optional[float] = 1.0,
     sinks: Optional[List[torch.Tensor]] = None,
@@ -2704,9 +2722,7 @@ def xqa_batch_decode_with_kv_cache_mla(
     max_seq_len: max sequence length for kv_cache
     out: output tensor, if not provided, will be allocated internally
     bmm1_scale: fused scale for mla bmm1 input.
-        when using trtllm-gen backend, it can be a torch.Tensor with dtype torch.float32 and must be fused with M_LOG2E
     bmm2_scale: fused scale for mla bmm2 input.
-        when using trtllm-gen backend, it can be a torch.Tensor with dtype torch.float32 and must be fused with M_LOG2E
     sinks: additional value per head in the denominator of the softmax.
 
     Note:
