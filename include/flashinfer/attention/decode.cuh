@@ -355,6 +355,14 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
   // sync local state of all warps inside a threadblock
   sync_state<vec_size, bdx, bdy, bdz>(variant, st_local, reinterpret_cast<float*>(smem), smem_md,
                                       tx, ty, tz);
+  // Add s_aux (learnable sink) contribution to softmax denominator after all tiles processed
+  if constexpr (variant.use_softmax) {
+    if (params.maybe_s_aux != nullptr) {
+      constexpr float LOG2_E = 1.4426950408889634f;  // log2(e)
+      float s_aux_val = params.maybe_s_aux[qo_head_idx];
+      st_local.d += math::ptx_exp2((s_aux_val - st_local.m) * LOG2_E);
+    }
+  }
 #pragma unroll
   for (size_t i = 0; i < vec_size; ++i) {
     st_local.o[i] = variant.OutputTransform(params, st_local.o[i], /*batch_idx=*/0, /*qo_idx=*/0,
@@ -589,6 +597,14 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
   // sync local state of all warps inside a threadblock
   sync_state<vec_size, bdx, bdy, bdz>(variant, st, reinterpret_cast<float*>(smem), smem_md, tx, ty,
                                       tz);
+  // Add s_aux (learnable sink) contribution to softmax denominator after all tiles processed
+  if constexpr (variant.use_softmax) {
+    if (params.maybe_s_aux != nullptr) {
+      constexpr float LOG2_E = 1.4426950408889634f;  // log2(e)
+      float s_aux_val = params.maybe_s_aux[qo_head_idx];
+      st.d += math::ptx_exp2((s_aux_val - st.m) * LOG2_E);
+    }
+  }
 #pragma unroll
   for (size_t i = 0; i < vec_size; ++i) {
     st.o[i] = variant.OutputTransform(params, st.o[i], bx, /*qo_idx=*/0, qo_head_idx, st.m, st.d,
