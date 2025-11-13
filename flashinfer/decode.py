@@ -2571,7 +2571,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
     bmm1_scale = q_scale * k_scale * sm_scale / (head_dim_qk ** 0.5)
     bmm2_scale = v_scale * o_scale
     or,
-    bmm1_scale = torch.Tensor([q_scale * k_scale * sm_scale / (head_dim_qk ** 0.5) * M_LOG2E])
+    bmm1_scale = torch.Tensor([q_scale * k_scale * sm_scale / (head_dim_qk ** 0.5))
     bmm2_scale = torch.Tensor([v_scale * o_scale])
 
     The two scale factors should be static constant for cuda graph capture.
