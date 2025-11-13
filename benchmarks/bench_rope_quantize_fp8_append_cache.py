@@ -16,13 +16,12 @@ limitations under the License.
 
 import os
 import sys
-import csv
-import subprocess
 import argparse
 import flashinfer
 import numpy as np
 import torch
 from flashinfer.testing.utils import bench_gpu_time_with_cudagraph
+from flashinfer.utils import get_gpu_memory_bandwidth
 
 # Add the project root to Python path to import test helpers
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
@@ -274,111 +273,6 @@ def benchmark_config(
     return ms, min_ms, max_ms, bandwidth_gb_s, tflops
 
 
-def _run_ncu_and_get_bw_pct(
-    script_path, config_name, num_tokens, page_size, enable_pdl
-):
-    cmd = [
-        "ncu",
-        "--target-processes",
-        "all",
-        "--metrics",
-        "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed,gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed",
-        "--csv",
-        "--page",
-        "raw",
-        sys.executable,
-        script_path,
-        "--ncu-single",
-        "--config",
-        config_name,
-        "--num-tokens",
-        str(num_tokens),
-        "--page-size",
-        str(page_size),
-        "--enable-pdl",
-        str(int(enable_pdl)),
-    ]
-    try:
-        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
-    except (subprocess.CalledProcessError, FileNotFoundError) as e:
-        print(f"Warning: Nsight Compute not available or failed: {e}")
-        return -1.0
-    # parse ncu output csv
-    target_metric_dram = "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed"
-    target_metric_compute = (
-        "gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed"
-    )
-    lines = [
-        l
-        for l in out.splitlines()
-        if l.strip() and not l.startswith("#") and not l.startswith("==")
-    ]
-    reader = csv.reader(lines)
-    header = None
-    kernel_idx = None
-    dram_idx = None
-    compute_idx = None
-    rows = []
-    for row in reader:
-        if not row:
-            continue
-        if header is None:
-            header = [c.strip() for c in row]
-            # Locate columns
-            try:
-                kernel_idx = header.index("Kernel Name")
-            except ValueError:
-                for i, c in enumerate(header):
-                    if c.replace(" ", "").lower() == "kernelname":
-                        kernel_idx = i
-                        break
-            try:
-                dram_idx = header.index(target_metric_dram)
-            except ValueError:
-                dram_idx = None
-            try:
-                compute_idx = header.index(target_metric_compute)
-            except ValueError:
-                compute_idx = None
-            continue
-        rows.append(row)
-    if header is None or (dram_idx is None and compute_idx is None):
-        print("Warning: Unable to parse BW% from Nsight Compute output.")
-        return -1.0, -1.0
-    # Only return the fused kernel's metrics; otherwise fail
-    fused_dram = None
-    fused_compute = None
-    for r in rows:
-        if len(r) <= max((kernel_idx or 0), dram_idx or 0, compute_idx or 0):
-            continue
-        kname = r[kernel_idx] if kernel_idx is not None else ""
-        kname_l = kname.lower()
-        # Match our fused kernel robustly
-        if (
-            "ropequantizeappendpagedkvcachekernel".lower() in kname_l
-            or ("rope" in kname_l and "append" in kname_l)
-            or "ropequantizeappend" in kname_l
-        ):
-            try:
-                if dram_idx is not None and len(r) > dram_idx:
-                    fused_dram = float(r[dram_idx])
-            except Exception:
-                fused_dram = None
-            try:
-                if compute_idx is not None and len(r) > compute_idx:
-                    fused_compute = float(r[compute_idx])
-            except Exception:
-                fused_compute = None
-            break
-    if fused_dram is not None or fused_compute is not None:
-        return (
-            fused_dram if fused_dram is not None else -1.0,
-            fused_compute if fused_compute is not None else -1.0,
-        )
-    print("Warning: Unable to find fused kernel metric in Nsight Compute output.")
-    return -1.0, -1.0
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -403,8 +297,11 @@ if __name__ == "__main__":
         sys.exit(0)
 
     # Get GPU information (for display only)
+    device = torch.device("cuda:0")
     gpu_name = torch.cuda.get_device_name(0)
+    gpu_peak_bandwidth = get_gpu_memory_bandwidth(device)
     print(f"\nDetected GPU: {gpu_name}")
+    print(f"Theoretical Peak Memory Bandwidth: {gpu_peak_bandwidth:.2f} GB/s")
     print()
 
     # Token counts to benchmark
@@ -417,54 +314,18 @@ if __name__ == "__main__":
         print(f"  {config_name.upper()}: {config_desc}")
         print(f"{'=' * 100}")
 
-        # Only use ncu if available. if not available, skip BW% calculations
-        first_tokens = token_counts[-1]
-        try:
-            probe_dram_pct, probe_compute_pct = _run_ncu_and_get_bw_pct(
-                os.path.abspath(__file__),
-                config_name,
-                first_tokens,
-                page_size_to_benchmark,
-                False,
+        print(
+            f"{'Tokens':<10} {'Time (ms)':<12} {'BW (GB/s)':<12} {'BW% (Peak)':<14} {'TFLOPs':<12}"
+        )
+        print("-" * 70)
+        for num_tokens in token_counts:
+            ms, _, _, bw, tflops = benchmark_config(
+                config_name, num_tokens, page_size=page_size_to_benchmark
             )
-            show_bw_pct = (probe_dram_pct >= 0) and (probe_compute_pct >= 0)
-        except Exception as e:
+            bw_pct = (bw / gpu_peak_bandwidth) * 100
             print(
-                f"Warning: Skipping BW% calculations due to Nsight Compute not available or failed: {e}"
+                f"{num_tokens:<10} {ms:<12.5f} {bw:<12.2f} {bw_pct:<14.1f} {tflops:<12.3f}"
             )
-            show_bw_pct = False
-
-        if show_bw_pct:
-            print(
-                f"{'Tokens':<10} {'Time (ms)':<12} {'BW (GB/s)':<12} {'BW% (DRAM)':<14} {'BW% (Compute)':<16} {'TFLOPs':<12}"
-            )
-            print("-" * 80)
-            for num_tokens in token_counts:
-                ms, _, _, bw, tflops = benchmark_config(
-                    config_name, num_tokens, page_size=page_size_to_benchmark
-                )
-                dram_pct, compute_pct = _run_ncu_and_get_bw_pct(
-                    os.path.abspath(__file__),
-                    config_name,
-                    num_tokens,
-                    page_size_to_benchmark,
-                    False,
-                )
-                if dram_pct < 0 or compute_pct < 0:
-                    # If individual row fails, fall back to skipping BW% entirely for consistency
-                    show_bw_pct = False
-                    break
-                print(
-                    f"{num_tokens:<10} {ms:<12.5f} {bw:<12.2f} {dram_pct:<14.1f} {compute_pct:<16.1f} {tflops:<12.3f}"
-                )
-        if not show_bw_pct:
-            print(f"{'Tokens':<10} {'Time (ms)':<12} {'BW (GB/s)':<12} {'TFLOPs':<12}")
-            print("-" * 50)
-            for num_tokens in token_counts:
-                ms, _, _, bw, tflops = benchmark_config(
-                    config_name, num_tokens, page_size=page_size_to_benchmark
-                )
-                print(f"{num_tokens:<10} {ms:<12.5f} {bw:<12.2f} {tflops:<12.3f}")
 
     # Print tables for each configuration
     print_config_table("mla", "128 Q heads, 1 K head, 64+512 dims (DeepSeek-style)")
@@ -476,4 +337,6 @@ if __name__ == "__main__":
     print("  Page size: 32, Batch size: 4")
     print("  Token range: 1 (single decode) → 8192 (large prefill)")
     print(f"  GPU: {gpu_name}")
+    print(f"  Theoretical Peak Memory Bandwidth: {gpu_peak_bandwidth:.2f} GB/s")
+    print("  BW% calculated as: (achieved_bandwidth / peak_bandwidth) * 100")
     print("=" * 100)
