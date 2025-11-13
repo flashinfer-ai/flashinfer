@@ -120,6 +120,8 @@ void trtllm_paged_attention_launcher(
   runner_params.vStrideBatch = kv_stride_batch;
   runner_params.mNumPagesInMemPool = num_pages_in_mem_pool;
   runner_params.stream = stream;
+  // the scaleSoftmaxLog2Ptr and outputScalePtr have higher priority than the scaleSoftmaxLog2 and
+  // outputScale. if they are not nullptr, then scaleSoftmaxLog2 and outputScale will be ignored
   runner_params.outputScale = bmm2_scale;
   runner_params.outputScalePtr = bmm2_scale_ptr;
   runner_params.scaleSoftmaxLog2 = bmm1_scale * M_LOG2E;
@@ -405,6 +407,8 @@ void trtllm_ragged_attention_launcher(
   runner_params.mQkvLayout = QkvLayout::SeparateQkv;
   runner_params.mMultiProcessorCount = sm_count;
   runner_params.stream = stream;
+  // the scaleSoftmaxLog2Ptr and outputScalePtr have higher priority than the scaleSoftmaxLog2 and
+  // outputScale. if they are not nullptr, then scaleSoftmaxLog2 and outputScale will be ignored
   runner_params.outputScale = bmm2_scale;
   runner_params.outputScalePtr = bmm2_scale_ptr;
   runner_params.scaleSoftmaxLog2 = bmm1_scale * M_LOG2E;
