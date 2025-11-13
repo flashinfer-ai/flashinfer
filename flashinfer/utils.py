@@ -241,10 +241,10 @@ def _get_sink_buf(
     sinks: Optional[torch.Tensor],
 ) -> Optional[torch.Tensor]:
     """Convert sinks tensor to proper format for CUDA kernels.
-    
+
     Args:
         sinks: Optional tensor of shape [num_qo_heads] with sink values per head
-        
+
     Returns:
         Contiguous float32 tensor or None if sinks is None
     """

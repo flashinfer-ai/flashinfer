@@ -34,7 +34,14 @@ def sink_attention_decode_ref(
 ) -> torch.Tensor:
     """Reference implementation for decode mode sink attention."""
     return sink_attention_unified(
-        q, k_cache, v_cache, sink, window_left, causal=True, sm_scale=sm_scale, mode="incremental"
+        q,
+        k_cache,
+        v_cache,
+        sink,
+        window_left,
+        causal=True,
+        sm_scale=sm_scale,
+        mode="incremental",
     )
 
 
@@ -53,9 +60,9 @@ def warmup_jit():
 @pytest.mark.parametrize(
     "num_qo_heads,num_kv_heads",
     [
-        (8, 8),   # MHA: equal heads
+        (8, 8),  # MHA: equal heads
         (32, 8),  # GQA: 4:1 ratio
-        (32, 32), # MHA: equal heads
+        (32, 32),  # MHA: equal heads
     ],
 )
 @pytest.mark.parametrize("head_dim", [64, 128])
@@ -96,7 +103,8 @@ def test_batch_decode_with_sink_attention(
 
     # Create page indices and metadata
     kv_indptr = (
-        torch.arange(0, batch_size + 1, device=device, dtype=torch.int32) * num_pages_per_seq
+        torch.arange(0, batch_size + 1, device=device, dtype=torch.int32)
+        * num_pages_per_seq
     )
     kv_indices = torch.arange(0, total_num_pages, device=device, dtype=torch.int32)
     kv_last_page_len = torch.full(
@@ -112,7 +120,9 @@ def test_batch_decode_with_sink_attention(
     workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8, device=device)
 
     # Test with FlashInfer
-    wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(workspace_buffer, kv_layout)
+    wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
+        workspace_buffer, kv_layout
+    )
     wrapper.plan(
         kv_indptr,
         kv_indices,
@@ -155,15 +165,21 @@ def test_batch_decode_with_sink_attention(
                     page_idx, 1, :actual_page_len
                 ].to(dtype)
             else:
-                k_cache_ref[b, token_start:token_end] = kv_data_fp32[
-                    page_idx, 0, :, :actual_page_len
-                ].transpose(0, 1).to(dtype)
-                v_cache_ref[b, token_start:token_end] = kv_data_fp32[
-                    page_idx, 1, :, :actual_page_len
-                ].transpose(0, 1).to(dtype)
+                k_cache_ref[b, token_start:token_end] = (
+                    kv_data_fp32[page_idx, 0, :, :actual_page_len]
+                    .transpose(0, 1)
+                    .to(dtype)
+                )
+                v_cache_ref[b, token_start:token_end] = (
+                    kv_data_fp32[page_idx, 1, :, :actual_page_len]
+                    .transpose(0, 1)
+                    .to(dtype)
+                )
 
     # Compute reference output
-    out_ref = sink_attention_decode_ref(q, k_cache_ref, v_cache_ref, sinks, window_left, sm_scale)
+    out_ref = sink_attention_decode_ref(
+        q, k_cache_ref, v_cache_ref, sinks, window_left, sm_scale
+    )
 
     # Compare results
     # bfloat16 may have slightly larger numerical differences due to lower precision,
@@ -199,7 +215,8 @@ def test_batch_decode_without_sink_attention(
     kv_data = torch.randn(*kv_shape, dtype=dtype, device=device)
 
     kv_indptr = (
-        torch.arange(0, batch_size + 1, device=device, dtype=torch.int32) * num_pages_per_seq
+        torch.arange(0, batch_size + 1, device=device, dtype=torch.int32)
+        * num_pages_per_seq
     )
     kv_indices = torch.arange(0, total_num_pages, device=device, dtype=torch.int32)
     kv_last_page_len = torch.full(
@@ -207,7 +224,9 @@ def test_batch_decode_without_sink_attention(
     )
 
     workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8, device=device)
-    wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(workspace_buffer, kv_layout)
+    wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
+        workspace_buffer, kv_layout
+    )
     wrapper.plan(
         kv_indptr,
         kv_indices,
@@ -263,7 +282,8 @@ def test_batch_decode_sink_attention_gqa(
     kv_data = torch.randn(*kv_shape, dtype=dtype, device=device)
 
     kv_indptr = (
-        torch.arange(0, batch_size + 1, device=device, dtype=torch.int32) * num_pages_per_seq
+        torch.arange(0, batch_size + 1, device=device, dtype=torch.int32)
+        * num_pages_per_seq
     )
     kv_indices = torch.arange(0, total_num_pages, device=device, dtype=torch.int32)
     kv_last_page_len = torch.full(
@@ -274,7 +294,9 @@ def test_batch_decode_sink_attention_gqa(
     sinks = torch.rand(num_qo_heads, device=device, dtype=torch.float32) * 5.0
 
     workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8, device=device)
-    wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(workspace_buffer, kv_layout)
+    wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
+        workspace_buffer, kv_layout
+    )
     wrapper.plan(
         kv_indptr,
         kv_indices,
@@ -301,4 +323,3 @@ def test_batch_decode_sink_attention_gqa(
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
-
