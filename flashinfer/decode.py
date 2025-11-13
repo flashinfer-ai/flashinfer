@@ -2175,9 +2175,10 @@ def trtllm_batch_decode_with_kv_cache(
 
     if backend == "xqa":
         # TODO(Siyuan): support device scale factors, which was removed in #2033
-        assert isinstance(bmm1_scale, float) and isinstance(bmm2_scale, float), (
-            "XQA MLA only supports float scale factors"
-        )
+        if not isinstance(bmm1_scale, float):
+            bmm1_scale = bmm1_scale.item()
+        if not isinstance(bmm2_scale, float):
+            bmm2_scale = bmm2_scale.item()
         # xqa backend doesn't support nvfp4 output
         if out_dtype == "nvfp4" or (out_dtype is None and isinstance(out, FP4Tensor)):
             raise ValueError("xqa backend does not support nvfp4 output")
@@ -2590,9 +2591,10 @@ def trtllm_batch_decode_with_kv_cache_mla(
         )
     if backend == "xqa":
         # TODO(Siyuan): support device scale factors, which was removed in #2033
-        assert isinstance(bmm1_scale, float) and isinstance(bmm2_scale, float), (
-            "XQA MLA only supports float scale factors"
-        )
+        if not isinstance(bmm1_scale, float):
+            bmm1_scale = bmm1_scale.item()
+        if not isinstance(bmm2_scale, float):
+            bmm2_scale = bmm2_scale.item()
         if (
             get_compute_capability(query.device)[0] != 12
             or query.dtype != torch.float8_e4m3fn
