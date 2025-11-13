@@ -536,29 +536,45 @@ def test_generalized_rope_quantize_append_kv_cache(
 
     # Build inputs following the same pattern used elsewhere
     if attention_type == "mla":
-        # Q: (N, Hq, *), K: 2D (N, *)x
+        # Q: (N, Hq, *), K: 2D (N, *)
         q_rope = torch.randn(
             num_tokens, num_qo_heads, rope_dim, dtype=input_dtype, device=device
         )
-        q_nope = torch.randn(
-            num_tokens, num_qo_heads, no_rope_dim, dtype=input_dtype, device=device
+        q_nope = (
+            None
+            if no_rope_dim == 0
+            else torch.randn(
+                num_tokens, num_qo_heads, no_rope_dim, dtype=input_dtype, device=device
+            )
         )
         k_rope = torch.randn(num_tokens, rope_dim, dtype=input_dtype, device=device)
-        k_nope = torch.randn(num_tokens, no_rope_dim, dtype=input_dtype, device=device)
+        k_nope = (
+            None
+            if no_rope_dim == 0
+            else torch.randn(num_tokens, no_rope_dim, dtype=input_dtype, device=device)
+        )
         v = None
     else:
         # GQA/MHA: K/V are 3D
         q_rope = torch.randn(
             num_tokens, num_qo_heads, rope_dim, dtype=input_dtype, device=device
         )
-        q_nope = torch.randn(
-            num_tokens, num_qo_heads, no_rope_dim, dtype=input_dtype, device=device
+        q_nope = (
+            None
+            if no_rope_dim == 0
+            else torch.randn(
+                num_tokens, num_qo_heads, no_rope_dim, dtype=input_dtype, device=device
+            )
         )
         k_rope = torch.randn(
             num_tokens, num_kv_heads, rope_dim, dtype=input_dtype, device=device
         )
-        k_nope = torch.randn(
-            num_tokens, num_kv_heads, no_rope_dim, dtype=input_dtype, device=device
+        k_nope = (
+            None
+            if no_rope_dim == 0
+            else torch.randn(
+                num_tokens, num_kv_heads, no_rope_dim, dtype=input_dtype, device=device
+            )
         )
         v = torch.randn(
             num_tokens, num_kv_heads, head_dim, dtype=input_dtype, device=device
@@ -699,9 +715,9 @@ def test_generalized_rope_quantize_append_kv_cache(
                 enable_pdl=enable_pdl,
             )
         )
-    # Compute reference output
-    q_in = torch.cat([q_rope, q_nope], dim=-1)
-    k_in = torch.cat([k_rope, k_nope], dim=-1)
+    # Compute reference output (handle None for no_rope_dim == 0)
+    q_in = q_rope if q_nope is None else torch.cat([q_rope, q_nope], dim=-1)
+    k_in = k_rope if k_nope is None else torch.cat([k_rope, k_nope], dim=-1)
     q_out_f16_ref, k_out_f16_ref = rope_ref.forward_native(pos_ids, q_in, k_in)
     q_out_f8_ref, k_out_f8_ref = map(
         lambda x: x.to(quant_dtype),
@@ -845,18 +861,26 @@ def test_rope_quantize_fp8_append_paged_kv_cache_decode(
             dtype=input_dtype,
             device=device,
         )
-        q_nope_existing = torch.randn(
-            num_existing_tokens,
-            num_qo_heads,
-            no_rope_dim,
-            dtype=input_dtype,
-            device=device,
+        q_nope_existing = (
+            None
+            if no_rope_dim == 0
+            else torch.randn(
+                num_existing_tokens,
+                num_qo_heads,
+                no_rope_dim,
+                dtype=input_dtype,
+                device=device,
+            )
         )
         k_rope_existing = torch.randn(
             num_existing_tokens, rope_dim, dtype=input_dtype, device=device
         )
-        k_nope_existing = torch.randn(
-            num_existing_tokens, no_rope_dim, dtype=input_dtype, device=device
+        k_nope_existing = (
+            None
+            if no_rope_dim == 0
+            else torch.randn(
+                num_existing_tokens, no_rope_dim, dtype=input_dtype, device=device
+            )
         )
         v_existing = None
     else:
@@ -867,12 +891,16 @@ def test_rope_quantize_fp8_append_paged_kv_cache_decode(
             dtype=input_dtype,
             device=device,
         )
-        q_nope_existing = torch.randn(
-            num_existing_tokens,
-            num_qo_heads,
-            no_rope_dim,
-            dtype=input_dtype,
-            device=device,
+        q_nope_existing = (
+            None
+            if no_rope_dim == 0
+            else torch.randn(
+                num_existing_tokens,
+                num_qo_heads,
+                no_rope_dim,
+                dtype=input_dtype,
+                device=device,
+            )
         )
         k_rope_existing = torch.randn(
             num_existing_tokens,
@@ -881,12 +909,16 @@ def test_rope_quantize_fp8_append_paged_kv_cache_decode(
             dtype=input_dtype,
             device=device,
         )
-        k_nope_existing = torch.randn(
-            num_existing_tokens,
-            num_kv_heads,
-            no_rope_dim,
-            dtype=input_dtype,
-            device=device,
+        k_nope_existing = (
+            None
+            if no_rope_dim == 0
+            else torch.randn(
+                num_existing_tokens,
+                num_kv_heads,
+                no_rope_dim,
+                dtype=input_dtype,
+                device=device,
+            )
         )
         v_existing = torch.randn(
             num_existing_tokens,
@@ -1036,28 +1068,56 @@ def test_rope_quantize_fp8_append_paged_kv_cache_decode(
         q_rope_new = torch.randn(
             num_new_tokens, num_qo_heads, rope_dim, dtype=input_dtype, device=device
         )
-        q_nope_new = torch.randn(
-            num_new_tokens, num_qo_heads, no_rope_dim, dtype=input_dtype, device=device
+        q_nope_new = (
+            None
+            if no_rope_dim == 0
+            else torch.randn(
+                num_new_tokens,
+                num_qo_heads,
+                no_rope_dim,
+                dtype=input_dtype,
+                device=device,
+            )
         )
         k_rope_new = torch.randn(
             num_new_tokens, rope_dim, dtype=input_dtype, device=device
         )
-        k_nope_new = torch.randn(
-            num_new_tokens, no_rope_dim, dtype=input_dtype, device=device
+        k_nope_new = (
+            None
+            if no_rope_dim == 0
+            else torch.randn(
+                num_new_tokens, no_rope_dim, dtype=input_dtype, device=device
+            )
         )
         v_new = None
     else:
         q_rope_new = torch.randn(
             num_new_tokens, num_qo_heads, rope_dim, dtype=input_dtype, device=device
         )
-        q_nope_new = torch.randn(
-            num_new_tokens, num_qo_heads, no_rope_dim, dtype=input_dtype, device=device
+        q_nope_new = (
+            None
+            if no_rope_dim == 0
+            else torch.randn(
+                num_new_tokens,
+                num_qo_heads,
+                no_rope_dim,
+                dtype=input_dtype,
+                device=device,
+            )
         )
         k_rope_new = torch.randn(
             num_new_tokens, num_kv_heads, rope_dim, dtype=input_dtype, device=device
         )
-        k_nope_new = torch.randn(
-            num_new_tokens, num_kv_heads, no_rope_dim, dtype=input_dtype, device=device
+        k_nope_new = (
+            None
+            if no_rope_dim == 0
+            else torch.randn(
+                num_new_tokens,
+                num_kv_heads,
+                no_rope_dim,
+                dtype=input_dtype,
+                device=device,
+            )
         )
         v_new = torch.randn(
             num_new_tokens, num_kv_heads, head_dim, dtype=input_dtype, device=device
@@ -1146,9 +1206,17 @@ def test_rope_quantize_fp8_append_paged_kv_cache_decode(
             )
         )
 
-    # Verify Q outputs for new tokens
-    q_in_new = torch.cat([q_rope_new, q_nope_new], dim=-1)
-    k_in_new = torch.cat([k_rope_new, k_nope_new], dim=-1)
+    # Verify Q outputs for new tokens (handle None for no_rope_dim == 0)
+    q_in_new = (
+        q_rope_new
+        if q_nope_new is None
+        else torch.cat([q_rope_new, q_nope_new], dim=-1)
+    )
+    k_in_new = (
+        k_rope_new
+        if k_nope_new is None
+        else torch.cat([k_rope_new, k_nope_new], dim=-1)
+    )
     q_out_f16_ref_new, k_out_f16_ref_new = rope_ref.forward_native(
         pos_ids_new, q_in_new, k_in_new
     )

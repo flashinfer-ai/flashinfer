@@ -1285,8 +1285,8 @@ def mla_rope_quantize_fp8(
 def rope_quantize_fp8(
     q_rope: torch.Tensor,
     k_rope: torch.Tensor,
-    q_nope: torch.Tensor,
-    k_nope: torch.Tensor,
+    q_nope: Optional[torch.Tensor],
+    k_nope: Optional[torch.Tensor],
     cos_sin_cache: torch.Tensor,
     pos_ids: torch.Tensor,
     is_neox: bool = True,
@@ -1313,12 +1313,12 @@ def rope_quantize_fp8(
     k_rope : torch.Tensor
         Key tensor (rotary dimensions). For GQA/MHA: ``(nnz, num_kv_heads, rope_dim)``.
         For MLA: ``(nnz, rope_dim)``. Must be float16 or bfloat16.
-    q_nope : torch.Tensor
+    q_nope : Optional[torch.Tensor]
         Query tensor (non-rotary dimensions), shape: ``(nnz, num_qo_heads, no_rope_dim)``.
-        Must be float16 or bfloat16.
-    k_nope : torch.Tensor
+        If ``None``, treated as zero-dim: a size-0 tensor will be created internally.
+    k_nope : Optional[torch.Tensor]
         Key tensor (non-rotary dimensions). For GQA/MHA: ``(nnz, num_kv_heads, no_rope_dim)``.
-        For MLA: ``(nnz, no_rope_dim)``. Must be float16 or bfloat16.
+        For MLA: ``(nnz, no_rope_dim)``. If ``None``, treated as zero-dim and created internally.
     cos_sin_cache : torch.Tensor
         Precomputed cosine and sine values, shape: ``(max_seq_len, rope_dim)``.
         First half contains cosine values, second half contains sine values. Must be float32.
@@ -1352,6 +1352,23 @@ def rope_quantize_fp8(
     """
     if cos_sin_cache.dtype != torch.float32:
         raise ValueError("cos_sin_cache should be float32")
+
+    # Allow None for nope tensors and normalize to size-0 tensors with correct shapes
+    nnz = q_rope.shape[0]
+    num_qo_heads = q_rope.shape[1]
+    is_mla = k_rope.ndim == 2
+    num_kv_heads = 1 if is_mla else k_rope.shape[1]
+    if q_nope is None:
+        q_nope = torch.empty(
+            nnz, num_qo_heads, 0, dtype=q_rope.dtype, device=q_rope.device
+        )
+    if k_nope is None:
+        if is_mla:
+            k_nope = torch.empty(nnz, 0, dtype=k_rope.dtype, device=k_rope.device)
+        else:
+            k_nope = torch.empty(
+                nnz, num_kv_heads, 0, dtype=k_rope.dtype, device=k_rope.device
+            )
 
     # Infer quantize_dtype from output tensors or default to float8_e4m3fn
     if quantize_dtype is None:
@@ -1407,8 +1424,8 @@ def rope_quantize_fp8(
 def rope_quantize_fp8_append_paged_kv_cache(
     q_rope: torch.Tensor,
     k_rope: torch.Tensor,
-    q_nope: torch.Tensor,
-    k_nope: torch.Tensor,
+    q_nope: Optional[torch.Tensor],
+    k_nope: Optional[torch.Tensor],
     v: Optional[torch.Tensor],
     cos_sin_cache: torch.Tensor,
     pos_ids: torch.Tensor,
@@ -1515,6 +1532,22 @@ def rope_quantize_fp8_append_paged_kv_cache(
 
     # Detect architecture
     is_mla = k_rope.ndim == 2
+
+    # Allow None for nope tensors and normalize to size-0 tensors with correct shapes
+    nnz = q_rope.shape[0]
+    num_qo_heads = q_rope.shape[1]
+    if q_nope is None:
+        q_nope = torch.empty(
+            nnz, num_qo_heads, 0, dtype=q_rope.dtype, device=q_rope.device
+        )
+    if k_nope is None:
+        if is_mla:
+            k_nope = torch.empty(nnz, 0, dtype=k_rope.dtype, device=k_rope.device)
+        else:
+            num_kv_heads = k_rope.shape[1]
+            k_nope = torch.empty(
+                nnz, num_kv_heads, 0, dtype=k_rope.dtype, device=k_rope.device
+            )
 
     # Infer quantize_dtype from output tensors or default
     if quantize_dtype is None:
