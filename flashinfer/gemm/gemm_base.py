@@ -1865,11 +1865,6 @@ def _check_mm_fp4_problem_size(
             f"Only torch.bfloat16 and torch.float16 are supported for FP4 GEMM operations."
         )
 
-    if backend != "trtllm" and use_8x4_sf_layout:
-        raise ValueError("Only TRTLLM FP4 GEMM supports 8x4 scale factor layout.")
-    if backend not in ["cudnn", "auto"] and not use_nvfp4:
-        raise ValueError("Only cudnn and auto FP4 GEMM supports mxfp4 quantization.")
-
     if use_nvfp4 and block_size != 16:
         raise ValueError("nvfp4 only supports block_size = 16.")
     if not use_nvfp4 and block_size != 32:
@@ -1892,6 +1887,8 @@ def _cudnn_gemm_fp4_requirement(
     backend: Literal["cudnn", "trtllm", "cutlass", "auto"] = "auto",
     use_nvfp4: bool = True,
 ):
+    if use_8x4_sf_layout:
+        raise ValueError("Only TRTLLM FP4 GEMM supports 8x4 scale factor layout.")
     if (
         not use_nvfp4
         and _match_sm_version(a.device, ["120"])
@@ -1950,6 +1947,8 @@ def _trtllm_gemm_fp4_requirement(
     backend: Literal["cudnn", "trtllm", "cutlass", "auto"] = "auto",
     use_nvfp4: bool = True,
 ):
+    if not use_nvfp4:
+        raise ValueError("Only cudnn and auto FP4 GEMM supports mxfp4 quantization.")
     if out_dtype != torch.bfloat16:
         raise ValueError(
             f"Unsupported output dtype: {out_dtype}. "
@@ -1972,6 +1971,10 @@ def _cutlass_gemm_fp4_requirement(
     backend: Literal["cudnn", "trtllm", "cutlass", "auto"] = "auto",
     use_nvfp4: bool = True,
 ):
+    if use_8x4_sf_layout:
+        raise ValueError("Only TRTLLM FP4 GEMM supports 8x4 scale factor layout.")
+    if not use_nvfp4:
+        raise ValueError("Only cudnn and auto FP4 GEMM supports mxfp4 quantization.")
     return True
 
 
