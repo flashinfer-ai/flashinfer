@@ -475,6 +475,17 @@ def get_gemm_sm120_module_cutlass_fp4():
     )
 
 
+def get_cutlass_fp4_gemm_module(
+    sm_major: int,
+):
+    if sm_major in [10, 11]:
+        return get_gemm_sm100_module_cutlass_fp4()
+    elif sm_major == 12:
+        return get_gemm_sm120_module_cutlass_fp4()
+    else:
+        raise ValueError(f"Unsupported SM major version: {sm_major}")
+
+
 @functools.cache
 def get_tgv_gemm_sm10x_module(
     dtype: torch.dtype = torch.bfloat16, use_sm_100f: bool = False
@@ -1654,7 +1665,7 @@ def mm_fp8(
     return out
 
 
-def _cudnn_gemm_fp4(
+def _get_cudnn_fp4_gemm_graph(
     a: torch.Tensor,
     b: torch.Tensor,
     a_descale: torch.Tensor,
@@ -1664,7 +1675,6 @@ def _cudnn_gemm_fp4(
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
     use_nvfp4: bool = True,
-    workspace_buffer: torch.Tensor = None,
     tactic: int = -1,
 ):
     _check_cudnn_availability()
@@ -1699,7 +1709,34 @@ def _cudnn_gemm_fp4(
         use_nvfp4,
         tactic=tactic,
     )
+    return graph
 
+
+def _cudnn_gemm_fp4(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_descale: torch.Tensor,
+    b_descale: torch.Tensor,
+    alpha: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    out: Optional[torch.Tensor] = None,
+    block_size: int = 16,
+    use_nvfp4: bool = True,
+    workspace_buffer: torch.Tensor = None,
+    tactic: int = -1,
+):
+    graph = _get_cudnn_fp4_gemm_graph(
+        a=a,
+        b=b,
+        a_descale=a_descale,
+        b_descale=b_descale,
+        alpha=alpha,
+        out_dtype=out_dtype,
+        out=out,
+        block_size=block_size,
+        use_nvfp4=use_nvfp4,
+        tactic=tactic,
+    )
     # execute the fp4 cudnn graph
     execute_cudnn_gemm_fp4_graph(
         graph, a, b, a_descale, b_descale, alpha, out, workspace_buffer, tactic=tactic
@@ -1728,32 +1765,19 @@ def _cudnn_gemm_fp4_runner():
                 workspace_buffer,
             ) = inputs
 
-            real_a_shape, real_a_stride = _get_real_fp4_shape_from_packed_uint8(a)
-            real_b_shape, real_b_stride = _get_real_fp4_shape_from_packed_uint8(b)
-            batch = real_a_shape[0]
-            expanded_a_descale_shape, expanded_a_descale_stride = (
-                _expand_block_scale_tensor_shape(a_descale, batch)
-            )
-            expanded_b_descale_shape, expanded_b_descale_stride = (
-                _expand_block_scale_tensor_shape(b_descale, batch)
+            graph = _get_cudnn_fp4_gemm_graph(
+                a=a,
+                b=b,
+                a_descale=a_descale,
+                b_descale=b_descale,
+                alpha=alpha,
+                out_dtype=out_dtype,
+                out=out,
+                block_size=block_size,
+                use_nvfp4=use_nvfp4,
+                tactic=-1,
             )
 
-            graph = build_plans_cudnn_fp4_gemm_graph(
-                real_a_shape,
-                real_a_stride,
-                real_b_shape,
-                real_b_stride,
-                expanded_a_descale_shape,
-                expanded_a_descale_stride,
-                expanded_b_descale_shape,
-                expanded_b_descale_stride,
-                cudnn.data_type.FP4_E2M1,
-                _torch_data_type_to_cudnn_data_type(out_dtype),
-                block_size,
-                a.device,
-                alpha is not None,
-                use_nvfp4,
-            )
             num_plans = graph.get_execution_plan_count()
             return list(range(num_plans))
 
@@ -2104,9 +2128,7 @@ def mm_fp4(
         "trtllm": lambda: get_trtllm_fp4_gemm_module().trtllm_fp4_gemm_runner(
             use_8x4_sf_layout
         ),
-        "cutlass": lambda: get_gemm_sm120_module_cutlass_fp4().cutlass_fp4_gemm_runner()
-        if major == 12
-        else get_gemm_sm100_module_cutlass_fp4().cutlass_fp4_gemm_runner(),
+        "cutlass": lambda: get_cutlass_fp4_gemm_module(major).cutlass_fp4_gemm_runner(),
     }
     runners = [backend_to_runner_factory[cur_backend]() for cur_backend in backends]
 
