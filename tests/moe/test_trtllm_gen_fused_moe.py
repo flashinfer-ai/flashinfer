@@ -208,7 +208,6 @@ class CUDAGraphMoE:
             local_expert_offset=0,
             local_num_experts=self.config["num_experts"],
             routed_scaling_factor=self.config["routed_scaling"],
-            tile_tokens_dim=None,
             routing_method_type=self.config["routing_method_type"],
             gated_act_type=self.config["gated_act_type"],
             do_finalize=True,
@@ -799,7 +798,6 @@ class FP8BlockScaleMoe(Moe):
                 0,
                 num_experts,
                 routed_scaling,
-                None,
                 routing_method_type,
                 use_shuffled_weight=static_data["use_shuffled_weight"],
                 weight_layout=static_data["weight_layout"],
@@ -979,7 +977,6 @@ class FP8PerTensorMoe(Moe):
                 routed_scaling,
                 routing_method_type
                 == RoutingMethodType.Llama4,  # Use_routing_scales_on_input
-                None,
                 routing_method_type,
                 tune_max_num_tokens=TUNE_MAX_NUM_TOKENS,
             )
