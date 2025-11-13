@@ -629,53 +629,92 @@ class BatchPODWithPagedKVCacheWrapper:
     --------
     >>> import torch
     >>> import flashinfer
-    >>> num_layers = 32
+    >>> num_layers = 8
     >>> num_qo_heads = 64
     >>> num_kv_heads = 8
     >>> head_dim = 128
     >>> max_num_pages = 128
-    >>> page_size = 16
+    >>> device = 0
+    >>> page_block_size = 1
+    >>> causal = True
     >>> # allocate 128MB workspace buffer
     >>> workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
     >>> wrapper = flashinfer.BatchPODWithPagedKVCacheWrapper(
     ...     workspace_buffer, "NHD"
     ... )
-    >>> batch_size = 7
-    >>> kv_page_indices = torch.arange(max_num_pages).int().to("cuda:0")
-    >>> kv_page_indptr = torch.tensor(
-    ...     [0, 17, 29, 44, 48, 66, 100, 128], dtype=torch.int32, device="cuda:0"
-    ... )
-    >>> # 1 <= kv_last_page_len <= page_size
-    >>> kv_last_page_len = torch.tensor(
-    ...     [1, 7, 14, 4, 3, 1, 16], dtype=torch.int32, device="cuda:0"
-    ... )
-    >>> kv_cache_at_layer = [
-    ...     torch.randn(
-    ...         max_num_pages, 2, page_size, num_kv_heads, head_dim, dtype=torch.float16, device="cuda:0"
-    ...     ) for _ in range(num_layers)
-    ... ]
+    >>> # Prefill and decode parameters
+    >>> p_qo_lens = [2048] * 2
+    >>> d_qo_lens = [1] * 128
+    >>> p_kv_lens = [2048] * 2
+    >>> d_kv_lens = [2048] * 128
+    >>> # Prefill plan inputs
+    >>> p_seq_lens_blocks = torch.ceil(
+    ...     torch.tensor(p_kv_lens, dtype=torch.int32) / page_block_size
+    ... ).int()
+    >>> p_q_indptr = torch.cat(
+    ...     [torch.tensor([0]), torch.cumsum(torch.tensor(p_qo_lens), 0)], dim=0
+    ... ).int()
+    >>> p_kv_indptr = torch.cat(
+    ...     [torch.tensor([0]), torch.cumsum(p_seq_lens_blocks, 0)], dim=0
+    ... ).int()
+    >>> kv_indices_p = torch.arange(0, p_kv_indptr[-1], device=device, dtype=torch.int32)
+    >>> last_page_len_p = (p_seq_lens_blocks - 1) % page_block_size + 1
+    >>> # Decode plan inputs
+    >>> d_seq_lens_blocks = torch.ceil(
+    ...     torch.tensor(d_kv_lens, dtype=torch.int32) / page_block_size
+    ... ).int()
+    >>> d_q_indptr = torch.cat(
+    ...     [torch.tensor([0]), torch.cumsum(torch.tensor(d_qo_lens), 0)], dim=0
+    ... ).int()
+    >>> d_kv_indptr = torch.cat(
+    ...     [torch.tensor([0]), torch.cumsum(d_seq_lens_blocks, 0)], dim=0
+    ... ).int()
+    >>> kv_indices_d = torch.arange(0, d_kv_indptr[-1], device=device, dtype=torch.int32)
+    >>> last_page_len_d = (d_seq_lens_blocks - 1) % page_block_size + 1
     >>> # create auxiliary data structures for batch decode attention
     >>> wrapper.plan(
-    ...     kv_page_indptr,
-    ...     kv_page_indices,
-    ...     kv_last_page_len,
-    ...     num_qo_heads,
-    ...     num_kv_heads,
-    ...     head_dim,
-    ...     page_size,
-    ...     pos_encoding_mode="NONE",
-    ...     data_type=torch.float16
+    ...     # Prefill params
+    ...     p_q_indptr.to(device),
+    ...     p_kv_indptr.to(device),
+    ...     kv_indices_p.to(device),
+    ...     last_page_len_p,
+    ...     # Decode params
+    ...     d_q_indptr.to(device),
+    ...     d_kv_indptr.to(device),
+    ...     kv_indices_d.to(device),
+    ...     last_page_len_d,
+    ...     # Common params
+    ...     num_qo_heads=num_qo_heads,
+    ...     num_kv_heads=num_kv_heads,
+    ...     head_dim=head_dim,
+    ...     page_size=page_block_size,
+    ...     q_data_type=torch.bfloat16,
+    ...     kv_data_type=torch.bfloat16,
     ... )
-    >>> outputs = []
+    >>> # Prefill input tensors
+    >>> q_p = torch.rand(p_q_indptr[-1].item(), num_qo_heads, head_dim).to(
+    ...     device, dtype=torch.bfloat16
+    ... )
+    >>> kv_p = torch.randn(p_kv_indptr[-1], 2, page_block_size, num_kv_heads, head_dim).to(
+    ...     device, dtype=torch.bfloat16
+    ... ).unbind(1)
+    >>> # Decode input tensors
+    >>> q_d = torch.rand(d_q_indptr[-1].item(), num_qo_heads, head_dim).to(
+    ...     device, dtype=torch.bfloat16
+    ... )
+    >>> kv_d = torch.randn(d_kv_indptr[-1], 2, page_block_size, num_kv_heads, head_dim).to(
+    ...     device, dtype=torch.bfloat16
+    ... ).unbind(1)
     >>> for i in range(num_layers):
-    ...     q = torch.randn(batch_size, num_qo_heads, head_dim).half().to("cuda:0")
-    ...     kv_cache = kv_cache_at_layer[i]
-    ...     # compute batch decode attention, reuse auxiliary data structures for all layers
-    ...     # TODO_AK: DEMONSTRATE USAGE OF POD
-    ...     outputs.append(o)
-    ...
-    >>> outputs[0].shape
-    torch.Size([7, 64, 128])
+    ...     o_p_batch, o_d_batch = wrapper.run(
+    ...         q_p,
+    ...         kv_p,
+    ...         q_d,
+    ...         kv_d,
+    ...         causal_p=causal,
+    ...     )
+    >>> print(o_p_batch.shape, o_d_batch.shape)
+    torch.Size([4096, 64, 128]) torch.Size([128, 64, 128])
 
     Note
     ----
