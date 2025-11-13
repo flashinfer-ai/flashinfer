@@ -1895,7 +1895,7 @@ class TrtllmGenDecodeModule:
 
         if isinstance(bmm1_scale, torch.Tensor):
             assert bmm1_scale.dtype == torch.float32
-            bmm1_scale *= log2e
+            bmm1_scale = bmm1_scale * log2e
         if isinstance(bmm2_scale, torch.Tensor):
             assert bmm2_scale.dtype == torch.float32
 
@@ -2295,7 +2295,7 @@ def trtllm_batch_decode_with_kv_cache(
 
         if isinstance(bmm1_scale, torch.Tensor):
             assert bmm1_scale.dtype == torch.float32
-            bmm1_scale *= log2e
+            bmm1_scale = bmm1_scale * log2e
         if isinstance(bmm2_scale, torch.Tensor):
             assert bmm2_scale.dtype == torch.float32
 
@@ -2663,7 +2663,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
 
         if isinstance(bmm1_scale, torch.Tensor):
             assert bmm1_scale.dtype == torch.float32
-            bmm1_scale *= log2e
+            bmm1_scale = bmm1_scale * log2e
         if isinstance(bmm2_scale, torch.Tensor):
             assert bmm2_scale.dtype == torch.float32
 

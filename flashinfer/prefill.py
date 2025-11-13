@@ -207,7 +207,7 @@ def get_trtllm_gen_prefill_module():
             out = torch.empty_like(query)
         if isinstance(bmm1_scale, torch.Tensor):
             assert bmm1_scale.dtype == torch.float32
-            bmm1_scale *= log2e
+            bmm1_scale = bmm1_scale * log2e
         if isinstance(bmm2_scale, torch.Tensor):
             assert bmm2_scale.dtype == torch.float32
         op.trtllm_paged_attention_context(
@@ -3291,7 +3291,7 @@ def trtllm_ragged_attention_deepseek(
 
     if isinstance(bmm1_scale, torch.Tensor):
         assert bmm1_scale.dtype == torch.float32
-        bmm1_scale *= log2e
+        bmm1_scale = bmm1_scale * log2e
     if isinstance(bmm2_scale, torch.Tensor):
         assert bmm2_scale.dtype == torch.float32
 
@@ -3504,7 +3504,7 @@ def trtllm_batch_context_with_kv_cache(
 
     if isinstance(bmm1_scale, torch.Tensor):
         assert bmm1_scale.dtype == torch.float32
-        bmm1_scale *= log2e
+        bmm1_scale = bmm1_scale * log2e
     if isinstance(bmm2_scale, torch.Tensor):
         assert bmm2_scale.dtype == torch.float32
     workspace_size = workspace_buffer.numel() * workspace_buffer.element_size()
