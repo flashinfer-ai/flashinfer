@@ -493,8 +493,10 @@ def test_trtllm_batch_prefill(
         seq_lens.to(GPU_DEVICE),
         torch.max(q_lens).item(),
         torch.max(seq_lens).item(),
-        q_scale * k_scale * sm_scale,  # bmm1_scale
-        v_scale / o_scale,  # bmm2_scale
+        torch.tensor(q_scale * k_scale * sm_scale * math.log2(math.e))
+        .to(torch.float32)
+        .to(GPU_DEVICE),  # bmm1_scale
+        torch.tensor(v_scale / o_scale).to(torch.float32).to(GPU_DEVICE),  # bmm2_scale
         batch_size,
         q_indptr,
         kv_indptr,
@@ -788,8 +790,10 @@ def _test_trtllm_batch_decode(
         page_table,
         seq_lens.to(GPU_DEVICE),
         torch.max(seq_lens).item(),
-        q_scale * k_scale * sm_scale,  # bmm1_scale
-        v_scale / o_scale,  # bmm2_scale
+        torch.tensor(q_scale * k_scale * sm_scale * math.log2(math.e))
+        .to(torch.float32)
+        .to(GPU_DEVICE),  # bmm1_scale
+        torch.tensor(v_scale / o_scale).to(torch.float32).to(GPU_DEVICE),  # bmm2_scale
         window_left,  # window_left
         out=out,
         out_dtype=out_dtype,

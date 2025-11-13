@@ -190,8 +190,8 @@ def get_trtllm_gen_prefill_module():
         seq_lens: torch.Tensor,
         max_q_len: int,
         max_kv_len: int,
-        bmm1_scale: float,
-        bmm2_scale: float,
+        bmm1_scale: Union[float, torch.Tensor],
+        bmm2_scale: Union[float, torch.Tensor],
         batch_size: int,
         cum_seq_lens_q: torch.Tensor,
         cum_seq_lens_kv: torch.Tensor,
@@ -204,12 +204,6 @@ def get_trtllm_gen_prefill_module():
         sm_count = get_device_sm_count(query.device)
         if out is None:
             out = torch.empty_like(query)
-        bmm1_scale = (
-            bmm1_scale.item() if isinstance(bmm1_scale, torch.Tensor) else bmm1_scale
-        )
-        bmm2_scale = (
-            bmm2_scale.item() if isinstance(bmm2_scale, torch.Tensor) else bmm2_scale
-        )
         op.trtllm_paged_attention_context(
             out,
             None,  # fp4 output not supported in wrapper api yet.
@@ -2065,6 +2059,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
             sm_scale *= q_scale
         if k_scale is not None:
             sm_scale *= k_scale
+        if isinstance(sm_scale, torch.Tensor) and self._backend == "trtllm-gen":
+            sm_scale *= math.log2(math.e)
         if rope_scale is None:
             rope_scale = 1.0
         if rope_theta is None:
@@ -3199,8 +3195,8 @@ def trtllm_ragged_attention_deepseek(
     seq_lens: torch.Tensor,
     max_q_len: int,
     max_kv_len: int,
-    bmm1_scale: float,
-    bmm2_scale: float,
+    bmm1_scale: Union[float, torch.Tensor],
+    bmm2_scale: Union[float, torch.Tensor],
     o_sf_scale: float,
     batch_size: int,
     window_left: int,
@@ -3230,10 +3226,12 @@ def trtllm_ragged_attention_deepseek(
         max query length
     max_kv_len : int
         max key/value length
-    bmm1_scale : float
+    bmm1_scale : Union[float, torch.Tensor]
         scale for bmm1, scale_q * scale_k * 1.0 / (head_dim_qk ** 0.5)
-    bmm2_scale : float
+        when using trtllm-gen backend, it can be a torch.Tensor with dtype torch.float32 and must be fused with M_LOG2E
+    bmm2_scale : Union[float, torch.Tensor]
         scale for bmm2, scale_v
+        when using trtllm-gen backend, it can be a torch.Tensor with dtype torch.float32.
     o_sf_scale : float
         scale for output
     batch_size : int
@@ -3325,8 +3323,8 @@ def trtllm_batch_context_with_kv_cache(
     seq_lens: torch.Tensor,
     max_q_len: int,
     max_kv_len: int,
-    bmm1_scale: float,
-    bmm2_scale: float,
+    bmm1_scale: Union[float, torch.Tensor],
+    bmm2_scale: Union[float, torch.Tensor],
     batch_size: int,
     cum_seq_lens_q: torch.Tensor,
     cum_seq_lens_kv: torch.Tensor,
@@ -3360,10 +3358,12 @@ def trtllm_batch_context_with_kv_cache(
         max sequence length for query
     max_kv_len : int
         max sequence length for kv_cache
-    bmm1_scale : float
+    bmm1_scale : Union[float, torch.Tensor]
         fused scale for bmm1 input.
-    bmm2_scale : float
+        when using trtllm-gen backend, it can be a torch.Tensor with dtype torch.float32 and must be fused with M_LOG2E
+    bmm2_scale : Union[float, torch.Tensor]
         fused scale for bmm2 input.
+        when using trtllm-gen backend, it can be a torch.Tensor with dtype torch.float32.
     batch_size : int
         batch size
     cum_seq_lens_q : torch.Tensor
@@ -3491,13 +3491,6 @@ def trtllm_batch_context_with_kv_cache(
         check_shape_dtype_device(out, query.shape, out_dtype, query.device, "out")
     else:
         raise ValueError(f"Invalid out_dtype: {out_dtype}")
-
-    bmm1_scale = (
-        bmm1_scale.item() if isinstance(bmm1_scale, torch.Tensor) else bmm1_scale
-    )
-    bmm2_scale = (
-        bmm2_scale.item() if isinstance(bmm2_scale, torch.Tensor) else bmm2_scale
-    )
 
     workspace_size = workspace_buffer.numel() * workspace_buffer.element_size()
     run_func(
