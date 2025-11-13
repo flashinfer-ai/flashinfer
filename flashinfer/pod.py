@@ -976,7 +976,7 @@ class BatchPODWithPagedKVCacheWrapper:
 
         num_colocated_ctas = self._plan_info_d[0]
         # Splitting small prefill causes unecessary bandwidth contention
-        if qo_indptr_host_p.sum() > 1536:
+        if total_num_rows_p > 1536:
             num_colocated_ctas = 0
         self._plan_info_p = self._cached_module.plan(
             self._float_workspace_buffer_p,
