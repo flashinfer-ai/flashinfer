@@ -1902,6 +1902,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             if self._backend == "fa2":
                 args.append(fixed_split_size or -1)  # fixed_split_size
                 args.append(disable_split_kv)  # disable_split_kv
+                args.append(0)  # num_colocated_ctas
             self._plan_info = self._cached_module.plan(
                 *args,
             )
@@ -2769,6 +2770,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             if self._backend == "fa2":
                 args.append(fixed_split_size or -1)  # fixed_split_size
                 args.append(disable_split_kv)  # disable_split_kv
+                args.append(0)  # num_colocated_ctas
             self._plan_info = self._cached_module.plan(
                 *args,
             )

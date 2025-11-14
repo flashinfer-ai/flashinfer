@@ -1060,6 +1060,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 window_left,
                 fixed_split_size,
                 disable_split_kv,
+                0,  # num_colocated_ctas
             )
         else:
             if self._jit_module is not None:
@@ -2920,7 +2921,7 @@ def fast_decode_plan(
             kv_lens_arr_host = get_seq_lens(indptr_host, last_page_len_host, page_size)
 
             try:
-                # Make sure we pass exactly 15 arguments for tensor core version
+                # Make sure we pass exactly 16 arguments for tensor core version
                 self._plan_info = self._cached_module.plan(
                     self._float_workspace_buffer,
                     self._int_workspace_buffer,
@@ -2940,6 +2941,7 @@ def fast_decode_plan(
                     window_left,
                     fixed_split_size,
                     disable_split_kv,
+                    0,  # num_colocated_ctas
                 )
             except Exception as e:
                 raise RuntimeError(f"Error in standard plan: {e}") from e
