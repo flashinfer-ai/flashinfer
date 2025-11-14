@@ -811,6 +811,7 @@ __global__ void finalizeKernelVecLoad(KernelParams params) {
   int64_t const stride = FINALIZE_THREADS_PER_BLOCK;
   int64_t const numElemsInPaddedCol = params.hiddenDimPadded / FINALIZE_ELEM_PER_THREAD;
   int64_t const numElemsInCol = params.hiddenDim / FINALIZE_ELEM_PER_THREAD;
+  bool const useScale = params.expertWeightsPtr != nullptr;
 
   __shared__ ScalePackedType scaleArrSmem[MaxTopK / TopKUnrollFactor];
   __shared__ IdxPackedType permutedIdxArrSmem[MaxTopK / TopKUnrollFactor];
@@ -820,10 +821,9 @@ __global__ void finalizeKernelVecLoad(KernelParams params) {
     int const expandedIdx = tokenIdx * params.topK + kChunkIdx * TopKUnrollFactor;
     auto permutedIdxPacked = reinterpret_cast<IdxPackedType const*>(
         params.expandedIdxToPermutedIdx)[expandedIdx / TopKUnrollFactor];
-    auto scalePacked = (params.expertWeightsPtr != nullptr)
-                           ? reinterpret_cast<ScalePackedType const*>(
-                                 params.expertWeightsPtr)[expandedIdx / TopKUnrollFactor]
-                           : ScalePackedType{TypeExpW(1.f)};
+    auto scalePacked = useScale ? reinterpret_cast<ScalePackedType const*>(
+                                      params.expertWeightsPtr)[expandedIdx / TopKUnrollFactor]
+                                : ScalePackedType{TypeExpW(1.f)};
 
     scaleArrSmem[kChunkIdx] = scalePacked;
     permutedIdxArrSmem[kChunkIdx] = permutedIdxPacked;
@@ -871,8 +871,9 @@ __global__ void finalizeKernelVecLoad(KernelParams params) {
         if (permutedIdx == -1) {
           continue;
         }
+        auto scale = useScale ? scaleFloatArr[ki] : 1.0f;
         ComputeElem expertResult = arrayConvert<InputElem, ComputeElem>(inputElemArr[ki]);
-        threadOutput = threadOutput + scaleFloatArr[ki] * expertResult;
+        threadOutput = threadOutput + scale * expertResult;
       }
     }
     OutputElem outputElem = arrayConvert<ComputeElem, OutputElem>(threadOutput);

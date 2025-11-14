@@ -144,10 +144,8 @@ namespace moe::dev {
     LAUNCH_EXPW(data, kernel, 4, numBlocks, numThreads, smemSize, stream);      \
   } else if (data.topK % 2 == 0) {                                              \
     LAUNCH_EXPW(data, kernel, 2, numBlocks, numThreads, smemSize, stream);      \
-  } else if (data.topK % 1 == 0) {                                              \
-    LAUNCH_EXPW(data, kernel, 1, numBlocks, numThreads, smemSize, stream);      \
   } else {                                                                      \
-    FLASHINFER_WARN("Unsupported topK");                                        \
+    LAUNCH_EXPW(data, kernel, 1, numBlocks, numThreads, smemSize, stream);      \
   }
 
 #define LAUNCH_TILEN(data, coopLaunch, types, kernel, numBlocks, numThreads, smemSize, stream)     \
