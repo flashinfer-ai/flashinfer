@@ -672,9 +672,207 @@ __device__ float4 vectorizedLoadPtx(float4 const* ptr) {
 // Final kernel to unpermute and scale
 // This kernel unpermutes the original data, does the k-way reduction and performs the final skip
 // connection.
+constexpr int MaxTopK = 64;
+
+typedef struct __CUDA_ALIGN__(4) {
+  cutlass::bfloat16_t array[2];
+} __nv_bfloat16_2;
+
+typedef struct __CUDA_ALIGN__(8) {
+  cutlass::bfloat16_t array[4];
+} __nv_bfloat16_4;
+
+typedef struct __CUDA_ALIGN__(8) {
+  half array[4];
+} half_4;
+
+template<int UnrollFactor_, typename TypeExpW_>
+struct ScaleTraitsStruct;
+
+template<>
+struct ScaleTraitsStruct<1, cutlass::bfloat16_t> {
+  using PackedType = cutlass::bfloat16_t;
+  using ArrayType = cutlass::Array<__nv_bfloat16, 1>;
+};
+
+template<>
+struct ScaleTraitsStruct<2, cutlass::bfloat16_t> {
+  using PackedType = __nv_bfloat16_2;
+  using ArrayType = cutlass::Array<__nv_bfloat16, 2>;
+};
+
+template<>
+struct ScaleTraitsStruct<4, cutlass::bfloat16_t> {
+  using PackedType = __nv_bfloat16_4;
+  using ArrayType = cutlass::Array<cutlass::bfloat16_t, 4>;
+};
+
+template<>
+struct ScaleTraitsStruct<1, float> {
+  using PackedType = float;
+  using ArrayType = cutlass::Array<float, 1>;
+};
+
+template<>
+struct ScaleTraitsStruct<2, float> {
+  using PackedType = float2;
+  using ArrayType = cutlass::Array<float, 2>;
+};
+
+template<>
+struct ScaleTraitsStruct<4, float> {
+  using PackedType = float4;
+  using ArrayType = cutlass::Array<float, 4>;
+};
+
+template<>
+struct ScaleTraitsStruct<1, half> {
+  using PackedType = half;
+  using ArrayType = cutlass::Array<half, 1>;
+};
+
+template<>
+struct ScaleTraitsStruct<2, half> {
+  using PackedType = half2;
+  using ArrayType = cutlass::Array<half, 2>;
+};
+
+template<>
+struct ScaleTraitsStruct<4, half> {
+  using PackedType = half_4;
+  using ArrayType = cutlass::Array<half, 4>;
+};
+
+template<int UnrollFactor_, typename TypeExpW_>
+struct FinalizeTraits;
+
+template<typename TypeExpW_>
+struct FinalizeTraits<1, TypeExpW_> {
+  using IdxPackedType = int;
+  using IdxArrayType = cutlass::Array<int, 1>;
+  using ScaleTraits = ScaleTraitsStruct<1, TypeExpW_>;
+  using ScalePackedType = typename ScaleTraits::PackedType;
+  using ScaleArrayType = typename ScaleTraits::ArrayType;
+};
+
+template<typename TypeExpW_>
+struct FinalizeTraits<2, TypeExpW_> {
+  using IdxPackedType = int2;
+  using IdxArrayType = cutlass::Array<int, 2>;
+  using ScaleTraits = ScaleTraitsStruct<2, TypeExpW_>;
+  using ScalePackedType = typename ScaleTraits::PackedType;
+  using ScaleArrayType = typename ScaleTraits::ArrayType;
+};
+
+template<typename TypeExpW_>
+struct FinalizeTraits<4, TypeExpW_> {
+  using IdxPackedType = int4;
+  using IdxArrayType = cutlass::Array<int, 4>;
+  using ScaleTraits = ScaleTraitsStruct<4, TypeExpW_>;
+  using ScalePackedType = typename ScaleTraits::PackedType;
+  using ScaleArrayType = typename ScaleTraits::ArrayType;
+};
 
 template <typename KernelParams>
 __global__ void finalizeKernelVecLoad(KernelParams params) {
+  using Type = typename KernelParams::Type;
+  using TypeExpW = typename KernelParams::TypeExpW;
+  int constexpr TopKUnrollFactor = KernelParams::TopKUnrollFactor;
+
+  static_assert(TopKUnrollFactor == 1 || TopKUnrollFactor == 2 || TopKUnrollFactor == 4, "TopKUnrollFactor must be 1, 2, or 4");
+  using FinalizeTraits = FinalizeTraits<TopKUnrollFactor, TypeExpW>;
+  using IdxPackedType = typename FinalizeTraits::IdxPackedType;
+  using IdxArrayType = typename FinalizeTraits::IdxArrayType;
+  using ScalePackedType = typename FinalizeTraits::ScalePackedType;
+  using ScaleArrayType = typename FinalizeTraits::ScaleArrayType;
+
+  int const hiddenDimPaddedBits = params.hiddenDimPadded * cutlass::sizeof_bits<Type>::value;
+  int const hiddenDimBits = params.hiddenDim * cutlass::sizeof_bits<Type>::value;
+  assert(hiddenDimPaddedBits % 128 == 0);
+  assert(hiddenDimBits % 128 == 0);
+
+  // Load 128-bits per thread, according to the smallest data type we read/write
+  constexpr int64_t FINALIZE_ELEM_PER_THREAD = 128 / cutlass::sizeof_bits<Type>::value;
+  using InputElem = cutlass::Array<Type, FINALIZE_ELEM_PER_THREAD>;
+  using OutputElem = cutlass::Array<Type, FINALIZE_ELEM_PER_THREAD>;
+  using ComputeElem = cutlass::Array<float, FINALIZE_ELEM_PER_THREAD>;
+
+  int64_t const tokenIdx = blockIdx.x;
+  int64_t const startOffset = threadIdx.x;
+  int64_t const stride = FINALIZE_THREADS_PER_BLOCK;
+  int64_t const numElemsInPaddedCol = params.hiddenDimPadded / FINALIZE_ELEM_PER_THREAD;
+  int64_t const numElemsInCol = params.hiddenDim / FINALIZE_ELEM_PER_THREAD;
+
+  __shared__ __nv_bfloat16_4 scaleArrSmem[MaxTopK / TopKUnrollFactor];
+  __shared__ IdxPackedType permutedIdxArrSmem[MaxTopK / TopKUnrollFactor];
+
+  for (int kChunkIdx = threadIdx.x; kChunkIdx < params.topK / TopKUnrollFactor; kChunkIdx += blockDim.x) {
+    int const expandedIdx = tokenIdx * params.topK + kChunkIdx * TopKUnrollFactor;
+    auto permutedIdxPacked = reinterpret_cast<IdxPackedType const*>(params.expandedIdxToPermutedIdx)[expandedIdx/4];
+    // auto permutedIdxArr = *reinterpret_cast<cutlass::Array<int, 4> const*>(&permutedIdxPacked);
+    auto scalePacked = (params.expertWeightsPtr != nullptr)
+                              ? reinterpret_cast<__nv_bfloat16_4 const*>(params.expertWeightsPtr)[expandedIdx/4]
+                              : __nv_bfloat16_4{cutlass::bfloat16_t(1.f), cutlass::bfloat16_t(1.f), cutlass::bfloat16_t(1.f), cutlass::bfloat16_t(1.f)};
+    // auto scaleArr = *reinterpret_cast<cutlass::Array<__nv_bfloat16, 4> const*>(&scalePacked);
+
+    scaleArrSmem[kChunkIdx] = scalePacked;
+    permutedIdxArrSmem[kChunkIdx] = permutedIdxPacked;
+  }
+  
+  auto const offset = tokenIdx * params.hiddenDim;
+  Type* outputPtr = params.outPtr + offset;
+  auto* outElemPtr = reinterpret_cast<OutputElem*>(outputPtr);
+  auto const* inElemPtr = reinterpret_cast<InputElem const*>(params.inPtr);
+  
+  #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  // wait on primary kernel when using PDL
+  if constexpr (KernelParams::UsePdl) {
+    cudaGridDependencySynchronize();
+  }
+  #endif
+  __syncthreads();
+
+
+  for (int elemIndex = startOffset; elemIndex < numElemsInCol; elemIndex += stride) {
+    ComputeElem threadOutput;
+    threadOutput.fill(0);
+    for (int kChunkIdx = 0; kChunkIdx < params.topK / TopKUnrollFactor; kChunkIdx++) {
+      auto permutedIdxArr = *reinterpret_cast<cutlass::Array<int, 4> const*>(&permutedIdxArrSmem[kChunkIdx]);
+      InputElem inputElemArr[TopKUnrollFactor];
+      #pragma unroll
+      for (int ki = 0; ki < TopKUnrollFactor; ++ki) {
+        auto const permutedIdx = permutedIdxArr[ki];
+        if (permutedIdx == -1) {
+          continue;
+        }
+        
+        auto const* inputPermutedPtr = inElemPtr + permutedIdx * numElemsInPaddedCol;
+        
+        float4 input =
+        vectorizedLoadPtx(reinterpret_cast<float4 const*>(&inputPermutedPtr[elemIndex]));
+        inputElemArr[ki] = *reinterpret_cast<InputElem const*>(&input);
+      }
+      auto scaleArr = *reinterpret_cast<ScaleArrayType const*>(&scaleArrSmem[kChunkIdx]);
+      auto const scaleFloatArr = arrayConvert<ScaleArrayType, cutlass::Array<float, TopKUnrollFactor>>(scaleArr);
+
+  #pragma unroll
+      for (int ki = 0; ki < TopKUnrollFactor; ++ki) {
+        auto const permutedIdx = permutedIdxArr[ki];
+        if (permutedIdx == -1) {
+          continue;
+        }
+
+        ComputeElem expertResult = arrayConvert<InputElem, ComputeElem>(inputElemArr[ki]);
+        threadOutput = threadOutput + scaleFloatArr[ki] * expertResult;
+      }
+    }
+    OutputElem outputElem = arrayConvert<ComputeElem, OutputElem>(threadOutput);
+    outElemPtr[elemIndex] = outputElem;
+  }
+}
+
+template <typename KernelParams>
+__global__ void finalizeKernelVecLoad_baseline(KernelParams params) {
   using Type = typename KernelParams::Type;
   using TypeExpW = typename KernelParams::TypeExpW;
 
@@ -813,7 +1011,7 @@ void run(Data const& data, void* stream) {
     int const numBlocksY = std::min(8192, data.numTokens);
     dim3 numBlocks(numBlocksX, numBlocksY);
 
-    LAUNCH_EXPW(data, finalizeDeepSeekKernel, numBlocks, numThreads, 0, stream);
+    LAUNCH_TOPK_EXPW(data, finalizeDeepSeekKernel, numBlocks, numThreads, 0, stream);
   } else {
     int const numThreads = 256;
     int const numBlocksX = (data.hiddenDim - 1 + numThreads) / numThreads;
@@ -827,9 +1025,10 @@ void run(Data const& data, void* stream) {
       // ensure that when the number of waves is greater than 1, we choose to use the kernel with
       // vectorized loading.
       dim3 numBlocks(numBlocksX, numBlocksY);
-      LAUNCH_EXPW(data, finalizeKernel, numBlocks, numThreads, 0, stream);
+      LAUNCH_TOPK_EXPW(data, finalizeKernel, numBlocks, numThreads, 0, stream);
     } else {
-      LAUNCH_EXPW(data, finalizeKernelVecLoad, /*numBlocks=*/data.numTokens,
+      FLASHINFER_CHECK(data.topK <= MaxTopK, "Finalize kernel with vectorized loading is not supported for this TopK value: %d", data.topK);
+      LAUNCH_TOPK_EXPW(data, finalizeKernelVecLoad_baseline, /*numBlocks=*/data.numTokens,
                   /*numThreads=*/FINALIZE_THREADS_PER_BLOCK, 0, stream);
     }
   }
