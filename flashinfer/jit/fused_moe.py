@@ -55,7 +55,7 @@ def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool = False) -> JitSpec:
         "-DENABLE_FP8",
         "-DENABLE_FP4",
         "-DUSING_OSS_CUTLASS_MOE_GEMM",
-        "-lineinfo"
+        "-lineinfo",
     ]
 
     nvcc_flags += current_compilation_context.get_nvcc_flags_list(
