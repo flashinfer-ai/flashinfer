@@ -156,6 +156,9 @@ class CommBackend(ABC):
     def allgather(self, data: int) -> List[int]: ...
 
     @abstractmethod
+    def barrier(self) -> None: ...
+
+    @abstractmethod
     def Split(self, color: int, key: int) -> "CommBackend": ...
 
 
@@ -208,6 +211,9 @@ class MPIBackend(CommBackend):
 
     def allgather(self, data: int) -> List[int]:
         return self._mpicomm.allgather(data)
+
+    def barrier(self):
+        self._mpicomm.Barrier()
 
     def Split(self, color: int, key: int) -> CommBackend:
         self._mpicomm = self._mpicomm.Split(color, key)
@@ -555,6 +561,7 @@ class McastDeviceMemory:
         group_rank: int,
         device_idx: int,
         is_multi_node: bool = True,
+        comm_backend_for_handle_transfer: Optional[CommBackend] = None,
     ):
         cu_device = checkCudaErrors(cuda.cuDeviceGet(device_idx))
 
@@ -631,7 +638,7 @@ class McastDeviceMemory:
                     "[McastDeviceMemory] Device does not support fabric handle."
                 )
 
-            self._alloc_mn_mcast_mem(buf_size)
+            self._alloc_mn_mcast_mem(buf_size, comm_backend_for_handle_transfer)
         else:
             # For single-node NVLS, would need to implement _alloc_nvls_mcast_mem
             raise NotImplementedError("Single-node NVLS allocation not implemented yet")
@@ -753,7 +760,9 @@ class McastDeviceMemory:
         """Get the total number of devices in the group"""
         return self.group_size
 
-    def _alloc_mn_mcast_mem(self, buf_size: int):
+    def _alloc_mn_mcast_mem(
+        self, buf_size: int, comm_backend_for_handle_transfer: Any = None
+    ):
         """Allocate multi-node multicast memory using MNNVL"""
 
         # Verify CUDA context
@@ -766,10 +775,10 @@ class McastDeviceMemory:
                 )
         except Exception as e:
             print(f"Error checking CUDA context: {e}")
-
-        # Get MPI communicator
-        comm = MpiComm()
-
+        if comm_backend_for_handle_transfer is None:
+            comm = MpiComm()
+        else:
+            comm = comm_backend_for_handle_transfer
         # Set up allocation properties
         handle_type = cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
 
@@ -969,6 +978,7 @@ class McastGPUBuffer:
         group_rank: int,
         device: torch.device,
         mn_nvlink: bool = True,
+        comm_backend_for_handle_transfer: Optional[CommBackend] = None,
     ):
         """
         Constructor for McastGpuBuffer.
@@ -979,9 +989,15 @@ class McastGPUBuffer:
             group_rank: The rank of the local process within the group
             device: The CUDA device for buffer allocation
             mn_nvlink: Flag indicating if multi-node NVLink is used
+            comm_backend_for_handle_transfer: Communication backend for handle transfer
         """
         self.mcast_device_memory = McastDeviceMemory(
-            buf_size, group_size, group_rank, device.index, mn_nvlink
+            buf_size,
+            group_size,
+            group_rank,
+            device.index,
+            mn_nvlink,
+            comm_backend_for_handle_transfer,
         )
         self.buf_size = buf_size
         self.local_device = device
