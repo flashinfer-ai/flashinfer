@@ -121,14 +121,14 @@ std::string getNvccCompiler() {
   return compiler;
 }
 
-inline void setJitIncludeDirs(std::vector<std::filesystem::path> const& dirs) {
-  static std::vector<std::filesystem::path>& includeDirs = getJitIncludeDirs();
-  includeDirs = dirs;
-}
-
 inline std::vector<std::filesystem::path>& getJitIncludeDirs() {
   static std::vector<std::filesystem::path> includeDirs;
   return includeDirs;
+}
+
+inline void setJitIncludeDirs(std::vector<std::filesystem::path> const& dirs) {
+  static std::vector<std::filesystem::path>& includeDirs = getJitIncludeDirs();
+  includeDirs = dirs;
 }
 
 std::string generateKernel(uint32_t const shape_n, uint32_t const shape_k, uint32_t const block_m,
