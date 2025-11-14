@@ -2003,21 +2003,15 @@ def _heuristic_func_mm_fp4(
     """
     cuda_major, _ = get_cuda_version()
     # If cuda version is 13 or greater:
-    # cudnn is more performant if cudnn version is 9.14 or greater.
-    if CUDNN_AVAILABLE and cuda_major >= 13 and cudnn.backend_version() >= 91400:
+    # cudnn is more performant if cudnn version is 9.15 or greater.
+    if CUDNN_AVAILABLE and cuda_major >= 13 and cudnn.backend_version() >= 91500:
         candidate_backends = ("cudnn", "cutlass")
     # Otherwise, prioritize cutlass
     else:
         candidate_backends = ("cutlass", "cudnn")
 
-    # Filter to only supported backends for this compute capability
-    # Note: The requirement function already validated that at least one backend is supported
-    heuristic_backends = []
-    for candidate in candidate_backends:
-        # mypy requires explicit type casting for the backend literal
-        if candidate in suitable_backends:
-            heuristic_backends.append(candidate)
-    return heuristic_backends
+    # Filter and return only supported backends
+    return [c for c in candidate_backends if c in suitable_backends]
 
 
 @backend_requirement(
@@ -2027,7 +2021,7 @@ def _heuristic_func_mm_fp4(
         "cutlass": _cutlass_gemm_fp4_requirement,
     },
     common_check=_check_mm_fp4_problem_size,
-    heuristic_func=_heuristic_func_mm_fp4,
+    heuristic_func=_heuristic_func_mm_fp4,  # result stored in mm_fp4.suitable_auto_backends
 )
 def mm_fp4(
     a: torch.Tensor,
