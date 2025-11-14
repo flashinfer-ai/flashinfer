@@ -41,8 +41,8 @@ def run(
     """
 
     # Fixed DeepSeek-V3/R1 geometry
-    H = hidden_size # deepseek v3: 7168
-    I = intermediate_size # deepseek v3: 2048
+    H = hidden_size  # deepseek v3: 7168
+    I = intermediate_size  # deepseek v3: 2048
     E_local = gemm1_weights.shape[0]
 
     BLOCK = 128
@@ -53,9 +53,9 @@ def run(
     assert E_local == num_local_experts, "num_local_experts shape mismatch"
 
     # Routing constants
-    TOP_K = top_k # deepseek v3: 8
-    N_GROUP = n_group # deepseek v3: 8
-    TOPK_GROUP = topk_group # deepseek v3: 4
+    TOP_K = top_k  # deepseek v3: 8
+    N_GROUP = n_group  # deepseek v3: 8
+    TOPK_GROUP = topk_group  # deepseek v3: 4
 
     # Block counts
     num_hidden_blocks = H // BLOCK  # 56
@@ -420,7 +420,9 @@ def test_correctness_dpsk_fp8_fused_moe(
 ):
     compatible_intermediate_size = routing_config["compatible_intermediate_size"]
     if intermediate_size not in compatible_intermediate_size:
-        pytest.skip(f"Intermediate size {intermediate_size} is not compatible with routing config {routing_config}")
+        pytest.skip(
+            f"Intermediate size {intermediate_size} is not compatible with routing config {routing_config}"
+        )
 
     print("\n" + "=" * 70)
     print(
@@ -440,13 +442,18 @@ def test_correctness_dpsk_fp8_fused_moe(
     torch.manual_seed(42)
 
     # Constants (DeepSeek-V3)
-    E_GLOBAL = routing_config["num_experts"]# deepseek v3: 256
-    E_LOCAL = 32 # todo(yingyi): tp8 for now, update later
+    E_GLOBAL = routing_config["num_experts"]  # deepseek v3: 256
+    E_LOCAL = 32  # todo(yingyi): default to tp8 for now, update later
     H = 7168
-    I = intermediate_size # deepseek v3: 2048
-    TOP_K = routing_config["top_k"] # deepseek v3: 8
-    N_GROUP = routing_config["n_groups"] # deepseek v3: 8
-    TOPK_GROUP = routing_config["top_k_groups"] # deepseek v3: 4
+    I = intermediate_size  # deepseek v3: 2048
+    TOP_K = routing_config["top_k"]  # deepseek v3: 8
+    N_GROUP = routing_config["n_groups"]  # deepseek v3: 8
+    TOPK_GROUP = routing_config["top_k_groups"]  # deepseek v3: 4
+
+    if local_expert_offset + E_LOCAL > E_GLOBAL:
+        pytest.skip(
+            f"Local expert offset {local_expert_offset} + {E_LOCAL} is greater than number of experts {E_GLOBAL}"
+        )
 
     # Generate random but consistent inputs
     print("Generating random inputs")
