@@ -388,6 +388,7 @@ def single_decode_with_kv_cache(
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
     return_lse: Literal[True] = True,
+    sinks: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
 
@@ -407,6 +408,7 @@ def single_decode_with_kv_cache(
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
     return_lse: bool = False,
+    sinks: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Decode attention with KV Cache for single request, return attention output.
 
@@ -533,6 +535,7 @@ def single_decode_with_kv_cache(
             window_left,
             None,  # packed_custom_mask
             _get_cache_alibi_slopes_buf(num_qo_heads, q.device),
+            sinks,  # maybe_s_aux
             logits_soft_cap,
             sm_scale,
             None,  # scale_q, not supported yet

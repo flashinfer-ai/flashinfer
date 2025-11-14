@@ -257,7 +257,7 @@ def test_batch_decode_without_sink_attention(
 
 @pytest.mark.parametrize("batch_size", [2])
 @pytest.mark.parametrize("kv_len", [64])
-@pytest.mark.parametrize("num_qo_heads", [8])
+@pytest.mark.parametrize("num_qo_heads", [16])
 @pytest.mark.parametrize("num_kv_heads", [8])
 @pytest.mark.parametrize("head_dim", [64])
 def test_batch_decode_sink_attention_gqa(
@@ -319,6 +319,89 @@ def test_batch_decode_sink_attention_gqa(
     assert out.dtype == dtype
     assert not torch.isnan(out).any()
     assert not torch.isinf(out).any()
+
+
+@pytest.mark.parametrize("kv_len", [32, 128, 512])
+@pytest.mark.parametrize(
+    "num_qo_heads,num_kv_heads",
+    [
+        (8, 8),  # MHA: equal heads
+        (16, 8),  # GQA: 2:1 ratio
+        (32, 8),  # GQA: 4:1 ratio
+        (32, 32),  # MHA: equal heads
+    ],
+)
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
+def test_single_decode_sink_attention_tensor_cores(
+    kv_len, num_qo_heads, num_kv_heads, head_dim, kv_layout
+):
+    """Test sink attention with single decode using tensor cores (prefill template)."""
+    torch.manual_seed(42)
+    device = torch.device("cuda:0")
+    dtype = torch.bfloat16
+
+    sm_scale = 1.0 / math.sqrt(head_dim)
+    window_left = -1  # No sliding window
+
+    # Create query tensor
+    q = torch.randn(num_qo_heads, head_dim, dtype=dtype, device=device)
+
+    # Create KV cache based on layout
+    if kv_layout == "NHD":
+        k = torch.randn(kv_len, num_kv_heads, head_dim, dtype=dtype, device=device)
+        v = torch.randn(kv_len, num_kv_heads, head_dim, dtype=dtype, device=device)
+    else:  # HND
+        k = torch.randn(num_kv_heads, kv_len, head_dim, dtype=dtype, device=device)
+        v = torch.randn(num_kv_heads, kv_len, head_dim, dtype=dtype, device=device)
+
+    # Sink tensor should have num_qo_heads elements
+    # Sink values should be on similar scale to logits (QK^T * sm_scale)
+    sinks = torch.randn(num_qo_heads, device=device, dtype=torch.float32) * 0.5
+
+    # Test with tensor cores enabled (uses prefill template)
+    out = flashinfer.single_decode_with_kv_cache(
+        q,
+        k,
+        v,
+        kv_layout=kv_layout,
+        pos_encoding_mode="NONE",
+        use_tensor_cores=True,
+        sm_scale=sm_scale,
+        sinks=sinks,
+    )
+
+    # Basic sanity check: output should have correct shape
+    assert out.shape == (num_qo_heads, head_dim)
+    assert out.dtype == dtype
+    assert not torch.isnan(out).any()
+    assert not torch.isinf(out).any()
+
+    # Validate against reference implementation
+    # Convert to batch format for reference (add batch dimension)
+    q_batch = q.unsqueeze(0)  # [1, num_qo_heads, head_dim]
+
+    # Convert KV cache to reference format [batch_size, kv_len, num_kv_heads, head_dim]
+    if kv_layout == "NHD":
+        k_cache_ref = k.unsqueeze(0)  # [1, kv_len, num_kv_heads, head_dim]
+        v_cache_ref = v.unsqueeze(0)  # [1, kv_len, num_kv_heads, head_dim]
+    else:  # HND -> transpose to NHD
+        k_cache_ref = k.transpose(0, 1).unsqueeze(0)  # [1, kv_len, num_kv_heads, head_dim]
+        v_cache_ref = v.transpose(0, 1).unsqueeze(0)  # [1, kv_len, num_kv_heads, head_dim]
+
+    # Compute reference output
+    out_ref = sink_attention_decode_ref(
+        q_batch, k_cache_ref, v_cache_ref, sinks, window_left, sm_scale
+    )
+
+    # Remove batch dimension from reference output
+    out_ref = out_ref.squeeze(0)  # [num_qo_heads, head_dim]
+
+    # Compare results
+    # bfloat16 may have slightly larger numerical differences due to lower precision,
+    # differences in order of operations between reference and CUDA kernel, and
+    # GQA scenarios where multiple query heads share KV heads
+    torch.testing.assert_close(out, out_ref, rtol=1e-2, atol=3.5e-2)
 
 
 if __name__ == "__main__":
