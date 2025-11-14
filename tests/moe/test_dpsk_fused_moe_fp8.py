@@ -1,6 +1,5 @@
 import pytest
 import torch
-import numpy as np
 from flashinfer.fused_moe import trtllm_fp8_block_scale_moe, WeightLayout
 from flashinfer.autotuner import autotune
 
@@ -243,28 +242,36 @@ def _fp8_block_quant_2d(w_bf16: torch.Tensor, block: int = 128):
     max_fp8 = finfo.max
 
     w_f32 = w_bf16.to(torch.float32).contiguous()
-    w_fp8 = torch.empty_like(w_f32, dtype=torch.float8_e4m3fn)
-    scales = torch.empty(
-        (*prefix, nb_r, nb_c), dtype=torch.float32, device=w_bf16.device
+    prefix_ndim = len(prefix)
+
+    # Reshape weights into 128x128 blocks and move block dims to the tail:
+    # [..., nb_r, block, nb_c, block] -> [..., nb_r, nb_c, block, block]
+    reshaped = w_f32.reshape(*prefix, nb_r, block, nb_c, block)
+    permute_dims = tuple(range(prefix_ndim)) + (
+        prefix_ndim,
+        prefix_ndim + 2,
+        prefix_ndim + 1,
+        prefix_ndim + 3,
+    )
+    blocks = reshaped.permute(permute_dims).contiguous()
+
+    # Compute per-block scales
+    amax = torch.amax(torch.abs(blocks), dim=(-1, -2))
+    scales = torch.where(
+        amax > 0,
+        amax / max_fp8,
+        torch.ones_like(amax, dtype=torch.float32),
     )
 
-    it = np.ndindex(*prefix) if prefix else [()]
-    for idx in it:
-        sel = idx if isinstance(idx, tuple) else (idx,)
-        for i in range(nb_r):
-            rs = slice(i * block, (i + 1) * block)
-            for j in range(nb_c):
-                cs = slice(j * block, (j + 1) * block)
-                blk = w_f32[(*sel, rs, cs)]  # [128, 128]
-                amax = torch.amax(torch.abs(blk))
-                s = (
-                    (amax / max_fp8)
-                    if amax > 0
-                    else torch.tensor(1.0, device=w_bf16.device)
-                )
-                q = (blk / s).to(torch.float8_e4m3fn)
-                w_fp8[(*sel, rs, cs)] = q
-                scales[(*sel, i, j)] = s
+    # Quantize blocks in parallel
+    q_blocks = (blocks / scales.unsqueeze(-1).unsqueeze(-1)).to(torch.float8_e4m3fn)
+
+    # Restore original layout
+    inv_permute = [0] * (prefix_ndim + 4)
+    for i, d in enumerate(permute_dims):
+        inv_permute[d] = i
+    w_fp8 = q_blocks.permute(*inv_permute).reshape(*prefix, R, C)
+
     return w_fp8, scales
 
 
