@@ -17,6 +17,13 @@ def run(
     gemm2_weights_scale: torch.Tensor,
     local_expert_offset: int,
     routed_scaling_factor: float,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts_global: int,
+    num_local_experts: int,
+    top_k: int,
+    n_group: int,
+    topk_group: int,
 ):
     """
     • FP8 block-scale dequantization: float ≈ fp8 * scale
@@ -34,23 +41,21 @@ def run(
     """
 
     # Fixed DeepSeek-V3/R1 geometry
-    H = 7168
-    I = 2048
+    H = hidden_size # deepseek v3: 7168
+    I = intermediate_size # deepseek v3: 2048
     E_local = gemm1_weights.shape[0]
 
     BLOCK = 128
     E_global = routing_logits.shape[1]
     T = routing_logits.shape[0]
 
-    assert H == 7168, "hidden_size must be 7168"
-    assert I == 2048, "intermediate_size must be 2048"
-    assert E_global == 256, "num_experts must be 256"
-    assert E_local == 32, "num_local_experts must be 32"
+    assert E_global == num_experts_global, "num_experts_global shape mismatch"
+    assert E_local == num_local_experts, "num_local_experts shape mismatch"
 
     # Routing constants
-    TOP_K = 8
-    N_GROUP = 8
-    TOPK_GROUP = 4
+    TOP_K = top_k # deepseek v3: 8
+    N_GROUP = n_group # deepseek v3: 8
+    TOPK_GROUP = topk_group # deepseek v3: 4
 
     # Block counts
     num_hidden_blocks = H // BLOCK  # 56
@@ -356,19 +361,67 @@ TUNE_MAX_NUM_TOKENS = 4096
         (1024, 32, True),
     ],
 )
+@pytest.mark.parametrize("intermediate_size", [2048, 1024, 768, 512, 384])
+@pytest.mark.parametrize(
+    "routing_config",
+    [
+        pytest.param(
+            {
+                "num_experts": 384,
+                "top_k": 8,
+                "padding": 8,
+                "n_groups": 1,
+                "top_k_groups": 1,
+                "routed_scaling": 2.5,
+                "compatible_intermediate_size": [1024, 2048],
+                "enable_autotune": True,
+            },
+            id="kimi_k2",
+        ),
+        pytest.param(
+            {
+                "num_experts": 256,
+                "top_k": 8,
+                "padding": 8,
+                "n_groups": 8,
+                "top_k_groups": 4,
+                "routed_scaling": 2.5,
+                "compatible_intermediate_size": [512, 1024, 2048],
+                "enable_autotune": True,
+            },
+            id="DSv3",
+        ),
+        pytest.param(
+            {
+                "num_experts": 72,
+                "top_k": 6,
+                "padding": 8,
+                "n_groups": 1,
+                "top_k_groups": 1,
+                "routed_scaling": 2.5,
+                "compatible_intermediate_size": [384, 768],
+                "enable_autotune": False,
+            },
+            id="DSLite",
+        ),
+    ],
+)
 @pytest.mark.parametrize("enable_pdl", [True, False])
-@pytest.mark.parametrize("enable_autotune", [True, False])
 def test_correctness_dpsk_fp8_fused_moe(
     seq_len,
-    *,
     local_expert_offset,
     use_bias,
+    intermediate_size,
+    routing_config,
     enable_pdl,
-    enable_autotune,
     atol: float = 1e-1,
     rtol: float = 2e-1,
     percent: float = 0.85,
 ):
+    compatible_intermediate_size = routing_config["compatible_intermediate_size"]
+    if intermediate_size not in compatible_intermediate_size:
+        pytest.skip(f"Intermediate size {intermediate_size} is not compatible with routing config {routing_config}")
+
     print("\n" + "=" * 70)
     print(
         f"Testing MoE FP8 Block-Scale: seq_len={seq_len}, offset={local_expert_offset}, use_bias={use_bias}"
@@ -387,13 +440,13 @@ def test_correctness_dpsk_fp8_fused_moe(
     torch.manual_seed(42)
 
     # Constants (DeepSeek-V3)
-    E_GLOBAL = 256
-    E_LOCAL = 32
+    E_GLOBAL = routing_config["num_experts"]# deepseek v3: 256
+    E_LOCAL = 32 # todo(yingyi): tp8 for now, update later
     H = 7168
-    I = 2048
-    TOP_K = 8
-    N_GROUP = 8
-    TOPK_GROUP = 4
+    I = intermediate_size # deepseek v3: 2048
+    TOP_K = routing_config["top_k"] # deepseek v3: 8
+    N_GROUP = routing_config["n_groups"] # deepseek v3: 8
+    TOPK_GROUP = routing_config["top_k_groups"] # deepseek v3: 4
 
     # Generate random but consistent inputs
     print("Generating random inputs")
@@ -422,12 +475,19 @@ def test_correctness_dpsk_fp8_fused_moe(
         gemm2_weights_scale=inputs["gemm2_weights_scale"],
         local_expert_offset=inputs["local_expert_offset"],
         routed_scaling_factor=inputs["routed_scaling_factor"],
+        hidden_size=H,
+        intermediate_size=I,
+        num_experts_global=E_GLOBAL,
+        num_local_experts=E_LOCAL,
+        top_k=TOP_K,
+        n_group=N_GROUP,
+        topk_group=TOPK_GROUP,
     )
 
     # Run FlashInfer fused kernel
     print("Running FlashInfer fused kernel")
-    tile_tokens_dim = get_tile_tokens_dim(seq_len, TOP_K, E_GLOBAL)
-    with autotune(enable_autotune):
+    # tile_tokens_dim = get_tile_tokens_dim(seq_len, TOP_K, E_GLOBAL)
+    with autotune(routing_config["enable_autotune"]):
         fi_out = trtllm_fp8_block_scale_moe(
             inputs["routing_logits"].to(torch.float32),
             inputs["routing_bias"],  # bf16
@@ -445,10 +505,9 @@ def test_correctness_dpsk_fp8_fused_moe(
             inputs["local_expert_offset"],
             inputs["local_num_experts"],
             inputs["routed_scaling_factor"],
-            tile_tokens_dim=tile_tokens_dim,
             routing_method_type=2,  # DeepSeek-styled
             use_shuffled_weight=False,
-            weight_layout=WeightLayout.BlockMajorK.value,
+            weight_layout=WeightLayout.MajorK.value,
             enable_pdl=enable_pdl,
             tune_max_num_tokens=TUNE_MAX_NUM_TOKENS,
         )
@@ -509,6 +568,16 @@ if __name__ == "__main__":
         seq_len=1,
         local_expert_offset=0,
         use_bias=False,
+        intermediate_size=2048,
+        routing_config={
+            "num_experts": 256,
+            "top_k": 8,
+            "padding": 8,
+            "n_groups": 8,
+            "top_k_groups": 4,
+            "routed_scaling": 2.5,
+            "compatible_intermediate_size": [512, 1024, 2048],
+            "enable_autotune": True,
+        },
         enable_pdl=True,
-        enable_autotune=True,
     )
