@@ -25,7 +25,34 @@ if [[ "$1" == "--dry-run" ]] || [[ "${DRY_RUN}" == "true" ]]; then
 fi
 
 if [ "$DRY_RUN" != "true" ]; then
+    # Detect CUDA stream from CUDA_VERSION (e.g., 13.0.1 -> 13.0 -> cu130)
+    if [ -z "${CUDA_STREAM}" ]; then
+        CUDA_NUM=$(echo "${CUDA_VERSION}" | sed -E 's/^([0-9]+\.[0-9]+).*/\1/')
+        case "${CUDA_NUM}" in
+            12.8) CUDA_STREAM=cu128 ;;
+            12.9) CUDA_STREAM=cu129 ;;
+            13.0) CUDA_STREAM=cu130 ;;
+            *) CUDA_STREAM=cu129 ;;
+        esac
+    fi
+    echo "Using CUDA stream: ${CUDA_STREAM}"
+    echo ""
+
+    # Install precompiled kernels
+    echo "Installing flashinfer-cubin from PyPI/index..."
+    pip install -q flashinfer-cubin
+    echo "Installing flashinfer-jit-cache for ${CUDA_STREAM} from https://flashinfer.ai/whl/${CUDA_STREAM} ..."
+    pip install -q --extra-index-url "https://flashinfer.ai/whl/${CUDA_STREAM}" flashinfer-jit-cache
+    echo ""
+
+    # Install local python sources
     pip install -e . -v --no-deps
+    echo ""
+
+    # Verify installation
+    echo "Verifying installation..."
+    (cd /tmp && python -m flashinfer show-config)
+    echo ""
 fi
 
 EXIT_CODE=0
