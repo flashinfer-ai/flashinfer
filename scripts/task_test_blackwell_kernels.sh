@@ -25,24 +25,28 @@ if [[ "$1" == "--dry-run" ]] || [[ "${DRY_RUN}" == "true" ]]; then
 fi
 
 if [ "$DRY_RUN" != "true" ]; then
-    # Detect CUDA stream from CUDA_VERSION (e.g., 13.0.1 -> 13.0 -> cu130)
-    if [ -z "${CUDA_STREAM}" ]; then
-        CUDA_NUM=$(echo "${CUDA_VERSION}" | sed -E 's/^([0-9]+\.[0-9]+).*/\1/')
-        case "${CUDA_NUM}" in
-            12.8) CUDA_STREAM=cu128 ;;
-            12.9) CUDA_STREAM=cu129 ;;
-            13.0) CUDA_STREAM=cu130 ;;
-            *) CUDA_STREAM=cu129 ;;
-        esac
-    fi
-    echo "Using CUDA stream: ${CUDA_STREAM}"
+    echo "Using CUDA version: ${CUDA_VERSION}"
     echo ""
 
-    # Install precompiled kernels
-    echo "Installing flashinfer-cubin from PyPI/index..."
-    pip install -q flashinfer-cubin
-    echo "Installing flashinfer-jit-cache for ${CUDA_STREAM} from https://flashinfer.ai/whl/${CUDA_STREAM} ..."
-    pip install -q --extra-index-url "https://flashinfer.ai/whl/${CUDA_STREAM}" flashinfer-jit-cache
+    # Install precompiled kernels (require CI build artifacts)
+    : ${DIST_CUBIN_DIR:="../dist/${CUDA_VERSION}/cubin"}
+    : ${DIST_JIT_CACHE_DIR:="../dist/${CUDA_VERSION}/jit-cache"}
+
+    if [ -d "${DIST_CUBIN_DIR}" ] && ls "${DIST_CUBIN_DIR}"/*.whl >/dev/null 2>&1; then
+        echo "Installing flashinfer-cubin from ${DIST_CUBIN_DIR} ..."
+        pip install -q "${DIST_CUBIN_DIR}"/*.whl
+    else
+        echo "ERROR: flashinfer-cubin wheel not found in ${DIST_CUBIN_DIR}. Ensure the CI build stage produced the artifact." >&2
+        exit 1
+    fi
+
+    if [ -d "${DIST_JIT_CACHE_DIR}" ] && ls "${DIST_JIT_CACHE_DIR}"/*.whl >/dev/null 2>&1; then
+        echo "Installing flashinfer-jit-cache from ${DIST_JIT_CACHE_DIR} ..."
+        pip install -q "${DIST_JIT_CACHE_DIR}"/*.whl
+    else
+        echo "ERROR: flashinfer-jit-cache wheel not found in ${DIST_JIT_CACHE_DIR} for ${CUDA_VERSION}. Ensure the CI build stage produced the artifact." >&2
+        exit 1
+    fi
     echo ""
 
     # Install local python sources
