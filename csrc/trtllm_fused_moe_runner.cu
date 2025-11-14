@@ -517,16 +517,16 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
 
   auto const& config = mPassingConfigs[configIndex];
 
-  // mPermuteGemm1.run(args.hidden_states, hidden_states_scale_linear, args.gemm1_weights,
-  //                   args.gemm1_weights_scale, workspace.token_scales, args.output1_scales_scalar,
-  //                   args.output1_scales_gate_scalar, args.gemm1_bias, args.gemm1_alpha,
-  //                   args.gemm1_beta, args.gemm1_clamp_limit, workspace.gemm1_output,
-  //                   workspace.gemm1_output_scale, args.top_k, args.hidden_size,
-  //                   args.intermediate_size, args.local_num_experts, args.num_tokens,
-  //                   workspace.permuted_idx_to_token_idx, workspace.num_non_exiting_ctas,
-  //                   workspace.total_num_padded_tokens, workspace.cta_idx_xy_to_batch_idx,
-  //                   workspace.cta_idx_xy_to_mn_limit, workspace.bmm1_workspace,
-  //                   args.mUseRoutingScalesOnInput, device, stream, config.gemm1Config, enable_pdl);
+  mPermuteGemm1.run(args.hidden_states, hidden_states_scale_linear, args.gemm1_weights,
+                    args.gemm1_weights_scale, workspace.token_scales, args.output1_scales_scalar,
+                    args.output1_scales_gate_scalar, args.gemm1_bias, args.gemm1_alpha,
+                    args.gemm1_beta, args.gemm1_clamp_limit, workspace.gemm1_output,
+                    workspace.gemm1_output_scale, args.top_k, args.hidden_size,
+                    args.intermediate_size, args.local_num_experts, args.num_tokens,
+                    workspace.permuted_idx_to_token_idx, workspace.num_non_exiting_ctas,
+                    workspace.total_num_padded_tokens, workspace.cta_idx_xy_to_batch_idx,
+                    workspace.cta_idx_xy_to_mn_limit, workspace.bmm1_workspace,
+                    args.mUseRoutingScalesOnInput, device, stream, config.gemm1Config, enable_pdl);
 
   // We do not fuse activation with FC1 for DeepSeek FP8 due to the weights shuffling constraint.
   void* gemm2_input = workspace.gemm1_output;
@@ -540,13 +540,13 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
   }
 
   // Run gemm2
-  // mGemm2.run(gemm2_input, gemm2_input_scale, args.gemm2_weights, args.gemm2_weights_scale,
-  //            args.output2_scales_scalar, args.gemm2_bias, workspace.gemm2_output,
-  //            workspace.gemm2_output_scale, args.top_k, args.hidden_size, args.intermediate_size,
-  //            args.local_num_experts, args.num_tokens, workspace.num_non_exiting_ctas,
-  //            workspace.total_num_padded_tokens, workspace.cta_idx_xy_to_batch_idx,
-  //            workspace.cta_idx_xy_to_mn_limit, workspace.bmm2_workspace, device, stream,
-  //            config.gemm2Config, enable_pdl);
+  mGemm2.run(gemm2_input, gemm2_input_scale, args.gemm2_weights, args.gemm2_weights_scale,
+             args.output2_scales_scalar, args.gemm2_bias, workspace.gemm2_output,
+             workspace.gemm2_output_scale, args.top_k, args.hidden_size, args.intermediate_size,
+             args.local_num_experts, args.num_tokens, workspace.num_non_exiting_ctas,
+             workspace.total_num_padded_tokens, workspace.cta_idx_xy_to_batch_idx,
+             workspace.cta_idx_xy_to_mn_limit, workspace.bmm2_workspace, device, stream,
+             config.gemm2Config, enable_pdl);
 
   // Run finalize
   if (args.do_finalize) {
