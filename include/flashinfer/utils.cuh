@@ -204,10 +204,10 @@
 // convert interleave to compile-time constant
 #define DISPATCH_INTERLEAVE(interleave, INTERLEAVE, ...) \
   if (interleave) {                                      \
-    const bool INTERLEAVE = true;                        \
+    constexpr bool INTERLEAVE = true;                    \
     __VA_ARGS__                                          \
   } else {                                               \
-    const bool INTERLEAVE = false;                       \
+    constexpr bool INTERLEAVE = false;                   \
     __VA_ARGS__                                          \
   }
 
