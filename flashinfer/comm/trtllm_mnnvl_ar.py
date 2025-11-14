@@ -15,7 +15,7 @@ from flashinfer.comm.mapping import Mapping
 
 from ..jit import gen_trtllm_mnnvl_comm_module
 from ..utils import register_custom_op
-from .mnnvl import (McastGPUBuffer, CommBackend)
+from .mnnvl import McastGPUBuffer, CommBackend
 
 
 def mpi_barrier():
@@ -122,9 +122,10 @@ def get_trtllm_mnnvl_comm_module():
 
 
 def get_allreduce_mnnvl_workspace(
-    mapping: Mapping, dtype: torch.dtype,
+    mapping: Mapping,
+    dtype: torch.dtype,
+    comm_backend_for_handle_transfer: Optional[CommBackend] = None,
     buffer_size_in_bytes: Optional[int] = None,
-    comm: Optional[CommBackend] = None,
 ) -> Tuple[McastGPUBuffer, torch.Tensor, int]:
     """Get workspace buffers needed for multi-node NVLink all-reduce operation.
 
@@ -140,8 +141,8 @@ def get_allreduce_mnnvl_workspace(
     Args:
         mapping: Tensor parallel mapping configuration containing rank info
         dtype: Data type of the tensors being reduced
-        buffer_size_in_bytes: Optional buffer size. Practically, assign this to 3 * 2 * dtype.itemsize * hidden_dim * max_tokens
         comm: Optional communication backend for multi-node synchronization
+        buffer_size_in_bytes: Optional buffer size. Practically, assign this to 3 * 2 * dtype.itemsize * hidden_dim * max_tokens
 
     Returns:
         Tuple containing:
@@ -170,7 +171,7 @@ def get_allreduce_mnnvl_workspace(
         mapping.tp_rank,
         torch.device("cuda", mapping.local_rank),
         mapping.is_multi_node() or force_mn,
-        comm=comm,
+        comm_backend_for_handle_transfer=comm_backend_for_handle_transfer,
     )
 
     # Initialize the unicast buffer with -0.0
@@ -178,10 +179,10 @@ def get_allreduce_mnnvl_workspace(
 
     # CPU barrier since we assume this should not be called in cuda graph
     torch.cuda.synchronize()
-    if comm:
-        comm.barrier()
-    else:
+    if comm_backend_for_handle_transfer is None:
         mpi_barrier()
+    else:
+        comm_backend_for_handle_transfer.barrier()
 
     # This is a buffer to maintain the state of this allreduce Op
     # [Buffer_ptr, Clear_ptr, Buffer_size, num_tokens_prev, atomic access counter]
