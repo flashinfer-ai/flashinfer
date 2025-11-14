@@ -121,67 +121,13 @@ std::string getNvccCompiler() {
   return compiler;
 }
 
-std::vector<std::filesystem::path> getJitIncludeDirs() {
+inline void setJitIncludeDirs(std::vector<std::filesystem::path> const& dirs) {
+  static std::vector<std::filesystem::path>& includeDirs = getJitIncludeDirs();
+  includeDirs = dirs;
+}
+
+inline std::vector<std::filesystem::path>& getJitIncludeDirs() {
   static std::vector<std::filesystem::path> includeDirs;
-  if (includeDirs.empty()) {
-    // Command to execute - try pip first, fallback to uv pip
-    char const* cmd =
-        "pip show flashinfer-python 2>/dev/null || uv pip show flashinfer-python 2>/dev/null";
-
-    // Buffer to store the output
-    std::array<char, 128> buffer;
-    std::string result;
-
-// Open pipe to command
-#ifdef _MSC_VER
-    FILE* pipe = _popen(cmd, "r");
-#else
-    FILE* pipe = popen(cmd, "r");
-#endif
-
-    if (pipe) {
-      // Read the output
-      while (fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
-        result += buffer.data();
-      }
-
-// Close the pipe
-#ifdef _MSC_VER
-      _pclose(pipe);
-#else
-      pclose(pipe);
-#endif
-
-      // Parse the location using regex
-      // `pip show tensorrt_llm` will output something like:
-      // Location: /usr/local/lib/python3.12/dist-packages
-      // Editable project location: /code
-      std::regex locationRegex("(Location|Editable project location): (.+)");
-
-      // Find all matches
-      auto match_begin = std::sregex_iterator(result.begin(), result.end(), locationRegex);
-      auto match_end = std::sregex_iterator();
-
-      // Get the number of matches
-      auto match_count = std::distance(match_begin, match_end);
-
-      if (match_count > 0) {
-        // Get the last match
-        auto last_match_iter = match_begin;
-        std::advance(last_match_iter, match_count - 1);
-
-        // Get the path from the second capture group
-        std::string location = last_match_iter->str(2);
-        location.erase(location.find_last_not_of(" \n\r\t") + 1);
-
-        // Set the include directory based on the package location
-        includeDirs.push_back(std::filesystem::path(location) / "flashinfer" / "data" / "csrc" /
-                              "nv_internal" / "tensorrt_llm");
-      }
-    } else {
-      TLLM_LOG_WARNING("Failed to find FlashInfer installation, DeepGEMM will be disabled.");
-    }
-  }
   return includeDirs;
 }
 
@@ -290,6 +236,11 @@ class Compiler {
   }
 
   [[nodiscard]] bool isValid() const { return !includeDirs_.empty(); }
+
+  // Set include directories before the singleton is initialized
+  static void setIncludeDirs(std::vector<std::filesystem::path> const& dirs) {
+    setJitIncludeDirs(dirs);
+  }
 
   // Build function
   Runtime* build(uint32_t const shape_n, uint32_t const shape_k, uint32_t const block_m,
