@@ -5,7 +5,6 @@ from flashinfer.fused_moe import trtllm_fp8_block_scale_moe, WeightLayout
 from flashinfer.autotuner import autotune
 
 
-@torch.no_grad()
 def run(
     routing_logits: torch.Tensor,
     routing_bias: torch.Tensor,
@@ -269,20 +268,6 @@ def _fp8_block_quant_2d(w_bf16: torch.Tensor, block: int = 128):
     return w_fp8, scales
 
 
-def next_power_of_2(n: int):
-    return 1 << (n - 1).bit_length() if n > 0 else 1
-
-
-def get_tile_tokens_dim(num_tokens, top_k, num_experts):
-    # Guess tokens per expert assuming perfect expert distribution first.
-    num_tokens_per_expert = (num_tokens * top_k) // num_experts
-    # And pad the number to the next power of 2.
-    tile_tokens_dim = next_power_of_2(num_tokens_per_expert)
-    # Cap to 8-64 tokens per CTA tile as it's the range supported by the kernel.
-    tile_tokens_dim = min(max(tile_tokens_dim, 8), 64)
-    return tile_tokens_dim
-
-
 # -----------------------------
 # Random input generator for MoE DS-V3
 # -----------------------------
@@ -493,7 +478,6 @@ def test_correctness_dpsk_fp8_fused_moe(
 
     # Run FlashInfer fused kernel
     print("Running FlashInfer fused kernel")
-    # tile_tokens_dim = get_tile_tokens_dim(seq_len, TOP_K, E_GLOBAL)
     with autotune(routing_config["enable_autotune"]):
         fi_out = trtllm_fp8_block_scale_moe(
             inputs["routing_logits"].to(torch.float32),
