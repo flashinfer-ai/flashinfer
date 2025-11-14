@@ -25,15 +25,15 @@ def run(
     topk_group: int,
 ):
     """
-    • FP8 block-scale dequantization: float ≈ fp8 * scale
-    • DeepSeek-V3 no-aux routing:
+    - FP8 block-scale dequantization: float ≈ fp8 * scale
+    - DeepSeek-V3 no-aux routing:
         s = sigmoid(logits)
         s_with_bias = s + bias
         group by n_group=8; per group take top-2 sum → pick topk_group=4 groups
         on the kept groups, take global top_k=8 experts
         combine with weights derived from s (without bias), normalized and
         scaled by routed_scaling_factor
-    • Local computation:
+    - Local computation:
         only experts in [local_expert_offset, local_expert_offset + E_local) are
         computed on this rank (GEMM1 → SwiGLU → GEMM2), then per-token weighted
         accumulation.
@@ -409,19 +409,11 @@ def test_correctness_dpsk_fp8_fused_moe(
             f"Intermediate size {intermediate_size} is not compatible with routing config {routing_config}"
         )
 
-    print("\n" + "=" * 70)
-    print(
-        f"Testing MoE FP8 Block-Scale: seq_len={seq_len}, offset={local_expert_offset}, use_bias={use_bias}"
-    )
-    print("=" * 70)
-
     if not torch.cuda.is_available():
-        print("WARNING: CUDA not available, skipping test.")
-        return True
+        pytest.skip("CUDA not available")
 
     if trtllm_fp8_block_scale_moe is None:
-        print("WARNING: flashinfer fused_moe kernel not available.")
-        return False
+        pytest.skip("flashinfer fused_moe kernel not available")
 
     device = "cuda"
     torch.manual_seed(42)
@@ -441,7 +433,6 @@ def test_correctness_dpsk_fp8_fused_moe(
         )
 
     # Generate random but consistent inputs
-    print("Generating random inputs")
     inputs = generate_random_inputs_moe(
         seq_len,
         num_experts_global=E_GLOBAL,
@@ -450,12 +441,11 @@ def test_correctness_dpsk_fp8_fused_moe(
         intermediate_size=I,
         use_bias=use_bias,
         local_expert_offset=local_expert_offset,
-        routed_scaling_factor=2.5,
+        routed_scaling_factor=routing_config["routed_scaling"],
         device=device,
     )
 
     # Run reference (returns bf16)
-    print("Running reference")
     ref_out = run(
         routing_logits=inputs["routing_logits"],
         routing_bias=inputs["routing_bias"],
@@ -477,7 +467,6 @@ def test_correctness_dpsk_fp8_fused_moe(
     )
 
     # Run FlashInfer fused kernel
-    print("Running FlashInfer fused kernel")
     with autotune(routing_config["enable_autotune"]):
         fi_out = trtllm_fp8_block_scale_moe(
             inputs["routing_logits"].to(torch.float32),
