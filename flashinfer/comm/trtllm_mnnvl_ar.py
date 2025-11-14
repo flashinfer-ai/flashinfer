@@ -138,6 +138,7 @@ def get_allreduce_mnnvl_workspace(
     Args:
         mapping: Tensor parallel mapping configuration containing rank info
         dtype: Data type of the tensors being reduced
+        buffer_size_in_bytes: Optional buffer size. Practically, assign this to 3 * 2 * dtype.itemsize * hidden_dim * max_tokens
 
     Returns:
         Tuple containing:
@@ -225,6 +226,11 @@ def trtllm_mnnvl_all_reduce(
         [Optional] out: Output tensor to store the result (required if wait_for_results is True)
 
     """
+
+    if len(inp.shape) != 2:
+        raise ValueError(
+            f"The input tensor must be 2D, got {len(inp.shape)}D. The shape is {inp.shape}."
+        )
 
     if inp.shape[0] > buffer_M:
         raise ValueError(
