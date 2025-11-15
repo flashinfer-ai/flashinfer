@@ -23,6 +23,7 @@ workspace_size = 128 * 1024 * 1024
 )  # todo(Yingyi): verify larger q_len_per_request
 @pytest.mark.parametrize("dynamic_scale", [False])
 @pytest.mark.parametrize("enable_pdl", [True, False, None])
+@pytest.mark.parametrize("backend", ["trtllm-gen", "xqa"])
 def test_trtllm_batch_decode_mla(
     batch_size: int,
     scale: float,
@@ -31,10 +32,19 @@ def test_trtllm_batch_decode_mla(
     q_len_per_request: int,
     dynamic_scale: bool,
     enable_pdl: bool,
+    backend: str,
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
-    if compute_capability[0] != 10:
-        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+    if backend == "xqa":
+        if compute_capability[0] != 12:
+            pytest.skip("XQA MLA only supports SM120 GPUs")
+        if q_len_per_request != 1 or dtype != torch.float8_e4m3fn:
+            pytest.skip(
+                "XQA MLA only supports q_len_per_request == 1 and dtype == torch.float8_e4m3fn"
+            )
+    if backend == "trtllm-gen":
+        if compute_capability[0] != 10:
+            pytest.skip("TRTLLM-GEN MLA only supports SM100 and SM103 GPUs")
     if dynamic_scale and dtype != torch.float8_e4m3fn:
         pytest.skip("Dynamic scale is not supported for non-fp8 dtype")
 
@@ -72,7 +82,7 @@ def test_trtllm_batch_decode_mla(
     max_num_blocks_per_seq = blocks_per_seq.max().item()
 
     # Generate random but unique block IDs for all sequences
-    total_blocks_needed = sum(blocks_per_seq)
+    total_blocks_needed = int(blocks_per_seq.sum().item())
     all_block_ids = torch.randperm(
         total_blocks_needed, device=device
     )  # Random permutation
@@ -86,7 +96,7 @@ def test_trtllm_batch_decode_mla(
     # Populate block tables and track block assignments
     block_id = 0
     for i in range(batch_size):
-        num_blocks_needed = blocks_per_seq[i]
+        num_blocks_needed = int(blocks_per_seq[i].item())
         block_tables[i, :num_blocks_needed] = all_block_ids[
             block_id : block_id + num_blocks_needed
         ]
@@ -144,6 +154,7 @@ def test_trtllm_batch_decode_mla(
         bmm1_scale_log2_tensor=bmm1_log2_scale_tensor,
         bmm2_scale_tensor=bmm2_scale_tensor,
         enable_pdl=enable_pdl,
+        backend=backend,
     )
     # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
     # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
@@ -198,31 +209,52 @@ def test_trtllm_batch_decode_mla(
 
     o_ref = wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=False)
 
-    # check is nan
-    assert not torch.isnan(o_ref).any(), "o_ref is nan"
-    assert not torch.isnan(output).any(), "output is nan"
+    if backend == "trtllm-gen":
+        # check is nan
+        assert not torch.isnan(o_ref).any(), "o_ref is nan"
+        assert not torch.isnan(output).any(), "output is nan"
 
-    if dtype == torch.float8_e4m3fn:
-        try:
-            torch.testing.assert_close(
-                output,
-                o_ref.view(batch_size, q_len_per_request, num_q_heads, -1),
-                rtol=1e-1,
-                atol=1e-1,
-            )  # todo: do reference with normal attention?
-        except AssertionError as e:
-            print("output:", output)
-            print("o_ref:", o_ref)
-            raise e
-    else:
-        try:
-            torch.testing.assert_close(
-                output,
-                o_ref.view(batch_size, q_len_per_request, num_q_heads, -1),
-                rtol=1e-2,
-                atol=1e-2,
-            )
-        except AssertionError as e:
-            print("output:", output)
-            print("o_ref:", o_ref)
-            raise e
+        if dtype == torch.float8_e4m3fn:
+            try:
+                torch.testing.assert_close(
+                    output,
+                    o_ref.view(batch_size, q_len_per_request, num_q_heads, -1),
+                    rtol=1e-1,
+                    atol=1e-1,
+                )  # todo: do reference with normal attention?
+            except AssertionError as e:
+                print("output:", output)
+                print("o_ref:", o_ref)
+                raise e
+        else:
+            try:
+                torch.testing.assert_close(
+                    output,
+                    o_ref.view(batch_size, q_len_per_request, num_q_heads, -1),
+                    rtol=1e-2,
+                    atol=1e-2,
+                )
+            except AssertionError as e:
+                print("output:", output)
+                print("o_ref:", o_ref)
+                raise e
+    elif backend == "xqa":
+        atol = 0.05
+        rtol = 0.05
+
+        diff_abs = torch.abs(
+            o_ref.view(batch_size, q_len_per_request, num_q_heads, -1) - output
+        )
+        diff_rel = diff_abs / (
+            torch.abs(o_ref.view(batch_size, q_len_per_request, num_q_heads, -1)) + 1e-8
+        )
+
+        within_tolerance = (diff_abs <= atol) | (diff_rel <= rtol)
+
+        pass_ratio = within_tolerance.float().mean().item()
+
+        required_ratio = 0.95
+        assert pass_ratio >= required_ratio, (
+            f"Total {o_ref.numel()} elements, only {pass_ratio:.1%} meet tolerance criteria, "
+            f"require at least {required_ratio:.1%}"
+        )

@@ -28,6 +28,12 @@ export MAX_JOBS
 : ${CUDA_VISIBLE_DEVICES:=""}
 echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES}"
 
+# Clean Python bytecode cache to avoid stale imports (e.g., after module refactoring)
+echo "Cleaning Python bytecode cache..."
+find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+find . -type f -name '*.pyc' -delete 2>/dev/null || true
+echo "Cache cleaned."
+
 echo ""
 echo "Detecting CUDA architecture list..."
 export FLASHINFER_CUDA_ARCH_LIST=$(python3 -c '
@@ -37,7 +43,16 @@ arches = ["7.5", "8.0", "8.9", "9.0a"]
 if cuda_ver is not None:
     try:
         major, minor = map(int, cuda_ver.split(".")[:2])
-        if (major, minor) >= (12, 8):
+        if (major, minor) >= (13, 0):
+            arches.append("10.0a")
+            arches.append("10.3a")
+            arches.append("11.0f")
+            arches.append("12.0f")
+        elif (major, minor) >= (12, 9):
+            arches.append("10.0a")
+            arches.append("10.3a")
+            arches.append("12.0f")
+        elif (major, minor) >= (12, 8):
             arches.append("10.0a")
             arches.append("12.0a")
     except Exception:

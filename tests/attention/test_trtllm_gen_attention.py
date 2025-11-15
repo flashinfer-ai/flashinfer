@@ -102,8 +102,8 @@ def create_kv_cache(
 ):
     # Create separate K and V caches
     max_seq_len = torch.max(seq_lens).item()
-    num_tokens = max_seq_len * batch_size
-    num_pages = (num_tokens + page_size - 1) // page_size
+    num_pages_per_seq = (max_seq_len + page_size - 1) // page_size
+    num_pages = num_pages_per_seq * batch_size
     ref_kv_dtype_torch = DTYPE_MAP[ref_kv_dtype]
     if kv_dtype != "fp8":  # for fp8, create with high precision to generate scale.
         assert kv_dtype == ref_kv_dtype, (
@@ -665,6 +665,9 @@ def _test_trtllm_batch_decode(
         # todo(Yingyi): add support for nvfp4 with speculative decoding
         pytest.skip("nvfp4 is not supported for q_len_per_req > 1")
 
+    if backend == "trtllm-gen" and o_dtype == "fp8" and q_dtype != "fp8":
+        pytest.skip("trtllm-gen backend only supports fp8 output for fp8 query")
+
     # Set up test parameters
     torch.manual_seed(0)
 
@@ -797,6 +800,7 @@ def _test_trtllm_batch_decode(
         enable_pdl=enable_pdl,
         backend=backend,
         q_len_per_req=q_len_per_req,
+        o_scale=o_scale,
     )
     if backend == "trtllm-gen":
         # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
@@ -926,6 +930,8 @@ def _test_trtllm_batch_decode(
         ("fp16", "fp16", "fp16"),
         ("bf16", "fp8", "bf16"),
         ("fp16", "fp8", "fp16"),
+        ("bf16", "fp8", "fp8"),
+        ("fp16", "fp8", "fp8"),
         ("fp8", "fp8", "bf16"),
         ("fp8", "fp8", "fp16"),
         ("fp8", "fp8", "fp8"),

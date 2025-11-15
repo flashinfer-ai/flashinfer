@@ -610,7 +610,7 @@ __launch_bounds__(128 * 3)
         float const qScale,
         OutputHead* __restrict__ const output,  // [nbReq][beamWidth][nbQHeads]
 #if LOW_PREC_OUTPUT
-        float const* const rcpOutScale,
+        float rcpOutScale,
 #endif
 #if USE_INPUT_KV
         IOHead const* __restrict__ const qkv,  // [nbReq][beamWidth][nbQHeads+nbKHeads+nbVHeads],
@@ -626,8 +626,7 @@ __launch_bounds__(128 * 3)
         BeamSearchParams const beamSearchParams,
 #endif
         uint32_t const batchSize,
-        float const* __restrict__ const kvCacheScale,  // Device memory scalar. Same scale for K and
-                                                       // V cache. Used only for int8/fp8 KV cache.
+        float kvCacheScale,  // Same scale for K and V cache. Used only for int8/fp8 KV cache.
         __grid_constant__ CUtensorMap const tensorMapVLLMK,
         __grid_constant__ CUtensorMap const tensorMapVLLMV,
 #if SPEC_DEC
@@ -773,7 +772,7 @@ __launch_bounds__(128 * 3)
     }
 
     float const qkScale =
-        qScale * (isKVCacheQuantized ? kvCacheScale[0] : 1.f) *
+        qScale * (isKVCacheQuantized ? kvCacheScale : 1.f) *
         rsqrtf(validElemsPerHead);  // qkScale is applied onto Q*K.T before softmax.
     uint32_t const warpRank = warpIdx.x;
 
@@ -958,11 +957,11 @@ __launch_bounds__(128 * 3)
 
     constexpr float xScale = 1.f / kE4M3_MAX;
 #if LOW_PREC_OUTPUT
-    float const oScale = rcpOutScale[0];
+    float const oScale = rcpOutScale;
 #else
     constexpr float oScale = 1.F;
 #endif
-    float const xvoScale = xScale * (isKVCacheQuantized ? kvCacheScale[0] : 1.f) * oScale;
+    float const xvoScale = xScale * (isKVCacheQuantized ? kvCacheScale : 1.f) * oScale;
 
     Gemm1Acc acc{};  // init to zeros to avoid runtime checking for first gmma instruction.
     gmma::fence();
@@ -1316,7 +1315,7 @@ __launch_bounds__(128 * 3)
               headGrpSize * nbKHeads + idxHeadGrp + (headGrpSize + 2) * nbKHeads * idxReq;
           IOHead const& inKHead = qkv[inputKHeadOffset];
           uint32_t const lane = laneId();
-          float const rcpKScale = 1.F / kvCacheScale[0];
+          float const rcpKScale = 1.F / kvCacheScale;
 #if ROPE_STYLE == 0
           constexpr bool isNeox = false;
           auto const pairs =
@@ -1375,7 +1374,7 @@ __launch_bounds__(128 * 3)
               (headGrpSize + 1) * nbKHeads + idxHeadGrp + (headGrpSize + 2) * nbKHeads * idxReq;
           IOHead const& inVHead = qkv[inputVHeadOffset];
           uint32_t const lane = laneId();
-          float const rcpVScale = 1.F / kvCacheScale[0];
+          float const rcpVScale = 1.F / kvCacheScale;
           constexpr bool isNeox = false;
           auto const pairs =
               loadHead<InputElem, isNeox, warp_size, float>(inVHead, lane) * rcpVScale;
@@ -2911,7 +2910,7 @@ void launchHopperF8MHA(
 #endif
     float qScale, OutputHead* output,
 #if LOW_PREC_OUTPUT
-    float const* rcpOutScale,
+    float rcpOutScale,
 #endif
 #if USE_INPUT_KV
     InputHead const* qkv,
@@ -2931,8 +2930,7 @@ void launchHopperF8MHA(
     BeamSearchParams const& beamSearchParams,
 #endif
     uint32_t batchSize,
-    float const* __restrict__ kvCacheScale,  // Device memory scalar. Same scale for K and V cache.
-                                             // Used only for int8/fp8 KV cache.
+    float kvCacheScale,  // Same scale for K and V cache. Used only for int8/fp8 KV cache.
 #if SPEC_DEC
     SpecDecParams const& specDecParams,
 #endif
@@ -3039,13 +3037,12 @@ static uint32_t const hostSmemSize = configureKernel();
 void launchHopperF8MHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads,
                                  uint32_t slidingWinSize, float qScale, OutputHead* output,
 #if LOW_PREC_OUTPUT
-                                 float const* rcpOutScale,
+                                 float rcpOutScale,
 #endif
                                  InputHead const* q, float const* attentionSinks,
                                  GMemCacheHead* kCacheVLLM, GMemCacheHead* vCacheVLLM,
                                  KVCachePageIndex const* kvCachePageList, uint32_t maxSeqLen,
-                                 uint32_t const* seqLen, uint32_t batchSize,
-                                 float const* __restrict__ kvCacheScale,
+                                 uint32_t const* seqLen, uint32_t batchSize, float kvCacheScale,
 #if SPEC_DEC
                                  uint32_t qSeqLen, uint32_t const* qCuSeqLens, MaskType const* mask,
 #endif

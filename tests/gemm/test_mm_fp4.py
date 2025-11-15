@@ -9,7 +9,7 @@ from flashinfer import (
     mxfp4_quantize,
 )
 from flashinfer.utils import get_compute_capability, LibraryError
-from flashinfer.gemm import CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR
+from flashinfer.gemm.gemm_base import CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR
 
 
 # TODO: Consdier splitting this function up for the various backends

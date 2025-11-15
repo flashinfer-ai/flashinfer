@@ -3,21 +3,21 @@
 # Analysis period: 180 days
 # Minimum commits threshold: 1
 
-benchmarks/ @bkryu @cyx-6 @nv-yunzheq @kahyunnam @jiahanc
+benchmarks/ @bkryu @cyx-6 @yzh119 @jiahanc @nv-yunzheq
 benchmarks/routines/ @bkryu @nv-yunzheq @cyx-6 @nvmbreughe @Anerudhan
 ci/ @cyx-6 @yzh119 @nvmbreughe
 ci/scripts/ @cyx-6
 ci/scripts/jenkins/ @cyx-6
-csrc/ @wenscarl @yzh119 @cyx-6 @djmmoss @yongwww
-csrc/fused_moe/ @yzh119 @yongwww @djmmoss @wenscarl @cyx-6
-csrc/fused_moe/cutlass_backend/ @yzh119 @yongwww @djmmoss @wenscarl @cyx-6
-csrc/nv_internal/ @wenscarl @djmmoss @yzh119 @cyx-6 @yongwww
-csrc/nv_internal/cpp/ @wenscarl @yongwww @djmmoss @joker-eph @ttyio
-csrc/nv_internal/include/ @wenscarl
-csrc/nv_internal/tensorrt_llm/ @wenscarl @djmmoss @yzh119 @cyx-6 @yongwww
-csrc/xqa/ @yzh119 @cyx-6
+csrc/ @wenscarl @yzh119 @cyx-6 @djmmoss @nv-yunzheq
+csrc/fused_moe/ @nv-yunzheq @yzh119 @yongwww @djmmoss @cyx-6
+csrc/fused_moe/cutlass_backend/ @nv-yunzheq @yzh119 @yongwww @djmmoss @cyx-6
+csrc/nv_internal/ @wenscarl @djmmoss @nv-yunzheq @yongwww @cyx-6
+csrc/nv_internal/cpp/ @wenscarl @bkryu @yongwww @djmmoss @joker-eph
+csrc/nv_internal/include/ @wenscarl @nv-yunzheq
+csrc/nv_internal/tensorrt_llm/ @wenscarl @djmmoss @nv-yunzheq @yongwww @cyx-6
+csrc/xqa/ @cyx-6 @yzh119
 docs/ @yzh119 @cyx-6 @wenscarl @nv-yunzheq @aleozlx
-flashinfer/ @yzh119 @cyx-6 @wenscarl @nvmbreughe @bkryu
+flashinfer/ @yzh119 @cyx-6 @nvmbreughe @wenscarl @jiahanc
 flashinfer-cubin/ @yzh119 @cyx-6
 flashinfer-cubin/flashinfer_cubin/ @yzh119
 flashinfer-jit-cache/ @yzh119 @cyx-6
@@ -25,19 +25,21 @@ flashinfer-jit-cache/flashinfer_jit_cache/ @yzh119
 flashinfer/comm/ @yzh119 @cyx-6 @nvmbreughe @wenscarl @djmmoss
 flashinfer/cudnn/ @Anerudhan @yzh119 @cyx-6 @Anerudhan
 flashinfer/cute_dsl/ @yzh119 @kaixih @Amir-19 @aleozlx
-flashinfer/fused_moe/ @djmmoss @yzh119 @cyx-6 @wenscarl @IwakuraRein
-flashinfer/jit/ @yzh119 @cyx-6 @djmmoss @aleozlx @yongwww
-flashinfer/jit/attention/ @yzh119 @Anerudhan @joker-eph
-flashinfer/jit/gemm/ @yzh119
+flashinfer/dsv3_ops/ @nvmbreughe
+flashinfer/fused_moe/ @djmmoss @yzh119 @cyx-6 @jiahanc @wenscarl
+flashinfer/gemm/ @nvmbreughe
+flashinfer/jit/ @yzh119 @cyx-6 @jiahanc @nvmbreughe @nv-yunzheq
+flashinfer/jit/attention/ @yzh119 @cyx-6 @Anerudhan @joker-eph
+flashinfer/jit/gemm/ @yzh119 @nv-yunzheq @jiahanc
 flashinfer/logits_processor/ @cyx-6 @yzh119
 flashinfer/profiler/ @cyx-6
-flashinfer/triton/ @cyx-6 @nvmbreughe @yzh119
+flashinfer/triton/ @nvmbreughe @cyx-6
 flashinfer/tuning_configs/ @kaixih
-include/ @yzh119 @cyx-6 @wenscarl @kahyunnam @joker-eph
-include/flashinfer/ @yzh119 @cyx-6 @wenscarl @kahyunnam @joker-eph
+include/ @yzh119 @jiahanc @nvmbreughe @bkryu @wenscarl
+include/flashinfer/ @yzh119 @jiahanc @nvmbreughe @bkryu @wenscarl
 include/flashinfer/attention/ @yzh119 @kahyunnam @joker-eph
 include/flashinfer/comm/ @yongwww @nvmbreughe @djmmoss @yzh119 @cyx-6
-include/flashinfer/gemm/ @ttyio @yongwww @aleozlx @cyx-6
-include/flashinfer/trtllm/ @joker-eph @aleozlx @yzh119 @cyx-6 @wenscarl
+include/flashinfer/gemm/ @ttyio @yongwww @nvmbreughe @aleozlx
+include/flashinfer/trtllm/ @jiahanc @joker-eph @aleozlx @yzh119 @cyx-6
 profiler/ @cyx-6
 scripts/ @yzh119 @nvmbreughe @dierksen @yongwww @bkryu

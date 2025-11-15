@@ -167,7 +167,7 @@ with contextlib.suppress(ImportError):
 # ============================================================================
 with contextlib.suppress(ImportError):
     from .pod import PODWithPagedKVCacheWrapper as PODWithPagedKVCacheWrapper
-
+    from .pod import BatchPODWithPagedKVCacheWrapper as BatchPODWithPagedKVCacheWrapper
 
 # ============================================================================
 # Prefill operations

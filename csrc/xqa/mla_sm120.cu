@@ -395,8 +395,7 @@ struct KernelArgs {
   OutputHead* __restrict__ const& output;  // [totalNbIntputTokens][nbQHeads]
   KVCacheList<usePagedKVCache> const& cacheList;
   uint32_t const& batchSize;
-  float const* __restrict__ const& kvCacheScale;  // Device memory scalar. Same scale for K and V
-                                                  // cache. Used only for int8/fp8 KV cache.
+  float kvCacheScale;  // Same scale for K and V cache. Used only for int8/fp8 KV cache.
   Vec<CgaXBuffer, nbProducerCtasPerCga>* __restrict__ const&
       cgaXBuf;                                        // [totalNbInputTokens][maxNbSubSeq]
   uint32_t* __restrict__ const& semaphores;           // [totalNbInputTokens]
@@ -449,7 +448,7 @@ struct Producer {
     __syncthreads();
 #endif
     if (threadIdx.x == 0) {
-      smem.qkScaleLog2e = args.qScale * args.kvCacheScale[0] * log2e;
+      smem.qkScaleLog2e = args.qScale * args.kvCacheScale * log2e;
     }
 
     if (threadIdx.x < headGrpSize) {
@@ -1228,7 +1227,7 @@ __device__ inline void Consumer::compute() {
 
   ThrdRegRowMax const accRowSum =
       loadShmRowMax<warpTile.y>(smem.accRowSum[tileIdx.x], tileBase.y, lane);
-  float const xvScale = computeRowSumFromF8 ? args.kvCacheScale[0] : args.kvCacheScale[0] * xScale;
+  float const xvScale = computeRowSumFromF8 ? args.kvCacheScale : args.kvCacheScale * xScale;
   WarpOutputTile const output = finalize(acc, accRowSum, xvScale, lane);
 
   bool const isMultiBlockMode = (nbSubSeq != 1);
@@ -1553,8 +1552,7 @@ __launch_bounds__(32 * 4 * 3, 1) __cluster_dims__(cgaSize, 1, 1) void kernel_mha
     float const qScale,
     OutputHead* __restrict__ const output,  // [totalNbIntputTokens][nbQHeads]
     KVCacheList<usePagedKVCache> const cacheList, uint32_t const batchSize,
-    float const* __restrict__ const kvCacheScale,  // Device memory scalar. Same scale for K and V
-                                                   // cache. Used only for int8/fp8 KV cache.
+    float kvCacheScale,  // Same scale for K and V cache. Used only for int8/fp8 KV cache.
     Vec<CgaXBuffer,
         nbProducerCtasPerCga>* __restrict__ const cgaXBuf,  // [totalNbInputTokens][maxNbSubSeq]
     uint32_t* __restrict__ const semaphores = nullptr,      // [totalNbInputTokens]
@@ -1657,8 +1655,7 @@ void launchMLA(
     KVCachePageIndex const* kvCachePageList,  // device pointer. shape:
                                               // [batchSize][maxNbPagesPerSeq] (Layout 1)
     uint32_t maxSeqLen, uint32_t const* seqLen, uint32_t batchSize,
-    float const* __restrict__ kvCacheScale,  // Device memory scalar. Same scale for K and V cache.
-                                             // Used only for int8/fp8 KV cache.
+    float kvCacheScale,  // Same scale for K and V cache. Used only for int8/fp8 KV cache.
     uint32_t* semaphores, void* scratch, bool enable_pdl, uint64_t kv_stride_page,
     uint64_t kv_stride_token, uint64_t kv_stride_head, cudaStream_t stream) {
 #if IS_MLA
@@ -1779,8 +1776,7 @@ void launchMLAFlashInfer(
     KVCachePageIndex const* kvCachePageList,  // device pointer. shape:
                                               // [batchSize][maxNbPagesPerSeq] (Layout 1)
     uint32_t maxSeqLen, uint32_t const* seqLen, uint32_t batchSize,
-    float const* __restrict__ kvCacheScale,  // Device memory scalar. Same scale for K and V cache.
-                                             // Used only for int8/fp8 KV cache.
+    float kvCacheScale,  // Same scale for K and V cache. Used only for int8/fp8 KV cache.
     uint32_t* semaphores, void* scratch, bool enable_pdl, uint64_t kv_stride_page,
     uint64_t kv_stride_token, uint64_t kv_stride_head, cudaStream_t stream) {
 #if IS_MLA
@@ -1794,17 +1790,17 @@ void launchMLAFlashInfer(
   uint32_t const nbVHeads = nbKHeads;
   uint32_t const nbQHeads = nbKHeads * headGrpSize;
   uint32_t const nbQKVHeads = nbQHeads + nbKHeads + nbVHeads;
-  uint32_t const nbSubSeqPerSeq = [&]() -> uint32_t {
+  /*uint32_t const nbSubSeqPerSeq = [&]() -> uint32_t {
     float const factor = 4.f;
     return mha::min<uint32_t>(
         mha::max<uint32_t>(
             1U, (uint32_t)round(multiProcessorCount / 4 / (batchSize * nbKHeads) * factor)),
         divUp(maxSeqLen, tokensPerTile * 2));
-  }();
+  }();*/ // MLA disables multi-block mode for now
   // printf("nbSubSeqPerSeq = %u\n", nbSubSeqPerSeq);
   // gridDim.z == nbKHeads * batchSize && gridDim.y == nbSubSeqPerSeq && gridDim.x ==
   // nbInputSeqSplit
-  dim3 const dimGrid{4 * inputSeqLen, nbSubSeqPerSeq, nbKHeads * batchSize};
+  dim3 const dimGrid{4 * inputSeqLen, 1, nbKHeads * batchSize};
   dim3 const dimCta{warp_size * 4 * 3, 1, 1};
   auto const launchCfg = makeLaunchConfig(dimGrid, dimCta, hostSmemSize, stream, enable_pdl);
   uint32_t const maxNbPagesPerSeq = exactDiv(maxSeqLen, tokensPerPage);
