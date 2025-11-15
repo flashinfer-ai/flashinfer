@@ -54,6 +54,7 @@ from ..jit.gemm import gen_gemm_sm100_module_cutlass_fp8
 from ..jit.gemm import gen_trtllm_gen_gemm_module
 from ..jit.gemm import gen_tgv_gemm_sm10x_module
 from ..jit.gemm import gen_deepgemm_sm100_module
+from ..jit.gemm import gen_fp8_blockscale_gemm_sm90_module
 
 
 CUDNN_AVAILABLE = False
@@ -3109,5 +3110,264 @@ def batch_deepgemm_fp8_nt_groupwise(
     m_grouped_fp8_gemm_nt_masked(
         (a, a_scale), (b, b_scale), out, masked_m, expected_m, scale_granularity_mnk
     )
+
+    return out
+
+@functools.cache
+def get_fp8_blockscale_gemm_runner():
+    """Get the FP8 block scale GEMM runner module for SM90."""
+    module = gen_fp8_blockscale_gemm_sm90_module().build_and_load()
+    return module.init()
+
+
+def fp8_blockscale_gemm_swapab(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    weight_scale: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    """
+    Perform FP8 block-scaled GEMM with automatic swapAB optimization.
+    This function automatically selects between normal and swapAB kernel based on
+    the M dimension. For small M (< 32), it uses the swapAB kernel for
+    better performance.
+    The computation is: output = input @ weight.T with per-block FP8 quantization
+    and scaling.
+    
+    Supported Dtype Combinations
+    -----------------------------
+    - **BF16 + BF16 → BF16**: Both inputs BF16, internal quantization (no scales needed)
+    - **BF16 + FP8 → BF16**: BF16 input, FP8 weight
+    
+    Note: 
+    - FP16 is NOT supported. 
+    - FP8 + BF16 is NOT supported (missing kernel implementation)
+    
+    Parameters
+    ----------
+    input : torch.Tensor
+        Input activation tensor of shape (M, K).
+        - BF16 (torch.bfloat16) with internal quantization 
+    weight : torch.Tensor
+        Weight tensor of shape (N, K). Can be:
+        - FP8 (torch.float8_e4m3fn) with weight_scale required 
+        - BF16 (torch.bfloat16) for internal quantization 
+    input_scale : torch.Tensor, optional
+        Not used. Input is always BF16 with internal quantization.
+    weight_scale : torch.Tensor, optional
+        Scaling factors for weight. Required if weight is FP8.
+        Supports TWO granularities:
+        - Per-token (1x128 blocks): shape (N, K // 128)
+        - Per-block (128x128 blocks): shape (N // 128, K // 128)
+    out : torch.Tensor, optional
+        Output tensor of shape (M, N). If None, will be allocated.
+    out_dtype : torch.dtype, optional
+        Output data type. Default is torch.bfloat16.
+    Returns
+    -------
+    torch.Tensor
+        Output tensor of shape (M, N) with dtype `out_dtype`.
+    Examples
+    --------
+    >>> import torch
+    >>> from flashinfer.gemm import fp8_blockscale_gemm_swapab
+    >>>
+    >>> M, N, K = 16, 4096, 4096  
+    >>> device = "cuda"
+    >>>
+    >>> # BF16 inputs 
+    >>> input_bf16 = torch.randn(M, K, device=device, dtype=torch.bfloat16)
+    >>> weight_bf16 = torch.randn(N, K, device=device, dtype=torch.bfloat16)
+    >>> output = fp8_blockscale_gemm_swapab(input_bf16, weight_bf16)
+    >>> print(output.shape)  # torch.Size([16, 4096])
+    >>>
+    >>> # Mixed: BF16 input + FP8 weight 
+    >>> from flashinfer.testing.utils import per_token_cast_to_fp8
+    >>> input_bf16 = torch.randn(M, K, device=device, dtype=torch.bfloat16)
+    >>> weight_bf16 = torch.randn(N, K, device=device, dtype=torch.bfloat16)
+    >>> weight_fp8, weight_scale = per_token_cast_to_fp8(weight_bf16)
+    >>> output = fp8_blockscale_gemm_swapab(input_bf16, weight_fp8, None, weight_scale)
+    >>> print(output.shape)  # torch.Size([16, 4096])
+    >>>
+    >>> # FP8 weight with 128x128 block scales 
+    >>> from flashinfer.testing.utils import per_block_cast_to_fp8
+    >>> weight_bf16 = torch.randn(N, K, device=device, dtype=torch.bfloat16)
+    >>> weight_fp8, weight_scale = per_block_cast_to_fp8(weight_bf16)
+    >>> # weight_scale has shape (N // 128, K // 128)
+    >>> input_bf16 = torch.randn(M, K, device=device, dtype=torch.bfloat16)
+    >>> output = fp8_blockscale_gemm_swapab(input_bf16, weight_fp8, None, weight_scale)
+    >>> print(output.shape)  # torch.Size([16, 4096])
+    Notes
+    -----
+    - This function requires NVIDIA Hopper (SM90) architecture and CUDA 12.8+
+    - SwapAB kernel is automatically used when M < 32 (threshold)
+    - For FP8 inputs, scaling factors must be provided
+    - For BF16 inputs, quantization and scaling happen internally
+    - Weight scales support two granularities:
+      * Per-token (1x128 blocks): (N, K//128) 
+      * Per-block (128x128 blocks): (N//128, K//128) 
+    - Input scales only support per-token format: (M, K//128)
+    - The function uses DeepGEMM backend with JIT compilation
+    """
+    # Validate architecture support
+    if not _match_sm_version(input.device, ["90", "90a"]):
+        raise ValueError(
+            "fp8_blockscale_gemm_swapab is only supported on SM90 (Hopper) architecture."
+        )
+
+    # Validate tensor dimensions
+    if input.ndim != 2:
+        raise ValueError(f"Input must be 2D (M, K), got shape {input.shape}")
+    if weight.ndim != 2:
+        raise ValueError(f"Weight must be 2D (N, K), got shape {weight.shape}")
+    
+    # Get dimensions
+    M, K = input.shape
+    N, K_weight = weight.shape
+    
+    if K != K_weight:
+        raise ValueError(
+            f"K dimension mismatch: input has K={K}, weight has K={K_weight}"
+        )
+    
+    # Validate K is divisible by block size (128)
+    BLOCK_SIZE = 128
+    if K % BLOCK_SIZE != 0:
+        raise ValueError(
+            f"K dimension must be divisible by block size ({BLOCK_SIZE}), got K={K}"
+        )
+    
+    # Validate device consistency
+    if input.device != weight.device:
+        raise ValueError(
+            f"Input and weight must be on the same device. "
+            f"Got input: {input.device}, weight: {weight.device}"
+        )
+    
+    # Validate dtype combinations
+    input_is_fp8 = input.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]
+    weight_is_fp8 = weight.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]
+    input_is_bf16 = input.dtype == torch.bfloat16
+    weight_is_bf16 = weight.dtype == torch.bfloat16
+    
+    # Explicitly reject FP8 input + BF16 weight (missing kernel implementation)
+    if input_is_fp8 and weight_is_bf16:
+        raise ValueError(
+            "FP8 input + BF16 weight is not supported (missing kernel implementation). "
+        )
+    
+    # Validate scale requirements for FP8 inputs
+    if input_is_fp8:
+        if input_scale is None:
+            raise ValueError(
+                "input_scale is required when input is FP8. "
+                "For BF16 inputs, omit input_scale for internal quantization."
+            )
+        # Validate scale shape: (M, K // BLOCK_SIZE)
+        expected_scale_shape = (M, K // BLOCK_SIZE)
+        if input_scale.shape != expected_scale_shape:
+            raise ValueError(
+                f"input_scale shape mismatch. Expected {expected_scale_shape}, "
+                f"got {input_scale.shape}"
+            )
+        if input_scale.dtype != torch.float32:
+            raise ValueError(
+                f"input_scale must be float32, got {input_scale.dtype}"
+            )
+        if input_scale.device != input.device:
+            raise ValueError(
+                f"input_scale device mismatch. Expected {input.device}, "
+                f"got {input_scale.device}"
+            )
+    else:
+        if not input_is_bf16:
+            raise ValueError(
+                f"Input must be either FP8 (torch.float8_e4m3fn) or BF16 (torch.bfloat16), "
+                f"got {input.dtype}"
+            )
+        if input_scale is not None:
+            raise ValueError(
+                "input_scale should not be provided for BF16 inputs. "
+                "Use FP8 inputs if you want to provide external scales."
+            )
+    
+    if weight_is_fp8:
+        if weight_scale is None:
+            raise ValueError(
+                "weight_scale is required when weight is FP8. "
+                "For BF16 weights, omit weight_scale for internal quantization."
+            )
+        # Validate scale shape: supports (N, K // BLOCK_SIZE) or (N // BLOCK_SIZE, K // BLOCK_SIZE)
+        expected_per_token_shape = (N, K // BLOCK_SIZE)
+        expected_per_block_shape = ((N + BLOCK_SIZE - 1) // BLOCK_SIZE, K // BLOCK_SIZE)
+        is_per_token = weight_scale.shape == expected_per_token_shape
+        is_per_block = weight_scale.shape == expected_per_block_shape
+        
+        if not (is_per_token or is_per_block):
+            raise ValueError(
+                f"weight_scale shape mismatch. Expected either {expected_per_token_shape} "
+                f"(per-token, 1x128 blocks) or {expected_per_block_shape} "
+                f"(per-block, 128x128 blocks), got {weight_scale.shape}"
+            )
+        if weight_scale.dtype != torch.float32:
+            raise ValueError(
+                f"weight_scale must be float32, got {weight_scale.dtype}"
+            )
+        if weight_scale.device != weight.device:
+            raise ValueError(
+                f"weight_scale device mismatch. Expected {weight.device}, "
+                f"got {weight_scale.device}"
+            )
+    else:
+        if not weight_is_bf16:
+            raise ValueError(
+                f"Weight must be either FP8 (torch.float8_e4m3fn) or BF16 (torch.bfloat16), "
+                f"got {weight.dtype}"
+            )
+        if weight_scale is not None:
+            raise ValueError(
+                "weight_scale should not be provided for BF16 weights. "
+                "Use FP8 weights if you want to provide external scales."
+            )
+
+    # Validate output tensor if provided
+    if out is not None:
+        if out.shape != (M, N):
+            raise ValueError(
+                f"Output shape mismatch. Expected ({M}, {N}), got {out.shape}"
+            )
+        if out.device != input.device:
+            raise ValueError(
+                f"Output device mismatch. Expected {input.device}, got {out.device}"
+            )
+        if out_dtype is not None and out.dtype != out_dtype:
+            raise ValueError(
+                f"Output dtype mismatch. Expected {out_dtype}, got {out.dtype}"
+            )
+        out_dtype = out.dtype
+    else:
+        # Allocate output
+        out_dtype = out_dtype or torch.bfloat16
+        if out_dtype not in [torch.bfloat16, torch.float16]:
+            raise ValueError(
+                f"Output dtype must be torch.bfloat16 or torch.float16, got {out_dtype}"
+            )
+        out = torch.empty(M, N, dtype=out_dtype, device=input.device)
+
+    # Get the runner
+    runner = get_fp8_blockscale_gemm_runner()
+
+    # Allocate workspace 
+    workspace_size = runner.get_workspace_size(M, N, K)
+    workspace = None
+    if workspace_size > 0:
+        workspace = torch.empty(
+            workspace_size, dtype=torch.uint8, device=input.device
+        )
+        runner.configure_workspace(workspace)
+    
+    runner.gemm(input, weight, out, input_scale, weight_scale)
 
     return out
