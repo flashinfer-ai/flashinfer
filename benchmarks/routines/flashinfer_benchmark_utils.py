@@ -235,17 +235,7 @@ routine_cc_to_supported_backends = {
         "10.3": ["cudnn", "cublas", "cutlass"],
         "12.0": ["cudnn", "cublas"],
     },
-    "mm_fp4": {
-        "7.5": [],
-        "8.0": [],
-        "8.6": [],
-        "8.9": [],
-        "9.0": [],
-        "10.0": ["cudnn", "trtllm", "cutlass"],
-        "10.3": ["cudnn", "trtllm", "cutlass"],
-        "12.0": ["cudnn", "cutlass"],
-        "12.1": ["cudnn", "cutlass"],
-    },
+    # Note: mm_fp4 uses support checkers to filter backends, so it is not listed here
     # MOE
     "trtllm_fp4_block_scale_moe": {
         "7.5": [],

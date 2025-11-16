@@ -12,16 +12,7 @@ from flashinfer.utils import get_compute_capability, LibraryError
 from flashinfer.gemm.gemm_base import CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR
 
 
-# TODO: Consdier splitting this function up for the various backends
-@pytest.mark.parametrize("m", [1, 48, 128, 256, 512])
-@pytest.mark.parametrize("n", [128, 256, 512])
-@pytest.mark.parametrize("k", [128, 256, 512])
-@pytest.mark.parametrize("res_dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("backend", ["trtllm", "cudnn", "cutlass"])
-@pytest.mark.parametrize("use_128x4_sf_layout", [False, True])
-@pytest.mark.parametrize("auto_tuning", [False, True])
-@pytest.mark.parametrize("fp4_type", ["nvfp4", "mxfp4", "mxfp4_alpha"])
-def test_mm_fp4(
+def _test_mm_fp4(
     m, n, k, res_dtype, backend, use_128x4_sf_layout, auto_tuning, fp4_type
 ):
     use_nvfp4 = fp4_type == "nvfp4"
@@ -40,10 +31,8 @@ def test_mm_fp4(
             pytest.skip("trtllm gemm does not support SM110/SM120/SM121 GPUs.")
     if not use_128x4_sf_layout and backend != "trtllm":
         pytest.skip("Skipping test for non-trtllm fp4 with use_128x4_sf_layout=False")
-    if auto_tuning and backend == "cudnn":
-        pytest.skip("Skipping test for cudnn fp4 with auto_tuning=True")
-    if not use_nvfp4 and backend != "cudnn":
-        pytest.skip("mx_fp4 is only supported for cudnn backend")
+    if not use_nvfp4 and backend not in ["cudnn", "auto"]:
+        pytest.skip("mx_fp4 is only supported for cudnn and auto backends")
 
     input = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
     mat2 = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
@@ -103,6 +92,39 @@ def test_mm_fp4(
             pytest.xfail(str(e))
         else:
             pytest.fail(str(e))
+
+
+# TODO: Consdier splitting this function up for the various backends
+@pytest.mark.parametrize("m", [1, 48, 128, 256, 512])
+@pytest.mark.parametrize("n", [128, 256, 512])
+@pytest.mark.parametrize("k", [128, 256, 512])
+@pytest.mark.parametrize("res_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("backend", ["trtllm", "cudnn", "cutlass"])
+@pytest.mark.parametrize("use_128x4_sf_layout", [False, True])
+@pytest.mark.parametrize("auto_tuning", [False, True])
+@pytest.mark.parametrize("fp4_type", ["nvfp4", "mxfp4", "mxfp4_alpha"])
+def test_mm_fp4(
+    m, n, k, res_dtype, backend, use_128x4_sf_layout, auto_tuning, fp4_type
+):
+    # Non-auto backends
+    _test_mm_fp4(
+        m, n, k, res_dtype, backend, use_128x4_sf_layout, auto_tuning, fp4_type
+    )
+
+
+# Split tests for checking auto functionality
+@pytest.mark.parametrize("m", [1, 48, 256, 512])
+@pytest.mark.parametrize("n", [256, 512])
+@pytest.mark.parametrize("k", [256, 512])
+@pytest.mark.parametrize("res_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("use_128x4_sf_layout", [True])
+@pytest.mark.parametrize("auto_tuning", [False, True])
+@pytest.mark.parametrize("fp4_type", ["nvfp4", "mxfp4", "mxfp4_alpha"])
+def test_mm_fp4_backend_auto(
+    m, n, k, res_dtype, use_128x4_sf_layout, auto_tuning, fp4_type
+):
+    # Some test cases for auto backend.
+    _test_mm_fp4(m, n, k, res_dtype, "auto", use_128x4_sf_layout, auto_tuning, fp4_type)
 
 
 if __name__ == "__main__":

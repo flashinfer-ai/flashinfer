@@ -93,6 +93,10 @@ def _match_sm_version(device: torch.device, sm_version: list[str]):
     return device_arch in sm_version
 
 
+def get_cuda_version():
+    return tuple(map(int, torch.version.cuda.split(".")))  # (major, minor)
+
+
 @functools.cache
 def get_gemm_module():
     module = gen_gemm_module().build_and_load()
@@ -406,87 +410,50 @@ def fp8_gemm_sm100(
 def _create_cutlass_fp4_gemm_module(module, op_name: str, tuner_name: str):
     """Helper function to create cutlass FP4 GEMM module."""
 
-    class CutlassFp4GemmRunner(TunableRunner):
-        def __init__(self):
-            self._fp4_gemm_runner = module.fp4_gemm
+    def cutlass_fp4_gemm_runner():
+        class CutlassFp4GemmRunner(TunableRunner):
+            def __init__(self):
+                self._fp4_gemm_runner = module.fp4_gemm
 
-        def get_valid_tactics(
-            self,
-            inputs: List[torch.Tensor],
-            profile: OptimizationProfile,
-        ) -> List[int]:
-            return list(range(module.fp4_gemm_tactic_num()))
+            def get_valid_tactics(
+                self,
+                inputs: List[torch.Tensor],
+                profile: OptimizationProfile,
+            ) -> List[int]:
+                return list(range(module.fp4_gemm_tactic_num()))
 
-        def forward(
-            self,
-            inputs: List[torch.Tensor],
-            tactic: int = -1,
-            do_preparation: bool = False,
-            **kwargs,
-        ):
-            a, b, a_descale, b_descale, alpha, out, workspace_buffer = inputs
-            module.fp4_gemm(
-                a, b, a_descale, b_descale, alpha, out, workspace_buffer, tactic
-            )
-            return out
+            def forward(
+                self,
+                inputs: List[torch.Tensor],
+                tactic: int = -1,
+                do_preparation: bool = False,
+                **kwargs,
+            ):
+                (
+                    a,
+                    b,
+                    a_descale,
+                    b_descale,
+                    alpha,
+                    _,
+                    out,
+                    _,
+                    _,
+                    workspace_buffer,
+                ) = inputs
+                if a.dtype == torch.uint8 and a_descale.dtype == torch.float8_e4m3fn:
+                    a_descale = a_descale.view(torch.uint8)
+                if b.dtype == torch.uint8 and b_descale.dtype == torch.float8_e4m3fn:
+                    b_descale = b_descale.view(torch.uint8)
+                module.fp4_gemm(
+                    a, b.T, a_descale, b_descale.T, alpha, out, workspace_buffer, tactic
+                )
+                return out
 
-    @register_custom_op(
-        op_name,
-        mutates_args=(""),
-    )
-    def cutlass_fp4_gemm(
-        a: torch.Tensor,
-        b: torch.Tensor,
-        a_descale: torch.Tensor,
-        b_descale: torch.Tensor,
-        alpha: torch.Tensor,
-        out: torch.Tensor,
-        workspace_buffer: torch.Tensor,
-    ):
-        tuner = AutoTuner.get()
-
-        a_tensor_index = 0
-        a_scale_tensor_index = 2
-        out_tensor_index = 5
-
-        def pad_up(x, y):
-            return ((x + y - 1) // y) * y
-
-        tuning_config = TuningConfig(
-            dynamic_tensor_specs=(
-                DynamicTensorSpec(
-                    (a_tensor_index,),
-                    (0,),
-                    get_last_power_of_2_num_tokens_buckets,
-                    last_positive_power_of_2,
-                ),
-            ),
-            constraint_specs=(
-                ConstraintSpec(
-                    a_scale_tensor_index,
-                    0,
-                    lambda shapes: pad_up(shapes[a_tensor_index][0], 128),
-                ),
-                ConstraintSpec(
-                    out_tensor_index, 0, lambda shapes: shapes[a_tensor_index][0]
-                ),
-            ),
-        )
-
-        fp4_runner = CutlassFp4GemmRunner()
-
-        inputs = [a, b, a_descale, b_descale, alpha, out, workspace_buffer]
-        _, tactic = tuner.choose_one(
-            tuner_name,
-            [fp4_runner],
-            tuning_config,
-            inputs,
-        )
-
-        fp4_runner(inputs=inputs, tactic=tactic)
+        return CutlassFp4GemmRunner()
 
     return SimpleNamespace(
-        cutlass_fp4_gemm=cutlass_fp4_gemm,
+        cutlass_fp4_gemm_runner=cutlass_fp4_gemm_runner,
     )
 
 
@@ -506,6 +473,17 @@ def get_gemm_sm120_module_cutlass_fp4():
     return _create_cutlass_fp4_gemm_module(
         module, "flashinfer::cutlass_fp4_gemm_sm120", "cutlass_fp4_gemm_sm120"
     )
+
+
+def get_cutlass_fp4_gemm_module(
+    sm_major: int,
+):
+    if sm_major in [10, 11]:
+        return get_gemm_sm100_module_cutlass_fp4()
+    elif sm_major == 12:
+        return get_gemm_sm120_module_cutlass_fp4()
+    else:
+        raise ValueError(f"Unsupported SM major version: {sm_major}")
 
 
 @functools.cache
@@ -1292,6 +1270,7 @@ def build_plans_cudnn_fp4_gemm_graph(
     device,
     alpha,
     use_nvfp4,
+    tactic: int = -1,
 ):
     graph = create_cudnn_execution_plans_fp4_gemm(
         a_shape,
@@ -1311,7 +1290,10 @@ def build_plans_cudnn_fp4_gemm_graph(
     )
 
     graph.check_support()
-    graph.build_plans()
+    if tactic != -1:
+        graph.build_plan_at_index(tactic)
+    else:
+        graph.build_plans()
     return graph
 
 
@@ -1324,6 +1306,7 @@ def execute_cudnn_gemm_fp4_graph(
     alpha,
     c_final,
     workspace_buffer,
+    tactic: int = -1,
 ):
     variant_pack = {
         UIDs.A_UID.value: a.view(get_native_fp4_dtype()),
@@ -1343,7 +1326,12 @@ def execute_cudnn_gemm_fp4_graph(
 
     stream = torch.cuda.current_stream(a.device)
 
-    graph.execute(variant_pack, workspace_buffer, handle=_get_cudnn_handle(stream))
+    if tactic == -1:
+        graph.execute(variant_pack, workspace_buffer, handle=_get_cudnn_handle(stream))
+    else:
+        graph.execute_plan_at_index(
+            variant_pack, workspace_buffer, tactic, handle=_get_cudnn_handle(stream)
+        )
 
 
 @functools.cache
@@ -1677,6 +1665,158 @@ def mm_fp8(
     return out
 
 
+def _get_cudnn_fp4_gemm_graph(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_descale: torch.Tensor,
+    b_descale: torch.Tensor,
+    alpha: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    out: Optional[torch.Tensor] = None,
+    block_size: int = 16,
+    use_nvfp4: bool = True,
+    tactic: int = -1,
+):
+    _check_cudnn_availability()
+    # the fp4 cudnn graph will be shared for both mm and bmm, so
+    # here we need to get the 3d shape and stride including the
+    # batch dimension for both input and block scale tensors.
+    real_a_shape, real_a_stride = _get_real_fp4_shape_from_packed_uint8(a)
+    real_b_shape, real_b_stride = _get_real_fp4_shape_from_packed_uint8(b)
+    batch = real_a_shape[0]
+    expanded_a_descale_shape, expanded_a_descale_stride = (
+        _expand_block_scale_tensor_shape(a_descale, batch)
+    )
+    expanded_b_descale_shape, expanded_b_descale_stride = (
+        _expand_block_scale_tensor_shape(b_descale, batch)
+    )
+
+    # build the fp4 cudnn graph
+    graph = build_plans_cudnn_fp4_gemm_graph(
+        real_a_shape,
+        real_a_stride,
+        real_b_shape,
+        real_b_stride,
+        expanded_a_descale_shape,
+        expanded_a_descale_stride,
+        expanded_b_descale_shape,
+        expanded_b_descale_stride,
+        cudnn.data_type.FP4_E2M1,
+        _torch_data_type_to_cudnn_data_type(out_dtype),
+        block_size,
+        a.device,
+        alpha is not None,
+        use_nvfp4,
+        tactic=tactic,
+    )
+    return graph
+
+
+def _cudnn_gemm_fp4(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_descale: torch.Tensor,
+    b_descale: torch.Tensor,
+    alpha: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    out: Optional[torch.Tensor] = None,
+    block_size: int = 16,
+    use_nvfp4: bool = True,
+    workspace_buffer: torch.Tensor = None,
+    tactic: int = -1,
+):
+    graph = _get_cudnn_fp4_gemm_graph(
+        a=a,
+        b=b,
+        a_descale=a_descale,
+        b_descale=b_descale,
+        alpha=alpha,
+        out_dtype=out_dtype,
+        out=out,
+        block_size=block_size,
+        use_nvfp4=use_nvfp4,
+        tactic=tactic,
+    )
+    # execute the fp4 cudnn graph
+    execute_cudnn_gemm_fp4_graph(
+        graph, a, b, a_descale, b_descale, alpha, out, workspace_buffer, tactic=tactic
+    )
+
+
+def _cudnn_gemm_fp4_runner():
+    class CudnnFp4GemmRunner(TunableRunner):
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+        ) -> List[int]:
+            # cudnn has heuristic for fp4 gemm, so we only need to use the default tactic
+            _check_cudnn_availability()
+            (
+                a,
+                b,
+                a_descale,
+                b_descale,
+                alpha,
+                out_dtype,
+                out,
+                block_size,
+                use_nvfp4,
+                workspace_buffer,
+            ) = inputs
+
+            graph = _get_cudnn_fp4_gemm_graph(
+                a=a,
+                b=b,
+                a_descale=a_descale,
+                b_descale=b_descale,
+                alpha=alpha,
+                out_dtype=out_dtype,
+                out=out,
+                block_size=block_size,
+                use_nvfp4=use_nvfp4,
+                tactic=-1,
+            )
+
+            num_plans = graph.get_execution_plan_count()
+            return list(range(num_plans))
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic: int = -1,
+            do_preparation: bool = False,
+            **kwargs,
+        ) -> torch.Tensor:
+            (
+                a,
+                b,
+                a_descale,
+                b_descale,
+                alpha,
+                out_dtype,
+                out,
+                block_size,
+                use_nvfp4,
+                workspace_buffer,
+            ) = inputs
+            _cudnn_gemm_fp4(
+                a,
+                b,
+                a_descale,
+                b_descale,
+                alpha,
+                out_dtype,
+                out,
+                block_size,
+                use_nvfp4,
+                workspace_buffer,
+                tactic=tactic,
+            )
+
+    return CudnnFp4GemmRunner()
+
+
 def _check_mm_fp4_problem_size(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -1687,7 +1827,7 @@ def _check_mm_fp4_problem_size(
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
     use_8x4_sf_layout: bool = False,
-    backend: Literal["cudnn", "trtllm", "cutlass"] = "cudnn",
+    backend: Literal["cudnn", "trtllm", "cutlass", "auto"] = "auto",
     use_nvfp4: bool = True,
 ):
     # Generic checks
@@ -1725,11 +1865,6 @@ def _check_mm_fp4_problem_size(
             f"Only torch.bfloat16 and torch.float16 are supported for FP4 GEMM operations."
         )
 
-    if backend != "trtllm" and use_8x4_sf_layout:
-        raise ValueError("Only TRTLLM FP4 GEMM supports 8x4 scale factor layout.")
-    if backend != "cudnn" and not use_nvfp4:
-        raise ValueError("Only cudnn FP4 GEMM supports mxfp4 quantization.")
-
     if use_nvfp4 and block_size != 16:
         raise ValueError("nvfp4 only supports block_size = 16.")
     if not use_nvfp4 and block_size != 32:
@@ -1749,9 +1884,11 @@ def _cudnn_gemm_fp4_requirement(
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
     use_8x4_sf_layout: bool = False,
-    backend: Literal["cudnn", "trtllm", "cutlass"] = "cudnn",
+    backend: Literal["cudnn", "trtllm", "cutlass", "auto"] = "auto",
     use_nvfp4: bool = True,
 ):
+    if use_8x4_sf_layout:
+        raise ValueError("Only TRTLLM FP4 GEMM supports 8x4 scale factor layout.")
     if (
         not use_nvfp4
         and _match_sm_version(a.device, ["120"])
@@ -1807,9 +1944,11 @@ def _trtllm_gemm_fp4_requirement(
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
     use_8x4_sf_layout: bool = False,
-    backend: Literal["cudnn", "trtllm", "cutlass"] = "cudnn",
+    backend: Literal["cudnn", "trtllm", "cutlass", "auto"] = "auto",
     use_nvfp4: bool = True,
 ):
+    if not use_nvfp4:
+        raise ValueError("Only cudnn and auto FP4 GEMM supports mxfp4 quantization.")
     if out_dtype != torch.bfloat16:
         raise ValueError(
             f"Unsupported output dtype: {out_dtype}. "
@@ -1829,19 +1968,60 @@ def _cutlass_gemm_fp4_requirement(
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
     use_8x4_sf_layout: bool = False,
-    backend: Literal["cudnn", "trtllm", "cutlass"] = "cudnn",
+    backend: Literal["cudnn", "trtllm", "cutlass", "auto"] = "auto",
     use_nvfp4: bool = True,
 ):
+    if use_8x4_sf_layout:
+        raise ValueError("Only TRTLLM FP4 GEMM supports 8x4 scale factor layout.")
+    if not use_nvfp4:
+        raise ValueError("Only cudnn and auto FP4 GEMM supports mxfp4 quantization.")
     return True
+
+
+def _heuristic_func_mm_fp4(
+    suitable_backends: List[str],
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_descale: torch.Tensor,
+    b_descale: torch.Tensor,
+    alpha: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    out: Optional[torch.Tensor] = None,
+    block_size: int = 16,
+    use_8x4_sf_layout: bool = False,
+    backend: Literal["cudnn", "trtllm", "cutlass", "auto"] = "cudnn",
+    use_nvfp4: bool = True,
+):
+    r"""
+    Heuristic function for mm_fp4 backend selection. Routes to either cudnn or cutlass, but not trtllm.
+
+    Logic for which comes first:
+    - If cuda version is 12 - use cutlass.
+    - If cuda version is 13 and cudnn version is less than 9.14 - use cutlass.
+    - If cuda version is 13 and cudnn version is 9.14 or greater - use cudnn.
+
+    """
+    cuda_major, _ = get_cuda_version()
+    # If cuda version is 13 or greater:
+    # cudnn is more performant if cudnn version is 9.15 or greater.
+    if CUDNN_AVAILABLE and cuda_major >= 13 and cudnn.backend_version() >= 91500:
+        candidate_backends = ("cudnn", "cutlass")
+    # Otherwise, prioritize cutlass
+    else:
+        candidate_backends = ("cutlass", "cudnn")
+
+    # Filter and return only supported backends
+    return [c for c in candidate_backends if c in suitable_backends]
 
 
 @backend_requirement(
     {
-        "cudnn": _cudnn_gemm_fp4_requirement,  # Each backend has its own requirement function
+        "cudnn": _cudnn_gemm_fp4_requirement,
         "trtllm": _trtllm_gemm_fp4_requirement,
         "cutlass": _cutlass_gemm_fp4_requirement,
     },
-    common_check=_check_mm_fp4_problem_size,  # Shape checks common to all backends
+    common_check=_check_mm_fp4_problem_size,
+    heuristic_func=_heuristic_func_mm_fp4,  # result stored in mm_fp4.suitable_auto_backends
 )
 def mm_fp4(
     a: torch.Tensor,
@@ -1853,7 +2033,7 @@ def mm_fp4(
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
     use_8x4_sf_layout: bool = False,
-    backend: Literal["cudnn", "trtllm", "cutlass"] = "cudnn",
+    backend: Literal["cudnn", "trtllm", "cutlass", "auto"] = "auto",
     use_nvfp4: bool = True,
 ) -> torch.Tensor:
     r"""MM FP4
@@ -1887,8 +2067,8 @@ def mm_fp4(
     use_8x4_sf_layout: bool
         Whether to use 8x4 scale factor layout or 128x4 scale factor layout, defaults to False.
 
-    backend: Literal["cudnn", "trtllm", "cutlass"]
-        Backend to use, defaults to "cudnn".
+    backend: Literal["cudnn", "trtllm", "cutlass", "auto"]
+        Backend to use, defaults to "auto", which automatically selects the best backend between cudnn and cutlass.
 
     use_nvfp4: bool
         Whether to use nvfp4 quantization or mxfp4 quantization, defaults to False.
@@ -1930,70 +2110,78 @@ def mm_fp4(
         "mm_fp4_workspace", DEFAULT_WORKSPACE_SIZE, a.device
     )
 
-    if backend == "cudnn":
-        # the fp4 cudnn graph will be shared for both mm and bmm, so
-        # here we need to get the 3d shape and stride including the
-        # batch dimension for both input and block scale tensors.
-        real_a_shape, real_a_stride = _get_real_fp4_shape_from_packed_uint8(a)
-        real_b_shape, real_b_stride = _get_real_fp4_shape_from_packed_uint8(b)
-        batch = real_a_shape[0]
-        expanded_a_descale_shape, expanded_a_descale_stride = (
-            _expand_block_scale_tensor_shape(a_descale, batch)
-        )
-        expanded_b_descale_shape, expanded_b_descale_stride = (
-            _expand_block_scale_tensor_shape(b_descale, batch)
-        )
+    # Auto-select the best backend
+    if backend == "auto":
+        backends = mm_fp4.suitable_auto_backends
+    else:
+        backends = [backend]
 
-        # build the fp4 cudnn graph
-        graph = build_plans_cudnn_fp4_gemm_graph(
-            real_a_shape,
-            real_a_stride,
-            real_b_shape,
-            real_b_stride,
-            expanded_a_descale_shape,
-            expanded_a_descale_stride,
-            expanded_b_descale_shape,
-            expanded_b_descale_stride,
-            cudnn.data_type.FP4_E2M1,
-            _torch_data_type_to_cudnn_data_type(out_dtype),
-            block_size,
-            a.device,
-            alpha is not None,
-            use_nvfp4,
-        )
+    # At this point, backends contains a supported backend if specified, or all supported backends if backend='auto'.
+    # Lazy initialization of runners to avoid overhead of creating a new runner that will not be used
+    major, _ = get_compute_capability(a.device)
 
-        # execute the fp4 cudnn graph
-        execute_cudnn_gemm_fp4_graph(
-            graph, a, b, a_descale, b_descale, alpha, out, workspace_buffer
-        )
-    elif backend == "trtllm":
-        get_trtllm_fp4_gemm_module().trtllm_fp4_gemm(
-            a,
-            b.T,
-            a_descale,
-            b_descale.T,
-            alpha,
-            out,
-            use_8x4_sf_layout=use_8x4_sf_layout,
-            workspace_buffer=workspace_buffer,
-        )
-    elif backend == "cutlass":
-        # cutlass require uint8 scale when a/b is fp4 packed uint8.
-        if a.dtype == torch.uint8 and a_descale.dtype == torch.float8_e4m3fn:
-            a_descale = a_descale.view(torch.uint8)
-        if b.dtype == torch.uint8 and b_descale.dtype == torch.float8_e4m3fn:
-            b_descale = b_descale.view(torch.uint8)
+    backend_to_runner_factory = {
+        "cudnn": lambda: _cudnn_gemm_fp4_runner(),
+        "trtllm": lambda: get_trtllm_fp4_gemm_module().trtllm_fp4_gemm_runner(
+            use_8x4_sf_layout
+        ),
+        "cutlass": lambda: get_cutlass_fp4_gemm_module(major).cutlass_fp4_gemm_runner(),
+    }
+    runners = [backend_to_runner_factory[cur_backend]() for cur_backend in backends]
 
-        # Dispatch to the correct module based on device architecture
-        major, _ = get_compute_capability(a.device)
-        if major == 12:
-            gemm_module = get_gemm_sm120_module_cutlass_fp4()
-        else:
-            gemm_module = get_gemm_sm100_module_cutlass_fp4()
+    # Now we have a list of runners for desired & supported backends.
+    tuner = AutoTuner.get()
 
-        gemm_module.cutlass_fp4_gemm(
-            a, b.T, a_descale, b_descale.T, alpha, out, workspace_buffer
-        )
+    a_tensor_index = 0
+    a_scale_tensor_index = 2
+    out_tensor_index = 6
+
+    def pad_up(x, y):
+        return ((x + y - 1) // y) * y
+
+    tuning_config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                (a_tensor_index,),
+                (0,),
+                get_last_power_of_2_num_tokens_buckets,
+                last_positive_power_of_2,
+            ),
+        ),
+        constraint_specs=(
+            ConstraintSpec(
+                a_scale_tensor_index,
+                0,
+                lambda shapes: pad_up(
+                    shapes[a_tensor_index][0], 8 if use_8x4_sf_layout else 128
+                ),
+            ),
+            ConstraintSpec(
+                out_tensor_index, 0, lambda shapes: shapes[a_tensor_index][0]
+            ),
+        ),
+    )
+
+    inputs = [
+        a,
+        b,
+        a_descale,
+        b_descale,
+        alpha,
+        out_dtype,
+        out,
+        block_size,
+        use_nvfp4,
+        workspace_buffer,
+    ]
+    runner, tactic = tuner.choose_one(
+        "fp4_gemm",
+        runners,
+        tuning_config,
+        inputs,
+    )
+
+    runner(inputs=inputs, tactic=tactic)
     return out
 
 
@@ -2355,139 +2543,82 @@ def get_trtllm_fp4_gemm_module():
     op = mod.build_and_load()
     setup_cubin_loader(mod.get_library_path())
 
-    class TrtllmFp4GemmRunner(TunableRunner):
-        def __init__(self, use_8x4_sf_layout: bool = True):
-            self._fp4_gemm_runner = op.trtllm_gemm
-            self._use_8x4_sf_layout = use_8x4_sf_layout
+    def trtllm_fp4_gemm_runner(use_8x4_sf_layout: bool = True):
+        class TrtllmFp4GemmRunner(TunableRunner):
+            def __init__(self, use_8x4_sf_layout: bool = True):
+                self._fp4_gemm_runner = op.trtllm_gemm
+                self._use_8x4_sf_layout = use_8x4_sf_layout
 
-        def get_valid_tactics(
-            self,
-            inputs: List[torch.Tensor],
-            profile: OptimizationProfile,
-        ) -> List[int]:
-            a_tensor_index = 1
-            b_tensor_index = 2
+            def get_valid_tactics(
+                self,
+                inputs: List[torch.Tensor],
+                profile: OptimizationProfile,
+            ) -> List[int]:
+                a_tensor_index = 1
+                b_tensor_index = 2
 
-            a = profile.get_opt_shapes()[a_tensor_index]
-            b = profile.get_opt_shapes()[b_tensor_index]
-            m = a[0]
-            n = b[0]
-            k = a[1] * 2
-            (
-                workspace_buffer,
-                a,
-                b,
-                a_descale,
-                b_descale,
-                alpha,
-                out,
-            ) = inputs
-            type_e2m1 = 0
-            type_bf16 = 2
-            return list(
-                op.trtllm_gemm_tactics(
-                    m, n, k, type_e2m1, type_bf16, self._use_8x4_sf_layout
+                a = profile.get_opt_shapes()[a_tensor_index]
+                b = profile.get_opt_shapes()[b_tensor_index]
+                m = a[0]
+                n = b[0]
+                k = a[1] * 2
+                (
+                    a,
+                    b,
+                    a_descale,
+                    b_descale,
+                    alpha,
+                    _,
+                    out,
+                    _,
+                    _,
+                    workspace_buffer,
+                ) = inputs
+                type_e2m1 = 0
+                type_bf16 = 2
+                return list(
+                    op.trtllm_gemm_tactics(
+                        m, n, k, type_e2m1, type_bf16, self._use_8x4_sf_layout
+                    )
                 )
-            )
 
-        def forward(
-            self,
-            inputs: List[torch.Tensor],
-            tactic: int = -1,
-            do_preparation: bool = False,
-            **kwargs,
-        ):
-            (
-                workspace_buffer,
-                a,
-                b,
-                a_descale,
-                b_descale,
-                alpha,
-                out,
-            ) = inputs
-            op.trtllm_gemm(
-                workspace_buffer,
-                a,
-                b,
-                a_descale,
-                b_descale,
-                alpha,
-                out,
-                self._use_8x4_sf_layout,
-                tactic,
-            )
-            return out
+            def forward(
+                self,
+                inputs: List[torch.Tensor],
+                tactic: int = -1,
+                do_preparation: bool = False,
+                **kwargs,
+            ):
+                (
+                    a,
+                    b,
+                    a_descale,
+                    b_descale,
+                    alpha,
+                    _,
+                    out,
+                    _,
+                    _,
+                    workspace_buffer,
+                ) = inputs
+                self._fp4_gemm_runner(
+                    workspace_buffer,
+                    a,
+                    b.T,
+                    a_descale,
+                    b_descale.T,
+                    alpha,
+                    out,
+                    self._use_8x4_sf_layout,
+                    tactic,
+                )
+                return out
 
-    @register_custom_op(
-        "flashinfer::trtllm_fp4_gemm",
-        mutates_args=(""),
-    )
-    def trtllm_fp4_gemm(
-        a: torch.Tensor,
-        b: torch.Tensor,
-        a_descale: torch.Tensor,
-        b_descale: torch.Tensor,
-        alpha: torch.Tensor,
-        out: torch.Tensor,
-        use_8x4_sf_layout: bool,
-        workspace_buffer: torch.Tensor,
-    ):
-        tuner = AutoTuner.get()
-
-        a_tensor_index = 1
-        a_scale_tensor_index = 3
-        out_tensor_index = 6
-
-        def pad_up(x, y):
-            return ((x + y - 1) // y) * y
-
-        tuning_config = TuningConfig(
-            dynamic_tensor_specs=(
-                DynamicTensorSpec(
-                    (a_tensor_index,),
-                    (0,),
-                    get_last_power_of_2_num_tokens_buckets,
-                    last_positive_power_of_2,
-                ),
-            ),
-            constraint_specs=(
-                ConstraintSpec(
-                    a_scale_tensor_index,
-                    0,
-                    lambda shapes: pad_up(
-                        shapes[a_tensor_index][0], 8 if use_8x4_sf_layout else 128
-                    ),
-                ),
-                ConstraintSpec(
-                    out_tensor_index, 0, lambda shapes: shapes[a_tensor_index][0]
-                ),
-            ),
-        )
-
-        fp4_runner = TrtllmFp4GemmRunner(use_8x4_sf_layout)
-
-        inputs = [
-            workspace_buffer,
-            a,
-            b,
-            a_descale,
-            b_descale,
-            alpha,
-            out,
-        ]
-        _, tactic = tuner.choose_one(
-            "trtllm_fp4_gemm_8x4" if use_8x4_sf_layout else "trtllm_fp4_gemm_128x4",
-            [fp4_runner],
-            tuning_config,
-            inputs,
-        )
-
-        fp4_runner(inputs=inputs, tactic=tactic)
+        return TrtllmFp4GemmRunner(use_8x4_sf_layout)
 
     # Register the module
     return SimpleNamespace(
-        trtllm_fp4_gemm=trtllm_fp4_gemm,
+        trtllm_fp4_gemm_runner=trtllm_fp4_gemm_runner,
     )
 
 
