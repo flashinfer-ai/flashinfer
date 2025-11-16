@@ -9,42 +9,22 @@ from flashinfer.fused_moe import (
 )
 
 
-def run(
-    routing_logits: torch.Tensor,
-    routing_bias: torch.Tensor,
+def dequant_fp8_block_scaled(
+    intermediate_size: int,
+    hidden_size: int,
     hidden_states: torch.Tensor,
     hidden_states_scale: torch.Tensor,
     gemm1_weights: torch.Tensor,
     gemm1_weights_scale: torch.Tensor,
     gemm2_weights: torch.Tensor,
     gemm2_weights_scale: torch.Tensor,
-    local_expert_offset: int,
-    routed_scaling_factor: float,
-    hidden_size: int,
-    intermediate_size: int,
+    routing_logits: torch.Tensor,
+    routing_bias: torch.Tensor,
     num_experts_global: int,
     num_local_experts: int,
-    top_k: int,
-    n_group: int,
-    topk_group: int,
 ):
-    """
-    - FP8 block-scale dequantization: float ≈ fp8 * scale
-    - DeepSeek-V3 no-aux routing:
-        s = sigmoid(logits)
-        s_with_bias = s + bias
-        group by n_group=8; per group take top-2 sum → pick topk_group=4 groups
-        on the kept groups, take global top_k=8 experts
-        combine with weights derived from s (without bias), normalized and
-        scaled by routed_scaling_factor
-    - Local computation:
-        only experts in [local_expert_offset, local_expert_offset + E_local) are
-        computed on this rank (GEMM1 → SwiGLU → GEMM2), then per-token weighted
-        accumulation.
-    """
-
-    # Fixed DeepSeek-V3/R1 geometry
-    H = hidden_size  # deepseek v3: 7168
+    # FP8 block-scale dequantization: float ≈ fp8 * scale
+    H = hidden_size
     I = intermediate_size  # deepseek v3: 2048
     E_local = gemm1_weights.shape[0]
 
@@ -54,11 +34,6 @@ def run(
 
     assert E_global == num_experts_global, "num_experts_global shape mismatch"
     assert E_local == num_local_experts, "num_local_experts shape mismatch"
-
-    # Routing constants
-    TOP_K = top_k  # deepseek v3: 8
-    N_GROUP = n_group  # deepseek v3: 8
-    TOPK_GROUP = topk_group  # deepseek v3: 4
 
     # Block counts
     num_hidden_blocks = H // BLOCK  # 56
@@ -82,9 +57,6 @@ def run(
     )
     assert routing_bias.shape[-1] == E_global
 
-    device = hidden_states.device
-
-    # 1) FP8 block-scale dequantization
     # hidden_states: [T, H], scale: [H/128, T] (transposed layout)
     A_fp32 = hidden_states.to(torch.float32)
     A_scale = hidden_states_scale.to(torch.float32)  # [H/128, T]
@@ -110,6 +82,52 @@ def run(
     S2_expanded = torch.repeat_interleave(S2, BLOCK, dim=1)  # [E, H, I/128]
     S2_expanded = torch.repeat_interleave(S2_expanded, BLOCK, dim=2)  # [E, H, I]
     W2 = W2_fp32 * S2_expanded  # [E, H, I] float32
+
+    return A, W13, W2
+
+
+def _deepseek_moe_core(
+    routing_logits: torch.Tensor,
+    routing_bias: torch.Tensor,
+    local_expert_offset: int,
+    routed_scaling_factor: float,
+    intermediate_size: int,
+    num_experts_global: int,
+    num_local_experts: int,
+    top_k: int,
+    n_group: int,
+    topk_group: int,
+    hidden_size: int,
+    A: torch.Tensor,
+    W13: torch.Tensor,
+    W2: torch.Tensor,
+):
+    """
+    - DeepSeek-V3 no-aux routing:
+        s = sigmoid(logits)
+        s_with_bias = s + bias
+        group by n_group=8; per group take top-2 sum → pick topk_group=4 groups
+        on the kept groups, take global top_k=8 experts
+        combine with weights derived from s (without bias), normalized and
+        scaled by routed_scaling_factor
+    - Local computation:
+        only experts in [local_expert_offset, local_expert_offset + E_local) are
+        computed on this rank (GEMM1 → SwiGLU → GEMM2), then per-token weighted
+        accumulation.
+    """
+
+    # Routing constants
+    TOP_K = top_k  # deepseek v3: 8
+    N_GROUP = n_group  # deepseek v3: 8
+    TOPK_GROUP = topk_group  # deepseek v3: 4
+
+    I = intermediate_size  # deepseek v3: 2048
+    H = hidden_size  # deepseek v3: 7168
+    E_local = num_local_experts
+    E_global = num_experts_global
+    T = routing_logits.shape[0]
+
+    device = A.device
 
     # 2) No-aux routing
     logits = routing_logits.to(torch.float32)  # [T, E_global]
@@ -193,6 +211,70 @@ def run(
         output.index_add_(0, token_idx, O * w_tok.unsqueeze(1))  # [Tk,H] * [Tk,1]
 
     return output.to(torch.bfloat16)
+
+
+def run_fp8_block_scale_moe_reference(
+    routing_logits: torch.Tensor,
+    routing_bias: torch.Tensor,
+    hidden_states: torch.Tensor,
+    hidden_states_scale: torch.Tensor,
+    gemm1_weights: torch.Tensor,
+    gemm1_weights_scale: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    gemm2_weights_scale: torch.Tensor,
+    local_expert_offset: int,
+    routed_scaling_factor: float,
+    intermediate_size: int,
+    num_experts_global: int,
+    num_local_experts: int,
+    top_k: int,
+    n_group: int,
+    topk_group: int,
+    hidden_size: int,
+):
+    I = intermediate_size  # deepseek v3: 2048
+    E_local = gemm1_weights.shape[0]
+    H = hidden_size  # deepseek v3: 7168
+    assert E_local == num_local_experts, "num_local_experts shape mismatch"
+
+    E_global = routing_logits.shape[1]
+    assert E_global == num_experts_global, "num_experts_global shape mismatch"
+
+    # FP8 block-scale dequantization
+    A, W13, W2 = dequant_fp8_block_scaled(
+        hidden_size=H,
+        intermediate_size=I,
+        hidden_states=hidden_states,
+        hidden_states_scale=hidden_states_scale,
+        gemm1_weights=gemm1_weights,
+        gemm1_weights_scale=gemm1_weights_scale,
+        gemm2_weights=gemm2_weights,
+        gemm2_weights_scale=gemm2_weights_scale,
+        routing_logits=routing_logits,
+        routing_bias=routing_bias,
+        num_experts_global=E_global,
+        num_local_experts=E_local,
+    )
+
+    # DeepSeek-V3 no-aux routing
+    output = _deepseek_moe_core(
+        A=A,
+        W13=W13,
+        W2=W2,
+        routing_logits=routing_logits,
+        routing_bias=routing_bias,
+        num_experts_global=E_global,
+        num_local_experts=E_local,
+        top_k=top_k,
+        n_group=n_group,
+        topk_group=topk_group,
+        hidden_size=H,
+        intermediate_size=I,
+        local_expert_offset=local_expert_offset,
+        routed_scaling_factor=routed_scaling_factor,
+    )
+
+    return output
 
 
 # -----------------------------
@@ -339,6 +421,67 @@ def generate_random_inputs_moe(
     }
 
 
+def stats_accuracy(
+    ref_out: torch.Tensor,
+    fi_out: torch.Tensor,
+    atol: float = 1e-1,
+    rtol: float = 2e-1,
+    percent: float = 0.85,
+):
+    H = ref_out.shape[1]
+    assert H == 7168
+
+    # Compare
+    ref_f32 = ref_out.float()
+    fi_f32 = fi_out.float()
+
+    abs_diff = (ref_f32 - fi_f32).abs()
+    rel_diff = abs_diff / (fi_f32.abs() + 1e-8)
+
+    print("\nComparison stats:")
+    print(f"Max abs diff:  {abs_diff.max().item():.6e}")
+    print(f"Mean abs diff: {abs_diff.mean().item():.6e}")
+    print(f"Max rel diff:  {rel_diff.max().item():.6e}")
+    print(f"Mean rel diff: {rel_diff.mean().item():.6e}")
+
+    # Cosine similarity and MSE
+    cos_sim = torch.nn.functional.cosine_similarity(
+        ref_f32.flatten(), fi_f32.flatten(), dim=0
+    ).item()
+    mse = torch.mean((ref_f32 - fi_f32) ** 2).item()
+    print(f"Cosine similarity: {cos_sim:.6f}")
+    print(f"MSE: {mse:.6e}")
+
+    # Strict allclose
+    allclose = torch.allclose(ref_f32, fi_f32, atol=atol, rtol=rtol)
+    print(f"\nAllclose(atol={atol}, rtol={rtol}): {allclose}")
+
+    if not allclose:
+        # Show top-5 largest absolute errors
+        flat = abs_diff.flatten()
+        k = min(5, flat.numel())
+        topv, topi = torch.topk(flat, k)
+        print("\nTop-5 absolute error locations:")
+        for rank in range(k):
+            idx = topi[rank].item()
+            t = idx // H
+            h = idx % H
+            print(
+                f"  [t={t}, h={h}]: ref={ref_f32.flatten()[idx].item():.6e}, "
+                f"fi={fi_f32.flatten()[idx].item():.6e}, diff={topv[rank].item():.6e}"
+            )
+
+    left = (ref_f32 - fi_f32).abs()
+    right = atol + rtol * fi_f32.abs()
+    ok = left <= right
+    hit_ratio = ok.float().mean().item()
+    print(f"\nHit ratio: {hit_ratio * 100:.2f}%  (need >= {percent * 100:.2f}%)")
+
+    assert hit_ratio >= percent, (
+        f"Hit ratio {hit_ratio * 100:.2f}% is less than required {percent * 100:.2f}%"
+    )
+
+
 # Max num tokens to tune for trtllm-gen fused moe
 TUNE_MAX_NUM_TOKENS = 4096
 
@@ -346,9 +489,6 @@ TUNE_MAX_NUM_TOKENS = 4096
 # -----------------------------
 # Test Entry
 # -----------------------------
-@pytest.mark.parametrize(
-    "test_tag", ["FP8BlockScaleMoe"]
-)  # todo(yingyi): add "FP8PerTensorMoe"
 @pytest.mark.parametrize(
     "seq_len, local_expert_offset, use_bias",
     [
@@ -414,7 +554,6 @@ TUNE_MAX_NUM_TOKENS = 4096
             {
                 "use_shuffled_weight": False,
                 "layout": WeightLayout.MajorK,
-                "compatible_moe_impls": ["FP8BlockScaleMoe"],
             },
             id="NoShuffle_MajorK",
         ),
@@ -422,11 +561,6 @@ TUNE_MAX_NUM_TOKENS = 4096
             {
                 "use_shuffled_weight": True,
                 "layout": WeightLayout.MajorK,
-                "compatible_moe_impls": [
-                    "FP4Moe",
-                    "FP8PerTensorMoe",
-                    "FP8BlockScaleMoe",
-                ],
             },
             id="Shuffled_MajorK",
         ),
@@ -434,14 +568,12 @@ TUNE_MAX_NUM_TOKENS = 4096
             {
                 "use_shuffled_weight": True,
                 "layout": WeightLayout.BlockMajorK,
-                "compatible_moe_impls": ["FP8BlockScaleMoe"],
             },
             id="Shuffled_BlockMajorK",
         ),
     ],
 )
 def test_correctness_dpsk_fp8_fused_moe(
-    test_tag: str,
     seq_len: int,
     local_expert_offset: int,
     use_bias: bool,
@@ -463,12 +595,6 @@ def test_correctness_dpsk_fp8_fused_moe(
     if intermediate_size not in compatible_intermediate_size:
         pytest.skip(
             f"Intermediate size {intermediate_size} is not compatible with routing config {routing_config}"
-        )
-
-    compatible_moe_impls = weight_processing["compatible_moe_impls"]
-    if test_tag not in compatible_moe_impls:
-        pytest.skip(
-            f"Test {test_tag} is not compatible with weight processing {weight_processing}"
         )
 
     device = "cuda"
@@ -502,7 +628,7 @@ def test_correctness_dpsk_fp8_fused_moe(
     )
 
     # Run reference (returns bf16)
-    ref_out = run(
+    ref_out = run_fp8_block_scale_moe_reference(
         routing_logits=inputs["routing_logits"],
         routing_bias=inputs["routing_bias"],
         hidden_states=inputs["hidden_states"],
@@ -584,55 +710,7 @@ def test_correctness_dpsk_fp8_fused_moe(
             tune_max_num_tokens=TUNE_MAX_NUM_TOKENS,
         )
 
-    # Compare
-    ref_f32 = ref_out.float()
-    fi_f32 = fi_out.float()
-
-    abs_diff = (ref_f32 - fi_f32).abs()
-    rel_diff = abs_diff / (fi_f32.abs() + 1e-8)
-
-    print("\nComparison stats:")
-    print(f"Max abs diff:  {abs_diff.max().item():.6e}")
-    print(f"Mean abs diff: {abs_diff.mean().item():.6e}")
-    print(f"Max rel diff:  {rel_diff.max().item():.6e}")
-    print(f"Mean rel diff: {rel_diff.mean().item():.6e}")
-
-    # Cosine similarity and MSE
-    cos_sim = torch.nn.functional.cosine_similarity(
-        ref_f32.flatten(), fi_f32.flatten(), dim=0
-    ).item()
-    mse = torch.mean((ref_f32 - fi_f32) ** 2).item()
-    print(f"Cosine similarity: {cos_sim:.6f}")
-    print(f"MSE: {mse:.6e}")
-
-    # Strict allclose
-    allclose = torch.allclose(ref_f32, fi_f32, atol=atol, rtol=rtol)
-    print(f"\nAllclose(atol={atol}, rtol={rtol}): {allclose}")
-
-    if not allclose:
-        # Show top-5 largest absolute errors
-        flat = abs_diff.flatten()
-        k = min(5, flat.numel())
-        topv, topi = torch.topk(flat, k)
-        print("\nTop-5 absolute error locations:")
-        for rank in range(k):
-            idx = topi[rank].item()
-            t = idx // H
-            h = idx % H
-            print(
-                f"  [t={t}, h={h}]: ref={ref_f32.flatten()[idx].item():.6e}, "
-                f"fi={fi_f32.flatten()[idx].item():.6e}, diff={topv[rank].item():.6e}"
-            )
-
-    left = (ref_f32 - fi_f32).abs()
-    right = atol + rtol * fi_f32.abs()
-    ok = left <= right
-    hit_ratio = ok.float().mean().item()
-    print(f"\nHit ratio: {hit_ratio * 100:.2f}%  (need >= {percent * 100:.2f}%)")
-
-    assert hit_ratio >= percent, (
-        f"Hit ratio {hit_ratio * 100:.2f}% is less than required {percent * 100:.2f}%"
-    )
+    stats_accuracy(ref_out, fi_out, atol=atol, rtol=rtol, percent=percent)
 
 
 if __name__ == "__main__":
@@ -652,4 +730,8 @@ if __name__ == "__main__":
             "enable_autotune": True,
         },
         enable_pdl=True,
+        weight_processing={
+            "use_shuffled_weight": False,
+            "layout": WeightLayout.MajorK,
+        },
     )
