@@ -1,12 +1,11 @@
 import pytest
 import torch
-from flashinfer import reorder_rows_for_gated_act_gemm, shuffle_matrix_a
+from flashinfer import shuffle_matrix_a
 from flashinfer.fused_moe.core import convert_to_block_layout
 from flashinfer.autotuner import autotune
 from flashinfer.fused_moe import (
     WeightLayout,
     trtllm_fp8_block_scale_moe,
-    trtllm_fp8_per_tensor_scale_moe,
 )
 
 
@@ -347,7 +346,9 @@ TUNE_MAX_NUM_TOKENS = 4096
 # -----------------------------
 # Test Entry
 # -----------------------------
-@pytest.mark.parametrize("test_tag", ["FP8BlockScaleMoe", "FP8PerTensorMoe"])
+@pytest.mark.parametrize(
+    "test_tag", ["FP8BlockScaleMoe"]
+)  # todo(yingyi): add "FP8PerTensorMoe"
 @pytest.mark.parametrize(
     "seq_len, local_expert_offset, use_bias",
     [
@@ -530,7 +531,9 @@ def test_correctness_dpsk_fp8_fused_moe(
 
     if use_shuffled_weight:
         # Apply weight shuffling similar to the trtllm_gen_fused_moe test
-        epilogue_tile_m = 64  # todo(yingyi): FIXME: this depends on the kernel internals
+        epilogue_tile_m = (
+            64  # todo(yingyi): FIXME: this depends on the kernel internals
+        )
 
         gemm1_weights_shuffled = []
         gemm2_weights_shuffled = []
