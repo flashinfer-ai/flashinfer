@@ -21,6 +21,7 @@ from typing import Callable, Dict, Iterable, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.version
+import pynvml
 from torch.torch_version import TorchVersion
 from torch.torch_version import __version__ as torch_version
 import inspect
@@ -253,6 +254,46 @@ def get_compute_capability(device: torch.device) -> Tuple[int, int]:
     if device.type != "cuda":
         raise ValueError("device must be a cuda device")
     return torch.cuda.get_device_capability(device.index)
+
+
+@functools.cache
+def get_gpu_memory_bandwidth(device: torch.device) -> float:
+    """
+    Get GPU memory bandwidth in GB/s for the specified CUDA device.
+
+    Args:
+        device: torch.device object, e.g., torch.device('cuda:0')
+
+    Returns:
+        float: GPU memory bandwidth (GB/s)
+
+    Raises:
+        ValueError: If device is not a CUDA device
+    """
+    # Convert to torch.device object if string is passed
+    if isinstance(device, str):
+        device = torch.device(device)
+
+    # Check if it's a CUDA device
+    if device.type != "cuda":
+        raise ValueError(f"Device must be a CUDA device, got {device}")
+
+    # Get device index
+    device_index = device.index if device.index is not None else 0
+
+    # Use pynvml to get bandwidth
+    pynvml.nvmlInit()
+    try:
+        handle = pynvml.nvmlDeviceGetHandleByIndex(device_index)
+        bus_width = pynvml.nvmlDeviceGetMemoryBusWidth(handle)
+        mem_clock = pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_MEM)
+
+        # Calculate theoretical peak bandwidth (GB/s)
+        bandwidth = (mem_clock * bus_width * 2) / 8 / 1000
+
+        return bandwidth
+    finally:
+        pynvml.nvmlShutdown()
 
 
 def _check_cached_qkv_data_type(
