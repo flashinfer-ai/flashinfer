@@ -1,7 +1,13 @@
 import pytest
 import torch
-from flashinfer.fused_moe import trtllm_fp8_block_scale_moe, WeightLayout
+from flashinfer import reorder_rows_for_gated_act_gemm, shuffle_matrix_a
+from flashinfer.fused_moe.core import convert_to_block_layout
 from flashinfer.autotuner import autotune
+from flashinfer.fused_moe import (
+    WeightLayout,
+    trtllm_fp8_block_scale_moe,
+    trtllm_fp8_per_tensor_scale_moe,
+)
 
 
 def run(
@@ -341,6 +347,7 @@ TUNE_MAX_NUM_TOKENS = 4096
 # -----------------------------
 # Test Entry
 # -----------------------------
+@pytest.mark.parametrize("test_tag", ["FP8BlockScaleMoe", "FP8PerTensorMoe"])
 @pytest.mark.parametrize(
     "seq_len, local_expert_offset, use_bias",
     [
@@ -399,28 +406,69 @@ TUNE_MAX_NUM_TOKENS = 4096
     ],
 )
 @pytest.mark.parametrize("enable_pdl", [True, False])
+@pytest.mark.parametrize(
+    "weight_processing",
+    [
+        pytest.param(
+            {
+                "use_shuffled_weight": False,
+                "layout": WeightLayout.MajorK,
+                "compatible_moe_impls": ["FP8BlockScaleMoe"],
+            },
+            id="NoShuffle_MajorK",
+        ),
+        pytest.param(
+            {
+                "use_shuffled_weight": True,
+                "layout": WeightLayout.MajorK,
+                "compatible_moe_impls": [
+                    "FP4Moe",
+                    "FP8PerTensorMoe",
+                    "FP8BlockScaleMoe",
+                ],
+            },
+            id="Shuffled_MajorK",
+        ),
+        pytest.param(
+            {
+                "use_shuffled_weight": True,
+                "layout": WeightLayout.BlockMajorK,
+                "compatible_moe_impls": ["FP8BlockScaleMoe"],
+            },
+            id="Shuffled_BlockMajorK",
+        ),
+    ],
+)
 def test_correctness_dpsk_fp8_fused_moe(
-    seq_len,
-    local_expert_offset,
-    use_bias,
-    intermediate_size,
-    routing_config,
-    enable_pdl,
+    test_tag: str,
+    seq_len: int,
+    local_expert_offset: int,
+    use_bias: bool,
+    intermediate_size: int,
+    routing_config: dict,
+    enable_pdl: bool,
+    weight_processing: dict,
     atol: float = 1e-1,
     rtol: float = 2e-1,
     percent: float = 0.85,
 ):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    if trtllm_fp8_block_scale_moe is None:
+        pytest.skip("flashinfer fused_moe kernel not available")
+
     compatible_intermediate_size = routing_config["compatible_intermediate_size"]
     if intermediate_size not in compatible_intermediate_size:
         pytest.skip(
             f"Intermediate size {intermediate_size} is not compatible with routing config {routing_config}"
         )
 
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA not available")
-
-    if trtllm_fp8_block_scale_moe is None:
-        pytest.skip("flashinfer fused_moe kernel not available")
+    compatible_moe_impls = weight_processing["compatible_moe_impls"]
+    if test_tag not in compatible_moe_impls:
+        pytest.skip(
+            f"Test {test_tag} is not compatible with weight processing {weight_processing}"
+        )
 
     device = "cuda"
     torch.manual_seed(42)
@@ -473,6 +521,40 @@ def test_correctness_dpsk_fp8_fused_moe(
         topk_group=TOPK_GROUP,
     )
 
+    # Prepare weights based on weight_processing configuration
+    use_shuffled_weight = weight_processing["use_shuffled_weight"]
+    weight_layout = weight_processing["layout"]
+
+    gemm1_weights = inputs["gemm1_weights"]
+    gemm2_weights = inputs["gemm2_weights"]
+
+    if use_shuffled_weight:
+        # Apply weight shuffling similar to the trtllm_gen_fused_moe test
+        epilogue_tile_m = 64  # todo(yingyi): FIXME: this depends on the kernel internals
+
+        gemm1_weights_shuffled = []
+        gemm2_weights_shuffled = []
+
+        for i in range(E_LOCAL):
+            # Shuffle weights for better performance
+            tmp_weights1 = shuffle_matrix_a(
+                gemm1_weights[i].view(torch.uint8), epilogue_tile_m
+            )
+            tmp_weights2 = shuffle_matrix_a(
+                gemm2_weights[i].view(torch.uint8), epilogue_tile_m
+            )
+
+            if weight_layout == WeightLayout.BlockMajorK:
+                block_k = 128
+                tmp_weights1 = convert_to_block_layout(tmp_weights1, block_k)
+                tmp_weights2 = convert_to_block_layout(tmp_weights2, block_k)
+
+            gemm1_weights_shuffled.append(tmp_weights1)
+            gemm2_weights_shuffled.append(tmp_weights2)
+
+        gemm1_weights = torch.stack(gemm1_weights_shuffled).view(torch.float8_e4m3fn)
+        gemm2_weights = torch.stack(gemm2_weights_shuffled).view(torch.float8_e4m3fn)
+
     # Run FlashInfer fused kernel
     with autotune(routing_config["enable_autotune"]):
         fi_out = trtllm_fp8_block_scale_moe(
@@ -480,9 +562,9 @@ def test_correctness_dpsk_fp8_fused_moe(
             inputs["routing_bias"],  # bf16
             inputs["hidden_states"],  # fp8
             inputs["hidden_states_scale"],  # [H/128, T]
-            inputs["gemm1_weights"],  # fp8
+            gemm1_weights,  # fp8 (potentially shuffled)
             inputs["gemm1_weights_scale"].to(torch.float32),
-            inputs["gemm2_weights"],  # fp8
+            gemm2_weights,  # fp8 (potentially shuffled)
             inputs["gemm2_weights_scale"].to(torch.float32),
             E_GLOBAL,
             TOP_K,
@@ -493,8 +575,8 @@ def test_correctness_dpsk_fp8_fused_moe(
             inputs["local_num_experts"],
             inputs["routed_scaling_factor"],
             routing_method_type=2,  # DeepSeek-styled
-            use_shuffled_weight=False,
-            weight_layout=WeightLayout.MajorK.value,
+            use_shuffled_weight=use_shuffled_weight,
+            weight_layout=weight_layout,
             enable_pdl=enable_pdl,
             tune_max_num_tokens=TUNE_MAX_NUM_TOKENS,
         )
