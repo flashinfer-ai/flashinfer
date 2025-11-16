@@ -116,27 +116,36 @@ namespace moe::dev {
     FLASHINFER_WARN("Unsupported dtypeElt");                                                      \
   }
 
-#define LAUNCH_EXPW(data, kernel, numBlocks, numThreads, smemSize, stream)                         \
-  if (data.mDtypeElt == tg::Dtype::Fp16 && data.mDtypeExpW == tg::Dtype::Fp32) {                   \
-    LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::half_t, float), kernel, numBlocks, numThreads,     \
-               smemSize, stream);                                                                  \
-  } else if (data.mDtypeElt == tg::Dtype::E4m3 && data.mDtypeExpW == tg::Dtype::Fp32) {            \
-    LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::float_e4m3_t, float), kernel, numBlocks,           \
-               numThreads, smemSize, stream);                                                      \
-  } else if (data.mDtypeElt == tg::Dtype::Bfloat16 && data.mDtypeExpW == tg::Dtype::Fp32) {        \
-    LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::bfloat16_t, float), kernel, numBlocks, numThreads, \
-               smemSize, stream);                                                                  \
-  } else if (data.mDtypeElt == tg::Dtype::Fp16 && data.mDtypeExpW == tg::Dtype::Bfloat16) {        \
-    LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::half_t, cutlass::bfloat16_t), kernel, numBlocks,   \
-               numThreads, smemSize, stream);                                                      \
-  } else if (data.mDtypeElt == tg::Dtype::E4m3 && data.mDtypeExpW == tg::Dtype::Bfloat16) {        \
-    LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::float_e4m3_t, cutlass::bfloat16_t), kernel,        \
-               numBlocks, numThreads, smemSize, stream);                                           \
-  } else if (data.mDtypeElt == tg::Dtype::Bfloat16 && data.mDtypeExpW == tg::Dtype::Bfloat16) {    \
-    LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::bfloat16_t, cutlass::bfloat16_t), kernel,          \
-               numBlocks, numThreads, smemSize, stream);                                           \
-  } else {                                                                                         \
-    FLASHINFER_WARN("Unsupported pair");                                                           \
+#define LAUNCH_EXPW(data, kernel, topK, numBlocks, numThreads, smemSize, stream)                  \
+  if (data.mDtypeElt == tg::Dtype::Fp16 && data.mDtypeExpW == tg::Dtype::Fp32) {                  \
+    LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::half_t, float, topK), kernel, numBlocks,          \
+               numThreads, smemSize, stream);                                                     \
+  } else if (data.mDtypeElt == tg::Dtype::E4m3 && data.mDtypeExpW == tg::Dtype::Fp32) {           \
+    LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::float_e4m3_t, float, topK), kernel, numBlocks,    \
+               numThreads, smemSize, stream);                                                     \
+  } else if (data.mDtypeElt == tg::Dtype::Bfloat16 && data.mDtypeExpW == tg::Dtype::Fp32) {       \
+    LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::bfloat16_t, float, topK), kernel, numBlocks,      \
+               numThreads, smemSize, stream);                                                     \
+  } else if (data.mDtypeElt == tg::Dtype::Fp16 && data.mDtypeExpW == tg::Dtype::Bfloat16) {       \
+    LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::half_t, cutlass::bfloat16_t, topK), kernel,       \
+               numBlocks, numThreads, smemSize, stream);                                          \
+  } else if (data.mDtypeElt == tg::Dtype::E4m3 && data.mDtypeExpW == tg::Dtype::Bfloat16) {       \
+    LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::float_e4m3_t, cutlass::bfloat16_t, topK), kernel, \
+               numBlocks, numThreads, smemSize, stream);                                          \
+  } else if (data.mDtypeElt == tg::Dtype::Bfloat16 && data.mDtypeExpW == tg::Dtype::Bfloat16) {   \
+    LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::bfloat16_t, cutlass::bfloat16_t, topK), kernel,   \
+               numBlocks, numThreads, smemSize, stream);                                          \
+  } else {                                                                                        \
+    FLASHINFER_WARN("Unsupported pair");                                                          \
+  }
+
+#define LAUNCH_TOPK_EXPW(data, kernel, numBlocks, numThreads, smemSize, stream) \
+  if (data.topK % 4 == 0) {                                                     \
+    LAUNCH_EXPW(data, kernel, 4, numBlocks, numThreads, smemSize, stream);      \
+  } else if (data.topK % 2 == 0) {                                              \
+    LAUNCH_EXPW(data, kernel, 2, numBlocks, numThreads, smemSize, stream);      \
+  } else {                                                                      \
+    LAUNCH_EXPW(data, kernel, 1, numBlocks, numThreads, smemSize, stream);      \
   }
 
 #define LAUNCH_TILEN(data, coopLaunch, types, kernel, numBlocks, numThreads, smemSize, stream)     \
@@ -453,10 +462,11 @@ struct Data {
   int32_t const* totalNumPaddedTokens;
 };
 
-template <typename Type_, typename TypeExpW_, bool UsePdl_>
+template <typename Type_, typename TypeExpW_, int TopKUnrollFactor_, bool UsePdl_>
 struct KernelParams {
   using Type = Type_;
   using TypeExpW = TypeExpW_;
+  static constexpr int TopKUnrollFactor = TopKUnrollFactor_;
   static constexpr bool UsePdl = UsePdl_;
 
   Type const* inPtr;

@@ -122,7 +122,7 @@ def get_trtllm_mnnvl_comm_module():
 
 
 def get_allreduce_mnnvl_workspace(
-    mapping: Mapping, dtype: torch.dtype
+    mapping: Mapping, dtype: torch.dtype, buffer_size_in_bytes: Optional[int] = None
 ) -> Tuple[McastGPUBuffer, torch.Tensor, int]:
     """Get workspace buffers needed for multi-node NVLink all-reduce operation.
 
@@ -138,6 +138,7 @@ def get_allreduce_mnnvl_workspace(
     Args:
         mapping: Tensor parallel mapping configuration containing rank info
         dtype: Data type of the tensors being reduced
+        buffer_size_in_bytes: Optional buffer size. Practically, assign this to 3 * 2 * dtype.itemsize * hidden_dim * max_tokens
 
     Returns:
         Tuple containing:
@@ -152,7 +153,9 @@ def get_allreduce_mnnvl_workspace(
     # LCM for hidden_dim: 2048, 4096, 5120, 7168, 8192 = 286720
     # max_num_elements must be a multiple of 286720
     lcm_hidden_dim = 286720
-    TARGET_WORKSPACE_SIZE_BYTES = 12_000_000
+    TARGET_WORKSPACE_SIZE_BYTES = (
+        buffer_size_in_bytes if buffer_size_in_bytes is not None else 12_000_000
+    )
     buffer_size_in_bytes = math.ceil(
         TARGET_WORKSPACE_SIZE_BYTES / (lcm_hidden_dim * stride)
     ) * (lcm_hidden_dim * stride)
@@ -223,6 +226,17 @@ def trtllm_mnnvl_all_reduce(
         [Optional] out: Output tensor to store the result (required if wait_for_results is True)
 
     """
+
+    if len(inp.shape) != 2:
+        raise ValueError(
+            f"The input tensor must be 2D, got {len(inp.shape)}D. The shape is {inp.shape}."
+        )
+
+    if inp.shape[0] > buffer_M:
+        raise ValueError(
+            f"The number of tokens in the input tensor {inp.shape[0]} is greater than the buffer_M {buffer_M}. This is not supported. Please increase the workspace size, or decrease the amount of tokens to at most {buffer_M}."
+        )
+
     module = get_trtllm_mnnvl_comm_module()
     module.trtllm_mnnvl_all_reduce(
         inp,

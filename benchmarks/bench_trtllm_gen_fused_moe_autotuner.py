@@ -114,7 +114,6 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
             0,  # local_expert_offset
             num_experts,
             2.5,  # routed_scaling_factor
-            None,  # tile_tokens_dim
             RoutingMethodType.DeepSeekV3.value,
             True,  # use_shuffled_weight
             WeightLayout.BlockMajorK.value,  # weight_layout
@@ -142,7 +141,6 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
             num_experts,
             1.0,  # routed_scaling_factor
             False,  # use_routing_scales_on_input
-            None,  # tile_tokens_dim
             RoutingMethodType.TopK.value,
             enable_pdl,
             num_tokens if tune_max_num_tokens is None else tune_max_num_tokens,
@@ -287,7 +285,6 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
         0,  # local_expert_offset
         num_experts,
         None,  # routed_scaling_factor
-        None,  # tile_tokens_dim
         RoutingMethodType.Renormalize.value,
         True,
         enable_pdl,
