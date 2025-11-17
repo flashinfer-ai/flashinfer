@@ -377,6 +377,7 @@ namespace flashinfer::trtllm_dsv3_fused_routing {
                     reinterpret_cast<half*>(topk_values.data_ptr()),
                     reinterpret_cast<int32_t*>(topk_indices.data_ptr()), num_tokens, num_experts, n_group,
                     topk_group, topk, routed_scaling_factor, launch_with_pdl, stream);
+                break;
             default: throw std::invalid_argument("Invalid bias dtype, only supports float16, float32, and bfloat16"); break;
             }
             break;
