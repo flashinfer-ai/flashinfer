@@ -235,7 +235,7 @@ class Compiler {
     return instance;
   }
 
-  [[nodiscard]] bool isValid() const { return !includeDirs_.empty(); }
+  [[nodiscard]] bool isValid() const { return !getJitIncludeDirs().empty(); }
 
   // Set include directories before the singleton is initialized
   static void setIncludeDirs(std::vector<std::filesystem::path> const& dirs) {
@@ -313,7 +313,7 @@ class Compiler {
       std::filesystem::create_directories(path);
     }
 
-    for (auto const& dir : includeDirs_) {
+    for (auto const& dir : getJitIncludeDirs()) {
       flags.push_back("-I" + dir.string());
     }
 
@@ -469,10 +469,8 @@ class Compiler {
   }
 
  private:
-  std::vector<std::filesystem::path> includeDirs_;
-
   // Private constructor for singleton pattern
-  Compiler() : includeDirs_(getJitIncludeDirs()) {
+  Compiler() {
     // Create necessary directories
     if (kJitUseNvcc || kJitDumpCubin) {
       std::filesystem::create_directories(getTmpDir());
