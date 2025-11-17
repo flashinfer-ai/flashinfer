@@ -41,7 +41,7 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
 
 from flashinfer.utils import get_compute_capability
-from .utils import get_cutlass_dtype, cutlass_to_torch_dtype, get_num_sm, make_ptr
+from .utils import get_cutlass_dtype, cutlass_to_torch_dtype, make_ptr
 
 
 """
@@ -2661,7 +2661,6 @@ class BlockwiseGemmCuteDSL:
         use_2cta_instrs: bool,
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
-        sm_version: str,
     ):
         self._m = m
         self._n = n
@@ -2701,7 +2700,6 @@ class BlockwiseGemmCuteDSL:
         self._max_active_clusters = hardware_info.get_max_active_clusters(
             self._cluster_shape_mn[0] * self._cluster_shape_mn[1]
         )
-        self._sm_version = sm_version
 
     @cute.jit
     def __call__(
@@ -2781,7 +2779,6 @@ def get_cute_dsl_compiled_blockwise_gemm_kernel(
     use_2cta_instrs: bool,
     mma_tiler_mn: Tuple[int, int],
     cluster_shape_mn: Tuple[int, int],
-    sm_version: str,
 ) -> Callable:
     def get_cute_pointers(
         input_tensors: Optional[List[torch.tensor]],
@@ -2865,7 +2862,6 @@ def get_cute_dsl_compiled_blockwise_gemm_kernel(
             use_2cta_instrs=use_2cta_instrs,
             mma_tiler_mn=mma_tiler_mn,
             cluster_shape_mn=cluster_shape_mn,
-            sm_version=sm_version,
         ),
         *get_cute_pointers(None),
         cutlass_torch.current_stream(),
@@ -2916,7 +2912,6 @@ def blockwise_gemm(
     sf_dtype: str,
     c_dtype: str,
     acc_dtype: str,
-    sm_count: Optional[int] = None,
     **kwargs,
 ):
     if len(a_torch.shape) == 3 and len(b_torch.shape) == 3:
@@ -2929,8 +2924,6 @@ def blockwise_gemm(
 
     mma_tiler_mn = kwargs.pop("mma_tiler_mn", (128, 128))
     cluster_shape_mn = kwargs.pop("cluster_shape_mn", (1, 1))
-    if sm_count is None:
-        sm_count = get_num_sm(a_torch.device)
     use_2cta_instrs = kwargs.pop("use_2cta_instrs", False)
     assert len(kwargs) == 0, f"Unsupported kwargs: {kwargs}"
 
@@ -2953,8 +2946,6 @@ def blockwise_gemm(
         use_2cta_instrs=use_2cta_instrs,
         mma_tiler_mn=mma_tiler_mn,
         cluster_shape_mn=cluster_shape_mn,
-        sm_count=sm_count,
-        sm_version=f"sm_{major}{minor}",
     )(
         a_tensor_gpu=a_torch,
         b_tensor_gpu=b_torch,

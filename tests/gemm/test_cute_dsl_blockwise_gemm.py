@@ -9,7 +9,6 @@ import torch
 from flashinfer.cute_dsl.blockwise_gemm import BlockwiseGemmKernel, blockwise_gemm
 from flashinfer.cute_dsl.utils import (
     get_cutlass_dtype,
-    get_num_sm,
     is_cute_dsl_available,
 )
 
@@ -135,8 +134,6 @@ def test_blockwise_gemm_python_interface(
     l, m = lm
     k, n = kn
 
-    sm_count = get_num_sm(device)
-
     print(f"device: {device}")
 
     if not BlockwiseGemmKernel.can_implement(
@@ -189,7 +186,6 @@ def test_blockwise_gemm_python_interface(
             sf_dtype=sf_dtype,
             c_dtype=c_dtype,
             acc_dtype=acc_dtype,
-            sm_count=sm_count,
             mma_tiler_mn=mma_tiler_mn,
             cluster_shape_mn=cluster_shape_mn,
             use_2cta_instrs=use_2cta_instrs,
