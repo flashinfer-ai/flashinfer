@@ -467,8 +467,8 @@ def gen_single_decode_module(
         dtype_o,
         head_dim_qk,
         head_dim_vo,
-        ["maybe_alibi_slopes"],  # additional_tensor_names
-        ["float"],  # additional_tensor_dtypes
+        ["maybe_alibi_slopes", "maybe_s_aux"],  # additional_tensor_names
+        ["float", "float"],  # additional_tensor_dtypes
         [
             "logits_soft_cap",
             "sm_scale",
@@ -516,7 +516,11 @@ def gen_single_prefill_module(
 
     if backend == "fa2":
         assert not fp8_enabled, "fp8 tensor core is not supported in fa2 backend"
-        additional_tensor_names = ["maybe_custom_mask", "maybe_alibi_slopes", "maybe_s_aux"]
+        additional_tensor_names = [
+            "maybe_custom_mask",
+            "maybe_alibi_slopes",
+            "maybe_s_aux",
+        ]
         additional_tensor_dtypes = ["uint8_t", "float", "float"]
         additional_scalar_names = [
             "logits_soft_cap",

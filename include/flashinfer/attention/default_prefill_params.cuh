@@ -88,8 +88,7 @@ struct SinglePrefillParams {
         partition_kv(false) {}
 
   __host__ SinglePrefillParams(DTypeQ* q, DTypeKV* k, DTypeKV* v, uint8_t* maybe_custom_mask,
-                               DTypeO* o, float* lse, float* maybe_alibi_slopes,
-                               float* maybe_s_aux,
+                               DTypeO* o, float* lse, float* maybe_alibi_slopes, float* maybe_s_aux,
                                uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t qo_len,
                                uint32_t kv_len, uint32_t q_stride_n, uint32_t q_stride_h,
                                uint32_t kv_stride_n, uint32_t kv_stride_h, uint32_t head_dim,
@@ -230,10 +229,9 @@ struct BatchPrefillRaggedParams {
                                     IdType* q_indptr, IdType* kv_indptr, IdType* maybe_mask_indptr,
                                     IdType* maybe_q_rope_offset, IdType* maybe_k_rope_offset,
                                     DTypeO* o, float* lse, float* maybe_alibi_slopes,
-                                    float* maybe_s_aux,
-                                    uint32_t num_qo_heads, uint32_t num_kv_heads,
-                                    uint32_t q_stride_n, uint32_t q_stride_h, uint32_t kv_stride_n,
-                                    uint32_t kv_stride_h, int32_t window_left,
+                                    float* maybe_s_aux, uint32_t num_qo_heads,
+                                    uint32_t num_kv_heads, uint32_t q_stride_n, uint32_t q_stride_h,
+                                    uint32_t kv_stride_n, uint32_t kv_stride_h, int32_t window_left,
                                     float logits_soft_cap, float sm_scale, float rope_scale,
                                     float rope_theta)
       : q(q),
@@ -371,10 +369,9 @@ struct BatchPrefillPagedParams {
                                    uint8_t* maybe_custom_mask, IdType* q_indptr,
                                    IdType* maybe_mask_indptr, IdType* maybe_q_rope_offset,
                                    DTypeO* o, float* lse, float* maybe_alibi_slopes,
-                                   float* maybe_s_aux,
-                                   uint32_t num_qo_heads, IdType q_stride_n, IdType q_stride_h,
-                                   int32_t window_left, float logits_soft_cap, float sm_scale,
-                                   float rope_scale, float rope_theta)
+                                   float* maybe_s_aux, uint32_t num_qo_heads, IdType q_stride_n,
+                                   IdType q_stride_h, int32_t window_left, float logits_soft_cap,
+                                   float sm_scale, float rope_scale, float rope_theta)
       : q(q),
         paged_kv(paged_kv),
         maybe_custom_mask(maybe_custom_mask),

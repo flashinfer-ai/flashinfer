@@ -386,8 +386,12 @@ def test_single_decode_sink_attention_tensor_cores(
         k_cache_ref = k.unsqueeze(0)  # [1, kv_len, num_kv_heads, head_dim]
         v_cache_ref = v.unsqueeze(0)  # [1, kv_len, num_kv_heads, head_dim]
     else:  # HND -> transpose to NHD
-        k_cache_ref = k.transpose(0, 1).unsqueeze(0)  # [1, kv_len, num_kv_heads, head_dim]
-        v_cache_ref = v.transpose(0, 1).unsqueeze(0)  # [1, kv_len, num_kv_heads, head_dim]
+        k_cache_ref = k.transpose(0, 1).unsqueeze(
+            0
+        )  # [1, kv_len, num_kv_heads, head_dim]
+        v_cache_ref = v.transpose(0, 1).unsqueeze(
+            0
+        )  # [1, kv_len, num_kv_heads, head_dim]
 
     # Compute reference output
     out_ref = sink_attention_decode_ref(
