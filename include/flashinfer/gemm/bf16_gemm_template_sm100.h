@@ -151,25 +151,31 @@ size_t genericBf16GemmKernelLauncherSm100(__nv_bfloat16 const* A, __nv_bfloat16 
 
   Gemm gemm;
 
-  CUTLASS_CHECK(gemm.can_implement(arguments));
+  // Return workspace size
+  if (!A && !B && !D) {
+    return gemm.get_workspace_size(arguments);
+  }
 
-  size_t workspace_size = gemm.get_workspace_size(arguments);
-  if (workspace_size > workspaceBytes) {
+  if (gemm.get_workspace_size(arguments) > workspaceBytes) {
     throw std::runtime_error("[Bf16 Gemm Runner] insufficient workspace");
   }
 
-  // NOTE: These can also be simplified using CUTLASS_CHECK. Same goes for some of the other files.
-  cutlass::Status initStatus = gemm.initialize(arguments, workspacePtr, stream);
+  auto can_implement = gemm.can_implement(arguments);
+  if (can_implement != cutlass::Status::kSuccess) {
+    throw std::runtime_error("[Bf16 Gemm Runner] cutlass kernel not implemented given the params");
+  }
+
+  auto initStatus = gemm.initialize(arguments, workspacePtr);
   if (initStatus != cutlass::Status::kSuccess) {
     throw std::runtime_error("[Bf16 Gemm Runner] failed to initialize");
   }
 
-  cutlass::Status runStatus = gemm.run(stream);
+  auto runStatus = gemm.run(stream);
   if (runStatus != cutlass::Status::kSuccess) {
     throw std::runtime_error("[Bf16 Gemm Runner] failed to run");
   }
 
-  return workspace_size;
+  return gemm.get_workspace_size(arguments);
 }
 
 }  // namespace gemm

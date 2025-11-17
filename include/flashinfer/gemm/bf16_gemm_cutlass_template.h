@@ -64,26 +64,26 @@ size_t dispatchGemmClusterShapeSm100(__nv_bfloat16 const* A, __nv_bfloat16 const
                                                 _1SM>(A, B, D, m, n, k, b, gemmConfig, workspacePtr,
                                                       workspaceBytes, stream);
       break;
-    // case ClusterShape::ClusterShape_1x2x1:
-    //   return genericBf16GemmKernelLauncherSm100<T, arch, CTA_M_, CTA_N_, CTA_K_,
-    //                                             Shape<_1, _2, _1>, _1SM>(
-    //     A, B, D, m, n, k, b, gemmConfig, workspacePtr, workspaceBytes, stream);
-    //   break;
-    // case ClusterShape::ClusterShape_1x4x1:
-    //   return genericBf16GemmKernelLauncherSm100<T, arch, CTA_M_, CTA_N_, CTA_K_,
-    //                                             Shape<_1, _4, _1>, _1SM>(
-    //     A, B, D, m, n, k, b, gemmConfig, workspacePtr, workspaceBytes, stream);
-    //   break;
-    // case ClusterShape::ClusterShape_2x1x1:
-    //   return genericBf16GemmKernelLauncherSm100<T, arch, CTA_M_, CTA_N_, CTA_K_,
-    //                                             Shape<_2, _1, _1>, _2SM>(
-    //     A, B, D, m, n, k, b, gemmConfig, workspacePtr, workspaceBytes, stream);
-    //   break;
-    // case ClusterShape::ClusterShape_2x2x1:
-    //   return genericBf16GemmKernelLauncherSm100<T, arch, CTA_M_, CTA_N_, CTA_K_,
-    //                                             Shape<_2, _2, _1>, _2SM>(
-    //     A, B, D, m, n, k, b, gemmConfig, workspacePtr, workspaceBytes, stream);
-    //   break;
+    case ClusterShape::ClusterShape_1x2x1:
+      return genericBf16GemmKernelLauncherSm100<T, arch, CTA_M_, CTA_N_, CTA_K_, Shape<_1, _2, _1>,
+                                                _1SM>(A, B, D, m, n, k, b, gemmConfig, workspacePtr,
+                                                      workspaceBytes, stream);
+      break;
+    case ClusterShape::ClusterShape_1x4x1:
+      return genericBf16GemmKernelLauncherSm100<T, arch, CTA_M_, CTA_N_, CTA_K_, Shape<_1, _4, _1>,
+                                                _1SM>(A, B, D, m, n, k, b, gemmConfig, workspacePtr,
+                                                      workspaceBytes, stream);
+      break;
+    case ClusterShape::ClusterShape_2x1x1:
+      return genericBf16GemmKernelLauncherSm100<T, arch, CTA_M_, CTA_N_, CTA_K_, Shape<_2, _1, _1>,
+                                                _2SM>(A, B, D, m, n, k, b, gemmConfig, workspacePtr,
+                                                      workspaceBytes, stream);
+      break;
+    case ClusterShape::ClusterShape_2x2x1:
+      return genericBf16GemmKernelLauncherSm100<T, arch, CTA_M_, CTA_N_, CTA_K_, Shape<_2, _2, _1>,
+                                                _2SM>(A, B, D, m, n, k, b, gemmConfig, workspacePtr,
+                                                      workspaceBytes, stream);
+      break;
     default:
       throw std::runtime_error("invalid config for bf16 gemm");
       break;
@@ -101,31 +101,22 @@ size_t dispatchToArch(__nv_bfloat16 const* A, __nv_bfloat16 const* B, void* D, i
       return dispatchGemmClusterShapeSm100<T, arch, 64, 64, 128>(
           B, A, static_cast<T*>(D), n, m, k, b, gemmConfig, workspacePtr, workspaceBytes, stream);
       break;
-      // case CutlassTileConfigSM100::CtaShape64x128x128B:
-      //  return dispatchGemmClusterShapeSm100<T, arch, 64, 128, 128>(
-      //      B, A, static_cast<T*>(D), n, m, k, b, gemmConfig, workspacePtr, workspaceBytes,
-      //      stream);
-      //  break;
-      // case CutlassTileConfigSM100::CtaShape64x256x128B:
-      //  return dispatchGemmClusterShapeSm100<T, arch, 64, 256, 128>(
-      //      B, A, static_cast<T*>(D), n, m, k, b, gemmConfig, workspacePtr, workspaceBytes,
-      //      stream);
-      //  break;
-      // case CutlassTileConfigSM100::CtaShape128x64x128B:
-      //  return dispatchGemmClusterShapeSm100<T, arch, 128, 64, 128>(
-      //      B, A, static_cast<T*>(D), n, m, k, b, gemmConfig, workspacePtr, workspaceBytes,
-      //      stream);
-      //  break;
-      // case CutlassTileConfigSM100::CtaShape128x128x128B:
-      //  return dispatchGemmClusterShapeSm100<T, arch, 128, 128, 128>(
-      //      B, A, static_cast<T*>(D), n, m, k, b, gemmConfig, workspacePtr, workspaceBytes,
-      //      stream);
-      //  break;
-      // case CutlassTileConfigSM100::CtaShape128x256x128B:
-      //  return dispatchGemmClusterShapeSm100<T, arch, 128, 256, 128>(
-      //      B, A, static_cast<T*>(D), n, m, k, b, gemmConfig, workspacePtr, workspaceBytes,
-      //      stream);
-      //  break;
+    case CutlassTileConfigSM100::CtaShape64x128x128B:
+      return dispatchGemmClusterShapeSm100<T, arch, 64, 128, 128>(
+          B, A, static_cast<T*>(D), n, m, k, b, gemmConfig, workspacePtr, workspaceBytes, stream);
+      break;
+    case CutlassTileConfigSM100::CtaShape64x256x128B:
+      return dispatchGemmClusterShapeSm100<T, arch, 64, 256, 128>(
+          B, A, static_cast<T*>(D), n, m, k, b, gemmConfig, workspacePtr, workspaceBytes, stream);
+      break;
+    case CutlassTileConfigSM100::CtaShape128x64x128B:
+      return dispatchGemmClusterShapeSm100<T, arch, 128, 64, 128>(
+          B, A, static_cast<T*>(D), n, m, k, b, gemmConfig, workspacePtr, workspaceBytes, stream);
+      break;
+    case CutlassTileConfigSM100::CtaShape128x128x128B:
+      return dispatchGemmClusterShapeSm100<T, arch, 128, 128, 128>(
+          B, A, static_cast<T*>(D), n, m, k, b, gemmConfig, workspacePtr, workspaceBytes, stream);
+      break;
 
     default:
       throw std::runtime_error("unsupported tile config for bf16 gemm");
@@ -189,15 +180,15 @@ std::vector<CutlassGemmConfig> CutlassBf16GemmRunner<T>::getConfigs() const {
   std::vector<CutlassGemmConfig> candidate_configs;
 
   std::vector<CutlassTileConfigSM100> tilesSm100 = {
-      CutlassTileConfigSM100::CtaShape64x64x128B,  // CutlassTileConfigSM100::CtaShape64x128x128B,
-      // CutlassTileConfigSM100::CtaShape64x256x128B,  CutlassTileConfigSM100::CtaShape128x64x128B,
-      // CutlassTileConfigSM100::CtaShape128x128x128B, CutlassTileConfigSM100::CtaShape128x256x128B,
+      CutlassTileConfigSM100::CtaShape64x64x128B,   CutlassTileConfigSM100::CtaShape64x128x128B,
+      CutlassTileConfigSM100::CtaShape64x256x128B,  CutlassTileConfigSM100::CtaShape128x64x128B,
+      CutlassTileConfigSM100::CtaShape128x128x128B,
   };
 
   std::vector<ClusterShape> clusterShapes = {
-      ClusterShape::ClusterShape_1x1x1,  // ClusterShape::ClusterShape_1x2x1,
-      // ClusterShape::ClusterShape_1x4x1, ClusterShape::ClusterShape_2x1x1,
-      // ClusterShape::ClusterShape_2x2x1,
+      ClusterShape::ClusterShape_1x1x1, ClusterShape::ClusterShape_1x2x1,
+      ClusterShape::ClusterShape_1x4x1, ClusterShape::ClusterShape_2x1x1,
+      ClusterShape::ClusterShape_2x2x1,
   };
 
   for (auto const& tile_config : tilesSm100) {

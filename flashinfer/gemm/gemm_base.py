@@ -214,7 +214,18 @@ def mm_bf16(
     torch.Tensor
         Out tensor, shape (m, n), bf16 or fp16.
 
-    # Note: add Examples section here
+    Examples
+    --------
+    >>> import torch
+    >>> import torch.nn.functional as F
+    >>> import flashinfer
+    >>> input = torch.randn([48, 64], device="cuda", dtype=torch.bfloat16
+    >>> weight = torch.randn([80, 64], device="cuda", dtype=torch.bfloat16).transpose(-2, -1)
+    >>> out = flashinfer.mm_bf16(input, weight)
+    >>> print(out.shape)
+    torch.Size([48, 80])
+    >>> out.dtype
+    torch.bfloat16
     """
     if backend != "cutlass":
         raise ValueError(f"Unsupported backend: {backend}. Only cutlass is available.")
@@ -280,7 +291,18 @@ def bmm_bf16(
     torch.Tensor
         Out tensor, shape (b, m, n), bf16 or fp16.
 
-    # Note: add Examples section here
+    Examples
+    --------
+    >>> import torch
+    >>> import torch.nn.functional as F
+    >>> import flashinfer
+    >>> input = torch.randn([16, 48, 64], device="cuda", dtype=torch.bfloat16
+    >>> weight = torch.randn([16, 80, 64], device="cuda", dtype=torch.bfloat16).transpose(-2, -1)
+    >>> out = flashinfer.bmm_bf16(input, weight)
+    >>> print(out.shape)
+    torch.Size([16, 48, 80])
+    >>> out.dtype
+    torch.bfloat16
     """
     if backend != "cutlass":
         raise ValueError(f"Unsupported backend: {backend}. Only cutlass is available.")
