@@ -80,7 +80,7 @@ def test_fp8_blockscale_gemm_swapab(m, n, k, input_dtype, weight_dtype):
     assert output.shape == (m, n), f"Expected shape {(m, n)}, got {output.shape}"
     assert output.dtype == torch.bfloat16, f"Expected BF16 output, got {output.dtype}"
     
-    # Check correctness using cosine similarity
+    # Check correctness
     cos_sim = F.cosine_similarity(
         reference.flatten().float(), 
         output.flatten().float(), 
@@ -136,8 +136,6 @@ def test_fp8_blockscale_gemm_dtypes(m, n, k, input_dtype, weight_dtype):
         input_tensor, input_scale = input_bf16, None
     
     # Quantize weight 
-    # Note: Use per_token_cast_to_fp8 for weights too (1x128 blocks)
-    # This gives the correct scale shape (N, K//128)
     if weight_dtype == torch.float8_e4m3fn:
         weight_tensor, weight_scale = per_token_cast_to_fp8(weight_bf16)
     else:
@@ -155,7 +153,7 @@ def test_fp8_blockscale_gemm_dtypes(m, n, k, input_dtype, weight_dtype):
     assert output.shape == (m, n), f"Expected shape {(m, n)}, got {output.shape}"
     assert output.dtype == torch.bfloat16, f"Expected BF16 output, got {output.dtype}"
     
-    # Check correctness using cosine similarity
+    # Check correctness
     cos_sim = F.cosine_similarity(
         reference.flatten().float(),
         output.flatten().float(),
@@ -188,14 +186,14 @@ def test_fp8_blockscale_gemm_per_block_weight_scales():
         pytest.skip("FP8 block-scale GEMM requires SM90a (Hopper) support")
     
     device = "cuda"
-    m, n, k = 16, 512, 512  # N and K must be divisible by 128 for per-block
+    m, n, k = 16, 512, 512  
     torch.manual_seed(42)
     
-    # Create BF16 data
+    # Create inputs
     input_bf16 = torch.randn(m, k, device=device, dtype=torch.bfloat16)
     weight_bf16 = torch.randn(n, k, device=device, dtype=torch.bfloat16)
     
-    # Quantize weight with per-block (128x128) blocks -> (N//128, K//128)
+    # Quantize weight with per-block (128x128) blocks 
     weight_fp8, weight_scale = per_block_cast_to_fp8(weight_bf16)
     
     # Verify scale shape
@@ -301,7 +299,7 @@ def test_fp8_blockscale_gemm_error_handling():
     with pytest.raises(ValueError):
         fp8_blockscale_gemm_swapab(input_fp8, weight, input_scale=wrong_scale)
     
-    # Test: FP8 input + BF16 weight is NOT supported (missing kernel implementation)
+    # Test: FP8 input + BF16 weight is NOT supported 
     input_bf16 = torch.randn(m, k, device=device, dtype=torch.bfloat16)
     input_fp8, input_scale = per_token_cast_to_fp8(input_bf16)
     weight = torch.randn(n, k, device=device, dtype=torch.bfloat16)

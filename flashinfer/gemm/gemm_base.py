@@ -3114,10 +3114,9 @@ def batch_deepgemm_fp8_nt_groupwise(
     return out
 
 @functools.cache
-def get_fp8_blockscale_gemm_runner():
+def get_fp8_blockscale_gemm_runner_sm90():
     """Get the FP8 block scale GEMM runner module for SM90."""
-    module = gen_fp8_blockscale_gemm_sm90_module().build_and_load()
-    return module.init()
+    return gen_fp8_blockscale_gemm_sm90_module().build_and_load().init()
 
 
 def fp8_blockscale_gemm_swapab(
@@ -3133,17 +3132,11 @@ def fp8_blockscale_gemm_swapab(
     This function automatically selects between normal and swapAB kernel based on
     the M dimension. For small M (< 32), it uses the swapAB kernel for
     better performance.
-    The computation is: output = input @ weight.T with per-block FP8 quantization
-    and scaling.
     
     Supported Dtype Combinations
     -----------------------------
     - **BF16 + BF16 → BF16**: Both inputs BF16, internal quantization (no scales needed)
     - **BF16 + FP8 → BF16**: BF16 input, FP8 weight
-    
-    Note: 
-    - FP16 is NOT supported. 
-    - FP8 + BF16 is NOT supported (missing kernel implementation)
     
     Parameters
     ----------
@@ -3155,12 +3148,8 @@ def fp8_blockscale_gemm_swapab(
         - FP8 (torch.float8_e4m3fn) with weight_scale required 
         - BF16 (torch.bfloat16) for internal quantization 
     input_scale : torch.Tensor, optional
-        Not used. Input is always BF16 with internal quantization.
     weight_scale : torch.Tensor, optional
         Scaling factors for weight. Required if weight is FP8.
-        Supports TWO granularities:
-        - Per-token (1x128 blocks): shape (N, K // 128)
-        - Per-block (128x128 blocks): shape (N // 128, K // 128)
     out : torch.Tensor, optional
         Output tensor of shape (M, N). If None, will be allocated.
     out_dtype : torch.dtype, optional
@@ -3223,7 +3212,6 @@ def fp8_blockscale_gemm_swapab(
     if weight.ndim != 2:
         raise ValueError(f"Weight must be 2D (N, K), got shape {weight.shape}")
     
-    # Get dimensions
     M, K = input.shape
     N, K_weight = weight.shape
     
@@ -3237,13 +3225,6 @@ def fp8_blockscale_gemm_swapab(
     if K % BLOCK_SIZE != 0:
         raise ValueError(
             f"K dimension must be divisible by block size ({BLOCK_SIZE}), got K={K}"
-        )
-    
-    # Validate device consistency
-    if input.device != weight.device:
-        raise ValueError(
-            f"Input and weight must be on the same device. "
-            f"Got input: {input.device}, weight: {weight.device}"
         )
     
     # Validate dtype combinations
@@ -3263,9 +3244,7 @@ def fp8_blockscale_gemm_swapab(
         if input_scale is None:
             raise ValueError(
                 "input_scale is required when input is FP8. "
-                "For BF16 inputs, omit input_scale for internal quantization."
             )
-        # Validate scale shape: (M, K // BLOCK_SIZE)
         expected_scale_shape = (M, K // BLOCK_SIZE)
         if input_scale.shape != expected_scale_shape:
             raise ValueError(
@@ -3297,9 +3276,7 @@ def fp8_blockscale_gemm_swapab(
         if weight_scale is None:
             raise ValueError(
                 "weight_scale is required when weight is FP8. "
-                "For BF16 weights, omit weight_scale for internal quantization."
             )
-        # Validate scale shape: supports (N, K // BLOCK_SIZE) or (N // BLOCK_SIZE, K // BLOCK_SIZE)
         expected_per_token_shape = (N, K // BLOCK_SIZE)
         expected_per_block_shape = ((N + BLOCK_SIZE - 1) // BLOCK_SIZE, K // BLOCK_SIZE)
         is_per_token = weight_scale.shape == expected_per_token_shape
@@ -3314,11 +3291,6 @@ def fp8_blockscale_gemm_swapab(
         if weight_scale.dtype != torch.float32:
             raise ValueError(
                 f"weight_scale must be float32, got {weight_scale.dtype}"
-            )
-        if weight_scale.device != weight.device:
-            raise ValueError(
-                f"weight_scale device mismatch. Expected {weight.device}, "
-                f"got {weight_scale.device}"
             )
     else:
         if not weight_is_bf16:
@@ -3357,7 +3329,7 @@ def fp8_blockscale_gemm_swapab(
         out = torch.empty(M, N, dtype=out_dtype, device=input.device)
 
     # Get the runner
-    runner = get_fp8_blockscale_gemm_runner()
+    runner = get_fp8_blockscale_gemm_runner_sm90()
 
     # Allocate workspace 
     workspace_size = runner.get_workspace_size(M, N, K)
