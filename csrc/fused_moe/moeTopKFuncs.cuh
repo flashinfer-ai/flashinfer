@@ -23,14 +23,14 @@
 
 #include <cub/cub.cuh>
 
-#include "tensorrt_llm/kernels/archCondition.h"
+#include "flashinfer/arch_condition.h"
 
 namespace tensorrt_llm::kernels {
 
 namespace reduce_topk {
 namespace cg = cooperative_groups;
 static constexpr int kWARP_SIZE = 32;
-static constexpr bool kTLLM_GEN_HAS_FAST_REDUX = tensorrt_llm::kernels::arch::is_major_v<10>;
+static constexpr bool kTLLM_GEN_HAS_FAST_REDUX = flashinfer::arch::is_major_v<10>;
 
 template <typename T_>
 struct TopKRedType {
