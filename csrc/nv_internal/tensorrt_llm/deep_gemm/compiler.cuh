@@ -36,6 +36,9 @@
 #include "nvrtc.h"
 #include "runtime.cuh"
 #include "scheduler.cuh"
+#include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/logger.h"
 
 #ifdef _WIN32
 #include <windows.h>
