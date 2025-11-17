@@ -1993,12 +1993,15 @@ def _heuristic_func_mm_fp4(
     use_nvfp4: bool = True,
 ):
     r"""
-    Heuristic function for mm_fp4 backend selection. Routes to either cudnn or cutlass, but not trtllm.
+    Heuristic function for mm_fp4 backend selection. Routes to either cudnn or cutlass.
+    Note: trtllm is not considered in the backend selection because it requires a specific
+    input quantization (swizzling/shuffling) that differs from the preparation used
+    for cudnn and cutlass backends.
 
     Logic for which comes first:
     - If cuda version is 12 - use cutlass.
-    - If cuda version is 13 and cudnn version is less than 9.14 - use cutlass.
-    - If cuda version is 13 and cudnn version is 9.14 or greater - use cudnn.
+    - If cuda version is 13 and cudnn version is less than 9.15 - use cutlass.
+    - If cuda version is 13 and cudnn version is 9.15 or greater - use cudnn.
 
     """
     cuda_major, _ = get_cuda_version()
