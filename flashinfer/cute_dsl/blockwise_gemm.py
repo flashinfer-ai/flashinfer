@@ -2661,7 +2661,6 @@ class BlockwiseGemmCuteDSL:
         use_2cta_instrs: bool,
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
-        sm_count: int,
         sm_version: str,
     ):
         self._m = m
@@ -2699,11 +2698,8 @@ class BlockwiseGemmCuteDSL:
             )
 
         hardware_info = cutlass.utils.HardwareInfo()
-        self._max_active_clusters = min(
-            hardware_info.get_max_active_clusters(
-                self._cluster_shape_mn[0] * self._cluster_shape_mn[1]
-            ),
-            sm_count,
+        self._max_active_clusters = hardware_info.get_max_active_clusters(
+            self._cluster_shape_mn[0] * self._cluster_shape_mn[1]
         )
         self._sm_version = sm_version
 
@@ -2785,7 +2781,6 @@ def get_cute_dsl_compiled_blockwise_gemm_kernel(
     use_2cta_instrs: bool,
     mma_tiler_mn: Tuple[int, int],
     cluster_shape_mn: Tuple[int, int],
-    sm_count: int,
     sm_version: str,
 ) -> Callable:
     def get_cute_pointers(
@@ -2870,7 +2865,6 @@ def get_cute_dsl_compiled_blockwise_gemm_kernel(
             use_2cta_instrs=use_2cta_instrs,
             mma_tiler_mn=mma_tiler_mn,
             cluster_shape_mn=cluster_shape_mn,
-            sm_count=sm_count,
             sm_version=sm_version,
         ),
         *get_cute_pointers(None),
