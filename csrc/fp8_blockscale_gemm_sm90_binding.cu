@@ -88,7 +88,6 @@ class Fp8BlockScaleGemmRunner : public tvm::ffi::ModuleObj {
               const Optional<TensorView>& scales_a, const Optional<TensorView>& scales_b) {
     auto stream = get_stream(input.device());
 
-    // Extract tensor info
     auto input_ptr = input.data_ptr();
     auto weight_ptr = weight.data_ptr();
     auto output_ptr = output.data_ptr();
@@ -97,7 +96,6 @@ class Fp8BlockScaleGemmRunner : public tvm::ffi::ModuleObj {
     int shape_k = input.size(1);
     int shape_n = weight.size(0);
     
-    // Sanity checks (defense against Python bugs)
     TVM_FFI_ICHECK(input_ptr != nullptr) << "input is null";
     TVM_FFI_ICHECK(weight_ptr != nullptr) << "weight is null";
     TVM_FFI_ICHECK(output_ptr != nullptr) << "output is null";
@@ -107,7 +105,7 @@ class Fp8BlockScaleGemmRunner : public tvm::ffi::ModuleObj {
     bool input_is_fp8 = is_fp8_e4m3fn(input.dtype());
     bool weight_is_fp8 = is_fp8_e4m3fn(weight.dtype());
     
-    // Extract scale pointers (nullptr if not provided)
+    // Extract scale pointers 
     float const* scales_a_ptr = scales_a.has_value() 
         ? reinterpret_cast<float const*>(scales_a.value().data_ptr()) 
         : nullptr;
@@ -118,11 +116,8 @@ class Fp8BlockScaleGemmRunner : public tvm::ffi::ModuleObj {
     // Select appropriate runner
     auto* runner = selectRunner(input_is_fp8, weight_is_fp8);
     TVM_FFI_ICHECK(runner != nullptr) << "Unsupported dtype combination";
-    
-    // Ensure workspace is configured (defensive check)
     TVM_FFI_ICHECK(workspace_ != nullptr) << "Workspace not configured. Call configure_workspace first.";
     
-    // Call kernel
     runner->gemm(output_ptr, input_ptr, weight_ptr, shape_m, shape_n, shape_k,
                  stream, scales_a_ptr, scales_b_ptr);
   }

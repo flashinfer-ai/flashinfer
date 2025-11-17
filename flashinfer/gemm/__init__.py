@@ -14,7 +14,7 @@ from .gemm_base import gemm_fp8_nt_blockscaled as gemm_fp8_nt_blockscaled
 from .gemm_base import gemm_fp8_nt_groupwise as gemm_fp8_nt_groupwise
 from .gemm_base import group_gemm_fp8_nt_groupwise as group_gemm_fp8_nt_groupwise
 from .gemm_base import (
-    get_fp8_blockscale_gemm_runner as get_fp8_blockscale_gemm_runner,
+    get_fp8_blockscale_gemm_runner_sm90 as get_fp8_blockscale_gemm_runner_sm90,
 )
 from .gemm_base import (
     fp8_blockscale_gemm_swapab as fp8_blockscale_gemm_swapab,
@@ -36,7 +36,7 @@ __all__ = [
     "gemm_fp8_nt_blockscaled",
     "gemm_fp8_nt_groupwise",
     "group_gemm_fp8_nt_groupwise",
-    "get_fp8_blockscale_gemm_runner",
+    "get_fp8_blockscale_gemm_runner_sm90",
     "fp8_blockscale_gemm_swapab",
     "mm_M1_16_K7168_N256",
 ]
