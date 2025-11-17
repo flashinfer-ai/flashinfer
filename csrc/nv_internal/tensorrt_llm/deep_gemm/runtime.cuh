@@ -65,7 +65,7 @@ class Runtime {
 
   ~Runtime() {
     if (lib_ != nullptr) {
-      CHECK_CUDA_DRIVER(cuLibraryUnload(lib_));
+      CHECK_CUDA(cuLibraryUnload(lib_));
     }
   }
 
@@ -89,18 +89,17 @@ class Runtime {
         cubin_ = std::vector<char>(std::istreambuf_iterator<char>(cubinFile), {});
       }
 
-      CHECK_CUDA_DRIVER(
-          cuLibraryLoadData(&lib_, cubin_.data(), nullptr, nullptr, 0, nullptr, nullptr, 0));
+      CHECK_CUDA(cuLibraryLoadData(&lib_, cubin_.data(), nullptr, nullptr, 0, nullptr, nullptr, 0));
 
       unsigned int numKernels = 0;
-      CHECK_CUDA_DRIVER(cuLibraryGetKernelCount(&numKernels, lib_));
+      CHECK_CUDA(cuLibraryGetKernelCount(&numKernels, lib_));
 
       std::vector<CUkernel> kernels(numKernels);
-      CHECK_CUDA_DRIVER(cuLibraryEnumerateKernels(kernels.data(), numKernels, lib_));
+      CHECK_CUDA(cuLibraryEnumerateKernels(kernels.data(), numKernels, lib_));
 
       for (auto kernel : kernels) {
         char const* kernelName;
-        CHECK_CUDA_DRIVER(cuKernelGetName(&kernelName, kernel));
+        CHECK_CUDA(cuKernelGetName(&kernelName, kernel));
         std::string kernelNameStr(kernelName);
         if (kernelNameStr.find("fp8_gemm_kernel") != std::string::npos) {
           kernel_ = kernel;

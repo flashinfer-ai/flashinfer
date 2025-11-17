@@ -148,6 +148,8 @@ def gen_cutlass_fused_moe_module(
             jit_env.FLASHINFER_CSRC_DIR
             / "fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu",
             jit_env.FLASHINFER_CSRC_DIR
+            / "fused_moe/cutlass_backend/deepgemm_jit_setup.cu",
+            jit_env.FLASHINFER_CSRC_DIR
             / "fused_moe/cutlass_backend/cutlass_fused_moe_instantiation.cu",
             # Add all generated kernels
             *(output_dir / kernel for kernel in output_dir.rglob("*.generated.cu")),

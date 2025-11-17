@@ -27,7 +27,6 @@
 #include "../../tvm_ffi_utils.h"
 #include "cutlass_kernel_selector.h"
 #include "moe_gemm_kernels.h"
-#include "nv_internal/tensorrt_llm/deep_gemm/compiler.cuh"
 #include "tensorrt_llm/common/workspace.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
 
@@ -1200,18 +1199,3 @@ tvm::ffi::Module init(DLDataType activation_dtype, DLDataType weight_dtype, DLDa
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(init, init);
-
-namespace flashinfer {
-
-void set_deepgemm_jit_include_dirs(tvm::ffi::Array<tvm::ffi::String> include_dirs) {
-  std::vector<std::filesystem::path> dirs;
-  for (const auto& dir : include_dirs) {
-    dirs.push_back(std::filesystem::path(std::string(dir)));
-  }
-  deep_gemm::jit::Compiler::setIncludeDirs(dirs);
-}
-
-}  // namespace flashinfer
-
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(set_deepgemm_jit_include_dirs,
-                              flashinfer::set_deepgemm_jit_include_dirs);

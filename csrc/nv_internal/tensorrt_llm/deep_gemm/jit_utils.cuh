@@ -39,9 +39,7 @@
   } while (0)
 
 // Helper function to check CUDA driver errors
-// Only define if not already defined (avoid conflicts with tvm_ffi_utils.h)
-#ifndef CHECK_CUDA_DRIVER
-#define CHECK_CUDA_DRIVER(call)                                 \
+#define CHECK_CUDA(call)                                        \
   do {                                                          \
     CUresult result = call;                                     \
     if (result != CUDA_SUCCESS) {                               \
@@ -51,7 +49,6 @@
       exit(1);                                                  \
     }                                                           \
   } while (0)
-#endif
 
 namespace deep_gemm::jit {
 
