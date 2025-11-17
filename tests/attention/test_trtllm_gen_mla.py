@@ -294,7 +294,7 @@ def test_trtllm_batch_decode_mla(
 @pytest.mark.parametrize("dynamic_scale", [False])
 @pytest.mark.parametrize("enable_pdl", [True, False, None])
 @pytest.mark.parametrize("backend", ["trtllm-gen"])
-@pytest.mark.parametrize("MAX_SEQ_LEN", [1024])
+@pytest.mark.parametrize("MAX_SEQ_LEN", [1024, 8960])
 def test_dsr1_trtllm_mla(
     batch_size: int,
     scale: float,
