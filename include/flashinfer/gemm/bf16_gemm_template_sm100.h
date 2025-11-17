@@ -144,7 +144,6 @@ size_t genericBf16GemmKernelLauncherSm100(__nv_bfloat16 const* A, __nv_bfloat16 
        stride_B},
       {{}, nullptr, stride_C, reinterpret_cast<ElementOutput*>(D), stride_D}};
 
-  // Is not the right way to do this?
   auto& fusion_args = arguments.epilogue.thread;
   fusion_args.alpha = 1.0f;
   fusion_args.beta = 0.0f;
