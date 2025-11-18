@@ -1,3 +1,4 @@
+#include <cmath>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 
@@ -58,7 +59,7 @@ __global__ void deepseek_v3_topk_kernel(InputT* scores, OutputT* topkValues, Idx
   // note that for invalid scores, we simply use a negative value:
   // they work well even with the compacted format used in topK, and
   // sigmoid / bias activated scores cannot be negative
-  static constexpr float invalidScoreFloat = -1.F;
+  static constexpr float invalidScoreFloat = float{-INFINITY};;
   const OutputT invalidScore = OutputT{invalidScoreFloat};
 
   // load bias already; each warp represents one expert group
@@ -127,10 +128,11 @@ __global__ void deepseek_v3_topk_kernel(InputT* scores, OutputT* topkValues, Idx
 
 #pragma unroll
       for (int ii = 0; ii < MaxNumTopGroups; ++ii) {  // bound of numGroup
-        auto groupIdx = topGroupIdx[ii];
+        // auto groupIdx = topGroupIdx[ii];
+        auto groupIdx = (ii < topkGroup) ? topGroupIdx[ii] : 0; 
         expertIdxGroup[ii] = groupIdx * numExpertsPerGroup + laneIdx;
 
-        expertScoreGroup[ii] = groupIdx < numGroup && expertSelected
+        expertScoreGroup[ii] = (ii < topkGroup) && expertSelected
                                    ? smemScoreBias[expertIdxGroup[ii]]
                                    : invalidScoreFloat;
       }
