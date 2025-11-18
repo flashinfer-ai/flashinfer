@@ -7,7 +7,7 @@ from flashinfer.fused_moe import (
     WeightLayout,
     trtllm_fp8_block_scale_moe,
 )
-from .test_utils import skip_checks, QuantMode
+from .utils import skip_checks, QuantMode
 from flashinfer import GatedActType
 
 
@@ -611,7 +611,7 @@ def test_correctness_dpsk_fp8_fused_moe(
     if "compatible_moe_impls" not in weight_processing:
         weight_processing["compatible_moe_impls"] = [type(moe_impl)]
 
-    # Use the complete skip_checks function from test_utils
+    # Use the complete skip_checks function from utils
     skip_checks(
         moe_impl=moe_impl,
         routing_config=routing_config,
