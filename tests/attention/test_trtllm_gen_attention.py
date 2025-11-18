@@ -1015,7 +1015,6 @@ def test_trtllm_batch_decode_bs1(
     head_dim,
 ):
     # Small number of test cases for batch size 1
-    # pytest.xfail("trtllm-gen decode gets incorrect output with bs1")
     _test_trtllm_batch_decode(
         "trtllm-gen",
         kv_layout,
