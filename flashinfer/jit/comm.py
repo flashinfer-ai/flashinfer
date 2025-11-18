@@ -78,3 +78,32 @@ def gen_vllm_comm_module() -> JitSpec:
             jit_env.FLASHINFER_CSRC_DIR / "vllm_custom_all_reduce.cu",
         ],
     )
+
+
+def gen_mnnvl_a2a_module() -> JitSpec:
+    return gen_jit_spec(
+        "mnnvl_a2a",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "trtllm_moe_a2a.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "nv_internal"
+            / "tensorrt_llm"
+            / "kernels"
+            / "communicationKernels"
+            / "moeAlltoAllKernels.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "nv_internal"
+            / "cpp"
+            / "common"
+            / "envUtils.cpp",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "nv_internal"
+            / "cpp"
+            / "common"
+            / "tllmException.cpp",
+        ],
+        extra_include_paths=[
+            str(jit_env.FLASHINFER_CSRC_DIR / "nv_internal"),
+            str(jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "include"),
+        ],
+    )
