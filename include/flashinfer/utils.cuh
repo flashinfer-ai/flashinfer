@@ -335,6 +335,18 @@ inline std::pair<int, int> GetCudaComputeCapability() {
   return std::make_pair(major, minor);
 }
 
+inline int GetCudaMultiProcessorCount() {
+  static int sm_count = 0;
+  if (sm_count == 0) {
+    int device_id;
+    cudaGetDevice(&device_id);
+    cudaDeviceProp device_prop;
+    cudaGetDeviceProperties(&device_prop, device_id);
+    sm_count = device_prop.multiProcessorCount;
+  }
+  return sm_count;
+}
+
 template <typename T>
 inline void DebugPrintCUDAArray(T* device_ptr, size_t size, std::string prefix = "") {
   std::vector<T> host_array(size);
