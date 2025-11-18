@@ -1,5 +1,3 @@
-import math
-
 import pytest
 import torch
 
@@ -123,21 +121,6 @@ def test_trtllm_batch_decode_mla(
     workspace_buffer = global_trtllm_gen_fmha_workspace_buffer
     workspace_buffer_ref = global_workspace_buffer
 
-    bmm1_log2_scale_tensor = (
-        torch.tensor(
-            [scale / ((128 + 64) ** 0.5 * math.log2(math.e))],
-            dtype=torch.float32,
-            device=device,
-        )
-        if dynamic_scale
-        else None
-    )
-    bmm2_scale_tensor = (
-        torch.tensor([1.0], dtype=torch.float32, device=device)
-        if dynamic_scale
-        else None
-    )
-
     # Run decode-MLA
     output = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
         query=query,
@@ -151,8 +134,6 @@ def test_trtllm_batch_decode_mla(
         max_seq_len=max_seq_len,
         bmm1_scale=scale / ((128 + 64) ** 0.5),
         bmm2_scale=1.0,
-        bmm1_scale_log2_tensor=bmm1_log2_scale_tensor,
-        bmm2_scale_tensor=bmm2_scale_tensor,
         enable_pdl=enable_pdl,
         backend=backend,
     )
