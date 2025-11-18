@@ -67,6 +67,81 @@ def _setup_logger():
 _setup_logger()
 
 
+def _log_system_info():
+    """Log system information once at module initialization."""
+    if _API_LOG_LEVEL == 0:
+        return
+
+    lines = []
+    lines.append("=" * 80)
+    lines.append("FlashInfer API Logging - System Information")
+    lines.append("=" * 80)
+
+    try:
+        # FlashInfer version
+        try:
+            from .version import __version__ as flashinfer_version
+
+            lines.append(f"FlashInfer version: {flashinfer_version}")
+        except Exception:
+            lines.append("FlashInfer version: <unavailable>")
+
+        # CUDA toolkit version
+        cuda_version = torch.version.cuda
+        if cuda_version:
+            lines.append(f"CUDA toolkit version: {cuda_version}")
+        else:
+            lines.append("CUDA toolkit version: <unavailable - CPU-only build?>")
+
+        # cuDNN version
+        try:
+            if torch.backends.cudnn.is_available():
+                cudnn_version = torch.backends.cudnn.version()
+                if cudnn_version:
+                    lines.append(f"cuDNN version: {cudnn_version}")
+                else:
+                    lines.append("cuDNN version: <unavailable>")
+            else:
+                lines.append("cuDNN version: <not available>")
+        except Exception as e:
+            lines.append(f"cuDNN version: <error: {e}>")
+
+        # GPU information (if CUDA is available)
+        if torch.cuda.is_available():
+            device_count = torch.cuda.device_count()
+            lines.append(f"Number of GPUs: {device_count}")
+
+            # Log information for each GPU
+            for i in range(device_count):
+                try:
+                    gpu_name = torch.cuda.get_device_name(i)
+                    capability = torch.cuda.get_device_capability(i)
+                    sm_arch = capability[0] * 10 + capability[1]
+                    lines.append(f"  GPU {i}: {gpu_name}")
+                    lines.append(
+                        f"    Compute capability: {capability[0]}.{capability[1]} (SM{sm_arch})"
+                    )
+                except Exception as e:
+                    lines.append(f"  GPU {i}: <error: {e}>")
+        else:
+            lines.append("CUDA: Not available (CPU-only mode)")
+
+        # PyTorch version
+        lines.append(f"PyTorch version: {torch.__version__}")
+
+    except Exception as e:
+        lines.append(f"Error gathering system information: {e}")
+
+    lines.append("=" * 80)
+    lines.append("")  # Empty line for readability
+
+    _logger.debug("\n".join(lines))
+
+
+# Log system information once at module load time (if logging is enabled)
+_log_system_info()
+
+
 def _format_value(value: Any, level: int, indent: int = 0) -> str:
     """
     Format a value for logging based on the log level.
