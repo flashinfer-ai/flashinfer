@@ -984,6 +984,7 @@ def test_trtllm_batch_decode(
     "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size",
     [
         (1, 1, 16, 8, 8),
+        (1, 1, 32, 8, 8),
     ],
 )
 @pytest.mark.parametrize("window_left", [-1])
@@ -995,7 +996,7 @@ def test_trtllm_batch_decode(
 )
 @pytest.mark.parametrize("enable_pdl", [None])
 @pytest.mark.parametrize("enable_sink", [False])
-@pytest.mark.parametrize("max_in_kv_len", [8192])
+@pytest.mark.parametrize("max_in_kv_len", [4096, 8192])
 @pytest.mark.parametrize("head_dim", [128])
 def test_trtllm_batch_decode_bs1(
     kv_layout,
@@ -1014,7 +1015,7 @@ def test_trtllm_batch_decode_bs1(
     head_dim,
 ):
     # Small number of test cases for batch size 1
-    pytest.xfail("trtllm-gen decode gets incorrect output with bs1")
+    # pytest.xfail("trtllm-gen decode gets incorrect output with bs1")
     _test_trtllm_batch_decode(
         "trtllm-gen",
         kv_layout,
