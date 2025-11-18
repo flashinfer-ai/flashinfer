@@ -19,6 +19,7 @@ from typing import Literal, Optional, Tuple, Union, overload
 
 import torch
 
+from .api_logging import flashinfer_api_log
 from .jit import gen_batch_mla_module
 from .jit.mla import gen_mla_module
 from .utils import MaskMode, check_shape_dtype_device, determine_mla_backend
@@ -129,6 +130,7 @@ class BatchMLAPagedAttentionWrapper:
     torch.Size([114, 128, 512])
     """
 
+    @flashinfer_api_log
     def __init__(
         self,
         float_workspace_buffer: torch.Tensor,
@@ -199,6 +201,7 @@ class BatchMLAPagedAttentionWrapper:
         else:
             self._backend = backend
 
+    @flashinfer_api_log
     def plan(
         self,
         qo_indptr: torch.Tensor,
@@ -333,6 +336,7 @@ class BatchMLAPagedAttentionWrapper:
         return_lse_base_on_e: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
+    @flashinfer_api_log
     def run(
         self,
         q_nope: torch.Tensor,
