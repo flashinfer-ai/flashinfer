@@ -7,6 +7,8 @@ from flashinfer.fused_moe import (
     WeightLayout,
     trtllm_fp8_block_scale_moe,
 )
+from .test_utils import skip_checks, QuantMode
+from flashinfer import GatedActType
 
 
 def dequant_fp8_block_scaled(
@@ -591,11 +593,34 @@ def test_correctness_dpsk_fp8_fused_moe(
     if trtllm_fp8_block_scale_moe is None:
         pytest.skip("flashinfer fused_moe kernel not available")
 
-    compatible_intermediate_size = routing_config["compatible_intermediate_size"]
-    if intermediate_size not in compatible_intermediate_size:
-        pytest.skip(
-            f"Intermediate size {intermediate_size} is not compatible with routing config {routing_config}"
-        )
+    # Create a mock MoE implementation for skip_checks
+    class FP8BlockScaleMoe:
+        def __init__(self):
+            self.name = "FP8BlockScale"
+            self.quant_mode = QuantMode.FP8_BLOCK_SCALE
+
+    moe_impl = FP8BlockScaleMoe()
+
+    # Make copies of config dicts to avoid modifying the original parametrize values
+    routing_config = dict(routing_config)
+    weight_processing = dict(weight_processing)
+
+    # Ensure they have compatible_moe_impls
+    if "compatible_moe_impls" not in routing_config:
+        routing_config["compatible_moe_impls"] = [type(moe_impl)]
+    if "compatible_moe_impls" not in weight_processing:
+        weight_processing["compatible_moe_impls"] = [type(moe_impl)]
+
+    # Use the complete skip_checks function from test_utils
+    skip_checks(
+        moe_impl=moe_impl,
+        routing_config=routing_config,
+        weight_processing=weight_processing,
+        gated_act_type=GatedActType.SwiGlu,
+        num_tokens=seq_len,
+        hidden_size=7168,  # DeepSeek-V3 hidden size
+        intermediate_size=intermediate_size,
+    )
 
     device = "cuda"
     torch.manual_seed(42)
