@@ -339,6 +339,52 @@ def unpack_compare_nvfp4(
     return output_unpacked, output_ref
 
 
+def generate_causal_mask(
+    batch_size: int,
+    q_seq_len: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Generate causal attention mask for speculative decoding.
+
+    Parameters
+    ----------
+    batch_size : int
+        Batch size
+    q_seq_len : int
+        Query sequence length (number of speculative decoding tokens)
+    device : torch.device
+        Target device for the mask tensor
+
+    Returns
+    -------
+    torch.Tensor
+        Causal mask with shape [batch_size, q_seq_len, mask_size_per_row]
+        where mask_size_per_row = divUp(q_seq_len, 32) * 2 (in uint16_t units).
+        Data type: torch.uint16
+
+    """
+    import numpy as np
+
+    num_packed_masks_per_token = (q_seq_len + 31) // 32
+
+    mask_np = np.zeros(
+        (batch_size, q_seq_len, num_packed_masks_per_token), dtype=np.uint32
+    )
+
+    for q_pos in range(q_seq_len):
+        for kv_pos in range(q_pos + 1):  # Causal: only see previous queries and self
+            word_idx = kv_pos // 32
+            bit_in_word = kv_pos % 32
+            if word_idx < num_packed_masks_per_token:
+                mask_np[:, q_pos, word_idx] |= np.uint32(1 << bit_in_word)
+
+    mask_uint32 = torch.from_numpy(mask_np).to(device)
+    mask_uint16 = mask_uint32.view(torch.uint16)
+
+    return mask_uint16
+
+
 def _test_trtllm_batch_prefill(
     kv_layout,
     batch_size,
@@ -701,12 +747,6 @@ def _test_trtllm_batch_decode(
     if backend == "xqa" and q_dtype == "fp8":
         pytest.skip("xqa backend only supports fp16 and bf16 query")
 
-    # xqa backend doesn't support speculative decoding yet
-    if backend == "xqa" and q_len_per_req > 1:
-        pytest.skip(
-            "xqa backend does not support speculative decoding (q_len_per_req > 1) yet"
-        )
-
     if o_dtype == "nvfp4" and q_len_per_req > 1:
         # todo(Yingyi): add support for nvfp4 with speculative decoding
         pytest.skip("nvfp4 is not supported for q_len_per_req > 1")
@@ -826,6 +866,11 @@ def _test_trtllm_batch_decode(
             kv_indptr=kv_indptr_tokens,
         )
 
+    if q_len_per_req > 1:
+        mask = generate_causal_mask(batch_size, q_len_per_req, GPU_DEVICE)
+    else:
+        mask = None
+
     # Run decode function call with specified backend
     bmm1_scale = q_scale * k_scale * sm_scale
     bmm2_scale = v_scale / o_scale
@@ -857,6 +902,7 @@ def _test_trtllm_batch_decode(
         backend=backend,
         q_len_per_req=q_len_per_req,
         o_scale=o_scale,
+        mask=mask,
     )
     if backend == "trtllm-gen":
         # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero

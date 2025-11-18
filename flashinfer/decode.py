@@ -2079,6 +2079,7 @@ def trtllm_batch_decode_with_kv_cache(
     backend: str = "auto",
     q_len_per_req: Optional[int] = 1,
     o_scale: Optional[float] = 1.0,
+    mask: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, FP4Tensor]:
     """
     Parameters
@@ -2149,6 +2150,9 @@ def trtllm_batch_decode_with_kv_cache(
     o_scale : Optional[float] = 1.0
         output scale factor for xqa fp8 output.
 
+    mask : Optional[torch.Tensor] = None
+        causal attention mask for xqa speculative decoding.
+
     Returns
     -------
     out : Union[torch.Tensor, FP4Tensor]
@@ -2209,6 +2213,7 @@ def trtllm_batch_decode_with_kv_cache(
             enable_pdl=enable_pdl,
             q_len_per_req=q_len_per_req,
             o_scale=o_scale,
+            mask=mask,
         )
     elif backend == "trtllm-gen":
         # Convert NHD layout to HND if necessary (transpose only changes stride, not data)
@@ -2353,6 +2358,7 @@ def xqa_batch_decode_with_kv_cache(
     enable_pdl: bool = None,
     q_len_per_req: Optional[int] = 1,
     o_scale: Optional[float] = 1.0,
+    mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Parameters
@@ -2404,14 +2410,15 @@ def xqa_batch_decode_with_kv_cache(
     o_scale : Optional[float] = 1.0
         output scale factor for fp8 output.
 
+    mask : Optional[torch.Tensor] = None
+        causal attention mask for xqa speculative decoding.
+
     Returns
     -------
     out : torch.Tensor
         output torch.Tensor.
     """
     enable_pdl = device_support_pdl(query.device) if enable_pdl is None else enable_pdl
-
-    assert q_len_per_req == 1, "xqa not support speculative decoding yet"
 
     if isinstance(kv_cache, tuple):
         k_cache, v_cache = kv_cache
@@ -2453,6 +2460,9 @@ def xqa_batch_decode_with_kv_cache(
     kv_scale_value = bmm2_scale * o_scale
     q_scale_value = bmm1_scale / kv_scale_value * (head_dim**0.5)
 
+    if q_len_per_req > 1:
+        batch_size = query.shape[0] // q_len_per_req
+        query = query.view(batch_size, q_len_per_req, query.shape[1], query.shape[2])
     query_new = query.unsqueeze(1)
     seq_lens_new = seq_lens.unsqueeze(1)
     sinks_new = sinks.reshape(num_kv_heads, -1) if sinks is not None else None
@@ -2481,6 +2491,8 @@ def xqa_batch_decode_with_kv_cache(
         sm_count=sm_count,
         enable_pdl=enable_pdl,
         rcp_out_scale=1.0 / o_scale,
+        q_seq_len=q_len_per_req,
+        mask=mask,
     )
 
     return out

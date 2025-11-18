@@ -1262,6 +1262,23 @@ __device__ inline void addAttentionSinks(ThrdRegRowMax& globalRowSum,
   }
 }
 
+#if SPEC_DEC
+// SPEC_DEC version: handles head-token mixed layout
+__device__ inline void addAttentionSinksSpecDec(ThrdRegRowMax& globalRowSum,
+                                                ThrdRegRowMax const globalRowMax,
+                                                float const* attentionSinks, uint32_t headGrpSize) {
+  for (uint32_t i = 0; i < globalRowSum.size; i++) {
+    uint32_t idxHeadToken = warp_size * i + laneId();
+    // In SPEC_DEC, layout is [token0_head0, token0_head1, ..., token1_head0, ...]
+    // Extract head index from head-token index
+    uint32_t headIdx = idxHeadToken % headGrpSize;
+    if (headIdx < headGrpSize && idxHeadToken < rowsPerBlock) {
+      globalRowSum[i] += expf(attentionSinks[headIdx] - globalRowMax[i]);
+    }
+  }
+}
+#endif
+
 #ifdef NDEBUG
 __device__ __forceinline__
 #else
@@ -2161,7 +2178,12 @@ CUBIN_EXPORT __global__
       // enabled.
       if (!isMultiBlock && attentionSinks != nullptr) {
         // Attention sinks are per head.
+#if SPEC_DEC
+        addAttentionSinksSpecDec(globalRowSum, globalRowMax,
+                                 attentionSinks + headGrpSize * idxHeadGrp, headGrpSize);
+#else
         addAttentionSinks(globalRowSum, globalRowMax, attentionSinks + headGrpSize * idxHeadGrp);
+#endif
       }
       ThrdRegRowMax const rcpRowSum = __frcp_rn(globalRowSum);
 #if LOW_PREC_OUTPUT
@@ -2341,7 +2363,12 @@ CUBIN_EXPORT __global__
         }
         if (attentionSinks != nullptr) {
           // Attention sinks are per head.
+#if SPEC_DEC
+          addAttentionSinksSpecDec(mergedRowSum, mergedRowMax,
+                                   attentionSinks + headGrpSize * idxHeadGrp, headGrpSize);
+#else
           addAttentionSinks(mergedRowSum, mergedRowMax, attentionSinks + headGrpSize * idxHeadGrp);
+#endif
         }
         __syncthreads();
         rescaleAcc(warp, sumAcc, fullRescaleMask, __frcp_rn(mergedRowSum));

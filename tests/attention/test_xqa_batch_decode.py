@@ -290,6 +290,52 @@ def get_last_page_len(seq_lens, page_size):
     return last_page_len
 
 
+def generate_causal_mask(
+    batch_size: int,
+    q_seq_len: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Generate causal attention mask for speculative decoding.
+
+    Parameters
+    ----------
+    batch_size : int
+        Batch size
+    q_seq_len : int
+        Query sequence length (number of speculative decoding tokens)
+    device : torch.device
+        Target device for the mask tensor
+
+    Returns
+    -------
+    torch.Tensor
+        Causal mask with shape [batch_size, q_seq_len, mask_size_per_row]
+        where mask_size_per_row = divUp(q_seq_len, 32) * 2 (in uint16_t units).
+        Data type: torch.uint16
+
+    """
+    import numpy as np
+
+    num_packed_masks_per_token = (q_seq_len + 31) // 32
+
+    mask_np = np.zeros(
+        (batch_size, q_seq_len, num_packed_masks_per_token), dtype=np.uint32
+    )
+
+    for q_pos in range(q_seq_len):
+        for kv_pos in range(q_pos + 1):  # Causal: only see previous queries and self
+            word_idx = kv_pos // 32
+            bit_in_word = kv_pos % 32
+            if word_idx < num_packed_masks_per_token:
+                mask_np[:, q_pos, word_idx] |= np.uint32(1 << bit_in_word)
+
+    mask_uint32 = torch.from_numpy(mask_np).to(device)
+    mask_uint16 = mask_uint32.view(torch.uint16)
+
+    return mask_uint16
+
+
 @pytest.mark.skipif(
     get_compute_capability(torch.device(device="cuda"))[0] not in [9, 10, 12],
     reason="XQA is only supported on SM90, SM100, SM120 GPUs",
@@ -297,6 +343,9 @@ def get_last_page_len(seq_lens, page_size):
 @pytest.mark.parametrize(
     "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size",
     [
+        (4, 4, 64, 4, 2),
+        (4, 2, 16, 2, 4),
+        (4, 3, 32, 2, 6),
         (4, 1, 16, 2, 1),
         (4, 1, 32, 2, 5),
         (128, 1, 64, 2, 6),
@@ -338,8 +387,6 @@ def test_xqa_batch_decode(
 
     This test supports both NHD and HND layouts.
     """
-    if q_len_per_req > 1:
-        pytest.skip("xqa does not support speculative decoding yet")
 
     # Set up test parameters
     torch.manual_seed(0)
@@ -444,6 +491,11 @@ def test_xqa_batch_decode(
             kv_indptr=kv_indptr_tokens,
         )
 
+    if q_len_per_req > 1:
+        mask = generate_causal_mask(batch_size, q_len_per_req, GPU_DEVICE)
+    else:
+        mask = None
+
     # Run xqa_batch_decode_with_kv_cache function
     output = flashinfer.decode.xqa_batch_decode_with_kv_cache(
         q.contiguous(),
@@ -461,6 +513,7 @@ def test_xqa_batch_decode(
         kv_layout=kv_layout,
         q_len_per_req=q_len_per_req,
         o_scale=o_scale,
+        mask=mask,
     )
 
     # Verification
