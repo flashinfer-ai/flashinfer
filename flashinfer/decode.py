@@ -42,6 +42,7 @@ from .prefill import (
     get_single_prefill_module,
 )
 from .utils import (
+    log2e,
     FP4Tensor,
     MaskMode,
     PosEncodingMode,
@@ -1880,8 +1881,8 @@ class TrtllmGenDecodeModule:
         block_tables: torch.Tensor,
         seq_lens: torch.Tensor,
         max_seq_len: int,
-        bmm1_scale: float,  # todo(Yingyi): add dynamic scale tensor later
-        bmm2_scale: float,
+        bmm1_scale: Union[float, torch.Tensor],
+        bmm2_scale: Union[float, torch.Tensor],
         workspace_size: int,
         window_left: int = -1,
         enable_pdl: bool = None,
@@ -1893,12 +1894,11 @@ class TrtllmGenDecodeModule:
         if self._sm_count is None:
             self._sm_count = get_device_sm_count(query.device)
 
-        bmm1_scale = (
-            bmm1_scale.item() if isinstance(bmm1_scale, torch.Tensor) else bmm1_scale
-        )
-        bmm2_scale = (
-            bmm2_scale.item() if isinstance(bmm2_scale, torch.Tensor) else bmm2_scale
-        )
+        if isinstance(bmm1_scale, torch.Tensor):
+            assert bmm1_scale.dtype == torch.float32
+            bmm1_scale = bmm1_scale * log2e
+        if isinstance(bmm2_scale, torch.Tensor):
+            assert bmm2_scale.dtype == torch.float32
 
         self._op.trtllm_paged_attention_decode(
             out,
@@ -2066,8 +2066,8 @@ def trtllm_batch_decode_with_kv_cache(
     block_tables: torch.Tensor,
     seq_lens: torch.Tensor,
     max_seq_len: int,
-    bmm1_scale: float,
-    bmm2_scale: float,  # todo(Yingyi): add dynamic scale tensor later
+    bmm1_scale: Union[float, torch.Tensor] = 1.0,
+    bmm2_scale: Union[float, torch.Tensor] = 1.0,
     window_left: int = -1,
     out: Optional[Union[torch.Tensor, FP4Tensor]] = None,
     out_dtype: Optional[Union[torch.dtype, str]] = None,
@@ -2105,11 +2105,13 @@ def trtllm_batch_decode_with_kv_cache(
     max_seq_len : int
         max sequence length for kv_cache
 
-    bmm1_scale : float
+    bmm1_scale : Union[float, torch.Tensor]
         fused scale for bmm1 input.
+        when using trtllm-gen backend, it can be a torch.Tensor with dtype torch.float32.
 
-    bmm2_scale : float
+    bmm2_scale : Union[float, torch.Tensor]
         fused scale for bmm2 input.
+        when using trtllm-gen backend, it can be a torch.Tensor with dtype torch.float32.
 
     window_left : int = -1
         The left (inclusive) window size for the attention window, when set to ``-1``, the window
@@ -2173,6 +2175,11 @@ def trtllm_batch_decode_with_kv_cache(
         )
 
     if backend == "xqa":
+        # TODO(Siyuan): support device scale factors, which was removed in #2033
+        if not isinstance(bmm1_scale, float):
+            bmm1_scale = bmm1_scale.item()
+        if not isinstance(bmm2_scale, float):
+            bmm2_scale = bmm2_scale.item()
         # xqa backend doesn't support nvfp4 output
         if out_dtype == "nvfp4" or (out_dtype is None and isinstance(out, FP4Tensor)):
             raise ValueError("xqa backend does not support nvfp4 output")
@@ -2287,12 +2294,11 @@ def trtllm_batch_decode_with_kv_cache(
         else:
             raise ValueError(f"Invalid out_dtype: {out_dtype}")
 
-        bmm1_scale = (
-            bmm1_scale.item() if isinstance(bmm1_scale, torch.Tensor) else bmm1_scale
-        )
-        bmm2_scale = (
-            bmm2_scale.item() if isinstance(bmm2_scale, torch.Tensor) else bmm2_scale
-        )
+        if isinstance(bmm1_scale, torch.Tensor):
+            assert bmm1_scale.dtype == torch.float32
+            bmm1_scale = bmm1_scale * log2e
+        if isinstance(bmm2_scale, torch.Tensor):
+            assert bmm2_scale.dtype == torch.float32
 
         run_func(
             out,
@@ -2533,10 +2539,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
     seq_lens: torch.Tensor,
     max_seq_len: int,
     out: Optional[torch.Tensor] = None,
-    bmm1_scale: Optional[float] = 1.0,
-    bmm2_scale: Optional[float] = 1.0,
-    bmm1_scale_log2_tensor: Optional[torch.Tensor] = None,
-    bmm2_scale_tensor: Optional[torch.Tensor] = None,
+    bmm1_scale: Union[float, torch.Tensor] = 1.0,
+    bmm2_scale: Union[float, torch.Tensor] = 1.0,
     sinks: Optional[List[torch.Tensor]] = None,
     enable_pdl: bool = None,
     backend: str = "auto",
@@ -2554,9 +2558,9 @@ def trtllm_batch_decode_with_kv_cache_mla(
     max_seq_len: max sequence length for kv_cache
     out: output tensor, if not provided, will be allocated internally
     bmm1_scale: fused scale for mla bmm1 input.
+        when using trtllm-gen backend, it can be a torch.Tensor with dtype torch.float32.
     bmm2_scale: fused scale for mla bmm2 input.
-    bmm1_scale_log2_tensor: On-device fused scale tensor for mla bmm1 input. Must be fused with * M_LOG2E before passing in.
-    bmm2_scale_tensor: On-device fused scale tensor for mla bmm2 input.
+        when using trtllm-gen backend, it can be a torch.Tensor with dtype torch.float32.
     sinks: additional value per head in the denominator of the softmax.
     backend : str = "auto"
         The implementation backend, could be ``auto``/``xqa`` or ``trtllm-gen``. Defaults to ``auto``.
@@ -2569,8 +2573,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
     bmm1_scale = q_scale * k_scale * sm_scale / (head_dim_qk ** 0.5)
     bmm2_scale = v_scale * o_scale
     or,
-    bmm1_scale_log2_tensor = [q_scale * k_scale * sm_scale / (head_dim_qk ** 0.5) * M_LOG2E]
-    bmm2_scale_tensor = [v_scale * o_scale]
+    bmm1_scale = torch.Tensor([q_scale * k_scale * sm_scale / (head_dim_qk ** 0.5))
+    bmm2_scale = torch.Tensor([v_scale * o_scale])
 
     The two scale factors should be static constant for cuda graph capture.
     Either (bmm1_scale, bmm2_scale) or (bmm1_scale_log2_tensor, bmm2_scale_tensor) should be provided.
@@ -2587,6 +2591,11 @@ def trtllm_batch_decode_with_kv_cache_mla(
             "trtllm-gen" if get_compute_capability(query.device)[0] == 10 else "xqa"
         )
     if backend == "xqa":
+        # TODO(Siyuan): support device scale factors, which was removed in #2033
+        if not isinstance(bmm1_scale, float):
+            bmm1_scale = bmm1_scale.item()
+        if not isinstance(bmm2_scale, float):
+            bmm2_scale = bmm2_scale.item()
         if (
             get_compute_capability(query.device)[0] != 12
             or query.dtype != torch.float8_e4m3fn
@@ -2653,15 +2662,11 @@ def trtllm_batch_decode_with_kv_cache_mla(
                 "out",
             )
 
-        if bmm1_scale_log2_tensor is not None and bmm2_scale_tensor is not None:
-            # dynamic scale factors
-            if (
-                query.dtype != torch.float8_e4m3fn
-                or kv_cache.dtype != torch.float8_e4m3fn
-            ):
-                raise ValueError(
-                    "Dynamic scale factors bmm1_scale_tensor and bmm2_scale_tensor are only supported for fp8 tensor core operation"
-                )
+        if isinstance(bmm1_scale, torch.Tensor):
+            assert bmm1_scale.dtype == torch.float32
+            bmm1_scale = bmm1_scale * log2e
+        if isinstance(bmm2_scale, torch.Tensor):
+            assert bmm2_scale.dtype == torch.float32
 
         run_func(
             out,
@@ -2701,10 +2706,9 @@ def xqa_batch_decode_with_kv_cache_mla(
     seq_lens: torch.Tensor,
     max_seq_len: int,
     out: Optional[torch.Tensor] = None,
+    # TODO(Siyuan): support device scale factors, which was removed in #2033
     bmm1_scale: Optional[float] = 1.0,
     bmm2_scale: Optional[float] = 1.0,
-    bmm1_scale_log2_tensor: Optional[torch.Tensor] = None,
-    bmm2_scale_tensor: Optional[torch.Tensor] = None,
     sinks: Optional[List[torch.Tensor]] = None,
     enable_pdl: bool = None,
 ) -> torch.Tensor:
@@ -2722,17 +2726,12 @@ def xqa_batch_decode_with_kv_cache_mla(
     out: output tensor, if not provided, will be allocated internally
     bmm1_scale: fused scale for mla bmm1 input.
     bmm2_scale: fused scale for mla bmm2 input.
-    bmm1_scale_log2_tensor: On-device fused scale tensor for mla bmm1 input. Must be fused with * M_LOG2E before passing in.
-    bmm2_scale_tensor: On-device fused scale tensor for mla bmm2 input.
     sinks: additional value per head in the denominator of the softmax.
 
     Note:
     In MLA, the actual BMM1 and BMM2 scales applied would be fused as:
     bmm1_scale = q_scale * k_scale * sm_scale / (head_dim_qk ** 0.5)
     bmm2_scale = v_scale * o_scale
-    or,
-    bmm1_scale_log2_tensor = [q_scale * k_scale * sm_scale / (head_dim_qk ** 0.5) * M_LOG2E]
-    bmm2_scale_tensor = [v_scale * o_scale]
 
     The two scale factors should be static constant for cuda graph capture.
     Either (bmm1_scale, bmm2_scale) or (bmm1_scale_log2_tensor, bmm2_scale_tensor) should be provided.
