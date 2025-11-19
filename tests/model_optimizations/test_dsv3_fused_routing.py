@@ -330,7 +330,6 @@ class DSv3RoutingGroundTruth:
         return set(topk_idx.tolist())
 
 
-
 def validate_expert_selection(ground_truth, topk_indices_kernel, topk_values_kernel):
     """Validate kernel outputs and provide detailed debug info for failures."""
     num_tokens = topk_indices_kernel.shape[0]
