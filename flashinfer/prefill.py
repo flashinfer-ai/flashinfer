@@ -33,7 +33,7 @@ from .jit import (
     gen_trtllm_gen_fmha_module,
 )
 from .cudnn import cudnn_batch_prefill_with_kv_cache
-from .page import block_sparse_indices_to_vector_sparse_offsets, get_seq_lens
+from .page import get_seq_lens
 from .quantization import packbits, segment_packbits
 from .utils import (
     FP4Tensor,
@@ -1424,16 +1424,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
             * self._float_workspace_buffer.element_size()
         )
         self.device = float_workspace_buffer.device
-        self._vector_sparse_indptr_buffer: Optional[torch.Tensor] = None
-        if backend in ["fa3", "auto", "trtllm-gen"]:
-            # NOTE(Zihao): assume maximum accumulate kv length is 16M
-            self._vector_sparse_indices_buffer = torch.empty(
-                (16 * 1024 * 1024,), dtype=torch.int32, device=self.device
-            )
-            # NOTE(Zihao): assume maximum batch size is 32768
-            self._vector_sparse_indptr_buffer = torch.empty(
-                (32768,), dtype=torch.int32, device=self.device
-            )
 
         self._kv_lens_buffer = torch.empty(
             (32768,), dtype=torch.int32, device=self.device
@@ -1839,22 +1829,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     self._backend, *get_module_args
                 )
 
-        if self._backend == "fa3" or self._backend == "trtllm-gen":
-            if page_size != 1:
-                vector_sparse_indptr_host = torch.cat(
-                    [
-                        torch.tensor(
-                            [0], dtype=torch.int32, device=kv_lens_arr_host.device
-                        ),
-                        torch.cumsum(kv_lens_arr_host, dim=0, dtype=torch.int32),
-                    ],
-                    dim=0,
-                )
-                self._vector_sparse_indptr_buffer[
-                    : len(vector_sparse_indptr_host)
-                ].copy_(vector_sparse_indptr_host, non_blocking=non_blocking)
-                paged_kv_indptr_host = vector_sparse_indptr_host
-
         self._block_tables = block_tables
         if self._backend == "trtllm-gen":
             assert logits_soft_cap == 0.0
@@ -2042,13 +2016,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
             q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
         )
 
-        stride_block = k_cache.stride(0)
         if self._kv_layout == "NHD":
             page_size = k_cache.shape[1]
-            stride_n = k_cache.stride(1)
         else:
             page_size = k_cache.shape[2]
-            stride_n = k_cache.stride(2)
         window_left = self._window_left if window_left is None else window_left
         if self._backend != "trtllm-gen":
             # NOTE(Siyuan): since window_left is appeared in the plan function, we need to make sure it is the same as the one in the plan function.
@@ -2106,24 +2077,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if self._prefix_len_ptr is not None:
             mask_mode = MaskMode.MULTIITEMSCORING.value
 
-        if self._backend == "fa3":
-            # NOTE(Zihao): we divide both stride_block and stride_n by stride_n
-            # because we will multiply stride_n back in the kernel
-            sparse_indices = block_sparse_indices_to_vector_sparse_offsets(
-                self._paged_kv_indices_buf,
-                self._paged_kv_indptr_buf,
-                self._vector_sparse_indices_buffer,  # output
-                self._vector_sparse_indptr_buffer,
-                self._kv_lens_buffer,
-                stride_block // stride_n,
-                1,  # stride_n // stride_n
-                page_size,
-            )
-            sparse_indptr = self._vector_sparse_indptr_buffer
-        else:
-            sparse_indices = self._paged_kv_indices_buf
-            sparse_indptr = self._paged_kv_indptr_buf
-
         if self._backend == "cudnn":
             if self._seq_lens_q is not None and self._seq_lens_q.dim() == 1:
                 self._seq_lens_q = self._seq_lens_q.reshape(self._batch_size, 1, 1, 1)
@@ -2160,8 +2113,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 k_cache,
                 v_cache,
                 self._qo_indptr_buf,
-                sparse_indptr,
-                sparse_indices,
+                self._paged_kv_indptr_buf,
+                self._paged_kv_indices_buf,
                 self._paged_kv_last_page_len_buf,
                 out,
                 lse,
@@ -2198,7 +2151,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     self._max_kv_len,
                     self._batch_size,
                     self._qo_indptr_buf,
-                    self._vector_sparse_indptr_buffer,
+                    self._paged_kv_indptr_buf,
                     sinks,
                 ]
 

@@ -218,13 +218,24 @@ void BatchPrefillWithPagedKVCacheSM90Run(
           params.k_stride_h = paged_k_cache.stride(2);
           params.v_stride_n = paged_v_cache.stride(1);
           params.v_stride_h = paged_v_cache.stride(2);
+          // For sparse paged KV cache, store the stride between pages
+          params.k_page_stride = paged_k_cache.stride(0);
+          params.v_page_stride = paged_v_cache.stride(0);
         } else {
           // (num_pages, num_heads, page_size, head_dim)
           params.k_stride_h = paged_k_cache.stride(1);
           params.k_stride_n = paged_k_cache.stride(2);
           params.v_stride_h = paged_v_cache.stride(1);
           params.v_stride_n = paged_v_cache.stride(2);
+          // For sparse paged KV cache, store the stride between pages
+          params.k_page_stride = paged_k_cache.stride(0);
+          params.v_page_stride = paged_v_cache.stride(0);
         }
+        // Sparse mainloop assumes K and V have same strides for efficiency
+        TVM_FFI_ICHECK_EQ(params.k_page_stride, params.v_page_stride)
+            << "K and V must have same page stride for sparse attention";
+        TVM_FFI_ICHECK_EQ(params.k_stride_n, params.v_stride_n)
+            << "K and V must have same stride_n for sparse attention";
         params.nnz_qo = q.size(0);
         params.num_qo_heads = q.size(1);
         params.num_kv_heads = num_kv_heads;
