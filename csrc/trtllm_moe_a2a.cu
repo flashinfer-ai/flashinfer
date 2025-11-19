@@ -108,31 +108,34 @@ Tensor moeA2AInitializeOp(TensorView workspace, int64_t epRank, int64_t epSize,
   return metainfo;
 }
 
-Tuple<Array<int64_t>, int64_t> moeA2ADispatchOp(TensorView tokenSelectedExperts,
-                                                TensorView payloadPtrsTensor,
-                                                TensorView payloadElementSizesTensor,
-                                                TensorView payloadElementsPerTokenTensor,
-                                                TensorView workspace, TensorView metainfo,
-                                                int64_t runtimeMaxTokensPerRank, int64_t epRank,
-                                                int64_t epSize, int64_t topK, int64_t numExperts) {
+Tuple<Array<int64_t>, Array<int64_t>, int64_t> moeA2ADispatchOp(
+    TensorView tokenSelectedExperts, Array<Tensor> inputPayloads, TensorView workspace,
+    TensorView metainfo, int64_t runtimeMaxTokensPerRank, int64_t epRank, int64_t epSize,
+    int64_t topK, int64_t numExperts) {
   using tl_throughput::PayloadDescriptor;
+  fflush(stdout);
+
   CHECK_INPUT(tokenSelectedExperts);
   CHECK_INPUT_TYPE(tokenSelectedExperts, dl_int32);
   TVM_FFI_ICHECK_EQ(tokenSelectedExperts.ndim(), 2) << "token_selected_experts must be 2D";
   TVM_FFI_ICHECK_EQ(tokenSelectedExperts.size(1), topK) << "token_selected_experts shape mismatch";
 
-  CHECK_INPUT_TYPE(payloadPtrsTensor, dl_int64);
-  CHECK_INPUT_TYPE(payloadElementSizesTensor, dl_int32);
-  CHECK_INPUT_TYPE(payloadElementsPerTokenTensor, dl_int32);
-  TVM_FFI_ICHECK_EQ(payloadPtrsTensor.ndim(), 1);
-  TVM_FFI_ICHECK_EQ(payloadElementSizesTensor.ndim(), 1);
-  TVM_FFI_ICHECK_EQ(payloadElementsPerTokenTensor.ndim(), 1);
-
-  int numPayloads = static_cast<int>(payloadPtrsTensor.size(0));
+  int numPayloads = static_cast<int>(inputPayloads.size());
   TVM_FFI_ICHECK(numPayloads > 0) << "At least one payload is required";
-  TVM_FFI_ICHECK(numPayloads <= tl_throughput::kMaxPayloads) << "Too many payloads";
-  TVM_FFI_ICHECK_EQ(payloadElementSizesTensor.size(0), numPayloads);
-  TVM_FFI_ICHECK_EQ(payloadElementsPerTokenTensor.size(0), numPayloads);
+  TVM_FFI_ICHECK(numPayloads <= tl_throughput::kMaxPayloads)
+      << "Too many payloads: " << numPayloads << " > " << tl_throughput::kMaxPayloads;
+
+  auto localNumTokens = static_cast<int>(tokenSelectedExperts.size(0));
+  TVM_FFI_ICHECK(localNumTokens > 0) << "local_num_tokens must be positive";
+
+  // Validate all payloads and calculate sizes
+  for (int i = 0; i < numPayloads; ++i) {
+    auto const& payload = inputPayloads[i];
+    CHECK_INPUT(payload);
+    TVM_FFI_ICHECK_EQ(payload.ndim(), 2) << "payload " << i << " must be 2D";
+    TVM_FFI_ICHECK_EQ(payload.size(0), localNumTokens)
+        << "payload " << i << " first dimension must match local_num_tokens";
+  }
 
   CHECK_CPU(metainfo);
   CHECK_INPUT_TYPE(metainfo, dl_int64);
@@ -151,29 +154,30 @@ Tuple<Array<int64_t>, int64_t> moeA2ADispatchOp(TensorView tokenSelectedExperts,
       << "num_experts must be divisible by ep_size";
   TVM_FFI_ICHECK(topK > 0 && topK <= tl_throughput::kMaxTopK);
 
-  auto localNumTokens = static_cast<int>(tokenSelectedExperts.size(0));
-  TVM_FFI_ICHECK(localNumTokens > 0) << "local_num_tokens must be positive";
-
-  auto* payloadPtrs = static_cast<int64_t const*>(payloadPtrsTensor.data_ptr());
-  auto* payloadEltSizes = static_cast<int32_t const*>(payloadElementSizesTensor.data_ptr());
-  auto* payloadEltPerToken = static_cast<int32_t const*>(payloadElementsPerTokenTensor.data_ptr());
-
+  // Calculate payload descriptors and sizes from input tensors
   std::vector<PayloadDescriptor> payloadDescriptors(numPayloads);
   std::vector<int64_t> payloadByteSizes(numPayloads);
   int64_t totalBytesNeeded = 0;
+
   for (int i = 0; i < numPayloads; ++i) {
-    payloadDescriptors[i].src_data = reinterpret_cast<void const*>(payloadPtrs[i]);
-    payloadDescriptors[i].element_size = payloadEltSizes[i];
-    payloadDescriptors[i].elements_per_token = payloadEltPerToken[i];
-    int64_t bytesPerPayload = static_cast<int64_t>(epSize) * runtimeMaxTokensPerRank *
-                              payloadEltPerToken[i] * payloadEltSizes[i];
+    auto const& payload = inputPayloads[i];
+    int elementsPerToken = static_cast<int>(payload.size(1));
+    int elementSize = static_cast<int>(get_element_size(payload));
+
+    payloadDescriptors[i].src_data = payload.data_ptr();
+    payloadDescriptors[i].element_size = elementSize;
+    payloadDescriptors[i].elements_per_token = elementsPerToken;
+
+    int64_t bytesPerPayload =
+        static_cast<int64_t>(epSize) * runtimeMaxTokensPerRank * elementsPerToken * elementSize;
     payloadByteSizes[i] = bytesPerPayload;
     totalBytesNeeded += bytesPerPayload;
   }
 
   auto* workspaceBase = static_cast<uint8_t*>(workspace.data_ptr());
   auto strideBytes = workspace.stride(0);
-  auto* rankWorkspacePtr = workspaceBase + epRank * strideBytes;
+  size_t rankWorkspaceOffset = epRank * strideBytes;
+  auto* rankWorkspacePtr = workspaceBase + rankWorkspaceOffset;
   int64_t sizePerRank = workspace.size(1);
 
   int64_t requiredSize = offsets[fi_throughput::PAYLOAD_DATA_OFFSET_INDEX] + totalBytesNeeded;
@@ -225,17 +229,18 @@ Tuple<Array<int64_t>, int64_t> moeA2ADispatchOp(TensorView tokenSelectedExperts,
   TVM_FFI_ICHECK(launchErr == cudaSuccess)
       << "moe_a2a_dispatch launch failed: " << cudaGetErrorString(launchErr);
 
-  Array<int64_t> recvPtrs;
-  recvPtrs.reserve(numPayloads);
+  Array<int64_t> recvOffsets;
+  Array<int64_t> recvByteSizes;
+  recvOffsets.reserve(numPayloads);
   size_t localOffset = static_cast<size_t>(offsets[fi_throughput::PAYLOAD_DATA_OFFSET_INDEX]);
-  for (int payloadIdx = 0; payloadIdx < numPayloads; ++payloadIdx) {
-    auto* ptr = rankWorkspacePtr + localOffset;
-    recvPtrs.push_back(reinterpret_cast<int64_t>(ptr));
-    localOffset += payloadByteSizes[payloadIdx];
+  for (auto payloadByteSize : payloadByteSizes) {
+    recvOffsets.push_back(rankWorkspaceOffset + localOffset);
+    recvByteSizes.push_back(payloadByteSize);
+    localOffset += payloadByteSize;
   }
 
   int64_t combinePayloadOffset = static_cast<int64_t>(alignOffset(localOffset));
-  return Tuple(recvPtrs, combinePayloadOffset);
+  return Tuple(recvOffsets, recvByteSizes, combinePayloadOffset);
 }
 
 nvinfer1::DataType toNvDataType(DLDataType dtype) {
