@@ -236,7 +236,7 @@ def trtllm_batch_decode_mla(
 @pytest.mark.parametrize(
     "q_len_per_request", [1, 2]
 )  # todo(Yingyi): verify larger q_len_per_request
-@pytest.mark.parametrize("dynamic_scale", [False])
+@pytest.mark.parametrize("dynamic_scale", [True, False])
 @pytest.mark.parametrize("enable_pdl", [True, False, None])
 @pytest.mark.parametrize("backend", ["trtllm-gen", "xqa"])
 def test_trtllm_batch_decode_mla(
@@ -270,7 +270,7 @@ def test_trtllm_batch_decode_mla(
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.bfloat16])
 @pytest.mark.parametrize("page_size", [64])
 @pytest.mark.parametrize("q_len_per_request", [1, 2, 3])
-@pytest.mark.parametrize("dynamic_scale", [False])
+@pytest.mark.parametrize("dynamic_scale", [True, False])
 @pytest.mark.parametrize("enable_pdl", [True, False, None])
 @pytest.mark.parametrize("backend", ["trtllm-gen"])
 @pytest.mark.parametrize("MAX_SEQ_LEN", [1024, 8960])
