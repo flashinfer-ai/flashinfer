@@ -334,13 +334,14 @@ cudaError_t BatchFP8PrefillWithPagedKVCacheKernelTraitsDispatched(Params& params
                        params.q_stride_n,
                        params.q_stride_h),  // layout_Q
        params.k_ptr,
-       // NOTE(Zihao): nnz was useless here, we can just pass 0
-       get_gmem_layout(/*nnz=*/0, params.num_kv_heads, KernelTraits::HEAD_DIM, params.k_stride_n,
-                       params.k_stride_h),  // layout_K
+       params.k_stride_n,     // k_stride_n
+       params.k_page_stride,  // k_page_stride
        params.v_ptr,
-       get_gmem_layout(/*nnz=*/0, params.num_kv_heads, KernelTraits::HEAD_DIM, params.v_stride_n,
-                       params.v_stride_h),  // layout_V
-       params.kv_indices, params.window_left, params.additional_params});
+       params.v_stride_n,     // v_stride_n
+       params.v_page_stride,  // v_page_stride
+       params.kv_indices,
+       static_cast<uint32_t>(params.page_size),  // page_size
+       params.window_left, params.additional_params});
   typename CollectiveEpilogue::Params epilogue_params =
       CollectiveEpilogue::to_underlying_arguments({
           params.o_ptr,

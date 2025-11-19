@@ -99,10 +99,13 @@ struct FP8SparseCollectiveMainloop {
     DTypeQ const* Q_ptr;
     LayoutT layout_Q;
     DTypeKV const* K_ptr;
-    LayoutT layout_K;
+    int64_t k_stride_n;     // Stride between consecutive KV tokens
+    int64_t k_page_stride;  // Stride between pages
     DTypeKV const* V_ptr;
-    LayoutT layout_V;
+    int64_t v_stride_n;     // Stride between consecutive KV tokens
+    int64_t v_page_stride;  // Stride between pages
     IdType const* kv_indices;
+    uint32_t page_size;  // Size of each page
     int window_left;
     AdditionalParams additional_params;
   };
@@ -110,12 +113,15 @@ struct FP8SparseCollectiveMainloop {
   // Device side kernel params
   struct Params {
     LayoutT layout_Q;
-    LayoutT layout_K;
-    LayoutT layout_V;
     TMA_Q tma_load_Q;
     DTypeKV* K_ptr;
+    int64_t k_stride_n;
+    int64_t k_page_stride;
     DTypeKV* V_ptr;
+    int64_t v_stride_n;
+    int64_t v_page_stride;
     IdType* kv_indices;
+    uint_fastdiv page_size;  // Size of each page (as fastdiv for efficient divmod)
     int window_left;
     AdditionalParams additional_params;
     using DTypeKV = typename Ktraits::DTypeKV;
@@ -125,15 +131,10 @@ struct FP8SparseCollectiveMainloop {
     Tensor mQ = make_tensor(make_gmem_ptr(args.Q_ptr), args.layout_Q);
     TMA_Q tma_load_Q =
         make_tma_copy(GmemTiledCopyQ{}, mQ, SmemLayoutQ{}, select<0, 2>(TileShape_QKD{}), _1{});
-    return {args.layout_Q,
-            args.layout_K,
-            args.layout_V,
-            tma_load_Q,
-            const_cast<DTypeKV*>(args.K_ptr),
-            const_cast<DTypeKV*>(args.V_ptr),
-            const_cast<IdType*>(args.kv_indices),
-            args.window_left,
-            args.additional_params};
+    return {args.layout_Q,   tma_load_Q,         const_cast<DTypeKV*>(args.K_ptr),
+            args.k_stride_n, args.k_page_stride, const_cast<DTypeKV*>(args.V_ptr),
+            args.v_stride_n, args.v_page_stride, const_cast<IdType*>(args.kv_indices),
+            args.page_size,  args.window_left,   args.additional_params};
   }
 
   CUTLASS_DEVICE
@@ -208,43 +209,71 @@ struct FP8SparseCollectiveMainloop {
 
     constexpr int HEAD_DIM = get<2>(TileShape_QKD{});
     constexpr int CTA_KV = get<1>(TileShape_QKD{});
-    auto indexed_gather = BlockSparseIndexedGather<IdType>(mainloop_params.kv_indices + kv_indptr);
+    IdType const* kv_indices_ptr = mainloop_params.kv_indices + kv_indptr;
 
-    Tensor mK = make_block_sparse_tensor(  // (kv_len, D)
-        make_gmem_ptr(mainloop_params.K_ptr + kv_head_idx * stride<2>(mainloop_params.layout_K)),
-        make_shape(kv_len, HEAD_DIM), stride<0>(mainloop_params.layout_K), indexed_gather);
-    Tensor mV = make_block_sparse_tensor(  // (kv_len, D)
-        make_gmem_ptr(mainloop_params.V_ptr + kv_head_idx * stride<2>(mainloop_params.layout_V)),
-        make_shape(kv_len, HEAD_DIM), stride<0>(mainloop_params.layout_V), indexed_gather);
-
-    Tensor gK = local_tile(mK, select<1, 2>(TileShape_QKD{}), make_coord(_, _0{}));  // (KV, D, kv)
-    Tensor gV = local_tile(mV, select<1, 2>(TileShape_QKD{}), make_coord(_, _0{}));  // (KV, D, kv)
-    Tensor cKV = cute::make_identity_tensor(gK.shape());
+    // Setup for manual K/V loading with page table
+    DTypeKV* k_base_ptr = mainloop_params.K_ptr;
+    DTypeKV* v_base_ptr = mainloop_params.V_ptr;
+    int64_t k_stride_n = mainloop_params.k_stride_n;
+    int64_t k_page_stride = mainloop_params.k_page_stride;
+    int64_t v_stride_n = mainloop_params.v_stride_n;
+    int64_t v_page_stride = mainloop_params.v_page_stride;
 
     GmemTiledCopyKV gmem_tiled_copy_kv;
     auto gmem_thr_copy_kv = gmem_tiled_copy_kv.get_slice(thread_idx);
 
-    Tensor tKgK = gmem_thr_copy_kv.partition_S(gK);     // (CPY, CPY_KV, CPY_D, kv)
-    Tensor tKsK = gmem_thr_copy_kv.partition_D(sK);     // (CPY, CPY_KV, CPY_D, PIPE)
-    Tensor tVgV = gmem_thr_copy_kv.partition_S(gV);     // (CPY, CPY_KV, CPY_D, kv)
-    Tensor tVsV = gmem_thr_copy_kv.partition_D(sV);     // (CPY, CPY_KV, CPY_D, PIPE)
+    // Create coordinate tensors for partitioning
+    Tensor cKV = cute::make_identity_tensor(make_shape(CTA_KV, HEAD_DIM));
     Tensor tKVcKV = gmem_thr_copy_kv.partition_D(cKV);  // (CPY, CPY_KV, CPY_D)
     Tensor tKVcKVGroup = flatten_1(tKVcKV);             // (CPY, (CPY_KV, CPY_D))
+    Tensor tKsK = gmem_thr_copy_kv.partition_D(sK);     // (CPY, CPY_KV, CPY_D, PIPE)
+    Tensor tVsV = gmem_thr_copy_kv.partition_D(sV);     // (CPY, CPY_KV, CPY_D, PIPE)
+
+    // Lambda to load K/V tile with manual offset calculation
+    auto load_kv_tile = [&](DTypeKV* base_ptr, int64_t stride_n, int64_t page_stride, auto& tXsX,
+                            int tile_idx, int pipe_idx, bool use_predicate) {
+      using VecType = typename GmemTiledCopyKV::ValType;
+      constexpr int VecSize = sizeof(VecType) / sizeof(DTypeKV);
+
+      int kv_base_idx = tile_idx * CTA_KV;
+      int valid_tile_size = use_predicate ? std::min<int>(kv_len - kv_base_idx, CTA_KV) : CTA_KV;
+
+      // Flatten the destination tensor for this pipe stage
+      Tensor tXsXiGroup = flatten_1(tXsX(_, _, _, pipe_idx));  // (CPY, (CPY_KV, CPY_D))
+
+      // Iterate over flattened elements this thread is responsible for
+      CUTE_UNROLL
+      for (int i = 0; i < size(tXsXiGroup); ++i) {
+        auto coord = tKVcKVGroup(_0{}, i);
+        int kv_offset = get<0>(coord);
+        int d_idx = get<1>(coord);
+        int kv_idx = kv_base_idx + kv_offset;
+
+        bool guard = kv_idx < kv_len && kv_offset < valid_tile_size;
+
+        // Compute page and offset within page
+        uint32_t page_iter, entry_idx;
+        mainloop_params.page_size.divmod(kv_idx, page_iter, entry_idx);
+        IdType page_idx = kv_indices_ptr[page_iter];
+
+        // Compute address: base_ptr + page_idx * page_stride + entry_idx * stride_n + d_idx
+        int64_t offset = page_idx * page_stride + entry_idx * stride_n + d_idx;
+        VecType const* src_ptr = reinterpret_cast<VecType const*>(base_ptr + offset);
+        VecType* dst_ptr = reinterpret_cast<VecType*>(&tXsXiGroup(0, i));
+
+        cutlass::arch::cp_async_zfill<sizeof(VecType), cutlass::arch::CacheOperation::Global>(
+            dst_ptr, src_ptr, guard);
+      }
+    };
 
     int valid_last_kv_tile_size = std::min<int>(kv_len - kv_tile_idx * CTA_KV, CTA_KV);
-    auto predicate_fn = [&](auto coords) {
-      auto s_coords = tKVcKVGroup(_0{}, coords);
-      return elem_less(get<0>(s_coords), valid_last_kv_tile_size);
-    };
 
     // load last k-tile
     // all threads are issuing as TMA is disabled
     {
       pipeline_k.producer_acquire(smem_pipe_write);
-      Tensor tKgKiGroup = flatten_1(tKgK(_, _, _, kv_tile_idx));  // (CPY, (CPY_KV, CPY_D))
-      Tensor tKsKiGroup =
-          flatten_1(tKsK(_, _, _, smem_pipe_write.index()));  // (CPY, (CPY_KV, CPY_D))
-      copy_if(gmem_tiled_copy_kv, predicate_fn, tKgKiGroup, tKsKiGroup);
+      load_kv_tile(k_base_ptr, k_stride_n, k_page_stride, tKsK, kv_tile_idx,
+                   smem_pipe_write.index(), true);
       pipeline_k.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
     }
 
@@ -266,10 +295,8 @@ struct FP8SparseCollectiveMainloop {
     if (kv_tile_idx == swa_begin_kv_tile_idx) {
       // first tile is the last tile
       pipeline_v.producer_acquire(smem_pipe_write);
-      Tensor tVgViGroup = flatten_1(tVgV(_, _, _, kv_tile_idx));  // (CPY, (CPY_KV, CPY_D))
-      Tensor tVsViGroup =
-          flatten_1(tVsV(_, _, _, smem_pipe_write.index()));  // (CPY, (CPY_KV, CPY_D))
-      copy_if(gmem_tiled_copy_kv, predicate_fn, tVgViGroup, tVsViGroup);
+      load_kv_tile(v_base_ptr, v_stride_n, v_page_stride, tVsV, kv_tile_idx,
+                   smem_pipe_write.index(), true);
       pipeline_v.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
 
       // Transpose V
@@ -283,10 +310,8 @@ struct FP8SparseCollectiveMainloop {
     } else {
       // load second last k-tile and last v-tile
       pipeline_v.producer_acquire(smem_pipe_write);
-      Tensor tVgViGroup = flatten_1(tVgV(_, _, _, kv_tile_idx));  // (CPY, (CPY_KV, CPY_D))
-      Tensor tVsViGroup =
-          flatten_1(tVsV(_, _, _, smem_pipe_write.index()));  // (CPY, (CPY_KV, CPY_D))
-      copy_if(gmem_tiled_copy_kv, predicate_fn, tVgViGroup, tVsViGroup);
+      load_kv_tile(v_base_ptr, v_stride_n, v_page_stride, tVsV, kv_tile_idx,
+                   smem_pipe_write.index(), true);
       pipeline_v.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
 
       // Transpose V
@@ -299,9 +324,8 @@ struct FP8SparseCollectiveMainloop {
       ++smem_pipe_write;  // update state, as K is loaded 1 step faster
 
       pipeline_k.producer_acquire(smem_pipe_write);
-      Tensor tKgKi = tKgK(_, _, _, kv_tile_idx - 1);          // (CPY, CPY_KV, CPY_D)
-      Tensor tKsKi = tKsK(_, _, _, smem_pipe_write.index());  // (CPY, CPY_KV, CPY_D)
-      copy(gmem_tiled_copy_kv, tKgKi, tKsKi);
+      load_kv_tile(k_base_ptr, k_stride_n, k_page_stride, tKsK, kv_tile_idx - 1,
+                   smem_pipe_write.index(), false);
       pipeline_k.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
 
       --kv_tile_idx;
@@ -310,9 +334,8 @@ struct FP8SparseCollectiveMainloop {
 #pragma unroll 2
       for (; kv_tile_idx > swa_begin_kv_tile_idx; --kv_tile_idx) {
         pipeline_v.producer_acquire(smem_pipe_write);
-        Tensor tVgVi = tVgV(_, _, _, kv_tile_idx);              // (CPY, CPY_KV, CPY_D)
-        Tensor tVsVi = tVsV(_, _, _, smem_pipe_write.index());  // (CPY, CPY_KV, CPY_D)
-        copy(gmem_tiled_copy_kv, tVgVi, tVsVi);
+        load_kv_tile(v_base_ptr, v_stride_n, v_page_stride, tVsV, kv_tile_idx,
+                     smem_pipe_write.index(), false);
         pipeline_v.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
 
         // Transpose V
@@ -325,9 +348,8 @@ struct FP8SparseCollectiveMainloop {
         ++smem_pipe_write;  // update state, as K is loaded 1 step faster
 
         pipeline_k.producer_acquire(smem_pipe_write);
-        Tensor tKgKi = tKgK(_, _, _, kv_tile_idx - 1);          // (CPY, CPY_KV, CPY_D)
-        Tensor tKsKi = tKsK(_, _, _, smem_pipe_write.index());  // (CPY, CPY_KV, CPY_D)
-        copy(gmem_tiled_copy_kv, tKgKi, tKsKi);
+        load_kv_tile(k_base_ptr, k_stride_n, k_page_stride, tKsK, kv_tile_idx - 1,
+                     smem_pipe_write.index(), false);
         pipeline_k.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
       }
       scheduler.prefetch_next_work(scheduler_params, work_tile_info);
@@ -335,9 +357,8 @@ struct FP8SparseCollectiveMainloop {
       // load first v tile
       {
         pipeline_v.producer_acquire(smem_pipe_write);
-        Tensor tVgVi = tVgV(_, _, _, 0);                        // (CPY, (CPY_KV, CPY_D))
-        Tensor tVsVi = tVsV(_, _, _, smem_pipe_write.index());  // (CPY, (CPY_KV, CPY_D))
-        copy(gmem_tiled_copy_kv, tVgVi, tVsVi);
+        load_kv_tile(v_base_ptr, v_stride_n, v_page_stride, tVsV, 0, smem_pipe_write.index(),
+                     false);
         pipeline_v.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
 
         // Transpose V
