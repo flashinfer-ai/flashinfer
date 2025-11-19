@@ -46,10 +46,10 @@ _API_LOG_DEST = _substitute_process_id(
     os.environ.get("FLASHINFER_LOGDEST_DBG", "stdout")
 )
 
-# Enable cuDNN, cuBLAS, and cuBLASLt API logging when FlashInfer logging level >= 3
+# Enable cuDNN, cuBLAS, and cuBLASLt API logging when FlashInfer logging level >= 5
 # Only override if the user hasn't already configured the logging switch
 # If the switch is not set, we override both the switch and destination as a bundle
-if _API_LOG_LEVEL >= 3:
+if _API_LOG_LEVEL >= 5:
     # cuBLAS logging: Check switch, set both switch and destination
     if "CUBLAS_LOGINFO_DBG" not in os.environ:
         os.environ["CUBLAS_LOGINFO_DBG"] = "1"
@@ -104,7 +104,7 @@ def _setup_logger():
     else:
         handler = logging.FileHandler(_API_LOG_DEST, mode="a")
 
-    # Use a simple formatter (we'll format the detailed content ourselves)
+    # Use a simple formatter (we'll add timestamps manually to key lines)
     formatter = logging.Formatter("%(message)s")
     handler.setFormatter(formatter)
 
@@ -116,6 +116,13 @@ def _setup_logger():
 _setup_logger()
 
 
+def _get_timestamp() -> str:
+    """Get current timestamp in the format [YYYY-MM-DD HH:MM:SS]."""
+    from datetime import datetime
+
+    return datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
+
+
 def _log_system_info():
     """Log system information once at module initialization."""
     if _API_LOG_LEVEL == 0:
@@ -123,7 +130,7 @@ def _log_system_info():
 
     lines = []
     lines.append("=" * 80)
-    lines.append("FlashInfer API Logging - System Information")
+    lines.append(f"{_get_timestamp()} FlashInfer API Logging - System Information")
     lines.append("=" * 80)
 
     try:
@@ -179,9 +186,9 @@ def _log_system_info():
         lines.append(f"PyTorch version: {torch.__version__}")
 
         # cuDNN/cuBLAS/cuBLASLt logging status
-        if _API_LOG_LEVEL >= 3:
+        if _API_LOG_LEVEL >= 5:
             lines.append("")
-            lines.append("cuDNN/cuBLAS/cuBLASLt Logging: Enabled (Level 3)")
+            lines.append("cuDNN/cuBLAS/cuBLASLt Logging: Enabled (Level 5)")
             cublas_info = os.environ.get("CUBLAS_LOGINFO_DBG", "not set")
             cublas_dest = os.environ.get("CUBLAS_LOGDEST_DBG", "not set")
             cublaslt_level = os.environ.get("CUBLASLT_LOG_LEVEL", "not set")
@@ -249,7 +256,7 @@ def _format_value(value: Any, level: int, indent: int = 0) -> str:
         if level == 1:
             return f"{indent_str}Tensor(...)"
 
-        # Level 2+: Show metadata
+        # Level 3+: Show metadata
         lines = [f"{indent_str}Tensor("]
         lines.append(f"{indent_str}  shape={tuple(value.shape)}")
         lines.append(f"{indent_str}  stride={tuple(value.stride())}")
@@ -258,8 +265,8 @@ def _format_value(value: Any, level: int, indent: int = 0) -> str:
         lines.append(f"{indent_str}  requires_grad={value.requires_grad}")
         lines.append(f"{indent_str}  is_contiguous={value.is_contiguous()}")
 
-        # Level 3: Add statistics
-        if level >= 3:
+        # Level 5: Add statistics
+        if level >= 5:
             try:
                 # Skip statistics if we're in CUDA graph capture mode
                 # (operations like .min()/.max()/.mean() cause synchronization issues)
@@ -452,11 +459,11 @@ def _log_function_inputs(
     kwargs : dict
         Keyword arguments
     level : int
-        Logging level (2 or 3)
+        Logging level (3 or 5)
     """
     lines = []
     lines.append("=" * 80)
-    lines.append(f"FlashInfer API Call: {func_name}")
+    lines.append(f"{_get_timestamp()} FlashInfer API Call: {func_name}")
     lines.append("-" * 80)
 
     # Log explicitly provided inputs
@@ -499,7 +506,7 @@ def _log_function_outputs(func_name: str, result: Any, level: int) -> None:
     result : Any
         Function return value
     level : int
-        Logging level (2 or 3)
+        Logging level (3 or 5)
     """
     lines = []
     # Log outputs
@@ -524,8 +531,8 @@ def flashinfer_api_log(func: Callable = None) -> Callable:
     FLASHINFER_LOGLEVEL_DBG : int (default: 0)
         - 0: No logging (zero overhead - decorator returns original function)
         - 1: Log function name only (logged BEFORE execution - crash-safe)
-        - 2: Log function name + inputs/outputs with metadata (inputs logged BEFORE execution - crash-safe)
-        - 3: Log function name + inputs/outputs with metadata + tensor statistics (inputs logged BEFORE execution - crash-safe)
+        - 3: Log function name + inputs/outputs with metadata (inputs logged BEFORE execution - crash-safe)
+        - 5: Log function name + inputs/outputs with metadata + tensor statistics (inputs logged BEFORE execution - crash-safe)
 
     FLASHINFER_LOGDEST_DBG : str (default: "stdout")
         - "stdout": Log to standard output
@@ -543,18 +550,20 @@ def flashinfer_api_log(func: Callable = None) -> Callable:
 
     Notes
     -----
+    - Key header lines include a timestamp in the format: [YYYY-MM-DD HH:MM:SS]
+      (e.g., "FlashInfer API Call: function_name", "FlashInfer API Logging - System Information")
     - When FLASHINFER_LOGLEVEL_DBG=0, the decorator has truly zero overhead
       as it returns the original function unchanged.
     - Function names and inputs are logged BEFORE execution:
       - Level 1: Function name only
-      - Levels 2-3: Function name + inputs with metadata
+      - Levels 3-5: Function name + inputs with metadata
       This means critical debugging information is preserved even if the function
       crashes (e.g., CUDA illegal memory access, out-of-bounds, etc.).
-    - Outputs are logged AFTER successful execution for levels 2 and 3.
-    - **CUDA Graph Compatibility**: At level 3, tensor statistics (min/max/mean/nan_count)
+    - Outputs are logged AFTER successful execution for levels 3 and 5.
+    - **CUDA Graph Compatibility**: At level 5, tensor statistics (min/max/mean/nan_count)
       are automatically skipped during CUDA graph capture to avoid synchronization issues.
       The message "[statistics skipped: CUDA graph capture in progress]" will be logged.
-    - **cuDNN/cuBLAS/cuBLASLt Integration**: At level 3, if not already set by the user, the following
+    - **cuDNN/cuBLAS/cuBLASLt Integration**: At level 5, if not already set by the user, the following
       environment variables are automatically configured to enable cuDNN, cuBLAS, and cuBLASLt logging:
       - CUBLAS_LOGINFO_DBG=1, CUBLAS_LOGDEST_DBG=flashinfer_cublas_log_%i.txt
       - CUBLASLT_LOG_LEVEL=2, CUBLASLT_LOG_FILE=flashinfer_cublaslt_log_%i.txt
@@ -588,9 +597,11 @@ def flashinfer_api_log(func: Callable = None) -> Callable:
             try:
                 if _API_LOG_LEVEL == 1:
                     # Level 1: Just log function name before execution (crash-safe)
-                    _logger.debug(f"FlashInfer API Call: {func_name}")
-                elif _API_LOG_LEVEL >= 2:
-                    # Level 2+: Log full inputs before execution (crash-safe)
+                    _logger.debug(
+                        f"{_get_timestamp()} FlashInfer API Call: {func_name}"
+                    )
+                elif _API_LOG_LEVEL >= 3:
+                    # Level 3+: Log full inputs before execution (crash-safe)
                     _log_function_inputs(f, func_name, args, kwargs, _API_LOG_LEVEL)
             except Exception as e:
                 _logger.error(f"[LOGGING ERROR in {func_name} (pre-execution)]: {e}")
@@ -598,10 +609,10 @@ def flashinfer_api_log(func: Callable = None) -> Callable:
             # Call the original function (may crash here with CUDA errors)
             result = f(*args, **kwargs)
 
-            # Log outputs AFTER successful execution (level 2+ only)
+            # Log outputs AFTER successful execution (level 3+ only)
             try:
-                if _API_LOG_LEVEL >= 2:
-                    # Level 2+: Log outputs (inputs were already logged above)
+                if _API_LOG_LEVEL >= 3:
+                    # Level 3+: Log outputs (inputs were already logged above)
                     _log_function_outputs(func_name, result, _API_LOG_LEVEL)
             except Exception as e:
                 _logger.error(f"[LOGGING ERROR in {func_name} (outputs)]: {e}")

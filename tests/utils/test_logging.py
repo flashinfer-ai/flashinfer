@@ -119,13 +119,13 @@ class TestAPILogging:
         finally:
             Path(log_file).unlink(missing_ok=True)
 
-    def test_level_2_inputs_outputs(self):
-        """Test that level 2 logs inputs and outputs with metadata."""
+    def test_level_3_inputs_outputs(self):
+        """Test that level 3 logs inputs and outputs with metadata."""
         with tempfile.NamedTemporaryFile(mode="w+", delete=False, suffix=".txt") as f:
             log_file = f.name
 
         try:
-            decorator = self.setup_logging(level=2, dest=log_file)
+            decorator = self.setup_logging(level=3, dest=log_file)
 
             @decorator
             def test_function(tensor, value):
@@ -151,19 +151,19 @@ class TestAPILogging:
             # Should log outputs
             assert "Output value:" in log_contents
 
-            # Should NOT log statistics (level 3 only)
+            # Should NOT log statistics (level 5 only)
             assert "min=" not in log_contents
             assert "max=" not in log_contents
         finally:
             Path(log_file).unlink(missing_ok=True)
 
-    def test_level_3_statistics(self):
-        """Test that level 3 logs tensor statistics."""
+    def test_level_5_statistics(self):
+        """Test that level 5 logs tensor statistics."""
         with tempfile.NamedTemporaryFile(mode="w+", delete=False, suffix=".txt") as f:
             log_file = f.name
 
         try:
-            decorator = self.setup_logging(level=3, dest=log_file)
+            decorator = self.setup_logging(level=5, dest=log_file)
 
             @decorator
             def test_function(tensor):
@@ -191,7 +191,7 @@ class TestAPILogging:
             log_file = f.name
 
         try:
-            decorator = self.setup_logging(level=2, dest=log_file)
+            decorator = self.setup_logging(level=3, dest=log_file)
 
             @decorator
             def test_function(mode: TestEnum, strategy: StringEnum):
@@ -221,7 +221,7 @@ class TestAPILogging:
             log_file = f.name
 
         try:
-            decorator = self.setup_logging(level=2, dest=log_file)
+            decorator = self.setup_logging(level=3, dest=log_file)
 
             @decorator
             def test_function(x, y=10, z=20, mode=TestEnum.OPTION_A):
@@ -252,7 +252,7 @@ class TestAPILogging:
             log_file = f.name
 
         try:
-            decorator = self.setup_logging(level=2, dest=log_file)
+            decorator = self.setup_logging(level=3, dest=log_file)
 
             @decorator
             def test_function(x, y=10, z=20):
@@ -316,7 +316,7 @@ class TestAPILogging:
             log_file = f.name
 
         try:
-            decorator = self.setup_logging(level=2, dest=log_file)
+            decorator = self.setup_logging(level=3, dest=log_file)
 
             @decorator
             def crashing_function(x, y):
@@ -349,7 +349,7 @@ class TestAPILogging:
             log_file = f.name
 
         try:
-            decorator = self.setup_logging(level=2, dest=log_file)
+            decorator = self.setup_logging(level=3, dest=log_file)
 
             @decorator
             def test_function(
@@ -387,7 +387,7 @@ class TestAPILogging:
             log_file = f.name
 
         try:
-            decorator = self.setup_logging(level=2, dest=log_file)
+            decorator = self.setup_logging(level=3, dest=log_file)
 
             @decorator
             def test_function(tensor):
@@ -420,7 +420,7 @@ class TestAPILogging:
             log_file = f.name
 
         try:
-            decorator = self.setup_logging(level=2, dest=log_file)
+            decorator = self.setup_logging(level=3, dest=log_file)
 
             @decorator
             def test_function(nested):
@@ -510,7 +510,7 @@ class TestAPILogging:
             log_file = f.name
 
         try:
-            decorator = self.setup_logging(level=2, dest=log_file)
+            decorator = self.setup_logging(level=3, dest=log_file)
 
             @decorator
             def test_function(a, b, c):
@@ -534,12 +534,12 @@ class TestAPILogging:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_cuda_graph_compatibility(self):
-        """Test that level 3 logging is compatible with CUDA graph capture."""
+        """Test that level 5 logging is compatible with CUDA graph capture."""
         with tempfile.NamedTemporaryFile(mode="w+", delete=False, suffix=".txt") as f:
             log_file = f.name
 
         try:
-            decorator = self.setup_logging(level=3, dest=log_file)
+            decorator = self.setup_logging(level=5, dest=log_file)
 
             @decorator
             def test_cuda_function(tensor):

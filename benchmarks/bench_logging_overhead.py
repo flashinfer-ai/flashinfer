@@ -12,14 +12,14 @@ Why torch.matmul instead of bmm_fp8?
 
 Usage:
     # Set the logging level before running
-    export FLASHINFER_LOGLEVEL_DBG=2
+    export FLASHINFER_LOGLEVEL_DBG=3
     python bench_logging_overhead.py
 
     # Or run with different levels
     FLASHINFER_LOGLEVEL_DBG=0 python bench_logging_overhead.py
     FLASHINFER_LOGLEVEL_DBG=1 python bench_logging_overhead.py
-    FLASHINFER_LOGLEVEL_DBG=2 python bench_logging_overhead.py
     FLASHINFER_LOGLEVEL_DBG=3 python bench_logging_overhead.py
+    FLASHINFER_LOGLEVEL_DBG=5 python bench_logging_overhead.py
 
     # Or use the helper script to run all levels
     bash benchmark_all_levels.sh
@@ -233,8 +233,8 @@ def main():
     level_names = {
         0: "No logging (zero-overhead)",
         1: "Function name only",
-        2: "Name + inputs/outputs + metadata",
-        3: "Name + inputs/outputs + metadata + statistics",
+        3: "Name + inputs/outputs + metadata",
+        5: "Name + inputs/outputs + metadata + statistics",
     }
     print(f"  Level description: {level_names.get(LOGGING_LEVEL, 'Unknown')}")
 
@@ -329,7 +329,7 @@ def main():
     print("RECOMMENDATIONS")
     print("=" * 80)
     print("\nTo benchmark other levels, run:")
-    for level in [0, 1, 2, 3]:
+    for level in [0, 1, 3, 5]:
         if level != LOGGING_LEVEL:
             print(f"  FLASHINFER_LOGLEVEL_DBG={level} python {sys.argv[0]}")
 
