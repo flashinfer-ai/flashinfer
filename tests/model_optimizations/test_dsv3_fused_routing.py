@@ -119,7 +119,7 @@ accumulating more numerical error.
 import torch
 import pytest
 from flashinfer.dsv3_ops import NoAuxTc
-from flashinfer.utils import get_compute_capability
+# from flashinfer.utils import get_compute_capability
 
 
 class DSv3RoutingGroundTruth:
@@ -527,10 +527,6 @@ def test_dsv3_fused_routing_op(
     1. Expert selection equivalence (allowing for ties)
     2. Value correctness within numerical precision tolerance
     """
-    compute_capability = get_compute_capability(torch.device("cuda"))
-    compute_capability_number = compute_capability[0] * 10 + compute_capability[1]
-    if compute_capability_number != 100:
-        pytest.skip("DSv3 Fused Routing is only supported on SM100")
 
     # Skip invalid configurations
     if topk_group * n_group < topk or topk_group > n_group:
