@@ -246,8 +246,6 @@ an error.
 
 We guard these partial chunks by zero-padding unused lanes, and only writing
 back the elements that actually exist in the chunk.
-
-Need to check to see how we impact perf.
 */
 template <typename DType, typename QuantType, uint32_t vec_size>
 __device__ __forceinline__ void scale_store_partial_chunk(const DType* in_ptr, QuantType* out_ptr,
@@ -1165,8 +1163,9 @@ cudaError_t RopeQuantizeAppendPagedKVCache(
     config.attrs = attribute;
     config.numAttrs = 1;
 
-    auto kernel = RopeQuantizeAppendPagedKVCacheKernel<INTERLEAVE, vec_size, 1, DType, IdType,
-                                                       QuantType, paged_kv_t<QuantType, IdType>>;
+    auto kernel =
+        RopeQuantizeAppendPagedKVCacheKernel<INTERLEAVE, vec_size, /*bdx=*/1, DType, IdType,
+                                             QuantType, paged_kv_t<QuantType, IdType>>;
     RopeQuantizeAppendPagedKVCacheParams params;
     params.nnz = nnz;
     params.num_qo_heads = num_qo_heads;
@@ -1239,8 +1238,8 @@ cudaError_t RopeQuantizeAppendPagedMLACache(
     config.numAttrs = 1;
 
     auto kernel =
-        RopeQuantizeAppendPagedKVCacheKernel<INTERLEAVE, vec_size, 1, DType, IdType, QuantType,
-                                             paged_kv_mla_t<QuantType, IdType>>;
+        RopeQuantizeAppendPagedKVCacheKernel<INTERLEAVE, vec_size, /*bdx=*/1, DType, IdType,
+                                             QuantType, paged_kv_mla_t<QuantType, IdType>>;
     DType* v_in_nullptr = nullptr;
     uint32_t num_kv_heads_1 = 1;
     size_t k_rope_in_stride_h_dup = k_rope_in_stride;
@@ -1268,9 +1267,18 @@ cudaError_t RopeQuantizeAppendPagedMLACache(
     params.quant_scale_q = quant_scale_q;
     params.quant_scale_kv = quant_scale_kv;
 
-    FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
-        &config, kernel, q_rope_in, k_rope_in, q_nope_in, k_nope_in, v_in_nullptr, q_rope_out,
-        q_nope_out, paged_kv_mla, batch_indices, positions, cos_sin_cache, pos_ids, params));
+    FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel,
+                                            // inputs
+                                            q_rope_in, k_rope_in, q_nope_in, k_nope_in,
+                                            v_in_nullptr,
+                                            // q outputs
+                                            q_rope_out, q_nope_out,
+                                            // cache + indices
+                                            paged_kv_mla, batch_indices, positions,
+                                            // rope tables
+                                            cos_sin_cache, pos_ids,
+                                            // params
+                                            params));
   });
 
   return cudaSuccess;
