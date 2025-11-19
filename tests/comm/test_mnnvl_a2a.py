@@ -193,8 +193,6 @@ def run_moe_a2a_dispatch_single_rank(
         assert recv_tensor.shape[1] == max_num_tokens
         assert recv_tensor.shape[2] == payloads[i].shape[1]
 
-    print(f"[Rank {rank}] Dispatch test passed")
-
 
 def run_moe_a2a_dispatch_moe_combine_single_rank(
     ep_size, all_num_tokens, top_k, num_experts_per_rank, hidden_size
@@ -311,8 +309,6 @@ def run_moe_a2a_dispatch_moe_combine_single_rank(
 
     # Verify against reference
     torch.testing.assert_close(combined_output, reference_output, rtol=1e-2, atol=1e-2)
-
-    print(f"[Rank {rank}] Full cycle test passed")
 
 
 @pytest.mark.parametrize("ep_size", [2, 4])
