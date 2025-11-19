@@ -659,11 +659,6 @@ def test_moe_a2a_dispatch_moe_combine(ep_size, all_num_tokens, top_k):
     hidden_states = payloads[0]
     token_final_scales = payloads[2]
 
-    # Create experts for this rank
-    experts = create_experts(
-        num_experts_per_rank, hidden_size, rank, "cuda", dtype=torch.bfloat16
-    )
-
     # Compute reference (single-GPU MoE)
     all_experts = torch.cat(
         [
@@ -675,14 +670,16 @@ def test_moe_a2a_dispatch_moe_combine(ep_size, all_num_tokens, top_k):
         dim=0,
     )
 
+    rank_experts = create_experts(
+        num_experts_per_rank, hidden_size, rank, "cuda", dtype=torch.bfloat16
+    )
+
     reference_output = fake_moe(
         hidden_states,
         token_selected_experts,
         token_final_scales,
         all_experts,
-        is_ep=True,
-        ep_rank=rank,
-        num_experts_per_rank=num_experts_per_rank,
+        is_ep=False,
     )
 
     torch.cuda.synchronize()
@@ -717,21 +714,22 @@ def test_moe_a2a_dispatch_moe_combine(ep_size, all_num_tokens, top_k):
     moe_output.zero_()
 
     # Process each rank's tokens with local experts
-    for source_rank in range(ep_size):
-        source_num_tokens = all_num_tokens[source_rank]
-        for token_idx in range(source_num_tokens):
-            for k in range(top_k):
-                expert_id = token_selected_experts_recv[
-                    source_rank, token_idx, k
-                ].item()
-                local_expert_id = expert_id - rank * num_experts_per_rank
-
-                if 0 <= local_expert_id < num_experts_per_rank:
-                    token_hidden = hidden_states_recv[source_rank, token_idx]
-                    scale = token_final_scales_recv[source_rank, token_idx, k]
-                    expert_out = token_hidden @ experts[local_expert_id]
-                    output_idx = source_rank * max_num_tokens + token_idx
-                    moe_output[output_idx] += expert_out * scale
+    print(
+        f"hidden_states_recv.shape: {hidden_states_recv.shape}, token_selected_experts_recv.shape: {token_selected_experts_recv.shape}, token_final_scales_recv.shape: {token_final_scales_recv.shape}, rank_experts.shape: {rank_experts.shape}, moe_output.shape: {moe_output.shape}"
+    )
+    moe_output[rank] = fake_moe(
+        hidden_states_recv.view(ep_size * max_num_tokens, hidden_states_recv.shape[-1]),
+        token_selected_experts_recv.view(
+            ep_size * max_num_tokens, token_selected_experts_recv.shape[-1]
+        ),
+        token_final_scales_recv.view(
+            ep_size * max_num_tokens, token_final_scales_recv.shape[-1]
+        ),
+        rank_experts,  # experts for current rank
+        is_ep=True,
+        ep_rank=rank,
+        num_experts_per_rank=num_experts_per_rank,
+    ).view(ep_size, max_num_tokens, hidden_states_recv.shape[-1])
 
     # Combine
     combined_output = moe_a2a.combine(

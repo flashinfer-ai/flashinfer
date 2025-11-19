@@ -529,7 +529,7 @@ class MoeAlltoAll:
             dtype: Data type for the tensor
 
         Returns:
-            tensor: [ep_size * max_tokens, hidden_size] workspace-backed tensor
+            tensor: [ep_size, max_tokens, hidden_size] workspace-backed tensor
         """
         if self._state.phase != "dispatched":
             raise RuntimeError(
@@ -539,7 +539,7 @@ class MoeAlltoAll:
         element_size = torch.tensor([], dtype=dtype).element_size()
         return moe_a2a_wrap_payload_tensor_in_workspace(
             self.workspace[self.ep_rank, :],
-            [self.ep_size * runtime_max_tokens_per_rank],
+            [self.ep_size, runtime_max_tokens_per_rank],
             self._state.combine_payload_offset,
             self._state.combine_payload_offset
             + self.ep_size * runtime_max_tokens_per_rank * hidden_size * element_size,
