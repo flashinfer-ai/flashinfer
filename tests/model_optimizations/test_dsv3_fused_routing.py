@@ -545,6 +545,7 @@ def test_dsv3_fused_routing_op(
             pytest.skip("Invalid configuration: exceeds kernel limits for n_group = 1")
 
     # Generate random inputs
+    torch.manual_seed(42)
     scores = torch.randn(num_tokens, num_experts, device="cuda", dtype=data_type)
     bias = torch.randn(num_experts, device="cuda", dtype=bias_type)
     routed_scaling_factor = 1.0
