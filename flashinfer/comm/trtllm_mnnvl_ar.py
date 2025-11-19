@@ -7,7 +7,7 @@ import functools
 import math
 import logging
 from types import SimpleNamespace
-from typing import Optional
+from typing import Optional, Tuple
 from enum import Enum
 
 import torch
@@ -34,11 +34,12 @@ class MNNVLAllreduceFusionStrategy(Enum):
     @staticmethod
     def is_one_shot(tp_size: int, num_tokens: int, hidden_dim: int, dtype: torch.dtype) -> bool:
         elem_size = torch.tensor([], dtype=dtype).element_size()
-        return num_tokens * hidden_dim * tp_size * elem_size <= kMNNVLOneShotThreshold
+        return num_tokens * hidden_dim * tp_size * elem_size <= MNNVL_ONE_SHOT_THRESHOLD
 
 
 # Empirical result calculated from num_tokens * hidden_dim * tp_size * elem_size
-kMNNVLOneShotThreshold = 64 * 1024 * 8 * 2
+# TODO(Refactor): Consider moving this to a configuration class or file
+MNNVL_ONE_SHOT_THRESHOLD = 64 * 1024 * 8 * 2
 
 
 class MNNVLAllreduceFusionWorkspace:
@@ -133,7 +134,7 @@ def get_trtllm_mnnvl_comm_module():
     @register_custom_op(
         "flashinfer::trtllm_mnnvl_allreduce_fusion",
         mutates_args=[
-            "inp",
+            "input",
             "multicast_buffer_ptr",
             "buffer_ptrs_dev",
             "buffer_ptr_local",
@@ -143,7 +144,7 @@ def get_trtllm_mnnvl_comm_module():
             "rmsnorm_fusion",
             "launch_with_pdl",
             "use_oneshot",
-            "out",
+            "output",
             "residual_out",
             "residual_in",
             "gamma",
@@ -151,7 +152,7 @@ def get_trtllm_mnnvl_comm_module():
         ],
     )
     def trtllm_mnnvl_allreduce_fusion(
-        inp: torch.Tensor,
+        input: torch.Tensor,
         multicast_buffer_ptr: int,  # Pointer address as integer
         buffer_ptrs_dev: int,  # Pointer address as integer
         buffer_ptr_local: int,  # Pointer address as integer
@@ -161,7 +162,7 @@ def get_trtllm_mnnvl_comm_module():
         rmsnorm_fusion: bool,
         launch_with_pdl: bool,
         use_oneshot: bool,
-        out: Optional[torch.Tensor],
+        output: torch.Tensor,
         residual_out: Optional[torch.Tensor],
         residual_in: Optional[torch.Tensor],
         gamma: Optional[torch.Tensor],
@@ -170,7 +171,7 @@ def get_trtllm_mnnvl_comm_module():
         """
         Perform a multi-node NVLink all-reduce operation with fusion.
         Args:
-            inp: Input tensor
+            input: Input tensor
             multicast_buffer_ptr: Pointer to the multicast buffer as an integer
             buffer_ptrs_dev: Pointer to the device array of buffer pointers as an integer
             buffer_ptr_local: Pointer to local buffer as an integer
@@ -180,13 +181,13 @@ def get_trtllm_mnnvl_comm_module():
             rmsnorm_fusion: Whether to perform RMSNorm fusion
             launch_with_pdl: Whether to launch with PDL
             use_oneshot: Whether to use one-shot (true) or two-shot (false)
-            outp: Output tensor
+            output: Output tensor
             residual_out: Residual output tensor (if rmsnorm)
             gamma: Gamma tensor (if rmsnorm)
             epsilon: Epsilon value (if rmsnorm)
         """
         module.trtllm_mnnvl_allreduce_fusion(
-            inp,
+            input,
             multicast_buffer_ptr,
             buffer_ptrs_dev,
             buffer_ptr_local,
@@ -196,7 +197,7 @@ def get_trtllm_mnnvl_comm_module():
             rmsnorm_fusion,
             launch_with_pdl,
             use_oneshot,
-            out,
+            output,
             residual_out,
             residual_in,
             gamma,
@@ -208,13 +209,13 @@ def get_trtllm_mnnvl_comm_module():
     )
 
 
-def trtllm_mnnvl_all_reduce(
-    inp: torch.Tensor,
+def trtllm_mnnvl_allreduce(
+    input: torch.Tensor,
     workspace: MNNVLAllreduceFusionWorkspace,
     launch_with_pdl: bool,
-    out: Optional[torch.Tensor] = None,
+    output: Optional[torch.Tensor] = None,
     strategy: MNNVLAllreduceFusionStrategy = MNNVLAllreduceFusionStrategy.AUTO,
-) -> None:
+) -> torch.Tensor:
     """Perform a multi-node NVLink all-reduce operation across multiple GPUs.
 
     This function performs an all-reduce (sum) operation using NVIDIA's multi-node NVLink (MNNVL)
@@ -229,24 +230,32 @@ def trtllm_mnnvl_all_reduce(
         Suitable for large data size and is optimized for balancing throughput and latency.
 
     Args:
-        inp: Local Input Shard [num_tokens, hidden_dim]
+        input: Local Input Shard [num_tokens, hidden_dim]
         workspace: MNNVLAllreduceFusionWorkspace
         launch_with_pdl: Whether to launch with PDL
-        out: Output tensor to store the result
+        output: Output tensor to store the result, empty tensor will be created if not provided.
         strategy: MNNVLAllreduceFusionStrategy. Internal heuristics will be used if not provided.
+    Returns:
+        output: Reduced tensor [num_tokens, hidden_dim]
     """
 
-    if len(inp.shape) != 2:
-        raise ValueError(f"The input tensor must be 2D, got {len(inp.shape)}D. The shape is {inp.shape}.")
+    # Check ndims here as the shape check is done in the kernel launch code.
+    if len(input.shape) != 2:
+        raise ValueError(f"The input tensor must be 2D, got {len(input.shape)}D. The shape is {input.shape}.")
+
+    if output is None:
+        output = torch.empty_like(input)
+    elif len(output.shape) != 2:
+        raise ValueError(f"The output tensor must be 2D, got {len(output.shape)}D. The shape is {output.shape}.")
 
     module = get_trtllm_mnnvl_comm_module()
 
     use_oneshot = strategy == MNNVLAllreduceFusionStrategy.ONESHOT or (
         strategy == MNNVLAllreduceFusionStrategy.AUTO
-        and MNNVLAllreduceFusionStrategy.is_one_shot(workspace.tp_size, inp.shape[0], inp.shape[1], inp.dtype)
+        and MNNVLAllreduceFusionStrategy.is_one_shot(workspace.tp_size, input.shape[0], input.shape[1], input.dtype)
     )
     module.trtllm_mnnvl_allreduce_fusion(
-        inp,
+        input,
         workspace.mc_ptr,
         workspace.uc_ptrs_dev,
         workspace.uc_ptr_local,
@@ -256,7 +265,7 @@ def trtllm_mnnvl_all_reduce(
         False,  # No RMSNorm Fusion
         launch_with_pdl,
         use_oneshot,
-        out,
+        output,
         None,
         None,
         None,
@@ -265,36 +274,60 @@ def trtllm_mnnvl_all_reduce(
 
 
 def trtllm_mnnvl_fused_allreduce_rmsnorm(
-    prenorm_output: torch.Tensor,
-    normed_output: torch.Tensor,
-    shard_input: torch.Tensor,
-    workspace: MNNVLAllreduceFusionWorkspace,
+    input: torch.Tensor,
+    residual_in: torch.Tensor,
     gamma: torch.Tensor,
-    epsilon: float,
-    residual: torch.Tensor,
-    launch_with_pdl: bool,
+    workspace: MNNVLAllreduceFusionWorkspace,
+    epsilon: Optional[float] = None,
+    output: Optional[torch.Tensor] = None,
+    residual_out: Optional[torch.Tensor] = None,
+    launch_with_pdl: bool = False,
     strategy: MNNVLAllreduceFusionStrategy = MNNVLAllreduceFusionStrategy.AUTO,
-) -> None:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """Performs MNNVL Allreduce + RMSNorm.
 
-    This function performs a multi-node all-reduce (sum) operation by first calling trtllm_mnnvl_all_reduce on the shard_input.
+    This function performs a multi-node all-reduce (sum) operation by first calling trtllm_mnnvl_allreduce on the shard_input.
     After this, it performs RMSNorm on the all-reduced result, reading it directly from the multicast buffer.
     Note: multicast buffer is the same as the unicast buffer for the current rank.
 
     Args:
-        prenorm_output: Output tensor for prenorm results
-        normed_output: Output tensor for normalized results
-        shard_input: Input tensor shard
+        input: Input tensor [num_tokens, hidden_dim]
+        residual_in: Residual input tensor [num_tokens, hidden_dim]
+        gamma: Gamma tensor [hidden_dim]
         workspace: MNNVLAllreduceFusionWorkspace
-        gamma: The gamma (norm weight) parameter for RMSNorm
-        epsilon: The epsilon parameter for RMSNorm
-        residual: The residual tensor to add
+        epsilon: The epsilon parameter for RMSNorm, torch.finfo.eps will be used if not provided.
+        output: Output tensor for normalized results [num_tokens, hidden_dim], empty tensor will be created if not provided.
+        residual_out: Residual output tensor [num_tokens, hidden_dim], empty tensor will be created if not provided.
         launch_with_pdl: Whether to launch with PDL
+        strategy: MNNVLAllreduceFusionStrategy. Internal heuristics will be used if not provided.
 
+    Returns:
+        output: Normalized tensor [num_tokens, hidden_dim]
+        residual_out: Residual output tensor [num_tokens, hidden_dim]
     """
-    if len(shard_input.shape) != 2:
+
+    if epsilon is None:
+        epsilon = torch.finfo(input.dtype).eps
+
+    if len(input.shape) != 2:
+        raise ValueError(f"The input tensor must be 2D, got {len(input.shape)}D. The shape is {input.shape}.")
+    if len(residual_in.shape) != 2:
         raise ValueError(
-            f"The input tensor must be 2D, got {len(shard_input.shape)}D. The shape is {shard_input.shape}."
+            f"The residual input tensor must be 2D, got {len(residual_in.shape)}D. The shape is {residual_in.shape}."
+        )
+    if gamma.numel() != input.shape[1]:
+        raise ValueError(
+            f"The gamma tensor must have the same number of elements as the hidden dimension, got {gamma.numel()} elements but expected {input.shape[1]} elements."
+        )
+    if output is None:
+        output = torch.empty_like(input)
+    elif len(output.shape) != 2:
+        raise ValueError(f"The output tensor must be 2D, got {len(output.shape)}D. The shape is {output.shape}.")
+    if residual_out is None:
+        residual_out = torch.empty_like(residual_in)
+    elif len(residual_out.shape) != 2:
+        raise ValueError(
+            f"The residual output tensor must be 2D, got {len(residual_out.shape)}D. The shape is {residual_out.shape}."
         )
 
     module = get_trtllm_mnnvl_comm_module()
@@ -303,14 +336,14 @@ def trtllm_mnnvl_fused_allreduce_rmsnorm(
         strategy == MNNVLAllreduceFusionStrategy.AUTO
         and MNNVLAllreduceFusionStrategy.is_one_shot(
             workspace.tp_size,
-            shard_input.shape[0],
-            shard_input.shape[1],
-            shard_input.dtype,
+            input.shape[0],
+            input.shape[1],
+            input.dtype,
         )
     )
 
     module.trtllm_mnnvl_allreduce_fusion(
-        shard_input,
+        input,
         workspace.mc_ptr,
         workspace.uc_ptrs_dev,
         workspace.uc_ptr_local,
@@ -320,9 +353,10 @@ def trtllm_mnnvl_fused_allreduce_rmsnorm(
         True,  # RMSNorm Fusion
         launch_with_pdl,
         use_oneshot,
-        normed_output,
-        prenorm_output,
-        residual,
+        output,
+        residual_out,
+        residual_in,
         gamma,
         epsilon,
     )
+    return output, residual_out
