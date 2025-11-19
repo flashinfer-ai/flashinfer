@@ -8,13 +8,16 @@ supporting multiple payloads per collective operation.
 # TODO Review
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Optional
 
 import torch
+import functools
 
 from .mnnvl import MnnvlMemory
 from .mapping import Mapping
 from ..jit.comm import gen_mnnvl_a2a_module
+from ..utils import register_custom_op
 
 
 @dataclass
@@ -26,9 +29,193 @@ class _A2AState:
     combine_payload_offset: Optional[int] = None
 
 
+@functools.cache
 def get_mnnvl_a2a_module():
     """Get or build the MNNVL A2A JIT module."""
-    return gen_mnnvl_a2a_module().build_and_load()
+    module = gen_mnnvl_a2a_module().build_and_load()
+
+    @register_custom_op(
+        "flashinfer::moe_a2a_initialize",
+        mutates_args=[],
+    )
+    def moe_a2a_initialize(
+        workspace: torch.Tensor,
+        ep_rank: int,
+        ep_size: int,
+        max_num_tokens: int,
+    ):
+        return module.moe_a2a_initialize(workspace, ep_rank, ep_size, max_num_tokens)
+
+    @register_custom_op(
+        "flashinfer::moe_a2a_dispatch",
+        mutates_args=[],
+    )
+    def moe_a2a_dispatch(
+        token_selected_experts: torch.Tensor,
+        input_payloads: list[torch.Tensor],
+        workspace: torch.Tensor,
+        metainfo: torch.Tensor,
+        runtime_max_tokens_per_rank: int,
+        ep_rank: int,
+        ep_size: int,
+        top_k: int,
+        num_experts: int,
+    ):
+        """
+        Dispatch tokens and payloads to expert ranks.
+
+        Args:
+            token_selected_experts: [local_num_tokens, top_k] int32 tensor
+            input_payloads: List of [local_num_tokens, *] tensors to dispatch
+            workspace: [ep_size, size_per_rank] workspace tensor
+            metainfo: Metadata tensor from initialize
+            runtime_max_tokens_per_rank: Max tokens per rank in this batch
+            ep_rank: Current expert parallel rank
+            ep_size: Total expert parallel size
+            top_k: Number of experts per token
+            num_experts: Total number of experts
+
+        Returns:
+            recv_tensors: List of [ep_size, max_tokens, *] tensors
+            combine_payload_offset: Offset for combine payload region
+        """
+        print(
+            f"moe_a2a_dispatch: token_selected_experts.shape={token_selected_experts.shape}, input_payloads={input_payloads}, workspace.shape={workspace.shape}, metainfo.shape={metainfo.shape}, runtime_max_tokens_per_rank={runtime_max_tokens_per_rank}, ep_rank={ep_rank}, ep_size={ep_size}, top_k={top_k}, num_experts={num_experts}"
+        )
+        recv_offsets, recv_sizes, combine_payload_offset = module.moe_a2a_dispatch(
+            token_selected_experts,
+            input_payloads,
+            workspace,
+            metainfo,
+            runtime_max_tokens_per_rank,
+            ep_rank,
+            ep_size,
+            top_k,
+            num_experts,
+        )
+        print(
+            f"moe_a2a_dispatch: recv_offsets={recv_offsets}, recv_sizes={recv_sizes}, combine_payload_offset={combine_payload_offset}"
+        )
+        workspace_base = workspace.flatten().view(dtype=torch.uint8)
+        output_payloads = []
+        for input_payload, offset, size in zip(
+            input_payloads, recv_offsets, recv_sizes, strict=True
+        ):
+            output_payload = (
+                workspace_base[offset : offset + size]
+                .view([ep_size, runtime_max_tokens_per_rank, -1])
+                .view(dtype=input_payload.dtype)
+            )
+            output_payloads.append(output_payload)
+
+        return output_payloads, combine_payload_offset
+
+    @register_custom_op(
+        "flashinfer::moe_a2a_combine",
+        mutates_args=[],
+    )
+    def moe_a2a_combine(
+        payload: torch.Tensor,
+        local_num_tokens: int,
+        workspace: torch.Tensor,
+        metainfo: torch.Tensor,
+        runtime_max_tokens_per_rank: int,
+        ep_rank: int,
+        ep_size: int,
+        top_k: int,
+        combine_payload_offset: int,
+        payload_in_workspace: bool = False,
+    ) -> torch.Tensor:
+        """
+        Combine expert outputs back to originating tokens.
+
+        Args:
+            payload: [ep_size, max_tokens, elements_per_token] tensor
+            local_num_tokens: Number of tokens on this rank
+            workspace: [ep_size, size_per_rank] workspace tensor
+            metainfo: Metadata tensor from initialize
+            runtime_max_tokens_per_rank: Max tokens per rank in this batch
+            ep_rank: Current expert parallel rank
+            ep_size: Total expert parallel size
+            top_k: Number of experts per token
+            combine_payload_offset: Offset from dispatch
+            payload_in_workspace: If True, payload is workspace-backed
+
+        Returns:
+            output: [local_num_tokens, elements_per_token] tensor
+        """
+        return module.moe_a2a_combine(
+            payload,
+            local_num_tokens,
+            workspace,
+            metainfo,
+            runtime_max_tokens_per_rank,
+            ep_rank,
+            ep_size,
+            top_k,
+            combine_payload_offset,
+            payload_in_workspace,
+        )
+
+    @register_custom_op(
+        "flashinfer::moe_a2a_sanitize_expert_ids",
+        mutates_args=[],
+    )
+    def moe_a2a_sanitize_expert_ids(
+        expert_ids: torch.Tensor,
+        workspace: torch.Tensor,
+        metainfo: torch.Tensor,
+        ep_rank: int,
+        invalid_expert_id: int,
+    ):
+        return module.moe_a2a_sanitize_expert_ids(
+            expert_ids, workspace, metainfo, ep_rank, invalid_expert_id
+        )
+
+    @register_custom_op(
+        "flashinfer::moe_a2a_get_combine_payload_tensor",
+        mutates_args=[],
+    )
+    def moe_a2a_get_combine_payload_tensor(
+        workspace: torch.Tensor,
+        ep_rank: int,
+        ep_size: int,
+        runtime_max_tokens_per_rank: int,
+        combine_payload_offset: int,
+        dtype: torch.dtype,
+        hidden_size: int,
+    ) -> torch.Tensor:
+        """
+        Get combine payload tensor backed by workspace (zero-copy).
+
+        Args:
+            workspace: [ep_size, size_per_rank] workspace tensor
+            ep_rank: Current expert parallel rank
+            ep_size: Total expert parallel size
+            runtime_max_tokens_per_rank: Max tokens per rank in this batch
+            combine_payload_offset: Offset from dispatch
+            dtype: Data type for the tensor
+            hidden_size: Hidden dimension size
+
+        Returns:
+            tensor: [ep_size * max_tokens, hidden_size] workspace-backed tensor
+        """
+        return module.moe_a2a_get_combine_payload_tensor(
+            workspace,
+            ep_rank,
+            ep_size,
+            runtime_max_tokens_per_rank,
+            combine_payload_offset,
+            dtype,
+            hidden_size,
+        )
+
+    return SimpleNamespace(
+        moe_a2a_initialize=moe_a2a_initialize,
+        moe_a2a_dispatch=moe_a2a_dispatch,
+        moe_a2a_combine=moe_a2a_combine,
+        moe_a2a_get_combine_payload_tensor=moe_a2a_get_combine_payload_tensor,
+    )
 
 
 def moe_a2a_initialize(
@@ -36,19 +223,7 @@ def moe_a2a_initialize(
     ep_rank: int,
     ep_size: int,
     max_num_tokens: int,
-) -> torch.Tensor:
-    """
-    Initialize MoE A2A workspace.
-
-    Args:
-        workspace: [ep_size, size_per_rank] uint8 tensor (MNNVL memory)
-        ep_rank: Current expert parallel rank
-        ep_size: Total expert parallel size
-        max_num_tokens: Maximum number of tokens supported
-
-    Returns:
-        metainfo: Tensor containing workspace offsets
-    """
+):
     return get_mnnvl_a2a_module().moe_a2a_initialize(
         workspace, ep_rank, ep_size, max_num_tokens
     )
@@ -65,24 +240,6 @@ def moe_a2a_dispatch(
     top_k: int,
     num_experts: int,
 ):
-    """
-    Dispatch tokens and payloads to expert ranks.
-
-    Args:
-        token_selected_experts: [local_num_tokens, top_k] int32 tensor
-        input_payloads: List of [local_num_tokens, *] tensors to dispatch
-        workspace: [ep_size, size_per_rank] workspace tensor
-        metainfo: Metadata tensor from initialize
-        runtime_max_tokens_per_rank: Max tokens per rank in this batch
-        ep_rank: Current expert parallel rank
-        ep_size: Total expert parallel size
-        top_k: Number of experts per token
-        num_experts: Total number of experts
-
-    Returns:
-        recv_tensors: List of [ep_size, max_tokens, *] tensors
-        combine_payload_offset: Offset for combine payload region
-    """
     return get_mnnvl_a2a_module().moe_a2a_dispatch(
         token_selected_experts,
         input_payloads,
@@ -108,24 +265,6 @@ def moe_a2a_combine(
     combine_payload_offset: int,
     payload_in_workspace: bool = False,
 ) -> torch.Tensor:
-    """
-    Combine expert outputs back to originating tokens.
-
-    Args:
-        payload: [ep_size, max_tokens, elements_per_token] tensor
-        local_num_tokens: Number of tokens on this rank
-        workspace: [ep_size, size_per_rank] workspace tensor
-        metainfo: Metadata tensor from initialize
-        runtime_max_tokens_per_rank: Max tokens per rank in this batch
-        ep_rank: Current expert parallel rank
-        ep_size: Total expert parallel size
-        top_k: Number of experts per token
-        combine_payload_offset: Offset from dispatch
-        payload_in_workspace: If True, payload is workspace-backed
-
-    Returns:
-        output: [local_num_tokens, elements_per_token] tensor
-    """
     return get_mnnvl_a2a_module().moe_a2a_combine(
         payload,
         local_num_tokens,
@@ -146,18 +285,8 @@ def moe_a2a_sanitize_expert_ids(
     metainfo: torch.Tensor,
     ep_rank: int,
     invalid_expert_id: int,
-) -> None:
-    """
-    Sanitize expert IDs for invalid tokens.
-
-    Args:
-        expert_ids: [ep_size, max_tokens, top_k] int32 tensor (modified in-place)
-        workspace: [ep_size, size_per_rank] workspace tensor
-        metainfo: Metadata tensor from initialize
-        ep_rank: Current expert parallel rank
-        invalid_expert_id: Value to fill for invalid tokens
-    """
-    get_mnnvl_a2a_module().moe_a2a_sanitize_expert_ids(
+):
+    return get_mnnvl_a2a_module().moe_a2a_sanitize_expert_ids(
         expert_ids, workspace, metainfo, ep_rank, invalid_expert_id
     )
 
@@ -171,21 +300,6 @@ def moe_a2a_get_combine_payload_tensor(
     dtype: torch.dtype,
     hidden_size: int,
 ) -> torch.Tensor:
-    """
-    Get combine payload tensor backed by workspace (zero-copy).
-
-    Args:
-        workspace: [ep_size, size_per_rank] workspace tensor
-        ep_rank: Current expert parallel rank
-        ep_size: Total expert parallel size
-        runtime_max_tokens_per_rank: Max tokens per rank in this batch
-        combine_payload_offset: Offset from dispatch
-        dtype: Data type for the tensor
-        hidden_size: Hidden dimension size
-
-    Returns:
-        tensor: [ep_size * max_tokens, hidden_size] workspace-backed tensor
-    """
     return get_mnnvl_a2a_module().moe_a2a_get_combine_payload_tensor(
         workspace,
         ep_rank,
