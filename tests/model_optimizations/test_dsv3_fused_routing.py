@@ -329,48 +329,9 @@ class DSv3RoutingGroundTruth:
 
         return set(topk_idx.tolist())
 
-    def get_debug_info(self, token_idx, kernel_experts):
-        """Generate comprehensive debug information for a token."""
-        kernel_experts_set = set(kernel_experts)
-        ref_experts_set = set(self.ref_expert_indices[token_idx].tolist())
-        kernel_groups = set(self.get_expert_group(e) for e in kernel_experts)
-        ref_groups = set(self.ref_group_indices[token_idx].tolist())
-
-        info = {
-            "token_idx": token_idx,
-            "ref_groups": sorted(ref_groups),
-            "kernel_groups": sorted(kernel_groups),
-            "tied_groups": sorted(self.tied_group_sets[token_idx])
-            if self.tied_group_sets[token_idx]
-            else [],
-            "group_scores": {
-                g: self.group_scores[token_idx, g].item() for g in range(self.n_group)
-            },
-            "ref_experts": self.ref_expert_indices[token_idx].tolist(),
-            "kernel_experts": sorted(kernel_experts),
-            "experts_only_kernel": sorted(kernel_experts_set - ref_experts_set),
-            "experts_only_ref": sorted(ref_experts_set - kernel_experts_set),
-        }
-
-        # Get detailed scores for all involved experts
-        all_experts = kernel_experts_set | ref_experts_set
-        biased_scores = self.biased_scores[token_idx]
-        sigmoid_scores = self.sigmoid_scores[token_idx]
-
-        info["expert_scores"] = {}
-        for expert_id in sorted(all_experts):
-            info["expert_scores"][expert_id] = {
-                "group": self.get_expert_group(expert_id),
-                "sigmoid": sigmoid_scores[expert_id].item(),
-                "biased": biased_scores[expert_id].item(),
-                "in_kernel": expert_id in kernel_experts_set,
-                "in_ref": expert_id in ref_experts_set,
-            }
-
-        return info
 
 
-def validate_and_debug(ground_truth, topk_indices_kernel, topk_values_kernel):
+def validate_expert_selection(ground_truth, topk_indices_kernel, topk_values_kernel):
     """Validate kernel outputs and provide detailed debug info for failures."""
     num_tokens = topk_indices_kernel.shape[0]
     tokens_with_different_experts = set()
@@ -392,58 +353,6 @@ def validate_and_debug(ground_truth, topk_indices_kernel, topk_values_kernel):
         )
 
         if not is_valid:
-            # Generate and print detailed debug info
-            info = ground_truth.get_debug_info(token_idx, kernel_experts)
-
-            print(f"\n{'=' * 80}")
-            print(f"EXPERT SELECTION MISMATCH - Token {token_idx}")
-            print(f"Reason: {reason}")
-            print(f"{'=' * 80}")
-
-            print(
-                f"\nGroup Analysis (n_group={ground_truth.n_group}, topk_group={ground_truth.topk_group}):"
-            )
-            print(f"  Reference selected: {info['ref_groups']}")
-            print(f"  Kernel selected:    {info['kernel_groups']}")
-            if info["tied_groups"]:
-                print(f"  Tied groups:        {info['tied_groups']}")
-
-            print(f"\nGroup Scores (threshold={ground_truth.group_tie_threshold:.6f}):")
-            for g in range(ground_truth.n_group):
-                score = info["group_scores"][g]
-                tags = []
-                if g in info["ref_groups"]:
-                    tags.append("REF")
-                if g in info["kernel_groups"]:
-                    tags.append("KERNEL")
-                if g in info["tied_groups"]:
-                    tags.append("TIED")
-                tag_str = f" [{'/'.join(tags)}]" if tags else ""
-                print(f"  Group {g:2d}: {score:8.6f}{tag_str}")
-
-            print(f"\nExpert Selection (topk={ground_truth.topk}):")
-            print(f"  Reference: {info['ref_experts']}")
-            print(f"  Kernel:    {info['kernel_experts']}")
-            if info["experts_only_kernel"]:
-                print(f"  Only in kernel: {info['experts_only_kernel']}")
-            if info["experts_only_ref"]:
-                print(f"  Only in ref:    {info['experts_only_ref']}")
-
-            print(
-                f"\nExpert Scores (threshold={ground_truth.expert_tie_threshold:.6f}):"
-            )
-            for expert_id, scores in sorted(info["expert_scores"].items()):
-                tags = []
-                if scores["in_kernel"]:
-                    tags.append("KERNEL")
-                if scores["in_ref"]:
-                    tags.append("REF")
-                tag_str = f" [{'/'.join(tags)}]" if tags else ""
-                print(
-                    f"  Expert {expert_id:3d} (Group {scores['group']:2d}): "
-                    f"sigmoid={scores['sigmoid']:.6f}, biased={scores['biased']:.6f}{tag_str}"
-                )
-
             return False, tokens_with_different_experts
 
     return True, tokens_with_different_experts
@@ -582,7 +491,7 @@ def test_dsv3_fused_routing_op(
     topk_indices = topk_indices.gather(1, sorted_idx)
 
     # Validate expert selection
-    all_valid, tokens_with_different_experts = validate_and_debug(
+    all_valid, tokens_with_different_experts = validate_expert_selection(
         ground_truth, topk_indices, sorted_vals
     )
 
