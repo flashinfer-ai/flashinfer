@@ -55,7 +55,11 @@ void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbK
   float const* attentionSinksPtr =
       attentionSinks.has_value() ? reinterpret_cast<float const*>(attentionSinks.value().data_ptr())
                                  : nullptr;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 900
   auto const mha_func = run_sm90_fp8_mha ? &launchHopperF8MHAFlashInfer : &launchMHAFlashInfer;
+#else
+  auto const mha_func = &launchMHAFlashInfer;
+#endif
 
   // Extract strides from TensorView (in elements, not bytes)
   uint64_t kv_stride_page = kCacheVLLM.stride(0);

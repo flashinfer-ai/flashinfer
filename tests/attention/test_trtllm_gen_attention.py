@@ -364,22 +364,36 @@ def generate_causal_mask(
         Data type: torch.uint16
 
     """
-    import numpy as np
-
     num_packed_masks_per_token = (q_seq_len + 31) // 32
 
-    mask_np = np.zeros(
-        (batch_size, q_seq_len, num_packed_masks_per_token), dtype=np.uint32
+    q_indices = torch.arange(q_seq_len, device=device, dtype=torch.int32).unsqueeze(1)
+    kv_indices = torch.arange(q_seq_len, device=device, dtype=torch.int32).unsqueeze(0)
+
+    causal_bool_mask = kv_indices <= q_indices
+
+    padded_seq_len = num_packed_masks_per_token * 32
+    if padded_seq_len > q_seq_len:
+        padding = torch.zeros(
+            q_seq_len, padded_seq_len - q_seq_len, device=device, dtype=torch.bool
+        )
+        causal_bool_mask = torch.cat([causal_bool_mask, padding], dim=1)
+
+    causal_bool_mask = causal_bool_mask.view(q_seq_len, num_packed_masks_per_token, 32)
+
+    bit_positions = torch.tensor(
+        [1 << i for i in range(32)], device=device, dtype=torch.int64
     )
 
-    for q_pos in range(q_seq_len):
-        for kv_pos in range(q_pos + 1):  # Causal: only see previous queries and self
-            word_idx = kv_pos // 32
-            bit_in_word = kv_pos % 32
-            if word_idx < num_packed_masks_per_token:
-                mask_np[:, q_pos, word_idx] |= np.uint32(1 << bit_in_word)
+    mask_uint32 = (
+        (causal_bool_mask.to(torch.int64) * bit_positions).sum(dim=-1).to(torch.uint32)
+    )
 
-    mask_uint32 = torch.from_numpy(mask_np).to(device)
+    mask_uint32 = (
+        mask_uint32.unsqueeze(0)
+        .expand(batch_size, q_seq_len, num_packed_masks_per_token)
+        .contiguous()
+    )
+
     mask_uint16 = mask_uint32.view(torch.uint16)
 
     return mask_uint16
