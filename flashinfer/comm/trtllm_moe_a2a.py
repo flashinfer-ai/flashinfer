@@ -76,10 +76,11 @@ def get_mnnvl_a2a_module():
             num_experts: Total number of experts
 
         Returns:
-            recv_tensors: List of [ep_size, max_tokens, *] tensors
+            recv_offsets: List of offsets for each payload in the workspace
+            recv_sizes: List of sizes for each payload in the workspace
             combine_payload_offset: Offset for combine payload region
         """
-        recv_offsets, recv_sizes, combine_payload_offset = module.moe_a2a_dispatch(
+        return module.moe_a2a_dispatch(
             token_selected_experts,
             input_payloads,
             workspace,
@@ -90,19 +91,6 @@ def get_mnnvl_a2a_module():
             top_k,
             num_experts,
         )
-        workspace_base = workspace.flatten().view(dtype=torch.uint8)
-        output_payloads = []
-        for input_payload, offset, size in zip(
-            input_payloads, recv_offsets, recv_sizes, strict=True
-        ):
-            output_payload = (
-                workspace_base[offset : offset + size]
-                .view([ep_size, runtime_max_tokens_per_rank, -1])
-                .view(dtype=input_payload.dtype)
-            )
-            output_payloads.append(output_payload)
-
-        return output_payloads, combine_payload_offset
 
     @register_custom_op(
         "flashinfer::moe_a2a_combine",
@@ -167,48 +155,25 @@ def get_mnnvl_a2a_module():
         )
 
     @register_custom_op(
-        "flashinfer::moe_a2a_get_combine_payload_tensor",
+        "flashinfer::moe_a2a_get_metainfo_index_pairs",
         mutates_args=[],
     )
-    def moe_a2a_get_combine_payload_tensor(
-        workspace: torch.Tensor,
-        ep_rank: int,
-        ep_size: int,
-        runtime_max_tokens_per_rank: int,
-        combine_payload_offset: int,
-        dtype: torch.dtype,
-        hidden_size: int,
-    ) -> torch.Tensor:
+    def moe_a2a_get_metainfo_index_pairs():
         """
-        Get combine payload tensor backed by workspace (zero-copy).
-
-        Args:
-            workspace: [ep_size, size_per_rank] workspace tensor
-            ep_rank: Current expert parallel rank
-            ep_size: Total expert parallel size
-            runtime_max_tokens_per_rank: Max tokens per rank in this batch
-            combine_payload_offset: Offset from dispatch
-            dtype: Data type for the tensor
-            hidden_size: Hidden dimension size
+        Get all metainfo index constants from C++.
 
         Returns:
-            tensor: [ep_size * max_tokens, hidden_size] workspace-backed tensor
+            Tuple of (names, values) where names is a list of constant names
+            and values is a list of their corresponding integer values
         """
-        return module.moe_a2a_get_combine_payload_tensor(
-            workspace,
-            ep_rank,
-            ep_size,
-            runtime_max_tokens_per_rank,
-            combine_payload_offset,
-            dtype,
-            hidden_size,
-        )
+        return module.moe_a2a_get_metainfo_index_pairs()
 
     return SimpleNamespace(
         moe_a2a_initialize=moe_a2a_initialize,
         moe_a2a_dispatch=moe_a2a_dispatch,
         moe_a2a_combine=moe_a2a_combine,
-        moe_a2a_get_combine_payload_tensor=moe_a2a_get_combine_payload_tensor,
+        moe_a2a_sanitize_expert_ids=moe_a2a_sanitize_expert_ids,
+        moe_a2a_get_metainfo_index_pairs=moe_a2a_get_metainfo_index_pairs,
     )
 
 
@@ -223,6 +188,37 @@ def moe_a2a_initialize(
     )
 
 
+def moe_a2a_wrap_payload_tensor_in_workspace(
+    workspace: torch.Tensor,
+    leading_shape: list[int],
+    slice_start: int,
+    slice_end: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """
+    Wrap an offset in the workspace into a tensor.
+
+    Args:
+        workspace: [ep_size, size_per_rank] workspace tensor
+        ep_rank: Current expert parallel rank
+        ep_size: Total expert parallel size
+        runtime_max_tokens_per_rank: Max tokens per rank in this batch
+        total_size: Total size of the payload
+        offset: Offset from dispatch
+        dtype: Data type for the tensor
+
+    Returns:
+        tensor: [ep_size * max_tokens, hidden_size] workspace-backed tensor
+    """
+    workspace_base = workspace.flatten().view(dtype=torch.uint8)
+    result = (
+        workspace_base[slice_start:slice_end]
+        .view(leading_shape + [-1])
+        .view(dtype=dtype)
+    )
+    return result
+
+
 def moe_a2a_dispatch(
     token_selected_experts: torch.Tensor,
     input_payloads: list[torch.Tensor],
@@ -234,17 +230,36 @@ def moe_a2a_dispatch(
     top_k: int,
     num_experts: int,
 ):
-    return get_mnnvl_a2a_module().moe_a2a_dispatch(
-        token_selected_experts,
-        input_payloads,
-        workspace,
-        metainfo,
-        runtime_max_tokens_per_rank,
-        ep_rank,
-        ep_size,
-        top_k,
-        num_experts,
+    recv_offsets, recv_sizes, combine_payload_offset = (
+        get_mnnvl_a2a_module().moe_a2a_dispatch(
+            token_selected_experts,
+            input_payloads,
+            workspace,
+            metainfo,
+            runtime_max_tokens_per_rank,
+            ep_rank,
+            ep_size,
+            top_k,
+            num_experts,
+        )
     )
+
+    output_payloads = []
+    for input_payload, offset, size in zip(
+        input_payloads, recv_offsets, recv_sizes, strict=True
+    ):
+        # This uses absolute offsets in the workspace, so skip indexing into the workspace
+        output_payloads.append(
+            moe_a2a_wrap_payload_tensor_in_workspace(
+                workspace,
+                [ep_size, runtime_max_tokens_per_rank],
+                offset,
+                offset + size,
+                input_payload.dtype,
+            )
+        )
+
+    return output_payloads, combine_payload_offset
 
 
 def moe_a2a_combine(
@@ -285,26 +300,6 @@ def moe_a2a_sanitize_expert_ids(
     )
 
 
-def moe_a2a_get_combine_payload_tensor(
-    workspace: torch.Tensor,
-    ep_rank: int,
-    ep_size: int,
-    runtime_max_tokens_per_rank: int,
-    combine_payload_offset: int,
-    dtype: torch.dtype,
-    hidden_size: int,
-) -> torch.Tensor:
-    return get_mnnvl_a2a_module().moe_a2a_get_combine_payload_tensor(
-        workspace,
-        ep_rank,
-        ep_size,
-        runtime_max_tokens_per_rank,
-        combine_payload_offset,
-        dtype,
-        hidden_size,
-    )
-
-
 class MoeAlltoAll:
     """
     Manages MoE All-to-All operations with proper workspace allocation and synchronization.
@@ -320,6 +315,29 @@ class MoeAlltoAll:
 
     # Single shared workspace across the process
     _WORKSPACE: Optional[dict] = None
+
+    # Metainfo index constants (loaded dynamically from C++)
+    # These offsets allow accessing internal workspace data for testing/debugging
+    _METAINFO_INDEX: Optional[dict] = None
+
+    @classmethod
+    def _init_constants(cls):
+        """Initialize constants from C++ if not already done."""
+        if cls._METAINFO_INDEX is None:
+            module = get_mnnvl_a2a_module()
+            names, values = module.moe_a2a_get_metainfo_index_pairs()
+
+            # Convert TVM arrays to Python and build dictionary
+            # Strip "MOE_A2A_" prefix from names for cleaner API
+            cls._METAINFO_INDEX = {}
+            for name, value in zip(names, values, strict=True):
+                # Convert from "MOE_A2A_SEND_COUNTERS_OFFSET_INDEX" to "SEND_COUNTERS_OFFSET_INDEX"
+                clean_name = (
+                    name.replace("MOE_A2A_", "")
+                    if name.startswith("MOE_A2A_")
+                    else name
+                )
+                cls._METAINFO_INDEX[clean_name] = int(value)
 
     def __init__(
         self,
@@ -339,13 +357,16 @@ class MoeAlltoAll:
             num_experts: Total number of experts
             workspace_size_per_rank: Size of workspace per rank in bytes (default: 512MB)
         """
+        # Initialize constants from C++
+        self._init_constants()
+
         # Initialize MNNVL memory system
         MnnvlMemory.initialize()
 
         self.workspace_size_per_rank = workspace_size_per_rank
         self.max_num_tokens = max_num_tokens
-        self.ep_size = mapping.tp_size
-        self.ep_rank = mapping.tp_rank
+        self.ep_size = mapping.moe_ep_size
+        self.ep_rank = mapping.moe_ep_rank
         self.top_k = top_k
         self.num_experts = num_experts
 
@@ -515,14 +536,14 @@ class MoeAlltoAll:
                 "get_combine_payload_tensor_in_workspace called before successful dispatch"
             )
 
-        return moe_a2a_get_combine_payload_tensor(
-            self.workspace,
-            self.ep_rank,
-            self.ep_size,
-            runtime_max_tokens_per_rank,
+        element_size = torch.tensor([], dtype=dtype).element_size()
+        return moe_a2a_wrap_payload_tensor_in_workspace(
+            self.workspace[self.ep_rank, :],
+            [self.ep_size * runtime_max_tokens_per_rank],
             self._state.combine_payload_offset,
+            self._state.combine_payload_offset
+            + self.ep_size * runtime_max_tokens_per_rank * hidden_size * element_size,
             dtype,
-            hidden_size,
         )
 
 
@@ -532,5 +553,4 @@ __all__ = [
     "moe_a2a_dispatch",
     "moe_a2a_combine",
     "moe_a2a_sanitize_expert_ids",
-    "moe_a2a_get_combine_payload_tensor",
 ]

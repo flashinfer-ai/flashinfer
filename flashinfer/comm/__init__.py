@@ -43,9 +43,6 @@ from .vllm_ar import register_graph_buffers as vllm_register_graph_buffers
 from .trtllm_moe_a2a import MoeAlltoAll as MoeAlltoAll
 from .trtllm_moe_a2a import moe_a2a_combine as moe_a2a_combine
 from .trtllm_moe_a2a import moe_a2a_dispatch as moe_a2a_dispatch
-from .trtllm_moe_a2a import (
-    moe_a2a_get_combine_payload_tensor as moe_a2a_get_combine_payload_tensor,
-)
 from .trtllm_moe_a2a import moe_a2a_initialize as moe_a2a_initialize
 from .trtllm_moe_a2a import (
     moe_a2a_sanitize_expert_ids as moe_a2a_sanitize_expert_ids,

@@ -142,4 +142,3 @@ MNNVL A2A (Throughput Backend)
     moe_a2a_dispatch
     moe_a2a_combine
     moe_a2a_sanitize_expert_ids
-    moe_a2a_get_combine_payload_tensor

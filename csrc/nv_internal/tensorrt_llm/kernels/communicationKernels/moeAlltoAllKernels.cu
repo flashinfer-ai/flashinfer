@@ -400,7 +400,7 @@ __global__ void moeA2ADispatchKernel(
           asm volatile("ld.relaxed.sys.u32 %0, [%1];" : "=r"(flag_value) : "l"(flag_ptr));
 #if ENABLE_DEBUG_PRINT
           printf(
-              "combine: ---Rank %d received completion flag from rank %d, flag_value: %d, "
+              "dispatch: ---Rank %d received completion flag from rank %d, flag_value: %d, "
               "expected_value: "
               "%d, address: %p\n",
               rank_id, peer_rank, flag_value, expected_value, flag_ptr);
