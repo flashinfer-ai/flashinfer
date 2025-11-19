@@ -33,7 +33,8 @@ void trtllm_mnnvl_allreduce_fusion(TensorView input, int64_t multicast_buffer_pt
                                    TensorView buffer_flags_mnnvl, int64_t nranks, int64_t rank,
                                    bool rmsnorm_fusion, bool launch_with_pdl, bool use_oneshot,
                                    TensorView output, Optional<TensorView> residual_out,
-                                   Optional<TensorView> gamma, Optional<double> epsilon) {
+                                   Optional<TensorView> residual_in, Optional<TensorView> gamma,
+                                   Optional<double> epsilon) {
   cudaSetDevice(input.device().device_id);
   auto stream = get_stream(input.device());
 
@@ -82,9 +83,8 @@ void trtllm_mnnvl_allreduce_fusion(TensorView input, int64_t multicast_buffer_pt
 
     // input data
     params.input = const_cast<void const*>(input.data_ptr());
-    params.residualIn = residual_out.has_value()
-                            ? const_cast<void const*>(residual_out.value().data_ptr())
-                            : nullptr;
+    params.residualIn =
+        residual_in.has_value() ? const_cast<void const*>(residual_in.value().data_ptr()) : nullptr;
     params.gamma = gamma.has_value() ? const_cast<void const*>(gamma.value().data_ptr()) : nullptr;
     params.epsilon = epsilon.has_value() ? epsilon.value() : 1e-5;
 

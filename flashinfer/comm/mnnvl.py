@@ -1005,7 +1005,7 @@ class McastGPUBuffer:
     def lamport_initialize(self, rank: int, dtype: torch.dtype):
         self.mcast_device_memory.lamport_initialize(rank, dtype)
 
-    def get_mc_buffer(
+    def get_multicast_buffer(
         self, sizes: tuple, dtype: torch.dtype, storage_offset: int = 0
     ) -> torch.Tensor:
         """
@@ -1019,11 +1019,27 @@ class McastGPUBuffer:
         Returns:
             A PyTorch tensor wrapping the multicast buffer section
         """
+
+        # FIXME: Is this needed? As the behavior of reading from mc_ptr is undefined.
+        raise NotImplementedError("Not implemented yet")
+
+    def get_unicast_buffer(
+        self, sizes: tuple, dtype: torch.dtype, storage_offset: int = 0
+    ) -> torch.Tensor:
+        """
+        Returns a PyTorch tensor view of the unicast buffer portion.
+        """
+
+        # TODO: How can I warp a raw pointer to a tensor in python level?
         raise NotImplementedError("Not implemented yet")
 
     def get_multicast_ptr(self) -> int:
         """Get the raw multicast pointer"""
         return self.mcast_device_memory.get_multicast_ptr()
+
+    def get_unicast_ptr(self, rank: int) -> int:
+        """Get the raw unicast pointer to a given rank"""
+        return self.mcast_device_memory.get_unicast_ptr(rank)
 
     def get_buffer_ptrs_dev(self) -> int:
         """Get the buffer pointers device array"""
