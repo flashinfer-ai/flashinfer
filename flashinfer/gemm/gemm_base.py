@@ -54,6 +54,7 @@ from ..jit.gemm import gen_gemm_sm100_module_cutlass_fp8
 from ..jit.gemm import gen_trtllm_gen_gemm_module
 from ..jit.gemm import gen_tgv_gemm_sm10x_module
 from ..jit.gemm import gen_deepgemm_sm100_module
+from ..jit.cpp_ext import get_cuda_version
 
 
 CUDNN_AVAILABLE = False
@@ -91,10 +92,6 @@ def _match_sm_version(device: torch.device, sm_version: list[str]):
     major, minor = get_compute_capability(device)
     device_arch = f"{major * 10 + minor}"
     return device_arch in sm_version
-
-
-def get_cuda_version():
-    return tuple(map(int, torch.version.cuda.split(".")))  # (major, minor)
 
 
 @functools.cache
@@ -2004,7 +2001,7 @@ def _heuristic_func_mm_fp4(
     - If cuda version is 13 and cudnn version is 9.15 or greater - use cudnn.
 
     """
-    cuda_major, _ = get_cuda_version()
+    cuda_major = get_cuda_version().major
     # If cuda version is 13 or greater:
     # cudnn is more performant if cudnn version is 9.15 or greater.
     if CUDNN_AVAILABLE and cuda_major >= 13 and cudnn.backend_version() >= 91500:
