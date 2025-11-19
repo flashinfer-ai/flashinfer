@@ -79,9 +79,6 @@ def get_mnnvl_a2a_module():
             recv_tensors: List of [ep_size, max_tokens, *] tensors
             combine_payload_offset: Offset for combine payload region
         """
-        print(
-            f"moe_a2a_dispatch: token_selected_experts.shape={token_selected_experts.shape}, input_payloads={input_payloads}, workspace.shape={workspace.shape}, metainfo.shape={metainfo.shape}, runtime_max_tokens_per_rank={runtime_max_tokens_per_rank}, ep_rank={ep_rank}, ep_size={ep_size}, top_k={top_k}, num_experts={num_experts}"
-        )
         recv_offsets, recv_sizes, combine_payload_offset = module.moe_a2a_dispatch(
             token_selected_experts,
             input_payloads,
@@ -92,9 +89,6 @@ def get_mnnvl_a2a_module():
             ep_size,
             top_k,
             num_experts,
-        )
-        print(
-            f"moe_a2a_dispatch: recv_offsets={recv_offsets}, recv_sizes={recv_sizes}, combine_payload_offset={combine_payload_offset}"
         )
         workspace_base = workspace.flatten().view(dtype=torch.uint8)
         output_payloads = []
