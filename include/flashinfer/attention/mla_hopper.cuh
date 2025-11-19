@@ -542,7 +542,7 @@ __device__ __forceinline__ void write_o(typename KTraits::SharedStorage* smem_st
           uint32_t q, r;
           num_heads.divmod(packed_offset + warp_idx_in_wg * 16 + 8 * j + lane_idx / 4, q, r);
           if (lane_idx % 4 == 0 && q < q_len) {
-            final_lse[q * num_heads + r] = math::ptx_log2(d[j]) + float(m[j]);
+            final_lse[q * num_heads + r] = math::loge2 * (math::ptx_log2(d[j]) + float(m[j]));
           }
         }
       }
