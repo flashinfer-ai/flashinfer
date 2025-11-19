@@ -61,8 +61,8 @@ class DynamicTensorSpec:
         # Set default tensor_initializers if not provided
         if self.tensor_initializers is None:
             self.tensor_initializers = [
-                lambda shapes, dtype, device: torch.randn(shapes, device=device).to(
-                    dtype
+                lambda shapes, dtype, device: (
+                    torch.randn(shapes, device=device).to(dtype) * 10 - 5
                 )
                 for _ in range(len(self.input_idx))
             ]
@@ -761,8 +761,8 @@ class AutoTuner:
     def _prepare_input_tensors(
         self, profile: OptimizationProfile, inputs: List[torch.Tensor]
     ) -> List[torch.Tensor]:
-        default_initializer = lambda shapes, dtype, device: torch.rand(
-            shapes, device=device
+        default_initializer = lambda shapes, dtype, device: (
+            torch.rand(shapes, device=device) * 10 - 5
         ).to(dtype)
         tensors = []
         for i, p in enumerate(profile.shapes):
