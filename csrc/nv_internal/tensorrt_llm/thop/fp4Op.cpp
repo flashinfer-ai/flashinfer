@@ -32,7 +32,6 @@
 using tvm::ffi::Array;
 using tvm::ffi::Map;
 using tvm::ffi::Optional;
-using tvm::ffi::Tensor;
 
 static int getExp(float v) {
   int vIntRepr;
@@ -141,8 +140,8 @@ int computeSFIndex(int rowIdx, int colIdx, int totalRow, int totalColumn,
 // Interleave (and possibly pad) the weights block scaling factor.
 // blockScale: [num_experts, rows, cols] or [rows, cols]
 // Return: num_experts * pad_up(rows, 128) * pad_up(cols, 4)
-void BlockScaleInterleave(Tensor blockScale, Tensor interleavedBlockScale) {
-  bool is_cuda = (blockScale->device.device_type == kDLCUDA);
+void BlockScaleInterleave(TensorView blockScale, TensorView interleavedBlockScale) {
+  bool is_cuda = (blockScale.device().device_type == kDLCUDA);
   if (is_cuda) {
     CHECK_CUDA(blockScale);
   } else {
@@ -150,7 +149,7 @@ void BlockScaleInterleave(Tensor blockScale, Tensor interleavedBlockScale) {
   }
   CHECK_CONTIGUOUS(blockScale);
   CHECK_INPUT_TYPE(blockScale, dl_uint8);
-  auto blockScaleShape = blockScale.shape();
+  auto blockScaleShape = blockScale.sizes();
   TVM_FFI_ICHECK(blockScaleShape.size() == 2 || blockScaleShape.size() == 3)
       << "Block Scale should be 2D or 3D tensor.";
   auto num_experts = blockScaleShape.size() == 3 ? blockScaleShape[0] : 1;
@@ -165,18 +164,19 @@ void BlockScaleInterleave(Tensor blockScale, Tensor interleavedBlockScale) {
 
   if (is_cuda) {
     const thread_local int smCount = tensorrt_llm::common::getMultiProcessorCount();
-    const cudaStream_t stream = get_stream(blockScale->device);
+    const cudaStream_t stream = get_stream(blockScale.device());
 
     tensorrt_llm::kernels::invokeBlockScaleInterleave(
-        num_experts, rows, rows_padded, cols, cols_padded, static_cast<uint8_t*>(blockScale->data),
-        static_cast<uint8_t*>(interleavedBlockScale->data), smCount, stream);
+        num_experts, rows, rows_padded, cols, cols_padded,
+        static_cast<uint8_t*>(blockScale.data_ptr()),
+        static_cast<uint8_t*>(interleavedBlockScale.data_ptr()), smCount, stream);
   } else {
     for (int eIdx = 0; eIdx < static_cast<int>(num_experts); eIdx++) {
       uint8_t* interleavedBlockScalePtr =
-          static_cast<uint8_t*>(interleavedBlockScale->data) + eIdx * expert_out_size;
+          static_cast<uint8_t*>(interleavedBlockScale.data_ptr()) + eIdx * expert_out_size;
       for (int rIdx = 0; rIdx < static_cast<int>(rows_padded); ++rIdx) {
         auto globalRowIdx = eIdx * rows + rIdx;
-        uint8_t* blockScalePtr = static_cast<uint8_t*>(blockScale->data) + globalRowIdx * cols;
+        uint8_t* blockScalePtr = static_cast<uint8_t*>(blockScale.data_ptr()) + globalRowIdx * cols;
         for (int cIdx = 0; cIdx < static_cast<int>(cols_padded); ++cIdx) {
           uint8_t sf_ori = 0;
           if (rIdx < static_cast<int>(rows) && cIdx < static_cast<int>(cols)) {
@@ -195,8 +195,8 @@ void BlockScaleInterleave(Tensor blockScale, Tensor interleavedBlockScale) {
 // blockScale: [num_experts, rows, cols] or [rows, cols]
 // Note: rows and cols are the dimensions of the original unswizzled SFMatrix, so reshape input
 // before passing into this function! Return: The same shape as blockScale
-void BlockScaleInterleaveReverse(Tensor const& blockScale, Tensor reversedBlockScale) {
-  bool is_cuda = (blockScale->device.device_type == kDLCUDA);
+void BlockScaleInterleaveReverse(TensorView const& blockScale, TensorView reversedBlockScale) {
+  bool is_cuda = (blockScale.device().device_type == kDLCUDA);
   if (is_cuda) {
     CHECK_CUDA(blockScale);
   } else {
@@ -204,7 +204,7 @@ void BlockScaleInterleaveReverse(Tensor const& blockScale, Tensor reversedBlockS
   }
   CHECK_CONTIGUOUS(blockScale);
   CHECK_INPUT_TYPE(blockScale, dl_uint8);
-  auto blockScaleShape = blockScale.shape();
+  auto blockScaleShape = blockScale.sizes();
   TVM_FFI_ICHECK(blockScaleShape.size() == 2 || blockScaleShape.size() == 3)
       << "Block Scale should be 2D or 3D tensor.";
   auto num_experts = blockScaleShape.size() == 3 ? blockScaleShape[0] : 1;
@@ -216,10 +216,10 @@ void BlockScaleInterleaveReverse(Tensor const& blockScale, Tensor reversedBlockS
 
   if (is_cuda) {
     const thread_local int smCount = tensorrt_llm::common::getMultiProcessorCount();
-    const cudaStream_t stream = get_stream(blockScale->device);
+    const cudaStream_t stream = get_stream(blockScale.device());
     tensorrt_llm::kernels::invokeBlockScaleInterleaveReverse(
-        num_experts, rows, cols, static_cast<uint8_t*>(blockScale->data),
-        static_cast<uint8_t*>(reversedBlockScale->data), smCount, stream);
+        num_experts, rows, cols, static_cast<uint8_t*>(blockScale.data_ptr()),
+        static_cast<uint8_t*>(reversedBlockScale.data_ptr()), smCount, stream);
   } else {
     // index in the swizzled SFMatrix -> (eIdx, rIdx, cIdx) in the unswizzled SFMatrix
     Map<int, Array<int>> identity;
@@ -232,11 +232,11 @@ void BlockScaleInterleaveReverse(Tensor const& blockScale, Tensor reversedBlockS
         }
       }
     }
-    uint8_t* blockScalePtr = static_cast<uint8_t*>(blockScale->data);
+    uint8_t* blockScalePtr = static_cast<uint8_t*>(blockScale.data_ptr());
     for (int i = 0; i < expert_out_size * num_experts; i++) {
       auto loc_2d = identity[i];
       if (loc_2d[1] < rows && loc_2d[2] < cols) {
-        uint8_t* reversedBlockScalePtr = static_cast<uint8_t*>(reversedBlockScale->data) +
+        uint8_t* reversedBlockScalePtr = static_cast<uint8_t*>(reversedBlockScale.data_ptr()) +
                                          (loc_2d[0] * rows + loc_2d[1]) * cols + loc_2d[2];
         *reversedBlockScalePtr = blockScalePtr[i];
       }
@@ -245,20 +245,21 @@ void BlockScaleInterleaveReverse(Tensor const& blockScale, Tensor reversedBlockS
 }
 
 // Used by the (fp16 -> int4) quant layer + int4 gemm network.
-void E2M1AndUFP8SFScaleToFloatV2(Tensor valueE2M1, Tensor scaleFP8SF, Optional<Tensor> globalScale,
-                                 Tensor floatTensor, int64_t sfVecSize, int64_t sfType,
+void E2M1AndUFP8SFScaleToFloatV2(TensorView valueE2M1, TensorView scaleFP8SF,
+                                 Optional<TensorView> globalScale, TensorView floatTensorView,
+                                 int64_t sfVecSize, int64_t sfType,
                                  bool isSfSwizzledLayout = true) {
   CHECK_CPU_INPUT(valueE2M1, dl_uint8);
   CHECK_CPU_INPUT(scaleFP8SF, dl_uint8);
-  auto packedShape = valueE2M1.shape();
-  auto scaleShape = scaleFP8SF.shape();
+  auto packedShape = valueE2M1.sizes();
+  auto scaleShape = scaleFP8SF.sizes();
   TVM_FFI_ICHECK_EQ(packedShape.size(), 2) << "valueE2M1 should be 2D tensor.";
   TVM_FFI_ICHECK_EQ(scaleShape.size(), 1) << "scaleFP8SF should be 1D tensor.";
 
   float globalScaleVal{1.0f};
   if (sfType == 1) {
     TVM_FFI_ICHECK(globalScale.has_value()) << "globalScale is required when sfType is 1.";
-    globalScaleVal = static_cast<float*>(globalScale.value()->data)[0];
+    globalScaleVal = static_cast<float*>(globalScale.value().data_ptr())[0];
   }
 
   int hiddenDim = packedShape[1] * 2;
@@ -271,10 +272,10 @@ void E2M1AndUFP8SFScaleToFloatV2(Tensor valueE2M1, Tensor scaleFP8SF, Optional<T
   for (size_t vIdx = 0; vIdx < static_cast<size_t>(packedShape[0]); ++vIdx) {
     for (int group = 0; group < groupsPerHiddenDim; ++group) {
       float* floatPtr =
-          static_cast<float*>(floatTensor->data) + vIdx * hiddenDim + group * sfVecSize;
-      uint8_t* packedFp4Ptr = static_cast<uint8_t*>(valueE2M1->data) + vIdx * packedFp4HiddenDim +
-                              group * sfVecSize / 2;
-      uint8_t* scaleFP8SFPtr = static_cast<uint8_t*>(scaleFP8SF->data);
+          static_cast<float*>(floatTensorView.data_ptr()) + vIdx * hiddenDim + group * sfVecSize;
+      uint8_t* packedFp4Ptr = static_cast<uint8_t*>(valueE2M1.data_ptr()) +
+                              vIdx * packedFp4HiddenDim + group * sfVecSize / 2;
+      uint8_t* scaleFP8SFPtr = static_cast<uint8_t*>(scaleFP8SF.data_ptr());
       uint8_t fp8Scale =
           scaleFP8SFPtr[computeSFIndex(vIdx, group, packedShape[0], groupsPerHiddenDim, layout)];
       float scaleFloat;
@@ -298,7 +299,8 @@ void E2M1AndUFP8SFScaleToFloatV2(Tensor valueE2M1, Tensor scaleFP8SF, Optional<T
   }
 }
 
-void mxfp4_dequantize_host(Tensor weight, Tensor scale, Tensor dequant_weight, int64_t group_size) {
+void mxfp4_dequantize_host(TensorView weight, TensorView scale, TensorView dequant_weight,
+                           int64_t group_size) {
   // weight (n, k / 2)
   // scale (n, k / group_size)
 
@@ -306,25 +308,26 @@ void mxfp4_dequantize_host(Tensor weight, Tensor scale, Tensor dequant_weight, i
   CHECK_CPU_INPUT(scale, dl_uint8);
   CHECK_CONTIGUOUS(weight);
   CHECK_CONTIGUOUS(scale);
-  TVM_FFI_ICHECK_NE(weight.shape().Product(), 0) << "weight should not be empty tensor";
+  TVM_FFI_ICHECK_NE(weight.numel(), 0) << "weight should not be empty tensor";
   CHECK_INPUT_TYPE(weight, dl_uint8);
   CHECK_INPUT_TYPE(scale, dl_uint8);
 
-  int const n = weight->shape[0];
-  int const k = weight->shape[1] * 2;
+  int const n = weight.size(0);
+  int const k = weight.size(1) * 2;
 
-  TVM_FFI_ICHECK_EQ(n, scale->shape[0]) << "weight and scale must have the same number of rows";
-  TVM_FFI_ICHECK_EQ(k, scale->shape[1] * group_size)
+  TVM_FFI_ICHECK_EQ(n, scale.size(0)) << "weight and scale must have the same number of rows";
+  TVM_FFI_ICHECK_EQ(k, scale.size(1) * group_size)
       << "weight and scale must have the same number of columns";
 
 #if CUDA_VERSION >= 12080
-  uint8_t* weight_packed_ptr = static_cast<uint8_t*>(weight->data);
-  __nv_fp8_e8m0* scale_ptr = reinterpret_cast<__nv_fp8_e8m0*>(static_cast<uint8_t*>(scale->data));
-  float* dequant_weight_ptr = static_cast<float*>(dequant_weight->data);
+  uint8_t* weight_packed_ptr = static_cast<uint8_t*>(weight.data_ptr());
+  __nv_fp8_e8m0* scale_ptr =
+      reinterpret_cast<__nv_fp8_e8m0*>(static_cast<uint8_t*>(scale.data_ptr()));
+  float* dequant_weight_ptr = static_cast<float*>(dequant_weight.data_ptr());
   float fp4_lut[] = {0.0, 0.5,  1.0,  1.5,  2.0,  3.0,  4.0,  6.0,
                      0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0};
 
-  const auto num_packed_elements = weight.shape().Product();
+  const auto num_packed_elements = weight.numel();
   for (int packed_idx = 0; packed_idx < num_packed_elements; ++packed_idx) {
     int8_t weight_packed_data = weight_packed_ptr[packed_idx];
 
@@ -337,7 +340,7 @@ void mxfp4_dequantize_host(Tensor weight, Tensor scale, Tensor dequant_weight, i
     int scale_n_idx = packed_idx / (k / 2);
     int scale_k_idx = ((packed_idx * 2) % k) / group_size;
 
-    float scale_ = static_cast<float>(scale_ptr[scale_n_idx * scale->shape[1] + scale_k_idx]);
+    float scale_ = static_cast<float>(scale_ptr[scale_n_idx * scale.size(1) + scale_k_idx]);
 
     dequant_weight_ptr[2 * packed_idx] = weight_low * scale_;
     dequant_weight_ptr[2 * packed_idx + 1] = weight_high * scale_;

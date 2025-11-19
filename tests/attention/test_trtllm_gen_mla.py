@@ -1,5 +1,3 @@
-import math
-
 import pytest
 import torch
 
@@ -11,19 +9,7 @@ global_trtllm_gen_fmha_workspace_buffer = None  # must be zero initialized
 workspace_size = 128 * 1024 * 1024
 
 
-@pytest.mark.parametrize(
-    "batch_size",
-    [1, 2, 4, 16, 32, 64, 128, 256, 512, 768, 1024],
-)
-@pytest.mark.parametrize("scale", [1.0, 0.5])
-@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.bfloat16])
-@pytest.mark.parametrize("page_size", [32, 64])
-@pytest.mark.parametrize(
-    "q_len_per_request", [1, 2]
-)  # todo(Yingyi): verify larger q_len_per_request
-@pytest.mark.parametrize("dynamic_scale", [False])
-@pytest.mark.parametrize("enable_pdl", [True, False, None])
-def test_trtllm_batch_decode_mla(
+def trtllm_batch_decode_mla(
     batch_size: int,
     scale: float,
     dtype: torch.dtype,
@@ -31,18 +17,25 @@ def test_trtllm_batch_decode_mla(
     q_len_per_request: int,
     dynamic_scale: bool,
     enable_pdl: bool,
+    backend: str,
+    MAX_SEQ_LEN: int,
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
-    if compute_capability[0] in [11, 12]:
-        pytest.skip("trtllm-gen does not support SM110/SM120/SM121 GPUs.")
+    if backend == "xqa":
+        if compute_capability[0] != 12:
+            pytest.skip("XQA MLA only supports SM120 GPUs")
+        if q_len_per_request != 1 or dtype != torch.float8_e4m3fn:
+            pytest.skip(
+                "XQA MLA only supports q_len_per_request == 1 and dtype == torch.float8_e4m3fn"
+            )
+    if backend == "trtllm-gen":
+        if compute_capability[0] != 10:
+            pytest.skip("TRTLLM-GEN MLA only supports SM100 and SM103 GPUs")
     if dynamic_scale and dtype != torch.float8_e4m3fn:
         pytest.skip("Dynamic scale is not supported for non-fp8 dtype")
 
     torch.manual_seed(42)
     device = "cuda:0"
-
-    # Fixed max sequence length
-    MAX_SEQ_LEN = 1024
 
     # Deepseek attention config (decode-MLA)
     num_q_heads = 128
@@ -72,7 +65,7 @@ def test_trtllm_batch_decode_mla(
     max_num_blocks_per_seq = blocks_per_seq.max().item()
 
     # Generate random but unique block IDs for all sequences
-    total_blocks_needed = sum(blocks_per_seq)
+    total_blocks_needed = int(blocks_per_seq.sum().item())
     all_block_ids = torch.randperm(
         total_blocks_needed, device=device
     )  # Random permutation
@@ -86,7 +79,7 @@ def test_trtllm_batch_decode_mla(
     # Populate block tables and track block assignments
     block_id = 0
     for i in range(batch_size):
-        num_blocks_needed = blocks_per_seq[i]
+        num_blocks_needed = int(blocks_per_seq[i].item())
         block_tables[i, :num_blocks_needed] = all_block_ids[
             block_id : block_id + num_blocks_needed
         ]
@@ -113,21 +106,6 @@ def test_trtllm_batch_decode_mla(
     workspace_buffer = global_trtllm_gen_fmha_workspace_buffer
     workspace_buffer_ref = global_workspace_buffer
 
-    bmm1_log2_scale_tensor = (
-        torch.tensor(
-            [scale / ((128 + 64) ** 0.5 * math.log2(math.e))],
-            dtype=torch.float32,
-            device=device,
-        )
-        if dynamic_scale
-        else None
-    )
-    bmm2_scale_tensor = (
-        torch.tensor([1.0], dtype=torch.float32, device=device)
-        if dynamic_scale
-        else None
-    )
-
     # Run decode-MLA
     output = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
         query=query,
@@ -141,9 +119,8 @@ def test_trtllm_batch_decode_mla(
         max_seq_len=max_seq_len,
         bmm1_scale=scale / ((128 + 64) ** 0.5),
         bmm2_scale=1.0,
-        bmm1_scale_log2_tensor=bmm1_log2_scale_tensor,
-        bmm2_scale_tensor=bmm2_scale_tensor,
         enable_pdl=enable_pdl,
+        backend=backend,
     )
     # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
     # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
@@ -198,31 +175,124 @@ def test_trtllm_batch_decode_mla(
 
     o_ref = wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=False)
 
-    # check is nan
-    assert not torch.isnan(o_ref).any(), "o_ref is nan"
-    assert not torch.isnan(output).any(), "output is nan"
+    if backend == "trtllm-gen":
+        # check is nan
+        assert not torch.isnan(o_ref).any(), "o_ref is nan"
+        assert not torch.isnan(output).any(), "output is nan"
 
-    if dtype == torch.float8_e4m3fn:
-        try:
-            torch.testing.assert_close(
-                output,
-                o_ref.view(batch_size, q_len_per_request, num_q_heads, -1),
-                rtol=1e-1,
-                atol=1e-1,
-            )  # todo: do reference with normal attention?
-        except AssertionError as e:
-            print("output:", output)
-            print("o_ref:", o_ref)
-            raise e
-    else:
-        try:
-            torch.testing.assert_close(
-                output,
-                o_ref.view(batch_size, q_len_per_request, num_q_heads, -1),
-                rtol=1e-2,
-                atol=1e-2,
-            )
-        except AssertionError as e:
-            print("output:", output)
-            print("o_ref:", o_ref)
-            raise e
+        if dtype == torch.float8_e4m3fn:
+            try:
+                torch.testing.assert_close(
+                    output,
+                    o_ref.view(batch_size, q_len_per_request, num_q_heads, -1),
+                    rtol=1e-1,
+                    atol=1e-1,
+                )  # todo: do reference with normal attention?
+            except AssertionError as e:
+                print("output:", output)
+                print("o_ref:", o_ref)
+                raise e
+        else:
+            try:
+                torch.testing.assert_close(
+                    output,
+                    o_ref.view(batch_size, q_len_per_request, num_q_heads, -1),
+                    rtol=1e-2,
+                    atol=1e-2,
+                )
+            except AssertionError as e:
+                print("output:", output)
+                print("o_ref:", o_ref)
+                raise e
+    elif backend == "xqa":
+        atol = 0.05
+        rtol = 0.05
+
+        diff_abs = torch.abs(
+            o_ref.view(batch_size, q_len_per_request, num_q_heads, -1) - output
+        )
+        diff_rel = diff_abs / (
+            torch.abs(o_ref.view(batch_size, q_len_per_request, num_q_heads, -1)) + 1e-8
+        )
+
+        within_tolerance = (diff_abs <= atol) | (diff_rel <= rtol)
+
+        pass_ratio = within_tolerance.float().mean().item()
+
+        required_ratio = 0.95
+        assert pass_ratio >= required_ratio, (
+            f"Total {o_ref.numel()} elements, only {pass_ratio:.1%} meet tolerance criteria, "
+            f"require at least {required_ratio:.1%}"
+        )
+
+
+@pytest.mark.parametrize(
+    "batch_size",
+    [1, 2, 4, 16, 32, 64, 128, 256, 512, 768, 1024],
+)
+@pytest.mark.parametrize("scale", [1.0, 0.5])
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.bfloat16])
+@pytest.mark.parametrize("page_size", [32, 64])
+@pytest.mark.parametrize(
+    "q_len_per_request", [1, 2]
+)  # todo(Yingyi): verify larger q_len_per_request
+@pytest.mark.parametrize("dynamic_scale", [False])
+@pytest.mark.parametrize("enable_pdl", [True, False, None])
+@pytest.mark.parametrize("backend", ["trtllm-gen", "xqa"])
+def test_trtllm_batch_decode_mla(
+    batch_size: int,
+    scale: float,
+    dtype: torch.dtype,
+    page_size: int,
+    q_len_per_request: int,
+    dynamic_scale: bool,
+    enable_pdl: bool,
+    backend: str,
+):
+    trtllm_batch_decode_mla(
+        batch_size,
+        scale,
+        dtype,
+        page_size,
+        q_len_per_request,
+        dynamic_scale,
+        enable_pdl,
+        backend,
+        1024,
+    )
+
+
+@pytest.mark.parametrize(
+    "batch_size",
+    [2, 4, 8],
+)
+@pytest.mark.parametrize("scale", [1.0, 0.5])
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.bfloat16])
+@pytest.mark.parametrize("page_size", [64])
+@pytest.mark.parametrize("q_len_per_request", [1, 2, 3])
+@pytest.mark.parametrize("dynamic_scale", [False])
+@pytest.mark.parametrize("enable_pdl", [True, False, None])
+@pytest.mark.parametrize("backend", ["trtllm-gen"])
+@pytest.mark.parametrize("MAX_SEQ_LEN", [1024, 8960])
+def test_dsr1_trtllm_mla(
+    batch_size: int,
+    scale: float,
+    dtype: torch.dtype,
+    page_size: int,
+    q_len_per_request: int,
+    dynamic_scale: bool,
+    enable_pdl: bool,
+    backend: str,
+    MAX_SEQ_LEN: int,
+):
+    trtllm_batch_decode_mla(
+        batch_size,
+        scale,
+        dtype,
+        page_size,
+        q_len_per_request,
+        dynamic_scale,
+        enable_pdl,
+        backend,
+        MAX_SEQ_LEN,
+    )

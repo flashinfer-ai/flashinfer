@@ -17,7 +17,7 @@ static_assert(sizeof(void*) == sizeof(fptr_t));
 using tvm::ffi::Array;
 using tvm::ffi::Tuple;
 
-fptr_t init_custom_ar(Array<fptr_t> fake_ipc_ptrs, Tensor rank_data, int64_t rank,
+fptr_t init_custom_ar(Array<fptr_t> fake_ipc_ptrs, TensorView rank_data, int64_t rank,
                       bool full_nvlink) {
   int world_size = fake_ipc_ptrs.size();
   if (world_size > 8) throw std::invalid_argument("world size > 8 is not supported");
@@ -28,12 +28,12 @@ fptr_t init_custom_ar(Array<fptr_t> fake_ipc_ptrs, Tensor rank_data, int64_t ran
   for (int i = 0; i < world_size; i++) {
     ipc_ptrs[i] = reinterpret_cast<vllm::Signal*>(fake_ipc_ptrs[i]);
   }
-  return (fptr_t) new vllm::CustomAllreduce(ipc_ptrs, rank_data->data, get_numel(rank_data), rank,
+  return (fptr_t) new vllm::CustomAllreduce(ipc_ptrs, rank_data.data_ptr(), rank_data.numel(), rank,
                                             world_size, full_nvlink);
 }
 
 /**
- * Make sure tensor t's data lies completely within ((char)t->data) +
+ * Make sure tensor t's data lies completely within ((char)t.data_ptr()) +
  * t.numel() * t.element_size(). This is slightly weaker than t.is_contiguous()
  * because it allows transpose of contiguous slice (i.e. slicing the first
  * dimension). Currently, we require this because stride information is not
@@ -48,56 +48,56 @@ fptr_t init_custom_ar(Array<fptr_t> fake_ipc_ptrs, Tensor rank_data, int64_t ran
  * 5. A[None].expand(2, -1, -1, -1): Not OK
  * 6. A[:, 1:, 1:]: Not OK
  */
-bool _is_weak_contiguous(Tensor t) {
-  auto numel = get_numel(t);
+bool _is_weak_contiguous(TensorView t) {
+  auto numel = t.numel();
   auto element_size = get_element_size(t);
   return t.IsContiguous() ||
-         (tvm::ffi::GetDataSize(numel, t->dtype) - t->byte_offset * element_size ==
+         (tvm::ffi::GetDataSize(numel, t.dtype()) - t.byte_offset() * element_size ==
           numel * element_size);
 }
 
 /**
  * Performs an out-of-place allreduce and stores result in out.
  *
- * If _reg_buffer is null, assumes inp->data is already IPC-registered.
+ * If _reg_buffer is null, assumes inp.data_ptr() is already IPC-registered.
  * Otherwise, _reg_buffer is assumed to be IPC-registered and inp is first
  * copied into _reg_buffer.
  */
-void all_reduce(fptr_t _fa, Tensor inp, Tensor out, fptr_t _reg_buffer, int64_t reg_buffer_sz_bytes,
-                int64_t num_ctas) {
+void all_reduce(fptr_t _fa, TensorView inp, TensorView out, fptr_t _reg_buffer,
+                int64_t reg_buffer_sz_bytes, int64_t num_ctas) {
   auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
-  cudaSetDevice(inp->device.device_id);
-  auto stream = get_stream(inp->device);
+  cudaSetDevice(inp.device().device_id);
+  auto stream = get_stream(inp.device());
 
-  TVM_FFI_ICHECK_EQ(inp->dtype, out->dtype);
-  TVM_FFI_ICHECK_EQ(get_numel(inp), get_numel(out));
+  TVM_FFI_ICHECK_EQ(inp.dtype(), out.dtype());
+  TVM_FFI_ICHECK_EQ(inp.numel(), out.numel());
   TVM_FFI_ICHECK(_is_weak_contiguous(out));
   TVM_FFI_ICHECK(_is_weak_contiguous(inp));
-  auto input_size = get_numel(inp) * get_element_size(inp);
+  auto input_size = inp.numel() * get_element_size(inp);
   auto reg_buffer = reinterpret_cast<void*>(_reg_buffer);
   if (reg_buffer) {
     TVM_FFI_ICHECK_LE(input_size, reg_buffer_sz_bytes);
     auto status =
-        cudaMemcpyAsync(reg_buffer, inp->data, input_size, cudaMemcpyDeviceToDevice, stream);
+        cudaMemcpyAsync(reg_buffer, inp.data_ptr(), input_size, cudaMemcpyDeviceToDevice, stream);
     TVM_FFI_ICHECK(status == cudaSuccess);
   } else {
-    reg_buffer = inp->data;
+    reg_buffer = inp.data_ptr();
   }
-  switch (encode_dlpack_dtype(out->dtype)) {
+  switch (encode_dlpack_dtype(out.dtype())) {
     case float32_code: {
       fa->allreduce<float>(stream, reinterpret_cast<float*>(reg_buffer),
-                           reinterpret_cast<float*>(out->data), get_numel(out), num_ctas);
+                           reinterpret_cast<float*>(out.data_ptr()), out.numel(), num_ctas);
       break;
     }
     case float16_code: {
       fa->allreduce<half>(stream, reinterpret_cast<half*>(reg_buffer),
-                          reinterpret_cast<half*>(out->data), get_numel(out), num_ctas);
+                          reinterpret_cast<half*>(out.data_ptr()), out.numel(), num_ctas);
       break;
     }
 #if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
     case bfloat16_code: {
       fa->allreduce<nv_bfloat16>(stream, reinterpret_cast<nv_bfloat16*>(reg_buffer),
-                                 reinterpret_cast<nv_bfloat16*>(out->data), get_numel(out),
+                                 reinterpret_cast<nv_bfloat16*>(out.data_ptr()), out.numel(),
                                  num_ctas);
       break;
     }

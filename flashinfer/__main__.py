@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 # flashinfer-cli
+import os
 import click
 from tabulate import tabulate  # type: ignore[import-untyped]
 
@@ -79,13 +80,14 @@ env_variables = {
     "FLASHINFER_CUDA_ARCH_LIST": current_compilation_context.TARGET_CUDA_ARCHS,
     "FLASHINFER_CUDA_VERSION": get_cuda_version(),
     "FLASHINFER_CUBINS_REPOSITORY": FLASHINFER_CUBINS_REPOSITORY,
-    "CUDA_HOME": get_cuda_path(),
     "CUDA_VERSION": get_cuda_version(),
 }
 try:
     env_variables["CUDA_HOME"] = get_cuda_path()
+    found_nvcc = os.path.isfile(os.path.join(env_variables["CUDA_HOME"], "bin", "nvcc"))
 except Exception:
-    env_variables["CUDA_HOME"] = "Not Found"
+    env_variables["CUDA_HOME"] = ""
+    found_nvcc = False
 
 
 @cli.command("show-config")
@@ -124,6 +126,11 @@ def show_config_cmd():
     click.secho("=== Torch Version Info ===", fg="yellow")
     click.secho("Torch version:", fg="magenta", nl=False)
     click.secho(f" {torch.__version__}", fg="cyan")
+    click.secho("CUDA runtime available:", fg="magenta", nl=False)
+    if torch.cuda.is_available():
+        click.secho(" Yes", fg="green")
+    else:
+        click.secho(" No", fg="red")
     click.secho("", fg="white")
 
     # Section: Environment Variables
@@ -131,6 +138,11 @@ def show_config_cmd():
     for name, value in env_variables.items():
         click.secho(f"{name}:", fg="magenta", nl=False)
         click.secho(f" {value}", fg="cyan")
+    click.secho("NVCC found:", fg="magenta", nl=False)
+    if found_nvcc:
+        click.secho(" Yes", fg="green")
+    else:
+        click.secho(" No", fg="red")
     click.secho("", fg="white")
 
     # Section: Artifact path

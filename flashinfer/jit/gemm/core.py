@@ -20,7 +20,7 @@ from itertools import product
 import jinja2
 import torch
 
-from ...artifacts import ArtifactPath, MetaInfoHash
+from ...artifacts import ArtifactPath, CheckSumHash
 from .. import env as jit_env
 from ..core import (
     JitSpec,
@@ -30,7 +30,7 @@ from ..core import (
     sm100f_nvcc_flags,
     current_compilation_context,
 )
-from ..cubin_loader import get_cubin
+from ..cubin_loader import get_cubin, get_meta_hash
 from ..utils import dtype_cutlass_map, filename_safe_dtype_map, write_if_different
 
 
@@ -361,10 +361,16 @@ def gen_trtllm_gen_gemm_module() -> JitSpec:
     include_path = f"{ArtifactPath.TRTLLM_GEN_GEMM}/include"
     header_name = "flashinferMetaInfo"
 
+    # Check if checksums.txt exists in the cubin directory
+    checksum_path = f"{ArtifactPath.TRTLLM_GEN_GEMM}/checksums.txt"
+    checksum = get_cubin(checksum_path, CheckSumHash.TRTLLM_GEN_GEMM)
+    assert checksum, f"Failed to get checksums.txt from {checksum_path}"
+    meta_hash = get_meta_hash(checksum)
+
     # use `get_cubin` to get "flashinferMetaInfo.h"
     metainfo = get_cubin(
         f"{include_path}/{header_name}.h",
-        MetaInfoHash.TRTLLM_GEN_GEMM,
+        meta_hash,
     )
     # make sure "flashinferMetaInfo.h" is downloaded or cached
     assert metainfo, f"{header_name}.h not found"
@@ -375,6 +381,7 @@ def gen_trtllm_gen_gemm_module() -> JitSpec:
         ],
         extra_cuda_cflags=[
             "-DTLLM_GEN_EXPORT_INTERFACE",
+            "-DTLLM_GEN_EXPORT_FLASHINFER",
             "-DTLLM_ENABLE_CUDA",
             f'-DTLLM_GEN_GEMM_CUBIN_PATH=\\"{ArtifactPath.TRTLLM_GEN_GEMM}\\"',
         ]
@@ -498,4 +505,39 @@ def gen_gemm_sm90_module() -> JitSpec:
         "gemm_sm90",
         source_paths,
         extra_cuda_cflags=sm90a_nvcc_flags,
+    )
+
+
+def gen_trtllm_low_latency_gemm_module() -> JitSpec:
+    include_path = f"{ArtifactPath.TRTLLM_GEN_GEMM}/include"
+    header_name = "flashinferMetaInfo"
+
+    # Check if checksums.txt exists in the cubin directory
+    checksum_path = f"{ArtifactPath.TRTLLM_GEN_GEMM}/checksums.txt"
+    checksum = get_cubin(checksum_path, CheckSumHash.TRTLLM_GEN_GEMM)
+    assert checksum, f"Failed to get checksums.txt from {checksum_path}"
+    meta_hash = get_meta_hash(checksum)
+
+    # use `get_cubin` to get "flashinferMetaInfo.h"
+    metainfo = get_cubin(
+        f"{include_path}/{header_name}.h",
+        meta_hash,
+    )
+    # make sure "flashinferMetaInfo.h" is downloaded or cached
+    assert metainfo, f"{header_name}.h not found"
+    return gen_jit_spec(
+        "trtllm_low_latency_gemm",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "trtllm_low_latency_gemm_runner.cu",
+        ],
+        extra_cuda_cflags=[
+            "-DTLLM_GEN_EXPORT_INTERFACE",
+            "-DTLLM_GEN_EXPORT_FLASHINFER",
+            "-DTLLM_ENABLE_CUDA",
+            f'-DTLLM_GEN_GEMM_CUBIN_PATH=\\"{ArtifactPath.TRTLLM_GEN_GEMM}\\"',
+        ]
+        + sm100a_nvcc_flags,
+        # link "include" sub-directory in cache
+        extra_include_paths=[jit_env.FLASHINFER_CUBIN_DIR / include_path],
+        extra_ldflags=["-lcuda"],
     )

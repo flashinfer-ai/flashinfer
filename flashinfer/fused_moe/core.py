@@ -18,9 +18,7 @@ import functools
 from enum import IntEnum
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple, Union
-
 import torch
-import tvm_ffi
 
 from ..autotuner import (
     AutoTuner,
@@ -29,14 +27,17 @@ from ..autotuner import (
     TunableRunner,
     TuningConfig,
 )
+from ..jit.cpp_ext import is_cuda_version_at_least
 from ..jit.core import logger
 from ..jit import (
     setup_cubin_loader,
 )
 from ..jit.fused_moe import (
     gen_cutlass_fused_moe_sm120_module,
+    gen_cutlass_fused_moe_sm103_module,
     gen_cutlass_fused_moe_sm100_module,
     gen_cutlass_fused_moe_sm90_module,
+    gen_cutlass_fused_moe_sm89_module,
     gen_trtllm_gen_fused_moe_sm100_module,
 )
 from ..utils import (
@@ -46,11 +47,11 @@ from ..utils import (
     get_shuffle_matrix_sf_a_row_indices,
     register_custom_op,
     register_fake_op,
+    get_compute_capability,
 )
 from .utils import (
     get_last_power_of_2_num_tokens_buckets,
     last_positive_power_of_2,
-    next_positive_power_of_2,
 )
 
 
@@ -71,6 +72,19 @@ class RoutingMethodType(IntEnum):
     TopK = (5,)
     # Unspecified
     Unspecified = 6
+
+
+# Copied from csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/common.h
+class ActivationType(IntEnum):
+    Gelu = 0
+    Relu = 1
+    Silu = 2
+    Swiglu = 3
+    Geglu = 4
+    SwigluBias = 5
+    Relu2 = 6
+    Identity = 7
+    InvalidType = 8
 
 
 class DtypeTrtllmGen(IntEnum):
@@ -165,13 +179,49 @@ class GatedActType(IntEnum):
     GeGlu = 1
 
 
+@functools.cache
+def is_trtllm_moe_supported(
+    dtype_weights: DtypeTrtllmGen,
+    dtype_act: DtypeTrtllmGen,
+    quant_method: Optional[str] = None,
+) -> bool:
+    arch = get_compute_capability(torch.cuda.current_device())
+    if arch[0] < 10:
+        return False
+    if dtype_weights not in [
+        DtypeTrtllmGen.Bfloat16,
+        DtypeTrtllmGen.E4m3,
+        DtypeTrtllmGen.E2m1,
+        DtypeTrtllmGen.MxE2m1,
+    ]:
+        return False
+    if (
+        dtype_weights == DtypeTrtllmGen.Bfloat16
+        and dtype_act != DtypeTrtllmGen.Bfloat16
+    ):
+        return False
+    if dtype_weights == DtypeTrtllmGen.E4m3 and dtype_act != DtypeTrtllmGen.E4m3:
+        return False
+    if dtype_weights == DtypeTrtllmGen.E2m1 and dtype_act != DtypeTrtllmGen.E2m1:
+        return False
+    if dtype_weights == DtypeTrtllmGen.MxE2m1 and dtype_act not in [
+        DtypeTrtllmGen.MxE2m1,
+        DtypeTrtllmGen.MxE4m3,
+        DtypeTrtllmGen.Bfloat16,
+    ]:
+        return False
+    return True
+
+
 def _maybe_get_cached_w3_w1_permute_indices(
     _cache_permute_indices,
     dst_w3_w1_weight: torch.Tensor,
     epilogue_tile_m: int,
     num_elts_per_sf: Union[None, int] = None,
 ) -> torch.Tensor:
-    if dst_w3_w1_weight.shape not in _cache_permute_indices:
+    # Create a unique cache key (weight_type, weight_shape)
+    cache_key = ("w3_w1", dst_w3_w1_weight.shape)
+    if cache_key not in _cache_permute_indices:
         # Get permute indices and chain them together
         permute0 = get_reorder_rows_for_gated_act_gemm_row_indices(dst_w3_w1_weight)
         if num_elts_per_sf is None:
@@ -185,20 +235,22 @@ def _maybe_get_cached_w3_w1_permute_indices(
                 num_elts_per_sf=num_elts_per_sf,
             )
         # Memoize permute indices as recompute is **very** costly
-        _cache_permute_indices[dst_w3_w1_weight.shape] = permute0[permute1].to(
+        _cache_permute_indices[cache_key] = permute0[permute1].to(
             dst_w3_w1_weight.device
         )
-    permute_indices = _cache_permute_indices[dst_w3_w1_weight.shape]
+    permute_indices = _cache_permute_indices[cache_key]
     return permute_indices
 
 
-def _maybe_get_cached_w2_permute_indices(
+def get_w2_permute_indices_with_cache(
     _cache_permute_indices,
     dst_w2_weight: torch.Tensor,
     epilogue_tile_m: int,
     num_elts_per_sf: Union[None, int] = None,
 ) -> torch.Tensor:
-    if dst_w2_weight.shape not in _cache_permute_indices:
+    # Create a unique cache key (weight_type, weight_shape)
+    cache_key = ("w2", dst_w2_weight.shape)
+    if cache_key not in _cache_permute_indices:
         if num_elts_per_sf is None:
             permute_indices = get_shuffle_matrix_a_row_indices(
                 dst_w2_weight, epilogue_tile_m
@@ -210,8 +262,8 @@ def _maybe_get_cached_w2_permute_indices(
                 num_elts_per_sf=num_elts_per_sf,
             ).to(dst_w2_weight.device)
         # Memoize permute indices as recompute is **very** costly
-        _cache_permute_indices[dst_w2_weight.shape] = permute_indices
-    permute_indices = _cache_permute_indices[dst_w2_weight.shape]
+        _cache_permute_indices[cache_key] = permute_indices
+    permute_indices = _cache_permute_indices[cache_key]
     return permute_indices
 
 
@@ -264,10 +316,14 @@ def convert_to_block_layout(input_tensor: torch.Tensor, blockK: int) -> torch.Te
 def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = False):
     if backend in ("120", "121"):
         module = gen_cutlass_fused_moe_sm120_module(use_fast_build).build_and_load()
-    elif backend in ("100", "103", "110"):
+    elif backend == "103":
+        module = gen_cutlass_fused_moe_sm103_module(use_fast_build).build_and_load()
+    elif backend in ("100", "110"):
         module = gen_cutlass_fused_moe_sm100_module(use_fast_build).build_and_load()
     elif backend == "90":
         module = gen_cutlass_fused_moe_sm90_module(use_fast_build).build_and_load()
+    elif backend == "89":
+        module = gen_cutlass_fused_moe_sm89_module(use_fast_build).build_and_load()
     else:
         raise ValueError(f"Invalid backend: {backend}")
 
@@ -305,6 +361,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             use_mxfp8_act_scaling: bool,
             min_latency_mode: bool,
             enable_pdl: bool,
+            activation_type: ActivationType,
         ):
             self.x_dtype = x_dtype
             self.weight_dtype = weight_dtype
@@ -330,6 +387,9 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
                 use_w4_group_scaling,
                 use_mxfp8_act_scaling,
             )
+            self.activation_type = activation_type
+            # Set by tuning flow to indicate which GEMM stage (1 or 2) to filter tactics for
+            self.gemm_idx_for_tuning: Optional[int] = None
 
             if instance_key not in MoERunner.runner_dict:
                 MoERunner.runner_dict[instance_key] = module.init(
@@ -348,7 +408,20 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             inputs: List[torch.Tensor],
             profile: OptimizationProfile,
         ) -> List[int]:
-            return list(range(self.fused_moe_runner.get_tactic_num()))
+            # Prefer filtering tactics by GEMM stage to avoid invalid combos during tuning
+            try:
+                gemm1_count = self.fused_moe_runner.get_gemm1_tactic_count()
+                gemm2_count = self.fused_moe_runner.get_gemm2_tactic_count()
+                total = gemm1_count + gemm2_count
+            except Exception:
+                return list(range(self.fused_moe_runner.get_tactic_num()))
+
+            stage = getattr(self, "gemm_idx_for_tuning", None)
+            if stage == 1:
+                return list(range(gemm1_count))
+            if stage == 2:
+                return list(range(gemm1_count, gemm1_count + gemm2_count))
+            return list(range(total))
 
         def forward(
             self,
@@ -383,6 +456,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
                 tactic,
                 do_preparation,
                 self.enable_pdl,
+                self.activation_type,
             )
 
         @classmethod
@@ -431,6 +505,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
         min_latency_mode: bool = False,
         tune_max_num_tokens: int = 8192,
         enable_pdl: Optional[bool] = None,
+        activation_type: ActivationType = ActivationType.Swiglu,
     ) -> List[torch.Tensor]:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(input.device)
@@ -455,8 +530,11 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             use_mxfp8_act_scaling=use_mxfp8_act_scaling,
             min_latency_mode=min_latency_mode,
             enable_pdl=enable_pdl,
+            activation_type=activation_type,
         )
 
+        # Limit tactics to GEMM1 during tuning
+        moe_runner.gemm_idx_for_tuning = 1
         _, gemm_tactic_1 = tuner.choose_one(
             "trtllm::fused_moe::gemm1",
             [moe_runner],
@@ -471,6 +549,8 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             gemm_idx=1,
         )
 
+        # Limit tactics to GEMM2 during tuning
+        moe_runner.gemm_idx_for_tuning = 2
         _, gemm_tactic_2 = tuner.choose_one(
             "trtllm::fused_moe::gemm2",
             [moe_runner],
@@ -537,6 +617,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             min_latency_mode,
             [gemm_tactic_1, gemm_tactic_2],
             enable_pdl,
+            activation_type,
         )
 
         return (
@@ -632,6 +713,7 @@ def cutlass_fused_moe(
     min_latency_mode: bool = False,
     tune_max_num_tokens: int = 8192,
     enable_pdl: Optional[bool] = None,
+    activation_type: ActivationType = ActivationType.Swiglu,
 ) -> torch.Tensor:
     """Compute a Mixture of Experts (MoE) layer using CUTLASS backend.
 
@@ -736,6 +818,9 @@ def cutlass_fused_moe(
     tune_max_num_tokens : int = 8192
         Maximum number of tokens for tuning. Defaults to 8192.
 
+    activation_type: ActivationType = ActivationType.Swiglu
+        Activation to apply on for GEMM1, note that Relu2 means non-gated GEMM1
+
     Returns
     -------
     out: torch.Tensor
@@ -746,8 +831,6 @@ def cutlass_fused_moe(
     ------
     NotImplementedError:
         If any of the following features are requested but not implemented:
-            - FP8 Block Scaling
-            - W4A8 Group Scaling
             - Minimum Latency Mode
 
     Note
@@ -757,12 +840,21 @@ def cutlass_fused_moe(
     - Currently, some advanced features like FP8 block scaling and minimum latency mode
         are not implemented for Blackwell architecture.
     """
-    if use_deepseek_fp8_block_scale:
-        raise NotImplementedError(
-            "DeepSeek FP8 Block Scaling is not yet implemented in CUTLASS for Blackwell."
-        )
+    major, minor = torch.cuda.get_device_capability()
+    device_arch = f"{major * 10 + minor}"
+
     if min_latency_mode:
         raise NotImplementedError("min latency mode not yet implemented for Blackwell.")
+
+    if use_deepseek_fp8_block_scale:
+        if device_arch != "90":
+            raise NotImplementedError(
+                "FP8 block scaling not yet implemented for Blackwell."
+            )
+        elif not is_cuda_version_at_least("12.8"):
+            raise NotImplementedError(
+                "FP8 block scaling not implemented for CUDA 12.6 or lower."
+            )
 
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)
@@ -779,9 +871,6 @@ def cutlass_fused_moe(
         check_shape_dtype_device(
             output, output_shape, output_dtype, input.device, "output"
         )
-
-    major, minor = torch.cuda.get_device_capability()
-    device_arch = f"{major * 10 + minor}"
 
     return get_cutlass_fused_moe_module(device_arch).cutlass_fused_moe(
         output,
@@ -811,6 +900,7 @@ def cutlass_fused_moe(
         min_latency_mode=min_latency_mode,
         tune_max_num_tokens=tune_max_num_tokens,
         enable_pdl=enable_pdl,
+        activation_type=activation_type,
     )
 
 
@@ -880,8 +970,9 @@ def get_trtllm_moe_sm100_module():
             use_deepseek_fp8: bool,
             hidden_size: int,
             intermediate_size: int,
-            gated_act_type: int,
-            tile_tokens_dim: Optional[int] = None,
+            gated_act_type: int = GatedActType.SwiGlu,
+            use_shuffled_weight: bool = False,
+            weight_layout: int = WeightLayout.MajorK,
         ):
             self.num_local_experts = num_local_experts
             self.top_k = top_k
@@ -891,30 +982,9 @@ def get_trtllm_moe_sm100_module():
             self.top_k = top_k
             self.hidden_size = hidden_size
             self.intermediate_size = intermediate_size
-            self.gated_act_type = gated_act_type
-            self.tile_tokens_dim = tile_tokens_dim
-
-        def get_tile_tokens_dim(self, num_tokens: int, top_k: int):
-            # Factor to account for the imbalance of the experts.
-            # factor equals to the
-            # max_real_num_tokens_per_expert / perfect_num_tokens_per_expert
-            # - 1.0 means perfect expert distribution.
-            # - > 1.0 means some experts have more
-            #     tokens than the perfect distribution.
-            # - < 1.0 does not make sense.
-            imbalance_factor = 1.3
-            # Calculate the number of tokens per expert
-            # assuming perfect distribution.
-            num_tokens_per_expert = (num_tokens * top_k) // self.num_local_experts
-            # Apply the imbalance factor.
-            num_tokens_per_expert = int(num_tokens_per_expert * imbalance_factor)
-            # And pad the number to the next power of 2.
-            tile_tokens_dim = next_positive_power_of_2(num_tokens_per_expert)
-            # Cap to 8-64 tokens per CTA tile
-            # as it's the range supported by the kernel.
-            tile_tokens_dim = min(max(tile_tokens_dim, 8), 64)
-
-            return tile_tokens_dim
+            self.gated_act_type = GatedActType(gated_act_type)
+            self.use_shuffled_weight = use_shuffled_weight
+            self.weight_layout = WeightLayout(weight_layout)
 
         def get_valid_tactics(
             self,
@@ -930,13 +1000,8 @@ def get_trtllm_moe_sm100_module():
                 *extra_inputs,
             ) = inputs
             num_tokens = routing_logits.shape[0]
-            tile_tokens_dim = (
-                self.get_tile_tokens_dim(num_tokens, self.top_k)
-                if self.tile_tokens_dim is None
-                else self.tile_tokens_dim
-            )
+
             instance_key = (
-                tile_tokens_dim,
                 self.dtype_act,
                 self.dtype_weights,
                 self.use_deepseek_fp8,
@@ -945,6 +1010,8 @@ def get_trtllm_moe_sm100_module():
                 self.intermediate_size,
                 self.num_local_experts,
                 self.gated_act_type,
+                self.use_shuffled_weight,
+                self.weight_layout,
                 num_tokens,
             )
             if instance_key not in MoERunner.valid_tactics_dict:
@@ -974,11 +1041,6 @@ def get_trtllm_moe_sm100_module():
                 *extra_inputs,
             ) = inputs
             num_tokens = routing_logits.shape[0]
-            tile_tokens_dim = (
-                self.get_tile_tokens_dim(num_tokens, self.top_k)
-                if self.tile_tokens_dim is None
-                else self.tile_tokens_dim
-            )
 
             extra_input_idx = 0
             if trtllm_gen_dtype_has_scale(self.dtype_act):
@@ -1003,43 +1065,127 @@ def get_trtllm_moe_sm100_module():
                 hidden_states_scale.dim() == 2
                 and hidden_states_scale.shape[0] == num_tokens
             ), "hidden_states_scale's first dimension must be batch size"
-
-            # TODO(siyuan): support fp8
-            moe_op.trtllm_fp4_block_scale_moe(
-                routing_logits,
-                topk_ids,
-                expert_weights,
-                kwargs["routing_bias"],
-                hidden_states,
-                hidden_states_scale,  # hidden_states_scale
-                kwargs["gemm1_weights"],
-                kwargs["gemm1_weights_scale"],
-                kwargs["gemm1_bias"],
-                kwargs["gemm1_alpha"],
-                kwargs["gemm1_beta"],
-                kwargs["gemm1_clamp_limit"],
-                kwargs["gemm2_weights"],
-                kwargs["gemm2_weights_scale"],
-                kwargs["gemm2_bias"],
-                kwargs["output1_scale_scalar"],
-                kwargs["output1_scale_gate_scalar"],
-                kwargs["output2_scale_scalar"],
-                kwargs["num_experts"],
-                self.top_k,
-                kwargs["n_group"],
-                kwargs["topk_group"],
-                self.intermediate_size,
-                kwargs["local_expert_offset"],
-                self.num_local_experts,
-                kwargs["routed_scaling_factor"],
-                tile_tokens_dim,
-                kwargs["routing_method_type"],
-                kwargs["enable_pdl"],
-                kwargs["do_finalize"],
-                self.gated_act_type,
-                output,
-                tactic,
-            )
+            # Choose the appropriate operation based on data types
+            if self.dtype_weights == DtypeTrtllmGen.Bfloat16:
+                # BF16 operations
+                moe_op.trtllm_bf16_moe(
+                    routing_logits,
+                    kwargs["routing_bias"],
+                    hidden_states,
+                    kwargs["gemm1_weights"],
+                    kwargs["gemm2_weights"],
+                    kwargs["num_experts"],
+                    self.top_k,
+                    kwargs["n_group"],
+                    kwargs["topk_group"],
+                    self.intermediate_size,
+                    kwargs["local_expert_offset"],
+                    self.num_local_experts,
+                    kwargs["routing_method_type"],
+                    kwargs["use_shuffled_weight"],
+                    kwargs["weight_layout"],
+                    kwargs["enable_pdl"],
+                    [-1, -1] if tactic == -1 else tactic,
+                )
+            elif (
+                self.dtype_act == DtypeTrtllmGen.E4m3
+                and self.dtype_weights == DtypeTrtllmGen.E4m3
+            ):
+                # FP8 operations
+                if self.use_deepseek_fp8:
+                    # FP8 block scale
+                    current_num_tokens = hidden_states.shape[0]
+                    current_hidden_size = hidden_states.shape[1]
+                    current_hidden_states_scale = torch.full(
+                        (current_hidden_size // 128, current_num_tokens),
+                        2.0,
+                        dtype=torch.float,
+                        device=hidden_states.device,
+                    )
+                    moe_op.trtllm_fp8_block_scale_moe(
+                        routing_logits,
+                        kwargs["routing_bias"],
+                        hidden_states,
+                        current_hidden_states_scale,
+                        kwargs["gemm1_weights"],
+                        kwargs["gemm1_weights_scale"],
+                        kwargs["gemm2_weights"],
+                        kwargs["gemm2_weights_scale"],
+                        output,
+                        kwargs["num_experts"],
+                        self.top_k,
+                        kwargs["n_group"],
+                        kwargs["topk_group"],
+                        self.intermediate_size,
+                        kwargs["local_expert_offset"],
+                        self.num_local_experts,
+                        kwargs["routed_scaling_factor"],
+                        kwargs["routing_method_type"],
+                        kwargs["use_shuffled_weight"],
+                        kwargs["weight_layout"],
+                        kwargs["enable_pdl"],
+                        [-1, -1] if tactic == -1 else tactic,
+                    )
+                else:
+                    # FP8 per tensor scale
+                    moe_op.trtllm_fp8_per_tensor_scale_moe(
+                        routing_logits,
+                        kwargs["routing_bias"],
+                        hidden_states,
+                        kwargs["gemm1_weights"],
+                        kwargs["output1_scales_scalar"],
+                        kwargs["output1_scales_gate_scalar"],
+                        kwargs["gemm2_weights"],
+                        kwargs["output2_scales_scalar"],
+                        output,
+                        kwargs["num_experts"],
+                        self.top_k,
+                        kwargs["n_group"],
+                        kwargs["topk_group"],
+                        self.intermediate_size,
+                        kwargs["local_expert_offset"],
+                        self.num_local_experts,
+                        kwargs["routed_scaling_factor"],
+                        kwargs["use_routing_scales_on_input"],
+                        kwargs["routing_method_type"],
+                        kwargs["enable_pdl"],
+                        [-1, -1] if tactic == -1 else tactic,
+                    )
+            else:
+                moe_op.trtllm_fp4_block_scale_moe(
+                    routing_logits,
+                    topk_ids,
+                    expert_weights,
+                    kwargs["routing_bias"],
+                    hidden_states,
+                    hidden_states_scale,  # hidden_states_scale
+                    kwargs["gemm1_weights"],
+                    kwargs["gemm1_weights_scale"],
+                    kwargs["gemm1_bias"],
+                    kwargs["gemm1_alpha"],
+                    kwargs["gemm1_beta"],
+                    kwargs["gemm1_clamp_limit"],
+                    kwargs["gemm2_weights"],
+                    kwargs["gemm2_weights_scale"],
+                    kwargs["gemm2_bias"],
+                    kwargs["output1_scale_scalar"],
+                    kwargs["output1_scale_gate_scalar"],
+                    kwargs["output2_scale_scalar"],
+                    kwargs["num_experts"],
+                    self.top_k,
+                    kwargs["n_group"],
+                    kwargs["topk_group"],
+                    self.intermediate_size,
+                    kwargs["local_expert_offset"],
+                    self.num_local_experts,
+                    kwargs["routed_scaling_factor"],
+                    kwargs["routing_method_type"],
+                    kwargs["enable_pdl"],
+                    kwargs["do_finalize"],
+                    self.gated_act_type,
+                    output,
+                    [-1, -1] if tactic == -1 else tactic,
+                )
 
         @classmethod
         @functools.lru_cache(maxsize=None)
@@ -1068,6 +1214,134 @@ def get_trtllm_moe_sm100_module():
             )
 
     @register_custom_op(
+        "flashinfer::trtllm_bf16_moe",
+        mutates_args=(""),
+    )
+    def trtllm_bf16_moe_op(
+        routing_logits: torch.Tensor,
+        routing_bias: Optional[torch.Tensor],
+        hidden_states: torch.Tensor,
+        gemm1_weights: torch.Tensor,
+        gemm2_weights: torch.Tensor,
+        num_experts: int,
+        top_k: int,
+        n_group: Optional[int],
+        topk_group: Optional[int],
+        intermediate_size: int,
+        local_expert_offset: int,
+        local_num_experts: int,
+        routing_method_type: int,
+        use_shuffled_weight: bool,
+        weight_layout: int,
+        enable_pdl: Optional[bool] = None,
+        tune_max_num_tokens: int = 8192,
+    ) -> torch.Tensor:
+        if enable_pdl is None:
+            enable_pdl = device_support_pdl(hidden_states.device)
+
+        # Use AutoTuner to select the best tactic
+        tuner = AutoTuner.get()
+        MoERunner.refine_tuning_config(tune_max_num_tokens)
+
+        num_tokens = hidden_states.shape[0]
+        hidden_size = hidden_states.shape[-1]
+
+        # Create workspace buffers
+        output = torch.empty(
+            num_tokens, hidden_size, dtype=torch.bfloat16, device=hidden_states.device
+        )
+        topk_ids = torch.empty(
+            num_tokens, top_k, dtype=torch.int32, device=hidden_states.device
+        )
+        expert_weights = torch.empty(
+            num_tokens, top_k, dtype=routing_logits.dtype, device=hidden_states.device
+        )
+
+        dtype_act = DtypeTrtllmGen.Bfloat16
+        dtype_weights = DtypeTrtllmGen.Bfloat16
+
+        moe_runner = MoERunner(
+            top_k=top_k,
+            num_local_experts=local_num_experts,
+            dtype_act=dtype_act,
+            dtype_weights=dtype_weights,
+            use_deepseek_fp8=False,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            weight_layout=weight_layout,
+            use_shuffled_weight=use_shuffled_weight,
+            gated_act_type=GatedActType.SwiGlu,  # Default for BF16
+        )
+
+        inputs = [output, routing_logits, topk_ids, expert_weights, hidden_states]
+
+        _, tactic = tuner.choose_one(
+            "flashinfer::trtllm_bf16_moe",
+            [moe_runner],
+            MoERunner.tuning_config_no_hidden_states_scales,
+            inputs,
+            routing_bias=routing_bias,
+            gemm1_weights=gemm1_weights,
+            gemm2_weights=gemm2_weights,
+            num_experts=num_experts,
+            n_group=n_group,
+            topk_group=topk_group,
+            local_expert_offset=local_expert_offset,
+            local_num_experts=local_num_experts,
+            routing_method_type=routing_method_type,
+            use_shuffled_weight=use_shuffled_weight,
+            weight_layout=weight_layout,
+            enable_pdl=enable_pdl,
+        )
+
+        # Call the C++ function with the selected tactic
+        result = moe_op.trtllm_bf16_moe(
+            routing_logits,
+            routing_bias,
+            hidden_states,
+            gemm1_weights,
+            gemm2_weights,
+            num_experts,
+            top_k,
+            n_group,
+            topk_group,
+            intermediate_size,
+            local_expert_offset,
+            local_num_experts,
+            routing_method_type,
+            use_shuffled_weight,
+            weight_layout,
+            enable_pdl,
+            [-1, -1] if tactic == -1 else tactic,
+        )
+        return result
+
+    @register_fake_op("flashinfer::trtllm_bf16_moe")
+    def _fake_trtllm_bf16_moe(
+        routing_logits: torch.Tensor,
+        routing_bias: Optional[torch.Tensor],
+        hidden_states: torch.Tensor,
+        gemm1_weights: torch.Tensor,
+        gemm2_weights: torch.Tensor,
+        num_experts: int,
+        top_k: int,
+        n_group: Optional[int],
+        topk_group: Optional[int],
+        intermediate_size: int,
+        local_expert_offset: int,
+        local_num_experts: int,
+        routing_method_type: int,
+        use_shuffled_weight: bool,
+        weight_layout: int,
+        enable_pdl: Optional[bool] = None,
+        tune_max_num_tokens: int = 8192,
+    ):
+        seq_len = hidden_states.shape[0]
+        hidden_size = hidden_states.shape[1]
+
+        return [hidden_states.new_empty([seq_len, hidden_size], dtype=torch.bfloat16)]
+
+    @register_custom_op(
         "flashinfer::trtllm_fp8_per_tensor_scale_moe",
         mutates_args=(""),
     )
@@ -1082,21 +1356,77 @@ def get_trtllm_moe_sm100_module():
         output2_scales_scalar: torch.Tensor,
         num_experts: int,
         top_k: int,
-        n_group: int,
-        topk_group: int,
+        n_group: Optional[int],
+        topk_group: Optional[int],
         intermediate_size: int,
         local_expert_offset: int,
         local_num_experts: int,
-        routed_scaling_factor: float,
+        routed_scaling_factor: Optional[float],
         use_routing_scales_on_input: bool,
-        tile_tokens_dim: int = 8,
         routing_method_type: int = 0,
         enable_pdl: Optional[bool] = None,
+        tune_max_num_tokens: int = 8192,
     ) -> torch.Tensor:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(hidden_states.device)
+        # Use AutoTuner to select the best tactic
+        tuner = AutoTuner.get()
+        MoERunner.refine_tuning_config(tune_max_num_tokens)
+
+        num_tokens = hidden_states.shape[0]
+        hidden_size = hidden_states.shape[-1]
+
+        # Create workspace buffers
+        output = torch.empty(
+            num_tokens, hidden_size, dtype=torch.bfloat16, device=hidden_states.device
+        )
+        topk_ids = torch.empty(
+            num_tokens, top_k, dtype=torch.int32, device=hidden_states.device
+        )
+        expert_weights = torch.empty(
+            num_tokens, top_k, dtype=routing_logits.dtype, device=hidden_states.device
+        )
+
+        dtype_act = DtypeTrtllmGen.E4m3  # FP8 activation
+        dtype_weights = DtypeTrtllmGen.E4m3  # FP8 weights
+
+        moe_runner = MoERunner(
+            top_k=top_k,
+            num_local_experts=local_num_experts,
+            dtype_act=dtype_act,
+            dtype_weights=dtype_weights,
+            use_deepseek_fp8=False,  # per_tensor mode
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            weight_layout=WeightLayout.MajorK,
+            use_shuffled_weight=True,
+        )
+
+        inputs = [output, routing_logits, topk_ids, expert_weights, hidden_states]
+
+        _, tactic = tuner.choose_one(
+            "flashinfer::trtllm_fp8_per_tensor_scale_moe",
+            [moe_runner],
+            MoERunner.tuning_config_no_hidden_states_scales,  # FP8 per-tensor doesn't use hidden_states_scale
+            inputs,
+            routing_bias=routing_bias,
+            gemm1_weights=gemm1_weights,
+            output1_scales_scalar=output1_scales_scalar,
+            output1_scales_gate_scalar=output1_scales_gate_scalar,
+            gemm2_weights=gemm2_weights,
+            output2_scales_scalar=output2_scales_scalar,
+            num_experts=num_experts,
+            n_group=n_group,
+            topk_group=topk_group,
+            local_expert_offset=local_expert_offset,
+            local_num_experts=local_num_experts,
+            routed_scaling_factor=routed_scaling_factor,
+            use_routing_scales_on_input=use_routing_scales_on_input,
+            routing_method_type=routing_method_type,
+            enable_pdl=enable_pdl,
+        )
         # Call the C++ function
-        output = moe_op.trtllm_fp8_per_tensor_scale_moe(
+        result = moe_op.trtllm_fp8_per_tensor_scale_moe(
             routing_logits,
             routing_bias,
             hidden_states,
@@ -1105,6 +1435,7 @@ def get_trtllm_moe_sm100_module():
             output1_scales_gate_scalar,
             gemm2_weights,
             output2_scales_scalar,
+            output,
             num_experts,
             top_k,
             n_group,
@@ -1114,11 +1445,12 @@ def get_trtllm_moe_sm100_module():
             local_num_experts,
             routed_scaling_factor,
             use_routing_scales_on_input,
-            tile_tokens_dim,
             routing_method_type,
             enable_pdl,
+            [-1, -1] if tactic == -1 else tactic,
         )
-        return output
+
+        return result
 
     @register_fake_op("flashinfer::trtllm_fp8_per_tensor_scale_moe")
     def _fake_trtllm_fp8_per_tensor_scale_moe(
@@ -1132,14 +1464,13 @@ def get_trtllm_moe_sm100_module():
         output2_scales_scalar: torch.Tensor,
         num_experts: int,
         top_k: int,
-        n_group: int,
-        topk_group: int,
+        n_group: Optional[int],
+        topk_group: Optional[int],
         intermediate_size: int,
         local_expert_offset: int,
         local_num_experts: int,
-        routed_scaling_factor: float,
+        routed_scaling_factor: Optional[float],
         use_routing_scales_on_input: bool,
-        tile_tokens_dim: int = 8,
         routing_method_type: int = 0,
         enable_pdl: Optional[bool] = None,
     ):
@@ -1164,22 +1495,86 @@ def get_trtllm_moe_sm100_module():
         output: torch.Tensor,
         num_experts: int,
         top_k: int,
-        n_group: int,
-        topk_group: int,
+        n_group: Optional[int],
+        topk_group: Optional[int],
         intermediate_size: int,
         local_expert_offset: int,
         local_num_experts: int,
-        routed_scaling_factor: float,
-        tile_tokens_dim: int,
+        routed_scaling_factor: Optional[float],
         routing_method_type: int,
         use_shuffled_weight: bool = False,
         weight_layout: int = 0,
         enable_pdl: Optional[bool] = None,
+        tune_max_num_tokens: int = 8192,
     ) -> torch.Tensor:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(hidden_states.device)
+
+        # Use AutoTuner to select the best tactic - follow FP4 pattern exactly
+        tuner = AutoTuner.get()
+        MoERunner.refine_tuning_config(tune_max_num_tokens)
+
+        num_tokens = hidden_states.shape[0]
+        hidden_size = hidden_states.shape[-1]
+
+        # Create workspace buffers
+        output = torch.empty(
+            num_tokens, hidden_size, dtype=torch.bfloat16, device=hidden_states.device
+        )
+        topk_ids = torch.empty(
+            num_tokens, top_k, dtype=torch.int32, device=hidden_states.device
+        )
+        expert_weights = torch.empty(
+            num_tokens, top_k, dtype=routing_logits.dtype, device=hidden_states.device
+        )
+
+        dtype_act = DtypeTrtllmGen.E4m3  # FP8 activation
+        dtype_weights = DtypeTrtllmGen.E4m3  # FP8 weights
+
+        moe_runner = MoERunner(
+            top_k=top_k,
+            num_local_experts=local_num_experts,
+            dtype_act=dtype_act,
+            dtype_weights=dtype_weights,
+            use_deepseek_fp8=True,  # block_scale mode
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            weight_layout=weight_layout,
+            use_shuffled_weight=use_shuffled_weight,
+        )
+
+        inputs = [
+            output,
+            routing_logits,
+            topk_ids,
+            expert_weights,
+            hidden_states,
+            hidden_states_scale,
+        ]
+
+        _, tactic = tuner.choose_one(
+            "flashinfer::trtllm_fp8_block_scale_moe",
+            [moe_runner],
+            MoERunner.tuning_config_with_hidden_states_scales,  # FP8 block-scale uses hidden_states_scale
+            inputs,
+            routing_bias=routing_bias,
+            gemm1_weights=gemm1_weights,
+            gemm1_weights_scale=gemm1_weights_scale,
+            gemm2_weights=gemm2_weights,
+            gemm2_weights_scale=gemm2_weights_scale,
+            num_experts=num_experts,
+            n_group=n_group,
+            topk_group=topk_group,
+            local_expert_offset=local_expert_offset,
+            local_num_experts=local_num_experts,
+            routed_scaling_factor=routed_scaling_factor,
+            routing_method_type=routing_method_type,
+            use_shuffled_weight=use_shuffled_weight,
+            weight_layout=weight_layout,
+            enable_pdl=enable_pdl,
+        )
         # Call the C++ function for block scale MoE
-        moe_op.trtllm_fp8_block_scale_moe(
+        result = moe_op.trtllm_fp8_block_scale_moe(
             routing_logits,
             routing_bias,
             hidden_states,
@@ -1197,14 +1592,14 @@ def get_trtllm_moe_sm100_module():
             local_expert_offset,
             local_num_experts,
             routed_scaling_factor,
-            tile_tokens_dim,
             routing_method_type,
             use_shuffled_weight,
             weight_layout,
             enable_pdl,
+            [-1, -1] if tactic == -1 else tactic,
         )
 
-        return output
+        return result
 
     @register_fake_op("flashinfer::trtllm_fp8_block_scale_moe")
     def _fake_trtllm_fp8_block_scale_moe(
@@ -1219,13 +1614,12 @@ def get_trtllm_moe_sm100_module():
         output: torch.Tensor,
         num_experts: int,
         top_k: int,
-        n_group: int,
-        topk_group: int,
+        n_group: Optional[int],
+        topk_group: Optional[int],
         intermediate_size: int,
         local_expert_offset: int,
         local_num_experts: int,
-        routed_scaling_factor: float,
-        tile_tokens_dim: int = 8,
+        routed_scaling_factor: Optional[float],
         routing_method_type: int = 0,
         use_shuffled_weight: bool = False,
         weight_layout: int = 0,
@@ -1267,7 +1661,6 @@ def get_trtllm_moe_sm100_module():
         local_expert_offset: int,
         num_local_experts: int,
         routed_scaling_factor: Optional[float],
-        tile_tokens_dim: int,
         routing_method_type: int,
         do_finalize: bool,
         enable_pdl: Optional[bool] = None,
@@ -1322,9 +1715,8 @@ def get_trtllm_moe_sm100_module():
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             gated_act_type=gated_act_type,
-            # NOTE(siyuan): do not fix the tile_tokens_dim to let tunnable runner decide the tile_tokens_dim itself.
-            # however, when the user chooses a different heuristic for tile_tokens_dim, the autotuner will fail to find the correct cached tactics.
-            # tile_tokens_dim=tile_tokens_dim,
+            weight_layout=WeightLayout.MajorK,
+            use_shuffled_weight=True,
         )
         tunning_config = (
             MoERunner.tuning_config_no_hidden_states_scales
@@ -1373,7 +1765,7 @@ def get_trtllm_moe_sm100_module():
         )
 
         # Call the C++ function for block scale MoE
-        output = moe_op.trtllm_fp4_block_scale_moe(
+        intermediate_output = moe_op.trtllm_fp4_block_scale_moe(
             routing_logits,
             topk_ids,
             expert_weights,
@@ -1400,20 +1792,22 @@ def get_trtllm_moe_sm100_module():
             local_expert_offset,
             num_local_experts,
             routed_scaling_factor,
-            tile_tokens_dim,
             routing_method_type,
             do_finalize,
             enable_pdl,
             gated_act_type,
             output,
-            tactic,
+            [-1, -1] if tactic == -1 else tactic,
         )
-        if isinstance(output, tvm_ffi.Array):
-            output = list(output)
-            for i in range(len(output)):
-                if isinstance(output[i], tvm_ffi.Tensor):
-                    output[i] = torch.from_dlpack(output[i])
-        return output
+        if do_finalize:
+            return [output]
+        else:
+            gemm2_output, expanded_idx_to_permuted_idx = intermediate_output
+            return [
+                torch.from_dlpack(gemm2_output),
+                expert_weights,
+                torch.from_dlpack(expanded_idx_to_permuted_idx),
+            ]
 
     @register_fake_op("flashinfer::trtllm_fp4_block_scale_moe")
     def _fake_trtllm_fp4_block_scale_moe(
@@ -1443,7 +1837,6 @@ def get_trtllm_moe_sm100_module():
         local_expert_offset: int,
         local_num_experts: int,
         routed_scaling_factor: Optional[float],
-        tile_tokens_dim: int,
         routing_method_type: int,
         do_finalize: bool,
         enable_pdl: bool,
@@ -1457,9 +1850,90 @@ def get_trtllm_moe_sm100_module():
         return [hidden_states.new_empty([seq_len, hidden_size], dtype=torch.bfloat16)]
 
     return SimpleNamespace(
+        trtllm_bf16_moe=trtllm_bf16_moe_op,
         trtllm_fp8_per_tensor_scale_moe=trtllm_fp8_per_tensor_scale_moe_op,
         trtllm_fp8_block_scale_moe=trtllm_fp8_block_scale_moe_op,
         trtllm_fp4_block_scale_moe=trtllm_fp4_block_scale_moe_op,
+    )
+
+
+def trtllm_bf16_moe(
+    routing_logits: torch.Tensor,
+    routing_bias: Optional[torch.Tensor],
+    hidden_states: torch.Tensor,
+    gemm1_weights: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+    n_group: Optional[int],
+    topk_group: Optional[int],
+    intermediate_size: int,
+    local_expert_offset: int,
+    local_num_experts: int,
+    routing_method_type: int = 0,
+    use_shuffled_weight: bool = True,
+    weight_layout: int = WeightLayout.BlockMajorK,
+    enable_pdl: bool = True,
+    tune_max_num_tokens: int = 8192,
+) -> torch.Tensor:
+    """BF16 MoE operation with autotuning support.
+
+    This function implements a bfloat16 Mixture of Experts layer using the TensorRT-LLM backend
+    with automatic performance tuning for optimal tile size selection.
+
+    Args:
+        routing_logits: [seq_len, num_experts] tensor of routing logits.
+            Supports float32 or bfloat16.
+        routing_bias: Optional [num_experts] tensor of routing bias.
+            Must be bfloat16 if provided.
+        hidden_states: [seq_len, hidden_size] tensor of input hidden states.
+            Must be bfloat16.
+        gemm1_weights: [num_experts, 2*intermediate_size, hidden_size] tensor of first layer weights.
+            Must be bfloat16.
+        gemm2_weights: [num_experts, hidden_size, intermediate_size] tensor of second layer weights.
+            Must be bfloat16.
+        num_experts: Total number of experts.
+        top_k: Number of experts to route to per token.
+        n_group: Number of expert groups.
+        topk_group: Number of groups to consider for top-k routing.
+        intermediate_size: Size of intermediate layer.
+        local_expert_offset: Offset of local experts in global expert space.
+        local_num_experts: Number of experts handled by this device.
+        routing_method_type: Type of routing method to use (default: 0).
+            - 0: Default (Softmax -> TopK)
+            - 1: Renormalize (TopK -> Softmax)
+            - 2: DeepSeekV3 (Sigmoid -> RoutingBiasAdd -> Top2 in group -> Top4 groups -> Top8 experts)
+            - 3: Llama4 (Top1 -> Sigmoid)
+            - 4: RenormalizeNaive (Softmax -> TopK -> Renormalize)
+        use_shuffled_weight: Whether to use shuffled weight layout for optimization (default: True).
+        weight_layout: Weight layout format (default: WeightLayout.BlockMajorK).
+            - 0: MajorK - K-major layout [Mn, K]
+            - 1: MajorMn - M-major for A and N-major for B [K, Mn]
+            - 2: BlockMajorK - Blocked along K dimension [K/blockK, Mn, blockK]
+        enable_pdl: Whether to enable Programmatic Dependent Launch. Auto-enabled for >= sm90.
+        tune_max_num_tokens: Maximum number of tokens for autotuning (default: 8192).
+
+    Returns:
+        torch.Tensor: Output tensor of shape [seq_len, hidden_size].
+    """
+    return get_trtllm_moe_sm100_module().trtllm_bf16_moe(
+        routing_logits,
+        routing_bias,
+        hidden_states,
+        gemm1_weights,
+        gemm2_weights,
+        num_experts,
+        top_k,
+        n_group,
+        topk_group,
+        intermediate_size,
+        local_expert_offset,
+        local_num_experts,
+        routing_method_type,
+        use_shuffled_weight,
+        weight_layout,
+        enable_pdl,
+        tune_max_num_tokens,
     )
 
 
@@ -1474,16 +1948,16 @@ def trtllm_fp8_per_tensor_scale_moe(
     output2_scales_scalar: torch.Tensor,
     num_experts: int,
     top_k: int,
-    n_group: int,
-    topk_group: int,
+    n_group: Optional[int],
+    topk_group: Optional[int],
     intermediate_size: int,
     local_expert_offset: int,
     local_num_experts: int,
-    routed_scaling_factor: float,
+    routed_scaling_factor: Optional[float],
     use_routing_scales_on_input: bool,
-    tile_tokens_dim: int = 8,
     routing_method_type: int = 0,
     enable_pdl: Optional[bool] = None,
+    tune_max_num_tokens: int = 8192,
 ) -> torch.Tensor:
     """FP8 per tensor scale MoE operation.
 
@@ -1505,9 +1979,9 @@ def trtllm_fp8_per_tensor_scale_moe(
         local_num_experts: Number of experts handled by this device
         routed_scaling_factor: Scaling factor for routing
         use_routing_scales_on_input: Whether to use routing scales on input
-        tile_tokens_dim: Tile dimension for tokens (default: 8)
         routing_method_type: Type of routing method to use (default: 0)
         enable_pdl: Whether to enable Programmatic Dependent Launch (PDL). Auto-enabled for >= sm90.
+        tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 8192)
 
     Returns:
         torch.Tensor: Output tensor of shape [seq_len, hidden_size]
@@ -1530,9 +2004,9 @@ def trtllm_fp8_per_tensor_scale_moe(
         local_num_experts,
         routed_scaling_factor,
         use_routing_scales_on_input,
-        tile_tokens_dim,
         routing_method_type,
         enable_pdl,
+        tune_max_num_tokens,
     )
 
 
@@ -1547,17 +2021,17 @@ def trtllm_fp8_block_scale_moe(
     gemm2_weights_scale: torch.Tensor,
     num_experts: int,
     top_k: int,
-    n_group: int,
-    topk_group: int,
+    n_group: Optional[int],
+    topk_group: Optional[int],
     intermediate_size: int,
     local_expert_offset: int,
     local_num_experts: int,
-    routed_scaling_factor: float,
-    tile_tokens_dim: int = 8,
+    routed_scaling_factor: Optional[float],
     routing_method_type: int = 0,
     use_shuffled_weight: bool = False,
     weight_layout: int = 0,
     enable_pdl: Optional[bool] = None,
+    tune_max_num_tokens: int = 8192,
 ) -> torch.Tensor:
     """FP8 block scale MoE operation.
 
@@ -1578,9 +2052,9 @@ def trtllm_fp8_block_scale_moe(
         local_expert_offset: Offset of local experts in global expert space
         local_num_experts: Number of experts handled by this device
         routed_scaling_factor: Scaling factor for routing
-        tile_tokens_dim: Tile dimension for tokens (default: 8)
         routing_method_type: Type of routing method to use (default: 0)
         enable_pdl: Whether to enable Programmatic Dependent Launch (PDL). Auto-enabled for >= sm90.
+        tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 8192)
     Returns:
         torch.Tensor: Output tensor of shape [seq_len, hidden_size]
     """
@@ -1605,11 +2079,11 @@ def trtllm_fp8_block_scale_moe(
         local_expert_offset,
         local_num_experts,
         routed_scaling_factor,
-        tile_tokens_dim,
         routing_method_type,
         use_shuffled_weight,
         weight_layout,
         enable_pdl,
+        tune_max_num_tokens,
     )
 
 
@@ -1638,7 +2112,6 @@ def trtllm_fp4_block_scale_moe(
     local_expert_offset: int,
     local_num_experts: int,
     routed_scaling_factor: Optional[float],
-    tile_tokens_dim: int = 8,
     routing_method_type: int = 0,
     do_finalize: bool = True,
     enable_pdl: Optional[bool] = None,
@@ -1689,7 +2162,6 @@ def trtllm_fp4_block_scale_moe(
         local_expert_offset (int): Offset of local experts in global expert space
         local_num_experts (int): Number of experts handled by this device
         routed_scaling_factor (Optional[float]): Scaling factor for routing (can be None for some routing methods)
-        tile_tokens_dim (int): Tile dimension for tokens (default: 8)
         routing_method_type (int): Type of routing method to use (default: 0)
             - 0: Default (Softmax -> TopK)
             - 1: Renormalize (TopK -> Softmax)
@@ -1735,7 +2207,6 @@ def trtllm_fp4_block_scale_moe(
         local_expert_offset,
         local_num_experts,
         routed_scaling_factor,
-        tile_tokens_dim,
         routing_method_type,
         do_finalize,
         enable_pdl,
@@ -1770,7 +2241,6 @@ def trtllm_fp4_block_scale_routed_moe(
     local_expert_offset: int,
     local_num_experts: int,
     routed_scaling_factor: Optional[float],
-    tile_tokens_dim: int = 8,
     routing_method_type: int = 0,
     do_finalize: bool = True,
     enable_pdl: Optional[bool] = None,
@@ -1823,7 +2293,6 @@ def trtllm_fp4_block_scale_routed_moe(
         local_expert_offset (int): Offset of local experts in global expert space
         local_num_experts (int): Number of experts handled by this device
         routed_scaling_factor (Optional[float]): Scaling factor for routing (can be None for some routing methods)
-        tile_tokens_dim (int): Tile dimension for tokens (default: 8)
         routing_method_type (int): Type of routing method to use (default: 0)
             - 0: Default (Softmax -> TopK)
             - 1: Renormalize (TopK -> Softmax)
@@ -1869,7 +2338,6 @@ def trtllm_fp4_block_scale_routed_moe(
         local_expert_offset,
         local_num_experts,
         routed_scaling_factor,
-        tile_tokens_dim,
         routing_method_type,
         do_finalize,
         enable_pdl,

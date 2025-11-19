@@ -18,7 +18,10 @@ import numpy as np
 import torch
 
 import flashinfer
-from flashinfer.testing.utils import bench_gpu_time
+from flashinfer.testing.utils import (
+    bench_gpu_time,
+    attention_tflops_per_sec_with_actual_seq_lens,
+)
 
 
 def bench_fmha_blackwell(
@@ -69,14 +72,17 @@ def bench_fmha_blackwell(
     )
     ms = np.median(measurements)
 
-    def flops(ms):
-        if causal:
-            return batch_size * qkv_len * qkv_len * num_heads * head_dim * 2 / ms / 1e9
-        else:
-            return batch_size * qkv_len * qkv_len * num_heads * head_dim * 4 / ms / 1e9
-
+    TFLOPS = attention_tflops_per_sec_with_actual_seq_lens(
+        torch.full((batch_size,), qkv_len),
+        torch.full((batch_size,), qkv_len),
+        head_dim,
+        head_dim,
+        num_heads,
+        causal,
+        ms,
+    )
     print(
-        f"bench_fmha_blackwell (batch_size={batch_size}, qkv_len={qkv_len}, num_heads={num_heads}, head_dim={head_dim}, causal={causal}), flops: {flops(ms):.3f} TFLOPs/s"
+        f"bench_fmha_blackwell (batch_size={batch_size}, qkv_len={qkv_len}, num_heads={num_heads}, head_dim={head_dim}, causal={causal}), flops: {TFLOPS:.3f} TFLOPs/s"
     )
 
 

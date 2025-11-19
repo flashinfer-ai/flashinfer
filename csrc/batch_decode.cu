@@ -37,15 +37,15 @@ using tvm::ffi::Array;
 using tvm::ffi::Optional;
 
 Array<int64_t> BatchDecodeWithPagedKVCachePlan(
-    Tensor float_workspace_buffer, Tensor int_workspace_buffer,
-    Tensor page_locked_int_workspace_buffer, Tensor indptr, int64_t batch_size,
+    TensorView float_workspace_buffer, TensorView int_workspace_buffer,
+    TensorView page_locked_int_workspace_buffer, TensorView indptr, int64_t batch_size,
     int64_t num_qo_heads, int64_t num_kv_heads, int64_t page_size, bool enable_cuda_graph,
     int64_t window_left, double logits_soft_cap, int64_t head_dim_qk, int64_t head_dim_vo,
-    Tensor empty_q_data, Tensor empty_kv_data) {
+    TensorView empty_q_data, TensorView empty_kv_data) {
   size_t float_workspace_size_in_bytes =
-      float_workspace_buffer->shape[0] * get_element_size(float_workspace_buffer);
+      float_workspace_buffer.size(0) * get_element_size(float_workspace_buffer);
   size_t int_workspace_size_in_bytes =
-      int_workspace_buffer->shape[0] * get_element_size(int_workspace_buffer);
+      int_workspace_buffer.size(0) * get_element_size(int_workspace_buffer);
 
   DecodePlanInfo plan_info;
 
@@ -53,8 +53,8 @@ Array<int64_t> BatchDecodeWithPagedKVCachePlan(
       << "CUDA cores template only supports equal head dim for QK and VO, please use tensor "
          "cores template for different head dim";
 
-  cudaSetDevice(float_workspace_buffer->device.device_id);
-  const cudaStream_t stream = get_stream(float_workspace_buffer->device);
+  cudaSetDevice(float_workspace_buffer.device().device_id);
+  const cudaStream_t stream = get_stream(float_workspace_buffer.device());
   DISPATCH_context(
       DTypeQ, DTypeKV, DTypeO, IdType, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
       USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP, AttentionVariant, Params, [&] {
@@ -62,10 +62,10 @@ Array<int64_t> BatchDecodeWithPagedKVCachePlan(
           auto work_estimation_func = BatchDecodeWithPagedKVCacheWorkEstimationDispatched<
               GROUP_SIZE, HEAD_DIM_QK, POS_ENCODING_MODE, AttentionVariant, Params>;
           cudaError_t status = DecodePlan<HEAD_DIM_QK, POS_ENCODING_MODE, AttentionVariant, Params>(
-              static_cast<void*>(float_workspace_buffer->data), float_workspace_size_in_bytes,
-              static_cast<void*>(int_workspace_buffer->data),
-              static_cast<void*>(page_locked_int_workspace_buffer->data),
-              int_workspace_size_in_bytes, plan_info, static_cast<IdType*>(indptr->data),
+              static_cast<void*>(float_workspace_buffer.data_ptr()), float_workspace_size_in_bytes,
+              static_cast<void*>(int_workspace_buffer.data_ptr()),
+              static_cast<void*>(page_locked_int_workspace_buffer.data_ptr()),
+              int_workspace_size_in_bytes, plan_info, static_cast<IdType*>(indptr.data_ptr()),
               batch_size, num_qo_heads, page_size, enable_cuda_graph,
               /*stream=*/stream, work_estimation_func);
 
@@ -78,28 +78,30 @@ Array<int64_t> BatchDecodeWithPagedKVCachePlan(
   return Array(plan_info.ToVector());
 }
 
-void BatchDecodeWithPagedKVCacheRun(Tensor float_workspace_buffer, Tensor int_workspace_buffer,
-                                    Array<int64_t> plan_info_vec, Tensor q, Tensor paged_k_cache,
-                                    Tensor paged_v_cache, Tensor paged_kv_indptr,
-                                    Tensor paged_kv_indices, Tensor paged_kv_last_page_len,
-                                    Tensor o, Optional<Tensor> maybe_lse, int64_t kv_layout_code,
-                                    int64_t window_left, bool enable_pdl ADDITIONAL_FUNC_PARAMS) {
+void BatchDecodeWithPagedKVCacheRun(TensorView float_workspace_buffer,
+                                    TensorView int_workspace_buffer, Array<int64_t> plan_info_vec,
+                                    TensorView q, TensorView paged_k_cache,
+                                    TensorView paged_v_cache, TensorView paged_kv_indptr,
+                                    TensorView paged_kv_indices, TensorView paged_kv_last_page_len,
+                                    TensorView o, Optional<TensorView> maybe_lse,
+                                    int64_t kv_layout_code, int64_t window_left,
+                                    bool enable_pdl ADDITIONAL_FUNC_PARAMS) {
   DecodePlanInfo plan_info;
   plan_info.FromVector(std::vector<int64_t>(plan_info_vec.begin(), plan_info_vec.end()));
   QKVLayout kv_layout = static_cast<QKVLayout>(kv_layout_code);
-  int64_t batch_size = q->shape[0];
-  int64_t num_qo_heads = q->shape[1];
+  int64_t batch_size = q.size(0);
+  int64_t num_qo_heads = q.size(1);
   int64_t num_kv_heads, page_size;
 
   if (kv_layout == QKVLayout::kHND) {
-    num_kv_heads = paged_k_cache->shape[1];
-    page_size = paged_k_cache->shape[2];
+    num_kv_heads = paged_k_cache.size(1);
+    page_size = paged_k_cache.size(2);
   } else {
-    page_size = paged_k_cache->shape[1];
-    num_kv_heads = paged_k_cache->shape[2];
+    page_size = paged_k_cache.size(1);
+    num_kv_heads = paged_k_cache.size(2);
   }
-  uint32_t head_dim_qk = q->shape[2];
-  uint32_t head_dim_vo = paged_v_cache->shape[3];
+  uint32_t head_dim_qk = q.size(2);
+  uint32_t head_dim_vo = paged_v_cache.size(3);
 
   TVM_FFI_ICHECK_EQ(head_dim_qk, head_dim_vo)
       << "CUDA cores template only supports equal head dim for QK and VO, please use tensor "
@@ -107,16 +109,16 @@ void BatchDecodeWithPagedKVCacheRun(Tensor float_workspace_buffer, Tensor int_wo
 
   if (maybe_lse.has_value()) {
     const auto& lse = maybe_lse.value();
-    TVM_FFI_ICHECK_EQ(lse->shape[0], batch_size);
-    TVM_FFI_ICHECK_EQ(lse->shape[1], num_qo_heads);
+    TVM_FFI_ICHECK_EQ(lse.size(0), batch_size);
+    TVM_FFI_ICHECK_EQ(lse.size(1), num_qo_heads);
   }
 
-  void* float_buffer = static_cast<void*>(float_workspace_buffer->data);
-  void* int_buffer = static_cast<void*>(int_workspace_buffer->data);
+  void* float_buffer = static_cast<void*>(float_workspace_buffer.data_ptr());
+  void* int_buffer = static_cast<void*>(int_workspace_buffer.data_ptr());
 
   // get q_stride_n and q_stride_h
-  const auto q_stride_n = q->strides[0];
-  const auto q_stride_h = q->strides[1];
+  const auto q_stride_n = q.stride(0);
+  const auto q_stride_h = q.stride(1);
 
   // get kv_cache_strides
   const int64_t* kv_cache_strides = nullptr;
@@ -128,24 +130,26 @@ void BatchDecodeWithPagedKVCacheRun(Tensor float_workspace_buffer, Tensor int_wo
   }
   kv_cache_strides = k_strides.data();
 
-  cudaSetDevice(q->device.device_id);
-  const cudaStream_t stream = get_stream(q->device);
+  cudaSetDevice(q.device().device_id);
+  const cudaStream_t stream = get_stream(q.device());
 
   DISPATCH_context(
       DTypeQ, DTypeKV, DTypeO, IdType, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
       USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP, AttentionVariant, Params, [&] {
         paged_kv_t<DTypeKV, IdType> paged_kv(
             num_kv_heads, page_size, HEAD_DIM_QK, batch_size, kv_layout,
-            static_cast<DTypeKV*>(paged_k_cache->data), static_cast<DTypeKV*>(paged_v_cache->data),
-            kv_cache_strides, static_cast<IdType*>(paged_kv_indices->data),
-            static_cast<IdType*>(paged_kv_indptr->data),
-            static_cast<IdType*>(paged_kv_last_page_len->data));
+            static_cast<DTypeKV*>(paged_k_cache.data_ptr()),
+            static_cast<DTypeKV*>(paged_v_cache.data_ptr()), kv_cache_strides,
+            static_cast<IdType*>(paged_kv_indices.data_ptr()),
+            static_cast<IdType*>(paged_kv_indptr.data_ptr()),
+            static_cast<IdType*>(paged_kv_last_page_len.data_ptr()));
 
         Params params;
-        params.q = static_cast<DTypeQ*>(q->data);
+        params.q = static_cast<DTypeQ*>(q.data_ptr());
         params.paged_kv = paged_kv;
-        params.o = static_cast<DTypeO*>(o->data);
-        params.lse = maybe_lse.has_value() ? static_cast<float*>(maybe_lse.value()->data) : nullptr;
+        params.o = static_cast<DTypeO*>(o.data_ptr());
+        params.lse =
+            maybe_lse.has_value() ? static_cast<float*>(maybe_lse.value().data_ptr()) : nullptr;
         params.padded_batch_size = 0;
         params.num_qo_heads = num_qo_heads;
         params.q_stride_n = q_stride_n;

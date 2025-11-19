@@ -14,7 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+from contextlib import nullcontext
+
 import pytest
+from flashinfer.fused_moe.core import ActivationType
 import torch
 from torch.nn import functional as F
 
@@ -135,7 +138,7 @@ def compute_routing(
     return routing_weights, selected_experts
 
 
-def torch_moe_nvfp4(a, w1, w2, topk, topk_weight, topk_ids):
+def torch_moe_nvfp4(a, w1, w2, topk, topk_weight, topk_ids, activation_type):
     B, D = a.shape
     a = a.view(B, -1, D).repeat(1, topk, 1).reshape(-1, D)
     out = torch.zeros(B * topk, w2.shape[1], dtype=a.dtype, device=a.device)
@@ -145,13 +148,26 @@ def torch_moe_nvfp4(a, w1, w2, topk, topk_weight, topk_ids):
     topk_ids = topk_ids.view(-1)
     # w1 needs to be swapped in terms of gate and up_proj
 
+    if activation_type == ActivationType.Swiglu:
+
+        def act(weight, mask):
+            m = weight.shape[0]
+            assert m % 2 == 0
+            w1_expert, w3_expert = weight[m // 2 :, :], weight[: m // 2, :]
+            return F.silu(a[mask] @ w1_expert.t()) * (a[mask] @ w3_expert.t())
+
+    elif activation_type == ActivationType.Relu2:
+
+        def act(weight, mask):
+            return F.relu(a[mask] @ weight.t()) ** 2
+
+    else:
+        raise ValueError(f"Unsupported activation type {activation_type}")
+
     for i in range(w1.shape[0]):
         mask = topk_ids == i
         if mask.sum():
-            m = w1[i].shape[0]
-            assert m % 2 == 0
-            w1_expert, w3_expert = w1[i][m // 2 :, :], w1[i][: m // 2, :]
-            inter = F.silu(a[mask] @ w1_expert.t()) * (a[mask] @ w3_expert.t())
+            inter = act(w1[i], mask)
             inter_gs = torch.tensor(1.0).cuda()
             inter_q, inter_blockscale = fp4_quantize(inter, inter_gs)
             inter = dequantize_nvfp4_to_dtype(
@@ -361,6 +377,11 @@ def test_moe_fp8(
     [(torch.float16, torch.float8_e4m3fn), (torch.bfloat16, torch.float8_e4m3fn)],
 )
 @pytest.mark.parametrize("quantized_input", [False, True])
+@pytest.mark.parametrize(
+    "activation_type",
+    [ActivationType.Swiglu, ActivationType.Relu2],
+    ids=["swiglu", "relu2"],
+)
 @pytest.mark.skipif(
     torch.cuda.get_device_capability()[0] not in [10, 11, 12],
     reason="NVFP4 is only supported on SM100, SM110 and SM120",
@@ -374,6 +395,7 @@ def test_moe_nvfp4(
     otype,
     wtype,
     quantized_input,
+    activation_type,
 ):
     # Skip invalid configurations
     if top_k > num_experts:
@@ -389,10 +411,10 @@ def test_moe_nvfp4(
     n = intermediate_size
     k = hidden_size
 
-    w1 = torch.randn((e, 2 * n, k), device="cuda", dtype=otype) / 10
-    w1_cutlass = torch.cat((w1[:, n:, :], w1[:, :n, :]), dim=1).contiguous()
+    w1_n = 2 * n if activation_type == ActivationType.Swiglu else n
+    w1 = torch.randn((e, w1_n, k), device="cuda", dtype=otype) / 10
 
-    sf_w1_2n = round_up(2 * n, 128)
+    sf_w1_2n = round_up(w1_n, 128)
     sf_w1_k = round_up(k // quant_blocksize, 4)
     w1_blockscale = torch.empty(
         (e, sf_w1_2n, sf_w1_k), device="cuda", dtype=torch.float8_e4m3fn
@@ -407,8 +429,8 @@ def test_moe_nvfp4(
     w2_blockscale = torch.empty(
         (e, sf_w2_k, sf_w2_n), device="cuda", dtype=torch.float8_e4m3fn
     )
-    w1_q = torch.empty((e, 2 * n, k // 2), device="cuda", dtype=torch.uint8)
-    w1_q_cutlass = torch.empty((e, 2 * n, k // 2), device="cuda", dtype=torch.uint8)
+    w1_q = torch.empty((e, w1_n, k // 2), device="cuda", dtype=torch.uint8)
+    w1_q_cutlass = torch.empty((e, w1_n, k // 2), device="cuda", dtype=torch.uint8)
     w2_q = torch.empty((e, k, n // 2), device="cuda", dtype=torch.uint8)
     w1_gs = torch.empty((e,), device="cuda", dtype=torch.float32)
     w2_gs = torch.empty((e,), device="cuda", dtype=torch.float32)
@@ -422,7 +444,7 @@ def test_moe_nvfp4(
         w1_q[expert], w1_blockscale[expert] = fp4_quantize(w1[expert], w1_gs[expert])
 
         w1_q_cutlass[expert], w1_blockscale_cutlass[expert] = fp4_quantize(
-            w1_cutlass[expert], w1_gs[expert]
+            w1[expert], w1_gs[expert]
         )
 
         w2_q[expert], w2_blockscale[expert] = fp4_quantize(w2[expert], w2_gs[expert])
@@ -467,6 +489,7 @@ def test_moe_nvfp4(
         quant_scales=quant_scales,
         input_sf=input_sf,
         output=flash_output,
+        activation_type=activation_type,
     )
 
     # Ref check
@@ -481,7 +504,7 @@ def test_moe_nvfp4(
         block_size=quant_blocksize,
     )
 
-    w1_d = torch.empty((e, 2 * n, k), device="cuda", dtype=otype)
+    w1_d = torch.empty((e, w1_n, k), device="cuda", dtype=otype)
     w2_d = torch.empty((e, k, n), device="cuda", dtype=otype)
 
     for idx in range(0, e):
@@ -502,12 +525,14 @@ def test_moe_nvfp4(
             block_size=quant_blocksize,
         )
 
-    w1_q_cutlass = torch.cat((w1_q[:, n:, :], w1_q[:, :n, :]), dim=1).contiguous()
-    w1_blockscale_cutlass = torch.cat(
-        (w1_blockscale[:, n:, :], w1_blockscale[:, :n, :]), dim=1
-    ).contiguous()
     ref_output = torch_moe_nvfp4(
-        a_in_dtype, w1_d, w2_d, top_k, routing_weights, selected_experts
+        a_in_dtype,
+        w1_d,
+        w2_d,
+        top_k,
+        routing_weights,
+        selected_experts,
+        activation_type,
     )
     torch.testing.assert_close(ref_output, flash_output, rtol=2e-1, atol=2e-1)
 
@@ -938,17 +963,13 @@ def dequantize_block(
 @pytest.mark.parametrize("num_experts", NUM_EXPERTS)
 @pytest.mark.parametrize("top_k", TOP_K_VALUES)
 @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
-@pytest.mark.skipif(
-    torch.cuda.get_device_capability()[0] not in [10, 11, 12],
-    reason="FP8 block scaling is only supported on SM100, SM110 and SM120",
-)
 def test_moe_fp8_block_scaling(
     batch_size, hidden_size, num_experts, top_k, intermediate_size
 ):
     """
     Test MoE with FP8 block scaling (Deepseek style):
-    - Activation: 128x1 blocks
-    - Weights: 128x128 blocks
+    - Activation: BF16 (unquantized)
+    - Weights: FP8 with 128x128 block scaling
     - Each block has its own scaling factor
 
     Args:
@@ -957,7 +978,6 @@ def test_moe_fp8_block_scaling(
         num_experts: Number of experts
         top_k: Number of experts to route to per token
         intermediate_size: Intermediate dimension size
-        Only support bf16 for hidden_states
     """
     torch.manual_seed(42)
     otype = torch.bfloat16
@@ -981,11 +1001,6 @@ def test_moe_fp8_block_scaling(
     routing_weights = torch.randn((batch_size, top_k)).cuda()
     routing_weights = F.softmax(routing_weights, dim=1)
 
-    # Run reference implementation (no quantization)
-    _ref_output = compute_with_experts(
-        num_experts, x, w31_weight, w2_weight, selected_experts, routing_weights
-    )
-
     # Quantize input and weights
     x_quant, x_scales = per_token_group_quant_fp8(x, group_size=128)
 
@@ -993,13 +1008,13 @@ def test_moe_fp8_block_scaling(
     w2_dequant = torch.empty_like(w2_weight)
     w31_quant = torch.empty_like(w31_weight).to(torch.float8_e4m3fn)
     w2_quant = torch.empty_like(w2_weight).to(torch.float8_e4m3fn)
-    w31_scales = torch.randn(
+    w31_scales = torch.zeros(
         num_experts,
         ceil_div(2 * intermediate_size, 128),
         ceil_div(hidden_size, 128),
         dtype=torch.float32,
     ).cuda()
-    w2_scales = torch.randn(
+    w2_scales = torch.zeros(
         num_experts,
         ceil_div(hidden_size, 128),
         ceil_div(intermediate_size, 128),
@@ -1013,7 +1028,7 @@ def test_moe_fp8_block_scaling(
         w31_scales.data[expert_id].copy_(w31_s)
         w2_quant.data[expert_id].copy_(w2)
         w2_scales.data[expert_id].copy_(w2_s)
-    # Dequantize for verificationa
+    # Dequantize for verification
     x_dequant = dequantize_block(x_quant, x_scales, x.dtype, x.shape)
     w31_dequant = dequantize_block(
         w31_quant, w31_scales, w31_weight.dtype, w31_weight.shape
@@ -1021,7 +1036,7 @@ def test_moe_fp8_block_scaling(
     w2_dequant = dequantize_block(w2_quant, w2_scales, w2_weight.dtype, w2_weight.shape)
 
     # Run reference implementation with dequantized tensors
-    _ref_output = compute_with_experts(
+    ref_output = compute_with_experts(
         num_experts,
         x_dequant,
         w31_dequant,
@@ -1029,16 +1044,16 @@ def test_moe_fp8_block_scaling(
         selected_experts,
         routing_weights,
     )
-    quant_scales = [
-        w31_scales,  # .view(-1),  # W31 scales
-        w2_scales,  # .view(-1),  # W2 scales
-    ]
 
-    # Call flashinfer implementation with block scaling and expect NotImplementedError
-    with pytest.raises(
-        NotImplementedError,
-        match="DeepSeek FP8 Block Scaling is not yet implemented in CUTLASS for Blackwell",
-    ):
+    flash_output = torch.zeros_like(x)
+
+    execption_context = (
+        pytest.raises(NotImplementedError)
+        if torch.cuda.get_device_capability()[0] != 9
+        else nullcontext()
+    )
+
+    with execption_context:
         _ = fused_moe.cutlass_fused_moe(
             x.contiguous(),
             selected_experts.to(torch.int),
@@ -1046,11 +1061,12 @@ def test_moe_fp8_block_scaling(
             w31_quant.contiguous(),
             w2_quant.contiguous(),
             otype,
-            tp_size=1,
-            tp_rank=0,
             use_deepseek_fp8_block_scale=True,
-            quant_scales=quant_scales,
+            quant_scales=[w31_scales.contiguous(), w2_scales.contiguous()],
+            output=flash_output,
         )
+
+        torch.testing.assert_close(flash_output, ref_output, rtol=1e-1, atol=1e-1)
 
 
 def quant_mxfp4_batches(a, num_experts):
@@ -1093,8 +1109,8 @@ def dequant_mxfp4_batches(
     ("alpha", "beta", "limit"), [(None, None, None), (0.5, 0.0, 7.0), (1.702, 1.0, 7.0)]
 )
 @pytest.mark.skipif(
-    torch.cuda.get_device_capability()[0] not in [10, 11],
-    reason="MXFP8xMXFP4 is only supported on SM100 and SM110",
+    torch.cuda.get_device_capability()[0] not in [10, 11, 12],
+    reason="MXFP8xMXFP4 is only supported on SM100, SM110 and SM120",
 )
 def test_moe_mxfp8_mxfp4(
     batch_size,

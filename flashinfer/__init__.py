@@ -25,7 +25,7 @@ from .activation import gelu_and_mul as gelu_and_mul
 from .activation import gelu_tanh_and_mul as gelu_tanh_and_mul
 from .activation import silu_and_mul as silu_and_mul
 from .activation import (
-    silu_and_mul_nvfp4_batched_quantize as silu_and_mul_nvfp4_batched_quantize,
+    silu_and_mul_scaled_nvfp4_experts_quantize as silu_and_mul_scaled_nvfp4_experts_quantize,
 )
 from .attention import BatchAttention as BatchAttention
 from .attention import (
@@ -71,6 +71,7 @@ from .fp4_quantization import (
     nvfp4_batched_quantize,
     shuffle_matrix_a,
     shuffle_matrix_sf_a,
+    scaled_fp4_grouped_quantize,
 )
 from .fp8_quantization import mxfp8_dequantize_host, mxfp8_quantize
 from .fused_moe import (
@@ -86,9 +87,11 @@ from .fused_moe import (
 from .gemm import SegmentGEMMWrapper as SegmentGEMMWrapper
 from .gemm import bmm_fp8 as bmm_fp8
 from .gemm import mm_fp4 as mm_fp4
+from .gemm import mm_fp8 as mm_fp8
 from .gemm import tgv_gemm_sm100 as tgv_gemm_sm100
 from .mla import BatchMLAPagedAttentionWrapper as BatchMLAPagedAttentionWrapper
 from .norm import fused_add_rmsnorm as fused_add_rmsnorm
+from .norm import layernorm as layernorm
 from .norm import gemma_fused_add_rmsnorm as gemma_fused_add_rmsnorm
 from .norm import gemma_rmsnorm as gemma_rmsnorm
 from .norm import rmsnorm as rmsnorm
@@ -97,6 +100,7 @@ from .page import append_paged_mla_kv_cache as append_paged_mla_kv_cache
 from .page import get_batch_indices_positions as get_batch_indices_positions
 from .page import get_seq_lens as get_seq_lens
 from .pod import PODWithPagedKVCacheWrapper as PODWithPagedKVCacheWrapper
+from .pod import BatchPODWithPagedKVCacheWrapper as BatchPODWithPagedKVCacheWrapper
 from .prefill import (
     BatchPrefillWithPagedKVCacheWrapper as BatchPrefillWithPagedKVCacheWrapper,
 )
@@ -141,5 +145,9 @@ from .sparse import BlockSparseAttentionWrapper as BlockSparseAttentionWrapper
 from .sparse import (
     VariableBlockSparseAttentionWrapper as VariableBlockSparseAttentionWrapper,
 )
+from .trtllm_low_latency_gemm import (
+    prepare_low_latency_gemm_weights as prepare_low_latency_gemm_weights,
+)
 from .utils import next_positive_power_of_2 as next_positive_power_of_2
 from .xqa import xqa as xqa
+from .xqa import xqa_mla as xqa_mla

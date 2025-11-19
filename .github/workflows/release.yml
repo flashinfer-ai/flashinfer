@@ -1,0 +1,444 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag (e.g., v1.2.3) to build and publish'
+        required: true
+        type: string
+  pull_request:
+    paths:
+      - '.github/workflows/release.yml'
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.set-version.outputs.version }}
+      release_tag: ${{ steps.set-version.outputs.release_tag }}
+      is_pr: ${{ steps.set-version.outputs.is_pr }}
+    steps:
+      - name: Determine if running in PR mode
+        id: check-mode
+        run: |
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            echo "is_pr=true" >> $GITHUB_OUTPUT
+            echo "Running in PR mode (dry-run)"
+          else
+            echo "is_pr=false" >> $GITHUB_OUTPUT
+            echo "Running in release mode"
+          fi
+
+      - name: Validate tag format
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          if [[ ! "${{ inputs.tag }}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([a-z0-9]+)?$ ]]; then
+            echo "Error: Tag '${{ inputs.tag }}' does not match the expected format (e.g., v1.2.3 or v1.2.3.post1 or v1.2.3rc1)"
+            exit 1
+          fi
+          echo "✓ Tag format is valid: ${{ inputs.tag }}"
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.head_ref || inputs.tag }}
+          submodules: true
+
+      - name: Verify tag matches version.txt
+        id: set-version
+        run: |
+          # Check version.txt - this is the source of truth
+          if [ ! -f "version.txt" ]; then
+            echo "Error: version.txt file not found!"
+            exit 1
+          fi
+
+          VERSION_TXT=$(cat version.txt | tr -d '[:space:]')
+
+          # In PR mode, use version from version.txt with a test suffix
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            echo "is_pr=true" >> $GITHUB_OUTPUT
+            echo "version=${VERSION_TXT}" >> $GITHUB_OUTPUT
+            echo "release_tag=test-v${VERSION_TXT}-pr${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
+            echo "✓ PR mode: using test tag test-v${VERSION_TXT}-pr${{ github.event.pull_request.number }}"
+          else
+            # Extract version from tag (remove 'v' prefix)
+            TAG_VERSION="${{ inputs.tag }}"
+            TAG_VERSION="${TAG_VERSION#v}"
+
+            if [ "$TAG_VERSION" != "$VERSION_TXT" ]; then
+              echo "❌ CRITICAL ERROR: version.txt does not match tag!"
+              echo "  Tag version: $TAG_VERSION"
+              echo "  version.txt: $VERSION_TXT"
+              echo ""
+              echo "Please update version.txt to match the release version before creating a release."
+              echo "The tag should be 'v$VERSION_TXT' (e.g., if version.txt contains '1.2.3', tag should be 'v1.2.3')"
+              exit 1
+            fi
+
+            echo "is_pr=false" >> $GITHUB_OUTPUT
+            echo "✓ version.txt matches tag version: $VERSION_TXT"
+            echo "version=${VERSION_TXT}" >> $GITHUB_OUTPUT
+            echo "release_tag=${{ inputs.tag }}" >> $GITHUB_OUTPUT
+          fi
+
+  build-flashinfer-python:
+    needs: setup
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.head_ref || inputs.tag }}
+          submodules: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install build wheel
+
+      - name: Build flashinfer-python wheel and sdist
+        run: |
+          echo "Building flashinfer-python..."
+          echo "Git commit: $(git rev-parse HEAD)"
+          python -m build
+          ls -lh dist/
+
+      - name: Upload flashinfer-python artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: flashinfer-python-dist
+          path: dist/*
+          retention-days: 7
+
+  build-flashinfer-cubin:
+    needs: setup
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.head_ref || inputs.tag }}
+          submodules: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install build twine wheel
+
+      - name: Build flashinfer-cubin wheel
+        run: |
+          echo "Building flashinfer-cubin..."
+          echo "Git commit: $(git rev-parse HEAD)"
+          cd flashinfer-cubin
+          rm -rf dist build *.egg-info
+          python -m build --wheel
+          ls -lh dist/
+          mkdir -p ../dist
+          cp dist/*.whl ../dist/
+
+      - name: Upload flashinfer-cubin artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: flashinfer-cubin-wheel
+          path: dist/*.whl
+          retention-days: 7
+
+  build-flashinfer-jit-cache:
+    needs: setup
+    strategy:
+      fail-fast: false
+      matrix:
+        cuda: ["12.8", "12.9", "13.0"]
+        arch: ['x86_64', 'aarch64']
+
+    runs-on: [self-hosted, "${{ matrix.arch == 'aarch64' && 'arm64' || matrix.arch }}"]
+
+    steps:
+      - name: Display Machine Information
+        run: |
+          echo "CPU: $(nproc) cores, $(lscpu | grep 'Model name' | cut -d':' -f2 | xargs)"
+          echo "RAM: $(free -h | awk '/^Mem:/ {print $7 " available out of " $2}')"
+          echo "Disk: $(df -h / | awk 'NR==2 {print $4 " available out of " $2}')"
+          echo "Architecture: $(uname -m)"
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.head_ref || inputs.tag }}
+          submodules: true
+
+      - name: Build wheel in container
+        env:
+          DOCKER_IMAGE: ${{ matrix.arch == 'aarch64' && format('pytorch/manylinuxaarch64-builder:cuda{0}', matrix.cuda) || format('pytorch/manylinux2_28-builder:cuda{0}', matrix.cuda) }}
+          FLASHINFER_CUDA_ARCH_LIST: ${{ matrix.cuda < '13.0' && '7.5 8.0 8.9 9.0a 10.0a 12.0a' || '7.5 8.0 8.9 9.0a 10.0a 10.3a 11.0a 12.0f' }}
+        run: |
+          # Extract CUDA major and minor versions
+          CUDA_MAJOR=$(echo "${{ matrix.cuda }}" | cut -d'.' -f1)
+          CUDA_MINOR=$(echo "${{ matrix.cuda }}" | cut -d'.' -f2)
+          export CUDA_MAJOR
+          export CUDA_MINOR
+          export FLASHINFER_LOCAL_VERSION="cu${CUDA_MAJOR}${CUDA_MINOR}"
+
+          chown -R $(id -u):$(id -g) ${{ github.workspace }}
+          mkdir -p ${{ github.workspace }}/ci-cache
+          chown -R $(id -u):$(id -g) ${{ github.workspace }}/ci-cache
+
+          # Run the build script inside the container with proper mounts
+          docker run --rm \
+            -v ${{ github.workspace }}:/workspace \
+            -v ${{ github.workspace }}/ci-cache:/ci-cache \
+            -e FLASHINFER_CI_CACHE=/ci-cache \
+            -e CUDA_VERSION="${{ matrix.cuda }}" \
+            -e CUDA_MAJOR="$CUDA_MAJOR" \
+            -e CUDA_MINOR="$CUDA_MINOR" \
+            -e FLASHINFER_LOCAL_VERSION="$FLASHINFER_LOCAL_VERSION" \
+            -e ARCH="${{ matrix.arch }}" \
+            -e FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST}" \
+            --user $(id -u):$(id -g) \
+            -w /workspace \
+            ${{ env.DOCKER_IMAGE }} \
+            bash /workspace/scripts/build_flashinfer_jit_cache_whl.sh
+        timeout-minutes: 180
+
+      - name: Display wheel size
+        run: du -h flashinfer-jit-cache/dist/*
+
+      - name: Create artifact name
+        id: artifact-name
+        run: |
+          CUDA_NO_DOT=$(echo "${{ matrix.cuda }}" | tr -d '.')
+          echo "name=jit-cache-cu${CUDA_NO_DOT}-${{ matrix.arch }}" >> $GITHUB_OUTPUT
+
+      - name: Upload flashinfer-jit-cache artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.artifact-name.outputs.name }}
+          path: flashinfer-jit-cache/dist/*.whl
+          retention-days: 7
+
+  create-release:
+    needs: [setup, build-flashinfer-python, build-flashinfer-cubin, build-flashinfer-jit-cache]
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+
+      - name: Generate release notes
+        id: release-notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ needs.setup.outputs.release_tag }}"
+
+          # Get the previous release tag
+          PREV_TAG=$(git tag --sort=-version:refname | grep -A1 "^${TAG}$" | tail -n1 || echo "")
+
+          if [ -z "$PREV_TAG" ]; then
+            echo "No previous tag found, generating notes from all commits"
+            NOTES=$(gh api /repos/${{ github.repository }}/releases/generate-notes \
+              -f tag_name="$TAG" \
+              -f target_commitish="${{ github.sha }}" \
+              --jq '.body')
+          else
+            echo "Generating notes from ${PREV_TAG} to ${TAG}"
+            NOTES=$(gh api /repos/${{ github.repository }}/releases/generate-notes \
+              -f tag_name="$TAG" \
+              -f previous_tag_name="$PREV_TAG" \
+              -f target_commitish="${{ github.sha }}" \
+              --jq '.body')
+          fi
+
+          # Save to file for multi-line output
+          echo "$NOTES" > /tmp/release_notes.md
+          echo "notes_file=/tmp/release_notes.md" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release (empty first)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ needs.setup.outputs.release_tag }}"
+
+          # Delete existing release and tag if they exist
+          if gh release view "$TAG" &>/dev/null; then
+            echo "Deleting existing release: $TAG"
+            gh release delete "$TAG" --yes --cleanup-tag
+          fi
+
+          # Read release notes from file
+          NOTES=$(cat ${{ steps.release-notes.outputs.notes_file }})
+
+          # Create new release without assets first
+          gh release create "$TAG" \
+            --title "Release v${{ needs.setup.outputs.version }}" \
+            --notes "$NOTES"
+
+      - name: Download flashinfer-python artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: flashinfer-python-dist
+          path: dist-python/
+
+      - name: Upload flashinfer-python to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ needs.setup.outputs.release_tag }}" dist-python/* --clobber
+
+      - name: Download flashinfer-cubin artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: flashinfer-cubin-wheel
+          path: dist-cubin/
+
+      - name: Upload flashinfer-cubin to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ needs.setup.outputs.release_tag }}" dist-cubin/* --clobber
+
+      - name: Upload flashinfer-jit-cache wheels to release (one at a time to avoid OOM)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Upload jit-cache wheels one at a time to avoid OOM
+          # Each wheel can be several GB, so we download, upload, delete, repeat
+          mkdir -p dist-jit-cache
+
+          for cuda in 128 129 130; do
+            for arch in x86_64 aarch64; do
+              ARTIFACT_NAME="jit-cache-cu${cuda}-${arch}"
+              echo "Processing ${ARTIFACT_NAME}..."
+
+              # Download this specific artifact
+              gh run download ${{ github.run_id }} -n "${ARTIFACT_NAME}" -D dist-jit-cache/ || {
+                echo "Warning: Failed to download ${ARTIFACT_NAME}, skipping..."
+                continue
+              }
+
+              # Upload to release
+              if [ -n "$(ls -A dist-jit-cache/)" ]; then
+                gh release upload "${{ needs.setup.outputs.release_tag }}" dist-jit-cache/* --clobber
+                echo "✅ Uploaded ${ARTIFACT_NAME}"
+              fi
+
+              # Clean up to save disk space before next iteration
+              rm -rf dist-jit-cache/*
+            done
+          done
+
+  publish-to-pypi:
+    needs: [setup, create-release]
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download flashinfer-python artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: flashinfer-python-dist
+          path: dist-python/
+
+      - name: Download flashinfer-cubin artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: flashinfer-cubin-wheel
+          path: dist-cubin/
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install twine
+        run: |
+          python -m pip install --upgrade pip
+          pip install twine
+
+      - name: Check packages with twine
+        run: |
+          echo "Running twine check..."
+          twine check dist-python/* dist-cubin/*
+          echo "✓ Package validation passed"
+
+      - name: Upload flashinfer-python to PyPI
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          echo "Uploading flashinfer (sdist and wheel) to PyPI..."
+          twine upload --verbose --non-interactive dist-python/*
+          echo "✓ Successfully uploaded flashinfer to PyPI"
+
+      - name: Upload flashinfer-cubin to PyPI
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          echo "Uploading flashinfer-cubin wheel to PyPI..."
+          twine upload --verbose --non-interactive dist-cubin/*.whl
+          echo "✓ Successfully uploaded flashinfer-cubin to PyPI"
+
+  update-wheel-index:
+    needs: [setup, create-release]
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout flashinfer repo
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Collect wheels and sdist
+        run: |
+          mkdir -p dist
+          find artifacts/ -name "*.whl" -exec cp {} dist/ \;
+          find artifacts/ -name "*.tar.gz" -exec cp {} dist/ \;
+          ls -lh dist/
+
+      - name: Clone wheel index
+        run: git clone https://oauth2:${WHL_TOKEN}@github.com/flashinfer-ai/whl.git flashinfer-whl
+        env:
+          WHL_TOKEN: ${{ secrets.WHL_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Update wheel index
+        run: |
+          python3 scripts/update_whl_index.py \
+            --dist-dir dist \
+            --output-dir flashinfer-whl \
+            --release-tag "${{ needs.setup.outputs.release_tag }}"
+
+      - name: Push wheel index
+        run: |
+          cd flashinfer-whl
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "update whl for release ${{ needs.setup.outputs.version }}"
+          git push

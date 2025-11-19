@@ -482,8 +482,12 @@ class AutoTuner:
                             )
                         except Exception as e:
                             shapes = self._get_input_sizes(tensors)
+                            logger.warning(
+                                f"[Autotuner]: Skipping tactic {r} {tac}, due to failure while profiling: {e}"
+                            )
 
-                            logger.error(
+                            # Log stacktrace as debug to not spam log
+                            logger.debug(
                                 f"[Autotuner]: Failed when profiling {r} {tac}, shapes={shapes}. Error occurred: {e}"
                             )
 
@@ -644,7 +648,9 @@ class AutoTuner:
 
             opt_shapes_max = {
                 v1: v2
-                for v1, v2 in zip(opt_shapes, tuple(opt_shapes[1:]) + (float("inf"),))
+                for v1, v2 in zip(
+                    opt_shapes, tuple(opt_shapes[1:]) + (float("inf"),), strict=True
+                )
             }
             dynamic_dims.append(
                 (spec.input_idx, spec.dim_idx, opt_shapes_max, opt_shapes)

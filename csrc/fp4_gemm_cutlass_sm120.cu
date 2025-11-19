@@ -50,51 +50,52 @@ CutlassGemmConfig getFp4GemmConfig(int64_t m, int64_t n, int64_t k, int64_t tact
 }
 
 template <typename T>
-void runGemm(Tensor& out, Tensor const& mat1, Tensor const& mat2, Tensor const& mat1Scale,
-             Tensor const& mat2Scale, Tensor const& globalScale, int64_t m, int64_t n, int64_t k,
-             int64_t batch_count, CutlassGemmConfig const& gemmConfig, Tensor workspace_buffer) {
+void runGemm(TensorView out, TensorView mat1, TensorView mat2, TensorView mat1Scale,
+             TensorView mat2Scale, TensorView globalScale, int64_t m, int64_t n, int64_t k,
+             int64_t batch_count, CutlassGemmConfig const& gemmConfig,
+             TensorView workspace_buffer) {
   CutlassFp4GemmRunner<T, FP4GemmType::W4A4_NVFP4_NVFP4> gemmRunner;
 
   int64_t const required_workspace_size = gemmRunner.getWorkspaceSize(m, n, k, batch_count);
   int64_t const provided_workspace_size =
-      get_numel(workspace_buffer) * get_element_size(workspace_buffer);
+      workspace_buffer.numel() * get_element_size(workspace_buffer);
 
   auto runKernel = [&](void* workspace) {
-    gemmRunner.gemm(out->data, mat1->data, mat2->data, mat1Scale->data, mat2Scale->data,
-                    static_cast<float*>(globalScale->data), m, n, k, batch_count, gemmConfig,
-                    reinterpret_cast<char*>(workspace), required_workspace_size,
-                    get_stream(mat1->device));
+    gemmRunner.gemm(out.data_ptr(), mat1.data_ptr(), mat2.data_ptr(), mat1Scale.data_ptr(),
+                    mat2Scale.data_ptr(), static_cast<float*>(globalScale.data_ptr()), m, n, k,
+                    batch_count, gemmConfig, reinterpret_cast<char*>(workspace),
+                    required_workspace_size, get_stream(mat1.device()));
   };
 
   if (provided_workspace_size < required_workspace_size) {
     Tensor new_workspace =
-        alloc_tensor({required_workspace_size}, DLDataType{kDLInt, 8, 1}, mat1->device);
-    runKernel(new_workspace->data);
+        alloc_tensor({required_workspace_size}, DLDataType{kDLInt, 8, 1}, mat1.device());
+    runKernel(new_workspace.data_ptr());
   } else {
-    runKernel(workspace_buffer->data);
+    runKernel(workspace_buffer.data_ptr());
   }
 }
 
 constexpr auto FLOAT4_E2M1X2 = dl_uint8;  // uint8_t
 constexpr auto SF_DTYPE = dl_uint8;       // uint8_t
 
-Tensor fp4_bmm_impl(Tensor const& mat1, Tensor const& mat2, Tensor const& mat1Scale,
-                    Tensor const& mat2Scale, Tensor const& globalScale, Tensor out,
-                    Tensor workspace_buffer, int64_t tactic) {
+void fp4_bmm_impl(TensorView mat1, TensorView mat2, TensorView mat1Scale, TensorView mat2Scale,
+                  TensorView globalScale, TensorView out, TensorView workspace_buffer,
+                  int64_t tactic) {
   // Validate inputs
-  TVM_FFI_ICHECK_EQ(mat1->dtype, FLOAT4_E2M1X2) << "mat1 must be FLOAT4_E2M1X2 (uint8)";
-  TVM_FFI_ICHECK_EQ(mat2->dtype, FLOAT4_E2M1X2) << "mat2 must be FLOAT4_E2M1X2 (uint8)";
-  TVM_FFI_ICHECK_EQ(mat1Scale->dtype, SF_DTYPE) << "mat1Scale must be SF_DTYPE (uint8)";
-  TVM_FFI_ICHECK_EQ(mat2Scale->dtype, SF_DTYPE) << "mat2Scale must be SF_DTYPE (uint8)";
-  TVM_FFI_ICHECK_EQ(globalScale->dtype, dl_float32) << "globalScale must be float";
-  TVM_FFI_ICHECK_EQ(mat1->device.device_type, kDLCUDA) << "mat1 must be on CUDA device";
-  TVM_FFI_ICHECK_EQ(mat2->device.device_type, kDLCUDA) << "mat2 must be on CUDA device";
-  TVM_FFI_ICHECK_EQ(mat1Scale->device.device_type, kDLCUDA) << "mat1Scale must be on CUDA device";
-  TVM_FFI_ICHECK_EQ(mat2Scale->device.device_type, kDLCUDA) << "mat2Scale must be on CUDA device";
-  TVM_FFI_ICHECK_EQ(globalScale->device.device_type, kDLCUDA)
+  TVM_FFI_ICHECK_EQ(mat1.dtype(), FLOAT4_E2M1X2) << "mat1 must be FLOAT4_E2M1X2 (uint8)";
+  TVM_FFI_ICHECK_EQ(mat2.dtype(), FLOAT4_E2M1X2) << "mat2 must be FLOAT4_E2M1X2 (uint8)";
+  TVM_FFI_ICHECK_EQ(mat1Scale.dtype(), SF_DTYPE) << "mat1Scale must be SF_DTYPE (uint8)";
+  TVM_FFI_ICHECK_EQ(mat2Scale.dtype(), SF_DTYPE) << "mat2Scale must be SF_DTYPE (uint8)";
+  TVM_FFI_ICHECK_EQ(globalScale.dtype(), dl_float32) << "globalScale must be float";
+  TVM_FFI_ICHECK_EQ(mat1.device().device_type, kDLCUDA) << "mat1 must be on CUDA device";
+  TVM_FFI_ICHECK_EQ(mat2.device().device_type, kDLCUDA) << "mat2 must be on CUDA device";
+  TVM_FFI_ICHECK_EQ(mat1Scale.device().device_type, kDLCUDA) << "mat1Scale must be on CUDA device";
+  TVM_FFI_ICHECK_EQ(mat2Scale.device().device_type, kDLCUDA) << "mat2Scale must be on CUDA device";
+  TVM_FFI_ICHECK_EQ(globalScale.device().device_type, kDLCUDA)
       << "globalScale must be on CUDA device";
-  TVM_FFI_ICHECK_EQ(out->device.device_type, kDLCUDA) << "out must be on CUDA device";
-  TVM_FFI_ICHECK_EQ(workspace_buffer->device.device_type, kDLCUDA)
+  TVM_FFI_ICHECK_EQ(out.device().device_type, kDLCUDA) << "out must be on CUDA device";
+  TVM_FFI_ICHECK_EQ(workspace_buffer.device().device_type, kDLCUDA)
       << "workspace_buffer must be on CUDA device";
 
   // Check device consistency
@@ -109,24 +110,24 @@ Tensor fp4_bmm_impl(Tensor const& mat1, Tensor const& mat2, Tensor const& mat1Sc
   int64_t b = 1;
   int64_t m, k_packed, n;
 
-  if (mat1->ndim == 2) {
-    m = mat1->shape[0];
-    k_packed = mat1->shape[1];
-  } else if (mat1->ndim == 3) {
-    b = mat1->shape[0];
-    m = mat1->shape[1];
-    k_packed = mat1->shape[2];
+  if (mat1.ndim() == 2) {
+    m = mat1.size(0);
+    k_packed = mat1.size(1);
+  } else if (mat1.ndim() == 3) {
+    b = mat1.size(0);
+    m = mat1.size(1);
+    k_packed = mat1.size(2);
   } else {
     TVM_FFI_ICHECK(false) << "mat1 must be 2D or 3D tensor";
   }
 
-  if (mat2->ndim == 2) {
-    n = mat2->shape[0];
-    TVM_FFI_ICHECK_EQ(mat2->shape[1], k_packed) << "mat2->shape[1] must match mat1.size(-1)";
-  } else if (mat2->ndim == 3) {
-    TVM_FFI_ICHECK_EQ(mat2->shape[0], b) << "Batch dimensions must match";
-    n = mat2->shape[1];
-    TVM_FFI_ICHECK_EQ(mat2->shape[2], k_packed) << "mat2->shape[2] must match mat1.size(-1)";
+  if (mat2.ndim() == 2) {
+    n = mat2.size(0);
+    TVM_FFI_ICHECK_EQ(mat2.size(1), k_packed) << "mat2.size(1) must match mat1.size(-1)";
+  } else if (mat2.ndim() == 3) {
+    TVM_FFI_ICHECK_EQ(mat2.size(0), b) << "Batch dimensions must match";
+    n = mat2.size(1);
+    TVM_FFI_ICHECK_EQ(mat2.size(2), k_packed) << "mat2.size(2) must match mat1.size(-1)";
   } else {
     TVM_FFI_ICHECK(false) << "mat2 must be 2D or 3D tensor";
   }
@@ -134,7 +135,7 @@ Tensor fp4_bmm_impl(Tensor const& mat1, Tensor const& mat2, Tensor const& mat1Sc
   // k_packed stores 2 FP4 values per byte
   int64_t k = k_packed * 2;
 
-  TVM_FFI_ICHECK_EQ(get_numel(globalScale), 1) << "globalScale must be a scalar tensor";
+  TVM_FFI_ICHECK_EQ(globalScale.numel(), 1) << "globalScale must be a scalar tensor";
 
   // Configure the kernel
   CutlassGemmConfig config =
@@ -146,14 +147,14 @@ Tensor fp4_bmm_impl(Tensor const& mat1, Tensor const& mat2, Tensor const& mat1Sc
   // Validate output dimensions
   std::vector<int64_t> out_shape =
       (b > 1) ? std::vector<int64_t>{b, m, n} : std::vector<int64_t>{m, n};
-  TVM_FFI_ICHECK_EQ(out->ndim, out_shape.size())
+  TVM_FFI_ICHECK_EQ(out.ndim(), out_shape.size())
       << "out must have " << out_shape.size() << " dimensions";
   for (size_t i = 0; i < out_shape.size(); ++i) {
-    TVM_FFI_ICHECK_EQ(out->shape[i], out_shape[i])
-        << "out.size(" << i << "): expected " << out_shape[i] << ", got " << out->shape[i];
+    TVM_FFI_ICHECK_EQ(out.size(i), out_shape[i])
+        << "out.size(" << i << "): expected " << out_shape[i] << ", got " << out.size(i);
   }
 
-  switch (encode_dlpack_dtype(out->dtype)) {
+  switch (encode_dlpack_dtype(out.dtype())) {
     case float16_code:
       runGemm<half>(out, mat1, mat2, mat1Scale, mat2Scale, globalScale, m, n, k, b, config,
                     workspace_buffer);
@@ -165,15 +166,13 @@ Tensor fp4_bmm_impl(Tensor const& mat1, Tensor const& mat2, Tensor const& mat1Sc
     default:
       TVM_FFI_ICHECK(false) << "out_dtype must be one of fp16/bf16.";
   }
-  return out;
 }
 
 }  // namespace
 
-Tensor fp4_gemm(Tensor const& mat1, Tensor const& mat2, Tensor const& mat1Scale,
-                Tensor const& mat2Scale, Tensor const& globalScale, Tensor out,
-                Tensor workspace_buffer, int64_t tactic) {
-  return fp4_bmm_impl(mat1, mat2, mat1Scale, mat2Scale, globalScale, out, workspace_buffer, tactic);
+void fp4_gemm(TensorView mat1, TensorView mat2, TensorView mat1Scale, TensorView mat2Scale,
+              TensorView globalScale, TensorView out, TensorView workspace_buffer, int64_t tactic) {
+  fp4_bmm_impl(mat1, mat2, mat1Scale, mat2Scale, globalScale, out, workspace_buffer, tactic);
 }
 
 int64_t fp4_gemm_tactic_num() {

@@ -19,6 +19,7 @@
 #include <cutlass/numeric_conversion.h>
 #include <cutlass/numeric_types.h>
 
+#include <algorithm>
 #include <cub/cub.cuh>
 #include <cuda/functional>
 #include <cuda/std/functional>
@@ -26,6 +27,7 @@
 
 #include "flashinfer/exception.h"
 #include "flashinfer/trtllm/fused_moe/DevKernel.h"
+#include "flashinfer/utils.cuh"
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -93,13 +95,118 @@ __global__ void activationKernel(KernelParams params) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+struct Float4Max {
+  __device__ __forceinline__ float4 operator()(float4 const& a, float4 const& b) const {
+    float4 result;
+    result.x = fmaxf(a.x, b.x);
+    result.y = fmaxf(a.y, b.y);
+    result.z = fmaxf(a.z, b.z);
+    result.w = fmaxf(a.w, b.w);
+    return result;
+  }
+};
+
+struct Float2Max {
+  __device__ __forceinline__ float2 operator()(float2 const& a, float2 const& b) const {
+    float2 result;
+    result.x = fmaxf(a.x, b.x);
+    result.y = fmaxf(a.y, b.y);
+    return result;
+  }
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename VecType, int size>
+__device__ __forceinline__ VecType packedTypeFromArray(float data[size]) {
+  return {};
+}
+
+template <>
+__device__ __forceinline__ float4 packedTypeFromArray<float4, 4>(float data[4]) {
+  float4 result;
+  result.x = data[0];
+  result.y = data[1];
+  result.z = data[2];
+  result.w = data[3];
+  return result;
+}
+
+template <>
+__device__ __forceinline__ float2 packedTypeFromArray<float2, 2>(float data[2]) {
+  float2 result;
+  result.x = data[0];
+  result.y = data[1];
+  return result;
+}
+
+template <>
+__device__ __forceinline__ float packedTypeFromArray<float, 1>(float data[1]) {
+  return data[0];
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename PackedType, int size>
+__device__ __forceinline__ cutlass::Array<float, size> arrayFromPackedType(PackedType data) {
+  return cutlass::Array<float, size>{};
+}
+
+template <>
+__device__ __forceinline__ cutlass::Array<float, 4> arrayFromPackedType<float4, 4>(float4 data) {
+  return cutlass::Array<float, 4>{data.x, data.y, data.z, data.w};
+}
+
+template <>
+__device__ __forceinline__ cutlass::Array<float, 2> arrayFromPackedType<float2, 2>(float2 data) {
+  return cutlass::Array<float, 2>{data.x, data.y};
+}
+
+template <>
+__device__ __forceinline__ cutlass::Array<float, 1> arrayFromPackedType<float, 1>(float data) {
+  return cutlass::Array<float, 1>{data};
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <int NUM_TOKENS_PER_CTA>
+struct KernelTraits;
+
+template <>
+struct KernelTraits<4> {
+  using MaxOp = Float4Max;
+  using PackedType = float4;
+};
+
+template <>
+struct KernelTraits<2> {
+  using MaxOp = Float2Max;
+  using PackedType = float2;
+};
+
+template <>
+struct KernelTraits<1> {
+#if CUDA_VERSION >= 12090
+  using MaxOp = cuda::maximum<>;
+#else
+  using MaxOp = cub::Max;
+#endif
+  using PackedType = float;
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 template <typename KernelParams>
 __global__ void activationDeepSeekKernel(KernelParams params) {
   using Type = typename KernelParams::Type;
-  using BlockReduce = cub::BlockReduce<float, 128>;
+  int32_t constexpr NumTokensPerCta = KernelParams::NumTokensPerCta;
+  using KernelTraits = KernelTraits<NumTokensPerCta>;
+  using MaxOp = typename KernelTraits::MaxOp;
+  using PackedType = typename KernelTraits::PackedType;
+  using BlockReduce = cub::BlockReduce<PackedType, 128>;
 
-  __shared__ float s_scaleOut;
-  __shared__ typename BlockReduce::TempStorage temp_storage;
+  __shared__ float s_scaleOutArr[NumTokensPerCta];
+  __shared__ typename BlockReduce::TempStorage tempStorage;
 
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
   // immediately trigger the secondary kernel when using PDL, then wait on primary
@@ -108,54 +215,101 @@ __global__ void activationDeepSeekKernel(KernelParams params) {
     cudaGridDependencySynchronize();
   }
 #endif
+
+  // The largest (finite) value that can be represented using E4m3.
+  float constexpr E4m3MaxVal{448.f};
+
+  int const totalNumPaddedTokens = params.totalNumPaddedTokens[0];
   // Loop over tokens
-  for (int tokenIdx = blockIdx.z; tokenIdx < params.numTokens; tokenIdx += gridDim.z) {
-    // Look over experts per token
-    for (int k = blockIdx.y; k < params.topK; k += gridDim.y) {
-      int const expandedIdx = tokenIdx * params.topK + k;
-      int const permutedIdx = params.expandedIdxToPermutedIdx[expandedIdx];
+  float scale1Arr[NumTokensPerCta];
+  float scale2Arr[NumTokensPerCta];
+  float dataX1Arr[NumTokensPerCta];
+  float dataX2Arr[NumTokensPerCta];
+  float outArr[NumTokensPerCta];
+  float absOutArr[NumTokensPerCta];
+  int permutedIdxArr[NumTokensPerCta];
 
-      // Needed for expert parallelism
-      if (permutedIdx == -1) continue;
-
-      // Loop over hidden dim
+  // Loop over tokens
+  for (int k = blockIdx.z; k < params.topK; k += gridDim.z) {
+    for (int tokenCtaIdx = blockIdx.y * NumTokensPerCta; tokenCtaIdx < params.numTokens;
+         tokenCtaIdx += gridDim.y * NumTokensPerCta) {
       for (int hiddenIdx = threadIdx.x + blockDim.x * blockIdx.x; hiddenIdx < params.innerDim / 2;
            hiddenIdx += blockDim.x * gridDim.x) {
-        int const baseIdx = permutedIdx * params.innerDim + hiddenIdx;
+#pragma unroll
+        for (int tokenInCtaIdx = 0; tokenInCtaIdx < NumTokensPerCta; tokenInCtaIdx++) {
+          int const tokenIdx = tokenCtaIdx + tokenInCtaIdx;
+          if (tokenIdx >= params.numTokens) {
+            break;
+          }
 
-        int const totalNumPaddedTokens = params.totalNumPaddedTokens[0];
+          int const expandedIdx = tokenIdx * params.topK + k;
+          int const permutedIdx = params.expandedIdxToPermutedIdx[expandedIdx];
+          permutedIdxArr[tokenInCtaIdx] = permutedIdx;
+          if (permutedIdx == -1) {
+            continue;
+          }
 
-        int const scale1_idx = permutedIdx + totalNumPaddedTokens * (hiddenIdx / 128);
-        int const scale2_idx =
-            permutedIdx + totalNumPaddedTokens * ((hiddenIdx / 128) + (params.innerDim / 2 / 128));
-        float const scale1 = params.inDqSfsPtr[scale1_idx];
-        float const scale2 = params.inDqSfsPtr[scale2_idx];
+          // Process blocks for this CTA
+          int const baseIdx = permutedIdx * params.innerDim + hiddenIdx;
 
-        float x1 = scale1 * (float)params.inPtr[baseIdx];
-        float x2 = scale2 * (float)params.inPtr[baseIdx + params.innerDim / 2];
+          int const scale1Idx = permutedIdx + totalNumPaddedTokens * (hiddenIdx / 128);
+          int const scale2Idx = permutedIdx + totalNumPaddedTokens *
+                                                  ((hiddenIdx / 128) + (params.innerDim / 2 / 128));
 
-        float act = silu(x2);
-        float out = act * x1;
+          scale1Arr[tokenInCtaIdx] = params.inDqSfsPtr[scale1Idx];
+          scale2Arr[tokenInCtaIdx] = params.inDqSfsPtr[scale2Idx];
+          dataX1Arr[tokenInCtaIdx] = static_cast<float>(params.inPtr[baseIdx]);
+          dataX2Arr[tokenInCtaIdx] =
+              static_cast<float>(params.inPtr[baseIdx + params.innerDim / 2]);
+        }
 
-        // The largest (finite) value that can be represented using E4m3.
-        float constexpr E4m3MaxVal{448.f};
+#pragma unroll
+        for (int tokenInCtaIdx = 0; tokenInCtaIdx < NumTokensPerCta; tokenInCtaIdx++) {
+          float x1 = scale1Arr[tokenInCtaIdx] * dataX1Arr[tokenInCtaIdx];
+          float x2 = scale2Arr[tokenInCtaIdx] * dataX2Arr[tokenInCtaIdx];
+          float act = silu(x2);
+          float out = act * x1;
+          outArr[tokenInCtaIdx] = out;
+          absOutArr[tokenInCtaIdx] = fabsf(out);
+        }
 
-        // Compute the absolute max
-#if CUDA_VERSION >= 12090
-        float aMax = BlockReduce(temp_storage).Reduce(fabsf(out), cuda::maximum<>{});
-#else
-        float aMax = BlockReduce(temp_storage).Reduce(fabsf(out), cub::Max{});
-#endif
-        if (threadIdx.x == 0) {
-          s_scaleOut = aMax / E4m3MaxVal;
-          int const scaleOut_idx = permutedIdx + totalNumPaddedTokens * (hiddenIdx / 128);
-          params.outDqSfsPtr[scaleOut_idx] = aMax / E4m3MaxVal;
+        auto absOutPacked = packedTypeFromArray<PackedType, NumTokensPerCta>(absOutArr);
+        auto aMaxPacked = BlockReduce(tempStorage).Reduce(absOutPacked, MaxOp{});
+        auto aMaxArr = arrayFromPackedType<PackedType, NumTokensPerCta>(aMaxPacked);
+
+#pragma unroll
+        for (int tokenInCtaIdx = 0; tokenInCtaIdx < NumTokensPerCta; tokenInCtaIdx++) {
+          if (threadIdx.x == 0) {
+            auto const tokenIdx = tokenCtaIdx + tokenInCtaIdx;
+            if (tokenIdx >= params.numTokens) {
+              break;
+            }
+            int const permutedIdx = permutedIdxArr[tokenInCtaIdx];
+            if (permutedIdx == -1) {
+              continue;
+            }
+            s_scaleOutArr[tokenInCtaIdx] = aMaxArr[tokenInCtaIdx] / E4m3MaxVal;
+            int const scaleOut_idx =
+                permutedIdxArr[tokenInCtaIdx] + totalNumPaddedTokens * (hiddenIdx / 128);
+            params.outDqSfsPtr[scaleOut_idx] = aMaxArr[tokenInCtaIdx] / E4m3MaxVal;
+          }
         }
         __syncthreads();
-        float const scaleOut = s_scaleOut;
-        __syncthreads();
-        int const outIdx = permutedIdx * (params.innerDim / 2) + hiddenIdx;
-        params.outPtr[outIdx] = (Type)(out / scaleOut);
+
+#pragma unroll
+        for (int tokenInCtaIdx = 0; tokenInCtaIdx < NumTokensPerCta; tokenInCtaIdx++) {
+          auto const tokenIdx = tokenCtaIdx + tokenInCtaIdx;
+          if (tokenIdx >= params.numTokens) {
+            break;
+          }
+          int const permutedIdx = permutedIdxArr[tokenInCtaIdx];
+          if (permutedIdx == -1) {
+            continue;
+          }
+          float const scaleOut = s_scaleOutArr[tokenInCtaIdx];
+          int const outIdx = permutedIdx * (params.innerDim / 2) + hiddenIdx;
+          params.outPtr[outIdx] = static_cast<Type>(outArr[tokenInCtaIdx] / scaleOut);
+        }
       }
     }
   }
@@ -172,15 +326,42 @@ void run(Data const& data, void* stream) {
   }
 
   if (data.mUseDeepSeekFp8) {
-    int const numThreads = 128;
-    const dim3 grid(data.innerDim / 128, data.topK, data.numTokens);
+    constexpr int NUM_ELTS_PER_LOAD = 1;
+    constexpr int NUM_ELTS_PER_SF = 128;
+    int const NUM_THREADS_PER_CTA = 128;
 
-    LAUNCH(data, activationDeepSeekKernel, grid, numThreads, 0, stream);
+    int device{-1};
+    cudaGetDevice(&device);
+    int numSms = 0;
+    cudaDeviceGetAttribute(&numSms, cudaDevAttrMultiProcessorCount, device);
+
+    // Output dimension is innerDim / 2, and each scale block is 128 elements
+    int const outputDim = data.innerDim / 2;
+    int const numScaleBlocks = (outputDim + NUM_ELTS_PER_SF - 1) / NUM_ELTS_PER_SF;
+    int const gridSizeX = (numScaleBlocks + NUM_ELTS_PER_LOAD - 1) / NUM_ELTS_PER_LOAD;
+
+    auto numCtas = gridSizeX * data.numTokens * data.topK;
+    // FIXME: This is heruistic based on very short benchmark.
+    int numTokensPerCta = 1;
+    if (numCtas > numSms * 32) {
+      numTokensPerCta = 4;
+    } else if (numCtas > numSms * 4) {
+      numTokensPerCta = 2;
+    } else {
+      numTokensPerCta = 1;
+    }
+
+    int const gridSizeY = std::min(8192, (data.numTokens + numTokensPerCta - 1) / numTokensPerCta);
+
+    const dim3 grid(gridSizeX, gridSizeY, data.topK);
+
+    LAUNCH_ACTIVATION(data, activationDeepSeekKernel, numTokensPerCta, grid, NUM_THREADS_PER_CTA, 0,
+                      stream);
   } else {
     int const numThreads = 256;
     const dim3 grid(data.innerDim / 128, data.topK, data.numTokens);
 
-    LAUNCH(data, activationKernel, grid, numThreads, 0, stream);
+    LAUNCH_ACTIVATION(data, activationKernel, 1, grid, numThreads, 0, stream);
   }
 }
 
@@ -491,11 +672,128 @@ __device__ float4 vectorizedLoadPtx(float4 const* ptr) {
 // Final kernel to unpermute and scale
 // This kernel unpermutes the original data, does the k-way reduction and performs the final skip
 // connection.
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+constexpr int MaxTopK = 64;
+
+typedef struct __CUDA_ALIGN__(4) {
+  cutlass::bfloat16_t array[2];
+} bfloat16_2;
+
+typedef struct __CUDA_ALIGN__(8) {
+  cutlass::bfloat16_t array[4];
+} bfloat16_4;
+
+typedef struct __CUDA_ALIGN__(8) {
+  half array[4];
+} half_4;
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <int UnrollFactor_, typename TypeExpW_>
+struct ScaleTraitsStruct;
+
+template <>
+struct ScaleTraitsStruct<1, cutlass::bfloat16_t> {
+  using PackedType = cutlass::bfloat16_t;
+  using ArrayType = cutlass::Array<cutlass::bfloat16_t, 1>;
+};
+
+template <>
+struct ScaleTraitsStruct<2, cutlass::bfloat16_t> {
+  using PackedType = bfloat16_2;
+  using ArrayType = cutlass::Array<cutlass::bfloat16_t, 2>;
+};
+
+template <>
+struct ScaleTraitsStruct<4, cutlass::bfloat16_t> {
+  using PackedType = bfloat16_4;
+  using ArrayType = cutlass::Array<cutlass::bfloat16_t, 4>;
+};
+
+template <>
+struct ScaleTraitsStruct<1, float> {
+  using PackedType = float;
+  using ArrayType = cutlass::Array<float, 1>;
+};
+
+template <>
+struct ScaleTraitsStruct<2, float> {
+  using PackedType = float2;
+  using ArrayType = cutlass::Array<float, 2>;
+};
+
+template <>
+struct ScaleTraitsStruct<4, float> {
+  using PackedType = float4;
+  using ArrayType = cutlass::Array<float, 4>;
+};
+
+template <>
+struct ScaleTraitsStruct<1, half> {
+  using PackedType = half;
+  using ArrayType = cutlass::Array<half, 1>;
+};
+
+template <>
+struct ScaleTraitsStruct<2, half> {
+  using PackedType = half2;
+  using ArrayType = cutlass::Array<half, 2>;
+};
+
+template <>
+struct ScaleTraitsStruct<4, half> {
+  using PackedType = half_4;
+  using ArrayType = cutlass::Array<half, 4>;
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <int UnrollFactor_, typename TypeExpW_>
+struct FinalizeTraits;
+
+template <typename TypeExpW_>
+struct FinalizeTraits<1, TypeExpW_> {
+  using IdxPackedType = int;
+  using IdxArrayType = cutlass::Array<int, 1>;
+  using ScaleTraits = ScaleTraitsStruct<1, TypeExpW_>;
+  using ScalePackedType = typename ScaleTraits::PackedType;
+  using ScaleArrayType = typename ScaleTraits::ArrayType;
+};
+
+template <typename TypeExpW_>
+struct FinalizeTraits<2, TypeExpW_> {
+  using IdxPackedType = int2;
+  using IdxArrayType = cutlass::Array<int, 2>;
+  using ScaleTraits = ScaleTraitsStruct<2, TypeExpW_>;
+  using ScalePackedType = typename ScaleTraits::PackedType;
+  using ScaleArrayType = typename ScaleTraits::ArrayType;
+};
+
+template <typename TypeExpW_>
+struct FinalizeTraits<4, TypeExpW_> {
+  using IdxPackedType = int4;
+  using IdxArrayType = cutlass::Array<int, 4>;
+  using ScaleTraits = ScaleTraitsStruct<4, TypeExpW_>;
+  using ScalePackedType = typename ScaleTraits::PackedType;
+  using ScaleArrayType = typename ScaleTraits::ArrayType;
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename KernelParams>
 __global__ void finalizeKernelVecLoad(KernelParams params) {
   using Type = typename KernelParams::Type;
   using TypeExpW = typename KernelParams::TypeExpW;
+  int constexpr TopKUnrollFactor = KernelParams::TopKUnrollFactor;
+
+  static_assert(TopKUnrollFactor == 1 || TopKUnrollFactor == 2 || TopKUnrollFactor == 4,
+                "TopKUnrollFactor must be 1, 2, or 4");
+  using FinalizeTraits = FinalizeTraits<TopKUnrollFactor, TypeExpW>;
+  using IdxPackedType = typename FinalizeTraits::IdxPackedType;
+  using IdxArrayType = typename FinalizeTraits::IdxArrayType;
+  using ScalePackedType = typename FinalizeTraits::ScalePackedType;
+  using ScaleArrayType = typename FinalizeTraits::ScaleArrayType;
 
   int const hiddenDimPaddedBits = params.hiddenDimPadded * cutlass::sizeof_bits<Type>::value;
   int const hiddenDimBits = params.hiddenDim * cutlass::sizeof_bits<Type>::value;
@@ -513,6 +811,23 @@ __global__ void finalizeKernelVecLoad(KernelParams params) {
   int64_t const stride = FINALIZE_THREADS_PER_BLOCK;
   int64_t const numElemsInPaddedCol = params.hiddenDimPadded / FINALIZE_ELEM_PER_THREAD;
   int64_t const numElemsInCol = params.hiddenDim / FINALIZE_ELEM_PER_THREAD;
+  bool const useScale = params.expertWeightsPtr != nullptr;
+
+  __shared__ ScalePackedType scaleArrSmem[MaxTopK / TopKUnrollFactor];
+  __shared__ IdxPackedType permutedIdxArrSmem[MaxTopK / TopKUnrollFactor];
+
+  for (int kChunkIdx = threadIdx.x; kChunkIdx < params.topK / TopKUnrollFactor;
+       kChunkIdx += blockDim.x) {
+    int const expandedIdx = tokenIdx * params.topK + kChunkIdx * TopKUnrollFactor;
+    auto permutedIdxPacked = reinterpret_cast<IdxPackedType const*>(
+        params.expandedIdxToPermutedIdx)[expandedIdx / TopKUnrollFactor];
+    auto scalePacked = useScale ? reinterpret_cast<ScalePackedType const*>(
+                                      params.expertWeightsPtr)[expandedIdx / TopKUnrollFactor]
+                                : ScalePackedType{TypeExpW(1.f)};
+
+    scaleArrSmem[kChunkIdx] = scalePacked;
+    permutedIdxArrSmem[kChunkIdx] = permutedIdxPacked;
+  }
 
   auto const offset = tokenIdx * params.hiddenDim;
   Type* outputPtr = params.outPtr + offset;
@@ -525,31 +840,42 @@ __global__ void finalizeKernelVecLoad(KernelParams params) {
     cudaGridDependencySynchronize();
   }
 #endif
+  __syncthreads();
 
   for (int elemIndex = startOffset; elemIndex < numElemsInCol; elemIndex += stride) {
     ComputeElem threadOutput;
     threadOutput.fill(0);
-    for (int k = 0; k < params.topK; ++k) {
-      int const expandedIdx = tokenIdx * params.topK + k;
-      int const permutedIdx = params.expandedIdxToPermutedIdx[expandedIdx];
-      if (permutedIdx == -1) {
-        continue;
+    for (int kChunkIdx = 0; kChunkIdx < params.topK / TopKUnrollFactor; kChunkIdx++) {
+      auto permutedIdxArr = *reinterpret_cast<IdxArrayType const*>(&permutedIdxArrSmem[kChunkIdx]);
+      InputElem inputElemArr[TopKUnrollFactor];
+#pragma unroll
+      for (int ki = 0; ki < TopKUnrollFactor; ++ki) {
+        auto const permutedIdx = permutedIdxArr[ki];
+        if (permutedIdx == -1) {
+          continue;
+        }
+
+        auto const* inputPermutedPtr = inElemPtr + permutedIdx * numElemsInPaddedCol;
+
+        float4 input =
+            vectorizedLoadPtx(reinterpret_cast<float4 const*>(&inputPermutedPtr[elemIndex]));
+        inputElemArr[ki] = *reinterpret_cast<InputElem const*>(&input);
       }
+      auto scaleArr = *reinterpret_cast<ScaleArrayType const*>(&scaleArrSmem[kChunkIdx]);
+      auto const scaleFloatArr =
+          arrayConvert<ScaleArrayType, cutlass::Array<float, TopKUnrollFactor>>(scaleArr);
 
-      float const scale = (params.expertWeightsPtr != nullptr)
-                              ? static_cast<float>(params.expertWeightsPtr[expandedIdx])
-                              : 1.f;
-
-      auto const* inputPermutedPtr = inElemPtr + permutedIdx * numElemsInPaddedCol;
-
-      float4 input =
-          vectorizedLoadPtx(reinterpret_cast<float4 const*>(&inputPermutedPtr[elemIndex]));
-      InputElem inputPermutedElem = *reinterpret_cast<InputElem const*>(&input);
-      ComputeElem expertResult = arrayConvert<InputElem, ComputeElem>(inputPermutedElem);
-
-      threadOutput = threadOutput + scale * expertResult;
+#pragma unroll
+      for (int ki = 0; ki < TopKUnrollFactor; ++ki) {
+        auto const permutedIdx = permutedIdxArr[ki];
+        if (permutedIdx == -1) {
+          continue;
+        }
+        auto scale = useScale ? scaleFloatArr[ki] : 1.0f;
+        ComputeElem expertResult = arrayConvert<InputElem, ComputeElem>(inputElemArr[ki]);
+        threadOutput = threadOutput + scale * expertResult;
+      }
     }
-
     OutputElem outputElem = arrayConvert<ComputeElem, OutputElem>(threadOutput);
     outElemPtr[elemIndex] = outputElem;
   }
@@ -632,7 +958,7 @@ void run(Data const& data, void* stream) {
     int const numBlocksY = std::min(8192, data.numTokens);
     dim3 numBlocks(numBlocksX, numBlocksY);
 
-    LAUNCH_EXPW(data, finalizeDeepSeekKernel, numBlocks, numThreads, 0, stream);
+    LAUNCH_TOPK_EXPW(data, finalizeDeepSeekKernel, numBlocks, numThreads, 0, stream);
   } else {
     int const numThreads = 256;
     int const numBlocksX = (data.hiddenDim - 1 + numThreads) / numThreads;
@@ -646,10 +972,14 @@ void run(Data const& data, void* stream) {
       // ensure that when the number of waves is greater than 1, we choose to use the kernel with
       // vectorized loading.
       dim3 numBlocks(numBlocksX, numBlocksY);
-      LAUNCH_EXPW(data, finalizeKernel, numBlocks, numThreads, 0, stream);
+      LAUNCH_TOPK_EXPW(data, finalizeKernel, numBlocks, numThreads, 0, stream);
     } else {
-      LAUNCH_EXPW(data, finalizeKernelVecLoad, /*numBlocks=*/data.numTokens,
-                  /*numThreads=*/FINALIZE_THREADS_PER_BLOCK, 0, stream);
+      FLASHINFER_CHECK(
+          data.topK <= MaxTopK,
+          "Finalize kernel with vectorized loading is not supported for this TopK value: %d",
+          data.topK);
+      LAUNCH_TOPK_EXPW(data, finalizeKernelVecLoad, /*numBlocks=*/data.numTokens,
+                       /*numThreads=*/FINALIZE_THREADS_PER_BLOCK, 0, stream);
     }
   }
 }

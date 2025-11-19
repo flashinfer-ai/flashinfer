@@ -127,17 +127,18 @@ cudaError_t CutlassMXFP4GroupwiseScaledGroupGEMMSM100(
 }  // namespace group_gemm
 }  // namespace flashinfer
 
-void CutlassGroupGemmMXFP4GroupwiseScaledSM100(Tensor int_workspace_buffer,
-                                               Tensor float_workspace_buffer, Tensor A, Tensor B,
-                                               Tensor SFA, Tensor SFB, Tensor D, Tensor m_indptr,
-                                               int64_t n, int64_t k, int64_t mma_sm, int64_t tile_m,
+void CutlassGroupGemmMXFP4GroupwiseScaledSM100(TensorView int_workspace_buffer,
+                                               TensorView float_workspace_buffer, TensorView A,
+                                               TensorView B, TensorView SFA, TensorView SFB,
+                                               TensorView D, TensorView m_indptr, int64_t n,
+                                               int64_t k, int64_t mma_sm, int64_t tile_m,
                                                int64_t tile_n, int64_t tile_k, bool swap_ab) {
-  cudaSetDevice(float_workspace_buffer->device.device_id);
-  auto stream = get_stream(A->device);
-  int num_groups = m_indptr->shape[0] - 1;
+  cudaSetDevice(float_workspace_buffer.device().device_id);
+  auto stream = get_stream(A.device());
+  int num_groups = m_indptr.size(0) - 1;
   DISPATCH_DLPACK_INPUT_OUTPUT_DTYPE(
-      A->dtype, B->dtype, SFA->dtype, SFB->dtype, D->dtype, c_type_in_a, c_type_in_b, c_type_sf_a,
-      c_type_sf_b, c_type_out, [&] {
+      A.dtype(), B.dtype(), SFA.dtype(), SFB.dtype(), D.dtype(), c_type_in_a, c_type_in_b,
+      c_type_sf_a, c_type_sf_b, c_type_out, [&] {
         return DISPATCH_MMA_SM(mma_sm, MMA_SM, [&] {
           return DISPATCH_TILE_M(tile_m, TILE_M, [&] {
             return DISPATCH_TILE_N(tile_n, TILE_N, [&] {
@@ -152,16 +153,16 @@ void CutlassGroupGemmMXFP4GroupwiseScaledSM100(Tensor int_workspace_buffer,
                     using cutlass_t_out = cutlass_dtype_t<c_type_out>;
                     auto status = flashinfer::group_gemm::CutlassMXFP4GroupwiseScaledGroupGEMMSM100<
                         TILE_M, TILE_N, TILE_K, MMA_SM, SWAP_AB>(
-                        static_cast<int*>(int_workspace_buffer->data),
-                        get_element_size(int_workspace_buffer) * int_workspace_buffer->shape[0],
-                        static_cast<float*>(float_workspace_buffer->data),
-                        get_element_size(float_workspace_buffer) * float_workspace_buffer->shape[0],
-                        static_cast<cutlass_t_in_a*>(A->data),
-                        static_cast<cutlass_t_in_b*>(B->data),
-                        static_cast<cutlass_t_sf_a*>(SFA->data),
-                        static_cast<cutlass_t_sf_b*>(SFB->data),
-                        static_cast<cutlass_t_out*>(D->data), static_cast<int*>(m_indptr->data), n,
-                        k, num_groups, stream);
+                        static_cast<int*>(int_workspace_buffer.data_ptr()),
+                        get_element_size(int_workspace_buffer) * int_workspace_buffer.size(0),
+                        static_cast<float*>(float_workspace_buffer.data_ptr()),
+                        get_element_size(float_workspace_buffer) * float_workspace_buffer.size(0),
+                        static_cast<cutlass_t_in_a*>(A.data_ptr()),
+                        static_cast<cutlass_t_in_b*>(B.data_ptr()),
+                        static_cast<cutlass_t_sf_a*>(SFA.data_ptr()),
+                        static_cast<cutlass_t_sf_b*>(SFB.data_ptr()),
+                        static_cast<cutlass_t_out*>(D.data_ptr()),
+                        static_cast<int*>(m_indptr.data_ptr()), n, k, num_groups, stream);
                     return status == cudaSuccess;
                   } else {
                     TVM_FFI_ICHECK(false) << "Unsupported input data type";

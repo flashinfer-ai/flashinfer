@@ -82,12 +82,12 @@ cudaError_t CutlassGroupwiseScaledGEMMSM120(void* float_buffer, size_t float_buf
 }  // namespace gemm
 }  // namespace flashinfer
 
-void CutlassGemmGroupwiseScaledSM120(Tensor float_workspace_buffer, Tensor A, Tensor B, Tensor SFA,
-                                     Tensor SFB, Tensor C, int64_t scale_granularity_m,
-                                     int64_t scale_granularity_n, int64_t scale_granularity_k,
-                                     std::string scale_major_mode) {
-  cudaSetDevice(float_workspace_buffer->device.device_id);
-  auto stream = get_stream(C->device);
+void CutlassGemmGroupwiseScaledSM120(TensorView float_workspace_buffer, TensorView A, TensorView B,
+                                     TensorView SFA, TensorView SFB, TensorView C,
+                                     int64_t scale_granularity_m, int64_t scale_granularity_n,
+                                     int64_t scale_granularity_k, std::string scale_major_mode) {
+  cudaSetDevice(float_workspace_buffer.device().device_id);
+  auto stream = get_stream(C.device());
 
   // Ensure scales are contiguous
   // Note: We keep the original shape and let the kernel's layout handle interpretation
@@ -95,7 +95,7 @@ void CutlassGemmGroupwiseScaledSM120(Tensor float_workspace_buffer, Tensor A, Te
   CHECK_CONTIGUOUS(SFB);
 
   DISPATCH_SCALE_MAJOR_K(scale_major_mode, SCALE_MAJOR_K, [&] {
-    return DISPATCH_DLPACK_INPUT_OUTPUT_DTYPE(A->dtype, C->dtype, c_type_in, c_type_out, [&] {
+    return DISPATCH_DLPACK_INPUT_OUTPUT_DTYPE(A.dtype(), C.dtype(), c_type_in, c_type_out, [&] {
       return DISPATCH_SCALE_GRANULARITY(
           scale_granularity_m, scale_granularity_n, scale_granularity_k, SCALE_GRANULARITY_M,
           SCALE_GRANULARITY_N, SCALE_GRANULARITY_K, [&] {
@@ -104,29 +104,29 @@ void CutlassGemmGroupwiseScaledSM120(Tensor float_workspace_buffer, Tensor A, Te
 
             // Handle both 2D and 3D tensors (BMM)
             int m, n, k, l;
-            if (A->ndim == 2) {
+            if (A.ndim() == 2) {
               // 2D case: simple matrix multiplication
-              m = A->shape[0];
-              k = A->shape[1];
-              n = B->shape[0];
+              m = A.size(0);
+              k = A.size(1);
+              n = B.size(0);
               l = 1;  // no batch dimension
-            } else if (A->ndim == 3) {
+            } else if (A.ndim() == 3) {
               // 3D case: batch matrix multiplication
-              l = A->shape[0];  // batch size
-              m = A->shape[1];  // per-batch m dimension
-              k = A->shape[2];  // per-batch k dimension
-              n = B->shape[2];  // per-batch n dimension (B is [batch, k, n] column-major)
+              l = A.size(0);  // batch size
+              m = A.size(1);  // per-batch m dimension
+              k = A.size(2);  // per-batch k dimension
+              n = B.size(2);  // per-batch n dimension (B is [batch, k, n] column-major)
             } else {
               return false;  // Unsupported tensor dimension
             }
 
             auto status = flashinfer::gemm::CutlassGroupwiseScaledGEMMSM120<
                 SCALE_GRANULARITY_M, SCALE_GRANULARITY_N, SCALE_GRANULARITY_K, SCALE_MAJOR_K>(
-                static_cast<void*>(float_workspace_buffer->data),
-                get_element_size(float_workspace_buffer) * get_numel(float_workspace_buffer),
-                static_cast<cutlass_t_in*>(A->data), static_cast<cutlass_t_in*>(B->data),
-                static_cast<float*>(SFA->data), static_cast<float*>(SFB->data),
-                static_cast<cutlass_t_out*>(C->data), m, n, k, l,
+                static_cast<void*>(float_workspace_buffer.data_ptr()),
+                get_element_size(float_workspace_buffer) * float_workspace_buffer.numel(),
+                static_cast<cutlass_t_in*>(A.data_ptr()), static_cast<cutlass_t_in*>(B.data_ptr()),
+                static_cast<float*>(SFA.data_ptr()), static_cast<float*>(SFB.data_ptr()),
+                static_cast<cutlass_t_out*>(C.data_ptr()), m, n, k, l,
                 stream);  // C is the output (D)
             return status == cudaSuccess;
           });

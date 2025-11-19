@@ -43,19 +43,20 @@ struct TrtllmGenGemmRunnerOptions {
 int64_t select_kernel_fp8(int32_t M, int32_t N, int32_t K,
                           const gemm::gemm::GemmInterface& interface) {
   static constexpr const char* KERNEL_NAME_HIGH_N_K_RATIO =
-      "gemm_Bfloat16_E4m3E4m3_Fp32_t128x8x128u2_s6_et64x8_m64x8x32_cga1x1x1_16dp256b_TN_transOut_"
+      "gemm_Bfloat16_E4m3E4m3_Fp32_t128x8x128u2_s6_et64x8_m64x8x32_cga1x1x1_16dp256b_rM_TN_"
+      "transOut_"
       "noShflA_dsFp8_schedP2x2x1x3_sm100f";
 
   static constexpr const char* KERNEL_NAME_LOW_N_K_RATIO =
-      "gemm_Bfloat16_E4m3E4m3_Fp32_t128x32x128u2_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_TN_"
+      "gemm_Bfloat16_E4m3E4m3_Fp32_t128x32x128u2_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_rM_TN_"
       "transOut_noShflA_dsFp8_schedS_sm100f";
 
   static constexpr const char* KERNEL_NAME_LARGE_N =
-      "gemm_Bfloat16_E4m3E4m3_Fp32_t128x32x128u2_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_TN_"
+      "gemm_Bfloat16_E4m3E4m3_Fp32_t128x32x128u2_s6_et64x32_m64x32x32_cga1x1x1_16dp256b_rM_TN_"
       "transOut_noShflA_dsFp8_schedP2x2x1x3_sm100f";
 
   static constexpr const char* KERNEL_NAME_DEFAULT =
-      "gemm_Bfloat16_E4m3E4m3_Fp32_t128x16x128u2_s6_et64x16_m64x16x32_cga1x1x1_16dp256b_TN_"
+      "gemm_Bfloat16_E4m3E4m3_Fp32_t128x16x128u2_s6_et64x16_m64x16x32_cga1x1x1_16dp256b_rM_TN_"
       "transOut_noShflA_dsFp8_schedS_sm100f";
 
   double const n_k_ratio = static_cast<double>(N) / static_cast<double>(K);
@@ -256,21 +257,22 @@ class TrtllmGenGemmRunner {
 using tvm::ffi::Array;
 using tvm::ffi::Optional;
 
-void trtllm_gemm(Tensor workspace_buffer, Tensor a, Tensor b, Tensor a_scale, Tensor b_scale,
-                 Optional<Tensor> globalScale, Tensor out, bool use_8x4_sf_layout, int64_t tactic) {
+void trtllm_gemm(TensorView workspace_buffer, TensorView a, TensorView b, TensorView a_scale,
+                 TensorView b_scale, Optional<TensorView> globalScale, TensorView out,
+                 bool use_8x4_sf_layout, int64_t tactic) {
   CHECK_DEVICE(a, b);
   CHECK_DEVICE(a, out);
   CHECK_INPUT(a);
   CHECK_INPUT(b);
   CHECK_INPUT(out);
   CHECK_INPUT(workspace_buffer);
-  TVM_FFI_ICHECK_EQ(workspace_buffer->ndim, 1);
+  TVM_FFI_ICHECK_EQ(workspace_buffer.ndim(), 1);
   CHECK_DIM(2, a);
   CHECK_DIM(2, b);
-  TVM_FFI_ICHECK_EQ(a->dtype, b->dtype);
-  TVM_FFI_ICHECK(a->dtype == dl_float8_e4m3fn || a->dtype == dl_uint8)
+  TVM_FFI_ICHECK_EQ(a.dtype(), b.dtype());
+  TVM_FFI_ICHECK(a.dtype() == dl_float8_e4m3fn || a.dtype() == dl_uint8)
       << "a must be a Float8 or Byte(e2m1) tensor";
-  bool is_fp8 = a->dtype == dl_float8_e4m3fn;
+  bool is_fp8 = a.dtype() == dl_float8_e4m3fn;
   if (is_fp8) {
     TVM_FFI_ICHECK(!globalScale.has_value()) << "globalScale must be a none tensor";
   } else {
@@ -281,11 +283,11 @@ void trtllm_gemm(Tensor workspace_buffer, Tensor a, Tensor b, Tensor a_scale, Te
     }
   }
 
-  int32_t m = a->shape[0];
-  int32_t k = is_fp8 ? a->shape[1] : a->shape[1] * 2;
-  int32_t n = b->shape[0];
-  TVM_FFI_ICHECK_EQ(b->shape[1], a->shape[1]) << "Matrix dimensions don't match for multiplication";
-  TVM_FFI_ICHECK(out->shape[0] == m && out->shape[1] == n) << "Output tensor has wrong dimensions";
+  int32_t m = a.size(0);
+  int32_t k = is_fp8 ? a.size(1) : a.size(1) * 2;
+  int32_t n = b.size(0);
+  TVM_FFI_ICHECK_EQ(b.size(1), a.size(1)) << "Matrix dimensions don't match for multiplication";
+  TVM_FFI_ICHECK(out.size(0) == m && out.size(1) == n) << "Output tensor has wrong dimensions";
 
   auto runner = flashinfer::TrtllmGenGemmRunner(flashinfer::TrtllmGenGemmRunnerOptions{
       .eltType = is_fp8 ? gemm::trtllm::gen::Dtype::E4m3 : gemm::trtllm::gen::Dtype::E2m1,
@@ -299,22 +301,22 @@ void trtllm_gemm(Tensor workspace_buffer, Tensor a, Tensor b, Tensor a_scale, Te
     tactic = runner.selectHeuristic(m, n, k);
   }
 
-  auto stream = get_stream(a->device);
+  auto stream = get_stream(a.device());
 
   auto runKernel = [&](void* workspace) {
-    runner.run(m, n, k, a->data, a_scale->data, b->data, b_scale->data, out->data,
-               globalScale.has_value() ? globalScale.value()->data : nullptr, nullptr, workspace,
-               stream, a->device.device_id, tactic);
+    runner.run(m, n, k, a.data_ptr(), a_scale.data_ptr(), b.data_ptr(), b_scale.data_ptr(),
+               out.data_ptr(), globalScale.has_value() ? globalScale.value().data_ptr() : nullptr,
+               nullptr, workspace, stream, a.device().device_id, tactic);
   };
 
   int64_t const required_workspace_size = runner.getWorkspaceSizeInBytes(m, n, k, tactic);
   int64_t const provided_workspace_size =
-      get_numel(workspace_buffer) * get_element_size(workspace_buffer);
+      workspace_buffer.numel() * get_element_size(workspace_buffer);
   if (provided_workspace_size < required_workspace_size) {
-    Tensor new_workspace = alloc_tensor({required_workspace_size}, dl_int8, a->device);
-    runKernel(new_workspace->data);
+    Tensor new_workspace = alloc_tensor({required_workspace_size}, dl_int8, a.device());
+    runKernel(new_workspace.data_ptr());
   } else {
-    runKernel(workspace_buffer->data);
+    runKernel(workspace_buffer.data_ptr());
   }
 }
 

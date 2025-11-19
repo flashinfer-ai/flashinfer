@@ -136,7 +136,7 @@ def _get_workspace_dir_name() -> pathlib.Path:
         f"{major}{minor}"
         for major, minor in sorted(compilation_context.TARGET_CUDA_ARCHS)
     )
-    return FLASHINFER_CACHE_DIR / arch
+    return FLASHINFER_CACHE_DIR / flashinfer_version / arch
 
 
 # use pathlib

@@ -41,7 +41,7 @@ except ImportError as e:
 
 import torch
 
-from .artifacts import ArtifactPath, MetaInfoHash
+from .artifacts import ArtifactPath
 from .cuda_utils import checkCudaErrors
 from .jit.cubin_loader import get_cubin
 from .jit.env import FLASHINFER_CUBIN_DIR
@@ -1487,13 +1487,15 @@ def m_grouped_fp8_gemm_nt_masked(
 
 
 class KernelMap:
-    def __init__(self, sha256: str):
-        self.sha256 = sha256
+    # Hash for kernel_map.json, updated when deepgemm cubins are republished
+    KERNEL_MAP_HASH = "f161e031826adb8c4f0d31ddbd2ed77e4909e4e43cdfc9728918162a62fcccfb"
+
+    def __init__(self):
         self.indice = None
 
     def init_indices(self):
         indice_path = ArtifactPath.DEEPGEMM + "/" + "kernel_map.json"
-        assert get_cubin(indice_path, self.sha256), (
+        assert get_cubin(indice_path, self.KERNEL_MAP_HASH), (
             "cubin kernel map file not found, nor downloaded with matched sha256"
         )
         path = FLASHINFER_CUBIN_DIR / indice_path
@@ -1513,4 +1515,4 @@ class KernelMap:
         return self.indice[key]
 
 
-KERNEL_MAP = KernelMap(MetaInfoHash.DEEPGEMM)
+KERNEL_MAP = KernelMap()

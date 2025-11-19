@@ -58,28 +58,29 @@ CutlassGemmConfig getFp4GemmConfig(int64_t m, int64_t n, int64_t k, int64_t tact
 }
 
 template <typename T>
-void runGemm(Tensor& out, Tensor const& mat1, Tensor const& mat2, Tensor const& mat1Scale,
-             Tensor const& mat2Scale, Tensor const& globalScale, int64_t m, int64_t n, int64_t k,
-             int64_t batch_count, CutlassGemmConfig const& gemmConfig, Tensor workspace_buffer) {
+void runGemm(TensorView out, TensorView mat1, TensorView mat2, TensorView mat1Scale,
+             TensorView mat2Scale, TensorView globalScale, int64_t m, int64_t n, int64_t k,
+             int64_t batch_count, CutlassGemmConfig const& gemmConfig,
+             TensorView workspace_buffer) {
   CutlassFp4GemmRunner<T, FP4GemmType::W4A4_NVFP4_NVFP4> gemmRunner;
 
   int64_t const required_workspace_size = gemmRunner.getWorkspaceSize(m, n, k, batch_count);
   int64_t const provided_workspace_size =
-      get_numel(workspace_buffer) * get_element_size(workspace_buffer);
+      workspace_buffer.numel() * get_element_size(workspace_buffer);
 
   auto runKernel = [&](void* workspace) {
-    gemmRunner.gemm(out->data, mat1->data, mat2->data, mat1Scale->data, mat2Scale->data,
-                    static_cast<float*>(globalScale->data), m, n, k, batch_count, gemmConfig,
-                    reinterpret_cast<char*>(workspace), required_workspace_size,
-                    get_stream(mat1->device));
+    gemmRunner.gemm(out.data_ptr(), mat1.data_ptr(), mat2.data_ptr(), mat1Scale.data_ptr(),
+                    mat2Scale.data_ptr(), static_cast<float*>(globalScale.data_ptr()), m, n, k,
+                    batch_count, gemmConfig, reinterpret_cast<char*>(workspace),
+                    required_workspace_size, get_stream(mat1.device()));
   };
 
   if (provided_workspace_size < required_workspace_size) {
     Tensor new_workspace =
-        alloc_tensor({required_workspace_size}, DLDataType{kDLInt, 8, 1}, mat1->device);
-    runKernel(new_workspace->data);
+        alloc_tensor({required_workspace_size}, DLDataType{kDLInt, 8, 1}, mat1.device());
+    runKernel(new_workspace.data_ptr());
   } else {
-    runKernel(workspace_buffer->data);
+    runKernel(workspace_buffer.data_ptr());
   }
 }
 
@@ -93,9 +94,9 @@ constexpr auto SF_DTYPE = dl_uint8;       // uint8_t
 // mat2Scale: ceil(N / 128) * 128 * ceil(K / sfVecSize / 4) * 4, SF_DTYPE (UE4M3 or UE8M0)
 // globalScale: [1], 1 / (((448 * 6) / mat1.abs().max()) * ((448 * 6) / mat2.abs().max()))
 // B = 1 for GEMM op as a special case
-Tensor fp4_bmm_impl(Tensor const& mat1, Tensor const& mat2, Tensor const& mat1Scale,
-                    Tensor const& mat2Scale, Tensor const& globalScale, Tensor out,
-                    Tensor workspace_buffer, int64_t tactic) {
+void fp4_bmm_impl(TensorView mat1, TensorView mat2, TensorView mat1Scale, TensorView mat2Scale,
+                  TensorView globalScale, TensorView out, TensorView workspace_buffer,
+                  int64_t tactic) {
   CHECK_INPUT_AND_TYPE(mat1, FLOAT4_E2M1X2);
   CHECK_INPUT_AND_TYPE(mat2, FLOAT4_E2M1X2);
 
@@ -107,27 +108,26 @@ Tensor fp4_bmm_impl(Tensor const& mat1, Tensor const& mat2, Tensor const& mat1Sc
   CHECK_INPUT_AND_TYPE(globalScale, dl_float32);
 
   int64_t m, n, k, b;
-  if (mat1->ndim == 2) {
-    TVM_FFI_ICHECK_EQ(mat2->ndim, 2) << "mat2 must be a matrix";
-    TVM_FFI_ICHECK_EQ(mat1->shape[1], mat2->shape[1] * mat2_k_scale)
-        << "mat1 and mat2 shapes cannot be multiplied (" << mat1->shape[0] << "x" << mat1->shape[1]
-        << " and " << mat2->shape[0] << "x" << mat2->shape[1] << ")";
-    m = mat1->shape[0];
-    n = mat2->shape[0];
-    k = mat2->shape[1] * 2;
+  if (mat1.ndim() == 2) {
+    TVM_FFI_ICHECK_EQ(mat2.ndim(), 2) << "mat2 must be a matrix";
+    TVM_FFI_ICHECK_EQ(mat1.size(1), mat2.size(1) * mat2_k_scale)
+        << "mat1 and mat2 shapes cannot be multiplied (" << mat1.size(0) << "x" << mat1.size(1)
+        << " and " << mat2.size(0) << "x" << mat2.size(1) << ")";
+    m = mat1.size(0);
+    n = mat2.size(0);
+    k = mat2.size(1) * 2;
     b = 1;
-  } else if (mat1->ndim == 3) {
-    TVM_FFI_ICHECK_EQ(mat2->ndim, 3) << "mat2 must be a batch of matrices";
-    TVM_FFI_ICHECK_EQ(mat1->shape[0], mat2->shape[0])
-        << "mat1 and mat2 must have the same batch size (" << mat1->shape[0] << " and "
-        << mat2->shape[0] << ")";
-    TVM_FFI_ICHECK_EQ(mat1->shape[2], mat2->shape[2] * mat2_k_scale)
-        << "mat1 and mat2 shapes cannot be multiplied (" << mat1->shape[1] << "x" << mat1->shape[2]
-        << " and " << mat2->shape[1] << "x" << mat2->shape[2] << ")";
-    m = mat1->shape[1];
-    n = mat2->shape[1];
-    k = mat2->shape[2] * 2;
-    b = mat1->shape[0];
+  } else if (mat1.ndim() == 3) {
+    TVM_FFI_ICHECK_EQ(mat2.ndim(), 3) << "mat2 must be a batch of matrices";
+    TVM_FFI_ICHECK_EQ(mat1.size(0), mat2.size(0)) << "mat1 and mat2 must have the same batch size ("
+                                                  << mat1.size(0) << " and " << mat2.size(0) << ")";
+    TVM_FFI_ICHECK_EQ(mat1.size(2), mat2.size(2) * mat2_k_scale)
+        << "mat1 and mat2 shapes cannot be multiplied (" << mat1.size(1) << "x" << mat1.size(2)
+        << " and " << mat2.size(1) << "x" << mat2.size(2) << ")";
+    m = mat1.size(1);
+    n = mat2.size(1);
+    k = mat2.size(2) * 2;
+    b = mat1.size(0);
   } else {
     TVM_FFI_LOG_AND_THROW(NotImplementedError) << "mat1 must be a matrix or a batch of matrices";
   }
@@ -140,24 +140,24 @@ Tensor fp4_bmm_impl(Tensor const& mat1, Tensor const& mat2, Tensor const& mat1Sc
 
   constexpr int alignment = 32;
   TVM_FFI_ICHECK_EQ(k % alignment, 0)
-      << "Expected k to be divisible by " << alignment << ", but got mat1 shape: ("
-      << mat1->shape[0] << "x" << mat1->shape[1] << "), k: " << k << ".";
+      << "Expected k to be divisible by " << alignment << ", but got mat1 shape: (" << mat1.size(0)
+      << "x" << mat1.size(1) << "), k: " << k << ".";
   TVM_FFI_ICHECK_EQ(n % alignment, 0)
-      << "Expected n to be divisible by " << alignment << ", but got mat2 shape: ("
-      << mat2->shape[0] << "x" << mat2->shape[1] << ").";
+      << "Expected n to be divisible by " << alignment << ", but got mat2 shape: (" << mat2.size(0)
+      << "x" << mat2.size(1) << ").";
 
   // Validate out dimensions
   std::vector<int64_t> out_shape =
-      mat1->ndim == 2 ? std::vector<int64_t>{m, n} : std::vector<int64_t>{b, m, n};
-  TVM_FFI_ICHECK_EQ(out->ndim, out_shape.size())
-      << "out must have " << out_shape.size() << " dimensions, but got " << out->ndim;
+      mat1.ndim() == 2 ? std::vector<int64_t>{m, n} : std::vector<int64_t>{b, m, n};
+  TVM_FFI_ICHECK_EQ(out.ndim(), out_shape.size())
+      << "out must have " << out_shape.size() << " dimensions, but got " << out.ndim();
   for (int i = 0; i < out_shape.size(); ++i) {
-    TVM_FFI_ICHECK_EQ(out->shape[i], out_shape[i])
+    TVM_FFI_ICHECK_EQ(out.size(i), out_shape[i])
         << "out shape mismatch at dimension " << i << ": expected " << out_shape[i] << ", got "
-        << out->shape[i];
+        << out.size(i);
   }
 
-  switch (encode_dlpack_dtype(out->dtype)) {
+  switch (encode_dlpack_dtype(out.dtype())) {
     case float16_code:
       runGemm<half>(out, mat1, mat2, mat1Scale, mat2Scale, globalScale, m, n, k, b, config,
                     workspace_buffer);
@@ -169,15 +169,13 @@ Tensor fp4_bmm_impl(Tensor const& mat1, Tensor const& mat2, Tensor const& mat1Sc
     default:
       TVM_FFI_ICHECK(false) << "out_dtype must be one of fp16/bf16.";
   }
-  return out;
 }
 
 }  // namespace
 
-Tensor fp4_gemm(Tensor const& mat1, Tensor const& mat2, Tensor const& mat1Scale,
-                Tensor const& mat2Scale, Tensor const& globalScale, Tensor out,
-                Tensor workspace_buffer, int64_t tactic) {
-  return fp4_bmm_impl(mat1, mat2, mat1Scale, mat2Scale, globalScale, out, workspace_buffer, tactic);
+void fp4_gemm(TensorView mat1, TensorView mat2, TensorView mat1Scale, TensorView mat2Scale,
+              TensorView globalScale, TensorView out, TensorView workspace_buffer, int64_t tactic) {
+  fp4_bmm_impl(mat1, mat2, mat1Scale, mat2Scale, globalScale, out, workspace_buffer, tactic);
 }
 
 int64_t fp4_gemm_tactic_num() {

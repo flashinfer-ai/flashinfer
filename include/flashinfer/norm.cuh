@@ -18,6 +18,9 @@
 
 #include <numeric>
 
+#include "flashinfer/trtllm/common/cudaTypeUtils.cuh"
+#include "flashinfer/trtllm/common/cudaUtils.h"
+#include "flashinfer/trtllm/common/reduceKernelUtils.cuh"
 #include "flashinfer/utils.cuh"
 #include "math.cuh"
 #include "utils.cuh"
@@ -26,6 +29,8 @@
 namespace flashinfer {
 
 namespace norm {
+
+using namespace tensorrt_llm::common;
 
 template <uint32_t VEC_SIZE, typename T>
 __global__ void RMSNormKernel(T* __restrict__ input, T* __restrict__ weight, T* __restrict__ output,
@@ -461,6 +466,263 @@ cudaError_t GemmaFusedAddRMSNorm(T* input, T* residual, T* weight, uint32_t batc
                                             stride_input, stride_residual, weight_bias, eps));
   });
 
+  return cudaSuccess;
+}
+
+template <typename T>
+struct QuantTypeStaticVals;
+
+template <>
+struct QuantTypeStaticVals<int8_t> {
+  static constexpr float MAX_VAL = 127.f;
+  static constexpr float MIN_SCALING_FACTOR = 0.f;
+  static constexpr float MIN_SCALING_FACTOR_RCP = FLT_MAX;
+};
+
+template <typename Tf, typename T>
+__inline__ __device__ Tf compute_layernorm(Tf val, float s_mean, float s_variance, T const* gemma,
+                                           T const* beta, int i) {
+  Tf ret = (val - s_mean) * s_variance * cuda_cast<Tf>(gemma[i]);
+  if (beta != nullptr) {
+    ret = ret + cuda_cast<Tf>(beta[i]);
+  }
+  return ret;
+}
+
+template <typename T, typename Tw, typename QuantT, bool USE_SHMEM,
+          bool USE_DIFF_OF_SQUARES = false>
+__global__ void generalLayerNorm(T const* input, Tw const* gemma, Tw const* beta, T* normed_output,
+                                 float const eps, int tokens, int hidden_dim,
+                                 float const* clamp_ptr, float const* scale_orig_quant_per_tensor,
+                                 float* scale_orig_quant_per_token, float* sum_per_token,
+                                 QuantT* normed_output_quant, bool has_fp8_min_scaling) {
+  constexpr auto num_elems_T = num_elems<T>::value;
+  using QuantT_packed_t = typename packed_as<QuantT, num_elems_T>::type;
+  using float_packed_t = typename packed_as<float, num_elems_T>::type;
+  using T_scalar = typename packed_as<T, 1>::type;
+
+  // The clamping minimum / maximum values.
+  T const clamp_min = cuda_cast<T>(clamp_ptr ? clamp_ptr[0] : -FLT_MAX);
+  T const clamp_max = cuda_cast<T>(clamp_ptr ? clamp_ptr[1] : FLT_MAX);
+
+  // The quantized data type's maximum value (upper-bound).
+  static constexpr float MAX_QUANT_VAL = QuantTypeStaticVals<QuantT>::MAX_VAL;
+  // The minimum scaling factor (lower-bound)
+  static constexpr float MIN_SCALING_FACTOR = QuantTypeStaticVals<QuantT>::MIN_SCALING_FACTOR;
+  static constexpr float MIN_SCALING_FACTOR_RCP =
+      QuantTypeStaticVals<QuantT>::MIN_SCALING_FACTOR_RCP;
+
+  extern __shared__ __align__(sizeof(float)) char _shmem[];
+  T* shmem = reinterpret_cast<T*>(_shmem);
+  __shared__ float s_mean;
+  __shared__ float s_variance;
+
+  int const tidx = threadIdx.x;
+  int const bidx = blockIdx.x;
+
+  float mean = 0.0f;
+  float variance = 0.0f;
+  float local_sum = 0.0f;
+  float local_var_sum = 0.0f;
+
+  int const n_elems = hidden_dim / num_elems_T;
+  for (int i = tidx; i < n_elems; i += blockDim.x) {
+    const T val = input[bidx * n_elems + i];
+    if constexpr (USE_SHMEM) {
+      shmem[i] = val;
+    }
+
+    const float_packed_t val_f = cuda_cast<float_packed_t>(val);
+    local_sum += cuda_sum<float>(val_f);
+    if constexpr (USE_DIFF_OF_SQUARES) {
+      local_var_sum += cuda_sum<float>(val_f * val_f);
+    }
+  }
+
+  if constexpr (USE_DIFF_OF_SQUARES) {
+    float packed[2] = {local_sum, local_var_sum};
+    blockReduceSumV2<float, 2>(packed);
+    mean = packed[0];
+    variance = packed[1];
+  } else {
+    mean = blockReduceSum(local_sum);
+  }
+
+  if (threadIdx.x == 0) {
+    mean = mean / hidden_dim;
+    s_mean = mean;
+    if constexpr (USE_DIFF_OF_SQUARES) {
+      variance = (variance / hidden_dim) - (mean * mean);  // Var[x] = E[x²] - E[x]²
+      s_variance = rsqrtf(variance + eps);
+    }
+  }
+  __syncthreads();
+
+  if constexpr (!USE_DIFF_OF_SQUARES) {
+    for (int i = tidx; i < n_elems; i += blockDim.x) {
+      const T val = USE_SHMEM ? shmem[i] : input[bidx * n_elems + i];
+      float_packed_t diff = cuda_cast<float_packed_t>(val) - s_mean;
+      local_var_sum += cuda_sum<float>(diff * diff);
+    }
+    variance = blockReduceSum(local_var_sum);
+
+    if (threadIdx.x == 0) {
+      s_variance = rsqrtf(variance / hidden_dim + eps);
+    }
+    __syncthreads();
+  }
+
+  bool const with_per_token_scaling = scale_orig_quant_per_token != nullptr;
+  bool const with_per_tensor_scaling = scale_orig_quant_per_tensor != nullptr;
+  bool const with_per_token_sum = sum_per_token != nullptr;
+
+  const float_packed_t scale_orig_quant =
+      cuda_cast<float_packed_t>(with_per_tensor_scaling ? *scale_orig_quant_per_tensor : 0.0f);
+  T_scalar amax = 1e-6f;
+  local_sum = 0.f;
+
+  for (int i = tidx; i < n_elems; i += blockDim.x) {
+    int const index = bidx * n_elems + i;
+    const float_packed_t val_f = cuda_cast<float_packed_t>(USE_SHMEM ? shmem[i] : input[index]);
+    T val = cuda_cast<T>(compute_layernorm(val_f, s_mean, s_variance, gemma, beta, i));
+
+    if (with_per_token_scaling) {
+      val = cuda_clamp(val, clamp_min, clamp_max);
+      amax = cuda_max(cuda_max<T_scalar, T>(cuda_abs(val)), amax);
+      if constexpr (USE_SHMEM) {
+        shmem[i] = val;
+      }
+    } else if (with_per_tensor_scaling) {
+      val = cuda_clamp(val, clamp_min, clamp_max);
+      reinterpret_cast<QuantT_packed_t*>(normed_output_quant)[index] =
+          cuda_cast<QuantT_packed_t>(cuda_cast<float_packed_t>(val) * scale_orig_quant);
+    } else {
+      normed_output[index] = val;
+    }
+
+    if (with_per_token_sum) {
+      local_sum += cuda_sum<float>(cuda_cast<float_packed_t>(val));
+    }
+  }
+
+  if (with_per_token_scaling) {
+    float abs_max_f = blockAllReduceMax(cuda_cast<float>(amax));
+    float const dynamic_per_token_scale =
+        has_fp8_min_scaling ? fminf(MAX_QUANT_VAL / abs_max_f, MIN_SCALING_FACTOR_RCP)
+                            : (MAX_QUANT_VAL / abs_max_f);
+    for (int i = tidx; i < n_elems; i += blockDim.x) {
+      int const index = bidx * n_elems + i;
+      float_packed_t val_f = cuda_cast<float_packed_t>(USE_SHMEM ? shmem[i] : input[index]);
+      if constexpr (!USE_SHMEM) {
+        val_f = compute_layernorm(val_f, s_mean, s_variance, gemma, beta, i);
+      }
+
+      reinterpret_cast<QuantT_packed_t*>(normed_output_quant)[index] =
+          cuda_cast<QuantT_packed_t>(val_f * cuda_cast<float_packed_t>(dynamic_per_token_scale));
+    }
+    if (tidx == 0) {
+      scale_orig_quant_per_token[bidx] =
+          has_fp8_min_scaling ? cuda_max(abs_max_f / MAX_QUANT_VAL, MIN_SCALING_FACTOR)
+                              : abs_max_f / MAX_QUANT_VAL;
+    }
+  }
+
+  if (with_per_token_sum) {
+    float packed_sum[1] = {local_sum};
+    blockReduceSumV2<float, 1>(packed_sum);
+    if (tidx == 0) {
+      sum_per_token[bidx] = packed_sum[0];
+    }
+  }
+}
+
+template <bool USE_DIFF_OF_SQUARES, typename T, typename Tw, typename QuantT>
+void dispatch_layernorm_type_square_method(
+    T const* input, Tw const* gemma, Tw const* beta, T* normed_output, float const eps, int tokens,
+    int hidden_dim, float const* clamp_ptr, float const* scale_orig_quant_per_tensor,
+    float* scale_orig_quant_per_token, float* sum_per_token, QuantT* normed_output_quant,
+    bool const has_fp8_min_scaling, dim3 const grid, dim3 const block, size_t const shmem_size,
+    cudaStream_t stream) {
+  // Do we use shared memory to cache intermediate results
+  bool use_shmem = true;
+  if (shmem_size >= (48 << 10)) {
+    cudaError_t ret =
+        cudaFuncSetAttribute(generalLayerNorm<T, Tw, QuantT, true, USE_DIFF_OF_SQUARES>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size);
+    // Use shared memory when the capacity is enough
+    use_shmem = (ret == cudaSuccess);
+  }
+
+  if (use_shmem) {
+    generalLayerNorm<T, Tw, QuantT, true, USE_DIFF_OF_SQUARES><<<grid, block, shmem_size, stream>>>(
+        input, gemma, beta, normed_output, eps, tokens, hidden_dim, clamp_ptr,
+        scale_orig_quant_per_tensor, scale_orig_quant_per_token, sum_per_token, normed_output_quant,
+        has_fp8_min_scaling);
+  } else {
+    generalLayerNorm<T, Tw, QuantT, false, USE_DIFF_OF_SQUARES><<<grid, block, 0, stream>>>(
+        input, gemma, beta, normed_output, eps, tokens, hidden_dim, clamp_ptr,
+        scale_orig_quant_per_tensor, scale_orig_quant_per_token, sum_per_token, normed_output_quant,
+        has_fp8_min_scaling);
+  }
+}
+
+template <typename T, typename Tw, typename QuantT>
+void dispatch_layernorm_type(T const* input, Tw const* gemma, Tw const* beta, T* normed_output,
+                             float const eps, int tokens, int hidden_dim, float const* clamp_ptr,
+                             float const* scale_orig_quant_per_tensor,
+                             float* scale_orig_quant_per_token, float* sum_per_token,
+                             QuantT* normed_output_quant, bool const has_fp8_min_scaling,
+                             dim3 const grid, dim3 const block, size_t const shmem_size,
+                             cudaStream_t stream, bool const use_diff_of_squares) {
+  if (use_diff_of_squares) {
+    dispatch_layernorm_type_square_method<true>(
+        input, gemma, beta, normed_output, eps, tokens, hidden_dim, clamp_ptr,
+        scale_orig_quant_per_tensor, scale_orig_quant_per_token, sum_per_token, normed_output_quant,
+        has_fp8_min_scaling, grid, block, shmem_size, stream);
+  } else {
+    dispatch_layernorm_type_square_method<false>(
+        input, gemma, beta, normed_output, eps, tokens, hidden_dim, clamp_ptr,
+        scale_orig_quant_per_tensor, scale_orig_quant_per_token, sum_per_token, normed_output_quant,
+        has_fp8_min_scaling, grid, block, shmem_size, stream);
+  }
+}
+
+template <typename T, typename Tw>
+cudaError_t LayerNorm(T* input, Tw* gemma, Tw* beta, T* out, uint32_t tokens, uint32_t hidden_dim,
+                      float eps = 1e-5, cudaStream_t stream = 0) {
+  dim3 grid(tokens);
+  dim3 block(min(hidden_dim, 1024));
+  // Make sure block.x is multiple of 32 for warp shuffle to work
+  block.x = 32 * ((block.x + 31) / 32);
+
+  constexpr size_t vec_size = 2;
+  const size_t shmem_size = hidden_dim * sizeof(T);
+  bool const use_vec_type = (hidden_dim % vec_size == 0) &&
+                            (std::is_same<T, half>::value || std::is_same<T, __nv_bfloat16>::value);
+
+  // Enable min_scaling factor if it is fp8 row-wise per-token quantization
+  // TODO(kaixih): add support for fp8 quantization if needed
+  bool has_fp8_min_scaling = false;
+  float* clamp_ptr = nullptr;
+  float* scale = nullptr;
+  float* dynamic_scale = nullptr;
+  float* sum_per_token = nullptr;
+  int8_t* normed_output_quant = nullptr;
+  bool use_diff_of_squares = false;
+
+  if (use_vec_type) {
+    using Tp = typename packed_as<T, vec_size>::type;
+    using Twp = typename packed_as<Tw, vec_size>::type;
+    dispatch_layernorm_type(reinterpret_cast<Tp const*>(input), reinterpret_cast<Twp const*>(gemma),
+                            reinterpret_cast<Twp const*>(beta), reinterpret_cast<Tp*>(out), eps,
+                            tokens, hidden_dim, clamp_ptr, scale, dynamic_scale, sum_per_token,
+                            normed_output_quant, has_fp8_min_scaling, grid, block, shmem_size,
+                            stream, use_diff_of_squares);
+  } else {
+    dispatch_layernorm_type(input, gemma, beta, out, eps, tokens, hidden_dim, clamp_ptr, scale,
+                            dynamic_scale, sum_per_token, normed_output_quant, has_fp8_min_scaling,
+                            grid, block, shmem_size, stream, use_diff_of_squares);
+  }
   return cudaSuccess;
 }
 

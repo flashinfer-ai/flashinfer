@@ -15,19 +15,19 @@
 [project]
 name = "flashinfer-python"
 description = "FlashInfer: Kernel Library for LLM Serving"
-requires-python = ">=3.9,<4.0"
+requires-python = ">=3.10,<4.0"
 authors = [{ name = "FlashInfer team" }]
 license = "Apache-2.0"
 readme = "README.md"
 urls = { Homepage = "https://github.com/flashinfer-ai/flashinfer" }
 dynamic = ["dependencies", "version"]
-license-files = ["LICENSE", "licenses/*"]
+license-files = ["LICENSE", "LICENSE*.txt"]
 
 [project.scripts]
 flashinfer = "flashinfer.__main__:cli"
 
 [build-system]
-requires = ["setuptools>=77", "packaging>=24", "apache-tvm-ffi==0.1.0b15"]
+requires = ["setuptools>=77", "packaging>=24", "apache-tvm-ffi>=0.1,<0.2"]
 build-backend = "build_backend"
 backend-path = ["."]
 

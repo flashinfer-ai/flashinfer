@@ -15,9 +15,10 @@
  */
 #include "tvm_ffi_utils.h"
 
-void CutlassGemmGroupwiseScaledSM100(Tensor float_workspace_buffer, Tensor A, Tensor B, Tensor SFA,
-                                     Tensor SFB, Tensor C, int64_t scale_granularity_m,
-                                     int64_t scale_granularity_n, int64_t scale_granularity_k,
-                                     std::string scale_major_mode, int64_t mma_sm);
+void CutlassGemmGroupwiseScaledSM100(TensorView float_workspace_buffer, TensorView A, TensorView B,
+                                     TensorView SFA, TensorView SFB, TensorView C,
+                                     int64_t scale_granularity_m, int64_t scale_granularity_n,
+                                     int64_t scale_granularity_k, std::string scale_major_mode,
+                                     int64_t mma_sm);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(gemm_fp8_nt_groupwise, CutlassGemmGroupwiseScaledSM100);

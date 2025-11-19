@@ -36,6 +36,7 @@ from .cudnn import cudnn_batch_prefill_with_kv_cache
 from .page import block_sparse_indices_to_vector_sparse_offsets, get_seq_lens
 from .quantization import packbits, segment_packbits
 from .utils import (
+    log2e,
     FP4Tensor,
     MaskMode,
     PosEncodingMode,
@@ -190,8 +191,8 @@ def get_trtllm_gen_prefill_module():
         seq_lens: torch.Tensor,
         max_q_len: int,
         max_kv_len: int,
-        bmm1_scale: float,
-        bmm2_scale: float,
+        bmm1_scale: Union[float, torch.Tensor],
+        bmm2_scale: Union[float, torch.Tensor],
         batch_size: int,
         cum_seq_lens_q: torch.Tensor,
         cum_seq_lens_kv: torch.Tensor,
@@ -204,12 +205,11 @@ def get_trtllm_gen_prefill_module():
         sm_count = get_device_sm_count(query.device)
         if out is None:
             out = torch.empty_like(query)
-        bmm1_scale = (
-            bmm1_scale.item() if isinstance(bmm1_scale, torch.Tensor) else bmm1_scale
-        )
-        bmm2_scale = (
-            bmm2_scale.item() if isinstance(bmm2_scale, torch.Tensor) else bmm2_scale
-        )
+        if isinstance(bmm1_scale, torch.Tensor):
+            assert bmm1_scale.dtype == torch.float32
+            bmm1_scale = bmm1_scale * log2e
+        if isinstance(bmm2_scale, torch.Tensor):
+            assert bmm2_scale.dtype == torch.float32
         op.trtllm_paged_attention_context(
             out,
             None,  # fp4 output not supported in wrapper api yet.
@@ -1715,7 +1715,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             self._max_q_len = max_token_per_sequence
         else:
             qo_indptr_host = qo_indptr.to("cpu")
-            self._max_q_len = max(qo_indptr_host).item()
+            self._max_q_len = max(qo_indptr_host[1:] - qo_indptr_host[:-1]).item()
             total_num_rows = int(qo_indptr_host[-1])
 
         if max_sequence_kv is not None:
@@ -1857,7 +1857,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         self._block_tables = block_tables
         if self._backend == "trtllm-gen":
-            assert self._kv_layout == "HND"
             assert logits_soft_cap == 0.0
             if self._block_tables is None:
                 blocks_per_seq = [
@@ -1903,6 +1902,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             if self._backend == "fa2":
                 args.append(fixed_split_size or -1)  # fixed_split_size
                 args.append(disable_split_kv)  # disable_split_kv
+                args.append(0)  # num_colocated_ctas
             self._plan_info = self._cached_module.plan(
                 *args,
             )
@@ -2041,6 +2041,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         _check_cached_qkv_data_type(
             q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
         )
+
         stride_block = k_cache.stride(0)
         if self._kv_layout == "NHD":
             page_size = k_cache.shape[1]
@@ -2087,6 +2088,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
             check_shape_dtype_device(
                 out, q.shape[:-1] + v_cache.shape[-1:], q.dtype, q.device, "out"
             )
+
+        # Convert NHD layout to HND for trtllm-gen backend
+        if self._backend == "trtllm-gen" and self._kv_layout == "NHD":
+            # For NHD: [..., N, H, D] -> HND: [..., H, N, D]
+            k_cache = k_cache.transpose(-3, -2)
+            v_cache = v_cache.transpose(-3, -2)
 
         if self._custom_mask_buf is not None:
             mask_mode = MaskMode.CUSTOM.value
@@ -2763,6 +2770,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             if self._backend == "fa2":
                 args.append(fixed_split_size or -1)  # fixed_split_size
                 args.append(disable_split_kv)  # disable_split_kv
+                args.append(0)  # num_colocated_ctas
             self._plan_info = self._cached_module.plan(
                 *args,
             )
@@ -3193,8 +3201,8 @@ def trtllm_ragged_attention_deepseek(
     seq_lens: torch.Tensor,
     max_q_len: int,
     max_kv_len: int,
-    bmm1_scale: float,
-    bmm2_scale: float,
+    bmm1_scale: Union[float, torch.Tensor],
+    bmm2_scale: Union[float, torch.Tensor],
     o_sf_scale: float,
     batch_size: int,
     window_left: int,
@@ -3224,10 +3232,12 @@ def trtllm_ragged_attention_deepseek(
         max query length
     max_kv_len : int
         max key/value length
-    bmm1_scale : float
+    bmm1_scale : Union[float, torch.Tensor]
         scale for bmm1, scale_q * scale_k * 1.0 / (head_dim_qk ** 0.5)
-    bmm2_scale : float
+        when using trtllm-gen backend, it can be a torch.Tensor with dtype torch.float32.
+    bmm2_scale : Union[float, torch.Tensor]
         scale for bmm2, scale_v
+        when using trtllm-gen backend, it can be a torch.Tensor with dtype torch.float32.
     o_sf_scale : float
         scale for output
     batch_size : int
@@ -3281,6 +3291,12 @@ def trtllm_ragged_attention_deepseek(
             dtype=torch.float32,
         )
 
+    if isinstance(bmm1_scale, torch.Tensor):
+        assert bmm1_scale.dtype == torch.float32
+        bmm1_scale = bmm1_scale * log2e
+    if isinstance(bmm2_scale, torch.Tensor):
+        assert bmm2_scale.dtype == torch.float32
+
     workspace_size = workspace_buffer.numel() * workspace_buffer.element_size()
     run_func(
         out,
@@ -3319,8 +3335,8 @@ def trtllm_batch_context_with_kv_cache(
     seq_lens: torch.Tensor,
     max_q_len: int,
     max_kv_len: int,
-    bmm1_scale: float,
-    bmm2_scale: float,
+    bmm1_scale: Union[float, torch.Tensor],
+    bmm2_scale: Union[float, torch.Tensor],
     batch_size: int,
     cum_seq_lens_q: torch.Tensor,
     cum_seq_lens_kv: torch.Tensor,
@@ -3329,6 +3345,7 @@ def trtllm_batch_context_with_kv_cache(
     out_dtype: Optional[Union[torch.dtype, str]] = None,
     o_sf_scale: Optional[float] = None,
     o_sf_vec_size: Optional[int] = None,
+    kv_layout: str = "HND",
     enable_pdl: Optional[bool] = None,
     sinks: Optional[List[torch.Tensor]] = None,
 ) -> Union[torch.Tensor, FP4Tensor]:
@@ -3338,8 +3355,11 @@ def trtllm_batch_context_with_kv_cache(
     query : torch.Tensor
         query tensor with shape [num_tokens, num_heads, head_dim]
     kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
-        If kv_cache is a single tensor, it should be a tensor with shape [num_pages, 1 or 2, num_kv_heads, page_size, head_dim]
-        If kv_cache is a tuple of two tensors, it should be a tuple of two tensors with shape [num_pages, num_kv_heads, page_size, head_dim]
+        If kv_cache is a single tensor, it should be a tensor with shape [num_pages, 1 or 2, num_kv_heads, page_size, head_dim] if :attr:`kv_layout` is "HND",
+        or [num_pages, 1 or 2, page_size, num_kv_heads, head_dim] if :attr:`kv_layout` is "NHD".
+        If kv_cache is a tuple of two tensors, it should be a tuple of two tensors with shape [num_pages, num_kv_heads, page_size, head_dim] if :attr:`kv_layout` is "HND",
+        or [num_pages, page_size, num_kv_heads, head_dim] if :attr:`kv_layout` is "NHD".
+        The first tensor is the key cache, the second tensor is the value cache.
     workspace_buffer : torch.Tensor. Must be initialized to 0 for its first use.
         workspace
     block_tables : torch.Tensor
@@ -3350,10 +3370,12 @@ def trtllm_batch_context_with_kv_cache(
         max sequence length for query
     max_kv_len : int
         max sequence length for kv_cache
-    bmm1_scale : float
+    bmm1_scale : Union[float, torch.Tensor]
         fused scale for bmm1 input.
-    bmm2_scale : float
+        when using trtllm-gen backend, it can be a torch.Tensor with dtype torch.float32.
+    bmm2_scale : Union[float, torch.Tensor]
         fused scale for bmm2 input.
+        when using trtllm-gen backend, it can be a torch.Tensor with dtype torch.float32.
     batch_size : int
         batch size
     cum_seq_lens_q : torch.Tensor
@@ -3371,6 +3393,11 @@ def trtllm_batch_context_with_kv_cache(
         scale for nvfp4 output tensor scale factor.
     o_sf_vec_size : Optional[int] = None
         vector size for nvfp4 output tensor scale factor.
+    enable_pdl : Optional[bool] = None
+        Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
+        Defaults to ``None``, which means it will be enabled if the device supports PDL.
+    kv_layout : str = "HND"
+        Layout of kv-cache, can be "HND" or "NHD", default is "HND".
     sinks : Optional[List[torch.Tensor]] = None
         additional value per head in the denominator of the softmax.
 
@@ -3395,6 +3422,12 @@ def trtllm_batch_context_with_kv_cache(
             # NOTE(Zihao): unbind transforms [num_pages, 2, ...] to ([num_pages, ...], [num_pages, ...])
             # it doesn't change underlying storage
             k_cache, v_cache = kv_cache.unbind(dim=1)
+
+    # Convert NHD layout to HND if necessary (transpose only changes stride, not data)
+    if kv_layout == "NHD":
+        # For NHD: [..., N, H, D] -> HND: [..., H, N, D]
+        k_cache = k_cache.transpose(-3, -2)
+        v_cache = v_cache.transpose(-3, -2)
 
     run_func = get_trtllm_gen_fmha_module().trtllm_paged_attention_context
     sm_count = get_device_sm_count(query.device)
@@ -3471,13 +3504,11 @@ def trtllm_batch_context_with_kv_cache(
     else:
         raise ValueError(f"Invalid out_dtype: {out_dtype}")
 
-    bmm1_scale = (
-        bmm1_scale.item() if isinstance(bmm1_scale, torch.Tensor) else bmm1_scale
-    )
-    bmm2_scale = (
-        bmm2_scale.item() if isinstance(bmm2_scale, torch.Tensor) else bmm2_scale
-    )
-
+    if isinstance(bmm1_scale, torch.Tensor):
+        assert bmm1_scale.dtype == torch.float32
+        bmm1_scale = bmm1_scale * log2e
+    if isinstance(bmm2_scale, torch.Tensor):
+        assert bmm2_scale.dtype == torch.float32
     workspace_size = workspace_buffer.numel() * workspace_buffer.element_size()
     run_func(
         out,

@@ -154,6 +154,7 @@ class MaskedSchedulerParams:
                 self._cluster_shape_mnk,
             ],
             self._values_pos,
+            strict=True,
         ):
             obj_list.append(new_from_mlir_values(obj, values[:n_items]))
             values = values[n_items:]
@@ -348,6 +349,7 @@ class MaskedScheduler:
                 cur_cluster_coord,
                 self.cta_id_in_cluster,
                 (*self.params.cluster_shape_mn, Int32(1)),
+                strict=True,
             )
         )
 

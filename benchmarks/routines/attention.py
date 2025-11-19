@@ -19,6 +19,30 @@ from .flashinfer_benchmark_utils import (
 )
 
 
+def normalize_backends(backends):
+    """
+    Normalize backend names planned for deprecation and print warnings.
+    Currently:
+    - Replaces deprecated 'trtllm-gen-native' with 'trtllm-native'.
+
+    Args:
+        backends: List of backend names
+
+    Returns:
+        List of normalized backend names
+    """
+    normalized = []
+    for backend in backends:
+        if backend == "trtllm-gen-native":
+            print(
+                "[WARNING] Backend name 'trtllm-gen-native' has been renamed to 'trtllm-native' and will be removed in a future release. "
+            )
+            normalized.append("trtllm-native")
+        else:
+            normalized.append(backend)
+    return normalized
+
+
 def run_attention_test(args):
     """
     Run an attention test.
@@ -66,7 +90,8 @@ def parse_attention_args(line, parser):
             "cudnn",
             "cutlass",
             "trtllm-gen",
-            "trtllm-gen-native",
+            "trtllm-native",
+            "trtllm-gen-native",  # Deprecated, will be removed in future
         ],
         help="Kernel backends to test. Default: fa2",
     )
@@ -151,6 +176,10 @@ def parse_attention_args(line, parser):
     )
 
     args = parser.parse_args(line)
+
+    # Normalize backend names (handle deprecated names)
+    args.backends = normalize_backends(args.backends)
+
     if args.verbose >= 1:
         print(f"[INFO] {args = }")
     return args
@@ -185,7 +214,7 @@ def sample_actual_seq_lens(max_seqlen, batch_size, device, random_actual_seq_len
 def testBatchDecodeWithPagedKVCacheWrapper(args):
     """
     Test BatchDecodeWithPagedKVCacheWrapper API and equivalent cuDNN API.
-    Supports fa2, fa2_tc, cudnn, trtllm-gen, trtllm-gen-native backends.
+    Supports fa2, fa2_tc, cudnn, trtllm-gen, trtllm-native backends.
 
     This test:
     1. Creates paged KV cache and query tensors
@@ -451,6 +480,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 page_size,
                 q_data_type=q_dtype,
                 data_type=kv_dtype,
+                block_tables=block_tables,
             )
 
     ## If FP8, prepare
@@ -489,7 +519,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 batch_offsets_q=ragged_q,
                 batch_offsets_o=ragged_q,
             )
-        elif backend == "trtllm-gen-native":
+        elif backend == "trtllm-native":
             return flashinfer.decode.trtllm_batch_decode_with_kv_cache(
                 query=q.contiguous(),
                 kv_cache=kv_cache,
@@ -507,6 +537,8 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
     has_reference_output = False
     # Iterate over each backend:
     for cur_backend in backends:
+        # Clear workspace buffer to prevent unexpected interactions between backends.
+        workspace_buffer.zero_()
         if run_refcheck:
             outputs[cur_backend] = run_backend_wrapper(cur_backend).detach().clone()
             if cur_backend == "fa2":
@@ -611,7 +643,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
 def testBatchPrefillWithPagedKVCacheWrapper(args):
     """
     Test BatchPrefillWithPagedKVCacheWrapper API and equivalent cuDNN API.
-    Supports fa2, fa3, trtllm-gen, trtllm-gen-native, and cudnn backends.
+    Supports fa2, fa3, trtllm-gen, trtllm-native, and cudnn backends.
 
     This test:
     1. Creates paged KV cache and query tensors for prefill
@@ -694,17 +726,13 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
             remove_trtllm = True
         if remove_trtllm:
             backends.remove("trtllm-gen")
-    if "trtllm-gen-native" in backends:
+    if "trtllm-native" in backends:
         remove_trtllm_native = False
-        if batch_size == 1:
-            # TO-DO: trtllm-gen-native hits IMA on batch size 1. Investigate and fix.
-            print("[INFO] trtllm-gen-native backend currently requires batch size > 1")
-            remove_trtllm_native = True
         if not causal:
-            print("[INFO] trtllm-gen-native backend currently requires causal = True")
+            print("[INFO] trtllm-native backend currently requires causal = True")
             remove_trtllm_native = True
         if remove_trtllm_native:
-            backends.remove("trtllm-gen-native")
+            backends.remove("trtllm-native")
 
     if "cutlass" in backends:
         print("[INFO] CUTLASS backend does not support prefill. Skipping.")
@@ -919,6 +947,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 causal=causal,
                 q_data_type=q_dtype,
                 kv_data_type=kv_dtype,
+                block_tables=block_tables,
             )
 
     k_scale, v_scale = None, None
@@ -955,7 +984,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 batch_offsets_q=q_indptr,
                 batch_offsets_o=q_indptr,
             )[0]
-        elif backend == "trtllm-gen-native":
+        elif backend == "trtllm-native":
             return flashinfer.prefill.trtllm_batch_context_with_kv_cache(
                 query=q,
                 kv_cache=kv_cache,
@@ -977,6 +1006,8 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
     has_reference_output = False
     # Iterate over each backend:
     for cur_backend in backends:
+        # Clear workspace buffer to prevent unexpected interactions between backends.
+        workspace_buffer.zero_()
         if run_refcheck:
             outputs[cur_backend] = run_backend_wrapper(cur_backend).detach().clone()
             if cur_backend == "fa2":
@@ -1176,25 +1207,21 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
         remove_trtllm = True
         if remove_trtllm:
             backends.remove("trtllm-gen")
-    if "trtllm-gen-native" in backends:
+    if "trtllm-native" in backends:
         remove_trtllm_native = False
         if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2] or kv_dtype in [
             torch.float8_e4m3fn,
             torch.float8_e5m2,
         ]:
-            print("[INFO] trtllm-gen-native backend does not support FP8. Skipping.")
-            remove_trtllm_native = True
-        if batch_size == 1:
-            # TO-DO: trtllm-gen-native hits IMA on batch size 1. Investigate and fix.
-            print("[INFO] trtllm-gen-native backend currently requires batch size > 1")
+            print("[INFO] trtllm-native backend does not support FP8. Skipping.")
             remove_trtllm_native = True
         if not (head_dim_qk == 192 and head_dim_vo == 128):
             print(
-                "[INFO] trtllm-gen-native backend requires head_dim_qk == 192 and head_dim_vo == 128"
+                "[INFO] trtllm-native backend requires head_dim_qk == 192 and head_dim_vo == 128"
             )
             remove_trtllm_native = True
         if remove_trtllm_native:
-            backends.remove("trtllm-gen-native")
+            backends.remove("trtllm-native")
 
     if len(backends) == 0:
         print("[ERROR] No backends to test. Exiting.")
@@ -1406,7 +1433,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 batch_offsets_stats=batch_offsets_stats,
                 is_cuda_graph_compatible=True,
             )[0]
-        elif backend == "trtllm-gen-native":
+        elif backend == "trtllm-native":
             return flashinfer.prefill.trtllm_ragged_attention_deepseek(
                 query=q,
                 key=k,
@@ -1433,6 +1460,8 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
     has_reference_output = False
     # Iterate over each backend:
     for cur_backend in backends:
+        # Clear workspace buffer to prevent unexpected interactions between backends.
+        workspace_buffer.zero_()
         if run_refcheck:
             outputs[cur_backend] = run_backend_wrapper(cur_backend).detach().clone()
             if cur_backend == "fa2":
@@ -1538,7 +1567,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
 def testBatchMLAPagedAttentionWrapper(args):
     """
     Test BatchMLAPagedAttentionWrapper and equivalent APIs.
-    Supports fa2, fa3, cutlass, and trtllm-gen-native.
+    Supports fa2, fa3, cutlass, and trtllm-native.
 
     This test:
     1. Creates paged query and key-value cache tensors
@@ -1634,15 +1663,15 @@ def testBatchMLAPagedAttentionWrapper(args):
             remove_cutlass = True
         if remove_cutlass:
             backends.remove("cutlass")
-    if "trtllm-gen-native" in backends:
+    if "trtllm-native" in backends:
         remove_trtllm_native = False
         if page_size not in [32, 64]:
             print(
-                "[INFO] trtllm-gen-native backend only supports page size 32 or 64. Skipping."
+                "[INFO] trtllm-native backend only supports page size 32 or 64. Skipping."
             )
             remove_trtllm_native = True
         if remove_trtllm_native:
-            backends.remove("trtllm-gen-native")
+            backends.remove("trtllm-native")
     if len(backends) == 0:
         print("[ERROR] No backends to test. Exiting.")
         return res
@@ -1790,7 +1819,12 @@ def testBatchMLAPagedAttentionWrapper(args):
     def run_backend_wrapper(backend):
         if backend in ["fa2", "fa3"]:
             return backend_wrappers[backend].run(
-                q_nope, q_pe, ckv_cache, kpe_cache, return_lse=False
+                q_nope,
+                q_pe,
+                ckv_cache,
+                kpe_cache,
+                page_table=block_tables,
+                return_lse=False,
             )
         elif backend == "cutlass":
             return backend_wrappers[backend].run(
@@ -1802,7 +1836,7 @@ def testBatchMLAPagedAttentionWrapper(args):
                 page_table=block_tables,
                 return_lse=False,
             )
-        if backend == "trtllm-gen-native":
+        elif backend == "trtllm-native":
             return flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
                 query=q.unsqueeze(1),
                 kv_cache=kv_cache.unsqueeze(1),
@@ -1823,6 +1857,8 @@ def testBatchMLAPagedAttentionWrapper(args):
     has_reference_output = False
     # Iterate over each backend:
     for cur_backend in backends:
+        # Clear workspace buffer to prevent unexpected interactions between backends.
+        workspace_buffer.zero_()
         if run_refcheck:
             outputs[cur_backend] = run_backend_wrapper(cur_backend).detach().clone()
             if cur_backend == "fa2":

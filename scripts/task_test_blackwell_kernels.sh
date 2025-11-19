@@ -6,6 +6,13 @@ set -eo pipefail
 : ${MAX_JOBS:=$(nproc)}
 : ${CUDA_VISIBLE_DEVICES:=0}
 
+# Clean Python bytecode cache to avoid stale imports (e.g., after module refactoring)
+echo "Cleaning Python bytecode cache..."
+find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+find . -type f -name '*.pyc' -delete 2>/dev/null || true
+echo "Cache cleaned."
+echo ""
+
 # Pytest configuration flags
 PYTEST_FLAGS="--continue-on-collection-errors -s"
 
@@ -87,7 +94,8 @@ if [ "$DRY_RUN" == "true" ]; then
 
     for test_file in $TEST_FILES; do
         TOTAL_TESTS=$((TOTAL_TESTS + 1))
-        echo "$TOTAL_TESTS. pytest $PYTEST_FLAGS $test_file"
+        JUNIT_FLAG="--junitxml=${JUNIT_DIR}/${test_file}.xml"
+        echo "$TOTAL_TESTS. pytest $PYTEST_FLAGS ${JUNIT_FLAG} \"${test_file}\""
     done
 
     echo ""
@@ -100,14 +108,16 @@ if [ "$DRY_RUN" == "true" ]; then
     echo "  $0"
     echo "Or set DRY_RUN=false $0"
 else
+    mkdir -p "${JUNIT_DIR}"
     for test_file in $TEST_FILES; do
         echo "=========================================="
-        echo "Running: pytest $PYTEST_FLAGS $test_file"
+        JUNIT_FLAG="--junitxml=${JUNIT_DIR}/${test_file}.xml"
+        echo "Running: pytest $PYTEST_FLAGS ${JUNIT_FLAG} \"${test_file}\""
         echo "=========================================="
 
         TOTAL_TESTS=$((TOTAL_TESTS + 1))
 
-        if pytest $PYTEST_FLAGS "$test_file"; then
+        if pytest $PYTEST_FLAGS "${JUNIT_FLAG}" "${test_file}"; then
             echo "✅ PASSED: $test_file"
             PASSED_TESTS=$((PASSED_TESTS + 1))
         else
