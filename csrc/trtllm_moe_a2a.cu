@@ -31,10 +31,9 @@
 #include "tensorrt_llm/thop/moeAlltoAllMeta.h"
 #include "tvm_ffi_utils.h"
 
-// TODO Review
-
 using tvm::ffi::Array;
 using tvm::ffi::Shape;
+using tvm::ffi::String;
 using tvm::ffi::Tensor;
 using tvm::ffi::TensorView;
 using tvm::ffi::Tuple;
@@ -105,6 +104,10 @@ Tensor moeA2AInitializeOp(TensorView workspace, int64_t epRank, int64_t epSize,
   Tensor metainfo = alloc_tensor({fi_throughput::NUM_METAINFO_FIELDS}, dl_int64, cpu);
   auto* metaPtr = static_cast<int64_t*>(metainfo.data_ptr());
   std::copy(offsets.begin(), offsets.end(), metaPtr);
+
+  auto err = cudaStreamSynchronize(stream);
+  TVM_FFI_ICHECK(err == cudaSuccess) << "cudaStreamSynchronize failed: " << cudaGetErrorString(err);
+
   return metainfo;
 }
 
@@ -371,25 +374,20 @@ void moeA2ASanitizeExpertIdsOp(TensorView expertIds, TensorView workspace, Tenso
       static_cast<int>(runtimeMaxTokensPerRank), static_cast<int>(topK), get_current_stream());
 }
 
-int64_t moeA2AGetCombinePayloadPtrOp(TensorView workspace, int64_t epRank, int64_t epSize,
-                                     int64_t runtimeMaxTokensPerRank, int64_t combinePayloadOffset,
-                                     int64_t elementsPerToken, int64_t elementSizeBytes) {
-  CHECK_INPUT_TYPE(workspace, dl_uint8);
-  TVM_FFI_ICHECK_EQ(workspace.ndim(), 2);
-  TVM_FFI_ICHECK_EQ(workspace.size(0), epSize);
-  TVM_FFI_ICHECK(epRank >= 0 && epRank < epSize);
-  TVM_FFI_ICHECK(runtimeMaxTokensPerRank > 0);
-  TVM_FFI_ICHECK(elementsPerToken > 0);
-  TVM_FFI_ICHECK(elementSizeBytes > 0);
+// Expose metainfo index constants for Python access
+// Returns a tuple of (names, values) for all metainfo constants
+Tuple<Array<String>, Array<int64_t>> getMoeA2AMetaInfoIndexPairs() {
+  auto pairs = fi_throughput::getMoeA2AMetaInfoIndexPairs();
 
-  int64_t sizePerRank = workspace.size(1);
-  int64_t bytesNeeded = epSize * runtimeMaxTokensPerRank * elementsPerToken * elementSizeBytes;
-  TVM_FFI_ICHECK(combinePayloadOffset >= 0 && combinePayloadOffset + bytesNeeded <= sizePerRank)
-      << "combine payload exceeds workspace capacity";
+  Array<String> names;
+  Array<int64_t> values;
 
-  auto* basePtr = static_cast<uint8_t*>(workspace.data_ptr());
-  auto* rankPtr = basePtr + epRank * workspace.stride(0);
-  return reinterpret_cast<int64_t>(rankPtr + combinePayloadOffset);
+  for (const auto& pair : pairs) {
+    names.push_back(pair.first);
+    values.push_back(pair.second);
+  }
+
+  return Tuple{names, values};
 }
 
 }  // namespace
@@ -398,4 +396,4 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_a2a_initialize, moeA2AInitializeOp);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_a2a_dispatch, moeA2ADispatchOp);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_a2a_combine, moeA2ACombineOp);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_a2a_sanitize_expert_ids, moeA2ASanitizeExpertIdsOp);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_a2a_get_combine_payload_ptr, moeA2AGetCombinePayloadPtrOp);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_a2a_get_metainfo_index_pairs, getMoeA2AMetaInfoIndexPairs);
