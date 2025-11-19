@@ -243,6 +243,7 @@ def run_moe_a2a_dispatch_single_rank(
         # Create MoeAlltoAll manager
         max_num_tokens = max(all_num_tokens)
 
+        MoeAlltoAll._WORKSPACE = None
         moe_a2a = MoeAlltoAll(
             mapping,
             max_num_tokens,
@@ -685,6 +686,7 @@ def test_moe_a2a_dispatch_moe_combine(ep_size, all_num_tokens, top_k):
     torch.cuda.synchronize()
 
     # Initialize MoeAlltoAll
+    MoeAlltoAll._WORKSPACE = None
     moe_a2a = MoeAlltoAll(
         mapping=mapping,
         max_num_tokens=max_num_tokens,
@@ -714,26 +716,27 @@ def test_moe_a2a_dispatch_moe_combine(ep_size, all_num_tokens, top_k):
     moe_output.zero_()
 
     # Process each rank's tokens with local experts
-    print(
-        f"hidden_states_recv.shape: {hidden_states_recv.shape}, token_selected_experts_recv.shape: {token_selected_experts_recv.shape}, token_final_scales_recv.shape: {token_final_scales_recv.shape}, rank_experts.shape: {rank_experts.shape}, moe_output.shape: {moe_output.shape}"
+    moe_output.copy_(
+        fake_moe(
+            hidden_states_recv.view(
+                ep_size * max_num_tokens, hidden_states_recv.shape[-1]
+            ),
+            token_selected_experts_recv.view(
+                ep_size * max_num_tokens, token_selected_experts_recv.shape[-1]
+            ),
+            token_final_scales_recv.view(
+                ep_size * max_num_tokens, token_final_scales_recv.shape[-1]
+            ),
+            rank_experts,  # experts for current rank
+            is_ep=True,
+            ep_rank=rank,
+            num_experts_per_rank=num_experts_per_rank,
+        ).view(ep_size, max_num_tokens, hidden_size)
     )
-    moe_output[rank] = fake_moe(
-        hidden_states_recv.view(ep_size * max_num_tokens, hidden_states_recv.shape[-1]),
-        token_selected_experts_recv.view(
-            ep_size * max_num_tokens, token_selected_experts_recv.shape[-1]
-        ),
-        token_final_scales_recv.view(
-            ep_size * max_num_tokens, token_final_scales_recv.shape[-1]
-        ),
-        rank_experts,  # experts for current rank
-        is_ep=True,
-        ep_rank=rank,
-        num_experts_per_rank=num_experts_per_rank,
-    ).view(ep_size, max_num_tokens, hidden_states_recv.shape[-1])
 
     # Combine
     combined_output = moe_a2a.combine(
-        payload=moe_output.view(ep_size, max_num_tokens, hidden_size),
+        payload=moe_output,
         runtime_max_tokens_per_rank=max_num_tokens,
         payload_in_workspace=True,
     )
