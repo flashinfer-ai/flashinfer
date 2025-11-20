@@ -110,6 +110,131 @@ def row_linear_residual_norm_fusion_forward(
         )
 
 
+@torch.inference_mode()
+def row_linear_residual_norm_fusion_forward_legacy(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+    hidden_size: int,
+    dtype: torch.dtype,
+    mapping: Mapping,
+    fusion: bool,
+    reference_output: tuple[torch.Tensor, ...],
+    multicast_ptr: int,
+    buffer_ptrs_dev: int,
+    unicast_ptr: int,
+    max_num_elements_mnnvl: int,
+    buffer_flags_mnnvl: torch.Tensor,
+):
+    tensor_parallel_size = mapping.tp_size
+    tensor_parallel_rank = mapping.tp_rank
+    MPI.COMM_WORLD.barrier()
+
+    def func(
+        input,
+        residual,
+        norm_weight,
+        eps,
+        enable_fusion,
+        multicast_ptr,
+        buffer_ptrs_dev,
+        unicast_ptr,
+        max_num_elements_mnnvl,
+    ):
+        # For both fused and unfused cases:
+        shape = input.shape
+        input = input.view(-1, shape[-1])
+        buffer_M = max_num_elements_mnnvl // hidden_size
+
+        if enable_fusion:
+            use_pdl = True
+
+            prenorm_output = torch.empty_like(residual)
+            normed_output = torch.empty_like(residual)
+
+            trtllm_mnnvl_ar.mpi_barrier()
+
+            trtllm_mnnvl_ar.trtllm_mnnvl_fused_allreduce_rmsnorm(
+                prenorm_output,
+                normed_output,
+                input,
+                multicast_ptr,
+                buffer_ptrs_dev,
+                unicast_ptr,
+                buffer_M,
+                buffer_flags_mnnvl,
+                tensor_parallel_size,
+                tensor_parallel_rank,
+                norm_weight,
+                eps,
+                residual,
+                use_pdl,
+            )
+
+            return normed_output.view(shape), prenorm_output.view(shape)
+
+        else:
+            output = torch.empty_like(input)
+
+            trtllm_mnnvl_ar.trtllm_mnnvl_all_reduce(
+                input,
+                multicast_ptr,
+                buffer_ptrs_dev,
+                buffer_M,
+                buffer_flags_mnnvl,
+                tensor_parallel_size,
+                tensor_parallel_rank,
+                True,  # wait_for_results
+                False,  # launch_with_pdl
+                output,  # Need to provide output tensor since we are writing them out.
+            )
+            return (output.view(shape),)
+
+    output = func(
+        x.clone(),
+        residual.clone(),
+        norm_weight,
+        eps,
+        fusion,
+        multicast_ptr,
+        buffer_ptrs_dev,
+        unicast_ptr,
+        max_num_elements_mnnvl,
+    )
+
+    assert output[0].shape == reference_output[0].shape
+
+    if tensor_parallel_rank == 0:
+        print("output[0] (first 10 values):", output[0].flatten()[:10])
+        print(
+            "reference_output[0] (first 10 values):",
+            reference_output[0].flatten()[:10],
+        )
+
+        if fusion:
+            print("output[1] (first 10 values):", output[1].flatten()[:10])
+            print(
+                "reference_output[1] (first 10 values):",
+                reference_output[1].flatten()[:10],
+            )
+
+    torch.testing.assert_close(
+        output[0],
+        reference_output[0],
+        rtol=0.05,
+        atol=0.15,
+    )
+
+    if fusion:
+        torch.testing.assert_close(
+            output[1],
+            reference_output[1],
+            rtol=0.05,
+            atol=0.15,
+        )
+
+
 """Helper function to run the core MNNVL AllReduce test logic"""
 
 
@@ -155,7 +280,13 @@ def prepare_test_data(seq_len: int, hidden_size: int, dtype: torch.dtype, fusion
 
 
 def run_mnnvl_ar_full(
-    monkeypatch, seq_lens: list[int], fusion: bool, dtype: torch.dtype, hidden_size: int
+    monkeypatch,
+    seq_lens: list[int],
+    fusion: bool,
+    dtype: torch.dtype,
+    hidden_size: int,
+    legacy_explicit_workspace_bytes: int = None,
+    legacy_api: bool = False,
 ):
     """Core test logic for MNNVL AllReduce operations.
 
@@ -211,14 +342,30 @@ def run_mnnvl_ar_full(
     failure_message = ""
 
     try:
-        required_workspace_bytes = trtllm_mnnvl_ar.MNNVLAllreduceFusionWorkspace.get_required_buffer_size_bytes(
-            mapping.tp_size,
-            max(seq_lens),
-            hidden_size,
-            dtype,
-            trtllm_mnnvl_ar.MNNVLAllreduceFusionStrategy.AUTO,
-        )
-        workspace = trtllm_mnnvl_ar.MNNVLAllreduceFusionWorkspace(mapping, required_workspace_bytes)
+        if legacy_api:
+            mcast_buffer_mnnvl, buffer_flags_mnnvl, max_num_elements_mnnvl = (
+                trtllm_mnnvl_ar.get_allreduce_mnnvl_workspace(
+                    mapping, dtype, buffer_size_in_bytes=legacy_explicit_workspace_bytes
+                )
+            )
+
+            multicast_ptr = mcast_buffer_mnnvl.get_multicast_ptr()
+            buffer_ptrs_dev = mcast_buffer_mnnvl.get_buffer_ptrs_dev()
+            unicast_ptr = mcast_buffer_mnnvl.mcast_device_memory.get_unicast_ptr(
+                mapping.tp_rank
+            )
+
+        else:
+            required_workspace_bytes = trtllm_mnnvl_ar.MNNVLAllreduceFusionWorkspace.get_required_buffer_size_bytes(
+                mapping.tp_size,
+                max(seq_lens),
+                hidden_size,
+                dtype,
+                trtllm_mnnvl_ar.MNNVLAllreduceFusionStrategy.AUTO,
+            )
+            workspace = trtllm_mnnvl_ar.MNNVLAllreduceFusionWorkspace(
+                mapping, required_workspace_bytes
+            )
 
         test_data = []
         for seq_len in seq_lens:
@@ -266,19 +413,34 @@ def run_mnnvl_ar_full(
                 print(
                     f"Testing seq_len={seq_len}, hidden_size={hidden_size}, fusion={fusion}, dtype={dtype}"
                 )
->>>>>>> bca4f5d9 (Passing the test.)
-
-            # Run the test with the same workspace
-            row_linear_residual_norm_fusion_forward(
-                x,
-                residual,
-                norm_weight,
-                eps,
-                mapping,
-                fusion,
-                reference_output,
-                workspace,
-            )
+            if legacy_api:
+                row_linear_residual_norm_fusion_forward_legacy(
+                    x,
+                    residual,
+                    norm_weight,
+                    eps,
+                    hidden_size,
+                    dtype,
+                    mapping,
+                    fusion,
+                    reference_output,
+                    multicast_ptr,
+                    buffer_ptrs_dev,
+                    unicast_ptr,
+                    max_num_elements_mnnvl,
+                    buffer_flags_mnnvl,
+                )
+            else:
+                row_linear_residual_norm_fusion_forward(
+                    x,
+                    residual,
+                    norm_weight,
+                    eps,
+                    mapping,
+                    fusion,
+                    reference_output,
+                    workspace,
+                )
 
             # Synchronize before next test
             trtllm_mnnvl_ar.mpi_barrier()
@@ -327,8 +489,23 @@ def run_mnnvl_ar_full(
 @pytest.mark.parametrize("fusion", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("hidden_size", [2880, 5120, 7168, 8192])
-def test_mnnvl_allreduce_default_workspace(
+def test_mnnvl_allreduce_refactored(
     monkeypatch, seq_lens: list[int], fusion: bool, dtype: torch.dtype, hidden_size: int
 ):
-    """Test MNNVL AllReduce with default workspace size."""
-    run_mnnvl_ar_full(monkeypatch, seq_lens, fusion, dtype, hidden_size)
+    """Test MNNVL AllReduce with refactored API."""
+    run_mnnvl_ar_full(
+        monkeypatch, seq_lens, fusion, dtype, hidden_size, legacy_api=False
+    )
+
+
+@pytest.mark.parametrize("seq_lens", [[1], [4], [15], [27, 11, 24], [127]])
+@pytest.mark.parametrize("fusion", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("hidden_size", [2048, 4096, 5120, 7168, 8192])
+def test_mnnvl_allreduce_legacy(
+    monkeypatch, seq_lens: list[int], fusion: bool, dtype: torch.dtype, hidden_size: int
+):
+    """Test MNNVL AllReduce with legacy API."""
+    run_mnnvl_ar_full(
+        monkeypatch, seq_lens, fusion, dtype, hidden_size, legacy_api=True
+    )

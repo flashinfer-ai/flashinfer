@@ -1033,7 +1033,11 @@ class McastGPUBuffer:
             group_rank: The rank of the local process within the group
             device: The CUDA device for buffer allocation
             mn_nvlink: Flag indicating if multi-node NVLink is used
+<<<<<<< HEAD
             comm_backend_for_handle_transfer: Communication backend for handle transfer
+=======
+            comm_backend_for_handle_transfer: The communicator to use for handle transfer
+>>>>>>> a2670e8c (Incorporate 2056; Add test for legacy APIs)
         """
         self.mcast_device_memory = McastDeviceMemory(
             buf_size,
