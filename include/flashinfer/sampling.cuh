@@ -2071,6 +2071,446 @@ cudaError_t TopKMaskLogits(DType* logits, DType* masked_logits, IdType* top_k_ar
   });
 }
 
+// ==================== Multi-CTA Top-K Implementation ====================
+
+// Atomic min/max for float using CAS
+__device__ __forceinline__ float atomicMinFloat(float* addr, float value) {
+  int* addr_as_int = (int*)addr;
+  int old = *addr_as_int, assumed;
+
+  do {
+    assumed = old;
+    old = atomicCAS(addr_as_int, assumed, __float_as_int(fminf(value, __int_as_float(assumed))));
+  } while (assumed != old);
+
+  return __int_as_float(old);
+}
+
+__device__ __forceinline__ float atomicMaxFloat(float* addr, float value) {
+  int* addr_as_int = (int*)addr;
+  int old = *addr_as_int, assumed;
+
+  do {
+    assumed = old;
+    old = atomicCAS(addr_as_int, assumed, __float_as_int(fmaxf(value, __int_as_float(assumed))));
+  } while (assumed != old);
+
+  return __int_as_float(old);
+}
+
+// Acquire/Release primitives for inter-CTA synchronization
+__device__ __forceinline__ int ld_acquire(int* ptr) {
+  int state = 0;
+
+#if (__CUDA_ARCH__ >= 700)
+  // SM70 and newer use memory consistency qualifiers
+  // Acquire pattern using acquire modifier
+  asm volatile("ld.global.acquire.gpu.b32 %0, [%1];\n" : "=r"(state) : "l"(ptr));
+#else
+  asm volatile("ld.cg.global.b32 %0, [%1];\n" : "=r"(state) : "l"(ptr));
+#endif
+
+  return state;
+}
+
+__device__ __forceinline__ void red_release(int* ptr, int val) {
+#if (__CUDA_ARCH__ >= 700)
+  // SM70 and newer use memory consistency qualifiers
+  // Release pattern using acq_rel fence + relaxed modifier
+  // (The fence also releases data that was weakly-written by other threads prior to the last
+  // syncthreads)
+  asm volatile("fence.acq_rel.gpu;\n");
+  asm volatile("red.relaxed.gpu.global.add.s32 [%0], %1;\n" : : "l"(ptr), "r"(val));
+#else
+  __threadfence();
+  atomicAdd(ptr, val);
+#endif
+}
+
+__device__ __forceinline__ void st_release(int* ptr, int val) {
+#if (__CUDA_ARCH__ >= 700)
+  // SM70 and newer use memory consistency qualifiers
+  // Release pattern: fence + release store
+  asm volatile("fence.acq_rel.gpu;\n");
+  asm volatile("st.release.gpu.global.b32 [%0], %1;\n" : : "l"(ptr), "r"(val));
+#else
+  __threadfence();
+  atomicExch(ptr, val);
+#endif
+}
+
+// Wait until the value at ptr reaches target_val using acquire semantics
+// Only thread 0 spins, then all threads synchronize
+__device__ __forceinline__ void wait_ge(int* ptr, int target_val, int thread_idx) {
+  if (thread_idx == 0) {
+#pragma unroll 1
+    while (ld_acquire(ptr) < target_val) {
+    }
+  }
+  __syncthreads();
+}
+
+// Global state for multi-CTA reduction (one per row)
+template <typename T>
+struct RowReductionState {
+  // Ping-pong buffers for atomic reduction
+  int count_0_buf[2];
+  int count_1_buf[2];
+  T min_buf[2];
+  T max_buf[2];
+
+  // Arrival counter for acquire/release synchronization
+  int arrival_counter;
+};
+
+template <uint32_t BLOCK_THREADS, BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE,
+          typename DType, typename IdType>
+__global__ void __launch_bounds__(BLOCK_THREADS) TopKMaskLogitsKernel_MultiCTA(
+    DType* logits,         // [batch, vocab_size]
+    DType* masked_logits,  // [batch, vocab_size]
+    IdType* top_k_arr,     // [batch] or nullptr
+    uint32_t top_k_val, uint32_t vocab_size, uint32_t batch_size,
+    RowReductionState<float>* row_states,  // [num_groups], num_groups = gridDim.x / ctas_per_group
+    uint32_t chunk_size,                   // elements per CTA (must be multiple of VEC_SIZE)
+    uint32_t ctas_per_group)               // CTAs per row
+{
+  const uint32_t global_cta_id = blockIdx.x;
+  const uint32_t group_id = global_cta_id / ctas_per_group;
+  const uint32_t cta_in_group = global_cta_id % ctas_per_group;
+  const uint32_t tx = threadIdx.x;
+
+  // Shared memory layout: [temp_storage] [padding] [logits data (16-byte aligned)]
+  extern __shared__ uint8_t smem[];
+  auto* temp_storage = reinterpret_cast<RenormTempStorage<BLOCK_THREADS, REDUCE_ALGORITHM>*>(smem);
+
+  // Align logits to 16 bytes
+  size_t temp_storage_size = sizeof(RenormTempStorage<BLOCK_THREADS, REDUCE_ALGORITHM>);
+  size_t logits_offset = ((temp_storage_size + 15) / 16) * 16;
+  DType* shared_logits = reinterpret_cast<DType*>(smem + logits_offset);
+
+  // Note: arrival_counter and count buffers should be pre-initialized to zero on the host side
+
+  // Persistent iteration counter for double buffering (never resets across rows)
+  int persistent_iteration = 0;
+
+  // Calculate total number of iterations for persistent loop
+  uint32_t num_groups = gridDim.x / ctas_per_group;
+  uint32_t total_iterations = (batch_size + num_groups - 1) / num_groups;
+
+  int barrier_phase = 0;
+  // Each group uses its own state (groups process rows sequentially in persistent loop)
+  RowReductionState<float>* state = &row_states[group_id];
+
+  // Initialize min/max buffer for this row (first CTA only)
+  if (cta_in_group == 0 && tx == 0) {
+    state->min_buf[0] = cuda::std::numeric_limits<float>::max();
+    state->max_buf[0] = cuda::std::numeric_limits<float>::lowest();
+  }
+
+  // First barrier: ensure all CTAs see the initialized min/max values
+  if (tx == 0) {
+    red_release(&state->arrival_counter, 1);
+  }
+  int target = (barrier_phase + 1) * ctas_per_group;
+  wait_ge(&state->arrival_counter, target, tx);
+  barrier_phase++;
+
+  // Persistent loop over rows
+  for (uint32_t iter = 0; iter < total_iterations; iter++) {
+    uint32_t row_idx = group_id + iter * num_groups;
+
+    if (row_idx >= batch_size) break;  // Early exit if out of bounds
+
+    const uint32_t chunk_start = cta_in_group * chunk_size;
+    const uint32_t chunk_end = min(chunk_start + chunk_size, vocab_size);
+    const uint32_t actual_chunk_size = chunk_end - chunk_start;
+
+    uint32_t k = top_k_arr == nullptr ? top_k_val : top_k_arr[row_idx];
+
+    // ========== Stage 1: Load to shared memory ==========
+    vec_t<DType, VEC_SIZE> logits_vec;
+    const uint32_t aligned_size = (actual_chunk_size / VEC_SIZE) * VEC_SIZE;
+
+    // Vectorized load for aligned portion
+#pragma unroll 2
+    for (uint32_t i = tx * VEC_SIZE; i < aligned_size; i += BLOCK_THREADS * VEC_SIZE) {
+      logits_vec.cast_load(logits + row_idx * vocab_size + chunk_start + i);
+      logits_vec.store(shared_logits + i);
+    }
+
+    // Scalar load for tail (only for last CTA if vocab_size not aligned)
+    for (uint32_t i = aligned_size + tx; i < actual_chunk_size; i += BLOCK_THREADS) {
+      shared_logits[i] = logits[row_idx * vocab_size + chunk_start + i];
+    }
+    __syncthreads();
+
+    double pivot = -cuda::std::numeric_limits<float>::infinity();
+
+    if (k < vocab_size) {
+      // ========== Stage 2: Initialize - find global min/max ==========
+      float local_min = cuda::std::numeric_limits<float>::max();
+      float local_max = cuda::std::numeric_limits<float>::lowest();
+
+      // Vectorized min/max for aligned portion
+#pragma unroll 2
+      for (uint32_t i = tx * VEC_SIZE; i < aligned_size; i += BLOCK_THREADS * VEC_SIZE) {
+        logits_vec.load(shared_logits + i);
+#pragma unroll
+        for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+          float val = logits_vec[j];
+          local_min = min(local_min, val);
+          local_max = max(local_max, val);
+        }
+      }
+
+      // Scalar min/max for tail
+      for (uint32_t i = aligned_size + tx; i < actual_chunk_size; i += BLOCK_THREADS) {
+        float val = shared_logits[i];
+        local_min = min(local_min, val);
+        local_max = max(local_max, val);
+      }
+
+      // Block reduction
+      float block_min =
+          BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage->block_prim.reduce)
+              .Reduce(local_min, MinReduceOp{});
+      __syncthreads();
+
+      float block_max =
+          BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage->block_prim.reduce)
+              .Reduce(local_max, MaxReduceOp{});
+      __syncthreads();
+
+      // Atomic reduction to global state
+      if (tx == 0) {
+        atomicMinFloat(&state->min_buf[0], block_min);
+        atomicMaxFloat(&state->max_buf[0], block_max);
+
+        // Signal arrival using release semantics
+        red_release(&state->arrival_counter, 1);
+      }
+      int target = (barrier_phase + 1) * ctas_per_group;
+      wait_ge(&state->arrival_counter, target, tx);
+      barrier_phase++;
+
+      float global_min = state->min_buf[0];
+      float global_max = state->max_buf[0];
+
+      // ========== Stage 3: Binary search ==========
+      double low = (global_min == -cuda::std::numeric_limits<float>::infinity())
+                       ? cuda::std::numeric_limits<float>::lowest()
+                       : global_min - 1;
+      double high = global_max;
+      float min_gt_low, max_le_high;
+
+      do {
+        double pivot_0 = (high + 2 * low) / 3;
+        double pivot_1 = (2 * high + low) / 3;
+
+        // Local counting from shared memory
+        int local_count_0 = 0, local_count_1 = 0;
+        float local_min_gt_low = high, local_max_le_high = low;
+
+        // Vectorized counting for aligned portion
+#pragma unroll 2
+        for (uint32_t i = tx * VEC_SIZE; i < aligned_size; i += BLOCK_THREADS * VEC_SIZE) {
+          logits_vec.load(shared_logits + i);
+#pragma unroll
+          for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+            float val = logits_vec[j];
+            // Branchless counting
+            local_count_0 += (val > pivot_0);
+            local_count_1 += (val > pivot_1);
+            // Update min/max
+            if (val > low) local_min_gt_low = min(local_min_gt_low, val);
+            if (val <= high) local_max_le_high = max(local_max_le_high, val);
+          }
+        }
+
+        // Scalar counting for tail
+        for (uint32_t i = aligned_size + tx; i < actual_chunk_size; i += BLOCK_THREADS) {
+          float val = shared_logits[i];
+          local_count_0 += (val > pivot_0);
+          local_count_1 += (val > pivot_1);
+          if (val > low) local_min_gt_low = min(local_min_gt_low, val);
+          if (val <= high) local_max_le_high = max(local_max_le_high, val);
+        }
+
+        // Block reduction
+        int block_count_0 =
+            BlockReduce<int, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage->block_prim.reduce_int)
+                .Sum(local_count_0);
+        __syncthreads();
+
+        int block_count_1 =
+            BlockReduce<int, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage->block_prim.reduce_int)
+                .Sum(local_count_1);
+        __syncthreads();
+
+        float block_min_gt_low =
+            BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage->block_prim.reduce)
+                .Reduce(local_min_gt_low, MinReduceOp{});
+        __syncthreads();
+
+        float block_max_le_high =
+            BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage->block_prim.reduce)
+                .Reduce(local_max_le_high, MaxReduceOp{});
+        __syncthreads();
+
+        // Ping-pong buffer index (use persistent_iteration for double buffering)
+        int buffer_idx = persistent_iteration & 1;
+
+        // Atomic reduction to global state
+        if (tx == 0) {
+          atomicAdd(&state->count_0_buf[buffer_idx], block_count_0);
+          atomicAdd(&state->count_1_buf[buffer_idx], block_count_1);
+          atomicMinFloat(&state->min_buf[buffer_idx], block_min_gt_low);
+          atomicMaxFloat(&state->max_buf[buffer_idx], block_max_le_high);
+
+          // Signal arrival using release semantics
+          red_release(&state->arrival_counter, 1);
+
+          // Last CTA clears next buffer (no need to reset counter anymore)
+          if (cta_in_group == ctas_per_group - 1) {
+            int next_buf = (persistent_iteration + 1) & 1;
+            state->count_0_buf[next_buf] = 0;
+            state->count_1_buf[next_buf] = 0;
+            state->min_buf[next_buf] = cuda::std::numeric_limits<float>::max();
+            state->max_buf[next_buf] = cuda::std::numeric_limits<float>::lowest();
+          }
+        }
+        int target = (barrier_phase + 1) * ctas_per_group;
+        wait_ge(&state->arrival_counter, target, tx);
+        barrier_phase++;
+
+        // Read results from current buffer
+        int aggregate_gt_pivot_0 = state->count_0_buf[buffer_idx];
+        int aggregate_gt_pivot_1 = state->count_1_buf[buffer_idx];
+        min_gt_low = state->min_buf[buffer_idx];
+        max_le_high = state->max_buf[buffer_idx];
+
+        // Update search range
+        if (aggregate_gt_pivot_1 >= k) {
+          low = pivot_1;
+        } else if (aggregate_gt_pivot_0 >= k) {
+          low = pivot_0;
+          high = min(pivot_1, max_le_high);
+        } else {
+          high = min(pivot_0, max_le_high);
+        }
+
+        persistent_iteration++;
+
+      } while (min_gt_low != max_le_high);
+
+      pivot = low;
+    }
+
+    // ========== Stage 4: Masking ==========
+    // Vectorized masking for aligned portion
+#pragma unroll 2
+    for (uint32_t i = tx * VEC_SIZE; i < aligned_size; i += BLOCK_THREADS * VEC_SIZE) {
+      logits_vec.load(shared_logits + i);
+#pragma unroll
+      for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+        logits_vec[j] =
+            (logits_vec[j] > pivot) ? logits_vec[j] : -cuda::std::numeric_limits<float>::infinity();
+      }
+      logits_vec.store(masked_logits + row_idx * vocab_size + chunk_start + i);
+    }
+
+    // Scalar masking for tail
+    for (uint32_t i = aligned_size + tx; i < actual_chunk_size; i += BLOCK_THREADS) {
+      float val = shared_logits[i];
+      masked_logits[row_idx * vocab_size + chunk_start + i] =
+          (val > pivot) ? val : -cuda::std::numeric_limits<float>::infinity();
+    }
+  }
+
+  // Finalize: reset counter for this group to prepare for next kernel launch
+  // All iterations are done, safe to reset now
+  if (cta_in_group == 0 && tx == 0) {
+    st_release(&row_states[group_id].arrival_counter, 0);
+  }
+}
+
+template <typename DType, typename IdType>
+cudaError_t TopKMaskLogitsMultiCTA(DType* logits, DType* masked_logits, IdType* top_k_arr,
+                                   uint32_t batch_size, uint32_t top_k_val, uint32_t vocab_size,
+                                   RowReductionState<float>* row_states_buffer,
+                                   cudaStream_t stream = 0) {
+  const uint32_t vec_size = std::gcd(16 / sizeof(DType), vocab_size);
+
+  auto compute_capacity = GetCudaComputeCapability();
+  DISPATCH_COMPUTE_CAP_NUM_THREADS(compute_capacity, BLOCK_THREADS, {
+    DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
+      // Calculate aligned temp storage size
+      constexpr size_t temp_storage_size = sizeof(RenormTempStorage<BLOCK_THREADS, REDUCE_ALGO>);
+      constexpr size_t temp_storage_aligned = round_up(temp_storage_size, 16UL);
+
+      // Get device properties
+      int device;
+      FLASHINFER_CUDA_CALL(cudaGetDevice(&device));
+      int max_smem_per_block;
+      FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&max_smem_per_block,
+                                                  cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+
+      // Calculate max chunk size that fits in shared memory
+      // smem layout: [temp_storage_aligned] [chunk_size * sizeof(DType)]
+      const size_t available_for_logits = max_smem_per_block - temp_storage_aligned;
+      uint32_t max_chunk_elements = available_for_logits / sizeof(DType);
+
+      // Round down to multiple of VEC_SIZE
+      max_chunk_elements = round_down(max_chunk_elements, VEC_SIZE);
+
+      // Ensure minimum chunk size for vectorized access
+      constexpr uint32_t min_chunk_size = VEC_SIZE * BLOCK_THREADS;
+      max_chunk_elements = std::max(max_chunk_elements, min_chunk_size);
+
+      // Calculate how many CTAs needed per row
+      uint32_t ctas_per_group = ceil_div(vocab_size, max_chunk_elements);
+      uint32_t chunk_size = ceil_div(vocab_size, ctas_per_group);
+      // Round up chunk_size to multiple of VEC_SIZE
+      chunk_size = round_up(chunk_size, VEC_SIZE);
+      // Ensure minimum chunk size
+      chunk_size = std::max(chunk_size, min_chunk_size);
+
+      // Get number of SMs
+      int num_sms;
+      FLASHINFER_CUDA_CALL(
+          cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device));
+
+      // Calculate grid size (must be multiple of ctas_per_group, up to num_sms)
+      uint32_t num_groups = std::min(static_cast<uint32_t>(num_sms) / ctas_per_group, batch_size);
+      if (num_groups == 0) {
+        // vocab_size too large to fit in shared memory even with one chunk per SM
+        return cudaErrorInvalidConfiguration;
+      }
+      uint32_t total_ctas = num_groups * ctas_per_group;
+
+      // Calculate shared memory size
+      const uint32_t smem_size = temp_storage_aligned + chunk_size * sizeof(DType);
+
+      // Launch kernel
+      dim3 nblks(total_ctas);
+      dim3 nthrs(BLOCK_THREADS);
+      void* args[] = {&logits,     &masked_logits,     &top_k_arr,  &top_k_val,     &vocab_size,
+                      &batch_size, &row_states_buffer, &chunk_size, &ctas_per_group};
+
+      auto kernel =
+          TopKMaskLogitsKernel_MultiCTA<BLOCK_THREADS, REDUCE_ALGO, VEC_SIZE, DType, IdType>;
+
+      FLASHINFER_CUDA_CALL(
+          cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+
+      // Use regular kernel launch via cudaLaunchKernel API
+      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+
+      return cudaSuccess;
+    });
+  });
+}
+
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
           typename DType, typename IdType>
