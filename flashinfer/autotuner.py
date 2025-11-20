@@ -62,8 +62,8 @@ class DynamicTensorSpec:
         if self.tensor_initializers is None:
             self.tensor_initializers = [
                 lambda shapes, dtype, device: (
-                    torch.randn(shapes, device=device).to(dtype) * 10 - 5
-                )
+                    torch.rand(shapes, device=device) * 10 - 5
+                ).to(dtype)
                 for _ in range(len(self.input_idx))
             ]
 
