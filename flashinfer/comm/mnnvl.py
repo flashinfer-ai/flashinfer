@@ -131,9 +131,6 @@ def alloc_and_copy_to_cuda(host_ptr_array: List[int]) -> int:
     if not host_ptr_array:
         return None
 
-    for addr in host_ptr_array:
-        print(f"DEBUG: ptr_array: 0x{addr:x}")
-
     ArrayType = ctypes.c_uint64 * len(host_ptr_array)
     c_array = ArrayType(*host_ptr_array)
     size_in_bytes = ctypes.sizeof(c_array)
@@ -719,9 +716,6 @@ class McastDeviceMemory:
         if not hasattr(self, "is_multi_node"):
             return
 
-        if not self.is_multi_node:
-            return
-
         # Skip cleanup during Python finalization to avoid segfaults
         # Especially cause the CUDA context could be destroyed at this point.
         if sys.is_finalizing():
@@ -884,7 +878,6 @@ class McastDeviceMemory:
             all_shareable_uc_handles = self.comm_backend.allgather(local_shareable_uc_handle.data)
         else:
             # Implement the allgather logic with ipc socket
-            # TODO: Do we need to model ipc socket as a comm backend? My tenative answer is no as it is not able to perform bootstrap without other communicator's help.
             all_shareable_uc_handles = [None] * self.group_size
             for i in range(self.group_size):
                 self.comm_backend.barrier()
@@ -895,8 +888,6 @@ class McastDeviceMemory:
                 src_rank = (self.group_rank + self.group_size - i) % self.group_size
                 all_shareable_uc_handles[src_rank] = self._ipc_socket.recv_fd()
         cuda.cuCtxSynchronize()
-
-        print(f"[Rank {self.group_rank}] all_shareable_uc_handles: {all_shareable_uc_handles}")
 
         # Import remote handles
         for p in range(self.group_size):

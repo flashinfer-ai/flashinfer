@@ -51,14 +51,16 @@ def row_linear_residual_norm_fusion_forward(
         if enable_fusion:
             trtllm_mnnvl_ar.mpi_barrier()
 
-            output, residual_out = trtllm_mnnvl_ar.trtllm_mnnvl_fused_allreduce_rmsnorm(
-                input,
-                residual,
-                norm_weight,
-                workspace,
-                eps,
-                launch_with_pdl=use_pdl,
-                strategy=trtllm_mnnvl_ar.MNNVLAllreduceFusionStrategy.AUTO,
+            output, residual_out = (
+                trtllm_mnnvl_ar.trtllm_mnnvl_fused_allreduce_add_rmsnorm(
+                    input,
+                    residual,
+                    norm_weight,
+                    workspace,
+                    eps,
+                    launch_with_pdl=use_pdl,
+                    strategy=trtllm_mnnvl_ar.MNNVLAllreduceFusionStrategy.AUTO,
+                )
             )
 
             return output.view(shape), residual_out.view(shape)

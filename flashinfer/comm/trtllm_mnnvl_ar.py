@@ -11,6 +11,7 @@ from typing import Optional, Tuple
 from enum import Enum
 
 import torch
+from typing_extensions import deprecated
 
 from flashinfer.comm.mapping import Mapping
 
@@ -278,7 +279,7 @@ def trtllm_mnnvl_allreduce(
     return output
 
 
-def trtllm_mnnvl_fused_allreduce_rmsnorm(
+def trtllm_mnnvl_fused_allreduce_add_rmsnorm(
     input: torch.Tensor,
     residual_in: torch.Tensor,
     gamma: torch.Tensor,
@@ -289,10 +290,10 @@ def trtllm_mnnvl_fused_allreduce_rmsnorm(
     launch_with_pdl: bool = False,
     strategy: MNNVLAllreduceFusionStrategy = MNNVLAllreduceFusionStrategy.AUTO,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Performs MNNVL Allreduce + RMSNorm.
+    """Performs MNNVL Allreduce + Residual + RMSNorm.
 
     This function performs a multi-node all-reduce (sum) operation by first calling trtllm_mnnvl_allreduce on the shard_input.
-    After this, it performs RMSNorm on the all-reduced result, reading it directly from the multicast buffer.
+    After this, it performs residual addition and RMSNorm on the all-reduced result, reading it directly from the multicast buffer.
     Note: multicast buffer is the same as the unicast buffer for the current rank.
 
     Args:
@@ -307,8 +308,8 @@ def trtllm_mnnvl_fused_allreduce_rmsnorm(
         strategy: MNNVLAllreduceFusionStrategy. Internal heuristics will be used if not provided.
 
     Returns:
-        output: Normalized tensor [num_tokens, hidden_dim]
-        residual_out: Residual output tensor [num_tokens, hidden_dim]
+        output: Add-residual and normalized tensor [num_tokens, hidden_dim]
+        residual_out: Add-residual tensor [num_tokens, hidden_dim]
     """
 
     if epsilon is None:
@@ -347,10 +348,6 @@ def trtllm_mnnvl_fused_allreduce_rmsnorm(
         )
     )
 
-    print(
-        f"[Rank {workspace.rank}] workspace.mc_ptr: {workspace.mc_ptr}, workspace.uc_ptrs_dev: {workspace.uc_ptrs_dev}, workspace.uc_ptr_local: {workspace.uc_ptr_local}"
-    )
-
     module.trtllm_mnnvl_allreduce_fusion(
         input,
         workspace.mc_ptr,
@@ -369,3 +366,225 @@ def trtllm_mnnvl_fused_allreduce_rmsnorm(
         epsilon,
     )
     return output, residual_out
+
+
+# Legacy API that has been deprecated; Left for backward compatibility
+@deprecated(
+    "get_allreduce_mnnvl_workspace is deprecated, use MNNVLAllreduceFusionWorkspace class to manage the workspace instead"
+)
+def get_allreduce_mnnvl_workspace(
+    mapping: Mapping, dtype: torch.dtype, buffer_size_in_bytes: Optional[int] = None
+) -> Tuple[McastGPUBuffer, torch.Tensor, int]:
+    """Get workspace buffers needed for multi-node NVLink all-reduce operation.
+
+    This function allocates and initializes the workspace buffers required for performing
+    multi-node NVLink all-reduce operations. It creates:
+    1. A multicast GPU buffer for communication between nodes
+    2. A flags tensor to track buffer state
+    3. Maximum number of elements that can fit in the buffer
+
+    The buffer size is calculated to efficiently handle common hidden dimensions
+    (2048, 4096, 5120, 7168, 8192) by using their LCM of 286720.
+
+    Args:
+        mapping: Tensor parallel mapping configuration containing rank info
+        dtype: Data type of the tensors being reduced
+        buffer_size_in_bytes: Optional buffer size. Practically, assign this to 3 * 2 * dtype.itemsize * hidden_dim * max_tokens
+
+    Returns:
+        Tuple containing:
+        - McastGPUBuffer: Multicast buffer for inter-node communication
+        - torch.Tensor: Buffer flags tensor tracking state
+        - int: Maximum number of elements that can fit in buffer
+    """
+    # buffer shape: [3, 2, buffer_tokens, hidden_dim]
+    stride = 3 * 2 * dtype.itemsize
+    # LCM for hidden_dim: 2048, 4096, 5120, 7168, 8192 = 286720
+    # max_num_elements must be a multiple of 286720
+    lcm_hidden_dim = 286720
+    TARGET_WORKSPACE_SIZE_BYTES = (
+        buffer_size_in_bytes if buffer_size_in_bytes is not None else 12_000_000
+    )
+    buffer_size_in_bytes = math.ceil(
+        TARGET_WORKSPACE_SIZE_BYTES / (lcm_hidden_dim * stride)
+    ) * (lcm_hidden_dim * stride)
+
+    # Redirect to the new workspace allocation logic. The new kernel needs the new flag buffer layout.
+    workspace = MNNVLAllreduceFusionWorkspace(mapping, buffer_size_in_bytes)
+
+    mcast_buffer = workspace.mcast_buffer_handle
+    buffer_flags = workspace.buffer_flags
+    max_num_elements = workspace.buffer_size_bytes // stride
+
+    return (
+        mcast_buffer,
+        buffer_flags,
+        max_num_elements,
+    )
+
+
+@deprecated(
+    "trtllm_mnnvl_all_reduce is deprecated, use trtllm_mnnvl_allreduce instead. This function will be removed in the future."
+)
+def trtllm_mnnvl_all_reduce(
+    inp: torch.Tensor,
+    multicast_buffer_ptr: int,  # Pointer address as integer
+    buffer_ptrs_dev: int,  # Pointer address as integer
+    buffer_M: int,
+    buffer_flags_mnnvl: torch.Tensor,
+    nranks: int,
+    rank: int,
+    wait_for_results: bool,
+    launch_with_pdl: bool,
+    out: Optional[torch.Tensor] = None,
+) -> None:
+    """Perform a multi-node NVLink all-reduce operation across multiple GPUs.
+
+    This function performs an all-reduce (sum) operation using NVIDIA's multi-node NVLink (MNNVL)
+    technology to efficiently combine tensors across multiple GPUs and nodes.
+
+    There are 3 steps:
+    1. scatter each GPU's input shard to the right unicast buffer
+    2. perform all-reduce on each GPU
+    3. broadcast the result to all GPUs
+
+    Args:
+        inp: Local Input Shard
+        multicast_buffer_ptr: Pointer to the multicast buffer as an integer
+        buffer_ptrs_dev: Pointer to device buffer pointers as an integer
+        buffer_M: Maximum number of elements // hidden_dim
+        buffer_flags_mnnvl: Tensor containing buffer state flags
+        nranks: Total number of ranks participating in the all-reduce
+        rank: Current process rank
+        wait_for_results: If True, store the result to out
+        launch_with_pdl: If True, launch using Programmatic Dependent Launch
+        [Optional] out: Output tensor to store the result (required if wait_for_results is True)
+
+    """
+
+    if len(inp.shape) != 2:
+        raise ValueError(
+            f"The input tensor must be 2D, got {len(inp.shape)}D. The shape is {inp.shape}."
+        )
+
+    # buffer_M is no longer used in this kernel but let's keep this check for consistency in behavior.
+    if inp.shape[0] > buffer_M:
+        raise ValueError(
+            f"The number of tokens in the input tensor {inp.shape[0]} is greater than the buffer_M {buffer_M}. This is not supported. Please increase the workspace size, or decrease the amount of tokens to at most {buffer_M}."
+        )
+
+    # Even in legacy code, this should only be used when we implement the fused allreduce+rmsnorm.
+    assert wait_for_results and (out is not None), (
+        "Calling the legacy trtllm_mnnvl_all_reduce with wait_for_results=False is not supported. Please use trtllm_mnnvl_allreduce instead."
+    )
+    module = get_trtllm_mnnvl_comm_module()
+    module.trtllm_mnnvl_allreduce_fusion(
+        input,
+        multicast_buffer_ptr,
+        buffer_ptrs_dev,
+        0,  # Allreduce kernel itself does not use this local pointer; still this could be risky but it is only used for legacy code compatibility.
+        buffer_flags_mnnvl,
+        nranks,
+        rank,
+        False,  # No RMSNorm Fusion
+        launch_with_pdl,
+        False,  # Use two-shot
+        out,
+        None,
+        None,
+        None,
+        None,
+    )
+
+
+@deprecated(
+    "trtllm_mnnvl_fused_allreduce_rmsnorm is deprecated, use trtllm_mnnvl_fused_allreduce_add_rmsnorm instead. This function will be removed in the future."
+)
+def trtllm_mnnvl_fused_allreduce_rmsnorm(
+    prenorm_output: torch.Tensor,
+    normed_output: torch.Tensor,
+    shard_input: torch.Tensor,
+    multicast_buffer_ptr: int,  # Pointer address as integer
+    buffer_ptrs_dev: int,  # Pointer address as integer
+    unicast_ptr: int,  # Local unicast buffer pointer
+    buffer_M: int,
+    buffer_flags_mnnvl: torch.Tensor,
+    nranks: int,
+    rank: int,
+    gamma: torch.Tensor,
+    epsilon: float,
+    residual: torch.Tensor,
+    launch_with_pdl: bool,
+) -> None:
+    """Performs MNNVL TwoShot Allreduce + RMSNorm.
+
+    This function performs a multi-node all-reduce (sum) operation by first calling trtllm_mnnvl_all_reduce on the shard_input.
+    After this, it performs RMSNorm on the all-reduced result, reading it directly from the multicast buffer.
+    Note: multicast buffer is the same as the unicast buffer for the current rank.
+
+    Args:
+        prenorm_output: Output tensor for prenorm results
+        normed_output: Output tensor for normalized results
+        shard_input: Input tensor shard
+        multicast_buffer_ptr: Pointer address as integer for multicast buffer
+        buffer_ptrs_dev: Pointer address as integer for device buffer pointers
+        unicast_ptr: Pointer address as integer for unicast buffer
+        buffer_M: Maximum number of elements // hidden_dim
+        buffer_flags_mnnvl: Buffer flags for synchronization
+        nranks: Number of ranks in the tensor parallel group
+        rank: Current rank in the tensor parallel group
+        gamma: The gamma (norm weight) parameter for RMSNorm
+        epsilon: The epsilon parameter for RMSNorm
+        residual: The residual tensor to add
+        launch_with_pdl: Whether to launch with PDL
+
+    """
+    if len(shard_input.shape) != 2:
+        raise ValueError(
+            f"The input tensor must be 2D, got {len(shard_input.shape)}D. The shape is {shard_input.shape}."
+        )
+
+    # buffer_M is no longer used in this kernel but let's keep this check for consistency in behavior.
+    if shard_input.shape[0] > buffer_M:
+        raise ValueError(
+            f"The number of tokens in the input tensor {shard_input.shape[0]} is greater than the buffer_M {buffer_M}. This is not supported. Please increase the workspace size, or decrease the amount of tokens to at most {buffer_M}."
+        )
+
+    if len(residual.shape) != 2:
+        raise ValueError(
+            f"The residual input tensor must be 2D, got {len(residual.shape)}D. The shape is {residual.shape}."
+        )
+    if gamma.numel() != shard_input.shape[1]:
+        raise ValueError(
+            f"The gamma tensor must have the same number of elements as the hidden dimension, got {gamma.numel()} elements but expected {shard_input.shape[1]} elements."
+        )
+
+    if len(normed_output.shape) != 2:
+        raise ValueError(
+            f"The output tensor must be 2D, got {len(normed_output.shape)}D. The shape is {normed_output.shape}."
+        )
+
+    if len(prenorm_output.shape) != 2:
+        raise ValueError(
+            f"The prenorm output tensor must be 2D, got {len(prenorm_output.shape)}D. The shape is {prenorm_output.shape}."
+        )
+
+    module = get_trtllm_mnnvl_comm_module()
+
+    module.trtllm_mnnvl_allreduce_fusion(
+        shard_input,
+        multicast_buffer_ptr,
+        buffer_ptrs_dev,
+        unicast_ptr,
+        buffer_flags_mnnvl,
+        nranks,
+        rank,
+        True,  # RMSNorm Fusion
+        launch_with_pdl,
+        False,
+        normed_output,
+        prenorm_output,
+        residual,
+        gamma,
+        epsilon,
+    )
