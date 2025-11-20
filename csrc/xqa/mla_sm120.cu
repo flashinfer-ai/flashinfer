@@ -1554,16 +1554,18 @@ __launch_bounds__(32 * 4 * 3, 1) __cluster_dims__(cgaSize, 1, 1) void kernel_mha
     __grid_constant__ CUtensorMap const tensorMapQ,  // MhaIOHead[nbQHeads * totalNbInputTokens],
     __grid_constant__ CUtensorMap const tensorMapK,  // with box=64 for the least significant dim
     __grid_constant__ CUtensorMap const tensorMapV,  // with box=128 for the least significant dim
-    float const qScale,
+    float const qScale, float const* qScalePtr,
     OutputHead* __restrict__ const output,  // [totalNbIntputTokens][nbQHeads]
-    KVCacheList<usePagedKVCache> const cacheList, uint32_t const batchSize,
-    float kvCacheScale,  // Same scale for K and V cache. Used only for int8/fp8 KV cache.
+    KVCacheList<usePagedKVCache> const cacheList, uint32_t const batchSize, float kvCacheScale,
+    float const* kvScalePtr,  // Same scale for K and V cache. Used only for int8/fp8 KV cache.
     Vec<CgaXBuffer,
         nbProducerCtasPerCga>* __restrict__ const cgaXBuf,  // [totalNbInputTokens][maxNbSubSeq]
     uint32_t* __restrict__ const semaphores = nullptr,      // [totalNbInputTokens]
     PartialResult* __restrict__ const partialResults =
         nullptr)  // [totalNbInputTokens][maxNbSubSeq]
 {
+  float const qScaleValue = qScalePtr != nullptr ? *qScalePtr : qScale;
+  float const kvCacheScaleValue = kvScalePtr != nullptr ? *kvScalePtr : kvCacheScale;
   assert(blockDim.x == 32 * 12 && blockDim.y == 1 && blockDim.z == 1);
   extern __shared__ char smemBuf[];
   uint32_t const warpRank = makeWarpUniform(this_warp(), threadIdx.x / warp_size);
@@ -1594,8 +1596,9 @@ __launch_bounds__(32 * 4 * 3, 1) __cluster_dims__(cgaSize, 1, 1) void kernel_mha
   uint32_t const ctaRank = clusterCtaRank();
   bool const isProducer = (ctaRank < nbProducerCtasPerCga);
 
-  KernelArgs const args{tensorMapQ, tensorMapK,   tensorMapV, qScale,     output,        cacheList,
-                        batchSize,  kvCacheScale, cgaXBuf,    semaphores, partialResults};
+  KernelArgs const args{tensorMapQ, tensorMapK, tensorMapV,    qScaleValue,
+                        output,     cacheList,  batchSize,     kvCacheScaleValue,
+                        cgaXBuf,    semaphores, partialResults};
 
   if (isProducer) {
     Producer{args,
@@ -1654,13 +1657,13 @@ CUtensorMap makeTensorMapForQ(void const* addr, CUtensorMapDataType_enum dataTyp
 void launchMLA(
     cudaDeviceProp const& prop,
     uint32_t inputSeqLen,  // uniform for all requests and causal mask is assumed
-    float qScale, OutputHead* output, InputHead const* q,
+    float qScale, float const* qScalePtr, OutputHead* output, InputHead const* q,
     GMemCacheHead* kCacheVLLM,                // K cache pool for VLLM layout
     GMemCacheHead* vCacheVLLM,                // V cache pool for VLLM layout
     KVCachePageIndex const* kvCachePageList,  // device pointer. shape:
                                               // [batchSize][maxNbPagesPerSeq] (Layout 1)
-    uint32_t maxSeqLen, uint32_t const* seqLen, uint32_t batchSize,
-    float kvCacheScale,  // Same scale for K and V cache. Used only for int8/fp8 KV cache.
+    uint32_t maxSeqLen, uint32_t const* seqLen, uint32_t batchSize, float kvCacheScale,
+    float const* kvScalePtr,  // Same scale for K and V cache. Used only for int8/fp8 KV cache.
     uint32_t* semaphores, void* scratch, bool enable_pdl, uint64_t kv_stride_page,
     uint64_t kv_stride_token, uint64_t kv_stride_head, cudaStream_t stream) {
 #if IS_MLA
@@ -1727,9 +1730,9 @@ void launchMLA(
   uint32_t const nbCgas = exactDiv(dimGrid.x, 4) * dimGrid.y * dimGrid.z;
   auto const cgaXBuf = static_cast<Vec<CgaXBuffer, nbProducerCtasPerCga>*>(scratch);
   auto const partialResults = reinterpret_cast<PartialResult*>(cgaXBuf + nbCgas);
-  cudaError_t const err = cudaLaunchKernelEx(&launchCfg, &kernel_mha, tensorMapQ, tensorMapK,
-                                             tensorMapV, qScale, output, cacheList, batchSize,
-                                             kvCacheScale, cgaXBuf, semaphores, partialResults);
+  cudaError_t const err = cudaLaunchKernelEx(
+      &launchCfg, &kernel_mha, tensorMapQ, tensorMapK, tensorMapV, qScale, qScalePtr, output,
+      cacheList, batchSize, kvCacheScale, kvScalePtr, cgaXBuf, semaphores, partialResults);
 #else
   KVCacheList<false> const cacheList{kvCacheData, seqLen, maxSeqLen};
   static_assert(!usePagedKVCache);
@@ -1775,13 +1778,13 @@ static uint32_t const hostSmemSize = configureKernel();
 void launchMLAFlashInfer(
     uint32_t multiProcessorCount,
     uint32_t inputSeqLen,  // uniform for all requests and causal mask is assumed
-    float qScale, OutputHead* output, InputHead const* q,
+    float qScale, float const* qScalePtr, OutputHead* output, InputHead const* q,
     GMemCacheHead* kCacheVLLM,                // K cache pool for VLLM layout
     GMemCacheHead* vCacheVLLM,                // V cache pool for VLLM layout
     KVCachePageIndex const* kvCachePageList,  // device pointer. shape:
                                               // [batchSize][maxNbPagesPerSeq] (Layout 1)
-    uint32_t maxSeqLen, uint32_t const* seqLen, uint32_t batchSize,
-    float kvCacheScale,  // Same scale for K and V cache. Used only for int8/fp8 KV cache.
+    uint32_t maxSeqLen, uint32_t const* seqLen, uint32_t batchSize, float kvCacheScale,
+    float const* kvScalePtr,  // Same scale for K and V cache. Used only for int8/fp8 KV cache.
     uint32_t* semaphores, void* scratch, bool enable_pdl, uint64_t kv_stride_page,
     uint64_t kv_stride_token, uint64_t kv_stride_head, cudaStream_t stream) {
 #if IS_MLA
@@ -1834,9 +1837,9 @@ void launchMLAFlashInfer(
   uint32_t const nbCgas = exactDiv(dimGrid.x, 4) * dimGrid.y * dimGrid.z;
   auto const cgaXBuf = static_cast<Vec<CgaXBuffer, nbProducerCtasPerCga>*>(scratch);
   auto const partialResults = reinterpret_cast<PartialResult*>(cgaXBuf + nbCgas);
-  cudaError_t const err = cudaLaunchKernelEx(&launchCfg, &kernel_mha, tensorMapQ, tensorMapK,
-                                             tensorMapV, qScale, output, cacheList, batchSize,
-                                             kvCacheScale, cgaXBuf, semaphores, partialResults);
+  cudaError_t const err = cudaLaunchKernelEx(
+      &launchCfg, &kernel_mha, tensorMapQ, tensorMapK, tensorMapV, qScale, qScalePtr, output,
+      cacheList, batchSize, kvCacheScale, kvScalePtr, cgaXBuf, semaphores, partialResults);
   checkCuda(err);
 #endif
 }
