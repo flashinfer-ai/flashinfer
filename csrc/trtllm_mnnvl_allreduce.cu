@@ -53,11 +53,18 @@ void trtllm_mnnvl_allreduce_fusion(TensorView input, int64_t multicast_buffer_pt
         << "nranks must be between 2 and 64, got " << nranks;
     TVM_FFI_ICHECK(rank >= 0 && rank < nranks)
         << "rank must be between 0 and nranks-1, got " << rank;
-    TVM_FFI_ICHECK((residual_out.has_value() && gamma.has_value() && epsilon.has_value()) ||
+    TVM_FFI_ICHECK((residual_in.has_value() && residual_out.has_value() && gamma.has_value() &&
+                    epsilon.has_value()) ||
                    !rmsnorm_fusion)
-        << "residual_out, gamma, and epsilon must be provided if rmsnorm_fusion is true";
+        << "residual_in, residual_out, gamma, and epsilon must be provided if rmsnorm_fusion is "
+           "true";
 
     if (rmsnorm_fusion) {
+      TVM_FFI_ICHECK(residual_in.value().size(0) == num_tokens &&
+                     residual_in.value().size(1) == token_dim)
+          << "residual_in shape mismatch: expected (" << input.size(0) << ", " << input.size(1)
+          << ") but got (" << residual_in.value().size(0) << ", " << residual_in.value().size(1)
+          << ")";
       TVM_FFI_ICHECK(residual_out.value().size(0) == num_tokens &&
                      residual_out.value().size(1) == token_dim)
           << "residual_out shape mismatch: expected (" << input.size(0) << ", " << input.size(1)

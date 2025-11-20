@@ -1,6 +1,6 @@
 # Check torch version:
 import traceback
-from typing import Tuple
+from typing import Tuple, Optional
 
 import pytest
 import torch
@@ -286,7 +286,7 @@ def run_mnnvl_ar_full(
     fusion: bool,
     dtype: torch.dtype,
     hidden_size: int,
-    legacy_explicit_workspace_bytes: int = None,
+    legacy_explicit_workspace_bytes: Optional[int] = None,
     legacy_api: bool = False,
 ):
     """Core test logic for MNNVL AllReduce operations.

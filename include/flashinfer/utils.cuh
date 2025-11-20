@@ -21,6 +21,7 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
+#include <atomic>
 #include <cstdint>
 #include <iostream>
 #include <type_traits>
@@ -335,16 +336,20 @@ inline std::pair<int, int> GetCudaComputeCapability() {
   return std::make_pair(major, minor);
 }
 
+// This function is thread-safe and cached the sm_count.
+// But it will only check the current CUDA device, thus assuming each process handles single GPU.
 inline int GetCudaMultiProcessorCount() {
-  static int sm_count = 0;
-  if (sm_count == 0) {
+  static std::atomic<int> sm_count{0};
+  int cached = sm_count.load(std::memory_order_relaxed);
+  if (cached == 0) {
     int device_id;
     cudaGetDevice(&device_id);
     cudaDeviceProp device_prop;
     cudaGetDeviceProperties(&device_prop, device_id);
-    sm_count = device_prop.multiProcessorCount;
+    cached = device_prop.multiProcessorCount;
+    sm_count.store(cached, std::memory_order_relaxed);
   }
-  return sm_count;
+  return cached;
 }
 
 template <typename T>

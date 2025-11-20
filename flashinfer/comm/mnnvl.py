@@ -716,6 +716,9 @@ class McastDeviceMemory:
         if not hasattr(self, "is_multi_node"):
             return
 
+        if hasattr(self, "_ipc_socket"):
+            self._ipc_socket.close()
+
         # Skip cleanup during Python finalization to avoid segfaults
         # Especially cause the CUDA context could be destroyed at this point.
         if sys.is_finalizing():
@@ -864,7 +867,7 @@ class McastDeviceMemory:
         # Allocate local GPU memory
         self.uc_handles[self.group_rank] = checkCudaErrors(cuda.cuMemCreate(self.allocation_size, allocation_prop, 0))
 
-        # Export local handle to fabric handle
+        # Export local handle to fabric handle or FD
         local_shareable_uc_handle = checkCudaErrors(
             cuda.cuMemExportToShareableHandle(
                 self.uc_handles[self.group_rank],
@@ -898,6 +901,12 @@ class McastDeviceMemory:
                         self._shareable_handle_type,
                     )
                 )
+                if (
+                    self._shareable_handle_type
+                    == cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+                ):
+                    # Close FD after import
+                    os.close(all_shareable_uc_handles[p])
 
         # Initialize multicasting
         if self.group_rank == 0:
@@ -943,7 +952,12 @@ class McastDeviceMemory:
                     self._shareable_handle_type,
                 )
             )
-
+        if (
+            self._shareable_handle_type
+            == cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+        ):
+            # Close FD after import
+            os.close(shareable_mc_handle)
         # Add device to multicast
         checkCudaErrors(cuda.cuMulticastAddDevice(self.mc_handle, self.device_idx))
 
