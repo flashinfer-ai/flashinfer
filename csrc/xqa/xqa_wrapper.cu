@@ -20,41 +20,54 @@
 using tvm::ffi::Optional;
 
 #if MLA_WRAPPER
-void xqa_wrapper_mla(int64_t multiProcessorCount, double qScale, TensorView output, TensorView q,
-                     TensorView kCacheVLLM, TensorView vCacheVLLM, TensorView kvCachePageList,
-                     int64_t maxSeqLen, TensorView seqLen, int64_t batchSize, double kvCacheScale,
+void xqa_wrapper_mla(int64_t multiProcessorCount, double qScale, Optional<TensorView> qScaleTensor,
+                     TensorView output, TensorView q, TensorView kCacheVLLM, TensorView vCacheVLLM,
+                     TensorView kvCachePageList, int64_t maxSeqLen, TensorView seqLen,
+                     int64_t batchSize, double kvCacheScale, Optional<TensorView> kvScaleTensor,
                      TensorView semaphores, TensorView scratch, bool enable_pdl) {
   auto stream = get_stream(output.device());
-
+  float const* qScalePtr = qScaleTensor.has_value()
+                               ? reinterpret_cast<float const*>(qScaleTensor.value().data_ptr())
+                               : nullptr;
+  float const* kvScalePtr = kvScaleTensor.has_value()
+                                ? reinterpret_cast<float const*>(kvScaleTensor.value().data_ptr())
+                                : nullptr;
   // Extract strides from TensorView (in elements, not bytes)
   uint64_t kv_stride_page = kCacheVLLM.stride(0);
   uint64_t kv_stride_token = kCacheVLLM.stride(-2);
   uint64_t kv_stride_head = kCacheVLLM.stride(-3);
 
-  launchMLAFlashInfer(multiProcessorCount, 1, qScale,
+  launchMLAFlashInfer(multiProcessorCount, 1, qScale, qScalePtr,
                       reinterpret_cast<OutputHead*>(output.data_ptr()),
                       reinterpret_cast<InputHead const*>(q.data_ptr()),
                       reinterpret_cast<GMemCacheHead*>(kCacheVLLM.data_ptr()),
                       reinterpret_cast<GMemCacheHead*>(vCacheVLLM.data_ptr()),
                       reinterpret_cast<KVCachePageIndex const*>(kvCachePageList.data_ptr()),
                       maxSeqLen, reinterpret_cast<uint32_t const*>(seqLen.data_ptr()), batchSize,
-                      kvCacheScale, reinterpret_cast<uint32_t*>(semaphores.data_ptr()),
+                      kvCacheScale, kvScalePtr, reinterpret_cast<uint32_t*>(semaphores.data_ptr()),
                       reinterpret_cast<void*>(scratch.data_ptr()), enable_pdl, kv_stride_page,
                       kv_stride_token, kv_stride_head, stream);
 }
 #else
 
 void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbKHeads,
-                 int64_t slidingWinSize, double qScale, TensorView output, double rcpOutScale,
-                 TensorView q, Optional<TensorView> attentionSinks, TensorView kCacheVLLM,
-                 TensorView vCacheVLLM, TensorView kvCachePageList, int64_t maxSeqLen,
-                 TensorView seqLen, int64_t batchSize, double kvCacheScale, int64_t qSeqLen,
-                 Optional<TensorView> mask, TensorView semaphores, TensorView scratch,
-                 bool enable_pdl) {
+                 int64_t slidingWinSize, double qScale, Optional<TensorView> qScaleTensor,
+                 TensorView output, double rcpOutScale, TensorView q,
+                 Optional<TensorView> attentionSinks, TensorView kCacheVLLM, TensorView vCacheVLLM,
+                 TensorView kvCachePageList, int64_t maxSeqLen, TensorView seqLen,
+                 int64_t batchSize, double kvCacheScale, Optional<TensorView> kvScaleTensor,
+                 int64_t qSeqLen, Optional<TensorView> mask, TensorView semaphores,
+                 TensorView scratch, bool enable_pdl) {
   auto stream = get_stream(output.device());
   float const* attentionSinksPtr =
       attentionSinks.has_value() ? reinterpret_cast<float const*>(attentionSinks.value().data_ptr())
                                  : nullptr;
+  float const* qScalePtr = qScaleTensor.has_value()
+                               ? reinterpret_cast<float const*>(qScaleTensor.value().data_ptr())
+                               : nullptr;
+  float const* kvScalePtr = kvScaleTensor.has_value()
+                                ? reinterpret_cast<float const*>(kvScaleTensor.value().data_ptr())
+                                : nullptr;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 900
   auto const mha_func = run_sm90_fp8_mha ? &launchHopperF8MHAFlashInfer : &launchMHAFlashInfer;
 #else
@@ -71,7 +84,7 @@ void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbK
       mask.has_value() ? reinterpret_cast<MaskType const*>(mask.value().data_ptr()) : nullptr;
 #endif
 
-  mha_func(multiProcessorCount, nbKHeads, slidingWinSize, qScale,
+  mha_func(multiProcessorCount, nbKHeads, slidingWinSize, qScale, qScalePtr,
            reinterpret_cast<OutputHead*>(output.data_ptr()),
 #if LOW_PREC_OUTPUT
            rcpOutScale,
@@ -81,6 +94,7 @@ void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbK
            reinterpret_cast<GMemCacheHead*>(vCacheVLLM.data_ptr()),
            reinterpret_cast<KVCachePageIndex const*>(kvCachePageList.data_ptr()), maxSeqLen,
            reinterpret_cast<uint32_t const*>(seqLen.data_ptr()), batchSize, kvCacheScale,
+           kvScalePtr,
 #if SPEC_DEC
            qSeqLen, nullptr, maskPtr,
 #endif

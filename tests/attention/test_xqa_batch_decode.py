@@ -75,8 +75,8 @@ def create_kv_cache(
 ):
     # Create separate K and V caches with specified layout (NHD or HND)
     max_seq_len = torch.max(seq_lens).item()
-    num_tokens = max_seq_len * batch_size
-    num_pages = (num_tokens + page_size - 1) // page_size
+    num_pages_per_seq = (max_seq_len + page_size - 1) // page_size
+    num_pages = num_pages_per_seq * batch_size
     ref_kv_dtype_torch = DTYPE_MAP[ref_kv_dtype]
     if kv_dtype != "fp8":
         assert kv_dtype == ref_kv_dtype, (
