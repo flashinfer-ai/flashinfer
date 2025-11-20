@@ -275,6 +275,8 @@ def trtllm_mnnvl_allreduce(
         None,
     )
 
+    return output
+
 
 def trtllm_mnnvl_fused_allreduce_rmsnorm(
     input: torch.Tensor,

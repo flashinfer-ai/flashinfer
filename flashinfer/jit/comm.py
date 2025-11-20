@@ -36,7 +36,6 @@ def gen_trtllm_mnnvl_comm_module() -> JitSpec:
         [
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_mnnvl_allreduce.cu",
         ],
-        extra_cuda_cflags=["-lineinfo"],
     )
 
 
