@@ -1114,7 +1114,6 @@ def _check_cudnn_fp4_availability():
 
 def _is_cublas_fp4_available_in_cudnn():
     """Check if cuBLAS backend for FP4 GEMM is available in cuDNN."""
-    _check_cudnn_availability()
 
     # Check cuDNN backend version for FP4 support (requires cudnn_version == 9.11.1 or cudnn_version >= 9.13)
     backend_version = cudnn.backend_version()
@@ -1166,7 +1165,6 @@ def create_cudnn_execution_plans_fp4_gemm(
     alpha_is_not_none,
     use_nvfp4,
 ):
-    _check_cudnn_availability()
     stream = torch.cuda.current_stream(device)
     with cudnn.graph(_get_cudnn_handle(stream)) as (graph, _):
         scale_type = cudnn.data_type.FP8_E4M3 if use_nvfp4 else cudnn.data_type.FP8_E8M0
@@ -1269,6 +1267,7 @@ def build_plans_cudnn_fp4_gemm_graph(
     use_nvfp4,
     tactic: int = -1,
 ):
+    # Graph should have been already cached, when we ran _cudnn_gemm_fp4_requirement
     graph = create_cudnn_execution_plans_fp4_gemm(
         a_shape,
         a_stride,
@@ -1674,7 +1673,6 @@ def _get_cudnn_fp4_gemm_graph(
     use_nvfp4: bool = True,
     tactic: int = -1,
 ):
-    _check_cudnn_availability()
     # the fp4 cudnn graph will be shared for both mm and bmm, so
     # here we need to get the 3d shape and stride including the
     # batch dimension for both input and block scale tensors.
@@ -1689,6 +1687,7 @@ def _get_cudnn_fp4_gemm_graph(
     )
 
     # build the fp4 cudnn graph
+    # Constructed graph is cached, via @functools.cache decorator.
     graph = build_plans_cudnn_fp4_gemm_graph(
         real_a_shape,
         real_a_stride,
@@ -1722,6 +1721,7 @@ def _cudnn_gemm_fp4(
     workspace_buffer: torch.Tensor = None,
     tactic: int = -1,
 ):
+    # Graph should have been already cached, when we ran _cudnn_gemm_fp4_requirement
     graph = _get_cudnn_fp4_gemm_graph(
         a=a,
         b=b,
@@ -1748,7 +1748,6 @@ def _cudnn_gemm_fp4_runner():
             profile: OptimizationProfile,
         ) -> List[int]:
             # cudnn has heuristic for fp4 gemm, so we only need to use the default tactic
-            _check_cudnn_availability()
             (
                 a,
                 b,
@@ -1762,6 +1761,7 @@ def _cudnn_gemm_fp4_runner():
                 workspace_buffer,
             ) = inputs
 
+            # Graph should have been already cached, when we ran _cudnn_gemm_fp4_requirement
             graph = _get_cudnn_fp4_gemm_graph(
                 a=a,
                 b=b,
@@ -1821,10 +1821,10 @@ def _check_mm_fp4_problem_size(
     b_descale: torch.Tensor,
     alpha: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
-    out: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,  # unused
     block_size: int = 16,
-    use_8x4_sf_layout: bool = False,
-    backend: Literal["cudnn", "trtllm", "cutlass", "auto"] = "auto",
+    use_8x4_sf_layout: bool = False,  # unused
+    backend: Literal["cudnn", "trtllm", "cutlass", "auto"] = "auto",  # unused
     use_nvfp4: bool = True,
 ):
     # Generic checks
@@ -1878,10 +1878,10 @@ def _cudnn_gemm_fp4_requirement(
     b_descale: torch.Tensor,
     alpha: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
-    out: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,  # unused
     block_size: int = 16,
     use_8x4_sf_layout: bool = False,
-    backend: Literal["cudnn", "trtllm", "cutlass", "auto"] = "auto",
+    backend: Literal["cudnn", "trtllm", "cutlass", "auto"] = "auto",  # unused
     use_nvfp4: bool = True,
 ):
     if use_8x4_sf_layout:
@@ -1908,7 +1908,8 @@ def _cudnn_gemm_fp4_requirement(
         _expand_block_scale_tensor_shape(b_descale, batch)
     )
 
-    # build the fp4 cudnn graph
+    # build the fp4 cudnn graph. This graph will be cached & reused in mm_fp4()
+    # because the graph is constructed with @functools.cache decorator
     graph = create_cudnn_execution_plans_fp4_gemm(
         real_a_shape,
         real_a_stride,
@@ -1932,16 +1933,16 @@ def _cudnn_gemm_fp4_requirement(
 
 @supported_compute_capability([100, 103])
 def _trtllm_gemm_fp4_requirement(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    a_descale: torch.Tensor,
-    b_descale: torch.Tensor,
-    alpha: Optional[torch.Tensor] = None,
+    a: torch.Tensor,  # unused
+    b: torch.Tensor,  # unused
+    a_descale: torch.Tensor,  # unused
+    b_descale: torch.Tensor,  # unused
+    alpha: Optional[torch.Tensor] = None,  # unused
     out_dtype: torch.dtype = torch.bfloat16,
-    out: Optional[torch.Tensor] = None,
-    block_size: int = 16,
-    use_8x4_sf_layout: bool = False,
-    backend: Literal["cudnn", "trtllm", "cutlass", "auto"] = "auto",
+    out: Optional[torch.Tensor] = None,  # unused
+    block_size: int = 16,  # unused
+    use_8x4_sf_layout: bool = False,  # unused
+    backend: Literal["cudnn", "trtllm", "cutlass", "auto"] = "auto",  # unused
     use_nvfp4: bool = True,
 ):
     if not use_nvfp4:
@@ -1956,16 +1957,16 @@ def _trtllm_gemm_fp4_requirement(
 
 @supported_compute_capability([100, 103, 110, 120, 121])
 def _cutlass_gemm_fp4_requirement(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    a_descale: torch.Tensor,
-    b_descale: torch.Tensor,
-    alpha: Optional[torch.Tensor] = None,
-    out_dtype: torch.dtype = torch.bfloat16,
-    out: Optional[torch.Tensor] = None,
-    block_size: int = 16,
+    a: torch.Tensor,  # unused
+    b: torch.Tensor,  # unused
+    a_descale: torch.Tensor,  # unused
+    b_descale: torch.Tensor,  # unused
+    alpha: Optional[torch.Tensor] = None,  # unused
+    out_dtype: torch.dtype = torch.bfloat16,  # unused
+    out: Optional[torch.Tensor] = None,  # unused
+    block_size: int = 16,  # unused
     use_8x4_sf_layout: bool = False,
-    backend: Literal["cudnn", "trtllm", "cutlass", "auto"] = "auto",
+    backend: Literal["cudnn", "trtllm", "cutlass", "auto"] = "auto",  # unused
     use_nvfp4: bool = True,
 ):
     if use_8x4_sf_layout:
