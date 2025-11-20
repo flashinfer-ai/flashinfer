@@ -562,7 +562,12 @@ def test_moe_a2a_dispatch(ep_size, all_num_tokens, top_k):
         )
     except Exception as e:
         traceback.print_exc()
+        comm.allgather(e)
         raise e
+
+    exceptions = comm.allgather(None)
+    if any(exceptions):
+        raise filter(lambda x: x is not None, exceptions)[0]
 
     # Gather results from all ranks
     all_results = comm.allgather(result)
@@ -638,111 +643,131 @@ def test_moe_a2a_dispatch_moe_combine(ep_size, all_num_tokens, top_k):
     num_experts_per_rank = 8
     workspace_size_per_rank = 512 * 1024 * 1024
 
-    mapping = Mapping(
-        rank=rank,
-        moe_ep_size=world_size,
-        tp_size=world_size,
-        world_size=world_size,
-    )
+    try:
+        mapping = Mapping(
+            rank=rank,
+            moe_ep_size=world_size,
+            tp_size=world_size,
+            world_size=world_size,
+        )
 
-    local_num_tokens = all_num_tokens[rank]
-    max_num_tokens = max(all_num_tokens)
+        local_num_tokens = all_num_tokens[rank]
+        max_num_tokens = max(all_num_tokens)
 
-    # Generate inputs
-    token_selected_experts = generate_token_selected_experts(
-        local_num_tokens, ep_size, num_experts_per_rank, top_k
-    )
+        # Generate inputs
+        token_selected_experts = generate_token_selected_experts(
+            local_num_tokens, ep_size, num_experts_per_rank, top_k
+        )
 
-    payloads, expert_id_payload_index = make_bfloat16_payloads(
-        local_num_tokens, hidden_size, top_k, rank, token_selected_experts
-    )
+        payloads, expert_id_payload_index = make_bfloat16_payloads(
+            local_num_tokens, hidden_size, top_k, rank, token_selected_experts
+        )
 
-    hidden_states = payloads[0]
-    token_final_scales = payloads[2]
+        hidden_states = payloads[0]
+        token_final_scales = payloads[2]
 
-    # Compute reference (single-GPU MoE)
-    all_experts = torch.cat(
-        [
-            create_experts(
-                num_experts_per_rank, hidden_size, r, "cuda", dtype=torch.bfloat16
-            )
-            for r in range(ep_size)
-        ],
-        dim=0,
-    )
+        # Compute reference (single-GPU MoE)
+        all_experts = torch.cat(
+            [
+                create_experts(
+                    num_experts_per_rank, hidden_size, r, "cuda", dtype=torch.bfloat16
+                )
+                for r in range(ep_size)
+            ],
+            dim=0,
+        )
 
-    rank_experts = create_experts(
-        num_experts_per_rank, hidden_size, rank, "cuda", dtype=torch.bfloat16
-    )
+        rank_experts = create_experts(
+            num_experts_per_rank, hidden_size, rank, "cuda", dtype=torch.bfloat16
+        )
 
-    reference_output = fake_moe(
-        hidden_states,
-        token_selected_experts,
-        token_final_scales,
-        all_experts,
-        is_ep=False,
-    )
+        reference_output = fake_moe(
+            hidden_states,
+            token_selected_experts,
+            token_final_scales,
+            all_experts,
+            is_ep=False,
+        )
 
-    torch.cuda.synchronize()
+        torch.cuda.synchronize()
 
-    # Initialize MoeAlltoAll
-    MoeAlltoAll._WORKSPACE = None
-    moe_a2a = MoeAlltoAll(
-        mapping=mapping,
-        max_num_tokens=max_num_tokens,
-        top_k=top_k,
-        num_experts=ep_size * num_experts_per_rank,
-        workspace_size_per_rank=workspace_size_per_rank,
-    )
+        # Initialize MoeAlltoAll
+        MoeAlltoAll._WORKSPACE = None
+        moe_a2a = MoeAlltoAll(
+            mapping=mapping,
+            max_num_tokens=max_num_tokens,
+            top_k=top_k,
+            num_experts=ep_size * num_experts_per_rank,
+            workspace_size_per_rank=workspace_size_per_rank,
+        )
 
-    # Dispatch
-    recv_tensors = moe_a2a.dispatch(
-        token_selected_experts=token_selected_experts,
-        input_payloads=payloads,
-        runtime_max_tokens_per_rank=max_num_tokens,
-    )
+        # Dispatch
+        recv_tensors = moe_a2a.dispatch(
+            token_selected_experts=token_selected_experts,
+            input_payloads=payloads,
+            runtime_max_tokens_per_rank=max_num_tokens,
+        )
 
-    # Unpack received tensors
-    hidden_states_recv = recv_tensors[0]  # [ep_size, max_tokens, hidden_size]
-    token_selected_experts_recv = recv_tensors[1]  # [ep_size, max_tokens, top_k]
-    token_final_scales_recv = recv_tensors[2]  # [ep_size, max_tokens, top_k]
+        # Unpack received tensors
+        hidden_states_recv = recv_tensors[0]  # [ep_size, max_tokens, hidden_size]
+        token_selected_experts_recv = recv_tensors[1]  # [ep_size, max_tokens, top_k]
+        token_final_scales_recv = recv_tensors[2]  # [ep_size, max_tokens, top_k]
 
-    # Get workspace-backed tensor for output
-    moe_output = moe_a2a.get_combine_payload_tensor_in_workspace(
-        runtime_max_tokens_per_rank=max_num_tokens,
-        hidden_size=hidden_size,
-        dtype=torch.bfloat16,
-    )
-    moe_output.zero_()
+        # Get workspace-backed tensor for output
+        moe_output = moe_a2a.get_combine_payload_tensor_in_workspace(
+            runtime_max_tokens_per_rank=max_num_tokens,
+            hidden_size=hidden_size,
+            dtype=torch.bfloat16,
+        )
+        moe_output.zero_()
 
-    # Process each rank's tokens with local experts
-    moe_output.copy_(
-        fake_moe(
-            hidden_states_recv.view(
-                ep_size * max_num_tokens, hidden_states_recv.shape[-1]
-            ),
-            token_selected_experts_recv.view(
-                ep_size * max_num_tokens, token_selected_experts_recv.shape[-1]
-            ),
-            token_final_scales_recv.view(
-                ep_size * max_num_tokens, token_final_scales_recv.shape[-1]
-            ),
-            rank_experts,  # experts for current rank
-            is_ep=True,
-            ep_rank=rank,
-            num_experts_per_rank=num_experts_per_rank,
-        ).view(ep_size, max_num_tokens, hidden_size)
-    )
+        # Process each rank's tokens with local experts
+        moe_output.copy_(
+            fake_moe(
+                hidden_states_recv.view(
+                    ep_size * max_num_tokens, hidden_states_recv.shape[-1]
+                ),
+                token_selected_experts_recv.view(
+                    ep_size * max_num_tokens, token_selected_experts_recv.shape[-1]
+                ),
+                token_final_scales_recv.view(
+                    ep_size * max_num_tokens, token_final_scales_recv.shape[-1]
+                ),
+                rank_experts,  # experts for current rank
+                is_ep=True,
+                ep_rank=rank,
+                num_experts_per_rank=num_experts_per_rank,
+            ).view(ep_size, max_num_tokens, hidden_size)
+        )
+    except Exception as e:
+        traceback.print_exc()
+        comm.allgather(e)
+        raise e
 
-    # Combine
-    combined_output = moe_a2a.combine(
-        payload=moe_output,
-        runtime_max_tokens_per_rank=max_num_tokens,
-        payload_in_workspace=True,
-    )
+    exceptions = comm.allgather(None)
+    if any(exceptions):
+        raise filter(lambda x: x is not None, exceptions)[0]
 
-    # Verify against reference
-    torch.testing.assert_close(combined_output, reference_output, rtol=1e-2, atol=1e-2)
+    try:
+        # Combine
+        combined_output = moe_a2a.combine(
+            payload=moe_output,
+            runtime_max_tokens_per_rank=max_num_tokens,
+            payload_in_workspace=True,
+        )
+
+        # Verify against reference
+        torch.testing.assert_close(
+            combined_output, reference_output, rtol=1e-2, atol=1e-2
+        )
+    except Exception as e:
+        traceback.print_exc()
+        comm.allgather(e)
+        raise e
+
+    exceptions = comm.allgather(None)
+    if any(exceptions):
+        raise filter(lambda x: x is not None, exceptions)[0]
 
 
 if __name__ == "__main__":
