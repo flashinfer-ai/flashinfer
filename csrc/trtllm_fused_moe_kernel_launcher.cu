@@ -1386,6 +1386,8 @@ Tensor trtllm_fp8_per_tensor_scale_moe(
     auto launcher = std::make_unique<Fp8PerTensorLauncher>(
         routing_logits, routing_bias, hidden_states, gemm1_weights, output1_scales_scalar,
         output1_scales_gate_scalar, gemm2_weights, output2_scales_scalar);
+    // Note: Original code passes tile_N where tile_tokens_dim is expected
+    // This seems incorrect but we match the original behavior
     launcher->init(std::move(args), curr_tile_N, routing_method_type, use_shuffled_weight,
                    weight_layout, use_routing_scales_on_input);
 
@@ -1468,6 +1470,8 @@ Tensor trtllm_fp8_block_scale_moe(
     auto launcher = std::make_unique<Fp8BlockScaleLauncher>(
         routing_logits, routing_bias, hidden_states, hidden_states_scale, gemm1_weights,
         gemm1_weights_scale, gemm2_weights, gemm2_weights_scale);
+    // Note: Original code passes tile_N where tile_tokens_dim is expected
+    // This seems incorrect but we match the original behavior
     launcher->init(std::move(args), curr_tile_N, routing_method_type, use_shuffled_weight,
                    weight_layout);
 

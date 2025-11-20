@@ -53,6 +53,7 @@ output_column_dict = {
         "routed_scaling_factor",
         "local_expert_offset",
         "local_num_experts",
+        "tile_tokens_dim",
         "routing_method",
         "use_shuffled_weight",
         "weight_layout",

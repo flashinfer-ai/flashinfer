@@ -166,7 +166,8 @@ The output CSV will contain detailed metrics including:
 | `--topk_group`           | Number of groups to consider for top-k routing. Default: 1                                                 |
 | `--routed_scaling_factor`| Scaling factor for routing. Default: 2.5                                                                   |
 | `--local_expert_offset`  | Offset of local experts in global expert space. Default: 0                                                 |
-| `--local_num_experts`    | Number of experts handled by this device. Default: equals num_experts                                      |                                                                    |
+| `--local_num_experts`    | Number of experts handled by this device. Default: equals num_experts                                      |
+| `--tile_tokens_dim`      | Tile dimension for tokens. Default: 8                                                                      |
 | `--routing_method`       | Routing method: `renormalize`, `deepseek_v3`, `llama4`, `renormalize_naive`. Default: `deepseek_v3`.       |
 | `--use_shuffled_weight`  | Whether to use shuffled weight layout                                                                      |
 | `--weight_layout`        | Weight layout: 0=MajorK, 1=MajorMn,  2=BlockMajorK. Default: 0                                             |
