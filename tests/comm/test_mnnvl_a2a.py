@@ -226,10 +226,10 @@ def run_moe_a2a_dispatch_single_rank(
 ):
     """Worker function for MPI testing."""
     comm = MPI.COMM_WORLD
-    rank = comm.Get_rank()
-    torch.cuda.set_device(rank)
-
     try:
+        rank = comm.Get_rank()
+        torch.cuda.set_device(rank)
+
         mapping = Mapping(
             rank=rank,
             tp_size=ep_size,
@@ -262,78 +262,82 @@ def run_moe_a2a_dispatch_single_rank(
         payloads, expert_id_payload_index = make_nvfp4_payloads(
             rank_local_tokens, hidden_size, top_k, rank, token_selected_experts
         )
-
-        recv_tensors = moe_a2a.dispatch(
-            token_selected_experts,
-            payloads,
-            max_num_tokens,
-            invalid_token_expert_id=invalid_token_expert_id,
-            expert_id_payload_index=expert_id_payload_index,
-        )
-
-        # Read counters and compact routing tensors from workspace
-        send_counters_offset = moe_a2a.metainfo[
-            MoeAlltoAll._METAINFO_INDEX["SEND_COUNTERS_OFFSET_INDEX"]
-        ].item()
-        recv_counters_offset = moe_a2a.metainfo[
-            MoeAlltoAll._METAINFO_INDEX["RECV_COUNTERS_OFFSET_INDEX"]
-        ].item()
-        topk_target_ranks_offset = moe_a2a.metainfo[
-            MoeAlltoAll._METAINFO_INDEX["TOPK_TARGET_RANKS_OFFSET_INDEX"]
-        ].item()
-        topk_send_indices_offset = moe_a2a.metainfo[
-            MoeAlltoAll._METAINFO_INDEX["TOPK_SEND_INDICES_OFFSET_INDEX"]
-        ].item()
-
-        send_counters = (
-            moe_a2a.workspace[
-                rank, send_counters_offset : send_counters_offset + ep_size * 4
-            ]
-            .view(torch.int32)
-            .cpu()
-        )
-        recv_counters = (
-            moe_a2a.workspace[
-                rank, recv_counters_offset : recv_counters_offset + ep_size * 4
-            ]
-            .view(torch.int32)
-            .cpu()
-        )
-        topk_target_ranks = (
-            moe_a2a.workspace[
-                rank,
-                topk_target_ranks_offset : topk_target_ranks_offset
-                + max_num_tokens * top_k * 4,
-            ]
-            .view(torch.int32)
-            .view(max_num_tokens, top_k)
-            .cpu()
-        )
-        topk_send_indices = (
-            moe_a2a.workspace[
-                rank,
-                topk_send_indices_offset : topk_send_indices_offset
-                + max_num_tokens * top_k * 4,
-            ]
-            .view(torch.int32)
-            .view(max_num_tokens, top_k)
-            .cpu()
-        )
-
-        # Return results to be collected (move to CPU for MPI transfer)
-        return (
-            token_selected_experts.cpu(),
-            [p.cpu() for p in payloads],
-            [rt.cpu() for rt in recv_tensors],
-            send_counters,
-            topk_send_indices,
-            topk_target_ranks,
-            recv_counters,
-            expert_id_payload_index,
-        )
     except Exception:
         traceback.print_exc()
+        comm.allgather(True)
         raise
+
+    if any(comm.allgather(False)):
+        raise Exception("Another rank failed")
+
+    recv_tensors = moe_a2a.dispatch(
+        token_selected_experts,
+        payloads,
+        max_num_tokens,
+        invalid_token_expert_id=invalid_token_expert_id,
+        expert_id_payload_index=expert_id_payload_index,
+    )
+
+    # Read counters and compact routing tensors from workspace
+    send_counters_offset = moe_a2a.metainfo[
+        MoeAlltoAll._METAINFO_INDEX["SEND_COUNTERS_OFFSET_INDEX"]
+    ].item()
+    recv_counters_offset = moe_a2a.metainfo[
+        MoeAlltoAll._METAINFO_INDEX["RECV_COUNTERS_OFFSET_INDEX"]
+    ].item()
+    topk_target_ranks_offset = moe_a2a.metainfo[
+        MoeAlltoAll._METAINFO_INDEX["TOPK_TARGET_RANKS_OFFSET_INDEX"]
+    ].item()
+    topk_send_indices_offset = moe_a2a.metainfo[
+        MoeAlltoAll._METAINFO_INDEX["TOPK_SEND_INDICES_OFFSET_INDEX"]
+    ].item()
+
+    send_counters = (
+        moe_a2a.workspace[
+            rank, send_counters_offset : send_counters_offset + ep_size * 4
+        ]
+        .view(torch.int32)
+        .cpu()
+    )
+    recv_counters = (
+        moe_a2a.workspace[
+            rank, recv_counters_offset : recv_counters_offset + ep_size * 4
+        ]
+        .view(torch.int32)
+        .cpu()
+    )
+    topk_target_ranks = (
+        moe_a2a.workspace[
+            rank,
+            topk_target_ranks_offset : topk_target_ranks_offset
+            + max_num_tokens * top_k * 4,
+        ]
+        .view(torch.int32)
+        .view(max_num_tokens, top_k)
+        .cpu()
+    )
+    topk_send_indices = (
+        moe_a2a.workspace[
+            rank,
+            topk_send_indices_offset : topk_send_indices_offset
+            + max_num_tokens * top_k * 4,
+        ]
+        .view(torch.int32)
+        .view(max_num_tokens, top_k)
+        .cpu()
+    )
+
+    # Return results to be collected (move to CPU for MPI transfer)
+    return (
+        token_selected_experts.cpu(),
+        [p.cpu() for p in payloads],
+        [rt.cpu() for rt in recv_tensors],
+        send_counters,
+        topk_send_indices,
+        topk_target_ranks,
+        recv_counters,
+        expert_id_payload_index,
+    )
 
 
 def verify_dispatch(
@@ -538,19 +542,19 @@ def test_moe_a2a_dispatch(ep_size, all_num_tokens, top_k):
         pytest.skip(f"Test requires exactly {ep_size} ranks")
 
     try:
-        MnnvlMemory.initialize()
-        if not MnnvlMemory.supports_mnnvl():
+        try:
+            MnnvlMemory.initialize()
+            if not MnnvlMemory.supports_mnnvl():
+                pytest.skip("MNNVL not supported on this system")
+        except Exception:
             pytest.skip("MNNVL not supported on this system")
-    except Exception:
-        pytest.skip("MNNVL not supported on this system")
 
-    hidden_size = 1024
-    num_experts_per_rank = 8
-    workspace_size_per_rank = 512 * 1024 * 1024
-    invalid_token_expert_id = -1
+        hidden_size = 1024
+        num_experts_per_rank = 8
+        workspace_size_per_rank = 512 * 1024 * 1024
+        invalid_token_expert_id = -1
 
-    # Run dispatch on this rank
-    try:
+        # Run dispatch on this rank
         result = run_moe_a2a_dispatch_single_rank(
             ep_size,
             all_num_tokens,
@@ -562,12 +566,11 @@ def test_moe_a2a_dispatch(ep_size, all_num_tokens, top_k):
         )
     except Exception as e:
         traceback.print_exc()
-        comm.allgather(e)
+        comm.allgather(True)
         raise e
 
-    exceptions = comm.allgather(None)
-    if any(exceptions):
-        raise filter(lambda x: x is not None, exceptions)[0]
+    if any(comm.allgather(False)):
+        raise Exception("Another rank failed")
 
     # Gather results from all ranks
     all_results = comm.allgather(result)
@@ -631,19 +634,18 @@ def test_moe_a2a_dispatch_moe_combine(ep_size, all_num_tokens, top_k):
         pytest.skip(f"Test requires exactly {ep_size} ranks")
 
     try:
-        MnnvlMemory.initialize()
-        if not MnnvlMemory.supports_mnnvl():
+        try:
+            MnnvlMemory.initialize()
+            if not MnnvlMemory.supports_mnnvl():
+                pytest.skip("MNNVL not supported on this system")
+        except Exception:
             pytest.skip("MNNVL not supported on this system")
-    except Exception:
-        pytest.skip("MNNVL not supported on this system")
 
-    torch.cuda.set_device(rank)
+        torch.cuda.set_device(rank)
 
-    hidden_size = 2880  # gpt-oss
-    num_experts_per_rank = 8
-    workspace_size_per_rank = 512 * 1024 * 1024
-
-    try:
+        hidden_size = 2880  # gpt-oss
+        num_experts_per_rank = 8
+        workspace_size_per_rank = 512 * 1024 * 1024
         mapping = Mapping(
             rank=rank,
             moe_ep_size=world_size,
@@ -700,7 +702,15 @@ def test_moe_a2a_dispatch_moe_combine(ep_size, all_num_tokens, top_k):
             num_experts=ep_size * num_experts_per_rank,
             workspace_size_per_rank=workspace_size_per_rank,
         )
+    except Exception as e:
+        traceback.print_exc()
+        comm.allgather(True)
+        raise e
 
+    if any(comm.allgather(False)):
+        raise Exception("Another rank failed")
+
+    try:
         # Dispatch
         recv_tensors = moe_a2a.dispatch(
             token_selected_experts=token_selected_experts,
@@ -741,12 +751,11 @@ def test_moe_a2a_dispatch_moe_combine(ep_size, all_num_tokens, top_k):
         )
     except Exception as e:
         traceback.print_exc()
-        comm.allgather(e)
+        comm.allgather(True)
         raise e
 
-    exceptions = comm.allgather(None)
-    if any(exceptions):
-        raise filter(lambda x: x is not None, exceptions)[0]
+    if any(comm.allgather(False)):
+        raise Exception("Another rank failed")
 
     try:
         # Combine
@@ -762,12 +771,11 @@ def test_moe_a2a_dispatch_moe_combine(ep_size, all_num_tokens, top_k):
         )
     except Exception as e:
         traceback.print_exc()
-        comm.allgather(e)
+        comm.allgather(True)
         raise e
 
-    exceptions = comm.allgather(None)
-    if any(exceptions):
-        raise filter(lambda x: x is not None, exceptions)[0]
+    if any(comm.allgather(False)):
+        raise Exception("Another rank failed")
 
 
 if __name__ == "__main__":
