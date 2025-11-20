@@ -24,6 +24,28 @@ from flashinfer.comm.mapping import Mapping
 from flashinfer.comm.mnnvl import MnnvlMemory
 
 
+class MPIExit(Exception):
+    pass
+
+
+def check_any_rank_failed():
+    comm = MPI.COMM_WORLD
+    if any(comm.allgather(False)):
+        raise MPIExit("Another rank failed")
+
+
+def safe_run(func, *args, **kwargs):
+    comm = MPI.COMM_WORLD
+    try:
+        func(*args, **kwargs)
+    except MPIExit as e:
+        raise e
+    except Exception as e:
+        traceback.print_exc()
+        comm.allgather(True)
+        raise e
+
+
 @pytest.fixture(autouse=True)
 def setup_test():
     torch.manual_seed(0x1234)
@@ -226,49 +248,45 @@ def run_moe_a2a_dispatch_single_rank(
 ):
     """Worker function for MPI testing."""
     comm = MPI.COMM_WORLD
-    try:
-        rank = comm.Get_rank()
-        torch.cuda.set_device(rank)
+    rank = comm.Get_rank()
+    torch.cuda.set_device(rank)
 
-        mapping = Mapping(
-            rank=rank,
-            tp_size=ep_size,
-            moe_ep_size=ep_size,
-            world_size=ep_size,
-            gpus_per_node=ep_size,
-            pp_size=1,
-            cp_size=1,
-        )
+    check_any_rank_failed()
 
-        # Create MoeAlltoAll manager
-        max_num_tokens = max(all_num_tokens)
+    mapping = Mapping(
+        rank=rank,
+        tp_size=ep_size,
+        moe_ep_size=ep_size,
+        world_size=ep_size,
+        gpus_per_node=ep_size,
+        pp_size=1,
+        cp_size=1,
+    )
 
-        MoeAlltoAll._WORKSPACE = None
-        moe_a2a = MoeAlltoAll(
-            mapping,
-            max_num_tokens,
-            top_k,
-            ep_size * num_experts_per_rank,
-            workspace_size_per_rank,
-        )
+    # Create MoeAlltoAll manager
+    max_num_tokens = max(all_num_tokens)
 
-        # Get the number of tokens for this specific rank (same as single-GPU)
-        rank_local_tokens = all_num_tokens[rank]
+    MoeAlltoAll._WORKSPACE = None
+    moe_a2a = MoeAlltoAll(
+        mapping,
+        max_num_tokens,
+        top_k,
+        ep_size * num_experts_per_rank,
+        workspace_size_per_rank,
+    )
 
-        # Generate data using helper functions
-        token_selected_experts = generate_token_selected_experts(
-            rank_local_tokens, ep_size, num_experts_per_rank, top_k
-        )
-        payloads, expert_id_payload_index = make_nvfp4_payloads(
-            rank_local_tokens, hidden_size, top_k, rank, token_selected_experts
-        )
-    except Exception:
-        traceback.print_exc()
-        comm.allgather(True)
-        raise
+    # Get the number of tokens for this specific rank (same as single-GPU)
+    rank_local_tokens = all_num_tokens[rank]
 
-    if any(comm.allgather(False)):
-        raise Exception("Another rank failed")
+    # Generate data using helper functions
+    token_selected_experts = generate_token_selected_experts(
+        rank_local_tokens, ep_size, num_experts_per_rank, top_k
+    )
+    payloads, expert_id_payload_index = make_nvfp4_payloads(
+        rank_local_tokens, hidden_size, top_k, rank, token_selected_experts
+    )
+
+    check_any_rank_failed()
 
     recv_tensors = moe_a2a.dispatch(
         token_selected_experts,
@@ -512,22 +530,7 @@ def verify_dispatch(
                     assert torch.all(token_expert_ids == invalid_token_expert_id)
 
 
-@pytest.mark.parametrize(
-    "ep_size,all_num_tokens,top_k",
-    [
-        # Basic configurations
-        (4, [32, 32, 32, 32], 2),  # Four ranks with uniform distribution
-        (4, [16, 32, 64, 48], 2),  # Four ranks with non-uniform distribution
-        (2, [100, 50], 2),  # Two ranks with different loads
-        (8, [10, 20, 30, 40, 50, 60, 70, 80], 2),  # Eight ranks with increasing load
-        # Different top_k values
-        (4, [32, 32, 32, 32], 4),  # Four ranks with top_k = 4
-        (4, [32, 32, 32, 32], 8),  # Four ranks with top_k = 8
-        # Edge cases
-        (4, [1, 1, 1, 1], 2),  # Four ranks with single token per rank
-    ],
-)
-def test_moe_a2a_dispatch(ep_size, all_num_tokens, top_k):
+def test_moe_a2a_dispatch_impl(ep_size, all_num_tokens, top_k):
     """Test MoE A2A dispatch operation."""
     if len(all_num_tokens) != ep_size:
         pytest.skip(
@@ -542,35 +545,31 @@ def test_moe_a2a_dispatch(ep_size, all_num_tokens, top_k):
         pytest.skip(f"Test requires exactly {ep_size} ranks")
 
     try:
-        try:
-            MnnvlMemory.initialize()
-            if not MnnvlMemory.supports_mnnvl():
-                pytest.skip("MNNVL not supported on this system")
-        except Exception:
+        MnnvlMemory.initialize()
+        if not MnnvlMemory.supports_mnnvl():
             pytest.skip("MNNVL not supported on this system")
+    except Exception:
+        pytest.skip("MNNVL not supported on this system")
 
-        hidden_size = 1024
-        num_experts_per_rank = 8
-        workspace_size_per_rank = 512 * 1024 * 1024
-        invalid_token_expert_id = -1
+    hidden_size = 1024
+    num_experts_per_rank = 8
+    workspace_size_per_rank = 512 * 1024 * 1024
+    invalid_token_expert_id = -1
 
-        # Run dispatch on this rank
-        result = run_moe_a2a_dispatch_single_rank(
-            ep_size,
-            all_num_tokens,
-            top_k,
-            workspace_size_per_rank,
-            num_experts_per_rank,
-            hidden_size,
-            invalid_token_expert_id,
-        )
-    except Exception as e:
-        traceback.print_exc()
-        comm.allgather(True)
-        raise e
+    check_any_rank_failed()
 
-    if any(comm.allgather(False)):
-        raise Exception("Another rank failed")
+    # Run dispatch on this rank
+    result = run_moe_a2a_dispatch_single_rank(
+        ep_size,
+        all_num_tokens,
+        top_k,
+        workspace_size_per_rank,
+        num_experts_per_rank,
+        hidden_size,
+        invalid_token_expert_id,
+    )
+
+    check_any_rank_failed()
 
     # Gather results from all ranks
     all_results = comm.allgather(result)
@@ -611,15 +610,24 @@ def test_moe_a2a_dispatch(ep_size, all_num_tokens, top_k):
 @pytest.mark.parametrize(
     "ep_size,all_num_tokens,top_k",
     [
-        (4, [32, 32, 32, 32], 2),
-        (4, [16, 32, 64, 48], 2),
-        (2, [100, 50], 2),
-        (4, [32, 32, 32, 32], 4),
-        (4, [1, 1, 1, 1], 2),
-        (8, [640, 640, 640, 640, 640, 640, 640, 640], 4),
+        # Basic configurations
+        (4, [32, 32, 32, 32], 2),  # Four ranks with uniform distribution
+        (4, [16, 32, 64, 48], 2),  # Four ranks with non-uniform distribution
+        (2, [100, 50], 2),  # Two ranks with different loads
+        (8, [10, 20, 30, 40, 50, 60, 70, 80], 2),  # Eight ranks with increasing load
+        # Different top_k values
+        (4, [32, 32, 32, 32], 4),  # Four ranks with top_k = 4
+        (4, [32, 32, 32, 32], 8),  # Four ranks with top_k = 8
+        # Edge cases
+        (4, [1, 1, 1, 1], 2),  # Four ranks with single token per rank
     ],
 )
-def test_moe_a2a_dispatch_moe_combine(ep_size, all_num_tokens, top_k):
+def test_moe_a2a_dispatch(ep_size, all_num_tokens, top_k):
+    """Test MoE A2A dispatch operation."""
+    safe_run(test_moe_a2a_dispatch_impl, ep_size, all_num_tokens, top_k)
+
+
+def test_moe_a2a_dispatch_moe_combine_impl(ep_size, all_num_tokens, top_k):
     """Test full MoE A2A dispatch + expert processing + combine cycle."""
     if len(all_num_tokens) != ep_size:
         pytest.skip(
@@ -634,148 +642,144 @@ def test_moe_a2a_dispatch_moe_combine(ep_size, all_num_tokens, top_k):
         pytest.skip(f"Test requires exactly {ep_size} ranks")
 
     try:
-        try:
-            MnnvlMemory.initialize()
-            if not MnnvlMemory.supports_mnnvl():
-                pytest.skip("MNNVL not supported on this system")
-        except Exception:
+        MnnvlMemory.initialize()
+        if not MnnvlMemory.supports_mnnvl():
             pytest.skip("MNNVL not supported on this system")
+    except Exception:
+        pytest.skip("MNNVL not supported on this system")
 
-        torch.cuda.set_device(rank)
+    torch.cuda.set_device(rank)
 
-        hidden_size = 2880  # gpt-oss
-        num_experts_per_rank = 8
-        workspace_size_per_rank = 512 * 1024 * 1024
-        mapping = Mapping(
-            rank=rank,
-            moe_ep_size=world_size,
-            tp_size=world_size,
-            world_size=world_size,
-        )
+    check_any_rank_failed()
 
-        local_num_tokens = all_num_tokens[rank]
-        max_num_tokens = max(all_num_tokens)
+    hidden_size = 2880  # gpt-oss
+    num_experts_per_rank = 8
+    workspace_size_per_rank = 512 * 1024 * 1024
+    mapping = Mapping(
+        rank=rank,
+        moe_ep_size=world_size,
+        tp_size=world_size,
+        world_size=world_size,
+    )
 
-        # Generate inputs
-        token_selected_experts = generate_token_selected_experts(
-            local_num_tokens, ep_size, num_experts_per_rank, top_k
-        )
+    local_num_tokens = all_num_tokens[rank]
+    max_num_tokens = max(all_num_tokens)
 
-        payloads, expert_id_payload_index = make_bfloat16_payloads(
-            local_num_tokens, hidden_size, top_k, rank, token_selected_experts
-        )
+    # Generate inputs
+    token_selected_experts = generate_token_selected_experts(
+        local_num_tokens, ep_size, num_experts_per_rank, top_k
+    )
 
-        hidden_states = payloads[0]
-        token_final_scales = payloads[2]
+    payloads, expert_id_payload_index = make_bfloat16_payloads(
+        local_num_tokens, hidden_size, top_k, rank, token_selected_experts
+    )
 
-        # Compute reference (single-GPU MoE)
-        all_experts = torch.cat(
-            [
-                create_experts(
-                    num_experts_per_rank, hidden_size, r, "cuda", dtype=torch.bfloat16
-                )
-                for r in range(ep_size)
-            ],
-            dim=0,
-        )
+    hidden_states = payloads[0]
+    token_final_scales = payloads[2]
 
-        rank_experts = create_experts(
-            num_experts_per_rank, hidden_size, rank, "cuda", dtype=torch.bfloat16
-        )
+    # Compute reference (single-GPU MoE)
+    all_experts = torch.cat(
+        [
+            create_experts(
+                num_experts_per_rank, hidden_size, r, "cuda", dtype=torch.bfloat16
+            )
+            for r in range(ep_size)
+        ],
+        dim=0,
+    )
 
-        reference_output = fake_moe(
-            hidden_states,
-            token_selected_experts,
-            token_final_scales,
-            all_experts,
-            is_ep=False,
-        )
+    rank_experts = create_experts(
+        num_experts_per_rank, hidden_size, rank, "cuda", dtype=torch.bfloat16
+    )
 
-        torch.cuda.synchronize()
+    reference_output = fake_moe(
+        hidden_states,
+        token_selected_experts,
+        token_final_scales,
+        all_experts,
+        is_ep=False,
+    )
 
-        # Initialize MoeAlltoAll
-        MoeAlltoAll._WORKSPACE = None
-        moe_a2a = MoeAlltoAll(
-            mapping=mapping,
-            max_num_tokens=max_num_tokens,
-            top_k=top_k,
-            num_experts=ep_size * num_experts_per_rank,
-            workspace_size_per_rank=workspace_size_per_rank,
-        )
-    except Exception as e:
-        traceback.print_exc()
-        comm.allgather(True)
-        raise e
+    # Initialize MoeAlltoAll
+    MoeAlltoAll._WORKSPACE = None
+    moe_a2a = MoeAlltoAll(
+        mapping=mapping,
+        max_num_tokens=max_num_tokens,
+        top_k=top_k,
+        num_experts=ep_size * num_experts_per_rank,
+        workspace_size_per_rank=workspace_size_per_rank,
+    )
 
-    if any(comm.allgather(False)):
-        raise Exception("Another rank failed")
+    check_any_rank_failed()
 
-    try:
-        # Dispatch
-        recv_tensors = moe_a2a.dispatch(
-            token_selected_experts=token_selected_experts,
-            input_payloads=payloads,
-            runtime_max_tokens_per_rank=max_num_tokens,
-        )
+    # Dispatch
+    recv_tensors = moe_a2a.dispatch(
+        token_selected_experts=token_selected_experts,
+        input_payloads=payloads,
+        runtime_max_tokens_per_rank=max_num_tokens,
+    )
 
-        # Unpack received tensors
-        hidden_states_recv = recv_tensors[0]  # [ep_size, max_tokens, hidden_size]
-        token_selected_experts_recv = recv_tensors[1]  # [ep_size, max_tokens, top_k]
-        token_final_scales_recv = recv_tensors[2]  # [ep_size, max_tokens, top_k]
+    # Unpack received tensors
+    hidden_states_recv = recv_tensors[0]  # [ep_size, max_tokens, hidden_size]
+    token_selected_experts_recv = recv_tensors[1]  # [ep_size, max_tokens, top_k]
+    token_final_scales_recv = recv_tensors[2]  # [ep_size, max_tokens, top_k]
 
-        # Get workspace-backed tensor for output
-        moe_output = moe_a2a.get_combine_payload_tensor_in_workspace(
-            runtime_max_tokens_per_rank=max_num_tokens,
-            hidden_size=hidden_size,
-            dtype=torch.bfloat16,
-        )
-        moe_output.zero_()
+    # Get workspace-backed tensor for output
+    moe_output = moe_a2a.get_combine_payload_tensor_in_workspace(
+        runtime_max_tokens_per_rank=max_num_tokens,
+        hidden_size=hidden_size,
+        dtype=torch.bfloat16,
+    )
+    moe_output.zero_()
 
-        # Process each rank's tokens with local experts
-        moe_output.copy_(
-            fake_moe(
-                hidden_states_recv.view(
-                    ep_size * max_num_tokens, hidden_states_recv.shape[-1]
-                ),
-                token_selected_experts_recv.view(
-                    ep_size * max_num_tokens, token_selected_experts_recv.shape[-1]
-                ),
-                token_final_scales_recv.view(
-                    ep_size * max_num_tokens, token_final_scales_recv.shape[-1]
-                ),
-                rank_experts,  # experts for current rank
-                is_ep=True,
-                ep_rank=rank,
-                num_experts_per_rank=num_experts_per_rank,
-            ).view(ep_size, max_num_tokens, hidden_size)
-        )
-    except Exception as e:
-        traceback.print_exc()
-        comm.allgather(True)
-        raise e
+    # Process each rank's tokens with local experts
+    moe_output.copy_(
+        fake_moe(
+            hidden_states_recv.view(
+                ep_size * max_num_tokens, hidden_states_recv.shape[-1]
+            ),
+            token_selected_experts_recv.view(
+                ep_size * max_num_tokens, token_selected_experts_recv.shape[-1]
+            ),
+            token_final_scales_recv.view(
+                ep_size * max_num_tokens, token_final_scales_recv.shape[-1]
+            ),
+            rank_experts,  # experts for current rank
+            is_ep=True,
+            ep_rank=rank,
+            num_experts_per_rank=num_experts_per_rank,
+        ).view(ep_size, max_num_tokens, hidden_size)
+    )
 
-    if any(comm.allgather(False)):
-        raise Exception("Another rank failed")
+    check_any_rank_failed()
 
-    try:
-        # Combine
-        combined_output = moe_a2a.combine(
-            payload=moe_output,
-            runtime_max_tokens_per_rank=max_num_tokens,
-            payload_in_workspace=True,
-        )
+    # Combine
+    combined_output = moe_a2a.combine(
+        payload=moe_output,
+        runtime_max_tokens_per_rank=max_num_tokens,
+        payload_in_workspace=True,
+    )
 
-        # Verify against reference
-        torch.testing.assert_close(
-            combined_output, reference_output, rtol=1e-2, atol=1e-2
-        )
-    except Exception as e:
-        traceback.print_exc()
-        comm.allgather(True)
-        raise e
+    # Verify against reference
+    torch.testing.assert_close(combined_output, reference_output, rtol=1e-2, atol=1e-2)
 
-    if any(comm.allgather(False)):
-        raise Exception("Another rank failed")
+    check_any_rank_failed()
+
+
+@pytest.mark.parametrize(
+    "ep_size,all_num_tokens,top_k",
+    [
+        (4, [32, 32, 32, 32], 2),
+        (4, [16, 32, 64, 48], 2),
+        (2, [100, 50], 2),
+        (4, [32, 32, 32, 32], 4),
+        (4, [1, 1, 1, 1], 2),
+        (8, [640, 640, 640, 640, 640, 640, 640, 640], 4),
+    ],
+)
+def test_moe_a2a_dispatch_moe_combine(ep_size, all_num_tokens, top_k):
+    """Test full MoE A2A dispatch + expert processing + combine cycle."""
+    safe_run(test_moe_a2a_dispatch_moe_combine_impl, ep_size, all_num_tokens, top_k)
 
 
 if __name__ == "__main__":
