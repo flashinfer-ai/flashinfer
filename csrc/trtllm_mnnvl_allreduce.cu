@@ -103,8 +103,7 @@ void trtllm_mnnvl_allreduce_fusion(TensorView input, int64_t multicast_buffer_pt
       status = twoshotAllreduceFusionDispatch<c_type>(params);
     }
     TVM_FFI_ICHECK(status == cudaSuccess)
-        << "twoshot_allreduce_dispatch_world_size failed with error code "
-        << cudaGetErrorString(status);
+        << "trtllm_mnnvl_allreduce_fusion failed with error code " << cudaGetErrorString(status);
   });
 }
 
