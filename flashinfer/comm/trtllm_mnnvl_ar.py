@@ -58,7 +58,7 @@ class MNNVLAllreduceFusionWorkspace:
             buffer_size_in_bytes = 16 * (1024**2)
         else:
             # Round up to the nearest multiple of 8MB
-            buffer_size_in_bytes = math.ceil(buffer_size_in_bytes / (8 * (1024**2)) * (8 * (1024**2)))
+            buffer_size_in_bytes = math.ceil(buffer_size_in_bytes / (8 * (1024**2))) * (8 * (1024**2))
 
         if buffer_size_in_bytes > (2**32 - 1):
             raise ValueError(
@@ -186,6 +186,9 @@ def get_trtllm_mnnvl_comm_module():
             gamma: Gamma tensor (if rmsnorm)
             epsilon: Epsilon value (if rmsnorm)
         """
+        print(
+            f"[Rank {rank}] Inside Kernel: multicast_buffer_ptr: {multicast_buffer_ptr:x}, buffer_ptrs_dev: {buffer_ptrs_dev:x}, buffer_ptr_local: {buffer_ptr_local:x}, buffer_flags_mnnvl: {buffer_flags_mnnvl}"
+        )
         module.trtllm_mnnvl_allreduce_fusion(
             input,
             multicast_buffer_ptr,
@@ -340,6 +343,10 @@ def trtllm_mnnvl_fused_allreduce_rmsnorm(
             input.shape[1],
             input.dtype,
         )
+    )
+
+    print(
+        f"[Rank {workspace.rank}] workspace.mc_ptr: {workspace.mc_ptr}, workspace.uc_ptrs_dev: {workspace.uc_ptrs_dev}, workspace.uc_ptr_local: {workspace.uc_ptr_local}"
     )
 
     module.trtllm_mnnvl_allreduce_fusion(

@@ -58,12 +58,14 @@ void trtllm_mnnvl_allreduce_fusion(TensorView input, int64_t multicast_buffer_pt
         << "residual_out, gamma, and epsilon must be provided if rmsnorm_fusion is true";
 
     if (rmsnorm_fusion) {
-      TVM_FFI_ICHECK(residual_out.size(0) == num_tokens && residual_out.size(1) == token_dim)
+      TVM_FFI_ICHECK(residual_out.value().size(0) == num_tokens &&
+                     residual_out.value().size(1) == token_dim)
           << "residual_out shape mismatch: expected (" << input.size(0) << ", " << input.size(1)
-          << ") but got (" << residual_out.size(0) << ", " << residual_out.size(1) << ")";
-      TVM_FFI_ICHECK(gamma.size(0) == token_dim)
+          << ") but got (" << residual_out.value().size(0) << ", " << residual_out.value().size(1)
+          << ")";
+      TVM_FFI_ICHECK(gamma.value().size(0) == token_dim)
           << "gamma must have the same shape as token dimension (" << token_dim << ") but got ("
-          << gamma.size(0) << ")";
+          << gamma.value().size(0) << ")";
     }
 
     // Create the parameters struct

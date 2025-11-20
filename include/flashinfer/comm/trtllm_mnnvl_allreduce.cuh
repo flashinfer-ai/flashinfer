@@ -536,6 +536,7 @@ __global__ void __launch_bounds__(1024)
   T* stagePtrLocal = reinterpret_cast<T*>(flag.getCurLamportBuf(inputPtrs[rank], 0));
 
   if (packedIdx * kELTS_PER_THREAD >= tokenDim) {
+    flag.ctaArrive();
     flag.clearDirtyLamportBuf(inputPtrs[rank], -1);
     return;
   }
@@ -545,7 +546,7 @@ __global__ void __launch_bounds__(1024)
   val.packed = loadPacked<PackedType>(&shardPtr[threadOffset]);
 #pragma unroll
   for (int i = 0; i < kELTS_PER_THREAD; i++) {
-    if (isNegZero(val.elements[i])) val.elements[i] = toFloat<T>(0.f);
+    if (isNegZero(val.elements[i])) val.elements[i] = fromFloat<T>(0.f);
   }
 
   reinterpret_cast<PackedType*>(
@@ -641,7 +642,7 @@ __global__ void __launch_bounds__(1024)
 #pragma unroll
     for (int i = 0; i < kELTS_PER_THREAD; i++) {
       packedAccum.elements[i] = fromFloat<T>(toFloat<T>(packedAccum.elements[i]) * rcpRms *
-                                             fromFloat<T>(gamma.elements[i]));
+                                             toFloat<T>(gamma.elements[i]));
     }
   }
   reinterpret_cast<PackedType*>(&outputPtr[threadOffset])[0] = packedAccum.packed;
@@ -725,18 +726,24 @@ cudaError_t oneshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
       // FIXME: Do we need other world sizes?
     case 2:
       DISPATCH_ALLREDUCE_KERNEL(2);
+      break;
     case 4:
       DISPATCH_ALLREDUCE_KERNEL(4);
+      break;
     case 8:
       DISPATCH_ALLREDUCE_KERNEL(8);
+      break;
     case 16:
       DISPATCH_ALLREDUCE_KERNEL(16);
+      break;
     case 32:
       DISPATCH_ALLREDUCE_KERNEL(32);
+      break;
     case 64:
       DISPATCH_ALLREDUCE_KERNEL(64);
+      break;
     default:
-      FLASHINFER_ERROR("MNNVL AllReduce: unsupported world_size " + std::to_string(params.nranks) +
+      FLASHINFER_ERROR("MNNVL AllReduce: unsupported world_size " + std::to_string(params.nRanks) +
                        ". Supported sizes: {2, 4, 8, 16, 32, 64}");
       return cudaErrorInvalidValue;
   }
@@ -1145,7 +1152,7 @@ cudaError_t twoshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
     int const dimPadded = round_up(tokenDim, numEltsPerThread * rnNumThreads);
     int const iters = dimPadded / rnNumThreads;
 
-    size_t const smemSize = 3 * rnBlockSize * iters * getDTypeSize(params.dType);
+    size_t const smemSize = 3 * rnBlockSize * iters * sizeof(T);
 
     FLASHINFER_LOG_DEBUG(
         "[MNNVL AllReduceTwoShotRMSNorm] Dispatch: grid size: (%d, %d, 1), block_size: %d, "
