@@ -314,6 +314,7 @@ class BatchMLAPagedAttentionWrapper:
         profiler_buffer: Optional[torch.Tensor] = None,
         kv_len: Optional[torch.Tensor] = None,
         page_table: Optional[torch.Tensor] = None,
+        return_lse_base_on_e: bool = False,
     ) -> torch.Tensor: ...
 
     @overload
@@ -329,6 +330,7 @@ class BatchMLAPagedAttentionWrapper:
         profiler_buffer: Optional[torch.Tensor] = None,
         kv_len: Optional[torch.Tensor] = None,
         page_table: Optional[torch.Tensor] = None,
+        return_lse_base_on_e: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
     def run(
@@ -343,6 +345,7 @@ class BatchMLAPagedAttentionWrapper:
         profiler_buffer: Optional[torch.Tensor] = None,
         kv_len: Optional[torch.Tensor] = None,
         page_table: Optional[torch.Tensor] = None,
+        return_lse_base_on_e: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Run the MLA attention computation.
 
@@ -441,6 +444,7 @@ class BatchMLAPagedAttentionWrapper:
             num_heads,
             page_size,
             sm_scale,
+            return_lse_base_on_e,
             *profiler_args,
         )
 
