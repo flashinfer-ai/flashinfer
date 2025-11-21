@@ -175,10 +175,10 @@ FlashInfer provides comprehensive API logging for debugging. Enable it using env
 
 ```bash
 # Enable logging (levels: 0=off (default), 1=basic, 3=detailed, 5=statistics)
-export FLASHINFER_LOGLEVEL_DBG=3
+export FLASHINFER_LOGLEVEL=3
 
 # Set log destination (stdout (default), stderr, or file path)
-export FLASHINFER_LOGDEST_DBG=stdout
+export FLASHINFER_LOGDEST=stdout
 ```
 
 For detailed information about logging levels, configuration, and advanced features, see [LOGGING.md](LOGGING.md).

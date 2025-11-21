@@ -47,21 +47,21 @@ class TestAPILogging:
     def setup_and_teardown(self):
         """Reset environment and reimport logging module for each test."""
         # Store original environment
-        original_level = os.environ.get("FLASHINFER_LOGLEVEL_DBG")
-        original_dest = os.environ.get("FLASHINFER_LOGDEST_DBG")
+        original_level = os.environ.get("FLASHINFER_APILEVEL")
+        original_dest = os.environ.get("FLASHINFER_APIDEST")
 
         yield
 
         # Restore original environment
         if original_level is not None:
-            os.environ["FLASHINFER_LOGLEVEL_DBG"] = original_level
-        elif "FLASHINFER_LOGLEVEL_DBG" in os.environ:
-            del os.environ["FLASHINFER_LOGLEVEL_DBG"]
+            os.environ["FLASHINFER_APILEVEL"] = original_level
+        elif "FLASHINFER_APILEVEL" in os.environ:
+            del os.environ["FLASHINFER_APILEVEL"]
 
         if original_dest is not None:
-            os.environ["FLASHINFER_LOGDEST_DBG"] = original_dest
-        elif "FLASHINFER_LOGDEST_DBG" in os.environ:
-            del os.environ["FLASHINFER_LOGDEST_DBG"]
+            os.environ["FLASHINFER_APIDEST"] = original_dest
+        elif "FLASHINFER_APIDEST" in os.environ:
+            del os.environ["FLASHINFER_APIDEST"]
 
         # Force reimport to pick up new environment variables
         if "flashinfer.api_logging" in sys.modules:
@@ -69,16 +69,16 @@ class TestAPILogging:
 
     def setup_logging(self, level: int, dest: str = "stdout"):
         """Helper to set up logging environment and reimport."""
-        os.environ["FLASHINFER_LOGLEVEL_DBG"] = str(level)
-        os.environ["FLASHINFER_LOGDEST_DBG"] = dest
+        os.environ["FLASHINFER_APILEVEL"] = str(level)
+        os.environ["FLASHINFER_APIDEST"] = dest
 
         # Force reimport
         if "flashinfer.api_logging" in sys.modules:
             del sys.modules["flashinfer.api_logging"]
 
-        from flashinfer.api_logging import flashinfer_log
+        from flashinfer.api_logging import flashinfer_api
 
-        return flashinfer_log
+        return flashinfer_api
 
     def test_level_0_zero_overhead(self):
         """Test that level 0 has truly zero overhead (returns original function)."""

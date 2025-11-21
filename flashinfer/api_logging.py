@@ -39,10 +39,8 @@ def _substitute_process_id(path: str) -> str:
 
 
 # Read environment variables once at module load time
-_API_LOG_LEVEL = int(os.environ.get("FLASHINFER_LOGLEVEL_DBG", "0"))
-_API_LOG_DEST = _substitute_process_id(
-    os.environ.get("FLASHINFER_LOGDEST_DBG", "stdout")
-)
+_API_LOG_LEVEL = int(os.environ.get("FLASHINFER_APILEVEL", "0"))
+_API_LOG_DEST = _substitute_process_id(os.environ.get("FLASHINFER_APIDEST", "stdout"))
 
 # Create logger using Python's logging library
 _logger = logging.getLogger("flashinfer.api")
@@ -56,7 +54,7 @@ def _setup_logger():
         _logger.setLevel(logging.CRITICAL + 1)  # Higher than any level
         return
 
-    # All enabled levels use loggging.DEBUG; verbosity is controlled by FLASHINFER_LOGLEVEL_DBG instead
+    # All enabled levels use loggging.DEBUG; verbosity is controlled by FLASHINFER_APILEVEL instead
     _logger.setLevel(logging.DEBUG)
 
     # Remove any existing handlers
@@ -463,22 +461,22 @@ def _log_function_outputs(func_name: str, result: Any, level: int) -> None:
     _logger.debug("\n".join(lines))
 
 
-def flashinfer_log(func: Callable = None) -> Callable:
+def flashinfer_api(func: Callable = None) -> Callable:
     """
     Decorator to log FlashInfer API calls using Python's logging library.
 
     This decorator integrates with Python's standard logging infrastructure while
-    maintaining zero overhead when disabled (FLASHINFER_LOGLEVEL_DBG=0).
+    maintaining zero overhead when disabled (FLASHINFER_APILEVEL=0).
 
     Environment Variables
     ---------------------
-    FLASHINFER_LOGLEVEL_DBG : int (default: 0)
+    FLASHINFER_APILEVEL : int (default: 0)
         - 0: No logging (zero overhead - decorator returns original function)
         - 1: Log function name only (logged BEFORE execution - crash-safe)
         - 3: Log function name + inputs/outputs with metadata (inputs logged BEFORE execution - crash-safe)
         - 5: Log function name + inputs/outputs with metadata + tensor statistics (inputs logged BEFORE execution - crash-safe)
 
-    FLASHINFER_LOGDEST_DBG : str (default: "stdout")
+    FLASHINFER_APIDEST : str (default: "stdout")
         - "stdout": Log to standard output
         - "stderr": Log to standard error
         - <path>: Log to specified file path
@@ -488,7 +486,7 @@ def flashinfer_log(func: Callable = None) -> Callable:
     --------
     Basic usage:
 
-    >>> @flashinfer_log
+    >>> @flashinfer_api
     ... def my_function(x, y):
     ...     return x + y
 
@@ -496,7 +494,7 @@ def flashinfer_log(func: Callable = None) -> Callable:
     -----
     - Key header lines include a timestamp in the format: [YYYY-MM-DD HH:MM:SS]
       (e.g., "FlashInfer API Call: function_name", "FlashInfer API Logging - System Information")
-    - When FLASHINFER_LOGLEVEL_DBG=0, the decorator has truly zero overhead
+    - When FLASHINFER_APILEVEL=0, the decorator has truly zero overhead
       as it returns the original function unchanged.
     - Function names and inputs are logged BEFORE execution:
       - Level 1: Function name only
