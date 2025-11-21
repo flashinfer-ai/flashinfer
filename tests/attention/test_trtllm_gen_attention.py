@@ -339,39 +339,7 @@ def unpack_compare_nvfp4(
     return output_unpacked, output_ref
 
 
-@pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
-@pytest.mark.parametrize(
-    "batch_size,page_size,num_kv_heads,head_grp_size",
-    [
-        (4, 16, 2, 1),
-        (4, 32, 4, 5),
-        (4, 64, 4, 8),
-        (128, 16, 2, 5),
-        (128, 32, 4, 1),
-        (128, 64, 2, 8),
-        (256, 16, 4, 8),
-        (256, 32, 2, 8),
-        (256, 64, 4, 1),
-        (256, 64, 4, 5),
-    ],
-)
-@pytest.mark.parametrize("window_left", [-1])  # todo(Siyuan): add 127 window_left
-@pytest.mark.parametrize(
-    "q_dtype,kv_dtype,o_dtype",
-    [
-        ("bf16", "bf16", "bf16"),
-        ("fp16", "fp16", "fp16"),
-        ("fp8", "fp8", "bf16"),
-        ("fp8", "fp8", "fp16"),
-        ("fp8", "fp8", "fp8"),
-        ("fp8", "fp8", "nvfp4"),
-    ],
-)
-@pytest.mark.parametrize("enable_pdl", [True, False, None])
-@pytest.mark.parametrize("enable_sink", [True, False])
-@pytest.mark.parametrize("max_q_len", [511])
-@pytest.mark.parametrize("max_kv_len", [2047])
-def test_trtllm_batch_prefill(
+def _test_trtllm_batch_prefill(
     kv_layout,
     batch_size,
     page_size,
@@ -385,6 +353,7 @@ def test_trtllm_batch_prefill(
     enable_sink,
     max_q_len,
     max_kv_len,
+    device_scale,
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] != 10:
@@ -485,6 +454,16 @@ def test_trtllm_batch_prefill(
         )
 
     # Run trtllm-gen function call
+    bmm1_scale = q_scale * k_scale * sm_scale
+    bmm2_scale = v_scale / o_scale
+    if isinstance(bmm1_scale, torch.Tensor) and not device_scale:
+        bmm1_scale = bmm1_scale.item()
+    elif not isinstance(bmm1_scale, torch.Tensor) and device_scale:
+        bmm1_scale = torch.tensor(bmm1_scale, device=GPU_DEVICE, dtype=torch.float32)
+    if isinstance(bmm2_scale, torch.Tensor) and not device_scale:
+        bmm2_scale = bmm2_scale.item()
+    elif not isinstance(bmm2_scale, torch.Tensor) and device_scale:
+        bmm2_scale = torch.tensor(bmm2_scale, device=GPU_DEVICE, dtype=torch.float32)
     output = flashinfer.prefill.trtllm_batch_context_with_kv_cache(
         q.contiguous(),
         kv_cache,
@@ -493,8 +472,8 @@ def test_trtllm_batch_prefill(
         seq_lens.to(GPU_DEVICE),
         torch.max(q_lens).item(),
         torch.max(seq_lens).item(),
-        q_scale * k_scale * sm_scale,  # bmm1_scale
-        v_scale / o_scale,  # bmm2_scale
+        bmm1_scale,  # bmm1_scale
+        bmm2_scale,  # bmm2_scale
         batch_size,
         q_indptr,
         kv_indptr,
@@ -572,6 +551,71 @@ def test_trtllm_batch_prefill(
 @pytest.mark.parametrize(
     "batch_size,page_size,num_kv_heads,head_grp_size",
     [
+        (4, 16, 2, 1),
+        (4, 32, 4, 5),
+        (4, 64, 4, 8),
+        (128, 16, 2, 5),
+        (128, 32, 4, 1),
+        (128, 64, 2, 8),
+        (256, 16, 4, 8),
+        (256, 32, 2, 8),
+        (256, 64, 4, 1),
+        (256, 64, 4, 5),
+    ],
+)
+@pytest.mark.parametrize("window_left", [-1])  # todo(Siyuan): add 127 window_left
+@pytest.mark.parametrize(
+    "q_dtype,kv_dtype,o_dtype",
+    [
+        ("bf16", "bf16", "bf16"),
+        ("fp16", "fp16", "fp16"),
+        ("fp8", "fp8", "bf16"),
+        ("fp8", "fp8", "fp16"),
+        ("fp8", "fp8", "fp8"),
+        ("fp8", "fp8", "nvfp4"),
+    ],
+)
+@pytest.mark.parametrize("enable_pdl", [None])
+@pytest.mark.parametrize("enable_sink", [True, False])
+@pytest.mark.parametrize("max_q_len", [511])
+@pytest.mark.parametrize("max_kv_len", [2047])
+def test_trtllm_batch_prefill(
+    kv_layout,
+    batch_size,
+    page_size,
+    num_kv_heads,
+    head_grp_size,
+    window_left,
+    q_dtype,
+    o_dtype,
+    kv_dtype,
+    enable_pdl,
+    enable_sink,
+    max_q_len,
+    max_kv_len,
+):
+    _test_trtllm_batch_prefill(
+        kv_layout,
+        batch_size,
+        page_size,
+        num_kv_heads,
+        head_grp_size,
+        window_left,
+        q_dtype,
+        o_dtype,
+        kv_dtype,
+        enable_pdl,
+        enable_sink,
+        max_q_len,
+        max_kv_len,
+        kv_dtype == "fp8",
+    )
+
+
+@pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
+@pytest.mark.parametrize(
+    "batch_size,page_size,num_kv_heads,head_grp_size",
+    [
         (1, 16, 8, 8),
     ],
 )
@@ -601,7 +645,7 @@ def test_trtllm_batch_prefill_bs1(
     max_q_len,
     max_kv_len,
 ):
-    test_trtllm_batch_prefill(
+    _test_trtllm_batch_prefill(
         kv_layout,
         batch_size,
         page_size,
@@ -615,6 +659,7 @@ def test_trtllm_batch_prefill_bs1(
         enable_sink,
         max_q_len,
         max_kv_len,
+        False,
     )
 
 
@@ -634,6 +679,7 @@ def _test_trtllm_batch_decode(
     enable_sink,
     max_in_kv_len,
     head_dim,
+    device_scale=False,
 ):
     """
     Common function for testing trtllm-gen decode.
@@ -781,6 +827,16 @@ def _test_trtllm_batch_decode(
         )
 
     # Run decode function call with specified backend
+    bmm1_scale = q_scale * k_scale * sm_scale
+    bmm2_scale = v_scale / o_scale
+    if isinstance(bmm1_scale, torch.Tensor) and not device_scale:
+        bmm1_scale = bmm1_scale.item()
+    elif not isinstance(bmm1_scale, torch.Tensor) and device_scale:
+        bmm1_scale = torch.tensor(bmm1_scale, device=GPU_DEVICE, dtype=torch.float32)
+    if isinstance(bmm2_scale, torch.Tensor) and not device_scale:
+        bmm2_scale = bmm2_scale.item()
+    elif not isinstance(bmm2_scale, torch.Tensor) and device_scale:
+        bmm2_scale = torch.tensor(bmm2_scale, device=GPU_DEVICE, dtype=torch.float32)
     output = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
         q.contiguous(),
         kv_cache,
@@ -788,8 +844,8 @@ def _test_trtllm_batch_decode(
         page_table,
         seq_lens.to(GPU_DEVICE),
         torch.max(seq_lens).item(),
-        q_scale * k_scale * sm_scale,  # bmm1_scale
-        v_scale / o_scale,  # bmm2_scale
+        bmm1_scale,
+        bmm2_scale,
         window_left,  # window_left
         out=out,
         out_dtype=out_dtype,
@@ -976,6 +1032,7 @@ def test_trtllm_batch_decode(
         enable_sink,
         max_in_kv_len,
         head_dim,
+        kv_dtype == "fp8",
     )
 
 
@@ -984,6 +1041,7 @@ def test_trtllm_batch_decode(
     "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size",
     [
         (1, 1, 16, 8, 8),
+        (1, 1, 32, 8, 8),
     ],
 )
 @pytest.mark.parametrize("window_left", [-1])
@@ -995,8 +1053,9 @@ def test_trtllm_batch_decode(
 )
 @pytest.mark.parametrize("enable_pdl", [None])
 @pytest.mark.parametrize("enable_sink", [False])
-@pytest.mark.parametrize("max_in_kv_len", [8192])
+@pytest.mark.parametrize("max_in_kv_len", [4096, 8192])
 @pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("device_scale", [True, False])
 def test_trtllm_batch_decode_bs1(
     kv_layout,
     batch_size,
@@ -1012,9 +1071,9 @@ def test_trtllm_batch_decode_bs1(
     enable_sink,
     max_in_kv_len,
     head_dim,
+    device_scale,
 ):
     # Small number of test cases for batch size 1
-    pytest.xfail("trtllm-gen decode gets incorrect output with bs1")
     _test_trtllm_batch_decode(
         "trtllm-gen",
         kv_layout,
@@ -1031,6 +1090,7 @@ def test_trtllm_batch_decode_bs1(
         enable_sink,
         max_in_kv_len,
         head_dim,
+        device_scale,
     )
 
 
@@ -1063,6 +1123,7 @@ def test_trtllm_batch_decode_bs1(
 @pytest.mark.parametrize("enable_sink", [False])
 @pytest.mark.parametrize("max_in_kv_len", [110])
 @pytest.mark.parametrize("head_dim", [256])
+@pytest.mark.parametrize("device_scale", [True, False])
 def test_trtllm_batch_decode_head_dim_256(
     kv_layout,
     batch_size,
@@ -1078,6 +1139,7 @@ def test_trtllm_batch_decode_head_dim_256(
     enable_sink,
     max_in_kv_len,
     head_dim,
+    device_scale,
 ):
     # Small number of test cases for head_dim = 256
     pytest.xfail("trtllm-gen decode gets incorrect output with head_dim = 256")
@@ -1097,6 +1159,7 @@ def test_trtllm_batch_decode_head_dim_256(
         enable_sink,
         max_in_kv_len,
         head_dim,
+        device_scale,
     )
 
 
@@ -1122,6 +1185,7 @@ def test_trtllm_batch_decode_head_dim_256(
 @pytest.mark.parametrize("enable_sink", [False])
 @pytest.mark.parametrize("max_in_kv_len", [4096, 8192, 16384, 32768, 65536, 131072])
 @pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("device_scale", [True, False])
 def test_trtllm_batch_decode_long_sequence_length(
     kv_layout,
     batch_size,
@@ -1137,6 +1201,7 @@ def test_trtllm_batch_decode_long_sequence_length(
     enable_sink,
     max_in_kv_len,
     head_dim,
+    device_scale,
 ):
     # Small number of test cases for long sequence length
     _test_trtllm_batch_decode(
@@ -1155,6 +1220,7 @@ def test_trtllm_batch_decode_long_sequence_length(
         enable_sink,
         max_in_kv_len,
         head_dim,
+        device_scale,
     )
 
 

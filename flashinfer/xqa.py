@@ -16,7 +16,7 @@ limitations under the License.
 
 import functools
 from types import SimpleNamespace
-from typing import Optional
+from typing import Optional, Union
 import torch
 
 from .jit.xqa import gen_xqa_module, gen_xqa_module_mla
@@ -59,7 +59,7 @@ def get_xqa_module(
         sm_count: int,
         num_kv_heads: int,
         sliding_win_size: int,
-        q_scale: float,
+        q_scale: Union[float, torch.Tensor],
         output: torch.Tensor,
         rcp_out_scale: float,
         q: torch.Tensor,
@@ -70,7 +70,7 @@ def get_xqa_module(
         max_seq_len: int,
         seq_lens: torch.Tensor,
         batch_size: int,
-        kv_scale: float,
+        kv_scale: Union[float, torch.Tensor],
         semaphores: torch.Tensor,
         workspace_buffer: torch.Tensor,
         enable_pdl: bool,
@@ -80,7 +80,8 @@ def get_xqa_module(
             sm_count,
             num_kv_heads,
             sliding_win_size,
-            q_scale,
+            1.0 if isinstance(q_scale, torch.Tensor) else q_scale,
+            None if isinstance(q_scale, float) else q_scale,
             output,
             rcp_out_scale,
             q,
@@ -91,7 +92,8 @@ def get_xqa_module(
             max_seq_len,
             seq_lens,
             batch_size,
-            kv_scale,
+            1.0 if isinstance(kv_scale, torch.Tensor) else kv_scale,
+            None if isinstance(kv_scale, float) else kv_scale,
             semaphores,
             workspace_buffer,
             enable_pdl,
@@ -105,7 +107,7 @@ def get_xqa_module(
         sm_count: int,
         num_kv_heads: int,
         sliding_win_size: int,
-        q_scale: float,
+        q_scale: Union[float, torch.Tensor],
         output: torch.Tensor,
         rcp_out_scale: float,
         q: torch.Tensor,
@@ -116,9 +118,10 @@ def get_xqa_module(
         max_seq_len: int,
         seq_lens: torch.Tensor,
         batch_size: int,
-        kv_scale: float,
+        kv_scale: Union[float, torch.Tensor],
         semaphores: torch.Tensor,
         workspace_buffer: torch.Tensor,
+        enable_pdl: bool,
     ) -> None:
         pass
 
@@ -139,8 +142,8 @@ def xqa(
     num_kv_heads: int,
     page_size: int,
     sinks: Optional[torch.Tensor] = None,
-    q_scale: float = 1.0,
-    kv_scale: float = 1.0,
+    q_scale: Union[float, torch.Tensor] = 1.0,
+    kv_scale: Union[float, torch.Tensor] = 1.0,
     sliding_win_size: int = 0,
     kv_layout: str = "NHD",
     sm_count: Optional[int] = None,
@@ -188,9 +191,9 @@ def xqa(
         Attention sink values with shape ``[num_kv_heads, head_group_ratio]``.
         Data type should be torch.float32.
         If None, no attention sinks are used.
-    q_scale : float, default=1.0
+    q_scale : Union[float, torch.Tensor], default=1.0
         Scale factor for query tensor.
-    kv_scale : float, default=1.0
+    kv_scale : Union[float, torch.Tensor], default=1.0
         Scale factor for KV cache.
     sliding_win_size : int, default=0
         Sliding window size for attention. If 0, no sliding window is used.
@@ -319,7 +322,7 @@ def get_xqa_module_mla(
     )
     def xqa_mla(
         sm_count: int,
-        q_scale: float,
+        q_scale: Union[float, torch.Tensor],
         output: torch.Tensor,
         q: torch.Tensor,
         k_cache: torch.Tensor,
@@ -328,14 +331,15 @@ def get_xqa_module_mla(
         max_seq_len: int,
         seq_lens: torch.Tensor,
         batch_size: int,
-        kv_scale: float,
+        kv_scale: Union[float, torch.Tensor],
         semaphores: torch.Tensor,
         workspace_buffer: torch.Tensor,
         enable_pdl: bool,
     ) -> None:
         module.xqa_wrapper_mla(
             sm_count,
-            q_scale,
+            1.0 if isinstance(q_scale, torch.Tensor) else q_scale,
+            None if isinstance(q_scale, float) else q_scale,
             output,
             q,
             k_cache,
@@ -344,7 +348,8 @@ def get_xqa_module_mla(
             max_seq_len,
             seq_lens,
             batch_size,
-            kv_scale,
+            1.0 if isinstance(kv_scale, torch.Tensor) else kv_scale,
+            None if isinstance(kv_scale, float) else kv_scale,
             semaphores,
             workspace_buffer,
             enable_pdl,
@@ -355,7 +360,7 @@ def get_xqa_module_mla(
     )
     def _fake_xqa_mla(
         sm_count: int,
-        q_scale: float,
+        q_scale: Union[float, torch.Tensor],
         output: torch.Tensor,
         q: torch.Tensor,
         k_cache: torch.Tensor,
@@ -364,7 +369,7 @@ def get_xqa_module_mla(
         max_seq_len: int,
         seq_lens: torch.Tensor,
         batch_size: int,
-        kv_scale: float,
+        kv_scale: Union[float, torch.Tensor],
         semaphores: torch.Tensor,
         workspace_buffer: torch.Tensor,
         enable_pdl: bool,
@@ -386,8 +391,8 @@ def xqa_mla(
     workspace_buffer: torch.Tensor,
     semaphores: torch.Tensor,
     page_size: int,
-    q_scale: float = 1.0,
-    kv_scale: float = 1.0,
+    q_scale: Union[float, torch.Tensor] = 1.0,
+    kv_scale: Union[float, torch.Tensor] = 1.0,
     sm_count: Optional[int] = None,
     enable_pdl: Optional[bool] = None,
 ) -> None:
@@ -422,9 +427,9 @@ def xqa_mla(
         Data type should be torch.uint32.
     page_size : int
         Size of each page in the paged KV cache. Must be one of [16, 32, 64, 128].
-    q_scale : float, default=1.0
+    q_scale : Union[float, torch.Tensor], default=1.0
         Scale factor for query tensor.
-    kv_scale : float, default=1.0
+    kv_scale : Union[float, torch.Tensor], default=1.0
         Scale factor for KV cache.
     sm_count : Optional[int], default=None
         Number of streaming multiprocessors to use.
