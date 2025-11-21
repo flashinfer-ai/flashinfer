@@ -15,6 +15,7 @@ def set_random_seed(seed=42):
     np.random.seed(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+    torch.cuda.random.manual_seed_all(seed)
 
 
 def round_up(a, b):
@@ -268,7 +269,9 @@ def test_xqa(
 
     # Shuffle page indices
     flattened = page_list_arg.flatten()
-    indices = torch.randperm(flattened.numel(), device="cuda")
+    generator = torch.Generator(device="cuda")
+    generator.manual_seed(42)
+    indices = torch.randperm(flattened.numel(), generator=generator, device="cuda")
     shuffled_flat = flattened[indices]
     page_list_arg = shuffled_flat.view(batch_size, nb_pages_per_seq)
 
@@ -335,6 +338,9 @@ def test_xqa(
 
     rcp_out_scale = 4.0 if use_fp8_output else 1.0
 
+    torch.cuda.synchronize()
+    semaphores.zero_()
+
     xqa(
         q_heads,
         cache_k_heads.to(torch.float8_e4m3fn) if fp8_kv_cache else cache_k_heads,
@@ -347,14 +353,16 @@ def test_xqa(
         nb_k_heads,
         tokens_per_page,
         sinks=attention_sinks,
-        q_scale=q_scale,
-        kv_scale=kv_cache_scale,
+        q_scale=torch.tensor(q_scale, device="cuda"),
+        kv_scale=torch.tensor(kv_cache_scale, device="cuda"),
         sliding_win_size=sliding_win_size,
         kv_layout=kv_layout,
         sm_count=sm_count,
         enable_pdl=enable_pdl,
         rcp_out_scale=rcp_out_scale,
     )
+
+    torch.cuda.synchronize()
 
     for req in range(batch_size):
         for b in range(beam_width):
