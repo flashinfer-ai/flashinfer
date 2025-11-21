@@ -1694,7 +1694,7 @@ def get_fmha_cutlass_sm100a_uri(
     # )
 
 
-def gen_fmha_cutlass_sm100a_module( 
+def gen_fmha_cutlass_sm100a_module(
     dtype_q: torch.dtype,
     dtype_kv: torch.dtype,
     dtype_o: torch.dtype,
@@ -1872,7 +1872,6 @@ def gen_cudnn_fmha_module():
     )
 
 
-
 def get_trtllm_fmha_v2_module():
     """Get compiled TRT-LLM FMHA v2 module."""
     module = gen_trtllm_fmha_v2_module().build_and_load()
@@ -1889,70 +1888,76 @@ def gen_trtllm_fmha_v2_module() -> JitSpec:
     # Copy the entire fmha_v2 directory to temp_dir first
     import shutil
     import importlib.util
-    import sys
-    import os
-    
+
     # Source and destination directories
     fmha_v2_source_dir = jit_env.FLASHINFER_CSRC_DIR / "fmha_v2"
     fmha_v2_temp_dir = temp_dir / "fmha_v2"
-    
+
     # Copy the entire fmha_v2 directory
     print(f"Copying fmha_v2 directory from {fmha_v2_source_dir} to {fmha_v2_temp_dir}")
     if fmha_v2_temp_dir.exists():
         shutil.rmtree(fmha_v2_temp_dir)
     shutil.copytree(fmha_v2_source_dir, fmha_v2_temp_dir)
-    
+
     # Generate source files
-    kernel_path = temp_dir / f"fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_192x128_output_bf16_sm120.cu"
-    binding_path = temp_dir / f"trtllm_fmha_v2_binding.cu"
-    print("kernel_path:", kernel_path)
+    binding_path = temp_dir / "trtllm_fmha_v2_binding.cu"
     print("binding_path:", binding_path)
-    
+
     # Path to the setup.py file in the copied directory
     setup_path = fmha_v2_temp_dir / "setup.py"
-    
+
     # Create a context manager to temporarily change directory
     class ChangeDir:
         def __init__(self, path):
             self.path = path
             self.old_cwd = None
-            
+
         def __enter__(self):
             self.old_cwd = os.getcwd()
             os.chdir(str(self.path))
             return self
-            
+
         def __exit__(self, exc_type, exc_val, exc_tb):
             os.chdir(self.old_cwd)
-    
+
     # Load and execute the module from the copied directory
     with ChangeDir(fmha_v2_temp_dir):
         # Load the module dynamically
         spec = importlib.util.spec_from_file_location("fmha_v2_setup", setup_path)
         fmha_v2_setup = importlib.util.module_from_spec(spec)
-        
+
         # Set __file__ attribute so the module knows its location
         fmha_v2_setup.__file__ = str(setup_path)
-        
+
         # Execute the module
         spec.loader.exec_module(fmha_v2_setup)
-        
+
         # Now call enumerate_kernels_custom in the correct directory
         kernels = fmha_v2_setup.enumerate_kernels_custom()
-        
-        print("enumerate_kernels_custom returned:", kernels)
         print("Working directory during execution:", os.getcwd())
-    
+
     print("FLASHINFER_CSRC_DIR:", jit_env.FLASHINFER_CSRC_DIR)
 
     # Copy the generated kernel file from the temp fmha_v2 directory
-    generated_kernel_path = fmha_v2_temp_dir / "generated" / "fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_192x128_output_bf16_sm120.cu"
-    if generated_kernel_path.exists():
-        shutil.copy2(generated_kernel_path, kernel_path)
-        print(f"Copied kernel file from {generated_kernel_path} to {kernel_path}")
-    else:
-        print(f"Warning: Generated kernel file not found at {generated_kernel_path}")
-    
+    kernels = [
+        "fmha_v2_flash_attention_bf16_64_128_S_q_k_v_192x128_sm120.cu",
+        "fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_192x128_output_bf16_sm120.cu",
+        "fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_192x128_sm120.cu",
+    ]
+
+    kernel_paths = []
+    for kernel in kernels:
+        generated_kernel_path = fmha_v2_temp_dir / "generated" / kernel
+        if generated_kernel_path.exists():
+            kernel_path = temp_dir / kernel
+            shutil.copy2(generated_kernel_path, kernel_path)
+            kernel_paths.append(generated_kernel_path)
+            print(f"Copied kernel file from {generated_kernel_path} to {kernel_path}")
+        else:
+            print(
+                f"Warning: Generated kernel file not found at {generated_kernel_path}"
+            )
+
     # Copy the binding file from the original location
     binding_source_path = jit_env.FLASHINFER_CSRC_DIR / "trtllm_fmha_v2_binding.cu"
     if binding_source_path.exists():
@@ -1961,14 +1966,14 @@ def gen_trtllm_fmha_v2_module() -> JitSpec:
     else:
         print(f"Warning: Binding file not found at {binding_source_path}")
     # Source paths
-    source_paths = [kernel_path, binding_path]
-    print("Source paths:", source_paths)
-    
+    source_paths = kernel_paths + [binding_path]
+    # print("Source paths:", source_paths)
+
     # NVCC flags
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
         supported_major_versions=[10, 11, 12]
     )
-    
+
     # Add TRT-LLM specific flags
     trtllm_flags = [
         "-DFMHA_ENABLE_SM89_QMMA",
@@ -1980,9 +1985,9 @@ def gen_trtllm_fmha_v2_module() -> JitSpec:
         f"-I{jit_env.FLASHINFER_CSRC_DIR / 'fmha_v2' / 'generated'}",
         f"-I{jit_env.FLASHINFER_INCLUDE_DIR}",  # Add FlashInfer include directory
     ]
-    
+
     nvcc_flags.extend(trtllm_flags)
-    
+
     return gen_jit_spec(
         uri,
         source_paths,

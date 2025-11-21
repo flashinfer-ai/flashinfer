@@ -3543,20 +3543,81 @@ def trtllm_batch_context_with_kv_cache(
     )
 
 
-# WIP (jimmyzho)
-def trtllm_fmha_v2_attention() -> torch.Tensor:
-    # Get compiled module
-    q = torch.randn(1024, 128, 192, dtype=torch.float16, device="cuda")
-    k = torch.randn(1024, 128, 192, dtype=torch.float16, device="cuda")
-    v = torch.randn(1024, 128, 128, dtype=torch.float16, device="cuda")
-    o = torch.randn(1024, 128, 128, dtype=torch.float16, device="cuda")
-    lse = torch.randn(1024, 128, dtype=torch.float32, device="cuda")
-    sm_scale = 1.0
-    num_heads = 128
-    head_dim = 192
-    seq_len = 1024
-
+def trtllm_prefill_deepseek(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    out: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    seq_len: int,
+    scale_softmax: float,
+    scale_bmm1: Optional[float] = None,
+    scale_bmm2: Optional[float] = None,
+    return_lse: bool = False,
+    lse: Optional[torch.Tensor] = None,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    """
+    Parameters
+    ----------
+    query : torch.Tensor
+        query tensor with shape [batch_size, seq_len, num_heads, head_dim]
+    key : torch.Tensor
+        key tensor with shape [batch_size, seq_len, num_heads, head_dim]
+    value : torch.Tensor
+        value tensor with shape [batch_size, seq_len, num_heads, head_dim]
+    out : torch.Tensor
+        output tensor with shape [batch_size, seq_len, num_heads, head_dim]
+    return_lse : bool
+        whether to return the log-sum-exp of attention output
+    num_heads : int
+        number of heads
+    head_dim : int
+        head dimension
+    seq_len : int
+        sequence length
+    scale_softmax : float
+        scale for softmax
+    scale_bmm1 : Optional[float]
+        scale for bmm1
+    scale_bmm2 : Optional[float]
+        scale for bmm2
+    lse : Optional[torch.Tensor]
+        log-sum-exp of attention output
+    Returns
+    -------
+    out: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        output torch.Tensor or Tuple[torch.Tensor, torch.Tensor].
+        If return_lse is True, the output will be a tuple of two tensors, the first is the output tensor, the second is the lse tensor.
+        If return_lse is False, the output will be a single tensor.
+    """
+    assert query.shape[3] == 192 and key.shape[3] == 192 and value.shape[3] == 128, (
+        "currently only support deepseek r1 192 query and 128 value"
+    )
     module = get_trtllm_fmha_v2_module()
-    module.run(q, k, v, o, lse, sm_scale, num_heads, head_dim, seq_len)
-
-    return o
+    is_e4m3 = query.dtype == torch.float8_e4m3fn
+    is_bf16_output = out.dtype == torch.bfloat16
+    scale_softmax = (
+        scale_softmax if scale_softmax is not None else 1.0 if is_e4m3 else 0.0
+    )
+    scale_bmm1 = scale_bmm1 if scale_bmm1 is not None else 1.0
+    scale_bmm2 = scale_bmm2 if scale_bmm2 is not None else 1.0
+    module.run(
+        query,
+        key,
+        value,
+        out,
+        lse,
+        num_heads,
+        head_dim,
+        seq_len,
+        scale_softmax,
+        scale_bmm1,
+        scale_bmm2,
+        is_e4m3,
+        is_bf16_output,
+    )
+    if return_lse:
+        return out, lse
+    else:
+        return out

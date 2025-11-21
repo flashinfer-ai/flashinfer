@@ -15,13 +15,13 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <fused_multihead_attention.h>
-#include <string>
+
 #include <memory>
+#include <string>
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-namespace lightweight_fmha
-{
+namespace lightweight_fmha {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -30,41 +30,37 @@ namespace lightweight_fmha
 // This function is only available when linking against .cu.o object files
 void run_lightweight_flash_attention_e4m3_fp32(
     const bert::Fused_multihead_attention_params_v2& params,
-    const bert::Fused_multihead_attention_launch_params& launch_params,
-    cudaStream_t stream);
+    const bert::Fused_multihead_attention_launch_params& launch_params, cudaStream_t stream);
 #endif
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Class for loading and running kernels from cubin files
-class CubinFlashAttention
-{
-public:
-    // Constructor loads the cubin file
-    CubinFlashAttention(const std::string& cubin_path);
-    
-    // Destructor cleans up
-    ~CubinFlashAttention();
-    
-    // Run the flash attention kernel
-    void run(
-        const bert::Fused_multihead_attention_params_v2& params,
-        const bert::Fused_multihead_attention_launch_params& launch_params,
-        cudaStream_t stream);
-    
-private:
-    CUmodule module_;
-    CUfunction kernel_nl_tiled_;
-    CUfunction kernel_nl_tiled_causal_;
-    bool initialized_;
-    
-    // Disable copy
-    CubinFlashAttention(const CubinFlashAttention&) = delete;
-    CubinFlashAttention& operator=(const CubinFlashAttention&) = delete;
+class CubinFlashAttention {
+ public:
+  // Constructor loads the cubin file
+  CubinFlashAttention(const std::string& cubin_path);
+
+  // Destructor cleans up
+  ~CubinFlashAttention();
+
+  // Run the flash attention kernel
+  void run(const bert::Fused_multihead_attention_params_v2& params,
+           const bert::Fused_multihead_attention_launch_params& launch_params, cudaStream_t stream);
+
+ private:
+  CUmodule module_;
+  CUfunction kernel_nl_tiled_;
+  CUfunction kernel_nl_tiled_causal_;
+  bool initialized_;
+
+  // Disable copy
+  CubinFlashAttention(const CubinFlashAttention&) = delete;
+  CubinFlashAttention& operator=(const CubinFlashAttention&) = delete;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-} // namespace lightweight_fmha
+}  // namespace lightweight_fmha
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
