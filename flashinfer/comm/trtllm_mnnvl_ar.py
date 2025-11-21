@@ -65,11 +65,11 @@ class MNNVLAllreduceFusionWorkspace:
 
         Args:
             mapping: Mapping configuration containing rank info
-            buffer_size_in_bytes: The size in bytes for each lamport buffer. The actual allocation size will be NUM_LAMPORT_BUFFERS * buffer_size_in_bytes.
+            buffer_size_in_bytes: The requested size in bytes for each lamport buffer. The actual allocation size may be larger due to alignment requirements. The actual usable size will be NUM_LAMPORT_BUFFERS * actual_buffer_size_per_lamport_buffer.
         """
         if buffer_size_in_bytes is None:
-            # Default to 512MB workspace size if not provided
-            buffer_size_in_bytes = 512 * (1024**2)
+            # Default to 16MB workspace size if not provided
+            buffer_size_in_bytes = 16 * (1024**2)
         else:
             # Round up to the nearest multiple of 8MB
             buffer_size_in_bytes = math.ceil(buffer_size_in_bytes / (8 * (1024**2))) * (8 * (1024**2))
@@ -80,20 +80,36 @@ class MNNVLAllreduceFusionWorkspace:
                 f"The buffer size in bytes {buffer_size_in_bytes} is greater than the maximum supported size (UINT32_MAX)."
             )
 
-        self.buffer_size_bytes = buffer_size_in_bytes
-        self.workspace_size_bytes = buffer_size_in_bytes * self.NUM_LAMPORT_BUFFERS
+        # Calculate total requested workspace size
+        requested_workspace_size = buffer_size_in_bytes * self.NUM_LAMPORT_BUFFERS
+
         self.rank = mapping.tp_rank
         self.tp_size = mapping.tp_size
         logging.debug(
-            f"[MNNVL Allreduce] TP size: {mapping.tp_size}, rank: {mapping.tp_rank}, Allocating workspace with size {buffer_size_in_bytes} bytes."
+            f"[MNNVL Allreduce] TP size: {mapping.tp_size}, rank: {mapping.tp_rank}, Allocating workspace with requested size {buffer_size_in_bytes} bytes per buffer."
         )
+
+        # Allocate the workspace
         self.mcast_buffer_handle = McastGPUBuffer(
-            self.workspace_size_bytes,
+            requested_workspace_size,
             mapping.tp_size,
             mapping.tp_rank,
             torch.device("cuda", mapping.local_rank),
             mapping.is_multi_node(),
             comm_backend,
+        )
+
+        # Get the actual usable buffer size after allocation (buf_size is updated by McastGPUBuffer)
+        allocated_size = self.mcast_buffer_handle.buf_size
+        # We want the buffer size to be aligned to 16B which is the granularity for buffer management.
+        self.buffer_size_bytes = (
+            math.floor(allocated_size / self.NUM_LAMPORT_BUFFERS) // 16 * 16
+        )
+        # This workspace size is used for checking the buffer. We need to set it to the actual size in use. The buffer free logic does not rely on this size.
+        self.workspace_size_bytes = self.buffer_size_bytes * self.NUM_LAMPORT_BUFFERS
+
+        logging.debug(
+            f"[MNNVL Allreduce] Actual allocated size: {allocated_size} bytes, Actual buffer size per lamport buffer: {self.buffer_size_bytes} bytes, total workspace: {self.workspace_size_bytes} bytes."
         )
 
         # We use FP32 for sentinel value regardless of the real dtype
