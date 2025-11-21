@@ -169,6 +169,20 @@ o = flashinfer.single_prefill_with_kv_cache(q, k, v, causal=False) # prefill att
 
 Check out [documentation](https://docs.flashinfer.ai/) for usage of batch decode/append/prefill kernels and shared-prefix cascading kernels.
 
+## API Logging
+
+FlashInfer provides comprehensive API logging for debugging. Enable it using environment variables:
+
+```bash
+# Enable logging (levels: 0=off (default), 1=basic, 3=detailed, 5=statistics)
+export FLASHINFER_LOGLEVEL_DBG=3
+
+# Set log destination (stdout (default), stderr, or file path)
+export FLASHINFER_LOGDEST_DBG=stdout
+```
+
+For detailed information about logging levels, configuration, and advanced features, see [LOGGING.md](LOGGING.md).
+
 ## Custom Attention Variants
 
 Starting from FlashInfer v0.2, users can customize their own attention variants with additional parameters. For more details, refer to our [JIT examples](https://github.com/flashinfer-ai/flashinfer/blob/main/tests/utils/test_jit_example.py).
