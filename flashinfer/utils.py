@@ -921,6 +921,13 @@ def backend_requirement(
         backends. Should accept the same arguments as the decorated function and return
         True if requirements are met, False otherwise.
         In the case where the kernel function does not have any specific backends, this can be decorated with @supported_compute_capability to specify the function's supported compute capabilities.
+    heuristic_func : callable, optional
+        A function that performs heuristic backend selection when backend is "auto".
+        Must be provided if backend is "auto". Does not do anything if backend is not "auto".
+        Should accept the same arguments as the decorated function.
+        Should return an ordered list of runnable backends with the most preferred backend first.
+        When decorated function is not autotuned, the first backend in the heuristic list will be run.
+        When decorated function is autotuned, the backends in the heuristic list will be autotuned over to find the best backend.
 
     Returns
     -------
@@ -1076,8 +1083,8 @@ def backend_requirement(
                 except ValueError:
                     continue
             # If a heuristic function is provided, filter the suitable backends based on the heuristic function
-            if heuristic_func is not None:
-                suitable_backends = heuristic_func(suitable_backends, *args, **kwargs)
+            assert heuristic_func is not None, "Heuristic function must be provided"
+            suitable_backends = heuristic_func(suitable_backends, *args, **kwargs)
             if not suitable_backends:
                 return False
             wrapper.suitable_auto_backends = suitable_backends
