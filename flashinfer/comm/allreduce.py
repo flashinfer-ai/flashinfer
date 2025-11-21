@@ -137,7 +137,6 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         tp_rank: int,
         max_token_num: int,
         hidden_dim: int,
-        dtype: torch.dtype,
         process_group: Optional["torch.distributed.ProcessGroup"] = None,
         **kwargs,
     ):
@@ -161,13 +160,14 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             tp_size=tp_size,
             max_token_num=max_token_num,
             hidden_dim=hidden_dim,
-            process_group=process_group,
+            group=process_group,
             **kwargs,
         )
 
         # Store essential attributes for easy access
-        self.workspace_ptrs = self._internal_workspace.workspace_ptrs
-        self.metadata = self._internal_workspace.metadata
+        self.ipc_handles = self._internal_workspace[0]
+        self.workspace_tensor = self._internal_workspace[1]
+        self.metadata = self._internal_workspace[2]
 
     def __getattr__(self, name):
         """Delegate attribute access to internal workspace if not found."""
@@ -726,37 +726,49 @@ def _allreduce_fusion_trtllm(
 ) -> torch.Tensor:
     """TensorRT-LLM backend implementation."""
 
+    # Extract shape from 2D input
     token_num, hidden_dim = input.shape
 
+    # Allocate output if needed (keep 2D shape)
     if output is None:
         output = torch.empty_like(input)
 
+    # Flatten all tensors to 1D for legacy trtllm_allreduce_fusion API
+    # The legacy API expects flattened tensors and explicit token_num/hidden_dim
+    input_flat = input.flatten()
+    output_flat = output.flatten()
+    residual_in_flat = residual_in.flatten() if residual_in is not None else None
+    residual_out_flat = residual_out.flatten() if residual_out is not None else None
+    norm_out_flat = norm_out.flatten() if norm_out is not None else None
+    quant_out_flat = quant_out.flatten() if quant_out is not None else None
+
+    # Call legacy API with flattened tensors
     trtllm_allreduce_fusion(
-        allreduce_in=input,
+        allreduce_in=input_flat,
         world_size=workspace.world_size,
         world_rank=workspace.rank,
         token_num=token_num,
         hidden_dim=hidden_dim,
-        workspace_ptrs=workspace.workspace_ptrs,
+        workspace_ptrs=workspace.workspace_tensor,
         launch_with_pdl=launch_with_pdl,
         trigger_completion_at_end=launch_with_pdl,  # Same meaning
         fp32_acc=fp32_acc,
         pattern_code=pattern,
         use_oneshot=use_oneshot,
-        allreduce_out=output,
-        residual_in=residual_in,
-        residual_out=residual_out,
-        norm_out=norm_out,
-        quant_out=quant_out,
-        scale_out=scale_out,
-        rms_gamma=rms_gamma,
+        allreduce_out=output_flat,
+        residual_in=residual_in_flat,
+        residual_out=residual_out_flat,
+        norm_out=norm_out_flat,
+        quant_out=quant_out_flat,
+        scale_out=scale_out,  # scale_out is not reshaped
+        rms_gamma=rms_gamma,  # 1D tensor, no reshape needed
         rms_eps=rms_eps,
         scale_factor=scale_factor,
         layout_code=layout_code,
         metadata=metadata,
     )
 
-    # Return the most downstream output
+    # Return the most downstream output (already in 2D shape from input views)
     if norm_out is not None:
         return norm_out
     elif quant_out is not None:

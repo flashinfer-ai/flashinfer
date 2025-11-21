@@ -40,7 +40,6 @@ from .vllm_ar import register_buffer as vllm_register_buffer
 from .vllm_ar import register_graph_buffers as vllm_register_graph_buffers
 
 # Unified AllReduce Fusion API
-from .allreduce import AllReduceFusionContext as AllReduceFusionContext
 from .allreduce import AllReduceFusionWorkspace as AllReduceFusionWorkspace
 from .allreduce import MNNVLAllReduceFusionWorkspace as MNNVLAllReduceFusionWorkspace
 from .allreduce import TRTLLMAllReduceFusionWorkspace as TRTLLMAllReduceFusionWorkspace
