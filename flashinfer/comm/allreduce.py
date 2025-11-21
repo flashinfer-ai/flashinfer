@@ -54,10 +54,24 @@ from abc import ABC, abstractmethod
 import torch
 
 from ..utils import backend_requirement, supported_compute_capability
+from .trtllm_ar import trtllm_allreduce_fusion
+from .trtllm_ar import trtllm_create_ipc_workspace_for_all_reduce_fusion
+from .trtllm_ar import trtllm_destroy_ipc_workspace_for_all_reduce_fusion
 
 
 # ============================================================================
-# WORKSPACE BASE CLASS
+# WORKSPACE BASE CLASS AND IMPLEMENTATIONS
+# ============================================================================
+#
+# Workspace classes wrap the underlying backend workspace implementations:
+# - TRTLLMAllReduceFusionWorkspace: Wraps trtllm_create_ipc_workspace_for_all_reduce_fusion
+# - MNNVLAllReduceFusionWorkspace: Wraps MNNVL workspace (to be implemented)
+#
+# Each workspace:
+# 1. Calls the backend-specific workspace creation function in __init__
+# 2. Stores the internal workspace as _internal_workspace
+# 3. Exposes essential attributes for the unified API
+# 4. Can be destroyed using destroy_allreduce_fusion_workspace()
 # ============================================================================
 
 
@@ -67,6 +81,7 @@ class AllReduceFusionWorkspace(ABC):
     def __init__(self, world_size: int, rank: int):
         self.world_size = world_size
         self.rank = rank
+        self._destroyed = False
 
     @property
     @abstractmethod
@@ -74,14 +89,105 @@ class AllReduceFusionWorkspace(ABC):
         """Return backend name."""
         pass
 
+    @abstractmethod
+    def destroy(self) -> None:
+        """
+        Destroy workspace and free resources.
+
+        This should be called explicitly when done using the workspace.
+        Prefer using AllReduceFusionContext context manager for automatic cleanup.
+        """
+        pass
+
+    def __del__(self):
+        """
+        Destructor - safety net if destroy() wasn't called explicitly.
+
+        Warns if cleanup wasn't done properly. Not recommended to rely on this
+        as __del__ timing is non-deterministic and can cause issues with
+        distributed/CUDA resources.
+        """
+        if not self._destroyed:
+            import warnings
+
+            warnings.warn(
+                f"{self.__class__.__name__} was not explicitly destroyed. "
+                f"Call workspace.destroy() or use AllReduceFusionContext to ensure "
+                f"proper cleanup of distributed/CUDA resources.",
+                ResourceWarning,
+                stacklevel=2,
+            )
+            try:
+                self.destroy()
+            except Exception as e:
+                # Can't raise in __del__, just warn
+                warnings.warn(
+                    f"Error during automatic cleanup of {self.__class__.__name__}: {e}",
+                    ResourceWarning,
+                    stacklevel=2,
+                )
+
 
 class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
     """TensorRT-LLM workspace for AllReduce fusion."""
 
-    def __init__(self, world_size: int, rank: int, workspace_ptrs, metadata):
-        super().__init__(world_size, rank)
-        self.workspace_ptrs = workspace_ptrs
-        self.metadata = metadata
+    def __init__(
+        self,
+        tp_size: int,
+        tp_rank: int,
+        max_token_num: int,
+        hidden_dim: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        process_group: Optional["torch.distributed.ProcessGroup"] = None,
+        **kwargs,
+    ):
+        """
+        Create TensorRT-LLM AllReduce fusion workspace.
+
+        Args:
+            tp_size: Tensor parallel size (world size)
+            tp_rank: Tensor parallel rank
+            max_token_num: Maximum number of tokens
+            hidden_dim: Hidden dimension size
+            dtype: Data type
+            device: CUDA device
+            process_group: PyTorch distributed process group
+            **kwargs: Additional arguments for workspace creation
+        """
+        super().__init__(tp_size, tp_rank)
+
+        # Call the actual workspace creation function
+        self._internal_workspace = trtllm_create_ipc_workspace_for_all_reduce_fusion(
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+            max_token_num=max_token_num,
+            hidden_dim=hidden_dim,
+            dtype=dtype,
+            device=device,
+            process_group=process_group,
+            **kwargs,
+        )
+
+        # Store essential attributes for easy access
+        self.workspace_ptrs = self._internal_workspace.workspace_ptrs
+        self.metadata = self._internal_workspace.metadata
+
+    def __getattr__(self, name):
+        """Delegate attribute access to internal workspace if not found."""
+        if name.startswith("_"):
+            raise AttributeError(
+                f"'{type(self).__name__}' object has no attribute '{name}'"
+            )
+        return getattr(self._internal_workspace, name)
+
+    def destroy(self) -> None:
+        """Destroy workspace and free resources."""
+        if self._destroyed:
+            return  # Already destroyed, nothing to do
+
+        trtllm_destroy_ipc_workspace_for_all_reduce_fusion(self._internal_workspace)
+        self._destroyed = True
 
     @property
     def backend(self) -> str:
@@ -95,18 +201,64 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         self,
         world_size: int,
         rank: int,
-        multicast_buffer_ptr: int,
-        buffer_ptrs_dev: int,
-        unicast_ptr: int,
-        buffer_M: int,
-        buffer_flags,
+        max_token_num: int,
+        hidden_dim: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        **kwargs,
     ):
+        """
+        Create MNNVL AllReduce fusion workspace.
+
+        Args:
+            world_size: Number of ranks
+            rank: Current rank
+            max_token_num: Maximum number of tokens
+            hidden_dim: Hidden dimension size
+            dtype: Data type
+            device: CUDA device
+            **kwargs: Additional arguments for workspace creation
+        """
         super().__init__(world_size, rank)
-        self.multicast_buffer_ptr = multicast_buffer_ptr
-        self.buffer_ptrs_dev = buffer_ptrs_dev
-        self.unicast_ptr = unicast_ptr
-        self.buffer_M = buffer_M
-        self.buffer_flags = buffer_flags
+
+        # TODO: Import and call the actual MNNVL workspace creation function
+        # For now, raise NotImplementedError
+        raise NotImplementedError(
+            "MNNVL workspace creation needs to be implemented in trtllm_mnnvl_ar.py. "
+            "Expected function: create_mnnvl_allreduce_fusion_workspace"
+        )
+
+        # When implemented, should look like:
+        # from .trtllm_mnnvl_ar import create_mnnvl_allreduce_fusion_workspace
+        #
+        # self._internal_workspace = create_mnnvl_allreduce_fusion_workspace(
+        #     world_size=world_size,
+        #     rank=rank,
+        #     max_token_num=max_token_num,
+        #     hidden_dim=hidden_dim,
+        #     dtype=dtype,
+        #     device=device,
+        #     **kwargs,
+        # )
+        #
+        # # Store essential attributes for easy access
+        # self.multicast_buffer_ptr = self._internal_workspace.multicast_buffer_ptr
+        # self.buffer_ptrs_dev = self._internal_workspace.buffer_ptrs_dev
+        # self.unicast_ptr = self._internal_workspace.unicast_ptr
+        # self.buffer_M = self._internal_workspace.buffer_M
+        # self.buffer_flags = self._internal_workspace.buffer_flags
+
+    def destroy(self) -> None:
+        """Destroy workspace and free resources."""
+        if self._destroyed:
+            return  # Already destroyed, nothing to do
+
+        # TODO: Implement MNNVL workspace destruction
+        self._destroyed = True
+        raise NotImplementedError("MNNVL workspace destruction not yet implemented")
+        # from .trtllm_mnnvl_ar import destroy_mnnvl_allreduce_fusion_workspace
+        # destroy_mnnvl_allreduce_fusion_workspace(self._internal_workspace)
+        # self._destroyed = True
 
     @property
     def backend(self) -> str:
@@ -337,11 +489,9 @@ def create_allreduce_fusion_workspace(
     else:
         actual_backend = backend
 
-    # Create workspace for selected backend
+    # Create workspace for selected backend using workspace constructors
     if actual_backend == "trtllm":
-        from .trtllm_ar import trtllm_create_ipc_workspace_for_all_reduce_fusion
-
-        workspace = trtllm_create_ipc_workspace_for_all_reduce_fusion(
+        return TRTLLMAllReduceFusionWorkspace(
             tp_size=world_size,
             tp_rank=rank,
             max_token_num=max_token_num,
@@ -351,30 +501,17 @@ def create_allreduce_fusion_workspace(
             process_group=process_group,
             **backend_kwargs,
         )
-        # Ensure workspace has required attributes for our API
-        if not hasattr(workspace, "world_size"):
-            workspace.world_size = world_size
-        if not hasattr(workspace, "rank"):
-            workspace.rank = rank
-        return workspace
 
     elif actual_backend == "mnnvl":
-        # TODO: Implement create_mnnvl_allreduce_fusion_workspace
-        # For now, raise NotImplementedError with instructions
-        raise NotImplementedError(
-            "MNNVL workspace creation needs to be implemented. "
-            "Expected function: trtllm_mnnvl_ar.create_mnnvl_allreduce_fusion_workspace"
+        return MNNVLAllReduceFusionWorkspace(
+            world_size=world_size,
+            rank=rank,
+            max_token_num=max_token_num,
+            hidden_dim=hidden_dim,
+            dtype=dtype,
+            device=device,
+            **backend_kwargs,
         )
-        # from .trtllm_mnnvl_ar import create_mnnvl_allreduce_fusion_workspace
-        # return create_mnnvl_allreduce_fusion_workspace(
-        #     world_size=world_size,
-        #     rank=rank,
-        #     max_token_num=max_token_num,
-        #     hidden_dim=hidden_dim,
-        #     dtype=dtype,
-        #     device=device,
-        #     **backend_kwargs
-        # )
     else:
         raise RuntimeError(f"Unknown backend: {actual_backend}")
 
@@ -388,8 +525,7 @@ def destroy_allreduce_fusion_workspace(workspace: AllReduceFusionWorkspace) -> N
     """
     Destroy workspace and free resources.
 
-    Automatically detects workspace type from the object and calls
-    appropriate cleanup function.
+    This is a convenience function that calls the workspace's destroy() method.
 
     Args:
         workspace: Workspace object to destroy
@@ -398,18 +534,9 @@ def destroy_allreduce_fusion_workspace(workspace: AllReduceFusionWorkspace) -> N
         >>> workspace = create_allreduce_fusion_workspace(...)
         >>> # ... use workspace ...
         >>> destroy_allreduce_fusion_workspace(workspace)
+        >>> # Or call directly: workspace.destroy()
     """
-    if isinstance(workspace, TRTLLMAllReduceFusionWorkspace):
-        from .trtllm_ar import trtllm_destroy_ipc_workspace_for_all_reduce_fusion
-
-        trtllm_destroy_ipc_workspace_for_all_reduce_fusion(workspace)
-    elif isinstance(workspace, MNNVLAllReduceFusionWorkspace):
-        # TODO: Implement MNNVL workspace destruction
-        raise NotImplementedError("MNNVL workspace destruction not yet implemented")
-        # from .trtllm_mnnvl_ar import destroy_mnnvl_allreduce_fusion_workspace
-        # destroy_mnnvl_allreduce_fusion_workspace(workspace)
-    else:
-        raise TypeError(f"Unknown workspace type: {type(workspace)}")
+    workspace.destroy()
 
 
 # ============================================================================
@@ -619,7 +746,6 @@ def _allreduce_fusion_trtllm(
     metadata: Optional[dict],
 ) -> torch.Tensor:
     """TensorRT-LLM backend implementation."""
-    from .trtllm_ar import trtllm_allreduce_fusion
 
     token_num, hidden_dim = input.shape
 
@@ -678,8 +804,6 @@ def _allreduce_fusion_mnnvl(
     2. Add residual
     3. RMSNorm
     """
-    from .trtllm_mnnvl_ar import trtllm_mnnvl_fused_allreduce_rmsnorm
-
     # Validate required parameters for RMS fusion
     if residual_in is None:
         raise ValueError("MNNVL AllReduce+RMS fusion requires residual_in")
@@ -693,117 +817,6 @@ def _allreduce_fusion_mnnvl(
         raise ValueError("MNNVL AllReduce+RMS fusion requires rms_gamma")
 
     # Call the MNNVL fusion function
-    trtllm_mnnvl_fused_allreduce_rmsnorm(
-        prenorm_output=residual_out,
-        normed_output=norm_out,
-        shard_input=input,
-        multicast_buffer_ptr=workspace.multicast_buffer_ptr,
-        buffer_ptrs_dev=workspace.buffer_ptrs_dev,
-        unicast_ptr=workspace.unicast_ptr,
-        buffer_M=workspace.buffer_M,
-        buffer_flags_mnnvl=workspace.buffer_flags,
-        nranks=workspace.world_size,
-        rank=workspace.rank,
-        gamma=rms_gamma,
-        epsilon=rms_eps,
-        residual=residual_in,
-        launch_with_pdl=launch_with_pdl,
-    )
+    raise NotImplementedError("MNNVL AllReduce+RMS fusion is not implemented")
 
     return norm_out
-
-
-# ============================================================================
-# CONTEXT MANAGER
-# ============================================================================
-
-
-class AllReduceFusionContext:
-    """
-    Context manager with automatic workspace management.
-
-    This provides a convenient high-level API that handles workspace
-    creation and cleanup automatically.
-
-    Example:
-        >>> with AllReduceFusionContext(
-        ...     backend="auto",
-        ...     world_size=8,
-        ...     rank=0,
-        ...     max_token_num=2048,
-        ...     hidden_dim=4096,
-        ...     dtype=torch.bfloat16,
-        ...     topology="single_node"
-        ... ) as ctx:
-        ...     for batch in training_loop:
-        ...         prenorm = torch.empty_like(batch.hidden_states)
-        ...         normed = torch.empty_like(batch.hidden_states)
-        ...
-        ...         output = ctx.allreduce_fusion(
-        ...             input=batch.hidden_states,
-        ...             residual_out=prenorm,
-        ...             norm_out=normed,
-        ...             residual_in=batch.residual,
-        ...             rms_gamma=model.norm_weight,
-        ...             launch_with_pdl=True
-        ...         )
-        >>> # Workspace automatically cleaned up
-    """
-
-    def __init__(
-        self,
-        backend: Literal["trtllm", "mnnvl", "auto"] = "auto",
-        world_size: int = None,
-        rank: int = None,
-        max_token_num: int = None,
-        hidden_dim: int = None,
-        dtype: torch.dtype = None,
-        device: Optional[torch.device] = None,
-        topology: str = "single_node",
-        **kwargs,
-    ):
-        """
-        Initialize context manager.
-
-        Args:
-            backend: Backend to use ("trtllm", "mnnvl", or "auto")
-            world_size: Number of ranks
-            rank: Current rank
-            max_token_num: Maximum tokens to support
-            hidden_dim: Hidden dimension
-            dtype: Data type
-            device: CUDA device
-            topology: Network topology ("single_node" or "multi_node")
-            **kwargs: Additional backend-specific arguments
-        """
-        # Workspace creation does all the selection logic via decorator
-        self.workspace = create_allreduce_fusion_workspace(
-            backend=backend,
-            world_size=world_size,
-            rank=rank,
-            max_token_num=max_token_num,
-            hidden_dim=hidden_dim,
-            dtype=dtype,
-            device=device,
-            topology=topology,
-            **kwargs,
-        )
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        destroy_allreduce_fusion_workspace(self.workspace)
-
-    def allreduce_fusion(self, input: torch.Tensor, **kwargs) -> torch.Tensor:
-        """
-        Call allreduce_fusion with the managed workspace.
-
-        Args:
-            input: Input tensor
-            **kwargs: Additional arguments passed to allreduce_fusion()
-
-        Returns:
-            Output tensor
-        """
-        return allreduce_fusion(input=input, workspace=self.workspace, **kwargs)
