@@ -32,8 +32,6 @@ def _substitute_process_id(path: str) -> str:
 
     This is useful for multi-process/multi-GPU environments where each process
     needs its own log file.
-
-    Example: "flashinfer_log_%i.txt" -> "flashinfer_log_12345.txt"
     """
     if "%i" in path:
         return path.replace("%i", str(os.getpid()))
@@ -45,38 +43,6 @@ _API_LOG_LEVEL = int(os.environ.get("FLASHINFER_LOGLEVEL_DBG", "0"))
 _API_LOG_DEST = _substitute_process_id(
     os.environ.get("FLASHINFER_LOGDEST_DBG", "stdout")
 )
-
-# Enable cuDNN, cuBLAS, and cuBLASLt API logging when FlashInfer logging level >= 5
-# Only override if the user hasn't already configured the logging switch
-# If the switch is not set, we override both the switch and destination as a bundle
-if _API_LOG_LEVEL >= 5:
-    # cuBLAS logging: Check switch, set both switch and destination
-    if "CUBLAS_LOGINFO_DBG" not in os.environ:
-        os.environ["CUBLAS_LOGINFO_DBG"] = "1"
-        os.environ["CUBLAS_LOGDEST_DBG"] = _substitute_process_id(
-            "flashinfer_cublas_log_%i.txt"
-        )
-
-    # cuBLASLt logging: Check switch, set both switch and destination
-    if "CUBLASLT_LOG_LEVEL" not in os.environ:
-        os.environ["CUBLASLT_LOG_LEVEL"] = "2"
-        os.environ["CUBLASLT_LOG_FILE"] = _substitute_process_id(
-            "flashinfer_cublaslt_log_%i.txt"
-        )
-
-    # cuDNN backend logging: Check switch, set both switch and destination
-    if "CUDNN_LOGLEVEL_DBG" not in os.environ:
-        os.environ["CUDNN_LOGLEVEL_DBG"] = "2.5"
-        os.environ["CUDNN_LOGDEST_DBG"] = _substitute_process_id(
-            "flashinfer_cudnn_backend_log_%i.txt"
-        )
-
-    # cuDNN frontend logging: Check switch, set both switch and destination
-    if "CUDNN_FRONTEND_LOG_INFO" not in os.environ:
-        os.environ["CUDNN_FRONTEND_LOG_INFO"] = "1"
-        os.environ["CUDNN_FRONTEND_LOG_FILE"] = _substitute_process_id(
-            "flashinfer_cudnn_frontend_log_%i.txt"
-        )
 
 # Create logger using Python's logging library
 _logger = logging.getLogger("flashinfer.api")
@@ -184,28 +150,6 @@ def _log_system_info():
 
         # PyTorch version
         lines.append(f"PyTorch version: {torch.__version__}")
-
-        # cuDNN/cuBLAS/cuBLASLt logging status
-        if _API_LOG_LEVEL >= 5:
-            lines.append("")
-            lines.append("cuDNN/cuBLAS/cuBLASLt Logging: Enabled (Level 5)")
-            cublas_info = os.environ.get("CUBLAS_LOGINFO_DBG", "not set")
-            cublas_dest = os.environ.get("CUBLAS_LOGDEST_DBG", "not set")
-            cublaslt_level = os.environ.get("CUBLASLT_LOG_LEVEL", "not set")
-            cublaslt_file = os.environ.get("CUBLASLT_LOG_FILE", "not set")
-            cudnn_level = os.environ.get("CUDNN_LOGLEVEL_DBG", "not set")
-            cudnn_dest = os.environ.get("CUDNN_LOGDEST_DBG", "not set")
-            cudnn_fe_info = os.environ.get("CUDNN_FRONTEND_LOG_INFO", "not set")
-            cudnn_fe_file = os.environ.get("CUDNN_FRONTEND_LOG_FILE", "not set")
-
-            lines.append(f"  CUBLAS_LOGINFO_DBG={cublas_info}")
-            lines.append(f"  CUBLAS_LOGDEST_DBG={cublas_dest}")
-            lines.append(f"  CUBLASLT_LOG_LEVEL={cublaslt_level}")
-            lines.append(f"  CUBLASLT_LOG_FILE={cublaslt_file}")
-            lines.append(f"  CUDNN_LOGLEVEL_DBG={cudnn_level}")
-            lines.append(f"  CUDNN_LOGDEST_DBG={cudnn_dest}")
-            lines.append(f"  CUDNN_FRONTEND_LOG_INFO={cudnn_fe_info}")
-            lines.append(f"  CUDNN_FRONTEND_LOG_FILE={cudnn_fe_file}")
 
     except Exception as e:
         lines.append(f"Error gathering system information: {e}")
@@ -519,7 +463,7 @@ def _log_function_outputs(func_name: str, result: Any, level: int) -> None:
     _logger.debug("\n".join(lines))
 
 
-def flashinfer_api_log(func: Callable = None) -> Callable:
+def flashinfer_log(func: Callable = None) -> Callable:
     """
     Decorator to log FlashInfer API calls using Python's logging library.
 
@@ -544,7 +488,7 @@ def flashinfer_api_log(func: Callable = None) -> Callable:
     --------
     Basic usage:
 
-    >>> @flashinfer_api_log
+    >>> @flashinfer_log
     ... def my_function(x, y):
     ...     return x + y
 
@@ -563,13 +507,7 @@ def flashinfer_api_log(func: Callable = None) -> Callable:
     - **CUDA Graph Compatibility**: At level 5, tensor statistics (min/max/mean/nan_count)
       are automatically skipped during CUDA graph capture to avoid synchronization issues.
       The message "[statistics skipped: CUDA graph capture in progress]" will be logged.
-    - **cuDNN/cuBLAS/cuBLASLt Integration**: At level 5, if not already set by the user, the following
-      environment variables are automatically configured to enable cuDNN, cuBLAS, and cuBLASLt logging:
-      - CUBLAS_LOGINFO_DBG=1, CUBLAS_LOGDEST_DBG=flashinfer_cublas_log_%i.txt
-      - CUBLASLT_LOG_LEVEL=2, CUBLASLT_LOG_FILE=flashinfer_cublaslt_log_%i.txt
-      - CUDNN_LOGLEVEL_DBG=2.5, CUDNN_LOGDEST_DBG=flashinfer_cudnn_backend_log_%i.txt
-      - CUDNN_FRONTEND_LOG_INFO=1, CUDNN_FRONTEND_LOG_FILE=flashinfer_cudnn_frontend_log_%i.txt
-      The %i pattern is automatically replaced with the process ID for multi-process environments.
+    - The %i pattern is automatically replaced with the process ID for multi-process environments.
     - The logger does not propagate to the root logger to avoid duplicate logs.
     """
     # If logging is disabled, return original function with zero overhead
@@ -621,7 +559,6 @@ def flashinfer_api_log(func: Callable = None) -> Callable:
 
         return wrapper
 
-    # Support both @flashinfer_api_log and @flashinfer_api_log()
     if func is None:
         return decorator
     return decorator(func)

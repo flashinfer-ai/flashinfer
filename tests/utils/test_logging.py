@@ -76,9 +76,9 @@ class TestAPILogging:
         if "flashinfer.api_logging" in sys.modules:
             del sys.modules["flashinfer.api_logging"]
 
-        from flashinfer.api_logging import flashinfer_api_log
+        from flashinfer.api_logging import flashinfer_log
 
-        return flashinfer_api_log
+        return flashinfer_log
 
     def test_level_0_zero_overhead(self):
         """Test that level 0 has truly zero overhead (returns original function)."""

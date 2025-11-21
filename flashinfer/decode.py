@@ -21,7 +21,7 @@ from typing import Any, List, Literal, Optional, Tuple, Union, overload
 
 import torch
 
-from .api_logging import flashinfer_api_log
+from .api_logging import flashinfer_log
 from .xqa import xqa, xqa_mla
 from .cudnn import cudnn_batch_decode_with_kv_cache as cudnn_batch_decode_with_kv_cache
 from .jit import (
@@ -313,7 +313,7 @@ def get_trtllm_gen_fmha_module():
     return op
 
 
-@flashinfer_api_log
+@flashinfer_log
 def single_decode_with_kv_cache_with_jit_module(
     jit_module: Any,
     q: torch.Tensor,
@@ -390,7 +390,7 @@ def single_decode_with_kv_cache(
 ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
 
-@flashinfer_api_log
+@flashinfer_log
 def single_decode_with_kv_cache(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -649,7 +649,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
     manages the lifecycle of these data structures.
     """
 
-    @flashinfer_api_log
+    @flashinfer_log
     def __init__(
         self,
         float_workspace_buffer: torch.Tensor,
@@ -813,7 +813,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             pin_memory=True,
         )
 
-    @flashinfer_api_log
+    @flashinfer_log
     def plan(
         self,
         indptr: torch.Tensor,
@@ -1167,7 +1167,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         window_left: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
-    @flashinfer_api_log
+    @flashinfer_log
     def run(
         self,
         q: torch.Tensor,
@@ -2065,7 +2065,7 @@ def get_trtllm_gen_decode_module(*args):
     )
 
 
-@flashinfer_api_log
+@flashinfer_log
 def trtllm_batch_decode_with_kv_cache(
     query: torch.Tensor,
     kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
@@ -2339,7 +2339,7 @@ def trtllm_batch_decode_with_kv_cache(
 
 
 # xqa uses NHD layout
-@flashinfer_api_log
+@flashinfer_log
 def xqa_batch_decode_with_kv_cache(
     query: torch.Tensor,
     kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
@@ -2524,7 +2524,7 @@ def _check_trtllm_gen_mla_shape(
         )
 
 
-@flashinfer_api_log
+@flashinfer_log
 def trtllm_batch_decode_with_kv_cache_mla(
     query: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -2686,7 +2686,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
         raise ValueError(f"Backend {backend} not supported")
 
 
-@flashinfer_api_log
+@flashinfer_log
 def xqa_batch_decode_with_kv_cache_mla(
     query: torch.Tensor,
     kv_cache: torch.Tensor,

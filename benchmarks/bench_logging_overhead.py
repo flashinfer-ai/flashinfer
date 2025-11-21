@@ -5,11 +5,6 @@ Benchmark script to measure the overhead of API logging at different levels.
 This script creates decorated and undecorated versions of a test function
 (torch.matmul) and compares their performance to accurately measure logging overhead.
 
-Why torch.matmul instead of bmm_fp8?
-  - bmm_fp8 is already decorated in the FlashInfer source code
-  - Using it would cause double-decoration and inaccurate results
-  - torch.matmul gives us a clean baseline to measure pure decorator overhead
-
 Usage:
     # Set the logging level before running
     export FLASHINFER_LOGLEVEL_DBG=3
@@ -37,30 +32,18 @@ LOGGING_LEVEL = int(os.environ.get("FLASHINFER_LOGLEVEL_DBG", "0"))
 LOG_DEST = os.environ.get("FLASHINFER_LOGDEST_DBG", "/tmp/flashinfer_benchmark_log.txt")
 
 # Import the decorator
-try:
-    from flashinfer.api_logging import flashinfer_api_log
-except ImportError as e:
-    print(f"Error: Could not import flashinfer: {e}")
-    print("Make sure flashinfer is installed.")
-    exit(1)
+from flashinfer.api_logging import flashinfer_log
 
 
 # Create two versions of a test function:
 # 1. Undecorated (baseline)
 # 2. Decorated (with logging)
-#
-# We use a simple torch.matmul instead of bmm_fp8 because bmm_fp8 is already
-# decorated in the source code, which would cause double-decoration.
-
-
 def test_matmul_undecorated(A, B):
-    """Undecorated version - baseline for comparison."""
     return torch.matmul(A, B)
 
 
-@flashinfer_api_log
+@flashinfer_log
 def test_matmul_decorated(A, B):
-    """Decorated version - with API logging."""
     return torch.matmul(A, B)
 
 

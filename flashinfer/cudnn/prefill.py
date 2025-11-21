@@ -3,7 +3,7 @@ from typing import Optional
 
 import torch
 
-from ..api_logging import flashinfer_api_log
+from ..api_logging import flashinfer_log
 from .utils import get_cudnn_fmha_gen_module
 
 try:
@@ -384,7 +384,7 @@ def _batch_prefill_with_kv_cache(
         return out, None
 
 
-@flashinfer_api_log
+@flashinfer_log
 def cudnn_batch_prefill_with_kv_cache(
     q: torch.Tensor,
     k_cache: torch.Tensor,
