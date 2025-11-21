@@ -21,7 +21,7 @@ python train.py
 
 | Level | Name | Features | Use Case |
 |-------|------|----------|----------|
-| **0** | Disabled (Default) | No logging (zero overhad) | Production |
+| **0** | Disabled (Default) | No logging (zero overhead) | Production |
 | **1** | Function Names | Function names only | Basic tracing |
 | **3** | Inputs/Outputs | Function names + arguments + outputs with metadata | Standard debugging |
 | **5** | Statistics | Level 3 + tensor statistics (min, max, mean, NaN/Inf counts) | Numerical analysis |
