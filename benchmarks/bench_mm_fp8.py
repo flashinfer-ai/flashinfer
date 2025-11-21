@@ -70,7 +70,7 @@ def bench_mm_fp8(m, n, k, in_dtype, out_dtype):
             out=res,
         ),
         dry_run_time_ms=25,
-        repeat_time_ms=100,  # Low latency kernels benchmarked run within 100 usec
+        repeat_time_ms=100,  # 100ms should be enough for low latency kernels that run within 100 usec
         use_cuda_graph=True,
         enable_cupti=True,
     )
