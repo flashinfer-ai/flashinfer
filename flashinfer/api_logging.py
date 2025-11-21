@@ -463,10 +463,13 @@ def _log_function_outputs(func_name: str, result: Any, level: int) -> None:
 
 def flashinfer_api(func: Callable = None) -> Callable:
     """
-    Decorator to log FlashInfer API calls using Python's logging library.
+    Decorator to FlashInfer's APIs.
 
+    Currently logs input and output values of the function using Python's logging library.
     This decorator integrates with Python's standard logging infrastructure while
     maintaining zero overhead when disabled (FLASHINFER_LOGLEVEL=0).
+
+    NOTE/TODO: Not all FlashInfer APIs are decorated with this decorator yet. This is a work in progress.
 
     Environment Variables
     ---------------------
