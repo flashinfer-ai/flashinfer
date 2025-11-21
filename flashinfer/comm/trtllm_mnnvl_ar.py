@@ -33,9 +33,18 @@ class MNNVLAllreduceFusionStrategy(Enum):
     AUTO = 99
 
     @staticmethod
+<<<<<<< HEAD
     def is_one_shot(tp_size: int, num_tokens: int, hidden_dim: int, dtype: torch.dtype) -> bool:
+=======
+    def select_strategy(
+        tp_size: int, num_tokens: int, hidden_dim: int, dtype: torch.dtype
+    ) -> "MNNVLAllreduceFusionStrategy":
+>>>>>>> c6ed1472 (Address review comments.)
         elem_size = torch.tensor([], dtype=dtype).element_size()
-        return num_tokens * hidden_dim * tp_size * elem_size <= MNNVL_ONE_SHOT_THRESHOLD
+        if num_tokens * hidden_dim * tp_size * elem_size <= MNNVL_ONE_SHOT_THRESHOLD:
+            return MNNVLAllreduceFusionStrategy.ONESHOT
+        else:
+            return MNNVLAllreduceFusionStrategy.TWOSHOT
 
 
 # Empirical result calculated from num_tokens * hidden_dim * tp_size * elem_size
@@ -52,15 +61,15 @@ class MNNVLAllreduceFusionWorkspace:
         comm_backend: Optional[CommBackend] = None,
     ):
         """
-        Initialize the MNNVL Allreduce Fusion Workspace. COMM_WORLD will be used for creating the workspace and synchronization. The process might hang if the intended communication group in mapping is not COMM_WORLD.
+        Initialize the MNNVL Allreduce Fusion Workspace. comm_backend will be used for creating the workspace and synchronization. If not provided, MPIBackend will be used which will use COMM_WORLD for synchronization.
 
         Args:
             mapping: Mapping configuration containing rank info
             buffer_size_in_bytes: The size in bytes for each lamport buffer. The actual allocation size will be NUM_LAMPORT_BUFFERS * buffer_size_in_bytes.
         """
         if buffer_size_in_bytes is None:
-            # Default to 16MB workspace size if not provided
-            buffer_size_in_bytes = 16 * (1024**2)
+            # Default to 512MB workspace size if not provided
+            buffer_size_in_bytes = 512 * (1024**2)
         else:
             # Round up to the nearest multiple of 8MB
             buffer_size_in_bytes = math.ceil(buffer_size_in_bytes / (8 * (1024**2))) * (8 * (1024**2))
@@ -108,7 +117,28 @@ class MNNVLAllreduceFusionWorkspace:
         self.uc_ptr_local = self.mcast_buffer_handle.get_unicast_ptr(self.rank)
         self.mc_ptr = self.mcast_buffer_handle.get_multicast_ptr()
 
+    @functools.cache
+    def is_buffer_size_sufficient(
+        self,
+        tp_size: int,
+        num_tokens: int,
+        hidden_dim: int,
+        dtype: torch.dtype,
+        strategy: MNNVLAllreduceFusionStrategy = MNNVLAllreduceFusionStrategy.AUTO,
+    ) -> bool:
+        """
+        Calculate the required buffer size for a given problem size.
+        """
+        required_buffer_size = self.get_required_buffer_size_bytes(
+            tp_size, num_tokens, hidden_dim, dtype, strategy
+        )
+        if required_buffer_size > self.buffer_size_bytes:
+            return False
+        else:
+            return True
+
     @staticmethod
+    @functools.cache
     def get_required_buffer_size_bytes(
         tp_size: int,
         num_tokens: int,
@@ -120,10 +150,19 @@ class MNNVLAllreduceFusionWorkspace:
         Calculate the required buffer size for a given problem size.
         """
         elem_size = torch.tensor([], dtype=dtype).element_size()
+<<<<<<< HEAD
         is_one_shot = MNNVLAllreduceFusionStrategy.is_one_shot(tp_size, num_tokens, hidden_dim, dtype)
         if strategy == MNNVLAllreduceFusionStrategy.ONESHOT or (
             strategy == MNNVLAllreduceFusionStrategy.AUTO and is_one_shot
         ):
+=======
+        if strategy == MNNVLAllreduceFusionStrategy.AUTO:
+            strategy = MNNVLAllreduceFusionStrategy.select_strategy(
+                tp_size, num_tokens, hidden_dim, dtype
+            )
+
+        if strategy == MNNVLAllreduceFusionStrategy.ONESHOT:
+>>>>>>> c6ed1472 (Address review comments.)
             # For one-shot, each rank needs to store num_tokens * tp_size tokens
             buffer_size = num_tokens * hidden_dim * tp_size * elem_size
         else:
@@ -256,10 +295,25 @@ def trtllm_mnnvl_allreduce(
 
     module = get_trtllm_mnnvl_comm_module()
 
+<<<<<<< HEAD
     use_oneshot = strategy == MNNVLAllreduceFusionStrategy.ONESHOT or (
         strategy == MNNVLAllreduceFusionStrategy.AUTO
         and MNNVLAllreduceFusionStrategy.is_one_shot(workspace.tp_size, input.shape[0], input.shape[1], input.dtype)
     )
+=======
+    if strategy == MNNVLAllreduceFusionStrategy.AUTO:
+        strategy = MNNVLAllreduceFusionStrategy.select_strategy(
+            workspace.tp_size, input.shape[0], input.shape[1], input.dtype
+        )
+
+    if not workspace.is_buffer_size_sufficient(
+        workspace.tp_size, input.shape[0], input.shape[1], input.dtype, strategy
+    ):
+        raise ValueError(
+            f"The buffer size in the given workspace is insufficient for the given problem size. Buffer: {workspace.buffer_size_bytes} bytes, Required: {workspace.get_required_buffer_size_bytes(workspace.tp_size, input.shape[0], input.shape[1], input.dtype, strategy)} bytes."
+        )
+
+>>>>>>> c6ed1472 (Address review comments.)
     module.trtllm_mnnvl_allreduce_fusion(
         input,
         workspace.mc_ptr,
@@ -270,7 +324,7 @@ def trtllm_mnnvl_allreduce(
         workspace.rank,
         False,  # No RMSNorm Fusion
         launch_with_pdl,
-        use_oneshot,
+        strategy == MNNVLAllreduceFusionStrategy.ONESHOT,
         output,
         None,
         None,
@@ -340,15 +394,16 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm(
 
     module = get_trtllm_mnnvl_comm_module()
 
-    use_oneshot = strategy == MNNVLAllreduceFusionStrategy.ONESHOT or (
-        strategy == MNNVLAllreduceFusionStrategy.AUTO
-        and MNNVLAllreduceFusionStrategy.is_one_shot(
-            workspace.tp_size,
-            input.shape[0],
-            input.shape[1],
-            input.dtype,
+    if strategy == MNNVLAllreduceFusionStrategy.AUTO:
+        strategy = MNNVLAllreduceFusionStrategy.select_strategy(
+            workspace.tp_size, input.shape[0], input.shape[1], input.dtype
         )
-    )
+    if not workspace.is_buffer_size_sufficient(
+        workspace.tp_size, input.shape[0], input.shape[1], input.dtype, strategy
+    ):
+        raise ValueError(
+            f"The buffer size in the given workspace is insufficient for the given problem size. Buffer: {workspace.buffer_size_bytes} bytes, Required: {workspace.get_required_buffer_size_bytes(workspace.tp_size, input.shape[0], input.shape[1], input.dtype, strategy)} bytes."
+        )
 
     module.trtllm_mnnvl_allreduce_fusion(
         input,
@@ -360,7 +415,7 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm(
         workspace.rank,
         True,  # RMSNorm Fusion
         launch_with_pdl,
-        use_oneshot,
+        strategy == MNNVLAllreduceFusionStrategy.ONESHOT,
         output,
         residual_out,
         residual_in,

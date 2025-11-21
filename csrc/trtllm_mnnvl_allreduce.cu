@@ -26,8 +26,6 @@ using tvm::ffi::Optional;
     }                                                                               \
   }()
 
-// FIXME: is bool flag for oneshot a good idea? Trying to avoid defining a new type/enum at this
-// level
 void trtllm_mnnvl_allreduce_fusion(TensorView input, int64_t multicast_buffer_ptr,
                                    int64_t buffer_ptrs_dev, int64_t buffer_ptr_local,
                                    TensorView buffer_flags_mnnvl, int64_t nranks, int64_t rank,
