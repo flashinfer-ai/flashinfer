@@ -138,7 +138,6 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         max_token_num: int,
         hidden_dim: int,
         dtype: torch.dtype,
-        device: torch.device,
         process_group: Optional["torch.distributed.ProcessGroup"] = None,
         **kwargs,
     ):
@@ -151,7 +150,6 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             max_token_num: Maximum number of tokens
             hidden_dim: Hidden dimension size
             dtype: Data type
-            device: CUDA device
             process_group: PyTorch distributed process group
             **kwargs: Additional arguments for workspace creation
         """
@@ -159,12 +157,10 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
 
         # Call the actual workspace creation function
         self._internal_workspace = trtllm_create_ipc_workspace_for_all_reduce_fusion(
-            tp_size=tp_size,
             tp_rank=tp_rank,
+            tp_size=tp_size,
             max_token_num=max_token_num,
             hidden_dim=hidden_dim,
-            dtype=dtype,
-            device=device,
             process_group=process_group,
             **kwargs,
         )
@@ -204,7 +200,6 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         max_token_num: int,
         hidden_dim: int,
         dtype: torch.dtype,
-        device: torch.device,
         **kwargs,
     ):
         """
@@ -216,7 +211,6 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             max_token_num: Maximum number of tokens
             hidden_dim: Hidden dimension size
             dtype: Data type
-            device: CUDA device
             **kwargs: Additional arguments for workspace creation
         """
         super().__init__(world_size, rank)
@@ -229,15 +223,12 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         )
 
         # When implemented, should look like:
-        # from .trtllm_mnnvl_ar import create_mnnvl_allreduce_fusion_workspace
-        #
         # self._internal_workspace = create_mnnvl_allreduce_fusion_workspace(
         #     world_size=world_size,
         #     rank=rank,
         #     max_token_num=max_token_num,
         #     hidden_dim=hidden_dim,
         #     dtype=dtype,
-        #     device=device,
         #     **kwargs,
         # )
         #
@@ -278,7 +269,6 @@ def _trtllm_workspace_check(
     max_token_num: int,
     hidden_dim: int,
     dtype: torch.dtype,
-    device: Optional[torch.device],
     topology: str,
     **kwargs,
 ) -> bool:
@@ -305,7 +295,6 @@ def _mnnvl_workspace_check(
     max_token_num: int,
     hidden_dim: int,
     dtype: torch.dtype,
-    device: Optional[torch.device],
     topology: str,
     **kwargs,
 ) -> bool:
@@ -337,7 +326,6 @@ def _workspace_creation_heuristic(
     max_token_num: int,
     hidden_dim: int,
     dtype: torch.dtype,
-    device: Optional[torch.device],
     topology: str,
     **kwargs,
 ) -> list[str]:
@@ -355,7 +343,6 @@ def _workspace_creation_heuristic(
         max_token_num: Maximum number of tokens
         hidden_dim: Hidden dimension size
         dtype: Data type
-        device: CUDA device
         topology: Network topology ("single_node" or "multi_node")
         **kwargs: Additional arguments
 
@@ -417,7 +404,6 @@ def create_allreduce_fusion_workspace(
     max_token_num: int = None,
     hidden_dim: int = None,
     dtype: torch.dtype = None,
-    device: Optional[torch.device] = None,
     topology: str = "single_node",
     process_group: Optional["torch.distributed.ProcessGroup"] = None,
     **backend_kwargs,
@@ -436,7 +422,6 @@ def create_allreduce_fusion_workspace(
         max_token_num: Maximum number of tokens to support
         hidden_dim: Hidden dimension size
         dtype: Data type for communication tensors
-        device: CUDA device (defaults to current CUDA device)
         topology: Network topology hint for backend selection
                   "single_node" - All ranks on one node (default)
                   "multi_node" - Ranks span multiple nodes
@@ -476,9 +461,6 @@ def create_allreduce_fusion_workspace(
         ... )
         >>> print(workspace.backend)  # "mnnvl"
     """
-    if device is None:
-        device = torch.device(f"cuda:{torch.cuda.current_device()}")
-
     # Decorator has validated backend - now create workspace
     # If backend="auto", decorator has selected the best one and stored it
 
@@ -496,8 +478,6 @@ def create_allreduce_fusion_workspace(
             tp_rank=rank,
             max_token_num=max_token_num,
             hidden_dim=hidden_dim,
-            dtype=dtype,
-            device=device,
             process_group=process_group,
             **backend_kwargs,
         )
@@ -509,7 +489,6 @@ def create_allreduce_fusion_workspace(
             max_token_num=max_token_num,
             hidden_dim=hidden_dim,
             dtype=dtype,
-            device=device,
             **backend_kwargs,
         )
     else:
@@ -580,7 +559,7 @@ def allreduce_fusion(
     Args:
         input: Input tensor [token_num, hidden_dim]
         workspace: Workspace object (type determines backend)
-        launch_with_pdl: Use Persistent Device Launch
+        launch_with_pdl: Use Persistent Dependency Launch
 
         # ===== OUTPUT tensors (pre-allocated, filled by function) =====
         output: AllReduce output [token_num, hidden_dim]
