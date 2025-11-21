@@ -7,14 +7,14 @@ This script creates decorated and undecorated versions of a test function
 
 Usage:
     # Set the logging level before running
-    export FLASHINFER_APILEVEL=3
+    export FLASHINFER_LOGLEVEL=3
     python bench_logging_overhead.py
 
     # Or run with different levels
-    FLASHINFER_APILEVEL=0 python bench_logging_overhead.py
-    FLASHINFER_APILEVEL=1 python bench_logging_overhead.py
-    FLASHINFER_APILEVEL=3 python bench_logging_overhead.py
-    FLASHINFER_APILEVEL=5 python bench_logging_overhead.py
+    FLASHINFER_LOGLEVEL=0 python bench_logging_overhead.py
+    FLASHINFER_LOGLEVEL=1 python bench_logging_overhead.py
+    FLASHINFER_LOGLEVEL=3 python bench_logging_overhead.py
+    FLASHINFER_LOGLEVEL=5 python bench_logging_overhead.py
 
     # Or use the helper script to run all levels
     bash benchmark_all_levels.sh
@@ -28,8 +28,8 @@ import numpy as np
 from typing import List, Tuple
 
 # Get logging level BEFORE importing flashinfer
-LOGGING_LEVEL = int(os.environ.get("FLASHINFER_APILEVEL", "0"))
-LOG_DEST = os.environ.get("FLASHINFER_APIDEST", "/tmp/flashinfer_benchmark_log.txt")
+LOGGING_LEVEL = int(os.environ.get("FLASHINFER_LOGLEVEL", "0"))
+LOG_DEST = os.environ.get("FLASHINFER_LOGDEST", "/tmp/flashinfer_benchmark_log.txt")
 
 # Import the decorator
 from flashinfer.api_logging import flashinfer_api
@@ -209,8 +209,8 @@ def main():
 
     # Display logging configuration
     print("\nLogging Configuration:")
-    print(f"  FLASHINFER_APILEVEL = {LOGGING_LEVEL}")
-    print(f"  FLASHINFER_APIDEST = {LOG_DEST}")
+    print(f"  FLASHINFER_LOGLEVEL = {LOGGING_LEVEL}")
+    print(f"  FLASHINFER_LOGDEST = {LOG_DEST}")
 
     # Get level name
     level_names = {
@@ -314,7 +314,7 @@ def main():
     print("\nTo benchmark other levels, run:")
     for level in [0, 1, 3, 5]:
         if level != LOGGING_LEVEL:
-            print(f"  FLASHINFER_APILEVEL={level} python {sys.argv[0]}")
+            print(f"  FLASHINFER_LOGLEVEL={level} python {sys.argv[0]}")
 
     print("\n" + "=" * 80)
     print("Benchmark complete!")

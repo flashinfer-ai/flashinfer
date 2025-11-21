@@ -47,21 +47,21 @@ class TestAPILogging:
     def setup_and_teardown(self):
         """Reset environment and reimport logging module for each test."""
         # Store original environment
-        original_level = os.environ.get("FLASHINFER_APILEVEL")
-        original_dest = os.environ.get("FLASHINFER_APIDEST")
+        original_level = os.environ.get("FLASHINFER_LOGLEVEL")
+        original_dest = os.environ.get("FLASHINFER_LOGDEST")
 
         yield
 
         # Restore original environment
         if original_level is not None:
-            os.environ["FLASHINFER_APILEVEL"] = original_level
-        elif "FLASHINFER_APILEVEL" in os.environ:
-            del os.environ["FLASHINFER_APILEVEL"]
+            os.environ["FLASHINFER_LOGLEVEL"] = original_level
+        elif "FLASHINFER_LOGLEVEL" in os.environ:
+            del os.environ["FLASHINFER_LOGLEVEL"]
 
         if original_dest is not None:
-            os.environ["FLASHINFER_APIDEST"] = original_dest
-        elif "FLASHINFER_APIDEST" in os.environ:
-            del os.environ["FLASHINFER_APIDEST"]
+            os.environ["FLASHINFER_LOGDEST"] = original_dest
+        elif "FLASHINFER_LOGDEST" in os.environ:
+            del os.environ["FLASHINFER_LOGDEST"]
 
         # Force reimport to pick up new environment variables
         if "flashinfer.api_logging" in sys.modules:
@@ -69,8 +69,8 @@ class TestAPILogging:
 
     def setup_logging(self, level: int, dest: str = "stdout"):
         """Helper to set up logging environment and reimport."""
-        os.environ["FLASHINFER_APILEVEL"] = str(level)
-        os.environ["FLASHINFER_APIDEST"] = dest
+        os.environ["FLASHINFER_LOGLEVEL"] = str(level)
+        os.environ["FLASHINFER_LOGDEST"] = dest
 
         # Force reimport
         if "flashinfer.api_logging" in sys.modules:
