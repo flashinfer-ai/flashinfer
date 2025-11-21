@@ -587,7 +587,7 @@ def test_tensor_validation_min_p(batch_size, vocab_size, p):
         flashinfer.sampling.min_p_sampling_from_probs(
             normalized_prob,
             torch.tensor(
-                [[p] * vocab_size] * batch_size, dtype=torch.int, device="cuda:0"
+                [[p] * vocab_size] * batch_size, dtype=torch.float32, device="cuda:0"
             ),
         )
 
@@ -597,7 +597,7 @@ def test_tensor_validation_min_p(batch_size, vocab_size, p):
         match=r"Expected a 1D tensor of shape \(batch_size,\) or scalar.*got a 0-dimensional tensor",
     ):
         flashinfer.sampling.min_p_sampling_from_probs(
-            normalized_prob, torch.tensor(p, dtype=torch.int, device="cuda:0")
+            normalized_prob, torch.tensor(p, dtype=torch.float32, device="cuda:0")
         )
 
     # 4: non-int32 indices raises error.
@@ -607,7 +607,7 @@ def test_tensor_validation_min_p(batch_size, vocab_size, p):
     ):
         flashinfer.sampling.min_p_sampling_from_probs(
             normalized_prob,
-            torch.tensor([p] * batch_size, dtype=torch.int, device="cuda:0"),
+            torch.tensor([p] * batch_size, dtype=torch.float32, device="cuda:0"),
             torch.tensor([p] * batch_size, dtype=torch.int64, device="cuda:0"),
         )
 
@@ -617,13 +617,13 @@ def test_tensor_validation_min_p(batch_size, vocab_size, p):
             ValueError, match="Sampling parameter tensor batch size mismatch"
         ):
             flashinfer.sampling.min_p_sampling_from_probs(
-                normalized_prob, torch.tensor([p], dtype=torch.int, device="cuda:0")
+                normalized_prob, torch.tensor([p], dtype=torch.float32, device="cuda:0")
             )
 
     # 6: 1D tensor with the correct batch size works.
     samples = flashinfer.sampling.min_p_sampling_from_probs(
         normalized_prob,
-        torch.tensor([p] * batch_size, dtype=torch.int, device="cuda:0"),
+        torch.tensor([p] * batch_size, dtype=torch.float32, device="cuda:0"),
     )
     assert samples.shape == (batch_size,)
 
