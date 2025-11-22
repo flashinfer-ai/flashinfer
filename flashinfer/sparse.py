@@ -111,6 +111,7 @@ class BlockSparseAttentionWrapper:
         self,
         float_workspace_buffer: torch.Tensor,
         backend: str = "auto",
+        kv_lens_buffer_size: int = 32768,
     ) -> None:
         r"""Constructs of :class:`BlockSparseAttentionWrapper`.
 
@@ -124,6 +125,8 @@ class BlockSparseAttentionWrapper:
             The implementation backend, could be ``auto``/``fa2`` or ``fa3``. Defaults to ``auto``.
             If set to ``auto``, the function will automatically choose the backend based on the
             device architecture and kernel availability.
+        kv_lens_buffer_size : int
+            The size of the kv lens buffer (num_kv_heads * num_blocks_row/batch_size), defaults to 32768.
         """
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
@@ -139,13 +142,12 @@ class BlockSparseAttentionWrapper:
             self._vector_sparse_indices_buffer = torch.empty(
                 (128 * 1024 * 1024,), dtype=torch.int32, device=self.device
             )
-            # NOTE(Zihao): assume maximum batch size is 32768
             self._vector_sparse_indptr_buffer = torch.empty(
-                (32768,), dtype=torch.int32, device=self.device
+                (kv_lens_buffer_size,), dtype=torch.int32, device=self.device
             )
 
         self._kv_lens_buffer = torch.empty(
-            (32768,), dtype=torch.int32, device=self.device
+            (kv_lens_buffer_size,), dtype=torch.int32, device=self.device
         )
         self._pin_memory_int_workspace_buffer = torch.empty(
             self._int_workspace_buffer.shape,
@@ -739,6 +741,7 @@ class VariableBlockSparseAttentionWrapper:
         self,
         float_workspace_buffer: torch.Tensor,
         backend: str = "auto",
+        kv_lens_buffer_size: int = 32768,
     ) -> None:
         r"""Constructs of :class:`VariableBlockSparseAttentionWrapper`.
 
@@ -752,6 +755,8 @@ class VariableBlockSparseAttentionWrapper:
             The implementation backend, could be ``auto``/``fa2`` or ``fa3``. Defaults to ``auto``.
             If set to ``auto``, the function will automatically choose the backend based on the
             device architecture and kernel availability.
+        kv_lens_buffer_size : int
+            The size of the kv lens buffer (num_kv_heads * num_blocks_row/batch_size), defaults to 32768.
         """
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
@@ -766,11 +771,11 @@ class VariableBlockSparseAttentionWrapper:
                 (128 * 1024 * 1024,), dtype=torch.int32, device=self.device
             )
             self._vector_sparse_indptr_buffer = torch.empty(
-                (32768,), dtype=torch.int32, device=self.device
+                (kv_lens_buffer_size,), dtype=torch.int32, device=self.device
             )
 
         self._kv_lens_buffer = torch.empty(
-            (32768,), dtype=torch.int32, device=self.device
+            (kv_lens_buffer_size,), dtype=torch.int32, device=self.device
         )
         self._pin_memory_int_workspace_buffer = torch.empty(
             self._int_workspace_buffer.shape,
