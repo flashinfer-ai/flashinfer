@@ -3289,6 +3289,7 @@ def batch_deepgemm_fp8_nt_groupwise(
 
     return out
 
+
 @functools.cache
 def get_fp8_blockscale_gemm_runner_sm90():
     """Get the FP8 block scale GEMM runner module for SM90."""
@@ -3308,21 +3309,21 @@ def fp8_blockscale_gemm_swapab(
     This function automatically selects between normal and swapAB kernel based on
     the M dimension. For small M (< 32), it uses the swapAB kernel for
     better performance.
-    
+
     Supported Dtype Combinations
     -----------------------------
     - **BF16 + BF16 → BF16**: Both inputs BF16, internal quantization (no scales needed)
     - **BF16 + FP8 → BF16**: BF16 input, FP8 weight
-    
+
     Parameters
     ----------
     input : torch.Tensor
         Input activation tensor of shape (M, K).
-        - BF16 (torch.bfloat16) with internal quantization 
+        - BF16 (torch.bfloat16) with internal quantization
     weight : torch.Tensor
         Weight tensor of shape (N, K). Can be:
-        - FP8 (torch.float8_e4m3fn) with weight_scale required 
-        - BF16 (torch.bfloat16) for internal quantization 
+        - FP8 (torch.float8_e4m3fn) with weight_scale required
+        - BF16 (torch.bfloat16) for internal quantization
     input_scale : torch.Tensor, optional
     weight_scale : torch.Tensor, optional
         Scaling factors for weight. Required if weight is FP8.
@@ -3339,16 +3340,16 @@ def fp8_blockscale_gemm_swapab(
     >>> import torch
     >>> from flashinfer.gemm import fp8_blockscale_gemm_swapab
     >>>
-    >>> M, N, K = 16, 4096, 4096  
+    >>> M, N, K = 16, 4096, 4096
     >>> device = "cuda"
     >>>
-    >>> # BF16 inputs 
+    >>> # BF16 inputs
     >>> input_bf16 = torch.randn(M, K, device=device, dtype=torch.bfloat16)
     >>> weight_bf16 = torch.randn(N, K, device=device, dtype=torch.bfloat16)
     >>> output = fp8_blockscale_gemm_swapab(input_bf16, weight_bf16)
     >>> print(output.shape)  # torch.Size([16, 4096])
     >>>
-    >>> # Mixed: BF16 input + FP8 weight 
+    >>> # Mixed: BF16 input + FP8 weight
     >>> from flashinfer.testing.utils import per_token_cast_to_fp8
     >>> input_bf16 = torch.randn(M, K, device=device, dtype=torch.bfloat16)
     >>> weight_bf16 = torch.randn(N, K, device=device, dtype=torch.bfloat16)
@@ -3356,7 +3357,7 @@ def fp8_blockscale_gemm_swapab(
     >>> output = fp8_blockscale_gemm_swapab(input_bf16, weight_fp8, None, weight_scale)
     >>> print(output.shape)  # torch.Size([16, 4096])
     >>>
-    >>> # FP8 weight with 128x128 block scales 
+    >>> # FP8 weight with 128x128 block scales
     >>> from flashinfer.testing.utils import per_block_cast_to_fp8
     >>> weight_bf16 = torch.randn(N, K, device=device, dtype=torch.bfloat16)
     >>> weight_fp8, weight_scale = per_block_cast_to_fp8(weight_bf16)
@@ -3371,8 +3372,8 @@ def fp8_blockscale_gemm_swapab(
     - For FP8 inputs, scaling factors must be provided
     - For BF16 inputs, quantization and scaling happen internally
     - Weight scales support two granularities:
-      * Per-token (1x128 blocks): (N, K//128) 
-      * Per-block (128x128 blocks): (N//128, K//128) 
+      * Per-token (1x128 blocks): (N, K//128)
+      * Per-block (128x128 blocks): (N//128, K//128)
     - Input scales only support per-token format: (M, K//128)
     - The function uses DeepGEMM backend with JIT compilation
     """
@@ -3387,40 +3388,40 @@ def fp8_blockscale_gemm_swapab(
         raise ValueError(f"Input must be 2D (M, K), got shape {input.shape}")
     if weight.ndim != 2:
         raise ValueError(f"Weight must be 2D (N, K), got shape {weight.shape}")
-    
+
     M, K = input.shape
     N, K_weight = weight.shape
-    
+
     if K != K_weight:
         raise ValueError(
             f"K dimension mismatch: input has K={K}, weight has K={K_weight}"
         )
-    
+
     # Validate K is divisible by block size (128)
     BLOCK_SIZE = 128
     if K % BLOCK_SIZE != 0:
         raise ValueError(
             f"K dimension must be divisible by block size ({BLOCK_SIZE}), got K={K}"
         )
-    
+
     # Validate dtype combinations
     input_is_fp8 = input.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]
     weight_is_fp8 = weight.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]
     input_is_bf16 = input.dtype == torch.bfloat16
     weight_is_bf16 = weight.dtype == torch.bfloat16
-    
+
     # Explicitly reject FP8 input + BF16 weight (missing kernel implementation)
     if input_is_fp8 and weight_is_bf16:
         raise ValueError(
             "FP8 input + BF16 weight is not supported (missing kernel implementation). "
         )
-    
+
     # Validate scale requirements for FP8 inputs
     if input_is_fp8:
         if input_scale is None:
-            raise ValueError(
-                "input_scale is required when input is FP8. "
-            )
+            raise ValueError("input_scale is required when input is FP8. ")
+        # Users provide input_scale in shape (M, K//128), matching per_token_cast_to_fp8 output.
+        # We transpose it internally to (K//128, M) to match TensorRT-LLM kernel expectations.
         expected_scale_shape = (M, K // BLOCK_SIZE)
         if input_scale.shape != expected_scale_shape:
             raise ValueError(
@@ -3428,9 +3429,7 @@ def fp8_blockscale_gemm_swapab(
                 f"got {input_scale.shape}"
             )
         if input_scale.dtype != torch.float32:
-            raise ValueError(
-                f"input_scale must be float32, got {input_scale.dtype}"
-            )
+            raise ValueError(f"input_scale must be float32, got {input_scale.dtype}")
         if input_scale.device != input.device:
             raise ValueError(
                 f"input_scale device mismatch. Expected {input.device}, "
@@ -3447,17 +3446,15 @@ def fp8_blockscale_gemm_swapab(
                 "input_scale should not be provided for BF16 inputs. "
                 "Use FP8 inputs if you want to provide external scales."
             )
-    
+
     if weight_is_fp8:
         if weight_scale is None:
-            raise ValueError(
-                "weight_scale is required when weight is FP8. "
-            )
+            raise ValueError("weight_scale is required when weight is FP8. ")
         expected_per_token_shape = (N, K // BLOCK_SIZE)
         expected_per_block_shape = ((N + BLOCK_SIZE - 1) // BLOCK_SIZE, K // BLOCK_SIZE)
         is_per_token = weight_scale.shape == expected_per_token_shape
         is_per_block = weight_scale.shape == expected_per_block_shape
-        
+
         if not (is_per_token or is_per_block):
             raise ValueError(
                 f"weight_scale shape mismatch. Expected either {expected_per_token_shape} "
@@ -3465,9 +3462,7 @@ def fp8_blockscale_gemm_swapab(
                 f"(per-block, 128x128 blocks), got {weight_scale.shape}"
             )
         if weight_scale.dtype != torch.float32:
-            raise ValueError(
-                f"weight_scale must be float32, got {weight_scale.dtype}"
-            )
+            raise ValueError(f"weight_scale must be float32, got {weight_scale.dtype}")
     else:
         if not weight_is_bf16:
             raise ValueError(
@@ -3507,15 +3502,40 @@ def fp8_blockscale_gemm_swapab(
     # Get the runner
     runner = get_fp8_blockscale_gemm_runner_sm90()
 
-    # Allocate workspace 
+    # Allocate workspace
     workspace_size = runner.get_workspace_size(M, N, K)
     workspace = None
     if workspace_size > 0:
-        workspace = torch.empty(
-            workspace_size, dtype=torch.uint8, device=input.device
-        )
+        workspace = torch.empty(workspace_size, dtype=torch.uint8, device=input.device)
         runner.configure_workspace(workspace)
-    
-    runner.gemm(input, weight, out, input_scale, weight_scale)
+
+    if input_scale is not None:
+        M_padded = ((M + 3) // 4) * 4  # Round M up to multiple of 4
+        K_blocks = K // BLOCK_SIZE
+
+        # Create padded tensor with the stride TRT-LLM expects
+        input_scale_padded = torch.zeros(
+            K_blocks, M_padded, dtype=torch.float32, device=input.device
+        )
+
+        # Copy scales into the non-padded region: (K//128, M)
+        # Transpose from (M, K//128) to (K//128, M) and copy
+        input_scale_padded[:, :M] = input_scale.T
+
+        # Extract view of the actual (K//128, M) region
+        # This view has stride (M_padded, 1) which matches TRT-LLM's expectations
+        input_scale_transposed = input_scale_padded[:, :M]
+
+        # Verify stride matches TRT-LLM's expectations
+        expected_stride_0 = M_padded
+        if input_scale_transposed.stride(0) != expected_stride_0:
+            raise ValueError(
+                f"input_scale stride mismatch: expected stride[0]={expected_stride_0} "
+                f"(M_padded={M_padded}), got {input_scale_transposed.stride(0)}"
+            )
+    else:
+        input_scale_transposed = None
+
+    runner.gemm(input, weight, out, input_scale_transposed, weight_scale)
 
     return out

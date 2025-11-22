@@ -54,4 +54,3 @@ def gen_fp8_blockscale_gemm_sm90_module(use_fast_build: bool = False) -> JitSpec
             / "cutlass_kernels",
         ],
     )
-

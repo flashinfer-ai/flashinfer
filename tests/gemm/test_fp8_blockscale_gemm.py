@@ -29,6 +29,22 @@ from flashinfer.utils import (
 from flashinfer.jit.gemm import gen_fp8_blockscale_gemm_sm90_module
 
 
+def calc_diff(output: torch.Tensor, expected: torch.Tensor) -> float:
+    """Calculate similarity difference using TensorRT-LLM's metric.
+
+    Returns diff = 1 - sim, where sim = 2*<x,y> / (||x||² + ||y||²)
+    This is similar to cosine similarity but uses squared norms in denominator.
+
+    diff < 0.001 corresponds to >99.9% similarity.
+    """
+    output_f64 = output.to(torch.float64)
+    expected_f64 = expected.to(torch.float64)
+    denominator = (output_f64 * output_f64 + expected_f64 * expected_f64).sum()
+    sim = 2 * (output_f64 * expected_f64).sum() / denominator
+    diff = 1 - sim
+    return diff.item()
+
+
 @pytest.fixture(
     autouse=not has_flashinfer_jit_cache(),
     scope="module",
@@ -44,47 +60,45 @@ def warmup_jit():
 @pytest.mark.parametrize("m", [1, 16, 32, 64, 128])
 @pytest.mark.parametrize("n", [128, 256, 512, 1024, 4096])
 @pytest.mark.parametrize("k", [256, 512, 1024, 4096])
-@pytest.mark.parametrize("input_dtype", [torch.bfloat16]) 
-@pytest.mark.parametrize("weight_dtype", [torch.bfloat16]) 
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
+@pytest.mark.parametrize("weight_dtype", [torch.bfloat16])
 def test_fp8_blockscale_gemm_swapab(m, n, k, input_dtype, weight_dtype):
     """Test FP8 block-scale GEMM with swapAB optimization.
-    
+
     This test focuses on the usage: BF16 inputs with internal quantization.
     The kernel automatically handles FP8 quantization with proper block-scale computation.
     """
     compute_capability = get_compute_capability(torch.device("cuda"))
     if compute_capability[0] < 9:
         pytest.skip("FP8 block-scale GEMM requires SM90 (Hopper) or later")
-    
+
     if not is_sm90a_supported(torch.device("cuda")):
         pytest.skip("FP8 block-scale GEMM requires SM90a (Hopper) support")
-    
+
     # K must be divisible by 128 (block size requirement)
     if k % 128 != 0:
         pytest.skip("K must be divisible by 128 for block-scale GEMM")
-    
+
     device = "cuda"
     torch.manual_seed(42)
-    
-    # Create BF16 inputs 
+
+    # Create BF16 inputs
     input = torch.randn(m, k, device=device, dtype=input_dtype)
     weight = torch.randn(n, k, device=device, dtype=weight_dtype)
-    
+
     # Compute reference result
     reference = torch.matmul(input, weight.T)
-    
+
     # Run FP8 block-scale GEMM
     output = fp8_blockscale_gemm_swapab(input, weight)
-    
+
     # Verify output shape
     assert output.shape == (m, n), f"Expected shape {(m, n)}, got {output.shape}"
     assert output.dtype == torch.bfloat16, f"Expected BF16 output, got {output.dtype}"
-    
+
     # Check correctness
     cos_sim = F.cosine_similarity(
-        reference.flatten().float(), 
-        output.flatten().float(), 
-        dim=0
+        reference.flatten().float(), output.flatten().float(), dim=0
     )
     assert cos_sim > 0.99, f"Cosine similarity {cos_sim} is too low (expected > 0.99)"
 
@@ -95,160 +109,237 @@ def test_fp8_blockscale_gemm_swapab(m, n, k, input_dtype, weight_dtype):
 @pytest.mark.parametrize(
     "input_dtype,weight_dtype",
     [
-        (torch.bfloat16, torch.bfloat16),      # Both BF16 (for testing internal quantization)
-        (torch.bfloat16, torch.float8_e4m3fn), # BF16 input + FP8 weight 
-    ]
+        (
+            torch.bfloat16,
+            torch.bfloat16,
+        ),  # Both BF16 (for testing internal quantization)
+        (torch.bfloat16, torch.float8_e4m3fn),  # BF16 input + FP8 weight
+    ],
 )
 def test_fp8_blockscale_gemm_dtypes(m, n, k, input_dtype, weight_dtype):
     """Test the 2 recommended dtype combinations with proper FP8 quantization.
-    
+
     Uses quantization from flashinfer.testing.utils:
     - per_token_cast_to_fp8: 1x128 block quantization (for both input and weight)
-    
+
     Note: Both input and weight use per_token (1x128 blocks).
     The API expects scale shape (N, K//128), which per_token provides.
-    
+
     These utilities return scales in the correct format (reciprocals) that
-    match TRT-LLM's kernel expectations. For kernel reference, 
+    match TRT-LLM's kernel expectations. For kernel reference,
     see csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm_kernel.cuh
     """
     compute_capability = get_compute_capability(torch.device("cuda"))
     if compute_capability[0] < 9:
         pytest.skip("FP8 block-scale GEMM requires SM90 (Hopper) or later")
-    
+
     if not is_sm90a_supported(torch.device("cuda")):
         pytest.skip("FP8 block-scale GEMM requires SM90a (Hopper) support")
-    
+
     if k % 128 != 0:
         pytest.skip("K must be divisible by 128 for block-scale GEMM")
-    
+
     device = "cuda"
     torch.manual_seed(42)
-    
+
     # Create BF16 data for reference
     input_bf16 = torch.randn(m, k, device=device, dtype=torch.bfloat16)
     weight_bf16 = torch.randn(n, k, device=device, dtype=torch.bfloat16)
-    
+
     # Quantize input
     if input_dtype == torch.float8_e4m3fn:
         input_tensor, input_scale = per_token_cast_to_fp8(input_bf16)
     else:
         input_tensor, input_scale = input_bf16, None
-    
-    # Quantize weight 
+
+    # Quantize weight
     if weight_dtype == torch.float8_e4m3fn:
         weight_tensor, weight_scale = per_token_cast_to_fp8(weight_bf16)
     else:
         weight_tensor, weight_scale = weight_bf16, None
-    
-    # Compute reference 
+
+    # Compute reference
     reference = torch.matmul(input_bf16, weight_bf16.T)
-    
+
     # Run FP8 block-scale GEMM
     output = fp8_blockscale_gemm_swapab(
         input_tensor, weight_tensor, input_scale, weight_scale
     )
-    
+
     # Verify output properties
     assert output.shape == (m, n), f"Expected shape {(m, n)}, got {output.shape}"
     assert output.dtype == torch.bfloat16, f"Expected BF16 output, got {output.dtype}"
-    
+
     # Check correctness
     cos_sim = F.cosine_similarity(
-        reference.flatten().float(),
-        output.flatten().float(),
-        dim=0
+        reference.flatten().float(), output.flatten().float(), dim=0
     )
-    
+
     if input_dtype == torch.bfloat16 and weight_dtype == torch.bfloat16:
         threshold = 0.99
-    else: 
+    else:
         # BF16+FP8: BF16 input quantized internally, FP8 weight pre-quantized
         # TODO: check threshold
         threshold = 0.967
-    
+
     assert cos_sim > threshold, (
         f"Cosine similarity {cos_sim:.4f} too low for "
         f"{input_dtype} + {weight_dtype} (expected > {threshold})"
     )
 
 
+@pytest.mark.parametrize("m", [7, 32, 128])
+@pytest.mark.parametrize("n", [1024, 4096])
+@pytest.mark.parametrize("k", [512, 4096])
+def test_fp8_blockscale_gemm_w8a8(m, n, k):
+    """Test W8A8 (FP8+FP8) GEMM with per-token scales for both input and weight.
+
+    This test demonstrates full FP8 quantization for both activations and weights.
+    """
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    if compute_capability[0] < 9:
+        pytest.skip("FP8 block-scale GEMM requires SM90 (Hopper) or later")
+
+    if not is_sm90a_supported(torch.device("cuda")):
+        pytest.skip("FP8 block-scale GEMM requires SM90a (Hopper) support")
+
+    device = "cuda"
+    # m, n, k = 64, 2048, 4096
+    torch.manual_seed(42)
+
+    # Create BF16 inputs for reference (no normalization)
+    # Raw randn values work well with FP8 quantization without causing numerical issues
+    input_bf16 = torch.randn(m, k, device=device, dtype=torch.bfloat16)
+    weight_bf16 = torch.randn(n, k, device=device, dtype=torch.bfloat16)
+
+    # Quantize both input and weight to FP8 with per-token (1x128) scales
+    input_fp8, input_scale = per_token_cast_to_fp8(input_bf16)
+    weight_fp8, weight_scale = per_token_cast_to_fp8(weight_bf16)
+
+    # Verify scale shapes
+    assert input_scale.shape == (m, k // 128), (
+        f"Expected input scale shape ({m}, {k // 128}), got {input_scale.shape}"
+    )
+    assert weight_scale.shape == (n, k // 128), (
+        f"Expected weight scale shape ({n}, {k // 128}), got {weight_scale.shape}"
+    )
+    assert input_scale.min() > 0, "Input scale should be positive"
+    assert weight_scale.min() > 0, "Weight scale should be positive"
+
+    # Run W8A8 GEMM: FP8 input + FP8 weight
+    output = fp8_blockscale_gemm_swapab(
+        input_fp8, weight_fp8, input_scale, weight_scale
+    )
+
+    # Dequantize FP8 tensors to create reference (tests kernel correctness, not quantization)
+    # Dequant: bf16 = fp8.to(bf16) * scale (applied per 128-element block)
+    input_dequant = torch.zeros_like(input_bf16)
+    for i in range(m):
+        for k_tile in range(k // 128):
+            start, end = k_tile * 128, (k_tile + 1) * 128
+            input_dequant[i, start:end] = (
+                input_fp8[i, start:end].to(torch.bfloat16) * input_scale[i, k_tile]
+            )
+
+    weight_dequant = torch.zeros_like(weight_bf16)
+    for j in range(n):
+        for k_tile in range(k // 128):
+            start, end = k_tile * 128, (k_tile + 1) * 128
+            weight_dequant[j, start:end] = (
+                weight_fp8[j, start:end].to(torch.bfloat16) * weight_scale[j, k_tile]
+            )
+
+    reference = torch.matmul(input_dequant, weight_dequant.T)
+
+    # Use cosine similarity (same metric as BF16+FP8 tests)
+    cos_sim = F.cosine_similarity(
+        reference.flatten().float(), output.flatten().float(), dim=0
+    )
+    # W8A8 achieves ~97% cosine similarity against dequantized FP8 reference
+    assert cos_sim > 0.967, (
+        f"W8A8 cosine similarity {cos_sim:.4f} too low (expected > 0.967)"
+    )
+
+    print(f"✓ W8A8 (FP8+FP8): cosine similarity = {cos_sim:.4f}")
+
+
 def test_fp8_blockscale_gemm_per_block_weight_scales():
     """Test BF16+FP8 GEMM with per-block (128x128) weight scales.
-    
+
     This test demonstrates using 128x128 block quantization for weights with BF16 input,
     """
     compute_capability = get_compute_capability(torch.device("cuda"))
     if compute_capability[0] < 9:
         pytest.skip("FP8 block-scale GEMM requires SM90 (Hopper) or later")
-    
+
     if not is_sm90a_supported(torch.device("cuda")):
         pytest.skip("FP8 block-scale GEMM requires SM90a (Hopper) support")
-    
+
     device = "cuda"
-    m, n, k = 16, 512, 512  
+    m, n, k = 16, 512, 512
     torch.manual_seed(42)
-    
+
     # Create inputs
     input_bf16 = torch.randn(m, k, device=device, dtype=torch.bfloat16)
     weight_bf16 = torch.randn(n, k, device=device, dtype=torch.bfloat16)
-    
-    # Quantize weight with per-block (128x128) blocks 
+
+    # Quantize weight with per-block (128x128) blocks
     weight_fp8, weight_scale = per_block_cast_to_fp8(weight_bf16)
-    
+
     # Verify scale shape
-    assert weight_scale.shape == (n // 128, k // 128), f"Expected weight scale shape ({n // 128}, {k // 128}), got {weight_scale.shape}"
+    assert weight_scale.shape == (n // 128, k // 128), (
+        f"Expected weight scale shape ({n // 128}, {k // 128}), got {weight_scale.shape}"
+    )
     assert weight_scale.min() > 0, "Weight scale should be positive (reciprocal format)"
-    
+
     # Run GEMM: BF16 input (internal quant) + FP8 weight (per-block scales)
     output = fp8_blockscale_gemm_swapab(input_bf16, weight_fp8, None, weight_scale)
-    
+
     # Compare to BF16 reference
     reference = torch.matmul(input_bf16, weight_bf16.T)
-    
+
     cos_sim = F.cosine_similarity(
-        reference.flatten().float(), 
-        output.flatten().float(), 
-        dim=0
+        reference.flatten().float(), output.flatten().float(), dim=0
     )
     # TODO: check threshold
     assert cos_sim > 0.967, f"Per-block weight scale accuracy too low: {cos_sim:.4f}"
-    
+
     print(f"✓ Per-block weight scales: cosine similarity = {cos_sim:.4f}")
 
 
-@pytest.mark.parametrize("m,n,k", [
-    (1, 4096, 4096),    
-    (8, 4096, 4096),     
-    (128, 4096, 4096),   
-    (16, 8192, 8192),    
-    (32, 2048, 4096),    
-])
+@pytest.mark.parametrize(
+    "m,n,k",
+    [
+        (1, 4096, 4096),
+        (8, 4096, 4096),
+        (128, 4096, 4096),
+        (16, 8192, 8192),
+        (32, 2048, 4096),
+    ],
+)
 def test_fp8_blockscale_gemm_shapes(m, n, k):
     """Test various common shapes used in LLM inference."""
     compute_capability = get_compute_capability(torch.device("cuda"))
     if compute_capability[0] < 9:
         pytest.skip("FP8 block-scale GEMM requires SM90 (Hopper) or later")
-    
+
     if not is_sm90a_supported(torch.device("cuda")):
         pytest.skip("FP8 block-scale GEMM requires SM90a (Hopper) support")
-    
+
     if k % 128 != 0:
         pytest.skip("K must be divisible by 128")
-    
+
     device = "cuda"
     torch.manual_seed(42)
-    
+
     input = torch.randn(m, k, device=device, dtype=torch.bfloat16)
     weight = torch.randn(n, k, device=device, dtype=torch.bfloat16)
-    
+
     reference = torch.matmul(input, weight.T)
     output = fp8_blockscale_gemm_swapab(input, weight)
-    
+
     cos_sim = F.cosine_similarity(
-        reference.flatten().float(), 
-        output.flatten().float(), 
-        dim=0
+        reference.flatten().float(), output.flatten().float(), dim=0
     )
     assert cos_sim > 0.99, f"Shape ({m}, {n}, {k}): cosine similarity {cos_sim} too low"
 
@@ -258,39 +349,39 @@ def test_fp8_blockscale_gemm_error_handling():
     compute_capability = get_compute_capability(torch.device("cuda"))
     if compute_capability[0] < 9:
         pytest.skip("FP8 block-scale GEMM requires SM90 (Hopper) or later")
-    
+
     if not is_sm90a_supported(torch.device("cuda")):
         pytest.skip("FP8 block-scale GEMM requires SM90a (Hopper) support")
-    
+
     device = "cuda"
     m, n, k = 16, 256, 256
-    
+
     # Test: K not divisible by 128
     input = torch.randn(m, 127, device=device, dtype=torch.bfloat16)
     weight = torch.randn(n, 127, device=device, dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="divisible by block size"):
         fp8_blockscale_gemm_swapab(input, weight)
-    
+
     # Test: FP16 not supported
     input = torch.randn(m, k, device=device, dtype=torch.float16)
     weight = torch.randn(n, k, device=device, dtype=torch.float16)
     with pytest.raises(ValueError, match="FP8.*or BF16"):
         fp8_blockscale_gemm_swapab(input, weight)
-    
+
     # Test: FP8 weight without scale (naive conversion)
     input_bf16 = torch.randn(m, k, device=device, dtype=torch.bfloat16)
     weight_bf16 = torch.randn(n, k, device=device, dtype=torch.bfloat16)
     weight_fp8_naive = weight_bf16.to(torch.float8_e4m3fn)
     with pytest.raises(ValueError, match="weight_scale is required when weight is FP8"):
         fp8_blockscale_gemm_swapab(input_bf16, weight_fp8_naive, None, None)
-    
+
     # Test: BF16 input with scale (should raise error)
     input = torch.randn(m, k, device=device, dtype=torch.bfloat16)
     weight = torch.randn(n, k, device=device, dtype=torch.bfloat16)
     fake_scale = torch.ones(m, k // 128, device=device, dtype=torch.float32)
     with pytest.raises(ValueError, match="input_scale should not be provided for BF16"):
         fp8_blockscale_gemm_swapab(input, weight, input_scale=fake_scale)
-    
+
     # Test: Wrong scale shape for FP8 input
     input_bf16 = torch.randn(m, k, device=device, dtype=torch.bfloat16)
     input_fp8, _ = per_token_cast_to_fp8(input_bf16)
@@ -298,8 +389,8 @@ def test_fp8_blockscale_gemm_error_handling():
     wrong_scale = torch.ones(m, k // 64, device=device, dtype=torch.float32)
     with pytest.raises(ValueError):
         fp8_blockscale_gemm_swapab(input_fp8, weight, input_scale=wrong_scale)
-    
-    # Test: FP8 input + BF16 weight is NOT supported 
+
+    # Test: FP8 input + BF16 weight is NOT supported
     input_bf16 = torch.randn(m, k, device=device, dtype=torch.bfloat16)
     input_fp8, input_scale = per_token_cast_to_fp8(input_bf16)
     weight = torch.randn(n, k, device=device, dtype=torch.bfloat16)
@@ -312,36 +403,33 @@ def test_fp8_blockscale_gemm_output_buffer():
     compute_capability = get_compute_capability(torch.device("cuda"))
     if compute_capability[0] < 9:
         pytest.skip("FP8 block-scale GEMM requires SM90 (Hopper) or later")
-    
+
     if not is_sm90a_supported(torch.device("cuda")):
         pytest.skip("FP8 block-scale GEMM requires SM90a (Hopper) support")
-    
+
     device = "cuda"
     m, n, k = 16, 256, 256
     torch.manual_seed(42)
-    
+
     input = torch.randn(m, k, device=device, dtype=torch.bfloat16)
     weight = torch.randn(n, k, device=device, dtype=torch.bfloat16)
-    
+
     # Pre-allocate output
     output = torch.empty(m, n, device=device, dtype=torch.bfloat16)
-    
+
     # Run GEMM with pre-allocated output
     result = fp8_blockscale_gemm_swapab(input, weight, out=output)
-    
+
     # Verify result is the same buffer
     assert result is output
-    
+
     # Verify correctness
     reference = torch.matmul(input, weight.T)
     cos_sim = F.cosine_similarity(
-        reference.flatten().float(), 
-        output.flatten().float(), 
-        dim=0
+        reference.flatten().float(), output.flatten().float(), dim=0
     )
     assert cos_sim > 0.99
 
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
-
