@@ -29,25 +29,38 @@ if [ "$DRY_RUN" != "true" ]; then
     echo ""
 
     # Install precompiled kernels (require CI build artifacts)
-    : ${DIST_CUBIN_DIR:="../dist/${CUDA_VERSION}/cubin"}
-    : ${DIST_JIT_CACHE_DIR:="../dist/${CUDA_VERSION}/jit-cache"}
+    JIT_ARCH_EFFECTIVE=""
+    if [ -n "${JIT_ARCH}" ]; then
+        if [ "${JIT_ARCH}" = "12.0" ]; then
+            if [ "${CUDA_VERSION}" = "cu129" ]; then
+                JIT_ARCH_EFFECTIVE="12.0a"
+            else
+                JIT_ARCH_EFFECTIVE="12.0f"
+            fi
+        else
+            JIT_ARCH_EFFECTIVE="${JIT_ARCH}"
+        fi
+        echo "Using JIT_ARCH from environment: ${JIT_ARCH_EFFECTIVE}"
+        DIST_CUBIN_DIR="../dist/${CUDA_VERSION}/${JIT_ARCH_EFFECTIVE}/cubin"
+        DIST_JIT_CACHE_DIR="../dist/${CUDA_VERSION}/${JIT_ARCH_EFFECTIVE}/jit-cache"
 
-    if [ -d "${DIST_CUBIN_DIR}" ] && ls "${DIST_CUBIN_DIR}"/*.whl >/dev/null 2>&1; then
-        echo "Installing flashinfer-cubin from ${DIST_CUBIN_DIR} ..."
-        pip install -q "${DIST_CUBIN_DIR}"/*.whl
-    else
-        echo "ERROR: flashinfer-cubin wheel not found in ${DIST_CUBIN_DIR}. Ensure the CI build stage produced the artifact." >&2
-        exit 1
-    fi
+        if [ -d "${DIST_CUBIN_DIR}" ] && ls "${DIST_CUBIN_DIR}"/*.whl >/dev/null 2>&1; then
+            echo "Installing flashinfer-cubin from ${DIST_CUBIN_DIR} ..."
+            pip install -q "${DIST_CUBIN_DIR}"/*.whl
+        else
+            echo "ERROR: flashinfer-cubin wheel not found in ${DIST_CUBIN_DIR}. Ensure the CI build stage produced the artifact." >&2
+            exit 1
+        fi
 
-    if [ -d "${DIST_JIT_CACHE_DIR}" ] && ls "${DIST_JIT_CACHE_DIR}"/*.whl >/dev/null 2>&1; then
-        echo "Installing flashinfer-jit-cache from ${DIST_JIT_CACHE_DIR} ..."
-        pip install -q "${DIST_JIT_CACHE_DIR}"/*.whl
-    else
-        echo "ERROR: flashinfer-jit-cache wheel not found in ${DIST_JIT_CACHE_DIR} for ${CUDA_VERSION}. Ensure the CI build stage produced the artifact." >&2
-        exit 1
+        if [ -d "${DIST_JIT_CACHE_DIR}" ] && ls "${DIST_JIT_CACHE_DIR}"/*.whl >/dev/null 2>&1; then
+            echo "Installing flashinfer-jit-cache from ${DIST_JIT_CACHE_DIR} ..."
+            pip install -q "${DIST_JIT_CACHE_DIR}"/*.whl
+        else
+            echo "ERROR: flashinfer-jit-cache wheel not found in ${DIST_JIT_CACHE_DIR} for ${CUDA_VERSION}. Ensure the CI build stage produced the artifact." >&2
+            exit 1
+        fi
+        echo ""
     fi
-    echo ""
 
     # Install local python sources
     pip install -e . -v --no-deps
