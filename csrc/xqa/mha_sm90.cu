@@ -640,8 +640,8 @@ __launch_bounds__(128 * 3)
         uint32_t* __restrict__ const semaphores =
             nullptr,  // [nbReq][nbKHeads][divUp(specDecParams.qSeqLen, inputTokensPerCta)]
         void* __restrict__ const scratch = nullptr) {
-  float const qScaleValue = qScalePtr != nullptr ? *qScalePtr : qScale;
-  float const kvCacheScaleValue = kvScalePtr != nullptr ? *kvScalePtr : kvCacheScale;
+  float const qScaleValue = qScalePtr != nullptr ? qScalePtr[0] : qScale;
+  float const kvCacheScaleValue = kvScalePtr != nullptr ? kvScalePtr[0] : kvCacheScale;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 900 && defined(__CUDA_ARCH_FEAT_SM90_ALL) && \
     (IS_SUPPORTED_F16_CASE || CACHE_ELEM_ENUM == 2) && BEAM_WIDTH == 1
   uint32_t const idxReq = blockIdx.z / nbKHeads;

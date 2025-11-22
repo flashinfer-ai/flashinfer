@@ -1310,8 +1310,8 @@ CUBIN_EXPORT __global__
         uint32_t kv_stride_page, uint32_t kv_stride_token, uint32_t kv_stride_head,
         uint32_t* __restrict__ semaphores = nullptr, void* __restrict__ scratch = nullptr) {
 
-  float const qScaleValue = qScalePtr != nullptr ? *qScalePtr : qScale;
-  float const kvCacheScaleValue = kvScalePtr != nullptr ? *kvScalePtr : kvCacheScale;
+  float const qScaleValue = qScalePtr != nullptr ? qScalePtr[0] : qScale;
+  float const kvCacheScaleValue = kvScalePtr != nullptr ? kvScalePtr[0] : kvCacheScale;
   assert(allowMultiBlockMode || gridDim.x == 1);
   bool const isMultiBlock = allowMultiBlockMode && (gridDim.x != 1);
   uint32_t const nbSubSeqPerSeq = allowMultiBlockMode ? gridDim.x : 1;

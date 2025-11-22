@@ -8,14 +8,13 @@ from flashinfer import xqa, xqa_mla
 from flashinfer.utils import get_compute_capability
 
 
-def set_random_seed(seed=42):
+def set_random_seed(seed=0):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-    torch.cuda.random.manual_seed_all(seed)
 
 
 def round_up(a, b):
@@ -174,7 +173,7 @@ def test_xqa(
     q_scale,
     use_fp8_output,
 ):
-    set_random_seed(42)
+    set_random_seed(0)
 
     nb_q_heads = nb_k_heads * head_grp_size
 
@@ -454,7 +453,7 @@ def test_xqa_mla(
     q_scale,
     enable_pdl,
 ):
-    set_random_seed(42)
+    set_random_seed(0)
 
     # MLA specific constants (fixed, not parameterized)
     nb_k_heads = 1  # MLA only supports 1 K head
