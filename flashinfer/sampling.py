@@ -808,7 +808,13 @@ def top_p_sampling_from_probs(
     _check_indices_dtype(indices)
     _check_tensor_param(top_p, probs)
     return get_sampling_module().top_p_sampling_from_probs(
-        probs, indices, *_to_tensor_scalar_tuple(top_p), deterministic, generator, seed, offset
+        probs,
+        indices,
+        *_to_tensor_scalar_tuple(top_p),
+        deterministic,
+        generator,
+        seed,
+        offset,
     )
 
 
@@ -898,7 +904,13 @@ def top_k_sampling_from_probs(
     _check_indices_dtype(indices)
     _check_tensor_param(top_k, probs)
     return get_sampling_module().top_k_sampling_from_probs(
-        probs, indices, *_to_tensor_scalar_tuple(top_k), deterministic, generator, seed, offset
+        probs,
+        indices,
+        *_to_tensor_scalar_tuple(top_k),
+        deterministic,
+        generator,
+        seed,
+        offset,
     )
 
 
@@ -984,7 +996,13 @@ def min_p_sampling_from_probs(
     _check_indices_dtype(indices)
     _check_tensor_param(min_p, probs)
     return get_sampling_module().min_p_sampling_from_probs(
-        probs, indices, *_to_tensor_scalar_tuple(min_p), deterministic, generator, seed, offset
+        probs,
+        indices,
+        *_to_tensor_scalar_tuple(min_p),
+        deterministic,
+        generator,
+        seed,
+        offset,
     )
 
 
