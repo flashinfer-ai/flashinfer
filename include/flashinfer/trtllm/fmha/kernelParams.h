@@ -325,10 +325,8 @@ struct KernelParams {
     }
 
     // Ragged layout has no batch stride; reset negative overflow to 0 for TMA descriptor.
-    if (!isPagedKv(options.mQkvLayout) && !isContiguousKv(options.mQkvLayout)) {
-      if (strideBatch < 0) {
-        strideBatch = 0;
-      }
+    if (!isPagedKv(options.mQkvLayout) && !isContiguousKv(options.mQkvLayout) && strideBatch < 0) {
+      strideBatch = 0;
     }
 
     // The 3 strides (the other ones are 1 and 0).
