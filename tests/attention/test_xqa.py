@@ -128,7 +128,22 @@ def ref_attention(
 @pytest.mark.parametrize("use_sliding_window", [True, False])
 @pytest.mark.parametrize("input_type", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("use_attention_sinks", [True, False])
-@pytest.mark.parametrize("seq_len", [2, 15, 256, 512])
+@pytest.mark.parametrize(
+    "seq_len",
+    [
+        2,
+        15,
+        256,
+        512,
+        pytest.param(
+            514,
+            marks=pytest.mark.xfail(
+                reason="seq_len=514 is known to fail in full test suite occasionally",
+                strict=False,
+            ),
+        ),
+    ],
+)
 @pytest.mark.parametrize("batch_size", [1, 4])
 @pytest.mark.parametrize("nb_k_heads", [2, 4])
 @pytest.mark.parametrize("tokens_per_page", [16, 64])
