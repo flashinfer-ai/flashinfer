@@ -804,6 +804,51 @@ def _should_use_oneshot(
     return comm_size_mb <= _use_oneshot_heuristics[world_size]
 
 
+def _check_workspace_metadata(
+    token_num: int,
+    hidden_dim: int,
+    world_size: int,
+    dtype: torch.dtype,
+    metadata: dict,
+) -> None:
+    errors = []
+    required_keys = ["max_token_num", "tp_size", "hidden_dim", "use_fp32_lamport"]
+    for key in required_keys:
+        if key not in metadata:
+            errors.append(f"Workspace metadata is missing required key: {key}")
+    if errors:
+        error_msg = "Workspace metadata validation failed:\n" + "\n".join(
+            f"  - {e}" for e in errors
+        )
+        raise ValueError(error_msg)
+
+    # world_size must match tp_size (flag size depends on it)
+    if world_size != metadata["tp_size"]:
+        errors.append(
+            f"world_size ({world_size}) does not match workspace tp_size ({metadata['tp_size']}). "
+            f"Workspace was created for tp_size={metadata['tp_size']}."
+        )
+
+    # token_num * hidden_dim must not exceed max_token_num * hidden_dim
+    if token_num * hidden_dim > metadata["max_token_num"] * metadata["hidden_dim"]:
+        errors.append(
+            f"token_num ({token_num}) * hidden_dim ({hidden_dim}) exceeds workspace max_token_num ({metadata['max_token_num']}) * hidden_dim ({metadata['hidden_dim']}). "
+            f"This may cause Illegal Memory Access."
+        )
+
+    # use_fp32_lamport must match
+    if metadata["use_fp32_lamport"] != (dtype == torch.float32):
+        errors.append(
+            f"use_fp32_lamport ({metadata['use_fp32_lamport']}) does not match allreduce_in.dtype ({dtype}). "
+            f"Workspace was created for use_fp32_lamport={metadata['use_fp32_lamport']}."
+        )
+    if errors:
+        error_msg = "Workspace validation failed:\n" + "\n".join(
+            f"  - {e}" for e in errors
+        )
+        raise ValueError(error_msg)
+
+
 def trtllm_allreduce_fusion(
     allreduce_in: torch.Tensor,
     world_size: int,
@@ -858,50 +903,9 @@ def trtllm_allreduce_fusion(
 
     # Validate against workspace metadata if provided
     if metadata is not None:
-        errors = []
-        required_keys = ["max_token_num", "tp_size", "hidden_dim", "use_fp32_lamport"]
-        for key in required_keys:
-            if key not in metadata:
-                errors.append(f"Workspace metadata is missing required key: {key}")
-        if errors:
-            error_msg = "Workspace metadata validation failed:\n" + "\n".join(
-                f"  - {e}" for e in errors
-            )
-            raise ValueError(error_msg)
-
-        # Check 1: token_num must not exceed max_token_num
-        if token_num > metadata["max_token_num"]:
-            errors.append(
-                f"token_num ({token_num}) exceeds workspace max_token_num ({metadata['max_token_num']}). "
-                f"This may cause Illegal Memory Access."
-            )
-
-        # Check 2: world_size must match tp_size
-        if world_size != metadata["tp_size"]:
-            errors.append(
-                f"world_size ({world_size}) does not match workspace tp_size ({metadata['tp_size']}). "
-                f"Workspace was created for tp_size={metadata['tp_size']}."
-            )
-
-        # Check 3: hidden_dim must match
-        if hidden_dim != metadata["hidden_dim"]:
-            errors.append(
-                f"hidden_dim ({hidden_dim}) does not match workspace hidden_dim ({metadata['hidden_dim']}). "
-                f"Workspace was created for hidden_dim={metadata['hidden_dim']}."
-            )
-
-        # Check 4: use_fp32_lamport must match
-        if metadata["use_fp32_lamport"] != (allreduce_in.dtype == torch.float32):
-            errors.append(
-                f"use_fp32_lamport ({metadata['use_fp32_lamport']}) does not match allreduce_in.dtype ({allreduce_in.dtype}). "
-                f"Workspace was created for use_fp32_lamport={metadata['use_fp32_lamport']}."
-            )
-
-        if errors:
-            error_msg = "Workspace validation failed:\n" + "\n".join(
-                f"  - {e}" for e in errors
-            )
-            raise ValueError(error_msg)
+        _check_workspace_metadata(
+            token_num, hidden_dim, world_size, allreduce_in.dtype, metadata
+        )
 
     if use_oneshot is None:
         use_oneshot = _should_use_oneshot(
