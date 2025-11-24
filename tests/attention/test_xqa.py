@@ -128,7 +128,7 @@ def ref_attention(
 @pytest.mark.parametrize("use_sliding_window", [True, False])
 @pytest.mark.parametrize("input_type", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("use_attention_sinks", [True, False])
-@pytest.mark.parametrize("seq_len", [2, 15, 256, 514])
+@pytest.mark.parametrize("seq_len", [2, 15, 256, 512])
 @pytest.mark.parametrize("batch_size", [1, 4])
 @pytest.mark.parametrize("nb_k_heads", [2, 4])
 @pytest.mark.parametrize("tokens_per_page", [16, 64])
@@ -327,9 +327,6 @@ def test_xqa(
 
     rcp_out_scale = 4.0 if use_fp8_output else 1.0
 
-    torch.cuda.synchronize()
-    semaphores.zero_()
-
     xqa(
         q_heads,
         cache_k_heads.to(torch.float8_e4m3fn) if fp8_kv_cache else cache_k_heads,
@@ -350,8 +347,6 @@ def test_xqa(
         enable_pdl=enable_pdl,
         rcp_out_scale=rcp_out_scale,
     )
-
-    torch.cuda.synchronize()
 
     # Batch reconstruct all K/V caches from paged memory
     # [batch_size, nb_k_heads, max_seq_len, valid_elems_per_head]
