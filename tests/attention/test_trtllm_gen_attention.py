@@ -414,13 +414,13 @@ def _test_trtllm_batch_prefill(
     max_q_len,
     max_kv_len,
     device_scale,
+    head_dim,
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] != 10:
         pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
     # Set up test parameters
     torch.manual_seed(0)
-    head_dim = 128
 
     # Generate random sequence lengths
     num_qo_heads = num_kv_heads * head_grp_size
@@ -639,6 +639,7 @@ def _test_trtllm_batch_prefill(
 @pytest.mark.parametrize("enable_sink", [True, False])
 @pytest.mark.parametrize("max_q_len", [511])
 @pytest.mark.parametrize("max_kv_len", [2047])
+@pytest.mark.parametrize("head_dim", [128, 256])
 def test_trtllm_batch_prefill(
     kv_layout,
     batch_size,
@@ -653,6 +654,7 @@ def test_trtllm_batch_prefill(
     enable_sink,
     max_q_len,
     max_kv_len,
+    head_dim,
 ):
     _test_trtllm_batch_prefill(
         kv_layout,
@@ -669,6 +671,7 @@ def test_trtllm_batch_prefill(
         max_q_len,
         max_kv_len,
         kv_dtype == "fp8",
+        head_dim,
     )
 
 
@@ -690,6 +693,7 @@ def test_trtllm_batch_prefill(
 @pytest.mark.parametrize("enable_sink", [False])
 @pytest.mark.parametrize("max_q_len", [8192])
 @pytest.mark.parametrize("max_kv_len", [8192])
+@pytest.mark.parametrize("head_dim", [128, 256])
 def test_trtllm_batch_prefill_bs1(
     kv_layout,
     batch_size,
@@ -704,6 +708,7 @@ def test_trtllm_batch_prefill_bs1(
     enable_sink,
     max_q_len,
     max_kv_len,
+    head_dim,
 ):
     _test_trtllm_batch_prefill(
         kv_layout,
@@ -720,6 +725,7 @@ def test_trtllm_batch_prefill_bs1(
         max_q_len,
         max_kv_len,
         False,
+        head_dim,
     )
 
 
@@ -1202,7 +1208,6 @@ def test_trtllm_batch_decode_head_dim_256(
     device_scale,
 ):
     # Small number of test cases for head_dim = 256
-    pytest.xfail("trtllm-gen decode gets incorrect output with head_dim = 256")
     _test_trtllm_batch_decode(
         "trtllm-gen",
         kv_layout,
