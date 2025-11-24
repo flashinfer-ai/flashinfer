@@ -85,7 +85,6 @@ def _run_correctness_worker(
                 dtype=dtype,
                 topology="single_node",
                 process_group=group,
-                use_fp32_lamport=lamport_use_fp32,
             )
             # Extract metadata for compatibility with tests
             workspace_metadata = workspace.metadata
