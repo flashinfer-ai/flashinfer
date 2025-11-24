@@ -33,8 +33,8 @@ beam_width = 1
 
 def ref_attention(
     q,
-    k_cache,  # Changed: now takes full tensor [seq_len, dim]
-    v_cache,  # Changed: now takes full tensor [seq_len, dim]
+    k_cache,
+    v_cache,
     seq_len,
     q_scale,
     kv_scale,
@@ -42,16 +42,22 @@ def ref_attention(
     attention_sinks,
     sliding_win_size,
     valid_elems_per_head,
-    valid_elems_per_v_head=None,  # Optional: for MLA where V dim != K dim
+    valid_elems_per_v_head=None,
 ):
     """
-    For MLA:
-    - Q/K dimension: 576 (valid_elems_per_head)
-    - V dimension: 512 (valid_elems_per_v_head)
-    - Output dimension: matches valid_elems_per_head (576) but only first
-      valid_elems_per_v_head (512) elements are valid
+    Batched reference attention implementation.
+
+    Args:
+        q: [batch_size, nb_k_heads, head_grp_size, valid_elems_per_head]
+        k_cache: [batch_size, nb_k_heads, seq_len, valid_elems_per_head]
+        v_cache: [batch_size, nb_k_heads, seq_len, valid_elems_per_v_head]
+        seq_len: scalar or [batch_size] tensor
+        attention_sinks: [nb_k_heads, head_grp_size] or None
+
+    Returns:
+        out: [batch_size, nb_k_heads, head_grp_size, valid_elems_per_v_head]
     """
-    head_grp_size = q.shape[0]
+    batch_size, nb_k_heads, head_grp_size, _ = q.shape
     rcp_x_scale = 1.0 / x_scale
     qk_scale = q_scale * kv_scale / math.sqrt(valid_elems_per_head)
 
@@ -59,21 +65,16 @@ def ref_attention(
     if valid_elems_per_v_head is None:
         valid_elems_per_v_head = valid_elems_per_head
 
-    q_f32 = q.to(torch.float32)  # [head_grp_size, valid_elems_per_head]
-
-    # Directly use the pre-assembled cache tensors
-    k_cache_f32 = k_cache[:seq_len].to(torch.float32)  # [seq_len, valid_elems_per_head]
-    # For MLA: V cache storage is 576 but only first 512 elements are valid
-    v_cache_f32 = v_cache[:seq_len, :valid_elems_per_v_head].to(
+    # Convert to float32 for computation
+    q_f32 = q.to(
         torch.float32
-    )  # [seq_len, valid_elems_per_v_head]
-
-    # q_f32: [head_grp_size, valid_elems_per_head]
-    # k_cache_f32: [seq_len, valid_elems_per_head]
-    # gemm0_acc: [head_grp_size, seq_len]
-    gemm0_acc = torch.zeros(
-        head_grp_size, seq_len, dtype=torch.float32, device=q_f32.device
-    )
+    )  # [batch_size, nb_k_heads, head_grp_size, valid_elems_per_head]
+    k_cache_f32 = k_cache[:, :, :seq_len].to(
+        torch.float32
+    )  # [batch_size, nb_k_heads, seq_len, valid_elems_per_head]
+    v_cache_f32 = v_cache[:, :, :seq_len, :valid_elems_per_v_head].to(
+        torch.float32
+    )  # [batch_size, nb_k_heads, seq_len, valid_elems_per_v_head]
 
     # Calculate sliding window start position
     if sliding_win_size == 0 or seq_len < sliding_win_size:
@@ -81,49 +82,38 @@ def ref_attention(
     else:
         seq_beg = seq_len - sliding_win_size
 
-    # Set positions before sliding window to negative infinity (masking)
+    # Q·K^T: [batch_size, nb_k_heads, head_grp_size, seq_len]
+    gemm0_acc = torch.matmul(q_f32, k_cache_f32.transpose(-2, -1)) * qk_scale
+
+    # Apply sliding window mask
     if seq_beg > 0:
-        gemm0_acc[:, :seq_beg] = float("-inf")
+        gemm0_acc[:, :, :, :seq_beg] = float("-inf")
 
-    # q_f32: [head_grp_size, valid_elems_per_head]
-    # k_cache_f32[seq_beg:seq_len]: [valid_seq_len, valid_elems_per_head]
-    if seq_beg < seq_len:
-        valid_k_cache = k_cache_f32[
-            seq_beg:seq_len
-        ]  # [valid_seq_len, valid_elems_per_head]
-        valid_scores = (
-            torch.matmul(q_f32, valid_k_cache.t()) * qk_scale
-        )  # [head_grp_size, valid_seq_len]
-        gemm0_acc[:, seq_beg:seq_len] = valid_scores
+    # Softmax
+    row_max = torch.max(gemm0_acc, dim=-1, keepdim=True)[
+        0
+    ]  # [batch_size, nb_k_heads, head_grp_size, 1]
+    x = torch.exp(
+        gemm0_acc - row_max
+    )  # [batch_size, nb_k_heads, head_grp_size, seq_len]
 
-    row_max = torch.max(gemm0_acc, dim=1, keepdim=True)[0]  # [head_grp_size, 1]
-    x = torch.exp(gemm0_acc - row_max)  # [head_grp_size, seq_len]
+    row_sum = torch.sum(
+        x, dim=-1, keepdim=True
+    )  # [batch_size, nb_k_heads, head_grp_size, 1]
 
-    row_sum = torch.sum(x, dim=1, keepdim=True)  # [head_grp_size, 1]
+    # Add attention sinks contribution
+    if attention_sinks is not None:
+        # attention_sinks: [nb_k_heads, head_grp_size]
+        # row_max: [batch_size, nb_k_heads, head_grp_size, 1]
+        sink_weights = torch.exp(
+            attention_sinks.unsqueeze(0).unsqueeze(-1) - row_max
+        )  # [batch_size, nb_k_heads, head_grp_size, 1]
+        row_sum = row_sum + sink_weights
 
     x = x * rcp_x_scale
 
-    if seq_beg < seq_len:
-        valid_x = x[:, seq_beg:seq_len]  # [head_grp_size, valid_seq_len]
-        valid_v_cache = v_cache_f32[
-            seq_beg:seq_len
-        ]  # [valid_seq_len, valid_elems_per_v_head]
-        out = torch.matmul(
-            valid_x, valid_v_cache
-        )  # [head_grp_size, valid_elems_per_v_head]
-    else:
-        out = torch.zeros(
-            head_grp_size,
-            valid_elems_per_v_head,
-            dtype=torch.float32,
-            device=q_f32.device,
-        )
-
-    if attention_sinks is not None:
-        sink_weights = torch.exp(
-            attention_sinks - row_max.squeeze(-1)
-        )  # [head_grp_size]
-        row_sum.squeeze(-1)[:] += sink_weights
+    # Attention · V: [batch_size, nb_k_heads, head_grp_size, valid_elems_per_v_head]
+    out = torch.matmul(x, v_cache_f32)
 
     out = out * (x_scale * kv_scale) / row_sum
 
@@ -363,76 +353,106 @@ def test_xqa(
 
     torch.cuda.synchronize()
 
+    # Batch reconstruct all K/V caches from paged memory
+    # [batch_size, nb_k_heads, max_seq_len, valid_elems_per_head]
+    num_pages = (seq_len + tokens_per_page - 1) // tokens_per_page
+    batch_k_cache = torch.zeros(
+        batch_size,
+        nb_k_heads,
+        max_seq_len,
+        valid_elems_per_head,
+        dtype=input_type,
+        device="cuda",
+    )
+    batch_v_cache = torch.zeros(
+        batch_size,
+        nb_k_heads,
+        max_seq_len,
+        valid_elems_per_head,
+        dtype=input_type,
+        device="cuda",
+    )
+
     for req in range(batch_size):
-        for b in range(beam_width):
-            for idx_k_head in range(nb_k_heads):
-                # Assemble contiguous K/V cache from paged memory using advanced indexing
-                num_pages = (seq_len + tokens_per_page - 1) // tokens_per_page
-                pages = page_list_arg[req, :num_pages]  # [num_pages]
+        pages = page_list_arg[req, :num_pages]  # [num_pages]
+        for idx_k_head in range(nb_k_heads):
+            # Gather all pages at once
+            if kv_layout == "NHD":
+                k_pages = cache_k_heads[
+                    pages, :, idx_k_head, :
+                ]  # [num_pages, tokens_per_page, head_dim]
+                v_pages = cache_v_heads[pages, :, idx_k_head, :]
+            else:  # HND
+                k_pages = cache_k_heads[
+                    pages, idx_k_head, :, :
+                ]  # [num_pages, tokens_per_page, head_dim]
+                v_pages = cache_v_heads[pages, idx_k_head, :, :]
 
-                # Gather all pages at once
-                if kv_layout == "NHD":
-                    # [num_pages, tokens_per_page, nb_k_heads, head_dim]
-                    k_pages = cache_k_heads[
-                        pages, :, idx_k_head, :
-                    ]  # [num_pages, tokens_per_page, head_dim]
-                    v_pages = cache_v_heads[pages, :, idx_k_head, :]
-                else:  # HND
-                    # [num_pages, nb_k_heads, tokens_per_page, head_dim]
-                    k_pages = cache_k_heads[
-                        pages, idx_k_head, :, :
-                    ]  # [num_pages, tokens_per_page, head_dim]
-                    v_pages = cache_v_heads[pages, idx_k_head, :, :]
+            # Reshape to contiguous sequence and store
+            batch_k_cache[req, idx_k_head, : num_pages * tokens_per_page] = (
+                k_pages.reshape(-1, valid_elems_per_head)
+            )
+            batch_v_cache[req, idx_k_head, : num_pages * tokens_per_page] = (
+                v_pages.reshape(-1, valid_elems_per_head)
+            )
 
-                # Reshape to contiguous sequence
-                k_cache = k_pages.reshape(
-                    -1, valid_elems_per_head
-                )  # [num_pages*tokens_per_page, head_dim]
-                v_cache = v_pages.reshape(-1, valid_elems_per_head)
+    # Reshape q_heads: [batch_size, beam_width, nb_q_heads, dim] -> [batch_size, nb_k_heads, head_grp_size, dim]
+    # Since beam_width = 1, we can squeeze it
+    q_reshaped = q_heads.squeeze(1).reshape(
+        batch_size, nb_k_heads, head_grp_size, valid_elems_per_head
+    )
 
-                ref_output = ref_attention(
-                    q=q_heads[req][b][
-                        idx_k_head * head_grp_size : (idx_k_head + 1) * head_grp_size
-                    ],
-                    k_cache=k_cache,
-                    v_cache=v_cache,
-                    seq_len=seq_len,
-                    q_scale=q_scale,
-                    kv_scale=kv_cache_scale,
-                    x_scale=1.0,
-                    attention_sinks=attention_sinks[idx_k_head, :]
-                    if use_attention_sinks
-                    else None,
-                    sliding_win_size=sliding_win_size if use_sliding_window else 0,
-                    valid_elems_per_head=valid_elems_per_head,
-                )
-                kernel_output = output[req][b][
-                    idx_k_head * head_grp_size : (idx_k_head + 1) * head_grp_size
-                ].to(torch.float32)
-                if fp8_kv_cache:
-                    atol = 0.05
-                    rtol = 0.05
-                else:
-                    atol = 0.01
-                    rtol = 0.01
-                if use_fp8_output:
-                    ref_output = ref_output * rcp_out_scale
-                    atol = 0.15
-                    rtol = 0.15
+    # Batch compute reference attention
+    ref_output_batch = ref_attention(
+        q=q_reshaped,
+        k_cache=batch_k_cache,
+        v_cache=batch_v_cache,
+        seq_len=seq_len,
+        q_scale=q_scale,
+        kv_scale=kv_cache_scale,
+        x_scale=1.0,
+        attention_sinks=attention_sinks if use_attention_sinks else None,
+        sliding_win_size=sliding_win_size if use_sliding_window else 0,
+        valid_elems_per_head=valid_elems_per_head,
+    )  # [batch_size, nb_k_heads, head_grp_size, valid_elems_per_head]
 
-                diff_abs = torch.abs(ref_output - kernel_output)
-                diff_rel = diff_abs / (torch.abs(ref_output) + 1e-8)
+    # Reshape kernel output to match: [batch_size, beam_width, nb_q_heads, dim] -> [batch_size, nb_k_heads, head_grp_size, dim]
+    kernel_output_reshaped = (
+        output.squeeze(1)
+        .reshape(batch_size, nb_k_heads, head_grp_size, valid_elems_per_head)
+        .to(torch.float32)
+    )
 
-                within_tolerance = (diff_abs <= atol) | (diff_rel <= rtol)
+    if use_fp8_output:
+        ref_output_batch = ref_output_batch * rcp_out_scale
 
-                pass_ratio = within_tolerance.float().mean().item()
+    # Set tolerances
+    if fp8_kv_cache:
+        atol = 0.05
+        rtol = 0.05
+    else:
+        atol = 0.01
+        rtol = 0.01
+    if use_fp8_output:
+        atol = 0.15
+        rtol = 0.15
 
-                required_ratio = 0.99
-                assert pass_ratio >= required_ratio, (
-                    f"req={req}, b={b}, idx_k_head={idx_k_head}: "
-                    f"Total {ref_output.numel()} elements, only {pass_ratio:.1%} meet tolerance criteria, "
-                    f"require at least {required_ratio:.1%}"
-                )
+    # Compute differences for all elements at once
+    diff_abs = torch.abs(ref_output_batch - kernel_output_reshaped)
+    diff_rel = diff_abs / (torch.abs(ref_output_batch) + 1e-8)
+    within_tolerance = (diff_abs <= atol) | (diff_rel <= rtol)
+
+    # One-shot validation for all elements
+    total_elements = ref_output_batch.numel()
+    passing_elements = within_tolerance.sum().item()
+    pass_ratio = passing_elements / total_elements
+    required_ratio = 0.99
+
+    assert pass_ratio >= required_ratio, (
+        f"Batch validation failed: "
+        f"Total {total_elements} elements, only {passing_elements} ({pass_ratio:.1%}) meet tolerance criteria, "
+        f"require at least {required_ratio:.1%}"
+    )
 
 
 @pytest.mark.skipif(
@@ -578,54 +598,88 @@ def test_xqa_mla(
         enable_pdl=enable_pdl,
     )
 
+    # Batch reconstruct all K/V caches from paged memory
+    # [batch_size, nb_k_heads, max_seq_len, valid_elems_per_head_qk]
+    num_pages = (seq_len + tokens_per_page - 1) // tokens_per_page
+    batch_k_cache = torch.zeros(
+        batch_size,
+        nb_k_heads,
+        max_seq_len,
+        valid_elems_per_head_qk,
+        dtype=torch.float32,
+        device="cuda",
+    )
+    batch_v_cache = torch.zeros(
+        batch_size,
+        nb_k_heads,
+        max_seq_len,
+        valid_elems_per_head_qk,
+        dtype=torch.float32,
+        device="cuda",
+    )
+
     for req in range(batch_size):
-        for b in range(beam_width):
-            for idx_k_head in range(nb_k_heads):
-                # Assemble contiguous K/V cache from paged memory using advanced indexing
-                num_pages = (seq_len + tokens_per_page - 1) // tokens_per_page
-                pages = page_list_arg[req, :num_pages]  # [num_pages]
+        pages = page_list_arg[req, :num_pages]  # [num_pages]
+        for idx_k_head in range(nb_k_heads):
+            # NHD layout: [num_pages, tokens_per_page, nb_k_heads, head_dim]
+            k_pages = cache_k_heads[
+                pages, :, idx_k_head, :
+            ]  # [num_pages, tokens_per_page, head_dim]
+            v_pages = cache_v_heads[pages, :, idx_k_head, :]
 
-                # NHD layout: [num_pages, tokens_per_page, nb_k_heads, head_dim]
-                k_pages = cache_k_heads[
-                    pages, :, idx_k_head, :
-                ]  # [num_pages, tokens_per_page, head_dim]
-                v_pages = cache_v_heads[pages, :, idx_k_head, :]
+            # Reshape to contiguous sequence and store
+            batch_k_cache[req, idx_k_head, : num_pages * tokens_per_page] = (
+                k_pages.reshape(-1, valid_elems_per_head_qk)
+            )
+            batch_v_cache[req, idx_k_head, : num_pages * tokens_per_page] = (
+                v_pages.reshape(-1, valid_elems_per_head_qk)
+            )
 
-                # Reshape to contiguous sequence
-                k_cache = k_pages.reshape(-1, valid_elems_per_head_qk)
-                v_cache = v_pages.reshape(-1, valid_elems_per_head_qk)
+    # Reshape q_heads: [batch_size, beam_width, nb_q_heads, dim] -> [batch_size, nb_k_heads, head_grp_size, dim]
+    # Since beam_width = 1, we can squeeze it
+    q_reshaped = q_heads.squeeze(1).reshape(
+        batch_size, nb_k_heads, head_grp_size, valid_elems_per_head_qk
+    )
 
-                ref_output = ref_attention(
-                    q=q_heads[req][b][
-                        idx_k_head * head_grp_size : (idx_k_head + 1) * head_grp_size
-                    ],
-                    k_cache=k_cache,
-                    v_cache=v_cache,
-                    seq_len=seq_len,
-                    q_scale=q_scale * math.sqrt(576),
-                    kv_scale=kv_cache_scale,
-                    x_scale=1.0,
-                    attention_sinks=None,
-                    sliding_win_size=0,
-                    valid_elems_per_head=valid_elems_per_head_qk,  # Q/K dimension (576)
-                    valid_elems_per_v_head=valid_elems_per_head_v,  # V dimension (512)
-                ).to(torch.float32)
-                kernel_output = output[req][b][
-                    idx_k_head * head_grp_size : (idx_k_head + 1) * head_grp_size
-                ].to(torch.float32)
-                atol = 0.05
-                rtol = 0.05
+    # Batch compute reference attention
+    ref_output_batch = ref_attention(
+        q=q_reshaped,
+        k_cache=batch_k_cache,
+        v_cache=batch_v_cache,
+        seq_len=seq_len,
+        q_scale=q_scale * math.sqrt(576),
+        kv_scale=kv_cache_scale,
+        x_scale=1.0,
+        attention_sinks=None,
+        sliding_win_size=0,
+        valid_elems_per_head=valid_elems_per_head_qk,  # Q/K dimension (576)
+        valid_elems_per_v_head=valid_elems_per_head_v,  # V dimension (512)
+    )  # [batch_size, nb_k_heads, head_grp_size, valid_elems_per_v_head]
 
-                diff_abs = torch.abs(ref_output - kernel_output)
-                diff_rel = diff_abs / (torch.abs(ref_output) + 1e-8)
+    # Reshape kernel output to match: [batch_size, beam_width, nb_q_heads, valid_elems_per_v_head] -> [batch_size, nb_k_heads, head_grp_size, valid_elems_per_v_head]
+    kernel_output_reshaped = (
+        output.squeeze(1)
+        .reshape(batch_size, nb_k_heads, head_grp_size, valid_elems_per_head_v)
+        .to(torch.float32)
+    )
 
-                within_tolerance = (diff_abs <= atol) | (diff_rel <= rtol)
+    # Set tolerances
+    atol = 0.05
+    rtol = 0.05
 
-                pass_ratio = within_tolerance.float().mean().item()
+    # Compute differences for all elements at once
+    diff_abs = torch.abs(ref_output_batch - kernel_output_reshaped)
+    diff_rel = diff_abs / (torch.abs(ref_output_batch) + 1e-8)
+    within_tolerance = (diff_abs <= atol) | (diff_rel <= rtol)
 
-                required_ratio = 0.95
-                assert pass_ratio >= required_ratio, (
-                    f"req={req}, b={b}, idx_k_head={idx_k_head}: "
-                    f"Total {ref_output.numel()} elements, only {pass_ratio:.1%} meet tolerance criteria, "
-                    f"require at least {required_ratio:.1%}"
-                )
+    # One-shot validation for all elements
+    total_elements = ref_output_batch.numel()
+    passing_elements = within_tolerance.sum().item()
+    pass_ratio = passing_elements / total_elements
+    required_ratio = 0.95
+
+    assert pass_ratio >= required_ratio, (
+        f"Batch validation failed: "
+        f"Total {total_elements} elements, only {passing_elements} ({pass_ratio:.1%}) meet tolerance criteria, "
+        f"require at least {required_ratio:.1%}"
+    )
