@@ -57,6 +57,7 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*"]
 "flashinfer.data" = "."
 "flashinfer.data.cutlass" = "3rdparty/cutlass"
 "flashinfer.data.spdlog" = "3rdparty/spdlog"
+"flashinfer.data.tensorrt_llm" = "3rdparty/TensorRT-LLM"
 
 [tool.setuptools.package-data]
 "flashinfer" = [
@@ -72,6 +73,9 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*"]
 ]
 "flashinfer.data.spdlog" = [
     "include/**",
+]
+"flashinfer.data.tensorrt_llm" = [
+    "cpp/kernels/fmha_v2/**",
 ]
 
 [tool.mypy]
