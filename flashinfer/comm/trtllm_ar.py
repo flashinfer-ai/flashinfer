@@ -804,7 +804,7 @@ def _should_use_oneshot(
     return comm_size_mb <= _use_oneshot_heuristics[world_size]
 
 
-def _check_workspace_metadata(
+def check_trtllm_allreduce_fusion_workspace_metadata(
     token_num: int,
     hidden_dim: int,
     world_size: int,
@@ -903,7 +903,7 @@ def trtllm_allreduce_fusion(
 
     # Validate against workspace metadata if provided
     if metadata is not None:
-        _check_workspace_metadata(
+        check_trtllm_allreduce_fusion_workspace_metadata(
             token_num, hidden_dim, world_size, allreduce_in.dtype, metadata
         )
 

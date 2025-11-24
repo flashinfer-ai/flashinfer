@@ -48,7 +48,7 @@ Example usage:
     >>> destroy_allreduce_fusion_workspace(workspace)
 """
 
-from typing import Union, Literal, Optional
+from typing import Union, Literal, Optional, Tuple, List, cast
 from abc import ABC, abstractmethod
 
 import torch
@@ -57,6 +57,11 @@ from ..utils import backend_requirement, supported_compute_capability
 from .trtllm_ar import trtllm_allreduce_fusion
 from .trtllm_ar import trtllm_create_ipc_workspace_for_all_reduce_fusion
 from .trtllm_ar import trtllm_destroy_ipc_workspace_for_all_reduce_fusion
+from .trtllm_ar import check_trtllm_allreduce_fusion_workspace_metadata
+
+# Note: AllReduceFusionPattern and QuantizationSFLayout are pseudo-types (classes with int constants)
+# Import them for runtime use but type hint as int for mypy compatibility
+from .trtllm_ar import AllReduceFusionPattern
 
 
 # ============================================================================
@@ -161,13 +166,22 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             max_token_num=max_token_num,
             hidden_dim=hidden_dim,
             group=process_group,
+            create_metadata=True,
             **kwargs,
         )
 
         # Store essential attributes for easy access
-        self.ipc_handles = self._internal_workspace[0]
-        self.workspace_tensor = self._internal_workspace[1]
-        self.metadata = self._internal_workspace[2]
+        # Cast to 3-tuple to make linter happy, since we always call with create_metadata=True
+        workspace_tuple = cast(
+            Tuple[List[List[int]], torch.Tensor, dict], self._internal_workspace
+        )
+        self.ipc_handles = workspace_tuple[0]
+        self.workspace_tensor = workspace_tuple[1]
+        self.metadata = workspace_tuple[2]
+
+    @property
+    def backend(self) -> str:
+        return "trtllm"
 
     def __getattr__(self, name):
         """Delegate attribute access to internal workspace if not found."""
@@ -177,6 +191,18 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             )
         return getattr(self._internal_workspace, name)
 
+    def is_sufficient_for(
+        self, token_num: int, hidden_dim: int, tp_size: int, dtype: torch.dtype
+    ) -> bool:
+        try:
+            check_trtllm_allreduce_fusion_workspace_metadata(
+                token_num, hidden_dim, tp_size, dtype, self.metadata
+            )
+            return True
+        except ValueError as e:
+            print(f"Workspace is insufficient for problem size. {e}")
+            return False
+
     def destroy(self) -> None:
         """Destroy workspace and free resources."""
         if self._destroyed:
@@ -184,10 +210,6 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
 
         trtllm_destroy_ipc_workspace_for_all_reduce_fusion(self.ipc_handles)
         self._destroyed = True
-
-    @property
-    def backend(self) -> str:
-        return "trtllm"
 
 
 class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
@@ -214,7 +236,6 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             **kwargs: Additional arguments for workspace creation
         """
         super().__init__(world_size, rank)
-
         # TODO: Import and call the actual MNNVL workspace creation function
         # For now, raise NotImplementedError
         raise NotImplementedError(
@@ -239,6 +260,10 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         # self.buffer_M = self._internal_workspace.buffer_M
         # self.buffer_flags = self._internal_workspace.buffer_flags
 
+    @property
+    def backend(self) -> str:
+        return "mnnvl"
+
     def destroy(self) -> None:
         """Destroy workspace and free resources."""
         if self._destroyed:
@@ -250,10 +275,6 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         # from .trtllm_mnnvl_ar import destroy_mnnvl_allreduce_fusion_workspace
         # destroy_mnnvl_allreduce_fusion_workspace(self._internal_workspace)
         # self._destroyed = True
-
-    @property
-    def backend(self) -> str:
-        return "mnnvl"
 
 
 # ============================================================================
@@ -413,6 +434,19 @@ def create_allreduce_fusion_workspace(
 
     Backend selection (checks + heuristics) handled by @backend_requirement decorator.
 
+    **Important: Workspace Reusability**
+    The workspace is allocated based on the total size (max_token_num * hidden_dim * dtype_size).
+    You can reuse the same workspace with different shapes as long as the total size fits:
+
+    - Workspace(max_token_num=2048, hidden_dim=4096) can handle:
+      - (token_num=2048, hidden_dim=4096) ✓
+      - (token_num=1024, hidden_dim=4096) ✓
+      - (token_num=4096, hidden_dim=2048) ✓ (same total size)
+      - (token_num=1024, hidden_dim=8192) ✓ (same total size)
+      - (token_num=4096, hidden_dim=4096) ✗ (too large)
+
+    Use `workspace.is_sufficient_for(token_num, hidden_dim, dtype)` to check before use.
+
     Args:
         backend: Backend to use ("trtllm", "mnnvl", or "auto")
                  "auto" uses heuristic to select best backend based on topology
@@ -448,6 +482,11 @@ def create_allreduce_fusion_workspace(
         ...     topology="single_node"
         ... )
         >>> print(workspace.backend)  # "trtllm"
+        >>> print(workspace.get_workspace_capacity())  # 8388608 elements
+
+        >>> # Check if workspace can handle different problem sizes
+        >>> workspace.is_sufficient_for(1024, 4096, 8, torch.bfloat16)  # True
+        >>> workspace.is_sufficient_for(4096, 2048, 8, torch.bfloat16)  # True (same total)
 
         >>> # Explicit backend selection
         >>> workspace = create_allreduce_fusion_workspace(
@@ -555,6 +594,10 @@ def allreduce_fusion(
     - AllReduce only
     - AllReduce + Residual + RMSNorm
     - AllReduce + Residual + RMSNorm + Quantization (FP8/FP4)
+
+    **Note on Workspace Reusability:**
+    You can reuse the same workspace with different (token_num, hidden_dim) combinations
+    as long as `workspace.is_sufficient_for(token_num, hidden_dim, tp_size, dtype)` returns True.
 
     Args:
         input: Input tensor [token_num, hidden_dim]
@@ -685,9 +728,8 @@ def _infer_fusion_pattern(
     """
     Automatically infer fusion pattern from provided tensors.
 
-    Returns AllReduceFusionPattern value based on which output tensors are provided.
+    Returns AllReduceFusionPattern value (as int) based on which output tensors are provided.
     """
-    from .trtllm_ar import AllReduceFusionPattern
 
     if quant_out is not None:
         # Quantization patterns
@@ -743,6 +785,7 @@ def _allreduce_fusion_trtllm(
     quant_out_flat = quant_out.flatten() if quant_out is not None else None
 
     # Call legacy API with flattened tensors
+    # Note: pattern and layout_code are ints but legacy API uses pseudo-type hints
     trtllm_allreduce_fusion(
         allreduce_in=input_flat,
         world_size=workspace.world_size,
@@ -753,7 +796,7 @@ def _allreduce_fusion_trtllm(
         launch_with_pdl=launch_with_pdl,
         trigger_completion_at_end=launch_with_pdl,  # Same meaning
         fp32_acc=fp32_acc,
-        pattern_code=pattern,
+        pattern_code=pattern,  # type: ignore[arg-type]
         use_oneshot=use_oneshot,
         allreduce_out=output_flat,
         residual_in=residual_in_flat,
@@ -764,7 +807,7 @@ def _allreduce_fusion_trtllm(
         rms_gamma=rms_gamma,  # 1D tensor, no reshape needed
         rms_eps=rms_eps,
         scale_factor=scale_factor,
-        layout_code=layout_code,
+        layout_code=layout_code,  # type: ignore[arg-type]
         metadata=metadata,
     )
 
