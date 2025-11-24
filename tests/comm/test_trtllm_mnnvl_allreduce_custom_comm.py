@@ -250,7 +250,7 @@ def test_mnnvl_allreduce_custom_communicator(
 
     available_gpus = torch.cuda.device_count()
     if world_size > available_gpus:
-        raise ValueError(
+        pytest.skip(
             f"world_size {world_size} is greater than available_gpus {available_gpus}"
         )
     print(f"Running test for world_size={world_size}")
