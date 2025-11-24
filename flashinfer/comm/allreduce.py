@@ -142,8 +142,8 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         tp_rank: int,
         max_token_num: int,
         hidden_dim: int,
+        dtype: torch.dtype = torch.float16,
         process_group: Optional["torch.distributed.ProcessGroup"] = None,
-        **kwargs,
     ):
         """
         Create TensorRT-LLM AllReduce fusion workspace.
@@ -167,7 +167,7 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             hidden_dim=hidden_dim,
             group=process_group,
             create_metadata=True,
-            **kwargs,
+            use_fp32_lamport=dtype == torch.float32,
         )
 
         # Store essential attributes for easy access
@@ -427,7 +427,7 @@ def create_allreduce_fusion_workspace(
     dtype: torch.dtype = None,
     topology: str = "single_node",
     process_group: Optional["torch.distributed.ProcessGroup"] = None,
-    **backend_kwargs,
+    **backend_kwargs,  # TODO(nvmbreughe): remove this
 ) -> AllReduceFusionWorkspace:
     """
     Create workspace for AllReduce fusion operations.
@@ -517,8 +517,8 @@ def create_allreduce_fusion_workspace(
             tp_rank=rank,
             max_token_num=max_token_num,
             hidden_dim=hidden_dim,
+            dtype=dtype,
             process_group=process_group,
-            **backend_kwargs,
         )
 
     elif actual_backend == "mnnvl":
