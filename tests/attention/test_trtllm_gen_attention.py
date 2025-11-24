@@ -339,6 +339,66 @@ def unpack_compare_nvfp4(
     return output_unpacked, output_ref
 
 
+def generate_causal_mask(
+    batch_size: int,
+    q_seq_len: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Generate causal attention mask for speculative decoding.
+
+    Parameters
+    ----------
+    batch_size : int
+        Batch size
+    q_seq_len : int
+        Query sequence length (number of speculative decoding tokens)
+    device : torch.device
+        Target device for the mask tensor
+
+    Returns
+    -------
+    torch.Tensor
+        Causal mask with shape [batch_size, q_seq_len, mask_size_per_row]
+        where mask_size_per_row = divUp(q_seq_len, 32) * 2 (in uint16_t units).
+        Data type: torch.uint16
+
+    """
+    num_packed_masks_per_token = (q_seq_len + 31) // 32
+
+    q_indices = torch.arange(q_seq_len, device=device, dtype=torch.int32).unsqueeze(1)
+    kv_indices = torch.arange(q_seq_len, device=device, dtype=torch.int32).unsqueeze(0)
+
+    causal_bool_mask = kv_indices <= q_indices
+
+    padded_seq_len = num_packed_masks_per_token * 32
+    if padded_seq_len > q_seq_len:
+        padding = torch.zeros(
+            q_seq_len, padded_seq_len - q_seq_len, device=device, dtype=torch.bool
+        )
+        causal_bool_mask = torch.cat([causal_bool_mask, padding], dim=1)
+
+    causal_bool_mask = causal_bool_mask.view(q_seq_len, num_packed_masks_per_token, 32)
+
+    bit_positions = torch.tensor(
+        [1 << i for i in range(32)], device=device, dtype=torch.int64
+    )
+
+    mask_uint32 = (
+        (causal_bool_mask.to(torch.int64) * bit_positions).sum(dim=-1).to(torch.uint32)
+    )
+
+    mask_uint32 = (
+        mask_uint32.unsqueeze(0)
+        .expand(batch_size, q_seq_len, num_packed_masks_per_token)
+        .contiguous()
+    )
+
+    mask_uint16 = mask_uint32.view(torch.uint16)
+
+    return mask_uint16
+
+
 def _test_trtllm_batch_prefill(
     kv_layout,
     batch_size,
@@ -701,12 +761,6 @@ def _test_trtllm_batch_decode(
     if backend == "xqa" and q_dtype == "fp8":
         pytest.skip("xqa backend only supports fp16 and bf16 query")
 
-    # xqa backend doesn't support speculative decoding yet
-    if backend == "xqa" and q_len_per_req > 1:
-        pytest.skip(
-            "xqa backend does not support speculative decoding (q_len_per_req > 1) yet"
-        )
-
     if o_dtype == "nvfp4" and q_len_per_req > 1:
         # todo(Yingyi): add support for nvfp4 with speculative decoding
         pytest.skip("nvfp4 is not supported for q_len_per_req > 1")
@@ -826,6 +880,11 @@ def _test_trtllm_batch_decode(
             kv_indptr=kv_indptr_tokens,
         )
 
+    if q_len_per_req > 1:
+        mask = generate_causal_mask(batch_size, q_len_per_req, GPU_DEVICE)
+    else:
+        mask = None
+
     # Run decode function call with specified backend
     bmm1_scale = q_scale * k_scale * sm_scale
     bmm2_scale = v_scale / o_scale
@@ -857,6 +916,7 @@ def _test_trtllm_batch_decode(
         backend=backend,
         q_len_per_req=q_len_per_req,
         o_scale=o_scale,
+        mask=mask,
     )
     if backend == "trtllm-gen":
         # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
