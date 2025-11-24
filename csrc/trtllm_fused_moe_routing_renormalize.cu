@@ -435,8 +435,8 @@ void run(Data const& data, void* stream) {
       << "Routing kernel expects #experts " << data.mNumExperts << " to be a multiple of 4.";
 
   // FIXME: routingIndicesBlockKernel breaks the vllm + gpt-oss DeepEP
-  // bool const useSingleBlock = data.mNumTokens <= BlockKernelMaxNumTokens;
-  bool const useSingleBlock = false;
+  bool const useSingleBlock =
+      data.mNumTokens <= BlockKernelMaxNumTokens && data.mPtrTopKPacked == nullptr;
 
   bool const useSingleCluster =
       data.mNumTokens <= ((data.mPtrScores != nullptr || data.mPtrTopKIds != nullptr)

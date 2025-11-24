@@ -104,6 +104,8 @@ struct KernelParams {
   // The sequence lengths for K/V. Required by pagedKv kernels to avoid unnecessary computation
   // based on (ptrCumSeqLensKv[batchIdx + 1] - ptrCumSeqLensKv[batchIdx]).
   int32_t const* ptrSeqLensKv;
+  // The reserved memory buffer.
+  int32_t* ptrReservedMem;
   // The softmax stats buffer.
   float2* ptrSoftmaxStats;
 
@@ -139,6 +141,8 @@ struct KernelParams {
   int64_t mNumHiddenEltsO;
   // The total number of pages in the paged-kv memory pool.
   int32_t mNumPagesInMemPool;
+  // The number of tokens per page (used if dynamic numTokensPerPage is enabled).
+  int32_t mNumTokensPerPageLog2;
   // The output scale for FP8 quantization.
   float mOutputScale;
   // The scaling factor for softmax (multiplied by log2 to use faster exp2).
@@ -147,11 +151,15 @@ struct KernelParams {
   float mScaleSfKv;
   // The SF scale for O.
   float mScaleSfO;
+  // The reserved parameter.
+  float mReservedParam;
   // The start token index in SF tensor. Used for FP4 SF offset calculation in generation phase
   // kernel when inflight batching is enabled in TRT-LLM.
   int32_t mStartTokenIdxSfO;
   // The sum of sequence lengths for Q and K/V.
   int32_t mSumOfSeqLensQ, mSumOfSeqLensKv;
+  // The sparseMla topK value.
+  int32_t mSparseMlaTopK;
   // The flag to use block sparse attention.
   bool mUseBlockSparseAttention;
 
@@ -543,6 +551,8 @@ struct KernelParams {
                                       int32_t maxNumCtasQ, int32_t maxNumCtasKv) {
     // Create the return struct.
     KernelParams params;
+    // Memset the kernel parameters to 0.
+    memset(&params, 0, sizeof(KernelParams));
 
     // Get the device pointers for TMA descriptors.
     auto [qPtr, kPtr, vPtr] = getDevicePtrs(options, get_size_in_bytes(kernelMeta.mDataTypeKv));
@@ -687,6 +697,16 @@ struct KernelParams {
       // Default 0 means that chunked attention is disabled.
       params.mChunkedAttentionSizeLog2 = 0;
     }
+
+    // Compute the log of numTokensPerPage
+    int32_t numTokensPerPageLog2{-1};
+    if (isPagedKv(options.mQkvLayout)) {
+      FLASHINFER_CHECK((options.mNumTokensPerPage & (options.mNumTokensPerPage - 1)) == 0,
+                       "NumTokensPerPage must be power of 2");
+      numTokensPerPageLog2 = (int)log2f((float)options.mNumTokensPerPage);
+    }
+    params.mNumTokensPerPageLog2 = numTokensPerPageLog2;
+
     params.mMaxSeqLenQ = options.mMaxSeqLenQ;
     params.mMaxSeqLenKv = options.mMaxSeqLenKv;
     params.mMaxNumCtasQ = maxNumCtasQ;
@@ -701,7 +721,6 @@ struct KernelParams {
     params.mNumHeadsKv = options.mNumHeadsKv;
     params.mNumHeadsQPerKv = options.mNumHeadsQPerKv;
     params.mNumHiddenEltsO = options.mNumHeadsQ * options.mHeadDimQk;
-    // todo(Yingyi): might take a scalar tensor later
     params.mOutputScale = options.outputScale;
     params.mScaleSoftmaxLog2 = options.scaleSoftmaxLog2;
     params.mStartTokenIdxSfO = options.mSfStartTokenIdx;

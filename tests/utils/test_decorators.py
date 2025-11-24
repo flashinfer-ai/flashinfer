@@ -327,6 +327,117 @@ def test_common_check():
         my_kernel(x_3d, backend="cudnn")
 
 
+def test_suitable_auto_backends():
+    """Test the suitable_auto_backends method."""
+    if not torch.cuda.is_available():
+        pytest.skip("Skipping CUDA tests (no GPU available)")
+
+    x = torch.randn(1, 1, device="cuda")
+    major, minor = torch.cuda.get_device_capability(x.device)
+    actual_capability = major * 10 + minor
+
+    @supported_compute_capability([80, 86, 89, 90, actual_capability])
+    def _cutlass_check(x, backend):
+        return x.shape[0] > 10
+
+    @supported_compute_capability([75, 80, 86, 89, 90, actual_capability])
+    def _cudnn_check(x, backend):
+        return x.shape[0] > 5
+
+    # When using an auto backend, some heuristic function must exist
+    def _heuristic_func(suitable_backends, x, backend):
+        candidate_backends = None
+        if x.shape[0] > 5:
+            candidate_backends = ["cudnn", "cutlass"]
+        else:
+            candidate_backends = ["cutlass", "cudnn"]
+
+        heuristic_backends = []
+        for backend in candidate_backends:
+            if backend in suitable_backends:
+                heuristic_backends.append(backend)
+        return heuristic_backends
+
+    @backend_requirement(
+        backend_checks={
+            "cutlass": _cutlass_check,
+            "cudnn": _cudnn_check,
+        },
+        heuristic_func=_heuristic_func,
+    )
+    def my_kernel(x, backend="auto"):
+        backends = my_kernel.suitable_auto_backends
+        if x.shape[0] > 5:
+            assert "cudnn" in backends
+        if x.shape[0] > 10:
+            assert "cutlass" in backends
+        return x * 2
+
+    x = torch.randn(6, 10, device="cuda")
+    result = my_kernel(x, backend="auto")
+    assert result.shape == x.shape
+
+    with pytest.raises(
+        BackendSupportedError, match="No suitable auto backends found for my_kernel"
+    ):
+        x = torch.randn(1, 1, device="cuda")
+        my_kernel(x, backend="auto")
+
+
+def test_heuristic_func():
+    """Test the heuristic_func parameter."""
+    if not torch.cuda.is_available():
+        pytest.skip("Skipping CUDA tests (no GPU available)")
+
+    x = torch.randn(1, 1, device="cuda")
+    major, minor = torch.cuda.get_device_capability(x.device)
+    actual_capability = major * 10 + minor
+
+    @supported_compute_capability([80, 86, 89, 90, actual_capability])
+    def _cutlass_check(x, backend):
+        return x.shape[0] > 10
+
+    @supported_compute_capability([75, 80, 86, 89, 90, actual_capability])
+    def _cudnn_check(x, backend):
+        return x.shape[0] > 5
+
+    @supported_compute_capability([75, 80, 86, 89, 90, actual_capability])
+    def _trtllm_check(x, backend):
+        return x.shape[0] > 0
+
+    def _heuristic_func(suitable_backends, x, backend):
+        # Cutlass fails check
+        assert "cutlass" not in suitable_backends
+
+        # Example: out of the supported backends in suitable_backends,
+        # cudnn is preferred over trtllm when shape[0] > 5
+        if x.shape[0] > 5:
+            return ["cudnn", "trtllm"]
+        else:
+            return ["trtllm", "cudnn"]
+
+    @backend_requirement(
+        {"cutlass": _cutlass_check, "cudnn": _cudnn_check, "trtllm": _trtllm_check},
+        heuristic_func=_heuristic_func,
+    )
+    def my_kernel(x, backend="auto"):
+        if x.shape[0] > 5:
+            assert my_kernel.suitable_auto_backends[0] == "cudnn"
+            assert my_kernel.suitable_auto_backends[1] == "trtllm"
+        else:
+            assert my_kernel.suitable_auto_backends[0] == "trtllm"
+            assert my_kernel.suitable_auto_backends[1] == "cudnn"
+        return x * 2
+
+    x = torch.randn(8, 10, device="cuda")
+    result = my_kernel(x, backend="auto")
+    assert result.shape == x.shape
+
+    x = torch.randn(2, 10, device="cuda")
+    result = my_kernel(x, backend="auto")
+    assert result.shape == x.shape
+
+
 def test_functools_wraps_preserves_metadata():
     """Test that backend_requirement preserves function metadata with functools.wraps."""
 

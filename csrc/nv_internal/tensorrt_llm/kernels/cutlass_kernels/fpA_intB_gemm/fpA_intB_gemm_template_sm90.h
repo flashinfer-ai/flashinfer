@@ -26,7 +26,7 @@
 
 namespace tensorrt_llm {
 namespace kernels {
-namespace cutlass_kernels {
+namespace cutlass_kernels_oss {
 namespace tk = tensorrt_llm::common;
 namespace tkc = tensorrt_llm::cutlass_extensions;
 
@@ -43,6 +43,7 @@ void sm90_dispatch_epilogue_schedules(
     ScaleZeroType const* weight_zero_points, BiasType const* biases, float const alpha,
     OutputType* C, int m, int n, int k, int const group_size, tkc::CutlassGemmConfig gemm_config,
     char* workspace, size_t workspace_bytes, cudaStream_t stream, int* occupancy = nullptr) {
+  TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
   switch (gemm_config.epilogue_schedule) {
     case tkc::EpilogueScheduleType::AUTO:
       using EpilogueScheduleType =
@@ -57,7 +58,7 @@ void sm90_dispatch_epilogue_schedules(
       break;
     default:
       throw std::runtime_error(
-          "[TensorRT-LLM Error][fpA_intB][sm90_dispatch_epilogue_schedules] epilogue schedule "
+          "[TensorRT LLM Error][fpA_intB][sm90_dispatch_epilogue_schedules] epilogue schedule "
           "config is invalid for "
           "mixed "
           "type GEMM.");
@@ -105,6 +106,8 @@ void sm90_dispatch_mainloop_schedules(
     ScaleZeroType const* weight_zero_points, BiasType const* biases, float const alpha,
     OutputType* C, int m, int n, int k, int const group_size, tkc::CutlassGemmConfig gemm_config,
     char* workspace, size_t workspace_bytes, cudaStream_t stream, int* occupancy = nullptr) {
+  TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
+
   constexpr bool tile_shapes_supported = are_tile_shapes_supported<CTAShape, ClusterShape>();
 
   if constexpr (tile_shapes_supported) {
@@ -122,7 +125,7 @@ void sm90_dispatch_mainloop_schedules(
         break;
       default:
         throw std::runtime_error(
-            "[TensorRT-LLM Error][fpA_intB][sm90_dispatch_mainloop_schedules] mainloop schedule "
+            "[TensorRT LLM Error][fpA_intB][sm90_dispatch_mainloop_schedules] mainloop schedule "
             "config is invalid "
             "for "
             "mixed type GEMM.");
@@ -130,7 +133,7 @@ void sm90_dispatch_mainloop_schedules(
     }
   } else {
     throw std::runtime_error(
-        "[TensorRT-LLM Error][fpA_intB][sm90_dispatch_mainloop_schedules] Unsupported CTA and "
+        "[TensorRT LLM Error][fpA_intB][sm90_dispatch_mainloop_schedules] Unsupported CTA and "
         "Cluster shapes for "
         "mixed type GEMM.");
   }
@@ -146,6 +149,7 @@ void sm90_dispatch_gemm_config(ActivationType const* A, WeightType const* B,
                                int const group_size, tkc::CutlassGemmConfig gemm_config,
                                char* workspace, size_t workspace_bytes, cudaStream_t stream,
                                int* occupancy = nullptr) {
+  TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
   switch (gemm_config.cluster_shape) {
     case tkc::ClusterShape::ClusterShape_1x1x1:
       sm90_dispatch_mainloop_schedules<ActivationType, WeightType, ScaleZeroType, BiasType,
@@ -177,7 +181,7 @@ void sm90_dispatch_gemm_config(ActivationType const* A, WeightType const* B,
       break;
     default:
       throw std::runtime_error(
-          "[TensorRT-LLM Error][fpA_intB][dispatch_CGA_config] Config is invalid for mixed type "
+          "[TensorRT LLM Error][fpA_intB][dispatch_CGA_config] Config is invalid for mixed type "
           "GEMM.");
       break;
   }
@@ -192,6 +196,7 @@ void sm90_dispatch_gemm_to_cutlass(ActivationType const* A, WeightType const* B,
                                    int const group_size, char* workspace, size_t workspace_bytes,
                                    tkc::CutlassGemmConfig gemm_config, cudaStream_t stream,
                                    int* occupancy = nullptr) {
+  TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
   // Note that SIMT configs are omitted here since they are not supported for fpA_intB.
   // We also only instantiate configs here where threadblockShapeM == warpShapeM since those usually
   // perform the best for mixed type gemms.
@@ -261,22 +266,22 @@ void sm90_dispatch_gemm_to_cutlass(ActivationType const* A, WeightType const* B,
       break;
     case tkc::CutlassTileConfigSM90::Undefined:
       throw std::runtime_error(
-          "[TensorRT-LLm Error][fpA_intB][sm90_dispatch_gemm_to_cutlass] gemm config undefined.");
+          "[TensorRT LLM Error][fpA_intB][sm90_dispatch_gemm_to_cutlass] gemm config undefined.");
       break;
     case tkc::CutlassTileConfigSM90::ChooseWithHeuristic:
       throw std::runtime_error(
-          "[TensorRT-LLm Error][fpA_intB][sm90_dispatch_gemm_to_cutlass] gemm config should have "
+          "[TensorRT LLM Error][fpA_intB][sm90_dispatch_gemm_to_cutlass] gemm config should have "
           "already been set by "
           "heuristic.");
       break;
     default:
       throw std::runtime_error(
-          "[TensorRT-LLm Error][fpA_intB][sm90_dispatch_gemm_to_cutlass] Config is invalid for "
+          "[TensorRT LLM Error][fpA_intB][sm90_dispatch_gemm_to_cutlass] Config is invalid for "
           "mixed type GEMM.");
       break;
   }
 }
 
-}  // namespace cutlass_kernels
+}  // namespace cutlass_kernels_oss
 }  // namespace kernels
 }  // namespace tensorrt_llm

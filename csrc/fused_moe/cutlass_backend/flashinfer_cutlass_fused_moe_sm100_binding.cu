@@ -72,6 +72,8 @@ class DtypeUtils {
       default:
         TVM_FFI_ICHECK(false) << "unsupported data type";
     }
+
+    return nvinfer1::DataType::kFLOAT;  // supress compiler warning
   }
 
  private:
@@ -111,6 +113,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         TVM_FFI_ICHECK(false) << "Invalid output type " << DLDataTypeToString(output_type)
                               << " specified for " << DLDataTypeToString(mActivationDtype);
     }
+
+    return nullptr;  // supress compiler warning
   };
 
   FusedMoeRunner(DLDataType activation_dtype, DLDataType weight_dtype, DLDataType output_dtype,
@@ -219,7 +223,13 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     }
 
     mProfiler = std::make_shared<kernels::GemmProfilerBackend>();
-    mAllProfiles = mKernelRunner->getTactics();
+    // Get tactics for both GEMM1 and GEMM2, combine them
+    auto gemm1_tactics = mKernelRunner->getTactics(kernels::MoeGemmId::GEMM_1);
+    auto gemm2_tactics = mKernelRunner->getTactics(kernels::MoeGemmId::GEMM_2);
+    mGemm1TacticCount = static_cast<int64_t>(gemm1_tactics.size());
+    mGemm2TacticCount = static_cast<int64_t>(gemm2_tactics.size());
+    mAllProfiles = gemm1_tactics;
+    mAllProfiles.insert(mAllProfiles.end(), gemm2_tactics.begin(), gemm2_tactics.end());
     TVM_FFI_ICHECK(!mAllProfiles.empty())
         << "No valid tactics available for fused moe op with the requested input combination "
            "Activation: "
@@ -367,10 +377,31 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 
     // TODO: support lora in the future
     ::tensorrt_llm::kernels::LoraParams lora_params{};
+    // HACK Define default values for parameters we don't have good values for
+    bool const swizzled_input_sf = true;               // Assume input_sf is swizzled by default
+    int64_t const unpadded_hidden_size = hidden_size;  // Assume no padding by default
+    bool const use_lora = false;                       // No lora support yet
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
     mKernelRunner->runMoe(
         input.data_ptr(), input_sf.has_value() ? input_sf.value().data_ptr() : nullptr,
-        reinterpret_cast<int const*>(token_selected_experts.data_ptr()),
+        swizzled_input_sf, reinterpret_cast<int const*>(token_selected_experts.data_ptr()),
+        token_final_scales.has_value()
+            ? reinterpret_cast<float const*>(token_final_scales.value().data_ptr())
+            : nullptr,
+        fc1_expert_weights.data_ptr(),
+        fc1_expert_biases.has_value() ? fc1_expert_biases.value().data_ptr() : nullptr,
+        activation_params, fc2_expert_weights.data_ptr(),
+        fc2_expert_biases.has_value() ? fc2_expert_biases.value().data_ptr() : nullptr,
+        quant_params, num_rows, hidden_size, unpadded_hidden_size, inter_size, num_experts_total,
+        static_cast<int>(experts_per_token),
+        static_cast<char*>(workspace_info.workspace.data_ptr()), output.data_ptr(),
+        static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, enable_alltoall,
+        use_lora, lora_params, mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params,
+        enable_pdl, stream);
+#else
+    mKernelRunner->runMoe(
+        input.data_ptr(), input_sf.has_value() ? input_sf.value().data_ptr() : nullptr,
+        swizzled_input_sf, reinterpret_cast<int const*>(token_selected_experts.data_ptr()),
         token_final_scales.has_value()
             ? reinterpret_cast<float const*>(token_final_scales.value().data_ptr())
             : nullptr,
@@ -381,25 +412,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         quant_params, num_rows, hidden_size, inter_size, num_experts_total,
         static_cast<int>(experts_per_token),
         static_cast<char*>(workspace_info.workspace.data_ptr()), output.data_ptr(),
-        static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, enable_alltoall,
-        false, lora_params, mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params,
-        enable_pdl, stream);
-#else
-    mKernelRunner->runMoe(
-        input.data_ptr(), input_sf.has_value() ? input_sf.value().data_ptr() : nullptr,
-        reinterpret_cast<int const*>(token_selected_experts.data_ptr()),
-        token_final_scales.has_value()
-            ? reinterpret_cast<float const*>(token_final_scales.value().data_ptr())
-            : nullptr,
-        fc1_expert_weights.data_ptr(),
-        fc1_expert_biases.has_value() ? fc1_expert_biases.value().data_ptr() : nullptr,
-        activation_params, fc2_expert_weights.data_ptr(),
-        fc2_expert_biases.has_value() ? fc2_expert_biases.value().data_ptr() : nullptr,
-        quant_params, num_rows, hidden_size, inter_size, num_experts_total,
-        static_cast<int>(experts_per_token), static_cast<char*>(workspace_info.workspace),
-        output.data_ptr(), static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config,
-        false, lora_params, mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params,
-        enable_pdl, stream);
+        static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, false, lora_params,
+        mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, enable_pdl, stream);
 #endif
   }
 
@@ -547,10 +561,14 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 
     // TODO: support lora in the future
     ::tensorrt_llm::kernels::LoraParams lora_params{};
+    // HACK Define default values for parameters we don't have good values for
+    bool const swizzled_input_sf_ml = true;               // Assume input_sf is swizzled by default
+    int64_t const unpadded_hidden_size_ml = hidden_size;  // Assume no padding by default
+    bool const use_lora_ml = false;                       // No lora support yet
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
     mKernelRunner->runMoe(
         input.data_ptr(), input_sf.has_value() ? input_sf.value().data_ptr() : nullptr,
-        reinterpret_cast<int const*>(token_selected_experts.data_ptr()),
+        swizzled_input_sf_ml, reinterpret_cast<int const*>(token_selected_experts.data_ptr()),
         token_final_scales.has_value()
             ? reinterpret_cast<float const*>(token_final_scales.value().data_ptr())
             : nullptr,
@@ -558,16 +576,16 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         fc1_expert_biases.has_value() ? fc1_expert_biases.value().data_ptr() : nullptr,
         activation_params, fc2_expert_weights.data_ptr(),
         fc2_expert_biases.has_value() ? fc2_expert_biases.value().data_ptr() : nullptr,
-        quant_params, num_rows, hidden_size, inter_size, num_experts_total,
+        quant_params, num_rows, hidden_size, unpadded_hidden_size_ml, inter_size, num_experts_total,
         static_cast<int>(experts_per_token),
         static_cast<char*>(workspace_info.workspace.data_ptr()), output.data_ptr(),
         static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, enable_alltoall,
-        false, lora_params, mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params,
+        use_lora_ml, lora_params, mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params,
         enable_pdl, stream);
 #else
     mKernelRunner->runMoe(
         input.data_ptr(), input_sf.has_value() ? input_sf.value().data_ptr() : nullptr,
-        reinterpret_cast<int const*>(token_selected_experts.data_ptr()),
+        swizzled_input_sf_ml, reinterpret_cast<int const*>(token_selected_experts.data_ptr()),
         token_final_scales.has_value()
             ? reinterpret_cast<float const*>(token_final_scales.value().data_ptr())
             : nullptr,
@@ -575,11 +593,12 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         fc1_expert_biases.has_value() ? fc1_expert_biases.value().data_ptr() : nullptr,
         activation_params, fc2_expert_weights.data_ptr(),
         fc2_expert_biases.has_value() ? fc2_expert_biases.value().data_ptr() : nullptr,
-        quant_params, num_rows, hidden_size, inter_size, num_experts_total,
-        static_cast<int>(experts_per_token), static_cast<char*>(workspace_info.workspace),
-        output.data_ptr(), static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config,
-        false, lora_params, mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params,
-        enable_pdl, stream);
+        quant_params, num_rows, hidden_size, unpadded_hidden_size_ml, inter_size, num_experts_total,
+        static_cast<int>(experts_per_token),
+        static_cast<char*>(workspace_info.workspace.data_ptr()), output.data_ptr(),
+        static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, false, use_lora_ml,
+        lora_params, mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, enable_pdl,
+        stream);
 #endif
   }
 
@@ -641,19 +660,20 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       auto activation_dtype =
           (mUseW4GroupScaling && !isWFP4A16Quant()) ? dl_float8_e4m3fn : mActivationDtype;
       activation_dtype = isNvfp4Quant() ? dl_int64 : activation_dtype;
+      int64_t const unpadded_hidden_size_profiler = hidden_size;  // HACK no padding by default
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
       mProfiler->init(*mKernelRunner.get(), mProfiler->mGemmToProfile,
                       DtypeUtils::dataType(activation_dtype), DtypeUtils::dataType(mWeightDtype),
                       DtypeUtils::dataType(mOutputDtype), num_experts, static_cast<int>(top_k),
-                      hidden_size, inter_size, group_size, activation_type, USE_BIAS, USE_LORA,
-                      min_latency_mode,
+                      hidden_size, unpadded_hidden_size_profiler, inter_size, group_size,
+                      activation_type, USE_BIAS, USE_LORA, min_latency_mode,
                       /*need_weights*/ false, parallelism_config, enable_alltoall);
 #else
       mProfiler->init(*mKernelRunner.get(), mProfiler->mGemmToProfile,
                       DtypeUtils::dataType(activation_dtype), DtypeUtils::dataType(mWeightDtype),
                       DtypeUtils::dataType(mOutputDtype), num_experts, static_cast<int>(top_k),
-                      hidden_size, inter_size, group_size, activation_type, USE_BIAS, USE_LORA,
-                      min_latency_mode,
+                      hidden_size, unpadded_hidden_size_profiler, inter_size, group_size,
+                      activation_type, USE_BIAS, USE_LORA, min_latency_mode,
                       /*need_weights*/ false, parallelism_config);
 #endif
 
@@ -691,6 +711,10 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
           });
     } else if (name == "get_tactic_num") {
       return Function::FromTyped([this]() -> int64_t { return getTacticNum(); });
+    } else if (name == "get_gemm1_tactic_count") {
+      return Function::FromTyped([this]() -> int64_t { return mGemm1TacticCount; });
+    } else if (name == "get_gemm2_tactic_count") {
+      return Function::FromTyped([this]() -> int64_t { return mGemm2TacticCount; });
     } else if (name == "run_moe") {
       return Function::FromTyped(
           [this](TensorView output, TensorView input, TensorView token_selected_experts,
@@ -758,6 +782,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 
   using Profile = tensorrt_llm::cutlass_extensions::CutlassGemmConfig;
   std::vector<Profile> mAllProfiles;
+  int64_t mGemm1TacticCount{0};
+  int64_t mGemm2TacticCount{0};
 
   void setRunnerProfiles(Optional<Array<int64_t>> profile_ids) {
     if (mUseDeepSeekFP8BlockScaling) {
@@ -771,13 +797,34 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     }
 
     auto best_gemm1_profile = mAllProfiles.front();
-    auto best_gemm2_profile = mAllProfiles.front();
+    // Default GEMM2 profile should come from the GEMM2 subrange if present
+    auto best_gemm2_profile =
+        (mGemm2TacticCount > 0 && mAllProfiles.size() > static_cast<size_t>(mGemm1TacticCount))
+            ? mAllProfiles.at(mGemm1TacticCount)
+            : mAllProfiles.front();
     if (profile_ids.has_value()) {
       TVM_FFI_ICHECK_EQ(profile_ids.value().size(), 2) << "Expecting 2 profile ids";
-      best_gemm1_profile = profile_ids.value()[0] == -1 ? best_gemm1_profile
-                                                        : mAllProfiles.at(profile_ids.value()[0]);
-      best_gemm2_profile = profile_ids.value()[1] == -1 ? best_gemm2_profile
-                                                        : mAllProfiles.at(profile_ids.value()[1]);
+      // GEMM1 index: accept absolute index; otherwise if clearly out of combined range, keep
+      // default
+      auto id1 = profile_ids.value()[0];
+      if (id1 != -1) {
+        TVM_FFI_ICHECK(id1 >= 0 && id1 < mGemm1TacticCount) << "Invalid gemm1 profile id: " << id1;
+        best_gemm1_profile = mAllProfiles.at(id1);
+      }
+
+      // GEMM2 index: support both absolute (combined) and relative (within GEMM2 subrange) ids
+      auto id2 = profile_ids.value()[1];
+      if (id2 != -1) {
+        int64_t absolute_id2 = id2;
+        // If id2 appears relative to GEMM2 subrange, offset it
+        if (id2 >= 0 && id2 < mGemm2TacticCount) {
+          absolute_id2 = mGemm1TacticCount + id2;
+        }
+        TVM_FFI_ICHECK(absolute_id2 >= 0 &&
+                       absolute_id2 < static_cast<int64_t>(mAllProfiles.size()))
+            << "Invalid gemm2 profile id: " << id2;
+        best_gemm2_profile = mAllProfiles.at(absolute_id2);
+      }
     }
     mKernelRunner->setTactic(best_gemm1_profile, best_gemm2_profile);
   }

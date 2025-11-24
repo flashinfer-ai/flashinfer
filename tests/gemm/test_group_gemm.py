@@ -23,6 +23,7 @@ from flashinfer.utils import (
     has_flashinfer_jit_cache,
     is_sm90a_supported,
 )
+from flashinfer.jit.gemm import gen_gemm_module, gen_gemm_sm90_module
 
 DTYPES = [torch.float16]
 CUDA_DEVICES = ["cuda:0"]
@@ -33,9 +34,9 @@ CUDA_DEVICES = ["cuda:0"]
     scope="module",
 )
 def warmup_jit():
-    jit_specs = [flashinfer.gemm.gen_gemm_module()]
+    jit_specs = [gen_gemm_module()]
     if is_sm90a_supported(torch.device("cuda:0")):
-        jit_specs.append(flashinfer.gemm.gen_gemm_sm90_module())
+        jit_specs.append(gen_gemm_sm90_module())
     flashinfer.jit.build_jit_specs(jit_specs, verbose=False)
     yield
 

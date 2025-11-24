@@ -15,12 +15,12 @@ Kernel Library for LLM Serving
 [![Build Status](https://ci.tlcpack.ai/job/flashinfer-ci/job/main/badge/icon)](https://ci.tlcpack.ai/job/flashinfer-ci/job/main/)
 [![Documentation](https://github.com/flashinfer-ai/flashinfer/actions/workflows/build-doc.yml/badge.svg)](https://github.com/flashinfer-ai/flashinfer/actions/workflows/build-doc.yml)
 
-
 FlashInfer is a library and kernel generator for Large Language Models that provides high-performance implementation of LLM GPU kernels such as FlashAttention, SparseAttention, PageAttention, Sampling, and more. FlashInfer focuses on LLM serving and inference, and delivers state-of-the-art performance across diverse scenarios.
 
 Check our [v0.2 release blog](https://flashinfer.ai/2024/12/16/flashinfer-v02-release.html) for new features!
 
 The core features of FlashInfer include:
+
 1. **Efficient Sparse/Dense Attention Kernels**: Efficient single/batch attention for sparse(paged)/dense KV-storage on CUDA Cores and Tensor Cores (both FA2 & FA3) templates. The vector-sparse attention can achieve 90% of the bandwidth of dense kernels with same problem size.
 2. **Load-Balanced Scheduling**: FlashInfer decouples `plan`/`run` stage of attention computation where we schedule the computation of variable-length inputs in `plan` stage to alleviate load-imbalance issue.
 3. **Memory Efficiency**: FlashInfer offers [Cascade Attention](https://docs.flashinfer.ai/api/cascade.html#flashinfer.cascade.MultiLevelCascadeAttentionWrapper) for hierarchical KV-Cache, and implements Head-Query fusion for accelerating Grouped-Query Attention, and efficient kernels for low-precision attention and fused-RoPE attention for compressed KV-Cache.
@@ -31,6 +31,7 @@ The core features of FlashInfer include:
 FlashInfer supports PyTorch, TVM and C++ (header-only) APIs, and can be easily integrated into existing projects.
 
 ## News
+
 - [Mar 10, 2025] [Blog Post](https://flashinfer.ai/2025/03/10/sampling.html) Sorting-Free GPU Kernels for LLM Sampling, which explains the design of sampling kernels in FlashInfer.
 - [Mar 1, 2025] Checkout flashinfer's [intra-kernel profiler](https://github.com/flashinfer-ai/flashinfer/tree/main/profiler) for visualizing the timeline of each threadblock in GPU kernels.
 - [Dec 16, 2024] [Blog Post](https://flashinfer.ai/2024/12/16/flashinfer-v02-release.html) FlashInfer 0.2 - Efficient and Customizable Kernels for LLM Inference Serving
@@ -51,11 +52,13 @@ pip install flashinfer-python
 ```
 
 **Package Options:**
+
 - **flashinfer-python**: Core package that compiles/downloads kernels on first use
 - **flashinfer-cubin**: Pre-compiled kernel binaries for all supported GPU architectures
 - **flashinfer-jit-cache**: Pre-built kernel cache for specific CUDA versions
 
 **For faster initialization and offline usage**, install the optional packages to have most kernels pre-compiled:
+
 ```bash
 pip install flashinfer-python flashinfer-cubin
 # JIT cache package (replace cu129 with your CUDA version: cu128, cu129, or cu130)
@@ -75,6 +78,7 @@ python -m pip install -v .
 ```
 
 **For development**, install in editable mode:
+
 ```bash
 python -m pip install --no-build-isolation -e . -v
 ```
@@ -82,6 +86,7 @@ python -m pip install --no-build-isolation -e . -v
 **Build optional packages:**
 
 `flashinfer-cubin`:
+
 ```bash
 cd flashinfer-cubin
 python -m build --no-isolation --wheel
@@ -89,8 +94,9 @@ python -m pip install dist/*.whl
 ```
 
 `flashinfer-jit-cache` (customize `FLASHINFER_CUDA_ARCH_LIST` for your target GPUs):
+
 ```bash
-export FLASHINFER_CUDA_ARCH_LIST="7.5 8.0 8.9 10.0a 10.3a 12.0a"
+export FLASHINFER_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a 10.0a 10.3a 11.0a 12.0f"
 cd flashinfer-jit-cache
 python -m build --no-isolation --wheel
 python -m pip install dist/*.whl
@@ -120,6 +126,7 @@ flashinfer show-config
 ```
 
 This command displays:
+
 - FlashInfer version and installed packages (flashinfer-python, flashinfer-cubin, flashinfer-jit-cache)
 - PyTorch and CUDA version information
 - Environment variables and artifact paths
@@ -162,6 +169,20 @@ o = flashinfer.single_prefill_with_kv_cache(q, k, v, causal=False) # prefill att
 
 Check out [documentation](https://docs.flashinfer.ai/) for usage of batch decode/append/prefill kernels and shared-prefix cascading kernels.
 
+## API Logging
+
+FlashInfer provides comprehensive API logging for debugging. Enable it using environment variables:
+
+```bash
+# Enable logging (levels: 0=off (default), 1=basic, 3=detailed, 5=statistics)
+export FLASHINFER_LOGLEVEL=3
+
+# Set log destination (stdout (default), stderr, or file path)
+export FLASHINFER_LOGDEST=stdout
+```
+
+For detailed information about logging levels, configuration, and advanced features, see [LOGGING.md](LOGGING.md).
+
 ## Custom Attention Variants
 
 Starting from FlashInfer v0.2, users can customize their own attention variants with additional parameters. For more details, refer to our [JIT examples](https://github.com/flashinfer-ai/flashinfer/blob/main/tests/utils/test_jit_example.py).
@@ -173,6 +194,7 @@ FlashInfer currently provides support for NVIDIA SM architectures 75 and higher 
 ## Adoption
 
 We are thrilled to share that FlashInfer is being adopted by many cutting-edge projects, including but not limited to:
+
 - [MLC-LLM](https://github.com/mlc-ai/mlc-llm)
 - [Punica](https://github.com/punica-ai/punica)
 - [SGLang](https://github.com/sgl-project/sglang)

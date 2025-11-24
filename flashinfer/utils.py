@@ -21,6 +21,7 @@ from typing import Callable, Dict, Iterable, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.version
+import pynvml
 from torch.torch_version import TorchVersion
 from torch.torch_version import __version__ as torch_version
 import inspect
@@ -253,6 +254,46 @@ def get_compute_capability(device: torch.device) -> Tuple[int, int]:
     if device.type != "cuda":
         raise ValueError("device must be a cuda device")
     return torch.cuda.get_device_capability(device.index)
+
+
+@functools.cache
+def get_gpu_memory_bandwidth(device: torch.device) -> float:
+    """
+    Get GPU memory bandwidth in GB/s for the specified CUDA device.
+
+    Args:
+        device: torch.device object, e.g., torch.device('cuda:0')
+
+    Returns:
+        float: GPU memory bandwidth (GB/s)
+
+    Raises:
+        ValueError: If device is not a CUDA device
+    """
+    # Convert to torch.device object if string is passed
+    if isinstance(device, str):
+        device = torch.device(device)
+
+    # Check if it's a CUDA device
+    if device.type != "cuda":
+        raise ValueError(f"Device must be a CUDA device, got {device}")
+
+    # Get device index
+    device_index = device.index if device.index is not None else 0
+
+    # Use pynvml to get bandwidth
+    pynvml.nvmlInit()
+    try:
+        handle = pynvml.nvmlDeviceGetHandleByIndex(device_index)
+        bus_width = pynvml.nvmlDeviceGetMemoryBusWidth(handle)
+        mem_clock = pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_MEM)
+
+        # Calculate theoretical peak bandwidth (GB/s)
+        bandwidth = (mem_clock * bus_width * 2) / 8 / 1000
+
+        return bandwidth
+    finally:
+        pynvml.nvmlShutdown()
 
 
 def _check_cached_qkv_data_type(
@@ -854,7 +895,9 @@ def supported_compute_capability(supported_ccs: Iterable[int]) -> Callable:
 
 
 def backend_requirement(
-    backend_checks: Dict[str, Callable], common_check: Optional[Callable] = None
+    backend_checks: Dict[str, Callable],
+    common_check: Optional[Callable] = None,
+    heuristic_func: Optional[Callable] = None,
 ) -> Callable:
     """
     Decorator to enforce backend and problem size requirements for kernel functions.
@@ -878,6 +921,13 @@ def backend_requirement(
         backends. Should accept the same arguments as the decorated function and return
         True if requirements are met, False otherwise.
         In the case where the kernel function does not have any specific backends, this can be decorated with @supported_compute_capability to specify the function's supported compute capabilities.
+    heuristic_func : callable, optional
+        A function that performs heuristic backend selection when backend is "auto".
+        Must be provided if backend is "auto". Does not do anything if backend is not "auto".
+        Should accept the same arguments as the decorated function.
+        Should return an ordered list of runnable backends with the most preferred backend first.
+        When decorated function is not autotuned, the first backend in the heuristic list will be run.
+        When decorated function is autotuned, the backends in the heuristic list will be autotuned over to find the best backend.
 
     Returns
     -------
@@ -1018,6 +1068,47 @@ def backend_requirement(
             # Whether the given backend exists in the API
             return backend in backend_checks
 
+        def suitable_auto_backends(cc, *args, **kwargs):
+            if common_check is not None and not common_check(*args, **kwargs):
+                return False
+            suitable_backends = []
+            # Check for each backend support
+            for backend in backend_checks:
+                req_checker = backend_checks[backend]
+                try:
+                    if req_checker(
+                        *args, **kwargs
+                    ) and req_checker.is_compute_capability_supported(cc):
+                        suitable_backends.append(backend)
+                except ValueError:
+                    continue
+            # If a heuristic function is provided, filter the suitable backends based on the heuristic function
+            assert heuristic_func is not None, "Heuristic function must be provided"
+            suitable_backends = heuristic_func(suitable_backends, *args, **kwargs)
+            if not suitable_backends:
+                return False
+            wrapper.suitable_auto_backends = suitable_backends
+            return True
+
+        def _get_capability(*args, **kwargs):
+            capability = None
+            # Find the first tensor argument.
+            # Assume all tensors are on the same device/capability.
+            # We could consider check all tensors at a performance cost.
+            tensor_arg = None
+            all_args = args + tuple(kwargs.values())
+            for value in all_args:
+                if isinstance(value, torch.Tensor):
+                    tensor_arg = value
+                    break
+
+            if tensor_arg is not None:
+                # Get compute capability from the first tensor
+                # Assume all tensors are on the same device/capability
+                major, minor = get_compute_capability(tensor_arg.device)
+                capability = major * 10 + minor
+            return capability
+
         # @brief: Wrapper function that calls the orignal, decorated function, after applying a number of checks.
         # @note that here we manually apply defaults to the arguments in the wrapper function when doing validation.
         @functools.wraps(func)
@@ -1034,45 +1125,48 @@ def backend_requirement(
                 bound_args.apply_defaults()
                 # Convert to kwargs for validation functions
                 kwargs_with_defaults = dict(bound_args.arguments)
-
                 backend = kwargs_with_defaults.get("backend")
-
-                capability = None
-                # Find the first tensor argument.
-                # Assume all tensors are on the same device/capability.
-                # We could consider check all tensors at a performance cost.
-                tensor_arg = None
-                for value in kwargs_with_defaults.values():
-                    if isinstance(value, torch.Tensor):
-                        tensor_arg = value
-                        break
-
-                if tensor_arg is not None:
-                    # Get compute capability from the first tensor
-                    # Assume all tensors are on the same device/capability
-                    major, minor = get_compute_capability(tensor_arg.device)
-                    capability = major * 10 + minor
-
+                capability = _get_capability(*args, **kwargs)
                 if not has_backend_choices() and common_check is None:
                     raise ValueError(
                         f"Invalid @backend_requirement decorator usage: no backend choices and no common_check for {func.__name__}"
                     )
 
                 if has_backend_choices():
-                    if not is_backend_supported(backend, capability):
-                        extra = f" with capability {capability}" if capability else ""
-                        raise BackendSupportedError(
-                            f"{func.__name__} does not support backend '{backend}'{extra}"
-                        )
+                    if backend == "auto":
+                        if not suitable_auto_backends(
+                            capability, **kwargs_with_defaults
+                        ):
+                            raise BackendSupportedError(
+                                f"No suitable auto backends found for {func.__name__}"
+                            )
+                    else:
+                        if not is_backend_supported(backend, capability):
+                            extra = (
+                                f" with capability {capability}" if capability else ""
+                            )
+                            raise BackendSupportedError(
+                                f"{func.__name__} does not support backend '{backend}'{extra}"
+                            )
+                        if not _is_problem_size_supported(**kwargs_with_defaults):
+                            raise ValueError(
+                                f"Problem size is not supported for {func.__name__}"
+                            )
                 else:
+                    # If the function doesnt have backends (i.e., there is only 1, implicit backend), run the following checks.
                     if not is_compute_capability_supported(capability):
                         raise BackendSupportedError(
                             f"{func.__name__} does not support compute capability {capability}"
                         )
-                if not _is_problem_size_supported(**kwargs_with_defaults):
-                    raise ValueError(
-                        f"Problem size is not supported for {func.__name__}"
-                    )
+                    if not _is_problem_size_supported(**kwargs_with_defaults):
+                        raise ValueError(
+                            f"Problem size is not supported for {func.__name__}"
+                        )
+            elif skip_check and heuristic_func is not None:
+                if kwargs.get("backend") == "auto":
+                    # This needs to be called for heuristic function
+                    capability = _get_capability(*args, **kwargs)
+                    suitable_auto_backends(capability, *args, **kwargs)
 
             return func(*args, **kwargs)
 

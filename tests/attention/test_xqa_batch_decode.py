@@ -75,8 +75,8 @@ def create_kv_cache(
 ):
     # Create separate K and V caches with specified layout (NHD or HND)
     max_seq_len = torch.max(seq_lens).item()
-    num_tokens = max_seq_len * batch_size
-    num_pages = (num_tokens + page_size - 1) // page_size
+    num_pages_per_seq = (max_seq_len + page_size - 1) // page_size
+    num_pages = num_pages_per_seq * batch_size
     ref_kv_dtype_torch = DTYPE_MAP[ref_kv_dtype]
     if kv_dtype != "fp8":
         assert kv_dtype == ref_kv_dtype, (
@@ -143,28 +143,33 @@ def create_kv_cache(
 
 
 def create_page_table(batch_size, seq_lens, page_size):
+    # Ensure seq_lens is on GPU and calculate page_per_seq on GPU
+    seq_lens = seq_lens.to(GPU_DEVICE)
     page_per_seq = (seq_lens + page_size - 1) // page_size
     max_num_pages_per_seq = torch.max(page_per_seq).item()
 
-    # Generate random but unique page IDs for all sequences
+    # Generate sequential page IDs
     total_pages_needed = torch.sum(page_per_seq).item()
-    all_page_ids = torch.randperm(
+    all_page_ids = torch.arange(
         total_pages_needed, dtype=torch.int32, device=GPU_DEVICE
     )
 
-    # Generate unique page IDs for all sequences
-    page_tables = torch.zeros(
-        (batch_size, max_num_pages_per_seq), dtype=torch.int32, device=GPU_DEVICE
+    # Use cumsum to create page offsets for each sequence
+    page_offsets = torch.cat(
+        [
+            torch.tensor([0], device=GPU_DEVICE, dtype=torch.int32),
+            torch.cumsum(page_per_seq[:-1], dim=0, dtype=torch.int32),
+        ]
     )
 
-    # Populate page tables and track page assignments
-    page_id = 0
-    for i in range(batch_size):
-        num_pages_needed = page_per_seq[i]
-        page_tables[i, :num_pages_needed] = all_page_ids[
-            page_id : page_id + num_pages_needed
-        ]
-        page_id += num_pages_needed
+    # Create page tables using broadcasting
+    page_idx_range = torch.arange(
+        max_num_pages_per_seq, device=GPU_DEVICE, dtype=torch.int32
+    ).unsqueeze(0)
+    page_tables = (
+        page_offsets.unsqueeze(1) + page_idx_range
+    )  # [batch_size, max_num_pages_per_seq]
+
     return page_tables, all_page_ids, page_per_seq
 
 
@@ -179,43 +184,69 @@ def flatten_paged_kv(
     """Build flat K/V and token-level indptr from paged KV cache and page table.
 
     Supports both NHD and HND layouts.
+    Optimized to avoid loops using vectorized operations.
     """
     device = ref_kv_cache.device
     batch_size = int(page_table.shape[0])
 
-    # Move loop-control tensors to CPU to avoid GPU sync in loops
-    page_table_cpu = page_table.cpu()
-    seq_lens_cpu = seq_lens.cpu()
-    kv_last_page_len_cpu = kv_last_page_len.cpu()
-    page_per_seq = (seq_lens_cpu + page_size - 1) // page_size
-    k_list = []
-    v_list = []
-    for i in range(batch_size):
-        pages_i = int(page_per_seq[i].item())
-        last_len_i = int(kv_last_page_len_cpu[i].item())
-        for j in range(pages_i):
-            page_id = int(page_table_cpu[i, j].item())
-            if kv_layout == "NHD":
-                # NHD: [page_id, 0/1, page_size, num_heads, head_dim]
-                k_page = ref_kv_cache[page_id, 0]  # [page_size, num_heads, head_dim]
-                v_page = ref_kv_cache[page_id, 1]
-                if j == pages_i - 1:
-                    k_page = k_page[:last_len_i, :, :]
-                    v_page = v_page[:last_len_i, :, :]
-            else:  # HND
-                # HND: [page_id, 0/1, num_heads, page_size, head_dim]
-                k_page = ref_kv_cache[page_id, 0]  # [num_heads, page_size, head_dim]
-                v_page = ref_kv_cache[page_id, 1]
-                if j == pages_i - 1:
-                    k_page = k_page[:, :last_len_i, :]
-                    v_page = v_page[:, :last_len_i, :]
-                # Transpose to NHD: [num_heads, page_size, head_dim] -> [page_size, num_heads, head_dim]
-                k_page = k_page.transpose(0, 1)
-                v_page = v_page.transpose(0, 1)
-            k_list.append(k_page)
-            v_list.append(v_page)
-    k_flat = torch.cat(k_list, dim=0)
-    v_flat = torch.cat(v_list, dim=0)
+    # Calculate number of pages per sequence
+    page_per_seq = (seq_lens + page_size - 1) // page_size
+    max_pages = int(page_per_seq.max().item())
+
+    # Gather all pages at once using advanced indexing
+    # page_table shape: [batch_size, max_pages]
+    if kv_layout == "NHD":
+        # ref_kv_cache: [num_pages_total, 2, page_size, num_heads, head_dim]
+        # Gather: [batch_size, max_pages, page_size, num_heads, head_dim]
+        k_pages = ref_kv_cache[
+            page_table, 0
+        ]  # [batch_size, max_pages, page_size, num_heads, head_dim]
+        v_pages = ref_kv_cache[page_table, 1]
+    else:  # HND
+        # ref_kv_cache: [num_pages_total, 2, num_heads, page_size, head_dim]
+        # Gather: [batch_size, max_pages, num_heads, page_size, head_dim]
+        k_pages = ref_kv_cache[
+            page_table, 0
+        ]  # [batch_size, max_pages, num_heads, page_size, head_dim]
+        v_pages = ref_kv_cache[page_table, 1]
+        # Transpose to NHD: [batch_size, max_pages, num_heads, page_size, head_dim] -> [batch_size, max_pages, page_size, num_heads, head_dim]
+        k_pages = k_pages.transpose(2, 3)
+        v_pages = v_pages.transpose(2, 3)
+
+    # Reshape to [batch_size, max_pages * page_size, num_heads, head_dim]
+    num_heads = k_pages.shape[-2]
+    head_dim = k_pages.shape[-1]
+    k_pages = k_pages.reshape(batch_size, max_pages * page_size, num_heads, head_dim)
+    v_pages = v_pages.reshape(batch_size, max_pages * page_size, num_heads, head_dim)
+
+    # Create token indices for each sequence using vectorized operations
+    # For each batch, we need to extract [:seq_len] tokens
+    max_seq_len = seq_lens.max().item()
+    token_idx = torch.arange(max_seq_len, device=device, dtype=torch.int32).unsqueeze(
+        0
+    )  # [1, max_seq_len]
+    token_mask = token_idx < seq_lens.unsqueeze(1)  # [batch_size, max_seq_len]
+
+    # Gather valid tokens for all sequences at once
+    # Expand k_pages and v_pages to max_seq_len, then mask
+    k_gathered = k_pages[
+        :, :max_seq_len, :, :
+    ]  # [batch_size, max_seq_len, num_heads, head_dim]
+    v_gathered = v_pages[
+        :, :max_seq_len, :, :
+    ]  # [batch_size, max_seq_len, num_heads, head_dim]
+
+    # Flatten and filter by mask
+    k_gathered_flat = k_gathered.reshape(
+        -1, num_heads, head_dim
+    )  # [batch_size * max_seq_len, num_heads, head_dim]
+    v_gathered_flat = v_gathered.reshape(-1, num_heads, head_dim)
+    token_mask_flat = token_mask.reshape(-1)  # [batch_size * max_seq_len]
+
+    # Keep only valid tokens
+    k_flat = k_gathered_flat[token_mask_flat]
+    v_flat = v_gathered_flat[token_mask_flat]
+
     kv_indptr_tokens = torch.cat(
         [
             torch.tensor([0], dtype=torch.int32, device=device),
@@ -259,6 +290,66 @@ def get_last_page_len(seq_lens, page_size):
     return last_page_len
 
 
+def generate_causal_mask(
+    batch_size: int,
+    q_seq_len: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Generate causal attention mask for speculative decoding.
+
+    Parameters
+    ----------
+    batch_size : int
+        Batch size
+    q_seq_len : int
+        Query sequence length (number of speculative decoding tokens)
+    device : torch.device
+        Target device for the mask tensor
+
+    Returns
+    -------
+    torch.Tensor
+        Causal mask with shape [batch_size, q_seq_len, mask_size_per_row]
+        where mask_size_per_row = divUp(q_seq_len, 32) * 2 (in uint16_t units).
+        Data type: torch.uint16
+
+    """
+    num_packed_masks_per_token = (q_seq_len + 31) // 32
+
+    q_indices = torch.arange(q_seq_len, device=device, dtype=torch.int32).unsqueeze(1)
+    kv_indices = torch.arange(q_seq_len, device=device, dtype=torch.int32).unsqueeze(0)
+
+    causal_bool_mask = kv_indices <= q_indices
+
+    padded_seq_len = num_packed_masks_per_token * 32
+    if padded_seq_len > q_seq_len:
+        padding = torch.zeros(
+            q_seq_len, padded_seq_len - q_seq_len, device=device, dtype=torch.bool
+        )
+        causal_bool_mask = torch.cat([causal_bool_mask, padding], dim=1)
+
+    causal_bool_mask = causal_bool_mask.view(q_seq_len, num_packed_masks_per_token, 32)
+
+    bit_positions = torch.tensor(
+        [1 << i for i in range(32)], device=device, dtype=torch.int64
+    )
+
+    mask_uint32 = (
+        (causal_bool_mask.to(torch.int64) * bit_positions).sum(dim=-1).to(torch.uint32)
+    )
+
+    mask_uint32 = (
+        mask_uint32.unsqueeze(0)
+        .expand(batch_size, q_seq_len, num_packed_masks_per_token)
+        .contiguous()
+    )
+
+    mask_uint16 = mask_uint32.view(torch.uint16)
+
+    return mask_uint16
+
+
 @pytest.mark.skipif(
     get_compute_capability(torch.device(device="cuda"))[0] not in [9, 10, 12],
     reason="XQA is only supported on SM90, SM100, SM120 GPUs",
@@ -266,6 +357,9 @@ def get_last_page_len(seq_lens, page_size):
 @pytest.mark.parametrize(
     "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size",
     [
+        (4, 4, 64, 4, 2),
+        (4, 2, 16, 2, 4),
+        (4, 3, 32, 2, 6),
         (4, 1, 16, 2, 1),
         (4, 1, 32, 2, 5),
         (128, 1, 64, 2, 6),
@@ -280,6 +374,8 @@ def get_last_page_len(seq_lens, page_size):
         ("fp16", "fp16", "fp16"),
         ("bf16", "fp8", "bf16"),
         ("fp16", "fp8", "fp16"),
+        ("bf16", "fp8", "fp8"),
+        ("fp16", "fp8", "fp8"),
     ],
 )
 @pytest.mark.parametrize("enable_pdl", [True, False, None])
@@ -305,8 +401,6 @@ def test_xqa_batch_decode(
 
     This test supports both NHD and HND layouts.
     """
-    if q_len_per_req > 1:
-        pytest.skip("xqa does not support speculative decoding yet")
 
     # Set up test parameters
     torch.manual_seed(0)
@@ -411,6 +505,11 @@ def test_xqa_batch_decode(
             kv_indptr=kv_indptr_tokens,
         )
 
+    if q_len_per_req > 1:
+        mask = generate_causal_mask(batch_size, q_len_per_req, GPU_DEVICE)
+    else:
+        mask = None
+
     # Run xqa_batch_decode_with_kv_cache function
     output = flashinfer.decode.xqa_batch_decode_with_kv_cache(
         q.contiguous(),
@@ -427,12 +526,14 @@ def test_xqa_batch_decode(
         sinks=(sink if enable_sink else None),
         kv_layout=kv_layout,
         q_len_per_req=q_len_per_req,
+        o_scale=o_scale,
+        mask=mask,
     )
 
     # Verification
     torch.testing.assert_close(
-        output,
-        output_ref,
+        output.float(),
+        output_ref.float() / o_scale,
         rtol=1e-1 if kv_dtype == "fp8" else 1e-2,
         atol=1e-1 if kv_dtype == "fp8" else 1e-2,
     )
