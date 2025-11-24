@@ -182,7 +182,7 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         if self._destroyed:
             return  # Already destroyed, nothing to do
 
-        trtllm_destroy_ipc_workspace_for_all_reduce_fusion(self._internal_workspace)
+        trtllm_destroy_ipc_workspace_for_all_reduce_fusion(self.ipc_handles)
         self._destroyed = True
 
     @property
