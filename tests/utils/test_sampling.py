@@ -726,6 +726,84 @@ def test_check_tensor_param_top_k(batch_size, vocab_size, k):
     assert samples.shape == normalized_prob.shape
 
 
+@pytest.mark.parametrize("batch_size", [1, 99, 989])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+def test_sampling_from_probs_seed_offset_reproducibility(batch_size, vocab_size):
+    """Test that explicit seed/offset produces reproducible results."""
+    torch.manual_seed(42)
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
+    normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+
+    seed, offset = 12345, 0
+
+    samples1 = flashinfer.sampling.sampling_from_probs(
+        normalized_prob, seed=seed, offset=offset
+    )
+    samples2 = flashinfer.sampling.sampling_from_probs(
+        normalized_prob, seed=seed, offset=offset
+    )
+
+    assert torch.all(samples1 == samples2), (
+        "Same seed/offset should produce identical samples"
+    )
+
+
+@pytest.mark.parametrize("batch_size", [1, 99, 989])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+def test_sampling_from_logits_seed_offset_reproducibility(batch_size, vocab_size):
+    """Test that explicit seed/offset produces reproducible results."""
+    torch.manual_seed(42)
+    logits = torch.randn(batch_size, vocab_size, device="cuda:0")
+
+    seed, offset = 12345, 0
+
+    samples1 = flashinfer.sampling.sampling_from_logits(
+        logits, seed=seed, offset=offset
+    )
+    samples2 = flashinfer.sampling.sampling_from_logits(
+        logits, seed=seed, offset=offset
+    )
+
+    assert torch.all(samples1 == samples2), (
+        "Same seed/offset should produce identical samples"
+    )
+
+
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+def test_sampling_different_seed_offset_produces_different_results(vocab_size):
+    """Test that different seed/offset values produce different samples."""
+    torch.manual_seed(42)
+    batch_size = 1000
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
+    normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+
+    samples_seed1 = flashinfer.sampling.sampling_from_probs(
+        normalized_prob, seed=12345, offset=0
+    )
+    samples_seed2 = flashinfer.sampling.sampling_from_probs(
+        normalized_prob, seed=67890, offset=0
+    )
+
+    samples_offset1 = flashinfer.sampling.sampling_from_probs(
+        normalized_prob, seed=12345, offset=0
+    )
+    samples_offset2 = flashinfer.sampling.sampling_from_probs(
+        normalized_prob, seed=12345, offset=1000
+    )
+
+    seed_match_rate = (samples_seed1 == samples_seed2).float().mean().item()
+    offset_match_rate = (samples_offset1 == samples_offset2).float().mean().item()
+
+    assert seed_match_rate < 1, (
+        f"Different seeds should produce mostly different samples, "
+        f"got {seed_match_rate:.2%} match rate"
+    )
+    assert offset_match_rate < 1, (
+        f"Different offsets should produce mostly different samples, "
+        f"got {offset_match_rate:.2%} match rate"
+    )
+
+
 if __name__ == "__main__":
     # test_sampling_freq(128256, gumbel_distribution(0.1), 0.5)
     test_sampling_from_logits_freq(128256, gumbel_distribution(0.1))
