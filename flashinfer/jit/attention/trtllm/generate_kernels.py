@@ -180,12 +180,3 @@ def enumerate_kernels(src_target: Path, gen_dir: Path):
         # yapf: enable
 
         generate_files(specs_names)
-
-
-if __name__ == "__main__":
-    import sys
-
-    if len(sys.argv) != 3:
-        print(f"Usage: {sys.argv[0]} <src_target> <gen_dir>")
-        sys.exit(1)
-    enumerate_kernels(Path(sys.argv[1]), Path(sys.argv[2]))
