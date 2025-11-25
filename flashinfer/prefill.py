@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Union, overload
 
 import torch
 
+from .api_logging import flashinfer_api
 from .jit import (
     gen_batch_prefill_module,
     gen_customize_batch_prefill_module,
@@ -874,6 +875,7 @@ def get_batch_prefill_jit_module(module_name: str, jit_module: Any):
     )
 
 
+@flashinfer_api
 def single_prefill_with_kv_cache_with_jit_module(
     jit_module: Any,
     q: torch.Tensor,
@@ -958,6 +960,7 @@ def single_prefill_with_kv_cache(
 ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
 
+@flashinfer_api
 def single_prefill_with_kv_cache(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1326,6 +1329,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
     wrapper class manages the lifecycle of these data structures.
     """
 
+    @flashinfer_api
     def __init__(
         self,
         float_workspace_buffer: torch.Tensor,
@@ -1521,6 +1525,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             pin_memory=True,
         )
 
+    @flashinfer_api
     def plan(
         self,
         qo_indptr: torch.Tensor,
@@ -1977,6 +1982,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         window_left: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
+    @flashinfer_api
     def run(
         self,
         q: torch.Tensor,
@@ -2351,6 +2357,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
     wrapper class manages the lifecycle of these data structures.
     """
 
+    @flashinfer_api
     def __init__(
         self,
         float_workspace_buffer: torch.Tensor,
@@ -2494,6 +2501,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             pin_memory=True,
         )
 
+    @flashinfer_api
     def plan(
         self,
         qo_indptr: torch.Tensor,
@@ -2838,6 +2846,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         enable_pdl: Optional[bool] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
+    @flashinfer_api
     def run(
         self,
         q: torch.Tensor,
@@ -3194,6 +3203,7 @@ def get_trtllm_gen_fmha_module():
     return op
 
 
+@flashinfer_api
 def trtllm_ragged_attention_deepseek(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -3328,6 +3338,7 @@ def trtllm_ragged_attention_deepseek(
         return out
 
 
+@flashinfer_api
 def trtllm_batch_context_with_kv_cache(
     query: torch.Tensor,
     kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],

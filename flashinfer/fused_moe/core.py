@@ -20,6 +20,7 @@ from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 
+from ..api_logging import flashinfer_api
 from ..autotuner import (
     AutoTuner,
     DynamicTensorSpec,
@@ -685,6 +686,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
 
 
 # ref: https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/custom_ops/torch_custom_ops.py#L121
+@flashinfer_api
 def cutlass_fused_moe(
     input: torch.Tensor,
     token_selected_experts: torch.Tensor,
@@ -1857,6 +1859,7 @@ def get_trtllm_moe_sm100_module():
     )
 
 
+@flashinfer_api
 def trtllm_bf16_moe(
     routing_logits: torch.Tensor,
     routing_bias: Optional[torch.Tensor],
@@ -1937,6 +1940,7 @@ def trtllm_bf16_moe(
     )
 
 
+@flashinfer_api
 def trtllm_fp8_per_tensor_scale_moe(
     routing_logits: torch.Tensor,
     routing_bias: Optional[torch.Tensor],
@@ -2010,6 +2014,7 @@ def trtllm_fp8_per_tensor_scale_moe(
     )
 
 
+@flashinfer_api
 def trtllm_fp8_block_scale_moe(
     routing_logits: torch.Tensor,
     routing_bias: Optional[torch.Tensor],
@@ -2087,6 +2092,7 @@ def trtllm_fp8_block_scale_moe(
     )
 
 
+@flashinfer_api
 def trtllm_fp4_block_scale_moe(
     routing_logits: torch.Tensor,
     routing_bias: Optional[torch.Tensor],
@@ -2216,6 +2222,7 @@ def trtllm_fp4_block_scale_moe(
     )
 
 
+@flashinfer_api
 def trtllm_fp4_block_scale_routed_moe(
     topk_ids: torch.Tensor,
     routing_bias: Optional[torch.Tensor],

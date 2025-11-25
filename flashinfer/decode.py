@@ -21,6 +21,7 @@ from typing import Any, List, Literal, Optional, Tuple, Union, overload
 
 import torch
 
+from .api_logging import flashinfer_api
 from .xqa import xqa, xqa_mla
 from .cudnn import cudnn_batch_decode_with_kv_cache as cudnn_batch_decode_with_kv_cache
 from .jit import (
@@ -312,6 +313,7 @@ def get_trtllm_gen_fmha_module():
     return op
 
 
+@flashinfer_api
 def single_decode_with_kv_cache_with_jit_module(
     jit_module: Any,
     q: torch.Tensor,
@@ -388,6 +390,7 @@ def single_decode_with_kv_cache(
 ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
 
+@flashinfer_api
 def single_decode_with_kv_cache(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -646,6 +649,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
     manages the lifecycle of these data structures.
     """
 
+    @flashinfer_api
     def __init__(
         self,
         float_workspace_buffer: torch.Tensor,
@@ -809,6 +813,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             pin_memory=True,
         )
 
+    @flashinfer_api
     def plan(
         self,
         indptr: torch.Tensor,
@@ -1162,6 +1167,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         window_left: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
+    @flashinfer_api
     def run(
         self,
         q: torch.Tensor,
@@ -1916,6 +1922,7 @@ class TrtllmGenDecodeModule:
             -1,  # o_sf_vec_size
             0,  # o_sf_start_index
             window_left,
+            0,  # sparse_mla_top_k
             self._sm_count,
             enable_pdl,
             workspace_size,
@@ -2059,6 +2066,7 @@ def get_trtllm_gen_decode_module(*args):
     )
 
 
+@flashinfer_api
 def trtllm_batch_decode_with_kv_cache(
     query: torch.Tensor,
     kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
@@ -2079,6 +2087,7 @@ def trtllm_batch_decode_with_kv_cache(
     backend: str = "auto",
     q_len_per_req: Optional[int] = 1,
     o_scale: Optional[float] = 1.0,
+    mask: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, FP4Tensor]:
     """
     Parameters
@@ -2149,6 +2158,9 @@ def trtllm_batch_decode_with_kv_cache(
     o_scale : Optional[float] = 1.0
         output scale factor for xqa fp8 output.
 
+    mask : Optional[torch.Tensor] = None
+        causal attention mask for xqa speculative decoding.
+
     Returns
     -------
     out : Union[torch.Tensor, FP4Tensor]
@@ -2204,6 +2216,7 @@ def trtllm_batch_decode_with_kv_cache(
             enable_pdl=enable_pdl,
             q_len_per_req=q_len_per_req,
             o_scale=o_scale,
+            mask=mask,
         )
     elif backend == "trtllm-gen":
         # Convert NHD layout to HND if necessary (transpose only changes stride, not data)
@@ -2316,6 +2329,7 @@ def trtllm_batch_decode_with_kv_cache(
             o_sf_vec_size or -1,
             o_sf_start_index,
             window_left,
+            0,  # sparse_mla_top_k
             sm_count,
             enable_pdl,
             workspace_buffer.numel() * workspace_buffer.element_size(),
@@ -2332,6 +2346,7 @@ def trtllm_batch_decode_with_kv_cache(
 
 
 # xqa uses NHD layout
+@flashinfer_api
 def xqa_batch_decode_with_kv_cache(
     query: torch.Tensor,
     kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
@@ -2348,6 +2363,7 @@ def xqa_batch_decode_with_kv_cache(
     enable_pdl: bool = None,
     q_len_per_req: Optional[int] = 1,
     o_scale: Optional[float] = 1.0,
+    mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Parameters
@@ -2399,14 +2415,15 @@ def xqa_batch_decode_with_kv_cache(
     o_scale : Optional[float] = 1.0
         output scale factor for fp8 output.
 
+    mask : Optional[torch.Tensor] = None
+        causal attention mask for xqa speculative decoding.
+
     Returns
     -------
     out : torch.Tensor
         output torch.Tensor.
     """
     enable_pdl = device_support_pdl(query.device) if enable_pdl is None else enable_pdl
-
-    assert q_len_per_req == 1, "xqa not support speculative decoding yet"
 
     if isinstance(kv_cache, tuple):
         k_cache, v_cache = kv_cache
@@ -2441,6 +2458,9 @@ def xqa_batch_decode_with_kv_cache(
     kv_scale_value = bmm2_scale * o_scale
     q_scale_value = bmm1_scale / kv_scale_value * (head_dim**0.5)
 
+    if q_len_per_req > 1:
+        batch_size = query.shape[0] // q_len_per_req
+        query = query.view(batch_size, q_len_per_req, query.shape[1], query.shape[2])
     query_new = query.unsqueeze(1)
     seq_lens_new = seq_lens.unsqueeze(1)
     sinks_new = sinks.reshape(num_kv_heads, -1) if sinks is not None else None
@@ -2469,6 +2489,8 @@ def xqa_batch_decode_with_kv_cache(
         sm_count=sm_count,
         enable_pdl=enable_pdl,
         rcp_out_scale=1.0 / o_scale,
+        q_seq_len=q_len_per_req,
+        mask=mask,
     )
 
     return out
@@ -2480,6 +2502,7 @@ def _check_trtllm_gen_mla_shape(
     qk_nope_head_dim,
     kv_lora_rank,
     qk_rope_head_dim,
+    sparse_mla_top_k,
     page_table,
     page_size,
 ):
@@ -2504,18 +2527,26 @@ def _check_trtllm_gen_mla_shape(
             f"Expected head dim 576 for query and kv_cache, got {D_q} and {D_ckv}"
         )
 
-    B_block_table, block_num = page_table.shape
-    block_size = page_size
-    if B_q != B_block_table:
-        raise ValueError(
-            f"Expected batch size {B_q} for query and block_table, got {B_q} and {B_block_table}"
-        )
-    if block_num % (128 / block_size) != 0:
-        raise ValueError(
-            f"Expected block_num % (128 / block_size) == 0, got {block_num=} and {block_size=}"
-        )
+    if sparse_mla_top_k > 0:
+        page_table_shape = page_table.shape
+        if page_table_shape != (B_q, Q_len, sparse_mla_top_k):
+            raise ValueError(
+                f"Expected page_table.shape == (B_q, Q_len, sparse_mla_top_k), got {page_table_shape}"
+            )
+    else:
+        B_block_table, block_num = page_table.shape
+        block_size = page_size
+        if B_q != B_block_table:
+            raise ValueError(
+                f"Expected batch size {B_q} for query and block_table, got {B_q} and {B_block_table}"
+            )
+        if block_num % (128 / block_size) != 0:
+            raise ValueError(
+                f"Expected block_num % (128 / block_size) == 0, got {block_num=} and {block_size=}"
+            )
 
 
+@flashinfer_api
 def trtllm_batch_decode_with_kv_cache_mla(
     query: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -2526,6 +2557,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
     block_tables: torch.Tensor,
     seq_lens: torch.Tensor,
     max_seq_len: int,
+    sparse_mla_top_k: int = 0,
     out: Optional[torch.Tensor] = None,
     bmm1_scale: Union[float, torch.Tensor] = 1.0,
     bmm2_scale: Union[float, torch.Tensor] = 1.0,
@@ -2541,6 +2573,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
     qk_nope_head_dim: qk_nope_head_dim, must be 128
     kv_lora_rank: kv_lora_rank, must be 512
     qk_rope_head_dim: qk_rope_head_dim, must be 64
+    sparse_mla_top_k: sparse MLA top k, must be 0 for non-sparse MLA.
     block_tables: page_table of kv cache, [batch_size, num_pages]
     seq_lens: query_len
     max_seq_len: max sequence length for kv_cache
@@ -2633,6 +2666,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
             qk_nope_head_dim,
             kv_lora_rank,
             qk_rope_head_dim,
+            sparse_mla_top_k,
             block_tables,
             block_size,
         )
@@ -2666,6 +2700,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
             -1,  # o_sf_vec_size
             0,  # o_sf_start_index
             -1,  # window_left
+            sparse_mla_top_k,
             sm_count,
             enable_pdl,
             workspace_buffer.numel() * workspace_buffer.element_size(),
@@ -2677,6 +2712,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
         raise ValueError(f"Backend {backend} not supported")
 
 
+@flashinfer_api
 def xqa_batch_decode_with_kv_cache_mla(
     query: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -2746,6 +2782,7 @@ def xqa_batch_decode_with_kv_cache_mla(
         qk_nope_head_dim,
         kv_lora_rank,
         qk_rope_head_dim,
+        0,  # sparse_mla_top_k
         block_tables,
         block_size,
     )
