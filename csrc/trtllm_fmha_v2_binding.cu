@@ -31,13 +31,11 @@
 
 using tvm::ffi::Optional;
 
-// Type aliases from NVIDIA's FMHA library - keep in global namespace
 using Launch_params = bert::Fused_multihead_attention_launch_params;
 using Attention_mask_type = fmha::Attention_mask_type;
 using Attention_input_layout = fmha::Attention_input_layout;
 using Kv_block_array = fmha::Kv_block_array;
 
-// External kernel function declarations - must be in global namespace
 extern void run_fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_192x128_output_bf16_sm120_nl_tiled(
     const bert::Fused_multihead_attention_params_v2& params,
     const bert::Fused_multihead_attention_launch_params& launch_params, cudaStream_t stream);
@@ -49,7 +47,6 @@ extern void run_fmha_v2_flash_attention_bf16_64_128_S_q_k_v_192x128_sm120_nl_til
 extern void run_fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_192x128_sm120_nl_tiled(
     const bert::Fused_multihead_attention_params_v2& params,
     const bert::Fused_multihead_attention_launch_params& launch_params, cudaStream_t stream);
-
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 namespace flashinfer {
@@ -280,7 +277,6 @@ static inline void determine_launch_params(
   }
 }
 
-
 /**
  * @brief TVM FFI binding for TRTLLM FMHA V2 kernel for MLA attention
  *
@@ -298,10 +294,12 @@ static inline void determine_launch_params(
  * @param v Value tensor [batch, kv_seqlen, num_kv_heads, 128] in E4M3
  * @param o Output tensor [batch, q_seqlen, num_heads, 128] in BF16
  * @param maybe_lse Optional log-sum-exp tensor for softmax statistics
- * @param sm_scale Attention scale factor (typically 1/sqrt(head_dim))
  * @param num_heads Number of query heads
  * @param head_dim Head dimension (must be 192 for this kernel)
  * @param seq_len Sequence length (not used, extracted from tensor shapes)
+ * @param scale_softmax Softmax scale factor
+ * @param scale_bmm1 Scale factor for the first GEMM
+ * @param scale_bmm2 Scale factor for the second GEMM
  * @param is_e4m3 Whether the input is E4M3
  * @param is_bf16_output Whether the output is BF16
  */
@@ -324,7 +322,6 @@ void TRTLLMFMHAv2Run(TensorView q, TensorView k, TensorView v, TensorView o,
   // head_dim_v
   const int head_dim_v = v.shape()[3];  // Should be 128
 
-  // 2. Set fixed parameters matching the command
   Data_type data_type = is_e4m3 ? DATA_TYPE_E4M3 : DATA_TYPE_BF16;
   Data_type acc_type = DATA_TYPE_FP32;
   Data_type output_dtype = is_bf16_output ? DATA_TYPE_BF16 : DATA_TYPE_FP16;
@@ -405,7 +402,7 @@ void TRTLLMFMHAv2Run(TensorView q, TensorView k, TensorView v, TensorView o,
              maybe_lse.has_value() ? maybe_lse.value().data_ptr() : nullptr, scale_bmm2_d,
              scale_bmm1,     // scale_bmm1
              scale_softmax,  // scale_softmax
-             scale_bmm2,     // scale_bmm2 (E4M3 uses 1.0)
+             scale_bmm2,     // scale_bmm2
              0.0f,           // softcapping_scale_bmm1 (disabled)
              false,          // use_int8_scale_max
              false,          // interleaved
@@ -413,28 +410,22 @@ void TRTLLMFMHAv2Run(TensorView q, TensorView k, TensorView v, TensorView o,
              false);         // has_alibi
 
   if (data_type == DATA_TYPE_E4M3 && output_dtype == DATA_TYPE_BF16) {
-    printf(
-        "Calling "
-        "fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_192x128_output_bf16_sm120_nl_tiled\n");
     run_fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_192x128_output_bf16_sm120_nl_tiled(
         params, launch_params, stream);
   } else if (data_type == DATA_TYPE_BF16) {
-    printf("Calling fmha_v2_flash_attention_bf16_64_128_S_q_k_v_192x128_sm120_nl_tiled\n");
     run_fmha_v2_flash_attention_bf16_64_128_S_q_k_v_192x128_sm120_nl_tiled(params, launch_params,
                                                                            stream);
   } else if (data_type == DATA_TYPE_E4M3 && acc_type == DATA_TYPE_FP32) {
-    printf("Calling fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_192x128_sm120_nl_tiled\n");
     run_fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_192x128_sm120_nl_tiled(
         params, launch_params, stream);
   } else {
     throw std::runtime_error("Unsupported data type");
   }
-
+  printf("TRTLLMFMHAv2Run done\n");
   FMHA_CHECK_CUDA(cudaFree(scale_bmm2_d));
   FMHA_CHECK_CUDA(cudaFree(cu_seqlens_d));
 }
 
-// TVM FFI export must be in global namespace
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, flashinfer::TRTLLMFMHAv2Run);
 
 }  // namespace flashinfer

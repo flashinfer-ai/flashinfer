@@ -4,6 +4,3 @@
 [submodule "3rdparty/spdlog"]
 	path = 3rdparty/spdlog
 	url = https://github.com/gabime/spdlog.git
-[submodule "3rdparty/TensorRT-LLM"]
-	path = 3rdparty/TensorRT-LLM
-	url = https://github.com/NVIDIA/TensorRT-LLM.git

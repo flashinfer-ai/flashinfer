@@ -151,7 +151,7 @@ spec_fields = (
     "output_dtype",
     "is_mtp",
 )
-kernel_spec = namedtuple("kernel_spec", spec_fields)
+kernel_spec = namedtuple("kernel_spec", spec_fields)  # type: ignore[misc]
 kernel_spec.__new__.__defaults__ = (
     1,  # ctas_per_head
     1,  # sm_mma
@@ -1848,7 +1848,7 @@ def encode_name(kernel_spec):
     feature_tags = ""
     if effective_sm == 90:
         # let's think about where to insert tma/ldgsts in the string before MR. [Timmy]
-        if kernel_spec.ldgsts_q == True:
+        if kernel_spec.ldgsts_q:
             tma_or_ldgsts = "_ldgsts"
         else:
             tma_or_ldgsts = "_tma"
@@ -2312,7 +2312,7 @@ def get_kernel_code(kspec, kname, lname):
             )
     elif effective_sm == 90:
         use_tma = 1
-        if kspec.ldgsts_q == True:
+        if kspec.ldgsts_q:
             use_tma = 0
         if kspec.warp_specialization:
             code = kernel_hopper_warp_specialization_template.format(
@@ -2347,7 +2347,7 @@ def get_api_code(specs_names):
             )
 
     signatures = []
-    for kspec, fname, lname, kname in specs_names:
+    for kspec, _fname, lname, _kname in specs_names:
         effective_sm, _ = get_effective_sm_and_name(kspec)
         use_tma = effective_sm == 90 and not kspec.ldgsts_q
         signatures.append(get_signature(lname, kspec.version, kspec.cross_mha, use_tma))
@@ -2491,7 +2491,7 @@ if( data_type == {data_type} && output_data_type == {output_data_type} && d == {
 
     {lname}_nl_tiled(params, launch_params, stream);
 
-}} """.format(
+}} """.format(  # type: ignore[str-format]
                     **kspec._asdict(),
                     data_type=data_type,
                     output_data_type=output_data_type,
@@ -2508,7 +2508,7 @@ if( data_type == {data_type} && output_data_type == {output_data_type} && d == {
 
     {lname}(params, launch_params, stream);
 
-}} """.format(
+}} """.format(  # type: ignore[str-format]
                     **kspec._asdict(),
                     data_type=data_type,
                     output_data_type=output_data_type,
@@ -2524,7 +2524,7 @@ if( data_type == {data_type} && output_data_type == {output_data_type} && d == {
 
     {lname}_nl(params, launch_params, stream);
 
-}} """.format(
+}} """.format(  # type: ignore[str-format]
                     **kspec._asdict(),
                     data_type=data_type,
                     output_data_type=output_data_type,
@@ -2657,7 +2657,9 @@ if( data_type == {data_type} && d == {head_size} && sm == {sm} {warp_spec_check}
     && version == {version} ) {{
     warps_m = {warps_m};
     warps_n = {warps_n};
-}} """.format(**locals(), **kspec._asdict(), unroll_check=gen_unroll_check(kspec))
+}} """.format(  # type: ignore[str-format]
+                **locals(), **kspec._asdict(), unroll_check=gen_unroll_check(kspec)
+            )
         return """\
 if( data_type == {data_type} && s == {slen} && d == {head_size} && sm == {sm} {warp_spec_check}
     && version == {version} ) {{
@@ -2860,7 +2862,7 @@ int main(){{
 def get_kernel_traits_code(specs_names):
     print_kernel_specs = []
 
-    for kspec, fname, lname, kname in specs_names:
+    for kspec, fname, lname, kname in specs_names:  # noqa: B007 (fname, lname used via locals())
         effective_sm, sm_name = get_effective_sm_and_name(kspec)
         if effective_sm < 90:
             instruction_traits = sm_name.capitalize() + "_" + dtype2traits[kspec.dtype]
@@ -3242,7 +3244,7 @@ def get_cubin_header(kernel_traits, specs_names):
     cubin_lens = []
     cubins_dict = {}
     cubin_lens_dict = {}
-    for kspec, fname, lname, kname in specs_names:
+    for kspec, fname, lname, kname in specs_names:  # noqa: B007 (lname, kname used via locals())
         if generate_cu_trtllm and not use_cubin_header(
             kspec.sm, kspec.head_size, kspec.dtype
         ):
@@ -3263,7 +3265,7 @@ def get_cubin_header(kernel_traits, specs_names):
     metadata_v2_dict = {}
     unroll_config_v1 = []
     unroll_config_v2 = []
-    for kname, smem, threads, fname, unroll_step, unroll_threshold in kernel_traits:
+    for kname, smem, threads, fname, unroll_step, unroll_threshold in kernel_traits:  # noqa: B007 (smem, threads, unroll_threshold used via locals())
         name = fname.replace(".", "_")
         cubin_name = "cubin_{name}_cubin".format(name=name)
         kname_remove_causal = kname.replace("_causal", "")
@@ -3469,7 +3471,7 @@ def get_cubin_header(kernel_traits, specs_names):
 """.format(**locals())
             metadata_v2.append(code)
         else:
-            assert False, "Something terrible happened"
+            raise AssertionError("Something terrible happened")
 
     metadata_v1 = ",\n".join(metadata_v1)
     # Add macros to only include needed cubins during compilation.
@@ -3477,7 +3479,7 @@ def get_cubin_header(kernel_traits, specs_names):
         metadata_v2 = ""
         for sm in metadata_v2_dict.keys():
             macro_begin = f"#ifndef EXCLUDE_SM_{sm}"
-            macro_end = f"#endif\n\n"
+            macro_end = "#endif\n\n"
             metadata_v2 += macro_begin + "\n" + (",\n".join(metadata_v2_dict[sm]))
             last_key = list(metadata_v2_dict.keys())[-1]
             metadata_v2 += ("" if sm == last_key else ",") + "\n" + macro_end
@@ -3486,7 +3488,7 @@ def get_cubin_header(kernel_traits, specs_names):
     # Add macros to only include needed cubins during compilation.
     for sm in cubins_dict.keys():
         macro_begin = f"#ifndef EXCLUDE_SM_{sm}"
-        macro_end = f"#endif\n"
+        macro_end = "#endif\n"
         cubins.extend([macro_begin] + cubins_dict[sm] + [macro_end])
         if sm in cubin_lens_dict:
             cubin_lens.extend([macro_begin] + cubin_lens_dict[sm] + [macro_end])
@@ -3696,7 +3698,17 @@ def generate_files(specs_names):
     # Make sure we have a bin directory.
     if not os.path.exists("bin"):
         os.mkdir("bin")
-    cmd = "nvcc -I src -Xcompiler -Wno-enum-compare --std=c++17 -o bin/print_traits.exe generated/print_kernel_traits.cu".split()
+    cmd = [
+        "nvcc",
+        "-I",
+        "src",
+        "-Xcompiler",
+        "-Wno-enum-compare",
+        "--std=c++17",
+        "-o",
+        "bin/print_traits.exe",
+        "generated/print_kernel_traits.cu",
+    ]
     if "CUDA_PATH" in os.environ:
         cmd[0] = os.environ["CUDA_PATH"] + "/bin/" + cmd[0]
     print('Running command "{}" to build "bin/print_traits.exe":'.format(" ".join(cmd)))
@@ -5158,19 +5170,14 @@ def enumerate_hmma_flash_kernels_base(
         # tune kv fragment double buffer
         limit_qk_fragments = False
         limit_v_fragments = False
-        if head_size >= 256:
-            limit_qk_fragments = True
-            limit_v_fragments = True
-        elif head_size >= 128 and sm == 70:
+        if head_size >= 256 or head_size >= 128 and sm == 70:
             limit_qk_fragments = True
             limit_v_fragments = True
 
         # tune kv_loop step
         q_loop_step = 64
         kv_loop_step = 64
-        if head_size > 128:
-            kv_loop_step = 16
-        elif head_size > 64 and sm == 70:
+        if head_size > 128 or head_size > 64 and sm == 70:
             kv_loop_step = 16
         elif head_size > 32:
             kv_loop_step = 32
@@ -5636,7 +5643,7 @@ def enumerate_imma_kernels(specs, sm=80):
             warps_n=8,
             version=1,
             interleaved=False,
-            ldgsts_q=True if sm >= 80 else False,
+            ldgsts_q=sm >= 80,
             ldgsts_k=False,
             ldgsts_v=False,
             share_smem_k_v=True,
@@ -5660,7 +5667,7 @@ def enumerate_imma_kernels(specs, sm=80):
             warps_n=8,
             version=2,
             interleaved=False,
-            ldgsts_q=True if sm >= 80 else False,
+            ldgsts_q=sm >= 80,
             ldgsts_k=False,
             ldgsts_v=False,
             share_smem_k_v=False,
@@ -5823,7 +5830,7 @@ def enumerate_imma_kernels(specs, sm=80):
             warps_n=4,
             version=1,
             interleaved=False,
-            ldgsts_q=True if sm >= 80 else False,
+            ldgsts_q=sm >= 80,
             ldgsts_k=False,
             ldgsts_v=False,
             share_smem_k_v=False,
@@ -5846,7 +5853,7 @@ def enumerate_imma_kernels(specs, sm=80):
             warps_n=4,
             version=2,
             interleaved=False,
-            ldgsts_q=True if sm >= 80 else False,
+            ldgsts_q=sm >= 80,
             ldgsts_k=False,
             ldgsts_v=False,
             share_smem_k_v=False,
@@ -5894,7 +5901,7 @@ def enumerate_imma_kernels(specs, sm=80):
             warps_n=2,
             version=1,
             interleaved=False,
-            ldgsts_q=True if sm >= 80 else False,
+            ldgsts_q=sm >= 80,
             ldgsts_k=False,
             ldgsts_v=False,
             share_smem_k_v=False,
@@ -5940,7 +5947,7 @@ def enumerate_imma_kernels(specs, sm=80):
             warps_n=2,
             version=2,
             interleaved=False,
-            ldgsts_q=True if sm >= 80 else False,
+            ldgsts_q=sm >= 80,
             ldgsts_k=False,
             ldgsts_v=False,
             share_smem_k_v=False,
@@ -6809,7 +6816,7 @@ def enumerate_kernels():
 
     # Expand the cartesian product of the list fields "seq_len" and "head_size".
     specs_expanded = []
-    list_like = lambda x: isinstance(x, list) or isinstance(x, tuple)
+    list_like = lambda x: isinstance(x, (list, tuple))
     for kspec in specs:
         tmp_s = kspec.seq_len
         tmp_d = kspec.head_size
@@ -6847,16 +6854,16 @@ def enumerate_kernels():
                   and kspec.head_size_v   == 0
                   and kspec.sage_block_sizes is None
                   and kspec.version       == 2
-                  and kspec.cross_mha     == False
-                  and kspec.flash_attention == True
+                  and not kspec.cross_mha
+                  and kspec.flash_attention
                   and kspec.input_layout != InputLayout.SEPARATE_Q_K_V
                   or (kspec.sm == 90
                   and kspec.dtype         in ['fp16', 'bf16', 'fp16_fp32']
                   and kspec.head_size     <= 256
-                  and kspec.ldgsts_q  == True
+                  and kspec.ldgsts_q
                   and kspec.version       == 2
-                  and kspec.cross_mha     == False
-                  and kspec.flash_attention == False)
+                  and not kspec.cross_mha
+                  and not kspec.flash_attention)
                   # Clip/SigLip support.
                   or  (kspec.sm           == 100
                   and kspec.dtype         in ['fp16', 'bf16', 'fp16_fp32', 'e4m3', 'e4m3_fp32']
@@ -6864,8 +6871,8 @@ def enumerate_kernels():
                   and kspec.head_size_v   == 0
                   and kspec.sage_block_sizes is None
                   and kspec.version       == 2
-                  and kspec.cross_mha     == False
-                  and kspec.flash_attention == True
+                  and not kspec.cross_mha
+                  and kspec.flash_attention
                   and kspec.input_layout != InputLayout.SEPARATE_Q_K_V)
                   # Deepseek MLA (generation 576/512 paged)
                   or (kspec.sm            in [90, 100, 120]
@@ -6875,10 +6882,10 @@ def enumerate_kernels():
                   and kspec.input_layout == InputLayout.Q_PAGED_KV
                   and kspec.sage_block_sizes is None
                   and kspec.version       == 2
-                  and kspec.cross_mha     == False
-                  and kspec.flash_attention == True
-                  and kspec.warp_specialization == False
-                  and kspec.tiled == True)
+                  and not kspec.cross_mha
+                  and kspec.flash_attention
+                  and not kspec.warp_specialization
+                  and kspec.tiled)
                   # Deepseek MLA (context 192/128 separate-q-k-v)
                   or (kspec.sm            in [90, 100, 120]
                   and kspec.dtype         in ['bf16', 'e4m3', 'e4m3_fp32']
@@ -6887,203 +6894,34 @@ def enumerate_kernels():
                   and kspec.input_layout == InputLayout.SEPARATE_Q_K_V
                   and kspec.sage_block_sizes is None
                   and kspec.version       == 2
-                  and kspec.cross_mha     == False
-                  and kspec.flash_attention == True
-                  and ((kspec.warp_specialization == True and kspec.alibi == False)   # sm90
-                    or (kspec.warp_specialization == False and kspec.tiled == True))  # non-sm90
-                  and kspec.enable_attn_logit_softcapping == False)
+                  and not kspec.cross_mha
+                  and kspec.flash_attention
+                  and ((kspec.warp_specialization and not kspec.alibi)   # sm90
+                    or (not kspec.warp_specialization and kspec.tiled))  # non-sm90
+                  and not kspec.enable_attn_logit_softcapping)
                   # SageAttention (warp_spec, head_size in (80, 128), packed QKV, padding mask)
                   or (kspec.sm            == 90
                   and kspec.head_size     in [80, 128]
                   and kspec.version       == 2
                   and kspec.sage_block_sizes in [(64, 64, 256)]
-                  and kspec.cross_mha     == False
-                  and kspec.flash_attention == True
-                  and kspec.warp_specialization == True
+                  and not kspec.cross_mha
+                  and kspec.flash_attention
+                  and kspec.warp_specialization
                   and kspec.input_layout == InputLayout.PACKED_QKV
-                  and kspec.alibi == False
-                  and kspec.enable_attn_logit_softcapping == False)
+                  and not kspec.alibi
+                  and not kspec.enable_attn_logit_softcapping)
                   # SageAttention on Ada (head_size in (80, 128), packed QKV, padding mask)
                   or (kspec.sm            == 89
                   and kspec.head_size     in [80, 128]
                   and kspec.sage_block_sizes in [(64, 32, 32)]
                   and kspec.output_dtype in ['fp16', 'bf16']
                   and kspec.version       == 2
-                  and kspec.cross_mha     == False
-                  and kspec.flash_attention == True
-                  and kspec.warp_specialization == False
+                  and not kspec.cross_mha
+                  and kspec.flash_attention
+                  and not kspec.warp_specialization
                   and kspec.input_layout == InputLayout.PACKED_QKV))
                   # only generate head_size = 128/256 for attn_logit_softcapping operation.
                   and (kspec.head_size == 128 or kspec.head_size == 256 or not kspec.enable_attn_logit_softcapping)]
     # yapf: enable
 
     generate_files(specs_names)
-
-
-def enumerate_kernels_custom():
-    if not os.path.exists("./generated"):
-        os.mkdir("./generated")
-
-    specs = []
-
-    # enumerate_hmma_flash_kernels(specs, sm=120, dtype='fp16')
-    # enumerate_hmma_flash_kernels(specs, sm=120, dtype='bf16')
-    enumerate_hmma_flash_kernels(specs, sm=120, dtype="bf16", head_size_v=128)
-    # enumerate_hmma_flash_kernels(specs,
-    #                                 sm=120,
-    #                                 dtype='bf16',
-    #                                 head_size_v=512)
-    # enumerate_qmma_kernels(specs, sm=120)
-    enumerate_qmma_flash_kernels(specs, sm=120, dtype="e4m3_fp32", head_sizes=[192])
-    # enumerate_qmma_flash_kernels(specs, sm=120, dtype='bf16', head_sizes=[192])
-    # Add bf16 output MLA kernels.
-    # enumerate_qmma_flash_kernels(specs, sm=120, dtype='e4m3_fp32', head_sizes=[192], output_dtype="bf16")
-    enumerate_qmma_flash_kernels(
-        specs, sm=120, dtype="e4m3_fp32", head_sizes=[192], output_dtype="bf16"
-    )
-
-    # Expand the cartesian product of the list fields "seq_len" and "head_size".
-    specs_expanded = []
-    list_like = lambda x: isinstance(x, list) or isinstance(x, tuple)
-    for kspec in specs:
-        tmp_s = kspec.seq_len
-        tmp_d = kspec.head_size
-        tmp_dtype = kspec.dtype
-        tmp_exp = (
-            [kspec._replace(seq_len=s) for s in tmp_s] if list_like(tmp_s) else [kspec]
-        )
-        tmp_exp = (
-            [tmp_ks._replace(head_size=d) for d in tmp_d for tmp_ks in tmp_exp]
-            if list_like(tmp_d)
-            else tmp_exp
-        )
-        tmp_exp = (
-            [tmp_ks._replace(dtype=dt) for dt in tmp_dtype for tmp_ks in tmp_exp]
-            if list_like(tmp_dtype)
-            else tmp_exp
-        )
-        specs_expanded.extend(tmp_exp)
-
-    # Sanitize kernel specs
-    specs_expanded = [kspec for kspec in specs_expanded if kspec.sm >= kspec.sm_mma]
-
-    specs_names = [
-        (kspec, *encode_name(kspec))
-        for kspec in specs_expanded
-        # Volta is deprecated in TRT-LLM.
-        if (
-            kspec.sm in [80, 86, 89, 90, 120]
-            and kspec.dtype in ["fp16", "bf16", "fp16_fp32", "e4m3", "e4m3_fp32"]
-            and kspec.head_size <= 256
-            and kspec.head_size_v == 0
-            and kspec.sage_block_sizes is None
-            and kspec.version == 2
-            and kspec.cross_mha == False
-            and kspec.flash_attention == True
-            and kspec.input_layout != InputLayout.SEPARATE_Q_K_V
-            or (
-                kspec.sm == 90
-                and kspec.dtype in ["fp16", "bf16", "fp16_fp32"]
-                and kspec.head_size <= 256
-                and kspec.ldgsts_q == True
-                and kspec.version == 2
-                and kspec.cross_mha == False
-                and kspec.flash_attention == False
-            )
-            # Clip/SigLip support.
-            or (
-                kspec.sm == 100
-                and kspec.dtype in ["fp16", "bf16", "fp16_fp32", "e4m3", "e4m3_fp32"]
-                and kspec.head_size == 80
-                and kspec.head_size_v == 0
-                and kspec.sage_block_sizes is None
-                and kspec.version == 2
-                and kspec.cross_mha == False
-                and kspec.flash_attention == True
-                and kspec.input_layout != InputLayout.SEPARATE_Q_K_V
-            )
-            # Deepseek MLA (generation 576/512 paged)
-            or (
-                kspec.sm in [90, 100, 120]
-                and kspec.dtype in ["bf16", "e4m3_fp32"]
-                and kspec.head_size == 576
-                and kspec.head_size_v == 512
-                and kspec.input_layout == InputLayout.Q_PAGED_KV
-                and kspec.sage_block_sizes is None
-                and kspec.version == 2
-                and kspec.cross_mha == False
-                and kspec.flash_attention == True
-                and kspec.warp_specialization == False
-                and kspec.tiled == True
-            )
-            # Deepseek MLA (context 192/128 separate-q-k-v)
-            or (
-                kspec.sm in [90, 100, 120]
-                and kspec.dtype in ["bf16", "e4m3", "e4m3_fp32"]
-                and kspec.head_size == 192
-                and kspec.head_size_v == 128
-                and kspec.input_layout == InputLayout.SEPARATE_Q_K_V
-                and kspec.sage_block_sizes is None
-                and kspec.version == 2
-                and kspec.cross_mha == False
-                and kspec.flash_attention == True
-                and (
-                    (kspec.warp_specialization == True and kspec.alibi == False)  # sm90
-                    or (kspec.warp_specialization == False and kspec.tiled == True)
-                )  # non-sm90
-                and kspec.enable_attn_logit_softcapping == False
-            )
-            # SageAttention (warp_spec, head_size in (80, 128), packed QKV, padding mask)
-            or (
-                kspec.sm == 90
-                and kspec.head_size in [80, 128]
-                and kspec.version == 2
-                and kspec.sage_block_sizes in [(64, 64, 256)]
-                and kspec.cross_mha == False
-                and kspec.flash_attention == True
-                and kspec.warp_specialization == True
-                and kspec.input_layout == InputLayout.PACKED_QKV
-                and kspec.alibi == False
-                and kspec.enable_attn_logit_softcapping == False
-            )
-            # SageAttention on Ada (head_size in (80, 128), packed QKV, padding mask)
-            or (
-                kspec.sm == 89
-                and kspec.head_size in [80, 128]
-                and kspec.sage_block_sizes in [(64, 32, 32)]
-                and kspec.output_dtype in ["fp16", "bf16"]
-                and kspec.version == 2
-                and kspec.cross_mha == False
-                and kspec.flash_attention == True
-                and kspec.warp_specialization == False
-                and kspec.input_layout == InputLayout.PACKED_QKV
-            )
-        )
-        # only generate head_size = 128/256 for attn_logit_softcapping operation.
-        and (
-            kspec.head_size == 128
-            or kspec.head_size == 256
-            or not kspec.enable_attn_logit_softcapping
-        )
-    ]
-    # yapf: enable
-
-    generate_files(specs_names)
-
-
-if __name__ == "__main__":
-    # enumerate_kernels()
-    enumerate_kernels_custom()
-# General restrictions
-# FP16: no s=192
-# FP16: no Volta
-# Interleaved only for Int8
-
-# v1:
-# 384 should have 1x8 kernels not to exceed xmmas_n = 4
-# No support for interleaved
-
-# v2:
-#
-
-# TODO record all step and smem configs

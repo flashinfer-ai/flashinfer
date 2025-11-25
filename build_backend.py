@@ -16,7 +16,6 @@ limitations under the License.
 
 import os
 import shutil
-import subprocess
 from pathlib import Path
 
 from setuptools import build_meta as orig
@@ -86,28 +85,6 @@ def write_if_different(path: Path, content: str) -> None:
 def _create_data_dir(use_symlinks=True):
     _data_dir.mkdir(parents=True, exist_ok=True)
 
-    sparse_script = _root / "scripts" / "setup_sparse_submodules.sh"
-    if sparse_script.exists() and (_root / ".git").exists():
-        try:
-            # Run the sparse checkout script with bash
-            result = subprocess.run(
-                ["bash", str(sparse_script)],
-                check=True,
-                cwd=_root,
-                capture_output=True,
-                text=True,
-            )
-            if result.stdout:
-                print(result.stdout)
-        except subprocess.CalledProcessError as e:
-            print(f"Warning: Failed to setup sparse submodules: {e}")
-            if e.stderr:
-                print(f"Error details: {e.stderr}")
-            if e.stdout:
-                print(f"Output: {e.stdout}")
-        except Exception as e:
-            print(f"Warning: Unexpected error setting up sparse submodules: {e}")
-
     def ln(source: str, target: str) -> None:
         src = _root / source
         dst = _data_dir / target
@@ -128,9 +105,6 @@ def _create_data_dir(use_symlinks=True):
 
     ln("3rdparty/cutlass", "cutlass")
     ln("3rdparty/spdlog", "spdlog")
-    ln(
-        "3rdparty/TensorRT-LLM", "TensorRT-LLM"
-    )  # Sparse checkout: only cpp/kernels/fmha_v2
     ln("csrc", "csrc")
     ln("include", "include")
 

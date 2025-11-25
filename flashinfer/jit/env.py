@@ -152,9 +152,6 @@ CUTLASS_INCLUDE_DIRS: list[pathlib.Path] = [
     _package_root / "data" / "cutlass" / "tools" / "util" / "include",
 ]
 SPDLOG_INCLUDE_DIR: pathlib.Path = _package_root / "data" / "spdlog" / "include"
-TRTLLM_FMHA_V2_DIR: pathlib.Path = (
-    _package_root / "data" / "TensorRT-LLM" / "cpp" / "kernels" / "fmha_v2"
-)
 
 
 def get_nvshmem_include_dirs():
