@@ -337,7 +337,6 @@ def gen_jit_spec(
         "-DFLASHINFER_ENABLE_FP8_E4M3",
         "-DFLASHINFER_ENABLE_FP8_E5M2",
     ]
-    debug = True
     if debug:
         cflags += ["-O0", "-g"]
         cuda_cflags += [
