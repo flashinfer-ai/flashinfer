@@ -23,9 +23,9 @@ def test_trtllm_ragged_kv_large_stride_overflow():
 
     device = torch.device("cuda")
     compute_capability = get_compute_capability(device)
-    if compute_capability[0] < 10:
+    if compute_capability[0] != 10:
         pytest.skip(
-            f"TRTLLM ragged attention requires SM100+ GPUs, got sm{compute_capability[0]}{compute_capability[1]}"
+            f"TRTLLM-gen ragged attention requires SM100 and SM103 GPUs, got sm{compute_capability[0]}{compute_capability[1]}"
         )
 
     torch.manual_seed(42)
