@@ -367,9 +367,9 @@ _FP8_GEMM_SM100_TUNING_CONFIG = TuningConfig(
     ),
     constraint_specs=(
         ConstraintSpec(
-            4, # out_tensor_index
+            4,  # out_tensor_index
             -2,
-            lambda shapes: shapes[0][-2], 
+            lambda shapes: shapes[0][-2],
         ),
     ),
 )
@@ -2036,14 +2036,14 @@ _MM_FP4_TUNING_CONFIG_8x4 = TuningConfig(
     ),
     constraint_specs=(
         ConstraintSpec(
-            2, # a_scale_tensor_index
+            2,  # a_scale_tensor_index
             0,
-            lambda shapes: _pad_up(shapes[0][0], 8),  
+            lambda shapes: _pad_up(shapes[0][0], 8),
         ),
         ConstraintSpec(
-            6, # out_tensor_index
+            6,  # out_tensor_index
             0,
-            lambda shapes: shapes[0][0], 
+            lambda shapes: shapes[0][0],
         ),
     ),
 )
@@ -2060,14 +2060,14 @@ _MM_FP4_TUNING_CONFIG_128x4 = TuningConfig(
     ),
     constraint_specs=(
         ConstraintSpec(
-            2, # a_scale_tensor_index
+            2,  # a_scale_tensor_index
             0,
-            lambda shapes: _pad_up(shapes[0][0], 128),  
+            lambda shapes: _pad_up(shapes[0][0], 128),
         ),
         ConstraintSpec(
-            6, # out_tensor_index
+            6,  # out_tensor_index
             0,
-            lambda shapes: shapes[0][0], 
+            lambda shapes: shapes[0][0],
         ),
     ),
 )
