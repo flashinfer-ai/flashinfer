@@ -3,7 +3,7 @@ import torch
 import math
 
 
-from flashinfer.prefill import trtllm_prefill_deepseek
+from flashinfer.prefill import fmha_v2_prefill_deepseek
 from tests.utils_fp8 import to_float8
 
 
@@ -53,7 +53,7 @@ def attention_ref(
         (torch.float8_e4m3fn, torch.float16),
     ],
 )
-def test_trtllm_prefill_deepseek(
+def test_fmha_v2_prefill_deepseek(
     batch_size, num_heads, head_dim_qk, head_dim_v, seq_len, qkv_dtype, o_dtype
 ):
     torch.manual_seed(42)
@@ -120,7 +120,7 @@ def test_trtllm_prefill_deepseek(
     scale_bmm1 = q_scale * k_scale * sm_scale
     scale_bmm2 = v_scale
     scale_softmax = 1.0 if qkv_dtype == torch.float8_e4m3fn else 0.0
-    out, lse = trtllm_prefill_deepseek(
+    out, lse = fmha_v2_prefill_deepseek(
         q,
         k,
         v,

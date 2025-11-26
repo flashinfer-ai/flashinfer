@@ -421,7 +421,6 @@ void TRTLLMFMHAv2Run(TensorView q, TensorView k, TensorView v, TensorView o,
   } else {
     throw std::runtime_error("Unsupported data type");
   }
-  printf("TRTLLMFMHAv2Run done\n");
   FMHA_CHECK_CUDA(cudaFree(scale_bmm2_d));
   FMHA_CHECK_CUDA(cudaFree(cu_seqlens_d));
 }

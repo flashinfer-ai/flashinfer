@@ -3554,7 +3554,7 @@ def trtllm_batch_context_with_kv_cache(
     )
 
 
-def trtllm_prefill_deepseek(
+def fmha_v2_prefill_deepseek(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,

@@ -37,7 +37,7 @@ from ..utils import (
     write_if_different,
 )
 from .utils import generate_additional_params
-from .trtllm.generate_kernels import enumerate_kernels
+from .fmha_v2.generate_kernels import enumerate_kernels
 
 
 def get_single_decode_uri(
