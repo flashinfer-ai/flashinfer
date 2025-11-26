@@ -56,6 +56,20 @@ if [ "$DRY_RUN" != "true" ]; then
         DIST_CUBIN_DIR="../dist/${CUDA_STREAM}/${JIT_ARCH_EFFECTIVE}/cubin"
         DIST_JIT_CACHE_DIR="../dist/${CUDA_STREAM}/${JIT_ARCH_EFFECTIVE}/jit-cache"
 
+        echo "==== Debug: listing artifact directories ===="
+        echo "Tree under ../dist:"
+        (cd .. && ls -al dist) || true
+        echo ""
+        echo "Tree under ../dist/${CUDA_STREAM}:"
+        (cd .. && ls -al "dist/${CUDA_STREAM}") || true
+        echo ""
+        echo "Contents of ${DIST_CUBIN_DIR}:"
+        ls -al "${DIST_CUBIN_DIR}" || true
+        echo ""
+        echo "Contents of ${DIST_JIT_CACHE_DIR}:"
+        ls -al "${DIST_JIT_CACHE_DIR}" || true
+        echo "============================================="
+
         if [ -d "${DIST_CUBIN_DIR}" ] && ls "${DIST_CUBIN_DIR}"/*.whl >/dev/null 2>&1; then
             echo "Installing flashinfer-cubin from ${DIST_CUBIN_DIR} ..."
             pip install -q "${DIST_CUBIN_DIR}"/*.whl
