@@ -30,6 +30,7 @@ class QuantMode(IntEnum):
     FP8_BLOCK_SCALE = 4
     FP8_PER_TENSOR = 5
     BF16 = 6
+    MXINT4_BF16_BF16 = 7
 
 
 def skip_checks(

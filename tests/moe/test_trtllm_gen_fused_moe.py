@@ -583,6 +583,136 @@ class FP4Moe(Moe):
 
 
 # ====================================================================================
+# MxInt4 Block Scale Quantization Implementation
+# ====================================================================================
+
+
+def mxint4_quantize(
+    x: torch.Tensor, sf_vec_size: int = 32
+) -> tuple[torch.Tensor, torch.Tensor]:
+    x_reshaped = x.reshape(-1, sf_vec_size)
+    amax = torch.abs(x_reshaped).max(dim=-1, keepdim=True)[0].to(torch.float32)
+    scales = amax / 7.0
+    x_scaled = x_reshaped * scales.reciprocal()
+    x_int8 = x_scaled.to(torch.int8).reshape(-1, sf_vec_size // 2, 2)
+    x_int4 = (x_int8[..., 0] & 0x0F) | ((x_int8[..., 1] & 0x0F) << 4)
+    return x_int4.reshape(*x.shape[:-1], x.shape[-1] // 2), scales.reshape(
+        -1, sf_vec_size
+    )
+
+
+class MxInt4BlockScaleMoe(Moe):
+    """MxInt4 MoE implementation with block scaling (DeepSeek style)."""
+
+    def quantize_weights(self, gemm1_weights, gemm2_weights, hidden_states_sample):
+        """Quantize weights to MxInt4 with block scaling."""
+        num_experts = gemm1_weights.shape[0]
+        intermediate_size = gemm1_weights.shape[1] // 2
+        hidden_size = gemm1_weights.shape[
+            2
+        ]  # [num_experts, 2*intermediate_size, hidden_size]
+
+        # Quantize weights to MxInt4
+        sf_vec_size = 16
+        gemm1_weights_int4, gemm1_scales = mxint4_quantize(gemm1_weights, sf_vec_size)
+        gemm2_weights_int4, gemm2_scales = mxint4_quantize(gemm2_weights, sf_vec_size)
+        gemm1_scales = gemm1_scales.to(torch.bfloat16).reshape(
+            num_experts,
+            2 * intermediate_size // sf_vec_size,
+            hidden_size // sf_vec_size,
+        )
+        gemm2_scales = gemm2_scales.to(torch.bfloat16).reshape(
+            num_experts, hidden_size // sf_vec_size, intermediate_size // sf_vec_size
+        )
+        return {
+            "gemm1_weights_int4": gemm1_weights_int4,
+            "gemm2_weights_int4": gemm2_weights_int4,
+            "gemm1_scales": gemm1_scales,
+            "gemm2_scales": gemm2_scales,
+        }
+
+    def prepare_static_weights_for_kernel(
+        self,
+        args_dequant,
+        args,
+        gemm1_weights_orig,
+        gemm2_weights_orig,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        weight_processing,
+    ):
+        """Prepare quantized weights for kernel (done offline with weights)."""
+
+        # TODO: is this correct for mxint4 x bf16 kernel?
+        epilogue_tile_m = 128
+
+        # TODO: should we shuffle the weights and/or scales here?
+        gemm1_weights_mxint4_shuffled = []
+        gemm2_weights_mxint4_shuffled = []
+        for i in range(num_experts):
+            # Calculate the permute indices for the following:
+            # 1. Reorder rows of W1 and scales for fused gated activation
+            # 2. Shuffle weights and scaling factors for transposed mma output
+            # for both w3_w1 and w2 weights and scale factors
+            permute_indices = _maybe_get_cached_w3_w1_permute_indices(
+                self._cache_permute_indices,
+                args.gemm1_weights[i].view(torch.uint8),
+                epilogue_tile_m,
+            )
+            gemm1_weights_shuffled = (
+                args.gemm1_weights[i]
+                .view(torch.uint8)[permute_indices.to(args.gemm1_weights.device)]
+                .contiguous()
+            )
+
+            permute_indices = get_w2_permute_indices_with_cache(
+                self._cache_permute_indices,
+                args.gemm2_weights[i].view(torch.uint8),
+                epilogue_tile_m,
+            )
+            gemm2_weights_shuffled = (
+                args.gemm2_weights[i]
+                .view(torch.uint8)[permute_indices.to(args.gemm2_weights.device)]
+                .contiguous()
+            )
+
+            block_k = 128
+            gemm1_weights_shuffled = convert_to_block_layout(
+                gemm1_weights_shuffled, block_k
+            )
+            gemm2_weights_shuffled = convert_to_block_layout(
+                gemm2_weights_shuffled, block_k
+            )
+
+            gemm1_weights_mxint4_shuffled.append(gemm1_weights_shuffled)
+            gemm2_weights_mxint4_shuffled.append(gemm2_weights_shuffled)
+
+        gemm1_weights_mxint4_shuffled = torch.stack(gemm1_weights_mxint4_shuffled)
+        gemm2_weights_mxint4_shuffled = torch.stack(gemm2_weights_mxint4_shuffled)
+
+        return {
+            "gemm1_weights": gemm1_weights_mxint4_shuffled,
+            "gemm1_scales": args.gemm1_scales,
+            "gemm2_weights": gemm2_weights_mxint4_shuffled,
+            "gemm2_scales": args.gemm2_scales,
+        }
+
+    def call_moe(
+        self, static_data, hidden_states_orig, hidden_states_scale_global, **kwargs
+    ):
+        # TODO
+        pass
+
+    def compute_reference(self, args):
+        return run_moe_reference_mxint4(args, QuantMode.MXINT4_BF16_BF16)
+
+    def get_tolerances(self):
+        """Get FP4-specific accuracy tolerances."""
+        return {"atol": 0.1, "rtol": 0.85, "percent": 0.925}
+
+
+# ====================================================================================
 # FP8 Block Scale Quantization Implementation
 # ====================================================================================
 
@@ -1726,10 +1856,7 @@ def run_moe_dequant(args, quant_mode: QuantMode):
             .to(torch.float)
         )
         args.c_global_sf = 1.0
-    elif quant_mode == QuantMode.BF16:
-        activation_output = activation_output.to(torch.bfloat16).to(torch.float)
-        args.c_global_sf = 1.0
-    else:  # mxfp4Bf16
+    else:  # Bf16, MxFp4xBf16, MxInt4xBf16
         activation_output = activation_output.to(torch.bfloat16).to(torch.float)
         args.c_global_sf = 1.0
 
@@ -1963,6 +2090,54 @@ def run_moe_reference_bf16(args):
     )
 
     return run_moe_dequant(args_dequant, QuantMode.BF16), args_dequant
+
+
+def run_moe_reference_mxint4(args):
+    sf_vec_size = 16
+
+    hidden_states_dequant = args.hidden_states.to(torch.bfloat16).to(torch.float)
+
+    num_experts = args.gemm1_weights.shape[0]
+    intermediate_size = (
+        args.gemm1_weights.shape[1] // 2
+    )  # gemm1 has 2*intermediate_size rows
+    hidden_size = (
+        args.gemm1_weights.shape[2] * 2
+    )  # packed int4, so actual hidden_size is 2x
+
+    def dequantize(weights, scales):
+        weights_int8 = torch.stack(
+            [weights & 0x0F, (weights >> 4) & 0x0F], dim=-1
+        ).reshape(num_experts, 2 * intermediate_size, hidden_size)
+        weights_float = weights_int8.to(torch.bfloat16).to(torch.float)
+        scales_expanded = (
+            scales.to(torch.bfloat16)
+            .to(torch.float)
+            .repeat_interleave(sf_vec_size, dim=-1)
+            .reshape(weights.shape)
+        )
+        return weights_float * scales_expanded
+
+    gemm1_weights_dequant = dequantize(args.gemm1_weights, args.gemm1_scales)
+    gemm2_weights_dequant = dequantize(args.gemm2_weights, args.gemm2_scales)
+
+    args_dequant = moe_args_dequant(
+        args.num_tokens,
+        args.num_experts,
+        args.hidden_size,
+        args.intermediate_size,
+        args.top_k,
+        args.padding,
+        hidden_states_dequant,
+        args.expert_logits,
+        gemm1_weights_dequant,
+        gemm2_weights_dequant,
+        args.permute_info,
+        args.use_routing_scales_on_input,
+        args.gated_act_type,
+    )
+
+    return run_moe_dequant(args_dequant, QuantMode.MXINT4_BF16_BF16), args_dequant
 
 
 def _compute_moe_actual_unified(moe_impl, args_dequant, args, **kwargs):
