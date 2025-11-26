@@ -403,7 +403,7 @@ __global__ void moeA2ADispatchKernel(
 #pragma unroll 1  // No unroll
       for (int peer_rank = lane_id; peer_rank < ep_size; peer_rank += warpSize) {
         bool flag_set = false;
-        [[maybe_unused]] clock_t s = clock64();
+        [[maybe_unused]] auto s = clock64();
         do {
           uint32_t* flag_ptr = &ptrs.completion_flags[rank_id][peer_rank];
           uint32_t flag_value;
@@ -417,7 +417,7 @@ __global__ void moeA2ADispatchKernel(
               rank_id, peer_rank, flag_value, expected_value, flag_ptr);
 #endif
           flag_set = flag_value == expected_value;
-        } while (!flag_set || check_timeout(s));
+        } while (!flag_set && !check_timeout(s));
 
         if (__builtin_expect(!flag_set, 0)) {
           printf("dispatch: ---Rank %d timed out waiting for completion flag from rank %d\n",
@@ -708,7 +708,7 @@ __global__ void moeA2ACombineKernel(
 #pragma unroll 1  // No unroll
     for (int peer_rank = lane_id; peer_rank < ep_size; peer_rank += warpSize) {
       bool flag_set = false;
-      [[maybe_unused]] clock_t s = clock64();
+      [[maybe_unused]] auto s = clock64();
       do {
         uint32_t* flag_ptr = &ptrs.completion_flags[rank_id][peer_rank];
         uint32_t flag_value;
@@ -722,7 +722,7 @@ __global__ void moeA2ACombineKernel(
             rank_id, peer_rank, flag_value, expected_value, flag_ptr);
 #endif
         flag_set = flag_value == expected_value;
-      } while (!flag_set || check_timeout(s));
+      } while (!flag_set && !check_timeout(s));
 
       if (__builtin_expect(!flag_set, 0)) {
         printf("combine: ---Rank %d timed out waiting for completion flag from rank %d\n", rank_id,
