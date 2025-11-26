@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import traceback
+import random
 
 import pytest
 import torch
@@ -249,7 +250,11 @@ def run_moe_a2a_dispatch_single_rank(
     """Worker function for MPI testing."""
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
-    torch.cuda.set_device(rank)
+
+    # get local rank
+    node_comm = comm.Split_type(MPI.COMM_TYPE_SHARED)
+    node_local_rank = node_comm.Get_rank()
+    torch.cuda.set_device(node_local_rank)
 
     check_any_rank_failed()
 
@@ -530,19 +535,19 @@ def verify_dispatch(
                     assert torch.all(token_expert_ids == invalid_token_expert_id)
 
 
-def moe_a2a_dispatch_test_impl(ep_size, all_num_tokens, top_k):
+def moe_a2a_dispatch_test_impl(distribution, top_k):
     """Test MoE A2A dispatch operation."""
-    if len(all_num_tokens) != ep_size:
-        pytest.skip(
-            f"all_num_tokens length {len(all_num_tokens)} must match ep_size {ep_size}"
-        )
-
     comm = MPI.COMM_WORLD
-    # rank = comm.Get_rank()
     world_size = comm.Get_size()
+    ep_size = world_size
 
-    if world_size != ep_size:
-        pytest.skip(f"Test requires exactly {ep_size} ranks")
+    if distribution == "random":
+        random.seed(0xD5)
+        all_num_tokens = [random.randint(1, 100) for _ in range(world_size)]
+    elif distribution == "uniform":
+        all_num_tokens = [50] * world_size
+    else:
+        pytest.skip(f"Invalid distribution: {distribution}")
 
     try:
         MnnvlMemory.initialize()
@@ -608,38 +613,37 @@ def moe_a2a_dispatch_test_impl(ep_size, all_num_tokens, top_k):
 
 
 @pytest.mark.parametrize(
-    "ep_size,all_num_tokens,top_k",
+    "distribution,top_k",
     [
-        # Basic configurations
-        (4, [32, 32, 32, 32], 2),  # Four ranks with uniform distribution
-        (4, [16, 32, 64, 48], 2),  # Four ranks with non-uniform distribution
-        (2, [100, 50], 2),  # Two ranks with different loads
-        (8, [10, 20, 30, 40, 50, 60, 70, 80], 2),  # Eight ranks with increasing load
-        # Different top_k values
-        (4, [32, 32, 32, 32], 4),  # Four ranks with top_k = 4
-        (4, [32, 32, 32, 32], 8),  # Four ranks with top_k = 8
-        # Edge cases
-        (4, [1, 1, 1, 1], 2),  # Four ranks with single token per rank
+        ("random", 1),  # topk=1 with random distribution
+        ("uniform", 1),  # topk=1 with uniform distribution
+        ("random", 2),  # topk=2 with random distribution
+        ("uniform", 2),  # topk=2 with uniform distribution
+        ("random", 8),  # topk=8 with random distribution
+        ("uniform", 8),  # topk=8 with uniform distribution
+        ("random", 64),  # topk=64 with random distribution
+        ("uniform", 64),  # topk=64 with uniform distribution
     ],
 )
-def test_moe_a2a_dispatch(ep_size, all_num_tokens, top_k):
+def test_moe_a2a_dispatch(distribution, top_k):
     """Test MoE A2A dispatch operation."""
-    safe_run(moe_a2a_dispatch_test_impl, ep_size, all_num_tokens, top_k)
+    safe_run(moe_a2a_dispatch_test_impl, distribution, top_k)
 
 
-def moe_a2a_dispatch_moe_combine_test_impl(ep_size, all_num_tokens, top_k):
+def moe_a2a_dispatch_moe_combine_test_impl(distribution, top_k):
     """Test full MoE A2A dispatch + expert processing + combine cycle."""
-    if len(all_num_tokens) != ep_size:
-        pytest.skip(
-            f"all_num_tokens length {len(all_num_tokens)} must match ep_size {ep_size}"
-        )
 
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     world_size = comm.Get_size()
+    ep_size = world_size
 
-    if world_size != ep_size:
-        pytest.skip(f"Test requires exactly {ep_size} ranks")
+    if distribution == "random":
+        all_num_tokens = [random.randint(1, 100) for _ in range(world_size)]
+    elif distribution == "uniform":
+        all_num_tokens = [50] * world_size
+    else:
+        pytest.skip(f"Invalid distribution: {distribution}")
 
     try:
         MnnvlMemory.initialize()
@@ -648,7 +652,10 @@ def moe_a2a_dispatch_moe_combine_test_impl(ep_size, all_num_tokens, top_k):
     except Exception:
         pytest.skip("MNNVL not supported on this system")
 
-    torch.cuda.set_device(rank)
+    # get local rank
+    node_comm = comm.Split_type(MPI.COMM_TYPE_SHARED)
+    node_local_rank = node_comm.Get_rank()
+    torch.cuda.set_device(node_local_rank)
 
     check_any_rank_failed()
 
@@ -767,19 +774,21 @@ def moe_a2a_dispatch_moe_combine_test_impl(ep_size, all_num_tokens, top_k):
 
 
 @pytest.mark.parametrize(
-    "ep_size,all_num_tokens,top_k",
+    "distribution,top_k",
     [
-        (4, [32, 32, 32, 32], 2),
-        (4, [16, 32, 64, 48], 2),
-        (2, [100, 50], 2),
-        (4, [32, 32, 32, 32], 4),
-        (4, [1, 1, 1, 1], 2),
-        (8, [640, 640, 640, 640, 640, 640, 640, 640], 4),
+        ("random", 1),  # topk=1 with random distribution
+        ("uniform", 1),  # topk=1 with uniform distribution
+        ("random", 2),  # topk=2 with random distribution
+        ("uniform", 2),  # topk=2 with uniform distribution
+        ("random", 8),  # topk=8 with random distribution
+        ("uniform", 8),  # topk=8 with uniform distribution
+        ("random", 64),  # topk=64 with random distribution
+        ("uniform", 64),  # topk=64 with uniform distribution
     ],
 )
-def test_moe_a2a_dispatch_moe_combine(ep_size, all_num_tokens, top_k):
+def test_moe_a2a_dispatch_moe_combine(distribution, top_k):
     """Test full MoE A2A dispatch + expert processing + combine cycle."""
-    safe_run(moe_a2a_dispatch_moe_combine_test_impl, ep_size, all_num_tokens, top_k)
+    safe_run(moe_a2a_dispatch_moe_combine_test_impl, distribution, top_k)
 
 
 if __name__ == "__main__":
