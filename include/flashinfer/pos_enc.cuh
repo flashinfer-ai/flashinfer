@@ -1297,6 +1297,67 @@ cudaError_t BatchQKApplyRotaryPosIdsCosSinCache(
     FLASHINFER_ERROR(err_msg.str());
   }
 
+  // We have better performance with this kernel with these head_dim instead of RopeQuantize
+  if (head_dim == 64 || head_dim == 128 || head_dim == 256 || head_dim == 512) {
+    int dev_id = 0;
+    int num_sms = 0;
+    FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
+    FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev_id));
+
+    DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
+      DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
+        // operate on 16 Bytes at a time
+        constexpr uint32_t vec_size = std::max(16 / sizeof(DType), HEAD_DIM / 32);
+        // how many threads needed per head_dim
+        constexpr uint32_t bdx = HEAD_DIM / vec_size;
+        // how many threads needed per block
+        uint32_t num_threads = std::max(128U, bdx);
+        // how many tokens can we process in a block
+        uint32_t bdy = num_threads / bdx;
+        // how many blocks needed to process all tokens
+        uint32_t nblks_x = (nnz + bdy - 1) / bdy;
+        void* args[] = {(void*)&q,
+                        (void*)&k,
+                        (void*)&q_rope,
+                        (void*)&k_rope,
+                        (void*)&cos_sin_cache,
+                        (void*)&pos_ids,
+                        (void*)&nnz,
+                        (void*)&num_qo_heads,
+                        (void*)&num_kv_heads,
+                        (void*)&rotary_dim,
+                        (void*)&q_stride_n,
+                        (void*)&q_stride_h,
+                        (void*)&k_stride_n,
+                        (void*)&k_stride_h,
+                        (void*)&q_rope_stride_n,
+                        (void*)&q_rope_stride_h,
+                        (void*)&k_rope_stride_n,
+                        (void*)&k_rope_stride_h};
+        auto kernel_0 = BatchQKApplyRotaryPosIdsCosSinCacheKernel<INTERLEAVE, HEAD_DIM, vec_size,
+                                                                  bdx, DType, IdType>;
+
+        int num_blocks_per_sm_0 = 0;
+        FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &num_blocks_per_sm_0, kernel_0, num_threads, /*smem_size=*/0));
+        uint32_t num_ctas_0 = num_blocks_per_sm_0 * num_sms;
+
+        if ((nnz + bdy - 1) / bdy >= num_ctas_0) {
+          dim3 nblks(nblks_x);
+          dim3 nthrs(bdx, bdy);
+          FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel_0, nblks, nthrs, args, 0, stream));
+        } else {
+          dim3 nblks(nblks_x, num_qo_heads + num_kv_heads);
+          dim3 nthrs(bdx, bdy);
+          auto kernel_1 = BatchQKApplyRotaryPosIdsCosSinCacheHeadParallelismKernel<
+              INTERLEAVE, HEAD_DIM, vec_size, bdx, DType, IdType>;
+          FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel_1, nblks, nthrs, args, 0, stream));
+        }
+      });
+    });
+    return cudaSuccess;
+  }
+
   const uint32_t rope_dim = rotary_dim;
   const uint32_t no_rope_dim = head_dim - rotary_dim;
 
