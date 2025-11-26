@@ -33,13 +33,9 @@ class MNNVLAllreduceFusionStrategy(Enum):
     AUTO = 99
 
     @staticmethod
-<<<<<<< HEAD
-    def is_one_shot(tp_size: int, num_tokens: int, hidden_dim: int, dtype: torch.dtype) -> bool:
-=======
     def select_strategy(
         tp_size: int, num_tokens: int, hidden_dim: int, dtype: torch.dtype
     ) -> "MNNVLAllreduceFusionStrategy":
->>>>>>> c6ed1472 (Address review comments.)
         elem_size = torch.tensor([], dtype=dtype).element_size()
         if num_tokens * hidden_dim * tp_size * elem_size <= MNNVL_ONE_SHOT_THRESHOLD:
             return MNNVLAllreduceFusionStrategy.ONESHOT
@@ -72,7 +68,9 @@ class MNNVLAllreduceFusionWorkspace:
             buffer_size_in_bytes = 16 * (1024**2)
         else:
             # Round up to the nearest multiple of 8MB
-            buffer_size_in_bytes = math.ceil(buffer_size_in_bytes / (8 * (1024**2))) * (8 * (1024**2))
+            buffer_size_in_bytes = math.ceil(buffer_size_in_bytes / (8 * (1024**2))) * (
+                8 * (1024**2)
+            )
         if comm_backend is None:
             comm_backend = MPIBackend()
         if buffer_size_in_bytes > (2**32 - 1):
@@ -166,25 +164,20 @@ class MNNVLAllreduceFusionWorkspace:
         Calculate the required buffer size for a given problem size.
         """
         elem_size = torch.tensor([], dtype=dtype).element_size()
-<<<<<<< HEAD
-        is_one_shot = MNNVLAllreduceFusionStrategy.is_one_shot(tp_size, num_tokens, hidden_dim, dtype)
-        if strategy == MNNVLAllreduceFusionStrategy.ONESHOT or (
-            strategy == MNNVLAllreduceFusionStrategy.AUTO and is_one_shot
-        ):
-=======
         if strategy == MNNVLAllreduceFusionStrategy.AUTO:
             strategy = MNNVLAllreduceFusionStrategy.select_strategy(
                 tp_size, num_tokens, hidden_dim, dtype
             )
 
         if strategy == MNNVLAllreduceFusionStrategy.ONESHOT:
->>>>>>> c6ed1472 (Address review comments.)
             # For one-shot, each rank needs to store num_tokens * tp_size tokens
             buffer_size = num_tokens * hidden_dim * tp_size * elem_size
         else:
             # For two-shot, each rank stores a slices of tokens. We need to round up to the nearest tp_size.
             # 2 Stage is required for the two-shot allreduce.
-            buffer_size = 2 * math.ceil(num_tokens / tp_size) * tp_size * hidden_dim * elem_size
+            buffer_size = (
+                2 * math.ceil(num_tokens / tp_size) * tp_size * hidden_dim * elem_size
+            )
         return buffer_size
 
 
@@ -302,21 +295,19 @@ def trtllm_mnnvl_allreduce(
 
     # Check ndims here as the shape check is done in the kernel launch code.
     if len(input.shape) != 2:
-        raise ValueError(f"The input tensor must be 2D, got {len(input.shape)}D. The shape is {input.shape}.")
+        raise ValueError(
+            f"The input tensor must be 2D, got {len(input.shape)}D. The shape is {input.shape}."
+        )
 
     if output is None:
         output = torch.empty_like(input)
     elif len(output.shape) != 2:
-        raise ValueError(f"The output tensor must be 2D, got {len(output.shape)}D. The shape is {output.shape}.")
+        raise ValueError(
+            f"The output tensor must be 2D, got {len(output.shape)}D. The shape is {output.shape}."
+        )
 
     module = get_trtllm_mnnvl_comm_module()
 
-<<<<<<< HEAD
-    use_oneshot = strategy == MNNVLAllreduceFusionStrategy.ONESHOT or (
-        strategy == MNNVLAllreduceFusionStrategy.AUTO
-        and MNNVLAllreduceFusionStrategy.is_one_shot(workspace.tp_size, input.shape[0], input.shape[1], input.dtype)
-    )
-=======
     if strategy == MNNVLAllreduceFusionStrategy.AUTO:
         strategy = MNNVLAllreduceFusionStrategy.select_strategy(
             workspace.tp_size, input.shape[0], input.shape[1], input.dtype
@@ -329,7 +320,6 @@ def trtllm_mnnvl_allreduce(
             f"The buffer size in the given workspace is insufficient for the given problem size. Buffer: {workspace.buffer_size_bytes} bytes, Required: {workspace.get_required_buffer_size_bytes(workspace.tp_size, input.shape[0], input.shape[1], input.dtype, strategy)} bytes."
         )
 
->>>>>>> c6ed1472 (Address review comments.)
     module.trtllm_mnnvl_allreduce_fusion(
         input,
         workspace.mc_ptr,
@@ -388,7 +378,9 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm(
         epsilon = torch.finfo(input.dtype).eps
 
     if len(input.shape) != 2:
-        raise ValueError(f"The input tensor must be 2D, got {len(input.shape)}D. The shape is {input.shape}.")
+        raise ValueError(
+            f"The input tensor must be 2D, got {len(input.shape)}D. The shape is {input.shape}."
+        )
     if len(residual_in.shape) != 2:
         raise ValueError(
             f"The residual input tensor must be 2D, got {len(residual_in.shape)}D. The shape is {residual_in.shape}."
@@ -400,7 +392,9 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm(
     if output is None:
         output = torch.empty_like(input)
     elif len(output.shape) != 2:
-        raise ValueError(f"The output tensor must be 2D, got {len(output.shape)}D. The shape is {output.shape}.")
+        raise ValueError(
+            f"The output tensor must be 2D, got {len(output.shape)}D. The shape is {output.shape}."
+        )
     if residual_out is None:
         residual_out = torch.empty_like(residual_in)
     elif len(residual_out.shape) != 2:
@@ -478,13 +472,17 @@ def get_allreduce_mnnvl_workspace(
     # LCM for hidden_dim: 2048, 4096, 5120, 7168, 8192 = 286720
     # max_num_elements must be a multiple of 286720
     lcm_hidden_dim = 286720
-    TARGET_WORKSPACE_SIZE_BYTES = buffer_size_in_bytes if buffer_size_in_bytes is not None else 12_000_000
-    buffer_size_in_bytes = math.ceil(TARGET_WORKSPACE_SIZE_BYTES / (lcm_hidden_dim * stride)) * (
-        lcm_hidden_dim * stride
+    TARGET_WORKSPACE_SIZE_BYTES = (
+        buffer_size_in_bytes if buffer_size_in_bytes is not None else 12_000_000
     )
+    buffer_size_in_bytes = math.ceil(
+        TARGET_WORKSPACE_SIZE_BYTES / (lcm_hidden_dim * stride)
+    ) * (lcm_hidden_dim * stride)
 
     # Redirect to the new workspace allocation logic. The new kernel needs the new flag buffer layout.
-    workspace = MNNVLAllreduceFusionWorkspace(mapping, buffer_size_in_bytes, comm_backend_for_handle_transfer)
+    workspace = MNNVLAllreduceFusionWorkspace(
+        mapping, buffer_size_in_bytes, comm_backend_for_handle_transfer
+    )
 
     mcast_buffer = workspace.mcast_buffer_handle
     buffer_flags = workspace.buffer_flags
@@ -537,7 +535,9 @@ def trtllm_mnnvl_all_reduce(
     """
 
     if len(inp.shape) != 2:
-        raise ValueError(f"The input tensor must be 2D, got {len(inp.shape)}D. The shape is {inp.shape}.")
+        raise ValueError(
+            f"The input tensor must be 2D, got {len(inp.shape)}D. The shape is {inp.shape}."
+        )
 
     # buffer_M is no longer used in this kernel but let's keep this check for consistency in behavior.
     if inp.shape[0] > buffer_M:
@@ -546,9 +546,9 @@ def trtllm_mnnvl_all_reduce(
         )
 
     # Even in legacy code, this should only be used when we implement the fused allreduce+rmsnorm.
-    assert wait_for_results and (
-        out is not None
-    ), "Calling the legacy trtllm_mnnvl_all_reduce with wait_for_results=False is not supported. Please use trtllm_mnnvl_allreduce instead."
+    assert wait_for_results and (out is not None), (
+        "Calling the legacy trtllm_mnnvl_all_reduce with wait_for_results=False is not supported. Please use trtllm_mnnvl_allreduce instead."
+    )
     module = get_trtllm_mnnvl_comm_module()
     module.trtllm_mnnvl_allreduce_fusion(
         inp,
