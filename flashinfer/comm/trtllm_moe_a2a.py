@@ -14,7 +14,7 @@ from typing import Optional
 import torch
 import functools
 
-from .mnnvl import MnnvlMemory
+from .mnnvl import MnnvlMemory, MnnvlConfig
 from .mapping import Mapping
 from ..jit.comm import gen_mnnvl_a2a_module
 from ..utils import register_custom_op
@@ -346,6 +346,7 @@ class MoeAlltoAll:
         top_k: int,
         num_experts: int,
         workspace_size_per_rank: int = 512 * 1024 * 1024,
+        mnnvl_config: Optional[MnnvlConfig] = None,
     ):
         """
         Initialize MoeAlltoAll with workspace allocation.
@@ -362,6 +363,8 @@ class MoeAlltoAll:
 
         # Initialize MNNVL memory system
         MnnvlMemory.initialize()
+        if mnnvl_config:
+            MnnvlMemory.set_comm_from_config(mapping, mnnvl_config)  # type: ignore[attr-defined]
 
         self.workspace_size_per_rank = workspace_size_per_rank
         self.max_num_tokens = max_num_tokens
