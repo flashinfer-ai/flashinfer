@@ -61,9 +61,9 @@ class DynamicTensorSpec:
         # Set default tensor_initializers if not provided
         if self.tensor_initializers is None:
             self.tensor_initializers = [
-                lambda shapes, dtype, device: torch.randn(shapes, device=device).to(
-                    dtype
-                )
+                lambda shapes, dtype, device: (
+                    torch.rand(shapes, device=device) * 10 - 5
+                ).to(dtype)
                 for _ in range(len(self.input_idx))
             ]
 
@@ -458,6 +458,13 @@ class AutoTuner:
         # Record the total configs to try
         self.stats.tuned_op_total_configs[custom_op] = len(profiles)
 
+        # Pre-compute runner arg names to avoid calling inspect.signature in the loop
+        runner_arg_names_map = {}
+        for r in runners:
+            runner_arg_names_map[r] = {
+                param.name for param in inspect.signature(r.forward).parameters.values()
+            }
+
         for p in profiles:
             tensors = self._prepare_input_tensors(p, inputs)
             is_cache_hit, runner_id, tactic, _ = self.search_cache(
@@ -470,9 +477,7 @@ class AutoTuner:
                 for r_id, r in enumerate(runners):
                     # TODO: use FakeTensor here.
                     valid_tactics = r.get_valid_tactics(tensors, p)
-                    runner_arg_names = {
-                        p.name for p in inspect.signature(r.forward).parameters.values()
-                    }
+                    runner_arg_names = runner_arg_names_map[r]
                     if "do_preparation" in runner_arg_names and len(valid_tactics) > 0:
                         r(tensors, tactic=-1, do_preparation=True, **kwargs)
                     for tac in valid_tactics:
@@ -761,8 +766,8 @@ class AutoTuner:
     def _prepare_input_tensors(
         self, profile: OptimizationProfile, inputs: List[torch.Tensor]
     ) -> List[torch.Tensor]:
-        default_initializer = lambda shapes, dtype, device: torch.rand(
-            shapes, device=device
+        default_initializer = lambda shapes, dtype, device: (
+            torch.rand(shapes, device=device) * 10 - 5
         ).to(dtype)
         tensors = []
         for i, p in enumerate(profile.shapes):

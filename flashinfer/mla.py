@@ -19,6 +19,7 @@ from typing import Literal, Optional, Tuple, Union, overload
 
 import torch
 
+from .api_logging import flashinfer_api
 from .jit import gen_batch_mla_module
 from .jit.mla import gen_mla_module
 from .utils import MaskMode, check_shape_dtype_device, determine_mla_backend
@@ -129,6 +130,7 @@ class BatchMLAPagedAttentionWrapper:
     torch.Size([114, 128, 512])
     """
 
+    @flashinfer_api
     def __init__(
         self,
         float_workspace_buffer: torch.Tensor,
@@ -199,6 +201,7 @@ class BatchMLAPagedAttentionWrapper:
         else:
             self._backend = backend
 
+    @flashinfer_api
     def plan(
         self,
         qo_indptr: torch.Tensor,
@@ -314,6 +317,7 @@ class BatchMLAPagedAttentionWrapper:
         profiler_buffer: Optional[torch.Tensor] = None,
         kv_len: Optional[torch.Tensor] = None,
         page_table: Optional[torch.Tensor] = None,
+        return_lse_base_on_e: bool = False,
     ) -> torch.Tensor: ...
 
     @overload
@@ -329,8 +333,10 @@ class BatchMLAPagedAttentionWrapper:
         profiler_buffer: Optional[torch.Tensor] = None,
         kv_len: Optional[torch.Tensor] = None,
         page_table: Optional[torch.Tensor] = None,
+        return_lse_base_on_e: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
+    @flashinfer_api
     def run(
         self,
         q_nope: torch.Tensor,
@@ -343,6 +349,7 @@ class BatchMLAPagedAttentionWrapper:
         profiler_buffer: Optional[torch.Tensor] = None,
         kv_len: Optional[torch.Tensor] = None,
         page_table: Optional[torch.Tensor] = None,
+        return_lse_base_on_e: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Run the MLA attention computation.
 
@@ -441,6 +448,7 @@ class BatchMLAPagedAttentionWrapper:
             num_heads,
             page_size,
             sm_scale,
+            return_lse_base_on_e,
             *profiler_args,
         )
 

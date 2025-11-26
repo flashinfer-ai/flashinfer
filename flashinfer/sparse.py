@@ -473,6 +473,7 @@ class BlockSparseAttentionWrapper:
             if self._backend == "fa2":
                 args.append(-1)  # fixed_split_size
                 args.append(False)  # disable_split_kv
+                args.append(0)  # num_colocated_ctas
             self._plan_info = self._cached_module.plan(
                 *args,
             )
@@ -1062,6 +1063,7 @@ class VariableBlockSparseAttentionWrapper:
         if self._backend == "fa2":
             args.append(-1)  # fixed_split_size
             args.append(False)  # disable_split_kv
+            args.append(0)  # num_colocated_ctas
         self._plan_info = self._cached_module.plan(
             *args,
         )

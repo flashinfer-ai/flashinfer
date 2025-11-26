@@ -180,7 +180,6 @@ def test_trtllm_gen_routed_fused_moe(
         0,  # local_expert_offset
         num_experts,
         None,  # routed_scaling_factor
-        None,  # tile_tokens_dim
         routing_method_type.value,
         True,  # do_finalize
         enable_pdl,
@@ -234,7 +233,6 @@ def test_trtllm_gen_routed_fused_moe(
         0,  # local_expert_offset
         num_experts,
         None,  # routed_scaling_factor
-        None,  # tile_tokens_dim
         routing_method_type.value,
         True,  # do_finalize
         enable_pdl,

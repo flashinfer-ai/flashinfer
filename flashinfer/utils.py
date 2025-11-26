@@ -21,6 +21,7 @@ from typing import Callable, Dict, Iterable, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.version
+import pynvml
 from torch.torch_version import TorchVersion
 from torch.torch_version import __version__ as torch_version
 import inspect
@@ -253,6 +254,46 @@ def get_compute_capability(device: torch.device) -> Tuple[int, int]:
     if device.type != "cuda":
         raise ValueError("device must be a cuda device")
     return torch.cuda.get_device_capability(device.index)
+
+
+@functools.cache
+def get_gpu_memory_bandwidth(device: torch.device) -> float:
+    """
+    Get GPU memory bandwidth in GB/s for the specified CUDA device.
+
+    Args:
+        device: torch.device object, e.g., torch.device('cuda:0')
+
+    Returns:
+        float: GPU memory bandwidth (GB/s)
+
+    Raises:
+        ValueError: If device is not a CUDA device
+    """
+    # Convert to torch.device object if string is passed
+    if isinstance(device, str):
+        device = torch.device(device)
+
+    # Check if it's a CUDA device
+    if device.type != "cuda":
+        raise ValueError(f"Device must be a CUDA device, got {device}")
+
+    # Get device index
+    device_index = device.index if device.index is not None else 0
+
+    # Use pynvml to get bandwidth
+    pynvml.nvmlInit()
+    try:
+        handle = pynvml.nvmlDeviceGetHandleByIndex(device_index)
+        bus_width = pynvml.nvmlDeviceGetMemoryBusWidth(handle)
+        mem_clock = pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_MEM)
+
+        # Calculate theoretical peak bandwidth (GB/s)
+        bandwidth = (mem_clock * bus_width * 2) / 8 / 1000
+
+        return bandwidth
+    finally:
+        pynvml.nvmlShutdown()
 
 
 def _check_cached_qkv_data_type(
@@ -880,6 +921,13 @@ def backend_requirement(
         backends. Should accept the same arguments as the decorated function and return
         True if requirements are met, False otherwise.
         In the case where the kernel function does not have any specific backends, this can be decorated with @supported_compute_capability to specify the function's supported compute capabilities.
+    heuristic_func : callable, optional
+        A function that performs heuristic backend selection when backend is "auto".
+        Must be provided if backend is "auto". Does not do anything if backend is not "auto".
+        Should accept the same arguments as the decorated function.
+        Should return an ordered list of runnable backends with the most preferred backend first.
+        When decorated function is not autotuned, the first backend in the heuristic list will be run.
+        When decorated function is autotuned, the backends in the heuristic list will be autotuned over to find the best backend.
 
     Returns
     -------
@@ -1035,8 +1083,8 @@ def backend_requirement(
                 except ValueError:
                     continue
             # If a heuristic function is provided, filter the suitable backends based on the heuristic function
-            if heuristic_func is not None:
-                suitable_backends = heuristic_func(suitable_backends, *args, **kwargs)
+            assert heuristic_func is not None, "Heuristic function must be provided"
+            suitable_backends = heuristic_func(suitable_backends, *args, **kwargs)
             if not suitable_backends:
                 return False
             wrapper.suitable_auto_backends = suitable_backends
