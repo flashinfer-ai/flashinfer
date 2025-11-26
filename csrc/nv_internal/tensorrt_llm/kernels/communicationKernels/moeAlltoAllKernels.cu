@@ -29,6 +29,9 @@ namespace tensorrt_llm::kernels::mnnvl_throughput {
 
 #define ENABLE_DEBUG_PRINT 0
 #define DISABLE_SYNC_FOR_PROFILING 0
+#ifndef DISABLE_TIMEOUT
+#define DISABLE_TIMEOUT 0
+#endif
 
 // Helper function for ceiling division
 template <typename T>
@@ -103,6 +106,13 @@ __host__ __device__ inline T ceilDiv(T m, T n) {
     using POLICY = WarpPolicy;                          \
     __VA_ARGS__                                         \
   }
+
+#if DISABLE_TIMEOUT
+#define check_timeout(s) false
+#else
+// 300 * 2000 MHz - should be high enough on any GPU but will prevent a hang
+#define check_timeout(s) ((clock64() - (s)) > (300ll * 2000ll * 1000ll * 1000ll))
+#endif
 
 // ============================================================================
 // Helper Functions for Expert-to-Rank Mapping
@@ -393,6 +403,7 @@ __global__ void moeA2ADispatchKernel(
 #pragma unroll 1  // No unroll
       for (int peer_rank = lane_id; peer_rank < ep_size; peer_rank += warpSize) {
         bool flag_set = false;
+        [[maybe_unused]] clock_t s = clock64();
         do {
           uint32_t* flag_ptr = &ptrs.completion_flags[rank_id][peer_rank];
           uint32_t flag_value;
@@ -406,7 +417,14 @@ __global__ void moeA2ADispatchKernel(
               rank_id, peer_rank, flag_value, expected_value, flag_ptr);
 #endif
           flag_set = flag_value == expected_value;
-        } while (!flag_set);
+        } while (!flag_set || check_timeout(s));
+
+        if (__builtin_expect(!flag_set, 0)) {
+          printf("dispatch: ---Rank %d timed out waiting for completion flag from rank %d\n",
+                 rank_id, peer_rank);
+          asm volatile("trap;");
+          return;
+        }
       }
       // asm volatile("fence.acquire.sys;");
 #endif
@@ -690,6 +708,7 @@ __global__ void moeA2ACombineKernel(
 #pragma unroll 1  // No unroll
     for (int peer_rank = lane_id; peer_rank < ep_size; peer_rank += warpSize) {
       bool flag_set = false;
+      [[maybe_unused]] clock_t s = clock64();
       do {
         uint32_t* flag_ptr = &ptrs.completion_flags[rank_id][peer_rank];
         uint32_t flag_value;
@@ -703,7 +722,14 @@ __global__ void moeA2ACombineKernel(
             rank_id, peer_rank, flag_value, expected_value, flag_ptr);
 #endif
         flag_set = flag_value == expected_value;
-      } while (!flag_set);
+      } while (!flag_set || check_timeout(s));
+
+      if (__builtin_expect(!flag_set, 0)) {
+        printf("combine: ---Rank %d timed out waiting for completion flag from rank %d\n", rank_id,
+               peer_rank);
+        asm volatile("trap;");
+        return;
+      }
     }
     asm volatile("fence.acquire.sys;");
   }
