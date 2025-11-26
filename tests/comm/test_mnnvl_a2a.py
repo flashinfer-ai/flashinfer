@@ -530,7 +530,7 @@ def verify_dispatch(
                     assert torch.all(token_expert_ids == invalid_token_expert_id)
 
 
-def test_moe_a2a_dispatch_impl(ep_size, all_num_tokens, top_k):
+def moe_a2a_dispatch_test_impl(ep_size, all_num_tokens, top_k):
     """Test MoE A2A dispatch operation."""
     if len(all_num_tokens) != ep_size:
         pytest.skip(
@@ -624,10 +624,10 @@ def test_moe_a2a_dispatch_impl(ep_size, all_num_tokens, top_k):
 )
 def test_moe_a2a_dispatch(ep_size, all_num_tokens, top_k):
     """Test MoE A2A dispatch operation."""
-    safe_run(test_moe_a2a_dispatch_impl, ep_size, all_num_tokens, top_k)
+    safe_run(moe_a2a_dispatch_test_impl, ep_size, all_num_tokens, top_k)
 
 
-def test_moe_a2a_dispatch_moe_combine_impl(ep_size, all_num_tokens, top_k):
+def moe_a2a_dispatch_moe_combine_test_impl(ep_size, all_num_tokens, top_k):
     """Test full MoE A2A dispatch + expert processing + combine cycle."""
     if len(all_num_tokens) != ep_size:
         pytest.skip(
@@ -779,7 +779,7 @@ def test_moe_a2a_dispatch_moe_combine_impl(ep_size, all_num_tokens, top_k):
 )
 def test_moe_a2a_dispatch_moe_combine(ep_size, all_num_tokens, top_k):
     """Test full MoE A2A dispatch + expert processing + combine cycle."""
-    safe_run(test_moe_a2a_dispatch_moe_combine_impl, ep_size, all_num_tokens, top_k)
+    safe_run(moe_a2a_dispatch_moe_combine_test_impl, ep_size, all_num_tokens, top_k)
 
 
 if __name__ == "__main__":
