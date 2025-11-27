@@ -8,7 +8,6 @@ from mpi4py import MPI  # Added MPI import
 
 import flashinfer.comm.trtllm_mnnvl_ar as trtllm_mnnvl_ar
 from flashinfer.comm.mapping import Mapping
-from flashinfer.comm.mnnvl import CommBackend, MpiComm
 
 # Use flashinfer.norm.rmsnorm as reference implementation.
 from flashinfer.norm import rmsnorm
@@ -26,15 +25,7 @@ def row_linear_residual_norm_fusion_forward(
     workspace: trtllm_mnnvl_ar.MNNVLAllreduceFusionWorkspace,
 ):
     tensor_parallel_rank = mapping.tp_rank
-<<<<<<< HEAD
-    if comm_backend_for_handle_transfer is None:
-        comm = MpiComm()
-    else:
-        comm = comm_backend_for_handle_transfer
-    comm.barrier()
-=======
     MPI.COMM_WORLD.barrier()
->>>>>>> bca4f5d9 (Passing the test.)
 
     def func(
         input,
@@ -322,19 +313,12 @@ def run_mnnvl_ar_full(
     torch.cuda.set_device(mapping.local_rank)
 
     if mapping.local_rank == 0:
-<<<<<<< HEAD
-        print(f"[Node {mapping.node_rank}] Running MNNVL AllReduce test with {world_size} ranks")
-        print(f"[Node {mapping.node_rank}] Rank {rank} using GPU {torch.cuda.current_device()}")
-
-    tensor_parallel_size = world_size
-=======
         print(
             f"[Node {mapping.node_rank}] Running MNNVL AllReduce test with {world_size} ranks"
         )
         print(
             f"[Node {mapping.node_rank}] Rank {rank} using GPU {torch.cuda.current_device()}"
         )
->>>>>>> bca4f5d9 (Passing the test.)
     eps = 1e-5
     torch.manual_seed(42 + rank)
 
@@ -380,37 +364,6 @@ def run_mnnvl_ar_full(
         # Test each sequence length with the same workspace (reusing allocated buffers within this list)
         for seq_len, x, residual, norm_weight, reference_output in test_data:
             if rank == 0:
-<<<<<<< HEAD
-                print(f"Testing seq_len={seq_len}, hidden_size={hidden_size}, fusion={fusion}, dtype={dtype}")
-                print(f"[Rank {rank}] Buffer flags: {workspace.buffer_flags}")
-
-            # Generate test data (same on all ranks due to same seed)
-            x_full = torch.randn(
-                (tensor_parallel_size, seq_len, hidden_size),
-                dtype=dtype,
-                device=torch.device("cuda"),
-            )
-            residual = torch.randn((seq_len, hidden_size), dtype=dtype, device=torch.device("cuda"))
-            norm_weight = torch.randn((hidden_size,), dtype=dtype, device=torch.device("cuda"))
-
-            # Each rank gets its slice of the input
-            x = x_full[rank, :, :]
-
-            # Compute reference output based on fusion mode
-            reference_output: Tuple[torch.Tensor, ...] = None
-            if fusion:
-                # Fused case: AllReduce + Residual Add + RMS Norm
-                allreduce_result = torch.sum(x_full, dim=0)  # AllReduce result
-                residual_out = allreduce_result + residual  # Add residual
-                print("Device of residual_out:{}, norm_weight:{}".format(residual_out.device, norm_weight.device))
-                norm_out = rmsnorm(residual_out, norm_weight, eps, enable_pdl=False)
-
-                reference_output = (norm_out, residual_out)
-            else:
-                # Non-fused case: Only AllReduce
-                allreduce_result = torch.sum(x_full, dim=0)  # AllReduce result
-                reference_output = (allreduce_result,)
-=======
                 print(
                     f"Testing seq_len={seq_len}, hidden_size={hidden_size}, fusion={fusion}, dtype={dtype}"
                 )
@@ -446,7 +399,9 @@ def run_mnnvl_ar_full(
             # Synchronize before next test
             trtllm_mnnvl_ar.mpi_barrier()
 
-            print(f"PASSED[rank={rank}]: seq_len={seq_len}, fusion={fusion}, dtype={dtype}")
+            print(
+                f"PASSED[rank={rank}]: seq_len={seq_len}, fusion={fusion}, dtype={dtype}"
+            )
 
     except Exception as e:
         rank_failed = True
