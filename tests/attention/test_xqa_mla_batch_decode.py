@@ -49,8 +49,8 @@ def test_xqa_mla_batch_decode(
         device=device,
     ).to(dtype)
 
-    num_tokens = max_seq_len * batch_size
-    num_blocks = (num_tokens + page_size - 1) // page_size
+    num_blocks_per_seq = (max_seq_len + page_size - 1) // page_size
+    num_blocks = num_blocks_per_seq * batch_size
 
     # Sequence lengths and block tables
     seq_lens = [torch.randint(1, max_seq_len, (1,)).item() for _ in range(batch_size)]

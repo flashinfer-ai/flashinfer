@@ -32,8 +32,8 @@ void BatchMLAPagedAttentionSM90Run(TensorView float_workspace_buffer,
                                    TensorView q_nope, TensorView q_pe, TensorView ckv_cache,
                                    TensorView kpe_cache, TensorView kv_indices, TensorView o,
                                    Optional<TensorView> maybe_lse, int64_t mask_mode_code,
-                                   int64_t num_heads, int64_t page_size,
-                                   double sm_scale ADDITIONAL_FUNC_PARAMS);
+                                   int64_t num_heads, int64_t page_size, double sm_scale,
+                                   bool return_lse_base_on_e ADDITIONAL_FUNC_PARAMS);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(plan, BatchMLAPagedAttentionSM90Plan);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, BatchMLAPagedAttentionSM90Run);

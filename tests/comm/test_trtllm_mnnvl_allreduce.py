@@ -1,5 +1,5 @@
 # Check torch version:
-from typing import Tuple
+from typing import Tuple, Optional
 
 import pytest
 import torch
@@ -7,6 +7,7 @@ from mpi4py import MPI  # Added MPI import
 
 import flashinfer.comm.trtllm_mnnvl_ar as trtllm_mnnvl_ar
 from flashinfer.comm.mapping import Mapping
+from flashinfer.comm.mnnvl import CommBackend, MpiComm
 
 # Use flashinfer.norm.rmsnorm as reference implementation.
 from flashinfer.norm import rmsnorm
@@ -28,6 +29,7 @@ def row_linear_residual_norm_fusion_forward(
     unicast_ptr: int,
     max_num_elements_mnnvl: int,
     buffer_flags_mnnvl: torch.Tensor,
+    comm_backend_for_handle_transfer: Optional[CommBackend] = None,
 ):
     x = x.cuda()
     residual = residual.cuda()
@@ -36,8 +38,11 @@ def row_linear_residual_norm_fusion_forward(
 
     tensor_parallel_size = mapping.tp_size
     tensor_parallel_rank = mapping.tp_rank
-
-    MPI.COMM_WORLD.barrier()
+    if comm_backend_for_handle_transfer is None:
+        comm = MpiComm()
+    else:
+        comm = comm_backend_for_handle_transfer
+    comm.barrier()
 
     def func(
         input,

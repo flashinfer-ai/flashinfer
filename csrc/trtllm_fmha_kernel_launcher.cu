@@ -82,8 +82,8 @@ void trtllm_paged_attention_launcher(
     int64_t kv_stride_heads, int64_t kv_stride_batch, int64_t max_num_blocks_per_seq,
     double bmm1_scale, double bmm2_scale, const float* bmm1_scale_log2_ptr,
     const float* bmm2_scale_ptr, double o_sf_scale, int64_t o_sf_vec_size, int64_t o_sf_start_index,
-    int64_t window_left, int64_t sum_seq_q, int64_t sm_count, bool enable_pdl,
-    int64_t workspace_size, cudaStream_t stream) {
+    int64_t window_left, int64_t sum_seq_q, int64_t sparse_mla_top_k, int64_t sm_count,
+    bool enable_pdl, int64_t workspace_size, cudaStream_t stream) {
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads must be a multiple of num_kv_heads, got num_kv_heads: " << num_kv_heads
@@ -138,6 +138,12 @@ void trtllm_paged_attention_launcher(
   runner_params.mSumOfSeqLensQ = sum_seq_q;
   runner_params.ptrAttentionSinks = attention_sinks;
   runner_params.enable_pdl = enable_pdl;
+
+  // The sparse MLA parameters.
+  runner_params.mSparseMla = sparse_mla_top_k > 0;
+  runner_params.mSparseMlaTopK = sparse_mla_top_k;
+  TVM_FFI_ICHECK((head_dim_qk == 576 && head_dim_vo == 512) || sparse_mla_top_k <= 0)
+      << "Only decode MLA supports sparse MLA";
 
   AlignedAllocator float_allocator(workspace_buffer, workspace_size);
   if (mode == TllmPagedAttentionMode::Context) {
@@ -201,15 +207,13 @@ inline Data_type dl_dtype_to_tllm_data_type(const DLDataType dtype) {
 
 inline bool is_4bit(Data_type data_type) { return data_type == Data_type::DATA_TYPE_E2M1; }
 
-void trtllm_paged_attention_decode(TensorView out, Optional<TensorView> out_scale_factor,
-                                   TensorView query, TensorView key_cache, TensorView value_cache,
-                                   TensorView workspace_buffer, TensorView block_tables,
-                                   TensorView seq_lens, int64_t max_kv_len,
-                                   Variant<double, ffi::Tensor> bmm1_scale,
-                                   Variant<double, ffi::Tensor> bmm2_scale, double o_sf_scale,
-                                   int64_t o_sf_vec_size, int64_t o_sf_start_index,
-                                   int64_t window_left, int64_t sm_count, bool enable_pdl,
-                                   int64_t workspace_size, Optional<TensorView> attention_sinks) {
+void trtllm_paged_attention_decode(
+    TensorView out, Optional<TensorView> out_scale_factor, TensorView query, TensorView key_cache,
+    TensorView value_cache, TensorView workspace_buffer, TensorView block_tables,
+    TensorView seq_lens, int64_t max_kv_len, Variant<double, ffi::Tensor> bmm1_scale,
+    Variant<double, ffi::Tensor> bmm2_scale, double o_sf_scale, int64_t o_sf_vec_size,
+    int64_t o_sf_start_index, int64_t window_left, int64_t sparse_mla_top_k, int64_t sm_count,
+    bool enable_pdl, int64_t workspace_size, Optional<TensorView> attention_sinks) {
   auto q_data_type = dl_dtype_to_tllm_data_type(query.dtype());
   auto kv_data_type = dl_dtype_to_tllm_data_type(key_cache.dtype());
   TVM_FFI_ICHECK_EQ(key_cache.ndim(), value_cache.ndim());
@@ -287,8 +291,8 @@ void trtllm_paged_attention_decode(TensorView out, Optional<TensorView> out_scal
       num_pages_in_mem_pool, num_qo_heads, num_kv_heads, head_dim_q, head_dim_o, page_size,
       kv_stride_keys_values, kv_stride_heads, kv_stride_batch, max_num_blocks_per_seq,
       bmm1_scale_value, bmm2_scale_value, bmm1_scale_log2_ptr, bmm2_scale_ptr, o_sf_scale,
-      o_sf_vec_size, o_sf_start_index, window_left, sum_seq_q, sm_count, enable_pdl, workspace_size,
-      stream);
+      o_sf_vec_size, o_sf_start_index, window_left, sum_seq_q, sparse_mla_top_k, sm_count,
+      enable_pdl, workspace_size, stream);
 }
 
 void trtllm_paged_attention_context(
@@ -367,8 +371,8 @@ void trtllm_paged_attention_context(
       max_q_len, max_kv_len, num_pages_in_mem_pool, num_qo_heads, num_kv_heads, head_dim_q,
       head_dim_o, page_size, kv_stride_keys_values, kv_stride_heads, kv_stride_batch,
       max_num_blocks_per_seq, bmm1_scale_value, bmm2_scale_value, bmm1_scale_log2_ptr,
-      bmm2_scale_ptr, o_sf_scale, o_sf_vec_size, o_sf_start_index, window_left, sum_seq_q, sm_count,
-      enable_pdl, workspace_size, stream);
+      bmm2_scale_ptr, o_sf_scale, o_sf_vec_size, o_sf_start_index, window_left, sum_seq_q,
+      /*sparse_mla_top_k=*/0, sm_count, enable_pdl, workspace_size, stream);
 }
 
 void trtllm_ragged_attention_launcher(

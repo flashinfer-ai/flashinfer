@@ -71,6 +71,7 @@ struct MLAParams {
   uint32_t o_stride_h;
 
   float sm_scale;
+  bool return_lse_base_on_e;
 };
 
 };  // namespace flashinfer

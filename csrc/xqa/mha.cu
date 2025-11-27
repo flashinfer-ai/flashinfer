@@ -1,13 +1,18 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2024 NVIDIA CORPORATION & AFFILIATES. All rights
- * reserved. SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights
+ * reserved. SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 #include "cuda_hint.cuh"
@@ -1262,6 +1267,23 @@ __device__ inline void addAttentionSinks(ThrdRegRowMax& globalRowSum,
   }
 }
 
+#if SPEC_DEC
+// SPEC_DEC version: handles head-token mixed layout
+__device__ inline void addAttentionSinksSpecDec(ThrdRegRowMax& globalRowSum,
+                                                ThrdRegRowMax const globalRowMax,
+                                                float const* attentionSinks, uint32_t headGrpSize) {
+  for (uint32_t i = 0; i < globalRowSum.size; i++) {
+    uint32_t idxHeadToken = warp_size * i + laneId();
+    // In SPEC_DEC, layout is [token0_head0, token0_head1, ..., token1_head0, ...]
+    // Extract head index from head-token index
+    uint32_t headIdx = idxHeadToken % headGrpSize;
+    if (headIdx < headGrpSize && idxHeadToken < rowsPerBlock) {
+      globalRowSum[i] += expf(attentionSinks[headIdx] - globalRowMax[i]);
+    }
+  }
+}
+#endif
+
 #ifdef NDEBUG
 __device__ __forceinline__
 #else
@@ -1278,7 +1300,7 @@ CUBIN_EXPORT __global__
 #if SLIDING_WINDOW
         uint32_t slidingWinSize,
 #endif
-        float qScale,
+        float qScale, float const* qScalePtr,
         OutputHead* __restrict__ const output,  // [nbReq][beamWidth][nbQHeads]
 #if LOW_PREC_OUTPUT
         float rcpOutScale,
@@ -1300,10 +1322,13 @@ CUBIN_EXPORT __global__
         BeamSearchParams const beamSearchParams,
 #endif
 #endif
-        uint32_t const batchSize,
-        float kvCacheScale,  // Same scale for K and V cache. Used only for int8/fp8 KV cache.
+        uint32_t const batchSize, float kvCacheScale,
+        float const* kvScalePtr,  // Same scale for K and V cache. Used only for int8/fp8 KV cache.
         uint32_t kv_stride_page, uint32_t kv_stride_token, uint32_t kv_stride_head,
         uint32_t* __restrict__ semaphores = nullptr, void* __restrict__ scratch = nullptr) {
+
+  float const qScaleValue = qScalePtr != nullptr ? qScalePtr[0] : qScale;
+  float const kvCacheScaleValue = kvScalePtr != nullptr ? kvScalePtr[0] : kvCacheScale;
   assert(allowMultiBlockMode || gridDim.x == 1);
   bool const isMultiBlock = allowMultiBlockMode && (gridDim.x != 1);
   uint32_t const nbSubSeqPerSeq = allowMultiBlockMode ? gridDim.x : 1;
@@ -1502,7 +1527,7 @@ CUBIN_EXPORT __global__
   };
   if (warpIdx.z == 0) {
     float const qkScale =
-        qScale * (isKVCacheQuantized ? kvCacheScale : 1.f) *
+        qScaleValue * (isKVCacheQuantized ? kvCacheScaleValue : 1.f) *
         rsqrtf(validElemsPerHead);  // qkScale is applied onto Q*K.T before softmax.
     CircIdx<nbKBuffers> idxCurrSMemKBuf{nbKBuffers - 1};
     auto const getSMemKTile = [&](uint32_t idx) -> SharedMem::KSmemBuffer& {
@@ -2155,13 +2180,18 @@ CUBIN_EXPORT __global__
       }
     }
 
-    float voScale = (isKVCacheQuantized ? kvCacheScale : 1.F);
+    float voScale = (isKVCacheQuantized ? kvCacheScaleValue : 1.F);
     if (seqIterInit < nbSeqIters) {  // otherwise rcpRowSum will be NAN.
       // The attention sinks are moved to the multi-block reduction part if the multi-block is
       // enabled.
       if (!isMultiBlock && attentionSinks != nullptr) {
         // Attention sinks are per head.
+#if SPEC_DEC
+        addAttentionSinksSpecDec(globalRowSum, globalRowMax,
+                                 attentionSinks + headGrpSize * idxHeadGrp, headGrpSize);
+#else
         addAttentionSinks(globalRowSum, globalRowMax, attentionSinks + headGrpSize * idxHeadGrp);
+#endif
       }
       ThrdRegRowMax const rcpRowSum = __frcp_rn(globalRowSum);
 #if LOW_PREC_OUTPUT
@@ -2341,7 +2371,12 @@ CUBIN_EXPORT __global__
         }
         if (attentionSinks != nullptr) {
           // Attention sinks are per head.
+#if SPEC_DEC
+          addAttentionSinksSpecDec(mergedRowSum, mergedRowMax,
+                                   attentionSinks + headGrpSize * idxHeadGrp, headGrpSize);
+#else
           addAttentionSinks(mergedRowSum, mergedRowMax, attentionSinks + headGrpSize * idxHeadGrp);
+#endif
         }
         __syncthreads();
         rescaleAcc(warp, sumAcc, fullRescaleMask, __frcp_rn(mergedRowSum));
@@ -2393,7 +2428,7 @@ CUBIN_EXPORT __global__ __launch_bounds__(256, nbCtaPerSM) void kernel_mha(
 #if SLIDING_WINDOW
     uint32_t slidingWinSize,
 #endif
-    float qScale,
+    float qScale, float const* qScalePtr,
     OutputHead* __restrict__ const output,  // [nbReq][beamWidth][nbQHeads]
 #if LOW_PREC_OUTPUT
     float rcpOutScale,
@@ -2408,8 +2443,8 @@ CUBIN_EXPORT __global__ __launch_bounds__(256, nbCtaPerSM) void kernel_mha(
 #if BEAM_WIDTH > 1
     BeamSearchParams const beamSearchParams,
 #endif
-    uint32_t const batchSize,
-    float kvCacheScale,  // Same scale for K and V cache. Used only for int8/fp8 KV cache.
+    uint32_t const batchSize, float kvCacheScale,
+    float const* kvScalePtr,  // Same scale for K and V cache. Used only for int8/fp8 KV cache.
     uint32_t kv_stride_page, uint32_t kv_stride_token, uint32_t kv_stride_head,
     uint32_t* __restrict__ semaphores = nullptr, void* __restrict__ scratch = nullptr) {
 #if SPEC_DEC
@@ -2420,7 +2455,7 @@ CUBIN_EXPORT __global__ __launch_bounds__(256, nbCtaPerSM) void kernel_mha(
 #if SLIDING_WINDOW
                   slidingWinSize,
 #endif
-                  qScale, output,
+                  qScale, qScalePtr, output,
 #if LOW_PREC_OUTPUT
                   rcpOutScale,
 #endif
@@ -2432,8 +2467,8 @@ CUBIN_EXPORT __global__ __launch_bounds__(256, nbCtaPerSM) void kernel_mha(
 #if BEAM_WIDTH > 1
                   beamSearchParams,
 #endif
-                  batchSize, kvCacheScale, kv_stride_page, kv_stride_token, kv_stride_head,
-                  semaphores, scratch);
+                  batchSize, kvCacheScale, kvScalePtr, kv_stride_page, kv_stride_token,
+                  kv_stride_head, semaphores, scratch);
 }
 #else
 static constexpr auto kernel_mha = kernel_mha_impl;
@@ -2445,7 +2480,7 @@ void launchMHA(
 #if SLIDING_WINDOW
     uint32_t slidingWinSize,
 #endif
-    float qScale, OutputHead* output,
+    float qScale, float const* qScalePtr, OutputHead* output,
 #if LOW_PREC_OUTPUT
     float rcpOutScale,
 #endif
@@ -2466,8 +2501,8 @@ void launchMHA(
 #if BEAM_WIDTH > 1
     BeamSearchParams const& beamSearchParams,
 #endif
-    uint32_t batchSize,
-    float kvCacheScale,  // Same scale for K and V cache. Used only for int8/fp8 KV cache.
+    uint32_t batchSize, float kvCacheScale,
+    float const* kvScalePtr,  // Same scale for K and V cache. Used only for int8/fp8 KV cache.
 #if SPEC_DEC
     SpecDecParams const& specDecParams,
 #endif
@@ -2532,7 +2567,7 @@ void launchMHA(
 #if SLIDING_WINDOW
                      slidingWinSize,
 #endif
-                     qScale, output,
+                     qScale, qScalePtr, output,
 #if LOW_PREC_OUTPUT
                      rcpOutScale,
 #endif
@@ -2544,8 +2579,8 @@ void launchMHA(
 #if BEAM_WIDTH > 1
                      beamSearchParams,
 #endif
-                     batchSize, kvCacheScale, stride_page_in_heads, stride_token_in_heads,
-                     stride_head_in_heads, semaphores, scratch);
+                     batchSize, kvCacheScale, kvScalePtr, stride_page_in_heads,
+                     stride_token_in_heads, stride_head_in_heads, semaphores, scratch);
   checkCuda(cudaPeekAtLastError());
 #endif  // USE_INPUT_KV
 }
@@ -2561,14 +2596,14 @@ static uint32_t configureKernel() {
 static uint32_t const hostSmemSize = configureKernel();
 
 void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32_t slidingWinSize,
-                         float qScale, OutputHead* output,
+                         float qScale, float const* qScalePtr, OutputHead* output,
 #if LOW_PREC_OUTPUT
                          float rcpOutScale,
 #endif
                          InputHead const* q, float const* attentionSinks, GMemCacheHead* kCacheVLLM,
                          GMemCacheHead* vCacheVLLM, KVCachePageIndex const* kvCachePageList,
                          uint32_t maxSeqLen, uint32_t const* seqLen, uint32_t batchSize,
-                         float kvCacheScale,
+                         float kvCacheScale, float const* kvScalePtr,
 #if SPEC_DEC
                          uint32_t qSeqLen, uint32_t const* qCuSeqLens, MaskType const* mask,
 #endif
@@ -2607,7 +2642,7 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
 #if SLIDING_WINDOW
                      slidingWinSize,
 #endif
-                     qScale, output,
+                     qScale, qScalePtr, output,
 #if LOW_PREC_OUTPUT
                      rcpOutScale,
 #endif
@@ -2615,8 +2650,9 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
 #if SPEC_DEC
                      mask,
 #endif
-                     attentionSinks, cacheList, batchSize, kvCacheScale, stride_page_in_heads,
-                     stride_token_in_heads, stride_head_in_heads, semaphores, scratch);
+                     attentionSinks, cacheList, batchSize, kvCacheScale, kvScalePtr,
+                     stride_page_in_heads, stride_token_in_heads, stride_head_in_heads, semaphores,
+                     scratch);
   checkCuda(cudaPeekAtLastError());
 }
 #endif

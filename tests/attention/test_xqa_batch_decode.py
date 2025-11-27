@@ -75,8 +75,8 @@ def create_kv_cache(
 ):
     # Create separate K and V caches with specified layout (NHD or HND)
     max_seq_len = torch.max(seq_lens).item()
-    num_tokens = max_seq_len * batch_size
-    num_pages = (num_tokens + page_size - 1) // page_size
+    num_pages_per_seq = (max_seq_len + page_size - 1) // page_size
+    num_pages = num_pages_per_seq * batch_size
     ref_kv_dtype_torch = DTYPE_MAP[ref_kv_dtype]
     if kv_dtype != "fp8":
         assert kv_dtype == ref_kv_dtype, (
@@ -290,6 +290,66 @@ def get_last_page_len(seq_lens, page_size):
     return last_page_len
 
 
+def generate_causal_mask(
+    batch_size: int,
+    q_seq_len: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Generate causal attention mask for speculative decoding.
+
+    Parameters
+    ----------
+    batch_size : int
+        Batch size
+    q_seq_len : int
+        Query sequence length (number of speculative decoding tokens)
+    device : torch.device
+        Target device for the mask tensor
+
+    Returns
+    -------
+    torch.Tensor
+        Causal mask with shape [batch_size, q_seq_len, mask_size_per_row]
+        where mask_size_per_row = divUp(q_seq_len, 32) * 2 (in uint16_t units).
+        Data type: torch.uint16
+
+    """
+    num_packed_masks_per_token = (q_seq_len + 31) // 32
+
+    q_indices = torch.arange(q_seq_len, device=device, dtype=torch.int32).unsqueeze(1)
+    kv_indices = torch.arange(q_seq_len, device=device, dtype=torch.int32).unsqueeze(0)
+
+    causal_bool_mask = kv_indices <= q_indices
+
+    padded_seq_len = num_packed_masks_per_token * 32
+    if padded_seq_len > q_seq_len:
+        padding = torch.zeros(
+            q_seq_len, padded_seq_len - q_seq_len, device=device, dtype=torch.bool
+        )
+        causal_bool_mask = torch.cat([causal_bool_mask, padding], dim=1)
+
+    causal_bool_mask = causal_bool_mask.view(q_seq_len, num_packed_masks_per_token, 32)
+
+    bit_positions = torch.tensor(
+        [1 << i for i in range(32)], device=device, dtype=torch.int64
+    )
+
+    mask_uint32 = (
+        (causal_bool_mask.to(torch.int64) * bit_positions).sum(dim=-1).to(torch.uint32)
+    )
+
+    mask_uint32 = (
+        mask_uint32.unsqueeze(0)
+        .expand(batch_size, q_seq_len, num_packed_masks_per_token)
+        .contiguous()
+    )
+
+    mask_uint16 = mask_uint32.view(torch.uint16)
+
+    return mask_uint16
+
+
 @pytest.mark.skipif(
     get_compute_capability(torch.device(device="cuda"))[0] not in [9, 10, 12],
     reason="XQA is only supported on SM90, SM100, SM120 GPUs",
@@ -297,6 +357,9 @@ def get_last_page_len(seq_lens, page_size):
 @pytest.mark.parametrize(
     "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size",
     [
+        (4, 4, 64, 4, 2),
+        (4, 2, 16, 2, 4),
+        (4, 3, 32, 2, 6),
         (4, 1, 16, 2, 1),
         (4, 1, 32, 2, 5),
         (128, 1, 64, 2, 6),
@@ -338,8 +401,6 @@ def test_xqa_batch_decode(
 
     This test supports both NHD and HND layouts.
     """
-    if q_len_per_req > 1:
-        pytest.skip("xqa does not support speculative decoding yet")
 
     # Set up test parameters
     torch.manual_seed(0)
@@ -444,6 +505,11 @@ def test_xqa_batch_decode(
             kv_indptr=kv_indptr_tokens,
         )
 
+    if q_len_per_req > 1:
+        mask = generate_causal_mask(batch_size, q_len_per_req, GPU_DEVICE)
+    else:
+        mask = None
+
     # Run xqa_batch_decode_with_kv_cache function
     output = flashinfer.decode.xqa_batch_decode_with_kv_cache(
         q.contiguous(),
@@ -461,6 +527,7 @@ def test_xqa_batch_decode(
         kv_layout=kv_layout,
         q_len_per_req=q_len_per_req,
         o_scale=o_scale,
+        mask=mask,
     )
 
     # Verification
