@@ -547,8 +547,8 @@ def get_gemm_sm100_module_cutlass_bf16():
     return SimpleNamespace(
         cutlass_bf16_gemm_runner=cutlass_bf16_gemm_runner,
     )
-  
- 
+
+
 _FP8_GEMM_SM100_TUNING_CONFIG = TuningConfig(
     dynamic_tensor_specs=(
         DynamicTensorSpec(
