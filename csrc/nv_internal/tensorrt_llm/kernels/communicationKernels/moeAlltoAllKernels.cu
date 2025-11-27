@@ -29,6 +29,7 @@ namespace tensorrt_llm::kernels::mnnvl_throughput {
 
 #define ENABLE_DEBUG_PRINT 0
 #define DISABLE_SYNC_FOR_PROFILING 0
+
 #ifndef DISABLE_TIMEOUT
 #define DISABLE_TIMEOUT 0
 #endif
