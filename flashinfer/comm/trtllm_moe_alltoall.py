@@ -175,10 +175,10 @@ def get_mnnvl_a2a_module():
     def moe_a2a_get_workspace_size_per_rank(
         ep_size: int,
         max_num_tokens: int,
-        payload_size_per_element: int,
+        payload_size_per_token: int,
     ):
         return module.moe_a2a_get_workspace_size_per_rank(
-            ep_size, max_num_tokens, payload_size_per_element
+            ep_size, max_num_tokens, payload_size_per_token
         )
 
     return SimpleNamespace(
@@ -317,10 +317,10 @@ def moe_a2a_sanitize_expert_ids(
 def moe_a2a_get_workspace_size_per_rank(
     ep_size: int,
     max_num_tokens: int,
-    payload_size_per_element: int,
+    payload_size_per_token: int,
 ):
     return get_mnnvl_a2a_module().moe_a2a_get_workspace_size_per_rank(
-        ep_size, max_num_tokens, payload_size_per_element
+        ep_size, max_num_tokens, payload_size_per_token
     )
 
 
