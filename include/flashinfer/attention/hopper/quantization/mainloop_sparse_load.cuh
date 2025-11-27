@@ -229,37 +229,85 @@ struct FP8SparseCollectiveMainloop {
     Tensor tKsK = gmem_thr_copy_kv.partition_D(sK);     // (CPY, CPY_KV, CPY_D, PIPE)
     Tensor tVsV = gmem_thr_copy_kv.partition_D(sV);     // (CPY, CPY_KV, CPY_D, PIPE)
 
-    // Lambda to load K/V tile with manual offset calculation
-    auto load_kv_tile = [&](DTypeKV* base_ptr, int64_t stride_n, int64_t page_stride, auto& tXsX,
-                            int tile_idx, int pipe_idx, bool use_predicate) {
+    // FA3-style prefetch offset optimization: pre-compute page offsets and share via shuffle
+    // This reduces redundant page table lookups and address calculations
+    int64_t my_kv_offset[2];  // Rolling buffer: page_idx * page_stride + entry_idx * stride_n
+
+    // Group organization based on partition strategy (same as FP16 sparse_mainloop)
+    // For FP8 with cp.async: AlignmentKV=16 (128bits/8bits), NUM_PRODUCER_THREADS=128
+    // The simt gmem tiled copy partitions threads as: (thread_stride_M, thread_stride_K)
+    // where thread_stride_M = threads / (CTA_KV / AlignmentKV) for column-major
+    // NUM_KV_PER_ITER = number of KV elements each thread handles per iteration
+    //
+    // The tiled copy arrangement:
+    // - Each thread loads AlignmentKV (16) elements contiguously in the D dimension
+    // - Threads are spread across the (KV, D) tile
+    // For column-major: threads stride by (D/AlignmentKV) in the KV dimension
+    // D_stride = HEAD_DIM / AlignmentKV (e.g., 128/16=8 or 256/16=16)
+    // Thread arrangement: threads = KV_stride * D_stride
+    // So KV_stride = NUM_COPY_THREADS / D_stride = NUM_COPY_THREADS * AlignmentKV / HEAD_DIM
+    // NUM_KV_PER_ITER = CTA_KV / KV_stride = CTA_KV * HEAD_DIM / (NUM_COPY_THREADS * AlignmentKV)
+    static constexpr int NUM_COPY_THREADS = Ktraits::NUM_PRODUCER_THREADS;
+    constexpr int NUM_KV_PER_ITER = CTA_KV * HEAD_DIM / (NUM_COPY_THREADS * AlignmentKV);
+    constexpr int KV_STRIDE = CTA_KV / NUM_KV_PER_ITER;
+    constexpr int NUM_GROUPS = KV_STRIDE;
+    constexpr int THREADS_PER_GROUP = NUM_COPY_THREADS / NUM_GROUPS;
+    constexpr int NUM_ITERS_PER_GROUP = NUM_KV_PER_ITER;
+
+    int group_id = thread_idx / THREADS_PER_GROUP;
+    int thread_in_group = thread_idx % THREADS_PER_GROUP;
+
+    // Prefetch: compute page_idx * page_stride + entry_idx * stride_n
+    auto prefetch_kv_offset = [&](int kv_tile_idx, int64_t stride_n, int64_t page_stride,
+                                  bool use_predicate) {
+      int kv_base_idx = kv_tile_idx * CTA_KV;
+      int buf_idx = kv_tile_idx % 2;
+
+      int kv_idx_read = kv_base_idx + group_id + thread_in_group * KV_STRIDE;
+      bool valid_read =
+          thread_in_group < NUM_ITERS_PER_GROUP && (!use_predicate || kv_idx_read < kv_len);
+
+      if (valid_read) {
+        // Use divmod to find page and offset within page
+        uint32_t page_iter, entry_idx;
+        mainloop_params.page_size.divmod(kv_idx_read, page_iter, entry_idx);
+        IdType page_idx = kv_indices_ptr[page_iter];
+        // Pre-compute: page_idx * page_stride + entry_idx * stride_n
+        my_kv_offset[buf_idx] = page_idx * page_stride + entry_idx * stride_n;
+      } else {
+        my_kv_offset[buf_idx] = 0;
+      }
+    };
+
+    // Load K/V with pre-computed offsets using shuffle
+    auto load_kv_with_prefetch = [&](DTypeKV* base_ptr, auto& tXsX, int tile_idx, int pipe_idx,
+                                     bool use_predicate) {
       using Vec = AlignmentTypeKV;
       constexpr int VecSize = AlignmentKV;
 
       int kv_base_idx = tile_idx * CTA_KV;
+      int buf_idx = tile_idx % 2;
 
-      // Use recast to view smem as Vec type (like FP16 sparse_mainloop)
       auto dst = recast<Vec>(flatten(tXsX(_, _, _, pipe_idx)));
       auto c = flatten(tKVcKV);
 
-      // Iterate over Vec-sized elements
-      CUTE_UNROLL
+      constexpr unsigned FULL_MASK = 0xffffffff;
+
+      // Load using FA3-style shuffle with pre-computed offsets
+      CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < size(dst); ++i) {
         auto coord = c(VecSize * i);
         int kv_offset = get<0>(coord);
         int d_idx = get<1>(coord);
         int kv_idx = kv_base_idx + kv_offset;
-
         bool guard = !use_predicate || kv_idx < kv_len;
 
-        // Compute page and offset within page
-        uint32_t page_iter, entry_idx;
-        mainloop_params.page_size.divmod(kv_idx, page_iter, entry_idx);
-        IdType page_idx = kv_indices_ptr[page_iter];
+        // Shuffle the pre-computed offset (page_idx * page_stride + entry_idx * stride_n)
+        int src_thread = group_id * THREADS_PER_GROUP + kv_offset / KV_STRIDE;
+        int64_t base_offset = __shfl_sync(FULL_MASK, my_kv_offset[buf_idx], src_thread);
 
-        // Compute address: base_ptr + page_idx * page_stride + entry_idx * stride_n + d_idx
-        int64_t offset = page_idx * page_stride + entry_idx * stride_n + d_idx;
-        Vec const* src_ptr = reinterpret_cast<Vec const*>(base_ptr + offset);
-
+        // Final address: base_ptr + base_offset + d_idx
+        Vec const* src_ptr = reinterpret_cast<Vec const*>(base_ptr + base_offset + d_idx);
         cutlass::arch::cp_async_zfill<sizeof(Vec), cutlass::arch::CacheOperation::Global>(
             &dst(i), src_ptr, guard);
       }
@@ -267,12 +315,12 @@ struct FP8SparseCollectiveMainloop {
 
     int valid_last_kv_tile_size = std::min<int>(kv_len - kv_tile_idx * CTA_KV, CTA_KV);
 
-    // load last k-tile
+    // load last k-tile with prefetch optimization
     // all threads are issuing as TMA is disabled
     {
+      prefetch_kv_offset(kv_tile_idx, k_stride_n, k_page_stride, true);
       pipeline_k.producer_acquire(smem_pipe_write);
-      load_kv_tile(k_base_ptr, k_stride_n, k_page_stride, tKsK, kv_tile_idx,
-                   smem_pipe_write.index(), true);
+      load_kv_with_prefetch(k_base_ptr, tKsK, kv_tile_idx, smem_pipe_write.index(), true);
       pipeline_k.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
     }
 
@@ -292,10 +340,9 @@ struct FP8SparseCollectiveMainloop {
     shared_storage.barrier_O.wait((work_idx + 1) % 2);
 
     if (kv_tile_idx == swa_begin_kv_tile_idx) {
-      // first tile is the last tile
+      // first tile is the last tile, reuse kv_tile_idx prefetch for V
       pipeline_v.producer_acquire(smem_pipe_write);
-      load_kv_tile(v_base_ptr, v_stride_n, v_page_stride, tVsV, kv_tile_idx,
-                   smem_pipe_write.index(), true);
+      load_kv_with_prefetch(v_base_ptr, tVsV, kv_tile_idx, smem_pipe_write.index(), true);
       pipeline_v.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
 
       // Transpose V
@@ -308,9 +355,12 @@ struct FP8SparseCollectiveMainloop {
       ++smem_pipe_write;  // update state, as K is loaded 1 step faster
     } else {
       // load second last k-tile and last v-tile
+      // Prefetch for next K tile (kv_tile_idx - 1)
+      prefetch_kv_offset(kv_tile_idx - 1, k_stride_n, k_page_stride, false);
+
+      // Load V using prefetch from last K load (kv_tile_idx)
       pipeline_v.producer_acquire(smem_pipe_write);
-      load_kv_tile(v_base_ptr, v_stride_n, v_page_stride, tVsV, kv_tile_idx,
-                   smem_pipe_write.index(), true);
+      load_kv_with_prefetch(v_base_ptr, tVsV, kv_tile_idx, smem_pipe_write.index(), true);
       pipeline_v.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
 
       // Transpose V
@@ -322,9 +372,9 @@ struct FP8SparseCollectiveMainloop {
       ++smem_pipe_read;
       ++smem_pipe_write;  // update state, as K is loaded 1 step faster
 
+      // Load K (kv_tile_idx - 1) using prefetched offset
       pipeline_k.producer_acquire(smem_pipe_write);
-      load_kv_tile(k_base_ptr, k_stride_n, k_page_stride, tKsK, kv_tile_idx - 1,
-                   smem_pipe_write.index(), false);
+      load_kv_with_prefetch(k_base_ptr, tKsK, kv_tile_idx - 1, smem_pipe_write.index(), false);
       pipeline_k.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
 
       --kv_tile_idx;
@@ -332,9 +382,12 @@ struct FP8SparseCollectiveMainloop {
       // load remaining k/v tiles
 #pragma unroll 2
       for (; kv_tile_idx > swa_begin_kv_tile_idx; --kv_tile_idx) {
+        // Prefetch for next K tile
+        prefetch_kv_offset(kv_tile_idx - 1, k_stride_n, k_page_stride, false);
+
+        // Load V using prefetch from previous K prefetch
         pipeline_v.producer_acquire(smem_pipe_write);
-        load_kv_tile(v_base_ptr, v_stride_n, v_page_stride, tVsV, kv_tile_idx,
-                     smem_pipe_write.index(), false);
+        load_kv_with_prefetch(v_base_ptr, tVsV, kv_tile_idx, smem_pipe_write.index(), false);
         pipeline_v.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
 
         // Transpose V
@@ -346,18 +399,18 @@ struct FP8SparseCollectiveMainloop {
         ++smem_pipe_read;
         ++smem_pipe_write;  // update state, as K is loaded 1 step faster
 
+        // Load K using prefetched offset
         pipeline_k.producer_acquire(smem_pipe_write);
-        load_kv_tile(k_base_ptr, k_stride_n, k_page_stride, tKsK, kv_tile_idx - 1,
-                     smem_pipe_write.index(), false);
+        load_kv_with_prefetch(k_base_ptr, tKsK, kv_tile_idx - 1, smem_pipe_write.index(), false);
         pipeline_k.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
       }
       scheduler.prefetch_next_work(scheduler_params, work_tile_info);
 
       // load first v tile
       {
+        prefetch_kv_offset(0, v_stride_n, v_page_stride, false);
         pipeline_v.producer_acquire(smem_pipe_write);
-        load_kv_tile(v_base_ptr, v_stride_n, v_page_stride, tVsV, 0, smem_pipe_write.index(),
-                     false);
+        load_kv_with_prefetch(v_base_ptr, tVsV, 0, smem_pipe_write.index(), false);
         pipeline_v.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
 
         // Transpose V

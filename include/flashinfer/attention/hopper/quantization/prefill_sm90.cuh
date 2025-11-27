@@ -459,11 +459,12 @@ cudaError_t BatchFP8PrefillWithPagedKVCacheDispatched(Params& params, bool enabl
         LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS>(params, stream);
   } else {
     // HEAD_DIM == 256;
-    // NOTE(Zihao): CTA_KV not tuned for HEAD_DIM == 256, need to optimize later
+    // NOTE: Use smaller CTA_KV=64 for sparse paged loading to reduce page table lookup overhead
+    // (FP8 transpose requires minimum 64x64 blocks, so CTA_KV cannot be smaller than 64)
     BatchFP8PrefillWithPagedKVCacheKernelTraitsDispatched<
         FP8AttentionKernelTraits</*USE_TMA_LOAD_KV=*/false, HEAD_DIM,
                                  /*CTA_Q_=*/128,
-                                 /*CTA_KV_=*/128,
+                                 /*CTA_KV_=*/64,
                                  /*NUM_STAGES_=*/2, typename Params::DTypeQ,
                                  typename Params::DTypeKV, typename Params::DTypeO,
                                  typename Params::IdType, AttentionVariant>,
