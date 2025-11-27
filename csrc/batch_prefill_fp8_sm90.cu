@@ -29,6 +29,11 @@ template <uint32_t HEAD_DIM, MaskMode MASK_MODE, bool LEFT_SLIDING_WINDOW,
 cudaError_t BatchFP8PrefillWithPagedKVCacheDispatched(Params& params, bool enable_pdl,
                                                       cudaStream_t stream);
 
+template <uint32_t HEAD_DIM, MaskMode MASK_MODE, bool LEFT_SLIDING_WINDOW,
+          bool SAME_SCHEDULE_FOR_ALL_HEADS, typename AttentionVariant, typename Params>
+cudaError_t BatchFP8PrefillWithRaggedKVCacheDispatched(Params& params, bool enable_pdl,
+                                                       cudaStream_t stream);
+
 }  // namespace flashinfer
 
 using namespace flashinfer;
@@ -78,7 +83,94 @@ void BatchPrefillWithRaggedKVCacheSM90Run(ffi::TensorView float_workspace_buffer
                                           int64_t window_left,
                                           bool enable_pdl  // placeholder
                                               ADDITIONAL_FUNC_PARAMS) {
-  return;  // TODO: Implement this function
+  PrefillPlanSM90Info plan_info;
+  plan_info.FromVector(std::vector<int64_t>(plan_info_vec.begin(), plan_info_vec.end()));
+
+  if (maybe_lse.has_value()) {
+    const auto& lse = maybe_lse.value();
+    TVM_FFI_ICHECK_EQ(lse.size(0), q.size(0));
+    TVM_FFI_ICHECK_EQ(lse.size(1), q.size(1));
+  }
+
+  void* float_buffer_ptr = float_workspace_buffer.data_ptr();
+  void* int_buffer_ptr = int_workspace_buffer.data_ptr();
+
+  int64_t head_dim_qk = q.size(2);
+  int64_t head_dim_vo = v.size(2);
+
+  QKVLayout kv_layout = static_cast<QKVLayout>(layout);
+
+  cudaSetDevice(float_workspace_buffer.device().device_id);
+  const cudaStream_t stream = get_stream(float_workspace_buffer.device());
+  const MaskMode mask_mode = static_cast<MaskMode>(mask_mode_code);
+  bool use_swa = window_left != -1;
+
+  DISPATCH_context(
+      DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM_QK, HEAD_DIM_VO, USE_SLIDING_WINDOW,
+      USE_LOGITS_SOFT_CAP, AttentionVariant, RaggedParams, PagedParams, [&] {
+        RaggedParams params;
+
+        params.q_ptr = static_cast<DTypeQ*>(q.data_ptr());
+        params.k_ptr = static_cast<DTypeKV*>(k.data_ptr());
+        params.v_ptr = static_cast<DTypeKV*>(v.data_ptr());
+        params.o_ptr = static_cast<DTypeO*>(o.data_ptr());
+        params.lse_ptr = maybe_lse ? static_cast<float*>(maybe_lse.value().data_ptr()) : nullptr;
+        params.q_stride_n = q.stride(0);
+        params.q_stride_h = q.stride(1);
+        params.o_stride_n = o.stride(0);
+        params.o_stride_h = o.stride(1);
+        if (kv_layout == QKVLayout::kNHD) {
+          params.k_stride_n = k.stride(0);
+          params.k_stride_h = k.stride(1);
+          params.v_stride_n = v.stride(0);
+          params.v_stride_h = v.stride(1);
+        } else {
+          params.k_stride_h = k.stride(0);
+          params.k_stride_n = k.stride(1);
+          params.v_stride_h = v.stride(0);
+          params.v_stride_n = v.stride(1);
+        }
+        params.nnz_qo = q.size(0);
+        params.nnz_kv = k.size(0);
+        params.num_qo_heads = q.size(1);
+        params.num_kv_heads = k.size(1);
+        params.group_size = params.num_qo_heads / params.num_kv_heads;
+        params.window_left = window_left;
+        params.causal = mask_mode_code == 1;
+        params.qo_tile_indices =
+            GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.qo_tile_indices_offset);
+        params.qo_indptr = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.qo_indptr_offset);
+        params.kv_indptr = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.kv_indptr_offset);
+        params.qo_lens = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.qo_len_offset);
+        params.kv_lens = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.kv_len_offset);
+        params.head_indices =
+            GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.head_indices_offset);
+        params.work_indptr =
+            GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.work_indptr_offset);
+        params.batch_indices =
+            GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.batch_indices_offset);
+
+        ADDITIONAL_PARAMS_SETTER
+
+        // Not support various head_dim for now
+        static_assert(HEAD_DIM_QK == HEAD_DIM_VO, "head_dim_qk and head_dim_vo should be the same");
+        // Currently only support same quantization precision
+        static_assert(std::is_same_v<DTypeQ, DTypeKV>);
+
+        bool same_schedule_for_all_heads = plan_info.same_schedule_for_all_heads;
+        DISPATCH_BOOL(same_schedule_for_all_heads, SAME_SCHEDULER_FOR_ALL_HEADS, [&] {
+          cudaError_t status =
+              BatchFP8PrefillWithRaggedKVCacheDispatched<HEAD_DIM_QK, MASK_MODE, USE_SLIDING_WINDOW,
+                                                         SAME_SCHEDULER_FOR_ALL_HEADS,
+                                                         AttentionVariant>(params, enable_pdl,
+                                                                           stream);
+
+          TVM_FFI_ICHECK(status == cudaSuccess)
+              << "BatchPrefillWithRaggedKVCacheSM90Run failed with error: "
+              << cudaGetErrorString(status);
+          return true;
+        });
+      });
 }
 
 void BatchPrefillWithPagedKVCacheSM90Run(
@@ -136,12 +228,18 @@ void BatchPrefillWithPagedKVCacheSM90Run(
           params.k_stride_h = paged_k_cache.stride(2);
           params.v_stride_n = paged_v_cache.stride(1);
           params.v_stride_h = paged_v_cache.stride(2);
+          // For sparse paged KV cache, store the stride between pages
+          params.k_page_stride = paged_k_cache.stride(0);
+          params.v_page_stride = paged_v_cache.stride(0);
         } else {
           // (num_pages, num_heads, page_size, head_dim)
           params.k_stride_h = paged_k_cache.stride(1);
           params.k_stride_n = paged_k_cache.stride(2);
           params.v_stride_h = paged_v_cache.stride(1);
           params.v_stride_n = paged_v_cache.stride(2);
+          // For sparse paged KV cache, store the stride between pages
+          params.k_page_stride = paged_k_cache.stride(0);
+          params.v_page_stride = paged_v_cache.stride(0);
         }
         params.nnz_qo = q.size(0);
         params.num_qo_heads = q.size(1);

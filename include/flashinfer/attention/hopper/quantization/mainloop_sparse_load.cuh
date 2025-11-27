@@ -232,24 +232,24 @@ struct FP8SparseCollectiveMainloop {
     // Lambda to load K/V tile with manual offset calculation
     auto load_kv_tile = [&](DTypeKV* base_ptr, int64_t stride_n, int64_t page_stride, auto& tXsX,
                             int tile_idx, int pipe_idx, bool use_predicate) {
-      using VecType = typename GmemTiledCopyKV::ValType;
-      constexpr int VecSize = sizeof(VecType) / sizeof(DTypeKV);
+      using Vec = AlignmentTypeKV;
+      constexpr int VecSize = AlignmentKV;
 
       int kv_base_idx = tile_idx * CTA_KV;
-      int valid_tile_size = use_predicate ? std::min<int>(kv_len - kv_base_idx, CTA_KV) : CTA_KV;
 
-      // Flatten the destination tensor for this pipe stage
-      Tensor tXsXiGroup = flatten_1(tXsX(_, _, _, pipe_idx));  // (CPY, (CPY_KV, CPY_D))
+      // Use recast to view smem as Vec type (like FP16 sparse_mainloop)
+      auto dst = recast<Vec>(flatten(tXsX(_, _, _, pipe_idx)));
+      auto c = flatten(tKVcKV);
 
-      // Iterate over flattened elements this thread is responsible for
+      // Iterate over Vec-sized elements
       CUTE_UNROLL
-      for (int i = 0; i < size(tXsXiGroup); ++i) {
-        auto coord = tKVcKVGroup(_0{}, i);
+      for (int i = 0; i < size(dst); ++i) {
+        auto coord = c(VecSize * i);
         int kv_offset = get<0>(coord);
         int d_idx = get<1>(coord);
         int kv_idx = kv_base_idx + kv_offset;
 
-        bool guard = kv_idx < kv_len && kv_offset < valid_tile_size;
+        bool guard = !use_predicate || kv_idx < kv_len;
 
         // Compute page and offset within page
         uint32_t page_iter, entry_idx;
@@ -258,11 +258,10 @@ struct FP8SparseCollectiveMainloop {
 
         // Compute address: base_ptr + page_idx * page_stride + entry_idx * stride_n + d_idx
         int64_t offset = page_idx * page_stride + entry_idx * stride_n + d_idx;
-        VecType const* src_ptr = reinterpret_cast<VecType const*>(base_ptr + offset);
-        VecType* dst_ptr = reinterpret_cast<VecType*>(&tXsXiGroup(0, i));
+        Vec const* src_ptr = reinterpret_cast<Vec const*>(base_ptr + offset);
 
-        cutlass::arch::cp_async_zfill<sizeof(VecType), cutlass::arch::CacheOperation::Global>(
-            dst_ptr, src_ptr, guard);
+        cutlass::arch::cp_async_zfill<sizeof(Vec), cutlass::arch::CacheOperation::Global>(
+            &dst(i), src_ptr, guard);
       }
     };
 

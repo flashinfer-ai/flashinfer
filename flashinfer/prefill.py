@@ -413,7 +413,13 @@ def get_batch_prefill_module(backend, *args):
         rope_scale: float,
         rope_theta: float,
         token_pos_in_items_len: int,
+        scale_q: Optional[torch.Tensor] = None,
+        scale_k: Optional[torch.Tensor] = None,
+        scale_v: Optional[torch.Tensor] = None,
     ) -> None:
+        # Check if FP8 by presence of scale tensors
+        is_fp8 = scale_q is not None
+
         if backend == "fa2":
             ragged_run_func(
                 float_workspace_buffer,
@@ -439,10 +445,34 @@ def get_batch_prefill_module(backend, *args):
                 logits_soft_cap,
                 sm_scale,
                 1.0 / rope_scale,  # rope_rcp_scale
-                1.0 / rope_theta,  # rope_rcp_theta
+                1.0 / rope_theta,  # rope_rcp_theta,
                 token_pos_in_items_len,
             )
+        elif is_fp8:
+            # FA3 FP8: scale_q, scale_k, scale_v, sm_scale
+            ragged_run_func(
+                float_workspace_buffer,
+                int_workspace_buffer,
+                plan_info_vec,
+                q,
+                k,
+                v,
+                qo_indptr,
+                kv_indptr,
+                o,
+                maybe_lse,
+                mask_mode,
+                layout,
+                window_left,
+                enable_pdl,
+                scale_q,
+                scale_k,
+                scale_v,
+                sm_scale,
+            )
         else:
+            # FA3 FP16: maybe_prefix_len_ptr, maybe_token_pos_in_items_ptr,
+            # maybe_max_item_len_ptr, logits_soft_cap, sm_scale, token_pos_in_items_len
             ragged_run_func(
                 float_workspace_buffer,
                 int_workspace_buffer,
@@ -1533,6 +1563,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         rope_theta: Optional[float] = None,
         q_data_type: Union[str, torch.dtype] = "float16",
         kv_data_type: Optional[Union[str, torch.dtype]] = None,
+        o_data_type: Optional[Union[str, torch.dtype]] = None,
         non_blocking: bool = True,
         prefix_len_ptr: Optional[torch.Tensor] = None,
         token_pos_in_items_ptr: Optional[torch.Tensor] = None,
@@ -1617,6 +1648,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
             The data type of the query tensor, defaults torch.float16.
         kv_data_type : Optional[Union[str, torch.dtype]]
             The data type of the key/value tensor. If None, will be set to :attr:`q_data_type`.
+        o_data_type : Optional[Union[str, torch.dtype]]
+            The data type of the output tensor. If None, will be set to :attr:`q_data_type`.
+            For FP8 inputs, this should typically be set to torch.float16.
         non_blocking : bool
             Whether to copy the input tensors to the device asynchronously, defaults to ``True``.
         prefix_len_ptr :Optional[torch.Tensor]
@@ -1668,6 +1702,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if kv_data_type is None:
             kv_data_type = q_data_type
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
+        if o_data_type is None:
+            o_data_type = q_data_type
+        o_data_type = canonicalize_torch_dtype(o_data_type)
 
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
@@ -1798,6 +1835,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         self._cached_q_data_type = q_data_type
         self._cached_kv_data_type = kv_data_type
+        self._cached_o_data_type = o_data_type
 
         if self._jit_module is not None:
             self._cached_module = self._jit_module
@@ -1815,7 +1853,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 get_module_args = (
                     q_data_type,
                     kv_data_type,
-                    q_data_type,
+                    o_data_type,
                     paged_kv_indptr.dtype,
                     head_dim_qk,
                     head_dim_vo,
@@ -2052,12 +2090,15 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 )
 
         if out is None:
+            # Use cached output data type if available (for FP8 attention with FP16 output)
+            out_dtype = getattr(self, "_cached_o_data_type", None) or q.dtype
             out = torch.empty(
-                q.shape[:-1] + v_cache.shape[-1:], dtype=q.dtype, device=q.device
+                q.shape[:-1] + v_cache.shape[-1:], dtype=out_dtype, device=q.device
             )
         else:
+            out_dtype = getattr(self, "_cached_o_data_type", None) or q.dtype
             check_shape_dtype_device(
-                out, q.shape[:-1] + v_cache.shape[-1:], q.dtype, q.device, "out"
+                out, q.shape[:-1] + v_cache.shape[-1:], out_dtype, q.device, "out"
             )
 
         # Convert NHD layout to HND for trtllm-gen backend
@@ -2126,6 +2167,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
             if self._jit_module is not None:
                 run_args.extend(list(args))
             else:
+                # Extract FP8 scale tensors from *args if q is FP8
+                fp8_scale_q = None
+                fp8_scale_k = None
+                fp8_scale_v = None
+                if is_float8(q) and len(args) >= 3:
+                    fp8_scale_q = args[0]
+                    fp8_scale_k = args[1]
+                    fp8_scale_v = args[2]
                 run_args += [
                     self._custom_mask_buf,
                     self._mask_indptr_buf,
@@ -2135,9 +2184,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     self._max_item_len_ptr,
                     logits_soft_cap,
                     sm_scale,
-                    None,  # scale_q, not supported yet
-                    None,  # scale_k
-                    None,  # scale_v
+                    fp8_scale_q,
+                    fp8_scale_k,
+                    fp8_scale_v,
                     rope_scale,
                     rope_theta,
                     self._token_pos_in_items_len,
@@ -2466,6 +2515,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         rope_theta: Optional[float] = None,
         q_data_type: Union[str, torch.dtype] = "float16",
         kv_data_type: Optional[Union[str, torch.dtype]] = None,
+        o_data_type: Optional[Union[str, torch.dtype]] = None,
         non_blocking: bool = True,
         prefix_len_ptr: Optional[torch.Tensor] = None,
         token_pos_in_items_ptr: Optional[torch.Tensor] = None,
@@ -2540,6 +2590,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             The data type of the query tensor, defaults to torch.float16.
         kv_data_type : Optional[Union[str, torch.dtype]]
             The data type of the key/value tensor. If None, will be set to :attr:`q_data_type`.
+        o_data_type : Optional[Union[str, torch.dtype]]
+            The data type of the output tensor. If None, will be set to :attr:`q_data_type`.
+            For FP8 inputs, this should typically be set to torch.float16.
         non_blocking : bool
             Whether to copy the input tensors to the device asynchronously, defaults to ``True``.
         prefix_len_ptr :Optional[torch.Tensor]
@@ -2580,6 +2633,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         if kv_data_type is None:
             kv_data_type = q_data_type
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
+        if o_data_type is None:
+            o_data_type = q_data_type
+        o_data_type = canonicalize_torch_dtype(o_data_type)
         if head_dim_vo is None:
             head_dim_vo = head_dim_qk
         if fixed_split_size is None:
@@ -2652,6 +2708,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
 
         self._cached_q_data_type = q_data_type
         self._cached_kv_data_type = kv_data_type
+        self._cached_o_data_type = o_data_type
         kv_len_arr = kv_indptr_host[1:] - kv_indptr_host[:-1]
 
         self._prefix_len_ptr = prefix_len_ptr
@@ -2675,7 +2732,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             get_module_args = (
                 q_data_type,
                 kv_data_type,
-                q_data_type,
+                o_data_type,
                 kv_indptr.dtype,
                 head_dim_qk,
                 head_dim_vo,
@@ -2862,11 +2919,17 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 )
         if out is None:
             out = torch.empty(
-                q.shape[:-1] + v.shape[-1:], dtype=q.dtype, device=q.device
+                q.shape[:-1] + v.shape[-1:],
+                dtype=self._cached_o_data_type,
+                device=q.device,
             )
         else:
             check_shape_dtype_device(
-                out, q.shape[:-1] + v.shape[-1:], q.dtype, q.device, "out"
+                out,
+                q.shape[:-1] + v.shape[-1:],
+                self._cached_o_data_type,
+                q.device,
+                "out",
             )
         if self._backend == "cutlass":
             out, lse = fmha_varlen(
@@ -2884,7 +2947,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             )
             return (out, lse) if return_lse else out
 
-        if is_float8(q):
+        # Skip FP8->FP16 conversion for FA3 backend with FP8 support
+        # The JIT module will handle FP8 natively
+        if is_float8(q) and self._backend != "fa3":
             logging.warning(
                 "Our current prefill kernel implementation needs f16 input, the f8 inputs "
                 " are casted to f16, which could result in performance degradation."
@@ -2933,6 +2998,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 rope_theta,
                 self._token_pos_in_items_len,
             ]
+            # For FP8, append scale tensors
+            if is_float8(q):
+                run_args.extend(list(args))  # scale_q, scale_k, scale_v
 
         assert self._cached_module is not None, "cached module is not initialized"
         self._cached_module.ragged_run(*run_args)
