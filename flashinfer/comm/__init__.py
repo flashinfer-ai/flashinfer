@@ -40,12 +40,15 @@ from .vllm_ar import register_buffer as vllm_register_buffer
 from .vllm_ar import register_graph_buffers as vllm_register_graph_buffers
 
 # MNNVL A2A (Throughput Backend)
-from .trtllm_moe_a2a import MoeAlltoAll as MoeAlltoAll
-from .trtllm_moe_a2a import moe_a2a_combine as moe_a2a_combine
-from .trtllm_moe_a2a import moe_a2a_dispatch as moe_a2a_dispatch
-from .trtllm_moe_a2a import moe_a2a_initialize as moe_a2a_initialize
-from .trtllm_moe_a2a import (
+from .trtllm_moe_alltoall import MoeAlltoAll as MoeAlltoAll
+from .trtllm_moe_alltoall import moe_a2a_combine as moe_a2a_combine
+from .trtllm_moe_alltoall import moe_a2a_dispatch as moe_a2a_dispatch
+from .trtllm_moe_alltoall import moe_a2a_initialize as moe_a2a_initialize
+from .trtllm_moe_alltoall import (
     moe_a2a_sanitize_expert_ids as moe_a2a_sanitize_expert_ids,
+)
+from .trtllm_moe_alltoall import (
+    moe_a2a_get_workspace_size_per_rank as moe_a2a_get_workspace_size_per_rank,
 )
 
 # from .mnnvl import MnnvlMemory, MnnvlMoe, MoEAlltoallInfo

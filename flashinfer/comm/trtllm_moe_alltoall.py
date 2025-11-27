@@ -168,12 +168,26 @@ def get_mnnvl_a2a_module():
         """
         return module.moe_a2a_get_metainfo_index_pairs()
 
+    @register_custom_op(
+        "flashinfer::moe_a2a_get_workspace_size_per_rank",
+        mutates_args=[],
+    )
+    def moe_a2a_get_workspace_size_per_rank(
+        ep_size: int,
+        max_num_tokens: int,
+        payload_size_per_element: int,
+    ):
+        return module.moe_a2a_get_workspace_size_per_rank(
+            ep_size, max_num_tokens, payload_size_per_element
+        )
+
     return SimpleNamespace(
         moe_a2a_initialize=moe_a2a_initialize,
         moe_a2a_dispatch=moe_a2a_dispatch,
         moe_a2a_combine=moe_a2a_combine,
         moe_a2a_sanitize_expert_ids=moe_a2a_sanitize_expert_ids,
         moe_a2a_get_metainfo_index_pairs=moe_a2a_get_metainfo_index_pairs,
+        moe_a2a_get_workspace_size_per_rank=moe_a2a_get_workspace_size_per_rank,
     )
 
 
@@ -300,6 +314,16 @@ def moe_a2a_sanitize_expert_ids(
     )
 
 
+def moe_a2a_get_workspace_size_per_rank(
+    ep_size: int,
+    max_num_tokens: int,
+    payload_size_per_element: int,
+):
+    return get_mnnvl_a2a_module().moe_a2a_get_workspace_size_per_rank(
+        ep_size, max_num_tokens, payload_size_per_element
+    )
+
+
 class MoeAlltoAll:
     """
     Manages MoE All-to-All operations with proper workspace allocation and synchronization.
@@ -314,7 +338,40 @@ class MoeAlltoAll:
     """
 
     # Single shared workspace across the process
-    _WORKSPACE: Optional[dict] = None
+    # _WORKSPACE: Optional[dict] = None
+    _WORKSPACE_CACHE: dict[tuple[int, int, int, int], dict] = {}
+
+    @classmethod
+    def get_workspace(
+        cls,
+        workspace_size_per_rank: int,
+        ep_rank: int,
+        ep_size: int,
+        max_num_tokens: int,
+        mapping: Mapping,
+    ) -> dict:
+        key = (workspace_size_per_rank, ep_rank, ep_size, max_num_tokens)
+        if key in cls._WORKSPACE_CACHE:
+            return cls._WORKSPACE_CACHE[key]
+        else:
+            mnnvl_mem = MnnvlMemory(mapping, workspace_size_per_rank)
+            workspace = mnnvl_mem.as_torch_strided_tensor(torch.uint8)
+            metainfo = moe_a2a_initialize(
+                workspace,
+                ep_rank,
+                ep_size,
+                max_num_tokens,
+            )
+            cls._WORKSPACE_CACHE[key] = {
+                "workspace_size_per_rank": workspace_size_per_rank,
+                "max_num_tokens": max_num_tokens,
+                "ep_rank": ep_rank,
+                "ep_size": ep_size,
+                "mnnvl_mem": mnnvl_mem,
+                "workspace": workspace,
+                "metainfo": metainfo,
+            }
+            return cls._WORKSPACE_CACHE[key]
 
     # Metainfo index constants (loaded dynamically from C++)
     # These offsets allow accessing internal workspace data for testing/debugging
@@ -379,39 +436,41 @@ class MoeAlltoAll:
             raise ValueError("num_experts must be a positive int")
 
         # Allocate or reuse workspace
-        if self._WORKSPACE is None:
-            mnnvl_mem = MnnvlMemory(mapping, workspace_size_per_rank)
-            workspace = mnnvl_mem.as_torch_strided_tensor(torch.uint8)
-            metainfo = moe_a2a_initialize(
-                workspace,
-                self.ep_rank,
-                self.ep_size,
-                self.max_num_tokens,
-            )
-            MoeAlltoAll._WORKSPACE = {
-                "workspace_size_per_rank": workspace_size_per_rank,
-                "max_num_tokens": self.max_num_tokens,
-                "ep_rank": self.ep_rank,
-                "ep_size": self.ep_size,
-                "mnnvl_mem": mnnvl_mem,
-                "workspace": workspace,
-                "metainfo": metainfo,
-            }
-        else:
-            # Validate workspace compatibility
-            assert (
-                self._WORKSPACE["workspace_size_per_rank"] == workspace_size_per_rank
-            ), "Workspace size mismatch"
-            assert self._WORKSPACE["max_num_tokens"] == self.max_num_tokens, (
-                "Max tokens mismatch"
-            )
-            assert self._WORKSPACE["ep_rank"] == self.ep_rank, "EP rank mismatch"
-            assert self._WORKSPACE["ep_size"] == self.ep_size, "EP size mismatch"
+        self._WORKSPACE = self.get_workspace(
+            workspace_size_per_rank,
+            self.ep_rank,
+            self.ep_size,
+            self.max_num_tokens,
+            mapping,
+        )
+        # Validate workspace compatibility
+        assert self._WORKSPACE["workspace_size_per_rank"] == workspace_size_per_rank, (
+            "Workspace size mismatch"
+        )
+        assert self._WORKSPACE["max_num_tokens"] == self.max_num_tokens, (
+            "Max tokens mismatch"
+        )
+        assert self._WORKSPACE["ep_rank"] == self.ep_rank, "EP rank mismatch"
+        assert self._WORKSPACE["ep_size"] == self.ep_size, "EP size mismatch"
 
         self.mnnvl_mem = self._WORKSPACE["mnnvl_mem"]
         self.workspace = self._WORKSPACE["workspace"]
         self.metainfo = self._WORKSPACE["metainfo"]
         self._state = _A2AState()
+
+    def _reset_workspace(self):
+        """Reset the workspace to free up its state. This is mainly used for testing. Use this with caution. This object is no longer usable after this."""
+        torch.cuda.synchronize()
+        del self._WORKSPACE
+        del self._WORKSPACE_CACHE[
+            (
+                self.workspace_size_per_rank,
+                self.ep_rank,
+                self.ep_size,
+                self.max_num_tokens,
+            )
+        ]
+        self._state.phase = "deleted"
 
     def dispatch(
         self,
@@ -556,4 +615,5 @@ __all__ = [
     "moe_a2a_dispatch",
     "moe_a2a_combine",
     "moe_a2a_sanitize_expert_ids",
+    "moe_a2a_get_workspace_size_per_rank",
 ]
