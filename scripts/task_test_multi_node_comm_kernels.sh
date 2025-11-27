@@ -16,4 +16,4 @@ set -x
 
 pytest -s tests/comm/test_mnnvl_memory.py
 pytest -s tests/comm/test_trtllm_mnnvl_allreduce.py
-pytest -s tests/comm/test_mnnvl_a2a.py
+pytest -s tests/comm/test_mnnvl_moe_alltoall.py
