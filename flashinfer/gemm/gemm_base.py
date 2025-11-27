@@ -219,7 +219,7 @@ def mm_bf16(
     >>> import torch
     >>> import torch.nn.functional as F
     >>> import flashinfer
-    >>> input = torch.randn([48, 64], device="cuda", dtype=torch.bfloat16
+    >>> input = torch.randn([48, 64], device="cuda", dtype=torch.bfloat16)
     >>> weight = torch.randn([80, 64], device="cuda", dtype=torch.bfloat16).transpose(-2, -1)
     >>> out = flashinfer.mm_bf16(input, weight)
     >>> print(out.shape)
@@ -296,7 +296,7 @@ def bmm_bf16(
     >>> import torch
     >>> import torch.nn.functional as F
     >>> import flashinfer
-    >>> input = torch.randn([16, 48, 64], device="cuda", dtype=torch.bfloat16
+    >>> input = torch.randn([16, 48, 64], device="cuda", dtype=torch.bfloat16)
     >>> weight = torch.randn([16, 80, 64], device="cuda", dtype=torch.bfloat16).transpose(-2, -1)
     >>> out = flashinfer.bmm_bf16(input, weight)
     >>> print(out.shape)
