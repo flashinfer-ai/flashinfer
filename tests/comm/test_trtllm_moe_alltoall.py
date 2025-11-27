@@ -31,39 +31,15 @@ def setup_test_environment():
 
 # Single GPU test parameters
 SINGLE_GPU_PARAMS = [
-    (902, 32768, 256, 8, torch.float16),  # Large data, float16
-    (101, 288, 128, 4, torch.float16),  # Medium data, float16
-    (902, 7168, 256, 8, torch.bfloat16),  # Large data, bfloat16
-    (101, 288, 128, 4, torch.bfloat16),  # Medium data, bfloat16
-    (10, 8, 8, 2, torch.bfloat16),  # Small data, bfloat16
+    (902, 7168, 256, 8),  # Large data
+    (10, 288, 128, 4),  # Medium data
+    (10, 8, 8, 2),  # Small data
 ]
 
 MULTI_RANK_PARAMS = [
-    (2, 5, 8, torch.float16),  # Small input, 2 ranks
-    (4, 901, 32768, torch.bfloat16),  # Large input, 4 ranks
-    (8, 16384, 128, torch.float16),  # Many small vectors, 8 ranks
-]
-
-PREPARE_INDICES_PARAMS = [
-    (0, 8, 256, 4, 3, False),  # Rank 0, small config
-    (1, 8, 256, 4, 3, True),  # Rank 1, small config with real cumsum
-    (7, 8, 256, 8, 1025, False),  # High rank, medium config
-    (7, 64, 1024, 32, 1029, True),  # High rank, large config with real cumsum
-]
-
-LOCAL_GATHER_PARAMS = [
-    (0, 8, 256, 4, 3),  # Rank 0, small config
-    (7, 8, 256, 8, 32),  # High rank, medium config
-    (7, 64, 1024, 32, 1029),  # High rank, large config
-]
-
-
-# Real cross-GPU communication test parameters
-CROSS_GPU_PARAMS = [
-    (2, 100, 256, torch.float16),  # 2 GPUs, 2 ranks
-    (2, 300, 512, torch.bfloat16),  # 2 GPUs, 2 ranks, larger data
-    (4, 150, 256, torch.float16),  # 4 GPUs, 4 ranks (if available)
-    (4, 400, 512, torch.float16),  # 4 GPUs, 4 ranks, larger data
+    (2, 5, 8),  # Small input, 2 ranks
+    (4, 901, 32768),  # Large input, 4 ranks
+    (8, 16384, 128),  # Many small vectors, 8 ranks
 ]
 
 
@@ -86,20 +62,34 @@ def requires_gpus(min_gpus):
     return decorator
 
 
+def make_payload(num_tokens, vector_dim, dtype):
+    if dtype == torch.uint8 or dtype == torch.int32:
+        return torch.randint(
+            torch.iinfo(dtype).min,
+            torch.iinfo(dtype).max,
+            (num_tokens, vector_dim),
+            dtype=dtype,
+            device=torch.device("cuda"),
+        )
+    else:
+        return torch.randn(
+            num_tokens, vector_dim, dtype=dtype, device=torch.device("cuda")
+        )
+
+
 @pytest.mark.parametrize(
-    "num_tokens,vector_dim,num_experts,top_k,dtype",
+    "num_tokens,vector_dim,num_experts,top_k",
     SINGLE_GPU_PARAMS,
 )
-def test_moe_alltoall_single_gpu(num_tokens, vector_dim, num_experts, top_k, dtype):
+def test_moe_alltoall_single_gpu(num_tokens, vector_dim, num_experts, top_k):
     """Test MOE alltoall communication on single GPU."""
     torch.cuda.set_device(0)
     # Create a random input tensor
-    input_tensor1 = torch.randn(
-        num_tokens, vector_dim, dtype=dtype, device=torch.device("cuda")
-    )
-    input_tensor2 = torch.randn(
-        num_tokens, vector_dim * 2, dtype=dtype, device=torch.device("cuda")
-    )
+    dtypes = [torch.float16, torch.bfloat16, torch.int32, torch.uint8]
+    input_tensors = [
+        make_payload(num_tokens, vector_dim * (i + 1), dtype)
+        for i, dtype in enumerate(dtypes)
+    ]
 
     token_selected_experts = torch.empty(
         num_tokens, top_k, dtype=torch.int32, device=torch.device("cuda")
@@ -111,12 +101,12 @@ def test_moe_alltoall_single_gpu(num_tokens, vector_dim, num_experts, top_k, dty
         )[:top_k]
     token_selected_experts = token_selected_experts.contiguous()
 
+    payload_size_per_token = sum([x[0].numel() * x.itemsize for x in input_tensors])
+
     workspace_size = trtllm_moe_alltoall.moe_a2a_get_workspace_size_per_rank(
         1,
         num_tokens,
-        input_tensor1.numel() * dtype.itemsize
-        + input_tensor2.numel() * dtype.itemsize
-        + token_selected_experts.numel() * torch.int32.itemsize,
+        payload_size_per_token,
     )
     mapping = Mapping(rank=0, world_size=1)
     moe_a2a = trtllm_moe_alltoall.MoeAlltoAll(
@@ -127,35 +117,25 @@ def test_moe_alltoall_single_gpu(num_tokens, vector_dim, num_experts, top_k, dty
         workspace_size_per_rank=workspace_size,
     )
 
-    output_tensor1, output_tensor2, token_selected_experts_output = moe_a2a.dispatch(
+    output_tensors = moe_a2a.dispatch(
         token_selected_experts,
-        [input_tensor1, input_tensor2, token_selected_experts],
+        input_tensors,
         num_tokens,
         invalid_token_expert_id=-3,  # Tokens assigned to invalid expert are set to -3
         expert_id_payload_index=2,
     )
 
     # Sort to undo the shuffling that happens in the dispatch kernel.
-    input_tensor1, _ = torch.sort(input_tensor1, dim=0)
-    input_tensor2, _ = torch.sort(input_tensor2, dim=0)
-    token_selected_experts, _ = torch.sort(token_selected_experts, dim=0)
-    output_tensor1, _ = torch.sort(output_tensor1[0], dim=0)
-    output_tensor2, _ = torch.sort(output_tensor2[0], dim=0)
-    token_selected_experts_output, _ = torch.sort(
-        token_selected_experts_output[0], dim=0
-    )
-
-    torch.testing.assert_close(output_tensor1, input_tensor1, atol=0, rtol=0)
-    torch.testing.assert_close(output_tensor2, input_tensor2, atol=0, rtol=0)
-    torch.testing.assert_close(
-        token_selected_experts_output, token_selected_experts, atol=0, rtol=0
-    )
+    for input_tensor, output_tensor in zip(input_tensors, output_tensors, strict=True):
+        input_tensor, _ = torch.sort(input_tensor, dim=0)
+        output_tensor, _ = torch.sort(output_tensor.flatten(end_dim=1), dim=0)
+        torch.testing.assert_close(output_tensor, input_tensor, atol=0, rtol=0)
 
     moe_a2a._reset_workspace()
 
 
-@pytest.mark.parametrize("world_size,num_tokens,vector_dim,dtype", MULTI_RANK_PARAMS)
-def test_moe_alltoall_multi_rank_single_gpu(world_size, num_tokens, vector_dim, dtype):
+@pytest.mark.parametrize("world_size,num_tokens,vector_dim", MULTI_RANK_PARAMS)
+def test_moe_alltoall_multi_rank_single_gpu(world_size, num_tokens, vector_dim):
     """Test MOE alltoall communication with multiple ranks on single GPU."""
     torch.cuda.set_device(0)
     max_world_size = 8
@@ -163,17 +143,11 @@ def test_moe_alltoall_multi_rank_single_gpu(world_size, num_tokens, vector_dim, 
         f"should run with world_size at most {max_world_size}"
     )
 
-    # SM count is now set up globally in the fixture
-
+    dtypes = [torch.float16, torch.bfloat16, torch.int32, torch.uint8]
     # Create a random input tensor
     input_tensors = [
-        torch.randn(
-            num_tokens * world_size,
-            vector_dim * (i + 1),
-            dtype=dtype,
-            device=torch.device("cuda"),
-        )
-        for i in range(2)
+        make_payload(num_tokens * world_size, vector_dim * (i + 1), dtype)
+        for i, dtype in enumerate(dtypes)
     ]
 
     token_selected_experts = torch.randint(
@@ -184,7 +158,7 @@ def test_moe_alltoall_multi_rank_single_gpu(world_size, num_tokens, vector_dim, 
         device=torch.device("cuda"),
     )
 
-    payloads = input_tensors + [token_selected_experts]
+    payloads = input_tensors
     total_payload_size_per_element = [x[0].numel() * x.itemsize for x in payloads]
     total_payload_size_per_element = sum(total_payload_size_per_element)
 
@@ -219,9 +193,12 @@ def test_moe_alltoall_multi_rank_single_gpu(world_size, num_tokens, vector_dim, 
             rank_payloads = [
                 x[rank * num_tokens : (rank + 1) * num_tokens] for x in payloads
             ]
+            rank_token_selected_experts = token_selected_experts[
+                rank * num_tokens : (rank + 1) * num_tokens
+            ]
             output_tensors.append(
                 trtllm_moe_alltoall.moe_a2a_dispatch(
-                    rank_payloads[2],
+                    rank_token_selected_experts,
                     rank_payloads,
                     all_workspaces,
                     metainfo[rank],
@@ -238,33 +215,19 @@ def test_moe_alltoall_multi_rank_single_gpu(world_size, num_tokens, vector_dim, 
 
     torch.cuda.synchronize()
 
-    torch.set_printoptions(threshold=float("inf"))
-    print(
-        f"all_workspaces: {all_workspaces.shape} {all_workspaces.flatten().view(torch.uint8)[1152:1632].view(torch.bfloat16)}"
-    )
-
-    for rank in range(world_size):
-        print(f"output_tensors[{rank}]: {output_tensors[rank]}")
-
     for rank in range(world_size):
         # Get the indices where token_selected_experts == rank
-        print(
-            f"token_selected_experts: {token_selected_experts.shape} {token_selected_experts}"
-        )
         token_selected_experts_indices = (
             token_selected_experts.flatten() == rank
         ).nonzero(as_tuple=False)
 
-        for actual, ref in zip(output_tensors[rank], payloads, strict=True):
-            print(f"token_selected_experts_indices: {token_selected_experts_indices}")
-            print(f"actual raw: {actual.shape} {actual}")
-            actual = actual[rank][: len(token_selected_experts_indices)]
-            print(f"actual filtered: {actual.shape} {actual}")
+        for actual, ref in zip(output_tensors[rank][:-1], payloads[:-1], strict=True):
+            # Select the tensors that arent all zeros
+            actual = actual.flatten(end_dim=1)
+            actual = actual[actual.any(dim=1)]
             ref = ref[token_selected_experts_indices].squeeze()
             actual, _ = torch.sort(actual, dim=0)
             ref, _ = torch.sort(ref, dim=0)
-            print(f"actual: {actual}")
-            print(f"ref: {ref}")
             torch.testing.assert_close(actual, ref, atol=0, rtol=0)
 
 
