@@ -148,8 +148,9 @@ def variable_length_merge_states_kernel(
         for head_idx in tl.range(bdy):
             o, m, d = 0.0, -5e4, 1.0
             for iter in tl.range(tl.load(indptr + pos), tl.load(indptr + pos + 1)):
-                s = tl.load(s_ptr + iter * num_heads + head_idx)
-                v = tl.load(v_ptr + (iter * num_heads + head_idx) * head_dim + tx)
+                iter_i64 = iter.to(tl.int64)
+                s = tl.load(s_ptr + iter_i64 * num_heads + head_idx)
+                v = tl.load(v_ptr + (iter_i64 * num_heads + head_idx) * head_dim + tx)
                 o, m, d = state_merge(o, m, d, v, s, 1)
             o, m, d = state_normalize(o, m, d)
             tl.store(v_merged_ptr + (pos * num_heads + head_idx) * head_dim + tx, o)

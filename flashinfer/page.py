@@ -34,42 +34,6 @@ def get_page_module():
     return gen_page_module().build_and_load()
 
 
-def block_sparse_indices_to_vector_sparse_offsets(
-    block_sparse_indices: torch.Tensor,
-    block_sparse_indptr: torch.Tensor,
-    vector_sparse_offsets: torch.Tensor,
-    vector_sparse_indptr: torch.Tensor,
-    kv_lens: torch.Tensor,
-    stride_block: int,
-    stride_n: int,
-    block_size: int,
-) -> torch.Tensor:
-    if block_size == 1:
-        if stride_block == 1:
-            return block_sparse_indices
-        else:
-            return block_sparse_indices * stride_block
-
-    assert block_sparse_indices.dtype == torch.int32
-    assert block_sparse_indptr.dtype == torch.int32
-    assert vector_sparse_offsets.dtype == torch.int32
-    assert vector_sparse_indptr.dtype == torch.int32
-    assert kv_lens.dtype == torch.int32
-    batch_size = block_sparse_indptr.size(0) - 1
-    get_page_module().block_sparse_indices_to_vector_sparse_offsets(
-        block_sparse_indices,
-        block_sparse_indptr,
-        vector_sparse_offsets,
-        vector_sparse_indptr,
-        kv_lens,
-        stride_block,
-        stride_n,
-        batch_size,
-        block_size,
-    )
-    return vector_sparse_offsets
-
-
 @register_custom_op(
     "flashinfer::append_paged_mla_kv_cache",
     mutates_args=("ckv_cache", "kpe_cache"),
