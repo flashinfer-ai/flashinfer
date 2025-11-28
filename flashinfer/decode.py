@@ -57,6 +57,7 @@ from .utils import (
     _get_range_buf,
     _unpack_paged_kv_cache,
     canonicalize_torch_dtype,
+    determine_attention_backend,
     device_support_pdl,
     get_device_sm_count,
     is_float8,
@@ -715,7 +716,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 self._jit_module = get_batch_prefill_jit_module(
                     jit_args[0],
                     gen_customize_batch_prefill_module(
-                        "fa2", *jit_args
+                        backend, *jit_args
                     ).build_and_load(),
                 )
             else:
@@ -837,6 +838,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         seq_lens: Optional[torch.Tensor] = None,
         fixed_split_size: Optional[int] = None,
         disable_split_kv: bool = False,
+        o_data_type: Optional[Union[str, torch.dtype]] = None,
     ) -> None:
         r"""Plan batch decode for given problem specification.
 
@@ -970,6 +972,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
         if kv_data_type is None:
             kv_data_type = q_data_type
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
+        if o_data_type is None:
+            o_data_type = q_data_type
+        o_data_type = canonicalize_torch_dtype(o_data_type)
+
         if fixed_split_size is not None and not self.use_tensor_cores:
             raise ValueError(
                 "fixed_split_size is only supported by tensor core decode for now."
@@ -1018,7 +1024,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._cached_module = get_trtllm_gen_decode_module(
                 q_data_type,
                 kv_data_type,
-                q_data_type,
+                o_data_type,
                 indptr.dtype,
                 head_dim,
                 head_dim,
@@ -1033,11 +1039,20 @@ class BatchDecodeWithPagedKVCacheWrapper:
             if self._jit_module is not None:
                 self._cached_module = self._jit_module
             else:
+                if self._backend == "auto":
+                    self._backend = determine_attention_backend(
+                        self.device,
+                        PosEncodingMode[pos_encoding_mode].value,
+                        False,  # use_fp16_qk_reduction
+                        False,  # use_custom_mask
+                        q_data_type,
+                        kv_data_type,
+                    )
                 self._cached_module = get_batch_prefill_module(
-                    "fa2",
+                    self._backend,
                     q_data_type,
                     kv_data_type,
-                    q_data_type,
+                    o_data_type,
                     indptr.dtype,
                     head_dim,  # head_dim_qk
                     head_dim,  # head_dim_vo
@@ -1047,7 +1062,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     False,  # use_fp16_qk_reduction
                 )
 
-            self._plan_info = self._cached_module.plan(
+            args = [
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
                 self._pin_memory_int_workspace_buffer,
@@ -1064,9 +1079,13 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 head_dim,
                 False,  # causal
                 window_left,
-                fixed_split_size,
-                disable_split_kv,
-                0,  # num_colocated_ctas
+            ]
+            if self._backend == "fa2":
+                args.append(fixed_split_size)
+                args.append(disable_split_kv)
+                args.append(0)  # num_colocated_ctas
+            self._plan_info = self._cached_module.plan(
+                *args,
             )
         else:
             if self._jit_module is not None:
@@ -1075,7 +1094,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 self._cached_module = get_batch_decode_module(
                     q_data_type,
                     kv_data_type,
-                    q_data_type,
+                    o_data_type,
                     indptr.dtype,
                     head_dim,  # head_dim_qk
                     head_dim,  # head_dim_vo
@@ -2938,7 +2957,7 @@ def fast_decode_plan(
             kv_lens_arr_host = get_seq_lens(indptr_host, last_page_len_host, page_size)
 
             try:
-                # Make sure we pass exactly 16 arguments for tensor core version
+                # Make sure we pass exactly 19 arguments for tensor core version
                 self._plan_info = self._cached_module.plan(
                     self._float_workspace_buffer,
                     self._int_workspace_buffer,
