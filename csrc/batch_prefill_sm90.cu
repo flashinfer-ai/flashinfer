@@ -170,6 +170,9 @@ void BatchPrefillWithPagedKVCacheSM90Run(
     ffi::TensorView paged_kv_indices, ffi::TensorView paged_kv_last_page_len, ffi::TensorView o,
     Optional<ffi::TensorView> maybe_lse, int64_t mask_mode_code, int64_t layout,
     int64_t window_left, bool enable_pdl ADDITIONAL_FUNC_PARAMS) {
+
+  std::cout << ">>>> in BatchPrefillWithPagedKVCacheSM90Run() default <<<<" << std::endl;
+
   PrefillPlanSM90Info plan_info;
   plan_info.FromVector(std::vector<int64_t>(plan_info_vec.begin(), plan_info_vec.end()));
 

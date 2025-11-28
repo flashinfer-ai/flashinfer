@@ -88,14 +88,22 @@ void BatchPrefillWithPagedKVCacheSM90Run(
     ffi::TensorView paged_kv_indices, ffi::TensorView paged_kv_last_page_len, ffi::TensorView o,
     Optional<ffi::TensorView> maybe_lse, int64_t mask_mode_code, int64_t layout,
     int64_t window_left, bool enable_pdl ADDITIONAL_FUNC_PARAMS) {
+
+  std::cout << ">>>> in BatchPrefillWithPagedKVCacheSM90Run() FP8 <<<<" << std::endl;
+
   PrefillPlanSM90Info plan_info;
   plan_info.FromVector(std::vector<int64_t>(plan_info_vec.begin(), plan_info_vec.end()));
+
+  std::cout << ">>>> before maybe_lse.has_value() <<<<" << std::endl;
 
   if (maybe_lse.has_value()) {
     const auto& lse = maybe_lse.value();
     TVM_FFI_ICHECK_EQ(lse.size(0), q.size(0));
     TVM_FFI_ICHECK_EQ(lse.size(1), q.size(1));
   }
+
+  std::cout << ">>>> before kv_layout check <<<<" << std::endl;
+
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
   int64_t num_kv_heads, page_size;
   int64_t head_dim_qk = q.size(2);
@@ -108,6 +116,8 @@ void BatchPrefillWithPagedKVCacheSM90Run(
     num_kv_heads = paged_k_cache.size(2);
   }
 
+  std::cout << ">>>> before void* float_buffer_ptr = float_workspace_buffer.data_ptr() <<<<" << std::endl;
+
   void* float_buffer_ptr = float_workspace_buffer.data_ptr();
   void* int_buffer_ptr = int_workspace_buffer.data_ptr();
 
@@ -116,20 +126,30 @@ void BatchPrefillWithPagedKVCacheSM90Run(
   const MaskMode mask_mode = static_cast<MaskMode>(mask_mode_code);
   bool use_swa = window_left != -1;
 
+  std::cout << ">>>> before DISPATCH_context <<<<" << std::endl;
+
   DISPATCH_context(
       DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM_QK, HEAD_DIM_VO, USE_SLIDING_WINDOW,
       USE_LOGITS_SOFT_CAP, AttentionVariant, RaggedParams, PagedParams, [&] {
         PagedParams params;
 
+        std::cout << ">>>> before params.q_ptr = static_cast<DTypeQ*>(q.data_ptr()) <<<<" << std::endl;
+
         params.q_ptr = static_cast<DTypeQ*>(q.data_ptr());
         params.k_ptr = static_cast<DTypeKV*>(paged_k_cache.data_ptr());
         params.v_ptr = static_cast<DTypeKV*>(paged_v_cache.data_ptr());
         params.o_ptr = static_cast<DTypeO*>(o.data_ptr());
+
+        std::cout << ">>>> before params.lse_ptr = maybe_lse ? static_cast<float*>(maybe_lse.value().data_ptr()) : nullptr <<<<" << std::endl;
+
         params.lse_ptr = maybe_lse ? static_cast<float*>(maybe_lse.value().data_ptr()) : nullptr;
         params.q_stride_n = q.stride(0);
         params.q_stride_h = q.stride(1);
         params.o_stride_n = o.stride(0);
         params.o_stride_h = o.stride(1);
+
+        std::cout << ">>>> before kv_layout check <<<<" << std::endl;
+
         if (kv_layout == QKVLayout::kNHD) {
           // (num_pages, page_size, num_heads, head_dim)
           params.k_stride_n = paged_k_cache.stride(1);
@@ -143,6 +163,9 @@ void BatchPrefillWithPagedKVCacheSM90Run(
           params.v_stride_h = paged_v_cache.stride(1);
           params.v_stride_n = paged_v_cache.stride(2);
         }
+
+        std::cout << ">>>> before params.nnz_qo = q.size(0) <<<<" << std::endl;
+
         params.nnz_qo = q.size(0);
         params.num_qo_heads = q.size(1);
         params.num_kv_heads = num_kv_heads;
@@ -150,6 +173,9 @@ void BatchPrefillWithPagedKVCacheSM90Run(
         params.page_size = page_size;
         params.window_left = window_left;
         params.causal = mask_mode_code == 1;
+
+        std::cout << ">>>> before params.qo_tile_indices = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.qo_tile_indices_offset) <<<<" << std::endl;
+
         params.qo_tile_indices =
             GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.qo_tile_indices_offset);
         params.qo_indptr = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.qo_indptr_offset);
@@ -164,12 +190,18 @@ void BatchPrefillWithPagedKVCacheSM90Run(
             GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.work_indptr_offset);
         params.kv_indices = static_cast<IdType*>(paged_kv_indices.data_ptr());
 
+        std::cout << ">>>> before ADDITIONAL_PARAMS_SETTER <<<<" << std::endl;
+
         ADDITIONAL_PARAMS_SETTER
+
+        std::cout << ">>>> before static_assert <<<<" << std::endl;
 
         // Not support various head_dim for now
         static_assert(HEAD_DIM_QK == HEAD_DIM_VO, "head_dim_qk and head_dim_vo should be the same");
         // Currently only support same quantization precision
         static_assert(std::is_same_v<DTypeQ, DTypeKV>);
+
+        std::cout << ">>>> before bool same_schedule_for_all_heads = plan_info.same_schedule_for_all_heads <<<<" << std::endl;
 
         bool same_schedule_for_all_heads = plan_info.same_schedule_for_all_heads;
         DISPATCH_BOOL(same_schedule_for_all_heads, SAME_SCHEDULER_FOR_ALL_HEADS, [&] {

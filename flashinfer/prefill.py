@@ -1561,6 +1561,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         max_sequence_kv: Optional[int] = None,
         fixed_split_size: Optional[int] = None,
         disable_split_kv: bool = False,
+        o_data_type: Optional[Union[str, torch.dtype]] = None,
     ) -> None:
         r"""Plan batch prefill/append attention on Paged KV-Cache for given problem specification.
 
@@ -1680,10 +1681,18 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         The :meth:`plan` method cannot be used in Cuda Graph or in ``torch.compile``.
         """
+        print(f"in plan(): q_data_type: {q_data_type}")
+        print(f"in plan(): kv_data_type: {kv_data_type}")
+        print(f"in plan(): o_data_type: {kv_data_type}")
         q_data_type = canonicalize_torch_dtype(q_data_type)
+
         if kv_data_type is None:
             kv_data_type = q_data_type
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
+
+        if o_data_type is None:
+            o_data_type = q_data_type
+        o_data_type = canonicalize_torch_dtype(o_data_type)
 
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
@@ -1814,6 +1823,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         self._cached_q_data_type = q_data_type
         self._cached_kv_data_type = kv_data_type
+        self._cached_o_data_type = o_data_type
 
         if self._jit_module is not None:
             self._cached_module = self._jit_module
@@ -1827,11 +1837,15 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     q_data_type,
                     kv_data_type,
                 )
+            print(f"backend: {self._backend}")
+            print(f"q_data_type: {q_data_type}")
+            print(f"kv_data_type: {kv_data_type}")
+            print(f"o_data_type: {o_data_type}")
             if self._backend != "cudnn":
                 get_module_args = (
                     q_data_type,
                     kv_data_type,
-                    q_data_type,
+                    o_data_type,
                     paged_kv_indptr.dtype,
                     head_dim_qk,
                     head_dim_vo,
@@ -2048,6 +2062,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
         _check_cached_qkv_data_type(
             q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
         )
+        o_dtype = self._cached_o_data_type
+        if out is not None and out.dtype != o_dtype:
+            raise ValueError(
+                f"The dtype of out {out.dtype} does not match the o_data_type {o_dtype} specified in plan function."
+            )
 
         stride_block = k_cache.stride(0)
         if self._kv_layout == "NHD":
@@ -2089,11 +2108,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         if out is None:
             out = torch.empty(
-                q.shape[:-1] + v_cache.shape[-1:], dtype=q.dtype, device=q.device
+                q.shape[:-1] + v_cache.shape[-1:], dtype=o_dtype, device=q.device
             )
         else:
             check_shape_dtype_device(
-                out, q.shape[:-1] + v_cache.shape[-1:], q.dtype, q.device, "out"
+                out, q.shape[:-1] + v_cache.shape[-1:], o_dtype, q.device, "out"
             )
 
         # Convert NHD layout to HND for trtllm-gen backend
