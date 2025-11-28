@@ -188,7 +188,7 @@ Tuple<Array<int64_t>, Array<int64_t>, int64_t> moeA2ADispatchOp(
 
     TVM_FFI_ICHECK(totalBytesNeeded % elementSize == 0)
         << "Misaligned payload buffer " << i << " with element size " << elementSize
-        << ". Consider putting ordering payloads by minimum element size";
+        << ". Consider reordering payloads by largest to smallest element size";
   }
 
   auto* workspaceBase = static_cast<uint8_t*>(workspace.data_ptr());
