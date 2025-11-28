@@ -1,5 +1,8 @@
 import math
 
+import sys
+sys.path.append("./")
+
 import pytest
 import torch
 from tests.test_helpers.utils_fp4 import (
@@ -54,8 +57,13 @@ def generate_seq_lens_prefill(batch_size, max_q_len, max_in_kv_len):
     return q_lens, in_kv_lens, seq_lens
 
 
-def generate_seq_lens_decode(batch_size, q_len_per_req, max_in_kv_len):
-    q_lens = torch.full((batch_size,), q_len_per_req, dtype=torch.int32)
+def generate_seq_lens_decode(batch_size, q_len_per_req, max_in_kv_len, max_q_len):
+    if q_len_per_req is not None:
+        assert max_q_len is None, "Can not specify both q_len_per_req and max_q_len."
+        q_lens = torch.full((batch_size,), q_len_per_req, dtype=torch.int32)
+    else:
+        assert max_q_len is not None, "Must specify either q_len_per_req or max_q_len."
+        q_lens = torch.randint(1, max_q_len + 1, (batch_size,), dtype=torch.int32)
     in_kv_lens = torch.randint(0, max_in_kv_len + 1, (batch_size,), dtype=torch.int)
     in_kv_lens[-1] = max_in_kv_len
     seq_lens = q_lens + in_kv_lens
@@ -746,6 +754,7 @@ def _test_trtllm_batch_decode(
     max_in_kv_len,
     head_dim,
     device_scale=False,
+    max_q_len=None,
 ):
     """
     Common function for testing trtllm-gen decode.
@@ -780,7 +789,7 @@ def _test_trtllm_batch_decode(
     # Generate random sequence lengths
     num_qo_heads = num_kv_heads * head_grp_size
     q_lens, in_kv_lens, seq_lens = generate_seq_lens_decode(
-        batch_size, q_len_per_req, max_in_kv_len
+        batch_size, q_len_per_req, max_in_kv_len, max_q_len
     )
 
     # Create query tensor and related data
@@ -835,7 +844,7 @@ def _test_trtllm_batch_decode(
         "window_left": window_left,
     }
     if not enable_sink:
-        if q_len_per_req == 1:
+        if q_len_per_req is not None and q_len_per_req == 1:
             wrapper_ref = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
                 workspace_buffer_ref, kv_layout, use_tensor_cores=True
             )
@@ -886,7 +895,7 @@ def _test_trtllm_batch_decode(
             kv_indptr=kv_indptr_tokens,
         )
 
-    if q_len_per_req > 1:
+    if (q_len_per_req and q_len_per_req > 1):
         mask = generate_causal_mask(batch_size, q_len_per_req, GPU_DEVICE)
     else:
         mask = None
@@ -923,6 +932,9 @@ def _test_trtllm_batch_decode(
         q_len_per_req=q_len_per_req,
         o_scale=o_scale,
         mask=mask,
+        max_q_len=max_q_len if max_q_len is not None else None,
+        cum_seq_lens_q=q_indptr if max_q_len is not None else None,
+        cum_seq_lens_kv=kv_indptr if max_q_len is not None else None,
     )
     if backend == "trtllm-gen":
         # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
@@ -948,7 +960,7 @@ def _test_trtllm_batch_decode(
 
     # convert to float32 for fp8 is not supported by assert_close
     # relax rtol and atol for speculative decoding test
-    if q_len_per_req > 1:
+    if (q_len_per_req and q_len_per_req > 1) or (max_q_len and max_q_len > 1):
         rtol, atol = rtol * 2, atol * 2
 
     # Arbitary small mismatch rate
@@ -1433,4 +1445,94 @@ def test_trtllm_gen_prefill_deepseek_bs1(
 ):
     test_trtllm_gen_prefill_deepseek(
         batch_size, s_qo, s_kv, num_kv_heads, head_grp_size, causal
+    )
+
+
+def test_trtllm_batch_decode_spec(
+    kv_layout,
+    batch_size,
+    max_q_len,
+    page_size,
+    num_kv_heads,
+    head_grp_size,
+    window_left,
+    q_dtype,
+    o_dtype,
+    kv_dtype,
+    enable_pdl,
+    enable_sink,
+    max_in_kv_len,
+    head_dim,
+):
+    _test_trtllm_batch_decode(
+        "trtllm-gen",
+        kv_layout,
+        batch_size,
+        None, # q_len_per_req
+        page_size,
+        num_kv_heads,
+        head_grp_size,
+        window_left,
+        q_dtype,
+        o_dtype,
+        kv_dtype,
+        enable_pdl,
+        enable_sink,
+        max_in_kv_len,
+        head_dim,
+        max_q_len=max_q_len,
+    )
+
+
+if __name__ == "__main__":
+    # pytest.main([__file__])
+    test_trtllm_batch_decode_spec(
+        kv_layout="HND",
+        batch_size=4,
+        max_q_len=12,
+        page_size=64,
+        num_kv_heads=4,
+        head_grp_size=1,
+        window_left=-1,
+        q_dtype="bf16",
+        kv_dtype="bf16",
+        o_dtype="bf16",
+        enable_pdl=None,
+        enable_sink=False,
+        max_in_kv_len=110,
+        head_dim=128,
+    )
+    _test_trtllm_batch_decode(
+        backend='trtllm-gen',
+        kv_layout="HND",
+        batch_size=4,
+        q_len_per_req=3,
+        page_size=64,
+        num_kv_heads=4,
+        head_grp_size=1,
+        window_left=-1,
+        q_dtype="bf16",
+        kv_dtype="bf16",
+        o_dtype="bf16",
+        enable_pdl=None,
+        enable_sink=False,
+        max_in_kv_len=110,
+        head_dim=128,
+    )
+    _test_trtllm_batch_decode(
+        backend='trtllm-gen',
+        kv_layout="HND",
+        batch_size=4,
+        q_len_per_req=1,
+        page_size=64,
+        num_kv_heads=4,
+        head_grp_size=1,
+        window_left=-1,
+        q_dtype="fp8",
+        kv_dtype="fp8",
+        o_dtype="nvfp4",
+        enable_pdl=None,
+        enable_sink=False,
+        max_in_kv_len=110,
+        head_dim=128,
     )

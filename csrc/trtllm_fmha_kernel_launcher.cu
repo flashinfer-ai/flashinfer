@@ -26,6 +26,7 @@
 #include <sstream>
 #include <unordered_map>
 
+#include "tvm/ffi/error.h"
 #include "tvm_ffi_utils.h"
 
 using tvm::ffi::Optional;
@@ -163,6 +164,9 @@ void trtllm_paged_attention_launcher(
         use_multi_block ? TileScheduler::Static : TileScheduler::Persistent;
     runner_params.mMultiCtasKvMode = use_multi_block;
 
+    runner_params.cumSeqLensQPtr = cum_seq_lens_q;
+    runner_params.cumSeqLensKvPtr = cum_seq_lens_kv;
+
     size_t max_batch_size = 8192;   // todo(Yingyi): get from dlfw
     size_t max_num_qo_heads = 256;  // todo(Yingyi): get from dlfw, in total 8MB
     size_t num_semaphores =
@@ -213,7 +217,11 @@ void trtllm_paged_attention_decode(
     TensorView seq_lens, int64_t max_kv_len, Variant<double, ffi::Tensor> bmm1_scale,
     Variant<double, ffi::Tensor> bmm2_scale, double o_sf_scale, int64_t o_sf_vec_size,
     int64_t o_sf_start_index, int64_t window_left, int64_t sparse_mla_top_k, int64_t sm_count,
-    bool enable_pdl, int64_t workspace_size, Optional<TensorView> attention_sinks) {
+    bool enable_pdl, int64_t workspace_size, Optional<TensorView> attention_sinks,
+    Optional<int64_t> optional_max_q_len,
+    Optional<TensorView> cum_seq_lens_q,
+    Optional<TensorView> cum_seq_lens_kv
+  ) {
   auto q_data_type = dl_dtype_to_tllm_data_type(query.dtype());
   auto kv_data_type = dl_dtype_to_tllm_data_type(key_cache.dtype());
   TVM_FFI_ICHECK_EQ(key_cache.ndim(), value_cache.ndim());
@@ -221,14 +229,37 @@ void trtllm_paged_attention_decode(
     TVM_FFI_ICHECK_EQ(key_cache.size(i), value_cache.size(i));
   }
   auto o_data_type = dl_dtype_to_tllm_data_type(out.dtype());
-  // NOTE(Zihao): query is [B, Q, H, D]
-  // where Q is the number of query tokens per request, used in MTP
-  // based on profiled results, always use decode mode for MTP (q_len is small)
-  // example: when kv_len = 10000, q < 200, decode mode is faster
-  int batch_size = query.size(0);
-  int q_len_per_request = query.size(1);
-  int sum_seq_q = batch_size * q_len_per_request;
-  int num_qo_heads = query.size(2);
+  int batch_size;
+  int max_q_len;
+  int sum_seq_q;
+  int num_qo_heads;
+  int* cum_seq_lens_q_ptr = nullptr; 
+  int* cum_seq_lens_kv_ptr = nullptr;
+  if (!optional_max_q_len.has_value()) {
+    // each request has the same length
+
+    // NOTE(Zihao): query is [B, Q, H, D]
+    // where Q is the number of query tokens per request, used in MTP
+    // based on profiled results, always use decode mode for MTP (q_len is small)
+    // example: when kv_len = 10000, q < 200, decode mode is faster
+    int q_len_per_request = query.size(1);
+    batch_size = query.size(0);
+    sum_seq_q = batch_size * q_len_per_request;
+    num_qo_heads = query.size(2);
+    max_q_len = q_len_per_request;
+  } else {
+    // each request has different length
+    TVM_FFI_CHECK(cum_seq_lens_q.has_value(), "cum_seq_lens_q must be provided when max_q_len is provided");
+    TVM_FFI_CHECK(cum_seq_lens_kv.has_value(), "cum_seq_lens_kv must be provided when max_q_len is provided");
+    // the shape of query: [sum_seq_q, num_qo_heads, head_dim_q]
+    // the shape of cum_seq_lens_q: [batch_size + 1]
+    batch_size = cum_seq_lens_q.value().size(0) - 1;
+    sum_seq_q = query.size(0);
+    num_qo_heads = query.size(1);
+    max_q_len = optional_max_q_len.value();
+    cum_seq_lens_q_ptr = static_cast<int*>(cum_seq_lens_q.value().data_ptr());
+    cum_seq_lens_kv_ptr = static_cast<int*>(cum_seq_lens_kv.value().data_ptr());
+  }
   // Multiply by two for FP4 tensor as it is stored as UINT8 dtype. Assume the dim is even.
   int head_dim_k = is_4bit(kv_data_type) ? key_cache.size(-1) * 2 : key_cache.size(-1);
   int head_dim_q = is_4bit(q_data_type) ? query.size(-1) * 2 : query.size(-1);
@@ -285,9 +316,9 @@ void trtllm_paged_attention_decode(
       out.data_ptr(), output_sf_ptr, query.data_ptr(), key_cache.data_ptr(), value_cache.data_ptr(),
       workspace_buffer.data_ptr(), static_cast<int*>(block_tables.data_ptr()),
       static_cast<int*>(seq_lens.data_ptr()),
-      /*cum_seq_lens_q=*/nullptr,
-      /*cum_seq_lens_kv=*/nullptr, attention_sinks_ptr, q_data_type, kv_data_type, o_data_type,
-      TllmPagedAttentionMode::ForGen, batch_size, /*max_q_len=*/q_len_per_request, max_kv_len,
+      cum_seq_lens_q_ptr,
+      cum_seq_lens_kv_ptr, attention_sinks_ptr, q_data_type, kv_data_type, o_data_type,
+      TllmPagedAttentionMode::ForGen, batch_size, max_q_len, max_kv_len,
       num_pages_in_mem_pool, num_qo_heads, num_kv_heads, head_dim_q, head_dim_o, page_size,
       kv_stride_keys_values, kv_stride_heads, kv_stride_batch, max_num_blocks_per_seq,
       bmm1_scale_value, bmm2_scale_value, bmm1_scale_log2_ptr, bmm2_scale_ptr, o_sf_scale,
