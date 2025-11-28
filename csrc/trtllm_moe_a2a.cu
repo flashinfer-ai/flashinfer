@@ -316,8 +316,8 @@ Tensor moeA2ACombineOp(TensorView payload, int64_t localNumTokens, TensorView wo
   if (payloadInWorkspace) {
     auto* expectedPtr = rankWorkspacePtr + combinePayloadOffset;
     TVM_FFI_ICHECK(payload.data_ptr() == expectedPtr)
-        << "payload_in_workspace is True but tensor pointer mismatch: " << payload.data_ptr()
-        << " != " << expectedPtr;
+        << "payload_in_workspace is True but tensor pointer mismatch: " << (void*)payload.data_ptr()
+        << " != " << (void*)expectedPtr;
   }
 
   Tensor output =
