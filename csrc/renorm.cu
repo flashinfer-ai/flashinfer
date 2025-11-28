@@ -59,8 +59,10 @@ void top_k_renorm_probs(TensorView probs, TensorView renorm_probs,
 }
 
 void top_k_mask_logits(TensorView logits, TensorView mask_logits,
-                       Optional<TensorView> maybe_top_k_arr, int64_t top_k_val) {
+                       Optional<TensorView> maybe_top_k_arr, int64_t top_k_val,
+                       TensorView row_states_buffer) {
   CHECK_INPUT(logits);
+  CHECK_INPUT(row_states_buffer);
   CHECK_DIM(2, logits);  // logits: (batch_size, vocab_size)
   unsigned int batch_size = logits.size(0);
   unsigned int vocab_size = logits.size(1);
@@ -68,10 +70,14 @@ void top_k_mask_logits(TensorView logits, TensorView mask_logits,
 
   cudaSetDevice(logits.device().device_id);
   auto stream = get_stream(logits.device());
-  cudaError_t status = sampling::TopKMaskLogits<float>(
+
+  cudaError_t status;
+  // Use multi-CTA kernel
+  status = sampling::TopKMaskLogitsMultiCTA<float, int>(
       static_cast<float*>(logits.data_ptr()), static_cast<float*>(mask_logits.data_ptr()),
       has_top_k_arr ? static_cast<int*>(maybe_top_k_arr.value().data_ptr()) : nullptr, batch_size,
-      top_k_val, vocab_size, stream);
+      top_k_val, vocab_size,
+      static_cast<sampling::RowReductionState<float>*>(row_states_buffer.data_ptr()), stream);
 
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "TopKMaskLogits failed with error code " << cudaGetErrorString(status);
