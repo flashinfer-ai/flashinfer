@@ -175,10 +175,14 @@ def get_mnnvl_a2a_module():
     def moe_a2a_get_workspace_size_per_rank(
         ep_size: int,
         max_num_tokens: int,
-        payload_size_per_token: int,
+        total_dispatch_payload_size_per_token: int,
+        combine_payload_size_per_token: int,
     ):
         return module.moe_a2a_get_workspace_size_per_rank(
-            ep_size, max_num_tokens, payload_size_per_token
+            ep_size,
+            max_num_tokens,
+            total_dispatch_payload_size_per_token,
+            combine_payload_size_per_token,
         )
 
     return SimpleNamespace(
@@ -224,11 +228,12 @@ def moe_a2a_wrap_payload_tensor_in_workspace(
     Returns:
         tensor: [ep_size * max_tokens, hidden_size] workspace-backed tensor
     """
-    workspace_base = workspace.flatten().view(dtype=torch.uint8)
+    workspace_base = workspace.view(-1).view(dtype=torch.uint8)
+    assert slice_end <= workspace.numel(), (
+        f"slice_end {slice_end} exceeds workspace size {workspace.numel()}"
+    )
     result = (
-        workspace_base[slice_start:slice_end]
-        .view(leading_shape + [-1])
-        .view(dtype=dtype)
+        workspace_base[slice_start:slice_end].view(dtype=dtype).view(*leading_shape, -1)
     )
     return result
 
@@ -317,10 +322,14 @@ def moe_a2a_sanitize_expert_ids(
 def moe_a2a_get_workspace_size_per_rank(
     ep_size: int,
     max_num_tokens: int,
-    payload_size_per_token: int,
+    total_dispatch_payload_size_per_token: int,
+    combine_payload_size_per_token: int,
 ):
     return get_mnnvl_a2a_module().moe_a2a_get_workspace_size_per_rank(
-        ep_size, max_num_tokens, payload_size_per_token
+        ep_size,
+        max_num_tokens,
+        total_dispatch_payload_size_per_token,
+        combine_payload_size_per_token,
     )
 
 

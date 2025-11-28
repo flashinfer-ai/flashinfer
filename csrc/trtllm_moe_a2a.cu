@@ -88,12 +88,14 @@ fi_throughput::MoeA2ADataOffsets calculateOffsets(int epSize, int maxNumTokens) 
 }
 
 int64_t getMoeA2AWorkspaceSizePerRank(int64_t epSize, int64_t maxNumTokens,
-                                      int64_t maxPayloadSizePerElement) {
+                                      int64_t totalDispatchSizePerToken,
+                                      int64_t combineSizePerToken) {
   int64_t metadata_size =
       calculateOffsets(static_cast<int>(epSize),
                        static_cast<int>(maxNumTokens))[fi_throughput::PAYLOAD_DATA_OFFSET_INDEX];
-  int64_t payload_size = maxNumTokens * maxPayloadSizePerElement;
-  return alignOffset(metadata_size + payload_size);
+  int64_t payload_size = maxNumTokens * totalDispatchSizePerToken;
+  int64_t combine_size = maxNumTokens * combineSizePerToken;
+  return alignOffset(metadata_size + payload_size) + alignOffset(combine_size);
 }
 
 Tensor moeA2AInitializeOp(TensorView workspace, int64_t epRank, int64_t epSize,
@@ -184,6 +186,10 @@ Tuple<Array<int64_t>, Array<int64_t>, int64_t> moeA2ADispatchOp(
         static_cast<int64_t>(epSize) * runtimeMaxTokensPerRank * elementsPerToken * elementSize;
     payloadByteSizes[i] = bytesPerPayload;
     totalBytesNeeded += bytesPerPayload;
+
+    TVM_FFI_ICHECK(totalBytesNeeded % elementSize == 0)
+        << "Misaligned payload buffer " << i << " with element size " << elementSize
+        << ". Consider putting ordering payloads by minimum element size";
   }
 
   auto* workspaceBase = static_cast<uint8_t*>(workspace.data_ptr());
@@ -310,7 +316,8 @@ Tensor moeA2ACombineOp(TensorView payload, int64_t localNumTokens, TensorView wo
   if (payloadInWorkspace) {
     auto* expectedPtr = rankWorkspacePtr + combinePayloadOffset;
     TVM_FFI_ICHECK(payload.data_ptr() == expectedPtr)
-        << "payload_in_workspace is True but tensor pointer mismatch";
+        << "payload_in_workspace is True but tensor pointer mismatch: " << payload.data_ptr()
+        << " != " << expectedPtr;
   }
 
   Tensor output =
