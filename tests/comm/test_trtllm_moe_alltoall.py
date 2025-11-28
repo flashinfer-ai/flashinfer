@@ -504,7 +504,7 @@ def test_moe_combine_multi_rank_single_gpu(
     for rank in range(world_size):
         inplace_combine_tensors.append(
             trtllm_moe_alltoall.moe_a2a_wrap_payload_tensor_in_workspace(
-                all_workspaces,
+                all_workspaces[rank, :],
                 [world_size, num_tokens],
                 combine_payload_offsets[rank],
                 combine_payload_offsets[rank]
