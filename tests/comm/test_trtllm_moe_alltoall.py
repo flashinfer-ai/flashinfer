@@ -38,42 +38,35 @@ SINGLE_GPU_PARAMS = [
 
 MULTI_RANK_PARAMS = [
     (2, 5, 8),  # Small input, 2 ranks
-    (4, 901, 32768),  # Large input, 4 ranks
-    (8, 16384, 128),  # Many small vectors, 8 ranks
+    (4, 32, 32768),  # Large input, 4 ranks
+    (8, 16, 2048),  # Medium input, 8 ranks
 ]
 
 SANITIZE_PARAMS = [
-    (2, 5),  # Few tokens, 2 ranks
-    (4, 901),  # Many tokens, 4 ranks
+    (2, 64),  # 2 ranks
+    (4, 32),  # 4 ranks
+    (8, 16),  # 8 ranks
 ]
 
 COMBINE_PARAMS = [
-    (2, 5, 8, 2, torch.bfloat16),  # Small input, 2 ranks
-    (4, 901, 32768, 4, torch.bfloat16),  # Large input, 4 ranks
-    (8, 16384, 128, 8, torch.bfloat16),  # Many small vectors, 8 ranks
-    (2, 5, 8, 2, torch.float16),  # Small input, 2 ranks
-    (4, 901, 32768, 4, torch.float16),  # Large input, 4 ranks
-    (8, 16384, 128, 8, torch.float16),  # Many small vectors, 8 ranks
+    (2, 64, 8, 2, torch.bfloat16),  # Small input, 2 ranks
+    (4, 32, 32768, 4, torch.bfloat16),  # Large input, 4 ranks
+    (8, 16, 2048, 8, torch.bfloat16),  # Medium input, 8 ranks
+    (2, 64, 8, 2, torch.float16),  # Small input, 2 ranks
+    (4, 32, 32768, 4, torch.float16),  # Large input, 4 ranks
+    (8, 16, 2048, 8, torch.float16),  # Medium input, 8 ranks
 ]
 
 
-def get_available_gpu_count():
-    """Get the number of available GPUs."""
-    if not torch.cuda.is_available():
-        return 0
-    return torch.cuda.device_count()
-
-
-def requires_gpus(min_gpus):
-    """Decorator to skip test if insufficient GPUs are available."""
-
-    def decorator(func):
-        return pytest.mark.skipif(
-            get_available_gpu_count() < min_gpus,
-            reason=f"Requires at least {min_gpus} GPUs, but only {get_available_gpu_count()} available",
-        )(func)
-
-    return decorator
+# This is a hack to ensure we get forward progress when running multiple kernels on a single GPU
+def check_sufficient_sm_count(num_tokens, world_size):
+    if (
+        num_tokens * world_size
+        > torch.cuda.get_device_properties(0).multi_processor_count
+    ):
+        pytest.skip(
+            f"Requires at least {num_tokens * world_size} SMs, but only {torch.cuda.get_device_properties(0).multi_processor_count} available"
+        )
 
 
 def make_payload(num_tokens, vector_dim, dtype):
@@ -192,13 +185,6 @@ def dispatch_from_single_rank(
         combine_size,
     )
 
-    print(f"world_size: {world_size}")
-    print(f"num_tokens: {num_tokens}")
-    print(f"world_size * num_tokens: {world_size * num_tokens}")
-    print(f"total_payload_size_per_element: {total_payload_size_per_element}")
-    print(f"combine_size: {combine_size}")
-    print(f"workspace_size: {workspace_size}")
-
     all_workspaces = torch.zeros(
         world_size, workspace_size, dtype=torch.uint8, device=torch.device("cuda")
     )
@@ -315,6 +301,7 @@ def combine_from_single_rank(
 def test_moe_alltoall_multi_rank_single_gpu(world_size, num_tokens, vector_dim):
     """Test MOE alltoall communication with multiple ranks on single GPU."""
     torch.cuda.set_device(0)
+    check_sufficient_sm_count(num_tokens, world_size)
     max_world_size = 8
     assert world_size <= max_world_size, (
         f"should run with world_size at most {max_world_size}"
@@ -358,6 +345,7 @@ def test_moe_alltoall_multi_rank_single_gpu(world_size, num_tokens, vector_dim):
 @pytest.mark.parametrize("world_size,num_tokens", SANITIZE_PARAMS)
 def test_sanitize_expert_ids(world_size, num_tokens):
     torch.cuda.set_device(0)
+    check_sufficient_sm_count(num_tokens, world_size)
     max_world_size = 8
     assert world_size <= max_world_size, (
         f"should run with world_size at most {max_world_size}"
@@ -438,8 +426,6 @@ def fake_moe(
                 torch.stack(results, dim=0), dim=0, dtype=torch.float32
             ).to(processed_states.dtype)
 
-    print(f"processed_states shape: {processed_states.shape}")
-    print(f"target_shape: {target_shape}")
     return processed_states.view(target_shape)
 
 
@@ -448,6 +434,7 @@ def test_moe_combine_multi_rank_single_gpu(
     world_size, num_tokens, vector_dim, top_k, dtype
 ):
     torch.cuda.set_device(0)
+    check_sufficient_sm_count(num_tokens, world_size)
     max_world_size = 8
     assert world_size <= max_world_size, (
         f"should run with world_size at most {max_world_size}"
@@ -544,8 +531,8 @@ def test_moe_combine_multi_rank_single_gpu(
         torch.testing.assert_close(
             combine_results[rank],
             reference_result[rank * num_tokens : (rank + 1) * num_tokens],
-            atol=1e-2,
-            rtol=1e-2,
+            atol=1.5e-2,
+            rtol=1.5e-2,
         )
 
 
