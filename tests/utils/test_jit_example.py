@@ -256,6 +256,7 @@ def test_batch_decode_flash_sigmoid(use_tensor_cores):
         kv_layout="NHD",
         use_tensor_cores=use_tensor_cores,
         jit_args=jit_args,
+        backend="fa2",
     )
 
     batch_size = 128
