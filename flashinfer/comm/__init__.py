@@ -45,10 +45,13 @@ from .trtllm_moe_alltoall import moe_a2a_combine as moe_a2a_combine
 from .trtllm_moe_alltoall import moe_a2a_dispatch as moe_a2a_dispatch
 from .trtllm_moe_alltoall import moe_a2a_initialize as moe_a2a_initialize
 from .trtllm_moe_alltoall import (
+    moe_a2a_get_workspace_size_per_rank as moe_a2a_get_workspace_size_per_rank,
+)
+from .trtllm_moe_alltoall import (
     moe_a2a_sanitize_expert_ids as moe_a2a_sanitize_expert_ids,
 )
 from .trtllm_moe_alltoall import (
-    moe_a2a_get_workspace_size_per_rank as moe_a2a_get_workspace_size_per_rank,
+    moe_a2a_wrap_payload_tensor_in_workspace as moe_a2a_wrap_payload_tensor_in_workspace,
 )
 
 # from .mnnvl import MnnvlMemory, MnnvlMoe, MoEAlltoallInfo

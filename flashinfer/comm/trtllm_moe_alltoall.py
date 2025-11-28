@@ -651,4 +651,5 @@ __all__ = [
     "moe_a2a_get_workspace_size_per_rank",
     "moe_a2a_initialize",
     "moe_a2a_sanitize_expert_ids",
+    "moe_a2a_wrap_payload_tensor_in_workspace",
 ]
