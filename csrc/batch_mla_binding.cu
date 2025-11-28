@@ -31,7 +31,8 @@ void BatchMLAPagedAttentionRun(TensorView float_workspace_buffer, TensorView int
                                Array<int64_t> plan_info_vec, TensorView q_nope, TensorView q_pe,
                                TensorView ckv_cache, TensorView kpe_cache, TensorView kv_indices,
                                TensorView o, Optional<TensorView> maybe_lse, int64_t mask_mode_code,
-                               int64_t num_heads, int64_t page_size, double sm_scale);
+                               int64_t num_heads, int64_t page_size, double sm_scale,
+                               bool return_lse_base_on_e);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(plan, BatchMLAPagedAttentionPlan);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, BatchMLAPagedAttentionRun);

@@ -21,6 +21,7 @@ from .core import (
     convert_to_block_layout,
     cutlass_fused_moe,
     gen_cutlass_fused_moe_sm120_module,
+    gen_cutlass_fused_moe_sm103_module,
     gen_cutlass_fused_moe_sm100_module,
     gen_cutlass_fused_moe_sm90_module,
     gen_trtllm_gen_fused_moe_sm100_module,
@@ -32,6 +33,10 @@ from .core import (
     trtllm_bf16_moe,
 )
 
+from .fused_routing_dsv3 import (  # noqa: F401
+    NoAuxTc as NoAuxTc,
+)
+
 __all__ = [
     "RoutingMethodType",
     "GatedActType",
@@ -39,6 +44,7 @@ __all__ = [
     "convert_to_block_layout",
     "cutlass_fused_moe",
     "gen_cutlass_fused_moe_sm120_module",
+    "gen_cutlass_fused_moe_sm103_module",
     "gen_cutlass_fused_moe_sm100_module",
     "gen_cutlass_fused_moe_sm90_module",
     "gen_trtllm_gen_fused_moe_sm100_module",
@@ -48,4 +54,5 @@ __all__ = [
     "trtllm_fp4_block_scale_routed_moe",
     "trtllm_fp8_block_scale_moe",
     "trtllm_fp8_per_tensor_scale_moe",
+    "NoAuxTc",
 ]

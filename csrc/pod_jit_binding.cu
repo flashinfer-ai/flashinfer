@@ -37,5 +37,5 @@ void pod_with_kv_cache_tensor(
     double logits_soft_cap_d, double sm_scale_d, double rope_rcp_scale_d, double rope_rcp_theta_d,
     bool enable_pdl);
 
-// Batch-request prefill attention with KV-Cache operator
+// Single prefill, Batch-request decode attention with KV-Cache operator
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(pod_with_kv_cache_tensor, pod_with_kv_cache_tensor);

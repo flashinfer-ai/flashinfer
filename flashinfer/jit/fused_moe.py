@@ -47,6 +47,24 @@ def gen_cutlass_fused_moe_sm120_module(use_fast_build: bool = False) -> JitSpec:
     return gen_cutlass_fused_moe_module(nvcc_flags, "120", use_fast_build)
 
 
+def gen_cutlass_fused_moe_sm103_module(use_fast_build: bool = False) -> JitSpec:
+    nvcc_flags = [
+        "-DCOMPILE_BLACKWELL_TMA_GEMMS",
+        "-DCOMPILE_BLACKWELL_TMA_GROUPED_GEMMS",
+        "-DENABLE_BF16",
+        "-DENABLE_FP8",
+        "-DENABLE_FP4",
+        "-DUSING_OSS_CUTLASS_MOE_GEMM",
+        "-DCOMPILE_BLACKWELL_SM103_TMA_GROUPED_GEMMS",
+    ]
+
+    nvcc_flags += current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[10]
+    )
+
+    return gen_cutlass_fused_moe_module(nvcc_flags, "103", use_fast_build)
+
+
 def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool = False) -> JitSpec:
     nvcc_flags = [
         "-DCOMPILE_BLACKWELL_TMA_GEMMS",

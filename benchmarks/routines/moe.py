@@ -117,13 +117,6 @@ def parse_moe_args(line, parser):
         help="Number of experts handled by this device. Defaults to num_experts.",
     )
     parser.add_argument(
-        "--tile_tokens_dim",
-        type=int,
-        required=False,
-        default=8,
-        help="Tile dimension for tokens.",
-    )
-    parser.add_argument(
         "--routing_method",
         type=str,
         required=False,
@@ -560,7 +553,6 @@ def testTrtllmFp4BlockScaleMoe(args):
     )
     local_expert_offset = args.local_expert_offset
     local_num_experts = args.local_num_experts or num_experts
-    tile_tokens_dim = args.tile_tokens_dim
     routing_method_type = args.routing_method_type
     use_shuffled_weight = args.use_shuffled_weight
     weight_layout = args.weight_layout
@@ -705,7 +697,6 @@ def testTrtllmFp4BlockScaleMoe(args):
             local_expert_offset=local_expert_offset,
             local_num_experts=local_num_experts,
             routed_scaling_factor=routed_scaling_factor,
-            tile_tokens_dim=tile_tokens_dim,
             routing_method_type=routing_method_type,
             gated_act_type=gated_act_type,
             do_finalize=True,
@@ -780,7 +771,6 @@ def testTrtllmFp4BlockScaleMoe(args):
         cur_res["routed_scaling_factor"] = routed_scaling_factor
         cur_res["local_expert_offset"] = local_expert_offset
         cur_res["local_num_experts"] = local_num_experts
-        cur_res["tile_tokens_dim"] = tile_tokens_dim
         cur_res["routing_method"] = args.routing_method
         cur_res["use_shuffled_weight"] = use_shuffled_weight
         cur_res["weight_layout"] = weight_layout
@@ -1185,7 +1175,6 @@ def testTrtllmFp8BlockScaleMoe(args):
     )
     local_expert_offset = args.local_expert_offset
     local_num_experts = args.local_num_experts or num_experts
-    tile_tokens_dim = args.tile_tokens_dim
     routing_method_type = args.routing_method_type
     use_shuffled_weight = args.use_shuffled_weight
     weight_layout = args.weight_layout
@@ -1277,27 +1266,6 @@ def testTrtllmFp8BlockScaleMoe(args):
         print(f"[VVERBOSE] gemm1_weights_fp8.shape = {gemm1_weights_fp8.shape}")
         print(f"[VVERBOSE] gemm2_weights_fp8.shape = {gemm2_weights_fp8.shape}")
 
-    # Match test heuristic for tile_tokens_dim when using BlockMajorK
-    if use_shuffled_weight and weight_layout == WeightLayout.BlockMajorK:
-
-        def _next_pow2(x: int) -> int:
-            x = max(1, x)
-            x -= 1
-            x |= x >> 1
-            x |= x >> 2
-            x |= x >> 4
-            x |= x >> 8
-            x |= x >> 16
-            return x + 1
-
-        tokens_per_expert = max(1, (num_tokens * top_k) // max(local_num_experts, 1))
-        suggested_tile = min(max(_next_pow2(tokens_per_expert), 8), 64)
-        if suggested_tile != tile_tokens_dim and args.verbose >= 1:
-            print(
-                f"[INFO] Overriding tile_tokens_dim {tile_tokens_dim} -> {suggested_tile} for BlockMajorK"
-            )
-        tile_tokens_dim = suggested_tile
-
     def run_fp8_block_moe():
         # Quantize hidden states to FP8 for block scale MOE
         hidden_states_fp8 = hidden_states.to(torch.float8_e4m3fn)
@@ -1320,7 +1288,6 @@ def testTrtllmFp8BlockScaleMoe(args):
             local_expert_offset=local_expert_offset,
             local_num_experts=local_num_experts,
             routed_scaling_factor=routed_scaling_factor,
-            tile_tokens_dim=tile_tokens_dim,
             routing_method_type=routing_method_type,
             use_shuffled_weight=use_shuffled_weight,
             weight_layout=weight_layout,
@@ -1381,7 +1348,6 @@ def testTrtllmFp8BlockScaleMoe(args):
         cur_res["routed_scaling_factor"] = routed_scaling_factor
         cur_res["local_expert_offset"] = local_expert_offset
         cur_res["local_num_experts"] = local_num_experts
-        cur_res["tile_tokens_dim"] = tile_tokens_dim
         cur_res["routing_method"] = args.routing_method
         cur_res["use_shuffled_weight"] = use_shuffled_weight
         cur_res["weight_layout"] = weight_layout
@@ -1448,7 +1414,6 @@ def testTrtllmFp8PerTensorScaleMoe(args):
     )
     local_expert_offset = args.local_expert_offset
     local_num_experts = args.local_num_experts or num_experts
-    tile_tokens_dim = args.tile_tokens_dim
     routing_method_type = args.routing_method_type
     use_routing_scales_on_input = args.use_routing_scales_on_input
     is_cuda_graph_compatible = not args.no_cuda_graph
@@ -1527,7 +1492,6 @@ def testTrtllmFp8PerTensorScaleMoe(args):
             local_num_experts=local_num_experts,
             routed_scaling_factor=routed_scaling_factor,
             use_routing_scales_on_input=use_routing_scales_on_input,
-            tile_tokens_dim=tile_tokens_dim,
             routing_method_type=routing_method_type,
         )
 
@@ -1585,7 +1549,6 @@ def testTrtllmFp8PerTensorScaleMoe(args):
         cur_res["routed_scaling_factor"] = routed_scaling_factor
         cur_res["local_expert_offset"] = local_expert_offset
         cur_res["local_num_experts"] = local_num_experts
-        cur_res["tile_tokens_dim"] = tile_tokens_dim
         cur_res["routing_method"] = args.routing_method
         cur_res["use_routing_bias"] = args.use_routing_bias
         cur_res["use_routing_scales_on_input"] = use_routing_scales_on_input

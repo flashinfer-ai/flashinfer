@@ -287,6 +287,10 @@ struct TllmGenFmhaRunnerParams {
   float mScaleSfKv;
   // The SF scale for output.
   float mScaleSfO;
+  // Whether to use sparse MLA.
+  bool mSparseMla;
+  // The top k value for sparse MLA.
+  int mSparseMlaTopK;
   // The cuda stream.
   cudaStream_t stream;
   // Whether to enable PDL (Programmatic Dependent Launch).
