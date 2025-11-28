@@ -178,6 +178,18 @@ def get_mnnvl_moe_alltoall_module():
         total_dispatch_payload_size_per_token: int,
         combine_payload_size_per_token: int,
     ):
+        """
+        Get the workspace size per rank for the MoeAlltoAll operation.
+
+        Args:
+            ep_size: Total expert parallel size
+            max_num_tokens: Maximum number of tokens across all ranks
+            total_dispatch_payload_size_per_token: The size of the payload per token in the dispatch phase. This should be the sum of all payloads tensors.
+            combine_payload_size_per_token: The size of the payload per token in the combine phase.
+
+        Returns:
+            workspace_size_per_rank: Size of the workspace per rank in bytes
+        """
         return module.moe_a2a_get_workspace_size_per_rank(
             ep_size,
             max_num_tokens,
@@ -218,15 +230,13 @@ def moe_a2a_wrap_payload_tensor_in_workspace(
 
     Args:
         workspace: [ep_size, size_per_rank] workspace tensor
-        ep_rank: Current expert parallel rank
-        ep_size: Total expert parallel size
-        runtime_max_tokens_per_rank: Max tokens per rank in this batch
-        total_size: Total size of the payload
-        offset: Offset from dispatch
-        dtype: Data type for the tensor
+        leading_shape: The leading shape to wrap the tensor with
+        slice_start: The start of the slice in the workspace
+        slice_end: The end of the slice in the workspace
+        dtype: Data type for the output tensor
 
     Returns:
-        tensor: [ep_size * max_tokens, hidden_size] workspace-backed tensor
+        tensor: [leading_shape, *] workspace-backed tensor
     """
     workspace_base = workspace.view(-1).view(dtype=torch.uint8)
     assert slice_end <= workspace.numel(), (
@@ -249,6 +259,24 @@ def moe_a2a_dispatch(
     top_k: int,
     num_experts: int,
 ):
+    """
+    Dispatch tokens and payloads to expert ranks.
+
+    Args:
+        token_selected_experts: [local_num_tokens, top_k] int32 tensor
+        input_payloads: List of [local_num_tokens, *] tensors to dispatch
+        workspace: [ep_size, size_per_rank] workspace tensor
+        metainfo: Metadata tensor from initialize
+        runtime_max_tokens_per_rank: Max tokens per rank in this batch
+        ep_rank: Current expert parallel rank
+        ep_size: Total expert parallel size
+        top_k: Number of experts per token
+        num_experts: Total number of experts
+
+    Returns:
+        output_payloads: List of payloads for this rank, backed by data in the workspace
+        combine_payload_offset: The offset to place the combine payload in the workspace
+    """
     recv_offsets, recv_sizes, combine_payload_offset = (
         get_mnnvl_moe_alltoall_module().moe_a2a_dispatch(
             token_selected_experts,

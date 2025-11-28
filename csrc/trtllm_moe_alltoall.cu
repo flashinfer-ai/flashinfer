@@ -127,7 +127,6 @@ Tuple<Array<int64_t>, Array<int64_t>, int64_t> moeA2ADispatchOp(
     TensorView metainfo, int64_t runtimeMaxTokensPerRank, int64_t epRank, int64_t epSize,
     int64_t topK, int64_t numExperts) {
   using tl_throughput::PayloadDescriptor;
-  fflush(stdout);
 
   CHECK_INPUT(tokenSelectedExperts);
   CHECK_INPUT_TYPE(tokenSelectedExperts, dl_int32);
@@ -388,6 +387,10 @@ void moeA2ASanitizeExpertIdsOp(TensorView expertIds, TensorView workspace, Tenso
       static_cast<int32_t*>(expertIds.data_ptr()), recvCounters,
       static_cast<int32_t>(invalidExpertId), static_cast<int>(epSize),
       static_cast<int>(runtimeMaxTokensPerRank), static_cast<int>(topK), get_current_stream());
+
+  auto err = cudaGetLastError();
+  TVM_FFI_ICHECK(err == cudaSuccess)
+      << "moe_a2a_sanitize_expert_ids launch failed: " << cudaGetErrorString(err);
 }
 
 // Expose metainfo index constants for Python access

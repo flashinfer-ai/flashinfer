@@ -49,12 +49,14 @@ SANITIZE_PARAMS = [
 ]
 
 COMBINE_PARAMS = [
-    (2, 64, 8, 2, torch.bfloat16),  # Small input, 2 ranks
-    (4, 32, 32768, 4, torch.bfloat16),  # Large input, 4 ranks
-    (8, 16, 2048, 8, torch.bfloat16),  # Medium input, 8 ranks
-    (2, 64, 8, 2, torch.float16),  # Small input, 2 ranks
-    (4, 32, 32768, 4, torch.float16),  # Large input, 4 ranks
-    (8, 16, 2048, 8, torch.float16),  # Medium input, 8 ranks
+    (2, 64, 8, 2, torch.bfloat16, True),  # Small input, 2 ranks
+    (4, 32, 32768, 4, torch.bfloat16, True),  # Large input, 4 ranks
+    (8, 16, 2048, 8, torch.bfloat16, True),  # Medium input, 8 ranks
+    (8, 16, 2048, 8, torch.bfloat16, False),  # Medium input, 8 ranks
+    (2, 64, 8, 2, torch.float16, True),  # Small input, 2 ranks
+    (4, 32, 32768, 4, torch.float16, True),  # Large input, 4 ranks
+    (8, 16, 2048, 8, torch.float16, True),  # Medium input, 8 ranks
+    (8, 16, 2048, 8, torch.float16, False),  # Medium input, 8 ranks
 ]
 
 
@@ -429,9 +431,11 @@ def fake_moe(
     return processed_states.view(target_shape)
 
 
-@pytest.mark.parametrize("world_size,num_tokens,vector_dim,top_k,dtype", COMBINE_PARAMS)
+@pytest.mark.parametrize(
+    "world_size,num_tokens,vector_dim,top_k,dtype,payload_in_workspace", COMBINE_PARAMS
+)
 def test_moe_combine_multi_rank_single_gpu(
-    world_size, num_tokens, vector_dim, top_k, dtype
+    world_size, num_tokens, vector_dim, top_k, dtype, payload_in_workspace
 ):
     torch.cuda.set_device(0)
     check_sufficient_sm_count(num_tokens, world_size)
@@ -489,16 +493,27 @@ def test_moe_combine_multi_rank_single_gpu(
 
     inplace_combine_tensors = []
     for rank in range(world_size):
-        inplace_combine_tensors.append(
-            trtllm_moe_alltoall.moe_a2a_wrap_payload_tensor_in_workspace(
-                all_workspaces[rank, :],
-                [world_size, num_tokens],
-                combine_payload_offsets[rank],
-                combine_payload_offsets[rank]
-                + world_size * num_tokens * vector_dim * dtype.itemsize,
-                dtype,
+        if payload_in_workspace:
+            inplace_combine_tensors.append(
+                trtllm_moe_alltoall.moe_a2a_wrap_payload_tensor_in_workspace(
+                    all_workspaces[rank, :],
+                    [world_size, num_tokens],
+                    combine_payload_offsets[rank],
+                    combine_payload_offsets[rank]
+                    + world_size * num_tokens * vector_dim * dtype.itemsize,
+                    dtype,
+                )
             )
-        )
+        else:
+            inplace_combine_tensors.append(
+                torch.empty(
+                    world_size,
+                    num_tokens,
+                    vector_dim,
+                    dtype=dtype,
+                    device=torch.device("cuda"),
+                )
+            )
 
     for rank in range(world_size):
         inplace_combine_tensors[rank].copy_(
@@ -520,7 +535,7 @@ def test_moe_combine_multi_rank_single_gpu(
         metainfo,
         world_size,
         combine_payload_offsets,
-        payload_in_workspace=True,
+        payload_in_workspace=payload_in_workspace,
     )
 
     reference_result = fake_moe(
