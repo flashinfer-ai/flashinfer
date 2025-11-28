@@ -80,11 +80,11 @@ def gen_vllm_comm_module() -> JitSpec:
     )
 
 
-def gen_mnnvl_a2a_module() -> JitSpec:
+def gen_mnnvl_moe_alltoall_module() -> JitSpec:
     return gen_jit_spec(
-        "mnnvl_a2a",
+        "mnnvl_moe_alltoall",
         [
-            jit_env.FLASHINFER_CSRC_DIR / "trtllm_moe_a2a.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "trtllm_moe_alltoall.cu",
             jit_env.FLASHINFER_CSRC_DIR
             / "nv_internal"
             / "tensorrt_llm"
