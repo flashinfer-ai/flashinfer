@@ -25,7 +25,75 @@ if [[ "$1" == "--dry-run" ]] || [[ "${DRY_RUN}" == "true" ]]; then
 fi
 
 if [ "$DRY_RUN" != "true" ]; then
+    echo "Using CUDA version: ${CUDA_VERSION}"
+    echo ""
+
+    # Install precompiled kernels (require CI build artifacts)
+    JIT_ARCH_EFFECTIVE=""
+    # Map CUDA_VERSION to CUDA_STREAM for artifact lookup
+    if [[ "${CUDA_VERSION}" == cu* ]]; then
+        CUDA_STREAM="${CUDA_VERSION}"
+    elif [ "${CUDA_VERSION}" = "12.9.0" ]; then
+        CUDA_STREAM="cu129"
+    else
+        CUDA_STREAM="cu130"
+    fi
+    echo "Using CUDA stream: ${CUDA_STREAM}"
+    echo ""
+    if [ -n "${JIT_ARCH}" ]; then
+        # 12.0a for CUDA 12.9.0, 12.0f for CUDA 13.0.0
+        if [ "${JIT_ARCH}" = "12.0" ]; then
+            if [ "${CUDA_STREAM}" = "cu129" ]; then
+                JIT_ARCH_EFFECTIVE="12.0a"
+            else
+                JIT_ARCH_EFFECTIVE="12.0f"
+            fi
+        else
+            JIT_ARCH_EFFECTIVE="${JIT_ARCH}"
+        fi
+
+        echo "Using JIT_ARCH from environment: ${JIT_ARCH_EFFECTIVE}"
+        DIST_CUBIN_DIR="../dist/${CUDA_STREAM}/${JIT_ARCH_EFFECTIVE}/cubin"
+        DIST_JIT_CACHE_DIR="../dist/${CUDA_STREAM}/${JIT_ARCH_EFFECTIVE}/jit-cache"
+
+        echo "==== Debug: listing artifact directories ===="
+        echo "Tree under ../dist:"
+        (cd .. && ls -al dist) || true
+        echo ""
+        echo "Tree under ../dist/${CUDA_STREAM}:"
+        (cd .. && ls -al "dist/${CUDA_STREAM}") || true
+        echo ""
+        echo "Contents of ${DIST_CUBIN_DIR}:"
+        ls -al "${DIST_CUBIN_DIR}" || true
+        echo ""
+        echo "Contents of ${DIST_JIT_CACHE_DIR}:"
+        ls -al "${DIST_JIT_CACHE_DIR}" || true
+        echo "============================================="
+
+        if [ -d "${DIST_CUBIN_DIR}" ] && ls "${DIST_CUBIN_DIR}"/*.whl >/dev/null 2>&1; then
+            echo "Installing flashinfer-cubin from ${DIST_CUBIN_DIR} ..."
+            pip install -q "${DIST_CUBIN_DIR}"/*.whl
+        else
+            echo "ERROR: flashinfer-cubin wheel not found in ${DIST_CUBIN_DIR}. Ensure the CI build stage produced the artifact." >&2
+        fi
+
+        if [ -d "${DIST_JIT_CACHE_DIR}" ] && ls "${DIST_JIT_CACHE_DIR}"/*.whl >/dev/null 2>&1; then
+            echo "Installing flashinfer-jit-cache from ${DIST_JIT_CACHE_DIR} ..."
+            pip install -q "${DIST_JIT_CACHE_DIR}"/*.whl
+        else
+            echo "ERROR: flashinfer-jit-cache wheel not found in ${DIST_JIT_CACHE_DIR} for ${CUDA_VERSION}. Ensure the CI build stage produced the artifact." >&2
+        fi
+        echo ""
+    fi
+
+    # Install local python sources
     pip install -e . -v --no-deps
+    echo ""
+
+    # Verify installation
+    echo "Verifying installation..."
+    (cd /tmp && python -m flashinfer show-config)
+    echo ""
 fi
 
 EXIT_CODE=0
