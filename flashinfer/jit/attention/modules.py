@@ -974,6 +974,9 @@ def gen_batch_prefill_module(
     # KV-only quant is not influenced by this flag
     fp8_enabled = dtype_q in [torch.float8_e4m3fn, torch.float8_e5m2]
 
+    assert backend in ["fa2", "fa3"], f"backend must be fa2 or fa3 in gen_batch_prefill_module(), got: {backend}"
+    assert dtype_o not in [torch.float8_e4m3fn, torch.float8_e5m2], "FP8 output is not supported in fa2/fa3 backends yet"
+
     if backend == "fa2":
         assert not fp8_enabled, "fp8 tensor core is not supported in fa2 backend"
         additional_tensor_names = [
@@ -1019,7 +1022,7 @@ def gen_batch_prefill_module(
             variant_name = f"DefaultAttention<{str(use_logits_soft_cap).lower()}>"
             variant_decl = "#include<flashinfer/attention/hopper/variants.cuh>"
         else:
-            additional_tensor_names = ["scale_q", "scale_k", "scale_v"]
+            additional_tensor_names = ["maybe_scale_q", "maybe_scale_k", "maybe_scale_v"]
             additional_tensor_dtypes = ["float", "float", "float"]
             additional_scalar_names = ["sm_scale"]
             additional_scalar_dtypes = ["double"]

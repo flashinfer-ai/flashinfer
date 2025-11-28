@@ -1650,7 +1650,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             The data type of the key/value tensor. If None, will be set to :attr:`q_data_type`.
         o_data_type : Optional[Union[str, torch.dtype]]
             The data type of the output tensor. If None, will be set to :attr:`q_data_type`.
-            For FP8 inputs, this should typically be set to torch.float16.
+            For FP8 inputs, this should typically be set to torch.float16 or torch.bfloat16.
         non_blocking : bool
             Whether to copy the input tensors to the device asynchronously, defaults to ``True``.
         prefix_len_ptr :Optional[torch.Tensor]
@@ -1699,6 +1699,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         The :meth:`plan` method cannot be used in Cuda Graph or in ``torch.compile``.
         """
         q_data_type = canonicalize_torch_dtype(q_data_type)
+
         if kv_data_type is None:
             kv_data_type = q_data_type
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
@@ -2025,6 +2026,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         *args
             Additional arguments for custom kernels.
+        q_scale : Optional[float]
+            The calibration scale of query for fp8 input, if not provided, will be set to ``1.0``.
         k_scale : Optional[float]
             The calibration scale of key for fp8 input, if not provided, will be set to ``1.0``.
         v_scale : Optional[float]
@@ -2053,6 +2056,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
         _check_cached_qkv_data_type(
             q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
         )
+        o_dtype = self._cached_o_data_type
+        if out is not None and out.dtype != o_dtype:
+            raise ValueError(
+                f"The dtype of out {out.dtype} does not match the o_data_type {o_dtype} specified in plan function."
+            )
 
         if self._kv_layout == "NHD":
             page_size = k_cache.shape[1]
@@ -2206,7 +2214,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
             assert self._cached_module is not None, "cached module is not initialized"
             self._cached_module.paged_run(*run_args)
-            if v_scale is not None:
+            if v_scale is not None and v_scale != 1.0:
                 # TODO(Zihao): fused into kernel
                 if is_float8(out):
                     out = (out.to(torch.float32) * v_scale).to(out.dtype)
@@ -2592,7 +2600,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             The data type of the key/value tensor. If None, will be set to :attr:`q_data_type`.
         o_data_type : Optional[Union[str, torch.dtype]]
             The data type of the output tensor. If None, will be set to :attr:`q_data_type`.
-            For FP8 inputs, this should typically be set to torch.float16.
+            For FP8 inputs, this should typically be set to torch.float16 or torch.bfloat16.
         non_blocking : bool
             Whether to copy the input tensors to the device asynchronously, defaults to ``True``.
         prefix_len_ptr :Optional[torch.Tensor]

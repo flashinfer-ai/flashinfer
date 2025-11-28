@@ -212,8 +212,8 @@ struct FP8SparseCollectiveMainloop {
     IdType const* kv_indices_ptr = mainloop_params.kv_indices + kv_indptr;
 
     // Setup for manual K/V loading with page table
-    DTypeKV* k_base_ptr = mainloop_params.K_ptr;
-    DTypeKV* v_base_ptr = mainloop_params.V_ptr;
+    DTypeKV* k_base_ptr = mainloop_params.K_ptr + kv_head_idx * HEAD_DIM;
+    DTypeKV* v_base_ptr = mainloop_params.V_ptr + kv_head_idx * HEAD_DIM;
     int64_t k_stride_n = mainloop_params.k_stride_n;
     int64_t k_page_stride = mainloop_params.k_page_stride;
     int64_t v_stride_n = mainloop_params.v_stride_n;
