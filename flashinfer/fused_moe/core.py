@@ -116,13 +116,14 @@ class DtypeTrtllmGen(IntEnum):
     Int64 = (0, 1, 1, 64, 11)
     MxE2m1 = (1, 1, 0, 4, 12)
     MxE4m3 = (1, 1, 0, 8, 13)
-    UE8m0 = (0, 0, 0, 8, 14)
-    UInt8 = (0, 0, 1, 8, 15)
-    UInt16 = (0, 0, 1, 16, 16)
-    UInt32 = (0, 0, 1, 32, 17)
-    UInt64 = (0, 0, 1, 64, 18)
-    UInt128 = (0, 0, 1, 128, 19)
-    Void = (0, 1, 0, 0, 20)
+    MxInt4 = (1, 1, 1, 4, 14)
+    UE8m0 = (0, 0, 0, 8, 15)
+    UInt8 = (0, 0, 1, 8, 16)
+    UInt16 = (0, 0, 1, 16, 17)
+    UInt32 = (0, 0, 1, 32, 18)
+    UInt64 = (0, 0, 1, 64, 19)
+    UInt128 = (0, 0, 1, 128, 20)
+    Void = (0, 1, 0, 0, 21)
 
 
 def trtllm_gen_dtype_has_scale(dtype: DtypeTrtllmGen) -> bool:
@@ -1153,6 +1154,34 @@ def get_trtllm_moe_sm100_module():
                         kwargs["enable_pdl"],
                         [-1, -1] if tactic == -1 else tactic,
                     )
+            elif (
+                self.dtype_act == DtypeTrtllmGen.Bfloat16
+                and self.dtype_weights == DtypeTrtllmGen.MxInt4
+            ):
+                moe_op.trtllm_mxint4_block_scale_moe(
+                    routing_logits,
+                    kwargs["routing_bias"],
+                    hidden_states,
+                    kwargs["gemm1_weights"],
+                    kwargs["gemm1_weights_scale"],
+                    kwargs["gemm1_alpha"],
+                    kwargs["gemm1_beta"],
+                    kwargs["gemm1_clamp_limit"],
+                    kwargs["gemm2_weights"],
+                    kwargs["gemm2_weights_scale"],
+                    kwargs["num_experts"],
+                    self.top_k,
+                    kwargs["n_group"],
+                    kwargs["topk_group"],
+                    self.intermediate_size,
+                    kwargs["local_expert_offset"],
+                    self.num_local_experts,
+                    kwargs["routed_scaling_factor"],
+                    kwargs["routing_method_type"],
+                    kwargs["enable_pdl"],
+                    output,
+                    [-1, -1] if tactic == -1 else tactic,
+                )
             else:
                 moe_op.trtllm_fp4_block_scale_moe(
                     routing_logits,
@@ -1851,11 +1880,167 @@ def get_trtllm_moe_sm100_module():
 
         return [hidden_states.new_empty([seq_len, hidden_size], dtype=torch.bfloat16)]
 
+    @register_custom_op(
+        "flashinfer::trtllm_mxint4_block_scale_moe",
+        mutates_args=(""),
+    )
+    def trtllm_mxint4_block_scale_moe_op(
+        routing_logits: torch.Tensor,
+        routing_bias: Optional[torch.Tensor],
+        hidden_states: torch.Tensor,
+        gemm1_weights: torch.Tensor,
+        gemm1_weights_scale: torch.Tensor,
+        gemm1_alpha: Optional[torch.Tensor],
+        gemm1_beta: Optional[torch.Tensor],
+        gemm1_clamp_limit: Optional[torch.Tensor],
+        gemm2_weights: torch.Tensor,
+        gemm2_weights_scale: torch.Tensor,
+        num_experts: int,
+        top_k: int,
+        n_group: Optional[int],
+        topk_group: Optional[int],
+        intermediate_size: int,
+        local_expert_offset: int,
+        num_local_experts: int,
+        routed_scaling_factor: Optional[float],
+        routing_method_type: int,
+        enable_pdl: Optional[bool] = None,
+        output: Optional[torch.Tensor] = None,
+        tune_max_num_tokens: int = 8192,
+    ) -> List[torch.Tensor]:
+        routing_dtype = routing_logits.dtype
+        hidden_size = hidden_states.shape[-1]
+        if hidden_states.dtype == torch.uint8:
+            hidden_size = hidden_size * 2
+        num_tokens = hidden_states.shape[0]
+
+        # workspace buffers required by trtllm-gen
+        topk_ids = torch.empty(
+            num_tokens, top_k, dtype=torch.int32, device=hidden_states.device
+        )
+        expert_weights = torch.empty(
+            num_tokens, top_k, dtype=routing_dtype, device=hidden_states.device
+        )
+        if enable_pdl is None:
+            enable_pdl = device_support_pdl(hidden_states.device)
+        if output is None:
+            output = torch.empty(
+                num_tokens,
+                hidden_size,
+                dtype=torch.bfloat16,
+                device=hidden_states.device,
+            )
+
+        tuner = AutoTuner.get()
+        MoERunner.refine_tuning_config(tune_max_num_tokens)
+        dtype_act = DtypeTrtllmGen.Bfloat16
+        dtype_weights = DtypeTrtllmGen.MxInt4
+        moe_runner = MoERunner(
+            top_k=top_k,
+            num_local_experts=num_local_experts,
+            dtype_act=dtype_act,
+            dtype_weights=dtype_weights,
+            use_deepseek_fp8=False,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            gated_act_type=GatedActType.SwiGlu,
+            weight_layout=WeightLayout.BlockMajorK,
+            use_shuffled_weight=True,
+        )
+        tunning_config = MoERunner.tuning_config_no_hidden_states_scales
+        inputs = [
+            output,
+            routing_logits,
+            topk_ids,
+            expert_weights,
+            hidden_states,
+        ]
+
+        _, tactic = tuner.choose_one(
+            "flashinfer::trtllm_mxint4_block_scale_moe",
+            [moe_runner],
+            tunning_config,
+            inputs,
+            num_experts=num_experts,
+            routing_bias=routing_bias,
+            gemm1_weights=gemm1_weights,
+            gemm1_weights_scale=gemm1_weights_scale,
+            gemm1_alpha=gemm1_alpha,
+            gemm1_beta=gemm1_beta,
+            gemm1_clamp_limit=gemm1_clamp_limit,
+            gemm2_weights=gemm2_weights,
+            gemm2_weights_scale=gemm2_weights_scale,
+            n_group=n_group,
+            topk_group=topk_group,
+            local_expert_offset=local_expert_offset,
+            routed_scaling_factor=routed_scaling_factor,
+            routing_method_type=routing_method_type,
+            enable_pdl=enable_pdl,
+        )
+
+        # Call the C++ function for block scale MoE
+        moe_op.trtllm_mxint4_block_scale_moe(
+            routing_logits,
+            routing_bias,
+            hidden_states,
+            gemm1_weights,
+            gemm1_weights_scale,
+            gemm1_alpha,
+            gemm1_beta,
+            gemm1_clamp_limit,
+            gemm2_weights,
+            gemm2_weights_scale,
+            num_experts,
+            top_k,
+            n_group,
+            topk_group,
+            intermediate_size,
+            local_expert_offset,
+            num_local_experts,
+            routed_scaling_factor,
+            routing_method_type,
+            enable_pdl,
+            output,
+            [-1, -1] if tactic == -1 else tactic,
+        )
+        return output
+
+    @register_fake_op("flashinfer::trtllm_mxint4_block_scale_moe")
+    def _fake_trtllm_mxint4_block_scale_moe(
+        routing_logits: torch.Tensor,
+        routing_bias: Optional[torch.Tensor],
+        hidden_states: torch.Tensor,
+        gemm1_weights: torch.Tensor,
+        gemm1_weights_scale: torch.Tensor,
+        gemm1_alpha: Optional[torch.Tensor],
+        gemm1_beta: Optional[torch.Tensor],
+        gemm1_clamp_limit: Optional[torch.Tensor],
+        gemm2_weights: torch.Tensor,
+        gemm2_weights_scale: torch.Tensor,
+        num_experts: int,
+        top_k: int,
+        n_group: Optional[int],
+        topk_group: Optional[int],
+        intermediate_size: int,
+        local_expert_offset: int,
+        local_num_experts: int,
+        routed_scaling_factor: Optional[float],
+        routing_method_type: int,
+        enable_pdl: bool,
+        output: Optional[torch.Tensor],
+        tune_max_num_tokens: int,
+    ):
+        seq_len = hidden_states.shape[0]
+        hidden_size = hidden_states.shape[1]
+
+        return [hidden_states.new_empty([seq_len, hidden_size], dtype=torch.bfloat16)]
+
     return SimpleNamespace(
         trtllm_bf16_moe=trtllm_bf16_moe_op,
         trtllm_fp8_per_tensor_scale_moe=trtllm_fp8_per_tensor_scale_moe_op,
         trtllm_fp8_block_scale_moe=trtllm_fp8_block_scale_moe_op,
         trtllm_fp4_block_scale_moe=trtllm_fp4_block_scale_moe_op,
+        trtllm_mxint4_block_scale_moe=trtllm_mxint4_block_scale_moe_op,
     )
 
 
@@ -2349,6 +2534,98 @@ def trtllm_fp4_block_scale_routed_moe(
         do_finalize,
         enable_pdl,
         gated_act_type,
+        output,
+        tune_max_num_tokens,
+    )
+
+
+@flashinfer_api
+def trtllm_mxint4_block_scale_moe(
+    routing_logits: torch.Tensor,
+    hidden_states: torch.Tensor,
+    gemm1_weights: torch.Tensor,
+    gemm1_weights_scale: torch.Tensor,
+    gemm1_alpha: Optional[torch.Tensor],
+    gemm1_beta: Optional[torch.Tensor],
+    gemm1_clamp_limit: Optional[torch.Tensor],
+    gemm2_weights: torch.Tensor,
+    gemm2_weights_scale: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+    n_group: Optional[int],
+    topk_group: Optional[int],
+    intermediate_size: int,
+    local_expert_offset: int,
+    local_num_experts: int,
+    routed_scaling_factor: Optional[float],
+    routing_method_type: int = 0,
+    enable_pdl: Optional[bool] = None,
+    output: Optional[torch.Tensor] = None,
+    tune_max_num_tokens: int = 8192,
+) -> List[torch.Tensor]:
+    """MxInt4 block scale MoE operation.
+
+    Args:
+        routing_logits (torch.Tensor): shape [seq_len, num_experts]
+            Input tensor of routing logits. Supports float32, bfloat16.
+        hidden_states (torch.Tensor): shape [seq_len, hidden_size // 2 if nvfp4 else hidden_size]
+            Tensor of input hidden states. Supports bfloat16, mxfp8, and nvfp4 (packed into uint8)
+        gemm1_weights (torch.Tensor): shape [num_experts, 2 * intermediate_size, hidden_size // 2]
+            Tensor of FC1 weights. Dtype must be uint8 (packed fp4)
+        gemm1_weights_scale (torch.Tensor): shape [num_experts, 2 * intermediate_size, hidden_size // (32 if mxfp4 else 16)]
+            Scale tensor of FC1 weights. Dtype must be float8.
+        gemm1_alpha (Optional[torch.Tensor]): shape [num_experts]
+            Tensor of swiglu alpha. Dtype is float32.
+        gemm1_beta (Optional[torch.Tensor]): shape [num_experts]
+            Tensor of swiglu beta. Dtype is float32.
+        gemm1_clamp_limit (Optional[torch.Tensor]): shape [num_experts]
+            Tensor of swiglu clamp limit. Dtype is float32.
+        gemm2_weights (torch.Tensor): shape [num_experts, hidden_size, intermediate_size]
+            Tensor of FC2 weights. Dtype must be uint8 (packed fp4)
+        gemm2_weights_scale (torch.Tensor): shape [num_experts, hidden_size, intermediate_size // (32 if mxfp4 else 16)]
+            Scale tensor of FC2 weights. Dtype must be float8.
+        num_experts (int): Total number of experts
+        top_k (int): Number of experts to route to per token
+        n_group (Optional[int]): Number of expert groups (can be None for some routing methods)
+        topk_group (Optional[int]): Number of groups to consider for top-k routing (can be None for some routing methods)
+        intermediate_size (int): Size of intermediate layer
+        local_expert_offset (int): Offset of local experts in global expert space
+        local_num_experts (int): Number of experts handled by this device
+        routed_scaling_factor (Optional[float]): Scaling factor for routing (can be None for some routing methods)
+        routing_method_type (int): Type of routing method to use (default: 0)
+            - 0: Default (Softmax -> TopK)
+            - 1: Renormalize (TopK -> Softmax)
+            - 2: DeepSeekV3 (Sigmoid -> RoutingBiasAdd -> Top2 in group -> Top4 groups -> Top8 experts)
+            - 3: Llama4 (Top1 -> Sigmoid)
+            - 4: RenormalizeNaive (Softmax -> TopK -> Renormalize)
+        enable_pdl (Optional[bool]): Whether to enable Programmatic Dependent Launch (PDL). Auto-enabled for >= sm90.
+        tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 8192)
+        output (Optional[torch.Tensor]): shape [seq_len, hidden_size]
+            Optional inplace output tensor.
+    Returns:
+        torch.Tensor: returns the final MoE output.
+    """
+    return get_trtllm_moe_sm100_module().trtllm_mxint4_block_scale_moe(
+        routing_logits,
+        None,
+        hidden_states,
+        gemm1_weights,
+        gemm1_weights_scale,
+        gemm1_alpha,
+        gemm1_beta,
+        gemm1_clamp_limit,
+        gemm2_weights,
+        gemm2_weights_scale,
+        num_experts,
+        top_k,
+        n_group,
+        topk_group,
+        intermediate_size,
+        local_expert_offset,
+        local_num_experts,
+        routed_scaling_factor,
+        routing_method_type,
+        enable_pdl,
         output,
         tune_max_num_tokens,
     )

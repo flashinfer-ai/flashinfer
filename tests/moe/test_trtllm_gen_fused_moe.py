@@ -40,6 +40,7 @@ from flashinfer.fused_moe import (
     trtllm_fp8_block_scale_moe,
     trtllm_fp8_per_tensor_scale_moe,
     trtllm_bf16_moe,
+    trtllm_mxint4_block_scale_moe,
 )
 from flashinfer.fused_moe.core import (
     get_w2_permute_indices_with_cache,
@@ -613,22 +614,32 @@ class MxInt4BlockScaleMoe(Moe):
         ]  # [num_experts, 2*intermediate_size, hidden_size]
 
         # Quantize weights to MxInt4
-        sf_vec_size = 16
+        sf_vec_size = 32
         gemm1_weights_int4, gemm1_scales = mxint4_quantize(gemm1_weights, sf_vec_size)
         gemm2_weights_int4, gemm2_scales = mxint4_quantize(gemm2_weights, sf_vec_size)
         gemm1_scales = gemm1_scales.to(torch.bfloat16).reshape(
             num_experts,
-            2 * intermediate_size // sf_vec_size,
+            2 * intermediate_size,
             hidden_size // sf_vec_size,
         )
         gemm2_scales = gemm2_scales.to(torch.bfloat16).reshape(
-            num_experts, hidden_size // sf_vec_size, intermediate_size // sf_vec_size
+            num_experts, hidden_size, intermediate_size // sf_vec_size
         )
         return {
-            "gemm1_weights_int4": gemm1_weights_int4,
-            "gemm2_weights_int4": gemm2_weights_int4,
+            "hidden_states_scale_global": None,
+            "gemm1_weights": gemm1_weights_int4,
+            "gemm2_weights": gemm2_weights_int4,
             "gemm1_scales": gemm1_scales,
             "gemm2_scales": gemm2_scales,
+            "gemm1_scales_global": None,
+            "gemm2_scales_global": None,
+        }
+
+    def quantize_inputs(self, hidden_states, *unused_args):
+        """No scaling for hidden states."""
+        return {
+            "hidden_states": hidden_states.to(torch.bfloat16),
+            "hidden_states_scale": None,
         }
 
     def prepare_static_weights_for_kernel(
@@ -701,11 +712,43 @@ class MxInt4BlockScaleMoe(Moe):
     def call_moe(
         self, static_data, hidden_states_orig, hidden_states_scale_global, **kwargs
     ):
-        # TODO
-        pass
+        """Call MoE with runtime input quantization + kernel execution (done at runtime)."""
+        expert_logits = kwargs["expert_logits"]
+        num_experts = kwargs["num_experts"]
+        top_k = kwargs["top_k"]
+        n_groups = kwargs["n_groups"]
+        top_k_groups = kwargs["top_k_groups"]
+        intermediate_size = kwargs["intermediate_size"]
+        routing_method_type = kwargs["routing_method_type"]
+        enable_autotune = kwargs.get("enable_autotune", True)
+
+        # Use autotuner for optimal kernel selection
+        with autotune(enable_autotune):
+            output = trtllm_mxint4_block_scale_moe(
+                expert_logits,  # float
+                hidden_states_orig,
+                static_data["gemm1_weights"],
+                static_data["gemm1_scales"],
+                None,
+                None,
+                None,
+                static_data["gemm2_weights"],
+                static_data["gemm2_scales"],
+                num_experts,
+                top_k,
+                n_groups,
+                top_k_groups,
+                intermediate_size,
+                0,
+                num_experts,
+                1.0,
+                routing_method_type=routing_method_type,
+                tune_max_num_tokens=TUNE_MAX_NUM_TOKENS,
+            )
+        return output.to(torch.float)
 
     def compute_reference(self, args):
-        return run_moe_reference_mxint4(args, QuantMode.MXINT4_BF16_BF16)
+        return run_moe_reference_mxint4(args)
 
     def get_tolerances(self):
         """Get FP4-specific accuracy tolerances."""
@@ -2093,28 +2136,24 @@ def run_moe_reference_bf16(args):
 
 
 def run_moe_reference_mxint4(args):
-    sf_vec_size = 16
+    sf_vec_size = 32
 
     hidden_states_dequant = args.hidden_states.to(torch.bfloat16).to(torch.float)
 
     num_experts = args.gemm1_weights.shape[0]
-    intermediate_size = (
-        args.gemm1_weights.shape[1] // 2
-    )  # gemm1 has 2*intermediate_size rows
-    hidden_size = (
-        args.gemm1_weights.shape[2] * 2
-    )  # packed int4, so actual hidden_size is 2x
 
     def dequantize(weights, scales):
+        k = weights.shape[-1] * 2
+        n = weights.shape[-2]
         weights_int8 = torch.stack(
             [weights & 0x0F, (weights >> 4) & 0x0F], dim=-1
-        ).reshape(num_experts, 2 * intermediate_size, hidden_size)
+        ).reshape(num_experts, n, k)
         weights_float = weights_int8.to(torch.bfloat16).to(torch.float)
         scales_expanded = (
             scales.to(torch.bfloat16)
             .to(torch.float)
             .repeat_interleave(sf_vec_size, dim=-1)
-            .reshape(weights.shape)
+            .reshape(weights_float.shape)
         )
         return weights_float * scales_expanded
 
@@ -2394,6 +2433,7 @@ def run_moe_test(
         pytest.param(FP4Moe(quant_mode=QuantMode.FP4_NVFP4_NVFP4), id="NvFP4xNvFP4"),
         pytest.param(FP4Moe(quant_mode=QuantMode.FP4_MXFP4_MXFP8), id="MxFP4xMxFP8"),
         pytest.param(FP4Moe(quant_mode=QuantMode.FP4_MXFP4_Bf16), id="MxFP4xBf16"),
+        pytest.param(MxInt4BlockScaleMoe(), id="MxInt4xBf16"),
     ],
 )
 @pytest.mark.parametrize(
@@ -2414,6 +2454,7 @@ def run_moe_test(
                     FP8BlockScaleMoe,
                     FP4Moe,
                     BF16Moe,
+                    MxInt4BlockScaleMoe,
                 ],
                 "compatible_intermediate_size": [384, 768, 1024],
                 "enable_autotune": True,
@@ -2435,6 +2476,7 @@ def run_moe_test(
                     FP8BlockScaleMoe,
                     FP4Moe,
                     BF16Moe,
+                    MxInt4BlockScaleMoe,
                 ],
                 "compatible_intermediate_size": [384, 1024],
                 "enable_autotune": False,
@@ -2456,6 +2498,7 @@ def run_moe_test(
                     FP8BlockScaleMoe,
                     FP4Moe,
                     BF16Moe,
+                    MxInt4BlockScaleMoe,
                 ],
                 "compatible_intermediate_size": [512],
                 "enable_autotune": True,
@@ -2487,7 +2530,11 @@ def run_moe_test(
             {
                 "use_shuffled_weight": True,
                 "layout": WeightLayout.BlockMajorK,
-                "compatible_moe_impls": [FP8BlockScaleMoe, BF16Moe],
+                "compatible_moe_impls": [
+                    FP8BlockScaleMoe,
+                    BF16Moe,
+                    MxInt4BlockScaleMoe,
+                ],
             },
             id="Shuffled_BlockMajorK",
         ),
