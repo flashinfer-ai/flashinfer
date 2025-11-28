@@ -42,6 +42,20 @@ MULTI_RANK_PARAMS = [
     (8, 16384, 128),  # Many small vectors, 8 ranks
 ]
 
+SANITIZE_PARAMS = [
+    (2, 5),  # Few tokens, 2 ranks
+    (4, 901),  # Many tokens, 4 ranks
+]
+
+COMBINE_PARAMS = [
+    (2, 5, 8, 2, torch.bfloat16),  # Small input, 2 ranks
+    (4, 901, 32768, 4, torch.bfloat16),  # Large input, 4 ranks
+    (8, 16384, 128, 8, torch.bfloat16),  # Many small vectors, 8 ranks
+    (2, 5, 8, 2, torch.float16),  # Small input, 2 ranks
+    (4, 901, 32768, 4, torch.float16),  # Large input, 4 ranks
+    (8, 16384, 128, 8, torch.float16),  # Many small vectors, 8 ranks
+]
+
 
 def get_available_gpu_count():
     """Get the number of available GPUs."""
@@ -85,7 +99,8 @@ def test_moe_alltoall_single_gpu(num_tokens, vector_dim, num_experts, top_k):
     """Test MOE alltoall communication on single GPU."""
     torch.cuda.set_device(0)
     # Create a random input tensor
-    dtypes = [torch.float16, torch.bfloat16, torch.int32, torch.uint8]
+    dtypes = [torch.bfloat16, torch.float16, torch.int32, torch.uint8]
+    hidden_state_index = 0
     input_tensors = [
         make_payload(num_tokens, vector_dim * (i + 1), dtype)
         for i, dtype in enumerate(dtypes)
@@ -107,6 +122,7 @@ def test_moe_alltoall_single_gpu(num_tokens, vector_dim, num_experts, top_k):
         1,
         num_tokens,
         payload_size_per_token,
+        input_tensors[0].shape[-1] * input_tensors[0].itemsize,
     )
     mapping = Mapping(rank=0, world_size=1)
     moe_a2a = trtllm_moe_alltoall.MoeAlltoAll(
@@ -131,7 +147,168 @@ def test_moe_alltoall_single_gpu(num_tokens, vector_dim, num_experts, top_k):
         output_tensor, _ = torch.sort(output_tensor.flatten(end_dim=1), dim=0)
         torch.testing.assert_close(output_tensor, input_tensor, atol=0, rtol=0)
 
-    moe_a2a._reset_workspace()
+    inplace_combine_tensor = moe_a2a.get_combine_payload_tensor_in_workspace(
+        num_tokens,
+        input_tensors[hidden_state_index].shape[-1],
+        input_tensors[hidden_state_index].dtype,
+    )
+
+    # Copy first output tensor into inplace_combine_tensor
+    inplace_combine_tensor.copy_(output_tensors[hidden_state_index])
+
+    output = moe_a2a.combine(
+        inplace_combine_tensor, num_tokens, payload_in_workspace=True
+    )
+
+    # Should just be a direct copy for 1 GPU
+    torch.testing.assert_close(
+        output, input_tensors[hidden_state_index], atol=0, rtol=0
+    )
+
+
+def dispatch_from_single_rank(
+    input_tensors,
+    token_selected_experts,
+    world_size,
+    num_experts,
+    num_tokens,
+    hidden_state_index=None,
+):
+    payloads = input_tensors
+    total_payload_size_per_element = [x[0].numel() * x.itemsize for x in payloads]
+    total_payload_size_per_element = sum(total_payload_size_per_element)
+
+    combine_size = 0
+    if hidden_state_index is not None:
+        combine_size = (
+            input_tensors[hidden_state_index].shape[-1]
+            * input_tensors[hidden_state_index].itemsize
+        )
+
+    workspace_size = trtllm_moe_alltoall.moe_a2a_get_workspace_size_per_rank(
+        world_size,
+        num_tokens * world_size,
+        total_payload_size_per_element,
+        combine_size,
+    )
+
+    print(f"world_size: {world_size}")
+    print(f"num_tokens: {num_tokens}")
+    print(f"world_size * num_tokens: {world_size * num_tokens}")
+    print(f"total_payload_size_per_element: {total_payload_size_per_element}")
+    print(f"combine_size: {combine_size}")
+    print(f"workspace_size: {workspace_size}")
+
+    all_workspaces = torch.zeros(
+        world_size, workspace_size, dtype=torch.uint8, device=torch.device("cuda")
+    )
+
+    # Must be done before the synchronization so the state is cleared
+    metainfo = []
+    for rank in range(world_size):
+        metainfo.append(
+            trtllm_moe_alltoall.moe_a2a_initialize(
+                all_workspaces,
+                rank,
+                world_size,
+                num_tokens * world_size,
+            )
+        )
+
+    # Synchronize before starting parallel communication
+    torch.cuda.synchronize()
+
+    output_tensors = []
+    combine_payload_offsets = []
+    # do alltoall in parallel
+    cuda_streams_all_ranks = [torch.cuda.Stream() for _ in range(world_size)]
+    for rank in range(world_size):
+        with torch.cuda.stream(cuda_streams_all_ranks[rank]):
+            rank_payloads = [
+                x[rank * num_tokens : (rank + 1) * num_tokens] for x in payloads
+            ]
+            rank_token_selected_experts = token_selected_experts[
+                rank * num_tokens : (rank + 1) * num_tokens
+            ]
+            output, offset = trtllm_moe_alltoall.moe_a2a_dispatch(
+                rank_token_selected_experts,
+                rank_payloads,
+                all_workspaces,
+                metainfo[rank],
+                num_tokens,
+                ep_rank=rank,
+                ep_size=world_size,
+                top_k=rank_token_selected_experts.shape[-1],
+                num_experts=num_experts,
+            )
+            output_tensors.append(output)
+            combine_payload_offsets.append(offset)
+
+    for rank in range(world_size):
+        cuda_streams_all_ranks[rank].synchronize()
+
+    torch.cuda.synchronize()
+
+    return output_tensors, all_workspaces, metainfo, combine_payload_offsets
+
+
+def sanitize_expert_ids_from_single_rank(
+    output_tensors,
+    expert_ids_index,
+    all_workspaces,
+    metainfo,
+    world_size,
+    invalid_expert_id,
+):
+    for rank in range(world_size):
+        trtllm_moe_alltoall.moe_a2a_sanitize_expert_ids(
+            output_tensors[rank][expert_ids_index],
+            all_workspaces,
+            metainfo[rank],
+            rank,
+            invalid_expert_id,
+        )
+    return output_tensors
+
+
+def combine_from_single_rank(
+    combine_payload,
+    num_tokens,
+    top_k,
+    all_workspaces,
+    metainfo,
+    world_size,
+    combine_payload_offsets,
+    payload_in_workspace,
+):
+    combine_results = []
+
+    torch.cuda.synchronize()
+
+    cuda_streams_all_ranks = [torch.cuda.Stream() for _ in range(world_size)]
+    for rank in range(world_size):
+        with torch.cuda.stream(cuda_streams_all_ranks[rank]):
+            combine_results.append(
+                trtllm_moe_alltoall.moe_a2a_combine(
+                    combine_payload[rank],
+                    num_tokens,
+                    all_workspaces,
+                    metainfo[rank],
+                    num_tokens,
+                    ep_rank=rank,
+                    ep_size=world_size,
+                    top_k=top_k,
+                    combine_payload_offset=combine_payload_offsets[rank],
+                    payload_in_workspace=payload_in_workspace,
+                )
+            )
+
+    for rank in range(world_size):
+        cuda_streams_all_ranks[rank].synchronize()
+
+    torch.cuda.synchronize()
+
+    return combine_results
 
 
 @pytest.mark.parametrize("world_size,num_tokens,vector_dim", MULTI_RANK_PARAMS)
@@ -158,62 +335,9 @@ def test_moe_alltoall_multi_rank_single_gpu(world_size, num_tokens, vector_dim):
         device=torch.device("cuda"),
     )
 
-    payloads = input_tensors
-    total_payload_size_per_element = [x[0].numel() * x.itemsize for x in payloads]
-    total_payload_size_per_element = sum(total_payload_size_per_element)
-
-    workspace_size = trtllm_moe_alltoall.moe_a2a_get_workspace_size_per_rank(
-        world_size, num_tokens * world_size, total_payload_size_per_element
+    output_tensors, _, _, _ = dispatch_from_single_rank(
+        input_tensors, token_selected_experts, world_size, world_size, num_tokens
     )
-
-    all_workspaces = torch.zeros(
-        world_size, workspace_size, dtype=torch.uint8, device=torch.device("cuda")
-    )
-
-    # Must be done before the synchronization so the state is cleared
-    metainfo = []
-    for rank in range(world_size):
-        metainfo.append(
-            trtllm_moe_alltoall.moe_a2a_initialize(
-                all_workspaces,
-                rank,
-                world_size,
-                num_tokens * world_size,
-            )
-        )
-
-    # Synchronize before starting parallel communication
-    torch.cuda.synchronize()
-
-    output_tensors = []
-    # do alltoall in parallel
-    cuda_streams_all_ranks = [torch.cuda.Stream() for _ in range(world_size)]
-    for rank in range(world_size):
-        with torch.cuda.stream(cuda_streams_all_ranks[rank]):
-            rank_payloads = [
-                x[rank * num_tokens : (rank + 1) * num_tokens] for x in payloads
-            ]
-            rank_token_selected_experts = token_selected_experts[
-                rank * num_tokens : (rank + 1) * num_tokens
-            ]
-            output_tensors.append(
-                trtllm_moe_alltoall.moe_a2a_dispatch(
-                    rank_token_selected_experts,
-                    rank_payloads,
-                    all_workspaces,
-                    metainfo[rank],
-                    num_tokens,
-                    ep_rank=rank,
-                    ep_size=world_size,
-                    top_k=1,
-                    num_experts=world_size,
-                )[0]
-            )
-
-    for rank in range(world_size):
-        cuda_streams_all_ranks[rank].synchronize()
-
-    torch.cuda.synchronize()
 
     for rank in range(world_size):
         # Get the indices where token_selected_experts == rank
@@ -221,7 +345,7 @@ def test_moe_alltoall_multi_rank_single_gpu(world_size, num_tokens, vector_dim):
             token_selected_experts.flatten() == rank
         ).nonzero(as_tuple=False)
 
-        for actual, ref in zip(output_tensors[rank][:-1], payloads[:-1], strict=True):
+        for actual, ref in zip(output_tensors[rank], input_tensors, strict=True):
             # Select the tensors that arent all zeros
             actual = actual.flatten(end_dim=1)
             actual = actual[actual.any(dim=1)]
@@ -231,7 +355,199 @@ def test_moe_alltoall_multi_rank_single_gpu(world_size, num_tokens, vector_dim):
             torch.testing.assert_close(actual, ref, atol=0, rtol=0)
 
 
-# TODO Add a combine test
+@pytest.mark.parametrize("world_size,num_tokens", SANITIZE_PARAMS)
+def test_sanitize_expert_ids(world_size, num_tokens):
+    torch.cuda.set_device(0)
+    max_world_size = 8
+    assert world_size <= max_world_size, (
+        f"should run with world_size at most {max_world_size}"
+    )
+
+    flags = torch.ones(
+        num_tokens * world_size, 1, dtype=torch.bool, device=torch.device("cuda")
+    )
+    token_selected_experts = torch.randint(
+        0,
+        world_size,
+        (num_tokens * world_size, 1),
+        dtype=torch.int32,
+        device=torch.device("cuda"),
+    )
+
+    output_tensors, all_workspaces, metainfo, _ = dispatch_from_single_rank(
+        [token_selected_experts, flags],
+        token_selected_experts,
+        world_size,
+        world_size,
+        num_tokens,
+    )
+
+    # Clone since the tensors are modified in place
+    expected_output_tensors = [(x[0].clone(), x[1].clone()) for x in output_tensors]
+    output_tensors = sanitize_expert_ids_from_single_rank(
+        output_tensors, 0, all_workspaces, metainfo, world_size, -3
+    )
+
+    for rank, (sanitized, raw) in enumerate(
+        zip(output_tensors, expected_output_tensors, strict=True)
+    ):
+        raw_tensor, flag_tensor = raw
+        valid_mask = (raw_tensor == rank) & flag_tensor
+        raw_tensor[~valid_mask] = -3
+        torch.testing.assert_close(sanitized[0], raw_tensor, atol=0, rtol=0)
+
+
+def fake_moe(
+    hidden_states,
+    token_selected_experts,
+    num_experts,
+    is_ep=False,
+    ep_rank=None,
+    num_experts_per_rank=None,
+):
+    target_shape = hidden_states.shape
+    hidden_states = hidden_states.flatten(end_dim=-2)
+    token_selected_experts = token_selected_experts.flatten(end_dim=-2)
+    num_tokens, _ = hidden_states.shape
+    _, top_k = token_selected_experts.shape
+
+    if is_ep:
+        assert ep_rank is not None and num_experts_per_rank is not None
+
+    # Initialize output
+    processed_states = torch.zeros_like(hidden_states)
+
+    # Process each token
+    for token_idx in range(num_tokens):
+        results = []
+        # For each expert selected for this token/
+        for k in range(top_k):
+            expert_id = token_selected_experts[token_idx, k].item()
+            if is_ep and not (
+                expert_id >= ep_rank * num_experts_per_rank
+                and expert_id < (ep_rank + 1) * num_experts_per_rank
+            ):
+                continue
+
+            scale = (expert_id + 1.0) / num_experts + 0.5
+            results.append(hidden_states[token_idx] * scale)
+
+        # Summing the results after is closer to the actual implementation as we do a tree reduction.
+        if results:
+            processed_states[token_idx] = torch.sum(
+                torch.stack(results, dim=0), dim=0, dtype=torch.float32
+            ).to(processed_states.dtype)
+
+    print(f"processed_states shape: {processed_states.shape}")
+    print(f"target_shape: {target_shape}")
+    return processed_states.view(target_shape)
+
+
+@pytest.mark.parametrize("world_size,num_tokens,vector_dim,top_k,dtype", COMBINE_PARAMS)
+def test_moe_combine_multi_rank_single_gpu(
+    world_size, num_tokens, vector_dim, top_k, dtype
+):
+    torch.cuda.set_device(0)
+    max_world_size = 8
+    assert world_size <= max_world_size, (
+        f"should run with world_size at most {max_world_size}"
+    )
+
+    num_experts = world_size * top_k
+
+    token_selected_experts_index = 0
+    hidden_state_index = 1
+
+    token_selected_experts = torch.empty(
+        num_tokens * world_size, top_k, dtype=torch.int32, device=torch.device("cuda")
+    )
+
+    for i in range(num_tokens * world_size):
+        # Include one extra expert to represent invalid expert IDs
+        token_selected_experts[i] = torch.randperm(
+            num_experts, dtype=torch.int32, device=torch.device("cuda")
+        )[:top_k]
+    token_selected_experts = token_selected_experts.contiguous()
+
+    # Create a random input tensor
+    reference_tensor = make_payload(num_tokens * world_size, vector_dim, dtype)
+    input_tensors = [
+        token_selected_experts,
+        reference_tensor,
+        make_payload(
+            num_tokens * world_size, 1, torch.uint8
+        ),  # Some extra payload to test combine alignment logic
+    ]
+
+    output_tensors, all_workspaces, metainfo, combine_payload_offsets = (
+        dispatch_from_single_rank(
+            input_tensors,
+            token_selected_experts,
+            world_size,
+            num_experts,
+            num_tokens,
+            hidden_state_index,
+        )
+    )
+
+    # Sanitize expert ids for fake_moe
+    output_tensors = sanitize_expert_ids_from_single_rank(
+        output_tensors,
+        token_selected_experts_index,
+        all_workspaces,
+        metainfo,
+        world_size,
+        -1,
+    )
+
+    inplace_combine_tensors = []
+    for rank in range(world_size):
+        inplace_combine_tensors.append(
+            trtllm_moe_alltoall.moe_a2a_wrap_payload_tensor_in_workspace(
+                all_workspaces,
+                [world_size, num_tokens],
+                combine_payload_offsets[rank],
+                combine_payload_offsets[rank]
+                + world_size * num_tokens * vector_dim * dtype.itemsize,
+                dtype,
+            )
+        )
+
+    for rank in range(world_size):
+        inplace_combine_tensors[rank].copy_(
+            fake_moe(
+                output_tensors[rank][hidden_state_index],
+                output_tensors[rank][token_selected_experts_index],
+                num_experts,
+                is_ep=True,
+                ep_rank=rank,
+                num_experts_per_rank=num_experts // world_size,
+            )
+        )
+
+    combine_results = combine_from_single_rank(
+        inplace_combine_tensors,
+        num_tokens,
+        top_k,
+        all_workspaces,
+        metainfo,
+        world_size,
+        combine_payload_offsets,
+        payload_in_workspace=True,
+    )
+
+    reference_result = fake_moe(
+        input_tensors[hidden_state_index], token_selected_experts, num_experts
+    )
+
+    for rank in range(world_size):
+        torch.testing.assert_close(
+            combine_results[rank],
+            reference_result[rank * num_tokens : (rank + 1) * num_tokens],
+            atol=1e-2,
+            rtol=1e-2,
+        )
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
