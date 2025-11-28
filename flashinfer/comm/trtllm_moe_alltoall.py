@@ -16,7 +16,7 @@ import functools
 
 from .mnnvl import MnnvlMemory, MnnvlConfig
 from .mapping import Mapping
-from ..jit.comm import gen_mnnvl_a2a_module
+from ..jit.comm import gen_mnnvl_moe_alltoall_module
 from ..utils import register_custom_op
 
 
@@ -30,9 +30,9 @@ class _A2AState:
 
 
 @functools.cache
-def get_mnnvl_a2a_module():
+def get_mnnvl_moe_alltoall_module():
     """Get or build the MNNVL A2A JIT module."""
-    module = gen_mnnvl_a2a_module().build_and_load()
+    module = gen_mnnvl_moe_alltoall_module().build_and_load()
 
     @register_custom_op(
         "flashinfer::moe_a2a_initialize",
@@ -201,7 +201,7 @@ def moe_a2a_initialize(
     ep_size: int,
     max_num_tokens: int,
 ):
-    return get_mnnvl_a2a_module().moe_a2a_initialize(
+    return get_mnnvl_moe_alltoall_module().moe_a2a_initialize(
         workspace, ep_rank, ep_size, max_num_tokens
     )
 
@@ -250,7 +250,7 @@ def moe_a2a_dispatch(
     num_experts: int,
 ):
     recv_offsets, recv_sizes, combine_payload_offset = (
-        get_mnnvl_a2a_module().moe_a2a_dispatch(
+        get_mnnvl_moe_alltoall_module().moe_a2a_dispatch(
             token_selected_experts,
             input_payloads,
             workspace,
@@ -293,7 +293,7 @@ def moe_a2a_combine(
     combine_payload_offset: int,
     payload_in_workspace: bool = False,
 ) -> torch.Tensor:
-    return get_mnnvl_a2a_module().moe_a2a_combine(
+    return get_mnnvl_moe_alltoall_module().moe_a2a_combine(
         payload,
         local_num_tokens,
         workspace,
@@ -314,7 +314,7 @@ def moe_a2a_sanitize_expert_ids(
     ep_rank: int,
     invalid_expert_id: int,
 ):
-    return get_mnnvl_a2a_module().moe_a2a_sanitize_expert_ids(
+    return get_mnnvl_moe_alltoall_module().moe_a2a_sanitize_expert_ids(
         expert_ids, workspace, metainfo, ep_rank, invalid_expert_id
     )
 
@@ -325,7 +325,7 @@ def moe_a2a_get_workspace_size_per_rank(
     total_dispatch_payload_size_per_token: int,
     combine_payload_size_per_token: int,
 ):
-    return get_mnnvl_a2a_module().moe_a2a_get_workspace_size_per_rank(
+    return get_mnnvl_moe_alltoall_module().moe_a2a_get_workspace_size_per_rank(
         ep_size,
         max_num_tokens,
         total_dispatch_payload_size_per_token,
@@ -390,7 +390,7 @@ class MoeAlltoAll:
     def _init_constants(cls):
         """Initialize constants from C++ if not already done."""
         if cls._METAINFO_INDEX is None:
-            module = get_mnnvl_a2a_module()
+            module = get_mnnvl_moe_alltoall_module()
             names, values = module.moe_a2a_get_metainfo_index_pairs()
 
             # Convert TVM arrays to Python and build dictionary
