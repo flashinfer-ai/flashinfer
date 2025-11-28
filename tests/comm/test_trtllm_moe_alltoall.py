@@ -24,7 +24,7 @@ import flashinfer.comm.trtllm_moe_alltoall as trtllm_moe_alltoall
 
 @pytest.fixture(autouse=True, scope="session")
 def setup_test_environment():
-    """Set up test environment and warm up JIT compilation."""
+    """Set up torch seed for deterministic tests."""
     torch.manual_seed(0xD5)
     yield
 
@@ -410,7 +410,7 @@ def fake_moe(
     # Process each token
     for token_idx in range(num_tokens):
         results = []
-        # For each expert selected for this token/
+        # For each expert selected for this token
         for k in range(top_k):
             expert_id = token_selected_experts[token_idx, k].item()
             if is_ep and not (

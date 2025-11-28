@@ -38,17 +38,18 @@ def safe_run(func, *args, **kwargs):
     comm = MPI.COMM_WORLD
     try:
         func(*args, **kwargs)
-    except MPIExit as e:
-        raise e
-    except Exception as e:
+    except MPIExit:
+        raise
+    except Exception:
         traceback.print_exc()
         comm.allgather(True)
-        raise e
+        raise
 
 
 @pytest.fixture(autouse=True)
 def setup_test():
     torch.manual_seed(0x1234)
+    yield
 
 
 def compute_target_rank_id(expert_id, num_experts_per_rank):
@@ -154,7 +155,7 @@ def fake_moe(
     # Process each token
     for token_idx in range(num_tokens):
         results = []
-        # For each expert selected for this token/
+        # For each expert selected for this token
         for k in range(top_k):
             expert_id = token_selected_experts[token_idx, k].item()
             if is_ep:

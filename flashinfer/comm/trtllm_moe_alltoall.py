@@ -5,8 +5,6 @@ This module provides the throughput-optimized all-to-all backend for MoE expert 
 supporting multiple payloads per collective operation.
 """
 
-# TODO Review
-
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Optional
@@ -648,9 +646,9 @@ class MoeAlltoAll:
 
 __all__ = [
     "MoeAlltoAll",
-    "moe_a2a_initialize",
-    "moe_a2a_dispatch",
     "moe_a2a_combine",
-    "moe_a2a_sanitize_expert_ids",
+    "moe_a2a_dispatch",
     "moe_a2a_get_workspace_size_per_rank",
+    "moe_a2a_initialize",
+    "moe_a2a_sanitize_expert_ids",
 ]
