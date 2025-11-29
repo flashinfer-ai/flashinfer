@@ -37,6 +37,7 @@ from ..utils import (
     write_if_different,
 )
 from .utils import generate_additional_params
+from .fmha_v2.generate_kernels import enumerate_kernels
 
 
 def get_single_decode_uri(
@@ -1868,4 +1869,44 @@ def gen_cudnn_fmha_module():
         extra_cuda_cflags=[
             f'-DCUDNN_SDPA_CUBIN_PATH=\\"{ArtifactPath.CUDNN_SDPA}\\"',
         ],
+    )
+
+
+def get_trtllm_fmha_v2_module():
+    module = gen_trtllm_fmha_v2_module().build_and_load()
+    return module
+
+
+def gen_trtllm_fmha_v2_module() -> JitSpec:
+    uri = "trtllm_fmha_v2"
+    cached_ops = jit_env.FLASHINFER_JIT_DIR / uri
+    cached_ops.mkdir(parents=True, exist_ok=True)
+
+    fmha_v2_src_dir = jit_env.FLASHINFER_CSRC_DIR / "fmha_v2"
+
+    # Generate kernel source
+    enumerate_kernels(fmha_v2_src_dir, cached_ops)
+
+    kernels = [
+        "fmha_v2_flash_attention_bf16_64_128_S_q_k_v_192x128_sm120.cu",
+        "fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_192x128_output_bf16_sm120.cu",
+        "fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_192x128_sm120.cu",
+    ]
+
+    kernel_paths = [
+        jit_env.FLASHINFER_JIT_DIR / "trtllm_fmha_v2" / "generated" / kernel
+        for kernel in kernels
+    ]
+    binding_source_path = jit_env.FLASHINFER_CSRC_DIR / "trtllm_fmha_v2_binding.cu"
+    source_paths = kernel_paths + [binding_source_path]
+
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[10, 11, 12]
+    )
+    nvcc_flags.append(f"-I{jit_env.FLASHINFER_CSRC_DIR / 'fmha_v2'}")
+
+    return gen_jit_spec(
+        uri,
+        source_paths,
+        extra_cuda_cflags=nvcc_flags,
     )

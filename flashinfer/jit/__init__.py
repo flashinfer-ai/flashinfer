@@ -55,6 +55,7 @@ from .attention import get_pod_uri as get_pod_uri
 from .attention import get_single_decode_uri as get_single_decode_uri
 from .attention import get_single_prefill_uri as get_single_prefill_uri
 from .attention import gen_trtllm_gen_fmha_module as gen_trtllm_gen_fmha_module
+from .attention import get_trtllm_fmha_v2_module as get_trtllm_fmha_v2_module
 from .core import JitSpec as JitSpec
 from .core import JitSpecStatus as JitSpecStatus
 from .core import JitSpecRegistry as JitSpecRegistry
