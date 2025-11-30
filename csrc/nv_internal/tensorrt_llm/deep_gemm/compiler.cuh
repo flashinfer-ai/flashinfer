@@ -134,11 +134,11 @@ inline void setJitIncludeDirs(std::vector<std::filesystem::path> const& dirs) {
   includeDirs = dirs;
 }
 
-inline std::string generateKernel(uint32_t const shape_n, uint32_t const shape_k, uint32_t const block_m,
-                           uint32_t const block_n, uint32_t const block_k,
-                           uint32_t const num_groups, uint32_t const num_stages,
-                           uint32_t const num_tma_multicast, deep_gemm::GemmType const gemm_type,
-                           bool swapAB = false) {
+inline std::string generateKernel(uint32_t const shape_n, uint32_t const shape_k,
+                                  uint32_t const block_m, uint32_t const block_n,
+                                  uint32_t const block_k, uint32_t const num_groups,
+                                  uint32_t const num_stages, uint32_t const num_tma_multicast,
+                                  deep_gemm::GemmType const gemm_type, bool swapAB = false) {
   constexpr uint32_t kNumTMAThreads = 128;
   constexpr uint32_t kNumMathThreadsPerGroup = 128;
 
