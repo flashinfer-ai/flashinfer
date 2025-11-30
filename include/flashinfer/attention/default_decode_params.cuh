@@ -37,6 +37,7 @@ struct SingleDecodeParams {
   DTypeO* o;
   float* lse;
   float* maybe_alibi_slopes;
+  float* maybe_s_aux;
   uint32_t kv_len;
   uint32_t num_qo_heads;
   uint32_t num_kv_heads;
@@ -58,6 +59,7 @@ struct SingleDecodeParams {
         o(nullptr),
         lse(nullptr),
         maybe_alibi_slopes(nullptr),
+        maybe_s_aux(nullptr),
         kv_len(0),
         num_qo_heads(0),
         num_kv_heads(0),
@@ -84,6 +86,7 @@ struct SingleDecodeParams {
         o(o),
         lse(nullptr),
         maybe_alibi_slopes(maybe_alibi_slopes),
+        maybe_s_aux(nullptr),
         kv_len(seq_len),
         num_qo_heads(num_qo_heads),
         num_kv_heads(num_kv_heads),
@@ -118,6 +121,7 @@ struct BatchDecodeParams {
   DTypeO* o;
   float* lse;
   float* maybe_alibi_slopes;
+  float* maybe_s_aux;
   uint32_t padded_batch_size;
   uint32_t num_qo_heads;
   IdType q_stride_n;
@@ -142,6 +146,7 @@ struct BatchDecodeParams {
         o(nullptr),
         lse(nullptr),
         maybe_alibi_slopes(nullptr),
+        maybe_s_aux(nullptr),
         padded_batch_size(0),
         num_qo_heads(0),
         q_stride_n(0),
@@ -170,6 +175,7 @@ struct BatchDecodeParams {
         o(o),
         lse(lse),
         maybe_alibi_slopes(maybe_alibi_slopes),
+        maybe_s_aux(nullptr),
         padded_batch_size(0),
         num_qo_heads(num_qo_heads),
         q_stride_n(q_stride_n),

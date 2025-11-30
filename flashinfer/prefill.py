@@ -279,6 +279,7 @@ def get_single_prefill_module(backend, *args):
         window_left: int,
         maybe_packed_custom_mask: Optional[torch.Tensor],
         maybe_alibi_slopes: Optional[torch.Tensor],
+        maybe_s_aux: Optional[torch.Tensor],
         logits_soft_cap: float,
         sm_scale: float,
         scale_q: Optional[torch.Tensor],
@@ -332,6 +333,7 @@ def get_single_prefill_module(backend, *args):
                 window_left,
                 maybe_packed_custom_mask,
                 maybe_alibi_slopes,
+                maybe_s_aux,
                 logits_soft_cap,
                 sm_scale,
                 1.0 / rope_scale,  # rope_rcp_scale
@@ -352,6 +354,7 @@ def get_single_prefill_module(backend, *args):
         window_left: int,
         maybe_packed_custom_mask: Optional[torch.Tensor],
         maybe_alibi_slopes: Optional[torch.Tensor],
+        maybe_s_aux: Optional[torch.Tensor],
         logits_soft_cap: float,
         sm_scale: float,
         rope_scale: float,
