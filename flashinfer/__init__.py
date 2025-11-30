@@ -84,6 +84,10 @@ from .fused_moe import (
     trtllm_fp8_block_scale_moe,
     trtllm_fp8_per_tensor_scale_moe,
 )
+from .sparse_moe import (
+    sparse_moe_forward as sparse_moe_forward,
+    SparseMoeBlock as SparseMoeBlock,
+)
 from .gemm import SegmentGEMMWrapper as SegmentGEMMWrapper
 from .gemm import bmm_fp8 as bmm_fp8
 from .gemm import mm_fp4 as mm_fp4
@@ -150,3 +154,10 @@ from .trtllm_low_latency_gemm import (
 from .utils import next_positive_power_of_2 as next_positive_power_of_2
 from .xqa import xqa as xqa
 from .xqa import xqa_mla as xqa_mla
+
+# Linear/GEMM operations
+from .linear import linear as linear
+from .linear import linear_with_bias as linear_with_bias
+from .linear import bmm as bmm
+from .linear import matmul as matmul
+from .linear import embedding as embedding
