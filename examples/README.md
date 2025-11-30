@@ -2,16 +2,81 @@
 
 This directory contains end-to-end examples demonstrating how to use FlashInfer for LLM inference.
 
+## New FlashInfer Modules
+
+This example relies on several new modules added to FlashInfer to provide complete coverage of LLM operations:
+
+### `flashinfer/linear.py` - Linear Algebra Operations
+
+Generic linear/GEMM operations using PyTorch as a backend, exposed through FlashInfer's API.
+
+| Function | Description |
+|----------|-------------|
+| `flashinfer.linear(input, weight)` | Matrix multiplication without bias |
+| `flashinfer.linear_with_bias(input, weight, bias)` | Matrix multiplication with bias |
+| `flashinfer.embedding(input, weight)` | Token embedding lookup |
+| `flashinfer.bmm(input, mat2)` | Batched matrix multiplication |
+| `flashinfer.matmul(input, other)` | General matrix multiplication |
+
+**Usage:**
+```python
+import flashinfer
+
+# Linear projection
+output = flashinfer.linear(hidden_states, weight)  # [batch, seq, in] @ [out, in].T -> [batch, seq, out]
+
+# With bias
+output = flashinfer.linear_with_bias(hidden_states, weight, bias)
+
+# Embedding lookup
+embeddings = flashinfer.embedding(token_ids, embedding_weight)  # [batch, seq] -> [batch, seq, dim]
+```
+
+### `flashinfer/sparse_moe.py` - Sparse Mixture of Experts
+
+Sparse MoE routing and computation for mixture-of-experts models.
+
+| Function/Class | Description |
+|----------------|-------------|
+| `flashinfer.sparse_moe_forward(...)` | Core MoE forward pass with top-k routing |
+| `flashinfer.SparseMoeBlock` | Pre-built MoE module class |
+
+**Usage:**
+```python
+import flashinfer
+
+# Functional API
+output, router_logits = flashinfer.sparse_moe_forward(
+    hidden_states,      # [batch, seq, hidden_dim]
+    gate_weight,        # [num_experts, hidden_dim]
+    expert_fn,          # Callable: (Tensor, int) -> Tensor
+    num_experts=128,
+    top_k=8,
+    norm_topk_prob=True,
+)
+
+# Module API
+moe_block = flashinfer.SparseMoeBlock(
+    hidden_size=2048,
+    intermediate_size=768,
+    num_experts=128,
+    top_k=8,
+)
+output, router_logits = moe_block(hidden_states)
+```
+
+---
+
 ## `llm_inference.py` - Complete LLM Inference with FlashInfer
 
 This example shows how to perform complete LLM inference using **only FlashInfer kernels** for all compute-intensive operations. It loads pre-trained models from HuggingFace and replaces all standard PyTorch operations with optimized FlashInfer equivalents.
 
 ### FlashInfer Kernels Used
 
+**Existing FlashInfer Kernels:**
+
 | Operation | FlashInfer Function |
 |-----------|---------------------|
-| Token Embedding | `flashinfer.embedding` |
-| Linear Projections | `flashinfer.linear`, `flashinfer.linear_with_bias` |
 | RMS Normalization | `flashinfer.rmsnorm` |
 | Rotary Position Embeddings | `flashinfer.apply_rope_pos_ids_inplace` |
 | Llama 3.1 RoPE (scaled) | `flashinfer.apply_llama31_rope_pos_ids_inplace` |
@@ -19,7 +84,14 @@ This example shows how to perform complete LLM inference using **only FlashInfer
 | Decode Attention | `flashinfer.single_decode_with_kv_cache` |
 | SiLU Activation | `flashinfer.silu_and_mul` |
 | Top-k/Top-p Sampling | `flashinfer.top_k_top_p_sampling_from_probs` |
-| Sparse MoE Routing | `flashinfer.sparse_moe_forward` |
+
+**New Modules Added for This Example:**
+
+| Operation | FlashInfer Function | Module |
+|-----------|---------------------|--------|
+| Token Embedding | `flashinfer.embedding` | `linear.py` |
+| Linear Projections | `flashinfer.linear`, `flashinfer.linear_with_bias` | `linear.py` |
+| Sparse MoE Routing | `flashinfer.sparse_moe_forward` | `sparse_moe.py` |
 
 ### Supported Models
 
