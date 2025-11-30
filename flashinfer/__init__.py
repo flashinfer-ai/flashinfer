@@ -88,6 +88,29 @@ from .sparse_moe import (
     sparse_moe_forward as sparse_moe_forward,
     SparseMoeBlock as SparseMoeBlock,
 )
+from .tensor_parallel import (
+    # Initialization
+    init_tensor_parallel as init_tensor_parallel,
+    get_tensor_parallel_world_size as get_tensor_parallel_world_size,
+    get_tensor_parallel_rank as get_tensor_parallel_rank,
+    get_tensor_parallel_group as get_tensor_parallel_group,
+    is_using_flashinfer_custom_ar as is_using_flashinfer_custom_ar,
+    # Communication primitives (FlashInfer custom all-reduce when available)
+    all_reduce as all_reduce,
+    all_gather as all_gather,
+    reduce_scatter as reduce_scatter,
+    # Backward compatible aliases
+    tensor_parallel_all_reduce as tensor_parallel_all_reduce,
+    tensor_parallel_all_gather as tensor_parallel_all_gather,
+    tensor_parallel_reduce_scatter as tensor_parallel_reduce_scatter,
+    # Tensor parallel layers
+    ColumnParallelLinear as ColumnParallelLinear,
+    MergedColumnParallelLinear as MergedColumnParallelLinear,
+    RowParallelLinear as RowParallelLinear,
+    VocabParallelEmbedding as VocabParallelEmbedding,
+    TensorParallelMLP as TensorParallelMLP,
+    TensorParallelSparseMoeBlock as TensorParallelSparseMoeBlock,
+)
 from .gemm import SegmentGEMMWrapper as SegmentGEMMWrapper
 from .gemm import bmm_fp8 as bmm_fp8
 from .gemm import mm_fp4 as mm_fp4

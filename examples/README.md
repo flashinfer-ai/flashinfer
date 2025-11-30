@@ -65,6 +65,77 @@ moe_block = flashinfer.SparseMoeBlock(
 output, router_logits = moe_block(hidden_states)
 ```
 
+### `flashinfer/tensor_parallel.py` - Megatron-style Tensor Parallelism
+
+Tensor-parallel linear layers and communication primitives for distributed inference.
+
+**Communication Primitives (FlashInfer Custom All-Reduce):**
+
+FlashInfer provides optimized all-reduce using the `trtllm_allreduce_fusion` kernel, which is **included directly in FlashInfer** (no TensorRT-LLM or external library required). This kernel is optimized for low-latency intra-node communication and automatically falls back to NCCL if unavailable.
+
+| Function | Description |
+|----------|-------------|
+| `flashinfer.all_reduce(tensor)` | Optimized all-reduce using `flashinfer.comm.trtllm_allreduce_fusion` (NCCL fallback) |
+| `flashinfer.all_gather(tensor, dim)` | All-gather across TP group (NCCL) |
+| `flashinfer.reduce_scatter(tensor, dim)` | Reduce-scatter across TP group (NCCL) |
+| `flashinfer.is_using_flashinfer_custom_ar()` | Check if FlashInfer custom all-reduce is active |
+
+**Tensor Parallel Layers:**
+
+| Class | Description |
+|-------|-------------|
+| `flashinfer.ColumnParallelLinear` | Linear with output dim split across GPUs |
+| `flashinfer.RowParallelLinear` | Linear with input dim split, all-reduce output |
+| `flashinfer.MergedColumnParallelLinear` | Fused QKV or gate+up projections |
+| `flashinfer.VocabParallelEmbedding` | Embedding with vocabulary parallelism |
+| `flashinfer.TensorParallelMLP` | MLP with TP (gate/up=Column, down=Row) |
+| `flashinfer.TensorParallelSparseMoeBlock` | MoE with TP within each expert |
+
+**Parallelism Strategy:**
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                       Megatron-style TP                          │
+├──────────────────────────────────────────────────────────────────┤
+│  Q, K, V, gate_proj, up_proj  →  ColumnParallel (split output)   │
+│  o_proj, down_proj            →  RowParallel (all-reduce output) │
+│  Embedding, LM head           →  VocabParallel                   │
+│  MoE experts                  →  TP within each expert           │
+├──────────────────────────────────────────────────────────────────┤
+│  All-Reduce Backend: flashinfer.comm.trtllm_allreduce_fusion     │
+│  (No external dependencies - kernel included in FlashInfer)      │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+**Usage:**
+```python
+import flashinfer
+
+# Initialize (call in each process) - sets up FlashInfer's optimized all-reduce workspace
+flashinfer.init_tensor_parallel(
+    tp_size=4,
+    tp_rank=rank,
+    max_token_num=8192,       # Workspace size for custom all-reduce
+    hidden_dim=4096,          # Model hidden dimension
+    use_flashinfer_custom_ar=True,  # Use FlashInfer's trtllm_allreduce_fusion
+)
+
+# Check if FlashInfer custom all-reduce is active
+print(f"Using FlashInfer AR: {flashinfer.is_using_flashinfer_custom_ar()}")
+
+# Column parallel: output is split, no communication
+q_proj = flashinfer.ColumnParallelLinear(hidden_size, num_heads * head_dim)
+
+# Row parallel: input is split, output is all-reduced via flashinfer.all_reduce
+o_proj = flashinfer.RowParallelLinear(num_heads * head_dim, hidden_size)
+
+# Vocab parallel embedding (uses flashinfer.all_reduce internally)
+embed = flashinfer.VocabParallelEmbedding(vocab_size, hidden_size)
+
+# Direct communication primitives (uses trtllm_allreduce_fusion when available)
+output = flashinfer.all_reduce(partial_output)
+gathered = flashinfer.all_gather(local_tensor, dim=-1)
+```
+
 ---
 
 ## `llm_inference.py` - Complete LLM Inference with FlashInfer
@@ -194,3 +265,71 @@ FlashInfer Kernels Used:
 ✓ flashinfer.top_k_top_p_sampling_from_probs - Sampling
 ```
 
+---
+
+## `llm_inference_tp.py` - Tensor-Parallel LLM Inference
+
+This example demonstrates **multi-GPU tensor-parallel inference** using Megatron-style parallelism.
+
+### Tensor Parallelism Strategy
+
+| Layer Type | Parallelism | Communication |
+|------------|-------------|---------------|
+| Q, K, V projections | Column Parallel | None (split output) |
+| O projection | Row Parallel | `flashinfer.all_reduce` (trtllm_allreduce_fusion) |
+| gate_proj, up_proj | Column Parallel | None (split output) |
+| down_proj | Row Parallel | `flashinfer.all_reduce` (trtllm_allreduce_fusion) |
+| Embedding | Vocab Parallel | `flashinfer.all_reduce` (trtllm_allreduce_fusion) |
+| LM head | Column Parallel | `flashinfer.all_gather` (NCCL) |
+| MoE experts | TP within expert | `flashinfer.all_reduce` per expert |
+
+### Usage
+
+Launch with `torchrun` for multi-GPU:
+
+```bash
+# 2-GPU tensor parallel
+torchrun --nproc_per_node=2 llm_inference_tp.py --model Qwen/Qwen2.5-1.5B-Instruct
+
+# 4-GPU tensor parallel  
+torchrun --nproc_per_node=4 llm_inference_tp.py --model Qwen/Qwen3-4B-Instruct-2507
+
+# 8-GPU tensor parallel for MoE
+torchrun --nproc_per_node=8 llm_inference_tp.py --model Qwen/Qwen3-30B-A3B-Instruct-2507
+```
+
+### Requirements
+
+- Multiple CUDA GPUs (SM 9.0+/Hopper recommended for best all-reduce performance)
+- PyTorch with NCCL support
+- `num_attention_heads` and `num_kv_heads` must be divisible by TP size
+- For MoE models: works with any number of experts (TP applied within each expert)
+- **No external libraries required** - FlashInfer's `trtllm_allreduce_fusion` kernel is self-contained
+
+### Example Output
+
+```
+============================================================
+FlashInfer Tensor-Parallel LLM Inference
+============================================================
+
+Model: Qwen/Qwen2.5-1.5B-Instruct
+Tensor Parallel Size: 2
+Device: cuda:0
+FlashInfer Custom All-Reduce: True
+
+...
+
+Generated text:
+The capital of France is Paris.
+
+============================================================
+Tensor Parallel Summary:
+============================================================
+✓ Tensor Parallel Size: 2
+✓ ColumnParallelLinear: Q, K, V, gate_proj, up_proj
+✓ RowParallelLinear: o_proj, down_proj
+✓ VocabParallelEmbedding: Token embeddings
+✓ flashinfer.all_reduce: Using FlashInfer trtllm_allreduce_fusion
+✓ flashinfer.all_gather: Communication primitive
+```
