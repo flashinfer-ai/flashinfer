@@ -47,7 +47,7 @@
 namespace deep_gemm::jit {
 
 // Generate a unique ID for temporary directories to avoid collisions
-std::string generateUniqueId() {
+inline std::string generateUniqueId() {
   // Use current time and random number to generate a unique ID
   static std::mt19937 gen(std::random_device{}());
   static std::uniform_int_distribution<> distrib(0, 999999);
@@ -62,7 +62,7 @@ std::string generateUniqueId() {
   return std::to_string(value) + "_" + std::to_string(random_value);
 }
 
-std::filesystem::path getDefaultUserDir() {
+inline std::filesystem::path getDefaultUserDir() {
   static std::filesystem::path userDir;
   if (userDir.empty()) {
     char const* cacheDir = getenv("TRTLLM_DG_CACHE_DIR");
@@ -94,7 +94,7 @@ inline std::filesystem::path getTmpDir() { return getDefaultUserDir() / "tmp"; }
 
 inline std::filesystem::path getCacheDir() { return getDefaultUserDir() / "cache"; }
 
-std::string getNvccCompiler() {
+inline std::string getNvccCompiler() {
   static std::string compiler;
   if (compiler.empty()) {
     // Check environment variable
@@ -134,7 +134,7 @@ inline void setJitIncludeDirs(std::vector<std::filesystem::path> const& dirs) {
   includeDirs = dirs;
 }
 
-std::string generateKernel(uint32_t const shape_n, uint32_t const shape_k, uint32_t const block_m,
+inline std::string generateKernel(uint32_t const shape_n, uint32_t const shape_k, uint32_t const block_m,
                            uint32_t const block_n, uint32_t const block_k,
                            uint32_t const num_groups, uint32_t const num_stages,
                            uint32_t const num_tma_multicast, deep_gemm::GemmType const gemm_type,
