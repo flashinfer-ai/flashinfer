@@ -651,183 +651,101 @@ def allreduce_fusion(
     """
     # Auto-detect pattern if not provided
     if pattern is None:
-        pattern = _infer_fusion_pattern(
-            output, residual_in, residual_out, norm_out, quant_out, scale_out
-        )
+        if quant_out is not None:
+            # Quantization patterns
+            if norm_out is not None and residual_out is not None:
+                pattern = AllReduceFusionPattern.kARResidualRMSNormOutFP8Quant  # 4
+            else:
+                pattern = AllReduceFusionPattern.kARResidualRMSNormFP8Quant  # 2
+        elif norm_out is not None:
+            pattern = AllReduceFusionPattern.kARResidualRMSNorm  # 1
+        else:
+            pattern = AllReduceFusionPattern.kAllReduce  # 0
 
-    # Infer backend from workspace type and dispatch
+    # Dispatch based on workspace type
     if isinstance(workspace, TRTLLMAllReduceFusionWorkspace):
-        return _allreduce_fusion_trtllm(
-            input=input,
-            workspace=workspace,
+        # TensorRT-LLM backend implementation
+        # Extract shape from 2D input
+        token_num, hidden_dim = input.shape
+
+        # Allocate output if needed (keep 2D shape)
+        if output is None:
+            output = torch.empty_like(input)
+
+        # Flatten all tensors to 1D for legacy trtllm_allreduce_fusion API
+        # The legacy API expects flattened tensors and explicit token_num/hidden_dim
+        input_flat = input.flatten()
+        output_flat = output.flatten()
+        residual_in_flat = residual_in.flatten() if residual_in is not None else None
+        residual_out_flat = residual_out.flatten() if residual_out is not None else None
+        norm_out_flat = norm_out.flatten() if norm_out is not None else None
+        quant_out_flat = quant_out.flatten() if quant_out is not None else None
+
+        # Call legacy API with flattened tensors
+        # Note: pattern and layout_code are ints but legacy API uses pseudo-type hints
+        trtllm_allreduce_fusion(
+            allreduce_in=input_flat,
+            world_size=workspace.world_size,
+            world_rank=workspace.rank,
+            token_num=token_num,
+            hidden_dim=hidden_dim,
+            workspace_ptrs=workspace.workspace_tensor,
             launch_with_pdl=launch_with_pdl,
-            output=output,
-            residual_in=residual_in,
-            residual_out=residual_out,
-            norm_out=norm_out,
-            quant_out=quant_out,
-            scale_out=scale_out,
-            rms_gamma=rms_gamma,
+            trigger_completion_at_end=launch_with_pdl,  # Same meaning
+            fp32_acc=fp32_acc,
+            pattern_code=pattern,  # type: ignore[arg-type]
+            use_oneshot=use_oneshot,
+            allreduce_out=output_flat,
+            residual_in=residual_in_flat,
+            residual_out=residual_out_flat,
+            norm_out=norm_out_flat,
+            quant_out=quant_out_flat,
+            scale_out=scale_out,  # scale_out is not reshaped
+            rms_gamma=rms_gamma,  # 1D tensor, no reshape needed
             rms_eps=rms_eps,
             scale_factor=scale_factor,
-            layout_code=layout_code,
-            pattern=pattern,
-            use_oneshot=use_oneshot,
-            fp32_acc=fp32_acc,
+            layout_code=layout_code,  # type: ignore[arg-type]
             metadata=metadata,
         )
+
+        # Return the most downstream output (already in 2D shape from input views)
+        if norm_out is not None:
+            return norm_out
+        elif quant_out is not None:
+            return quant_out
+        else:
+            return output
+
     elif isinstance(workspace, MNNVLAllReduceFusionWorkspace):
-        return _allreduce_fusion_mnnvl(
-            input=input,
-            workspace=workspace,
-            launch_with_pdl=launch_with_pdl,
-            residual_in=residual_in,
-            residual_out=residual_out,
-            norm_out=norm_out,
-            rms_gamma=rms_gamma,
-            rms_eps=rms_eps,
-        )
+        if (
+            pattern != AllReduceFusionPattern.kARResidualRMSNorm
+            and pattern != AllReduceFusionPattern.kAllReduce
+        ):
+            raise ValueError(
+                f"MNNVL AllReduce+RMS fusion does not support pattern {pattern}"
+            )
+        # MNNVL backend implementation
+        # Validate required parameters for RMS fusion
+        if residual_in is None:
+            raise ValueError("MNNVL AllReduce+RMS fusion requires residual_in")
+        if residual_out is None:
+            raise ValueError(
+                "MNNVL AllReduce+RMS fusion requires residual_out (prenorm_output)"
+            )
+        if norm_out is None:
+            raise ValueError(
+                "MNNVL AllReduce+RMS fusion requires norm_out (normed_output)"
+            )
+        if rms_gamma is None:
+            raise ValueError("MNNVL AllReduce+RMS fusion requires rms_gamma")
+
+        # Call the MNNVL fusion function
+        raise NotImplementedError("MNNVL AllReduce+RMS fusion is not implemented")
+
+        return norm_out
+
     else:
         raise TypeError(
             f"Unknown workspace type: {type(workspace)}. "
             f"Expected TRTLLMAllReduceFusionWorkspace or MNNVLAllReduceFusionWorkspace"
         )
-
-
-# ============================================================================
-# HELPER FUNCTIONS
-# ============================================================================
-
-
-def _infer_fusion_pattern(
-    output, residual_in, residual_out, norm_out, quant_out, scale_out
-) -> int:
-    """
-    Automatically infer fusion pattern from provided tensors.
-
-    Returns AllReduceFusionPattern value (as int) based on which output tensors are provided.
-    """
-
-    if quant_out is not None:
-        # Quantization patterns
-        if norm_out is not None and residual_out is not None:
-            # Has separate norm output and residual output
-            return AllReduceFusionPattern.kARResidualRMSNormOutFP8Quant  # 4
-        else:
-            # Quant without separate outputs
-            return AllReduceFusionPattern.kARResidualRMSNormFP8Quant  # 2
-    elif norm_out is not None:
-        # RMS Norm without quantization
-        return AllReduceFusionPattern.kARResidualRMSNorm  # 1
-    else:
-        # Just AllReduce
-        return AllReduceFusionPattern.kAllReduce  # 0
-
-
-def _allreduce_fusion_trtllm(
-    input: torch.Tensor,
-    workspace: TRTLLMAllReduceFusionWorkspace,
-    launch_with_pdl: bool,
-    output: Optional[torch.Tensor],
-    residual_in: Optional[torch.Tensor],
-    residual_out: Optional[torch.Tensor],
-    norm_out: Optional[torch.Tensor],
-    quant_out: Optional[torch.Tensor],
-    scale_out: Optional[torch.Tensor],
-    rms_gamma: Optional[torch.Tensor],
-    rms_eps: float,
-    scale_factor: Optional[Union[torch.Tensor, float]],
-    layout_code: Optional[int],
-    pattern: int,
-    use_oneshot: Optional[bool],
-    fp32_acc: bool,
-    metadata: Optional[dict],
-) -> torch.Tensor:
-    """TensorRT-LLM backend implementation."""
-
-    # Extract shape from 2D input
-    token_num, hidden_dim = input.shape
-
-    # Allocate output if needed (keep 2D shape)
-    if output is None:
-        output = torch.empty_like(input)
-
-    # Flatten all tensors to 1D for legacy trtllm_allreduce_fusion API
-    # The legacy API expects flattened tensors and explicit token_num/hidden_dim
-    input_flat = input.flatten()
-    output_flat = output.flatten()
-    residual_in_flat = residual_in.flatten() if residual_in is not None else None
-    residual_out_flat = residual_out.flatten() if residual_out is not None else None
-    norm_out_flat = norm_out.flatten() if norm_out is not None else None
-    quant_out_flat = quant_out.flatten() if quant_out is not None else None
-
-    # Call legacy API with flattened tensors
-    # Note: pattern and layout_code are ints but legacy API uses pseudo-type hints
-    trtllm_allreduce_fusion(
-        allreduce_in=input_flat,
-        world_size=workspace.world_size,
-        world_rank=workspace.rank,
-        token_num=token_num,
-        hidden_dim=hidden_dim,
-        workspace_ptrs=workspace.workspace_tensor,
-        launch_with_pdl=launch_with_pdl,
-        trigger_completion_at_end=launch_with_pdl,  # Same meaning
-        fp32_acc=fp32_acc,
-        pattern_code=pattern,  # type: ignore[arg-type]
-        use_oneshot=use_oneshot,
-        allreduce_out=output_flat,
-        residual_in=residual_in_flat,
-        residual_out=residual_out_flat,
-        norm_out=norm_out_flat,
-        quant_out=quant_out_flat,
-        scale_out=scale_out,  # scale_out is not reshaped
-        rms_gamma=rms_gamma,  # 1D tensor, no reshape needed
-        rms_eps=rms_eps,
-        scale_factor=scale_factor,
-        layout_code=layout_code,  # type: ignore[arg-type]
-        metadata=metadata,
-    )
-
-    # Return the most downstream output (already in 2D shape from input views)
-    if norm_out is not None:
-        return norm_out
-    elif quant_out is not None:
-        return quant_out
-    else:
-        return output
-
-
-def _allreduce_fusion_mnnvl(
-    input: torch.Tensor,
-    workspace: MNNVLAllReduceFusionWorkspace,
-    launch_with_pdl: bool,
-    residual_in: Optional[torch.Tensor],
-    residual_out: Optional[torch.Tensor],
-    norm_out: Optional[torch.Tensor],
-    rms_gamma: Optional[torch.Tensor],
-    rms_eps: float,
-) -> torch.Tensor:
-    """
-    MNNVL backend implementation.
-
-    Calls trtllm_mnnvl_fused_allreduce_rmsnorm which performs:
-    1. AllReduce on input
-    2. Add residual
-    3. RMSNorm
-    """
-    # Validate required parameters for RMS fusion
-    if residual_in is None:
-        raise ValueError("MNNVL AllReduce+RMS fusion requires residual_in")
-    if residual_out is None:
-        raise ValueError(
-            "MNNVL AllReduce+RMS fusion requires residual_out (prenorm_output)"
-        )
-    if norm_out is None:
-        raise ValueError("MNNVL AllReduce+RMS fusion requires norm_out (normed_output)")
-    if rms_gamma is None:
-        raise ValueError("MNNVL AllReduce+RMS fusion requires rms_gamma")
-
-    # Call the MNNVL fusion function
-    raise NotImplementedError("MNNVL AllReduce+RMS fusion is not implemented")
-
-    return norm_out
