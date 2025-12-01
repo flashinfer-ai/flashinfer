@@ -16,6 +16,7 @@
  */
 
 #pragma once
+#include <cuda.h>
 #include <cuda_runtime.h>
 #include <nvrtc.h>
 
@@ -67,7 +68,7 @@ GemmConfig get_best_gemm_config(uint32_t shape_m, uint32_t shape_n, uint32_t sha
 
 namespace deep_gemm::jit {
 
-std::string gemm_type_to_string(deep_gemm::GemmType gemm_type) {
+inline std::string gemm_type_to_string(deep_gemm::GemmType gemm_type) {
   switch (gemm_type) {
     case deep_gemm::GemmType::Normal:
       return std::string("Normal");
@@ -85,10 +86,10 @@ std::string gemm_type_to_string(deep_gemm::GemmType gemm_type) {
   }
 }
 
-int div_up(int a, int b) { return (a + b - 1) / b; }
+inline int div_up(int a, int b) { return (a + b - 1) / b; }
 
-int get_smem_size(int num_stages, int k, int block_m, int block_n, int block_k = 128,
-                  bool swap_ab = false) {
+inline int get_smem_size(int num_stages, int k, int block_m, int block_n, int block_k = 128,
+                         bool swap_ab = false) {
   if (!swap_ab) {
     int smem_d = block_m * block_n * 2;
     int smem_a_per_stage = block_m * block_k;
@@ -126,16 +127,16 @@ int get_smem_size(int num_stages, int k, int block_m, int block_n, int block_k =
   }
 }
 
-bool is_tma_multicast_legal(int n, int block_n, int num_tma_multicast, int num_sms) {
+inline bool is_tma_multicast_legal(int n, int block_n, int num_tma_multicast, int num_sms) {
   if (num_tma_multicast == 1) {
     return true;
   }
   return (n % (block_n * num_tma_multicast) == 0) && num_sms % num_tma_multicast == 0;
 }
 
-GemmConfig get_best_gemm_config(uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
-                                int num_groups, int num_device_sms,
-                                bool is_grouped_contiguous = false, bool swap_ab = false) {
+inline GemmConfig get_best_gemm_config(uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
+                                       int num_groups, int num_device_sms,
+                                       bool is_grouped_contiguous = false, bool swap_ab = false) {
   // Choose candidate block sizes
   std::vector<int> block_ms;
   block_ms.push_back((!is_grouped_contiguous && shape_m <= 64) ? 64 : 128);

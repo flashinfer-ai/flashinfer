@@ -328,6 +328,14 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
     else:
         raise ValueError(f"Invalid backend: {backend}")
 
+    # Set DeepGEMM JIT include directories after module is loaded
+    from ..jit import env as jit_env
+
+    deepgemm_include_dir = str(
+        jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "tensorrt_llm"
+    )
+    module.set_deepgemm_jit_include_dirs([deepgemm_include_dir])
+
     class MoERunner(TunableRunner):
         # avoid overhead of creating a new runner in forward pass
         runner_dict: Dict[
