@@ -32,20 +32,20 @@ Example usage:
     ...     topology="single_node"
     ... )
     >>>
-    >>> # Perform AllReduce + RMSNorm fusion
-    >>> prenorm = torch.empty_like(hidden_states)
-    >>> normed = torch.empty_like(hidden_states)
-    >>> output = allreduce_fusion(
-    ...     input=hidden_states,
-    ...     workspace=workspace,
-    ...     launch_with_pdl=True,
-    ...     residual_out=prenorm,
-    ...     norm_out=normed,
-    ...     residual_in=residual,
-    ...     rms_gamma=norm_weight
-    ... )
-    >>>
-    >>> destroy_allreduce_fusion_workspace(workspace)
+        >>> # Perform AllReduce + RMSNorm fusion
+        >>> prenorm = torch.empty_like(hidden_states)
+        >>> normed = torch.empty_like(hidden_states)
+        >>> output = allreduce_fusion(
+        ...     input=hidden_states,
+        ...     workspace=workspace,
+        ...     launch_with_pdl=True,
+        ...     residual_out=prenorm,
+        ...     norm_out=normed,
+        ...     residual_in=residual,
+        ...     rms_gamma=norm_weight
+        ... )
+        >>>
+        >>> workspace.destroy()
 """
 
 from typing import Union, Literal, Optional, Tuple, List, cast
@@ -76,7 +76,7 @@ from .trtllm_ar import AllReduceFusionPattern
 # 1. Calls the backend-specific workspace creation function in __init__
 # 2. Stores the internal workspace as _internal_workspace
 # 3. Exposes essential attributes for the unified API
-# 4. Can be destroyed using destroy_allreduce_fusion_workspace()
+# 4. Can be destroyed using workspace.destroy()
 # ============================================================================
 
 
@@ -532,29 +532,6 @@ def create_allreduce_fusion_workspace(
         )
     else:
         raise RuntimeError(f"Unknown backend: {actual_backend}")
-
-
-# ============================================================================
-# WORKSPACE DESTRUCTION
-# ============================================================================
-
-
-def destroy_allreduce_fusion_workspace(workspace: AllReduceFusionWorkspace) -> None:
-    """
-    Destroy workspace and free resources.
-
-    This is a convenience function that calls the workspace's destroy() method.
-
-    Args:
-        workspace: Workspace object to destroy
-
-    Example:
-        >>> workspace = create_allreduce_fusion_workspace(...)
-        >>> # ... use workspace ...
-        >>> destroy_allreduce_fusion_workspace(workspace)
-        >>> # Or call directly: workspace.destroy()
-    """
-    workspace.destroy()
 
 
 # ============================================================================

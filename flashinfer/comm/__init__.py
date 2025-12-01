@@ -47,8 +47,5 @@ from .allreduce import allreduce_fusion as allreduce_fusion
 from .allreduce import (
     create_allreduce_fusion_workspace as create_allreduce_fusion_workspace,
 )
-from .allreduce import (
-    destroy_allreduce_fusion_workspace as destroy_allreduce_fusion_workspace,
-)
 
 # from .mnnvl import MnnvlMemory, MnnvlMoe, MoEAlltoallInfo
