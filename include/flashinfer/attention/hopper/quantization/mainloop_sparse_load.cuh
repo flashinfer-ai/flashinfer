@@ -26,7 +26,6 @@
 #include <cutlass/pipeline/pipeline.hpp>
 
 #include "../../../math.cuh"
-#include "../block_sparse_gather.cuh"
 #include "../named_barrier.cuh"
 #include "../utils.cuh"
 #include "kernel_traits.cuh"
