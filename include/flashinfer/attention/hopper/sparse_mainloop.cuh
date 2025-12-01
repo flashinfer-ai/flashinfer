@@ -269,6 +269,7 @@ struct SparseCollectiveMainloop {
 
     // FA3-style cooperative loading: store pre-computed base offset for each KV position
     int64_t my_kv_offset[2];  // Rolling buffer: page_idx * page_stride + entry_idx * stride_n
+    int parity = 0;           // Buffer parity for double buffering, toggled with ^= 1
 
     // Group organization based on partition strategy
     constexpr int NUM_KV_PER_ITER = decltype(size<1>(tKcK))::value;   // e.g., 12
@@ -282,9 +283,9 @@ struct SparseCollectiveMainloop {
 
     // Prefetch: compute page_idx * page_stride + entry_idx * stride_n
     // NOTE: Assumes K and V have same strides (asserted on host side)
+    // Uses parity to select buffer slot, caller must toggle parity after load
     auto prefetch_kv_offset = [&](int kv_tile_idx, bool use_predicate) {
       int kv_base_idx = kv_tile_idx * CTA_KV;
-      int buf_idx = kv_tile_idx % 2;
 
       int kv_idx_read = kv_base_idx + group_id + thread_in_group * KV_STRIDE;
       bool valid_read =
@@ -296,20 +297,20 @@ struct SparseCollectiveMainloop {
         mainloop_params.page_size.divmod(kv_idx_read, page_iter, entry_idx);
         IdType page_idx = kv_indices_ptr[page_iter];
         // Pre-compute: page_idx * page_stride + entry_idx * stride_n
-        my_kv_offset[buf_idx] = page_idx * k_page_stride + entry_idx * k_stride_n;
+        my_kv_offset[parity] = page_idx * k_page_stride + entry_idx * k_stride_n;
       } else {
-        my_kv_offset[buf_idx] = 0;
+        my_kv_offset[parity] = 0;
       }
     };
 
     // Unified helper lambda to load K or V with pre-computed offsets
+    // Uses parity to select buffer slot, caller must toggle parity after load
     auto load_kv_with_gather = [&](auto&& tXsX, auto&& tXcX, DTypeKV* base_ptr, int kv_tile_idx,
                                    int stage_idx, bool use_predicate) {
       using Vec = AlignmentTypeKV;
       constexpr int VecSize = sizeof(Vec) / sizeof(DTypeKV);
 
       int kv_base_idx = kv_tile_idx * CTA_KV;
-      int buf_idx = kv_tile_idx % 2;
 
       auto dst = recast<Vec>(flatten(tXsX(_, _, _, stage_idx)));
       auto c = flatten(tXcX(_, _, _, kv_tile_idx));
@@ -327,7 +328,7 @@ struct SparseCollectiveMainloop {
 
         // Shuffle the pre-computed offset (page_idx * page_stride + entry_idx * stride_n)
         int src_thread = group_id * THREADS_PER_GROUP + kv_offset / KV_STRIDE;
-        int64_t base_offset = __shfl_sync(FULL_MASK, my_kv_offset[buf_idx], src_thread);
+        int64_t base_offset = __shfl_sync(FULL_MASK, my_kv_offset[parity], src_thread);
 
         // Final address: base_ptr + base_offset + d_idx
         // where base_offset = page_idx * page_stride + entry_idx * stride_n
@@ -338,12 +339,14 @@ struct SparseCollectiveMainloop {
     };
 
     // load last k-tile
+    // parity=0: prefetch kv_tile_idx -> my_kv_offset[0]
     {
       prefetch_kv_offset(kv_tile_idx, true);
       pipeline_k.producer_acquire(smem_pipe_write_k);
       load_kv_with_gather(tKsK, tKcK, K_ptr_base, kv_tile_idx, smem_pipe_write_k.index(), true);
       pipeline_k.producer_commit(smem_pipe_write_k, cutlass::arch::cpasync_barrier_arrive);
       ++smem_pipe_write_k;
+      // Note: don't toggle parity here, we reuse the same buffer for V below
     }
 
     // All producer threads sync on kQueryEmpty barrier before loading Q
@@ -366,47 +369,60 @@ struct SparseCollectiveMainloop {
     shared_storage.barrier_O.wait((work_idx + 1) % 2);
 
     if (kv_tile_idx == swa_begin_kv_tile_idx) {
-      // kv_tile_idx already prefetched above, reuse it for V
+      // kv_tile_idx already prefetched above (parity=0), reuse it for V
       pipeline_v.producer_acquire(smem_pipe_write_v);
       load_kv_with_gather(tVsV, tVcV, V_ptr_base, kv_tile_idx, smem_pipe_write_v.index(), true);
       pipeline_v.producer_commit(smem_pipe_write_v, cutlass::arch::cpasync_barrier_arrive);
       ++smem_pipe_write_v;
     } else {
       // load second last k-tile and last v-tile
+      // parity=0: kv_tile_idx is in my_kv_offset[0]
+      // Now prefetch kv_tile_k into my_kv_offset[1]
       int kv_tile_k = kv_tile_idx_decrement(kv_tile_idx);
+      parity ^= 1;  // parity=1
       prefetch_kv_offset(kv_tile_k, false);
       pipeline_k.producer_acquire(smem_pipe_write_k);
       load_kv_with_gather(tKsK, tKcK, K_ptr_base, kv_tile_k, smem_pipe_write_k.index(), false);
       pipeline_k.producer_commit(smem_pipe_write_k, cutlass::arch::cpasync_barrier_arrive);
       ++smem_pipe_write_k;
 
-      // kv_tile_idx already prefetched above, reuse it for V
+      // Load V for kv_tile_idx using my_kv_offset[0]
+      parity ^= 1;  // parity=0
       pipeline_v.producer_acquire(smem_pipe_write_v);
       load_kv_with_gather(tVsV, tVcV, V_ptr_base, kv_tile_idx, smem_pipe_write_v.index(), true);
       pipeline_v.producer_commit(smem_pipe_write_v, cutlass::arch::cpasync_barrier_arrive);
       kv_tile_idx = kv_tile_idx_decrement(kv_tile_idx);
       ++smem_pipe_write_v;
+      // Now kv_tile_idx == kv_tile_k, and its offset is in my_kv_offset[1]
+      parity ^= 1;  // parity=1, pointing to kv_tile_idx's offset
 
       // load remaining k/v tiles
 #pragma unroll 2
       for (; kv_tile_idx > swa_begin_kv_tile_idx;
            kv_tile_idx = kv_tile_idx_decrement(kv_tile_idx)) {
+        // parity points to current kv_tile_idx's offset
+        // Prefetch next K tile into the other buffer
         int kv_tile_k = kv_tile_idx_decrement(kv_tile_idx);
+        parity ^= 1;  // Toggle to other buffer for prefetch
         prefetch_kv_offset(kv_tile_k, false);
         pipeline_k.producer_acquire(smem_pipe_write_k);
         load_kv_with_gather(tKsK, tKcK, K_ptr_base, kv_tile_k, smem_pipe_write_k.index(), false);
         pipeline_k.producer_commit(smem_pipe_write_k, cutlass::arch::cpasync_barrier_arrive);
         ++smem_pipe_write_k;
 
-        // kv_tile_idx already prefetched in previous iteration, reuse
+        // Load V for kv_tile_idx using the previous buffer
+        parity ^= 1;  // Toggle back to kv_tile_idx's buffer
         pipeline_v.producer_acquire(smem_pipe_write_v);
         load_kv_with_gather(tVsV, tVcV, V_ptr_base, kv_tile_idx, smem_pipe_write_v.index(), false);
         pipeline_v.producer_commit(smem_pipe_write_v, cutlass::arch::cpasync_barrier_arrive);
         ++smem_pipe_write_v;
+        // After loop update, kv_tile_idx becomes kv_tile_k
+        // Toggle parity to point to kv_tile_k's buffer for next iteration
+        parity ^= 1;
       }
       scheduler.prefetch_next_work(scheduler_params, work_tile_info);
 
-      // load first v tile
+      // load first v tile (tile 0)
       {
         prefetch_kv_offset(0, false);
         pipeline_v.producer_acquire(smem_pipe_write_v);
