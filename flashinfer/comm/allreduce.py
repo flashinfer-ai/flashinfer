@@ -542,6 +542,7 @@ def create_allreduce_fusion_workspace(
 def allreduce_fusion(
     input: torch.Tensor,
     workspace: AllReduceFusionWorkspace,
+    pattern: int,
     launch_with_pdl: bool = False,
     # ===== OUTPUT tensors (pre-allocated, will be filled) =====
     output: Optional[torch.Tensor] = None,
@@ -556,7 +557,6 @@ def allreduce_fusion(
     scale_factor: Optional[Union[torch.Tensor, float]] = None,
     layout_code: Optional[int] = None,
     # ===== Control parameters =====
-    pattern: Optional[int] = None,
     use_oneshot: Optional[bool] = None,
     fp32_acc: bool = False,
     metadata: Optional[dict] = None,
@@ -579,6 +579,14 @@ def allreduce_fusion(
     Args:
         input: Input tensor [token_num, hidden_dim]
         workspace: Workspace object (type determines backend)
+        pattern: Fusion pattern (AllReduceFusionPattern constant, 0-5)
+                 - kAllReduce = 0
+                 - kARResidualRMSNorm = 1
+                 - kARResidualRMSNormFP8Quant = 2
+                 - kARResidualRMSNormFP4Quant = 3
+                 - kARResidualRMSNormOutFP8Quant = 4
+                 - kARResidualRMSNormOutFP4Quant = 5
+                 Note: MNNVL only supports patterns 0 and 1
         launch_with_pdl: Use Persistent Dependency Launch
 
         # ===== OUTPUT tensors (pre-allocated, filled by function) =====
@@ -596,8 +604,6 @@ def allreduce_fusion(
         layout_code: Scale factor layout (QuantizationSFLayout) [trtllm only]
 
         # ===== Control parameters =====
-        pattern: Fusion pattern (AllReduceFusionPattern)
-                 If None, auto-detected based on provided output tensors
         use_oneshot: [trtllm only] Use oneshot strategy vs twoshot
                      If None, uses internal heuristics
         fp32_acc: [trtllm only] Use FP32 accumulation for AllReduce
@@ -626,6 +632,7 @@ def allreduce_fusion(
         >>> output = allreduce_fusion(
         ...     input=hidden_states,
         ...     workspace=workspace,
+        ...     pattern=AllReduceFusionPattern.kARResidualRMSNorm,
         ...     launch_with_pdl=True,
         ...     residual_out=prenorm,
         ...     norm_out=normed,
@@ -641,6 +648,7 @@ def allreduce_fusion(
         >>> output = allreduce_fusion(
         ...     input=hidden_states,
         ...     workspace=workspace,
+        ...     pattern=AllReduceFusionPattern.kARResidualRMSNormFP8Quant,
         ...     norm_out=normed,
         ...     quant_out=quant,
         ...     scale_out=scales,
@@ -649,19 +657,6 @@ def allreduce_fusion(
         ...     scale_factor=scale_tensor
         ... )
     """
-    # Auto-detect pattern if not provided
-    if pattern is None:
-        if quant_out is not None:
-            # Quantization patterns
-            if norm_out is not None and residual_out is not None:
-                pattern = AllReduceFusionPattern.kARResidualRMSNormOutFP8Quant  # 4
-            else:
-                pattern = AllReduceFusionPattern.kARResidualRMSNormFP8Quant  # 2
-        elif norm_out is not None:
-            pattern = AllReduceFusionPattern.kARResidualRMSNorm  # 1
-        else:
-            pattern = AllReduceFusionPattern.kAllReduce  # 0
-
     # Dispatch based on workspace type
     if isinstance(workspace, TRTLLMAllReduceFusionWorkspace):
         # TensorRT-LLM backend implementation
