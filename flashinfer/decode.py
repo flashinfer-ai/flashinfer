@@ -1615,6 +1615,7 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
             pin_memory=True,
         )
 
+    @flashinfer_api
     def plan(
         self,
         indptr: torch.Tensor,
@@ -1740,6 +1741,7 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
         self._rope_scale = rope_scale
         self._rope_theta = rope_theta
 
+    @flashinfer_api
     def run(
         self,
         q_nope: torch.Tensor,

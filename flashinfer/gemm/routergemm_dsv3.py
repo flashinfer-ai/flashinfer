@@ -1,3 +1,4 @@
+from ..api_logging import flashinfer_api
 from flashinfer.jit import gen_dsv3_router_gemm_module
 import functools
 from types import SimpleNamespace
@@ -85,6 +86,7 @@ def get_dsv3_router_gemm_module():
     )
 
 
+@flashinfer_api
 @backend_requirement({}, common_check=_mm_M1_16_K7168_N256_shape_checks)
 def mm_M1_16_K7168_N256(
     mat_a: torch.Tensor,

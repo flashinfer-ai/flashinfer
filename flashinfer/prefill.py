@@ -3554,6 +3554,7 @@ def trtllm_batch_context_with_kv_cache(
     )
 
 
+@flashinfer_api
 def fmha_v2_prefill_deepseek(
     query: torch.Tensor,
     key: torch.Tensor,

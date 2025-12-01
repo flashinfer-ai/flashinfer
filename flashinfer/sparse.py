@@ -19,6 +19,7 @@ from typing import Optional, Tuple, Union
 
 import torch
 
+from .api_logging import flashinfer_api
 from .decode import get_batch_decode_module
 from .page import block_sparse_indices_to_vector_sparse_offsets
 from .prefill import _compute_page_mask_indptr, get_batch_prefill_module
@@ -107,6 +108,7 @@ class BlockSparseAttentionWrapper:
     True
     """
 
+    @flashinfer_api
     def __init__(
         self,
         float_workspace_buffer: torch.Tensor,
@@ -203,6 +205,7 @@ class BlockSparseAttentionWrapper:
         if vector_sparse_indptr_buffer is not None:
             self._vector_sparse_indptr_buffer = vector_sparse_indptr_buffer
 
+    @flashinfer_api
     def plan(
         self,
         indptr: torch.Tensor,
@@ -511,6 +514,7 @@ class BlockSparseAttentionWrapper:
         self._rope_theta = rope_theta
         return self.run(q, k, v, scale_q, scale_k, scale_v)
 
+    @flashinfer_api
     def run(
         self,
         q: torch.Tensor,
@@ -735,6 +739,7 @@ class VariableBlockSparseAttentionWrapper:
     >>> o = wrapper.run(q, k, v)
     """
 
+    @flashinfer_api
     def __init__(
         self,
         float_workspace_buffer: torch.Tensor,
@@ -822,6 +827,7 @@ class VariableBlockSparseAttentionWrapper:
         if vector_sparse_indptr_buffer is not None:
             self._vector_sparse_indptr_buffer = vector_sparse_indptr_buffer
 
+    @flashinfer_api
     def plan(
         self,
         block_mask_map: torch.Tensor,
@@ -1098,6 +1104,7 @@ class VariableBlockSparseAttentionWrapper:
         self._rope_theta = rope_theta
         return self.run(q, k, v)
 
+    @flashinfer_api
     def run(
         self,
         q: torch.Tensor,

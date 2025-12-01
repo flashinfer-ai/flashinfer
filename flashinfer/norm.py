@@ -19,6 +19,7 @@ from typing import Optional
 
 import torch
 
+from .api_logging import flashinfer_api
 from .jit.norm import gen_norm_module
 from .utils import device_support_pdl, register_custom_op, register_fake_op
 
@@ -28,6 +29,7 @@ def get_norm_module():
     return gen_norm_module().build_and_load()
 
 
+@flashinfer_api
 def rmsnorm(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -90,6 +92,7 @@ def _rmsnorm_fake(
     pass
 
 
+@flashinfer_api
 @register_custom_op("flashinfer::fused_add_rmsnorm", mutates_args=("input", "residual"))
 def fused_add_rmsnorm(
     input: torch.Tensor,
@@ -136,6 +139,7 @@ def _fused_add_rmsnorm_fake(
     pass
 
 
+@flashinfer_api
 def gemma_rmsnorm(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -198,6 +202,7 @@ def _gemma_rmsnorm_fake(
     pass
 
 
+@flashinfer_api
 @register_custom_op(
     "flashinfer::gemma_fused_add_rmsnorm", mutates_args=("input", "residual")
 )
@@ -246,6 +251,7 @@ def _gemma_fused_add_rmsnorm_fake(
     pass
 
 
+@flashinfer_api
 @register_custom_op("flashinfer::layernorm", mutates_args=())
 def layernorm(
     input: torch.Tensor,
