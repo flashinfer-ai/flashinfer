@@ -105,7 +105,10 @@ class TensorParallelAttention(nn.Module):
         self.num_kv_heads_per_partition = self.num_key_value_heads // tp_size
         self.num_key_value_groups = self.num_heads_per_partition // self.num_kv_heads_per_partition
         
-        attention_bias = getattr(config, 'attention_bias', False)
+        # Check for attention bias - Qwen2 has it but Qwen3 doesn't
+        # Note: Qwen2 has biases even though config doesn't have attention_bias attribute
+        config_model_type_raw = getattr(config, 'model_type', '')
+        attention_bias = getattr(config, 'attention_bias', config_model_type_raw == 'qwen2')
         
         # Column parallel projections
         self.q_proj = flashinfer.ColumnParallelLinear(
@@ -212,10 +215,10 @@ class TensorParallelAttention(nn.Module):
             v = v.unsqueeze(3).expand(-1, -1, -1, self.num_key_value_groups, -1)
             v = v.reshape(batch_size, kv_len, self.num_heads_per_partition, self.head_dim)
         
-        # FlashInfer attention
-        q_fi = q.squeeze(0)
-        k_fi = k.squeeze(0)
-        v_fi = v.squeeze(0)
+        # FlashInfer attention - ensure tensors are contiguous
+        q_fi = q.squeeze(0).contiguous()
+        k_fi = k.squeeze(0).contiguous()
+        v_fi = v.squeeze(0).contiguous()
         
         if is_prefill or seq_len > 1:
             attn_output = flashinfer.single_prefill_with_kv_cache(
@@ -418,30 +421,107 @@ class TensorParallelForCausalLM(nn.Module):
         return generated_ids
 
 
-def load_weights_tp(model: TensorParallelForCausalLM, hf_model, compute_dtype: torch.dtype):
-    """Load weights with tensor parallelism sharding."""
+def dequantize_fp8_blockwise(weight_fp8: torch.Tensor, scale_inv: torch.Tensor, block_size: tuple, dtype: torch.dtype) -> torch.Tensor:
+    """Dequantize FP8 weights with block-wise scaling.
+    
+    The dequantization formula is: weight_dequant = weight_fp8 * scale_inv
+    Note: Despite the name 'scale_inv', this is actually the scale factor to multiply.
+    
+    Args:
+        weight_fp8: FP8 weight tensor of shape [out_features, in_features]
+        scale_inv: Scale tensor of shape [out_blocks, in_blocks]
+        block_size: Tuple of (out_block_size, in_block_size)
+        dtype: Target dtype for dequantized weights
+    
+    Returns:
+        Dequantized weight tensor of shape [out_features, in_features]
+    """
+    out_features, in_features = weight_fp8.shape
+    out_block_size, in_block_size = block_size
+    
+    # Convert FP8 to float for computation
+    weight_float = weight_fp8.to(torch.float32)
+    
+    # Calculate number of blocks
+    out_blocks = out_features // out_block_size
+    in_blocks = in_features // in_block_size
+    
+    # Reshape weight for block-wise operations
+    # weight: [out_features, in_features] -> [out_blocks, out_block_size, in_blocks, in_block_size]
+    weight_blocked = weight_float.view(out_blocks, out_block_size, in_blocks, in_block_size)
+    
+    # Expand scale_inv to match block structure
+    scale_expanded = scale_inv.view(out_blocks, 1, in_blocks, 1)
+    
+    # Dequantize: multiply by scale_inv
+    weight_dequant = weight_blocked * scale_expanded
+    
+    # Reshape back
+    weight_dequant = weight_dequant.view(out_features, in_features)
+    
+    return weight_dequant.to(dtype)
+
+
+def get_weight_dequantized(hf_linear, compute_dtype: torch.dtype, use_fp8: bool) -> torch.Tensor:
+    """Get weight from HF linear layer, dequantizing if FP8.
+    
+    Args:
+        hf_linear: HuggingFace linear layer
+        compute_dtype: Target dtype
+        use_fp8: Whether FP8 dequantization should be applied
+        
+    Returns:
+        Weight tensor in compute_dtype
+    """
+    if use_fp8 and hasattr(hf_linear, 'weight') and hf_linear.weight.dtype == torch.float8_e4m3fn:
+        # FP8 model with block-wise quantization - dequantize
+        if hasattr(hf_linear, 'weight_scale_inv'):
+            block_size = getattr(hf_linear, 'block_size', [128, 128])
+            return dequantize_fp8_blockwise(
+                hf_linear.weight.data,
+                hf_linear.weight_scale_inv.data,
+                tuple(block_size),
+                compute_dtype
+            )
+        else:
+            # No scale - just convert dtype
+            return hf_linear.weight.data.to(compute_dtype)
+    else:
+        # BF16/FP16 model
+        return hf_linear.weight.data.to(compute_dtype)
+
+
+def load_weights_tp(model: TensorParallelForCausalLM, hf_model, compute_dtype: torch.dtype, use_fp8: bool = False):
+    """Load weights with tensor parallelism sharding, handling FP8 dequantization.
+    
+    Args:
+        model: TensorParallelForCausalLM model to load weights into
+        hf_model: HuggingFace model with weights
+        compute_dtype: Target dtype for computation
+        use_fp8: Whether the source model uses FP8 quantization
+    """
     tp_rank = flashinfer.get_tensor_parallel_rank()
     tp_size = flashinfer.get_tensor_parallel_world_size()
     
-    # Embedding
+    # Embedding (not FP8 quantized)
     model.model.embed_tokens.load_weight_shard(hf_model.model.embed_tokens.weight.data)
     
     for i, (tp_layer, hf_layer) in enumerate(zip(model.model.layers, hf_model.model.layers)):
-        # Attention projections
+        # Attention projections - dequantize FP8 first, then shard
         tp_layer.self_attn.q_proj.load_weight_shard(
-            hf_layer.self_attn.q_proj.weight.data.to(compute_dtype),
+            get_weight_dequantized(hf_layer.self_attn.q_proj, compute_dtype, use_fp8),
             hf_layer.self_attn.q_proj.bias.data.to(compute_dtype) if hf_layer.self_attn.q_proj.bias is not None else None
         )
         tp_layer.self_attn.k_proj.load_weight_shard(
-            hf_layer.self_attn.k_proj.weight.data.to(compute_dtype),
+            get_weight_dequantized(hf_layer.self_attn.k_proj, compute_dtype, use_fp8),
             hf_layer.self_attn.k_proj.bias.data.to(compute_dtype) if hf_layer.self_attn.k_proj.bias is not None else None
         )
         tp_layer.self_attn.v_proj.load_weight_shard(
-            hf_layer.self_attn.v_proj.weight.data.to(compute_dtype),
+            get_weight_dequantized(hf_layer.self_attn.v_proj, compute_dtype, use_fp8),
             hf_layer.self_attn.v_proj.bias.data.to(compute_dtype) if hf_layer.self_attn.v_proj.bias is not None else None
         )
         tp_layer.self_attn.o_proj.load_weight_shard(
-            hf_layer.self_attn.o_proj.weight.data.to(compute_dtype)
+            get_weight_dequantized(hf_layer.self_attn.o_proj, compute_dtype, use_fp8)
         )
         
         # QK norm (Qwen3)
@@ -453,8 +533,9 @@ def load_weights_tp(model: TensorParallelForCausalLM, hf_model, compute_dtype: t
         
         # MLP
         if tp_layer.use_moe:
-            # MoE gate (replicated on all GPUs)
-            tp_layer.mlp.gate.weight.data.copy_(hf_layer.mlp.gate.weight.data.to(compute_dtype))
+            # MoE gate (replicated on all GPUs) - dequantize FP8 first
+            gate_weight = get_weight_dequantized(hf_layer.mlp.gate, compute_dtype, use_fp8)
+            tp_layer.mlp.gate.weight.data.copy_(gate_weight)
             
             # All experts with TP sharding within each expert
             for expert_idx in range(len(tp_layer.mlp.experts)):
@@ -462,26 +543,26 @@ def load_weights_tp(model: TensorParallelForCausalLM, hf_model, compute_dtype: t
                 hf_expert = hf_layer.mlp.experts[expert_idx]
                 
                 # gate_proj and up_proj: ColumnParallel (shard output dim)
-                tp_expert.gate_proj.load_weight_shard(hf_expert.gate_proj.weight.data.to(compute_dtype))
-                tp_expert.up_proj.load_weight_shard(hf_expert.up_proj.weight.data.to(compute_dtype))
+                tp_expert.gate_proj.load_weight_shard(get_weight_dequantized(hf_expert.gate_proj, compute_dtype, use_fp8))
+                tp_expert.up_proj.load_weight_shard(get_weight_dequantized(hf_expert.up_proj, compute_dtype, use_fp8))
                 # down_proj: RowParallel (shard input dim)
-                tp_expert.down_proj.load_weight_shard(hf_expert.down_proj.weight.data.to(compute_dtype))
+                tp_expert.down_proj.load_weight_shard(get_weight_dequantized(hf_expert.down_proj, compute_dtype, use_fp8))
         else:
-            # Dense MLP
-            tp_layer.mlp.gate_proj.load_weight_shard(hf_layer.mlp.gate_proj.weight.data.to(compute_dtype))
-            tp_layer.mlp.up_proj.load_weight_shard(hf_layer.mlp.up_proj.weight.data.to(compute_dtype))
-            tp_layer.mlp.down_proj.load_weight_shard(hf_layer.mlp.down_proj.weight.data.to(compute_dtype))
+            # Dense MLP - dequantize FP8 first, then shard
+            tp_layer.mlp.gate_proj.load_weight_shard(get_weight_dequantized(hf_layer.mlp.gate_proj, compute_dtype, use_fp8))
+            tp_layer.mlp.up_proj.load_weight_shard(get_weight_dequantized(hf_layer.mlp.up_proj, compute_dtype, use_fp8))
+            tp_layer.mlp.down_proj.load_weight_shard(get_weight_dequantized(hf_layer.mlp.down_proj, compute_dtype, use_fp8))
         
-        # Layer norms (replicated)
+        # Layer norms (replicated, not FP8)
         tp_layer.input_layernorm.weight.data.copy_(hf_layer.input_layernorm.weight.data)
         tp_layer.post_attention_layernorm.weight.data.copy_(hf_layer.post_attention_layernorm.weight.data)
     
-    # Final norm
+    # Final norm (not FP8)
     model.model.norm.weight.data.copy_(hf_model.model.norm.weight.data)
     
-    # LM head
+    # LM head - dequantize FP8 first, then shard
     if model.lm_head is not None:
-        model.lm_head.load_weight_shard(hf_model.lm_head.weight.data.to(compute_dtype))
+        model.lm_head.load_weight_shard(get_weight_dequantized(hf_model.lm_head, compute_dtype, use_fp8))
 
 
 def get_model_type(model_name: str) -> str:
@@ -537,6 +618,9 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
+    # Detect FP8 model
+    use_fp8 = "FP8" in model_name or "fp8" in model_name
+    
     if rank == 0:
         print(f"\nModel config:")
         print(f"  - Hidden size: {config.hidden_size}")
@@ -544,17 +628,23 @@ def main():
         print(f"  - Num attention heads: {config.num_attention_heads}")
         print(f"  - Num KV heads: {config.num_key_value_heads}")
         print(f"  - Vocab size: {config.vocab_size}")
+        if use_fp8:
+            print(f"  - FP8 quantized: True")
         
         num_experts = getattr(config, 'num_experts', 0)
         if num_experts > 0:
             print(f"  - Num experts: {num_experts}")
             print(f"  - Experts per token: {getattr(config, 'num_experts_per_tok', 1)}")
     
-    # Load HF model on rank 0, broadcast to all
+    # Load HF model
     if rank == 0:
         print(f"\nLoading HuggingFace model...")
     
-    hf_model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=dtype)
+    if use_fp8:
+        # FP8 models need device_map for proper loading
+        hf_model = AutoModelForCausalLM.from_pretrained(model_name, device_map="cuda")
+    else:
+        hf_model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=dtype)
     
     # Create tensor-parallel model
     if rank == 0:
@@ -562,11 +652,13 @@ def main():
     
     tp_model = TensorParallelForCausalLM(config, model_type).to(device=device, dtype=dtype)
     
-    # Load weights with sharding
+    # Load weights with sharding (and FP8 dequantization if needed)
     if rank == 0:
         print("Loading weights with tensor parallelism...")
+        if use_fp8:
+            print("  (Dequantizing FP8 weights during loading)")
     
-    load_weights_tp(tp_model, hf_model, dtype)
+    load_weights_tp(tp_model, hf_model, dtype, use_fp8=use_fp8)
     
     # Free HF model
     del hf_model

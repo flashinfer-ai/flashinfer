@@ -629,13 +629,13 @@ class VocabParallelEmbedding(nn.Module):
         # Mask for tokens in this partition's range
         input_mask = (input_ >= self.vocab_start_idx) & (input_ < self.vocab_end_idx)
         
-        # Shift indices to local range
-        masked_input = input_.clone()
-        masked_input[~input_mask] = 0  # Dummy index for out-of-range tokens
-        masked_input = masked_input - self.vocab_start_idx
+        # Shift indices to local range - clamp to valid range to avoid out-of-bounds
+        # For tokens not in this partition, we use index 0 (dummy) and then zero out
+        local_input = input_ - self.vocab_start_idx
+        local_input = torch.clamp(local_input, min=0, max=self.weight.shape[0] - 1)
         
         # Look up embeddings
-        output = F.embedding(masked_input, self.weight)
+        output = F.embedding(local_input, self.weight)
         
         # Zero out embeddings for out-of-range tokens
         output = output * input_mask.unsqueeze(-1).to(output.dtype)
