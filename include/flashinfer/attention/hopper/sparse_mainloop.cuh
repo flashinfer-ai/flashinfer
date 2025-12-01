@@ -86,6 +86,9 @@ struct SparseCollectiveMainloop {
 
   static constexpr bool USE_TMA_LOAD_KV = false;
   static constexpr int NUM_MMA_THREADS = size(typename Ktraits::TiledMmaQK{});
+  // Verify NUM_PRODUCER_THREADS matches NUM_COPY_THREADS for sparse loading
+  static_assert(Ktraits::NUM_PRODUCER_THREADS == NUM_COPY_THREADS,
+                "NUM_PRODUCER_THREADS must equal NUM_COPY_THREADS for sparse/paged KV loading");
   using MainloopPipeline = typename Ktraits::MainloopPipeline;
   using PipelineParams = typename MainloopPipeline::Params;
   using PipelineState = typename MainloopPipeline::PipelineState;
@@ -343,11 +346,12 @@ struct SparseCollectiveMainloop {
       ++smem_pipe_write_k;
     }
 
-    // load Q tile
-    if (warp_idx_in_warpgroup == 0) {
-      cutlass::arch::NamedBarrier::sync(NUM_MMA_THREADS + cutlass::NumThreadsPerWarp,
-                                        static_cast<int>(NamedBarriers::kQueryEmpty));
+    // All producer threads sync on kQueryEmpty barrier before loading Q
+    cutlass::arch::NamedBarrier::sync(NUM_MMA_THREADS + Ktraits::NUM_PRODUCER_THREADS,
+                                      static_cast<int>(NamedBarriers::kQueryEmpty));
 
+    // load Q tile (only warp 0 issues TMA)
+    if (warp_idx_in_warpgroup == 0) {
       int lane_predicate = cute::elect_one_sync();
       if (lane_predicate) {
         shared_storage.barrier_Q.arrive_and_expect_tx(TmaTransactionBytesQ);
