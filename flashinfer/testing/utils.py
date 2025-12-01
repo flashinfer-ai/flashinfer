@@ -757,10 +757,26 @@ def bench_gpu_time_with_cupti(
                 )
             elif activity.kind == cupti.ActivityKind.RUNTIME:
                 # Runtime activity
-                launches.append((activity.start, activity.end, activity.correlation_id, activity.cbid, activity.kind))
+                launches.append(
+                    (
+                        activity.start,
+                        activity.end,
+                        activity.correlation_id,
+                        activity.cbid,
+                        activity.kind,
+                    )
+                )
             elif activity.kind == cupti.ActivityKind.DRIVER:
                 # Driver activity
-                launches.append((activity.start, activity.end, activity.correlation_id, activity.cbid, activity.kind))
+                launches.append(
+                    (
+                        activity.start,
+                        activity.end,
+                        activity.correlation_id,
+                        activity.cbid,
+                        activity.kind,
+                    )
+                )
 
     if l2_flush:
         l2_flush_size = int(l2_flush_size_mb) * 1024 * 1024
