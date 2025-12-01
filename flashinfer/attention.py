@@ -41,6 +41,7 @@ def get_holistic_attention_module(*args):
 
 
 class BatchAttention:
+    @flashinfer_api
     def __init__(
         self,
         kv_layout: str = "NHD",
