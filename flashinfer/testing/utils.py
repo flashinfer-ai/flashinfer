@@ -755,19 +755,11 @@ def bench_gpu_time_with_cupti(
                         activity.correlation_id,
                     )
                 )
-            elif activity.kind == cupti.ActivityKind.RUNTIME:
-                # Runtime activity
-                launches.append(
-                    (
-                        activity.start,
-                        activity.end,
-                        activity.correlation_id,
-                        activity.cbid,
-                        activity.kind,
-                    )
-                )
-            elif activity.kind == cupti.ActivityKind.DRIVER:
-                # Driver activity
+            elif activity.kind in (
+                cupti.ActivityKind.RUNTIME,
+                cupti.ActivityKind.DRIVER,
+            ):
+                # Runtime or Driver activity
                 launches.append(
                     (
                         activity.start,
