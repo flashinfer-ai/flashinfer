@@ -2568,12 +2568,12 @@ def trtllm_mxint4_block_scale_moe(
     Args:
         routing_logits (torch.Tensor): shape [seq_len, num_experts]
             Input tensor of routing logits. Supports float32, bfloat16.
-        hidden_states (torch.Tensor): shape [seq_len, hidden_size // 2 if nvfp4 else hidden_size]
-            Tensor of input hidden states. Supports bfloat16, mxfp8, and nvfp4 (packed into uint8)
+        hidden_states (torch.Tensor): shape [seq_len, hidden_size]
+            Tensor of input hidden states. Supports bfloat16.
         gemm1_weights (torch.Tensor): shape [num_experts, 2 * intermediate_size, hidden_size // 2]
-            Tensor of FC1 weights. Dtype must be uint8 (packed fp4)
-        gemm1_weights_scale (torch.Tensor): shape [num_experts, 2 * intermediate_size, hidden_size // (32 if mxfp4 else 16)]
-            Scale tensor of FC1 weights. Dtype must be float8.
+            Tensor of FC1 weights. Dtype must be uint8 (packed mxint4)
+        gemm1_weights_scale (torch.Tensor): shape [num_experts, 2 * intermediate_size, hidden_size // 32]
+            Scale tensor of FC1 weights. Dtype must be bfloat16.
         gemm1_alpha (Optional[torch.Tensor]): shape [num_experts]
             Tensor of swiglu alpha. Dtype is float32.
         gemm1_beta (Optional[torch.Tensor]): shape [num_experts]
@@ -2581,9 +2581,9 @@ def trtllm_mxint4_block_scale_moe(
         gemm1_clamp_limit (Optional[torch.Tensor]): shape [num_experts]
             Tensor of swiglu clamp limit. Dtype is float32.
         gemm2_weights (torch.Tensor): shape [num_experts, hidden_size, intermediate_size]
-            Tensor of FC2 weights. Dtype must be uint8 (packed fp4)
-        gemm2_weights_scale (torch.Tensor): shape [num_experts, hidden_size, intermediate_size // (32 if mxfp4 else 16)]
-            Scale tensor of FC2 weights. Dtype must be float8.
+            Tensor of FC2 weights. Dtype must be uint8 (packed mxint4)
+        gemm2_weights_scale (torch.Tensor): shape [num_experts, hidden_size, intermediate_size // 32]
+            Scale tensor of FC2 weights. Dtype must be bfloat16.
         num_experts (int): Total number of experts
         top_k (int): Number of experts to route to per token
         n_group (Optional[int]): Number of expert groups (can be None for some routing methods)

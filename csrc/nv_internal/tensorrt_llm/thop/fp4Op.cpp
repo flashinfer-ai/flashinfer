@@ -155,7 +155,7 @@ void blockScaleInterleaveHost(TensorView blockScale, TensorView interleavedBlock
       auto globalRowIdx = eIdx * rows + rIdx;
       T* blockScalePtr = static_cast<T*>(blockScale.data_ptr()) + globalRowIdx * cols;
       for (int cIdx = 0; cIdx < static_cast<int>(cols_padded); ++cIdx) {
-        uint8_t sf_ori = 0;
+        T sf_ori = 0;
         if (rIdx < static_cast<int>(rows) && cIdx < static_cast<int>(cols)) {
           sf_ori = blockScalePtr[cIdx];
         }

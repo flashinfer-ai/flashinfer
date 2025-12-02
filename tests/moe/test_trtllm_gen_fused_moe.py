@@ -789,7 +789,7 @@ class MxInt4BlockScaleMoe(Moe):
         return run_moe_reference_mxint4(args)
 
     def get_tolerances(self):
-        """Get FP4-specific accuracy tolerances."""
+        """Get MXINT4-specific accuracy tolerances."""
         return {"atol": 0.1, "rtol": 0.85, "percent": 0.925}
 
 
@@ -2472,12 +2472,12 @@ def run_moe_test(
 @pytest.mark.parametrize(
     "moe_impl",
     [
-        # pytest.param(BF16Moe(), id="BF16xBF16"),
-        # pytest.param(FP8BlockScaleMoe(), id="FP8_Block"),
-        # pytest.param(FP8PerTensorMoe(), id="FP8_Tensor"),
-        # pytest.param(FP4Moe(quant_mode=QuantMode.FP4_NVFP4_NVFP4), id="NvFP4xNvFP4"),
-        # pytest.param(FP4Moe(quant_mode=QuantMode.FP4_MXFP4_MXFP8), id="MxFP4xMxFP8"),
-        # pytest.param(FP4Moe(quant_mode=QuantMode.FP4_MXFP4_Bf16), id="MxFP4xBf16"),
+        pytest.param(BF16Moe(), id="BF16xBF16"),
+        pytest.param(FP8BlockScaleMoe(), id="FP8_Block"),
+        pytest.param(FP8PerTensorMoe(), id="FP8_Tensor"),
+        pytest.param(FP4Moe(quant_mode=QuantMode.FP4_NVFP4_NVFP4), id="NvFP4xNvFP4"),
+        pytest.param(FP4Moe(quant_mode=QuantMode.FP4_MXFP4_MXFP8), id="MxFP4xMxFP8"),
+        pytest.param(FP4Moe(quant_mode=QuantMode.FP4_MXFP4_Bf16), id="MxFP4xBf16"),
         pytest.param(MxInt4BlockScaleMoe(), id="MxInt4xBf16"),
     ],
 )
