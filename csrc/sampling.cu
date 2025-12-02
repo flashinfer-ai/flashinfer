@@ -21,6 +21,26 @@ using namespace flashinfer;
 
 using tvm::ffi::Optional;
 
+// Validate sampling parameters
+inline void check_tensor_param(const Optional<TensorView>& maybe_param, const TensorView& tensor) {
+  if (maybe_param.has_value()) {
+    const TensorView& param = maybe_param.value();
+    if (param.ndim() == 0) {
+      TVM_FFI_ICHECK(false)
+          << "Expected a 1D tensor of shape (batch_size,) or scalar for the sampling parameter, "
+          << "but got a 0-dimensional tensor with shape " << param.size(0) << ". ";
+    } else if (param.ndim() > 1) {
+      TVM_FFI_ICHECK(false) << "Expected a 1D tensor or scalar for the sampling parameter, "
+                            << "but got a " << param.ndim() << "D tensor. ";
+    } else if (param.size(0) != tensor.size(0)) {
+      TVM_FFI_ICHECK(false) << "Sampling parameter tensor batch size mismatch: "
+                            << "expected length " << tensor.size(0)
+                            << " to match the reference tensor batch size, "
+                            << "but got length " << param.size(0) << ". ";
+    }
+  }
+}
+
 void softmax(TensorView workspace_buffer, TensorView logits, TensorView output,
              Optional<TensorView> maybe_temperature_arr, double temperature_val, bool enable_pdl) {
   CHECK_INPUT(workspace_buffer);
@@ -48,6 +68,7 @@ void sampling_from_logits(TensorView logits, TensorView output, Optional<TensorV
                           bool deterministic, uint64_t philox_seed, uint64_t philox_offset) {
   CHECK_INPUT(logits);
   CHECK_DIM(2, logits);  // logits: (batch_size, vocab_size)
+  CHECK_MAYBE_INPUT_TYPE(maybe_indices, dl_int32);
   unsigned int batch_size = output.size(0);
   unsigned int vocab_size = logits.size(1);
 
@@ -65,6 +86,7 @@ void sampling_from_probs(TensorView probs, TensorView output, Optional<TensorVie
                          bool deterministic, uint64_t philox_seed, uint64_t philox_offset) {
   CHECK_INPUT(probs);
   CHECK_DIM(2, probs);  // probs: (batch_size, vocab_size)
+  CHECK_MAYBE_INPUT_TYPE(maybe_indices, dl_int32);
   unsigned int batch_size = output.size(0);
   unsigned int vocab_size = probs.size(1);
 
@@ -84,8 +106,10 @@ void top_p_sampling_from_probs(TensorView probs, TensorView output,
                                bool deterministic, uint64_t philox_seed, uint64_t philox_offset) {
   CHECK_INPUT(probs);
   CHECK_DIM(2, probs);  // probs: (batch_size, vocab_size)
+  CHECK_MAYBE_INPUT_TYPE(maybe_indices, dl_int32);
   unsigned int batch_size = output.size(0);
   unsigned int vocab_size = probs.size(1);
+  check_tensor_param(maybe_top_p_arr, probs);
   bool has_top_p_arr = maybe_top_p_arr.has_value();
 
   ffi::CUDADeviceGuard device_guard(probs.device().device_id);
@@ -108,8 +132,10 @@ void top_k_sampling_from_probs(TensorView probs, TensorView output,
   CHECK_DEVICE(output, probs);
   CHECK_DIM(2, probs);   // probs: (batch_size, vocab_size)
   CHECK_DIM(1, output);  // output: (batch_size)
+  CHECK_MAYBE_INPUT_TYPE(maybe_indices, dl_int32);
   unsigned int batch_size = output.size(0);
   unsigned int vocab_size = probs.size(1);
+  check_tensor_param(maybe_top_k_arr, probs);
   bool has_top_k_arr = maybe_top_k_arr.has_value();
 
   ffi::CUDADeviceGuard device_guard(probs.device().device_id);
@@ -132,8 +158,10 @@ void min_p_sampling_from_probs(TensorView probs, TensorView output,
   CHECK_DEVICE(output, probs);
   CHECK_DIM(2, probs);   // probs: (batch_size, vocab_size)
   CHECK_DIM(1, output);  // output: (batch_size)
+  CHECK_MAYBE_INPUT_TYPE(maybe_indices, dl_int32);
   unsigned int batch_size = output.size(0);
   unsigned int vocab_size = probs.size(1);
+  check_tensor_param(maybe_min_p_arr, probs);
   bool has_min_p_arr = maybe_min_p_arr.has_value();
 
   ffi::CUDADeviceGuard device_guard(probs.device().device_id);
@@ -159,8 +187,11 @@ void top_k_top_p_sampling_from_probs(TensorView probs, TensorView output,
   CHECK_DEVICE(output, probs);
   CHECK_DIM(2, probs);   // probs: (batch_size, vocab_size)
   CHECK_DIM(1, output);  // output: (batch_size)
+  CHECK_MAYBE_INPUT_TYPE(maybe_indices, dl_int32);
   unsigned int batch_size = output.size(0);
   unsigned int vocab_size = probs.size(1);
+  check_tensor_param(maybe_top_k_arr, probs);
+  check_tensor_param(maybe_top_p_arr, probs);
   bool has_top_k_arr = maybe_top_k_arr.has_value();
   bool has_top_p_arr = maybe_top_p_arr.has_value();
 

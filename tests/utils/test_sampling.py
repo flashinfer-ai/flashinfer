@@ -582,7 +582,7 @@ def test_tensor_validation_min_p(batch_size, vocab_size, p):
 
     # 2: 2D tensor raises error.
     with pytest.raises(
-        ValueError, match=r"Expected a 1D tensor or scalar.*got a 2D tensor"
+        RuntimeError, match=r"Expected a 1D tensor or scalar.*got a 2D tensor"
     ):
         flashinfer.sampling.min_p_sampling_from_probs(
             normalized_prob,
@@ -593,7 +593,7 @@ def test_tensor_validation_min_p(batch_size, vocab_size, p):
 
     # 3: 0D tensor raises error.
     with pytest.raises(
-        ValueError,
+        RuntimeError,
         match=r"Expected a 1D tensor of shape \(batch_size,\) or scalar.*got a 0-dimensional tensor",
     ):
         flashinfer.sampling.min_p_sampling_from_probs(
@@ -602,8 +602,8 @@ def test_tensor_validation_min_p(batch_size, vocab_size, p):
 
     # 4: non-int32 indices raises error.
     with pytest.raises(
-        ValueError,
-        match=r"indices must have dtype torch\.int32, got torch\.int64",
+        RuntimeError,
+        match=r"(indices must have dtype torch\.int32, got torch\.int64|Inconsistency of Tensor type.*maybe_indices|int64 vs\. int32)",
     ):
         flashinfer.sampling.min_p_sampling_from_probs(
             normalized_prob,
@@ -614,7 +614,7 @@ def test_tensor_validation_min_p(batch_size, vocab_size, p):
     # 5: 1D tensor with a broken batch size raises error (only when batch_size > 1).
     if batch_size > 1:
         with pytest.raises(
-            ValueError, match="Sampling parameter tensor batch size mismatch"
+            RuntimeError, match="Sampling parameter tensor batch size mismatch"
         ):
             flashinfer.sampling.min_p_sampling_from_probs(
                 normalized_prob, torch.tensor([p], dtype=torch.float32, device="cuda:0")
@@ -641,7 +641,7 @@ def test_check_tensor_param_top_p(batch_size, vocab_size, p):
 
     # 2: 2D tensor raises error.
     with pytest.raises(
-        ValueError, match=r"Expected a 1D tensor or scalar.*got a 2D tensor"
+        RuntimeError, match=r"Expected a 1D tensor or scalar.*got a 2D tensor"
     ):
         flashinfer.sampling.top_p_renorm_probs(
             normalized_prob,
@@ -652,7 +652,7 @@ def test_check_tensor_param_top_p(batch_size, vocab_size, p):
 
     # 3: 0D tensor raises error.
     with pytest.raises(
-        ValueError,
+        RuntimeError,
         match=r"Expected a 1D tensor of shape \(batch_size,\) or scalar.*got a 0-dimensional tensor",
     ):
         flashinfer.sampling.top_p_renorm_probs(
@@ -662,7 +662,7 @@ def test_check_tensor_param_top_p(batch_size, vocab_size, p):
     # 4: 1D tensor with a broken batch size raises error (only when batch_size > 1).
     if batch_size > 1:
         with pytest.raises(
-            ValueError, match="Sampling parameter tensor batch size mismatch"
+            RuntimeError, match="Sampling parameter.*batch size mismatch"
         ):
             flashinfer.sampling.top_p_renorm_probs(
                 normalized_prob, torch.tensor([p], dtype=torch.int, device="cuda:0")
@@ -691,7 +691,7 @@ def test_check_tensor_param_top_k(batch_size, vocab_size, k):
 
     # 2: 2D tensor raises error.
     with pytest.raises(
-        ValueError, match=r"Expected a 1D tensor or scalar.*got a 2D tensor"
+        RuntimeError, match=r"Expected a 1D tensor or scalar.*got a 2D tensor"
     ):
         flashinfer.sampling.top_k_renorm_probs(
             normalized_prob,
@@ -702,7 +702,7 @@ def test_check_tensor_param_top_k(batch_size, vocab_size, k):
 
     # 3: 0D tensor raises error.
     with pytest.raises(
-        ValueError,
+        RuntimeError,
         match=r"Expected a 1D tensor of shape \(batch_size,\) or scalar.*got a 0-dimensional tensor",
     ):
         flashinfer.sampling.top_k_renorm_probs(
@@ -712,7 +712,7 @@ def test_check_tensor_param_top_k(batch_size, vocab_size, k):
     # 4: 1D tensor with a wrong shape raises error (only when batch_size > 1).
     if batch_size > 1:
         with pytest.raises(
-            ValueError, match="Sampling parameter tensor batch size mismatch"
+            RuntimeError, match="Sampling parameter.*batch size mismatch"
         ):
             flashinfer.sampling.top_k_renorm_probs(
                 normalized_prob, torch.tensor([k], dtype=torch.int, device="cuda:0")

@@ -42,6 +42,8 @@ Array<int64_t> BatchDecodeWithPagedKVCachePlan(
     int64_t num_qo_heads, int64_t num_kv_heads, int64_t page_size, bool enable_cuda_graph,
     int64_t window_left, double logits_soft_cap, int64_t head_dim_qk, int64_t head_dim_vo,
     TensorView empty_q_data, TensorView empty_kv_data) {
+  CHECK_INPUT_TYPE(indptr, dl_int32);
+
   size_t float_workspace_size_in_bytes =
       float_workspace_buffer.size(0) * get_element_size(float_workspace_buffer);
   size_t int_workspace_size_in_bytes =
@@ -86,6 +88,10 @@ void BatchDecodeWithPagedKVCacheRun(TensorView float_workspace_buffer,
                                     TensorView o, Optional<TensorView> maybe_lse,
                                     int64_t kv_layout_code, int64_t window_left,
                                     bool enable_pdl ADDITIONAL_FUNC_PARAMS) {
+  CHECK_INPUT_TYPE(paged_kv_indptr, dl_int32);
+  CHECK_INPUT_TYPE(paged_kv_indices, dl_int32);
+  CHECK_INPUT_TYPE(paged_kv_last_page_len, dl_int32);
+
   DecodePlanInfo plan_info;
   plan_info.FromVector(std::vector<int64_t>(plan_info_vec.begin(), plan_info_vec.end()));
   QKVLayout kv_layout = static_cast<QKVLayout>(kv_layout_code);

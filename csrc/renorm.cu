@@ -21,12 +21,33 @@ using namespace flashinfer;
 
 using tvm::ffi::Optional;
 
+// Validate sampling parameters
+inline void check_tensor_param(const Optional<TensorView>& maybe_param, const TensorView& tensor) {
+  if (maybe_param.has_value()) {
+    const TensorView& param = maybe_param.value();
+    if (param.ndim() == 0) {
+      TVM_FFI_ICHECK(false)
+          << "Expected a 1D tensor of shape (batch_size,) or scalar for the sampling parameter, "
+          << "but got a 0-dimensional tensor with shape " << param.size(0) << ". ";
+    } else if (param.ndim() > 1) {
+      TVM_FFI_ICHECK(false) << "Expected a 1D tensor or scalar for the sampling parameter, "
+                            << "but got a " << param.ndim() << "D tensor. ";
+    } else if (param.size(0) != tensor.size(0)) {
+      TVM_FFI_ICHECK(false) << "Sampling parameter tensor batch size mismatch: "
+                            << "expected length " << tensor.size(0)
+                            << " to match the reference tensor batch size, "
+                            << "but got length " << param.size(0) << ". ";
+    }
+  }
+}
+
 void top_p_renorm_probs(TensorView probs, TensorView renorm_probs,
                         Optional<TensorView> maybe_top_p_arr, double top_p_val) {
   CHECK_INPUT(probs);
   CHECK_DIM(2, probs);  // probs: (batch_size, vocab_size)
   unsigned int batch_size = probs.size(0);
   unsigned int vocab_size = probs.size(1);
+  check_tensor_param(maybe_top_p_arr, probs);
   bool has_top_p_arr = maybe_top_p_arr.has_value();
 
   ffi::CUDADeviceGuard device_guard(probs.device().device_id);
@@ -45,6 +66,7 @@ void top_k_renorm_probs(TensorView probs, TensorView renorm_probs,
   CHECK_DIM(2, probs);  // probs: (batch_size, vocab_size)
   unsigned int batch_size = probs.size(0);
   unsigned int vocab_size = probs.size(1);
+  check_tensor_param(maybe_top_k_arr, probs);
   bool has_top_k_arr = maybe_top_k_arr.has_value();
 
   ffi::CUDADeviceGuard device_guard(probs.device().device_id);
@@ -64,6 +86,7 @@ void top_k_mask_logits(TensorView logits, TensorView mask_logits,
   CHECK_DIM(2, logits);  // logits: (batch_size, vocab_size)
   unsigned int batch_size = logits.size(0);
   unsigned int vocab_size = logits.size(1);
+  check_tensor_param(maybe_top_k_arr, logits);
   bool has_top_k_arr = maybe_top_k_arr.has_value();
 
   ffi::CUDADeviceGuard device_guard(logits.device().device_id);
