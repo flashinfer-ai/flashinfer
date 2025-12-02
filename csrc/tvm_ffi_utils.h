@@ -238,27 +238,6 @@ inline void check_shape(const tvm::ffi::TensorView& a, const tvm::ffi::TensorVie
   }
 }
 
-inline void check_tensor_param(const tvm::ffi::Optional<tvm::ffi::TensorView>& maybe_param,
-                               const tvm::ffi::TensorView& tensor) {
-  // Helper to validate sampling parameters
-  if (maybe_param.has_value()) {
-    const tvm::ffi::TensorView& param = maybe_param.value();
-    if (param.ndim() == 0) {
-      TVM_FFI_ICHECK(false)
-          << "Expected a 1D tensor of shape (batch_size,) or scalar for the sampling parameter, "
-          << "but got a 0-dimensional tensor.";
-    } else if (param.ndim() > 1) {
-      TVM_FFI_ICHECK(false) << "Expected a 1D tensor or scalar for the sampling parameter, "
-                            << "but got a " << param.ndim() << "D tensor.";
-    } else if (param.size(0) != tensor.size(0)) {
-      TVM_FFI_ICHECK(false) << "Sampling parameter tensor batch size mismatch: "
-                            << "expected length " << tensor.size(0)
-                            << " to match the reference tensor batch size, "
-                            << "but got length " << param.size(0) << ".";
-    }
-  }
-}
-
 #define CHECK_CUDA(x) \
   TVM_FFI_ICHECK_EQ(x.device().device_type, kDLCUDA) << #x " must be a CUDA tensor";
 #define CHECK_CPU(x) \
