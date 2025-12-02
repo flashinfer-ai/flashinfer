@@ -283,55 +283,6 @@ __global__ void AppendPagedKVCacheKernel(paged_kv_t<DType, IdType> paged_kv,
   }
 }
 
-template <typename IdType>
-__global__ void BlockSparseIndicesToVectorSparseOffsetsKernel(
-    IdType* __restrict__ block_sparse_indices, IdType* __restrict__ block_sparse_indptr,
-    IdType* __restrict__ vector_sparse_offsets, IdType* __restrict__ vector_sparse_indptr,
-    IdType* __restrict__ kv_lens, const uint32_t stride_block, const uint32_t stride_n,
-    const uint32_t batch_size, const uint_fastdiv block_size) {
-#pragma unroll 1
-  for (int b = blockIdx.x; b < batch_size; ++b) {
-#pragma unroll 2
-    for (int pos = threadIdx.x; pos < kv_lens[b]; pos += blockDim.x) {
-      uint32_t q, r;
-      block_size.divmod(pos, q, r);
-      vector_sparse_offsets[vector_sparse_indptr[b] + pos] =
-          block_sparse_indices[block_sparse_indptr[b] + q] * stride_block + r * stride_n;
-    }
-  }
-}
-
-template <typename IdType>
-cudaError_t BlockSparseIndicesToVectorSparseOffset(
-    IdType* block_sparse_indices, IdType* block_sparse_indptr, IdType* vector_sparse_offsets,
-    IdType* vector_sparse_indptr, IdType* kv_lens, const int64_t stride_block,
-    const int64_t stride_n, const int64_t batch_size, const uint32_t block_size,
-    cudaStream_t stream = nullptr) {
-  int dev_id = 0;
-  int num_sms = 0;
-  FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
-  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev_id));
-
-  uint32_t num_threads = 512;
-
-  uint_fastdiv block_size_fastdiv(block_size);
-
-  auto kernel = BlockSparseIndicesToVectorSparseOffsetsKernel<IdType>;
-  void* args[] = {(void*)&block_sparse_indices,
-                  (void*)&block_sparse_indptr,
-                  (void*)&vector_sparse_offsets,
-                  (void*)&vector_sparse_indptr,
-                  (void*)&kv_lens,
-                  (void*)&stride_block,
-                  (void*)&stride_n,
-                  (void*)&batch_size,
-                  (void*)&block_size_fastdiv};
-
-  FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, num_sms, num_threads, args, 0, stream));
-
-  return cudaSuccess;
-}
-
 /*!
  * \brief Append new keys/values to the paged key-value cache in the decode phase
  * \tparam DType The data type of the key-value cache

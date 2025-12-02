@@ -70,10 +70,14 @@ struct StandardFP8Attention {
         block_coord;
     // 448 for e4m3; 57344 for e5m2
     p_scale = std::numeric_limits<typename MainloopParams::DTypeKV>::max();
-    scale_pv = params.additional_params.scale_v[kv_head_idx] / p_scale;
-    sm_scale_with_qk_log2 = params.additional_params.scale_q[qo_head_idx] *
-                            params.additional_params.scale_k[kv_head_idx] *
-                            params.additional_params.sm_scale * math::log2e;
+    const float* scale_q_ptr = params.additional_params.maybe_scale_q;
+    const float* scale_k_ptr = params.additional_params.maybe_scale_k;
+    const float* scale_v_ptr = params.additional_params.maybe_scale_v;
+    const float scale_q = scale_q_ptr ? scale_q_ptr[qo_head_idx] : 1.0f;
+    const float scale_k = scale_k_ptr ? scale_k_ptr[kv_head_idx] : 1.0f;
+    const float scale_v = scale_v_ptr ? scale_v_ptr[kv_head_idx] : 1.0f;
+    scale_pv = scale_v / p_scale;
+    sm_scale_with_qk_log2 = scale_q * scale_k * params.additional_params.sm_scale * math::log2e;
   }
 
   template <int NUM_ROWS_PER_THREAD>
