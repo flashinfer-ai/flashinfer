@@ -32,7 +32,7 @@ void trtllm_moe_allreduce_fusion(
     TensorView moe_reduction_token_input, Optional<int64_t> layout_code,
     Optional<TensorView> moe_allreduce_out, Optional<TensorView> residual_out,
     Optional<TensorView> norm_out, Optional<TensorView> quant_out, Optional<TensorView> scale_out) {
-  cudaSetDevice(moe_reduction_active_experts_token_input.device().device_id);
+  ffi::CUDADeviceGuard device_guard(moe_reduction_active_experts_token_input.device().device_id);
   auto stream = get_stream(moe_reduction_active_experts_token_input.device());
 
   DISPATCH_FLOATING_TYPES_FOR_ALLREDUCE(

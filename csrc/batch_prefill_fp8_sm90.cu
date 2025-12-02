@@ -50,7 +50,7 @@ Array<int64_t> BatchPrefillWithKVCacheSM90Plan(
 
   flashinfer::PrefillPlanSM90Info plan_info;
 
-  cudaSetDevice(float_workspace_buffer.device().device_id);
+  ffi::CUDADeviceGuard device_guard(float_workspace_buffer.device().device_id);
   const cudaStream_t stream = get_stream(float_workspace_buffer.device());
 
   cudaError_t status = PrefillSM90Plan(
@@ -111,7 +111,7 @@ void BatchPrefillWithPagedKVCacheSM90Run(
   void* float_buffer_ptr = float_workspace_buffer.data_ptr();
   void* int_buffer_ptr = int_workspace_buffer.data_ptr();
 
-  cudaSetDevice(float_workspace_buffer.device().device_id);
+  ffi::CUDADeviceGuard device_guard(float_workspace_buffer.device().device_id);
   const cudaStream_t stream = get_stream(float_workspace_buffer.device());
   const MaskMode mask_mode = static_cast<MaskMode>(mask_mode_code);
   bool use_swa = window_left != -1;

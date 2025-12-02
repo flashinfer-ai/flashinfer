@@ -37,7 +37,7 @@ void trtllm_allreduce_fusion(TensorView allreduce_in, int64_t world_size, int64_
                              Optional<TensorView> quant_out, Optional<TensorView> scale_out,
                              Optional<TensorView> rms_gamma, Optional<double> rms_eps,
                              Optional<TensorView> scale_factor, Optional<int64_t> layout_code) {
-  cudaSetDevice(allreduce_in.device().device_id);
+  ffi::CUDADeviceGuard device_guard(allreduce_in.device().device_id);
   // todo(Yingyi): add dispatch for float and bfloat16
 
   DISPATCH_FLOATING_TYPES_FOR_ALLREDUCE(allreduce_in.dtype(), c_type, [&] {

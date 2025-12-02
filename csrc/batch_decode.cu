@@ -53,7 +53,7 @@ Array<int64_t> BatchDecodeWithPagedKVCachePlan(
       << "CUDA cores template only supports equal head dim for QK and VO, please use tensor "
          "cores template for different head dim";
 
-  cudaSetDevice(float_workspace_buffer.device().device_id);
+  ffi::CUDADeviceGuard device_guard(float_workspace_buffer.device().device_id);
   const cudaStream_t stream = get_stream(float_workspace_buffer.device());
   DISPATCH_context(
       DTypeQ, DTypeKV, DTypeO, IdType, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
@@ -130,7 +130,7 @@ void BatchDecodeWithPagedKVCacheRun(TensorView float_workspace_buffer,
   }
   kv_cache_strides = k_strides.data();
 
-  cudaSetDevice(q.device().device_id);
+  ffi::CUDADeviceGuard device_guard(q.device().device_id);
   const cudaStream_t stream = get_stream(q.device());
 
   DISPATCH_context(

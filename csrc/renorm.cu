@@ -29,7 +29,7 @@ void top_p_renorm_probs(TensorView probs, TensorView renorm_probs,
   unsigned int vocab_size = probs.size(1);
   bool has_top_p_arr = maybe_top_p_arr.has_value();
 
-  cudaSetDevice(probs.device().device_id);
+  ffi::CUDADeviceGuard device_guard(probs.device().device_id);
   auto stream = get_stream(probs.device());
   cudaError_t status = sampling::TopPRenormProb<float>(
       static_cast<float*>(probs.data_ptr()), static_cast<float*>(renorm_probs.data_ptr()),
@@ -47,7 +47,7 @@ void top_k_renorm_probs(TensorView probs, TensorView renorm_probs,
   unsigned int vocab_size = probs.size(1);
   bool has_top_k_arr = maybe_top_k_arr.has_value();
 
-  cudaSetDevice(probs.device().device_id);
+  ffi::CUDADeviceGuard device_guard(probs.device().device_id);
   auto stream = get_stream(probs.device());
   cudaError_t status = sampling::TopKRenormProb<float>(
       static_cast<float*>(probs.data_ptr()), static_cast<float*>(renorm_probs.data_ptr()),
@@ -66,7 +66,7 @@ void top_k_mask_logits(TensorView logits, TensorView mask_logits,
   unsigned int vocab_size = logits.size(1);
   bool has_top_k_arr = maybe_top_k_arr.has_value();
 
-  cudaSetDevice(logits.device().device_id);
+  ffi::CUDADeviceGuard device_guard(logits.device().device_id);
   auto stream = get_stream(logits.device());
   cudaError_t status = sampling::TopKMaskLogits<float>(
       static_cast<float*>(logits.data_ptr()), static_cast<float*>(mask_logits.data_ptr()),

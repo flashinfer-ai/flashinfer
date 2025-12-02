@@ -133,7 +133,7 @@ void CutlassGroupGemmMXFP4GroupwiseScaledSM100(TensorView int_workspace_buffer,
                                                TensorView D, TensorView m_indptr, int64_t n,
                                                int64_t k, int64_t mma_sm, int64_t tile_m,
                                                int64_t tile_n, int64_t tile_k, bool swap_ab) {
-  cudaSetDevice(float_workspace_buffer.device().device_id);
+  ffi::CUDADeviceGuard device_guard(float_workspace_buffer.device().device_id);
   auto stream = get_stream(A.device());
   int num_groups = m_indptr.size(0) - 1;
   DISPATCH_DLPACK_INPUT_OUTPUT_DTYPE(

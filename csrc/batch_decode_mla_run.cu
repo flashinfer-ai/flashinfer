@@ -35,7 +35,7 @@ void BatchDecodeWithPagedKVCacheRunMLA(
   void* float_buffer = static_cast<void*>(float_workspace_buffer.data_ptr());
   void* int_buffer = static_cast<void*>(int_workspace_buffer.data_ptr());
 
-  cudaSetDevice(q_nope.device().device_id);
+  ffi::CUDADeviceGuard device_guard(q_nope.device().device_id);
   const cudaStream_t stream = get_stream(q_nope.device());
 
   paged_kv_mla_t<DTypeKV, IdType> paged_kv(
