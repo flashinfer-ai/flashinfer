@@ -1501,6 +1501,7 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
     a more efficient and general MLA implementation that supports decode and incremental prefill.
     """
 
+    @flashinfer_api
     def __init__(
         self,
         float_workspace_buffer: torch.Tensor,
@@ -1615,6 +1616,7 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
             pin_memory=True,
         )
 
+    @flashinfer_api
     def plan(
         self,
         indptr: torch.Tensor,
@@ -1740,6 +1742,7 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
         self._rope_scale = rope_scale
         self._rope_theta = rope_theta
 
+    @flashinfer_api
     def run(
         self,
         q_nope: torch.Tensor,

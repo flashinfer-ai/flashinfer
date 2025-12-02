@@ -19,6 +19,7 @@ from types import SimpleNamespace
 from typing import Any, Optional, Tuple, Union
 import torch
 
+from .api_logging import flashinfer_api
 from .jit.sampling import gen_sampling_module
 from .utils import (
     _get_cache_buf,
@@ -529,6 +530,7 @@ def _check_tensor_param(param: Any, tensor: torch.Tensor) -> None:
             )
 
 
+@flashinfer_api
 def softmax(
     logits: torch.Tensor,
     temperature: Optional[Union[torch.Tensor, float]] = None,
@@ -586,6 +588,7 @@ def softmax(
     )
 
 
+@flashinfer_api
 def sampling_from_logits(
     logits: torch.Tensor,
     indices: Optional[torch.Tensor] = None,
@@ -651,6 +654,7 @@ def sampling_from_logits(
     )
 
 
+@flashinfer_api
 def sampling_from_probs(
     probs: torch.Tensor,
     indices: Optional[torch.Tensor] = None,
@@ -722,6 +726,7 @@ def sampling_from_probs(
     )
 
 
+@flashinfer_api
 def top_p_sampling_from_probs(
     probs: torch.Tensor,
     top_p: Union[torch.Tensor, float],
@@ -818,6 +823,7 @@ def top_p_sampling_from_probs(
     )
 
 
+@flashinfer_api
 def top_k_sampling_from_probs(
     probs: torch.Tensor,
     top_k: Union[torch.Tensor, int],
@@ -914,6 +920,7 @@ def top_k_sampling_from_probs(
     )
 
 
+@flashinfer_api
 def min_p_sampling_from_probs(
     probs: torch.Tensor,
     min_p: Union[torch.Tensor, float],
@@ -1006,6 +1013,7 @@ def min_p_sampling_from_probs(
     )
 
 
+@flashinfer_api
 def top_k_top_p_sampling_from_logits(
     logits: torch.Tensor,
     top_k: Union[torch.Tensor, int],
@@ -1139,6 +1147,7 @@ def top_k_top_p_sampling_from_logits(
         raise ValueError(f"Invalid filter_apply_order: {filter_apply_order}")
 
 
+@flashinfer_api
 def top_k_top_p_sampling_from_probs(
     probs: torch.Tensor,
     top_k: Union[torch.Tensor, int],
@@ -1265,6 +1274,7 @@ def top_k_top_p_sampling_from_probs(
         raise ValueError(f"Invalid filter_apply_order: {filter_apply_order}")
 
 
+@flashinfer_api
 def top_p_renorm_probs(
     probs: torch.Tensor,
     top_p: Union[torch.Tensor, float],
@@ -1331,6 +1341,7 @@ def top_p_renorm_probs(
 top_p_renorm_prob = top_p_renorm_probs
 
 
+@flashinfer_api
 def top_k_renorm_probs(
     probs: torch.Tensor,
     top_k: Union[torch.Tensor, int],
@@ -1396,6 +1407,7 @@ def top_k_renorm_probs(
 top_k_renorm_prob = top_k_renorm_probs
 
 
+@flashinfer_api
 def top_k_mask_logits(
     logits: torch.Tensor, top_k: Union[torch.Tensor, int]
 ) -> torch.Tensor:
@@ -1453,6 +1465,7 @@ def top_k_mask_logits(
     )
 
 
+@flashinfer_api
 def chain_speculative_sampling(
     draft_probs,
     draft_token_ids,

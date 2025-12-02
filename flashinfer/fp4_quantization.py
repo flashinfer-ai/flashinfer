@@ -21,6 +21,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
+from .api_logging import flashinfer_api
 from .jit import JitSpec
 from .jit import env as jit_env
 from .jit import (
@@ -624,6 +625,7 @@ def get_fp4_quantization_module(backend: str = "100"):
     )
 
 
+@flashinfer_api
 def fp4_quantize(
     input: torch.Tensor,
     global_scale: Optional[torch.Tensor] = None,
@@ -689,6 +691,7 @@ def fp4_quantize(
     return x_q, sf
 
 
+@flashinfer_api
 def block_scale_interleave(unswizzled_sf: torch.Tensor) -> torch.Tensor:
     """Swizzle block scale tensor for FP4 format.
 
@@ -721,6 +724,7 @@ def block_scale_interleave(unswizzled_sf: torch.Tensor) -> torch.Tensor:
 nvfp4_block_scale_interleave = block_scale_interleave
 
 
+@flashinfer_api
 def e2m1_and_ufp8sf_scale_to_float(
     e2m1_tensor: torch.Tensor,
     ufp8_scale_tensor: torch.Tensor,
@@ -763,6 +767,7 @@ def e2m1_and_ufp8sf_scale_to_float(
     )
 
 
+@flashinfer_api
 def shuffle_matrix_a(input_tensor: torch.Tensor, epilogue_tile_m: int) -> torch.Tensor:
     """
     PyTorch equivalent of trtllm-gen `shuffleMatrixA`
@@ -772,6 +777,7 @@ def shuffle_matrix_a(input_tensor: torch.Tensor, epilogue_tile_m: int) -> torch.
     return input_tensor[row_indices.to(input_tensor.device)]
 
 
+@flashinfer_api
 def shuffle_matrix_sf_a(
     input_tensor: torch.Tensor,
     epilogue_tile_m: int,
@@ -806,6 +812,7 @@ class SfLayout(Enum):
     layout_linear = 2
 
 
+@flashinfer_api
 def nvfp4_quantize(
     a,
     a_global_sf,
@@ -866,6 +873,7 @@ def nvfp4_quantize(
     return a_fp4, a_sf
 
 
+@flashinfer_api
 def mxfp4_quantize(a):
     """
     Quantize input tensor to MXFP4 format.
@@ -883,6 +891,7 @@ def mxfp4_quantize(a):
     return a_fp4, a_sf
 
 
+@flashinfer_api
 def mxfp4_dequantize(a_fp4, a_sf):
     """
     Dequantize input tensor from MXFP4 format.
@@ -904,6 +913,7 @@ def mxfp4_dequantize(a_fp4, a_sf):
     )
 
 
+@flashinfer_api
 def mxfp4_dequantize_host(
     weight: torch.Tensor,
     scale: torch.Tensor,
@@ -932,6 +942,7 @@ def mxfp4_dequantize_host(
     )
 
 
+@flashinfer_api
 def nvfp4_batched_quantize(
     a,
     a_global_sf,
@@ -961,6 +972,7 @@ def nvfp4_batched_quantize(
     return a_fp4, a_sf
 
 
+@flashinfer_api
 def scaled_fp4_grouped_quantize(
     a,
     mask,

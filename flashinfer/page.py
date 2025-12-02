@@ -19,6 +19,7 @@ from typing import Optional, Tuple, Union
 
 import torch
 
+from .api_logging import flashinfer_api
 from .jit.page import gen_page_module
 from .utils import (
     TensorLayout,
@@ -154,6 +155,7 @@ def _fake_append_paged_kv_cache_kernel(
     pass
 
 
+@flashinfer_api
 def get_batch_indices_positions(
     append_indptr: torch.Tensor, seq_lens: torch.Tensor, nnz: int
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -235,6 +237,7 @@ def get_seq_lens(
     )
 
 
+@flashinfer_api
 def append_paged_mla_kv_cache(
     append_ckv: torch.Tensor,
     append_kpe: torch.Tensor,
@@ -284,6 +287,7 @@ def append_paged_mla_kv_cache(
     )
 
 
+@flashinfer_api
 def append_paged_kv_cache(
     append_key: torch.Tensor,
     append_value: torch.Tensor,

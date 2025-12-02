@@ -19,6 +19,7 @@ from types import SimpleNamespace
 from typing import Optional, Union
 import torch
 
+from .api_logging import flashinfer_api
 from .jit.xqa import gen_xqa_module, gen_xqa_module_mla
 from .jit.utils import filename_safe_dtype_map
 from .utils import (
@@ -143,6 +144,7 @@ def get_xqa_module(
     )
 
 
+@flashinfer_api
 def xqa(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -414,6 +416,7 @@ def get_xqa_module_mla(
     )
 
 
+@flashinfer_api
 def xqa_mla(
     q: torch.Tensor,
     k_cache: torch.Tensor,

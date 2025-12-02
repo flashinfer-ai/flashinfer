@@ -181,7 +181,7 @@ export FLASHINFER_LOGLEVEL=3
 export FLASHINFER_LOGDEST=stdout
 ```
 
-For detailed information about logging levels, configuration, and advanced features, see [LOGGING.md](LOGGING.md).
+For detailed information about logging levels, configuration, and advanced features, see [Logging](https://docs.flashinfer.ai/logging.html) in our documentation.
 
 ## Custom Attention Variants
 
