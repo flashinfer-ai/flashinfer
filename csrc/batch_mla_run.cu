@@ -56,7 +56,7 @@ void BatchMLAPagedAttentionRun(TensorView float_workspace_buffer, TensorView int
   unsigned int o_stride_n = o.stride(0);
   unsigned int o_stride_h = o.stride(1);
 
-  cudaSetDevice(q_nope.device().device_id);
+  ffi::CUDADeviceGuard device_guard(q_nope.device().device_id);
   const cudaStream_t stream = get_stream(q_nope.device());
 
   DISPATCH_context(
