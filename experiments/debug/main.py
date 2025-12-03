@@ -1,250 +1,98 @@
 import torch
-import torch.nn.functional as F
-from flashinfer.decode import trtllm_batch_decode_with_kv_cache
 from flashinfer.prefill import trtllm_batch_context_with_kv_cache
-
-
-def ref_batch_decode_with_paged_kv_cache(
-    query, kv_cache, block_tables, seq_lens, cum_seq_lens_q, cum_seq_lens_kv, 
-    max_q_len, max_kv_len, dtype=torch.bfloat16, is_causal=False
-):
-    """
-    Reference implementation of batch decode with paged KV cache.
-    
-    Args:
-        query: [num_q_tokens, num_q_heads, head_size] - query tokens
-        kv_cache: [num_pages, 2, num_kv_heads, page_size, head_size] - paged KV cache
-        block_tables: [batch_size, max_blocks_per_seq] - block tables for each sequence
-        seq_lens: [batch_size] - sequence lengths (q_len + kv_len)
-        cum_seq_lens_q: [batch_size + 1] - cumulative query lengths
-        cum_seq_lens_kv: [batch_size + 1] - cumulative KV lengths
-        max_q_len: max query length
-        max_kv_len: max KV length
-        is_causal: whether to apply causal masking (for prefill phase)
-    
-    Returns:
-        output: [num_q_tokens, num_q_heads, head_size] - attention output
-    """
-    batch_size = block_tables.shape[0]
-    num_q_heads = query.shape[1]
-    head_size = query.shape[2]
-    num_kv_heads = kv_cache.shape[2]
-    page_size = kv_cache.shape[3]
-    num_pages = kv_cache.shape[0]
-    
-    # Number of heads per KV head (for GQA)
-    num_heads_per_kv = num_q_heads // num_kv_heads
-    
-    output = torch.zeros_like(query)
-    
-    # Process each sequence in the batch
-    for b in range(batch_size):
-        q_start = cum_seq_lens_q[b]
-        q_end = cum_seq_lens_q[b + 1]
-        kv_start = cum_seq_lens_kv[b]
-        kv_end = cum_seq_lens_kv[b + 1]
-        
-        q_len = q_end - q_start
-        kv_len = kv_end - kv_start
-        
-        # Get query for this sequence: [q_len, num_q_heads, head_size]
-        q = query[q_start:q_end]  # [q_len, num_q_heads, head_size]
-        
-        # Reconstruct K and V from paged cache
-        block_table = block_tables[b]  # [max_blocks_per_seq]
-        
-        # Flatten paged KV cache into [kv_len, num_kv_heads, head_size]
-        k_list = []
-        v_list = []
-        
-        tokens_in_cache = 0
-        for block_idx in block_table:
-            if block_idx < 0:  # Invalid block
-                break
-            
-            page = kv_cache[block_idx]  # [2, num_kv_heads, page_size, head_size]
-            k_page = page[0]  # [num_kv_heads, page_size, head_size]
-            v_page = page[1]  # [num_kv_heads, page_size, head_size]
-            
-            # Determine how many tokens are in this page
-            remaining = kv_len - tokens_in_cache
-            num_tokens_in_page = min(page_size, remaining)
-            
-            k_list.append(k_page[:, :num_tokens_in_page, :])  # [num_kv_heads, num_tokens, head_size]
-            v_list.append(v_page[:, :num_tokens_in_page, :])  # [num_kv_heads, num_tokens, head_size]
-            
-            tokens_in_cache += num_tokens_in_page
-            if tokens_in_cache >= kv_len:
-                break
-        
-        # Concatenate pages: [num_kv_heads, kv_len, head_size]
-        k = torch.cat(k_list, dim=1)
-        v = torch.cat(v_list, dim=1)
-        
-        # Expand for GQA if needed: [num_q_heads, kv_len, head_size]
-        if num_heads_per_kv > 1:
-            k = k.repeat_interleave(num_heads_per_kv, dim=0)
-            v = v.repeat_interleave(num_heads_per_kv, dim=0)
-        
-        # Compute attention: Q @ K^T -> [q_len, num_q_heads, kv_len]
-        # q: [q_len, num_q_heads, head_size]
-        # k: [num_q_heads, kv_len, head_size]
-        # We need to reshape for batched matrix multiply
-        
-        q_reshaped = q.transpose(0, 1)  # [num_q_heads, q_len, head_size]
-        
-        # Compute scores: [num_q_heads, q_len, kv_len]
-        scores = torch.matmul(q_reshaped, k.transpose(1, 2)) / (head_size ** 0.5)
-        
-        # Apply causal mask if needed (for prefill phase)
-        if is_causal:
-            # Create causal mask: position i can only attend to positions <= i (in KV)
-            # scores shape: [num_q_heads, q_len, kv_len]
-            # For prefill, KV indices go from 0 to kv_len-1, but we need to know their actual positions
-            # In prefill with paged cache, the KV includes both existing context + new tokens
-            # The q tokens can attend to all KV tokens up to their position
-            
-            # Create causal mask [q_len, kv_len]
-            # KV indices 0..kv_len-1 correspond to the KV context
-            # Q indices start from kv_len (they are added after KV)
-            # But since we're doing prefill, Q tokens are part of the sequence being processed
-            # Causal means Q at position i can attend to KV at position <= i
-            
-            # For now: KV tokens are from 0..kv_len-1, Q tokens are interleaved
-            # In prefill, position of q[i] = kv_len + i (it comes after KV)
-            # So q[i] can attend to KV[0..min(kv_len-1, kv_len+i)]
-            # But also q[i] can attend to q[0..i] (other query tokens)
-            
-            # Simpler: assume causal mask between Q and KV+Q
-            # KV has indices 0..kv_len-1, Q has indices kv_len..kv_len+q_len-1
-            # q[i] (actual position kv_len+i) can attend to KV[0..kv_len-1] and Q[0..i]
-            
-            causal_mask = torch.zeros((q_len, kv_len), device=scores.device, dtype=torch.bool)
-            # For prefill: all query tokens can attend to all KV tokens (they come before)
-            causal_mask.fill_(True)
-            
-            # Convert to attention mask
-            scores = scores.masked_fill(~causal_mask.unsqueeze(0), float('-inf'))
-        
-        # Apply softmax: [num_q_heads, q_len, kv_len]
-        attn_weights = F.softmax(scores, dim=-1)
-        
-        # Apply attention to values: [num_q_heads, q_len, head_size]
-        attn_output = torch.matmul(attn_weights, v)
-        
-        # Transpose back: [q_len, num_q_heads, head_size]
-        attn_output = attn_output.transpose(0, 1)
-        
-        # Store in output
-        output[q_start:q_end] = attn_output
-    
-    return output
 
 
 def main():
     dtype = torch.bfloat16
-    batch_size = 2
-    num_pages = 2
     page_size = 64
     num_q_heads = 1
     num_kv_heads = 1
     head_size = 128
     workspace_size = 256 * 1024 * 1024
+    batch_size = 2
 
-    q_lens = torch.tensor([1, 2], dtype=torch.int32).cuda()
-    kv_lens = torch.tensor([3, 4], dtype=torch.int32).cuda()
-    cum_seq_lens_q = torch.cat([torch.tensor([0], dtype=torch.int32).cuda(), torch.cumsum(q_lens, dim=0)]).cuda()
+    # Following the test exactly:
+    # q_lens: number of query tokens
+    # in_kv_lens: number of existing KV tokens  
+    # seq_lens = q_lens + in_kv_lens (TOTAL tokens for which K/V must be in cache)
+    q_lens = torch.tensor([1, 1], dtype=torch.int32)
+    in_kv_lens = torch.tensor([5, 5], dtype=torch.int32) 
+    seq_lens = q_lens + in_kv_lens  # Total = [6, 6]
     
-    # Calculate pages per sequence (not tokens per sequence!)
-    import math
-    cum_seq_lens_kv = torch.cat([torch.tensor([0], dtype=torch.int32).cuda(), torch.cumsum(kv_lens, dim=0)]).cuda()
+    # Create cumulative indices
+    cum_seq_lens_q = torch.cat([torch.tensor([0], dtype=torch.int32).cuda(), torch.cumsum(q_lens, dim=0).cuda()]).contiguous()
     
-    seq_lens = q_lens + kv_lens
+    # Calculate pages needed - based on TOTAL seq_lens
+    page_per_seq = (seq_lens + page_size - 1) // page_size
+    cum_seq_lens_kv = torch.cat([torch.tensor([0], dtype=torch.int32).cuda(), torch.cumsum(page_per_seq, dim=0).cuda()]).contiguous()
     
     print(f"q_lens: {q_lens}")
-    print(f"kv_lens (tokens): {kv_lens}")
-    print(f"seq_lens (q+kv): {seq_lens}")
+    print(f"in_kv_lens: {in_kv_lens}")
+    print(f"seq_lens: {seq_lens}")
+    print(f"page_per_seq: {page_per_seq}")
     print(f"cum_seq_lens_q: {cum_seq_lens_q}")
     print(f"cum_seq_lens_kv: {cum_seq_lens_kv}")
     print()
-    max_q_len = q_lens.max().item()
+    
     num_q_tokens = q_lens.sum().item()
+    num_pages = page_per_seq.sum().item()
+    
+    # Create tensors
     query = torch.ones(num_q_tokens, num_q_heads, head_size, dtype=dtype).cuda()
     kv_cache = torch.zeros(num_pages, 2, num_kv_heads, page_size, head_size, dtype=dtype).cuda()
-    workspace = torch.empty(workspace_size, dtype=torch.uint8).cuda()
+    workspace = torch.zeros(workspace_size, dtype=torch.uint8).cuda()
     block_tables = torch.tensor([[0], [1]], dtype=torch.int32).cuda()
-    max_seq_len = seq_lens.max().item()
-    kv_layout = "HND"
-
-    # set the key/value in kv_cache for testing
-    kv_cache[:, 0, :, 0, :] = 1.0
-    kv_cache[:, 0, :, 1, :] = 1.0
-    kv_cache[:, 0, :, 2, :] = 1.0
-    kv_cache[:, 0, :, 3, :] = 1.0
-
-    kv_cache[:, 1, :, 0, :] = 1.0
-    kv_cache[:, 1, :, 1, :] = 2.0
-    kv_cache[:, 1, :, 2, :] = 3.0
-    kv_cache[:, 1, :, 3, :] = 4.0
-
-    # print(query)
-    # print(kv_cache)
-
-    # decode_output = trtllm_batch_decode_with_kv_cache(
-    #     query=query,
-    #     kv_cache=kv_cache,
-    #     workspace_buffer=workspace,
-    #     block_tables=block_tables,
-    #     seq_lens=seq_lens,
-    #     max_kv_len=max_seq_len,
-    #     kv_layout=kv_layout,
-    #     backend='trtllm-gen',
-    #     max_q_len=max_q_len,
-    #     cum_seq_lens_q=cum_seq_lens_q,
-    #     cum_seq_lens_kv=cum_seq_lens_kv
-    # )
-    # print("Decode output:")
-    # print(decode_output)
-
-    prefill_output = trtllm_batch_context_with_kv_cache(
-        query=query,
+    
+    # Fill KV cache for ALL positions (0 to seq_lens-1 for each batch)
+    # Batch 0 uses page 0, batch 1 uses page 1
+    # Each batch has seq_lens[i] = 6 tokens
+    k_cache = kv_cache[:, 0, :, :, :]
+    v_cache = kv_cache[:, 1, :, :, :]
+    
+    for batch_idx in range(batch_size):
+        page_idx = block_tables[batch_idx, 0].item()
+        for pos in range(seq_lens[batch_idx].item()):
+            k_cache[page_idx, :, pos, :] = 1.0
+            v_cache[page_idx, :, pos, :] = float(pos)
+    
+    print(f"Query shape: {query.shape}")
+    print(f"KV cache shape: {kv_cache.shape}")
+    print(f"Block tables: {block_tables}")
+    print()
+    
+    # Debug print
+    for batch_idx in range(batch_size):
+        page_idx = block_tables[batch_idx, 0].item()
+        print(f"Batch {batch_idx}, Page {page_idx} - K/V for first 6 positions:")
+        for pos in range(6):
+            print(f"  pos {pos}: K={k_cache[page_idx, 0, pos, 0]:.1f}, V={v_cache[page_idx, 0, pos, 0]:.1f}")
+    print()
+    
+    # Call the function following test exactly
+    output = trtllm_batch_context_with_kv_cache(
+        query=query.contiguous(),
         kv_cache=kv_cache,
         workspace_buffer=workspace,
         block_tables=block_tables,
-        seq_lens=seq_lens,
-        max_q_len=max_q_len,
-        max_kv_len=max_seq_len,
-        kv_layout=kv_layout,
-        cum_seq_lens_q=cum_seq_lens_q,
-        cum_seq_lens_kv=cum_seq_lens_kv,
-        bmm1_scale=1.0,
-        bmm2_scale=1.0,
+        seq_lens=seq_lens.cuda(),
+        max_q_len=q_lens.max().item(),
+        max_kv_len=seq_lens.max().item(),
+        bmm1_scale=1.0,  # bmm1_scale
+        bmm2_scale=1.0,  # bmm2_scale  
         batch_size=batch_size,
-    )
-    print(f"Prefill output shape: {prefill_output.shape}")
-    print("Prefill output (first 5 dims of each batch):")
-    for b in range(prefill_output.shape[0]):
-        print(f"  Batch {b}: {prefill_output[b, 0, 0]}")
-
-    expected_output = ref_batch_decode_with_paged_kv_cache(
-        query=query,
-        kv_cache=kv_cache,
-        block_tables=block_tables,
-        seq_lens=seq_lens,
         cum_seq_lens_q=cum_seq_lens_q,
         cum_seq_lens_kv=cum_seq_lens_kv,
-        max_q_len=max_q_len,
-        max_kv_len=max_seq_len,
-        dtype=dtype,
-        is_causal=True  # Prefill phase uses causal masking
+        window_left=-1,  # window_left
+        kv_layout="HND",
     )
-    print("Ref output:")
-    print(expected_output)
-
-    print("Difference(prefill vs. ref):")
-    print(prefill_output - expected_output)
-
-
+    
+    print(f"Output shape: {output.shape}")
+    for b in range(batch_size):
+        print(f"Batch {b}: {output[b, 0, 0]:.2f}")
+    print()
+    print("Expected for causal: Each query attends to all previous + itself")
+    print("Batch 0, token 0: attends to [0,1,2,3,4,5] -> avg = 2.5")
+    print("Batch 1, token 0: attends to [0,1,2,3,4,5] -> avg = 2.5")
 
 
 if __name__ == "__main__":
