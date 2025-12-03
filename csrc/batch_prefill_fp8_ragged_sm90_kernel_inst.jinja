@@ -12,4 +12,4 @@ template cudaError_t BatchFP8PrefillWithRaggedKVCacheDispatched
      {{ variant_name }}, RaggedParams>(RaggedParams& params, bool enable_pdl, cudaStream_t stream);
 {% endfor %}
 
-};  // namespace flashinfer
+}  // namespace flashinfer
