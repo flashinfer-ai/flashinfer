@@ -222,6 +222,7 @@ void trtllm_paged_attention_decode(
     Optional<TensorView> cum_seq_lens_q,
     Optional<TensorView> cum_seq_lens_kv
   ) {
+  printf("running trtllm_paged_attention_decode\n");
   auto q_data_type = dl_dtype_to_tllm_data_type(query.dtype());
   auto kv_data_type = dl_dtype_to_tllm_data_type(key_cache.dtype());
   TVM_FFI_ICHECK_EQ(key_cache.ndim(), value_cache.ndim());
@@ -334,6 +335,7 @@ void trtllm_paged_attention_context(
     double o_sf_scale, int64_t o_sf_vec_size, int64_t o_sf_start_index, int64_t batch_size,
     int64_t window_left, TensorView cum_seq_lens_q, TensorView cum_seq_lens_kv, int64_t sm_count,
     bool enable_pdl, int64_t workspace_size, Optional<TensorView> attention_sinks) {
+  printf("running trtllm_paged_attention_context\n");
   auto q_data_type = dl_dtype_to_tllm_data_type(query.dtype());
   auto kv_data_type = dl_dtype_to_tllm_data_type(key_cache.dtype());
   auto o_data_type = dl_dtype_to_tllm_data_type(out.dtype());
@@ -506,6 +508,7 @@ void trtllm_ragged_attention(TensorView out, TensorView query, TensorView key, T
                              TensorView cum_seq_lens_kv, int64_t sm_count, bool enable_pdl,
                              bool is_causal, int64_t workspace_size,
                              Optional<TensorView> attention_sinks, Optional<TensorView> lse) {
+  printf("running trtllm_ragged_attention\n");
   float* attention_sinks_ptr = nullptr;
   if (attention_sinks.has_value()) {
     TVM_FFI_ICHECK_EQ(attention_sinks.value().dtype(), dl_float32)

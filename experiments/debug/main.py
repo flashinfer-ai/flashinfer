@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 from flashinfer.decode import trtllm_batch_decode_with_kv_cache
+from flashinfer.prefill import trtllm_batch_context_with_kv_cache
 
 
 def ref_batch_decode_with_paged_kv_cache(
@@ -133,7 +134,7 @@ def main():
     max_seq_len = seq_lens.max().item()
     kv_layout = "HND"
 
-    output = trtllm_batch_decode_with_kv_cache(
+    decode_output = trtllm_batch_decode_with_kv_cache(
         query=query,
         kv_cache=kv_cache,
         workspace_buffer=workspace,
@@ -146,9 +147,28 @@ def main():
         cum_seq_lens_q=cum_seq_lens_q,
         cum_seq_lens_kv=cum_seq_lens_kv
     )
-    print(query)
-    print(kv_cache)
-    print(output)
+    # print(query)
+    # print(kv_cache)
+    print("Decode output:")
+    print(decode_output)
+
+    prefill_output = trtllm_batch_context_with_kv_cache(
+        batch_size=batch_size,
+        query=query,
+        kv_cache=kv_cache,
+        workspace_buffer=workspace,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        max_q_len=max_q_len,
+        max_kv_len=max_seq_len,
+        kv_layout=kv_layout,
+        cum_seq_lens_q=cum_seq_lens_q,
+        cum_seq_lens_kv=cum_seq_lens_kv,
+        bmm1_scale=1.0,
+        bmm2_scale=1.0,
+    )
+    print("Prefill output:")
+    print(prefill_output)
 
     expected_output = ref_batch_decode_with_paged_kv_cache(
         query=query,
@@ -161,10 +181,12 @@ def main():
         max_kv_len=max_seq_len,
         dtype=dtype
     )
-    print("Expected output:")
+    print("Ref output:")
     print(expected_output)
-    print("Difference:")
-    print(output - expected_output)
+
+    print("Difference(prefill vs. ref):")
+    print(prefill_output - expected_output)
+
 
 
 

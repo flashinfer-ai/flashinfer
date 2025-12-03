@@ -811,6 +811,7 @@ def _test_trtllm_batch_decode(
         batch_size, seq_lens, page_size
     )
     kv_indptr = generate_cumsum_lens(page_per_seq)
+    kv_indptr_tokens = generate_cumsum_lens(in_kv_lens)
     kv_last_page_len = get_last_page_len(seq_lens, page_size)
 
     workspace_buffer, workspace_buffer_ref = create_workspace_buffers(GPU_DEVICE)
@@ -843,6 +844,7 @@ def _test_trtllm_batch_decode(
         "q_data_type": ref_q.dtype,
         "window_left": window_left,
     }
+    print("running ref")
     if not enable_sink:
         if q_len_per_req is not None and q_len_per_req == 1:
             wrapper_ref = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
@@ -894,6 +896,7 @@ def _test_trtllm_batch_decode(
             qo_indptr=q_indptr,
             kv_indptr=kv_indptr_tokens,
         )
+    print("finished ref")
 
     if (q_len_per_req and q_len_per_req > 1):
         mask = generate_causal_mask(batch_size, q_len_per_req, GPU_DEVICE)
@@ -911,6 +914,7 @@ def _test_trtllm_batch_decode(
         bmm2_scale = bmm2_scale.item()
     elif not isinstance(bmm2_scale, torch.Tensor) and device_scale:
         bmm2_scale = torch.tensor(bmm2_scale, device=GPU_DEVICE, dtype=torch.float32)
+    print("running test")
     output = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
         q.contiguous(),
         kv_cache,
@@ -936,6 +940,7 @@ def _test_trtllm_batch_decode(
         cum_seq_lens_q=q_indptr if max_q_len is not None else None,
         cum_seq_lens_kv=kv_indptr if max_q_len is not None else None,
     )
+    print("finished test")
     if backend == "trtllm-gen":
         # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
         # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
@@ -1502,37 +1507,37 @@ if __name__ == "__main__":
         max_in_kv_len=110,
         head_dim=128,
     )
-    _test_trtllm_batch_decode(
-        backend='trtllm-gen',
-        kv_layout="HND",
-        batch_size=4,
-        q_len_per_req=3,
-        page_size=64,
-        num_kv_heads=4,
-        head_grp_size=1,
-        window_left=-1,
-        q_dtype="bf16",
-        kv_dtype="bf16",
-        o_dtype="bf16",
-        enable_pdl=None,
-        enable_sink=False,
-        max_in_kv_len=110,
-        head_dim=128,
-    )
-    _test_trtllm_batch_decode(
-        backend='trtllm-gen',
-        kv_layout="HND",
-        batch_size=4,
-        q_len_per_req=1,
-        page_size=64,
-        num_kv_heads=4,
-        head_grp_size=1,
-        window_left=-1,
-        q_dtype="fp8",
-        kv_dtype="fp8",
-        o_dtype="nvfp4",
-        enable_pdl=None,
-        enable_sink=False,
-        max_in_kv_len=110,
-        head_dim=128,
-    )
+    # _test_trtllm_batch_decode(
+    #     backend='trtllm-gen',
+    #     kv_layout="HND",
+    #     batch_size=4,
+    #     q_len_per_req=3,
+    #     page_size=64,
+    #     num_kv_heads=4,
+    #     head_grp_size=1,
+    #     window_left=-1,
+    #     q_dtype="bf16",
+    #     kv_dtype="bf16",
+    #     o_dtype="bf16",
+    #     enable_pdl=None,
+    #     enable_sink=False,
+    #     max_in_kv_len=110,
+    #     head_dim=128,
+    # )
+    # _test_trtllm_batch_decode(
+    #     backend='trtllm-gen',
+    #     kv_layout="HND",
+    #     batch_size=4,
+    #     q_len_per_req=1,
+    #     page_size=64,
+    #     num_kv_heads=4,
+    #     head_grp_size=1,
+    #     window_left=-1,
+    #     q_dtype="fp8",
+    #     kv_dtype="fp8",
+    #     o_dtype="nvfp4",
+    #     enable_pdl=None,
+    #     enable_sink=False,
+    #     max_in_kv_len=110,
+    #     head_dim=128,
+    # )

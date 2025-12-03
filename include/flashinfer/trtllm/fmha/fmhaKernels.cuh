@@ -169,6 +169,7 @@ class TllmGenFmhaKernel {
       // Add debug info when kernels are not found.
       FLASHINFER_CHECK(findMetaIter != mKernelMetaMap.end(),
                        "Trtllm-gen kernels not found: " + info);
+      printf("Using trtllm-gen kernel (iter=%d): %s\n", selectKernelIter, info.c_str());
 
       //  auto const& kernelMeta = mKernelMeta[findIter->second.mMetaInfoIndex];
       auto const findFuncIter = mFunctions.find(hashId);

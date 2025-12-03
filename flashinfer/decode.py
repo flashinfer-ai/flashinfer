@@ -2318,6 +2318,7 @@ def trtllm_batch_decode_with_kv_cache(
         if isinstance(bmm2_scale, torch.Tensor):
             assert bmm2_scale.dtype == torch.float32
 
+        print("TRTLLM GEN DECODE RUN")
         run_func(
             out,
             out_scale_factor,
@@ -2348,6 +2349,7 @@ def trtllm_batch_decode_with_kv_cache(
             cum_seq_lens_q,
             cum_seq_lens_kv,
         )
+        print("TRTLLM GEN DECODE RUN DONE")
 
         return (
             out
