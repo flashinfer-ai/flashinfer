@@ -15,31 +15,12 @@
  */
 #include <flashinfer/sampling.cuh>
 
+#include "sampling_utils.h"
 #include "tvm_ffi_utils.h"
 
 using namespace flashinfer;
 
 using tvm::ffi::Optional;
-
-// Validate sampling parameters
-inline void check_tensor_param(const Optional<TensorView>& maybe_param, const TensorView& tensor) {
-  if (maybe_param.has_value()) {
-    const TensorView& param = maybe_param.value();
-    if (param.ndim() == 0) {
-      TVM_FFI_THROW(ValueError)
-          << "Expected a 1D tensor of shape (batch_size,) or scalar for the sampling parameter, "
-          << "but got a 0-dimensional tensor.";
-    } else if (param.ndim() > 1) {
-      TVM_FFI_THROW(ValueError) << "Expected a 1D tensor or scalar for the sampling parameter, "
-                                << "but got a " << param.ndim() << "D tensor.";
-    } else if (param.size(0) != tensor.size(0)) {
-      TVM_FFI_THROW(ValueError) << "Sampling parameter tensor batch size mismatch: "
-                                << "expected length " << tensor.size(0)
-                                << " to match the reference tensor batch size, "
-                                << "but got length " << param.size(0) << ".";
-    }
-  }
-}
 
 void top_p_renorm_probs(TensorView probs, TensorView renorm_probs,
                         Optional<TensorView> maybe_top_p_arr, double top_p_val) {
