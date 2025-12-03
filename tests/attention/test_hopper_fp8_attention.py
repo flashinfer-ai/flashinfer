@@ -9,21 +9,32 @@ import flashinfer
 from flashinfer.utils import is_sm90a_supported
 
 
+def get_fp8_dtype_minmax(dtype: torch.dtype) -> Tuple[float, float]:
+    """Get min/max representable values for FP8 dtype."""
+    if dtype == torch.float8_e4m3fn:
+        return -448.0, 448.0
+    elif dtype == torch.float8_e5m2:
+        return -57344, 57344
+    else:
+        raise ValueError(f"Unsupported quantization dtype: {dtype}")
+
+
 def per_head_symmetric_quant(
     x: torch.Tensor, quant_dtype: torch.dtype
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    # x: [seq_len, num_heads, head_dim]
+    """Quantize tensor with per-head scale factors.
+
+    Args:
+        x: Input tensor of shape [seq_len, num_heads, head_dim]
+        quant_dtype: FP8 dtype (e4m3 or e5m2)
+
+    Returns:
+        Tuple of (quantized tensor, per-head scales of shape [num_heads])
+    """
     assert quant_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]
 
-    def get_dtype_minmax(dtype: torch.dtype) -> Tuple[float, float]:
-        if dtype == torch.float8_e4m3fn:
-            return -448.0, 448.0
-        elif dtype == torch.float8_e5m2:
-            return -57344, 57344
-        else:
-            raise ValueError(f"Unsupported quantization dtype: {dtype}")
-
-    o_min_val, o_max_val = get_dtype_minmax(quant_dtype)
+    o_min_val, o_max_val = get_fp8_dtype_minmax(quant_dtype)
+    # Compute max per head: reduce over seq_len and head_dim
     x_max_val = x.abs().amax(dim=(0, 2)).to(dtype=torch.float32)
 
     s_out = torch.clamp(x_max_val / o_max_val, min=1e-6)
@@ -39,6 +50,59 @@ def per_head_symmetric_quant(
     assert not torch.any(torch.isnan(s_out))
 
     return q_x_out, s_out
+
+
+def per_tensor_symmetric_quant(
+    x: torch.Tensor, quant_dtype: torch.dtype
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize tensor with a single per-tensor scale factor.
+
+    Args:
+        x: Input tensor of shape [seq_len, num_heads, head_dim]
+        quant_dtype: FP8 dtype (e4m3 or e5m2)
+
+    Returns:
+        Tuple of (quantized tensor, per-tensor scale of shape [1])
+    """
+    assert quant_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]
+
+    o_min_val, o_max_val = get_fp8_dtype_minmax(quant_dtype)
+    # Compute max over entire tensor
+    x_max_val = x.abs().amax().to(dtype=torch.float32)
+
+    s_out = torch.clamp(x_max_val / o_max_val, min=1e-6).view(1)
+
+    q_x_out = torch.clamp(
+        x / s_out,
+        min=o_min_val,
+        max=o_max_val,
+    ).to(dtype=quant_dtype)
+
+    assert not torch.any(torch.isnan(q_x_out))
+    assert not torch.any(torch.isnan(s_out))
+
+    return q_x_out, s_out
+
+
+def broadcast_scale_to_per_head(scale: torch.Tensor, num_heads: int) -> torch.Tensor:
+    """Broadcast per-tensor scale to per-head scale if needed.
+
+    Args:
+        scale: Scale tensor of shape [1] (per-tensor) or [num_heads] (per-head)
+        num_heads: Number of heads
+
+    Returns:
+        Scale tensor of shape [num_heads]
+    """
+    if scale.numel() == 1:
+        # Per-tensor scale: broadcast to all heads
+        return scale.expand(num_heads).contiguous()
+    else:
+        # Already per-head scale
+        assert scale.numel() == num_heads, (
+            f"Scale size {scale.numel()} != num_heads {num_heads}"
+        )
+        return scale
 
 
 def bsr_attention_ref(
@@ -280,6 +344,50 @@ def test_batch_prefill_ragged(batch_size, num_heads, head_dim, causal, dtype):
     assert mse < 1.0, f"MSE too high: {mse.item()}"
 
 
+def create_per_head_varying_kv(
+    shape: Tuple[int, ...],
+    num_heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    device: str,
+) -> torch.Tensor:
+    """Create K/V tensor with per-head varying scale to reveal head offset bugs.
+
+    Each head gets data with a different scale factor: head i gets scale (i+1).
+    This ensures that if the kernel incorrectly reads head 0's data for head i,
+    the output will have noticeably different magnitude, causing high MSE.
+
+    Args:
+        shape: Tensor shape, should contain num_heads dimension
+        num_heads: Number of heads
+        head_dim: Head dimension
+        dtype: Data type
+        device: Device string
+
+    Returns:
+        Tensor with per-head varying scale
+    """
+    # Generate base random tensor
+    tensor = torch.randn(shape, dtype=dtype, device=device)
+
+    # Apply per-head scaling: head i gets multiplied by (i+1)
+    # This makes different heads have different magnitudes
+    # Shape handling: for paged KV (num_pages, page_size, num_heads, head_dim)
+    # or for flat KV (seq_len, num_heads, head_dim)
+    if len(shape) == 4:
+        # Paged: (num_pages, page_size, num_heads, head_dim)
+        scale = torch.arange(1, num_heads + 1, dtype=dtype, device=device).view(
+            1, 1, num_heads, 1
+        )
+    else:
+        # Flat: (seq_len, num_heads, head_dim)
+        scale = torch.arange(1, num_heads + 1, dtype=dtype, device=device).view(
+            1, num_heads, 1
+        )
+
+    return tensor * scale
+
+
 # Test batch prefill with paged KV cache: MSE should be below threshold
 @pytest.mark.parametrize("batch_size", [2, 4])
 @pytest.mark.parametrize("num_heads", [8, 32])
@@ -340,11 +448,21 @@ def test_batch_prefill_paged(batch_size, num_heads, head_dim, causal, dtype):
         total_qo_len, num_qo_heads, head_dim, dtype=torch.half, device="cuda"
     )
     # Paged KV cache: (num_pages, page_size, num_heads, head_dim)
-    paged_k_fp16 = torch.randn(
-        total_pages, page_size, num_kv_heads, head_dim, dtype=torch.half, device="cuda"
+    # Use per-head varying scale to reveal head offset bugs:
+    # If kernel incorrectly reads head 0's data for all heads, MSE will be high
+    paged_k_fp16 = create_per_head_varying_kv(
+        (total_pages, page_size, num_kv_heads, head_dim),
+        num_kv_heads,
+        head_dim,
+        torch.half,
+        "cuda",
     )
-    paged_v_fp16 = torch.randn(
-        total_pages, page_size, num_kv_heads, head_dim, dtype=torch.half, device="cuda"
+    paged_v_fp16 = create_per_head_varying_kv(
+        (total_pages, page_size, num_kv_heads, head_dim),
+        num_kv_heads,
+        head_dim,
+        torch.half,
+        "cuda",
     )
 
     # Get reference output using fp16
@@ -398,9 +516,299 @@ def test_batch_prefill_paged(batch_size, num_heads, head_dim, causal, dtype):
     )
     o_fp8 = wrapper_fp8.run(q_fp8, (paged_k_fp8, paged_v_fp8), s_q, s_k, s_v)
 
+    # Compute MSE - with per-head varying K/V data, head offset bugs will cause high MSE
+    # because reading head 0's data for head i gives wrong scale magnitude
+    mse = torch.mean((o_ref.float() - o_fp8.float()) ** 2)
+    assert mse < 1.0, f"MSE too high: {mse.item()}"
+
+
+# Test batch prefill with paged KV cache and GQA (grouped query attention)
+# GQA has num_qo_heads > num_kv_heads, this tests the head offset calculation more thoroughly
+@pytest.mark.parametrize("batch_size", [2])
+@pytest.mark.parametrize("num_qo_heads,num_kv_heads", [(32, 8), (16, 4), (8, 2)])
+@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("causal", [True])
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
+def test_batch_prefill_paged_gqa(
+    batch_size, num_qo_heads, num_kv_heads, head_dim, causal, dtype
+):
+    """Test FP8 batch prefill with paged KV cache using grouped query attention (GQA).
+
+    GQA is important to test because:
+    1. It exercises the head mapping logic (multiple Q heads share one KV head)
+    2. It verifies kv_head_idx calculation is correct for different group sizes
+    3. The per-head varying K/V data makes head offset bugs highly visible
+    """
+    if not is_sm90a_supported(torch.device("cuda")):
+        pytest.skip("SM90A is not supported")
+
+    print(
+        f"Testing FP8 batch prefill paged GQA with batch_size={batch_size}, "
+        f"num_qo_heads={num_qo_heads}, num_kv_heads={num_kv_heads}, "
+        f"head_dim={head_dim}, causal={causal}, dtype={dtype}"
+    )
+
+    # Setup
+    o_dtype = torch.half
+    page_size = 16
+
+    # Create variable length sequences
+    torch.manual_seed(0)
+    qo_lens = [128 * (i + 1) for i in range(batch_size)]
+    kv_lens = [128 * (i + 1) for i in range(batch_size)]
+
+    # Build indptr for Q
+    qo_indptr = torch.tensor(
+        [0] + [sum(qo_lens[: i + 1]) for i in range(batch_size)],
+        dtype=torch.int32,
+        device="cuda",
+    )
+
+    total_qo_len = sum(qo_lens)
+
+    # Compute number of pages needed for each sequence
+    kv_page_counts = [(kv_len + page_size - 1) // page_size for kv_len in kv_lens]
+    total_pages = sum(kv_page_counts)
+
+    # Build paged KV indptr and indices
+    kv_indptr = torch.tensor(
+        [0] + [sum(kv_page_counts[: i + 1]) for i in range(batch_size)],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    kv_indices = torch.arange(total_pages, dtype=torch.int32, device="cuda")
+    kv_last_page_len = torch.tensor(
+        [
+            kv_len % page_size if kv_len % page_size != 0 else page_size
+            for kv_len in kv_lens
+        ],
+        dtype=torch.int32,
+        device="cuda",
+    )
+
+    # Create input tensors (fp16)
+    q_fp16 = torch.randn(
+        total_qo_len, num_qo_heads, head_dim, dtype=torch.half, device="cuda"
+    )
+    # Paged KV cache: (num_pages, page_size, num_kv_heads, head_dim)
+    # Use per-head varying scale to reveal head offset bugs
+    paged_k_fp16 = create_per_head_varying_kv(
+        (total_pages, page_size, num_kv_heads, head_dim),
+        num_kv_heads,
+        head_dim,
+        torch.half,
+        "cuda",
+    )
+    paged_v_fp16 = create_per_head_varying_kv(
+        (total_pages, page_size, num_kv_heads, head_dim),
+        num_kv_heads,
+        head_dim,
+        torch.half,
+        "cuda",
+    )
+
+    # Get reference output using fp16
+    wrapper_fp16 = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
+        "NHD",
+        backend="fa3",
+    )
+    wrapper_fp16.plan(
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        causal=causal,
+    )
+    o_ref = wrapper_fp16.run(q_fp16, (paged_k_fp16, paged_v_fp16))
+
+    # Quantize to FP8
+    q_fp8, s_q = per_head_symmetric_quant(q_fp16, quant_dtype=dtype)
+    k_flat = paged_k_fp16.view(-1, num_kv_heads, head_dim)
+    v_flat = paged_v_fp16.view(-1, num_kv_heads, head_dim)
+    k_fp8_flat, s_k = per_head_symmetric_quant(k_flat, quant_dtype=dtype)
+    v_fp8_flat, s_v = per_head_symmetric_quant(v_flat, quant_dtype=dtype)
+    paged_k_fp8 = k_fp8_flat.view(total_pages, page_size, num_kv_heads, head_dim)
+    paged_v_fp8 = v_fp8_flat.view(total_pages, page_size, num_kv_heads, head_dim)
+
+    # Run FP8 batch prefill with paged KV cache
+    wrapper_fp8 = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
+        "NHD",
+        backend="fa3",
+    )
+    wrapper_fp8.plan(
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+        o_data_type=o_dtype,
+        causal=causal,
+    )
+    o_fp8 = wrapper_fp8.run(q_fp8, (paged_k_fp8, paged_v_fp8), s_q, s_k, s_v)
+
     # Compute MSE
     mse = torch.mean((o_ref.float() - o_fp8.float()) ** 2)
     assert mse < 1.0, f"MSE too high: {mse.item()}"
+
+
+# Test both per-tensor and per-head scale types
+@pytest.mark.parametrize("scale_type", ["per_head", "per_tensor"])
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
+def test_batch_prefill_paged_scale_types(scale_type, dtype):
+    """Test FP8 batch prefill with both per-tensor and per-head scale types.
+
+    This test verifies that:
+    1. Per-head scale: shape [num_heads], each head has its own scale
+    2. Per-tensor scale: shape [1], single scale broadcast to all heads
+    """
+    if not is_sm90a_supported(torch.device("cuda")):
+        pytest.skip("SM90A is not supported")
+
+    print(
+        f"Testing FP8 batch prefill paged with scale_type={scale_type}, dtype={dtype}"
+    )
+
+    # Setup
+    batch_size = 2
+    num_qo_heads = num_kv_heads = 8
+    head_dim = 128
+    o_dtype = torch.half
+    page_size = 16
+    causal = True
+
+    # Create variable length sequences
+    torch.manual_seed(0)
+    qo_lens = [128 * (i + 1) for i in range(batch_size)]
+    kv_lens = [128 * (i + 1) for i in range(batch_size)]
+
+    # Build indptr for Q
+    qo_indptr = torch.tensor(
+        [0] + [sum(qo_lens[: i + 1]) for i in range(batch_size)],
+        dtype=torch.int32,
+        device="cuda",
+    )
+
+    total_qo_len = sum(qo_lens)
+
+    # Compute number of pages needed for each sequence
+    kv_page_counts = [(kv_len + page_size - 1) // page_size for kv_len in kv_lens]
+    total_pages = sum(kv_page_counts)
+
+    # Build paged KV indptr and indices
+    kv_indptr = torch.tensor(
+        [0] + [sum(kv_page_counts[: i + 1]) for i in range(batch_size)],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    kv_indices = torch.arange(total_pages, dtype=torch.int32, device="cuda")
+    kv_last_page_len = torch.tensor(
+        [
+            kv_len % page_size if kv_len % page_size != 0 else page_size
+            for kv_len in kv_lens
+        ],
+        dtype=torch.int32,
+        device="cuda",
+    )
+
+    # Create input tensors (fp16)
+    q_fp16 = torch.randn(
+        total_qo_len, num_qo_heads, head_dim, dtype=torch.half, device="cuda"
+    )
+    paged_k_fp16 = create_per_head_varying_kv(
+        (total_pages, page_size, num_kv_heads, head_dim),
+        num_kv_heads,
+        head_dim,
+        torch.half,
+        "cuda",
+    )
+    paged_v_fp16 = create_per_head_varying_kv(
+        (total_pages, page_size, num_kv_heads, head_dim),
+        num_kv_heads,
+        head_dim,
+        torch.half,
+        "cuda",
+    )
+
+    # Get reference output using fp16
+    wrapper_fp16 = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
+        "NHD",
+        backend="fa3",
+    )
+    wrapper_fp16.plan(
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        causal=causal,
+    )
+    o_ref = wrapper_fp16.run(q_fp16, (paged_k_fp16, paged_v_fp16))
+
+    # Quantize to FP8 with the specified scale type
+    if scale_type == "per_head":
+        q_fp8, s_q = per_head_symmetric_quant(q_fp16, quant_dtype=dtype)
+        k_flat = paged_k_fp16.view(-1, num_kv_heads, head_dim)
+        v_flat = paged_v_fp16.view(-1, num_kv_heads, head_dim)
+        k_fp8_flat, s_k = per_head_symmetric_quant(k_flat, quant_dtype=dtype)
+        v_fp8_flat, s_v = per_head_symmetric_quant(v_flat, quant_dtype=dtype)
+    else:  # per_tensor
+        q_fp8, s_q = per_tensor_symmetric_quant(q_fp16, quant_dtype=dtype)
+        k_flat = paged_k_fp16.view(-1, num_kv_heads, head_dim)
+        v_flat = paged_v_fp16.view(-1, num_kv_heads, head_dim)
+        k_fp8_flat, s_k = per_tensor_symmetric_quant(k_flat, quant_dtype=dtype)
+        v_fp8_flat, s_v = per_tensor_symmetric_quant(v_flat, quant_dtype=dtype)
+
+    paged_k_fp8 = k_fp8_flat.view(total_pages, page_size, num_kv_heads, head_dim)
+    paged_v_fp8 = v_fp8_flat.view(total_pages, page_size, num_kv_heads, head_dim)
+
+    # Broadcast per-tensor scales to per-head if needed
+    # The kernel expects per-head scales, so we broadcast [1] -> [num_heads]
+    s_q_broadcast = broadcast_scale_to_per_head(s_q, num_qo_heads)
+    s_k_broadcast = broadcast_scale_to_per_head(s_k, num_kv_heads)
+    s_v_broadcast = broadcast_scale_to_per_head(s_v, num_kv_heads)
+
+    # Run FP8 batch prefill with paged KV cache
+    wrapper_fp8 = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
+        "NHD",
+        backend="fa3",
+    )
+    wrapper_fp8.plan(
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+        o_data_type=o_dtype,
+        causal=causal,
+    )
+    o_fp8 = wrapper_fp8.run(
+        q_fp8, (paged_k_fp8, paged_v_fp8), s_q_broadcast, s_k_broadcast, s_v_broadcast
+    )
+
+    # Compute MSE
+    mse = torch.mean((o_ref.float() - o_fp8.float()) ** 2)
+    assert mse < 1.0, f"MSE too high for scale_type={scale_type}: {mse.item()}"
 
 
 if __name__ == "__main__":

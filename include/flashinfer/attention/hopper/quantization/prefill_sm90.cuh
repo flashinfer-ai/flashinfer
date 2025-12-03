@@ -335,9 +335,11 @@ cudaError_t BatchFP8PrefillWithPagedKVCacheKernelTraitsDispatched(Params& params
                        params.q_stride_h),  // layout_Q
        params.k_ptr,
        params.k_stride_n,     // k_stride_n
+       params.k_stride_h,     // k_stride_h
        params.k_page_stride,  // k_page_stride
        params.v_ptr,
        params.v_stride_n,     // v_stride_n
+       params.v_stride_h,     // v_stride_h
        params.v_page_stride,  // v_page_stride
        params.kv_indices,
        static_cast<uint32_t>(params.page_size),  // page_size

@@ -99,9 +99,11 @@ struct FP8SparseCollectiveMainloop {
     LayoutT layout_Q;
     DTypeKV const* K_ptr;
     int64_t k_stride_n;     // Stride between consecutive KV tokens
+    int64_t k_stride_h;     // Stride between heads
     int64_t k_page_stride;  // Stride between pages
     DTypeKV const* V_ptr;
     int64_t v_stride_n;     // Stride between consecutive KV tokens
+    int64_t v_stride_h;     // Stride between heads
     int64_t v_page_stride;  // Stride between pages
     IdType const* kv_indices;
     uint32_t page_size;  // Size of each page
@@ -115,9 +117,11 @@ struct FP8SparseCollectiveMainloop {
     TMA_Q tma_load_Q;
     DTypeKV* K_ptr;
     int64_t k_stride_n;
+    int64_t k_stride_h;
     int64_t k_page_stride;
     DTypeKV* V_ptr;
     int64_t v_stride_n;
+    int64_t v_stride_h;
     int64_t v_page_stride;
     IdType* kv_indices;
     uint_fastdiv page_size;  // Size of each page (as fastdiv for efficient divmod)
@@ -130,10 +134,20 @@ struct FP8SparseCollectiveMainloop {
     Tensor mQ = make_tensor(make_gmem_ptr(args.Q_ptr), args.layout_Q);
     TMA_Q tma_load_Q =
         make_tma_copy(GmemTiledCopyQ{}, mQ, SmemLayoutQ{}, select<0, 2>(TileShape_QKD{}), _1{});
-    return {args.layout_Q,   tma_load_Q,         const_cast<DTypeKV*>(args.K_ptr),
-            args.k_stride_n, args.k_page_stride, const_cast<DTypeKV*>(args.V_ptr),
-            args.v_stride_n, args.v_page_stride, const_cast<IdType*>(args.kv_indices),
-            args.page_size,  args.window_left,   args.additional_params};
+    return {args.layout_Q,
+            tma_load_Q,
+            const_cast<DTypeKV*>(args.K_ptr),
+            args.k_stride_n,
+            args.k_stride_h,
+            args.k_page_stride,
+            const_cast<DTypeKV*>(args.V_ptr),
+            args.v_stride_n,
+            args.v_stride_h,
+            args.v_page_stride,
+            const_cast<IdType*>(args.kv_indices),
+            args.page_size,
+            args.window_left,
+            args.additional_params};
   }
 
   CUTLASS_DEVICE
@@ -211,8 +225,9 @@ struct FP8SparseCollectiveMainloop {
     IdType const* kv_indices_ptr = mainloop_params.kv_indices + kv_indptr;
 
     // Setup for manual K/V loading with page table
-    DTypeKV* k_base_ptr = mainloop_params.K_ptr;
-    DTypeKV* v_base_ptr = mainloop_params.V_ptr;
+    // Add kv_head_idx * stride_h offset to base pointers for correct head addressing
+    DTypeKV* k_base_ptr = mainloop_params.K_ptr + kv_head_idx * mainloop_params.k_stride_h;
+    DTypeKV* v_base_ptr = mainloop_params.V_ptr + kv_head_idx * mainloop_params.v_stride_h;
     int64_t k_stride_n = mainloop_params.k_stride_n;
     int64_t k_page_stride = mainloop_params.k_page_stride;
     int64_t v_stride_n = mainloop_params.v_stride_n;
