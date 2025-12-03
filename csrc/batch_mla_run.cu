@@ -31,11 +31,14 @@ void BatchMLAPagedAttentionRun(TensorView float_workspace_buffer, TensorView int
                                Array<int64_t> plan_info_vec, TensorView q_nope, TensorView q_pe,
                                TensorView ckv_cache, TensorView kpe_cache, TensorView kv_indices,
                                TensorView o, Optional<TensorView> maybe_lse, int64_t mask_mode_code,
-                               int64_t num_heads, int64_t page_size, double sm_scale) {
+                               int64_t num_heads, int64_t page_size, double sm_scale,
+                               bool return_lse_base_on_e) {
   // q_nope: [n, num_heads, head_dim_ckv]
   // q_pe: [n, num_heads, head_dim_kpe]
   // ckv_cache: [num_pages, page_size, head_dim_ckv]
   // kpe_cache: [num_pages, page_size, head_dim_kpe]
+  CHECK_INPUT_TYPE(kv_indices, dl_int32);
+
   MLAPlanInfo plan_info;
   plan_info.FromVector(std::vector<int64_t>(plan_info_vec.begin(), plan_info_vec.end()));
 
@@ -55,7 +58,7 @@ void BatchMLAPagedAttentionRun(TensorView float_workspace_buffer, TensorView int
   unsigned int o_stride_n = o.stride(0);
   unsigned int o_stride_h = o.stride(1);
 
-  cudaSetDevice(q_nope.device().device_id);
+  ffi::CUDADeviceGuard device_guard(q_nope.device().device_id);
   const cudaStream_t stream = get_stream(q_nope.device());
 
   DISPATCH_context(
@@ -112,6 +115,7 @@ void BatchMLAPagedAttentionRun(TensorView float_workspace_buffer, TensorView int
         params.o_stride_h = o_stride_h;
 
         params.sm_scale = sm_scale;
+        params.return_lse_base_on_e = return_lse_base_on_e;
 
         cudaError_t status = mla::BatchMLAPagedAttention<MASK_MODE, HEAD_DIM_CKV, HEAD_DIM_KPE>(
             params, plan_info.num_blks_x, plan_info.num_blks_y, stream);

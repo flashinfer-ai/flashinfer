@@ -88,7 +88,7 @@ void append_paged_kv_cache(TensorView append_key, TensorView append_value, Tenso
   TVM_FFI_ICHECK_EQ(append_value.size(1), num_heads);
   TVM_FFI_ICHECK_EQ(append_value.size(2), head_dim);
 
-  cudaSetDevice(append_key.device().device_id);
+  ffi::CUDADeviceGuard device_guard(append_key.device().device_id);
   const cudaStream_t stream = get_stream(append_key.device());
   bool success = DISPATCH_DLPACK_DTYPE_TO_CTYPE(paged_k_cache.dtype(), c_type, [&] {
     paged_kv_t<c_type, int32_t> paged_kv(
@@ -165,7 +165,7 @@ void append_paged_mla_kv_cache(TensorView append_ckv, TensorView append_kpe,
   TVM_FFI_ICHECK_EQ(append_ckv.size(1), ckv_dim);
   TVM_FFI_ICHECK_EQ(append_kpe.size(1), kpe_dim);
 
-  cudaSetDevice(append_ckv.device().device_id);
+  ffi::CUDADeviceGuard device_guard(append_ckv.device().device_id);
   const cudaStream_t stream = get_stream(append_ckv.device());
   bool success = DISPATCH_DLPACK_DTYPE_TO_CTYPE(ckv_cache.dtype(), c_type, [&] {
     paged_kv_mla_t<c_type, int32_t> paged_mla_kv(

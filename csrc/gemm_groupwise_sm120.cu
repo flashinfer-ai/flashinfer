@@ -86,7 +86,7 @@ void CutlassGemmGroupwiseScaledSM120(TensorView float_workspace_buffer, TensorVi
                                      TensorView SFA, TensorView SFB, TensorView C,
                                      int64_t scale_granularity_m, int64_t scale_granularity_n,
                                      int64_t scale_granularity_k, std::string scale_major_mode) {
-  cudaSetDevice(float_workspace_buffer.device().device_id);
+  ffi::CUDADeviceGuard device_guard(float_workspace_buffer.device().device_id);
   auto stream = get_stream(C.device());
 
   // Ensure scales are contiguous

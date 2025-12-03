@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Union, overload
 
 import torch
 
+from .api_logging import flashinfer_api
 from .jit import (
     gen_batch_prefill_module,
     gen_customize_batch_prefill_module,
@@ -31,11 +32,13 @@ from .jit import (
     get_single_prefill_uri,
     setup_cubin_loader,
     gen_trtllm_gen_fmha_module,
+    get_trtllm_fmha_v2_module,
 )
 from .cudnn import cudnn_batch_prefill_with_kv_cache
 from .page import get_seq_lens
 from .quantization import packbits, segment_packbits
 from .utils import (
+    log2e,
     FP4Tensor,
     MaskMode,
     PosEncodingMode,
@@ -190,8 +193,8 @@ def get_trtllm_gen_prefill_module():
         seq_lens: torch.Tensor,
         max_q_len: int,
         max_kv_len: int,
-        bmm1_scale: float,
-        bmm2_scale: float,
+        bmm1_scale: Union[float, torch.Tensor],
+        bmm2_scale: Union[float, torch.Tensor],
         batch_size: int,
         cum_seq_lens_q: torch.Tensor,
         cum_seq_lens_kv: torch.Tensor,
@@ -204,12 +207,11 @@ def get_trtllm_gen_prefill_module():
         sm_count = get_device_sm_count(query.device)
         if out is None:
             out = torch.empty_like(query)
-        bmm1_scale = (
-            bmm1_scale.item() if isinstance(bmm1_scale, torch.Tensor) else bmm1_scale
-        )
-        bmm2_scale = (
-            bmm2_scale.item() if isinstance(bmm2_scale, torch.Tensor) else bmm2_scale
-        )
+        if isinstance(bmm1_scale, torch.Tensor):
+            assert bmm1_scale.dtype == torch.float32
+            bmm1_scale = bmm1_scale * log2e
+        if isinstance(bmm2_scale, torch.Tensor):
+            assert bmm2_scale.dtype == torch.float32
         op.trtllm_paged_attention_context(
             out,
             None,  # fp4 output not supported in wrapper api yet.
@@ -903,6 +905,7 @@ def get_batch_prefill_jit_module(module_name: str, jit_module: Any):
     )
 
 
+@flashinfer_api
 def single_prefill_with_kv_cache_with_jit_module(
     jit_module: Any,
     q: torch.Tensor,
@@ -987,6 +990,7 @@ def single_prefill_with_kv_cache(
 ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
 
+@flashinfer_api
 def single_prefill_with_kv_cache(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1355,6 +1359,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
     wrapper class manages the lifecycle of these data structures.
     """
 
+    @flashinfer_api
     def __init__(
         self,
         float_workspace_buffer: torch.Tensor,
@@ -1540,6 +1545,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             pin_memory=True,
         )
 
+    @flashinfer_api
     def plan(
         self,
         qo_indptr: torch.Tensor,
@@ -1988,6 +1994,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         window_left: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
+    @flashinfer_api
     def run(
         self,
         q: torch.Tensor,
@@ -2352,6 +2359,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
     wrapper class manages the lifecycle of these data structures.
     """
 
+    @flashinfer_api
     def __init__(
         self,
         float_workspace_buffer: torch.Tensor,
@@ -2495,6 +2503,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             pin_memory=True,
         )
 
+    @flashinfer_api
     def plan(
         self,
         qo_indptr: torch.Tensor,
@@ -2847,6 +2856,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         enable_pdl: Optional[bool] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
+    @flashinfer_api
     def run(
         self,
         q: torch.Tensor,
@@ -3214,6 +3224,7 @@ def get_trtllm_gen_fmha_module():
     return op
 
 
+@flashinfer_api
 def trtllm_ragged_attention_deepseek(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -3222,8 +3233,8 @@ def trtllm_ragged_attention_deepseek(
     seq_lens: torch.Tensor,
     max_q_len: int,
     max_kv_len: int,
-    bmm1_scale: float,
-    bmm2_scale: float,
+    bmm1_scale: Union[float, torch.Tensor],
+    bmm2_scale: Union[float, torch.Tensor],
     o_sf_scale: float,
     batch_size: int,
     window_left: int,
@@ -3253,10 +3264,12 @@ def trtllm_ragged_attention_deepseek(
         max query length
     max_kv_len : int
         max key/value length
-    bmm1_scale : float
+    bmm1_scale : Union[float, torch.Tensor]
         scale for bmm1, scale_q * scale_k * 1.0 / (head_dim_qk ** 0.5)
-    bmm2_scale : float
+        when using trtllm-gen backend, it can be a torch.Tensor with dtype torch.float32.
+    bmm2_scale : Union[float, torch.Tensor]
         scale for bmm2, scale_v
+        when using trtllm-gen backend, it can be a torch.Tensor with dtype torch.float32.
     o_sf_scale : float
         scale for output
     batch_size : int
@@ -3310,6 +3323,12 @@ def trtllm_ragged_attention_deepseek(
             dtype=torch.float32,
         )
 
+    if isinstance(bmm1_scale, torch.Tensor):
+        assert bmm1_scale.dtype == torch.float32
+        bmm1_scale = bmm1_scale * log2e
+    if isinstance(bmm2_scale, torch.Tensor):
+        assert bmm2_scale.dtype == torch.float32
+
     workspace_size = workspace_buffer.numel() * workspace_buffer.element_size()
     run_func(
         out,
@@ -3340,6 +3359,7 @@ def trtllm_ragged_attention_deepseek(
         return out
 
 
+@flashinfer_api
 def trtllm_batch_context_with_kv_cache(
     query: torch.Tensor,
     kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
@@ -3348,8 +3368,8 @@ def trtllm_batch_context_with_kv_cache(
     seq_lens: torch.Tensor,
     max_q_len: int,
     max_kv_len: int,
-    bmm1_scale: float,
-    bmm2_scale: float,
+    bmm1_scale: Union[float, torch.Tensor],
+    bmm2_scale: Union[float, torch.Tensor],
     batch_size: int,
     cum_seq_lens_q: torch.Tensor,
     cum_seq_lens_kv: torch.Tensor,
@@ -3383,10 +3403,12 @@ def trtllm_batch_context_with_kv_cache(
         max sequence length for query
     max_kv_len : int
         max sequence length for kv_cache
-    bmm1_scale : float
+    bmm1_scale : Union[float, torch.Tensor]
         fused scale for bmm1 input.
-    bmm2_scale : float
+        when using trtllm-gen backend, it can be a torch.Tensor with dtype torch.float32.
+    bmm2_scale : Union[float, torch.Tensor]
         fused scale for bmm2 input.
+        when using trtllm-gen backend, it can be a torch.Tensor with dtype torch.float32.
     batch_size : int
         batch size
     cum_seq_lens_q : torch.Tensor
@@ -3515,13 +3537,11 @@ def trtllm_batch_context_with_kv_cache(
     else:
         raise ValueError(f"Invalid out_dtype: {out_dtype}")
 
-    bmm1_scale = (
-        bmm1_scale.item() if isinstance(bmm1_scale, torch.Tensor) else bmm1_scale
-    )
-    bmm2_scale = (
-        bmm2_scale.item() if isinstance(bmm2_scale, torch.Tensor) else bmm2_scale
-    )
-
+    if isinstance(bmm1_scale, torch.Tensor):
+        assert bmm1_scale.dtype == torch.float32
+        bmm1_scale = bmm1_scale * log2e
+    if isinstance(bmm2_scale, torch.Tensor):
+        assert bmm2_scale.dtype == torch.float32
     workspace_size = workspace_buffer.numel() * workspace_buffer.element_size()
     run_func(
         out,
@@ -3553,3 +3573,84 @@ def trtllm_batch_context_with_kv_cache(
         if out_dtype != "nvfp4"
         else FP4Tensor(out, out_scale_factor, o_sf_start_index, query.shape)
     )
+
+
+@flashinfer_api
+def fmha_v2_prefill_deepseek(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    out: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    seq_len: int,
+    scale_softmax: float,
+    scale_bmm1: Optional[float] = None,
+    scale_bmm2: Optional[float] = None,
+    return_lse: bool = False,
+    lse: Optional[torch.Tensor] = None,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    """
+    Parameters
+    ----------
+    query : torch.Tensor
+        query tensor with shape [batch_size, seq_len, num_heads, head_dim]
+    key : torch.Tensor
+        key tensor with shape [batch_size, seq_len, num_heads, head_dim]
+    value : torch.Tensor
+        value tensor with shape [batch_size, seq_len, num_heads, head_dim]
+    out : torch.Tensor
+        output tensor with shape [batch_size, seq_len, num_heads, head_dim]
+    return_lse : bool
+        whether to return the log-sum-exp of attention output
+    num_heads : int
+        number of heads
+    head_dim : int
+        head dimension
+    seq_len : int
+        sequence length
+    scale_softmax : float
+        scale for softmax
+    scale_bmm1 : Optional[float]
+        scale for bmm1
+    scale_bmm2 : Optional[float]
+        scale for bmm2
+    lse : Optional[torch.Tensor]
+        log-sum-exp of attention output
+    Returns
+    -------
+    out: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        output torch.Tensor or Tuple[torch.Tensor, torch.Tensor].
+        If return_lse is True, the output will be a tuple of two tensors, the first is the output tensor, the second is the lse tensor.
+        If return_lse is False, the output will be a single tensor.
+    """
+    assert query.shape[3] == 192 and key.shape[3] == 192 and value.shape[3] == 128, (
+        "currently only support deepseek r1 192 query and 128 value"
+    )
+    module = get_trtllm_fmha_v2_module()
+    is_e4m3 = query.dtype == torch.float8_e4m3fn
+    is_bf16_output = out.dtype == torch.bfloat16
+    scale_softmax = (
+        scale_softmax if scale_softmax is not None else 1.0 if is_e4m3 else 0.0
+    )
+    scale_bmm1 = scale_bmm1 if scale_bmm1 is not None else 1.0
+    scale_bmm2 = scale_bmm2 if scale_bmm2 is not None else 1.0
+    module.run(
+        query,
+        key,
+        value,
+        out,
+        lse,
+        num_heads,
+        head_dim,
+        seq_len,
+        scale_softmax,
+        scale_bmm1,
+        scale_bmm2,
+        is_e4m3,
+        is_bf16_output,
+    )
+    if return_lse:
+        return out, lse
+    else:
+        return out

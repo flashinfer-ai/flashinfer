@@ -19,6 +19,7 @@ from typing import Optional, Tuple, Union
 
 import torch
 
+from .api_logging import flashinfer_api
 from .decode import get_batch_decode_module
 from .prefill import _compute_page_mask_indptr, get_batch_prefill_module
 from .quantization import segment_packbits
@@ -106,6 +107,7 @@ class BlockSparseAttentionWrapper:
     True
     """
 
+    @flashinfer_api
     def __init__(
         self,
         float_workspace_buffer: torch.Tensor,
@@ -184,6 +186,7 @@ class BlockSparseAttentionWrapper:
             pin_memory=True,
         )
 
+    @flashinfer_api
     def plan(
         self,
         indptr: torch.Tensor,
@@ -478,6 +481,7 @@ class BlockSparseAttentionWrapper:
         self._rope_theta = rope_theta
         return self.run(q, k, v, scale_q, scale_k, scale_v)
 
+    @flashinfer_api
     def run(
         self,
         q: torch.Tensor,
@@ -675,6 +679,7 @@ class VariableBlockSparseAttentionWrapper:
     >>> o = wrapper.run(q, k, v)
     """
 
+    @flashinfer_api
     def __init__(
         self,
         float_workspace_buffer: torch.Tensor,
@@ -747,6 +752,7 @@ class VariableBlockSparseAttentionWrapper:
             pin_memory=True,
         )
 
+    @flashinfer_api
     def plan(
         self,
         block_mask_map: torch.Tensor,
@@ -1015,6 +1021,7 @@ class VariableBlockSparseAttentionWrapper:
         self._rope_theta = rope_theta
         return self.run(q, k, v)
 
+    @flashinfer_api
     def run(
         self,
         q: torch.Tensor,
