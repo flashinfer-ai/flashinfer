@@ -9,29 +9,35 @@ def main():
     num_kv_heads = 1
     head_size = 128
     workspace_size = 256 * 1024 * 1024
-    batch_size = 2
 
     # Following the test exactly:
     # q_lens: number of query tokens
     # in_kv_lens: number of existing KV tokens  
     # seq_lens = q_lens + in_kv_lens (TOTAL tokens for which K/V must be in cache)
     q_lens = torch.tensor([1, 1], dtype=torch.int32)
-    in_kv_lens = torch.tensor([5, 5], dtype=torch.int32) 
+    in_kv_lens = torch.tensor([5, 5], dtype=torch.int32)
     seq_lens = q_lens + in_kv_lens  # Total = [6, 6]
+    batch_size = q_lens.size(0)
     
     # Create cumulative indices
-    cum_seq_lens_q = torch.cat([torch.tensor([0], dtype=torch.int32).cuda(), torch.cumsum(q_lens, dim=0).cuda()]).contiguous()
+    cum_seq_lens_q = torch.cat([
+        torch.tensor([0], dtype=torch.int32).cuda(),
+        torch.cumsum(q_lens.cuda(), dim=0, dtype=torch.int32)
+    ]).contiguous()
     
     # Calculate pages needed - based on TOTAL seq_lens
     page_per_seq = (seq_lens + page_size - 1) // page_size
-    cum_seq_lens_kv = torch.cat([torch.tensor([0], dtype=torch.int32).cuda(), torch.cumsum(page_per_seq, dim=0).cuda()]).contiguous()
+    cum_seq_lens_kv = torch.cat([
+        torch.tensor([0], dtype=torch.int32).cuda(), 
+        torch.cumsum(page_per_seq.cuda(), dim=0, dtype=torch.int32)
+    ]).contiguous()
     
-    print(f"q_lens: {q_lens}")
-    print(f"in_kv_lens: {in_kv_lens}")
-    print(f"seq_lens: {seq_lens}")
-    print(f"page_per_seq: {page_per_seq}")
-    print(f"cum_seq_lens_q: {cum_seq_lens_q}")
-    print(f"cum_seq_lens_kv: {cum_seq_lens_kv}")
+    print(f"q_lens: {q_lens} (device: {q_lens.device}, dtype: {q_lens.dtype})")
+    print(f"in_kv_lens: {in_kv_lens} (device: {in_kv_lens.device}, dtype: {in_kv_lens.dtype})")
+    print(f"seq_lens: {seq_lens} (device: {seq_lens.device}, dtype: {seq_lens.dtype})")
+    print(f"page_per_seq: {page_per_seq} (device: {page_per_seq.device}, dtype: {page_per_seq.dtype})")
+    print(f"cum_seq_lens_q: {cum_seq_lens_q} (device: {cum_seq_lens_q.device}, dtype: {cum_seq_lens_q.dtype})")
+    print(f"cum_seq_lens_kv: {cum_seq_lens_kv} (device: {cum_seq_lens_kv.device}, dtype: {cum_seq_lens_kv.dtype})")
     print()
     
     num_q_tokens = q_lens.sum().item()
@@ -41,7 +47,7 @@ def main():
     query = torch.ones(num_q_tokens, num_q_heads, head_size, dtype=dtype).cuda()
     kv_cache = torch.zeros(num_pages, 2, num_kv_heads, page_size, head_size, dtype=dtype).cuda()
     workspace = torch.zeros(workspace_size, dtype=torch.uint8).cuda()
-    block_tables = torch.tensor([[0], [1]], dtype=torch.int32).cuda()
+    block_tables = torch.tensor([[i] for i in range(batch_size)], dtype=torch.int32).cuda()
     
     # Fill KV cache for ALL positions (0 to seq_lens-1 for each batch)
     # Batch 0 uses page 0, batch 1 uses page 1
@@ -93,6 +99,7 @@ def main():
     print("Expected for causal: Each query attends to all previous + itself")
     print("Batch 0, token 0: attends to [0,1,2,3,4,5] -> avg = 2.5")
     print("Batch 1, token 0: attends to [0,1,2,3,4,5] -> avg = 2.5")
+    print("Batch 2, token 0: attends to [0,1,2,3,4,5] -> avg = 2.5")
 
 
 if __name__ == "__main__":
