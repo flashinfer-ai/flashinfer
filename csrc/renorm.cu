@@ -15,6 +15,7 @@
  */
 #include <flashinfer/sampling.cuh>
 
+#include "sampling_utils.h"
 #include "tvm_ffi_utils.h"
 
 using namespace flashinfer;
@@ -27,6 +28,7 @@ void top_p_renorm_probs(TensorView probs, TensorView renorm_probs,
   CHECK_DIM(2, probs);  // probs: (batch_size, vocab_size)
   unsigned int batch_size = probs.size(0);
   unsigned int vocab_size = probs.size(1);
+  check_tensor_param(maybe_top_p_arr, probs);
   bool has_top_p_arr = maybe_top_p_arr.has_value();
 
   ffi::CUDADeviceGuard device_guard(probs.device().device_id);
@@ -45,6 +47,7 @@ void top_k_renorm_probs(TensorView probs, TensorView renorm_probs,
   CHECK_DIM(2, probs);  // probs: (batch_size, vocab_size)
   unsigned int batch_size = probs.size(0);
   unsigned int vocab_size = probs.size(1);
+  check_tensor_param(maybe_top_k_arr, probs);
   bool has_top_k_arr = maybe_top_k_arr.has_value();
 
   ffi::CUDADeviceGuard device_guard(probs.device().device_id);
@@ -64,6 +67,7 @@ void top_k_mask_logits(TensorView logits, TensorView mask_logits,
   CHECK_DIM(2, logits);  // logits: (batch_size, vocab_size)
   unsigned int batch_size = logits.size(0);
   unsigned int vocab_size = logits.size(1);
+  check_tensor_param(maybe_top_k_arr, logits);
   bool has_top_k_arr = maybe_top_k_arr.has_value();
 
   ffi::CUDADeviceGuard device_guard(logits.device().device_id);

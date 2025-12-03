@@ -37,6 +37,8 @@ void BatchMLAPagedAttentionRun(TensorView float_workspace_buffer, TensorView int
   // q_pe: [n, num_heads, head_dim_kpe]
   // ckv_cache: [num_pages, page_size, head_dim_ckv]
   // kpe_cache: [num_pages, page_size, head_dim_kpe]
+  CHECK_INPUT_TYPE(kv_indices, dl_int32);
+
   MLAPlanInfo plan_info;
   plan_info.FromVector(std::vector<int64_t>(plan_info_vec.begin(), plan_info_vec.end()));
 

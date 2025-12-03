@@ -251,18 +251,6 @@ class BatchMLAPagedAttentionWrapper:
         use_profiler : bool, optional
             Whether to enable intra-kernel profiler, default is False.
         """
-
-        for tensor, name in [
-            (kv_len_arr, "kv_len_arr"),
-            (kv_indptr, "kv_indptr"),
-            (qo_indptr, "qo_indptr"),
-            (kv_indices, "kv_indices"),
-        ]:
-            if tensor.dtype != torch.int32:
-                raise ValueError(
-                    f"Expected {name}.dtype == torch.int32, got {tensor.dtype}"
-                )
-
         self._cached_module = get_batch_mla_module(
             self._backend,
             q_data_type,

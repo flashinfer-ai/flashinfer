@@ -904,16 +904,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         The :meth:`plan` method cannot be used in Cuda Graph or in ``torch.compile``.
         """
-        for tensor, name in [
-            (indptr, "indptr"),
-            (indices, "indices"),
-            (last_page_len, "last_page_len"),
-        ]:
-            if tensor.dtype != torch.int32:
-                raise ValueError(
-                    f"{name} must have dtype torch.int32, got {tensor.dtype}"
-                )
-
         self._workspace_size = (
             self._float_workspace_buffer.numel()
             * self._float_workspace_buffer.element_size()
@@ -1673,16 +1663,6 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
         :meth:`run_return_lse` calls, auxiliary data structures will be created
         during this call and cached for multiple run calls.
         """
-        for tensor, name in [
-            (indptr, "indptr"),
-            (indices, "indices"),
-            (last_page_len, "last_page_len"),
-        ]:
-            if tensor.dtype != torch.int32:
-                raise ValueError(
-                    f"{name} must have dtype torch.int32, got {tensor.dtype}"
-                )
-
         batch_size = len(last_page_len)
         if logits_soft_cap is None:
             logits_soft_cap = 0.0

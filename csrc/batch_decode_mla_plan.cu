@@ -15,6 +15,8 @@ Array<int64_t> BatchDecodeWithPagedKVCachePlanMLA(TensorView float_workspace_buf
                                                   TensorView indptr, int64_t batch_size,
                                                   int64_t num_qo_heads, int64_t page_size,
                                                   bool enable_cuda_graph) {
+  CHECK_INPUT_TYPE(indptr, dl_int32);
+
   ffi::CUDADeviceGuard device_guard(float_workspace_buffer.device().device_id);
   const cudaStream_t stream = get_stream(float_workspace_buffer.device());
 
