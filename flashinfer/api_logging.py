@@ -635,28 +635,6 @@ def _log_system_info():
         # PyTorch version
         lines.append(f"PyTorch version: {torch.__version__}")
 
-        # cuDNN/cuBLAS/cuBLASLt logging status
-        if _API_LOG_LEVEL >= 8:
-            lines.append("")
-            lines.append("cuDNN/cuBLAS/cuBLASLt Logging: Enabled (Level 8)")
-            cublas_info = os.environ.get("CUBLAS_LOGINFO_DBG", "not set")
-            cublas_dest = os.environ.get("CUBLAS_LOGDEST_DBG", "not set")
-            cublaslt_level = os.environ.get("CUBLASLT_LOG_LEVEL", "not set")
-            cublaslt_file = os.environ.get("CUBLASLT_LOG_FILE", "not set")
-            cudnn_level = os.environ.get("CUDNN_LOGLEVEL_DBG", "not set")
-            cudnn_dest = os.environ.get("CUDNN_LOGDEST_DBG", "not set")
-            cudnn_fe_info = os.environ.get("CUDNN_FRONTEND_LOG_INFO", "not set")
-            cudnn_fe_file = os.environ.get("CUDNN_FRONTEND_LOG_FILE", "not set")
-
-            lines.append(f"  CUBLAS_LOGINFO_DBG={cublas_info}")
-            lines.append(f"  CUBLAS_LOGDEST_DBG={cublas_dest}")
-            lines.append(f"  CUBLASLT_LOG_LEVEL={cublaslt_level}")
-            lines.append(f"  CUBLASLT_LOG_FILE={cublaslt_file}")
-            lines.append(f"  CUDNN_LOGLEVEL_DBG={cudnn_level}")
-            lines.append(f"  CUDNN_LOGDEST_DBG={cudnn_dest}")
-            lines.append(f"  CUDNN_FRONTEND_LOG_INFO={cudnn_fe_info}")
-            lines.append(f"  CUDNN_FRONTEND_LOG_FILE={cudnn_fe_file}")
-
     except Exception as e:
         lines.append(f"Error gathering system information: {e}")
 
@@ -847,10 +825,7 @@ def _format_value(value: Any, level: int, indent: int = 0) -> str:
 def _get_default_params(func: Callable, args: tuple, kwargs: dict) -> dict:
     """
         Extract parameters that have default values but were not explicitly provided.
-    <<<<<<< HEAD
-    =======
 
-    >>>>>>> 92c15f7 (Adding benchmark. Applying pre-commit)
         Parameters
         ----------
         func : Callable
