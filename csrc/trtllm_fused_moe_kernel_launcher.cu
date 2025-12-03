@@ -827,6 +827,12 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
     TVM_FFI_ICHECK_EQ(gemm1_weights.dtype(), dl_float8_e4m3fn) << "gemm1_weights must be fp8.";
     TVM_FFI_ICHECK_EQ(gemm2_weights.dtype(), dl_float8_e4m3fn) << "gemm2_weights must be fp8.";
 
+    if (static_cast<RoutingMethodType>(routing_method_type) ==
+                     RoutingMethodType::DeepSeekV3)
+    {
+      TVM_FFI_ICHECK_EQ(routing_logits.dtype(), dl_float32) << "routing_logits must be float for DeepSeekV3 Routing method.";
+    }
+
     TVM_FFI_ICHECK_EQ(gemm1_weights_scale.dtype(), dl_float32)
         << "gemm1_weights_scale must be float.";
     TVM_FFI_ICHECK_EQ(gemm1_weights_scale.ndim(), 3) << "gemm1_weights_scale must be 3D.";
