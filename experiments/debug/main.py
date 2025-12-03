@@ -6,7 +6,7 @@ from flashinfer.prefill import trtllm_batch_context_with_kv_cache
 
 def ref_batch_decode_with_paged_kv_cache(
     query, kv_cache, block_tables, seq_lens, cum_seq_lens_q, cum_seq_lens_kv, 
-    max_q_len, max_kv_len, dtype=torch.bfloat16
+    max_q_len, max_kv_len, dtype=torch.bfloat16, is_causal=False
 ):
     """
     Reference implementation of batch decode with paged KV cache.
@@ -20,6 +20,7 @@ def ref_batch_decode_with_paged_kv_cache(
         cum_seq_lens_kv: [batch_size + 1] - cumulative KV lengths
         max_q_len: max query length
         max_kv_len: max KV length
+        is_causal: whether to apply causal masking (for prefill phase)
     
     Returns:
         output: [num_q_tokens, num_q_heads, head_size] - attention output
@@ -95,6 +96,36 @@ def ref_batch_decode_with_paged_kv_cache(
         # Compute scores: [num_q_heads, q_len, kv_len]
         scores = torch.matmul(q_reshaped, k.transpose(1, 2)) / (head_size ** 0.5)
         
+        # Apply causal mask if needed (for prefill phase)
+        if is_causal:
+            # Create causal mask: position i can only attend to positions <= i (in KV)
+            # scores shape: [num_q_heads, q_len, kv_len]
+            # For prefill, KV indices go from 0 to kv_len-1, but we need to know their actual positions
+            # In prefill with paged cache, the KV includes both existing context + new tokens
+            # The q tokens can attend to all KV tokens up to their position
+            
+            # Create causal mask [q_len, kv_len]
+            # KV indices 0..kv_len-1 correspond to the KV context
+            # Q indices start from kv_len (they are added after KV)
+            # But since we're doing prefill, Q tokens are part of the sequence being processed
+            # Causal means Q at position i can attend to KV at position <= i
+            
+            # For now: KV tokens are from 0..kv_len-1, Q tokens are interleaved
+            # In prefill, position of q[i] = kv_len + i (it comes after KV)
+            # So q[i] can attend to KV[0..min(kv_len-1, kv_len+i)]
+            # But also q[i] can attend to q[0..i] (other query tokens)
+            
+            # Simpler: assume causal mask between Q and KV+Q
+            # KV has indices 0..kv_len-1, Q has indices kv_len..kv_len+q_len-1
+            # q[i] (actual position kv_len+i) can attend to KV[0..kv_len-1] and Q[0..i]
+            
+            causal_mask = torch.zeros((q_len, kv_len), device=scores.device, dtype=torch.bool)
+            # For prefill: all query tokens can attend to all KV tokens (they come before)
+            causal_mask.fill_(True)
+            
+            # Convert to attention mask
+            scores = scores.masked_fill(~causal_mask.unsqueeze(0), float('-inf'))
+        
         # Apply softmax: [num_q_heads, q_len, kv_len]
         attn_weights = F.softmax(scores, dim=-1)
         
@@ -121,39 +152,61 @@ def main():
     workspace_size = 256 * 1024 * 1024
 
     q_lens = torch.tensor([1, 2], dtype=torch.int32).cuda()
-    kv_lens = torch.tensor([33, 44], dtype=torch.int32).cuda()
+    kv_lens = torch.tensor([3, 4], dtype=torch.int32).cuda()
     cum_seq_lens_q = torch.cat([torch.tensor([0], dtype=torch.int32).cuda(), torch.cumsum(q_lens, dim=0)]).cuda()
+    
+    # Calculate pages per sequence (not tokens per sequence!)
+    import math
     cum_seq_lens_kv = torch.cat([torch.tensor([0], dtype=torch.int32).cuda(), torch.cumsum(kv_lens, dim=0)]).cuda()
+    
     seq_lens = q_lens + kv_lens
+    
+    print(f"q_lens: {q_lens}")
+    print(f"kv_lens (tokens): {kv_lens}")
+    print(f"seq_lens (q+kv): {seq_lens}")
+    print(f"cum_seq_lens_q: {cum_seq_lens_q}")
+    print(f"cum_seq_lens_kv: {cum_seq_lens_kv}")
+    print()
     max_q_len = q_lens.max().item()
     num_q_tokens = q_lens.sum().item()
     query = torch.ones(num_q_tokens, num_q_heads, head_size, dtype=dtype).cuda()
-    kv_cache = torch.randn(num_pages, 2, num_kv_heads, page_size, head_size, dtype=dtype).cuda()
+    kv_cache = torch.zeros(num_pages, 2, num_kv_heads, page_size, head_size, dtype=dtype).cuda()
     workspace = torch.empty(workspace_size, dtype=torch.uint8).cuda()
     block_tables = torch.tensor([[0], [1]], dtype=torch.int32).cuda()
     max_seq_len = seq_lens.max().item()
     kv_layout = "HND"
 
-    decode_output = trtllm_batch_decode_with_kv_cache(
-        query=query,
-        kv_cache=kv_cache,
-        workspace_buffer=workspace,
-        block_tables=block_tables,
-        seq_lens=seq_lens,
-        max_kv_len=max_seq_len,
-        kv_layout=kv_layout,
-        backend='trtllm-gen',
-        max_q_len=max_q_len,
-        cum_seq_lens_q=cum_seq_lens_q,
-        cum_seq_lens_kv=cum_seq_lens_kv
-    )
+    # set the key/value in kv_cache for testing
+    kv_cache[:, 0, :, 0, :] = 1.0
+    kv_cache[:, 0, :, 1, :] = 1.0
+    kv_cache[:, 0, :, 2, :] = 1.0
+    kv_cache[:, 0, :, 3, :] = 1.0
+
+    kv_cache[:, 1, :, 0, :] = 1.0
+    kv_cache[:, 1, :, 1, :] = 2.0
+    kv_cache[:, 1, :, 2, :] = 3.0
+    kv_cache[:, 1, :, 3, :] = 4.0
+
     # print(query)
     # print(kv_cache)
-    print("Decode output:")
-    print(decode_output)
+
+    # decode_output = trtllm_batch_decode_with_kv_cache(
+    #     query=query,
+    #     kv_cache=kv_cache,
+    #     workspace_buffer=workspace,
+    #     block_tables=block_tables,
+    #     seq_lens=seq_lens,
+    #     max_kv_len=max_seq_len,
+    #     kv_layout=kv_layout,
+    #     backend='trtllm-gen',
+    #     max_q_len=max_q_len,
+    #     cum_seq_lens_q=cum_seq_lens_q,
+    #     cum_seq_lens_kv=cum_seq_lens_kv
+    # )
+    # print("Decode output:")
+    # print(decode_output)
 
     prefill_output = trtllm_batch_context_with_kv_cache(
-        batch_size=batch_size,
         query=query,
         kv_cache=kv_cache,
         workspace_buffer=workspace,
@@ -166,9 +219,12 @@ def main():
         cum_seq_lens_kv=cum_seq_lens_kv,
         bmm1_scale=1.0,
         bmm2_scale=1.0,
+        batch_size=batch_size,
     )
-    print("Prefill output:")
-    print(prefill_output)
+    print(f"Prefill output shape: {prefill_output.shape}")
+    print("Prefill output (first 5 dims of each batch):")
+    for b in range(prefill_output.shape[0]):
+        print(f"  Batch {b}: {prefill_output[b, 0, 0]}")
 
     expected_output = ref_batch_decode_with_paged_kv_cache(
         query=query,
@@ -179,7 +235,8 @@ def main():
         cum_seq_lens_kv=cum_seq_lens_kv,
         max_q_len=max_q_len,
         max_kv_len=max_seq_len,
-        dtype=dtype
+        dtype=dtype,
+        is_causal=True  # Prefill phase uses causal masking
     )
     print("Ref output:")
     print(expected_output)
