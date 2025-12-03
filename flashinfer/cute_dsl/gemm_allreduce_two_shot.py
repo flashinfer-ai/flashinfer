@@ -8,7 +8,8 @@ import cutlass.cute as cute
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils
-import cutlass.utils.distributed_helpers as distributed_helpers
+import cutlass.utils.distributed as distributed
+
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.typing import (
     Int32,
@@ -18,6 +19,32 @@ from cutlass.cute.typing import (
     Float8E4M3FN,
     Float8E5M2,
 )
+
+def spin_lock_multimem_arrive(lock_ptr: Pointer, loc=None, ip=None) -> None:
+    """
+    arrive a spin lock when the lock_ptr is a multimem address.
+    """
+    distributed.multimem_red_relaxed_gpu_add1(lock_ptr, loc=loc, ip=ip)
+
+def sm_wise_inter_gpu_multimem_barrier(
+    barrier: Pointer, barrier_mc: Pointer, num_ranks, loc=None, ip=None
+) -> None:
+    """
+    barrier for inter-gpu sm-wise
+    """
+    bidx, bidy, bidz = cute.arch.block_idx()
+    bdimx, bdimy, _ = cute.arch.grid_dim()
+    pid = bidx + bidy * bdimx + bidz * bdimx * bdimy
+    distributed.multimem_red_release_sys_add1(barrier_mc + pid, loc=loc, ip=ip)
+    cute.arch.fence_proxy(cute.arch.ProxyKind.alias)
+    
+    # v4.3.1 does not have mem_order="acquire" variant in `distributed` module
+    #rewrite using https://github.com/NVIDIA/cutlass/blob/52ae719eda738e665e95cf4fa99409a7a650dd5c/python/CuTeDSL/cutlass/utils/distributed_helpers.py#L70 or
+    #https://github.com/NVIDIA/cutlass/blob/v4.3.1/python/CuTeDSL/cutlass/utils/distributed.py#L300
+    #distributed.spin_lock_wait(
+    #    barrier + pid, num_ranks, mem_order="acquire", mem_scope="sys", loc=loc, ip=ip
+    #)
+
 
 
 """
@@ -1231,7 +1258,7 @@ class PersistentDenseGemmKernel:
                         with cute.arch.elect_one():
                             flag = barrier_flag_mc.iterator + tile_id
                             cute.arch.fence_acq_rel_gpu()
-                            distributed_helpers.spin_lock_multimem_arrive(flag)
+                            spin_lock_multimem_arrive(flag)
                             cute.arch.fence_proxy(cute.arch.ProxyKind.alias)
 
                 #
@@ -1321,7 +1348,7 @@ class PersistentDenseGemmKernel:
                         with cute.arch.elect_one():
                             flag = barrier_flag.iterator + tile_id
                             # TODO: we may use LDG+STG for spin lock instead of ATOMIC_CAS for better performance.
-                            distributed_helpers.spin_lock_wait(flag, num_ranks)
+                            distributed.spin_lock_atom_cas_relaxed_wait(flag, expected_val=num_ranks, reset_val=0, scope="gpu")
 
                     cute.arch.barrier(
                         barrier_id=self.all_reduce_sync_bar_id,
@@ -1357,31 +1384,31 @@ class PersistentDenseGemmKernel:
                             x, y, z, w = 0, 0, 0, 0
                             if cutlass.const_expr(self.c_dtype == Float16):
                                 x, y, z, w = (
-                                    distributed_helpers.multimem_ld_reduce_8xf16(mc_ptr)
+                                    distributed.multimem_ld_reduce_8xf16(mc_ptr)
                                 )
                             elif cutlass.const_expr(self.c_dtype == Float32):
                                 x, y, z, w = (
-                                    distributed_helpers.multimem_ld_reduce_4xf32(mc_ptr)
+                                    distributed.multimem_ld_reduce_4xf32(mc_ptr)
                                 )
                             elif cutlass.const_expr(self.c_dtype == BFloat16):
                                 x, y, z, w = (
-                                    distributed_helpers.multimem_ld_reduce_8xbf16(
+                                    distributed.multimem_ld_reduce_8xbf16(
                                         mc_ptr
                                     )
                                 )
                             elif cutlass.const_expr(self.c_dtype == Float8E4M3FN):
                                 x, y, z, w = (
-                                    distributed_helpers.multimem_ld_reduce_16xe4m3(
+                                    distributed.multimem_ld_reduce_16xe4m3(
                                         mc_ptr
                                     )
                                 )
                             elif cutlass.const_expr(self.c_dtype == Float8E5M2):
                                 x, y, z, w = (
-                                    distributed_helpers.multimem_ld_reduce_16xe5m2(
+                                    distributed.multimem_ld_reduce_16xe5m2(
                                         mc_ptr
                                     )
                                 )
-                            distributed_helpers.multimem_st_4xb32(mc_ptr, x, y, z, w)
+                            distributed.multimem_st_4xb32(mc_ptr, x, y, z, w)
                     # Advance to next tile
                     tile_sched.advance_to_next_work()
                     work_tile = tile_sched.get_current_work()
@@ -1396,7 +1423,7 @@ class PersistentDenseGemmKernel:
                 ) * cute.size(self.cluster_shape_mn)
                 if warp_idx == self.all_reduce_warp_id[0]:
                     with cute.arch.elect_one():
-                        distributed_helpers.sm_wise_inter_gpu_multimem_barrier(
+                        sm_wise_inter_gpu_multimem_barrier(
                             barrier_flag.iterator + last_flag_idx,
                             barrier_flag_mc.iterator + last_flag_idx,
                             self.num_ranks,
