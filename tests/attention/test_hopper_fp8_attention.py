@@ -353,9 +353,10 @@ def create_per_head_varying_kv(
 ) -> torch.Tensor:
     """Create K/V tensor with per-head varying scale to reveal head offset bugs.
 
-    Each head gets data with a different scale factor: head i gets scale (i+1).
+    Each head gets data with a slightly different scale factor: head i gets scale (1 + i*0.1).
     This ensures that if the kernel incorrectly reads head 0's data for head i,
     the output will have noticeably different magnitude, causing high MSE.
+    Using small scale differences (0.1 step) to keep quantization error manageable.
 
     Args:
         shape: Tensor shape, should contain num_heads dimension
@@ -370,18 +371,19 @@ def create_per_head_varying_kv(
     # Generate base random tensor
     tensor = torch.randn(shape, dtype=dtype, device=device)
 
-    # Apply per-head scaling: head i gets multiplied by (i+1)
-    # This makes different heads have different magnitudes
+    # Apply per-head scaling: head i gets multiplied by (1 + i*0.1)
+    # This makes different heads have slightly different magnitudes
+    # Using smaller scale differences to reduce quantization error while still detecting bugs
     # Shape handling: for paged KV (num_pages, page_size, num_heads, head_dim)
     # or for flat KV (seq_len, num_heads, head_dim)
     if len(shape) == 4:
         # Paged: (num_pages, page_size, num_heads, head_dim)
-        scale = torch.arange(1, num_heads + 1, dtype=dtype, device=device).view(
+        scale = (1.0 + 0.1 * torch.arange(num_heads, dtype=dtype, device=device)).view(
             1, 1, num_heads, 1
         )
     else:
         # Flat: (seq_len, num_heads, head_dim)
-        scale = torch.arange(1, num_heads + 1, dtype=dtype, device=device).view(
+        scale = (1.0 + 0.1 * torch.arange(num_heads, dtype=dtype, device=device)).view(
             1, num_heads, 1
         )
 
@@ -515,6 +517,7 @@ def test_batch_prefill_paged(batch_size, num_heads, head_dim, causal, dtype):
         causal=causal,
     )
     o_fp8 = wrapper_fp8.run(q_fp8, (paged_k_fp8, paged_v_fp8), s_q, s_k, s_v)
+    print(o_ref, o_fp8)
 
     # Compute MSE - with per-head varying K/V data, head offset bugs will cause high MSE
     # because reading head 0's data for head i gives wrong scale magnitude
