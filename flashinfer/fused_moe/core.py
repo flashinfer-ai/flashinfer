@@ -132,6 +132,7 @@ def trtllm_gen_dtype_has_scale(dtype: DtypeTrtllmGen) -> bool:
         DtypeTrtllmGen.E2m1,
         DtypeTrtllmGen.MxE2m1,
         DtypeTrtllmGen.MxE4m3,
+        DtypeTrtllmGen.MxInt4,
     ]:
         return True
     else:
