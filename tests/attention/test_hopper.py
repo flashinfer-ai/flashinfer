@@ -434,7 +434,7 @@ def test_batch_prefill_with_paged_kv_cache_multi_item_scoring_fa3(
             97,
             81,
             [16, 16],
-            list(range(80)) + [0] + [0] * 16 + list(range(76)) + [0],
+            list(range(80)) + [0] * 17 + list(range(76)) + [0] * 5,
             97,
             [79, 75],
         ),
