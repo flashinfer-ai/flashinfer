@@ -529,8 +529,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         :param cluster_shape_mn: Tuple (ClusterM, ClusterN) shape of the cluster.
         :type cluster_shape_mn: Tuple[int, int]
         """
-        assert sm_version == "sm_100", (
-            "sm_100 is the only supported SM version for cute-dsl backend."
+        supported_sm_versions = ["sm_100", "sm_103"]
+        assert sm_version in supported_sm_versions, (
+            f"{supported_sm_versions} are the only supported SM versions for cute-dsl backend, but encountered {sm_version}"
         )
 
         self.acc_dtype = cutlass.Float32
@@ -561,7 +562,12 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         self.cta_sync_bar_id = 0
         self.epilog_sync_bar_id = 1
         self.tmem_ptr_sync_bar_id = 2
-        self.smem_capacity = utils.get_smem_capacity_in_bytes(sm_version)
+
+        # HACK "sm_103" doesn't work yet for the query
+        # https://github.com/NVIDIA/cutlass/blob/5016493cc0d8650d5b2f6d2c2751cf49bc217e86/python/CuTeDSL/cutlass/utils/smem_allocator.py#L19
+        # self.smem_capacity = utils.get_smem_capacity_in_bytes(sm_version)
+        self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
+
         SM100_TMEM_CAPACITY_COLUMNS = 512
         self.num_tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
 
