@@ -199,6 +199,7 @@ def _dump_function_inputs(
     func_name: str,
     args: tuple,
     kwargs: dict,
+    self_id: Optional[int] = None,
 ) -> Optional[str]:
     """
     Dump function inputs to disk BEFORE execution (crash-safe).
@@ -219,6 +220,8 @@ def _dump_function_inputs(
         Positional arguments
     kwargs : dict
         Keyword arguments
+    self_id : Optional[int]
+        The id() of the 'self' object if this is a method call
 
     Returns
     -------
@@ -296,6 +299,9 @@ def _dump_function_inputs(
             },
             "execution_status": "inputs_saved",  # Will be updated to "completed" after outputs
         }
+
+        if self_id is not None:
+            metadata["self_id"] = self_id
 
         # Add tensor details for random generation fallback
         for key, tensor in input_tensors.items():
@@ -558,6 +564,7 @@ def replay_from_dump(
     compare_outputs: bool = False,
     device: str = "cuda",
     run: bool = False,
+    object_registry: Optional[Dict[int, Any]] = None,
 ) -> Any:
     """
     Replay a function call from a dumped directory.
@@ -583,6 +590,9 @@ def replay_from_dump(
         - "cuda:N": Load to specific CUDA device
     run : bool
         If True, try to resolve and execute the function
+    object_registry : Optional[Dict[int, Any]]
+        Registry of stateful objects mapped by their ID from the log.
+        Used to replay methods on the same object instance across calls.
 
     Returns
     -------
@@ -698,7 +708,65 @@ def replay_from_dump(
 
     if run:
         module_name = metadata.get("module")
-        func = _resolve_function(module_name, func_name)
+        self_id = metadata.get("self_id")
+
+        func = None
+        obj = None
+
+        # Stateful replay logic
+        if self_id is not None:
+            if func_name.endswith(".__init__"):
+                # This is a constructor call
+                # Resolution: Get the class and instantiate it
+                class_name = func_name.split(".")[
+                    -2
+                ]  # e.g. "Wrapper.__init__" -> "Wrapper"
+                cls_obj = _resolve_function(module_name, class_name)
+                if cls_obj and callable(cls_obj):
+                    # Instantiate: obj = Class(*args[1:], **kwargs)
+                    # Note: args[0] is 'self' placeholder in the dump for __init__, skip it
+                    real_args = args[1:] if len(args) > 0 else []
+                    try:
+                        _logger.info(f"Instantiating {class_name} (ID: {self_id})...")
+                        # We need to handle the case where __init__ is called.
+                        # The safest way is to just call the class constructor.
+                        # We assume the logged args match the constructor args.
+                        obj = cls_obj(*real_args, **kwargs)
+                        if object_registry is not None:
+                            object_registry[self_id] = obj
+                        # __init__ returns None, but effectively we returned the object
+                        execution_result = None
+                        result_dict["execution_result"] = execution_result
+
+                        # Since we successfully "ran" (instantiated), we can mark it done
+                        # But there is no output to compare for __init__ usually (returns None)
+                        if compare_outputs:
+                            result_dict["comparison_match"] = (
+                                True  # Trivial pass for __init__
+                            )
+                        return result_dict
+                    except Exception as e:
+                        _logger.error(f"Failed to instantiate {class_name}: {e}")
+                        result_dict["execution_error"] = str(e)
+                        return result_dict
+            else:
+                # Instance method call
+                if object_registry is not None and self_id in object_registry:
+                    obj = object_registry[self_id]
+                    method_name = func_name.split(".")[-1]
+                    if hasattr(obj, method_name):
+                        func = getattr(obj, method_name)
+                        # args[0] is 'self' placeholder, skip it
+                        args = args[1:] if len(args) > 0 else []
+                    else:
+                        _logger.warning(f"Object {obj} has no method {method_name}")
+                else:
+                    _logger.warning(
+                        f"Object ID {self_id} not found in registry. Creating new instance if possible? No."
+                    )
+
+        if func is None:
+            func = _resolve_function(module_name, func_name)
 
         if func:
             try:
@@ -786,6 +854,9 @@ def replay_sequence(root_dir: str, device: str = "cuda") -> list:
     total = len(dump_dirs)
     _logger.info(f"Found {total} dumps to replay from {root_dir}")
 
+    # Registry for stateful objects (mapped by id(self))
+    object_registry: Dict[int, Any] = {}
+
     for i, dump_dir in enumerate(dump_dirs):
         _logger.info(f"[{i + 1}/{total}] Replaying {dump_dir.name}...")
         try:
@@ -793,7 +864,11 @@ def replay_sequence(root_dir: str, device: str = "cuda") -> list:
             # and assume outputs are not necessarily present or we just want to verify it runs.
             # If outputs are present, we can compare.
             res = replay_from_dump(
-                str(dump_dir), compare_outputs=True, device=device, run=True
+                str(dump_dir),
+                compare_outputs=True,
+                device=device,
+                run=True,
+                object_registry=object_registry,
             )
             # Add dump_dir to the result for CLI reporting
             res["dump_dir"] = str(dump_dir)
@@ -1249,6 +1324,7 @@ def flashinfer_api(func: Callable = None) -> Callable:
         def wrapper(*args, **kwargs):
             # Determine function name (with class name if applicable)
             func_name = f.__name__
+            self_id = None
             if args and hasattr(args[0], "__class__"):
                 try:
                     class_name = args[0].__class__.__name__
@@ -1256,6 +1332,7 @@ def flashinfer_api(func: Callable = None) -> Callable:
                         "BatchMLAPagedAttentionWrapper"
                     ]:
                         func_name = f"{class_name}.{func_name}"
+                        self_id = id(args[0])
                 except Exception:
                     pass
 
@@ -1263,7 +1340,9 @@ def flashinfer_api(func: Callable = None) -> Callable:
             dump_dir = None
             if _API_LOG_LEVEL >= 10:
                 try:
-                    dump_dir = _dump_function_inputs(f, func_name, args, kwargs)
+                    dump_dir = _dump_function_inputs(
+                        f, func_name, args, kwargs, self_id=self_id
+                    )
                     if dump_dir:
                         _logger.debug(f"Inputs dumped to: {dump_dir}")
                 except Exception as e:
