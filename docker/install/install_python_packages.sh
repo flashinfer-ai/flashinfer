@@ -24,7 +24,8 @@ CUDA_VERSION=${1:-cu128}
 
 # Install torch with specific CUDA version first, followed by others in requirements.txt, and then others.
 # This is to ensure that the torch version is compatible with the CUDA version.
-pip3 install --force-reinstall torch --index-url https://download.pytorch.org/whl/${CUDA_VERSION}
+pip3 install torch --index-url https://download.pytorch.org/whl/${CUDA_VERSION} --dry-run
+pip3 install torch --index-url https://download.pytorch.org/whl/${CUDA_VERSION}
 pip3 install -r /install/requirements.txt
 pip3 install responses pytest scipy build cuda-python nvidia-nvshmem-cu12
 
