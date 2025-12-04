@@ -157,10 +157,36 @@ FlashInfer includes a "Flight Recorder" mode (Level 10) that captures inputs/out
     export FLASHINFER_DUMP_DIR=./my_dumps
 
     # Run your application
-    python my_app.py
+    python3 benchmarks/flashinfer_benchmark.py --routine mm_fp4 --m 4 --n 1024 --k 7168 --out_dtype bfloat16 --backends cudnn --use_128x4_sf_layout --use_nvfp4 --refcheck -vv --generate_repro_command --use_cupti --no_cuda_graph --num_iters 5
+    ... output redacted ...
 
     # Replay recorded calls
-    export FLASHINFER_LOGLEVEL=1 # 0 for pass/fail.
+    export FLASHINFER_LOGLEVEL=0 # 1 for more detailed replay results.
     flashinfer replay --dir ./my_dumps
     # or
     python -m flashinfer replay --dir ./my_dumps
+
+    [1] nvfp4_quantize (20251204_143216_802_nvfp4_quantize_call0001): ✅ Passed
+    [2] fp4_quantize (20251204_143216_868_fp4_quantize_call0001): ✅ Passed
+    [3] nvfp4_quantize (20251204_143216_949_nvfp4_quantize_call0002): ✅ Passed
+    [4] fp4_quantize (20251204_143217_003_fp4_quantize_call0002): ✅ Passed
+    [5] mm_fp4 (20251204_143217_178_mm_fp4_call0001): ✅ Passed
+    [6] mm_fp4 (20251204_143217_346_mm_fp4_call0002): ✅ Passed
+    [7] mm_fp4 (20251204_143217_427_mm_fp4_call0003): ✅ Passed
+    [8] mm_fp4 (20251204_143217_475_mm_fp4_call0004): ✅ Passed
+    [9] mm_fp4 (20251204_143217_510_mm_fp4_call0005): ✅ Passed
+    [10] mm_fp4 (20251204_143217_551_mm_fp4_call0006): ✅ Passed
+    [11] mm_fp4 (20251204_143217_591_mm_fp4_call0007): ✅ Passed
+    [12] mm_fp4 (20251204_143217_631_mm_fp4_call0008): ✅ Passed
+    [13] mm_fp4 (20251204_143217_672_mm_fp4_call0009): ✅ Passed
+    [14] mm_fp4 (20251204_143217_708_mm_fp4_call0010): ✅ Passed
+    [15] mm_fp4 (20251204_143217_769_mm_fp4_call0011): ✅ Passed
+    [16] mm_fp4 (20251204_143217_812_mm_fp4_call0012): ✅ Passed
+    [17] mm_fp4 (20251204_143217_852_mm_fp4_call0013): ✅ Passed
+    [18] mm_fp4 (20251204_143217_904_mm_fp4_call0014): ✅ Passed
+    [19] mm_fp4 (20251204_143218_153_mm_fp4_call0015): ✅ Passed
+    [20] mm_fp4 (20251204_143218_390_mm_fp4_call0016): ✅ Passed
+    [21] mm_fp4 (20251204_143218_627_mm_fp4_call0017): ✅ Passed
+    [22] mm_fp4 (20251204_143218_862_mm_fp4_call0018): ✅ Passed
+
+    Summary: 22 passed, 0 failed/mismatch

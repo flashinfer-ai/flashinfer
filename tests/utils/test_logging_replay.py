@@ -15,7 +15,7 @@ limitations under the License.
 """
 
 """
-Integration tests for Level 10 API logging with actual FlashInfer APIs.
+Tests for Level 10 API logging with actual FlashInfer APIs.
 
 This test suite verifies that Level 10 logging (tensor dumping) works correctly
 with all decorated FlashInfer APIs. For each API, we:
@@ -81,75 +81,36 @@ def verify_and_replay_dump(
     dump_dir, original_output, func_to_replay, expected_dumps=1, dump_idx=0
 ):
     """Helper to verify dump creation and replay functionality."""
-    from flashinfer.api_logging import replay_from_dump
-    import json
+    from flashinfer.api_logging import replay_sequence
 
-    # Verify dump was created
-    assert dump_dir.exists()
-    dumps = sorted(list(dump_dir.iterdir()))
+    # Replay sequence
+    results = replay_sequence(str(dump_dir), device="cuda")
 
-    # If checking for a specific function, filter dumps
+    # Filter results if checking for specific function
     if func_to_replay:
-        # Filter logic: Find dumps whose metadata function_name matches
-        filtered_dumps = []
         target_name = func_to_replay.__name__
-        for d in dumps:
-            meta_path = d / "metadata.json"
-            if meta_path.exists():
-                with open(meta_path, "r") as f:
-                    meta = json.load(f)
-                if meta.get("function_name") == target_name:
-                    filtered_dumps.append(d)
+        results = [
+            res
+            for res in results
+            if res.get("metadata", {}).get("function_name") == target_name
+        ]
 
-        # If we found matching dumps, use them. Otherwise fall back to all dumps (might fail assertion)
-        if filtered_dumps:
-            dumps = filtered_dumps
-            # If we filtered, reset expected_dumps if it was just '1' (default) to allow for cases
-            # where multiple calls happened but we only care about the last one if not specified.
-            # However, to be safe with existing tests, let's stick to strict checking if explicit.
-
-    # Relaxed check: Just ensure we found AT LEAST the expected number of dumps
-    assert len(dumps) >= expected_dumps, (
-        f"Expected at least {expected_dumps} dumps, found {len(dumps)}"
+    assert len(results) >= expected_dumps, (
+        f"Expected at least {expected_dumps} dumps, found {len(results)}"
     )
 
-    # Use the LAST dump by default if we have multiple and index is 0 (common case for 'verify the last call')
-    # But if dump_idx is specified, use that.
+    # Get the target result (usually the last one if multiple)
     if dump_idx == -1:
-        dump = dumps[-1]
+        result = results[-1]
     else:
-        # If dump_idx is 0 but we have multiple, we probably want the last one if expected_dumps was 1?
-        # Actually, for this specific failure (mm_fp4), we want the LAST one (mm_fp4),
-        # while previous ones were nvfp4_quantize.
-        # So let's pick the last one if we have more than expected.
-        dump = dumps[-1]
-
-    if (dump / "outputs.pt").exists():
-        assert (dump / "inputs.pt").exists()
-        assert (dump / "metadata.json").exists()
-
-    # Load dump with automatic execution (run=True)
-    replay_result = replay_from_dump(
-        str(dump), compare_outputs=True, device="cuda", run=True
-    )
+        result = results[dump_idx]
 
     # Verify comparison passed
-    assert replay_result["comparison_match"] is True
+    assert result["comparison_match"] is True
 
-    # Verify dumped output matches original (double check)
-    dumped_output = replay_result["expected_tensors"]["result"]
-    assert torch.allclose(original_output, dumped_output, atol=1e-5, rtol=1e-3)
-
-    # Verify execution result matches original
-    execution_result = replay_result["execution_result"]
+    # Verify execution result matches original (in-memory check)
+    execution_result = result["execution_result"]
     assert torch.allclose(original_output, execution_result, atol=1e-5, rtol=1e-3)
-
-    # Also test manual replay if func_to_replay provided (legacy check)
-    if func_to_replay:
-        replayed_output = func_to_replay(
-            *replay_result["args"], **replay_result["kwargs"]
-        )
-        assert torch.allclose(original_output, replayed_output, atol=1e-5, rtol=1e-3)
 
 
 def test_replay_sequence(level10_environment):
