@@ -2093,7 +2093,6 @@ def trtllm_batch_decode_with_kv_cache(
     mask: Optional[torch.Tensor] = None,
     max_q_len: Optional[int] = None,
     cum_seq_lens_q: Optional[torch.Tensor] = None,
-    cum_seq_lens_kv: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, FP4Tensor]:
     """
     Parameters
@@ -2347,7 +2346,6 @@ def trtllm_batch_decode_with_kv_cache(
             sinks,
             max_q_len,
             cum_seq_lens_q,
-            cum_seq_lens_kv,
         )
         print("TRTLLM GEN DECODE RUN DONE")
 

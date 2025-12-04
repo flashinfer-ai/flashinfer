@@ -165,7 +165,7 @@ void trtllm_paged_attention_launcher(
     runner_params.mMultiCtasKvMode = use_multi_block;
 
     runner_params.cumSeqLensQPtr = cum_seq_lens_q;
-    runner_params.cumSeqLensKvPtr = cum_seq_lens_kv;
+    runner_params.cumSeqLensKvPtr = nullptr;
 
     size_t max_batch_size = 8192;   // todo(Yingyi): get from dlfw
     size_t max_num_qo_heads = 256;  // todo(Yingyi): get from dlfw, in total 8MB
@@ -219,8 +219,7 @@ void trtllm_paged_attention_decode(
     int64_t o_sf_start_index, int64_t window_left, int64_t sparse_mla_top_k, int64_t sm_count,
     bool enable_pdl, int64_t workspace_size, Optional<TensorView> attention_sinks,
     Optional<int64_t> optional_max_q_len,
-    Optional<TensorView> cum_seq_lens_q,
-    Optional<TensorView> cum_seq_lens_kv
+    Optional<TensorView> cum_seq_lens_q
   ) {
   printf("running trtllm_paged_attention_decode\n");
   auto q_data_type = dl_dtype_to_tllm_data_type(query.dtype());
@@ -235,7 +234,6 @@ void trtllm_paged_attention_decode(
   int sum_seq_q;
   int num_qo_heads;
   int* cum_seq_lens_q_ptr = nullptr; 
-  int* cum_seq_lens_kv_ptr = nullptr;
   if (!optional_max_q_len.has_value()) {
     // each request has the same length
 
@@ -251,7 +249,6 @@ void trtllm_paged_attention_decode(
   } else {
     // each request has different length
     TVM_FFI_CHECK(cum_seq_lens_q.has_value(), "cum_seq_lens_q must be provided when max_q_len is provided");
-    TVM_FFI_CHECK(cum_seq_lens_kv.has_value(), "cum_seq_lens_kv must be provided when max_q_len is provided");
     // the shape of query: [sum_seq_q, num_qo_heads, head_dim_q]
     // the shape of cum_seq_lens_q: [batch_size + 1]
     batch_size = cum_seq_lens_q.value().size(0) - 1;
@@ -259,7 +256,6 @@ void trtllm_paged_attention_decode(
     num_qo_heads = query.size(1);
     max_q_len = optional_max_q_len.value();
     cum_seq_lens_q_ptr = static_cast<int*>(cum_seq_lens_q.value().data_ptr());
-    cum_seq_lens_kv_ptr = static_cast<int*>(cum_seq_lens_kv.value().data_ptr());
   }
   // Multiply by two for FP4 tensor as it is stored as UINT8 dtype. Assume the dim is even.
   int head_dim_k = is_4bit(kv_data_type) ? key_cache.size(-1) * 2 : key_cache.size(-1);
@@ -318,7 +314,7 @@ void trtllm_paged_attention_decode(
       workspace_buffer.data_ptr(), static_cast<int*>(block_tables.data_ptr()),
       static_cast<int*>(seq_lens.data_ptr()),
       cum_seq_lens_q_ptr,
-      cum_seq_lens_kv_ptr, attention_sinks_ptr, q_data_type, kv_data_type, o_data_type,
+      /*cum_seq_lens_kv_ptr*/nullptr, attention_sinks_ptr, q_data_type, kv_data_type, o_data_type,
       TllmPagedAttentionMode::ForGen, batch_size, max_q_len, max_kv_len,
       num_pages_in_mem_pool, num_qo_heads, num_kv_heads, head_dim_q, head_dim_o, page_size,
       kv_stride_keys_values, kv_stride_heads, kv_stride_batch, max_num_blocks_per_seq,

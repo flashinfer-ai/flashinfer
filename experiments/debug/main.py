@@ -82,7 +82,6 @@ def main():
         bmm1_scale=1.0,  # bmm1_scale
         bmm2_scale=1.0,  # bmm2_scale  
         cum_seq_lens_q=cum_seq_lens_q,
-        cum_seq_lens_kv=cum_seq_lens_kv,
         window_left=-1,  # window_left
         kv_layout="HND",
     )
