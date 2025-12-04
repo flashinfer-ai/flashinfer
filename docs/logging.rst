@@ -45,6 +45,10 @@ Logging Levels
      - Statistics
      - Level 3 + tensor statistics (min, max, mean, NaN/Inf counts)
      - Numerical analysis
+   * - **10**
+     - Flight Recorder
+     - Level 5 + dumps all input/output tensors to ``.pt`` files
+     - Full Reproducibility / Debugging
 
 Environment Variables
 ---------------------
@@ -63,11 +67,35 @@ Main Configuration
    * - ``FLASHINFER_LOGLEVEL``
      - int
      - 0
-     - Logging level (0, 1, 3, 5)
+     - Logging level (0, 1, 3, 5, 10)
    * - ``FLASHINFER_LOGDEST``
      - str
      - ``stdout``
      - Log destination: ``stdout``, ``stderr``, or file path
+
+Dump Configuration (Level 10)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 15 15 40
+
+   * - Variable
+     - Type
+     - Default
+     - Description
+   * - ``FLASHINFER_DUMP_DIR``
+     - str
+     - ``flashinfer_dumps``
+     - Directory to save dump files
+   * - ``FLASHINFER_DUMP_MAX_SIZE_GB``
+     - float
+     - 20
+     - Maximum size of dump directory in GB (Level 10 only)
+   * - ``FLASHINFER_DUMP_MAX_COUNT``
+     - int
+     - 1000
+     - Maximum number of API calls to dump
 
 Process ID Substitution
 ^^^^^^^^^^^^^^^^^^^^^^^^
@@ -116,3 +144,23 @@ Level 0 has zero overhead
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 At Level 0, the decorator returns the original function unchanged. No wrapper, no checks, no overhead.
+
+Flight Recorder & Replay
+------------------------
+
+FlashInfer includes a "Flight Recorder" mode (Level 10) that captures inputs/outputs for reproducibility.
+
+.. code-block:: bash
+
+    # Enable Flight Recorder (Metadata + Tensors)
+    export FLASHINFER_LOGLEVEL=10
+    export FLASHINFER_DUMP_DIR=./my_dumps
+
+    # Run your application
+    python my_app.py
+
+    # Replay recorded calls
+    export FLASHINFER_LOGLEVEL=1 # 0 for pass/fail.
+    flashinfer replay --dir ./my_dumps
+    # or
+    python -m flashinfer replay --dir ./my_dumps

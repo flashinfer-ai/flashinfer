@@ -25,6 +25,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, Tuple, Optional
 import contextlib
+import importlib
 import torch
 
 
@@ -96,6 +97,20 @@ _setup_logger()
 def _get_timestamp() -> str:
     """Get current timestamp in the format [YYYY-MM-DD HH:MM:SS]."""
     return datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
+
+
+def _warn_security_implications():
+    """Warn users about security implications of Level 10 logging."""
+    if _API_LOG_LEVEL >= 10:
+        print("=" * 80)
+        print(
+            "SECURITY WARNING: FlashInfer API Logging is set to Level 10 (Tensor Dumping).\n"
+            "This will dump ALL input and outputs including tensors for FlashInfer APIs to disk in\n"
+            "the configured dump directory. Ensure that you are NOT processing sensitive data\n"
+            "or that the dump directory is secure. To disable dumping, unset FLASHINFER_LOGLEVEL or\n"
+            "set it to below 10. For more information, see https://docs.flashinfer.ai/logging.html"
+        )
+        print("=" * 80)
 
 
 def _get_tensor_size_bytes(tensor: torch.Tensor) -> int:
@@ -257,7 +272,7 @@ def _dump_function_inputs(
             torch.save(input_tensors, dump_dir / "inputs.pt")
 
         # Create partial metadata (inputs only, outputs will be added later)
-        metadata = {
+        metadata: Dict[str, Any] = {
             "function_name": func_name,
             "module": func.__module__ if hasattr(func, "__module__") else "<unknown>",
             "call_sequence": call_seq,
@@ -271,6 +286,7 @@ def _dump_function_inputs(
                 "input_size_bytes": input_size,
                 "input_size_mb": input_size / (1024 * 1024),
             },
+            "tensor_details": {},  # Detailed shape/dtype/stride info for reconstruction
             "function_signature": str(inspect.signature(func))
             if hasattr(inspect, "signature")
             else "<unavailable>",
@@ -280,6 +296,15 @@ def _dump_function_inputs(
             },
             "execution_status": "inputs_saved",  # Will be updated to "completed" after outputs
         }
+
+        # Add tensor details for random generation fallback
+        for key, tensor in input_tensors.items():
+            metadata["tensor_details"][key] = {
+                "shape": list(tensor.shape),
+                "dtype": str(tensor.dtype),
+                "stride": list(tensor.stride()),
+                "device": str(tensor.device),
+            }
 
         # Try to get FlashInfer version
         try:
@@ -375,6 +400,17 @@ def _dump_function_outputs(dump_dir: str, result: Any) -> None:
             ] / (1024 * 1024)
             metadata["execution_status"] = "completed"
 
+            # Add output tensor details
+            if "tensor_details" not in metadata:
+                metadata["tensor_details"] = {}
+            for key, tensor in output_tensors.items():
+                metadata["tensor_details"][key] = {
+                    "shape": list(tensor.shape),
+                    "dtype": str(tensor.dtype),
+                    "stride": list(tensor.stride()),
+                    "device": str(tensor.device),
+                }
+
             # Save updated metadata
             with open(metadata_path, "w") as f:
                 json.dump(metadata, f, indent=2)
@@ -395,6 +431,26 @@ def _dump_function_outputs(dump_dir: str, result: Any) -> None:
         import traceback
 
         _logger.error(traceback.format_exc())
+
+
+def _generate_random_tensor(metadata: Dict[str, Any], device: str) -> torch.Tensor:
+    """Generate a random tensor based on metadata."""
+    shape = metadata.get("shape")
+    dtype_str = metadata.get("dtype", "torch.float16")
+
+    # Parse dtype
+    dtype_name = str(dtype_str).replace("torch.", "")
+    dtype = getattr(torch, dtype_name, torch.float16)
+
+    # Handle special types
+    if dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+        # Create float32/16 first then cast
+        t = torch.randn(shape, device=device, dtype=torch.float16)
+        return t.to(dtype)
+    elif dtype in [torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8]:
+        return torch.randint(low=0, high=10, size=shape, device=device, dtype=dtype)
+    else:
+        return torch.randn(shape, device=device, dtype=dtype)
 
 
 def _reconstruct_value(value: Any) -> Any:
@@ -426,8 +482,82 @@ def _reconstruct_value(value: Any) -> Any:
     return value
 
 
+def _resolve_function(module_name: str, function_name: str) -> Optional[Callable]:
+    """Resolve a function from module name and function name."""
+    try:
+        module = importlib.import_module(module_name)
+        # Handle nested function names (e.g. Class.method)
+        parts = function_name.split(".")
+        obj: Any = module
+        for part in parts:
+            obj = getattr(obj, part)
+        if not callable(obj):
+            return None
+        return obj
+    except Exception as e:
+        _logger.warning(
+            f"Could not resolve function {module_name}.{function_name}: {e}"
+        )
+        return None
+
+
+def _compare_results(
+    actual: Any, expected: Any, rtol: float = 1e-3, atol: float = 1e-3
+) -> bool:
+    """Recursively compare execution results."""
+    if isinstance(actual, torch.Tensor) and isinstance(expected, torch.Tensor):
+        # Check shape
+        if actual.shape != expected.shape:
+            _logger.warning(
+                f"Shape mismatch: actual {actual.shape} vs expected {expected.shape}"
+            )
+            return False
+        # Check dtype
+        if actual.dtype != expected.dtype:
+            _logger.warning(
+                f"Dtype mismatch: actual {actual.dtype} vs expected {expected.dtype}"
+            )
+            return False
+
+        # Check values
+        if not torch.allclose(actual, expected, rtol=rtol, atol=atol):
+            diff = (actual - expected).abs().max().item()
+            _logger.warning(f"Value mismatch: max diff {diff}")
+            return False
+        return True
+
+    elif isinstance(actual, (list, tuple)) and isinstance(expected, (list, tuple)):
+        if len(actual) != len(expected):
+            _logger.warning(
+                f"Length mismatch: actual {len(actual)} vs expected {len(expected)}"
+            )
+            return False
+        return all(
+            _compare_results(a, e, rtol, atol)
+            for a, e in zip(actual, expected, strict=True)
+        )
+
+    elif isinstance(actual, dict) and isinstance(expected, dict):
+        if actual.keys() != expected.keys():
+            _logger.warning(
+                f"Key mismatch: actual {actual.keys()} vs expected {expected.keys()}"
+            )
+            return False
+        return all(_compare_results(actual[k], expected[k], rtol, atol) for k in actual)
+
+    else:
+        # Fallback for other types (including None)
+        if actual != expected:
+            _logger.warning(f"Value mismatch: actual {actual} vs expected {expected}")
+            return False
+        return True
+
+
 def replay_from_dump(
-    dump_dir: str, compare_outputs: bool = False, device: str = "cuda"
+    dump_dir: str,
+    compare_outputs: bool = False,
+    device: str = "cuda",
+    run: bool = False,
 ) -> Any:
     """
     Replay a function call from a dumped directory.
@@ -437,7 +567,8 @@ def replay_from_dump(
     2. Loads inputs.safetensors to get input tensors
     3. Moves tensors to specified device (default: cuda)
     4. Reconstructs the function call
-    5. Optionally compares with saved outputs
+    5. Optionally executes the function (if run=True)
+    6. Optionally compares with saved outputs
 
     Parameters
     ----------
@@ -450,6 +581,8 @@ def replay_from_dump(
         - "cuda" (default): Load to cuda:0
         - "cpu": Load to CPU
         - "cuda:N": Load to specific CUDA device
+    run : bool
+        If True, try to resolve and execute the function
 
     Returns
     -------
@@ -458,21 +591,11 @@ def replay_from_dump(
         - 'args': Positional arguments (tensors on specified device)
         - 'kwargs': Keyword arguments (tensors on specified device)
         - 'metadata': Full metadata
+        - 'execution_result': Result of execution (if run=True)
+        - 'comparison_match': Boolean indicating if result matched expected (if run=True and compare_outputs=True)
         If compare_outputs=True, also includes:
         - 'expected_tensors': Expected output tensors
         - 'expected_metadata': Expected output metadata
-
-    Examples
-    --------
-    >>> # Load to cuda:0 (default)
-    >>> data = replay_from_dump("flashinfer_dumps/20251119_150823_mm_fp4_call0001/")
-    >>> result = mm_fp4(*data['args'], **data['kwargs'])
-    >>>
-    >>> # Load to specific device
-    >>> data = replay_from_dump("flashinfer_dumps/.../", device="cuda:1")
-    >>>
-    >>> # Load to CPU
-    >>> data = replay_from_dump("flashinfer_dumps/.../", device="cpu")
     """
     dump_path = Path(dump_dir)
     if not dump_path.exists():
@@ -493,6 +616,19 @@ def replay_from_dump(
     input_tensors = {}
     if inputs_path.exists():
         input_tensors = torch.load(str(inputs_path), map_location="cpu")
+    elif metadata.get("tensor_details"):
+        _logger.warning(
+            "inputs.pt not found. Generating random tensors from metadata..."
+        )
+        tensor_details = metadata["tensor_details"]
+        for key in metadata["tensor_info"]["input_tensor_keys"]:
+            if key in tensor_details:
+                # Generate random tensor
+                input_tensors[key] = _generate_random_tensor(
+                    tensor_details[key], device="cpu"
+                )
+            else:
+                _logger.warning(f"Missing details for tensor {key}, cannot generate.")
 
     # Move tensors to specified device (preserving stride)
     for key, tensor in input_tensors.items():
@@ -533,44 +669,136 @@ def replay_from_dump(
             if kwarg_name not in kwargs:  # Don't override tensor kwargs
                 kwargs[kwarg_name] = _reconstruct_value(input_metadata[key])
 
-    # Try to import and get the function
     _logger.info(f"Replaying {func_name} from {dump_dir}")
     _logger.info(f"  Args: {len(args)}, Kwargs: {list(kwargs.keys())}")
 
-    # The user needs to import the function themselves
-    # We just return the reconstructed inputs and metadata for manual replay
-    if not compare_outputs:
-        _logger.warning(
-            "Automatic function resolution not implemented. "
-            "Please manually call: your_function(*args, **kwargs) "
-            "where args and kwargs are loaded from the dump."
-        )
-        return {"args": args, "kwargs": kwargs, "metadata": metadata}
-    else:
-        # Load expected outputs (with stride/contiguity preserved)
+    result_dict = {"args": args, "kwargs": kwargs, "metadata": metadata}
+
+    # Load expected outputs if needed
+    expected_outputs = {}
+    output_metadata = {}
+    if compare_outputs:
         outputs_path = dump_path / "outputs.pt"
-        expected_outputs = {}
         if outputs_path.exists():
             expected_outputs = torch.load(str(outputs_path), map_location="cpu")
-
-            # Move output tensors to specified device (preserving stride)
+            # Move output tensors to specified device
             for key, tensor in expected_outputs.items():
                 expected_outputs[key] = tensor.to(device)
 
         output_metadata = metadata.get("output_metadata", {})
+        result_dict["expected_tensors"] = expected_outputs
+        result_dict["expected_metadata"] = output_metadata
 
+    if run:
+        module_name = metadata.get("module")
+        func = _resolve_function(module_name, func_name)
+
+        if func:
+            try:
+                _logger.info(f"Executing {module_name}.{func_name}...")
+                execution_result = func(*args, **kwargs)
+                result_dict["execution_result"] = execution_result
+
+                if compare_outputs:
+                    # Flatten execution result to dict for comparison
+                    actual_outputs = {}
+                    if isinstance(execution_result, torch.Tensor):
+                        actual_outputs["result"] = execution_result
+                    elif isinstance(execution_result, (tuple, list)):
+                        for i, item in enumerate(execution_result):
+                            if isinstance(item, torch.Tensor):
+                                actual_outputs[f"result_{i}"] = item
+                    elif isinstance(execution_result, dict):
+                        # If result is already a dict of tensors? Unlikely for FlashInfer but possible
+                        actual_outputs = execution_result
+
+                    # Compare tensors
+                    match = True
+                    if expected_outputs:
+                        match = _compare_results(actual_outputs, expected_outputs)
+
+                    result_dict["comparison_match"] = match
+                    if match:
+                        _logger.info("Replay comparison passed!")
+                    else:
+                        _logger.warning("Replay comparison FAILED.")
+
+            except Exception as e:
+                _logger.error(f"Execution failed: {e}")
+                import traceback
+
+                _logger.error(traceback.format_exc())
+                result_dict["execution_error"] = str(e)
+        else:
+            _logger.warning(
+                f"Skipping execution: could not resolve {module_name}.{func_name}"
+            )
+    elif not compare_outputs:
         _logger.warning(
-            "Automatic function resolution and comparison not implemented. "
-            "Returning inputs, expected outputs, and metadata for manual replay."
+            "Automatic function resolution disabled. "
+            "Pass run=True to execute, or manually call function."
         )
 
-        return {
-            "args": args,
-            "kwargs": kwargs,
-            "expected_tensors": expected_outputs,
-            "expected_metadata": output_metadata,
-            "metadata": metadata,
-        }
+    return result_dict
+
+
+def replay_sequence(root_dir: str, device: str = "cuda") -> list:
+    """
+    Replay a sequence of API calls from a root dump directory.
+
+    This function iterates through all dump directories in the root directory,
+    sorted by timestamp/sequence number, and replays them in order.
+
+    Parameters
+    ----------
+    root_dir : str
+        Path to the root directory containing dump subdirectories
+    device : str
+        Target device for execution (default: "cuda")
+
+    Returns
+    -------
+    list
+        List of results from replay_from_dump calls
+    """
+    root_path = Path(root_dir)
+    if not root_path.exists():
+        raise FileNotFoundError(f"Root dump directory not found: {root_dir}")
+
+    # Find all subdirectories that look like dumps
+    # Pattern: YYYYMMDD_HHMMSS_microseconds_funcname_callXXXX
+    dump_dirs = []
+    for item in root_path.iterdir():
+        if item.is_dir() and (item / "metadata.json").exists():
+            dump_dirs.append(item)
+
+    # Sort by directory name (which starts with timestamp)
+    dump_dirs.sort(key=lambda x: x.name)
+
+    results = []
+    total = len(dump_dirs)
+    _logger.info(f"Found {total} dumps to replay from {root_dir}")
+
+    for i, dump_dir in enumerate(dump_dirs):
+        _logger.info(f"[{i + 1}/{total}] Replaying {dump_dir.name}...")
+        try:
+            # We assume that for sequence replay, we want to EXECUTE the calls
+            # and assume outputs are not necessarily present or we just want to verify it runs.
+            # If outputs are present, we can compare.
+            res = replay_from_dump(
+                str(dump_dir), compare_outputs=True, device=device, run=True
+            )
+            # Add dump_dir to the result for CLI reporting
+            res["dump_dir"] = str(dump_dir)
+            results.append(res)
+        except Exception as e:
+            _logger.error(f"Failed to replay {dump_dir.name}: {e}")
+            # Continue with next dump? Or stop?
+            # Usually for flight recorder, we might want to continue or stop.
+            # Let's record error and continue.
+            results.append({"error": str(e), "dump_dir": str(dump_dir)})
+
+    return results
 
 
 def _log_system_info():
@@ -646,6 +874,7 @@ def _log_system_info():
 
 # Log system information once at module load time (if logging is enabled)
 _log_system_info()
+_warn_security_implications()
 
 
 def _format_value(value: Any, level: int, indent: int = 0) -> str:
@@ -824,20 +1053,20 @@ def _format_value(value: Any, level: int, indent: int = 0) -> str:
 
 def _get_default_params(func: Callable, args: tuple, kwargs: dict) -> dict:
     """
-        Extract parameters that have default values but were not explicitly provided.
+    Extract parameters that have default values but were not explicitly provided.
 
-        Parameters
-        ----------
-        func : Callable
-            The function being called
-        args : tuple
-            Positional arguments that were provided
-        kwargs : dict
-            Keyword arguments that were provided
-        Returns
-        -------
-        dict
-            Dictionary of parameter names to default values for parameters that were not provided
+    Parameters
+    ----------
+    func : Callable
+        The function being called
+    args : tuple
+        Positional arguments that were provided
+    kwargs : dict
+        Keyword arguments that were provided
+    Returns
+    -------
+    dict
+        Dictionary of parameter names to default values for parameters that were not provided
     """
     try:
         sig = inspect.signature(func)
@@ -957,7 +1186,7 @@ def flashinfer_api(func: Callable = None) -> Callable:
         - 1: Log function name only (logged BEFORE execution - crash-safe)
         - 3: Log function name + inputs/outputs with metadata (inputs logged BEFORE execution - crash-safe)
         - 5: Log function name + inputs/outputs with metadata + tensor statistics (inputs logged BEFORE execution - crash-safe)
-        - 8: Level 5 logging + automatically enable cuDNN/cuBLAS/cuBLASLt API logging
+        - 8: Level 5 logging + metadata-only dump (no tensor data saved)
         - 10: Level 8 logging + dump tensors to disk for reproducibility (preserves stride/contiguity)
 
     FLASHINFER_LOGDEST : str (default: "stdout")
