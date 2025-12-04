@@ -1901,7 +1901,7 @@ def gen_trtllm_fmha_v2_module() -> JitSpec:
     source_paths = kernel_paths + [binding_source_path]
 
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[8, 9, 10, 11, 12]
+        supported_major_versions=[12]
     )
     nvcc_flags.append(f"-I{jit_env.FLASHINFER_CSRC_DIR / 'fmha_v2'}")
     nvcc_flags.append("-Wno-deprecated-gpu-targets")
