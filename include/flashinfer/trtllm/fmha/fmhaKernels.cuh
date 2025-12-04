@@ -585,6 +585,7 @@ class TllmGenFmhaKernel {
     auto const& kernelMeta = mKernelMeta[metaIndex];
     CUmodule hmod{0};
     std::string kernelName(kernelMeta.mFuncName);
+    printf("Loading kernel: %s\n", kernelName.c_str());
 
     // Check if the module is already loaded.
     auto findModuleIter = mModules.find(kernelMeta.mFuncName);

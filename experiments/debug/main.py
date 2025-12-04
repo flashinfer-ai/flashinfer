@@ -1,5 +1,6 @@
 import torch
 from flashinfer.prefill import trtllm_batch_context_with_kv_cache
+from flashinfer.decode import trtllm_batch_decode_with_kv_cache
 
 
 def main():
@@ -14,8 +15,8 @@ def main():
     # q_lens: number of query tokens
     # in_kv_lens: number of existing KV tokens  
     # seq_lens = q_lens + in_kv_lens (TOTAL tokens for which K/V must be in cache)
-    q_lens = torch.tensor([1, 1], dtype=torch.int32)
-    in_kv_lens = torch.tensor([5, 5], dtype=torch.int32)
+    q_lens = torch.tensor([1, 1, 5], dtype=torch.int32)
+    in_kv_lens = torch.tensor([5, 5, 5], dtype=torch.int32)
     seq_lens = q_lens + in_kv_lens  # Total = [6, 6]
     batch_size = q_lens.size(0)
     
@@ -32,14 +33,6 @@ def main():
         torch.cumsum(page_per_seq.cuda(), dim=0, dtype=torch.int32)
     ]).contiguous()
     
-    print(f"q_lens: {q_lens} (device: {q_lens.device}, dtype: {q_lens.dtype})")
-    print(f"in_kv_lens: {in_kv_lens} (device: {in_kv_lens.device}, dtype: {in_kv_lens.dtype})")
-    print(f"seq_lens: {seq_lens} (device: {seq_lens.device}, dtype: {seq_lens.dtype})")
-    print(f"page_per_seq: {page_per_seq} (device: {page_per_seq.device}, dtype: {page_per_seq.dtype})")
-    print(f"cum_seq_lens_q: {cum_seq_lens_q} (device: {cum_seq_lens_q.device}, dtype: {cum_seq_lens_q.dtype})")
-    print(f"cum_seq_lens_kv: {cum_seq_lens_kv} (device: {cum_seq_lens_kv.device}, dtype: {cum_seq_lens_kv.dtype})")
-    print()
-    
     num_q_tokens = q_lens.sum().item()
     num_pages = page_per_seq.sum().item()
     
@@ -49,9 +42,6 @@ def main():
     workspace = torch.zeros(workspace_size, dtype=torch.uint8).cuda()
     block_tables = torch.tensor([[i] for i in range(batch_size)], dtype=torch.int32).cuda()
     
-    # Fill KV cache for ALL positions (0 to seq_lens-1 for each batch)
-    # Batch 0 uses page 0, batch 1 uses page 1
-    # Each batch has seq_lens[i] = 6 tokens
     k_cache = kv_cache[:, 0, :, :, :]
     v_cache = kv_cache[:, 1, :, :, :]
     
@@ -60,22 +50,10 @@ def main():
         for pos in range(seq_lens[batch_idx].item()):
             k_cache[page_idx, :, pos, :] = 1.0
             v_cache[page_idx, :, pos, :] = float(pos)
+            print(f"Batch {batch_idx} Pos {pos} set in page {page_idx}")
     
-    print(f"Query shape: {query.shape}")
-    print(f"KV cache shape: {kv_cache.shape}")
-    print(f"Block tables: {block_tables}")
-    print()
-    
-    # Debug print
-    for batch_idx in range(batch_size):
-        page_idx = block_tables[batch_idx, 0].item()
-        print(f"Batch {batch_idx}, Page {page_idx} - K/V for first 6 positions:")
-        for pos in range(6):
-            print(f"  pos {pos}: K={k_cache[page_idx, 0, pos, 0]:.1f}, V={v_cache[page_idx, 0, pos, 0]:.1f}")
-    print()
-    
-    # Call the function following test exactly
-    output = trtllm_batch_context_with_kv_cache(
+    # prefill
+    prefill_output = trtllm_batch_context_with_kv_cache(
         query=query.contiguous(),
         kv_cache=kv_cache,
         workspace_buffer=workspace,
@@ -91,15 +69,33 @@ def main():
         window_left=-1,  # window_left
         kv_layout="HND",
     )
-    
-    print(f"Output shape: {output.shape}")
+
+    # decode
+    decode_output = trtllm_batch_decode_with_kv_cache(
+        query=query.contiguous(),
+        kv_cache=kv_cache,
+        workspace_buffer=workspace,
+        block_tables=block_tables,
+        seq_lens=seq_lens.cuda(),
+        max_q_len=q_lens.max().item(),
+        max_kv_len=seq_lens.max().item(),
+        bmm1_scale=1.0,  # bmm1_scale
+        bmm2_scale=1.0,  # bmm2_scale  
+        cum_seq_lens_q=cum_seq_lens_q,
+        cum_seq_lens_kv=cum_seq_lens_kv,
+        window_left=-1,  # window_left
+        kv_layout="HND",
+    )
+
+    print("Prefill Output:")
     for b in range(batch_size):
-        print(f"Batch {b}: {output[b, 0, 0]:.2f}")
+        print(f"Batch {b}: {prefill_output[b, 0, 0]:.2f}")
     print()
-    print("Expected for causal: Each query attends to all previous + itself")
-    print("Batch 0, token 0: attends to [0,1,2,3,4,5] -> avg = 2.5")
-    print("Batch 1, token 0: attends to [0,1,2,3,4,5] -> avg = 2.5")
-    print("Batch 2, token 0: attends to [0,1,2,3,4,5] -> avg = 2.5")
+
+    print("Decode Output:")
+    for b in range(batch_size):
+        print(f"Batch {b}: {decode_output[b, 0, 0]:.2f}")   
+    print()
 
 
 if __name__ == "__main__":
