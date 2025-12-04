@@ -16,10 +16,13 @@ limitations under the License.
 
 import pytest
 import torch
-
+import pynvml
 from flashinfer.comm.mapping import Mapping
+from flashinfer.comm.mnnvl import MnnvlMemory
 
 import flashinfer.comm.trtllm_moe_alltoall as trtllm_moe_alltoall
+
+pynvml.nvmlInit()
 
 
 @pytest.fixture(autouse=True, scope="session")
@@ -89,6 +92,10 @@ def make_payload(num_tokens, vector_dim, dtype):
 @pytest.mark.parametrize(
     "num_tokens,vector_dim,num_experts,top_k",
     SINGLE_GPU_PARAMS,
+)
+@pytest.mark.skipif(
+    not MnnvlMemory.supports_mnnvl(),
+    reason="Mnnvl memory is not supported on this platform",
 )
 def test_moe_alltoall_single_gpu(num_tokens, vector_dim, num_experts, top_k):
     """Test MOE alltoall communication on single GPU."""
@@ -551,6 +558,10 @@ def test_moe_combine_multi_rank_single_gpu(
         )
 
 
+@pytest.mark.skipif(
+    not MnnvlMemory.supports_mnnvl(),
+    reason="Mnnvl memory is not supported on this platform",
+)
 def test_moe_workspace_size_per_rank():
     """Test the workspace size per rank for the MoeAlltoAll operation."""
     ep_size = 8
