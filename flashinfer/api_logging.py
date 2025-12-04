@@ -46,7 +46,7 @@ def _substitute_process_id(path: str) -> str:
 _API_LOG_LEVEL = int(os.environ.get("FLASHINFER_LOGLEVEL", "0"))
 _API_LOG_DEST = _substitute_process_id(os.environ.get("FLASHINFER_LOGDEST", "stdout"))
 
-# Level 10 tensor dumping configuration
+# Configuration for Level 10 tensor dumping
 _DUMP_DIR = os.environ.get("FLASHINFER_DUMP_DIR", "flashinfer_dumps")
 _DUMP_MAX_SIZE_GB = float(os.environ.get("FLASHINFER_DUMP_MAX_SIZE_GB", "20"))
 _DUMP_MAX_COUNT = int(os.environ.get("FLASHINFER_DUMP_MAX_COUNT", "1000"))
@@ -110,6 +110,7 @@ def _warn_security_implications():
             "or that the dump directory is secure. To disable dumping, unset FLASHINFER_LOGLEVEL or\n"
             "set it to below 10. For more information, see https://docs.flashinfer.ai/logging.html"
         )
+        print(f"Current dump directory is: {_DUMP_DIR}")
         print("=" * 80)
 
 
@@ -120,7 +121,10 @@ def _get_tensor_size_bytes(tensor: torch.Tensor) -> int:
 
 def _serialize_value(value: Any) -> Any:
     """
-    Convert a value to a JSON-serializable format for metadata.
+    Convert a non-tensor value to a JSON-serializable format for metadata.
+
+    This function is intended for serializing non-tensor arguments/values
+    that are used in API input or output metadata. Tensor arguments are not handled here.
     """
     try:
         if isinstance(value, torch.dtype):
@@ -177,7 +181,6 @@ def _extract_tensors_and_metadata(
     for i, arg in enumerate(args):
         key = f"arg_{i}"
         if isinstance(arg, torch.Tensor):
-            # Move to CPU while preserving stride information
             tensors[key] = arg.cpu()
         else:
             metadata[key] = _serialize_value(arg)
@@ -186,7 +189,6 @@ def _extract_tensors_and_metadata(
     for key, value in kwargs.items():
         kwarg_key = f"kwarg_{key}"
         if isinstance(value, torch.Tensor):
-            # Move to CPU while preserving stride information
             tensors[kwarg_key] = value.cpu()
         else:
             metadata[kwarg_key] = _serialize_value(value)
@@ -207,7 +209,7 @@ def _dump_function_inputs(
     This function:
     1. Extracts tensors and metadata from inputs
     2. Creates a timestamped directory
-    3. Saves inputs.safetensors and partial metadata.json
+    3. Saves inputs.pt and partial metadata.json
     4. Tracks cumulative size and count limits
 
     Parameters
@@ -230,7 +232,6 @@ def _dump_function_inputs(
     """
     global _dump_count, _dump_total_size_bytes
 
-    # Check count limit
     if _dump_count >= _DUMP_MAX_COUNT:
         _logger.warning(
             f"Dump limit reached ({_DUMP_MAX_COUNT} dumps). Skipping dump for {func_name}. "
@@ -300,6 +301,7 @@ def _dump_function_inputs(
             "execution_status": "inputs_saved",  # Will be updated to "completed" after outputs
         }
 
+        # Add self_id to metadata if it is a class method call
         if self_id is not None:
             metadata["self_id"] = self_id
 
@@ -439,26 +441,6 @@ def _dump_function_outputs(dump_dir: str, result: Any) -> None:
         _logger.error(traceback.format_exc())
 
 
-def _generate_random_tensor(metadata: Dict[str, Any], device: str) -> torch.Tensor:
-    """Generate a random tensor based on metadata."""
-    shape = metadata.get("shape")
-    dtype_str = metadata.get("dtype", "torch.float16")
-
-    # Parse dtype
-    dtype_name = str(dtype_str).replace("torch.", "")
-    dtype = getattr(torch, dtype_name, torch.float16)
-
-    # Handle special types
-    if dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
-        # Create float32/16 first then cast
-        t = torch.randn(shape, device=device, dtype=torch.float16)
-        return t.to(dtype)
-    elif dtype in [torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8]:
-        return torch.randint(low=0, high=10, size=shape, device=device, dtype=dtype)
-    else:
-        return torch.randn(shape, device=device, dtype=dtype)
-
-
 def _reconstruct_value(value: Any) -> Any:
     """
     Reconstruct special types from metadata format.
@@ -511,6 +493,7 @@ def _compare_results(
     actual: Any, expected: Any, rtol: float = 1e-3, atol: float = 1e-3
 ) -> bool:
     """Recursively compare execution results."""
+    # torch.Tensor comparison
     if isinstance(actual, torch.Tensor) and isinstance(expected, torch.Tensor):
         # Check shape
         if actual.shape != expected.shape:
@@ -525,13 +508,14 @@ def _compare_results(
             )
             return False
 
-        # Check values
+        # Check values; apply relative and absolute tolerance.
         if not torch.allclose(actual, expected, rtol=rtol, atol=atol):
             diff = (actual - expected).abs().max().item()
             _logger.warning(f"Value mismatch: max diff {diff}")
             return False
         return True
 
+    # list/tuple comparison
     elif isinstance(actual, (list, tuple)) and isinstance(expected, (list, tuple)):
         if len(actual) != len(expected):
             _logger.warning(
@@ -543,6 +527,7 @@ def _compare_results(
             for a, e in zip(actual, expected, strict=True)
         )
 
+    # dict comparison
     elif isinstance(actual, dict) and isinstance(expected, dict):
         if actual.keys() != expected.keys():
             _logger.warning(
@@ -551,8 +536,8 @@ def _compare_results(
             return False
         return all(_compare_results(actual[k], expected[k], rtol, atol) for k in actual)
 
+    # fallback for other types (including None). Just do a naive comparison.
     else:
-        # Fallback for other types (including None)
         if actual != expected:
             _logger.warning(f"Value mismatch: actual {actual} vs expected {expected}")
             return False
@@ -571,7 +556,7 @@ def replay_from_dump(
 
     This function:
     1. Loads metadata.json to get function info
-    2. Loads inputs.safetensors to get input tensors
+    2. Loads inputs.pt to get input tensors
     3. Moves tensors to specified device (default: cuda)
     4. Reconstructs the function call
     5. Optionally executes the function (if run=True)
@@ -621,26 +606,16 @@ def replay_from_dump(
 
     func_name = metadata["function_name"]
 
-    # Load input tensors (with stride/contiguity preserved)
+    # Load input tensors
     inputs_path = dump_path / "inputs.pt"
-    input_tensors = {}
-    if inputs_path.exists():
-        input_tensors = torch.load(str(inputs_path), map_location="cpu")
-    elif metadata.get("tensor_details"):
-        _logger.warning(
-            "inputs.pt not found. Generating random tensors from metadata..."
-        )
-        tensor_details = metadata["tensor_details"]
-        for key in metadata["tensor_info"]["input_tensor_keys"]:
-            if key in tensor_details:
-                # Generate random tensor
-                input_tensors[key] = _generate_random_tensor(
-                    tensor_details[key], device="cpu"
-                )
-            else:
-                _logger.warning(f"Missing details for tensor {key}, cannot generate.")
+    if not inputs_path.exists():
+        # Could consider generating random tensors from metadata if needed.
+        # for now, just raise an error.
+        raise FileNotFoundError(f"inputs.pt not found in {dump_dir}")
 
-    # Move tensors to specified device (preserving stride)
+    input_tensors = torch.load(str(inputs_path), map_location="cpu")
+
+    # Move tensors to specified device
     for key, tensor in input_tensors.items():
         input_tensors[key] = tensor.to(device)
 
@@ -662,7 +637,8 @@ def replay_from_dump(
             idx = int(key.split("_")[1])
             max_arg_idx = max(max_arg_idx, idx)
 
-    # Reconstruct positional args in order
+    # Reconstruct positional args in order so that we can replay
+    # the function call exactly as it was logged.
     for i in range(max_arg_idx + 1):
         key = f"arg_{i}"
         if key in input_tensors:
@@ -674,7 +650,7 @@ def replay_from_dump(
             _logger.warning(f"Missing argument {i} in dump.")
             args.append(None)
 
-    # Add keyword arguments
+    # Add keyword arguments. Here the ordering is not important.
     for key in input_tensors.keys():
         if key.startswith("kwarg_"):
             kwarg_name = key.replace("kwarg_", "")
@@ -713,7 +689,8 @@ def replay_from_dump(
         func = None
         obj = None
 
-        # Stateful replay logic
+        # Stateful replay logic for class methods calls.
+        # Necessary for wrapped classes like BatchDecodeWithPagedKVCacheWrapper.
         if self_id is not None:
             if func_name.endswith(".__init__"):
                 # This is a constructor call
@@ -841,7 +818,7 @@ def replay_sequence(root_dir: str, device: str = "cuda") -> list:
         raise FileNotFoundError(f"Root dump directory not found: {root_dir}")
 
     # Find all subdirectories that look like dumps
-    # Pattern: YYYYMMDD_HHMMSS_microseconds_funcname_callXXXX
+    # Pattern: YYYYMMDD_HHMMSS_milliseconds_funcname_callXXXX
     dump_dirs = []
     for item in root_path.iterdir():
         if item.is_dir() and (item / "metadata.json").exists():
@@ -874,10 +851,8 @@ def replay_sequence(root_dir: str, device: str = "cuda") -> list:
             res["dump_dir"] = str(dump_dir)
             results.append(res)
         except Exception as e:
-            _logger.error(f"Failed to replay {dump_dir.name}: {e}")
-            # Continue with next dump? Or stop?
-            # Usually for flight recorder, we might want to continue or stop.
             # Let's record error and continue.
+            _logger.error(f"Failed to replay {dump_dir.name}: {e}")
             results.append({"error": str(e), "dump_dir": str(dump_dir)})
 
     return results
@@ -1254,6 +1229,9 @@ def _log_function_outputs(func_name: str, result: Any, level: int) -> None:
 def flashinfer_api(func: Callable = None) -> Callable:
     """
     Decorator to FlashInfer's APIs.
+
+    .. warning::
+        This API logging feature is experimental and may change in future versions.
 
     Currently logs input and output values of the function using Python's logging library.
     This decorator integrates with Python's standard logging infrastructure while

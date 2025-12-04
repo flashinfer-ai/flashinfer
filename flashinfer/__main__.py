@@ -400,7 +400,7 @@ def replay_cmd(dump_dir):
         click.secho(f"❌ Directory not found: {dump_dir}", fg="red")
         return
 
-    # Check if this is a single dump or a session root
+    # Check if this is a single dump or a session / sequence root
     is_single_dump = os.path.exists(os.path.join(dump_dir, "metadata.json"))
 
     try:
@@ -418,7 +418,7 @@ def replay_cmd(dump_dir):
             else:
                 click.secho("⚠️  Replay finished but outputs did not match", fg="yellow")
         else:
-            # Session replay
+            # Session / sequence replay
             click.secho(f"Replaying session from {dump_dir}...", fg="cyan")
             results = replay_sequence(dump_dir, device=device)
 
