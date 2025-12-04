@@ -111,9 +111,12 @@ def gen_xqa_module(
     if has_sm90:
         sources.append(jit_env.FLASHINFER_CSRC_DIR / "xqa/mha_sm90.cu")
         sources.append(jit_env.FLASHINFER_CSRC_DIR / "xqa/tensorMap.cpp")
+        flag_sm90_mha = ["-DUSE_SM90_MHA=1"]
+    else:
+        flag_sm90_mha = ["-DUSE_SM90_MHA=0"]
 
     return gen_jit_spec(
-        f"xqa_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_output_{filename_safe_dtype_map[output_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}_use_spec_dec_{use_spec_dec}",
+        f"xqa_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_output_{filename_safe_dtype_map[output_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}_use_spec_dec_{use_spec_dec}_spec_q_seq_len_{q_seq_len}",
         sources,
         extra_cuda_cflags=xqa_nvcc_flags
         + sm_nvcc_flags
@@ -125,7 +128,8 @@ def gen_xqa_module(
         + flag_sliding_window
         + flag_low_prec_output
         + flag_spec_dec
-        + flag_mla_wrapper,
+        + flag_mla_wrapper
+        + flag_sm90_mha,
         extra_ldflags=["-lcuda"],  # Add CUDA Driver API library
     )
 
