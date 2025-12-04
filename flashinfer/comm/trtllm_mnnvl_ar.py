@@ -75,24 +75,28 @@ class MNNVLAllreduceFusionWorkspace:
             ), (
                 "max_num_tokens, hidden_dim, and dtype must be provided if buffer_size_in_bytes is not provided."
             )
+
+            # If the user want to explictly use one-shot pass the threshold, which requires larger workspace size,
+            # We expect the user to set workspace size manually.
+            elem_size = torch.tensor([], dtype=dtype).element_size()
+            oneshot_max_num_tokens = min(
+                MNNVL_ONE_SHOT_THRESHOLD // (mapping.tp_size * elem_size * hidden_dim),
+                max_num_tokens,
+            )
             one_shot_size_bytes = self.get_required_buffer_size_bytes(
                 mapping.tp_size,
-                max_num_tokens,
+                oneshot_max_num_tokens,
                 hidden_dim,
                 dtype,
                 MNNVLAllreduceFusionStrategy.ONESHOT,
             )
-            if max_num_tokens > MNNVL_ONE_SHOT_THRESHOLD:
-                two_shot_size_bytes = self.get_required_buffer_size_bytes(
-                    mapping.tp_size,
-                    max_num_tokens,
-                    hidden_dim,
-                    dtype,
-                    MNNVLAllreduceFusionStrategy.TWOSHOT,
-                )
-            else:
-                two_shot_size_bytes = 0
-
+            two_shot_size_bytes = self.get_required_buffer_size_bytes(
+                mapping.tp_size,
+                max_num_tokens,
+                hidden_dim,
+                dtype,
+                MNNVLAllreduceFusionStrategy.TWOSHOT,
+            )
             # We don't do roundup here as it will happen at the allocation.
             buffer_size_in_bytes = max(one_shot_size_bytes, two_shot_size_bytes)
         else:
