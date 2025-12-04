@@ -167,33 +167,24 @@ def get_mnnvl_moe_alltoall_module():
         return module.moe_a2a_get_metainfo_index_pairs()
 
     @register_custom_op(
-        "flashinfer::moe_a2a_get_workspace_size_per_rank",
+        "flashinfer::moe_a2a_get_aux_data_size",
         mutates_args=[],
     )
-    def moe_a2a_get_workspace_size_per_rank(
+    def moe_a2a_get_aux_data_size(
         ep_size: int,
         max_num_tokens: int,
-        total_dispatch_payload_size_per_token: int,
-        combine_payload_size_per_token: int,
     ):
         """
-        Get the workspace size per rank for the MoeAlltoAll operation.
+        Get the auxilary datasize per rank for the MoeAlltoAll operation.
 
         Args:
             ep_size: Total expert parallel size
             max_num_tokens: Maximum number of tokens across all ranks
-            total_dispatch_payload_size_per_token: The size of the payload per token in the dispatch phase. This should be the sum of all payloads tensors.
-            combine_payload_size_per_token: The size of the payload per token in the combine phase.
 
         Returns:
-            workspace_size_per_rank: Size of the workspace per rank in bytes
+            aux_data_size: Size of the auxilary data per rank in bytes
         """
-        return module.moe_a2a_get_workspace_size_per_rank(
-            ep_size,
-            max_num_tokens,
-            total_dispatch_payload_size_per_token,
-            combine_payload_size_per_token,
-        )
+        return module.moe_a2a_get_aux_data_size(ep_size, max_num_tokens)
 
     return SimpleNamespace(
         moe_a2a_initialize=moe_a2a_initialize,
@@ -201,7 +192,7 @@ def get_mnnvl_moe_alltoall_module():
         moe_a2a_combine=moe_a2a_combine,
         moe_a2a_sanitize_expert_ids=moe_a2a_sanitize_expert_ids,
         moe_a2a_get_metainfo_index_pairs=moe_a2a_get_metainfo_index_pairs,
-        moe_a2a_get_workspace_size_per_rank=moe_a2a_get_workspace_size_per_rank,
+        moe_a2a_get_aux_data_size=moe_a2a_get_aux_data_size,
     )
 
 
@@ -351,11 +342,31 @@ def moe_a2a_get_workspace_size_per_rank(
     total_dispatch_payload_size_per_token: int,
     combine_payload_size_per_token: int,
 ):
-    return get_mnnvl_moe_alltoall_module().moe_a2a_get_workspace_size_per_rank(
+    """
+    Get the workspace size per rank for the MoeAlltoAll operation.
+
+    Args:
+        ep_size: Total expert parallel size
+        max_num_tokens: Maximum number of tokens across all ranks
+        total_dispatch_payload_size_per_token: The size of the payload per token in the dispatch phase. This should be the sum of all payloads.
+        combine_payload_size_per_token: The size of the payload per token in the combine phase.
+
+    Returns:
+        workspace_size_per_rank: Size of the workspace per rank in bytes
+    """
+    aux_data_size = get_mnnvl_moe_alltoall_module().moe_a2a_get_aux_data_size(
         ep_size,
         max_num_tokens,
-        total_dispatch_payload_size_per_token,
-        combine_payload_size_per_token,
+    )
+
+    def pad_up(x, y):
+        return ((x + y - 1) // y) * y
+
+    # Pad to 128 bytes to ensure alignment. This matches the implementation of C++ torch OP code.
+    return (
+        pad_up(aux_data_size, 128)
+        + pad_up(ep_size * max_num_tokens * total_dispatch_payload_size_per_token, 128)
+        + pad_up(ep_size * max_num_tokens * combine_payload_size_per_token, 128)
     )
 
 
@@ -408,6 +419,48 @@ class MoeAlltoAll:
             }
             return cls._WORKSPACE_CACHE[key]
 
+    @staticmethod
+    def get_moe_workspace_size_per_rank(
+        ep_size: int,
+        top_k: int,
+        max_num_tokens: int,
+        hidden_size: int,
+        extra_payload_bytes_per_token: int = 0,
+    ) -> int:
+        """
+        Convenience wrapper to calculate the workspace size per rank for the MoeAlltoAll operation. Automatically calculates the size of the dispatch and combine payloads when using default values.
+        This allocates space assuming 16-bit float, which may overallocate for quantized models. For a tighter bound, use the base function `moe_a2a_get_workspace_size_per_rank` directly.
+
+        Args:
+            ep_size: Total expert parallel size
+            top_k: Number of experts per token
+            max_num_tokens: Maximum number of tokens across all ranks
+            hidden_size: Hidden dimension size
+            extra_payload_size_per_token: Extra size per token in the payload
+        Returns:
+            workspace_size_per_rank: Size of the workspace per rank in bytes
+        """
+        # Default to 16-bit hidden states which should work in all cases.
+        element_size = 2
+
+        # Dispatch needs workspace for hidden states, token_selected_experts, token_final_scales
+        total_dispatch_payload_size_per_token = (
+            int(hidden_size * element_size)  # (Unquantized) token hidden states
+            + top_k * 4  # token_selected_experts
+            + top_k * 4  # token_final_scales
+            + extra_payload_bytes_per_token  # extra payload bytes per token
+        )
+
+        # Requires space for hidden states
+        combine_payload_size_per_token = int(hidden_size * element_size)
+
+        return moe_a2a_get_workspace_size_per_rank(
+            ep_size,
+            max_num_tokens,
+            total_dispatch_payload_size_per_token,
+            combine_payload_size_per_token,
+        )
+
     # Metainfo index constants (loaded dynamically from C++)
     # These offsets allow accessing internal workspace data for testing/debugging
     _METAINFO_INDEX: Optional[dict] = None
@@ -437,7 +490,8 @@ class MoeAlltoAll:
         max_num_tokens: int,
         top_k: int,
         num_experts: int,
-        workspace_size_per_rank: int = 512 * 1024 * 1024,
+        workspace_size_per_rank: int = None,
+        hidden_size: int = None,
         mnnvl_config: Optional[MnnvlConfig] = None,
     ):
         """
@@ -448,10 +502,20 @@ class MoeAlltoAll:
             max_num_tokens: Maximum number of tokens supported
             top_k: Number of experts per token
             num_experts: Total number of experts
-            workspace_size_per_rank: Size of workspace per rank in bytes (default: 512MB)
+            workspace_size_per_rank: Size of workspace per rank in bytes, if None hidden_size must be provided
+            hidden_size: Hidden dimension size used when calculating the workspace size, if workspace_size_per_rank is not provided
+            mnnvl_config: Used to configure the communication backend for the MNNVL memory object
         """
         # Initialize constants from C++
         self._init_constants()
+
+        if workspace_size_per_rank is None:
+            assert hidden_size is not None, (
+                "hidden_size must be provided if workspace_size_per_rank is not provided"
+            )
+            workspace_size_per_rank = self.get_moe_workspace_size_per_rank(
+                mapping.moe_ep_size, top_k, max_num_tokens, hidden_size
+            )
 
         # Initialize MNNVL memory system
         MnnvlMemory.initialize()

@@ -551,5 +551,57 @@ def test_moe_combine_multi_rank_single_gpu(
         )
 
 
+def test_moe_workspace_size_per_rank():
+    """Test the workspace size per rank for the MoeAlltoAll operation."""
+    ep_size = 8
+    num_tokens = 10
+    hidden_size = 128
+    topk = 2
+    raw_workspace_size = trtllm_moe_alltoall.moe_a2a_get_workspace_size_per_rank(
+        ep_size,
+        num_tokens,
+        (hidden_size * torch.bfloat16.itemsize + topk * 4 + topk * 4),
+        hidden_size * torch.bfloat16.itemsize,
+    )
+    assert raw_workspace_size > 0
+
+    moe_workspace_size = (
+        trtllm_moe_alltoall.MoeAlltoAll.get_moe_workspace_size_per_rank(
+            ep_size, topk, num_tokens, hidden_size
+        )
+    )
+    assert moe_workspace_size == raw_workspace_size
+
+    empty_workspace_size = trtllm_moe_alltoall.moe_a2a_get_workspace_size_per_rank(
+        ep_size, num_tokens, 0, 0
+    )
+
+    assert empty_workspace_size > 0
+    assert (
+        empty_workspace_size
+        == trtllm_moe_alltoall.get_mnnvl_moe_alltoall_module().moe_a2a_get_aux_data_size(
+            ep_size, num_tokens
+        )
+    )
+
+    non_empty_workspace_size = trtllm_moe_alltoall.moe_a2a_get_workspace_size_per_rank(
+        ep_size, num_tokens, hidden_size, hidden_size
+    )
+
+    actual_data_size = non_empty_workspace_size - empty_workspace_size
+    assert actual_data_size == hidden_size * ep_size * num_tokens * 2
+
+    mapping = Mapping(rank=0, world_size=1)
+    moe_a2a = trtllm_moe_alltoall.MoeAlltoAll(
+        mapping, num_tokens, topk, ep_size, hidden_size=hidden_size
+    )
+    raw_workspace_size = (
+        trtllm_moe_alltoall.MoeAlltoAll.get_moe_workspace_size_per_rank(
+            mapping.moe_ep_size, topk, num_tokens, hidden_size
+        )
+    )
+    assert moe_a2a.workspace_size_per_rank == raw_workspace_size
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

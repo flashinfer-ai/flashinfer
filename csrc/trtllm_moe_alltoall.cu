@@ -87,15 +87,9 @@ fi_throughput::MoeA2ADataOffsets calculateOffsets(int epSize, int maxNumTokens) 
   return offsets;
 }
 
-int64_t getMoeA2AWorkspaceSizePerRank(int64_t epSize, int64_t maxNumTokens,
-                                      int64_t totalDispatchSizePerToken,
-                                      int64_t combineSizePerToken) {
-  int64_t metadata_size =
-      calculateOffsets(static_cast<int>(epSize),
-                       static_cast<int>(maxNumTokens))[fi_throughput::PAYLOAD_DATA_OFFSET_INDEX];
-  int64_t payload_size = maxNumTokens * totalDispatchSizePerToken;
-  int64_t combine_size = maxNumTokens * combineSizePerToken;
-  return alignOffset(metadata_size + payload_size) + alignOffset(combine_size);
+int64_t getMoeA2AAuxDataSize(int64_t epSize, int64_t maxNumTokens) {
+  return calculateOffsets(static_cast<int>(epSize),
+                          static_cast<int>(maxNumTokens))[fi_throughput::PAYLOAD_DATA_OFFSET_INDEX];
 }
 
 Tensor moeA2AInitializeOp(TensorView workspace, int64_t epRank, int64_t epSize,
@@ -411,7 +405,7 @@ Tuple<Array<String>, Array<int64_t>> getMoeA2AMetaInfoIndexPairs() {
 
 }  // namespace
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_a2a_get_workspace_size_per_rank, getMoeA2AWorkspaceSizePerRank);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_a2a_get_aux_data_size, getMoeA2AAuxDataSize);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_a2a_initialize, moeA2AInitializeOp);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_a2a_dispatch, moeA2ADispatchOp);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_a2a_combine, moeA2ACombineOp);
