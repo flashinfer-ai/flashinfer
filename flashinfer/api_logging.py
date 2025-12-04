@@ -639,23 +639,30 @@ def replay_from_dump(
     kwargs = {}
     input_metadata = metadata.get("input_metadata", {})
 
-    # Sort keys to reconstruct in order
-    tensor_keys = sorted(
-        [k for k in input_tensors.keys() if k.startswith("arg_")],
-        key=lambda x: int(x.split("_")[1]),
-    )
+    # Get max arg index from both tensors and metadata
+    max_arg_idx = -1
 
-    for key in tensor_keys:
-        args.append(input_tensors[key])
+    for key in input_tensors.keys():
+        if key.startswith("arg_"):
+            idx = int(key.split("_")[1])
+            max_arg_idx = max(max_arg_idx, idx)
 
-    # Add non-tensor positional args
-    for key in sorted(
-        [k for k in input_metadata.keys() if k.startswith("arg_")],
-        key=lambda x: int(x.split("_")[1]),
-    ):
-        arg_idx = int(key.split("_")[1])
-        if arg_idx >= len(args):
+    for key in input_metadata.keys():
+        if key.startswith("arg_"):
+            idx = int(key.split("_")[1])
+            max_arg_idx = max(max_arg_idx, idx)
+
+    # Reconstruct positional args in order
+    for i in range(max_arg_idx + 1):
+        key = f"arg_{i}"
+        if key in input_tensors:
+            args.append(input_tensors[key])
+        elif key in input_metadata:
             args.append(_reconstruct_value(input_metadata[key]))
+        else:
+            # Should not happen if dump is consistent, but safeguard
+            _logger.warning(f"Missing argument {i} in dump.")
+            args.append(None)
 
     # Add keyword arguments
     for key in input_tensors.keys():
