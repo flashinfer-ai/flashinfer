@@ -341,15 +341,11 @@ def run_mnnvl_ar_full(
             )
 
         else:
-            required_workspace_bytes = trtllm_mnnvl_ar.MNNVLAllreduceFusionWorkspace.get_required_buffer_size_bytes(
-                mapping.tp_size,
-                max(seq_lens),
-                hidden_size,
-                dtype,
-                trtllm_mnnvl_ar.MNNVLAllreduceFusionStrategy.AUTO,
-            )
             workspace = trtllm_mnnvl_ar.MNNVLAllreduceFusionWorkspace(
-                mapping, required_workspace_bytes
+                mapping,
+                max_num_tokens=max(seq_lens),
+                hidden_dim=hidden_size,
+                dtype=dtype,
             )
 
         test_data = []

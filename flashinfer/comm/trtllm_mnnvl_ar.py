@@ -53,6 +53,9 @@ class MNNVLAllreduceFusionWorkspace:
     def __init__(
         self,
         mapping: Mapping,
+        max_num_tokens: Optional[int] = None,
+        hidden_dim: Optional[int] = None,
+        dtype: Optional[torch.dtype] = None,
         buffer_size_in_bytes: Optional[int] = None,
         comm_backend: Optional[CommBackend] = None,
     ):
@@ -63,14 +66,40 @@ class MNNVLAllreduceFusionWorkspace:
             mapping: Mapping configuration containing rank info
             buffer_size_in_bytes: The requested size in bytes for each lamport buffer. The actual allocation size may be larger due to alignment requirements. The actual usable size will be NUM_LAMPORT_BUFFERS * actual_buffer_size_per_lamport_buffer.
         """
+
         if buffer_size_in_bytes is None:
-            # Default to 16MB workspace size if not provided
-            buffer_size_in_bytes = 16 * (1024**2)
-        else:
-            # Round up to the nearest multiple of 8MB
-            buffer_size_in_bytes = math.ceil(buffer_size_in_bytes / (8 * (1024**2))) * (
-                8 * (1024**2)
+            assert (
+                max_num_tokens is not None
+                and hidden_dim is not None
+                and dtype is not None
+            ), (
+                "max_num_tokens, hidden_dim, and dtype must be provided if buffer_size_in_bytes is not provided."
             )
+            one_shot_size_bytes = self.get_required_buffer_size_bytes(
+                mapping.tp_size,
+                max_num_tokens,
+                hidden_dim,
+                dtype,
+                MNNVLAllreduceFusionStrategy.ONESHOT,
+            )
+            if max_num_tokens > MNNVL_ONE_SHOT_THRESHOLD:
+                two_shot_size_bytes = self.get_required_buffer_size_bytes(
+                    mapping.tp_size,
+                    max_num_tokens,
+                    hidden_dim,
+                    dtype,
+                    MNNVLAllreduceFusionStrategy.TWOSHOT,
+                )
+            else:
+                two_shot_size_bytes = 0
+
+            # We don't do roundup here as it will happen at the allocation.
+            buffer_size_in_bytes = max(one_shot_size_bytes, two_shot_size_bytes)
+        else:
+            logging.debug(
+                f"[MNNVL Allreduce] Using provided buffer size override in bytes: {buffer_size_in_bytes} bytes."
+            )
+
         if comm_backend is None:
             comm_backend = MPIBackend()
         if buffer_size_in_bytes > (2**32 - 1):
@@ -481,11 +510,14 @@ def get_allreduce_mnnvl_workspace(
 
     # Redirect to the new workspace allocation logic. The new kernel needs the new flag buffer layout.
     workspace = MNNVLAllreduceFusionWorkspace(
-        mapping, buffer_size_in_bytes, comm_backend_for_handle_transfer
+        mapping,
+        buffer_size_in_bytes=buffer_size_in_bytes,
+        comm_backend=comm_backend_for_handle_transfer,
     )
 
     mcast_buffer = workspace.mcast_buffer_handle
     buffer_flags = workspace.buffer_flags
+    # this is calculated using the legacy behavior. We do not use the actual allocated size.
     max_num_elements = workspace.buffer_size_bytes // stride
 
     return (
