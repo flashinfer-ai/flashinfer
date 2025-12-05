@@ -7,6 +7,7 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
+from cutlass.cute.typing import Pointer, Int32
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.distributed as distributed
 
@@ -26,6 +27,56 @@ def spin_lock_multimem_arrive(lock_ptr: Pointer, loc=None, ip=None) -> None:
     """
     distributed.multimem_red_relaxed_gpu_add1(lock_ptr, loc=loc, ip=ip)
 
+# HACK https://github.com/NVIDIA/cutlass/issues/2845 
+from cutlass._mlir.dialects import nvvm
+from cutlass.cutlass_dsl import T
+from cutlass._mlir.dialects.nvvm import (
+    MemOrderKind,
+    MemScopeKind,
+    AtomicOpKind,
+)
+@cute.jit
+def spin_lock_atom_cas_acquire_wait(
+    lock_ptr: Pointer,
+    *,
+    expected_val: Int32,
+    reset_val: Int32,
+    scope: str,
+    loc=None,
+    ip=None,
+) -> None:
+    """
+    wait on a spin lock until the expected count is reached. Reset flag to reset_val if the expected count is reached.
+    """
+    if scope == "gpu":
+        result = 0
+        while result != expected_val:
+            result = nvvm.atomicrmw(
+                T.i32(),
+                AtomicOpKind.CAS,
+                lock_ptr.llvm_ptr,
+                Int32(reset_val).ir_value(loc=loc, ip=ip),
+                b=Int32(expected_val).ir_value(loc=loc, ip=ip),
+                mem_order=MemOrderKind.ACQUIRE,
+                syncscope=MemScopeKind.GPU,
+                loc=loc,
+                ip=ip,
+            )
+    elif scope == "sys":
+        result = 0
+        while result != expected_val:
+            result = nvvm.atomicrmw(
+                T.i32(),
+                AtomicOpKind.CAS,
+                lock_ptr.llvm_ptr,
+                Int32(reset_val).ir_value(loc=loc, ip=ip),
+                b=Int32(expected_val).ir_value(loc=loc, ip=ip),
+                mem_order=MemOrderKind.ACQUIRE,
+                syncscope=MemScopeKind.SYS,
+                loc=loc,
+                ip=ip,
+            )
+
 def sm_wise_inter_gpu_multimem_barrier(
     barrier: Pointer, barrier_mc: Pointer, num_ranks, loc=None, ip=None
 ) -> None:
@@ -39,12 +90,8 @@ def sm_wise_inter_gpu_multimem_barrier(
     cute.arch.fence_proxy(cute.arch.ProxyKind.alias)
     
     # v4.3.1 does not have mem_order="acquire" variant in `distributed` module
-    #rewrite using https://github.com/NVIDIA/cutlass/blob/52ae719eda738e665e95cf4fa99409a7a650dd5c/python/CuTeDSL/cutlass/utils/distributed_helpers.py#L70 or
-    #https://github.com/NVIDIA/cutlass/blob/v4.3.1/python/CuTeDSL/cutlass/utils/distributed.py#L300
-    #distributed.spin_lock_wait(
-    #    barrier + pid, num_ranks, mem_order="acquire", mem_scope="sys", loc=loc, ip=ip
-    #)
-
+    # filed issue https://github.com/NVIDIA/cutlass/issues/2845
+    spin_lock_atom_cas_acquire_wait(barrier+pid, expected_val=num_ranks, reset_val=0, scope="sys", loc=loc, ip=ip)
 
 
 """
