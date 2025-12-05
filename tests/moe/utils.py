@@ -30,6 +30,7 @@ class QuantMode(IntEnum):
     FP8_BLOCK_SCALE = 4
     FP8_PER_TENSOR = 5
     BF16 = 6
+    MXINT4_BF16_BF16 = 7
 
 
 def skip_checks(
@@ -83,6 +84,13 @@ def skip_checks(
     if intermediate_size not in routing_config["compatible_intermediate_size"]:
         pytest.skip(
             f"Incompatible: intermediate_size={intermediate_size} with {routing_config['routing_method_type'].name} routing ({routing_config['num_experts']} experts)"
+        )
+
+    if type(moe_impl).__name__ == "MxInt4BlockScaleMoe" and (
+        intermediate_size % 256 != 0 or hidden_size % 256 != 0
+    ):
+        pytest.skip(
+            f"Incompatible: intermediate_size={intermediate_size} or hidden_size={hidden_size} with MXINT4_BF16_BF16 quantization"
         )
 
     # TODO(jimmzhou): enable MxFP4xBf16 on SM103

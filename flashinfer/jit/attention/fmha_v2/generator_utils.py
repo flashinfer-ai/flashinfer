@@ -3711,10 +3711,10 @@ def generate_files(specs_names):
     ]
     if "CUDA_PATH" in os.environ:
         cmd[0] = os.environ["CUDA_PATH"] + "/bin/" + cmd[0]
-    print('Running command "{}" to build "bin/print_traits.exe":'.format(" ".join(cmd)))
+    # print('Running command "{}" to build "bin/print_traits.exe":'.format(" ".join(cmd)))
     process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
     output, error = process.communicate()
-    print('Running "bin/print_traits.exe":')
+    # print('Running "bin/print_traits.exe":')
     process = subprocess.Popen(
         "bin/print_traits.exe", stdin=subprocess.PIPE, stdout=subprocess.PIPE
     )
