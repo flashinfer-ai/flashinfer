@@ -1706,7 +1706,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             Whether to copy the input tensors to the device asynchronously, defaults to ``True``.
         prefix_len_ptr :Optional[torch.Tensor]
             prefix length. A uint32 1D tensor indicating the prefix length of each prompt. The tensor size is equal to the batch size.
-        token_pos_in_items_ptr : Optional[float]
+        token_pos_in_items_ptr : Optional[torch.Tensor]
             A uint16 1D tensor (it will be converted to uint16 in flashinfer) indicating the token position of each item and started from 0 (delimiter)
             for each item. E.g., if we have 3 items of length 3, 2, 4 respectively for this member. This vector will be looking like
             `[0, 1, 2, 3, 0, 1, 2, 0, 1, 2, 3, 4, 0]` with 4 delimiters indexed as 0. For batch size > 1,
@@ -1716,7 +1716,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             zero padding length for `token_pos_in_items_ptr` to better handle the bsz > 1 case. Still using the above 3,2,4 example.
             If we set `token_pos_in_items_len` to be 20, it will be  `[0, 1, 2, 3, 0, 1, 2, 0, 1, 2, 3, 4, 0, 0, 0, 0, 0, 0, 0, 0]`
             with 7 padded zeros. (note there're 8 zeros in the end where the first one is the delimiter token 0 in the end of the prompt)
-        max_item_len_ptr : Optional[float]
+        max_item_len_ptr : Optional[torch.Tensor]
             a uint16 vector contains the max token length of all items for each prompt
         seq_lens: Optional[torch.Tensor]
             A uint32 1D tensor indicating the kv sequence length of each prompt. shape: ``[batch_size]``.
@@ -2594,7 +2594,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             The dimension of the heads on query/key tensor.
         head_dim_vo : Optional[int]
             The dimension of the heads on value/output tensor.
-            If not provided, will be set to ``head_dim_vo``.
+            If not provided, will be set to ``head_dim_qk``.
         custom_mask : Optional[torch.Tensor]
             The flattened boolean mask tensor, shape: ``(sum(q_len[i] * k_len[i] for i in range(batch_size))``.
             The elements in the mask tensor should be either ``True`` or ``False``,
@@ -2651,7 +2651,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             Whether to copy the input tensors to the device asynchronously, defaults to ``True``.
         prefix_len_ptr :Optional[torch.Tensor]
             prefix length. A uint32 1D tensor indicating the prefix length of each prompt. The tensor size is equal to the batch size.
-        token_pos_in_items_ptr : Optional[float]
+        token_pos_in_items_ptr : Optional[torch.Tensor]
             A uint16 1D tensor (it will be converted to uint16 in flashinfer) indicating the token position of each item and started from 0 (delimiter)
             for each item. E.g., if we have 3 items of length 3, 2, 4 respectively for this member. This vector will be looking like
             `[0, 1, 2, 3, 0, 1, 2, 0, 1, 2, 3, 4, 0]` with 4 delimiters indexed as 0. For batch size > 1,
@@ -2661,7 +2661,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             zero padding length for `token_pos_in_items_ptr` to better handle the bsz > 1 case. Still using the above 3,2,4 example.
             If we set `token_pos_in_items_len` to be 20, it will be  `[0, 1, 2, 3, 0, 1, 2, 0, 1, 2, 3, 4, 0, 0, 0, 0, 0, 0, 0, 0]`
             with 7 padded zeros. (note there're 8 zeros in the end where the first one is the delimiter token 0 in the end of the prompt)
-        max_item_len_ptr : Optional[float]
+        max_item_len_ptr : Optional[torch.Tensor]
             a uint16 vector contains the max token length of all items for each prompt
         fixed_split_size : Optional[int],
             The fixed split size for split-kv FA2 prefill/decode, in pages. Recommend setting to the average sequence length of your workload.
