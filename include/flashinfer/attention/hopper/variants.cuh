@@ -32,6 +32,7 @@ DEFINE_HAS_MEMBER(maybe_scale_q)
 DEFINE_HAS_MEMBER(scale_q_scalar)
 DEFINE_HAS_MEMBER(maybe_scale_k)
 DEFINE_HAS_MEMBER(scale_k_scalar)
+DEFINE_HAS_MEMBER(scale_pv)
 
 // Helper to get scale value from tensor pointer or scalar fallback
 template <typename T>
@@ -64,6 +65,16 @@ template <typename AdditionalParams>
 __device__ __forceinline__ float get_k_scale(const AdditionalParams& params, uint32_t kv_head_idx) {
   if constexpr (has_maybe_scale_k_v<AdditionalParams> && has_scale_k_scalar_v<AdditionalParams>) {
     return get_scale(params.maybe_scale_k, params.scale_k_scalar, kv_head_idx);
+  } else {
+    return 1.0f;
+  }
+}
+
+// Helper to get scale_pv from attention variant (returns 1.0 if field doesn't exist)
+template <typename AttentionVariant>
+__device__ __forceinline__ float get_variant_scale_pv(const AttentionVariant& variant) {
+  if constexpr (has_scale_pv_v<AttentionVariant>) {
+    return variant.scale_pv;
   } else {
     return 1.0f;
   }
