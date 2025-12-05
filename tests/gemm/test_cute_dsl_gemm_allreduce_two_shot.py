@@ -401,6 +401,7 @@ def run(
 
     return exec_time  # Return execution time in microseconds
 
+
 def _run_correctness_worker(world_size, rank, distributed_init_port):
     assert rank >= 0
     torch.cuda.set_device(rank)

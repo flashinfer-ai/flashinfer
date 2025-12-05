@@ -7,12 +7,12 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
-from cutlass.cute.typing import Pointer, Int32
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.distributed as distributed
 
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.typing import (
+    Pointer,
     Int32,
     Float16,
     BFloat16,
@@ -21,13 +21,15 @@ from cutlass.cute.typing import (
     Float8E5M2,
 )
 
+
 def spin_lock_multimem_arrive(lock_ptr: Pointer, loc=None, ip=None) -> None:
     """
     arrive a spin lock when the lock_ptr is a multimem address.
     """
     distributed.multimem_red_relaxed_gpu_add1(lock_ptr, loc=loc, ip=ip)
 
-# HACK https://github.com/NVIDIA/cutlass/issues/2845 
+
+# HACK https://github.com/NVIDIA/cutlass/issues/2845
 from cutlass._mlir.dialects import nvvm
 from cutlass.cutlass_dsl import T
 from cutlass._mlir.dialects.nvvm import (
@@ -35,6 +37,8 @@ from cutlass._mlir.dialects.nvvm import (
     MemScopeKind,
     AtomicOpKind,
 )
+
+
 @cute.jit
 def spin_lock_atom_cas_acquire_wait(
     lock_ptr: Pointer,
@@ -77,6 +81,7 @@ def spin_lock_atom_cas_acquire_wait(
                 ip=ip,
             )
 
+
 def sm_wise_inter_gpu_multimem_barrier(
     barrier: Pointer, barrier_mc: Pointer, num_ranks, loc=None, ip=None
 ) -> None:
@@ -88,10 +93,12 @@ def sm_wise_inter_gpu_multimem_barrier(
     pid = bidx + bidy * bdimx + bidz * bdimx * bdimy
     distributed.multimem_red_release_sys_add1(barrier_mc + pid, loc=loc, ip=ip)
     cute.arch.fence_proxy(cute.arch.ProxyKind.alias)
-    
+
     # v4.3.1 does not have mem_order="acquire" variant in `distributed` module
     # filed issue https://github.com/NVIDIA/cutlass/issues/2845
-    spin_lock_atom_cas_acquire_wait(barrier+pid, expected_val=num_ranks, reset_val=0, scope="sys", loc=loc, ip=ip)
+    spin_lock_atom_cas_acquire_wait(
+        barrier + pid, expected_val=num_ranks, reset_val=0, scope="sys", loc=loc, ip=ip
+    )
 
 
 """
@@ -1395,7 +1402,9 @@ class PersistentDenseGemmKernel:
                         with cute.arch.elect_one():
                             flag = barrier_flag.iterator + tile_id
                             # TODO: we may use LDG+STG for spin lock instead of ATOMIC_CAS for better performance.
-                            distributed.spin_lock_atom_cas_relaxed_wait(flag, expected_val=num_ranks, reset_val=0, scope="gpu")
+                            distributed.spin_lock_atom_cas_relaxed_wait(
+                                flag, expected_val=num_ranks, reset_val=0, scope="gpu"
+                            )
 
                     cute.arch.barrier(
                         barrier_id=self.all_reduce_sync_bar_id,
@@ -1430,30 +1439,24 @@ class PersistentDenseGemmKernel:
                             mc_ptr = frgC_mc[None, i, j].iterator
                             x, y, z, w = 0, 0, 0, 0
                             if cutlass.const_expr(self.c_dtype == Float16):
-                                x, y, z, w = (
-                                    distributed.multimem_ld_reduce_8xf16(mc_ptr)
+                                x, y, z, w = distributed.multimem_ld_reduce_8xf16(
+                                    mc_ptr
                                 )
                             elif cutlass.const_expr(self.c_dtype == Float32):
-                                x, y, z, w = (
-                                    distributed.multimem_ld_reduce_4xf32(mc_ptr)
+                                x, y, z, w = distributed.multimem_ld_reduce_4xf32(
+                                    mc_ptr
                                 )
                             elif cutlass.const_expr(self.c_dtype == BFloat16):
-                                x, y, z, w = (
-                                    distributed.multimem_ld_reduce_8xbf16(
-                                        mc_ptr
-                                    )
+                                x, y, z, w = distributed.multimem_ld_reduce_8xbf16(
+                                    mc_ptr
                                 )
                             elif cutlass.const_expr(self.c_dtype == Float8E4M3FN):
-                                x, y, z, w = (
-                                    distributed.multimem_ld_reduce_16xe4m3(
-                                        mc_ptr
-                                    )
+                                x, y, z, w = distributed.multimem_ld_reduce_16xe4m3(
+                                    mc_ptr
                                 )
                             elif cutlass.const_expr(self.c_dtype == Float8E5M2):
-                                x, y, z, w = (
-                                    distributed.multimem_ld_reduce_16xe5m2(
-                                        mc_ptr
-                                    )
+                                x, y, z, w = distributed.multimem_ld_reduce_16xe5m2(
+                                    mc_ptr
                                 )
                             distributed.multimem_st_4xb32(mc_ptr, x, y, z, w)
                     # Advance to next tile
