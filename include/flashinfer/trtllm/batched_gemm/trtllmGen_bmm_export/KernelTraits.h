@@ -289,6 +289,7 @@ class KernelTraits {
         // gmemC reuses loadAb memory for split-K in DSMEM.
         // Epilogue1 does not reuse and continues after the memory allocated Epilogue0
         // NOTE: we can always reuse loadAb SMEM as long as we don't have persistent scheduler.
+
         auto const reuseFirstChunksSmemStoreC =
             doesSplitKUseDsmem(splitK) && resIdx == 0 && !usePersistentScheduler;
 

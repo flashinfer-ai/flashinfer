@@ -487,7 +487,7 @@ def test_cute_dsl_gemm_allreduce_two_shot(world_size):
             f"world_size {world_size} is greater than available_gpus {available_gpus}"
         )
 
-    if get_compute_capability(torch.device("cuda")) != (10, 0):
+    if get_compute_capability(torch.device("cuda")) not in [(10, 0), (10, 3)]:
         pytest.skip("cute_dsl_gemm_allreduce_two_shot requires SM100")
 
     print(f"Running test for world_size={world_size}")
