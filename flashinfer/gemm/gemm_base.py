@@ -2135,8 +2135,7 @@ def mm_fp4(
 
     use_nvfp4: bool
         Whether to use nvfp4 quantization or mxfp4 quantization, defaults to ``True``.
-        When ``use_nvfp4=True``, ``block_size`` must be 16; when ``use_nvfp4=False``,
-        ``block_size`` must be 32.
+        See the ``block_size`` parameter for related constraints.
 
     Notes
     -----
