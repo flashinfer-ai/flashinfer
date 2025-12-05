@@ -562,12 +562,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         self.cta_sync_bar_id = 0
         self.epilog_sync_bar_id = 1
         self.tmem_ptr_sync_bar_id = 2
-
-        # HACK "sm_103" doesn't work yet for the query
-        # https://github.com/NVIDIA/cutlass/blob/5016493cc0d8650d5b2f6d2c2751cf49bc217e86/python/CuTeDSL/cutlass/utils/smem_allocator.py#L19
-        # self.smem_capacity = utils.get_smem_capacity_in_bytes(sm_version)
-        self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
-
+        self.smem_capacity = utils.get_smem_capacity_in_bytes(sm_version)
         SM100_TMEM_CAPACITY_COLUMNS = 512
         self.num_tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
 
