@@ -265,10 +265,10 @@ def get_fp4_quantization_module(backend: str = "100"):
         """Swizzle block scale tensor for FP4 format.
 
         Args:
-            unswizzled_sf (torch.Tensor): unswizzled block scale tensor with dtype uint8.
+            unswizzled_sf (torch.Tensor): unswizzled block scale tensor with dtype uint8 or bfloat16.
 
         Returns:
-            torch.Tensor: output tensor for swizzled block scale with dtype uint8.
+            torch.Tensor: output tensor for swizzled block scale with dtype uint8 or bfloat16.
         """
         num_experts = unswizzled_sf.shape[0] if unswizzled_sf.dim() == 3 else 1
         expert_out_size = _compute_swizzled_layout_sf_size(
@@ -276,7 +276,7 @@ def get_fp4_quantization_module(backend: str = "100"):
         )
         out = torch.empty(
             (num_experts * expert_out_size,),
-            dtype=torch.uint8,
+            dtype=unswizzled_sf.dtype,
             device=unswizzled_sf.device,
         )
         module.block_scale_interleave_sm100(unswizzled_sf, out)
@@ -699,18 +699,18 @@ def block_scale_interleave(unswizzled_sf: torch.Tensor) -> torch.Tensor:
     for FP4 operations. The output needs to be padded in the m dimension to be a multiple of 128.
 
     Args:
-        unswizzled_sf (torch.Tensor): Input tensor with dtype uint8.
+        unswizzled_sf (torch.Tensor): Input tensor with dtype uint8 or bfloat16.
 
     Returns:
         torch.Tensor: Swizzled tensor with the same shape as input.
 
     Raises:
-        AssertionError: If input dtype is not uint8.
+        AssertionError: If input dtype is not uint8 or bfloat16.
     """
     # TODO(shuw): check input dtype is uint8
-    assert unswizzled_sf.dtype == torch.uint8, (
-        f"Input dtype must be uint8, got {unswizzled_sf.dtype}"
-    )
+    assert (
+        unswizzled_sf.dtype == torch.uint8 or unswizzled_sf.dtype == torch.bfloat16
+    ), f"Input dtype must be uint8 or bfloat16, got {unswizzled_sf.dtype}"
 
     major, minor = get_compute_capability(unswizzled_sf.device)
     device_arch = f"{major * 10 + minor}"
