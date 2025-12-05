@@ -268,7 +268,7 @@ def run(
         cluster_shape_mn,
         use_tma_store,
         all_reduce=all_reduce,
-        sm_version=f"sm_{major}{minor}"
+        sm_version=f"sm_{major}{minor}",
     )
 
     if not can_implement:
