@@ -2116,7 +2116,7 @@ def mm_fp4(
         Global scale tensor, float scalar.
 
     out_dtype: torch.dtype
-        Output dtype, bf16 or fp16.
+        Output dtype, bf16 or fp16. When ``backend="trtllm"``, only ``bf16`` is supported.
 
     out: Optional[torch.Tensor]
         Out tensor, shape (m, n), bf16 or fp16, defaults to ``None``.
@@ -2128,10 +2128,14 @@ def mm_fp4(
         Whether to use 8x4 scale factor layout or 128x4 scale factor layout, defaults to False.
 
     backend: Literal["cudnn", "trtllm", "cutlass", "auto"]
-        Backend to use, defaults to "auto", which automatically selects the best backend between cudnn and cutlass.
+        Backend to use, defaults to ``"auto"``, which automatically selects the best
+        backend between ``"cudnn"`` and ``"cutlass"`` based on the current CUDA and
+        cuDNN versions. The ``"trtllm"`` backend is never selected when
+        ``backend="auto"`` because it requires different weight preparation.
 
     use_nvfp4: bool
-        Whether to use nvfp4 quantization or mxfp4 quantization, defaults to False.
+        Whether to use nvfp4 quantization or mxfp4 quantization, defaults to ``True``.
+        See the ``block_size`` parameter for related constraints.
 
     Notes
     -----
