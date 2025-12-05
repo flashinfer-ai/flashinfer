@@ -162,6 +162,7 @@ class PersistentDenseGemmKernel:
         cluster_shape_mn: Tuple[int, int],
         use_tma_store: bool,
         all_reduce="none",
+        sm_version="sm_100",
     ):
         """Initializes the configuration for a Blackwell dense GEMM kernel.
 
@@ -235,7 +236,7 @@ class PersistentDenseGemmKernel:
         self.epilog_sync_bar_id = 1
         self.tmem_ptr_sync_bar_id = 2
         self.all_reduce_sync_bar_id = 3
-        self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
+        self.smem_capacity = utils.get_smem_capacity_in_bytes(sm_version)
 
         self.num_ranks = 1
         self.rank_id = 0
@@ -252,8 +253,6 @@ class PersistentDenseGemmKernel:
         if self.cluster_shape_mn[0] == 4 and self.cluster_shape_mn[1] == 4:
             return False
         return True
-
-        self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
 
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs

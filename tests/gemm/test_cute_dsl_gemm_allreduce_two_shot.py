@@ -258,6 +258,8 @@ def run(
         l, m, n, k, a_major, b_major, c_major, ab_dtype, c_dtype, all_reduce != "none"
     )
 
+    major, minor = get_compute_capability(a_tensor.device)
+
     # Build GEMM object
     gemm = PersistentDenseGemmKernel(
         acc_dtype,
@@ -266,6 +268,7 @@ def run(
         cluster_shape_mn,
         use_tma_store,
         all_reduce=all_reduce,
+        sm_version=f"sm_{major}{minor}"
     )
 
     if not can_implement:
