@@ -212,13 +212,6 @@ class FusedMoeLauncher {
                    args->local_expert_offset + args->local_num_experts <= args->num_experts)
         << "expert offset and count must be within valid range";
 
-    if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3) {
-      auto const routing_logits_dtype =
-          routing_logits.has_value() ? routing_logits.value().dtype() : dl_float32;
-      TVM_FFI_ICHECK_EQ(routing_logits_dtype, dl_float32)
-          << "routing_logits must be float for DeepSeekV3 Routing method.";
-    }
-
     check_routing_logits_shape();
 
     if (routing_bias.has_value()) {
