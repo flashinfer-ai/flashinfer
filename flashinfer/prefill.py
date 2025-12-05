@@ -66,6 +66,26 @@ from .utils import (
 )
 
 
+def _split_scale_param(scale):
+    """Split scale parameter into tensor and scalar components.
+
+    Args:
+        scale: Can be a torch.Tensor (per-head), a scalar float, or None.
+
+    Returns:
+        tuple: (tensor_ptr, scalar_val) where:
+            - If scale is tensor: (scale, 1.0)
+            - If scale is scalar: (None, scale)
+            - If scale is None: (None, 1.0)
+    """
+    if scale is None:
+        return None, 1.0
+    elif isinstance(scale, torch.Tensor):
+        return scale, 1.0
+    else:
+        return None, float(scale)
+
+
 @functools.cache
 def get_fmha_module(
     dtype_q: torch.dtype,
@@ -288,6 +308,7 @@ def get_single_prefill_module(backend, *args):
         rope_theta: float,
     ) -> None:
         if backend == "fa3":
+            scale_v_tensor, scale_v_scalar = _split_scale_param(scale_v)
             if not is_float8(q):
                 run_func(
                     q,
@@ -299,11 +320,15 @@ def get_single_prefill_module(backend, *args):
                     mask_mode,
                     layout,
                     window_left,
+                    scale_v_tensor,
                     logits_soft_cap,
                     sm_scale,
+                    scale_v_scalar,
                 )
             else:
                 # FP8 enabled
+                scale_q_tensor, scale_q_scalar = _split_scale_param(scale_q)
+                scale_k_tensor, scale_k_scalar = _split_scale_param(scale_k)
                 run_func(
                     q,
                     k,
@@ -314,10 +339,13 @@ def get_single_prefill_module(backend, *args):
                     mask_mode,
                     layout,
                     window_left,
-                    scale_q,
-                    scale_k,
-                    scale_v,
+                    scale_q_tensor,
+                    scale_k_tensor,
+                    scale_v_tensor,
                     sm_scale,
+                    scale_q_scalar,
+                    scale_k_scalar,
+                    scale_v_scalar,
                 )
         else:
             run_func(
@@ -451,7 +479,10 @@ def get_batch_prefill_module(backend, *args):
                 token_pos_in_items_len,
             )
         elif is_fp8:
-            # FA3 FP8: scale_q, scale_k, scale_v, sm_scale
+            # FA3 FP8: scale_q, scale_k, scale_v, sm_scale, scale_q_scalar, scale_k_scalar, scale_v_scalar
+            scale_q_tensor, scale_q_scalar = _split_scale_param(scale_q)
+            scale_k_tensor, scale_k_scalar = _split_scale_param(scale_k)
+            scale_v_tensor, scale_v_scalar = _split_scale_param(scale_v)
             ragged_run_func(
                 float_workspace_buffer,
                 int_workspace_buffer,
@@ -467,14 +498,18 @@ def get_batch_prefill_module(backend, *args):
                 layout,
                 window_left,
                 enable_pdl,
-                scale_q,
-                scale_k,
-                scale_v,
+                scale_q_tensor,
+                scale_k_tensor,
+                scale_v_tensor,
                 sm_scale,
+                scale_q_scalar,
+                scale_k_scalar,
+                scale_v_scalar,
             )
         else:
             # FA3 FP16: maybe_prefix_len_ptr, maybe_token_pos_in_items_ptr,
-            # maybe_max_item_len_ptr, logits_soft_cap, sm_scale, token_pos_in_items_len
+            # maybe_max_item_len_ptr, scale_v, logits_soft_cap, sm_scale, scale_v_scalar, token_pos_in_items_len
+            scale_v_tensor, scale_v_scalar = _split_scale_param(scale_v)
             ragged_run_func(
                 float_workspace_buffer,
                 int_workspace_buffer,
@@ -493,8 +528,10 @@ def get_batch_prefill_module(backend, *args):
                 maybe_prefix_len_ptr,
                 maybe_token_pos_in_items_ptr,
                 maybe_max_item_len_ptr,
+                scale_v_tensor,
                 logits_soft_cap,
                 sm_scale,
+                scale_v_scalar,
                 token_pos_in_items_len,
             )
 
@@ -652,6 +689,7 @@ def get_batch_prefill_module(backend, *args):
                 token_pos_in_items_len,
             )
         else:
+            scale_v_tensor, scale_v_scalar = _split_scale_param(scale_v)
             if not is_float8(q):
                 paged_run_func(
                     float_workspace_buffer,
@@ -673,11 +711,15 @@ def get_batch_prefill_module(backend, *args):
                     maybe_prefix_len_ptr,
                     maybe_token_pos_in_items_ptr,
                     maybe_max_item_len_ptr,
+                    scale_v_tensor,
                     logits_soft_cap,
                     sm_scale,
+                    scale_v_scalar,
                     token_pos_in_items_len,
                 )
             else:
+                scale_q_tensor, scale_q_scalar = _split_scale_param(scale_q)
+                scale_k_tensor, scale_k_scalar = _split_scale_param(scale_k)
                 paged_run_func(
                     float_workspace_buffer,
                     int_workspace_buffer,
@@ -695,10 +737,13 @@ def get_batch_prefill_module(backend, *args):
                     layout,
                     window_left,
                     enable_pdl,
-                    scale_q,
-                    scale_k,
-                    scale_v,
+                    scale_q_tensor,
+                    scale_k_tensor,
+                    scale_v_tensor,
                     sm_scale,
+                    scale_q_scalar,
+                    scale_k_scalar,
+                    scale_v_scalar,
                 )
         return o
 

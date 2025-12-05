@@ -316,7 +316,7 @@ CUTLASS_DEVICE void mma_f16(
   consumer_wait(pipeline_v, smem_pipe_read_v);
   gemm</*init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, tOrP, tOrV(_, _, _, smem_pipe_read_v.index()),
                                        tOrO);
-  attention_updater.finalize(tSrS);
+  attention_updater.finalize(tSrS, variant.scale_pv);
   warpgroup_wait<0>();
   pipeline_v.consumer_release(smem_pipe_read_v);  // release V, otherwise producers will hang
   ++smem_pipe_read_v;
