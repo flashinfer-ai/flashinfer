@@ -258,7 +258,7 @@ def run(
         l, m, n, k, a_major, b_major, c_major, ab_dtype, c_dtype, all_reduce != "none"
     )
 
-    major, minor = get_compute_capability(a_tensor.device)
+    major, minor = torch.cuda.get_device_capability()
 
     # Build GEMM object
     gemm = PersistentDenseGemmKernel(
