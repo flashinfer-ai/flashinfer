@@ -207,7 +207,7 @@ def test_deepseek_prefill(
 
 @pytest.mark.parametrize("batch_size", [1, 4, 8, 16])
 @pytest.mark.parametrize("seq_len", [11, 12, 99, 1763, 9999, 32767])
-@pytest.mark.parametrize("page_size", [1])  # [1, 16])
+@pytest.mark.parametrize("page_size", [1, 16])
 @pytest.mark.parametrize("num_qo_heads", [1, 4, 8])
 @pytest.mark.parametrize("num_kv_heads", [1, 4, 8])
 @pytest.mark.parametrize("causal", [False, True])
@@ -267,8 +267,7 @@ def test_batch_paged_prefill(
     kv_indptr = torch.arange(
         0, batch_size * num_pages_per_request + 1, num_pages_per_request
     ).int()
-    # NOTE(Zihao): pad 256 elements to avoid out-of-bound because we didn't check the boundary in the kernel
-    kv_indices = torch.arange(0, batch_size * num_pages_per_request + 256).int()
+    kv_indices = torch.arange(0, batch_size * num_pages_per_request).int()
     last_page_len = torch.full((batch_size,), last_page_len, dtype=torch.int32)
 
     wrapper_sm80.plan(
@@ -435,7 +434,7 @@ def test_batch_prefill_with_paged_kv_cache_multi_item_scoring_fa3(
             97,
             81,
             [16, 16],
-            list(range(80)) + [0] + [0] * 16 + list(range(76)) + [0],
+            list(range(80)) + [0] * 17 + list(range(76)) + [0] * 5,
             97,
             [79, 75],
         ),

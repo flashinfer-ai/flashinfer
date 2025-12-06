@@ -112,31 +112,6 @@ void append_paged_kv_cache(TensorView append_key, TensorView append_value, Tenso
                           << paged_k_cache.dtype();
 }
 
-void block_sparse_indices_to_vector_sparse_offsets(
-    TensorView block_sparse_indices, TensorView block_sparse_indptr,
-    TensorView vector_sparse_offsets, TensorView vector_sparse_indptr, TensorView kv_len_arr,
-    int64_t stride_block, int64_t stride_n, int64_t batch_size, int64_t block_size) {
-  CHECK_INPUT(block_sparse_indices);
-  CHECK_INPUT(block_sparse_indptr);
-  CHECK_INPUT(vector_sparse_offsets);
-  CHECK_INPUT(vector_sparse_indptr);
-  CHECK_INPUT(kv_len_arr);
-
-  ffi::CUDADeviceGuard device_guard(block_sparse_indices.device().device_id);
-  const cudaStream_t stream = get_stream(block_sparse_indices.device());
-
-  cudaError_t status = BlockSparseIndicesToVectorSparseOffset(
-      static_cast<int32_t*>(block_sparse_indices.data_ptr()),
-      static_cast<int32_t*>(block_sparse_indptr.data_ptr()),
-      static_cast<int32_t*>(vector_sparse_offsets.data_ptr()),
-      static_cast<int32_t*>(vector_sparse_indptr.data_ptr()),
-      static_cast<int32_t*>(kv_len_arr.data_ptr()), stride_block, stride_n, batch_size, block_size,
-      stream);
-
-  TVM_FFI_ICHECK(status == cudaSuccess)
-      << "BlockSparseIndicesToVectorSparseOffset failed with error: " << cudaGetErrorString(status);
-}
-
 void append_paged_mla_kv_cache(TensorView append_ckv, TensorView append_kpe,
                                TensorView batch_indices, TensorView positions, TensorView ckv_cache,
                                TensorView kpe_cache, TensorView kv_indices, TensorView kv_indptr,
