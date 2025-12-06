@@ -35,7 +35,7 @@ from .core import (
 )
 
 from .fused_routing_dsv3 import (  # noqa: F401
-    NoAuxTc as NoAuxTc,
+    fused_topk_deepseek as fused_topk_deepseek,
 )
 
 __all__ = [
@@ -56,5 +56,5 @@ __all__ = [
     "trtllm_fp8_block_scale_moe",
     "trtllm_fp8_per_tensor_scale_moe",
     "trtllm_mxint4_block_scale_moe",
-    "NoAuxTc",
+    "fused_topk_deepseek",
 ]
