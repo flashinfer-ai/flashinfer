@@ -1684,6 +1684,10 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
     TVM_FFI_ICHECK_EQ(routing_logits.value().ndim(), 2) << "routing_logits must be 2D.";
     TVM_FFI_ICHECK_EQ(routing_logits.value().size(1), num_experts)
         << "routing_logits has incorrect shape.";
+    if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3) {
+      TVM_FFI_ICHECK_EQ(routing_logits.value().dtype(), dl_float32)
+          << "routing_logits must be float.";
+    }
   }
   if (routing_bias.has_value()) {
     TVM_FFI_ICHECK(routing_bias.value().dtype() == dl_bfloat16 ||
