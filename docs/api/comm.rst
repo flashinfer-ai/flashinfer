@@ -128,3 +128,19 @@ TensorRT-LLM MNNVL AllReduce
     trtllm_mnnvl_all_reduce
     trtllm_mnnvl_fused_allreduce_rmsnorm
     mpi_barrier
+
+MNNVL A2A (Throughput Backend)
+-------------------------------
+
+.. currentmodule:: flashinfer.comm
+
+.. autosummary::
+    :toctree: ../generated
+
+    MoeAlltoAll
+    moe_a2a_initialize
+    moe_a2a_dispatch
+    moe_a2a_combine
+    moe_a2a_sanitize_expert_ids
+    moe_a2a_get_workspace_size_per_rank
+    moe_a2a_wrap_payload_tensor_in_workspace

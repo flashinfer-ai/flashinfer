@@ -64,7 +64,7 @@ bool getEnvDisableKVCacheTransferOverlap();
 
 bool getEnvEnableReceiveKVCacheParallel();
 
-std::string getEnvKVCacheTransferOutputPath();
+std::string const& getEnvKVCacheTimeOutputPath();
 
 bool getEnvTryZCopyForKVCacheTransfer();
 
@@ -91,5 +91,14 @@ bool getEnvKVCacheTransferUseAsyncBuffer();
 size_t getEnvKVCacheSendMaxConcurrenceNum();
 
 size_t getEnvMemSizeForKVCacheTransferBuffer();
+
+// Whether to use one block per token for MoE A2A kernels (default true).
+bool getEnvMoeA2AOneBlockPerToken();
+
+// TODO: For DEV purpose temporarily.
+// Block size (threads per block) for MoE A2A Dispatch kernels (default 256 if unset or invalid)
+int getEnvMoeA2ADispatchBlockSize();
+// Block size (threads per block) for MoE A2A Combine kernels (default 256 if unset or invalid)
+int getEnvMoeA2ACombineBlockSize();
 
 }  // namespace tensorrt_llm::common
