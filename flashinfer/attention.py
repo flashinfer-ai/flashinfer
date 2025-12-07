@@ -244,8 +244,7 @@ class BatchAttention:
         # profiler_buffer is optional
         profiler_args = (profiler_buffer,) if self._use_profiler else ()
 
-        module = self.module
-        module.run(
+        self.module.run(
             self.float_workspace_buffer,
             self.int_workspace_buffer,
             self._plan_info,
