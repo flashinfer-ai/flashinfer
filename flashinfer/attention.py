@@ -78,22 +78,20 @@ class BatchAttention:
 
         self._use_cuda_graph = use_cuda_graph
         if use_cuda_graph:
-            if not torch.is_tensor(paged_kv_indptr_buffer):
-                raise ValueError(
-                    "paged_kv_indptr_buffer should be a torch.Tensor in cudagraph mode"
-                )
-            if not torch.is_tensor(paged_kv_indices_buffer):
-                raise ValueError(
-                    "paged_kv_indices_buffer should be a torch.Tensor in cudagraph mode"
-                )
-            if not torch.is_tensor(kv_len_arr_buffer):
-                raise ValueError(
-                    "kv_len_arr_buffer should be a torch.Tensor in cudagraph mode"
-                )
+            buffers_to_check = {
+                "paged_kv_indptr_buffer": paged_kv_indptr_buffer,
+                "paged_kv_indices_buffer": paged_kv_indices_buffer,
+                "kv_len_arr_buffer": kv_len_arr_buffer,
+            }
+            for name, buf in buffers_to_check.items():
+                if not torch.is_tensor(buf):
+                    raise ValueError(
+                        f"{name} should be a torch.Tensor in cudagraph mode"
+                    )
             self._fixed_batch_size = len(kv_len_arr_buffer)
             if len(paged_kv_indptr_buffer) != self._fixed_batch_size + 1:
                 raise ValueError(
-                    "The size of kv_indptr_buffer should be batch_size + 1"
+                    "The size of paged_kv_indptr_buffer should be batch_size + 1"
                 )
             self._qo_indptr_buf = torch.arange(
                 self._fixed_batch_size + 1,
@@ -178,8 +176,6 @@ class BatchAttention:
             self._paged_kv_indptr_buf.copy_(kv_indptr, non_blocking=True)
             self._kv_len_arr_buf.copy_(kv_len_arr, non_blocking=True)
         else:
-            # No addtional buf allocated for CUDA graph tensor
-            # Allocate outside FlashInfer
             self._qo_indptr_buf = qo_indptr.to(self.device, non_blocking=True)
             self._paged_kv_indices_buf = kv_indices.to(self.device, non_blocking=True)
             self._kv_len_arr_buf = kv_len_arr.to(self.device, non_blocking=True)
