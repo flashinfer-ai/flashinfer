@@ -106,7 +106,4 @@ def gen_moe_alltoall_module() -> JitSpec:
             str(jit_env.FLASHINFER_CSRC_DIR / "nv_internal"),
             str(jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "include"),
         ],
-        # Debug flags
-        extra_cuda_cflags=["-g", "-G"],
-        extra_cflags=["-g", "-O0"],
     )

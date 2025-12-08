@@ -34,7 +34,7 @@ def get_moe_alltoall_module():
 
     @register_custom_op(
         "flashinfer::moe_a2a_initialize",
-        mutates_args=[],
+        mutates_args=("workspace",),
     )
     def moe_a2a_initialize(
         workspace: torch.Tensor,
@@ -46,7 +46,7 @@ def get_moe_alltoall_module():
 
     @register_custom_op(
         "flashinfer::moe_a2a_dispatch",
-        mutates_args=[],
+        mutates_args=("workspace",),
     )
     def moe_a2a_dispatch(
         token_selected_experts: torch.Tensor,
@@ -92,7 +92,7 @@ def get_moe_alltoall_module():
 
     @register_custom_op(
         "flashinfer::moe_a2a_combine",
-        mutates_args=[],
+        mutates_args=("workspace",),
     )
     def moe_a2a_combine(
         payload: torch.Tensor,
@@ -139,7 +139,7 @@ def get_moe_alltoall_module():
 
     @register_custom_op(
         "flashinfer::moe_a2a_sanitize_expert_ids",
-        mutates_args=[],
+        mutates_args=("expert_ids",),
     )
     def moe_a2a_sanitize_expert_ids(
         expert_ids: torch.Tensor,
@@ -436,7 +436,7 @@ class MoeAlltoAll:
             top_k: Number of experts per token
             max_num_tokens: Maximum number of tokens across all ranks
             hidden_size: Hidden dimension size
-            extra_payload_size_per_token: Extra size per token in the payload
+            extra_payload_bytes_per_token: Extra size per token in the payload
         Returns:
             workspace_size_per_rank: Size of the workspace per rank in bytes
         """
