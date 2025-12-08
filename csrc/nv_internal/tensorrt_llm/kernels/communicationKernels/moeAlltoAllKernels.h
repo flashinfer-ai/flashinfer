@@ -18,7 +18,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
-namespace tensorrt_llm::kernels::mnnvl_throughput {
+namespace tensorrt_llm::kernels::moe_alltoall {
 
 // Configuration constants
 static constexpr int kMaxExperts = 256;  // Maximum number of experts per rank
@@ -178,4 +178,4 @@ void moe_a2a_sanitize_expert_ids_launch(int32_t* expert_ids, int32_t const* recv
                                         int32_t invalid_id, int ep_size, int max_tokens_per_rank,
                                         int top_k, cudaStream_t stream);
 
-}  // namespace tensorrt_llm::kernels::mnnvl_throughput
+}  // namespace tensorrt_llm::kernels::moe_alltoall

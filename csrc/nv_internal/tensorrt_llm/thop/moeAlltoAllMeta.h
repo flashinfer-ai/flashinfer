@@ -22,7 +22,7 @@
 #include <vector>
 
 namespace torch_ext {
-namespace mnnvl_throughput {
+namespace moe_alltoall {
 
 // Enum for indexing into moe_a2a_metainfo tensor
 enum MoeA2AMetaInfoIndex : int64_t {
@@ -57,5 +57,5 @@ inline std::vector<std::pair<char const*, int64_t>> getMoeA2AMetaInfoIndexPairs(
   };
 }
 
-}  // namespace mnnvl_throughput
+}  // namespace moe_alltoall
 }  // namespace torch_ext

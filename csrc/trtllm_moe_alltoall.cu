@@ -40,8 +40,8 @@ using tvm::ffi::Tuple;
 
 namespace {
 
-namespace tl_throughput = tensorrt_llm::kernels::mnnvl_throughput;
-namespace fi_throughput = torch_ext::mnnvl_throughput;
+namespace tl_throughput = tensorrt_llm::kernels::moe_alltoall;
+namespace fi_throughput = torch_ext::moe_alltoall;
 
 constexpr size_t kCachelineAlignment = 128;
 constexpr size_t kInt32Bytes = sizeof(int32_t);

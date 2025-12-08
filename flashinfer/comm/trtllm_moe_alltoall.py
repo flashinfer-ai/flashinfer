@@ -29,7 +29,7 @@ class _A2AState:
 
 @functools.cache
 def get_moe_alltoall_module():
-    """Get or build the MNNVL A2A JIT module."""
+    """Get or build the MOE A2A JIT module."""
     module = gen_moe_alltoall_module().build_and_load()
 
     @register_custom_op(

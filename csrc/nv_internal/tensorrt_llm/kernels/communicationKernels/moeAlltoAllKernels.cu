@@ -25,7 +25,7 @@
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/communicationKernels/moeAlltoAllKernels.h"
 
-namespace tensorrt_llm::kernels::mnnvl_throughput {
+namespace tensorrt_llm::kernels::moe_alltoall {
 
 #define ENABLE_DEBUG_PRINT 0
 #define DISABLE_SYNC_FOR_PROFILING 0
@@ -871,4 +871,4 @@ void moe_a2a_sanitize_expert_ids_launch(int32_t* expert_ids, int32_t const* recv
       expert_ids, recv_counters, ep_size, max_tokens_per_rank, top_k, invalid_id);
 }
 
-}  // namespace tensorrt_llm::kernels::mnnvl_throughput
+}  // namespace tensorrt_llm::kernels::moe_alltoall
