@@ -95,6 +95,7 @@ from .norm import layernorm as layernorm
 from .norm import gemma_fused_add_rmsnorm as gemma_fused_add_rmsnorm
 from .norm import gemma_rmsnorm as gemma_rmsnorm
 from .norm import rmsnorm as rmsnorm
+from .norm import rmsnorm_fp4quant as rmsnorm_fp4quant
 from .page import append_paged_kv_cache as append_paged_kv_cache
 from .page import append_paged_mla_kv_cache as append_paged_mla_kv_cache
 from .page import get_batch_indices_positions as get_batch_indices_positions
