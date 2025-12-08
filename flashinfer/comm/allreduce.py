@@ -668,12 +668,31 @@ def allreduce_fusion(
 
         # Flatten all tensors to 1D for legacy trtllm_allreduce_fusion API
         # The legacy API expects flattened tensors and explicit token_num/hidden_dim
-        input_flat = input.flatten()
-        output_flat = output.flatten()
-        residual_in_flat = residual_in.flatten() if residual_in is not None else None
-        residual_out_flat = residual_out.flatten() if residual_out is not None else None
-        norm_out_flat = norm_out.flatten() if norm_out is not None else None
-        quant_out_flat = quant_out.flatten() if quant_out is not None else None
+        # We require contiguous tensors so that view(-1) creates a view (not a copy),
+        # ensuring writes to the flattened tensors are reflected in the original 2D tensors
+        def _flatten_checked(t, name):
+            if not t.is_contiguous():
+                raise ValueError(f"{name} must be contiguous")
+            return t.view(-1)
+
+        input_flat = _flatten_checked(input, "input")
+        output_flat = _flatten_checked(output, "output")
+        residual_in_flat = (
+            _flatten_checked(residual_in, "residual_in")
+            if residual_in is not None
+            else None
+        )
+        residual_out_flat = (
+            _flatten_checked(residual_out, "residual_out")
+            if residual_out is not None
+            else None
+        )
+        norm_out_flat = (
+            _flatten_checked(norm_out, "norm_out") if norm_out is not None else None
+        )
+        quant_out_flat = (
+            _flatten_checked(quant_out, "quant_out") if quant_out is not None else None
+        )
 
         # Call legacy API with flattened tensors
         # Note: pattern and layout_code are ints but legacy API uses pseudo-type hints
