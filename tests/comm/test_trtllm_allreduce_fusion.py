@@ -86,8 +86,6 @@ def _run_correctness_worker(
                 topology="single_node",
                 process_group=group,
             )
-            # Extract metadata for compatibility with tests
-            workspace_metadata = workspace.metadata
 
         test_loop = 5
 
@@ -239,7 +237,6 @@ def _run_correctness_worker(
                                                     pattern=pattern_code,
                                                     use_oneshot=use_oneshot,
                                                     fp32_acc=fp32_acc,
-                                                    metadata=workspace_metadata,
                                                 )
 
                                     # NOTE: in real case, you dont have to set all optional params. You could set those required by fusion pattern.
@@ -304,7 +301,6 @@ def _run_correctness_worker(
                                                     pattern=pattern_code,
                                                     use_oneshot=use_oneshot,
                                                     fp32_acc=fp32_acc,
-                                                    metadata=workspace_metadata,
                                                 )
                                     # replay
                                     g.replay()

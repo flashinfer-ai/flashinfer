@@ -559,7 +559,6 @@ def allreduce_fusion(
     # ===== Control parameters =====
     use_oneshot: Optional[bool] = None,
     fp32_acc: bool = False,
-    metadata: Optional[dict] = None,
 ) -> torch.Tensor:
     """
     AllReduce + RMSNorm fusion operation.
@@ -604,10 +603,10 @@ def allreduce_fusion(
         layout_code: Scale factor layout (QuantizationSFLayout) [trtllm only]
 
         # ===== Control parameters =====
-        use_oneshot: [trtllm only] Use oneshot strategy vs twoshot
-                     If None, uses internal heuristics
+        use_oneshot: Use oneshot strategy vs twoshot
+                     If None, uses internal heuristics.
+                     Note that the MNNVL backend needs to be initialized with a sufficiently large workspace if one_shot is used.
         fp32_acc: [trtllm only] Use FP32 accumulation for AllReduce
-        metadata: [trtllm only] Workspace metadata for validation
 
     Returns:
         Output tensor (typically norm_out for fusion cases, output otherwise)
@@ -700,7 +699,7 @@ def allreduce_fusion(
             rms_eps=rms_eps,
             scale_factor=scale_factor,
             layout_code=layout_code,  # type: ignore[arg-type]
-            metadata=metadata,
+            metadata=workspace.metadata,
         )
 
         # Return the most downstream output (already in 2D shape from input views)
