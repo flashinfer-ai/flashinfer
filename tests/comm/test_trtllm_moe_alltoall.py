@@ -590,7 +590,7 @@ def test_moe_workspace_size_per_rank():
     assert empty_workspace_size > 0
     assert (
         empty_workspace_size
-        == trtllm_moe_alltoall.get_mnnvl_moe_alltoall_module().moe_a2a_get_aux_data_size(
+        == trtllm_moe_alltoall.get_moe_alltoall_module().moe_a2a_get_aux_data_size(
             ep_size, num_tokens
         )
     )

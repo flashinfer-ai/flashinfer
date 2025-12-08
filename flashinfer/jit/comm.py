@@ -80,7 +80,7 @@ def gen_vllm_comm_module() -> JitSpec:
     )
 
 
-def gen_mnnvl_moe_alltoall_module() -> JitSpec:
+def gen_moe_alltoall_module() -> JitSpec:
     return gen_jit_spec(
         "mnnvl_moe_alltoall",
         [
@@ -106,4 +106,7 @@ def gen_mnnvl_moe_alltoall_module() -> JitSpec:
             str(jit_env.FLASHINFER_CSRC_DIR / "nv_internal"),
             str(jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "include"),
         ],
+        # Debug flags
+        extra_cuda_cflags=["-g", "-G"],
+        extra_cflags=["-g", "-O0"],
     )

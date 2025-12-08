@@ -17,11 +17,10 @@ name = "flashinfer-python"
 description = "FlashInfer: Kernel Library for LLM Serving"
 requires-python = ">=3.10,<4.0"
 authors = [{ name = "FlashInfer team" }]
-license = "Apache-2.0"
+license = {text = "Apache-2.0"}
 readme = "README.md"
 urls = { Homepage = "https://github.com/flashinfer-ai/flashinfer" }
 dynamic = ["dependencies", "version"]
-license-files = ["LICENSE", "LICENSE*.txt"]
 
 [project.scripts]
 flashinfer = "flashinfer.__main__:cli"
