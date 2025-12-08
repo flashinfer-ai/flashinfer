@@ -742,8 +742,8 @@ def detect_sm_capabilities():
         "sm100": has_sm("compute_100", "12.8"),
         "sm100f": has_sm("compute_100", "12.9"),
         "sm103": has_sm("compute_103", "12.9"),
-        "sm110": has_sm("compute_110", "12.9"),
-        "sm120": has_sm("compute_120", "12.9"),
+        "sm110": has_sm("compute_110", "13.0"),
+        "sm120": has_sm("compute_120", "12.8"),
         "sm121": has_sm("compute_121", "12.9"),
     }
 
