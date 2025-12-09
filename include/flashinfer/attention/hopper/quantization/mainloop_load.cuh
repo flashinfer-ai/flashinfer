@@ -48,6 +48,10 @@ struct FP8CollectiveMainloop {
   using StrideT = cute::Shape<int64_t, _1, int64_t>;  // (N, D, H)
   using LayoutT = cute::Layout<ShapeT, StrideT>;
 
+  // Transposed stride for V TMA loading: (D, N, H) instead of (N, D, H)
+  // This loads V^T directly into MN-major smem layout
+  using StrideVTransposed = cute::Shape<_1, int64_t, int64_t>;  // (D, N, H)
+
   using ShapeLseT = cute::Shape<int32_t, int32_t>;
   using StrideLseT = cute::Shape<_1, int64_t>;
   using LayoutLseT = cute::Layout<ShapeLseT, StrideLseT>;
@@ -64,11 +68,15 @@ struct FP8CollectiveMainloop {
                   repeat_like(StrideT{}, int32_t(0)), StrideT{}),
       take<0, 2>(SmemLayoutK{}), select<1, 2>(TileShape_QKD{}), _1{}));  // no mcast
 
+  // FA3-style: TMA loads V with transposed gmem strides into SmemLayoutV (MN-major)
+  // Gmem V has shape (N, D, H), we load with transposed strides to get V^T into (D, N) smem tiles
+  // SmemLayoutV now has shape (HEAD_DIM, CTA_KV, STAGES) = (D, N, STAGES)
+  // Tile shape for V TMA: select<2, 1>(TileShape_QKD{}) = (HEAD_DIM, CTA_KV)
   using TMA_V = decltype(make_tma_copy(
       GmemTiledCopyKV{},
       make_tensor(make_gmem_ptr(static_cast<DTypeKV const*>(nullptr)),
-                  repeat_like(StrideT{}, int32_t(0)), StrideT{}),
-      take<0, 2>(SmemLayoutV{}), select<1, 2>(TileShape_QKD{}), _1{}));  // no mcast
+                  repeat_like(StrideVTransposed{}, int32_t(0)), StrideVTransposed{}),
+      take<0, 2>(SmemLayoutV{}), select<2, 1>(TileShape_QKD{}), _1{}));  // no mcast
 
   static constexpr bool USE_TMA_LOAD_KV = true;
   using MainloopPipeline = typename Ktraits::MainloopPipeline;
@@ -121,9 +129,19 @@ struct FP8CollectiveMainloop {
     Tensor mK = make_tensor(make_gmem_ptr(args.K_ptr), args.layout_K);
     TMA_K tma_load_K = make_tma_copy(GmemTiledCopyKV{}, mK, SmemLayoutK{}(_, _, _0{}),
                                      select<1, 2>(TileShape_QKD{}), _1{});  // no mcast
-    Tensor mV = make_tensor(make_gmem_ptr(args.V_ptr), args.layout_V);
+
+    // FA3-style: Create V tensor with transposed strides for TMA loading
+    // Original V layout: (N, D, H) with strides (stride_N, 1, stride_H)
+    // Transposed V layout for TMA: (D, N, H) with strides (1, stride_N, stride_H)
+    auto [shape_N, shape_D, shape_H] = args.layout_V.shape();
+    auto [stride_N, stride_D, stride_H] = args.layout_V.stride();
+    auto shape_V_transposed = make_shape(shape_D, shape_N, shape_H);
+    auto stride_V_transposed = make_stride(stride_D, stride_N, stride_H);
+    Tensor mV = make_tensor(make_gmem_ptr(args.V_ptr),
+                            make_layout(shape_V_transposed, stride_V_transposed));
     TMA_V tma_load_V = make_tma_copy(GmemTiledCopyKV{}, mV, SmemLayoutV{}(_, _, _0{}),
-                                     select<1, 2>(TileShape_QKD{}), _1{});  // no mcast
+                                     select<2, 1>(TileShape_QKD{}), _1{});  // no mcast
+
     return {args.layout_Q, args.layout_K, args.layout_V,    tma_load_Q,
             tma_load_K,    tma_load_V,    args.window_left, args.additional_params};
   }
@@ -161,20 +179,24 @@ struct FP8CollectiveMainloop {
                            BlockCoord const& block_coord, int work_idx) {
     Tensor sQ = make_tensor(make_smem_ptr(shared_storage.smem_q.data()), SmemLayoutQ{});
     Tensor sK = make_tensor(make_smem_ptr(shared_storage.smem_k.data()), SmemLayoutK{});
+    // sV now uses SmemLayoutV which is SmemLayoutVtTma (MN-major, shape (HEAD_DIM, CTA_KV, STAGES))
     Tensor sV = make_tensor(make_smem_ptr(shared_storage.smem_v.data()), SmemLayoutV{});
 
     Tensor mQ = mainloop_params.tma_load_Q.get_tma_tensor(mainloop_params.layout_Q.shape());
     Tensor mK = mainloop_params.tma_load_K.get_tma_tensor(mainloop_params.layout_K.shape());
-    Tensor mV = mainloop_params.tma_load_V.get_tma_tensor(mainloop_params.layout_V.shape());
+
+    // FA3-style: mV uses transposed shape (D, N, H) instead of (N, D, H)
+    auto [shape_N, shape_D, shape_H] = mainloop_params.layout_V.shape();
+    auto shape_V_transposed = make_shape(shape_D, shape_N, shape_H);
+    Tensor mV = mainloop_params.tma_load_V.get_tma_tensor(shape_V_transposed);
 
     // *** Prepare In-kernel V Transpose ***
-    using SmemLayoutVTransposeSrc = typename Ktraits::SmemLayoutVTransposeSrc;
-    using SmemLayoutVtTransposeTgt = typename Ktraits::SmemLayoutVtTransposeTgt;
-
-    Tensor sV_src = as_position_independent_swizzle_tensor(
-        make_tensor(make_smem_ptr(shared_storage.smem_v.data()), SmemLayoutVTransposeSrc{}));
+    // FA3-style: sVt_src (MN-major) is the TMA destination, sVt_tgt (K-major) is the MMA source
+    // Both have the same shape (HEAD_DIM, CTA_KV, STAGES), only different swizzle patterns
+    Tensor sVt_src = as_position_independent_swizzle_tensor(
+        make_tensor(make_smem_ptr(shared_storage.smem_v.data()), SmemLayoutV{}));
     Tensor sVt_tgt = as_position_independent_swizzle_tensor(
-        make_tensor(make_smem_ptr(shared_storage.smem_vt.data()), SmemLayoutVtTransposeTgt{}));
+        make_tensor(make_smem_ptr(shared_storage.smem_vt.data()), SmemLayoutVt{}));
     auto v_tranposer = SmemTransposeFP8_64x64<Ktraits>();
 
     auto [q_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len, batch_idx] =
@@ -185,8 +207,9 @@ struct FP8CollectiveMainloop {
                                       qo_len)(_, _, q_tile_idx);  // (Q, D)
     Tensor gK = get_local_tile_tensor(mK, select<1, 2>(TileShape_QKD{}), kv_head_idx, kv_indptr,
                                       kv_len);  // (K, D, _)
-    Tensor gV = get_local_tile_tensor(mV, select<1, 2>(TileShape_QKD{}), kv_head_idx, kv_indptr,
-                                      kv_len);  // (K, D, _)
+    // FA3-style: gV uses transposed tile shape (HEAD_DIM, CTA_KV) = select<2, 1>(TileShape_QKD{})
+    Tensor gV = get_local_tile_tensor(mV, select<2, 1>(TileShape_QKD{}), kv_head_idx, kv_indptr,
+                                      kv_len);  // (D, K, _)
 
     Tensor sQ_x = make_tensor(sQ.data(), make_layout(sQ.layout(), Layout<_1>{}));
     Tensor gQ_x = make_tensor(gQ.data(), make_layout(gQ.layout(), Layout<_1>{}));
@@ -246,7 +269,7 @@ struct FP8CollectiveMainloop {
 
     pipeline_v.consumer_wait(smem_pipe_read);
     pipeline_vt.producer_acquire(smem_pipe_write);
-    v_tranposer.do_transpose(sV_src, sVt_tgt, smem_pipe_read.index());
+    v_tranposer.do_transpose(sVt_src, sVt_tgt, smem_pipe_read.index());
     pipeline_vt.producer_commit(smem_pipe_write);
     pipeline_v.consumer_release(smem_pipe_read);
     ++smem_pipe_read;
@@ -271,7 +294,7 @@ struct FP8CollectiveMainloop {
 
       pipeline_v.consumer_wait(smem_pipe_read);
       pipeline_vt.producer_acquire(smem_pipe_write);
-      v_tranposer.do_transpose(sV_src, sVt_tgt, smem_pipe_read.index());
+      v_tranposer.do_transpose(sVt_src, sVt_tgt, smem_pipe_read.index());
       pipeline_vt.producer_commit(smem_pipe_write);
       pipeline_v.consumer_release(smem_pipe_read);
       ++smem_pipe_read;
@@ -293,7 +316,7 @@ struct FP8CollectiveMainloop {
       }
       pipeline_v.consumer_wait(smem_pipe_read);
       pipeline_vt.producer_acquire(smem_pipe_write);
-      v_tranposer.do_transpose(sV_src, sVt_tgt, smem_pipe_read.index());
+      v_tranposer.do_transpose(sVt_src, sVt_tgt, smem_pipe_read.index());
       pipeline_vt.producer_commit(smem_pipe_write);
       pipeline_v.consumer_release(smem_pipe_read);
       ++smem_pipe_read;

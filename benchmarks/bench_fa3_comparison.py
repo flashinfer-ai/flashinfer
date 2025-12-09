@@ -6,10 +6,8 @@ random.seed(42)
 device = "cuda"
 dtype = torch.float16
 
-import sys
-
-sys.path.insert(0, "/home/zhye/flash-attention/hopper")
 from flash_attn_interface import flash_attn_varlen_func as fa3_varlen_func
+from flash_attn_interface import flash_attn_with_kvcache as fa3_kvcache_func
 import flashinfer
 from flashinfer.testing import (
     bench_gpu_time_with_cuda_event as bench_gpu_time_with_cupti,
@@ -365,4 +363,356 @@ for batch_size, seq_len, num_qo_heads, num_kv_heads in fp8_configs:
     else:
         print(
             f"{config_str:<35} {'N/A':<18} {'N/A':<15} {'N/A':<10} {'N/A':<12} {'N/A':<12}"
+        )
+
+# FP16 Paged KV Cache tests
+print("\n--- FP16 Paged KV Cache Prefill ---")
+print(
+    f"{'Config':<45} {'FlashInfer (ms)':<18} {'FA3 (ms)':<15} {'diff':<10} {'FI TFLOPS':<12} {'FA3 TFLOPS':<12}"
+)
+print("-" * 125)
+
+fp16_paged_configs = [
+    # (batch_size, seq_len, num_qo_heads, num_kv_heads, page_size)
+    # page_size=1
+    (8, 2048, 32, 8, 1),
+    (8, 4096, 32, 8, 1),
+    (8, 8192, 32, 8, 1),
+    (4, 16384, 32, 8, 1),
+    # page_size=16
+    (8, 2048, 32, 8, 16),
+    (8, 4096, 32, 8, 16),
+    (8, 8192, 32, 8, 16),
+    (4, 16384, 32, 8, 16),
+]
+
+for batch_size, seq_len, num_qo_heads, num_kv_heads, page_size in fp16_paged_configs:
+    qo_lens = [seq_len] * batch_size
+    kv_lens = [seq_len] * batch_size
+    total_q = sum(qo_lens)
+    total_kv_pages = sum((kv_len + page_size - 1) // page_size for kv_len in kv_lens)
+
+    # FP16 tensors
+    q_fp16 = torch.randn(
+        total_q, num_qo_heads, head_dim, dtype=torch.float16, device=device
+    )
+
+    # Paged KV cache: (num_pages, 2, page_size, num_kv_heads, head_dim)
+    kv_data_fp16 = torch.randn(
+        total_kv_pages,
+        2,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        dtype=torch.float16,
+        device=device,
+    )
+
+    # Page indices for each request
+    kv_indptr = torch.tensor(
+        [0]
+        + [
+            sum((kv_lens[i] + page_size - 1) // page_size for i in range(j + 1))
+            for j in range(batch_size)
+        ],
+        dtype=torch.int32,
+        device=device,
+    )
+    kv_indices = torch.arange(total_kv_pages, dtype=torch.int32, device=device)
+    kv_last_page_len = torch.tensor(
+        [((kv_len - 1) % page_size) + 1 for kv_len in kv_lens],
+        dtype=torch.int32,
+        device=device,
+    )
+    qo_indptr = torch.tensor(
+        [0] + list(torch.cumsum(torch.tensor(qo_lens), 0).numpy()),
+        dtype=torch.int32,
+        device=device,
+    )
+
+    config_str = f"bs={batch_size}, seq={seq_len}, h={num_qo_heads}/{num_kv_heads}, page={page_size}"
+
+    # Benchmark FlashInfer FP16 Paged
+    fi_time = None
+    fi_tflops = None
+    try:
+        wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device),
+            "NHD",
+            backend="fa3",
+        )
+        wrapper.plan(
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_len,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            causal=True,
+            q_data_type=torch.float16,
+        )
+        fi_time = bench_fn(lambda: wrapper.run(q_fp16, kv_data_fp16))
+        fi_tflops = calc_tflops(
+            batch_size, seq_len, num_qo_heads, head_dim, fi_time, causal=True
+        )
+    except Exception as e:
+        print(f"FlashInfer error: {e}")
+        fi_time = None
+        fi_tflops = None
+
+    # FA3 paged attention
+    fa3_time = None
+    fa3_tflops = None
+    try:
+        num_pages_per_seq = (seq_len + page_size - 1) // page_size
+        max_num_blocks_per_seq = num_pages_per_seq
+
+        # Create FA3 paged KV cache: (num_blocks, page_size, num_kv_heads, head_dim)
+        k_cache_fa3 = kv_data_fp16[
+            :, 0, :, :, :
+        ]  # (num_pages, page_size, num_kv_heads, head_dim)
+        v_cache_fa3 = kv_data_fp16[:, 1, :, :, :]
+
+        # Create page table: (batch_size, max_num_blocks_per_seq)
+        page_table = torch.zeros(
+            batch_size, max_num_blocks_per_seq, dtype=torch.int32, device=device
+        )
+        for b in range(batch_size):
+            start_page = b * num_pages_per_seq
+            for p in range(num_pages_per_seq):
+                page_table[b, p] = start_page + p
+
+        # Q for FA3: (batch_size, seq_len, num_qo_heads, head_dim)
+        q_fa3 = q_fp16.reshape(batch_size, seq_len, num_qo_heads, head_dim)
+
+        # cache_seqlens
+        cache_seqlens = torch.full(
+            (batch_size,), seq_len, dtype=torch.int32, device=device
+        )
+
+        fa3_time = bench_fn(
+            lambda: fa3_kvcache_func(
+                q_fa3,
+                k_cache_fa3,
+                v_cache_fa3,
+                cache_seqlens=cache_seqlens,
+                page_table=page_table,
+                causal=True,
+            )
+        )
+        fa3_tflops = calc_tflops(
+            batch_size, seq_len, num_qo_heads, head_dim, fa3_time, causal=True
+        )
+    except Exception as e:
+        print(f"FA3 paged error: {e}")
+        fa3_time = None
+        fa3_tflops = None
+
+    if fi_time is not None and fa3_time is not None:
+        diff = (fi_time - fa3_time) / fa3_time * 100
+        print(
+            f"{config_str:<45} {fi_time:<18.3f} {fa3_time:<15.3f} {diff:>+.1f}%{'':<4} {fi_tflops:<12.1f} {fa3_tflops:<12.1f}"
+        )
+    elif fi_time is not None:
+        print(
+            f"{config_str:<45} {fi_time:<18.3f} {'N/A':<15} {'N/A':<10} {fi_tflops:<12.1f} {'N/A':<12}"
+        )
+    else:
+        print(
+            f"{config_str:<45} {'N/A':<18} {'N/A':<15} {'N/A':<10} {'N/A':<12} {'N/A':<12}"
+        )
+
+# FP8 Paged KV Cache tests
+print("\n--- FP8 Paged KV Cache Prefill ---")
+print(
+    f"{'Config':<45} {'FlashInfer (ms)':<18} {'FA3 (ms)':<15} {'diff':<10} {'FI TFLOPS':<12} {'FA3 TFLOPS':<12}"
+)
+print("-" * 125)
+
+fp8_paged_configs = [
+    # (batch_size, seq_len, num_qo_heads, num_kv_heads, page_size)
+    # page_size=1
+    (8, 2048, 32, 8, 1),
+    (8, 4096, 32, 8, 1),
+    (8, 8192, 32, 8, 1),
+    (4, 16384, 32, 8, 1),
+    # page_size=16
+    (8, 2048, 32, 8, 16),
+    (8, 4096, 32, 8, 16),
+    (8, 8192, 32, 8, 16),
+    (4, 16384, 32, 8, 16),
+]
+
+for batch_size, seq_len, num_qo_heads, num_kv_heads, page_size in fp8_paged_configs:
+    qo_lens = [seq_len] * batch_size
+    kv_lens = [seq_len] * batch_size
+    total_q = sum(qo_lens)
+    total_kv_pages = sum((kv_len + page_size - 1) // page_size for kv_len in kv_lens)
+
+    # Create FP16 tensors first
+    q_fp16 = torch.randn(
+        total_q, num_qo_heads, head_dim, dtype=torch.float16, device=device
+    )
+
+    # Paged KV cache: (num_pages, 2, page_size, num_kv_heads, head_dim)
+    kv_data_fp16 = torch.randn(
+        total_kv_pages,
+        2,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        dtype=torch.float16,
+        device=device,
+    )
+
+    # Page indices for each request
+    kv_indptr = torch.tensor(
+        [0]
+        + [
+            sum((kv_lens[i] + page_size - 1) // page_size for i in range(j + 1))
+            for j in range(batch_size)
+        ],
+        dtype=torch.int32,
+        device=device,
+    )
+    kv_indices = torch.arange(total_kv_pages, dtype=torch.int32, device=device)
+    kv_last_page_len = torch.tensor(
+        [((kv_len - 1) % page_size) + 1 for kv_len in kv_lens],
+        dtype=torch.int32,
+        device=device,
+    )
+    qo_indptr = torch.tensor(
+        [0] + list(torch.cumsum(torch.tensor(qo_lens), 0).numpy()),
+        dtype=torch.int32,
+        device=device,
+    )
+
+    # Quantize Q to FP8
+    q_fp8, s_q = per_head_symmetric_quant(q_fp16, fp8_dtype)
+
+    # For paged KV, we need to quantize differently
+    k_fp16 = kv_data_fp16[:, 0, :, :, :].reshape(-1, num_kv_heads, head_dim)
+    v_fp16 = kv_data_fp16[:, 1, :, :, :].reshape(-1, num_kv_heads, head_dim)
+    k_fp8, s_k = per_head_symmetric_quant(k_fp16, fp8_dtype)
+    v_fp8, s_v = per_head_symmetric_quant(v_fp16, fp8_dtype)
+
+    # Reshape back to paged format
+    kv_data_fp8 = torch.stack(
+        [
+            k_fp8.reshape(total_kv_pages, page_size, num_kv_heads, head_dim),
+            v_fp8.reshape(total_kv_pages, page_size, num_kv_heads, head_dim),
+        ],
+        dim=1,
+    )
+
+    config_str = f"bs={batch_size}, seq={seq_len}, h={num_qo_heads}/{num_kv_heads}, page={page_size}"
+
+    # Benchmark FlashInfer FP8 Paged
+    fi_time = None
+    fi_tflops = None
+    try:
+        wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device),
+            "NHD",
+            backend="fa3",
+        )
+        wrapper.plan(
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_len,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            causal=True,
+            q_data_type=fp8_dtype,
+            kv_data_type=fp8_dtype,
+            o_data_type=torch.float16,
+        )
+        fi_time = bench_fn(lambda: wrapper.run(q_fp8, kv_data_fp8, s_q, s_k, s_v))
+        fi_tflops = calc_tflops(
+            batch_size, seq_len, num_qo_heads, head_dim, fi_time, causal=True
+        )
+    except Exception as e:
+        print(f"FlashInfer error: {e}")
+        fi_time = None
+        fi_tflops = None
+
+    # FA3 paged attention
+    fa3_time = None
+    fa3_tflops = None
+    try:
+        # FA3 paged format: (num_blocks, page_size, num_kv_heads, head_dim)
+        num_pages_per_seq = (seq_len + page_size - 1) // page_size
+        max_num_blocks_per_seq = num_pages_per_seq
+
+        # Create FA3 paged KV cache
+        k_cache_fa3 = k_fp8.reshape(total_kv_pages, page_size, num_kv_heads, head_dim)
+        v_cache_fa3 = v_fp8.reshape(total_kv_pages, page_size, num_kv_heads, head_dim)
+
+        # Create page table: (batch_size, max_num_blocks_per_seq)
+        page_table = torch.zeros(
+            batch_size, max_num_blocks_per_seq, dtype=torch.int32, device=device
+        )
+        for b in range(batch_size):
+            start_page = b * num_pages_per_seq
+            for p in range(num_pages_per_seq):
+                page_table[b, p] = start_page + p
+
+        # Q for FA3: (batch_size, seq_len, num_qo_heads, head_dim)
+        q_fa3 = q_fp8.reshape(batch_size, seq_len, num_qo_heads, head_dim)
+
+        # cache_seqlens: actual sequence lengths
+        cache_seqlens = torch.full(
+            (batch_size,), seq_len, dtype=torch.int32, device=device
+        )
+
+        # descale tensors for FP8
+        # FA3 expects per-head descale: shape (batch_size, num_kv_heads) for GQA
+        k_descale_fa3 = s_k.squeeze().unsqueeze(0).expand(batch_size, -1).contiguous()
+        v_descale_fa3 = s_v.squeeze().unsqueeze(0).expand(batch_size, -1).contiguous()
+        # q_descale should also be (batch_size, num_kv_heads) - one scale per kv head group
+        q_descale_fa3 = (
+            s_q.squeeze()
+            .reshape(num_kv_heads, num_qo_heads // num_kv_heads)
+            .mean(dim=1)
+        )
+        q_descale_fa3 = q_descale_fa3.unsqueeze(0).expand(batch_size, -1).contiguous()
+
+        fa3_time = bench_fn(
+            lambda: fa3_kvcache_func(
+                q_fa3,
+                k_cache_fa3,
+                v_cache_fa3,
+                cache_seqlens=cache_seqlens,
+                page_table=page_table,
+                q_descale=q_descale_fa3,
+                k_descale=k_descale_fa3,
+                v_descale=v_descale_fa3,
+                causal=True,
+            )
+        )
+        fa3_tflops = calc_tflops(
+            batch_size, seq_len, num_qo_heads, head_dim, fa3_time, causal=True
+        )
+    except Exception as e:
+        print(f"FA3 paged error: {e}")
+        fa3_time = None
+        fa3_tflops = None
+
+    if fi_time is not None and fa3_time is not None:
+        diff = (fi_time - fa3_time) / fa3_time * 100
+        print(
+            f"{config_str:<45} {fi_time:<18.3f} {fa3_time:<15.3f} {diff:>+.1f}%{'':<4} {fi_tflops:<12.1f} {fa3_tflops:<12.1f}"
+        )
+    elif fi_time is not None:
+        print(
+            f"{config_str:<45} {fi_time:<18.3f} {'N/A':<15} {'N/A':<10} {fi_tflops:<12.1f} {'N/A':<12}"
+        )
+    else:
+        print(
+            f"{config_str:<45} {'N/A':<18} {'N/A':<15} {'N/A':<10} {'N/A':<12} {'N/A':<12}"
         )

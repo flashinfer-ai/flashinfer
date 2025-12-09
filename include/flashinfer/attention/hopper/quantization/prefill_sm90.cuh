@@ -233,7 +233,8 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
                                                                      q_tile_idx, qo_len, kv_len);
       }
 
-      mma_fp8<Ktraits, /*LEFT_SLIDING_WINDOW=*/LEFT_SLIDING_WINDOW, CAUSAL,
+      mma_fp8<Ktraits, typename CollectiveMainloop::SmemLayoutVt,
+              /*LEFT_SLIDING_WINDOW=*/LEFT_SLIDING_WINDOW, CAUSAL,
               CollectiveMainloop::WarpScheduler>(
           mainloop_params, variant, pipeline_k, pipeline_vt, smem_pipe_read_k, smem_pipe_read_v,
           tOrO, attention_updater, num_kv_tiles, swa_begin_kv_tile_idx, swa_end_kv_tile_idx,
