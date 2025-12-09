@@ -330,7 +330,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
     class MoERunner(TunableRunner):
         # avoid overhead of creating a new runner in forward pass
         runner_dict: Dict[
-            Tuple[torch.dtype, torch.dtype, torch.dtype, bool, bool, bool], Any
+            Tuple[torch.dtype, torch.dtype, torch.dtype, bool, bool, bool, bool], Any
         ] = dict()
         tuning_config = TuningConfig(
             dynamic_tensor_specs=(
@@ -362,6 +362,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             min_latency_mode: bool,
             enable_pdl: bool,
             activation_type: ActivationType,
+            use_packed_weights: bool,
         ):
             self.x_dtype = x_dtype
             self.weight_dtype = weight_dtype
@@ -379,6 +380,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             self.use_mxfp8_act_scaling = use_mxfp8_act_scaling
             self.min_latency_mode = min_latency_mode
             self.enable_pdl = enable_pdl
+            self.use_packed_weights = use_packed_weights
             instance_key = (
                 x_dtype,
                 weight_dtype,
@@ -386,6 +388,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
                 use_deepseek_fp8_block_scale,
                 use_w4_group_scaling,
                 use_mxfp8_act_scaling,
+                use_packed_weights,
             )
             self.activation_type = activation_type
             # Set by tuning flow to indicate which GEMM stage (1 or 2) to filter tactics for
@@ -399,6 +402,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
                     use_deepseek_fp8_block_scale,
                     use_w4_group_scaling,
                     use_mxfp8_act_scaling,
+                    use_packed_weights,
                 )
 
             self.fused_moe_runner = MoERunner.runner_dict[instance_key]
@@ -506,6 +510,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
         tune_max_num_tokens: int = 8192,
         enable_pdl: Optional[bool] = None,
         activation_type: ActivationType = ActivationType.Swiglu,
+        use_packed_weights: bool = False,
     ) -> List[torch.Tensor]:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(input.device)
@@ -531,6 +536,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             min_latency_mode=min_latency_mode,
             enable_pdl=enable_pdl,
             activation_type=activation_type,
+            use_packed_weights=use_packed_weights,
         )
 
         # Limit tactics to GEMM1 during tuning
@@ -660,6 +666,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
         min_latency_mode: bool = False,
         tune_max_num_tokens: int = 8192,
         enable_pdl: Optional[bool] = None,
+        use_packed_weights: bool = False,
     ):
         seq_len = input.shape[0]
         hidden_size = fc2_expert_weights.shape[1]
@@ -711,6 +718,7 @@ def cutlass_fused_moe(
     use_w4_group_scaling: bool = False,
     use_mxfp8_act_scaling: bool = False,
     min_latency_mode: bool = False,
+    use_packed_weights: bool = False,
     tune_max_num_tokens: int = 8192,
     enable_pdl: Optional[bool] = None,
     activation_type: ActivationType = ActivationType.Swiglu,
@@ -893,6 +901,7 @@ def cutlass_fused_moe(
         ep_rank,
         cluster_size,
         cluster_rank,
+        use_packed_weights=use_packed_weights,
         enable_alltoall=enable_alltoall,
         use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
         use_w4_group_scaling=use_w4_group_scaling,
@@ -973,6 +982,7 @@ def get_trtllm_moe_sm100_module():
             gated_act_type: int = GatedActType.SwiGlu,
             use_shuffled_weight: bool = False,
             weight_layout: int = WeightLayout.MajorK,
+            use_packed_weights: bool = False,
         ):
             self.num_local_experts = num_local_experts
             self.top_k = top_k
@@ -985,6 +995,7 @@ def get_trtllm_moe_sm100_module():
             self.gated_act_type = GatedActType(gated_act_type)
             self.use_shuffled_weight = use_shuffled_weight
             self.weight_layout = WeightLayout(weight_layout)
+            self.use_packed_weights = use_packed_weights
 
         def get_valid_tactics(
             self,
