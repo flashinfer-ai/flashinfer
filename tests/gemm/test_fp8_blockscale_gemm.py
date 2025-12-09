@@ -19,7 +19,7 @@ import torch
 import torch.nn.functional as F
 
 import flashinfer
-from flashinfer.gemm import fp8_blockscale_gemm_swapab
+from flashinfer.gemm import fp8_blockscale_gemm_sm90
 from flashinfer.testing.utils import per_token_cast_to_fp8, per_block_cast_to_fp8
 from flashinfer.utils import (
     get_compute_capability,
@@ -62,7 +62,7 @@ def warmup_jit():
 @pytest.mark.parametrize("k", [256, 512, 1024, 4096])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
 @pytest.mark.parametrize("weight_dtype", [torch.bfloat16])
-def test_fp8_blockscale_gemm_swapab(m, n, k, input_dtype, weight_dtype):
+def test_fp8_blockscale_gemm_sm90(m, n, k, input_dtype, weight_dtype):
     """Test FP8 block-scale GEMM with swapAB optimization.
 
     This test focuses on the usage: BF16 inputs with internal quantization.
@@ -90,7 +90,7 @@ def test_fp8_blockscale_gemm_swapab(m, n, k, input_dtype, weight_dtype):
     reference = torch.matmul(input, weight.T)
 
     # Run FP8 block-scale GEMM
-    output = fp8_blockscale_gemm_swapab(input, weight)
+    output = fp8_blockscale_gemm_sm90(input, weight)
 
     # Verify output shape
     assert output.shape == (m, n), f"Expected shape {(m, n)}, got {output.shape}"
@@ -162,7 +162,7 @@ def test_fp8_blockscale_gemm_dtypes(m, n, k, input_dtype, weight_dtype):
     reference = torch.matmul(input_bf16, weight_bf16.T)
 
     # Run FP8 block-scale GEMM
-    output = fp8_blockscale_gemm_swapab(
+    output = fp8_blockscale_gemm_sm90(
         input_tensor, weight_tensor, input_scale, weight_scale
     )
 
@@ -227,9 +227,7 @@ def test_fp8_blockscale_gemm_w8a8(m, n, k):
     assert weight_scale.min() > 0, "Weight scale should be positive"
 
     # Run W8A8 GEMM: FP8 input + FP8 weight
-    output = fp8_blockscale_gemm_swapab(
-        input_fp8, weight_fp8, input_scale, weight_scale
-    )
+    output = fp8_blockscale_gemm_sm90(input_fp8, weight_fp8, input_scale, weight_scale)
 
     # Dequantize FP8 tensors to create reference (tests kernel correctness, not quantization)
     # Dequant: bf16 = fp8.to(bf16) * scale (applied per 128-element block)
@@ -293,7 +291,7 @@ def test_fp8_blockscale_gemm_per_block_weight_scales():
     assert weight_scale.min() > 0, "Weight scale should be positive (reciprocal format)"
 
     # Run GEMM: BF16 input (internal quant) + FP8 weight (per-block scales)
-    output = fp8_blockscale_gemm_swapab(input_bf16, weight_fp8, None, weight_scale)
+    output = fp8_blockscale_gemm_sm90(input_bf16, weight_fp8, None, weight_scale)
 
     # Compare to BF16 reference
     reference = torch.matmul(input_bf16, weight_bf16.T)
@@ -336,7 +334,7 @@ def test_fp8_blockscale_gemm_shapes(m, n, k):
     weight = torch.randn(n, k, device=device, dtype=torch.bfloat16)
 
     reference = torch.matmul(input, weight.T)
-    output = fp8_blockscale_gemm_swapab(input, weight)
+    output = fp8_blockscale_gemm_sm90(input, weight)
 
     cos_sim = F.cosine_similarity(
         reference.flatten().float(), output.flatten().float(), dim=0
@@ -360,27 +358,27 @@ def test_fp8_blockscale_gemm_error_handling():
     input = torch.randn(m, 127, device=device, dtype=torch.bfloat16)
     weight = torch.randn(n, 127, device=device, dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="divisible by block size"):
-        fp8_blockscale_gemm_swapab(input, weight)
+        fp8_blockscale_gemm_sm90(input, weight)
 
     # Test: FP16 not supported
     input = torch.randn(m, k, device=device, dtype=torch.float16)
     weight = torch.randn(n, k, device=device, dtype=torch.float16)
     with pytest.raises(ValueError, match="FP8.*or BF16"):
-        fp8_blockscale_gemm_swapab(input, weight)
+        fp8_blockscale_gemm_sm90(input, weight)
 
     # Test: FP8 weight without scale (naive conversion)
     input_bf16 = torch.randn(m, k, device=device, dtype=torch.bfloat16)
     weight_bf16 = torch.randn(n, k, device=device, dtype=torch.bfloat16)
     weight_fp8_naive = weight_bf16.to(torch.float8_e4m3fn)
     with pytest.raises(ValueError, match="weight_scale is required when weight is FP8"):
-        fp8_blockscale_gemm_swapab(input_bf16, weight_fp8_naive, None, None)
+        fp8_blockscale_gemm_sm90(input_bf16, weight_fp8_naive, None, None)
 
     # Test: BF16 input with scale (should raise error)
     input = torch.randn(m, k, device=device, dtype=torch.bfloat16)
     weight = torch.randn(n, k, device=device, dtype=torch.bfloat16)
     fake_scale = torch.ones(m, k // 128, device=device, dtype=torch.float32)
     with pytest.raises(ValueError, match="input_scale should not be provided for BF16"):
-        fp8_blockscale_gemm_swapab(input, weight, input_scale=fake_scale)
+        fp8_blockscale_gemm_sm90(input, weight, input_scale=fake_scale)
 
     # Test: Wrong scale shape for FP8 input
     input_bf16 = torch.randn(m, k, device=device, dtype=torch.bfloat16)
@@ -388,14 +386,14 @@ def test_fp8_blockscale_gemm_error_handling():
     weight = torch.randn(n, k, device=device, dtype=torch.bfloat16)
     wrong_scale = torch.ones(m, k // 64, device=device, dtype=torch.float32)
     with pytest.raises(ValueError):
-        fp8_blockscale_gemm_swapab(input_fp8, weight, input_scale=wrong_scale)
+        fp8_blockscale_gemm_sm90(input_fp8, weight, input_scale=wrong_scale)
 
     # Test: FP8 input + BF16 weight is NOT supported
     input_bf16 = torch.randn(m, k, device=device, dtype=torch.bfloat16)
     input_fp8, input_scale = per_token_cast_to_fp8(input_bf16)
     weight = torch.randn(n, k, device=device, dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="FP8 input.*BF16 weight.*not supported"):
-        fp8_blockscale_gemm_swapab(input_fp8, weight, input_scale, None)
+        fp8_blockscale_gemm_sm90(input_fp8, weight, input_scale, None)
 
 
 def test_fp8_blockscale_gemm_output_buffer():
@@ -418,7 +416,7 @@ def test_fp8_blockscale_gemm_output_buffer():
     output = torch.empty(m, n, device=device, dtype=torch.bfloat16)
 
     # Run GEMM with pre-allocated output
-    result = fp8_blockscale_gemm_swapab(input, weight, out=output)
+    result = fp8_blockscale_gemm_sm90(input, weight, out=output)
 
     # Verify result is the same buffer
     assert result is output

@@ -3296,7 +3296,8 @@ def get_fp8_blockscale_gemm_runner_sm90():
     return gen_fp8_blockscale_gemm_sm90_module().build_and_load().init()
 
 
-def fp8_blockscale_gemm_swapab(
+@flashinfer_api
+def fp8_blockscale_gemm_sm90(
     input: torch.Tensor,
     weight: torch.Tensor,
     input_scale: Optional[torch.Tensor] = None,
@@ -3338,7 +3339,7 @@ def fp8_blockscale_gemm_swapab(
     Examples
     --------
     >>> import torch
-    >>> from flashinfer.gemm import fp8_blockscale_gemm_swapab
+    >>> from flashinfer.gemm import fp8_blockscale_gemm_sm90
     >>>
     >>> M, N, K = 16, 4096, 4096
     >>> device = "cuda"
@@ -3346,7 +3347,7 @@ def fp8_blockscale_gemm_swapab(
     >>> # BF16 inputs
     >>> input_bf16 = torch.randn(M, K, device=device, dtype=torch.bfloat16)
     >>> weight_bf16 = torch.randn(N, K, device=device, dtype=torch.bfloat16)
-    >>> output = fp8_blockscale_gemm_swapab(input_bf16, weight_bf16)
+    >>> output = fp8_blockscale_gemm_sm90(input_bf16, weight_bf16)
     >>> print(output.shape)  # torch.Size([16, 4096])
     >>>
     >>> # Mixed: BF16 input + FP8 weight
@@ -3354,7 +3355,7 @@ def fp8_blockscale_gemm_swapab(
     >>> input_bf16 = torch.randn(M, K, device=device, dtype=torch.bfloat16)
     >>> weight_bf16 = torch.randn(N, K, device=device, dtype=torch.bfloat16)
     >>> weight_fp8, weight_scale = per_token_cast_to_fp8(weight_bf16)
-    >>> output = fp8_blockscale_gemm_swapab(input_bf16, weight_fp8, None, weight_scale)
+    >>> output = fp8_blockscale_gemm_sm90(input_bf16, weight_fp8, None, weight_scale)
     >>> print(output.shape)  # torch.Size([16, 4096])
     >>>
     >>> # FP8 weight with 128x128 block scales
@@ -3363,7 +3364,7 @@ def fp8_blockscale_gemm_swapab(
     >>> weight_fp8, weight_scale = per_block_cast_to_fp8(weight_bf16)
     >>> # weight_scale has shape (N // 128, K // 128)
     >>> input_bf16 = torch.randn(M, K, device=device, dtype=torch.bfloat16)
-    >>> output = fp8_blockscale_gemm_swapab(input_bf16, weight_fp8, None, weight_scale)
+    >>> output = fp8_blockscale_gemm_sm90(input_bf16, weight_fp8, None, weight_scale)
     >>> print(output.shape)  # torch.Size([16, 4096])
     Notes
     -----
@@ -3380,7 +3381,7 @@ def fp8_blockscale_gemm_swapab(
     # Validate architecture support
     if not _match_sm_version(input.device, ["90", "90a"]):
         raise ValueError(
-            "fp8_blockscale_gemm_swapab is only supported on SM90 (Hopper) architecture."
+            "fp8_blockscale_gemm_sm90 is only supported on SM90 (Hopper) architecture."
         )
 
     # Validate tensor dimensions
@@ -3392,7 +3393,7 @@ def fp8_blockscale_gemm_swapab(
     M, K = input.shape
     N, K_weight = weight.shape
 
-    if K != K_weight:
+    if K_weight != K:
         raise ValueError(
             f"K dimension mismatch: input has K={K}, weight has K={K_weight}"
         )
