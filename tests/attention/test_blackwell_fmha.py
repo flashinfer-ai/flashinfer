@@ -419,6 +419,7 @@ def test_blackwell_cutlass_fmha_fp8(
         sm_scale=sm_scale,
         q_data_type=dtype_in,
         kv_data_type=dtype_in,
+        o_data_type=dtype_out,
     )
     o, lse = wrapper.run(q, k, v, return_lse=True)
 
@@ -473,37 +474,48 @@ def test_blackwell_cutlass_fmha_fp8(
 
 
 if __name__ == "__main__":
-    test_blackwell_cutlass_fmha(
-        9,
-        377,
-        977,
-        1,
-        1,
-        192,
-        128,
-        1,
-        False,
-        torch.bfloat16,
+    test_blackwell_cutlass_fmha_fp8(
+        batch_size=9,
+        qo_len=377,
+        kv_len=977,
+        num_qo_heads=1,
+        num_kv_heads=1,
+        head_dim_qk=192,
+        head_dim_vo=128,
+        sm_scale=1,
+        causal=False,
     )
+    # test_blackwell_cutlass_fmha(
+    #     9,
+    #     377,
+    #     977,
+    #     1,
+    #     1,
+    #     192,
+    #     128,
+    #     1,
+    #     False,
+    #     torch.bfloat16,
+    # )
 
-    test_blackwell_cutlass_varlen(
-        [0, 1274, 2568, 3915, 5194, 6498, 7839, 8192],
-        32,
-        4,
-        128,
-        128,
-        1,
-        True,
-        torch.bfloat16,
-    )
+    # test_blackwell_cutlass_varlen(
+    #     [0, 1274, 2568, 3915, 5194, 6498, 7839, 8192],
+    #     32,
+    #     4,
+    #     128,
+    #     128,
+    #     1,
+    #     True,
+    #     torch.bfloat16,
+    # )
 
-    test_blackwell_cutlass_qo_kv_varlen(
-        [0, 10, 20, 30, 40, 50, 60, 100],
-        [0, 50, 50, 50, 50, 50, 50, 50],
-        32,
-        8,
-        128,
-        128,
-        1,
-        torch.bfloat16,
-    )
+    # test_blackwell_cutlass_qo_kv_varlen(
+    #     [0, 10, 20, 30, 40, 50, 60, 100],
+    #     [0, 50, 50, 50, 50, 50, 50, 50],
+    #     32,
+    #     8,
+    #     128,
+    #     128,
+    #     1,
+    #     torch.bfloat16,
+    # )

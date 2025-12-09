@@ -85,7 +85,8 @@ void FMHACutlassSM100Run(ffi::TensorView workspace_buffer, ffi::TensorView q, ff
                          ffi::TensorView qo_tile_indices, ffi::TensorView qo_head_indices,
                          ffi::TensorView batch_indices, ffi::TensorView o,
                          Optional<ffi::TensorView> maybe_lse, int64_t mask_mode_code,
-                         double sm_scale, int64_t max_qo_len) {
+                         double sm_scale, double scale_q, double scale_k, double scale_v,
+                         double o_scale, int64_t max_qo_len) {
   TVM_FFI_ICHECK_EQ(q.dtype(), k.dtype());
   auto scalar_type_in = q.dtype();
   auto scalar_type_out = o.dtype();
@@ -128,7 +129,7 @@ void FMHACutlassSM100Run(ffi::TensorView workspace_buffer, ffi::TensorView q, ff
         static_cast<int*>(qo_head_indices.data_ptr()), static_cast<int*>(batch_indices.data_ptr()),
         static_cast<cutlass_type_out*>(o.data_ptr()),
         maybe_lse.has_value() ? static_cast<float*>(maybe_lse.value().data_ptr()) : nullptr,
-        mask_mode_code, sm_scale, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, q_stride_n,
+        mask_mode_code, sm_scale, scale_q, scale_k, scale_v, o_scale, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, q_stride_n,
         q_stride_h, k_stride_n, k_stride_h, v_stride_n, v_stride_h, batch_size, total_qo_len,
         total_kv_len, max_qo_len, stream);
     TVM_FFI_ICHECK_EQ(status, cudaSuccess)

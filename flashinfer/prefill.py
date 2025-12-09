@@ -2908,6 +2908,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         k: torch.Tensor,
         v: torch.Tensor,
         *args,
+        q_scale: Optional[float] = None,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+        o_scale: Optional[float] = None,
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
@@ -2926,6 +2930,14 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             The value tensor, shape: ``[kv_indptr[-1], num_kv_heads, head_dim_vo]``
         *args
             Additional arguments for the custom kernel.
+        q_scale: Optional[float]
+            The calibration scale of fp8 query, if not provided, will be set to ``1.0``.
+        k_scale: Optional[float]
+            The calibration scale of fp8 key, if not provided, will be set to ``1.0``.
+        v_scale: Optional[float]
+            The calibration scale of fp8 value, if not provided, will be set to ``1.0``.
+        o_scale: Optional[float]
+            The calibration scale of output, if not provided, will be set to ``1.0``.
         out : Optional[torch.Tensor]
             The output tensor, if not provided, will be allocated internally.
         lse : Optional[torch.Tensor]
@@ -2998,6 +3010,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 plan_info=self._plan_info,
                 causal=self._causal,
                 sm_scale=sm_scale,
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                o_scale=o_scale,
                 max_qo_len=self._max_qo_len,
                 out=out,
                 lse=lse,
@@ -3183,6 +3199,10 @@ def fmha_varlen(
     lse: Optional[torch.Tensor] = None,
     causal: bool = False,
     sm_scale: Optional[float] = None,
+    q_scale: Optional[float] = None,
+    k_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
+    o_scale: Optional[float] = None,
     return_lse: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     workspace_buffer = _get_cache_buf(
@@ -3207,6 +3227,14 @@ def fmha_varlen(
     mask_mode_code = 1 if causal else 0
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(head_dim_qk)
+    if q_scale is None:
+        q_scale = 1.0
+    if k_scale is None:
+        k_scale = 1.0
+    if v_scale is None:
+        v_scale = 1.0
+    if o_scale is None:
+        o_scale = 1.0
 
     qo_total_len = nnz_qo
     if max_qo_len is None:
@@ -3255,6 +3283,10 @@ def fmha_varlen(
         lse,
         mask_mode_code,
         sm_scale,
+        q_scale,
+        k_scale,
+        v_scale,
+        o_scale,
         max_qo_len,
     )
 

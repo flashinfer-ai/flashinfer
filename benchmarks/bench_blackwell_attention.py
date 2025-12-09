@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import argparse
 import csv
 import numpy as np
 import torch
@@ -34,28 +35,20 @@ def bench_fmha_blackwell(
     head_dim_vo,
     causal,
     dtype,
+    o_data_type,
 ):
-    # if sizeof(dtype) == 1, create randn from half and then convert to dtype
-    if dtype.itemsize == 1:
-        q = torch.randn(
-            batch_size * qkv_len, num_qo_heads, head_dim_qk, dtype=torch.half, device="cuda"
-        ).to(dtype)
-        k = torch.randn(
-            batch_size * qkv_len, num_kv_heads, head_dim_qk, dtype=torch.half, device="cuda"
-        ).to(dtype)
-        v = torch.randn(
-            batch_size * qkv_len, num_kv_heads, head_dim_vo, dtype=torch.half, device="cuda"
-        ).to(dtype)
-    else:
-        q = torch.randn(
-            batch_size * qkv_len, num_qo_heads, head_dim_qk, dtype=dtype, device="cuda"
-        )
-        k = torch.randn(
-            batch_size * qkv_len, num_kv_heads, head_dim_qk, dtype=dtype, device="cuda"
-        )
-        v = torch.randn(
-            batch_size * qkv_len, num_kv_heads, head_dim_vo, dtype=dtype, device="cuda"
-        )
+    # if sizeof(dtype) == 1 like with torch.float8_e4m3fn,
+    # create randn from half and then convert to dtype
+    init_dtype = torch.half if dtype.itemsize == 1 else dtype
+    q = torch.randn(
+        batch_size * qkv_len, num_qo_heads, head_dim_qk, dtype=init_dtype, device="cuda"
+    ).to(dtype)
+    k = torch.randn(
+        batch_size * qkv_len, num_kv_heads, head_dim_qk, dtype=init_dtype, device="cuda"
+    ).to(dtype)
+    v = torch.randn(
+        batch_size * qkv_len, num_kv_heads, head_dim_vo, dtype=init_dtype, device="cuda"
+    ).to(dtype)
 
     qo_segment_offsets = (
         torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * qkv_len
@@ -68,6 +61,8 @@ def bench_fmha_blackwell(
         kv_layout="NHD",
         backend="cutlass",
     )
+    # For FP8 input, output must be bfloat16
+    o_data_type = torch.bfloat16 if dtype.itemsize == 1 else dtype
     wrapper.plan(
         qo_segment_offsets,
         kv_segment_offsets,
@@ -78,6 +73,7 @@ def bench_fmha_blackwell(
         causal=causal,
         q_data_type=dtype,
         kv_data_type=dtype,
+        o_data_type=o_data_type,
     )
     _o = wrapper.run(q, k, v)
     measurements = bench_gpu_time(
@@ -90,16 +86,39 @@ def bench_fmha_blackwell(
     TFLOPS = attention_tflops_per_sec_with_actual_seq_lens(
         torch.full((batch_size,), qkv_len),
         torch.full((batch_size,), qkv_len),
-        head_dim,
-        head_dim,
-        num_heads,
+        head_dim_qk,
+        head_dim_vo,
+        num_qo_heads,
         causal,
         ms,
     )
     print(
-        f"bench_fmha_blackwell (batch_size={batch_size}, qkv_len={qkv_len}, num_heads={num_heads}, head_dim={head_dim}, causal={causal}), flops: {TFLOPS:.3f} TFLOPs/s"
+        f"bench_fmha_blackwell (batch_size={batch_size}, qkv_len={qkv_len}, num_qo_heads={num_qo_heads}, num_kv_heads={num_kv_heads}, head_dim_qk={head_dim_qk}, head_dim_vo={head_dim_vo}, causal={causal}), flops: {TFLOPS:.3f} TFLOPs/s"
+    )
+    return {
+        "config_name": f"Blackwell-{config_name}",
+        "batch_size": batch_size,
+        "qkv_len": qkv_len,
+        "num_qo_heads": num_qo_heads,
+        "num_kv_heads": num_kv_heads,
+        "head_dim_qk": head_dim_qk,
+        "head_dim_vo": head_dim_vo,
+        "causal": causal,
+        "dtype": dtype,
+        "time_ms": ms,
+        "tflops": TFLOPS,
+    }
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Benchmark FP8 attention for DeepSeek-R1")
+    parser.add_argument(
+        "--save-results-to",
+        type=str,
+        default=None,
+        help="Path to save benchmark results as CSV (optional)"
+    )
+    args = parser.parse_args()
+    
     results = []
     
     # Define configurations: (batch_size, qkv_len, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, config_name)
@@ -125,7 +144,8 @@ if __name__ == "__main__":
             print(f"\n[{config_name}] BS={batch_size}, SeqLen={qkv_len}, Causal={causal}, BF16")
             result_bf16 = bench_fmha_blackwell(
                 batch_size, qkv_len, num_qo_heads, num_kv_heads, 
-                head_dim_qk, head_dim_vo, causal, torch.bfloat16
+                head_dim_qk, head_dim_vo, causal, torch.bfloat16,
+                o_data_type=torch.bfloat16,
             )
             result_bf16["config_name"] = config_name
             results.append(result_bf16)
@@ -135,24 +155,25 @@ if __name__ == "__main__":
             print(f"[{config_name}] BS={batch_size}, SeqLen={qkv_len}, Causal={causal}, FP8")
             result_fp8 = bench_fmha_blackwell(
                 batch_size, qkv_len, num_qo_heads, num_kv_heads,
-                head_dim_qk, head_dim_vo, causal, torch.float8_e4m3fn
+                head_dim_qk, head_dim_vo, causal, torch.float8_e4m3fn,
+                o_data_type=torch.bfloat16,
             )
             result_fp8["config_name"] = config_name
             results.append(result_fp8)
             speedup = result_fp8['tflops'] / result_bf16['tflops']
             print(f"  → {result_fp8['tflops']:.2f} TFLOPs/s, {result_fp8['time_ms']:.3f} ms (speedup: {speedup:.2f}x)")
     
-    # Write results to CSV
-    csv_filename = "/workspace/logs/fp8_attention_deepseek_benchmark.csv"
-    fieldnames = ["config_name", "batch_size", "qkv_len", "num_qo_heads", "num_kv_heads", 
-                  "head_dim_qk", "head_dim_vo", "causal", "dtype", "time_ms", "tflops"]
-    
-    with open(csv_filename, 'w', newline='') as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        writer.writeheader()
-        for result in results:
-            writer.writerow(result)
-    
-    print(f"\n{'='*80}")
-    print(f"Results saved to: {csv_filename}")
-    print(f"{'='*80}")
+    # Write results to CSV if requested
+    if args.save_results_to:
+        fieldnames = ["config_name", "batch_size", "qkv_len", "num_qo_heads", "num_kv_heads", 
+                      "head_dim_qk", "head_dim_vo", "causal", "dtype", "time_ms", "tflops"]
+        
+        with open(args.save_results_to, 'w', newline='') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            for result in results:
+                writer.writerow(result)
+        
+        print(f"\n{'='*80}")
+        print(f"Results saved to: {args.save_results_to}")
+        print(f"{'='*80}")
