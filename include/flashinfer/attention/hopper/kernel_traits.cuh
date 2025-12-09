@@ -17,6 +17,7 @@
 #include "cutlass/layout/layout.h"
 #include "cutlass/numeric_types.h"
 #include "cutlass/pipeline/pipeline.hpp"
+#include "sm90_pipeline_no_cluster.cuh"
 
 namespace flashinfer {
 
@@ -109,8 +110,10 @@ struct AttentionKernelTraits {
                                    GMMA::Major::K, DTypeO, decltype(cute::get<0>(TileShape_PDV{})),
                                    decltype(cute::get<1>(TileShape_PDV{}))>());
   using SmemLayoutO = decltype(tile_to_shape(SmemLayoutAtomO{}, select<0, 1>(TileShape_PDV{})));
+  // Use PipelineTmaAsyncNoCluster for TMA loads to avoid perf regression in Cutlass 3.6+
+  // Only 1 out of 128 threads signals the barrier (instead of all threads)
   using MainloopPipeline =
-      std::conditional_t<USE_TMA_LOAD_KV, typename cutlass::PipelineTmaAsync<NUM_STAGES>,
+      std::conditional_t<USE_TMA_LOAD_KV, PipelineTmaAsyncNoCluster<NUM_STAGES>,
                          typename cutlass::PipelineAsync<NUM_STAGES>>;
   using PipelineState = typename cutlass::PipelineState<NUM_STAGES>;
 
