@@ -1837,7 +1837,7 @@ def testBatchMLAPagedAttentionWrapper(args):
                 return_lse=False,
             )
         elif backend == "trtllm-native":
-            return flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+            return flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla(
                 query=q.unsqueeze(1),
                 kv_cache=kv_cache.unsqueeze(1),
                 workspace_buffer=workspace_buffer,

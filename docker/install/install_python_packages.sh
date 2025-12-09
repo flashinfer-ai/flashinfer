@@ -22,9 +22,10 @@ set -u
 # Accept CUDA version as parameter (e.g., cu126, cu128, cu129)
 CUDA_VERSION=${1:-cu128}
 
-# Install requirements.txt first, so we can override any versions later for docker image
-pip3 install -r /install/requirements.txt
+# Install torch with specific CUDA version first, followed by others in requirements.txt, and then others.
+# This is to ensure that the torch version is compatible with the CUDA version.
 pip3 install --force-reinstall torch --index-url https://download.pytorch.org/whl/${CUDA_VERSION}
+pip3 install -r /install/requirements.txt
 pip3 install responses pytest scipy build cuda-python nvidia-nvshmem-cu12
 
 # Install cudnn package based on CUDA version

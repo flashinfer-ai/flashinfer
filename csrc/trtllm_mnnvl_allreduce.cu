@@ -33,7 +33,7 @@ void trtllm_mnnvl_allreduce_fusion(TensorView input, int64_t multicast_buffer_pt
                                    TensorView output, Optional<TensorView> residual_out,
                                    Optional<TensorView> residual_in, Optional<TensorView> gamma,
                                    Optional<double> epsilon) {
-  cudaSetDevice(input.device().device_id);
+  ffi::CUDADeviceGuard device_guard(input.device().device_id);
   auto stream = get_stream(input.device());
 
   DISPATCH_FLOATING_TYPES_FOR_MNNVL_ALLREDUCE(input.dtype(), c_type, [&] {

@@ -56,7 +56,7 @@ Array<int64_t> BatchPrefillWithKVCacheSM90Plan(
 
   flashinfer::PrefillPlanSM90Info plan_info;
 
-  cudaSetDevice(float_workspace_buffer.device().device_id);
+  ffi::CUDADeviceGuard device_guard(float_workspace_buffer.device().device_id);
   const cudaStream_t stream = get_stream(float_workspace_buffer.device());
 
   cudaError_t status = PrefillSM90Plan(
@@ -97,7 +97,7 @@ void BatchPrefillWithRaggedKVCacheSM90Run(
 
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
 
-  cudaSetDevice(float_workspace_buffer.device().device_id);
+  ffi::CUDADeviceGuard device_guard(float_workspace_buffer.device().device_id);
   const cudaStream_t stream = get_stream(float_workspace_buffer.device());
   const MaskMode mask_mode = static_cast<MaskMode>(mask_mode_code);
   bool use_swa = window_left != -1;
@@ -193,7 +193,7 @@ void BatchPrefillWithPagedKVCacheSM90Run(
   void* float_buffer_ptr = float_workspace_buffer.data_ptr();
   void* int_buffer_ptr = int_workspace_buffer.data_ptr();
 
-  cudaSetDevice(float_workspace_buffer.device().device_id);
+  ffi::CUDADeviceGuard device_guard(float_workspace_buffer.device().device_id);
   const cudaStream_t stream = get_stream(float_workspace_buffer.device());
   const MaskMode mask_mode = static_cast<MaskMode>(mask_mode_code);
   bool use_swa = window_left != -1;
@@ -218,13 +218,24 @@ void BatchPrefillWithPagedKVCacheSM90Run(
           params.k_stride_h = paged_k_cache.stride(2);
           params.v_stride_n = paged_v_cache.stride(1);
           params.v_stride_h = paged_v_cache.stride(2);
+          // For sparse paged KV cache, store the stride between pages
+          params.k_page_stride = paged_k_cache.stride(0);
+          params.v_page_stride = paged_v_cache.stride(0);
         } else {
           // (num_pages, num_heads, page_size, head_dim)
           params.k_stride_h = paged_k_cache.stride(1);
           params.k_stride_n = paged_k_cache.stride(2);
           params.v_stride_h = paged_v_cache.stride(1);
           params.v_stride_n = paged_v_cache.stride(2);
+          // For sparse paged KV cache, store the stride between pages
+          params.k_page_stride = paged_k_cache.stride(0);
+          params.v_page_stride = paged_v_cache.stride(0);
         }
+        // Sparse mainloop assumes K and V have same strides for efficiency
+        TVM_FFI_ICHECK_EQ(params.k_page_stride, params.v_page_stride)
+            << "K and V must have same page stride for sparse attention";
+        TVM_FFI_ICHECK_EQ(params.k_stride_n, params.v_stride_n)
+            << "K and V must have same stride_n for sparse attention";
         params.nnz_qo = q.size(0);
         params.num_qo_heads = q.size(1);
         params.num_kv_heads = num_kv_heads;
