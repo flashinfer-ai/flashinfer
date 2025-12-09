@@ -116,7 +116,7 @@ def get_dsv3_fused_routing_module():
 
 
 @backend_requirement({}, common_check=_check_dsv3_fused_routing_supported)
-def NoAuxTc(
+def fused_topk_deepseek(
     scores: torch.Tensor,
     bias: torch.Tensor,
     n_group: int,

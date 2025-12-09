@@ -91,7 +91,7 @@ void CutlassGroupGemmFP8GroupwiseScaledSM100(
     TensorView SFA, TensorView SFB, TensorView D, TensorView m_indptr, int64_t n, int64_t k,
     int64_t scale_granularity_m, int64_t scale_granularity_n, int64_t scale_granularity_k,
     std::string scale_major_mode, int64_t mma_sm) {
-  cudaSetDevice(float_workspace_buffer.device().device_id);
+  ffi::CUDADeviceGuard device_guard(float_workspace_buffer.device().device_id);
   auto stream = get_stream(D.device());
   int num_groups = m_indptr.size(0) - 1;
   int max_m = SFA.size(1);

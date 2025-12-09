@@ -20,6 +20,7 @@ from typing import Optional, Tuple, Union
 
 import torch
 
+from .api_logging import flashinfer_api
 from .jit import gen_batch_attention_module
 from .utils import (
     MaskMode,
@@ -40,6 +41,7 @@ def get_holistic_attention_module(*args):
 
 
 class BatchAttention:
+    @flashinfer_api
     def __init__(
         self,
         kv_layout: str = "NHD",
@@ -65,6 +67,7 @@ class BatchAttention:
             pin_memory=True,
         )
 
+    @flashinfer_api
     def plan(
         self,
         qo_indptr: torch.Tensor,
@@ -132,6 +135,7 @@ class BatchAttention:
             causal,
         )
 
+    @flashinfer_api
     def run(
         self,
         q: torch.Tensor,

@@ -60,15 +60,16 @@ namespace tg = trtllm::gen;
 
 // Type of the gated activation
 enum class ActType {
+  // clang-format off
   // For ActType == SwiGlu, ideally we would like to have something like
-  //    gatedAct = quantScaleC * (x0 * dequantScaleAb + beta) * ((x1 * scaleGate) *
-  //    sigmoid(alpha * x1 * scaleGate)).
+  //    gatedAct = quantScaleC * (x0 * dequantScaleAb + beta) * ((x1 * scaleGate) * sigmoid(alpha * x1 * scaleGate)).
   // But for now, we use the simplified version
-  //    gatedAct = scaleC * (x0 + beta') * ((x1 * scaleGate) * sigmoid(alpha * x1 * scaleGate)),
+  //    gatedAct = scaleC      * (x0                 + beta') * ((x1 * scaleGate) * sigmoid(alpha * x1 * scaleGate)),
   // where x0 and x1 are the raw numbers from Gemm, while scaleC and scaleGate are input scales,
   // beta' = beta / dequantScaleAb, scaleC = quantScaleC * dequantScaleAb.
   //
   // GatedSilu is a special case of SwiGlu where the alpha is 1.0 and the beta is 0.0.
+  // clang-format on
   SwiGlu,
   // For ActType == GeGlu, we use the simplified version
   //    gatedAct = scaleC' * (x0 + beta') * ((x1 * scaleGate) * phi(alpha * x1 * scaleGate)),
@@ -119,7 +120,7 @@ struct GemmGatedActOptions : public gemm::GemmOptions {
 
 // Check if the options are valid or not.
 inline bool checkAndUpdateGemmGatedActOptions(gemmGatedAct::GemmGatedActOptions& options,
-                                              bool isBlackwell, bool updateOptions = true) {
+                                              tg::CudaArch cudaArch, bool updateOptions = true) {
   // tmpOut is already transposed at this stage
   auto const hiddenSizeStr = options.mTransposeMmaOutput ? "M" : "N";
   auto const hiddenSize = options.mTransposeMmaOutput ? options.mM : options.mN;
@@ -144,7 +145,7 @@ inline bool checkAndUpdateGemmGatedActOptions(gemmGatedAct::GemmGatedActOptions&
                      ") must be a multiple of ", hiddenGranularity, " for block-scaled outputs.");
   }
 
-  auto isValid = gemm::checkAndUpdateGemmOptions(options, isBlackwell,
+  auto isValid = gemm::checkAndUpdateGemmOptions(options, cudaArch,
                                                  /* tpGrpSize */ 1, updateOptions);
 
   if (!isValid) {
@@ -211,7 +212,7 @@ struct GemmGatedActConfig {
   int32_t mInstanceIdx{0};
 
   GemmGatedActOptions mOptions{};
-  gemm::SmVersion mSm{gemm::SmVersion::Sm100a};
+  tg::CudaArch mSm{tg::CudaArch::Sm100a};
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

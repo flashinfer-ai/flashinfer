@@ -37,6 +37,7 @@ from ..utils import (
     write_if_different,
 )
 from .utils import generate_additional_params
+from .fmha_v2.generate_kernels import enumerate_kernels
 
 
 def get_single_decode_uri(
@@ -529,17 +530,26 @@ def gen_single_prefill_module(
         variant_decl = "#include<flashinfer/attention/variants.cuh>"
     else:
         if not fp8_enabled:
-            additional_tensor_names = []
-            additional_tensor_dtypes = []
-            additional_scalar_names = ["logits_soft_cap", "sm_scale"]
-            additional_scalar_dtypes = ["double", "double"]
+            additional_tensor_names = ["maybe_scale_v"]
+            additional_tensor_dtypes = ["float"]
+            additional_scalar_names = ["logits_soft_cap", "sm_scale", "scale_v_scalar"]
+            additional_scalar_dtypes = ["double", "double", "double"]
             variant_name = f"DefaultAttention<{str(use_logits_soft_cap).lower()}>"
             variant_decl = "#include<flashinfer/attention/hopper/variants.cuh>"
         else:
-            additional_tensor_names = ["scale_q", "scale_k", "scale_v"]
+            additional_tensor_names = [
+                "maybe_scale_q",
+                "maybe_scale_k",
+                "maybe_scale_v",
+            ]
             additional_tensor_dtypes = ["float", "float", "float"]
-            additional_scalar_names = ["sm_scale"]
-            additional_scalar_dtypes = ["double"]
+            additional_scalar_names = [
+                "sm_scale",
+                "scale_q_scalar",
+                "scale_k_scalar",
+                "scale_v_scalar",
+            ]
+            additional_scalar_dtypes = ["double", "double", "double", "double"]
             variant_name = "DefaultFP8Attention"
             variant_decl = "#include<flashinfer/attention/hopper/variants.cuh>"
 
@@ -1008,21 +1018,32 @@ def gen_batch_prefill_module(
                 "maybe_prefix_len_ptr",
                 "maybe_token_pos_in_items_ptr",
                 "maybe_max_item_len_ptr",
+                "maybe_scale_v",
             ]
-            additional_tensor_dtypes = ["uint32_t", "uint16_t", "uint16_t"]
+            additional_tensor_dtypes = ["uint32_t", "uint16_t", "uint16_t", "float"]
             additional_scalar_names = [
                 "logits_soft_cap",
                 "sm_scale",
+                "scale_v_scalar",
                 "token_pos_in_items_len",
             ]
-            additional_scalar_dtypes = ["double", "double", "int64_t"]
+            additional_scalar_dtypes = ["double", "double", "double", "int64_t"]
             variant_name = f"DefaultAttention<{str(use_logits_soft_cap).lower()}>"
             variant_decl = "#include<flashinfer/attention/hopper/variants.cuh>"
         else:
-            additional_tensor_names = ["scale_q", "scale_k", "scale_v"]
+            additional_tensor_names = [
+                "maybe_scale_q",
+                "maybe_scale_k",
+                "maybe_scale_v",
+            ]
             additional_tensor_dtypes = ["float", "float", "float"]
-            additional_scalar_names = ["sm_scale"]
-            additional_scalar_dtypes = ["double"]
+            additional_scalar_names = [
+                "sm_scale",
+                "scale_q_scalar",
+                "scale_k_scalar",
+                "scale_v_scalar",
+            ]
+            additional_scalar_dtypes = ["double", "double", "double", "double"]
             variant_name = "DefaultFP8Attention"
             variant_decl = "#include<flashinfer/attention/hopper/variants.cuh>"
 
@@ -1868,4 +1889,45 @@ def gen_cudnn_fmha_module():
         extra_cuda_cflags=[
             f'-DCUDNN_SDPA_CUBIN_PATH=\\"{ArtifactPath.CUDNN_SDPA}\\"',
         ],
+    )
+
+
+def get_trtllm_fmha_v2_module():
+    module = gen_trtllm_fmha_v2_module().build_and_load()
+    return module
+
+
+def gen_trtllm_fmha_v2_module() -> JitSpec:
+    uri = "trtllm_fmha_v2"
+    cached_ops = jit_env.FLASHINFER_JIT_DIR / uri
+    cached_ops.mkdir(parents=True, exist_ok=True)
+
+    fmha_v2_src_dir = jit_env.FLASHINFER_CSRC_DIR / "fmha_v2"
+
+    # Generate kernel source
+    enumerate_kernels(fmha_v2_src_dir, cached_ops)
+
+    kernels = [
+        "fmha_v2_flash_attention_bf16_64_128_S_q_k_v_192x128_sm120.cu",
+        "fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_192x128_output_bf16_sm120.cu",
+        "fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_192x128_sm120.cu",
+    ]
+
+    kernel_paths = [
+        jit_env.FLASHINFER_JIT_DIR / "trtllm_fmha_v2" / "generated" / kernel
+        for kernel in kernels
+    ]
+    binding_source_path = jit_env.FLASHINFER_CSRC_DIR / "trtllm_fmha_v2_binding.cu"
+    source_paths = kernel_paths + [binding_source_path]
+
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[12]
+    )
+    nvcc_flags.append(f"-I{jit_env.FLASHINFER_CSRC_DIR / 'fmha_v2'}")
+    nvcc_flags.append("-Wno-deprecated-gpu-targets")
+
+    return gen_jit_spec(
+        uri,
+        source_paths,
+        extra_cuda_cflags=nvcc_flags,
     )

@@ -786,8 +786,8 @@ def get_shuffle_matrix_a_row_indices(
 def get_shuffle_matrix_sf_a_row_indices(
     input_tensor: torch.Tensor, epilogue_tile_m: int, num_elts_per_sf: int = 16
 ) -> torch.Tensor:
-    assert input_tensor.dtype == torch.uint8
-    assert num_elts_per_sf == 16
+    assert input_tensor.dtype == torch.uint8 or input_tensor.dtype == torch.bfloat16
+    assert num_elts_per_sf == 16 or num_elts_per_sf == 32
 
     assert input_tensor.dim() == 2, (
         f"input_tensor should be a 2D tensor, not {input_tensor.dim()}"

@@ -740,7 +740,7 @@ def bench_gpu_time_with_cupti(
         return buffer_size, max_num_records
 
     def func_buffer_completed(
-        launches: list[tuple[float, float, int]],
+        launches: list[tuple[float, float, int, int, int]],
         kernels: list[tuple[str, float, float, int]],
         activities: list,
     ):
@@ -755,9 +755,20 @@ def bench_gpu_time_with_cupti(
                         activity.correlation_id,
                     )
                 )
-            elif activity.kind == cupti.ActivityKind.RUNTIME:
-                # Runtime activity
-                launches.append((activity.start, activity.end, activity.correlation_id))
+            elif activity.kind in (
+                cupti.ActivityKind.RUNTIME,
+                cupti.ActivityKind.DRIVER,
+            ):
+                # Runtime or Driver activity
+                launches.append(
+                    (
+                        activity.start,
+                        activity.end,
+                        activity.correlation_id,
+                        activity.cbid,
+                        activity.kind,
+                    )
+                )
 
     if l2_flush:
         l2_flush_size = int(l2_flush_size_mb) * 1024 * 1024
@@ -815,11 +826,12 @@ def bench_gpu_time_with_cupti(
     torch.cuda.synchronize()
 
     # CUPTI measurement
-    launches: list[tuple[float, float, int]] = []
+    launches: list[tuple[float, float, int, int, int]] = []
     kernels: list[tuple[str, float, float, int]] = []
     iter_timestamps = []
     cupti.activity_enable(cupti.ActivityKind.RUNTIME)
     cupti.activity_enable(cupti.ActivityKind.CONCURRENT_KERNEL)
+    cupti.activity_enable(cupti.ActivityKind.DRIVER)
     cupti.activity_register_callbacks(
         func_buffer_requested, partial(func_buffer_completed, launches, kernels)
     )
@@ -836,6 +848,7 @@ def bench_gpu_time_with_cupti(
     cupti.activity_flush_all(0)
     cupti.activity_disable(cupti.ActivityKind.RUNTIME)
     cupti.activity_disable(cupti.ActivityKind.CONCURRENT_KERNEL)
+    cupti.activity_disable(cupti.ActivityKind.DRIVER)
     cupti.finalize()
 
     # Process activities

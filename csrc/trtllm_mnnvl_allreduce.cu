@@ -30,7 +30,7 @@ void trtllm_mnnvl_all_reduce(TensorView in, int64_t multicast_buffer_ptr, int64_
                              int64_t buffer_M, TensorView buffer_flags_mnnvl, int64_t nranks,
                              int64_t rank, bool wait_for_results, bool launch_with_pdl,
                              Optional<TensorView> out) {
-  cudaSetDevice(in.device().device_id);
+  ffi::CUDADeviceGuard device_guard(in.device().device_id);
   auto stream = get_stream(in.device());
 
   DISPATCH_FLOATING_TYPES_FOR_MNNVL_ALLREDUCE(in.dtype(), c_type, [&] {
@@ -74,7 +74,7 @@ void trtllm_mnnvl_all_reduce(TensorView in, int64_t multicast_buffer_ptr, int64_
 void trtllm_mnnvl_rmsnorm(int64_t multicast_buffer_ptr, TensorView prenorm_output,
                           TensorView normed_output, TensorView gamma, double epsilon,
                           TensorView residual, TensorView buffer_flags, bool launch_with_pdl) {
-  cudaSetDevice(prenorm_output.device().device_id);
+  ffi::CUDADeviceGuard device_guard(prenorm_output.device().device_id);
   auto stream = get_stream(prenorm_output.device());
 
   DISPATCH_FLOATING_TYPES_FOR_MNNVL_ALLREDUCE(prenorm_output.dtype(), c_type, [&] {

@@ -19,6 +19,7 @@ from types import SimpleNamespace
 from typing import Optional, Union
 import torch
 
+from .api_logging import flashinfer_api
 from .jit.xqa import gen_xqa_module, gen_xqa_module_mla
 from .jit.utils import filename_safe_dtype_map
 from .utils import (
@@ -39,6 +40,7 @@ def get_xqa_module(
     head_group_ratio: int,
     use_sliding_window: bool,
     output_dtype: torch.dtype,
+    q_seq_len: int,
 ):
     module = gen_xqa_module(
         input_dtype,
@@ -48,10 +50,16 @@ def get_xqa_module(
         head_group_ratio,
         use_sliding_window,
         output_dtype,
+        q_seq_len,
     ).build_and_load()
 
+    if q_seq_len > 1:
+        use_spec_dec = True
+    else:
+        use_spec_dec = False
+
     @register_custom_op(
-        f"flashinfer::xqa_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_output_{filename_safe_dtype_map[output_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}",
+        f"flashinfer::xqa_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_output_{filename_safe_dtype_map[output_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}_use_spec_dec_{use_spec_dec}_spec_q_seq_len_{q_seq_len}",
         mutates_args=("output", "workspace_buffer"),
     )
     def xqa(
@@ -74,6 +82,8 @@ def get_xqa_module(
         semaphores: torch.Tensor,
         workspace_buffer: torch.Tensor,
         enable_pdl: bool,
+        q_seq_len: int,
+        mask: Optional[torch.Tensor],
     ) -> None:
         module.xqa_wrapper(
             run_sm90_fp8_mha,
@@ -94,13 +104,15 @@ def get_xqa_module(
             batch_size,
             1.0 if isinstance(kv_scale, torch.Tensor) else kv_scale,
             None if isinstance(kv_scale, float) else kv_scale,
+            q_seq_len,
+            mask,
             semaphores,
             workspace_buffer,
             enable_pdl,
         )
 
     @register_fake_op(
-        f"flashinfer::xqa_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_output_{filename_safe_dtype_map[output_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}"
+        f"flashinfer::xqa_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_output_{filename_safe_dtype_map[output_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}_use_spec_dec_{use_spec_dec}_spec_q_seq_len_{q_seq_len}"
     )
     def _fake_xqa(
         run_sm90_fp8_mha: bool,
@@ -122,6 +134,8 @@ def get_xqa_module(
         semaphores: torch.Tensor,
         workspace_buffer: torch.Tensor,
         enable_pdl: bool,
+        q_seq_len: int,
+        mask: Optional[torch.Tensor],
     ) -> None:
         pass
 
@@ -130,6 +144,7 @@ def get_xqa_module(
     )
 
 
+@flashinfer_api
 def xqa(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -149,12 +164,15 @@ def xqa(
     sm_count: Optional[int] = None,
     enable_pdl: Optional[bool] = None,
     rcp_out_scale: float = 1.0,
+    q_seq_len: int = 1,
+    mask: Optional[torch.Tensor] = None,
 ) -> None:
     r"""Apply attention with paged KV cache using XQA kernel.
     Parameters
     ----------
     q : torch.Tensor
-        Query tensor with shape ``[batch_size, beam_width, num_q_heads, head_dim]``.
+        Query tensor with shape ``[batch_size, beam_width, num_q_heads, head_dim]`` if not using speculative decoding,
+        or ``[batch_size, beam_width, q_seq_len, num_q_heads, head_dim]`` if using speculative decoding. ``q_seq_len`` is the number of speculative decoding tokens.
         Data type should be torch.float16 or torch.bfloat16.
         Now only beam_width 1 is supported.
     k_cache: torch.Tensor
@@ -175,7 +193,7 @@ def xqa(
         Sequence lengths tensor with shape ``[batch_size, beam_width]``.
         Data type should be torch.uint32.
     output : torch.Tensor
-        Output tensor with shape ``[batch_size, beam_width, num_q_heads, head_dim]``.
+        Output tensor with shape that matches the query tensor.
         Data type should match query tensor or kv tensor. This tensor will be modified in-place.
     workspace_buffer : torch.Tensor
         Workspace buffer for temporary computations.
@@ -207,12 +225,19 @@ def xqa(
         If None, will be set to True if hardware supports it.
     rcp_out_scale : float, default=1.0
         Reciprocal of output scale factor.
+    q_seq_len : int, default=1
+        Query sequence length. When > 1, enables speculative decoding mode.
+    mask : Optional[torch.Tensor], default=None
+        Causal attention mask for speculative decoding mode (when ``q_seq_len > 1``).
+        Shape: ``[batch_size, q_seq_len, mask_size_per_row]`` where
+        ``mask_size_per_row = ((q_seq_len + 31) // 32) * 2``.
+        Data type should be torch.uint16 (bit-packed format, aligned to 32 bits).
 
     Note
     ----
     The function automatically infers several parameters from tensor shapes:
     - batch_size from q.shape[0]
-    - num_q_heads from q.shape[2]
+    - num_q_heads from q.shape[-2]
     - head_dim from q.shape[-1]
     - input_dtype from q.dtype
     - kv_cache_dtype from k.dtype
@@ -227,7 +252,7 @@ def xqa(
 
     # Infer parameters from tensors
     batch_size = q.shape[0]
-    num_q_heads = q.shape[2]
+    num_q_heads = q.shape[-2]
     head_dim = q.shape[-1]
 
     # Calculate head_group_ratio
@@ -274,7 +299,14 @@ def xqa(
         head_group_ratio,
         use_sliding_window,
         output.dtype,
+        q_seq_len,
     )
+
+    if q_seq_len > 1:
+        assert mask is not None, "Mask is required for speculative decoding"
+        if sinks is not None:
+            run_sm90_fp8_mha = False  # TODO: mha_sm90.cu has precision issue if sinks and speculative decoding are used simultaneously
+
     xqa_module.xqa(
         run_sm90_fp8_mha,
         sm_count,
@@ -295,6 +327,8 @@ def xqa(
         semaphores,
         workspace_buffer,
         enable_pdl,
+        q_seq_len,
+        mask,
     )
 
 
@@ -381,6 +415,7 @@ def get_xqa_module_mla(
     )
 
 
+@flashinfer_api
 def xqa_mla(
     q: torch.Tensor,
     k_cache: torch.Tensor,

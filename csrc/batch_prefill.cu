@@ -58,7 +58,7 @@ Array<int64_t> BatchPrefillWithKVCachePlan(
 
   PrefillPlanInfo plan_info;
 
-  cudaSetDevice(float_workspace_buffer.device().device_id);
+  ffi::CUDADeviceGuard device_guard(float_workspace_buffer.device().device_id);
   const cudaStream_t stream = get_stream(float_workspace_buffer.device());
   cudaError_t status = PrefillPlan<IdType>(
       float_workspace_buffer.data_ptr(), float_workspace_size_in_bytes,
@@ -114,7 +114,7 @@ void BatchPrefillWithRaggedKVCacheRun(TensorView float_workspace_buffer,
 
   const MaskMode mask_mode = static_cast<MaskMode>(mask_mode_code);
 
-  cudaSetDevice(float_workspace_buffer.device().device_id);
+  ffi::CUDADeviceGuard device_guard(float_workspace_buffer.device().device_id);
   const cudaStream_t stream = get_stream(float_workspace_buffer.device());
 
   DISPATCH_context(
@@ -247,7 +247,7 @@ void BatchPrefillWithPagedKVCacheRun(TensorView float_workspace_buffer,
         << "k/v strides differs at " << i;
   }
 
-  cudaSetDevice(float_workspace_buffer.device().device_id);
+  ffi::CUDADeviceGuard device_guard(float_workspace_buffer.device().device_id);
   const cudaStream_t stream = get_stream(float_workspace_buffer.device());
 
   DISPATCH_context(

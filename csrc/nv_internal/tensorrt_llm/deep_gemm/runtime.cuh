@@ -181,6 +181,6 @@ class RuntimeCache {
 };
 
 // Global function to access the singleton
-RuntimeCache& getGlobalRuntimeCache() { return RuntimeCache::getInstance(); }
+inline RuntimeCache& getGlobalRuntimeCache() { return RuntimeCache::getInstance(); }
 
 }  // namespace deep_gemm::jit

@@ -22,6 +22,7 @@ from typing import List, Literal, Optional, Tuple
 from flashinfer.trtllm_low_latency_gemm import trtllm_low_latency_gemm
 import torch
 
+from ..api_logging import flashinfer_api
 from ..autotuner import (
     AutoTuner,
     ConstraintSpec,
@@ -355,6 +356,25 @@ def get_gemm_sm100_module_cutlass_fp8():
     )
 
 
+_FP8_GEMM_SM100_TUNING_CONFIG = TuningConfig(
+    dynamic_tensor_specs=(
+        DynamicTensorSpec(
+            (0,),  # a_tensor_index
+            (-2,),
+            get_last_power_of_2_num_tokens_buckets,
+            last_positive_power_of_2,
+        ),
+    ),
+    constraint_specs=(
+        ConstraintSpec(
+            4,  # out_tensor_index
+            -2,
+            lambda shapes: shapes[0][-2],
+        ),
+    ),
+)
+
+
 def fp8_gemm_sm100(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -375,29 +395,12 @@ def fp8_gemm_sm100(
         runners.append(_cudnn_gemm_fp8_runner())
     assert runners, "No suitable runners found"
     tuner = AutoTuner.get()
-    a_tensor_index = 0
-    out_tensor_index = 4
-    tuning_config = TuningConfig(
-        dynamic_tensor_specs=(
-            DynamicTensorSpec(
-                (a_tensor_index,),
-                (-2,),
-                get_last_power_of_2_num_tokens_buckets,
-                last_positive_power_of_2,
-            ),
-        ),
-        constraint_specs=(
-            ConstraintSpec(
-                out_tensor_index, -2, lambda shapes: shapes[a_tensor_index][-2]
-            ),
-        ),
-    )
 
     inputs = [a, b, scale_a, scale_b, out, workspace_buffer]
     runner, tactic = tuner.choose_one(
         "fp8_gemm",
         runners,
-        tuning_config,
+        _FP8_GEMM_SM100_TUNING_CONFIG,
         inputs,
     )
 
@@ -539,6 +542,7 @@ def get_tgv_gemm_sm10x_module(
     )
 
 
+@flashinfer_api
 def tgv_gemm_sm100(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -884,6 +888,7 @@ class SegmentGEMMWrapper:
         self._float_workspace_buffer = float_workspace_buffer
         self._int_workspace_buffer = int_workspace_buffer
 
+    @flashinfer_api
     def run(
         self,
         x: torch.Tensor,
@@ -1551,6 +1556,7 @@ def _expand_block_scale_tensor_shape(block_scale_tensor, batch_size):
     return (tuple(block_scale_shape), tuple(block_scale_stride))
 
 
+@flashinfer_api
 def mm_fp8(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -2015,6 +2021,58 @@ def _heuristic_func_mm_fp4(
     return [c for c in candidate_backends if c in suitable_backends]
 
 
+def _pad_up(x, y):
+    return ((x + y - 1) // y) * y
+
+
+_MM_FP4_TUNING_CONFIG_8x4 = TuningConfig(
+    dynamic_tensor_specs=(
+        DynamicTensorSpec(
+            (0,),  # a_tensor_index
+            (0,),
+            get_last_power_of_2_num_tokens_buckets,
+            last_positive_power_of_2,
+        ),
+    ),
+    constraint_specs=(
+        ConstraintSpec(
+            2,  # a_scale_tensor_index
+            0,
+            lambda shapes: _pad_up(shapes[0][0], 8),
+        ),
+        ConstraintSpec(
+            6,  # out_tensor_index
+            0,
+            lambda shapes: shapes[0][0],
+        ),
+    ),
+)
+
+
+_MM_FP4_TUNING_CONFIG_128x4 = TuningConfig(
+    dynamic_tensor_specs=(
+        DynamicTensorSpec(
+            (0,),  # a_tensor_index
+            (0,),
+            get_last_power_of_2_num_tokens_buckets,
+            last_positive_power_of_2,
+        ),
+    ),
+    constraint_specs=(
+        ConstraintSpec(
+            2,  # a_scale_tensor_index
+            0,
+            lambda shapes: _pad_up(shapes[0][0], 128),
+        ),
+        ConstraintSpec(
+            6,  # out_tensor_index
+            0,
+            lambda shapes: shapes[0][0],
+        ),
+    ),
+)
+
+
 @backend_requirement(
     {
         "cudnn": _cudnn_gemm_fp4_requirement,
@@ -2024,6 +2082,7 @@ def _heuristic_func_mm_fp4(
     common_check=_check_mm_fp4_problem_size,
     heuristic_func=_heuristic_func_mm_fp4,  # result stored in mm_fp4.suitable_auto_backends
 )
+@flashinfer_api
 def mm_fp4(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -2057,7 +2116,7 @@ def mm_fp4(
         Global scale tensor, float scalar.
 
     out_dtype: torch.dtype
-        Output dtype, bf16 or fp16.
+        Output dtype, bf16 or fp16. When ``backend="trtllm"``, only ``bf16`` is supported.
 
     out: Optional[torch.Tensor]
         Out tensor, shape (m, n), bf16 or fp16, defaults to ``None``.
@@ -2069,10 +2128,14 @@ def mm_fp4(
         Whether to use 8x4 scale factor layout or 128x4 scale factor layout, defaults to False.
 
     backend: Literal["cudnn", "trtllm", "cutlass", "auto"]
-        Backend to use, defaults to "auto", which automatically selects the best backend between cudnn and cutlass.
+        Backend to use, defaults to ``"auto"``, which automatically selects the best
+        backend between ``"cudnn"`` and ``"cutlass"`` based on the current CUDA and
+        cuDNN versions. The ``"trtllm"`` backend is never selected when
+        ``backend="auto"`` because it requires different weight preparation.
 
     use_nvfp4: bool
-        Whether to use nvfp4 quantization or mxfp4 quantization, defaults to False.
+        Whether to use nvfp4 quantization or mxfp4 quantization, defaults to ``True``.
+        See the ``block_size`` parameter for related constraints.
 
     Notes
     -----
@@ -2133,34 +2196,8 @@ def mm_fp4(
     # Now we have a list of runners for desired & supported backends.
     tuner = AutoTuner.get()
 
-    a_tensor_index = 0
-    a_scale_tensor_index = 2
-    out_tensor_index = 6
-
-    def pad_up(x, y):
-        return ((x + y - 1) // y) * y
-
-    tuning_config = TuningConfig(
-        dynamic_tensor_specs=(
-            DynamicTensorSpec(
-                (a_tensor_index,),
-                (0,),
-                get_last_power_of_2_num_tokens_buckets,
-                last_positive_power_of_2,
-            ),
-        ),
-        constraint_specs=(
-            ConstraintSpec(
-                a_scale_tensor_index,
-                0,
-                lambda shapes: pad_up(
-                    shapes[a_tensor_index][0], 8 if use_8x4_sf_layout else 128
-                ),
-            ),
-            ConstraintSpec(
-                out_tensor_index, 0, lambda shapes: shapes[a_tensor_index][0]
-            ),
-        ),
+    tuning_config = (
+        _MM_FP4_TUNING_CONFIG_8x4 if use_8x4_sf_layout else _MM_FP4_TUNING_CONFIG_128x4
     )
 
     inputs = [
@@ -2281,6 +2318,7 @@ def _heuristic_func_bmm_fp8(
     common_check=_check_bmm_fp8_problem_size,
     heuristic_func=_heuristic_func_bmm_fp8,
 )
+@flashinfer_api
 def bmm_fp8(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -2372,6 +2410,7 @@ def bmm_fp8(
     return out
 
 
+@flashinfer_api
 def gemm_fp8_nt_groupwise(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -2623,6 +2662,7 @@ def get_trtllm_fp4_gemm_module():
     )
 
 
+@flashinfer_api
 def gemm_fp8_nt_blockscaled(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -2651,6 +2691,7 @@ def gemm_fp8_nt_blockscaled(
     )
 
 
+@flashinfer_api
 def group_gemm_fp8_nt_groupwise(
     a: torch.Tensor,  # (cum_m, k)
     b: torch.Tensor,  # (batch_size, n, k)
@@ -2813,6 +2854,7 @@ def group_gemm_fp8_nt_groupwise(
     return out
 
 
+@flashinfer_api
 def group_gemm_mxfp8_mxfp4_nt_groupwise(
     a: torch.Tensor,  # (cum_m, k)
     b: torch.Tensor,  # (batch_size, n, k // 2)
@@ -2980,6 +3022,7 @@ def get_deepgemm_sm100_module():
     return module
 
 
+@flashinfer_api
 def group_deepgemm_fp8_nt_groupwise(
     a: torch.Tensor,  # (m, k)
     b: torch.Tensor,  # (batch_size, n, k)
@@ -3110,6 +3153,7 @@ def group_deepgemm_fp8_nt_groupwise(
     return out
 
 
+@flashinfer_api
 def batch_deepgemm_fp8_nt_groupwise(
     a: torch.Tensor,  # (batch_size, m, k)
     b: torch.Tensor,  # (batch_size, n, k)

@@ -96,7 +96,7 @@ void FMHACutlassSM100Run(ffi::TensorView workspace_buffer, ffi::TensorView q, ff
   int v_stride_n = v.stride(0);
   int v_stride_h = v.stride(1);
 
-  cudaSetDevice(qo_segment_offsets.device().device_id);
+  ffi::CUDADeviceGuard device_guard(qo_segment_offsets.device().device_id);
   const cudaStream_t stream = get_stream(o.device());
 
   DISPATCH_context(DTypeIn, DTypeOut, HEAD_DIM_QK, HEAD_DIM_VO, MASK_MODE, [&] {

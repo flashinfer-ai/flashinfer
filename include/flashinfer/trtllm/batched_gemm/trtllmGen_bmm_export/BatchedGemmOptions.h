@@ -85,16 +85,17 @@ struct BatchedGemmOptions : public gemmGatedAct::GemmGatedActOptions {
       gemm::AllReduceAlgo allReduceAlgo, gemm::BiasType biasType, int blockK, int clusterDimX,
       int clusterDimY, int clusterDimZ, gemm::CtaSwizzleType ctaSwizzleType, tg::Dtype dtypeAcc,
       tg::Dtype dtypeA, tg::Dtype dtypeB, tg::Dtype dtypeC, tg::Dtype dtypeMmaA,
-      tg::Dtype dtypeMmaB, bool enablesEarlyExit, bool enablesDelayedEarlyExit,
-      bool enablesGlobalPtxKnobs, int epilogueLdtmDps, int epilogueLdtmBits, int epilogueTileM,
-      int epilogueTileN, bool fuseUtccpWithUtcmma, bool gridTriggerSecondaryA,
-      bool gridTriggerSecondaryB, bool gridWaitForPrimaryEarlyExit, bool gridWaitForPrimaryA,
-      bool gridWaitForPrimaryB, bool hoistLoadTaskInit, bool hoistMmaTaskTryWaits, int k,
-      gemm::KernelTraits kernelTraits, gemm::MatrixLayout layoutA, gemm::MatrixLayout layoutB,
-      int m, int mmaK, tg::MmaKind mmaKind, int mmaM, int mmaN, bool mockAllReduce, int n,
-      int numEpilogueWarps, int numRegsCastAWarps, int numRegsCopySfLdsSttm,
-      int numRegsPerThreadEpilogueWarp, int numRegsPerThreadNonEpilogueWarp, int numSlicesForSplitK,
-      int numSlicesForSliceK, int numStages, int numStagesMma, int numStagesMmaWithinWorkTile,
+      tg::Dtype dtypeMmaB, gemm::EltwiseActType eltwiseActType, bool enablesEarlyExit,
+      bool enablesDelayedEarlyExit, bool enablesGlobalPtxKnobs, int epilogueLdtmDps,
+      int epilogueLdtmBits, int epilogueTileM, int epilogueTileN, bool fuseUtccpWithUtcmma,
+      bool gridTriggerSecondaryA, bool gridTriggerSecondaryB, bool gridWaitForPrimaryEarlyExit,
+      bool gridWaitForPrimaryA, bool gridWaitForPrimaryB, bool hoistLoadTaskInit,
+      bool hoistMmaTaskTryWaits, int k, gemm::KernelTraits kernelTraits, gemm::MatrixLayout layoutA,
+      gemm::MatrixLayout layoutB, int m, int mmaK, tg::MmaKind mmaKind, int mmaM, int mmaN,
+      bool mockAllReduce, int n, int numEpilogueWarps, int numRegsCastAWarps,
+      int numRegsCopySfLdsSttm, int numRegsPerThreadEpilogueWarp,
+      int numRegsPerThreadNonEpilogueWarp, int numSlicesForSplitK, int numSlicesForSliceK,
+      int numStages, int numStagesMma, int numStagesMmaWithinWorkTile,
       int numStagesMmaAcrossWorkTile, int numStagesWorkId, bool outputDebugTensors, bool patchF2fp,
       std::optional<int32_t> sfBlockSizeA, tg::SfLayout sfLayoutA, tg::SfLayout sfLayoutB,
       tg::SfLayout sfLayoutC, int32_t sfReshapeFactor, bool sliceK, gemm::SplitK splitK, int tileK,
@@ -114,20 +115,21 @@ struct BatchedGemmOptions : public gemmGatedAct::GemmGatedActOptions {
             gemm::GemmOptions(
                 allReduceAlgo, biasType, blockK, clusterDimX, clusterDimY, clusterDimZ,
                 ctaSwizzleType, dtypeAcc, dtypeA, dtypeB, dtypeC, dtypeMmaA, dtypeMmaB,
-                enablesEarlyExit, enablesDelayedEarlyExit, enablesGlobalPtxKnobs, epilogueLdtmDps,
-                epilogueLdtmBits, epilogueTileM, epilogueTileN, fuseUtccpWithUtcmma,
-                gridTriggerSecondaryA, gridTriggerSecondaryB, gridWaitForPrimaryEarlyExit,
-                gridWaitForPrimaryA, gridWaitForPrimaryB, hoistLoadTaskInit, hoistMmaTaskTryWaits,
-                k, kernelTraits, layoutA, layoutB, m, mmaK, mmaKind, mmaM, mmaN, mockAllReduce, n,
-                numEpilogueWarps, numRegsCastAWarps, numRegsCopySfLdsSttm,
-                numRegsPerThreadEpilogueWarp, numRegsPerThreadNonEpilogueWarp, numSlicesForSplitK,
-                numSlicesForSliceK, numStages, numStagesMma, numStagesMmaWithinWorkTile,
-                numStagesMmaAcrossWorkTile, numStagesWorkId, outputDebugTensors, patchF2fp,
-                sfBlockSizeA, sfLayoutA, sfLayoutB, sfLayoutC, sfReshapeFactor, sliceK, splitK,
-                tileK, tileM, tileN, tileScheduler, transposeMmaOutput, useCustomMmaSchedule,
-                useDeepSeekFp8, useHoistTryWaitForCustomMmaSchedule, useMaxTmemOverlap,
-                usePerTokenSfA, usePerTokenSfB, useShuffledMatrixA, useTmaStore, useTwoTmaLoadWarps,
-                useTwoMmaWarps, useUnrollLoop2xForMma, validM, validN, validK, worldSize),
+                eltwiseActType, enablesEarlyExit, enablesDelayedEarlyExit, enablesGlobalPtxKnobs,
+                epilogueLdtmDps, epilogueLdtmBits, epilogueTileM, epilogueTileN,
+                fuseUtccpWithUtcmma, gridTriggerSecondaryA, gridTriggerSecondaryB,
+                gridWaitForPrimaryEarlyExit, gridWaitForPrimaryA, gridWaitForPrimaryB,
+                hoistLoadTaskInit, hoistMmaTaskTryWaits, k, kernelTraits, layoutA, layoutB, m, mmaK,
+                mmaKind, mmaM, mmaN, mockAllReduce, n, numEpilogueWarps, numRegsCastAWarps,
+                numRegsCopySfLdsSttm, numRegsPerThreadEpilogueWarp, numRegsPerThreadNonEpilogueWarp,
+                numSlicesForSplitK, numSlicesForSliceK, numStages, numStagesMma,
+                numStagesMmaWithinWorkTile, numStagesMmaAcrossWorkTile, numStagesWorkId,
+                outputDebugTensors, patchF2fp, sfBlockSizeA, sfLayoutA, sfLayoutB, sfLayoutC,
+                sfReshapeFactor, sliceK, splitK, tileK, tileM, tileN, tileScheduler,
+                transposeMmaOutput, useCustomMmaSchedule, useDeepSeekFp8,
+                useHoistTryWaitForCustomMmaSchedule, useMaxTmemOverlap, usePerTokenSfA,
+                usePerTokenSfB, useShuffledMatrixA, useTmaStore, useTwoTmaLoadWarps, useTwoMmaWarps,
+                useUnrollLoop2xForMma, validM, validN, validK, worldSize),
             actType, clampBeforeAct),
         mBatchedM(batchedM),
         mBatchedN(batchedN),
@@ -182,7 +184,7 @@ struct BatchedGemmOptions : public gemmGatedAct::GemmGatedActOptions {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Check if the options are valid or not.
-inline bool checkAndUpdateBatchedGemmOptions(BatchedGemmOptions& options, bool isBlackwell,
+inline bool checkAndUpdateBatchedGemmOptions(BatchedGemmOptions& options, tg::CudaArch cudaArch,
                                              bool updateOptions = true) {
   bool isValid = true;
   if (options.mUseTmaOobOpt && !options.mUseTwoTmaLoadWarps) {
@@ -197,10 +199,9 @@ inline bool checkAndUpdateBatchedGemmOptions(BatchedGemmOptions& options, bool i
   }
   if (options.mFusedAct) {
     // ensure that we check the fused options as well
-    isValid = gemmGatedAct::checkAndUpdateGemmGatedActOptions(options, isBlackwell, updateOptions);
+    isValid = gemmGatedAct::checkAndUpdateGemmGatedActOptions(options, cudaArch, updateOptions);
   } else {
-    isValid =
-        gemm::checkAndUpdateGemmOptions(options, isBlackwell, 1 /* tpGrpSize */, updateOptions);
+    isValid = gemm::checkAndUpdateGemmOptions(options, cudaArch, 1 /* tpGrpSize */, updateOptions);
   }
 
   bool batchM = options.mBatchMode == BatchedGemmOptions::BatchMode::BatchM;
@@ -346,8 +347,17 @@ inline bool checkAndUpdateBatchedGemmOptions(BatchedGemmOptions& options, bool i
 
   // We do not handle the case where K is not a multiple of TileK.
   // TMA based load handles the case transparently.
-  if (doesRouteImplUseLdgsts(options.mRouteImpl)) {
-    TLLM_CHECK_ERROR(options.mK % options.mTileK == 0, "K must be a multiple of TileK");
+  if (doesRouteImplUseLdgsts(options.mRouteImpl) &&
+      doesRouteImplUseLdgPlusSts(options.mRouteSfsImpl.value())) {
+    TLLM_CHECK_ERROR(options.mK % options.mTileK == 0,
+                     "K must be a multiple of TileK when using Ldg based routing");
+  }
+
+  if (options.mRouteSfsImpl.has_value() &&
+      (doesRouteImplUseLdgsts(options.mRouteSfsImpl.value()) ||
+       doesRouteImplUseLdgPlusSts(options.mRouteSfsImpl.value()))) {
+    TLLM_CHECK_ERROR(options.mK % options.mTileK == 0,
+                     "K must be a multiple of tileK when using Ldg based SF routing");
   }
 
   if (options.mClusterDimX > 1 && batchM && options.mRouteImpl != RouteImpl::NoRoute) {
@@ -380,7 +390,7 @@ struct BatchedGemmConfig {
   int32_t mInstanceIdx{0};
 
   BatchedGemmOptions mOptions;
-  gemm::SmVersion mSm{gemm::SmVersion::Sm100a};
+  tg::CudaArch mSm{tg::CudaArch::Sm100a};
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

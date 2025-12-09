@@ -53,7 +53,7 @@ void CutlassSegmentGEMMSM90(TensorView float_workspace_buffer, TensorView int_wo
                             TensorView y_stride, TensorView empty_x_data, TensorView empty_y_data,
                             bool weight_column_major) {
   unsigned int batch_size = x_ptr.size(0);
-  cudaSetDevice(float_workspace_buffer.device().device_id);
+  ffi::CUDADeviceGuard device_guard(float_workspace_buffer.device().device_id);
   const cudaStream_t stream = get_stream(float_workspace_buffer.device());
   DISPATCH_DLPACK_INPUT_OUTPUT_DTYPE(
       empty_x_data.dtype(), empty_y_data.dtype(), c_type_in, c_type_out, [&] {
