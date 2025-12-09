@@ -239,12 +239,29 @@ for batch_size, min_len, max_len, num_qo_heads, num_kv_heads in varlen_configs:
         f"{config_str:<40} {fi_time:<18.3f} {fa3_time:<15.3f} {diff:+.1f}%{'':5} {fi_tflops:<12.1f} {fa3_tflops:<12.1f}"
     )
 
-# FP8 tests (FA3 only, FlashInfer FP8 FA3 backend has compilation issues)
-print("\n--- FP8 Batch Prefill (FA3 only) ---")
-print(f"{'Config':<35} {'FA3 (ms)':<15} {'FA3 TFLOPS':<12}")
-print("-" * 70)
+# FP8 tests
+print("\n--- FP8 Batch Prefill ---")
+print(
+    f"{'Config':<35} {'FlashInfer (ms)':<18} {'FA3 (ms)':<15} {'diff':<10} {'FI TFLOPS':<12} {'FA3 TFLOPS':<12}"
+)
+print("-" * 115)
 
 fp8_dtype = torch.float8_e4m3fn
+
+
+def per_head_symmetric_quant(x, quant_dtype):
+    """Per-head symmetric quantization to FP8."""
+    o_min_val, o_max_val = (
+        (-448.0, 448.0) if quant_dtype == torch.float8_e4m3fn else (-57344, 57344)
+    )
+    x_max_val = x.abs().amax(dim=(0, 2)).to(dtype=torch.float32)
+    s_out = torch.clamp(x_max_val / o_max_val, min=1e-6)
+    s_out_broadcast = s_out.view(1, -1, 1)
+    q_x_out = torch.clamp(x / s_out_broadcast, min=o_min_val, max=o_max_val).to(
+        dtype=quant_dtype
+    )
+    return q_x_out, s_out
+
 
 fp8_configs = [
     (8, 2048, 32, 8),
@@ -257,7 +274,7 @@ for batch_size, seq_len, num_qo_heads, num_kv_heads in fp8_configs:
     qo_lens = [seq_len] * batch_size
     total_q = sum(qo_lens)
 
-    # Create FP8 tensors with proper scaling
+    # Create FP16 tensors first
     q_fp16 = torch.randn(
         total_q, num_qo_heads, head_dim, dtype=torch.float16, device=device
     )
@@ -268,9 +285,10 @@ for batch_size, seq_len, num_qo_heads, num_kv_heads in fp8_configs:
         total_q, num_kv_heads, head_dim, dtype=torch.float16, device=device
     )
 
-    q_fp8 = q_fp16.to(fp8_dtype)
-    k_fp8 = k_fp16.to(fp8_dtype)
-    v_fp8 = v_fp16.to(fp8_dtype)
+    # Quantize to FP8 with proper scaling
+    q_fp8, s_q = per_head_symmetric_quant(q_fp16, fp8_dtype)
+    k_fp8, s_k = per_head_symmetric_quant(k_fp16, fp8_dtype)
+    v_fp8, s_v = per_head_symmetric_quant(v_fp16, fp8_dtype)
 
     cu_seqlens = torch.tensor(
         [0] + list(torch.cumsum(torch.tensor(qo_lens), 0).numpy()),
@@ -278,6 +296,39 @@ for batch_size, seq_len, num_qo_heads, num_kv_heads in fp8_configs:
         device=device,
     )
 
+    config_str = f"bs={batch_size}, seq={seq_len}, h={num_qo_heads}/{num_kv_heads}"
+
+    # Benchmark FlashInfer FP8
+    fi_time = None
+    fi_tflops = None
+    try:
+        wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+            torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device),
+            backend="fa3",
+        )
+        wrapper.plan(
+            cu_seqlens,
+            cu_seqlens,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            head_dim,
+            causal=True,
+            q_data_type=fp8_dtype,
+            kv_data_type=fp8_dtype,
+            o_data_type=torch.float16,  # Output is FP16
+        )
+        fi_time = bench_fn(lambda: wrapper.run(q_fp8, k_fp8, v_fp8, s_q, s_k, s_v))
+        fi_tflops = calc_tflops(
+            batch_size, seq_len, num_qo_heads, head_dim, fi_time, causal=True
+        )
+    except Exception:
+        fi_time = None
+        fi_tflops = None
+
+    # Benchmark FA3 FP8
+    fa3_time = None
+    fa3_tflops = None
     try:
         fa3_time = bench_fn(
             lambda: fa3_varlen_func(
@@ -294,8 +345,24 @@ for batch_size, seq_len, num_qo_heads, num_kv_heads in fp8_configs:
         fa3_tflops = calc_tflops(
             batch_size, seq_len, num_qo_heads, head_dim, fa3_time, causal=True
         )
-        config_str = f"bs={batch_size}, seq={seq_len}, h={num_qo_heads}/{num_kv_heads}"
-        print(f"{config_str:<35} {fa3_time:<15.3f} {fa3_tflops:<12.1f}")
-    except Exception as e:
-        config_str = f"bs={batch_size}, seq={seq_len}, h={num_qo_heads}/{num_kv_heads}"
-        print(f"{config_str:<35} FA3 FP8 failed: {e}")
+    except Exception:
+        fa3_time = None
+        fa3_tflops = None
+
+    if fi_time is not None and fa3_time is not None:
+        diff = (fi_time - fa3_time) / fa3_time * 100
+        print(
+            f"{config_str:<35} {fi_time:<18.3f} {fa3_time:<15.3f} {diff:+.1f}%{'':5} {fi_tflops:<12.1f} {fa3_tflops:<12.1f}"
+        )
+    elif fi_time is not None:
+        print(
+            f"{config_str:<35} {fi_time:<18.3f} {'N/A':<15} {'N/A':<10} {fi_tflops:<12.1f} {'N/A':<12}"
+        )
+    elif fa3_time is not None:
+        print(
+            f"{config_str:<35} {'N/A':<18} {fa3_time:<15.3f} {'N/A':<10} {'N/A':<12} {fa3_tflops:<12.1f}"
+        )
+    else:
+        print(
+            f"{config_str:<35} {'N/A':<18} {'N/A':<15} {'N/A':<10} {'N/A':<12} {'N/A':<12}"
+        )
