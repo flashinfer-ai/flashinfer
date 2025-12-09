@@ -176,7 +176,7 @@ void dispatchMoeGemmFinalDispatchTmaWarpSpecialized(
                            "MXFPX is not supported for the selected weight combination");
     }
 
-    if constexpr (Arch::kMinComputeCapability >= 100 && Arch::kMinComputeCapability < 120) {
+    if constexpr (Arch::kMinComputeCapability >= 100 && Arch::kMinComputeCapability < 110) {
       bool const dynamic_cga =
           gemm_config.dynamic_cluster_shape != cutlass_extensions::ClusterShape::Undefined;
       bool const swap_ab = hopper_input.swap_ab;
@@ -204,7 +204,7 @@ void dispatchMoeGemmFinalDispatchTmaWarpSpecialized(
               gemm_config.epilogue_schedule, dynamic_cga, swap_ab);
       selected_func(hopper_input, num_experts, multi_processor_count, stream, occupancy,
                     workspace_size, cluster_shape_cute, cluster_shape_cute_fallback);
-    } else if constexpr (Arch::kMinComputeCapability >= 120 || Arch::kMinComputeCapability == 90) {
+    } else if constexpr (Arch::kMinComputeCapability >= 120 || Arch::kMinComputeCapability == 90 || Arch::kMinComputeCapability == 110) {
       using EpilogueSchedule = void;  // These are hardcoded in the launcher
       constexpr bool dynamic_cga = false;
       auto selected_func =
