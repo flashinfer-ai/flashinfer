@@ -1,5 +1,3 @@
-from typing import List
-
 from .. import env as jit_env
 from ..core import (
     JitSpec,
