@@ -41,7 +41,9 @@ from .vllm_ar import register_graph_buffers as vllm_register_graph_buffers
 
 # Unified AllReduce Fusion API
 from .allreduce import AllReduceFusionWorkspace as AllReduceFusionWorkspace
-from .allreduce import MNNVLAllReduceFusionWorkspace as MNNVLAllReduceFusionWorkspace
+from .trtllm_mnnvl_ar import (
+    MNNVLAllReduceFusionWorkspace as MNNVLAllReduceFusionWorkspace,
+)
 from .allreduce import TRTLLMAllReduceFusionWorkspace as TRTLLMAllReduceFusionWorkspace
 from .allreduce import allreduce_fusion as allreduce_fusion
 from .allreduce import (

@@ -48,8 +48,8 @@ Example usage:
         >>> workspace.destroy()
 """
 
-from typing import Union, Literal, Optional, Tuple, List, cast
-from abc import ABC, abstractmethod
+from typing import Union, Literal, Optional, Tuple, List, cast, Any
+from .workspace_base import AllReduceFusionWorkspace
 
 import torch
 
@@ -59,18 +59,22 @@ from .trtllm_ar import trtllm_create_ipc_workspace_for_all_reduce_fusion
 from .trtllm_ar import trtllm_destroy_ipc_workspace_for_all_reduce_fusion
 from .trtllm_ar import check_trtllm_allreduce_fusion_workspace_metadata
 
+from .mapping import Mapping
+
+from .mnnvl import CommBackend
+
 # Note: AllReduceFusionPattern and QuantizationSFLayout are pseudo-types (classes with int constants)
 # Import them for runtime use but type hint as int for mypy compatibility
 from .trtllm_ar import AllReduceFusionPattern
-
+from .trtllm_mnnvl_ar import MNNVLAllReduceFusionWorkspace
 
 # ============================================================================
-# WORKSPACE BASE CLASS AND IMPLEMENTATIONS
+# WORKSPACE IMPLEMENTATIONS
 # ============================================================================
 #
 # Workspace classes wrap the underlying backend workspace implementations:
 # - TRTLLMAllReduceFusionWorkspace: Wraps trtllm_create_ipc_workspace_for_all_reduce_fusion
-# - MNNVLAllReduceFusionWorkspace: Wraps MNNVL workspace (to be implemented)
+# - MNNVLAllReduceFusionWorkspace: Wraps MNNVL workspace (see trtllm_mnnvl_ar.py)
 #
 # Each workspace:
 # 1. Calls the backend-specific workspace creation function in __init__
@@ -78,59 +82,6 @@ from .trtllm_ar import AllReduceFusionPattern
 # 3. Exposes essential attributes for the unified API
 # 4. Can be destroyed using workspace.destroy()
 # ============================================================================
-
-
-class AllReduceFusionWorkspace(ABC):
-    """Base class for AllReduce fusion workspaces."""
-
-    def __init__(self, world_size: int, rank: int):
-        self.world_size = world_size
-        self.rank = rank
-        self._destroyed = False
-
-    @property
-    @abstractmethod
-    def backend(self) -> str:
-        """Return backend name."""
-        pass
-
-    @abstractmethod
-    def destroy(self) -> None:
-        """
-        Destroy workspace and free resources.
-
-        This should be called explicitly when done using the workspace.
-        Prefer using AllReduceFusionContext context manager for automatic cleanup.
-        """
-        pass
-
-    def __del__(self):
-        """
-        Destructor - safety net if destroy() wasn't called explicitly.
-
-        Warns if cleanup wasn't done properly. Not recommended to rely on this
-        as __del__ timing is non-deterministic and can cause issues with
-        distributed/CUDA resources.
-        """
-        if not self._destroyed:
-            import warnings
-
-            warnings.warn(
-                f"{self.__class__.__name__} was not explicitly destroyed. "
-                f"Call workspace.destroy() or use AllReduceFusionContext to ensure "
-                f"proper cleanup of distributed/CUDA resources.",
-                ResourceWarning,
-                stacklevel=2,
-            )
-            try:
-                self.destroy()
-            except Exception as e:
-                # Can't raise in __del__, just warn
-                warnings.warn(
-                    f"Error during automatic cleanup of {self.__class__.__name__}: {e}",
-                    ResourceWarning,
-                    stacklevel=2,
-                )
 
 
 class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
@@ -191,12 +142,17 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             )
         return getattr(self._internal_workspace, name)
 
-    def is_sufficient_for(
-        self, token_num: int, hidden_dim: int, tp_size: int, dtype: torch.dtype
+    def is_buffer_size_sufficient(
+        self,
+        tp_size: int,
+        num_tokens: int,
+        hidden_dim: int,
+        dtype: torch.dtype,
+        use_oneshot: Optional[Any] = None,
     ) -> bool:
         try:
             check_trtllm_allreduce_fusion_workspace_metadata(
-                token_num, hidden_dim, tp_size, dtype, self.metadata
+                num_tokens, hidden_dim, tp_size, dtype, self.metadata
             )
             return True
         except ValueError as e:
@@ -210,71 +166,6 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
 
         trtllm_destroy_ipc_workspace_for_all_reduce_fusion(self.ipc_handles)
         self._destroyed = True
-
-
-class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
-    """MNNVL workspace for AllReduce fusion."""
-
-    def __init__(
-        self,
-        world_size: int,
-        rank: int,
-        max_token_num: int,
-        hidden_dim: int,
-        dtype: torch.dtype,
-        **kwargs,
-    ):
-        """
-        Create MNNVL AllReduce fusion workspace.
-
-        Args:
-            world_size: Number of ranks
-            rank: Current rank
-            max_token_num: Maximum number of tokens
-            hidden_dim: Hidden dimension size
-            dtype: Data type
-            **kwargs: Additional arguments for workspace creation
-        """
-        super().__init__(world_size, rank)
-        # TODO: Import and call the actual MNNVL workspace creation function
-        # For now, raise NotImplementedError
-        raise NotImplementedError(
-            "MNNVL workspace creation needs to be implemented in trtllm_mnnvl_ar.py. "
-            "Expected function: create_mnnvl_allreduce_fusion_workspace"
-        )
-
-        # When implemented, should look like:
-        # self._internal_workspace = create_mnnvl_allreduce_fusion_workspace(
-        #     world_size=world_size,
-        #     rank=rank,
-        #     max_token_num=max_token_num,
-        #     hidden_dim=hidden_dim,
-        #     dtype=dtype,
-        #     **kwargs,
-        # )
-        #
-        # # Store essential attributes for easy access
-        # self.multicast_buffer_ptr = self._internal_workspace.multicast_buffer_ptr
-        # self.buffer_ptrs_dev = self._internal_workspace.buffer_ptrs_dev
-        # self.unicast_ptr = self._internal_workspace.unicast_ptr
-        # self.buffer_M = self._internal_workspace.buffer_M
-        # self.buffer_flags = self._internal_workspace.buffer_flags
-
-    @property
-    def backend(self) -> str:
-        return "mnnvl"
-
-    def destroy(self) -> None:
-        """Destroy workspace and free resources."""
-        if self._destroyed:
-            return  # Already destroyed, nothing to do
-
-        # TODO: Implement MNNVL workspace destruction
-        self._destroyed = True
-        raise NotImplementedError("MNNVL workspace destruction not yet implemented")
-        # from .trtllm_mnnvl_ar import destroy_mnnvl_allreduce_fusion_workspace
-        # destroy_mnnvl_allreduce_fusion_workspace(self._internal_workspace)
-        # self._destroyed = True
 
 
 # ============================================================================
@@ -427,7 +318,8 @@ def create_allreduce_fusion_workspace(
     dtype: torch.dtype = None,
     topology: str = "single_node",
     process_group: Optional["torch.distributed.ProcessGroup"] = None,
-    **backend_kwargs,  # TODO(nvmbreughe): remove this
+    gpus_per_node: int = None,
+    comm_backend: Optional[CommBackend] = None,
 ) -> AllReduceFusionWorkspace:
     """
     Create workspace for AllReduce fusion operations.
@@ -459,8 +351,9 @@ def create_allreduce_fusion_workspace(
         topology: Network topology hint for backend selection
                   "single_node" - All ranks on one node (default)
                   "multi_node" - Ranks span multiple nodes
-        process_group: PyTorch distributed process group
-        **backend_kwargs: Additional backend-specific arguments
+        process_group: PyTorch distributed process group (for trtllm backend).
+        gpus_per_node: Number of GPUs per node (for multi-node topology).
+        comm_backend: Communication backend to use (for multi-node topology).
 
     Returns:
         Workspace object (TRTLLMAllReduceFusionWorkspace or MNNVLAllReduceFusionWorkspace)
@@ -522,13 +415,18 @@ def create_allreduce_fusion_workspace(
         )
 
     elif actual_backend == "mnnvl":
-        return MNNVLAllReduceFusionWorkspace(
+        mapping = Mapping(
             world_size=world_size,
             rank=rank,
-            max_token_num=max_token_num,
+            gpus_per_node=gpus_per_node,
+            tp_size=world_size,
+        )
+        return MNNVLAllReduceFusionWorkspace(
+            mapping=mapping,
+            max_num_tokens=max_token_num,
             hidden_dim=hidden_dim,
             dtype=dtype,
-            **backend_kwargs,
+            comm_backend=comm_backend,
         )
     else:
         raise RuntimeError(f"Unknown backend: {actual_backend}")
