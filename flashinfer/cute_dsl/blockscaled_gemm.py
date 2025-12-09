@@ -529,8 +529,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         :param cluster_shape_mn: Tuple (ClusterM, ClusterN) shape of the cluster.
         :type cluster_shape_mn: Tuple[int, int]
         """
-        assert sm_version == "sm_100", (
-            "sm_100 is the only supported SM version for cute-dsl backend."
+        supported_sm_versions = ["sm_100", "sm_103"]
+        assert sm_version in supported_sm_versions, (
+            f"{supported_sm_versions} are the only supported SM versions for cute-dsl backend, but encountered {sm_version}"
         )
 
         self.acc_dtype = cutlass.Float32
