@@ -109,18 +109,21 @@ def bench_fmha_blackwell(
         "tflops": TFLOPS,
     }
 
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Benchmark FP8 attention for DeepSeek-R1")
+    parser = argparse.ArgumentParser(
+        description="Benchmark FP8 attention for DeepSeek-R1"
+    )
     parser.add_argument(
         "--save-results-to",
         type=str,
         default=None,
-        help="Path to save benchmark results as CSV (optional)"
+        help="Path to save benchmark results as CSV (optional)",
     )
     args = parser.parse_args()
-    
+
     results = []
-    
+
     # Define configurations: (batch_size, qkv_len, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, config_name)
     # DeepSeek-R1 uses MLA (Multi-head Latent Attention) with 128 heads
     # head_dim_qk=192 (128 nope + 64 rope), head_dim_vo=128
@@ -131,49 +134,88 @@ if __name__ == "__main__":
         (2, 4096, 128, 128, 192, 128, "DeepSeek-R1"),
         (1, 8192, 128, 128, 192, 128, "DeepSeek-R1"),
     ]
-    
+
     # Run benchmarks: Causal first, then non-causal
     # For each config: bfloat16 then fp8
     for causal in [True, False]:
-        print(f"\n{'='*80}")
+        print(f"\n{'=' * 80}")
         print(f"Running {'CAUSAL' if causal else 'NON-CAUSAL'} benchmarks")
-        print(f"{'='*80}")
-        
-        for batch_size, qkv_len, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, config_name in configs:
+        print(f"{'=' * 80}")
+
+        for (
+            batch_size,
+            qkv_len,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim_qk,
+            head_dim_vo,
+            config_name,
+        ) in configs:
             # Run bfloat16
-            print(f"\n[{config_name}] BS={batch_size}, SeqLen={qkv_len}, Causal={causal}, BF16")
+            print(
+                f"\n[{config_name}] BS={batch_size}, SeqLen={qkv_len}, Causal={causal}, BF16"
+            )
             result_bf16 = bench_fmha_blackwell(
-                batch_size, qkv_len, num_qo_heads, num_kv_heads, 
-                head_dim_qk, head_dim_vo, causal, torch.bfloat16,
+                batch_size,
+                qkv_len,
+                num_qo_heads,
+                num_kv_heads,
+                head_dim_qk,
+                head_dim_vo,
+                causal,
+                torch.bfloat16,
                 o_data_type=torch.bfloat16,
             )
             result_bf16["config_name"] = config_name
             results.append(result_bf16)
-            print(f"  → {result_bf16['tflops']:.2f} TFLOPs/s, {result_bf16['time_ms']:.3f} ms")
-            
+            print(
+                f"  → {result_bf16['tflops']:.2f} TFLOPs/s, {result_bf16['time_ms']:.3f} ms"
+            )
+
             # Run fp8
-            print(f"[{config_name}] BS={batch_size}, SeqLen={qkv_len}, Causal={causal}, FP8")
+            print(
+                f"[{config_name}] BS={batch_size}, SeqLen={qkv_len}, Causal={causal}, FP8"
+            )
             result_fp8 = bench_fmha_blackwell(
-                batch_size, qkv_len, num_qo_heads, num_kv_heads,
-                head_dim_qk, head_dim_vo, causal, torch.float8_e4m3fn,
+                batch_size,
+                qkv_len,
+                num_qo_heads,
+                num_kv_heads,
+                head_dim_qk,
+                head_dim_vo,
+                causal,
+                torch.float8_e4m3fn,
                 o_data_type=torch.bfloat16,
             )
             result_fp8["config_name"] = config_name
             results.append(result_fp8)
-            speedup = result_fp8['tflops'] / result_bf16['tflops']
-            print(f"  → {result_fp8['tflops']:.2f} TFLOPs/s, {result_fp8['time_ms']:.3f} ms (speedup: {speedup:.2f}x)")
-    
+            speedup = result_fp8["tflops"] / result_bf16["tflops"]
+            print(
+                f"  → {result_fp8['tflops']:.2f} TFLOPs/s, {result_fp8['time_ms']:.3f} ms (speedup: {speedup:.2f}x)"
+            )
+
     # Write results to CSV if requested
     if args.save_results_to:
-        fieldnames = ["config_name", "batch_size", "qkv_len", "num_qo_heads", "num_kv_heads", 
-                      "head_dim_qk", "head_dim_vo", "causal", "dtype", "time_ms", "tflops"]
-        
-        with open(args.save_results_to, 'w', newline='') as csvfile:
+        fieldnames = [
+            "config_name",
+            "batch_size",
+            "qkv_len",
+            "num_qo_heads",
+            "num_kv_heads",
+            "head_dim_qk",
+            "head_dim_vo",
+            "causal",
+            "dtype",
+            "time_ms",
+            "tflops",
+        ]
+
+        with open(args.save_results_to, "w", newline="") as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
             for result in results:
                 writer.writerow(result)
-        
-        print(f"\n{'='*80}")
+
+        print(f"\n{'=' * 80}")
         print(f"Results saved to: {args.save_results_to}")
-        print(f"{'='*80}")
+        print(f"{'=' * 80}")

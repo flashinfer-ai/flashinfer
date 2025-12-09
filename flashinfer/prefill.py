@@ -2989,7 +2989,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             out_dtype = torch.bfloat16 if q.dtype.itemsize == 1 else q.dtype
             out = torch.empty(
                 q.shape[:-1] + v.shape[-1:],
-                dtype=self._cached_o_data_type,
+                dtype=out_dtype,
                 device=q.device,
             )
         else:
@@ -3166,6 +3166,10 @@ def fmha_varlen(
     lse: Optional[torch.Tensor] = None,
     causal: bool = False,
     sm_scale: Optional[float] = None,
+    q_scale: Optional[float] = None,
+    k_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
+    o_scale: Optional[float] = None,
     return_lse: Literal[False] = False,
 ) -> torch.Tensor: ...
 
@@ -3183,6 +3187,10 @@ def fmha_varlen(
     lse: Optional[torch.Tensor] = None,
     causal: bool = False,
     sm_scale: Optional[float] = None,
+    q_scale: Optional[float] = None,
+    k_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
+    o_scale: Optional[float] = None,
     return_lse: Literal[True] = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 

@@ -59,7 +59,7 @@ using tvm::ffi::Optional;
         return __VA_ARGS__();                                                  \
       });                                                                      \
     } else {                                                                   \
-      return DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP8(in_dtype, c_type_in, [&] {    \
+      return DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP8(in_dtype, c_type_in, [&] {     \
         using c_type_out = nv_bfloat16;                                        \
         return __VA_ARGS__();                                                  \
       });                                                                      \
@@ -129,9 +129,9 @@ void FMHACutlassSM100Run(ffi::TensorView workspace_buffer, ffi::TensorView q, ff
         static_cast<int*>(qo_head_indices.data_ptr()), static_cast<int*>(batch_indices.data_ptr()),
         static_cast<cutlass_type_out*>(o.data_ptr()),
         maybe_lse.has_value() ? static_cast<float*>(maybe_lse.value().data_ptr()) : nullptr,
-        mask_mode_code, sm_scale, scale_q, scale_k, scale_v, o_scale, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, q_stride_n,
-        q_stride_h, k_stride_n, k_stride_h, v_stride_n, v_stride_h, batch_size, total_qo_len,
-        total_kv_len, max_qo_len, stream);
+        mask_mode_code, sm_scale, scale_q, scale_k, scale_v, o_scale, num_qo_heads, num_kv_heads,
+        head_dim_qk, head_dim_vo, q_stride_n, q_stride_h, k_stride_n, k_stride_h, v_stride_n,
+        v_stride_h, batch_size, total_qo_len, total_kv_len, max_qo_len, stream);
     TVM_FFI_ICHECK_EQ(status, cudaSuccess)
         << "Cutlass FMHA forward pass failed" << cudaGetErrorString(status);
 
