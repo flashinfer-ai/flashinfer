@@ -53,7 +53,6 @@ from .workspace_base import AllReduceFusionWorkspace
 
 import torch
 
-from ..utils import backend_requirement, supported_compute_capability
 from .trtllm_ar import trtllm_allreduce_fusion
 from .trtllm_ar import trtllm_create_ipc_workspace_for_all_reduce_fusion
 from .trtllm_ar import trtllm_destroy_ipc_workspace_for_all_reduce_fusion
@@ -161,7 +160,7 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
 
     def destroy(self) -> None:
         """Destroy workspace and free resources."""
-        if self._destroyed:
+        if self._destroyed is True:
             return  # Already destroyed, nothing to do
 
         trtllm_destroy_ipc_workspace_for_all_reduce_fusion(self.ipc_handles)
@@ -169,11 +168,10 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
 
 
 # ============================================================================
-# BACKEND CHECKS - Hard requirements for decorator
+# BACKEND CHECKS - Hard requirements for backend selection
 # ============================================================================
 
 
-@supported_compute_capability([80, 86, 89, 90, 100])
 def _trtllm_workspace_check(
     backend: str,
     world_size: int,
@@ -188,9 +186,8 @@ def _trtllm_workspace_check(
     Check if trtllm backend CAN be used for workspace creation.
 
     Hard requirements:
-    - SM80+ compute capability (checked by decorator)
-    - Single-node topology
-    - Module availability
+    - Single-node topology (multi-node not supported)
+
     """
     # trtllm is optimized for single-node
     if topology == "multi_node":
@@ -199,7 +196,6 @@ def _trtllm_workspace_check(
     return True
 
 
-@supported_compute_capability([90, 100])
 def _mnnvl_workspace_check(
     backend: str,
     world_size: int,
@@ -213,20 +209,13 @@ def _mnnvl_workspace_check(
     """
     Check if mnnvl backend CAN be used for workspace creation.
 
-    Hard requirements:
-    - SM90+ compute capability (checked by decorator)
-    - Multi-node topology
-    - Module availability
     """
-    # MNNVL is designed for multi-node
-    if topology == "single_node":
-        return False
 
     return True
 
 
 # ============================================================================
-# HEURISTIC - Performance-based selection for decorator
+# HEURISTIC - Performance-based backend selection
 # ============================================================================
 
 
@@ -239,6 +228,7 @@ def _workspace_creation_heuristic(
     hidden_dim: int,
     dtype: torch.dtype,
     topology: str,
+    # TODO(nvmbreughe): Remove this
     **kwargs,
 ) -> list[str]:
     """
@@ -276,39 +266,33 @@ def _workspace_creation_heuristic(
             return ["mnnvl"]
 
     # Single-node scenarios
-    problem_size = max_token_num * hidden_dim
+    return ["mnnvl"]
+    # problem_size = max_token_num * hidden_dim
 
-    # Large problems (>4M elements): trtllm optimized for throughput
-    if problem_size > 4 * 1024 * 1024:
-        if "trtllm" in suitable_backends:
-            return ["trtllm"]
+    # # Large problems (>4M elements): trtllm optimized for throughput
+    # if problem_size > 4 * 1024 * 1024:
+    #     if "trtllm" in suitable_backends:
+    #         return ["trtllm"]
 
-    # Small token counts (<128): trtllm one-shot has better latency
-    if max_token_num < 128:
-        if "trtllm" in suitable_backends:
-            return ["trtllm"]
+    # # Small token counts (<128): trtllm one-shot has better latency
+    # if max_token_num < 128:
+    #     if "trtllm" in suitable_backends:
+    #         return ["trtllm"]
 
-    # Small world sizes (<=4): trtllm one-shot efficient
-    if world_size <= 4:
-        if "trtllm" in suitable_backends:
-            return ["trtllm"]
+    # # Small world sizes (<=4): trtllm one-shot efficient
+    # if world_size <= 4:
+    #     if "trtllm" in suitable_backends:
+    #         return ["trtllm"]
 
-    # Default: return first available
-    return [suitable_backends[0]]
+    # # Default: return first available
+    # return [suitable_backends[0]]
 
 
 # ============================================================================
-# WORKSPACE CREATION - Uses decorator for all validation
+# WORKSPACE CREATION
 # ============================================================================
 
 
-@backend_requirement(
-    backend_checks={
-        "trtllm": _trtllm_workspace_check,
-        "mnnvl": _mnnvl_workspace_check,
-    },
-    heuristic_func=_workspace_creation_heuristic,
-)
 def create_allreduce_fusion_workspace(
     backend: Literal["trtllm", "mnnvl", "auto"] = "auto",
     world_size: int = None,
@@ -324,7 +308,7 @@ def create_allreduce_fusion_workspace(
     """
     Create workspace for AllReduce fusion operations.
 
-    Backend selection (checks + heuristics) handled by @backend_requirement decorator.
+    Backend selection uses topology-based checks and heuristics.
 
     **Important: Workspace Reusability**
     The workspace is allocated based on the total size (max_token_num * hidden_dim * dtype_size).
@@ -393,13 +377,51 @@ def create_allreduce_fusion_workspace(
         ... )
         >>> print(workspace.backend)  # "mnnvl"
     """
-    # Decorator has validated backend - now create workspace
-    # If backend="auto", decorator has selected the best one and stored it
-
-    # Get actual backend (decorator resolved "auto" to concrete backend)
+    if gpus_per_node is None:
+        gpus_per_node = min(torch.cuda.device_count(), world_size)
+    # Determine the actual backend to use
     if backend == "auto":
-        # Decorator stored the selected backend in suitable_auto_backends
-        actual_backend = create_allreduce_fusion_workspace.suitable_auto_backends[0]
+        # Find suitable backends based on topology (anny CC check needs to be checked at kernel runtime, since there are no tensor available at this point)
+        suitable_backends = []
+        if _trtllm_workspace_check(
+            backend=backend,
+            world_size=world_size,
+            rank=rank,
+            max_token_num=max_token_num,
+            hidden_dim=hidden_dim,
+            dtype=dtype,
+            topology=topology,
+        ):
+            suitable_backends.append("trtllm")
+        if _mnnvl_workspace_check(
+            backend=backend,
+            world_size=world_size,
+            rank=rank,
+            max_token_num=max_token_num,
+            hidden_dim=hidden_dim,
+            dtype=dtype,
+            topology=topology,
+        ):
+            suitable_backends.append("mnnvl")
+
+        if not suitable_backends:
+            raise ValueError(
+                f"No suitable backend found for topology={topology}. "
+                f"trtllm requires single_node topology, mnnvl works with both."
+            )
+
+        # Apply heuristic to select best backend
+        selected = _workspace_creation_heuristic(
+            suitable_backends=suitable_backends,
+            backend=backend,
+            world_size=world_size,
+            rank=rank,
+            max_token_num=max_token_num,
+            hidden_dim=hidden_dim,
+            dtype=dtype,
+            topology=topology,
+        )
+        actual_backend = selected[0] if selected else suitable_backends[0]
     else:
         actual_backend = backend
 

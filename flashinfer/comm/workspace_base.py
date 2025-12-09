@@ -23,6 +23,11 @@ import torch
 class AllReduceFusionWorkspace(ABC):
     """Base class for AllReduce fusion workspaces."""
 
+    # Explicit type annotations for mypy (needed due to __getattr__ in subclasses)
+    world_size: int
+    rank: int
+    _destroyed: bool
+
     def __init__(self, world_size: int, rank: int):
         self.world_size = world_size
         self.rank = rank
