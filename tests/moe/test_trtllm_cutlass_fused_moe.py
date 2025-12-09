@@ -1393,18 +1393,9 @@ def compute_w4a8_reference(
     """
     results = torch.zeros_like(x)
 
-    def unpack_int4_to_int8(packed: torch.Tensor, pack_dim: str = "k") -> torch.Tensor:
-        """
-        Unpack INT4 weights from packed INT8 format.
+    def unpack_int4_to_int8(packed: torch.Tensor) -> torch.Tensor:
+        # unpack int4x2 to int8, packed in input dim (W4A8_CUSTOM)
 
-        Args:
-            packed: Packed tensor where 2 INT4 values are stored in 1 INT8
-            pack_dim: "k" means packed in input dim (W4A8_CUSTOM style)
-                    "n" means packed in output dim (VANILLA style)
-
-        Returns:
-            Unpacked INT8 tensor with original INT4 values sign-extended to INT8
-        """
         # Each int8 contains two int4 values
         # Low nibble and high nibble
         low = (packed & 0x0F).to(torch.int8)
@@ -1415,15 +1406,9 @@ def compute_w4a8_reference(
         low = torch.where(low >= 8, low - 16, low)
         high = torch.where(high >= 8, high - 16, high)
 
-        if pack_dim == "k":
-            # Packed in K dimension: shape [N, K//2] -> [N, K]
-            # Interleave low and high along last dimension
-            result = torch.stack([low, high], dim=-1).reshape(packed.shape[0], -1)
-        else:
-            # Packed in N dimension: shape [N//2, K] -> [N, K]
-            # This requires transposing, unpacking, then transposing back
-            result = torch.stack([low, high], dim=-1).reshape(-1, packed.shape[1])
-
+        # Packed in K dimension: shape [N, K//2] -> [N, K]
+        # Interleave low and high along last dimension
+        result = torch.stack([low, high], dim=-1).reshape(packed.shape[0], -1)
         return result
 
     def process_w4a8_layer(
@@ -1436,11 +1421,8 @@ def compute_w4a8_reference(
         weight_scale_2: torch.Tensor = None,
         group_size: int = 128,
     ) -> torch.Tensor:
+        # process a single layer with W4A8 quantization (test_fused_moe_w4afp8.ref())
         """
-        Process a single layer with W4A8 quantization.
-
-        This mimics the reference implementation from TensorRT-LLM test_fused_moe_w4afp8.
-
         Args:
             act: Input activation [batch, hidden_size]
             weight: Unpacked INT4->INT8 weight [hidden_size, output_size]
@@ -1504,9 +1486,9 @@ def compute_w4a8_reference(
         w = weights_dict[e_idx]
 
         # Unpack INT4 weights to INT8 (packed in K dimension for W4A8_CUSTOM)
-        w1 = unpack_int4_to_int8(w["w1_weight"], pack_dim="k")  # [N, K]
-        w2 = unpack_int4_to_int8(w["w2_weight"], pack_dim="k")  # [K, N]
-        w3 = unpack_int4_to_int8(w["w3_weight"], pack_dim="k")  # [N, K]
+        w1 = unpack_int4_to_int8(w["w1_weight"])  # [N, K]
+        w2 = unpack_int4_to_int8(w["w2_weight"])  # [K, N]
+        w3 = unpack_int4_to_int8(w["w3_weight"])  # [N, K]
 
         # Combine w3 and w1 for gated activation: [2N, K]
         w3_w1 = torch.cat([w3, w1], dim=0)
