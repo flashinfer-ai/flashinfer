@@ -262,7 +262,6 @@ def run_moe_a2a_dispatch_single_rank(
     ep_size,
     all_num_tokens,
     top_k,
-    workspace_size_per_rank,
     num_experts_per_rank,
     hidden_size,
     invalid_token_expert_id,
@@ -291,13 +290,12 @@ def run_moe_a2a_dispatch_single_rank(
     # Create MoeAlltoAll manager
     max_num_tokens = max(all_num_tokens)
 
-    MoeAlltoAll._WORKSPACE = None
     moe_a2a = MoeAlltoAll(
         mapping,
         max_num_tokens,
         top_k,
         ep_size * num_experts_per_rank,
-        workspace_size_per_rank,
+        hidden_size=hidden_size,
     )
 
     # Get the number of tokens for this specific rank (same as single-GPU)
@@ -578,7 +576,6 @@ def moe_a2a_dispatch_test_impl(distribution, top_k):
 
     hidden_size = 1024
     num_experts_per_rank = max(8, (top_k + ep_size - 1) // ep_size)
-    workspace_size_per_rank = 512 * 1024 * 1024
     invalid_token_expert_id = -1
 
     check_any_rank_failed()
@@ -594,7 +591,6 @@ def moe_a2a_dispatch_test_impl(distribution, top_k):
         ep_size,
         all_num_tokens,
         top_k,
-        workspace_size_per_rank,
         num_experts_per_rank,
         hidden_size,
         invalid_token_expert_id,
@@ -692,7 +688,6 @@ def moe_a2a_dispatch_moe_combine_test_impl(distribution, top_k):
 
     hidden_size = 2880  # gpt-oss
     num_experts_per_rank = 8
-    workspace_size_per_rank = 512 * 1024 * 1024
     mapping = Mapping(
         rank=rank,
         moe_ep_size=world_size,
@@ -739,13 +734,12 @@ def moe_a2a_dispatch_moe_combine_test_impl(distribution, top_k):
     )
 
     # Initialize MoeAlltoAll
-    MoeAlltoAll._WORKSPACE = None
     moe_a2a = MoeAlltoAll(
         mapping=mapping,
         max_num_tokens=max_num_tokens,
         top_k=top_k,
         num_experts=ep_size * num_experts_per_rank,
-        workspace_size_per_rank=workspace_size_per_rank,
+        hidden_size=hidden_size,
     )
 
     check_any_rank_failed()

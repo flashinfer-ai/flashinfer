@@ -234,14 +234,13 @@ def moe_a2a_wrap_payload_tensor_in_workspace(
     assert slice_end - slice_start <= workspace_base.shape[1], (
         "slice_end - slice_start must belong to a single rank"
     )
-    assert (
-        slice_start // workspace_base.shape[1]
-        == (slice_end - 1) // workspace_base.shape[1]
-    ), "slice_start and slice_end must belong to the same rank"
-    slice_rank = slice_start // workspace_base.shape[1]
-    local_slice_start = slice_start % workspace_base.shape[1]
+    slice_rank = slice_start // workspace_base.stride(0)
+    local_slice_start = slice_start % workspace_base.stride(0)
     slice_length = slice_end - slice_start
     local_slice_end = local_slice_start + slice_length
+    assert local_slice_end <= workspace_base.shape[1], (
+        "slice must fall within the workspace size per rank"
+    )
     result = (
         workspace_base[slice_rank, local_slice_start:local_slice_end]
         .view(dtype=dtype)
