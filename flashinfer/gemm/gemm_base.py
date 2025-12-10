@@ -3315,6 +3315,7 @@ def fp8_blockscale_gemm_sm90(
     -----------------------------
     - **BF16 + BF16 → BF16**: Both inputs BF16, internal quantization (no scales needed)
     - **BF16 + FP8 → BF16**: BF16 input, FP8 weight
+    - **FP8 + FP8 → BF16** (W8A8): Both inputs FP8 with scales required
 
     Parameters
     ----------
@@ -3406,8 +3407,8 @@ def fp8_blockscale_gemm_sm90(
         )
 
     # Validate dtype combinations
-    input_is_fp8 = input.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]
-    weight_is_fp8 = weight.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]
+    input_is_fp8 = input.dtype == torch.float8_e4m3fn
+    weight_is_fp8 = weight.dtype == torch.float8_e4m3fn
     input_is_bf16 = input.dtype == torch.bfloat16
     weight_is_bf16 = weight.dtype == torch.bfloat16
 
@@ -3485,6 +3486,10 @@ def fp8_blockscale_gemm_sm90(
         if out.device != input.device:
             raise ValueError(
                 f"Output device mismatch. Expected {input.device}, got {out.device}"
+            )
+        if out.dtype not in [torch.bfloat16, torch.float16]:
+            raise ValueError(
+                f"Output dtype must be torch.bfloat16 or torch.float16, got {out.dtype}"
             )
         if out_dtype is not None and out.dtype != out_dtype:
             raise ValueError(
