@@ -1918,7 +1918,6 @@ class TrtllmGenDecodeModule:
             sinks,
             None,   # max_q_len
             None,   # cum_seq_lens_q
-            None    # cum_seq_lens_kv
         )
         return out
 
@@ -2186,9 +2185,9 @@ def trtllm_batch_decode_with_kv_cache(
             raise ValueError("xqa backend does not support nvfp4 output")
         if o_sf_scale is not None or o_sf_vec_size is not None:
             raise ValueError("xqa backend does not support o_sf_scale or o_sf_vec_size")
-        if max_q_len is not None or cum_seq_lens_q is not None or cum_seq_lens_kv is not None:
+        if max_q_len is not None or cum_seq_lens_q is not None:
             raise ValueError(
-                "xqa backend does not support cum_seq_lens_q or cum_seq_lens_kv"
+                "xqa backend does not support cum_seq_lens_q"
             )
 
         # Handle out and out_dtype
@@ -2306,7 +2305,6 @@ def trtllm_batch_decode_with_kv_cache(
         if isinstance(bmm2_scale, torch.Tensor):
             assert bmm2_scale.dtype == torch.float32
 
-        print("TRTLLM GEN DECODE RUN")
         run_func(
             out,
             out_scale_factor,
@@ -2336,7 +2334,6 @@ def trtllm_batch_decode_with_kv_cache(
             max_q_len,
             cum_seq_lens_q,
         )
-        print("TRTLLM GEN DECODE RUN DONE")
 
         return (
             out

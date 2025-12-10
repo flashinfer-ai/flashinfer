@@ -840,7 +840,6 @@ def _test_trtllm_batch_decode(
         "q_data_type": ref_q.dtype,
         "window_left": window_left,
     }
-    print("running ref")
     if not enable_sink:
         if q_len_per_req is not None and q_len_per_req == 1:
             wrapper_ref = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
@@ -1527,3 +1526,38 @@ def test_trtllm_batch_decode_spec(
         head_dim,
         max_q_len=max_q_len,
     )
+
+
+if __name__ == "__main__":
+    # You can comment out the test groups you don't want to run
+    test_groups = [
+        # Prefill tests
+        # "test_trtllm_batch_prefill",
+        # "test_trtllm_batch_prefill_bs1",
+        
+        # # Decode tests
+        "test_trtllm_batch_decode",
+        # "test_trtllm_batch_decode_bs1",
+        # "test_trtllm_batch_decode_head_dim_256",
+        # "test_trtllm_batch_decode_long_sequence_length",
+        # "test_trtllm_batch_decode_spec",
+        
+        # # DeepSeek tests
+        # "test_trtllm_gen_prefill_deepseek",
+        # "test_trtllm_gen_prefill_deepseek_bs1",
+    ]
+    
+    # Build pytest arguments
+    args = [__file__, "-v", "-s", "-x"]  # -x stops at first failure
+    
+    # Add -k filter to select specific tests
+    # Uncomment the line below to run specific tests
+    # test_groups = ["test_trtllm_batch_decode_spec"]  # Example: only run spec decode tests
+    
+    if test_groups:
+        # Create a regex pattern to match any of the test groups
+        pattern = " or ".join(test_groups)
+        args.extend(["-k", pattern])
+    
+    # Run pytest
+    pytest.main(args)
