@@ -13,7 +13,7 @@ def gen_fp8_blockscale_gemm_sm90_module(use_fast_build: bool = False) -> JitSpec
         "-DCOMPILE_HOPPER_TMA_GEMMS",
         "-DENABLE_BF16",
         "-DENABLE_FP8",
-        "-DENABLE_FP8_BLOCK_SCALE" if is_cuda_version_at_least("12.8") else "",
+        *(("-DENABLE_FP8_BLOCK_SCALE",) if is_cuda_version_at_least("12.8") else ()),
     ]
 
     return gen_jit_spec(

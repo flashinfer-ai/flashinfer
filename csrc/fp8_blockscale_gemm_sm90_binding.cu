@@ -97,14 +97,16 @@ class Fp8BlockScaleGemmRunner : public tvm::ffi::ModuleObj {
     auto weight_ptr = weight.data_ptr();
     auto output_ptr = output.data_ptr();
 
-    int shape_m = input.size(0);
-    int shape_k = input.size(1);
-    int shape_n = weight.size(0);
+    int64_t shape_m = input.size(0);
+    int64_t shape_k = input.size(1);
+    int64_t shape_n = weight.size(0);
 
     TVM_FFI_ICHECK(input_ptr != nullptr) << "input is null";
     TVM_FFI_ICHECK(weight_ptr != nullptr) << "weight is null";
     TVM_FFI_ICHECK(output_ptr != nullptr) << "output is null";
     TVM_FFI_ICHECK(shape_k == weight.size(1)) << "K dimension mismatch";
+    TVM_FFI_ICHECK(shape_k % 16 == 0) << "N must be a multiple of 16, (K=" << shape_k << ")";
+    TVM_FFI_ICHECK(shape_n % 16 == 0) << "N must be a multiple of 16, (N=" << shape_n << ")";
 
     // Determine dtypes for runner selection
     bool input_is_fp8 = is_fp8_e4m3fn(input.dtype());
