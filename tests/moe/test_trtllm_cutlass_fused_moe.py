@@ -116,6 +116,30 @@ def break_fp4_bytes(a, dtype):
     return values.reshape(m, n * 2).to(dtype=dtype)
 
 
+def break_int4_bytes_to_int8(packed):
+    low = (packed & 0x0F).to(torch.int8)
+    high = ((packed >> 4) & 0x0F).to(torch.int8)
+    low = torch.where(low >= 8, low - 16, low)
+    high = torch.where(high >= 8, high - 16, high)
+    return torch.stack([low, high], dim=-1).reshape(packed.shape[0], -1)
+
+
+def dequantize_int4_to_dtype(
+    packed_weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    group_size: int,
+    dtype: torch.dtype,
+    weight_scale_2: torch.Tensor = None,
+) -> torch.Tensor:
+    # unpack: [N, K//2] -> [N, K]
+    unpacked = break_int4_bytes_to_int8(packed_weight)
+    scale_expanded = weight_scale.repeat_interleave(group_size, dim=1)
+    dequant = unpacked.float() * scale_expanded.float()
+    if weight_scale_2 is not None:
+        dequant = dequant / weight_scale_2.float()
+    return dequant.to(dtype)
+
+
 def compute_routing(
     router_logits: torch.Tensor, top_k: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -182,6 +206,77 @@ def torch_moe_nvfp4(a, w1, w2, topk, topk_weight, topk_ids, activation_type):
     return (
         out.view(B, -1, w2.shape[1]) * topk_weight.view(B, -1, 1).to(out.dtype)
     ).sum(dim=1)
+
+
+def torch_moe_w4a8(
+    num_experts,
+    x,
+    w31_weight,
+    w2_weight,
+    selected_experts,
+    routing_weights,
+    fc1_input_scale,
+    fc2_input_scale,
+    fc1_pre_quant_scale,
+    fc2_pre_quant_scale,
+    fc1_weight_scale_2,
+    fc2_weight_scale_2,
+):
+    dtype = x.dtype
+    results = torch.zeros_like(x)
+
+    for expert_id in range(num_experts):
+        mask = selected_experts == expert_id
+        if not mask.sum():
+            continue
+        batch_idx, nth_expert = torch.where(mask)
+
+        w31_expert = w31_weight[expert_id]  # [2N, K]
+        w2_expert = w2_weight[expert_id]  # [K, N]
+        w3_expert, w1_expert = torch.chunk(w31_expert, 2, dim=0)
+
+        expert_inputs = x[batch_idx]
+        if fc1_input_scale is not None:
+            scale1 = fc1_input_scale[expert_id]
+
+        if fc1_pre_quant_scale is not None:
+            expert_inputs_scaled = expert_inputs * fc1_pre_quant_scale[expert_id]
+        else:
+            expert_inputs_scaled = expert_inputs
+        inp_q = (
+            torch.clamp(expert_inputs_scaled / scale1, -448.0, 448.0)
+            .to(torch.float8_e4m3fn)
+            .to(dtype)
+        )
+        x1 = (inp_q @ w1_expert.t()) * scale1
+        x2 = (inp_q @ w3_expert.t()) * scale1
+        if fc1_weight_scale_2 is not None:
+            ws2 = fc1_weight_scale_2[expert_id]
+            x1 = x1 * ws2.to(dtype)
+            x2 = x2 * ws2.to(dtype)
+
+        inter = F.silu(x1) * x2
+
+        if fc2_input_scale is not None:
+            scale2 = fc2_input_scale[expert_id]
+        if fc2_pre_quant_scale is not None:
+            inter_scaled = inter * fc2_pre_quant_scale[expert_id]
+        else:
+            inter_scaled = inter
+        inter_q = (
+            torch.clamp(inter_scaled / scale2, -448.0, 448.0)
+            .to(torch.float8_e4m3fn)
+            .to(dtype)
+        )
+        output = (inter_q @ w2_expert.t()) * scale2
+
+        if fc2_weight_scale_2 is not None:
+            ws2 = fc2_weight_scale_2[expert_id]
+            output = output * ws2.to(dtype)
+
+        results[batch_idx] += routing_weights[batch_idx, nth_expert, None] * output
+
+    return results.view_as(x)
 
 
 def compute_with_experts(
@@ -1365,204 +1460,13 @@ def test_moe_bf16_mxfp4(
     torch.testing.assert_close(ref_output, flash_output, rtol=1e-1, atol=1e-1)
 
 
-def compute_w4a8_reference(
-    x: torch.Tensor,
-    weights_dict: dict,
-    num_experts: int,
-    selected_experts: torch.Tensor,
-    routing_weights: torch.Tensor,
-    dtype: torch.dtype,
-    group_size: int = 128,
-) -> torch.Tensor:
-    """
-    Reference implementation for W4A8 MoE computation.
-
-    Follows the exact computation from TensorRT-LLM test_fused_moe_w4afp8.ref()
-
-    Args:
-        x: Input tensor [batch_size, hidden_size]
-        weights_dict: Dictionary with all weight tensors per expert
-        num_experts: Number of experts
-        selected_experts: Selected expert indices [batch_size, top_k]
-        routing_weights: Routing weights [batch_size, top_k]
-        dtype: Output dtype
-        group_size: Quantization group size
-
-    Returns:
-        Output tensor [batch_size, hidden_size]
-    """
-    results = torch.zeros_like(x)
-
-    def unpack_int4_to_int8(packed: torch.Tensor) -> torch.Tensor:
-        # unpack int4x2 to int8, packed in input dim (W4A8_CUSTOM)
-
-        # Each int8 contains two int4 values
-        # Low nibble and high nibble
-        low = (packed & 0x0F).to(torch.int8)
-        high = ((packed >> 4) & 0x0F).to(torch.int8)
-
-        # Sign extend from 4-bit to 8-bit
-        # If bit 3 is set (value >= 8), subtract 16 to get negative value
-        low = torch.where(low >= 8, low - 16, low)
-        high = torch.where(high >= 8, high - 16, high)
-
-        # Packed in K dimension: shape [N, K//2] -> [N, K]
-        # Interleave low and high along last dimension
-        result = torch.stack([low, high], dim=-1).reshape(packed.shape[0], -1)
-        return result
-
-    def process_w4a8_layer(
-        act: torch.Tensor,
-        weight: torch.Tensor,
-        weight_scale: torch.Tensor,
-        input_scale: torch.Tensor,
-        dtype: torch.dtype,
-        pre_quant_scale: torch.Tensor = None,
-        weight_scale_2: torch.Tensor = None,
-        group_size: int = 128,
-    ) -> torch.Tensor:
-        # process a single layer with W4A8 quantization (test_fused_moe_w4afp8.ref())
-        """
-        Args:
-            act: Input activation [batch, hidden_size]
-            weight: Unpacked INT4->INT8 weight [hidden_size, output_size]
-            weight_scale: Per-group dequantization scale [hidden_size // group_size, output_size]
-            input_scale: Per-tensor scale for FP8 activation quantization
-            dtype: Output dtype (bfloat16 or float16)
-            pre_quant_scale: Per-channel activation scale before FP8 quantization
-            weight_scale_2: Per-tensor weight scale (for two-stage dequantization)
-            group_size: Number of elements per scale group
-
-        Returns:
-            Output tensor after quantized matmul
-        """
-        # Step 1: Apply pre-quant scale to activation (SmoothQuant-style)
-        if pre_quant_scale is not None:
-            act = act * pre_quant_scale
-
-        # Step 2: Quantize activation to FP8
-        # Clamp to FP8 E4M3 representable range [-448, 448]
-        act_fp8 = (
-            torch.clamp(act / input_scale, -448.0, 448.0)
-            .to(torch.float8_e4m3fn)
-            .to(dtype)
-        )
-
-        # Step 3: Dequantize INT4 weights using per-group scales
-        # weight_scale shape: [K // group_size, N], need to expand to [K, N]
-        weight_scale_expanded = weight_scale.repeat_interleave(group_size, dim=0)
-        weight_dequant = weight.float() * weight_scale_expanded.float()
-
-        # Step 4: Apply weight_scale_2 if present (divide weights, multiply output)
-        if weight_scale_2 is not None:
-            weight_dequant = weight_dequant / weight_scale_2.float()
-
-        # Convert to target dtype for matmul
-        weight_dequant = weight_dequant.to(dtype)
-
-        # Step 5: Compute matmul and scale output
-        output = torch.matmul(act_fp8, weight_dequant) * input_scale.to(dtype)
-
-        # Step 6: Apply weight_scale_2 to output if present
-        if weight_scale_2 is not None:
-            output = output * weight_scale_2.to(dtype)
-
-        return output
-
-    for e_idx in range(num_experts):
-        # Find tokens routed to this expert
-        mask = selected_experts == e_idx
-        activated_tokens = mask.sum(1).bool()
-        act = x[activated_tokens, :]
-
-        if act.shape[0] == 0:
-            continue
-
-        # Get routing weights for activated tokens
-        final_scale = (
-            (routing_weights * mask.float()).sum(1)[activated_tokens].unsqueeze(1)
-        )
-
-        w = weights_dict[e_idx]
-
-        # Unpack INT4 weights to INT8 (packed in K dimension for W4A8_CUSTOM)
-        w1 = unpack_int4_to_int8(w["w1_weight"])  # [N, K]
-        w2 = unpack_int4_to_int8(w["w2_weight"])  # [K, N]
-        w3 = unpack_int4_to_int8(w["w3_weight"])  # [N, K]
-
-        # Combine w3 and w1 for gated activation: [2N, K]
-        w3_w1 = torch.cat([w3, w1], dim=0)
-
-        # Combine scales
-        s1 = w["w1_scale"]  # [N, K // group_size]
-        s3 = w["w3_scale"]  # [N, K // group_size]
-        s3_s1 = torch.cat([s3, s1], dim=0)  # [2N, K // group_size]
-
-        # Max input scales for w1 and w3 (they should be the same in W4A8_CUSTOM)
-        p1 = w["input_scale"]
-        p3 = w["input_scale"]
-        p3_p1 = torch.max(p1, p3)
-
-        # Max pre-quant scales
-        a1 = w["w1_pre_quant_scale"]
-        a3 = w["w3_pre_quant_scale"]
-        a3_a1 = torch.max(a1, a3)
-
-        # Weight scale 2
-        q3_q1 = w["weight_scale_2"]
-
-        # FC1 + FC3 (gate and up projection)
-        # Weight shape for matmul: [K, 2N] (transposed from [2N, K])
-        fc1 = process_w4a8_layer(
-            act,
-            w3_w1.T.contiguous(),  # [K, 2N]
-            s3_s1.T.contiguous(),  # [K // group_size, 2N]
-            p3_p1,
-            dtype,
-            pre_quant_scale=a3_a1,
-            weight_scale_2=q3_q1,
-            group_size=group_size,
-        )
-
-        # Split and apply SwiGLU: fc1 = up * silu(gate)
-        fc1_up, gate = fc1.chunk(2, dim=-1)
-        fc1_out = fc1_up * torch.nn.functional.silu(gate)
-
-        # FC2 (down projection)
-        # Get FC2 scales
-        s2 = w["w2_scale"]  # [K, N // group_size]
-        p2 = w["input_scale"]
-        a2 = w["w2_pre_quant_scale"]
-        q2 = w["weight_scale_2"]
-
-        fc2 = process_w4a8_layer(
-            fc1_out,
-            w2.T.contiguous(),  # [N, K]
-            s2.T.contiguous(),  # [N // group_size, K]
-            p2,
-            dtype,
-            pre_quant_scale=a2,
-            weight_scale_2=q2,
-            group_size=group_size,
-        )
-
-        # Accumulate with routing weight
-        results[activated_tokens, :] += (fc2 * final_scale).to(results.dtype)
-
-    return results
-
-
 @pytest.mark.parametrize("batch_size", BATCH_SIZES)
 @pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
 @pytest.mark.parametrize("num_experts", NUM_EXPERTS)
 @pytest.mark.parametrize("top_k", TOP_K_VALUES)
 @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.skipif(
-    torch.cuda.get_device_capability()[0] != 9,
-    reason="W4A8 INT4xFP8 is only supported on SM90",
-)
-def test_moe_w4a8_fp8(
+def test_moe_w4a8(
     batch_size: int,
     hidden_size: int,
     num_experts: int,
@@ -1571,162 +1475,111 @@ def test_moe_w4a8_fp8(
     dtype: torch.dtype,
 ):
     """Test MoE with W4A8 quantization (INT4 weights, FP8 activations)."""
+    if torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip("W4A8 is only supported on SM90")
     if top_k > num_experts:
         pytest.skip("top_k must be <= num_experts")
 
     torch.manual_seed(42)
     group_size = 128
+    e = num_experts
+    m = batch_size
+    n = intermediate_size
+    k = hidden_size
+    affine_coeff = 0.005
 
-    def generate_w4a8_test_data(
-        batch_size: int,
-        hidden_size: int,
-        intermediate_size: int,
-        num_experts: int,
-        top_k: int,
-        dtype: torch.dtype = torch.bfloat16,
-        group_size: int = 128,
-        seed: int = 0,
-    ):
-        torch.manual_seed(seed)
-        torch.cuda.manual_seed(seed)
+    x = torch.randn(m, k, dtype=dtype, device="cuda")
+    router_logits = torch.randn(m, e, dtype=dtype, device="cuda")
+    w1_weight = torch.randint(
+        -128, 127, (e, n, k // 2), dtype=torch.int8, device="cuda"
+    )
+    w2_weight = torch.randint(
+        -128, 127, (e, k, n // 2), dtype=torch.int8, device="cuda"
+    )
+    w3_weight = torch.randint(
+        -128, 127, (e, n, k // 2), dtype=torch.int8, device="cuda"
+    )
 
-        e, m, n, k = num_experts, batch_size, intermediate_size, hidden_size
-        affine_coeff = 0.005
+    # per group weight
+    w1_scale = (
+        torch.randn(e, n, k // group_size, dtype=dtype, device="cuda") * affine_coeff
+    )
+    w2_scale = (
+        torch.randn(e, k, n // group_size, dtype=dtype, device="cuda") * affine_coeff
+    )
+    w3_scale = (
+        torch.randn(e, n, k // group_size, dtype=dtype, device="cuda") * affine_coeff
+    )
 
-        x = torch.randn(m, k, dtype=dtype, device="cuda")
-        router_logits = torch.randn(m, e, dtype=dtype, device="cuda")
-        w1_weight = torch.randint(
-            -128, 127, (e, n, k // 2), dtype=torch.int8, device="cuda"
-        )
-        w2_weight = torch.randint(
-            -128, 127, (e, k, n // 2), dtype=torch.int8, device="cuda"
-        )
-        w3_weight = torch.randint(
-            -128, 127, (e, n, k // 2), dtype=torch.int8, device="cuda"
-        )
+    # per channel pre quant scales
+    w1_pre_quant_scale = torch.rand(e, k, dtype=dtype, device="cuda") * 0.1 + 0.95
+    w2_pre_quant_scale = torch.rand(e, n, dtype=dtype, device="cuda") * 0.1 + 0.95
+    w3_pre_quant_scale = torch.rand(e, k, dtype=dtype, device="cuda") * 0.1 + 0.95
 
-        # per group weight
-        w1_scale = (
-            torch.randn(e, n, k // group_size, dtype=dtype, device="cuda")
-            * affine_coeff
-        )
-        w2_scale = (
-            torch.randn(e, k, n // group_size, dtype=dtype, device="cuda")
-            * affine_coeff
-        )
-        w3_scale = (
-            torch.randn(e, n, k // group_size, dtype=dtype, device="cuda")
-            * affine_coeff
-        )
+    input_scale = torch.rand(e, 1, dtype=torch.float32, device="cuda") * 0.2 + 0.1
+    weight_scale_2 = torch.ones(e, 1, dtype=torch.float32, device="cuda")
 
-        # per channel pre quant scales
-        w1_pre_quant_scale = torch.rand(e, k, dtype=dtype, device="cuda") * 0.1 + 0.95
-        w2_pre_quant_scale = torch.rand(e, n, dtype=dtype, device="cuda") * 0.1 + 0.95
-        w3_pre_quant_scale = torch.rand(e, k, dtype=dtype, device="cuda") * 0.1 + 0.95
+    fc1_weights = torch.cat([w3_weight, w1_weight], dim=1)
+    fc2_weights = w2_weight
 
-        input_scale = torch.rand(e, 1, dtype=torch.float32, device="cuda") * 0.2 + 0.1
-        weight_scale_2 = torch.ones(e, 1, dtype=torch.float32, device="cuda")
-
-        fc1_weights = torch.cat([w3_weight, w1_weight], dim=1)
-        fc2_weights = w2_weight
-
-        weights_dict = {
-            i: {
-                "w1_weight": w1_weight[i],
-                "w2_weight": w2_weight[i],
-                "w3_weight": w3_weight[i],
-                "w1_scale": w1_scale[i],
-                "w2_scale": w2_scale[i],
-                "w3_scale": w3_scale[i],
-                "w1_pre_quant_scale": w1_pre_quant_scale[i],
-                "w2_pre_quant_scale": w2_pre_quant_scale[i],
-                "w3_pre_quant_scale": w3_pre_quant_scale[i],
-                "input_scale": input_scale[i],
-                "weight_scale_2": weight_scale_2[i],
-            }
-            for i in range(e)
-        }
-
-        interleave_fc1 = 4 if k % 512 == 0 else (2 if k % 256 == 0 else 1)
-        interleave_fc2 = 4 if n % 512 == 0 else (2 if n % 256 == 0 else 1)
-
-        # FC31 weight scales: [e, 2N, K//g] -> interleaved [e, K//(g*i), 2N*i]
-        w3_w1_scales = torch.cat([w3_scale, w1_scale], dim=1)
-        s = w3_w1_scales.shape
-        w3_w1_scales_int = (
-            w3_w1_scales.reshape(s[0], s[1], s[2] // interleave_fc1, interleave_fc1)
+    def interleave_weights(w: torch.Tensor, dim: int) -> torch.Tensor:
+        interleave_factor = 4 if dim % 512 == 0 else (2 if dim % 256 == 0 else 1)
+        s = w.shape
+        w_interleaved = (
+            w.reshape(s[0], s[1], s[2] // interleave_factor, interleave_factor)
             .permute(0, 2, 1, 3)
-            .reshape(s[0], s[2] // interleave_fc1, s[1] * interleave_fc1)
+            .reshape(s[0], s[2] // interleave_factor, s[1] * interleave_factor)
             .contiguous()
         )
+        return w_interleaved
 
-        # FC2 weight scales: [e, K, N//g] -> interleaved [e, N//(g*i), K*i]
-        s2 = w2_scale.shape
-        w2_scales_int = (
-            w2_scale.reshape(s2[0], s2[1], s2[2] // interleave_fc2, interleave_fc2)
-            .permute(0, 2, 1, 3)
-            .reshape(s2[0], s2[2] // interleave_fc2, s2[1] * interleave_fc2)
-            .contiguous()
-        )
+    w3_w1_scales = torch.cat([w3_scale, w1_scale], dim=1)
+    w3_w1_scales_int = interleave_weights(w3_w1_scales, k)
+    w2_scales_int = interleave_weights(w2_scale, n)
 
-        # act scales
-        w3_w1_pre_quant_max = torch.max(w1_pre_quant_scale, w3_pre_quant_scale)
-        w3_w1_input_scale_max = input_scale.max()
-        fc31_act_scale = (w3_w1_pre_quant_max / w3_w1_input_scale_max).to(dtype)
-        fc2_act_scale = (w2_pre_quant_scale / input_scale).to(dtype).unsqueeze(-1)
+    # act scales
+    w3_w1_pre_quant_max = torch.max(w1_pre_quant_scale, w3_pre_quant_scale)
+    w3_w1_input_scale_max = input_scale.max()
+    fc31_act_scale = (w3_w1_pre_quant_max / w3_w1_input_scale_max).to(dtype)
+    fc2_act_scale = (w2_pre_quant_scale / input_scale).to(dtype).unsqueeze(-1)
 
-        fc31_alpha = (weight_scale_2.squeeze(-1) * w3_w1_input_scale_max).float()
-        fc2_alpha = (weight_scale_2.squeeze(-1) * input_scale.squeeze(-1)).float()
+    fc31_alpha = (weight_scale_2.squeeze(-1) * w3_w1_input_scale_max).float()
+    fc2_alpha = (weight_scale_2.squeeze(-1) * input_scale.squeeze(-1)).float()
 
-        zero_1 = torch.empty(0, dtype=dtype, device="cuda")
-        zero_2 = torch.empty(0, dtype=dtype, device="cuda")
+    zero_1 = torch.empty(0, dtype=dtype, device="cuda")
+    zero_2 = torch.empty(0, dtype=dtype, device="cuda")
 
-        # SM90 requires bfloat16 bit patterns
-        sm = (
-            torch.cuda.get_device_capability()[0] * 10
-            + torch.cuda.get_device_capability()[1]
-        )
-        if sm >= 90:
-            w3_w1_scales_out = w3_w1_scales_int.to(torch.bfloat16).view(dtype)
-            w2_scales_out = w2_scales_int.to(torch.bfloat16).view(dtype)
-            fc31_act_out = fc31_act_scale.to(torch.bfloat16).view(dtype)
-            fc2_act_out = fc2_act_scale.to(torch.bfloat16).view(dtype)
-        else:
-            w3_w1_scales_out = w3_w1_scales_int.to(dtype)
-            w2_scales_out = w2_scales_int.to(dtype)
-            fc31_act_out = fc31_act_scale
-            fc2_act_out = fc2_act_scale
+    # SM90 requires bfloat16 bit patterns
+    sm = (
+        torch.cuda.get_device_capability()[0] * 10
+        + torch.cuda.get_device_capability()[1]
+    )
+    if sm >= 90:
+        w3_w1_scales_out = w3_w1_scales_int.to(torch.bfloat16).view(dtype)
+        w2_scales_out = w2_scales_int.to(torch.bfloat16).view(dtype)
+        fc31_act_out = fc31_act_scale.to(torch.bfloat16).view(dtype)
+        fc2_act_out = fc2_act_scale.to(torch.bfloat16).view(dtype)
+    else:
+        w3_w1_scales_out = w3_w1_scales_int.to(dtype)
+        w2_scales_out = w2_scales_int.to(dtype)
+        fc31_act_out = fc31_act_scale
+        fc2_act_out = fc2_act_scale
 
-        quant_scales = (
-            w3_w1_scales_out,
-            w2_scales_out,
-            fc31_act_out,
-            fc2_act_out,
-            zero_1,
-            zero_2,
-            fc31_alpha,
-            fc2_alpha,
-        )
-
-        return x, router_logits, weights_dict, fc1_weights, fc2_weights, quant_scales
-
-    x, router_logits, weights_dict, fc1_weights, fc2_weights, quant_scales = (
-        generate_w4a8_test_data(
-            batch_size=batch_size,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            num_experts=num_experts,
-            top_k=top_k,
-            dtype=dtype,
-            group_size=group_size,
-            seed=42,
-        )
+    quant_scales = (
+        w3_w1_scales_out,
+        w2_scales_out,
+        fc31_act_out,
+        fc2_act_out,
+        zero_1,
+        zero_2,
+        fc31_alpha,
+        fc2_alpha,
     )
 
     routing_weights, selected_experts = compute_routing(router_logits, top_k)
     selected_experts_int32 = selected_experts.to(torch.int32)
 
-    kernel_output = torch.zeros_like(x)
+    flash_output = torch.zeros_like(x)
     _ = fused_moe.cutlass_fused_moe(
         x,
         selected_experts_int32,
@@ -1736,21 +1589,52 @@ def test_moe_w4a8_fp8(
         dtype,
         quant_scales=quant_scales,
         use_w4_group_scaling=True,
-        output=kernel_output,
+        output=flash_output,
         use_packed_weights=True,
     )
 
-    ref_output = compute_w4a8_reference(
-        x,
-        weights_dict,
-        num_experts,
-        selected_experts.to(torch.int64),
-        routing_weights,
-        dtype,
-        group_size=group_size,
-    )
+    w31_weight_list = []
+    w2_weight_list = []
 
-    torch.testing.assert_close(kernel_output, ref_output, rtol=1e-2, atol=0.1)
+    for e_idx in range(num_experts):
+        w1_w = w1_weight[e_idx]  # [N, K//2]
+        w3_w = w3_weight[e_idx]  # [N, K//2]
+        w2_w = w2_weight[e_idx]  # [K, N//2]
+        w1_s = w1_scale[e_idx]  # [N, K//group_size]
+        w3_s = w3_scale[e_idx]  # [N, K//group_size]
+        w2_s = w2_scale[e_idx]  # [K, N//group_size]
+        ws2 = weight_scale_2[e_idx]  # [1]
+
+        # dequant w1 and w3: [N, K//2] -> [N, K]
+        w1_dequant = dequantize_int4_to_dtype(w1_w, w1_s, group_size, dtype, ws2)
+        w3_dequant = dequantize_int4_to_dtype(w3_w, w3_s, group_size, dtype, ws2)
+
+        # dequant w2: [K, N//2] -> [K, N]
+        w2_dequant = dequantize_int4_to_dtype(w2_w, w2_s, group_size, dtype, ws2)
+
+        w31 = torch.cat([w3_dequant, w1_dequant], dim=0)  # [2N, K]
+
+        w31_weight_list.append(w31)
+        w2_weight_list.append(w2_dequant)
+
+    w31_weight_dequant = torch.stack(w31_weight_list, dim=0)  # [e, 2N, K]
+    w2_weight_dequant = torch.stack(w2_weight_list, dim=0)  # [e, K, N]
+
+    ref_output = torch_moe_w4a8(
+        num_experts,
+        x,
+        w31_weight_dequant,
+        w2_weight_dequant,
+        selected_experts,
+        routing_weights,
+        fc1_input_scale=input_scale.squeeze(-1),
+        fc2_input_scale=input_scale.squeeze(-1),
+        fc1_pre_quant_scale=torch.max(w1_pre_quant_scale, w3_pre_quant_scale),
+        fc2_pre_quant_scale=w2_pre_quant_scale,
+        fc1_weight_scale_2=weight_scale_2.squeeze(-1),
+        fc2_weight_scale_2=weight_scale_2.squeeze(-1),
+    )
+    torch.testing.assert_close(ref_output, flash_output, rtol=1e-2, atol=1e-1)
 
 
 if __name__ == "__main__":
