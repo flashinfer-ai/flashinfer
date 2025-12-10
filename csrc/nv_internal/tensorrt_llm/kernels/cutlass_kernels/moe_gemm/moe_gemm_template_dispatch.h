@@ -796,12 +796,11 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
       // cases with small numbers of tokens SM80 is faster. We check here to see which is selected
       if (inputs.gemm_config.sm_version >= 90) {
         // Check the major version of the SM matches
-        TLLM_CHECK_WITH_INFO(
-            (inputs.gemm_config.sm_version / 10 == sm_ / 10) ||
-            // allow sm100 configs to run on sm110 as well
-            (inputs.gemm_config.sm_version / 10 == 10 && sm_ / 10 == 11),
-            "Using SM %d configuration for SM %d device",
-            inputs.gemm_config.sm_version, sm_);
+        TLLM_CHECK_WITH_INFO((inputs.gemm_config.sm_version / 10 == sm_ / 10) ||
+                                 // allow sm100 configs to run on sm110 as well
+                                 (inputs.gemm_config.sm_version / 10 == 10 && sm_ / 10 == 11),
+                             "Using SM %d configuration for SM %d device",
+                             inputs.gemm_config.sm_version, sm_);
         TLLM_CHECK_WITH_INFO(inputs.biases != nullptr || hopper_inputs.ptr_c == nullptr,
                              "Input biases and hopper input disagree if bias is enabled");
         TLLM_CHECK_WITH_INFO(
