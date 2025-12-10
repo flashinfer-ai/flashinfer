@@ -218,7 +218,7 @@ def moe_a2a_wrap_payload_tensor_in_workspace(
     Wrap an offset in the workspace into a tensor.
 
     Args:
-        workspace: [ep_size, size_per_rank] workspace tensor
+        workspace: [ep_size, size_per_rank] or [size_per_rank] workspace tensor
         leading_shape: The leading shape to wrap the tensor with
         slice_start: The start of the slice in the workspace
         slice_end: The end of the slice in the workspace
@@ -227,12 +227,25 @@ def moe_a2a_wrap_payload_tensor_in_workspace(
     Returns:
         tensor: [leading_shape, *] workspace-backed tensor
     """
-    workspace_base = workspace.view(-1).view(dtype=torch.uint8)
-    assert slice_end <= workspace.numel(), (
-        f"slice_end {slice_end} exceeds workspace size {workspace.numel()}"
+    if workspace.ndim == 1:
+        workspace = workspace.unsqueeze(0)
+    workspace_base = workspace.view(dtype=torch.uint8)
+    assert workspace.ndim == 2, "workspace must be shape [ep_size, size_per_rank]"
+    assert slice_end - slice_start <= workspace_base.shape[1], (
+        "slice_end - slice_start must belong to a single rank"
     )
+    assert (
+        slice_start // workspace_base.shape[1]
+        == (slice_end - 1) // workspace_base.shape[1]
+    ), "slice_start and slice_end must belong to the same rank"
+    slice_rank = slice_start // workspace_base.shape[1]
+    local_slice_start = slice_start % workspace_base.shape[1]
+    slice_length = slice_end - slice_start
+    local_slice_end = local_slice_start + slice_length
     result = (
-        workspace_base[slice_start:slice_end].view(dtype=dtype).view(*leading_shape, -1)
+        workspace_base[slice_rank, local_slice_start:local_slice_end]
+        .view(dtype=dtype)
+        .view(*leading_shape, -1)
     )
     return result
 
