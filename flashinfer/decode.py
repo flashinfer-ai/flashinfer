@@ -1916,6 +1916,9 @@ class TrtllmGenDecodeModule:
             enable_pdl,
             workspace_size,
             sinks,
+            None,   # max_q_len
+            None,   # cum_seq_lens_q
+            None    # cum_seq_lens_kv
         )
         return out
 
@@ -2062,7 +2065,7 @@ def trtllm_batch_decode_with_kv_cache(
     workspace_buffer: torch.Tensor,
     block_tables: torch.Tensor,
     seq_lens: torch.Tensor,
-    max_seq_len: int,
+    max_kv_len: int,
     bmm1_scale: Union[float, torch.Tensor] = 1.0,
     bmm2_scale: Union[float, torch.Tensor] = 1.0,
     window_left: int = -1,
@@ -2077,12 +2080,14 @@ def trtllm_batch_decode_with_kv_cache(
     q_len_per_req: Optional[int] = 1,
     o_scale: Optional[float] = 1.0,
     mask: Optional[torch.Tensor] = None,
+    max_q_len: Optional[int] = None,
+    cum_seq_lens_q: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, FP4Tensor]:
     """
     Parameters
     ----------
     query : torch.Tensor
-        query tensor with shape [num_tokens, num_heads, head_dim], num_tokens = batch_size * q_len_per_request
+        query tensor with shape [num_tokens, num_heads, head_dim], num_tokens = total query tokens in the batch.
 
     kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
         If kv_cache is a single tensor, it should be a tensor with shape [num_pages, 1 or 2, num_kv_heads, page_size, head_dim] if :attr:`kv_layout` is ``HND``,
@@ -2181,6 +2186,10 @@ def trtllm_batch_decode_with_kv_cache(
             raise ValueError("xqa backend does not support nvfp4 output")
         if o_sf_scale is not None or o_sf_vec_size is not None:
             raise ValueError("xqa backend does not support o_sf_scale or o_sf_vec_size")
+        if max_q_len is not None or cum_seq_lens_q is not None or cum_seq_lens_kv is not None:
+            raise ValueError(
+                "xqa backend does not support cum_seq_lens_q or cum_seq_lens_kv"
+            )
 
         # Handle out and out_dtype
         if out_dtype is None:
@@ -2195,7 +2204,7 @@ def trtllm_batch_decode_with_kv_cache(
             workspace_buffer=workspace_buffer,
             block_tables=block_tables,
             seq_lens=seq_lens,
-            max_seq_len=max_seq_len,
+            max_seq_len=max_kv_len,
             bmm1_scale=bmm1_scale,
             bmm2_scale=bmm2_scale,
             window_left=window_left,
@@ -2297,6 +2306,7 @@ def trtllm_batch_decode_with_kv_cache(
         if isinstance(bmm2_scale, torch.Tensor):
             assert bmm2_scale.dtype == torch.float32
 
+        print("TRTLLM GEN DECODE RUN")
         run_func(
             out,
             out_scale_factor,
@@ -2305,13 +2315,13 @@ def trtllm_batch_decode_with_kv_cache(
                 q_len_per_req,
                 query.size(1),
                 query.size(2),
-            ),
+            ) if q_len_per_req is not None else query,
             k_cache,
             v_cache,
             workspace_buffer,
             block_tables,
             seq_lens,
-            max_seq_len,
+            max_kv_len,
             bmm1_scale,
             bmm2_scale,
             o_sf_scale or -1.0,
@@ -2323,7 +2333,10 @@ def trtllm_batch_decode_with_kv_cache(
             enable_pdl,
             workspace_buffer.numel() * workspace_buffer.element_size(),
             sinks,
+            max_q_len,
+            cum_seq_lens_q,
         )
+        print("TRTLLM GEN DECODE RUN DONE")
 
         return (
             out
