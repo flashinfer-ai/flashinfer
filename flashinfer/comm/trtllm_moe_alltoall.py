@@ -12,7 +12,7 @@ from typing import Optional
 import torch
 import functools
 
-from .api_logging import flashinfer_api
+from ..api_logging import flashinfer_api
 
 from .mnnvl import MnnvlMemory, MnnvlConfig
 from .mapping import Mapping
