@@ -12,6 +12,8 @@ from typing import Optional
 import torch
 import functools
 
+from .api_logging import flashinfer_api
+
 from .mnnvl import MnnvlMemory, MnnvlConfig
 from .mapping import Mapping
 from ..jit.comm import gen_moe_alltoall_module
@@ -196,6 +198,7 @@ def get_moe_alltoall_module():
     )
 
 
+@flashinfer_api
 def moe_a2a_initialize(
     workspace: torch.Tensor,
     ep_rank: int,
@@ -207,6 +210,7 @@ def moe_a2a_initialize(
     )
 
 
+@flashinfer_api
 def moe_a2a_wrap_payload_tensor_in_workspace(
     workspace: torch.Tensor,
     leading_shape: list[int],
@@ -249,6 +253,7 @@ def moe_a2a_wrap_payload_tensor_in_workspace(
     return result
 
 
+@flashinfer_api
 def moe_a2a_dispatch(
     token_selected_experts: torch.Tensor,
     input_payloads: list[torch.Tensor],
@@ -310,6 +315,7 @@ def moe_a2a_dispatch(
     return output_payloads, combine_payload_offset
 
 
+@flashinfer_api
 def moe_a2a_combine(
     payload: torch.Tensor,
     local_num_tokens: int,
@@ -336,6 +342,7 @@ def moe_a2a_combine(
     )
 
 
+@flashinfer_api
 def moe_a2a_sanitize_expert_ids(
     expert_ids: torch.Tensor,
     workspace: torch.Tensor,
@@ -348,6 +355,7 @@ def moe_a2a_sanitize_expert_ids(
     )
 
 
+@flashinfer_api
 def moe_a2a_get_workspace_size_per_rank(
     ep_size: int,
     max_num_tokens: int,
@@ -432,6 +440,7 @@ class MoeAlltoAll:
             return cls._WORKSPACE_CACHE[key]
 
     @staticmethod
+    @flashinfer_api
     def get_moe_workspace_size_per_rank(
         ep_size: int,
         top_k: int,
@@ -583,6 +592,7 @@ class MoeAlltoAll:
         ]
         self._state.phase = "deleted"
 
+    @flashinfer_api
     def dispatch(
         self,
         token_selected_experts: torch.Tensor,
@@ -642,6 +652,7 @@ class MoeAlltoAll:
 
         return recv_tensors
 
+    @flashinfer_api
     def combine(
         self,
         payload: torch.Tensor,
@@ -684,6 +695,7 @@ class MoeAlltoAll:
 
         return output
 
+    @flashinfer_api
     def get_combine_payload_tensor_in_workspace(
         self,
         runtime_max_tokens_per_rank: int,
