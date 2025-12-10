@@ -218,9 +218,7 @@ void trtllm_paged_attention_decode(
     Variant<double, ffi::Tensor> bmm2_scale, double o_sf_scale, int64_t o_sf_vec_size,
     int64_t o_sf_start_index, int64_t window_left, int64_t sparse_mla_top_k, int64_t sm_count,
     bool enable_pdl, int64_t workspace_size, Optional<TensorView> attention_sinks,
-    Optional<int64_t> optional_max_q_len,
-    Optional<TensorView> cum_seq_lens_q
-  ) {
+    Optional<int64_t> optional_max_q_len, Optional<TensorView> cum_seq_lens_q) {
   auto q_data_type = dl_dtype_to_tllm_data_type(query.dtype());
   auto kv_data_type = dl_dtype_to_tllm_data_type(key_cache.dtype());
   TVM_FFI_ICHECK_EQ(key_cache.ndim(), value_cache.ndim());
@@ -232,7 +230,7 @@ void trtllm_paged_attention_decode(
   int max_q_len;
   int sum_seq_q;
   int num_qo_heads;
-  int* cum_seq_lens_q_ptr = nullptr; 
+  int* cum_seq_lens_q_ptr = nullptr;
   if (!optional_max_q_len.has_value()) {
     // each request has the same length
 
@@ -241,7 +239,8 @@ void trtllm_paged_attention_decode(
     // based on profiled results, always use decode mode for MTP (q_len is small)
     // example: when kv_len = 10000, q < 200, decode mode is faster
     TVM_FFI_CHECK(query.ndim() == 4,
-                  "When max_q_len is not provided, query must be of shape [batch_size, q_len, num_qo_heads, head_dim_q]");
+                  "When max_q_len is not provided, query must be of shape [batch_size, q_len, "
+                  "num_qo_heads, head_dim_q]");
     int q_len_per_request = query.size(1);
     batch_size = query.size(0);
     sum_seq_q = batch_size * q_len_per_request;
@@ -249,9 +248,11 @@ void trtllm_paged_attention_decode(
     max_q_len = q_len_per_request;
   } else {
     // each request has different length
-    TVM_FFI_CHECK(cum_seq_lens_q.has_value(), "cum_seq_lens_q must be provided when max_q_len is provided");
-    TVM_FFI_CHECK(query.ndim() == 3, 
-                  "When max_q_len is provided, query must be of shape [sum_seq_q, num_qo_heads, head_dim_q]");
+    TVM_FFI_CHECK(cum_seq_lens_q.has_value(),
+                  "cum_seq_lens_q must be provided when max_q_len is provided");
+    TVM_FFI_CHECK(
+        query.ndim() == 3,
+        "When max_q_len is provided, query must be of shape [sum_seq_q, num_qo_heads, head_dim_q]");
     // the shape of query: [sum_seq_q, num_qo_heads, head_dim_q]
     // the shape of cum_seq_lens_q: [batch_size + 1]
     batch_size = cum_seq_lens_q.value().size(0) - 1;
@@ -315,15 +316,13 @@ void trtllm_paged_attention_decode(
   trtllm_paged_attention_launcher(
       out.data_ptr(), output_sf_ptr, query.data_ptr(), key_cache.data_ptr(), value_cache.data_ptr(),
       workspace_buffer.data_ptr(), static_cast<int*>(block_tables.data_ptr()),
-      static_cast<int*>(seq_lens.data_ptr()),
-      cum_seq_lens_q_ptr,
-      /*cum_seq_lens_kv*/nullptr, attention_sinks_ptr, q_data_type, kv_data_type, o_data_type,
-      TllmPagedAttentionMode::ForGen, batch_size, max_q_len, max_kv_len,
-      num_pages_in_mem_pool, num_qo_heads, num_kv_heads, head_dim_q, head_dim_o, page_size,
-      kv_stride_keys_values, kv_stride_heads, kv_stride_batch, max_num_blocks_per_seq,
-      bmm1_scale_value, bmm2_scale_value, bmm1_scale_log2_ptr, bmm2_scale_ptr, o_sf_scale,
-      o_sf_vec_size, o_sf_start_index, window_left, sum_seq_q, sparse_mla_top_k, sm_count,
-      enable_pdl, workspace_size, stream);
+      static_cast<int*>(seq_lens.data_ptr()), cum_seq_lens_q_ptr,
+      /*cum_seq_lens_kv*/ nullptr, attention_sinks_ptr, q_data_type, kv_data_type, o_data_type,
+      TllmPagedAttentionMode::ForGen, batch_size, max_q_len, max_kv_len, num_pages_in_mem_pool,
+      num_qo_heads, num_kv_heads, head_dim_q, head_dim_o, page_size, kv_stride_keys_values,
+      kv_stride_heads, kv_stride_batch, max_num_blocks_per_seq, bmm1_scale_value, bmm2_scale_value,
+      bmm1_scale_log2_ptr, bmm2_scale_ptr, o_sf_scale, o_sf_vec_size, o_sf_start_index, window_left,
+      sum_seq_q, sparse_mla_top_k, sm_count, enable_pdl, workspace_size, stream);
 }
 
 void trtllm_paged_attention_context(

@@ -773,7 +773,12 @@ def _test_trtllm_batch_decode(
     if backend == "xqa" and q_dtype == "fp8":
         pytest.skip("xqa backend only supports fp16 and bf16 query")
 
-    if o_dtype == "nvfp4" and (q_len_per_req is not None and q_len_per_req > 1 or max_q_len is not None and max_q_len > 1):
+    if o_dtype == "nvfp4" and (
+        q_len_per_req is not None
+        and q_len_per_req > 1
+        or max_q_len is not None
+        and max_q_len > 1
+    ):
         # todo(Yingyi): add support for nvfp4 with speculative decoding
         pytest.skip("nvfp4 is not supported for q_len_per_req > 1 or max_q_len > 1 yet")
 
@@ -892,7 +897,7 @@ def _test_trtllm_batch_decode(
             kv_indptr=kv_indptr_tokens,
         )
 
-    if (q_len_per_req and q_len_per_req > 1):
+    if q_len_per_req and q_len_per_req > 1:
         # only used for xqa speculative decoding
         mask = generate_causal_mask(batch_size, q_len_per_req, GPU_DEVICE)
     else:
@@ -976,9 +981,10 @@ def _test_trtllm_batch_decode(
 
     # Only test wrapper with trtllm-gen backend
     if (
-        o_dtype != "nvfp4" 
-        and backend == "trtllm-gen" 
-        and q_len_per_req is not None   # only test for the case all requests have the same q_len
+        o_dtype != "nvfp4"
+        and backend == "trtllm-gen"
+        and q_len_per_req
+        is not None  # only test for the case all requests have the same q_len
     ):  # wrapper api does not support fp4 output yet.
         # test wrapper with trtllm-gen backend
         wrapper_trtllm_gen = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
@@ -1512,7 +1518,7 @@ def test_trtllm_batch_decode_spec(
         backend,
         kv_layout,
         batch_size,
-        None, # q_len_per_req
+        None,  # q_len_per_req
         page_size,
         num_kv_heads,
         head_grp_size,

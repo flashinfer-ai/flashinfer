@@ -1916,8 +1916,8 @@ class TrtllmGenDecodeModule:
             enable_pdl,
             workspace_size,
             sinks,
-            None,   # max_q_len
-            None,   # cum_seq_lens_q
+            None,  # max_q_len
+            None,  # cum_seq_lens_q
         )
         return out
 
@@ -2186,9 +2186,7 @@ def trtllm_batch_decode_with_kv_cache(
         if o_sf_scale is not None or o_sf_vec_size is not None:
             raise ValueError("xqa backend does not support o_sf_scale or o_sf_vec_size")
         if max_q_len is not None or cum_seq_lens_q is not None:
-            raise ValueError(
-                "xqa backend does not support cum_seq_lens_q"
-            )
+            raise ValueError("xqa backend does not support cum_seq_lens_q")
 
         # Handle out and out_dtype
         if out_dtype is None:
@@ -2313,7 +2311,9 @@ def trtllm_batch_decode_with_kv_cache(
                 q_len_per_req,
                 query.size(1),
                 query.size(2),
-            ) if q_len_per_req is not None else query,
+            )
+            if q_len_per_req is not None
+            else query,
             k_cache,
             v_cache,
             workspace_buffer,
