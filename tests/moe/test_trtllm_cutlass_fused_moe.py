@@ -1490,15 +1490,9 @@ def test_moe_w4a8(
 
     x = torch.randn(m, k, dtype=dtype, device="cuda")
     router_logits = torch.randn(m, e, dtype=dtype, device="cuda")
-    w1_weight = torch.randint(
-        -128, 127, (e, n, k // 2), dtype=torch.int8, device="cuda"
-    )
-    w2_weight = torch.randint(
-        -128, 127, (e, k, n // 2), dtype=torch.int8, device="cuda"
-    )
-    w3_weight = torch.randint(
-        -128, 127, (e, n, k // 2), dtype=torch.int8, device="cuda"
-    )
+    w1_weight = torch.randint(0, 256, (e, n, k // 2), dtype=torch.uint8, device="cuda")
+    w2_weight = torch.randint(0, 256, (e, k, n // 2), dtype=torch.uint8, device="cuda")
+    w3_weight = torch.randint(0, 256, (e, n, k // 2), dtype=torch.uint8, device="cuda")
 
     # per group weight
     w1_scale = (
@@ -1523,6 +1517,7 @@ def test_moe_w4a8(
     fc2_weights = w2_weight
 
     def interleave_weights(w: torch.Tensor, dim: int) -> torch.Tensor:
+        # Factors are chosen based on TRTLLM's quantization.py
         interleave_factor = 4 if dim % 512 == 0 else (2 if dim % 256 == 0 else 1)
         s = w.shape
         w_interleaved = (

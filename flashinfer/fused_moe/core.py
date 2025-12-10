@@ -835,6 +835,9 @@ def cutlass_fused_moe(
     min_latency_mode : bool = False
         Whether to use minimum latency mode. Defaults to False.
 
+    use_packed_weights : bool = False
+        Whether to use packed uint4x2 weights passed as packed uint8 values. Defaults to False.
+
     tune_max_num_tokens : int = 8192
         Maximum number of tokens for tuning. Defaults to 8192.
 
