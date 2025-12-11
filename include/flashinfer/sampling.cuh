@@ -331,49 +331,6 @@ __device__ __forceinline__ void DeterministicInclusiveSum(
 
 template <uint32_t VEC_SIZE, uint32_t BLOCK_THREADS, BlockReduceAlgorithm REDUCE_ALGORITHM,
           typename TempStorage>
-__device__ __forceinline__ std::tuple<float, float> GetMinMaxValue(float* in_data, uint32_t row_idx,
-                                                                   uint32_t d,
-                                                                   TempStorage& temp_storage) {
-  const uint32_t tx = threadIdx.x;
-  vec_t<float, VEC_SIZE> in_data_vec;
-  // Thread-local min/max accumulation (deferred reduction)
-  float thread_max = -cuda::std::numeric_limits<float>::infinity();
-  float thread_min = cuda::std::numeric_limits<float>::infinity();
-
-  for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
-    in_data_vec.fill(0);
-    if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
-      in_data_vec.cast_load(in_data + row_idx * d + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
-    }
-#pragma unroll
-    for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-      thread_max = max(thread_max, static_cast<float>(in_data_vec[j]));
-      thread_min = min(thread_min, static_cast<float>(in_data_vec[j]));
-    }
-  }
-
-  // Single block reduction after loop completes
-  float max_val =
-      BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
-          .Reduce(thread_max, MaxReduceOp{});
-  __syncthreads();
-  float min_val =
-      BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
-          .Reduce(thread_min, MinReduceOp{});
-
-  if (tx == 0) {
-    temp_storage.max_val = max_val;
-    temp_storage.min_val = min_val;
-  }
-  __syncthreads();
-  max_val = temp_storage.max_val;
-  min_val = temp_storage.min_val;
-
-  return std::make_tuple(min_val, max_val);
-}
-
-template <uint32_t VEC_SIZE, uint32_t BLOCK_THREADS, BlockReduceAlgorithm REDUCE_ALGORITHM,
-          typename TempStorage>
 __device__ __forceinline__ float GetMaxValue(float* in_data, uint32_t row_idx, uint32_t d,
                                              TempStorage& temp_storage) {
   const uint32_t tx = threadIdx.x;
@@ -1864,31 +1821,6 @@ cudaError_t TopPRenormProb(DType* probs, DType* renormed_prob, float* top_p_arr,
 }
 
 // ==================== Multi-CTA Top-K Implementation ====================
-
-// Atomic min/max for float using CAS
-__device__ __forceinline__ float atomicMinFloat(float* addr, float value) {
-  int* addr_as_int = (int*)addr;
-  int old = *addr_as_int, assumed;
-
-  do {
-    assumed = old;
-    old = atomicCAS(addr_as_int, assumed, __float_as_int(fminf(value, __int_as_float(assumed))));
-  } while (assumed != old);
-
-  return __int_as_float(old);
-}
-
-__device__ __forceinline__ float atomicMaxFloat(float* addr, float value) {
-  int* addr_as_int = (int*)addr;
-  int old = *addr_as_int, assumed;
-
-  do {
-    assumed = old;
-    old = atomicCAS(addr_as_int, assumed, __float_as_int(fmaxf(value, __int_as_float(assumed))));
-  } while (assumed != old);
-
-  return __int_as_float(old);
-}
 
 // Acquire/Release primitives for inter-CTA synchronization
 __device__ __forceinline__ int ld_acquire(int* ptr) {
