@@ -447,7 +447,8 @@ For more control, you can manually load the dumped tensors:
     from pathlib import Path
     from flashinfer import bmm_fp8
 
-    dump_dir = Path("./bmm_fp8_dumps/20251234_456789_012_bmm_fp8_call0001")
+    # Path is an example, replace with the actual path.
+    dump_dir = Path("./bmm_fp8_dumps/20251204_103217_012_bmm_fp8_call0001")
 
     # Load metadata
     with open(dump_dir / "metadata.json") as f:
