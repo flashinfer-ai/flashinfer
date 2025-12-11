@@ -79,7 +79,7 @@ def packbits(x: torch.Tensor, bitorder: str = "big") -> torch.Tensor:
 
 def _get_indptr_for_packed_mask(
     indptr: torch.Tensor,
-):
+) -> torch.Tensor:
     seglen = indptr[1:] - indptr[:-1]
     packed_len = (seglen + 7) // 8
     indptr_new = torch.zeros(len(indptr), dtype=indptr.dtype, device=indptr.device)
