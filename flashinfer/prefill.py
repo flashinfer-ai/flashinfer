@@ -1471,7 +1471,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
             mask will be used in attention computation.
 
         backend : str
-            The implementation backend, could be ``auto``/``fa2``,``fa3`` or ``cudnn``. Defaults to ``auto``.
+            The implementation backend, could be ``auto``/``fa2``/``fa3``/``cudnn`` or ``trtllm-gen``.
+            Defaults to ``auto``.
             If set to ``auto``, the wrapper will automatically choose the backend based on the
             device architecture and kernel availability.
 
@@ -1920,6 +1921,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         self._block_tables = block_tables
         if self._backend == "trtllm-gen":
+            if not causal:
+                raise NotImplementedError(
+                    "Non-causal attention is not supported for trtllm-gen backend with paged KV cache. "
+                    "Please use causal=True or choose a different backend (e.g., fa2, fa3, cudnn)."
+                )
             assert logits_soft_cap == 0.0
             if self._block_tables is None:
                 blocks_per_seq = [
@@ -2457,7 +2463,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             will be used in attention computation.
 
         backend : str
-            The implementation backend, could be ``auto``/``fa2``/``fa3`` or ``trtllm-gen``.
+            The implementation backend, could be ``auto``/``fa2``/``fa3`` or ``cutlass``.
             Defaults to ``auto``.
             If set to ``auto``, the wrapper will automatically choose the backend based on the
             device architecture and kernel availability.
