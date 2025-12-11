@@ -390,7 +390,7 @@ def _build_rmsnorm_fp4quant_graph(
         for building variant_pack.
 
     Note:
-        Tensor layout is [batch_size, hidden_size, 1, 1] with row-major strides.
+        Tensor layout is [batch_size, hidden_size, 1, 1] with row-major (NCHW) strides.
     """
     # Use global cached handle with stream set (matches gemm_base.py pattern)
     stream = torch.cuda.current_stream(device)
@@ -405,7 +405,7 @@ def _build_rmsnorm_fp4quant_graph(
     # Convert PyTorch dtype to cuDNN dtype
     cudnn_input_dtype = _torch_dtype_to_cudnn_dtype(input_dtype)
 
-    # Input tensor X: [batch_size, hidden_size, 1, 1]
+    # Input tensor X: [batch_size, hidden_size, 1, 1] with NCHW strides
     x = graph.tensor(
         name="X",
         dim=[batch_size, hidden_size, 1, 1],
@@ -413,7 +413,7 @@ def _build_rmsnorm_fp4quant_graph(
         data_type=cudnn_input_dtype,
     )
 
-    # Weight tensor: [1, hidden_size, 1, 1] (same dtype as input)
+    # Weight tensor: [1, hidden_size, 1, 1] (same dtype as input) with NCHW strides
     weight = graph.tensor(
         name="weight",
         dim=[1, hidden_size, 1, 1],
@@ -513,9 +513,11 @@ def _execute_rmsnorm_fp4quant_graph(
 def rmsnorm_fp4quant(
     input: torch.Tensor,
     weight: torch.Tensor,
+    y_fp4: torch.Tensor,
+    block_scale: torch.Tensor,
     eps: float = 1e-6,
     block_size: int = 16,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> None:
     r"""Fused RMS normalization with FP4 quantization using cuDNN.
 
     This function performs RMSNorm followed by FP4 block scale quantization
@@ -533,23 +535,21 @@ def rmsnorm_fp4quant(
     weight : torch.Tensor
         Weight tensor, shape ``(hidden_size,)``.
         Must have the same dtype as input.
+    y_fp4 : torch.Tensor
+        Output tensor for quantized values in FP4_E2M1 format, packed as uint8.
+        Shape must be ``(batch_size, hidden_size // 2)`` for 2D input, or
+        ``(batch_size, seq_len, hidden_size // 2)`` for 3D input.
+        Two FP4 values are packed per byte. Must be dtype ``torch.uint8``.
+    block_scale : torch.Tensor
+        Output tensor for block scale factors in FP8_E4M3 format.
+        Shape must be ``(batch_size, hidden_size // block_size)`` for 2D input, or
+        ``(batch_size, seq_len, hidden_size // block_size)`` for 3D input.
+        Must be dtype ``torch.float8_e4m3fn``.
     eps : float
         Epsilon for numerical stability in RMSNorm. Default is ``1e-6``.
     block_size : int
         Block size for FP4 quantization. Default is ``16`` (standard for NVFP4).
         The hidden_size must be divisible by block_size.
-
-    Returns
-    -------
-    Tuple[torch.Tensor, torch.Tensor]
-        A tuple containing:
-        - ``y_fp4``: Quantized tensor in FP4_E2M1 format, packed as uint8.
-          Shape is ``(batch_size, hidden_size // 2)`` for 2D input, or
-          ``(batch_size, seq_len, hidden_size // 2)`` for 3D input.
-          Two FP4 values are packed per byte.
-        - ``block_scale``: Block scale factors in FP8_E4M3 format.
-          Shape is ``(batch_size, hidden_size // block_size)`` for 2D input, or
-          ``(batch_size, seq_len, hidden_size // block_size)`` for 3D input.
 
     Raises
     ------
@@ -571,11 +571,14 @@ def rmsnorm_fp4quant(
     >>> import torch
     >>> from flashinfer.norm import rmsnorm_fp4quant
     >>> # Create input tensors
-    >>> batch_size, hidden_size = 4, 128
+    >>> batch_size, hidden_size, block_size = 4, 128, 16
     >>> x = torch.randn(batch_size, hidden_size, device="cuda", dtype=torch.float16)
     >>> weight = torch.randn(hidden_size, device="cuda", dtype=torch.float16)
+    >>> # Allocate output tensors
+    >>> y_fp4 = torch.empty(batch_size, hidden_size // 2, device="cuda", dtype=torch.uint8)
+    >>> block_scale = torch.empty(batch_size, hidden_size // block_size, device="cuda", dtype=torch.float8_e4m3fn)
     >>> # Fused RMSNorm + FP4 quantization
-    >>> y_fp4, block_scale = rmsnorm_fp4quant(x, weight)
+    >>> rmsnorm_fp4quant(x, weight, y_fp4, block_scale)
     >>> y_fp4.shape
     torch.Size([4, 64])
     >>> block_scale.shape
@@ -597,16 +600,13 @@ def rmsnorm_fp4quant(
         )
 
     # Handle input shape
-    original_shape = input.shape
     if input.ndim == 2:
         batch_size, hidden_size = input.shape
-        is_3d = False
     elif input.ndim == 3:
         batch_size, seq_len, hidden_size = input.shape
         # Flatten to 2D for processing
         input = input.view(batch_size * seq_len, hidden_size)
         batch_size = batch_size * seq_len
-        is_3d = True
     else:
         raise ValueError(
             f"Input must be 2D or 3D tensor, got {input.ndim}D tensor with shape {input.shape}"
@@ -624,7 +624,7 @@ def rmsnorm_fp4quant(
         )
 
     # Reshape input and weight for cuDNN 4D format
-    # Using layout: [batch, hidden_size, 1, 1]
+    # Using row-major layout (NCHW): [batch, hidden_size, 1, 1] with NCHW strides
     # Both input and weight use the same dtype (bf16/fp16)
     x_2d = input.view(batch_size, hidden_size)
     x_4d = x_2d.unsqueeze(-1).unsqueeze(-1)  # [B, H] -> [B, H, 1, 1]
@@ -639,17 +639,11 @@ def rmsnorm_fp4quant(
         device=input.device,
     )
 
-    # Allocate output tensors
+    # Reshape output tensors for cuDNN 4D format
     # FP4 packed: 2 values per byte, axis=1 is the hidden dimension
-    y_fp4 = torch.empty(
-        batch_size, hidden_size // 2, 1, 1, dtype=torch.uint8, device=input.device
-    )
-
-    # Block scale: one scale per block along axis=1
     num_blocks = hidden_size // block_size
-    block_scale = torch.empty(
-        batch_size, num_blocks, 1, 1, dtype=torch.float8_e4m3fn, device=input.device
-    )
+    y_fp4_4d = y_fp4.view(batch_size, hidden_size // 2, 1, 1)
+    block_scale_4d = block_scale.view(batch_size, num_blocks, 1, 1)
 
     # Execute the graph
     _execute_rmsnorm_fp4quant_graph(
@@ -658,20 +652,6 @@ def rmsnorm_fp4quant(
         x_data=x_4d,
         weight_data=weight_4d,
         eps=eps,
-        y_fp4_data=y_fp4,
-        block_scale_data=block_scale,
+        y_fp4_data=y_fp4_4d,
+        block_scale_data=block_scale_4d,
     )
-
-    # Reshape outputs to remove extra dimensions
-    # From [batch, hidden//2, 1, 1] to [batch, hidden//2]
-    y_fp4 = y_fp4.view(batch_size, hidden_size // 2)
-    # From [batch, num_blocks, 1, 1] to [batch, num_blocks]
-    block_scale = block_scale.view(batch_size, num_blocks)
-
-    # Restore 3D shape if input was 3D
-    if is_3d:
-        orig_batch, orig_seq = original_shape[0], original_shape[1]
-        y_fp4 = y_fp4.view(orig_batch, orig_seq, hidden_size // 2)
-        block_scale = block_scale.view(orig_batch, orig_seq, num_blocks)
-
-    return y_fp4, block_scale
