@@ -2500,39 +2500,24 @@ cudaError_t RadixTopKMaskLogitsMultiCTA(DType* logits, DType* masked_logits, IdT
   FLASHINFER_CUDA_CALL(
       cudaDeviceGetAttribute(&max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
 
-  // Fixed shared memory overhead: histogram[256] + suffix_sum[256] + 4 scalars + alignment
+  // Fixed shared memory overhead: histogram[256] + suffix_sum[256] + 4 scalars
   constexpr size_t fixed_smem_size = sizeof(uint32_t) * (256 + 256 + 4);
-  constexpr size_t fixed_smem_aligned = ((fixed_smem_size + 15) / 16) * 16;
+  constexpr size_t fixed_smem_aligned = round_up(fixed_smem_size, 16);
 
   // Calculate max chunk size that fits in shared memory
-  // smem layout: [fixed_smem_aligned] [chunk_size * sizeof(OrderedType)]
-  // For FP32: OrderedType = uint32_t (4 bytes)
-  // For FP16/BF16: OrderedType = uint16_t (2 bytes) - can fit 2x more elements!
   const size_t available_for_ordered = max_smem_per_block - fixed_smem_aligned;
   uint32_t max_chunk_elements = available_for_ordered / sizeof(OrderedType);
-
-  // Round down to multiple of vec_size
-  max_chunk_elements = (max_chunk_elements / vec_size) * vec_size;
-
-  // Ensure minimum chunk size for vectorized access
+  max_chunk_elements = round_down(max_chunk_elements, vec_size);
   const uint32_t min_chunk_size = vec_size * BLOCK_THREADS;
   max_chunk_elements = std::max(max_chunk_elements, min_chunk_size);
 
-  // Calculate how many CTAs needed per row
-  uint32_t ctas_per_group = (vocab_size + max_chunk_elements - 1) / max_chunk_elements;
-  uint32_t chunk_size = (vocab_size + ctas_per_group - 1) / ctas_per_group;
-
-  // Round up chunk_size to multiple of vec_size
-  chunk_size = ((chunk_size + vec_size - 1) / vec_size) * vec_size;
-
-  // Ensure chunk_size doesn't exceed max
+  uint32_t ctas_per_group = ceil_div(vocab_size, max_chunk_elements);
+  uint32_t chunk_size = ceil_div(vocab_size, ctas_per_group);
+  chunk_size = round_up(chunk_size, vec_size);
   chunk_size = std::min(chunk_size, max_chunk_elements);
 
-  // Shared memory: fixed overhead + ordered values cache (using OrderedType size)
   const uint32_t smem_size = fixed_smem_aligned + chunk_size * sizeof(OrderedType);
-
-  // Dispatch based on whether we need single-CTA or multi-CTA path
-  bool single_cta = (ctas_per_group == 1);
+  const bool single_cta = (ctas_per_group == 1);
 
   // Calculate number of groups (how many rows to process concurrently)
   uint32_t num_groups = std::min(static_cast<uint32_t>(num_sms) / ctas_per_group, batch_size);
@@ -2839,37 +2824,24 @@ cudaError_t RadixTopKRenormProbMultiCTA(DType* probs, DType* renormed_prob, IdTy
   FLASHINFER_CUDA_CALL(
       cudaDeviceGetAttribute(&max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
 
-  // Fixed shared memory overhead: histogram[256] + suffix_sum[256] + 4 scalars + 1 float +
-  // alignment
+  // Fixed shared memory overhead: histogram[256] + suffix_sum[256] + 4 scalars + 1 float
   constexpr size_t fixed_smem_size = sizeof(uint32_t) * (256 + 256 + 4) + sizeof(float);
-  constexpr size_t fixed_smem_aligned = ((fixed_smem_size + 15) / 16) * 16;
+  constexpr size_t fixed_smem_aligned = round_up(fixed_smem_size, 16);
 
   // Calculate max chunk size that fits in shared memory
   const size_t available_for_ordered = max_smem_per_block - fixed_smem_aligned;
   uint32_t max_chunk_elements = available_for_ordered / sizeof(OrderedType);
-
-  // Round down to multiple of vec_size
-  max_chunk_elements = (max_chunk_elements / vec_size) * vec_size;
-
-  // Ensure minimum chunk size for vectorized access
+  max_chunk_elements = round_down(max_chunk_elements, vec_size);
   const uint32_t min_chunk_size = vec_size * BLOCK_THREADS;
   max_chunk_elements = std::max(max_chunk_elements, min_chunk_size);
 
-  // Calculate how many CTAs needed per row
-  uint32_t ctas_per_group = (vocab_size + max_chunk_elements - 1) / max_chunk_elements;
-  uint32_t chunk_size = (vocab_size + ctas_per_group - 1) / ctas_per_group;
-
-  // Round up chunk_size to multiple of vec_size
-  chunk_size = ((chunk_size + vec_size - 1) / vec_size) * vec_size;
-
-  // Ensure chunk_size doesn't exceed max
+  uint32_t ctas_per_group = ceil_div(vocab_size, max_chunk_elements);
+  uint32_t chunk_size = ceil_div(vocab_size, ctas_per_group);
+  chunk_size = round_up(chunk_size, vec_size);
   chunk_size = std::min(chunk_size, max_chunk_elements);
 
-  // Shared memory: fixed overhead + ordered values cache
   const uint32_t smem_size = fixed_smem_aligned + chunk_size * sizeof(OrderedType);
-
-  // Dispatch based on whether we need single-CTA or multi-CTA path
-  bool single_cta = (ctas_per_group == 1);
+  const bool single_cta = (ctas_per_group == 1);
 
   // Calculate number of groups (how many rows to process concurrently)
   uint32_t num_groups = std::min(static_cast<uint32_t>(num_sms) / ctas_per_group, batch_size);
@@ -3315,30 +3287,26 @@ cudaError_t RadixTopKMultiCTA(DType* input, IdType* output_indices, DType* outpu
   FLASHINFER_CUDA_CALL(
       cudaDeviceGetAttribute(&max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
 
-  // Fixed smem: histogram[256] + suffix_sum[256] + scalars
-  // Multi-CTA: 4 scalars; Single-CTA: 5 scalars (extra output_counter)
-  constexpr size_t fixed_smem_multi = sizeof(uint32_t) * (256 + 256 + 4);
-  constexpr size_t fixed_smem_single = sizeof(uint32_t) * (256 + 256 + 5);
-  constexpr size_t fixed_smem_multi_aligned = ((fixed_smem_multi + 15) / 16) * 16;
-  constexpr size_t fixed_smem_single_aligned = ((fixed_smem_single + 15) / 16) * 16;
+  // Fixed smem: histogram[256] + suffix_sum[256] + scalars (5 for single-CTA path)
+  constexpr size_t fixed_smem_size = sizeof(uint32_t) * (256 + 256 + 5);
+  constexpr size_t fixed_smem_aligned = round_up(fixed_smem_size, 16);
 
-  // Use the larger one for initial calculation to be conservative
-  const size_t available_for_ordered = max_smem_per_block - fixed_smem_single_aligned;
+  const size_t available_for_ordered = max_smem_per_block - fixed_smem_aligned;
   uint32_t max_chunk_elements = available_for_ordered / sizeof(OrderedType);
-  max_chunk_elements = (max_chunk_elements / vec_size) * vec_size;
+  max_chunk_elements = round_down(max_chunk_elements, vec_size);
   const uint32_t min_chunk_size = vec_size * BLOCK_THREADS;
   max_chunk_elements = std::max(max_chunk_elements, min_chunk_size);
 
-  uint32_t ctas_per_group = (vocab_size + max_chunk_elements - 1) / max_chunk_elements;
-  uint32_t chunk_size = (vocab_size + ctas_per_group - 1) / ctas_per_group;
-  chunk_size = ((chunk_size + vec_size - 1) / vec_size) * vec_size;
+  uint32_t ctas_per_group = ceil_div(vocab_size, max_chunk_elements);
+  uint32_t chunk_size = ceil_div(vocab_size, ctas_per_group);
+  chunk_size = round_up(chunk_size, vec_size);
   chunk_size = std::min(chunk_size, max_chunk_elements);
 
   // Determine if we use single-CTA path
   const bool single_cta = (ctas_per_group == 1);
 
   // Calculate smem_size
-  const uint32_t smem_size = fixed_smem_multi_aligned + chunk_size * sizeof(OrderedType);
+  const uint32_t smem_size = fixed_smem_aligned + chunk_size * sizeof(OrderedType);
 
   // Calculate number of groups (how many rows to process concurrently)
   uint32_t num_groups = std::min(static_cast<uint32_t>(num_sms) / ctas_per_group, batch_size);

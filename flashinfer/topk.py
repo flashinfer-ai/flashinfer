@@ -145,6 +145,8 @@ def top_k(
     See Also
     --------
     torch.topk : PyTorch's built-in top-k function
+    sampling.top_k_mask_logits : Top-k masking for logits (sets non-top-k to -inf)
+    sampling.top_k_renorm_probs : Top-k filtering and renormalization for probabilities
     """
     input.size(1)
     batch_size = input.size(0)

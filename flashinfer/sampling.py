@@ -1374,6 +1374,7 @@ def top_k_renorm_probs(
     top_k_sampling_from_probs
     sampling_from_probs
     top_p_renorm_probs
+    top_k : General-purpose top-k selection (returns indices and values)
     """
     # Allocate row_states buffer for multi-CTA kernel (1MB is enough for any GPU)
     buffer_bytes = 1024 * 1024  # 1MB
@@ -1445,6 +1446,7 @@ def top_k_mask_logits(
     See Also
     --------
     top_k_renorm_probs
+    top_k : General-purpose top-k selection (returns indices and values)
     """
     # Allocate row_states buffer for multi-CTA kernel (1MB is enough for any GPU)
     buffer_bytes = 1024 * 1024  # 1MB
