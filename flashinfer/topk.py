@@ -23,10 +23,6 @@ import torch
 from .jit.topk import gen_topk_module
 from .utils import _get_cache_buf, register_custom_op, register_fake_op
 
-# RadixRowState size (histogram[2][256] + remaining_k + prefix + arrival_counter + output_counter)
-# = 2*256*4 + 4 + 4 + 4 + 4 = 2064 bytes
-RADIX_ROW_STATE_SIZE = 2064
-
 
 @functools.cache
 def get_topk_module():
