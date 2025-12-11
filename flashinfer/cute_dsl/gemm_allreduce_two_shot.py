@@ -8,9 +8,11 @@ import cutlass.cute as cute
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils
-import cutlass.utils.distributed_helpers as distributed_helpers
+import cutlass.utils.distributed as distributed
+
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.typing import (
+    Pointer,
     Int32,
     Float16,
     BFloat16,
@@ -18,6 +20,85 @@ from cutlass.cute.typing import (
     Float8E4M3FN,
     Float8E5M2,
 )
+
+
+def spin_lock_multimem_arrive(lock_ptr: Pointer, loc=None, ip=None) -> None:
+    """
+    arrive a spin lock when the lock_ptr is a multimem address.
+    """
+    distributed.multimem_red_relaxed_gpu_add1(lock_ptr, loc=loc, ip=ip)
+
+
+# HACK https://github.com/NVIDIA/cutlass/issues/2845
+from cutlass._mlir.dialects import nvvm
+from cutlass.cutlass_dsl import T
+from cutlass._mlir.dialects.nvvm import (
+    MemOrderKind,
+    MemScopeKind,
+    AtomicOpKind,
+)
+
+
+@cute.jit
+def spin_lock_atom_cas_acquire_wait(
+    lock_ptr: Pointer,
+    *,
+    expected_val: Int32,
+    reset_val: Int32,
+    scope: str,
+    loc=None,
+    ip=None,
+) -> None:
+    """
+    wait on a spin lock until the expected count is reached. Reset flag to reset_val if the expected count is reached.
+    """
+    if scope == "gpu":
+        result = 0
+        while result != expected_val:
+            result = nvvm.atomicrmw(
+                T.i32(),
+                AtomicOpKind.CAS,
+                lock_ptr.llvm_ptr,
+                Int32(reset_val).ir_value(loc=loc, ip=ip),
+                b=Int32(expected_val).ir_value(loc=loc, ip=ip),
+                mem_order=MemOrderKind.ACQUIRE,
+                syncscope=MemScopeKind.GPU,
+                loc=loc,
+                ip=ip,
+            )
+    elif scope == "sys":
+        result = 0
+        while result != expected_val:
+            result = nvvm.atomicrmw(
+                T.i32(),
+                AtomicOpKind.CAS,
+                lock_ptr.llvm_ptr,
+                Int32(reset_val).ir_value(loc=loc, ip=ip),
+                b=Int32(expected_val).ir_value(loc=loc, ip=ip),
+                mem_order=MemOrderKind.ACQUIRE,
+                syncscope=MemScopeKind.SYS,
+                loc=loc,
+                ip=ip,
+            )
+
+
+def sm_wise_inter_gpu_multimem_barrier(
+    barrier: Pointer, barrier_mc: Pointer, num_ranks, loc=None, ip=None
+) -> None:
+    """
+    barrier for inter-gpu sm-wise
+    """
+    bidx, bidy, bidz = cute.arch.block_idx()
+    bdimx, bdimy, _ = cute.arch.grid_dim()
+    pid = bidx + bidy * bdimx + bidz * bdimx * bdimy
+    distributed.multimem_red_release_sys_add1(barrier_mc + pid, loc=loc, ip=ip)
+    cute.arch.fence_proxy(cute.arch.ProxyKind.alias)
+
+    # v4.3.1 does not have mem_order="acquire" variant in `distributed` module
+    # filed issue https://github.com/NVIDIA/cutlass/issues/2845
+    spin_lock_atom_cas_acquire_wait(
+        barrier + pid, expected_val=num_ranks, reset_val=0, scope="sys", loc=loc, ip=ip
+    )
 
 
 """
@@ -162,6 +243,7 @@ class PersistentDenseGemmKernel:
         cluster_shape_mn: Tuple[int, int],
         use_tma_store: bool,
         all_reduce="none",
+        sm_version="sm_100",
     ):
         """Initializes the configuration for a Blackwell dense GEMM kernel.
 
@@ -235,7 +317,7 @@ class PersistentDenseGemmKernel:
         self.epilog_sync_bar_id = 1
         self.tmem_ptr_sync_bar_id = 2
         self.all_reduce_sync_bar_id = 3
-        self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
+        self.smem_capacity = utils.get_smem_capacity_in_bytes(sm_version)
 
         self.num_ranks = 1
         self.rank_id = 0
@@ -252,8 +334,6 @@ class PersistentDenseGemmKernel:
         if self.cluster_shape_mn[0] == 4 and self.cluster_shape_mn[1] == 4:
             return False
         return True
-
-        self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
 
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
@@ -1231,7 +1311,7 @@ class PersistentDenseGemmKernel:
                         with cute.arch.elect_one():
                             flag = barrier_flag_mc.iterator + tile_id
                             cute.arch.fence_acq_rel_gpu()
-                            distributed_helpers.spin_lock_multimem_arrive(flag)
+                            spin_lock_multimem_arrive(flag)
                             cute.arch.fence_proxy(cute.arch.ProxyKind.alias)
 
                 #
@@ -1321,7 +1401,9 @@ class PersistentDenseGemmKernel:
                         with cute.arch.elect_one():
                             flag = barrier_flag.iterator + tile_id
                             # TODO: we may use LDG+STG for spin lock instead of ATOMIC_CAS for better performance.
-                            distributed_helpers.spin_lock_wait(flag, num_ranks)
+                            distributed.spin_lock_atom_cas_relaxed_wait(
+                                flag, expected_val=num_ranks, reset_val=0, scope="gpu"
+                            )
 
                     cute.arch.barrier(
                         barrier_id=self.all_reduce_sync_bar_id,
@@ -1356,32 +1438,26 @@ class PersistentDenseGemmKernel:
                             mc_ptr = frgC_mc[None, i, j].iterator
                             x, y, z, w = 0, 0, 0, 0
                             if cutlass.const_expr(self.c_dtype == Float16):
-                                x, y, z, w = (
-                                    distributed_helpers.multimem_ld_reduce_8xf16(mc_ptr)
+                                x, y, z, w = distributed.multimem_ld_reduce_8xf16(
+                                    mc_ptr
                                 )
                             elif cutlass.const_expr(self.c_dtype == Float32):
-                                x, y, z, w = (
-                                    distributed_helpers.multimem_ld_reduce_4xf32(mc_ptr)
+                                x, y, z, w = distributed.multimem_ld_reduce_4xf32(
+                                    mc_ptr
                                 )
                             elif cutlass.const_expr(self.c_dtype == BFloat16):
-                                x, y, z, w = (
-                                    distributed_helpers.multimem_ld_reduce_8xbf16(
-                                        mc_ptr
-                                    )
+                                x, y, z, w = distributed.multimem_ld_reduce_8xbf16(
+                                    mc_ptr
                                 )
                             elif cutlass.const_expr(self.c_dtype == Float8E4M3FN):
-                                x, y, z, w = (
-                                    distributed_helpers.multimem_ld_reduce_16xe4m3(
-                                        mc_ptr
-                                    )
+                                x, y, z, w = distributed.multimem_ld_reduce_16xe4m3(
+                                    mc_ptr
                                 )
                             elif cutlass.const_expr(self.c_dtype == Float8E5M2):
-                                x, y, z, w = (
-                                    distributed_helpers.multimem_ld_reduce_16xe5m2(
-                                        mc_ptr
-                                    )
+                                x, y, z, w = distributed.multimem_ld_reduce_16xe5m2(
+                                    mc_ptr
                                 )
-                            distributed_helpers.multimem_st_4xb32(mc_ptr, x, y, z, w)
+                            distributed.multimem_st_4xb32(mc_ptr, x, y, z, w)
                     # Advance to next tile
                     tile_sched.advance_to_next_work()
                     work_tile = tile_sched.get_current_work()
@@ -1396,7 +1472,7 @@ class PersistentDenseGemmKernel:
                 ) * cute.size(self.cluster_shape_mn)
                 if warp_idx == self.all_reduce_warp_id[0]:
                     with cute.arch.elect_one():
-                        distributed_helpers.sm_wise_inter_gpu_multimem_barrier(
+                        sm_wise_inter_gpu_multimem_barrier(
                             barrier_flag.iterator + last_flag_idx,
                             barrier_flag_mc.iterator + last_flag_idx,
                             self.num_ranks,

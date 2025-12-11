@@ -23,6 +23,7 @@
 #include "Enums.h"
 #include "KernelParams.h"
 #include "KernelTraits.h"
+#include "trtllm/gen/CudaArchDecl.h"
 #include "trtllm/gen/DtypeDecl.h"
 #include "trtllm/gen/MmaDecl.h"
 #include "trtllm/gen/SfLayoutDecl.h"
@@ -106,9 +107,9 @@ struct GemmOptions {
   GemmOptions(AllReduceAlgo allReduceAlgo, BiasType biasType, int blockK, int clusterDimX,
               int clusterDimY, int clusterDimZ, CtaSwizzleType ctaSwizzleType, tg::Dtype dtypeAcc,
               tg::Dtype dtypeA, tg::Dtype dtypeB, tg::Dtype dtypeC, tg::Dtype dtypeMmaA,
-              tg::Dtype dtypeMmaB, bool enablesEarlyExit, bool enablesDelayedEarlyExit,
-              bool enablesGlobalPtxKnobs, int epilogueLdtmDps, int epilogueLdtmBits,
-              int epilogueTileM, int epilogueTileN, bool fuseUtccpWithUtcmma,
+              tg::Dtype dtypeMmaB, EltwiseActType eltwiseActType, bool enablesEarlyExit,
+              bool enablesDelayedEarlyExit, bool enablesGlobalPtxKnobs, int epilogueLdtmDps,
+              int epilogueLdtmBits, int epilogueTileM, int epilogueTileN, bool fuseUtccpWithUtcmma,
               bool gridTriggerSecondaryA, bool gridTriggerSecondaryB,
               bool gridWaitForPrimaryEarlyExit, bool gridWaitForPrimaryA, bool gridWaitForPrimaryB,
               bool hoistLoadTaskInit, bool hoistMmaTaskTryWaits, int k, KernelTraits kernelTraits,
@@ -139,6 +140,7 @@ struct GemmOptions {
         mDtypeC{dtypeC},
         mDtypeMmaA{dtypeMmaA},
         mDtypeMmaB{dtypeMmaB},
+        mEltwiseActType{eltwiseActType},
         mEnablesEarlyExit{enablesEarlyExit},
         mEnablesDelayedEarlyExit{enablesDelayedEarlyExit},
         mEnablesGlobalPtxKnobs{enablesGlobalPtxKnobs},
@@ -206,7 +208,6 @@ struct GemmOptions {
         mValidN{validN},
         mValidK{validK},
         mWorldSize{worldSize} {}
-
   // The all-reduce algorithm.
   AllReduceAlgo mAllReduceAlgo{AllReduceAlgo::None};
   // The type of bias.
@@ -233,6 +234,8 @@ struct GemmOptions {
   tg::Dtype mDtypeMmaA{tg::Dtype::Void};
   // Data type of the B matrix for the MMA, if different from the input type.
   tg::Dtype mDtypeMmaB{tg::Dtype::Void};
+  // The type of activation.
+  EltwiseActType mEltwiseActType{EltwiseActType::None};
   // Whether to enable early exit.
   bool mEnablesEarlyExit{false};
   // Whether to enable delayed early exit to overlap
@@ -392,14 +395,7 @@ struct GemmOptions {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-enum class SmVersion { Sm90a, Sm100a, Sm100f, Sm103a };
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-inline bool isSmVersionBlackwell(SmVersion smVersion) {
-  return smVersion == SmVersion::Sm100a || smVersion == SmVersion::Sm100f ||
-         smVersion == SmVersion::Sm103a;
-}
+using SmVersion = tg::CudaArch;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 //
@@ -421,7 +417,7 @@ struct GemmConfig {
   int32_t mInstanceIdx{0};
 
   GemmOptions mOptions{};
-  SmVersion mSm{SmVersion::Sm100a};
+  tg::CudaArch mSm{tg::CudaArch::Sm100a};
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -480,6 +476,9 @@ inline std::string dumpOptions(GemmOptions const& options, bool dumpRuntimeParam
      << "," << std::endl;
   ss << "mDtypeMmaB="
      << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mDtypeMmaB) << ")"
+     << "," << std::endl;
+  ss << "mEltwiseActType="
+     << "gemm::EltwiseActType(" << static_cast<int32_t>(options.mEltwiseActType) << ")"
      << "," << std::endl;
   ss << "mEnablesEarlyExit=" << options.mEnablesEarlyExit << "," << std::endl;
   ss << "mEnablesDelayedEarlyExit=" << options.mEnablesDelayedEarlyExit << "," << std::endl;
@@ -610,9 +609,11 @@ inline int32_t getShuffleBlockSize(int epilogueTileM) {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Check if the options are valid or not.
-inline bool checkAndUpdateGemmOptions(GemmOptions& options, bool isBlackwell, int tpGrpSize,
+inline bool checkAndUpdateGemmOptions(GemmOptions& options, tg::CudaArch cudaArch, int tpGrpSize,
                                       bool updateOptions = true) {
   options.mWorldSize = tpGrpSize;
+
+  bool isBlackwell = tg::isArchBlackwell(cudaArch);
 
   if (options.mDtypeB == tg::Dtype::Void) {
     if (updateOptions) {
@@ -639,21 +640,20 @@ inline bool checkAndUpdateGemmOptions(GemmOptions& options, bool isBlackwell, in
   }
 
   // If validM/N/K is not specified, then assume the full range of the dimension is valid.
-  if (options.mValidM == -1) {
-    options.mValidM = options.mM;
-  }
-  if (options.mValidN == -1) {
-    options.mValidN = options.mN;
-  }
-  if (options.mValidK == -1) {
-    options.mValidK = options.mK;
+  if (options.mValidM < 0 || options.mValidN < 0 || options.mValidK < 0) {
+    if (updateOptions) {
+      options.mValidM = options.mValidM < 0 ? options.mM : options.mValidM;
+      options.mValidN = options.mValidN < 0 ? options.mN : options.mValidN;
+      options.mValidK = options.mValidK < 0 ? options.mK : options.mValidK;
+    } else {
+      return false;
+    }
   }
 
   // It must not exceed the padded dimensions.
   if (options.mValidM > options.mM || options.mValidN > options.mN ||
       options.mValidK > options.mK) {
     TLLM_LOG_WARNING(
-        options.mValidK <= options.mK,
         "ValidM, ValidN, and ValidK must be less than or equal to M, N, and K respectively.");
     if (updateOptions) {
       options.mValidM = std::min(options.mValidM, options.mM);
@@ -684,10 +684,11 @@ inline bool checkAndUpdateGemmOptions(GemmOptions& options, bool isBlackwell, in
 #endif  // TLLM_PUBLIC_RELEASE
 
   // Check that the A cast is supported.
-  // Currently, we only support {MxFp4, NvFp4} -> Bf16.
+  // Currently, we only support {MxFp4, NvFp4, MxInt4} -> Bf16.
   TLLM_CHECK_ERROR(
       (options.mDtypeA == options.mDtypeMmaA) ||
-          ((options.mDtypeA == tg::Dtype::MxE2m1 || options.mDtypeA == tg::Dtype::E2m1) &&
+          ((options.mDtypeA == tg::Dtype::MxE2m1 || options.mDtypeA == tg::Dtype::E2m1 ||
+            options.mDtypeA == tg::Dtype::MxInt4) &&
            options.mDtypeMmaA == tg::Dtype::Bfloat16) ||
           (options.mDtypeA == tg::Dtype::E2m1 && options.mDtypeMmaA == tg::Dtype::E4m3),
       "Unsupported cast for A: ", tg::dtypeToString(options.mDtypeA), " -> ",
@@ -1306,6 +1307,16 @@ inline bool checkAndUpdateGemmOptions(GemmOptions& options, bool isBlackwell, in
     }
   }
 
+  if (isBlackwell && !options.mUseCustomMmaSchedule && !options.mUseDeepSeekFp8 &&
+      options.mTileScheduler == TileScheduler::Persistent) {
+    if (updateOptions) {
+      options.mUseCustomMmaSchedule = true;
+    } else {
+      TLLM_CHECK_ERROR(false,
+                       "TileScheduler::Persistent and !UseCustomMmaSchedule is not supported.");
+    }
+  }
+
   if (options.mEnablesDelayedEarlyExit && options.mEnablesEarlyExit) {
     TLLM_LOG_WARNING(
         "Only one of early exit and delayed early exit should be enabled. Disabling "
@@ -1441,6 +1452,10 @@ inline bool checkAndUpdateGemmOptions(GemmOptions& options, bool isBlackwell, in
                      "Using more than 4 warps for epilogue does not work with sliceK");
     TLLM_CHECK_ERROR(!options.mUseDeepSeekFp8,
                      "Using more than 4 warps for epilogue does not work with mUseDeepSeekFp8");
+
+    auto const numEpilogueWrpGrps = options.mNumEpilogueWarps / 4;
+    TLLM_CHECK_ERROR(options.mTileN % (options.mEpilogueTileN * numEpilogueWrpGrps) == 0,
+                     "TileN must be a multiple of EpilogueTileN * numEpilogueWrpGrps");
   }
 
   if (updateOptions) {
