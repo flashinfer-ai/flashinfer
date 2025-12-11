@@ -655,7 +655,7 @@ def test_chain_speculative_sampling(
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("p", [0.05, 0.1, 0.2, 0.7, 1])
-def test_check_tensor_param_min_p(batch_size, vocab_size, p):
+def test_tensor_validation_min_p(batch_size, vocab_size, p):
     pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
     normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
 
@@ -670,7 +670,7 @@ def test_check_tensor_param_min_p(batch_size, vocab_size, p):
         flashinfer.sampling.min_p_sampling_from_probs(
             normalized_prob,
             torch.tensor(
-                [[p] * vocab_size] * batch_size, dtype=torch.int, device="cuda:0"
+                [[p] * vocab_size] * batch_size, dtype=torch.float32, device="cuda:0"
             ),
         )
 
@@ -680,22 +680,33 @@ def test_check_tensor_param_min_p(batch_size, vocab_size, p):
         match=r"Expected a 1D tensor of shape \(batch_size,\) or scalar.*got a 0-dimensional tensor",
     ):
         flashinfer.sampling.min_p_sampling_from_probs(
-            normalized_prob, torch.tensor(p, dtype=torch.int, device="cuda:0")
+            normalized_prob, torch.tensor(p, dtype=torch.float32, device="cuda:0")
         )
 
-    # 4: 1D tensor with a broken batch size raises error (only when batch_size > 1).
+    # 4: non-int32 indices raises error.
+    with pytest.raises(
+        RuntimeError,
+        match=r"(Inconsistency of Tensor type.*maybe_indices)",
+    ):
+        flashinfer.sampling.min_p_sampling_from_probs(
+            normalized_prob,
+            torch.tensor([p] * batch_size, dtype=torch.float32, device="cuda:0"),
+            torch.tensor([p] * batch_size, dtype=torch.int64, device="cuda:0"),
+        )
+
+    # 5: 1D tensor with a broken batch size raises error (only when batch_size > 1).
     if batch_size > 1:
         with pytest.raises(
             ValueError, match="Sampling parameter tensor batch size mismatch"
         ):
             flashinfer.sampling.min_p_sampling_from_probs(
-                normalized_prob, torch.tensor([p], dtype=torch.int, device="cuda:0")
+                normalized_prob, torch.tensor([p], dtype=torch.float32, device="cuda:0")
             )
 
-    # 5: 1D tensor with the correct batch size works.
+    # 6: 1D tensor with the correct batch size works.
     samples = flashinfer.sampling.min_p_sampling_from_probs(
         normalized_prob,
-        torch.tensor([p] * batch_size, dtype=torch.int, device="cuda:0"),
+        torch.tensor([p] * batch_size, dtype=torch.float32, device="cuda:0"),
     )
     assert samples.shape == (batch_size,)
 
@@ -733,9 +744,7 @@ def test_check_tensor_param_top_p(batch_size, vocab_size, p):
 
     # 4: 1D tensor with a broken batch size raises error (only when batch_size > 1).
     if batch_size > 1:
-        with pytest.raises(
-            ValueError, match="Sampling parameter tensor batch size mismatch"
-        ):
+        with pytest.raises(ValueError, match="Sampling parameter.*batch size mismatch"):
             flashinfer.sampling.top_p_renorm_probs(
                 normalized_prob, torch.tensor([p], dtype=torch.int, device="cuda:0")
             )
@@ -783,9 +792,7 @@ def test_check_tensor_param_top_k(batch_size, vocab_size, k):
 
     # 4: 1D tensor with a wrong shape raises error (only when batch_size > 1).
     if batch_size > 1:
-        with pytest.raises(
-            ValueError, match="Sampling parameter tensor batch size mismatch"
-        ):
+        with pytest.raises(ValueError, match="Sampling parameter.*batch size mismatch"):
             flashinfer.sampling.top_k_renorm_probs(
                 normalized_prob, torch.tensor([k], dtype=torch.int, device="cuda:0")
             )
@@ -796,6 +803,84 @@ def test_check_tensor_param_top_k(batch_size, vocab_size, k):
         torch.tensor([k] * batch_size, dtype=torch.int, device="cuda:0"),
     )
     assert samples.shape == normalized_prob.shape
+
+
+@pytest.mark.parametrize("batch_size", [1, 99, 989])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+def test_sampling_from_probs_seed_offset_reproducibility(batch_size, vocab_size):
+    """Test that explicit seed/offset produces reproducible results."""
+    torch.manual_seed(42)
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
+    normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+
+    seed, offset = 12345, 0
+
+    samples1 = flashinfer.sampling.sampling_from_probs(
+        normalized_prob, seed=seed, offset=offset
+    )
+    samples2 = flashinfer.sampling.sampling_from_probs(
+        normalized_prob, seed=seed, offset=offset
+    )
+
+    assert torch.all(samples1 == samples2), (
+        "Same seed/offset should produce identical samples"
+    )
+
+
+@pytest.mark.parametrize("batch_size", [1, 99, 989])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+def test_sampling_from_logits_seed_offset_reproducibility(batch_size, vocab_size):
+    """Test that explicit seed/offset produces reproducible results."""
+    torch.manual_seed(42)
+    logits = torch.randn(batch_size, vocab_size, device="cuda:0")
+
+    seed, offset = 12345, 0
+
+    samples1 = flashinfer.sampling.sampling_from_logits(
+        logits, seed=seed, offset=offset
+    )
+    samples2 = flashinfer.sampling.sampling_from_logits(
+        logits, seed=seed, offset=offset
+    )
+
+    assert torch.all(samples1 == samples2), (
+        "Same seed/offset should produce identical samples"
+    )
+
+
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+def test_sampling_different_seed_offset_produces_different_results(vocab_size):
+    """Test that different seed/offset values produce different samples."""
+    torch.manual_seed(42)
+    batch_size = 1000
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
+    normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+
+    samples_seed1 = flashinfer.sampling.sampling_from_probs(
+        normalized_prob, seed=12345, offset=0
+    )
+    samples_seed2 = flashinfer.sampling.sampling_from_probs(
+        normalized_prob, seed=67890, offset=0
+    )
+
+    samples_offset1 = flashinfer.sampling.sampling_from_probs(
+        normalized_prob, seed=12345, offset=0
+    )
+    samples_offset2 = flashinfer.sampling.sampling_from_probs(
+        normalized_prob, seed=12345, offset=1000
+    )
+
+    seed_match_rate = (samples_seed1 == samples_seed2).float().mean().item()
+    offset_match_rate = (samples_offset1 == samples_offset2).float().mean().item()
+
+    assert seed_match_rate < 1, (
+        f"Different seeds should produce mostly different samples, "
+        f"got {seed_match_rate:.2%} match rate"
+    )
+    assert offset_match_rate < 1, (
+        f"Different offsets should produce mostly different samples, "
+        f"got {offset_match_rate:.2%} match rate"
+    )
 
 
 if __name__ == "__main__":

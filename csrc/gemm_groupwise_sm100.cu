@@ -91,7 +91,7 @@ void CutlassGemmGroupwiseScaledSM100(TensorView float_workspace_buffer, TensorVi
                                      int64_t scale_granularity_m, int64_t scale_granularity_n,
                                      int64_t scale_granularity_k, std::string scale_major_mode,
                                      int64_t mma_sm) {
-  cudaSetDevice(float_workspace_buffer.device().device_id);
+  ffi::CUDADeviceGuard device_guard(float_workspace_buffer.device().device_id);
   const cudaStream_t stream = get_stream(C.device());
   DISPATCH_SCALE_MAJOR_K(scale_major_mode, SCALE_MAJOR_K, [&] {
     return DISPATCH_MMA_SM(mma_sm, MMA_SM, [&] {

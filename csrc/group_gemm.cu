@@ -25,7 +25,7 @@ void CutlassSegmentGEMM(TensorView workspace_buffer, TensorView all_problems, Te
                         TensorView y_ld, TensorView empty_x_data, bool weight_column_major) {
   unsigned int batch_size = x_ptr.size(0);
 
-  cudaSetDevice(workspace_buffer.device().device_id);
+  ffi::CUDADeviceGuard device_guard(workspace_buffer.device().device_id);
   const cudaStream_t stream = get_stream(workspace_buffer.device());
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(empty_x_data.dtype(), c_type, [&] {
     using cutlass_t = cutlass_dtype_t<c_type>;

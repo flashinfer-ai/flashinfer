@@ -51,7 +51,7 @@ void apply_rope(TensorView q, TensorView k, TensorView q_rope, TensorView k_rope
   size_t k_rope_stride_h = k_rope.stride(1);
   TVM_FFI_ICHECK_EQ(indptr.dtype(), offsets.dtype());
 
-  cudaSetDevice(q.device().device_id);
+  ffi::CUDADeviceGuard device_guard(q.device().device_id);
   const cudaStream_t stream = get_stream(q.device());
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(q.dtype(), c_type, [&] {
     return DISPATCH_DLPACK_IDTYPE_TO_CTYPE(indptr.dtype(), c_idtype, [&] {
@@ -94,7 +94,7 @@ void apply_rope_pos_ids(TensorView q, TensorView k, TensorView q_rope, TensorVie
   size_t k_rope_stride_n = k_rope.stride(0);
   size_t k_rope_stride_h = k_rope.stride(1);
 
-  cudaSetDevice(q.device().device_id);
+  ffi::CUDADeviceGuard device_guard(q.device().device_id);
   const cudaStream_t stream = get_stream(q.device());
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(q.dtype(), c_type, [&] {
     return DISPATCH_DLPACK_IDTYPE_TO_CTYPE(pos_ids.dtype(), c_idtype, [&] {
@@ -144,7 +144,7 @@ void apply_rope_pos_ids_cos_sin_cache(TensorView q, TensorView k, TensorView q_r
   size_t k_rope_stride_n = k_rope.stride(0);
   size_t k_rope_stride_h = k_rope.stride(1);
 
-  cudaSetDevice(q.device().device_id);
+  ffi::CUDADeviceGuard device_guard(q.device().device_id);
   const cudaStream_t stream = get_stream(q.device());
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(q.dtype(), c_type, [&] {
     return DISPATCH_DLPACK_IDTYPE_TO_CTYPE(pos_ids.dtype(), c_idtype, [&] {
@@ -196,7 +196,7 @@ void apply_llama31_rope(TensorView q, TensorView k, TensorView q_rope, TensorVie
   size_t k_rope_stride_h = k_rope.stride(1);
   TVM_FFI_ICHECK_EQ(indptr.dtype(), offsets.dtype());
 
-  cudaSetDevice(q.device().device_id);
+  ffi::CUDADeviceGuard device_guard(q.device().device_id);
   const cudaStream_t stream = get_stream(q.device());
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(q.dtype(), c_type, [&] {
     return DISPATCH_DLPACK_IDTYPE_TO_CTYPE(indptr.dtype(), c_idtype, [&] {
@@ -242,7 +242,7 @@ void apply_llama31_rope_pos_ids(TensorView q, TensorView k, TensorView q_rope, T
   size_t k_rope_stride_n = k_rope.stride(0);
   size_t k_rope_stride_h = k_rope.stride(1);
 
-  cudaSetDevice(q.device().device_id);
+  ffi::CUDADeviceGuard device_guard(q.device().device_id);
   const cudaStream_t stream = get_stream(q.device());
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(q.dtype(), c_type, [&] {
     return DISPATCH_DLPACK_IDTYPE_TO_CTYPE(pos_ids.dtype(), c_idtype, [&] {
@@ -393,7 +393,7 @@ void rope_quantize(TensorView q_rope_in, TensorView k_rope_in, TensorView q_nope
     k_nope_out_stride_h = k_nope_out.stride(1);
   }
 
-  cudaSetDevice(q_rope_in.device().device_id);
+  ffi::CUDADeviceGuard device_guard(q_rope_in.device().device_id);
   const cudaStream_t stream = get_stream(q_rope_in.device());
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(q_rope_in.dtype(), c_type, [&] {
     return DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP8(q_rope_out.dtype(), c_quant_type, [&] {
@@ -542,7 +542,7 @@ void rope_quantize_append_paged_kv_cache(
     v_in_stride_h = v_in.stride(1);
   }
 
-  cudaSetDevice(q_rope_in.device().device_id);
+  ffi::CUDADeviceGuard device_guard(q_rope_in.device().device_id);
   const cudaStream_t stream = get_stream(q_rope_in.device());
 
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(q_rope_in.dtype(), c_type, [&] {

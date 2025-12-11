@@ -1,13 +1,18 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights
+ * reserved. SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 #include "cuda_hint.cuh"
@@ -607,7 +612,7 @@ __launch_bounds__(128 * 3)
 #if SLIDING_WINDOW
         uint32_t const slidingWinSize,
 #endif
-        float const qScale,
+        float const qScale, float const* qScalePtr,
         OutputHead* __restrict__ const output,  // [nbReq][beamWidth][nbQHeads]
 #if LOW_PREC_OUTPUT
         float rcpOutScale,
@@ -625,8 +630,8 @@ __launch_bounds__(128 * 3)
 #if USE_BEAM_SEARCH
         BeamSearchParams const beamSearchParams,
 #endif
-        uint32_t const batchSize,
-        float kvCacheScale,  // Same scale for K and V cache. Used only for int8/fp8 KV cache.
+        uint32_t const batchSize, float kvCacheScale,
+        float const* kvScalePtr,  // Same scale for K and V cache. Used only for int8/fp8 KV cache.
         __grid_constant__ CUtensorMap const tensorMapVLLMK,
         __grid_constant__ CUtensorMap const tensorMapVLLMV,
 #if SPEC_DEC
@@ -635,6 +640,8 @@ __launch_bounds__(128 * 3)
         uint32_t* __restrict__ const semaphores =
             nullptr,  // [nbReq][nbKHeads][divUp(specDecParams.qSeqLen, inputTokensPerCta)]
         void* __restrict__ const scratch = nullptr) {
+  float const qScaleValue = qScalePtr != nullptr ? qScalePtr[0] : qScale;
+  float const kvCacheScaleValue = kvScalePtr != nullptr ? kvScalePtr[0] : kvCacheScale;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 900 && defined(__CUDA_ARCH_FEAT_SM90_ALL) && \
     (IS_SUPPORTED_F16_CASE || CACHE_ELEM_ENUM == 2) && BEAM_WIDTH == 1
   uint32_t const idxReq = blockIdx.z / nbKHeads;
@@ -772,7 +779,7 @@ __launch_bounds__(128 * 3)
     }
 
     float const qkScale =
-        qScale * (isKVCacheQuantized ? kvCacheScale : 1.f) *
+        qScaleValue * (isKVCacheQuantized ? kvCacheScaleValue : 1.f) *
         rsqrtf(validElemsPerHead);  // qkScale is applied onto Q*K.T before softmax.
     uint32_t const warpRank = warpIdx.x;
 
@@ -961,7 +968,7 @@ __launch_bounds__(128 * 3)
 #else
     constexpr float oScale = 1.F;
 #endif
-    float const xvoScale = xScale * (isKVCacheQuantized ? kvCacheScale : 1.f) * oScale;
+    float const xvoScale = xScale * (isKVCacheQuantized ? kvCacheScaleValue : 1.f) * oScale;
 
     Gemm1Acc acc{};  // init to zeros to avoid runtime checking for first gmma instruction.
     gmma::fence();
@@ -1315,7 +1322,7 @@ __launch_bounds__(128 * 3)
               headGrpSize * nbKHeads + idxHeadGrp + (headGrpSize + 2) * nbKHeads * idxReq;
           IOHead const& inKHead = qkv[inputKHeadOffset];
           uint32_t const lane = laneId();
-          float const rcpKScale = 1.F / kvCacheScale;
+          float const rcpKScale = 1.F / kvCacheScaleValue;
 #if ROPE_STYLE == 0
           constexpr bool isNeox = false;
           auto const pairs =
@@ -1374,7 +1381,7 @@ __launch_bounds__(128 * 3)
               (headGrpSize + 1) * nbKHeads + idxHeadGrp + (headGrpSize + 2) * nbKHeads * idxReq;
           IOHead const& inVHead = qkv[inputVHeadOffset];
           uint32_t const lane = laneId();
-          float const rcpVScale = 1.F / kvCacheScale;
+          float const rcpVScale = 1.F / kvCacheScaleValue;
           constexpr bool isNeox = false;
           auto const pairs =
               loadHead<InputElem, isNeox, warp_size, float>(inVHead, lane) * rcpVScale;
@@ -2908,7 +2915,7 @@ void launchHopperF8MHA(
 #if SLIDING_WINDOW
     uint32_t slidingWinSize,
 #endif
-    float qScale, OutputHead* output,
+    float qScale, float const* qScalePtr, OutputHead* output,
 #if LOW_PREC_OUTPUT
     float rcpOutScale,
 #endif
@@ -2929,8 +2936,8 @@ void launchHopperF8MHA(
 #if USE_BEAM_SEARCH
     BeamSearchParams const& beamSearchParams,
 #endif
-    uint32_t batchSize,
-    float kvCacheScale,  // Same scale for K and V cache. Used only for int8/fp8 KV cache.
+    uint32_t batchSize, float kvCacheScale,
+    float const* kvScalePtr,  // Same scale for K and V cache. Used only for int8/fp8 KV cache.
 #if SPEC_DEC
     SpecDecParams const& specDecParams,
 #endif
@@ -3000,7 +3007,7 @@ void launchHopperF8MHA(
 #if SLIDING_WINDOW
                          slidingWinSize,
 #endif
-                         qScale, output,
+                         qScale, qScalePtr, output,
 #if LOW_PREC_OUTPUT
                          rcpOutScale,
 #endif
@@ -3016,7 +3023,7 @@ void launchHopperF8MHA(
 #if USE_BEAM_SEARCH
                          beamSearchParams,
 #endif
-                         batchSize, kvCacheScale, tensorMapVLLMK, tensorMapVLLMV,
+                         batchSize, kvCacheScale, kvScalePtr, tensorMapVLLMK, tensorMapVLLMV,
 #if SPEC_DEC
                          specDecParams,
 #endif
@@ -3034,21 +3041,20 @@ static uint32_t configureKernel() {
 
 static uint32_t const hostSmemSize = configureKernel();
 
-void launchHopperF8MHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads,
-                                 uint32_t slidingWinSize, float qScale, OutputHead* output,
+void launchHopperF8MHAFlashInfer(
+    uint32_t multiProcessorCount, uint32_t nbKHeads, uint32_t slidingWinSize, float qScale,
+    float const* qScalePtr, OutputHead* output,
 #if LOW_PREC_OUTPUT
-                                 float rcpOutScale,
+    float rcpOutScale,
 #endif
-                                 InputHead const* q, float const* attentionSinks,
-                                 GMemCacheHead* kCacheVLLM, GMemCacheHead* vCacheVLLM,
-                                 KVCachePageIndex const* kvCachePageList, uint32_t maxSeqLen,
-                                 uint32_t const* seqLen, uint32_t batchSize, float kvCacheScale,
+    InputHead const* q, float const* attentionSinks, GMemCacheHead* kCacheVLLM,
+    GMemCacheHead* vCacheVLLM, KVCachePageIndex const* kvCachePageList, uint32_t maxSeqLen,
+    uint32_t const* seqLen, uint32_t batchSize, float kvCacheScale, float const* kvScalePtr,
 #if SPEC_DEC
-                                 uint32_t qSeqLen, uint32_t const* qCuSeqLens, MaskType const* mask,
+    uint32_t qSeqLen, uint32_t const* qCuSeqLens, MaskType const* mask,
 #endif
-                                 uint32_t* semaphores, void* scratch, bool enable_pdl,
-                                 uint64_t kv_stride_page, uint64_t kv_stride_token,
-                                 uint64_t kv_stride_head, cudaStream_t stream) {
+    uint32_t* semaphores, void* scratch, bool enable_pdl, uint64_t kv_stride_page,
+    uint64_t kv_stride_token, uint64_t kv_stride_head, cudaStream_t stream) {
   uint32_t const nbSubSeqPerSeq = [&]() -> uint32_t {
     float const factor = 0.25f;
     return mha::min<uint32_t>(
@@ -3091,12 +3097,12 @@ void launchHopperF8MHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads
 #if SLIDING_WINDOW
                                              slidingWinSize,
 #endif
-                                             qScale, output,
+                                             qScale, qScalePtr, output,
 #if LOW_PREC_OUTPUT
                                              rcpOutScale,
 #endif
                                              q, attentionSinks, cacheList, batchSize, kvCacheScale,
-                                             tensorMapVLLMK, tensorMapVLLMV,
+                                             kvScalePtr, tensorMapVLLMK, tensorMapVLLMV,
 #if SPEC_DEC
                                              specDecParams,
 #endif

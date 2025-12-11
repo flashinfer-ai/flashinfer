@@ -18,6 +18,7 @@
 #include <tvm/ffi/dtype.h>
 #include <tvm/ffi/error.h>
 #include <tvm/ffi/extra/c_env_api.h>
+#include <tvm/ffi/extra/cuda/device_guard.h>
 #include <tvm/ffi/function.h>
 
 #include "dlpack/dlpack.h"
@@ -271,6 +272,10 @@ inline void check_shape(const tvm::ffi::TensorView& a, const tvm::ffi::TensorVie
   CHECK_CUDA(x);                    \
   CHECK_CONTIGUOUS(x);              \
   CHECK_INPUT_TYPE(x, st)
+#define CHECK_MAYBE_INPUT_TYPE(maybe_x, st) \
+  if (maybe_x.has_value()) {                \
+    CHECK_INPUT_TYPE(maybe_x.value(), st);  \
+  }
 #define CHECK_LAST_DIM_CONTIGUOUS_INPUT(x) \
   CHECK_CUDA(x);                           \
   CHECK_LAST_DIM_CONTIGUOUS(x)
