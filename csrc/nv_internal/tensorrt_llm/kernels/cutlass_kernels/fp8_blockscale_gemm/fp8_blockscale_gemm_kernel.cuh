@@ -1163,10 +1163,13 @@ __global__ void convert_kernel(OutputType* output, InputType const* const input,
 }
 
 static int kNumDeviceSMs = -1;
-static bool kDeepGemmEnabled = []() -> bool {
+// a function that returns kDeepGemmEnabled
+bool getDeepGemmEnabled() {
   char const* env_var = std::getenv("TRTLLM_DG_ENABLED");
   return deep_gemm::jit::getGlobalCompiler().isValid() && (!env_var || std::string(env_var) != "0");
-}();
+}
+
+static bool kDeepGemmEnabled = []() -> bool { return getDeepGemmEnabled(); }();
 
 void fp8_1x128_cs(__nv_fp8_e4m3* mat_quant, float* scales, __nv_bfloat16 const* mat, int shape_x,
                   int shape_y, cudaStream_t stream) {
@@ -1420,7 +1423,7 @@ void fp8_gemm_run(__nv_fp8_e4m3* mat_a, int ld_a, __nv_fp8_e4m3* mat_b, int ld_b
     gemm_dispatch_sm89(mat_a, mat_b, mat_d, scales_a, scales_b, shape_m, shape_n, shape_k, stream);
     return;
   }
-  if (kDeepGemmEnabled) {
+  if (getDeepGemmEnabled()) {
     gemm_dispatch(mat_a, ld_a, mat_b, ld_b, mat_d, ld_d, scales_a, scales_b, shape_m, shape_n,
                   shape_k, stream);
   } else {
@@ -1544,7 +1547,7 @@ void fp8_grouped_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a, 
     }
   }
 
-  if (kDeepGemmEnabled) {
+  if (getDeepGemmEnabled()) {
     grouped_gemm_dispatch(fp8_mat_a, fp8_mat_b, mat_d, num_problems, problem_m_offsets, expected_m,
                           max_shape_m, max_shape_m_padded, shape_n, shape_k, scales_a, scales_b,
                           stream);
@@ -1658,7 +1661,7 @@ void fp8_stride_batch_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_ma
                                      num_problems, shape_m, shape_n, shape_k, stream);
     return;
   }
-  if (kDeepGemmEnabled) {
+  if (getDeepGemmEnabled()) {
     strided_batch_gemm_dispatch(fp8_mat_a, ld_a, stride_a, fp8_mat_b, ld_b, stride_b, mat_d, ld_d,
                                 stride_d, scales_a, scales_b, num_problems, shape_m, shape_n,
                                 shape_k, stream);

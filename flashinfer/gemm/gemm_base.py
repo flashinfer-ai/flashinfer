@@ -3293,7 +3293,14 @@ def batch_deepgemm_fp8_nt_groupwise(
 @functools.cache
 def get_fp8_blockscale_gemm_runner_sm90():
     """Get the FP8 block scale GEMM runner module for SM90."""
-    return gen_fp8_blockscale_gemm_sm90_module().build_and_load().init()
+    module = gen_fp8_blockscale_gemm_sm90_module().build_and_load()
+    from ..jit import env as jit_env
+
+    deepgemm_include_dir = str(
+        jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "tensorrt_llm"
+    )
+    module.set_deepgemm_jit_include_dirs([deepgemm_include_dir])
+    return module.init()
 
 
 @flashinfer_api
