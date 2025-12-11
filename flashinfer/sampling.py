@@ -1375,8 +1375,6 @@ def top_k_renorm_probs(
     sampling_from_probs
     top_p_renorm_probs
     """
-    _check_tensor_param(top_k, probs)
-
     # Allocate row_states buffer for multi-CTA kernel (1MB is enough for any GPU)
     buffer_bytes = 1024 * 1024  # 1MB
     row_states_buffer = _get_cache_buf(
@@ -1448,8 +1446,6 @@ def top_k_mask_logits(
     --------
     top_k_renorm_probs
     """
-    _check_tensor_param(top_k, logits)
-
     # Allocate row_states buffer for multi-CTA kernel (1MB is enough for any GPU)
     buffer_bytes = 1024 * 1024  # 1MB
     row_states_buffer = _get_cache_buf(
