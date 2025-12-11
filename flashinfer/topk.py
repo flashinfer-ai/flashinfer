@@ -16,7 +16,7 @@ limitations under the License.
 
 import functools
 from types import SimpleNamespace
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple
 
 import torch
 
@@ -28,12 +28,14 @@ from .utils import _get_cache_buf, register_custom_op, register_fake_op
 def get_topk_module():
     module = gen_topk_module().build_and_load()
 
-    @register_custom_op("flashinfer::radix_topk", mutates_args=("row_states_buffer",))
+    @register_custom_op(
+        "flashinfer::radix_topk", mutates_args=("row_states_buffer", "output_values")
+    )
     def radix_topk(
         input: torch.Tensor,
         top_k: int,
         row_states_buffer: Optional[torch.Tensor],
-        output_values: Optional[torch.Tensor] = None,
+        output_values: torch.Tensor,
     ) -> torch.Tensor:
         device = input.device
         # Supports float32, float16, bfloat16
@@ -54,7 +56,7 @@ def get_topk_module():
         input: torch.Tensor,
         top_k: int,
         row_states_buffer: Optional[torch.Tensor],
-        output_values: Optional[torch.Tensor] = None,
+        output_values: torch.Tensor,
     ) -> torch.Tensor:
         batch_size = input.size(0)
         return torch.empty(batch_size, top_k, dtype=torch.int32, device=input.device)
@@ -68,8 +70,7 @@ def top_k(
     input: torch.Tensor,
     k: int,
     sorted: bool = False,
-    return_values: bool = True,
-) -> Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Radix-based Top-K selection.
 
     This function selects the top-k largest elements from each row of the input
@@ -89,24 +90,15 @@ def top_k(
     sorted : bool, optional
         If True, the returned top-k elements will be sorted in descending order.
         Default is False (unsorted, which is faster).
-    return_values : bool, optional
-        If True (default), return both values and indices.
-        If False, return only indices (faster, avoids gather operation).
 
     Returns
     -------
-    If return_values=True (default):
-        values : torch.Tensor
-            Tensor of shape ``(batch_size, k)`` containing the top-k values.
-            Same dtype as input.
-        indices : torch.Tensor
-            Tensor of shape ``(batch_size, k)`` with int64 dtype containing the
-            indices of the top-k elements.
-
-    If return_values=False:
-        indices : torch.Tensor
-            Tensor of shape ``(batch_size, k)`` with int64 dtype containing the
-            indices of the top-k elements.
+    values : torch.Tensor
+        Tensor of shape ``(batch_size, k)`` containing the top-k values.
+        Same dtype as input.
+    indices : torch.Tensor
+        Tensor of shape ``(batch_size, k)`` with int64 dtype containing the
+        indices of the top-k elements.
 
     Note
     ----
@@ -115,8 +107,6 @@ def top_k(
     - The radix-based algorithm is O(n) in vocabulary size, compared to O(n log k)
       for heap-based methods, making it faster for large vocabularies.
     - For small vocabularies (< 1000), ``torch.topk`` may be faster.
-    - Setting ``return_values=False`` is faster when you only need indices,
-      as it avoids the gather operation for values.
 
     Examples
     --------
@@ -136,26 +126,17 @@ def top_k(
     >>> values_sorted, indices_sorted = flashinfer.top_k(logits, k, sorted=True)
     >>> # Values are now in descending order within each row
 
-    Getting only indices (faster):
-
-    >>> indices_only = flashinfer.top_k(logits, k, return_values=False)
-    >>> indices_only.shape
-    torch.Size([4, 256])
-
     See Also
     --------
     torch.topk : PyTorch's built-in top-k function
     sampling.top_k_mask_logits : Top-k masking for logits (sets non-top-k to -inf)
     sampling.top_k_renorm_probs : Top-k filtering and renormalization for probabilities
     """
-    input.size(1)
     batch_size = input.size(0)
     device = input.device
 
     # Allocate row_states buffer for multi-CTA path
-    # For single-CTA path this buffer is not used but we always allocate for simplicity
     # 1MB is enough for any reasonable GPU (covers up to ~500 groups)
-    # zero_init=True ensures arrival_counter starts at 0 on first use
     row_states_buffer: Optional[torch.Tensor] = _get_cache_buf(
         f"radix_topk_row_states_{input.device}",
         1024 * 1024,  # 1MB
@@ -164,11 +145,9 @@ def top_k(
     )
 
     # Allocate output_values for kernel to write directly
-    output_values: Optional[torch.Tensor] = None
-    if return_values:
-        output_values = torch.empty(batch_size, k, dtype=input.dtype, device=device)
+    output_values = torch.empty(batch_size, k, dtype=input.dtype, device=device)
 
-    # Get indices using radix-based selection (kernel writes values if output_values provided)
+    # Get indices using radix-based selection
     indices_int32 = get_topk_module().radix_topk(
         input, k, row_states_buffer, output_values
     )
@@ -176,18 +155,13 @@ def top_k(
     # Convert to int64 for compatibility
     indices = indices_int32.long()
 
-    if not return_values:
-        return indices
-
-    values = output_values
-
     if sorted:
         # Sort within each row by value (descending)
-        sorted_values, sort_indices = torch.sort(values, dim=-1, descending=True)
+        sorted_values, sort_indices = torch.sort(output_values, dim=-1, descending=True)
         sorted_indices = torch.gather(indices, dim=-1, index=sort_indices)
         return sorted_values, sorted_indices
 
-    return values, indices
+    return output_values, indices
 
 
 # Alias for compatibility

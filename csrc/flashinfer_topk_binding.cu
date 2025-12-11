@@ -17,8 +17,7 @@
 
 using tvm::ffi::Optional;
 
-void radix_topk(TensorView input, TensorView output_indices,
-                Optional<TensorView> maybe_output_values,
+void radix_topk(TensorView input, TensorView output_indices, TensorView output_values,
                 Optional<TensorView> maybe_row_states_buffer, int64_t top_k);
 
 // Radix-based Top-K selection

@@ -2890,7 +2890,7 @@ template <uint32_t BLOCK_THREADS, uint32_t VEC_SIZE, bool SINGLE_CTA, typename D
 __global__ void __launch_bounds__(BLOCK_THREADS)
     RadixTopKKernel_MultiCTA(DType* input,            // [batch, vocab_size]
                              IdType* output_indices,  // [batch, top_k]
-                             DType* output_values,    // [batch, top_k] or nullptr
+                             DType* output_values,    // [batch, top_k]
                              IdType* top_k_arr,       // [batch] or nullptr
                              uint32_t top_k_val, uint32_t vocab_size, uint32_t batch_size,
                              RadixRowState* row_states,  // [num_groups] (nullptr if SINGLE_CTA)
@@ -2966,10 +2966,8 @@ __global__ void __launch_bounds__(BLOCK_THREADS)
         if (chunk_start + i < k) {
           output_indices[row_idx * top_k_val + chunk_start + i] =
               static_cast<IdType>(chunk_start + i);
-          if (output_values != nullptr) {
-            output_values[row_idx * top_k_val + chunk_start + i] =
-                input[row_idx * vocab_size + chunk_start + i];
-          }
+          output_values[row_idx * top_k_val + chunk_start + i] =
+              input[row_idx * vocab_size + chunk_start + i];
         }
       }
       continue;
@@ -3200,9 +3198,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS)
           int pos = global_base + local_pos;
           // No need to check pos < k here since all > pivot elements are in top-k
           output_indices[row_idx * top_k_val + pos] = static_cast<IdType>(chunk_start + i);
-          if (output_values != nullptr) {
-            output_values[row_idx * top_k_val + pos] = Traits::FromOrdered(ordered_val);
-          }
+          output_values[row_idx * top_k_val + pos] = Traits::FromOrdered(ordered_val);
         }
       }
     }
@@ -3230,9 +3226,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS)
         }
         if (pos < static_cast<int>(k)) {
           output_indices[row_idx * top_k_val + pos] = static_cast<IdType>(chunk_start + i);
-          if (output_values != nullptr) {
-            output_values[row_idx * top_k_val + pos] = Traits::FromOrdered(ordered_val);
-          }
+          output_values[row_idx * top_k_val + pos] = Traits::FromOrdered(ordered_val);
         }
       }
     }
@@ -3258,11 +3252,11 @@ __global__ void __launch_bounds__(BLOCK_THREADS)
 }
 
 /*!
- * \brief Launch multi-CTA Radix Top-K kernel (returns indices and optionally values)
+ * \brief Launch multi-CTA Radix Top-K kernel (returns indices and values)
  *
  * \param input Input tensor [batch_size, vocab_size]
  * \param output_indices Output indices tensor [batch_size, top_k]
- * \param output_values Output values tensor [batch_size, top_k] or nullptr if not needed
+ * \param output_values Output values tensor [batch_size, top_k]
  * \param top_k_arr Per-row top-k values or nullptr for uniform top_k
  * \param batch_size Number of rows
  * \param top_k_val Default top-k value (used when top_k_arr is nullptr)

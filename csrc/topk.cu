@@ -21,13 +21,14 @@ using namespace flashinfer;
 
 using tvm::ffi::Optional;
 
-void radix_topk(TensorView input, TensorView output_indices,
-                Optional<TensorView> maybe_output_values,
+void radix_topk(TensorView input, TensorView output_indices, TensorView output_values,
                 Optional<TensorView> maybe_row_states_buffer, int64_t top_k) {
   CHECK_INPUT(input);
   CHECK_INPUT(output_indices);
+  CHECK_INPUT(output_values);
   CHECK_DIM(2, input);           // input: (batch_size, d)
   CHECK_DIM(2, output_indices);  // output_indices: (batch_size, top_k)
+  CHECK_DIM(2, output_values);   // output_values: (batch_size, top_k)
 
   unsigned int batch_size = input.size(0);
   unsigned int d = input.size(1);
@@ -46,16 +47,10 @@ void radix_topk(TensorView input, TensorView output_indices,
   }
 
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP32_FP16(dtype, c_type, [&] {
-    c_type* output_values_ptr = nullptr;
-    if (maybe_output_values.has_value()) {
-      CHECK_INPUT(maybe_output_values.value());
-      CHECK_DIM(2, maybe_output_values.value());
-      output_values_ptr = static_cast<c_type*>(maybe_output_values.value().data_ptr());
-    }
     status = sampling::RadixTopKMultiCTA<c_type, int32_t>(
         static_cast<c_type*>(input.data_ptr()), static_cast<int32_t*>(output_indices.data_ptr()),
-        output_values_ptr,  // output_values (nullptr if not writing values)
-        nullptr,            // top_k_arr
+        static_cast<c_type*>(output_values.data_ptr()),
+        nullptr,  // top_k_arr
         batch_size, static_cast<uint32_t>(top_k), d, row_states_ptr, stream);
     return true;
   });
