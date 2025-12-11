@@ -99,12 +99,12 @@ def _get_timestamp() -> str:
     return datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
 
 
-def _warn_security_implications():
+def _warn_dump():
     """Warn users about security implications of Level 10 logging."""
     if _API_LOG_LEVEL >= 10:
         print("=" * 80)
         print(
-            "SECURITY WARNING: FlashInfer API Logging is set to Level 10 (Tensor Dumping).\n"
+            "WARNING: FlashInfer API Logging is set to Level 10 (Tensor Dumping).\n"
             "This will dump ALL input and outputs including tensors for FlashInfer APIs to disk in\n"
             "the configured dump directory. Ensure that you are NOT processing sensitive data\n"
             "or that the dump directory is secure. To disable dumping, unset FLASHINFER_LOGLEVEL or\n"
@@ -931,7 +931,7 @@ def _log_system_info():
 
 # Log system information once at module load time (if logging is enabled)
 _log_system_info()
-_warn_security_implications()
+_warn_dump()
 
 
 def _format_value(value: Any, level: int, indent: int = 0) -> str:
