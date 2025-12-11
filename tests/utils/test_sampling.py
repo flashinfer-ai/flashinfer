@@ -447,20 +447,29 @@ def test_top_p_renorm_probs(batch_size, vocab_size, p):
     )
 
 
-@pytest.mark.parametrize("batch_size", [1, 19, 99])
+@pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("k", [10, 100, 500])
+@pytest.mark.parametrize(
+    "distribution",
+    [
+        normal_distribution(1),
+        normal_distribution(5),
+        gumbel_distribution(0.1),
+    ],
+)
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_top_k_renorm_probs(batch_size, vocab_size, k, dtype):
+def test_top_k_renorm_probs(batch_size, vocab_size, k, distribution, dtype):
     if k > vocab_size:
         pytest.skip("k should be less than vocab_size")
 
     torch.manual_seed(42)
+    logits = distribution((batch_size, vocab_size), "cuda:0")
+    normalized_prob_fp32 = torch.softmax(logits, dim=-1)
 
     if dtype == torch.float32:
-        # FP32: use uniform random probs for exact comparison
-        pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
-        normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+        # FP32: exact comparison with ground truth
+        normalized_prob = normalized_prob_fp32
 
         # Compute ground truth
         sorted_prob, _ = torch.sort(normalized_prob, descending=True)
@@ -475,22 +484,14 @@ def test_top_k_renorm_probs(batch_size, vocab_size, k, dtype):
 
         renorm_prob = flashinfer.sampling.top_k_renorm_probs(normalized_prob, k)
 
-        for i in range(batch_size):
-            torch.testing.assert_close(
-                renorm_prob_ground_truth[i],
-                renorm_prob[i],
-                rtol=1e-3,
-                atol=1e-3,
-            )
-    else:
-        # FP16/BF16: use softmax of logits for more concentrated probs
-        # Add per-row offset to create variation across batch rows
-        logits = torch.randn(batch_size, vocab_size, device="cuda:0") * 5
-        row_offsets = (
-            torch.arange(batch_size, device="cuda:0").unsqueeze(1).float() * 0.1
+        torch.testing.assert_close(
+            renorm_prob_ground_truth,
+            renorm_prob,
+            rtol=1e-3,
+            atol=1e-3,
         )
-        logits = logits + row_offsets
-        normalized_prob_fp32 = torch.softmax(logits, dim=-1)
+    else:
+        # FP16/BF16: use tolerance-based checks
         normalized_prob = normalized_prob_fp32.to(dtype)
 
         # Count non-zero elements in input (limited by FP16 precision)
@@ -516,24 +517,34 @@ def test_top_k_renorm_probs(batch_size, vocab_size, k, dtype):
         assert torch.all(nonzero_counts <= expected_counts.float() + tolerance)
 
 
-@pytest.mark.parametrize("batch_size", [1, 19, 99])
+@pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("k", [10, 100, 500])
+@pytest.mark.parametrize(
+    "distribution",
+    [
+        normal_distribution(1),
+        normal_distribution(5),
+        gumbel_distribution(0.1),
+    ],
+)
 @pytest.mark.parametrize("neginf_input", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_top_k_mask_logits(batch_size, vocab_size, k, neginf_input, dtype):
+def test_top_k_mask_logits(
+    batch_size, vocab_size, k, distribution, neginf_input, dtype
+):
     if k > vocab_size:
         pytest.skip("k should be less than vocab_size")
 
     torch.manual_seed(42)
+    logits = distribution((batch_size, vocab_size), "cuda:0")
+    if neginf_input:
+        num_neginf = torch.randint(1, vocab_size * batch_size, (1,)).item()
+        idxs = torch.randperm(batch_size * vocab_size, device="cuda:0")[:num_neginf]
+        logits[idxs // vocab_size, idxs % vocab_size] = -float("inf")
 
     if dtype == torch.float32:
         # FP32: exact comparison with renorm_probs reference
-        logits = torch.randn(batch_size, vocab_size, device="cuda:0") * 5
-        if neginf_input:
-            num_neginf = torch.randint(1, vocab_size * batch_size, (1,)).item()
-            idxs = torch.randperm(batch_size * vocab_size, device="cuda:0")[:num_neginf]
-            logits[idxs // vocab_size, idxs % vocab_size] = -float("inf")
         probs = torch.softmax(logits, dim=-1)
         masked_logits = flashinfer.sampling.top_k_mask_logits(logits, k)
         renormed_probs = torch.softmax(masked_logits, dim=-1)
@@ -547,17 +558,7 @@ def test_top_k_mask_logits(batch_size, vocab_size, k, neginf_input, dtype):
         )
     else:
         # FP16/BF16: use tolerance-based checks
-        # Add per-row offset to create variation across batch rows
-        logits_fp32 = torch.randn(batch_size, vocab_size, device="cuda:0") * 10
-        row_offsets = (
-            torch.arange(batch_size, device="cuda:0").unsqueeze(1).float() * 0.1
-        )
-        logits_fp32 = logits_fp32 + row_offsets
-        if neginf_input:
-            num_neginf = torch.randint(1, vocab_size * batch_size, (1,)).item()
-            idxs = torch.randperm(batch_size * vocab_size, device="cuda:0")[:num_neginf]
-            logits_fp32[idxs // vocab_size, idxs % vocab_size] = -float("inf")
-        logits = logits_fp32.to(dtype)
+        logits = logits.to(dtype)
 
         # Count finite inputs per row (for expected output calculation)
         finite_inputs = torch.isfinite(logits).sum(dim=-1)
