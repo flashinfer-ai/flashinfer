@@ -77,6 +77,14 @@ def packbits(x: torch.Tensor, bitorder: str = "big") -> torch.Tensor:
     """
     return _packbits(x, bitorder)
 
+def _get_indptr_for_packed_mask(
+    indptr: torch.Tensor,
+):
+    seglen = indptr[1:] - indptr[:-1]
+    packed_len = (seglen + 7) // 8
+    indptr_new = torch.zeros(len(indptr), dtype=indptr.dtype, device=indptr.device)
+    indptr_new[1:] = torch.cumsum(packed_len, 0)
+    return indptr_new
 
 @flashinfer_api
 def segment_packbits(
@@ -125,10 +133,7 @@ def segment_packbits(
     --------
     packbits
     """
-    seglen = indptr[1:] - indptr[:-1]
-    packed_len = (seglen + 7) // 8
-    indptr_new = torch.zeros(len(indptr), dtype=indptr.dtype, device=indptr.device)
-    indptr_new[1:] = torch.cumsum(packed_len, 0)
+    indptr_new = _get_indptr_for_packed_mask(indptr)
     output_nnzs = indptr_new[-1].item()
 
     device = x.device

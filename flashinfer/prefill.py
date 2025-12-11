@@ -36,7 +36,7 @@ from .jit import (
 )
 from .cudnn import cudnn_batch_prefill_with_kv_cache
 from .page import get_seq_lens
-from .quantization import packbits, segment_packbits
+from .quantization import packbits, segment_packbits, _get_indptr_for_packed_mask
 from .utils import (
     log2e,
     FP4Tensor,
@@ -1768,6 +1768,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._batch_size = batch_size
         self._num_qo_heads = num_qo_heads
         self._num_kv_heads = num_kv_heads
+        
+        # TODO: should we check consistency between custom_mask and packed_custom_mask?
+        
         if custom_mask is not None or packed_custom_mask is not None:
             mask_indptr = _compute_page_mask_indptr(
                 qo_indptr,
@@ -1775,6 +1778,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 paged_kv_last_page_len,
                 page_size,
             )
+        
+        if packed_custom_mask is not None and custom_mask is None:
+            mask_indptr = _get_indptr_for_packed_mask(mask_indptr)
+        
         if packed_custom_mask is None and custom_mask is not None:
             # create packed custom mask from custom mask
             packed_custom_mask, mask_indptr = segment_packbits(
