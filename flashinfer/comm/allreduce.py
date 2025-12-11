@@ -66,6 +66,8 @@ from .mnnvl import CommBackend
 # Import them for runtime use but type hint as int for mypy compatibility
 from .trtllm_ar import AllReduceFusionPattern
 from .trtllm_mnnvl_ar import MNNVLAllReduceFusionWorkspace
+from .trtllm_mnnvl_ar import trtllm_mnnvl_allreduce
+from .trtllm_mnnvl_ar import trtllm_mnnvl_fused_allreduce_add_rmsnorm
 
 # ============================================================================
 # WORKSPACE IMPLEMENTATIONS
@@ -211,7 +213,10 @@ def _mnnvl_workspace_check(
 
     """
 
-    return True
+    if topology == "multi_node":
+        return True
+
+    return False
 
 
 # ============================================================================
@@ -266,26 +271,10 @@ def _workspace_creation_heuristic(
             return ["mnnvl"]
 
     # Single-node scenarios
-    return ["mnnvl"]
-    # problem_size = max_token_num * hidden_dim
-
-    # # Large problems (>4M elements): trtllm optimized for throughput
-    # if problem_size > 4 * 1024 * 1024:
-    #     if "trtllm" in suitable_backends:
-    #         return ["trtllm"]
-
-    # # Small token counts (<128): trtllm one-shot has better latency
-    # if max_token_num < 128:
-    #     if "trtllm" in suitable_backends:
-    #         return ["trtllm"]
-
-    # # Small world sizes (<=4): trtllm one-shot efficient
-    # if world_size <= 4:
-    #     if "trtllm" in suitable_backends:
-    #         return ["trtllm"]
-
-    # # Default: return first available
-    # return [suitable_backends[0]]
+    elif "trtllm" in suitable_backends:
+        return ["trtllm"]
+    else:
+        return []
 
 
 # ============================================================================
@@ -657,25 +646,49 @@ def allreduce_fusion(
             raise ValueError(
                 f"MNNVL AllReduce+RMS fusion does not support pattern {pattern}"
             )
+
         # MNNVL backend implementation
-        # Validate required parameters for RMS fusion
-        if residual_in is None:
-            raise ValueError("MNNVL AllReduce+RMS fusion requires residual_in")
-        if residual_out is None:
-            raise ValueError(
-                "MNNVL AllReduce+RMS fusion requires residual_out (prenorm_output)"
+        if pattern == AllReduceFusionPattern.kAllReduce:
+            # AllReduce only
+            if output is None:
+                output = torch.empty_like(input)
+            trtllm_mnnvl_allreduce(
+                input=input,
+                workspace=workspace,
+                launch_with_pdl=launch_with_pdl,
+                output=output,
             )
-        if norm_out is None:
-            raise ValueError(
-                "MNNVL AllReduce+RMS fusion requires norm_out (normed_output)"
+            return output
+
+        elif pattern == AllReduceFusionPattern.kARResidualRMSNorm:
+            # AllReduce + Residual + RMSNorm fusion
+            # Validate required parameters
+            if residual_in is None:
+                raise ValueError("MNNVL AllReduce+RMS fusion requires residual_in")
+            if rms_gamma is None:
+                raise ValueError("MNNVL AllReduce+RMS fusion requires rms_gamma")
+
+            # Allocate output tensors if not provided
+            if norm_out is None:
+                norm_out = torch.empty_like(input)
+            if residual_out is None:
+                residual_out = torch.empty_like(input)
+
+            # Call the MNNVL fusion function
+            norm_result, residual_result = trtllm_mnnvl_fused_allreduce_add_rmsnorm(
+                input=input,
+                residual_in=residual_in,
+                gamma=rms_gamma,
+                workspace=workspace,
+                epsilon=rms_eps,
+                output=norm_out,
+                residual_out=residual_out,
+                launch_with_pdl=launch_with_pdl,
             )
-        if rms_gamma is None:
-            raise ValueError("MNNVL AllReduce+RMS fusion requires rms_gamma")
+            return norm_result
 
-        # Call the MNNVL fusion function
-        raise NotImplementedError("MNNVL AllReduce+RMS fusion is not implemented")
-
-        return norm_out
+        else:
+            raise ValueError(f"Unsupported pattern for MNNVL backend: {pattern}")
 
     else:
         raise TypeError(
