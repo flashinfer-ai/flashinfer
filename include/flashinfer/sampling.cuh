@@ -1878,6 +1878,139 @@ __global__ void TopKMaskLogitsKernel(DType* logits, DType* masked_logits, IdType
   }
 }
 
+/*!
+ * \brief Radix-based Top-K Mask Logits Kernel
+ *
+ * Uses radix select to find the k-th largest element in 4 passes (8 bits per pass),
+ * then masks all elements <= k-th element to -inf.
+ *
+ * \tparam BLOCK_THREADS Number of threads per block
+ * \tparam VEC_SIZE Vector size for memory access
+ * \tparam DType Data type
+ * \tparam IdType Index type
+ */
+template <uint32_t BLOCK_THREADS, uint32_t VEC_SIZE, typename DType, typename IdType>
+__global__ void RadixTopKMaskLogitsKernel(DType* logits, DType* masked_logits, IdType* top_k_arr,
+                                          uint32_t top_k_val, uint32_t d) {
+  constexpr uint32_t RADIX = 256;  // 8-bit radix
+
+  const uint32_t bx = blockIdx.x;
+  const uint32_t tx = threadIdx.x;
+  const uint32_t row_idx = bx;
+  uint32_t k = top_k_arr == nullptr ? top_k_val : top_k_arr[bx];
+
+  // Shared memory layout
+  extern __shared__ uint8_t smem[];
+  uint32_t* histogram = reinterpret_cast<uint32_t*>(smem);  // [RADIX]
+  uint32_t* shared_vars = histogram + RADIX;                // [3]: threshold, remaining_k, prefix
+
+  vec_t<float, VEC_SIZE> logits_vec;
+  float pivot = -cuda::std::numeric_limits<float>::infinity();
+
+  if (k >= d) {
+    // k >= d: no masking needed, just copy
+#pragma unroll 2
+    for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
+      if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
+        logits_vec.cast_load(logits + row_idx * d + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
+        logits_vec.store(masked_logits + row_idx * d + i * BLOCK_THREADS * VEC_SIZE +
+                         tx * VEC_SIZE);
+      }
+    }
+    return;
+  }
+
+  // Initialize
+  if (tx == 0) {
+    shared_vars[0] = 0;  // threshold bucket
+    shared_vars[1] = k;  // remaining_k
+    shared_vars[2] = 0;  // accumulated prefix (high bits of k-th element)
+  }
+  __syncthreads();
+
+  // 4 rounds of radix select (32 bits total)
+  for (uint32_t round = 0; round < 4; ++round) {
+    uint32_t shift = 24 - round * 8;
+    uint32_t prefix = shared_vars[2];
+    uint32_t remaining_k = shared_vars[1];
+
+    // Clear histogram
+    for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
+      histogram[i] = 0;
+    }
+    __syncthreads();
+
+    // Build histogram for current byte
+    for (uint32_t i = tx; i < d; i += BLOCK_THREADS) {
+      float val = static_cast<float>(logits[row_idx * d + i]);
+      uint32_t bits = __float_as_uint(val);
+      // Convert to ordered representation
+      uint32_t ordered = (bits & 0x80000000) ? ~bits : (bits ^ 0x80000000);
+
+      // Check if this element matches the prefix (high bits determined so far)
+      uint32_t mask = (round == 0) ? 0 : (0xFFFFFFFF << (32 - round * 8));
+      if ((ordered & mask) == prefix) {
+        uint32_t bucket = (ordered >> shift) & 0xFF;
+        atomicAdd(&histogram[bucket], 1);
+      }
+    }
+    __syncthreads();
+
+    // Compute suffix sum (count of elements >= each bucket)
+    {
+      uint32_t val = (tx < RADIX) ? histogram[tx] : 0;
+      __syncthreads();
+
+      for (uint32_t stride = 1; stride < RADIX; stride *= 2) {
+        uint32_t other = (tx < RADIX && tx + stride < RADIX) ? histogram[tx + stride] : 0;
+        __syncthreads();
+        if (tx < RADIX) {
+          histogram[tx] = val + other;
+        }
+        __syncthreads();
+        val = (tx < RADIX) ? histogram[tx] : 0;
+      }
+    }
+
+    // Find threshold bucket
+    if (tx < RADIX) {
+      uint32_t count_ge = histogram[tx];
+      uint32_t count_gt = (tx + 1 < RADIX) ? histogram[tx + 1] : 0;
+      if (count_ge >= remaining_k && count_gt < remaining_k) {
+        shared_vars[0] = tx;
+        shared_vars[1] = remaining_k - count_gt;
+        shared_vars[2] = prefix | (tx << shift);
+      }
+    }
+    __syncthreads();
+  }
+
+  // Convert final ordered uint32 back to float pivot
+  uint32_t ordered_pivot = shared_vars[2];
+  // Reverse the ordered transformation: if MSB is 1, flip sign bit; else flip all bits
+  uint32_t pivot_bits =
+      (ordered_pivot & 0x80000000) ? (ordered_pivot ^ 0x80000000) : ~ordered_pivot;
+  pivot = __uint_as_float(pivot_bits);
+
+  // Final masking pass
+#pragma unroll 2
+  for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
+    logits_vec.fill(-cuda::std::numeric_limits<float>::infinity());
+    if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
+      logits_vec.cast_load(logits + row_idx * d + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
+    }
+#pragma unroll
+    for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+      // Keep elements > pivot (strictly greater than k-th element)
+      logits_vec[j] =
+          (logits_vec[j] > pivot) ? logits_vec[j] : -cuda::std::numeric_limits<float>::infinity();
+    }
+    if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
+      logits_vec.store(masked_logits + row_idx * d + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
+    }
+  }
+}
+
 template <uint32_t BLOCK_THREADS, BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE,
           typename DType, typename IdType>
 __global__ void TopKRenormProbKernel(DType* probs, DType* renormed_prob, IdType* top_k_arr,
@@ -2069,6 +2202,39 @@ cudaError_t TopKMaskLogits(DType* logits, DType* masked_logits, IdType* top_k_ar
     });
     return cudaSuccess;
   });
+}
+
+/*!
+ * \brief Radix-based Top-K Mask Logits
+ *
+ * Uses radix select to find the k-th largest element in exactly 4 passes,
+ * then masks all elements <= k-th element to -inf.
+ *
+ * This is more efficient than the binary search based TopKMaskLogits for
+ * large vocabularies as it has predictable O(4 * d) memory accesses.
+ */
+template <typename DType, typename IdType>
+cudaError_t RadixTopKMaskLogits(DType* logits, DType* masked_logits, IdType* top_k_arr,
+                                uint32_t batch_size, uint32_t top_k_val, uint32_t d,
+                                cudaStream_t stream = 0) {
+  constexpr uint32_t BLOCK_THREADS = 1024;
+  constexpr uint32_t RADIX = 256;
+  const uint32_t vec_size = std::gcd(16 / sizeof(DType), d);
+
+  // Shared memory: histogram[RADIX] + shared_vars[3]
+  const uint32_t smem_size = RADIX * sizeof(uint32_t) + 3 * sizeof(uint32_t);
+
+  dim3 nblks(batch_size);
+  dim3 nthrs(BLOCK_THREADS);
+  void* args[] = {&logits, &masked_logits, &top_k_arr, &top_k_val, &d};
+
+  DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
+    auto kernel = RadixTopKMaskLogitsKernel<BLOCK_THREADS, VEC_SIZE, DType, IdType>;
+    FLASHINFER_CUDA_CALL(
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+  });
+  return cudaSuccess;
 }
 
 // ==================== Multi-CTA Top-K Implementation ====================
@@ -2511,6 +2677,379 @@ cudaError_t TopKMaskLogitsMultiCTA(DType* logits, DType* masked_logits, IdType* 
   });
 }
 
+// ==================== Multi-CTA Radix Top-K Mask Logits ====================
+
+// Global state for multi-CTA radix reduction (one per group)
+struct RadixRowState {
+  uint32_t histogram[2][256];  // Double-buffered histograms for ping-pong
+  uint32_t remaining_k;        // Remaining k after current round
+  uint32_t prefix;             // Accumulated prefix (high bits of k-th element)
+  int arrival_counter;         // For inter-CTA synchronization
+};
+
+template <uint32_t BLOCK_THREADS, uint32_t VEC_SIZE, typename DType, typename IdType>
+__global__ void __launch_bounds__(BLOCK_THREADS)
+    RadixTopKMaskLogitsKernel_MultiCTA(DType* logits,         // [batch, vocab_size]
+                                       DType* masked_logits,  // [batch, vocab_size]
+                                       IdType* top_k_arr,     // [batch] or nullptr
+                                       uint32_t top_k_val, uint32_t vocab_size, uint32_t batch_size,
+                                       RadixRowState* row_states,  // [num_groups]
+                                       uint32_t chunk_size,        // elements per CTA
+                                       uint32_t ctas_per_group)    // CTAs per row
+{
+  constexpr uint32_t RADIX = 256;  // 8-bit radix
+
+  const uint32_t global_cta_id = blockIdx.x;
+  const uint32_t group_id = global_cta_id / ctas_per_group;
+  const uint32_t cta_in_group = global_cta_id % ctas_per_group;
+  const uint32_t tx = threadIdx.x;
+
+  // Shared memory layout: [fixed storage] [ordered values cache]
+  extern __shared__ uint8_t smem[];
+
+  // Fixed shared memory (at the beginning)
+  constexpr size_t fixed_smem_size =
+      sizeof(uint32_t) * (RADIX + RADIX + 4);  // histogram + suffix + 4 scalars
+  uint32_t* local_histogram = reinterpret_cast<uint32_t*>(smem);
+  uint32_t* suffix_sum = local_histogram + RADIX;
+  uint32_t* shared_scalars =
+      suffix_sum + RADIX;  // [prefix_cache, remaining_k_cache, found_bucket, found_remaining_k]
+
+  // Align ordered values cache to 16 bytes
+  size_t ordered_offset = ((fixed_smem_size + 15) / 16) * 16;
+  uint32_t* shared_ordered = reinterpret_cast<uint32_t*>(smem + ordered_offset);
+
+// Aliases for scalar shared variables
+#define prefix_cache shared_scalars[0]
+#define remaining_k_cache shared_scalars[1]
+#define found_bucket shared_scalars[2]
+#define found_remaining_k shared_scalars[3]
+
+  RadixRowState* state = &row_states[group_id];
+
+  // Calculate total number of iterations for persistent loop
+  uint32_t num_groups = gridDim.x / ctas_per_group;
+  uint32_t total_iterations = (batch_size + num_groups - 1) / num_groups;
+
+  int barrier_phase = 0;
+
+  // Persistent loop over rows
+  for (uint32_t iter = 0; iter < total_iterations; iter++) {
+    uint32_t row_idx = group_id + iter * num_groups;
+
+    if (row_idx >= batch_size) break;
+
+    const uint32_t chunk_start = cta_in_group * chunk_size;
+    const uint32_t chunk_end = min(chunk_start + chunk_size, vocab_size);
+
+    uint32_t k = top_k_arr == nullptr ? top_k_val : top_k_arr[row_idx];
+
+    float pivot = -cuda::std::numeric_limits<float>::infinity();
+
+    const uint32_t actual_chunk_size = chunk_end - chunk_start;
+
+    if (k >= vocab_size) {
+      // k >= vocab_size: no masking needed, just copy
+      vec_t<float, VEC_SIZE> logits_vec;
+#pragma unroll 2
+      for (uint32_t i = tx * VEC_SIZE; i < actual_chunk_size; i += BLOCK_THREADS * VEC_SIZE) {
+        if (i + VEC_SIZE <= actual_chunk_size) {
+          logits_vec.cast_load(logits + row_idx * vocab_size + chunk_start + i);
+          logits_vec.store(masked_logits + row_idx * vocab_size + chunk_start + i);
+        }
+      }
+      // Handle tail
+      for (uint32_t i = (actual_chunk_size / VEC_SIZE) * VEC_SIZE + tx; i < actual_chunk_size;
+           i += BLOCK_THREADS) {
+        masked_logits[row_idx * vocab_size + chunk_start + i] =
+            logits[row_idx * vocab_size + chunk_start + i];
+      }
+      continue;
+    }
+
+    // ========== Stage 1: Load and convert to ordered uint32 in shared memory ==========
+    // This is done ONCE per row, avoiding 4x global memory reads
+    vec_t<DType, VEC_SIZE> logits_vec;
+    const uint32_t aligned_size = (actual_chunk_size / VEC_SIZE) * VEC_SIZE;
+
+#pragma unroll 2
+    for (uint32_t i = tx * VEC_SIZE; i < aligned_size; i += BLOCK_THREADS * VEC_SIZE) {
+      logits_vec.cast_load(logits + row_idx * vocab_size + chunk_start + i);
+#pragma unroll
+      for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+        float val = static_cast<float>(logits_vec[j]);
+        uint32_t bits = __float_as_uint(val);
+        // Convert to ordered representation (for descending order)
+        shared_ordered[i + j] = (bits & 0x80000000) ? ~bits : (bits ^ 0x80000000);
+      }
+    }
+    // Handle tail
+    for (uint32_t i = aligned_size + tx; i < actual_chunk_size; i += BLOCK_THREADS) {
+      float val = static_cast<float>(logits[row_idx * vocab_size + chunk_start + i]);
+      uint32_t bits = __float_as_uint(val);
+      shared_ordered[i] = (bits & 0x80000000) ? ~bits : (bits ^ 0x80000000);
+    }
+    __syncthreads();
+
+    // Initialize local caches
+    if (tx == 0) {
+      prefix_cache = 0;
+      remaining_k_cache = k;
+    }
+    // Clear both global histograms (all CTAs participate)
+    for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
+      state->histogram[0][i] = 0;
+      state->histogram[1][i] = 0;
+    }
+    __syncthreads();
+
+    // Barrier to ensure initialization is visible
+    if (tx == 0) {
+      red_release(&state->arrival_counter, 1);
+    }
+    int target = (barrier_phase + 1) * ctas_per_group;
+    wait_ge(&state->arrival_counter, target, tx);
+    barrier_phase++;
+    __syncthreads();
+
+    // ========== Stage 2: 4 rounds of radix select ==========
+    // Using double-buffering: round N uses histogram[N % 2]
+    // Round N clears histogram[(N+1) % 2] for next round's use
+    for (uint32_t round = 0; round < 4; ++round) {
+      uint32_t shift = 24 - round * 8;
+      // Read from local cache (no global memory access needed!)
+      uint32_t prefix = prefix_cache;
+      uint32_t remaining_k = remaining_k_cache;
+
+      // Current histogram for this round
+      uint32_t* current_hist = state->histogram[round % 2];
+      // Other histogram - clear it for use in round+1 (or next row's round 0)
+      uint32_t* other_hist = state->histogram[(round + 1) % 2];
+
+      // Clear local histogram AND clear the "other" global histogram for next round
+      // These are independent operations on different memory, no conflict
+      for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
+        local_histogram[i] = 0;
+        other_hist[i] = 0;  // Prepare for next round (no barrier needed!)
+      }
+      __syncthreads();
+
+      // Build local histogram from SHARED MEMORY (no global memory access!)
+      for (uint32_t i = tx; i < actual_chunk_size; i += BLOCK_THREADS) {
+        uint32_t ordered = shared_ordered[i];
+
+        // Check if this element matches the prefix (high bits determined so far)
+        uint32_t mask = (round == 0) ? 0 : (0xFFFFFFFF << (32 - round * 8));
+        if ((ordered & mask) == prefix) {
+          uint32_t bucket = (ordered >> shift) & 0xFF;
+          atomicAdd(&local_histogram[bucket], 1);
+        }
+      }
+      __syncthreads();
+
+      // Atomically add local histogram to current global histogram
+      for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
+        if (local_histogram[i] > 0) {
+          atomicAdd(&current_hist[i], local_histogram[i]);
+        }
+      }
+
+      // Barrier: wait for all CTAs to finish histogram accumulation
+      // This is the ONLY barrier per round (double-buffering eliminates the second one!)
+      if (tx == 0) {
+        red_release(&state->arrival_counter, 1);
+      }
+      target = (barrier_phase + 1) * ctas_per_group;
+      wait_ge(&state->arrival_counter, target, tx);
+      barrier_phase++;
+      __syncthreads();
+
+      // ALL CTAs: load current global histogram to shared memory and do suffix sum
+      for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
+        suffix_sum[i] = current_hist[i];
+      }
+      __syncthreads();
+
+      // Parallel suffix sum in shared memory (much faster than global memory!)
+      // Compute count of elements >= each bucket value
+      for (uint32_t stride = 1; stride < RADIX; stride *= 2) {
+        uint32_t val = 0;
+        if (tx < RADIX) {
+          val = suffix_sum[tx];
+          if (tx + stride < RADIX) {
+            val += suffix_sum[tx + stride];
+          }
+        }
+        __syncthreads();
+        if (tx < RADIX) {
+          suffix_sum[tx] = val;
+        }
+        __syncthreads();
+      }
+
+      // ALL CTAs: find threshold bucket (all compute same result)
+      // Use shared variable to communicate the found bucket (via macros to shared_scalars[2..3])
+      if (tx == 0) {
+        found_bucket = 0;
+        found_remaining_k = remaining_k;
+      }
+      __syncthreads();
+
+      if (tx < RADIX) {
+        uint32_t count_ge = suffix_sum[tx];
+        uint32_t count_gt = (tx + 1 < RADIX) ? suffix_sum[tx + 1] : 0;
+        if (count_ge >= remaining_k && count_gt < remaining_k) {
+          found_bucket = tx;
+          found_remaining_k = remaining_k - count_gt;
+        }
+      }
+      __syncthreads();
+
+      // Update local caches (all CTAs have same values)
+      if (tx == 0) {
+        prefix_cache = prefix | (found_bucket << shift);
+        remaining_k_cache = found_remaining_k;
+      }
+      __syncthreads();
+
+      // No second barrier needed! Double-buffering allows next round to proceed
+      // because it uses a different histogram (other_hist is already cleared)
+    }
+
+    // Convert final ordered uint32 back to float pivot
+    uint32_t ordered_pivot = prefix_cache;
+    uint32_t pivot_bits =
+        (ordered_pivot & 0x80000000) ? (ordered_pivot ^ 0x80000000) : ~ordered_pivot;
+    pivot = __uint_as_float(pivot_bits);
+
+    // ========== Stage 3: Final masking pass ==========
+    // Reuse logits_vec from Stage 1
+
+#pragma unroll 2
+    for (uint32_t i = tx * VEC_SIZE; i < aligned_size; i += BLOCK_THREADS * VEC_SIZE) {
+      logits_vec.cast_load(logits + row_idx * vocab_size + chunk_start + i);
+#pragma unroll
+      for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+        logits_vec[j] =
+            (logits_vec[j] > pivot) ? logits_vec[j] : -cuda::std::numeric_limits<float>::infinity();
+      }
+      logits_vec.store(masked_logits + row_idx * vocab_size + chunk_start + i);
+    }
+
+    // Handle tail
+    for (uint32_t i = aligned_size + tx; i < actual_chunk_size; i += BLOCK_THREADS) {
+      float val = static_cast<float>(logits[row_idx * vocab_size + chunk_start + i]);
+      masked_logits[row_idx * vocab_size + chunk_start + i] =
+          (val > pivot) ? val : -cuda::std::numeric_limits<float>::infinity();
+    }
+  }
+
+  // Reset arrival counter for next kernel launch
+  if (cta_in_group == 0 && tx == 0) {
+    st_release(&state->arrival_counter, 0);
+  }
+
+#undef prefix_cache
+#undef remaining_k_cache
+#undef found_bucket
+#undef found_remaining_k
+}
+
+template <typename DType, typename IdType>
+cudaError_t RadixTopKMaskLogitsMultiCTA(DType* logits, DType* masked_logits, IdType* top_k_arr,
+                                        uint32_t batch_size, uint32_t top_k_val,
+                                        uint32_t vocab_size, RadixRowState* row_states_buffer,
+                                        cudaStream_t stream = 0) {
+  constexpr uint32_t BLOCK_THREADS = 1024;
+  const uint32_t vec_size = std::gcd(16 / sizeof(DType), vocab_size);
+
+  // Get device properties
+  int device;
+  FLASHINFER_CUDA_CALL(cudaGetDevice(&device));
+  int num_sms;
+  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device));
+  int max_smem_per_block;
+  FLASHINFER_CUDA_CALL(
+      cudaDeviceGetAttribute(&max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+
+  // Fixed shared memory overhead: histogram[256] + suffix_sum[256] + 4 scalars + alignment
+  constexpr size_t fixed_smem_size = sizeof(uint32_t) * (256 + 256 + 4);
+  constexpr size_t fixed_smem_aligned = ((fixed_smem_size + 15) / 16) * 16;
+
+  // Calculate max chunk size that fits in shared memory
+  // smem layout: [fixed_smem_aligned] [chunk_size * sizeof(uint32_t)]
+  const size_t available_for_ordered = max_smem_per_block - fixed_smem_aligned;
+  uint32_t max_chunk_elements = available_for_ordered / sizeof(uint32_t);
+
+  // Round down to multiple of vec_size
+  max_chunk_elements = (max_chunk_elements / vec_size) * vec_size;
+
+  // Ensure minimum chunk size for vectorized access
+  constexpr uint32_t min_chunk_size = 16 * BLOCK_THREADS;
+  max_chunk_elements = std::max(max_chunk_elements, min_chunk_size);
+
+  // Calculate how many CTAs needed per row
+  uint32_t ctas_per_group = (vocab_size + max_chunk_elements - 1) / max_chunk_elements;
+  uint32_t chunk_size = (vocab_size + ctas_per_group - 1) / ctas_per_group;
+
+  // Round up chunk_size to multiple of vec_size
+  chunk_size = ((chunk_size + vec_size - 1) / vec_size) * vec_size;
+
+  // Ensure chunk_size doesn't exceed max
+  chunk_size = std::min(chunk_size, max_chunk_elements);
+
+  // Calculate number of groups (must fit within SM count)
+  uint32_t num_groups = std::min(static_cast<uint32_t>(num_sms) / ctas_per_group, batch_size);
+  if (num_groups == 0) num_groups = 1;
+  uint32_t total_ctas = num_groups * ctas_per_group;
+
+  dim3 nblks(total_ctas);
+  dim3 nthrs(BLOCK_THREADS);
+
+  // Shared memory: fixed overhead + ordered values cache
+  const uint32_t smem_size = fixed_smem_aligned + chunk_size * sizeof(uint32_t);
+
+  void* args[] = {&logits,     &masked_logits,     &top_k_arr,  &top_k_val,     &vocab_size,
+                  &batch_size, &row_states_buffer, &chunk_size, &ctas_per_group};
+
+  DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
+    auto kernel = RadixTopKMaskLogitsKernel_MultiCTA<BLOCK_THREADS, VEC_SIZE, DType, IdType>;
+    FLASHINFER_CUDA_CALL(
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+  });
+
+  return cudaSuccess;
+}
+
+/*!
+ * \brief Auto-selecting RadixTopKMaskLogits launcher.
+ *
+ * Automatically chooses between single-CTA and multi-CTA implementations based on vocab_size.
+ * - vocab_size < 48000: uses single-CTA (RadixTopKMaskLogits)
+ * - vocab_size >= 48000: uses multi-CTA (RadixTopKMaskLogitsMultiCTA)
+ *
+ * \param row_states_buffer Buffer for inter-CTA synchronization (only used for multi-CTA).
+ *        Can be nullptr if vocab_size < 48000.
+ */
+template <typename DType, typename IdType>
+cudaError_t RadixTopKMaskLogitsAuto(DType* logits, DType* masked_logits, IdType* top_k_arr,
+                                    uint32_t batch_size, uint32_t top_k_val, uint32_t vocab_size,
+                                    RadixRowState* row_states_buffer, cudaStream_t stream = 0) {
+  constexpr uint32_t VOCAB_THRESHOLD_FOR_MULTI_CTA = 48000;
+
+  if (vocab_size < VOCAB_THRESHOLD_FOR_MULTI_CTA) {
+    // Use single-CTA for small vocab
+    return RadixTopKMaskLogits<DType, IdType>(logits, masked_logits, top_k_arr, batch_size,
+                                              top_k_val, vocab_size, stream);
+  } else {
+    // Use multi-CTA for large vocab
+    return RadixTopKMaskLogitsMultiCTA<DType, IdType>(logits, masked_logits, top_k_arr, batch_size,
+                                                      top_k_val, vocab_size, row_states_buffer,
+                                                      stream);
+  }
+}
+
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
           typename DType, typename IdType>
@@ -2683,6 +3222,280 @@ cudaError_t ChainSpeculativeSampling(DType* draft_probs, IdType* draft_token_ids
         })});
     return cudaSuccess;
   });
+}
+
+// ===================== Radix-based Top-K Selection =====================
+
+/*!
+ * \brief Convert float32 to ordered uint32 for radix sort comparison
+ * \param x Float value to convert
+ * \return Unsigned integer with same ordering as float
+ */
+__device__ __forceinline__ uint32_t float_to_ordered_uint32(float x) {
+  uint32_t bits = __float_as_uint(x);
+  // If negative, flip all bits; if positive, flip sign bit
+  return (bits & 0x80000000) ? ~bits : (bits ^ 0x80000000);
+}
+
+/*!
+ * \brief Single-CTA Radix Top-K kernel
+ *
+ * Uses a radix histogram approach to find top-k elements:
+ * - Stage 1: Build histogram for top 8 bits (from FP16 representation)
+ * - Stage 2-4: Refine using remaining bits from FP32 representation
+ *
+ * \tparam BLOCK_THREADS Number of threads per block
+ * \tparam DType Data type of input values
+ * \tparam IdType Data type of indices
+ */
+template <uint32_t BLOCK_THREADS, typename DType, typename IdType>
+__global__ void RadixTopKKernel(DType* __restrict__ input, IdType* __restrict__ output_indices,
+                                IdType* __restrict__ starts, IdType* __restrict__ ends,
+                                uint32_t batch_size, uint32_t d, uint32_t top_k) {
+  constexpr uint32_t RADIX = 256;  // 8-bit radix
+  constexpr uint32_t SMEM_CANDIDATE_SIZE = 4096;
+
+  const uint32_t bx = blockIdx.x;
+  const uint32_t tx = threadIdx.x;
+
+  if (bx >= batch_size) return;
+
+  // Shared memory layout
+  extern __shared__ uint8_t smem[];
+  uint32_t* histogram = reinterpret_cast<uint32_t*>(smem);  // [RADIX + 1] for suffix sum
+  IdType* candidates[2];
+  candidates[0] = reinterpret_cast<IdType*>(histogram + RADIX + 1);
+  candidates[1] = candidates[0] + SMEM_CANDIDATE_SIZE;
+  uint32_t* shared_vars =
+      reinterpret_cast<uint32_t*>(candidates[1] + SMEM_CANDIDATE_SIZE);  // [5]: threshold,
+                                                                         // remaining_k,
+                                                                         // num_candidates,
+                                                                         // output_counter,
+                                                                         // cand_counter
+
+  // Get row bounds
+  uint32_t start_idx = starts ? static_cast<uint32_t>(starts[bx]) : 0;
+  uint32_t end_idx = ends ? static_cast<uint32_t>(ends[bx]) : d;
+  uint32_t row_size = end_idx - start_idx;
+
+  // Initialize
+  for (uint32_t i = tx; i < RADIX + 1; i += BLOCK_THREADS) {
+    histogram[i] = 0;
+  }
+  if (tx < 5) {
+    shared_vars[tx] = 0;
+  }
+  __syncthreads();
+
+  // ========== Stage 1: Build histogram from top 8 bits ==========
+  for (uint32_t i = tx; i < row_size; i += BLOCK_THREADS) {
+    float val = static_cast<float>(input[bx * d + start_idx + i]);
+    __half hval = __float2half(val);
+    uint16_t bits = __half_as_ushort(hval);
+    uint16_t ordered = (bits & 0x8000) ? ~bits : (bits ^ 0x8000);
+    uint32_t bucket = ordered >> 8;
+    atomicAdd(&histogram[bucket], 1);
+  }
+  __syncthreads();
+
+  // Compute suffix sum: histogram[i] = count of elements in buckets >= i
+  // Thread-safe parallel suffix sum
+  {
+    uint32_t val = (tx < RADIX) ? histogram[tx] : 0;
+    __syncthreads();
+
+    for (uint32_t stride = 1; stride < RADIX; stride *= 2) {
+      uint32_t other = (tx < RADIX && tx + stride < RADIX) ? histogram[tx + stride] : 0;
+      __syncthreads();
+      if (tx < RADIX) {
+        histogram[tx] = val + other;
+      }
+      __syncthreads();
+      val = (tx < RADIX) ? histogram[tx] : 0;
+    }
+  }
+
+  // Find threshold bucket
+  if (tx < RADIX) {
+    uint32_t count_ge = histogram[tx];
+    uint32_t count_gt = (tx + 1 < RADIX) ? histogram[tx + 1] : 0;
+    if (count_ge > top_k && count_gt <= top_k) {
+      shared_vars[0] = tx;                // threshold
+      shared_vars[1] = top_k - count_gt;  // remaining_k
+    }
+  }
+  __syncthreads();
+
+  uint32_t threshold_bucket = shared_vars[0];
+  uint32_t remaining_k = shared_vars[1];
+
+  // Reset counters
+  if (tx == 0) {
+    shared_vars[2] = 0;  // num_candidates
+    shared_vars[3] = 0;  // output_counter
+  }
+  __syncthreads();
+
+  // Second pass: output elements above threshold, collect at threshold
+  for (uint32_t i = tx; i < row_size; i += BLOCK_THREADS) {
+    float val = static_cast<float>(input[bx * d + start_idx + i]);
+    __half hval = __float2half(val);
+    uint16_t bits = __half_as_ushort(hval);
+    uint16_t ordered = (bits & 0x8000) ? ~bits : (bits ^ 0x8000);
+    uint32_t bucket = ordered >> 8;
+
+    if (bucket > threshold_bucket) {
+      uint32_t pos = atomicAdd(&shared_vars[3], 1);
+      if (pos < top_k) {
+        output_indices[bx * top_k + pos] = static_cast<IdType>(start_idx + i);
+      }
+    } else if (bucket == threshold_bucket && remaining_k > 0) {
+      uint32_t cand_pos = atomicAdd(&shared_vars[2], 1);
+      if (cand_pos < SMEM_CANDIDATE_SIZE) {
+        candidates[0][cand_pos] = static_cast<IdType>(start_idx + i);
+      }
+    }
+  }
+  __syncthreads();
+
+  uint32_t output_pos = shared_vars[3];
+  uint32_t num_candidates = shared_vars[2];
+  uint32_t read_buf = 0;
+
+  // ========== Stage 2-4: Refine using 8-bit chunks from FP32 ==========
+  for (uint32_t round = 0; round < 3 && remaining_k > 0 && num_candidates > 0; ++round) {
+    // Clear histogram
+    for (uint32_t i = tx; i < RADIX + 1; i += BLOCK_THREADS) {
+      histogram[i] = 0;
+    }
+    __syncthreads();
+
+    // Build histogram
+    uint32_t shift = 24 - round * 8;
+    for (uint32_t i = tx; i < num_candidates; i += BLOCK_THREADS) {
+      IdType idx = candidates[read_buf][i];
+      float val = static_cast<float>(input[bx * d + idx]);
+      uint32_t ordered = float_to_ordered_uint32(val);
+      uint32_t bucket = (ordered >> shift) & 0xFF;
+      atomicAdd(&histogram[bucket], 1);
+    }
+    __syncthreads();
+
+    // Suffix sum (thread-safe)
+    {
+      uint32_t val = (tx < RADIX) ? histogram[tx] : 0;
+      __syncthreads();
+      for (uint32_t stride = 1; stride < RADIX; stride *= 2) {
+        uint32_t other = (tx < RADIX && tx + stride < RADIX) ? histogram[tx + stride] : 0;
+        __syncthreads();
+        if (tx < RADIX) {
+          histogram[tx] = val + other;
+        }
+        __syncthreads();
+        val = (tx < RADIX) ? histogram[tx] : 0;
+      }
+    }
+
+    // Find new threshold
+    if (tx < RADIX) {
+      uint32_t count_ge = histogram[tx];
+      uint32_t count_gt = (tx + 1 < RADIX) ? histogram[tx + 1] : 0;
+      if (count_ge > remaining_k && count_gt <= remaining_k) {
+        shared_vars[0] = tx;
+        shared_vars[1] = remaining_k - count_gt;
+      }
+    }
+    __syncthreads();
+
+    threshold_bucket = shared_vars[0];
+    uint32_t new_remaining_k = shared_vars[1];
+
+    // Reset counters
+    if (tx == 0) {
+      shared_vars[3] = 0;  // output counter for this round
+      shared_vars[4] = 0;  // new candidate counter
+    }
+    __syncthreads();
+
+    uint32_t write_buf = 1 - read_buf;
+
+    // Output and collect
+    for (uint32_t i = tx; i < num_candidates; i += BLOCK_THREADS) {
+      IdType idx = candidates[read_buf][i];
+      float val = static_cast<float>(input[bx * d + idx]);
+      uint32_t ordered = float_to_ordered_uint32(val);
+      uint32_t bucket = (ordered >> shift) & 0xFF;
+
+      if (bucket > threshold_bucket) {
+        uint32_t pos = atomicAdd(&shared_vars[3], 1);
+        if (output_pos + pos < top_k) {
+          output_indices[bx * top_k + output_pos + pos] = idx;
+        }
+      } else if (bucket == threshold_bucket && new_remaining_k > 0) {
+        if (round == 2) {
+          uint32_t pos = atomicAdd(&shared_vars[3], 1);
+          if (output_pos + pos < top_k) {
+            output_indices[bx * top_k + output_pos + pos] = idx;
+          }
+        } else {
+          uint32_t cand_pos = atomicAdd(&shared_vars[4], 1);
+          if (cand_pos < SMEM_CANDIDATE_SIZE) {
+            candidates[write_buf][cand_pos] = idx;
+          }
+        }
+      }
+    }
+    __syncthreads();
+
+    output_pos += shared_vars[3];
+    num_candidates = shared_vars[4];
+    remaining_k = new_remaining_k;
+    read_buf = write_buf;
+  }
+}
+
+/*!
+ * \brief Launch Radix Top-K kernel
+ *
+ * \tparam DType Data type of input values
+ * \tparam IdType Data type of indices
+ * \param input Input tensor of shape (batch_size, d)
+ * \param output_indices Output tensor of shape (batch_size, top_k)
+ * \param starts Optional start indices per row
+ * \param ends Optional end indices per row
+ * \param batch_size Number of rows
+ * \param d Number of elements per row
+ * \param top_k Number of top elements to select
+ * \param stream CUDA stream
+ * \return cudaError_t
+ */
+template <typename DType, typename IdType>
+cudaError_t RadixTopK(DType* input, IdType* output_indices, IdType* starts, IdType* ends,
+                      uint32_t batch_size, uint32_t d, uint32_t top_k, cudaStream_t stream = 0) {
+  constexpr uint32_t BLOCK_THREADS = 1024;
+  constexpr uint32_t RADIX = 256;
+  constexpr uint32_t SMEM_CANDIDATE_SIZE = 4096;
+
+  // Shared memory size:
+  // - histogram: (RADIX + 1) uint32_t
+  // - candidates[0]: SMEM_CANDIDATE_SIZE IdType
+  // - candidates[1]: SMEM_CANDIDATE_SIZE IdType
+  // - shared_vars: 5 uint32_t
+  size_t smem_size = (RADIX + 1) * sizeof(uint32_t) +            // histogram
+                     2 * SMEM_CANDIDATE_SIZE * sizeof(IdType) +  // double-buffered candidates
+                     5 * sizeof(uint32_t);                       // shared variables
+
+  dim3 nblks(batch_size);
+  dim3 nthrs(BLOCK_THREADS);
+
+  auto kernel = RadixTopKKernel<BLOCK_THREADS, DType, IdType>;
+  FLASHINFER_CUDA_CALL(
+      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+
+  void* args[] = {&input, &output_indices, &starts, &ends, &batch_size, &d, &top_k};
+  FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+
+  return cudaSuccess;
 }
 
 }  // namespace sampling
