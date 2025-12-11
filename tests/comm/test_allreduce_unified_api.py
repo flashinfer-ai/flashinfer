@@ -1,9 +1,12 @@
-# Check torch version:
+# Test for unified AllReduce API with multiple backends
+# Run with: mpirun -np <num_gpus> pytest tests/comm/test_allreduce_unified_api.py -vv -s
+import os
 import traceback
 from typing import Tuple
 
 import pytest
 import torch
+import torch.distributed as dist
 from mpi4py import MPI
 
 import flashinfer.comm.trtllm_mnnvl_ar as trtllm_mnnvl_ar
@@ -18,6 +21,34 @@ from flashinfer.comm import (
 
 # Use flashinfer.norm.rmsnorm as reference implementation.
 from flashinfer.norm import rmsnorm
+
+
+def init_torch_distributed_from_mpi():
+    """Initialize torch.distributed using MPI rank info."""
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    world_size = comm.Get_size()
+
+    if dist.is_initialized():
+        return
+
+    # Set environment variables for torch.distributed
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "29500"
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+
+    dist.init_process_group(
+        backend="nccl",
+        rank=rank,
+        world_size=world_size,
+    )
+
+
+def cleanup_torch_distributed():
+    """Cleanup torch.distributed if initialized."""
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 @torch.inference_mode()
@@ -156,14 +187,15 @@ def prepare_test_data(seq_len: int, hidden_size: int, dtype: torch.dtype, fusion
     return (x_local, residual, norm_weight), reference_output
 
 
-def run_mnnvl_allreduce_test(
+def run_allreduce_test(
     monkeypatch,
     seq_lens: list[int],
     fusion: bool,
     dtype: torch.dtype,
     hidden_size: int,
+    backend: str,
 ):
-    """Core test logic for MNNVL AllReduce operations using the unified API.
+    """Core test logic for AllReduce operations using the unified API.
 
     Args:
         monkeypatch: pytest monkeypatch fixture
@@ -171,6 +203,7 @@ def run_mnnvl_allreduce_test(
         fusion: Whether to test fused allreduce+rmsnorm or just allreduce
         dtype: Data type for tensors
         hidden_size: Hidden dimension size
+        backend: Backend to use ("auto", "trtllm", "mnnvl")
     """
 
     comm = MPI.COMM_WORLD
@@ -179,7 +212,7 @@ def run_mnnvl_allreduce_test(
     gpus_per_node = torch.cuda.device_count()
 
     if gpus_per_node == 0:
-        pytest.skip("MNNVL allreduce test requires at least one CUDA device per node")
+        pytest.skip("AllReduce test requires at least one CUDA device per node")
     if world_size < 2:
         pytest.skip(f"This test requires at least 2 MPI ranks, got {world_size}")
 
@@ -187,8 +220,15 @@ def run_mnnvl_allreduce_test(
     local_rank = rank % gpus_per_node
     torch.cuda.set_device(local_rank)
 
+    # Initialize torch.distributed for trtllm backend (needed for IPC workspace)
+    # TODO: check if it is ok to do this with auto backend
+    process_group = None
+    if backend in ("trtllm", "auto"):
+        init_torch_distributed_from_mpi()
+        process_group = dist.group.WORLD
+
     if local_rank == 0:
-        print(f"Running MNNVL AllReduce test with {world_size} ranks")
+        print(f"Running AllReduce test with {world_size} ranks, backend={backend}")
         print(f"Rank {rank} using GPU {torch.cuda.current_device()}")
 
     eps = 1e-5
@@ -199,15 +239,18 @@ def run_mnnvl_allreduce_test(
     try:
         # Create workspace using unified API
         workspace = create_allreduce_fusion_workspace(
-            backend="mnnvl",
+            backend=backend,
             world_size=world_size,
             rank=rank,
             max_token_num=max(seq_lens),
             hidden_dim=hidden_size,
             dtype=dtype,
-            topology="single_node",  # MPI handles multi-node
+            topology="single_node",
             gpus_per_node=gpus_per_node,
+            process_group=process_group,
         )
+
+        print(f"Rank {rank}: Created workspace with backend={workspace.backend}")
 
         # Prepare test data for all sequence lengths
         test_data = []
@@ -241,11 +284,11 @@ def run_mnnvl_allreduce_test(
             trtllm_mnnvl_ar.mpi_barrier()
 
             print(
-                f"PASSED[rank={rank}]: seq_len={seq_len}, fusion={fusion}, dtype={dtype}"
+                f"PASSED[rank={rank}]: seq_len={seq_len}, fusion={fusion}, dtype={dtype}, backend={backend}"
             )
 
     except Exception as e:
-        failure_message = f"FAILED[rank={rank}]: seq_lens={seq_lens}, fusion={fusion}, dtype={dtype} failed: {e}"
+        failure_message = f"FAILED[rank={rank}]: seq_lens={seq_lens}, fusion={fusion}, dtype={dtype}, backend={backend} failed: {e}"
         print(failure_message)
         print(traceback.format_exc())
 
@@ -260,6 +303,9 @@ def run_mnnvl_allreduce_test(
     finally:
         if workspace is not None:
             workspace.destroy()
+        # Cleanup torch.distributed if we initialized it
+        if backend in ("trtllm", "auto"):
+            cleanup_torch_distributed()
 
     # Final synchronization
     trtllm_mnnvl_ar.mpi_barrier()
@@ -272,11 +318,17 @@ def run_mnnvl_allreduce_test(
 @pytest.mark.parametrize("fusion", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("hidden_size", [2880, 5120, 7168, 8192])
-def test_mnnvl_allreduce(
-    monkeypatch, seq_lens: list[int], fusion: bool, dtype: torch.dtype, hidden_size: int
+@pytest.mark.parametrize("backend", ["auto", "trtllm", "mnnvl"])
+def test_allreduce_unified(
+    monkeypatch,
+    seq_lens: list[int],
+    fusion: bool,
+    dtype: torch.dtype,
+    hidden_size: int,
+    backend: str,
 ):
-    """Test MNNVL AllReduce with unified API.
-    
-    Run with: mpirun -np <num_gpus> pytest tests/comm/test_trtllm_mnnvl_allreduce.py -vv -s
+    """Test AllReduce with unified API across different backends.
+
+    Run with: mpirun -np <num_gpus> pytest tests/comm/test_allreduce_unified_api.py -vv -s
     """
-    run_mnnvl_allreduce_test(monkeypatch, seq_lens, fusion, dtype, hidden_size)
+    run_allreduce_test(monkeypatch, seq_lens, fusion, dtype, hidden_size, backend)

@@ -76,7 +76,9 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             dtype: The data type of the tensors to be reduced.
             buffer_size_in_bytes: The requested size in bytes for each lamport buffer. The actual allocation size may be larger due to alignment requirements. The actual usable size will be NUM_LAMPORT_BUFFERS * actual_buffer_size_per_lamport_buffer.
         """
+        super().__init__(mapping.world_size, mapping.rank)
 
+        print("Allocating MNNVL Allreduce Fusion Workspace...")
         if buffer_size_in_bytes is None:
             assert (
                 max_num_tokens is not None
@@ -227,13 +229,12 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
     def backend(self) -> str:
         return "mnnvl"
 
-    @property
     def destroy(self) -> None:
         """Destroy workspace and free resources."""
         if self._destroyed:
             return  # Already destroyed, nothing to do
 
-        print("TODO: Implement this properly!")
+        # TODO: Implement proper cleanup of mcast_buffer_handle if needed
         self._destroyed = True
 
 
