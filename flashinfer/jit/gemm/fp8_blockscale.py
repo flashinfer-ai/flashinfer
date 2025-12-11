@@ -22,6 +22,8 @@ def gen_fp8_blockscale_gemm_sm90_module(use_fast_build: bool = False) -> JitSpec
             jit_env.FLASHINFER_CSRC_DIR
             / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.cu",
             jit_env.FLASHINFER_CSRC_DIR / "fp8_blockscale_gemm_sm90_binding.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "fused_moe/cutlass_backend/deepgemm_jit_setup.cu",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/envUtils.cpp",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/logger.cpp",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/stringUtils.cpp",
