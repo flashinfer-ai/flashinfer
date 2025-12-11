@@ -52,7 +52,8 @@ void top_p_renorm_probs(TensorView probs, TensorView renorm_probs,
                         Optional<TensorView> maybe_top_p_arr, double top_p_val);
 
 void top_k_renorm_probs(TensorView probs, TensorView renorm_probs,
-                        Optional<TensorView> maybe_top_k_arr, int64_t top_k_val);
+                        Optional<TensorView> maybe_top_k_arr, int64_t top_k_val,
+                        TensorView row_states_buffer);
 
 void top_k_mask_logits(TensorView logits, TensorView mask_logits,
                        Optional<TensorView> maybe_top_k_arr, int64_t top_k_val,

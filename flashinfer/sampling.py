@@ -350,13 +350,19 @@ def get_sampling_module():
 
     # torch library for top_k_renorm_probs
 
-    @register_custom_op("flashinfer::top_k_renorm_probs", mutates_args=())
+    @register_custom_op(
+        "flashinfer::top_k_renorm_probs", mutates_args=("row_states_buffer",)
+    )
     def top_k_renorm_probs(
         probs: torch.Tensor,
         maybe_top_k_arr: Optional[torch.Tensor],
         top_k_val: int,
+        row_states_buffer: torch.Tensor,
     ) -> torch.Tensor:
-        probs = probs.float()
+        # Support FP32, FP16, BF16
+        assert probs.dtype in [torch.float32, torch.float16, torch.bfloat16], (
+            f"Unsupported dtype {probs.dtype}, expected float32, float16, or bfloat16"
+        )
         maybe_top_k_arr = maybe_top_k_arr.int() if maybe_top_k_arr is not None else None
         renorm_probs = torch.empty_like(probs)
         module.top_k_renorm_probs(
@@ -364,6 +370,7 @@ def get_sampling_module():
             renorm_probs,
             maybe_top_k_arr,
             top_k_val,
+            row_states_buffer,
         )
         return renorm_probs
 
@@ -372,6 +379,7 @@ def get_sampling_module():
         probs: torch.Tensor,
         maybe_top_k_arr: Optional[torch.Tensor],
         top_k_val: int,
+        row_states_buffer: torch.Tensor,
     ) -> torch.Tensor:
         return torch.empty_like(probs)
 
@@ -386,7 +394,10 @@ def get_sampling_module():
         top_k_val: int,
         row_states_buffer: torch.Tensor,
     ) -> torch.Tensor:
-        logits = logits.float()
+        # Support FP32, FP16, BF16
+        assert logits.dtype in [torch.float32, torch.float16, torch.bfloat16], (
+            f"Unsupported dtype {logits.dtype}, expected float32, float16, or bfloat16"
+        )
         maybe_top_k_arr = maybe_top_k_arr.int() if maybe_top_k_arr is not None else None
         mask_logits = torch.empty_like(logits)
 
@@ -406,7 +417,7 @@ def get_sampling_module():
         top_k_val: int,
         row_states_buffer: torch.Tensor,
     ) -> torch.Tensor:
-        return torch.empty_like(logits, dtype=torch.float32)
+        return torch.empty_like(logits)
 
     # torch library for chain_speculative_sampling
 
@@ -1245,6 +1256,7 @@ def top_k_renorm_probs(
     ----------
     probs: torch.Tensor
         Probabilities, shape ``(batch_size, num_classes)``.
+        Supported dtypes: ``float32``, ``float16``, ``bfloat16``.
     top_k: Union[torch.Tensor, int]
         Either a scalar or a tensor of shape ``(batch_size,)``, representing the top-k threshold for for
         for re-normalizing probabilities, should be in ``(0, num_classes)``.
@@ -1256,6 +1268,7 @@ def top_k_renorm_probs(
     -------
     renorm_probs: torch.Tensor
         Renormalized probabilities, shape ``(batch_size, num_classes)``.
+        Same dtype as input ``probs``.
 
     Examples
     --------
@@ -1292,8 +1305,18 @@ def top_k_renorm_probs(
     top_p_renorm_probs
     """
     _check_tensor_param(top_k, probs)
+
+    # Allocate row_states buffer for multi-CTA kernel (1MB is enough for any GPU)
+    buffer_bytes = 1024 * 1024  # 1MB
+    row_states_buffer = _get_cache_buf(
+        f"top_k_renorm_probs_row_states_{probs.device}",
+        buffer_bytes,
+        probs.device,
+        zero_init=True,
+    )
+
     return get_sampling_module().top_k_renorm_probs(
-        probs, *_to_tensor_scalar_tuple(top_k)
+        probs, *_to_tensor_scalar_tuple(top_k), row_states_buffer
     )
 
 
@@ -1309,6 +1332,7 @@ def top_k_mask_logits(
     ----------
     logits: torch.Tensor
         Logits before softmax, shape ``(batch_size, num_classes)``.
+        Supported dtypes: ``float32``, ``float16``, ``bfloat16``.
     top_k: Union[torch.Tensor, int]
         Either a scalar or a tensor of shape ``(batch_size,)``, representing the top-k threshold for for
         for masking logits, should be in ``(0, num_classes)``.
@@ -1320,6 +1344,7 @@ def top_k_mask_logits(
     -------
     masked_logits: torch.Tensor
         Masked logits, shape ``(batch_size, num_classes)``.
+        Same dtype as input ``logits``.
 
     Examples
     --------

@@ -21,8 +21,9 @@ using namespace flashinfer;
 
 using tvm::ffi::Optional;
 
-void radix_topk(TensorView input, TensorView output_indices, Optional<TensorView> maybe_starts,
-                Optional<TensorView> maybe_ends, int64_t top_k) {
+void radix_topk(TensorView input, TensorView output_indices,
+                Optional<TensorView> maybe_output_values,
+                Optional<TensorView> maybe_row_states_buffer, int64_t top_k) {
   CHECK_INPUT(input);
   CHECK_INPUT(output_indices);
   CHECK_DIM(2, input);           // input: (batch_size, d)
@@ -31,17 +32,33 @@ void radix_topk(TensorView input, TensorView output_indices, Optional<TensorView
   unsigned int batch_size = input.size(0);
   unsigned int d = input.size(1);
 
-  bool has_starts = maybe_starts.has_value();
-  bool has_ends = maybe_ends.has_value();
-
   cudaSetDevice(input.device().device_id);
   auto stream = get_stream(input.device());
 
-  cudaError_t status = sampling::RadixTopK<float, int32_t>(
-      static_cast<float*>(input.data_ptr()), static_cast<int32_t*>(output_indices.data_ptr()),
-      has_starts ? static_cast<int32_t*>(maybe_starts.value().data_ptr()) : nullptr,
-      has_ends ? static_cast<int32_t*>(maybe_ends.value().data_ptr()) : nullptr, batch_size, d,
-      static_cast<uint32_t>(top_k), stream);
+  cudaError_t status;
+  auto dtype = input.dtype();
+
+  // Get row_states_buffer if provided (for multi-CTA path)
+  sampling::RadixRowState* row_states_ptr = nullptr;
+  if (maybe_row_states_buffer.has_value()) {
+    row_states_ptr =
+        static_cast<sampling::RadixRowState*>(maybe_row_states_buffer.value().data_ptr());
+  }
+
+  DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP32_FP16(dtype, c_type, [&] {
+    c_type* output_values_ptr = nullptr;
+    if (maybe_output_values.has_value()) {
+      CHECK_INPUT(maybe_output_values.value());
+      CHECK_DIM(2, maybe_output_values.value());
+      output_values_ptr = static_cast<c_type*>(maybe_output_values.value().data_ptr());
+    }
+    status = sampling::RadixTopKMultiCTA<c_type, int32_t>(
+        static_cast<c_type*>(input.data_ptr()), static_cast<int32_t*>(output_indices.data_ptr()),
+        output_values_ptr,  // output_values (nullptr if not writing values)
+        nullptr,            // top_k_arr
+        batch_size, static_cast<uint32_t>(top_k), d, row_states_ptr, stream);
+    return true;
+  });
 
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "RadixTopK failed with error code " << cudaGetErrorString(status);
