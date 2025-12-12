@@ -671,7 +671,19 @@ def testTrtllmFp4BlockScaleMoe(args):
         print(f"[VVERBOSE] gemm1_weights_fp4.shape = {gemm1_weights_fp4.shape}")
         print(f"[VVERBOSE] gemm2_weights_fp4.shape = {gemm2_weights_fp4.shape}")
 
-    def run_fp4_moe():
+    def run_fp4_moe(
+        routing_logits,
+        routing_bias,
+        hidden_states_fp4,
+        hidden_states_scale_linear_fp4,
+        gemm1_weights_fp4,
+        gemm1_weights_scale,
+        gemm2_weights_fp4,
+        gemm2_weights_scale,
+        output1_scale_scalar,
+        output1_scale_gate_scalar,
+        output2_scale_scalar,
+    ):
         return trtllm_fp4_block_scale_moe(
             routing_logits=routing_logits,
             routing_bias=routing_bias,
@@ -716,7 +728,19 @@ def testTrtllmFp4BlockScaleMoe(args):
             )
         with autotune(True):
             for _ in range(warmup_iters):
-                run_fp4_moe()
+                run_fp4_moe(
+                    routing_logits,
+                    routing_bias,
+                    hidden_states_fp4,
+                    hidden_states_scale_linear_fp4,
+                    gemm1_weights_fp4,
+                    gemm1_weights_scale,
+                    gemm2_weights_fp4,
+                    gemm2_weights_scale,
+                    output1_scale_scalar,
+                    output1_scale_gate_scalar,
+                    output2_scale_scalar,
+                )
 
     # Benchmark timing
     times = bench_gpu_time(
@@ -729,6 +753,20 @@ def testTrtllmFp4BlockScaleMoe(args):
         sleep_after_run=False,
         enable_cupti=args.use_cupti,
         use_cuda_graph=is_cuda_graph_compatible,
+        rotate_buffers=True,
+        input_args=(
+            routing_logits,
+            routing_bias,
+            hidden_states_fp4,
+            hidden_states_scale_linear_fp4,
+            gemm1_weights_fp4,
+            gemm1_weights_scale,
+            gemm2_weights_fp4,
+            gemm2_weights_scale,
+            output1_scale_scalar,
+            output1_scale_gate_scalar,
+            output2_scale_scalar,
+        ),
     )
 
     # Compute performance metrics
@@ -887,7 +925,7 @@ def testCutlassFusedMoe(args):
 
     if variant == "base":
 
-        def run_cutlass():
+        def run_cutlass(x, selected_experts, routing_weights, w31_local, w2_local, out):
             return cutlass_fused_moe(
                 x,
                 selected_experts.to(torch.int),
@@ -902,6 +940,15 @@ def testCutlassFusedMoe(args):
                 quant_scales=None,
                 output=out,
             )
+
+        input_args_for_bench = (
+            x,
+            selected_experts,
+            routing_weights,
+            w31_local,
+            w2_local,
+            out,
+        )
 
     elif variant == "fp8":
         # Per-tensor FP8 for weights and activation scale
@@ -938,7 +985,14 @@ def testCutlassFusedMoe(args):
             hidden_states_scale_scalar,
         ]
 
-        def run_cutlass():
+        def run_cutlass(
+            x_quant,
+            selected_experts,
+            routing_weights,
+            w31_weight_fp8,
+            w2_weight_fp8,
+            out,
+        ):
             return cutlass_fused_moe(
                 x_quant,
                 selected_experts.to(torch.int),
@@ -953,6 +1007,15 @@ def testCutlassFusedMoe(args):
                 quant_scales=quant_scales,
                 output=out,
             )
+
+        input_args_for_bench = (
+            x_quant,
+            selected_experts,
+            routing_weights,
+            w31_weight_fp8,
+            w2_weight_fp8,
+            out,
+        )
 
     elif variant == "nvfp4":
         # NVFP4: FP4 block-scale weights, optional quantized input
@@ -1012,7 +1075,9 @@ def testCutlassFusedMoe(args):
             1.0 / (a2_gs * w2_gs),
         ]
 
-        def run_cutlass():
+        def run_cutlass(
+            hidden_states, selected_experts, routing_weights, w1_q, w2_q, out
+        ):
             return cutlass_fused_moe(
                 hidden_states,
                 selected_experts.to(torch.int),
@@ -1028,6 +1093,15 @@ def testCutlassFusedMoe(args):
                 input_sf=input_sf,
                 output=out,
             )
+
+        input_args_for_bench = (
+            hidden_states,
+            selected_experts,
+            routing_weights,
+            w1_q,
+            w2_q,
+            out,
+        )
     else:
         raise ValueError(f"Unknown cutlass_variant: {variant}")
 
@@ -1043,7 +1117,7 @@ def testCutlassFusedMoe(args):
             print(f"[INFO] Autotune warmup for CUTLASS fused MoE: {warmup_iters} iters")
         with autotune(True):
             for _ in range(warmup_iters):
-                run_cutlass()
+                run_cutlass(*input_args_for_bench)
 
     # Measure
     times = bench_gpu_time(
@@ -1056,6 +1130,8 @@ def testCutlassFusedMoe(args):
         sleep_after_run=False,
         enable_cupti=args.use_cupti,
         use_cuda_graph=is_cuda_graph_compatible,
+        rotate_buffers=True,
+        input_args=input_args_for_bench,
     )
 
     median_time = np.median(times)
@@ -1266,7 +1342,16 @@ def testTrtllmFp8BlockScaleMoe(args):
         print(f"[VVERBOSE] gemm1_weights_fp8.shape = {gemm1_weights_fp8.shape}")
         print(f"[VVERBOSE] gemm2_weights_fp8.shape = {gemm2_weights_fp8.shape}")
 
-    def run_fp8_block_moe():
+    def run_fp8_block_moe(
+        routing_logits,
+        routing_bias,
+        hidden_states,
+        hidden_states_scale,
+        kernel_gemm1_weights,
+        gemm1_weights_scale,
+        kernel_gemm2_weights,
+        gemm2_weights_scale,
+    ):
         # Quantize hidden states to FP8 for block scale MOE
         hidden_states_fp8 = hidden_states.to(torch.float8_e4m3fn)
         # Note: FP8 block scale MOE expects int64_t for n_group/topk_group, not Optional[int64_t]
@@ -1305,6 +1390,17 @@ def testTrtllmFp8BlockScaleMoe(args):
         sleep_after_run=False,
         enable_cupti=args.use_cupti,
         use_cuda_graph=is_cuda_graph_compatible,
+        rotate_buffers=True,
+        input_args=(
+            routing_logits,
+            routing_bias,
+            hidden_states,
+            hidden_states_scale,
+            kernel_gemm1_weights,
+            gemm1_weights_scale,
+            kernel_gemm2_weights,
+            gemm2_weights_scale,
+        ),
     )
 
     # Compute performance metrics
@@ -1471,7 +1567,16 @@ def testTrtllmFp8PerTensorScaleMoe(args):
         print(f"[VVERBOSE] gemm1_weights_fp8.shape = {gemm1_weights_fp8.shape}")
         print(f"[VVERBOSE] gemm2_weights_fp8.shape = {gemm2_weights_fp8.shape}")
 
-    def run_fp8_per_tensor_moe():
+    def run_fp8_per_tensor_moe(
+        routing_logits,
+        routing_bias,
+        hidden_states_fp8,
+        gemm1_weights_fp8,
+        output1_scales_scalar,
+        output1_scales_gate_scalar,
+        gemm2_weights_fp8,
+        output2_scales_scalar,
+    ):
         # Note: FP8 per-tensor MOE expects int64_t for n_group/topk_group, not Optional[int64_t]
         # So we convert None to 0 to indicate "no groups" mode
         return trtllm_fp8_per_tensor_scale_moe(
@@ -1506,6 +1611,17 @@ def testTrtllmFp8PerTensorScaleMoe(args):
         sleep_after_run=False,
         enable_cupti=args.use_cupti,
         use_cuda_graph=is_cuda_graph_compatible,
+        rotate_buffers=True,
+        input_args=(
+            routing_logits,
+            routing_bias,
+            hidden_states_fp8,
+            gemm1_weights_fp8,
+            output1_scales_scalar,
+            output1_scales_gate_scalar,
+            gemm2_weights_fp8,
+            output2_scales_scalar,
+        ),
     )
 
     # Compute performance metrics
