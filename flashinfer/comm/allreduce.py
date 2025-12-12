@@ -181,7 +181,7 @@ def _trtllm_workspace_check(
     max_token_num: int,
     hidden_dim: int,
     dtype: torch.dtype,
-    topology: str,
+    topology: Literal["single_node", "multi_node"],
 ) -> bool:
     """
     Check if trtllm backend CAN be used for workspace creation.
@@ -204,7 +204,7 @@ def _mnnvl_workspace_check(
     max_token_num: int,
     hidden_dim: int,
     dtype: torch.dtype,
-    topology: str,
+    topology: Literal["single_node", "multi_node"],
 ) -> bool:
     """
     Check if mnnvl backend CAN be used for workspace creation.
@@ -230,7 +230,7 @@ def _workspace_creation_heuristic(
     max_token_num: int,
     hidden_dim: int,
     dtype: torch.dtype,
-    topology: str,
+    topology: Literal["single_node", "multi_node"],
 ) -> list[str]:
     """
     Select best backend for workspace creation based on performance.
@@ -290,7 +290,7 @@ def create_allreduce_fusion_workspace(
     max_token_num: int = None,
     hidden_dim: int = None,
     dtype: torch.dtype = None,
-    topology: str = "single_node",
+    topology: Literal["single_node", "multi_node"] = "single_node",
     process_group: Optional["torch.distributed.ProcessGroup"] = None,
     gpus_per_node: int = None,
     comm_backend: Optional[CommBackend] = None,
