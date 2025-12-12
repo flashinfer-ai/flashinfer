@@ -141,6 +141,30 @@ CUTLASS_DEVICE void permute_regs_A_to_C(Fragment& accum) {
   }
 }
 
+// Permute output registers for FP8 kernel before writing to smem
+// This undoes the register permutation from the FP8 MMA
+// out has shape ((2, 2, N / 8), MMA_M, MMA_N), each element is 32 bits (float)
+template <typename Fragment>
+CUTLASS_DEVICE void permute_output_fp8(Fragment& out) {
+  static_assert(decltype(size<0, 0>(out))::value == 2);
+  static_assert(decltype(size<0, 1>(out))::value == 2);
+  static_assert(decltype(size<0, 2>(out))::value % 2 == 0);
+  static_assert(decltype(stride<0, 0>(out))::value == 1);
+  static_assert(sizeof(typename Fragment::value_type) == 4);
+  Tensor frag = group_modes<1, 3>(out);  // ((2, 2, N / 8), (MMA_M, MMA_N))
+#pragma unroll
+  for (int mi = 0; mi < size<1>(frag); ++mi) {
+#pragma unroll
+    for (int j = 0; j < size<0, 1>(frag); ++j) {
+#pragma unroll
+      for (int i = 0; i < size<0, 2>(frag) / 2; ++i) {
+        cutlass::swap(frag(make_coord(_1{}, j, 2 * i), mi),
+                      frag(make_coord(_0{}, j, 2 * i + 1), mi));
+      }
+    }
+  }
+}
+
 template <typename To_type, typename Engine, typename Layout>
 __forceinline__ __device__ auto convert_type(Tensor<Engine, Layout> const& tensor) {
   using From_type = typename Engine::value_type;
