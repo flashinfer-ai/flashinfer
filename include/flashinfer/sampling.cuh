@@ -1878,7 +1878,7 @@ __device__ __forceinline__ void wait_ge(int* ptr, int target_val, int thread_idx
 
 // Global state for multi-CTA radix reduction (one per group)
 struct RadixRowState {
-  uint32_t histogram[2][256];  // Double-buffered histograms for ping-pong
+  uint32_t histogram[3][256];  // Triple-buffered histograms for 1-barrier-per-round
   uint32_t remaining_k;        // Remaining k after current round
   uint32_t prefix;             // Accumulated prefix (high bits of k-th element)
   int arrival_counter;         // For inter-CTA synchronization
@@ -2020,27 +2020,27 @@ template <uint32_t BLOCK_THREADS, bool SINGLE_CTA, typename OrderedType>
 __device__ __forceinline__ void RadixSelectOneRound(
     const OrderedType* shared_ordered, uint32_t actual_chunk_size, uint32_t* local_histogram,
     uint32_t* suffix_sum, uint32_t* shared_scalars, RadixRowState* state, uint32_t prefix,
-    uint32_t remaining_k, uint32_t round, int& barrier_phase, uint32_t ctas_per_group, uint32_t tx,
-    uint32_t* out_new_prefix, uint32_t* out_new_remaining_k) {
+    uint32_t remaining_k, uint32_t round, uint32_t iter, int& barrier_phase,
+    uint32_t ctas_per_group, uint32_t cta_in_group, uint32_t tx, uint32_t* out_new_prefix,
+    uint32_t* out_new_remaining_k) {
   constexpr uint32_t RADIX = 256;
   constexpr uint32_t ORDERED_BITS = sizeof(OrderedType) * 8;
   constexpr uint32_t RADIX_BITS = 8;
+  constexpr uint32_t NUM_ROUNDS = ORDERED_BITS / RADIX_BITS;
   uint32_t shift = ORDERED_BITS - (round + 1) * RADIX_BITS;
+  uint32_t global_round = iter * NUM_ROUNDS + round;
 
-  // For multi-CTA: pointers to global histograms
+  // For multi-CTA: pointers to global histograms (triple buffer)
   uint32_t* current_hist = nullptr;
-  uint32_t* other_hist = nullptr;
+  uint32_t* next_hist = nullptr;
   if constexpr (!SINGLE_CTA) {
-    current_hist = state->histogram[round % 2];
-    other_hist = state->histogram[(round + 1) % 2];
+    current_hist = state->histogram[global_round % 3];
+    next_hist = state->histogram[(global_round + 1) % 3];
   }
 
-  // Clear local histogram AND (for multi-CTA) clear the "other" global histogram
+  // Clear local histogram only
   for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
     local_histogram[i] = 0;
-    if constexpr (!SINGLE_CTA) {
-      other_hist[i] = 0;  // Prepare for next round
-    }
   }
   __syncthreads();
 
@@ -2049,16 +2049,24 @@ __device__ __forceinline__ void RadixSelectOneRound(
                                                        local_histogram, prefix, shift, round, tx);
   __syncthreads();
 
-  // For multi-CTA: add to global histogram and barrier
+  // For multi-CTA: write -> (leading CTA clears next) -> barrier -> read
   // For single-CTA: local_histogram is already the complete histogram
   if constexpr (!SINGLE_CTA) {
+    // Accumulate local histogram to global
     for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
       if (local_histogram[i] > 0) {
         atomicAdd(&current_hist[i], local_histogram[i]);
       }
     }
 
-    // Barrier: wait for all CTAs to finish histogram accumulation
+    // Only leading CTA clears next round's histogram BEFORE barrier
+    if (cta_in_group == 0) {
+      for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
+        next_hist[i] = 0;
+      }
+    }
+
+    // Barrier: wait for all CTAs to finish atomicAdd and clearing
     if (tx == 0) {
       red_release(&state->arrival_counter, 1);
     }
@@ -2067,7 +2075,7 @@ __device__ __forceinline__ void RadixSelectOneRound(
     barrier_phase++;
     __syncthreads();
 
-    // Load from global histogram to suffix_sum
+    // Read current histogram (after barrier, all atomicAdds are complete)
     for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
       suffix_sum[i] = current_hist[i];
     }
@@ -2121,7 +2129,7 @@ __device__ __forceinline__ DType RadixSelectFindPivot(
     const DType* input, typename RadixTopKTraits<DType>::OrderedType* shared_ordered,
     uint32_t* local_histogram, uint32_t* suffix_sum, uint32_t* shared_scalars, RadixRowState* state,
     uint32_t chunk_start, uint32_t actual_chunk_size, uint32_t k, int& barrier_phase,
-    uint32_t ctas_per_group, uint32_t tx) {
+    uint32_t ctas_per_group, uint32_t cta_in_group, uint32_t tx, uint32_t iter = 0) {
   using Traits = RadixTopKTraits<DType>;
   using OrderedType = typename Traits::OrderedType;
   constexpr uint32_t RADIX = 256;
@@ -2151,16 +2159,8 @@ __device__ __forceinline__ DType RadixSelectFindPivot(
   uint32_t prefix = 0;
   uint32_t remaining_k = k;
 
-  // Clear global histograms (only needed for multi-CTA)
-  if constexpr (!SINGLE_CTA) {
-    for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
-      state->histogram[0][i] = 0;
-      state->histogram[1][i] = 0;
-    }
-  }
-  __syncthreads();
-
   // Initial barrier (skip for single CTA)
+  // Histograms are pre-cleared externally (Python side) and cleared at end of each iteration
   if constexpr (!SINGLE_CTA) {
     if (tx == 0) {
       red_release(&state->arrival_counter, 1);
@@ -2172,12 +2172,13 @@ __device__ __forceinline__ DType RadixSelectFindPivot(
   }
 
   // Stage 2: NUM_ROUNDS of radix select
+  // Double buffer with leading CTA clearing at start of each round
   for (uint32_t round = 0; round < NUM_ROUNDS; ++round) {
     uint32_t new_prefix, new_remaining_k;
     RadixSelectOneRound<BLOCK_THREADS, SINGLE_CTA, OrderedType>(
         shared_ordered, actual_chunk_size, local_histogram, suffix_sum, shared_scalars, state,
-        prefix, remaining_k, round, barrier_phase, ctas_per_group, tx, &new_prefix,
-        &new_remaining_k);
+        prefix, remaining_k, round, iter, barrier_phase, ctas_per_group, cta_in_group, tx,
+        &new_prefix, &new_remaining_k);
     prefix = new_prefix;
     remaining_k = new_remaining_k;
     __syncthreads();
@@ -2304,13 +2305,6 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKMaskLogitsKernel_Multi
       prefix_cache = 0;
       remaining_k_cache = k;
     }
-    // Clear global histograms (only needed for multi-CTA)
-    if constexpr (!SINGLE_CTA) {
-      for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
-        state->histogram[0][i] = 0;
-        state->histogram[1][i] = 0;
-      }
-    }
     __syncthreads();
 
     // Barrier to ensure all CTAs have arrived at this iteration (skip for single CTA)
@@ -2325,29 +2319,27 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKMaskLogitsKernel_Multi
     }
 
     // ========== Stage 2: NUM_ROUNDS of radix select ==========
-    // Using double-buffering: round N uses histogram[N % 2]
-    // Round N clears histogram[(N+1) % 2] for next round's use
+    // Triple-buffer optimization: only 1 barrier per round
+    // - Use global_round = iter * NUM_ROUNDS + round for buffer indexing
+    // - Only leading CTA clears next buffer before barrier
     for (uint32_t round = 0; round < NUM_ROUNDS; ++round) {
+      uint32_t global_round = iter * NUM_ROUNDS + round;
       uint32_t shift = ORDERED_BITS - (round + 1) * RADIX_BITS;
       // Read from local cache (no global memory access needed!)
       uint32_t prefix = prefix_cache;
       uint32_t remaining_k = remaining_k_cache;
 
-      // For multi-CTA: pointers to global histograms
-      // For single-CTA: these are not used
+      // For multi-CTA: pointers to global histograms (triple buffer)
       uint32_t* current_hist = nullptr;
-      uint32_t* other_hist = nullptr;
+      uint32_t* next_hist = nullptr;
       if constexpr (!SINGLE_CTA) {
-        current_hist = state->histogram[round % 2];
-        other_hist = state->histogram[(round + 1) % 2];
+        current_hist = state->histogram[global_round % 3];
+        next_hist = state->histogram[(global_round + 1) % 3];
       }
 
-      // Clear local histogram AND (for multi-CTA) clear the "other" global histogram
+      // Clear local histogram only
       for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
         local_histogram[i] = 0;
-        if constexpr (!SINGLE_CTA) {
-          other_hist[i] = 0;  // Prepare for next round (no barrier needed!)
-        }
       }
       __syncthreads();
 
@@ -2368,16 +2360,24 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKMaskLogitsKernel_Multi
       }
       __syncthreads();
 
-      // For multi-CTA: add to global histogram and barrier
+      // For multi-CTA: write -> (leading CTA clears next) -> barrier -> read
       // For single-CTA: local_histogram is already the complete histogram
       if constexpr (!SINGLE_CTA) {
+        // Accumulate local histogram to global
         for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
           if (local_histogram[i] > 0) {
             atomicAdd(&current_hist[i], local_histogram[i]);
           }
         }
 
-        // Barrier: wait for all CTAs to finish histogram accumulation
+        // Only leading CTA clears next round's histogram BEFORE barrier
+        if (cta_in_group == 0) {
+          for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
+            next_hist[i] = 0;
+          }
+        }
+
+        // Barrier: wait for all CTAs to finish atomicAdd and clearing
         if (tx == 0) {
           red_release(&state->arrival_counter, 1);
         }
@@ -2386,7 +2386,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKMaskLogitsKernel_Multi
         barrier_phase++;
         __syncthreads();
 
-        // Load from global histogram to suffix_sum
+        // Read current histogram (after barrier, all atomicAdds are complete)
         for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
           suffix_sum[i] = current_hist[i];
         }
@@ -2439,9 +2439,6 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKMaskLogitsKernel_Multi
         remaining_k_cache = found_remaining_k;
       }
       __syncthreads();
-
-      // No second barrier needed! Double-buffering allows next round to proceed
-      // because it uses a different histogram (other_hist is already cleared)
     }
 
     // Convert final ordered representation back to DType pivot using type traits
@@ -2469,10 +2466,19 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKMaskLogitsKernel_Multi
     }
   }
 
-  // Reset arrival counter for next kernel launch (only for multi-CTA)
+  // Clear histogram buffers and reset arrival counter for next kernel launch (only for multi-CTA)
   if constexpr (!SINGLE_CTA) {
-    if (cta_in_group == 0 && tx == 0) {
-      st_release(&state->arrival_counter, 0);
+    // Only leading CTA clears the buffers using release semantics
+    if (cta_in_group == 0) {
+      for (uint32_t buf = 0; buf < 3; ++buf) {
+        for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
+          state->histogram[buf][i] = 0;
+        }
+      }
+
+      if (tx == 0) {
+        st_release(&state->arrival_counter, 0);
+      }
     }
   }
 
@@ -2710,7 +2716,8 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKRenormProbKernel_Multi
     // ========== Stage 1: Find pivot using RadixSelectFindPivot ==========
     pivot = RadixSelectFindPivot<BLOCK_THREADS, VEC_SIZE, SINGLE_CTA, DType>(
         probs + row_idx * vocab_size, shared_ordered, local_histogram, suffix_sum, shared_scalars,
-        state, chunk_start, actual_chunk_size, k, barrier_phase, ctas_per_group, tx);
+        state, chunk_start, actual_chunk_size, k, barrier_phase, ctas_per_group, cta_in_group, tx,
+        iter);
 
     // ========== Stage 2: Compute sum of elements >= pivot ==========
     float thread_sum = 0.0f;
@@ -2798,10 +2805,19 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKRenormProbKernel_Multi
     }
   }
 
-  // Reset arrival counter for next kernel launch (only for multi-CTA)
+  // Clear histogram buffers and reset arrival counter for next kernel launch (only for multi-CTA)
   if constexpr (!SINGLE_CTA) {
-    if (cta_in_group == 0 && tx == 0) {
-      st_release(&state->arrival_counter, 0);
+    // Only leading CTA clears the buffers using release semantics
+    if (cta_in_group == 0) {
+      for (uint32_t buf = 0; buf < 3; ++buf) {
+        for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
+          state->histogram[buf][i] = 0;
+        }
+      }
+
+      if (tx == 0) {
+        st_release(&state->arrival_counter, 0);
+      }
     }
   }
 }
@@ -2999,13 +3015,6 @@ __global__ void __launch_bounds__(BLOCK_THREADS)
         shared_output_counter = 0;  // Use shared memory counter for single CTA
       }
     }
-    // Clear global histograms (only needed for multi-CTA)
-    if constexpr (!SINGLE_CTA) {
-      for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
-        state->histogram[0][i] = 0;
-        state->histogram[1][i] = 0;
-      }
-    }
     __syncthreads();
 
     // Barrier to ensure all CTAs have arrived at this iteration (skip for single CTA)
@@ -3018,37 +3027,34 @@ __global__ void __launch_bounds__(BLOCK_THREADS)
       barrier_phase++;
       __syncthreads();
 
-      // CTA 0 clears output counter AFTER barrier
+      // CTA 0 clears output counter AFTER barrier (needed for every iteration)
       if (cta_in_group == 0 && tx == 0) {
         st_release(&state->output_counter, 0);
       }
-      __syncthreads();
     }
 
     // ========== Stage 2: NUM_ROUNDS of radix select ==========
-    // Using double-buffering: round N uses histogram[N % 2]
-    // Round N clears histogram[(N+1) % 2] for next round's use
+    // Triple-buffer optimization: only 1 barrier per round
+    // - Use global_round = iter * NUM_ROUNDS + round for buffer indexing
+    // - Only leading CTA clears next buffer before barrier
     for (uint32_t round = 0; round < NUM_ROUNDS; ++round) {
+      uint32_t global_round = iter * NUM_ROUNDS + round;
       uint32_t shift = ORDERED_BITS - (round + 1) * RADIX_BITS;
       // Read from local cache (no global memory access needed!)
       uint32_t prefix = prefix_cache;
       uint32_t remaining_k = remaining_k_cache;
 
-      // For multi-CTA: pointers to global histograms
-      // For single-CTA: these are not used
+      // For multi-CTA: pointers to global histograms (triple buffer)
       uint32_t* current_hist = nullptr;
-      uint32_t* other_hist = nullptr;
+      uint32_t* next_hist = nullptr;
       if constexpr (!SINGLE_CTA) {
-        current_hist = state->histogram[round % 2];
-        other_hist = state->histogram[(round + 1) % 2];
+        current_hist = state->histogram[global_round % 3];
+        next_hist = state->histogram[(global_round + 1) % 3];
       }
 
-      // Clear local histogram AND (for multi-CTA) clear the "other" global histogram
+      // Clear local histogram only
       for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
         local_histogram[i] = 0;
-        if constexpr (!SINGLE_CTA) {
-          other_hist[i] = 0;  // Prepare for next round (no barrier needed!)
-        }
       }
       __syncthreads();
 
@@ -3068,16 +3074,24 @@ __global__ void __launch_bounds__(BLOCK_THREADS)
       }
       __syncthreads();
 
-      // For multi-CTA: add to global histogram and barrier
+      // For multi-CTA: write -> (leading CTA clears next) -> barrier -> read
       // For single-CTA: local_histogram is already the complete histogram
       if constexpr (!SINGLE_CTA) {
+        // Accumulate local histogram to global
         for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
           if (local_histogram[i] > 0) {
             atomicAdd(&current_hist[i], local_histogram[i]);
           }
         }
 
-        // Barrier: wait for all CTAs to finish histogram accumulation
+        // Only leading CTA clears next round's histogram BEFORE barrier
+        if (cta_in_group == 0) {
+          for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
+            next_hist[i] = 0;
+          }
+        }
+
+        // Barrier: wait for all CTAs to finish atomicAdd and clearing
         if (tx == 0) {
           red_release(&state->arrival_counter, 1);
         }
@@ -3086,7 +3100,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS)
         barrier_phase++;
         __syncthreads();
 
-        // Load from global histogram to suffix_sum
+        // Read current histogram (after barrier, all atomicAdds are complete)
         for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
           suffix_sum[i] = current_hist[i];
         }
@@ -3237,10 +3251,19 @@ __global__ void __launch_bounds__(BLOCK_THREADS)
     // ensures all CTAs complete Stage 3 before output_counter is reset
   }
 
-  // Reset arrival counter for next kernel launch (only for multi-CTA)
+  // Clear histogram buffers and reset arrival counter for next kernel launch (only for multi-CTA)
   if constexpr (!SINGLE_CTA) {
-    if (cta_in_group == 0 && tx == 0) {
-      st_release(&state->arrival_counter, 0);
+    // Only leading CTA clears the buffers using release semantics
+    if (cta_in_group == 0) {
+      for (uint32_t buf = 0; buf < 3; ++buf) {
+        for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
+          state->histogram[buf][i] = 0;
+        }
+      }
+
+      if (tx == 0) {
+        st_release(&state->arrival_counter, 0);
+      }
     }
   }
 
