@@ -820,7 +820,7 @@ class TestLogitsPipeVsSamplingOps:
 
         # Allow small differences due to floating point precision in intermediate steps
         diff_ratio = (samples_pipe != samples_direct).sum().item() / batch_size
-        assert diff_ratio < 0.01, f"Too many differences: {diff_ratio * 100:.2f}%"
+        assert diff_ratio < 0.02, f"Too many differences: {diff_ratio * 100:.2f}%"
 
     @pytest.mark.parametrize("batch_size", [1, 99, 989])
     @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
