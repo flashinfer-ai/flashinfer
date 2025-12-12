@@ -26,7 +26,8 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-from typing import Optional, Tuple, Type, Union
+import functools
+from typing import Callable, Optional, Tuple, Type, Union, List
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -36,28 +37,35 @@ import cutlass.torch as cutlass_torch
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
-import torch
-import functools
+import cutlass.utils.distributed_helpers as distributed_helpers
 from cutlass._mlir import ir
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import from_dlpack
-
 from cutlass.cutlass_dsl import (
-    Int32,
-    Int64,
-    Uint8,
-    Uint64,
     T,
     Integer,
     dsl_user_op,
     extract_mlir_values,
     new_from_mlir_values,
 )
+from cutlass.cute.typing import (
+    Int32,
+    Int64,
+    Uint8,
+    Uint64,
+    Float16,
+    BFloat16,
+    Float32,
+    Float8E4M3FN,
+    Float8E5M2,
+    Tensor,
+)
 from cutlass._mlir.dialects import llvm
-from flashinfer.utils import get_compute_capability
 from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
+import torch
+
+from flashinfer.utils import get_compute_capability
 from .utils import get_cutlass_dtype, cutlass_to_torch_dtype, get_num_sm, make_ptr
-from typing import Callable, List
 
 
 sizeof_i32 = 4
@@ -397,6 +405,7 @@ using CUTE DSL.
 - Matrix A is MxKxL, L is batch dimension, A can be row-major("K") or column-major("M") for MXF8 input type and can only be row-major("K") for MXF4/NVF4 input type
 - Matrix B is NxKxL, L is batch dimension, B can be row-major("N") or column-major("K") for MXF8 input type and can only be row-major("K") for MXF4/NVF4 input type
 - Matrix C is MxNxL, L is batch dimension, C can be row-major("N") or column-major("M")
+- Matrix C_mc is a multicast C matrix that changes can be broadcasted to all GPUs by multimem instructions (needed only for all-reduce epilogue)
 - Matrix SFA layout is filled internally according to A shape and BlockScaledBasicChunk, which has M×ceil_div(K, sf_vec_size)×L elements respectively
 - Matrix SFB layout is filled internally according to B shape and BlockScaledBasicChunk, which has N×ceil_div(K, sf_vec_size)×L elements respectively
 
@@ -406,6 +415,7 @@ This GEMM kernel supports the following features:
     - Implements TMA multicast with cluster to reduce L2 memory traffic
     - Support persistent tile scheduling to better overlap memory load/store with mma between tiles
     - Support warp specialization to avoid explicit pipelining between mainloop load and mma
+    - Support all-reduce epilogue with multimem instructions to distribute the workload to all GPUs
 
 This GEMM works as follows:
 1. DMA warp: Load A and B matrices from global memory (GMEM) to shared memory (SMEM) using TMA operations.
@@ -417,6 +427,13 @@ This GEMM works as follows:
     - Type convert C matrix to output type.
     - Optionally store C matrix from registers (RMEM) to shared memory (SMEM) to global memory (GMEM) with TMA operations,
       or directly store C matrix from registers (RMEM) to global memory (GMEM) without TMA operations.
+4. All reduce epilogue:
+    - Load and reduce the 128bit data from all ranks by multimem instructions.
+    - Broadcast the reduced data to all ranks by multimem instructions.
+    - current implementation only supports two_shot all-reduce which means each rank only computes a portion of
+      the output tensor and broadcast the result to all ranks.
+    - the all-reduce epilogue is only supported when use_tma_store is True.
+    - the all-reduce epilogue is only supported when c_dtype is Float16, Float32, BFloat16, Float8E4M3FN, Float8E5M2.
 
 SM100 tcgen05.mma.kind.block_scale instructions operate as follows:
 - Read matrix A from SMEM
@@ -436,6 +453,16 @@ Input arguments to this example is shown below:
       --mma_tiler_mn 256,128 --cluster_shape_mn 2,1                            \
       --mnkl 8192,8192,1024,1
 
+to run with all reduce epilogue (only on multi-GPU with NVLink):
+
+.. code-block:: bash
+
+    torchrun --nproc-per-node 8 examples/blackwell/dense_blockscaled_gemm_persistent.py            \
+      --ab_dtype Float4E2M1FN --sf_dtype Float8E8M0FNU --sf_vec_size 16        \
+      --c_dtype Float16                                                        \
+      --mma_tiler_mn 256,128 --cluster_shape_mn 2,1                            \
+      --mnkl 8192,8192,1024,1 --all_reduce two_shot
+
 To collect performance with NCU profiler:
 
 .. code-block:: bash
@@ -445,7 +472,8 @@ To collect performance with NCU profiler:
       --c_dtype Float16                                                        \
       --mma_tiler_mn 256,128 --cluster_shape_mn 2,1                            \
       --mnkl 8192,8192,1024,1                                                  \
-      --warmup_iterations 1 --iterations 10 --skip_ref_check
+      --warmup_iterations 1 --iterations 10 --skip_ref_check                    \
+      --all_reduce two_shot
 
 
 Constraints:
@@ -458,6 +486,7 @@ Constraints:
 * Cluster shape M must be multiple of 2 if Mma tiler M is 256(use_2cta_instrs)
 * The contiguous dimension of A/B/C tensors must be at least 16 bytes aligned,
   i.e, number of elements is a multiple of 16 and 32 for Float8 and Float4, respectively.
+* when all_reduce is not "none", M and N must be multiple of 128, world_size must be 8
 """
 
 
@@ -471,6 +500,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
     :type mma_tiler_mn: Tuple[int, int]
     :param cluster_shape_mn: Cluster dimensions (M,N) for parallel processing
     :type cluster_shape_mn: Tuple[int, int]
+    :param all_reduce: All-reduce mode, can be "none", "two_shot"
+    :type all_reduce: str
 
     :note: In current version, A and B tensor must have the same data type
         - i.e., Float8E4M3FN for A and Float8E5M2 for B is not supported
@@ -509,6 +540,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
         sm_version: str,
+        all_reduce="none",
     ):
         """Initializes the configuration for a Blackwell dense GEMM kernel.
 
@@ -545,6 +577,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
         )
 
+        self.all_reduce = all_reduce
+
         self.occupancy = 1
         # Set specialized warp ids
         self.epilog_warp_id = (
@@ -555,16 +589,33 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         )
         self.mma_warp_id = 4
         self.tma_warp_id = 5
+        self.all_reduce_warp_id: Tuple[int, ...] = ()
+        self.all_reduce = "none"
+        if all_reduce != "none":
+            self.all_reduce = all_reduce
+            self.all_reduce_warp_id = (6, 7, 8, 9)
         self.threads_per_cta = 32 * len(
-            (self.mma_warp_id, self.tma_warp_id, *self.epilog_warp_id)
+            (
+                self.mma_warp_id,
+                self.tma_warp_id,
+                *self.epilog_warp_id,
+                *self.all_reduce_warp_id,
+            )
         )
         # Set barrier id for cta sync, epilogue sync and tmem ptr sync
         self.cta_sync_bar_id = 0
         self.epilog_sync_bar_id = 1
         self.tmem_ptr_sync_bar_id = 2
+        self.all_reduce_sync_bar_id = 3
         self.smem_capacity = utils.get_smem_capacity_in_bytes(sm_version)
         SM100_TMEM_CAPACITY_COLUMNS = 512
         self.num_tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
+
+        self.num_ranks = 1
+        self.rank_id = 0
+        if all_reduce != "none":
+            self.num_ranks = torch.distributed.get_world_size()
+            self.rank_id = torch.distributed.get_rank()
 
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
@@ -721,6 +772,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         alpha_tensor: Optional[cute.Tensor],
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
+        c_mc: cute.Tensor = None,
+        barrier_flag: cute.Tensor = None,
+        barrier_flag_mc: cute.Tensor = None,
     ):
         """Execute the GEMM operation in steps:
         - Setup static attributes before smem/grid/tma computation
@@ -746,6 +800,12 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         :param stream: CUDA stream for asynchronous execution
         :type stream: cuda.CUstream
         :param alpha_tensor: Optional 1D tensor of shape (l,) containing per-batch scaling factors.
+        :param c_mc: Output symmetric tensor C_mc, any write or read to a multicast tensor will be broadcasted to all GPUs
+        :type c_mc: cute.Tensor
+        :param barrier_flag: Barrier flag to sync between peers
+        :type barrier_flag: cute.Tensor
+        :param barrier_flag_mc: Multicast barrier flag to sync between peers
+        :type barrier_flag_mc: cute.Tensor
         :type alpha_tensor: cute.Tensor
         :raises TypeError: If input data types are incompatible with the MMA instruction.
         """
@@ -962,6 +1022,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             self.c_smem_layout_staged,
             self.epi_tile,
             self.tile_sched_params,
+            c_mc,
+            barrier_flag,
+            barrier_flag_mc,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -997,6 +1060,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         c_smem_layout_staged: Union[cute.Layout, cute.ComposedLayout, None],
         epi_tile: cute.Tile,
         tile_sched_params: MaskedSchedulerParams,
+        c_mc: cute.Tensor,
+        barrier_flag: cute.Tensor,
+        barrier_flag_mc: cute.Tensor,
     ):
         """
         GPU device kernel performing the Persistent batched GEMM computation.
@@ -1015,7 +1081,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             cpasync.prefetch_descriptor(tma_atom_c)
 
         use_2cta_instrs = cute.size(tiled_mma.thr_id.shape) == 2
-
         #
         # Setup cta/thread coordinates
         #
@@ -1797,6 +1862,24 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 acc_consumer_state.advance()
 
                 #
+                # Allreduce
+                #
+                if cutlass.const_expr(self.all_reduce == "two_shot"):
+                    tile_id = Int32(
+                        tile_sched._current_work_linear_idx
+                        * cute.size(self.cluster_shape_mn)
+                        + cute.arch.block_idx_in_cluster()
+                    )
+                    if warp_idx == self.epilog_warp_id[0]:
+                        cute.arch.cp_async_bulk_wait_group(0, read=False)
+                        # System barrier to make sure that data from each GPU is in memory before allreduce
+                        with cute.arch.elect_one():
+                            flag = barrier_flag_mc.iterator + tile_id
+                            cute.arch.fence_acq_rel_gpu()
+                            distributed_helpers.spin_lock_multimem_arrive(flag)
+                            cute.arch.fence_proxy(cute.arch.ProxyKind.alias)
+
+                #
                 # Advance to next tile
                 #
                 tile_sched.advance_to_next_work()
@@ -1850,6 +1933,147 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
 
             else:
                 c_pipeline.producer_tail()
+
+        # ///////////////////////////////////////////////////////////////////////////////
+        #  Allreduce warps
+        # ///////////////////////////////////////////////////////////////////////////////
+        if cutlass.const_expr(self.all_reduce == "two_shot"):
+            if warp_idx >= self.all_reduce_warp_id[0]:
+                # ///////////////////////////////////////////////////////////////////////////////
+                # Add persistent tile loop
+                # ///////////////////////////////////////////////////////////////////////////////
+
+                rank_id = self.rank_id
+                num_ranks = Int32(self.num_ranks)
+                lane_id = cute.arch.lane_idx()  # noqa
+
+                # tile_sched = utils.StaticPersistentTileScheduler.create(
+                #     tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+                # )
+                tile_sched = MaskedScheduler.create(
+                    tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+                )
+                work_tile = tile_sched.initial_work_tile_info()
+
+                # we want 128bit ld/st for better performance
+                atom_val = 128 // c_mc.element_type.width
+                atom_thr_n = self.mma_tiler[1] // atom_val
+                atom_thr_m = len(self.all_reduce_warp_id) * (
+                    cute.arch.WARP_SIZE // atom_thr_n
+                )
+                thr_layout = cute.make_layout(
+                    (atom_thr_m, atom_thr_n), stride=(atom_thr_n, 1)
+                )
+                val_layout = cute.make_layout((1, atom_val), stride=(atom_val, 1))
+
+                copy_atom_load = cute.make_copy_atom(
+                    cute.nvgpu.CopyUniversalOp(), c_mc.element_type
+                )
+                tiled_copy_fake = cute.make_tiled_copy_tv(
+                    copy_atom_load, thr_layout, val_layout
+                )
+                thr_copy_fake = tiled_copy_fake.get_slice(
+                    tidx - self.all_reduce_warp_id[0] * 32
+                )
+
+                while work_tile.is_valid_tile:
+                    cur_tile_coord = work_tile.tile_idx
+                    tile_id = Int32(
+                        tile_sched._current_work_linear_idx
+                        * cute.size(self.cluster_shape_mn)
+                        + cute.arch.block_idx_in_cluster()
+                    )
+                    mma_tile_coord_mnl = (
+                        cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape),
+                        cur_tile_coord[1],
+                        cur_tile_coord[2],
+                    )
+
+                    # System barrier to make sure that data from each GPU is in memory before allreduce
+                    if warp_idx == self.all_reduce_warp_id[0]:
+                        with cute.arch.elect_one():
+                            flag = barrier_flag.iterator + tile_id
+                            # TODO: we may use LDG+STG for spin lock instead of ATOMIC_CAS for better performance.
+                            distributed_helpers.spin_lock_wait(flag, num_ranks)
+
+                    cute.arch.barrier(
+                        barrier_id=self.all_reduce_sync_bar_id,
+                        number_of_threads=32 * len(self.all_reduce_warp_id),
+                    )
+                    # partition and slice at tile level
+                    gC_mc = cute.local_tile(
+                        c_mc,
+                        cute.slice_(self.mma_tiler, (None, None, 0)),
+                        (None, None, None),
+                    )
+                    tCgC_mc = thr_mma.partition_C(gC_mc)
+                    tCgC_mc_slice = tCgC_mc[((None, None), 0, 0, *mma_tile_coord_mnl)]
+
+                    # partition based on the number of GPUs
+                    cta_mma_tile_m = self.mma_tiler[0] // cute.size(
+                        tiled_mma.thr_id.shape
+                    )
+                    m_local_rank = int(cta_mma_tile_m / self.num_ranks)
+                    tCgC_mc_slice_partitioned = cute.zipped_divide(
+                        tCgC_mc_slice, (m_local_rank, self.mma_tiler[1])
+                    )
+                    tCgC_mc_local_rank = cute.slice_(
+                        tCgC_mc_slice_partitioned, ((None, None), (rank_id, 0))
+                    )
+
+                    # partition at thread level
+                    frgC_mc = thr_copy_fake.partition_S(tCgC_mc_local_rank)
+                    atom, loop_m, loop_n = frgC_mc.shape
+                    for i in cutlass.range_constexpr(loop_m):
+                        for j in cutlass.range_constexpr(loop_n):
+                            mc_ptr = frgC_mc[None, i, j].iterator
+                            x, y, z, w = 0, 0, 0, 0
+                            if cutlass.const_expr(self.c_dtype == Float16):
+                                x, y, z, w = (
+                                    distributed_helpers.multimem_ld_reduce_8xf16(mc_ptr)
+                                )
+                            elif cutlass.const_expr(self.c_dtype == Float32):
+                                x, y, z, w = (
+                                    distributed_helpers.multimem_ld_reduce_4xf32(mc_ptr)
+                                )
+                            elif cutlass.const_expr(self.c_dtype == BFloat16):
+                                x, y, z, w = (
+                                    distributed_helpers.multimem_ld_reduce_8xbf16(
+                                        mc_ptr
+                                    )
+                                )
+                            elif cutlass.const_expr(self.c_dtype == Float8E4M3FN):
+                                x, y, z, w = (
+                                    distributed_helpers.multimem_ld_reduce_16xe4m3(
+                                        mc_ptr
+                                    )
+                                )
+                            elif cutlass.const_expr(self.c_dtype == Float8E5M2):
+                                x, y, z, w = (
+                                    distributed_helpers.multimem_ld_reduce_16xe5m2(
+                                        mc_ptr
+                                    )
+                                )
+                            distributed_helpers.multimem_st_4xb32(mc_ptr, x, y, z, w)
+                    # Advance to next tile
+                    tile_sched.advance_to_next_work()
+                    work_tile, _ = tile_sched.get_current_work()
+
+                cute.arch.barrier(
+                    barrier_id=self.all_reduce_sync_bar_id,
+                    number_of_threads=32 * len(self.all_reduce_warp_id),
+                )
+                # System barrier to make sure all the peer memory transfers are completed.
+                last_flag_idx = cute.size(
+                    tile_sched.params.problem_layout_ncluster_mnl
+                ) * cute.size(self.cluster_shape_mn)
+                if warp_idx == self.all_reduce_warp_id[0]:
+                    with cute.arch.elect_one():
+                        distributed_helpers.sm_wise_inter_gpu_multimem_barrier(
+                            barrier_flag.iterator + last_flag_idx,
+                            barrier_flag_mc.iterator + last_flag_idx,
+                            self.num_ranks,
+                        )
 
     def mainloop_s2t_copy_and_partition(
         self,
@@ -2199,6 +2423,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         sf_dtype: Type[cutlass.Numeric],
         sf_vec_size: int,
         c_dtype: Type[cutlass.Numeric],
+        all_reduce: str = "none",
     ) -> bool:
         """
         Check if the dtypes and sf_vec_size are valid combinations
@@ -2247,6 +2472,20 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             cutlass.Float8E5M2,
             cutlass.Float8E4M3FN,
         }:
+            is_valid = False
+
+        # check if c_dtype is supported by multimem all-reduce
+        if cutlass.const_expr(
+            all_reduce != "none"
+            and c_dtype
+            not in {
+                cutlass.Float16,
+                cutlass.Float32,
+                cutlass.BFloat16,
+                cutlass.Float8E4M3FN,
+                cutlass.Float8E5M2,
+            }
+        ):
             is_valid = False
 
         return is_valid
@@ -2334,6 +2573,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         a_major: str,
         b_major: str,
         c_major: str,
+        all_reduce: str = "none",
     ) -> bool:
         """
         Check if the tensor alignment is valid
@@ -2374,7 +2614,64 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             or not check_contigous_16B_alignment(c_dtype, c_major == "m", (m, n, l))
         ):
             is_valid = False
+        if all_reduce != "none" and m % 128 != 0 and n % 128 != 0:
+            is_valid = False
+
         return is_valid
+
+    @staticmethod
+    def compute_barrier_flag_size(
+        m: int,
+        n: int,
+        l: int,
+        mma_tiler_mn: Tuple[int, int],
+        cluster_shape_mn: Tuple[int, int],
+        sm_count: int,
+    ) -> int:
+        """
+        Compute the required size for barrier flag tensors used in all-reduce synchronization.
+
+        The barrier flags are used for:
+        1. Per-tile synchronization during the all-reduce phase
+        2. Final inter-GPU synchronization barrier
+
+        :param m: Number of rows in the output matrix
+        :type m: int
+        :param n: Number of columns in the output matrix
+        :type n: int
+        :param l: Batch size
+        :type l: int
+        :param mma_tiler_mn: Shape of the MMA tiler (M, N)
+        :type mma_tiler_mn: Tuple[int, int]
+        :param cluster_shape_mn: Cluster dimensions (M, N)
+        :type cluster_shape_mn: Tuple[int, int]
+        :param sm_count: Number of SMs available
+        :type sm_count: int
+
+        :return: Total number of barrier flags needed
+        :rtype: int
+        """
+        # Calculate CTA tile shape accounting for 2-CTA instructions
+        use_2cta_instrs = mma_tiler_mn[0] == 256
+        cta_tile_shape_m = mma_tiler_mn[0] // (2 if use_2cta_instrs else 1)
+        cta_tile_shape_n = mma_tiler_mn[1]
+
+        # Calculate number of tiles per batch
+        num_tiles_m = (m + cta_tile_shape_m - 1) // cta_tile_shape_m
+        num_tiles_n = (n + cta_tile_shape_n - 1) // cta_tile_shape_n
+        num_tiles_per_batch = num_tiles_m * num_tiles_n
+
+        # Calculate number of clusters per batch
+        cluster_size = cluster_shape_mn[0] * cluster_shape_mn[1]
+        num_ctas_per_tile = cluster_size
+
+        # Total tiles across all batches and clusters
+        num_tiles = num_tiles_per_batch * l * num_ctas_per_tile
+
+        # Add extra space for final barrier (one per SM)
+        total_barrier_size = num_tiles + sm_count
+
+        return total_barrier_size
 
     @staticmethod
     def can_implement(
@@ -2391,6 +2688,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         a_major: str,
         b_major: str,
         c_major: str,
+        all_reduce: str = "none",
+        process_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> bool:
         """
         Check if the gemm can be implemented
@@ -2421,6 +2720,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         :type b_major: str
         :param c_major: The major axis of the C tensor
         :type c_major: str
+        :param all_reduce: All-reduce mode, can be "none", "two_shot"
+        :type all_reduce: str
 
         :return: True if the gemm can be implemented, False otherwise
         :rtype: bool
@@ -2428,7 +2729,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         can_implement = True
         # Skip unsupported types
         if not Sm100BlockScaledPersistentDenseGemmKernel.is_valid_dtypes_and_scale_factor_vec_size(
-            ab_dtype, sf_dtype, sf_vec_size, c_dtype
+            ab_dtype, sf_dtype, sf_vec_size, c_dtype, all_reduce
         ):
             can_implement = False
         # Skip unsupported layouts
@@ -2443,9 +2744,15 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             can_implement = False
         # Skip illegal problem shape for load/store alignment
         if not Sm100BlockScaledPersistentDenseGemmKernel.is_valid_tensor_alignment(
-            m, n, k, l, ab_dtype, c_dtype, a_major, b_major, c_major
+            m, n, k, l, ab_dtype, c_dtype, a_major, b_major, c_major, all_reduce
         ):
             can_implement = False
+
+        # Check for all reduce constraints
+        if all_reduce != "none":
+            # TODO(asamani): expand the logic for mnnvl support
+            if torch.distributed.get_world_size(process_group) not in [2, 4, 8]:
+                can_implement = False
         return can_implement
 
 
@@ -2577,6 +2884,7 @@ class MaskedBatchedMatmulCuteDSL:
         cluster_shape_mn: Tuple[int, int],
         sm_count: int,
         sm_version: str,
+        all_reduce: str = "none",
     ):
         self._m = m
         self._n = n
@@ -2592,6 +2900,7 @@ class MaskedBatchedMatmulCuteDSL:
         self._sf_vec_size = sf_vec_size
         self._mma_tiler_mn = mma_tiler_mn
         self._cluster_shape_mn = cluster_shape_mn
+        self._all_reduce = all_reduce
 
         if not Sm100BlockScaledPersistentDenseGemmKernel.can_implement(
             ab_dtype,
@@ -2607,9 +2916,10 @@ class MaskedBatchedMatmulCuteDSL:
             a_major,
             b_major,
             c_major,
+            all_reduce,
         ):
             raise TypeError(
-                f"MaskedBatchedMatmulCuteDSL: Unsupported with {ab_dtype}, {sf_dtype}, {sf_vec_size}, {c_dtype},  {mma_tiler_mn}, {cluster_shape_mn}, {m}, {n}, {k}, {l}, {a_major}, {b_major}, {c_major}"
+                f"MaskedBatchedMatmulCuteDSL: Unsupported with {ab_dtype}, {sf_dtype}, {sf_vec_size}, {c_dtype},  {mma_tiler_mn}, {cluster_shape_mn}, {m}, {n}, {k}, {l}, {a_major}, {b_major}, {c_major}, {all_reduce}"
             )
 
         # Compute max active clusters on current device
@@ -2633,8 +2943,25 @@ class MaskedBatchedMatmulCuteDSL:
         masked_m_ptr: cute.Pointer,
         dst_signals_ptr: Optional[cute.Pointer],
         alpha_ptr: cute.Pointer,
+        c_mc_ptr: Optional[cute.Pointer],
+        barrier_flag_ptr: Optional[cute.Pointer],
+        barrier_flag_mc_ptr: Optional[cute.Pointer],
         current_stream: cuda.CUstream,
     ):
+        if cutlass.const_expr(self._all_reduce != "none"):
+            barrier_flag_size = (
+                Sm100BlockScaledPersistentDenseGemmKernel.compute_barrier_flag_size(
+                    self._m,
+                    self._n,
+                    self._l,
+                    self._mma_tiler_mn,
+                    self._cluster_shape_mn,
+                    self._max_active_clusters,
+                )
+            )
+        else:
+            barrier_flag_size = 1  # Dummy size when not used
+
         a_tensor = cute.make_tensor(
             a_ptr,
             layout=cute.make_ordered_layout(
@@ -2655,6 +2982,33 @@ class MaskedBatchedMatmulCuteDSL:
                 (self._m, self._n, self._l),
                 order=(0, 1, 2) if self._c_major == "m" else (1, 0, 2),
             ),
+        )
+        c_mc_tensor = (
+            cute.make_tensor(
+                c_mc_ptr,
+                layout=cute.make_ordered_layout(
+                    (self._m, self._n, self._l),
+                    order=(0, 1, 2) if self._c_major == "m" else (1, 0, 2),
+                ),
+            )
+            if c_mc_ptr is not None
+            else None
+        )
+        barrier_flag_tensor = (
+            cute.make_tensor(
+                barrier_flag_ptr,
+                layout=cute.make_ordered_layout((barrier_flag_size,), order=(0,)),
+            )
+            if barrier_flag_ptr is not None
+            else None
+        )
+        barrier_flag_mc_tensor = (
+            cute.make_tensor(
+                barrier_flag_mc_ptr,
+                layout=cute.make_ordered_layout((barrier_flag_size,), order=(0,)),
+            )
+            if barrier_flag_mc_ptr is not None
+            else None
         )
 
         # calculate sf_tensor shape and order
@@ -2720,6 +3074,7 @@ class MaskedBatchedMatmulCuteDSL:
             mma_tiler_mn=self._mma_tiler_mn,
             cluster_shape_mn=self._cluster_shape_mn,
             sm_version=self._sm_version,
+            all_reduce=self._all_reduce,
         )(
             a_tensor,
             b_tensor,
@@ -2731,6 +3086,9 @@ class MaskedBatchedMatmulCuteDSL:
             alpha_tensor,
             self._max_active_clusters,
             current_stream,
+            c_mc_tensor,
+            barrier_flag_tensor,
+            barrier_flag_mc_tensor,
         )
 
 
@@ -2753,6 +3111,7 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
     sm_count: int,
     sm_version: str,
     enable_dst_signals: bool,
+    all_reduce: str = "none",
 ) -> Callable:
     def get_cute_pointers(
         input_tensors: Optional[List[torch.tensor]],
@@ -2767,10 +3126,17 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
                 masked_m_data_ptr,
                 dst_signals_data_ptr,
                 alpha_data_ptr,
-            ) = [16 for _ in range(8)]
+                c_mc_data_ptr,
+                barrier_flag_data_ptr,
+                barrier_flag_mc_data_ptr,
+            ) = [16 for _ in range(11)]
 
             if not enable_dst_signals:
                 dst_signals_data_ptr = None
+            if all_reduce == "none":
+                c_mc_data_ptr = None
+                barrier_flag_data_ptr = None
+                barrier_flag_mc_data_ptr = None
 
         else:
             (
@@ -2782,6 +3148,9 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
                 masked_m_tensor_gpu,
                 dst_signals_tensor_gpu,
                 alpha_tensor_gpu,
+                c_mc_gpu,
+                barrier_flag_gpu,
+                barrier_flag_mc_gpu,
             ) = input_tensors
 
             assert enable_dst_signals == (dst_signals_tensor_gpu is not None)
@@ -2795,6 +3164,9 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
                 masked_m_data_ptr,
                 dst_signals_data_ptr,
                 alpha_data_ptr,
+                c_mc_data_ptr,
+                barrier_flag_data_ptr,
+                barrier_flag_mc_data_ptr,
             ) = (
                 a_tensor_gpu.data_ptr(),
                 b_tensor_gpu.data_ptr(),
@@ -2806,6 +3178,11 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
                 if dst_signals_tensor_gpu is not None
                 else None,
                 alpha_tensor_gpu.data_ptr() if alpha_tensor_gpu is not None else None,
+                c_mc_gpu.data_ptr() if c_mc_gpu is not None else None,
+                barrier_flag_gpu.data_ptr() if barrier_flag_gpu is not None else None,
+                barrier_flag_mc_gpu.data_ptr()
+                if barrier_flag_mc_gpu is not None
+                else None,
             )
 
         a_ptr = make_ptr(
@@ -2864,6 +3241,36 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
             if alpha_data_ptr is not None and alpha_dtype is not None
             else None
         )
+        c_mc_ptr = (
+            make_ptr(
+                c_dtype,
+                c_mc_data_ptr,
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            if c_mc_data_ptr is not None
+            else None
+        )
+        barrier_flag_ptr = (
+            make_ptr(
+                cutlass.Int32,
+                barrier_flag_data_ptr,
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            if barrier_flag_data_ptr is not None
+            else None
+        )
+        barrier_flag_mc_ptr = (
+            make_ptr(
+                cutlass.Int32,
+                barrier_flag_mc_data_ptr,
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            if barrier_flag_mc_data_ptr is not None
+            else None
+        )
 
         return [
             a_ptr,
@@ -2874,6 +3281,9 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
             masked_m_ptr,
             dst_signals_ptr,
             alpha_ptr,
+            c_mc_ptr,
+            barrier_flag_ptr,
+            barrier_flag_mc_ptr,
         ]
 
     kernel = cute.compile(
@@ -2894,6 +3304,7 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
             cluster_shape_mn=cluster_shape_mn,
             sm_count=sm_count,
             sm_version=sm_version,
+            all_reduce=all_reduce,
         ),
         *get_cute_pointers(None),
         cutlass_torch.current_stream(),
@@ -2908,6 +3319,12 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
         dst_signals_tensor_gpu: torch.Tensor,
         c_tensor_gpu: Optional[torch.Tensor] = None,
         alpha_tensor_gpu: Optional[torch.Tensor] = None,
+        c_mc_gpu: Optional[Tensor] = None,
+        c_mc_torch: Optional[torch.Tensor] = None,
+        barrier_flag_gpu: Optional[Tensor] = None,
+        barrier_flag_torch: Optional[torch.Tensor] = None,
+        barrier_flag_mc_gpu: Optional[Tensor] = None,
+        barrier_flag_mc_torch: Optional[torch.Tensor] = None,
     ):
         if c_tensor_gpu is None:
             # fp4 gemm output is not supported
@@ -2932,6 +3349,9 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
                     masked_m_tensor_gpu,
                     dst_signals_tensor_gpu,
                     alpha_tensor_gpu,
+                    c_mc_torch,
+                    barrier_flag_torch,
+                    barrier_flag_mc_torch,
                 ]
             ),
             current_stream,
@@ -2954,6 +3374,13 @@ def grouped_gemm_nt_masked(
     sf_vec_size: int,
     dst_signals: Optional[torch.Tensor] = None,
     sm_count: Optional[int] = None,
+    all_reduce: str = "none",
+    out_mc: Optional[Tensor] = None,
+    out_mc_torch: Optional[torch.Tensor] = None,
+    barrier_flag: Optional[Tensor] = None,
+    barrier_flag_mc: Optional[Tensor] = None,
+    barrier_flag_torch: Optional[torch.Tensor] = None,
+    barrier_flag_mc_torch: Optional[torch.Tensor] = None,
     **kwargs,
 ):
     """
@@ -3034,6 +3461,7 @@ def grouped_gemm_nt_masked(
         sm_count=sm_count,
         sm_version=f"sm_{major}{minor}",
         enable_dst_signals=dst_signals is not None,
+        all_reduce=all_reduce,
     )(
         a_tensor_gpu=a_torch,
         b_tensor_gpu=b_torch,
@@ -3043,4 +3471,10 @@ def grouped_gemm_nt_masked(
         masked_m_tensor_gpu=masked_m,
         dst_signals_tensor_gpu=dst_signals,
         alpha_tensor_gpu=alpha,
+        c_mc_gpu=out_mc,
+        c_mc_torch=out_mc_torch,
+        barrier_flag_gpu=barrier_flag,
+        barrier_flag_torch=barrier_flag_torch,
+        barrier_flag_mc_gpu=barrier_flag_mc,
+        barrier_flag_mc_torch=barrier_flag_mc_torch,
     )
