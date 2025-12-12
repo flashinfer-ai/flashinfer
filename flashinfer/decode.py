@@ -1916,6 +1916,8 @@ class TrtllmGenDecodeModule:
             enable_pdl,
             workspace_size,
             sinks,
+            None,  # max_q_len
+            None,  # cum_seq_lens_q
         )
         return out
 
@@ -2077,12 +2079,14 @@ def trtllm_batch_decode_with_kv_cache(
     q_len_per_req: Optional[int] = 1,
     o_scale: Optional[float] = 1.0,
     mask: Optional[torch.Tensor] = None,
+    max_q_len: Optional[int] = None,
+    cum_seq_lens_q: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, FP4Tensor]:
     """
     Parameters
     ----------
     query : torch.Tensor
-        query tensor with shape [num_tokens, num_heads, head_dim], num_tokens = batch_size * q_len_per_request
+        query tensor with shape [num_tokens, num_heads, head_dim], num_tokens = total query tokens in the batch.
 
     kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
         If kv_cache is a single tensor, it should be a tensor with shape [num_pages, 1 or 2, num_kv_heads, page_size, head_dim] if :attr:`kv_layout` is ``HND``,
@@ -2150,6 +2154,16 @@ def trtllm_batch_decode_with_kv_cache(
     mask : Optional[torch.Tensor] = None
         causal attention mask for xqa speculative decoding.
 
+    max_q_len: Optional[int] = None
+        The maximum query sequence length across all requests when using variable-length queries.
+        Only supported by trtllm-gen backend. Must be provided together with ``cum_seq_lens_q``.
+        When None, all requests use uniform query length specified by ``q_len_per_req``.
+
+    cum_seq_lens_q : Optional[torch.Tensor] = None
+        Cumulative query sequence lengths for variable-length query support, shape: ``[batch_size + 1]``, dtype: ``torch.int32``.
+        Only supported by trtllm-gen backend. Must be provided together with ``max_q_len``.
+        When None, all requests use uniform query length specified by ``q_len_per_req``.
+
     Returns
     -------
     out : Union[torch.Tensor, FP4Tensor]
@@ -2181,6 +2195,8 @@ def trtllm_batch_decode_with_kv_cache(
             raise ValueError("xqa backend does not support nvfp4 output")
         if o_sf_scale is not None or o_sf_vec_size is not None:
             raise ValueError("xqa backend does not support o_sf_scale or o_sf_vec_size")
+        if max_q_len is not None or cum_seq_lens_q is not None:
+            raise ValueError("xqa backend does not support cum_seq_lens_q")
 
         # Handle out and out_dtype
         if out_dtype is None:
@@ -2305,7 +2321,9 @@ def trtllm_batch_decode_with_kv_cache(
                 q_len_per_req,
                 query.size(1),
                 query.size(2),
-            ),
+            )
+            if q_len_per_req is not None
+            else query,
             k_cache,
             v_cache,
             workspace_buffer,
@@ -2323,6 +2341,8 @@ def trtllm_batch_decode_with_kv_cache(
             enable_pdl,
             workspace_buffer.numel() * workspace_buffer.element_size(),
             sinks,
+            max_q_len,
+            cum_seq_lens_q,
         )
 
         return (
