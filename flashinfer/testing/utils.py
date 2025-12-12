@@ -1270,7 +1270,6 @@ def bench_gpu_time_with_cudagraph(
         - Memory usage scales with the number of rotations needed to exceed L2 cache.
 
     See Also:
-        - PyTorch CUDA Graphs: https://pytorch.org/blog/accelerating-pytorch-with-cuda-graphs/
         - ``calculate_rotation_count``: Computes required buffer copies for cold-L2.
     """
     if input_kwargs is None:
