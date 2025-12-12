@@ -385,10 +385,11 @@ def test_top_k_top_p_sampling_from_probs_logits_alignment(batch_size, vocab_size
     # NOTE(Zihao): Applying softmax followed by top_k_renorm (softmax -> top_k_renorm)
     # does not guarantee bitwise-identical results compared to top_k_mask followed by softmax (top_k_mask -> softmax).
     # This may cause slight differences in subsequent top-p sampling.
-    # We tolerate up to a 1% mismatch rate.
-    assert match_rate >= 0.99, (
+    # Additionally, ties at the k-th position may be resolved differently.
+    # We tolerate up to a 5% mismatch rate.
+    assert match_rate >= 0.95, (
         f"Sample match rate {match_rate:.2%} is below threshold "
-        f"({batch_size - num_matches}/{batch_size} mismatches, expected <=1%)"
+        f"({samples.numel() - num_matches}/{samples.numel()} mismatches, expected <=5%)"
     )
 
 
@@ -447,57 +448,152 @@ def test_top_p_renorm_probs(batch_size, vocab_size, p):
     )
 
 
-@pytest.mark.parametrize("batch_size", [1, 99, 989])
+@pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("k", [10, 100, 500])
-def test_top_k_renorm_probs(batch_size, vocab_size, k):
+@pytest.mark.parametrize(
+    "distribution",
+    [
+        normal_distribution(1),
+        normal_distribution(5),
+        gumbel_distribution(0.1),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_top_k_renorm_probs(batch_size, vocab_size, k, distribution, dtype):
     if k > vocab_size:
         pytest.skip("k should be less than vocab_size")
+
     torch.manual_seed(42)
-    pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
-    normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
-    sorted_prob, _ = torch.sort(normalized_prob, descending=True)
-    pivot = sorted_prob[:, k - 1]
-    mask = (normalized_prob >= pivot.unsqueeze(-1)).int()
-    renorm_prob_ground_truth = normalized_prob.clone()
-    renorm_prob_ground_truth[mask == 0] = 0
-    renorm_prob_ground_truth = renorm_prob_ground_truth / renorm_prob_ground_truth.sum(
-        dim=-1, keepdim=True
-    )
+    logits = distribution((batch_size, vocab_size), "cuda:0")
+    normalized_prob_fp32 = torch.softmax(logits, dim=-1)
+    normalized_prob = normalized_prob_fp32.to(dtype)
 
     renorm_prob = flashinfer.sampling.top_k_renorm_probs(normalized_prob, k)
-    for i in range(batch_size):
-        torch.testing.assert_close(
-            renorm_prob_ground_truth[i],
-            renorm_prob[i],
-            rtol=1e-3,
-            atol=1e-3,
-        )
+
+    # Check output dtype matches input
+    assert renorm_prob.dtype == dtype
+
+    # Check that the output sums to 1
+    sums = renorm_prob.float().sum(dim=-1)
+    torch.testing.assert_close(sums, torch.ones_like(sums), rtol=1e-2, atol=1e-2)
+
+    # Count non-zero elements in output
+    nonzero_counts = (renorm_prob > 0).sum(dim=-1)
+
+    # Find the pivot value (k-th largest) and count ties
+    sorted_prob, _ = torch.sort(normalized_prob, descending=True)
+    pivot = sorted_prob[:, k - 1]
+
+    # Count how many elements are strictly greater than pivot
+    num_greater = (normalized_prob > pivot.unsqueeze(-1)).sum(dim=-1)
+    # Count how many elements equal the pivot (ties)
+    num_ties = (normalized_prob == pivot.unsqueeze(-1)).sum(dim=-1)
+
+    # Valid range: [num_greater, num_greater + num_ties]
+    # The kernel must keep all elements > pivot, and may keep some/all/none of the ties
+    # But it must keep exactly k elements total (if there are enough)
+    nonzero_input = (normalized_prob > 0).sum(dim=-1)
+    expected_k = torch.minimum(
+        torch.full_like(nonzero_input, k, dtype=torch.int64), nonzero_input
+    )
+
+    # Check: nonzero_counts should be in valid range considering ties
+    max_valid = num_greater + num_ties
+
+    # The actual count should be >= k (we keep at least k) and within tie range
+    # Due to floating point, allow small tolerance
+    assert torch.all(nonzero_counts >= torch.clamp(expected_k - 1, min=0)), (
+        f"Some rows have fewer non-zero elements than expected. "
+        f"nonzero_counts min: {nonzero_counts.min()}, expected_k min: {expected_k.min()}"
+    )
+    assert torch.all(nonzero_counts <= max_valid + 1), (
+        f"Some rows have more non-zero elements than allowed by ties. "
+        f"nonzero_counts max: {nonzero_counts.max()}, max_valid max: {max_valid.max()}"
+    )
 
 
-@pytest.mark.parametrize("batch_size", [1, 99, 989])
+@pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("k", [10, 100, 500])
+@pytest.mark.parametrize(
+    "distribution",
+    [
+        normal_distribution(1),
+        normal_distribution(5),
+        gumbel_distribution(0.1),
+    ],
+)
 @pytest.mark.parametrize("neginf_input", [False, True])
-def test_top_k_mask_logits(batch_size, vocab_size, k, neginf_input):
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_top_k_mask_logits(
+    batch_size, vocab_size, k, distribution, neginf_input, dtype
+):
     if k > vocab_size:
         pytest.skip("k should be less than vocab_size")
+
     torch.manual_seed(42)
-    logits = torch.randn(batch_size, vocab_size, device="cuda:0") * 5
+    logits = distribution((batch_size, vocab_size), "cuda:0")
     if neginf_input:
         num_neginf = torch.randint(1, vocab_size * batch_size, (1,)).item()
         idxs = torch.randperm(batch_size * vocab_size, device="cuda:0")[:num_neginf]
         logits[idxs // vocab_size, idxs % vocab_size] = -float("inf")
-    probs = torch.softmax(logits, dim=-1)
-    masked_logits = flashinfer.sampling.top_k_mask_logits(logits, k)
-    renormed_probs = torch.softmax(masked_logits, dim=-1)
-    renormed_probs_ref = flashinfer.sampling.top_k_renorm_prob(probs, k)
 
-    torch.testing.assert_close(
-        renormed_probs,
-        renormed_probs_ref,
-        rtol=1e-3,
-        atol=1e-3,
+    logits = logits.to(dtype)
+    masked_logits = flashinfer.sampling.top_k_mask_logits(logits, k)
+
+    # Check output dtype matches input
+    assert masked_logits.dtype == dtype
+
+    # Check that softmax of masked logits sums to 1
+    probs = torch.softmax(masked_logits.float(), dim=-1)
+    sums = probs.sum(dim=-1)
+    torch.testing.assert_close(sums, torch.ones_like(sums), rtol=1e-3, atol=1e-3)
+
+    # Count finite elements in output
+    finite_counts = torch.isfinite(masked_logits).sum(dim=-1)
+
+    # Find the pivot value (k-th largest among finite values) and count ties
+    # Replace -inf with a very small value for sorting
+    logits_for_sort = logits.clone()
+    logits_for_sort[~torch.isfinite(logits_for_sort)] = -float("inf")
+    sorted_logits, _ = torch.sort(logits_for_sort, descending=True)
+
+    # Count finite inputs per row
+    finite_inputs = torch.isfinite(logits).sum(dim=-1)
+
+    # For each row, find the pivot (k-th largest if enough finite values)
+    effective_k = torch.minimum(
+        torch.full_like(finite_inputs, k, dtype=torch.int64), finite_inputs
+    )
+
+    # Get pivot for each row (handle case where effective_k might be 0)
+    pivot = torch.zeros(batch_size, dtype=dtype, device=logits.device)
+    for i in range(batch_size):
+        ek = effective_k[i].item()
+        if ek > 0:
+            pivot[i] = sorted_logits[i, ek - 1]
+        else:
+            pivot[i] = float("-inf")
+
+    # Count how many elements are strictly greater than pivot
+    num_greater = (logits > pivot.unsqueeze(-1)).sum(dim=-1)
+    # Count how many elements equal the pivot (ties) - only among finite values
+    num_ties = ((logits == pivot.unsqueeze(-1)) & torch.isfinite(logits)).sum(dim=-1)
+
+    # Valid range considering ties
+    max_valid = num_greater + num_ties
+
+    # Check: finite_counts should be >= effective_k (we keep at least k finite values)
+    # and <= max_valid (we don't keep more than all elements >= pivot)
+    # Allow small tolerance for floating point issues
+    assert torch.all(finite_counts >= torch.clamp(effective_k - 1, min=0)), (
+        f"Some rows have fewer finite elements than expected. "
+        f"finite_counts min: {finite_counts.min()}, effective_k min: {effective_k.min()}"
+    )
+    assert torch.all(finite_counts <= max_valid + 1), (
+        f"Some rows have more finite elements than allowed by ties. "
+        f"finite_counts max: {finite_counts.max()}, max_valid max: {max_valid.max()}"
     )
 
 

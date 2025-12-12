@@ -42,8 +42,10 @@ void top_p_renorm_probs(TensorView probs, TensorView renorm_probs,
 }
 
 void top_k_renorm_probs(TensorView probs, TensorView renorm_probs,
-                        Optional<TensorView> maybe_top_k_arr, int64_t top_k_val) {
+                        Optional<TensorView> maybe_top_k_arr, int64_t top_k_val,
+                        TensorView row_states_buffer) {
   CHECK_INPUT(probs);
+  CHECK_INPUT(row_states_buffer);
   CHECK_DIM(2, probs);  // probs: (batch_size, vocab_size)
   unsigned int batch_size = probs.size(0);
   unsigned int vocab_size = probs.size(1);
@@ -52,18 +54,29 @@ void top_k_renorm_probs(TensorView probs, TensorView renorm_probs,
 
   ffi::CUDADeviceGuard device_guard(probs.device().device_id);
   auto stream = get_stream(probs.device());
-  cudaError_t status = sampling::TopKRenormProb<float>(
-      static_cast<float*>(probs.data_ptr()), static_cast<float*>(renorm_probs.data_ptr()),
-      has_top_k_arr ? static_cast<int*>(maybe_top_k_arr.value().data_ptr()) : nullptr, batch_size,
-      top_k_val, vocab_size, stream);
+
+  cudaError_t status;
+  auto dtype = probs.dtype();
+
+  // Use radix-based top-k with dtype dispatch for FP32/FP16/BF16
+  DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP32_FP16(dtype, c_type, [&] {
+    status = sampling::RadixTopKRenormProbMultiCTA<c_type, int>(
+        static_cast<c_type*>(probs.data_ptr()), static_cast<c_type*>(renorm_probs.data_ptr()),
+        has_top_k_arr ? static_cast<int*>(maybe_top_k_arr.value().data_ptr()) : nullptr, batch_size,
+        top_k_val, vocab_size, static_cast<sampling::RadixRowState*>(row_states_buffer.data_ptr()),
+        stream);
+    return true;
+  });
 
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "TopKRenormProb failed with error code " << cudaGetErrorString(status);
 }
 
 void top_k_mask_logits(TensorView logits, TensorView mask_logits,
-                       Optional<TensorView> maybe_top_k_arr, int64_t top_k_val) {
+                       Optional<TensorView> maybe_top_k_arr, int64_t top_k_val,
+                       TensorView row_states_buffer) {
   CHECK_INPUT(logits);
+  CHECK_INPUT(row_states_buffer);
   CHECK_DIM(2, logits);  // logits: (batch_size, vocab_size)
   unsigned int batch_size = logits.size(0);
   unsigned int vocab_size = logits.size(1);
@@ -72,10 +85,20 @@ void top_k_mask_logits(TensorView logits, TensorView mask_logits,
 
   ffi::CUDADeviceGuard device_guard(logits.device().device_id);
   auto stream = get_stream(logits.device());
-  cudaError_t status = sampling::TopKMaskLogits<float>(
-      static_cast<float*>(logits.data_ptr()), static_cast<float*>(mask_logits.data_ptr()),
-      has_top_k_arr ? static_cast<int*>(maybe_top_k_arr.value().data_ptr()) : nullptr, batch_size,
-      top_k_val, vocab_size, stream);
+
+  cudaError_t status;
+  auto dtype = logits.dtype();
+
+  // Use radix-based top-k with auto-selection (single-CTA for small vocab, multi-CTA for large
+  // vocab)
+  DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP32_FP16(dtype, c_type, [&] {
+    status = sampling::RadixTopKMaskLogitsMultiCTA<c_type, int>(
+        static_cast<c_type*>(logits.data_ptr()), static_cast<c_type*>(mask_logits.data_ptr()),
+        has_top_k_arr ? static_cast<int*>(maybe_top_k_arr.value().data_ptr()) : nullptr, batch_size,
+        top_k_val, vocab_size, static_cast<sampling::RadixRowState*>(row_states_buffer.data_ptr()),
+        stream);
+    return true;
+  });
 
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "TopKMaskLogits failed with error code " << cudaGetErrorString(status);
