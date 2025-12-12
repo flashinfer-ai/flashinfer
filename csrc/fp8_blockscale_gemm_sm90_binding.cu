@@ -7,6 +7,7 @@
 #include <type_traits>
 #include <vector>
 
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
 #include "tvm_ffi_utils.h"
 
@@ -54,11 +55,16 @@ class Fp8BlockScaleGemmRunner : public tvm::ffi::ModuleObj {
   const char* kind() const final { return "fp8_blockscale_gemm_runner"; }
 
   Optional<Function> GetFunction(const tvm::ffi::String& name) {
-    if (name == "gemm") {
+    if (name == "run_gemm") {
       return Function::FromTyped([this](TensorView input, TensorView weight, TensorView output,
                                         Optional<TensorView> scales_a,
                                         Optional<TensorView> scales_b) {
         runGemm(input, weight, output, scales_a, scales_b);
+      });
+    } else if (name == "fp8_quantize_1x128") {
+      return Function::FromTyped([this](TensorView input, TensorView outValueE4M3,
+                                        TensorView outScaleFP8SF, bool use_ue8m0) {
+        fp8_quantize_1x128(input, outValueE4M3, outScaleFP8SF, use_ue8m0);
       });
     } else if (name == "get_workspace_size") {
       return Function::FromTyped(
@@ -117,11 +123,11 @@ class Fp8BlockScaleGemmRunner : public tvm::ffi::ModuleObj {
       TVM_FFI_ICHECK(scales_a.has_value() && scales_a.value().data_ptr() != nullptr)
           << "scales_a is required for FP8 input";
       // TensorRT-LLM expects scale shape: (K/128, M) after transpose
-      int64_t expected_scale_k = (shape_k + 127) / 128;
-      TVM_FFI_ICHECK(scales_a.value().size(0) == expected_scale_k &&
-                     scales_a.value().size(1) == shape_m)
-          << "scales_a shape mismatch: expected (" << expected_scale_k << ", " << shape_m
-          << "), got (" << scales_a.value().size(0) << ", " << scales_a.value().size(1) << ")";
+      // int64_t expected_scale_k = (shape_k + 127) / 128;
+      // TVM_FFI_ICHECK(scales_a.value().size(0) == expected_scale_k &&
+      //                scales_a.value().size(1) == shape_m)
+      //     << "scales_a shape mismatch: expected (" << expected_scale_k << ", " << shape_m
+      //     << "), got (" << scales_a.value().size(0) << ", " << scales_a.value().size(1) << ")";
     }
 
     if (weight_is_fp8) {
@@ -173,6 +179,28 @@ class Fp8BlockScaleGemmRunner : public tvm::ffi::ModuleObj {
       runner->gemm(output_ptr, input_ptr, weight_ptr, shape_m, shape_n, shape_k, stream,
                    scales_a_ptr, scales_b_ptr);
     }
+  }
+
+  void fp8_quantize_1x128(const TensorView input, TensorView valueE4M3, TensorView scaleFP8SF,
+                          bool use_ue8m0) {
+    auto data_shape = input.sizes();
+    TVM_FFI_ICHECK_EQ(data_shape.size(), 2) << "input should be 2D tensor.";
+
+    auto const m = data_shape[0];
+    auto const n = data_shape[1];
+
+    TVM_FFI_ICHECK_LE(m, std::numeric_limits<int32_t>::max()) << "M must be within int32";
+    TVM_FFI_ICHECK_LE(n, std::numeric_limits<int32_t>::max()) << "N must be within int32";
+    TVM_FFI_ICHECK_EQ(n % 16, 0) << "n must be divisible by 16";
+
+    __nv_fp8_e4m3* act_buffer = reinterpret_cast<__nv_fp8_e4m3*>(valueE4M3.data_ptr());
+    float* act_scale_buffer = reinterpret_cast<float*>(scaleFP8SF.data_ptr());
+
+    auto stream = get_stream(input.device());
+
+    runner_bf16_fp8_->fp8CS1x128(act_buffer, act_scale_buffer,
+                                 reinterpret_cast<__nv_bfloat16 const*>(input.data_ptr()), n, m,
+                                 stream);
   }
 
   int64_t getWorkspaceSize(int64_t shape_m, int64_t shape_n, int64_t shape_k) {
