@@ -260,6 +260,65 @@ def test_fp8_blockscale_gemm_w8a8(m, n, k):
 
     print(f"✓ W8A8 (FP8+FP8): cosine similarity = {cos_sim:.4f}")
 
+@pytest.mark.parametrize("m", [7, 32, 128])
+@pytest.mark.parametrize("n", [1024, 4096])
+@pytest.mark.parametrize("k", [512, 4096])
+def test_fp8_blockscale_gemm_w8a8_with_quant_kernel(m, n, k):
+    """Test W8A8 (FP8+FP8) GEMM with per-token scales for both input and weight.
+
+    This test demonstrates full FP8 quantization for both activations and weights.
+    """
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    if compute_capability[0] < 9:
+        pytest.skip("FP8 block-scale GEMM requires SM90 (Hopper) or later")
+
+    if not is_sm90a_supported(torch.device("cuda")):
+        pytest.skip("FP8 block-scale GEMM requires SM90a (Hopper) support")
+
+    device = "cuda"
+    # m, n, k = 64, 2048, 4096
+    torch.manual_seed(42)
+
+    # Create BF16 inputs for reference (no normalization)
+    # Raw randn values work well with FP8 quantization without causing numerical issues
+    input_bf16 = torch.randn(m, k, device=device, dtype=torch.bfloat16)
+    weight_bf16 = torch.randn(n, k, device=device, dtype=torch.bfloat16)
+
+    # Quantize both input and weight to FP8 with per-token (1x128) scales
+    weight_fp8, weight_scale = per_token_cast_to_fp8(weight_bf16)
+
+    # Verify scale shapes
+    assert weight_scale.shape == (n, k // 128), (
+        f"Expected weight scale shape ({n}, {k // 128}), got {weight_scale.shape}"
+    )
+    assert weight_scale.min() > 0, "Weight scale should be positive"
+
+    # Run W8A8 GEMM: FP8 input + FP8 weight
+    output = fp8_blockscale_gemm_sm90(input_bf16, weight_fp8, None, weight_scale)
+
+    # Dequantize FP8 tensors to create reference (tests kernel correctness, not quantization)
+    # Dequant: bf16 = fp8.to(bf16) * scale (applied per 128-element block)
+    weight_dequant = torch.zeros_like(weight_bf16)
+    for j in range(n):
+        for k_tile in range(k // 128):
+            start, end = k_tile * 128, (k_tile + 1) * 128
+            weight_dequant[j, start:end] = (
+                weight_fp8[j, start:end].to(torch.bfloat16) * weight_scale[j, k_tile]
+            )
+
+    reference = torch.matmul(input_bf16, weight_dequant.T)
+
+    # Use cosine similarity (same metric as BF16+FP8 tests)
+    cos_sim = F.cosine_similarity(
+        reference.flatten().float(), output.flatten().float(), dim=0
+    )
+    # W8A8 achieves ~97% cosine similarity against dequantized FP8 reference
+    assert cos_sim > 0.967, (
+        f"W8A8 cosine similarity {cos_sim:.4f} too low (expected > 0.967)"
+    )
+
+    print(f"✓ W8A8 (FP8+FP8): cosine similarity = {cos_sim:.4f}")
+
 
 def test_fp8_blockscale_gemm_per_block_weight_scales():
     """Test BF16+FP8 GEMM with per-block (128x128) weight scales.

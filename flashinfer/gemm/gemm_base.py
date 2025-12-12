@@ -3522,33 +3522,44 @@ def fp8_blockscale_gemm_sm90(
         workspace = torch.empty(workspace_size, dtype=torch.uint8, device=input.device)
         runner.configure_workspace(workspace)
 
-    if input_scale is not None:
-        M_padded = ((M + 3) // 4) * 4  # Round M up to multiple of 4
-        K_blocks = K // BLOCK_SIZE
+    if input_is_bf16 and weight_is_fp8 and input_scale is None:
+        # Quantize the bf16 input to FP8 with correct scale format to run gemm at fp8 x fp8
+        M_padded = ((M + 4 - 1) // 4) * 4  # Round M up to multiple of 4
+        K_blocks = (K + BLOCK_SIZE - 1) // BLOCK_SIZE
+        input_scale_size = ((K * M_padded * 4 + BLOCK_SIZE - 1) // BLOCK_SIZE) // 4
 
-        # Create padded tensor with the stride TRT-LLM expects
-        input_scale_padded = torch.zeros(
-            K_blocks, M_padded, dtype=torch.float32, device=input.device
-        )
-
-        # Copy scales into the non-padded region: (K//128, M)
-        # Transpose from (M, K//128) to (K//128, M) and copy
-        input_scale_padded[:, :M] = input_scale.T
-
-        # Extract view of the actual (K//128, M) region
-        # This view has stride (M_padded, 1) which matches TRT-LLM's expectations
-        input_scale_transposed = input_scale_padded[:, :M]
-
-        # Verify stride matches TRT-LLM's expectations
-        expected_stride_0 = M_padded
-        if input_scale_transposed.stride(0) != expected_stride_0:
-            raise ValueError(
-                f"input_scale stride mismatch: expected stride[0]={expected_stride_0} "
-                f"(M_padded={M_padded}), got {input_scale_transposed.stride(0)}"
-            )
+        fp8_input = torch.empty((M_padded, K), dtype=torch.float8_e4m3fn, device=input.device)
+        input_scale = torch.empty((input_scale_size), dtype=torch.float32, device=input.device)
+        runner.fp8_quantize_1x128(input, fp8_input, input_scale, False)
+        input = fp8_input[:M, :]
     else:
-        input_scale_transposed = None
+        if input_scale is not None:
+            M_padded = ((M + 4 - 1) // 4) * 4  # Round M up to multiple of 4
+            K_blocks = K // BLOCK_SIZE
 
-    runner.gemm(input, weight, out, input_scale_transposed, weight_scale)
+            # Create padded tensor with the stride TRT-LLM expects
+            input_scale_padded = torch.zeros(
+                K_blocks, M_padded, dtype=torch.float32, device=input.device
+            )
+
+            # Copy scales into the non-padded region: (K//128, M)
+            # Transpose from (M, K//128) to (K//128, M) and copy
+            input_scale_padded[:, :M] = input_scale.T
+
+            # Extract view of the actual (K//128, M) region
+            # This view has stride (M_padded, 1) which matches TRT-LLM's expectations
+            input_scale = input_scale_padded[:, :M]
+
+            # Verify stride matches TRT-LLM's expectations
+            expected_stride_0 = M_padded
+            if input_scale.stride(0) != expected_stride_0:
+                raise ValueError(
+                    f"input_scale stride mismatch: expected stride[0]={expected_stride_0} "
+                    f"(M_padded={M_padded}), got {input_scale.stride(0)}"
+                )
+        else:
+            pass
+
+    runner.run_gemm(input, weight, out, input_scale, weight_scale)
 
     return out
