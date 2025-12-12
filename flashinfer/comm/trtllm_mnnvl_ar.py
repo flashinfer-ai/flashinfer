@@ -18,6 +18,7 @@ from flashinfer.comm.mapping import Mapping
 from ..jit import gen_trtllm_mnnvl_comm_module
 from ..utils import register_custom_op
 from .mnnvl import McastGPUBuffer, CommBackend, MPIBackend
+from .workspace_base import AllReduceFusionWorkspace
 
 
 def mpi_barrier():
@@ -47,7 +48,7 @@ class MNNVLAllreduceFusionStrategy(Enum):
 MNNVL_ONE_SHOT_THRESHOLD = 64 * 1024 * 8 * 2
 
 
-class MNNVLAllreduceFusionWorkspace:
+class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
     NUM_LAMPORT_BUFFERS = 3
 
     def __init__(
@@ -75,6 +76,7 @@ class MNNVLAllreduceFusionWorkspace:
             dtype: The data type of the tensors to be reduced.
             buffer_size_in_bytes: The requested size in bytes for each lamport buffer. The actual allocation size may be larger due to alignment requirements. The actual usable size will be NUM_LAMPORT_BUFFERS * actual_buffer_size_per_lamport_buffer.
         """
+        super().__init__(mapping.world_size, mapping.rank)
 
         if buffer_size_in_bytes is None:
             assert (
@@ -222,6 +224,22 @@ class MNNVLAllreduceFusionWorkspace:
             )
         return buffer_size
 
+    @property
+    def backend(self) -> str:
+        return "mnnvl"
+
+    def destroy(self) -> None:
+        """Destroy workspace and free resources."""
+        if getattr(self, "_destroyed", False):
+            return  # Already destroyed, nothing to do
+
+        del self.mcast_buffer_handle
+        del self.buffer_flags
+        del self.uc_ptrs_dev
+        del self.uc_ptr_local
+        del self.mc_ptr
+        self._destroyed = True
+
 
 @functools.cache
 def get_trtllm_mnnvl_comm_module():
@@ -307,7 +325,7 @@ def get_trtllm_mnnvl_comm_module():
 
 def trtllm_mnnvl_allreduce(
     input: torch.Tensor,
-    workspace: MNNVLAllreduceFusionWorkspace,
+    workspace: MNNVLAllReduceFusionWorkspace,
     launch_with_pdl: bool,
     output: Optional[torch.Tensor] = None,
     strategy: MNNVLAllreduceFusionStrategy = MNNVLAllreduceFusionStrategy.AUTO,
@@ -327,7 +345,7 @@ def trtllm_mnnvl_allreduce(
 
     Args:
         input: Local Input Shard [num_tokens, hidden_dim]
-        workspace: MNNVLAllreduceFusionWorkspace
+        workspace: MNNVLAllReduceFusionWorkspace
         launch_with_pdl: Whether to launch with PDL
         output: Output tensor to store the result, empty tensor will be created if not provided.
         strategy: MNNVLAllreduceFusionStrategy. Internal heuristics will be used if not provided.
@@ -387,7 +405,7 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm(
     input: torch.Tensor,
     residual_in: torch.Tensor,
     gamma: torch.Tensor,
-    workspace: MNNVLAllreduceFusionWorkspace,
+    workspace: MNNVLAllReduceFusionWorkspace,
     epsilon: Optional[float] = None,
     output: Optional[torch.Tensor] = None,
     residual_out: Optional[torch.Tensor] = None,
@@ -404,7 +422,7 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm(
         input: Input tensor [num_tokens, hidden_dim]
         residual_in: Residual input tensor [num_tokens, hidden_dim]
         gamma: Gamma tensor [hidden_dim]
-        workspace: MNNVLAllreduceFusionWorkspace
+        workspace: MNNVLAllReduceFusionWorkspace
         epsilon: The epsilon parameter for RMSNorm, torch.finfo.eps will be used if not provided.
         output: Output tensor for normalized results [num_tokens, hidden_dim], empty tensor will be created if not provided.
         residual_out: Residual output tensor [num_tokens, hidden_dim], empty tensor will be created if not provided.
@@ -479,7 +497,7 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm(
 
 # Legacy API that has been deprecated; Left for backward compatibility
 @deprecated(
-    "get_allreduce_mnnvl_workspace is deprecated, use MNNVLAllreduceFusionWorkspace class to manage the workspace instead"
+    "get_allreduce_mnnvl_workspace is deprecated, use MNNVLAllReduceFusionWorkspace class to manage the workspace instead"
 )
 def get_allreduce_mnnvl_workspace(
     mapping: Mapping,
@@ -522,7 +540,7 @@ def get_allreduce_mnnvl_workspace(
     ) * (lcm_hidden_dim * stride)
 
     # Redirect to the new workspace allocation logic. The new kernel needs the new flag buffer layout.
-    workspace = MNNVLAllreduceFusionWorkspace(
+    workspace = MNNVLAllReduceFusionWorkspace(
         mapping,
         buffer_size_in_bytes=buffer_size_in_bytes,
         comm_backend=comm_backend_for_handle_transfer,

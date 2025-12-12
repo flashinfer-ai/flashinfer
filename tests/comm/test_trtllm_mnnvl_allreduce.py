@@ -22,7 +22,7 @@ def row_linear_residual_norm_fusion_forward(
     mapping: Mapping,
     fusion: bool,
     reference_output: tuple[torch.Tensor, ...],
-    workspace: trtllm_mnnvl_ar.MNNVLAllreduceFusionWorkspace,
+    workspace: trtllm_mnnvl_ar.MNNVLAllReduceFusionWorkspace,
 ):
     tensor_parallel_rank = mapping.tp_rank
     MPI.COMM_WORLD.barrier()
@@ -341,7 +341,7 @@ def run_mnnvl_ar_full(
             )
 
         else:
-            workspace = trtllm_mnnvl_ar.MNNVLAllreduceFusionWorkspace(
+            workspace = trtllm_mnnvl_ar.MNNVLAllReduceFusionWorkspace(
                 mapping,
                 max_num_tokens=max(seq_lens),
                 hidden_dim=hidden_size,
