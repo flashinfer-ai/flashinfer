@@ -68,7 +68,7 @@ struct CollectiveStoreTma {
 
   using CopyOpR2S =
       decltype(cutlass::epilogue::collective::detail::sm90_get_smem_store_op_for_accumulator<
-               StrideO, ElementO>());
+               StrideO, ElementO, TileShape_MN>());
   using CopyAtomR2S = Copy_Atom<CopyOpR2S, SmemElementO>;
 
   using CopyOpS2G = SM90_TMA_STORE;
@@ -81,7 +81,6 @@ struct CollectiveStoreTma {
   struct Arguments {
     ElementO* ptr_O;
     StrideO dO;
-    void* workspace;
   };
 
   struct Params {

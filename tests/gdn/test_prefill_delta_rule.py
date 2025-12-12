@@ -9,7 +9,6 @@ import pytest
 
 from .reference_delta_rule import exclusive_cumsum, blockwise_delta_rule
 
-import sys, pathlib
 
 from flashinfer.gdn_prefill import chunk_gated_delta_rule
 
@@ -29,7 +28,9 @@ def _test_prefill_kernel(
     seed: int | None = None,
 ):
     if not alpha and not beta:
-        pytest.skip("large diff due to output value amplitude explosion along token dimension")
+        pytest.skip(
+            "large diff due to output value amplitude explosion along token dimension"
+        )
 
     random.seed(seed)
     torch.random.manual_seed(seed)
@@ -44,29 +45,58 @@ def _test_prefill_kernel(
     kv_dtype = torch.float32
     device = torch.device("cuda")
     with device:
-        q, k, v = qkv_factory(seq_lens, num_q_heads, num_k_heads, num_v_heads, head_size, dtype)
+        q, k, v = qkv_factory(
+            seq_lens, num_q_heads, num_k_heads, num_v_heads, head_size, dtype
+        )
         # l2 norm k to avoid numerical instability
         k = torch.nn.functional.normalize(k, p=2.0, dim=-1)
         cu_seq_lens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int64)
         alpha = torch.rand(total_seqlen, num_sab_heads) if alpha else None
         beta = torch.rand(total_seqlen, num_sab_heads) if beta else None
 
-    our_o = torch.empty([total_seqlen, num_o_heads, head_size], dtype=q.dtype, device=q.device)
-    our_state = torch.empty((num_seqs, num_sab_heads, head_size, head_size), dtype=torch.float32, device=q.device)
+    our_o = torch.empty(
+        [total_seqlen, num_o_heads, head_size], dtype=q.dtype, device=q.device
+    )
+    our_state = torch.empty(
+        (num_seqs, num_sab_heads, head_size, head_size),
+        dtype=torch.float32,
+        device=q.device,
+    )
     our_o.fill_(float("nan"))
     our_state.fill_(float("nan"))
 
-    chunk_gated_delta_rule(q, k, v, alpha, beta, scale, None, True, cu_seq_lens, True, output=our_o, output_state=our_state)
+    chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        alpha,
+        beta,
+        scale,
+        None,
+        True,
+        cu_seq_lens,
+        True,
+        output=our_o,
+        output_state=our_state,
+    )
 
     torch.cuda.synchronize()
 
     # postprocessing raw output, ref_state is v-major, our_state is k-major, unify to v-major for testing
     our_state = our_state.transpose(-1, -2)
 
-    ref_o, ref_state = blockwise_delta_rule(q.float(), k.float(), v.float(), seq_lens, scale_factor=scale, alpha=alpha, beta=beta, kv_dtype=torch.float32)
+    ref_o, ref_state = blockwise_delta_rule(
+        q.float(),
+        k.float(),
+        v.float(),
+        seq_lens,
+        scale_factor=scale,
+        alpha=alpha,
+        beta=beta,
+        kv_dtype=torch.float32,
+    )
     ref_o = ref_o.to(q.dtype)
     ref_state = ref_state.to(kv_dtype)
-
 
     if dtype == torch.bfloat16:
         ref_o = ref_o.to(dtype)
@@ -83,11 +113,15 @@ def _test_prefill_kernel(
     torch.testing.assert_close(our_o, ref_o, atol=atol_o, rtol=rtol_o)
     torch.testing.assert_close(our_state, ref_state, atol=atol_kv, rtol=rtol_kv)
 
+
 @pytest.mark.parametrize("beta", [False, True])
 @pytest.mark.parametrize("alpha", [False, True])
 @pytest.mark.parametrize("scale", [1.0, "auto"])
 @pytest.mark.parametrize("head_size", [128])
-@pytest.mark.parametrize("num_q_heads, num_k_heads, num_v_heads", [(1, 1, 1), (4, 1, 1), (3, 3, 3), (6, 2, 2), (1, 1, 2), (2, 2 ,4)])
+@pytest.mark.parametrize(
+    "num_q_heads, num_k_heads, num_v_heads",
+    [(1, 1, 1), (4, 1, 1), (3, 3, 3), (6, 2, 2), (1, 1, 2), (2, 2, 4)],
+)
 @pytest.mark.parametrize("seq_lens", [[64], [128], [256], [256, 256], [64, 128, 512]])
 @pytest.mark.parametrize("block_size", [64])
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
@@ -106,15 +140,34 @@ def test_prefill_kernel_basic(
     seed: int = os.environ.get("SEED", 0),
 ):
     scale = 1.0 / math.sqrt(head_size) if scale == "auto" else scale
-    _test_prefill_kernel(qkv_factory, dtype, num_q_heads, num_k_heads, num_v_heads, head_size, block_size, seq_lens, scale, alpha, beta, seed)
+    _test_prefill_kernel(
+        qkv_factory,
+        dtype,
+        num_q_heads,
+        num_k_heads,
+        num_v_heads,
+        head_size,
+        block_size,
+        seq_lens,
+        scale,
+        alpha,
+        beta,
+        seed,
+    )
 
 
 @pytest.mark.parametrize("beta", [False, True])
 @pytest.mark.parametrize("alpha", [False, True])
 @pytest.mark.parametrize("scale", [1.0, "auto"])
 @pytest.mark.parametrize("head_size", [128])
-@pytest.mark.parametrize("num_q_heads, num_k_heads, num_v_heads", [(1, 1, 1), (4, 1, 1), (3, 3, 3), (6, 2, 2), (1, 1, 2), (2, 2 ,4)])
-@pytest.mark.parametrize("seq_lens", [[31], [61], [91], [121], [251], [511, 501], [31, 63, 93, 123, 150, 500]])
+@pytest.mark.parametrize(
+    "num_q_heads, num_k_heads, num_v_heads",
+    [(1, 1, 1), (4, 1, 1), (3, 3, 3), (6, 2, 2), (1, 1, 2), (2, 2, 4)],
+)
+@pytest.mark.parametrize(
+    "seq_lens",
+    [[31], [61], [91], [121], [251], [511, 501], [31, 63, 93, 123, 150, 500]],
+)
 @pytest.mark.parametrize("block_size", [32])
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
 def test_prefill_kernel_nonfull(
@@ -132,7 +185,20 @@ def test_prefill_kernel_nonfull(
     seed: int = os.environ.get("SEED", 0),
 ):
     scale = 1.0 / math.sqrt(head_size) if scale == "auto" else scale
-    _test_prefill_kernel(qkv_factory, dtype, num_q_heads, num_k_heads, num_v_heads, head_size, block_size, seq_lens, scale, alpha, beta, seed)
+    _test_prefill_kernel(
+        qkv_factory,
+        dtype,
+        num_q_heads,
+        num_k_heads,
+        num_v_heads,
+        head_size,
+        block_size,
+        seq_lens,
+        scale,
+        alpha,
+        beta,
+        seed,
+    )
 
 
 def _test_chunked_prefill(
@@ -151,7 +217,9 @@ def _test_chunked_prefill(
     seed: int | None = None,
 ):
     if not alpha and not beta:
-        pytest.skip("large diff due to output value amplitude explosion along token dimension")
+        pytest.skip(
+            "large diff due to output value amplitude explosion along token dimension"
+        )
 
     random.seed(seed)
     torch.random.manual_seed(seed)
@@ -168,8 +236,12 @@ def _test_chunked_prefill(
     kv_dtype = torch.float32
     device = torch.device("cuda")
     with device:
-        q1, k1, v1 = qkv_factory(seq_lens1, num_q_heads, num_k_heads, num_v_heads, head_size, dtype)
-        q2, k2, v2 = qkv_factory(seq_lens2, num_q_heads, num_k_heads, num_v_heads, head_size, dtype)
+        q1, k1, v1 = qkv_factory(
+            seq_lens1, num_q_heads, num_k_heads, num_v_heads, head_size, dtype
+        )
+        q2, k2, v2 = qkv_factory(
+            seq_lens2, num_q_heads, num_k_heads, num_v_heads, head_size, dtype
+        )
         # l2 norm k to avoid numerical instability
         k1 = torch.nn.functional.normalize(k1, p=2.0, dim=-1)
         k2 = torch.nn.functional.normalize(k2, p=2.0, dim=-1)
@@ -180,17 +252,55 @@ def _test_chunked_prefill(
         beta1 = torch.rand(total_seqlen1, num_sab_heads) if beta else None
         beta2 = torch.rand(total_seqlen2, num_sab_heads) if beta else None
 
-    our_o1 = torch.empty([total_seqlen1, num_o_heads, head_size], dtype=q1.dtype, device=q1.device)
-    our_o2 = torch.empty([total_seqlen2, num_o_heads, head_size], dtype=q2.dtype, device=q2.device)
-    our_state1 = torch.empty((num_seqs, num_sab_heads, head_size, head_size), dtype=torch.float32, device=q1.device)
-    our_state2 = torch.empty((num_seqs, num_sab_heads, head_size, head_size), dtype=torch.float32, device=q1.device)
+    our_o1 = torch.empty(
+        [total_seqlen1, num_o_heads, head_size], dtype=q1.dtype, device=q1.device
+    )
+    our_o2 = torch.empty(
+        [total_seqlen2, num_o_heads, head_size], dtype=q2.dtype, device=q2.device
+    )
+    our_state1 = torch.empty(
+        (num_seqs, num_sab_heads, head_size, head_size),
+        dtype=torch.float32,
+        device=q1.device,
+    )
+    our_state2 = torch.empty(
+        (num_seqs, num_sab_heads, head_size, head_size),
+        dtype=torch.float32,
+        device=q1.device,
+    )
     our_o1.fill_(float("nan"))
     our_o2.fill_(float("nan"))
     our_state1.fill_(float("nan"))
     our_state2.fill_(float("nan"))
 
-    chunk_gated_delta_rule(q1, k1, v1, alpha1, beta1, scale, None, True, cu_seq_lens1, True, output=our_o1, output_state=our_state1)
-    chunk_gated_delta_rule(q2, k2, v2, alpha2, beta2, scale, our_state1, True, cu_seq_lens2, True, output=our_o2, output_state=our_state2)
+    chunk_gated_delta_rule(
+        q1,
+        k1,
+        v1,
+        alpha1,
+        beta1,
+        scale,
+        None,
+        True,
+        cu_seq_lens1,
+        True,
+        output=our_o1,
+        output_state=our_state1,
+    )
+    chunk_gated_delta_rule(
+        q2,
+        k2,
+        v2,
+        alpha2,
+        beta2,
+        scale,
+        our_state1,
+        True,
+        cu_seq_lens2,
+        True,
+        output=our_o2,
+        output_state=our_state2,
+    )
     our_state = our_state2
 
     torch.cuda.synchronize()
@@ -203,8 +313,8 @@ def _test_chunked_prefill(
         for i in range(cu_seq_lens1.size(0) - 1):
             s1 = cu_seq_lens1[i]
             s2 = cu_seq_lens2[i]
-            e1 = cu_seq_lens1[i+1]
-            e2 = cu_seq_lens2[i+1]
+            e1 = cu_seq_lens1[i + 1]
+            e2 = cu_seq_lens2[i + 1]
             output.append(t1[s1:e1])
             output.append(t2[s2:e2])
         return torch.concat(output)
@@ -219,12 +329,20 @@ def _test_chunked_prefill(
     alpha = concat_varlen(alpha1, cu_seq_lens1, alpha2, cu_seq_lens2) if alpha else None
     beta = concat_varlen(beta1, cu_seq_lens1, beta2, cu_seq_lens2) if beta else None
 
-    seq_lens = [a+b for a, b in zip(seq_lens1, seq_lens2)]
+    seq_lens = [a + b for a, b in zip(seq_lens1, seq_lens2, strict=True)]
 
-    ref_o, ref_state = blockwise_delta_rule(q.float(), k.float(), v.float(), seq_lens, scale_factor=scale, alpha=alpha, beta=beta, kv_dtype=torch.float32)
+    ref_o, ref_state = blockwise_delta_rule(
+        q.float(),
+        k.float(),
+        v.float(),
+        seq_lens,
+        scale_factor=scale,
+        alpha=alpha,
+        beta=beta,
+        kv_dtype=torch.float32,
+    )
     ref_o = ref_o.to(q.dtype)
     ref_state = ref_state.to(kv_dtype)
-
 
     if dtype == torch.bfloat16:
         ref_o = ref_o.to(dtype)
@@ -241,17 +359,21 @@ def _test_chunked_prefill(
     torch.testing.assert_close(our_o, ref_o, atol=atol_o, rtol=rtol_o)
     torch.testing.assert_close(our_state, ref_state, atol=atol_kv, rtol=rtol_kv)
 
+
 @pytest.mark.parametrize("beta", [False, True])
 @pytest.mark.parametrize("alpha", [False, True])
 @pytest.mark.parametrize("scale", [1.0, "auto"])
 @pytest.mark.parametrize("head_size", [128])
-@pytest.mark.parametrize("num_q_heads, num_k_heads, num_v_heads", [(6, 2, 2), (2, 2, 4)])
+@pytest.mark.parametrize(
+    "num_q_heads, num_k_heads, num_v_heads", [(6, 2, 2), (2, 2, 4)]
+)
 @pytest.mark.parametrize(
     "seq_lens1, seq_lens2",
     list(
         zip(
             [[61], [128], [511, 501], [256, 256], [123, 150, 500], [64, 128, 512]],
             [[128], [61], [256, 256], [511, 501], [64, 128, 512], [123, 150, 500]],
+            strict=True,
         )
     ),
 )
@@ -273,4 +395,18 @@ def test_chunked_prefill(
     seed: int = os.environ.get("SEED", 0),
 ):
     scale = 1.0 / math.sqrt(head_size) if scale == "auto" else scale
-    _test_chunked_prefill(qkv_factory, dtype, num_q_heads, num_k_heads, num_v_heads, head_size, block_size, seq_lens1, seq_lens2, scale, alpha, beta, seed)
+    _test_chunked_prefill(
+        qkv_factory,
+        dtype,
+        num_q_heads,
+        num_k_heads,
+        num_v_heads,
+        head_size,
+        block_size,
+        seq_lens1,
+        seq_lens2,
+        scale,
+        alpha,
+        beta,
+        seed,
+    )

@@ -395,8 +395,6 @@ struct FlatMainloopTmaWarpSpecializedDeltaRule {
     TMA_K tma_load_k;
     TMA_V tma_load_v;
     TMA_O tma_store_o;
-    Element* ptr_O;
-    LayoutV dO;
     void* tensormaps;
     float scale;
 

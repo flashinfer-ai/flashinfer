@@ -1,9 +1,8 @@
 #pragma once
 
+#include "cute/tensor.hpp"
 #include "cutlass/cutlass.h"
 #include "cutlass/pipeline/sm90_pipeline.hpp"
-#include "cute/tensor.hpp"
-
 #include "flat/unused.hpp"
 
 namespace flat::collective {
@@ -15,8 +14,7 @@ enum class LoadKindVector {
   kBeta,
 };
 
-CUTE_HOST_DEVICE constexpr char const*
-to_string(LoadKindVector kind) {
+CUTE_HOST_DEVICE constexpr char const* to_string(LoadKindVector kind) {
   if (kind == LoadKindVector::kAlpha) {
     return "alpha";
   } else if (kind == LoadKindVector::kBeta) {
@@ -26,12 +24,8 @@ to_string(LoadKindVector kind) {
   }
 }
 
-template <
-    LoadKindVector kKind,
-    class Pipeline,
-    class ElementSrc, class GmemLayout,
-    class ElementDst, class SmemLayout,
-    class VectorProcessor_ = Unused>
+template <LoadKindVector kKind, class Pipeline, class ElementSrc, class GmemLayout,
+          class ElementDst, class SmemLayout, class VectorProcessor_ = Unused>
 struct CollectiveLoadVector {
   using SharedStorage = cute::array_aligned<ElementDst, cute::cosize_v<SmemLayout>>;
   using PipelineState = typename cutlass::PipelineState<Pipeline::Stages>;
@@ -40,26 +34,33 @@ struct CollectiveLoadVector {
 
   static_assert(rank_v<SmemLayout> == 2 || rank_v<SmemLayout> == 3);
 
-  static constexpr LoadKindVector kind       = kKind;
-  static constexpr int            VectorSize = size<0>(SmemLayout{});
+  static constexpr LoadKindVector kind = kKind;
+  static constexpr int VectorSize = size<0>(SmemLayout{});
 
   CUTE_DEVICE
-  CollectiveLoadVector(ElementSrc const* src, GmemLayout layout, ElementSrc oob_value, Pipeline& pipeline, SharedStorage& storage)
-      : src_(src), src_layout_(layout), src_oob_value_(oob_value), pipeline_(pipeline), storage_(storage) {}
+  CollectiveLoadVector(ElementSrc const* src, GmemLayout layout, ElementSrc oob_value,
+                       Pipeline& pipeline, SharedStorage& storage)
+      : src_(src),
+        src_layout_(layout),
+        src_oob_value_(oob_value),
+        pipeline_(pipeline),
+        storage_(storage) {}
 
   template <class ProblemSize, class TileShape, class WorkDesc>
-  CUTE_DEVICE auto
-  partition_SD(ProblemSize const& problem_size, TileShape const& tile_shape, WorkDesc const& work_desc) {
+  CUTE_DEVICE auto partition_SD(ProblemSize const& problem_size, TileShape const& tile_shape,
+                                WorkDesc const& work_desc) {
     constexpr auto BlkSeqQ = decltype(get<0>(tile_shape))::value;
 
     Tensor g = [&] {
       auto head_idx = work_desc.o_head_idx();  // num_o_heads == num_sab_heads
-      DPRINTF0_W("slice view GMEM %s: seq_idx:%d head_idx:%d tok_offset:%lld\n", to_string(kind), work_desc.seq_idx, head_idx, work_desc.tok_offset);
+      DPRINTF0_W("slice view GMEM %s: seq_idx:%d head_idx:%d tok_offset:%lld\n", to_string(kind),
+                 work_desc.seq_idx, head_idx, work_desc.tok_offset);
       Tensor m_varlen_head = make_tensor(make_gmem_ptr(src_), src_layout_);
 
-      Tensor m_varlen = m_varlen_head(_, head_idx);                                 // slice into current head_idx
-      Tensor m_offset = domain_offset(make_coord(work_desc.tok_offset), m_varlen);  // offset to start of the current sequence
-      Tensor g_full   = flat_divide(m_offset, BlkSeqQ);                             // (blk, iter_blk)
+      Tensor m_varlen = m_varlen_head(_, head_idx);  // slice into current head_idx
+      Tensor m_offset = domain_offset(make_coord(work_desc.tok_offset),
+                                      m_varlen);       // offset to start of the current sequence
+      Tensor g_full = flat_divide(m_offset, BlkSeqQ);  // (blk, iter_blk)
       return g_full;
     }();
     // (blk, pipe) or (blk, pipe, N), N for feature rich preprocess, data will be stored at 0
@@ -67,14 +68,21 @@ struct CollectiveLoadVector {
 
     auto thr_layout = Layout<_32>{};
     auto val_layout = Layout<_1>{};
-    auto tiled_copy = make_tiled_copy(Copy_Atom<UniversalCopy<ElementSrc>, ElementDst>{}, thr_layout, val_layout);
-    auto thr_copy   = tiled_copy.get_thread_slice(cutlass::canonical_lane_idx());
+    auto tiled_copy =
+        make_tiled_copy(Copy_Atom<UniversalCopy<ElementSrc>, ElementDst>{}, thr_layout, val_layout);
+    auto thr_copy = tiled_copy.get_thread_slice(cutlass::canonical_lane_idx());
 
-    auto coord           = thr_copy.partition_S(make_identity_tensor(Shape<Int<BlkSeqQ>, _1>{}));
+    auto coord = thr_copy.partition_S(make_identity_tensor(Shape<Int<BlkSeqQ>, _1>{}));
     auto len_of_last_blk = work_desc.seq_len - (ceil_div(work_desc.seq_len, BlkSeqQ) - 1) * BlkSeqQ;
 
-    auto mask = FunctionPredTensor([coord, len_of_last_blk](auto frag_coord) {
-      auto coord_in_blk = get<0>(coord(frag_coord));
+    // auto mask = FunctionPredTensor([coord, len_of_last_blk](auto frag_coord) {
+    //   auto coord_in_blk = get<0>(coord(frag_coord));
+    //   return coord_in_blk < len_of_last_blk;
+    // });
+    // NOTE: old FunctionPredTensor is easier to understand, cute::lazy::transform means
+    //   coord(runtime_input) and then transfrom with the given lambda
+    auto mask = cute::lazy::transform(coord, [len_of_last_blk](auto const& c) {
+      auto coord_in_blk = get<0>(c);
       return coord_in_blk < len_of_last_blk;
     });
 
@@ -85,12 +93,12 @@ struct CollectiveLoadVector {
   }
 
   template <bool IsTail, class SrcDst>
-  CUTE_DEVICE void
-  step(SrcDst const& src_dst, int src_iter, PipelineState& dst_pipe, int num_iters, VectorProcessor processor = {}) {
+  CUTE_DEVICE void step(SrcDst const& src_dst, int src_iter, PipelineState& dst_pipe, int num_iters,
+                        VectorProcessor processor = {}) {
     auto src = get<0>(src_dst);
     auto dst = get<1>(src_dst);
 
-    auto regs = make_fragment_like<ElementSrc>(take<0,2>(shape(dst)));
+    auto regs = make_fragment_like<ElementSrc>(take<0, 2>(shape(dst)));
     if constexpr (!IsTail) {
       copy(src(_, _, src_iter), regs);
     } else {
@@ -125,12 +133,12 @@ struct CollectiveLoadVector {
     ++dst_pipe;
   }
 
-private:
+ private:
   ElementSrc const* src_;
-  GmemLayout        src_layout_;  // in (packed_seq, H) coordinate
-  ElementSrc        src_oob_value_;
-  Pipeline&         pipeline_;
-  SharedStorage&    storage_;
+  GmemLayout src_layout_;  // in (packed_seq, H) coordinate
+  ElementSrc src_oob_value_;
+  Pipeline& pipeline_;
+  SharedStorage& storage_;
 };
 
 }  // namespace flat::collective

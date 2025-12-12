@@ -2,10 +2,11 @@ import functools
 
 import pytest
 import torch
-import torch.distributions as dist
 
 
-def multidist_randn(num_dists, dim, mean_mean=0.0, mean_std=1.0, scale_lower=0.5, scale_upper=1.5):
+def multidist_randn(
+    num_dists, dim, mean_mean=0.0, mean_std=1.0, scale_lower=0.5, scale_upper=1.5
+):
     means = torch.distributions.Normal(mean_mean, mean_std).sample((num_dists,))
     scales = torch.distributions.Uniform(scale_lower, scale_upper).sample((num_dists,))
     data = torch.distributions.Normal(means, scales).sample((dim,))
@@ -18,7 +19,9 @@ def multidist_randu(num_dists, dim, mean_mean=0.0, mean_std=1.0, lower=-1.0, upp
     return data.T.contiguous()
 
 
-def gen_qkv(seq_lens, num_q_heads, num_k_heads, num_v_heads, head_size, dtype=torch.float16):
+def gen_qkv(
+    seq_lens, num_q_heads, num_k_heads, num_v_heads, head_size, dtype=torch.float16
+):
     # qkv_rng = functools.partial(multidist_randn, mean_std=0.1)
     qkv_rng = functools.partial(multidist_randu, mean_std=0.05, lower=-0.25, upper=0.25)
 
