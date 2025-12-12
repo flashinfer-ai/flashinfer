@@ -223,16 +223,15 @@ else
             continue
         fi
 
-        # Create a temporary file with the node IDs
-        TEMP_NODE_FILE=$(mktemp)
-        echo "$SAMPLED_NODE_IDS" > "$TEMP_NODE_FILE"
+        # Create a bash array with the node IDs
+        mapfile -t SAMPLED_NODE_IDS_ARRAY <<< "$SAMPLED_NODE_IDS"
 
         JUNIT_FLAG="--junitxml=${JUNIT_DIR}/${test_file}.xml"
 
         # Run pytest with the sampled node IDs
         TOTAL_TESTS=$((TOTAL_TESTS + 1))
 
-        if pytest $PYTEST_FLAGS "${JUNIT_FLAG}" $(cat "$TEMP_NODE_FILE" | tr '\n' ' '); then
+        if pytest $PYTEST_FLAGS "${JUNIT_FLAG}" "${SAMPLED_NODE_IDS_ARRAY[@]}"; then
             echo "✅ PASSED: $test_file ($SAMPLED_IN_FILE/$TOTAL_IN_FILE tests)"
             PASSED_TESTS=$((PASSED_TESTS + 1))
         else
@@ -241,7 +240,6 @@ else
             EXIT_CODE=1
         fi
 
-        rm -f "$TEMP_NODE_FILE"
         echo ""
     done
 
