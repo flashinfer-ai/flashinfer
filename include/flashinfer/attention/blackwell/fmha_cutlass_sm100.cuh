@@ -76,7 +76,8 @@ struct FwdRunner {
                          IdType* qo_segment_offsets, IdType* kv_segment_offsets,
                          IdType* work_indptr, IdType* qo_tile_indices, IdType* qo_head_indices,
                          IdType* batch_indices, DTypeOut* o, float* maybe_lse, int mask_mode_code,
-                         double sm_scale, int num_qo_heads, int num_kv_heads, int head_dim_qk,
+                         double sm_scale, double q_scale, double k_scale, double v_scale,
+                         double o_scale, int num_qo_heads, int num_kv_heads, int head_dim_qk,
                          int head_dim_vo, int q_stride_n, int q_stride_h, int k_stride_n,
                          int k_stride_h, int v_stride_n, int v_stride_h, int batch_size,
                          int total_qo_len, int total_kv_len, int max_qo_len, cudaStream_t stream) {
@@ -120,7 +121,7 @@ struct FwdRunner {
 
     typename Operation::Arguments arguments{
         problem_shape,
-        {q, layout_Q, k, layout_K, v, layout_V, sm_scale},
+        {q, layout_Q, k, layout_K, v, layout_V, sm_scale, q_scale, k_scale, v_scale, o_scale},
         {o - max_qo_len * get<0>(stride_O), layout_O, maybe_lse, layout_LSE, max_qo_len},
         {work_indptr, qo_tile_indices, qo_head_indices, batch_indices},
         hw_info};
@@ -163,16 +164,17 @@ cudaError_t run_fmha_fwd(void* workspace_buffer, DTypeIn* q, DTypeIn* k, DTypeIn
                          IdType* qo_segment_offsets, IdType* kv_segment_offsets,
                          IdType* work_indptr, IdType* qo_tile_indices, IdType* qo_head_indices,
                          IdType* batch_indices, DTypeOut* o, float* maybe_lse, int mask_mode_code,
-                         double sm_scale, int num_qo_heads, int num_kv_heads, int head_dim_qk,
+                         double sm_scale, double q_scale, double k_scale, double v_scale,
+                         double o_scale, int num_qo_heads, int num_kv_heads, int head_dim_qk,
                          int head_dim_vo, int q_stride_n, int q_stride_h, int k_stride_n,
                          int k_stride_h, int v_stride_n, int v_stride_h, int batch_size,
                          int total_qo_len, int total_kv_len, int max_qo_len, cudaStream_t stream) {
   return FwdRunner<DTypeIn, DTypeOut, IdType, TileShapeQK, TileShapePV, ActiveMask>::run(
       workspace_buffer, q, k, v, qo_segment_offsets, kv_segment_offsets, work_indptr,
       qo_tile_indices, qo_head_indices, batch_indices, o, maybe_lse, mask_mode_code, sm_scale,
-      num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, q_stride_n, q_stride_h, k_stride_n,
-      k_stride_h, v_stride_n, v_stride_h, batch_size, total_qo_len, total_kv_len, max_qo_len,
-      stream);
+      q_scale, k_scale, v_scale, o_scale, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo,
+      q_stride_n, q_stride_h, k_stride_n, k_stride_h, v_stride_n, v_stride_h, batch_size,
+      total_qo_len, total_kv_len, max_qo_len, stream);
 }
 
 };  // namespace flashinfer

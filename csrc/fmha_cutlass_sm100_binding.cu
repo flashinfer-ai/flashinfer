@@ -22,8 +22,8 @@ void FMHACutlassSM100Run(TensorView workspace_buffer, TensorView q, TensorView k
                          TensorView work_indptr, TensorView qo_tile_indices,
                          TensorView qo_head_indices, TensorView batch_indices, TensorView o,
                          Optional<TensorView> maybe_lse, int64_t mask_mode_code, double sm_scale,
-                         int64_t num_qo_heads, int64_t num_kv_heads, int64_t head_dim_qk,
-                         int64_t head_dim_vo, int64_t max_qo_len);
+                         double scale_q, double scale_k, double scale_v, double o_scale,
+                         int64_t max_qo_len);
 
 void blackwell_fmha_plan(TensorView qo_segment_offsets, TensorView kv_segment_offsets,
                          TensorView work_indptr, TensorView qo_tile_indices,
