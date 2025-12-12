@@ -1,6 +1,5 @@
 # Test for unified AllReduce API with multiple backends
 # Run with: mpirun -np <num_gpus> pytest tests/comm/test_allreduce_unified_api.py -vv -s
-import os
 import traceback
 from typing import Tuple
 
@@ -22,33 +21,11 @@ from flashinfer.comm import (
 # Use flashinfer.norm.rmsnorm as reference implementation.
 from flashinfer.norm import rmsnorm
 
-
-def init_torch_distributed_from_mpi():
-    """Initialize torch.distributed using MPI rank info."""
-    comm = MPI.COMM_WORLD
-    rank = comm.Get_rank()
-    world_size = comm.Get_size()
-
-    if dist.is_initialized():
-        return
-
-    # Set environment variables for torch.distributed
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "29500"
-    os.environ["RANK"] = str(rank)
-    os.environ["WORLD_SIZE"] = str(world_size)
-
-    dist.init_process_group(
-        backend="nccl",
-        rank=rank,
-        world_size=world_size,
-    )
-
-
-def cleanup_torch_distributed():
-    """Cleanup torch.distributed if initialized."""
-    if dist.is_initialized():
-        dist.destroy_process_group()
+# Test helpers
+from tests.test_helpers.comm import (
+    init_torch_distributed_from_mpi,
+    cleanup_torch_distributed,
+)
 
 
 @torch.inference_mode()

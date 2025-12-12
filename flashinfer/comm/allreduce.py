@@ -311,7 +311,7 @@ def create_allreduce_fusion_workspace(
       - (token_num=1024, hidden_dim=8192) ✓ (same total size)
       - (token_num=4096, hidden_dim=4096) ✗ (too large)
 
-    Use `workspace.is_sufficient_for(token_num, hidden_dim, dtype)` to check before use.
+    Use `workspace.is_buffer_size_sufficient(token_num, hidden_dim, dtype)` to check before use.
 
     Args:
         backend: Backend to use ("trtllm", "mnnvl", or "auto")
@@ -352,8 +352,8 @@ def create_allreduce_fusion_workspace(
         >>> print(workspace.get_workspace_capacity())  # 8388608 elements
 
         >>> # Check if workspace can handle different problem sizes
-        >>> workspace.is_sufficient_for(1024, 4096, 8, torch.bfloat16)  # True
-        >>> workspace.is_sufficient_for(4096, 2048, 8, torch.bfloat16)  # True (same total)
+        >>> workspace.is_buffer_size_sufficient(1024, 4096, 8, torch.bfloat16)  # True
+        >>> workspace.is_buffer_size_sufficient(4096, 2048, 8, torch.bfloat16)  # True (same total)
 
         >>> # Explicit backend selection
         >>> workspace = create_allreduce_fusion_workspace(
@@ -482,7 +482,7 @@ def allreduce_fusion(
 
     **Note on Workspace Reusability:**
     You can reuse the same workspace with different (token_num, hidden_dim) combinations
-    as long as `workspace.is_sufficient_for(token_num, hidden_dim, tp_size, dtype)` returns True.
+    as long as `workspace.is_buffer_size_sufficient(token_num, hidden_dim, tp_size, dtype)` returns True.
 
     Args:
         input: Input tensor [token_num, hidden_dim]

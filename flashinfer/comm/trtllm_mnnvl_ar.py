@@ -78,7 +78,6 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         """
         super().__init__(mapping.world_size, mapping.rank)
 
-        print("Allocating MNNVL Allreduce Fusion Workspace...")
         if buffer_size_in_bytes is None:
             assert (
                 max_num_tokens is not None

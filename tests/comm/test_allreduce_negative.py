@@ -3,7 +3,7 @@
 
 import pytest
 import torch
-from mpi4py import MPI
+import torch.distributed as dist
 
 import flashinfer.comm.trtllm_mnnvl_ar as trtllm_mnnvl_ar
 
@@ -14,23 +14,12 @@ from flashinfer.comm import (
     QuantizationSFLayout,
 )
 
-
-def setup_mpi_and_cuda():
-    """Setup MPI and CUDA device for tests."""
-    comm = MPI.COMM_WORLD
-    rank = comm.Get_rank()
-    world_size = comm.Get_size()
-    gpus_per_node = torch.cuda.device_count()
-
-    if gpus_per_node == 0:
-        pytest.skip("Tests require at least one CUDA device per node")
-    if world_size < 2:
-        pytest.skip(f"Tests require at least 2 MPI ranks, got {world_size}")
-
-    local_rank = rank % gpus_per_node
-    torch.cuda.set_device(local_rank)
-
-    return rank, world_size, gpus_per_node
+# Test helpers
+from tests.test_helpers.comm import (
+    setup_mpi_and_cuda,
+    init_torch_distributed_from_mpi,
+    cleanup_torch_distributed,
+)
 
 
 class TestMNNVLUnsupportedPatterns:
@@ -183,3 +172,101 @@ class TestMNNVLMissingRequiredParameters:
                 residual_in=residual,
                 # rms_gamma is missing
             )
+
+
+@pytest.mark.parametrize("backend", ["mnnvl", "trtllm"])
+class TestBufferSizeSufficient:
+    """Test is_buffer_size_sufficient method for different backends."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self, backend):
+        """Setup workspace with small buffer for testing."""
+        self.backend = backend
+        self.rank, self.world_size, self.gpus_per_node = setup_mpi_and_cuda()
+
+        # Initialize torch.distributed for trtllm backend
+        self.process_group = None
+        if backend == "trtllm":
+            init_torch_distributed_from_mpi()
+            self.process_group = dist.group.WORLD
+
+        # Create workspace with small max_token_num to test buffer limits
+        self.max_token_num = 64
+        self.hidden_dim = 2880
+        self.dtype = torch.float16
+
+        self.workspace = create_allreduce_fusion_workspace(
+            backend=backend,
+            world_size=self.world_size,
+            rank=self.rank,
+            max_token_num=self.max_token_num,
+            hidden_dim=self.hidden_dim,
+            dtype=self.dtype,
+            topology="single_node",
+            gpus_per_node=self.gpus_per_node,
+            process_group=self.process_group,
+        )
+
+        yield
+
+        # Cleanup
+        if self.workspace is not None:
+            self.workspace.destroy()
+        if backend == "trtllm":
+            cleanup_torch_distributed()
+        trtllm_mnnvl_ar.mpi_barrier()
+
+    def test_buffer_sufficient_for_smaller_size(self, backend):
+        """Test that is_buffer_size_sufficient returns True for sizes within capacity."""
+        # Use smaller size than max_token_num
+        result = self.workspace.is_buffer_size_sufficient(
+            tp_size=self.world_size,
+            num_tokens=self.max_token_num // 2,
+            hidden_dim=self.hidden_dim,
+            dtype=self.dtype,
+        )
+        assert result is True, (
+            f"[{backend}] Buffer should be sufficient for smaller token count"
+        )
+
+    def test_buffer_sufficient_for_exact_size(self, backend):
+        """Test that is_buffer_size_sufficient returns True for exact capacity."""
+        result = self.workspace.is_buffer_size_sufficient(
+            tp_size=self.world_size,
+            num_tokens=self.max_token_num,
+            hidden_dim=self.hidden_dim,
+            dtype=self.dtype,
+        )
+        assert result is True, (
+            f"[{backend}] Buffer should be sufficient for exact max token count"
+        )
+
+    def test_buffer_insufficient_for_larger_size(self, backend):
+        """Test that is_buffer_size_sufficient returns False for sizes exceeding capacity."""
+        # Calculate the actual buffer capacity and use a size that definitely exceeds it
+        elem_size = torch.tensor([], dtype=self.dtype).element_size()
+
+        if backend == "mnnvl":
+            # For MNNVL two-shot: buffer_size >= 2 * ceil(num_tokens/tp_size) * tp_size * hidden_dim * elem_size
+            max_tokens_in_buffer = self.workspace.buffer_size_bytes // (
+                2 * self.hidden_dim * elem_size
+            )
+        else:
+            # For TRTLLM: use metadata to determine max capacity
+            max_tokens_in_buffer = (
+                self.workspace.metadata["max_token_num"]
+                * self.workspace.metadata["hidden_dim"]
+            ) // self.hidden_dim
+
+        large_num_tokens = max_tokens_in_buffer * 10  # Use 10x the capacity
+
+        result = self.workspace.is_buffer_size_sufficient(
+            tp_size=self.world_size,
+            num_tokens=large_num_tokens,
+            hidden_dim=self.hidden_dim,
+            dtype=self.dtype,
+        )
+        assert result is False, (
+            f"[{backend}] Buffer should be insufficient for {large_num_tokens} tokens "
+            f"(buffer can hold ~{max_tokens_in_buffer})"
+        )
