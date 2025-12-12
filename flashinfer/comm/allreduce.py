@@ -162,7 +162,7 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
 
     def destroy(self) -> None:
         """Destroy workspace and free resources."""
-        if self._destroyed is True:
+        if getattr(self, "_destroyed", False):
             return  # Already destroyed, nothing to do
 
         trtllm_destroy_ipc_workspace_for_all_reduce_fusion(self.ipc_handles)
@@ -182,7 +182,6 @@ def _trtllm_workspace_check(
     hidden_dim: int,
     dtype: torch.dtype,
     topology: str,
-    **kwargs,
 ) -> bool:
     """
     Check if trtllm backend CAN be used for workspace creation.
@@ -206,7 +205,6 @@ def _mnnvl_workspace_check(
     hidden_dim: int,
     dtype: torch.dtype,
     topology: str,
-    **kwargs,
 ) -> bool:
     """
     Check if mnnvl backend CAN be used for workspace creation.
@@ -216,7 +214,7 @@ def _mnnvl_workspace_check(
     if topology == "multi_node":
         return True
 
-    return False
+    return True
 
 
 # ============================================================================
@@ -233,8 +231,6 @@ def _workspace_creation_heuristic(
     hidden_dim: int,
     dtype: torch.dtype,
     topology: str,
-    # TODO(nvmbreughe): Remove this
-    **kwargs,
 ) -> list[str]:
     """
     Select best backend for workspace creation based on performance.
@@ -253,6 +249,8 @@ def _workspace_creation_heuristic(
         topology: Network topology ("single_node" or "multi_node")
         **kwargs: Additional arguments
 
+    Note that at this point, the backend selection does not take "runtime parameters" into account, such as layout_code, and fusion pattern.
+
     Returns:
         List containing the selected backend (single element)
     """
@@ -263,18 +261,21 @@ def _workspace_creation_heuristic(
         return suitable_backends
 
     # Decision tree based on benchmark data
-    # TODO: Replace with actual benchmarking results
 
     # Multi-node: MNNVL is designed for this
     if topology == "multi_node":
         if "mnnvl" in suitable_backends:
             return ["mnnvl"]
+        else:
+            return [suitable_backends[0]]
 
     # Single-node scenarios
-    elif "trtllm" in suitable_backends:
-        return ["trtllm"]
+    # From benchmarking data, we can see that MNNVL is either on par (smaller problem sizes) or significantly faster than TRTLLM (larger problem sizes such as hidden_dim=8192, token_num=64 for TP=4), for single-node scenarios.
+    # However, trtllm has a larger support surface (more fusion patterns, more quantization support, etc.)
+    if "mnnvl" in suitable_backends:
+        return ["mnnvl"]
     else:
-        return []
+        return [suitable_backends[0]]
 
 
 # ============================================================================
@@ -410,7 +411,7 @@ def create_allreduce_fusion_workspace(
             dtype=dtype,
             topology=topology,
         )
-        actual_backend = selected[0] if selected else suitable_backends[0]
+        actual_backend = selected[0]
     else:
         actual_backend = backend
 
@@ -472,8 +473,7 @@ def allreduce_fusion(
     """
     AllReduce + RMSNorm fusion operation.
 
-    Backend is automatically determined from workspace type.
-    No backend parameter needed!
+    Backend is automatically determined from workspace type. If you need another backend, create the workspace for the desired backend.
 
     Supports multiple fusion patterns:
     - AllReduce only
@@ -486,7 +486,7 @@ def allreduce_fusion(
 
     Args:
         input: Input tensor [token_num, hidden_dim]
-        workspace: Workspace object (type determines backend)
+        workspace: Workspace object (type determines backend, see create_allreduce_fusion_workspace)
         pattern: Fusion pattern (AllReduceFusionPattern constant, 0-5)
                  - kAllReduce = 0
                  - kARResidualRMSNorm = 1
@@ -644,7 +644,12 @@ def allreduce_fusion(
             and pattern != AllReduceFusionPattern.kAllReduce
         ):
             raise ValueError(
-                f"MNNVL AllReduce+RMS fusion does not support pattern {pattern}"
+                f"MNNVL AllReduce+RMS fusion does not support pattern {pattern}. Please try the TRTLLM backend instead."
+            )
+
+        if layout_code is not None:
+            raise ValueError(
+                "MNNVL AllReduce does not support quantization fusion and thus no layout_code"
             )
 
         # MNNVL backend implementation

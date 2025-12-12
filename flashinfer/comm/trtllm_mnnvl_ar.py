@@ -231,10 +231,14 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
 
     def destroy(self) -> None:
         """Destroy workspace and free resources."""
-        if self._destroyed:
+        if getattr(self, "_destroyed", False):
             return  # Already destroyed, nothing to do
 
-        # TODO: Implement proper cleanup of mcast_buffer_handle if needed
+        del self.mcast_buffer_handle
+        del self.buffer_flags
+        del self.uc_ptrs_dev
+        del self.uc_ptr_local
+        del self.mc_ptr
         self._destroyed = True
 
 

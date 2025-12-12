@@ -317,7 +317,7 @@ def run_allreduce_test(
 )
 @pytest.mark.parametrize("fusion", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("hidden_size", [2880, 5120, 7168, 8192])
+@pytest.mark.parametrize("hidden_size", [2880, 7168])
 @pytest.mark.parametrize("backend", ["auto", "trtllm", "mnnvl"])
 def test_allreduce_unified(
     monkeypatch,

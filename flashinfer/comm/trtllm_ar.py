@@ -123,7 +123,7 @@ def get_trtllm_comm_module():
         )
 
     @deprecated(
-        "trtllm_create_ipc_workspace_for_all_reduce and trtllm_custom_all_reduce are deprecated, use trtllm_create_ipc_workspace_for_all_reduce_fusion and trtllm_allreduce_fusion instead"
+        "trtllm_create_ipc_workspace_for_all_reduce and trtllm_custom_all_reduce are deprecated and will be removed in the next major bump, use allreduce.py instead."
     )
     @register_custom_op(
         "flashinfer::trtllm_custom_all_reduce",
@@ -398,7 +398,7 @@ LamportTokenNumThreshold = 16
 
 
 @deprecated(
-    "trtllm_create_ipc_workspace_for_all_reduce and trtllm_custom_all_reduce are deprecated, use trtllm_create_ipc_workspace_for_all_reduce_fusion and trtllm_allreduce_fusion instead"
+    "trtllm_create_ipc_workspace_for_all_reduce and trtllm_custom_all_reduce are deprecated and will be removed in the next major bump, use allreduce.py instead."
 )
 def trtllm_create_ipc_workspace_for_all_reduce(
     rank: int,
@@ -500,7 +500,9 @@ BarrierFlagCount = 256
 MAX_COMM_SIZE = 2147483647 & ~((1 << 21) - 1)  # MAX_INT32 rounded down to 2MB
 
 
-# @TODO(nvmbreughe): on a next major bump, remove create_metadata and make create_metadata=True the default behavior
+@deprecated(
+    "use the unified API allreduce.py instead. It will internally call trtllm_create_ipc_workspace_for_all_reduce_fusion."
+)
 def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     tp_rank: int,
     tp_size: int,
@@ -849,6 +851,9 @@ def check_trtllm_allreduce_fusion_workspace_metadata(
         raise ValueError(error_msg)
 
 
+@deprecated(
+    "use the unified API allreduce.py instead. It will internally call trtllm_allreduce_fusion."
+)
 def trtllm_allreduce_fusion(
     allreduce_in: torch.Tensor,
     world_size: int,
