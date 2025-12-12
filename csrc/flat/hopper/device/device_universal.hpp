@@ -7,13 +7,13 @@
 #if !defined(__CUDACC_RTC__)
 #include "cutlass/cluster_launch.hpp"
 #include "cutlass/trace.h"
-#endif // !defined(__CUDACC_RTC__)
+#endif  // !defined(__CUDACC_RTC__)
 
 namespace cutlass::device {
 
 template <class Kernel_>
 class Universal {
-public:
+ public:
   using Kernel = Kernel_;
 
   static int const kThreadCount = Kernel::MaxThreadsPerBlock;
@@ -23,8 +23,7 @@ public:
   /// Argument structure: Kernel API
   using Params = typename Kernel::Params;
 
-private:
-
+ private:
   /// Kernel API parameters object
   Params params_;
 
@@ -34,41 +33,31 @@ private:
     return initialized;
   }
 
-public:
-
+ public:
   /// Access the Params structure
-  Params const& params() const {
-    return params_;
-  }
+  Params const& params() const { return params_; }
 
   /// Determines whether the GEMM can execute the given problem.
-  static Status
-  can_implement(Arguments const& args) {
+  static Status can_implement(Arguments const& args) {
     if (Kernel::can_implement(args)) {
       return Status::kSuccess;
-    }
-    else {
+    } else {
       return Status::kInvalid;
     }
   }
 
   /// Gets the workspace size
-  static size_t
-  get_workspace_size(Arguments const& args) {
+  static size_t get_workspace_size(Arguments const& args) {
     size_t workspace_bytes = 0;
     workspace_bytes += Kernel::get_workspace_size(args);
     return workspace_bytes;
   }
 
   /// Computes the grid shape
-  static dim3
-  get_grid_shape(Params const& params) {
-    return Kernel::get_grid_shape(params);
-  }
+  static dim3 get_grid_shape(Params const& params) { return Kernel::get_grid_shape(params); }
 
   /// Computes the maximum number of active blocks per multiprocessor
-  static int
-  maximum_active_blocks(int /* smem_capacity */ = -1) {
+  static int maximum_active_blocks(int /* smem_capacity */ = -1) {
     CUTLASS_TRACE_HOST("Universal::maximum_active_blocks()");
     int max_active_blocks = -1;
     int smem_size = Kernel::SharedStorageSize;
@@ -77,31 +66,24 @@ public:
     cudaError_t result;
     if (smem_size >= (48 << 10)) {
       CUTLASS_TRACE_HOST("  Setting smem size to " << smem_size);
-      result = cudaFuncSetAttribute(
-          device_kernel<Kernel>,
-          cudaFuncAttributeMaxDynamicSharedMemorySize,
-          smem_size);
+      result = cudaFuncSetAttribute(device_kernel<Kernel>,
+                                    cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
       if (cudaSuccess != result) {
-        result = cudaGetLastError(); // to clear the error bit
+        result = cudaGetLastError();  // to clear the error bit
         CUTLASS_TRACE_HOST(
-          "  cudaFuncSetAttribute() returned error: "
-          << cudaGetErrorString(result));
+            "  cudaFuncSetAttribute() returned error: " << cudaGetErrorString(result));
         return -1;
       }
     }
 
     // query occupancy after setting smem size
     result = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &max_active_blocks,
-        device_kernel<Kernel>,
-        Kernel::MaxThreadsPerBlock,
-        smem_size);
+        &max_active_blocks, device_kernel<Kernel>, Kernel::MaxThreadsPerBlock, smem_size);
 
     if (cudaSuccess != result) {
-      result = cudaGetLastError(); // to clear the error bit
-      CUTLASS_TRACE_HOST(
-        "  cudaOccupancyMaxActiveBlocksPerMultiprocessor() returned error: "
-        << cudaGetErrorString(result));
+      result = cudaGetLastError();  // to clear the error bit
+      CUTLASS_TRACE_HOST("  cudaOccupancyMaxActiveBlocksPerMultiprocessor() returned error: "
+                         << cudaGetErrorString(result));
       return -1;
     }
 
@@ -110,10 +92,10 @@ public:
   }
 
   /// Initializes GEMM state from arguments.
-  Status
-  initialize(Arguments const& args, void* workspace = nullptr, cudaStream_t stream = nullptr) {
+  Status initialize(Arguments const& args, void* workspace = nullptr,
+                    cudaStream_t stream = nullptr) {
     CUTLASS_TRACE_HOST("Universal::initialize() - workspace "
-      << workspace << ", stream: " << (stream ? "non-null" : "null"));
+                       << workspace << ", stream: " << (stream ? "non-null" : "null"));
 
     // Initialize the workspace
     Status status = Kernel::initialize_workspace(args, workspace, stream);
@@ -131,12 +113,11 @@ public:
     if (smem_size >= (48 << 10)) {
       CUTLASS_TRACE_HOST("  Setting smem size to " << smem_size);
       cudaError_t result = cudaFuncSetAttribute(
-          device_kernel<Kernel>,
-          cudaFuncAttributeMaxDynamicSharedMemorySize,
-          smem_size);
+          device_kernel<Kernel>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
       if (cudaSuccess != result) {
-        result = cudaGetLastError(); // to clear the error bit
-        CUTLASS_TRACE_HOST("  cudaFuncSetAttribute() returned error: " << cudaGetErrorString(result));
+        result = cudaGetLastError();  // to clear the error bit
+        CUTLASS_TRACE_HOST(
+            "  cudaFuncSetAttribute() returned error: " << cudaGetErrorString(result));
         return Status::kErrorInternal;
       }
     }
@@ -147,8 +128,7 @@ public:
   }
 
   /// Update API is preserved in 3.0, but does not guarantee a lightweight update of params.
-  Status
-  update(Arguments const& args, void* workspace = nullptr) {
+  Status update(Arguments const& args, void* workspace = nullptr) {
     CUTLASS_TRACE_HOST("Universal()::update() - workspace: " << workspace);
 
     size_t workspace_bytes = get_workspace_size(args);
@@ -160,10 +140,9 @@ public:
     return Status::kSuccess;
   }
 
-  /// Primary run() entry point API that is static allowing users to create and manage their own params.
-  /// Supplied params struct must be construct by calling Kernel::to_underling_arguments()
-  static Status
-  run(Params& params, cudaStream_t stream = nullptr) {
+  /// Primary run() entry point API that is static allowing users to create and manage their own
+  /// params. Supplied params struct must be construct by calling Kernel::to_underling_arguments()
+  static Status run(Params& params, cudaStream_t stream = nullptr) {
     CUTLASS_TRACE_HOST("Universal::run()");
     dim3 const block = Kernel::get_block_shape();
     dim3 const grid = get_grid_shape(params);
@@ -173,15 +152,15 @@ public:
 
     Status launch_result;
     // Use extended launch API only for mainloops that use it
-    if constexpr(Kernel::ArchTag::kMinComputeCapability >= 90) {
+    if constexpr (Kernel::ArchTag::kMinComputeCapability >= 90) {
       dim3 cluster(cute::size<0>(typename Kernel::ClusterShape{}),
                    cute::size<1>(typename Kernel::ClusterShape{}),
                    cute::size<2>(typename Kernel::ClusterShape{}));
-      void const* kernel = (void const*) device_kernel<Kernel>;
+      void const* kernel = (void const*)device_kernel<Kernel>;
       void* kernel_params[] = {&params};
-      launch_result = ClusterLauncher::launch(grid, cluster, block, smem_size, stream, kernel, kernel_params);
-    }
-    else {
+      launch_result =
+          ClusterLauncher::launch(grid, cluster, block, smem_size, stream, kernel, kernel_params);
+    } else {
       launch_result = Status::kSuccess;
       cutlass::arch::synclog_setup();
       device_kernel<Kernel><<<grid, block, smem_size, stream>>>(params);
@@ -190,20 +169,19 @@ public:
     cudaError_t result = cudaGetLastError();
     if (cudaSuccess == result && Status::kSuccess == launch_result) {
       return Status::kSuccess;
-    }
-    else {
+    } else {
       CUTLASS_TRACE_HOST("  Kernel launch failed. Reason: " << result);
       return Status::kErrorInternal;
     }
   }
 
   //
-  // Non-static launch overloads that first create and set the internal params struct of this kernel handle.
+  // Non-static launch overloads that first create and set the internal params struct of this kernel
+  // handle.
   //
 
   /// Launches the kernel after first constructing Params internal state from supplied arguments.
-  Status
-  run(Arguments const& args, void* workspace = nullptr, cudaStream_t stream = nullptr) {
+  Status run(Arguments const& args, void* workspace = nullptr, cudaStream_t stream = nullptr) {
     Status status = initialize(args, workspace, stream);
     if (Status::kSuccess == status) {
       status = run(params_, stream);
@@ -212,26 +190,22 @@ public:
   }
 
   /// Launches the kernel after first constructing Params internal state from supplied arguments.
-  Status
-  operator()(Arguments const& args, void* workspace = nullptr, cudaStream_t stream = nullptr) {
+  Status operator()(Arguments const& args, void* workspace = nullptr,
+                    cudaStream_t stream = nullptr) {
     return run(args, workspace, stream);
   }
 
-  /// Overload that allows a user to re-launch the same kernel without updating internal params struct.
-  Status
-  run(cudaStream_t stream = nullptr) {
-    return run(params_, stream);
-  }
+  /// Overload that allows a user to re-launch the same kernel without updating internal params
+  /// struct.
+  Status run(cudaStream_t stream = nullptr) { return run(params_, stream); }
 
-  /// Overload that allows a user to re-launch the same kernel without updating internal params struct.
-  Status
-  operator()(cudaStream_t stream = nullptr) {
-    return run(params_, stream);
-  }
+  /// Overload that allows a user to re-launch the same kernel without updating internal params
+  /// struct.
+  Status operator()(cudaStream_t stream = nullptr) { return run(params_, stream); }
 };
 
 ////////////////////////////////////////////////////////////////////////////////
 
-} // namespace cutlass::device
+}  // namespace cutlass::device
 
 ////////////////////////////////////////////////////////////////////////////////

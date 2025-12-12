@@ -11,7 +11,7 @@ using namespace cute;
 struct GQATag {};  //         num_q_heads == ratio * num_k_heads == ratio * num_v_heads
 struct GVATag {};  // ratio * num_q_heads == ratio * num_k_heads ==         num_v_heads
 
-template<typename GroupingTag = GQATag>
+template <typename GroupingTag = GQATag>
 struct WorkDesc {
   // coord
   int32_t seq_idx;
@@ -26,14 +26,11 @@ struct WorkDesc {
   int32_t tile_idx = 0;
 
   template <typename Params>
-  CUTE_DEVICE bool
-  is_valid(Params const& params) {
+  CUTE_DEVICE bool is_valid(Params const& params) {
     return seq_idx >= 0 && seq_idx < params.num_seqs;
   }
 
-  CUTE_DEVICE int32_t q_head_idx() const {
-    return private_q_head_idx;
-  }
+  CUTE_DEVICE int32_t q_head_idx() const { return private_q_head_idx; }
 
   CUTE_DEVICE int32_t k_head_idx() const {
     if constexpr (std::is_same_v<GroupingTag, GQATag>) {
@@ -45,9 +42,7 @@ struct WorkDesc {
     }
   }
 
-  CUTE_DEVICE int32_t v_head_idx() const {
-    return private_v_head_idx;
-  }
+  CUTE_DEVICE int32_t v_head_idx() const { return private_v_head_idx; }
 
   CUTE_DEVICE int32_t o_head_idx() const {
     if constexpr (std::is_same_v<GroupingTag, GQATag>) {
@@ -63,7 +58,7 @@ struct WorkDesc {
 template <typename GroupingTag = GQATag>
 struct IndividualTileScheduler {
   struct Params {
-    dim3    grid;
+    dim3 grid;
     int32_t num_seqs;
     int32_t num_q_heads;
     int32_t num_v_heads;
@@ -75,11 +70,10 @@ struct IndividualTileScheduler {
   IndividualTileScheduler(Params const& params) {}
 
   template <typename ProblemSize, typename ClusterShape, typename TileShape>
-  static Params
-  to_underlying_arguments(
-      ProblemSize const& problem_size, cutlass::KernelHardwareInfo const& hw_info,
-      ClusterShape const& cluster_shape, TileShape const& tile_shape
-  ) {
+  static Params to_underlying_arguments(ProblemSize const& problem_size,
+                                        cutlass::KernelHardwareInfo const& hw_info,
+                                        ClusterShape const& cluster_shape,
+                                        TileShape const& tile_shape) {
     dim3 grid(0, 1, 1);
     if constexpr (std::is_same_v<GroupingTag, GQATag>) {
       grid.x = problem_size.num_seqs * problem_size.num_q_heads;
@@ -88,25 +82,25 @@ struct IndividualTileScheduler {
     } else {
       static_assert(dependent_false<GroupingTag>, "unknown grouping relation");
     }
-    DPRINTF("to_underlying_arguments: grid:{.x:%d, .y:%d, .z:%d}, num_seqs:%d, num_q_heads:%d, num_v_heads:%d\n",
-            grid.x, grid.y, grid.z, problem_size.num_seqs, problem_size.num_q_heads, problem_size.num_v_heads);
+    DPRINTF(
+        "to_underlying_arguments: grid:{.x:%d, .y:%d, .z:%d}, num_seqs:%d, num_q_heads:%d, "
+        "num_v_heads:%d\n",
+        grid.x, grid.y, grid.z, problem_size.num_seqs, problem_size.num_q_heads,
+        problem_size.num_v_heads);
     return {
-        .grid        = grid,
-        .num_seqs    = problem_size.num_seqs,
+        .grid = grid,
+        .num_seqs = problem_size.num_seqs,
         .num_q_heads = problem_size.num_q_heads,
         .num_v_heads = problem_size.num_v_heads,
     };
   }
 
-  static dim3
-  get_grid_shape(Params const& params) {
-    return params.grid;
-  }
+  static dim3 get_grid_shape(Params const& params) { return params.grid; }
 
   template <typename ProblemSize>
-  CUTE_DEVICE WorkDesc<GroupingTag>
-  get_next_work(Params params, ProblemSize const& problem_size) {
-    int32_t seq_idx; ;
+  CUTE_DEVICE WorkDesc<GroupingTag> get_next_work(Params params, ProblemSize const& problem_size) {
+    int32_t seq_idx;
+    ;
     int32_t q_head_idx;
     int32_t v_head_idx;
     if constexpr (std::is_same_v<GroupingTag, GQATag>) {
@@ -121,24 +115,26 @@ struct IndividualTileScheduler {
       static_assert(dependent_false<GroupingTag>, "unknown grouping relation");
     }
 
-    int64_t s       = problem_size.cu_seqlens[seq_idx];
-    int64_t e       = problem_size.cu_seqlens[seq_idx + 1];
+    int64_t s = problem_size.cu_seqlens[seq_idx];
+    int64_t e = problem_size.cu_seqlens[seq_idx + 1];
     int64_t seq_len = e - s;
 
     if (scheduled) {
       seq_idx = -1;
     } else {
       scheduled = true;
-      DPRINTF0_W("get_next_work: this_work={seq_idx:%d q_head_idx:%d v_head_idx:%d tok_offset:%lld seq_len:%lld}\n",
-                 seq_idx, q_head_idx, v_head_idx, s, seq_len);
+      DPRINTF0_W(
+          "get_next_work: this_work={seq_idx:%d q_head_idx:%d v_head_idx:%d tok_offset:%lld "
+          "seq_len:%lld}\n",
+          seq_idx, q_head_idx, v_head_idx, s, seq_len);
     }
 
     return {
-        .seq_idx            = seq_idx,
+        .seq_idx = seq_idx,
         .private_q_head_idx = q_head_idx,
         .private_v_head_idx = v_head_idx,
-        .tok_offset         = s,
-        .seq_len            = seq_len,
+        .tok_offset = s,
+        .seq_len = seq_len,
     };
   }
 };

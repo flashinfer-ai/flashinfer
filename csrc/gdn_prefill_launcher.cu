@@ -34,11 +34,11 @@ using tvm::ffi::Variant;
 namespace flashinfer {
 
 void gdn_prefill_launcher(void* output, void* output_state, void* q, void* k, void* v,
-                             void* input_state, void* alpha, void* beta, int64_t* cu_seqlens,
-                             int64_t num_seqs, int64_t num_q_heads, int64_t num_k_heads,
-                             int64_t num_v_heads, int64_t num_o_heads, int64_t head_size,
-                             int64_t packed_seq, float scale, int64_t sm_count, DLDataType dtype,
-                             cudaStream_t stream) {
+                          void* input_state, void* alpha, void* beta, int64_t* cu_seqlens,
+                          int64_t num_seqs, int64_t num_q_heads, int64_t num_k_heads,
+                          int64_t num_v_heads, int64_t num_o_heads, int64_t head_size,
+                          int64_t packed_seq, float scale, int64_t sm_count, DLDataType dtype,
+                          cudaStream_t stream) {
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(dtype, DType, [&] {
     int dev_id;
     cudaGetDevice(&dev_id);
@@ -69,8 +69,8 @@ void gdn_prefill_launcher(void* output, void* output_state, void* q, void* k, vo
 }
 
 void gdn_prefill(TensorView output, TensorView output_state, TensorView q, TensorView k,
-                            TensorView v, TensorView cu_seqlens, Optional<TensorView> input_state,
-                            Optional<TensorView> alpha, Optional<TensorView> beta, double scale) {
+                 TensorView v, TensorView cu_seqlens, Optional<TensorView> input_state,
+                 Optional<TensorView> alpha, Optional<TensorView> beta, double scale) {
   int64_t num_seqs = cu_seqlens.size(0) - 1;
   int64_t packed_seq = q.size(0);
   int64_t head_size = q.size(2);
@@ -109,7 +109,6 @@ void gdn_prefill(TensorView output, TensorView output_state, TensorView q, Tenso
   CHECK_INPUT(k);
   CHECK_INPUT(v);
   CHECK_INPUT(cu_seqlens);
-
 
   TVM_FFI_ICHECK(output.dtype() == dl_float16 || output.dtype() == dl_bfloat16);
   TVM_FFI_ICHECK_EQ(output_state.dtype(), dl_float32);
@@ -164,10 +163,10 @@ void gdn_prefill(TensorView output, TensorView output_state, TensorView q, Tenso
   auto stream = get_stream(q.device());
 
   gdn_prefill_launcher(output.data_ptr(), output_state.data_ptr(), q.data_ptr(), k.data_ptr(),
-                          v.data_ptr(), input_state_ptr, alpha_ptr, beta_ptr,
-                          static_cast<int64_t*>(cu_seqlens.data_ptr()), num_seqs, num_q_heads,
-                          num_k_heads, num_v_heads, num_o_heads, head_size, packed_seq,
-                          static_cast<float>(scale), sm_count, q.dtype(), stream);
+                       v.data_ptr(), input_state_ptr, alpha_ptr, beta_ptr,
+                       static_cast<int64_t*>(cu_seqlens.data_ptr()), num_seqs, num_q_heads,
+                       num_k_heads, num_v_heads, num_o_heads, head_size, packed_seq,
+                       static_cast<float>(scale), sm_count, q.dtype(), stream);
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(gdn_prefill, gdn_prefill);

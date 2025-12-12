@@ -26,7 +26,6 @@ def gen_gdn_prefill_module() -> JitSpec:
     return gen_jit_spec(
         name="gdn_prefill_launcher",
         sources=[jit_env.FLASHINFER_CSRC_DIR / "gdn_prefill_launcher.cu"],
-        extra_cuda_cflags=sm90a_nvcc_flags + ["-DFLAT_SM90A_ENABLED"],
+        extra_cuda_cflags=sm90a_nvcc_flags + ["-DFLAT_SM90A_ENABLED", "-std=c++20"],
         extra_include_paths=[jit_env.FLASHINFER_CSRC_DIR],
     )
-

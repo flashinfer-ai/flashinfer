@@ -24,7 +24,6 @@ from .jit.gdn import gen_gdn_prefill_module
 from .utils import (
     register_custom_op,
     register_fake_op,
-    check_shape_dtype_device,
 )
 
 

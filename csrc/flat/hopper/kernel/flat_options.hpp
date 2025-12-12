@@ -9,7 +9,7 @@ namespace flat::kernel {
 template <auto kTag, class Value>
 struct Option {
   static constexpr auto tag = kTag;
-  using option_value        = Value;
+  using option_value = Value;
 };
 
 using DefaultOptions = std::tuple<>;
@@ -25,35 +25,34 @@ struct find_option_impl<kTag, Default> {
 };
 
 template <auto kTag, typename Default>
-struct find_option_impl<kTag, Default, void>
-    : find_option_impl<kTag, Default> {};
+struct find_option_impl<kTag, Default, void> : find_option_impl<kTag, Default> {};
 
 template <auto kTag, typename Default, typename Option, typename... Options>
-struct find_option_impl<kTag, Default, Option, Options...> :
-  std::conditional_t<
-    Option::tag == kTag,
-    Option,
-    find_option_impl<kTag, Default, Options...> > {};
+struct find_option_impl<kTag, Default, Option, Options...>
+    : std::conditional_t<Option::tag == kTag, Option, find_option_impl<kTag, Default, Options...>> {
+};
 
 template <auto kTag, typename Default, typename... Options>
-struct find_option_impl<kTag, Default, std::tuple<Options...>> :
-  find_option_impl<kTag, Default, Options...> {};
+struct find_option_impl<kTag, Default, std::tuple<Options...>>
+    : find_option_impl<kTag, Default, Options...> {};
 
 template <typename NewOption, typename... Options>
 struct add_option_impl;
 
 template <typename NewOption, typename... Options>
-struct add_option_impl<NewOption, std::tuple<Options...>>{
+struct add_option_impl<NewOption, std::tuple<Options...>> {
   using options = std::tuple<Options..., NewOption>;
 };
 
 }  // namespace detail
 
 template <auto kTag, typename Default, typename... Options>
-using find_option_t = typename detail::find_option_impl<kTag, Default, std::tuple<Options...>>::option_value;
+using find_option_t =
+    typename detail::find_option_impl<kTag, Default, std::tuple<Options...>>::option_value;
 
 template <auto kTag, typename Value, typename... Options>
-using add_option_t = typename detail::add_option_impl<Option<kTag, Value>, std::tuple<Options...>>::options;
+using add_option_t =
+    typename detail::add_option_impl<Option<kTag, Value>, std::tuple<Options...>>::options;
 
 template <auto kTag, typename Value, typename... Options>
 constexpr auto add_option(Option<kTag, Value> new_option, std::tuple<Options...> options_tuple) {
@@ -73,7 +72,8 @@ enum class Tag {
   kNeedsAlpha,  // gated delta rule
   kNeedsBeta,   // delta rule
   kIsGVA,
-  kInitStateFromInput,  // if true, initialize state by reading global memory instead of zero initialization.
+  kInitStateFromInput,  // if true, initialize state by reading global memory instead of zero
+                        // initialization.
 };
 
 }  // namespace flat::kernel
