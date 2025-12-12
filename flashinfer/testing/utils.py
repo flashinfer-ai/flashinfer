@@ -17,7 +17,7 @@ limitations under the License.
 import math
 import random
 import time
-from typing import Tuple, Any
+from typing import Tuple, Any, List, Optional
 
 import os
 import sys
@@ -28,6 +28,186 @@ import torch
 from einops import rearrange, reduce, repeat
 
 from flashinfer.utils import round_up
+
+
+# =============================================================================
+# Rotating Buffer Utilities for Cold-L2 Benchmarking
+# =============================================================================
+
+
+def get_l2_cache_size(device=None) -> int:
+    """
+    Get L2 cache size in bytes for the given CUDA device.
+
+    Args:
+        device: CUDA device (int, torch.device, or None for current device).
+
+    Returns:
+        L2 cache size in bytes.
+    """
+    if device is None:
+        device = torch.cuda.current_device()
+    props = torch.cuda.get_device_properties(device)
+    return props.L2_cache_size
+
+
+def _calculate_tensor_bytes(tensors: List[torch.Tensor]) -> int:
+    """
+    Calculate total bytes of tensors residing on GPU.
+    Assumes all tensors are on the same device.
+
+    Args:
+        tensors: List of torch.Tensor objects.
+
+    Returns:
+        Total bytes occupied by GPU tensors (CPU tensors are ignored).
+    """
+    total = 0
+    for t in tensors:
+        if isinstance(t, torch.Tensor) and t.is_cuda:
+            total += t.numel() * t.element_size()
+    return total
+
+
+def _extract_gpu_tensors(obj) -> List[torch.Tensor]:
+    """
+    Recursively extract all GPU-resident tensors from a nested structure
+    of lists, tuples, and dicts.
+
+    Args:
+        obj: Object to extract tensors from (can be tensor, list, tuple, dict, or other).
+
+    Returns:
+        Flat list of tensors on GPU found in the structure.
+    """
+    tensors = []
+    if isinstance(obj, torch.Tensor) and obj.is_cuda:
+        tensors.append(obj)
+    elif isinstance(obj, (list, tuple)):
+        for item in obj:
+            tensors.extend(_extract_gpu_tensors(item))
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            tensors.extend(_extract_gpu_tensors(v))
+    return tensors
+
+
+def calculate_rotation_count(
+    tensors: List[torch.Tensor], device=None, min_rotations: int = 2
+) -> int:
+    """
+    Calculate the number of buffer copies needed to ensure cold L2 cache.
+
+    The function uses conservative thresholds to account for:
+    - LRU eviction being gradual (not all data evicted when capacity exceeded)
+    - Cache associativity effects (some data may persist in non-conflicting sets)
+    - Hardware prefetching behavior
+
+    Returns 1 (no rotation needed) only when tensor size substantially exceeds
+    L2 cache (>= 5x), ensuring cache effects are truly negligible.
+
+    Args:
+        tensors: List of tensors to consider for rotation (must be on GPU).
+        device: Device for L2 cache query (None for current device).
+        min_rotations: Minimum number of rotations when rotation is needed.
+
+    Returns:
+        Number of buffer copies needed (1 means no rotation needed).
+    """
+    l2_size = get_l2_cache_size(device)
+    total_bytes = _calculate_tensor_bytes(tensors)
+
+    if total_bytes == 0:
+        return 1  # No tensors to rotate
+
+    # Use aggressive threshold: only skip rotation if tensors far exceed L2 (5x)
+    # This ensures cache effects are truly negligible even with prefetching
+    safe_cache_threshold = l2_size * 5
+    if total_bytes >= safe_cache_threshold:
+        return 1  # Tensors far exceed L2, no rotation needed
+
+    # Conservative formula: ensure between any two uses of the same buffer,
+    # we've accessed enough data to fully flush L2 with margin
+    # Using safe_cache_threshold ensures we account for all cache effects
+    num_rotations = math.ceil(safe_cache_threshold / total_bytes) + 1
+
+    return max(min_rotations, num_rotations)
+
+
+def _clone_structure(obj):
+    """
+    Deep clone a nested structure, cloning GPU tensors with detach().clone()
+    while preserving scalars, booleans, and other non-tensor values.
+
+    For non-contiguous tensors (e.g., created with as_strided), this function
+    preserves the stride pattern using torch.empty_strided() + copy_(). This is
+    important for backends like cuDNN that expect specific memory layouts.
+
+    Args:
+        obj: Object to clone (tensor, list, tuple, dict, or other).
+
+    Returns:
+        Cloned structure with GPU tensors cloned, other values preserved.
+    """
+    if isinstance(obj, torch.Tensor):
+        if obj.is_cuda:
+            if obj.is_contiguous():
+                return obj.detach().clone()
+            else:
+                # Preserve stride pattern for non-contiguous tensors
+                # (e.g., as_strided views used by cuDNN paged attention)
+                result = torch.empty_strided(
+                    obj.size(),
+                    obj.stride(),
+                    dtype=obj.dtype,
+                    device=obj.device,
+                )
+                result.copy_(obj.detach())
+                return result
+        else:
+            return obj  # CPU tensors returned as-is
+    elif isinstance(obj, list):
+        return [_clone_structure(item) for item in obj]
+    elif isinstance(obj, tuple):
+        return tuple(_clone_structure(item) for item in obj)
+    elif isinstance(obj, dict):
+        return {k: _clone_structure(v) for k, v in obj.items()}
+    else:
+        # Non-tensor, non-container: return as-is (e.g., int, float, str, bool, None)
+        return obj
+
+
+def _create_rotated_buffer_copies(
+    input_args: Tuple, input_kwargs: dict, num_rotations: int
+) -> List[Tuple[Tuple, dict]]:
+    """
+    Create multiple copies of input_args and input_kwargs for buffer rotation.
+
+    The first copy (index 0) uses the original args/kwargs.
+    Subsequent copies clone all GPU tensors while preserving other values.
+
+    Args:
+        input_args: Positional arguments tuple.
+        input_kwargs: Keyword arguments dict.
+        num_rotations: Number of buffer copies to create.
+
+    Returns:
+        List of (args, kwargs) tuples, one for each rotation index.
+    """
+    if num_rotations <= 1:
+        return [(input_args, input_kwargs)]
+
+    copies = []
+    # First copy uses original args/kwargs
+    copies.append((input_args, input_kwargs))
+
+    # Create cloned copies for remaining rotations
+    for _ in range(num_rotations - 1):
+        cloned_args = _clone_structure(input_args)
+        cloned_kwargs = _clone_structure(input_kwargs)
+        copies.append((cloned_args, cloned_kwargs))
+
+    return copies
 
 
 def _ceil_to_ue8m0(x: torch.Tensor):
@@ -558,32 +738,86 @@ def bench_gpu_time_with_cuda_event(
     l2_flush_size_mb: int = 256,
     l2_flush_device: str = "cuda",
     sleep_after_run: bool = False,
+    input_args: Tuple = (),
+    input_kwargs: Optional[dict] = None,
 ):
     """
     Benchmark kernel execution time using CUDA events (no CUDA graphs).
-    Measures kernel launch latency + actual kernel execution time for fn().
-    Can flush L2 cache and sleep after the run.
 
-    Number of dry run and actual run iterations can be set by iteration count or time:
-    - If dry_run_iters and repeat_iters are provided, provided iteration count will be used.
-    - If dry_run_iters and repeat_iters are not provided, dry_run_time_ms and repeat_time_ms will be used.
+    This is the simplest benchmarking method. It measures the total time from kernel
+    launch to completion, which includes both CPU-side kernel launch latency and
+    actual GPU kernel execution time. Best suited for kernels where launch overhead
+    is negligible compared to execution time.
 
-    Returns an array of measured times so that the caller can compute statistics.
+    The function performs:
+    1. A quick estimation phase (5 iterations) to determine iteration counts
+    2. Dry-run warmup iterations (not measured)
+    3. Measured iterations with per-iteration timing via CUDA events
+
+    Iteration counts can be specified directly or derived from target durations:
+    - If dry_run_iters/repeat_iters are provided, those counts are used directly.
+    - Otherwise, counts are computed from dry_run_time_ms/repeat_time_ms.
 
     Args:
-        fn: Function to benchmark.
-        dry_run_iters: Number of dry runs during which times does not count. If not provided, dry_run_time_ms will be used.
-        repeat_iters: Number of iterations. If not provided, repeat_time_ms will be used.
-        dry_run_time_ms: Time to run the dry run in milliseconds.
-        repeat_time_ms: Time to run the repeat in milliseconds.
-        l2_flush: Whether to flush L2 cache.
-        l2_flush_size_mb: Size of the L2 cache to flush.
-        l2_flush_device: Device that needs to flush L2 cache.
-        sleep_after_run: Whether to sleep after the run. Sleep time is dynamically set.
+        fn (Callable): Function to benchmark.
+            - If ``input_args``/``input_kwargs`` are empty: called as ``fn()``
+            - If ``input_args``/``input_kwargs`` are provided: called as
+              ``fn(*input_args, **input_kwargs)``
+        dry_run_iters (int, optional): Number of warmup iterations (not timed).
+            If None, computed from dry_run_time_ms.
+        repeat_iters (int, optional): Number of measured iterations.
+            If None, computed from repeat_time_ms.
+        dry_run_time_ms (int): Target warmup duration in ms (default: 25).
+        repeat_time_ms (int): Target measurement duration in ms (default: 100).
+        l2_flush (bool): If True, flush L2 cache before each iteration (default: True).
+        l2_flush_size_mb (int): Size of buffer for L2 flush in MB (default: 256).
+        l2_flush_device (str): Device for the flush buffer (default: "cuda").
+        sleep_after_run (bool): If True, sleep briefly after each iteration to
+            reduce thermal throttling (default: False).
+        input_args (tuple): Positional arguments to pass to fn. When provided,
+            fn is called as ``fn(*input_args, **input_kwargs)``.
+        input_kwargs (dict, optional): Keyword arguments to pass to fn.
 
     Returns:
-        measured_times: List of measured times.
+        List[float]: Per-iteration execution times in milliseconds.
+
+    Example:
+        Basic usage with a lambda (captures inputs in closure):
+
+        >>> q = torch.randn(1024, 128, device="cuda")
+        >>> k = torch.randn(1024, 128, device="cuda")
+        >>> times = bench_gpu_time_with_cuda_event(
+        ...     fn=lambda: torch.matmul(q, k.T),
+        ...     l2_flush=True,
+        ... )
+        >>> print(f"Median time: {np.median(times):.3f} ms")
+
+    Example:
+        Using input_args for explicit argument passing:
+
+        >>> def my_kernel(a, b):
+        ...     return torch.matmul(a, b.T)
+        >>> times = bench_gpu_time_with_cuda_event(
+        ...     fn=my_kernel,
+        ...     input_args=(q, k),
+        ... )
+
+    Note:
+        This method does NOT use CUDA graphs, so each iteration incurs kernel
+        launch overhead. For microbenchmarking where launch latency matters,
+        consider using ``bench_gpu_time_with_cudagraph`` instead.
     """
+    if input_kwargs is None:
+        input_kwargs = {}
+
+    # Check if args are provided (determines how we call fn)
+    has_args = bool(input_args) or bool(input_kwargs)
+
+    def call_fn():
+        if has_args:
+            fn(*input_args, **input_kwargs)
+        else:
+            fn()
 
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
@@ -594,13 +828,13 @@ def bench_gpu_time_with_cuda_event(
     ## Estimate kernel execution time by running the kernel 5 times
     measurement_iters = 5
     torch.cuda.synchronize()
-    fn()  # Call once to exclude initial overhead
+    call_fn()  # Call once to exclude initial overhead
     torch.cuda.synchronize()
     start_event.record()
     for _ in range(measurement_iters):
         if l2_flush:
             buffer.zero_()
-        fn()
+        call_fn()
     end_event.record()
     torch.cuda.synchronize()
     estimated_kernel_execution_time = (
@@ -618,7 +852,7 @@ def bench_gpu_time_with_cuda_event(
     for _ in range(dry_run_iters):
         if l2_flush:
             buffer.zero_()
-        fn()
+        call_fn()
     torch.cuda.synchronize()
 
     # Actual run
@@ -629,7 +863,7 @@ def bench_gpu_time_with_cuda_event(
         if l2_flush:
             buffer.zero_()
         start_events[iter_idx].record()
-        fn()
+        call_fn()
         end_events[iter_idx].record()
 
         if sleep_after_run:
@@ -654,35 +888,75 @@ def bench_gpu_time_with_cupti(
     l2_flush_device: str = "cuda",
     sleep_after_run: bool = False,
     use_cuda_graph: bool = False,
+    # Rotating buffer parameters for cold-L2 benchmarking (fallback to CUDA graph)
+    rotate_buffers: bool = False,
+    input_args: Tuple = (),
+    input_kwargs: Optional[dict] = None,
 ):
     """
-    Benchmark GPU time using CUPTI activity tracing to measure kernel execution time.
+    Benchmark GPU time using CUPTI activity tracing for precise kernel timing.
+
+    CUPTI (CUDA Profiling Tools Interface) provides hardware-level profiling that
+    measures actual GPU kernel execution time, excluding CPU-side launch overhead.
+    This gives the most accurate kernel performance measurements.
+
+    # Note:
+    # This function does not use rotating buffers (even if CUDA graphs are enabled)
+    # because flushing L2 with `l2_flush=True` ensures each iteration begins with a
+    # cold L2 cache, removing the need for buffer rotation. This approach is both
+    # simpler and provides clean cold-cache timing for each run.
 
     Behavior:
-    - Uses CUPTI (>=13) to capture runtime launches and concurrent kernel activities
-      and computes per-iteration GPU time from recorded activities.
-    - Supports optional CUDA Graph capture (use_cuda_graph=True). In this mode, a
-      single replay of the captured graph is timed per iteration.
-    - If CUPTI is unavailable or <13, falls back to CUDA events or CUDA graphs
-      depending on use_cuda_graph.
-    - Dry run and repeat iterations can be specified directly or derived from
-      target times (dry_run_time_ms/repeat_time_ms) using a short estimate phase.
-    - Optionally flushes L2 and sleeps after runs to reduce throttling.
+    - Uses CUPTI (requires version >= 13, i.e., CUDA 13+) to trace kernel activities
+      and compute per-iteration GPU time from recorded start/end timestamps.
+    - Optionally captures operations in a CUDA graph (use_cuda_graph=True) for
+      reduced launch overhead during measurement.
+    - If CUPTI is unavailable, falls back to:
+      - ``bench_gpu_time_with_cudagraph`` if use_cuda_graph=True
+      - ``bench_gpu_time_with_cuda_event`` otherwise
 
     Args:
-        fn: Callable to benchmark.
-        dry_run_iters: Dry-run iterations; if None, inferred from dry_run_time_ms.
-        repeat_iters: Measurement iterations; if None, inferred from repeat_time_ms.
-        dry_run_time_ms: Target dry-run duration in ms when inferring iterations.
-        repeat_time_ms: Target measurement duration in ms when inferring iterations.
-        l2_flush: Whether to flush L2 before each iteration.
-        l2_flush_size_mb: Size of the buffer used for L2 flush.
-        l2_flush_device: Device for the flush buffer.
-        sleep_after_run: Whether to sleep briefly after each iteration.
-        use_cuda_graph: If True, capture and replay a CUDA graph during timing.
+        fn (Callable): Function to benchmark.
+            - If ``input_args``/``input_kwargs`` are empty: called as ``fn()``
+            - If ``input_args``/``input_kwargs`` are provided: called as
+              ``fn(*input_args, **input_kwargs)``
+        dry_run_iters (int, optional): Number of warmup iterations (not timed).
+            If None, computed from dry_run_time_ms.
+        repeat_iters (int, optional): Number of measured iterations.
+            If None, computed from repeat_time_ms.
+        dry_run_time_ms (int): Target warmup duration in ms (default: 25).
+        repeat_time_ms (int): Target measurement duration in ms (default: 100).
+        l2_flush (bool): If True, flush L2 cache before each iteration (default: True).
+        l2_flush_size_mb (int): Size of buffer for L2 flush in MB (default: 256).
+        l2_flush_device (str): Device for the flush buffer (default: "cuda").
+        sleep_after_run (bool): If True, sleep briefly after each iteration (default: False).
+        use_cuda_graph (bool): If True, capture and replay a CUDA graph (default: False).
+        rotate_buffers (bool): If True (fallback path only), use rotating buffer copies
+            for cold-L2 benchmarking. See ``bench_gpu_time_with_cudagraph`` for details.
+        input_args (tuple): Positional arguments to pass to fn. When provided,
+            fn is called as ``fn(*input_args, **input_kwargs)``.
+        input_kwargs (dict, optional): Keyword arguments to pass to fn.
 
     Returns:
-        List[float]: Measured times in milliseconds per iteration.
+        List[float]: Per-iteration GPU kernel execution times in milliseconds.
+
+    Example:
+        Basic CUPTI benchmarking (requires cupti-python >= 13):
+
+        >>> q = torch.randn(1024, 128, device="cuda")
+        >>> k = torch.randn(1024, 128, device="cuda")
+        >>> times = bench_gpu_time_with_cupti(
+        ...     fn=lambda: torch.matmul(q, k.T),
+        ...     l2_flush=True,
+        ... )
+        >>> print(f"Median GPU time: {np.median(times):.3f} ms")
+
+    Note:
+        Requires ``cupti-python`` package version >= 13.0.0:
+        ``pip install -U cupti-python``
+
+        If CUPTI is not available, a warning is issued and the function
+        automatically falls back to CUDA event or CUDA graph timing.
     """
     # check if CUPTI is installed and its version is >= 13.0.0
     try:
@@ -719,6 +993,9 @@ def bench_gpu_time_with_cupti(
                 l2_flush_size_mb=l2_flush_size_mb,
                 l2_flush_device=l2_flush_device,
                 sleep_after_run=sleep_after_run,
+                rotate_buffers=rotate_buffers,
+                input_args=input_args,
+                input_kwargs=input_kwargs,
             )
         else:
             return bench_gpu_time_with_cuda_event(
@@ -770,12 +1047,24 @@ def bench_gpu_time_with_cupti(
                     )
                 )
 
+    if input_kwargs is None:
+        input_kwargs = {}
+
+    # Check if args are provided (determines how we call fn)
+    has_args = bool(input_args) or bool(input_kwargs)
+
+    def call_fn():
+        if has_args:
+            fn(*input_args, **input_kwargs)
+        else:
+            fn()
+
     if l2_flush:
         l2_flush_size = int(l2_flush_size_mb) * 1024 * 1024
         buffer = torch.empty(l2_flush_size, device=l2_flush_device, dtype=torch.int8)
 
     # Prepare runner (either direct fn or CUDA graph replay)
-    runner = fn
+    runner = call_fn
     g = None
     if use_cuda_graph:
         # Warmup run to avoid capturing one-time inits
@@ -784,19 +1073,19 @@ def bench_gpu_time_with_cupti(
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
             for _ in range(3):
-                fn()
+                call_fn()
         torch.cuda.current_stream().wait_stream(s)
 
         # Capture kernel in graph
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
-            fn()
+            call_fn()
         runner = g.replay
 
     ## Estimate kernel execution time by running the runner 5 times
     measurement_iters = 5
     torch.cuda.synchronize()
-    fn()  # Call once to exclude initial overhead
+    call_fn()  # Call once to exclude initial overhead
     torch.cuda.synchronize()
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
@@ -889,37 +1178,106 @@ def bench_gpu_time_with_cudagraph(
     l2_flush_size_mb: int = 256,
     l2_flush_device: str = "cuda",
     sleep_after_run: bool = False,
+    # Rotating buffer parameters for cold-L2 benchmarking
+    rotate_buffers: bool = False,
+    input_args: Tuple = (),
+    input_kwargs: Optional[dict] = None,
 ):
     """
-    Benchmark GPU time using by constructing CUDA graphs with kernel launch and then replaying the graph.
-    Increasing the number of iterations within graph can amortize kernel launch latency to help
-    obtain measurements close to GPU kernel time of fn().
-    Can flush L2 cache and sleep after the run.
+    Benchmark GPU time using CUDA graphs with amortized kernel launch overhead.
 
-    Number of dry run and actual run iterations can be set by iteration count or time:
-    - If dry_run_iters and repeat_iters are provided, provided iteration count will be used.
-    - If dry_run_iters and repeat_iters are not provided, dry_run_time_ms and repeat_time_ms will be used.
+    CUDA graphs capture a sequence of GPU operations and replay them with minimal
+    CPU overhead. By running multiple iterations within a single graph, kernel
+    launch latency is amortized, yielding measurements closer to pure GPU time.
 
-    Returns an array of measured times so that the caller can compute statistics.
+    **Cold-L2 Benchmarking with Rotating Buffers**:
 
-    Uses PyTorch's API to construt and use CUDA Graphs.
-    Also see PyTorch's post on CUDA Graphs: https://pytorch.org/blog/accelerating-pytorch-with-cuda-graphs/
+    When ``rotate_buffers=True``, the function creates multiple copies of the input
+    tensors and rotates through them during graph capture. This ensures each kernel
+    invocation within the graph operates on different memory regions, preventing
+    artificially good performance from hot L2 cache effects.
+
+    The number of buffer copies is automatically calculated based on the device's
+    L2 cache size and total input tensor size. If inputs already exceed L2 capacity,
+    no rotation is needed.
 
     Args:
-        fn: Function to benchmark.
-        dry_run_iters: Number of dry runs during which times does not count. If not provided, dry_run_time_ms will be used.
-        repeat_iters: Number of iterations. If not provided, repeat_time_ms will be used.
-        dry_run_time_ms: Time to run the dry run in milliseconds.
-        repeat_time_ms: Time to run the repeat in milliseconds.
-        num_iters_within_graph: Number of iterations to run within the graph.
-        l2_flush: Whether to flush L2 cache.
-        l2_flush_size_mb: Size of the L2 cache to flush.
-        l2_flush_device: Device that needs to flush L2 cache.
-        sleep_after_run: Whether to sleep after the run. Sleep time is dynamically set.
+        fn (Callable): Function to benchmark.
+            - If ``input_args``/``input_kwargs`` are empty: called as ``fn()``
+            - If ``input_args``/``input_kwargs`` are provided: called as
+              ``fn(*input_args, **input_kwargs)``
+        dry_run_iters (int, optional): Number of warmup iterations (not timed).
+            If None, computed from dry_run_time_ms.
+        repeat_iters (int, optional): Number of measured iterations (graph replays).
+            If None, computed from repeat_time_ms.
+        dry_run_time_ms (int): Target warmup duration in ms (default: 25).
+        repeat_time_ms (int): Target measurement duration in ms (default: 100).
+        num_iters_within_graph (int): Number of kernel calls captured in the graph
+            (default: 10). Higher values better amortize launch overhead but use
+            more memory when rotating buffers.
+        l2_flush (bool): If True, flush L2 cache before each graph replay (default: True).
+        l2_flush_size_mb (int): Size of buffer for L2 flush in MB (default: 256).
+        l2_flush_device (str): Device for the flush buffer (default: "cuda").
+        sleep_after_run (bool): If True, sleep briefly after each iteration (default: False).
+        rotate_buffers (bool): If True, use rotating buffer copies to ensure cold L2
+            cache for each kernel invocation within the graph (default: False).
+            Requires input_args and/or input_kwargs to contain GPU tensors.
+        input_args (tuple): Positional arguments to pass to fn. When provided,
+            fn is called as ``fn(*input_args, **input_kwargs)``. GPU tensors in
+            this structure will be cloned when ``rotate_buffers=True``.
+        input_kwargs (dict, optional): Keyword arguments to pass to fn. GPU
+            tensors in this structure will be cloned when ``rotate_buffers=True``.
 
     Returns:
-        measured_times: List of measured times.
+        List[float]: Per-iteration execution times in milliseconds. Each time is
+        the graph replay duration divided by ``num_iters_within_graph``.
+
+    Example:
+        Basic CUDA graph benchmarking (hot L2, suitable for compute-bound kernels):
+
+        >>> q = torch.randn(1024, 128, device="cuda")
+        >>> k = torch.randn(1024, 128, device="cuda")
+        >>> times = bench_gpu_time_with_cudagraph(
+        ...     fn=lambda: torch.matmul(q, k.T),
+        ...     num_iters_within_graph=10,
+        ... )
+        >>> print(f"Median time: {np.median(times):.3f} ms")
+
+    Example:
+        Cold-L2 benchmarking with rotating buffers (for memory-bound kernels):
+
+        >>> def run_attention(q, k, v, o):
+        ...     # Your attention kernel that writes to o
+        ...     flashinfer.single_prefill_with_kv_cache(q, k, v, o)
+        ...
+        >>> q = torch.randn(batch, heads, seq_len, head_dim, device="cuda")
+        >>> k = torch.randn(batch, heads, seq_len, head_dim, device="cuda")
+        >>> v = torch.randn(batch, heads, seq_len, head_dim, device="cuda")
+        >>> o = torch.empty_like(q)
+        >>> times = bench_gpu_time_with_cudagraph(
+        ...     fn=run_attention,
+        ...     rotate_buffers=True,
+        ...     input_args=(q, k, v, o),
+        ... )
+        >>> print(f"Cold-L2 median time: {np.median(times):.3f} ms")
+
+    Note:
+        - When using ``input_args``/``input_kwargs``, the function must accept the
+          tensors as arguments (not capture them from closure).
+        - When ``rotate_buffers=True``, GPU tensors are automatically detected and
+          cloned. Non-tensor arguments (scalars, booleans, etc.) are preserved
+          across all copies.
+        - Memory usage scales with the number of rotations needed to exceed L2 cache.
+
+    See Also:
+        - PyTorch CUDA Graphs: https://pytorch.org/blog/accelerating-pytorch-with-cuda-graphs/
+        - ``calculate_rotation_count``: Computes required buffer copies for cold-L2.
     """
+    if input_kwargs is None:
+        input_kwargs = {}
+
+    # Check if args are provided (determines how we call fn)
+    has_args = bool(input_args) or bool(input_kwargs)
 
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
@@ -927,20 +1285,64 @@ def bench_gpu_time_with_cudagraph(
         l2_flush_size = int(l2_flush_size_mb) * 1024 * 1024
         buffer = torch.empty(l2_flush_size, device=l2_flush_device, dtype=torch.int8)
 
+    # Determine rotation count if rotating buffers
+    num_rotations = 1
+    rotated_copies = None
+    if rotate_buffers:
+        # Extract all GPU tensors from args and kwargs
+        gpu_tensors = _extract_gpu_tensors(input_args) + _extract_gpu_tensors(
+            input_kwargs
+        )
+        if len(gpu_tensors) == 0:
+            warnings.warn(
+                "rotate_buffers=True but no GPU tensors found in input_args/input_kwargs. "
+                "Falling back to non-rotating mode.",
+                category=UserWarning,
+                stacklevel=2,
+            )
+            rotate_buffers = False
+        else:
+            num_rotations = calculate_rotation_count(gpu_tensors, l2_flush_device)
+            if num_rotations > 1:
+                rotated_copies = _create_rotated_buffer_copies(
+                    input_args, input_kwargs, num_rotations
+                )
+            else:
+                # No rotation needed (tensors exceed L2)
+                rotate_buffers = False
+
+    # Define how to call fn
+    def call_fn():
+        if has_args:
+            fn(*input_args, **input_kwargs)
+        else:
+            fn()
+
+    def call_fn_with_rotation(buf_idx: int):
+        args, kwargs = rotated_copies[buf_idx]
+        fn(*args, **kwargs)
+
     # Warmup run
     torch.cuda.synchronize()
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):
         for _ in range(3):
-            fn()
+            call_fn()
     torch.cuda.current_stream().wait_stream(s)
 
     # Capture kernel in graph
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
-        for _ in range(num_iters_within_graph):
-            fn()
+        if rotate_buffers and num_rotations > 1:
+            # Capture with rotating buffers: use buffer[iter % num_rotations]
+            for iter_idx in range(num_iters_within_graph):
+                buf_idx = iter_idx % num_rotations
+                call_fn_with_rotation(buf_idx)
+        else:
+            # Non-rotating capture (uses original args if provided)
+            for _ in range(num_iters_within_graph):
+                call_fn()
     torch.cuda.synchronize()
 
     ## Estimate kernel execution time by running the kernel 5 times
@@ -1008,17 +1410,86 @@ def bench_gpu_time(
     enable_cupti: bool = False,
     use_cuda_graph: bool = False,
     num_iters_within_graph: int = 10,
+    # Rotating buffer parameters for cold-L2 benchmarking (CUDA graph path only)
+    rotate_buffers: bool = False,
+    input_args: Tuple = (),
+    input_kwargs: Optional[dict] = None,
 ):
     """
-    Benchmark wrapper that chooses among CUPTI, CUDA events, or CUDA Graphs.
+    Unified GPU benchmarking interface with configurable timing backends.
 
-    By default, uses CUDA events (enable_cupti=False, use_cuda_graph=False).
+    This is the recommended entry point for GPU kernel benchmarking. It provides
+    a single interface that dispatches to the appropriate timing implementation
+    based on the configuration flags.
 
-    Args mirror the underlying implementations; extra control flags:
-    - enable_cupti: If True, use CUPTI to measure GPU kernel time.
-      - If use_cuda_graph is True, will capture and replay a CUDA graph during measurement.
-    - use_cuda_graph: If True (and enable_cupti is False), use CUDA graph timing.
-    - num_iters_within_graph: Iterations to run within the CUDA graph when used (non-CUPTI path only).
+    **Timing Backends** (in order of precedence):
+
+    1. **CUPTI** (``enable_cupti=True``): Most accurate, measures pure GPU kernel
+       time via hardware profiling. Requires cupti-python >= 13.
+    2. **CUDA Graphs** (``use_cuda_graph=True``): Amortizes launch overhead by
+       capturing and replaying multiple kernel calls. Good balance of accuracy
+       and availability.
+    3. **CUDA Events** (default): Simplest method, measures launch + execution.
+       Available everywhere but includes CPU overhead.
+
+    Args:
+        fn (Callable): Function to benchmark.
+            - If ``input_args``/``input_kwargs`` are empty: called as ``fn()``
+            - If ``input_args``/``input_kwargs`` are provided: called as
+              ``fn(*input_args, **input_kwargs)``
+        dry_run_iters (int, optional): Number of warmup iterations (not timed).
+        repeat_iters (int, optional): Number of measured iterations.
+        dry_run_time_ms (int): Target warmup duration in ms (default: 25).
+        repeat_time_ms (int): Target measurement duration in ms (default: 100).
+        l2_flush (bool): If True, flush L2 cache before each iteration (default: True).
+        l2_flush_size_mb (int): Size of buffer for L2 flush in MB (default: 256).
+        l2_flush_device (str): Device for the flush buffer (default: "cuda").
+        sleep_after_run (bool): If True, sleep briefly after iterations (default: False).
+        enable_cupti (bool): If True, use CUPTI for timing (default: False).
+        use_cuda_graph (bool): If True, use CUDA graph timing (default: False).
+        num_iters_within_graph (int): Kernel calls per graph (CUDA graph mode only,
+            default: 10).
+        rotate_buffers (bool): If True, use rotating buffers for cold-L2 benchmarking
+            (CUDA graph mode only, default: False).
+        input_args (tuple): Positional arguments to pass to fn. When provided (in
+            any mode), fn is called as ``fn(*input_args, **input_kwargs)``.
+        input_kwargs (dict, optional): Keyword arguments to pass to fn.
+
+    Returns:
+        List[float]: Per-iteration execution times in milliseconds.
+
+    Example:
+        Simple benchmarking with CUDA events (default):
+
+        >>> times = bench_gpu_time(fn=lambda: my_kernel())
+        >>> print(f"Median: {np.median(times):.3f} ms")
+
+    Example:
+        CUDA graph benchmarking for reduced launch overhead:
+
+        >>> times = bench_gpu_time(
+        ...     fn=lambda: my_kernel(),
+        ...     use_cuda_graph=True,
+        ...     num_iters_within_graph=10,
+        ... )
+
+    Example:
+        Cold-L2 benchmarking for memory-bound kernels:
+
+        >>> def run_kernel(x, y, out):
+        ...     my_memory_bound_kernel(x, y, out)
+        ...
+        >>> times = bench_gpu_time(
+        ...     fn=run_kernel,
+        ...     use_cuda_graph=True,
+        ...     rotate_buffers=True,
+        ...     input_args=(x, y, out),
+        ... )
+
+    See Also:
+        - ``bench_gpu_time_with_cuda_event``: Direct CUDA event timing.
+        - ``bench_gpu_time_with_cudagraph``: Direct CUDA graph timing.
+        - ``bench_gpu_time_with_cupti``: Direct CUPTI timing.
     """
     if enable_cupti:
         return bench_gpu_time_with_cupti(
@@ -1032,6 +1503,9 @@ def bench_gpu_time(
             l2_flush_device,
             sleep_after_run,
             use_cuda_graph,
+            rotate_buffers,
+            input_args,
+            input_kwargs,
         )
     if use_cuda_graph:
         return bench_gpu_time_with_cudagraph(
@@ -1045,6 +1519,9 @@ def bench_gpu_time(
             l2_flush_size_mb,
             l2_flush_device,
             sleep_after_run,
+            rotate_buffers,
+            input_args,
+            input_kwargs,
         )
     return bench_gpu_time_with_cuda_event(
         fn,
@@ -1056,6 +1533,8 @@ def bench_gpu_time(
         l2_flush_size_mb,
         l2_flush_device,
         sleep_after_run,
+        input_args,
+        input_kwargs,
     )
 
 
