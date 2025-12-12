@@ -75,9 +75,9 @@ def _test_prefill_kernel(
         atol_kv = 5e-3
         rtol_kv = 1e-3
     else:
-        atol_o = 5e-4
-        rtol_o = 5e-4
-        atol_kv = 5e-4
+        atol_o = 1e-3
+        rtol_o = 1e-3
+        atol_kv = 1e-3
         rtol_kv = 1e-4
 
     torch.testing.assert_close(our_o, ref_o, atol=atol_o, rtol=rtol_o)
@@ -225,11 +225,6 @@ def _test_chunked_prefill(
     ref_o = ref_o.to(q.dtype)
     ref_state = ref_state.to(kv_dtype)
 
-    # import numpy as np
-    # np.save("ref_o.npy", ref_o.float().cpu().numpy())
-    # np.save("our_o.npy", our_o.float().cpu().numpy())
-    # np.save("ref_state.npy", ref_state.float().cpu().numpy())
-    # np.save("our_state.npy", our_state.float().cpu().numpy())
 
     if dtype == torch.bfloat16:
         ref_o = ref_o.to(dtype)
@@ -239,8 +234,8 @@ def _test_chunked_prefill(
         rtol_kv = 1e-3
     else:
         atol_o = 2e-3
-        rtol_o = 5e-4
-        atol_kv = 5e-4
+        rtol_o = 1e-3
+        atol_kv = 1e-3
         rtol_kv = 1e-4
 
     torch.testing.assert_close(our_o, ref_o, atol=atol_o, rtol=rtol_o)

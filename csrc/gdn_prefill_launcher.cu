@@ -26,6 +26,7 @@
 #include "cute/numeric/numeric_types.hpp"
 #include "cutlass/arch/arch.h"
 #include "flat/prefill/prefill_kernel.hpp"
+#include "flat/prefill/prefill_kernel_delta_rule_sm90.cuh"
 
 using tvm::ffi::Optional;
 using tvm::ffi::TensorView;
