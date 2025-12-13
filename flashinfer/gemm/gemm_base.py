@@ -2410,6 +2410,78 @@ def bmm_fp8(
     return out
 
 
+@supported_compute_capability([100, 103, 120, 121])
+def _cutlass_gemm_fp8_nt_groupwise_requirement(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    scale_major_mode: Optional[Literal["MN", "K"]] = None,
+    mma_sm: int = 1,
+    scale_granularity_mnk: Tuple[int, int, int] = (1, 128, 128),
+    out: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    backend: Literal["cutlass", "trtllm"] = "cutlass",
+):
+    if scale_major_mode is None:
+        raise ValueError("scale_major_mode is required in CUTLASS")
+
+    return True
+
+
+@supported_compute_capability([100, 103])
+def _trtllm_gemm_fp8_nt_groupwise_requirement(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    scale_major_mode: Optional[Literal["MN", "K"]] = None,
+    mma_sm: int = 1,
+    scale_granularity_mnk: Tuple[int, int, int] = (1, 128, 128),
+    out: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    backend: Literal["cutlass", "trtllm"] = "cutlass",
+):
+    if scale_granularity_mnk != (1, 128, 128):
+        raise ValueError("scale_granularity_mnk must be (1, 128, 128) in TRTLLM")
+    if a.shape[1] < 256:
+        raise ValueError("a.shape[1] must be >= 256 in TRTLLM")
+
+    return True
+
+
+def _check_gemm_fp8_nt_groupwise_problem_size(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    scale_major_mode: Optional[Literal["MN", "K"]] = None,
+    mma_sm: int = 1,
+    scale_granularity_mnk: Tuple[int, int, int] = (1, 128, 128),
+    out: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    backend: Literal["cutlass", "trtllm"] = "cutlass",
+):
+    if a.ndim != 2 or b.ndim != 2:
+        raise ValueError(f"Shape mismatch. a.shape = {a.shape}, b.shape = {b.shape}")
+
+    if a.shape[1] != b.shape[1]:
+        raise ValueError(
+            f"Shape mismatch. a.shape[1] = {a.shape[1]}, b.shape[1] = {b.shape[1]}"
+        )
+
+    _validate_fp8_output_dtype(out_dtype)
+
+    return True
+
+
+@backend_requirement(
+    {
+        "cutlass": _cutlass_gemm_fp8_nt_groupwise_requirement,
+        "trtllm": _trtllm_gemm_fp8_nt_groupwise_requirement,
+    },
+    common_check=_check_gemm_fp8_nt_groupwise_problem_size,
+)
 @flashinfer_api
 def gemm_fp8_nt_groupwise(
     a: torch.Tensor,
@@ -2484,26 +2556,15 @@ def gemm_fp8_nt_groupwise(
     -----
     The ``m`` should be padded to a multiple of 4 before calling this function, to accommodate the kernel's requirement.
     """
-    if backend == "trtllm" and _match_sm_version(a.device, ["110"]):
-        raise ValueError("TRTLLM FP8 GEMM is not supported on SM110.")
 
     workspace_buffer = _get_cache_buf(
         "gemm_fp8_nt_groupwise_workspace", DEFAULT_WORKSPACE_SIZE, a.device
     )
-    if a.ndim != 2 or b.ndim != 2:
-        raise ValueError(f"Shape mismatch. a.shape = {a.shape}, b.shape = {b.shape}")
-
-    if a.shape[1] != b.shape[1]:
-        raise ValueError(
-            f"Shape mismatch. a.shape[1] = {a.shape[1]}, b.shape[1] = {b.shape[1]}"
-        )
 
     if out is None:
         out_dtype = out_dtype or torch.bfloat16
     else:
         out_dtype = out.dtype
-
-    _validate_fp8_output_dtype(out_dtype)
 
     # NOTE(Zihao): (out_specified, need_padding)
     # (False, False) -> create out_padded tensor explicitly
@@ -2520,18 +2581,6 @@ def gemm_fp8_nt_groupwise(
         )
 
     if backend == "cutlass":
-        if not _match_sm_version(a.device, ["100", "103", "110", "120", "121"]):
-            raise ValueError(
-                "gemm_fp8_nt_groupwise is only supported on SM100, SM103, SM110, SM120, or SM121 in cutlass backend."
-            )
-    elif backend == "trtllm":
-        if not _match_sm_version(a.device, ["100", "103"]):
-            raise ValueError(
-                "gemm_fp8_nt_groupwise is only supported on SM100, SM103 in trtllm backend."
-            )
-
-    if backend == "cutlass":
-        assert scale_major_mode is not None
         if is_sm120a_supported(a.device) or is_sm121a_supported(a.device):
             # SM120/121 doesn't use mma_sm parameter
             get_gemm_sm120_module().gemm_fp8_nt_groupwise(
@@ -2559,8 +2608,6 @@ def gemm_fp8_nt_groupwise(
         else:
             raise ValueError(f"Unsupported device for FP8 GEMM: {a.device}")
     elif backend == "trtllm":
-        assert scale_granularity_mnk == (1, 128, 128)
-        assert a.shape[1] >= 256
         # mma_sm is ignored
         get_trtllm_gemm_module().trtllm_gemm(
             workspace_buffer,
@@ -2662,6 +2709,48 @@ def get_trtllm_fp4_gemm_module():
     )
 
 
+@supported_compute_capability([100, 103, 120, 121])
+def _check_gemm_fp8_nt_blockscaled_problem_size(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    scale_major_mode: Optional[Literal["MN", "K"]] = "MN",
+    mma_sm: int = 1,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+):
+    _check_gemm_fp8_nt_groupwise_problem_size(
+        a,
+        b,
+        a_scale,
+        b_scale,
+        scale_major_mode,
+        mma_sm,
+        out,
+        out_dtype,
+        backend="cutlass",
+    )
+
+    _cutlass_gemm_fp8_nt_groupwise_requirement(
+        a,
+        b,
+        a_scale,
+        b_scale,
+        scale_major_mode,
+        mma_sm,
+        out,
+        out_dtype,
+        backend="cutlass",
+    )
+
+    return True
+
+
+@backend_requirement(
+    {},
+    common_check=_check_gemm_fp8_nt_blockscaled_problem_size,
+)
 @flashinfer_api
 def gemm_fp8_nt_blockscaled(
     a: torch.Tensor,
@@ -2691,6 +2780,79 @@ def gemm_fp8_nt_blockscaled(
     )
 
 
+@supported_compute_capability([100, 120, 121])
+def _check_group_gemm_fp8_nt_groupwise_problem_size(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    m_indptr: torch.Tensor,
+    scale_granularity_mnk: Tuple[int, int, int] = (1, 128, 128),
+    scale_major_mode: Literal["MN", "K"] = "MN",
+    mma_sm: int = 1,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+):
+    if a.dtype not in [torch.float8_e4m3fn, torch.float8_e5m2]:
+        raise ValueError(f"a must be a float8 tensor, but got {a.dtype}")
+    if b.dtype not in [torch.float8_e4m3fn, torch.float8_e5m2]:
+        raise ValueError(f"b must be a float8 tensor, but got {b.dtype}")
+    if a_scale.dtype not in [torch.float32]:
+        raise ValueError(f"a_scale must be a float32 tensor, but got {a_scale.dtype}")
+    if b_scale.dtype not in [torch.float32]:
+        raise ValueError(f"b_scale must be a float32 tensor, but got {b_scale.dtype}")
+    if m_indptr.dtype not in [torch.int32]:
+        raise ValueError(f"m_indptr must be a int32 tensor, but got {m_indptr.dtype}")
+    if scale_major_mode not in ["MN", "K"]:
+        raise ValueError(
+            f"scale_major_mode must be either 'MN' or 'K', but got {scale_major_mode}"
+        )
+    if mma_sm not in [1, 2]:
+        raise ValueError(f"mma_sm must be either 1 or 2, but got {mma_sm}")
+
+    # assert a.shape[0] == m_indptr[-1].item()  # Not enabled in consideration of performance
+    n = b.shape[1]
+    k = b.shape[2]
+
+    if out is None:
+        if out_dtype is None:
+            out_dtype = torch.bfloat16
+    else:
+        if out_dtype is None:
+            out_dtype = out.dtype
+        if out.shape != (a.shape[0], n):
+            raise ValueError(
+                f"Shape mismatch. out.shape = {out.shape}, (a.shape[0], n) = {(a.shape[0], n)}"
+            )
+        if out.dtype != out_dtype:
+            raise ValueError(
+                f"dtype mismatch. out.dtype = {out.dtype}, out_dtype = {out_dtype}"
+            )
+
+    _validate_fp8_output_dtype(out_dtype)
+
+    if a.shape[1] != k:
+        raise ValueError(f"Shape mismatch. a.shape[1] = {a.shape[1]}, k = {k}")
+    if n % 8 != 0:
+        raise ValueError(f"n must be a multiple of 8, but got {n}")
+    if k % 16 != 0:
+        raise ValueError(f"k must be a multiple of 16, but got {k}")
+
+    num_groups = m_indptr.shape[0] - 1
+
+    if is_sm120a_supported(a.device) or is_sm121a_supported(a.device):
+        if num_groups > 1:
+            raise RuntimeError(
+                "group_gemm_fp8_nt_groupwise has correctness issues for num_groups > 1 on SM120/121"
+            )
+
+    return True
+
+
+@backend_requirement(
+    {},
+    common_check=_check_group_gemm_fp8_nt_groupwise_problem_size,
+)
 @flashinfer_api
 def group_gemm_fp8_nt_groupwise(
     a: torch.Tensor,  # (cum_m, k)
@@ -2756,19 +2918,6 @@ def group_gemm_fp8_nt_groupwise(
     Each value in ``m_indptr`` should be padded to a multiple of 4 before calling this function,
     to accommodate the kernel's requirement.
     """
-    if (
-        not is_sm100a_supported(a.device)
-        and not is_sm120a_supported(a.device)
-        and not is_sm121a_supported(a.device)
-    ):
-        raise ValueError(
-            "gemm_fp8_nt_groupwise is only supported on SM100, SM120, and SM121."
-        )
-    if not (_match_sm_version(a.device, ["100", "103", "110", "120", "121"])):
-        raise ValueError(
-            "gemm_fp8_nt_groupwise is only supported on SM100, SM103, SM110, SM120, or SM121."
-        )
-
     int_workspace_buffer = _get_cache_buf(
         "group_gemm_fp8_nt_groupwise_int_workspace", DEFAULT_WORKSPACE_SIZE, a.device
     )
@@ -2776,46 +2925,21 @@ def group_gemm_fp8_nt_groupwise(
         "group_gemm_fp8_nt_groupwise_float_workspace", DEFAULT_WORKSPACE_SIZE, a.device
     )
 
-    assert a.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]
-    assert b.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]
-    assert a_scale.dtype == torch.float32
-    assert b_scale.dtype == torch.float32
-    assert m_indptr.dtype == torch.int32
-    assert scale_major_mode in ["MN", "K"]
-    assert mma_sm in [1, 2]
     if out is None:
         if out_dtype is None:
             out_dtype = torch.bfloat16
     else:
         if out_dtype is None:
             out_dtype = out.dtype
-    _validate_fp8_output_dtype(out_dtype)
 
-    num_groups = m_indptr.shape[0] - 1
-    assert b.shape[0] == num_groups
     n = b.shape[1]
     k = b.shape[2]
-
-    # assert a.shape[0] == m_indptr[-1].item()  # Not enabled in consideration of performance
-    assert a.shape[1] == k
-    align_n = 8
-    align_k = 16
-    assert n % align_n == 0
-    assert k % align_k == 0
 
     out_shape = (a.shape[0], n)
     if out is None:
         out = torch.empty(out_shape, dtype=out_dtype, device=a.device)
-    else:
-        assert out.shape == out_shape
-        assert out.dtype == out_dtype
 
     if is_sm120a_supported(a.device) or is_sm121a_supported(a.device):
-        # it has correctness issues for num_groups > 1
-        if num_groups > 1:
-            raise RuntimeError(
-                "group_gemm_fp8_nt_groupwise has correctness issues for num_groups > 1 on SM120/121"
-            )
         # SM120/121 doesn't use mma_sm parameter
         get_gemm_sm120_module().group_gemm_fp8_nt_groupwise(
             int_workspace_buffer,
@@ -2847,13 +2971,96 @@ def group_gemm_fp8_nt_groupwise(
             scale_major_mode,
             mma_sm,
         )
-    else:
-        raise ValueError(
-            f"group_gemm_fp8_nt_groupwise requires SM100, SM120, or SM121, but got {a.device}"
-        )
     return out
 
 
+@supported_compute_capability([100, 103, 110, 120, 121])
+def _check_group_gemm_mxfp8_mxfp4_nt_groupwise_problem_size(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    m_indptr: torch.Tensor,
+    mma_sm: int = 1,
+    tile_m: int = 128,
+    tile_n: int = 128,
+    tile_k: int = 128,
+    swap_ab: bool = True,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+):
+    if a.dtype not in [torch.float8_e4m3fn, torch.float8_e5m2]:
+        raise ValueError(
+            f"a must be a float8_e4m3fn or float8_e5m2 tensor, but got {a.dtype}"
+        )
+    if b.dtype != torch.uint8:
+        raise ValueError(f"b must be a uint8 tensor, but got {b.dtype}")
+    if a_scale.dtype != torch.uint8:
+        raise ValueError(f"a_scale must be a uint8 tensor, but got {a_scale.dtype}")
+    if b_scale.dtype != torch.uint8:
+        raise ValueError(f"b_scale must be a uint8 tensor, but got {b_scale.dtype}")
+    if m_indptr.dtype != torch.int32:
+        raise ValueError(f"m_indptr must be a int32 tensor, but got {m_indptr.dtype}")
+    if mma_sm not in [1, 2]:
+        raise ValueError(f"mma_sm must be either 1 or 2, but got {mma_sm}")
+    if tile_m not in [128]:
+        raise ValueError(f"tile_m must be 128, but got {tile_m}")
+    if tile_n not in [64, 128, 192, 256]:
+        raise ValueError(f"tile_n must be one of [64, 128, 192, 256], but got {tile_n}")
+    if tile_k not in [128, 256]:
+        raise ValueError(f"tile_k must be either 128 or 256, but got {tile_k}")
+    if swap_ab not in [True, False]:
+        raise ValueError(f"swap_ab must be a boolean value, but got {swap_ab}")
+
+    # Determine out_dtype if not specified
+    if out is None:
+        if out_dtype is None:
+            out_dtype = torch.bfloat16
+    else:
+        if out_dtype is None:
+            out_dtype = out.dtype
+
+    if out_dtype not in [torch.bfloat16, torch.float16]:
+        raise ValueError(
+            f"out_dtype must be either torch.bfloat16 or torch.float16, but got {out_dtype}"
+        )
+
+    num_groups = m_indptr.shape[0] - 1
+    if b.shape[0] != num_groups:
+        raise ValueError(
+            f"b.shape[0] must equal num_groups (m_indptr.shape[0] - 1), but got b.shape[0]={b.shape[0]}, num_groups={num_groups}"
+        )
+
+    n = b.shape[1]
+    k = b.shape[2] * 2  # Multiply by 2 because b is e2m1 packed as uint8
+
+    # assert a.shape[0] == m_indptr[-1].item()  # Not enabled in consideration of performance
+    if a.shape[1] != k:
+        raise ValueError(
+            f"a.shape[1] must equal k, but got a.shape[1]={a.shape[1]}, k={k}"
+        )
+
+    align_n = 8
+    align_k = 128
+    if n % align_n != 0:
+        raise ValueError(f"n must be a multiple of {align_n}, but got n={n}")
+    if k % align_k != 0:
+        raise ValueError(f"k must be a multiple of {align_k}, but got k={k}")
+
+    out_shape = (a.shape[0], n)
+    if out is not None:
+        if out.shape != out_shape:
+            raise ValueError(f"out.shape must be {out_shape}, but got {out.shape}")
+        if out.dtype != out_dtype:
+            raise ValueError(f"out.dtype must be {out_dtype}, but got {out.dtype}")
+
+    return True
+
+
+@backend_requirement(
+    {},
+    common_check=_check_group_gemm_mxfp8_mxfp4_nt_groupwise_problem_size,
+)
 @flashinfer_api
 def group_gemm_mxfp8_mxfp4_nt_groupwise(
     a: torch.Tensor,  # (cum_m, k)
@@ -2931,43 +3138,20 @@ def group_gemm_mxfp8_mxfp4_nt_groupwise(
         DEFAULT_WORKSPACE_SIZE,
         a.device,
     )
-
-    assert a.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]
-    assert b.dtype == torch.uint8
-    assert a_scale.dtype == torch.uint8
-    assert b_scale.dtype == torch.uint8
-    assert m_indptr.dtype == torch.int32
-    assert mma_sm in [1, 2]
-    assert tile_m in [128]
-    assert tile_n in [64, 128, 192, 256]
-    assert tile_k in [128, 256]
-    assert swap_ab in [True, False]
+    # Determine out_dtype if not specified
     if out is None:
         if out_dtype is None:
             out_dtype = torch.bfloat16
     else:
         if out_dtype is None:
             out_dtype = out.dtype
-    assert out_dtype in [torch.bfloat16, torch.float16]
 
-    num_groups = m_indptr.shape[0] - 1
-    assert b.shape[0] == num_groups
     n = b.shape[1]
     k = b.shape[2] * 2  # Multiply by 2 because b is e2m1 packed as uint8
-
-    # assert a.shape[0] == m_indptr[-1].item()  # Not enabled in consideration of performance
-    assert a.shape[1] == k
-    align_n = 8
-    align_k = 128
-    assert n % align_n == 0
-    assert k % align_k == 0
 
     out_shape = (a.shape[0], n)
     if out is None:
         out = torch.empty(out_shape, dtype=out_dtype, device=a.device)
-    else:
-        assert out.shape == out_shape
-        assert out.dtype == out_dtype
 
     get_gemm_sm100_module().group_gemm_mxfp4_nt_groupwise(
         int_workspace_buffer,
@@ -3022,6 +3206,30 @@ def get_deepgemm_sm100_module():
     return module
 
 
+@supported_compute_capability([100, 103])
+def _check_group_deepgemm_fp8_nt_groupwise_problem_size(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    m_indices: torch.Tensor,
+    scale_granularity_mnk: Tuple[int, int, int] = (1, 128, 128),
+    out: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+) -> bool:
+    from flashinfer.deep_gemm import (
+        _check_group_deepgemm_fp8_nt_contiguous_problem_size,
+    )
+
+    return _check_group_deepgemm_fp8_nt_contiguous_problem_size(
+        (a, a_scale), (b, b_scale), out, m_indices, scale_granularity_mnk
+    )
+
+
+@backend_requirement(
+    {},
+    common_check=_check_group_deepgemm_fp8_nt_groupwise_problem_size,
+)
 @flashinfer_api
 def group_deepgemm_fp8_nt_groupwise(
     a: torch.Tensor,  # (m, k)
@@ -3137,11 +3345,6 @@ def group_deepgemm_fp8_nt_groupwise(
     """
     from flashinfer.deep_gemm import m_grouped_fp8_gemm_nt_contiguous
 
-    if not _match_sm_version(a.device, ["100", "103"]):
-        raise ValueError(
-            "m_grouped_fp8_gemm_nt_contiguous is only supported on SM100, SM100, SM103."
-        )
-
     if out is None:
         out_dtype = out_dtype or torch.bfloat16
         out = torch.empty(a.shape[0], b.shape[1], dtype=out_dtype, device=a.device)
@@ -3153,6 +3356,29 @@ def group_deepgemm_fp8_nt_groupwise(
     return out
 
 
+@supported_compute_capability([100, 103])
+def _check_batch_deepgemm_fp8_nt_groupwise(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    masked_m: torch.Tensor,
+    expected_m: int,
+    scale_granularity_mnk: Tuple[int, int, int] = (1, 128, 128),
+    out: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+) -> bool:
+    from flashinfer.deep_gemm import _check_m_grouped_fp8_gemm_nt_masked_problem_size
+
+    return _check_m_grouped_fp8_gemm_nt_masked_problem_size(
+        (a, a_scale), (b, b_scale), out, masked_m, expected_m, scale_granularity_mnk
+    )
+
+
+@backend_requirement(
+    {},
+    common_check=_check_batch_deepgemm_fp8_nt_groupwise,
+)
 @flashinfer_api
 def batch_deepgemm_fp8_nt_groupwise(
     a: torch.Tensor,  # (batch_size, m, k)
@@ -3270,11 +3496,6 @@ def batch_deepgemm_fp8_nt_groupwise(
     - The block size for scaling is determined by the ``scale_granularity_mnk`` parameter
     """
     from flashinfer.deep_gemm import m_grouped_fp8_gemm_nt_masked
-
-    if not _match_sm_version(a.device, ["100", "103"]):
-        raise ValueError(
-            "m_grouped_fp8_gemm_nt_masked is only supported on SM100, SM103."
-        )
 
     if out is None:
         out_dtype = out_dtype or torch.bfloat16
