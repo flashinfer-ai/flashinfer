@@ -262,7 +262,7 @@ def testGemmFp8NtGroupwise(args):
     a_dequant = dequantize_fp8(a_fp8, a_scale, scale_major_mode)
     b_dequant = dequantize_fp8(b_fp8, b_scale, scale_major_mode)
 
-    def run_backend(backend):
+    def run_backend(backend, a_fp8, b_fp8, a_scale, b_scale):
         if backend in ["cutlass", "trtllm"]:
             return flashinfer.gemm.gemm_fp8_nt_groupwise(
                 a=a_fp8,
@@ -287,9 +287,11 @@ def testGemmFp8NtGroupwise(args):
     outputs = {}
     for cur_backend in backends:
         if run_refcheck:
-            outputs[cur_backend] = run_backend(cur_backend).detach()
+            outputs[cur_backend] = run_backend(
+                cur_backend, a_fp8, b_fp8, a_scale, b_scale
+            ).detach()
         backend_times[cur_backend] = bench_gpu_time(
-            fn=lambda: run_backend(cur_backend),
+            fn=run_backend,
             dry_run_iters=args.dry_run_iters,
             repeat_iters=args.num_iters,
             l2_flush=True,
@@ -298,6 +300,8 @@ def testGemmFp8NtGroupwise(args):
             sleep_after_run=True,  # GEMMs are very MMA-heavy, so prefer sleep to reduce throttling.
             enable_cupti=args.use_cupti,
             use_cuda_graph=is_cuda_graph_compatible,
+            rotate_buffers=True,
+            input_args=(cur_backend, a_fp8, b_fp8, a_scale, b_scale),
         )
 
     tested_backends = list(outputs.keys())
@@ -438,7 +442,7 @@ def testGroupGemmFp8NtGroupwise(args):
         print(f"[VVERBOSE] {b_scale.shape = }")
         print(f"[VVERBOSE] {m_indptr.shape = }")
 
-    def run_backend(backend):
+    def run_backend(backend, a_fp8, b_fp8, a_scale, b_scale, m_indptr):
         if backend == "cutlass":
             return flashinfer.gemm.group_gemm_fp8_nt_groupwise(
                 a=a_fp8,
@@ -469,9 +473,11 @@ def testGroupGemmFp8NtGroupwise(args):
     outputs = {}
     for cur_backend in backends:
         if run_refcheck:
-            outputs[cur_backend] = run_backend(cur_backend).detach()
+            outputs[cur_backend] = run_backend(
+                cur_backend, a_fp8, b_fp8, a_scale, b_scale, m_indptr
+            ).detach()
         backend_times[cur_backend] = bench_gpu_time(
-            fn=lambda: run_backend(cur_backend),
+            fn=run_backend,
             dry_run_iters=args.dry_run_iters,
             repeat_iters=args.num_iters,
             l2_flush=True,
@@ -480,6 +486,8 @@ def testGroupGemmFp8NtGroupwise(args):
             sleep_after_run=True,  # GEMMs are very MMA-heavy, so prefer sleep to reduce throttling.
             enable_cupti=args.use_cupti,
             use_cuda_graph=is_cuda_graph_compatible,
+            rotate_buffers=True,
+            input_args=(cur_backend, a_fp8, b_fp8, a_scale, b_scale, m_indptr),
         )
 
     tested_backends = list(outputs.keys())
@@ -637,7 +645,7 @@ def testBmmFp8(args):
         print(f"[VVERBOSE] {mat2_inv_s = }")
         print(f"[VVERBOSE] {mat2_inv_s.dtype = }")
 
-    def run_backend(backend):
+    def run_backend(backend, input_fp8, mat2_fp8, input_inv_s, mat2_inv_s):
         if backend in ["cudnn", "cublas", "cutlass"]:
             return flashinfer.gemm.bmm_fp8(
                 A=input_fp8,
@@ -665,16 +673,20 @@ def testBmmFp8(args):
                     print(f"[INFO] Autotune warmup for bmm_fp8: {warmup_iters} iters")
                 with autotune(True):
                     for _ in range(warmup_iters):
-                        run_backend(cur_backend)
+                        run_backend(
+                            cur_backend, input_fp8, mat2_fp8, input_inv_s, mat2_inv_s
+                        )
 
     # Storage for timing results and outputs
     backend_times = {backend: [] for backend in backends}
     outputs = {}
     for cur_backend in backends:
         if run_refcheck:
-            outputs[cur_backend] = run_backend(cur_backend).detach()
+            outputs[cur_backend] = run_backend(
+                cur_backend, input_fp8, mat2_fp8, input_inv_s, mat2_inv_s
+            ).detach()
         backend_times[cur_backend] = bench_gpu_time(
-            fn=lambda: run_backend(cur_backend),
+            fn=run_backend,
             dry_run_iters=args.dry_run_iters,
             repeat_iters=args.num_iters,
             l2_flush=True,
@@ -683,6 +695,8 @@ def testBmmFp8(args):
             sleep_after_run=True,
             enable_cupti=args.use_cupti,
             use_cuda_graph=is_cuda_graph_compatible,
+            rotate_buffers=True,
+            input_args=(cur_backend, input_fp8, mat2_fp8, input_inv_s, mat2_inv_s),
         )
 
     tested_backends = list(outputs.keys())
@@ -882,7 +896,15 @@ def testMmFp4(args):
         print("[ERROR] No backends passed validation. Exiting.")
         return
 
-    def run_backend(backend):
+    def run_backend(
+        backend,
+        input_fp4,
+        mat2_fp4,
+        mat2_fp4_trtllm,
+        input_inv_s,
+        mat2_inv_s,
+        mat2_inv_s_trtllm,
+    ):
         if backend in ["cudnn", "trtllm", "cutlass", "auto"]:
             return flashinfer.gemm.mm_fp4(
                 a=input_fp4,
@@ -913,16 +935,32 @@ def testMmFp4(args):
                 print(f"[INFO] Autotune warmup for mm_fp4: {warmup_iters} iters")
             with autotune(True):
                 for _ in range(warmup_iters):
-                    run_backend(cur_backend)
+                    run_backend(
+                        cur_backend,
+                        input_fp4,
+                        mat2_fp4,
+                        mat2_fp4_trtllm,
+                        input_inv_s,
+                        mat2_inv_s,
+                        mat2_inv_s_trtllm,
+                    )
 
     # Storage for timing results and outputs
     backend_times = {backend: [] for backend in backends}
     outputs = {}
     for cur_backend in backends:
         if run_refcheck:
-            outputs[cur_backend] = run_backend(cur_backend).detach()
+            outputs[cur_backend] = run_backend(
+                cur_backend,
+                input_fp4,
+                mat2_fp4,
+                mat2_fp4_trtllm,
+                input_inv_s,
+                mat2_inv_s,
+                mat2_inv_s_trtllm,
+            ).detach()
         backend_times[cur_backend] = bench_gpu_time(
-            fn=lambda: run_backend(cur_backend),
+            fn=run_backend,
             dry_run_iters=args.dry_run_iters,
             repeat_iters=args.num_iters,
             l2_flush=True,
@@ -931,6 +969,16 @@ def testMmFp4(args):
             sleep_after_run=True,
             enable_cupti=args.use_cupti,
             use_cuda_graph=is_cuda_graph_compatible,
+            rotate_buffers=True,
+            input_args=(
+                cur_backend,
+                input_fp4,
+                mat2_fp4,
+                mat2_fp4_trtllm,
+                input_inv_s,
+                mat2_inv_s,
+                mat2_inv_s_trtllm,
+            ),
         )
 
     tested_backends = list(outputs.keys())
