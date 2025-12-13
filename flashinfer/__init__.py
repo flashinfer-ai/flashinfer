@@ -143,6 +143,8 @@ from .sampling import top_p_renorm_probs as top_p_renorm_probs
 from .sampling import top_p_sampling_from_probs as top_p_sampling_from_probs
 from . import topk as topk
 from .topk import top_k as top_k
+from .topk import top_k_page_table_transform as top_k_page_table_transform
+from .topk import top_k_ragged_transform as top_k_ragged_transform
 from .sparse import BlockSparseAttentionWrapper as BlockSparseAttentionWrapper
 from .sparse import (
     VariableBlockSparseAttentionWrapper as VariableBlockSparseAttentionWrapper,
