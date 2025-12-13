@@ -58,3 +58,89 @@ void radix_topk(TensorView input, TensorView output_indices, TensorView output_v
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "RadixTopK failed with error code " << cudaGetErrorString(status);
 }
+
+void radix_topk_page_table_transform(TensorView input, TensorView output_page_table,
+                                     TensorView src_page_table,
+                                     Optional<TensorView> maybe_row_to_batch, TensorView lengths,
+                                     Optional<TensorView> maybe_row_states_buffer, int64_t top_k) {
+  CHECK_INPUT(input);
+  CHECK_INPUT(output_page_table);
+  CHECK_INPUT(src_page_table);
+  CHECK_INPUT(lengths);
+  CHECK_DIM(2, input);              // input: (num_rows, max_len)
+  CHECK_DIM(2, output_page_table);  // output_page_table: (num_rows, top_k)
+  CHECK_DIM(2, src_page_table);     // src_page_table: (batch_size, max_len)
+  CHECK_DIM(1, lengths);            // lengths: (num_rows,)
+
+  unsigned int num_rows = input.size(0);
+  unsigned int max_len = input.size(1);
+  int64_t src_stride = src_page_table.stride(0);
+
+  cudaSetDevice(input.device().device_id);
+  auto stream = get_stream(input.device());
+
+  cudaError_t status;
+  auto dtype = input.dtype();
+
+  sampling::RadixRowState* row_states_ptr = nullptr;
+  if (maybe_row_states_buffer.has_value()) {
+    row_states_ptr =
+        static_cast<sampling::RadixRowState*>(maybe_row_states_buffer.value().data_ptr());
+  }
+
+  int32_t* row_to_batch_ptr = nullptr;
+  if (maybe_row_to_batch.has_value()) {
+    row_to_batch_ptr = static_cast<int32_t*>(maybe_row_to_batch.value().data_ptr());
+  }
+
+  DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP32_FP16(dtype, c_type, [&] {
+    status = sampling::RadixTopKPageTableTransformMultiCTA<c_type, int32_t>(
+        static_cast<c_type*>(input.data_ptr()), static_cast<int32_t*>(output_page_table.data_ptr()),
+        static_cast<const int32_t*>(src_page_table.data_ptr()), src_stride, row_to_batch_ptr,
+        static_cast<int32_t*>(lengths.data_ptr()), num_rows, static_cast<uint32_t>(top_k), max_len,
+        row_states_ptr, stream);
+    return true;
+  });
+
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "RadixTopKPageTableTransform failed with error code " << cudaGetErrorString(status);
+}
+
+void radix_topk_ragged_transform(TensorView input, TensorView output_indices, TensorView offsets,
+                                 TensorView lengths, Optional<TensorView> maybe_row_states_buffer,
+                                 int64_t top_k) {
+  CHECK_INPUT(input);
+  CHECK_INPUT(output_indices);
+  CHECK_INPUT(offsets);
+  CHECK_INPUT(lengths);
+  CHECK_DIM(2, input);           // input: (num_rows, max_len)
+  CHECK_DIM(2, output_indices);  // output_indices: (num_rows, top_k)
+  CHECK_DIM(1, offsets);         // offsets: (num_rows,)
+  CHECK_DIM(1, lengths);         // lengths: (num_rows,)
+
+  unsigned int num_rows = input.size(0);
+  unsigned int max_len = input.size(1);
+
+  cudaSetDevice(input.device().device_id);
+  auto stream = get_stream(input.device());
+
+  cudaError_t status;
+  auto dtype = input.dtype();
+
+  sampling::RadixRowState* row_states_ptr = nullptr;
+  if (maybe_row_states_buffer.has_value()) {
+    row_states_ptr =
+        static_cast<sampling::RadixRowState*>(maybe_row_states_buffer.value().data_ptr());
+  }
+
+  DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP32_FP16(dtype, c_type, [&] {
+    status = sampling::RadixTopKRaggedTransformMultiCTA<c_type, int32_t>(
+        static_cast<c_type*>(input.data_ptr()), static_cast<int32_t*>(output_indices.data_ptr()),
+        static_cast<const int32_t*>(offsets.data_ptr()), static_cast<int32_t*>(lengths.data_ptr()),
+        num_rows, static_cast<uint32_t>(top_k), max_len, row_states_ptr, stream);
+    return true;
+  });
+
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "RadixTopKRaggedTransform failed with error code " << cudaGetErrorString(status);
+}
