@@ -477,126 +477,7 @@ class BatchedGemmInterface {
   int32_t run(BatchedGemmConfig const& config, void* workspace,
               BatchedGemmData const& batchedGemmData, void* cudaStream,
               int32_t /*multiProcessorCount*/, bool usePdl = true,
-              std::optional<std::reference_wrapper<ModuleCache>> moduleCache = std::nullopt) {
-    // Get options from config and data.
-    auto options = getOptionsFromConfigAndData(config, batchedGemmData);
-
-    bool const batchM = options.mBatchMode == BatchedGemmOptions::BatchMode::BatchM;
-    bool const useDeepSeekFp8 = options.mUseDeepSeekFp8 && options.mDtypeA == tg::Dtype::E4m3 &&
-                                options.mDtypeB == tg::Dtype::E4m3;
-
-    auto workspaceSizes = getWorkspaceSizesInBytes(config, batchedGemmData);
-    float* dPtrRowMax{nullptr};
-    uint32_t* dPtrRowMaxBars{nullptr};
-
-    // Set the completion barriers to 0 if needed.
-    if (useDeepSeekFp8 && options.mFusedAct) {
-      dPtrRowMax = reinterpret_cast<float*>(alignPtr(reinterpret_cast<char*>(workspace), 1024));
-      dPtrRowMaxBars = reinterpret_cast<uint32_t*>(
-          alignPtr(reinterpret_cast<char*>(dPtrRowMax) + workspaceSizes[0], 1024));
-      auto err = cudaMemsetAsync((void*)dPtrRowMaxBars, 0x00, workspaceSizes[1],
-                                 reinterpret_cast<cudaStream_t>(cudaStream));
-      if (err != cudaSuccess) {
-        return 1;
-      }
-    }
-
-    auto [numCtaBatch, numCtaTile, numCtaInner] =
-        getGridDim(options, batchedGemmData.mProblemDimensions.mMaxNumCtasInTokenDim);
-    auto kernelParams = KernelParamsSetup::setKernelParams(
-        options, batchM, batchedGemmData.mInputBuffers.mPtrA, batchedGemmData.mInputBuffers.mPtrB,
-        batchedGemmData.mOutputBuffers.mPtrC, batchedGemmData.mInputBuffers.mPtrSfA,
-        batchedGemmData.mInputBuffers.mPtrSfB, batchedGemmData.mInputBuffers.mPtrPerTokenSfA,
-        batchedGemmData.mInputBuffers.mPtrPerTokenSfB, batchedGemmData.mInputBuffers.mPtrBias,
-        batchedGemmData.mOutputBuffers.mPtrSfC, batchedGemmData.mInputBuffers.mPtrScaleC,
-        batchedGemmData.mInputBuffers.mPtrScaleGate, batchedGemmData.mInputBuffers.mPtrClampLimit,
-        batchedGemmData.mInputBuffers.mPtrGatedActAlpha,
-        batchedGemmData.mInputBuffers.mPtrGatedActBeta, batchedGemmData.mInputBuffers.mPtrRouteMap,
-        dPtrRowMax, dPtrRowMaxBars, batchedGemmData.mInputBuffers.mPtrNumNonExitingCtas,
-        batchedGemmData.mInputBuffers.mPtrTotalNumPaddedTokens,
-        batchedGemmData.mInputBuffers.mPtrCtaIdxXyToBatchIdx,
-        batchedGemmData.mInputBuffers.mPtrCtaIdxXyToMnLimit, numCtaBatch);
-
-    // The size of the grid.
-    std::vector<int32_t> grid = batchM ? std::vector<int32_t>{numCtaBatch, numCtaTile, numCtaInner}
-                                       : std::vector<int32_t>{numCtaTile, numCtaBatch, numCtaInner};
-
-    BatchedGemmConfig batchedGemmConfig = config;
-#ifndef TLLM_GEN_EXPORT_INTERFACE
-    // Generate and compile the kernel if data is not provided.
-    if (config.mData == nullptr) {
-      batchedGemmConfig = generateAndCompileKernel(batchedGemmConfig);
-    }
-    TLLM_CHECK_ERROR(batchedGemmConfig.mCudaRunner != nullptr, "CudaRunner is not set");
-    batchedGemmConfig.mCudaRunner->run((void*)&kernelParams, (void*)cudaStream, grid,
-                                       /* cluster */ {},
-                                       /* instanceId */ batchedGemmConfig.mInstanceIdx);
-    return 0;
-#endif
-
-    CUmodule cuModule;
-    CUfunction cuFunction;
-
-    if (moduleCache.has_value()) {
-      ModuleCache& moduleCacheRef = moduleCache.value().get();
-
-      // Modules are associated with a specific context, so the context is included in the key
-      CUcontext ctx;
-      unsigned long long ctxId;
-      cuCtxGetCurrent(&ctx);
-      cuCtxGetId(ctx, &ctxId);
-
-      // Reinterpret the ctxId as a string to avoid needing a custom hash or converting it to a
-      // string in decimal representation.
-      std::string const ctxName =
-          std::string(reinterpret_cast<char*>(&ctxId), sizeof(unsigned long long) / sizeof(char));
-      std::string const funcName = std::string(batchedGemmConfig.mFunctionName);
-      auto const moduleKey = ctxName + funcName;
-      auto module = moduleCacheRef.find(moduleKey);
-
-      // Use cache if module is found, otherwise load and insert into cache
-      if (module != moduleCacheRef.end()) {
-        cuFunction = std::get<1>(module->second);
-      } else {
-        gemm::loadCubinData(&cuModule, batchedGemmConfig);
-        cuModuleGetFunction(&cuFunction, cuModule, batchedGemmConfig.mFunctionName);
-        moduleCacheRef.insert(std::make_pair(moduleKey, std::make_tuple(cuModule, cuFunction)));
-      }
-    } else {
-      gemm::loadCubinData(&cuModule, batchedGemmConfig);
-      cuModuleGetFunction(&cuFunction, cuModule, batchedGemmConfig.mFunctionName);
-    }
-
-    // Prepare the grid/block.
-    dim3 block3{static_cast<uint32_t>(batchedGemmConfig.mNumThreadsPerCTA),
-                static_cast<uint32_t>(1), static_cast<uint32_t>(1)};
-    dim3 grid3{(grid.size() > 0 ? static_cast<uint32_t>(grid[0]) : 1u),
-               (grid.size() > 1 ? static_cast<uint32_t>(grid[1]) : 1u),
-               (grid.size() > 2 ? static_cast<uint32_t>(grid[2]) : 1u)};
-    // Prepare the cluster size.
-    dim3 cluster3{static_cast<uint32_t>(options.mClusterDimX),
-                  static_cast<uint32_t>(options.mClusterDimY),
-                  static_cast<uint32_t>(options.mClusterDimZ)};
-
-    // Whether PDL can safely be enabled
-    const bool pdlSafe = batchedGemmConfig.mOptions.mGridWaitForPrimaryRouting ||
-                         batchedGemmConfig.mOptions.mGridWaitForPrimaryEarlyExit ||
-                         batchedGemmConfig.mOptions.mGridWaitForPrimaryA ||
-                         batchedGemmConfig.mOptions.mGridWaitForPrimaryB;
-
-    // Run the kernel.
-    auto result = trtllm::gen::launchKernel((void*)&kernelParams, cudaStream,
-                                            batchedGemmConfig.mSharedMemSize, cuFunction, block3,
-                                            grid3, cluster3, usePdl && pdlSafe);
-    if (result != CUDA_SUCCESS) {
-      return result;
-    }
-    // If a module cache has not been given, unload the module to avoid leaking
-    if (!moduleCache.has_value()) {
-      cuModuleUnload(cuModule);
-    }
-    return 0;
-  }
+              std::optional<std::reference_wrapper<ModuleCache>> moduleCache = std::nullopt);
 
   //////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -800,6 +681,130 @@ class BatchedGemmInterface {
   // The number of rotations.
   int32_t mNumRotations;
 };
+
+int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config, void* workspace,
+                                  BatchedGemmData const& batchedGemmData, void* cudaStream,
+                                  int32_t /*multiProcessorCount*/, bool usePdl,
+                                  std::optional<std::reference_wrapper<ModuleCache>> moduleCache) {
+  // Get options from config and data.
+  auto options = getOptionsFromConfigAndData(config, batchedGemmData);
+
+  bool const batchM = options.mBatchMode == BatchedGemmOptions::BatchMode::BatchM;
+  bool const useDeepSeekFp8 = options.mUseDeepSeekFp8 && options.mDtypeA == tg::Dtype::E4m3 &&
+                              options.mDtypeB == tg::Dtype::E4m3;
+
+  auto workspaceSizes = getWorkspaceSizesInBytes(config, batchedGemmData);
+  float* dPtrRowMax{nullptr};
+  uint32_t* dPtrRowMaxBars{nullptr};
+
+  // Set the completion barriers to 0 if needed.
+  if (useDeepSeekFp8 && options.mFusedAct) {
+    dPtrRowMax = reinterpret_cast<float*>(alignPtr(reinterpret_cast<char*>(workspace), 1024));
+    dPtrRowMaxBars = reinterpret_cast<uint32_t*>(
+        alignPtr(reinterpret_cast<char*>(dPtrRowMax) + workspaceSizes[0], 1024));
+    auto err = cudaMemsetAsync((void*)dPtrRowMaxBars, 0x00, workspaceSizes[1],
+                               reinterpret_cast<cudaStream_t>(cudaStream));
+    if (err != cudaSuccess) {
+      return 1;
+    }
+  }
+
+  auto [numCtaBatch, numCtaTile, numCtaInner] =
+      getGridDim(options, batchedGemmData.mProblemDimensions.mMaxNumCtasInTokenDim);
+  auto kernelParams = KernelParamsSetup::setKernelParams(
+      options, batchM, batchedGemmData.mInputBuffers.mPtrA, batchedGemmData.mInputBuffers.mPtrB,
+      batchedGemmData.mOutputBuffers.mPtrC, batchedGemmData.mInputBuffers.mPtrSfA,
+      batchedGemmData.mInputBuffers.mPtrSfB, batchedGemmData.mInputBuffers.mPtrPerTokenSfA,
+      batchedGemmData.mInputBuffers.mPtrPerTokenSfB, batchedGemmData.mInputBuffers.mPtrBias,
+      batchedGemmData.mOutputBuffers.mPtrSfC, batchedGemmData.mInputBuffers.mPtrScaleC,
+      batchedGemmData.mInputBuffers.mPtrScaleGate, batchedGemmData.mInputBuffers.mPtrClampLimit,
+      batchedGemmData.mInputBuffers.mPtrGatedActAlpha,
+      batchedGemmData.mInputBuffers.mPtrGatedActBeta, batchedGemmData.mInputBuffers.mPtrRouteMap,
+      dPtrRowMax, dPtrRowMaxBars, batchedGemmData.mInputBuffers.mPtrNumNonExitingCtas,
+      batchedGemmData.mInputBuffers.mPtrTotalNumPaddedTokens,
+      batchedGemmData.mInputBuffers.mPtrCtaIdxXyToBatchIdx,
+      batchedGemmData.mInputBuffers.mPtrCtaIdxXyToMnLimit, numCtaBatch);
+
+  // The size of the grid.
+  std::vector<int32_t> grid = batchM ? std::vector<int32_t>{numCtaBatch, numCtaTile, numCtaInner}
+                                     : std::vector<int32_t>{numCtaTile, numCtaBatch, numCtaInner};
+
+  BatchedGemmConfig batchedGemmConfig = config;
+#ifndef TLLM_GEN_EXPORT_INTERFACE
+  // Generate and compile the kernel if data is not provided.
+  if (config.mData == nullptr) {
+    batchedGemmConfig = generateAndCompileKernel(batchedGemmConfig);
+  }
+  TLLM_CHECK_ERROR(batchedGemmConfig.mCudaRunner != nullptr, "CudaRunner is not set");
+  batchedGemmConfig.mCudaRunner->run((void*)&kernelParams, (void*)cudaStream, grid,
+                                     /* cluster */ {},
+                                     /* instanceId */ batchedGemmConfig.mInstanceIdx);
+  return 0;
+#endif
+
+  CUmodule cuModule;
+  CUfunction cuFunction;
+
+  if (moduleCache.has_value()) {
+    ModuleCache& moduleCacheRef = moduleCache.value().get();
+
+    // Modules are associated with a specific context, so the context is included in the key
+    CUcontext ctx;
+    unsigned long long ctxId;
+    cuCtxGetCurrent(&ctx);
+    cuCtxGetId(ctx, &ctxId);
+
+    // Reinterpret the ctxId as a string to avoid needing a custom hash or converting it to a
+    // string in decimal representation.
+    std::string const ctxName =
+        std::string(reinterpret_cast<char*>(&ctxId), sizeof(unsigned long long) / sizeof(char));
+    std::string const funcName = std::string(batchedGemmConfig.mFunctionName);
+    auto const moduleKey = ctxName + funcName;
+    auto module = moduleCacheRef.find(moduleKey);
+
+    // Use cache if module is found, otherwise load and insert into cache
+    if (module != moduleCacheRef.end()) {
+      cuFunction = std::get<1>(module->second);
+    } else {
+      gemm::loadCubinData(&cuModule, batchedGemmConfig);
+      cuModuleGetFunction(&cuFunction, cuModule, batchedGemmConfig.mFunctionName);
+      moduleCacheRef.insert(std::make_pair(moduleKey, std::make_tuple(cuModule, cuFunction)));
+    }
+  } else {
+    gemm::loadCubinData(&cuModule, batchedGemmConfig);
+    cuModuleGetFunction(&cuFunction, cuModule, batchedGemmConfig.mFunctionName);
+  }
+
+  // Prepare the grid/block.
+  dim3 block3{static_cast<uint32_t>(batchedGemmConfig.mNumThreadsPerCTA), static_cast<uint32_t>(1),
+              static_cast<uint32_t>(1)};
+  dim3 grid3{(grid.size() > 0 ? static_cast<uint32_t>(grid[0]) : 1u),
+             (grid.size() > 1 ? static_cast<uint32_t>(grid[1]) : 1u),
+             (grid.size() > 2 ? static_cast<uint32_t>(grid[2]) : 1u)};
+  // Prepare the cluster size.
+  dim3 cluster3{static_cast<uint32_t>(options.mClusterDimX),
+                static_cast<uint32_t>(options.mClusterDimY),
+                static_cast<uint32_t>(options.mClusterDimZ)};
+
+  // Whether PDL can safely be enabled
+  const bool pdlSafe = batchedGemmConfig.mOptions.mGridWaitForPrimaryRouting ||
+                       batchedGemmConfig.mOptions.mGridWaitForPrimaryEarlyExit ||
+                       batchedGemmConfig.mOptions.mGridWaitForPrimaryA ||
+                       batchedGemmConfig.mOptions.mGridWaitForPrimaryB;
+
+  // Run the kernel.
+  auto result =
+      trtllm::gen::launchKernel((void*)&kernelParams, cudaStream, batchedGemmConfig.mSharedMemSize,
+                                cuFunction, block3, grid3, cluster3, usePdl && pdlSafe);
+  if (result != CUDA_SUCCESS) {
+    return result;
+  }
+  // If a module cache has not been given, unload the module to avoid leaking
+  if (!moduleCache.has_value()) {
+    cuModuleUnload(cuModule);
+  }
+  return 0;
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
