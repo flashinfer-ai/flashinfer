@@ -2051,9 +2051,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
         q: torch.Tensor,
         paged_kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
         *args,
-        q_scale: Optional[float] = None,
-        k_scale: Optional[float] = None,
-        v_scale: Optional[float] = None,
+        q_scale: Optional[Union[float, torch.Tensor]] = None,
+        k_scale: Optional[Union[float, torch.Tensor]] = None,
+        v_scale: Optional[Union[float, torch.Tensor]] = None,
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
@@ -2083,9 +2083,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         *args
             Additional arguments for custom kernels.
-        k_scale : Optional[float]
+        q_scale : Optional[Union[float, torch.Tensor]]
+            The calibration scale of query for fp8 input, if not provided, will be set to ``1.0``.
+        k_scale : Optional[Union[float, torch.Tensor]]
             The calibration scale of key for fp8 input, if not provided, will be set to ``1.0``.
-        v_scale : Optional[float]
+        v_scale : Optional[Union[float, torch.Tensor]]
             The calibration scale of value for fp8 input, if not provided, will be set to ``1.0``.
         out : Optional[torch.Tensor]
             The output tensor, if not provided, will be allocated internally.
@@ -2129,10 +2131,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
             logits_soft_cap = 0.0
         if sm_scale is None:
             sm_scale = 1.0 / math.sqrt(q.size(-1))
-        if q_scale is not None:
-            sm_scale *= q_scale
-        if k_scale is not None:
-            sm_scale *= k_scale
+        if self._backend != "cudnn":
+            if q_scale is not None:
+                sm_scale *= q_scale
+            if k_scale is not None:
+                sm_scale *= k_scale
         if rope_scale is None:
             rope_scale = 1.0
         if rope_theta is None:
@@ -2150,7 +2153,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if out is None:
             # Use cached output data type if available (for FP8 attention with FP16 output)
             out_dtype = getattr(self, "_cached_o_data_type", None) or q.dtype
-            out = torch.empty(
+            out = torch.zeros(
                 q.shape[:-1] + v_cache.shape[-1:], dtype=out_dtype, device=q.device
             )
         else:
@@ -2196,10 +2199,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 block_tables=self._block_tables,
                 causal=self._causal,
                 return_lse=return_lse,
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
                 batch_offsets_q=self._qo_indptr_buf,
                 batch_offsets_o=self._qo_indptr_buf,
                 out=out,
                 lse=lse,
+                o_data_type=out_dtype,
             )
         else:
             if self._backend != "trtllm-gen":
