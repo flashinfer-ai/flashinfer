@@ -1,0 +1,98 @@
+name: Auto Tag and Release
+
+on:
+  pull_request:
+    types: [closed]
+    branches:
+      - main
+
+jobs:
+  auto-tag-and-release:
+    # Only run if the PR was merged and has the version-bump label
+    if: github.event.pull_request.merged == true && contains(github.event.pull_request.labels.*.name, 'version-bump')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Get version from version.txt
+        id: get-version
+        run: |
+          VERSION=$(cat version.txt | tr -d '[:space:]')
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "tag=v${VERSION}" >> $GITHUB_OUTPUT
+          echo "Version from version.txt: ${VERSION}"
+          echo "Will create tag: v${VERSION}"
+
+      - name: Check if tag already exists
+        id: check-tag
+        run: |
+          TAG="v${{ steps.get-version.outputs.version }}"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "⚠️  Tag $TAG already exists"
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "✓ Tag $TAG does not exist yet"
+          fi
+
+      - name: Create and push tag
+        if: steps.check-tag.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v${{ steps.get-version.outputs.version }}"
+
+          # Configure git
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Create annotated tag
+          git tag -a "$TAG" -m "Release $TAG"
+
+          # Push tag
+          git push origin "$TAG"
+
+          echo "✅ Created and pushed tag: $TAG"
+
+      - name: Trigger release workflow
+        if: steps.check-tag.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.FLASHINFER_BOT_TOKEN }}
+        run: |
+          TAG="v${{ steps.get-version.outputs.version }}"
+
+          # Trigger the release workflow
+          gh workflow run release.yml \
+            -f tag="$TAG"
+
+          echo "✅ Triggered release workflow for tag: $TAG"
+
+      - name: Summary
+        run: |
+          echo "## Auto Tag and Release Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ steps.check-tag.outputs.exists }}" = "true" ]; then
+            echo "⚠️ Tag v${{ steps.get-version.outputs.version }} already exists, skipped" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "✅ Successfully created tag and triggered release workflow" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "- **Version**: ${{ steps.get-version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Tag**: v${{ steps.get-version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **PR**: #${{ github.event.pull_request.number }}" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "🔗 [View Release Workflow Runs](../../actions/workflows/release.yml)" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Tag already exists
+        if: steps.check-tag.outputs.exists == 'true'
+        run: |
+          echo "Tag v${{ steps.get-version.outputs.version }} already exists, skipping tag creation and release"
+          exit 0
