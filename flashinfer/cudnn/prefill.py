@@ -113,6 +113,7 @@ def _sdpa_prefill_key_fn(
     key = (
         graph_b,
         q.dim(),
+        q.dtype,
         k_cache.dim(),
         max_token_seq_q,
         max_sequence_kv,
@@ -644,6 +645,9 @@ def cudnn_batch_prefill_with_kv_cache(
         raise ValueError(
             "lse must have shape (num_sequences, max_token_per_sequence, h_qo)"
         )
+
+    if o_data_type is None:
+        o_data_type = q.dtype
 
     if out is None:
         out_shape = (num_tokens, h_qo, d_vo)
