@@ -803,9 +803,10 @@ def bench_gpu_time_with_cuda_event(
         ... )
 
     Note:
-        This method does NOT use CUDA graphs, so each iteration incurs kernel
-        launch overhead. For microbenchmarking where launch latency matters,
-        consider using ``bench_gpu_time_with_cudagraph`` instead.
+        - This method does NOT use CUDA graphs, so each iteration incurs kernel
+          launch overhead. For microbenchmarking where launch latency matters,
+          consider using ``bench_gpu_time_with_cudagraph`` instead.
+        - Use ``l2_flush=True`` to ensure cold L2 cache for memory-bound kernels.
     """
     if input_kwargs is None:
         input_kwargs = {}
@@ -900,11 +901,9 @@ def bench_gpu_time_with_cupti(
     measures actual GPU kernel execution time, excluding CPU-side launch overhead.
     This gives the most accurate kernel performance measurements.
 
-    # Note:
-    # This function does not use rotating buffers (even if CUDA graphs are enabled)
-    # because flushing L2 with `l2_flush=True` ensures each iteration begins with a
-    # cold L2 cache, removing the need for buffer rotation. This approach is both
-    # simpler and provides clean cold-cache timing for each run.
+    Use ``l2_flush=True`` to ensure cold L2 cache.
+    Rotating buffers are not needed with CUPTI because L2 flush occurs between
+    each measured iteration regardless of use_cuda_graph.
 
     Behavior:
     - Uses CUPTI (requires version >= 13, i.e., CUDA 13+) to trace kernel activities
@@ -1190,16 +1189,17 @@ def bench_gpu_time_with_cudagraph(
     CPU overhead. By running multiple iterations within a single graph, kernel
     launch latency is amortized, yielding measurements closer to pure GPU time.
 
-    **Cold-L2 Benchmarking with Rotating Buffers**:
+    **Cold-L2 Benchmarking**:
+
+    Note that ``l2_flush`` only flushes L2 cache between graph replays, not between
+    the multiple kernel iterations captured within the graph. For memory-bound
+    kernels, use ``rotate_buffers=True`` to ensure cold L2 for each iteration.
 
     When ``rotate_buffers=True``, the function creates multiple copies of the input
     tensors and rotates through them during graph capture. This ensures each kernel
     invocation within the graph operates on different memory regions, preventing
-    artificially good performance from hot L2 cache effects.
-
-    The number of buffer copies is automatically calculated based on the device's
-    L2 cache size and total input tensor size. If inputs already exceed L2 capacity,
-    no rotation is needed.
+    artificially good performance from hot L2 cache effects. The number of buffer
+    copies is automatically calculated based on the device's L2 cache size.
 
     Args:
         fn (Callable): Function to benchmark.
@@ -1430,6 +1430,12 @@ def bench_gpu_time(
        and availability.
     3. **CUDA Events** (default): Simplest method, measures launch + execution.
        Available everywhere but includes CPU overhead.
+
+    **Cold-L2 Cache Strategies**:
+
+    - Use ``l2_flush=True`` for enable_cupti=True or (use_cuda_graph=False and enable_cupti=False).
+    - Use ``rotate_buffers=True`` for (use_cuda_graph=True and enable_cupti=False) since l2_flush only flushes
+      between graph replays, not between iterations within the graph when not using CUPTI.
 
     Args:
         fn (Callable): Function to benchmark.
