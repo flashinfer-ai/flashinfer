@@ -680,7 +680,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
         use_packed_weights: bool = False,
     ):
         seq_len = input.shape[0]
-        hidden_size = fc2_expert_weights.shape[1]
+        hidden_size = output.shape[1]
 
         if min_latency_mode:
             num_experts_on_rank = fc2_expert_weights.shape[0]
@@ -891,8 +891,12 @@ def cutlass_fused_moe(
     if output is None:
         output = torch.empty(output_shape, dtype=output_dtype, device=input.device)
     else:
-        check_shape_dtype_device(
-            output, output_shape, output_dtype, input.device, "output"
+        check_shape_dtype_device(output, None, output_dtype, input.device, "output")
+        assert output.shape[0] == output_shape[0], (
+            f"output.shape[0]={output.shape[0]} must be equal to {output_shape[0]}"
+        )
+        assert output.shape[1] <= output_shape[1], (
+            f"output.shape[1]={output.shape[1]} must be less than or equal to {output_shape[1]}"
         )
 
     return get_cutlass_fused_moe_module(device_arch).cutlass_fused_moe(
@@ -1753,6 +1757,16 @@ def get_trtllm_moe_sm100_module():
                 dtype=torch.bfloat16,
                 device=hidden_states.device,
             )
+        else:
+            check_shape_dtype_device(
+                output, None, torch.bfloat16, hidden_states.device, "output"
+            )
+            assert output.shape[0] == num_tokens, (
+                f"output.shape[0]={output.shape[0]} must be equal to {num_tokens}"
+            )
+            assert output.shape[1] <= hidden_size, (
+                f"output.shape[1]={output.shape[1]} must be less than or equal to {hidden_size}"
+            )
 
         tuner = AutoTuner.get()
         MoERunner.refine_tuning_config(tune_max_num_tokens)
@@ -1899,7 +1913,7 @@ def get_trtllm_moe_sm100_module():
         tune_max_num_tokens: int,
     ):
         seq_len = hidden_states.shape[0]
-        hidden_size = hidden_states.shape[1]
+        hidden_size = hidden_states.shape[1] if output is None else output.shape[1]
 
         return [hidden_states.new_empty([seq_len, hidden_size], dtype=torch.bfloat16)]
 
