@@ -12,3 +12,4 @@ fi
 
 # Run each test file separately to isolate CUDA memory issues
 pytest -s tests/utils/test_logits_processor.py
+pytest -s tests/norm/test_rmsnorm_fp4_quant.py

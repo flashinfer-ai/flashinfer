@@ -16,7 +16,7 @@ limitations under the License.
 
 import functools
 from enum import Enum
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import torch
 
@@ -28,9 +28,13 @@ from .autotuner import (
     TuningConfig,
 )
 from .jit.norm import gen_norm_module
-from .utils import device_support_pdl, register_custom_op, register_fake_op
-
-
+from .utils import (
+    backend_requirement,
+    device_support_pdl,
+    register_custom_op,
+    register_fake_op,
+    supported_compute_capability,
+)
 
 
 # cuDNN availability check
@@ -342,7 +346,7 @@ def _get_cudnn_norm_handle(stream: torch.cuda.Stream):
         if not CUDNN_AVAILABLE:
             raise RuntimeError(
                 "cuDNN is not available. Please install cuDNN to use rmsnorm_fp4quant. "
-                "You can install it with: pip install nvidia-cudnn-cu12 nvidia-cudnn-frontend"
+                "You can install it with: pip install nvidia-cudnn-cu13 nvidia-cudnn-frontend"
             )
         _cudnn_norm_handle = cudnn.create_handle()
     cudnn.set_stream(_cudnn_norm_handle, stream.cuda_stream)
@@ -354,14 +358,14 @@ def _check_cudnn_rmsnorm_fp4quant_availability():
     if not CUDNN_AVAILABLE:
         raise RuntimeError(
             "cuDNN is not available. Please install cuDNN to use rmsnorm_fp4quant. "
-            "You can install it with: pip install nvidia-cudnn-cu12 nvidia-cudnn-frontend"
+            "You can install it with: pip install nvidia-cudnn-cu13 nvidia-cudnn-frontend"
         )
 
     # Check cuDNN backend version for FP4 block scale quantization support
     backend_version = cudnn.backend_version()
-    if backend_version < 90700:
+    if backend_version < 91800:
         raise RuntimeError(
-            f"cuDNN RMSNorm + FP4 quantization requires backend version >= 90700 (9.7.0), "
+            f"cuDNN RMSNorm + FP4 quantization requires backend version >= 91800 (9.18.0), "
             f"found {backend_version}. Please upgrade cuDNN."
         )
 
@@ -658,7 +662,26 @@ def _get_cudnn_rmsnorm_fp4quant_runner():
     return CudnnRMSNormFP4QuantRunner()
 
 
+@supported_compute_capability([100, 103, 110, 120, 121])
+def _rmsnorm_fp4quant_checks(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    y_fp4: torch.Tensor,
+    block_scale: torch.Tensor,
+    eps: float = 1e-6,
+    block_size: int = 16,
+) -> bool:
+    """Validation checks for rmsnorm_fp4quant.
+
+    This function is decorated with @supported_compute_capability to enable
+    runtime compute capability checking via @backend_requirement.
+    """
+    _check_cudnn_rmsnorm_fp4quant_availability()
+    return True
+
+
 @flashinfer_api
+@backend_requirement({}, common_check=_rmsnorm_fp4quant_checks)
 def rmsnorm_fp4quant(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -735,8 +758,6 @@ def rmsnorm_fp4quant(
     >>> block_scale.shape
     torch.Size([4, 8])
     """
-    _check_cudnn_rmsnorm_fp4quant_availability()
-
     # Validate input dtype
     if input.dtype not in (torch.float16, torch.bfloat16):
         raise ValueError(
