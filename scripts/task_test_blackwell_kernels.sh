@@ -7,6 +7,11 @@ set -eo pipefail
 : ${CUDA_VISIBLE_DEVICES:=0}
 : ${SAMPLE_RATE:=5}  # Run every Nth test in sanity mode (5 = ~20% coverage)
 
+# Randomize starting offset (0 to SAMPLE_RATE-1) for sampling variety
+if [ -z "${SAMPLE_OFFSET:-}" ]; then
+    SAMPLE_OFFSET=$((RANDOM % SAMPLE_RATE))
+fi
+
 # Clean Python bytecode cache to avoid stale imports (e.g., after module refactoring)
 echo "Cleaning Python bytecode cache..."
 find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
@@ -38,6 +43,7 @@ fi
 
 if [ "$SANITY_TEST" = "true" ]; then
     echo "🔬 SANITY TEST MODE - Running every ${SAMPLE_RATE}th test (~$((100 / SAMPLE_RATE))% coverage)"
+    echo "   Sampling pattern: offset=${SAMPLE_OFFSET} (tests #${SAMPLE_OFFSET}, #$((SAMPLE_OFFSET + SAMPLE_RATE)), #$((SAMPLE_OFFSET + SAMPLE_RATE * 2))...)"
     echo ""
 else
     echo "📋 FULL TEST MODE - Running all tests from each test file"
@@ -212,13 +218,17 @@ if [ "$DRY_RUN" == "true" ]; then
             TOTAL_IN_FILE=$(echo "$ALL_NODE_IDS" | wc -l)
             TOTAL_TEST_CASES=$((TOTAL_TEST_CASES + TOTAL_IN_FILE))
 
-            # Sample every Nth test
-            SAMPLED_NODE_IDS=$(echo "$ALL_NODE_IDS" | awk "NR % $SAMPLE_RATE == 1")
+            # Sample every Nth test with random offset
+            SAMPLED_NODE_IDS=$(echo "$ALL_NODE_IDS" | awk "NR % $SAMPLE_RATE == $SAMPLE_OFFSET")
+            # Fallback: if no tests sampled (offset missed all tests), take the first test
+            if [ -z "$SAMPLED_NODE_IDS" ] || [ $(echo "$SAMPLED_NODE_IDS" | wc -l) -eq 0 ]; then
+                SAMPLED_NODE_IDS=$(echo "$ALL_NODE_IDS" | head -1)
+            fi
             SAMPLED_IN_FILE=$(echo "$SAMPLED_NODE_IDS" | wc -l)
             SAMPLED_TEST_CASES=$((SAMPLED_TEST_CASES + SAMPLED_IN_FILE))
 
             echo "  Total test cases: $TOTAL_IN_FILE"
-            echo "  Sampled test cases: $SAMPLED_IN_FILE (every ${SAMPLE_RATE}th test)"
+            echo "  Sampled test cases: $SAMPLED_IN_FILE (every ${SAMPLE_RATE}th test, offset ${SAMPLE_OFFSET})"
             echo "  Sample of tests that would run:"
             echo "$SAMPLED_NODE_IDS" | head -5 | sed 's/^/    /' || true
             if [ "$SAMPLED_IN_FILE" -gt 5 ]; then
@@ -238,7 +248,10 @@ if [ "$DRY_RUN" == "true" ]; then
         else
             echo "Coverage: N/A (no tests collected)"
         fi
-        echo "Sample rate: every ${SAMPLE_RATE}th test"
+        echo "Sample rate: every ${SAMPLE_RATE}th test, offset ${SAMPLE_OFFSET}"
+        echo ""
+        echo "To reproduce this exact run:"
+        echo "  SAMPLE_RATE=${SAMPLE_RATE} SAMPLE_OFFSET=${SAMPLE_OFFSET} $0 --sanity-test"
     else
         # Full test mode
         for test_file in $TEST_FILES; do
@@ -257,8 +270,14 @@ if [ "$DRY_RUN" == "true" ]; then
 
     echo ""
     echo "To actually run the tests, execute without --dry-run:"
-    echo "  $0 $([ "$SANITY_TEST" == "true" ] && echo "--sanity-test")"
-    echo "Or set DRY_RUN=false $0"
+    if [ "$SANITY_TEST" == "true" ]; then
+        echo "  $0 --sanity-test"
+        echo ""
+        echo "To reproduce this exact sampling pattern:"
+        echo "  SAMPLE_RATE=${SAMPLE_RATE} SAMPLE_OFFSET=${SAMPLE_OFFSET} $0 --sanity-test"
+    else
+        echo "  $0"
+    fi
 else
     mkdir -p "${JUNIT_DIR}"
 
@@ -298,13 +317,17 @@ else
             TOTAL_IN_FILE=$(echo "$ALL_NODE_IDS" | wc -l)
             TOTAL_TEST_CASES=$((TOTAL_TEST_CASES + TOTAL_IN_FILE))
 
-            # Sample every Nth test
-            SAMPLED_NODE_IDS=$(echo "$ALL_NODE_IDS" | awk "NR % $SAMPLE_RATE == 1")
+             # Sample every Nth test with random offset
+            SAMPLED_NODE_IDS=$(echo "$ALL_NODE_IDS" | awk "NR % $SAMPLE_RATE == $SAMPLE_OFFSET")
+            # Fallback: if no tests sampled (offset missed all tests), take the first test
+            if [ -z "$SAMPLED_NODE_IDS" ] || [ $(echo "$SAMPLED_NODE_IDS" | wc -l) -eq 0 ]; then
+                SAMPLED_NODE_IDS=$(echo "$ALL_NODE_IDS" | head -1)
+            fi
             SAMPLED_IN_FILE=$(echo "$SAMPLED_NODE_IDS" | wc -l)
             SAMPLED_TEST_CASES=$((SAMPLED_TEST_CASES + SAMPLED_IN_FILE))
 
             echo "Total test cases in file: $TOTAL_IN_FILE"
-            echo "Running sampled test cases: $SAMPLED_IN_FILE (every ${SAMPLE_RATE}th test)"
+            echo "Running sampled test cases: $SAMPLED_IN_FILE (every ${SAMPLE_RATE}th test, offset ${SAMPLE_OFFSET})"
 
             if [ "$SAMPLED_IN_FILE" -eq 0 ]; then
                 echo "⚠️  No tests sampled from $test_file, skipping"
@@ -347,7 +370,10 @@ else
         else
             echo "Coverage: N/A (no tests collected)"
         fi
-        echo "Sample rate: every ${SAMPLE_RATE}th test"
+        echo "Sample rate: every ${SAMPLE_RATE}th test, offset ${SAMPLE_OFFSET}"
+        echo ""
+        echo "To reproduce this exact run:"
+        echo "  SAMPLE_RATE=${SAMPLE_RATE} SAMPLE_OFFSET=${SAMPLE_OFFSET} $0 --sanity-test"
 
         if [ -n "$FAILED_TESTS" ]; then
             echo ""
