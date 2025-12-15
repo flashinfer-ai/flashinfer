@@ -2625,12 +2625,50 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKKernel_Unified(
     } else if constexpr (MODE == RadixTopKMode::PageTableTransform) {
       uint32_t batch_idx = (row_to_batch != nullptr) ? row_to_batch[row_idx] : row_idx;
       const IdType* src_page_entry = aux_data + batch_idx * aux_stride;
-      RadixCollectIndices<BLOCK_THREADS, SINGLE_CTA, OrderedType>(
-          shared_ordered, actual_chunk_size, chunk_start, k, ordered_pivot, local_histogram,
-          &shared_output_counter, state, barrier_phase, ctas_per_group, tx,
-          [&](uint32_t original_idx, OrderedType /*ordered_val*/, int pos) {
-            row_output[pos] = src_page_entry[original_idx];
-          });
+
+      if constexpr (SINGLE_CTA) {
+        // Two-phase approach: collect indices first, then transform
+        RadixCollectIndices<BLOCK_THREADS, SINGLE_CTA, OrderedType>(
+            shared_ordered, actual_chunk_size, chunk_start, k, ordered_pivot, local_histogram,
+            &shared_output_counter, state, barrier_phase, ctas_per_group, tx,
+            [&](uint32_t original_idx, OrderedType /*ordered_val*/, int pos) {
+              row_output[pos] = static_cast<IdType>(original_idx);
+            });
+        __syncthreads();
+
+        // Transform through page table with coalesced access
+        for (uint32_t i = tx; i < k; i += BLOCK_THREADS) {
+          IdType idx = row_output[i];
+          row_output[i] = src_page_entry[idx];
+        }
+      } else {
+        // Multi-CTA: Two-phase approach
+        // Phase 1: collect raw indices (scattered writes to global memory)
+        RadixCollectIndices<BLOCK_THREADS, SINGLE_CTA, OrderedType>(
+            shared_ordered, actual_chunk_size, chunk_start, k, ordered_pivot, local_histogram,
+            &shared_output_counter, state, barrier_phase, ctas_per_group, tx,
+            [&](uint32_t original_idx, OrderedType /*ordered_val*/, int pos) {
+              row_output[pos] = static_cast<IdType>(original_idx);
+            });
+
+        // Barrier to ensure all CTAs finished writing indices
+        if (tx == 0) {
+          red_release(&state->arrival_counter, 1);
+        }
+        int target = (barrier_phase + 1) * ctas_per_group;
+        wait_ge(&state->arrival_counter, target, tx);
+        barrier_phase++;
+        __syncthreads();
+
+        // Phase 2: all CTAs participate in page table transform (coalesced access)
+        uint32_t elems_per_cta = (k + ctas_per_group - 1) / ctas_per_group;
+        uint32_t my_start = cta_in_group * elems_per_cta;
+        uint32_t my_end = min(my_start + elems_per_cta, k);
+        for (uint32_t i = my_start + tx; i < my_end; i += BLOCK_THREADS) {
+          IdType idx = row_output[i];
+          row_output[i] = src_page_entry[idx];
+        }
+      }
     } else {  // RaggedTransform
       IdType offset = aux_data[row_idx];
       RadixCollectIndices<BLOCK_THREADS, SINGLE_CTA, OrderedType>(
