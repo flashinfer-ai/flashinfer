@@ -294,13 +294,10 @@ def testGemmFp8NtGroupwise(args):
             fn=run_backend,
             dry_run_iters=args.dry_run_iters,
             repeat_iters=args.num_iters,
-            l2_flush=True,
-            l2_flush_size_mb=256,
-            l2_flush_device=device,
             sleep_after_run=True,  # GEMMs are very MMA-heavy, so prefer sleep to reduce throttling.
             enable_cupti=args.use_cupti,
             use_cuda_graph=is_cuda_graph_compatible,
-            rotate_buffers=True,
+            cold_l2_cache=True,
             input_args=(cur_backend, a_fp8, b_fp8, a_scale, b_scale),
         )
 
@@ -480,13 +477,10 @@ def testGroupGemmFp8NtGroupwise(args):
             fn=run_backend,
             dry_run_iters=args.dry_run_iters,
             repeat_iters=args.num_iters,
-            l2_flush=True,
-            l2_flush_size_mb=256,
-            l2_flush_device=device,
             sleep_after_run=True,  # GEMMs are very MMA-heavy, so prefer sleep to reduce throttling.
             enable_cupti=args.use_cupti,
             use_cuda_graph=is_cuda_graph_compatible,
-            rotate_buffers=True,
+            cold_l2_cache=True,
             input_args=(cur_backend, a_fp8, b_fp8, a_scale, b_scale, m_indptr),
         )
 
@@ -689,13 +683,10 @@ def testBmmFp8(args):
             fn=run_backend,
             dry_run_iters=args.dry_run_iters,
             repeat_iters=args.num_iters,
-            l2_flush=True,
-            l2_flush_size_mb=256,
-            l2_flush_device=device,
             sleep_after_run=True,
             enable_cupti=args.use_cupti,
             use_cuda_graph=is_cuda_graph_compatible,
-            rotate_buffers=True,
+            cold_l2_cache=True,
             input_args=(cur_backend, input_fp8, mat2_fp8, input_inv_s, mat2_inv_s),
         )
 
@@ -963,13 +954,10 @@ def testMmFp4(args):
             fn=run_backend,
             dry_run_iters=args.dry_run_iters,
             repeat_iters=args.num_iters,
-            l2_flush=True,
-            l2_flush_size_mb=256,
-            l2_flush_device=device,
             sleep_after_run=True,
             enable_cupti=args.use_cupti,
             use_cuda_graph=is_cuda_graph_compatible,
-            rotate_buffers=True,
+            cold_l2_cache=True,
             input_args=(
                 cur_backend,
                 input_fp4,
