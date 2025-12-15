@@ -122,7 +122,7 @@ class TestMnnvlMemory:
         reason="Mnnvl memory is not supported on this platform",
     )
     def test_moe_alltoall_multi_rank_single_gpu(self):
-        torch.cuda.set_device(self.rank)
+        torch.cuda.set_device(self.local_rank)
         max_world_size = 8
         assert self.world_size <= max_world_size, (
             f"should run with world_size at most {max_world_size}"
