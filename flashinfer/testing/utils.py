@@ -765,9 +765,7 @@ def bench_gpu_time_with_cuda_event(
     """
     Benchmark kernel execution time using CUDA events (no CUDA graphs).
 
-    This is the simplest benchmarking method. It measures the total time from kernel
-    launch to completion, which includes both CPU-side kernel launch latency and
-    actual GPU kernel execution time. Best suited for kernels where launch overhead
+    This is the simplest benchmarking method. Best suited for kernels where launch overhead
     is negligible compared to execution time.
 
     The function performs:
@@ -1245,9 +1243,6 @@ def bench_gpu_time_with_cudagraph(
     through during graph capture, ensuring each kernel invocation operates on
     different memory regions. The number of buffer copies is automatically
     calculated based on the device's L2 cache size.
-
-    Note: For CUDA graphs, L2 flush alone is insufficient because the flush only
-    occurs between graph replays, not between kernel iterations within the graph.
 
     Args:
         fn (Callable): The kernel function to benchmark.
