@@ -317,7 +317,7 @@ else
             TOTAL_IN_FILE=$(echo "$ALL_NODE_IDS" | wc -l)
             TOTAL_TEST_CASES=$((TOTAL_TEST_CASES + TOTAL_IN_FILE))
 
-             # Sample every Nth test with random offset
+            # Sample every Nth test with random offset
             SAMPLED_NODE_IDS=$(echo "$ALL_NODE_IDS" | awk "NR % $SAMPLE_RATE == $SAMPLE_OFFSET")
             # Fallback: if no tests sampled (offset missed all tests), take the first test
             if [ -z "$SAMPLED_NODE_IDS" ] || [ $(echo "$SAMPLED_NODE_IDS" | wc -l) -eq 0 ]; then
