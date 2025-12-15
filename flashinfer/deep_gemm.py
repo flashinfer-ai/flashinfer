@@ -1393,7 +1393,7 @@ def _check_group_deepgemm_fp8_nt_contiguous_problem_size(
     m__ = m_indices.numel()
 
     # Type and shape checks
-    if m != m_ or k != k_ or n != n_ or m__ != m_ or num_groups != m__:
+    if m != m_ or k != k_ or n != n_ or m__ != m_:
         raise ValueError(
             f"Shape mismatch. m = {m}, m_ = {m_}, k = {k}, k_ = {k_}, n = {n}, n_ = {n_}, m__ = {m__}"
         )

@@ -2470,8 +2470,11 @@ def _check_gemm_fp8_nt_groupwise_problem_size(
             f"Shape mismatch. a.shape[1] = {a.shape[1]}, b.shape[1] = {b.shape[1]}"
         )
 
+    if out is None:
+        out_dtype = out_dtype or torch.bfloat16
+    else:
+        out_dtype = out.dtype
     _validate_fp8_output_dtype(out_dtype)
-
     return True
 
 
@@ -2780,7 +2783,7 @@ def gemm_fp8_nt_blockscaled(
     )
 
 
-@supported_compute_capability([100, 120, 121])
+@supported_compute_capability([100, 103, 120, 121])
 def _check_group_gemm_fp8_nt_groupwise_problem_size(
     a: torch.Tensor,
     b: torch.Tensor,
