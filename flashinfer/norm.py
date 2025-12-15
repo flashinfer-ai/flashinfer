@@ -16,13 +16,21 @@ limitations under the License.
 
 import functools
 from enum import Enum
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
 from .api_logging import flashinfer_api
+from .autotuner import (
+    AutoTuner,
+    OptimizationProfile,
+    TunableRunner,
+    TuningConfig,
+)
 from .jit.norm import gen_norm_module
 from .utils import device_support_pdl, register_custom_op, register_fake_op
+
+
 
 
 # cuDNN availability check
@@ -371,7 +379,7 @@ def _torch_dtype_to_cudnn_dtype(dtype: torch.dtype):
 
 
 @functools.cache
-def _build_rmsnorm_fp4quant_graph(
+def _create_rmsnorm_fp4quant_execution_plans(
     batch_size: int,
     hidden_size: int,
     block_size: int,
@@ -379,7 +387,11 @@ def _build_rmsnorm_fp4quant_graph(
     device,
 ):
     """
-    Build and cache the cuDNN graph for fused RMSNorm + FP4 quantization.
+    Create cuDNN graph with execution plans for fused RMSNorm + FP4 quantization.
+
+    This function creates the graph and execution plans but does NOT build them.
+    The plans are built separately in _build_rmsnorm_fp4quant_graph to allow
+    for tactic-specific caching.
 
     The graph performs:
     1. RMSNorm: y = (x / RMS(x)) * weight
@@ -454,16 +466,12 @@ def _build_rmsnorm_fp4quant_graph(
     y_fp4.set_output(True).set_data_type(cudnn.data_type.FP4_E2M1)
     block_scale_out.set_output(True).set_data_type(cudnn.data_type.FP8_E4M3)
 
-    # Build the graph
+    # Build the graph and create execution plans (but don't build plans yet)
     graph.validate()
     graph.build_operation_graph()
     graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
-    graph.check_support()
-    graph.build_plans()
 
     # Return graph and tensor objects for variant_pack
-    # Note: handle is not stored here - we get it fresh at execution time
-    # with the current stream set (matching gemm_base.py pattern)
     tensor_dict = {
         "x": x,
         "weight": weight,
@@ -471,6 +479,45 @@ def _build_rmsnorm_fp4quant_graph(
         "y_fp4": y_fp4,
         "block_scale": block_scale_out,
     }
+
+    return graph, tensor_dict
+
+
+@functools.cache
+def _build_rmsnorm_fp4quant_graph(
+    batch_size: int,
+    hidden_size: int,
+    block_size: int,
+    input_dtype: torch.dtype,
+    device,
+    tactic: int = -1,
+):
+    """
+    Build execution plan at specific index for the RMSNorm + FP4 quantization graph.
+
+    This function is cached with the tactic parameter to allow different tactics
+    to be built and cached separately for autotuning.
+
+    Args:
+        batch_size: Batch size
+        hidden_size: Hidden dimension size
+        block_size: Block size for FP4 quantization
+        input_dtype: Input tensor dtype (float16 or bfloat16)
+        device: CUDA device
+        tactic: Execution plan index to build. -1 means build all plans.
+
+    Returns:
+        Tuple of (graph, tensor_dict)
+    """
+    graph, tensor_dict = _create_rmsnorm_fp4quant_execution_plans(
+        batch_size, hidden_size, block_size, input_dtype, device
+    )
+
+    graph.check_support()
+    if tactic != -1:
+        graph.build_plan_at_index(tactic)
+    else:
+        graph.build_plans()
 
     return graph, tensor_dict
 
@@ -483,8 +530,20 @@ def _execute_rmsnorm_fp4quant_graph(
     eps: float,
     y_fp4_data: torch.Tensor,
     block_scale_data: torch.Tensor,
+    tactic: int = -1,
 ):
-    """Execute the cached cuDNN RMSNorm + FP4 quantization graph."""
+    """Execute the cached cuDNN RMSNorm + FP4 quantization graph.
+
+    Args:
+        graph: The cuDNN graph object
+        tensor_dict: Dictionary of tensor objects for building variant_pack
+        x_data: Input tensor
+        weight_data: Weight tensor
+        eps: Epsilon value for RMSNorm
+        y_fp4_data: Output tensor for FP4 quantized values
+        block_scale_data: Output tensor for block scale factors
+        tactic: Execution plan index to use. -1 means use default execution.
+    """
     # Prepare epsilon as CPU tensor (pass by value)
     eps_cpu = torch.full((1, 1, 1, 1), eps, dtype=torch.float32, device="cpu")
 
@@ -506,7 +565,97 @@ def _execute_rmsnorm_fp4quant_graph(
     stream = torch.cuda.current_stream(x_data.device)
     handle = _get_cudnn_norm_handle(stream)
 
-    graph.execute(variant_pack, workspace, handle=handle)
+    if tactic == -1:
+        graph.execute(variant_pack, workspace, handle=handle)
+    else:
+        graph.execute_plan_at_index(variant_pack, workspace, tactic, handle=handle)
+
+
+@functools.cache
+def _get_cudnn_rmsnorm_fp4quant_runner():
+    """Get a cached TunableRunner for cuDNN RMSNorm + FP4 quantization."""
+
+    class CudnnRMSNormFP4QuantRunner(TunableRunner):
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+        ) -> List[int]:
+            """Return list of valid execution plan indices for autotuning."""
+            (
+                input_tensor,
+                weight,
+                y_fp4,
+                block_scale,
+                eps,
+                block_size,
+            ) = inputs
+
+            batch_size = input_tensor.shape[0]
+            hidden_size = input_tensor.shape[1]
+
+            # Get the graph with execution plans (not built yet)
+            graph, _ = _create_rmsnorm_fp4quant_execution_plans(
+                batch_size,
+                hidden_size,
+                block_size,
+                input_tensor.dtype,
+                input_tensor.device,
+            )
+
+            num_plans = graph.get_execution_plan_count()
+            return list(range(num_plans))
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic: int = -1,
+            do_preparation: bool = False,
+            **kwargs,
+        ):
+            """Execute the RMSNorm + FP4 quantization with specified tactic."""
+            (
+                input_tensor,
+                weight,
+                y_fp4,
+                block_scale,
+                eps,
+                block_size,
+            ) = inputs
+
+            batch_size = input_tensor.shape[0]
+            hidden_size = input_tensor.shape[1]
+            num_blocks = hidden_size // block_size
+
+            # Reshape tensors for cuDNN 4D format
+            x_4d = input_tensor.view(batch_size, hidden_size, 1, 1)
+            weight_4d = weight.view(1, hidden_size, 1, 1)
+            y_fp4_4d = y_fp4.view(batch_size, hidden_size // 2, 1, 1)
+            block_scale_4d = block_scale.view(batch_size, num_blocks, 1, 1)
+
+            # Build the graph with the specified tactic
+            graph, tensor_dict = _build_rmsnorm_fp4quant_graph(
+                batch_size,
+                hidden_size,
+                block_size,
+                input_tensor.dtype,
+                input_tensor.device,
+                tactic=tactic,
+            )
+
+            # Execute the graph
+            _execute_rmsnorm_fp4quant_graph(
+                graph=graph,
+                tensor_dict=tensor_dict,
+                x_data=x_4d,
+                weight_data=weight_4d,
+                eps=eps,
+                y_fp4_data=y_fp4_4d,
+                block_scale_data=block_scale_4d,
+                tactic=tactic,
+            )
+
+    return CudnnRMSNormFP4QuantRunner()
 
 
 @flashinfer_api
@@ -565,6 +714,8 @@ def rmsnorm_fp4quant(
     - The FP4_E2M1 format uses 4 bits per value with 2 exponent bits and 1 mantissa bit.
     - The block scale is computed as ``max_abs_in_block / 6.0`` (where 6.0 is FP4_E2M1_MAX),
       then rounded to FP8_E4M3 format.
+    - Autotuning is supported: the function will automatically select the best cuDNN
+      execution plan when autotuning is enabled.
 
     Examples
     --------
@@ -623,35 +774,29 @@ def rmsnorm_fp4quant(
             f"hidden_size ({hidden_size}) must be divisible by 2 for FP4 packing"
         )
 
-    # Reshape input and weight for cuDNN 4D format
-    # Using row-major layout (NCHW): [batch, hidden_size, 1, 1] with NCHW strides
-    # Both input and weight use the same dtype (bf16/fp16)
-    x_2d = input.view(batch_size, hidden_size)
-    x_4d = x_2d.unsqueeze(-1).unsqueeze(-1)  # [B, H] -> [B, H, 1, 1]
-    weight_4d = weight.view(1, hidden_size, 1, 1)
+    # Flatten input to 2D for the runner
+    input_2d = input.view(batch_size, hidden_size)
 
-    # Get or build the cached graph
-    graph, tensor_dict = _build_rmsnorm_fp4quant_graph(
-        batch_size=batch_size,
-        hidden_size=hidden_size,
-        block_size=block_size,
-        input_dtype=input.dtype,
-        device=input.device,
+    # Use AutoTuner for execution plan selection
+    runners = [_get_cudnn_rmsnorm_fp4quant_runner()]
+    tuner = AutoTuner.get()
+
+    # Package inputs for the runner
+    # Note: eps and block_size are passed as Python values (not tensors)
+    inputs = [
+        input_2d,
+        weight,
+        y_fp4,
+        block_scale,
+        eps,
+        block_size,
+    ]
+
+    runner, tactic = tuner.choose_one(
+        "rmsnorm_fp4quant",
+        runners,
+        TuningConfig(),
+        inputs,
     )
 
-    # Reshape output tensors for cuDNN 4D format
-    # FP4 packed: 2 values per byte, axis=1 is the hidden dimension
-    num_blocks = hidden_size // block_size
-    y_fp4_4d = y_fp4.view(batch_size, hidden_size // 2, 1, 1)
-    block_scale_4d = block_scale.view(batch_size, num_blocks, 1, 1)
-
-    # Execute the graph
-    _execute_rmsnorm_fp4quant_graph(
-        graph=graph,
-        tensor_dict=tensor_dict,
-        x_data=x_4d,
-        weight_data=weight_4d,
-        eps=eps,
-        y_fp4_data=y_fp4_4d,
-        block_scale_data=block_scale_4d,
-    )
+    runner(inputs=inputs, tactic=tactic)
