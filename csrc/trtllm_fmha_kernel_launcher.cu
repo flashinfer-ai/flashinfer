@@ -211,14 +211,17 @@ inline Data_type dl_dtype_to_tllm_data_type(const DLDataType dtype) {
 
 inline bool is_4bit(Data_type data_type) { return data_type == Data_type::DATA_TYPE_E2M1; }
 
-void trtllm_paged_attention_decode(
-    TensorView out, Optional<TensorView> out_scale_factor, TensorView query, TensorView key_cache,
-    TensorView value_cache, TensorView workspace_buffer, TensorView block_tables,
-    TensorView seq_lens, int64_t max_kv_len, Variant<double, ffi::Tensor> bmm1_scale,
-    Variant<double, ffi::Tensor> bmm2_scale, double o_sf_scale, int64_t o_sf_vec_size,
-    int64_t o_sf_start_index, int64_t window_left, int64_t sparse_mla_top_k, int64_t sm_count,
-    bool enable_pdl, int64_t workspace_size, Optional<TensorView> attention_sinks,
-    Optional<int64_t> optional_max_q_len, Optional<TensorView> cum_seq_lens_q) {
+void trtllm_paged_attention_decode(TensorView out, Optional<TensorView> out_scale_factor,
+                                   TensorView query, TensorView key_cache, TensorView value_cache,
+                                   TensorView workspace_buffer, TensorView block_tables,
+                                   TensorView seq_lens, int64_t max_q_len, int64_t max_kv_len,
+                                   Variant<double, ffi::Tensor> bmm1_scale,
+                                   Variant<double, ffi::Tensor> bmm2_scale, double o_sf_scale,
+                                   int64_t o_sf_vec_size, int64_t o_sf_start_index,
+                                   int64_t batch_size, int64_t window_left,
+                                   int64_t sparse_mla_top_k, int64_t sm_count, bool enable_pdl,
+                                   int64_t workspace_size, Optional<TensorView> attention_sinks,
+                                   Optional<TensorView> cum_seq_lens_q) {
   auto q_data_type = dl_dtype_to_tllm_data_type(query.dtype());
   auto kv_data_type = dl_dtype_to_tllm_data_type(key_cache.dtype());
   TVM_FFI_ICHECK_EQ(key_cache.ndim(), value_cache.ndim());
@@ -226,41 +229,12 @@ void trtllm_paged_attention_decode(
     TVM_FFI_ICHECK_EQ(key_cache.size(i), value_cache.size(i));
   }
   auto o_data_type = dl_dtype_to_tllm_data_type(out.dtype());
-  int batch_size;
-  int max_q_len;
-  int sum_seq_q;
-  int num_qo_heads;
-  int* cum_seq_lens_q_ptr = nullptr;
-  if (!optional_max_q_len.has_value()) {
-    // each request has the same length
-
-    // NOTE(Zihao): query is [B, Q, H, D]
-    // where Q is the number of query tokens per request, used in MTP
-    // based on profiled results, always use decode mode for MTP (q_len is small)
-    // example: when kv_len = 10000, q < 200, decode mode is faster
-    TVM_FFI_CHECK(query.ndim() == 4,
-                  "When max_q_len is not provided, query must be of shape [batch_size, q_len, "
-                  "num_qo_heads, head_dim_q]");
-    int q_len_per_request = query.size(1);
-    batch_size = query.size(0);
-    sum_seq_q = batch_size * q_len_per_request;
-    num_qo_heads = query.size(2);
-    max_q_len = q_len_per_request;
-  } else {
-    // each request has different length
-    TVM_FFI_CHECK(cum_seq_lens_q.has_value(),
-                  "cum_seq_lens_q must be provided when max_q_len is provided");
-    TVM_FFI_CHECK(
-        query.ndim() == 3,
-        "When max_q_len is provided, query must be of shape [sum_seq_q, num_qo_heads, head_dim_q]");
-    // the shape of query: [sum_seq_q, num_qo_heads, head_dim_q]
-    // the shape of cum_seq_lens_q: [batch_size + 1]
-    batch_size = cum_seq_lens_q.value().size(0) - 1;
-    sum_seq_q = query.size(0);
-    num_qo_heads = query.size(1);
-    max_q_len = optional_max_q_len.value();
-    cum_seq_lens_q_ptr = static_cast<int*>(cum_seq_lens_q.value().data_ptr());
-  }
+  int sum_seq_q = query.size(0);
+  int num_qo_heads = query.size(1);
+  // the cum_seq_lens_q is optional, and can be nullptr when all sequences have the same query
+  // length
+  int* cum_seq_lens_q_ptr =
+      cum_seq_lens_q.has_value() ? static_cast<int*>(cum_seq_lens_q.value().data_ptr()) : nullptr;
   // Multiply by two for FP4 tensor as it is stored as UINT8 dtype. Assume the dim is even.
   int head_dim_k = is_4bit(kv_data_type) ? key_cache.size(-1) * 2 : key_cache.size(-1);
   int head_dim_q = is_4bit(q_data_type) ? query.size(-1) * 2 : query.size(-1);

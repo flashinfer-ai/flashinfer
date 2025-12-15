@@ -1895,28 +1895,34 @@ class TrtllmGenDecodeModule:
         if isinstance(bmm2_scale, torch.Tensor):
             assert bmm2_scale.dtype == torch.float32
 
+        assert len(query.size()) == 4
+        batch_size = query.size(0)
+        max_q_len = query.size(1)
+        query = query.flatten(0, 1)  # [B*S, H, D]
+
         self._op.trtllm_paged_attention_decode(
             out,
             None,  # fp4 output not supported in wrapper api yet.
-            query,  # [B, S, H, D], w/ MTP here so second dim is S
+            query,  # [B * S, H, D], w/ MTP here so S dim is > 1
             k_cache,
             v_cache,
             workspace_buffer,
             block_tables,
             seq_lens,
+            max_q_len,
             max_seq_len,
             bmm1_scale,
             bmm2_scale,
             -1,  # o_sf_scale
             -1,  # o_sf_vec_size
             0,  # o_sf_start_index
+            batch_size,
             window_left,
             0,  # sparse_mla_top_k
             self._sm_count,
             enable_pdl,
             workspace_size,
             sinks,
-            None,  # max_q_len
             None,  # cum_seq_lens_q
         )
         return out
@@ -2313,35 +2319,36 @@ def trtllm_batch_decode_with_kv_cache(
         if isinstance(bmm2_scale, torch.Tensor):
             assert bmm2_scale.dtype == torch.float32
 
+        if q_len_per_req is not None:
+            max_q_len = q_len_per_req
+            batch_size = query.size(0) // q_len_per_req
+        else:
+            assert max_q_len is not None
+            batch_size = cum_seq_lens_q.size(0) - 1
+
         run_func(
             out,
             out_scale_factor,
-            query.view(
-                query.size(0) // q_len_per_req,
-                q_len_per_req,
-                query.size(1),
-                query.size(2),
-            )
-            if q_len_per_req is not None
-            else query,
+            query,
             k_cache,
             v_cache,
             workspace_buffer,
             block_tables,
             seq_lens,
+            max_q_len,
             max_seq_len,
             bmm1_scale,
             bmm2_scale,
             o_sf_scale or -1.0,
             o_sf_vec_size or -1,
             o_sf_start_index,
+            batch_size,
             window_left,
             0,  # sparse_mla_top_k
             sm_count,
             enable_pdl,
             workspace_buffer.numel() * workspace_buffer.element_size(),
             sinks,
-            max_q_len,
             cum_seq_lens_q,
         )
 
