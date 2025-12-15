@@ -119,9 +119,10 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 
   FusedMoeRunner(DLDataType activation_dtype, DLDataType weight_dtype, DLDataType output_dtype,
                  bool use_deepseek_fp8_block_scale, bool use_w4_group_scaling,
-                 bool use_mxfp8_act_scaling) {
+                 bool use_mxfp8_act_scaling, bool use_packed_weights) {
     mActivationDtype = activation_dtype;
     mWeightDtype = weight_dtype;
+    mUsePackedWeights = use_packed_weights;
     mOutputDtype = output_dtype;
     mUseDeepSeekFP8BlockScaling = use_deepseek_fp8_block_scale;
     mUseW4GroupScaling = use_w4_group_scaling;
@@ -779,6 +780,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
   bool mUseDeepSeekFP8BlockScaling = false;
   bool mUseW4GroupScaling = false;
   bool mUseMxfp8ActScaling = false;
+  bool mUsePackedWeights = false;
 
   using Profile = tensorrt_llm::cutlass_extensions::CutlassGemmConfig;
   std::vector<Profile> mAllProfiles;
@@ -1174,9 +1176,11 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
            mActivationDtype != dl_float8_e4m3fn;  // FP8 activation does not use FP4
   }
 
-  bool isWFP4A16Quant() const { return mUseW4GroupScaling && mWeightDtype == dl_uint8; }
+  bool isWFP4A16Quant() const {
+    return mUseW4GroupScaling && mWeightDtype == dl_uint8 && !mUsePackedWeights;
+  }
 
-  bool isInt4Quant() const { return mWeightDtype == dl_uint4x2; }
+  bool isInt4Quant() const { return mWeightDtype == dl_uint8 && mUsePackedWeights; }
 
   bool isW4AFp8Quant() const { return mActivationDtype == dl_float8_e4m3fn && isInt4Quant(); }
 
@@ -1191,10 +1195,10 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 
 tvm::ffi::Module init(DLDataType activation_dtype, DLDataType weight_dtype, DLDataType output_dtype,
                       bool use_deepseek_fp8_block_scale, bool use_w4_group_scaling,
-                      bool use_mxfp8_act_scaling) {
-  auto ptr = tvm::ffi::make_object<FusedMoeRunner>(activation_dtype, weight_dtype, output_dtype,
-                                                   use_deepseek_fp8_block_scale,
-                                                   use_w4_group_scaling, use_mxfp8_act_scaling);
+                      bool use_mxfp8_act_scaling, bool use_packed_weights) {
+  auto ptr = tvm::ffi::make_object<FusedMoeRunner>(
+      activation_dtype, weight_dtype, output_dtype, use_deepseek_fp8_block_scale,
+      use_w4_group_scaling, use_mxfp8_act_scaling, use_packed_weights);
   return tvm::ffi::Module(ptr);
 }
 

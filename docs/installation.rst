@@ -15,6 +15,11 @@ Prerequisites
 
 - Python: 3.10, 3.11, 3.12, 3.13, 3.14
 
+- CUDA: 12.6, 12.8, 13.0, 13.1
+
+.. note::
+   FlashInfer strives to follow PyTorch's supported CUDA versions plus the latest CUDA release.
+
 Quick Start
 ^^^^^^^^^^^
 

@@ -21,6 +21,7 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
+#include <atomic>
 #include <cstdint>
 #include <iostream>
 #include <type_traits>
@@ -317,13 +318,18 @@
 namespace flashinfer {
 
 template <typename T1, typename T2>
-__forceinline__ __device__ __host__ T1 ceil_div(const T1 x, const T2 y) {
+__forceinline__ __device__ __host__ constexpr T1 ceil_div(const T1 x, const T2 y) noexcept {
   return (x + y - 1) / y;
 }
 
 template <typename T1, typename T2>
-__forceinline__ __device__ __host__ T1 round_up(const T1 x, const T2 y) {
+__forceinline__ __device__ __host__ constexpr T1 round_up(const T1 x, const T2 y) noexcept {
   return ceil_div(x, y) * y;
+}
+
+template <typename T1, typename T2>
+__forceinline__ __device__ __host__ constexpr T1 round_down(const T1 x, const T2 y) noexcept {
+  return (x / y) * y;
 }
 
 inline std::pair<int, int> GetCudaComputeCapability() {
@@ -333,6 +339,22 @@ inline std::pair<int, int> GetCudaComputeCapability() {
   cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device_id);
   cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device_id);
   return std::make_pair(major, minor);
+}
+
+// This function is thread-safe and cached the sm_count.
+// But it will only check the current CUDA device, thus assuming each process handles single GPU.
+inline int GetCudaMultiProcessorCount() {
+  static std::atomic<int> sm_count{0};
+  int cached = sm_count.load(std::memory_order_relaxed);
+  if (cached == 0) {
+    int device_id;
+    cudaGetDevice(&device_id);
+    cudaDeviceProp device_prop;
+    cudaGetDeviceProperties(&device_prop, device_id);
+    cached = device_prop.multiProcessorCount;
+    sm_count.store(cached, std::memory_order_relaxed);
+  }
+  return cached;
 }
 
 template <typename T>
