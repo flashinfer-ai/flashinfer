@@ -14,7 +14,7 @@ import numpy as np
 import torch
 
 import flashinfer
-from flashinfer.testing.utils import bench_gpu_time
+from flashinfer.testing.utils import bench_gpu_time_with_cupti
 
 
 def set_topk_algo(algo: str):
@@ -45,10 +45,8 @@ def bench_top_k(
     scores = torch.randn(batch_size, seq_len, device="cuda", dtype=dtype)
 
     # FlashInfer top_k
-    measurements = bench_gpu_time(
+    measurements = bench_gpu_time_with_cupti(
         lambda: flashinfer.top_k(scores, k),
-        dry_run_time_ms=100,
-        repeat_time_ms=1000,
     )
     fi_ms = np.median(measurements)
 
@@ -61,10 +59,8 @@ def bench_top_k(
     }
 
     # Compare with torch.topk
-    measurements = bench_gpu_time(
+    measurements = bench_gpu_time_with_cupti(
         lambda: torch.topk(scores, k, dim=-1),
-        dry_run_time_ms=100,
-        repeat_time_ms=1000,
     )
     torch_ms = np.median(measurements)
     result["torch_us"] = torch_ms * 1e3
@@ -91,15 +87,13 @@ def bench_page_table_transform(
     )
 
     # FlashInfer
-    measurements = bench_gpu_time(
+    measurements = bench_gpu_time_with_cupti(
         lambda: flashinfer.top_k_page_table_transform(
             scores, src_page_table, lengths, k
         ),
         # lambda: flashinfer.sampling.top_k_mask_logits(
         #    scores, k
         # ),
-        dry_run_time_ms=100,
-        repeat_time_ms=1000,
     )
     fi_ms = np.median(measurements)
 
@@ -114,12 +108,10 @@ def bench_page_table_transform(
     # SGLang comparison (only supports k=2048 and float32)
     if compare_sglang and HAS_SGL_KERNEL and k == 2048 and dtype == torch.float32:
         cu_seqlens_q = torch.arange(0, batch_size + 1, dtype=torch.int32, device="cuda")
-        measurements = bench_gpu_time(
+        measurements = bench_gpu_time_with_cupti(
             lambda: sgl_kernel.fast_topk_transform_fused(
                 scores, lengths, src_page_table, cu_seqlens_q, k
             ),
-            dry_run_time_ms=100,
-            repeat_time_ms=1000,
         )
         sg_ms = np.median(measurements)
         result["sglang_us"] = sg_ms * 1e3
@@ -143,10 +135,8 @@ def bench_ragged_transform(
     )
 
     # FlashInfer
-    measurements = bench_gpu_time(
+    measurements = bench_gpu_time_with_cupti(
         lambda: flashinfer.top_k_ragged_transform(scores, offsets, lengths, k),
-        dry_run_time_ms=100,
-        repeat_time_ms=1000,
     )
     fi_ms = np.median(measurements)
 
@@ -160,12 +150,10 @@ def bench_ragged_transform(
 
     # SGLang comparison (only supports k=2048 and float32)
     if compare_sglang and HAS_SGL_KERNEL and k == 2048 and dtype == torch.float32:
-        measurements = bench_gpu_time(
+        measurements = bench_gpu_time_with_cupti(
             lambda: sgl_kernel.fast_topk_transform_ragged_fused(
                 scores, lengths, offsets, k
             ),
-            dry_run_time_ms=100,
-            repeat_time_ms=1000,
         )
         sg_ms = np.median(measurements)
         result["sglang_us"] = sg_ms * 1e3
