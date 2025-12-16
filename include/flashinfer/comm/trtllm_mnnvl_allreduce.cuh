@@ -654,7 +654,7 @@ cudaError_t oneshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
   int const tokenDim = params.tokenDim;
   int const eltsPerThread = sizeof(float4) / sizeof(T);
 
-  static const int kSMVersionMajor = flashinfer::GetCudaComputeCapability().first;
+  static const int kSMVersionMajor = GetCudaComputeCapability().first;
 
   auto [blockSize, clusterSize, loadsPerThread] =
       adjustGridConfig(numTokens, tokenDim, eltsPerThread, kSMVersionMajor);
@@ -1114,7 +1114,7 @@ cudaError_t twoshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
 
   // Launch the rmsnorm lamport kernel if fusion is enabled
   if (params.rmsNormFusion) {
-    static const int kSMVersionMajor = flashinfer::GetCudaComputeCapability().first;
+    static const int kSMVersionMajor = GetCudaComputeCapability().first;
     auto gridConfig = adjustGridConfig(numTokens, tokenDim, numEltsPerThread, kSMVersionMajor);
     int rnBlockSize = std::get<0>(gridConfig);
     int rnClusterSize = std::get<1>(gridConfig);
