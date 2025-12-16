@@ -2170,8 +2170,8 @@ template <uint32_t BLOCK_THREADS, bool SINGLE_CTA, typename OrderedType>
 __device__ __forceinline__ OrderedType RadixSelectFromSharedMemory(
     const OrderedType* shared_ordered, uint32_t actual_chunk_size, uint32_t k,
     uint32_t* local_histogram, uint32_t* suffix_sum, uint32_t* shared_scalars, RadixRowState* state,
-    int& barrier_phase, uint32_t ctas_per_group, uint32_t cta_in_group, uint32_t tx,
-    uint32_t iter = 0) {
+    int& barrier_phase, uint32_t ctas_per_group, uint32_t cta_in_group, uint32_t tx, uint32_t iter,
+    uint32_t& out_local_gt_count) {
   constexpr uint32_t RADIX = 256;
   constexpr uint32_t RADIX_BITS = 8;
   constexpr uint32_t ORDERED_BITS = sizeof(OrderedType) * 8;
@@ -2232,6 +2232,7 @@ __device__ __forceinline__ OrderedType RadixSelectFromSharedMemory(
     __syncthreads();
 
     // Build local histogram
+#pragma unroll 2
     for (uint32_t i = tx; i < actual_chunk_size; i += BLOCK_THREADS) {
       OrderedType ordered = shared_ordered[i];
       OrderedType mask =
@@ -2305,6 +2306,36 @@ __device__ __forceinline__ OrderedType RadixSelectFromSharedMemory(
 
   OrderedType ordered_pivot = static_cast<OrderedType>(prefix_cache);
 
+  // Count > pivot elements by scanning shared_ordered
+  // This is needed because suffix_sum only tracks elements matching the current prefix,
+  // not all elements > pivot (which includes elements with higher-order bits > pivot)
+  if (tx == 0) {
+    suffix_sum[0] = 0;
+  }
+  __syncthreads();
+
+  uint32_t my_gt_count = 0;
+#pragma unroll 2
+  for (uint32_t i = tx; i < actual_chunk_size; i += BLOCK_THREADS) {
+    if (shared_ordered[i] > ordered_pivot) {
+      my_gt_count++;
+    }
+  }
+
+  // Warp-level reduction
+  for (int offset = 16; offset > 0; offset /= 2) {
+    my_gt_count += __shfl_down_sync(0xffffffff, my_gt_count, offset);
+  }
+
+  // First thread of each warp atomics to shared
+  int lane = tx % 32;
+  if (lane == 0 && my_gt_count > 0) {
+    atomicAdd(&suffix_sum[0], my_gt_count);
+  }
+  __syncthreads();
+
+  out_local_gt_count = suffix_sum[0];
+
 #undef prefix_cache
 #undef remaining_k_cache
 #undef found_bucket
@@ -2355,23 +2386,25 @@ __device__ __forceinline__ DType RadixSelectFindPivot(
                                                               actual_chunk_size, tx);
 
   // Stage 2: Radix select to find pivot
+  uint32_t local_gt_count = 0;  // Not used in this function
   OrderedType ordered_pivot = RadixSelectFromSharedMemory<BLOCK_THREADS, SINGLE_CTA, OrderedType>(
       shared_ordered, actual_chunk_size, k, local_histogram, suffix_sum, shared_scalars, state,
-      barrier_phase, ctas_per_group, cta_in_group, tx, iter);
+      barrier_phase, ctas_per_group, cta_in_group, tx, iter, local_gt_count);
 
   // Convert ordered representation back to DType pivot
   return Traits::FromOrdered(ordered_pivot);
 }
 
 /*!
- * \brief Collect top-k indices based on pivot value with custom output transform.
+ * \brief Collect top-k indices based on pivot value with custom output transform (Single Pass).
  *
- * This is the common Stage 3 logic for all TopK kernels. It collects elements >= pivot
- * and applies a custom transform when writing to output.
+ * This optimized version uses a single pass to write all elements:
+ * - > pivot: use shared memory atomic for local offset within CTA's allocation
+ * - == pivot: use global memory atomic, check if pos < k before writing
  *
- * The collection is done in two passes:
- * 1. Count and write elements > pivot (guaranteed to be in top-k)
- * 2. Write elements == pivot until we reach k elements (tie handling)
+ * The local_gt_count is computed during the last round of radix select, so we know
+ * exactly how many > pivot elements each CTA has. This allows batched global atomic
+ * (one per CTA) for > pivot elements.
  *
  * \tparam BLOCK_THREADS Number of threads per block
  * \tparam SINGLE_CTA True if single-CTA mode
@@ -2384,10 +2417,11 @@ __device__ __forceinline__ DType RadixSelectFindPivot(
  * \param chunk_start Start index in input for this chunk
  * \param k Number of top elements to select
  * \param ordered_pivot The pivot value in ordered representation
- * \param local_histogram Shared memory for local counter (reused, only uses [0] and [1])
+ * \param local_gt_count Number of > pivot elements in this CTA (from radix select)
+ * \param local_histogram Shared memory for counters
  * \param shared_output_counter Pointer to shared output counter (SINGLE_CTA mode)
  * \param state RadixRowState pointer for multi-CTA sync (nullptr if SINGLE_CTA)
- * \param barrier_phase Reference to barrier phase counter
+ * \param barrier_phase Reference to barrier phase counter (unused in new implementation)
  * \param ctas_per_group Number of CTAs per group
  * \param tx Thread index
  * \param output_func Functor called as output_func(original_idx, ordered_val, output_pos) for each
@@ -2396,70 +2430,39 @@ __device__ __forceinline__ DType RadixSelectFindPivot(
 template <uint32_t BLOCK_THREADS, bool SINGLE_CTA, typename OrderedType, typename OutputFunc>
 __device__ __forceinline__ void RadixCollectIndices(
     const OrderedType* shared_ordered, uint32_t actual_chunk_size, uint32_t chunk_start, uint32_t k,
-    OrderedType ordered_pivot, uint32_t* local_histogram, uint32_t* shared_output_counter,
-    RadixRowState* state, int& barrier_phase, uint32_t ctas_per_group, uint32_t tx,
-    OutputFunc output_func) {
-// Use local_histogram[0] and [1] as local_counter and global_base
-#define local_counter local_histogram[0]
-#define global_base local_histogram[1]
+    OrderedType ordered_pivot, uint32_t local_gt_count, uint32_t* local_histogram,
+    uint32_t* shared_output_counter, RadixRowState* state, int& barrier_phase,
+    uint32_t ctas_per_group, uint32_t tx, OutputFunc output_func) {
+// Use local_histogram for counters:
+// [0]: local_offset_gt (local offset for > pivot elements within CTA's allocation)
+// [1]: global_base_gt (global base position for > pivot)
+#define local_offset_gt local_histogram[0]
+#define global_base_gt local_histogram[1]
 
-  // Pass 1: Count elements > pivot locally
+  // Get global base position for this CTA's > pivot elements (one atomic per CTA)
   if (tx == 0) {
-    local_counter = 0;
-  }
-  __syncthreads();
-
-  for (uint32_t i = tx; i < actual_chunk_size; i += BLOCK_THREADS) {
-    OrderedType ordered_val = shared_ordered[i];
-    if (ordered_val > ordered_pivot) {
-      atomicAdd(&local_counter, 1);
-    }
-  }
-  __syncthreads();
-
-  // Get base position for this CTA
-  uint32_t cta_count_gt = local_counter;
-  if (tx == 0 && cta_count_gt > 0) {
-    if constexpr (SINGLE_CTA) {
-      global_base = atomicAdd(shared_output_counter, cta_count_gt);
-    } else {
-      global_base = atomicAdd(&state->output_counter, cta_count_gt);
-    }
-  }
-  __syncthreads();
-
-  // Pass 2: Write elements > pivot
-  if (tx == 0) {
-    local_counter = 0;
-  }
-  __syncthreads();
-
-  if (cta_count_gt > 0) {
-    for (uint32_t i = tx; i < actual_chunk_size; i += BLOCK_THREADS) {
-      OrderedType ordered_val = shared_ordered[i];
-      if (ordered_val > ordered_pivot) {
-        uint32_t local_pos = atomicAdd(&local_counter, 1);
-        int pos = global_base + local_pos;
-        output_func(chunk_start + i, ordered_val, pos);
+    local_offset_gt = 0;
+    if (local_gt_count > 0) {
+      if constexpr (SINGLE_CTA) {
+        global_base_gt = atomicAdd(shared_output_counter, local_gt_count);
+      } else {
+        global_base_gt = atomicAdd(&state->output_counter, local_gt_count);
       }
     }
   }
-
-  // Barrier for multi-CTA
-  if constexpr (!SINGLE_CTA) {
-    if (tx == 0) {
-      red_release(&state->arrival_counter, 1);
-    }
-    int target = (barrier_phase + 1) * ctas_per_group;
-    wait_ge(&state->arrival_counter, target, tx);
-    barrier_phase++;
-  }
   __syncthreads();
 
-  // Pass 3: Write elements == pivot
+  // Single pass: write > pivot with shared atomic, write == pivot with global atomic
+#pragma unroll 2
   for (uint32_t i = tx; i < actual_chunk_size; i += BLOCK_THREADS) {
     OrderedType ordered_val = shared_ordered[i];
-    if (ordered_val == ordered_pivot) {
+    if (ordered_val > ordered_pivot) {
+      // > pivot: use shared atomic for local offset, write directly
+      uint32_t local_pos = atomicAdd(&local_offset_gt, 1);
+      int pos = global_base_gt + local_pos;
+      output_func(chunk_start + i, ordered_val, pos);
+    } else if (ordered_val == ordered_pivot) {
+      // == pivot: use global atomic, check bounds
       int pos;
       if constexpr (SINGLE_CTA) {
         pos = atomicAdd(shared_output_counter, 1);
@@ -2467,13 +2470,13 @@ __device__ __forceinline__ void RadixCollectIndices(
         pos = atomicAdd(&state->output_counter, 1);
       }
       if (pos < static_cast<int>(k)) {
-        output_func(chunk_start + i, ordered_val, pos);
+        output_func(chunk_start + i, ordered_pivot, pos);
       }
     }
   }
 
-#undef local_counter
-#undef global_base
+#undef local_offset_gt
+#undef global_base_gt
 }
 
 // ==================== Unified Radix Top-K Kernel with Epilogue Modes ====================
@@ -2607,17 +2610,18 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKKernel_Unified(
     LoadToSharedOrdered<BLOCK_THREADS, VEC_SIZE, DType, Traits>(
         input + row_idx * stride, shared_ordered, chunk_start, actual_chunk_size, tx);
 
-    // Stage 2: Radix select to find k-th largest element
+    // Stage 2: Radix select to find k-th largest element (also computes local_gt_count)
+    uint32_t local_gt_count = 0;
     OrderedType ordered_pivot = RadixSelectFromSharedMemory<BLOCK_THREADS, SINGLE_CTA, OrderedType>(
         shared_ordered, actual_chunk_size, k, local_histogram, suffix_sum, shared_scalars, state,
-        barrier_phase, ctas_per_group, cta_in_group, tx, iter);
+        barrier_phase, ctas_per_group, cta_in_group, tx, iter, local_gt_count);
 
-    // Stage 3: Collect indices with mode-specific epilogue
+    // Stage 3: Collect indices with mode-specific epilogue (single pass)
     if constexpr (MODE == RadixTopKMode::Basic) {
       DType* row_output_values = output_values + row_idx * top_k_val;
       RadixCollectIndices<BLOCK_THREADS, SINGLE_CTA, OrderedType>(
-          shared_ordered, actual_chunk_size, chunk_start, k, ordered_pivot, local_histogram,
-          &shared_output_counter, state, barrier_phase, ctas_per_group, tx,
+          shared_ordered, actual_chunk_size, chunk_start, k, ordered_pivot, local_gt_count,
+          local_histogram, &shared_output_counter, state, barrier_phase, ctas_per_group, tx,
           [&](uint32_t original_idx, OrderedType ordered_val, int pos) {
             row_output[pos] = static_cast<IdType>(original_idx);
             row_output_values[pos] = Traits::FromOrdered(ordered_val);
@@ -2626,31 +2630,22 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKKernel_Unified(
       uint32_t batch_idx = (row_to_batch != nullptr) ? row_to_batch[row_idx] : row_idx;
       const IdType* src_page_entry = aux_data + batch_idx * aux_stride;
 
-      if constexpr (SINGLE_CTA) {
-        // Two-phase approach: collect indices first, then transform
-        RadixCollectIndices<BLOCK_THREADS, SINGLE_CTA, OrderedType>(
-            shared_ordered, actual_chunk_size, chunk_start, k, ordered_pivot, local_histogram,
-            &shared_output_counter, state, barrier_phase, ctas_per_group, tx,
-            [&](uint32_t original_idx, OrderedType /*ordered_val*/, int pos) {
-              row_output[pos] = static_cast<IdType>(original_idx);
-            });
-        __syncthreads();
+      // Collect raw indices first
+      RadixCollectIndices<BLOCK_THREADS, SINGLE_CTA, OrderedType>(
+          shared_ordered, actual_chunk_size, chunk_start, k, ordered_pivot, local_gt_count,
+          local_histogram, &shared_output_counter, state, barrier_phase, ctas_per_group, tx,
+          [&](uint32_t original_idx, OrderedType /*ordered_val*/, int pos) {
+            row_output[pos] = static_cast<IdType>(original_idx);
+          });
 
+      if constexpr (SINGLE_CTA) {
+        __syncthreads();
         // Transform through page table with coalesced access
         for (uint32_t i = tx; i < k; i += BLOCK_THREADS) {
           IdType idx = row_output[i];
           row_output[i] = src_page_entry[idx];
         }
       } else {
-        // Multi-CTA: Two-phase approach
-        // Phase 1: collect raw indices (scattered writes to global memory)
-        RadixCollectIndices<BLOCK_THREADS, SINGLE_CTA, OrderedType>(
-            shared_ordered, actual_chunk_size, chunk_start, k, ordered_pivot, local_histogram,
-            &shared_output_counter, state, barrier_phase, ctas_per_group, tx,
-            [&](uint32_t original_idx, OrderedType /*ordered_val*/, int pos) {
-              row_output[pos] = static_cast<IdType>(original_idx);
-            });
-
         // Barrier to ensure all CTAs finished writing indices
         if (tx == 0) {
           red_release(&state->arrival_counter, 1);
@@ -2660,7 +2655,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKKernel_Unified(
         barrier_phase++;
         __syncthreads();
 
-        // Phase 2: all CTAs participate in page table transform (coalesced access)
+        // All CTAs participate in page table transform (coalesced access)
         uint32_t elems_per_cta = (k + ctas_per_group - 1) / ctas_per_group;
         uint32_t my_start = cta_in_group * elems_per_cta;
         uint32_t my_end = min(my_start + elems_per_cta, k);
@@ -2672,8 +2667,8 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKKernel_Unified(
     } else {  // RaggedTransform
       IdType offset = aux_data[row_idx];
       RadixCollectIndices<BLOCK_THREADS, SINGLE_CTA, OrderedType>(
-          shared_ordered, actual_chunk_size, chunk_start, k, ordered_pivot, local_histogram,
-          &shared_output_counter, state, barrier_phase, ctas_per_group, tx,
+          shared_ordered, actual_chunk_size, chunk_start, k, ordered_pivot, local_gt_count,
+          local_histogram, &shared_output_counter, state, barrier_phase, ctas_per_group, tx,
           [&](uint32_t original_idx, OrderedType /*ordered_val*/, int pos) {
             row_output[pos] = static_cast<IdType>(original_idx) + offset;
           });
@@ -2781,9 +2776,10 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKMaskLogitsKernel_Multi
         logits + row_idx * vocab_size, shared_ordered, chunk_start, actual_chunk_size, tx);
 
     // ========== Stage 2: Radix select to find pivot ==========
+    uint32_t local_gt_count = 0;  // Not used in this kernel
     OrderedType ordered_pivot = RadixSelectFromSharedMemory<BLOCK_THREADS, SINGLE_CTA, OrderedType>(
         shared_ordered, actual_chunk_size, k, local_histogram, suffix_sum, shared_scalars, state,
-        barrier_phase, ctas_per_group, cta_in_group, tx, iter);
+        barrier_phase, ctas_per_group, cta_in_group, tx, iter, local_gt_count);
 
     pivot = Traits::FromOrdered(ordered_pivot);
 
