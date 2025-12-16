@@ -1753,6 +1753,16 @@ def get_trtllm_moe_sm100_module():
                 dtype=torch.bfloat16,
                 device=hidden_states.device,
             )
+        else:
+            check_shape_dtype_device(
+                output, None, torch.bfloat16, hidden_states.device, "output"
+            )
+            assert output.shape[0] == num_tokens, (
+                f"output.shape[0]={output.shape[0]} must be equal to {num_tokens}"
+            )
+            assert output.shape[1] <= hidden_size, (
+                f"output.shape[1]={output.shape[1]} must be less than or equal to {hidden_size}"
+            )
 
         tuner = AutoTuner.get()
         MoERunner.refine_tuning_config(tune_max_num_tokens)
@@ -1899,7 +1909,7 @@ def get_trtllm_moe_sm100_module():
         tune_max_num_tokens: int,
     ):
         seq_len = hidden_states.shape[0]
-        hidden_size = hidden_states.shape[1]
+        hidden_size = hidden_states.shape[1] if output is None else output.shape[1]
 
         return [hidden_states.new_empty([seq_len, hidden_size], dtype=torch.bfloat16)]
 
