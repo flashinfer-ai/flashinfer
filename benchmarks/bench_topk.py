@@ -91,9 +91,6 @@ def bench_page_table_transform(
         lambda: flashinfer.top_k_page_table_transform(
             scores, src_page_table, lengths, k
         ),
-        # lambda: flashinfer.sampling.top_k_mask_logits(
-        #    scores, k
-        # ),
     )
     fi_ms = np.median(measurements)
 
