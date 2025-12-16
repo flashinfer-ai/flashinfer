@@ -779,7 +779,7 @@ def bench_gpu_time_with_cupti(
 
     def func_buffer_completed(
         launches: list[tuple[float, float, int, int, int]],
-        kernels: list[tuple[str, float, float, int]],
+        kernels: list[tuple[str, float, float, int, int, int, int, int]],
         activities: list,
     ):
         for activity in activities:
@@ -862,7 +862,7 @@ def bench_gpu_time_with_cupti(
 
     # CUPTI measurement
     launches: list[tuple[float, float, int, int, int]] = []
-    kernels: list[tuple[str, float, float, int]] = []
+    kernels: list[tuple[str, float, float, int, int, int, int, int]] = []
     iter_timestamps = []
     cupti.activity_enable(cupti.ActivityKind.RUNTIME)
     cupti.activity_enable(cupti.ActivityKind.CONCURRENT_KERNEL)
