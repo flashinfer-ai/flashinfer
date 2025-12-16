@@ -739,22 +739,57 @@ def bench_gpu_time_with_cupti(
         max_num_records = 0
         return buffer_size, max_num_records
 
+    def set_kernel_name(activity):
+        if activity.kind == cupti.ActivityKind.CONCURRENT_KERNEL:
+            return activity.name
+        elif activity.kind == cupti.ActivityKind.MEMCPY:
+            return "MEMCPY"
+        elif activity.kind == cupti.ActivityKind.MEMSET:
+            return "MEMSET"
+
+    def get_bytes(activity):
+        if activity.kind in (cupti.ActivityKind.MEMCPY, cupti.ActivityKind.MEMSET):
+            return activity.bytes
+        else:
+            return 0
+
+    def get_copy_kind(activity):
+        if activity.kind == cupti.ActivityKind.MEMCPY:
+            return activity.copy_kind
+        else:
+            return 0
+
+    def get_value(activity):
+        if activity.kind == cupti.ActivityKind.MEMSET:
+            return activity.value
+        else:
+            return 0
+
+    def collect_kernel_info(activity):
+        return (
+            set_kernel_name(activity),
+            activity.start,
+            activity.end,
+            activity.correlation_id,
+            get_copy_kind(activity),
+            get_bytes(activity),
+            get_value(activity),
+            activity.kind,
+        )
+
     def func_buffer_completed(
         launches: list[tuple[float, float, int, int, int]],
-        kernels: list[tuple[str, float, float, int]],
+        kernels: list[tuple[str, float, float, int, int, int, int, int]],
         activities: list,
     ):
         for activity in activities:
-            if activity.kind == cupti.ActivityKind.CONCURRENT_KERNEL:
+            if activity.kind in (
+                cupti.ActivityKind.CONCURRENT_KERNEL,
+                cupti.ActivityKind.MEMCPY,
+                cupti.ActivityKind.MEMSET,
+            ):
                 # Kernel activity
-                kernels.append(
-                    (
-                        activity.name,
-                        activity.start,
-                        activity.end,
-                        activity.correlation_id,
-                    )
-                )
+                kernels.append(collect_kernel_info(activity))
             elif activity.kind in (
                 cupti.ActivityKind.RUNTIME,
                 cupti.ActivityKind.DRIVER,
@@ -827,11 +862,13 @@ def bench_gpu_time_with_cupti(
 
     # CUPTI measurement
     launches: list[tuple[float, float, int, int, int]] = []
-    kernels: list[tuple[str, float, float, int]] = []
+    kernels: list[tuple[str, float, float, int, int, int, int, int]] = []
     iter_timestamps = []
     cupti.activity_enable(cupti.ActivityKind.RUNTIME)
     cupti.activity_enable(cupti.ActivityKind.CONCURRENT_KERNEL)
     cupti.activity_enable(cupti.ActivityKind.DRIVER)
+    cupti.activity_enable(cupti.ActivityKind.MEMCPY)
+    cupti.activity_enable(cupti.ActivityKind.MEMSET)
     cupti.activity_register_callbacks(
         func_buffer_requested, partial(func_buffer_completed, launches, kernels)
     )
@@ -849,7 +886,13 @@ def bench_gpu_time_with_cupti(
     cupti.activity_disable(cupti.ActivityKind.RUNTIME)
     cupti.activity_disable(cupti.ActivityKind.CONCURRENT_KERNEL)
     cupti.activity_disable(cupti.ActivityKind.DRIVER)
+    cupti.activity_disable(cupti.ActivityKind.MEMCPY)
+    cupti.activity_disable(cupti.ActivityKind.MEMSET)
     cupti.finalize()
+
+    def generate_kernel_string(kernel):
+        # No start, end, correlation_id is considered in the kernel string
+        return f"{kernel[0]}_{kernel[4]}_{kernel[5]}_{kernel[6]}_{kernel[7]}"
 
     # Process activities
     measured_times = []
@@ -862,7 +905,7 @@ def bench_gpu_time_with_cupti(
         iter_kernels = [k for k in kernels if k[3] in corr_ids]
         if not iter_kernels:
             raise ValueError(f"No kernel activities recorded for iteration {idx}")
-        current_kernel_names = set(k[0] for k in iter_kernels)
+        current_kernel_names = set(generate_kernel_string(k) for k in iter_kernels)
         # check if the kernel names are consistent
         if kernel_names is None:
             kernel_names = current_kernel_names
