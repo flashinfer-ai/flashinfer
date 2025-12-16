@@ -14,10 +14,33 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import os
+
 import pytest
 import torch
 
 import flashinfer
+from flashinfer.topk import can_implement_filtered_topk
+
+
+@pytest.fixture
+def set_topk_algo():
+    """Fixture to set and reset FLASHINFER_TOPK_ALGO environment variable."""
+    original_value = os.environ.get("FLASHINFER_TOPK_ALGO", None)
+
+    def _set_algo(algo: str):
+        if algo == "auto":
+            os.environ.pop("FLASHINFER_TOPK_ALGO", None)
+        else:
+            os.environ["FLASHINFER_TOPK_ALGO"] = algo
+
+    yield _set_algo
+
+    # Restore original value
+    if original_value is None:
+        os.environ.pop("FLASHINFER_TOPK_ALGO", None)
+    else:
+        os.environ["FLASHINFER_TOPK_ALGO"] = original_value
 
 
 def compute_topk_accuracy(test_indices, ref_indices, batch_size, k):
@@ -979,6 +1002,181 @@ def test_compare_with_sglang_style_prefill_mode(num_rows, max_len, k):
     assert accuracy >= min_accuracy, (
         f"FlashInfer vs SGLang-style prefill mode accuracy {accuracy:.4f} < {min_accuracy}"
     )
+
+
+# ===================== Algorithm-specific Tests =====================
+
+
+@pytest.mark.parametrize("algo", ["auto", "multi_cta", "filtered"])
+@pytest.mark.parametrize("batch_size", [1, 8])
+@pytest.mark.parametrize("vocab_size", [4096, 32000])
+@pytest.mark.parametrize("k", [256, 1024])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_top_k_algorithms(algo, batch_size, vocab_size, k, dtype, set_topk_algo):
+    """Test top_k with different algorithms (auto, multi_cta, filtered)."""
+    if k > vocab_size:
+        pytest.skip("k should be less than vocab_size")
+
+    if algo == "filtered" and not can_implement_filtered_topk():
+        pytest.skip("GPU does not support filtered topk (requires 128KB shared memory)")
+
+    set_topk_algo(algo)
+
+    torch.manual_seed(42)
+    logits = torch.randn(batch_size, vocab_size, device="cuda", dtype=dtype)
+
+    # flashinfer top_k with specified algorithm
+    values, indices = flashinfer.top_k(logits, k)
+
+    # Reference: torch.topk
+    ref_values, ref_indices = torch.topk(logits, k, dim=-1)
+
+    # Check output shapes
+    assert values.shape == (batch_size, k)
+    assert indices.shape == (batch_size, k)
+
+    # Check dtypes
+    assert values.dtype == dtype
+    assert indices.dtype == torch.int64
+
+    # Verify values match the gathered indices
+    gathered_values = torch.gather(logits, dim=-1, index=indices)
+    torch.testing.assert_close(values, gathered_values)
+
+    # Check accuracy
+    accuracy = compute_topk_accuracy(indices.int(), ref_indices.int(), batch_size, k)
+    min_accuracy = 0.98
+    assert accuracy >= min_accuracy, (
+        f"Algorithm {algo}: Accuracy {accuracy:.4f} < {min_accuracy}"
+    )
+
+
+@pytest.mark.parametrize("algo", ["auto", "multi_cta", "filtered"])
+@pytest.mark.parametrize("num_rows", [1, 8])
+@pytest.mark.parametrize("max_len", [4096, 8192])
+@pytest.mark.parametrize("k", [256, 512])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_page_table_transform_algorithms(
+    algo, num_rows, max_len, k, dtype, set_topk_algo
+):
+    """Test page table transform with different algorithms."""
+    if k > max_len:
+        pytest.skip("k should be less than max_len")
+
+    if algo == "filtered" and not can_implement_filtered_topk():
+        pytest.skip("GPU does not support filtered topk (requires 128KB shared memory)")
+
+    set_topk_algo(algo)
+
+    torch.manual_seed(42)
+    device = "cuda"
+
+    scores = torch.randn(num_rows, max_len, device=device, dtype=dtype)
+    src_page_table = torch.randint(
+        0, 10000, (num_rows, max_len), device=device, dtype=torch.int32
+    )
+    lengths = torch.full((num_rows,), max_len, device=device, dtype=torch.int32)
+
+    output = flashinfer.top_k_page_table_transform(scores, src_page_table, lengths, k)
+    ref_output = reference_page_table_transform(scores, src_page_table, lengths, k)
+
+    assert output.shape == (num_rows, k)
+    assert output.dtype == torch.int32
+
+    accuracy = compute_transform_accuracy(output, ref_output, num_rows, k)
+    min_accuracy = 0.95
+    assert accuracy >= min_accuracy, (
+        f"Algorithm {algo}: Accuracy {accuracy:.4f} < {min_accuracy}"
+    )
+
+
+@pytest.mark.parametrize("algo", ["auto", "multi_cta", "filtered"])
+@pytest.mark.parametrize("num_rows", [1, 8])
+@pytest.mark.parametrize("max_len", [4096, 8192])
+@pytest.mark.parametrize("k", [256, 512])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_ragged_transform_algorithms(algo, num_rows, max_len, k, dtype, set_topk_algo):
+    """Test ragged transform with different algorithms."""
+    if k > max_len:
+        pytest.skip("k should be less than max_len")
+
+    if algo == "filtered" and not can_implement_filtered_topk():
+        pytest.skip("GPU does not support filtered topk (requires 128KB shared memory)")
+
+    set_topk_algo(algo)
+
+    torch.manual_seed(42)
+    device = "cuda"
+
+    scores = torch.randn(num_rows, max_len, device=device, dtype=dtype)
+    offsets = torch.arange(
+        0, num_rows * max_len, max_len, device=device, dtype=torch.int32
+    )
+    lengths = torch.full((num_rows,), max_len, device=device, dtype=torch.int32)
+
+    output = flashinfer.top_k_ragged_transform(scores, offsets, lengths, k)
+    ref_output = reference_ragged_transform(scores, offsets, lengths, k)
+
+    assert output.shape == (num_rows, k)
+    assert output.dtype == torch.int32
+
+    accuracy = compute_transform_accuracy(output, ref_output, num_rows, k)
+    min_accuracy = 0.95
+    assert accuracy >= min_accuracy, (
+        f"Algorithm {algo}: Accuracy {accuracy:.4f} < {min_accuracy}"
+    )
+
+
+@pytest.mark.parametrize("algo", ["auto", "multi_cta", "filtered"])
+def test_algorithms_produce_same_topk_set(algo, set_topk_algo):
+    """Test that all algorithms produce valid top-k sets."""
+    if algo == "filtered" and not can_implement_filtered_topk():
+        pytest.skip("GPU does not support filtered topk (requires 128KB shared memory)")
+
+    torch.manual_seed(42)
+    batch_size = 4
+    vocab_size = 32000
+    k = 256
+    dtype = torch.float32
+    device = "cuda"
+
+    logits = torch.randn(batch_size, vocab_size, device=device, dtype=dtype)
+
+    set_topk_algo(algo)
+    values, indices = flashinfer.top_k(logits, k)
+
+    # Verify all returned values are truly top-k
+    for i in range(batch_size):
+        kth_largest = torch.kthvalue(-logits[i], k).values.item() * -1
+        assert values[i].min().item() >= kth_largest - 1e-6, (
+            f"Algorithm {algo}, row {i}: min value {values[i].min().item()} < "
+            f"kth largest {kth_largest}"
+        )
+
+
+@pytest.mark.parametrize("algo", ["auto", "multi_cta", "filtered"])
+def test_algorithms_with_large_k(algo, set_topk_algo):
+    """Test algorithms with large k values (stress test)."""
+    if algo == "filtered" and not can_implement_filtered_topk():
+        pytest.skip("GPU does not support filtered topk (requires 128KB shared memory)")
+
+    torch.manual_seed(42)
+    batch_size = 2
+    vocab_size = 4096
+    k = 2048  # 50% of vocab_size
+    dtype = torch.float32
+    device = "cuda"
+
+    set_topk_algo(algo)
+
+    logits = torch.randn(batch_size, vocab_size, device=device, dtype=dtype)
+    values, indices = flashinfer.top_k(logits, k)
+
+    ref_values, ref_indices = torch.topk(logits, k, dim=-1)
+
+    assert values.shape == (batch_size, k)
+    accuracy = compute_topk_accuracy(indices.int(), ref_indices.int(), batch_size, k)
+    assert accuracy >= 0.98, f"Algorithm {algo}: Accuracy {accuracy:.4f} < 0.98"
 
 
 if __name__ == "__main__":

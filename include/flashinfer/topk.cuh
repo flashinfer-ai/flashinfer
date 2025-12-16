@@ -2309,6 +2309,25 @@ cudaError_t FilteredTopK(DType* input, IdType* output_indices, DType* output_val
   return cudaSuccess;
 }
 
+/*!
+ * \brief Check if the GPU supports enough shared memory for FilteredTopK algorithm.
+ *
+ * FilteredTopK requires 128KB dynamic shared memory. This function checks if the
+ * current GPU's max shared memory per SM is sufficient.
+ *
+ * \return true if GPU supports FilteredTopK, false otherwise
+ */
+inline bool CanImplementFilteredTopK() {
+  int device_id;
+  if (cudaGetDevice(&device_id) != cudaSuccess) return false;
+  int max_smem_per_sm;
+  if (cudaDeviceGetAttribute(&max_smem_per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor,
+                             device_id) != cudaSuccess) {
+    return false;
+  }
+  return static_cast<size_t>(max_smem_per_sm) >= FILTERED_TOPK_SMEM_DYNAMIC;
+}
+
 // Algorithm override for benchmarking (controlled by FLASHINFER_TOPK_ALGO env var)
 enum class TopKAlgoOverride { AUTO, FILTERED, MULTI_CTA };
 
@@ -2336,17 +2355,7 @@ inline TopKAlgoOverride GetTopKAlgoOverride() {
 template <typename DType>
 inline bool ShouldUseFilteredTopK(uint32_t num_rows, uint32_t top_k_val, uint32_t max_len) {
   // Check if GPU supports enough shared memory for FilteredTopK
-  int device;
-  if (cudaGetDevice(&device) != cudaSuccess) return false;
-  int max_smem_per_block;
-  if (cudaDeviceGetAttribute(&max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin,
-                             device) != cudaSuccess) {
-    return false;
-  }
-
-  constexpr size_t filtered_smem_required = FILTERED_TOPK_SMEM_DYNAMIC + 16 * 1024;
-  const bool gpu_supports_filtered =
-      (static_cast<size_t>(max_smem_per_block) >= filtered_smem_required);
+  const bool gpu_supports_filtered = CanImplementFilteredTopK();
   const bool k_fits_filtered = (top_k_val <= FILTERED_TOPK_MAX_K) && (max_len > top_k_val);
 
   if (!gpu_supports_filtered || !k_fits_filtered) {

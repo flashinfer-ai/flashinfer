@@ -133,7 +133,22 @@ def get_topk_module():
         radix_topk=radix_topk,
         radix_topk_page_table_transform=radix_topk_page_table_transform,
         radix_topk_ragged_transform=radix_topk_ragged_transform,
+        can_implement_filtered_topk=module.can_implement_filtered_topk,
     )
+
+
+def can_implement_filtered_topk() -> bool:
+    r"""Check if the GPU supports enough shared memory for FilteredTopK algorithm.
+
+    FilteredTopK requires 128KB dynamic shared memory. This function checks if the
+    current GPU's max shared memory per SM is sufficient.
+
+    Returns
+    -------
+    bool
+        True if GPU supports FilteredTopK, False otherwise.
+    """
+    return get_topk_module().can_implement_filtered_topk()
 
 
 def top_k(

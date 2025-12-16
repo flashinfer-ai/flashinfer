@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include <flashinfer/sampling.cuh>
+#include <flashinfer/topk.cuh>
 
 #include "tvm_ffi_utils.h"
 
@@ -146,3 +147,5 @@ void radix_topk_ragged_transform(TensorView input, TensorView output_indices, Te
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "TopKRaggedTransform failed with error code " << cudaGetErrorString(status);
 }
+
+bool can_implement_filtered_topk() { return sampling::CanImplementFilteredTopK(); }
