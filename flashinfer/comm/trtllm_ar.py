@@ -21,6 +21,7 @@ from types import SimpleNamespace
 from typing import List, Optional, Tuple, Union
 from typing_extensions import deprecated
 
+from flashinfer.comm.mnnvl import CommBackend, MPIBackend, SymmDeviceMemory
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
@@ -509,7 +510,7 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     max_token_num: int,
     hidden_dim,
     use_fp32_lamport: bool = False,
-    group: Optional[ProcessGroup] = None,
+    comm_backend: Optional[CommBackend] = None,
     create_metadata: bool = False,
 ) -> Union[
     Tuple[List[List[int]], torch.Tensor], Tuple[List[List[int]], torch.Tensor, dict]
@@ -521,7 +522,7 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     - max_token_num: the maximum number of tokens in a sequence.
     - hidden_dim: the dimension of the hidden states.
     - use_fp32_lamport: if True, we will use fp32 datatype in allreduce fusion.
-    - group: the process group to use.
+    - comm_backend: the communication backend to use.
     - create_metadata: if True, return metadata dict as third element (default: False).
 
     Returns:
@@ -546,6 +547,9 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     Reference: trtllm, cpp/tensorrt_llm/kernels/communicationKernels/allReduceWorkspace.cu, Workspace init
     """
 
+    if comm_backend is None:
+        comm_backend = MPIBackend()
+
     buffer_size = tp_size * max_token_num * hidden_dim * 2
     flag_size = tp_size * BarrierFlagCount * 4
     # lamport_comm_size = tp_size * max(max_token_num, OneShotMaxToken) * hidden_dim * 2
@@ -567,11 +571,21 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     # [buffer_size, flag_size, lamport_buffer_size]
 
     ipc_handles: List[List[int]] = list()
+    mem_handles: List[SymmDeviceMemory] = list()
     for size in [buffer_size, flag_size, lamport_buffer_size]:
         # todo(review): confirm we need this alignment
         # all sizes should be aligned to 1LU << 21 bytes (2MB)
         aligned_size = round_up(size, 1 << 21)
-        ipc_handles.append(create_shared_buffer(aligned_size, group))
+        symm_mem = SymmDeviceMemory(aligned_size,
+                                    tp_size,
+                                    tp_rank,
+                                    torch.device("cuda", tp_rank).index,
+                                    comm_backend,
+                                    False,
+                                    False)
+        ipc_handles.append(symm_mem.uc_ptrs)
+        mem_handles.append(symm_mem)
+
 
     print(
         f"rank {tp_rank} allocated ipc_handles: {[[hex(handle) for handle in sublist] for sublist in ipc_handles]}"
@@ -626,7 +640,7 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
         workspace, dtype=torch.int64, device=torch.device("cuda")
     )
 
-    dist.barrier(group=group)  # must sync after create_workspace
+    comm_backend.barrier()  # must sync after create_workspace
 
     if create_metadata:
         metadata = {
@@ -640,9 +654,9 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
             "lamport_comm_size": lamport_comm_size,
             "lamport_buffer_size": lamport_buffer_size,
         }
-        return ipc_handles, workspace_tensor, metadata
+        return ipc_handles, workspace_tensor, mem_handles, metadata
     else:
-        return ipc_handles, workspace_tensor
+        return ipc_handles, workspace_tensor, mem_handles
 
 
 def trtllm_destroy_ipc_workspace_for_all_reduce_fusion(

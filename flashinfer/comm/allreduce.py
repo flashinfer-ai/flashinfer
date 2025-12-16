@@ -60,7 +60,7 @@ from .trtllm_ar import check_trtllm_allreduce_fusion_workspace_metadata
 
 from .mapping import Mapping
 
-from .mnnvl import CommBackend
+from .mnnvl import CommBackend, SymmDeviceMemory
 
 # Note: AllReduceFusionPattern and QuantizationSFLayout are pseudo-types (classes with int constants)
 # Import them for runtime use but type hint as int for mypy compatibility
@@ -95,7 +95,7 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         max_token_num: int,
         hidden_dim: int,
         dtype: torch.dtype = torch.float16,
-        process_group: Optional["torch.distributed.ProcessGroup"] = None,
+        comm_backend: Optional[CommBackend] = None,
     ):
         """
         Create TensorRT-LLM AllReduce fusion workspace.
@@ -106,7 +106,7 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             max_token_num: Maximum number of tokens
             hidden_dim: Hidden dimension size
             dtype: Data type
-            process_group: PyTorch distributed process group
+            comm_backend: Communication backend
             **kwargs: Additional arguments for workspace creation
         """
         super().__init__(tp_size, tp_rank)
@@ -117,7 +117,7 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             tp_size=tp_size,
             max_token_num=max_token_num,
             hidden_dim=hidden_dim,
-            group=process_group,
+            comm_backend=comm_backend,
             create_metadata=True,
             use_fp32_lamport=dtype == torch.float32,
         )
@@ -125,11 +125,12 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         # Store essential attributes for easy access
         # Cast to 3-tuple to make linter happy, since we always call with create_metadata=True
         workspace_tuple = cast(
-            Tuple[List[List[int]], torch.Tensor, dict], self._internal_workspace
+            Tuple[List[List[int]], torch.Tensor, List[SymmDeviceMemory], dict], self._internal_workspace,
         )
         self.ipc_handles = workspace_tuple[0]
         self.workspace_tensor = workspace_tuple[1]
-        self.metadata = workspace_tuple[2]
+        self.mem_handles = workspace_tuple[2]
+        self.metadata = workspace_tuple[3]
 
     @property
     def backend(self) -> str:
@@ -165,7 +166,10 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         if getattr(self, "_destroyed", False):
             return  # Already destroyed, nothing to do
 
-        trtllm_destroy_ipc_workspace_for_all_reduce_fusion(self.ipc_handles)
+        del self.ipc_handles
+        del self.workspace_tensor
+        del self.mem_handles
+        del self.metadata
         self._destroyed = True
 
 
@@ -423,7 +427,7 @@ def create_allreduce_fusion_workspace(
             max_token_num=max_token_num,
             hidden_dim=hidden_dim,
             dtype=dtype,
-            process_group=process_group,
+            comm_backend=comm_backend,
         )
 
     elif actual_backend == "mnnvl":
