@@ -93,8 +93,9 @@ void radix_topk_page_table_transform(TensorView input, TensorView output_page_ta
     row_to_batch_ptr = static_cast<int32_t*>(maybe_row_to_batch.value().data_ptr());
   }
 
+  // Use unified dispatch with heuristics to choose between FilteredTopK and RadixTopK
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP32_FP16(dtype, c_type, [&] {
-    status = sampling::RadixTopKPageTableTransformMultiCTA<c_type, int32_t>(
+    status = sampling::TopKPageTableTransformDispatch<c_type, int32_t>(
         static_cast<c_type*>(input.data_ptr()), static_cast<int32_t*>(output_page_table.data_ptr()),
         static_cast<const int32_t*>(src_page_table.data_ptr()), src_stride, row_to_batch_ptr,
         static_cast<int32_t*>(lengths.data_ptr()), num_rows, static_cast<uint32_t>(top_k), max_len,
@@ -103,7 +104,7 @@ void radix_topk_page_table_transform(TensorView input, TensorView output_page_ta
   });
 
   TVM_FFI_ICHECK(status == cudaSuccess)
-      << "RadixTopKPageTableTransform failed with error code " << cudaGetErrorString(status);
+      << "TopKPageTableTransform failed with error code " << cudaGetErrorString(status);
 }
 
 void radix_topk_ragged_transform(TensorView input, TensorView output_indices, TensorView offsets,
@@ -133,8 +134,9 @@ void radix_topk_ragged_transform(TensorView input, TensorView output_indices, Te
         static_cast<sampling::RadixRowState*>(maybe_row_states_buffer.value().data_ptr());
   }
 
+  // Use unified dispatch with heuristics to choose between FilteredTopK and RadixTopK
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP32_FP16(dtype, c_type, [&] {
-    status = sampling::RadixTopKRaggedTransformMultiCTA<c_type, int32_t>(
+    status = sampling::TopKRaggedTransformDispatch<c_type, int32_t>(
         static_cast<c_type*>(input.data_ptr()), static_cast<int32_t*>(output_indices.data_ptr()),
         static_cast<const int32_t*>(offsets.data_ptr()), static_cast<int32_t*>(lengths.data_ptr()),
         num_rows, static_cast<uint32_t>(top_k), max_len, row_states_ptr, stream);
@@ -142,5 +144,5 @@ void radix_topk_ragged_transform(TensorView input, TensorView output_indices, Te
   });
 
   TVM_FFI_ICHECK(status == cudaSuccess)
-      << "RadixTopKRaggedTransform failed with error code " << cudaGetErrorString(status);
+      << "TopKRaggedTransform failed with error code " << cudaGetErrorString(status);
 }

@@ -21,6 +21,8 @@
 #include <curand_kernel.h>
 #include <curand_philox4x32_x.h>
 
+#include <cstdlib>
+#include <cstring>
 #include <cub/cub.cuh>
 #include <cuda/functional>
 #include <cuda/std/functional>
@@ -2302,6 +2304,14 @@ __device__ __forceinline__ OrderedType RadixSelectFromSharedMemory(
       remaining_k_cache = found_remaining_k;
     }
     __syncthreads();
+
+    // Early exit: if remaining_k is 0, we've found the exact boundary
+    // All elements > current prefix are in top-k, no need for further refinement
+    if constexpr (SINGLE_CTA) {
+      if (remaining_k_cache == 0) {
+        break;
+      }
+    }
   }
 
   OrderedType ordered_pivot = static_cast<OrderedType>(prefix_cache);
@@ -3675,6 +3685,805 @@ cudaError_t ChainSpeculativeSampling(DType* draft_probs, IdType* draft_token_ids
         })});
     return cudaSuccess;
   });
+}
+
+// ==================== FilteredTopK Implementation ====================
+// Based on sgl-kernel's filter algorithm with multi-dtype support
+
+// FilteredTopK traits for different data types
+template <typename DType>
+struct FilteredTopKTraits;
+
+// Specialization for float (32-bit): coarse histogram uses FP16 high 8 bits, 4 refinement rounds
+template <>
+struct FilteredTopKTraits<float> {
+  using OrderedType = uint32_t;
+  static constexpr int NUM_REFINE_ROUNDS = 4;
+  static constexpr int FIRST_REFINE_SHIFT = 24;
+
+  __device__ __forceinline__ static uint8_t ToCoarseKey(float x) {
+    // Convert to FP16 representation and extract high 8 bits
+    __half h = __float2half_rn(x);
+    uint16_t bits = __half_as_ushort(h);
+    uint16_t key =
+        (bits & 0x8000) ? static_cast<uint16_t>(~bits) : static_cast<uint16_t>(bits | 0x8000);
+    return static_cast<uint8_t>(key >> 8);
+  }
+
+  __device__ __forceinline__ static OrderedType ToOrdered(float x) {
+    uint32_t bits = __float_as_uint(x);
+    return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
+  }
+};
+
+// Specialization for half (16-bit): coarse histogram uses high 8 bits, only need low 8 bits for
+// refinement Since coarse key = high 8 bits, refinement only needs to look at low 8 bits (no
+// additional rounds needed if we can determine topk from coarse pass alone)
+template <>
+struct FilteredTopKTraits<half> {
+  using OrderedType = uint16_t;
+  static constexpr int NUM_REFINE_ROUNDS = 1;   // Only 1 round for low 8 bits
+  static constexpr int FIRST_REFINE_SHIFT = 0;  // Start from bit 0 (low 8 bits)
+
+  __device__ __forceinline__ static uint8_t ToCoarseKey(half x) {
+    uint16_t bits = __half_as_ushort(x);
+    uint16_t key =
+        (bits & 0x8000) ? static_cast<uint16_t>(~bits) : static_cast<uint16_t>(bits | 0x8000);
+    return static_cast<uint8_t>(key >> 8);
+  }
+
+  __device__ __forceinline__ static OrderedType ToOrdered(half x) {
+    uint16_t bits = __half_as_ushort(x);
+    return (bits & 0x8000) ? static_cast<uint16_t>(~bits) : static_cast<uint16_t>(bits | 0x8000);
+  }
+};
+
+// Specialization for nv_bfloat16 (16-bit): same as half
+template <>
+struct FilteredTopKTraits<nv_bfloat16> {
+  using OrderedType = uint16_t;
+  static constexpr int NUM_REFINE_ROUNDS = 1;
+  static constexpr int FIRST_REFINE_SHIFT = 0;
+
+  __device__ __forceinline__ static uint8_t ToCoarseKey(nv_bfloat16 x) {
+    uint16_t bits = __bfloat16_as_ushort(x);
+    uint16_t key =
+        (bits & 0x8000) ? static_cast<uint16_t>(~bits) : static_cast<uint16_t>(bits | 0x8000);
+    return static_cast<uint8_t>(key >> 8);
+  }
+
+  __device__ __forceinline__ static OrderedType ToOrdered(nv_bfloat16 x) {
+    uint16_t bits = __bfloat16_as_ushort(x);
+    return (bits & 0x8000) ? static_cast<uint16_t>(~bits) : static_cast<uint16_t>(bits | 0x8000);
+  }
+};
+
+// FilteredTopK constants
+constexpr uint32_t FILTERED_TOPK_MAX_K = 2048;
+constexpr uint32_t FILTERED_TOPK_BLOCK_THREADS = 1024;
+constexpr uint32_t FILTERED_TOPK_SMEM_INPUT_SIZE = 16 * 1024;  // 16K indices per buffer
+constexpr size_t FILTERED_TOPK_SMEM_DYNAMIC =
+    sizeof(int) * 2 * FILTERED_TOPK_SMEM_INPUT_SIZE;  // 128KB
+
+/*!
+ * \brief Filtered Top-K kernel for PageTableTransform mode.
+ * Uses static shared memory for fixed arrays, dynamic for input double buffer.
+ * \tparam VEC_SIZE Vector size for input loads (1, 2, 4, or 8)
+ */
+template <typename DType, typename IdType, int VEC_SIZE>
+__global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
+    FilteredTopKPageTableTransformKernel(const DType* __restrict__ input,
+                                         IdType* __restrict__ output_page_table,
+                                         const IdType* __restrict__ src_page_table,
+                                         int64_t src_stride,
+                                         const IdType* __restrict__ row_to_batch,
+                                         const IdType* __restrict__ lengths, uint32_t num_rows,
+                                         uint32_t top_k, uint32_t max_len) {
+  // Match sgl-kernel's structure exactly
+  constexpr uint32_t BLOCK_SIZE = FILTERED_TOPK_BLOCK_THREADS;
+  constexpr int RADIX = 256;
+  constexpr int SMEM_INPUT_SIZE = FILTERED_TOPK_SMEM_INPUT_SIZE;
+
+  const uint32_t bid = blockIdx.x;
+  const int tx = threadIdx.x;
+
+  if (bid >= num_rows) return;
+
+  const int length = lengths[bid];
+  const DType* score = input + bid * max_len;
+  IdType* dst_page_entry = output_page_table + bid * top_k;
+  const uint32_t batch_idx = (row_to_batch != nullptr) ? row_to_batch[bid] : bid;
+  const IdType* src_page_entry = src_page_table + batch_idx * src_stride;
+
+  // Trivial case: length <= top_k
+  if (length <= static_cast<int>(top_k)) {
+    for (int i = tx; i < static_cast<int>(top_k); i += BLOCK_SIZE) {
+      dst_page_entry[i] = (i < length) ? src_page_entry[i] : static_cast<IdType>(-1);
+    }
+    return;
+  }
+
+  // Static shared memory (same layout as sgl-kernel)
+  alignas(128) __shared__ int s_histogram_buf[2][RADIX + 128];
+  __shared__ int s_counter;
+  __shared__ int s_threshold_bin_id;
+  __shared__ int s_num_input[2];
+  alignas(16) __shared__ int s_indices[FILTERED_TOPK_MAX_K];
+
+  auto& s_histogram = s_histogram_buf[0];
+
+  // Dynamic shared memory for input double buffer
+  extern __shared__ int s_input_idx[][SMEM_INPUT_SIZE];
+
+  using Traits = FilteredTopKTraits<DType>;
+  int topk = top_k;
+
+  // Stage 1: 8-bit coarse histogram with vectorized loads
+  // Note: VEC_SIZE is chosen such that max_len % VEC_SIZE == 0, so no tail handling needed
+  if (tx < RADIX + 1) s_histogram[tx] = 0;
+  __syncthreads();
+
+  vec_t<DType, VEC_SIZE> score_vec;
+
+#pragma unroll 2
+  for (int base = tx * VEC_SIZE; base < length; base += BLOCK_SIZE * VEC_SIZE) {
+    score_vec.cast_load(&score[base]);
+#pragma unroll
+    for (int j = 0; j < VEC_SIZE; ++j) {
+      const auto bin = Traits::ToCoarseKey(score_vec[j]);
+      atomicAdd(&s_histogram[bin], 1);
+    }
+  }
+  __syncthreads();
+
+  // Suffix sum (run_cumsum lambda equivalent)
+  const auto run_cumsum = [&]() {
+#pragma unroll 8
+    for (int i = 0; i < 8; ++i) {
+      if (tx < RADIX) {
+        const auto j = 1 << i;
+        const auto k = i & 1;
+        auto value = s_histogram_buf[k][tx];
+        if (tx < RADIX - j) {
+          value += s_histogram_buf[k][tx + j];
+        }
+        s_histogram_buf[k ^ 1][tx] = value;
+      }
+      __syncthreads();
+    }
+  };
+
+  run_cumsum();
+  if (tx < RADIX && s_histogram[tx] > topk && s_histogram[tx + 1] <= topk) {
+    s_threshold_bin_id = tx;
+    s_num_input[0] = 0;
+    s_counter = 0;
+  }
+  __syncthreads();
+
+  const auto threshold_bin = s_threshold_bin_id;
+  topk -= s_histogram[threshold_bin + 1];
+
+  if (topk == 0) {
+    // Vectorized filter: collect indices where bin > threshold
+#pragma unroll 2
+    for (int base = tx * VEC_SIZE; base < length; base += BLOCK_SIZE * VEC_SIZE) {
+      score_vec.cast_load(&score[base]);
+#pragma unroll
+      for (int j = 0; j < VEC_SIZE; ++j) {
+        const auto bin = static_cast<int>(Traits::ToCoarseKey(score_vec[j]));
+        if (bin > threshold_bin) {
+          const auto pos = atomicAdd(&s_counter, 1);
+          s_indices[pos] = base + j;
+        }
+      }
+    }
+    __syncthreads();
+  } else {
+    __syncthreads();
+    if (tx < RADIX + 1) s_histogram[tx] = 0;
+    __syncthreads();
+
+    // For float32: refine from bit 24, for fp16: refine from bit 0
+    constexpr int NUM_ROUNDS = Traits::NUM_REFINE_ROUNDS;
+    constexpr int FIRST_SHIFT = Traits::FIRST_REFINE_SHIFT;
+
+    // Vectorized filter + histogram for refinement
+#pragma unroll 2
+    for (int base = tx * VEC_SIZE; base < length; base += BLOCK_SIZE * VEC_SIZE) {
+      score_vec.cast_load(&score[base]);
+#pragma unroll
+      for (int j = 0; j < VEC_SIZE; ++j) {
+        const auto raw_input = score_vec[j];
+        const auto bin = static_cast<int>(Traits::ToCoarseKey(raw_input));
+        if (bin > threshold_bin) {
+          const auto pos = atomicAdd(&s_counter, 1);
+          s_indices[pos] = base + j;
+        } else if (bin == threshold_bin) {
+          const auto pos = atomicAdd(&s_num_input[0], 1);
+          if (pos < SMEM_INPUT_SIZE) {
+            s_input_idx[0][pos] = base + j;
+            const auto ordered = Traits::ToOrdered(raw_input);
+            const auto sub_bin = (ordered >> FIRST_SHIFT) & 0xFF;
+            atomicAdd(&s_histogram[sub_bin], 1);
+          }
+        }
+      }
+    }
+    __syncthreads();
+
+    // Stage 2: refine with 8bit radix passes
+    // For float32: 4 rounds (bits 24-16-8-0)
+    // For fp16/bf16: 1 round (bits 0 only, since coarse pass used bits 8-15)
+
+#pragma unroll
+    for (int round = 0; round < NUM_ROUNDS; ++round) {
+      __shared__ int s_last_remain;
+      const auto r_idx = round % 2;
+
+      const auto _raw_num_input = s_num_input[r_idx];
+      const auto num_input = (_raw_num_input < SMEM_INPUT_SIZE) ? _raw_num_input : SMEM_INPUT_SIZE;
+
+      run_cumsum();
+      if (tx < RADIX && s_histogram[tx] > topk && s_histogram[tx + 1] <= topk) {
+        s_threshold_bin_id = tx;
+        s_num_input[r_idx ^ 1] = 0;
+        s_last_remain = topk - s_histogram[tx + 1];
+      }
+      __syncthreads();
+
+      const auto threshold = s_threshold_bin_id;
+      topk -= s_histogram[threshold + 1];
+
+      // Calculate bit offset: float32 uses 24-16-8-0, fp16 uses just 0
+      const int offset = FIRST_SHIFT - round * 8;
+      const bool is_last_round = (round == NUM_ROUNDS - 1);
+
+      if (topk == 0) {
+        for (int i = tx; i < num_input; i += BLOCK_SIZE) {
+          const auto idx = s_input_idx[r_idx][i];
+          const auto bin = (Traits::ToOrdered(score[idx]) >> offset) & 0xFF;
+          if (static_cast<int>(bin) > threshold) {
+            const auto pos = atomicAdd(&s_counter, 1);
+            s_indices[pos] = idx;
+          }
+        }
+        __syncthreads();
+        break;
+      } else {
+        __syncthreads();
+        if (tx < RADIX + 1) s_histogram[tx] = 0;
+        __syncthreads();
+        for (int i = tx; i < num_input; i += BLOCK_SIZE) {
+          const auto idx = s_input_idx[r_idx][i];
+          const auto raw_input = score[idx];
+          const auto bin = (Traits::ToOrdered(raw_input) >> offset) & 0xFF;
+          if (static_cast<int>(bin) > threshold) {
+            const auto pos = atomicAdd(&s_counter, 1);
+            s_indices[pos] = idx;
+          } else if (static_cast<int>(bin) == threshold) {
+            if (is_last_round) {
+              const auto pos = atomicAdd(&s_last_remain, -1);
+              if (pos > 0) {
+                s_indices[top_k - pos] = idx;
+              }
+            } else {
+              const auto pos = atomicAdd(&s_num_input[r_idx ^ 1], 1);
+              if (pos < SMEM_INPUT_SIZE) {
+                s_input_idx[r_idx ^ 1][pos] = idx;
+                const auto bin32 = Traits::ToOrdered(raw_input);
+                const auto sub_bin = (bin32 >> (offset - 8)) & 0xFF;
+                atomicAdd(&s_histogram[sub_bin], 1);
+              }
+            }
+          }
+        }
+        __syncthreads();
+      }
+    }
+  }
+
+  // Transform through page table with vectorized loads/stores
+  constexpr int OUTPUT_VEC_SIZE = 4;  // 4 x int32 = 128 bits
+  const int aligned_k = (top_k / OUTPUT_VEC_SIZE) * OUTPUT_VEC_SIZE;
+
+  // Vectorized: each thread handles 4 consecutive elements
+#pragma unroll 2
+  for (int base = tx * OUTPUT_VEC_SIZE; base < aligned_k; base += BLOCK_SIZE * OUTPUT_VEC_SIZE) {
+    // Vectorized load from shared memory
+    int4 idx_vec = *reinterpret_cast<int4*>(&s_indices[base]);
+    // Gather from global memory (scattered reads, can't vectorize)
+    int4 out_vec;
+    out_vec.x = src_page_entry[idx_vec.x];
+    out_vec.y = src_page_entry[idx_vec.y];
+    out_vec.z = src_page_entry[idx_vec.z];
+    out_vec.w = src_page_entry[idx_vec.w];
+    // Vectorized store to global memory
+    *reinterpret_cast<int4*>(&dst_page_entry[base]) = out_vec;
+  }
+
+  // Handle tail elements
+  for (int i = aligned_k + tx; i < static_cast<int>(top_k); i += BLOCK_SIZE) {
+    dst_page_entry[i] = src_page_entry[s_indices[i]];
+  }
+}
+
+/*!
+ * \brief Filtered Top-K kernel for RaggedTransform mode.
+ * Uses static shared memory for fixed arrays, dynamic for input double buffer.
+ * \tparam VEC_SIZE Vector size for input loads (1, 2, 4, or 8)
+ */
+template <typename DType, typename IdType, int VEC_SIZE>
+__global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
+    FilteredTopKRaggedTransformKernel(const DType* __restrict__ input,
+                                      IdType* __restrict__ output_indices,
+                                      const IdType* __restrict__ offsets,
+                                      const IdType* __restrict__ lengths, uint32_t num_rows,
+                                      uint32_t top_k, uint32_t max_len) {
+  // Match sgl-kernel's structure exactly
+  constexpr uint32_t BLOCK_SIZE = FILTERED_TOPK_BLOCK_THREADS;
+  constexpr int RADIX = 256;
+  constexpr int SMEM_INPUT_SIZE = FILTERED_TOPK_SMEM_INPUT_SIZE;
+
+  const uint32_t bid = blockIdx.x;
+  const int tx = threadIdx.x;
+
+  if (bid >= num_rows) return;
+
+  const int length = lengths[bid];
+  const DType* score = input + bid * max_len;
+  IdType* dst_indices_entry = output_indices + bid * top_k;
+  const IdType offset_val = offsets[bid];
+
+  // Trivial case: length <= top_k
+  if (length <= static_cast<int>(top_k)) {
+    for (int i = tx; i < static_cast<int>(top_k); i += BLOCK_SIZE) {
+      dst_indices_entry[i] =
+          (i < length) ? static_cast<IdType>(i) + offset_val : static_cast<IdType>(-1);
+    }
+    return;
+  }
+
+  // Static shared memory (same layout as sgl-kernel)
+  alignas(128) __shared__ int s_histogram_buf[2][RADIX + 128];
+  __shared__ int s_counter;
+  __shared__ int s_threshold_bin_id;
+  __shared__ int s_num_input[2];
+  alignas(16) __shared__ int s_indices[FILTERED_TOPK_MAX_K];
+
+  auto& s_histogram = s_histogram_buf[0];
+
+  // Dynamic shared memory for input double buffer
+  extern __shared__ int s_input_idx[][SMEM_INPUT_SIZE];
+
+  using Traits = FilteredTopKTraits<DType>;
+  int topk = top_k;
+
+  // Stage 1: 8-bit coarse histogram with vectorized loads
+  // Note: VEC_SIZE is chosen such that max_len % VEC_SIZE == 0, so no tail handling needed
+  if (tx < RADIX + 1) s_histogram[tx] = 0;
+  __syncthreads();
+
+  vec_t<DType, VEC_SIZE> score_vec;
+
+#pragma unroll 2
+  for (int base = tx * VEC_SIZE; base < length; base += BLOCK_SIZE * VEC_SIZE) {
+    score_vec.cast_load(&score[base]);
+#pragma unroll
+    for (int j = 0; j < VEC_SIZE; ++j) {
+      const auto bin = Traits::ToCoarseKey(score_vec[j]);
+      atomicAdd(&s_histogram[bin], 1);
+    }
+  }
+  __syncthreads();
+
+  // Suffix sum (run_cumsum lambda equivalent)
+  const auto run_cumsum = [&]() {
+#pragma unroll 8
+    for (int i = 0; i < 8; ++i) {
+      if (tx < RADIX) {
+        const auto j = 1 << i;
+        const auto k = i & 1;
+        auto value = s_histogram_buf[k][tx];
+        if (tx < RADIX - j) {
+          value += s_histogram_buf[k][tx + j];
+        }
+        s_histogram_buf[k ^ 1][tx] = value;
+      }
+      __syncthreads();
+    }
+  };
+
+  run_cumsum();
+  if (tx < RADIX && s_histogram[tx] > topk && s_histogram[tx + 1] <= topk) {
+    s_threshold_bin_id = tx;
+    s_num_input[0] = 0;
+    s_counter = 0;
+  }
+  __syncthreads();
+
+  const auto threshold_bin = s_threshold_bin_id;
+  topk -= s_histogram[threshold_bin + 1];
+
+  if (topk == 0) {
+    // Vectorized filter: collect indices where bin > threshold
+#pragma unroll 2
+    for (int base = tx * VEC_SIZE; base < length; base += BLOCK_SIZE * VEC_SIZE) {
+      score_vec.cast_load(&score[base]);
+#pragma unroll
+      for (int j = 0; j < VEC_SIZE; ++j) {
+        const auto bin = static_cast<int>(Traits::ToCoarseKey(score_vec[j]));
+        if (bin > threshold_bin) {
+          const auto pos = atomicAdd(&s_counter, 1);
+          s_indices[pos] = base + j;
+        }
+      }
+    }
+    __syncthreads();
+  } else {
+    __syncthreads();
+    if (tx < RADIX + 1) s_histogram[tx] = 0;
+    __syncthreads();
+
+    // For float32: refine from bit 24, for fp16: refine from bit 0
+    constexpr int NUM_ROUNDS = Traits::NUM_REFINE_ROUNDS;
+    constexpr int FIRST_SHIFT = Traits::FIRST_REFINE_SHIFT;
+
+    // Vectorized filter + histogram for refinement
+#pragma unroll 2
+    for (int base = tx * VEC_SIZE; base < length; base += BLOCK_SIZE * VEC_SIZE) {
+      score_vec.cast_load(&score[base]);
+#pragma unroll
+      for (int j = 0; j < VEC_SIZE; ++j) {
+        const auto raw_input = score_vec[j];
+        const auto bin = static_cast<int>(Traits::ToCoarseKey(raw_input));
+        if (bin > threshold_bin) {
+          const auto pos = atomicAdd(&s_counter, 1);
+          s_indices[pos] = base + j;
+        } else if (bin == threshold_bin) {
+          const auto pos = atomicAdd(&s_num_input[0], 1);
+          if (pos < SMEM_INPUT_SIZE) {
+            s_input_idx[0][pos] = base + j;
+            const auto ordered = Traits::ToOrdered(raw_input);
+            const auto sub_bin = (ordered >> FIRST_SHIFT) & 0xFF;
+            atomicAdd(&s_histogram[sub_bin], 1);
+          }
+        }
+      }
+    }
+    __syncthreads();
+
+    // Stage 2: refine with 8bit radix passes
+    // For float32: 4 rounds (bits 24-16-8-0)
+    // For fp16/bf16: 1 round (bits 0 only, since coarse pass used bits 8-15)
+
+    for (int round = 0; round < NUM_ROUNDS; ++round) {
+      __shared__ int s_last_remain;
+      const auto r_idx = round % 2;
+
+      const auto _raw_num_input = s_num_input[r_idx];
+      const auto num_input = (_raw_num_input < SMEM_INPUT_SIZE) ? _raw_num_input : SMEM_INPUT_SIZE;
+
+      run_cumsum();
+      if (tx < RADIX && s_histogram[tx] > topk && s_histogram[tx + 1] <= topk) {
+        s_threshold_bin_id = tx;
+        s_num_input[r_idx ^ 1] = 0;
+        s_last_remain = topk - s_histogram[tx + 1];
+      }
+      __syncthreads();
+
+      const auto threshold = s_threshold_bin_id;
+      topk -= s_histogram[threshold + 1];
+
+      // Calculate bit offset: float32 uses 24-16-8-0, fp16 uses just 0
+      const int offset = FIRST_SHIFT - round * 8;
+      const bool is_last_round = (round == NUM_ROUNDS - 1);
+
+      if (topk == 0) {
+        for (int i = tx; i < num_input; i += BLOCK_SIZE) {
+          const auto idx = s_input_idx[r_idx][i];
+          const auto bin = (Traits::ToOrdered(score[idx]) >> offset) & 0xFF;
+          if (static_cast<int>(bin) > threshold) {
+            const auto pos = atomicAdd(&s_counter, 1);
+            s_indices[pos] = idx;
+          }
+        }
+        __syncthreads();
+        break;
+      } else {
+        __syncthreads();
+        if (tx < RADIX + 1) s_histogram[tx] = 0;
+        __syncthreads();
+        for (int i = tx; i < num_input; i += BLOCK_SIZE) {
+          const auto idx = s_input_idx[r_idx][i];
+          const auto raw_input = score[idx];
+          const auto bin = (Traits::ToOrdered(raw_input) >> offset) & 0xFF;
+          if (static_cast<int>(bin) > threshold) {
+            const auto pos = atomicAdd(&s_counter, 1);
+            s_indices[pos] = idx;
+          } else if (static_cast<int>(bin) == threshold) {
+            if (is_last_round) {
+              const auto pos = atomicAdd(&s_last_remain, -1);
+              if (pos > 0) {
+                s_indices[top_k - pos] = idx;
+              }
+            } else {
+              const auto pos = atomicAdd(&s_num_input[r_idx ^ 1], 1);
+              if (pos < SMEM_INPUT_SIZE) {
+                s_input_idx[r_idx ^ 1][pos] = idx;
+                const auto bin32 = Traits::ToOrdered(raw_input);
+                const auto sub_bin = (bin32 >> (offset - 8)) & 0xFF;
+                atomicAdd(&s_histogram[sub_bin], 1);
+              }
+            }
+          }
+        }
+        __syncthreads();
+      }
+    }
+  }
+
+  // Transform with offset using vectorized loads/stores
+  constexpr int OUTPUT_VEC_SIZE = 4;  // 4 x int32 = 128 bits
+  const int aligned_k = (top_k / OUTPUT_VEC_SIZE) * OUTPUT_VEC_SIZE;
+
+  // Vectorized: each thread handles 4 consecutive elements
+#pragma unroll 2
+  for (int base = tx * OUTPUT_VEC_SIZE; base < aligned_k; base += BLOCK_SIZE * OUTPUT_VEC_SIZE) {
+    // Vectorized load from shared memory
+    int4 idx_vec = *reinterpret_cast<int4*>(&s_indices[base]);
+    // Add offset to each index
+    int4 out_vec;
+    out_vec.x = static_cast<IdType>(idx_vec.x) + offset_val;
+    out_vec.y = static_cast<IdType>(idx_vec.y) + offset_val;
+    out_vec.z = static_cast<IdType>(idx_vec.z) + offset_val;
+    out_vec.w = static_cast<IdType>(idx_vec.w) + offset_val;
+    // Vectorized store to global memory
+    *reinterpret_cast<int4*>(&dst_indices_entry[base]) = out_vec;
+  }
+
+  // Handle tail elements
+  for (int i = aligned_k + tx; i < static_cast<int>(top_k); i += BLOCK_SIZE) {
+    dst_indices_entry[i] = static_cast<IdType>(s_indices[i]) + offset_val;
+  }
+}
+
+// Helper to compute GCD for VEC_SIZE selection
+constexpr uint32_t gcd(uint32_t a, uint32_t b) {
+  while (b != 0) {
+    uint32_t t = b;
+    b = a % b;
+    a = t;
+  }
+  return a;
+}
+
+// Compute optimal VEC_SIZE based on max_len and dtype
+// Returns 1, 2, 4, or 8
+template <typename DType>
+constexpr int ComputeFilteredTopKVecSize(uint32_t max_len) {
+  constexpr int MAX_VEC = 16 / sizeof(DType);  // 4 for float32, 8 for fp16/bf16
+  // For short sequences, vectorization overhead not worth it
+  if (max_len < 8192) return 1;
+  // Use GCD to find largest power-of-2 divisor
+  const uint32_t g = gcd(max_len, static_cast<uint32_t>(MAX_VEC));
+  return static_cast<int>(g);
+}
+
+// Launch functions with VEC_SIZE dispatch
+template <typename DType, typename IdType>
+cudaError_t FilteredTopKPageTableTransform(DType* input, IdType* output_page_table,
+                                           const IdType* src_page_table, int64_t src_stride,
+                                           const IdType* row_to_batch, IdType* lengths,
+                                           uint32_t num_rows, uint32_t top_k_val, uint32_t max_len,
+                                           cudaStream_t stream = 0) {
+  constexpr size_t smem_size = FILTERED_TOPK_SMEM_DYNAMIC;
+  constexpr int MAX_VEC = 16 / sizeof(DType);
+
+  dim3 grid(num_rows);
+  dim3 block(FILTERED_TOPK_BLOCK_THREADS);
+  void* args[] = {&input,   &output_page_table, &src_page_table, &src_stride, &row_to_batch,
+                  &lengths, &num_rows,          &top_k_val,      &max_len};
+
+  // Dispatch based on computed VEC_SIZE
+  const int vec_size = ComputeFilteredTopKVecSize<DType>(max_len);
+
+#define DISPATCH_VEC_SIZE(VS)                                                                    \
+  if (vec_size == VS) {                                                                          \
+    auto kernel = FilteredTopKPageTableTransformKernel<DType, IdType, VS>;                       \
+    FLASHINFER_CUDA_CALL(                                                                        \
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));   \
+    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, grid, block, args, smem_size, stream)); \
+    return cudaSuccess;                                                                          \
+  }
+
+  DISPATCH_VEC_SIZE(1)
+  DISPATCH_VEC_SIZE(2)
+  DISPATCH_VEC_SIZE(4)
+  if constexpr (MAX_VEC >= 8) {
+    DISPATCH_VEC_SIZE(8)
+  }
+#undef DISPATCH_VEC_SIZE
+
+  return cudaSuccess;
+}
+
+template <typename DType, typename IdType>
+cudaError_t FilteredTopKRaggedTransform(DType* input, IdType* output_indices, const IdType* offsets,
+                                        IdType* lengths, uint32_t num_rows, uint32_t top_k_val,
+                                        uint32_t max_len, cudaStream_t stream = 0) {
+  constexpr size_t smem_size = FILTERED_TOPK_SMEM_DYNAMIC;
+  constexpr int MAX_VEC = 16 / sizeof(DType);
+
+  dim3 grid(num_rows);
+  dim3 block(FILTERED_TOPK_BLOCK_THREADS);
+  void* args[] = {&input, &output_indices, &offsets, &lengths, &num_rows, &top_k_val, &max_len};
+
+  // Dispatch based on computed VEC_SIZE
+  const int vec_size = ComputeFilteredTopKVecSize<DType>(max_len);
+
+#define DISPATCH_VEC_SIZE(VS)                                                                    \
+  if (vec_size == VS) {                                                                          \
+    auto kernel = FilteredTopKRaggedTransformKernel<DType, IdType, VS>;                          \
+    FLASHINFER_CUDA_CALL(                                                                        \
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));   \
+    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, grid, block, args, smem_size, stream)); \
+    return cudaSuccess;                                                                          \
+  }
+
+  DISPATCH_VEC_SIZE(1)
+  DISPATCH_VEC_SIZE(2)
+  DISPATCH_VEC_SIZE(4)
+  if constexpr (MAX_VEC >= 8) {
+    DISPATCH_VEC_SIZE(8)
+  }
+#undef DISPATCH_VEC_SIZE
+
+  return cudaSuccess;
+}
+
+// Algorithm override for benchmarking (controlled by FLASHINFER_TOPK_ALGO env var)
+enum class TopKAlgoOverride { AUTO, FILTERED, MULTI_CTA };
+
+inline TopKAlgoOverride GetTopKAlgoOverride() {
+  const char* env = std::getenv("FLASHINFER_TOPK_ALGO");
+  if (env == nullptr) return TopKAlgoOverride::AUTO;
+  if (std::strcmp(env, "filtered") == 0) return TopKAlgoOverride::FILTERED;
+  if (std::strcmp(env, "multi_cta") == 0) return TopKAlgoOverride::MULTI_CTA;
+  return TopKAlgoOverride::AUTO;
+}
+
+// Dispatch functions with heuristics
+template <typename DType, typename IdType>
+cudaError_t TopKPageTableTransformDispatch(DType* input, IdType* output_page_table,
+                                           const IdType* src_page_table, int64_t src_stride,
+                                           const IdType* row_to_batch, IdType* lengths,
+                                           uint32_t num_rows, uint32_t top_k_val, uint32_t max_len,
+                                           RadixRowState* row_states_buffer,
+                                           cudaStream_t stream = 0) {
+  // Check if GPU supports enough shared memory for FilteredTopK (128KB dynamic + static)
+  int device;
+  FLASHINFER_CUDA_CALL(cudaGetDevice(&device));
+  int max_smem_per_block;
+  FLASHINFER_CUDA_CALL(
+      cudaDeviceGetAttribute(&max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+
+  // FilteredTopK requires ~136KB total shared memory (128KB dynamic + 8KB static)
+  constexpr size_t filtered_smem_required = FILTERED_TOPK_SMEM_DYNAMIC + 16 * 1024;  // with margin
+  const bool gpu_supports_filtered =
+      (static_cast<size_t>(max_smem_per_block) >= filtered_smem_required);
+
+  // Check for algorithm override (for benchmarking)
+  const TopKAlgoOverride algo_override = GetTopKAlgoOverride();
+  const bool k_fits_filtered = (top_k_val <= FILTERED_TOPK_MAX_K) && (max_len > top_k_val);
+
+  // Handle explicit algorithm override
+  if (algo_override == TopKAlgoOverride::FILTERED && gpu_supports_filtered && k_fits_filtered) {
+    return FilteredTopKPageTableTransform<DType, IdType>(input, output_page_table, src_page_table,
+                                                         src_stride, row_to_batch, lengths,
+                                                         num_rows, top_k_val, max_len, stream);
+  }
+  if (algo_override == TopKAlgoOverride::MULTI_CTA) {
+    return RadixTopKPageTableTransformMultiCTA<DType, IdType>(
+        input, output_page_table, src_page_table, src_stride, row_to_batch, lengths, num_rows,
+        top_k_val, max_len, row_states_buffer, stream);
+  }
+
+  // Dispatch heuristics (dtype-aware):
+  // - FilteredTopK: best for large batch (efficient single-CTA per row)
+  // - RadixTopK Multi-CTA: best for small batch + long sequences (parallel across SMs)
+  //
+  // For 16-bit types (fp16/bf16):
+  //   Multi-CTA's memory bandwidth advantage is more pronounced due to smaller data size.
+  //   Simple rule: FilteredTopK for seq <= 16K, Multi-CTA otherwise.
+  //
+  // For 32-bit types (fp32):
+  //   FilteredTopK benefits more from larger batch sizes even at longer sequences.
+  //   - seq <= 32K: always use FilteredTopK
+  //   - seq > 32K: use batch threshold = max_len / 16384
+
+  bool use_filtered = false;
+  if (gpu_supports_filtered && k_fits_filtered) {
+    if constexpr (sizeof(DType) <= 2) {
+      // 16-bit types: simpler threshold at 16K
+      use_filtered = (max_len <= 16384);
+    } else {
+      // 32-bit types: more nuanced heuristic
+      if (max_len <= 32768) {
+        use_filtered = true;
+      } else {
+        const uint32_t batch_threshold = max_len / 16384;
+        use_filtered = (num_rows > batch_threshold);
+      }
+    }
+  }
+
+  if (use_filtered) {
+    return FilteredTopKPageTableTransform<DType, IdType>(input, output_page_table, src_page_table,
+                                                         src_stride, row_to_batch, lengths,
+                                                         num_rows, top_k_val, max_len, stream);
+  }
+  return RadixTopKPageTableTransformMultiCTA<DType, IdType>(
+      input, output_page_table, src_page_table, src_stride, row_to_batch, lengths, num_rows,
+      top_k_val, max_len, row_states_buffer, stream);
+}
+
+template <typename DType, typename IdType>
+cudaError_t TopKRaggedTransformDispatch(DType* input, IdType* output_indices, const IdType* offsets,
+                                        IdType* lengths, uint32_t num_rows, uint32_t top_k_val,
+                                        uint32_t max_len, RadixRowState* row_states_buffer,
+                                        cudaStream_t stream = 0) {
+  // Check if GPU supports enough shared memory for FilteredTopK
+  int device;
+  FLASHINFER_CUDA_CALL(cudaGetDevice(&device));
+  int max_smem_per_block;
+  FLASHINFER_CUDA_CALL(
+      cudaDeviceGetAttribute(&max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+
+  constexpr size_t filtered_smem_required = FILTERED_TOPK_SMEM_DYNAMIC + 16 * 1024;
+  const bool gpu_supports_filtered =
+      (static_cast<size_t>(max_smem_per_block) >= filtered_smem_required);
+
+  // Check for algorithm override (for benchmarking)
+  const TopKAlgoOverride algo_override = GetTopKAlgoOverride();
+  const bool k_fits_filtered = (top_k_val <= FILTERED_TOPK_MAX_K) && (max_len > top_k_val);
+
+  // Handle explicit algorithm override
+  if (algo_override == TopKAlgoOverride::FILTERED && gpu_supports_filtered && k_fits_filtered) {
+    return FilteredTopKRaggedTransform<DType, IdType>(input, output_indices, offsets, lengths,
+                                                      num_rows, top_k_val, max_len, stream);
+  }
+  if (algo_override == TopKAlgoOverride::MULTI_CTA) {
+    return RadixTopKRaggedTransformMultiCTA<DType, IdType>(input, output_indices, offsets, lengths,
+                                                           num_rows, top_k_val, max_len,
+                                                           row_states_buffer, stream);
+  }
+
+  // Dispatch heuristics (dtype-aware, same as PageTableTransform):
+  // - 16-bit types: FilteredTopK for seq <= 16K, Multi-CTA otherwise
+  // - 32-bit types: FilteredTopK for seq <= 32K or large batch at longer sequences
+
+  bool use_filtered = false;
+  if (gpu_supports_filtered && k_fits_filtered) {
+    if constexpr (sizeof(DType) <= 2) {
+      use_filtered = (max_len <= 16384);
+    } else {
+      if (max_len <= 32768) {
+        use_filtered = true;
+      } else {
+        const uint32_t batch_threshold = max_len / 16384;
+        use_filtered = (num_rows > batch_threshold);
+      }
+    }
+  }
+
+  if (use_filtered) {
+    return FilteredTopKRaggedTransform<DType, IdType>(input, output_indices, offsets, lengths,
+                                                      num_rows, top_k_val, max_len, stream);
+  }
+  return RadixTopKRaggedTransformMultiCTA<DType, IdType>(input, output_indices, offsets, lengths,
+                                                         num_rows, top_k_val, max_len,
+                                                         row_states_buffer, stream);
 }
 
 }  // namespace sampling

@@ -8,12 +8,22 @@ Optional comparison with SGLang's sgl_kernel implementation.
 """
 
 import argparse
+import os
 
 import numpy as np
 import torch
 
 import flashinfer
 from flashinfer.testing.utils import bench_gpu_time
+
+
+def set_topk_algo(algo: str):
+    """Set environment variable to force specific topk algorithm."""
+    if algo == "auto":
+        os.environ.pop("FLASHINFER_TOPK_ALGO", None)
+    else:
+        os.environ["FLASHINFER_TOPK_ALGO"] = algo
+
 
 # Try to import sgl_kernel for comparison
 try:
@@ -164,6 +174,20 @@ def bench_ragged_transform(
     return result
 
 
+def parse_dtype(dtype_str: str) -> torch.dtype:
+    """Parse dtype string to torch.dtype."""
+    dtype_map = {
+        "fp32": torch.float32,
+        "float32": torch.float32,
+        "fp16": torch.float16,
+        "float16": torch.float16,
+        "half": torch.float16,
+        "bf16": torch.bfloat16,
+        "bfloat16": torch.bfloat16,
+    }
+    return dtype_map[dtype_str.lower()]
+
+
 @torch.inference_mode()
 def main():
     parser = argparse.ArgumentParser(description="Benchmark Top-K operations")
@@ -178,7 +202,20 @@ def main():
         default="all",
         help="Which operation to benchmark",
     )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default="fp32",
+        help="Data type: fp32, fp16, or bf16 (default: fp32)",
+    )
+    parser.add_argument(
+        "--compare-algorithms",
+        action="store_true",
+        help="Compare multi-CTA vs filtered algorithms",
+    )
     args = parser.parse_args()
+
+    dtype = parse_dtype(args.dtype)
 
     if args.compare_sglang and not HAS_SGL_KERNEL:
         print("WARNING: sgl_kernel not found, skipping SGLang comparison")
@@ -189,9 +226,59 @@ def main():
     seq_lens = [4096, 16384, 65536, 131072, 262144, 524288]
     k_values = [256, 512, 1024, 2048, 4096]
 
+    dtype_str = args.dtype.upper()
+
+    # Algorithm comparison mode
+    if args.compare_algorithms:
+        print("=" * 100)
+        print(
+            f"Algorithm comparison: Multi-CTA vs Filtered (dtype={dtype_str}, k=2048)"
+        )
+        print("=" * 100)
+        print(
+            f"{'batch':>6} {'seq_len':>10} | {'Multi-CTA':>12} {'Filtered':>12} {'Winner':>12}"
+        )
+        print("-" * 70)
+
+        for batch_size in batch_sizes:
+            for seq_len in seq_lens:
+                k = 2048
+                if k > seq_len:
+                    continue
+                try:
+                    # Benchmark Multi-CTA
+                    set_topk_algo("multi_cta")
+                    result_mc = bench_page_table_transform(
+                        batch_size, seq_len, k, dtype
+                    )
+                    mc_us = result_mc["flashinfer_us"]
+
+                    # Benchmark Filtered
+                    set_topk_algo("filtered")
+                    result_f = bench_page_table_transform(batch_size, seq_len, k, dtype)
+                    f_us = result_f["flashinfer_us"]
+
+                    # Reset to auto
+                    set_topk_algo("auto")
+
+                    winner = "Multi-CTA" if mc_us < f_us else "Filtered"
+                    speedup = max(mc_us, f_us) / min(mc_us, f_us)
+                    print(
+                        f"{batch_size:>6} {seq_len:>10} | "
+                        f"{mc_us:>10.2f}us {f_us:>10.2f}us "
+                        f"{winner:>8} {speedup:.2f}x"
+                    )
+                except RuntimeError as e:
+                    if "out of memory" in str(e):
+                        print(f"{batch_size:>6} {seq_len:>10} | OOM")
+                        torch.cuda.empty_cache()
+                    else:
+                        raise
+        return
+
     if args.op in ["all", "top_k"]:
         print("=" * 100)
-        print("top_k: Basic radix-based top-k selection")
+        print(f"top_k: Basic radix-based top-k selection (dtype={dtype_str})")
         print("=" * 100)
         print(
             f"{'batch':>6} {'seq_len':>10} {'k':>6} | {'FlashInfer':>12} {'torch.topk':>12} {'Speedup':>10}"
@@ -204,7 +291,7 @@ def main():
                     if k > seq_len:
                         continue
                     try:
-                        result = bench_top_k(batch_size, seq_len, k)
+                        result = bench_top_k(batch_size, seq_len, k, dtype)
                         print(
                             f"{result['batch_size']:>6} {result['seq_len']:>10} {result['k']:>6} | "
                             f"{result['flashinfer_us']:>10.2f}us {result['torch_us']:>10.2f}us "
@@ -219,9 +306,11 @@ def main():
 
     if args.op in ["all", "page_table"]:
         print("\n" + "=" * 100)
-        print("top_k_page_table_transform: Fused top-k + page table gather")
+        print(
+            f"top_k_page_table_transform: Fused top-k + page table gather (dtype={dtype_str})"
+        )
         if args.compare_sglang:
-            print("NOTE: SGLang only supports k=2048")
+            print("NOTE: SGLang only supports k=2048 and float32")
         print("=" * 100)
 
         header = f"{'batch':>6} {'seq_len':>10} {'k':>6} | {'FlashInfer':>12}"
@@ -237,7 +326,11 @@ def main():
                         continue
                     try:
                         result = bench_page_table_transform(
-                            batch_size, seq_len, k, compare_sglang=args.compare_sglang
+                            batch_size,
+                            seq_len,
+                            k,
+                            dtype,
+                            compare_sglang=args.compare_sglang,
                         )
                         line = (
                             f"{result['batch_size']:>6} {result['seq_len']:>10} {result['k']:>6} | "
@@ -257,9 +350,11 @@ def main():
 
     if args.op in ["all", "ragged"]:
         print("\n" + "=" * 100)
-        print("top_k_ragged_transform: Fused top-k + ragged index transform")
+        print(
+            f"top_k_ragged_transform: Fused top-k + ragged index transform (dtype={dtype_str})"
+        )
         if args.compare_sglang:
-            print("NOTE: SGLang only supports k=2048")
+            print("NOTE: SGLang only supports k=2048 and float32")
         print("=" * 100)
 
         header = f"{'batch':>6} {'seq_len':>10} {'k':>6} | {'FlashInfer':>12}"
@@ -275,7 +370,11 @@ def main():
                         continue
                     try:
                         result = bench_ragged_transform(
-                            batch_size, seq_len, k, compare_sglang=args.compare_sglang
+                            batch_size,
+                            seq_len,
+                            k,
+                            dtype,
+                            compare_sglang=args.compare_sglang,
                         )
                         line = (
                             f"{result['batch_size']:>6} {result['seq_len']:>10} {result['k']:>6} | "
@@ -292,26 +391,6 @@ def main():
                             torch.cuda.empty_cache()
                         else:
                             raise
-
-    print("\n" + "=" * 100)
-    print("Summary")
-    print("=" * 100)
-    print(
-        """
-FlashInfer Top-K advantages:
-- Supports arbitrary k values (SGLang only supports k=2048)
-- Supports sequence lengths > 128K (SGLang limited to 131072)
-- Faster for long sequences (>= 64K)
-
-SGLang advantages:
-- Slightly faster for short sequences (< 32K) with k=2048
-
-Use FlashInfer when:
-- You need flexible k values
-- You have long sequences (>= 64K)
-- You need to support sequences > 128K
-"""
-    )
 
 
 if __name__ == "__main__":
