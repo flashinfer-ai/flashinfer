@@ -447,17 +447,17 @@ inline __device__ T blockReduceSum(T val) {
 }
 // A helper function to tune the grid configuration for fused oneshot and rmsnorm kernels
 // Return (block_size, cluster_size, loads_per_thread)
-std::tuple<int, int, int> adjustGridConfig(int numTokens, int dim, int eltsPerThread) {
+std::tuple<int, int, int> adjustGridConfig(int numTokens, int dim, int eltsPerThread,
+                                           int smVersionMajor) {
   // Start with preferred block_size and cluster_size
-  static const int kSMVersionMajor = flashinfer::GetCudaComputeCapability().first;
-  int clusterSize = kSMVersionMajor >= 9 ? 8 : 1;
+  int clusterSize = smVersionMajor >= 9 ? 8 : 1;
   int blockSize = 128;
   // ========================== Adjust the grid configuration ==========================
   int threadsNeeded = ceil_div(dim, eltsPerThread);
   int loadsPerThread = 1;
 
   blockSize = ceil_div(threadsNeeded, clusterSize);
-  if (kSMVersionMajor >= 9) {
+  if (smVersionMajor >= 9) {
     while (threadsNeeded % clusterSize != 0 && clusterSize > 1) {
       clusterSize /= 2;
     }
@@ -474,7 +474,7 @@ std::tuple<int, int, int> adjustGridConfig(int numTokens, int dim, int eltsPerTh
   }
   // Trying to scale up use multiple loads or CGA
   while (blockSize > 1024) {
-    if (kSMVersionMajor >= 9) {
+    if (smVersionMajor >= 9) {
       if (clusterSize < 8) {
         clusterSize = clusterSize << 1;
       } else {
@@ -657,7 +657,7 @@ cudaError_t oneshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
   static const int kSMVersionMajor = flashinfer::GetCudaComputeCapability().first;
 
   auto [blockSize, clusterSize, loadsPerThread] =
-      adjustGridConfig(numTokens, tokenDim, eltsPerThread);
+      adjustGridConfig(numTokens, tokenDim, eltsPerThread, kSMVersionMajor);
   dim3 grid(numTokens, clusterSize, 1);
 
   FLASHINFER_LOG_DEBUG(
@@ -1040,6 +1040,10 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(T_IN* outputPreNorm, T_OU
   }
   constexpr int kELTS_SIZE = sizeof(T_IN);
 
+  // Assume the previous kernel does not modify the buffer_flags.
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaGridDependencySynchronize();
+#endif
   // Update the buffer pointers
   flag.waitAndUpdate({static_cast<uint32_t>(round_up(numTokens, worldSize) * dim * kELTS_SIZE),
                       static_cast<uint32_t>(numTokens * dim * kELTS_SIZE), 0, 0});
@@ -1111,7 +1115,7 @@ cudaError_t twoshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
   // Launch the rmsnorm lamport kernel if fusion is enabled
   if (params.rmsNormFusion) {
     static const int kSMVersionMajor = flashinfer::GetCudaComputeCapability().first;
-    auto gridConfig = adjustGridConfig(numTokens, tokenDim, numEltsPerThread);
+    auto gridConfig = adjustGridConfig(numTokens, tokenDim, numEltsPerThread, kSMVersionMajor);
     int rnBlockSize = std::get<0>(gridConfig);
     int rnClusterSize = std::get<1>(gridConfig);
     int rnLoadsPerThread = std::get<2>(gridConfig);
@@ -1132,7 +1136,7 @@ cudaError_t twoshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
     rnAttrs[1].val.clusterDim.z = 1;
     rnConfig.numAttrs = kSMVersionMajor >= 9 ? 2 : 1;
 
-    bool const rnUseCGA = rnClusterSize > 1;
+    bool const rnUseCGA = kSMVersionMajor >= 9 && rnClusterSize > 1;
     int const dimPadded = round_up(tokenDim, numEltsPerThread * rnNumThreads);
     int const iters = dimPadded / rnNumThreads;
 
