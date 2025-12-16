@@ -46,17 +46,17 @@ void radix_topk(TensorView input, TensorView output_indices, TensorView output_v
         static_cast<sampling::RadixRowState*>(maybe_row_states_buffer.value().data_ptr());
   }
 
+  // Use unified dispatch with heuristics to choose between FilteredTopK and RadixTopK
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP32_FP16(dtype, c_type, [&] {
-    status = sampling::RadixTopKMultiCTA<c_type, int32_t>(
+    status = sampling::TopKDispatch<c_type, int32_t>(
         static_cast<c_type*>(input.data_ptr()), static_cast<int32_t*>(output_indices.data_ptr()),
-        static_cast<c_type*>(output_values.data_ptr()),
-        nullptr,  // top_k_arr
-        batch_size, static_cast<uint32_t>(top_k), d, row_states_ptr, stream);
+        static_cast<c_type*>(output_values.data_ptr()), batch_size, static_cast<uint32_t>(top_k), d,
+        row_states_ptr, stream);
     return true;
   });
 
   TVM_FFI_ICHECK(status == cudaSuccess)
-      << "RadixTopK failed with error code " << cudaGetErrorString(status);
+      << "TopK failed with error code " << cudaGetErrorString(status);
 }
 
 void radix_topk_page_table_transform(TensorView input, TensorView output_page_table,
