@@ -125,6 +125,8 @@ def bench_cute_dsl(batch_size, hidden_size, dtype, block_size=16):
         l2_flush=True,
         enable_cupti=True,
         use_cuda_graph=False,
+        dry_run_iters=10,
+        repeat_iters=100,
     )
 
     # Return median time
@@ -163,6 +165,8 @@ def bench_cudnn(batch_size, hidden_size, dtype, block_size=16):
         l2_flush=True,
         enable_cupti=True,
         use_cuda_graph=False,
+        dry_run_iters=10,
+        repeat_iters=100,
     )
 
     # Return median time
@@ -194,6 +198,8 @@ def run_benchmark():
     batch_sizes = sorted(list(set(batch_sizes)))  # deduplicate and sort
 
     hidden_sizes = [2**j for j in range(11, 16)]  # 2048 to 32768
+    hidden_sizes += [1536]
+    hidden_sizes = sorted(list(set(hidden_sizes)))  # deduplicate and sort
 
     configs = [
         (batch_size, hidden_size)

@@ -108,8 +108,10 @@ blackwell_required = pytest.mark.skipif(
 class TestRMSNormFP4QuantCuteDSL:
     """Tests for CuTe-DSL RMSNorm + FP4 Quantization."""
 
-    @pytest.mark.parametrize("batch_size", [1, 4, 16, 32, 7, 13, 33, 100])
-    @pytest.mark.parametrize("hidden_size", [64, 128, 256, 512, 1024])
+    @pytest.mark.parametrize(
+        "batch_size", [1, 4, 16, 32, 7, 13, 33, 100, 128, 8192, 16384]
+    )
+    @pytest.mark.parametrize("hidden_size", [64, 128, 256, 512, 1024, 1536])
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     @pytest.mark.parametrize("eps", [1e-5, 1e-6])
     def test_rmsnorm_fp4quant_2d(self, batch_size, hidden_size, dtype, eps):
@@ -159,9 +161,9 @@ class TestRMSNormFP4QuantCuteDSL:
             atol=1.0,
         )
 
-    @pytest.mark.parametrize("batch_size", [1, 4, 3, 7])
+    @pytest.mark.parametrize("batch_size", [1, 4, 3, 7, 128])
     @pytest.mark.parametrize("seq_len", [16, 64, 128, 37, 99])
-    @pytest.mark.parametrize("hidden_size", [128, 256])
+    @pytest.mark.parametrize("hidden_size", [128, 256, 1536])
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     def test_rmsnorm_fp4quant_3d(self, batch_size, seq_len, hidden_size, dtype):
         """Test fused RMSNorm + FP4 quantization with 3D input."""
@@ -263,8 +265,8 @@ class TestRMSNormFP4QuantCuteDSL:
 class TestRMSNormFP4QuantMXFP4:
     """Tests for MXFP4 format (block_size=32, UE8M0 scales)."""
 
-    @pytest.mark.parametrize("batch_size", [1, 4, 16, 7, 25])
-    @pytest.mark.parametrize("hidden_size", [128, 256, 512])
+    @pytest.mark.parametrize("batch_size", [1, 4, 16, 7, 25, 128, 8192, 16384])
+    @pytest.mark.parametrize("hidden_size", [128, 256, 512, 1536])
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     def test_mxfp4_basic(self, batch_size, hidden_size, dtype):
         """Test MXFP4 format (block_size=32, UE8M0 scales)."""
@@ -319,8 +321,8 @@ class TestRMSNormFP4QuantMXFP4:
 class TestCuDNNComparison:
     """Tests comparing CuTe-DSL backend with cuDNN backend."""
 
-    @pytest.mark.parametrize("batch_size", [1, 4, 16, 7, 25])
-    @pytest.mark.parametrize("hidden_size", [128, 256, 512])
+    @pytest.mark.parametrize("batch_size", [1, 4, 16, 7, 25, 128, 8192, 16384])
+    @pytest.mark.parametrize("hidden_size", [128, 256, 512, 1536])
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     def test_cudnn_vs_cute_dsl(self, batch_size, hidden_size, dtype):
         """Compare CuTe-DSL output with cuDNN backend."""
