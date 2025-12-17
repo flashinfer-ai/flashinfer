@@ -203,11 +203,16 @@ def get_alibi_slopes(n_heads: int) -> torch.Tensor:
 _cache_buf: Dict[Tuple[str, torch.device], torch.Tensor] = {}
 
 
-def _get_cache_buf(name: str, bytes: int, device: torch.device) -> torch.Tensor:
+def _get_cache_buf(
+    name: str, bytes: int, device: torch.device, zero_init: bool = False
+) -> torch.Tensor:
     key = (name, device)
     buf = _cache_buf.get(key)
     if buf is None or buf.size(0) < bytes:
-        buf = torch.empty(bytes, dtype=torch.uint8, device=device)
+        if zero_init:
+            buf = torch.zeros(bytes, dtype=torch.uint8, device=device)
+        else:
+            buf = torch.empty(bytes, dtype=torch.uint8, device=device)
         _cache_buf[key] = buf
     return buf
 
