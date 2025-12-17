@@ -896,7 +896,7 @@ class RMSNormFP4QuantKernel:
             return 1
 
         props = torch.cuda.get_device_properties(torch.cuda.current_device())
-        max_smem_bytes = props.shared_memory_per_block
+        max_smem_bytes = props.shared_memory_per_block_optin
         elem_size = dtype.width // 8
 
         for cluster_n in [1, 2, 4, 8, 16]:
