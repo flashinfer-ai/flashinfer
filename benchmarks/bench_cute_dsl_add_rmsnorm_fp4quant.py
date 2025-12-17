@@ -338,10 +338,7 @@ def sanity_check_outputs(dtype=torch.float16, block_size=16):
                 f"FP4 match: {match_pct:.1f}% (expected >= 70%)"
             )
         else:
-            print(
-                f"  OK: ({batch_size}, {hidden_size}) - "
-                f"FP4 match"
-            )
+            print(f"  OK: ({batch_size}, {hidden_size}) - FP4 match")
 
     return all_passed
 
@@ -509,4 +506,3 @@ def run_benchmark():
 
 if __name__ == "__main__":
     run_benchmark()
-

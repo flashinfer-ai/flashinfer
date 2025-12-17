@@ -1140,7 +1140,9 @@ class AddRMSNormFP4QuantKernel:
             num_bits_per_copy=COPY_BITS,
         )
 
-        tiled_copy_load = cute.make_tiled_copy(copy_atom_load_async, tv_layout, tiler_mn)
+        tiled_copy_load = cute.make_tiled_copy(
+            copy_atom_load_async, tv_layout, tiler_mn
+        )
 
         thr_copy_X = tiled_copy_load.get_slice(tidx)
         thr_copy_R = tiled_copy_load.get_slice(tidx)
@@ -1295,7 +1297,9 @@ class AddRMSNormFP4QuantKernel:
                             max_abs = fmax_f32(max_abs, fabs_f32(y15))
 
                             scale_float = max_abs * fp4_max_rcp
-                            scale_float = fmin_f32(scale_float, Float32(FLOAT8_E4M3_MAX))
+                            scale_float = fmin_f32(
+                                scale_float, Float32(FLOAT8_E4M3_MAX)
+                            )
                             scale_fp8_u32 = cvt_f32_to_e4m3(scale_float)
                             scale_fp8 = Uint8(scale_fp8_u32 & Uint32(0xFF))
                             inv_scale = fp8_e4m3_to_f32_and_rcp(scale_fp8_u32)
@@ -1336,8 +1340,12 @@ class AddRMSNormFP4QuantKernel:
                             q15 = y15 * inv_scale
 
                             packed_lo = cvt_e2m1x8_f32(q0, q1, q2, q3, q4, q5, q6, q7)
-                            packed_hi = cvt_e2m1x8_f32(q8, q9, q10, q11, q12, q13, q14, q15)
-                            packed64 = (Uint64(packed_hi) << Uint64(32)) | Uint64(packed_lo)
+                            packed_hi = cvt_e2m1x8_f32(
+                                q8, q9, q10, q11, q12, q13, q14, q15
+                            )
+                            packed64 = (Uint64(packed_hi) << Uint64(32)) | Uint64(
+                                packed_lo
+                            )
 
                             out_offset = block_start // 2
                             out_ptr = get_ptr_as_int64(
@@ -1347,10 +1355,18 @@ class AddRMSNormFP4QuantKernel:
 
                         else:
                             # Global memory path (cluster mode)
-                            h_ptr0 = get_ptr_as_int64(mX, actual_row_idx * H + block_start)
-                            h_ptr1 = get_ptr_as_int64(mX, actual_row_idx * H + block_start + Int32(8))
-                            r_ptr0 = get_ptr_as_int64(mR, actual_row_idx * H + block_start)
-                            r_ptr1 = get_ptr_as_int64(mR, actual_row_idx * H + block_start + Int32(8))
+                            h_ptr0 = get_ptr_as_int64(
+                                mX, actual_row_idx * H + block_start
+                            )
+                            h_ptr1 = get_ptr_as_int64(
+                                mX, actual_row_idx * H + block_start + Int32(8)
+                            )
+                            r_ptr0 = get_ptr_as_int64(
+                                mR, actual_row_idx * H + block_start
+                            )
+                            r_ptr1 = get_ptr_as_int64(
+                                mR, actual_row_idx * H + block_start + Int32(8)
+                            )
                             w_ptr0 = get_ptr_as_int64(mW, block_start)
                             w_ptr1 = get_ptr_as_int64(mW, block_start + Int32(8))
 
@@ -1457,7 +1473,9 @@ class AddRMSNormFP4QuantKernel:
                                 y14, y15 = bfloat2_to_float2_scaled(hw7, rstd)
 
                             scale_float = max_abs * fp4_max_rcp
-                            scale_float = fmin_f32(scale_float, Float32(FLOAT8_E4M3_MAX))
+                            scale_float = fmin_f32(
+                                scale_float, Float32(FLOAT8_E4M3_MAX)
+                            )
                             scale_fp8_u32 = cvt_f32_to_e4m3(scale_float)
                             scale_fp8 = Uint8(scale_fp8_u32 & Uint32(0xFF))
                             inv_scale = fp8_e4m3_to_f32_and_rcp(scale_fp8_u32)
@@ -1498,8 +1516,12 @@ class AddRMSNormFP4QuantKernel:
                             q15 = y15 * inv_scale
 
                             packed_lo = cvt_e2m1x8_f32(q0, q1, q2, q3, q4, q5, q6, q7)
-                            packed_hi = cvt_e2m1x8_f32(q8, q9, q10, q11, q12, q13, q14, q15)
-                            packed64 = (Uint64(packed_hi) << Uint64(32)) | Uint64(packed_lo)
+                            packed_hi = cvt_e2m1x8_f32(
+                                q8, q9, q10, q11, q12, q13, q14, q15
+                            )
+                            packed64 = (Uint64(packed_hi) << Uint64(32)) | Uint64(
+                                packed_lo
+                            )
 
                             out_offset = block_start // 2
                             out_ptr = get_ptr_as_int64(
@@ -1652,7 +1674,9 @@ class AddRMSNormFP4QuantKernel:
                                 inv_scale = ue8m0_to_output_scale(scale_ue8m0)
                             else:
                                 scale_float = max_abs * fp4_max_rcp
-                                scale_float = fmin_f32(scale_float, Float32(FLOAT8_E4M3_MAX))
+                                scale_float = fmin_f32(
+                                    scale_float, Float32(FLOAT8_E4M3_MAX)
+                                )
                                 scale_fp8_u32 = cvt_f32_to_e4m3(scale_float)
                                 scale_u8 = Uint8(scale_fp8_u32 & Uint32(0xFF))
                                 inv_scale = fp8_e4m3_to_f32_and_rcp(scale_fp8_u32)
@@ -1710,14 +1734,26 @@ class AddRMSNormFP4QuantKernel:
                             q31 = y31 * inv_scale
 
                             packed_lo_0 = cvt_e2m1x8_f32(q0, q1, q2, q3, q4, q5, q6, q7)
-                            packed_hi_0 = cvt_e2m1x8_f32(q8, q9, q10, q11, q12, q13, q14, q15)
-                            packed64_0 = (Uint64(packed_hi_0) << Uint64(32)) | Uint64(packed_lo_0)
+                            packed_hi_0 = cvt_e2m1x8_f32(
+                                q8, q9, q10, q11, q12, q13, q14, q15
+                            )
+                            packed64_0 = (Uint64(packed_hi_0) << Uint64(32)) | Uint64(
+                                packed_lo_0
+                            )
 
-                            packed_lo_1 = cvt_e2m1x8_f32(q16, q17, q18, q19, q20, q21, q22, q23)
-                            packed_hi_1 = cvt_e2m1x8_f32(q24, q25, q26, q27, q28, q29, q30, q31)
-                            packed64_1 = (Uint64(packed_hi_1) << Uint64(32)) | Uint64(packed_lo_1)
+                            packed_lo_1 = cvt_e2m1x8_f32(
+                                q16, q17, q18, q19, q20, q21, q22, q23
+                            )
+                            packed_hi_1 = cvt_e2m1x8_f32(
+                                q24, q25, q26, q27, q28, q29, q30, q31
+                            )
+                            packed64_1 = (Uint64(packed_hi_1) << Uint64(32)) | Uint64(
+                                packed_lo_1
+                            )
 
-                            fp4_offset = actual_row_idx * (H // 2) + sf_idx * (block_size // 2)
+                            fp4_offset = actual_row_idx * (H // 2) + sf_idx * (
+                                block_size // 2
+                            )
                             fp4_ptr_0 = get_ptr_as_int64(mY, fp4_offset)
                             fp4_ptr_1 = get_ptr_as_int64(mY, fp4_offset + Int32(8))
                             st_global_u64(fp4_ptr_0, packed64_0)
@@ -1726,15 +1762,31 @@ class AddRMSNormFP4QuantKernel:
                         else:
                             # Global memory path for MXFP4 (cluster mode)
                             # Load x, r, w as 4 x 128-bit loads each
-                            x_ptr0 = get_ptr_as_int64(mX, actual_row_idx * H + block_start)
-                            x_ptr1 = get_ptr_as_int64(mX, actual_row_idx * H + block_start + Int32(8))
-                            x_ptr2 = get_ptr_as_int64(mX, actual_row_idx * H + block_start + Int32(16))
-                            x_ptr3 = get_ptr_as_int64(mX, actual_row_idx * H + block_start + Int32(24))
+                            x_ptr0 = get_ptr_as_int64(
+                                mX, actual_row_idx * H + block_start
+                            )
+                            x_ptr1 = get_ptr_as_int64(
+                                mX, actual_row_idx * H + block_start + Int32(8)
+                            )
+                            x_ptr2 = get_ptr_as_int64(
+                                mX, actual_row_idx * H + block_start + Int32(16)
+                            )
+                            x_ptr3 = get_ptr_as_int64(
+                                mX, actual_row_idx * H + block_start + Int32(24)
+                            )
 
-                            r_ptr0 = get_ptr_as_int64(mR, actual_row_idx * H + block_start)
-                            r_ptr1 = get_ptr_as_int64(mR, actual_row_idx * H + block_start + Int32(8))
-                            r_ptr2 = get_ptr_as_int64(mR, actual_row_idx * H + block_start + Int32(16))
-                            r_ptr3 = get_ptr_as_int64(mR, actual_row_idx * H + block_start + Int32(24))
+                            r_ptr0 = get_ptr_as_int64(
+                                mR, actual_row_idx * H + block_start
+                            )
+                            r_ptr1 = get_ptr_as_int64(
+                                mR, actual_row_idx * H + block_start + Int32(8)
+                            )
+                            r_ptr2 = get_ptr_as_int64(
+                                mR, actual_row_idx * H + block_start + Int32(16)
+                            )
+                            r_ptr3 = get_ptr_as_int64(
+                                mR, actual_row_idx * H + block_start + Int32(24)
+                            )
 
                             w_ptr0 = get_ptr_as_int64(mW, block_start)
                             w_ptr1 = get_ptr_as_int64(mW, block_start + Int32(8))
@@ -1938,7 +1990,9 @@ class AddRMSNormFP4QuantKernel:
                                 inv_scale = ue8m0_to_output_scale(scale_ue8m0)
                             else:
                                 scale_float = max_abs * fp4_max_rcp
-                                scale_float = fmin_f32(scale_float, Float32(FLOAT8_E4M3_MAX))
+                                scale_float = fmin_f32(
+                                    scale_float, Float32(FLOAT8_E4M3_MAX)
+                                )
                                 scale_fp8_u32 = cvt_f32_to_e4m3(scale_float)
                                 scale_u8 = Uint8(scale_fp8_u32 & Uint32(0xFF))
                                 inv_scale = fp8_e4m3_to_f32_and_rcp(scale_fp8_u32)
@@ -1995,14 +2049,26 @@ class AddRMSNormFP4QuantKernel:
                             q31 = y31 * inv_scale
 
                             packed_lo_0 = cvt_e2m1x8_f32(q0, q1, q2, q3, q4, q5, q6, q7)
-                            packed_hi_0 = cvt_e2m1x8_f32(q8, q9, q10, q11, q12, q13, q14, q15)
-                            packed64_0 = (Uint64(packed_hi_0) << Uint64(32)) | Uint64(packed_lo_0)
+                            packed_hi_0 = cvt_e2m1x8_f32(
+                                q8, q9, q10, q11, q12, q13, q14, q15
+                            )
+                            packed64_0 = (Uint64(packed_hi_0) << Uint64(32)) | Uint64(
+                                packed_lo_0
+                            )
 
-                            packed_lo_1 = cvt_e2m1x8_f32(q16, q17, q18, q19, q20, q21, q22, q23)
-                            packed_hi_1 = cvt_e2m1x8_f32(q24, q25, q26, q27, q28, q29, q30, q31)
-                            packed64_1 = (Uint64(packed_hi_1) << Uint64(32)) | Uint64(packed_lo_1)
+                            packed_lo_1 = cvt_e2m1x8_f32(
+                                q16, q17, q18, q19, q20, q21, q22, q23
+                            )
+                            packed_hi_1 = cvt_e2m1x8_f32(
+                                q24, q25, q26, q27, q28, q29, q30, q31
+                            )
+                            packed64_1 = (Uint64(packed_hi_1) << Uint64(32)) | Uint64(
+                                packed_lo_1
+                            )
 
-                            fp4_offset = actual_row_idx * (H // 2) + sf_idx * (block_size // 2)
+                            fp4_offset = actual_row_idx * (H // 2) + sf_idx * (
+                                block_size // 2
+                            )
                             fp4_ptr_0 = get_ptr_as_int64(mY, fp4_offset)
                             fp4_ptr_1 = get_ptr_as_int64(mY, fp4_offset + Int32(8))
                             st_global_u64(fp4_ptr_0, packed64_0)
