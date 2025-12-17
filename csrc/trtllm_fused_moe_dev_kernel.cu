@@ -299,10 +299,12 @@ __global__ void activationDeepSeekKernel(KernelParams params) {
             if (permutedIdx == -1) {
               continue;
             }
-            s_scaleOutArr[tokenInCtaIdx] = aMaxArr[tokenInCtaIdx] / E4m3MaxVal;
+            // Add a small epsilon to the scale to avoid division by zero, in case the maximum is zero.
+            float scaleOut = aMaxArr[tokenInCtaIdx] / E4m3MaxVal + std::numeric_limits<float>::min();
+            s_scaleOutArr[tokenInCtaIdx] = scaleOut;
             int const scaleOut_idx =
                 permutedIdxArr[tokenInCtaIdx] + totalNumPaddedTokens * (hiddenIdx / 128);
-            params.outDqSfsPtr[scaleOut_idx] = aMaxArr[tokenInCtaIdx] / E4m3MaxVal;
+            params.outDqSfsPtr[scaleOut_idx] = scaleOut;
           }
         }
         __syncthreads();
