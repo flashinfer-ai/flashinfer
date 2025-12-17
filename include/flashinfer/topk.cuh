@@ -597,14 +597,6 @@ __device__ __forceinline__ OrderedType RadixSelectFromSharedMemory(
       remaining_k_cache = found_remaining_k;
     }
     __syncthreads();
-
-    // Early exit: if remaining_k is 0, we've found the exact boundary
-    // All elements > current prefix are in top-k, no need for further refinement
-    if constexpr (SINGLE_CTA) {
-      if (remaining_k_cache == 0) {
-        break;
-      }
-    }
   }
 
   OrderedType ordered_pivot = static_cast<OrderedType>(prefix_cache);
@@ -755,17 +747,38 @@ __device__ __forceinline__ void RadixCollectIndices(
   }
   __syncthreads();
 
-  // Single pass: write > pivot with shared atomic, write == pivot with global atomic
+  // Pass 1: Write elements > pivot
+  // These are guaranteed to be in top-k, use local offset within CTA's allocation
 #pragma unroll 2
   for (uint32_t i = tx; i < actual_chunk_size; i += BLOCK_THREADS) {
     OrderedType ordered_val = shared_ordered[i];
     if (ordered_val > ordered_pivot) {
-      // > pivot: use shared atomic for local offset, write directly
       uint32_t local_pos = atomicAdd(&local_offset_gt, 1);
       int pos = global_base_gt + local_pos;
       output_func(chunk_start + i, ordered_val, pos);
-    } else if (ordered_val == ordered_pivot) {
-      // == pivot: use global atomic, check bounds
+    }
+  }
+
+  // Barrier to ensure all > pivot elements are collected first (only for multi-CTA)
+  // This is critical: without this barrier, CTAs may write == pivot elements while
+  // other CTAs are still writing > pivot elements, causing incorrect positions.
+  if constexpr (!SINGLE_CTA) {
+    if (tx == 0) {
+      red_release(&state->arrival_counter, 1);
+    }
+    int target = (barrier_phase + 1) * ctas_per_group;
+    wait_ge(&state->arrival_counter, target, tx);
+    barrier_phase++;
+  }
+  __syncthreads();
+
+  // Pass 2: Write elements == pivot
+  // Use global atomic directly since we need cross-CTA coordination to respect
+  // the k limit (some == pivot elements may be truncated).
+#pragma unroll 2
+  for (uint32_t i = tx; i < actual_chunk_size; i += BLOCK_THREADS) {
+    OrderedType ordered_val = shared_ordered[i];
+    if (ordered_val == ordered_pivot) {
       int pos;
       if constexpr (SINGLE_CTA) {
         pos = atomicAdd(shared_output_counter, 1);
