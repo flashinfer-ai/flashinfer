@@ -513,7 +513,17 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
             v_fp8 = (v_data / v_scale).to(kv_dtype)
             kv_cache_for_trt = torch.cat([k_fp8, v_fp8], dim=1)
 
-    def run_backend_wrapper(backend):
+    def run_backend_wrapper(
+        backend,
+        q,
+        kv_cache,
+        k_cache,
+        v_cache,
+        workspace_buffer,
+        block_tables,
+        actual_seq_lens_kv,
+        ragged_q,
+    ):
         if backend in ["fa2", "fa2_tc", "trtllm-gen"]:
             return backend_wrappers[backend].run(
                 q, kv_cache, k_scale=k_scale, v_scale=v_scale
@@ -545,7 +555,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
             )
         else:
             print(f"[ERROR] Backend {backend} not supported")
-            return res
+            return None
 
     has_reference_output = False
     # Iterate over each backend:
@@ -553,21 +563,44 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
         # Clear workspace buffer to prevent unexpected interactions between backends.
         workspace_buffer.zero_()
         if run_refcheck:
-            outputs[cur_backend] = run_backend_wrapper(cur_backend).detach().clone()
+            outputs[cur_backend] = (
+                run_backend_wrapper(
+                    cur_backend,
+                    q,
+                    kv_cache,
+                    k_cache,
+                    v_cache,
+                    workspace_buffer,
+                    block_tables,
+                    actual_seq_lens_kv,
+                    ragged_q,
+                )
+                .detach()
+                .clone()
+            )
             if cur_backend == "fa2":
                 has_reference_output = True
                 reference_output = outputs[cur_backend]
         # Unified benchmark entry: prefer graph if compatible and not using CUPTI
         backend_times[cur_backend] = bench_gpu_time(
-            fn=lambda: run_backend_wrapper(cur_backend),
+            fn=run_backend_wrapper,
             dry_run_iters=args.dry_run_iters,
             repeat_iters=args.num_iters,
-            l2_flush=True,
-            l2_flush_size_mb=256,
-            l2_flush_device=device,
             sleep_after_run=False,
             enable_cupti=args.use_cupti,
             use_cuda_graph=(is_cuda_graph_compatible and cur_backend != "fa2"),
+            cold_l2_cache=True,
+            input_args=(
+                cur_backend,
+                q,
+                kv_cache,
+                k_cache,
+                v_cache,
+                workspace_buffer,
+                block_tables,
+                actual_seq_lens_kv,
+                ragged_q,
+            ),
         )
 
     # Perform reference check
@@ -1054,7 +1087,20 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 block_tables=block_tables,
             )
 
-    def run_backend_wrapper(backend):
+    def run_backend_wrapper(
+        backend,
+        q,
+        kv_cache,
+        k_cache,
+        v_cache,
+        workspace_buffer,
+        block_tables,
+        actual_seq_lens_q_device,
+        actual_seq_lens_kv_device,
+        q_indptr,
+        qo_indptr,
+        kv_indptr,
+    ):
         if backend in ["fa2", "fa3", "trtllm-gen"]:
             return backend_wrappers[backend].run(
                 q, kv_cache, q_scale=q_scale, k_scale=k_scale, v_scale=v_scale
@@ -1115,7 +1161,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
             )[0]
         else:
             print(f"[ERROR] Backend {backend} not supported")
-            return res
+            return None
 
     has_reference_output = False
     reference_backend = None
@@ -1124,21 +1170,50 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
         # Clear workspace buffer to prevent unexpected interactions between backends.
         workspace_buffer.zero_()
         if run_refcheck:
-            outputs[cur_backend] = run_backend_wrapper(cur_backend).detach().clone()
+            outputs[cur_backend] = (
+                run_backend_wrapper(
+                    cur_backend,
+                    q,
+                    kv_cache,
+                    k_cache,
+                    v_cache,
+                    workspace_buffer,
+                    block_tables,
+                    actual_seq_lens_q_device,
+                    actual_seq_lens_kv_device,
+                    q_indptr,
+                    qo_indptr,
+                    kv_indptr,
+                )
+                .detach()
+                .clone()
+            )
             if cur_backend == "fa2":
                 has_reference_output = True
                 reference_output = outputs[cur_backend]
                 reference_backend = "fa2"
         backend_times[cur_backend] = bench_gpu_time(
-            fn=lambda: run_backend_wrapper(cur_backend),
+            fn=run_backend_wrapper,
             dry_run_iters=args.dry_run_iters,
             repeat_iters=args.num_iters,
-            l2_flush=True,
-            l2_flush_size_mb=256,
-            l2_flush_device=device,
             sleep_after_run=False,
             enable_cupti=args.use_cupti,
             use_cuda_graph=(is_cuda_graph_compatible and cur_backend != "fa2"),
+            cold_l2_cache=True,
+            input_args=(
+                cur_backend,
+                q,
+                kv_cache,
+                k_cache,
+                v_cache,
+                workspace_buffer,
+                block_tables,
+                actual_seq_lens_q_device,
+                actual_seq_lens_kv_device,
+                q_indptr,
+                qo_indptr,
+                kv_indptr,
+            ),
         )
 
     # Perform reference check
@@ -1541,7 +1616,23 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
         k = (k / k_scale).to(kv_dtype)
         v = (v / v_scale).to(kv_dtype)
 
-    def run_backend_wrapper(backend):
+    def run_backend_wrapper(
+        backend,
+        q,
+        k,
+        v,
+        workspace_buffer,
+        block_tables,
+        actual_seq_lens_q_device,
+        actual_seq_lens_kv_device,
+        q_indptr,
+        k_indptr,
+        v_indptr,
+        o_indptr,
+        batch_offsets_stats,
+        qo_indptr,
+        kv_indptr,
+    ):
         if backend in ["cutlass", "fa2", "fa3", "trtllm-gen"]:
             return backend_wrappers[backend].run_return_lse(q, k, v)[0]
         elif backend == "cudnn":
@@ -1587,7 +1678,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
             )[0]
         else:
             print(f"[ERROR] Backend {backend} not supported")
-            return res
+            return None
 
     has_reference_output = False
     # Iterate over each backend:
@@ -1595,20 +1686,55 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
         # Clear workspace buffer to prevent unexpected interactions between backends.
         workspace_buffer.zero_()
         if run_refcheck:
-            outputs[cur_backend] = run_backend_wrapper(cur_backend).detach().clone()
+            outputs[cur_backend] = (
+                run_backend_wrapper(
+                    cur_backend,
+                    q,
+                    k,
+                    v,
+                    workspace_buffer,
+                    block_tables,
+                    actual_seq_lens_q_device,
+                    actual_seq_lens_kv_device,
+                    q_indptr,
+                    k_indptr,
+                    v_indptr,
+                    o_indptr,
+                    batch_offsets_stats,
+                    qo_indptr,
+                    kv_indptr,
+                )
+                .detach()
+                .clone()
+            )
             if cur_backend == "fa2":
                 has_reference_output = True
                 reference_output = outputs[cur_backend]
         backend_times[cur_backend] = bench_gpu_time(
-            fn=lambda: run_backend_wrapper(cur_backend),
+            fn=run_backend_wrapper,
             dry_run_iters=args.dry_run_iters,
             repeat_iters=args.num_iters,
-            l2_flush=True,
-            l2_flush_size_mb=256,
-            l2_flush_device=device,
             sleep_after_run=True,
             enable_cupti=args.use_cupti,
             use_cuda_graph=(is_cuda_graph_compatible and cur_backend != "fa2"),
+            cold_l2_cache=True,
+            input_args=(
+                cur_backend,
+                q,
+                k,
+                v,
+                workspace_buffer,
+                block_tables,
+                actual_seq_lens_q_device,
+                actual_seq_lens_kv_device,
+                q_indptr,
+                k_indptr,
+                v_indptr,
+                o_indptr,
+                batch_offsets_stats,
+                qo_indptr,
+                kv_indptr,
+            ),
         )
 
     # Perform reference check
@@ -1944,7 +2070,18 @@ def testBatchMLAPagedAttentionWrapper(args):
         kpe_cache = kpe_cache.to(kv_dtype)
         kv_cache = kv_cache.to(kv_dtype)
 
-    def run_backend_wrapper(backend):
+    def run_backend_wrapper(
+        backend,
+        q_nope,
+        q_pe,
+        ckv_cache,
+        kpe_cache,
+        q,
+        kv_cache,
+        workspace_buffer,
+        block_tables,
+        actual_seq_lens_kv,
+    ):
         if backend in ["fa2", "fa3"]:
             return backend_wrappers[backend].run(
                 q_nope,
@@ -1980,7 +2117,7 @@ def testBatchMLAPagedAttentionWrapper(args):
             ).squeeze(1)
         else:
             print(f"[ERROR] Unsupported backend: {backend}")
-            return res
+            return None
 
     has_reference_output = False
     # Iterate over each backend:
@@ -1988,20 +2125,45 @@ def testBatchMLAPagedAttentionWrapper(args):
         # Clear workspace buffer to prevent unexpected interactions between backends.
         workspace_buffer.zero_()
         if run_refcheck:
-            outputs[cur_backend] = run_backend_wrapper(cur_backend).detach().clone()
+            outputs[cur_backend] = (
+                run_backend_wrapper(
+                    cur_backend,
+                    q_nope,
+                    q_pe,
+                    ckv_cache,
+                    kpe_cache,
+                    q,
+                    kv_cache,
+                    workspace_buffer,
+                    block_tables,
+                    actual_seq_lens_kv,
+                )
+                .detach()
+                .clone()
+            )
             if cur_backend == "fa2":
                 has_reference_output = True
                 reference_output = outputs[cur_backend]
         backend_times[cur_backend] = bench_gpu_time(
-            fn=lambda: run_backend_wrapper(cur_backend),
+            fn=run_backend_wrapper,
             dry_run_iters=args.dry_run_iters,
             repeat_iters=args.num_iters,
-            l2_flush=True,
-            l2_flush_size_mb=256,
-            l2_flush_device=device,
             sleep_after_run=False,
             enable_cupti=args.use_cupti,
             use_cuda_graph=(is_cuda_graph_compatible and cur_backend != "fa2"),
+            cold_l2_cache=True,
+            input_args=(
+                cur_backend,
+                q_nope,
+                q_pe,
+                ckv_cache,
+                kpe_cache,
+                q,
+                kv_cache,
+                workspace_buffer,
+                block_tables,
+                actual_seq_lens_kv,
+            ),
         )
 
     # Perform reference check
