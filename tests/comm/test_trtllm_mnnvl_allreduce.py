@@ -438,7 +438,7 @@ def run_mnnvl_ar_full(
 )
 @pytest.mark.parametrize("fusion", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("hidden_size", [2880, 5120, 7168, 8192])
+@pytest.mark.parametrize("hidden_size", [2880, 5120, 7168, 8192, 16384])
 def test_mnnvl_allreduce_refactored(
     monkeypatch, seq_lens: list[int], fusion: bool, dtype: torch.dtype, hidden_size: int
 ):
@@ -451,7 +451,7 @@ def test_mnnvl_allreduce_refactored(
 @pytest.mark.parametrize("seq_lens", [[1], [4], [15], [27, 11, 24], [127]])
 @pytest.mark.parametrize("fusion", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("hidden_size", [2048, 4096, 5120, 7168, 8192])
+@pytest.mark.parametrize("hidden_size", [2048, 4096, 5120, 7168, 8192, 16384])
 def test_mnnvl_allreduce_legacy(
     monkeypatch, seq_lens: list[int], fusion: bool, dtype: torch.dtype, hidden_size: int
 ):
