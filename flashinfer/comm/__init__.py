@@ -48,6 +48,8 @@ from .allreduce import TRTLLMAllReduceFusionWorkspace as TRTLLMAllReduceFusionWo
 from .allreduce import allreduce_fusion as allreduce_fusion
 from .allreduce import (
     create_allreduce_fusion_workspace as create_allreduce_fusion_workspace,
+)
+
 # MNNVL A2A (Throughput Backend)
 from .trtllm_moe_alltoall import MoeAlltoAll as MoeAlltoAll
 from .trtllm_moe_alltoall import moe_a2a_combine as moe_a2a_combine
