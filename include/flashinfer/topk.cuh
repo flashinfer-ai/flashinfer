@@ -2143,49 +2143,16 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
   }
 
   // Output phase - mode-specific
-  constexpr int OUTPUT_VEC_SIZE = 4;
-  const int aligned_k = (top_k / OUTPUT_VEC_SIZE) * OUTPUT_VEC_SIZE;
-
 #pragma unroll 2
-  for (int base = tx * OUTPUT_VEC_SIZE; base < aligned_k; base += BLOCK_SIZE * OUTPUT_VEC_SIZE) {
-    int4 idx_vec = *reinterpret_cast<int4*>(&s_indices[base]);
-
+  for (int base = tx; base < static_cast<int>(top_k); base += BLOCK_SIZE) {
+    const int idx = s_indices[base];
     if constexpr (MODE == FilteredTopKMode::PageTable) {
-      int4 out_vec;
-      out_vec.x = src_page_entry[idx_vec.x];
-      out_vec.y = src_page_entry[idx_vec.y];
-      out_vec.z = src_page_entry[idx_vec.z];
-      out_vec.w = src_page_entry[idx_vec.w];
-      *reinterpret_cast<int4*>(&dst[base]) = out_vec;
+      dst[base] = src_page_entry[idx];
     } else if constexpr (MODE == FilteredTopKMode::Ragged) {
-      int4 out_vec;
-      out_vec.x = idx_vec.x + offset_val;
-      out_vec.y = idx_vec.y + offset_val;
-      out_vec.z = idx_vec.z + offset_val;
-      out_vec.w = idx_vec.w + offset_val;
-      *reinterpret_cast<int4*>(&dst[base]) = out_vec;
+      dst[base] = static_cast<IdType>(idx) + offset_val;
     } else {  // Plain
-      *reinterpret_cast<int4*>(&dst[base]) = idx_vec;
-      // Gather values and use vec_t for vectorized store
-      vec_t<DType, 4> val_vec;
-      val_vec[0] = score[idx_vec.x];
-      val_vec[1] = score[idx_vec.y];
-      val_vec[2] = score[idx_vec.z];
-      val_vec[3] = score[idx_vec.w];
-      val_vec.store(&dst_values[base]);
-    }
-  }
-
-  // Handle tail elements
-  for (int i = aligned_k + tx; i < static_cast<int>(top_k); i += BLOCK_SIZE) {
-    const int idx = s_indices[i];
-    if constexpr (MODE == FilteredTopKMode::PageTable) {
-      dst[i] = src_page_entry[idx];
-    } else if constexpr (MODE == FilteredTopKMode::Ragged) {
-      dst[i] = static_cast<IdType>(idx) + offset_val;
-    } else {  // Plain
-      dst[i] = static_cast<IdType>(idx);
-      dst_values[i] = score[idx];
+      dst[base] = static_cast<IdType>(idx);
+      dst_values[base] = score[idx];
     }
   }
 }
