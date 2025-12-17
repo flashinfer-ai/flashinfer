@@ -136,14 +136,17 @@ def download_file(
         return False
 
 
-def get_meta_hash(checksums_bytes: bytes) -> str:
+def get_meta_hash(
+    checksums_bytes: bytes, target_file: str = "flashinferMetaInfo.h"
+) -> str:
     """
     Parse the checksums.txt file and get the hash of corresponding flashinferMetaInfo.h file
     """
     checksums_lines = checksums_bytes.decode("utf-8").splitlines()
     for line in checksums_lines:
         sha256, filename = line.strip().split()
-        if ".h" in filename:
+        # Match specifically flashinferMetaInfo.h (case-insensitive for the 'I' in Infer)
+        if filename.lower().endswith(target_file.lower()):
             return sha256
     raise ValueError("Invalid checksums.txt, no flashinferMetaInfo.h found")
 
@@ -187,6 +190,38 @@ def load_cubin(cubin_path: str, sha256: str) -> bytes:
     except Exception:
         pass
     return b""
+
+
+def make_symlink(src: str, symlink_parent: str, symlink_name: str) -> None:
+    """
+    Create a symlink from {src} to {symlink_parent}/{symlink_name}.
+    If the symlink does not exist, create the parent directory and create the symlink.
+    """
+    symlink_path = safe_urljoin(symlink_parent, symlink_name)
+    if not os.path.exists(symlink_path):
+        os.makedirs(symlink_parent, exist_ok=True)
+        os.symlink(src, symlink_path)
+
+
+def get_file(
+    uri_path: str,
+    sha256: str,
+    file_path: str = None,
+    session=None,
+) -> bytes:
+    """
+    Load a file from local cache directory {file_path}, ensure that the sha256 signature matches.
+    Otherwise, download the file from {uri_path} and write to {file_path}.
+    """
+
+    file = load_cubin(file_path, sha256)
+    if file:
+        return file
+    os.makedirs(os.path.dirname(file_path), exist_ok=True)
+    uri = safe_urljoin(FLASHINFER_CUBINS_REPOSITORY, uri_path)
+    logger.info(f"Fetching file from {uri}")
+    download_file(uri, file_path, session=session)
+    return load_cubin(file_path, sha256)
 
 
 def get_cubin(file_name: str, sha256: str, session=None) -> bytes:

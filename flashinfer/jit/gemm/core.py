@@ -30,7 +30,12 @@ from ..core import (
     sm100f_nvcc_flags,
     current_compilation_context,
 )
-from ..cubin_loader import get_cubin, get_meta_hash
+from ..cubin_loader import (
+    get_cubin,
+    get_meta_hash,
+    make_symlink,
+    get_file,
+)
 from ..utils import dtype_cutlass_map, filename_safe_dtype_map, write_if_different
 
 
@@ -489,6 +494,35 @@ def gen_trtllm_gen_gemm_module() -> JitSpec:
     )
     # make sure "flashinferMetaInfo.h" is downloaded or cached
     assert metainfo, f"{header_name}.h not found"
+
+    header_files = [
+        "GemmInterface.h",
+        "GemmOptions.h",
+        "Enums.h",
+        "KernelTraits.h",
+        "KernelParams.h",
+        "KernelParamsDecl.h",
+        "TmaDescriptor.h",
+        "trtllm/gen/CommonUtils.h",
+        "trtllm/gen/CudaKernelLauncher.h",
+        "trtllm/gen/DtypeDecl.h",
+        "trtllm/gen/MmaDecl.h",
+        "trtllm/gen/SfLayoutDecl.h",
+        "trtllm/gen/CudaArchDecl.h",
+    ]
+
+    header_path = f"{include_path}/trtllmGen_gemm_export"
+    for file in header_files:
+        uri_path = f"{header_path}/{file}"
+        file_hash = get_meta_hash(checksum, file)
+        file_path = jit_env.FLASHINFER_CUBIN_DIR / "trtllmGen_gemm_export" / file
+        get_file(uri_path, file_hash, file_path)
+    # Create directory flashinfer/trtllm/gemm/trtllmGen_gemm_export pointing to trtllmGen_gemm_export
+    symlink_parent = str(jit_env.FLASHINFER_CUBIN_DIR / "flashinfer/trtllm/gemm")
+    make_symlink(
+        "../../../trtllmGen_gemm_export", symlink_parent, "trtllmGen_gemm_export"
+    )
+
     return gen_jit_spec(
         "trtllm_gemm",
         [
@@ -502,7 +536,10 @@ def gen_trtllm_gen_gemm_module() -> JitSpec:
         ]
         + sm100a_nvcc_flags,
         # link "include" sub-directory in cache
-        extra_include_paths=[jit_env.FLASHINFER_CUBIN_DIR / include_path],
+        extra_include_paths=[
+            jit_env.FLASHINFER_CUBIN_DIR,
+            jit_env.FLASHINFER_CUBIN_DIR / include_path,
+        ],
     )
 
 
@@ -640,6 +677,35 @@ def gen_trtllm_low_latency_gemm_module() -> JitSpec:
     )
     # make sure "flashinferMetaInfo.h" is downloaded or cached
     assert metainfo, f"{header_name}.h not found"
+
+    header_files = [
+        "GemmInterface.h",
+        "GemmOptions.h",
+        "Enums.h",
+        "KernelTraits.h",
+        "KernelParams.h",
+        "KernelParamsDecl.h",
+        "TmaDescriptor.h",
+        "trtllm/gen/CommonUtils.h",
+        "trtllm/gen/CudaKernelLauncher.h",
+        "trtllm/gen/DtypeDecl.h",
+        "trtllm/gen/MmaDecl.h",
+        "trtllm/gen/SfLayoutDecl.h",
+        "trtllm/gen/CudaArchDecl.h",
+    ]
+
+    header_path = f"{include_path}/trtllmGen_gemm_export"
+    for file in header_files:
+        uri_path = f"{header_path}/{file}"
+        file_hash = get_meta_hash(checksum, file)
+        file_path = jit_env.FLASHINFER_CUBIN_DIR / "trtllmGen_gemm_export" / file
+        get_file(uri_path, file_hash, file_path)
+    # Create directory flashinfer/trtllm/gemm/trtllmGen_gemm_export pointing to trtllmGen_gemm_export
+    symlink_parent = str(jit_env.FLASHINFER_CUBIN_DIR / "flashinfer/trtllm/gemm")
+    make_symlink(
+        "../../../trtllmGen_gemm_export", symlink_parent, "trtllmGen_gemm_export"
+    )
+
     return gen_jit_spec(
         "trtllm_low_latency_gemm",
         [
