@@ -39,6 +39,17 @@ from .vllm_ar import meta_size as vllm_meta_size
 from .vllm_ar import register_buffer as vllm_register_buffer
 from .vllm_ar import register_graph_buffers as vllm_register_graph_buffers
 
+# Unified AllReduce Fusion API
+from .allreduce import AllReduceFusionWorkspace as AllReduceFusionWorkspace
+from .trtllm_mnnvl_ar import (
+    MNNVLAllReduceFusionWorkspace as MNNVLAllReduceFusionWorkspace,
+)
+from .allreduce import TRTLLMAllReduceFusionWorkspace as TRTLLMAllReduceFusionWorkspace
+from .allreduce import allreduce_fusion as allreduce_fusion
+from .allreduce import (
+    create_allreduce_fusion_workspace as create_allreduce_fusion_workspace,
+)
+
 # MNNVL A2A (Throughput Backend)
 from .trtllm_moe_alltoall import MoeAlltoAll as MoeAlltoAll
 from .trtllm_moe_alltoall import moe_a2a_combine as moe_a2a_combine
