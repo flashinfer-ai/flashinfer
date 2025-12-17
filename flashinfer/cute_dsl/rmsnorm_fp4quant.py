@@ -199,38 +199,6 @@ def rcp_approx_ftz(a: Float32, *, loc=None, ip=None) -> Float32:
 
 
 @dsl_user_op
-def fabs_f32(val: Float32, *, loc=None, ip=None) -> Float32:
-    """Compute absolute value of float32 using PTX abs.f32."""
-    return Float32(
-        llvm.inline_asm(
-            T.f32(),
-            [Float32(val).ir_value(loc=loc, ip=ip)],
-            "abs.f32 $0, $1;",
-            "=f,f",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
-@dsl_user_op
-def fmax_f32(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
-    """Compute max of two float32 values using PTX max.f32."""
-    return Float32(
-        llvm.inline_asm(
-            T.f32(),
-            [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
-            "max.f32 $0, $1, $2;",
-            "=f,f,f",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
-@dsl_user_op
 def fmin_f32(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
     """Compute min of two float32 values using PTX min.f32 (branchless clamping)."""
     return Float32(
@@ -851,7 +819,7 @@ class RMSNormFP4QuantKernel:
     Key optimizations:
     1. Half2/BFloat2 SIMD for max-abs computation
     2. Branchless scale clamping via fmin_f32
-    3. Cluster synchronization (SM90+) for large H dimensions
+    3. Cluster synchronization for large H dimensions
     4. Direct 128-bit vectorized global loads
     """
 
@@ -1129,7 +1097,7 @@ class RMSNormFP4QuantKernel:
             mbar_ptr = smem.allocate_array(Int64, num_elems=1)
 
         # ==================================================================
-        # Initialize cluster (SM90+ only)
+        # Initialize cluster
         # ==================================================================
         if cutlass.const_expr(cluster_n > 1):
             if tidx == 0:
@@ -1806,7 +1774,7 @@ def rmsnorm_fp4quant_cute_dsl(
 
     Notes
     -----
-    - Requires SM90+ for cluster support with large hidden dimensions.
+    - Requires SM100+ for FP4 quantization PTX intrinsics
     - For block_size=16: uses E4M3 scale factors (NVFP4)
     - For block_size=32: uses UE8M0 scale factors (MXFP4)
     """

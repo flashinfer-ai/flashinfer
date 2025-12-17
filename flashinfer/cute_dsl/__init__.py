@@ -32,6 +32,10 @@ if is_cute_dsl_available():
         get_sm_version,
         supports_cluster,
     )
+    from .add_rmsnorm_fp4quant import (
+        add_rmsnorm_fp4quant_cute_dsl,
+        AddRMSNormFP4QuantKernel,
+    )
 
 __all__ = [
     # Utils
@@ -47,4 +51,7 @@ __all__ = [
     "RMSNormFP4QuantKernel",
     "get_sm_version",
     "supports_cluster",
+    # Add + RMSNorm + FP4 Quantization
+    "add_rmsnorm_fp4quant_cute_dsl",
+    "AddRMSNormFP4QuantKernel",
 ]
