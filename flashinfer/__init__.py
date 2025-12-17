@@ -95,8 +95,16 @@ from .norm import layernorm as layernorm
 from .norm import gemma_fused_add_rmsnorm as gemma_fused_add_rmsnorm
 from .norm import gemma_rmsnorm as gemma_rmsnorm
 from .norm import rmsnorm as rmsnorm
-from .cute_dsl import rmsnorm_fp4quant_cute_dsl as rmsnorm_fp4quant_cute_dsl
-from .cute_dsl import add_rmsnorm_fp4quant_cute_dsl as add_rmsnorm_fp4quant_cute_dsl
+
+try:
+    from .cute_dsl import rmsnorm_fp4quant_cute_dsl as rmsnorm_fp4quant_cute_dsl
+    from .cute_dsl import (
+        add_rmsnorm_fp4quant_cute_dsl as add_rmsnorm_fp4quant_cute_dsl,
+    )
+except ImportError:
+    # CuTe-DSL not available, set to None for graceful degradation
+    rmsnorm_fp4quant_cute_dsl = None  # type: ignore[misc,assignment]
+    add_rmsnorm_fp4quant_cute_dsl = None  # type: ignore[misc,assignment]
 from .page import append_paged_kv_cache as append_paged_kv_cache
 from .page import append_paged_mla_kv_cache as append_paged_mla_kv_cache
 from .page import get_batch_indices_positions as get_batch_indices_positions

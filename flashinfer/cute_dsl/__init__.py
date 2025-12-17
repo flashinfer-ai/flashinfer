@@ -30,7 +30,6 @@ if is_cute_dsl_available():
         rmsnorm_fp4quant_cute_dsl,
         RMSNormFP4QuantKernel,
         get_sm_version,
-        supports_cluster,
     )
     from .add_rmsnorm_fp4quant import (
         add_rmsnorm_fp4quant_cute_dsl,
@@ -38,20 +37,23 @@ if is_cute_dsl_available():
     )
 
 __all__ = [
-    # Utils
+    # Utils (always available)
     "is_cute_dsl_available",
     "make_ptr",
     "get_cutlass_dtype",
     "get_num_sm",
-    # Blockscaled GEMM
-    "grouped_gemm_nt_masked",
-    "Sm100BlockScaledPersistentDenseGemmKernel",
-    # RMSNorm + FP4 Quantization
-    "rmsnorm_fp4quant_cute_dsl",
-    "RMSNormFP4QuantKernel",
-    "get_sm_version",
-    "supports_cluster",
-    # Add + RMSNorm + FP4 Quantization
-    "add_rmsnorm_fp4quant_cute_dsl",
-    "AddRMSNormFP4QuantKernel",
 ]
+
+if is_cute_dsl_available():
+    __all__ += [
+        # Blockscaled GEMM
+        "grouped_gemm_nt_masked",
+        "Sm100BlockScaledPersistentDenseGemmKernel",
+        # RMSNorm + FP4 Quantization
+        "rmsnorm_fp4quant_cute_dsl",
+        "RMSNormFP4QuantKernel",
+        "get_sm_version",
+        # Add + RMSNorm + FP4 Quantization
+        "add_rmsnorm_fp4quant_cute_dsl",
+        "AddRMSNormFP4QuantKernel",
+    ]

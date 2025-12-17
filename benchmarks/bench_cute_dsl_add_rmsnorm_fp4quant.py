@@ -353,8 +353,7 @@ def run_benchmark():
     print(f"GPU Compute Capability: SM{cc}")
 
     if cc < 100:
-        print("ERROR: Blackwell GPU (SM100+) required for FP4 quantization")
-        return
+        raise RuntimeError("Blackwell GPU (SM100+) required for FP4 quantization")
 
     dtype = torch.float16
     block_size = 16

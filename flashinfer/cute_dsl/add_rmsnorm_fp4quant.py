@@ -54,18 +54,23 @@ COPY_BITS = 128
 # =============================================================================
 
 
-@functools.cache
-def get_sm_version() -> int:
-    """Get the SM version of the current CUDA device."""
+@functools.lru_cache(maxsize=16)
+def get_sm_version(device: int | torch.device | str | None = None) -> int:
+    """Get the SM version of a CUDA device.
+
+    Args:
+        device: CUDA device to query. Can be an int (device index), torch.device,
+            device string (e.g., 'cuda:0'), or None to use current device.
+
+    Returns:
+        SM version as an integer (e.g., 100 for SM100).
+    """
     if not torch.cuda.is_available():
         return 80
-    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    if device is None:
+        device = torch.cuda.current_device()
+    props = torch.cuda.get_device_properties(device)
     return props.major * 10 + props.minor
-
-
-def supports_cluster() -> bool:
-    """Check if the current device supports cluster operations (SM90+)."""
-    return get_sm_version() >= 90
 
 
 # =============================================================================
@@ -2301,7 +2306,7 @@ def add_rmsnorm_fp4quant_cute_dsl(
     actual_scale_format = (
         scale_format if scale_format else ("ue8m0" if block_size == 32 else "e4m3")
     )
-    sm_version = get_sm_version()
+    sm_version = get_sm_version(input.device)
 
     tensor_api = _get_compiled_kernel(
         hidden_size,
@@ -2326,5 +2331,4 @@ __all__ = [
     "AddRMSNormFP4QuantKernel",
     "add_rmsnorm_fp4quant_cute_dsl",
     "get_sm_version",
-    "supports_cluster",
 ]
