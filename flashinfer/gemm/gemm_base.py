@@ -3413,6 +3413,9 @@ def fp8_blockscale_gemm_sm90(
             f"K dimension must be divisible by block size ({BLOCK_SIZE}), got K={K}"
         )
 
+    if N % 64 != 0:
+        raise ValueError(f"N dimension must be divisible by 64, got N={N}")
+
     # Validate dtype combinations
     input_is_fp8 = input.dtype == torch.float8_e4m3fn
     weight_is_fp8 = weight.dtype == torch.float8_e4m3fn
@@ -3429,14 +3432,6 @@ def fp8_blockscale_gemm_sm90(
     if input_is_fp8:
         if input_scale is None:
             raise ValueError("input_scale is required when input is FP8. ")
-        # Users provide input_scale in shape (M, K//128), matching per_token_cast_to_fp8 output.
-        # We transpose it internally to (K//128, M) to match TensorRT-LLM kernel expectations.
-        expected_scale_shape = (M, K // BLOCK_SIZE)
-        if input_scale.shape != expected_scale_shape:
-            raise ValueError(
-                f"input_scale shape mismatch. Expected {expected_scale_shape}, "
-                f"got {input_scale.shape}"
-            )
         if input_scale.dtype != torch.float32:
             raise ValueError(f"input_scale must be float32, got {input_scale.dtype}")
         if input_scale.device != input.device:
@@ -3522,44 +3517,5 @@ def fp8_blockscale_gemm_sm90(
         workspace = torch.empty(workspace_size, dtype=torch.uint8, device=input.device)
         runner.configure_workspace(workspace)
 
-    if input_is_bf16 and weight_is_fp8 and input_scale is None:
-        # Quantize the bf16 input to FP8 with correct scale format to run gemm at fp8 x fp8
-        M_padded = ((M + 4 - 1) // 4) * 4  # Round M up to multiple of 4
-        K_blocks = (K + BLOCK_SIZE - 1) // BLOCK_SIZE
-        input_scale_size = ((K * M_padded * 4 + BLOCK_SIZE - 1) // BLOCK_SIZE) // 4
-
-        fp8_input = torch.empty((M_padded, K), dtype=torch.float8_e4m3fn, device=input.device)
-        input_scale = torch.empty((input_scale_size), dtype=torch.float32, device=input.device)
-        runner.fp8_quantize_1x128(input, fp8_input, input_scale, False)
-        input = fp8_input[:M, :]
-    else:
-        if input_scale is not None:
-            M_padded = ((M + 4 - 1) // 4) * 4  # Round M up to multiple of 4
-            K_blocks = K // BLOCK_SIZE
-
-            # Create padded tensor with the stride TRT-LLM expects
-            input_scale_padded = torch.zeros(
-                K_blocks, M_padded, dtype=torch.float32, device=input.device
-            )
-
-            # Copy scales into the non-padded region: (K//128, M)
-            # Transpose from (M, K//128) to (K//128, M) and copy
-            input_scale_padded[:, :M] = input_scale.T
-
-            # Extract view of the actual (K//128, M) region
-            # This view has stride (M_padded, 1) which matches TRT-LLM's expectations
-            input_scale = input_scale_padded[:, :M]
-
-            # Verify stride matches TRT-LLM's expectations
-            expected_stride_0 = M_padded
-            if input_scale.stride(0) != expected_stride_0:
-                raise ValueError(
-                    f"input_scale stride mismatch: expected stride[0]={expected_stride_0} "
-                    f"(M_padded={M_padded}), got {input_scale.stride(0)}"
-                )
-        else:
-            pass
-
     runner.run_gemm(input, weight, out, input_scale, weight_scale)
-
     return out

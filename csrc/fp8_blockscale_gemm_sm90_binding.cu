@@ -122,12 +122,6 @@ class Fp8BlockScaleGemmRunner : public tvm::ffi::ModuleObj {
     if (input_is_fp8) {
       TVM_FFI_ICHECK(scales_a.has_value() && scales_a.value().data_ptr() != nullptr)
           << "scales_a is required for FP8 input";
-      // TensorRT-LLM expects scale shape: (K/128, M) after transpose
-      // int64_t expected_scale_k = (shape_k + 127) / 128;
-      // TVM_FFI_ICHECK(scales_a.value().size(0) == expected_scale_k &&
-      //                scales_a.value().size(1) == shape_m)
-      //     << "scales_a shape mismatch: expected (" << expected_scale_k << ", " << shape_m
-      //     << "), got (" << scales_a.value().size(0) << ", " << scales_a.value().size(1) << ")";
     }
 
     if (weight_is_fp8) {
