@@ -2921,6 +2921,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         k: torch.Tensor,
         v: torch.Tensor,
         *args,
+        q_scale: Optional[float] = None,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+        o_scale: Optional[float] = None,
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
@@ -2939,6 +2943,14 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             The value tensor, shape: ``[kv_indptr[-1], num_kv_heads, head_dim_vo]``
         *args
             Additional arguments for the custom kernel.
+        q_scale: Optional[float]
+            The calibration scale of fp8 query, if not provided, will be set to ``1.0``.
+        k_scale: Optional[float]
+            The calibration scale of fp8 key, if not provided, will be set to ``1.0``.
+        v_scale: Optional[float]
+            The calibration scale of fp8 value, if not provided, will be set to ``1.0``.
+        o_scale: Optional[float]
+            The calibration scale of output, if not provided, will be set to ``1.0``.
         out : Optional[torch.Tensor]
             The output tensor, if not provided, will be allocated internally.
         lse : Optional[torch.Tensor]
@@ -2986,9 +2998,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     lse, (q.size(0), q.size(1)), torch.float32, q.device, "lse"
                 )
         if out is None:
+            # when input dtype is fp8, we need to use bf16 output
+            out_dtype = torch.bfloat16 if q.dtype.itemsize == 1 else q.dtype
             out = torch.empty(
                 q.shape[:-1] + v.shape[-1:],
-                dtype=self._cached_o_data_type,
+                dtype=out_dtype,
                 device=q.device,
             )
         else:
@@ -3009,6 +3023,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 plan_info=self._plan_info,
                 causal=self._causal,
                 sm_scale=sm_scale,
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                o_scale=o_scale,
                 max_qo_len=self._max_qo_len,
                 out=out,
                 lse=lse,
@@ -3161,6 +3179,10 @@ def fmha_varlen(
     lse: Optional[torch.Tensor] = None,
     causal: bool = False,
     sm_scale: Optional[float] = None,
+    q_scale: Optional[float] = None,
+    k_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
+    o_scale: Optional[float] = None,
     return_lse: Literal[False] = False,
 ) -> torch.Tensor: ...
 
@@ -3178,6 +3200,10 @@ def fmha_varlen(
     lse: Optional[torch.Tensor] = None,
     causal: bool = False,
     sm_scale: Optional[float] = None,
+    q_scale: Optional[float] = None,
+    k_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
+    o_scale: Optional[float] = None,
     return_lse: Literal[True] = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
@@ -3194,6 +3220,10 @@ def fmha_varlen(
     lse: Optional[torch.Tensor] = None,
     causal: bool = False,
     sm_scale: Optional[float] = None,
+    q_scale: Optional[float] = None,
+    k_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
+    o_scale: Optional[float] = None,
     return_lse: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     workspace_buffer = _get_cache_buf(
@@ -3218,6 +3248,14 @@ def fmha_varlen(
     mask_mode_code = 1 if causal else 0
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(head_dim_qk)
+    if q_scale is None:
+        q_scale = 1.0
+    if k_scale is None:
+        k_scale = 1.0
+    if v_scale is None:
+        v_scale = 1.0
+    if o_scale is None:
+        o_scale = 1.0
 
     qo_total_len = nnz_qo
     if max_qo_len is None:
@@ -3236,12 +3274,14 @@ def fmha_varlen(
     ) = plan_info
 
     if out is None:
+        # when input dtype is fp8, we need to use bf16 output
+        out_dtype = torch.bfloat16 if q.dtype.itemsize == 1 else q.dtype
         out = torch.empty(
             qo_total_len + max(max_qo_len, 128),
             num_qo_heads,
             head_dim_vo,
             device=q.device,
-            dtype=q.dtype,
+            dtype=out_dtype,
         )[max(max_qo_len, 128) :]
 
     if lse is None and return_lse:
@@ -3264,10 +3304,10 @@ def fmha_varlen(
         lse,
         mask_mode_code,
         sm_scale,
-        num_qo_heads,
-        num_kv_heads,
-        head_dim_qk,
-        head_dim_vo,
+        q_scale,
+        k_scale,
+        v_scale,
+        o_scale,
         max_qo_len,
     )
 
