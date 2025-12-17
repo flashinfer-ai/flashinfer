@@ -1027,12 +1027,27 @@ class RMSNormFP4QuantKernel:
             y_ptr,
             layout=cute.make_ordered_layout((M, H // 2), order=(1, 0)),
         )
-        mS = cute.make_tensor(
-            s_ptr,
-            layout=cute.make_ordered_layout(
-                (M, self.num_sf_blocks_per_row), order=(1, 0)
-            ),
-        )
+
+        # Create mS tensor with appropriate layout based on swizzle mode
+        if cutlass.const_expr(self.output_swizzled):
+            # For swizzled output, use 1D layout
+            # The swizzle writes use flat offsets: mS[swizzled_offset]
+            # We compute the swizzled offset in the kernel, so just use a 1D layout
+            # with stride 1 to treat the pointer as a flat array
+            num_m_tiles = (M + Int32(127)) // Int32(128)
+            swizzled_size = num_m_tiles * Int32(self.num_k_tiles * self.k_tile_stride)
+            mS = cute.make_tensor(
+                s_ptr,
+                layout=cute.make_layout((swizzled_size,), stride=(Int32(1),)),
+            )
+        else:
+            # For non-swizzled output, use 2D row-major layout
+            mS = cute.make_tensor(
+                s_ptr,
+                layout=cute.make_ordered_layout(
+                    (M, self.num_sf_blocks_per_row), order=(1, 0)
+                ),
+            )
 
         # Create TV layout
         tv_shape, tv_stride = self._make_tv_layout(
@@ -1684,6 +1699,7 @@ def _get_compiled_kernel(
     is_fp16: bool,
     sm_version: int,
     scale_format: str,
+    is_sf_swizzled_layout: bool,
 ) -> Callable:
     """
     Get a compiled kernel closure that takes torch.Tensor directly.
@@ -1730,7 +1746,7 @@ def _get_compiled_kernel(
         dtype=cutlass_dtype,
         H=hidden_size,
         block_size=block_size,
-        output_swizzled=False,
+        output_swizzled=is_sf_swizzled_layout,
         is_fp16=is_fp16,
         sm_version=sm_version,
         scale_format=scale_format,
@@ -1774,9 +1790,12 @@ def rmsnorm_fp4quant_cute_dsl(
     eps: float = 1e-6,
     block_size: int = 16,
     scale_format: str | None = None,
+    is_sf_swizzled_layout: bool = False,
 ) -> None:
     """
     Fused RMS normalization with FP4 quantization using CuTe-DSL.
+
+    Computes: ``y = RMSNorm(input) * weight``, then quantizes ``y`` to FP4.
 
     Parameters
     ----------
@@ -1784,26 +1803,48 @@ def rmsnorm_fp4quant_cute_dsl(
         Input tensor, shape ``(batch_size, hidden_size)`` or ``(batch_size, seq_len, hidden_size)``.
         Must be ``torch.float16`` or ``torch.bfloat16``.
     weight : torch.Tensor
-        Weight tensor, shape ``(hidden_size,)``.
+        Weight tensor for RMSNorm, shape ``(hidden_size,)``.
         Must have the same dtype as input.
     y_fp4 : torch.Tensor
         Output tensor for quantized values in FP4_E2M1 format, packed as uint8.
+        Two FP4 values are packed into each uint8 byte.
         Shape must be ``(batch_size, hidden_size // 2)`` or matching 3D input.
     block_scale : torch.Tensor
-        Output tensor for block scale factors.
-        Shape must be ``(batch_size, hidden_size // block_size)`` or matching 3D input.
+        Output tensor for per-block scale factors.
+
+        - If ``is_sf_swizzled_layout=False`` (default): row-major layout with shape
+          ``(batch_size, hidden_size // block_size)`` or matching 3D input.
+        - If ``is_sf_swizzled_layout=True``: swizzled layout for efficient tensor core
+          access, with shape ``(batch_size * hidden_size // block_size,)`` flattened.
+          The swizzle pattern uses 128x4 tiles where scales are arranged as:
+          ``[m_tile][k_tile][outer_m (32)][inner_m (4)][inner_k (4)]``.
+
+        Dtype should be ``torch.float8_e4m3fn`` for E4M3 format or ``torch.uint8``
+        for UE8M0 format.
     eps : float
         Epsilon for numerical stability in RMSNorm. Default is ``1e-6``.
     block_size : int
-        Block size for FP4 quantization. 16 for NVFP4, 32 for MXFP4.
+        Number of elements per quantization block. Default is ``16``.
+
+        - ``16``: NVFP4 format with E4M3 scale factors
+        - ``32``: MXFP4 format with UE8M0 scale factors
     scale_format : str, optional
-        Scale factor format: "e4m3" or "ue8m0". If None, auto-selects based on block_size.
+        Scale factor format: ``"e4m3"`` or ``"ue8m0"``.
+        If ``None``, auto-selects based on ``block_size``:
+        ``"e4m3"`` for block_size=16, ``"ue8m0"`` for block_size=32.
+    is_sf_swizzled_layout : bool
+        If ``True``, output scale factors in swizzled layout optimized for
+        tensor core GEMM operations. The swizzle uses 128x4 tiles with the pattern:
+        ``[m_tile_idx * k_tiles * 512 + k_tile_idx * 512 + outer_m * 16 + inner_m * 4 + inner_k]``
+        where ``outer_m = row % 32``, ``inner_m = (row % 128) // 32``, etc.
+        Default is ``False`` (row-major layout).
 
     Notes
     -----
-    - Requires SM100+ for FP4 quantization PTX intrinsics
-    - For block_size=16: uses E4M3 scale factors (NVFP4)
-    - For block_size=32: uses UE8M0 scale factors (MXFP4)
+    - Requires SM100+ (Blackwell) for FP4 quantization PTX intrinsics.
+    - For block_size=16 (NVFP4): uses E4M3 scale factors (max value 448.0).
+    - For block_size=32 (MXFP4): uses UE8M0 scale factors (power-of-2 scales).
+    - FP4 E2M1 format has a max representable value of 6.0.
     """
     # Handle 2D vs 3D input
     is_3d = input.dim() == 3
@@ -1832,7 +1873,12 @@ def rmsnorm_fp4quant_cute_dsl(
 
     # Get cached tensor_api and call it directly
     tensor_api = _get_compiled_kernel(
-        hidden_size, block_size, is_fp16, sm_version, actual_scale_format
+        hidden_size,
+        block_size,
+        is_fp16,
+        sm_version,
+        actual_scale_format,
+        is_sf_swizzled_layout,
     )
     tensor_api(
         input.contiguous(),
