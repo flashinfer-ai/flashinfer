@@ -13,6 +13,7 @@ from .gemm_base import (
 from .gemm_base import gemm_fp8_nt_blockscaled as gemm_fp8_nt_blockscaled
 from .gemm_base import gemm_fp8_nt_groupwise as gemm_fp8_nt_groupwise
 from .gemm_base import group_gemm_fp8_nt_groupwise as group_gemm_fp8_nt_groupwise
+from .gemm_base import fp8_blockscale_gemm_sm90 as fp8_blockscale_gemm_sm90
 
 from .routergemm_dsv3 import (
     mm_M1_16_K7168_N256 as mm_M1_16_K7168_N256,
@@ -30,5 +31,6 @@ __all__ = [
     "gemm_fp8_nt_blockscaled",
     "gemm_fp8_nt_groupwise",
     "group_gemm_fp8_nt_groupwise",
+    "fp8_blockscale_gemm_sm90",
     "mm_M1_16_K7168_N256",
 ]
