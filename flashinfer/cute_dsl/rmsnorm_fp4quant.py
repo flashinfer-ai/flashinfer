@@ -38,6 +38,7 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
 
 from .utils import make_ptr
+from ..api_logging import flashinfer_api
 
 
 # =============================================================================
@@ -1764,6 +1765,7 @@ def _get_compiled_kernel(
     return tensor_api
 
 
+@flashinfer_api
 def rmsnorm_fp4quant_cute_dsl(
     input: torch.Tensor,
     weight: torch.Tensor,
