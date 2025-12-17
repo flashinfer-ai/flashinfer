@@ -2730,8 +2730,9 @@ def _check_gemm_fp8_nt_blockscaled_problem_size(
         b_scale,
         scale_major_mode,
         mma_sm,
-        out,
-        out_dtype,
+        scale_granularity_mnk=(128, 128, 128),
+        out=out,
+        out_dtype=out_dtype,
         backend="cutlass",
     )
 
@@ -2742,8 +2743,9 @@ def _check_gemm_fp8_nt_blockscaled_problem_size(
         b_scale,
         scale_major_mode,
         mma_sm,
-        out,
-        out_dtype,
+        scale_granularity_mnk=(128, 128, 128),
+        out=out,
+        out_dtype=out_dtype,
         backend="cutlass",
     )
 
@@ -3224,6 +3226,10 @@ def _check_group_deepgemm_fp8_nt_groupwise_problem_size(
         _check_group_deepgemm_fp8_nt_contiguous_problem_size,
     )
 
+    if out is None:
+        out_dtype = out_dtype or torch.bfloat16
+        out = torch.empty(a.shape[0], b.shape[1], dtype=out_dtype, device=a.device)
+
     return _check_group_deepgemm_fp8_nt_contiguous_problem_size(
         (a, a_scale), (b, b_scale), out, m_indices, scale_granularity_mnk
     )
@@ -3351,7 +3357,7 @@ def group_deepgemm_fp8_nt_groupwise(
     if out is None:
         out_dtype = out_dtype or torch.bfloat16
         out = torch.empty(a.shape[0], b.shape[1], dtype=out_dtype, device=a.device)
-
+    print("GOT HERE")
     m_grouped_fp8_gemm_nt_contiguous(
         (a, a_scale), (b, b_scale), out, m_indices, scale_granularity_mnk
     )
@@ -3372,6 +3378,12 @@ def _check_batch_deepgemm_fp8_nt_groupwise(
     out_dtype: Optional[torch.dtype] = None,
 ) -> bool:
     from flashinfer.deep_gemm import _check_m_grouped_fp8_gemm_nt_masked_problem_size
+
+    if out is None:
+        out_dtype = out_dtype or torch.bfloat16
+        out = torch.empty(
+            a.shape[0], a.shape[1], b.shape[1], dtype=out_dtype, device=a.device
+        )
 
     return _check_m_grouped_fp8_gemm_nt_masked_problem_size(
         (a, a_scale), (b, b_scale), out, masked_m, expected_m, scale_granularity_mnk
