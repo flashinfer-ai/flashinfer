@@ -881,32 +881,29 @@ class AddRMSNormFP4QuantKernel:
 
     @staticmethod
     def _compute_cluster_n(H: int, dtype: cutlass.Numeric, sm_version: int) -> int:
-        """Compute optimal cluster size based on H and architecture."""
+        """Compute optimal cluster size based on H and device shared memory.
+
+        Dynamically determines the minimum cluster_n that fits within the
+        device's shared memory limit, making it compatible with different
+        GPU architectures (e.g., SM100 with 228KB vs SM120 with 128KB).
+        """
         if sm_version < 90:
             return 1
 
-        if dtype.width == 16:
-            if H <= 16 * 1024:
-                return 1
-            elif H <= 32 * 1024:
-                return 2
-            elif H <= 64 * 1024:
-                return 4
-            elif H <= 128 * 1024:
-                return 8
-            else:
-                return 16
-        else:
-            if H <= 32 * 1024:
-                return 1
-            elif H <= 64 * 1024:
-                return 2
-            elif H <= 128 * 1024:
-                return 4
-            elif H <= 256 * 1024:
-                return 8
-            else:
-                return 16
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        max_smem_bytes = props.shared_memory_per_block_optin
+        elem_size = dtype.width // 8
+
+        for cluster_n in [1, 2, 4, 8, 16]:
+            if H % cluster_n != 0:
+                continue
+            smem_needed = AddRMSNormFP4QuantKernel._estimate_smem_bytes(
+                H, cluster_n, elem_size
+            )
+            if smem_needed <= max_smem_bytes:
+                return cluster_n
+
+        return 16
 
     @staticmethod
     def _compute_threads_per_row(H_per_cta: int) -> int:
@@ -928,6 +925,34 @@ class AddRMSNormFP4QuantKernel:
     def _compute_num_threads(H_per_cta: int) -> int:
         """Compute total threads per block."""
         return 128 if H_per_cta <= 16384 else 256
+
+    @staticmethod
+    def _estimate_smem_bytes(H: int, cluster_n: int, elem_size: int) -> int:
+        """Estimate shared memory bytes needed for given configuration.
+
+        This is used to dynamically determine cluster_n based on device
+        shared memory limits.
+        """
+        H_per_cta = H // cluster_n
+        threads_per_row = AddRMSNormFP4QuantKernel._compute_threads_per_row(H_per_cta)
+        num_threads = AddRMSNormFP4QuantKernel._compute_num_threads(H_per_cta)
+        rows_per_block = num_threads // threads_per_row
+        warps_per_row = max(threads_per_row // 32, 1)
+
+        vec_size = COPY_BITS // 8 // elem_size
+        num_vec_blocks = max(
+            1, (H_per_cta // vec_size + threads_per_row - 1) // threads_per_row
+        )
+        cols_per_tile = vec_size * num_vec_blocks * threads_per_row
+
+        tile_bytes = rows_per_block * cols_per_tile * elem_size
+
+        if cluster_n == 1:
+            # 4 tiles: sX, sR, sW, sH + reduction buffer
+            return 4 * tile_bytes + rows_per_block * warps_per_row * 4
+        else:
+            # 2 tiles: sX, sR + larger reduction buffer + mbarrier
+            return 2 * tile_bytes + rows_per_block * warps_per_row * cluster_n * 4 + 8
 
     @staticmethod
     def _make_tv_layout(

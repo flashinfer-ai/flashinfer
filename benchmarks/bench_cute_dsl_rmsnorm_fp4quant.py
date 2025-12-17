@@ -15,8 +15,7 @@ limitations under the License.
 
 Benchmark: Fused RMSNorm + FP4 Quantization using CuTe-DSL Backend
 
-Compares the CuTe-DSL backend against the cuDNN backend for fused
-RMSNorm + FP4 quantization.
+Compares the CuTe-DSL fused kernel against separate RMSNorm + FP4 quantization.
 
 Usage:
     python bench_cute_dsl_rmsnorm_fp4quant.py
@@ -24,12 +23,11 @@ Usage:
 Requirements:
     - Blackwell GPU (SM100+)
     - CuTe-DSL installed
-    - cuDNN >= 9.18.0 (for comparison)
 """
 
-import json
 import numpy as np
 import torch
+from scipy.stats import gmean
 from flashinfer.testing.utils import bench_gpu_time
 
 
@@ -122,7 +120,7 @@ def bench_cute_dsl(batch_size, hidden_size, dtype, block_size=16):
             block_size=block_size,
             scale_format=scale_format,
         ),
-        l2_flush=True,
+        cold_l2_cache=True,
         enable_cupti=True,
         use_cuda_graph=False,
         dry_run_iters=10,
@@ -154,7 +152,7 @@ def bench_separate_flashinfer(batch_size, hidden_size, dtype, block_size=16):
     # Benchmark rmsnorm alone
     times_rmsnorm = bench_gpu_time(
         lambda: rmsnorm(x, weight, eps=eps, out=y_normed),
-        l2_flush=True,
+        cold_l2_cache=True,
         enable_cupti=True,
         use_cuda_graph=False,
         dry_run_iters=10,
@@ -174,7 +172,7 @@ def bench_separate_flashinfer(batch_size, hidden_size, dtype, block_size=16):
             sf_use_ue8m0=(block_size == 32),
             is_sf_swizzled_layout=False,
         ),
-        l2_flush=True,
+        cold_l2_cache=True,
         enable_cupti=True,
         use_cuda_graph=False,
         dry_run_iters=10,
@@ -183,46 +181,6 @@ def bench_separate_flashinfer(batch_size, hidden_size, dtype, block_size=16):
     t_fp4 = np.median(times_fp4)
 
     return t_rmsnorm, t_fp4, t_rmsnorm + t_fp4
-
-
-def bench_cudnn(batch_size, hidden_size, dtype, block_size=16):
-    """Benchmark cuDNN backend."""
-    from flashinfer.norm import rmsnorm_fp4quant, CUDNN_AVAILABLE
-
-    if not CUDNN_AVAILABLE:
-        return None
-
-    try:
-        import cudnn
-
-        if cudnn.backend_version() < 91800:
-            return None
-    except Exception:
-        return None
-
-    eps = 1e-6
-
-    x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
-    weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
-    y_fp4 = torch.empty(batch_size, hidden_size // 2, device="cuda", dtype=torch.uint8)
-    block_scale = torch.empty(
-        batch_size, hidden_size // block_size, device="cuda", dtype=torch.float8_e4m3fn
-    )
-
-    # Benchmark with bench_gpu_time
-    times = bench_gpu_time(
-        lambda: rmsnorm_fp4quant(
-            x, weight, y_fp4, block_scale, eps=eps, block_size=block_size
-        ),
-        l2_flush=True,
-        enable_cupti=True,
-        use_cuda_graph=False,
-        dry_run_iters=10,
-        repeat_iters=100,
-    )
-
-    # Return median time
-    return np.median(times)
 
 
 def sanity_check_outputs(dtype=torch.float16, block_size=16):
@@ -360,9 +318,8 @@ def run_benchmark():
     header = (
         f"{'Batch':<8} {'Hidden':<8} "
         f"{'CuTe-DSL (µs)':<14} {'BW (GB/s)':<10} "
-        f"{'cuDNN (µs)':<11} "
         f"{'RMSNorm (µs)':<13} {'FP4Q (µs)':<11} {'Separate (µs)':<14} "
-        f"{'vs cuDNN':<10} {'vs Separate':<12}"
+        f"{'vs Separate':<12}"
     )
     print(header)
     print("-" * len(header))
@@ -380,26 +337,6 @@ def run_benchmark():
         except Exception as e:
             print(f"{batch_size:<8} {hidden_size:<8} ERROR: {e}")
             continue
-
-        # cuDNN timing
-        try:
-            t_cudnn = bench_cudnn(batch_size, hidden_size, dtype, block_size)
-            if t_cudnn is not None:
-                t_cudnn_us = t_cudnn * 1e3  # ms to µs
-                cudnn_str = f"{t_cudnn_us:.1f}"
-                # vs cuDNN: relative performance (>1 means CuTe-DSL is faster)
-                vs_cudnn = t_cudnn / t_cute if t_cute > 0 else 0
-                vs_cudnn_str = f"{vs_cudnn:.2f}x"
-            else:
-                t_cudnn_us = None
-                cudnn_str = "N/A"
-                vs_cudnn = None
-                vs_cudnn_str = "N/A"
-        except Exception:
-            t_cudnn_us = None
-            cudnn_str = "N/A"
-            vs_cudnn = None
-            vs_cudnn_str = "N/A"
 
         # Separate FlashInfer timing
         try:
@@ -427,9 +364,8 @@ def run_benchmark():
         print(
             f"{batch_size:<8} {hidden_size:<8} "
             f"{t_cute_us:<14.1f} {bw_cute:<10.1f} "
-            f"{cudnn_str:<11} "
             f"{rmsnorm_str:<13} {fp4_str:<11} {separate_str:<14} "
-            f"{vs_cudnn_str:<10} {speedup_sep_str:<12}"
+            f"{speedup_sep_str:<12}"
         )
 
         result = {
@@ -437,8 +373,6 @@ def run_benchmark():
             "hidden_size": hidden_size,
             "cute_dsl_us": t_cute_us,
             "cute_dsl_bw_gb_s": bw_cute,
-            "cudnn_us": t_cudnn_us,
-            "vs_cudnn": vs_cudnn,
             "rmsnorm_us": t_rmsnorm_us,
             "fp4_quant_us": t_fp4_us,
             "separate_us": t_separate_us,
@@ -448,17 +382,21 @@ def run_benchmark():
 
     print()
     print("=" * 80)
+
+    # Calculate and print geomean speedup
+    speedups = [
+        r["speedup_vs_separate"]
+        for r in results
+        if r["speedup_vs_separate"] is not None
+    ]
+
+    if speedups:
+        geomean_speedup = gmean(speedups)
+        print(f"Geomean speedup vs Separate (2 kernels): {geomean_speedup:.2f}x")
+
+    print("=" * 80)
     print("Benchmark Complete")
     print("=" * 80)
-
-    # Output JSON summary
-    summary = {
-        "gpu_cc": cc,
-        "dtype": str(dtype),
-        "block_size": block_size,
-        "results": results,
-    }
-    print(f"MAIN_OUTPUT={json.dumps(summary)}")
 
 
 if __name__ == "__main__":

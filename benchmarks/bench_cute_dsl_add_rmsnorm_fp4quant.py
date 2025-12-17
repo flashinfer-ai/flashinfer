@@ -22,9 +22,9 @@ Usage:
     python bench_cute_dsl_add_rmsnorm_fp4quant.py
 """
 
-import json
 import numpy as np
 import torch
+from scipy.stats import gmean
 from flashinfer.testing.utils import bench_gpu_time
 
 
@@ -109,7 +109,7 @@ def bench_fused_cute_dsl(batch_size, hidden_size, dtype, block_size=16):
             block_size=block_size,
             scale_format=scale_format,
         ),
-        l2_flush=True,
+        cold_l2_cache=True,
         enable_cupti=True,
         use_cuda_graph=False,
         dry_run_iters=10,
@@ -143,7 +143,7 @@ def bench_fully_separate(batch_size, hidden_size, dtype, block_size=16):
     # Benchmark torch.add alone
     times_add = bench_gpu_time(
         lambda: torch.add(x, r, out=h),
-        l2_flush=True,
+        cold_l2_cache=True,
         enable_cupti=True,
         use_cuda_graph=False,
         dry_run_iters=10,
@@ -157,7 +157,7 @@ def bench_fully_separate(batch_size, hidden_size, dtype, block_size=16):
     # Benchmark rmsnorm alone
     times_rmsnorm = bench_gpu_time(
         lambda: rmsnorm(h, weight, eps=eps, out=y_normed),
-        l2_flush=True,
+        cold_l2_cache=True,
         enable_cupti=True,
         use_cuda_graph=False,
         dry_run_iters=10,
@@ -177,7 +177,7 @@ def bench_fully_separate(batch_size, hidden_size, dtype, block_size=16):
             sf_use_ue8m0=(block_size == 32),
             is_sf_swizzled_layout=False,
         ),
-        l2_flush=True,
+        cold_l2_cache=True,
         enable_cupti=True,
         use_cuda_graph=False,
         dry_run_iters=10,
@@ -222,7 +222,7 @@ def bench_partial_separate(batch_size, hidden_size, dtype, block_size=16):
     # Benchmark torch.add alone
     times_add = bench_gpu_time(
         lambda: torch.add(x, r, out=h),
-        l2_flush=True,
+        cold_l2_cache=True,
         enable_cupti=True,
         use_cuda_graph=False,
         dry_run_iters=10,
@@ -244,7 +244,7 @@ def bench_partial_separate(batch_size, hidden_size, dtype, block_size=16):
             block_size=block_size,
             scale_format=scale_format,
         ),
-        l2_flush=True,
+        cold_l2_cache=True,
         enable_cupti=True,
         use_cuda_graph=False,
         dry_run_iters=10,
@@ -491,17 +491,29 @@ def run_benchmark():
 
     print()
     print("=" * 120)
+
+    # Calculate and print geomean speedups
+    speedups_full = [
+        r["speedup_vs_fully_separate"]
+        for r in results
+        if r["speedup_vs_fully_separate"] is not None
+    ]
+    speedups_part = [
+        r["speedup_vs_partial_separate"]
+        for r in results
+        if r["speedup_vs_partial_separate"] is not None
+    ]
+
+    if speedups_full:
+        geomean_full = gmean(speedups_full)
+        print(f"Geomean speedup vs Fully Separate (3 kernels):   {geomean_full:.2f}x")
+    if speedups_part:
+        geomean_part = gmean(speedups_part)
+        print(f"Geomean speedup vs Partial Separate (2 kernels): {geomean_part:.2f}x")
+
+    print("=" * 120)
     print("Benchmark Complete")
     print("=" * 120)
-
-    # Output JSON summary
-    summary = {
-        "gpu_cc": cc,
-        "dtype": str(dtype),
-        "block_size": block_size,
-        "results": results,
-    }
-    print(f"MAIN_OUTPUT={json.dumps(summary)}")
 
 
 if __name__ == "__main__":
