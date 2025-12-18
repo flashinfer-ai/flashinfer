@@ -505,7 +505,7 @@ When working with FlashInfer's dependencies and tools, refer to these official d
 
 - **CuTe (CUTE DSL)**: CUTLASS's Cute Layout and Tensor DSL
   - Documentation: <https://docs.nvidia.com/cutlass/media/docs/pythonDSL/cute_dsl.html>
-  - **Tip**: Add `.md` to get markdown format: <https://docs.nvidia.com/cutlass/media/docs/pythonDSL/cute_dsl.html.md>
+  - **Tip**: Add `.md` to get Markdown format: <https://docs.nvidia.com/cutlass/media/docs/pythonDSL/cute_dsl.html.md>
   - Tutorial: <https://github.com/NVIDIA/cutlass/tree/main/examples/python/CuTeDSL>
 
 - **PTX ISA (Parallel Thread Execution)**: NVIDIA's PTX instruction set documentation
