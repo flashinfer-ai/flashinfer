@@ -41,14 +41,20 @@ def skip_checks(
     num_tokens,
     hidden_size,
     intermediate_size,
+    zero_hidden_states=False,
 ):
     """Common skip logic for all tests."""
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] not in [10]:
         pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
 
-    # Check if moe_impl is FP4Moe by class name to avoid circular imports
+    # Check moe_impl class by name to avoid circular imports
     is_fp4_moe = type(moe_impl).__name__ == "FP4Moe"
+    is_fp8_block_scale_moe = type(moe_impl).__name__ == "FP8BlockScaleMoe"
+
+    # Skip checking zero input for FP8 Block Scale MoE
+    if zero_hidden_states and not is_fp8_block_scale_moe:
+        pytest.skip("Skipping zero hidden states tests for non-FP8 Block Scale MoE.")
 
     # Skip incompatible combinations
     if gated_act_type == GatedActType.GeGlu and (
