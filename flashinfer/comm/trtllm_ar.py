@@ -526,8 +526,6 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     - max_token_num: the maximum number of tokens in a sequence.
     - hidden_dim: the dimension of the hidden states.
     - use_fp32_lamport: if True, we will use fp32 datatype in allreduce fusion.
-    - comm_backend: the communication backend to use.
-    - create_metadata: if True, return metadata dict as third element (default: False).
     - group: the process group to use.
     - create_metadata: if True, return metadata dict as third element (default: False).
     - comm_backend: the communication backend to use.

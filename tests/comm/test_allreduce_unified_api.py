@@ -202,6 +202,7 @@ def run_allreduce_test(
         print(f"Rank {rank} using GPU {torch.cuda.current_device()}")
 
     eps = 1e-5
+    torch.manual_seed(0)
 
     workspace = None
 

@@ -192,14 +192,9 @@ def _trtllm_workspace_check(
     Check if trtllm backend CAN be used for workspace creation.
 
     Hard requirements:
-    - Single-node topology (multi-node not supported)
-
+    - Up to 16 ranks supported.
     """
-    # trtllm is limited to 16 ranks
-    if world_size > 16:
-        return False
-
-    return True
+    return world_size <= 16
 
 
 def _mnnvl_workspace_check(
@@ -316,7 +311,7 @@ def create_allreduce_fusion_workspace(
         comm_backend: Communication backend to use.
         force_oneshot_support: Allocate workspace for oneshot strategy vs twoshot
                     True: Allocate workspace for oneshot strategy up to the largest problem size requested
-                    None/False: Allocate workspace for twoshot strategy for all problem sizes, and for oneshot strategy up to the heuristic threshold.
+                    False: Allocate workspace for twoshot strategy for all problem sizes, and for oneshot strategy up to the heuristic threshold.
                     Note that only the workspace for MNNVL backend needs to be initialized with the correct strategy.
                     The trtllm backend will be sufficient for both strategies.
 
