@@ -1787,7 +1787,7 @@ def _get_compiled_kernel(
 
 
 @flashinfer_api
-def rmsnorm_fp4quant_cute_dsl(
+def rmsnorm_fp4quant(
     input: torch.Tensor,
     weight: torch.Tensor,
     y_fp4: torch.Tensor,
@@ -1898,5 +1898,5 @@ def rmsnorm_fp4quant_cute_dsl(
 __all__ = [
     "RMSNormFP4QuantKernel",
     "get_sm_version",
-    "rmsnorm_fp4quant_cute_dsl",
+    "rmsnorm_fp4quant",
 ]

@@ -86,7 +86,7 @@ def compute_bandwidth_gb_s(
 
 def bench_cute_dsl(batch_size, hidden_size, dtype, block_size=16):
     """Benchmark CuTe-DSL backend."""
-    from flashinfer.cute_dsl.rmsnorm_fp4quant import rmsnorm_fp4quant_cute_dsl
+    from flashinfer.cute_dsl.rmsnorm_fp4quant import rmsnorm_fp4quant
 
     eps = 1e-6
 
@@ -111,7 +111,7 @@ def bench_cute_dsl(batch_size, hidden_size, dtype, block_size=16):
 
     # Benchmark with bench_gpu_time
     times = bench_gpu_time(
-        lambda: rmsnorm_fp4quant_cute_dsl(
+        lambda: rmsnorm_fp4quant(
             x,
             weight,
             y_fp4,
@@ -185,7 +185,7 @@ def bench_separate_flashinfer(batch_size, hidden_size, dtype, block_size=16):
 
 def sanity_check_outputs(dtype=torch.float16, block_size=16):
     """Verify CuTe-DSL output matches separate RMSNorm + fp4_quantize operations."""
-    from flashinfer.cute_dsl.rmsnorm_fp4quant import rmsnorm_fp4quant_cute_dsl
+    from flashinfer.cute_dsl.rmsnorm_fp4quant import rmsnorm_fp4quant
     from flashinfer.norm import rmsnorm
     from flashinfer.fp4_quantization import fp4_quantize
 
@@ -222,7 +222,7 @@ def sanity_check_outputs(dtype=torch.float16, block_size=16):
             )
             scale_format = "e4m3"
 
-        rmsnorm_fp4quant_cute_dsl(
+        rmsnorm_fp4quant(
             x,
             weight,
             y_fp4_cute,

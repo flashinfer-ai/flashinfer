@@ -290,3 +290,13 @@ def _layernorm_fake(
 ) -> torch.Tensor:
     b, k = input.shape
     return input.new_empty([b, k])
+
+
+# CuTe-DSL fused RMSNorm + FP4 Quantization kernels
+# These require CuTe-DSL to be available and SM100+ (Blackwell) GPUs
+try:
+    from .cute_dsl import rmsnorm_fp4quant, add_rmsnorm_fp4quant
+except ImportError:
+    # CuTe-DSL not available
+    rmsnorm_fp4quant = None  # type: ignore[misc,assignment]
+    add_rmsnorm_fp4quant = None  # type: ignore[misc,assignment]

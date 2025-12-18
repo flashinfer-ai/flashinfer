@@ -75,7 +75,7 @@ def compute_bandwidth_gb_s(
 
 def bench_fused_cute_dsl(batch_size, hidden_size, dtype, block_size=16):
     """Benchmark fused CuTe-DSL kernel."""
-    from flashinfer.cute_dsl.add_rmsnorm_fp4quant import add_rmsnorm_fp4quant_cute_dsl
+    from flashinfer.cute_dsl.add_rmsnorm_fp4quant import add_rmsnorm_fp4quant
 
     eps = 1e-6
 
@@ -99,7 +99,7 @@ def bench_fused_cute_dsl(batch_size, hidden_size, dtype, block_size=16):
         scale_format = "e4m3"
 
     times = bench_gpu_time(
-        lambda: add_rmsnorm_fp4quant_cute_dsl(
+        lambda: add_rmsnorm_fp4quant(
             x,
             r,
             weight,
@@ -257,7 +257,7 @@ def bench_partial_separate(batch_size, hidden_size, dtype, block_size=16):
 
 def sanity_check_outputs(dtype=torch.float16, block_size=16):
     """Verify CuTe-DSL output matches separate torch.add + RMSNorm + fp4_quantize."""
-    from flashinfer.cute_dsl.add_rmsnorm_fp4quant import add_rmsnorm_fp4quant_cute_dsl
+    from flashinfer.cute_dsl.add_rmsnorm_fp4quant import add_rmsnorm_fp4quant
     from flashinfer.norm import rmsnorm
     from flashinfer.fp4_quantization import fp4_quantize
 
@@ -295,7 +295,7 @@ def sanity_check_outputs(dtype=torch.float16, block_size=16):
             )
             scale_format = "e4m3"
 
-        add_rmsnorm_fp4quant_cute_dsl(
+        add_rmsnorm_fp4quant(
             x,
             r,
             weight,

@@ -27,12 +27,12 @@ if is_cute_dsl_available():
         Sm100BlockScaledPersistentDenseGemmKernel,
     )
     from .rmsnorm_fp4quant import (
-        rmsnorm_fp4quant_cute_dsl,
+        rmsnorm_fp4quant,
         RMSNormFP4QuantKernel,
         get_sm_version,
     )
     from .add_rmsnorm_fp4quant import (
-        add_rmsnorm_fp4quant_cute_dsl,
+        add_rmsnorm_fp4quant,
         AddRMSNormFP4QuantKernel,
     )
 
@@ -50,10 +50,10 @@ if is_cute_dsl_available():
         "grouped_gemm_nt_masked",
         "Sm100BlockScaledPersistentDenseGemmKernel",
         # RMSNorm + FP4 Quantization
-        "rmsnorm_fp4quant_cute_dsl",
+        "rmsnorm_fp4quant",
         "RMSNormFP4QuantKernel",
         "get_sm_version",
         # Add + RMSNorm + FP4 Quantization
-        "add_rmsnorm_fp4quant_cute_dsl",
+        "add_rmsnorm_fp4quant",
         "AddRMSNormFP4QuantKernel",
     ]

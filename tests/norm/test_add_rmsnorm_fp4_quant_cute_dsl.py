@@ -102,7 +102,7 @@ class TestAddRMSNormFP4QuantCuteDSL:
     def test_add_rmsnorm_fp4quant_2d(self, batch_size, hidden_size, dtype, eps):
         """Test fused Add + RMSNorm + FP4 quantization with 2D input."""
         from flashinfer.cute_dsl.add_rmsnorm_fp4quant import (
-            add_rmsnorm_fp4quant_cute_dsl,
+            add_rmsnorm_fp4quant,
         )
 
         torch.manual_seed(42)
@@ -122,7 +122,7 @@ class TestAddRMSNormFP4QuantCuteDSL:
             dtype=torch.float8_e4m3fn,
         )
 
-        add_rmsnorm_fp4quant_cute_dsl(
+        add_rmsnorm_fp4quant(
             x, r, weight, y_fp4, block_scale, eps=eps, block_size=block_size
         )
 
@@ -153,7 +153,7 @@ class TestAddRMSNormFP4QuantCuteDSL:
     def test_add_rmsnorm_fp4quant_3d(self, batch_size, seq_len, hidden_size, dtype):
         """Test fused Add + RMSNorm + FP4 quantization with 3D input."""
         from flashinfer.cute_dsl.add_rmsnorm_fp4quant import (
-            add_rmsnorm_fp4quant_cute_dsl,
+            add_rmsnorm_fp4quant,
         )
 
         torch.manual_seed(42)
@@ -175,7 +175,7 @@ class TestAddRMSNormFP4QuantCuteDSL:
             dtype=torch.float8_e4m3fn,
         )
 
-        add_rmsnorm_fp4quant_cute_dsl(
+        add_rmsnorm_fp4quant(
             x, r, weight, y_fp4, block_scale, eps=eps, block_size=block_size
         )
 
@@ -209,7 +209,7 @@ class TestAddRMSNormFP4QuantCuteDSL:
     def test_large_batch(self, batch_size, hidden_size, dtype):
         """Test with large batch sizes."""
         from flashinfer.cute_dsl.add_rmsnorm_fp4quant import (
-            add_rmsnorm_fp4quant_cute_dsl,
+            add_rmsnorm_fp4quant,
         )
 
         torch.manual_seed(42)
@@ -230,7 +230,7 @@ class TestAddRMSNormFP4QuantCuteDSL:
             dtype=torch.float8_e4m3fn,
         )
 
-        add_rmsnorm_fp4quant_cute_dsl(
+        add_rmsnorm_fp4quant(
             x, r, weight, y_fp4, block_scale, eps=eps, block_size=block_size
         )
 
@@ -258,7 +258,7 @@ class TestAddRMSNormFP4QuantMXFP4:
     def test_mxfp4_basic(self, batch_size, hidden_size, dtype):
         """Test MXFP4 format (block_size=32, UE8M0 scales)."""
         from flashinfer.cute_dsl.add_rmsnorm_fp4quant import (
-            add_rmsnorm_fp4quant_cute_dsl,
+            add_rmsnorm_fp4quant,
         )
 
         torch.manual_seed(42)
@@ -277,7 +277,7 @@ class TestAddRMSNormFP4QuantMXFP4:
             batch_size, hidden_size // block_size, device="cuda", dtype=torch.uint8
         )
 
-        add_rmsnorm_fp4quant_cute_dsl(
+        add_rmsnorm_fp4quant(
             x,
             r,
             weight,
@@ -325,7 +325,7 @@ class TestVsSeparateFlashInfer:
 
         """
         from flashinfer.cute_dsl.add_rmsnorm_fp4quant import (
-            add_rmsnorm_fp4quant_cute_dsl,
+            add_rmsnorm_fp4quant,
         )
         from flashinfer.norm import rmsnorm
 
@@ -348,7 +348,7 @@ class TestVsSeparateFlashInfer:
             dtype=torch.float8_e4m3fn,
         )
 
-        add_rmsnorm_fp4quant_cute_dsl(
+        add_rmsnorm_fp4quant(
             x, r, weight, y_fp4_fused, block_scale_fused, eps=eps, block_size=block_size
         )
 
@@ -390,7 +390,7 @@ class TestLargeHiddenSize:
     def test_large_hidden_nvfp4(self, batch_size, hidden_size, dtype):
         """Test NVFP4 format with large hidden sizes (cluster sync path)."""
         from flashinfer.cute_dsl.add_rmsnorm_fp4quant import (
-            add_rmsnorm_fp4quant_cute_dsl,
+            add_rmsnorm_fp4quant,
         )
 
         torch.manual_seed(42)
@@ -412,7 +412,7 @@ class TestLargeHiddenSize:
         )
 
         # Run kernel
-        add_rmsnorm_fp4quant_cute_dsl(
+        add_rmsnorm_fp4quant(
             x, r, weight, y_fp4, block_scale, eps=eps, block_size=block_size
         )
 
@@ -443,7 +443,7 @@ class TestLargeHiddenSize:
     def test_large_hidden_mxfp4(self, batch_size, hidden_size, dtype):
         """Test MXFP4 format with large hidden sizes (cluster sync path)."""
         from flashinfer.cute_dsl.add_rmsnorm_fp4quant import (
-            add_rmsnorm_fp4quant_cute_dsl,
+            add_rmsnorm_fp4quant,
         )
 
         torch.manual_seed(42)
@@ -462,7 +462,7 @@ class TestLargeHiddenSize:
         )
 
         # Run kernel
-        add_rmsnorm_fp4quant_cute_dsl(
+        add_rmsnorm_fp4quant(
             x,
             r,
             weight,
@@ -544,7 +544,7 @@ class TestSwizzledScaleFactors:
         Test that swizzled output, when unswizzled, matches the non-swizzled output.
         Uses NVFP4 format (block_size=16, E4M3 scales).
         """
-        from flashinfer.cute_dsl import add_rmsnorm_fp4quant_cute_dsl
+        from flashinfer.cute_dsl import add_rmsnorm_fp4quant
 
         block_size = 16
         torch.manual_seed(42)
@@ -577,7 +577,7 @@ class TestSwizzledScaleFactors:
         )
 
         # Run kernels
-        add_rmsnorm_fp4quant_cute_dsl(
+        add_rmsnorm_fp4quant(
             x,
             r,
             weight,
@@ -586,7 +586,7 @@ class TestSwizzledScaleFactors:
             block_size=block_size,
             is_sf_swizzled_layout=False,
         )
-        add_rmsnorm_fp4quant_cute_dsl(
+        add_rmsnorm_fp4quant(
             x,
             r,
             weight,
@@ -617,7 +617,7 @@ class TestSwizzledScaleFactors:
         Test that swizzled output, when unswizzled, matches the non-swizzled output.
         Uses MXFP4 format (block_size=32, UE8M0 scales).
         """
-        from flashinfer.cute_dsl import add_rmsnorm_fp4quant_cute_dsl
+        from flashinfer.cute_dsl import add_rmsnorm_fp4quant
 
         block_size = 32
         torch.manual_seed(42)
@@ -647,7 +647,7 @@ class TestSwizzledScaleFactors:
         )
 
         # Run kernels
-        add_rmsnorm_fp4quant_cute_dsl(
+        add_rmsnorm_fp4quant(
             x,
             r,
             weight,
@@ -656,7 +656,7 @@ class TestSwizzledScaleFactors:
             block_size=block_size,
             is_sf_swizzled_layout=False,
         )
-        add_rmsnorm_fp4quant_cute_dsl(
+        add_rmsnorm_fp4quant(
             x,
             r,
             weight,
