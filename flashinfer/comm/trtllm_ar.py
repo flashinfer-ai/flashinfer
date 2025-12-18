@@ -543,6 +543,9 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
       use_fp32_lamport, buffer_size, flag_size, lamport_comm_size, lamport_buffer_size
       and mem_handles is a list of SymmDeviceMemory objects.
 
+    Note: The optional parameters make the API clunky at this time. This will be refactored in the future, at the cost of backward compatibility, where the default behavior will be
+    create_metadata=True and use_symm_dev_mem=True.
+
     Note:
     We would init 3 IPC buffers for trtllm_custom_all_reduce_fusion.
     They are sized as follows:

@@ -284,7 +284,7 @@ def create_allreduce_fusion_workspace(
     dtype: torch.dtype = None,
     gpus_per_node: int = None,
     comm_backend: Optional[CommBackend] = None,
-    use_oneshot: bool = False,
+    force_oneshot_support: bool = False,
 ) -> AllReduceFusionWorkspace:
     """
     Create workspace for AllReduce fusion operations.
@@ -314,10 +314,9 @@ def create_allreduce_fusion_workspace(
         dtype: Data type for communication tensors
         gpus_per_node: Number of GPUs per node (for multi-node topology).
         comm_backend: Communication backend to use.
-        use_oneshot: Allocate workspace for oneshot strategy vs twoshot
-                    True: Allocate workspace for oneshot strategy (larger workspace size)
-                    False: Allocate workspace for twoshot strategy
-                    If None, uses internal heuristics to select the strategy.
+        force_oneshot_support: Allocate workspace for oneshot strategy vs twoshot
+                    True: Allocate workspace for oneshot strategy up to the largest problem size requested
+                    None/False: Allocate workspace for twoshot strategy for all problem sizes, and for oneshot strategy up to the heuristic threshold.
                     Note that only the workspace for MNNVL backend needs to be initialized with the correct strategy.
                     The trtllm backend will be sufficient for both strategies.
 
@@ -418,7 +417,7 @@ def create_allreduce_fusion_workspace(
             tp_size=world_size,
         )
         buffer_size_in_bytes = None
-        if use_oneshot:
+        if force_oneshot_support:
             buffer_size_in_bytes = (
                 MNNVLAllReduceFusionWorkspace.get_required_buffer_size_bytes(
                     world_size,
