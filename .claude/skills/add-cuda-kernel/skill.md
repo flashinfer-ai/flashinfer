@@ -227,50 +227,150 @@ def gen_scale_module(dtype_in, dtype_out):
 
 ### (Optional) Specifying Supported CUDA Architectures
 
-If your kernel only works on specific GPU architectures (e.g., Hopper SM90+, Blackwell SM100+), specify supported architectures:
+FlashInfer uses `CompilationContext` to manage CUDA architecture targets. This is critical because some kernels only work on specific GPU architectures (e.g., Hopper SM90, Blackwell SM100).
+
+#### How CompilationContext Works
+
+**Automatic Detection** (default):
+```python
+from flashinfer.compilation_context import CompilationContext
+
+ctx = CompilationContext()
+# Automatically detects all GPUs in the system
+# For SM90+, adds 'a' suffix (e.g., 9.0a for Hopper)
+# Result: ctx.TARGET_CUDA_ARCHS = {(9, '0a'), (10, '0a'), ...}
+```
+
+**Manual Override** (via environment variable):
+```bash
+export FLASHINFER_CUDA_ARCH_LIST="8.0 9.0a 10.0a"
+# Now only these architectures will be compiled
+```
+
+#### Specifying Architectures in Your JIT Module
+
+When creating a JIT module, specify which major SM versions are supported:
 
 ```python
 from flashinfer.jit.core import gen_jit_spec
 from flashinfer.jit import current_compilation_context
 
-def gen_scale_module(dtype_in, dtype_out):
-    uri = get_scale_uri(dtype_in, dtype_out)
+def gen_my_hopper_only_module():
+    """Example: Kernel only works on SM90+ (Hopper and newer)"""
+    uri = get_my_uri(...)
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
     # ... copy sources ...
 
-    # For universal kernels (works on all GPUs)
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=None  # All architectures
+        supported_major_versions=[9, 10, 11, 12]  # SM90, SM100, SM110, SM120
     )
-
-    # For Hopper+ only kernels (SM90, SM100, SM110, SM120)
-    # nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-    #     supported_major_versions=[9, 10, 11, 12]
-    # )
-
-    # For Blackwell-only kernels (SM100, SM110)
-    # nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-    #     supported_major_versions=[10, 11]
-    # )
 
     return gen_jit_spec(
         name=uri,
         sources=sources,
-        extra_cuda_cflags=nvcc_flags,  # ← Add architecture flags
+        extra_cuda_cflags=nvcc_flags,
+    )
+
+def gen_my_blackwell_only_module():
+    """Example: Kernel only works on SM100 (Blackwell)"""
+    uri = get_my_uri(...)
+    gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
+    # ... copy sources ...
+
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[10]  # SM100 only
+    )
+
+    return gen_jit_spec(
+        name=uri,
+        sources=sources,
+        extra_cuda_cflags=nvcc_flags,
+    )
+
+def gen_my_universal_module():
+    """Example: Kernel works on all architectures"""
+    uri = get_my_uri(...)
+    gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
+    # ... copy sources ...
+
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=None  # All available architectures
+    )
+
+    return gen_jit_spec(
+        name=uri,
+        sources=sources,
+        extra_cuda_cflags=nvcc_flags,
     )
 ```
 
-**Common architecture specifications:**
-- `None`: Works on all GPUs (default)
-- `[9, 10, 11, 12]`: Hopper and newer (SM90+)
-- `[10, 11]`: Blackwell and newer (SM100+)
-- `[12]`: Specific architecture only (SM120)
+**What Happens:**
+- ✅ If user's GPU is SM90 and they call a Hopper-only module → Compiles and runs
+- ❌ If user's GPU is SM80 and they call a Hopper-only module → `RuntimeError: No supported CUDA architectures found for major versions [9, 10, 11, 12]`
 
-**What happens:**
-- ✅ If user's GPU is supported → Kernel compiles and runs
-- ❌ If user's GPU is not supported → `RuntimeError: No supported CUDA architectures found`
+#### Real Examples from FlashInfer
 
-**Testing tip:** Add architecture skip in tests (see Step 6 below).
+```python
+# MLA kernel: Blackwell and newer only
+def gen_mla_module() -> JitSpec:
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[10, 11]  # SM100, SM110
+    )
+    return gen_jit_spec(
+        name=uri,
+        sources=sources,
+        extra_cuda_cflags=nvcc_flags,
+    )
+
+# Blackwell FMHA: SM120 only
+def gen_fmhav2_blackwell_module(...):
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[12]  # SM120 only
+    )
+    return gen_jit_spec(
+        name=uri,
+        sources=sources,
+        extra_cuda_cflags=nvcc_flags,
+    )
+
+# Standard attention: Hopper and newer
+def gen_batch_prefill_module(...):
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[9, 10, 11, 12]  # SM90+
+    )
+    return gen_jit_spec(
+        name=uri,
+        sources=sources,
+        extra_cuda_cflags=nvcc_flags,
+    )
+```
+
+#### Common Architecture Specifications
+
+| Supported Versions | Architectures | Use Case |
+|-------------------|---------------|----------|
+| `None` | All available GPUs | Universal kernels (default) |
+| `[9, 10, 11, 12]` | SM90, SM100, SM110, SM120 | Hopper and newer |
+| `[10, 11]` | SM100, SM110 | Blackwell and newer |
+| `[12]` | SM120 | Specific architecture only |
+| `[8, 9, 10, 11, 12]` | SM80+ | Ampere and newer |
+
+#### Testing with Architecture Requirements
+
+When your kernel has architecture requirements, add skip checks in tests (see Step 6 below):
+
+```python
+import pytest
+import torch
+from flashinfer.utils import is_sm90a_supported
+
+def test_hopper_kernel():
+    if not is_sm90a_supported(torch.device("cuda")):
+        pytest.skip("SM90a is not supported on this GPU")
+
+    # Test code here
+    ...
+```
 
 ## Step 5: Create Python API in `flashinfer/`
 

@@ -94,99 +94,33 @@ pytest tests/attention/test_hopper.py::test_single_prefill
 
 ### Skipping Tests Based on CUDA Architecture
 
-Many FlashInfer features require specific GPU architectures. Use utility functions to skip tests on unsupported hardware:
+Use `flashinfer.utils` functions to skip tests on unsupported GPU architectures:
 
-#### Architecture Check Functions
+**Available check functions:**
+- `get_compute_capability(device)` - Returns `(major, minor)` tuple
+- `is_sm90a_supported()` - Hopper (requires CUDA 12.3+)
+- `is_sm100a_supported()` - Blackwell (requires CUDA 12.8+)
+- `is_sm110a_supported()`, `is_sm120a_supported()`, `is_sm121a_supported()`
 
-FlashInfer provides helper functions in `flashinfer.utils`:
-
+**Example:**
 ```python
-from flashinfer.utils import (
-    get_compute_capability,  # Returns (major, minor) tuple
-    is_sm90a_supported,      # Hopper (SM90a) - requires CUDA 12.3+
-    is_sm100a_supported,     # Blackwell (SM100a) - requires CUDA 12.8+
-    is_sm100f_supported,     # Blackwell (SM100f) - requires CUDA 12.9+
-    is_sm110a_supported,     # Next-gen (SM110a) - requires CUDA 13.0+
-    is_sm120a_supported,     # SM120a - requires CUDA 12.8+
-    is_sm121a_supported,     # SM121a - requires CUDA 12.9+
-)
-```
-
-#### Example: Skip Test on Unsupported Architecture
-
-```python
-import pytest
-import torch
 from flashinfer.utils import is_sm90a_supported
 
-@pytest.mark.parametrize("seq_len", [128, 512, 2048])
-@pytest.mark.parametrize("head_dim", [64, 128, 256])
-def test_hopper_attention(seq_len, head_dim):
-    # Skip if GPU doesn't support Hopper
+def test_hopper_attention():
     if not is_sm90a_supported(torch.device("cuda")):
-        pytest.skip("SM90a is not supported on this GPU")
-
-    # Test code here - only runs on Hopper+
-    ...
+        pytest.skip("Requires SM90a")
+    # Test code...
 ```
 
-#### Example: Skip Based on Compute Capability
+**Common requirements:**
 
-```python
-import pytest
-import torch
-from flashinfer.utils import get_compute_capability
+| Feature | Min SM | Check Function |
+|---------|--------|----------------|
+| FlashAttention-3 | SM90a | `is_sm90a_supported()` |
+| MLA Attention | SM100a | `is_sm100a_supported()` |
+| FP8 GEMM | SM89+ | `get_compute_capability()[0] >= 9` |
 
-def test_blackwell_feature():
-    device = torch.device("cuda")
-    major, minor = get_compute_capability(device)
-
-    # Skip if not Blackwell (SM100+)
-    if major < 10:
-        pytest.skip(f"Requires SM100+, found SM{major}{minor}")
-
-    # Test Blackwell-specific features
-    ...
-```
-
-#### Example: Skip with Custom Architecture Check
-
-```python
-import pytest
-import torch
-from flashinfer.utils import get_compute_capability
-
-@pytest.mark.parametrize("batch_size", [1, 4, 16])
-def test_fp8_gemm(batch_size):
-    device = torch.device("cuda")
-    major, _ = get_compute_capability(device)
-
-    # FP8 requires SM89+ (Ada, Hopper, Blackwell)
-    if major < 9:
-        pytest.skip("FP8 operations require SM89+")
-
-    # Test FP8 GEMM
-    ...
-```
-
-#### Common Architecture Requirements
-
-| Feature | Min SM | Check Function | Notes |
-|---------|--------|----------------|-------|
-| FlashAttention-3 (Hopper) | SM90a | `is_sm90a_supported()` | CUDA 12.3+ |
-| MLA Attention | SM100a | `is_sm100a_supported()` | CUDA 12.8+ |
-| Blackwell FMHA | SM100a/SM120 | `is_sm100a_supported()` or manual | CUDA 12.8+ |
-| FP8 GEMM | SM89+ | Manual `major >= 9` | Ada/Hopper/Blackwell |
-| Standard FlashAttention | SM80+ | Usually no skip needed | Most GPUs |
-
-#### Automatic Test Skipping (conftest.py)
-
-FlashInfer's `tests/conftest.py` automatically handles some skips:
-
-1. **Out of Memory**: Tests are automatically skipped on OOM
-2. **Missing JIT Cache**: When running with pre-compiled packages, missing modules trigger skip
-
-**Note**: If a module compilation fails due to unsupported architecture, the test will fail with `RuntimeError: No supported CUDA architectures found`. Always add explicit architecture checks in your test to skip gracefully.
+**Auto-skip:** `tests/conftest.py` automatically skips on OOM and missing JIT cache.
 
 ## Benchmarking
 
@@ -251,99 +185,14 @@ FlashInfer's JIT system has three layers:
 
 ### Compilation Context: Architecture-Specific Compilation
 
-FlashInfer uses `CompilationContext` to manage CUDA architecture targets. This is critical because some kernels only work on specific GPU architectures (e.g., Hopper SM90, Blackwell SM100).
+FlashInfer uses `CompilationContext` to manage CUDA architecture targets. Some kernels only work on specific GPU architectures (e.g., Hopper SM90, Blackwell SM100).
 
-#### How It Works
+**How it works:**
+- Auto-detects GPUs in system or reads `FLASHINFER_CUDA_ARCH_LIST` environment variable
+- JIT modules specify `supported_major_versions=[9, 10, 11, 12]` to limit compilation to specific SM versions
+- If GPU not supported → `RuntimeError: No supported CUDA architectures found`
 
-**Automatic Detection** (default):
-```python
-from flashinfer.compilation_context import CompilationContext
-
-ctx = CompilationContext()
-# Automatically detects all GPUs in the system
-# For SM90+, adds 'a' suffix (e.g., 9.0a for Hopper)
-# Result: ctx.TARGET_CUDA_ARCHS = {(9, '0a'), (10, '0a'), ...}
-```
-
-**Manual Override** (via environment variable):
-```bash
-export FLASHINFER_CUDA_ARCH_LIST="8.0 9.0a 10.0a"
-# Now only these architectures will be compiled
-```
-
-#### Specifying Supported Architectures in JIT Modules
-
-When creating a JIT module, specify which major SM versions are supported:
-
-```python
-from flashinfer.jit.core import gen_jit_spec
-from flashinfer.jit import current_compilation_context
-
-def gen_my_hopper_only_module():
-    # This kernel only works on SM90+ (Hopper and newer)
-    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[9, 10, 11, 12]  # SM90, SM100, SM110, SM120
-    )
-
-    return gen_jit_spec(
-        uri="my_hopper_kernel",
-        sources=[...],
-        extra_cuda_cflags=nvcc_flags,
-    )
-
-def gen_my_blackwell_only_module():
-    # This kernel only works on SM100 (Blackwell)
-    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[10]  # SM100 only
-    )
-
-    return gen_jit_spec(
-        uri="my_blackwell_kernel",
-        sources=[...],
-        extra_cuda_cflags=nvcc_flags,
-    )
-
-def gen_my_universal_module():
-    # This kernel works on all architectures
-    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=None  # All available architectures
-    )
-
-    return gen_jit_spec(
-        uri="my_universal_kernel",
-        sources=[...],
-        extra_cuda_cflags=nvcc_flags,
-    )
-```
-
-**What Happens:**
-- If your GPU is SM80 and you call a Hopper-only module → `RuntimeError: No supported CUDA architectures found for major versions [9, 10, 11, 12]`
-- If your GPU is SM90 and you call a Hopper-only module → ✅ Compiles and runs
-
-#### Real Examples from FlashInfer
-
-```python
-# MLA kernel: Hopper and Blackwell only
-def gen_mla_module() -> JitSpec:
-    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[10, 11]  # SM100, SM110
-    )
-    # ...
-
-# Blackwell FMHA: Blackwell only
-def gen_fmhav2_blackwell_module(...):
-    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[12]  # SM120 only
-    )
-    # ...
-
-# Standard attention: Most architectures
-def gen_batch_prefill_module(...):
-    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[9, 10, 11, 12]  # SM90+
-    )
-    # ...
-```
+→ **See [`.claude/skills/add-cuda-kernel/skill.md`](.claude/skills/add-cuda-kernel/skill.md) for usage examples**
 
 ### Layer 2: Code Generation
 
@@ -475,72 +324,22 @@ flashinfer/
 
 ### Module Caching
 
-Python wrappers use `@functools.cache` to avoid recompilation:
+FlashInfer uses two-level caching to avoid recompilation:
 
-```python
-@functools.cache
-def get_some_module(dtype_in, dtype_out, ...):
-    # Only compiles once per unique parameter combination
-    return gen_some_module(...).build_and_load()
-```
+1. **Python-level** (`@functools.cache`): In-memory cache of loaded modules
+2. **File-level** (`~/.cache/flashinfer/`): Compiled `.so` files on disk
 
-#### How Caching Works
+**Cache invalidation** (automatic):
+- Source file changes (SHA256 hash)
+- Compilation flags change
+- CUDA architecture change
+- FlashInfer version change
 
-FlashInfer maintains a two-level cache:
+URI computed as: `hash(operation_type + parameters + source_hashes + flags + cuda_arch)`
 
-1. **Python-level cache** (`@functools.cache`): Keeps loaded modules in memory for the current Python process
-2. **File-level cache** (`~/.cache/flashinfer/<version>/*/cached_ops/`): Stores compiled `.so` files on disk
-
-When you call a FlashInfer function:
-- First, check Python cache for already-loaded module
-- If not in memory, check disk cache for compiled `.so` file
-- If not on disk, generate code, compile with ninja, and cache the result
-
-#### Cache Invalidation
-
-The cache is automatically invalidated when:
-
-- **Source file content changes**: Detected by computing SHA256 hash of source files
-- **Compilation flags change**: Different `extra_cuda_cflags`, `extra_cflags`, or `extra_ldflags`
-- **CUDA architecture changes**: Different `FLASHINFER_CUDA_ARCH_LIST` value
-- **FlashInfer version changes**: Each version has its own cache directory
-
-The URI (unique resource identifier) for each module is computed from:
-```python
-uri = hash(operation_type + parameters + source_hashes + flags + cuda_arch)
-```
-
-#### Manual Cache Management
-
-Clear entire cache (useful after upgrading FlashInfer or when troubleshooting):
-```bash
-rm -rf ~/.cache/flashinfer/
-```
-
-Clear cache for specific version:
-```bash
-rm -rf ~/.cache/flashinfer/<version>/
-```
-
-Clear only compiled modules (keep generated sources):
-```bash
-rm -rf ~/.cache/flashinfer/<version>/*/cached_ops/
-```
-
-View cache size:
-```bash
-du -sh ~/.cache/flashinfer/
-```
-
-#### Cache Location
-
-Default cache location: `~/.cache/flashinfer/`
-
-Override with environment variable:
-```bash
-export FLASHINFER_WORKSPACE_BASE="/scratch/my_cache"
-# Cache will be at /scratch/my_cache/flashinfer/
-```
+**Cache management:**
+- Clear cache: `rm -rf ~/.cache/flashinfer/`
+- Override location: `export FLASHINFER_WORKSPACE_BASE="/scratch"`
 
 ### Dispatch Macros
 
