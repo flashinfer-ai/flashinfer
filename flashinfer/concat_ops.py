@@ -36,7 +36,7 @@ def concat_mla_k(
 ) -> None:
     r"""Concatenate k_nope and k_rope tensors for MLA attention.
 
-    
+
 
     This function efficiently concatenates:
       - k_nope: per-head nope values

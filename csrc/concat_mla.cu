@@ -85,10 +85,10 @@ void concat_mla_k(TensorView k, TensorView k_nope, TensorView k_rope) {
   const cudaStream_t stream = get_stream(k.device());
 
   bool success = DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(k.dtype(), c_type, [&] {
-    cudaError_t status =
-        ConcatMLAK<c_type>(static_cast<c_type*>(k.data_ptr()), static_cast<c_type*>(k_nope.data_ptr()),
-                           static_cast<c_type*>(k_rope.data_ptr()), num_tokens, k_stride_0,
-                           k_stride_1, k_nope_stride_0, k_nope_stride_1, k_rope_stride_0, stream);
+    cudaError_t status = ConcatMLAK<c_type>(
+        static_cast<c_type*>(k.data_ptr()), static_cast<c_type*>(k_nope.data_ptr()),
+        static_cast<c_type*>(k_rope.data_ptr()), num_tokens, k_stride_0, k_stride_1,
+        k_nope_stride_0, k_nope_stride_1, k_rope_stride_0, stream);
 
     TVM_FFI_ICHECK(status == cudaSuccess)
         << "ConcatMLAK failed with error: " << cudaGetErrorString(status);

@@ -82,14 +82,17 @@ __global__ void ConcatMLAKKernel(DType* __restrict__ k, const DType* __restrict_
 
   // Source pointer for k_nope (indexed by token and head)
   const int2* __restrict__ nope_src =
-      reinterpret_cast<const int2*>(k_nope + token_id * k_nope_stride_0 + head_row0 * k_nope_stride_1) + lane_id;
+      reinterpret_cast<const int2*>(k_nope + token_id * k_nope_stride_0 +
+                                    head_row0 * k_nope_stride_1) +
+      lane_id;
 
   // Destination pointers for output k (nope part and rope part)
   int2* __restrict__ nope_dst =
       reinterpret_cast<int2*>(k + token_id * k_stride_0 + head_row0 * k_stride_1) + lane_id;
 
-  int* __restrict__ rope_dst =
-      reinterpret_cast<int*>(k + token_id * k_stride_0 + head_row0 * k_stride_1 + QK_NOPE_HEAD_DIM) + lane_id;
+  int* __restrict__ rope_dst = reinterpret_cast<int*>(k + token_id * k_stride_0 +
+                                                      head_row0 * k_stride_1 + QK_NOPE_HEAD_DIM) +
+                               lane_id;
 
   // Stride calculations for vector types
   const int nope_src_stride_v = (k_nope_stride_1 >> 2);  // int2 covers 4 bf16
@@ -147,7 +150,8 @@ __global__ void ConcatMLAKKernel(DType* __restrict__ k, const DType* __restrict_
 template <typename DType>
 cudaError_t ConcatMLAK(DType* k, const DType* k_nope, const DType* k_rope, int num_tokens,
                        int64_t k_stride_0, int k_stride_1, int64_t k_nope_stride_0,
-                       int k_nope_stride_1, int64_t k_rope_stride_0, cudaStream_t stream = nullptr) {
+                       int k_nope_stride_1, int64_t k_rope_stride_0,
+                       cudaStream_t stream = nullptr) {
   if (num_tokens == 0) {
     return cudaSuccess;
   }
