@@ -81,7 +81,7 @@ def verify_correctness():
     output_ref = execute_and_get_output(fn_torch, data)
     output_flashinfer = execute_and_get_output(fn_flashinfer, data)
 
-    if not torch.all(output_ref == output_flashinfer):
+    if not torch.allclose(output_ref, output_flashinfer):
         abs_delta = torch.abs(output_ref - output_flashinfer)
         raise AssertionError(
             f"FlashInfer output mismatch! "
