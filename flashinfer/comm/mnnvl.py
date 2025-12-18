@@ -232,6 +232,86 @@ class MPIBackend(CommBackend):
         return MPIBackend()  # Returns new adapter
 
 
+class TorchDistBackend(CommBackend):
+    """Communication backend using torch.distributed"""
+
+    def __init__(self, group: Optional[Any] = None):
+        """
+        Initialize TorchDistBackend.
+
+        Args:
+            group: Optional process group. If None, uses the default process group.
+        """
+        import torch.distributed as dist
+
+        if not dist.is_initialized():
+            raise RuntimeError(
+                "torch.distributed is not initialized. "
+                "Please call torch.distributed.init_process_group() first."
+            )
+        self._group = group
+        self._dist = dist
+
+    def Get_rank(self) -> int:
+        return self._dist.get_rank(self._group)
+
+    def Get_size(self) -> int:
+        return self._dist.get_world_size(self._group)
+
+    def allgather(self, data: Any) -> List[Any]:
+        """All-gather arbitrary Python objects across all ranks."""
+        output_list = [None] * self.Get_size()
+        self._dist.all_gather_object(output_list, data, group=self._group)
+        return output_list
+
+    def bcast(self, data: Any, root: int) -> Any:
+        """Broadcast a Python object from root to all ranks."""
+        object_list = [data]
+        self._dist.broadcast_object_list(object_list, src=root, group=self._group)
+        return object_list[0]
+
+    def barrier(self) -> None:
+        self._dist.barrier(group=self._group)
+
+    def Split(self, color: int, key: int) -> "TorchDistBackend":
+        """
+        Split the communicator into sub-groups based on color.
+
+        All processes with the same color will be in the same new group.
+        The key determines the rank ordering within the new group.
+
+        Args:
+            color: Processes with the same color are placed in the same group
+            key: Determines rank ordering within the new group (lower key = lower rank)
+
+        Returns:
+            New TorchDistBackend with the split process group
+        """
+        # Gather (color, key, global_rank) from all processes
+        global_rank = self.Get_rank()
+
+        all_info = self.allgather((color, key, global_rank))
+
+        # Group ranks by color, sort by key within each group
+        color_groups: Dict[int, List[tuple]] = {}
+        for c, k, r in all_info:
+            if c not in color_groups:
+                color_groups[c] = []
+            color_groups[c].append((k, r))
+
+        # Sort each group by key to determine rank ordering
+        for c in color_groups:
+            color_groups[c].sort(key=lambda x: x[0])
+
+        # Find my new group's ranks (in sorted order by key)
+        my_group_ranks = [r for _, r in color_groups[color]]
+
+        # Create new process group with the ranks in my color group
+        new_group = self._dist.new_group(ranks=my_group_ranks)
+
+        return TorchDistBackend(group=new_group)
+
+
 @dataclass
 class MnnvlConfig:
     """Configuration for MNNVL memory management"""
@@ -779,7 +859,10 @@ def is_mnnvl_fabric_supported(device_idx: int) -> bool:
         handle = pynvml.nvmlDeviceGetHandleByIndex(device_idx)
         fabric_info = pynvml.c_nvmlGpuFabricInfoV_t()
         pynvml.nvmlDeviceGetGpuFabricInfoV(handle, ctypes.byref(fabric_info))
-        if fabric_info.state >= pynvml.NVML_GPU_FABRIC_STATE_COMPLETED and fabric_info.clusterUuid[0] != 0:
+        if (
+            fabric_info.state >= pynvml.NVML_GPU_FABRIC_STATE_COMPLETED
+            and fabric_info.clusterUuid[0] != 0
+        ):
             return True
         return False
     finally:

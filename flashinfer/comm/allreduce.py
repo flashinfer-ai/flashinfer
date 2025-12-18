@@ -120,6 +120,7 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             comm_backend=comm_backend,
             create_metadata=True,
             use_fp32_lamport=dtype == torch.float32,
+            use_symm_dev_mem=True,
         )
 
         # Store essential attributes for easy access
@@ -281,7 +282,6 @@ def create_allreduce_fusion_workspace(
     max_token_num: int = None,
     hidden_dim: int = None,
     dtype: torch.dtype = None,
-    process_group: Optional["torch.distributed.ProcessGroup"] = None,
     gpus_per_node: int = None,
     comm_backend: Optional[CommBackend] = None,
     use_oneshot: bool = False,
@@ -312,7 +312,6 @@ def create_allreduce_fusion_workspace(
         max_token_num: Maximum number of tokens to support
         hidden_dim: Hidden dimension size
         dtype: Data type for communication tensors
-        process_group: PyTorch distributed process group (for trtllm backend).
         gpus_per_node: Number of GPUs per node (for multi-node topology).
         comm_backend: Communication backend to use.
         use_oneshot: Allocate workspace for oneshot strategy vs twoshot
@@ -418,9 +417,9 @@ def create_allreduce_fusion_workspace(
             gpus_per_node=gpus_per_node,
             tp_size=world_size,
         )
-        workspace_size_bytes = None
+        buffer_size_in_bytes = None
         if use_oneshot:
-            workspace_size_bytes = (
+            buffer_size_in_bytes = (
                 MNNVLAllReduceFusionWorkspace.get_required_buffer_size_bytes(
                     world_size,
                     max_token_num,
@@ -436,7 +435,7 @@ def create_allreduce_fusion_workspace(
             hidden_dim=hidden_dim,
             dtype=dtype,
             comm_backend=comm_backend,
-            workspace_size_bytes=workspace_size_bytes,
+            buffer_size_in_bytes=buffer_size_in_bytes,
         )
     else:
         raise RuntimeError(f"Unknown backend: {actual_backend}")
