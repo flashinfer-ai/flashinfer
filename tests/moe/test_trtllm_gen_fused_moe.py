@@ -2601,7 +2601,8 @@ def run_moe_test(
     ],
 )
 @pytest.mark.parametrize(
-    "zero_hidden_states", [True, False],
+    "zero_hidden_states",
+    [True, False],
 )
 def test_renormalize_routing(
     num_tokens,
