@@ -511,7 +511,7 @@ When working with FlashInfer's dependencies and tools, refer to these official d
 - **PTX ISA (Parallel Thread Execution)**: NVIDIA's PTX instruction set documentation
   - Documentation: <https://docs.nvidia.com/cuda/parallel-thread-execution/>
   - **Index/Table of Contents**: <https://docs.nvidia.com/cuda/parallel-thread-execution/index.html.md>
-  - **Tip**: Add `.md` to any page URL to get markdown format
+  - **Tip**: Add `.md` to any page URL to get Markdown format
   - Use for: Low-level instruction details, new GPU architecture features, inline PTX assembly
 
 ### When to Consult These Docs
