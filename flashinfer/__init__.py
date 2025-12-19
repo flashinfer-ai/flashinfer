@@ -145,6 +145,7 @@ from . import topk as topk
 from .topk import top_k as top_k
 from .topk import top_k_page_table_transform as top_k_page_table_transform
 from .topk import top_k_ragged_transform as top_k_ragged_transform
+from .moe_topk import moe_top_k as moe_top_k
 from .sparse import BlockSparseAttentionWrapper as BlockSparseAttentionWrapper
 from .sparse import (
     VariableBlockSparseAttentionWrapper as VariableBlockSparseAttentionWrapper,
