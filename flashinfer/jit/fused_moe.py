@@ -110,23 +110,38 @@ def gen_cutlass_fused_moe_module(
 ) -> JitSpec:
     """
     Generate a JitSpec for the cutlass fused moe module.
+
+    If the module is already in AOT cache (flashinfer-jit-cache), skip all
+    kernel generation and return a JitSpec directly. The sources list is
+    not used when loading from AOT cache.
     """
-    output_dir = (
-        jit_env.FLASHINFER_CSRC_DIR
-        / f"nv_internal/tensorrt_llm/cutlass_instantiations/{device_arch}"
+    # Check if the module is already in AOT cache
+    aot_path = (
+        jit_env.FLASHINFER_AOT_DIR
+        / f"fused_moe_{device_arch}"
+        / f"fused_moe_{device_arch}.so"
     )
 
-    try:
-        # Create output directory if it doesn't exist
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        generate_gemm_operations(
-            output_dir,
-            f"{device_arch};{device_arch}-real",
+    if aot_path.exists():
+        # AOT cache exists - skip ALL file generation
+        # When is_aot is True, JitSpec.build_and_load() just loads the .so directly
+        # and never uses the sources list, so we can return with empty generated sources
+        generated_sources = []
+    else:
+        # AOT cache doesn't exist - generate CUTLASS kernels for JIT compilation
+        output_dir = (
+            jit_env.FLASHINFER_GEN_SRC_DIR / f"cutlass_instantiations/{device_arch}"
         )
 
-    except Exception as e:
-        raise RuntimeError(f"Failed to generate Cutlass kernels: {e}") from e
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            generate_gemm_operations(
+                output_dir,
+                f"{device_arch};{device_arch}-real",
+            )
+            generated_sources = list(output_dir.rglob("*.generated.cu"))
+        except Exception as e:
+            raise RuntimeError(f"Failed to generate Cutlass kernels: {e}") from e
 
     return gen_jit_spec(
         f"fused_moe_{device_arch}",
@@ -169,8 +184,8 @@ def gen_cutlass_fused_moe_module(
             / "fused_moe/cutlass_backend/deepgemm_jit_setup.cu",
             jit_env.FLASHINFER_CSRC_DIR
             / "fused_moe/cutlass_backend/cutlass_fused_moe_instantiation.cu",
-            # Add all generated kernels
-            *(output_dir / kernel for kernel in output_dir.rglob("*.generated.cu")),
+            # Generated kernels (empty if AOT cache exists)
+            *generated_sources,
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/envUtils.cpp",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/logger.cpp",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/stringUtils.cpp",
