@@ -346,6 +346,8 @@ class BatchMLAPagedAttentionWrapper:
         self._page_size = page_size
         self._sm_scale = sm_scale
         self._use_profiler = use_profiler
+        # Store total query count for validation in run()
+        self._total_num_queries = int(qo_indptr_host[-1].item())
 
         self._plan_info = self._cached_module.plan(
             self._float_workspace_buffer,
@@ -433,6 +435,23 @@ class BatchMLAPagedAttentionWrapper:
         page_table : Optional[torch.Tensor]
             The page table of the paged kv-cache, shape: ``[batch_size, num_pages]``. Required when ``backend`` is ``cutlass``.
         """
+
+        if self._backend != "cutlass":
+            # Validate that run() inputs match the plan() configuration.
+            # Note: cutlass backend doesn't use plan()
+            if q_nope.shape[0] != self._total_num_queries:
+                raise ValueError(
+                    f"q_nope.shape[0] ({q_nope.shape[0]}) does not match "
+                    f"qo_indptr[-1] ({self._total_num_queries}) from plan(). "
+                    f"The total number of query tokens must be consistent between plan() and run()."
+                )
+            if q_pe.shape[0] != self._total_num_queries:
+                raise ValueError(
+                    f"q_pe.shape[0] ({q_pe.shape[0]}) does not match "
+                    f"qo_indptr[-1] ({self._total_num_queries}) from plan(). "
+                    f"The total number of query tokens must be consistent between plan() and run()."
+                )
+
         if self._backend == "cutlass":
             if return_lse:
                 raise ValueError("return_lse does not support cutlass backend for now.")
