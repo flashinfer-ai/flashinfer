@@ -73,6 +73,7 @@ def test_fp8_blockscale_gemm(
     c = gemm_fp8_nt_blockscaled(
         a_fp8, b_fp8, a_scale, b_scale, scale_major_mode, out_dtype=out_dtype
     )
+    torch.cuda.synchronize()
     torch.testing.assert_close(c, ref_c, atol=1e-2, rtol=1e-2)
 
 
@@ -137,6 +138,7 @@ def test_fp8_groupwise_gemm(
         out_dtype=out_dtype,
         backend=backend,
     )
+    torch.cuda.synchronize()
     torch.testing.assert_close(c, ref_c, atol=1e-2, rtol=1e-2)
 
 
@@ -199,6 +201,7 @@ def test_fp8_groupwise_group_gemm(
         scale_major_mode=scale_major_mode,
         out_dtype=out_dtype,
     )
+    torch.cuda.synchronize()
     ref_c = (
         einsum(
             a_dequant.view((group_size, m, k)),
