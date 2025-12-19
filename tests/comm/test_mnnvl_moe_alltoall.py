@@ -23,6 +23,8 @@ from flashinfer.comm import MoeAlltoAll
 from flashinfer.comm.mapping import Mapping
 from flashinfer.comm.mnnvl import MnnvlMemory
 
+from .conftest import mnnvl_available
+
 
 class MPIExit(Exception):
     pass
@@ -569,8 +571,10 @@ def moe_a2a_dispatch_test_impl(distribution, top_k):
 
     try:
         MnnvlMemory.initialize()
-        if not MnnvlMemory.supports_mnnvl():
-            pytest.skip("MNNVL not supported on this system")
+        if not mnnvl_available():
+            pytest.skip(
+                "MNNVL not supported on this system or container lacks SYS_PTRACE capability"
+            )
     except Exception:
         pytest.skip("MNNVL not supported on this system")
 
@@ -668,8 +672,10 @@ def moe_a2a_dispatch_moe_combine_test_impl(distribution, top_k):
 
     try:
         MnnvlMemory.initialize()
-        if not MnnvlMemory.supports_mnnvl():
-            pytest.skip("MNNVL not supported on this system")
+        if not mnnvl_available():
+            pytest.skip(
+                "MNNVL not supported on this system or container lacks SYS_PTRACE capability"
+            )
     except Exception:
         pytest.skip("MNNVL not supported on this system")
 
