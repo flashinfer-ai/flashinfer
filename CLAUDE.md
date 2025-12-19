@@ -523,3 +523,7 @@ When working with FlashInfer's dependencies and tools, refer to these official d
 - **Writing inline PTX assembly** → Consult PTX ISA for instruction syntax and semantics
 
 These dependencies are included in FlashInfer's `3rdparty/` directory or `requirements.txt`.
+
+### Some final suggestions for all AI agents
+
+> Because practical engineering involves the accumulated experience of trial and error, match the coding style, efficiency, complexity, verbosity, and defensiveness by learning from existing code as much as possible—this document contains many pointers on where to find examples. Document intentional departures with rationale. Mentioning "AI-assisted" in the git commit message is good transparency. For performance-critical hot paths, leave justification for the special algorithmic choices and other potential alternatives in a comment for review.
