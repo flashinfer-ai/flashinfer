@@ -345,7 +345,6 @@ def export_compile_commands_cmd(path, output):
     PATH: Output file path (default: compile_commands.json)
     """
     import json
-    import subprocess
 
     # --output option overrides PATH argument
     output_path = output if output is not None else path
@@ -360,37 +359,12 @@ def export_compile_commands_cmd(path, output):
         click.secho("No modules found to export.", fg="yellow")
         return
 
-    # Collect all compile commands using ninja -t compdb
+    # Collect all compile commands
     all_compile_commands = []
     for spec in all_specs.values():
         try:
-            # Ensure ninja file is generated
-            if not spec.is_ninja_generated:
-                spec.write_ninja()
-
-            # Run ninja -t compdb to extract compile commands
-            result = subprocess.run(
-                ["ninja", "-f", str(spec.ninja_path), "-t", "compdb"],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-
-            # Parse the JSON output
-            if result.stdout.strip():
-                compile_commands = json.loads(result.stdout)
-                all_compile_commands.extend(compile_commands)
-
-        except subprocess.CalledProcessError as e:
-            click.secho(
-                f"Warning: Failed to run ninja compdb for {spec.name}: {e}",
-                fg="yellow",
-            )
-        except json.JSONDecodeError as e:
-            click.secho(
-                f"Warning: Failed to parse compile commands for {spec.name}: {e}",
-                fg="yellow",
-            )
+            compile_commands = spec.get_compile_commands()
+            all_compile_commands.extend(compile_commands)
         except Exception as e:
             click.secho(
                 f"Warning: Failed to generate compile commands for {spec.name}: {e}",
