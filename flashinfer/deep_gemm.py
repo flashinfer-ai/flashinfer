@@ -1612,9 +1612,9 @@ KERNEL_MAP = KernelMap()
 
 
 __all__ = [
-    # Classes - 实际使用的
+    # Classes
     "KernelMap",
-    # Functions - 实际使用的
+    # Functions
     "load",
     "load_all",
     "m_grouped_fp8_gemm_nt_contiguous",
