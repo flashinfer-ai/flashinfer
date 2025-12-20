@@ -449,6 +449,9 @@ def run_mnnvl_ar_full(
 
 """Test with default workspace size"""
 
+# Multi-gpu test: mpirun -np 4 pytest tests/comm/test_trtllm_mnnvl_allreduce.py -vv -s
+# Multi-node test:srun -A coreai_libraries_cudnn -N2 --container-image=<flashinfer_image> -J --mpi=pmix -- bash -c 'hostname && cd <path_to_flashinfer> && pip install -e . && python -m pytest tests/comm/test_trtllm_mnnvl_allreduce.py'
+
 
 @pytest.mark.parametrize(
     "seq_lens",
