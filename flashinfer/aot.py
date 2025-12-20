@@ -752,31 +752,10 @@ def detect_sm_capabilities():
     }
 
 
-def register_default_modules(all: bool = False) -> int:
-    """Register the default set of modules
-
-    Args:
-        all: If True, register all modules regardless of detected GPU architecture
-
-    Returns:
-        Number of modules registered
-    """
+def register_default_modules() -> int:
+    """Register the default set of modules"""
     config = get_default_config()
-
-    if all:
-        # Set all SM capabilities to True to include all modules
-        sm_capabilities = {
-            "sm90": True,
-            "sm100": True,
-            "sm100f": True,
-            "sm103": True,
-            "sm110": True,
-            "sm120": True,
-            "sm121": True,
-        }
-    else:
-        # Detect SM capabilities based on available hardware
-        sm_capabilities = detect_sm_capabilities()
+    sm_capabilities = detect_sm_capabilities()
 
     jit_specs = gen_all_modules(
         config["f16_dtype"],
