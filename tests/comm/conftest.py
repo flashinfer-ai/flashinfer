@@ -11,6 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import torch.distributed as dist
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Cleanup torch.distributed at the end of pytest session.
+
+    This runs after all tests complete but before Python shutdown,
+    avoiding the "destroy_process_group() was not called" warning.
+    """
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
 
 """
 Shared test utilities for comm tests.
