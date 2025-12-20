@@ -604,7 +604,7 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
                 torch.device("cuda", tp_rank).index,
                 comm_backend,
                 enable_multicast=False,
-                False,
+                allocate_signal_pads=False,
             )
             ipc_handles.append(symm_mem.uc_ptrs)
             mem_handles.append(symm_mem)
