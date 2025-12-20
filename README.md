@@ -117,20 +117,27 @@ pip install -U --pre flashinfer-cubin --index-url https://flashinfer.ai/whl/nigh
 pip install -U --pre flashinfer-jit-cache --index-url https://flashinfer.ai/whl/nightly/cu129
 ```
 
-### Verify Installation
+### CLI Tools
 
-After installation, verify that FlashInfer is correctly installed and configured:
+FlashInfer provides several CLI commands for configuration, module management, and development:
 
 ```bash
+# Verify installation and view configuration
 flashinfer show-config
+
+# List and inspect modules
+flashinfer list-modules
+flashinfer module-status
+
+# Manage artifacts and cache
+flashinfer download-cubin
+flashinfer clear-cache
+
+# For developers: generate compile_commands.json for IDE integration
+flashinfer export-compile-commands [output_path]
 ```
 
-This command displays:
-
-- FlashInfer version and installed packages (flashinfer-python, flashinfer-cubin, flashinfer-jit-cache)
-- PyTorch and CUDA version information
-- Environment variables and artifact paths
-- Downloaded cubin status and module compilation status
+For complete documentation, see the [CLI reference](https://docs.flashinfer.ai/cli.html).
 
 ### Trying it out
 
