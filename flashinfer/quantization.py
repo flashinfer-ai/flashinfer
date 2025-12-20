@@ -138,6 +138,7 @@ def segment_packbits(
     get_quantization_module().segment_packbits(x, indptr, indptr_new, bitorder, y)
     return y, indptr_new
 
+
 __all__ = [
     "packbits",
     "segment_packbits",

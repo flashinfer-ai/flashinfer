@@ -1670,6 +1670,7 @@ def rope_quantize_fp8_append_paged_kv_cache(
 
     return q_rope_out, q_nope_out
 
+
 __all__ = [
     "apply_llama31_rope",
     "apply_llama31_rope_inplace",
