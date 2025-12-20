@@ -44,15 +44,24 @@ def _download_cubin():
         click.secho(f"❌ Cubin download failed: {e}", fg="red")
 
 
-def _ensure_modules_registered():
-    """Helper function to ensure modules are registered"""
+def _ensure_modules_registered(all=False):
+    """Helper function to ensure modules are registered
+
+    Args:
+        all: If True, register all modules regardless of detected GPU architecture
+    """
     statuses = jit_spec_registry.get_all_statuses()
     if not statuses:
-        click.secho("No modules found. Registering default modules...", fg="yellow")
+        msg = (
+            "No modules found. Registering all modules..."
+            if all
+            else "No modules found. Registering default modules..."
+        )
+        click.secho(msg, fg="yellow")
         try:
             from .aot import register_default_modules
 
-            num_registered = register_default_modules()
+            num_registered = register_default_modules(all=all)
             click.secho(f"✅ Registered {num_registered} modules", fg="green")
             statuses = jit_spec_registry.get_all_statuses()
         except Exception as e:
@@ -349,8 +358,8 @@ def export_compile_commands_cmd(path, output):
     # --output option overrides PATH argument
     output_path = output if output is not None else path
 
-    # Register default modules if none exist
-    _ensure_modules_registered()
+    # Force register all modules (including all architectures)
+    _ensure_modules_registered(all=True)
 
     # Get all registered specs
     all_specs = jit_spec_registry.get_all_specs()
