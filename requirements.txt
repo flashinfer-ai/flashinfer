@@ -4,7 +4,7 @@ einops
 ninja
 numpy
 nvidia-cudnn-frontend>=1.13.0
-nvidia-cutlass-dsl>=4.3.2
+nvidia-cutlass-dsl>=4.3.4
 nvidia-ml-py
 packaging>=24.2
 requests
