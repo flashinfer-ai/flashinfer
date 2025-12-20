@@ -1166,3 +1166,9 @@ class VariableBlockSparseAttentionWrapper:
             ).contiguous()
 
         return (out, lse) if return_lse else out
+
+
+__all__ = [
+    "BlockSparseAttentionWrapper",
+    "VariableBlockSparseAttentionWrapper",
+]

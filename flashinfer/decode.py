@@ -2677,3 +2677,13 @@ def fast_decode_plan(
     self._sm_scale = sm_scale
     self._rope_scale = rope_scale
     self._rope_theta = rope_theta
+
+
+__all__ = [
+    "BatchDecodeMlaWithPagedKVCacheWrapper",
+    "BatchDecodeWithPagedKVCacheWrapper",
+    "CUDAGraphBatchDecodeWithPagedKVCacheWrapper",
+    "cudnn_batch_decode_with_kv_cache",
+    "fast_decode_plan",
+    "single_decode_with_kv_cache",
+]

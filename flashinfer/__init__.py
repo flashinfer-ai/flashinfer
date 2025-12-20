@@ -89,6 +89,15 @@ from .gemm import bmm_fp8 as bmm_fp8
 from .gemm import mm_fp4 as mm_fp4
 from .gemm import mm_fp8 as mm_fp8
 from .gemm import tgv_gemm_sm100 as tgv_gemm_sm100
+
+# CuTe-DSL GEMM kernels (conditionally available)
+try:
+    from .gemm import grouped_gemm_nt_masked as grouped_gemm_nt_masked
+    from .gemm import (
+        Sm100BlockScaledPersistentDenseGemmKernel as Sm100BlockScaledPersistentDenseGemmKernel,
+    )
+except ImportError:
+    pass  # CuTe-DSL not available
 from .mla import BatchMLAPagedAttentionWrapper as BatchMLAPagedAttentionWrapper
 from .norm import fused_add_rmsnorm as fused_add_rmsnorm
 from .norm import layernorm as layernorm

@@ -789,3 +789,7 @@ class AutoTuner:
     def reset_statistics(self) -> None:
         """Reset all statistics counters."""
         self.stats = AutoTunerStatistics()
+
+__all__ = [
+    "autotune",
+]

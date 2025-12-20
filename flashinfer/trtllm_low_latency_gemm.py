@@ -222,3 +222,8 @@ def prepare_low_latency_gemm_weights(
     block_k = 128
     block_layout_weights = convert_to_block_layout(shuffled_weights, block_k)
     return block_layout_weights
+
+
+__all__ = [
+    "prepare_low_latency_gemm_weights",
+]

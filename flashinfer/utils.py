@@ -1182,3 +1182,7 @@ def backend_requirement(
         return wrapper
 
     return decorator
+
+__all__ = [
+    "next_positive_power_of_2",
+]

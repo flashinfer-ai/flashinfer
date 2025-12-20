@@ -15,3 +15,5 @@ Kernels for normalization layers.
     gemma_rmsnorm
     gemma_fused_add_rmsnorm
     layernorm
+    rmsnorm_fp4quant
+    add_rmsnorm_fp4quant

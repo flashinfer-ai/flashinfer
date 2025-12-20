@@ -222,3 +222,11 @@ def silu_and_mul_scaled_nvfp4_experts_quantize(
         a_global_sf,
     )
     return a_fp4, a_sf
+
+
+__all__ = [
+    "gelu_and_mul",
+    "gelu_tanh_and_mul",
+    "silu_and_mul",
+    "silu_and_mul_scaled_nvfp4_experts_quantize",
+]

@@ -21,3 +21,9 @@ try:
 except ModuleNotFoundError:
     __version__ = "0.0.0+unknown"
     __git_version__ = "unknown"
+
+
+__all__ = [
+    "__version__",
+    "__git_version__",
+]

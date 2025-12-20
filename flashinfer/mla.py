@@ -797,3 +797,8 @@ def xqa_batch_decode_with_kv_cache_mla(
     )
 
     return out
+
+
+__all__ = [
+    "BatchMLAPagedAttentionWrapper",
+]

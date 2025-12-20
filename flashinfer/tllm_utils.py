@@ -10,3 +10,9 @@ def get_trtllm_utils_module():
 
 def delay_kernel(stream_delay_micro_secs):
     get_trtllm_utils_module().delay_kernel(stream_delay_micro_secs)
+
+
+__all__ = [
+    "get_trtllm_utils_module",
+    "delay_kernel",
+]

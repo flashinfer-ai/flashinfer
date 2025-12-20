@@ -419,3 +419,9 @@ def top_k_ragged_transform(
     )
 
     return output_indices
+
+__all__ = [
+    "top_k",
+    "top_k_page_table_transform",
+    "top_k_ragged_transform",
+]

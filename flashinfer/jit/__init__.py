@@ -92,3 +92,67 @@ cuda_lib_path = os.environ.get(
 )
 if os.path.exists(f"{cuda_lib_path}/libcudart.so.12"):
     ctypes.CDLL(f"{cuda_lib_path}/libcudart.so.12", mode=ctypes.RTLD_GLOBAL)
+
+__all__ = [
+    # Submodules
+    "cubin_loader",
+    "env",
+    # Activation
+    "gen_act_and_mul_module",
+    "get_act_and_mul_cu_str",
+    # Attention
+    "gen_cudnn_fmha_module",
+    "gen_batch_attention_module",
+    "gen_batch_decode_mla_module",
+    "gen_batch_decode_module",
+    "gen_batch_mla_module",
+    "gen_batch_prefill_module",
+    "gen_customize_batch_decode_module",
+    "gen_customize_batch_prefill_module",
+    "gen_customize_single_decode_module",
+    "gen_customize_single_prefill_module",
+    "gen_fmha_cutlass_sm100a_module",
+    "gen_batch_pod_module",
+    "gen_pod_module",
+    "gen_single_decode_module",
+    "gen_single_prefill_module",
+    "get_batch_attention_uri",
+    "get_batch_decode_mla_uri",
+    "get_batch_decode_uri",
+    "get_batch_mla_uri",
+    "get_batch_prefill_uri",
+    "get_pod_uri",
+    "get_single_decode_uri",
+    "get_single_prefill_uri",
+    "gen_trtllm_gen_fmha_module",
+    "get_trtllm_fmha_v2_module",
+    # Core
+    "JitSpec",
+    "JitSpecStatus",
+    "JitSpecRegistry",
+    "jit_spec_registry",
+    "build_jit_specs",
+    "clear_cache_dir",
+    "gen_jit_spec",
+    "MissingJITCacheError",
+    "sm90a_nvcc_flags",
+    "sm100a_nvcc_flags",
+    "sm100f_nvcc_flags",
+    "sm103a_nvcc_flags",
+    "sm110a_nvcc_flags",
+    "sm120a_nvcc_flags",
+    "sm121a_nvcc_flags",
+    "current_compilation_context",
+    # Cubin Loader
+    "setup_cubin_loader",
+    # Comm
+    "gen_comm_alltoall_module",
+    "gen_trtllm_mnnvl_comm_module",
+    "gen_trtllm_comm_module",
+    "gen_vllm_comm_module",
+    "gen_nvshmem_module",
+    "gen_moe_alltoall_module",
+    # DSv3 Optimizations
+    "gen_dsv3_router_gemm_module",
+    "gen_dsv3_fused_routing_module",
+]

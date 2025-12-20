@@ -881,5 +881,10 @@ def main():
     )
 
 
+__all__ = [
+    "register_default_modules",
+]
+
+
 if __name__ == "__main__":
     main()

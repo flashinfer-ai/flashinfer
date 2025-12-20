@@ -25,6 +25,7 @@ Batch Decoding
 
     cudnn_batch_decode_with_kv_cache
     trtllm_batch_decode_with_kv_cache
+    fast_decode_plan
 
 .. autoclass:: BatchDecodeWithPagedKVCacheWrapper
     :members:
@@ -105,6 +106,24 @@ PageAttention for MLA
     trtllm_batch_decode_with_kv_cache_mla
 
 .. autoclass:: BatchMLAPagedAttentionWrapper
+    :members:
+
+    .. automethod:: __init__
+
+
+flashinfer.pod
+==============
+
+POD (Prefix-Only Decode) attention kernels for efficient prefix caching.
+
+.. currentmodule:: flashinfer.pod
+
+.. autoclass:: PODWithPagedKVCacheWrapper
+    :members:
+
+    .. automethod:: __init__
+
+.. autoclass:: BatchPODWithPagedKVCacheWrapper
     :members:
 
     .. automethod:: __init__

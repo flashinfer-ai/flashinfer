@@ -46,7 +46,7 @@ Types and Enums
     AllReduceFusionPattern
     AllReduceStrategyConfig
     AllReduceStrategyType
-    FP4QuantizationSFLayout
+    QuantizationSFLayout
 
 Core Operations
 ~~~~~~~~~~~~~~~
@@ -93,6 +93,26 @@ vLLM AllReduce
     vllm_register_graph_buffers
     vllm_get_graph_buffer_ipc_meta
     vllm_meta_size
+
+Unified AllReduce Fusion API
+-----------------------------
+
+.. autosummary::
+    :toctree: ../generated
+
+    AllReduceFusionWorkspace
+    TRTLLMAllReduceFusionWorkspace
+    allreduce_fusion
+    create_allreduce_fusion_workspace
+
+.. currentmodule:: flashinfer.comm.trtllm_mnnvl_ar
+
+.. autosummary::
+    :toctree: ../generated
+
+    MNNVLAllReduceFusionWorkspace
+
+.. currentmodule:: flashinfer.comm
 
 MNNVL (Multi-Node NVLink)
 -------------------------
