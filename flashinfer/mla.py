@@ -650,6 +650,10 @@ def trtllm_batch_decode_with_kv_cache_mla(
                 "out",
             )
 
+        batch_size = query.size(0)
+        max_q_len = query.size(1)
+        query = query.flatten(0, 1)  # [B*S, H, D]
+
         run_func(
             out,
             None,  # fp4 output not supported in wrapper api yet.
@@ -659,18 +663,21 @@ def trtllm_batch_decode_with_kv_cache_mla(
             workspace_buffer,
             block_tables,
             seq_lens,
+            max_q_len,
             max_seq_len,
             bmm1_scale,
             bmm2_scale,
             -1,  # o_sf_scale
             -1,  # o_sf_vec_size
             0,  # o_sf_start_index
+            batch_size,
             -1,  # window_left
             sparse_mla_top_k,
             sm_count,
             enable_pdl,
             workspace_buffer.numel() * workspace_buffer.element_size(),
             sinks,
+            None,  # cum_seq_lens_q
         )
 
         return out
