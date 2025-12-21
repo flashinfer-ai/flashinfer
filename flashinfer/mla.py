@@ -801,4 +801,9 @@ def xqa_batch_decode_with_kv_cache_mla(
 
 __all__ = [
     "BatchMLAPagedAttentionWrapper",
+    "trtllm_batch_decode_with_kv_cache_mla",
+    "xqa_batch_decode_with_kv_cache_mla",
+    "get_trtllm_gen_fmha_module",
+    "get_mla_module",
+    "get_batch_mla_module",
 ]

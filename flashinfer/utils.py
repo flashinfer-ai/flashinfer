@@ -1185,5 +1185,73 @@ def backend_requirement(
 
 
 __all__ = [
+    # Enums
+    "PosEncodingMode",
+    "MaskMode",
+    "TensorLayout",
+    "LogLevel",
+    # Exceptions
+    "GPUArchitectureError",
+    "LibraryError",
+    "BackendSupportedError",
+    # Classes
+    "FP4Tensor",
+    # Constants
+    "log2e",
+    "log_level_map",
+    # Utility functions
     "next_positive_power_of_2",
+    "calculate_tile_tokens_dim",
+    "is_float8",
+    "get_indptr",
+    "get_alibi_slopes",
+    "canonicalize_torch_dtype",
+    "get_compute_capability",
+    "get_gpu_memory_bandwidth",
+    "ceil_div",
+    "round_up",
+    "get_device_sm_count",
+    "check_shape_dtype_device",
+    # Backend and version functions
+    "determine_gemm_backend",
+    "is_fa3_backend_supported",
+    "is_cutlass_backend_supported",
+    "determine_attention_backend",
+    "version_at_least",
+    "has_cuda_cudart",
+    "has_flashinfer_jit_cache",
+    "has_flashinfer_cubin",
+    "get_cuda_python_version",
+    "determine_mla_backend",
+    # SM support functions
+    "is_sm90a_supported",
+    "is_sm100a_supported",
+    "is_sm100f_supported",
+    "is_sm110a_supported",
+    "is_sm120a_supported",
+    "is_sm121a_supported",
+    "device_support_pdl",
+    # Logging
+    "set_log_level",
+    # FP4/Shuffle functions
+    "get_shuffle_block_size",
+    "get_shuffle_matrix_a_row_indices",
+    "get_shuffle_matrix_sf_a_row_indices",
+    "get_native_fp4_dtype",
+    # Decorators
+    "supported_compute_capability",
+    "backend_requirement",
+    "register_custom_op",
+    "register_fake_op",
+    # Internal helpers (used across modules)
+    "_expand_5d",
+    "_expand_4d",
+    "_check_pos_encoding_mode",
+    "_check_kv_layout",
+    "_unpack_paged_kv_cache",
+    "_get_cache_buf",
+    "_ceil_pow2",
+    "_get_range_buf",
+    "_get_cache_alibi_slopes_buf",
+    "_check_cached_qkv_data_type",
 ]
