@@ -232,6 +232,11 @@ struct TllmGenFmhaRunnerParams {
   // The output scaling factor buffer.
   void* oSfPtr;
 
+  // The stride between different tokens for Q.
+  int qStrideTokens;
+  // The stride between different heads for Q.
+  int qStrideHeads;
+
   // The stride between different keys.
   int kStrideKeysValues;
   // The stride between different heads for K.
