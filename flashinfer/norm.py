@@ -414,15 +414,12 @@ except ImportError:
 
 __all__ = [
     "add_rmsnorm_fp4quant",
-__all__ = [
     "fused_add_rmsnorm",
+    "fused_add_rmsnorm_quant",
     "gemma_fused_add_rmsnorm",
     "gemma_rmsnorm",
     "layernorm",
     "rmsnorm",
+    "rmsnorm_fp4quant",
+    "rmsnorm_quant",
 ]
-
-if add_rmsnorm_fp4quant is not None:
-    __all__.append("add_rmsnorm_fp4quant")
-if rmsnorm_fp4quant is not None:
-    __all__.append("rmsnorm_fp4quant")
