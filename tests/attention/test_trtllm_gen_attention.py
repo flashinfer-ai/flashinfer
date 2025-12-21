@@ -1119,6 +1119,10 @@ def test_trtllm_batch_decode(
     head_dim,
     non_contiguous_query,
 ):
+    # xqa backend does not support non-contiguous query yet
+    if backend == "xqa" and non_contiguous_query:
+        pytest.skip("xqa backend does not support non-contiguous query")
+
     # General set of tests for trtllm-gen decode
     _test_trtllm_batch_decode(
         backend,
