@@ -194,24 +194,38 @@ struct KernelParams {
         static_cast<uint64_t>(options.mHeadDimQk), static_cast<uint64_t>(numGroupedHeads),
         static_cast<uint64_t>(numHeads), static_cast<uint64_t>(numTokens)};
 
-    // The hidden dimension when the tensor contains only Q (i.e. not QKV packed).
-    int32_t const hiddenDimQ{options.mNumHeadsQ * options.mHeadDimQk};
-
-    // The hidden dimension when the Q, K and V tensors are packed.
-    int32_t hiddenDimQkv{hiddenDimQ};
-    if (isPackedQkv(options.mQkvLayout)) {
-      FLASHINFER_CHECK(!groupsHeadsQ, "internal error");
-      hiddenDimQkv += options.mNumHeadsKv * (options.mHeadDimQk + options.mHeadDimV);
+    // The stride between tokens.
+    // Use user-provided stride if available, otherwise compute from layout.
+    int32_t strideTokens{options.qStrideTokens};
+    if (strideTokens == 0) {
+      // The hidden dimension when the tensor contains only Q (i.e. not QKV packed).
+      int32_t const hiddenDimQ{options.mNumHeadsQ * options.mHeadDimQk};
+      // The hidden dimension when the Q, K and V tensors are packed.
+      int32_t hiddenDimQkv{hiddenDimQ};
+      if (isPackedQkv(options.mQkvLayout)) {
+        FLASHINFER_CHECK(!groupsHeadsQ, "internal error");
+        hiddenDimQkv += options.mNumHeadsKv * (options.mHeadDimQk + options.mHeadDimV);
+      }
+      strideTokens = hiddenDimQkv;
     }
 
-    // The stride between tokens.
-    int32_t strideTokens{hiddenDimQkv};
-
     // The stride between heads.
-    int32_t strideHeads{groupsHeadsQ ? numGroupedHeads * options.mHeadDimQk : options.mHeadDimQk};
+    // Use user-provided stride if available, otherwise compute from layout.
+    int32_t strideHeads{options.qStrideHeads};
+    if (strideHeads == 0) {
+      strideHeads = options.mHeadDimQk;
+    }
+    // The stride between grouped heads (consecutive heads within a GQA group).
+    // Use user-provided stride if available, otherwise use headDimQk.
+    int32_t strideGroupedHeads{options.qStrideHeads};
+    if (strideGroupedHeads == 0) {
+      strideGroupedHeads = options.mHeadDimQk;
+    }
 
-    // The stride between grouped heads.
-    int32_t strideGroupedHeads{options.mHeadDimQk};
+    // For GQA, the TMA iterates over groups of heads, so we need to multiply by numGroupedHeads.
+    if (groupsHeadsQ) {
+      strideHeads = numGroupedHeads * strideHeads;
+    }
 
     // Assemble the stride (1, strideTokens, strideHeads).
     // Swap the first two dimension as mentioned before.
