@@ -516,6 +516,7 @@ def test_generalized_rope_quantize(
 @pytest.mark.parametrize("enable_pdl", [True, False])
 @pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
 @pytest.mark.parametrize("page_size", [16, 32])
+@pytest.mark.parametrize("idtype", [torch.int32, torch.int64])
 def test_generalized_rope_quantize_append_kv_cache(
     attention_type,
     num_qo_heads,
@@ -528,6 +529,7 @@ def test_generalized_rope_quantize_append_kv_cache(
     enable_pdl,
     kv_layout,
     page_size,
+    idtype,
 ):
     device = "cuda:0"
     # Fixed seed for reproducibility
@@ -589,36 +591,36 @@ def test_generalized_rope_quantize_append_kv_cache(
     rope_ref = FlashInferRotaryEmbedding(
         head_dim, rope_dim, max_seq_len, 10000, False, input_dtype, device
     )
-    pos_ids = torch.arange(num_tokens, device=device, dtype=torch.int32)
+    pos_ids = torch.arange(num_tokens, device=device, dtype=idtype)
 
     # Build paged metadata
     kv_append_length = torch.tensor(
-        [num_tokens] + [0] * (batch_size - 1), dtype=torch.int32, device=device
+        [num_tokens] + [0] * (batch_size - 1), dtype=idtype, device=device
     )
     kv_append_indptr = torch.cat(
         [
-            torch.zeros(1, dtype=torch.int32, device=device),
-            torch.cumsum(kv_append_length, dim=0),
+            torch.zeros(1, dtype=idtype, device=device),
+            torch.cumsum(kv_append_length, dim=0).to(idtype),
         ]
     )
     num_pages_per_req = torch.tensor(
         [(num_tokens + page_size - 1) // page_size] + [0] * (batch_size - 1),
-        dtype=torch.int32,
+        dtype=idtype,
         device=device,
     )
     kv_page_indptr = torch.cat(
         [
-            torch.zeros(1, dtype=torch.int32, device=device),
-            torch.cumsum(num_pages_per_req, dim=0),
+            torch.zeros(1, dtype=idtype, device=device),
+            torch.cumsum(num_pages_per_req, dim=0).to(idtype),
         ]
     )
     kv_page_indices = torch.arange(
-        kv_page_indptr[-1].item(), dtype=torch.int32, device=device
+        kv_page_indptr[-1].item(), dtype=idtype, device=device
     )
     kv_last_page_len = torch.tensor(
         [num_tokens % page_size if num_tokens % page_size != 0 else page_size]
         + [0] * (batch_size - 1),
-        dtype=torch.int32,
+        dtype=idtype,
         device=device,
     )
     # Allocate caches sized by required pages
@@ -629,6 +631,9 @@ def test_generalized_rope_quantize_append_kv_cache(
     batch_indices, positions = flashinfer.get_batch_indices_positions(
         kv_append_indptr, seq_lens, num_tokens
     )
+    # Convert to idtype to match other index tensors
+    batch_indices = batch_indices.to(idtype)
+    positions = positions.to(idtype)
 
     # Fused call + cache allocation
     if attention_type == "mla":
@@ -833,6 +838,7 @@ def test_generalized_rope_quantize_append_kv_cache(
 @pytest.mark.parametrize("enable_pdl", [True, False])
 @pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
 @pytest.mark.parametrize("page_size", [16, 32])
+@pytest.mark.parametrize("idtype", [torch.int32, torch.int64])
 def test_rope_quantize_fp8_append_paged_kv_cache_decode(
     attention_type,
     num_qo_heads,
@@ -846,6 +852,7 @@ def test_rope_quantize_fp8_append_paged_kv_cache_decode(
     enable_pdl,
     kv_layout,
     page_size,
+    idtype,
 ):
     """Test append to non-empty cache (decode/continuation scenario)."""
     device = "cuda:0"
@@ -937,28 +944,26 @@ def test_rope_quantize_fp8_append_paged_kv_cache_decode(
     rope_ref = FlashInferRotaryEmbedding(
         head_dim, rope_dim, max_seq_len, 10000, False, input_dtype, device
     )
-    pos_ids_existing = torch.arange(
-        num_existing_tokens, device=device, dtype=torch.int32
-    )
+    pos_ids_existing = torch.arange(num_existing_tokens, device=device, dtype=idtype)
 
     # Build metadata for existing tokens (single request for simplicity)
     kv_append_length_existing = torch.tensor(
-        [num_existing_tokens] + [0] * (batch_size - 1), dtype=torch.int32, device=device
+        [num_existing_tokens] + [0] * (batch_size - 1), dtype=idtype, device=device
     )
     kv_append_indptr_existing = torch.cat(
         [
-            torch.zeros(1, dtype=torch.int32, device=device),
-            torch.cumsum(kv_append_length_existing, dim=0),
+            torch.zeros(1, dtype=idtype, device=device),
+            torch.cumsum(kv_append_length_existing, dim=0).to(idtype),
         ]
     )
     num_pages_existing = (num_existing_tokens + page_size - 1) // page_size
     kv_page_indptr_existing = torch.tensor(
         [0, num_pages_existing] + [num_pages_existing] * (batch_size - 1),
-        dtype=torch.int32,
+        dtype=idtype,
         device=device,
     )
     kv_page_indices_existing = torch.arange(
-        num_pages_existing, dtype=torch.int32, device=device
+        num_pages_existing, dtype=idtype, device=device
     )
     kv_last_page_len_existing = torch.tensor(
         [
@@ -967,7 +972,7 @@ def test_rope_quantize_fp8_append_paged_kv_cache_decode(
             else page_size
         ]
         + [0] * (batch_size - 1),
-        dtype=torch.int32,
+        dtype=idtype,
         device=device,
     )
     seq_lens_existing = flashinfer.get_seq_lens(
@@ -976,6 +981,9 @@ def test_rope_quantize_fp8_append_paged_kv_cache_decode(
     batch_indices_existing, positions_existing = flashinfer.get_batch_indices_positions(
         kv_append_indptr_existing, seq_lens_existing, num_existing_tokens
     )
+    # Convert to idtype to match other index tensors
+    batch_indices_existing = batch_indices_existing.to(idtype)
+    positions_existing = positions_existing.to(idtype)
 
     # Allocate cache sized for existing + new tokens
     total_tokens = num_existing_tokens + num_new_tokens
@@ -1131,26 +1139,26 @@ def test_rope_quantize_fp8_append_paged_kv_cache_decode(
         num_existing_tokens,
         num_existing_tokens + num_new_tokens,
         device=device,
-        dtype=torch.int32,
+        dtype=idtype,
     )
 
     # Build metadata for new tokens (continue appending to first request)
     num_pages_new_needed = (total_tokens + page_size - 1) // page_size
     kv_page_indptr_new = torch.tensor(
         [0, num_pages_new_needed] + [num_pages_new_needed] * (batch_size - 1),
-        dtype=torch.int32,
+        dtype=idtype,
         device=device,
     )
     kv_page_indices_new = torch.arange(
-        num_pages_new_needed, dtype=torch.int32, device=device
+        num_pages_new_needed, dtype=idtype, device=device
     )
     # For continuation, positions start at num_existing_tokens
-    batch_indices_new = torch.zeros(num_new_tokens, device=device, dtype=torch.int32)
+    batch_indices_new = torch.zeros(num_new_tokens, device=device, dtype=idtype)
     positions_new = torch.arange(
         num_existing_tokens,
         num_existing_tokens + num_new_tokens,
         device=device,
-        dtype=torch.int32,
+        dtype=idtype,
     )
 
     # Snapshot existing cache for later comparison

@@ -450,6 +450,24 @@ void rope_quantize_append_paged_kv_cache(
   CHECK_INPUT(batch_indices);
   CHECK_INPUT(positions);
 
+  // Validate that all index tensors have the same dtype as pos_ids
+  if (kv_indices.dtype() != pos_ids.dtype()) {
+    TVM_FFI_LOG_AND_THROW(TypeError) << "kv_indices dtype (" << kv_indices.dtype()
+                                     << ") must match pos_ids dtype (" << pos_ids.dtype() << ")";
+  }
+  if (kv_indptr.dtype() != pos_ids.dtype()) {
+    TVM_FFI_LOG_AND_THROW(TypeError) << "kv_indptr dtype (" << kv_indptr.dtype()
+                                     << ") must match pos_ids dtype (" << pos_ids.dtype() << ")";
+  }
+  if (batch_indices.dtype() != pos_ids.dtype()) {
+    TVM_FFI_LOG_AND_THROW(TypeError) << "batch_indices dtype (" << batch_indices.dtype()
+                                     << ") must match pos_ids dtype (" << pos_ids.dtype() << ")";
+  }
+  if (positions.dtype() != pos_ids.dtype()) {
+    TVM_FFI_LOG_AND_THROW(TypeError) << "positions dtype (" << positions.dtype()
+                                     << ") must match pos_ids dtype (" << pos_ids.dtype() << ")";
+  }
+
   // Extract dimensions
   uint32_t rope_dim = q_rope_in.size(-1);
   uint32_t no_rope_dim = q_nope_in.size(-1);
@@ -555,12 +573,12 @@ void rope_quantize_append_paged_kv_cache(
           auto ckv_strides = ckv_cache.strides();
           auto kpe_strides = kpe_cache.strides();
 
-          paged_kv_mla_t<c_quant_type, int32_t> paged_kv_mla(
+          paged_kv_mla_t<c_quant_type, c_idtype> paged_kv_mla(
               page_size, no_rope_dim, rope_dim, batch_size,
               static_cast<c_quant_type*>(ckv_cache.data_ptr()), ckv_strides.data(),
               static_cast<c_quant_type*>(kpe_cache.data_ptr()), kpe_strides.data(),
-              static_cast<int32_t*>(kv_indices.data_ptr()),
-              static_cast<int32_t*>(kv_indptr.data_ptr()),
+              static_cast<c_idtype*>(kv_indices.data_ptr()),
+              static_cast<c_idtype*>(kv_indptr.data_ptr()),
               nullptr  // last_page_len not needed for this kernel
           );
 
@@ -571,8 +589,8 @@ void rope_quantize_append_paged_kv_cache(
               static_cast<c_type*>(k_nope_in.data_ptr()),
               static_cast<c_quant_type*>(q_rope_out.data_ptr()),
               static_cast<c_quant_type*>(q_nope_out.data_ptr()), paged_kv_mla,
-              static_cast<int32_t*>(batch_indices.data_ptr()),
-              static_cast<int32_t*>(positions.data_ptr()),
+              static_cast<c_idtype*>(batch_indices.data_ptr()),
+              static_cast<c_idtype*>(positions.data_ptr()),
               static_cast<float*>(cos_sin_cache.data_ptr()),
               static_cast<c_idtype*>(pos_ids.data_ptr()), nnz, num_qo_heads, rope_dim, no_rope_dim,
               q_rope_in_stride_n, q_rope_in_stride_h, q_nope_in_stride_n, q_nope_in_stride_h,
@@ -586,12 +604,12 @@ void rope_quantize_append_paged_kv_cache(
           auto v_strides = v_cache.strides();
           uint32_t head_dim = rope_dim + no_rope_dim;
 
-          paged_kv_t<c_quant_type, int32_t> paged_kv(
+          paged_kv_t<c_quant_type, c_idtype> paged_kv(
               num_kv_heads, page_size, head_dim, batch_size, kv_layout,
               static_cast<c_quant_type*>(k_cache.data_ptr()),
               static_cast<c_quant_type*>(v_cache.data_ptr()), k_strides.data(),
-              static_cast<int32_t*>(kv_indices.data_ptr()),
-              static_cast<int32_t*>(kv_indptr.data_ptr()),
+              static_cast<c_idtype*>(kv_indices.data_ptr()),
+              static_cast<c_idtype*>(kv_indptr.data_ptr()),
               nullptr  // last_page_len not needed for this kernel
           );
 
@@ -602,8 +620,8 @@ void rope_quantize_append_paged_kv_cache(
               static_cast<c_type*>(k_nope_in.data_ptr()), static_cast<c_type*>(v_in.data_ptr()),
               static_cast<c_quant_type*>(q_rope_out.data_ptr()),
               static_cast<c_quant_type*>(q_nope_out.data_ptr()), paged_kv,
-              static_cast<int32_t*>(batch_indices.data_ptr()),
-              static_cast<int32_t*>(positions.data_ptr()),
+              static_cast<c_idtype*>(batch_indices.data_ptr()),
+              static_cast<c_idtype*>(positions.data_ptr()),
               static_cast<float*>(cos_sin_cache.data_ptr()),
               static_cast<c_idtype*>(pos_ids.data_ptr()), nnz, num_qo_heads, num_kv_heads, rope_dim,
               no_rope_dim, q_rope_in_stride_n, q_rope_in_stride_h, q_nope_in_stride_n,
