@@ -678,5 +678,233 @@ class TestSwizzledScaleFactors:
         torch.testing.assert_close(block_scale_unswizzled, block_scale_ref)
 
 
+@cute_dsl_available
+@blackwell_required
+class TestAutoAllocation:
+    """Tests for automatic output tensor allocation when y_fp4 and block_scale are None."""
+
+    @pytest.mark.parametrize("batch_size", [1, 16, 128])
+    @pytest.mark.parametrize("hidden_size", [256, 1024, 4096])
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_auto_allocation_2d_nvfp4(self, batch_size, hidden_size, dtype):
+        """Test auto-allocation with 2D input and NVFP4 format."""
+        from flashinfer.cute_dsl.add_rmsnorm_fp4quant import add_rmsnorm_fp4quant
+
+        torch.manual_seed(42)
+        block_size = 16
+        eps = 1e-6
+
+        x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        r = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
+
+        # Call without providing y_fp4 and block_scale
+        y_fp4, block_scale = add_rmsnorm_fp4quant(
+            x, r, weight, eps=eps, block_size=block_size
+        )
+
+        # Verify output shapes
+        assert y_fp4.shape == (batch_size, hidden_size // 2)
+        assert block_scale.shape == (batch_size, hidden_size // block_size)
+
+        # Verify output dtypes
+        assert y_fp4.dtype == torch.uint8
+        assert block_scale.dtype == torch.float8_e4m3fn
+
+        # Reference computation
+        h = x + r
+        ref_rmsnorm = llama_rms_norm(h, weight, eps=eps)
+
+        # Dequantize and verify values
+        y_dequant = dequantize_fp4_output(y_fp4, block_scale, block_size)
+        torch.testing.assert_close(
+            y_dequant,
+            ref_rmsnorm.float(),
+            rtol=0.3,
+            atol=0.5,
+        )
+
+    @pytest.mark.parametrize("batch_size", [1, 4, 16])
+    @pytest.mark.parametrize("seq_len", [16, 64])
+    @pytest.mark.parametrize("hidden_size", [256, 1024])
+    @pytest.mark.parametrize("dtype", [torch.float16])
+    def test_auto_allocation_3d_nvfp4(self, batch_size, seq_len, hidden_size, dtype):
+        """Test auto-allocation with 3D input and NVFP4 format."""
+        from flashinfer.cute_dsl.add_rmsnorm_fp4quant import add_rmsnorm_fp4quant
+
+        torch.manual_seed(42)
+        block_size = 16
+        eps = 1e-6
+
+        x = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=dtype)
+        r = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=dtype)
+        weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
+
+        # Call without providing y_fp4 and block_scale
+        y_fp4, block_scale = add_rmsnorm_fp4quant(
+            x, r, weight, eps=eps, block_size=block_size
+        )
+
+        # Verify output shapes
+        assert y_fp4.shape == (batch_size, seq_len, hidden_size // 2)
+        assert block_scale.shape == (batch_size, seq_len, hidden_size // block_size)
+
+        # Verify output dtypes
+        assert y_fp4.dtype == torch.uint8
+        assert block_scale.dtype == torch.float8_e4m3fn
+
+        # Reference computation
+        h = x + r
+        ref_rmsnorm = llama_rms_norm(h, weight, eps=eps)
+
+        # Dequantize and verify values
+        y_dequant = dequantize_fp4_output(y_fp4, block_scale, block_size)
+        torch.testing.assert_close(
+            y_dequant,
+            ref_rmsnorm.float(),
+            rtol=0.3,
+            atol=0.5,
+        )
+
+    @pytest.mark.parametrize("batch_size", [1, 16, 128])
+    @pytest.mark.parametrize("hidden_size", [256, 1024])
+    @pytest.mark.parametrize("dtype", [torch.float16])
+    def test_auto_allocation_mxfp4(self, batch_size, hidden_size, dtype):
+        """Test auto-allocation with MXFP4 format (block_size=32, UE8M0 scales)."""
+        from flashinfer.cute_dsl.add_rmsnorm_fp4quant import add_rmsnorm_fp4quant
+
+        torch.manual_seed(42)
+        block_size = 32
+        eps = 1e-6
+
+        x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        r = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
+
+        # Call without providing y_fp4 and block_scale
+        y_fp4, block_scale = add_rmsnorm_fp4quant(
+            x, r, weight, eps=eps, block_size=block_size, scale_format="ue8m0"
+        )
+
+        # Verify output shapes
+        assert y_fp4.shape == (batch_size, hidden_size // 2)
+        assert block_scale.shape == (batch_size, hidden_size // block_size)
+
+        # Verify output dtypes
+        assert y_fp4.dtype == torch.uint8
+        assert block_scale.dtype == torch.uint8  # UE8M0 uses uint8
+
+        # Reference computation
+        h = x + r
+        ref_rmsnorm = llama_rms_norm(h, weight, eps=eps)
+
+        # Dequantize and verify values
+        y_dequant = dequantize_fp4_output(y_fp4, block_scale, block_size)
+        torch.testing.assert_close(
+            y_dequant,
+            ref_rmsnorm.float(),
+            rtol=0.3,
+            atol=0.7,
+        )
+
+    @pytest.mark.parametrize("batch_size", [16, 128])
+    @pytest.mark.parametrize("hidden_size", [512, 1024])
+    @pytest.mark.parametrize("dtype", [torch.float16])
+    def test_auto_allocation_swizzled(self, batch_size, hidden_size, dtype):
+        """Test auto-allocation with swizzled scale factor layout."""
+        from flashinfer.cute_dsl.add_rmsnorm_fp4quant import add_rmsnorm_fp4quant
+
+        torch.manual_seed(42)
+        block_size = 16
+        eps = 1e-6
+
+        x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        r = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
+
+        # Call without providing y_fp4 and block_scale, with swizzled layout
+        y_fp4, block_scale = add_rmsnorm_fp4quant(
+            x, r, weight, eps=eps, block_size=block_size, is_sf_swizzled_layout=True
+        )
+
+        # Verify output shapes
+        assert y_fp4.shape == (batch_size, hidden_size // 2)
+        # Swizzled layout has different shape
+        factor = block_size * 4
+        num_m_tiles = (batch_size + 127) // 128
+        num_k_tiles = (hidden_size + factor - 1) // factor
+        expected_swizzled_size = num_m_tiles * num_k_tiles * 32 * 4 * 4
+        assert block_scale.shape == (expected_swizzled_size,)
+
+        # Verify output dtypes
+        assert y_fp4.dtype == torch.uint8
+        assert block_scale.dtype == torch.float8_e4m3fn
+
+        # Unswizzle and compare with non-swizzled version
+        y_fp4_ref = torch.empty(
+            batch_size, hidden_size // 2, device="cuda", dtype=torch.uint8
+        )
+        block_scale_ref = torch.empty(
+            batch_size,
+            hidden_size // block_size,
+            device="cuda",
+            dtype=torch.float8_e4m3fn,
+        )
+        add_rmsnorm_fp4quant(
+            x, r, weight, y_fp4_ref, block_scale_ref, eps=eps, block_size=block_size
+        )
+
+        # FP4 values should be identical
+        torch.testing.assert_close(y_fp4, y_fp4_ref)
+
+        # Unswizzle and compare scales
+        block_scale_unswizzled = unswizzle_sf(
+            block_scale.view(torch.uint8), batch_size, hidden_size, block_size
+        ).view(torch.float8_e4m3fn)
+        torch.testing.assert_close(
+            block_scale_unswizzled.view(torch.uint8), block_scale_ref.view(torch.uint8)
+        )
+
+    @pytest.mark.parametrize("batch_size", [16, 128])
+    @pytest.mark.parametrize("hidden_size", [512, 1024])
+    def test_auto_allocation_matches_preallocated(self, batch_size, hidden_size):
+        """Test that auto-allocation produces same results as pre-allocated tensors."""
+        from flashinfer.cute_dsl.add_rmsnorm_fp4quant import add_rmsnorm_fp4quant
+
+        torch.manual_seed(42)
+        block_size = 16
+        eps = 1e-6
+        dtype = torch.float16
+
+        x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        r = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
+
+        # Pre-allocated version
+        y_fp4_pre = torch.empty(
+            batch_size, hidden_size // 2, device="cuda", dtype=torch.uint8
+        )
+        block_scale_pre = torch.empty(
+            batch_size,
+            hidden_size // block_size,
+            device="cuda",
+            dtype=torch.float8_e4m3fn,
+        )
+        add_rmsnorm_fp4quant(
+            x, r, weight, y_fp4_pre, block_scale_pre, eps=eps, block_size=block_size
+        )
+
+        # Auto-allocated version
+        y_fp4_auto, block_scale_auto = add_rmsnorm_fp4quant(
+            x, r, weight, eps=eps, block_size=block_size
+        )
+
+        # Results should be identical
+        torch.testing.assert_close(y_fp4_auto, y_fp4_pre)
+        torch.testing.assert_close(
+            block_scale_auto.view(torch.uint8), block_scale_pre.view(torch.uint8)
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

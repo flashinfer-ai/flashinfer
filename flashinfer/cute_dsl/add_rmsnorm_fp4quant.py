@@ -2220,13 +2220,13 @@ def add_rmsnorm_fp4quant(
     input: torch.Tensor,
     residual: torch.Tensor,
     weight: torch.Tensor,
-    y_fp4: torch.Tensor,
-    block_scale: torch.Tensor,
+    y_fp4: torch.Tensor | None = None,
+    block_scale: torch.Tensor | None = None,
     eps: float = 1e-6,
     block_size: int = 16,
     scale_format: str | None = None,
     is_sf_swizzled_layout: bool = False,
-) -> None:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Fused Add + RMS normalization + FP4 quantization using CuTe-DSL.
 
@@ -2243,11 +2243,12 @@ def add_rmsnorm_fp4quant(
     weight : torch.Tensor
         Weight tensor for RMSNorm, shape ``(hidden_size,)``.
         Must have the same dtype as input.
-    y_fp4 : torch.Tensor
+    y_fp4 : torch.Tensor, optional
         Output tensor for quantized values in FP4_E2M1 format, packed as uint8.
         Two FP4 values are packed into each uint8 byte.
         Shape must be ``(batch_size, hidden_size // 2)`` or matching 3D input.
-    block_scale : torch.Tensor
+        If ``None``, will be allocated automatically.
+    block_scale : torch.Tensor, optional
         Output tensor for per-block scale factors.
 
         - If ``is_sf_swizzled_layout=False`` (default): row-major layout with shape
@@ -2258,7 +2259,7 @@ def add_rmsnorm_fp4quant(
           ``[m_tile][k_tile][outer_m (32)][inner_m (4)][inner_k (4)]``.
 
         Dtype should be ``torch.float8_e4m3fn`` for E4M3 format or ``torch.uint8``
-        for UE8M0 format.
+        for UE8M0 format. If ``None``, will be allocated automatically.
     eps : float
         Epsilon for numerical stability in RMSNorm. Default is ``1e-6``.
     block_size : int
@@ -2277,6 +2278,14 @@ def add_rmsnorm_fp4quant(
         where ``outer_m = row % 32``, ``inner_m = (row % 128) // 32``, etc.
         Default is ``False`` (row-major layout).
 
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        A tuple of ``(y_fp4, block_scale)``:
+
+        - ``y_fp4``: Quantized FP4 values packed as uint8.
+        - ``block_scale``: Per-block scale factors.
+
     Notes
     -----
     - Requires SM100+ (Blackwell) for FP4 quantization PTX intrinsics.
@@ -2287,15 +2296,13 @@ def add_rmsnorm_fp4quant(
     is_3d = input.dim() == 3
     if is_3d:
         B, S, H = input.shape
-        input = input.view(B * S, H).contiguous()
-        residual = residual.view(B * S, H).contiguous()
-        y_fp4_2d = y_fp4.view(B * S, -1)
-        block_scale_2d = block_scale.view(B * S, -1)
+        input_2d = input.view(B * S, H).contiguous()
+        residual_2d = residual.view(B * S, H).contiguous()
     else:
-        y_fp4_2d = y_fp4
-        block_scale_2d = block_scale
+        input_2d = input
+        residual_2d = residual
 
-    batch_size, hidden_size = input.shape
+    batch_size, hidden_size = input_2d.shape
     dtype = input.dtype
 
     assert hidden_size % block_size == 0, "hidden_size must be divisible by block_size"
@@ -2308,6 +2315,57 @@ def add_rmsnorm_fp4quant(
     )
     sm_version = get_sm_version(input.device)
 
+    # Allocate output tensors if not provided
+    if y_fp4 is None:
+        if is_3d:
+            y_fp4 = torch.empty(
+                (B, S, hidden_size // 2), dtype=torch.uint8, device=input.device
+            )
+        else:
+            y_fp4 = torch.empty(
+                (batch_size, hidden_size // 2), dtype=torch.uint8, device=input.device
+            )
+
+    if block_scale is None:
+        # Determine scale dtype based on format
+        scale_dtype = (
+            torch.uint8 if actual_scale_format == "ue8m0" else torch.float8_e4m3fn
+        )
+        num_sf_blocks_per_row = hidden_size // block_size
+
+        if is_sf_swizzled_layout:
+            # Swizzled layout: flattened with 128x4 tile pattern
+            num_m_tiles = (batch_size + 127) // 128
+            num_k_tiles = (num_sf_blocks_per_row + 3) // 4
+            k_tile_stride = 512
+            swizzled_size = num_m_tiles * num_k_tiles * k_tile_stride
+            block_scale = torch.empty(
+                (swizzled_size,), dtype=scale_dtype, device=input.device
+            )
+        else:
+            if is_3d:
+                block_scale = torch.empty(
+                    (B, S, num_sf_blocks_per_row),
+                    dtype=scale_dtype,
+                    device=input.device,
+                )
+            else:
+                block_scale = torch.empty(
+                    (batch_size, num_sf_blocks_per_row),
+                    dtype=scale_dtype,
+                    device=input.device,
+                )
+
+    # Get 2D views for kernel
+    if is_3d:
+        y_fp4_2d = y_fp4.view(B * S, -1)
+        block_scale_2d = (
+            block_scale.view(B * S, -1) if not is_sf_swizzled_layout else block_scale
+        )
+    else:
+        y_fp4_2d = y_fp4
+        block_scale_2d = block_scale
+
     tensor_api = _get_compiled_kernel(
         hidden_size,
         block_size,
@@ -2317,14 +2375,16 @@ def add_rmsnorm_fp4quant(
         is_sf_swizzled_layout,
     )
     tensor_api(
-        input.contiguous(),
-        residual.contiguous(),
+        input_2d.contiguous(),
+        residual_2d.contiguous(),
         weight.contiguous(),
         y_fp4_2d,
         block_scale_2d.view(torch.uint8),
         batch_size,
         eps,
     )
+
+    return y_fp4, block_scale
 
 
 __all__ = [
