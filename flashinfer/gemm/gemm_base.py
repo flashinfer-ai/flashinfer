@@ -1347,8 +1347,8 @@ def execute_cudnn_gemm_mxfp8_graph(
     tactic: int = -1,
 ):
     variant_pack = {
-        UIDs.A_UID.value: a.view(torch.float8_e4m3fn),
-        UIDs.B_UID.value: b.view(torch.float8_e4m3fn),
+        UIDs.A_UID.value: a,
+        UIDs.B_UID.value: b,
         UIDs.BLOCK_DESCALE_A_UID.value: a_descale,
         UIDs.BLOCK_DESCALE_B_UID.value: b_descale,
         UIDs.O_UID.value: c_final,

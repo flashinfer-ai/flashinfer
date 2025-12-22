@@ -825,7 +825,7 @@ def testBmmMxfp8(args):
 
     if len(backends) == 0:
         print("[ERROR] No backends to test. Exiting.")
-        return
+        return res
 
     ## Prepare input tensors
     input = torch.randn([batch_size, m, k], device=device, dtype=torch.bfloat16)
@@ -943,7 +943,7 @@ def testBmmMxfp8(args):
                 m * k * torch.float8_e4m3fn.itemsize
                 + n * k * torch.float8_e4m3fn.itemsize
                 + m * n * res_dtype.itemsize
-            )
+            ) * batch_size
             tflops = problem_flops / (10**9 * median_time)  # in TFLOPs/sec
             tb_per_sec = problem_bytes / (10**9 * median_time)  # in TB/sec
             print_perf_metrics(backend_name, median_time, std_time, tflops, tb_per_sec)
