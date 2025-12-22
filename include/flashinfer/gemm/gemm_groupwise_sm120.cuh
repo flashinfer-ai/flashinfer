@@ -156,13 +156,12 @@ cudaError_t CutlassGroupwiseScaledGEMMSM120(void* float_buffer, size_t float_buf
 
   // Pass workspace pointer only if needed
   void* kernel_workspace = nullptr;
-  if (workspace_size > 0) {  // Only provide a pointer if workspace is actually needed
+  if (workspace_size > 0) {
     kernel_workspace = float_buffer;
   }
 
   status = gemm.initialize(arguments, kernel_workspace);
   if (status != cutlass::Status::kSuccess) {
-    // Don't continue if initialization failed
     return cudaErrorNotSupported;
   }
 

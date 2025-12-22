@@ -194,6 +194,11 @@ def get_gemm_sm120_module():
     return module
 
 
+def _pad_to_multiple(x: int, multiple: int) -> int:
+    """Round up x to the next multiple."""
+    return ((x + multiple - 1) // multiple) * multiple
+
+
 @functools.cache
 def get_gemm_sm120_module_cutlass_fp8():
     """Get CUTLASS FP8 runner for SM120/SM121 using the groupwise scaling kernel."""
@@ -251,17 +256,114 @@ def get_gemm_sm120_module_cutlass_fp8():
                 scale_gran_n = 128
                 scale_gran_k = 128
 
+                # SM120 CUTLASS blockwise scaling requires:
+                # - N % 128 == 0 (ScaleGranularityN)
+                # - K % 128 == 0 (TileK)
+                # If not aligned, we need to pad and then slice the result
+                n_padded = _pad_to_multiple(n_dim, scale_gran_n)
+                k_padded = _pad_to_multiple(k_dim, scale_gran_k)
+                needs_n_padding = n_padded != n_dim
+                needs_k_padding = k_padded != k_dim
+
+                # For aligned cases (no padding needed), pass tensors directly
+                # The kernel expects the transposed (non-contiguous) layout for B
+                if not needs_k_padding and not needs_n_padding:
+                    # No padding needed - use original tensors
+                    a_padded = a
+                    b_col_major_padded = b_col_major
+                else:
+                    # Padding needed
+                    # Key insight: The kernel expects B in transposed layout [batch, k, n]
+                    # with strides that make k vary fastest (the column-major pattern).
+                    # Original B comes from: randn([batch, n, k]).transpose(-2, -1)
+                    # So the underlying data is [batch, n, k] but view is [batch, k, n]
+                    #
+                    # To pad correctly while preserving this layout:
+                    # 1. Work with the underlying [batch, n, k] layout
+                    # 2. Pad n (now the second dim in underlying layout)
+                    # 3. Transpose back to get [batch, k, n_padded] with correct strides
+
+                    # Helper function to pad FP8 tensors safely
+                    def _safe_pad_fp8(tensor, pad_sizes):
+                        """Safely pad an FP8 tensor by converting to bf16, padding, and back."""
+                        if all(p == 0 for p in pad_sizes):
+                            return tensor
+                        orig_dtype = tensor.dtype
+                        tensor_bf16 = tensor.to(torch.bfloat16)
+                        padded_bf16 = torch.nn.functional.pad(
+                            tensor_bf16, pad_sizes, value=0.0
+                        )
+                        return padded_bf16.to(orig_dtype)
+
+                    if a.dim() == 2:
+                        # 2D case: a is [m, k], b is [n, k] (transposed from [k, n])
+                        a_padded = a
+                        if needs_k_padding:
+                            a_padded = _safe_pad_fp8(
+                                a_padded.contiguous(), (0, k_padded - k_dim)
+                            )
+
+                        # For B: transpose to [k, n], pad, transpose back
+                        b_underlying = b_col_major.transpose(
+                            -2, -1
+                        ).contiguous()  # [k, n]
+                        if needs_n_padding:
+                            b_underlying = _safe_pad_fp8(
+                                b_underlying, (0, n_padded - n_dim)
+                            )  # pad n
+                        if needs_k_padding:
+                            b_underlying = _safe_pad_fp8(
+                                b_underlying, (0, 0, 0, k_padded - k_dim)
+                            )  # pad k
+                        b_col_major_padded = b_underlying.transpose(
+                            -2, -1
+                        )  # back to [n_padded, k_padded]
+                    else:
+                        # 3D case: a is [batch, m, k], b is [batch, k, n] (transposed from [batch, n, k])
+                        a_padded = a
+                        if needs_k_padding:
+                            a_padded = _safe_pad_fp8(
+                                a_padded.contiguous(), (0, k_padded - k_dim)
+                            )
+
+                        # For B: transpose to [batch, n, k], pad, transpose back
+                        b_underlying = b_col_major.transpose(
+                            -2, -1
+                        ).contiguous()  # [batch, n, k]
+
+                        # Pad: last dim is k, second-to-last is n
+                        if needs_n_padding or needs_k_padding:
+                            k_pad = k_padded - k_dim
+                            n_pad = n_padded - n_dim
+                            b_underlying = _safe_pad_fp8(
+                                b_underlying, (0, k_pad, 0, n_pad)
+                            )  # (left_k, right_k, left_n, right_n)
+
+                        # Transpose back to [batch, k_padded, n_padded] - this gives non-contiguous layout
+                        b_col_major_padded = b_underlying.transpose(-2, -1)
+
+                # Create padded output if needed
+                if needs_n_padding:
+                    if a.dim() == 2:
+                        out_padded = torch.empty(
+                            (m_dim, n_padded), device=out.device, dtype=out.dtype
+                        )
+                    else:
+                        out_padded = torch.empty(
+                            (batch_size, m_dim, n_padded),
+                            device=out.device,
+                            dtype=out.dtype,
+                        )
+                else:
+                    out_padded = out
+
                 # For scalar scales, create compatible shapes for SM120
-                # SM120 requires scale tensors with specific shapes based on granularity
-                # Scale shape should be [m/scale_gran_m, k/scale_gran_k] for A
-                # and [n/scale_gran_n, k/scale_gran_k] for B
+                # The kernel computes scale layout based on problem shape
                 if scale_a.numel() == 1:
                     scale_m_count = (
                         batch_size * m_dim + scale_gran_m - 1
                     ) // scale_gran_m
-                    scale_k_count = (
-                        k_dim + scale_gran_k - 1
-                    ) // scale_gran_k  # k dimension
+                    scale_k_count = (k_padded + scale_gran_k - 1) // scale_gran_k
                     scale_a_expanded = (
                         scale_a.view(1, 1)
                         .expand(scale_m_count, scale_k_count)
@@ -271,13 +373,10 @@ def get_gemm_sm120_module_cutlass_fp8():
                     scale_a_expanded = scale_a
 
                 if scale_b.numel() == 1:
-                    # Calculate the expected scale dimensions
                     scale_n_count = (
-                        batch_size * n_dim + scale_gran_n - 1
+                        batch_size * n_padded + scale_gran_n - 1
                     ) // scale_gran_n
-                    scale_k_count = (
-                        k_dim + scale_gran_k - 1
-                    ) // scale_gran_k  # k dimension
+                    scale_k_count = (k_padded + scale_gran_k - 1) // scale_gran_k
                     scale_b_expanded = (
                         scale_b.view(1, 1)
                         .expand(scale_n_count, scale_k_count)
@@ -289,16 +388,24 @@ def get_gemm_sm120_module_cutlass_fp8():
                 # Call SM120 gemm_fp8_nt_groupwise (now handles both 2D and 3D)
                 module.gemm_fp8_nt_groupwise(
                     workspace_buffer,
-                    a,
-                    b_col_major,
+                    a_padded,
+                    b_col_major_padded,
                     scale_a_expanded,
                     scale_b_expanded,
-                    out,
+                    out_padded,
                     scale_gran_m,  # scale_granularity_m
                     scale_gran_n,  # scale_granularity_n
                     scale_gran_k,  # scale_granularity_k (adjusted for small k)
                     "MN",  # scale_major_mode
                 )
+
+                # Slice the result if we padded
+                if needs_n_padding:
+                    if a.dim() == 2:
+                        out.copy_(out_padded[:, :n_dim])
+                    else:
+                        out.copy_(out_padded[:, :, :n_dim])
+
                 return out
 
         return CutlassFp8GemmRunner()
