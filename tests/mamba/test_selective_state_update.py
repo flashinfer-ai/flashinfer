@@ -105,9 +105,14 @@ def create_test_inputs(
         (batch_size, nheads, dim), (nheads, 1, 0)
     )
 
-    A = -torch.rand(nheads, dtype=torch.float32, device=device).as_strided(
-        (nheads, dim, dstate), (1, 0, 0)
-    )
+    A_base = -torch.rand(nheads, dtype=torch.float32, device=device)
+    A = A_base.as_strided((nheads, dim, dstate), (1, 0, 0))
+
+    # A = -torch.rand(nheads, dtype=torch.float32, device=device).as_strided(
+    #     (nheads, dim, dstate), (1, 0, 0)
+    # )
+    # print(f"A dtype: {A.dtype}, shape: {A.shape}, stride {A.stride()}")
+    assert(A.stride() == (1, 0, 0))
 
     # B and C - (batch_size, ngroups, dstate)
     B = torch.randn(batch_size, ngroups, dstate, dtype=input_dtype, device=device)
@@ -203,7 +208,7 @@ def test_selective_state_update(
         state,
         inputs["x"],
         inputs["dt"],
-        A,
+        inputs["A"],
         inputs["B"],
         inputs["C"],
         D=inputs["D"],
