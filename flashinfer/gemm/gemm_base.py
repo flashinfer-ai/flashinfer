@@ -194,11 +194,6 @@ def get_gemm_sm120_module():
     return module
 
 
-def _pad_to_multiple(x: int, multiple: int) -> int:
-    """Round up x to the next multiple."""
-    return ((x + multiple - 1) // multiple) * multiple
-
-
 @functools.cache
 def get_gemm_sm120_module_cutlass_fp8():
     """Get CUTLASS FP8 runner for SM120/SM121 using the groupwise scaling kernel."""
@@ -250,6 +245,10 @@ def get_gemm_sm120_module_cutlass_fp8():
                 scale_gran_n = 128
                 scale_gran_k = 128
 
+                # Helper to round up to the next multiple
+                def _pad_to_multiple(x, multiple):
+                    return ((x + multiple - 1) // multiple) * multiple
+
                 # SM120 CUTLASS blockwise scaling requires:
                 # - N % 128 == 0 (ScaleGranularityN)
                 # - K % 128 == 0 (TileK)
@@ -277,64 +276,43 @@ def get_gemm_sm120_module_cutlass_fp8():
                     # 2. Pad n (now the second dim in underlying layout)
                     # 3. Transpose back to get [batch, k, n_padded] with correct strides
 
-                    # Helper function to pad FP8 tensors safely
-                    def _safe_pad_fp8(tensor, pad_sizes):
-                        """Safely pad an FP8 tensor by converting to bf16, padding, and back."""
-                        if all(p == 0 for p in pad_sizes):
-                            return tensor
-                        orig_dtype = tensor.dtype
-                        tensor_bf16 = tensor.to(torch.bfloat16)
-                        padded_bf16 = torch.nn.functional.pad(
-                            tensor_bf16, pad_sizes, value=0.0
-                        )
-                        return padded_bf16.to(orig_dtype)
-
                     if a.dim() == 2:
-                        # 2D case: a is [m, k], b is [n, k] (transposed from [k, n])
+                        # 2D case: a is [m, k], b_col_major is [n, k]
                         a_padded = a
                         if needs_k_padding:
-                            a_padded = _safe_pad_fp8(
+                            a_padded = torch.nn.functional.pad(
                                 a_padded.contiguous(), (0, k_padded - k_dim)
                             )
 
-                        # For B: transpose to [k, n], pad, transpose back
-                        b_underlying = b_col_major.transpose(
-                            -2, -1
-                        ).contiguous()  # [k, n]
-                        if needs_n_padding:
-                            b_underlying = _safe_pad_fp8(
-                                b_underlying, (0, n_padded - n_dim)
-                            )  # pad n
-                        if needs_k_padding:
-                            b_underlying = _safe_pad_fp8(
-                                b_underlying, (0, 0, 0, k_padded - k_dim)
-                            )  # pad k
-                        b_col_major_padded = b_underlying.transpose(
-                            -2, -1
-                        )  # back to [n_padded, k_padded]
+                        # For B: Create padded tensor and copy data directly
+                        # The kernel expects [n, k] shape with underlying [k, n] memory layout
+                        # (i.e., k varies fastest). Achieve this by creating [k_padded, n_padded]
+                        # contiguous tensor and transposing to get [n_padded, k_padded] view.
+                        b_underlying_padded = torch.zeros(
+                            (k_padded, n_padded),
+                            dtype=b_col_major.dtype,
+                            device=b_col_major.device,
+                        )
+                        b_col_major_padded = b_underlying_padded.transpose(-2, -1)
+                        b_col_major_padded[:n_dim, :k_dim].copy_(b_col_major)
                     else:
-                        # 3D case: a is [batch, m, k], b is [batch, k, n] (transposed from [batch, n, k])
+                        # 3D case: a is [batch, m, k], b_col_major is [batch, k, n]
                         a_padded = a
                         if needs_k_padding:
-                            a_padded = _safe_pad_fp8(
+                            a_padded = torch.nn.functional.pad(
                                 a_padded.contiguous(), (0, k_padded - k_dim)
                             )
 
-                        # For B: transpose to [batch, n, k], pad, transpose back
-                        b_underlying = b_col_major.transpose(
-                            -2, -1
-                        ).contiguous()  # [batch, n, k]
-
-                        # Pad: last dim is k, second-to-last is n
-                        if needs_n_padding or needs_k_padding:
-                            k_pad = k_padded - k_dim
-                            n_pad = n_padded - n_dim
-                            b_underlying = _safe_pad_fp8(
-                                b_underlying, (0, k_pad, 0, n_pad)
-                            )  # (left_k, right_k, left_n, right_n)
-
-                        # Transpose back to [batch, k_padded, n_padded] - this gives non-contiguous layout
-                        b_col_major_padded = b_underlying.transpose(-2, -1)
+                        # For B: Create padded tensor and copy data directly
+                        # The kernel expects [batch, k, n] shape with underlying [batch, n, k]
+                        # memory layout. Create [batch, n_padded, k_padded] and transpose.
+                        b_underlying_padded = torch.zeros(
+                            (batch_size, n_padded, k_padded),
+                            dtype=b_col_major.dtype,
+                            device=b_col_major.device,
+                        )
+                        b_col_major_padded = b_underlying_padded.transpose(-2, -1)
+                        b_col_major_padded[:, :k_dim, :n_dim].copy_(b_col_major)
 
                 # Create padded output if needed
                 if needs_n_padding:
