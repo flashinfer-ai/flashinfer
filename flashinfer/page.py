@@ -174,8 +174,8 @@ def get_batch_indices_positions(
     append_paged_kv_cache
     """
     batch_size = append_indptr.size(0) - 1
-    dtype = append_indptr.dtype
     device = append_indptr.device
+    dtype = torch.int32
 
     if batch_indices is None:
         batch_indices = torch.empty((nnz,), device=device, dtype=dtype)
