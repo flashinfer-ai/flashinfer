@@ -246,12 +246,6 @@ def get_gemm_sm120_module_cutlass_fp8():
                     k_dim = a.shape[2]
                     batch_size = a.shape[0]
 
-                # ScaleGranularityK must equal TileK (128)
-                if k_dim < 128:
-                    raise ValueError(
-                        f"SM120/SM121 CUTLASS blockwise scaling requires k >= 128, got k={k_dim}. "
-                    )
-
                 scale_gran_m = 1
                 scale_gran_n = 128
                 scale_gran_k = 128
@@ -2407,9 +2401,8 @@ def _heuristic_func_bmm_fp8(
         if is_sm_supported:
             heuristic_backends.append("cutlass_sm10x")
         elif is_sm120_supported:
-            k_dim = A.shape[-1] if A.dim() == 2 else A.shape[2]
-            if k_dim >= 128:
-                heuristic_backends.append("cutlass_sm12x")
+            # supports all K values through padding
+            heuristic_backends.append("cutlass_sm12x")
     if "cublas" in suitable_backends:
         heuristic_backends.append("cublas")
     if CUDNN_AVAILABLE and "cudnn" in suitable_backends:
