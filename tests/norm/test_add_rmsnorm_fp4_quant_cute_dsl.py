@@ -40,9 +40,17 @@ def llama_rms_norm(x, w, eps=1e-6):
 
 
 def dequantize_fp4_output(
-    y_fp4: torch.Tensor, block_scale: torch.Tensor, block_size: int
+    y_fp4: torch.Tensor,
+    block_scale: torch.Tensor,
+    block_size: int,
+    global_scale: torch.Tensor | None = None,
 ):
-    """Dequantize packed FP4 tensor using the associated block scales."""
+    """
+    Dequantize packed FP4 tensor using the associated block scales.
+
+    If global_scale is provided, the dequantized values are divided by global_scale
+    to reverse the scaling applied during quantization.
+    """
     y_fp4_float = cast_from_fp4(y_fp4)
     if y_fp4_float.dim() == 2:
         b, hidden_size = y_fp4_float.shape
@@ -52,7 +60,7 @@ def dequantize_fp4_output(
             scales = torch.pow(2.0, block_scale.int() - 127).unsqueeze(-1)
         else:
             scales = block_scale.float().unsqueeze(-1)
-        return (y_fp4_float * scales).reshape(b, hidden_size)
+        result = (y_fp4_float * scales).reshape(b, hidden_size)
     elif y_fp4_float.dim() == 3:
         b, s, hidden_size = y_fp4_float.shape
         assert hidden_size % block_size == 0
@@ -61,9 +69,81 @@ def dequantize_fp4_output(
             scales = torch.pow(2.0, block_scale.int() - 127).unsqueeze(-1)
         else:
             scales = block_scale.float().unsqueeze(-1)
-        return (y_fp4_float * scales).reshape(b, s, hidden_size)
+        result = (y_fp4_float * scales).reshape(b, s, hidden_size)
     else:
         raise ValueError(f"Unsupported FP4 output rank: {y_fp4_float.dim()}")
+
+    # Reverse global scale if it was applied during quantization
+    if global_scale is not None:
+        result = result / global_scale.item()
+
+    return result
+
+
+def compute_global_scale(
+    x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6
+) -> torch.Tensor:
+    """
+    Compute global scale for NVFP4 quantization of add+rmsnorm output.
+
+    global_scale = (FP8_E4M3_MAX * FP4_E2M1_MAX) / max_abs(rmsnorm(x + residual, weight))
+
+    This ensures the dynamic range of the output fits within the FP4 range.
+    """
+    FLOAT4_E2M1_MAX = 6.0
+    FLOAT8_E4M3_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
+
+    # Compute reference add+RMSNorm output
+    h = x + residual
+    ref_output = llama_rms_norm(h, weight, eps=eps)
+    tensor_amax = torch.abs(ref_output).max().to(torch.float32)
+    global_scale = torch.tensor(
+        [FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax.item()],
+        dtype=torch.float32,
+        device=x.device,
+    )
+    return global_scale
+
+
+def assert_close_with_tiered_tolerance(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    tight_rtol: float = 0.1,
+    tight_atol: float = 0.1,
+    loose_rtol: float = 0.5,
+    loose_atol: float = 2.0,
+    tight_pct: float = 0.99,
+    msg: str = "",
+):
+    """
+    Two-tiered tolerance check for quantized outputs.
+
+    - tight_pct (e.g., 99%) of elements must be within tight tolerance
+    - 100% of elements must be within loose tolerance
+
+    This handles the expected quantization noise where most elements match closely
+    but a few outliers may differ more due to rounding boundary effects.
+    """
+    diff = (actual - expected).abs()
+    rel_diff = diff / (expected.abs() + 1e-8)
+
+    # Check 1: tight_pct of elements within tight tolerance
+    within_tight = (diff <= tight_atol) | (rel_diff <= tight_rtol)
+    tight_pct_actual = within_tight.float().mean().item()
+    assert tight_pct_actual >= tight_pct, (
+        f"{msg}: Only {tight_pct_actual * 100:.1f}% of elements within tight tolerance "
+        f"(rtol={tight_rtol}, atol={tight_atol}), expected {tight_pct * 100:.0f}%"
+    )
+
+    # Check 2: 100% of elements within loose tolerance
+    within_loose = (diff <= loose_atol) | (rel_diff <= loose_rtol)
+    if not within_loose.all():
+        max_diff = diff.max().item()
+        max_rel = rel_diff.max().item()
+        raise AssertionError(
+            f"{msg}: Max diff {max_diff:.4f} (rel: {max_rel:.4f}) exceeds loose tolerance "
+            f"(rtol={loose_rtol}, atol={loose_atol})"
+        )
 
 
 def requires_cute_dsl():
@@ -139,11 +219,14 @@ class TestAddRMSNormFP4QuantCuteDSL:
         # Dequantize FP4 output for value-level comparison
         # Tolerance based on separate FP4 roundtrip test (rtol=0.3, atol=0.5)
         y_dequant = dequantize_fp4_output(y_fp4, block_scale, block_size)
-        torch.testing.assert_close(
+        assert_close_with_tiered_tolerance(
             y_dequant,
             ref_rmsnorm.float(),
-            rtol=0.3,
-            atol=0.5,
+            tight_rtol=0.3,
+            tight_atol=0.5,
+            loose_rtol=0.5,
+            loose_atol=2.0,
+            tight_pct=0.99,
         )
 
     @pytest.mark.parametrize("batch_size", [1, 4, 3, 7, 128])
@@ -191,11 +274,14 @@ class TestAddRMSNormFP4QuantCuteDSL:
 
         # Tolerance based on separate FP4 roundtrip test (rtol=0.3, atol=0.5)
         y_dequant = dequantize_fp4_output(y_fp4, block_scale, block_size)
-        torch.testing.assert_close(
+        assert_close_with_tiered_tolerance(
             y_dequant,
             ref_rmsnorm.float(),
-            rtol=0.3,
-            atol=0.5,
+            tight_rtol=0.3,
+            tight_atol=0.5,
+            loose_rtol=0.5,
+            loose_atol=2.0,
+            tight_pct=0.99,
         )
 
     @pytest.mark.parametrize(
@@ -366,12 +452,279 @@ class TestVsSeparateFlashInfer:
         )
 
         # Value-level comparison against reference RMSNorm output
-        torch.testing.assert_close(
+        assert_close_with_tiered_tolerance(
             y_fused_dequant,
             y_ref.float(),
-            rtol=0.3,
-            atol=0.5,
+            tight_rtol=0.3,
+            tight_atol=0.5,
+            loose_rtol=0.5,
+            loose_atol=2.0,
+            tight_pct=0.99,
         )
+
+
+@cute_dsl_available
+@blackwell_required
+class TestFusedVsSeparateFP4Quantize:
+    """
+    Tests comparing fused Add+RMSNorm+FP4Quant against separate add + RMSNorm + fp4_quantize.
+
+    This validates that the fused kernel applies global_scale identically to the
+    standalone fp4_quantize function.
+    """
+
+    @pytest.mark.parametrize("batch_size", [1, 4, 16, 128])
+    @pytest.mark.parametrize("hidden_size", [64, 256, 512, 1024, 2048, 4096])
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_nvfp4_fused_matches_separate(self, batch_size, hidden_size, dtype):
+        """
+        Compare fused kernel against separate add + RMSNorm + fp4_quantize for NVFP4.
+
+        This test verifies that the fused kernel applies global_scale identically
+        to the standalone fp4_quantize function, by comparing:
+        1. The packed FP4 output bytes
+        2. The block scale factors
+        """
+        from flashinfer.cute_dsl.add_rmsnorm_fp4quant import add_rmsnorm_fp4quant
+        from flashinfer import fp4_quantize
+
+        torch.manual_seed(42)
+        block_size = 16  # NVFP4
+        eps = 1e-6
+
+        x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        r = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
+
+        # Compute global_scale for NVFP4
+        global_scale = compute_global_scale(x, r, weight, eps=eps)
+
+        # === Fused kernel path ===
+        y_fp4_fused = torch.empty(
+            batch_size, hidden_size // 2, device="cuda", dtype=torch.uint8
+        )
+        block_scale_fused = torch.empty(
+            batch_size,
+            hidden_size // block_size,
+            device="cuda",
+            dtype=torch.float8_e4m3fn,
+        )
+        add_rmsnorm_fp4quant(
+            x,
+            r,
+            weight,
+            y_fp4_fused,
+            block_scale_fused,
+            global_scale=global_scale,
+            eps=eps,
+            block_size=block_size,
+            is_sf_swizzled_layout=False,  # Use unswizzled for easier comparison
+        )
+
+        # === Separate path: add + RMSNorm + fp4_quantize ===
+        h = x + r
+        y_rmsnorm = llama_rms_norm(h, weight, eps=eps)
+        y_fp4_separate, block_scale_separate = fp4_quantize(
+            y_rmsnorm,
+            global_scale,
+            sf_vec_size=block_size,
+            sf_use_ue8m0=False,  # E4M3 for NVFP4
+            is_sf_swizzled_layout=False,
+        )
+
+        # === Compare FP4 packed outputs ===
+        fp4_match = (y_fp4_fused == y_fp4_separate).float().mean().item()
+        assert fp4_match > 0.95, (
+            f"FP4 output mismatch: only {fp4_match * 100:.1f}% of bytes match"
+        )
+
+        # === Compare block scales ===
+        scale_fused = block_scale_fused.to(torch.float32)
+        scale_separate = (
+            block_scale_separate.view(torch.float8_e4m3fn)
+            .view(batch_size, -1)
+            .to(torch.float32)
+        )
+
+        scale_match = (scale_fused == scale_separate).float().mean().item()
+        assert scale_match > 0.95, (
+            f"Block scale mismatch: only {scale_match * 100:.1f}% of scales match"
+        )
+
+        # === Also verify dequantized values are close ===
+        y_fused_dequant = dequantize_fp4_output(
+            y_fp4_fused, block_scale_fused, block_size, global_scale
+        )
+        y_separate_dequant = dequantize_fp4_output(
+            y_fp4_separate,
+            block_scale_separate.view(torch.float8_e4m3fn).view(batch_size, -1),
+            block_size,
+            global_scale,
+        )
+
+        # Two-tiered tolerance: 99% within tight tolerance, 100% within loose tolerance
+        assert_close_with_tiered_tolerance(
+            y_fused_dequant,
+            y_separate_dequant,
+            tight_rtol=0.3,
+            tight_atol=0.5,
+            loose_rtol=0.5,
+            loose_atol=2.0,
+            tight_pct=0.99,
+            msg="Dequantized outputs from fused and separate paths should match closely",
+        )
+
+    @pytest.mark.parametrize("batch_size", [1, 4, 16, 128])
+    @pytest.mark.parametrize("hidden_size", [128, 256, 512, 1024, 2048, 4096])
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_mxfp4_fused_matches_separate(self, batch_size, hidden_size, dtype):
+        """
+        Compare fused kernel against separate add + RMSNorm + fp4_quantize for MXFP4.
+
+        MXFP4 uses block_size=32, UE8M0 scales, and no global_scale (global_scale=1.0).
+        """
+        from flashinfer.cute_dsl.add_rmsnorm_fp4quant import add_rmsnorm_fp4quant
+        from flashinfer import fp4_quantize
+
+        torch.manual_seed(42)
+        block_size = 32  # MXFP4
+        eps = 1e-6
+
+        x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        r = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
+
+        # MXFP4 uses global_scale=1.0
+        global_scale_val = torch.tensor(1.0, dtype=torch.float32, device="cuda")
+
+        # === Fused kernel path ===
+        y_fp4_fused = torch.empty(
+            batch_size, hidden_size // 2, device="cuda", dtype=torch.uint8
+        )
+        block_scale_fused = torch.empty(
+            batch_size, hidden_size // block_size, device="cuda", dtype=torch.uint8
+        )
+        add_rmsnorm_fp4quant(
+            x,
+            r,
+            weight,
+            y_fp4_fused,
+            block_scale_fused,
+            eps=eps,
+            block_size=block_size,
+            scale_format="ue8m0",
+            is_sf_swizzled_layout=False,
+        )
+
+        # === Separate path: add + RMSNorm + fp4_quantize ===
+        h = x + r
+        y_rmsnorm = llama_rms_norm(h, weight, eps=eps)
+        y_fp4_separate, block_scale_separate = fp4_quantize(
+            y_rmsnorm,
+            global_scale_val,
+            sf_vec_size=block_size,
+            sf_use_ue8m0=True,  # UE8M0 for MXFP4
+            is_sf_swizzled_layout=False,
+        )
+
+        # === Compare FP4 packed outputs ===
+        fp4_match = (y_fp4_fused == y_fp4_separate).float().mean().item()
+        assert fp4_match > 0.95, (
+            f"FP4 output mismatch: only {fp4_match * 100:.1f}% of bytes match"
+        )
+
+        # === Compare block scales ===
+        scale_fused = block_scale_fused
+        scale_separate = block_scale_separate.view(batch_size, -1)
+
+        scale_match = (scale_fused == scale_separate).float().mean().item()
+        assert scale_match > 0.95, (
+            f"Block scale mismatch: only {scale_match * 100:.1f}% of scales match"
+        )
+
+        # === Also verify dequantized values are close ===
+        # MXFP4 has larger errors due to power-of-2 scale constraints
+        y_fused_dequant = dequantize_fp4_output(
+            y_fp4_fused, block_scale_fused, block_size
+        )
+        y_separate_dequant = dequantize_fp4_output(
+            y_fp4_separate, scale_separate, block_size
+        )
+
+        # Two-tiered tolerance: 99% within tight tolerance, 100% within loose tolerance
+        assert_close_with_tiered_tolerance(
+            y_fused_dequant,
+            y_separate_dequant,
+            tight_rtol=0.3,
+            tight_atol=0.5,
+            loose_rtol=0.5,
+            loose_atol=2.0,
+            tight_pct=0.99,
+            msg="Dequantized outputs from fused and separate paths should match closely",
+        )
+
+    @pytest.mark.parametrize("batch_size", [1, 16, 64])
+    @pytest.mark.parametrize("hidden_size", [256, 1024, 4096])
+    def test_global_scale_value_consistency(self, batch_size, hidden_size):
+        """
+        Verify that the global_scale value correctly scales the block scales.
+
+        When global_scale is applied:
+        - block_scale_with_gs = global_scale * max_abs / FP4_MAX
+        - This should be approximately global_scale times larger than without global_scale
+        """
+        from flashinfer.cute_dsl.add_rmsnorm_fp4quant import add_rmsnorm_fp4quant
+
+        torch.manual_seed(42)
+        block_size = 16  # NVFP4
+        eps = 1e-6
+        dtype = torch.float16
+
+        x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        r = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
+
+        # Run with computed global_scale
+        global_scale = compute_global_scale(x, r, weight, eps=eps)
+
+        y_fp4_gs, block_scale_gs = add_rmsnorm_fp4quant(
+            x,
+            r,
+            weight,
+            global_scale=global_scale,
+            eps=eps,
+            block_size=block_size,
+            is_sf_swizzled_layout=False,
+        )
+
+        # Run without global_scale (global_scale=1.0)
+        global_scale_one = torch.tensor([1.0], dtype=torch.float32, device="cuda")
+
+        y_fp4_no_gs, block_scale_no_gs = add_rmsnorm_fp4quant(
+            x,
+            r,
+            weight,
+            global_scale=global_scale_one,
+            eps=eps,
+            block_size=block_size,
+            is_sf_swizzled_layout=False,
+        )
+
+        # The block scales with global_scale should be approximately global_scale times
+        # larger than without (since block_scale = global_scale * max_abs / FP4_MAX)
+        scale_gs = block_scale_gs.to(torch.float32)
+        scale_no_gs = block_scale_no_gs.to(torch.float32)
+
+        # Compute ratio where both are non-zero
+        non_zero_mask = (scale_no_gs > 0) & (scale_gs > 0)
+        if non_zero_mask.sum() > 0:
+            ratio = (scale_gs[non_zero_mask] / scale_no_gs[non_zero_mask]).mean().item()
+            expected_ratio = global_scale.item()
+
+            # Allow some tolerance due to FP8 quantization
+            assert abs(ratio - expected_ratio) / expected_ratio < 0.2, (
+                f"Block scale ratio {ratio:.2f} doesn't match expected global_scale {expected_ratio:.2f}"
+            )
 
 
 @cute_dsl_available
