@@ -245,67 +245,44 @@ def get_gemm_sm120_module_cutlass_fp8():
                 scale_gran_n = 128
                 scale_gran_k = 128
 
-                # Helper to round up to the next multiple
+                # round up to the next multiple
                 def _pad_to_multiple(x, multiple):
                     return ((x + multiple - 1) // multiple) * multiple
 
                 # SM120 CUTLASS blockwise scaling requires:
                 # - N % 128 == 0 (ScaleGranularityN)
                 # - K % 128 == 0 (TileK)
-                # If not aligned, we need to pad and then slice the result
+                # If not aligned, we pad and then slice the result
                 n_padded = _pad_to_multiple(n_dim, scale_gran_n)
                 k_padded = _pad_to_multiple(k_dim, scale_gran_k)
                 needs_n_padding = n_padded != n_dim
                 needs_k_padding = k_padded != k_dim
 
-                # For aligned cases (no padding needed), pass tensors directly
-                # The kernel expects the transposed (non-contiguous) layout for B
                 if not needs_k_padding and not needs_n_padding:
-                    # No padding needed - use original tensors
+                    # No padding needed
                     a_padded = a
                     b_col_major_padded = b_col_major
                 else:
                     # Padding needed
-                    # Key insight: The kernel expects B in transposed layout [batch, k, n]
-                    # with strides that make k vary fastest (the column-major pattern).
-                    # Original B comes from: randn([batch, n, k]).transpose(-2, -1)
-                    # So the underlying data is [batch, n, k] but view is [batch, k, n]
-                    #
-                    # To pad correctly while preserving this layout:
-                    # 1. Work with the underlying [batch, n, k] layout
-                    # 2. Pad n (now the second dim in underlying layout)
-                    # 3. Transpose back to get [batch, k, n_padded] with correct strides
-
                     if a.dim() == 2:
-                        # 2D case: a is [m, k], b_col_major is [n, k]
                         a_padded = a
                         if needs_k_padding:
                             a_padded = torch.nn.functional.pad(
                                 a_padded.contiguous(), (0, k_padded - k_dim)
                             )
-
-                        # For B: Create padded tensor and copy data directly
-                        # The kernel expects [n, k] shape with underlying [k, n] memory layout
-                        # (i.e., k varies fastest). Achieve this by creating [k_padded, n_padded]
-                        # contiguous tensor and transposing to get [n_padded, k_padded] view.
-                        b_underlying_padded = torch.zeros(
-                            (k_padded, n_padded),
+                        b_col_major_padded = torch.zeros(
+                            (n_padded, k_padded),
                             dtype=b_col_major.dtype,
                             device=b_col_major.device,
                         )
-                        b_col_major_padded = b_underlying_padded.transpose(-2, -1)
                         b_col_major_padded[:n_dim, :k_dim].copy_(b_col_major)
                     else:
-                        # 3D case: a is [batch, m, k], b_col_major is [batch, k, n]
                         a_padded = a
                         if needs_k_padding:
                             a_padded = torch.nn.functional.pad(
                                 a_padded.contiguous(), (0, k_padded - k_dim)
                             )
 
-                        # For B: Create padded tensor and copy data directly
-                        # The kernel expects [batch, k, n] shape with underlying [batch, n, k]
-                        # memory layout. Create [batch, n_padded, k_padded] and transpose.
                         b_underlying_padded = torch.zeros(
                             (batch_size, n_padded, k_padded),
                             dtype=b_col_major.dtype,
@@ -330,7 +307,6 @@ def get_gemm_sm120_module_cutlass_fp8():
                     out_padded = out
 
                 # For scalar scales, create compatible shapes for SM120
-                # The kernel computes scale layout based on problem shape
                 if scale_a.numel() == 1:
                     scale_m_count = (
                         batch_size * m_dim + scale_gran_m - 1
