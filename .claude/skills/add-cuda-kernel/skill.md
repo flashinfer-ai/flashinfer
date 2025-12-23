@@ -382,6 +382,7 @@ import torch
 from typing import Optional
 
 from .jit.scale import gen_scale_module
+from .utils import backend_requirement, supported_compute_capability
 
 
 @functools.cache
@@ -390,6 +391,30 @@ def get_scale_module(dtype_in, dtype_out):
     return gen_scale_module(dtype_in, dtype_out).build_and_load()
 
 
+@supported_compute_capability([80, 86, 89, 90, 100, 103, 110, 120])
+def _check_scale_problem_size(input: torch.Tensor, factor: float,
+                               out: Optional[torch.Tensor] = None) -> bool:
+    """Validate inputs for scale operation."""
+    # Validate input
+    if not input.is_cuda:
+        raise ValueError("Input must be a CUDA tensor")
+
+    # Validate output if provided
+    if out is not None:
+        if out.shape != input.shape:
+            raise ValueError("Output shape mismatch")
+        if out.dtype != input.dtype:
+            raise ValueError("Output dtype mismatch")
+        if not out.is_cuda:
+            raise ValueError("Output must be a CUDA tensor")
+
+    return True
+
+
+@backend_requirement(
+    backend_checks={},  # No backend choices for this simple kernel
+    common_check=_check_scale_problem_size,
+)
 def scale(input: torch.Tensor, factor: float,
           out: Optional[torch.Tensor] = None) -> torch.Tensor:
     """
@@ -418,16 +443,9 @@ def scale(input: torch.Tensor, factor: float,
     >>> torch.allclose(y, x * 2.0)
     True
     """
-    # Validate input
-    assert input.is_cuda, "Input must be a CUDA tensor"
-
     # Allocate output if needed
     if out is None:
         out = torch.empty_like(input)
-    else:
-        assert out.shape == input.shape, "Output shape mismatch"
-        assert out.dtype == input.dtype, "Output dtype mismatch"
-        assert out.is_cuda, "Output must be a CUDA tensor"
 
     # Get module (compile if first call with this dtype)
     dtype_str = str(input.dtype).replace("torch.", "")
@@ -444,7 +462,153 @@ def scale(input: torch.Tensor, factor: float,
 - Uses `@functools.cache` to cache compiled modules
 - Clean Python API with docstring
 - Handles output allocation
-- Validates inputs
+- Validates inputs using `@backend_requirement` decorator
+
+### Using `@backend_requirement` and `@supported_compute_capability` Decorators
+
+FlashInfer provides two decorators for enforcing compute capability and backend requirements:
+
+#### `@supported_compute_capability` Decorator
+
+Marks a function with its supported CUDA compute capabilities:
+
+```python
+from flashinfer.utils import supported_compute_capability
+
+@supported_compute_capability([80, 86, 89, 90, 100, 103, 110, 120])
+def _my_check_function(input, output):
+    """Supports SM80 (Ampere) through SM120 (Blackwell)."""
+    # Validation logic here
+    return True
+```
+
+#### `@backend_requirement` Decorator
+
+Enforces backend and problem size requirements at runtime. There are three usage patterns:
+
+**Pattern 1: Single Backend (No Backend Choices)**
+
+For kernels with only one implementation (like our scale example):
+
+```python
+from flashinfer.utils import backend_requirement, supported_compute_capability
+
+@supported_compute_capability([80, 86, 89, 90, 100, 103, 110, 120])
+def _check_my_kernel(input, output):
+    """Validate inputs. Must return True if valid."""
+    if input.shape[-1] > 256:
+        raise ValueError("Head dimension must be <= 256")
+    return True
+
+@backend_requirement(
+    backend_checks={},  # Empty dict = no backend parameter
+    common_check=_check_my_kernel,
+)
+def my_kernel(input, output):
+    # Kernel implementation
+    pass
+```
+
+**Pattern 2: Multiple Backends**
+
+For kernels with multiple implementation backends (e.g., CUTLASS, cuDNN):
+
+```python
+@supported_compute_capability([80, 86, 89, 90])
+def _cutlass_check(q, k, v, backend):
+    """CUTLASS backend: Ampere through Hopper."""
+    if q.shape[-1] > 256:
+        raise ValueError("CUTLASS: head_dim must be <= 256")
+    return True
+
+@supported_compute_capability([75, 80, 86, 89, 90, 100])
+def _cudnn_check(q, k, v, backend):
+    """cuDNN backend: Turing through Blackwell."""
+    return True
+
+@backend_requirement(
+    backend_checks={
+        "cutlass": _cutlass_check,
+        "cudnn": _cudnn_check,
+    },
+    common_check=None,  # Optional: shared validation for all backends
+)
+def attention(q, k, v, backend="cutlass"):
+    if backend == "cutlass":
+        # CUTLASS implementation
+        pass
+    elif backend == "cudnn":
+        # cuDNN implementation
+        pass
+```
+
+**Pattern 3: Auto Backend Selection**
+
+For kernels that can automatically select the best backend:
+
+```python
+def _heuristic_func(suitable_backends, q, k, v, backend):
+    """Return backends in order of preference."""
+    # Prefer CUTLASS for small head dims, cuDNN for larger
+    if q.shape[-1] <= 128:
+        preferred = ["cutlass", "cudnn"]
+    else:
+        preferred = ["cudnn", "cutlass"]
+    return [b for b in preferred if b in suitable_backends]
+
+@backend_requirement(
+    backend_checks={
+        "cutlass": _cutlass_check,
+        "cudnn": _cudnn_check,
+    },
+    common_check=_common_validation,
+    heuristic_func=_heuristic_func,  # Required when backend="auto" is used
+)
+def attention(q, k, v, backend="auto"):
+    if backend == "auto":
+        # Use the first backend from suitable_auto_backends
+        backend = attention.suitable_auto_backends[0]
+    # ... rest of implementation
+```
+
+#### Features Added by `@backend_requirement`
+
+The decorator adds these methods to the wrapped function:
+
+```python
+# Check if a backend is supported (optionally for a specific CC)
+scale.is_backend_supported("cutlass")           # True/False
+scale.is_backend_supported("cutlass", cc=90)    # True/False for Hopper
+
+# Check if any backend supports this compute capability
+scale.is_compute_capability_supported(90)       # True/False
+
+# Check if a backend exists
+scale.has_backend("cutlass")                    # True/False
+
+# Check if there are multiple backend choices
+scale.has_backend_choices()                     # True/False
+```
+
+#### `skip_check` Keyword Argument
+
+The decorator adds a `skip_check` keyword argument to bypass validation for performance-critical code paths:
+
+```python
+# Normal call with validation
+result = scale(x, 2.0)
+
+# Skip validation for performance (use with caution!)
+result = scale(x, 2.0, skip_check=True)
+```
+
+#### Check Function Requirements
+
+Check functions must:
+1. Accept the same arguments as the decorated function
+2. Return `True` if validation passes
+3. Raise `ValueError` with descriptive message if validation fails
+4. Be decorated with `@supported_compute_capability` to specify supported architectures
 
 ## Step 6: Write Tests in `tests/`
 
@@ -505,7 +669,7 @@ def test_scale_cpu_error():
 
     x = torch.randn(128, dtype=torch.float32)
 
-    with pytest.raises(AssertionError, match="CUDA"):
+    with pytest.raises(ValueError, match="CUDA"):
         flashinfer.scale(x, 2.0)
 ```
 
