@@ -174,22 +174,18 @@ def get_batch_indices_positions(
     append_paged_kv_cache
     """
     batch_size = append_indptr.size(0) - 1
+    dtype = append_indptr.dtype
+    device = append_indptr.device
 
     if batch_indices is None:
-        batch_indices = torch.empty(
-            (nnz,), device=append_indptr.device, dtype=torch.int32
-        )
+        batch_indices = torch.empty((nnz,), device=device, dtype=dtype)
     else:
-        check_shape_dtype_device(
-            batch_indices, (nnz,), torch.int32, append_indptr.device, "batch_indices"
-        )
+        check_shape_dtype_device(batch_indices, (nnz,), dtype, device, "batch_indices")
 
     if positions is None:
-        positions = torch.empty((nnz,), device=append_indptr.device, dtype=torch.int32)
+        positions = torch.empty((nnz,), device=device, dtype=dtype)
     else:
-        check_shape_dtype_device(
-            positions, (nnz,), torch.int32, append_indptr.device, "positions"
-        )
+        check_shape_dtype_device(positions, (nnz,), dtype, device, "positions")
 
     from .triton.page import get_batch_indices_positions_kernel
 
