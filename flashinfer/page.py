@@ -179,15 +179,17 @@ def get_batch_indices_positions(
         batch_indices = torch.empty(
             (nnz,), device=append_indptr.device, dtype=torch.int32
         )
-    check_shape_dtype_device(
-        batch_indices, (nnz,), torch.int32, append_indptr.device, "batch_indices"
-    )
+    else:
+        check_shape_dtype_device(
+            batch_indices, (nnz,), torch.int32, append_indptr.device, "batch_indices"
+        )
 
     if positions is None:
         positions = torch.empty((nnz,), device=append_indptr.device, dtype=torch.int32)
-    check_shape_dtype_device(
-        positions, (nnz,), torch.int32, append_indptr.device, "positions"
-    )
+    else:
+        check_shape_dtype_device(
+            positions, (nnz,), torch.int32, append_indptr.device, "positions"
+        )
 
     from .triton.page import get_batch_indices_positions_kernel
 
