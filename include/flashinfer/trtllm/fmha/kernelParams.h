@@ -44,7 +44,7 @@
 struct FastModDivInt32 {
  public:
   FastModDivInt32(int32_t divisor) : mDivisor(divisor) {
-    mShift = ceilLog2(mDivisor) - 1;
+    mShift = std::max(ceilLog2(mDivisor) - 1, 0);
     mMultiplier = static_cast<uint32_t>(
         flashinfer::ceil_div(uint64_t(1) << (32 + mShift), static_cast<uint64_t>(mDivisor)));
   }
