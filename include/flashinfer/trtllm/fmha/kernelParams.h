@@ -46,15 +46,10 @@ struct FastModDivInt32 {
   FastModDivInt32(int32_t divisor) : mDivisor(divisor) {
     mShift = ceilLog2(mDivisor) - 1;
     mMultiplier = static_cast<uint32_t>(
-        ceilDiv(uint64_t(1) << (32 + mShift), static_cast<uint64_t>(mDivisor)));
+        flashinfer::ceil_div(uint64_t(1) << (32 + mShift), static_cast<uint64_t>(mDivisor)));
   }
 
  private:
-  template <typename T>
-  T ceilDiv(T a, T b) {
-    return (a + b - 1) / b;
-  }
-
   int32_t ceilLog2(int32_t value) const {
     return static_cast<int32_t>(std::ceil(std::log2(value)));
   }

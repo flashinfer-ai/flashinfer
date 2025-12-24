@@ -615,6 +615,16 @@ class TllmGenFmhaKernel {
         continue;
       }
 
+      selectKernelParamsCopy.mTileSizeQ = tileSizeQ;
+      if (tileSizeQ >= 64) {
+        selectKernelParamsCopy.mKernelType = FmhaKernelType::KeepsMmaAbForGeneration;
+      } else {
+        selectKernelParamsCopy.mKernelType = FmhaKernelType::SwapsMmaAbForGeneration;
+      }
+
+      // Load the kernel.
+      std::tie(func, kernelMeta) = loadKernel(params, selectKernelParamsCopy);
+
       // Compute the number of CTAs.
       computeCtaAndClusterConfig(ctaLaunchParams, params, kernelMeta, selectKernelParamsCopy);
 
@@ -625,8 +635,8 @@ class TllmGenFmhaKernel {
           kernelMeta.mStepKv;
 
       // Compute the modeling kernel time = mainloop cost + reduction cost.
-      float modelingKernelTime = kernelMainloopCost[tileSizeQ] * seqLenPerCtaKv +
-                                 kernelReductionCost[tileSizeQ] * kernelReductionSeqLenFactor *
+      float modelingKernelTime = kernelMainloopCost.at(tileSizeQ) * seqLenPerCtaKv +
+                                 kernelReductionCost.at(tileSizeQ) * kernelReductionSeqLenFactor *
                                      ctaLaunchParams.mMaxNumCtasKv;
 
       // Compute the total number of CTAs.
