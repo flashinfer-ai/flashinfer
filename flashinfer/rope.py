@@ -1641,6 +1641,11 @@ def rope_quantize_fp8_append_paged_kv_cache(
 
     kv_layout_code = TensorLayout[kv_layout].value
 
+    batch_indices = batch_indices.int()
+    positions = positions.int()
+    kv_indices = kv_indices.int()
+    kv_indptr = kv_indptr.int()
+
     # Call custom op
     _rope_quantize_fp8_append_paged_kv_cache(
         q_rope,
