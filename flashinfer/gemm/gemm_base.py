@@ -4104,6 +4104,15 @@ def _check_bmm_mxfp8_problem_size(
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn"] = "cudnn",
 ):
+    # Check input tensors
+    if A.ndim != 3 or B.ndim != 3:
+        # A is [b, m, k], B is [b, k, n]
+        raise ValueError(f"bmm_mxfp8 accepts 3d tensors, got {A.shape=} and {B.shape=}")
+    if A.shape[2] != B.shape[1]:
+        raise ValueError(
+            f"K dimension (last dim of A) mismatch in bmm_mxfp8. got {A.shape=}, {B.shape=}"
+        )
+
     _validate_mxfp8_output_dtype(dtype)
     return True
 
@@ -4175,7 +4184,6 @@ def bmm_mxfp8(
     if backend != "cudnn":
         raise ValueError(f"Invalid backend: {backend}")
 
-    # TODO: check cuda_major >= 13 ?
     if not CUDNN_AVAILABLE:
         raise ValueError("cudnn is not available")
 
