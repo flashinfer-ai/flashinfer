@@ -1279,6 +1279,9 @@ def test_trtllm_batch_decode_head_dim_256(
         (1, 1, 32, 2, 5),
         (1, 3, 64, 2, 1),
         (1, 4, 64, 4, 1),
+        (32, 4, 16, 2, 8),
+        (32, 8, 16, 2, 8),
+        (32, 16, 16, 2, 8),
     ],
 )
 @pytest.mark.parametrize("window_left", [-1])

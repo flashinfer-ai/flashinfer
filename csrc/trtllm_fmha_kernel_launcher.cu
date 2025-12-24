@@ -159,8 +159,11 @@ void trtllm_paged_attention_launcher(
     runner_params.cumSeqLensQPtr = cum_seq_lens_q;
     runner_params.cumSeqLensKvPtr = cum_seq_lens_kv;
   } else {
-    // ForGen
-    runner_params.mMaskType = TrtllmGenAttentionMaskType::Dense;
+    // Generation.
+    // Note that kernel names are still labeled as using a dense mask even when maskType is
+    // specified as causal, this is expected for better performance as each CTA will only process
+    // one tokenQ in those cases, so dense mask works the same as causal mask.
+    runner_params.mMaskType = TrtllmGenAttentionMaskType::Causal;
     runner_params.mKernelType = FmhaKernelType::Generation;
     bool use_multi_block = true;
     runner_params.mTileScheduler =

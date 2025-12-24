@@ -348,12 +348,16 @@ struct TllmGenSelectKernelParams {
   bool mForceGmemReduction;
   // The mask type.
   TrtllmGenAttentionMaskType mMaskType;
+  // The number of tokens per page.
+  int mNumTokensPerPage;
   // Reuse smemK for V or not (only work with MLA generation kernels).
   bool mReuseSmemKForV;
   // Do we need to select a new kernel as the parameters have been updated.
   bool mSelectNewKernel;
   // The tile scheduler.
   TileScheduler mTileScheduler;
+  // The tile size for Q.
+  int mTileSizeQ;
   // The tile size for Kv.
   int mTileSizeKv;
   // Use 2 CTA MMA or not.
@@ -369,9 +373,11 @@ struct TllmGenSelectKernelParams {
                                                  : MultiCtasKvMode::Disabled),
         mForceGmemReduction(false),
         mMaskType(params.mMaskType),
+        mNumTokensPerPage(params.mNumTokensPerPage),
         mReuseSmemKForV(false),
         mSelectNewKernel(false),
         mTileScheduler(params.mTileScheduler),
+        mTileSizeQ(128),
         mTileSizeKv(128),
         mUses2CtaMma(false) {};
 };
