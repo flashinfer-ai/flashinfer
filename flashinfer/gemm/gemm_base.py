@@ -241,6 +241,16 @@ def _check_mm_bf16_problem_size(
             f"Second tensor has unsupported dtype {b.dtype}. Only bfloat16 is supported."
         )
 
+    if bias is not None:
+        if bias.dtype != torch.bfloat16:
+            raise ValueError(
+                f"Bias tensor has unsupported dtype {bias.dtype}. Only bfloat16 is supported."
+            )
+        if bias.shape != (b.shape[1],):
+            raise ValueError(
+                f"Bias tensor has supported shape {bias.shape}. Expecting shape ({b.shape[1]},)"
+            )
+
     return True
 
 
@@ -372,7 +382,58 @@ def mm_bf16(
     return out
 
 
-@supported_compute_capability([100])
+def _cutlass_bmm_bf16_requirement(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    backend: Literal["cutlass"] = "cutlass",
+):
+    _validate_bf16_output_dtype(out_dtype)
+
+    return True
+
+
+def _check_bmm_bf16_problem_size(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    backend: Literal["cutlass"] = "cutlass",
+):
+    if A.dtype != torch.bfloat16:
+        raise ValueError(
+            f"First tensor has unsupported dtype {A.dtype}. Only bfloat16 is supported."
+        )
+    if B.dtype != torch.bfloat16:
+        raise ValueError(
+            f"Second tensor has unsupported dtype {B.dtype}. Only bfloat16 is supported."
+        )
+
+    return True
+
+
+def _heuristic_func_bmm_bf16(
+    suitable_backends: List[str],
+    A: torch.Tensor,
+    B: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    backend: Literal["cutlass"] = "cutlass",
+):
+    heuristic_backends = []
+    if "cutlass" in suitable_backends:
+        heuristic_backends.append("cutlass")
+    return heuristic_backends
+
+
+@backend_requirement(
+    {
+        "cutlass": _cutlass_bmm_bf16_requirement,
+    },
+    common_check=_check_bmm_bf16_problem_size,
+    heuristic_func=_heuristic_func_bmm_bf16,
+)
 @flashinfer_api
 def bmm_bf16(
     A: torch.Tensor,
@@ -418,10 +479,6 @@ def bmm_bf16(
     >>> out.dtype
     torch.bfloat16
     """
-    if backend != "cutlass":
-        raise ValueError(f"Unsupported backend: {backend}. Only cutlass is available.")
-    if out_dtype not in (torch.bfloat16, torch.float16):
-        raise ValueError("Only bf16 and fp16 outputs are supported.")
 
     expected_shape = (A.shape[0], A.shape[1], B.shape[2])
     if out is None:
