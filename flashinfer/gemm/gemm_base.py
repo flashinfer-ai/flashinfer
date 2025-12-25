@@ -832,6 +832,7 @@ def bf16_gemm_sm100(
         runners.append(
             get_tgv_gemm_sm10x_module(a.dtype, use_sm_100f).tgv_gemm_runner()
         )
+    assert runners, "No suitable runners found"
     tuner = AutoTuner.get()
 
     inputs = [a, b, bias, pdl, out, workspace_buffer]
