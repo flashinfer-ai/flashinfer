@@ -382,6 +382,7 @@ def mm_bf16(
     return out
 
 
+@supported_compute_capability([100])
 def _cutlass_bmm_bf16_requirement(
     A: torch.Tensor,
     B: torch.Tensor,
