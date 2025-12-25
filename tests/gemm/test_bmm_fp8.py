@@ -51,7 +51,9 @@ def test_bmm_fp8(b, m, n, k, input_dtype, mat2_dtype, res_dtype, backend, auto_t
             backend=backend,
         )
 
-    cos_sim = F.cosine_similarity(reference.reshape(-1), res.reshape(-1), dim=0)
+    cos_sim = F.cosine_similarity(
+        reference.reshape(-1).float(), res.reshape(-1).float(), dim=0
+    )
     assert cos_sim > 0.99
 
 
