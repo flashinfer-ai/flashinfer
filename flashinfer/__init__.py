@@ -86,6 +86,7 @@ from .fused_moe import (
 )
 from .gemm import SegmentGEMMWrapper as SegmentGEMMWrapper
 from .gemm import bmm_fp8 as bmm_fp8
+from .gemm import bmm_mxfp8 as bmm_mxfp8
 from .gemm import mm_fp4 as mm_fp4
 from .gemm import mm_fp8 as mm_fp8
 from .gemm import tgv_gemm_sm100 as tgv_gemm_sm100
