@@ -241,15 +241,10 @@ def _check_mm_bf16_problem_size(
             f"Second tensor has unsupported dtype {b.dtype}. Only bfloat16 is supported."
         )
 
-    if bias is not None:
-        if bias.dtype != torch.bfloat16:
-            raise ValueError(
-                f"Bias tensor has unsupported dtype {bias.dtype}. Only bfloat16 is supported."
-            )
-        if bias.shape != (b.shape[1],):
-            raise ValueError(
-                f"Bias tensor has supported shape {bias.shape}. Expecting shape ({b.shape[1]},)"
-            )
+    if bias is not None and bias.dtype != torch.bfloat16:
+        raise ValueError(
+            f"Bias tensor has unsupported dtype {bias.dtype}. Only bfloat16 is supported."
+        )
 
     return True
 
@@ -301,10 +296,10 @@ def mm_bf16(
     Parameters
     ----------
     a: torch.Tensor
-        Input tensor, shape (m, k), bf16.
+        Input tensor, shape (m, k), bf16 in row-major layout.
 
     b: torch.Tensor
-        Weight tensor, shape (k, n), bf16.
+        Weight tensor, shape (k, n), bf16 in column-major layout.
 
     bias: Optional[torch.Tensor]
         Optional bias tensor, shape (n,). If provided, can only be used with the TGV backend. Defaults to ``None``.
@@ -325,21 +320,28 @@ def mm_bf16(
     Returns
     -------
     torch.Tensor
-        Out tensor, shape (m, n), bf16 or fp16.
+        Out tensor, shape (m, n), bf16 or fp16 in row-major layout.
 
     Examples
     --------
     >>> import torch
-    >>> import torch.nn.functional as F
     >>> import flashinfer
-    >>> input = torch.randn([48, 64], device="cuda", dtype=torch.bfloat16)
-    >>> weight = torch.randn([80, 64], device="cuda", dtype=torch.bfloat16).transpose(-2, -1)
-    >>> out = flashinfer.mm_bf16(input, weight)
-    >>> print(out.shape)
+    >>> # Using the TGV backend
+    >>> a = torch.randn([48, 64], device="cuda", dtype=torch.bfloat16)
+    >>> b = torch.randn([80, 64], device="cuda", dtype=torch.bfloat16).transpose(-2, -1)
+    >>> bias = torch.randn([80], device="cuda", dtype=torch.bfloat16)
+    >>> out = flashinfer.mm_bf16(a, b, bias=bias, pdl=True, backend="tgv")
+    >>> out.shape
     torch.Size([48, 80])
     >>> out.dtype
     torch.bfloat16
-    NOTE: update the examples to include the TGV backend and update the function
+    >>> # Using the CUTLASS backend
+    >>> fp16_out = torch.empty([48, 80], device="cuda", dtype=torch.float16)
+    >>> out = flashinfer.mm_bf16(a, b, out=fp16_out, out_dtype=torch.float16, backend="cutlass")
+    >>> out.shape
+    torch.Size([48, 80])
+    >>> out.dtype
+    torch.float16
     """
 
     if out is None:
@@ -448,10 +450,10 @@ def bmm_bf16(
     Parameters
     ----------
     A: torch.Tensor
-        Input tensor, shape (b, m, k), bf16.
+        Input tensor, shape (b, m, k), bf16 in row-major layout.
 
     B: torch.Tensor
-        Weight tensor, shape (b, k, n), bf16.
+        Weight tensor, shape (b, k, n), bf16 in column-major layout.
 
     out: Optional[torch.Tensor]
         Out tensor, shape (b, m, n), bf16 or fp16, defaults to ``None``.
@@ -465,17 +467,16 @@ def bmm_bf16(
     Returns
     -------
     torch.Tensor
-        Out tensor, shape (b, m, n), bf16 or fp16.
+        Out tensor, shape (b, m, n), bf16 or fp16 in row-major layout.
 
     Examples
     --------
     >>> import torch
-    >>> import torch.nn.functional as F
     >>> import flashinfer
     >>> input = torch.randn([16, 48, 64], device="cuda", dtype=torch.bfloat16)
     >>> weight = torch.randn([16, 80, 64], device="cuda", dtype=torch.bfloat16).transpose(-2, -1)
     >>> out = flashinfer.bmm_bf16(input, weight)
-    >>> print(out.shape)
+    >>> out.shape
     torch.Size([16, 48, 80])
     >>> out.dtype
     torch.bfloat16
@@ -1026,7 +1027,7 @@ def tgv_gemm_sm100(
         b: Second input tensor of shape (K, N) in column-major layout
         bias: Bias tensor of shape (N,)
         pdl: Whether to use PDL (persistent data loader), defaults to False
-        out: Output tensor, shape (M, N), defaults to None.
+        out: Optional output tensor, shape (M, N), defaults to None.
 
     Returns:
         Output tensor of shape (M, N) in row-major layout
