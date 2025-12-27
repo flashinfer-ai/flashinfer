@@ -219,7 +219,7 @@ median_time, std_time = bench_gpu_time(
     my_kernel,
     args=(x, y),
     enable_cupti=True,          # Will use CUDA events if CUPTI unavailable
-    rotate_buffers=True,        # Automatically rotate buffers
+    cold_l2_cache=True,         # Flush L2 or rotate buffers automatically
     num_iters=30
 )
 
@@ -240,7 +240,7 @@ median_time, std_time = bench_gpu_time(
 
 **What it means**: CUPTI is not available, using CUDA events instead
 
-**Impact**: Slightly less accurate timing, but still good for most purposes
+**Impact**: Less accurate for very fast kernels (5-50 us) due to synchronization overhead, but becomes negligible for longer-running kernels
 
 **Solution (optional)**: Install CUPTI for best accuracy:
 ```bash

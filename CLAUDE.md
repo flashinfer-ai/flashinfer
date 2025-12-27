@@ -15,6 +15,7 @@ FlashInfer is a GPU kernel library for LLM serving that uses **JIT (Just-In-Time
 | Install CUPTI for benchmarking | `pip install -U cupti-python` |
 | Run all tests | `pytest tests/` |
 | Run specific test | `pytest tests/path/test_file.py::test_function` |
+| Run multi-GPU test | `mpirun -np 4 pytest tests/comm/test_allreduce_unified_api.py` |
 | Run benchmark | `python benchmarks/flashinfer_benchmark.py --routine <name> <flags>` |
 | Run linting | `pre-commit run -a` |
 | Install pre-commit hooks | `pre-commit install` |
@@ -101,6 +102,11 @@ Use `flashinfer.utils` functions to skip tests on unsupported GPU architectures:
 - `is_sm90a_supported()` - Hopper (requires CUDA 12.3+)
 - `is_sm100a_supported()` - Blackwell (requires CUDA 12.8+)
 - `is_sm110a_supported()`, `is_sm120a_supported()`, `is_sm121a_supported()`
+
+**APIs decorated with `@backend_requirement`** also provide:
+- `api_name.is_compute_capability_supported(cc)` - e.g., `mm_fp4.is_compute_capability_supported(100)`
+- `api_name.is_backend_supported("backend")` - e.g., `mm_fp4.is_backend_supported("cudnn")`
+- `api_name.is_backend_supported("backend", cc)` - e.g., `mm_fp4.is_backend_supported("cudnn", 80)`
 
 **Example:**
 ```python
@@ -286,9 +292,20 @@ flashinfer/
 │   │   ├── gemm/                  # GEMM module generators
 │   │   ├── fused_moe/             # MOE module generators
 │   │   └── [...]
-│   ├── *.py                       # High-level Python APIs
+│   ├── gemm/                      # GEMM Python APIs
+│   ├── fused_moe/                 # MOE Python APIs
+│   ├── comm/                      # Communication Python APIs
+│   ├── *.py                       # Other high-level Python APIs
 │   ├── aot.py                     # AOT compilation for pre-built packages
 │   └── [...]
+│
+├── tests/                         # Test suite
+│   ├── attention/                 # Attention kernel tests
+│   ├── gemm/                      # GEMM kernel tests
+│   ├── moe/                       # MOE kernel tests
+│   ├── comm/                      # Communication tests
+│   ├── utils/                     # Utility tests
+│   └── conftest.py                # Pytest configuration
 │
 └── build_backend.py               # PEP 517 build backend
 ```
@@ -315,7 +332,7 @@ flashinfer/
 8. Register in `flashinfer/aot.py` for AOT compilation
 9. Export in `flashinfer/__init__.py`
 
-**Reference implementations:**
+**Example implementations:**
 - **Simple**: `flashinfer/norm.py` (RMSNorm) - no Jinja, good starting point
 - **Moderate**: `flashinfer/sampling.py` - with Jinja templating
 - **Complex**: `flashinfer/decode.py` - plan-run pattern, advanced workspace

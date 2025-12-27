@@ -126,10 +126,10 @@ Create `csrc/scale_jit_binding.cu`:
 #include "tvm_ffi_utils.h"
 
 // Forward declaration
-void scale_run(TensorView input, TensorView output, double factor);
+void run(TensorView input, TensorView output, double factor);
 
 // Implementation
-void scale_run(TensorView input, TensorView output, double factor) {
+void run(TensorView input, TensorView output, double factor) {
   // Convert TensorView to torch::Tensor
   auto input_tensor = input.get_torch_tensor();
   auto output_tensor = output.get_torch_tensor();
@@ -154,7 +154,7 @@ void scale_run(TensorView input, TensorView output, double factor) {
 }
 
 // Export to TVM-FFI
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, scale_run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, run);
 ```
 
 **Key points:**
@@ -294,12 +294,13 @@ from flashinfer.jit.core import gen_jit_spec
 from flashinfer.jit import current_compilation_context
 
 def gen_my_hopper_only_module():
-    """Example: Kernel only works on SM90+ (Hopper and newer)"""
+    """Example: Kernel works on SM90 and later supported architectures."""
     uri = get_my_uri(...)
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
     # ... copy sources ...
 
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        # Explicitly list supported SM versions - no automatic future compatibility
         supported_major_versions=[9, 10, 11, 12]  # SM90, SM100, SM110, SM120
     )
 
@@ -371,10 +372,10 @@ def gen_fmhav2_blackwell_module(...):
         extra_cuda_cflags=nvcc_flags,
     )
 
-# Standard attention: Hopper and newer
+# Standard attention: Hopper and later supported architectures
 def gen_batch_prefill_module(...):
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[9, 10, 11, 12]  # SM90+
+        supported_major_versions=[9, 10, 11, 12]  # SM90, SM100, SM110, SM120
     )
     return gen_jit_spec(
         name=uri,
@@ -388,10 +389,10 @@ def gen_batch_prefill_module(...):
 | Supported Versions | Architectures | Use Case |
 |-------------------|---------------|----------|
 | `None` | All available GPUs | Universal kernels (default) |
-| `[9, 10, 11, 12]` | SM90, SM100, SM110, SM120 | Hopper and newer |
-| `[10, 11]` | SM100, SM110 | Blackwell and newer |
+| `[9, 10, 11, 12]` | SM90, SM100, SM110, SM120 | Hopper, Blackwell |
+| `[10, 11, 12]` | SM100, SM110, SM120 | Blackwell only |
 | `[12]` | SM120 | Specific architecture only |
-| `[8, 9, 10, 11, 12]` | SM80+ | Ampere and newer |
+| `[8, 9, 10, 11, 12]` | SM80, SM90, SM100, SM110, SM120 | Ampere, Hopper, Blackwell |
 
 #### Testing with Architecture Requirements
 
@@ -653,7 +654,7 @@ Check functions must:
 
 ## Step 6: Write Tests in `tests/`
 
-Create `tests/test_scale.py`:
+Create tests in an appropriate subdirectory (e.g., `tests/elementwise/test_scale.py` or create a new subdir if needed):
 
 ```python
 import pytest
