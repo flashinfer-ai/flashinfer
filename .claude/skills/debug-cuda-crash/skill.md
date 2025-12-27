@@ -328,37 +328,29 @@ my_kernel(input, output)
 torch.cuda.synchronize()  # ← Flushes printf output
 ```
 
-### ⚠️ Warp-Specialized Kernels: Use `lane_id == 0`
+### ⚠️ Warp-Specialized Kernels: Choosing the Right Print Thread
 
 **Problem**: `threadIdx.x == 0` doesn't work for all warps (warp starting at thread 32 won't have thread 0).
 
-**Wrong** ❌:
+**Solution**: Choose one representative thread per specialization group.
+
 ```cpp
 __global__ void WarpSpecializedKernel(...) {
-  int warp_id = threadIdx.x / 32;
+  // Define your group's representative thread
+  // e.g., first thread of each warp: threadIdx.x % 32 == 0
+  // e.g., first thread of each 4-warp group: threadIdx.x % 128 == 0
 
-  // ❌ Only warp 0 will print!
-  if (threadIdx.x == 0) {
-    printf("Warp %d processing\n", warp_id);
+  if (is_group_representative) {
+    printf("Group %d processing\n", group_id);
   }
 }
 ```
 
-**Correct** ✅:
+**Common mistake** ❌:
 ```cpp
-__global__ void WarpSpecializedKernel(...) {
-  int warp_id = threadIdx.x / 32;
-  int lane_id = threadIdx.x % 32;
-
-  // ✅ Each warp has lane_id == 0
-  if (lane_id == 0) {
-    printf("Warp %d processing\n", warp_id);
-  }
-
-  // Alternative
-  if (threadIdx.x % 32 == 0) {
-    printf("Warp starting at thread %d\n", threadIdx.x);
-  }
+// ❌ Only warp 0 will print!
+if (threadIdx.x == 0) {
+  printf("Warp %d processing\n", threadIdx.x / 32);
 }
 ```
 
@@ -366,10 +358,8 @@ __global__ void WarpSpecializedKernel(...) {
 
 | Kernel Type | Print Condition | Notes |
 |-------------|-----------------|-------|
-| Simple kernel | `threadIdx.x == 0` | OK for single-warp blocks |
-| Warp-specialized | `lane_id == 0` | ✅ Each warp prints |
-| | `threadIdx.x % 32 == 0` | ✅ Same as above |
-| | `threadIdx.x == 0` | ❌ Only warp 0 prints |
+| Simple kernel | `threadIdx.x == 0` | One thread per block |
+| Warp-specialized | One thread per group | Depends on kernel design |
 
 ### Other Kernel Debugging Tools
 

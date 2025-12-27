@@ -79,7 +79,7 @@ Create `csrc/scale.cu`:
 using namespace flashinfer;
 
 // Type dispatcher helper
-#define DISPATCH_DTYPE(dtype, DType, ...)     \
+#define DISPATCH_DTYPE(dtype, DType, ...)      \
   if (dtype == torch::kFloat16) {              \
     using DType = half;                        \
     __VA_ARGS__                                \
@@ -89,6 +89,8 @@ using namespace flashinfer;
   } else if (dtype == torch::kFloat32) {       \
     using DType = float;                       \
     __VA_ARGS__                                \
+  } else {                                     \
+    TVM_FFI_THROW(TypeError) << "Unsupported dtype: " << dtype; \
   }
 
 void scale_launcher(torch::Tensor input, torch::Tensor output,
@@ -419,6 +421,7 @@ from typing import Optional
 
 from .jit.scale import gen_scale_module
 from .utils import backend_requirement, supported_compute_capability
+from .api_logging import flashinfer_api
 
 
 @functools.cache
@@ -447,6 +450,7 @@ def _check_scale_problem_size(input: torch.Tensor, factor: float,
     return True
 
 
+@flashinfer_api
 @backend_requirement(
     backend_checks={},  # No backend choices for this simple kernel
     common_check=_check_scale_problem_size,
@@ -497,7 +501,8 @@ def scale(input: torch.Tensor, factor: float,
 
 - Uses `@functools.cache` to cache compiled modules
 - Clean Python API with docstring
-- Handles output allocation
+- Adding the `@flashinfer_api` decorator enables logging and sets it apart from helper functions
+- **Destination passing style**: Output tensor(s) are passed as optional parameters (`out: Optional[torch.Tensor] = None`). This allows users to provide pre-allocated buffers to avoid allocation overhead in performance-critical paths. Only allocate internally when `out` is `None`.
 - Validates inputs using `@backend_requirement` decorator
 
 ### Using `@backend_requirement` and `@supported_compute_capability` Decorators
@@ -717,6 +722,8 @@ def test_scale_cpu_error():
 - Test error cases
 
 ## Step 7: Register in AOT
+
+Register your kernel in AOT so users with `flashinfer-jit-cache` can skip JIT compilation.
 
 Edit `flashinfer/aot.py`, add to the appropriate section:
 

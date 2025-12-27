@@ -120,7 +120,7 @@ def test_hopper_attention():
 | MLA Attention | SM100a | `is_sm100a_supported()` |
 | FP8 GEMM | SM89+ | `get_compute_capability()[0] >= 9` |
 
-**Auto-skip:** `tests/conftest.py` automatically skips on OOM and missing JIT cache.
+**Note:** `tests/conftest.py` auto-skips tests that trigger OOM, but tests should be written to avoid OOM by using appropriate problem sizes.
 
 ## Benchmarking
 
@@ -185,7 +185,7 @@ FlashInfer's JIT system has three layers:
 
 ### Compilation Context: Architecture-Specific Compilation
 
-FlashInfer uses `CompilationContext` to manage CUDA architecture targets. Some kernels only work on specific GPU architectures (e.g., Hopper SM90, Blackwell SM100).
+FlashInfer uses `CompilationContext` to manage CUDA architecture targets. Some kernels only work on specific GPU architectures (e.g., Hopper SM90, Blackwell SM100/SM12x).
 
 **How it works:**
 - Auto-detects GPUs in system or reads `FLASHINFER_CUDA_ARCH_LIST` environment variable
@@ -506,6 +506,7 @@ When working with FlashInfer's dependencies and tools, refer to these official d
 - **CuTe (CUTE DSL)**: CUTLASS's Cute Layout and Tensor DSL
   - Documentation: <https://docs.nvidia.com/cutlass/media/docs/pythonDSL/cute_dsl.html>
   - **Tip**: Add `.md` to get Markdown format: <https://docs.nvidia.com/cutlass/media/docs/pythonDSL/cute_dsl.html.md>
+  - The Cute DSL kernels rely on Python modules from the `nvidia-cutlass-dsl` pip package, not to be confused with Python modules in the `3rdparty/cutlass` submodule
   - Tutorial: <https://github.com/NVIDIA/cutlass/tree/main/examples/python/CuTeDSL>
 
 - **PTX ISA (Parallel Thread Execution)**: NVIDIA's PTX instruction set documentation
