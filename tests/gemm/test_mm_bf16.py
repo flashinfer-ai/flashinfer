@@ -10,11 +10,17 @@ from flashinfer.utils import get_compute_capability
 @pytest.mark.parametrize("n", [1024, 2048, 4096])
 @pytest.mark.parametrize("k", [1024, 2048, 3072])
 @pytest.mark.parametrize("res_dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("bias", [True, False])
+@pytest.mark.parametrize("enable_bias", [True, False])
 @pytest.mark.parametrize("pdl", [True, False])
 @pytest.mark.parametrize("backend", ["cutlass", "tgv"])
 def test_mm_bf16(
-    m: int, n: int, k: int, res_dtype: torch.dtype, bias: bool, pdl: bool, backend: str
+    m: int,
+    n: int,
+    k: int,
+    res_dtype: torch.dtype,
+    enable_bias: bool,
+    pdl: bool,
+    backend: str,
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     compute_capability_number = compute_capability[0] * 10 + compute_capability[1]
@@ -27,7 +33,7 @@ def test_mm_bf16(
     if str(compute_capability_number) == "103" and backend == "cutlass":
         pytest.skip("mm_bf16 with CUTLASS backend does not support SM103.")
 
-    if backend == "cutlass" and (bias or pdl):
+    if backend == "cutlass" and (enable_bias or pdl):
         pytest.skip(
             "mm_bf16 with CUTLASS backend does not support bias or pdl arguments."
         )
@@ -40,7 +46,7 @@ def test_mm_bf16(
     input = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
     mat2 = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
 
-    if bias:
+    if enable_bias:
         bias = torch.randn(n, device="cuda", dtype=torch.bfloat16)
         reference = F.linear(input, mat2, bias)
     else:
