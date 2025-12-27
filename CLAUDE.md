@@ -527,3 +527,9 @@ These dependencies are included in FlashInfer's `3rdparty/` directory or `requir
 ### Some final suggestions for all AI agents
 
 > Because practical engineering involves the accumulated experience of trial and error, match the coding style, efficiency, complexity, verbosity, and defensiveness by learning from existing code as much as possible—this document contains many pointers on where to find examples. Document intentional departures with rationale. Mentioning "AI-assisted" in the git commit message is good transparency. For performance-critical hot paths, leave justification for the special algorithmic choices and other potential alternatives in a comment for review.
+
+**Keep documentation in sync with code changes:** When modifying code that is referenced in this document or in `.claude/skills/`, update the corresponding documentation immediately. This includes:
+- Important infrastructure changes (e.g., `@flashinfer_api`, `@backend_requirement`, TVM-FFI macros) → Update examples in `CLAUDE.md` and relevant skill files
+- New patterns or conventions → Document them for future reference
+- Deprecated approaches → Remove or mark as deprecated in docs
+- New error handling patterns, macros, or utilities → Add to relevant skill tutorials

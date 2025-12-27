@@ -170,6 +170,42 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, scale_run);
 - Use `<<` to chain multiple values in the error message
 - Errors are properly propagated back to Python
 
+**When to use `TVM_FFI_THROW` vs `TVM_FFI_LOG_AND_THROW`:**
+
+- **`TVM_FFI_THROW`**: Use for normal runtime error handling. This is the standard way to report errors that will be caught and propagated to Python.
+
+- **`TVM_FFI_LOG_AND_THROW`**: Use only in cases where:
+  1. The function may be called during object construction time (e.g., validation in constructors or setup methods)
+  2. The exception may not be caught properly (e.g., during module initialization)
+  3. The error condition almost never fails in practice (e.g., internal errors, unsupported dtype combinations in dispatch macros)
+
+  This variant logs the error message before throwing, ensuring visibility even if the exception doesn't propagate correctly.
+
+**Example from fused_moe (see `csrc/trtllm_fused_moe_kernel_launcher.cu`):**
+```cpp
+// In a setup/validation function that may be called during construction
+void check_weights_shape(std::string which_weights) const {
+  if (which_weights != "gemm1" && which_weights != "gemm2") {
+    // Internal error that should never happen - use LOG_AND_THROW
+    TVM_FFI_LOG_AND_THROW(InternalError) << "Internal error: which_weights = " << which_weights;
+  }
+  // ...
+  if (weight_layout is unsupported) {
+    // Unsupported config during setup - use LOG_AND_THROW
+    TVM_FFI_LOG_AND_THROW(NotImplementedError)
+        << "Unsupported weight_layout: " << (int)weight_layout;
+  }
+}
+
+// In a normal runtime function
+void scale_run(TensorView input, TensorView output, double factor) {
+  if (!input_tensor.is_cuda()) {
+    // Normal validation error - use TVM_FFI_THROW
+    TVM_FFI_THROW(ValueError) << "Input must be a CUDA tensor";
+  }
+}
+```
+
 ## Step 4: Create JIT Generator (No Jinja for Simple Case)
 
 Create `flashinfer/jit/scale.py`:
