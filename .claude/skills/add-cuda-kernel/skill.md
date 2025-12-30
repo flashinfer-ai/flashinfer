@@ -73,97 +73,44 @@ cudaError_t ScaleLauncher(const T* input, T* output, T factor, int n,
 Create `csrc/scale.cu`:
 
 ```cpp
-#include <torch/extension.h>
 #include "flashinfer/scale.cuh"
 
 using namespace flashinfer;
 
-// Type dispatcher helper
-#define DISPATCH_DTYPE(dtype, DType, ...)      \
-  if (dtype == torch::kFloat16) {              \
-    using DType = half;                        \
-    __VA_ARGS__                                \
-  } else if (dtype == torch::kBFloat16) {      \
-    using DType = __nv_bfloat16;               \
-    __VA_ARGS__                                \
-  } else if (dtype == torch::kFloat32) {       \
-    using DType = float;                       \
-    __VA_ARGS__                                \
-  } else {                                     \
-    TVM_FFI_THROW(TypeError) << "Unsupported dtype: " << dtype; \
-  }
-
-void scale_launcher(torch::Tensor input, torch::Tensor output,
+void scale_launcher(TensorView input, TensorView output,
                     float factor) {
+  CHECK_INPUT(input);
+  CHECK_INPUT(output);
+  TVM_FFI_ICHECK_EQ(input.dtype(), output.dtype());
   int n = input.numel();
-  auto stream = at::cuda::getCurrentCUDAStream();
+  auto stream = get_stream(input.device());
 
-  DISPATCH_DTYPE(input.dtype(), DType, {
-    ScaleLauncher<DType>(
+  DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP32_FP16(input.dtype(), DType, [&] {
+    cudaError_t status = ScaleLauncher<DType>(
       input.data_ptr<DType>(),
       output.data_ptr<DType>(),
       static_cast<DType>(factor),
       n,
       stream
     );
+    TVM_FFI_ICHECK(status == cudaSuccess)
+        << "Failed to run ScaleLauncher: " << cudaGetErrorString(status);
+    return true;
   });
 }
 ```
 
 **Key points:**
 
-- Includes Torch headers (only allowed in `csrc/`)
-- Converts torch::Tensor to raw pointers
-- Dispatches on dtype
-- Gets CUDA stream from PyTorch
-
-## Step 3: Create TVM-FFI Binding in `csrc/`
-
-Create `csrc/scale_jit_binding.cu`:
-
-```cpp
-#include "scale.cu"
-#include "tvm_ffi_utils.h"
-
-// Forward declaration
-void run(TensorView input, TensorView output, double factor);
-
-// Implementation
-void run(TensorView input, TensorView output, double factor) {
-  // Convert TensorView to torch::Tensor
-  auto input_tensor = input.get_torch_tensor();
-  auto output_tensor = output.get_torch_tensor();
-
-  // Validate inputs using TVM-FFI error handling
-  if (!input_tensor.is_cuda()) {
-    TVM_FFI_THROW(ValueError) << "Input must be a CUDA tensor";
-  }
-  if (!output_tensor.is_cuda()) {
-    TVM_FFI_THROW(ValueError) << "Output must be a CUDA tensor";
-  }
-  if (input_tensor.numel() != output_tensor.numel()) {
-    TVM_FFI_THROW(ValueError) << "Input and output must have the same number of elements, "
-                              << "got input size " << input_tensor.numel()
-                              << " and output size " << output_tensor.numel();
-  }
-  if (input_tensor.dtype() != output_tensor.dtype()) {
-    TVM_FFI_THROW(ValueError) << "Input and output must have the same dtype";
-  }
-
-  scale_launcher(input_tensor, output_tensor, static_cast<float>(factor));
-}
-
-// Export to TVM-FFI
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, run);
-```
-
-**Key points:**
-
-- Forward declare the function first
-- Implement the function (converts TensorView to torch::Tensor)
-- **Use TVM-FFI exceptions**: `TVM_FFI_THROW(ErrorType) << "message"`
+- Includes TVM FFI utils headers `tvm_ffi_utils.h` (only allowed in `csrc/`)
+- Uses `tvm::ffi::TensorView` as input and output tensor types
+- Uses macros defined in `tvm_ffi_utils.h` to check the input and output if both on CUDA device, both contiguous, and share the same data type
+- Gets CUDA stream by TVM FFI, and prepare all scalar inputs for kernel function
+- Dispatches on dtype with macros defined in `tvm_ffi_utils.h`, or adds new one if not covered
+- Converts tvm::ffi::TensorView to raw pointers
+- Handles the result status of kernel by `TVM_FFI_ICHECK`
 - Add descriptive error messages with `<<` operator
-- Export using `TVM_FFI_DLL_EXPORT_TYPED_FUNC(name, function)`
+- **Use TVM-FFI exceptions**: `TVM_FFI_THROW(ErrorType) << "message"` for custom error checking
 
 **TVM-FFI Error Handling:**
 
@@ -207,6 +154,26 @@ void scale_run(TensorView input, TensorView output, double factor) {
   }
 }
 ```
+
+## Step 3: Create TVM-FFI Binding in `csrc/`
+
+Create `csrc/scale_jit_binding.cu`:
+
+```cpp
+#include "scale.cu"
+#include "tvm_ffi_utils.h"
+
+// Forward declaration
+void scale_launcher(TensorView input, TensorView output, float factor);
+
+// Export to TVM-FFI
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, scale_launcher);
+```
+
+**Key points:**
+
+- Forward declare the launcher function first
+- Export using `TVM_FFI_DLL_EXPORT_TYPED_FUNC(name, function)`
 
 ## Step 4: Create JIT Generator (No Jinja for Simple Case)
 
