@@ -33,25 +33,26 @@ def gdn_flops(
     """
     Calculate FLOPs for Gated Delta Rule (GDN) attention.
 
-    The delta rule involves:
-    1. Q @ K^T for each position: 2 * total_seq_len * num_q_heads * head_size
-    2. State update (k @ v^T): 2 * total_seq_len * head_size * head_size * num_heads
-    3. Output (q @ state): 2 * total_seq_len * num_q_heads * head_size * head_size
+    Delta Rule formula:
+        state_t = alpha_t * state_{t-1} + beta_t * (k_t @ v_t^T)
+        output_t = q_t @ state_t
 
-    For simplicity, we use an approximation similar to linear attention.
+    Matrix multiplications per token per head:
+    1. k @ v^T (outer product): 2 * d^2 FLOPs
+    2. q @ state: 2 * d^2 FLOPs
+
+    Note: alpha/beta gating are element-wise scalar multiplications,
+    not counted in TFLOPS.
     """
     num_o_heads = max(num_q_heads, num_v_heads)
 
-    # Q @ K^T component (per position, matmul with state)
-    qk_flops = 2 * total_seq_len * num_o_heads * head_size * head_size
+    # k @ v^T (outer product): 2 * d^2 per token per head
+    outer_product_flops = 2 * total_seq_len * num_o_heads * head_size * head_size
 
-    # State update: k^T @ v (outer product accumulated into state)
-    state_update_flops = 2 * total_seq_len * num_o_heads * head_size * head_size
-
-    # Output: q @ state
+    # q @ state: 2 * d^2 per token per head
     output_flops = 2 * total_seq_len * num_o_heads * head_size * head_size
 
-    total_flops = qk_flops + state_update_flops + output_flops
+    total_flops = outer_product_flops + output_flops
     return total_flops
 
 
