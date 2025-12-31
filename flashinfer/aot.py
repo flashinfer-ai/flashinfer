@@ -41,6 +41,7 @@ from .jit.fp4_quantization import (
     gen_fp4_quantization_sm121_module,
 )
 from .jit.fp8_quantization import gen_mxfp8_quantization_sm100_module
+from .jit.gdn import gen_gdn_prefill_sm90_module
 from .jit.fused_moe import (
     gen_cutlass_fused_moe_sm120_module,
     gen_cutlass_fused_moe_sm103_module,
@@ -535,6 +536,7 @@ def gen_all_modules(
         ]
         if has_sm90:
             jit_specs.append(gen_trtllm_utils_module())
+            jit_specs.append(gen_gdn_prefill_sm90_module())
 
     if (
         add_xqa and get_cuda_version() > Version("12.8")

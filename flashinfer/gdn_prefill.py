@@ -20,7 +20,7 @@ from typing import Optional, Union, Tuple
 import torch
 
 from .api_logging import flashinfer_api
-from .jit.gdn import gen_gdn_prefill_module
+from .jit.gdn import gen_gdn_prefill_sm90_module
 from .utils import (
     register_custom_op,
     register_fake_op,
@@ -29,7 +29,7 @@ from .utils import (
 
 @functools.cache
 def get_gdn_prefill_module():
-    module = gen_gdn_prefill_module().build_and_load()
+    module = gen_gdn_prefill_sm90_module().build_and_load()
 
     @register_custom_op("flashinfer::gdn_prefill", mutates_args=())
     def gdn_prefill(

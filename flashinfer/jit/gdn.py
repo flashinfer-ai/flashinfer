@@ -22,7 +22,7 @@ from .core import (
 )
 
 
-def gen_gdn_prefill_module() -> JitSpec:
+def gen_gdn_prefill_sm90_module() -> JitSpec:
     return gen_jit_spec(
         name="gdn_prefill_launcher",
         sources=[

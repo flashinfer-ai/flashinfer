@@ -3,6 +3,15 @@ import functools
 import pytest
 import torch
 
+from flashinfer.utils import is_sm90a_supported
+
+
+@pytest.fixture(autouse=True)
+def skip_if_not_sm90a():
+    """Skip GDN tests if SM90a is not supported."""
+    if not is_sm90a_supported(torch.device("cuda")):
+        pytest.skip("GDN requires SM90a (Hopper) architecture")
+
 
 def multidist_randn(
     num_dists, dim, mean_mean=0.0, mean_std=1.0, scale_lower=0.5, scale_upper=1.5
