@@ -2309,8 +2309,8 @@ def add_rmsnorm_fp4quant(
         Weight tensor for RMSNorm, shape ``(hidden_size,)``.
         Must have the same dtype as input.
     y_fp4 : torch.Tensor, optional
-        Output tensor for quantized values in FP4_E2M1 format, packed as uint8.
-        Two FP4 values are packed into each uint8 byte.
+        Output tensor for quantized values in FP4_E2M1 format with dtype
+        ``torch.float4_e2m1fn_x2``.
         Shape must be ``(batch_size, hidden_size // 2)`` or matching 3D input.
         If ``None``, will be allocated automatically.
     block_scale : torch.Tensor, optional
@@ -2391,11 +2391,15 @@ def add_rmsnorm_fp4quant(
     if y_fp4 is None:
         if is_3d:
             y_fp4 = torch.empty(
-                (B, S, hidden_size // 2), dtype=torch.uint8, device=input.device
+                (B, S, hidden_size // 2),
+                dtype=torch.float4_e2m1fn_x2,
+                device=input.device,
             )
         else:
             y_fp4 = torch.empty(
-                (batch_size, hidden_size // 2), dtype=torch.uint8, device=input.device
+                (batch_size, hidden_size // 2),
+                dtype=torch.float4_e2m1fn_x2,
+                device=input.device,
             )
 
     if block_scale is None:

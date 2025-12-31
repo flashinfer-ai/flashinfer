@@ -53,7 +53,9 @@ def dequantize_fp4_output(
     If global_scale is provided, the dequantized values are divided by global_scale
     to reverse the scaling applied during quantization.
     """
-    y_fp4_float = cast_from_fp4(y_fp4)
+    # View as uint8 for bitwise operations in cast_from_fp4
+    # (float4_e2m1fn_x2 and uint8 have the same memory layout)
+    y_fp4_float = cast_from_fp4(y_fp4.view(torch.uint8))
     if y_fp4_float.dim() == 2:
         b, hidden_size = y_fp4_float.shape
         assert hidden_size % block_size == 0
@@ -212,7 +214,7 @@ class TestRMSNormFP4QuantCuteDSL:
 
         # Allocate output tensors
         y_fp4 = torch.empty(
-            batch_size, hidden_size // 2, device="cuda", dtype=torch.uint8
+            batch_size, hidden_size // 2, device="cuda", dtype=torch.float4_e2m1fn_x2
         )
         block_scale = torch.empty(
             batch_size,
@@ -237,7 +239,7 @@ class TestRMSNormFP4QuantCuteDSL:
         assert block_scale.shape == (batch_size, hidden_size // block_size)
 
         # Verify output dtypes
-        assert y_fp4.dtype == torch.uint8
+        assert y_fp4.dtype == torch.float4_e2m1fn_x2
         assert block_scale.dtype == torch.float8_e4m3fn
 
         # Reference computation
@@ -277,7 +279,11 @@ class TestRMSNormFP4QuantCuteDSL:
 
         # Allocate output tensors
         y_fp4 = torch.empty(
-            batch_size, seq_len, hidden_size // 2, device="cuda", dtype=torch.uint8
+            batch_size,
+            seq_len,
+            hidden_size // 2,
+            device="cuda",
+            dtype=torch.float4_e2m1fn_x2,
         )
         block_scale = torch.empty(
             batch_size,
@@ -303,7 +309,7 @@ class TestRMSNormFP4QuantCuteDSL:
         assert block_scale.shape == (batch_size, seq_len, hidden_size // block_size)
 
         # Verify output dtypes
-        assert y_fp4.dtype == torch.uint8
+        assert y_fp4.dtype == torch.float4_e2m1fn_x2
         assert block_scale.dtype == torch.float8_e4m3fn
 
         # Reference computation
@@ -345,7 +351,7 @@ class TestRMSNormFP4QuantCuteDSL:
         global_scale = compute_global_scale(x, weight, eps=eps)
 
         y_fp4 = torch.empty(
-            batch_size, hidden_size // 2, device="cuda", dtype=torch.uint8
+            batch_size, hidden_size // 2, device="cuda", dtype=torch.float4_e2m1fn_x2
         )
         block_scale = torch.empty(
             batch_size,
@@ -399,7 +405,7 @@ class TestRMSNormFP4QuantMXFP4:
         weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
 
         y_fp4 = torch.empty(
-            batch_size, hidden_size // 2, device="cuda", dtype=torch.uint8
+            batch_size, hidden_size // 2, device="cuda", dtype=torch.float4_e2m1fn_x2
         )
         # UE8M0 scale factors are returned as uint8
         block_scale = torch.empty(
@@ -419,7 +425,7 @@ class TestRMSNormFP4QuantMXFP4:
         # Verify output shapes
         assert y_fp4.shape == (batch_size, hidden_size // 2)
         assert block_scale.shape == (batch_size, hidden_size // block_size)
-        assert y_fp4.dtype == torch.uint8
+        assert y_fp4.dtype == torch.float4_e2m1fn_x2
         assert block_scale.dtype == torch.uint8
 
         # Reference computation
@@ -467,7 +473,7 @@ class TestSeparateFlashInferComparison:
 
         # Fused CuTe-DSL kernel
         y_fp4_fused = torch.empty(
-            batch_size, hidden_size // 2, device="cuda", dtype=torch.uint8
+            batch_size, hidden_size // 2, device="cuda", dtype=torch.float4_e2m1fn_x2
         )
         block_scale_fused = torch.empty(
             batch_size,
@@ -546,7 +552,7 @@ class TestFusedVsSeparateFP4Quantize:
 
         # === Fused kernel path ===
         y_fp4_fused = torch.empty(
-            batch_size, hidden_size // 2, device="cuda", dtype=torch.uint8
+            batch_size, hidden_size // 2, device="cuda", dtype=torch.float4_e2m1fn_x2
         )
         block_scale_fused = torch.empty(
             batch_size,
@@ -577,7 +583,13 @@ class TestFusedVsSeparateFP4Quantize:
 
         # === Compare FP4 packed outputs ===
         # They should match exactly since the quantization logic is the same
-        fp4_match = (y_fp4_fused == y_fp4_separate).float().mean().item()
+        # View as uint8 for comparison (float4_e2m1fn_x2 doesn't support == operator)
+        fp4_match = (
+            (y_fp4_fused.view(torch.uint8) == y_fp4_separate.view(torch.uint8))
+            .float()
+            .mean()
+            .item()
+        )
         assert fp4_match > 0.95, (
             f"FP4 output mismatch: only {fp4_match * 100:.1f}% of bytes match"
         )
@@ -643,7 +655,7 @@ class TestFusedVsSeparateFP4Quantize:
 
         # === Fused kernel path ===
         y_fp4_fused = torch.empty(
-            batch_size, hidden_size // 2, device="cuda", dtype=torch.uint8
+            batch_size, hidden_size // 2, device="cuda", dtype=torch.float4_e2m1fn_x2
         )
         block_scale_fused = torch.empty(
             batch_size, hidden_size // block_size, device="cuda", dtype=torch.uint8
@@ -670,7 +682,13 @@ class TestFusedVsSeparateFP4Quantize:
         )
 
         # === Compare FP4 packed outputs ===
-        fp4_match = (y_fp4_fused == y_fp4_separate).float().mean().item()
+        # View as uint8 for comparison (float4_e2m1fn_x2 doesn't support == operator)
+        fp4_match = (
+            (y_fp4_fused.view(torch.uint8) == y_fp4_separate.view(torch.uint8))
+            .float()
+            .mean()
+            .item()
+        )
         assert fp4_match > 0.95, (
             f"FP4 output mismatch: only {fp4_match * 100:.1f}% of bytes match"
         )
@@ -796,7 +814,7 @@ class TestLargeHiddenSize:
         global_scale = compute_global_scale(x, weight, eps=eps)
 
         y_fp4 = torch.empty(
-            batch_size, hidden_size // 2, device="cuda", dtype=torch.uint8
+            batch_size, hidden_size // 2, device="cuda", dtype=torch.float4_e2m1fn_x2
         )
         block_scale = torch.empty(
             batch_size,
@@ -819,7 +837,7 @@ class TestLargeHiddenSize:
         # Verify output shapes
         assert y_fp4.shape == (batch_size, hidden_size // 2)
         assert block_scale.shape == (batch_size, hidden_size // block_size)
-        assert y_fp4.dtype == torch.uint8
+        assert y_fp4.dtype == torch.float4_e2m1fn_x2
         assert block_scale.dtype == torch.float8_e4m3fn
 
         # Sample first few rows for value comparison (full dequant is slow)
@@ -851,7 +869,7 @@ class TestLargeHiddenSize:
         weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
 
         y_fp4 = torch.empty(
-            batch_size, hidden_size // 2, device="cuda", dtype=torch.uint8
+            batch_size, hidden_size // 2, device="cuda", dtype=torch.float4_e2m1fn_x2
         )
         block_scale = torch.empty(
             batch_size, hidden_size // block_size, device="cuda", dtype=torch.uint8
@@ -871,7 +889,7 @@ class TestLargeHiddenSize:
         # Verify output shapes
         assert y_fp4.shape == (batch_size, hidden_size // 2)
         assert block_scale.shape == (batch_size, hidden_size // block_size)
-        assert y_fp4.dtype == torch.uint8
+        assert y_fp4.dtype == torch.float4_e2m1fn_x2
         assert block_scale.dtype == torch.uint8
 
         # Sample first few rows for value comparison (full dequant is slow)
@@ -952,7 +970,7 @@ class TestSwizzledScaleFactors:
 
         # Non-swizzled output
         y_fp4_ref = torch.empty(
-            batch_size, hidden_size // 2, device="cuda", dtype=torch.uint8
+            batch_size, hidden_size // 2, device="cuda", dtype=torch.float4_e2m1fn_x2
         )
         block_scale_ref = torch.empty(
             batch_size,
@@ -967,7 +985,7 @@ class TestSwizzledScaleFactors:
         num_k_tiles = (hidden_size + factor - 1) // factor
         swizzled_size = num_m_tiles * num_k_tiles * 32 * 4 * 4  # 128x4 tile pattern
         y_fp4_swizzled = torch.empty(
-            batch_size, hidden_size // 2, device="cuda", dtype=torch.uint8
+            batch_size, hidden_size // 2, device="cuda", dtype=torch.float4_e2m1fn_x2
         )
         block_scale_swizzled = torch.empty(
             swizzled_size, device="cuda", dtype=torch.float8_e4m3fn
@@ -998,8 +1016,10 @@ class TestSwizzledScaleFactors:
             block_scale_swizzled.view(torch.uint8), batch_size, hidden_size, block_size
         ).view(torch.float8_e4m3fn)
 
-        # FP4 values should be identical
-        torch.testing.assert_close(y_fp4_swizzled, y_fp4_ref)
+        # FP4 values should be identical (view as uint8 for comparison)
+        torch.testing.assert_close(
+            y_fp4_swizzled.view(torch.uint8), y_fp4_ref.view(torch.uint8)
+        )
 
         # Scale factors should match after unswizzling
         torch.testing.assert_close(
@@ -1024,7 +1044,7 @@ class TestSwizzledScaleFactors:
 
         # Non-swizzled output
         y_fp4_ref = torch.empty(
-            batch_size, hidden_size // 2, device="cuda", dtype=torch.uint8
+            batch_size, hidden_size // 2, device="cuda", dtype=torch.float4_e2m1fn_x2
         )
         block_scale_ref = torch.empty(
             batch_size, hidden_size // block_size, device="cuda", dtype=torch.uint8
@@ -1036,7 +1056,7 @@ class TestSwizzledScaleFactors:
         num_k_tiles = (hidden_size + factor - 1) // factor
         swizzled_size = num_m_tiles * num_k_tiles * 32 * 4 * 4  # 128x4 tile pattern
         y_fp4_swizzled = torch.empty(
-            batch_size, hidden_size // 2, device="cuda", dtype=torch.uint8
+            batch_size, hidden_size // 2, device="cuda", dtype=torch.float4_e2m1fn_x2
         )
         block_scale_swizzled = torch.empty(
             swizzled_size, device="cuda", dtype=torch.uint8
@@ -1065,8 +1085,10 @@ class TestSwizzledScaleFactors:
             block_scale_swizzled, batch_size, hidden_size, block_size
         )
 
-        # FP4 values should be identical
-        torch.testing.assert_close(y_fp4_swizzled, y_fp4_ref)
+        # FP4 values should be identical (view as uint8 for comparison)
+        torch.testing.assert_close(
+            y_fp4_swizzled.view(torch.uint8), y_fp4_ref.view(torch.uint8)
+        )
 
         # Scale factors should match after unswizzling
         torch.testing.assert_close(block_scale_unswizzled, block_scale_ref)
@@ -1104,7 +1126,7 @@ class TestAutoAllocation:
         assert block_scale.shape == (batch_size, hidden_size // block_size)
 
         # Verify output dtypes
-        assert y_fp4.dtype == torch.uint8
+        assert y_fp4.dtype == torch.float4_e2m1fn_x2
         assert block_scale.dtype == torch.float8_e4m3fn
 
         # Reference computation
@@ -1147,7 +1169,7 @@ class TestAutoAllocation:
         assert block_scale.shape == (batch_size, seq_len, hidden_size // block_size)
 
         # Verify output dtypes
-        assert y_fp4.dtype == torch.uint8
+        assert y_fp4.dtype == torch.float4_e2m1fn_x2
         assert block_scale.dtype == torch.float8_e4m3fn
 
         # Reference computation
@@ -1186,7 +1208,7 @@ class TestAutoAllocation:
         assert block_scale.shape == (batch_size, hidden_size // block_size)
 
         # Verify output dtypes
-        assert y_fp4.dtype == torch.uint8
+        assert y_fp4.dtype == torch.float4_e2m1fn_x2
         assert block_scale.dtype == torch.uint8  # UE8M0 uses uint8
 
         # Reference computation
@@ -1238,12 +1260,12 @@ class TestAutoAllocation:
         assert block_scale.shape == (expected_swizzled_size,)
 
         # Verify output dtypes
-        assert y_fp4.dtype == torch.uint8
+        assert y_fp4.dtype == torch.float4_e2m1fn_x2
         assert block_scale.dtype == torch.float8_e4m3fn
 
         # Unswizzle and compare with non-swizzled version
         y_fp4_ref = torch.empty(
-            batch_size, hidden_size // 2, device="cuda", dtype=torch.uint8
+            batch_size, hidden_size // 2, device="cuda", dtype=torch.float4_e2m1fn_x2
         )
         block_scale_ref = torch.empty(
             batch_size,
@@ -1261,8 +1283,8 @@ class TestAutoAllocation:
             block_size=block_size,
         )
 
-        # FP4 values should be identical
-        torch.testing.assert_close(y_fp4, y_fp4_ref)
+        # FP4 values should be identical (view as uint8 for comparison)
+        torch.testing.assert_close(y_fp4.view(torch.uint8), y_fp4_ref.view(torch.uint8))
 
         # Unswizzle and compare scales
         block_scale_unswizzled = unswizzle_sf(
@@ -1291,7 +1313,7 @@ class TestAutoAllocation:
 
         # Pre-allocated version
         y_fp4_pre = torch.empty(
-            batch_size, hidden_size // 2, device="cuda", dtype=torch.uint8
+            batch_size, hidden_size // 2, device="cuda", dtype=torch.float4_e2m1fn_x2
         )
         block_scale_pre = torch.empty(
             batch_size,
@@ -1314,8 +1336,10 @@ class TestAutoAllocation:
             x, weight, global_scale=global_scale, eps=eps, block_size=block_size
         )
 
-        # Results should be identical
-        torch.testing.assert_close(y_fp4_auto, y_fp4_pre)
+        # Results should be identical (view as uint8 for comparison)
+        torch.testing.assert_close(
+            y_fp4_auto.view(torch.uint8), y_fp4_pre.view(torch.uint8)
+        )
         torch.testing.assert_close(
             block_scale_auto.view(torch.uint8), block_scale_pre.view(torch.uint8)
         )

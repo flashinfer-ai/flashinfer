@@ -84,7 +84,9 @@ def bench_fused_cute_dsl(
     x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
     r = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
     weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
-    y_fp4 = torch.empty(batch_size, hidden_size // 2, device="cuda", dtype=torch.uint8)
+    y_fp4 = torch.empty(
+        batch_size, hidden_size // 2, device="cuda", dtype=torch.float4_e2m1fn_x2
+    )
 
     if block_size == 32:
         block_scale = torch.empty(
@@ -191,7 +193,7 @@ def sanity_check_outputs(dtype=torch.float16, block_size=16, global_scale=None):
 
         # CuTe-DSL fused path
         y_fp4_fused = torch.empty(
-            batch_size, hidden_size // 2, device="cuda", dtype=torch.uint8
+            batch_size, hidden_size // 2, device="cuda", dtype=torch.float4_e2m1fn_x2
         )
         if block_size == 32:
             block_scale_fused = torch.empty(
@@ -236,7 +238,10 @@ def sanity_check_outputs(dtype=torch.float16, block_size=16, global_scale=None):
         # 1. FP4 is very low precision (4 bits), small float differences can flip values
         # 2. Different scale factor computation between fused and separate paths
         # 3. Different floating-point operation ordering
-        match_count = (y_fp4_fused == y_fp4_sep).sum().item()
+        # View as uint8 for comparison (float4_e2m1fn_x2 doesn't support == operator)
+        match_count = (
+            (y_fp4_fused.view(torch.uint8) == y_fp4_sep.view(torch.uint8)).sum().item()
+        )
         total_count = y_fp4_fused.numel()
         match_pct = match_count / total_count * 100
 
