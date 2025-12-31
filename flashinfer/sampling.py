@@ -16,9 +16,10 @@ limitations under the License.
 
 import functools
 from types import SimpleNamespace
-from typing import Any, Optional, Tuple, Union
+from typing import Optional, Tuple, Union
 import torch
 
+from .api_logging import flashinfer_api
 from .jit.sampling import gen_sampling_module
 from .utils import (
     _get_cache_buf,
@@ -368,13 +369,19 @@ def get_sampling_module():
 
     # torch library for top_k_renorm_probs
 
-    @register_custom_op("flashinfer::top_k_renorm_probs", mutates_args=())
+    @register_custom_op(
+        "flashinfer::top_k_renorm_probs", mutates_args=("row_states_buffer",)
+    )
     def top_k_renorm_probs(
         probs: torch.Tensor,
         maybe_top_k_arr: Optional[torch.Tensor],
         top_k_val: int,
+        row_states_buffer: torch.Tensor,
     ) -> torch.Tensor:
-        probs = probs.float()
+        # Support FP32, FP16, BF16
+        assert probs.dtype in [torch.float32, torch.float16, torch.bfloat16], (
+            f"Unsupported dtype {probs.dtype}, expected float32, float16, or bfloat16"
+        )
         maybe_top_k_arr = maybe_top_k_arr.int() if maybe_top_k_arr is not None else None
         renorm_probs = torch.empty_like(probs)
         module.top_k_renorm_probs(
@@ -382,6 +389,7 @@ def get_sampling_module():
             renorm_probs,
             maybe_top_k_arr,
             top_k_val,
+            row_states_buffer,
         )
         return renorm_probs
 
@@ -390,25 +398,34 @@ def get_sampling_module():
         probs: torch.Tensor,
         maybe_top_k_arr: Optional[torch.Tensor],
         top_k_val: int,
+        row_states_buffer: torch.Tensor,
     ) -> torch.Tensor:
         return torch.empty_like(probs)
 
     # torch library for top_k_mask_logits
 
-    @register_custom_op("flashinfer::top_k_mask_logits", mutates_args=())
+    @register_custom_op(
+        "flashinfer::top_k_mask_logits", mutates_args=("row_states_buffer",)
+    )
     def top_k_mask_logits(
         logits: torch.Tensor,
         maybe_top_k_arr: Optional[torch.Tensor],
         top_k_val: int,
+        row_states_buffer: torch.Tensor,
     ) -> torch.Tensor:
-        logits = logits.float()
+        # Support FP32, FP16, BF16
+        assert logits.dtype in [torch.float32, torch.float16, torch.bfloat16], (
+            f"Unsupported dtype {logits.dtype}, expected float32, float16, or bfloat16"
+        )
         maybe_top_k_arr = maybe_top_k_arr.int() if maybe_top_k_arr is not None else None
         mask_logits = torch.empty_like(logits)
+
         module.top_k_mask_logits(
             logits,
             mask_logits,
             maybe_top_k_arr,
             top_k_val,
+            row_states_buffer,
         )
         return mask_logits
 
@@ -417,6 +434,7 @@ def get_sampling_module():
         logits: torch.Tensor,
         maybe_top_k_arr: Optional[torch.Tensor],
         top_k_val: int,
+        row_states_buffer: torch.Tensor,
     ) -> torch.Tensor:
         return torch.empty_like(logits)
 
@@ -502,33 +520,7 @@ def _to_tensor_scalar_tuple(x):
         return (None, x)
 
 
-def _check_indices_dtype(indices: Optional[torch.Tensor]) -> None:
-    """Validate indices dtype."""
-    if indices is not None and indices.dtype != torch.int32:
-        raise ValueError(f"indices must have dtype torch.int32, got {indices.dtype}")
-
-
-def _check_tensor_param(param: Any, tensor: torch.Tensor) -> None:
-    """Validate sampling parameters."""
-    if isinstance(param, torch.Tensor):
-        if param.dim() == 0:
-            raise ValueError(
-                f"Expected a 1D tensor of shape (batch_size,) or scalar for the sampling parameter, "
-                f"but got a 0-dimensional tensor with shape {param.shape}. "
-            )
-        elif param.dim() > 1:
-            raise ValueError(
-                f"Expected a 1D tensor or scalar for the sampling parameter, "
-                f"but got a {param.dim()}D tensor with shape {param.shape}. "
-            )
-        elif param.shape[0] != tensor.shape[0]:
-            raise ValueError(
-                f"Sampling parameter tensor batch size mismatch: "
-                f"expected length {tensor.shape[0]} to match the reference tensor batch size, "
-                f"but got length {param.shape[0]} with shape {param.shape}."
-            )
-
-
+@flashinfer_api
 def softmax(
     logits: torch.Tensor,
     temperature: Optional[Union[torch.Tensor, float]] = None,
@@ -586,6 +578,7 @@ def softmax(
     )
 
 
+@flashinfer_api
 def sampling_from_logits(
     logits: torch.Tensor,
     indices: Optional[torch.Tensor] = None,
@@ -645,12 +638,12 @@ def sampling_from_logits(
     if check_nan:
         if torch.any(torch.isnan(logits)):
             raise ValueError("Input logits contains NaN.")
-    _check_indices_dtype(indices)
     return get_sampling_module().sampling_from_logits(
         logits, indices, deterministic, generator, seed, offset
     )
 
 
+@flashinfer_api
 def sampling_from_probs(
     probs: torch.Tensor,
     indices: Optional[torch.Tensor] = None,
@@ -716,12 +709,12 @@ def sampling_from_probs(
     if check_nan:
         if torch.any(torch.isnan(probs)):
             raise ValueError("Input probs contains NaN.")
-    _check_indices_dtype(indices)
     return get_sampling_module().sampling_from_probs(
         probs, indices, deterministic, generator, seed, offset
     )
 
 
+@flashinfer_api
 def top_p_sampling_from_probs(
     probs: torch.Tensor,
     top_p: Union[torch.Tensor, float],
@@ -805,8 +798,6 @@ def top_p_sampling_from_probs(
     if check_nan:
         if torch.any(torch.isnan(probs)):
             raise ValueError("Input probs contains NaN.")
-    _check_indices_dtype(indices)
-    _check_tensor_param(top_p, probs)
     return get_sampling_module().top_p_sampling_from_probs(
         probs,
         indices,
@@ -818,6 +809,7 @@ def top_p_sampling_from_probs(
     )
 
 
+@flashinfer_api
 def top_k_sampling_from_probs(
     probs: torch.Tensor,
     top_k: Union[torch.Tensor, int],
@@ -901,8 +893,6 @@ def top_k_sampling_from_probs(
     if check_nan:
         if torch.any(torch.isnan(probs)):
             raise ValueError("Input probs contains NaN.")
-    _check_indices_dtype(indices)
-    _check_tensor_param(top_k, probs)
     return get_sampling_module().top_k_sampling_from_probs(
         probs,
         indices,
@@ -914,6 +904,7 @@ def top_k_sampling_from_probs(
     )
 
 
+@flashinfer_api
 def min_p_sampling_from_probs(
     probs: torch.Tensor,
     min_p: Union[torch.Tensor, float],
@@ -993,8 +984,6 @@ def min_p_sampling_from_probs(
     if check_nan:
         if torch.any(torch.isnan(probs)):
             raise ValueError("Input probs contains NaN.")
-    _check_indices_dtype(indices)
-    _check_tensor_param(min_p, probs)
     return get_sampling_module().min_p_sampling_from_probs(
         probs,
         indices,
@@ -1006,6 +995,7 @@ def min_p_sampling_from_probs(
     )
 
 
+@flashinfer_api
 def top_k_top_p_sampling_from_logits(
     logits: torch.Tensor,
     top_k: Union[torch.Tensor, int],
@@ -1104,9 +1094,6 @@ def top_k_top_p_sampling_from_logits(
     top_k_mask_logits
     top_p_sampling_from_probs
     """
-    _check_indices_dtype(indices)
-    _check_tensor_param(top_k, logits)
-    _check_tensor_param(top_p, logits)
     if filter_apply_order == "top_k_first":
         masked_logits = top_k_mask_logits(logits, top_k)
         probs = torch.softmax(masked_logits, dim=-1)
@@ -1139,6 +1126,7 @@ def top_k_top_p_sampling_from_logits(
         raise ValueError(f"Invalid filter_apply_order: {filter_apply_order}")
 
 
+@flashinfer_api
 def top_k_top_p_sampling_from_probs(
     probs: torch.Tensor,
     top_k: Union[torch.Tensor, int],
@@ -1232,9 +1220,6 @@ def top_k_top_p_sampling_from_probs(
     top_p_renorm_probs
     top_k_mask_logits
     """
-    _check_indices_dtype(indices)
-    _check_tensor_param(top_k, probs)
-    _check_tensor_param(top_p, probs)
     if filter_apply_order == "top_k_first":
         renorm_probs = top_k_renorm_probs(probs, top_k)
         return top_p_sampling_from_probs(
@@ -1265,6 +1250,7 @@ def top_k_top_p_sampling_from_probs(
         raise ValueError(f"Invalid filter_apply_order: {filter_apply_order}")
 
 
+@flashinfer_api
 def top_p_renorm_probs(
     probs: torch.Tensor,
     top_p: Union[torch.Tensor, float],
@@ -1322,7 +1308,6 @@ def top_p_renorm_probs(
     sampling_from_probs
     top_k_renorm_probs
     """
-    _check_tensor_param(top_p, probs)
     return get_sampling_module().top_p_renorm_probs(
         probs, *_to_tensor_scalar_tuple(top_p)
     )
@@ -1331,6 +1316,7 @@ def top_p_renorm_probs(
 top_p_renorm_prob = top_p_renorm_probs
 
 
+@flashinfer_api
 def top_k_renorm_probs(
     probs: torch.Tensor,
     top_k: Union[torch.Tensor, int],
@@ -1341,6 +1327,7 @@ def top_k_renorm_probs(
     ----------
     probs: torch.Tensor
         Probabilities, shape ``(batch_size, num_classes)``.
+        Supported dtypes: ``float32``, ``float16``, ``bfloat16``.
     top_k: Union[torch.Tensor, int]
         Either a scalar or a tensor of shape ``(batch_size,)``, representing the top-k threshold for for
         for re-normalizing probabilities, should be in ``(0, num_classes)``.
@@ -1352,6 +1339,7 @@ def top_k_renorm_probs(
     -------
     renorm_probs: torch.Tensor
         Renormalized probabilities, shape ``(batch_size, num_classes)``.
+        Same dtype as input ``probs``.
 
     Examples
     --------
@@ -1386,16 +1374,26 @@ def top_k_renorm_probs(
     top_k_sampling_from_probs
     sampling_from_probs
     top_p_renorm_probs
+    top_k : General-purpose top-k selection (returns indices and values)
     """
-    _check_tensor_param(top_k, probs)
+    # Allocate row_states buffer for multi-CTA kernel (1MB is enough for any GPU)
+    buffer_bytes = 1024 * 1024  # 1MB
+    row_states_buffer = _get_cache_buf(
+        f"top_k_renorm_probs_row_states_{probs.device}",
+        buffer_bytes,
+        probs.device,
+        zero_init=True,
+    )
+
     return get_sampling_module().top_k_renorm_probs(
-        probs, *_to_tensor_scalar_tuple(top_k)
+        probs, *_to_tensor_scalar_tuple(top_k), row_states_buffer
     )
 
 
 top_k_renorm_prob = top_k_renorm_probs
 
 
+@flashinfer_api
 def top_k_mask_logits(
     logits: torch.Tensor, top_k: Union[torch.Tensor, int]
 ) -> torch.Tensor:
@@ -1405,6 +1403,7 @@ def top_k_mask_logits(
     ----------
     logits: torch.Tensor
         Logits before softmax, shape ``(batch_size, num_classes)``.
+        Supported dtypes: ``float32``, ``float16``, ``bfloat16``.
     top_k: Union[torch.Tensor, int]
         Either a scalar or a tensor of shape ``(batch_size,)``, representing the top-k threshold for for
         for masking logits, should be in ``(0, num_classes)``.
@@ -1416,6 +1415,7 @@ def top_k_mask_logits(
     -------
     masked_logits: torch.Tensor
         Masked logits, shape ``(batch_size, num_classes)``.
+        Same dtype as input ``logits``.
 
     Examples
     --------
@@ -1446,13 +1446,26 @@ def top_k_mask_logits(
     See Also
     --------
     top_k_renorm_probs
+    top_k : General-purpose top-k selection (returns indices and values)
     """
-    _check_tensor_param(top_k, logits)
+    # Allocate row_states buffer for multi-CTA kernel (1MB is enough for any GPU)
+    buffer_bytes = 1024 * 1024  # 1MB
+    row_states_buffer = _get_cache_buf(
+        f"top_k_mask_logits_row_states_{logits.device}",
+        buffer_bytes,
+        logits.device,
+        zero_init=True,
+    )
+
+    # Note: row_states_buffer is zero-initialized on first allocation by _get_cache_buf
+    # Kernel will reset arrival_counter to 0 at the end of each launch
+
     return get_sampling_module().top_k_mask_logits(
-        logits, *_to_tensor_scalar_tuple(top_k)
+        logits, *_to_tensor_scalar_tuple(top_k), row_states_buffer
     )
 
 
+@flashinfer_api
 def chain_speculative_sampling(
     draft_probs,
     draft_token_ids,

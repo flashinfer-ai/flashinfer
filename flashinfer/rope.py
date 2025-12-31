@@ -19,6 +19,7 @@ from typing import Optional, Tuple
 
 import torch
 
+from .api_logging import flashinfer_api
 from .jit.rope import gen_rope_module
 from .utils import register_custom_op, register_fake_op
 
@@ -413,6 +414,7 @@ def _fake_apply_llama31_rope_pos_ids(
     pass
 
 
+@flashinfer_api
 def apply_rope_inplace(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -500,6 +502,7 @@ def apply_rope_inplace(
     )
 
 
+@flashinfer_api
 def apply_rope_pos_ids_inplace(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -558,6 +561,7 @@ def apply_rope_pos_ids_inplace(
     )
 
 
+@flashinfer_api
 def apply_llama31_rope_inplace(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -666,6 +670,7 @@ def apply_llama31_rope_inplace(
     )
 
 
+@flashinfer_api
 def apply_llama31_rope_pos_ids_inplace(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -744,6 +749,7 @@ def apply_llama31_rope_pos_ids_inplace(
     )
 
 
+@flashinfer_api
 def apply_rope(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -854,6 +860,7 @@ def apply_rope(
     return q_rope, k_rope
 
 
+@flashinfer_api
 def apply_rope_pos_ids(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -922,6 +929,7 @@ def apply_rope_pos_ids(
     return q_rope, k_rope
 
 
+@flashinfer_api
 def apply_llama31_rope(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1044,6 +1052,7 @@ def apply_llama31_rope(
     return q_rope, k_rope
 
 
+@flashinfer_api
 def apply_llama31_rope_pos_ids(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1131,6 +1140,7 @@ def apply_llama31_rope_pos_ids(
     return q_rope, k_rope
 
 
+@flashinfer_api
 def apply_rope_with_cos_sin_cache(
     positions: torch.Tensor,
     query: torch.Tensor,
@@ -1194,6 +1204,7 @@ def apply_rope_with_cos_sin_cache(
     return query_out, key_out
 
 
+@flashinfer_api
 def apply_rope_with_cos_sin_cache_inplace(
     positions: torch.Tensor,
     query: torch.Tensor,
@@ -1246,6 +1257,7 @@ def apply_rope_with_cos_sin_cache_inplace(
     )
 
 
+@flashinfer_api
 def mla_rope_quantize_fp8(
     q_rope: torch.Tensor,
     k_rope: torch.Tensor,
@@ -1282,6 +1294,7 @@ def mla_rope_quantize_fp8(
     )
 
 
+@flashinfer_api
 def rope_quantize_fp8(
     q_rope: torch.Tensor,
     k_rope: torch.Tensor,
@@ -1421,6 +1434,7 @@ def rope_quantize_fp8(
     return q_rope_out, k_rope_out, q_nope_out, k_nope_out
 
 
+@flashinfer_api
 def rope_quantize_fp8_append_paged_kv_cache(
     q_rope: torch.Tensor,
     k_rope: torch.Tensor,
@@ -1626,6 +1640,11 @@ def rope_quantize_fp8_append_paged_kv_cache(
     from .utils import TensorLayout
 
     kv_layout_code = TensorLayout[kv_layout].value
+
+    batch_indices = batch_indices.int()
+    positions = positions.int()
+    kv_indices = kv_indices.int()
+    kv_indptr = kv_indptr.int()
 
     # Call custom op
     _rope_quantize_fp8_append_paged_kv_cache(

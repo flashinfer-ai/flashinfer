@@ -40,6 +40,7 @@ from flashinfer.fused_moe import (
     trtllm_fp8_block_scale_moe,
     trtllm_fp8_per_tensor_scale_moe,
     trtllm_bf16_moe,
+    trtllm_mxint4_block_scale_moe,
 )
 from flashinfer.fused_moe.core import (
     get_w2_permute_indices_with_cache,
@@ -583,6 +584,219 @@ class FP4Moe(Moe):
 
 
 # ====================================================================================
+# MxInt4 Block Scale Quantization Implementation
+# ====================================================================================
+
+
+def mxint4_quantize(
+    x: torch.Tensor, sf_vec_size: int = 32
+) -> tuple[torch.Tensor, torch.Tensor]:
+    x_reshaped = x.reshape(-1, sf_vec_size)
+    x_max = x_reshaped.max(dim=-1, keepdim=True)[0].to(torch.float32)
+    x_min = x_reshaped.min(dim=-1, keepdim=True)[0].to(torch.float32)
+    x_max = x_max * 8.0 / 7.0
+    amax = torch.where(x_max > -x_min, x_max, -x_min)
+    scales = amax / 8.0
+    x_scaled = x_reshaped * scales.reciprocal()
+    x_int8 = (
+        x_scaled.round().clamp(-8, 7).to(torch.int8).reshape(-1, sf_vec_size // 2, 2)
+    )
+    x_int4 = (x_int8[..., 0] & 0x0F) | ((x_int8[..., 1] & 0x0F) << 4)
+    return x_int4.reshape(*x.shape[:-1], x.shape[-1] // 2), scales.reshape(
+        -1, sf_vec_size
+    )
+
+
+class MxInt4BlockScaleMoe(Moe):
+    """MxInt4 MoE implementation with block scaling (DeepSeek style)."""
+
+    def quantize_weights(self, gemm1_weights, gemm2_weights, hidden_states_sample):
+        """Quantize weights to MxInt4 with block scaling."""
+        num_experts = gemm1_weights.shape[0]
+        intermediate_size = gemm1_weights.shape[1] // 2
+        hidden_size = gemm1_weights.shape[
+            2
+        ]  # [num_experts, 2*intermediate_size, hidden_size]
+
+        # Quantize weights to MxInt4
+        sf_vec_size = 32
+        gemm1_weights_int4, gemm1_scales = mxint4_quantize(gemm1_weights, sf_vec_size)
+        gemm2_weights_int4, gemm2_scales = mxint4_quantize(gemm2_weights, sf_vec_size)
+        gemm1_scales = gemm1_scales.to(torch.bfloat16).reshape(
+            num_experts,
+            2 * intermediate_size,
+            hidden_size // sf_vec_size,
+        )
+        gemm2_scales = gemm2_scales.to(torch.bfloat16).reshape(
+            num_experts, hidden_size, intermediate_size // sf_vec_size
+        )
+        return {
+            "hidden_states_scale_global": None,
+            "gemm1_weights": gemm1_weights_int4,
+            "gemm2_weights": gemm2_weights_int4,
+            "gemm1_scales": gemm1_scales,
+            "gemm2_scales": gemm2_scales,
+            "gemm1_scales_global": None,
+            "gemm2_scales_global": None,
+        }
+
+    def quantize_inputs(self, hidden_states, *unused_args):
+        """No scaling for hidden states."""
+        return {
+            "hidden_states": hidden_states.to(torch.bfloat16),
+            "hidden_states_scale": None,
+        }
+
+    def prepare_static_weights_for_kernel(
+        self,
+        args_dequant,
+        args,
+        gemm1_weights_orig,
+        gemm2_weights_orig,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        weight_processing,
+    ):
+        """Prepare quantized weights for kernel (done offline with weights)."""
+
+        epilogue_tile_m = 128
+        gemm1_weights_mxint4_shuffled = []
+        gemm1_scales_shuffled = []
+        gemm2_weights_mxint4_shuffled = []
+        gemm2_scales_shuffled = []
+
+        for i in range(num_experts):
+            # Calculate the permute indices for the following:
+            # 1. Reorder rows of W1 and scales for fused gated activation
+            # 2. Shuffle weights and scaling factors for transposed mma output
+            # for both w3_w1 and w2 weights and scale factors
+            permute_indices = _maybe_get_cached_w3_w1_permute_indices(
+                self._cache_permute_indices,
+                args.gemm1_weights[i].view(torch.uint8),
+                epilogue_tile_m,
+            )
+            gemm1_weights_shuffled = (
+                args.gemm1_weights[i]
+                .view(torch.uint8)[permute_indices.to(args.gemm1_weights.device)]
+                .contiguous()
+            )
+            permute_sf_indices = _maybe_get_cached_w3_w1_permute_indices(
+                self._cache_permute_indices,
+                args.gemm1_scales[i].view(torch.bfloat16),
+                epilogue_tile_m,
+                num_elts_per_sf=32,
+            )
+            gemm1_scales_shuffled.append(
+                block_scale_interleave(
+                    args.gemm1_scales[i]
+                    .view(torch.bfloat16)[
+                        permute_sf_indices.to(args.gemm1_scales.device)
+                    ]
+                    .contiguous()
+                )
+            )
+
+            permute_indices = get_w2_permute_indices_with_cache(
+                self._cache_permute_indices,
+                args.gemm2_weights[i].view(torch.uint8),
+                epilogue_tile_m,
+            )
+            gemm2_weights_shuffled = (
+                args.gemm2_weights[i]
+                .view(torch.uint8)[permute_indices.to(args.gemm2_weights.device)]
+                .contiguous()
+            )
+
+            permute_sf_indices = get_w2_permute_indices_with_cache(
+                self._cache_permute_indices,
+                args.gemm2_scales[i].view(torch.bfloat16),
+                epilogue_tile_m,
+                num_elts_per_sf=16,
+            )
+            gemm2_scales_shuffled.append(
+                block_scale_interleave(
+                    args.gemm2_scales[i]
+                    .view(torch.bfloat16)[
+                        permute_sf_indices.to(args.gemm2_scales.device)
+                    ]
+                    .contiguous()
+                )
+            )
+
+            block_k = 128
+            gemm1_weights_shuffled = convert_to_block_layout(
+                gemm1_weights_shuffled, block_k
+            )
+            gemm2_weights_shuffled = convert_to_block_layout(
+                gemm2_weights_shuffled.view(torch.uint8), block_k
+            )
+
+            gemm1_weights_mxint4_shuffled.append(gemm1_weights_shuffled)
+            gemm2_weights_mxint4_shuffled.append(gemm2_weights_shuffled)
+
+        gemm1_weights_mxint4_shuffled = torch.stack(gemm1_weights_mxint4_shuffled)
+        gemm2_weights_mxint4_shuffled = torch.stack(gemm2_weights_mxint4_shuffled)
+        gemm1_scales_shuffled = torch.stack(gemm1_scales_shuffled).view(torch.bfloat16)
+        gemm2_scales_shuffled = torch.stack(gemm2_scales_shuffled).view(torch.bfloat16)
+
+        return {
+            "gemm1_weights": gemm1_weights_mxint4_shuffled,
+            "gemm1_scales": gemm1_scales_shuffled,
+            "gemm2_weights": gemm2_weights_mxint4_shuffled,
+            "gemm2_scales": gemm2_scales_shuffled,
+        }
+
+    def call_moe(
+        self, static_data, hidden_states_orig, hidden_states_scale_global, **kwargs
+    ):
+        """Call MoE with runtime input quantization + kernel execution (done at runtime)."""
+        expert_logits = kwargs["expert_logits"]
+        routing_bias = kwargs["routing_bias"]
+        num_experts = kwargs["num_experts"]
+        top_k = kwargs["top_k"]
+        n_groups = kwargs["n_groups"]
+        top_k_groups = kwargs["top_k_groups"]
+        intermediate_size = kwargs["intermediate_size"]
+        routing_method_type = kwargs["routing_method_type"]
+        enable_autotune = kwargs.get("enable_autotune", True)
+        routed_scaling = kwargs.get("routed_scaling", 1.0)
+
+        # Use autotuner for optimal kernel selection
+        with autotune(enable_autotune):
+            output = trtllm_mxint4_block_scale_moe(
+                expert_logits,  # float
+                routing_bias,
+                hidden_states_orig,
+                static_data["gemm1_weights"],
+                static_data["gemm1_scales"],
+                None,
+                None,
+                None,
+                static_data["gemm2_weights"],
+                static_data["gemm2_scales"],
+                num_experts,
+                top_k,
+                n_groups,
+                top_k_groups,
+                intermediate_size,
+                0,
+                num_experts,
+                routed_scaling,
+                routing_method_type=routing_method_type,
+                tune_max_num_tokens=TUNE_MAX_NUM_TOKENS,
+            )
+        return output.to(torch.float)
+
+    def compute_reference(self, args):
+        return run_moe_reference_mxint4(args)
+
+    def get_tolerances(self):
+        """Get MXINT4-specific accuracy tolerances."""
+        return {"atol": 0.1, "rtol": 0.85, "percent": 0.925}
+
+
+# ====================================================================================
 # FP8 Block Scale Quantization Implementation
 # ====================================================================================
 
@@ -1097,6 +1311,7 @@ class BF16Moe(Moe):
         n_groups = kwargs["n_groups"]
         top_k_groups = kwargs["top_k_groups"]
         intermediate_size = kwargs["intermediate_size"]
+        routed_scaling = kwargs["routed_scaling"]
         routing_method_type = kwargs["routing_method_type"]
         enable_autotune = kwargs.get("enable_autotune", True)
 
@@ -1115,6 +1330,7 @@ class BF16Moe(Moe):
                 intermediate_size,
                 0,
                 num_experts,
+                routed_scaling,
                 use_shuffled_weight=static_data["use_shuffled_weight"],
                 weight_layout=static_data["weight_layout"],
                 routing_method_type=routing_method_type,
@@ -1726,10 +1942,7 @@ def run_moe_dequant(args, quant_mode: QuantMode):
             .to(torch.float)
         )
         args.c_global_sf = 1.0
-    elif quant_mode == QuantMode.BF16:
-        activation_output = activation_output.to(torch.bfloat16).to(torch.float)
-        args.c_global_sf = 1.0
-    else:  # mxfp4Bf16
+    else:  # Bf16, MxFp4xBf16, MxInt4xBf16
         activation_output = activation_output.to(torch.bfloat16).to(torch.float)
         args.c_global_sf = 1.0
 
@@ -1963,6 +2176,57 @@ def run_moe_reference_bf16(args):
     )
 
     return run_moe_dequant(args_dequant, QuantMode.BF16), args_dequant
+
+
+def run_moe_reference_mxint4(args):
+    sf_vec_size = 32
+
+    hidden_states_dequant = args.hidden_states.to(torch.bfloat16).to(torch.float)
+
+    num_experts = args.gemm1_weights.shape[0]
+
+    def dequantize(weights, scales):
+        k = weights.shape[-1] * 2
+        n = weights.shape[-2]
+        # Unpack two 4-bit values (stored in two's-complement) from each byte
+        weights_int8 = (
+            torch.stack([weights & 0x0F, (weights >> 4) & 0x0F], dim=-1)
+            .reshape(num_experts, n, k)
+            .to(torch.int8)
+        )
+
+        # Interpret nibbles as signed 4-bit two's-complement values in [-8, 7]
+        weights_int8 = torch.where(weights_int8 < 8, weights_int8, weights_int8 - 16)
+
+        weights_float = weights_int8.to(torch.float)
+        scales_expanded = (
+            scales.to(torch.bfloat16)
+            .to(torch.float)
+            .repeat_interleave(sf_vec_size, dim=-1)
+            .reshape(weights_float.shape)
+        )
+        return weights_float * scales_expanded
+
+    gemm1_weights_dequant = dequantize(args.gemm1_weights, args.gemm1_scales)
+    gemm2_weights_dequant = dequantize(args.gemm2_weights, args.gemm2_scales)
+
+    args_dequant = moe_args_dequant(
+        args.num_tokens,
+        args.num_experts,
+        args.hidden_size,
+        args.intermediate_size,
+        args.top_k,
+        args.padding,
+        hidden_states_dequant,
+        args.expert_logits,
+        gemm1_weights_dequant,
+        gemm2_weights_dequant,
+        args.permute_info,
+        args.use_routing_scales_on_input,
+        args.gated_act_type,
+    )
+
+    return run_moe_dequant(args_dequant, QuantMode.MXINT4_BF16_BF16), args_dequant
 
 
 def _compute_moe_actual_unified(moe_impl, args_dequant, args, **kwargs):
@@ -2219,6 +2483,7 @@ def run_moe_test(
         pytest.param(FP4Moe(quant_mode=QuantMode.FP4_NVFP4_NVFP4), id="NvFP4xNvFP4"),
         pytest.param(FP4Moe(quant_mode=QuantMode.FP4_MXFP4_MXFP8), id="MxFP4xMxFP8"),
         pytest.param(FP4Moe(quant_mode=QuantMode.FP4_MXFP4_Bf16), id="MxFP4xBf16"),
+        pytest.param(MxInt4BlockScaleMoe(), id="MxInt4xBf16"),
     ],
 )
 @pytest.mark.parametrize(
@@ -2239,6 +2504,7 @@ def run_moe_test(
                     FP8BlockScaleMoe,
                     FP4Moe,
                     BF16Moe,
+                    MxInt4BlockScaleMoe,
                 ],
                 "compatible_intermediate_size": [384, 768, 1024],
                 "enable_autotune": True,
@@ -2260,6 +2526,7 @@ def run_moe_test(
                     FP8BlockScaleMoe,
                     FP4Moe,
                     BF16Moe,
+                    MxInt4BlockScaleMoe,
                 ],
                 "compatible_intermediate_size": [384, 1024],
                 "enable_autotune": False,
@@ -2281,6 +2548,7 @@ def run_moe_test(
                     FP8BlockScaleMoe,
                     FP4Moe,
                     BF16Moe,
+                    MxInt4BlockScaleMoe,
                 ],
                 "compatible_intermediate_size": [512],
                 "enable_autotune": True,
@@ -2312,7 +2580,11 @@ def run_moe_test(
             {
                 "use_shuffled_weight": True,
                 "layout": WeightLayout.BlockMajorK,
-                "compatible_moe_impls": [FP8BlockScaleMoe, BF16Moe],
+                "compatible_moe_impls": [
+                    FP8BlockScaleMoe,
+                    BF16Moe,
+                    MxInt4BlockScaleMoe,
+                ],
             },
             id="Shuffled_BlockMajorK",
         ),
@@ -2359,6 +2631,8 @@ def test_renormalize_routing(
         pytest.param(FP4Moe(quant_mode=QuantMode.FP4_NVFP4_NVFP4), id="NvFP4xNvFP4"),
         pytest.param(FP4Moe(quant_mode=QuantMode.FP4_MXFP4_MXFP8), id="MxFP4xMxFP8"),
         pytest.param(FP4Moe(quant_mode=QuantMode.FP4_MXFP4_Bf16), id="MxFP4xBf16"),
+        pytest.param(MxInt4BlockScaleMoe(), id="MxInt4xBf16"),
+        pytest.param(BF16Moe(), id="Bf16xBf16"),
     ],
 )
 @pytest.mark.parametrize(
@@ -2390,7 +2664,12 @@ def test_renormalize_routing(
                 "routed_scaling": 2.5,
                 "has_routing_bias": True,
                 "routing_method_type": RoutingMethodType.DeepSeekV3,
-                "compatible_moe_impls": [FP4Moe, FP8BlockScaleMoe],
+                "compatible_moe_impls": [
+                    FP4Moe,
+                    FP8BlockScaleMoe,
+                    MxInt4BlockScaleMoe,
+                    BF16Moe,
+                ],
                 "compatible_intermediate_size": [512, 1024, 2048],
                 "enable_autotune": True,
             },
@@ -2437,7 +2716,11 @@ def test_renormalize_routing(
             {
                 "use_shuffled_weight": True,
                 "layout": WeightLayout.BlockMajorK,
-                "compatible_moe_impls": [FP8BlockScaleMoe],
+                "compatible_moe_impls": [
+                    FP8BlockScaleMoe,
+                    MxInt4BlockScaleMoe,
+                    BF16Moe,
+                ],
             },
             id="Shuffled_BlockMajorK",
         ),

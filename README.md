@@ -117,20 +117,27 @@ pip install -U --pre flashinfer-cubin --index-url https://flashinfer.ai/whl/nigh
 pip install -U --pre flashinfer-jit-cache --index-url https://flashinfer.ai/whl/nightly/cu129
 ```
 
-### Verify Installation
+### CLI Tools
 
-After installation, verify that FlashInfer is correctly installed and configured:
+FlashInfer provides several CLI commands for configuration, module management, and development:
 
 ```bash
+# Verify installation and view configuration
 flashinfer show-config
+
+# List and inspect modules
+flashinfer list-modules
+flashinfer module-status
+
+# Manage artifacts and cache
+flashinfer download-cubin
+flashinfer clear-cache
+
+# For developers: generate compile_commands.json for IDE integration
+flashinfer export-compile-commands [output_path]
 ```
 
-This command displays:
-
-- FlashInfer version and installed packages (flashinfer-python, flashinfer-cubin, flashinfer-jit-cache)
-- PyTorch and CUDA version information
-- Environment variables and artifact paths
-- Downloaded cubin status and module compilation status
+For complete documentation, see the [CLI reference](https://docs.flashinfer.ai/cli.html).
 
 ### Trying it out
 
@@ -181,15 +188,19 @@ export FLASHINFER_LOGLEVEL=3
 export FLASHINFER_LOGDEST=stdout
 ```
 
-For detailed information about logging levels, configuration, and advanced features, see [LOGGING.md](LOGGING.md).
+For detailed information about logging levels, configuration, and advanced features, see [Logging](https://docs.flashinfer.ai/logging.html) in our documentation.
 
 ## Custom Attention Variants
 
 Starting from FlashInfer v0.2, users can customize their own attention variants with additional parameters. For more details, refer to our [JIT examples](https://github.com/flashinfer-ai/flashinfer/blob/main/tests/utils/test_jit_example.py).
 
-## GPU Support
+## GPU and CUDA Support
 
 FlashInfer currently provides support for NVIDIA SM architectures 75 and higher and beta support for 103, 110, 120, and 121.
+
+**Supported CUDA Versions:** 12.6, 12.8, 13.0, 13.1
+
+> **Note:** FlashInfer strives to follow PyTorch's supported CUDA versions plus the latest CUDA release.
 
 ## Adoption
 

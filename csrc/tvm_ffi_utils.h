@@ -18,6 +18,7 @@
 #include <tvm/ffi/dtype.h>
 #include <tvm/ffi/error.h>
 #include <tvm/ffi/extra/c_env_api.h>
+#include <tvm/ffi/extra/cuda/device_guard.h>
 #include <tvm/ffi/function.h>
 
 #include "dlpack/dlpack.h"
@@ -85,6 +86,23 @@ constexpr DLDevice cpu = DLDevice{kDLCPU, 0};
     switch (encode_dlpack_dtype(dlpack_dtype)) {                                         \
       _DISPATCH_CASE_F16(c_type, __VA_ARGS__)                                            \
       _DISPATCH_CASE_BF16(c_type, __VA_ARGS__)                                           \
+      default:                                                                           \
+        TVM_FFI_ICHECK(false) << __PRETTY_FUNCTION__ << " failed to dispatch data type " \
+                              << (dlpack_dtype).code << " " << (dlpack_dtype).bits;      \
+        return false;                                                                    \
+    }                                                                                    \
+  }()
+
+// Dispatcher for FP32/FP16/BF16 data types
+#define DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP32_FP16(dlpack_dtype, c_type, ...)              \
+  [&]() -> bool {                                                                        \
+    switch (encode_dlpack_dtype(dlpack_dtype)) {                                         \
+      case float32_code: {                                                               \
+        using c_type = float;                                                            \
+        return __VA_ARGS__();                                                            \
+      }                                                                                  \
+        _DISPATCH_CASE_F16(c_type, __VA_ARGS__)                                          \
+        _DISPATCH_CASE_BF16(c_type, __VA_ARGS__)                                         \
       default:                                                                           \
         TVM_FFI_ICHECK(false) << __PRETTY_FUNCTION__ << " failed to dispatch data type " \
                               << (dlpack_dtype).code << " " << (dlpack_dtype).bits;      \
@@ -254,6 +272,10 @@ inline void check_shape(const tvm::ffi::TensorView& a, const tvm::ffi::TensorVie
   CHECK_CUDA(x);                    \
   CHECK_CONTIGUOUS(x);              \
   CHECK_INPUT_TYPE(x, st)
+#define CHECK_MAYBE_INPUT_TYPE(maybe_x, st) \
+  if (maybe_x.has_value()) {                \
+    CHECK_INPUT_TYPE(maybe_x.value(), st);  \
+  }
 #define CHECK_LAST_DIM_CONTIGUOUS_INPUT(x) \
   CHECK_CUDA(x);                           \
   CHECK_LAST_DIM_CONTIGUOUS(x)

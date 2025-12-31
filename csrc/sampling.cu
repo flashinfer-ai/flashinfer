@@ -15,6 +15,7 @@
  */
 #include <flashinfer/sampling.cuh>
 
+#include "sampling_utils.h"
 #include "tvm_ffi_utils.h"
 
 using namespace flashinfer;
@@ -32,7 +33,7 @@ void softmax(TensorView workspace_buffer, TensorView logits, TensorView output,
 
   bool has_temperature_arr = maybe_temperature_arr.has_value();
 
-  cudaSetDevice(logits.device().device_id);
+  ffi::CUDADeviceGuard device_guard(logits.device().device_id);
   auto stream = get_stream(logits.device());
   cudaError_t status = sampling::OnlineSoftmax<float>(
       static_cast<float*>(logits.data_ptr()), static_cast<float*>(output.data_ptr()), batch_size,
@@ -48,10 +49,11 @@ void sampling_from_logits(TensorView logits, TensorView output, Optional<TensorV
                           bool deterministic, uint64_t philox_seed, uint64_t philox_offset) {
   CHECK_INPUT(logits);
   CHECK_DIM(2, logits);  // logits: (batch_size, vocab_size)
+  CHECK_MAYBE_INPUT_TYPE(maybe_indices, dl_int32);
   unsigned int batch_size = output.size(0);
   unsigned int vocab_size = logits.size(1);
 
-  cudaSetDevice(logits.device().device_id);
+  ffi::CUDADeviceGuard device_guard(logits.device().device_id);
   auto stream = get_stream(logits.device());
   cudaError_t status = sampling::SamplingFromLogits(
       static_cast<float*>(logits.data_ptr()), static_cast<int*>(output.data_ptr()),
@@ -65,10 +67,11 @@ void sampling_from_probs(TensorView probs, TensorView output, Optional<TensorVie
                          bool deterministic, uint64_t philox_seed, uint64_t philox_offset) {
   CHECK_INPUT(probs);
   CHECK_DIM(2, probs);  // probs: (batch_size, vocab_size)
+  CHECK_MAYBE_INPUT_TYPE(maybe_indices, dl_int32);
   unsigned int batch_size = output.size(0);
   unsigned int vocab_size = probs.size(1);
 
-  cudaSetDevice(probs.device().device_id);
+  ffi::CUDADeviceGuard device_guard(probs.device().device_id);
   auto stream = get_stream(probs.device());
   cudaError_t status = sampling::SamplingFromProb(
       static_cast<float*>(probs.data_ptr()), static_cast<int*>(output.data_ptr()),
@@ -84,11 +87,13 @@ void top_p_sampling_from_probs(TensorView probs, TensorView output,
                                bool deterministic, uint64_t philox_seed, uint64_t philox_offset) {
   CHECK_INPUT(probs);
   CHECK_DIM(2, probs);  // probs: (batch_size, vocab_size)
+  CHECK_MAYBE_INPUT_TYPE(maybe_indices, dl_int32);
   unsigned int batch_size = output.size(0);
   unsigned int vocab_size = probs.size(1);
+  check_tensor_param(maybe_top_p_arr, probs);
   bool has_top_p_arr = maybe_top_p_arr.has_value();
 
-  cudaSetDevice(probs.device().device_id);
+  ffi::CUDADeviceGuard device_guard(probs.device().device_id);
   auto stream = get_stream(probs.device());
   cudaError_t status = sampling::TopPSamplingFromProb<float, int>(
       static_cast<float*>(probs.data_ptr()), static_cast<int*>(output.data_ptr()),
@@ -108,11 +113,13 @@ void top_k_sampling_from_probs(TensorView probs, TensorView output,
   CHECK_DEVICE(output, probs);
   CHECK_DIM(2, probs);   // probs: (batch_size, vocab_size)
   CHECK_DIM(1, output);  // output: (batch_size)
+  CHECK_MAYBE_INPUT_TYPE(maybe_indices, dl_int32);
   unsigned int batch_size = output.size(0);
   unsigned int vocab_size = probs.size(1);
+  check_tensor_param(maybe_top_k_arr, probs);
   bool has_top_k_arr = maybe_top_k_arr.has_value();
 
-  cudaSetDevice(probs.device().device_id);
+  ffi::CUDADeviceGuard device_guard(probs.device().device_id);
   auto stream = get_stream(probs.device());
   cudaError_t status = sampling::TopKSamplingFromProb<float, int>(
       static_cast<float*>(probs.data_ptr()), static_cast<int*>(output.data_ptr()),
@@ -132,11 +139,13 @@ void min_p_sampling_from_probs(TensorView probs, TensorView output,
   CHECK_DEVICE(output, probs);
   CHECK_DIM(2, probs);   // probs: (batch_size, vocab_size)
   CHECK_DIM(1, output);  // output: (batch_size)
+  CHECK_MAYBE_INPUT_TYPE(maybe_indices, dl_int32);
   unsigned int batch_size = output.size(0);
   unsigned int vocab_size = probs.size(1);
+  check_tensor_param(maybe_min_p_arr, probs);
   bool has_min_p_arr = maybe_min_p_arr.has_value();
 
-  cudaSetDevice(probs.device().device_id);
+  ffi::CUDADeviceGuard device_guard(probs.device().device_id);
   auto stream = get_stream(probs.device());
   cudaError_t status = sampling::MinPSamplingFromProb<float, int>(
       static_cast<float*>(probs.data_ptr()),
@@ -159,12 +168,15 @@ void top_k_top_p_sampling_from_probs(TensorView probs, TensorView output,
   CHECK_DEVICE(output, probs);
   CHECK_DIM(2, probs);   // probs: (batch_size, vocab_size)
   CHECK_DIM(1, output);  // output: (batch_size)
+  CHECK_MAYBE_INPUT_TYPE(maybe_indices, dl_int32);
   unsigned int batch_size = output.size(0);
   unsigned int vocab_size = probs.size(1);
+  check_tensor_param(maybe_top_k_arr, probs);
+  check_tensor_param(maybe_top_p_arr, probs);
   bool has_top_k_arr = maybe_top_k_arr.has_value();
   bool has_top_p_arr = maybe_top_p_arr.has_value();
 
-  cudaSetDevice(probs.device().device_id);
+  ffi::CUDADeviceGuard device_guard(probs.device().device_id);
   auto stream = get_stream(probs.device());
   cudaError_t status = sampling::TopKTopPSamplingFromProb<float, int>(
       static_cast<float*>(probs.data_ptr()),
@@ -201,7 +213,7 @@ void chain_speculative_sampling(TensorView draft_probs, TensorView draft_token_i
   TVM_FFI_ICHECK_EQ(batch_size, output_accepted_token_num.size(0));
   TVM_FFI_ICHECK_EQ(batch_size, output_emitted_draft_token_num.size(0));
 
-  cudaSetDevice(draft_probs.device().device_id);
+  ffi::CUDADeviceGuard device_guard(draft_probs.device().device_id);
   auto stream = get_stream(draft_probs.device());
   cudaError_t status = sampling::ChainSpeculativeSampling<float, int>(
       static_cast<float*>(draft_probs.data_ptr()), static_cast<int*>(draft_token_ids.data_ptr()),

@@ -41,7 +41,7 @@ void merge_state(TensorView v_a, TensorView s_a, TensorView v_b, TensorView s_b,
   unsigned int num_heads = v_a.size(1);
   unsigned int head_dim = v_a.size(2);
 
-  cudaSetDevice(v_a.device().device_id);
+  ffi::CUDADeviceGuard device_guard(v_a.device().device_id);
   auto stream = get_stream(v_a.device());
 
   bool success = DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(v_a.dtype(), c_type, [&] {
@@ -85,7 +85,7 @@ void merge_state_in_place(TensorView v, TensorView s, TensorView v_other, Tensor
   unsigned int num_heads = v.size(1);
   unsigned int head_dim = v.size(2);
 
-  cudaSetDevice(v.device().device_id);
+  ffi::CUDADeviceGuard device_guard(v.device().device_id);
   auto stream = get_stream(v.device());
   bool success = DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(v.dtype(), c_type, [&] {
     cudaError_t status = MergeStateInPlace(
@@ -114,7 +114,7 @@ void merge_states(TensorView v, TensorView s, TensorView v_merged, TensorView s_
   unsigned int num_heads = v.size(2);
   unsigned int head_dim = v.size(3);
 
-  cudaSetDevice(v.device().device_id);
+  ffi::CUDADeviceGuard device_guard(v.device().device_id);
   auto stream = get_stream(v.device());
   bool success = DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(v.dtype(), c_type, [&] {
     cudaError_t status = MergeStates(

@@ -331,5 +331,57 @@ def list_modules_cmd(module_name):
             )
 
 
+@cli.command("export-compile-commands")
+@click.argument("path", required=False, default="compile_commands.json")
+@click.option(
+    "--output",
+    "-o",
+    default=None,
+    help="Output file path (overrides PATH argument)",
+)
+def export_compile_commands_cmd(path, output):
+    """Export compile commands to compile_commands.json
+
+    PATH: Output file path (default: compile_commands.json)
+    """
+    import json
+
+    # --output option overrides PATH argument
+    output_path = output if output is not None else path
+
+    # Register default modules if none exist
+    _ensure_modules_registered()
+
+    # Get all registered specs
+    all_specs = jit_spec_registry.get_all_specs()
+
+    if not all_specs:
+        click.secho("No modules found to export.", fg="yellow")
+        return
+
+    # Collect all compile commands
+    all_compile_commands = []
+    for spec in all_specs.values():
+        try:
+            compile_commands = spec.get_compile_commands()
+            all_compile_commands.extend(compile_commands)
+        except Exception as e:
+            click.secho(
+                f"Warning: Failed to generate compile commands for {spec.name}: {e}",
+                fg="yellow",
+            )
+
+    # Write to output file
+    try:
+        with open(output_path, "w") as f:
+            json.dump(all_compile_commands, f, indent=2)
+        click.secho(
+            f"✅ Successfully exported {len(all_compile_commands)} compile commands to {output_path}",
+            fg="green",
+        )
+    except Exception as e:
+        click.secho(f"❌ Failed to write compile commands: {e}", fg="red")
+
+
 if __name__ == "__main__":
     cli()

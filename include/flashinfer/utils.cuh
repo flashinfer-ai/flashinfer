@@ -21,6 +21,7 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
+#include <atomic>
 #include <cstdint>
 #include <iostream>
 #include <type_traits>
@@ -317,13 +318,18 @@
 namespace flashinfer {
 
 template <typename T1, typename T2>
-__forceinline__ __device__ __host__ T1 ceil_div(const T1 x, const T2 y) {
+__forceinline__ __device__ __host__ constexpr T1 ceil_div(const T1 x, const T2 y) noexcept {
   return (x + y - 1) / y;
 }
 
 template <typename T1, typename T2>
-__forceinline__ __device__ __host__ T1 round_up(const T1 x, const T2 y) {
+__forceinline__ __device__ __host__ constexpr T1 round_up(const T1 x, const T2 y) noexcept {
   return ceil_div(x, y) * y;
+}
+
+template <typename T1, typename T2>
+__forceinline__ __device__ __host__ constexpr T1 round_down(const T1 x, const T2 y) noexcept {
+  return (x / y) * y;
 }
 
 inline std::pair<int, int> GetCudaComputeCapability() {
@@ -333,6 +339,22 @@ inline std::pair<int, int> GetCudaComputeCapability() {
   cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device_id);
   cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device_id);
   return std::make_pair(major, minor);
+}
+
+// This function is thread-safe and cached the sm_count.
+// But it will only check the current CUDA device, thus assuming each process handles single GPU.
+inline int GetCudaMultiProcessorCount() {
+  static std::atomic<int> sm_count{0};
+  int cached = sm_count.load(std::memory_order_relaxed);
+  if (cached == 0) {
+    int device_id;
+    cudaGetDevice(&device_id);
+    cudaDeviceProp device_prop;
+    cudaGetDeviceProperties(&device_prop, device_id);
+    cached = device_prop.multiProcessorCount;
+    sm_count.store(cached, std::memory_order_relaxed);
+  }
+  return cached;
 }
 
 template <typename T>
@@ -396,6 +418,59 @@ inline int UpPowerOfTwo(int x) {
  */
 __device__ __forceinline__ uint32_t sub_if_greater_or_zero(uint32_t x, uint32_t y) {
   return (x > y) ? x - y : 0U;
+}
+
+// ======================= PTX Memory Utility Functions =======================
+// Non-atomic global memory access with cache streaming hint (cs)
+// These are useful for streaming memory access patterns where data is used once
+
+/*!
+ * \brief Get the lane ID within a warp (0-31)
+ */
+__forceinline__ __device__ int get_lane_id() {
+  int lane_id;
+  asm("mov.u32 %0, %%laneid;" : "=r"(lane_id));
+  return lane_id;
+}
+
+/*!
+ * \brief Non-atomic global load for int (4 bytes) with cache streaming hint
+ */
+__forceinline__ __device__ int ld_na_global_v1(const int* addr) {
+  int val;
+  asm volatile("ld.global.cs.b32 %0, [%1];" : "=r"(val) : "l"(addr));
+  return val;
+}
+
+/*!
+ * \brief Non-atomic global load for int2 (8 bytes) with cache streaming hint
+ */
+__forceinline__ __device__ int2 ld_na_global_v2(const int2* addr) {
+  int2 val;
+  asm volatile("ld.global.cs.v2.b32 {%0, %1}, [%2];" : "=r"(val.x), "=r"(val.y) : "l"(addr));
+  return val;
+}
+
+/*!
+ * \brief Non-atomic global store for int (4 bytes) with cache streaming hint
+ */
+__forceinline__ __device__ void st_na_global_v1(int* addr, int val) {
+  asm volatile("st.global.cs.b32 [%0], %1;" ::"l"(addr), "r"(val));
+}
+
+/*!
+ * \brief Non-atomic global store for int2 (8 bytes) with cache streaming hint
+ */
+__forceinline__ __device__ void st_na_global_v2(int2* addr, int2 val) {
+  asm volatile("st.global.cs.v2.b32 [%0], {%1, %2};" ::"l"(addr), "r"(val.x), "r"(val.y));
+}
+
+/*!
+ * \brief Prefetch data to L2 cache
+ */
+template <typename T>
+__forceinline__ __device__ void prefetch_L2(const T* addr) {
+  asm volatile("prefetch.global.L2 [%0];" ::"l"(addr));
 }
 
 __device__ __forceinline__ void swap(uint32_t& a, uint32_t& b) {

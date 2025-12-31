@@ -21,6 +21,8 @@
 #include <curand_kernel.h>
 #include <curand_philox4x32_x.h>
 
+#include <cstdlib>
+#include <cstring>
 #include <cub/cub.cuh>
 #include <cuda/functional>
 #include <cuda/std/functional>
@@ -31,6 +33,7 @@
 
 #include "allocator.h"
 #include "math.cuh"
+#include "topk.cuh"
 #include "utils.cuh"
 #include "vec_dtypes.cuh"
 
@@ -240,49 +243,6 @@ __device__ __forceinline__ void DeterministicInclusiveSum(
   for (uint32_t i = 0; i < VEC_SIZE; ++i) {
     out_data[i] = smem_prefix_sum[threadIdx.x / 32] + thread_exclusive_prefix_sum + thread_data[i];
   }
-}
-
-template <uint32_t VEC_SIZE, uint32_t BLOCK_THREADS, BlockReduceAlgorithm REDUCE_ALGORITHM,
-          typename TempStorage>
-__device__ __forceinline__ std::tuple<float, float> GetMinMaxValue(float* in_data, uint32_t row_idx,
-                                                                   uint32_t d,
-                                                                   TempStorage& temp_storage) {
-  const uint32_t tx = threadIdx.x;
-  vec_t<float, VEC_SIZE> in_data_vec;
-  // Thread-local min/max accumulation (deferred reduction)
-  float thread_max = -cuda::std::numeric_limits<float>::infinity();
-  float thread_min = cuda::std::numeric_limits<float>::infinity();
-
-  for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
-    in_data_vec.fill(0);
-    if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
-      in_data_vec.cast_load(in_data + row_idx * d + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
-    }
-#pragma unroll
-    for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-      thread_max = max(thread_max, static_cast<float>(in_data_vec[j]));
-      thread_min = min(thread_min, static_cast<float>(in_data_vec[j]));
-    }
-  }
-
-  // Single block reduction after loop completes
-  float max_val =
-      BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
-          .Reduce(thread_max, MaxReduceOp{});
-  __syncthreads();
-  float min_val =
-      BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
-          .Reduce(thread_min, MinReduceOp{});
-
-  if (tx == 0) {
-    temp_storage.max_val = max_val;
-    temp_storage.min_val = min_val;
-  }
-  __syncthreads();
-  max_val = temp_storage.max_val;
-  min_val = temp_storage.min_val;
-
-  return std::make_tuple(min_val, max_val);
 }
 
 template <uint32_t VEC_SIZE, uint32_t BLOCK_THREADS, BlockReduceAlgorithm REDUCE_ALGORITHM,
@@ -1754,257 +1714,6 @@ __global__ void TopPRenormProbKernel(DType* probs, DType* renormed_prob, float* 
   }
 }
 
-template <uint32_t BLOCK_THREADS, BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE,
-          typename DType, typename IdType>
-__global__ void TopKMaskLogitsKernel(DType* logits, DType* masked_logits, IdType* top_k_arr,
-                                     uint32_t top_k_val, uint32_t d) {
-  const uint32_t bx = blockIdx.x, tx = threadIdx.x;
-  const uint32_t row_idx = bx;
-  uint32_t k = top_k_arr == nullptr ? top_k_val : top_k_arr[bx];
-  double pivot = -cuda::std::numeric_limits<float>::infinity();
-  vec_t<float, VEC_SIZE> logits_vec;
-  if (k < d) {
-    extern __shared__ __align__(alignof(RenormTempStorage<BLOCK_THREADS, REDUCE_ALGO>))
-        uint8_t smem_renorm[];
-    auto& temp_storage =
-        reinterpret_cast<RenormTempStorage<BLOCK_THREADS, REDUCE_ALGO>&>(smem_renorm);
-    float logits_greater_than_pivot[VEC_SIZE];  // pivot initialized to 0
-
-    auto [min_val, max_val] = GetMinMaxValue<VEC_SIZE, BLOCK_THREADS, REDUCE_ALGORITHM,
-                                             RenormTempStorage<BLOCK_THREADS, REDUCE_ALGORITHM>>(
-        logits, row_idx, d, temp_storage);
-
-    double low = (min_val == -cuda::std::numeric_limits<float>::infinity())
-                     ? cuda::std::numeric_limits<float>::lowest()
-                     : min_val - 1,
-           high = max_val;
-    float min_gt_low, max_le_high;
-    // f(x) = len(nonzero(probs > x)), f(x) is non-increasing
-    // min_gt_low = min{p \in probs | p > low}, max_le_high = max{p \in probs | p <= high}
-    // loop invariant:
-    // - f(low) >= k, f(high) < k
-    // - f(low) > f(min_gt_low) >= f(max_le_high) == f(high)
-    // stopping condition: min_gt_low == max_le_high
-    // - f(low) >= k, f(min_gt_low) == f(max_le_high) == f(high) < k
-    do {
-      double pivot_0 = (high + 2 * low) / 3;
-      double pivot_1 = (2 * high + low) / 3;
-
-      int aggregate_gt_pivot_0 = 0, aggregate_gt_pivot_1 = 0;
-      min_gt_low = high;
-      max_le_high = low;
-      int threadlocal_aggregate_gt_pivot_0 = 0;
-      int threadlocal_aggregate_gt_pivot_1 = 0;
-#pragma unroll 2
-      for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
-        logits_vec.fill(0);
-        if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
-          logits_vec.cast_load(logits + row_idx * d + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
-        }
-        int probs_gt_pivot_0_count[VEC_SIZE], probs_gt_pivot_1_count[VEC_SIZE];
-#pragma unroll
-        for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-          probs_gt_pivot_0_count[j] =
-              logits_vec[j] > pivot_0 && (i * BLOCK_THREADS + tx) * VEC_SIZE + j < d;
-          probs_gt_pivot_1_count[j] =
-              logits_vec[j] > pivot_1 && (i * BLOCK_THREADS + tx) * VEC_SIZE + j < d;
-
-          if (logits_vec[j] > low && (i * BLOCK_THREADS + tx) * VEC_SIZE + j < d) {
-            min_gt_low = min(min_gt_low, logits_vec[j]);
-          }
-          if (logits_vec[j] <= high && (i * BLOCK_THREADS + tx) * VEC_SIZE + j < d) {
-            max_le_high = max(max_le_high, logits_vec[j]);
-          }
-          threadlocal_aggregate_gt_pivot_0 += probs_gt_pivot_0_count[j];
-          threadlocal_aggregate_gt_pivot_1 += probs_gt_pivot_1_count[j];
-        }
-      }
-      aggregate_gt_pivot_0 +=
-          BlockReduce<int, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce_int)
-              .Sum(threadlocal_aggregate_gt_pivot_0);
-      __syncthreads();
-
-      aggregate_gt_pivot_1 +=
-          BlockReduce<int, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce_int)
-              .Sum(threadlocal_aggregate_gt_pivot_1);
-      __syncthreads();
-
-      min_gt_low =
-          BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
-              .Reduce(min_gt_low, MinReduceOp{});
-      __syncthreads();
-      max_le_high =
-          BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
-              .Reduce(max_le_high, MaxReduceOp{});
-      if (tx == 0) {
-        temp_storage.block_aggregate.counts[0] = aggregate_gt_pivot_0;
-        temp_storage.block_aggregate.counts[1] = aggregate_gt_pivot_1;
-        temp_storage.min_val = min_gt_low;
-        temp_storage.max_val = max_le_high;
-      }
-      __syncthreads();
-      aggregate_gt_pivot_0 = temp_storage.block_aggregate.counts[0];
-      aggregate_gt_pivot_1 = temp_storage.block_aggregate.counts[1];
-      min_gt_low = temp_storage.min_val;
-      max_le_high = temp_storage.max_val;
-
-      if (aggregate_gt_pivot_1 >= k) {
-        low = pivot_1;
-      } else if (aggregate_gt_pivot_0 >= k) {
-        low = pivot_0;
-        high = min(pivot_1, max_le_high);
-      } else {
-        high = min(pivot_0, max_le_high);
-      }
-    } while (min_gt_low != max_le_high);
-    pivot = low;
-  }
-
-  // masking
-#pragma unroll 2
-  for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
-    logits_vec.fill(0);
-    if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
-      logits_vec.cast_load(logits + row_idx * d + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
-    }
-#pragma unroll
-    for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-      logits_vec[j] =
-          (logits_vec[j] > pivot) ? logits_vec[j] : -cuda::std::numeric_limits<float>::infinity();
-    }
-    if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
-      logits_vec.store(masked_logits + row_idx * d + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
-    }
-  }
-}
-
-template <uint32_t BLOCK_THREADS, BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE,
-          typename DType, typename IdType>
-__global__ void TopKRenormProbKernel(DType* probs, DType* renormed_prob, IdType* top_k_arr,
-                                     uint32_t top_k_val, uint32_t d) {
-  const uint32_t bx = blockIdx.x, tx = threadIdx.x;
-  const uint32_t row_idx = bx;
-  uint32_t k = top_k_arr == nullptr ? top_k_val : top_k_arr[bx];
-  double pivot = -cuda::std::numeric_limits<float>::infinity(), normalizer = 1;
-  vec_t<float, VEC_SIZE> probs_vec;
-  if (k < d) {
-    extern __shared__ __align__(alignof(RenormTempStorage<BLOCK_THREADS, REDUCE_ALGO>))
-        uint8_t smem_renorm[];
-    auto& temp_storage =
-        reinterpret_cast<RenormTempStorage<BLOCK_THREADS, REDUCE_ALGO>&>(smem_renorm);
-    temp_storage.max_val = 0;
-
-    float max_val = GetMaxValue<VEC_SIZE, BLOCK_THREADS, REDUCE_ALGORITHM,
-                                RenormTempStorage<BLOCK_THREADS, REDUCE_ALGORITHM>>(
-        probs, row_idx, d, temp_storage);
-
-    double low = 0, high = max_val;
-    float min_gt_low, max_le_high;
-    float sum_low = 1;
-    // f(x) = len(nonzero(probs > x)), f(x) is non-increasing
-    // min_gt_low = min{p \in probs | p > low}, max_le_high = max{p \in probs | p <= high}
-    // loop invariant:
-    // - f(low) >= k, f(high) < k
-    // - f(low) > f(min_gt_low) >= f(max_le_high) == f(high)
-    // stopping condition: min_gt_low == max_le_high
-    // - f(low) >= k, f(min_gt_low) == f(max_le_high) == f(high) < k
-    do {
-      double pivot_0 = (high + 2 * low) / 3;
-      double pivot_1 = (2 * high + low) / 3;
-
-      ValueCount<float> aggregate_gt_pivot_0{0, 0}, aggregate_gt_pivot_1{0, 0};
-      min_gt_low = high;
-      max_le_high = low;
-      ValueCount<float> threadlocal_aggregate_gt_pivot_0{0, 0},
-          threadlocal_aggregate_gt_pivot_1{0, 0};
-#pragma unroll 1
-      for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
-        probs_vec.fill(0);
-        if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
-          probs_vec.cast_load(probs + row_idx * d + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
-        }
-        ValueCount<float> probs_gt_pivot_0_pair[VEC_SIZE], probs_gt_pivot_1_pair[VEC_SIZE];
-#pragma unroll
-        for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-          probs_gt_pivot_0_pair[j] = {
-              (probs_vec[j] > pivot_0) ? probs_vec[j] : 0,
-              (probs_vec[j] > pivot_0 && (i * BLOCK_THREADS + tx) * VEC_SIZE + j < d)};
-          probs_gt_pivot_1_pair[j] = {
-              (probs_vec[j] > pivot_1) ? probs_vec[j] : 0,
-              (probs_vec[j] > pivot_1 && (i * BLOCK_THREADS + tx) * VEC_SIZE + j < d)};
-
-          if (probs_vec[j] > low && (i * BLOCK_THREADS + tx) * VEC_SIZE + j < d) {
-            min_gt_low = min(min_gt_low, probs_vec[j]);
-          }
-          if (probs_vec[j] <= high && (i * BLOCK_THREADS + tx) * VEC_SIZE + j < d) {
-            max_le_high = max(max_le_high, probs_vec[j]);
-          }
-          threadlocal_aggregate_gt_pivot_0 += probs_gt_pivot_0_pair[j];
-          threadlocal_aggregate_gt_pivot_1 += probs_gt_pivot_1_pair[j];
-        }
-      }
-      aggregate_gt_pivot_0 += BlockReduce<ValueCount<float>, BLOCK_THREADS, REDUCE_ALGORITHM>(
-                                  temp_storage.block_prim.reduce_value_count)
-                                  .Sum(threadlocal_aggregate_gt_pivot_0);
-      __syncthreads();
-
-      aggregate_gt_pivot_1 += BlockReduce<ValueCount<float>, BLOCK_THREADS, REDUCE_ALGORITHM>(
-                                  temp_storage.block_prim.reduce_value_count)
-                                  .Sum(threadlocal_aggregate_gt_pivot_1);
-      __syncthreads();
-
-      min_gt_low =
-          BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
-              .Reduce(min_gt_low, MinReduceOp{});
-      __syncthreads();
-      max_le_high =
-          BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
-              .Reduce(max_le_high, MaxReduceOp{});
-      if (tx == 0) {
-        temp_storage.block_aggregate.pairs[0] = aggregate_gt_pivot_0;
-        temp_storage.block_aggregate.pairs[1] = aggregate_gt_pivot_1;
-        temp_storage.min_val = min_gt_low;
-        temp_storage.max_val = max_le_high;
-      }
-      __syncthreads();
-      aggregate_gt_pivot_0 = temp_storage.block_aggregate.pairs[0];
-      aggregate_gt_pivot_1 = temp_storage.block_aggregate.pairs[1];
-      min_gt_low = temp_storage.min_val;
-      max_le_high = temp_storage.max_val;
-
-      if (aggregate_gt_pivot_1.count >= k) {
-        low = pivot_1;
-        sum_low = float(aggregate_gt_pivot_1.value);
-      } else if (aggregate_gt_pivot_0.count >= k) {
-        low = pivot_0;
-        high = min(pivot_1, max_le_high);
-        sum_low = float(aggregate_gt_pivot_0.value);
-      } else {
-        high = min(pivot_0, max_le_high);
-      }
-    } while (min_gt_low != max_le_high);
-
-    normalizer = math::ptx_rcp(max(sum_low, 1e-8));
-    pivot = low;
-  }
-
-  // normalize
-#pragma unroll 2
-  for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
-    probs_vec.fill(0);
-    if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
-      probs_vec.cast_load(probs + row_idx * d + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
-    }
-#pragma unroll
-    for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-      probs_vec[j] = (probs_vec[j] > pivot) ? probs_vec[j] * normalizer : 0;
-    }
-    if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
-      probs_vec.store(renormed_prob + row_idx * d + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
-    }
-  }
-}
-
 template <typename DType>
 cudaError_t TopPRenormProb(DType* probs, DType* renormed_prob, float* top_p_arr,
                            uint32_t batch_size, float top_p_val, uint32_t d,
@@ -2019,50 +1728,6 @@ cudaError_t TopPRenormProb(DType* probs, DType* renormed_prob, float* top_p_arr,
     void* args[] = {&probs, &renormed_prob, &top_p_arr, &top_p_val, &d};
     DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
       auto kernel = TopPRenormProbKernel<BLOCK_THREADS, REDUCE_ALGO, VEC_SIZE, DType>;
-      FLASHINFER_CUDA_CALL(
-          cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
-    });
-    return cudaSuccess;
-  });
-}
-
-template <typename DType, typename IdType>
-cudaError_t TopKRenormProb(DType* probs, DType* renormed_prob, IdType* top_k_arr,
-                           uint32_t batch_size, uint32_t top_k_val, uint32_t d,
-                           cudaStream_t stream = 0) {
-  const uint32_t vec_size = std::gcd(16 / sizeof(DType), d);
-
-  auto compute_capacity = GetCudaComputeCapability();
-  DISPATCH_COMPUTE_CAP_NUM_THREADS(compute_capacity, BLOCK_THREADS, {
-    const uint32_t smem_size = sizeof(RenormTempStorage<BLOCK_THREADS, REDUCE_ALGO>);
-    dim3 nblks(batch_size);
-    dim3 nthrs(BLOCK_THREADS);
-    void* args[] = {&probs, &renormed_prob, &top_k_arr, &top_k_val, &d};
-    DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
-      auto kernel = TopKRenormProbKernel<BLOCK_THREADS, REDUCE_ALGO, VEC_SIZE, DType, IdType>;
-      FLASHINFER_CUDA_CALL(
-          cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
-    });
-    return cudaSuccess;
-  });
-}
-
-template <typename DType, typename IdType>
-cudaError_t TopKMaskLogits(DType* logits, DType* masked_logits, IdType* top_k_arr,
-                           uint32_t batch_size, uint32_t top_k_val, uint32_t d,
-                           cudaStream_t stream = 0) {
-  const uint32_t vec_size = std::gcd(16 / sizeof(DType), d);
-
-  auto compute_capacity = GetCudaComputeCapability();
-  DISPATCH_COMPUTE_CAP_NUM_THREADS(compute_capacity, BLOCK_THREADS, {
-    const uint32_t smem_size = sizeof(RenormTempStorage<BLOCK_THREADS, REDUCE_ALGO>);
-    dim3 nblks(batch_size);
-    dim3 nthrs(BLOCK_THREADS);
-    void* args[] = {&logits, &masked_logits, &top_k_arr, &top_k_val, &d};
-    DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
-      auto kernel = TopKMaskLogitsKernel<BLOCK_THREADS, REDUCE_ALGO, VEC_SIZE, DType, IdType>;
       FLASHINFER_CUDA_CALL(
           cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
       FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
