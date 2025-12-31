@@ -1,3 +1,5 @@
+#include <cuda_bf16.h>
+
 #include "prefill_kernel_delta_rule_sm90.cuh"
 
 namespace flat {
@@ -75,12 +77,12 @@ template void launch_delta_rule_prefill_kernel<cutlass::arch::Sm90, half, half, 
     int32_t num_seqs, int32_t num_q_heads, int32_t num_k_heads, int32_t num_v_heads,
     int32_t num_o_heads, int32_t head_size, int64_t total_seqlen, float scale, int32_t sm_count);
 
-using bf16 = cute::bfloat16_t;
-
-template void launch_delta_rule_prefill_kernel<cutlass::arch::Sm90, bf16, bf16, float>(
-    cudaStream_t stream, bf16* output, float* state, bf16 const* q, bf16 const* k, bf16 const* v,
-    float const* input_state, float const* alpha, float const* beta, int64_t const* cu_seqlens,
-    int32_t num_seqs, int32_t num_q_heads, int32_t num_k_heads, int32_t num_v_heads,
-    int32_t num_o_heads, int32_t head_size, int64_t total_seqlen, float scale, int32_t sm_count);
+template void
+launch_delta_rule_prefill_kernel<cutlass::arch::Sm90, nv_bfloat16, nv_bfloat16, float>(
+    cudaStream_t stream, nv_bfloat16* output, float* state, nv_bfloat16 const* q,
+    nv_bfloat16 const* k, nv_bfloat16 const* v, float const* input_state, float const* alpha,
+    float const* beta, int64_t const* cu_seqlens, int32_t num_seqs, int32_t num_q_heads,
+    int32_t num_k_heads, int32_t num_v_heads, int32_t num_o_heads, int32_t head_size,
+    int64_t total_seqlen, float scale, int32_t sm_count);
 
 }  // namespace flat
