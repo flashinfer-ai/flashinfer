@@ -1,3 +1,8 @@
+---
+name: benchmark-kernel
+description: Guide for benchmarking FlashInfer kernels with CUPTI timing
+---
+
 # Tutorial: Benchmarking FlashInfer Kernels
 
 This tutorial shows you how to accurately benchmark FlashInfer kernels.
