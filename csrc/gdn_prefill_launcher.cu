@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <flashinfer/allocator.h>
 #include <flashinfer/exception.h>
 #include <tvm_ffi_utils.h>
@@ -23,10 +25,7 @@
 #include <iostream>
 #include <sstream>
 
-#include "cute/numeric/numeric_types.hpp"
-#include "cutlass/arch/arch.h"
 #include "flat/prefill/prefill_kernel.hpp"
-#include "flat/prefill/prefill_kernel_delta_rule_sm90.cuh"
 
 using tvm::ffi::Optional;
 using tvm::ffi::TensorView;

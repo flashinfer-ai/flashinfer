@@ -84,6 +84,7 @@ from .fused_moe import (
     trtllm_fp8_block_scale_moe,
     trtllm_fp8_per_tensor_scale_moe,
 )
+from .gdn_prefill import chunk_gated_delta_rule as chunk_gated_delta_rule
 from .gemm import SegmentGEMMWrapper as SegmentGEMMWrapper
 from .gemm import bmm_fp8 as bmm_fp8
 from .gemm import mm_fp4 as mm_fp4

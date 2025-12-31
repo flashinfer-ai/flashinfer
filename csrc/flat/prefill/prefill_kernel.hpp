@@ -4,6 +4,11 @@
 
 #include "cuda_runtime_api.h"
 
+// Forward declarations to avoid including full cutlass headers
+namespace cutlass::arch {
+struct Sm90;
+}  // namespace cutlass::arch
+
 namespace flat {
 
 template <typename ArchTag,  // TODO: hide this
