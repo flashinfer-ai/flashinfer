@@ -540,7 +540,12 @@ class TestFusedVsSeparateFP4Quantize:
 
         # === Compare FP4 packed outputs ===
         # View as uint8 for comparison (float4_e2m1fn_x2 doesn't support == operator)
-        fp4_match = (y_fp4_fused.view(torch.uint8) == y_fp4_separate.view(torch.uint8)).float().mean().item()
+        fp4_match = (
+            (y_fp4_fused.view(torch.uint8) == y_fp4_separate.view(torch.uint8))
+            .float()
+            .mean()
+            .item()
+        )
         assert fp4_match > 0.95, (
             f"FP4 output mismatch: only {fp4_match * 100:.1f}% of bytes match"
         )
@@ -636,7 +641,12 @@ class TestFusedVsSeparateFP4Quantize:
 
         # === Compare FP4 packed outputs ===
         # View as uint8 for comparison (float4_e2m1fn_x2 doesn't support == operator)
-        fp4_match = (y_fp4_fused.view(torch.uint8) == y_fp4_separate.view(torch.uint8)).float().mean().item()
+        fp4_match = (
+            (y_fp4_fused.view(torch.uint8) == y_fp4_separate.view(torch.uint8))
+            .float()
+            .mean()
+            .item()
+        )
         assert fp4_match > 0.95, (
             f"FP4 output mismatch: only {fp4_match * 100:.1f}% of bytes match"
         )
@@ -963,7 +973,9 @@ class TestSwizzledScaleFactors:
         ).view(torch.float8_e4m3fn)
 
         # FP4 values should be identical (view as uint8 for comparison)
-        torch.testing.assert_close(y_fp4_swizzled.view(torch.uint8), y_fp4_ref.view(torch.uint8))
+        torch.testing.assert_close(
+            y_fp4_swizzled.view(torch.uint8), y_fp4_ref.view(torch.uint8)
+        )
 
         # Scale factors should match after unswizzling
         torch.testing.assert_close(
@@ -1033,7 +1045,9 @@ class TestSwizzledScaleFactors:
         )
 
         # FP4 values should be identical (view as uint8 for comparison)
-        torch.testing.assert_close(y_fp4_swizzled.view(torch.uint8), y_fp4_ref.view(torch.uint8))
+        torch.testing.assert_close(
+            y_fp4_swizzled.view(torch.uint8), y_fp4_ref.view(torch.uint8)
+        )
 
         # Scale factors should match after unswizzling
         torch.testing.assert_close(block_scale_unswizzled, block_scale_ref)
@@ -1261,7 +1275,9 @@ class TestAutoAllocation:
         )
 
         # Results should be identical (view as uint8 for comparison)
-        torch.testing.assert_close(y_fp4_auto.view(torch.uint8), y_fp4_pre.view(torch.uint8))
+        torch.testing.assert_close(
+            y_fp4_auto.view(torch.uint8), y_fp4_pre.view(torch.uint8)
+        )
         torch.testing.assert_close(
             block_scale_auto.view(torch.uint8), block_scale_pre.view(torch.uint8)
         )
