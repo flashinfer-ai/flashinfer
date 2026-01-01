@@ -276,6 +276,11 @@ inline void check_shape(const tvm::ffi::TensorView& a, const tvm::ffi::TensorVie
   if (maybe_x.has_value()) {                \
     CHECK_INPUT_TYPE(maybe_x.value(), st);  \
   }
+#define CHECK_MAYBE_INPUT_TYPES(maybe_x, st1, st2)                                   \
+  if (maybe_x.has_value()) {                                                         \
+    TVM_FFI_ICHECK(maybe_x.value().dtype() == st1 || maybe_x.value().dtype() == st2) \
+        << "Inconsistency of Tensor type: " #maybe_x " must be " #st1 " or " #st2;   \
+  }
 #define CHECK_LAST_DIM_CONTIGUOUS_INPUT(x) \
   CHECK_CUDA(x);                           \
   CHECK_LAST_DIM_CONTIGUOUS(x)
