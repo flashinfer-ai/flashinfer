@@ -905,7 +905,8 @@ def test_sampling_from_probs_with_indices_dtype(batch_size, vocab_size, indices_
     indices = torch.arange(batch_size, dtype=indices_dtype, device="cuda:0")
 
     samples = flashinfer.sampling.sampling_from_probs(normalized_prob, indices=indices)
-    assert samples.dtype == torch.int32
+    # Output dtype matches indices dtype
+    assert samples.dtype == indices_dtype
     assert samples.shape == (batch_size,)
     assert torch.all(samples < vocab_size) and torch.all(samples >= 0)
 
@@ -920,7 +921,8 @@ def test_sampling_from_logits_with_indices_dtype(batch_size, vocab_size, indices
     indices = torch.arange(batch_size, dtype=indices_dtype, device="cuda:0")
 
     samples = flashinfer.sampling.sampling_from_logits(logits, indices=indices)
-    assert samples.dtype == torch.int32
+    # Output dtype matches indices dtype
+    assert samples.dtype == indices_dtype
     assert samples.shape == (batch_size,)
     assert torch.all(samples < vocab_size) and torch.all(samples >= 0)
 
@@ -939,7 +941,8 @@ def test_top_p_sampling_with_indices_dtype(batch_size, vocab_size, indices_dtype
     samples = flashinfer.sampling.top_p_sampling_from_probs(
         normalized_prob, p, indices=indices
     )
-    assert samples.dtype == torch.int32
+    # Output dtype matches indices dtype
+    assert samples.dtype == indices_dtype
     assert samples.shape == (batch_size,)
     assert torch.all(samples < vocab_size) and torch.all(samples >= 0)
 
@@ -960,7 +963,8 @@ def test_top_k_sampling_with_indices_dtype(batch_size, vocab_size, indices_dtype
     samples = flashinfer.sampling.top_k_sampling_from_probs(
         normalized_prob, k, indices=indices
     )
-    assert samples.dtype == torch.int32
+    # Output dtype matches indices dtype
+    assert samples.dtype == indices_dtype
     assert samples.shape == (batch_size,)
     assert torch.all(samples < vocab_size) and torch.all(samples >= 0)
 
@@ -979,7 +983,8 @@ def test_min_p_sampling_with_indices_dtype(batch_size, vocab_size, indices_dtype
     samples = flashinfer.sampling.min_p_sampling_from_probs(
         normalized_prob, p, indices=indices
     )
-    assert samples.dtype == torch.int32
+    # Output dtype matches indices dtype
+    assert samples.dtype == indices_dtype
     assert samples.shape == (batch_size,)
     assert torch.all(samples < vocab_size) and torch.all(samples >= 0)
 
@@ -1001,7 +1006,8 @@ def test_top_k_top_p_sampling_with_indices_dtype(
     samples = flashinfer.sampling.top_k_top_p_sampling_from_probs(
         normalized_prob, k, p, indices=indices, filter_apply_order="joint"
     )
-    assert samples.dtype == torch.int32
+    # Output dtype matches indices dtype
+    assert samples.dtype == indices_dtype
     assert samples.shape == (batch_size,)
     assert torch.all(samples < vocab_size) and torch.all(samples >= 0)
 
