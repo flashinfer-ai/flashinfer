@@ -2232,11 +2232,13 @@ def _get_compiled_kernel(
         nonlocal compiled_kernel
         # For swizzled mode, flatten the scale tensor to 1D
         s_tensor = s.flatten() if is_sf_swizzled_layout else s.contiguous()
+        # View y as uint8 since kernel expects uint8 but caller may pass float4_e2m1fn_x2
+        y_uint8 = y.view(torch.uint8)
         compiled_kernel(
             x,
             r,
             w,
-            y,
+            y_uint8,
             s_tensor,
             global_scale,
             Int32(M),
