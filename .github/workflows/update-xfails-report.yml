@@ -67,10 +67,6 @@ jobs:
             chore: update xfails report
 
             Auto-generated xfails report based on current test suite markers.
-
-            🤖 Generated with [Claude Code](https://claude.com/claude-code)
-
-            Co-Authored-By: Claude <noreply@anthropic.com>
           branch: auto-update-xfails-report
           base: main
           delete-branch: true
