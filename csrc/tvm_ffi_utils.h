@@ -281,6 +281,13 @@ inline void check_shape(const tvm::ffi::TensorView& a, const tvm::ffi::TensorVie
     TVM_FFI_ICHECK(maybe_x.value().dtype() == st1 || maybe_x.value().dtype() == st2) \
         << "Inconsistency of Tensor type: " #maybe_x " must be " #st1 " or " #st2;   \
   }
+#define CHECK_SAME_DTYPE(x, y)           \
+  TVM_FFI_ICHECK(x.dtype() == y.dtype()) \
+      << "Inconsistency of Tensor type: " #x " dtype must match " #y " dtype";
+#define CHECK_MAYBE_SAME_DTYPE(maybe_x, y) \
+  if (maybe_x.has_value()) {               \
+    CHECK_SAME_DTYPE(maybe_x.value(), y);  \
+  }
 #define CHECK_LAST_DIM_CONTIGUOUS_INPUT(x) \
   CHECK_CUDA(x);                           \
   CHECK_LAST_DIM_CONTIGUOUS(x)

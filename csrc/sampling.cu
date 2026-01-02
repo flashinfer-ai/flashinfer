@@ -50,11 +50,7 @@ void sampling_from_logits(TensorView logits, TensorView output, Optional<TensorV
   CHECK_INPUT(logits);
   CHECK_DIM(2, logits);  // logits: (batch_size, vocab_size)
   CHECK_MAYBE_INPUT_TYPES(maybe_indices, dl_int32, dl_int64);
-  // Validate indices dtype matches output dtype if indices provided
-  if (maybe_indices.has_value()) {
-    TVM_FFI_ICHECK(maybe_indices.value().dtype() == output.dtype())
-        << "indices dtype must match output dtype";
-  }
+  CHECK_MAYBE_SAME_DTYPE(maybe_indices, output);
   unsigned int batch_size = output.size(0);
   unsigned int vocab_size = logits.size(1);
 
@@ -78,11 +74,7 @@ void sampling_from_probs(TensorView probs, TensorView output, Optional<TensorVie
   CHECK_INPUT(probs);
   CHECK_DIM(2, probs);  // probs: (batch_size, vocab_size)
   CHECK_MAYBE_INPUT_TYPES(maybe_indices, dl_int32, dl_int64);
-  // Validate indices dtype matches output dtype if indices provided
-  if (maybe_indices.has_value()) {
-    TVM_FFI_ICHECK(maybe_indices.value().dtype() == output.dtype())
-        << "indices dtype must match output dtype";
-  }
+  CHECK_MAYBE_SAME_DTYPE(maybe_indices, output);
   unsigned int batch_size = output.size(0);
   unsigned int vocab_size = probs.size(1);
 
@@ -108,11 +100,7 @@ void top_p_sampling_from_probs(TensorView probs, TensorView output,
   CHECK_INPUT(probs);
   CHECK_DIM(2, probs);  // probs: (batch_size, vocab_size)
   CHECK_MAYBE_INPUT_TYPES(maybe_indices, dl_int32, dl_int64);
-  // Validate indices dtype matches output dtype if indices provided
-  if (maybe_indices.has_value()) {
-    TVM_FFI_ICHECK(maybe_indices.value().dtype() == output.dtype())
-        << "indices dtype must match output dtype";
-  }
+  CHECK_MAYBE_SAME_DTYPE(maybe_indices, output);
   unsigned int batch_size = output.size(0);
   unsigned int vocab_size = probs.size(1);
   check_tensor_param(maybe_top_p_arr, probs);
@@ -144,11 +132,7 @@ void top_k_sampling_from_probs(TensorView probs, TensorView output,
   CHECK_DIM(2, probs);   // probs: (batch_size, vocab_size)
   CHECK_DIM(1, output);  // output: (batch_size)
   CHECK_MAYBE_INPUT_TYPES(maybe_indices, dl_int32, dl_int64);
-  // Validate indices dtype matches output dtype if indices provided
-  if (maybe_indices.has_value()) {
-    TVM_FFI_ICHECK(maybe_indices.value().dtype() == output.dtype())
-        << "indices dtype must match output dtype";
-  }
+  CHECK_MAYBE_SAME_DTYPE(maybe_indices, output);
   unsigned int batch_size = output.size(0);
   unsigned int vocab_size = probs.size(1);
   check_tensor_param(maybe_top_k_arr, probs);
@@ -180,11 +164,7 @@ void min_p_sampling_from_probs(TensorView probs, TensorView output,
   CHECK_DIM(2, probs);   // probs: (batch_size, vocab_size)
   CHECK_DIM(1, output);  // output: (batch_size)
   CHECK_MAYBE_INPUT_TYPES(maybe_indices, dl_int32, dl_int64);
-  // Validate indices dtype matches output dtype if indices provided
-  if (maybe_indices.has_value()) {
-    TVM_FFI_ICHECK(maybe_indices.value().dtype() == output.dtype())
-        << "indices dtype must match output dtype";
-  }
+  CHECK_MAYBE_SAME_DTYPE(maybe_indices, output);
   unsigned int batch_size = output.size(0);
   unsigned int vocab_size = probs.size(1);
   check_tensor_param(maybe_min_p_arr, probs);
@@ -219,11 +199,7 @@ void top_k_top_p_sampling_from_probs(TensorView probs, TensorView output,
   CHECK_DIM(2, probs);   // probs: (batch_size, vocab_size)
   CHECK_DIM(1, output);  // output: (batch_size)
   CHECK_MAYBE_INPUT_TYPES(maybe_indices, dl_int32, dl_int64);
-  // Validate indices dtype matches output dtype if indices provided
-  if (maybe_indices.has_value()) {
-    TVM_FFI_ICHECK(maybe_indices.value().dtype() == output.dtype())
-        << "indices dtype must match output dtype";
-  }
+  CHECK_MAYBE_SAME_DTYPE(maybe_indices, output);
   unsigned int batch_size = output.size(0);
   unsigned int vocab_size = probs.size(1);
   check_tensor_param(maybe_top_k_arr, probs);
