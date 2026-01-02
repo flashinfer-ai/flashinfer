@@ -1749,6 +1749,11 @@ def _get_compiled_kernel(
     # Create fake stream that uses environment stream at runtime
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
+    # Global scale fake tensor (shape [1], float32)
+    global_scale_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Float32, (1,), assumed_align=4
+    )
+
     # Compile with TVM-FFI enabled
     compiled_kernel = cute.compile(
         kernel_obj,
@@ -1756,6 +1761,7 @@ def _get_compiled_kernel(
         w_fake,
         y_fake,
         s_fake,
+        global_scale_fake,
         Int32(1),  # Dummy M
         Float32(1e-6),  # Dummy eps
         stream_fake,
