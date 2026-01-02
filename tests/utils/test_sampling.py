@@ -896,118 +896,48 @@ def test_sampling_different_seed_offset_produces_different_results(vocab_size):
 
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000])
+@pytest.mark.parametrize(
+    "sampling_type",
+    ["from_probs", "from_logits", "top_p", "top_k", "min_p", "top_k_top_p"],
+)
 @pytest.mark.parametrize("indices_dtype", [torch.int32, torch.int64])
-def test_sampling_from_probs_with_indices_dtype(batch_size, vocab_size, indices_dtype):
-    """Test that sampling_from_probs works with both int32 and int64 indices."""
+def test_int64_indices_sampling(batch_size, vocab_size, sampling_type, indices_dtype):
+    """Test that all sampling functions work with both int32 and int64 indices."""
     torch.manual_seed(42)
-    pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
-    normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
-    indices = torch.arange(batch_size, dtype=indices_dtype, device="cuda:0")
 
-    samples = flashinfer.sampling.sampling_from_probs(normalized_prob, indices=indices)
-    # Output dtype matches indices dtype
-    assert samples.dtype == indices_dtype
-    assert samples.shape == (batch_size,)
-    assert torch.all(samples < vocab_size) and torch.all(samples >= 0)
-
-
-@pytest.mark.parametrize("batch_size", [1, 99, 989])
-@pytest.mark.parametrize("vocab_size", [111, 32000])
-@pytest.mark.parametrize("indices_dtype", [torch.int32, torch.int64])
-def test_sampling_from_logits_with_indices_dtype(batch_size, vocab_size, indices_dtype):
-    """Test that sampling_from_logits works with both int32 and int64 indices."""
-    torch.manual_seed(42)
+    # Create test data
     logits = torch.randn(batch_size, vocab_size, device="cuda:0")
+    probs = torch.softmax(logits, dim=-1)
     indices = torch.arange(batch_size, dtype=indices_dtype, device="cuda:0")
 
-    samples = flashinfer.sampling.sampling_from_logits(logits, indices=indices)
-    # Output dtype matches indices dtype
-    assert samples.dtype == indices_dtype
-    assert samples.shape == (batch_size,)
-    assert torch.all(samples < vocab_size) and torch.all(samples >= 0)
+    # Run the appropriate sampling function
+    if sampling_type == "from_probs":
+        samples = flashinfer.sampling.sampling_from_probs(probs, indices=indices)
+    elif sampling_type == "from_logits":
+        samples = flashinfer.sampling.sampling_from_logits(logits, indices=indices)
+    elif sampling_type == "top_p":
+        samples = flashinfer.sampling.top_p_sampling_from_probs(
+            probs, 0.9, indices=indices
+        )
+    elif sampling_type == "top_k":
+        k = min(100, vocab_size)
+        samples = flashinfer.sampling.top_k_sampling_from_probs(
+            probs, k, indices=indices
+        )
+    elif sampling_type == "min_p":
+        samples = flashinfer.sampling.min_p_sampling_from_probs(
+            probs, 0.1, indices=indices
+        )
+    elif sampling_type == "top_k_top_p":
+        k = min(100, vocab_size)
+        samples = flashinfer.sampling.top_k_top_p_sampling_from_probs(
+            probs, k, 0.9, indices=indices, filter_apply_order="joint"
+        )
 
-
-@pytest.mark.parametrize("batch_size", [1, 99, 989])
-@pytest.mark.parametrize("vocab_size", [111, 32000])
-@pytest.mark.parametrize("indices_dtype", [torch.int32, torch.int64])
-@pytest.mark.parametrize("p", [0.1, 0.5, 0.9])
-def test_top_p_sampling_with_indices_dtype(batch_size, vocab_size, indices_dtype, p):
-    """Test that top_p_sampling_from_probs works with both int32 and int64 indices."""
-    torch.manual_seed(42)
-    pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
-    normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
-    indices = torch.arange(batch_size, dtype=indices_dtype, device="cuda:0")
-
-    samples = flashinfer.sampling.top_p_sampling_from_probs(
-        normalized_prob, p, indices=indices
+    # Verify output
+    assert samples.dtype == indices_dtype, (
+        f"Output dtype {samples.dtype} doesn't match indices dtype {indices_dtype}"
     )
-    # Output dtype matches indices dtype
-    assert samples.dtype == indices_dtype
-    assert samples.shape == (batch_size,)
-    assert torch.all(samples < vocab_size) and torch.all(samples >= 0)
-
-
-@pytest.mark.parametrize("batch_size", [1, 99, 989])
-@pytest.mark.parametrize("vocab_size", [111, 32000])
-@pytest.mark.parametrize("indices_dtype", [torch.int32, torch.int64])
-@pytest.mark.parametrize("k", [10, 100])
-def test_top_k_sampling_with_indices_dtype(batch_size, vocab_size, indices_dtype, k):
-    """Test that top_k_sampling_from_probs works with both int32 and int64 indices."""
-    if k > vocab_size:
-        pytest.skip("k should be less than vocab_size")
-    torch.manual_seed(42)
-    pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
-    normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
-    indices = torch.arange(batch_size, dtype=indices_dtype, device="cuda:0")
-
-    samples = flashinfer.sampling.top_k_sampling_from_probs(
-        normalized_prob, k, indices=indices
-    )
-    # Output dtype matches indices dtype
-    assert samples.dtype == indices_dtype
-    assert samples.shape == (batch_size,)
-    assert torch.all(samples < vocab_size) and torch.all(samples >= 0)
-
-
-@pytest.mark.parametrize("batch_size", [1, 99, 989])
-@pytest.mark.parametrize("vocab_size", [111, 32000])
-@pytest.mark.parametrize("indices_dtype", [torch.int32, torch.int64])
-@pytest.mark.parametrize("p", [0.05, 0.2])
-def test_min_p_sampling_with_indices_dtype(batch_size, vocab_size, indices_dtype, p):
-    """Test that min_p_sampling_from_probs works with both int32 and int64 indices."""
-    torch.manual_seed(42)
-    pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
-    normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
-    indices = torch.arange(batch_size, dtype=indices_dtype, device="cuda:0")
-
-    samples = flashinfer.sampling.min_p_sampling_from_probs(
-        normalized_prob, p, indices=indices
-    )
-    # Output dtype matches indices dtype
-    assert samples.dtype == indices_dtype
-    assert samples.shape == (batch_size,)
-    assert torch.all(samples < vocab_size) and torch.all(samples >= 0)
-
-
-@pytest.mark.parametrize("batch_size", [1, 99, 989])
-@pytest.mark.parametrize("vocab_size", [111, 32000])
-@pytest.mark.parametrize("indices_dtype", [torch.int32, torch.int64])
-@pytest.mark.parametrize("p", [0.1, 0.5])
-def test_top_k_top_p_sampling_with_indices_dtype(
-    batch_size, vocab_size, indices_dtype, p
-):
-    """Test that top_k_top_p_sampling_from_probs works with both int32 and int64 indices."""
-    torch.manual_seed(42)
-    k = min(100, vocab_size)
-    pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
-    normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
-    indices = torch.arange(batch_size, dtype=indices_dtype, device="cuda:0")
-
-    samples = flashinfer.sampling.top_k_top_p_sampling_from_probs(
-        normalized_prob, k, p, indices=indices, filter_apply_order="joint"
-    )
-    # Output dtype matches indices dtype
-    assert samples.dtype == indices_dtype
     assert samples.shape == (batch_size,)
     assert torch.all(samples < vocab_size) and torch.all(samples >= 0)
 
