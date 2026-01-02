@@ -1019,7 +1019,7 @@ class AddRMSNormFP4QuantKernel:
 
         Takes tensors directly via TVM-FFI.
         - mX: Input tensor, shape (M, H), row-major
-        - mR: Residual tensor (will be updated in-place), shape (M, H), row-major
+        - mR: Residual tensor, shape (M, H), row-major
         - mW: Weight tensor, shape (H,)
         - mY: Output FP4 tensor, shape (M, H // 2), row-major (packed)
         - mS: Scale factor tensor, shape depends on swizzle mode
