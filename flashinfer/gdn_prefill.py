@@ -31,7 +31,9 @@ from .utils import (
 def get_gdn_prefill_module():
     module = gen_gdn_prefill_sm90_module().build_and_load()
 
-    @register_custom_op("flashinfer::gdn_prefill", mutates_args=())
+    @register_custom_op(
+        "flashinfer::gdn_prefill", mutates_args=("output", "output_state")
+    )
     def gdn_prefill(
         output: torch.Tensor,
         output_state: torch.Tensor,

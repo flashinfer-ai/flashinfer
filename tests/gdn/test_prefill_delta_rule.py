@@ -137,7 +137,7 @@ def test_prefill_kernel_basic(
     scale: float | str,
     alpha: bool,
     beta: bool,
-    seed: int = os.environ.get("SEED", 0),
+    seed: int = int(os.environ.get("SEED", "0")),
 ):
     scale = 1.0 / math.sqrt(head_size) if scale == "auto" else scale
     _test_prefill_kernel(
@@ -182,7 +182,7 @@ def test_prefill_kernel_nonfull(
     scale: float | str,
     alpha: bool,
     beta: bool,
-    seed: int = os.environ.get("SEED", 0),
+    seed: int = int(os.environ.get("SEED", "0")),
 ):
     scale = 1.0 / math.sqrt(head_size) if scale == "auto" else scale
     _test_prefill_kernel(
@@ -392,7 +392,7 @@ def test_chunked_prefill(
     scale: float | str,
     alpha: bool,
     beta: bool,
-    seed: int = os.environ.get("SEED", 0),
+    seed: int = int(os.environ.get("SEED", "0")),
 ):
     scale = 1.0 / math.sqrt(head_size) if scale == "auto" else scale
     _test_chunked_prefill(
