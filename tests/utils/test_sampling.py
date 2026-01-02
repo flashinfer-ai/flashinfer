@@ -696,16 +696,7 @@ def test_tensor_validation_min_p(batch_size, vocab_size, p):
             normalized_prob, torch.tensor(p, dtype=torch.float32, device="cuda:0")
         )
 
-    # 4: int64 indices should work (not raise error).
-    indices_int64 = torch.arange(batch_size, dtype=torch.int64, device="cuda:0")
-    samples = flashinfer.sampling.min_p_sampling_from_probs(
-        normalized_prob,
-        torch.tensor([p] * batch_size, dtype=torch.float32, device="cuda:0"),
-        indices_int64,
-    )
-    assert samples.shape == (batch_size,)
-
-    # 5: 1D tensor with a broken batch size raises error (only when batch_size > 1).
+    # 4: 1D tensor with a broken batch size raises error (only when batch_size > 1).
     if batch_size > 1:
         with pytest.raises(
             ValueError, match="Sampling parameter tensor batch size mismatch"
@@ -714,7 +705,7 @@ def test_tensor_validation_min_p(batch_size, vocab_size, p):
                 normalized_prob, torch.tensor([p], dtype=torch.float32, device="cuda:0")
             )
 
-    # 6: 1D tensor with the correct batch size works.
+    # 5: 1D tensor with the correct batch size works.
     samples = flashinfer.sampling.min_p_sampling_from_probs(
         normalized_prob,
         torch.tensor([p] * batch_size, dtype=torch.float32, device="cuda:0"),
@@ -902,15 +893,13 @@ def test_sampling_different_seed_offset_produces_different_results(vocab_size):
 )
 @pytest.mark.parametrize("indices_dtype", [torch.int32, torch.int64])
 def test_int64_indices_sampling(batch_size, vocab_size, sampling_type, indices_dtype):
-    """Test that all sampling functions work with both int32 and int64 indices."""
+    """Test that all sampling functions work with int64 indices."""
     torch.manual_seed(42)
 
-    # Create test data
     logits = torch.randn(batch_size, vocab_size, device="cuda:0")
     probs = torch.softmax(logits, dim=-1)
     indices = torch.arange(batch_size, dtype=indices_dtype, device="cuda:0")
 
-    # Run the appropriate sampling function
     if sampling_type == "from_probs":
         samples = flashinfer.sampling.sampling_from_probs(probs, indices=indices)
     elif sampling_type == "from_logits":
@@ -934,7 +923,6 @@ def test_int64_indices_sampling(batch_size, vocab_size, sampling_type, indices_d
             probs, k, 0.9, indices=indices, filter_apply_order="joint"
         )
 
-    # Verify output
     assert samples.dtype == indices_dtype, (
         f"Output dtype {samples.dtype} doesn't match indices dtype {indices_dtype}"
     )

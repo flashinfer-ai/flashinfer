@@ -97,7 +97,6 @@ def get_sampling_module():
         # to float32
         logits = logits.float()
         batch_size = indices.size(0) if indices is not None else logits.size(0)
-        # Output dtype matches indices dtype (int32 or int64)
         out_dtype = indices.dtype if indices is not None else torch.int32
         samples = torch.empty(batch_size, dtype=out_dtype, device=device)
         if seed is None or offset is None:
@@ -137,7 +136,6 @@ def get_sampling_module():
         device = probs.device
         probs = probs.float()
         batch_size = indices.size(0) if indices is not None else probs.size(0)
-        # Output dtype matches indices dtype (int32 or int64)
         out_dtype = indices.dtype if indices is not None else torch.int32
         samples = torch.empty(batch_size, dtype=out_dtype, device=device)
         if seed is None or offset is None:
@@ -184,7 +182,6 @@ def get_sampling_module():
             maybe_top_p_arr.float() if maybe_top_p_arr is not None else None
         )
         batch_size = indices.size(0) if indices is not None else probs.size(0)
-        # Output dtype matches indices dtype (int32 or int64)
         out_dtype = indices.dtype if indices is not None else torch.int32
         samples = torch.empty(batch_size, dtype=out_dtype, device=device)
         if seed is None or offset is None:
@@ -232,7 +229,6 @@ def get_sampling_module():
         probs = probs.float()
         batch_size = indices.size(0) if indices is not None else probs.size(0)
         maybe_top_k_arr = maybe_top_k_arr.int() if maybe_top_k_arr is not None else None
-        # Output dtype matches indices dtype (int32 or int64)
         out_dtype = indices.dtype if indices is not None else torch.int32
         samples = torch.empty(batch_size, dtype=out_dtype, device=device)
         if seed is None or offset is None:
@@ -282,7 +278,6 @@ def get_sampling_module():
             maybe_min_p_arr.float() if maybe_min_p_arr is not None else None
         )
         batch_size = indices.size(0) if indices is not None else probs.size(0)
-        # Output dtype matches indices dtype (int32 or int64)
         out_dtype = indices.dtype if indices is not None else torch.int32
         samples = torch.empty(batch_size, dtype=out_dtype, device=device)
         if seed is None or offset is None:
@@ -321,7 +316,6 @@ def get_sampling_module():
             maybe_top_p_arr.float() if maybe_top_p_arr is not None else None
         )
         batch_size = indices.size(0) if indices is not None else probs.size(0)
-        # Output dtype matches indices dtype (int32 or int64)
         out_dtype = indices.dtype if indices is not None else torch.int32
         samples = torch.empty(batch_size, dtype=out_dtype, device=device)
         if seed is None or offset is None:
