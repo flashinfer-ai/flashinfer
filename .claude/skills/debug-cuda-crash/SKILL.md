@@ -1,3 +1,8 @@
+---
+name: debug-cuda-crash
+description: Tutorial for debugging CUDA crashes using API logging
+---
+
 # Tutorial: Debugging CUDA Crashes with API Logging
 
 This tutorial shows you how to debug CUDA crashes and errors in FlashInfer using the `@flashinfer_api` logging decorator.
