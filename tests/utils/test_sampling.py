@@ -696,18 +696,7 @@ def test_tensor_validation_min_p(batch_size, vocab_size, p):
             normalized_prob, torch.tensor(p, dtype=torch.float32, device="cuda:0")
         )
 
-    # 4: non-int32 indices raises error.
-    with pytest.raises(
-        RuntimeError,
-        match=r"(Inconsistency of Tensor type.*maybe_indices)",
-    ):
-        flashinfer.sampling.min_p_sampling_from_probs(
-            normalized_prob,
-            torch.tensor([p] * batch_size, dtype=torch.float32, device="cuda:0"),
-            torch.tensor([p] * batch_size, dtype=torch.int64, device="cuda:0"),
-        )
-
-    # 5: 1D tensor with a broken batch size raises error (only when batch_size > 1).
+    # 4: 1D tensor with a broken batch size raises error (only when batch_size > 1).
     if batch_size > 1:
         with pytest.raises(
             ValueError, match="Sampling parameter tensor batch size mismatch"
@@ -716,7 +705,7 @@ def test_tensor_validation_min_p(batch_size, vocab_size, p):
                 normalized_prob, torch.tensor([p], dtype=torch.float32, device="cuda:0")
             )
 
-    # 6: 1D tensor with the correct batch size works.
+    # 5: 1D tensor with the correct batch size works.
     samples = flashinfer.sampling.min_p_sampling_from_probs(
         normalized_prob,
         torch.tensor([p] * batch_size, dtype=torch.float32, device="cuda:0"),
@@ -894,6 +883,51 @@ def test_sampling_different_seed_offset_produces_different_results(vocab_size):
         f"Different offsets should produce mostly different samples, "
         f"got {offset_match_rate:.2%} match rate"
     )
+
+
+@pytest.mark.parametrize("batch_size", [1, 99, 989])
+@pytest.mark.parametrize("vocab_size", [111, 32000])
+@pytest.mark.parametrize(
+    "sampling_type",
+    ["from_probs", "from_logits", "top_p", "top_k", "min_p", "top_k_top_p"],
+)
+@pytest.mark.parametrize("indices_dtype", [torch.int32, torch.int64])
+def test_int64_indices_sampling(batch_size, vocab_size, sampling_type, indices_dtype):
+    """Test that all sampling functions work with int64 indices."""
+    torch.manual_seed(42)
+
+    logits = torch.randn(batch_size, vocab_size, device="cuda:0")
+    probs = torch.softmax(logits, dim=-1)
+    indices = torch.arange(batch_size, dtype=indices_dtype, device="cuda:0")
+
+    if sampling_type == "from_probs":
+        samples = flashinfer.sampling.sampling_from_probs(probs, indices=indices)
+    elif sampling_type == "from_logits":
+        samples = flashinfer.sampling.sampling_from_logits(logits, indices=indices)
+    elif sampling_type == "top_p":
+        samples = flashinfer.sampling.top_p_sampling_from_probs(
+            probs, 0.9, indices=indices
+        )
+    elif sampling_type == "top_k":
+        k = min(100, vocab_size)
+        samples = flashinfer.sampling.top_k_sampling_from_probs(
+            probs, k, indices=indices
+        )
+    elif sampling_type == "min_p":
+        samples = flashinfer.sampling.min_p_sampling_from_probs(
+            probs, 0.1, indices=indices
+        )
+    elif sampling_type == "top_k_top_p":
+        k = min(100, vocab_size)
+        samples = flashinfer.sampling.top_k_top_p_sampling_from_probs(
+            probs, k, 0.9, indices=indices, filter_apply_order="joint"
+        )
+
+    assert samples.dtype == indices_dtype, (
+        f"Output dtype {samples.dtype} doesn't match indices dtype {indices_dtype}"
+    )
+    assert samples.shape == (batch_size,)
+    assert torch.all(samples < vocab_size) and torch.all(samples >= 0)
 
 
 if __name__ == "__main__":
