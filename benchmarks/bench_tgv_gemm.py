@@ -5,9 +5,10 @@ Tests the autotuner integration with TGV BF16 GEMM kernels.
 """
 
 import csv
+import numpy as np
 import torch
 import torch.nn.functional as F
-from flashinfer.testing.utils import bench_gpu_time_with_cudagraph
+from flashinfer.testing.utils import bench_gpu_time
 
 from flashinfer import tgv_gemm_sm100, autotune
 
@@ -80,15 +81,17 @@ def test_tgv_gemm_bf16_sm100_perf():
 
         torch.cuda.synchronize()
 
-        cublas_times = bench_gpu_time_with_cudagraph(
+        cublas_times = bench_gpu_time(
             lambda: F.linear(A, B.T, bias),
             dry_run_time_ms=100,
             repeat_time_ms=500,
-            cold_l2_cache=False,
+            use_cuda_graph=True,
+            enable_cupti=True,
+            cold_l2_cache=True,
         )
-        cublas_avg_time = sum(cublas_times) / len(cublas_times) / 1000
+        cublas_avg_time = np.median(cublas_times) / 1000
         print(
-            f"CUBLAS average time: {cublas_avg_time * 1000:.6f} ms, {flops / cublas_avg_time:.3f} TFLOPS"
+            f"CUBLAS median time: {cublas_avg_time * 1000:.6f} ms, {flops / cublas_avg_time:.3f} TFLOPS"
         )
 
         # Warmup
@@ -98,28 +101,32 @@ def test_tgv_gemm_bf16_sm100_perf():
 
         torch.cuda.synchronize()
 
-        tgv_times = bench_gpu_time_with_cudagraph(
+        tgv_times = bench_gpu_time(
             lambda: tgv_gemm_sm100(A, B, bias),
             dry_run_time_ms=100,
             repeat_time_ms=500,
-            cold_l2_cache=False,
+            use_cuda_graph=True,
+            enable_cupti=True,
+            cold_l2_cache=True,
         )
-        tgv_avg_time = sum(tgv_times) / len(tgv_times) / 1000
+        tgv_avg_time = np.median(tgv_times) / 1000
         print(
-            f"TGV average time: {tgv_avg_time * 1000:.6f} ms, {flops / tgv_avg_time:.3f} TFLOPS, speedup: {cublas_avg_time / tgv_avg_time:.2f}x"
+            f"TGV median time: {tgv_avg_time * 1000:.6f} ms, {flops / tgv_avg_time:.3f} TFLOPS, speedup: {cublas_avg_time / tgv_avg_time:.2f}x"
         )
 
         # Test with PDL
         print("\nTesting with PDL...")
-        pdl_times = bench_gpu_time_with_cudagraph(
+        pdl_times = bench_gpu_time(
             lambda: tgv_gemm_sm100(A, B, bias, pdl=True),
             dry_run_time_ms=100,
             repeat_time_ms=500,
-            cold_l2_cache=False,
+            use_cuda_graph=True,
+            enable_cupti=True,
+            cold_l2_cache=True,
         )
-        pdl_avg_time = sum(pdl_times) / len(pdl_times) / 1000
+        pdl_avg_time = np.median(pdl_times) / 1000
         print(
-            f"PDL average time: {pdl_avg_time * 1000:.6f} ms, {flops / pdl_avg_time:.3f} TFLOPS, speedup: {cublas_avg_time / pdl_avg_time:.2f}x"
+            f"PDL median time: {pdl_avg_time * 1000:.6f} ms, {flops / pdl_avg_time:.3f} TFLOPS, speedup: {cublas_avg_time / pdl_avg_time:.2f}x"
         )
 
         # Store results for CSV
