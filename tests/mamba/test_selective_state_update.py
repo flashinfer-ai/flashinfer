@@ -3,6 +3,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
+from .selective_state_update_triton import selective_state_update_triton
 
 import flashinfer
 
@@ -187,22 +188,39 @@ def test_selective_state_update(
         matrixA_dtype,
     )
 
-    state = inputs["state_cache"][inputs["slot_idx"]]
-    state_ref = rearrange(state, "... p n -> ... n p").detach().clone()
-    A = inputs["A"]
-    A_ref = (rearrange(A, "... p n -> ... n p") if A.ndim == 3 else A).detach().clone()
-    y_ref = selective_state_update_ref(
-        state_ref,
-        inputs["x"],
-        inputs["dt"],
-        A_ref,
-        inputs["B"],
-        inputs["C"],
-        D=inputs["D"],
-        z=None,
-        dt_bias=inputs["dt_bias"],
-        dt_softplus=delta_softplus,
-    )
+    # state = inputs["state_cache"][inputs["slot_idx"]]
+    # state_ref = rearrange(state, "... p n -> ... n p").detach().clone()
+    state = inputs["state_cache"]
+    state_ref = state.clone()
+    # A = inputs["A"]
+
+    # A_ref = (rearrange(A, "... p n -> ... n p") if A.ndim == 3 else A).detach().clone()
+    # y_ref = selective_state_update_ref(
+    #     state_ref,
+    #     inputs["x"],
+    #     inputs["dt"],
+    #     A_ref,
+    #     inputs["B"],
+    #     inputs["C"],
+    #     D=inputs["D"],
+    #     z=None,
+    #     dt_bias=inputs["dt_bias"],
+    #     dt_softplus=delta_softplus,
+    # )
+    y_ref = selective_state_update_triton(
+            state_ref,
+            inputs["x"],
+            inputs["dt"],
+            inputs["A"],
+            inputs["B"],
+            inputs["C"],
+            D=inputs["D"],
+            z=None,
+            dt_bias=inputs["dt_bias"],
+            dt_softplus=delta_softplus,
+            state_batch_indices=inputs["slot_idx"],
+            pad_slot_id=-1,
+        )
 
     y_test =  flashinfer.mamba.selective_state_update(
         state,
