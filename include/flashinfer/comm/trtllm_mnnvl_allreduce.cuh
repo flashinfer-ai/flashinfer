@@ -1388,7 +1388,7 @@ cudaError_t oneshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
         }                                                                            \
         break;                                                                       \
       case QuantType::kNone:                                                         \
-        LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, false, QuantType::kNone);                \
+        LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, true, QuantType::kNone);                 \
         break;                                                                       \
       default:                                                                       \
         FLASHINFER_ERROR("Unsupported quant type! Got " +                            \
