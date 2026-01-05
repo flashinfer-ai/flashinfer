@@ -2474,6 +2474,13 @@ def run_moe_test(
 
 
 # Test: Renormalize routing
+@pytest.mark.parametrize(
+    "zero_hidden_states",
+    [
+        pytest.param(True, id="ZeroHiddenStates"),
+        pytest.param(False, id="RandomHiddenStates"),
+    ],
+)
 @pytest.mark.parametrize("num_tokens", [8, 768, 3072])
 @pytest.mark.parametrize("hidden_size", [1024])
 @pytest.mark.parametrize("intermediate_size", [1024, 768, 512, 384])
@@ -2599,10 +2606,6 @@ def run_moe_test(
         pytest.param(GatedActType.SwiGlu, id="SwiGlu"),
         pytest.param(GatedActType.GeGlu, id="GeGlu"),
     ],
-)
-@pytest.mark.parametrize(
-    "zero_hidden_states",
-    [True, False],
 )
 def test_renormalize_routing(
     num_tokens,
