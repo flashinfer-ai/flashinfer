@@ -16,9 +16,18 @@
 #ifndef FLASHINFER_MAMBA_SELECTIVE_STATE_UPDATE_CUH_
 #define FLASHINFER_MAMBA_SELECTIVE_STATE_UPDATE_CUH_
 
+#include <cooperative_groups.h>
+#include <cooperative_groups/memcpy_async.h>
+#include <cuda_runtime_api.h>
+
+#include <cmath>
+#include <cstdint>
+#include <cuda/barrier>
+
 #include "../utils.cuh"
 #include "../vec_dtypes.cuh"
 #include "conversion.cuh"
+#include "create_tensor_map.cuh"
 
 namespace flashinfer::mamba {
 
@@ -46,60 +55,52 @@ struct SelectiveStateUpdateParams {
   void* __restrict__ state_batch_indices{nullptr};  // state_batch_indices: (batch,)
 };
 
-__forceinline__ __device__ float softplus(float x)
-{
-    return __logf(1.f + __expf(x));
-    // return log1pf(exp(x));
+__forceinline__ __device__ float softplus(float x) {
+  return __logf(1.f + __expf(x));
+  // return log1pf(exp(x));
 }
 
-__device__ __forceinline__ float fast_exp(float x)
-{
-    constexpr float log2_E = 1.4426950408889634f;
-    float y;
-    asm("ex2.approx.f32 %0,%1;" : "=f"(y) : "f"(x * log2_E));
-    return y;
+__device__ __forceinline__ float fast_exp(float x) {
+  constexpr float log2_E = 1.4426950408889634f;
+  float y;
+  asm("ex2.approx.f32 %0,%1;" : "=f"(y) : "f"(x * log2_E));
+  return y;
 }
 
-__device__ __forceinline__ float thresholded_softplus(float dt_value)
-{
-    constexpr float threshold = 20.f;
-    return (dt_value <= threshold) ? softplus(dt_value) : dt_value;
+__device__ __forceinline__ float thresholded_softplus(float dt_value) {
+  constexpr float threshold = 20.f;
+  return (dt_value <= threshold) ? softplus(dt_value) : dt_value;
 }
 
 template <typename T>
 __device__ inline auto make_zero() -> T;
 
 template <>
-__device__ inline auto make_zero<float2>() -> float2
-{
-    return make_float2(0.f, 0.f);
+__device__ inline auto make_zero<float2>() -> float2 {
+  return make_float2(0.f, 0.f);
 }
 
 template <typename compute_t, typename load_t>
-__device__ inline auto make_zeros() -> load_t
-{
-    load_t rValue;
+__device__ inline auto make_zeros() -> load_t {
+  load_t rValue;
 #pragma unroll
-    for (int i = 0; i < sizeof(load_t) / sizeof(compute_t); i++)
-    {
-        auto* dst = reinterpret_cast<compute_t*>(&rValue) + i;
-        convertAndStore(dst, 0.f);
-    }
-    return rValue;
+  for (int i = 0; i < sizeof(load_t) / sizeof(compute_t); i++) {
+    auto* dst = reinterpret_cast<compute_t*>(&rValue) + i;
+    convertAndStore(dst, 0.f);
+  }
+  return rValue;
 }
 
-__device__ __forceinline__ float warpReduceSum(float val)
-{
-    constexpr auto warpSize = 32;
-    for (int s = warpSize / 2; s > 0; s /= 2)
-    {
-        val += __shfl_down_sync(UINT32_MAX, val, s);
-    }
-    return val;
+__device__ __forceinline__ float warpReduceSum(float val) {
+  constexpr auto warpSize = 32;
+  for (int s = warpSize / 2; s > 0; s /= 2) {
+    val += __shfl_down_sync(UINT32_MAX, val, s);
+  }
+  return val;
 }
 
 template <typename input_t, typename weight_t, typename state_t>
-struct VectorizedLoadTraits{};
+struct VectorizedLoadTraits {};
 
 template <>
 struct VectorizedLoadTraits<__nv_bfloat16, __nv_bfloat16, __nv_bfloat16> {
@@ -236,13 +237,228 @@ __global__ void selective_state_update_kernel_simple(SelectiveStateUpdateParams 
   }
 }
 
+template <typename input_t, typename weight_t, typename matrixA_t, typename state_t,
+          int rowsPerStage, int dim, int dstate, uint8_t numStages>
+struct SharedStorage {
+  alignas(128) state_t state[numStages][rowsPerStage * dstate];
+  input_t x[dim];
+  float out[dim];  // dt is special cause we're gonna store input in there as well
+  input_t z[dim];
+  input_t B[dstate];
+  input_t C[dstate];
+
+  using barrier_t = cuda::barrier<cuda::thread_scope_block>;
+  barrier_t bar_empty[numStages];
+  barrier_t bar_full[numStages];
+  barrier_t bar_consumers;
+};
+
+template <typename input_t, typename weight_t, typename matrixA_t, typename state_t, int DIM,
+          int DSTATE, int consumerWarps, int rowsPerStage, int numStages = 1>
+__global__ void selective_state_update_kernel_producer_consumer_vertical(
+    SelectiveStateUpdateParams params, __grid_constant__ CUtensorMap const tensorState) {
+  auto* __restrict__ output =
+      reinterpret_cast<input_t*>(params.output);  // output: (batch, nheads, dim)
+
+  auto const* __restrict__ x =
+      reinterpret_cast<input_t const*>(params.x);  // x: (batch, nheads, dim)
+  auto const* __restrict__ dt =
+      reinterpret_cast<weight_t const*>(params.dt);  // dt: (batch, nheads, dim)
+  auto const* __restrict__ A = reinterpret_cast<matrixA_t const*>(params.A);  // A: (nheads)
+  auto const* __restrict__ B =
+      reinterpret_cast<input_t const*>(params.B);  // B: (batch, ngroups, dstate)
+  auto const* __restrict__ C =
+      reinterpret_cast<input_t const*>(params.C);  // C: (batch, ngroups, dstate)
+  auto const* __restrict__ D = reinterpret_cast<weight_t const*>(params.D);  // D: (nheads, dim)
+  auto const* __restrict__ dt_bias = reinterpret_cast<weight_t const*>(params.dt_bias);
+  auto const* __restrict__ z = reinterpret_cast<input_t const*>(params.z);
+  auto const* __restrict__ state_batch_indices =
+      reinterpret_cast<int const*>(params.state_batch_indices);
+
+  int const nheads = params.nheads;
+  int const ngroups = params.ngroups;
+  int const dim = params.dim;
+
+  constexpr auto warpSize = 32;
+  constexpr auto numWarps = 1 + consumerWarps;
+
+  auto const batch = blockIdx.x;
+  auto const head = blockIdx.y;
+  auto const group = head / (nheads / ngroups);
+  auto lane = threadIdx.x % warpSize;
+  auto warp = threadIdx.y;
+
+  auto const state_batch = (state_batch_indices) ? state_batch_indices[batch] : batch;
+
+  using sram_t =
+      SharedStorage<input_t, weight_t, matrixA_t, state_t, rowsPerStage, DIM, DSTATE, numStages>;
+#pragma nv_diag_suppress 20054
+  __shared__ sram_t sram;
+#pragma nv_diag_default 20054
+
+  namespace cde = cuda::device::experimental;
+  namespace cg = cooperative_groups;
+
+  for (int stage = warp; stage < numStages; stage += numWarps) {
+    if (lane > 0) continue;
+    constexpr auto num_arrivals = 1 + consumerWarps * warpSize;
+    init(&sram.bar_empty[stage], num_arrivals);
+    init(&sram.bar_full[stage], num_arrivals);
+    // signal to async proxy that barriers are initilized
+    cde::fence_proxy_async_shared_cta();
+  }
+  if (lane == 0 && warp == 0) {
+    init(&sram.bar_consumers, warpSize * consumerWarps);
+  }
+  __syncthreads();
+
+  if (warp == consumerWarps) {
+    auto const state_offset = (state_batch * nheads + head) * dim;
+
+    for (int d = 0, stage = 0; d < dim + rowsPerStage * numStages;
+         d += rowsPerStage, stage = (stage + 1) % numStages) {
+      if (lane == 0) {
+        cg::invoke_one(cg::coalesced_threads(), [&]() {
+          sram.bar_empty[stage].wait(sram.bar_empty[stage].arrive());
+
+          if (state_batch != params.pad_slot_id) {
+            // Writeback
+            if (d >= rowsPerStage * numStages) {
+              cde::cp_async_bulk_tensor_2d_shared_to_global(
+                  &tensorState,
+                  /*x*/ 0,
+                  /*y*/ state_offset + d - rowsPerStage * numStages, &sram.state[stage][0]);
+              cde::cp_async_bulk_commit_group();
+              cde::cp_async_bulk_wait_group_read<0>();
+            }
+
+            if (d < dim) {
+              cde::cp_async_bulk_tensor_2d_global_to_shared(&sram.state[stage][0], &tensorState,
+                                                            /*x*/ 0, /*y*/ state_offset + d,
+                                                            sram.bar_full[stage]);
+
+              // Unblock the consumers
+              auto constexpr bytesState = rowsPerStage * DSTATE * sizeof(state_t);
+              auto constexpr bytesToArrive = bytesState;
+              auto const _ =
+                  cuda::device::barrier_arrive_tx(sram.bar_full[stage], 1, bytesToArrive);
+            }
+          } else {
+            auto const _ = sram.bar_full[stage].arrive();
+          }
+        });
+      }
+    }
+  } else {  // consumers
+
+    using load_t = float2;
+    static constexpr auto vectorizedLoadSize = sizeof(load_t) / sizeof(weight_t);
+
+#pragma unroll
+    // Unblock the producer
+    for (uint8_t stage = 0; stage < numStages; ++stage) {
+      auto const _ = sram.bar_empty[stage].arrive();
+    }
+
+    // Load A
+    auto const A_value = toFloat(A[head]);
+
+    // Load D
+    auto const d_value = D ? toFloat(D[head]) : 0.f;
+
+    // load dt_value
+    auto dt_value = toFloat(dt[batch * params.dt_stride_batch + head]);
+    if (dt_bias) dt_value += toFloat(dt_bias[head]);
+    if (params.dt_softplus) {
+      dt_value = thresholded_softplus(dt_value);
+    }
+
+    if (warp == 0) {  // Load x, B
+      for (auto d = lane * vectorizedLoadSize; d < dim; d += warpSize * vectorizedLoadSize) {
+        auto* dst = reinterpret_cast<load_t*>(&sram.x[d]);
+        *dst = *reinterpret_cast<load_t const*>(&x[batch * params.x_stride_batch + head * dim + d]);
+      }
+      for (auto i = lane * vectorizedLoadSize; i < DSTATE; i += warpSize * vectorizedLoadSize) {
+        auto* dst = reinterpret_cast<load_t*>(&sram.B[i]);
+        *dst = *reinterpret_cast<load_t const*>(
+            &B[batch * params.B_stride_batch + group * DSTATE + i]);
+      }
+    } else if (warp == 1) {  // Load z, C
+      for (auto d = lane * vectorizedLoadSize; d < dim; d += warpSize * vectorizedLoadSize) {
+        auto* dst = reinterpret_cast<load_t*>(&sram.z[d]);
+        *dst = z ? *reinterpret_cast<load_t const*>(&z[batch * nheads * dim + head * dim + d])
+                 : make_zero<load_t>();
+      }
+      for (auto i = lane * vectorizedLoadSize; i < DSTATE; i += warpSize * vectorizedLoadSize) {
+        auto* dst = reinterpret_cast<load_t*>(&sram.C[i]);
+        *dst = *reinterpret_cast<load_t const*>(
+            &C[batch * params.C_stride_batch + group * DSTATE + i]);
+      }
+    }
+
+    sram.bar_consumers.wait(sram.bar_consumers.arrive());
+
+    for (auto dBegin = 0, stage = 0; dBegin < dim;
+         dBegin += rowsPerStage, stage = (stage + 1) % numStages) {
+      // wait for the producer
+      sram.bar_full[stage].wait(sram.bar_full[stage].arrive());
+
+#pragma unroll
+      for (auto dd = warp; dd < rowsPerStage; dd += consumerWarps) {
+        auto d = dBegin + dd;
+        float const x_value = toFloat(sram.x[d]);
+        float out_value = toFloat(d_value) * x_value * int(lane == 0);  // first lane has the value
+
+        for (int i = lane; i < DSTATE; i += warpSize) {
+          auto const state_value = (state_batch != params.pad_slot_id)
+                                       ? toFloat(sram.state[stage][dd * DSTATE + i])
+                                       : 0.f;
+          auto const B_value = toFloat(sram.B[i]);
+          auto const C_value = toFloat(sram.C[i]);
+
+          auto const dA = fast_exp(A_value * dt_value);
+          auto const dB = B_value * dt_value;
+          auto const new_state = state_value * dA + dB * x_value;
+
+          convertAndStore(&sram.state[stage][dd * DSTATE + i], new_state);
+          out_value += new_state * C_value;
+        }
+
+        out_value = warpReduceSum(out_value);
+        if (lane == 0) {
+          sram.out[d] = out_value;
+        }
+      }
+
+      // Unblock producer
+      cde::fence_proxy_async_shared_cta();
+      auto _ = sram.bar_empty[stage].arrive();
+    }
+
+    // Write output
+    sram.bar_consumers.wait(sram.bar_consumers.arrive());
+    auto d = warp * warpSize + lane;
+    if (d < dim) {
+      auto out_value = sram.out[d];
+      if (z) {
+        float z_value = toFloat(sram.z[d]);
+        float sig_z = __fdividef(1.f, (1.f + __expf(0.f - z_value)));
+        float silu_z = z_value * sig_z;
+        out_value *= silu_z;
+      }
+      convertAndStore(&output[batch * params.out_stride_batch + head * dim + d], out_value);
+    }
+  }
+}
+
 template <typename input_t, typename weight_t, typename matrixA_t, typename state_t>
 void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, cudaStream_t stream) {
-
   constexpr int DSTATE = 128;
   FLASHINFER_CHECK(params.dstate == DSTATE);
 
-  // #if (__CUDA_ARCH__ < 900) // pre-Hopper
+  auto [sm_major, sm_minor] = GetCudaComputeCapability();
+
+  if (sm_major < 9)  // pre-Hopper
   {
     constexpr int numWarps = 2;
     int const blocks_per_dim = (params.dim + 32 * numWarps - 1) / (32 * numWarps);
@@ -251,8 +467,35 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, cudaStream_t
     selective_state_update_kernel_simple<input_t, weight_t, matrixA_t, state_t, DSTATE, numWarps>
         <<<grid, block, 0, stream>>>(params);
   }
-  // #else
-  // #endif
+  else
+  {
+    constexpr auto numConsumers = 4;
+    constexpr auto numWarps = 1 + numConsumers;
+    constexpr auto numStages = 3;
+    constexpr auto rowsPerStage = 4 * numConsumers;
+    constexpr auto DIM = 64;
+    FLASHINFER_CHECK(params.dim == DIM);
+    auto scan_func = selective_state_update_kernel_producer_consumer_vertical<
+        input_t, weight_t, matrixA_t, state_t, DIM, DSTATE, numConsumers, rowsPerStage, numStages>;
+
+    dim3 block(32, numWarps);
+    dim3 grid(params.batch, params.nheads);
+
+    auto nh = params.nheads;
+    auto dim = params.dim;
+    auto B = params.state_cache_size;
+
+    FLASHINFER_CHECK(reinterpret_cast<uintptr_t>(params.state) % 128 == 0);  // TMA requires 128B aligned
+    auto tensorState = tma::createTensorMap<state_t>(params.state, B * nh * dim, DSTATE, rowsPerStage, DSTATE);
+    FLASHINFER_CHECK(params.dim % rowsPerStage == 0);
+
+    scan_func<<<grid, block, 0, stream>>>(params, tensorState);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess)
+    {
+        printf("Kernel launch failed: %s\n", cudaGetErrorString(err));
+    }
+  }
 }
 
 }  // namespace flashinfer::mamba
