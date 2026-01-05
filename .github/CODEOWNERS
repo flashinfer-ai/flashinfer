@@ -43,6 +43,6 @@ include/flashinfer/ @yzh119 @jiahanc @kahyunnam @IwakuraRein @nv-yunzheq
 include/flashinfer/attention/ @yzh119 @kahyunnam @joker-eph
 include/flashinfer/comm/ @yongwww @nvmbreughe @djmmoss @yzh119
 include/flashinfer/gemm/ @ttyio @yongwww @yzh119 @nvmbreughe @aleozlx
-include/flashinfer/trtllm/ @yzh119 @jiahanc @aleozlx @joker-eph @IwakuraRein
+include/flashinfer/trtllm/ @yzh119 @jiahanc @aleozlx @IwakuraRein @joker-eph
 profiler/ @cyx-6
 scripts/ @yzh119 @nvmbreughe @kahyunnam @jimmyzho @dierksen
