@@ -347,7 +347,7 @@ def get_trtllm_mnnvl_comm_module():
             residual_out,
             gamma,
             epsilon,
-            quant_type,
+            0 if quant_type is None else quant_type.value,
             quant_out,
             sf_out,
             output_scale,
