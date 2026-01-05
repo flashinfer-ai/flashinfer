@@ -20,12 +20,22 @@ from ..utils import register_custom_op
 from .mnnvl import McastGPUBuffer, CommBackend, MPIBackend
 from .workspace_base import AllReduceFusionWorkspace
 
+# TODO: Should this be moved to common file in allreduce.py?
+from .trtllm_ar import QuantizationSFLayout
+
 
 def mpi_barrier():
     from mpi4py import MPI
 
     """MPI barrier - could potentially be replaced with dist.barrier()"""
     MPI.COMM_WORLD.Barrier()
+
+
+# This should match the definition in trtllm_mnnvl_allreduce.cu
+class MNNVLAllreduceQuantFusionType(Enum):
+    NOQUNAT = 0
+    FP8 = 1
+    NVFP4 = 2
 
 
 class MNNVLAllreduceFusionStrategy(Enum):
@@ -248,73 +258,100 @@ def get_trtllm_mnnvl_comm_module():
         "flashinfer::trtllm_mnnvl_allreduce_fusion",
         mutates_args=[
             "input",
+            "output",
             "multicast_buffer_ptr",
             "buffer_ptrs_dev",
             "buffer_ptr_local",
             "buffer_flags_mnnvl",
             "nranks",
             "rank",
-            "rmsnorm_fusion",
-            "launch_with_pdl",
             "use_oneshot",
-            "output",
-            "residual_out",
+            "launch_with_pdl",
+            "rmsnorm_fusion",
             "residual_in",
+            "residual_out",
             "gamma",
             "epsilon",
+            "quant_type",
+            "quant_out",
+            "sf_out",
+            "output_scale",
+            "layout_code",
         ],
     )
     def trtllm_mnnvl_allreduce_fusion(
+        # Primary I/O
         input: torch.Tensor,
+        output: Optional[torch.Tensor],
+        # Communication infrastructure
         multicast_buffer_ptr: int,  # Pointer address as integer
         buffer_ptrs_dev: int,  # Pointer address as integer
         buffer_ptr_local: int,  # Pointer address as integer
         buffer_flags_mnnvl: torch.Tensor,
+        # Distributed configuration
         nranks: int,
         rank: int,
-        rmsnorm_fusion: bool,
-        launch_with_pdl: bool,
+        # Kernel control flags
         use_oneshot: bool,
-        output: torch.Tensor,
-        residual_out: Optional[torch.Tensor],
+        launch_with_pdl: bool,
+        # RMSNorm fusion
+        rmsnorm_fusion: bool,
         residual_in: Optional[torch.Tensor],
+        residual_out: Optional[torch.Tensor],
         gamma: Optional[torch.Tensor],
         epsilon: Optional[float],
+        # Quantization
+        quant_type: Optional[MNNVLAllreduceQuantFusionType],
+        quant_out: Optional[torch.Tensor],
+        sf_out: Optional[torch.Tensor],
+        output_scale: Optional[torch.Tensor],
+        layout_code: Optional[QuantizationSFLayout],
     ) -> None:
         """
         Perform a multi-node NVLink all-reduce operation with fusion.
         Args:
             input: Input tensor
+            output: Output tensor; w/ rmsnorm fusion, it is the normed output
             multicast_buffer_ptr: Pointer to the multicast buffer as an integer
             buffer_ptrs_dev: Pointer to the device array of buffer pointers as an integer
             buffer_ptr_local: Pointer to local buffer as an integer
             buffer_flags_mnnvl: Buffer flags tensor for synchronization
             nranks: Total number of ranks participating in the all-reduce
             rank: Current process rank
-            rmsnorm_fusion: Whether to perform RMSNorm fusion
-            launch_with_pdl: Whether to launch with PDL
             use_oneshot: Whether to use one-shot (true) or two-shot (false)
-            output: Output tensor
+            launch_with_pdl: Whether to launch with PDL
+            rmsnorm_fusion: Whether to perform RMSNorm fusion
+            residual_in: Residual input tensor (if rmsnorm)
             residual_out: Residual output tensor (if rmsnorm)
             gamma: Gamma tensor (if rmsnorm)
             epsilon: Epsilon value (if rmsnorm)
+            quant_type: Quantization type (kFP8, kFP4, kNone)
+            quant_out: Quantized output tensor
+            sf_out: Scaling factor output tensor
+            output_scale: Input scale applied to quant output
+            layout_code: Scaling factor layout code
         """
         module.trtllm_mnnvl_allreduce_fusion(
             input,
+            output,
             multicast_buffer_ptr,
             buffer_ptrs_dev,
             buffer_ptr_local,
             buffer_flags_mnnvl,
             nranks,
             rank,
-            rmsnorm_fusion,
-            launch_with_pdl,
             use_oneshot,
-            output,
-            residual_out,
+            launch_with_pdl,
+            rmsnorm_fusion,
             residual_in,
+            residual_out,
             gamma,
             epsilon,
+            quant_type,
+            quant_out,
+            sf_out,
+            output_scale,
+            layout_code,
         )
 
     return SimpleNamespace(
@@ -381,20 +418,25 @@ def trtllm_mnnvl_allreduce(
 
     module.trtllm_mnnvl_allreduce_fusion(
         input,
+        output,
         workspace.mc_ptr,
         workspace.uc_ptrs_dev,
         workspace.uc_ptr_local,
         workspace.buffer_flags,
         workspace.tp_size,
         workspace.rank,
-        False,  # No RMSNorm Fusion
-        launch_with_pdl,
         strategy == MNNVLAllreduceFusionStrategy.ONESHOT,
-        output,
-        None,
-        None,
-        None,
-        None,
+        launch_with_pdl,
+        False,  # No RMSNorm Fusion
+        None,  # residual_in
+        None,  # residual_out
+        None,  # gamma
+        None,  # epsilon
+        None,  # quant_type
+        None,  # quant_out
+        None,  # sf_out
+        None,  # output_scale
+        None,  # layout_code
     )
 
     return output
@@ -476,20 +518,25 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm(
 
     module.trtllm_mnnvl_allreduce_fusion(
         input,
+        output,
         workspace.mc_ptr,
         workspace.uc_ptrs_dev,
         workspace.uc_ptr_local,
         workspace.buffer_flags,
         workspace.tp_size,
         workspace.rank,
-        True,  # RMSNorm Fusion
-        launch_with_pdl,
         strategy == MNNVLAllreduceFusionStrategy.ONESHOT,
-        output,
-        residual_out,
+        launch_with_pdl,
+        True,  # RMSNorm Fusion
         residual_in,
+        residual_out,
         gamma,
         epsilon,
+        None,  # quant_type
+        None,  # quant_out
+        None,  # sf_out
+        None,  # output_scale
+        None,  # layout_code
     )
     return output, residual_out
 
@@ -614,20 +661,25 @@ def trtllm_mnnvl_all_reduce(
     module = get_trtllm_mnnvl_comm_module()
     module.trtllm_mnnvl_allreduce_fusion(
         inp,
+        out,
         multicast_buffer_ptr,
         buffer_ptrs_dev,
         0,  # Allreduce kernel itself does not use this local pointer; still this could be risky but it is only used for legacy code compatibility.
         buffer_flags_mnnvl,
         nranks,
         rank,
-        False,  # No RMSNorm Fusion
-        launch_with_pdl,
         False,  # Use two-shot
-        out,
-        None,
-        None,
-        None,
-        None,
+        launch_with_pdl,
+        False,  # No RMSNorm Fusion
+        None,  # residual_in
+        None,  # residual_out
+        None,  # gamma
+        None,  # epsilon
+        None,  # quant_type
+        None,  # quant_out
+        None,  # sf_out
+        None,  # output_scale
+        None,  # layout_code
     )
 
 
@@ -707,18 +759,23 @@ def trtllm_mnnvl_fused_allreduce_rmsnorm(
 
     module.trtllm_mnnvl_allreduce_fusion(
         shard_input,
+        normed_output,
         multicast_buffer_ptr,
         buffer_ptrs_dev,
         unicast_ptr,
         buffer_flags_mnnvl,
         nranks,
         rank,
-        True,  # RMSNorm Fusion
+        False,  # Use two-shot
         launch_with_pdl,
-        False,
-        normed_output,
-        prenorm_output,
+        True,  # RMSNorm Fusion
         residual,
+        prenorm_output,
         gamma,
         epsilon,
+        None,  # quant_type
+        None,  # quant_out
+        None,  # sf_out
+        None,  # output_scale
+        None,  # layout_code
     )
