@@ -3,6 +3,8 @@
 
 using namespace flashinfer::trtllm_mnnvl_allreduce;
 
+using flashinfer::QuantizationSFLayout;
+using flashinfer::trtllm_mnnvl_allreduce::QuantType;
 using tvm::ffi::Optional;
 
 #define DISPATCH_FLOATING_TYPES_FOR_MNNVL_ALLREDUCE(dtype, c_type, ...)             \
@@ -72,9 +74,10 @@ void trtllm_mnnvl_allreduce_fusion(
     // Validate input parameters
     TVM_FFI_ICHECK_EQ(token_dim % (sizeof(float4) / sizeof(c_type)), 0)
         << "token_dim must be divisible by " << sizeof(float4) / sizeof(c_type);
-    TVM_FFI_ICHECK(output.size(0) == input.size(0) && output.size(1) == input.size(1))
+    TVM_FFI_ICHECK(output.has_value() && output.value().size(0) == input.size(0) &&
+                   output.value().size(1) == input.size(1))
         << "output shape mismatch: expected (" << input.size(0) << ", " << input.size(1)
-        << ") but got (" << output.size(0) << ", " << output.size(1) << ")";
+        << ") but got (" << output.value().size(0) << ", " << output.value().size(1) << ")";
     TVM_FFI_ICHECK(nranks >= 2 && nranks <= 64)
         << "nranks must be between 2 and 64, got " << nranks;
     TVM_FFI_ICHECK(rank >= 0 && rank < nranks)
@@ -84,7 +87,7 @@ void trtllm_mnnvl_allreduce_fusion(
                    !rmsnorm_fusion)
         << "residual_in, residual_out, gamma, and epsilon must be provided if rmsnorm_fusion is "
            "true";
-    TVM_FFI_CHECK(quant_type_enum == QuantType::kNone || (rmsnorm_fusion && sizeof(c_type) == 2))
+    TVM_FFI_ICHECK(quant_type_enum == QuantType::kNone || (rmsnorm_fusion && sizeof(c_type) == 2))
         << "Qaunt fusion is only supported with RMSNorm fusion and FP16/BF16 dtype.";
 
     if (rmsnorm_fusion) {
@@ -140,17 +143,20 @@ void trtllm_mnnvl_allreduce_fusion(
         residual_in.has_value() ? const_cast<void const*>(residual_in.value().data_ptr()) : nullptr;
     params.gamma = gamma.has_value() ? const_cast<void const*>(gamma.value().data_ptr()) : nullptr;
     params.epsilon = epsilon.has_value() ? epsilon.value() : 1e-5;
-    params.outputScale =
-        output_scale.has_value() ? const_cast<float*>(output_scale.value().data_ptr()) : nullptr;
+    params.outputScale = output_scale.has_value()
+                             ? reinterpret_cast<float*>(output_scale.value().data_ptr())
+                             : nullptr;
 
     // output data
-    params.output = output.has_value() ? const_cast<void*>(output.value().data_ptr()) : nullptr;
-    params.residualOut =
-        residual_out.has_value() ? const_cast<void*>(residual_out.value().data_ptr()) : nullptr;
+    params.output =
+        output.has_value() ? reinterpret_cast<void*>(output.value().data_ptr()) : nullptr;
+    params.residualOut = residual_out.has_value()
+                             ? reinterpret_cast<void*>(residual_out.value().data_ptr())
+                             : nullptr;
     params.quantOut =
-        quant_out.has_value() ? const_cast<void*>(quant_out.value().data_ptr()) : nullptr;
+        quant_out.has_value() ? reinterpret_cast<void*>(quant_out.value().data_ptr()) : nullptr;
     params.scalingFactorOut =
-        sf_out.has_value() ? const_cast<void*>(sf_out.value().data_ptr()) : nullptr;
+        sf_out.has_value() ? reinterpret_cast<void*>(sf_out.value().data_ptr()) : nullptr;
     params.stream = stream;
 
     cudaError_t status;

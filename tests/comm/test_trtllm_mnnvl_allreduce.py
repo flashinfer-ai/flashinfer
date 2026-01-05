@@ -1,5 +1,7 @@
 # Check torch version:
+import sys
 import traceback
+from pathlib import Path
 from typing import Tuple, Optional
 
 import pytest
@@ -13,10 +15,12 @@ from flashinfer.comm.mnnvl import TorchDistBackend
 # Use flashinfer.norm.rmsnorm as reference implementation.
 from flashinfer.norm import rmsnorm
 
-# Test helpers
-from tests.test_helpers.comm import (
-    init_torch_distributed_from_mpi,
-)
+# Add project root to path for direct script execution
+_project_root = Path(__file__).resolve().parents[2]
+if str(_project_root) not in sys.path:
+    sys.path.insert(0, str(_project_root))
+
+from tests.test_helpers.comm import init_torch_distributed_from_mpi
 
 # Note: torch.distributed cleanup is handled by tests/comm/conftest.py
 
@@ -480,3 +484,7 @@ def test_mnnvl_allreduce_legacy(
     run_mnnvl_ar_full(
         monkeypatch, seq_lens, fusion, dtype, hidden_size, legacy_api=True
     )
+
+
+if __name__ == "__main__":
+    run_mnnvl_ar_full(None, [1], True, torch.float16, 2880, legacy_api=False)
