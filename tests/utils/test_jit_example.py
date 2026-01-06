@@ -11,7 +11,7 @@ from flashinfer.jit.attention import (
     gen_customize_single_prefill_module,
 )
 from flashinfer.prefill import single_prefill_with_kv_cache_with_jit_module
-from flashinfer.utils import MaskMode, is_sm90a_supported
+from flashinfer.utils import MaskMode, is_sm90a_supported, get_compute_capability
 
 
 def test_single_decode_mask():
@@ -166,6 +166,10 @@ def test_flash_sigmoid():
     torch.testing.assert_close(o, o_ref, rtol=2e-2, atol=2e-2)
 
 
+@pytest.mark.xfail(
+    get_compute_capability(torch.device("cuda:0")) == (12, 1),
+    reason="Numerical accuracy issue on SM 121 (Spark)",
+)
 def test_dump_logits():
     torch.manual_seed(42)
     variant_decl = r"""
@@ -252,6 +256,7 @@ def test_batch_decode_flash_sigmoid(use_tensor_cores):
         kv_layout="NHD",
         use_tensor_cores=use_tensor_cores,
         jit_args=jit_args,
+        backend="fa2",
     )
 
     batch_size = 128

@@ -8,22 +8,19 @@ from tests.utils_fp8 import to_float8
 
 
 @pytest.mark.parametrize("b", [1, 16])
-@pytest.mark.parametrize("m", [48, 128])
-@pytest.mark.parametrize("n", [80, 64])
-@pytest.mark.parametrize("k", [64, 256])
+@pytest.mark.parametrize("m", [1, 48, 128])
+@pytest.mark.parametrize("n", [64, 80, 10304])
+@pytest.mark.parametrize("k", [64, 256, 2688])
 @pytest.mark.parametrize("input_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 @pytest.mark.parametrize("mat2_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 @pytest.mark.parametrize("res_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("backend", ["cudnn", "cublas", "cutlass", "auto"])
 @pytest.mark.parametrize("auto_tuning", [True, False])
 def test_bmm_fp8(b, m, n, k, input_dtype, mat2_dtype, res_dtype, backend, auto_tuning):
-    if get_compute_capability(torch.device("cuda"))[0] == 12 and backend in [
-        "cutlass",
-        "auto",
-    ]:
-        # TODO(yongwwww): enable all test cases for SM120/121 CUTLASS bmm_fp8 backend
-        pytest.xfail(
-            "Not all test cases for CUTLASS bmm_fp8 on SM120/121 are passing at this moment"
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    if backend == "cutlass" and compute_capability[0] not in [10, 11, 12]:
+        pytest.skip(
+            "bmm_fp8 with cutlass backend is only supported on SM100, SM110, and SM120/121 GPUs."
         )
     if input_dtype == torch.float8_e5m2 and mat2_dtype == torch.float8_e5m2:
         pytest.skip("Invalid combination: both input and mat2 are e5m2")
@@ -54,7 +51,9 @@ def test_bmm_fp8(b, m, n, k, input_dtype, mat2_dtype, res_dtype, backend, auto_t
             backend=backend,
         )
 
-    cos_sim = F.cosine_similarity(reference.reshape(-1), res.reshape(-1), dim=0)
+    cos_sim = F.cosine_similarity(
+        reference.reshape(-1).float(), res.reshape(-1).float(), dim=0
+    )
     assert cos_sim > 0.99
 
 

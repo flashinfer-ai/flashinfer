@@ -381,6 +381,7 @@ def gen_trtllm_gen_gemm_module() -> JitSpec:
         ],
         extra_cuda_cflags=[
             "-DTLLM_GEN_EXPORT_INTERFACE",
+            "-DTLLM_GEN_EXPORT_FLASHINFER",
             "-DTLLM_ENABLE_CUDA",
             f'-DTLLM_GEN_GEMM_CUBIN_PATH=\\"{ArtifactPath.TRTLLM_GEN_GEMM}\\"',
         ]
@@ -531,6 +532,7 @@ def gen_trtllm_low_latency_gemm_module() -> JitSpec:
         ],
         extra_cuda_cflags=[
             "-DTLLM_GEN_EXPORT_INTERFACE",
+            "-DTLLM_GEN_EXPORT_FLASHINFER",
             "-DTLLM_ENABLE_CUDA",
             f'-DTLLM_GEN_GEMM_CUBIN_PATH=\\"{ArtifactPath.TRTLLM_GEN_GEMM}\\"',
         ]

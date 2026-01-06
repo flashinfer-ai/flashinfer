@@ -1,13 +1,18 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2024 NVIDIA CORPORATION & AFFILIATES. All rights
- * reserved. SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights
+ * reserved. SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 #pragma once
@@ -22,16 +27,21 @@ struct IndexedHeadPtrImpl {
   uint32_t const* indices;  // values are in range [0, beamWidth)
   Head* pool;
   Vec<KVCachePageIndex, nbPages> const* pageIndices;
-  uint32_t nbKHeads;
-  uint32_t offset;  // applied onto pool + pointers
+  uint32_t tokenOffset;   // token offset within the first page
+  uint32_t headIdx;       // head index
+  uint32_t stride_page;   // stride for each page (in units of Head)
+  uint32_t stride_token;  // stride for each token (in units of Head)
+  uint32_t stride_head;   // stride for each head (in units of Head)
 
   __device__ inline Head& operator[](uint32_t i) const { return *(*this + i); }
 
   __device__ inline Head* operator+(uint32_t i) const {
-    assert(indices[i] < beamWidth);
-    assert(nbPages == 1 || offset % tokensPerPage == 0);
-    auto const pageIdx = pageIndices[indices[i]][nbPages == 1 ? 0U : i / tokensPerPage];
-    return pool + (tokensPerPage * nbKHeads * pageIdx + offset + i % tokensPerPage);
+    uint32_t const beamIdx = indices[i];
+    assert(beamIdx < beamWidth);
+    uint32_t const absoluteTokenIdx = tokenOffset + i;
+    auto const pageIdx = pageIndices[beamIdx][nbPages == 1 ? 0U : absoluteTokenIdx / tokensPerPage];
+    return pool + pageIdx * stride_page + (absoluteTokenIdx % tokensPerPage) * stride_token +
+           headIdx * stride_head;
   }
 };
 
@@ -59,24 +69,21 @@ struct HeadPtr {
   static_assert(tokensPerPage != 0 && nbPages != 0);
   Head* pool;
   Vec<KVCachePageIndex, nbPages> pageIndices;
-  uint32_t nbKHeads;
-  uint32_t offset;  // offset inside the first page.
+  uint32_t tokenOffset;   // token offset within the first page
+  uint32_t headIdx;       // head index
+  uint32_t stride_page;   // stride for each page (in units of Head)
+  uint32_t stride_token;  // stride for each token (in units of Head)
+  uint32_t stride_head;   // stride for each head (in units of Head)
 
   __device__ inline Head& operator[](uint32_t i) const { return *(*this + i); }
 
   __device__ inline Head* operator+(uint32_t i) const {
-#if PAGED_KV_CACHE_LAYOUT == 1 && USE_PAGED_KV_CACHE
-    auto const pageIdx = pageIndices[nbPages == 1 ? 0U : i / tokensPerPage];
-    return (pageIdx & (1U << 31)) ? nullptr
-                                  : pool + (tokensPerPage * nbKHeads * pageIdx + offset +
-                                            (i % tokensPerPage) * nbKHeads);
-#else
-    assert(nbPages == 1 || offset % tokensPerPage == 0);
-    auto const pageIdx = pageIndices[nbPages == 1 ? 0U : i / tokensPerPage];
+    uint32_t const absoluteTokenIdx = tokenOffset + i;
+    auto const pageIdx = pageIndices[nbPages == 1 ? 0U : absoluteTokenIdx / tokensPerPage];
     return (pageIdx & (1U << 31))
                ? nullptr
-               : pool + (tokensPerPage * nbKHeads * pageIdx + offset + i % tokensPerPage);
-#endif
+               : pool + pageIdx * stride_page + (absoluteTokenIdx % tokensPerPage) * stride_token +
+                     headIdx * stride_head;
   }
 };
 
@@ -226,12 +233,8 @@ struct KVCacheList;
 
 template <>
 struct KVCacheList<true> {
-#if PAGED_KV_CACHE_LAYOUT == 1
   GMemCacheHead* kCacheVLLM;
   GMemCacheHead* vCacheVLLM;
-#else
-  GMemKVCacheHead* pool;
-#endif
   KVCachePageIndex const*
       kvCachePageList;  // shape: KVCachePageIndex[batchSize][beamWidth][2][maxNbPagesPerSeq].
   SeqLenDataType const* seqLenList;  // shape: [batchSize][beamWidth] (for compatibility)
@@ -279,16 +282,8 @@ __device__ inline Vec<KVCachePageIndex, nbLoadedPages> getPage(KVCacheList<true>
 #pragma unroll
   for (uint32_t i = 0; i < nbLoadedPages; i++) {
     uint32_t const idxPage = idxPageBeg + i;
-#if PAGED_KV_CACHE_LAYOUT == 1 && USE_PAGED_KV_CACHE
     ret[i] = (idxPage < nbPages ? cacheList.kvCachePageList[maxNbPagesPerSeq * idxReq + idxPage]
                                 : kBAD_PAGE_INDEX);
-#else
-    ret[i] =
-        (idxPage < nbPages ? cacheList.kvCachePageList[beamWidth * 2 * maxNbPagesPerSeq * idxReq +
-                                                       2 * maxNbPagesPerSeq * idxBeam +
-                                                       maxNbPagesPerSeq * (isK ? 0U : 1U) + idxPage]
-                           : kBAD_PAGE_INDEX);
-#endif
   }
   return ret;
 }

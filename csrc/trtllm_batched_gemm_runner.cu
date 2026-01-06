@@ -116,14 +116,16 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
     }
   }
 
-  FLASHINFER_CHECK(
-      !mPassingConfigIndices.empty(),
-      "No kernel found for the given options: mDtypeA: %s, mDtypeB: %s, mDtypeC: %s, "
-      "mUseDeepSeekFp8: %d, "
-      "mTransposeMmaOutput: %d, mRouteAct: %d, mFusedAct: %d, mIsStaticBatch: %d, mTileSize: %d",
-      tg::dtypeToString(mOptions.dtypeA).c_str(), tg::dtypeToString(mOptions.dtypeB).c_str(),
-      tg::dtypeToString(mOptions.dtypeC).c_str(), mOptions.deepSeekFp8, mOptions.transposeMmaOutput,
-      mOptions.routeAct, mOptions.fusedAct, mOptions.staticBatch, mOptions.tileSize);
+  std::ostringstream error_msg;
+  error_msg << "No kernel found for the given options: "
+            << "mDtypeA: " << tg::dtypeToString(mOptions.dtypeA)
+            << ", mDtypeB: " << tg::dtypeToString(mOptions.dtypeB)
+            << ", mDtypeC: " << tg::dtypeToString(mOptions.dtypeC)
+            << ", mUseDeepSeekFp8: " << mOptions.deepSeekFp8
+            << ", mTransposeMmaOutput: " << mOptions.transposeMmaOutput
+            << ", mRouteAct: " << mOptions.routeAct << ", mFusedAct: " << mOptions.fusedAct
+            << ", mIsStaticBatch: " << mOptions.staticBatch << ", mTileSize: " << mOptions.tileSize;
+  FLASHINFER_CHECK(!mPassingConfigIndices.empty(), error_msg.str());
 }
 
 size_t TrtllmGenBatchedGemmRunner::getWorkspaceSizeInBytes(
@@ -143,6 +145,10 @@ size_t TrtllmGenBatchedGemmRunner::getWorkspaceSizeInBytes(
   gemmData.mProblemDimensions.mRank = 0;
   gemmData.mProblemDimensions.mWorldSize = 1;
   gemmData.mProblemDimensions.mMaxNumCtasInTokenDim = maxNumCtasInBatchDim;
+
+  gemmData.mProblemDimensions.mValidM = gemmData.mProblemDimensions.mM;
+  gemmData.mProblemDimensions.mValidN = gemmData.mProblemDimensions.mN;
+  gemmData.mProblemDimensions.mValidK = gemmData.mProblemDimensions.mK;
 
   auto bmm = BatchedGemmInterface();
 
@@ -239,6 +245,10 @@ void TrtllmGenBatchedGemmRunner::run(
   int32_t multiProcessorCount;
   cudaDeviceGetAttribute(&multiProcessorCount, cudaDevAttrMultiProcessorCount, device);
 
+  gemmData.mProblemDimensions.mValidM = gemmData.mProblemDimensions.mM;
+  gemmData.mProblemDimensions.mValidN = gemmData.mProblemDimensions.mN;
+  gemmData.mProblemDimensions.mValidK = gemmData.mProblemDimensions.mK;
+
   // FIXME once we start using all-reduce in the epilogue of the bmm this can be moved elsewhere
   bmm.runInitBeforeWorldSync(config, gemmData, static_cast<void*>(stream));
 
@@ -327,6 +337,10 @@ std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(
   gemmData.mProblemDimensions.mWorldSize = 1;
   gemmData.mProblemDimensions.mMaxNumCtasInTokenDim = maxNumCtasInBatchDim;
 
+  gemmData.mProblemDimensions.mValidM = gemmData.mProblemDimensions.mM;
+  gemmData.mProblemDimensions.mValidN = gemmData.mProblemDimensions.mN;
+  gemmData.mProblemDimensions.mValidK = gemmData.mProblemDimensions.mK;
+
   auto cmpFunc = [&configs, &gemmData, &bmm, &multiProcessorCount](int64_t idx0, int64_t idx1) {
     auto const& optionsA = configs[idx0].mOptions;
     auto const& optionsB = configs[idx1].mOptions;
@@ -387,8 +401,7 @@ std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(
   // Filter out invalid configs.
   std::vector<int64_t> validConfigIndices;
   for (auto const& configIndex : prioritizedIndices) {
-    auto const& config = configs[configIndex];
-    auto isValidConfig = bmm.isValidConfig(config, gemmData);
+    auto isValidConfig = bmm.isValidConfig(configs[configIndex], gemmData);
     if (isValidConfig) {
       validConfigIndices.push_back(configIndex);
     }
@@ -435,7 +448,9 @@ bool TrtllmGenBatchedGemmRunner::isValidConfigIndex(int32_t configIndex, int32_t
 
   auto const& config = configs[configIndex];
 
-  return bmm.isValidConfig(config, gemmData);
+  // FIXME: temporarily disable split-k as renormalize routing plus expert number 256 failed in
+  // trtllm-gen ac83afb
+  return bmm.isValidConfig(config, gemmData) && config.mOptions.mClusterDimZ == 1;
 }
 
 }  // namespace kernels

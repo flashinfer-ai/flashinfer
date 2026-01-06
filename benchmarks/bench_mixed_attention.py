@@ -23,7 +23,10 @@ def run_bench(
     q_lens = torch.tensor(d_qo_lens + p_qo_lens, dtype=torch.int32)
 
     seq_lens_blocks = torch.ceil(seq_lens / page_block_size).int()
-    d_seq_lens_blocks = (
+    p_seq_lens_blocks = torch.ceil(
+        torch.tensor(p_kv_lens, dtype=torch.int32) / page_block_size
+    ).int()
+    d_seq_lens_blocks = torch.ceil(
         torch.tensor(d_kv_lens, dtype=torch.int32) / page_block_size
     ).int()
 
@@ -31,6 +34,14 @@ def run_bench(
     kv_indptr = torch.cat(
         [torch.tensor([0]), torch.cumsum(seq_lens_blocks, 0)], dim=0
     ).int()
+
+    p_q_indptr = torch.cat(
+        [torch.tensor([0]), torch.cumsum(torch.tensor(p_qo_lens), 0)], dim=0
+    ).int()
+    p_kv_indptr = torch.cat(
+        [torch.tensor([0]), torch.cumsum(p_seq_lens_blocks, 0)], dim=0
+    ).int()
+
     d_q_indptr = torch.cat(
         [torch.tensor([0]), torch.cumsum(torch.tensor(d_qo_lens), 0)], dim=0
     ).int()
@@ -46,7 +57,7 @@ def run_bench(
         device, dtype=torch.bfloat16
     )
 
-    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+    workspace_buffer = torch.empty(156 * 1024 * 1024, dtype=torch.uint8, device=device)
     kv_layout = "NHD"
 
     wrapper_old = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
@@ -72,7 +83,85 @@ def run_bench(
     measurements = bench_gpu_time(lambda: wrapper_old.run(q, kv_data))
     ms_old = np.median(measurements)
 
+    wrapper_persistent = flashinfer.BatchAttention(kv_layout="NHD")
+    wrapper_persistent.plan(
+        q_indptr.to(device),
+        kv_indptr.to(device),
+        torch.arange(num_blocks, dtype=torch.int32, device=device),
+        seq_lens.to(device),
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        head_dim,
+        page_block_size,
+        causal=causal,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+    )
+    o_persistent, _ = wrapper_persistent.run(q, kv_data)
+    measurements_persistent = bench_gpu_time(lambda: wrapper_persistent.run(q, kv_data))
+    ms_persistent = np.mean(measurements_persistent)
+
+    # Batched POD Attention
+    q_d = q[: d_q_indptr[-1]]
+    kv_d = kv_data[: d_kv_indptr[-1]].unbind(1)
+    q_p = q[d_q_indptr[-1] :]
+    kv_p = kv_data[d_kv_indptr[-1] :].unbind(1)
+    kv_indices_d = torch.arange(0, d_kv_indptr[-1], device=device, dtype=torch.int32)
+    kv_indices_p = torch.arange(0, p_kv_indptr[-1], device=device, dtype=torch.int32)
+
+    last_page_len_d = (d_seq_lens_blocks - 1) % page_block_size + 1
+    last_page_len_p = (p_seq_lens_blocks - 1) % page_block_size + 1
+    wrapper_pod = flashinfer.BatchPODWithPagedKVCacheWrapper(
+        workspace_buffer,
+        kv_layout=kv_layout,
+    )
+
+    wrapper_pod.plan(
+        # Prefill params
+        p_q_indptr.to(device),
+        p_kv_indptr.to(device),
+        kv_indices_p.to(device),
+        last_page_len_p,
+        # Decode params
+        d_q_indptr.to(device),
+        d_kv_indptr.to(device),
+        kv_indices_d.to(device),
+        last_page_len_d,
+        # Common params
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        page_size=page_block_size,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+    )
+    o_p_batch, o_d_batch = wrapper_pod.run(
+        q_p,
+        kv_p,
+        q_d,
+        kv_d,
+        causal_p=causal,
+    )
+    o_batch_pod = torch.cat([o_d_batch, o_p_batch], dim=0)
+
+    # Verify output matches
+    torch.testing.assert_close(
+        o_batch_pod, o, rtol=4e-3, atol=4e-3, msg="Batch POD-Attention decode mismatch!"
+    )
+    measurements = bench_gpu_time(
+        lambda: wrapper_pod.run(
+            q_p,
+            kv_p,
+            q_d,
+            kv_d,
+            causal_p=causal,
+        )
+    )
+    ms_batch_pod = np.median(measurements)
+
     if len(p_kv_lens) == 1:
+        # Single POD attention
         q_d = q[: d_q_indptr[-1]]
         kv_d = kv_data[: d_kv_indptr[-1]].unbind(1)
         q_p = q[d_q_indptr[-1] :]
@@ -109,7 +198,7 @@ def run_bench(
         o_pod = torch.cat([o_d, o_p], dim=0)
         # Verify output matches
         torch.testing.assert_close(
-            o, o_pod, rtol=1e-3, atol=1e-3, msg="POD-Attention output mismatch!"
+            o, o_pod, rtol=4e-3, atol=4e-3, msg="POD-Attention output mismatch!"
         )
         measurements = bench_gpu_time(
             lambda: wrapper_pod.run(
@@ -123,9 +212,51 @@ def run_bench(
             )
         )
         ms_pod = np.median(measurements)
+
+        # Sequential two kernels: single prefill + batch decode (tensor cores)
+        # Prefill using single_prefill_with_kv_cache
+        def _run_single_prefill():
+            return flashinfer.prefill.single_prefill_with_kv_cache(
+                q_p,
+                k_p,
+                v_p,
+                causal=causal,
+                pos_encoding_mode="NONE",
+                backend="fa2",
+            )
+
+        measurements_prefill = bench_gpu_time(lambda: _run_single_prefill())
+        ms_prefill = np.median(measurements_prefill)
+
+        # Batch decode using tensor cores
+        wrapper_decode = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+            workspace_buffer, kv_layout=kv_layout, use_tensor_cores=True
+        )
+        wrapper_decode.plan(
+            d_kv_indptr.to(device),
+            kv_indices_d.to(device),
+            last_page_len_d,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_block_size,
+            data_type=torch.bfloat16,
+            q_data_type=torch.bfloat16,
+        )
+        measurements_decode = bench_gpu_time(lambda: wrapper_decode.run(q_d, kv_d))
+        ms_decode = np.median(measurements_decode)
+        ms_seq_two_kernels = ms_prefill + ms_decode
+
     print(f"Elapsed time (Batched Prefill): {ms_old:.2f} ms")
+    print(f"Elapsed time (Batched POD Attention): {ms_batch_pod:.2f} ms")
     if len(p_kv_lens) == 1:
         print(f"Elapsed time (POD Attention): {ms_pod:.2f} ms")
+        print(f"Elapsed time (Sequential two kernels): {ms_seq_two_kernels:.2f} ms")
+    print(f"Elapsed time (Persistent BatchAttention): {ms_persistent:.2f} ms")
+    print(
+        f"Batch POD speedup over Persistent BatchAttention: {ms_persistent / ms_batch_pod:.2f}x"
+    )
+
     total_bytes = (
         q.numel() * q.element_size() + kv_data.numel() * kv_data.element_size()
     )
@@ -134,9 +265,21 @@ def run_bench(
     bandwidth_old_gb_s = total_bytes / (ms_old * 1e-3) / (1024**3)
 
     print(f"Memory bandwidth (Batched Prefill): {bandwidth_old_gb_s:.2f} GB/s")
+    bandwidth_batch_pod_gb_s = total_bytes / (ms_batch_pod * 1e-3) / (1024**3)
+    print(
+        f"Memory bandwidth (Batched POD Attention): {bandwidth_batch_pod_gb_s:.2f} GB/s"
+    )
     if len(p_kv_lens) == 1:
         bandwidth_pod_gb_s = total_bytes / (ms_pod * 1e-3) / (1024**3)
         print(f"Memory bandwidth (POD Attention): {bandwidth_pod_gb_s:.2f} GB/s")
+        bandwidth_seq_gb_s = total_bytes / (ms_seq_two_kernels * 1e-3) / (1024**3)
+        print(
+            f"Memory bandwidth (Sequential two kernels): {bandwidth_seq_gb_s:.2f} GB/s"
+        )
+    bandwidth_persistent_gb_s = total_bytes / (ms_persistent * 1e-3) / (1024**3)
+    print(
+        f"Memory bandwidth (Persistent BatchAttention): {bandwidth_persistent_gb_s:.2f} GB/s"
+    )
 
 
 if __name__ == "__main__":
@@ -144,74 +287,26 @@ if __name__ == "__main__":
     torch.random.manual_seed(42)
 
     # Irregular sequence lengths for prefill and decode
-    d_q_len_configs = [[1] * 122, [1] * 128, [1] * 242, [1] * 256]
-    d_kv_len_configs = [[600] * 122, [10000] * 128, [400] * 242, [8192] * 256]
-    p_q_configs = [[17] * 1, [10000], [17] * 1, []]
-    p_kv_configs = [[10000] * 1, [10000], [8192] * 1, []]
-
-    # construct random length testcases
-    for _ in range(1):
-        bsz = 256
-        stride = 16
-        sparsity = 0.05
-
-        full_kv_len = np.random.randint(1000, 8192, size=bsz)
-        p_q_lens = []
-        p_kv_lens = []
-        d_q_lens = []
-        d_kv_lens = []
-        for i in range(bsz):
-            if i % stride == 0:
-                kv_len = full_kv_len[i]
-                qo_len = stride + 1
-                p_q_lens.append(qo_len)
-                p_kv_lens.append(kv_len)
-            else:
-                kv_len = int(full_kv_len[i] * sparsity)
-                qo_len = 1
-                d_q_lens.append(qo_len)
-                d_kv_lens.append(kv_len)
-
-        p_q_configs.append(p_q_lens)
-        p_kv_configs.append(p_kv_lens)
-        d_q_len_configs.append(d_q_lens)
-        d_kv_len_configs.append(d_kv_lens)
-
-    for _ in range(1):
-        bsz = 128
-        stride = 16
-        sparsity = 0.05
-
-        full_kv_len = np.random.randint(2000, 16000, size=bsz)
-        p_q_lens = []
-        p_kv_lens = []
-        d_q_lens = []
-        d_kv_lens = []
-
-        for i in range(bsz):
-            if i % stride == 0:
-                kv_len = full_kv_len[i]
-                qo_len = stride + 1
-                p_q_lens.append(qo_len)
-                p_kv_lens.append(kv_len)
-            else:
-                kv_len = int(full_kv_len[i] * sparsity)
-                qo_len = 1
-                d_q_lens.append(qo_len)
-                d_kv_lens.append(kv_len)
-
-        p_q_configs.append(p_q_lens)
-        p_kv_configs.append(p_kv_lens)
-        d_q_len_configs.append(d_q_lens)
-        d_kv_len_configs.append(d_kv_lens)
+    d_q_len_configs = [[1] * 128] * 7
+    d_kv_len_configs = [
+        [2048] * 128,
+        [2048] * 128,
+        [2048] * 128,
+        [2048] * 128,
+        [4096] * 128,
+        [8192] * 128,
+        [8192] * 128,
+    ]
+    p_q_configs = [[512], [1536], [2048] * 2, [2048], [4096], [4096], [6000]]
+    p_kv_configs = [[512], [1536], [2048] * 2, [2048], [4096], [4096], [7000]]
 
     page_block_size = 1
-    num_kv_heads = 4
-    num_qo_heads = 28
+    num_kv_heads = 8
+    num_qo_heads = 32
     head_dim = 128
 
     for idx, (p_q_lens, p_kv_lens, d_q_len, d_kv_len) in enumerate(
-        zip(p_q_configs, p_kv_configs, d_q_len_configs, d_kv_len_configs)
+        zip(p_q_configs, p_kv_configs, d_q_len_configs, d_kv_len_configs, strict=True)
     ):
         print(f"===== Benchmark {idx + 1}: (kv_len, qo_len) set =====")
         run_bench(

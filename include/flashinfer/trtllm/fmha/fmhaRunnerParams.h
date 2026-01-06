@@ -232,6 +232,11 @@ struct TllmGenFmhaRunnerParams {
   // The output scaling factor buffer.
   void* oSfPtr;
 
+  // The stride between different tokens for Q.
+  int qStrideTokens;
+  // The stride between different heads for Q.
+  int qStrideHeads;
+
   // The stride between different keys.
   int kStrideKeysValues;
   // The stride between different heads for K.
@@ -287,6 +292,10 @@ struct TllmGenFmhaRunnerParams {
   float mScaleSfKv;
   // The SF scale for output.
   float mScaleSfO;
+  // Whether to use sparse MLA.
+  bool mSparseMla;
+  // The top k value for sparse MLA.
+  int mSparseMlaTopK;
   // The cuda stream.
   cudaStream_t stream;
   // Whether to enable PDL (Programmatic Dependent Launch).

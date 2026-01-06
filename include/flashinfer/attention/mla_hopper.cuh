@@ -455,7 +455,8 @@ __device__ __forceinline__ void write_o(typename KTraits::SharedStorage* smem_st
                                         float* partial_lse, float(*o_frag), float* m, float* d,
                                         const uint32_t o_stride_n, const uint32_t o_stride_h,
                                         const uint32_t q_len, const uint32_t packed_offset,
-                                        const uint_fastdiv& num_heads) {
+                                        const uint_fastdiv& num_heads,
+                                        const bool& return_lse_base_on_e) {
   using DTypeO = typename KTraits::DTypeO;
   constexpr uint32_t NUM_MMA_D_CKV = KTraits::NUM_MMA_D_CKV;
   constexpr uint32_t HEAD_DIM_CKV = KTraits::HEAD_DIM_CKV;
@@ -543,6 +544,9 @@ __device__ __forceinline__ void write_o(typename KTraits::SharedStorage* smem_st
           num_heads.divmod(packed_offset + warp_idx_in_wg * 16 + 8 * j + lane_idx / 4, q, r);
           if (lane_idx % 4 == 0 && q < q_len) {
             final_lse[q * num_heads + r] = math::ptx_log2(d[j]) + float(m[j]);
+            if (return_lse_base_on_e) {
+              final_lse[q * num_heads + r] *= math::loge2;
+            }
           }
         }
       }
@@ -796,7 +800,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
           final_lse ? final_lse + q_indptr * num_heads : nullptr,
           (partial_indptr == -1) ? nullptr : partial_o + partial_indptr * KTraits::HEAD_DIM_CKV,
           (partial_indptr == -1) ? nullptr : partial_lse + partial_indptr, o_frag, m, d, o_stride_n,
-          o_stride_h, qo_upperbound, qo_packed_idx_base, num_heads);
+          o_stride_h, qo_upperbound, qo_packed_idx_base, num_heads, params.return_lse_base_on_e);
       PROFILER_EVENT_END(variant, ProfileEventType::kWriteO);
       __syncthreads();
     }
@@ -936,7 +940,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
           final_lse ? final_lse + q_indptr * num_heads : nullptr,
           (partial_indptr == -1) ? nullptr : partial_o + partial_indptr * KTraits::HEAD_DIM_CKV,
           (partial_indptr == -1) ? nullptr : partial_lse + partial_indptr, o_frag, m, d, o_stride_n,
-          o_stride_h, qo_upperbound, qo_packed_idx_base, num_heads);
+          o_stride_h, qo_upperbound, qo_packed_idx_base, num_heads, params.return_lse_base_on_e);
       PROFILER_EVENT_END(variant, ProfileEventType::kWriteO);
       __syncthreads();
     }
@@ -953,7 +957,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
       params.merge_packed_offset_start, params.merge_packed_offset_end,
       params.merge_partial_packed_offset_start, params.merge_partial_packed_offset_end,
       params.merge_partial_stride, partial_o, partial_lse, final_o, final_lse, o_stride_n,
-      o_stride_h, num_heads);
+      o_stride_h, num_heads, params.return_lse_base_on_e);
 
   PROFILER_EVENT_END(variant, ProfileEventType::kSplitK);
 }

@@ -42,7 +42,7 @@ void single_prefill_with_kv_cache_sm90(ffi::TensorView q, ffi::TensorView k, ffi
   unsigned int qo_len = q.size(0);
 
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
-  cudaSetDevice(q.device().device_id);
+  ffi::CUDADeviceGuard device_guard(q.device().device_id);
   const cudaStream_t stream = get_stream(q.device());
   const MaskMode mask_mode = static_cast<MaskMode>(mask_mode_code);
 

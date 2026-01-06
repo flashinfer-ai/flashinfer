@@ -42,6 +42,7 @@ from .attention import (
     gen_customize_single_prefill_module as gen_customize_single_prefill_module,
 )
 from .attention import gen_fmha_cutlass_sm100a_module as gen_fmha_cutlass_sm100a_module
+from .attention import gen_batch_pod_module as gen_batch_pod_module
 from .attention import gen_pod_module as gen_pod_module
 from .attention import gen_single_decode_module as gen_single_decode_module
 from .attention import gen_single_prefill_module as gen_single_prefill_module
@@ -54,6 +55,7 @@ from .attention import get_pod_uri as get_pod_uri
 from .attention import get_single_decode_uri as get_single_decode_uri
 from .attention import get_single_prefill_uri as get_single_prefill_uri
 from .attention import gen_trtllm_gen_fmha_module as gen_trtllm_gen_fmha_module
+from .attention import get_trtllm_fmha_v2_module as get_trtllm_fmha_v2_module
 from .core import JitSpec as JitSpec
 from .core import JitSpecStatus as JitSpecStatus
 from .core import JitSpecRegistry as JitSpecRegistry
@@ -76,6 +78,13 @@ from .comm import gen_trtllm_mnnvl_comm_module as gen_trtllm_mnnvl_comm_module
 from .comm import gen_trtllm_comm_module as gen_trtllm_comm_module
 from .comm import gen_vllm_comm_module as gen_vllm_comm_module
 from .comm import gen_nvshmem_module as gen_nvshmem_module
+from .comm import gen_moe_alltoall_module as gen_moe_alltoall_module
+from .dsv3_optimizations import (
+    gen_dsv3_router_gemm_module as gen_dsv3_router_gemm_module,
+)
+from .dsv3_optimizations import (
+    gen_dsv3_fused_routing_module as gen_dsv3_fused_routing_module,
+)
 
 
 cuda_lib_path = os.environ.get(

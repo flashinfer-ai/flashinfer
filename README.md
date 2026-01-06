@@ -69,11 +69,20 @@ High-Performance GPU Kernels for LLM Inference
 
 ### Installation
 
+**Quickstart:**
+
 ```bash
 pip install flashinfer-python
 ```
 
-For faster initialization with pre-compiled kernels:
+**Package Options:**
+
+- **flashinfer-python**: Core package that compiles/downloads kernels on first use
+- **flashinfer-cubin**: Pre-compiled kernel binaries for all supported GPU architectures
+- **flashinfer-jit-cache**: Pre-built kernel cache for specific CUDA versions
+
+**For faster initialization and offline usage**, install the optional packages to have most kernels pre-compiled:
+
 ```bash
 pip install flashinfer-python flashinfer-cubin
 # JIT cache (replace cu129 with your CUDA version)
@@ -135,7 +144,8 @@ cd flashinfer
 python -m pip install -v .
 ```
 
-For development:
+**For development**, install in editable mode:
+
 ```bash
 python -m pip install --no-build-isolation -e . -v
 ```
@@ -169,13 +179,57 @@ pip install -U --pre flashinfer-cubin --index-url https://flashinfer.ai/whl/nigh
 pip install -U --pre flashinfer-jit-cache --index-url https://flashinfer.ai/whl/nightly/cu129
 ```
 
+### CLI Tools
+
+FlashInfer provides several CLI commands for configuration, module management, and development:
+
+```bash
+# Verify installation and view configuration
+flashinfer show-config
+
+# List and inspect modules
+flashinfer list-modules
+flashinfer module-status
+
+# Manage artifacts and cache
+flashinfer download-cubin
+flashinfer clear-cache
+
+# For developers: generate compile_commands.json for IDE integration
+flashinfer export-compile-commands [output_path]
+```
+
+For complete documentation, see the [CLI reference](https://docs.flashinfer.ai/cli.html).
+
+## API Logging
+
+FlashInfer provides comprehensive API logging for debugging. Enable it using environment variables:
+
+```bash
+# Enable logging (levels: 0=off (default), 1=basic, 3=detailed, 5=statistics)
+export FLASHINFER_LOGLEVEL=3
+
+# Set log destination (stdout (default), stderr, or file path)
+export FLASHINFER_LOGDEST=stdout
+```
+
+For detailed information about logging levels, configuration, and advanced features, see [Logging](https://docs.flashinfer.ai/logging.html) in our documentation.
+
 ## Custom Attention Variants
 
-FlashInfer supports custom attention variants through JIT compilation. For details, see our [JIT examples](https://github.com/flashinfer-ai/flashinfer/blob/main/tests/utils/test_jit_example.py).
+Starting from FlashInfer v0.2, users can customize their own attention variants with additional parameters. For more details, refer to our [JIT examples](https://github.com/flashinfer-ai/flashinfer/blob/main/tests/utils/test_jit_example.py).
+
+## GPU and CUDA Support
+
+FlashInfer currently provides support for NVIDIA SM architectures 75 and higher and beta support for 103, 110, 120, and 121.
+
+**Supported CUDA Versions:** 12.6, 12.8, 13.0, 13.1
+
+> **Note:** FlashInfer strives to follow PyTorch's supported CUDA versions plus the latest CUDA release.
 
 ## Adoption
 
-FlashInfer powers LLM inference in leading projects:
+FlashInfer powers LLM inference in:
 
 - [SGLang](https://github.com/sgl-project/sglang)
 - [vLLM](https://github.com/vllm-project/vllm)

@@ -19,8 +19,8 @@ from typing import Optional, Tuple, Union
 
 import torch
 
+from .api_logging import flashinfer_api
 from .decode import get_batch_decode_module
-from .page import block_sparse_indices_to_vector_sparse_offsets
 from .prefill import _compute_page_mask_indptr, get_batch_prefill_module
 from .quantization import segment_packbits
 from .utils import (
@@ -107,6 +107,7 @@ class BlockSparseAttentionWrapper:
     True
     """
 
+    @flashinfer_api
     def __init__(
         self,
         float_workspace_buffer: torch.Tensor,
@@ -133,16 +134,6 @@ class BlockSparseAttentionWrapper:
         self._int_workspace_buffer = torch.empty(
             (8 * 1024 * 1024,), dtype=torch.uint8, device=self.device
         )
-        if backend in ["fa3", "auto"]:
-            # NOTE(Zihao): assume maximum accumulate kv length is 128M
-            # NOTE(Yilong): 128M is required by video DiT models
-            self._vector_sparse_indices_buffer = torch.empty(
-                (128 * 1024 * 1024,), dtype=torch.int32, device=self.device
-            )
-            # NOTE(Zihao): assume maximum batch size is 32768
-            self._vector_sparse_indptr_buffer = torch.empty(
-                (32768,), dtype=torch.int32, device=self.device
-            )
 
         self._kv_lens_buffer = torch.empty(
             (32768,), dtype=torch.int32, device=self.device
@@ -171,8 +162,6 @@ class BlockSparseAttentionWrapper:
         self,
         float_workspace_buffer: torch.Tensor,
         int_workspace_buffer: torch.Tensor,
-        vector_sparse_indices_buffer: Optional[torch.Tensor] = None,
-        vector_sparse_indptr_buffer: Optional[torch.Tensor] = None,
     ) -> None:
         r"""Reset the workspace buffer.
 
@@ -197,12 +186,7 @@ class BlockSparseAttentionWrapper:
             pin_memory=True,
         )
 
-        # Enable user-defined size
-        if vector_sparse_indices_buffer is not None:
-            self._vector_sparse_indices_buffer = vector_sparse_indices_buffer
-        if vector_sparse_indptr_buffer is not None:
-            self._vector_sparse_indptr_buffer = vector_sparse_indptr_buffer
-
+    @flashinfer_api
     def plan(
         self,
         indptr: torch.Tensor,
@@ -438,20 +422,6 @@ class BlockSparseAttentionWrapper:
                 kv_lens_arr_host,
             )
 
-            if self._backend == "fa3":
-                if self.C != 1:
-                    vector_sparse_indptr_host = torch.cat(
-                        [
-                            torch.tensor([0], dtype=torch.int32),
-                            torch.cumsum(kv_lens_arr_host, dim=0, dtype=torch.int32),
-                        ],
-                        dim=0,
-                    )
-                    self._vector_sparse_indptr_buffer[
-                        : len(vector_sparse_indptr_host)
-                    ].copy_(vector_sparse_indptr_host, non_blocking=non_blocking)
-                    kv_indptr_host = vector_sparse_indptr_host
-
             args = [
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
@@ -473,6 +443,7 @@ class BlockSparseAttentionWrapper:
             if self._backend == "fa2":
                 args.append(-1)  # fixed_split_size
                 args.append(False)  # disable_split_kv
+                args.append(0)  # num_colocated_ctas
             self._plan_info = self._cached_module.plan(
                 *args,
             )
@@ -510,6 +481,7 @@ class BlockSparseAttentionWrapper:
         self._rope_theta = rope_theta
         return self.run(q, k, v, scale_q, scale_k, scale_v)
 
+    @flashinfer_api
     def run(
         self,
         q: torch.Tensor,
@@ -581,9 +553,6 @@ class BlockSparseAttentionWrapper:
         k = k.reshape(-1, self.C, *k.shape[-2:])
         v = v.reshape(-1, self.C, *v.shape[-2:])
 
-        stride_block = k.stride(0)
-        stride_n = k.stride(1)
-
         if return_lse:
             if lse is None:
                 lse = torch.empty(
@@ -612,30 +581,6 @@ class BlockSparseAttentionWrapper:
                 scale_v = torch.ones(v.shape[1], dtype=torch.float32, device=q.device)
 
         if self._use_tensor_cores:
-            if self._backend == "fa3":
-                if (
-                    self._vector_sparse_indices_buffer.numel()
-                    <= self._paged_kv_indices_buf.numel() * self.C
-                ):
-                    raise ValueError(
-                        "_vector_sparse_indices_buffer is not large enough. Please increase the size."
-                    )
-
-                sparse_indices = block_sparse_indices_to_vector_sparse_offsets(
-                    self._paged_kv_indices_buf,
-                    self._paged_kv_indptr_buf,
-                    self._vector_sparse_indices_buffer,  # output
-                    self._vector_sparse_indptr_buffer,
-                    self._kv_lens_buffer,
-                    stride_block // stride_n,
-                    1,  # stride_n // stride_n
-                    self.C,  # block_size
-                )
-                sparse_indptr = self._vector_sparse_indptr_buffer
-            else:
-                sparse_indices = self._paged_kv_indices_buf
-                sparse_indptr = self._paged_kv_indptr_buf
-
             self._cached_module.paged_run(
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
@@ -644,8 +589,8 @@ class BlockSparseAttentionWrapper:
                 k,
                 v,
                 self._qo_indptr,
-                sparse_indptr,
-                sparse_indices,
+                self._paged_kv_indptr_buf,
+                self._paged_kv_indices_buf,
                 self._paged_kv_last_page_len,
                 out,
                 lse,
@@ -734,6 +679,7 @@ class VariableBlockSparseAttentionWrapper:
     >>> o = wrapper.run(q, k, v)
     """
 
+    @flashinfer_api
     def __init__(
         self,
         float_workspace_buffer: torch.Tensor,
@@ -760,13 +706,6 @@ class VariableBlockSparseAttentionWrapper:
         self._int_workspace_buffer = torch.empty(
             (8 * 1024 * 1024,), dtype=torch.uint8, device=self.device
         )
-        if backend in ["fa3", "auto"]:
-            self._vector_sparse_indices_buffer = torch.empty(
-                (128 * 1024 * 1024,), dtype=torch.int32, device=self.device
-            )
-            self._vector_sparse_indptr_buffer = torch.empty(
-                (32768,), dtype=torch.int32, device=self.device
-            )
 
         self._kv_lens_buffer = torch.empty(
             (32768,), dtype=torch.int32, device=self.device
@@ -789,8 +728,6 @@ class VariableBlockSparseAttentionWrapper:
         self,
         float_workspace_buffer: torch.Tensor,
         int_workspace_buffer: torch.Tensor,
-        vector_sparse_indices_buffer: Optional[torch.Tensor] = None,
-        vector_sparse_indptr_buffer: Optional[torch.Tensor] = None,
     ) -> None:
         r"""Reset the workspace buffer.
 
@@ -815,12 +752,7 @@ class VariableBlockSparseAttentionWrapper:
             pin_memory=True,
         )
 
-        # Enable user-defined size
-        if vector_sparse_indices_buffer is not None:
-            self._vector_sparse_indices_buffer = vector_sparse_indices_buffer
-        if vector_sparse_indptr_buffer is not None:
-            self._vector_sparse_indptr_buffer = vector_sparse_indptr_buffer
-
+    @flashinfer_api
     def plan(
         self,
         block_mask_map: torch.Tensor,
@@ -1033,14 +965,6 @@ class VariableBlockSparseAttentionWrapper:
             kv_lens_arr_host,
         )
 
-        if self._backend == "fa3":
-            if self._vector_sparse_indptr_buffer.numel() <= kv_indptr.numel():
-                raise ValueError(
-                    "_vector_sparse_indptr_buffer is not large enough. Please increase the buffer size."
-                )
-            self._vector_sparse_indptr_buffer[: len(kv_indptr)].copy_(
-                kv_indptr, non_blocking=non_blocking
-            )
         args = [
             self._float_workspace_buffer,
             self._int_workspace_buffer,
@@ -1062,6 +986,7 @@ class VariableBlockSparseAttentionWrapper:
         if self._backend == "fa2":
             args.append(-1)  # fixed_split_size
             args.append(False)  # disable_split_kv
+            args.append(0)  # num_colocated_ctas
         self._plan_info = self._cached_module.plan(
             *args,
         )
@@ -1096,6 +1021,7 @@ class VariableBlockSparseAttentionWrapper:
         self._rope_theta = rope_theta
         return self.run(q, k, v)
 
+    @flashinfer_api
     def run(
         self,
         q: torch.Tensor,
@@ -1174,9 +1100,6 @@ class VariableBlockSparseAttentionWrapper:
             "num_kv_heads kv_len head_dim -> (num_kv_heads kv_len) 1 1 head_dim",
         ).contiguous()
 
-        stride_block = k.stride(0)
-        stride_n = k.stride(1)
-
         if return_lse:
             if lse is None:
                 lse = torch.empty(
@@ -1192,30 +1115,6 @@ class VariableBlockSparseAttentionWrapper:
         else:
             check_shape_dtype_device(out, q.shape, self._o_dtype, q.device, "out")
 
-        if self._backend == "fa3":
-            if (
-                self._vector_sparse_indices_buffer.numel()
-                <= self._paged_kv_indices_buf.numel()
-            ):
-                raise ValueError(
-                    "_vector_sparse_indices_buffer is not large enough. Please increase the buffer size."
-                )
-
-            sparse_indices = block_sparse_indices_to_vector_sparse_offsets(
-                self._paged_kv_indices_buf,
-                self._paged_kv_indptr_buf,
-                self._vector_sparse_indices_buffer,  # output
-                self._vector_sparse_indptr_buffer,
-                self._kv_lens_buffer,
-                stride_block // stride_n,
-                1,  # stride_n // stride_n
-                1,  # block_size
-            )
-            sparse_indptr = self._vector_sparse_indptr_buffer
-        else:
-            sparse_indices = self._paged_kv_indices_buf
-            sparse_indptr = self._paged_kv_indptr_buf
-
         self._cached_module.paged_run(
             self._float_workspace_buffer,
             self._int_workspace_buffer,
@@ -1224,8 +1123,8 @@ class VariableBlockSparseAttentionWrapper:
             k,
             v,
             self._qo_indptr,
-            sparse_indptr,
-            sparse_indices,
+            self._paged_kv_indptr_buf,
+            self._paged_kv_indices_buf,
             self._paged_kv_last_page_len,
             out,
             lse,

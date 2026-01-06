@@ -18,7 +18,13 @@ from typing import List
 
 from . import env as jit_env
 from ..artifacts import ArtifactPath, CheckSumHash
-from .core import JitSpec, gen_jit_spec, current_compilation_context, sm90a_nvcc_flags
+from .core import (
+    JitSpec,
+    gen_jit_spec,
+    current_compilation_context,
+    sm90a_nvcc_flags,
+    sm89_nvcc_flags,
+)
 from .cpp_ext import is_cuda_version_at_least
 from .cubin_loader import get_cubin, get_meta_hash
 from .gemm.cutlass.generate_kernels import generate_gemm_operations
@@ -39,6 +45,24 @@ def gen_cutlass_fused_moe_sm120_module(use_fast_build: bool = False) -> JitSpec:
     )
 
     return gen_cutlass_fused_moe_module(nvcc_flags, "120", use_fast_build)
+
+
+def gen_cutlass_fused_moe_sm103_module(use_fast_build: bool = False) -> JitSpec:
+    nvcc_flags = [
+        "-DCOMPILE_BLACKWELL_TMA_GEMMS",
+        "-DCOMPILE_BLACKWELL_TMA_GROUPED_GEMMS",
+        "-DENABLE_BF16",
+        "-DENABLE_FP8",
+        "-DENABLE_FP4",
+        "-DUSING_OSS_CUTLASS_MOE_GEMM",
+        "-DCOMPILE_BLACKWELL_SM103_TMA_GROUPED_GEMMS",
+    ]
+
+    nvcc_flags += current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[10]
+    )
+
+    return gen_cutlass_fused_moe_module(nvcc_flags, "103", use_fast_build)
 
 
 def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool = False) -> JitSpec:
@@ -69,6 +93,16 @@ def gen_cutlass_fused_moe_sm90_module(use_fast_build: bool = False) -> JitSpec:
         "-DUSING_OSS_CUTLASS_MOE_GEMM",
     ]
     return gen_cutlass_fused_moe_module(nvcc_flags, "90", use_fast_build)
+
+
+def gen_cutlass_fused_moe_sm89_module(use_fast_build: bool = False) -> JitSpec:
+    nvcc_flags = sm89_nvcc_flags + [
+        "-DENABLE_BF16",
+        "-DENABLE_FP8",
+        "-DENABLE_FP8_BLOCK_SCALE" if is_cuda_version_at_least("12.8") else "",
+        "-DUSING_OSS_CUTLASS_MOE_GEMM",
+    ]
+    return gen_cutlass_fused_moe_module(nvcc_flags, "89", use_fast_build)
 
 
 def gen_cutlass_fused_moe_module(
@@ -130,7 +164,9 @@ def gen_cutlass_fused_moe_module(
             jit_env.FLASHINFER_CSRC_DIR
             / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.cu",
             jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_sm100_binding.cu",
+            / "fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "fused_moe/cutlass_backend/deepgemm_jit_setup.cu",
             jit_env.FLASHINFER_CSRC_DIR
             / "fused_moe/cutlass_backend/cutlass_fused_moe_instantiation.cu",
             # Add all generated kernels
@@ -217,11 +253,12 @@ def gen_trtllm_gen_fused_moe_sm100_module() -> JitSpec:
         ],
         extra_cuda_cflags=[
             "-DTLLM_GEN_EXPORT_INTERFACE",
+            "-DTLLM_GEN_EXPORT_FLASHINFER",
             "-DTLLM_ENABLE_CUDA",
             "-DENABLE_BF16",
             "-DENABLE_FP8",
             "-DENABLE_FP4",
-            f'-DTLLM_GEN_BMM_CUBIN_PATH=\\"{ArtifactPath.TRTLLM_GEN_BMM}\\"',
+            f'-DTLLM_GEN_GEMM_CUBIN_PATH=\\"{ArtifactPath.TRTLLM_GEN_BMM}\\"',
         ]
         + nvcc_flags,
         extra_include_paths=[

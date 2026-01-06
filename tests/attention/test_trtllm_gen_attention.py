@@ -54,8 +54,13 @@ def generate_seq_lens_prefill(batch_size, max_q_len, max_in_kv_len):
     return q_lens, in_kv_lens, seq_lens
 
 
-def generate_seq_lens_decode(batch_size, q_len_per_req, max_in_kv_len):
-    q_lens = torch.full((batch_size,), q_len_per_req, dtype=torch.int32)
+def generate_seq_lens_decode(batch_size, q_len_per_req, max_in_kv_len, max_q_len):
+    if q_len_per_req is not None:
+        assert max_q_len is None, "Can not specify both q_len_per_req and max_q_len."
+        q_lens = torch.full((batch_size,), q_len_per_req, dtype=torch.int32)
+    else:
+        assert max_q_len is not None, "Must specify either q_len_per_req or max_q_len."
+        q_lens = torch.randint(1, max_q_len + 1, (batch_size,), dtype=torch.int32)
     in_kv_lens = torch.randint(0, max_in_kv_len + 1, (batch_size,), dtype=torch.int)
     in_kv_lens[-1] = max_in_kv_len
     seq_lens = q_lens + in_kv_lens
@@ -91,34 +96,62 @@ def create_query_tensor(q_lens, num_qo_heads, head_dim, q_dtype):
 
 
 def create_kv_cache(
-    batch_size, seq_lens, page_size, num_kv_heads, head_dim, kv_dtype, ref_kv_dtype
+    batch_size,
+    seq_lens,
+    page_size,
+    num_kv_heads,
+    head_dim,
+    kv_dtype,
+    ref_kv_dtype,
+    kv_layout="HND",
 ):
     # Create separate K and V caches
     max_seq_len = torch.max(seq_lens).item()
-    num_tokens = max_seq_len * batch_size
-    num_pages = (num_tokens + page_size - 1) // page_size
+    num_pages_per_seq = (max_seq_len + page_size - 1) // page_size
+    num_pages = num_pages_per_seq * batch_size
     ref_kv_dtype_torch = DTYPE_MAP[ref_kv_dtype]
     if kv_dtype != "fp8":  # for fp8, create with high precision to generate scale.
         assert kv_dtype == ref_kv_dtype, (
             "kv_dtype and ref_kv_dtype must be the same for non-fp8 kv_cache"
         )
 
-    k_cache = torch.randn(
-        num_pages,
-        num_kv_heads,
-        page_size,
-        head_dim,
-        dtype=ref_kv_dtype_torch,
-        device=GPU_DEVICE,
-    )
-    v_cache = torch.randn(
-        num_pages,
-        num_kv_heads,
-        page_size,
-        head_dim,
-        dtype=ref_kv_dtype_torch,
-        device=GPU_DEVICE,
-    )
+    # Create cache with appropriate layout
+    if kv_layout == "HND":
+        # HND layout: [num_pages, num_kv_heads, page_size, head_dim]
+        k_cache = torch.randn(
+            num_pages,
+            num_kv_heads,
+            page_size,
+            head_dim,
+            dtype=ref_kv_dtype_torch,
+            device=GPU_DEVICE,
+        )
+        v_cache = torch.randn(
+            num_pages,
+            num_kv_heads,
+            page_size,
+            head_dim,
+            dtype=ref_kv_dtype_torch,
+            device=GPU_DEVICE,
+        )
+    else:  # NHD layout
+        # NHD layout: [num_pages, page_size, num_kv_heads, head_dim]
+        k_cache = torch.randn(
+            num_pages,
+            page_size,
+            num_kv_heads,
+            head_dim,
+            dtype=ref_kv_dtype_torch,
+            device=GPU_DEVICE,
+        )
+        v_cache = torch.randn(
+            num_pages,
+            page_size,
+            num_kv_heads,
+            head_dim,
+            dtype=ref_kv_dtype_torch,
+            device=GPU_DEVICE,
+        )
 
     # Convert K and V separately to fp8 if needed
     if kv_dtype == "fp8":
@@ -173,6 +206,7 @@ def flatten_paged_kv(
     seq_lens: torch.Tensor,
     page_size: int,
     kv_last_page_len: torch.Tensor,
+    kv_layout: str = "HND",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build flat K/V and token-level indptr from paged KV cache and page table."""
     device = ref_kv_cache.device
@@ -192,11 +226,20 @@ def flatten_paged_kv(
             page_id = int(page_table_cpu[i, j].item())
             k_page = ref_kv_cache[page_id, 0]
             v_page = ref_kv_cache[page_id, 1]
-            if j == pages_i - 1:
-                k_page = k_page[:, :last_len_i, :]
-                v_page = v_page[:, :last_len_i, :]
-            k_list.append(einops.rearrange(k_page, "h p d -> p h d"))
-            v_list.append(einops.rearrange(v_page, "h p d -> p h d"))
+            if kv_layout == "HND":
+                # HND layout: [num_kv_heads, page_size, head_dim]
+                if j == pages_i - 1:
+                    k_page = k_page[:, :last_len_i, :]
+                    v_page = v_page[:, :last_len_i, :]
+                k_list.append(einops.rearrange(k_page, "h p d -> p h d"))
+                v_list.append(einops.rearrange(v_page, "h p d -> p h d"))
+            else:  # NHD layout
+                # NHD layout: [page_size, num_kv_heads, head_dim]
+                if j == pages_i - 1:
+                    k_page = k_page[:last_len_i, :, :]
+                    v_page = v_page[:last_len_i, :, :]
+                k_list.append(einops.rearrange(k_page, "p h d -> p h d"))
+                v_list.append(einops.rearrange(v_page, "p h d -> p h d"))
     k_flat = torch.cat(k_list, dim=0)
     v_flat = torch.cat(v_list, dim=0)
     kv_indptr_tokens = torch.cat(
@@ -301,39 +344,67 @@ def unpack_compare_nvfp4(
     return output_unpacked, output_ref
 
 
-@pytest.mark.parametrize("kv_layout", ["HND"])  # trtllm-gen only support HND
-@pytest.mark.parametrize(
-    "batch_size,page_size,num_kv_heads,head_grp_size",
-    [
-        (4, 16, 2, 1),
-        (4, 32, 4, 5),
-        (4, 64, 4, 8),
-        (128, 16, 2, 5),
-        (128, 32, 4, 1),
-        (128, 64, 2, 8),
-        (256, 16, 4, 8),
-        (256, 32, 2, 8),
-        (256, 64, 4, 1),
-        (256, 64, 4, 5),
-    ],
-)
-@pytest.mark.parametrize("window_left", [-1])  # todo(Siyuan): add 127 window_left
-@pytest.mark.parametrize(
-    "q_dtype,kv_dtype,o_dtype",
-    [
-        ("bf16", "bf16", "bf16"),
-        ("fp16", "fp16", "fp16"),
-        ("fp8", "fp8", "bf16"),
-        ("fp8", "fp8", "fp16"),
-        ("fp8", "fp8", "fp8"),
-        ("fp8", "fp8", "nvfp4"),
-    ],
-)
-@pytest.mark.parametrize("enable_pdl", [True, False, None])
-@pytest.mark.parametrize("enable_sink", [True, False])
-@pytest.mark.parametrize("max_q_len", [511])
-@pytest.mark.parametrize("max_kv_len", [2047])
-def test_trtllm_batch_prefill(
+def generate_causal_mask(
+    batch_size: int,
+    q_seq_len: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Generate causal attention mask for speculative decoding.
+
+    Parameters
+    ----------
+    batch_size : int
+        Batch size
+    q_seq_len : int
+        Query sequence length (number of speculative decoding tokens)
+    device : torch.device
+        Target device for the mask tensor
+
+    Returns
+    -------
+    torch.Tensor
+        Causal mask with shape [batch_size, q_seq_len, mask_size_per_row]
+        where mask_size_per_row = divUp(q_seq_len, 32) * 2 (in uint16_t units).
+        Data type: torch.uint16
+
+    """
+    num_packed_masks_per_token = (q_seq_len + 31) // 32
+
+    q_indices = torch.arange(q_seq_len, device=device, dtype=torch.int32).unsqueeze(1)
+    kv_indices = torch.arange(q_seq_len, device=device, dtype=torch.int32).unsqueeze(0)
+
+    causal_bool_mask = kv_indices <= q_indices
+
+    padded_seq_len = num_packed_masks_per_token * 32
+    if padded_seq_len > q_seq_len:
+        padding = torch.zeros(
+            q_seq_len, padded_seq_len - q_seq_len, device=device, dtype=torch.bool
+        )
+        causal_bool_mask = torch.cat([causal_bool_mask, padding], dim=1)
+
+    causal_bool_mask = causal_bool_mask.view(q_seq_len, num_packed_masks_per_token, 32)
+
+    bit_positions = torch.tensor(
+        [1 << i for i in range(32)], device=device, dtype=torch.int64
+    )
+
+    mask_uint32 = (
+        (causal_bool_mask.to(torch.int64) * bit_positions).sum(dim=-1).to(torch.uint32)
+    )
+
+    mask_uint32 = (
+        mask_uint32.unsqueeze(0)
+        .expand(batch_size, q_seq_len, num_packed_masks_per_token)
+        .contiguous()
+    )
+
+    mask_uint16 = mask_uint32.view(torch.uint16)
+
+    return mask_uint16
+
+
+def _test_trtllm_batch_prefill(
     kv_layout,
     batch_size,
     page_size,
@@ -347,13 +418,15 @@ def test_trtllm_batch_prefill(
     enable_sink,
     max_q_len,
     max_kv_len,
+    device_scale,
+    head_dim,
+    non_contiguous_query=False,
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
-    if compute_capability[0] in [11, 12]:
-        pytest.skip("trtllm-gen does not support SM110/SM120/SM121 GPUs.")
+    if compute_capability[0] != 10:
+        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
     # Set up test parameters
     torch.manual_seed(0)
-    head_dim = 128
 
     # Generate random sequence lengths
     num_qo_heads = num_kv_heads * head_grp_size
@@ -374,6 +447,7 @@ def test_trtllm_batch_prefill(
         head_dim,
         kv_dtype,
         "bf16" if q_dtype == "fp8" else q_dtype,
+        kv_layout,
     )
     page_table, all_page_ids, page_per_seq = create_page_table(
         batch_size, seq_lens, page_size
@@ -428,6 +502,7 @@ def test_trtllm_batch_prefill(
             seq_lens.to(GPU_DEVICE),
             page_size,
             kv_last_page_len,
+            kv_layout,
         )
         sink = torch.rand(num_qo_heads, device=GPU_DEVICE, dtype=torch.float32) * 5
         output_ref = sink_attention_unified(
@@ -445,16 +520,33 @@ def test_trtllm_batch_prefill(
         )
 
     # Run trtllm-gen function call
+    bmm1_scale = q_scale * k_scale * sm_scale
+    bmm2_scale = v_scale / o_scale
+    if isinstance(bmm1_scale, torch.Tensor) and not device_scale:
+        bmm1_scale = bmm1_scale.item()
+    elif not isinstance(bmm1_scale, torch.Tensor) and device_scale:
+        bmm1_scale = torch.tensor(bmm1_scale, device=GPU_DEVICE, dtype=torch.float32)
+    if isinstance(bmm2_scale, torch.Tensor) and not device_scale:
+        bmm2_scale = bmm2_scale.item()
+    elif not isinstance(bmm2_scale, torch.Tensor) and device_scale:
+        bmm2_scale = torch.tensor(bmm2_scale, device=GPU_DEVICE, dtype=torch.float32)
+
+    # Optionally make query non-contiguous for testing stride support
+    if non_contiguous_query:
+        q_input = make_query_non_contiguous(q, num_qo_heads, head_dim)
+    else:
+        q_input = q.contiguous()
+
     output = flashinfer.prefill.trtllm_batch_context_with_kv_cache(
-        q.contiguous(),
+        q_input,
         kv_cache,
         workspace_buffer,
         page_table,
         seq_lens.to(GPU_DEVICE),
         torch.max(q_lens).item(),
         torch.max(seq_lens).item(),
-        q_scale * k_scale * sm_scale,  # bmm1_scale
-        v_scale / o_scale,  # bmm2_scale
+        bmm1_scale,  # bmm1_scale
+        bmm2_scale,  # bmm2_scale
         batch_size,
         q_indptr,
         kv_indptr,
@@ -463,6 +555,7 @@ def test_trtllm_batch_prefill(
         out_dtype=out_dtype,
         o_sf_scale=o_sf_scale,
         o_sf_vec_size=o_sf_vec_size,
+        kv_layout=kv_layout,
         enable_pdl=enable_pdl,
         sinks=(sink if enable_sink else None),
     )
@@ -507,7 +600,7 @@ def test_trtllm_batch_prefill(
         plan_params["kv_data_type"] = kv_cache.dtype
         wrapper_trtllm_gen.plan(**plan_params)
         output_wrapper = wrapper_trtllm_gen.run(
-            q.contiguous(),
+            q_input,
             kv_cache,
             q_scale=q_scale,
             k_scale=k_scale,
@@ -527,7 +620,78 @@ def test_trtllm_batch_prefill(
         assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()
 
 
-@pytest.mark.parametrize("kv_layout", ["HND"])  # trtllm-gen only support HND
+@pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
+@pytest.mark.parametrize(
+    "batch_size,page_size,num_kv_heads,head_grp_size",
+    [
+        (4, 16, 2, 1),
+        (4, 32, 4, 5),
+        (4, 64, 4, 8),
+        (128, 16, 2, 5),
+        (128, 32, 4, 1),
+        (128, 64, 2, 8),
+        (256, 16, 4, 8),
+        (256, 32, 2, 8),
+        (256, 64, 4, 1),
+        (256, 64, 4, 5),
+    ],
+)
+@pytest.mark.parametrize("window_left", [-1])  # todo(Siyuan): add 127 window_left
+@pytest.mark.parametrize(
+    "q_dtype,kv_dtype,o_dtype",
+    [
+        ("bf16", "bf16", "bf16"),
+        ("fp16", "fp16", "fp16"),
+        ("fp8", "fp8", "bf16"),
+        ("fp8", "fp8", "fp16"),
+        ("fp8", "fp8", "fp8"),
+        ("fp8", "fp8", "nvfp4"),
+    ],
+)
+@pytest.mark.parametrize("enable_pdl", [None])
+@pytest.mark.parametrize("enable_sink", [True, False])
+@pytest.mark.parametrize("max_q_len", [511])
+@pytest.mark.parametrize("max_kv_len", [2047])
+@pytest.mark.parametrize("head_dim", [128, 256])
+@pytest.mark.parametrize("non_contiguous_query", [False, True])
+def test_trtllm_batch_prefill(
+    kv_layout,
+    batch_size,
+    page_size,
+    num_kv_heads,
+    head_grp_size,
+    window_left,
+    q_dtype,
+    o_dtype,
+    kv_dtype,
+    enable_pdl,
+    enable_sink,
+    max_q_len,
+    max_kv_len,
+    head_dim,
+    non_contiguous_query,
+):
+    _test_trtllm_batch_prefill(
+        kv_layout,
+        batch_size,
+        page_size,
+        num_kv_heads,
+        head_grp_size,
+        window_left,
+        q_dtype,
+        o_dtype,
+        kv_dtype,
+        enable_pdl,
+        enable_sink,
+        max_q_len,
+        max_kv_len,
+        kv_dtype == "fp8",
+        head_dim,
+        non_contiguous_query=non_contiguous_query,
+    )
+
+
+@pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
 @pytest.mark.parametrize(
     "batch_size,page_size,num_kv_heads,head_grp_size",
     [
@@ -545,6 +709,7 @@ def test_trtllm_batch_prefill(
 @pytest.mark.parametrize("enable_sink", [False])
 @pytest.mark.parametrize("max_q_len", [8192])
 @pytest.mark.parametrize("max_kv_len", [8192])
+@pytest.mark.parametrize("head_dim", [128, 256])
 def test_trtllm_batch_prefill_bs1(
     kv_layout,
     batch_size,
@@ -559,8 +724,9 @@ def test_trtllm_batch_prefill_bs1(
     enable_sink,
     max_q_len,
     max_kv_len,
+    head_dim,
 ):
-    test_trtllm_batch_prefill(
+    _test_trtllm_batch_prefill(
         kv_layout,
         batch_size,
         page_size,
@@ -574,50 +740,13 @@ def test_trtllm_batch_prefill_bs1(
         enable_sink,
         max_q_len,
         max_kv_len,
+        False,
+        head_dim,
     )
 
 
-@pytest.mark.parametrize("kv_layout", ["HND"])  # trtllm-gen only support HND
-@pytest.mark.parametrize(
-    "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size",
-    [
-        (4, 1, 16, 2, 1),
-        (4, 1, 32, 2, 5),
-        (4, 2, 64, 2, 5),
-        (4, 3, 32, 2, 5),
-        (4, 3, 64, 2, 1),
-        (4, 4, 64, 4, 1),
-        (4, 5, 64, 4, 8),
-        (128, 1, 64, 2, 5),
-        (128, 2, 32, 4, 1),
-        (128, 3, 16, 4, 8),
-        (128, 4, 16, 2, 5),
-        (128, 5, 16, 2, 5),
-        (256, 1, 64, 4, 8),
-        (256, 2, 16, 2, 8),
-        (256, 3, 64, 4, 5),
-        (256, 4, 32, 2, 8),
-        (256, 5, 32, 2, 1),
-    ],
-)
-@pytest.mark.parametrize("window_left", [-1, 127])
-@pytest.mark.parametrize(
-    "q_dtype,kv_dtype,o_dtype",
-    [
-        ("bf16", "bf16", "bf16"),
-        ("fp16", "fp16", "fp16"),
-        ("bf16", "fp8", "bf16"),
-        ("fp16", "fp8", "fp16"),
-        ("fp8", "fp8", "bf16"),
-        ("fp8", "fp8", "fp16"),
-        ("fp8", "fp8", "fp8"),
-        ("fp8", "fp8", "nvfp4"),
-    ],
-)
-@pytest.mark.parametrize("enable_pdl", [True, False, None])
-@pytest.mark.parametrize("enable_sink", [True, False])
-@pytest.mark.parametrize("max_in_kv_len", [110])
-def test_trtllm_batch_decode(
+def _test_trtllm_batch_decode(
+    backend,
     kv_layout,
     batch_size,
     q_len_per_req,
@@ -631,23 +760,50 @@ def test_trtllm_batch_decode(
     enable_pdl,
     enable_sink,
     max_in_kv_len,
+    head_dim,
+    device_scale=False,
+    max_q_len=None,
+    non_contiguous_query=False,
 ):
-    compute_capability = get_compute_capability(torch.device(device="cuda"))
-    if compute_capability[0] != 10:
-        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+    """
+    Common function for testing trtllm-gen decode.
 
-    if o_dtype == "nvfp4" and q_len_per_req > 1:
+    Combinations of parameters are tested in test_trtllm_batch_decode() and test_trtllm_batch_decode_...()
+    """
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+
+    # Check GPU architecture requirements for different backends
+    if backend == "trtllm-gen" and compute_capability[0] != 10:
+        pytest.skip("trtllm-gen backend requires SM100 and SM103 GPUs.")
+    if backend == "xqa" and compute_capability[0] < 9:
+        pytest.skip("xqa backend requires SM90+ GPUs.")
+
+    # xqa backend doesn't support nvfp4 output
+    if backend == "xqa" and o_dtype == "nvfp4":
+        pytest.skip("xqa backend does not support nvfp4 output")
+
+    if backend == "xqa" and q_dtype == "fp8":
+        pytest.skip("xqa backend only supports fp16 and bf16 query")
+
+    if o_dtype == "nvfp4" and (
+        q_len_per_req is not None
+        and q_len_per_req > 1
+        or max_q_len is not None
+        and max_q_len > 1
+    ):
         # todo(Yingyi): add support for nvfp4 with speculative decoding
-        pytest.skip("nvfp4 is not supported for q_len_per_req > 1")
+        pytest.skip("nvfp4 is not supported for q_len_per_req > 1 or max_q_len > 1 yet")
+
+    if backend == "trtllm-gen" and o_dtype == "fp8" and q_dtype != "fp8":
+        pytest.skip("trtllm-gen backend only supports fp8 output for fp8 query")
 
     # Set up test parameters
     torch.manual_seed(0)
-    head_dim = 128
 
     # Generate random sequence lengths
     num_qo_heads = num_kv_heads * head_grp_size
     q_lens, in_kv_lens, seq_lens = generate_seq_lens_decode(
-        batch_size, q_len_per_req, max_in_kv_len
+        batch_size, q_len_per_req, max_in_kv_len, max_q_len
     )
 
     # Create query tensor and related data
@@ -663,6 +819,7 @@ def test_trtllm_batch_decode(
         head_dim,
         kv_dtype,
         "bf16" if q_dtype == "fp8" else q_dtype,
+        kv_layout,
     )
     page_table, all_page_ids, page_per_seq = create_page_table(
         batch_size, seq_lens, page_size
@@ -701,7 +858,7 @@ def test_trtllm_batch_decode(
         "window_left": window_left,
     }
     if not enable_sink:
-        if q_len_per_req == 1:
+        if q_len_per_req is not None and q_len_per_req == 1:
             wrapper_ref = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
                 workspace_buffer_ref, kv_layout, use_tensor_cores=True
             )
@@ -735,6 +892,7 @@ def test_trtllm_batch_decode(
             seq_lens.to(GPU_DEVICE),
             page_size,
             kv_last_page_len,
+            kv_layout,
         )
         sink = torch.rand(num_qo_heads, device=GPU_DEVICE, dtype=torch.float32) * 5
         output_ref = sink_attention_unified(
@@ -751,28 +909,58 @@ def test_trtllm_batch_decode(
             kv_indptr=kv_indptr_tokens,
         )
 
-    # Run trtllm-gen function call
+    if q_len_per_req and q_len_per_req > 1:
+        # only used for xqa speculative decoding
+        mask = generate_causal_mask(batch_size, q_len_per_req, GPU_DEVICE)
+    else:
+        mask = None
+
+    # Run decode function call with specified backend
+    bmm1_scale = q_scale * k_scale * sm_scale
+    bmm2_scale = v_scale / o_scale
+    if isinstance(bmm1_scale, torch.Tensor) and not device_scale:
+        bmm1_scale = bmm1_scale.item()
+    elif not isinstance(bmm1_scale, torch.Tensor) and device_scale:
+        bmm1_scale = torch.tensor(bmm1_scale, device=GPU_DEVICE, dtype=torch.float32)
+    if isinstance(bmm2_scale, torch.Tensor) and not device_scale:
+        bmm2_scale = bmm2_scale.item()
+    elif not isinstance(bmm2_scale, torch.Tensor) and device_scale:
+        bmm2_scale = torch.tensor(bmm2_scale, device=GPU_DEVICE, dtype=torch.float32)
+
+    # Optionally make query non-contiguous for testing stride support
+    if non_contiguous_query:
+        q_input = make_query_non_contiguous(q, num_qo_heads, head_dim)
+    else:
+        q_input = q.contiguous()
+
     output = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
-        q.contiguous(),
+        q_input,
         kv_cache,
         workspace_buffer,
         page_table,
         seq_lens.to(GPU_DEVICE),
         torch.max(seq_lens).item(),
-        q_scale * k_scale * sm_scale,  # bmm1_scale
-        v_scale / o_scale,  # bmm2_scale
+        bmm1_scale,
+        bmm2_scale,
         window_left,  # window_left
         out=out,
         out_dtype=out_dtype,
         o_sf_scale=o_sf_scale,
         o_sf_vec_size=o_sf_vec_size,
-        enable_pdl=enable_pdl,
         sinks=(sink if enable_sink else None),
+        kv_layout=kv_layout,
+        enable_pdl=enable_pdl,
+        backend=backend,
         q_len_per_req=q_len_per_req,
+        o_scale=o_scale,
+        mask=mask,
+        max_q_len=max_q_len if max_q_len is not None else None,
+        cum_seq_lens_q=q_indptr if max_q_len is not None else None,
     )
-    # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
-    # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
-    assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()
+    if backend == "trtllm-gen":
+        # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
+        # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
+        assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()
 
     if o_dtype == "nvfp4":
         output, output_ref = unpack_compare_nvfp4(
@@ -787,9 +975,13 @@ def test_trtllm_batch_decode(
     else:
         rtol, atol = 1e-2, 1e-2
 
+    if backend == "xqa" and kv_dtype == "fp8":
+        atol = 1e-1
+        rtol = 1e-1
+
     # convert to float32 for fp8 is not supported by assert_close
     # relax rtol and atol for speculative decoding test
-    if q_len_per_req > 1:
+    if (q_len_per_req and q_len_per_req > 1) or (max_q_len and max_q_len > 1):
         rtol, atol = rtol * 2, atol * 2
 
     # Arbitary small mismatch rate
@@ -806,7 +998,13 @@ def test_trtllm_batch_decode(
         max_mismatched_elements=max_mismatched_elements,
     )
 
-    if o_dtype != "nvfp4":  # wrapper api does not support fp4 output yet.
+    # Only test wrapper with trtllm-gen backend
+    if (
+        o_dtype != "nvfp4"
+        and backend == "trtllm-gen"
+        and q_len_per_req
+        is not None  # only test for the case all requests have the same q_len
+    ):  # wrapper api does not support fp4 output yet.
         # test wrapper with trtllm-gen backend
         wrapper_trtllm_gen = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
             workspace_buffer, kv_layout, backend="trtllm-gen"
@@ -815,7 +1013,7 @@ def test_trtllm_batch_decode(
         plan_params["kv_data_type"] = kv_cache.dtype
         wrapper_trtllm_gen.plan(**plan_params)
         output_wrapper = wrapper_trtllm_gen.run(
-            q.contiguous(),
+            q_input,
             kv_cache,
             q_scale=q_scale,
             k_scale=k_scale,
@@ -858,11 +1056,101 @@ def test_trtllm_batch_decode(
         assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()
 
 
+@pytest.mark.parametrize("backend", ["trtllm-gen", "xqa"])
+@pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
+@pytest.mark.parametrize(
+    "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size",
+    [
+        (4, 1, 16, 2, 1),
+        (4, 1, 32, 2, 5),
+        (4, 2, 64, 2, 5),
+        (4, 3, 32, 2, 5),
+        (4, 3, 64, 2, 1),
+        (4, 4, 64, 4, 1),
+        (4, 5, 64, 4, 8),
+        (128, 1, 64, 2, 5),
+        (128, 2, 32, 4, 1),
+        (128, 3, 16, 4, 8),
+        (128, 4, 16, 2, 5),
+        (128, 5, 16, 2, 5),
+        (256, 1, 64, 4, 8),
+        (256, 2, 16, 2, 8),
+        (256, 3, 64, 4, 5),
+        (256, 4, 32, 2, 8),
+        (256, 5, 32, 2, 1),
+    ],
+)
+@pytest.mark.parametrize("window_left", [-1, 127])
+@pytest.mark.parametrize(
+    "q_dtype,kv_dtype,o_dtype",
+    [
+        ("bf16", "bf16", "bf16"),
+        ("fp16", "fp16", "fp16"),
+        ("bf16", "fp8", "bf16"),
+        ("fp16", "fp8", "fp16"),
+        ("bf16", "fp8", "fp8"),
+        ("fp16", "fp8", "fp8"),
+        ("fp8", "fp8", "bf16"),
+        ("fp8", "fp8", "fp16"),
+        ("fp8", "fp8", "fp8"),
+        ("fp8", "fp8", "nvfp4"),
+    ],
+)
+@pytest.mark.parametrize("enable_pdl", [True, False, None])
+@pytest.mark.parametrize("enable_sink", [True, False])
+@pytest.mark.parametrize("max_in_kv_len", [110])
+@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("non_contiguous_query", [False, True])
+def test_trtllm_batch_decode(
+    backend,
+    kv_layout,
+    batch_size,
+    q_len_per_req,
+    page_size,
+    num_kv_heads,
+    head_grp_size,
+    window_left,
+    q_dtype,
+    o_dtype,
+    kv_dtype,
+    enable_pdl,
+    enable_sink,
+    max_in_kv_len,
+    head_dim,
+    non_contiguous_query,
+):
+    # xqa backend does not support non-contiguous query yet
+    if backend == "xqa" and non_contiguous_query:
+        pytest.skip("xqa backend does not support non-contiguous query")
+
+    # General set of tests for trtllm-gen decode
+    _test_trtllm_batch_decode(
+        backend,
+        kv_layout,
+        batch_size,
+        q_len_per_req,
+        page_size,
+        num_kv_heads,
+        head_grp_size,
+        window_left,
+        q_dtype,
+        o_dtype,
+        kv_dtype,
+        enable_pdl,
+        enable_sink,
+        max_in_kv_len,
+        head_dim,
+        kv_dtype == "fp8",
+        non_contiguous_query=non_contiguous_query,
+    )
+
+
 @pytest.mark.parametrize("kv_layout", ["HND"])  # trtllm-gen only support HND
 @pytest.mark.parametrize(
     "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size",
     [
         (1, 1, 16, 8, 8),
+        (1, 1, 32, 8, 8),
     ],
 )
 @pytest.mark.parametrize("window_left", [-1])
@@ -874,7 +1162,9 @@ def test_trtllm_batch_decode(
 )
 @pytest.mark.parametrize("enable_pdl", [None])
 @pytest.mark.parametrize("enable_sink", [False])
-@pytest.mark.parametrize("max_in_kv_len", [8192])
+@pytest.mark.parametrize("max_in_kv_len", [4096, 8192])
+@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("device_scale", [True, False])
 def test_trtllm_batch_decode_bs1(
     kv_layout,
     batch_size,
@@ -889,9 +1179,12 @@ def test_trtllm_batch_decode_bs1(
     enable_pdl,
     enable_sink,
     max_in_kv_len,
+    head_dim,
+    device_scale,
 ):
-    pytest.xfail("trtllm-gen decode gets incorrect output with bs1")
-    test_trtllm_batch_decode(
+    # Small number of test cases for batch size 1
+    _test_trtllm_batch_decode(
+        "trtllm-gen",
         kv_layout,
         batch_size,
         q_len_per_req,
@@ -905,6 +1198,137 @@ def test_trtllm_batch_decode_bs1(
         enable_pdl,
         enable_sink,
         max_in_kv_len,
+        head_dim,
+        device_scale,
+    )
+
+
+@pytest.mark.parametrize("kv_layout", ["HND"])  # trtllm-gen only support HND
+@pytest.mark.parametrize(
+    "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size",
+    [
+        (4, 1, 16, 2, 1),
+        (4, 1, 32, 2, 5),
+        (4, 3, 64, 2, 1),
+        (4, 4, 64, 4, 1),
+        (128, 3, 16, 4, 8),
+        (128, 4, 16, 2, 5),
+        (256, 4, 32, 2, 8),
+        (256, 5, 32, 2, 1),
+    ],
+)
+@pytest.mark.parametrize("window_left", [-1])
+@pytest.mark.parametrize(
+    "q_dtype,kv_dtype,o_dtype",
+    [
+        ("bf16", "bf16", "bf16"),
+        ("fp16", "fp16", "fp16"),
+        ("fp8", "fp8", "fp16"),
+        ("fp8", "fp8", "fp8"),
+        ("fp8", "fp8", "nvfp4"),
+    ],
+)
+@pytest.mark.parametrize("enable_pdl", [None])
+@pytest.mark.parametrize("enable_sink", [False])
+@pytest.mark.parametrize("max_in_kv_len", [110])
+@pytest.mark.parametrize("head_dim", [256])
+@pytest.mark.parametrize("device_scale", [True, False])
+def test_trtllm_batch_decode_head_dim_256(
+    kv_layout,
+    batch_size,
+    q_len_per_req,
+    page_size,
+    num_kv_heads,
+    head_grp_size,
+    window_left,
+    q_dtype,
+    o_dtype,
+    kv_dtype,
+    enable_pdl,
+    enable_sink,
+    max_in_kv_len,
+    head_dim,
+    device_scale,
+):
+    # Small number of test cases for head_dim = 256
+    _test_trtllm_batch_decode(
+        "trtllm-gen",
+        kv_layout,
+        batch_size,
+        q_len_per_req,
+        page_size,
+        num_kv_heads,
+        head_grp_size,
+        window_left,
+        q_dtype,
+        o_dtype,
+        kv_dtype,
+        enable_pdl,
+        enable_sink,
+        max_in_kv_len,
+        head_dim,
+        device_scale,
+    )
+
+
+@pytest.mark.parametrize("kv_layout", ["HND"])  # trtllm-gen only support HND
+@pytest.mark.parametrize(
+    "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size",
+    [
+        (1, 1, 16, 2, 1),
+        (1, 1, 32, 2, 5),
+        (1, 3, 64, 2, 1),
+        (1, 4, 64, 4, 1),
+    ],
+)
+@pytest.mark.parametrize("window_left", [-1])
+@pytest.mark.parametrize(
+    "q_dtype,kv_dtype,o_dtype",
+    [
+        ("bf16", "bf16", "bf16"),
+        ("fp8", "fp8", "fp8"),
+    ],
+)
+@pytest.mark.parametrize("enable_pdl", [None])
+@pytest.mark.parametrize("enable_sink", [False])
+@pytest.mark.parametrize("max_in_kv_len", [4096, 8192, 16384, 32768, 65536, 131072])
+@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("device_scale", [True, False])
+def test_trtllm_batch_decode_long_sequence_length(
+    kv_layout,
+    batch_size,
+    q_len_per_req,
+    page_size,
+    num_kv_heads,
+    head_grp_size,
+    window_left,
+    q_dtype,
+    o_dtype,
+    kv_dtype,
+    enable_pdl,
+    enable_sink,
+    max_in_kv_len,
+    head_dim,
+    device_scale,
+):
+    # Small number of test cases for long sequence length
+    _test_trtllm_batch_decode(
+        "trtllm-gen",
+        kv_layout,
+        batch_size,
+        q_len_per_req,
+        page_size,
+        num_kv_heads,
+        head_grp_size,
+        window_left,
+        q_dtype,
+        o_dtype,
+        kv_dtype,
+        enable_pdl,
+        enable_sink,
+        max_in_kv_len,
+        head_dim,
+        device_scale,
     )
 
 
@@ -918,8 +1342,8 @@ def test_trtllm_gen_prefill_deepseek(
     batch_size, s_qo, s_kv, num_kv_heads, head_grp_size, causal
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
-    if compute_capability[0] in [11, 12]:
-        pytest.skip("trtllm-gen does not support SM110/SM120/SM121 GPUs.")
+    if compute_capability[0] != 10:
+        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
     if s_qo > s_kv:
         pytest.skip("s_qo > s_kv, skipping test as causal")
 
@@ -1055,6 +1479,98 @@ def test_trtllm_gen_prefill_deepseek_bs1(
     )
 
 
-if __name__ == "__main__":
-    test_trtllm_batch_prefill("HND", 128, 32, 2, 5, -1, "fp16", "fp16", "fp16", False)
-    test_trtllm_batch_decode("HND", 256, 3, 64, 4, 5, -1, "fp8", "fp8", "fp8", True)
+def make_query_non_contiguous(q, num_qo_heads, head_dim):
+    """
+    Create a non-contiguous version of the query tensor.
+    Create a (N, H, 2*D) tensor and slice the first D dimensions: x[..., :D]
+    This produces a non-contiguous view with the same data.
+    """
+    n, h, d = q.shape
+    # Create a larger tensor with 2*D in the last dimension
+    large_tensor = torch.zeros(n, h, 2 * d, dtype=q.dtype, device=q.device)
+    large_tensor[..., :d] = q
+    # Slice to get non-contiguous query (only last dim is contiguous)
+    q_non_contiguous = large_tensor[..., :d]
+    assert not q_non_contiguous.is_contiguous(), "Query should be non-contiguous"
+    return q_non_contiguous
+
+
+@pytest.mark.parametrize("backend", ["trtllm-gen"])
+@pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
+@pytest.mark.parametrize(
+    "batch_size,max_q_len,page_size,num_kv_heads,head_grp_size",
+    [
+        (4, 1, 16, 2, 1),
+        (4, 1, 32, 2, 5),
+        (4, 2, 64, 2, 5),
+        (4, 3, 32, 2, 5),
+        (4, 3, 64, 2, 1),
+        (4, 4, 64, 4, 1),
+        (4, 5, 64, 4, 8),
+        (128, 1, 64, 2, 5),
+        (128, 2, 32, 4, 1),
+        (128, 3, 16, 4, 8),
+        (128, 4, 16, 2, 5),
+        (128, 5, 16, 2, 5),
+        (256, 1, 64, 4, 8),
+        (256, 2, 16, 2, 8),
+        (256, 3, 64, 4, 5),
+        (256, 4, 32, 2, 8),
+        (256, 5, 32, 2, 1),
+    ],
+)
+@pytest.mark.parametrize("window_left", [-1, 127])
+@pytest.mark.parametrize(
+    "q_dtype,kv_dtype,o_dtype",
+    [
+        ("bf16", "bf16", "bf16"),
+        ("fp16", "fp16", "fp16"),
+        ("bf16", "fp8", "bf16"),
+        ("fp16", "fp8", "fp16"),
+        ("bf16", "fp8", "fp8"),
+        ("fp16", "fp8", "fp8"),
+        ("fp8", "fp8", "bf16"),
+        ("fp8", "fp8", "fp16"),
+        ("fp8", "fp8", "fp8"),
+        ("fp8", "fp8", "nvfp4"),
+    ],
+)
+@pytest.mark.parametrize("enable_pdl", [True, False, None])
+@pytest.mark.parametrize("enable_sink", [True, False])
+@pytest.mark.parametrize("max_in_kv_len", [110])
+@pytest.mark.parametrize("head_dim", [128])
+def test_trtllm_batch_decode_spec(
+    backend,
+    kv_layout,
+    batch_size,
+    max_q_len,
+    page_size,
+    num_kv_heads,
+    head_grp_size,
+    window_left,
+    q_dtype,
+    o_dtype,
+    kv_dtype,
+    enable_pdl,
+    enable_sink,
+    max_in_kv_len,
+    head_dim,
+):
+    _test_trtllm_batch_decode(
+        backend,
+        kv_layout,
+        batch_size,
+        None,  # q_len_per_req
+        page_size,
+        num_kv_heads,
+        head_grp_size,
+        window_left,
+        q_dtype,
+        o_dtype,
+        kv_dtype,
+        enable_pdl,
+        enable_sink,
+        max_in_kv_len,
+        head_dim,
+        max_q_len=max_q_len,
+    )

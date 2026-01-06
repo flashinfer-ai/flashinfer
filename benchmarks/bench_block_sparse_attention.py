@@ -18,7 +18,10 @@ import numpy as np
 import torch
 
 import flashinfer
-from flashinfer.testing.utils import bench_gpu_time
+from flashinfer.testing.utils import (
+    bench_gpu_time,
+    attention_tflops_per_sec_with_actual_seq_lens,
+)
 
 
 def bench_variable_block_sparse_attention(
@@ -120,7 +123,15 @@ def bench_variable_block_sparse_attention(
     )
 
     def flops(ms):
-        return seq_len * seq_len * num_qo_heads * head_dim * 4 / ms / 1e9
+        return attention_tflops_per_sec_with_actual_seq_lens(
+            torch.tensor([seq_len]),
+            torch.tensor([seq_len]),
+            head_dim,
+            head_dim,
+            num_qo_heads,
+            False,
+            ms,
+        )
 
     print(
         f"bench_variable_block_sparse_attention (num_qo_heads={num_qo_heads}, num_kv_heads={num_kv_heads}, head_dim={head_dim}, seq_len={seq_len}, num_blocks_row={num_blocks_row}, num_blocks_col={num_blocks_col}, block_density={block_density}), sparse fa2-template: {flops(sparse_ms_fa2):.3f} TFLOPs/s, sparse fa3-template: {flops(sparse_ms_fa3):.3f} TFLOPs/s, dense fa2-template: {flops(dense_sm80_ms):.3f} TFLOPs/s, dense fa3-template: {flops(dense_sm90_ms):.3f} TFLOPs/s"

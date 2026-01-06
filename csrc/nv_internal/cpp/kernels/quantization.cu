@@ -71,6 +71,21 @@ template void invokeQuantization<__nv_bfloat16>(int8_t* dst, __nv_bfloat16 const
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+// Helper function for grid configuration with swizzled layouts
+
+inline int computeEffectiveRows(int m, QuantizationSFLayout layout) {
+  int effectiveRows = m;
+  bool isSfSwizzledLayout = (layout == QuantizationSFLayout::SWIZZLED_128x4 ||
+                             layout == QuantizationSFLayout::SWIZZLED_8x4);
+  if (isSfSwizzledLayout) {
+    int rowTile = (layout == QuantizationSFLayout::SWIZZLED_128x4) ? 128 : 8;
+    int numPaddedRows = (m + rowTile - 1) / rowTile * rowTile;  // Round up to rowTile
+    effectiveRows = numPaddedRows;
+  }
+  return effectiveRows;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
 // MXFP8 Quantization
 
 template <typename T>
@@ -85,7 +100,8 @@ void invokeMxFP8Quantization(int b, int m, int n, int padded_n, T const* input, 
   dim3 block(std::min(int(padded_n / CVT_ELTS_PER_THREAD), 512));
   // Get number of blocks per SM (assume we can fully utilize the SM).
   int const numBlocksPerSM = std::max(1u, 2048u / block.x);
-  dim3 grid(std::min(int(m), multiProcessorCount * numBlocksPerSM));
+  int effectiveRows = computeEffectiveRows(m, layout);
+  dim3 grid(std::min(effectiveRows, multiProcessorCount * numBlocksPerSM));
 
   // Launch the cvt kernel.
   cudaLaunchConfig_t config;
@@ -177,7 +193,8 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
     dim3 block(std::min(int(n / CVT_FP8_TO_FP4_ELTS_PER_THREAD), 512));
     // Get number of blocks per SM (assume we can fully utilize the SM).
     int const numBlocksPerSM = std::max(1u, 2048u / block.x);
-    dim3 grid(std::min(int(m), multiProcessorCount * numBlocksPerSM));
+    int effectiveRows = computeEffectiveRows(m, layout);
+    dim3 grid(std::min(effectiveRows, multiProcessorCount * numBlocksPerSM));
 
     // Launch the cvt kernel.
     auto* kernel_instance = useUE8M0
@@ -197,7 +214,8 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
     dim3 block(std::min(int(n / CVT_ELTS_PER_THREAD), 512));
     // Get number of blocks per SM (assume we can fully utilize the SM).
     int const numBlocksPerSM = std::max(1u, 2048u / block.x);
-    dim3 grid(std::min(int(m), multiProcessorCount * numBlocksPerSM));
+    int effectiveRows = computeEffectiveRows(m, layout);
+    dim3 grid(std::min(effectiveRows, multiProcessorCount * numBlocksPerSM));
 
     // Launch the cvt kernel.
     auto* kernel_instance = useUE8M0
@@ -222,13 +240,14 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
   }
 }
 
+template <typename T>
 __global__ void block_scale_interleave_kernel(int numBatches, int numRows, int numRowsPadded,
-                                              int numCols, int numColsPadded, uint8_t const* SFIn,
-                                              uint8_t* SFOutput) {
+                                              int numCols, int numColsPadded, T const* SFIn,
+                                              T* SFOutput) {
   for (int rowIdx = blockIdx.x; rowIdx < numRowsPadded; rowIdx += gridDim.x) {
     for (int batchIdx = 0; batchIdx < numBatches; batchIdx++) {
       for (int colIdx = threadIdx.x; colIdx < numColsPadded; colIdx += blockDim.x) {
-        uint8_t sf = 0;
+        T sf = 0;
         if (rowIdx < numRows && colIdx < numCols) {
           int64_t inOffset = batchIdx * numRows * numCols + rowIdx * numCols + colIdx;
           sf = SFIn[inOffset];
@@ -269,18 +288,28 @@ __global__ void block_scale_interleave_reverse_kernel(int numBatches, int numRow
 }
 
 // This is intended for weight loading, so m and n are large, b <= 256
-void invokeBlockScaleInterleave(int b, int m, int m_padded, int n, int n_padded,
-                                uint8_t const* SFIn, uint8_t* SFOutput, int multiProcessorCount,
-                                cudaStream_t stream) {
+template <typename T>
+void invokeBlockScaleInterleave(int b, int m, int m_padded, int n, int n_padded, T const* SFIn,
+                                T* SFOutput, int multiProcessorCount, cudaStream_t stream) {
   // Each thread reads 1 int8 value
   dim3 block(std::min(n_padded, 1024));
   // Get number of blocks per SM (assume we can fully utilize the SM).
   int const numBlocksPerSM = std::max(1u, 4096u / block.x);
   dim3 grid(std::min(m_padded, multiProcessorCount * numBlocksPerSM));
 
-  block_scale_interleave_kernel<<<grid, block, 0, stream>>>(b, m, m_padded, n, n_padded, SFIn,
-                                                            SFOutput);
+  block_scale_interleave_kernel<T>
+      <<<grid, block, 0, stream>>>(b, m, m_padded, n, n_padded, SFIn, SFOutput);
 }
+
+// Explicit template instantiations for the types used by other compilation units
+template void invokeBlockScaleInterleave<uint8_t>(int b, int m, int m_padded, int n, int n_padded,
+                                                  uint8_t const* SFIn, uint8_t* SFOutput,
+                                                  int multiProcessorCount, cudaStream_t stream);
+template void invokeBlockScaleInterleave<__nv_bfloat16>(int b, int m, int m_padded, int n,
+                                                        int n_padded, __nv_bfloat16 const* SFIn,
+                                                        __nv_bfloat16* SFOutput,
+                                                        int multiProcessorCount,
+                                                        cudaStream_t stream);
 
 // This is intended for weight loading, so m and n are large, b <= 256
 void invokeBlockScaleInterleaveReverse(int b, int m, int n, uint8_t const* SFIn, uint8_t* SFOutput,

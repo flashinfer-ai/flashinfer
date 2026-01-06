@@ -16,17 +16,28 @@
 
 #include "tvm_ffi_utils.h"
 
-void xqa_wrapper(int64_t multiProcessorCount, int64_t nbKHeads, int64_t slidingWinSize,
-                 double qScale, TensorView output,
-#if LOW_PREC_OUTPUT
-                 TensorView rcpOutScale,
-#endif
-                 TensorView q, TensorView attentionSinks, TensorView pool,
-                 TensorView kvCachePageList, int64_t maxSeqLen, TensorView seqLen,
-                 int64_t batchSize, TensorView kvCacheScale,
-#if SPEC_DEC
-                 int64_t qSeqLen, TensorView qCuSeqLens, TensorView mask,
-#endif
-                 TensorView semaphores, TensorView scratch);
+#if MLA_WRAPPER
+void xqa_wrapper_mla(int64_t multiProcessorCount, double qScale,
+                     tvm::ffi::Optional<TensorView> qScaleTensor, TensorView output, TensorView q,
+                     TensorView kCacheVLLM, TensorView vCacheVLLM, TensorView kvCachePageList,
+                     int64_t maxSeqLen, TensorView seqLen, int64_t batchSize, double kvCacheScale,
+                     tvm::ffi::Optional<TensorView> kvScaleTensor, TensorView semaphores,
+                     TensorView scratch, bool enable_pdl);
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(xqa_wrapper_mla, xqa_wrapper_mla);
+
+#else
+
+void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbKHeads,
+                 int64_t slidingWinSize, double qScale, tvm::ffi::Optional<TensorView> qScaleTensor,
+                 TensorView output, double rcpOutScale, TensorView q,
+                 tvm::ffi::Optional<TensorView> attentionSinks, TensorView kCacheVLLM,
+                 TensorView vCacheVLLM, TensorView kvCachePageList, int64_t maxSeqLen,
+                 TensorView seqLen, int64_t batchSize, double kvCacheScale,
+                 tvm::ffi::Optional<TensorView> kvScaleTensor, int64_t qSeqLen,
+                 tvm::ffi::Optional<TensorView> mask, TensorView semaphores, TensorView scratch,
+                 bool enable_pdl);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(xqa_wrapper, xqa_wrapper);
+
+#endif

@@ -38,6 +38,17 @@ Batch Decoding
     .. automethod:: __init__
 
 
+XQA
+---
+
+.. currentmodule:: flashinfer.xqa
+
+.. autosummary::
+    :toctree: ../generated
+
+    xqa
+    xqa_mla
+
 flashinfer.prefill
 ==================
 
@@ -87,6 +98,11 @@ and `DeepSeek-R1 <https://arxiv.org/abs/2501.12948>`_).
 
 PageAttention for MLA
 ---------------------
+
+.. autosummary::
+    :toctree: ../generated
+
+    trtllm_batch_decode_with_kv_cache_mla
 
 .. autoclass:: BatchMLAPagedAttentionWrapper
     :members:

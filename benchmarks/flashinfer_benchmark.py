@@ -79,7 +79,13 @@ def parse_args(line=sys.argv[1:]):
         "--use_cupti",
         action="store_true",
         default=False,
-        help="Use CUPTI for timing GPU kernels when available.",
+        help="[DEPRECATED] Use CUPTI for timing GPU kernels. This is now the default behavior.",
+    )
+    parser.add_argument(
+        "--use_cuda_events",
+        action="store_true",
+        default=False,
+        help="Use CUDA events for timing GPU kernels instead of CUPTI.",
     )
     parser.add_argument(
         "--refcheck",
@@ -155,6 +161,16 @@ def parse_args(line=sys.argv[1:]):
 
     if args.generate_repro_command:
         args.repro_command = "python3 flashinfer_benchmark.py " + " ".join(line)
+
+    # Deprecation warning for use_cupti
+    if args.use_cupti:
+        print(
+            "[WARNING] --use_cupti is deprecated and will be removed in a future release. CUPTI is now enabled by default."
+        )
+    # use_cupti is deprecated and will be removed in a future release. CUPTI is now enabled by default.
+    # If --use_cuda_events is passed, disable use_cupti
+    args.use_cupti = not args.use_cuda_events
+
     return args
 
 

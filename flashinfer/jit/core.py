@@ -1,10 +1,11 @@
 import dataclasses
+import functools
 import logging
 import os
 from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Union
+from typing import Dict, List, Optional, Sequence, Union, Hashable
 
 import tvm_ffi
 from filelock import FileLock
@@ -60,6 +61,33 @@ class FlashInferJITLogger(logging.Logger):
             )
         )
 
+    def debug_once(self, msg: str, *args: Hashable) -> None:
+        """
+        As [`debug`][logging.Logger.debug], but subsequent calls with
+        the same message are silently dropped.
+        """
+        self._print_once(self.debug, msg, *args)
+
+    def info_once(self, msg: str, *args: Hashable) -> None:
+        """
+        As [`info`][logging.Logger.info], but subsequent calls with
+        the same message are silently dropped.
+        """
+        self._print_once(self.info, msg, *args)
+
+    def warning_once(self, msg: str, *args: Hashable) -> None:
+        """
+        As [`warning`][logging.Logger.warning], but subsequent calls with
+        the same message are silently dropped.
+        """
+        self._print_once(self.warning, msg, *args)
+
+    @functools.lru_cache(maxsize=None)
+    def _print_once(self, log_method, msg: str, *args: Hashable) -> None:
+        """Helper method to log messages only once per unique (msg, args) combination."""
+        # Note: stacklevel=3 to show the caller's location, not this helper method
+        log_method(msg, *args, stacklevel=3)
+
 
 logger = FlashInferJITLogger("flashinfer.jit")
 
@@ -90,7 +118,14 @@ common_nvcc_flags = [
     "-DFLASHINFER_ENABLE_FP8_E8M0",
     "-DFLASHINFER_ENABLE_FP4_E2M1",
 ]
-sm90a_nvcc_flags = ["-gencode=arch=compute_90a,code=sm_90a"] + common_nvcc_flags
+sm89_nvcc_flags = [
+    "-gencode=arch=compute_89,code=sm_89",
+    "-DFLASHINFER_ENABLE_FP8_E8M0",
+]
+sm90a_nvcc_flags = [
+    "-gencode=arch=compute_90a,code=sm_90a",
+    "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",
+] + common_nvcc_flags
 sm100a_nvcc_flags = ["-gencode=arch=compute_100a,code=sm_100a"] + common_nvcc_flags
 sm103a_nvcc_flags = ["-gencode=arch=compute_103a,code=sm_103a"] + common_nvcc_flags
 sm100f_nvcc_flags = ["-gencode=arch=compute_100f,code=sm_100f"] + common_nvcc_flags
@@ -278,6 +313,88 @@ class JitSpec:
             result = self.load(so_path)
 
         return result
+
+    def get_compile_commands(self) -> List[dict]:
+        """
+        Generate compile_commands.json entries for this JitSpec.
+
+        Returns:
+            A list of dictionaries, each representing a compile command entry
+            for a source file in this JitSpec.
+        """
+        from .cpp_ext import (
+            get_cuda_path,
+            build_common_cflags,
+            build_cflags,
+            build_cuda_cflags,
+        )
+
+        cuda_home = get_cuda_path()
+
+        # Build flags
+        common_cflags = build_common_cflags(cuda_home, self.extra_include_dirs)
+        cflags = build_cflags(common_cflags, self.extra_cflags)
+        cuda_cflags = build_cuda_cflags(common_cflags, self.extra_cuda_cflags)
+
+        # Replace $common_cflags and $cuda_home placeholders
+        def expand_flags(
+            flags: List[str], common_cflags_expanded: List[str]
+        ) -> List[str]:
+            expanded = []
+            for flag in flags:
+                if flag == "$common_cflags":
+                    expanded.extend(common_cflags_expanded)
+                elif "$cuda_home" in flag:
+                    expanded.append(flag.replace("$cuda_home", cuda_home))
+                else:
+                    expanded.append(flag)
+            return expanded
+
+        # Expand common_cflags first (it has $cuda_home placeholders)
+        common_cflags_expanded = [
+            flag.replace("$cuda_home", cuda_home) for flag in common_cflags
+        ]
+        cflags_expanded = expand_flags(cflags, common_cflags_expanded)
+        cuda_cflags_expanded = expand_flags(cuda_cflags, common_cflags_expanded)
+
+        # Get compilers
+        cxx = os.environ.get("CXX", "c++")
+        nvcc = os.environ.get("FLASHINFER_NVCC", f"{cuda_home}/bin/nvcc")
+
+        # Build directory
+        build_dir = str(self.jit_library_path.parent.resolve())
+
+        # Generate entries for each source file
+        compile_commands = []
+        for source in self.sources:
+            is_cuda = source.suffix == ".cu"
+
+            if is_cuda:
+                compiler = nvcc
+                flags = cuda_cflags_expanded
+                object_suffix = ".cuda.o"
+            else:
+                compiler = cxx
+                flags = cflags_expanded
+                object_suffix = ".o"
+
+            obj_name = source.with_suffix(object_suffix).name
+            output_file = os.path.join(build_dir, obj_name)
+
+            # Build the command string
+            command_parts = [compiler, "-c", str(source.resolve())]
+            command_parts += flags
+            command_parts += ["-o", output_file]
+
+            compile_commands.append(
+                {
+                    "directory": build_dir,
+                    "command": " ".join(command_parts),
+                    "file": str(source.resolve()),
+                }
+            )
+
+        return compile_commands
 
 
 def gen_jit_spec(
