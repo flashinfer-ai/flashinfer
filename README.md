@@ -109,31 +109,6 @@ v = torch.randn(2048, 32, 128, device="cuda", dtype=torch.float16)
 output = flashinfer.single_decode_with_kv_cache(q, k, v)
 ```
 
-### Batch Decode with Paged KV-Cache
-
-```python
-import torch
-import flashinfer
-
-# Setup paged attention wrapper
-workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
-wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(workspace, "NHD")
-
-# Plan the batch (call once per batch configuration)
-wrapper.plan(
-    indptr=kv_indptr,
-    indices=kv_indices,
-    last_page_len=kv_last_page_len,
-    num_qo_heads=32,
-    num_kv_heads=8,
-    head_dim=128,
-    page_size=16,
-)
-
-# Run attention (call for each layer)
-output = wrapper.run(q, kv_cache)
-```
-
 See [documentation](https://docs.flashinfer.ai/) for comprehensive API reference and tutorials.
 
 ### Install from Source
