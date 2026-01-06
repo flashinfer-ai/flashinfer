@@ -1007,6 +1007,7 @@ class RMSNormFP4QuantKernel:
         w_ptr: cute.Pointer,
         y_ptr: cute.Pointer,
         s_ptr: cute.Pointer,
+        global_scale_ptr: cute.Pointer,
         M: Int32,
         eps: Float32,
         stream: cuda.CUstream,
@@ -1015,6 +1016,11 @@ class RMSNormFP4QuantKernel:
 
         Takes raw pointers and batch size M, creates tensors internally.
         This avoids the overhead of from_dlpack() at runtime.
+
+        Args:
+            global_scale_ptr: Pointer to global scale tensor (shape [1], float32).
+                The kernel reads this value and computes 1/global_scale to apply:
+                y = rmsnorm(x) / global_scale. Use tensor with value 1.0 for no scaling.
         """
         H = self.H
 
@@ -1054,6 +1060,12 @@ class RMSNormFP4QuantKernel:
                 ),
             )
 
+        # Create global scale tensor (scalar)
+        mGlobalScale = cute.make_tensor(
+            global_scale_ptr,
+            layout=cute.make_layout((1,)),
+        )
+
         # Create TV layout
         tv_shape, tv_stride = self._make_tv_layout(
             self.threads_per_row,
@@ -1065,7 +1077,7 @@ class RMSNormFP4QuantKernel:
         tiler_mn = (self.rows_per_block, self.cols_per_tile)
 
         # Launch with cluster support
-        self.kernel(mX, mW, mY, mS, M, eps, tv_layout, tiler_mn).launch(
+        self.kernel(mX, mW, mY, mS, mGlobalScale, M, eps, tv_layout, tiler_mn).launch(
             grid=[cute.ceil_div(M, self.rows_per_block), self.cluster_n, 1],
             block=[self.num_threads, 1, 1],
             cluster=[1, self.cluster_n, 1]
@@ -1082,12 +1094,18 @@ class RMSNormFP4QuantKernel:
         mW: cute.Tensor,
         mY: cute.Tensor,
         mS: cute.Tensor,
+        mGlobalScale: cute.Tensor,
         M: Int32,
         eps: Float32,
         tv_layout: cute.Layout,
         tiler_mn: cute.Shape,
     ):
-        """Device kernel with cluster synchronization for large H."""
+        """Device kernel with cluster synchronization for large H.
+
+        mGlobalScale contains the global scale value. The kernel reads it and
+        computes 1/global_scale, which is multiplied with rstd to apply:
+        y = x * rstd * w / global_scale = rmsnorm(x, w) / global_scale
+        """
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
 
@@ -1231,6 +1249,10 @@ class RMSNormFP4QuantKernel:
         mean_sq = sum_sq / H  # Use full H, not H_per_cta
         rstd = cute.math.rsqrt(mean_sq + eps, fastmath=True)
 
+        # Read global_scale from device memory (CUDA graph compatible)
+        # Note: global_scale is incorporated into the block scale, NOT applied to input
+        global_scale_val = mGlobalScale[0]
+
         # Sync after reduction
         if cutlass.const_expr(cluster_n > 1):
             cute.arch.cluster_arrive_relaxed()
@@ -1362,14 +1384,20 @@ class RMSNormFP4QuantKernel:
 
                         # =======================================================
                         # Compute scale factor (FP8 E4M3) - Branchless clamping
+                        # global_scale is incorporated into block scale (not input)
+                        # Formula: scale = global_scale * max_abs / FP4_MAX
                         # =======================================================
-                        scale_float = max_abs * fp4_max_rcp
+                        scale_float = global_scale_val * max_abs * fp4_max_rcp
                         scale_float = fmin_f32(scale_float, Float32(FLOAT8_E4M3_MAX))
 
                         scale_fp8_u32 = cvt_f32_to_e4m3(scale_float)
                         scale_fp8 = Uint8(scale_fp8_u32 & Uint32(0xFF))
 
-                        inv_scale = fp8_e4m3_to_f32_and_rcp(scale_fp8_u32)
+                        # inv_scale = global_scale / scale_float
+                        # This cancels the global_scale in scale_float, giving ~6/max_abs
+                        inv_scale = (
+                            fp8_e4m3_to_f32_and_rcp(scale_fp8_u32) * global_scale_val
+                        )
 
                         # =======================================================
                         # Store scale factor
@@ -1604,19 +1632,27 @@ class RMSNormFP4QuantKernel:
                             y14_c1, y15_c1 = bfloat2_to_float2_scaled(xw7_c1, rstd)
 
                         # Compute scale factor (E4M3 or UE8M0 based on scale_format)
+                        # For E4M3: global_scale is incorporated into block scale
+                        # For UE8M0 (MXFP4): global_scale is not used
                         if cutlass.const_expr(self.scale_format == "ue8m0"):
                             scale_float = max_abs * fp4_max_rcp
                             scale_ue8m0 = cvt_f32_to_ue8m0(scale_float)
                             scale_u8 = Uint8(scale_ue8m0 & Uint32(0xFF))
                             inv_scale = ue8m0_to_output_scale(scale_ue8m0)
                         else:
-                            scale_float = max_abs * fp4_max_rcp
+                            # E4M3: scale = global_scale * max_abs / FP4_MAX
+                            scale_float = global_scale_val * max_abs * fp4_max_rcp
                             scale_float = fmin_f32(
                                 scale_float, Float32(FLOAT8_E4M3_MAX)
                             )
                             scale_fp8_u32 = cvt_f32_to_e4m3(scale_float)
                             scale_u8 = Uint8(scale_fp8_u32 & Uint32(0xFF))
-                            inv_scale = fp8_e4m3_to_f32_and_rcp(scale_fp8_u32)
+                            # inv_scale = global_scale / scale_float
+                            # This cancels the global_scale in scale_float
+                            inv_scale = (
+                                fp8_e4m3_to_f32_and_rcp(scale_fp8_u32)
+                                * global_scale_val
+                            )
 
                         if cutlass.const_expr(self.output_swizzled):
                             inner_k_idx = sf_idx % Int32(4)
@@ -1729,8 +1765,11 @@ def _get_compiled_kernel(
                 make_ptr(
                     cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16
                 ),  # s
+                make_ptr(
+                    cutlass.Float32, 16, cute.AddressSpace.gmem, assumed_align=4
+                ),  # global_scale
             ]
-        x, w, y, s = tensors
+        x, w, y, s, global_scale = tensors
         return [
             make_ptr(
                 cutlass_dtype, x.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
@@ -1743,6 +1782,12 @@ def _get_compiled_kernel(
             ),
             make_ptr(
                 cutlass.Uint8, s.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+            ),
+            make_ptr(
+                cutlass.Float32,
+                global_scale.data_ptr(),
+                cute.AddressSpace.gmem,
+                assumed_align=4,
             ),
         ]
 
@@ -1771,13 +1816,14 @@ def _get_compiled_kernel(
         w: torch.Tensor,
         y: torch.Tensor,
         s: torch.Tensor,
+        global_scale: torch.Tensor,
         M: int,
         eps: float,
     ) -> None:
         """Runtime API that converts tensors to pointers and calls the kernel."""
         nonlocal compiled_kernel
         compiled_kernel(
-            *get_cute_pointers([x, w, y, s]),
+            *get_cute_pointers([x, w, y, s, global_scale]),
             Int32(M),
             Float32(eps),
             cutlass_torch.current_stream(),
@@ -1790,17 +1836,19 @@ def _get_compiled_kernel(
 def rmsnorm_fp4quant(
     input: torch.Tensor,
     weight: torch.Tensor,
-    y_fp4: torch.Tensor,
-    block_scale: torch.Tensor,
+    y_fp4: torch.Tensor | None = None,
+    block_scale: torch.Tensor | None = None,
+    global_scale: torch.Tensor | None = None,
     eps: float = 1e-6,
     block_size: int = 16,
     scale_format: str | None = None,
     is_sf_swizzled_layout: bool = False,
-) -> None:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Fused RMS normalization with FP4 quantization using CuTe-DSL.
 
-    Computes: ``y = RMSNorm(input) * weight``, then quantizes ``y`` to FP4.
+    Computes: ``y = RMSNorm(input) * weight``, optionally applies global scaling
+    (``y = y / global_scale``), then quantizes ``y`` to FP4.
 
     Parameters
     ----------
@@ -1810,11 +1858,12 @@ def rmsnorm_fp4quant(
     weight : torch.Tensor
         Weight tensor for RMSNorm, shape ``(hidden_size,)``.
         Must have the same dtype as input.
-    y_fp4 : torch.Tensor
-        Output tensor for quantized values in FP4_E2M1 format, packed as uint8.
-        Two FP4 values are packed into each uint8 byte.
+    y_fp4 : torch.Tensor, optional
+        Output tensor for quantized values in FP4_E2M1 format with dtype
+        ``torch.float4_e2m1fn_x2``.
         Shape must be ``(batch_size, hidden_size // 2)`` or matching 3D input.
-    block_scale : torch.Tensor
+        If ``None``, will be allocated automatically.
+    block_scale : torch.Tensor, optional
         Output tensor for per-block scale factors.
 
         - If ``is_sf_swizzled_layout=False`` (default): row-major layout with shape
@@ -1825,7 +1874,13 @@ def rmsnorm_fp4quant(
           ``[m_tile][k_tile][outer_m (32)][inner_m (4)][inner_k (4)]``.
 
         Dtype should be ``torch.float8_e4m3fn`` for E4M3 format or ``torch.uint8``
-        for UE8M0 format.
+        for UE8M0 format. If ``None``, will be allocated automatically.
+    global_scale : torch.Tensor, optional
+        Global scale factor tensor of shape ``(1,)`` with dtype ``torch.float32``.
+        If provided, the RMSNorm output is divided by this value before quantization:
+        ``y = rmsnorm(x, w) / global_scale``. This is used for NVFP4 format where
+        a pre-computed global scale lifts per-block scales into optimal dynamic range.
+        If ``None``, no global scaling is applied (equivalent to global_scale=1.0).
     eps : float
         Epsilon for numerical stability in RMSNorm. Default is ``1e-6``.
     block_size : int
@@ -1844,6 +1899,14 @@ def rmsnorm_fp4quant(
         where ``outer_m = row % 32``, ``inner_m = (row % 128) // 32``, etc.
         Default is ``False`` (row-major layout).
 
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        A tuple of ``(y_fp4, block_scale)``:
+
+        - ``y_fp4``: Quantized FP4 values packed as uint8.
+        - ``block_scale``: Per-block scale factors.
+
     Notes
     -----
     - Requires SM100+ (Blackwell) for FP4 quantization PTX intrinsics.
@@ -1855,14 +1918,11 @@ def rmsnorm_fp4quant(
     is_3d = input.dim() == 3
     if is_3d:
         B, S, H = input.shape
-        input = input.view(B * S, H).contiguous()
-        y_fp4_2d = y_fp4.view(B * S, -1)
-        block_scale_2d = block_scale.view(B * S, -1)
+        input_2d = input.view(B * S, H).contiguous()
     else:
-        y_fp4_2d = y_fp4
-        block_scale_2d = block_scale
+        input_2d = input
 
-    batch_size, hidden_size = input.shape
+    batch_size, hidden_size = input_2d.shape
     dtype = input.dtype
 
     assert hidden_size % block_size == 0, "hidden_size must be divisible by block_size"
@@ -1876,6 +1936,65 @@ def rmsnorm_fp4quant(
     )
     sm_version = get_sm_version(input.device)
 
+    # Allocate output tensors if not provided
+    if y_fp4 is None:
+        if is_3d:
+            y_fp4 = torch.empty(
+                (B, S, hidden_size // 2),
+                dtype=torch.float4_e2m1fn_x2,
+                device=input.device,
+            )
+        else:
+            y_fp4 = torch.empty(
+                (batch_size, hidden_size // 2),
+                dtype=torch.float4_e2m1fn_x2,
+                device=input.device,
+            )
+
+    if block_scale is None:
+        # Determine scale dtype based on format
+        scale_dtype = (
+            torch.uint8 if actual_scale_format == "ue8m0" else torch.float8_e4m3fn
+        )
+        num_sf_blocks_per_row = hidden_size // block_size
+
+        if is_sf_swizzled_layout:
+            # Swizzled layout: flattened with 128x4 tile pattern
+            num_m_tiles = (batch_size + 127) // 128
+            num_k_tiles = (num_sf_blocks_per_row + 3) // 4
+            k_tile_stride = 512
+            swizzled_size = num_m_tiles * num_k_tiles * k_tile_stride
+            block_scale = torch.empty(
+                (swizzled_size,), dtype=scale_dtype, device=input.device
+            )
+        else:
+            if is_3d:
+                block_scale = torch.empty(
+                    (B, S, num_sf_blocks_per_row),
+                    dtype=scale_dtype,
+                    device=input.device,
+                )
+            else:
+                block_scale = torch.empty(
+                    (batch_size, num_sf_blocks_per_row),
+                    dtype=scale_dtype,
+                    device=input.device,
+                )
+
+    # Get 2D views for kernel
+    if is_3d:
+        y_fp4_2d = y_fp4.view(B * S, -1)
+        block_scale_2d = (
+            block_scale.view(B * S, -1) if not is_sf_swizzled_layout else block_scale
+        )
+    else:
+        y_fp4_2d = y_fp4
+        block_scale_2d = block_scale
+
+    # Create global_scale tensor if not provided (1.0 = no scaling)
+    if global_scale is None:
+        global_scale = torch.ones(1, dtype=torch.float32, device=input.device)
+
     # Get cached tensor_api and call it directly
     tensor_api = _get_compiled_kernel(
         hidden_size,
@@ -1886,13 +2005,16 @@ def rmsnorm_fp4quant(
         is_sf_swizzled_layout,
     )
     tensor_api(
-        input.contiguous(),
+        input_2d.contiguous(),
         weight.contiguous(),
         y_fp4_2d,
         block_scale_2d.view(torch.uint8),
+        global_scale.contiguous(),
         batch_size,
         eps,
     )
+
+    return y_fp4, block_scale
 
 
 __all__ = [
