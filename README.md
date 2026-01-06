@@ -20,7 +20,7 @@ High-Performance GPU Kernels for Inference
 ## Why FlashInfer?
 
 - **State-of-the-art Performance**: Optimized kernels for prefill, decode, and mixed batching scenarios
-- **Multiple Backends**: Automatically selects the best backend (FA2, FA3, cuDNN, CUTLASS, TensorRT-LLM) for your hardware and workload
+- **Multiple Backends**: Automatically selects the best backend for your hardware and workload
 - **Modern Architecture Support**: Support for SM75 (Turing) and later (through Blackwell)
 - **Low-Precision Compute**: FP8 and FP4 quantization for attention, GEMM, and MoE operations
 - **Production-Ready**: CUDAGraph and torch.compile compatible for low-latency serving
@@ -36,12 +36,12 @@ High-Performance GPU Kernels for Inference
 - **POD-Attention**: Fused prefill+decode for mixed batching
 
 ### GEMM & Linear Operations
-- **FP8 GEMM**: Per-tensor and groupwise scaling with cuDNN, cuBLAS, and CUTLASS backends
+- **FP8 GEMM**: Per-tensor and groupwise scaling
 - **FP4 GEMM**: NVFP4 and MXFP4 matrix multiplication for Blackwell GPUs
 - **Grouped GEMM**: Efficient batched matrix operations for LoRA and multi-expert routing
 
 ### Mixture of Experts (MoE)
-- **Fused MoE Kernels**: CUTLASS and TensorRT-LLM backends
+- **Fused MoE Kernels**
 - **Multiple Routing Methods**: DeepSeek-V3, Llama-4, and standard top-k routing
 - **Quantized MoE**: FP8 and FP4 expert weights with block-wise scaling
 
