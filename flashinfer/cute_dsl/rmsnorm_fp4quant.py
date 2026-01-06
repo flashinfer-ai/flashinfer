@@ -28,16 +28,13 @@ import math
 import operator
 from typing import Callable, Tuple
 
-import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
-import cutlass.torch as cutlass_torch
 import torch
 from cutlass import Float32, Int32, Int64, Uint32, Uint64, Uint8
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
 
-from .utils import make_ptr
 from ..api_logging import flashinfer_api
 
 
@@ -1003,68 +1000,24 @@ class RMSNormFP4QuantKernel:
     @cute.jit
     def __call__(
         self,
-        x_ptr: cute.Pointer,
-        w_ptr: cute.Pointer,
-        y_ptr: cute.Pointer,
-        s_ptr: cute.Pointer,
-        global_scale_ptr: cute.Pointer,
+        mX: cute.Tensor,
+        mW: cute.Tensor,
+        mY: cute.Tensor,
+        mS: cute.Tensor,
+        mGlobalScale: cute.Tensor,
         M: Int32,
         eps: Float32,
-        stream: cuda.CUstream,
+        stream,
     ):
         """Host function to launch the kernel.
 
-        Takes raw pointers and batch size M, creates tensors internally.
-        This avoids the overhead of from_dlpack() at runtime.
-
-        Args:
-            global_scale_ptr: Pointer to global scale tensor (shape [1], float32).
-                The kernel reads this value and computes 1/global_scale to apply:
-                y = rmsnorm(x) / global_scale. Use tensor with value 1.0 for no scaling.
+        Takes tensors directly via TVM-FFI.
+        - mX: Input tensor, shape (M, H), row-major
+        - mW: Weight tensor, shape (H,)
+        - mY: Output FP4 tensor, shape (M, H // 2), row-major (packed)
+        - mS: Scale factor tensor, shape depends on swizzle mode
+        - mGlobalScale: Global scale tensor, shape (1,), float32
         """
-        H = self.H
-
-        # Create tensors from pointers with known layouts
-        # Layout: (M, H) with row-major order (stride H for rows, 1 for columns)
-        mX = cute.make_tensor(
-            x_ptr,
-            layout=cute.make_ordered_layout((M, H), order=(1, 0)),
-        )
-        mW = cute.make_tensor(
-            w_ptr,
-            layout=cute.make_layout((H,)),
-        )
-        mY = cute.make_tensor(
-            y_ptr,
-            layout=cute.make_ordered_layout((M, H // 2), order=(1, 0)),
-        )
-
-        # Create mS tensor with appropriate layout based on swizzle mode
-        if cutlass.const_expr(self.output_swizzled):
-            # For swizzled output, use 1D layout
-            # The swizzle writes use flat offsets: mS[swizzled_offset]
-            # We compute the swizzled offset in the kernel, so just use a 1D layout
-            # with stride 1 to treat the pointer as a flat array
-            num_m_tiles = (M + Int32(127)) // Int32(128)
-            swizzled_size = num_m_tiles * Int32(self.num_k_tiles * self.k_tile_stride)
-            mS = cute.make_tensor(
-                s_ptr,
-                layout=cute.make_layout((swizzled_size,), stride=(Int32(1),)),
-            )
-        else:
-            # For non-swizzled output, use 2D row-major layout
-            mS = cute.make_tensor(
-                s_ptr,
-                layout=cute.make_ordered_layout(
-                    (M, self.num_sf_blocks_per_row), order=(1, 0)
-                ),
-            )
-
-        # Create global scale tensor (scalar)
-        mGlobalScale = cute.make_tensor(
-            global_scale_ptr,
-            layout=cute.make_layout((1,)),
-        )
 
         # Create TV layout
         tv_shape, tv_stride = self._make_tv_layout(
@@ -1745,51 +1698,9 @@ def _get_compiled_kernel(
     """
     Get a compiled kernel closure that takes torch.Tensor directly.
 
+    Uses TVM-FFI for efficient tensor passing without manual pointer construction.
     """
     cutlass_dtype = cutlass.Float16 if is_fp16 else cutlass.BFloat16
-
-    def get_cute_pointers(tensors):
-        """Convert torch tensors to cute pointers, or create dummy pointers for compilation."""
-        if tensors is None:
-            # Dummy pointers for compilation - just need alignment
-            return [
-                make_ptr(
-                    cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16
-                ),  # x
-                make_ptr(
-                    cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16
-                ),  # w
-                make_ptr(
-                    cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16
-                ),  # y
-                make_ptr(
-                    cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16
-                ),  # s
-                make_ptr(
-                    cutlass.Float32, 16, cute.AddressSpace.gmem, assumed_align=4
-                ),  # global_scale
-            ]
-        x, w, y, s, global_scale = tensors
-        return [
-            make_ptr(
-                cutlass_dtype, x.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
-            ),
-            make_ptr(
-                cutlass_dtype, w.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
-            ),
-            make_ptr(
-                cutlass.Uint8, y.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
-            ),
-            make_ptr(
-                cutlass.Uint8, s.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
-            ),
-            make_ptr(
-                cutlass.Float32,
-                global_scale.data_ptr(),
-                cute.AddressSpace.gmem,
-                assumed_align=4,
-            ),
-        ]
 
     # Create kernel instance
     kernel_obj = RMSNormFP4QuantKernel(
@@ -1802,13 +1713,59 @@ def _get_compiled_kernel(
         scale_format=scale_format,
     )
 
-    # Compile with dummy pointers
+    # Use symbolic size for dynamic M dimension
+    sym_m = cute.sym_int()
+
+    # Create fake tensors for compilation with TVM-FFI
+    # Use stride_order=(1, 0) for row-major layout and assumed_align=128 for async copy
+    x_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass_dtype, (sym_m, hidden_size), stride_order=(1, 0), assumed_align=128
+    )
+    w_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass_dtype, (hidden_size,), assumed_align=128
+    )
+    y_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Uint8, (sym_m, hidden_size // 2), stride_order=(1, 0), assumed_align=128
+    )
+
+    # Scale factor tensor layout depends on swizzle mode
+    if is_sf_swizzled_layout:
+        # For swizzled mode, use 1D layout - the swizzle pattern is computed in kernel
+        # Size is: num_m_tiles * num_k_tiles * 512, which is independent of M
+        # Use a separate symbolic variable for this size
+        sym_swizzled_size = cute.sym_int()
+        s_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Uint8, (sym_swizzled_size,), assumed_align=128
+        )
+    else:
+        # For non-swizzled mode, use 2D row-major layout
+        s_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Uint8,
+            (sym_m, hidden_size // block_size),
+            stride_order=(1, 0),
+            assumed_align=128,
+        )
+
+    # Create fake stream that uses environment stream at runtime
+    stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+
+    # Global scale fake tensor (shape [1], float32)
+    global_scale_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Float32, (1,), assumed_align=4
+    )
+
+    # Compile with TVM-FFI enabled
     compiled_kernel = cute.compile(
         kernel_obj,
-        *get_cute_pointers(None),
+        x_fake,
+        w_fake,
+        y_fake,
+        s_fake,
+        global_scale_fake,
         Int32(1),  # Dummy M
         Float32(1e-6),  # Dummy eps
-        cutlass_torch.current_stream(),
+        stream_fake,
+        options="--enable-tvm-ffi",
     )
 
     def tensor_api(
@@ -1820,13 +1777,20 @@ def _get_compiled_kernel(
         M: int,
         eps: float,
     ) -> None:
-        """Runtime API that converts tensors to pointers and calls the kernel."""
+        """Runtime API that passes torch tensors directly via TVM-FFI."""
         nonlocal compiled_kernel
+        # For swizzled mode, flatten the scale tensor to 1D
+        s_tensor = s.flatten() if is_sf_swizzled_layout else s.contiguous()
+        # View y as uint8 since kernel expects uint8 but caller may pass float4_e2m1fn_x2
+        y_uint8 = y.view(torch.uint8)
         compiled_kernel(
-            *get_cute_pointers([x, w, y, s, global_scale]),
+            x,
+            w,
+            y_uint8,
+            s_tensor,
+            global_scale,
             Int32(M),
             Float32(eps),
-            cutlass_torch.current_stream(),
         )
 
     return tensor_api
