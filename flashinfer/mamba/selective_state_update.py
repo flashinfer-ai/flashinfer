@@ -87,12 +87,26 @@ def selective_state_update(
     """
     output = torch.empty_like(x)
     _selective_state_update(
-        state, x, dt, output, A, B, C, D, z, dt_bias, dt_softplus, state_batch_indices, pad_slot_id
+        state,
+        x,
+        dt,
+        output,
+        A,
+        B,
+        C,
+        D,
+        z,
+        dt_bias,
+        dt_softplus,
+        state_batch_indices,
+        pad_slot_id,
     )
     return output
 
 
-@register_custom_op("flashinfer::selective_state_update", mutates_args=("state", "output"))
+@register_custom_op(
+    "flashinfer::selective_state_update", mutates_args=("state", "output")
+)
 def _selective_state_update(
     state: torch.Tensor,
     x: torch.Tensor,
@@ -110,7 +124,19 @@ def _selective_state_update(
 ) -> None:
     """Internal function registered with torch.library for torch.compile() support."""
     get_selective_state_update_module().selective_state_update(
-        state, x, dt, output, A, B, C, D, z, dt_bias, dt_softplus, state_batch_indices, pad_slot_id
+        state,
+        x,
+        dt,
+        output,
+        A,
+        B,
+        C,
+        D,
+        z,
+        dt_bias,
+        dt_softplus,
+        state_batch_indices,
+        pad_slot_id,
     )
 
 

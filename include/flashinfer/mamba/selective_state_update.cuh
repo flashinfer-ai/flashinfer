@@ -466,9 +466,7 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, cudaStream_t
     dim3 grid(blocks_per_dim, params.batch, params.nheads);
     selective_state_update_kernel_simple<input_t, weight_t, matrixA_t, state_t, DSTATE, numWarps>
         <<<grid, block, 0, stream>>>(params);
-  }
-  else
-  {
+  } else {
     constexpr auto numConsumers = 4;
     constexpr auto numWarps = 1 + numConsumers;
     constexpr auto numStages = 3;
@@ -485,15 +483,16 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, cudaStream_t
     auto dim = params.dim;
     auto B = params.state_cache_size;
 
-    FLASHINFER_CHECK(reinterpret_cast<uintptr_t>(params.state) % 128 == 0);  // TMA requires 128B aligned
-    auto tensorState = tma::createTensorMap<state_t>(params.state, B * nh * dim, DSTATE, rowsPerStage, DSTATE);
+    FLASHINFER_CHECK(reinterpret_cast<uintptr_t>(params.state) % 128 ==
+                     0);  // TMA requires 128B aligned
+    auto tensorState =
+        tma::createTensorMap<state_t>(params.state, B * nh * dim, DSTATE, rowsPerStage, DSTATE);
     FLASHINFER_CHECK(params.dim % rowsPerStage == 0);
 
     scan_func<<<grid, block, 0, stream>>>(params, tensorState);
     cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess)
-    {
-        printf("Kernel launch failed: %s\n", cudaGetErrorString(err));
+    if (err != cudaSuccess) {
+      printf("Kernel launch failed: %s\n", cudaGetErrorString(err));
     }
   }
 }

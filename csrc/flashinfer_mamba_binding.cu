@@ -22,9 +22,8 @@ namespace flashinfer::mamba {
 
 void selective_state_update(TensorView state, TensorView x, TensorView dt, TensorView output,
                             TensorView A, TensorView B, TensorView C, TensorView D,
-                            Optional<TensorView> z, Optional<TensorView> dt_bias,
-                            bool dt_softplus, Optional<TensorView> state_batch_indices,
-                            int64_t pad_slot_id);
+                            Optional<TensorView> z, Optional<TensorView> dt_bias, bool dt_softplus,
+                            Optional<TensorView> state_batch_indices, int64_t pad_slot_id);
 
 }  // namespace flashinfer::mamba
 

@@ -201,7 +201,6 @@ void selective_state_update(TensorView state, TensorView x, TensorView dt, Tenso
 
     throw std::runtime_error("selective_state_update is not implemented yet.");
   }
-
 }
 
 }  // namespace flashinfer::mamba
