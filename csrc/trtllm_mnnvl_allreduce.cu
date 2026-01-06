@@ -74,10 +74,15 @@ void trtllm_mnnvl_allreduce_fusion(
     // Validate input parameters
     TVM_FFI_ICHECK_EQ(token_dim % (sizeof(float4) / sizeof(c_type)), 0)
         << "token_dim must be divisible by " << sizeof(float4) / sizeof(c_type);
-    TVM_FFI_ICHECK(output.has_value() && output.value().size(0) == input.size(0) &&
-                   output.value().size(1) == input.size(1))
-        << "output shape mismatch: expected (" << input.size(0) << ", " << input.size(1)
-        << ") but got (" << output.value().size(0) << ", " << output.value().size(1) << ")";
+    // The output can be null only if we are fusing quantization
+    TVM_FFI_ICHECK(quant_type_enum != QuantType::kNone || output.has_value())
+        << "Output tensor must be provided when quantization fusion is disabled";
+    if (output.has_value()) {
+      TVM_FFI_ICHECK(output.value().size(0) == input.size(0) &&
+                     output.value().size(1) == input.size(1))
+          << "output shape mismatch: expected (" << input.size(0) << ", " << input.size(1)
+          << ") but got (" << output.value().size(0) << ", " << output.value().size(1) << ")";
+    }
     TVM_FFI_ICHECK(nranks >= 2 && nranks <= 64)
         << "nranks must be between 2 and 64, got " << nranks;
     TVM_FFI_ICHECK(rank >= 0 && rank < nranks)
@@ -106,8 +111,8 @@ void trtllm_mnnvl_allreduce_fusion(
           << gamma.value().size(0) << ")";
       switch (quant_type_enum) {
         case QuantType::kFP8:
-          TVM_FFI_ICHECK(quant_out.has_value() && sf_out.value().size(0) == num_tokens &&
-                         sf_out.value().size(1) == token_dim)
+          TVM_FFI_ICHECK(quant_out.has_value() && quant_out.value().size(0) == num_tokens &&
+                         quant_out.value().size(1) == token_dim)
               << "quant_out shape mismatch: expected (" << num_tokens << ", " << token_dim
               << ") but got (" << quant_out.value().size(0) << ", " << quant_out.value().size(1)
               << ")";
