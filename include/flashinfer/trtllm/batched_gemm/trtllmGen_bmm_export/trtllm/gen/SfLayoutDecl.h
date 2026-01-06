@@ -72,23 +72,23 @@ enum class SfLayout {
 
 inline std::string sfLayoutToString(SfLayout layout) {
   switch (layout) {
-    case SfLayout::Linear:
-      return "linear";
-    case SfLayout::R8c4:
-      return "8x4";
-    case SfLayout::R8c16:
-      return "8x16";
-    case SfLayout::R128c4:
-      return "128x4";
-    default:
-      assert(false);
-      return "Unsupported layout";
+  case SfLayout::Linear:
+    return "linear";
+  case SfLayout::R8c4:
+    return "8x4";
+  case SfLayout::R8c16:
+    return "8x16";
+  case SfLayout::R128c4:
+    return "128x4";
+  default:
+    assert(false);
+    return "Unsupported layout";
   }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-}  // namespace gen
-}  // namespace trtllm
+} // namespace gen
+} // namespace trtllm
 
-}  // namespace batchedGemm
+} // namespace batchedGemm

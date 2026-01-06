@@ -109,6 +109,9 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
           continue;
         }
       }
+      if ((int64_t)options.mEltwiseActType != (int64_t)mOptions.eltwiseActType) {
+        continue;
+      }
 
       if (mOptions.transposeMmaOutput && options.mEpilogueTileM == mOptions.epilogueTileM) {
         mPassingConfigIndices.push_back(i);
@@ -219,6 +222,8 @@ void TrtllmGenBatchedGemmRunner::run(
   gemmData.mInputBuffers.mPtrSfB = mOptions.transposeMmaOutput ? sfA : sfB;
   gemmData.mInputBuffers.mPtrScaleC = scaleC;
   gemmData.mInputBuffers.mPtrScaleGate = scaleGateC;
+  // TODO amitz-nv: Do we want to pass scaleAct instead of using scaleGateC?
+  gemmData.mInputBuffers.mPtrScaleAct = scaleGateC;
   gemmData.mInputBuffers.mPtrPerTokenSfA =
       mOptions.transposeMmaOutput ? perTokensSfB : perTokensSfA;
   gemmData.mInputBuffers.mPtrPerTokenSfB =

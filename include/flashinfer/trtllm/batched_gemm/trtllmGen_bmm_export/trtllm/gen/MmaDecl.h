@@ -21,9 +21,9 @@
 #include <string>
 #ifndef TLLM_GEN_EXPORT_INTERFACE
 #include "trtllm/gen/CommonUtils.h"
-#else  // TLLM_GEN_EXPORT_INTERFACE
+#else // TLLM_GEN_EXPORT_INTERFACE
 #include "CommonUtils.h"
-#endif  // TLLM_GEN_EXPORT_INTERFACE
+#endif // TLLM_GEN_EXPORT_INTERFACE
 
 namespace batchedGemm {
 
@@ -73,38 +73,40 @@ inline bool mmaKindIsBlockFmt(MmaKind mmaKind) {
 // For logging and error reporting
 inline std::string mmaKindToString(MmaKind mmaKind) {
   switch (mmaKind) {
-    case MmaKind::Auto:
-      return "Auto";
-    case MmaKind::Fp16:
-      return "Fp16";
-    case MmaKind::Fp8Fp6Fp4:
-      return "Fp8Fp6Fp4";
-    case MmaKind::Int8:
-      return "Int8";
-    case MmaKind::MxFp4NvFp4:
-      return "MxFp4NvFp4";
-    case MmaKind::MxFp8Fp6Fp4:
-      return "MxFp8Fp6Fp4";
-    case MmaKind::Tf32:
-      return "Tf32";
-    default:
-      assert(false);
-      return "Unsupported type";
+  case MmaKind::Auto:
+    return "Auto";
+  case MmaKind::Fp16:
+    return "Fp16";
+  case MmaKind::Fp8Fp6Fp4:
+    return "Fp8Fp6Fp4";
+  case MmaKind::Int8:
+    return "Int8";
+  case MmaKind::MxFp4NvFp4:
+    return "MxFp4NvFp4";
+  case MmaKind::MxFp8Fp6Fp4:
+    return "MxFp8Fp6Fp4";
+  case MmaKind::Tf32:
+    return "Tf32";
+  default:
+    assert(false);
+    return "Unsupported type";
   }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// function to get the TMEM column stride per group (i.e., 64 K elements)
-inline int32_t getTmemColStridePerGroup(int32_t tileMn, int32_t mmaK) {
-  // Calculate the stride of TMEM column for every 64 elements in the K dimension
-  int32_t div = 2 * ceilDiv(tileMn, 64);
-  return mmaK == 96 ? std::max(4, div) : div;
+// Get the TMEM column stride per group (i.e. kGroupSize * blockSize K elements)
+inline int32_t getTmemColStridePerGroup(int32_t tileMn, int32_t mmaK, int32_t kGroupSize) {
+  int32_t colStride = 2 * ceilDiv(tileMn, 64);
+  if (mmaK == 96) {
+    colStride = std::max(4, colStride);
+  }
+  return colStride;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-}  // namespace gen
-}  // namespace trtllm
+} // namespace gen
+} // namespace trtllm
 
-}  // namespace batchedGemm
+} // namespace batchedGemm

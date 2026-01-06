@@ -16,8 +16,8 @@
  */
 #pragma once
 
-#include <cassert>
 #include <string>
+#include <cassert>
 
 namespace batchedGemm {
 
@@ -38,24 +38,32 @@ enum class RouteImpl {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-inline bool doesRouteImplUseNoRoute(RouteImpl mode) { return (mode == RouteImpl::NoRoute); }
+inline bool doesRouteImplUseNoRoute(RouteImpl mode) {
+  return (mode == RouteImpl::NoRoute);
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-inline bool doesRouteImplUseLdgsts(RouteImpl mode) { return (mode == RouteImpl::Ldgsts); }
+inline bool doesRouteImplUseLdgsts(RouteImpl mode) {
+  return (mode == RouteImpl::Ldgsts);
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-inline bool doesRouteImplUseTma(RouteImpl mode) { return (mode == RouteImpl::Tma); }
+inline bool doesRouteImplUseTma(RouteImpl mode) {
+  return (mode == RouteImpl::Tma);
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-inline bool doesRouteImplUseLdgPlusSts(RouteImpl mode) { return (mode == RouteImpl::LdgPlusSts); }
+inline bool doesRouteImplUseLdgPlusSts(RouteImpl mode) {
+  return (mode == RouteImpl::LdgPlusSts);
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-}  // namespace batchedGemm
+} // namespace batchedGemm
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-}  // namespace batchedGemm
+} // namespace batchedGemm
