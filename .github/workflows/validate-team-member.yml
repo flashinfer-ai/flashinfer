@@ -30,16 +30,7 @@ jobs:
         run: |
           echo "Checking if $PR_AUTHOR is a member of agent-users team..."
 
-          gh api -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" /orgs/$ORG/teams/commiter/members
-
-          # Check if user is in the agent-users team
-          if gh api "/orgs/$ORG/teams/agent-users/memberships/$PR_AUTHOR" --silent 2>/dev/null; then
-            echo "✅ User $PR_AUTHOR is authorized (member of agent-users team)"
-            echo "authorized=true" >> $GITHUB_OUTPUT
-          else
-            echo "❌ User $PR_AUTHOR is not authorized (not a member of agent-users team)"
-            echo "authorized=false" >> $GITHUB_OUTPUT
-          fi
+          gh api -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" /orgs/$ORG/teams/agent-users/memberships/$PR_AUTHOR
 
       - name: Checkout repository
         if: steps.check-permission.outputs.authorized == 'true'
