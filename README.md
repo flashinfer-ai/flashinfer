@@ -5,7 +5,7 @@
   </picture>
 </p>
 <h1 align="center">
-High-Performance GPU Kernels for LLM Inference
+High-Performance GPU Kernels for Inference
 </h1>
 
 <p align="center">
@@ -15,7 +15,7 @@ High-Performance GPU Kernels for LLM Inference
 [![Build Status](https://ci.tlcpack.ai/job/flashinfer-ci/job/main/badge/icon)](https://ci.tlcpack.ai/job/flashinfer-ci/job/main/)
 [![Documentation](https://github.com/flashinfer-ai/flashinfer/actions/workflows/build-doc.yml/badge.svg)](https://github.com/flashinfer-ai/flashinfer/actions/workflows/build-doc.yml)
 
-**FlashInfer** is a library and kernel generator for LLM inference that delivers state-of-the-art performance across diverse GPU architectures. It provides unified APIs for attention, GEMM, and MoE operations with multiple backend implementations including FlashAttention-2/3, cuDNN, CUTLASS, and TensorRT-LLM.
+**FlashInfer** is a library and kernel generator for inference that delivers state-of-the-art performance across diverse GPU architectures. It provides unified APIs for attention, GEMM, and MoE operations with multiple backend implementations including FlashAttention-2/3, cuDNN, CUTLASS, and TensorRT-LLM.
 
 ## Why FlashInfer?
 
@@ -202,7 +202,7 @@ Users can customize their own attention variants with additional parameters. For
 
 ## Adoption
 
-FlashInfer powers LLM inference in:
+FlashInfer powers inference in:
 
 - [SGLang](https://github.com/sgl-project/sglang)
 - [vLLM](https://github.com/vllm-project/vllm)
