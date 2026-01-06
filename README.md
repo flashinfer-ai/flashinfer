@@ -194,9 +194,7 @@ For detailed information about logging levels, configuration, and advanced featu
 
 Starting from FlashInfer v0.2, users can customize their own attention variants with additional parameters. For more details, refer to our [JIT examples](https://github.com/flashinfer-ai/flashinfer/blob/main/tests/utils/test_jit_example.py).
 
-## GPU and CUDA Support
-
-FlashInfer currently provides support for NVIDIA SM architectures 75 and higher and beta support for 103, 110, 120, and 121.
+## CUDA Support
 
 **Supported CUDA Versions:** 12.6, 12.8, 13.0, 13.1
 
