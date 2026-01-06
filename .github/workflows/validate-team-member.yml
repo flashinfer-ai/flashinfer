@@ -18,7 +18,7 @@ jobs:
       pull-requests: read
       issues: read
       id-token: write
-      members: read  # Required to check team membership
+      # members: read  # Required to check team membership
 
     steps:
       - name: Check team membership
