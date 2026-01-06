@@ -24,13 +24,44 @@ jobs:
       issues: read
       id-token: write
       actions: read # Required for Claude to read CI results on PRs
+      members: read  # Required to check team membership
     steps:
+      - name: Check team membership
+        id: check-permission
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ORG: ${{ github.repository_owner }}
+        run: |
+          # Get the username based on the event type
+          if [[ "${{ github.event_name }}" == "issue_comment" ]] || [[ "${{ github.event_name }}" == "pull_request_review_comment" ]]; then
+            ACTOR="${{ github.event.comment.user.login }}"
+          elif [[ "${{ github.event_name }}" == "pull_request_review" ]]; then
+            ACTOR="${{ github.event.review.user.login }}"
+          elif [[ "${{ github.event_name }}" == "issues" ]]; then
+            ACTOR="${{ github.event.issue.user.login }}"
+          else
+            ACTOR="${{ github.actor }}"
+          fi
+
+          echo "Checking if $ACTOR is a member of agent-users team..."
+
+          # Check if user is in the agent-users team
+          if gh api "/orgs/$ORG/teams/agent-users/memberships/$ACTOR" --silent 2>/dev/null; then
+            echo "✅ User $ACTOR is authorized (member of agent-users team)"
+            echo "authorized=true" >> $GITHUB_OUTPUT
+          else
+            echo "❌ User $ACTOR is not authorized (not a member of agent-users team)"
+            echo "authorized=false" >> $GITHUB_OUTPUT
+          fi
+
       - name: Checkout repository
+        if: steps.check-permission.outputs.authorized == 'true'
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
       - name: Run Claude Code
+        if: steps.check-permission.outputs.authorized == 'true'
         id: claude
         uses: anthropics/claude-code-action@v1
         with:
@@ -47,4 +78,3 @@ jobs:
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
           # claude_args: '--allowed-tools Bash(gh pr:*)'
-
