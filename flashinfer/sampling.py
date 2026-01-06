@@ -35,6 +35,7 @@ def get_seed_and_offset(
     if generator is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         generator = torch.Generator(device=device)
+        generator.seed()
     # add mutex if multi-trheading needed
     state = generator.get_state()
     seed, offset = state.view(torch.int64)
