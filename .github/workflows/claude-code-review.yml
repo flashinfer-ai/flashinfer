@@ -1,0 +1,52 @@
+name: Claude Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+    # Optional: Only run on specific file changes
+    # paths:
+    #   - "src/**/*.ts"
+    #   - "src/**/*.tsx"
+    #   - "src/**/*.js"
+    #   - "src/**/*.jsx"
+
+jobs:
+  claude-review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      id-token: write
+      members: read  # Required to check team membership
+
+    steps:
+      - name: Check team membership
+        id: check-permission
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          ORG: ${{ github.repository_owner }}
+        run: |
+          echo "Checking if $PR_AUTHOR is a member of agent-users team..."
+
+          # Check if user is in the agent-users team
+          if gh api "/orgs/$ORG/teams/agent-users/memberships/$PR_AUTHOR" --silent 2>/dev/null; then
+            echo "✅ User $PR_AUTHOR is authorized (member of agent-users team)"
+            echo "authorized=true" >> $GITHUB_OUTPUT
+          else
+            echo "❌ User $PR_AUTHOR is not authorized (not a member of agent-users team)"
+            echo "authorized=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout repository
+        if: steps.check-permission.outputs.authorized == 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Run Claude Code Review
+        if: steps.check-permission.outputs.authorized == 'true'
+        id: claude-review
+        run: |
+          echo "pretend there is a claude agent working here..."
