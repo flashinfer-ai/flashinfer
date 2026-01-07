@@ -488,10 +488,6 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, cudaStream_t
     FLASHINFER_CHECK(params.dim % rowsPerStage == 0);
 
     scan_func<<<grid, block, 0, stream>>>(params, tensorState);
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-      printf("Kernel launch failed: %s\n", cudaGetErrorString(err));
-    }
   }
 }
 
