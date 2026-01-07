@@ -30,9 +30,9 @@ jobs:
         shell: bash
         run: |
           echo "Checking if $PR_AUTHOR is a member of agent-users team..."
-
+          gh auth login
           gh auth status
-          gh api /user -q .login
+          # gh api /user -q .login
 
           if [[ "$(GH_PAGER=cat gh api \
             -H "Accept: application/vnd.github+json" \
