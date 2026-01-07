@@ -314,8 +314,7 @@ std::vector<CutlassGemmConfig> CutlassFp4GemmRunner<T, fp4GemmType>::getConfigs(
 
   // There’s no heuristic yet, so for users without autotuning, we provide an ordering based on
   // performance sweeps from common workloads.
-  //std::vector<int64_t> best_tactics_index = {22, 20, 29, 4, 18};
-  std::vector<int64_t> best_tactics_index = {0, 1, 2, 3, 4};
+  std::vector<int64_t> best_tactics_index = {22, 20, 29, 4, 18};
   std::vector<CutlassGemmConfig> newCandidateConfigs;
   for (auto const& tactic_index : best_tactics_index) {
     newCandidateConfigs.push_back(candidateConfigs[tactic_index]);

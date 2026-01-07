@@ -30,8 +30,6 @@
 #include "flashinfer/arch_condition.h"
 #include "flashinfer/cutlass_utils.cuh"
 
-//#include "flashinfer/gemm/fp4_gemm_template_sm100.h" 
-
 #ifndef _WIN32
 #pragma GCC diagnostic pop
 #endif  // #ifndef _WIN32
@@ -125,7 +123,7 @@ size_t genericFp4UltraGemmKernelLauncher(void* D, void const* A, void const* B, 
     using ElementCompute = float;                                                                            \
     using ElementAccumulator = float;                                                                        \
     using OperatorClass = cutlass::arch::OpClassTensorOp;                                                    \
-    using EpilogueTileType = std::conditional_t<CTA_M_ == 128 && CTA_N_ == 256 && CTA_K_ == 256,             \
+    using EpilogueTileType = std::conditional_t<CTA_M_ == 128 && CTA_N_ == 256 && CTA_K_ == 768,             \
                                                 cute::Shape<cute::_128, cute::_64>,                          \
                                                 cutlass::epilogue::collective::EpilogueTileAuto>;            \
     using EpilogueSchedule = SMTypeAdapter_sm103<XSM_>::EpilogueSchedule;                                          \
@@ -148,15 +146,15 @@ size_t genericFp4UltraGemmKernelLauncher(void* D, void const* A, void const* B, 
         MainloopSchedule>::CollectiveOp;                                                                     \
                                                                                                              \
     template <typename Base>                                                                                 \
-    struct Sm10x11xOnly : Base {                                                                             \
+    struct Sm103Only : Base {                                                                             \
       using typename Base::Params;                                                                           \
       CUTLASS_DEVICE                                                                                         \
       void operator()(Params const& params, char* smem_buf) {                                                \
-        if constexpr (flashinfer::arch::is_major_v<10> || flashinfer::arch::is_major_v<11>) {                \
+        if constexpr (flashinfer::arch::is_match_v<103>) {                \
           this->Base::operator()(params, smem_buf);                                                          \
         } else {                                                                                             \
           if (cute::thread0()) {                                                                             \
-            printf("%s : This kernel shall only run on SM10x and SM11x devices.\n",                          \
+            printf("%s : This kernel shall only run on SM103 devices.\n",                          \
                    __PRETTY_FUNCTION__);                                                                     \
             __trap();                                                                                        \
           }                                                                                                  \
@@ -164,7 +162,7 @@ size_t genericFp4UltraGemmKernelLauncher(void* D, void const* A, void const* B, 
       }                                                                                                      \
     };                                                                                                       \
     using GemmKernel =                                                                                       \
-        Sm10x11xOnly<cutlass::gemm::kernel::GemmUniversal<cute::Shape<int, int, int, int>,                   \
+        Sm103Only<cutlass::gemm::kernel::GemmUniversal<cute::Shape<int, int, int, int>,                   \
                                                           CollectiveMainloop, CollectiveEpilogue,            \
                                                           cutlass::gemm::PersistentScheduler>>;              \
                                                                                                              \
