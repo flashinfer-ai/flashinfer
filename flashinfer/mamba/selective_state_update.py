@@ -97,7 +97,7 @@ def selective_state_update(
         B = B.unsqueeze(1)
     if C.dim() == 2:
         C = C.unsqueeze(1)
-    if D is not None and D.dim() == 1:
+    if D.dim() == 1:
         D = D.unsqueeze(0)
     if z is not None and z.dim() == 2:
         z = z.unsqueeze(1)
