@@ -24,15 +24,14 @@ jobs:
       - name: Check team membership
         id: check-permission
         env:
-          GH_TOKEN: ${{ secrets.FLASHINFER_GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           ORG: ${{ github.repository_owner }}
         shell: bash
         run: |
           echo "Checking if $PR_AUTHOR is a member of agent-users team..."
-          gh auth login
           gh auth status
-          # gh api /user -q .login
+          gh api /user -q .login
 
           if [[ "$(GH_PAGER=cat gh api \
             -H "Accept: application/vnd.github+json" \
