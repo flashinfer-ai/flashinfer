@@ -85,6 +85,24 @@ def selective_state_update(
     output : torch.Tensor
         Output tensor with shape (batch, dim) or (batch, nheads, dim)
     """
+    if state.dim() == 3:
+        state = state.unsqueeze(1)
+    if x.dim() == 2:
+        x = x.unsqueeze(1)
+    if dt.dim() == 2:
+        dt = dt.unsqueeze(1)
+    if A.dim() == 2:
+        A = A.unsqueeze(0)
+    if B.dim() == 2:
+        B = B.unsqueeze(1)
+    if C.dim() == 2:
+        C = C.unsqueeze(1)
+    if D is not None and D.dim() == 1:
+        D = D.unsqueeze(0)
+    if z is not None and z.dim() == 2:
+        z = z.unsqueeze(1)
+    if dt_bias is not None and dt_bias.dim() == 1:
+        dt_bias = dt_bias.unsqueeze(0)
     output = torch.empty_like(x)
     _selective_state_update(
         state,
