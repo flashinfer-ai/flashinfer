@@ -49,7 +49,7 @@ def selective_state_update(
     state_batch_indices: Optional[torch.Tensor] = None,
     pad_slot_id: int = -1,
 ) -> torch.Tensor:
-    r"""Selective state update operation for Mamba layers.
+    r"""Selective state update operation for Mamba layers (the generation phase).
 
     Parameters
     ----------
