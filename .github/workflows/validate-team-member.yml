@@ -26,7 +26,7 @@ jobs:
           username: ${{ github.event.pull_request.user.login }}
           organization: ${{ github.repository_owner }}
           team: agent-users
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.FLASHINFER_GITHUB_TOKEN }}
       # - name: Check team membership
       #   id: check-permission
       #   env:
