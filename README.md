@@ -213,13 +213,6 @@ FlashInfer powers inference in:
 - [lorax](https://github.com/predibase/lorax)
 - [ScaleLLM](https://github.com/vectorch-ai/ScaleLLM)
 
-## Resources
-
-- [Documentation](https://docs.flashinfer.ai/)
-- [Benchmarking Guide](benchmarks/README.md)
-- [Intra-kernel Profiler](profiler/README.md)
-- [Slack Community](https://join.slack.com/t/flashinfer/shared_invite/zt-379wct3hc-D5jR~1ZKQcU00WHsXhgvtA)
-
 ## Acknowledgement
 
 FlashInfer is inspired by [FlashAttention](https://github.com/dao-AILab/flash-attention/), [vLLM](https://github.com/vllm-project/vllm), [stream-K](https://arxiv.org/abs/2301.03598), [CUTLASS](https://github.com/nvidia/cutlass), and [AITemplate](https://github.com/facebookincubator/AITemplate).
