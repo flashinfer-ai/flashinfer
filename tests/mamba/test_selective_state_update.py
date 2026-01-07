@@ -30,7 +30,7 @@ def create_test_inputs(
         (batch_size, nheads, dim), (nheads, 1, 0)
     )
 
-    A_base = -torch.rand(nheads, dtype=torch.float32, device=device)
+    A_base = -torch.rand(nheads, dtype=matrixA_dtype, device=device)
     A = A_base.as_strided((nheads, dim, dstate), (1, 0, 0))
     assert A.stride() == (1, 0, 0)
 
