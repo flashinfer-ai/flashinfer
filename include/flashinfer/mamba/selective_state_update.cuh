@@ -57,14 +57,6 @@ struct SelectiveStateUpdateParams {
 
 __forceinline__ __device__ float softplus(float x) {
   return __logf(1.f + __expf(x));
-  // return log1pf(exp(x));
-}
-
-__device__ __forceinline__ float fast_exp(float x) {
-  constexpr float log2_E = 1.4426950408889634f;
-  float y;
-  asm("ex2.approx.f32 %0,%1;" : "=f"(y) : "f"(x * log2_E));
-  return y;
 }
 
 __device__ __forceinline__ float thresholded_softplus(float dt_value) {
@@ -161,7 +153,7 @@ __global__ void selective_state_update_kernel_simple(SelectiveStateUpdateParams 
     dt_value = thresholded_softplus(dt_value);
   }
 
-  auto const dA = fast_exp(A_value * dt_value);
+  auto const dA = __expf(A_value * dt_value);
 
   auto d_value = D ? toFloat(D[head]) : 0.f;
 
@@ -414,7 +406,7 @@ __global__ void selective_state_update_kernel_producer_consumer_vertical(
           auto const B_value = toFloat(sram.B[i]);
           auto const C_value = toFloat(sram.C[i]);
 
-          auto const dA = fast_exp(A_value * dt_value);
+          auto const dA = __expf(A_value * dt_value);
           auto const dB = B_value * dt_value;
           auto const new_state = state_value * dA + dB * x_value;
 
