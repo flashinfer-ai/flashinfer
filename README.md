@@ -49,7 +49,7 @@ High-Performance GPU Kernels for Inference
 - **Sorting-Free Sampling**: Efficient Top-K, Top-P, and Min-P without sorting
 - **Speculative Decoding**: Chain speculative sampling support
  
-### Distributed Computing
+### Communication
 - **AllReduce**: Custom implementations
 - **Multi-Node NVLink**: MNNVL support for multi-node inference
 - **NVSHMEM Integration**: For distributed memory operations
