@@ -269,13 +269,13 @@ size_t genericFp4UltraGemmKernelLauncher(void* D, void const* A, void const* B, 
     }                                                                                                        \
     auto initStatus = gemm.initialize(args, workspace, stream);                                              \
     if (initStatus != cutlass::Status::kSuccess) {                                                           \
-      std::string errMsg = "Failed to initialize cutlass FP4 gemm on sm100. Error: " +                       \
+      std::string errMsg = "Failed to initialize cutlass FP4 gemm on sm103. Error: " +                       \
                            std::string(cutlassGetStatusString(initStatus));                                  \
       throw std::runtime_error("[FP4 gemm Runner] " + errMsg);                                               \
     }                                                                                                        \
     auto runStatus = gemm.run(args, workspace, stream, nullptr, /*enablePDL=*/true);                         \
     if (runStatus != cutlass::Status::kSuccess) {                                                            \
-      std::string errMsg = "Failed to run cutlass FP4 gemm on sm100. Error: " +                              \
+      std::string errMsg = "Failed to run cutlass FP4 gemm on sm103. Error: " +                              \
                            std::string(cutlassGetStatusString(runStatus));                                   \
       throw std::runtime_error("[FP4 gemm Runner] " + errMsg);                                               \
     }                                                                                                        \

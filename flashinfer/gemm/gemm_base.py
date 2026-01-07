@@ -516,7 +516,7 @@ def _create_cutlass_fp4_gemm_module(module, op_name: str, tuner_name: str):
 
 @functools.cache
 def get_gemm_sm100_module_cutlass_fp4():
-    """Get the SM100/103/110 FP4 GEMM module."""
+    """Get the SM100/110 FP4 GEMM module."""
     module = gen_gemm_sm100_module_cutlass_fp4().build_and_load()
     return _create_cutlass_fp4_gemm_module(
         module, "flashinfer::cutlass_fp4_gemm", "cutlass_fp4_gemm"
@@ -524,7 +524,7 @@ def get_gemm_sm100_module_cutlass_fp4():
 
 @functools.cache
 def get_gemm_sm103_module_cutlass_fp4():
-    """Get the SM100/103/110 FP4 GEMM module."""
+    """Get the SM103 FP4 GEMM module."""
     module = gen_gemm_sm103_module_cutlass_fp4().build_and_load()
     return _create_cutlass_fp4_gemm_module(
         module, "flashinfer::cutlass_fp4_gemm", "cutlass_fp4_gemm"

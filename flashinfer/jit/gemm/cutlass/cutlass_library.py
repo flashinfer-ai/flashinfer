@@ -574,8 +574,6 @@ class KernelScheduleType(enum.Enum):
     Nvf4TmaWarpSpecialized1SmSm100 = enum_auto()
     Nvf4TmaWarpSpecialized2SmSm100 = enum_auto()
 
-    Nvf4TmaWarpSpecialized2SmSm103 = enum_auto()
-
     Mxf8f6f4TmaWarpSpecializedCooperativeSm120 = enum_auto()
     Mxf8f6f4TmaWarpSpecializedPingpongSm120 = enum_auto()
     Nvf4TmaWarpSpecializedCooperativeSm120 = enum_auto()
@@ -624,7 +622,6 @@ KernelScheduleTag = {
     KernelScheduleType.Mxf4TmaWarpSpecialized2SmSm100: "cutlass::gemm::KernelTmaWarpSpecialized2SmMxf4Sm100",
     KernelScheduleType.Nvf4TmaWarpSpecialized1SmSm100: "cutlass::gemm::KernelTmaWarpSpecialized1SmNvf4Sm100",
     KernelScheduleType.Nvf4TmaWarpSpecialized2SmSm100: "cutlass::gemm::KernelTmaWarpSpecialized2SmNvf4Sm100",
-    KernelScheduleType.Nvf4TmaWarpSpecialized2SmSm103: "cutlass::gemm::KernelTmaWarpSpecialized2SmBlockScaledMxNvf4UltraVs16Sm103", #RLC:
     KernelScheduleType.PtrArrayTmaWarpSpecializedCooperative: "cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperative",
     KernelScheduleType.PtrArrayTmaWarpSpecializedCooperativeFP8FastAccum: "cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperativeFP8FastAccum",
     KernelScheduleType.PtrArrayTmaWarpSpecializedPingpong: "cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpong",

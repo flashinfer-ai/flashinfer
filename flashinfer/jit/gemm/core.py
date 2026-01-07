@@ -95,7 +95,7 @@ def gen_gemm_sm100_module_cutlass_fp4() -> JitSpec:
 
 
 def gen_gemm_sm103_module_cutlass_fp4() -> JitSpec:
-    gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / "gen_gemm_sm100_cutlass_fp4"
+    gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / "gen_gemm_sm103_cutlass_fp4"
     os.makedirs(gen_directory, exist_ok=True)
     source_paths = [
         jit_env.FLASHINFER_CSRC_DIR / "fp4_gemm_cutlass_sm103.cu",
