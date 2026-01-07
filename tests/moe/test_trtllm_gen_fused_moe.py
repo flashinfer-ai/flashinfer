@@ -46,15 +46,11 @@ from flashinfer.fused_moe.core import (
     get_w2_permute_indices_with_cache,
     _maybe_get_cached_w3_w1_permute_indices,
 )
-from .utils import skip_checks, QuantMode
+from .utils import is_gated_activation, skip_checks, QuantMode
 
 
 # Max num tokens to tune for trtllm-gen fused moe
 TUNE_MAX_NUM_TOKENS = 4096
-
-
-def is_gated_activation(activation_type: ActivationType) -> bool:
-    return activation_type in [ActivationType.Swiglu, ActivationType.Geglu]
 
 
 def check_cuda(err):

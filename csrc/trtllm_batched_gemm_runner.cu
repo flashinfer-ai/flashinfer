@@ -125,6 +125,8 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
             << ", mDtypeB: " << tg::dtypeToString(mOptions.dtypeB)
             << ", mDtypeC: " << tg::dtypeToString(mOptions.dtypeC)
             << ", mUseDeepSeekFp8: " << mOptions.deepSeekFp8
+            << ", mActType: " << (int64_t)mOptions.actType
+            << ", mEltwiseActType: " << (int64_t)mOptions.eltwiseActType
             << ", mTransposeMmaOutput: " << mOptions.transposeMmaOutput
             << ", mRouteAct: " << mOptions.routeAct << ", mFusedAct: " << mOptions.fusedAct
             << ", mIsStaticBatch: " << mOptions.staticBatch << ", mTileSize: " << mOptions.tileSize;
