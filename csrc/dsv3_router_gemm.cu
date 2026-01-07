@@ -2,6 +2,9 @@
 #include "tvm_ffi_utils.h"
 
 namespace flashinfer::trtllm_dsv3_router_gemm {
+
+// Note: Explicit template instantiations are not needed here because
+// LoopUnroller already forces instantiation of all required specializations.
 template <typename Tin, typename Tout, int kNumTokens, int kNumExperts, int kHiddenDim>
 void invokeRouterGemm(Tout* output, Tin const* mat_a, Tin const* mat_b, cudaStream_t stream,
                       bool use_pdl = false) {
@@ -23,150 +26,6 @@ void invokeRouterGemm(Tout* output, Tin const* mat_a, Tin const* mat_b, cudaStre
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "cudaLaunchKernelEx failed with error code " << cudaGetErrorString(status);
 }
-
-template void invokeRouterGemm<__nv_bfloat16, float, 1, 256, 7168>(float*, __nv_bfloat16 const*,
-                                                                   __nv_bfloat16 const*,
-                                                                   cudaStream_t, bool);
-
-template void invokeRouterGemm<__nv_bfloat16, float, 2, 256, 7168>(float*, __nv_bfloat16 const*,
-                                                                   __nv_bfloat16 const*,
-                                                                   cudaStream_t, bool);
-
-template void invokeRouterGemm<__nv_bfloat16, float, 3, 256, 7168>(float*, __nv_bfloat16 const*,
-                                                                   __nv_bfloat16 const*,
-                                                                   cudaStream_t, bool);
-
-template void invokeRouterGemm<__nv_bfloat16, float, 4, 256, 7168>(float*, __nv_bfloat16 const*,
-                                                                   __nv_bfloat16 const*,
-                                                                   cudaStream_t, bool);
-
-template void invokeRouterGemm<__nv_bfloat16, float, 5, 256, 7168>(float*, __nv_bfloat16 const*,
-                                                                   __nv_bfloat16 const*,
-                                                                   cudaStream_t, bool);
-
-template void invokeRouterGemm<__nv_bfloat16, float, 6, 256, 7168>(float*, __nv_bfloat16 const*,
-                                                                   __nv_bfloat16 const*,
-                                                                   cudaStream_t, bool);
-
-template void invokeRouterGemm<__nv_bfloat16, float, 7, 256, 7168>(float*, __nv_bfloat16 const*,
-                                                                   __nv_bfloat16 const*,
-                                                                   cudaStream_t, bool);
-
-template void invokeRouterGemm<__nv_bfloat16, float, 8, 256, 7168>(float*, __nv_bfloat16 const*,
-                                                                   __nv_bfloat16 const*,
-                                                                   cudaStream_t, bool);
-
-template void invokeRouterGemm<__nv_bfloat16, float, 9, 256, 7168>(float*, __nv_bfloat16 const*,
-                                                                   __nv_bfloat16 const*,
-                                                                   cudaStream_t, bool);
-
-template void invokeRouterGemm<__nv_bfloat16, float, 10, 256, 7168>(float*, __nv_bfloat16 const*,
-                                                                    __nv_bfloat16 const*,
-                                                                    cudaStream_t, bool);
-
-template void invokeRouterGemm<__nv_bfloat16, float, 11, 256, 7168>(float*, __nv_bfloat16 const*,
-                                                                    __nv_bfloat16 const*,
-                                                                    cudaStream_t, bool);
-
-template void invokeRouterGemm<__nv_bfloat16, float, 12, 256, 7168>(float*, __nv_bfloat16 const*,
-                                                                    __nv_bfloat16 const*,
-                                                                    cudaStream_t, bool);
-
-template void invokeRouterGemm<__nv_bfloat16, float, 13, 256, 7168>(float*, __nv_bfloat16 const*,
-                                                                    __nv_bfloat16 const*,
-                                                                    cudaStream_t, bool);
-
-template void invokeRouterGemm<__nv_bfloat16, float, 14, 256, 7168>(float*, __nv_bfloat16 const*,
-                                                                    __nv_bfloat16 const*,
-                                                                    cudaStream_t, bool);
-
-template void invokeRouterGemm<__nv_bfloat16, float, 15, 256, 7168>(float*, __nv_bfloat16 const*,
-                                                                    __nv_bfloat16 const*,
-                                                                    cudaStream_t, bool);
-
-template void invokeRouterGemm<__nv_bfloat16, float, 16, 256, 7168>(float*, __nv_bfloat16 const*,
-                                                                    __nv_bfloat16 const*,
-                                                                    cudaStream_t, bool);
-
-template void invokeRouterGemm<__nv_bfloat16, __nv_bfloat16, 1, 256, 7168>(__nv_bfloat16*,
-                                                                           __nv_bfloat16 const*,
-                                                                           __nv_bfloat16 const*,
-                                                                           cudaStream_t, bool);
-
-template void invokeRouterGemm<__nv_bfloat16, __nv_bfloat16, 2, 256, 7168>(__nv_bfloat16*,
-                                                                           __nv_bfloat16 const*,
-                                                                           __nv_bfloat16 const*,
-                                                                           cudaStream_t, bool);
-
-template void invokeRouterGemm<__nv_bfloat16, __nv_bfloat16, 3, 256, 7168>(__nv_bfloat16*,
-                                                                           __nv_bfloat16 const*,
-                                                                           __nv_bfloat16 const*,
-                                                                           cudaStream_t, bool);
-
-template void invokeRouterGemm<__nv_bfloat16, __nv_bfloat16, 4, 256, 7168>(__nv_bfloat16*,
-                                                                           __nv_bfloat16 const*,
-                                                                           __nv_bfloat16 const*,
-                                                                           cudaStream_t, bool);
-
-template void invokeRouterGemm<__nv_bfloat16, __nv_bfloat16, 5, 256, 7168>(__nv_bfloat16*,
-                                                                           __nv_bfloat16 const*,
-                                                                           __nv_bfloat16 const*,
-                                                                           cudaStream_t, bool);
-
-template void invokeRouterGemm<__nv_bfloat16, __nv_bfloat16, 6, 256, 7168>(__nv_bfloat16*,
-                                                                           __nv_bfloat16 const*,
-                                                                           __nv_bfloat16 const*,
-                                                                           cudaStream_t, bool);
-
-template void invokeRouterGemm<__nv_bfloat16, __nv_bfloat16, 7, 256, 7168>(__nv_bfloat16*,
-                                                                           __nv_bfloat16 const*,
-                                                                           __nv_bfloat16 const*,
-                                                                           cudaStream_t, bool);
-
-template void invokeRouterGemm<__nv_bfloat16, __nv_bfloat16, 8, 256, 7168>(__nv_bfloat16*,
-                                                                           __nv_bfloat16 const*,
-                                                                           __nv_bfloat16 const*,
-                                                                           cudaStream_t, bool);
-
-template void invokeRouterGemm<__nv_bfloat16, __nv_bfloat16, 9, 256, 7168>(__nv_bfloat16*,
-                                                                           __nv_bfloat16 const*,
-                                                                           __nv_bfloat16 const*,
-                                                                           cudaStream_t, bool);
-
-template void invokeRouterGemm<__nv_bfloat16, __nv_bfloat16, 10, 256, 7168>(__nv_bfloat16*,
-                                                                            __nv_bfloat16 const*,
-                                                                            __nv_bfloat16 const*,
-                                                                            cudaStream_t, bool);
-
-template void invokeRouterGemm<__nv_bfloat16, __nv_bfloat16, 11, 256, 7168>(__nv_bfloat16*,
-                                                                            __nv_bfloat16 const*,
-                                                                            __nv_bfloat16 const*,
-                                                                            cudaStream_t, bool);
-
-template void invokeRouterGemm<__nv_bfloat16, __nv_bfloat16, 12, 256, 7168>(__nv_bfloat16*,
-                                                                            __nv_bfloat16 const*,
-                                                                            __nv_bfloat16 const*,
-                                                                            cudaStream_t, bool);
-
-template void invokeRouterGemm<__nv_bfloat16, __nv_bfloat16, 13, 256, 7168>(__nv_bfloat16*,
-                                                                            __nv_bfloat16 const*,
-                                                                            __nv_bfloat16 const*,
-                                                                            cudaStream_t, bool);
-
-template void invokeRouterGemm<__nv_bfloat16, __nv_bfloat16, 14, 256, 7168>(__nv_bfloat16*,
-                                                                            __nv_bfloat16 const*,
-                                                                            __nv_bfloat16 const*,
-                                                                            cudaStream_t, bool);
-
-template void invokeRouterGemm<__nv_bfloat16, __nv_bfloat16, 15, 256, 7168>(__nv_bfloat16*,
-                                                                            __nv_bfloat16 const*,
-                                                                            __nv_bfloat16 const*,
-                                                                            cudaStream_t, bool);
-
-template void invokeRouterGemm<__nv_bfloat16, __nv_bfloat16, 16, 256, 7168>(__nv_bfloat16*,
-                                                                            __nv_bfloat16 const*,
-                                                                            __nv_bfloat16 const*,
-                                                                            cudaStream_t, bool);
 
 template <int kBegin, int kEnd, int kNumExperts, int kHiddenDim>
 struct LoopUnroller {
@@ -197,7 +56,7 @@ struct LoopUnroller<kEnd, kEnd, kNumExperts, kHiddenDim> {
   }
 };
 
-template <typename Tout, int64_t tout_code, int kNumExperts>
+template <typename Tout, int64_t tout_code, int kNumExperts, int kBegin, int kEnd>
 void generic_router_gemm_op(TensorView mat_a, TensorView mat_b, TensorView out,
                             bool launch_with_pdl) {
   int const num_tokens = mat_a.sizes()[0];
@@ -220,7 +79,7 @@ void generic_router_gemm_op(TensorView mat_a, TensorView mat_b, TensorView out,
   }
 
   if (use_custom_kernel) {
-    LoopUnroller<1, 16, kNumExperts, kHiddenDim>::unroll(
+    LoopUnroller<kBegin, kEnd, kNumExperts, kHiddenDim>::unroll(
         num_tokens, reinterpret_cast<Tout*>(out.data_ptr()),
         reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
         reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr()), stream, launch_with_pdl);
@@ -230,11 +89,12 @@ void generic_router_gemm_op(TensorView mat_a, TensorView mat_b, TensorView out,
 }
 
 void dsv3_router_gemm_op(TensorView mat_a, TensorView mat_b, TensorView out, bool launch_with_pdl) {
-  generic_router_gemm_op<float, float32_code, 256>(mat_a, mat_b, out, launch_with_pdl);
+  generic_router_gemm_op<float, float32_code, 256, 1, 16>(mat_a, mat_b, out, launch_with_pdl);
 }
 
 void ml3_router_gemm_op(TensorView mat_a, TensorView mat_b, TensorView out, bool launch_with_pdl) {
-  generic_router_gemm_op<__nv_bfloat16, bfloat16_code, 128>(mat_a, mat_b, out, launch_with_pdl);
+  generic_router_gemm_op<__nv_bfloat16, bfloat16_code, 128, 1, 16>(mat_a, mat_b, out,
+                                                                   launch_with_pdl);
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(dsv3_router_gemm_op,
