@@ -55,9 +55,7 @@ struct SelectiveStateUpdateParams {
   void* __restrict__ state_batch_indices{nullptr};  // state_batch_indices: (batch,)
 };
 
-__forceinline__ __device__ float softplus(float x) {
-  return __logf(1.f + __expf(x));
-}
+__forceinline__ __device__ float softplus(float x) { return __logf(1.f + __expf(x)); }
 
 __device__ __forceinline__ float thresholded_softplus(float dt_value) {
   constexpr float threshold = 20.f;
@@ -247,19 +245,14 @@ template <typename input_t, typename weight_t, typename matrixA_t, typename stat
           int DSTATE, int consumerWarps, int rowsPerStage, int numStages = 1>
 __global__ void selective_state_update_kernel_producer_consumer_vertical(
     SelectiveStateUpdateParams params, __grid_constant__ CUtensorMap const tensorState) {
-  auto* __restrict__ output =
-      reinterpret_cast<input_t*>(params.output);  // output: (batch, nheads, dim)
+  auto* __restrict__ output = reinterpret_cast<input_t*>(params.output);
 
-  auto const* __restrict__ x =
-      reinterpret_cast<input_t const*>(params.x);  // x: (batch, nheads, dim)
-  auto const* __restrict__ dt =
-      reinterpret_cast<weight_t const*>(params.dt);  // dt: (batch, nheads, dim)
-  auto const* __restrict__ A = reinterpret_cast<matrixA_t const*>(params.A);  // A: (nheads)
-  auto const* __restrict__ B =
-      reinterpret_cast<input_t const*>(params.B);  // B: (batch, ngroups, dstate)
-  auto const* __restrict__ C =
-      reinterpret_cast<input_t const*>(params.C);  // C: (batch, ngroups, dstate)
-  auto const* __restrict__ D = reinterpret_cast<weight_t const*>(params.D);  // D: (nheads, dim)
+  auto const* __restrict__ x = reinterpret_cast<input_t const*>(params.x);
+  auto const* __restrict__ dt = reinterpret_cast<weight_t const*>(params.dt);
+  auto const* __restrict__ A = reinterpret_cast<matrixA_t const*>(params.A);
+  auto const* __restrict__ B = reinterpret_cast<input_t const*>(params.B);
+  auto const* __restrict__ C = reinterpret_cast<input_t const*>(params.C);
+  auto const* __restrict__ D = reinterpret_cast<weight_t const*>(params.D);
   auto const* __restrict__ dt_bias = reinterpret_cast<weight_t const*>(params.dt_bias);
   auto const* __restrict__ z = reinterpret_cast<input_t const*>(params.z);
   auto const* __restrict__ state_batch_indices =
@@ -377,8 +370,9 @@ __global__ void selective_state_update_kernel_producer_consumer_vertical(
     } else if (warp == 1) {  // Load z, C
       for (auto d = lane * vectorizedLoadSize; d < dim; d += warpSize * vectorizedLoadSize) {
         auto* dst = reinterpret_cast<load_t*>(&sram.z[d]);
-        *dst = z ? *reinterpret_cast<load_t const*>(&z[batch * params.z_stride_batch + head * dim + d])
-                 : make_zero<load_t>();
+        *dst =
+            z ? *reinterpret_cast<load_t const*>(&z[batch * params.z_stride_batch + head * dim + d])
+              : make_zero<load_t>();
       }
       for (auto i = lane * vectorizedLoadSize; i < DSTATE; i += warpSize * vectorizedLoadSize) {
         auto* dst = reinterpret_cast<load_t*>(&sram.C[i]);
@@ -443,43 +437,84 @@ __global__ void selective_state_update_kernel_producer_consumer_vertical(
 
 template <typename input_t, typename weight_t, typename matrixA_t, typename state_t>
 void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, cudaStream_t stream) {
-  constexpr int DSTATE = 128;
-  FLASHINFER_CHECK(params.dstate == DSTATE);
-
   auto [sm_major, sm_minor] = GetCudaComputeCapability();
 
   if (sm_major < 9)  // pre-Hopper
   {
-    constexpr int numWarps = 2;
-    int const blocks_per_dim = (params.dim + 32 * numWarps - 1) / (32 * numWarps);
-    dim3 block(32, numWarps);
-    dim3 grid(blocks_per_dim, params.batch, params.nheads);
-    selective_state_update_kernel_simple<input_t, weight_t, matrixA_t, state_t, DSTATE, numWarps>
-        <<<grid, block, 0, stream>>>(params);
+    auto dispatch_dstate = [&]<int DSTATE>() {
+      constexpr int numWarps = 2;
+      int const blocks_per_dim = (params.dim + 32 * numWarps - 1) / (32 * numWarps);
+      dim3 block(32, numWarps);
+      dim3 grid(blocks_per_dim, params.batch, params.nheads);
+      selective_state_update_kernel_simple<input_t, weight_t, matrixA_t, state_t, DSTATE, numWarps>
+          <<<grid, block, 0, stream>>>(params);
+    };
+
+    switch (params.dstate) {
+      case 64:
+        dispatch_dstate.template operator()<64>();
+        break;
+      case 128:
+        dispatch_dstate.template operator()<128>();
+        break;
+      case 256:
+        dispatch_dstate.template operator()<256>();
+        break;
+      default:
+        FLASHINFER_CHECK(false, "Unsupported dstate value. Supported values are: 64, 128, 256");
+    }
   } else {
-    constexpr auto numConsumers = 4;
-    constexpr auto numWarps = 1 + numConsumers;
-    constexpr auto numStages = 3;
-    constexpr auto rowsPerStage = 4 * numConsumers;
-    constexpr auto DIM = 64;
-    FLASHINFER_CHECK(params.dim == DIM);
-    auto scan_func = selective_state_update_kernel_producer_consumer_vertical<
-        input_t, weight_t, matrixA_t, state_t, DIM, DSTATE, numConsumers, rowsPerStage, numStages>;
+    auto dispatch_dim_dstate = [&]<int DIM, int DSTATE>() {
+      constexpr auto numConsumers = 4;
+      constexpr auto numWarps = 1 + numConsumers;
+      constexpr auto numStages = 3;
+      constexpr auto rowsPerStage = 4 * numConsumers;
+      FLASHINFER_CHECK(params.dim % rowsPerStage == 0);
+      auto scan_func = selective_state_update_kernel_producer_consumer_vertical<
+          input_t, weight_t, matrixA_t, state_t, DIM, DSTATE, numConsumers, rowsPerStage,
+          numStages>;
 
-    dim3 block(32, numWarps);
-    dim3 grid(params.batch, params.nheads);
+      dim3 block(32, numWarps);
+      dim3 grid(params.batch, params.nheads);
 
-    auto nh = params.nheads;
-    auto dim = params.dim;
-    auto B = params.state_cache_size;
+      auto nh = params.nheads;
+      auto dim = params.dim;
+      auto B = params.state_cache_size;
 
-    FLASHINFER_CHECK(reinterpret_cast<uintptr_t>(params.state) % 128 ==
-                     0);  // TMA requires 128B aligned
-    auto tensorState =
-        tma::createTensorMap<state_t>(params.state, B * nh * dim, DSTATE, rowsPerStage, DSTATE);
-    FLASHINFER_CHECK(params.dim % rowsPerStage == 0);
+      FLASHINFER_CHECK(reinterpret_cast<uintptr_t>(params.state) % 128 ==
+                       0);  // TMA requires 128B aligned
+      auto tensorState =
+          tma::createTensorMap<state_t>(params.state, B * nh * dim, DSTATE, rowsPerStage, DSTATE);
 
-    scan_func<<<grid, block, 0, stream>>>(params, tensorState);
+      scan_func<<<grid, block, 0, stream>>>(params, tensorState);
+    };
+
+    auto dispatch_dstate = [&]<int DIM>() {
+      switch (params.dstate) {
+        case 64:
+          dispatch_dim_dstate.template operator()<DIM, 64>();
+          break;
+        case 128:
+          dispatch_dim_dstate.template operator()<DIM, 128>();
+          break;
+        case 256:
+          dispatch_dim_dstate.template operator()<DIM, 256>();
+          break;
+        default:
+          FLASHINFER_CHECK(false, "Unsupported dstate value. Supported values are: 64, 128, 256");
+      }
+    };
+
+    switch (params.dim) {
+      case 64:
+        dispatch_dstate.template operator()<64>();
+        break;
+      case 128:
+        dispatch_dstate.template operator()<128>();
+        break;
+      default:
+        FLASHINFER_CHECK(false, "Unsupported dim value. Supported values are: 64, 128");
+    }
   }
 }
 
