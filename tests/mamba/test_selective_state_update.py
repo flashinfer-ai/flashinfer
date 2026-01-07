@@ -63,6 +63,7 @@ def create_test_inputs(
         "B": B,
         "C": C,
         "D": D,
+        "z": z,
         "dt_bias": dt_bias,
         "slot_idx": slot_idx,
     }
