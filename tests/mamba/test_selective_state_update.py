@@ -224,7 +224,7 @@ def test_selective_state_update_with_z():
     input_dtype = torch.bfloat16
     weight_dtype = torch.bfloat16
     matrixA_dtype = torch.float32
-    
+
     inputs = create_test_inputs(
         batch,
         nheads,
