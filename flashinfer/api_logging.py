@@ -17,10 +17,12 @@ limitations under the License.
 import enum
 import functools
 import inspect
+import json
 import logging
 import os
 import sys
-from typing import Any, Callable
+import uuid
+from typing import Any, Callable, Dict, Optional, Tuple
 import contextlib
 import torch
 
@@ -41,6 +43,16 @@ def _substitute_process_id(path: str) -> str:
 # Read environment variables once at module load time
 _API_LOG_LEVEL = int(os.environ.get("FLASHINFER_LOGLEVEL", "0"))
 _API_LOG_DEST = _substitute_process_id(os.environ.get("FLASHINFER_LOGDEST", "stdout"))
+
+# Bench logging environment variables
+_BENCH_LOG_ENABLED = os.environ.get("FLASHINFER_BENCH_LOG", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+_BENCH_LOG_DIR = _substitute_process_id(
+    os.environ.get("FLASHINFER_BENCH_LOG_DIR", ".flashinfer_bench_cache")
+)
 
 # Create logger using Python's logging library
 _logger = logging.getLogger("flashinfer.api")
@@ -469,6 +481,8 @@ def flashinfer_api(func: Callable = None) -> Callable:
     This decorator integrates with Python's standard logging infrastructure while
     maintaining zero overhead when disabled (FLASHINFER_LOGLEVEL=0).
 
+    Additionally supports workload dumping for benchmarking when FLASHINFER_BENCH_LOG is enabled.
+
     NOTE/TODO: Not all FlashInfer APIs are decorated with this decorator yet. This is a work in progress.
 
     Environment Variables
@@ -485,6 +499,18 @@ def flashinfer_api(func: Callable = None) -> Callable:
         - <path>: Log to specified file path
         - Use %i in path for process ID substitution (e.g., "log_%i.txt" -> "log_12345.txt")
 
+    FLASHINFER_BENCH_LOG : str (default: "0")
+        - "0", "false", "no": Disable workload dumping (zero overhead)
+        - "1", "true", "yes": Enable workload dumping
+        When enabled, dumps API input arguments to files for later replay/benchmarking.
+        Creates:
+        - Safetensors files containing tensor arguments
+        - JSONL log files with workload metadata and references to tensors
+
+    FLASHINFER_BENCH_LOG_DIR : str (default: ".flashinfer_bench_cache")
+        Directory where workload dump files are saved.
+        - Use %i in path for process ID substitution (e.g., "bench_%i/" -> "bench_12345/")
+
     Examples
     --------
     Basic usage:
@@ -493,11 +519,17 @@ def flashinfer_api(func: Callable = None) -> Callable:
     ... def my_function(x, y):
     ...     return x + y
 
+    Enable workload dumping:
+
+    >>> # Set environment variables before importing:
+    >>> # export FLASHINFER_BENCH_LOG=1
+    >>> # export FLASHINFER_BENCH_LOG_DIR=/path/to/workloads
+
     Notes
     -----
     - Key header lines include a timestamp in the format: [YYYY-MM-DD HH:MM:SS]
       (e.g., "FlashInfer API Call: function_name", "FlashInfer API Logging - System Information")
-    - When FLASHINFER_LOGLEVEL=0, the decorator has truly zero overhead
+    - When FLASHINFER_LOGLEVEL=0 and FLASHINFER_BENCH_LOG=0, the decorator has truly zero overhead
       as it returns the original function unchanged.
     - Function names and inputs are logged BEFORE execution:
       - Level 1: Function name only
@@ -510,9 +542,13 @@ def flashinfer_api(func: Callable = None) -> Callable:
       The message "[statistics skipped: CUDA graph capture in progress]" will be logged.
     - The %i pattern is automatically replaced with the process ID for multi-process environments.
     - The logger does not propagate to the root logger to avoid duplicate logs.
+    - **Workload Dumping**: When FLASHINFER_BENCH_LOG=1, all tensor arguments are saved to
+      safetensors files and metadata is written to JSONL files. This enables workload replay
+      for benchmarking and testing. The dumped workloads can be loaded using the safetensors
+      library and the JSONL metadata files.
     """
-    # If logging is disabled, return original function with zero overhead
-    if _API_LOG_LEVEL == 0:
+    # If both logging and bench logging are disabled, return original function with zero overhead
+    if _API_LOG_LEVEL == 0 and not _BENCH_LOG_ENABLED:
         if func is None:
             return lambda f: f
         return func
@@ -533,28 +569,38 @@ def flashinfer_api(func: Callable = None) -> Callable:
                     pass
 
             # Log BEFORE execution (crash-safe for all levels!)
-            try:
-                if _API_LOG_LEVEL == 1:
-                    # Level 1: Just log function name before execution (crash-safe)
-                    _logger.debug(
-                        f"{_get_timestamp()} FlashInfer API Call: {func_name}"
+            if _API_LOG_LEVEL > 0:
+                try:
+                    if _API_LOG_LEVEL == 1:
+                        # Level 1: Just log function name before execution (crash-safe)
+                        _logger.debug(
+                            f"{_get_timestamp()} FlashInfer API Call: {func_name}"
+                        )
+                    elif _API_LOG_LEVEL >= 3:
+                        # Level 3+: Log full inputs before execution (crash-safe)
+                        _log_function_inputs(f, func_name, args, kwargs, _API_LOG_LEVEL)
+                except Exception as e:
+                    _logger.error(
+                        f"[LOGGING ERROR in {func_name} (pre-execution)]: {e}"
                     )
-                elif _API_LOG_LEVEL >= 3:
-                    # Level 3+: Log full inputs before execution (crash-safe)
-                    _log_function_inputs(f, func_name, args, kwargs, _API_LOG_LEVEL)
-            except Exception as e:
-                _logger.error(f"[LOGGING ERROR in {func_name} (pre-execution)]: {e}")
+
+            # Dump workload BEFORE execution (crash-safe) if bench logging is enabled
+            if _BENCH_LOG_ENABLED:
+                try:
+                    _dump_workload(f, func_name, args, kwargs)
+                except Exception as e:
+                    _logger.warning(f"[BENCH LOG ERROR in {func_name}]: {e}")
 
             # Call the original function (may crash here with CUDA errors)
             result = f(*args, **kwargs)
 
             # Log outputs AFTER successful execution (level 3+ only)
-            try:
-                if _API_LOG_LEVEL >= 3:
+            if _API_LOG_LEVEL >= 3:
+                try:
                     # Level 3+: Log outputs (inputs were already logged above)
                     _log_function_outputs(func_name, result, _API_LOG_LEVEL)
-            except Exception as e:
-                _logger.error(f"[LOGGING ERROR in {func_name} (outputs)]: {e}")
+                except Exception as e:
+                    _logger.error(f"[LOGGING ERROR in {func_name} (outputs)]: {e}")
 
             return result
 
