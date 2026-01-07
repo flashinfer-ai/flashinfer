@@ -362,6 +362,7 @@ __global__ void selective_state_update_kernel_producer_consumer_vertical(
     if (params.dt_softplus) {
       dt_value = thresholded_softplus(dt_value);
     }
+    auto const dA = __expf(A_value * dt_value);
 
     if (warp == 0) {  // Load x, B
       for (auto d = lane * vectorizedLoadSize; d < dim; d += warpSize * vectorizedLoadSize) {
@@ -406,7 +407,6 @@ __global__ void selective_state_update_kernel_producer_consumer_vertical(
           auto const B_value = toFloat(sram.B[i]);
           auto const C_value = toFloat(sram.C[i]);
 
-          auto const dA = __expf(A_value * dt_value);
           auto const dB = B_value * dt_value;
           auto const new_state = state_value * dA + dB * x_value;
 
