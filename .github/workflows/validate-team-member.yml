@@ -18,46 +18,44 @@ jobs:
       pull-requests: read
       issues: read
       id-token: write
-      # members: read  # Required to check team membership
 
     steps:
-      - uses: tspascoal/get-user-teams-membership@v3
+      - name: Check team membership
+        id: check-permission
+        env:
+          # GITHUB_TOKEN cannot access org team membership API (HTTP 403)
+          # Use a PAT with read:org scope stored as FLASHINFER_GITHUB_TOKEN secret
+          GH_TOKEN: ${{ secrets.FLASHINFER_GITHUB_TOKEN }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          ORG: ${{ github.repository_owner }}
+          TEAM: agent-users
+        shell: bash
+        run: |
+          echo "Checking if $PR_AUTHOR is a member of $ORG/$TEAM team..."
+
+          # Check if user is a member of the team
+          IS_MEMBER=$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "/orgs/${ORG}/teams/${TEAM}/memberships/${PR_AUTHOR}" \
+            --jq '.state' 2>/dev/null || echo "none")
+
+          if [[ "$IS_MEMBER" == "active" ]]; then
+            echo "✅ $PR_AUTHOR is a member of $TEAM"
+            echo "authorized=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "❌ $PR_AUTHOR is not a member of $TEAM"
+            echo "authorized=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout repository
+        if: steps.check-permission.outputs.authorized == 'true'
+        uses: actions/checkout@v4
         with:
-          username: ${{ github.event.pull_request.user.login }}
-          organization: ${{ github.repository_owner }}
-          team: agent-users
-          GITHUB_TOKEN: ${{ secrets.FLASHINFER_GITHUB_TOKEN }}
-      # - name: Check team membership
-      #   id: check-permission
-      #   env:
-      #     GH_TOKEN: ${{ secrets.FLASHINFER_GITHUB_TOKEN }}
-      #     PR_AUTHOR: ${{ github.event.pull_request.user.login }}
-      #     ORG: ${{ github.repository_owner }}
-      #   shell: bash
-      #   run: |
-      #     echo "Checking if $PR_AUTHOR is a member of agent-users team..."
-      #     gh auth status
-      #     gh api /user -q .login
+          fetch-depth: 1
 
-      #     if [[ "$(GH_PAGER=cat gh api \
-      #       -H "Accept: application/vnd.github+json" \
-      #       -H "X-GitHub-Api-Version: 2022-11-28" \
-      #       /orgs/flashinfer-ai/teams/agent-users/members \
-      #       -q 'any(.[]; .login == $PR_AUTHOR)')" == "true" ]]; then
-      #         echo "✅"
-      #     else
-      #         echo "❌"
-      #     fi
-
-
-      # - name: Checkout repository
-      #   if: steps.check-permission.outputs.authorized == 'true'
-      #   uses: actions/checkout@v4
-      #   with:
-      #     fetch-depth: 1
-
-      # - name: Run Claude Code Review
-      #   if: steps.check-permission.outputs.authorized == 'true'
-      #   id: claude-review
-      #   run: |
-      #     echo "pretend there is a claude agent working here..."
+      - name: Run Claude Code Review
+        if: steps.check-permission.outputs.authorized == 'true'
+        id: claude-review
+        run: |
+          echo "pretend there is a claude agent working here..."
