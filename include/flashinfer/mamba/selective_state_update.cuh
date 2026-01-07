@@ -39,7 +39,7 @@ struct SelectiveStateUpdateParams {
   bool dt_softplus{false};
 
   int64_t x_stride_batch{}, dt_stride_batch{}, B_stride_batch{}, C_stride_batch{},
-      out_stride_batch{};
+      out_stride_batch{}, z_stride_batch{};
 
   void* __restrict__ state{nullptr};  // state_t: (state_cache_size, nheads, dim, dstate)
   void* __restrict__ x{nullptr};      // input_t: (batch, nheads, dim)
@@ -162,7 +162,7 @@ __global__ void selective_state_update_kernel_simple(SelectiveStateUpdateParams 
   if (d < dim) {
     sx[_d] = x[batch * params.x_stride_batch + head * dim + d];
     if (z) {
-      sz[_d] = z[batch * nheads * dim + head * dim + d];
+      sz[_d] = z[batch * params.z_stride_batch + head * dim + d];
     } else {
       convertAndStore(&sz[_d], 0.f);
     }
@@ -377,7 +377,7 @@ __global__ void selective_state_update_kernel_producer_consumer_vertical(
     } else if (warp == 1) {  // Load z, C
       for (auto d = lane * vectorizedLoadSize; d < dim; d += warpSize * vectorizedLoadSize) {
         auto* dst = reinterpret_cast<load_t*>(&sram.z[d]);
-        *dst = z ? *reinterpret_cast<load_t const*>(&z[batch * nheads * dim + head * dim + d])
+        *dst = z ? *reinterpret_cast<load_t const*>(&z[batch * params.z_stride_batch + head * dim + d])
                  : make_zero<load_t>();
       }
       for (auto i = lane * vectorizedLoadSize; i < DSTATE; i += warpSize * vectorizedLoadSize) {

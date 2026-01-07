@@ -111,8 +111,17 @@ void selective_state_update(TensorView state, TensorView x, TensorView dt, Tenso
                      bias.stride(1));
   }
 
-  // if(z.has_value())
-  FLASHINFER_CHECK(!z.has_value() && "z is not supported yet");
+  if (z.has_value()) {
+    auto& z_tensor = z.value();
+    CHECK_CUDA(z_tensor);
+    CHECK_DIM(3, z_tensor);  // z: {batch, nheads, dim}
+    FLASHINFER_CHECK(z_tensor.size(0) == batch, "z.size(0) must equal batch");
+    FLASHINFER_CHECK(z_tensor.size(1) == nheads, "z.size(1) must equal nheads");
+    FLASHINFER_CHECK(z_tensor.size(2) == dim, "z.size(2) must equal dim");
+    CHECK_LAST_DIM_CONTIGUOUS_INPUT(z_tensor);
+    FLASHINFER_CHECK(z_tensor.stride(1) == dim, "z.stride(1) must equal dim, got ",
+                     z_tensor.stride(1), " expected ", z_tensor.size(2));
+  }
 
   if (state_batch_indices) {
     CHECK_DIM(1, (*state_batch_indices));
@@ -150,6 +159,7 @@ void selective_state_update(TensorView state, TensorView x, TensorView dt, Tenso
   }
   if (z) {
     p.z = z.value().data_ptr();
+    p.z_stride_batch = z.value().stride(0);
   }
   p.A = A.data_ptr();
   p.B = B.data_ptr();

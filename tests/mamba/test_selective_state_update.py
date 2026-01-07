@@ -8,7 +8,7 @@ from .selective_state_update_triton import selective_state_update_triton
 
 
 def create_test_inputs(
-    batch_size, nheads, dim, dstate, ngroups, input_dtype, weight_dtype, matrixA_dtype
+    batch_size, nheads, dim, dstate, ngroups, input_dtype, weight_dtype, matrixA_dtype, z_none=True
 ):
     # Set seed for reproducibility
     torch.manual_seed(0)
@@ -51,6 +51,9 @@ def create_test_inputs(
     slot_idx = torch.randperm(ssm_state_cache_size, dtype=torch.int32, device=device)[
         :batch_size
     ]
+
+    # Create z tensor if z_none is False
+    z = None if z_none else torch.randn(batch_size, nheads, dim, dtype=input_dtype, device=device)
 
     return {
         "state_cache": state_cache,
@@ -95,6 +98,7 @@ def test_selective_state_update(
         input_dtype,
         weight_dtype,
         matrixA_dtype,
+        z_none=True,
     )
 
     state = inputs["state_cache"]
@@ -107,7 +111,7 @@ def test_selective_state_update(
         inputs["B"],
         inputs["C"],
         D=inputs["D"],
-        z=None,
+        z=inputs["z"],
         dt_bias=inputs["dt_bias"],
         dt_softplus=delta_softplus,
         state_batch_indices=inputs["slot_idx"],
@@ -122,7 +126,7 @@ def test_selective_state_update(
         inputs["B"],
         inputs["C"],
         D=inputs["D"],
-        z=None,
+        z=inputs["z"],
         dt_bias=inputs["dt_bias"],
         dt_softplus=delta_softplus,
         state_batch_indices=inputs["slot_idx"],
@@ -205,5 +209,88 @@ def test_selective_state_update(
             print(
                 f"  Index{idx_tuple}: ref={ref_val:.6f}, test={test_val:.6f}, diff={diff:.6e}, rel_diff={rel_diff:.6e}"
             )
+
+    assert states_match
+
+
+def test_selective_state_update_with_z():
+    """Test selective_state_update with z tensor (not None)."""
+    batch = 1
+    nheads = 8
+    dim = 64
+    dstate = 128
+    ngroups = 8
+    delta_softplus = True
+    input_dtype = torch.bfloat16
+    weight_dtype = torch.bfloat16
+    matrixA_dtype = torch.float32
+    
+    inputs = create_test_inputs(
+        batch,
+        nheads,
+        dim,
+        dstate,
+        ngroups,
+        input_dtype,
+        weight_dtype,
+        matrixA_dtype,
+        z_none=False,
+    )
+
+    state = inputs["state_cache"]
+    state_ref = state.clone()
+    y_ref = selective_state_update_triton(
+        state_ref,
+        inputs["x"],
+        inputs["dt"],
+        inputs["A"],
+        inputs["B"],
+        inputs["C"],
+        D=inputs["D"],
+        z=inputs["z"],
+        dt_bias=inputs["dt_bias"],
+        dt_softplus=delta_softplus,
+        state_batch_indices=inputs["slot_idx"],
+        pad_slot_id=-1,
+    )
+
+    y_test = flashinfer.mamba.selective_state_update(
+        state,
+        inputs["x"],
+        inputs["dt"],
+        inputs["A"],
+        inputs["B"],
+        inputs["C"],
+        D=inputs["D"],
+        z=inputs["z"],
+        dt_bias=inputs["dt_bias"],
+        dt_softplus=delta_softplus,
+        state_batch_indices=inputs["slot_idx"],
+        pad_slot_id=-1,
+    )
+
+    atol = 1e-3
+    rtol = 1e-2
+    outputs_match = torch.allclose(y_ref, y_test, atol=atol, rtol=rtol)
+
+    if outputs_match:
+        print(f"✓ Outputs match within tolerance (atol={atol}, rtol={rtol})")
+    else:
+        print(f"✗ Outputs do NOT match within tolerance (atol={atol}, rtol={rtol})")
+
+    assert outputs_match
+
+    # Check if states match within tolerance
+    states_match = torch.allclose(
+        state_ref[inputs["slot_idx"]],
+        state[inputs["slot_idx"]],
+        atol=atol,
+        rtol=rtol,
+    )
+
+    if states_match:
+        print(f"✓ States match within tolerance (atol={atol}, rtol={rtol})")
+    else:
+        print(f"✗ States do NOT match within tolerance (atol={atol}, rtol={rtol})")
 
     assert states_match
