@@ -7,7 +7,7 @@ import functools
 import math
 import logging
 from types import SimpleNamespace
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 from enum import Enum
 
 import torch
@@ -21,8 +21,7 @@ from ..fp4_quantization import _compute_swizzled_layout_sf_size
 from .mnnvl import McastGPUBuffer, CommBackend, MPIBackend
 from .workspace_base import AllReduceFusionWorkspace
 
-# TODO: Should this be moved to common file in allreduce.py?
-from .trtllm_ar import QuantizationSFLayout
+# QuantizationSFLayout is now in _types.py, imported below
 
 
 def mpi_barrier():
@@ -32,11 +31,9 @@ def mpi_barrier():
     MPI.COMM_WORLD.Barrier()
 
 
-# This should match the definition in trtllm_mnnvl_allreduce.cu
-class MNNVLAllreduceQuantFusionType(Enum):
-    NOQUNAT = 0
-    FP8 = 1
-    NVFP4 = 2
+# Import shared types from canonical location (_types.py)
+from ._types import QuantFusionType
+from ._types import QuantizationSFLayout
 
 
 class MNNVLAllreduceFusionStrategy(Enum):
@@ -294,19 +291,19 @@ def get_trtllm_mnnvl_comm_module():
         rank: int,
         # Kernel control flags
         use_oneshot: bool,
-        launch_with_pdl: bool,
+        launch_with_pdl: bool = False,
         # RMSNorm fusion
-        rmsnorm_fusion: bool,
-        residual_in: Optional[torch.Tensor],
-        residual_out: Optional[torch.Tensor],
-        gamma: Optional[torch.Tensor],
-        epsilon: Optional[float],
+        rmsnorm_fusion: bool = False,
+        residual_in: Optional[torch.Tensor] = None,
+        residual_out: Optional[torch.Tensor] = None,
+        gamma: Optional[torch.Tensor] = None,
+        epsilon: float = 1e-5,
         # Quantization
-        quant_type: Optional[MNNVLAllreduceQuantFusionType],
-        quant_out: Optional[torch.Tensor],
-        sf_out: Optional[torch.Tensor],
-        output_scale: Optional[torch.Tensor],
-        layout_code: Optional[QuantizationSFLayout],
+        quant_type: int = QuantFusionType.NONE,
+        quant_out: Optional[torch.Tensor] = None,
+        sf_out: Optional[torch.Tensor] = None,
+        output_scale: Optional[torch.Tensor] = None,
+        layout_code: int = QuantizationSFLayout.SWIZZLED_128x4,
     ) -> None:
         """
         Perform a multi-node NVLink all-reduce operation with fusion.
@@ -348,7 +345,7 @@ def get_trtllm_mnnvl_comm_module():
             residual_out,
             gamma,
             epsilon,
-            0 if quant_type is None else quant_type.value,
+            quant_type,
             quant_out,
             sf_out,
             output_scale,
@@ -418,26 +415,17 @@ def trtllm_mnnvl_allreduce(
         )
 
     module.trtllm_mnnvl_allreduce_fusion(
-        input,
-        output,
-        workspace.mc_ptr,
-        workspace.uc_ptrs_dev,
-        workspace.uc_ptr_local,
-        workspace.buffer_flags,
-        workspace.tp_size,
-        workspace.rank,
-        strategy == MNNVLAllreduceFusionStrategy.ONESHOT,
-        launch_with_pdl,
-        False,  # No RMSNorm Fusion
-        None,  # residual_in
-        None,  # residual_out
-        None,  # gamma
-        None,  # epsilon
-        None,  # quant_type
-        None,  # quant_out
-        None,  # sf_out
-        None,  # output_scale
-        None,  # layout_code
+        input=input,
+        output=output,
+        multicast_buffer_ptr=workspace.mc_ptr,
+        buffer_ptrs_dev=workspace.uc_ptrs_dev,
+        buffer_ptr_local=workspace.uc_ptr_local,
+        buffer_flags_mnnvl=workspace.buffer_flags,
+        nranks=workspace.tp_size,
+        rank=workspace.rank,
+        use_oneshot=(strategy == MNNVLAllreduceFusionStrategy.ONESHOT),
+        launch_with_pdl=launch_with_pdl,
+        rmsnorm_fusion=False,
     )
 
     return output
@@ -519,26 +507,21 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm(
         )
 
     module.trtllm_mnnvl_allreduce_fusion(
-        input,
-        output,
-        workspace.mc_ptr,
-        workspace.uc_ptrs_dev,
-        workspace.uc_ptr_local,
-        workspace.buffer_flags,
-        workspace.tp_size,
-        workspace.rank,
-        strategy == MNNVLAllreduceFusionStrategy.ONESHOT,
-        launch_with_pdl,
-        True,  # RMSNorm Fusion
-        residual_in,
-        residual_out,
-        gamma,
-        epsilon,
-        None,  # quant_type
-        None,  # quant_out
-        None,  # sf_out
-        None,  # output_scale
-        None,  # layout_code
+        input=input,
+        output=output,
+        multicast_buffer_ptr=workspace.mc_ptr,
+        buffer_ptrs_dev=workspace.uc_ptrs_dev,
+        buffer_ptr_local=workspace.uc_ptr_local,
+        buffer_flags_mnnvl=workspace.buffer_flags,
+        nranks=workspace.tp_size,
+        rank=workspace.rank,
+        use_oneshot=(strategy == MNNVLAllreduceFusionStrategy.ONESHOT),
+        launch_with_pdl=launch_with_pdl,
+        rmsnorm_fusion=True,
+        residual_in=residual_in,
+        residual_out=residual_out,
+        gamma=gamma,
+        epsilon=epsilon,
     )
     return output, residual_out
 
@@ -553,20 +536,22 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant(
     residual_out: Optional[torch.Tensor] = None,
     quant_out: Optional[torch.Tensor] = None,
     sf_out: Optional[torch.Tensor] = None,
-    output_scale: Optional[torch.Tensor] = None,
-    layout_code: Optional[QuantizationSFLayout] = QuantizationSFLayout.SWIZZLED_128x4,
-    quant_type: MNNVLAllreduceQuantFusionType = MNNVLAllreduceQuantFusionType.NOQUNAT,
+    output_scale: Union[torch.Tensor, float] = 1.0,
+    layout_code: int = QuantizationSFLayout.SWIZZLED_128x4,
+    quant_type: int = QuantFusionType.NONE,
     launch_with_pdl: bool = False,
     strategy: MNNVLAllreduceFusionStrategy = MNNVLAllreduceFusionStrategy.AUTO,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Performs MNNVL Allreduce + Residual + RMSNorm + Quantization.
 
     On top of trtllm_mnnvl_fused_allreduce_add_rmsnorm, this function performs quantization on the all-reduced result in-place.
+    Quant_out = f_quant(normed_out * output_scale), where normed_out is FP32(fp8 only)/FP16/BF16, and output_scale is FP32.
+
     Two quantization type is supported:
         - FP8: support both FP32 and FP16/BF16 input
         - FP4: support only FP16/BF16 input. Two scaling factor layouts are supported:
-            - SWIZZLED_128x4: [m_tile][k_tile][outer_m (32)][inner_m (4)][inner_k (4)]; The output needs to be padded
-                              to be multiples of 128x64.
+            - SWIZZLED_128x4: [m_tile][k_tile][outer_m (32)][inner_m (4)][inner_k (4)]; The scaling factor output needs to be padded
+                              to be multiples of 128x4.
             - LINEAR
 
     NOTE: Behavior is slightly different with trtllm_mnnvl_fused_allreduce_add_rmsnorm. The output is the pre-quant result and
@@ -582,7 +567,7 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant(
         residual_out: Residual output tensor [num_tokens, hidden_dim], empty tensor will be created if not provided.
         quant_out: Quantized output tensor [num_tokens, hidden_dim], empty tensor will be created if not provided.
         sf_out: Scaling factor output tensor [num_tokens, hidden_dim], empty tensor will be created if not provided.
-        output_scale: The global scale applied to quant output; This needs to be a GPU buffer as it may generated dynamically.
+        output_scale: The global scale applied to quant output.
         layout_code: Scaling factor layout code
         quant_type: Quantization type (kFP8, kFP4, kNone)
         launch_with_pdl: Whether to launch with PDL
@@ -618,12 +603,15 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant(
             f"The residual output tensor must be 2D, got {len(residual_out.shape)}D. The shape is {residual_out.shape}."
         )
 
-    if output_scale is None:
-        # This should be compatible with cuda graph
-        output_scale = torch.ones(1, device=input.device, dtype=torch.float32)
+    if isinstance(output_scale, torch.Tensor):
+        output_scale = output_scale.to(torch.float32)
+    else:
+        output_scale = torch.tensor(
+            [output_scale], dtype=torch.float32, device=input.device
+        )
 
     # Quantization related buffers
-    if quant_type == MNNVLAllreduceQuantFusionType.FP8:
+    if quant_type == QuantFusionType.FP8:
         if quant_out is None:
             quant_out = torch.empty_like(input, dtype=torch.float8_e4m3fn)
         # TODO: Do we need further check on the shape?
@@ -631,7 +619,7 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant(
             raise ValueError(
                 f"The quantized output tensor must be 2D, got {len(quant_out.shape)}D. The shape is {quant_out.shape}."
             )
-    elif quant_type == MNNVLAllreduceQuantFusionType.NVFP4:
+    elif quant_type == QuantFusionType.NVFP4:
         if quant_out is None:
             # TODO: PyTorch supports fp4x2 dtype, do we want to use that?
             quant_out = torch.empty(
@@ -680,26 +668,26 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant(
         )
 
     module.trtllm_mnnvl_allreduce_fusion(
-        input,
-        output,
-        workspace.mc_ptr,
-        workspace.uc_ptrs_dev,
-        workspace.uc_ptr_local,
-        workspace.buffer_flags,
-        workspace.tp_size,
-        workspace.rank,
-        strategy == MNNVLAllreduceFusionStrategy.ONESHOT,
-        launch_with_pdl,
-        True,  # RMSNorm Fusion
-        residual_in,
-        residual_out,
-        gamma,
-        epsilon,
-        quant_type,
-        quant_out,
-        sf_out,
-        output_scale,
-        layout_code,
+        input=input,
+        output=output,
+        multicast_buffer_ptr=workspace.mc_ptr,
+        buffer_ptrs_dev=workspace.uc_ptrs_dev,
+        buffer_ptr_local=workspace.uc_ptr_local,
+        buffer_flags_mnnvl=workspace.buffer_flags,
+        nranks=workspace.tp_size,
+        rank=workspace.rank,
+        use_oneshot=(strategy == MNNVLAllreduceFusionStrategy.ONESHOT),
+        launch_with_pdl=launch_with_pdl,
+        rmsnorm_fusion=True,
+        residual_in=residual_in,
+        residual_out=residual_out,
+        gamma=gamma,
+        epsilon=epsilon,
+        quant_type=quant_type,
+        quant_out=quant_out,
+        sf_out=sf_out,
+        output_scale=output_scale,
+        layout_code=layout_code,
     )
     return quant_out, sf_out, residual_out, output
 
@@ -823,26 +811,17 @@ def trtllm_mnnvl_all_reduce(
     )
     module = get_trtllm_mnnvl_comm_module()
     module.trtllm_mnnvl_allreduce_fusion(
-        inp,
-        out,
-        multicast_buffer_ptr,
-        buffer_ptrs_dev,
-        0,  # Allreduce kernel itself does not use this local pointer; still this could be risky but it is only used for legacy code compatibility.
-        buffer_flags_mnnvl,
-        nranks,
-        rank,
-        False,  # Use two-shot
-        launch_with_pdl,
-        False,  # No RMSNorm Fusion
-        None,  # residual_in
-        None,  # residual_out
-        None,  # gamma
-        None,  # epsilon
-        None,  # quant_type
-        None,  # quant_out
-        None,  # sf_out
-        None,  # output_scale
-        None,  # layout_code
+        input=inp,
+        output=out,
+        multicast_buffer_ptr=multicast_buffer_ptr,
+        buffer_ptrs_dev=buffer_ptrs_dev,
+        buffer_ptr_local=0,  # Allreduce kernel itself does not use this local pointer; still this could be risky but it is only used for legacy code compatibility.
+        buffer_flags_mnnvl=buffer_flags_mnnvl,
+        nranks=nranks,
+        rank=rank,
+        use_oneshot=False,
+        launch_with_pdl=launch_with_pdl,
+        rmsnorm_fusion=False,
     )
 
 
@@ -921,24 +900,19 @@ def trtllm_mnnvl_fused_allreduce_rmsnorm(
     module = get_trtllm_mnnvl_comm_module()
 
     module.trtllm_mnnvl_allreduce_fusion(
-        shard_input,
-        normed_output,
-        multicast_buffer_ptr,
-        buffer_ptrs_dev,
-        unicast_ptr,
-        buffer_flags_mnnvl,
-        nranks,
-        rank,
-        False,  # Use two-shot
-        launch_with_pdl,
-        True,  # RMSNorm Fusion
-        residual,
-        prenorm_output,
-        gamma,
-        epsilon,
-        None,  # quant_type
-        None,  # quant_out
-        None,  # sf_out
-        None,  # output_scale
-        None,  # layout_code
+        input=shard_input,
+        output=normed_output,
+        multicast_buffer_ptr=multicast_buffer_ptr,
+        buffer_ptrs_dev=buffer_ptrs_dev,
+        buffer_ptr_local=unicast_ptr,
+        buffer_flags_mnnvl=buffer_flags_mnnvl,
+        nranks=nranks,
+        rank=rank,
+        use_oneshot=False,
+        launch_with_pdl=launch_with_pdl,
+        rmsnorm_fusion=True,
+        residual_in=residual,
+        residual_out=prenorm_output,
+        gamma=gamma,
+        epsilon=epsilon,
     )

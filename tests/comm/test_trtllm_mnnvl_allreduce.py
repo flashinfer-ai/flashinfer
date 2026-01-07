@@ -9,7 +9,7 @@ import torch
 import torch.distributed as dist
 
 import flashinfer.comm.trtllm_mnnvl_ar as trtllm_mnnvl_ar
-from flashinfer.comm import AllReduceFusionPattern
+from flashinfer.comm import AllReduceFusionPattern, QuantFusionType, get_pattern_traits
 from flashinfer.comm.mapping import Mapping
 from flashinfer.comm.mnnvl import TorchDistBackend
 
@@ -25,39 +25,18 @@ from tests.test_helpers.comm import init_torch_distributed_from_mpi
 
 # Note: torch.distributed cleanup is handled by tests/comm/conftest.py
 
-# Helper functions to extract traits from pattern
-FP8 = trtllm_mnnvl_ar.MNNVLAllreduceQuantFusionType.FP8
-FP4 = trtllm_mnnvl_ar.MNNVLAllreduceQuantFusionType.NVFP4
+
+# Helper function
+def fp8_quant(input, scale):
+    finfo = torch.finfo(torch.float8_e4m3fn)
+    inv_scale = scale.reciprocal()
+    qinput = (input.float() * inv_scale).clamp(min=finfo.min, max=finfo.max)
+    return qinput.to(torch.float8_e4m3fn)
 
 
-def _has_quant(pattern: AllReduceFusionPattern) -> bool:
-    return pattern in [
-        AllReduceFusionPattern.kARResidualRMSNormFP8Quant,
-        AllReduceFusionPattern.kARResidualRMSNormFP4Quant,
-        AllReduceFusionPattern.kARResidualRMSNormOutFP8Quant,
-        AllReduceFusionPattern.kARResidualRMSNormOutFP4Quant,
-    ]
-
-
-def _has_rmsnorm(pattern: AllReduceFusionPattern) -> bool:
-    return _has_quant(pattern) or pattern == AllReduceFusionPattern.kARResidualRMSNorm
-
-
-def _has_norm_out(pattern: AllReduceFusionPattern) -> bool:
-    return pattern in [
-        AllReduceFusionPattern.kARResidualRMSNormOutFP8Quant,
-        AllReduceFusionPattern.kARResidualRMSNormOutFP4Quant,
-        AllReduceFusionPattern.kARResidualRMSNorm,
-    ]
-
-
-def _get_quant_type(
-    pattern: AllReduceFusionPattern,
-) -> trtllm_mnnvl_ar.MNNVLAllreduceQuantFusionType:
-    if pattern == AllReduceFusionPattern.kARResidualRMSNormFP8Quant:
-        return FP8
-    elif pattern == AllReduceFusionPattern.kARResidualRMSNormFP4Quant:
-        return FP4
+def dequant(input, scale, dtype):
+    dqinput = input.to(torch.float32) * scale
+    return dqinput.to(dtype)
 
 
 @torch.inference_mode()
@@ -72,6 +51,9 @@ def row_linear_residual_norm_fusion_forward(
     workspace: trtllm_mnnvl_ar.MNNVLAllReduceFusionWorkspace,
 ):
     tensor_parallel_rank = mapping.tp_rank
+    dummy_global_scale = torch.ones(
+        1, dtype=torch.float32, device=reference_output[0].device
+    )
     dist.barrier()
 
     def func(
@@ -114,7 +96,8 @@ def row_linear_residual_norm_fusion_forward(
             )
             return (output.view(shape),)
         else:
-            if _has_norm_out(pattern):
+            traits = get_pattern_traits(pattern)
+            if traits.has_norm_out:
                 output = torch.empty_like(input)
             else:
                 output = None
@@ -127,7 +110,7 @@ def row_linear_residual_norm_fusion_forward(
                     workspace,
                     eps,
                     output=output,
-                    quant_type=_get_quant_type(pattern),
+                    quant_type=traits.quant_type,
                     launch_with_pdl=use_pdl,
                     strategy=trtllm_mnnvl_ar.MNNVLAllreduceFusionStrategy.AUTO,
                 )
@@ -145,7 +128,11 @@ def row_linear_residual_norm_fusion_forward(
 
     output = func(x.clone(), residual.clone(), norm_weight, eps, pattern, workspace)
 
-    assert output[0].shape == reference_output[0].shape
+    traits = get_pattern_traits(pattern)
+
+    # The output shape of FP4 quant could be different.
+    if traits.quant_type != QuantFusionType.NVFP4:
+        assert output[0].shape == reference_output[0].shape
 
     if tensor_parallel_rank == 0:
         print("output[0] (first 10 values):", output[0].flatten()[:10])
@@ -154,7 +141,7 @@ def row_linear_residual_norm_fusion_forward(
             reference_output[0].flatten()[:10],
         )
 
-        if _has_rmsnorm(pattern):
+        if traits.has_rmsnorm:
             print("output[1] (first 10 values):", output[1].flatten()[:10])
             print(
                 "reference_output[1] (first 10 values):",
@@ -162,20 +149,18 @@ def row_linear_residual_norm_fusion_forward(
             )
 
     # Check output
-    if _has_quant(pattern):
-        if _get_quant_type(pattern) == FP8:
-            ref_quantized = reference_output[0].to(torch.float8_e4m3fn)
-            red_dequantized = ref_quantized.to(torch.float32)
-            output_dequantized = output[0].to(torch.float32)
-            torch.testing.assert_close(
-                output_dequantized,
-                red_dequantized,
-                rtol=0.05,
-                atol=0.15,
+    if traits.has_quant:
+        if traits.quant_type == QuantFusionType.FP8:
+            ref_dequant = dequant(
+                fp8_quant(reference_output[0], dummy_global_scale),
+                dummy_global_scale,
+                torch.float32,
             )
+            output_dequant = dequant(output[0], dummy_global_scale, torch.float32)
+            pct_tol = 0.001  # Allow up to 0.1% difference
             assert output[2] is None
 
-        elif _get_quant_type(pattern) == FP4:
+        elif traits.quant_type == QuantFusionType.NVFP4:
             # TODO: Check if this accuracy check is correct, we allow up to 1% difference following trtllm_ar fusion's test case
             # Default to 128x4 swizzled layout and nvfp4 (e4m3 sf, vec 16) only
             from flashinfer.fp4_quantization import (
@@ -183,23 +168,35 @@ def row_linear_residual_norm_fusion_forward(
                 e2m1_and_ufp8sf_scale_to_float,
             )
 
-            ref_quantized, ref_sf = nvfp4_quantize(reference_output[0], 1.0)
-            ref_dequantized = e2m1_and_ufp8sf_scale_to_float(
+            ref_quantized, ref_sf = nvfp4_quantize(
+                reference_output[0], dummy_global_scale
+            )
+            # FIXME: (Not in this PR, report it somewhere) the global scale is documented as optional, but providing None will lead to error.
+            ref_dequant = e2m1_and_ufp8sf_scale_to_float(
                 ref_quantized.view(torch.uint8).cpu(),
                 ref_sf.view(torch.uint8).cpu(),
-                1.0,
+                dummy_global_scale,
             ).cuda()
-            output_dequantized = e2m1_and_ufp8sf_scale_to_float(
+            output_dequant = e2m1_and_ufp8sf_scale_to_float(
                 output[0].view(torch.uint8).cpu(),
                 output[2].view(torch.uint8).cpu(),
-                1.0,
+                dummy_global_scale,
             ).cuda()
-            torch.testing.assert_close(
-                output_dequantized,
-                ref_dequantized,
-                rtol=0.05,
-                atol=0.15,
-            )
+            pct_tol = 0.01  # Allow up to 1% difference
+
+        # Allow up to 1% of elements to differ beyond tolerance
+        rtol, atol = 0.05, 0.15
+        diff = torch.abs(output_dequant - ref_dequant)
+        max_diff = torch.maximum(
+            torch.abs(ref_dequant) * rtol, torch.tensor(atol, device=ref_dequant.device)
+        )
+        mismatched = (diff > max_diff).sum().item()
+        total_elements = output_dequant.numel()
+        mismatch_ratio = mismatched / total_elements
+
+        assert mismatch_ratio <= pct_tol, (
+            f"Mismatch ratio {mismatch_ratio:.4%} exceeds {pct_tol:.4%} threshold"
+        )
     else:
         torch.testing.assert_close(
             output[0],
@@ -209,15 +206,15 @@ def row_linear_residual_norm_fusion_forward(
         )
 
     # Check residual output
-    if _has_rmsnorm(pattern):
+    if traits.has_rmsnorm:
         torch.testing.assert_close(
             output[1],
             reference_output[1],
             rtol=0.05,
             atol=0.15,
         )
-    if _has_quant(pattern):
-        if _has_norm_out(pattern):
+    if traits.has_quant:
+        if traits.has_norm_out:
             assert output[3] is not None
         else:
             assert output[3] is None
@@ -378,7 +375,7 @@ def prepare_test_data(
 
     x_local = x_full[rank, :, :]
     reference_output: Tuple[torch.Tensor, ...] = None
-    if pattern == AllReduceFusionPattern.kARResidualRMSNorm:
+    if pattern != AllReduceFusionPattern.kAllReduce:
         # Fused case: AllReduce + Residual Add + RMS Norm
         allreduce_result = torch.sum(x_full, dim=0)  # AllReduce result
         residual_out = allreduce_result + residual  # Add residual
@@ -574,7 +571,14 @@ def run_mnnvl_ar_full(
 )
 @pytest.mark.parametrize(
     "pattern",
-    [AllReduceFusionPattern.kAllReduce, AllReduceFusionPattern.kARResidualRMSNorm],
+    [
+        AllReduceFusionPattern.kAllReduce,
+        AllReduceFusionPattern.kARResidualRMSNorm,
+        AllReduceFusionPattern.kARResidualRMSNormFP8Quant,
+        AllReduceFusionPattern.kARResidualRMSNormFP4Quant,
+        AllReduceFusionPattern.kARResidualRMSNormOutFP8Quant,
+        AllReduceFusionPattern.kARResidualRMSNormOutFP4Quant,
+    ],
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("hidden_size", [2880, 5120, 7168, 8192, 16384])
@@ -614,9 +618,9 @@ def test_mnnvl_allreduce_legacy(
 if __name__ == "__main__":
     run_mnnvl_ar_full(
         None,
-        [1],
-        AllReduceFusionPattern.kARResidualRMSNormFP8Quant,
-        torch.float16,
-        2880,
+        seq_lens=[64],
+        pattern=AllReduceFusionPattern.kARResidualRMSNormFP8Quant,
+        dtype=torch.float16,
+        hidden_size=2880,
         legacy_api=False,
     )
