@@ -38,10 +38,11 @@ def test_dsv3_router_gemm_op(
 
 # Negative tests - test values just outside valid ranges
 @pytest.mark.parametrize(
-    "num_tokens,num_experts,hidden_dim,mat_a_dtype,mat_b_dtype,out_dtype,mat_b_transpose,expected_error",
+    "fn_array,num_tokens,num_experts,hidden_dim,mat_a_dtype,mat_b_dtype,out_dtype,mat_b_transpose,expected_error",
     [
         # Invalid num_tokens (must be 1-16)
-        (
+        pytest.param(
+            [mm_M1_16_K7168_N128, mm_M1_16_K7168_N256],
             0,
             256,
             7168,
@@ -50,8 +51,10 @@ def test_dsv3_router_gemm_op(
             torch.float32,
             True,
             "num_tokens",
+            id="all-num_tokens_0",
         ),
-        (
+        pytest.param(
+            [mm_M1_16_K7168_N128, mm_M1_16_K7168_N256],
             17,
             256,
             7168,
@@ -60,9 +63,35 @@ def test_dsv3_router_gemm_op(
             torch.float32,
             True,
             "num_tokens",
+            id="all-num_tokens_17",
         ),
-        # Invalid num_experts (must be 256)
-        (
+        # Invalid num_experts (must be 128 or 256, depending on the function)
+        pytest.param(
+            [mm_M1_16_K7168_N128],
+            8,
+            127,
+            7168,
+            torch.bfloat16,
+            torch.bfloat16,
+            torch.float32,
+            True,
+            "num_experts",
+            id="N128-num_experts_127",
+        ),
+        pytest.param(
+            [mm_M1_16_K7168_N128],
+            8,
+            129,
+            7168,
+            torch.bfloat16,
+            torch.bfloat16,
+            torch.float32,
+            True,
+            "num_experts",
+            id="N128-num_experts_129",
+        ),
+        pytest.param(
+            [mm_M1_16_K7168_N256],
             8,
             255,
             7168,
@@ -71,8 +100,10 @@ def test_dsv3_router_gemm_op(
             torch.float32,
             True,
             "num_experts",
+            id="N256-num_experts_255",
         ),
-        (
+        pytest.param(
+            [mm_M1_16_K7168_N256],
             8,
             257,
             7168,
@@ -81,9 +112,11 @@ def test_dsv3_router_gemm_op(
             torch.float32,
             True,
             "num_experts",
+            id="N256-num_experts_257",
         ),
         # Invalid hidden_dim (must be 7168)
-        (
+        pytest.param(
+            [mm_M1_16_K7168_N128, mm_M1_16_K7168_N256],
             8,
             256,
             7167,
@@ -92,8 +125,10 @@ def test_dsv3_router_gemm_op(
             torch.float32,
             True,
             "hidden_dim",
+            id="all-hidden_dim_7167",
         ),
-        (
+        pytest.param(
+            [mm_M1_16_K7168_N128, mm_M1_16_K7168_N256],
             8,
             256,
             7169,
@@ -102,13 +137,84 @@ def test_dsv3_router_gemm_op(
             torch.float32,
             True,
             "hidden_dim",
+            id="all-hidden_dim_7169",
         ),
         # Invalid dtypes
-        (8, 256, 7168, torch.float32, torch.bfloat16, torch.float32, True, "bfloat16"),
-        (8, 256, 7168, torch.bfloat16, torch.float32, torch.float32, True, "bfloat16"),
-        (8, 256, 7168, torch.bfloat16, torch.bfloat16, torch.bfloat16, True, "float32"),
+        pytest.param(
+            [mm_M1_16_K7168_N128],
+            8,
+            128,
+            7168,
+            torch.float32,
+            torch.bfloat16,
+            torch.float32,
+            True,
+            "bfloat16",
+            id="N128-invalid_mat_a_dtype",
+        ),
+        pytest.param(
+            [mm_M1_16_K7168_N128],
+            8,
+            128,
+            7168,
+            torch.bfloat16,
+            torch.float32,
+            torch.float32,
+            True,
+            "bfloat16",
+            id="N128-invalid_mat_b_dtype",
+        ),
+        pytest.param(
+            [mm_M1_16_K7168_N128],
+            8,
+            128,
+            7168,
+            torch.bfloat16,
+            torch.bfloat16,
+            torch.float32,
+            True,
+            "bfloat16",
+            id="N128-invalid_out_dtype",
+        ),
+        pytest.param(
+            [mm_M1_16_K7168_N256],
+            8,
+            256,
+            7168,
+            torch.float32,
+            torch.bfloat16,
+            torch.float32,
+            True,
+            "bfloat16",
+            id="N256-invalid_mat_a_dtype",
+        ),
+        pytest.param(
+            [mm_M1_16_K7168_N256],
+            8,
+            256,
+            7168,
+            torch.bfloat16,
+            torch.float32,
+            torch.float32,
+            True,
+            "bfloat16",
+            id="N256-invalid_mat_b_dtype",
+        ),
+        pytest.param(
+            [mm_M1_16_K7168_N256],
+            8,
+            256,
+            7168,
+            torch.bfloat16,
+            torch.bfloat16,
+            torch.bfloat16,
+            True,
+            "float32",
+            id="N256-invalid_out_dtype",
+        ),
         # Invalid stride (mat_b not transposed = row-major instead of column-major)
-        (
+        pytest.param(
+            [mm_M1_16_K7168_N128, mm_M1_16_K7168_N256],
             8,
             256,
             7168,
@@ -117,10 +223,12 @@ def test_dsv3_router_gemm_op(
             torch.float32,
             False,
             "column-major",
+            id="all-invalid_stride",
         ),
     ],
 )
 def test_dsv3_router_gemm_op_negative(
+    fn_array,
     num_tokens,
     num_experts,
     hidden_dim,
@@ -141,5 +249,6 @@ def test_dsv3_router_gemm_op_negative(
         mat_b = mat_b.t()  # column major
     out = torch.randn(num_tokens, num_experts, device="cuda", dtype=out_dtype)
 
-    with pytest.raises(ValueError, match=expected_error):
-        mm_M1_16_K7168_N256(mat_a, mat_b, out, launch_with_pdl=False)
+    for fn in fn_array:
+        with pytest.raises(ValueError, match=expected_error):
+            fn(mat_a, mat_b, out, launch_with_pdl=False)
