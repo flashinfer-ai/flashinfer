@@ -17,6 +17,7 @@ limitations under the License.
 from .core import (
     gen_gemm_module,
     gen_gemm_sm100_module_cutlass_fp4,
+    gen_gemm_sm103_module_cutlass_fp4,
     gen_gemm_sm120_module_cutlass_fp4,
     gen_gemm_sm100_module_cutlass_fp8,
     gen_gemm_sm100_module,
@@ -32,6 +33,7 @@ from .fp8_blockscale import gen_fp8_blockscale_gemm_sm90_module
 __all__ = [
     "gen_gemm_module",
     "gen_gemm_sm100_module_cutlass_fp4",
+    "gen_gemm_sm103_module_cutlass_fp4",
     "gen_gemm_sm120_module_cutlass_fp4",
     "gen_gemm_sm100_module_cutlass_fp8",
     "gen_gemm_sm100_module",
