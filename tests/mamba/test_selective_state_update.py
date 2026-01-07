@@ -69,10 +69,10 @@ def create_test_inputs(
     }
 
 
-@pytest.mark.parametrize("batch", [1, 32, 64])
+@pytest.mark.parametrize("batch", [1, 64])
 @pytest.mark.parametrize("nheads", [8, 64])
-@pytest.mark.parametrize("dim", [64])
-@pytest.mark.parametrize("dstate", [128])
+@pytest.mark.parametrize("dim", [64, 128])
+@pytest.mark.parametrize("dstate", [64, 128, 256])
 @pytest.mark.parametrize("ngroups", [8])
 @pytest.mark.parametrize("delta_softplus", [True])
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16])
