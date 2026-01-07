@@ -24,17 +24,19 @@ from .jit.sampling import gen_sampling_module
 from .utils import (
     _get_cache_buf,
     device_support_pdl,
+    get_default_generators,
     register_custom_op,
     register_fake_op,
 )
 
 
 def get_seed_and_offset(
-    increment: int, generator: Optional[torch.Generator] = None
+    increment: int,
+    generator: Optional[torch.Generator] = None,
+    device: Optional[torch.device] = None,
 ) -> Tuple[int, int]:
     if generator is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        generator = torch.Generator(device=device)
+        generator = get_default_generators(device)
     # add mutex if multi-trheading needed
     state = generator.get_state()
     seed, offset = state.view(torch.int64)
@@ -100,7 +102,9 @@ def get_sampling_module():
         out_dtype = indices.dtype if indices is not None else torch.int32
         samples = torch.empty(batch_size, dtype=out_dtype, device=device)
         if seed is None or offset is None:
-            seed, offset = get_seed_and_offset(batch_size * logits.size(1), generator)
+            seed, offset = get_seed_and_offset(
+                batch_size * logits.size(1), generator, device
+            )
         module.sampling_from_logits(
             logits,
             samples,
@@ -139,7 +143,7 @@ def get_sampling_module():
         out_dtype = indices.dtype if indices is not None else torch.int32
         samples = torch.empty(batch_size, dtype=out_dtype, device=device)
         if seed is None or offset is None:
-            seed, offset = get_seed_and_offset(batch_size, generator)
+            seed, offset = get_seed_and_offset(batch_size, generator, device)
         module.sampling_from_probs(
             probs,
             samples,
@@ -185,7 +189,7 @@ def get_sampling_module():
         out_dtype = indices.dtype if indices is not None else torch.int32
         samples = torch.empty(batch_size, dtype=out_dtype, device=device)
         if seed is None or offset is None:
-            seed, offset = get_seed_and_offset(batch_size * 32, generator)
+            seed, offset = get_seed_and_offset(batch_size * 32, generator, device)
         module.top_p_sampling_from_probs(
             probs,
             samples,
@@ -232,7 +236,7 @@ def get_sampling_module():
         out_dtype = indices.dtype if indices is not None else torch.int32
         samples = torch.empty(batch_size, dtype=out_dtype, device=device)
         if seed is None or offset is None:
-            seed, offset = get_seed_and_offset(batch_size * 32, generator)
+            seed, offset = get_seed_and_offset(batch_size * 32, generator, device)
         module.top_k_sampling_from_probs(
             probs,
             samples,
@@ -281,7 +285,7 @@ def get_sampling_module():
         out_dtype = indices.dtype if indices is not None else torch.int32
         samples = torch.empty(batch_size, dtype=out_dtype, device=device)
         if seed is None or offset is None:
-            seed, offset = get_seed_and_offset(batch_size, generator)
+            seed, offset = get_seed_and_offset(batch_size, generator, device)
         module.min_p_sampling_from_probs(
             probs,
             samples,
@@ -319,7 +323,7 @@ def get_sampling_module():
         out_dtype = indices.dtype if indices is not None else torch.int32
         samples = torch.empty(batch_size, dtype=out_dtype, device=device)
         if seed is None or offset is None:
-            seed, offset = get_seed_and_offset(batch_size * 32, generator)
+            seed, offset = get_seed_and_offset(batch_size * 32, generator, device)
         module.top_k_top_p_sampling_from_probs(
             probs,
             samples,
@@ -480,7 +484,7 @@ def get_sampling_module():
         output_token_ids = torch.empty((b, n + 1), dtype=torch.int32, device=device)
         if seed is None or offset is None:
             seed, offset = get_seed_and_offset(
-                draft_probs.size(0) * (draft_probs.size(1) + 1), generator
+                draft_probs.size(0) * (draft_probs.size(1) + 1), generator, device
             )
         module.chain_speculative_sampling(
             draft_probs,
