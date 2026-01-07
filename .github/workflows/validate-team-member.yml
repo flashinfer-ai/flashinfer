@@ -21,37 +21,43 @@ jobs:
       # members: read  # Required to check team membership
 
     steps:
-      - name: Check team membership
-        id: check-permission
-        env:
-          GH_TOKEN: ${{ secrets.FLASHINFER_GITHUB_TOKEN }}
-          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
-          ORG: ${{ github.repository_owner }}
-        shell: bash
-        run: |
-          echo "Checking if $PR_AUTHOR is a member of agent-users team..."
-          gh auth status
-          gh api /user -q .login
-
-          if [[ "$(GH_PAGER=cat gh api \
-            -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            /orgs/flashinfer-ai/teams/agent-users/members \
-            -q 'any(.[]; .login == $PR_AUTHOR)')" == "true" ]]; then
-              echo "✅"
-          else
-              echo "❌"
-          fi
-
-
-      - name: Checkout repository
-        if: steps.check-permission.outputs.authorized == 'true'
-        uses: actions/checkout@v4
+      - uses: tspascoal/get-user-teams-membership@v3
         with:
-          fetch-depth: 1
+          username: ${{ github.event.pull_request.user.login }}
+          organization: ${{ github.repository_owner }}
+          team: agent-users
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # - name: Check team membership
+      #   id: check-permission
+      #   env:
+      #     GH_TOKEN: ${{ secrets.FLASHINFER_GITHUB_TOKEN }}
+      #     PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+      #     ORG: ${{ github.repository_owner }}
+      #   shell: bash
+      #   run: |
+      #     echo "Checking if $PR_AUTHOR is a member of agent-users team..."
+      #     gh auth status
+      #     gh api /user -q .login
 
-      - name: Run Claude Code Review
-        if: steps.check-permission.outputs.authorized == 'true'
-        id: claude-review
-        run: |
-          echo "pretend there is a claude agent working here..."
+      #     if [[ "$(GH_PAGER=cat gh api \
+      #       -H "Accept: application/vnd.github+json" \
+      #       -H "X-GitHub-Api-Version: 2022-11-28" \
+      #       /orgs/flashinfer-ai/teams/agent-users/members \
+      #       -q 'any(.[]; .login == $PR_AUTHOR)')" == "true" ]]; then
+      #         echo "✅"
+      #     else
+      #         echo "❌"
+      #     fi
+
+
+      # - name: Checkout repository
+      #   if: steps.check-permission.outputs.authorized == 'true'
+      #   uses: actions/checkout@v4
+      #   with:
+      #     fetch-depth: 1
+
+      # - name: Run Claude Code Review
+      #   if: steps.check-permission.outputs.authorized == 'true'
+      #   id: claude-review
+      #   run: |
+      #     echo "pretend there is a claude agent working here..."
