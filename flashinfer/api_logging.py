@@ -563,3 +563,8 @@ def flashinfer_api(func: Callable = None) -> Callable:
     if func is None:
         return decorator
     return decorator(func)
+
+
+__all__ = [
+    "flashinfer_api",
+]

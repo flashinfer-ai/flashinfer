@@ -66,3 +66,58 @@ from .trtllm_moe_alltoall import (
 )
 
 # from .mnnvl import MnnvlMemory, MnnvlMoe, MoEAlltoallInfo
+
+__all__ = [
+    # CUDA IPC Utilities
+    "CudaRTLibrary",
+    "create_shared_buffer",
+    "free_shared_buffer",
+    # DLPack Utilities
+    "pack_strided_memory",
+    # Mapping Utilities
+    "Mapping",
+    # TensorRT-LLM AllReduce - Types and Enums
+    "AllReduceFusionOp",
+    "AllReduceFusionPattern",
+    "AllReduceStrategyConfig",
+    "AllReduceStrategyType",
+    "QuantizationSFLayout",
+    # TensorRT-LLM AllReduce - Core Operations
+    "trtllm_allreduce_fusion",
+    "trtllm_custom_all_reduce",
+    "trtllm_moe_allreduce_fusion",
+    "trtllm_moe_finalize_allreduce_fusion",
+    # TensorRT-LLM AllReduce - Workspace Management
+    "trtllm_create_ipc_workspace_for_all_reduce",
+    "trtllm_create_ipc_workspace_for_all_reduce_fusion",
+    "trtllm_destroy_ipc_workspace_for_all_reduce",
+    "trtllm_destroy_ipc_workspace_for_all_reduce_fusion",
+    # TensorRT-LLM AllReduce - Initialization and Utilities
+    "trtllm_lamport_initialize",
+    "trtllm_lamport_initialize_all",
+    "compute_fp4_swizzled_layout_sf_size",
+    "gen_trtllm_comm_module",
+    # vLLM AllReduce
+    "vllm_all_reduce",
+    "vllm_dispose",
+    "gen_vllm_comm_module",
+    "vllm_get_graph_buffer_ipc_meta",
+    "vllm_init_custom_ar",
+    "vllm_meta_size",
+    "vllm_register_buffer",
+    "vllm_register_graph_buffers",
+    # Unified AllReduce Fusion API
+    "AllReduceFusionWorkspace",
+    "TRTLLMAllReduceFusionWorkspace",
+    "MNNVLAllReduceFusionWorkspace",
+    "allreduce_fusion",
+    "create_allreduce_fusion_workspace",
+    # MNNVL A2A (Throughput Backend)
+    "MoeAlltoAll",
+    "moe_a2a_combine",
+    "moe_a2a_dispatch",
+    "moe_a2a_initialize",
+    "moe_a2a_get_workspace_size_per_rank",
+    "moe_a2a_sanitize_expert_ids",
+    "moe_a2a_wrap_payload_tensor_in_workspace",
+]

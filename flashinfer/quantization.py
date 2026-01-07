@@ -137,3 +137,9 @@ def segment_packbits(
     y = torch.empty(output_nnzs, dtype=torch.uint8, device=device)
     get_quantization_module().segment_packbits(x, indptr, indptr_new, bitorder, y)
     return y, indptr_new
+
+
+__all__ = [
+    "packbits",
+    "segment_packbits",
+]

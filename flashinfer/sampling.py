@@ -1611,3 +1611,19 @@ def chain_speculative_sampling(
         offset,
     )
     return output_token_ids, output_accepted_token_num, output_emitted_draft_token_num
+
+
+__all__ = [
+    "chain_speculative_sampling",
+    "min_p_sampling_from_probs",
+    "sampling_from_logits",
+    "sampling_from_probs",
+    "softmax",
+    "top_k_mask_logits",
+    "top_k_renorm_probs",
+    "top_k_sampling_from_probs",
+    "top_k_top_p_sampling_from_logits",
+    "top_k_top_p_sampling_from_probs",
+    "top_p_renorm_probs",
+    "top_p_sampling_from_probs",
+]

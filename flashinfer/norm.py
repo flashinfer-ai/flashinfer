@@ -411,3 +411,15 @@ except ImportError:
     # CuTe-DSL not available
     rmsnorm_fp4quant = None  # type: ignore[misc,assignment]
     add_rmsnorm_fp4quant = None  # type: ignore[misc,assignment]
+
+__all__ = [
+    "add_rmsnorm_fp4quant",
+    "fused_add_rmsnorm",
+    "fused_add_rmsnorm_quant",
+    "gemma_fused_add_rmsnorm",
+    "gemma_rmsnorm",
+    "layernorm",
+    "rmsnorm",
+    "rmsnorm_fp4quant",
+    "rmsnorm_quant",
+]

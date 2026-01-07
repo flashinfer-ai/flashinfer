@@ -22,6 +22,7 @@ FP8 GEMM
     :toctree: ../generated
 
     bmm_fp8
+    mm_fp8
     gemm_fp8_nt_groupwise
     group_gemm_fp8_nt_groupwise
     group_deepgemm_fp8_nt_groupwise
@@ -43,3 +44,32 @@ Grouped GEMM (Ampere/Hopper)
     :exclude-members: forward
 
     .. automethod:: __init__
+
+Blackwell GEMM
+--------------
+
+.. autosummary::
+    :toctree: ../generated
+
+    tgv_gemm_sm100
+
+TensorRT-LLM Low Latency GEMM
+------------------------------
+
+.. currentmodule:: flashinfer.trtllm_low_latency_gemm
+
+.. autosummary::
+    :toctree: ../generated
+
+    prepare_low_latency_gemm_weights
+
+CuTe-DSL GEMM
+-------------
+
+.. currentmodule:: flashinfer.gemm
+
+.. autosummary::
+    :toctree: ../generated
+
+    grouped_gemm_nt_masked
+    Sm100BlockScaledPersistentDenseGemmKernel

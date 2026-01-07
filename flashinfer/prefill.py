@@ -3762,3 +3762,11 @@ def fmha_v2_prefill_deepseek(
         return out, lse
     else:
         return out
+
+
+__all__ = [
+    "BatchPrefillWithPagedKVCacheWrapper",
+    "BatchPrefillWithRaggedKVCacheWrapper",
+    "single_prefill_with_kv_cache",
+    "single_prefill_with_kv_cache_return_lse",
+]

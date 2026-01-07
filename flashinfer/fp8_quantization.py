@@ -206,3 +206,9 @@ def mxfp8_dequantize_host(
         scale_tensor,
         is_sf_swizzled_layout,
     )
+
+
+__all__ = [
+    "mxfp8_dequantize_host",
+    "mxfp8_quantize",
+]

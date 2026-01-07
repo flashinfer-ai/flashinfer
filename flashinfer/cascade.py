@@ -1078,3 +1078,13 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
     def end_forward(self) -> None:
         r"""Warning: this function is deprecated and has no effect"""
         pass
+
+
+__all__ = [
+    "BatchDecodeWithSharedPrefixPagedKVCacheWrapper",
+    "BatchPrefillWithSharedPrefixPagedKVCacheWrapper",
+    "MultiLevelCascadeAttentionWrapper",
+    "merge_state",
+    "merge_state_in_place",
+    "merge_states",
+]

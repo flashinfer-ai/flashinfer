@@ -527,3 +527,9 @@ def xqa_mla(
         workspace_buffer,
         enable_pdl,
     )
+
+
+__all__ = [
+    "xqa",
+    "xqa_mla",
+]

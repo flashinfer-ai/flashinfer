@@ -80,3 +80,9 @@ def concat_mla_k(
     - ``rope_dim = 64``
     """
     get_concat_mla_module().concat_mla_k(k, k_nope, k_rope)
+
+
+__all__ = [
+    "get_concat_mla_module",
+    "concat_mla_k",
+]

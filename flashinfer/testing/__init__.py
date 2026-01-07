@@ -28,3 +28,18 @@ from .utils import (
     set_seed,
     sleep_after_kernel_run,
 )
+
+__all__ = [
+    "attention_flops",
+    "attention_flops_with_actual_seq_lens",
+    "attention_tb_per_sec",
+    "attention_tb_per_sec_with_actual_seq_lens",
+    "attention_tflops_per_sec",
+    "attention_tflops_per_sec_with_actual_seq_lens",
+    "bench_gpu_time",
+    "bench_gpu_time_with_cupti",
+    "bench_gpu_time_with_cuda_event",
+    "bench_gpu_time_with_cudagraph",
+    "set_seed",
+    "sleep_after_kernel_run",
+]

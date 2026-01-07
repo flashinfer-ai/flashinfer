@@ -66,3 +66,8 @@ class CompilationContext:
             f"-gencode=arch=compute_{major}{minor},code=sm_{major}{minor}"
             for major, minor in supported_cuda_archs
         ] + self.COMMON_NVCC_FLAGS
+
+
+__all__ = [
+    "CompilationContext",
+]

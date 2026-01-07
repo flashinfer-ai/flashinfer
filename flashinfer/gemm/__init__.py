@@ -20,6 +20,17 @@ from .routergemm_dsv3 import (
     mm_M1_16_K7168_N256 as mm_M1_16_K7168_N256,
 )
 
+# CuTe-DSL GEMM kernels
+try:
+    from ..cute_dsl import grouped_gemm_nt_masked as grouped_gemm_nt_masked
+    from ..cute_dsl import (
+        Sm100BlockScaledPersistentDenseGemmKernel as Sm100BlockScaledPersistentDenseGemmKernel,
+    )
+
+    _CUTE_DSL_AVAILABLE = True
+except ImportError:
+    _CUTE_DSL_AVAILABLE = False
+
 __all__ = [
     "SegmentGEMMWrapper",
     "bmm_fp8",
@@ -36,3 +47,9 @@ __all__ = [
     "fp8_blockscale_gemm_sm90",
     "mm_M1_16_K7168_N256",
 ]
+
+if _CUTE_DSL_AVAILABLE:
+    __all__ += [
+        "grouped_gemm_nt_masked",
+        "Sm100BlockScaledPersistentDenseGemmKernel",
+    ]

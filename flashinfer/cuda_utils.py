@@ -59,3 +59,8 @@ def checkCudaErrors(result):
         return result[1]
     else:
         return result[1:]
+
+
+__all__ = [
+    "checkCudaErrors",
+]

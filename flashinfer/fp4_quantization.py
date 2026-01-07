@@ -999,3 +999,20 @@ def scaled_fp4_grouped_quantize(
         mask,
     )
     return a_fp4, a_sf
+
+
+__all__ = [
+    "SfLayout",
+    "block_scale_interleave",
+    "nvfp4_block_scale_interleave",
+    "e2m1_and_ufp8sf_scale_to_float",
+    "fp4_quantize",
+    "mxfp4_dequantize_host",
+    "mxfp4_dequantize",
+    "mxfp4_quantize",
+    "nvfp4_quantize",
+    "nvfp4_batched_quantize",
+    "shuffle_matrix_a",
+    "shuffle_matrix_sf_a",
+    "scaled_fp4_grouped_quantize",
+]

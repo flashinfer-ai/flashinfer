@@ -1199,3 +1199,9 @@ class BatchPODWithPagedKVCacheWrapper:
     def end_forward(self) -> None:
         r"""Warning: this function is deprecated and has no effect."""
         pass
+
+
+__all__ = [
+    "BatchPODWithPagedKVCacheWrapper",
+    "PODWithPagedKVCacheWrapper",
+]

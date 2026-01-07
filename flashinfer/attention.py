@@ -277,3 +277,9 @@ class BatchAttentionWithAttentionSinkWrapper(BatchPrefillWithPagedKVCacheWrapper
             jit_args=jit_args,
             jit_kwargs=jit_kwargs,
         )
+
+
+__all__ = [
+    "BatchAttention",
+    "BatchAttentionWithAttentionSinkWrapper",
+]

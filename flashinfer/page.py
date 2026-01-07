@@ -399,3 +399,11 @@ def append_paged_kv_cache(
         kv_last_page_len,
         TensorLayout[kv_layout].value,
     )
+
+
+__all__ = [
+    "append_paged_kv_cache",
+    "append_paged_mla_kv_cache",
+    "get_batch_indices_positions",
+    "get_seq_lens",
+]
