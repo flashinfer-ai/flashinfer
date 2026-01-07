@@ -473,6 +473,9 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
             plan_kv_indptr = (
                 kv_indptr.clone().detach() if backend == "trtllm-gen" else kv_indptr
             )
+            # Map fa2_tc to fa2 for the actual backend parameter
+            # fa2_tc is a benchmark-specific name meaning "fa2 with tensor cores"
+            actual_backend = "fa2" if backend == "fa2_tc" else backend
             backend_wrappers[backend] = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
                 workspace_buffer,
                 "HND",
@@ -481,7 +484,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 paged_kv_indptr_buffer=plan_kv_indptr,
                 paged_kv_indices_buffer=kv_indices,
                 paged_kv_last_page_len_buffer=kv_last_page_len,
-                backend=backend,
+                backend=actual_backend,
             )
             backend_wrappers[backend].plan(
                 plan_kv_indptr,
