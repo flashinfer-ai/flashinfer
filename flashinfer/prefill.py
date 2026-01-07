@@ -55,6 +55,7 @@ from .utils import (
     device_support_pdl,
     get_device_sm_count,
     is_float8,
+    is_sm90a_supported,
     is_sm100a_supported,
     is_sm110a_supported,
     is_sm120a_supported,
@@ -3727,7 +3728,7 @@ def fmha_v2_prefill_deepseek(
     assert query.shape[3] == 192 and key.shape[3] == 192 and value.shape[3] == 128, (
         "currently only support deepseek r1 192 query and 128 value"
     )
-    module = get_trtllm_fmha_v2_module()
+    module = get_trtllm_fmha_v2_module(120)
     is_e4m3 = query.dtype == torch.float8_e4m3fn
     is_bf16_output = out.dtype == torch.bfloat16
     scale_softmax = (
@@ -3754,3 +3755,25 @@ def fmha_v2_prefill_deepseek(
         return out, lse
     else:
         return out
+
+
+def trtllm_fmha_v2_prefill(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    out: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    seq_len: int,
+    scale_softmax: float,
+    scale_bmm1: Optional[float] = None,
+    scale_bmm2: Optional[float] = None,
+    return_lse: bool = False,
+    lse: Optional[torch.Tensor] = None,
+):
+    if not is_sm90a_supported(query.device):
+        raise ValueError("trtllm_fmha_v2_prefill is only supported on SM90 GPUs.")
+
+    module = get_trtllm_fmha_v2_module(
+        query.dtype, seq_len, head_dim, use_logits_soft_cap=False
+    )

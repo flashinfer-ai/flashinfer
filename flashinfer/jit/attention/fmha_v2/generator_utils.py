@@ -3813,7 +3813,7 @@ def enumerate_hgmma_flash_warpspec_kernels(specs, sm=90, dtype="fp16"):
 
     # use specialized kernels for cases without alibi scales.
     # there is a numeric issues when applying the exp2f scale optimization and alibi scale at the same time.
-    combinations = product(
+    combinations = product[tuple[bool, bool, InputLayout, bool]](
         [False, True],
         [False, True],
         [

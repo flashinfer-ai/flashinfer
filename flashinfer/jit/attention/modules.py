@@ -1892,12 +1892,22 @@ def gen_cudnn_fmha_module():
     )
 
 
-def get_trtllm_fmha_v2_module():
-    module = gen_trtllm_fmha_v2_module().build_and_load()
-    return module
+def get_trtllm_fmha_v2_module(
+    dtype_q: torch.dtype, seq_len: int, head_dim_qk: int, use_logits_soft_cap: bool
+):
+    # if sm == 120:
+    #     return gen_trtllm_fmha_v2_sm120_module().build_and_load()
+    # elif sm == 90:
+    #     return gen_trtllm_fmha_v2_sm90_module().build_and_load()
+    # else:
+    #     raise ValueError(f"Invalid SM: {sm}")
+
+    return gen_trtllm_fmha_v2_sm90_module(
+        dtype_q, seq_len, head_dim_qk, use_logits_soft_cap
+    )
 
 
-def gen_trtllm_fmha_v2_module() -> JitSpec:
+def gen_trtllm_fmha_v2_sm120_module(device: torch.device) -> JitSpec:
     uri = "trtllm_fmha_v2"
     cached_ops = jit_env.FLASHINFER_JIT_DIR / uri
     cached_ops.mkdir(parents=True, exist_ok=True)
@@ -1930,4 +1940,161 @@ def gen_trtllm_fmha_v2_module() -> JitSpec:
         uri,
         source_paths,
         extra_cuda_cflags=nvcc_flags,
+    )
+
+
+def gen_fmha_v2_module(
+    dtype_q: torch.dtype,
+    head_dim_qk: int,
+    head_dim_v: int = 0,
+    input_layout: int = 0,  # 0=PACKED_QKV, 1=CONTIGUOUS_Q_KV, 2=Q_PAGED_KV, 3=SEPARATE_Q_K_V
+    use_logits_soft_cap: bool = False,
+    use_alibi: bool = True,
+    return_softmax_stats: bool = False,
+    sm: int = 90,
+) -> JitSpec:
+    """
+    Generate a JIT-compiled FMHAv2 module for a specific kernel configuration.
+
+    This function generates:
+    - Kernel code (.cu): The actual kernel implementation with launcher
+    - Dispatcher code (.h): Declares launcher extern for linking
+    - Binding code (.cu): TVM FFI binding for Python interface
+
+    Args:
+        dtype_q: Data type of Q tensor (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
+        head_dim_qk: Head dimension for Q and K
+        head_dim_v: Head dimension for V (0 = same as head_dim_qk)
+        input_layout: 0=PACKED_QKV, 1=CONTIGUOUS_Q_KV, 2=Q_PAGED_KV, 3=SEPARATE_Q_K_V
+        use_logits_soft_cap: Enable attention logit softcapping
+        use_alibi: Enable ALiBi position encoding support
+        return_softmax_stats: Return softmax statistics (for training)
+        sm: Target SM version (90, 89, 80, etc.)
+
+    Returns:
+        JitSpec for compilation
+    """
+    from .fmha_v2.fmha_library import (
+        InputLayout,
+        generate_jit_sources,
+    )
+
+    # Map torch dtypes to fmha_v2 dtype strings
+    dtype_map = {
+        torch.float16: "fp16",
+        torch.bfloat16: "bf16",
+        torch.float32: "fp16_fp32",
+    }
+    if hasattr(torch, "float8_e4m3fn"):
+        dtype_map[torch.float8_e4m3fn] = "e4m3_fp32"
+
+    dtype_str = dtype_map.get(dtype_q)
+    if dtype_str is None:
+        raise ValueError(f"Unsupported dtype: {dtype_q}")
+
+    # Map input_layout int to enum
+    input_layout_enum = InputLayout(input_layout)
+
+    # Build API params
+    api_params = {
+        "sm": sm,
+        "dtype": dtype_str,
+        "seq_len": 0,  # 0 = any sequence length (flash attention)
+        "head_size": head_dim_qk,
+        "head_size_v": head_dim_v,
+        "input_layout": input_layout_enum,
+        "scheduling_mode": 1,  # Dynamic tile scheduling
+        "enable_attn_logit_softcapping": use_logits_soft_cap,
+        "return_softmax_stats": return_softmax_stats,
+        "alibi": use_alibi,
+    }
+
+    # Generate all source files
+    sources = generate_jit_sources(api_params)
+
+    # Create unique URI based on kernel configuration
+    uri = f"fmha_v2_sm{sm}_{dtype_str}_h{head_dim_qk}"
+    if head_dim_v > 0:
+        uri += f"x{head_dim_v}"
+    uri += f"_layout{input_layout}"
+    if use_logits_soft_cap:
+        uri += "_softcap"
+    if use_alibi:
+        uri += "_alibi"
+
+    # Setup generated source directory
+    gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
+    gen_directory.mkdir(parents=True, exist_ok=True)
+
+    # Write kernel .cu file (contains kernels + launcher)
+    kernel_path = gen_directory / sources["kernel_filename"]
+    write_if_different(kernel_path, sources["kernel_code"])
+
+    # Write dispatcher .h file (declares launcher extern, provides fixed-name wrapper)
+    dispatcher_path = gen_directory / "fmha_v2_dispatcher.h"
+    write_if_different(dispatcher_path, sources["dispatcher_code"])
+
+    # Copy static binding .cu file
+    # The binding includes fmha_v2_dispatcher.h and calls the fixed-name wrapper
+    import shutil
+
+    static_binding_path = jit_env.FLASHINFER_CSRC_DIR / "fmha_v2" / "fmha_v2_binding.cu"
+    binding_path = gen_directory / "fmha_v2_binding.cu"
+    if static_binding_path.exists():
+        shutil.copy(static_binding_path, binding_path)
+
+    # Setup compilation flags
+    fmha_v2_src_dir = jit_env.FLASHINFER_CSRC_DIR / "fmha_v2"
+
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[11, 12]
+    )
+    nvcc_flags.extend(
+        [
+            f"-I{fmha_v2_src_dir}",
+            f"-I{gen_directory}",  # For dispatcher include
+            f"-I{jit_env.FLASHINFER_CSRC_DIR}",  # For tvm_ffi_utils.h
+            "-Wno-deprecated-gpu-targets",
+        ]
+    )
+
+    # Add SM-specific flags
+    if sm >= 90:
+        nvcc_flags.append("-gencode=arch=compute_90a,code=sm_90a")
+    elif sm == 89:
+        nvcc_flags.append("-gencode=arch=compute_89,code=sm_89")
+    elif sm >= 80:
+        nvcc_flags.append("-gencode=arch=compute_80,code=sm_80")
+
+    # Compile kernel + binding together
+    source_paths = [kernel_path, binding_path]
+
+    return gen_jit_spec(
+        uri,
+        source_paths,
+        extra_cuda_cflags=nvcc_flags,
+    )
+
+
+def gen_trtllm_fmha_v2_sm90_module(
+    dtype_q: torch.dtype,
+    seq_len: int,
+    head_dim_qk: int,
+    use_logits_soft_cap: bool,
+) -> JitSpec:
+    """
+    Generate SM90 FMHAv2 module (legacy API for backwards compatibility).
+
+    Note: seq_len parameter is ignored as we use flash attention which supports
+    any sequence length.
+    """
+    return gen_fmha_v2_module(
+        dtype_q=dtype_q,
+        head_dim_qk=head_dim_qk,
+        head_dim_v=0,
+        input_layout=0,  # PACKED_QKV
+        use_logits_soft_cap=use_logits_soft_cap,
+        use_alibi=True,
+        return_softmax_stats=False,
+        sm=90,
     )

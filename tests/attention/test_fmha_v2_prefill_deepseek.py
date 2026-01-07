@@ -168,3 +168,49 @@ def test_fmha_v2_prefill_deepseek(
         rtol, atol = 1e-2, 1e-3
 
     torch.testing.assert_close(lse, lse_ref, rtol=1e-2, atol=1e-3)
+
+
+def test_fmha_v2_prefill_sm90():
+    from flashinfer.prefill import trtllm_fmha_v2_prefill
+    from flashinfer.utils import is_sm90a_supported
+
+    if not is_sm90a_supported(torch.device("cuda")):
+        pytest.skip("trtllm_fmha_v2_prefill is only supported on SM90 GPUs.")
+    torch.manual_seed(42)
+
+    batch_size = 8
+    seq_len = 1024
+    num_heads = 8
+    head_dim_qk = 192
+    head_dim_v = 128
+    query = torch.randn(
+        batch_size, seq_len, num_heads, head_dim_qk, device="cuda", dtype=torch.float16
+    )
+    key = torch.randn(
+        batch_size, seq_len, num_heads, head_dim_qk, device="cuda", dtype=torch.float16
+    )
+    value = torch.randn(
+        batch_size, seq_len, num_heads, head_dim_v, device="cuda", dtype=torch.float16
+    )
+    out = torch.zeros(
+        batch_size, seq_len, num_heads, head_dim_v, device="cuda", dtype=torch.float16
+    )
+    scale_softmax = 1.0
+    scale_bmm1 = 1.0
+    scale_bmm2 = 1.0
+    return_lse = True
+    lse = torch.zeros(batch_size, seq_len, num_heads, 2, device="cuda")
+    trtllm_fmha_v2_prefill(
+        query,
+        key,
+        value,
+        out,
+        num_heads,
+        head_dim_qk,
+        seq_len,
+        scale_softmax,
+        scale_bmm1,
+        scale_bmm2,
+        return_lse=return_lse,
+        lse=lse,
+    )

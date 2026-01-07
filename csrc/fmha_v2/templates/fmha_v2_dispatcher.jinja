@@ -1,0 +1,61 @@
+{{ copyright }}
+/*
+ * FMHAv2 Dispatcher (JIT-generated)
+ *
+ * This file:
+ * 1. Declares the actual kernel launcher function as extern
+ * 2. Defines a fixed-name wrapper function that the static binding can call
+ *
+ * Generated for launcher: {{ launcher_name }}
+ */
+#pragma once
+
+#include <fused_multihead_attention.h>
+#include <fused_multihead_attention_utils.h>
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Extern declaration of the JIT-generated launcher function
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+extern void {{ launcher_name }}(
+    bert::Fused_multihead_attention_params_v2 &params,
+    const bert::Fused_multihead_attention_launch_params &launch_params,
+    cudaStream_t stream);
+
+{% if has_noloop and not tiled %}
+// No-loop variant
+extern void {{ launcher_name }}_nl(
+    bert::Fused_multihead_attention_params_v2 &params,
+    const bert::Fused_multihead_attention_launch_params &launch_params,
+    cudaStream_t stream);
+{% endif %}
+
+{% if tiled %}
+// Tiled no-loop variant
+extern void {{ launcher_name }}_nl_tiled(
+    bert::Fused_multihead_attention_params_v2 &params,
+    const bert::Fused_multihead_attention_launch_params &launch_params,
+    cudaStream_t stream);
+{% endif %}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Fixed-name wrapper function that the static binding calls
+// This provides a stable ABI regardless of the actual launcher name
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline void fmha_v2_run_kernel(
+    bert::Fused_multihead_attention_params_v2 &params,
+    const bert::Fused_multihead_attention_launch_params &launch_params,
+    cudaStream_t stream) {
+
+{% if tiled %}
+    // Tiled kernel variant
+    {{ launcher_name }}_nl_tiled(params, launch_params, stream);
+{% elif has_noloop %}
+    // No-loop variant (default for flash attention)
+    {{ launcher_name }}_nl(params, launch_params, stream);
+{% else %}
+    // Standard kernel
+    {{ launcher_name }}(params, launch_params, stream);
+{% endif %}
+}
