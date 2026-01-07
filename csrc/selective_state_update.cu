@@ -33,6 +33,8 @@ void selective_state_update(TensorView state, TensorView x, TensorView dt, Tenso
   auto const dstate = state.size(3);
   auto const ngroups = B.size(1);
 
+  FLASHINFER_CHECK(state_cache_size >= batch, "state.size(0) must be >= x.size(0)");
+
   FLASHINFER_CHECK(nheads % ngroups == 0, "nheads must be divisible by ngroups");
 
   // Check x shape and strides
