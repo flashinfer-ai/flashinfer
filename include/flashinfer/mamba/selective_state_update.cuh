@@ -161,9 +161,7 @@ __global__ void selective_state_update_kernel_simple(SelectiveStateUpdateParams 
     dt_value = thresholded_softplus(dt_value);
   }
 
-  // auto const dA = fast_exp(A_value * dt_value);
-  auto const dA = __expf(A_value * dt_value);
-  // auto const dA = exp(A_value * dt_value);
+  auto const dA = fast_exp(A_value * dt_value);
 
   auto d_value = D ? toFloat(D[head]) : 0.f;
 
