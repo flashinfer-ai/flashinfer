@@ -16,9 +16,10 @@
  */
 #pragma once
 
+#include <iostream>
+
 #include "trtllm/gen/DtypeDecl.h"
 #include "trtllm/gen/MmaDecl.h"
-#include <iostream>
 
 #ifdef TLLM_ENABLE_CUDA
 #include <cuda.h>
@@ -36,13 +37,10 @@ namespace tg = trtllm::gen;
 
 #ifdef TLLM_ENABLE_CUDA
 
-inline CUtensorMap buildNdTmaDescriptor(tg::Dtype dtype,
-                                        std::vector<uint64_t> const& shapes,
+inline CUtensorMap buildNdTmaDescriptor(tg::Dtype dtype, std::vector<uint64_t> const& shapes,
                                         std::vector<uint64_t> const& strides,
-                                        std::vector<int32_t> const& tileShapes,
-                                        void* gmemAddr,
-                                        bool doPad,
-                                        bool doSwizzle = true) {
+                                        std::vector<int32_t> const& tileShapes, void* gmemAddr,
+                                        bool doPad, bool doSwizzle = true) {
   // The multiplication factor of the data padding in SMEM.
   int32_t padMultiplier = 1;
   CUtensorMap desc{};
@@ -73,7 +71,7 @@ inline CUtensorMap buildNdTmaDescriptor(tg::Dtype dtype,
   // The swizzle type.
   CUtensorMapSwizzle swizzleType{CU_TENSOR_MAP_SWIZZLE_NONE};
   int32_t fastestDimTileSizeBytes =
-    (tileShapes[0] * tg::dtypeGetNumBits(dtype) * padMultiplier) / /* bits */ 8;
+      (tileShapes[0] * tg::dtypeGetNumBits(dtype) * padMultiplier) / /* bits */ 8;
   if (doSwizzle) {
     if ((fastestDimTileSizeBytes % 128) == 0) {
       swizzleType = CU_TENSOR_MAP_SWIZZLE_128B;
@@ -93,7 +91,7 @@ inline CUtensorMap buildNdTmaDescriptor(tg::Dtype dtype,
   }
 
   // Check gmem address must be 16B-aligned
-  assert((reinterpret_cast<uint64_t>(gmemAddr) & 0b1111) == 0); //
+  assert((reinterpret_cast<uint64_t>(gmemAddr) & 0b1111) == 0);  //
 
   // Check shape must be in range [1, 2^32]
   int32_t dim = shapes.size();
@@ -102,8 +100,8 @@ inline CUtensorMap buildNdTmaDescriptor(tg::Dtype dtype,
   assert(dim == 2 || dim == 3 || dim == 4);
   // Check shape range.
   for (int32_t ii = 0; ii < dim; ++ii) {
-    assert(shapes[ii] >= (uint64_t(1)));       // Size must be min 1
-    assert(shapes[ii] <= (uint64_t(1) << 32)); // Size must be max 2^32
+    assert(shapes[ii] >= (uint64_t(1)));        // Size must be min 1
+    assert(shapes[ii] <= (uint64_t(1) << 32));  // Size must be max 2^32
   }
 
   // TMA descriptor does not store the zeroth stride and assumes it is 1.
@@ -141,18 +139,13 @@ inline CUtensorMap buildNdTmaDescriptor(tg::Dtype dtype,
   std::vector<uint32_t> tileStrides(dim, 1);
 
   // Build the descriptor.
-  CUresult result = cuTensorMapEncodeTiled(&desc,
-                                           tmaDataFormat,
-                                           /*tensorRank=*/dim,
-                                           gmemAddr,
-                                           shapes.data(),
-                                           stridesInBytes.data(),
-                                           boxDim.data(),
-                                           tileStrides.data(),
-                                           /*interleave=*/CU_TENSOR_MAP_INTERLEAVE_NONE,
-                                           swizzleType,
-                                           /*l2Promotion=*/CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
-                                           /*oobFill=*/CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  CUresult result =
+      cuTensorMapEncodeTiled(&desc, tmaDataFormat,
+                             /*tensorRank=*/dim, gmemAddr, shapes.data(), stridesInBytes.data(),
+                             boxDim.data(), tileStrides.data(),
+                             /*interleave=*/CU_TENSOR_MAP_INTERLEAVE_NONE, swizzleType,
+                             /*l2Promotion=*/CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
+                             /*oobFill=*/CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
 
   if (result != CUDA_SUCCESS) {
     char const* errorString;
@@ -195,11 +188,9 @@ inline CUtensorMap buildNdTmaDescriptor(tg::Dtype dtype,
 }
 
 // TODO: make it work with the above descriptor?
-inline CUtensorMap buildSfTmaDescriptor(tg::Dtype dtype,
-                                        std::vector<uint64_t> const& shapes,
+inline CUtensorMap buildSfTmaDescriptor(tg::Dtype dtype, std::vector<uint64_t> const& shapes,
                                         std::vector<uint64_t> const& strides,
-                                        const std::vector<uint32_t>& tileShapes,
-                                        void* gmemAddr) {
+                                        const std::vector<uint32_t>& tileShapes, void* gmemAddr) {
   CUtensorMap desc{};
   CUtensorMapDataType tmaDataFormat{};
   if (dtype == tg::Dtype::E4m3 || dtype == tg::Dtype::UE8m0) {
@@ -215,14 +206,14 @@ inline CUtensorMap buildSfTmaDescriptor(tg::Dtype dtype,
   CUtensorMapSwizzle swizzleType = CU_TENSOR_MAP_SWIZZLE_NONE;
 
   // Check gmem address must be 16B-aligned
-  assert((reinterpret_cast<uint64_t>(gmemAddr) & 0b1111) == 0); //
+  assert((reinterpret_cast<uint64_t>(gmemAddr) & 0b1111) == 0);  //
 
   // Check shape must be in range [1, 2^32]
   int32_t dim = shapes.size();
   // Check shape range.
   for (int32_t ii = 0; ii < dim; ++ii) {
-    assert(shapes[ii] >= (uint64_t(1)));       // Size must be min 1
-    assert(shapes[ii] <= (uint64_t(1) << 32)); // Size must be max 2^32
+    assert(shapes[ii] >= (uint64_t(1)));        // Size must be min 1
+    assert(shapes[ii] <= (uint64_t(1) << 32));  // Size must be max 2^32
   }
 
   // TMA descriptor does not store the zeroth stride and assumes it is 1.
@@ -294,10 +285,10 @@ inline CUtensorMap buildSfTmaDescriptor(tg::Dtype dtype,
   return desc;
 }
 
-#endif // defined TLLM_ENABLE_CUDA
+#endif  // defined TLLM_ENABLE_CUDA
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-} // namespace gemm
+}  // namespace gemm
 
-} // namespace batchedGemm
+}  // namespace batchedGemm

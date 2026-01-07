@@ -1089,7 +1089,11 @@ class FP8PerTensorMoe(Moe):
         # Stack weights and scales for all experts
         gemm1_weights_fp8_interleaved = torch.stack(
             gemm1_weights_fp8_interleaved
-        ).reshape(num_experts, (2 if is_gated_activation(args.activation_type) else 1) * intermediate_size, hidden_size)
+        ).reshape(
+            num_experts,
+            (2 if is_gated_activation(args.activation_type) else 1) * intermediate_size,
+            hidden_size,
+        )
 
         # Shuffle weights and scaling factors for transposed mma output
         gemm1_weights_fp8_shuffled = []
@@ -1123,7 +1127,9 @@ class FP8PerTensorMoe(Moe):
                 * (1.0 / args.hidden_states_scale_global)
             )
         else:
-            scale_c_fc1 = args_dequant.c_global_sf * torch.ones_like(args.gemm1_scales_global)
+            scale_c_fc1 = args_dequant.c_global_sf * torch.ones_like(
+                args.gemm1_scales_global
+            )
         scale_gate_fc1 = (1.0 / args.gemm1_scales_global) * (
             1.0 / args.hidden_states_scale_global
         )
@@ -1869,7 +1875,11 @@ def run_moe_dequant(args, quant_mode: QuantMode):
 
     # Gemm1
     gemm1_output = torch.full(
-        (total_num_padded_tokens, (2 if is_gated_activation(args.activation_type) else 1) * args.intermediate_size),
+        (
+            total_num_padded_tokens,
+            (2 if is_gated_activation(args.activation_type) else 1)
+            * args.intermediate_size,
+        ),
         float("nan"),
         device="cuda",
     ).to(torch.float)
@@ -2356,7 +2366,11 @@ def run_moe_test(
         (num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16
     )
     gemm1_weights = torch.randn(
-        (num_experts, (2 if is_gated_activation(activation_type) else 1) * intermediate_size, hidden_size),
+        (
+            num_experts,
+            (2 if is_gated_activation(activation_type) else 1) * intermediate_size,
+            hidden_size,
+        ),
         device="cuda",
         dtype=torch.bfloat16,
     )

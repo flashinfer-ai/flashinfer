@@ -21,9 +21,9 @@
 #include <string>
 #ifndef TLLM_GEN_EXPORT_INTERFACE
 #include "trtllm/gen/CommonUtils.h"
-#else // TLLM_GEN_EXPORT_INTERFACE
+#else  // TLLM_GEN_EXPORT_INTERFACE
 #include "CommonUtils.h"
-#endif // TLLM_GEN_EXPORT_INTERFACE
+#endif  // TLLM_GEN_EXPORT_INTERFACE
 
 namespace batchedGemm {
 
@@ -73,23 +73,23 @@ inline bool mmaKindIsBlockFmt(MmaKind mmaKind) {
 // For logging and error reporting
 inline std::string mmaKindToString(MmaKind mmaKind) {
   switch (mmaKind) {
-  case MmaKind::Auto:
-    return "Auto";
-  case MmaKind::Fp16:
-    return "Fp16";
-  case MmaKind::Fp8Fp6Fp4:
-    return "Fp8Fp6Fp4";
-  case MmaKind::Int8:
-    return "Int8";
-  case MmaKind::MxFp4NvFp4:
-    return "MxFp4NvFp4";
-  case MmaKind::MxFp8Fp6Fp4:
-    return "MxFp8Fp6Fp4";
-  case MmaKind::Tf32:
-    return "Tf32";
-  default:
-    assert(false);
-    return "Unsupported type";
+    case MmaKind::Auto:
+      return "Auto";
+    case MmaKind::Fp16:
+      return "Fp16";
+    case MmaKind::Fp8Fp6Fp4:
+      return "Fp8Fp6Fp4";
+    case MmaKind::Int8:
+      return "Int8";
+    case MmaKind::MxFp4NvFp4:
+      return "MxFp4NvFp4";
+    case MmaKind::MxFp8Fp6Fp4:
+      return "MxFp8Fp6Fp4";
+    case MmaKind::Tf32:
+      return "Tf32";
+    default:
+      assert(false);
+      return "Unsupported type";
   }
 }
 
@@ -106,7 +106,7 @@ inline int32_t getTmemColStridePerGroup(int32_t tileMn, int32_t mmaK, int32_t kG
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-} // namespace gen
-} // namespace trtllm
+}  // namespace gen
+}  // namespace trtllm
 
-} // namespace batchedGemm
+}  // namespace batchedGemm

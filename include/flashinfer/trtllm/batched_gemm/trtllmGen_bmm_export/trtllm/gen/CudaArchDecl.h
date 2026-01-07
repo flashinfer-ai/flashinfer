@@ -46,9 +46,7 @@ enum class CudaArch {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-inline bool isArchHopper(CudaArch cudaArch) {
-  return cudaArch == CudaArch::Sm90a;
-}
+inline bool isArchHopper(CudaArch cudaArch) { return cudaArch == CudaArch::Sm90a; }
 
 inline bool isArchBlackwell(CudaArch cudaArch) {
   return cudaArch == CudaArch::Sm100a || cudaArch == CudaArch::Sm100f ||
@@ -59,17 +57,17 @@ inline bool isArchBlackwell(CudaArch cudaArch) {
 
 inline std::string cudaArchToString(CudaArch cudaArch, bool isFull = true) {
   switch (cudaArch) {
-  case CudaArch::Sm90a:
-    return isFull ? "90a" : "90";
-  case CudaArch::Sm100a:
-    return isFull ? "100a" : "100";
-  case CudaArch::Sm100f:
-    return isFull ? "100f" : "100";
-  case CudaArch::Sm103a:
-    return isFull ? "103a" : "103";
-  default:
-    assert(false);
-    return "";
+    case CudaArch::Sm90a:
+      return isFull ? "90a" : "90";
+    case CudaArch::Sm100a:
+      return isFull ? "100a" : "100";
+    case CudaArch::Sm100f:
+      return isFull ? "100f" : "100";
+    case CudaArch::Sm103a:
+      return isFull ? "103a" : "103";
+    default:
+      assert(false);
+      return "";
   }
 }
 
@@ -92,6 +90,6 @@ inline CudaArch stringToCudaArch(std::string const& str) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-} // namespace gen
-} // namespace trtllm
-} // namespace batchedGemm
+}  // namespace gen
+}  // namespace trtllm
+}  // namespace batchedGemm

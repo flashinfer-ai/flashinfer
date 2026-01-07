@@ -133,10 +133,8 @@ enum class CtaSwizzleType : uint32_t {
 
 // Helper functions to check the SplitK type.
 
-#define SPLIT_K_FUNCTION(Mode)                                                                     \
-  inline bool doesSplitKUse##Mode(SplitK mode) {                                                   \
-    return (mode == SplitK::Mode);                                                                 \
-  }
+#define SPLIT_K_FUNCTION(Mode) \
+  inline bool doesSplitKUse##Mode(SplitK mode) { return (mode == SplitK::Mode); }
 
 SPLIT_K_FUNCTION(Gmem)
 SPLIT_K_FUNCTION(Dsmem)
@@ -147,10 +145,8 @@ SPLIT_K_FUNCTION(Dsmem)
 
 // Helper functions to check the Bias type.
 
-#define BIAS_TYPE_FUNCTION(Mode)                                                                   \
-  inline bool isBiasType##Mode(BiasType type) {                                                    \
-    return (type == BiasType::Mode);                                                               \
-  }
+#define BIAS_TYPE_FUNCTION(Mode) \
+  inline bool isBiasType##Mode(BiasType type) { return (type == BiasType::Mode); }
 
 BIAS_TYPE_FUNCTION(None)
 BIAS_TYPE_FUNCTION(N)
@@ -161,6 +157,6 @@ BIAS_TYPE_FUNCTION(Mn)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-} // namespace gemm
+}  // namespace gemm
 
-} // namespace batchedGemm
+}  // namespace batchedGemm

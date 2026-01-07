@@ -21,20 +21,20 @@
 #ifdef TLLM_GEN_EXPORT_INTERFACE
 #include <iostream>
 
-#define TLLM_CHECK_ERROR(cond, ...)                                                                \
-  if (!(cond)) {                                                                                   \
-    printArgs(__VA_ARGS__);                                                                        \
-    return false;                                                                                  \
+#define TLLM_CHECK_ERROR(cond, ...) \
+  if (!(cond)) {                    \
+    printArgs(__VA_ARGS__);         \
+    return false;                   \
   }
 
 #define TLLM_LOG_ERROR(...) TLLM_CHECK_ERROR(false, __VA_ARGS__)
 
 #define TLLM_CHECK_ERROR_FMT(...) TLLM_CHECK_ERROR(false, __VA_ARGS__)
 
-#define TLLM_CHECK_WARNING(cond, ...)                                                              \
-  if (!(cond)) {                                                                                   \
-    printArgs(__VA_ARGS__);                                                                        \
-    return false;                                                                                  \
+#define TLLM_CHECK_WARNING(cond, ...) \
+  if (!(cond)) {                      \
+    printArgs(__VA_ARGS__);           \
+    return false;                     \
   }
 
 #define TLLM_LOG_WARNING(...) TLLM_CHECK_WARNING(false, __VA_ARGS__)
@@ -49,8 +49,8 @@ namespace trtllm {
 namespace gen {
 class CudaRunner;
 class GenCfg;
-} // namespace gen
-} // namespace trtllm
+}  // namespace gen
+}  // namespace trtllm
 
 namespace gemmGatedAct {
 
@@ -82,10 +82,8 @@ enum class ActType {
 
 // Helper functions to check the ActType type.
 
-#define TLLM_ACT_TYPE_FUNCTION(actType)                                                            \
-  inline bool is##actType(ActType type) {                                                          \
-    return (type == ActType::actType);                                                             \
-  }
+#define TLLM_ACT_TYPE_FUNCTION(actType) \
+  inline bool is##actType(ActType type) { return (type == ActType::actType); }
 
 TLLM_ACT_TYPE_FUNCTION(SwiGlu)
 TLLM_ACT_TYPE_FUNCTION(GeGlu)
@@ -96,12 +94,12 @@ TLLM_ACT_TYPE_FUNCTION(GeGlu)
 
 inline std::string getActTypeName(ActType type) {
   switch (type) {
-  case ActType::SwiGlu:
-    return "SwiGlu";
-  case ActType::GeGlu:
-    return "GeGlu";
-  default:
-    return "Unknown type";
+    case ActType::SwiGlu:
+      return "SwiGlu";
+    case ActType::GeGlu:
+      return "GeGlu";
+    default:
+      return "Unknown type";
   }
 }
 
@@ -110,9 +108,7 @@ inline std::string getActTypeName(ActType type) {
 struct GemmGatedActOptions : public gemm::GemmOptions {
   GemmGatedActOptions() = default;
   GemmGatedActOptions(gemm::GemmOptions options, ActType actType, bool clampBeforeAct)
-    : gemm::GemmOptions(options)
-    , mActType(actType)
-    , mClampBeforeAct(clampBeforeAct) {}
+      : gemm::GemmOptions(options), mActType(actType), mClampBeforeAct(clampBeforeAct) {}
 
   // Type of the gated activation.
   ActType mActType{ActType::SwiGlu};
@@ -124,14 +120,12 @@ struct GemmGatedActOptions : public gemm::GemmOptions {
 
 // Check if the options are valid or not.
 inline bool checkAndUpdateGemmGatedActOptions(gemmGatedAct::GemmGatedActOptions& options,
-                                              tg::CudaArch cudaArch,
-                                              bool updateOptions = true) {
-
+                                              tg::CudaArch cudaArch, bool updateOptions = true) {
   // tmpOut is already transposed at this stage
   auto const hiddenSizeStr = options.mTransposeMmaOutput ? "M" : "N";
   auto const hiddenSize = options.mTransposeMmaOutput ? options.mM : options.mN;
   auto const hiddenEpilogueTileSize =
-    options.mTransposeMmaOutput ? options.mEpilogueTileM : options.mEpilogueTileN;
+      options.mTransposeMmaOutput ? options.mEpilogueTileM : options.mEpilogueTileN;
 
   TLLM_CHECK_ERROR(hiddenSize % 2 == 0, hiddenSizeStr, " must be a multiple of 2.");
 
@@ -140,25 +134,19 @@ inline bool checkAndUpdateGemmGatedActOptions(gemmGatedAct::GemmGatedActOptions&
 
   if (options.mUseTmaStore) {
     TLLM_CHECK_ERROR(
-      hiddenEpilogueTileSize * tg::dtypeGetNumBits(options.mDtypeC) / /* bits */ 8 % 32 == 0,
-      "Unsupported output hidden tile size");
+        hiddenEpilogueTileSize * tg::dtypeGetNumBits(options.mDtypeC) / /* bits */ 8 % 32 == 0,
+        "Unsupported output hidden tile size");
   }
 
   if (options.mDtypeC == tg::Dtype::E2m1 || options.mDtypeC == tg::Dtype::MxE4m3) {
     int const outHiddenSize = (options.mTransposeMmaOutput ? options.mM : options.mN) / 2;
     int const hiddenGranularity = 4 * tg::dtypeNumEltsPerSf(options.mDtypeC);
-    TLLM_CHECK_ERROR(outHiddenSize % hiddenGranularity == 0,
-                     "Output hidden size (",
-                     outHiddenSize,
-                     ") must be a multiple of ",
-                     hiddenGranularity,
-                     " for block-scaled outputs.");
+    TLLM_CHECK_ERROR(outHiddenSize % hiddenGranularity == 0, "Output hidden size (", outHiddenSize,
+                     ") must be a multiple of ", hiddenGranularity, " for block-scaled outputs.");
   }
 
-  auto isValid = gemm::checkAndUpdateGemmOptions(options,
-                                                 cudaArch,
-                                                 /* tpGrpSize */ 1,
-                                                 updateOptions);
+  auto isValid = gemm::checkAndUpdateGemmOptions(options, cudaArch,
+                                                 /* tpGrpSize */ 1, updateOptions);
 
   if (!isValid) {
     return false;
@@ -166,22 +154,18 @@ inline bool checkAndUpdateGemmGatedActOptions(gemmGatedAct::GemmGatedActOptions&
 
   auto const validHiddenSize = options.mTransposeMmaOutput ? options.mValidM : options.mValidN;
   if (options.mUseDeepSeekFp8) {
-    TLLM_CHECK_ERROR(hiddenSize % 256 == 0 && validHiddenSize % 256 == 0,
-                     "Hidden size (",
-                     hiddenSize,
-                     ") and valid hidden size (",
-                     validHiddenSize,
+    TLLM_CHECK_ERROR(hiddenSize % 256 == 0 && validHiddenSize % 256 == 0, "Hidden size (",
+                     hiddenSize, ") and valid hidden size (", validHiddenSize,
                      ") must be a multiple of 256");
   }
 
   //
   if (options.mUseShuffledMatrixA) {
     auto const shuffleBlockSize = gemm::getShuffleBlockSize(options.mEpilogueTileM);
-    TLLM_CHECK_ERROR(hiddenSize % (2 * shuffleBlockSize) == 0 &&
-                       validHiddenSize % (2 * shuffleBlockSize) == 0,
-                     "M/validM must be a multiple of 2 * shuffle block size (",
-                     2 * shuffleBlockSize,
-                     ") when useShuffledMatrixA");
+    TLLM_CHECK_ERROR(
+        hiddenSize % (2 * shuffleBlockSize) == 0 && validHiddenSize % (2 * shuffleBlockSize) == 0,
+        "M/validM must be a multiple of 2 * shuffle block size (", 2 * shuffleBlockSize,
+        ") when useShuffledMatrixA");
   }
   if (options.mNumSlicesForSplitK > 1) {
     TLLM_CHECK_ERROR(doesSplitKUseDsmem(options.mSplitK),
@@ -233,7 +217,7 @@ struct GemmGatedActConfig {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-} // namespace gemmGatedAct
+}  // namespace gemmGatedAct
 
 #ifdef TLLM_GEN_EXPORT_INTERFACE
 
@@ -243,6 +227,6 @@ struct GemmGatedActConfig {
 #undef TLLM_LOG_WARNING
 #undef TLLM_LOG_INFO
 #undef TLLM_LOG_ERROR
-#endif // TLLM_GEN_EXPORT_INTERFACE
+#endif  // TLLM_GEN_EXPORT_INTERFACE
 
-} // namespace batchedGemm
+}  // namespace batchedGemm
