@@ -22,11 +22,6 @@ using tvm::ffi::Optional;
 
 namespace flashinfer::mamba {
 
-// TODO: Implement the launcher function that:
-// 1. Validates tensor dimensions and devices
-// 2. Extracts raw pointers from TensorView
-// 3. Calls the framework-agnostic kernel from include/flashinfer/mamba/selective_state_update.cuh
-//
 void selective_state_update(TensorView state, TensorView x, TensorView dt, TensorView output,
                             TensorView A, TensorView B, TensorView C, TensorView D,
                             Optional<TensorView> z, Optional<TensorView> dt_bias, bool dt_softplus,
@@ -198,8 +193,6 @@ void selective_state_update(TensorView state, TensorView x, TensorView dt, Tenso
                           << "matrixA_dtype=" << matrixA_dtype.code << ":" << matrixA_dtype.bits
                           << ". Currently only support: "
                           << "state=bfloat16, input=bfloat16, weight=bfloat16, matrixA=float32";
-
-    throw std::runtime_error("selective_state_update is not implemented yet.");
   }
 }
 
