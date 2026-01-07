@@ -54,7 +54,7 @@ def selective_state_update(
     Parameters
     ----------
     state : torch.Tensor
-        State tensor with shape (batch, dim, dstate) or (batch, nheads, dim, dstate)
+        State tensor with shape (state_cache_size, dim, dstate) or (state_cache_size, nheads, dim, dstate)
     x : torch.Tensor
         Input tensor with shape (batch, dim) or (batch, nheads, dim)
     dt : torch.Tensor
