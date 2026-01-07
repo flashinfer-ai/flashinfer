@@ -246,7 +246,6 @@ def parse_moe_args(line, parser):
     }
     args.routing_method_type = routing_method_name_to_type[args.routing_method]
 
-    args.activation_type = args.activation_type
     if args.verbose >= 1:
         print(f"[INFO] {args = }")
     return args
@@ -1606,7 +1605,7 @@ def testTrtllmFp8PerTensorScaleMoe(args):
             output1_scales_gate_scalar,
             gemm2_weights_fp8,
             output2_scales_scalar,
-            args.activation_type
+            args.activation_type,
         ),
     )
 
