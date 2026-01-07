@@ -298,7 +298,7 @@ def selective_state_update_triton(
         A.stride(-1) == 0
         and A.stride(-2) == 0
         and dt.stride(-1) == 0
-        and dt_bias.stride(-1) == 0
+        and (dt_bias is not None and dt_bias.stride(-1) == 0)
     )
     with torch.cuda.device(x.device.index):
         _selective_scan_update_kernel[grid](
