@@ -100,7 +100,8 @@ __global__ void routingMainKernel(KernelParams params) {
       smemScoreSigmoid[threadExpert] = scoreSigmoid;
     }
     // get the score with bias
-    // note: with invalid values, invalidScoreFloat ensures values are always smaller than valid ones
+    // note: with invalid values, invalidScoreFloat ensures values are always smaller than valid
+    // ones
     auto scoreBias = float{scoreSigmoid + float{biasVal}};
 
     if (expertSelected) {
