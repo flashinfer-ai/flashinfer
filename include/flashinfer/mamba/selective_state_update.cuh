@@ -245,6 +245,7 @@ template <typename input_t, typename weight_t, typename matrixA_t, typename stat
           int DSTATE, int consumerWarps, int rowsPerStage, int numStages = 1>
 __global__ void selective_state_update_kernel_producer_consumer_vertical(
     SelectiveStateUpdateParams params, __grid_constant__ CUtensorMap const tensorState) {
+#ifdef FLASHINFER_MAMBA_ENABLE_SM90
   auto* __restrict__ output = reinterpret_cast<input_t*>(params.output);
 
   auto const* __restrict__ x = reinterpret_cast<input_t const*>(params.x);
@@ -433,13 +434,16 @@ __global__ void selective_state_update_kernel_producer_consumer_vertical(
       convertAndStore(&output[batch * params.out_stride_batch + head * dim + d], out_value);
     }
   }
+#endif
 }
 
 template <typename input_t, typename weight_t, typename matrixA_t, typename state_t>
 void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, cudaStream_t stream) {
   auto [sm_major, sm_minor] = GetCudaComputeCapability();
 
+#ifdef FLASHINFER_MAMBA_ENABLE_SM90
   if (sm_major < 9)  // pre-Hopper
+#endif
   {
     auto dispatch_dstate = [&]<int DSTATE>() {
       constexpr int numWarps = 2;
@@ -463,7 +467,10 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, cudaStream_t
       default:
         FLASHINFER_CHECK(false, "Unsupported dstate value. Supported values are: 64, 128, 256");
     }
-  } else {
+  }
+#ifdef FLASHINFER_MAMBA_ENABLE_SM90
+  else {
+
     auto dispatch_dim_dstate = [&]<int DIM, int DSTATE>() {
       constexpr auto numConsumers = 4;
       constexpr auto numWarps = 1 + numConsumers;
@@ -516,6 +523,7 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, cudaStream_t
         FLASHINFER_CHECK(false, "Unsupported dim value. Supported values are: 64, 128");
     }
   }
+#endif
 }
 
 }  // namespace flashinfer::mamba
