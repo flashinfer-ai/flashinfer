@@ -12,7 +12,7 @@ Enable logging using two environment variables:
 
 .. code-block:: bash
 
-    # Set logging level (0-5)
+    # Set logging level (0-10)
     export FLASHINFER_LOGLEVEL=3
 
     # Set log destination (default is stdout)
@@ -47,7 +47,7 @@ Logging Levels
      - Numerical analysis
    * - **10**
      - Flight Recorder - Full Input/Output Dumps
-     - Level 5 + dumps all input/output tensors to ``.pt`` files
+     - Level 5 + dumps all input/output tensors to ``.pt`` (or ``.safetensors``) files
      - Full Reproducibility / Debugging
 
 Environment Variables
@@ -93,7 +93,7 @@ When FLASHINFER_LOGLEVEL is set to 10, the following environment variables can b
    * - ``FLASHINFER_DUMP_MAX_SIZE_GB``
      - float
      - 20
-     - Maximum size of dump directory in GB (Level 10 only)
+     - Maximum size of dump directory in GB
    * - ``FLASHINFER_DUMP_MAX_COUNT``
      - int
      - 1000
@@ -106,6 +106,52 @@ When FLASHINFER_LOGLEVEL is set to 10, the following environment variables can b
      - str
      - (empty)
      - Comma-separated patterns to exclude (fnmatch-style)
+   * - ``FLASHINFER_DUMP_SAFETENSORS``
+     - int
+     - 0
+     - Set to 1 to use safetensors format (no pickle, but loses stride info)
+
+SafeTensors Format (Optional)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+By default, tensors are saved using ``torch.save()`` which preserves tensor stride and contiguity information.
+For faster, pickle-free serialization, you can enable safetensors format:
+
+.. code-block:: bash
+
+    export FLASHINFER_DUMP_SAFETENSORS=1
+
+.. warning::
+    SafeTensors does NOT preserve tensor strides or non-contiguity.
+    All tensors are saved as contiguous. Use the default ``torch.save`` format
+    if stride preservation is important for your debugging.
+
+**Comparison**:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 25 35 40
+
+   * - Aspect
+     - torch.save (default)
+     - safetensors
+   * - Speed
+     - Standard
+     - Faster
+   * - Safety
+     - Uses pickle
+     - No pickle (safer)
+   * - Stride preservation
+     - ✅ Yes
+     - ❌ No (contiguous only)
+   * - File extension
+     - ``.pt``
+     - ``.safetensors``
+   * - Dependency
+     - `torch``
+     - Requires ``pip install safetensors``
+
+**Replay is format-agnostic**: The replay command automatically detects the format based on file extension.
 
 Dump Filtering (Include/Exclude)
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -224,6 +270,43 @@ Flight Recorder & Replay
 
 FlashInfer includes a "Flight Recorder" mode (Level 10) that captures inputs/outputs for reproducibility.
 
+Dump Directory Structure
+^^^^^^^^^^^^^^^^^^^^^^^^
+
+When Level 10 logging is enabled, FlashInfer creates the following structure:
+
+.. code-block:: text
+
+    FLASHINFER_DUMP_DIR/
+    ├── session.jsonl                    # Central log: one line per event (quick scanning)
+    ├── 20250108_143216_802_pid12345_mm_fp8_call0001/
+    │   ├── metadata.jsonl               # Per-dump metadata (JSONL format)
+    │   ├── inputs.pt                    # Input tensors (or .safetensors if enabled)
+    │   └── outputs.pt                   # Output tensors (or .safetensors if enabled)
+    ├── 20250108_143216_868_pid12345_single_decode_call0001/
+    │   ├── metadata.jsonl
+    │   ├── inputs.pt                    # (or .safetensors)
+    │   └── outputs.pt                   # (or .safetensors)
+    └── ...
+
+**JSONL Format**: Both ``session.jsonl`` and ``metadata.jsonl`` use `JSON Lines <https://jsonlines.org/>`_ format
+(one JSON object per line). This enables:
+
+- **Crash-safe logging**: Each API call appends two lines (inputs_saved, then completed)
+- **Quick scanning**: Use ``session.jsonl`` to browse all recorded calls without reading subdirectories
+- **Streaming reads**: Process records line-by-line for large sessions
+
+**Per-dump metadata.jsonl**:
+
+- Line 1: Written **before** execution (``execution_status: "inputs_saved"``)
+- Line 2: Appended **after** successful execution (``execution_status: "completed"``)
+
+If a crash occurs, only line 1 will be present, preserving the inputs for debugging.
+
+**Central session.jsonl**:
+
+One-stop log of all API calls. Use standard tools to filter and analyze:
+
 .. code-block:: bash
 
     # Enable Flight Recorder (Metadata + Tensors)
@@ -240,28 +323,28 @@ FlashInfer includes a "Flight Recorder" mode (Level 10) that captures inputs/out
     # or
     python -m flashinfer replay --dir ./my_dumps
 
-    [1] nvfp4_quantize (20251204_143216_802_nvfp4_quantize_call0001): ✅ Passed
-    [2] fp4_quantize (20251204_143216_868_fp4_quantize_call0001): ✅ Passed
-    [3] nvfp4_quantize (20251204_143216_949_nvfp4_quantize_call0002): ✅ Passed
-    [4] fp4_quantize (20251204_143217_003_fp4_quantize_call0002): ✅ Passed
-    [5] mm_fp4 (20251204_143217_178_mm_fp4_call0001): ✅ Passed
-    [6] mm_fp4 (20251204_143217_346_mm_fp4_call0002): ✅ Passed
-    [7] mm_fp4 (20251204_143217_427_mm_fp4_call0003): ✅ Passed
-    [8] mm_fp4 (20251204_143217_475_mm_fp4_call0004): ✅ Passed
-    [9] mm_fp4 (20251204_143217_510_mm_fp4_call0005): ✅ Passed
-    [10] mm_fp4 (20251204_143217_551_mm_fp4_call0006): ✅ Passed
-    [11] mm_fp4 (20251204_143217_591_mm_fp4_call0007): ✅ Passed
-    [12] mm_fp4 (20251204_143217_631_mm_fp4_call0008): ✅ Passed
-    [13] mm_fp4 (20251204_143217_672_mm_fp4_call0009): ✅ Passed
-    [14] mm_fp4 (20251204_143217_708_mm_fp4_call0010): ✅ Passed
-    [15] mm_fp4 (20251204_143217_769_mm_fp4_call0011): ✅ Passed
-    [16] mm_fp4 (20251204_143217_812_mm_fp4_call0012): ✅ Passed
-    [17] mm_fp4 (20251204_143217_852_mm_fp4_call0013): ✅ Passed
-    [18] mm_fp4 (20251204_143217_904_mm_fp4_call0014): ✅ Passed
-    [19] mm_fp4 (20251204_143218_153_mm_fp4_call0015): ✅ Passed
-    [20] mm_fp4 (20251204_143218_390_mm_fp4_call0016): ✅ Passed
-    [21] mm_fp4 (20251204_143218_627_mm_fp4_call0017): ✅ Passed
-    [22] mm_fp4 (20251204_143218_862_mm_fp4_call0018): ✅ Passed
+    [1] nvfp4_quantize (20251204_143216_802_pid12345_nvfp4_quantize_call0001): ✅ Passed
+    [2] fp4_quantize (20251204_143216_868_pid12345_fp4_quantize_call0001): ✅ Passed
+    [3] nvfp4_quantize (20251204_143216_949_pid12345_nvfp4_quantize_call0002): ✅ Passed
+    [4] fp4_quantize (20251204_143217_003_pid12345_fp4_quantize_call0002): ✅ Passed
+    [5] mm_fp4 (20251204_143217_178_pid12345_mm_fp4_call0001): ✅ Passed
+    [6] mm_fp4 (20251204_143217_346_pid12345_mm_fp4_call0002): ✅ Passed
+    [7] mm_fp4 (20251204_143217_427_pid12345_mm_fp4_call0003): ✅ Passed
+    [8] mm_fp4 (20251204_143217_475_pid12345_mm_fp4_call0004): ✅ Passed
+    [9] mm_fp4 (20251204_143217_510_pid12345_mm_fp4_call0005): ✅ Passed
+    [10] mm_fp4 (20251204_143217_551_pid12345_mm_fp4_call0006): ✅ Passed
+    [11] mm_fp4 (20251204_143217_591_pid12345_mm_fp4_call0007): ✅ Passed
+    [12] mm_fp4 (20251204_143217_631_pid12345_mm_fp4_call0008): ✅ Passed
+    [13] mm_fp4 (20251204_143217_672_pid12345_mm_fp4_call0009): ✅ Passed
+    [14] mm_fp4 (20251204_143217_708_pid12345_mm_fp4_call0010): ✅ Passed
+    [15] mm_fp4 (20251204_143217_769_pid12345_mm_fp4_call0011): ✅ Passed
+    [16] mm_fp4 (20251204_143217_812_pid12345_mm_fp4_call0012): ✅ Passed
+    [17] mm_fp4 (20251204_143217_852_pid12345_mm_fp4_call0013): ✅ Passed
+    [18] mm_fp4 (20251204_143217_904_pid12345_mm_fp4_call0014): ✅ Passed
+    [19] mm_fp4 (20251204_143218_153_pid12345_mm_fp4_call0015): ✅ Passed
+    [20] mm_fp4 (20251204_143218_390_pid12345_mm_fp4_call0016): ✅ Passed
+    [21] mm_fp4 (20251204_143218_627_pid12345_mm_fp4_call0017): ✅ Passed
+    [22] mm_fp4 (20251204_143218_862_pid12345_mm_fp4_call0018): ✅ Passed
 
     Summary: 22 passed, 0 failed/mismatch
 
@@ -509,6 +592,11 @@ Manual Replay Without ``replay_from_dump``
 
 For more control, you can manually load the dumped tensors:
 
+.. note::
+    This example assumes the default ``torch.save`` format (``.pt`` files).
+    If dumps were created with ``FLASHINFER_DUMP_SAFETENSORS=1``, use
+    ``safetensors.torch.load_file()`` instead of ``torch.load()``.
+
 .. code-block:: python
 
     """
@@ -520,14 +608,16 @@ For more control, you can manually load the dumped tensors:
     from flashinfer import bmm_fp8
 
     # Path is an example, replace with the actual path.
-    dump_dir = Path("./bmm_fp8_dumps/20251204_103217_012_bmm_fp8_call0001")
+    dump_dir = Path("./bmm_fp8_dumps/20250108_103217_012_pid12345_bmm_fp8_call0001")
 
-    # Load metadata
-    with open(dump_dir / "metadata.json") as f:
-        metadata = json.load(f)
+    # Load metadata from JSONL (read last line for most complete state)
+    with open(dump_dir / "metadata.jsonl") as f:
+        lines = [line.strip() for line in f if line.strip()]
+        metadata = json.loads(lines[-1])  # Last line has completed state
 
     print(f"Function: {metadata['function_name']}")
     print(f"Module: {metadata['module']}")
+    print(f"Status: {metadata['execution_status']}")
     print(f"Input tensors: {metadata['tensor_info']['input_tensor_keys']}")
 
     # Load input tensors
@@ -542,3 +632,47 @@ For more control, you can manually load the dumped tensors:
     # Tensors are ready to use - reconstruct the call as needed
     for key, tensor in inputs.items():
         print(f"  {key}: shape={tensor.shape}, dtype={tensor.dtype}")
+
+Scanning Session History
+^^^^^^^^^^^^^^^^^^^^^^^^
+
+Use the central ``session.jsonl`` to quickly scan all recorded API calls:
+
+.. code-block:: python
+
+    """
+    Scan session.jsonl for quick overview of recorded calls.
+    """
+    import json
+    from pathlib import Path
+    from collections import Counter
+
+    dump_root = Path("./my_dumps")
+    session_file = dump_root / "session.jsonl"
+
+    # Read all records
+    records = []
+    with open(session_file) as f:
+        for line in f:
+            if line.strip():
+                records.append(json.loads(line))
+
+    # Filter to completed calls only
+    completed = [r for r in records if r["execution_status"] == "completed"]
+    print(f"Total completed calls: {len(completed)}")
+
+    # Count by function name
+    func_counts = Counter(r["function_name"] for r in completed)
+    print("\nCalls by function:")
+    for func, count in func_counts.most_common():
+        print(f"  {func}: {count}")
+
+    # Find calls that didn't complete (potential crashes)
+    inputs_only = [r for r in records if r["execution_status"] == "inputs_saved"]
+    # Group by dump_dir to find incomplete calls
+    completed_dirs = {r["dump_dir"] for r in completed}
+    incomplete = [r for r in inputs_only if r["dump_dir"] not in completed_dirs]
+    if incomplete:
+        print(f"\n⚠️  Found {len(incomplete)} incomplete calls (potential crashes):")
+        for r in incomplete:
+            print(f"  - {r['function_name']} at {r['dump_dir']}")

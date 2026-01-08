@@ -59,10 +59,14 @@ _DUMP_EXCLUDE = os.environ.get("FLASHINFER_DUMP_EXCLUDE", "")
 _DUMP_INCLUDE_PATTERNS = [p.strip() for p in _DUMP_INCLUDE.split(",") if p.strip()]
 _DUMP_EXCLUDE_PATTERNS = [p.strip() for p in _DUMP_EXCLUDE.split(",") if p.strip()]
 
+# SafeTensors format option (default: use torch.save which preserves stride/contiguity)
+_DUMP_SAFETENSORS = os.environ.get("FLASHINFER_DUMP_SAFETENSORS", "0") == "1"
+
 # Global tracking for dump limits (reset per process)
 _dump_count = 0
 _dump_total_size_bytes = 0
 _dump_call_counter = {}  # Track call count per function
+_session_jsonl_initialized = False  # Track if session.jsonl header was written
 
 # Create logger using Python's logging library
 _logger = logging.getLogger("flashinfer.api")
@@ -119,6 +123,11 @@ def _warn_dump():
             "set it to below 10. For more information, see https://docs.flashinfer.ai/logging.html"
         )
         print(f"Current dump directory is: {_DUMP_DIR}")
+        if _DUMP_SAFETENSORS:
+            print(
+                "⚠️  SAFETENSORS mode enabled: tensor stride/non-contiguity will NOT be preserved.\n"
+                "    Tensors will be saved as contiguous. Use torch.save (default) to preserve strides."
+            )
         if _DUMP_INCLUDE_PATTERNS:
             print(f"Include filter: {_DUMP_INCLUDE_PATTERNS}")
         if _DUMP_EXCLUDE_PATTERNS:
@@ -164,6 +173,53 @@ def _should_dump_function(func_name: str) -> bool:
             return False
 
     return True
+
+
+def _append_to_jsonl(filepath: Path, record: Dict[str, Any]) -> None:
+    """
+    Append a JSON record as a single line to a JSONL file.
+
+    Parameters
+    ----------
+    filepath : Path
+        Path to the JSONL file
+    record : Dict[str, Any]
+        Record to append (will be serialized as single-line JSON)
+    """
+    with open(filepath, "a") as f:
+        f.write(json.dumps(record) + "\n")
+
+
+def _read_jsonl_last_record(filepath: Path) -> Optional[Dict[str, Any]]:
+    """
+    Read the last record from a JSONL file.
+
+    For metadata.jsonl, this returns the most complete state (completed if available,
+    otherwise inputs_saved).
+
+    Parameters
+    ----------
+    filepath : Path
+        Path to the JSONL file
+
+    Returns
+    -------
+    Optional[Dict[str, Any]]
+        The last record, or None if file is empty/doesn't exist
+    """
+    if not filepath.exists():
+        return None
+
+    last_line = None
+    with open(filepath, "r") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                last_line = line
+
+    if last_line:
+        return json.loads(last_line)
+    return None
 
 
 def _get_tensor_size_bytes(tensor: torch.Tensor) -> int:
@@ -331,9 +387,27 @@ def _dump_function_inputs(
             dump_dir.rmdir()
             return None
 
-        # Save input tensors using torch.save (preserves stride/contiguity)
+        # Save input tensors
         if input_tensors:
-            torch.save(input_tensors, dump_dir / "inputs.pt")
+            if _DUMP_SAFETENSORS:
+                # SafeTensors format: faster, no pickle, but loses stride/contiguity
+                try:
+                    from safetensors.torch import save_file
+
+                    # safetensors requires contiguous tensors
+                    tensors_contiguous = {
+                        k: v.contiguous() for k, v in input_tensors.items()
+                    }
+                    save_file(tensors_contiguous, str(dump_dir / "inputs.safetensors"))
+                except ImportError:
+                    _logger.error(
+                        "safetensors package not installed. "
+                        "Install with: pip install safetensors"
+                    )
+                    raise
+            else:
+                # torch.save format: preserves stride/contiguity
+                torch.save(input_tensors, dump_dir / "inputs.pt")
 
         # Create partial metadata (inputs only, outputs will be added later)
         metadata: Dict[str, Any] = {
@@ -351,6 +425,7 @@ def _dump_function_inputs(
                 "input_size_mb": input_size / (1024 * 1024),
             },
             "tensor_details": {},  # Detailed shape/dtype/stride info for reconstruction
+            "tensor_format": "safetensors" if _DUMP_SAFETENSORS else "torch",
             "function_signature": str(inspect.signature(func))
             if hasattr(inspect, "signature")
             else "<unavailable>",
@@ -382,9 +457,15 @@ def _dump_function_inputs(
         except Exception:
             metadata["versions"]["flashinfer"] = "<unavailable>"  # type: ignore[index]
 
-        # Save partial metadata
-        with open(dump_dir / "metadata.json", "w") as f:
-            json.dump(metadata, f, indent=2)
+        # Add dump_dir to metadata for central session.jsonl reference
+        metadata["dump_dir"] = str(dump_dir)
+
+        # Save metadata to per-dump JSONL (first line: inputs_saved)
+        _append_to_jsonl(dump_dir / "metadata.jsonl", metadata)
+
+        # Append to central session.jsonl for quick scanning
+        session_jsonl_path = Path(_DUMP_DIR) / "session.jsonl"
+        _append_to_jsonl(session_jsonl_path, metadata)
 
         # Update global tracking (only input size for now)
         _dump_count += 1
@@ -445,16 +526,25 @@ def _dump_function_outputs(dump_dir: str, result: Any) -> None:
         # Calculate output size
         output_size = sum(_get_tensor_size_bytes(t) for t in output_tensors.values())
 
-        # Save output tensors using torch.save (preserves stride/contiguity)
+        # Save output tensors
         if output_tensors:
-            torch.save(output_tensors, dump_path / "outputs.pt")
+            if _DUMP_SAFETENSORS:
+                # SafeTensors format: faster, no pickle, but loses stride/contiguity
+                from safetensors.torch import save_file
 
-        # Load existing metadata and update it
-        metadata_path = dump_path / "metadata.json"
-        if metadata_path.exists():
-            with open(metadata_path, "r") as f:
-                metadata = json.load(f)
+                tensors_contiguous = {
+                    k: v.contiguous() for k, v in output_tensors.items()
+                }
+                save_file(tensors_contiguous, str(dump_path / "outputs.safetensors"))
+            else:
+                # torch.save format: preserves stride/contiguity
+                torch.save(output_tensors, dump_path / "outputs.pt")
 
+        # Load existing metadata from JSONL (last record) and update it
+        metadata_jsonl_path = dump_path / "metadata.jsonl"
+        metadata = _read_jsonl_last_record(metadata_jsonl_path)
+
+        if metadata is not None:
             # Update with output information
             metadata["output_metadata"] = output_metadata
             metadata["tensor_info"]["output_tensor_keys"] = list(output_tensors.keys())
@@ -479,9 +569,12 @@ def _dump_function_outputs(dump_dir: str, result: Any) -> None:
                     "device": str(tensor.device),
                 }
 
-            # Save updated metadata
-            with open(metadata_path, "w") as f:
-                json.dump(metadata, f, indent=2)
+            # Append completion record to per-dump JSONL
+            _append_to_jsonl(metadata_jsonl_path, metadata)
+
+            # Append completion record to central session.jsonl
+            session_jsonl_path = Path(_DUMP_DIR) / "session.jsonl"
+            _append_to_jsonl(session_jsonl_path, metadata)
 
             # Update global size tracking
             _dump_total_size_bytes += output_size
@@ -492,7 +585,7 @@ def _dump_function_outputs(dump_dir: str, result: Any) -> None:
                 f"total dump size: {metadata['tensor_info']['total_size_mb']:.2f} MB)"
             )
         else:
-            _logger.error(f"metadata.json not found in {dump_dir}")
+            _logger.error(f"metadata.jsonl not found or empty in {dump_dir}")
 
     except Exception as e:
         _logger.error(f"Failed to dump outputs to {dump_dir}: {e}")
@@ -615,7 +708,7 @@ def replay_from_dump(
     Replay a function call from a dumped directory.
 
     This function:
-    1. Loads metadata.json to get function info
+    1. Loads metadata.jsonl to get function info
     2. Loads inputs.pt to get input tensors
     3. Moves tensors to specified device (default: cuda)
     4. Reconstructs the function call
@@ -658,24 +751,37 @@ def replay_from_dump(
     if not dump_path.exists():
         raise FileNotFoundError(f"Dump directory not found: {dump_dir}")
 
-    # Load metadata
-    metadata_path = dump_path / "metadata.json"
-    if not metadata_path.exists():
-        raise FileNotFoundError(f"metadata.json not found in {dump_dir}")
+    # Load metadata from JSONL (last record has most complete state)
+    metadata_jsonl_path = dump_path / "metadata.jsonl"
+    if not metadata_jsonl_path.exists():
+        raise FileNotFoundError(f"metadata.jsonl not found in {dump_dir}")
 
-    with open(metadata_path, "r") as f:
-        metadata = json.load(f)
+    metadata = _read_jsonl_last_record(metadata_jsonl_path)
+    if metadata is None:
+        raise ValueError(f"metadata.jsonl is empty in {dump_dir}")
 
     func_name = metadata["function_name"]
 
-    # Load input tensors
-    inputs_path = dump_path / "inputs.pt"
-    if not inputs_path.exists():
-        # Could consider generating random tensors from metadata if needed.
-        # for now, just raise an error.
-        raise FileNotFoundError(f"inputs.pt not found in {dump_dir}")
+    # Load input tensors - auto-detect format (torch.save or safetensors)
+    inputs_pt_path = dump_path / "inputs.pt"
+    inputs_safetensors_path = dump_path / "inputs.safetensors"
 
-    input_tensors = torch.load(str(inputs_path), map_location="cpu")
+    if inputs_pt_path.exists():
+        input_tensors = torch.load(str(inputs_pt_path), map_location="cpu")
+    elif inputs_safetensors_path.exists():
+        try:
+            from safetensors.torch import load_file
+
+            input_tensors = load_file(str(inputs_safetensors_path), device="cpu")
+        except ImportError:
+            raise ImportError(
+                "Dump was saved with safetensors but package not installed. "
+                "Install with: pip install safetensors"
+            ) from None
+    else:
+        raise FileNotFoundError(
+            f"Neither inputs.pt nor inputs.safetensors found in {dump_dir}"
+        )
 
     # Move tensors to specified device
     for key, tensor in input_tensors.items():
@@ -727,18 +833,33 @@ def replay_from_dump(
     _logger.info(f"Replaying {func_name} from {dump_dir}")
     _logger.info(f"  Args: {len(args)}, Kwargs: {list(kwargs.keys())}")
 
-    result_dict = {"args": args, "kwargs": kwargs, "metadata": metadata}
+    result_dict: Dict[str, Any] = {"args": args, "kwargs": kwargs, "metadata": metadata}
 
-    # Load expected outputs if needed
+    # Load expected outputs if needed - auto-detect format
     expected_outputs = {}
     output_metadata = {}
     if compare_outputs:
-        outputs_path = dump_path / "outputs.pt"
-        if outputs_path.exists():
-            expected_outputs = torch.load(str(outputs_path), map_location="cpu")
-            # Move output tensors to specified device
-            for key, tensor in expected_outputs.items():
-                expected_outputs[key] = tensor.to(device)
+        outputs_pt_path = dump_path / "outputs.pt"
+        outputs_safetensors_path = dump_path / "outputs.safetensors"
+
+        if outputs_pt_path.exists():
+            expected_outputs = torch.load(str(outputs_pt_path), map_location="cpu")
+        elif outputs_safetensors_path.exists():
+            try:
+                from safetensors.torch import load_file
+
+                expected_outputs = load_file(
+                    str(outputs_safetensors_path), device="cpu"
+                )
+            except ImportError:
+                raise ImportError(
+                    "Dump was saved with safetensors but package not installed. "
+                    "Install with: pip install safetensors"
+                ) from None
+
+        # Move output tensors to specified device
+        for key, tensor in expected_outputs.items():
+            expected_outputs[key] = tensor.to(device)
 
         output_metadata = metadata.get("output_metadata", {})
         result_dict["expected_tensors"] = expected_outputs
@@ -890,7 +1011,7 @@ def replay_sequence(root_dir: str, device: str = "cuda") -> list:
     # Pattern: YYYYMMDD_HHMMSS_milliseconds_pid<PID>_funcname_callXXXX
     dump_dirs = []
     for item in root_path.iterdir():
-        if item.is_dir() and (item / "metadata.json").exists():
+        if item.is_dir() and (item / "metadata.jsonl").exists():
             dump_dirs.append(item)
 
     # Sort by directory name (which starts with timestamp)

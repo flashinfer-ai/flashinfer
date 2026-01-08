@@ -401,7 +401,7 @@ def replay_cmd(dump_dir):
         return
 
     # Check if this is a single dump or a session / sequence root
-    is_single_dump = os.path.exists(os.path.join(dump_dir, "metadata.json"))
+    is_single_dump = os.path.exists(os.path.join(dump_dir, "metadata.jsonl"))
 
     try:
         if is_single_dump:
