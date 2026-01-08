@@ -1437,8 +1437,7 @@ def flashinfer_api(func: Callable = None) -> Callable:
         - 1: Log function name only (logged BEFORE execution - crash-safe)
         - 3: Log function name + inputs/outputs with metadata (inputs logged BEFORE execution - crash-safe)
         - 5: Log function name + inputs/outputs with metadata + tensor statistics (inputs logged BEFORE execution - crash-safe)
-        - 8: Level 5 logging + metadata-only dump (no tensor data saved)
-        - 10: Level 8 logging + dump tensors to disk for reproducibility (preserves stride/contiguity)
+        - 10: Level 5 logging + dump metadata and input/output tensors to disk for reproducibility (preserves stride/contiguity)
 
     FLASHINFER_LOGDEST : str (default: "stdout")
         - "stdout": Log to standard output
@@ -1455,6 +1454,16 @@ def flashinfer_api(func: Callable = None) -> Callable:
 
     FLASHINFER_DUMP_MAX_COUNT : int (default: 1000)
         - Maximum number of function call dumps
+
+    FLASHINFER_DUMP_SAFETENSORS : int (default: 0)
+        - 0: Use torch.save format (preserves stride/contiguity)
+        - 1: Use safetensors format (no pickle, but loses stride info)
+
+    FLASHINFER_DUMP_INCLUDE : str (default: "")
+        - Comma-separated list of patterns to include for dumping (fnmatch-style)
+
+    FLASHINFER_DUMP_EXCLUDE : str (default: "")
+        - Comma-separated list of patterns to exclude for dumping (fnmatch-style)
 
     Examples
     --------
