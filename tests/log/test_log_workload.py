@@ -199,7 +199,9 @@ def test_workload_dump_batch_decode():
 
     # Verify that the key tensors were dumped
     # The parameter names should match the function signature
-    assert "q" in loaded_tensors, f"'q' not found in dumped tensors: {list(loaded_tensors.keys())}"
+    assert "q" in loaded_tensors, (
+        f"'q' not found in dumped tensors: {list(loaded_tensors.keys())}"
+    )
 
     # For paged_kv_cache which is a tuple, it should be dumped as paged_kv_cache_0 and paged_kv_cache_1
     assert "paged_kv_cache_0" in loaded_tensors or "k_cache" in loaded_tensors, (
@@ -366,4 +368,3 @@ if __name__ == "__main__":
         if os.path.exists(_TEST_BENCH_DIR):
             print(f"\nCleaning up {_TEST_BENCH_DIR}")
             shutil.rmtree(_TEST_BENCH_DIR)
-

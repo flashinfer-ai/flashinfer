@@ -602,9 +602,7 @@ def _dump_workload(
         return None
 
 
-def _collect_tensors(
-    value: Any, name: str, tensors: Dict[str, torch.Tensor]
-) -> None:
+def _collect_tensors(value: Any, name: str, tensors: Dict[str, torch.Tensor]) -> None:
     """
     Recursively collect tensors from a value into the tensors dict.
 
