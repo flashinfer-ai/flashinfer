@@ -1182,3 +1182,9 @@ def backend_requirement(
         return wrapper
 
     return decorator
+
+
+@functools.cache
+def get_default_generators(device: torch.device):
+    torch.cuda.init()
+    return torch.cuda.default_generators[device.index]

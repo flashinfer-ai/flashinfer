@@ -133,7 +133,7 @@ Tuple<Array<int64_t>, Array<int64_t>, int64_t> moeA2ADispatchOp(
       << "Too many payloads: " << numPayloads << " > " << tl_throughput::kMaxPayloads;
 
   auto localNumTokens = static_cast<int>(tokenSelectedExperts.size(0));
-  TVM_FFI_ICHECK(localNumTokens > 0) << "local_num_tokens must be positive";
+  TVM_FFI_ICHECK(localNumTokens >= 0) << "local_num_tokens must be non-negative";
 
   // Validate all payloads and calculate sizes
   for (int i = 0; i < numPayloads; ++i) {
@@ -281,7 +281,7 @@ Tensor moeA2ACombineOp(TensorView payload, int64_t localNumTokens, TensorView wo
   TVM_FFI_ICHECK_EQ(payload.size(1), runtimeMaxTokensPerRank);
   TVM_FFI_ICHECK(epRank >= 0 && epRank < epSize);
   TVM_FFI_ICHECK(topK > 0 && topK <= tl_throughput::kMaxTopK);
-  TVM_FFI_ICHECK(localNumTokens > 0);
+  TVM_FFI_ICHECK(localNumTokens >= 0);
 
   CHECK_CPU(metainfo);
   CHECK_INPUT_TYPE(metainfo, dl_int64);
