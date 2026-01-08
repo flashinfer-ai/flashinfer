@@ -138,6 +138,7 @@ def get_topk_module():
     )
 
 
+@flashinfer_api
 def can_implement_filtered_topk() -> bool:
     r"""Check if the GPU supports enough shared memory for FilteredTopK algorithm.
 
@@ -152,6 +153,7 @@ def can_implement_filtered_topk() -> bool:
     return get_topk_module().can_implement_filtered_topk()
 
 
+@flashinfer_api
 def top_k(
     input: torch.Tensor,
     k: int,
