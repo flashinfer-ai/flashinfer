@@ -26,12 +26,9 @@ def test_mm_bf16(
     compute_capability_number = compute_capability[0] * 10 + compute_capability[1]
     if not mm_bf16.is_compute_capability_supported(compute_capability_number):
         pytest.skip(
-            f"mm_bf16 requires one of the following compute capabilities: "
-            f"{sorted(mm_bf16._supported_ccs)}. "
+            f"mm_bf16 not supported on current compute capability."
             f"Detected sm{compute_capability_number}."
         )
-    if str(compute_capability_number) == "103" and backend == "cutlass":
-        pytest.skip("mm_bf16 with CUTLASS backend does not support SM103.")
 
     if backend == "cutlass" and (enable_bias or pdl):
         pytest.skip(

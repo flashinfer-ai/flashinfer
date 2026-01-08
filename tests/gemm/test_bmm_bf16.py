@@ -16,8 +16,7 @@ def test_bmm_bf16(b, m, n, k, res_dtype):
     compute_capability_number = compute_capability[0] * 10 + compute_capability[1]
     if not bmm_bf16.is_compute_capability_supported(compute_capability_number):
         pytest.skip(
-            f"bmm_bf16 requires one of the following compute capabilities: "
-            f"{sorted(bmm_bf16._supported_ccs)}. "
+            f"bmm_bf16 not supported on current compute capability."
             f"Detected sm{compute_capability_number}."
         )
     torch.manual_seed(7)

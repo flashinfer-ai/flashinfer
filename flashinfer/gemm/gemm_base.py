@@ -182,7 +182,7 @@ def get_gemm_module():
     return _gemm_module
 
 
-@supported_compute_capability([100])
+@supported_compute_capability([100, 103])
 def _cutlass_mm_bf16_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -259,10 +259,8 @@ def _heuristic_func_mm_bf16(
     out_dtype: torch.dtype = torch.bfloat16,
     backend: Literal["cutlass", "tgv", "auto"] = "tgv",
 ):
-    is_sm103_supported = _match_sm_version(a.device, ["103"])
-
     heuristic_backends = []
-    if bias is not None or pdl or is_sm103_supported:
+    if bias is not None or pdl:
         if "tgv" in suitable_backends:
             heuristic_backends.append("tgv")
     else:
@@ -384,7 +382,7 @@ def mm_bf16(
     return out
 
 
-@supported_compute_capability([100])
+@supported_compute_capability([100, 103])
 def _cutlass_bmm_bf16_requirement(
     A: torch.Tensor,
     B: torch.Tensor,
