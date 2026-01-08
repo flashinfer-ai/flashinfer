@@ -1,3 +1,4 @@
+from flashinfer.api_logging import flashinfer_api
 from flashinfer.jit import gen_dsv3_fused_routing_module
 import functools
 from types import SimpleNamespace
@@ -115,6 +116,7 @@ def get_dsv3_fused_routing_module():
     )
 
 
+@flashinfer_api
 @backend_requirement({}, common_check=_check_dsv3_fused_routing_supported)
 def fused_topk_deepseek(
     scores: torch.Tensor,
