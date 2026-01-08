@@ -3,10 +3,10 @@
 # This file is meant to be sourced by test runner scripts
 
 # Default environment variables
-: ${JUNIT_DIR:=$(realpath ./junit)}
-: ${MAX_JOBS:=$(nproc)}
-: ${CUDA_VISIBLE_DEVICES:=0}
-: ${SAMPLE_RATE:=5}  # Run every Nth test in sanity mode (5 = ~20% coverage)
+: "${JUNIT_DIR:=$(realpath ./junit)}"
+: "${MAX_JOBS:=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
+: "${CUDA_VISIBLE_DEVICES:=0}"
+: "${SAMPLE_RATE:=5}"  # Run every Nth test in sanity mode (5 = ~20% coverage)
 
 # Randomize starting offset (0 to SAMPLE_RATE-1) for sampling variety
 if [ -z "${SAMPLE_OFFSET:-}" ]; then
@@ -17,7 +17,7 @@ fi
 PYTEST_FLAGS="--continue-on-collection-errors -s"
 
 # Command prefix for pytest (e.g., "mpirun -np 4" for multi-GPU tests)
-: ${PYTEST_COMMAND_PREFIX:=""}
+: "${PYTEST_COMMAND_PREFIX:=}"
 
 # Global variables for test execution
 FAILED_TESTS=""
@@ -25,6 +25,7 @@ TOTAL_TESTS=0
 PASSED_TESTS=0
 TOTAL_TEST_CASES=0
 SAMPLED_TEST_CASES=0
+# shellcheck disable=SC2034  # EXIT_CODE is used by calling scripts
 EXIT_CODE=0
 
 # Clean Python bytecode cache to avoid stale imports
@@ -37,6 +38,9 @@ clean_python_cache() {
 }
 
 # Parse command line arguments
+# Set DISABLE_SANITY_TEST=true before sourcing to disable sanity testing
+: "${DISABLE_SANITY_TEST:=false}"
+
 parse_args() {
     DRY_RUN=false
     SANITY_TEST=false
@@ -46,7 +50,13 @@ parse_args() {
                 DRY_RUN=true
                 ;;
             --sanity-test)
-                SANITY_TEST=true
+                if [ "$DISABLE_SANITY_TEST" = "true" ]; then
+                    echo "⚠️  WARNING: Sanity testing is disabled for this test suite"
+                    echo "    Running full tests instead"
+                    echo ""
+                else
+                    SANITY_TEST=true
+                fi
                 ;;
         esac
     done
@@ -69,11 +79,79 @@ print_test_mode_banner() {
     fi
 }
 
+# Install precompiled kernels (CI build artifacts)
+install_precompiled_kernels() {
+    if [ "$DRY_RUN" = "true" ]; then
+        return
+    fi
+
+    JIT_ARCH_EFFECTIVE=""
+    # Map CUDA_VERSION to CUDA_STREAM for artifact lookup
+    if [[ "${CUDA_VERSION}" == cu* ]]; then
+        CUDA_STREAM="${CUDA_VERSION}"
+    elif [ "${CUDA_VERSION}" = "12.9.0" ]; then
+        CUDA_STREAM="cu129"
+    else
+        CUDA_STREAM="cu130"
+    fi
+    echo "Using CUDA stream: ${CUDA_STREAM}"
+    echo ""
+
+    if [ -n "${JIT_ARCH}" ]; then
+        # 12.0a for CUDA 12.9.0, 12.0f for CUDA 13.0.0
+        if [ "${JIT_ARCH}" = "12.0" ]; then
+            if [ "${CUDA_STREAM}" = "cu129" ]; then
+                JIT_ARCH_EFFECTIVE="12.0a"
+            else
+                JIT_ARCH_EFFECTIVE="12.0f"
+            fi
+        else
+            JIT_ARCH_EFFECTIVE="${JIT_ARCH}"
+        fi
+
+        echo "Using JIT_ARCH from environment: ${JIT_ARCH_EFFECTIVE}"
+        DIST_CUBIN_DIR="../dist/${CUDA_STREAM}/${JIT_ARCH_EFFECTIVE}/cubin"
+        DIST_JIT_CACHE_DIR="../dist/${CUDA_STREAM}/${JIT_ARCH_EFFECTIVE}/jit-cache"
+
+        echo "==== Debug: listing artifact directories ===="
+        echo "Tree under ../dist:"
+        (cd .. && ls -al dist) || true
+        echo ""
+        echo "Tree under ../dist/${CUDA_STREAM}:"
+        (cd .. && ls -al "dist/${CUDA_STREAM}") || true
+        echo ""
+        echo "Contents of ${DIST_CUBIN_DIR}:"
+        ls -al "${DIST_CUBIN_DIR}" || true
+        echo ""
+        echo "Contents of ${DIST_JIT_CACHE_DIR}:"
+        ls -al "${DIST_JIT_CACHE_DIR}" || true
+        echo "============================================="
+
+        if [ -d "${DIST_CUBIN_DIR}" ] && ls "${DIST_CUBIN_DIR}"/*.whl >/dev/null 2>&1; then
+            echo "Installing flashinfer-cubin from ${DIST_CUBIN_DIR} ..."
+            pip install -q "${DIST_CUBIN_DIR}"/*.whl
+        else
+            echo "ERROR: flashinfer-cubin wheel not found in ${DIST_CUBIN_DIR}. Ensure the CI build stage produced the artifact." >&2
+        fi
+
+        if [ -d "${DIST_JIT_CACHE_DIR}" ] && ls "${DIST_JIT_CACHE_DIR}"/*.whl >/dev/null 2>&1; then
+            echo "Installing flashinfer-jit-cache from ${DIST_JIT_CACHE_DIR} ..."
+            pip install -q "${DIST_JIT_CACHE_DIR}"/*.whl
+        else
+            echo "ERROR: flashinfer-jit-cache wheel not found in ${DIST_JIT_CACHE_DIR} for ${CUDA_VERSION}. Ensure the CI build stage produced the artifact." >&2
+        fi
+        echo ""
+    fi
+}
+
 # Install and verify FlashInfer
 install_and_verify() {
     if [ "$DRY_RUN" != "true" ]; then
         echo "Using CUDA version: ${CUDA_VERSION}"
         echo ""
+
+        # Install precompiled kernels if enabled
+        install_precompiled_kernels
 
         # Install local python sources
         pip install -e . -v --no-deps
@@ -106,7 +184,7 @@ sample_tests() {
     # Sample every Nth test with random offset
     SAMPLED_NODE_IDS=$(echo "$all_node_ids" | awk "NR % $SAMPLE_RATE == $SAMPLE_OFFSET")
     # Fallback: if no tests sampled (offset missed all tests), take the first test
-    if [ -z "$SAMPLED_NODE_IDS" ] || [ $(echo "$SAMPLED_NODE_IDS" | wc -l) -eq 0 ]; then
+    if [ -z "$SAMPLED_NODE_IDS" ] || [ "$(echo "$SAMPLED_NODE_IDS" | wc -l)" -eq 0 ]; then
         SAMPLED_NODE_IDS=$(echo "$all_node_ids" | head -1)
     fi
 }
@@ -154,6 +232,7 @@ dry_run_full_file() {
     TOTAL_TESTS=$((TOTAL_TESTS + 1))
     JUNIT_FILENAME="${test_file//\//_}.xml"
     JUNIT_FLAG="--junitxml=${JUNIT_DIR}/${JUNIT_FILENAME}"
+    # shellcheck disable=SC2086  # PYTEST_COMMAND_PREFIX needs word splitting
     echo "$TOTAL_TESTS. ${PYTEST_COMMAND_PREFIX} pytest $PYTEST_FLAGS ${JUNIT_FLAG} \"${test_file}\""
 }
 
@@ -245,12 +324,14 @@ run_sanity_test_file() {
     # Run pytest with the sampled node IDs
     TOTAL_TESTS=$((TOTAL_TESTS + 1))
 
+    # shellcheck disable=SC2086  # PYTEST_COMMAND_PREFIX and PYTEST_FLAGS need word splitting
     if ${PYTEST_COMMAND_PREFIX} pytest $PYTEST_FLAGS "${JUNIT_FLAG}" "${SAMPLED_NODE_IDS_ARRAY[@]}"; then
         echo "✅ PASSED: $test_file ($SAMPLED_IN_FILE/$TOTAL_IN_FILE tests)"
         PASSED_TESTS=$((PASSED_TESTS + 1))
     else
         echo "❌ FAILED: $test_file ($SAMPLED_IN_FILE/$TOTAL_IN_FILE tests)"
         FAILED_TESTS="$FAILED_TESTS\n  - $test_file"
+        # shellcheck disable=SC2034  # EXIT_CODE is used by calling scripts
         EXIT_CODE=1
     fi
 
@@ -264,17 +345,20 @@ run_full_test_file() {
     echo "=========================================="
     JUNIT_FILENAME="${test_file//\//_}.xml"
     JUNIT_FLAG="--junitxml=${JUNIT_DIR}/${JUNIT_FILENAME}"
+    # shellcheck disable=SC2086  # PYTEST_COMMAND_PREFIX needs word splitting
     echo "Running: ${PYTEST_COMMAND_PREFIX} pytest $PYTEST_FLAGS ${JUNIT_FLAG} \"${test_file}\""
     echo "=========================================="
 
     TOTAL_TESTS=$((TOTAL_TESTS + 1))
 
+    # shellcheck disable=SC2086  # PYTEST_COMMAND_PREFIX and PYTEST_FLAGS need word splitting
     if ${PYTEST_COMMAND_PREFIX} pytest $PYTEST_FLAGS "${JUNIT_FLAG}" "${test_file}"; then
         echo "✅ PASSED: $test_file"
         PASSED_TESTS=$((PASSED_TESTS + 1))
     else
         echo "❌ FAILED: $test_file"
         FAILED_TESTS="$FAILED_TESTS\n  - $test_file"
+        # shellcheck disable=SC2034  # EXIT_CODE is used by calling scripts
         EXIT_CODE=1
     fi
 
