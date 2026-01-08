@@ -1229,15 +1229,39 @@ def bench_gpu_time_with_cupti(
         # No start, end, correlation_id is considered in the kernel string
         return f"{kernel[0]}_{kernel[4]}_{kernel[5]}_{kernel[6]}_{kernel[7]}"
 
-    # Process activities
+    # Process activities - OPTIMIZED O(N + M log M) algorithm
+    import bisect
+
+    # Step 1: Sort launches by start timestamp - O(M log M)
+    sorted_launches = sorted(launches, key=lambda l: l[0])
+    launch_starts = [l[0] for l in sorted_launches]
+
+    # Step 2: Build correlation_id -> kernels mapping - O(K)
+    corr_id_to_kernels: dict[
+        int, list[tuple[str, float, float, int, int, int, int, int]]
+    ] = {}
+    for k in kernels:
+        corr_id = k[3]
+        if corr_id not in corr_id_to_kernels:
+            corr_id_to_kernels[corr_id] = []
+        corr_id_to_kernels[corr_id].append(k)
+
     measured_times = []
     kernel_names = None
     for idx, (start_cpu, end_cpu) in enumerate(iter_timestamps):
-        # find all launches of kernels that happened within the iteration
-        iter_launches = [l for l in launches if l[0] >= start_cpu and l[0] <= end_cpu]
-        corr_ids = set(l[2] for l in iter_launches)
-        # find all GPU kernels that happened within the iteration
-        iter_kernels = [k for k in kernels if k[3] in corr_ids]
+        # Use binary search to find launches within time range - O(log M)
+        left_idx = bisect.bisect_left(launch_starts, start_cpu)
+        right_idx = bisect.bisect_right(launch_starts, end_cpu)
+
+        # Get correlation IDs for launches in range - O(range size)
+        corr_ids = set(sorted_launches[i][2] for i in range(left_idx, right_idx))
+
+        # Find all GPU kernels using the mapping - O(range size)
+        iter_kernels = []
+        for corr_id in corr_ids:
+            if corr_id in corr_id_to_kernels:
+                iter_kernels.extend(corr_id_to_kernels[corr_id])
+
         if not iter_kernels:
             raise ValueError(f"No kernel activities recorded for iteration {idx}")
         current_kernel_names = set(generate_kernel_string(k) for k in iter_kernels)

@@ -20,6 +20,7 @@ from typing import Optional, Tuple
 
 import torch
 
+from .api_logging import flashinfer_api
 from .jit.topk import gen_topk_module
 from .utils import _get_cache_buf, register_custom_op, register_fake_op
 
@@ -61,9 +62,94 @@ def get_topk_module():
         batch_size = input.size(0)
         return torch.empty(batch_size, top_k, dtype=torch.int32, device=input.device)
 
+    @register_custom_op(
+        "flashinfer::radix_topk_page_table_transform",
+        mutates_args=("row_states_buffer", "output_page_table"),
+    )
+    def radix_topk_page_table_transform(
+        input: torch.Tensor,
+        output_page_table: torch.Tensor,
+        src_page_table: torch.Tensor,
+        row_to_batch: Optional[torch.Tensor],
+        lengths: torch.Tensor,
+        row_states_buffer: Optional[torch.Tensor],
+        top_k: int,
+    ) -> None:
+        assert input.dtype in [torch.float32, torch.float16, torch.bfloat16], (
+            f"Unsupported dtype {input.dtype}, expected float32, float16, or bfloat16"
+        )
+        module.radix_topk_page_table_transform(
+            input,
+            output_page_table,
+            src_page_table,
+            row_to_batch,
+            lengths,
+            row_states_buffer,
+            top_k,
+        )
+
+    @register_fake_op("flashinfer::radix_topk_page_table_transform")
+    def _fake_radix_topk_page_table_transform(
+        input: torch.Tensor,
+        output_page_table: torch.Tensor,
+        src_page_table: torch.Tensor,
+        row_to_batch: Optional[torch.Tensor],
+        lengths: torch.Tensor,
+        row_states_buffer: Optional[torch.Tensor],
+        top_k: int,
+    ) -> None:
+        pass
+
+    @register_custom_op(
+        "flashinfer::radix_topk_ragged_transform",
+        mutates_args=("row_states_buffer", "output_indices"),
+    )
+    def radix_topk_ragged_transform(
+        input: torch.Tensor,
+        output_indices: torch.Tensor,
+        offsets: torch.Tensor,
+        lengths: torch.Tensor,
+        row_states_buffer: Optional[torch.Tensor],
+        top_k: int,
+    ) -> None:
+        assert input.dtype in [torch.float32, torch.float16, torch.bfloat16], (
+            f"Unsupported dtype {input.dtype}, expected float32, float16, or bfloat16"
+        )
+        module.radix_topk_ragged_transform(
+            input, output_indices, offsets, lengths, row_states_buffer, top_k
+        )
+
+    @register_fake_op("flashinfer::radix_topk_ragged_transform")
+    def _fake_radix_topk_ragged_transform(
+        input: torch.Tensor,
+        output_indices: torch.Tensor,
+        offsets: torch.Tensor,
+        lengths: torch.Tensor,
+        row_states_buffer: Optional[torch.Tensor],
+        top_k: int,
+    ) -> None:
+        pass
+
     return SimpleNamespace(
         radix_topk=radix_topk,
+        radix_topk_page_table_transform=radix_topk_page_table_transform,
+        radix_topk_ragged_transform=radix_topk_ragged_transform,
+        can_implement_filtered_topk=module.can_implement_filtered_topk,
     )
+
+
+def can_implement_filtered_topk() -> bool:
+    r"""Check if the GPU supports enough shared memory for FilteredTopK algorithm.
+
+    FilteredTopK requires 128KB dynamic shared memory. This function checks if the
+    current GPU's max shared memory per SM is sufficient.
+
+    Returns
+    -------
+    bool
+        True if GPU supports FilteredTopK, False otherwise.
+    """
+    return get_topk_module().can_implement_filtered_topk()
 
 
 def top_k(
@@ -166,3 +252,170 @@ def top_k(
 
 # Alias for compatibility
 topk = top_k
+
+
+@flashinfer_api
+def top_k_page_table_transform(
+    input: torch.Tensor,
+    src_page_table: torch.Tensor,
+    lengths: torch.Tensor,
+    k: int,
+    row_to_batch: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""Fused Top-K selection + Page Table Transform for sparse attention.
+
+    This function performs top-k selection on input scores and transforms the
+    selected indices through a page table lookup in a single fused kernel.
+    Used in sparse attention's second stage where selected KV cache positions
+    need to be mapped through page tables.
+
+    For each row i:
+        output_page_table[i, j] = src_page_table[batch_idx, topk_indices[j]]
+
+    where batch_idx is determined by row_to_batch[i] if provided, otherwise i.
+
+    Parameters
+    ----------
+    input : torch.Tensor
+        Input scores tensor of shape ``(num_rows, max_len)``.
+        Supported dtypes: ``float32``, ``float16``, ``bfloat16``.
+    src_page_table : torch.Tensor
+        Source page table of shape ``(batch_size, max_len)`` with dtype ``int32``.
+    lengths : torch.Tensor
+        Actual KV lengths per row of shape ``(num_rows,)`` with dtype ``int32``.
+    k : int
+        Number of top elements to select from each row.
+    row_to_batch : Optional[torch.Tensor], optional
+        Mapping from row index to batch index of shape ``(num_rows,)`` with
+        dtype ``int32``. If None, uses 1:1 mapping (row_idx == batch_idx).
+        Default is None.
+
+    Returns
+    -------
+    output_page_table : torch.Tensor
+        Output page table entries of shape ``(num_rows, k)`` with dtype ``int32``.
+        Contains the gathered page table entries for the top-k indices.
+        Positions beyond actual length are set to -1.
+
+    Note
+    ----
+    - This is specifically designed for sparse attention's second stage.
+    - If lengths[i] <= k, the output simply contains src_page_table[batch_idx, 0:lengths[i]]
+      with remaining positions set to -1.
+
+    Examples
+    --------
+    >>> import torch
+    >>> import flashinfer
+    >>> num_rows = 8
+    >>> max_len = 4096
+    >>> k = 256
+    >>> scores = torch.randn(num_rows, max_len, device="cuda", dtype=torch.float16)
+    >>> src_page_table = torch.randint(0, 1000, (num_rows, max_len), device="cuda", dtype=torch.int32)
+    >>> lengths = torch.full((num_rows,), max_len, device="cuda", dtype=torch.int32)
+    >>> output = flashinfer.top_k_page_table_transform(scores, src_page_table, lengths, k)
+    >>> output.shape
+    torch.Size([8, 256])
+    """
+    device = input.device
+    num_rows = input.size(0)
+
+    # Allocate row_states buffer for multi-CTA path
+    row_states_buffer: Optional[torch.Tensor] = _get_cache_buf(
+        f"radix_topk_row_states_{device}",
+        1024 * 1024,  # 1MB
+        device,
+        zero_init=True,
+    )
+
+    # Allocate output
+    output_page_table = torch.empty(num_rows, k, dtype=torch.int32, device=device)
+
+    get_topk_module().radix_topk_page_table_transform(
+        input,
+        output_page_table,
+        src_page_table,
+        row_to_batch,
+        lengths,
+        row_states_buffer,
+        k,
+    )
+
+    return output_page_table
+
+
+@flashinfer_api
+def top_k_ragged_transform(
+    input: torch.Tensor,
+    offsets: torch.Tensor,
+    lengths: torch.Tensor,
+    k: int,
+) -> torch.Tensor:
+    r"""Fused Top-K selection + Ragged Index Transform for sparse attention.
+
+    This function performs top-k selection on input scores and transforms the
+    selected indices by adding an offset in a single fused kernel.
+    Used in sparse attention's second stage with ragged/variable-length KV cache.
+
+    For each row i:
+        output_indices[i, j] = topk_indices[j] + offsets[i]
+
+    Parameters
+    ----------
+    input : torch.Tensor
+        Input scores tensor of shape ``(num_rows, max_len)``.
+        Supported dtypes: ``float32``, ``float16``, ``bfloat16``.
+    offsets : torch.Tensor
+        Offset to add per row of shape ``(num_rows,)`` with dtype ``int32``.
+    lengths : torch.Tensor
+        Actual KV lengths per row of shape ``(num_rows,)`` with dtype ``int32``.
+    k : int
+        Number of top elements to select from each row.
+
+    Returns
+    -------
+    output_indices : torch.Tensor
+        Output indices of shape ``(num_rows, k)`` with dtype ``int32``.
+        Contains the top-k indices plus offsets.
+        Positions beyond actual length are set to -1.
+
+    Note
+    ----
+    - This is specifically designed for sparse attention's second stage with
+      ragged KV cache layout.
+    - If lengths[i] <= k, the output contains [offsets[i], offsets[i]+1, ..., offsets[i]+lengths[i]-1]
+      with remaining positions set to -1.
+
+    Examples
+    --------
+    >>> import torch
+    >>> import flashinfer
+    >>> num_rows = 8
+    >>> max_len = 4096
+    >>> k = 256
+    >>> scores = torch.randn(num_rows, max_len, device="cuda", dtype=torch.float16)
+    >>> offsets = torch.arange(0, num_rows * max_len, max_len, device="cuda", dtype=torch.int32)
+    >>> lengths = torch.full((num_rows,), max_len, device="cuda", dtype=torch.int32)
+    >>> output = flashinfer.top_k_ragged_transform(scores, offsets, lengths, k)
+    >>> output.shape
+    torch.Size([8, 256])
+    """
+    device = input.device
+    num_rows = input.size(0)
+
+    # Allocate row_states buffer for multi-CTA path
+    row_states_buffer: Optional[torch.Tensor] = _get_cache_buf(
+        f"radix_topk_row_states_{device}",
+        1024 * 1024,  # 1MB
+        device,
+        zero_init=True,
+    )
+
+    # Allocate output
+    output_indices = torch.empty(num_rows, k, dtype=torch.int32, device=device)
+
+    get_topk_module().radix_topk_ragged_transform(
+        input, output_indices, offsets, lengths, row_states_buffer, k
+    )
+
+    return output_indices
