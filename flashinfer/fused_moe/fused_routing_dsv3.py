@@ -116,8 +116,8 @@ def get_dsv3_fused_routing_module():
     )
 
 
-@flashinfer_api
 @backend_requirement({}, common_check=_check_dsv3_fused_routing_supported)
+@flashinfer_api
 def fused_topk_deepseek(
     scores: torch.Tensor,
     bias: torch.Tensor,
