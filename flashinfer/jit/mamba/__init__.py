@@ -14,6 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from .selective_state_update import gen_selective_state_update_module
+from .selective_state_update import (
+    gen_selective_state_update_module,
+    gen_selective_state_update_sm90_module,
+)
 
-__all__ = ["gen_selective_state_update_module"]
+__all__ = [
+    "gen_selective_state_update_module",
+    "gen_selective_state_update_sm90_module",
+]
