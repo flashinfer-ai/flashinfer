@@ -1993,7 +1993,7 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
   for (int base = tx * VEC_SIZE; base < length; base += BLOCK_SIZE * VEC_SIZE) {
     score_vec.cast_load(&score[base]);
 #pragma unroll
-    for (int j = 0; j < VEC_SIZE; ++j) {
+    for (int j = 0; j < VEC_SIZE && base + j < length; ++j) {
       const auto bin = Traits::ToCoarseKey(score_vec[j]);
       atomicAdd(&s_histogram[bin], 1);
     }
@@ -2037,7 +2037,7 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
     for (int base = tx * VEC_SIZE; base < length; base += BLOCK_SIZE * VEC_SIZE) {
       score_vec.cast_load(&score[base]);
 #pragma unroll
-      for (int j = 0; j < VEC_SIZE; ++j) {
+      for (int j = 0; j < VEC_SIZE && base + j < length; ++j) {
         const auto bin = static_cast<int>(Traits::ToCoarseKey(score_vec[j]));
         if (bin > threshold_bin) {
           const auto pos = atomicAdd(&s_counter, 1);
@@ -2056,7 +2056,7 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
     for (int base = tx * VEC_SIZE; base < length; base += BLOCK_SIZE * VEC_SIZE) {
       score_vec.cast_load(&score[base]);
 #pragma unroll
-      for (int j = 0; j < VEC_SIZE; ++j) {
+      for (int j = 0; j < VEC_SIZE && base + j < length; ++j) {
         const auto raw_input = score_vec[j];
         const auto bin = static_cast<int>(Traits::ToCoarseKey(raw_input));
         if (bin > threshold_bin) {
