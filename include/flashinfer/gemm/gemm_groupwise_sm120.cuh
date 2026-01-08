@@ -171,12 +171,6 @@ cudaError_t CutlassGroupwiseScaledGEMMSM120(void* float_buffer, size_t float_buf
     return cudaErrorUnknown;
   }
 
-  // Sync to ensure kernel completes
-  cudaError_t cuda_err = cudaStreamSynchronize(stream);
-  if (cuda_err != cudaSuccess) {
-    return cuda_err;
-  }
-
   return cudaSuccess;
 #else
   return cudaErrorNotSupported;

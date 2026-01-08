@@ -473,6 +473,9 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
             plan_kv_indptr = (
                 kv_indptr.clone().detach() if backend == "trtllm-gen" else kv_indptr
             )
+            # Map fa2_tc to fa2 for the actual backend parameter
+            # fa2_tc is a benchmark-specific name meaning "fa2 with tensor cores"
+            actual_backend = "fa2" if backend == "fa2_tc" else backend
             backend_wrappers[backend] = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
                 workspace_buffer,
                 "HND",
@@ -481,7 +484,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 paged_kv_indptr_buffer=plan_kv_indptr,
                 paged_kv_indices_buffer=kv_indices,
                 paged_kv_last_page_len_buffer=kv_last_page_len,
-                backend=backend,
+                backend=actual_backend,
             )
             backend_wrappers[backend].plan(
                 plan_kv_indptr,
@@ -764,14 +767,14 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
             backends.remove("fa2")
     if "cudnn" in backends:
         remove_cudnn = False
-        # cuDNN FP8 prefill requires cuDNN >= 9.18.0 (backend version 91800)
+        # cuDNN FP8 prefill requires cuDNN >= 9.17.1 (backend version 91701)
         if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2] or kv_dtype in [
             torch.float8_e4m3fn,
             torch.float8_e5m2,
         ]:
-            if not CUDNN_AVAILABLE or CUDNN_BACKEND_VERSION < 91800:
+            if not CUDNN_AVAILABLE or CUDNN_BACKEND_VERSION < 91701:
                 print(
-                    f"[INFO] cuDNN FP8 prefill requires cuDNN >= 9.18.0. "
+                    f"[INFO] cuDNN FP8 prefill requires cuDNN >= 9.17.1. "
                     f"Current version: {CUDNN_BACKEND_VERSION}. Skipping cudnn backend."
                 )
                 remove_cudnn = True
@@ -785,9 +788,9 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
             torch.float8_e4m3fn,
             torch.float8_e5m2,
         ]:
-            if not CUDNN_AVAILABLE or CUDNN_BACKEND_VERSION < 91800:
+            if not CUDNN_AVAILABLE or CUDNN_BACKEND_VERSION < 91701:
                 print(
-                    f"[INFO] cuDNN FP8 prefill requires cuDNN >= 9.18.0. "
+                    f"[INFO] cuDNN FP8 prefill requires cuDNN >= 9.17.1. "
                     f"Current version: {CUDNN_BACKEND_VERSION}. Skipping cudnn-native backend."
                 )
                 remove_cudnn_native = True

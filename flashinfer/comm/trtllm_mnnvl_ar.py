@@ -137,7 +137,6 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             mapping.tp_size,
             mapping.tp_rank,
             torch.device("cuda", mapping.local_rank),
-            mapping.is_multi_node(),
             comm_backend,
         )
 

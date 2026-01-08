@@ -176,9 +176,9 @@ if CUDNN_AVAILABLE:
         if (
             cudnn_q_data_type == cudnn.data_type.FP8_E4M3
             or cudnn_q_data_type == cudnn.data_type.FP8_E5M2
-        ) and cudnn.backend_version() < 91800:
+        ) and cudnn.backend_version() < 91701:
             raise RuntimeError(
-                f"FP8 is not supported in cuDNN backend version < 9.18.0, current version is {cudnn.backend_version()}"
+                f"FP8 is not supported in cuDNN backend version < 9.17.1, current version is {cudnn.backend_version()}"
             )
 
         with cudnn.graph(handle) as (g, _):
