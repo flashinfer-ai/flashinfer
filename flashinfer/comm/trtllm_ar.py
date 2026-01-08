@@ -606,10 +606,11 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     ipc_handles: List[List[int]] = list()
     mem_handles: List[SymmDeviceMemory] = list()
     #for size in [buffer_size, flag_size, lamport_buffer_size]:
+    lamport_buffer_dtype = torch.float16 if not use_fp32_lamport else torch.float32
     for size, dtype in [
         (buffer_size, torch.float32),
         (flag_size, torch.int32),
-        (lamport_buffer_size, torch.float16),
+        (lamport_buffer_size, lamport_buffer_dtype),
     ]:
         # todo(review): confirm we need this alignment
         # all sizes should be aligned to 1LU << 21 bytes (2MB)
@@ -618,11 +619,11 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
         if not use_symm_dev_mem:
             #ipc_handles.append(create_shared_buffer(aligned_size, group))
             ptrs, tensor, handle = _alloc_symm_buffer_bytes(
-            aligned_size,
-            tp_size,
-            dtype,
-            device,
-            group_name,
+                aligned_size,
+                tp_size,
+                dtype,
+                device,
+                group_name,
             )
             symm_refs.append((tensor, handle))
             ipc_handles.append(ptrs)
