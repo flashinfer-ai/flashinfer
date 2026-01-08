@@ -15,17 +15,32 @@ limitations under the License.
 """
 
 from .. import env as jit_env
-from ..core import JitSpec, gen_jit_spec
+from ..core import JitSpec, gen_jit_spec, sm90a_nvcc_flags
 
 
 def gen_selective_state_update_module() -> JitSpec:
     nvcc_flags = [
         "-DENABLE_BF16",
-        "-DENABLE_FP8",
     ]
 
     return gen_jit_spec(
         "mamba_selective_state_update",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "selective_state_update.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "flashinfer_mamba_binding.cu",
+        ],
+        extra_cuda_cflags=nvcc_flags,
+    )
+
+
+def gen_selective_state_update_sm90_module() -> JitSpec:
+    nvcc_flags = sm90a_nvcc_flags + [
+        "-DENABLE_BF16",
+        "-DFLASHINFER_MAMBA_ENABLE_SM90",
+    ]
+
+    return gen_jit_spec(
+        "mamba_selective_state_update_sm90",
         [
             jit_env.FLASHINFER_CSRC_DIR / "selective_state_update.cu",
             jit_env.FLASHINFER_CSRC_DIR / "flashinfer_mamba_binding.cu",
