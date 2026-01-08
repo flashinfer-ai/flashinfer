@@ -138,7 +138,6 @@ def get_topk_module():
     )
 
 
-@flashinfer_api
 def can_implement_filtered_topk() -> bool:
     r"""Check if the GPU supports enough shared memory for FilteredTopK algorithm.
 

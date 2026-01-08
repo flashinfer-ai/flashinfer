@@ -195,7 +195,6 @@ def get_batch_indices_positions(
     return batch_indices, positions
 
 
-@flashinfer_api
 def get_seq_lens(
     kv_indptr: torch.Tensor, kv_last_page_len: torch.Tensor, page_size: int
 ) -> torch.Tensor:
