@@ -597,18 +597,35 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
 
     lamport_buffer_size = lamport_comm_size * 3
 
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    group_name = group.group_name
+    symm_refs: list[torch.Tensor] = []
     # we should init 3 buffers for all reduce fusion:
     # [buffer_size, flag_size, lamport_buffer_size]
 
     ipc_handles: List[List[int]] = list()
     mem_handles: List[SymmDeviceMemory] = list()
-    for size in [buffer_size, flag_size, lamport_buffer_size]:
+    #for size in [buffer_size, flag_size, lamport_buffer_size]:
+    for size, dtype in [
+        (buffer_size, torch.float32),
+        (flag_size, torch.int32),
+        (lamport_buffer_size, torch.float16),
+    ]:
         # todo(review): confirm we need this alignment
         # all sizes should be aligned to 1LU << 21 bytes (2MB)
         aligned_size = round_up(size, 1 << 21)
 
         if not use_symm_dev_mem:
-            ipc_handles.append(create_shared_buffer(aligned_size, group))
+            #ipc_handles.append(create_shared_buffer(aligned_size, group))
+            ptrs, tensor, handle = _alloc_symm_buffer_bytes(
+            aligned_size,
+            tp_size,
+            dtype,
+            device,
+            group_name,
+            )
+            symm_refs.append((tensor, handle))
+            ipc_handles.append(ptrs)
         else:
             symm_mem = SymmDeviceMemory(
                 aligned_size,
@@ -625,7 +642,7 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     print(
         f"rank {tp_rank} allocated ipc_handles: {[[hex(handle) for handle in sublist] for sublist in ipc_handles]}"
     )
-
+    _symm_workspace_refs[id(ipc_handles)] = symm_refs
     # Initialize lamport buffer
     aligned_lamport_buffer_size = round_up(lamport_buffer_size, 1 << 21)
     if use_fp32_lamport:
@@ -717,8 +734,8 @@ def trtllm_destroy_ipc_workspace_for_all_reduce_fusion(
     """
 
     symm_refs = _symm_workspace_refs.pop(id(workspace), None)
-    for ipc_handle in workspace:
-        free_shared_buffer(ipc_handle, group)
+    # for ipc_handle in workspace:
+    #     free_shared_buffer(ipc_handle, group)
 
 
 # allReduce fused quant utils
