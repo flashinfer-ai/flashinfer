@@ -169,8 +169,6 @@ def test_workload_dump_batch_decode():
 
     # Store original tensors for comparison
     original_q = inputs["q"].clone()
-    original_k_cache = inputs["k_cache"].clone()
-    original_v_cache = inputs["v_cache"].clone()
 
     # Run FlashInfer - this should trigger workload dump
     output, lse = decode_wrapper.run(
@@ -215,10 +213,9 @@ def test_workload_dump_batch_decode():
         loaded_q.to(original_q_cpu.dtype), original_q_cpu, atol=1e-6
     ), "Dumped 'q' tensor does not match original"
 
-    print(f"\n✓ Workload dump test passed!")
-    print(f"  - Safetensors file: {latest_file}")
-    print(f"  - Dumped tensors: {list(loaded_tensors.keys())}")
-    print(f"  - q shape: {loaded_tensors['q'].shape}")
+    print("  - Safetensors file: ", latest_file)
+    print("  - Dumped tensors: ", list(loaded_tensors.keys()))
+    print("  - q shape: ", loaded_tensors["q"].shape)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -283,8 +280,7 @@ def test_workload_dump_tensor_shapes():
             f"q shape mismatch: expected {expected_q_shape}, got {loaded_tensors['q'].shape}"
         )
 
-    print(f"\n✓ Tensor shape test passed!")
-    print(f"  - All shapes verified correctly")
+    print("  - Shapes verified correctly")
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -312,7 +308,7 @@ def test_multiple_runs_create_multiple_files():
     initial_files = set(get_dumped_safetensors_files(func_name))
 
     num_runs = 3
-    for i in range(num_runs):
+    for _ in range(num_runs):
         inputs = generate_random_inputs(
             batch_size,
             max_seq_len,
@@ -347,7 +343,6 @@ def test_multiple_runs_create_multiple_files():
         f"Expected at least {num_runs} new safetensors files, got {len(new_files)}"
     )
 
-    print(f"\n✓ Multiple runs test passed!")
     print(f"  - Created {len(new_files)} new safetensors files from {num_runs} runs")
 
 
@@ -366,5 +361,5 @@ if __name__ == "__main__":
     finally:
         # Cleanup
         if os.path.exists(_TEST_BENCH_DIR):
-            print(f"\nCleaning up {_TEST_BENCH_DIR}")
+            print("Cleaning up ", _TEST_BENCH_DIR)
             shutil.rmtree(_TEST_BENCH_DIR)
