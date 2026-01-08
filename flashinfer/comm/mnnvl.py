@@ -232,6 +232,86 @@ class MPIBackend(CommBackend):
         return MPIBackend()  # Returns new adapter
 
 
+class TorchDistBackend(CommBackend):
+    """Communication backend using torch.distributed"""
+
+    def __init__(self, group: Optional[Any] = None):
+        """
+        Initialize TorchDistBackend.
+
+        Args:
+            group: Optional process group. If None, uses the default process group.
+        """
+        import torch.distributed as dist
+
+        if not dist.is_initialized():
+            raise RuntimeError(
+                "torch.distributed is not initialized. "
+                "Please call torch.distributed.init_process_group() first."
+            )
+        self._group = group
+        self._dist = dist
+
+    def Get_rank(self) -> int:
+        return self._dist.get_rank(self._group)
+
+    def Get_size(self) -> int:
+        return self._dist.get_world_size(self._group)
+
+    def allgather(self, data: Any) -> List[Any]:
+        """All-gather arbitrary Python objects across all ranks."""
+        output_list = [None] * self.Get_size()
+        self._dist.all_gather_object(output_list, data, group=self._group)
+        return output_list
+
+    def bcast(self, data: Any, root: int) -> Any:
+        """Broadcast a Python object from root to all ranks."""
+        object_list = [data]
+        self._dist.broadcast_object_list(object_list, src=root, group=self._group)
+        return object_list[0]
+
+    def barrier(self) -> None:
+        self._dist.barrier(group=self._group)
+
+    def Split(self, color: int, key: int) -> "TorchDistBackend":
+        """
+        Split the communicator into sub-groups based on color.
+
+        All processes with the same color will be in the same new group.
+        The key determines the rank ordering within the new group.
+
+        Args:
+            color: Processes with the same color are placed in the same group
+            key: Determines rank ordering within the new group (lower key = lower rank)
+
+        Returns:
+            New TorchDistBackend with the split process group
+        """
+        # Gather (color, key, global_rank) from all processes
+        global_rank = self.Get_rank()
+
+        all_info = self.allgather((color, key, global_rank))
+
+        # Group ranks by color, sort by key within each group
+        color_groups: Dict[int, List[tuple]] = {}
+        for c, k, r in all_info:
+            if c not in color_groups:
+                color_groups[c] = []
+            color_groups[c].append((k, r))
+
+        # Sort each group by key to determine rank ordering
+        for c in color_groups:
+            color_groups[c].sort(key=lambda x: x[0])
+
+        # Find my new group's ranks (in sorted order by key)
+        my_group_ranks = [r for _, r in color_groups[color]]
+
+        # Create new process group with the ranks in my color group
+        new_group = self._dist.new_group(ranks=my_group_ranks)
+
+        return TorchDistBackend(group=new_group)
+
+
 @dataclass
 class MnnvlConfig:
     """Configuration for MNNVL memory management"""
@@ -764,9 +844,34 @@ class PosixFDHandleExchanger(HandleExchanger):
         self._socket.close()
 
 
+def is_mnnvl_fabric_supported(device_idx: int) -> bool:
+    fabric_handle_supported = checkCudaErrors(
+        cuda.cuDeviceGetAttribute(
+            cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED,
+            device_idx,
+        )
+    )
+    if fabric_handle_supported == 0:
+        return False
+
+    pynvml.nvmlInit()
+    try:
+        handle = pynvml.nvmlDeviceGetHandleByIndex(device_idx)
+        fabric_info = pynvml.c_nvmlGpuFabricInfoV_t()
+        pynvml.nvmlDeviceGetGpuFabricInfoV(handle, ctypes.byref(fabric_info))
+        if (
+            fabric_info.state >= pynvml.NVML_GPU_FABRIC_STATE_COMPLETED
+            and fabric_info.clusterUuid[0] != 0
+        ):
+            return True
+        return False
+    finally:
+        pynvml.nvmlShutdown()
+
+
 # TODO: This class follows similar logic with MnnvlMemory, but the latter use single instance mode to manage the memory allocation.
-class McastDeviceMemory:
-    """Python port of McastDeviceMemory from TensorRT-LLM"""
+class SymmDeviceMemory:
+    """Python port of SymmDeviceMemory from TensorRT-LLM"""
 
     def __init__(
         self,
@@ -774,8 +879,9 @@ class McastDeviceMemory:
         group_size: int,
         group_rank: int,
         device_idx: int,
-        is_multi_node: bool = True,
         comm_backend_for_handle_transfer: Optional[CommBackend] = None,
+        enable_multicast: bool = True,
+        allocate_signal_pads: bool = True,
     ):
         cu_device = checkCudaErrors(cuda.cuDeviceGet(device_idx))
 
@@ -795,7 +901,6 @@ class McastDeviceMemory:
 
         checkCudaErrors(cudart.cudaSetDevice(device_idx))
 
-        self.is_multi_node = is_multi_node
         self.device_idx = device_idx
         self.group_size = group_size
         self.group_rank = group_rank
@@ -828,31 +933,20 @@ class McastDeviceMemory:
         )
         if multicast_supported == 0:
             raise RuntimeError(
-                "[McastDeviceMemory] Device does not support multicasting."
+                "[SymmDeviceMemory] Device does not support multicasting."
             )
 
         # Calculate signal pad offset with alignment (matching C++ exactly)
         self.signal_pad_offset = round_up(buf_size, self.SIGNAL_PAD_ALIGNMENT)
 
         logging.info(
-            f"[McastDeviceMemory] Rank: {group_rank}, Group size: {group_size}, "
-            f"mnNvlink: {is_multi_node}, device_idx: {device_idx}, "
+            f"[SymmDeviceMemory] Rank: {group_rank}, Group size: {group_size}, "
+            f"device_idx: {device_idx}, "
             f"Signal pad offset: {self.signal_pad_offset}"
         )
 
-        # Create handle exchanger based on multi-node mode
-        if self.is_multi_node:
-            # Check if fabric handle is supported
-            fabric_handle_supported = checkCudaErrors(
-                cuda.cuDeviceGetAttribute(
-                    cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED,
-                    device_idx,
-                )
-            )
-            if fabric_handle_supported == 0:
-                raise RuntimeError(
-                    "[McastDeviceMemory] Device does not support fabric handle."
-                )
+        # Create handle exchanger
+        if is_mnnvl_fabric_supported(device_idx):
             self._exchanger: HandleExchanger = FabricHandleExchanger(
                 self.comm_backend, self.group_rank, self.group_size
             )
@@ -860,27 +954,23 @@ class McastDeviceMemory:
             self._exchanger = PosixFDHandleExchanger(
                 self.comm_backend, self.group_rank, self.group_size
             )
-        self._alloc_mn_mcast_mem(buf_size)
+        self._alloc_mn_mcast_mem(buf_size, enable_multicast)
 
-        # Initialize signal pads
-        self.signal_pads = [0] * self.group_size
-        for i in range(self.group_size):
-            self.signal_pads[i] = self.uc_ptrs[i] + self.signal_pad_offset
-            if i == self.group_rank:
-                checkCudaErrors(
-                    cuda.cuMemsetD8(self.signal_pads[i], 0, self.SIGNAL_PAD_SIZE)
-                )
+        if allocate_signal_pads:
+            # Initialize signal pads
+            self.signal_pads = [0] * self.group_size
+            for i in range(self.group_size):
+                self.signal_pads[i] = self.uc_ptrs[i] + self.signal_pad_offset
+                if i == self.group_rank:
+                    checkCudaErrors(
+                        cuda.cuMemsetD8(self.signal_pads[i], 0, self.SIGNAL_PAD_SIZE)
+                    )
 
-        # Create device pointers
-        self.signal_pads_dev = alloc_and_copy_to_cuda(self.signal_pads)
+            self.signal_pads_dev = alloc_and_copy_to_cuda(self.signal_pads)
         self.uc_ptrs_dev = alloc_and_copy_to_cuda(self.uc_ptrs)
 
     def __del__(self):
         """Destructor - cleanup allocated memory"""
-
-        # Check if we're in a valid state for cleanup
-        if not hasattr(self, "is_multi_node"):
-            return
 
         if hasattr(self, "_exchanger"):
             self._exchanger.close()
@@ -987,7 +1077,7 @@ class McastDeviceMemory:
         """Get the usable buffer size (excluding signal pad)"""
         return self.allocation_size - self.SIGNAL_PAD_SIZE
 
-    def _alloc_mn_mcast_mem(self, buf_size: int):
+    def _alloc_mn_mcast_mem(self, buf_size: int, enable_multicast: bool):
         """Allocate multi-node multicast memory using MNNVL"""
         self._verify_cuda_context()
 
@@ -998,7 +1088,8 @@ class McastDeviceMemory:
         self._allocate_unicast_buffers(allocation_prop)
 
         # Setup multicast object, exchange handles, map and bind memory
-        self._setup_multicast(mc_prop)
+        if enable_multicast:
+            self._setup_multicast(mc_prop)
 
     def _verify_cuda_context(self):
         """Verify CUDA context is set to the correct device."""
@@ -1198,7 +1289,7 @@ class McastDeviceMemory:
 
 class McastGPUBuffer:
     """
-    Wrapper class for McastDeviceMemory to facilitate PyTorch tensor creation.
+    Wrapper class for SymmDeviceMemory to facilitate PyTorch tensor creation.
     It manages a buffer accessible via unicast or multicast for multi-node communication.
 
     Python port of McastGPUBuffer from TensorRT-LLM
@@ -1210,7 +1301,6 @@ class McastGPUBuffer:
         group_size: int,
         group_rank: int,
         device: torch.device,
-        mn_nvlink: bool = True,
         comm_backend_for_handle_transfer: Optional[CommBackend] = None,
     ):
         """
@@ -1224,12 +1314,11 @@ class McastGPUBuffer:
             mn_nvlink: Flag indicating if multi-node NVLink is used
             comm_backend_for_handle_transfer: Communication backend for handle transfer
         """
-        self.mcast_device_memory = McastDeviceMemory(
+        self.mcast_device_memory = SymmDeviceMemory(
             buf_size,
             group_size,
             group_rank,
             device.index,
-            mn_nvlink,
             comm_backend_for_handle_transfer,
         )
         # Update buf_size to reflect the actual usable buffer size after allocation

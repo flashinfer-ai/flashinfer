@@ -241,27 +241,77 @@ def get_gemm_sm120_module_cutlass_fp8():
                     k_dim = a.shape[2]
                     batch_size = a.shape[0]
 
-                # ScaleGranularityK must equal TileK (128)
-                if k_dim < 128:
-                    raise ValueError(
-                        f"SM120/SM121 CUTLASS blockwise scaling requires k >= 128, got k={k_dim}. "
-                    )
-
                 scale_gran_m = 1
                 scale_gran_n = 128
                 scale_gran_k = 128
 
+                # round up to the next multiple
+                def _pad_to_multiple(x, multiple):
+                    return ((x + multiple - 1) // multiple) * multiple
+
+                # SM120 CUTLASS blockwise scaling requires:
+                # - N % 128 == 0 (ScaleGranularityN)
+                # - K % 128 == 0 (TileK)
+                # If not aligned, we pad and then slice the result
+                n_padded = _pad_to_multiple(n_dim, scale_gran_n)
+                k_padded = _pad_to_multiple(k_dim, scale_gran_k)
+                needs_n_padding = n_padded != n_dim
+                needs_k_padding = k_padded != k_dim
+
+                if not needs_k_padding and not needs_n_padding:
+                    # No padding needed
+                    a_padded = a
+                    b_col_major_padded = b_col_major
+                else:
+                    # Padding needed
+                    if a.dim() == 2:
+                        a_padded = a
+                        if needs_k_padding:
+                            a_padded = torch.nn.functional.pad(
+                                a_padded.contiguous(), (0, k_padded - k_dim)
+                            )
+                        b_col_major_padded = torch.zeros(
+                            (n_padded, k_padded),
+                            dtype=b_col_major.dtype,
+                            device=b_col_major.device,
+                        )
+                        b_col_major_padded[:n_dim, :k_dim].copy_(b_col_major)
+                    else:
+                        a_padded = a
+                        if needs_k_padding:
+                            a_padded = torch.nn.functional.pad(
+                                a_padded.contiguous(), (0, k_padded - k_dim)
+                            )
+
+                        b_underlying_padded = torch.zeros(
+                            (batch_size, n_padded, k_padded),
+                            dtype=b_col_major.dtype,
+                            device=b_col_major.device,
+                        )
+                        b_col_major_padded = b_underlying_padded.transpose(-2, -1)
+                        b_col_major_padded[:, :k_dim, :n_dim].copy_(b_col_major)
+
+                # Create padded output if needed
+                if needs_n_padding:
+                    if a.dim() == 2:
+                        out_padded = torch.empty(
+                            (m_dim, n_padded), device=out.device, dtype=out.dtype
+                        )
+                    else:
+                        out_padded = torch.empty(
+                            (batch_size, m_dim, n_padded),
+                            device=out.device,
+                            dtype=out.dtype,
+                        )
+                else:
+                    out_padded = out
+
                 # For scalar scales, create compatible shapes for SM120
-                # SM120 requires scale tensors with specific shapes based on granularity
-                # Scale shape should be [m/scale_gran_m, k/scale_gran_k] for A
-                # and [n/scale_gran_n, k/scale_gran_k] for B
                 if scale_a.numel() == 1:
                     scale_m_count = (
                         batch_size * m_dim + scale_gran_m - 1
                     ) // scale_gran_m
-                    scale_k_count = (
-                        k_dim + scale_gran_k - 1
-                    ) // scale_gran_k  # k dimension
+                    scale_k_count = (k_padded + scale_gran_k - 1) // scale_gran_k
                     scale_a_expanded = (
                         scale_a.view(1, 1)
                         .expand(scale_m_count, scale_k_count)
@@ -271,13 +321,10 @@ def get_gemm_sm120_module_cutlass_fp8():
                     scale_a_expanded = scale_a
 
                 if scale_b.numel() == 1:
-                    # Calculate the expected scale dimensions
                     scale_n_count = (
-                        batch_size * n_dim + scale_gran_n - 1
+                        batch_size * n_padded + scale_gran_n - 1
                     ) // scale_gran_n
-                    scale_k_count = (
-                        k_dim + scale_gran_k - 1
-                    ) // scale_gran_k  # k dimension
+                    scale_k_count = (k_padded + scale_gran_k - 1) // scale_gran_k
                     scale_b_expanded = (
                         scale_b.view(1, 1)
                         .expand(scale_n_count, scale_k_count)
@@ -289,16 +336,24 @@ def get_gemm_sm120_module_cutlass_fp8():
                 # Call SM120 gemm_fp8_nt_groupwise (now handles both 2D and 3D)
                 module.gemm_fp8_nt_groupwise(
                     workspace_buffer,
-                    a,
-                    b_col_major,
+                    a_padded,
+                    b_col_major_padded,
                     scale_a_expanded,
                     scale_b_expanded,
-                    out,
+                    out_padded,
                     scale_gran_m,  # scale_granularity_m
                     scale_gran_n,  # scale_granularity_n
                     scale_gran_k,  # scale_granularity_k (adjusted for small k)
                     "MN",  # scale_major_mode
                 )
+
+                # Slice the result if we padded
+                if needs_n_padding:
+                    if a.dim() == 2:
+                        out.copy_(out_padded[:, :n_dim])
+                    else:
+                        out.copy_(out_padded[:, :, :n_dim])
+
                 return out
 
         return CutlassFp8GemmRunner()
@@ -1336,6 +1391,41 @@ def execute_cudnn_gemm_fp4_graph(
         )
 
 
+def execute_cudnn_gemm_mxfp8_graph(
+    graph,
+    a,
+    b,
+    a_descale,
+    b_descale,
+    c_final,
+    workspace_buffer,
+    tactic: int = -1,
+):
+    variant_pack = {
+        UIDs.A_UID.value: a,
+        UIDs.B_UID.value: b,
+        UIDs.BLOCK_DESCALE_A_UID.value: a_descale,
+        UIDs.BLOCK_DESCALE_B_UID.value: b_descale,
+        UIDs.O_UID.value: c_final,
+    }
+
+    workspace_size = graph.get_workspace_size()
+
+    if workspace_buffer.numel() < workspace_size:
+        workspace_buffer = torch.empty(
+            workspace_size, device=a.device, dtype=torch.uint8
+        )
+
+    stream = torch.cuda.current_stream(a.device)
+
+    if tactic == -1:
+        graph.execute(variant_pack, workspace_buffer, handle=_get_cudnn_handle(stream))
+    else:
+        graph.execute_plan_at_index(
+            variant_pack, workspace_buffer, tactic, handle=_get_cudnn_handle(stream)
+        )
+
+
 @functools.cache
 def build_cudnn_gemm_with_per_tensor_q_graph(
     a_shape, a_stride, b_shape, b_stride, a_type, b_type, o_type, device
@@ -2300,9 +2390,8 @@ def _heuristic_func_bmm_fp8(
         if is_sm_supported:
             heuristic_backends.append("cutlass_sm10x")
         elif is_sm120_supported:
-            k_dim = A.shape[-1] if A.dim() == 2 else A.shape[2]
-            if k_dim >= 128:
-                heuristic_backends.append("cutlass_sm12x")
+            # supports all K values through padding
+            heuristic_backends.append("cutlass_sm12x")
     if "cublas" in suitable_backends:
         heuristic_backends.append("cublas")
     if CUDNN_AVAILABLE and "cudnn" in suitable_backends:
@@ -3754,4 +3843,410 @@ def fp8_blockscale_gemm_sm90(
         runner.configure_workspace(workspace)
 
     runner.run_gemm(input, weight, out, input_scale, weight_scale)
+    return out
+
+
+def _calculate_block_scale_dims(
+    m: int, n: int, k: int, block_size: int
+) -> Tuple[int, int, int]:
+    """Calculate block scale dimensions using indestructible block formula."""
+    INDESTRUCTIBLE_128x4_BLOCK_M_N = 128
+    INDESTRUCTIBLE_128x4_BLOCK_K = 4
+
+    def div_up(a, b):
+        return (a + b - 1) // b
+
+    block_scale_dim_m = (
+        div_up(m, INDESTRUCTIBLE_128x4_BLOCK_M_N) * INDESTRUCTIBLE_128x4_BLOCK_M_N
+    )
+    block_scale_dim_n = (
+        div_up(n, INDESTRUCTIBLE_128x4_BLOCK_M_N) * INDESTRUCTIBLE_128x4_BLOCK_M_N
+    )
+    block_scale_dim_k = (
+        div_up(div_up(k, block_size), INDESTRUCTIBLE_128x4_BLOCK_K)
+        * INDESTRUCTIBLE_128x4_BLOCK_K
+    )
+
+    return block_scale_dim_m, block_scale_dim_n, block_scale_dim_k
+
+
+@functools.cache
+def create_cudnn_execution_plans_mxfp8_gemm(
+    a_shape,
+    a_stride,
+    a_type,  # cudnn.data_type, FP8_E4M3 or FP8_E5M2
+    b_shape,
+    b_stride,
+    b_type,  # cudnn.data_type, FP8_E4M3 or FP8_E5M2
+    block_size,
+    o_type,  # cudnn.data_type, BF16 or FP16
+    device,
+):
+    if len(a_shape) != 3:
+        raise ValueError(f"A shape must be 3D, got {a_shape}")
+    if len(b_shape) != 3:
+        raise ValueError(f"B shape must be 3D, got {b_shape}")
+
+    if a_type not in [cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2]:
+        raise ValueError(f"A type must be FP8_E4M3 or FP8_E5M2, got {a_type}")
+    if b_type not in [cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2]:
+        raise ValueError(f"B type must be FP8_E4M3 or FP8_E5M2, got {b_type}")
+    if o_type not in [cudnn.data_type.BFLOAT16, cudnn.data_type.HALF]:
+        raise ValueError(f"Output type must be BF16 or FP16, got {o_type}")
+
+    # Extract batch, m, n, k dimensions
+    b_dim = a_shape[0]
+    m = a_shape[1]
+    k = a_shape[2]
+    n = b_shape[2]
+
+    # Calculate block scale dimensions using indestructible block formula
+    block_scale_dim_m, block_scale_dim_n, block_scale_dim_k = (
+        _calculate_block_scale_dims(m, n, k, block_size)
+    )
+
+    # For mxfp8, scale tensors need to be reshaped to 3D with correct strides
+    # cuDNN expects K-major layout: stride for K dimension should be 1
+    # For block_descale_a: shape [b, block_scale_dim_m, block_scale_dim_k], stride [block_scale_dim_m * block_scale_dim_k, block_scale_dim_k, 1]
+    # For block_descale_b: shape [b, block_scale_dim_k, block_scale_dim_n], stride [block_scale_dim_n * block_scale_dim_k, 1, block_scale_dim_k]
+
+    a_descale_shape = (b_dim, block_scale_dim_m, block_scale_dim_k)
+    a_descale_stride = (
+        block_scale_dim_m * block_scale_dim_k,
+        block_scale_dim_k,
+        1,
+    )
+
+    b_descale_shape = (b_dim, block_scale_dim_k, block_scale_dim_n)
+    b_descale_stride = (
+        block_scale_dim_n * block_scale_dim_k,
+        1,
+        block_scale_dim_k,
+    )
+
+    # MXFP8 uses FP8_E4M3/FP8_E5M2 for quantized data
+    # MXFP8 uses FP8_E8M0 for scale data
+    scale_type = cudnn.data_type.FP8_E8M0
+
+    stream = torch.cuda.current_stream(device)
+    with cudnn.graph(_get_cudnn_handle(stream)) as (graph, _):
+        a_cudnn_tensor = graph.tensor(
+            name="a",
+            dim=tuple(a_shape),  # [b, m, k]
+            stride=tuple(a_stride),  # [m * k, k, 1]
+            data_type=a_type,
+        )
+        b_cudnn_tensor = graph.tensor(
+            name="b",
+            dim=tuple(b_shape),  # [b, k, n]
+            stride=tuple(b_stride),  # [k * n, 1, k]
+            data_type=b_type,
+        )
+        block_descale_a_cudnn_tensor = graph.tensor(
+            name="block_descale_a",
+            dim=a_descale_shape,
+            stride=a_descale_stride,
+            data_type=scale_type,
+            reordering_type=cudnn.tensor_reordering.F8_128x4,
+        )
+        block_descale_b_cudnn_tensor = graph.tensor(
+            name="block_descale_b",
+            dim=b_descale_shape,
+            stride=b_descale_stride,
+            data_type=scale_type,
+            reordering_type=cudnn.tensor_reordering.F8_128x4,
+        )
+
+        # Dequantize the input tensors
+        dequant_a_tensor = graph.block_scale_dequantize(
+            a_cudnn_tensor,
+            block_descale_a_cudnn_tensor,
+            block_size=[1, block_size],
+            name="dequant_a",
+        )
+        dequant_a_tensor.set_data_type(cudnn.data_type.FLOAT)
+        dequant_b_tensor = graph.block_scale_dequantize(
+            b_cudnn_tensor,
+            block_descale_b_cudnn_tensor,
+            block_size=[block_size, 1],
+            name="dequant_b",
+        )
+        dequant_b_tensor.set_data_type(cudnn.data_type.FLOAT)
+
+        # The actual matmul operation
+        c_tensor = graph.matmul(
+            dequant_a_tensor,
+            dequant_b_tensor,
+            compute_data_type=cudnn.data_type.FLOAT,
+            name="gemm",
+        )
+        c_tensor.set_data_type(cudnn.data_type.FLOAT)
+
+        # Output the dequantized result with the specified output dtype
+        c_tensor.set_output(True).set_data_type(o_type)
+        c_final_cudnn_tensor = c_tensor
+
+        a_cudnn_tensor.set_uid(UIDs.A_UID.value)
+        b_cudnn_tensor.set_uid(UIDs.B_UID.value)
+        block_descale_a_cudnn_tensor.set_uid(UIDs.BLOCK_DESCALE_A_UID.value)
+        block_descale_b_cudnn_tensor.set_uid(UIDs.BLOCK_DESCALE_B_UID.value)
+        c_final_cudnn_tensor.set_uid(UIDs.O_UID.value)
+
+        graph.validate()
+        graph.build_operation_graph()
+        graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.B])
+
+        return graph
+
+
+def _get_cudnn_mxfp8_gemm_graph(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    out_dtype: torch.dtype = torch.bfloat16,
+    out: Optional[torch.Tensor] = None,
+    block_size: int = 32,  # mxfp8 block size is 32
+    tactic: int = -1,
+):
+    graph = create_cudnn_execution_plans_mxfp8_gemm(
+        a_shape=a.shape,
+        a_stride=a.stride(),
+        b_shape=b.shape,
+        b_stride=b.stride(),
+        a_type=_torch_data_type_to_cudnn_data_type(a.dtype),
+        b_type=_torch_data_type_to_cudnn_data_type(b.dtype),
+        o_type=_torch_data_type_to_cudnn_data_type(out_dtype),
+        block_size=block_size,
+        device=a.device,
+    )
+
+    graph.check_support()
+    if tactic != -1:
+        graph.build_plan_at_index(tactic)
+    else:
+        graph.build_plans()
+    return graph
+
+
+def _cudnn_gemm_mxfp8(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_descale: torch.Tensor,
+    b_descale: torch.Tensor,
+    out_dtype: torch.dtype = torch.bfloat16,
+    out: Optional[torch.Tensor] = None,
+    workspace_buffer: torch.Tensor = None,
+    tactic: int = -1,
+):
+    # mxfp8 block size is 32
+    block_size = 32
+
+    # Graph should have been already cached, when we ran _cudnn_bmm_mxfp8_requirement
+    graph = _get_cudnn_mxfp8_gemm_graph(
+        a=a,
+        b=b,
+        out_dtype=out_dtype,
+        out=out,
+        block_size=block_size,
+        tactic=tactic,
+    )
+    # execute the mxfp8 cudnn graph
+    execute_cudnn_gemm_mxfp8_graph(
+        graph=graph,
+        a=a,
+        b=b,
+        a_descale=a_descale,
+        b_descale=b_descale,
+        c_final=out,
+        workspace_buffer=workspace_buffer,
+        tactic=tactic,
+    )
+
+
+def _cudnn_gemm_mxfp8_runner():
+    class CudnnMxfp8GemmRunner(TunableRunner):
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+        ) -> List[int]:
+            # TODO: check if this is correct
+            # cudnn has heuristic for mxfp8 gemm, so we only need to use the default tactic
+            return [0]
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic: int = -1,
+            do_preparation: bool = False,
+            **kwargs,
+        ) -> torch.Tensor:
+            a, b, scale_a, scale_b, out, workspace_buffer = inputs
+            _cudnn_gemm_mxfp8(
+                a=a,
+                b=b,
+                a_descale=scale_a,
+                b_descale=scale_b,
+                out=out,
+                out_dtype=out.dtype,
+                workspace_buffer=workspace_buffer,
+                tactic=tactic,
+            )
+            return out
+
+    return CudnnMxfp8GemmRunner()
+
+
+def mxfp8_gemm_sm100(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    out: torch.Tensor,
+    workspace_buffer: torch.Tensor,
+    runner_names: List[str],
+) -> None:
+    runners = []
+    if "cudnn" in runner_names:
+        runners.append(_cudnn_gemm_mxfp8_runner())
+    assert runners, "No suitable runners found"
+    tuner = AutoTuner.get()
+
+    inputs = [a, b, scale_a, scale_b, out, workspace_buffer]
+    runner, tactic = tuner.choose_one(
+        "mxfp8_gemm",  # TODO: check if this is correct
+        runners,
+        _FP8_GEMM_SM100_TUNING_CONFIG,  # TODO: check if this is correct
+        inputs,
+    )
+
+    runner(inputs=inputs, tactic=tactic)
+
+
+@supported_compute_capability([100, 103])
+def _cudnn_bmm_mxfp8_requirement(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    dtype: torch.dtype,
+    out: Optional[torch.Tensor] = None,
+    backend: Literal["cudnn"] = "cudnn",
+):
+    _check_cudnn_availability()
+    return True
+
+
+def _validate_mxfp8_output_dtype(dtype: torch.dtype):
+    """Validate that the output dtype is either bf16 or fp16."""
+    if dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(
+            f"Unsupported output dtype: {dtype}. "
+            f"Only torch.bfloat16 and torch.float16 are supported for MXFP8 GEMM operations."
+        )
+
+
+def _check_bmm_mxfp8_problem_size(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    dtype: torch.dtype,
+    out: Optional[torch.Tensor] = None,
+    backend: Literal["cudnn"] = "cudnn",
+):
+    # Check input tensors
+    if A.ndim != 3 or B.ndim != 3:
+        # A is [b, m, k], B is [b, k, n]
+        raise ValueError(f"bmm_mxfp8 accepts 3d tensors, got {A.shape=} and {B.shape=}")
+    if A.shape[2] != B.shape[1]:
+        raise ValueError(
+            f"K dimension (last dim of A) mismatch in bmm_mxfp8. got {A.shape=}, {B.shape=}"
+        )
+
+    _validate_mxfp8_output_dtype(dtype)
+    return True
+
+
+def _heuristic_func_bmm_mxfp8(
+    suitable_backends: List[str],
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    dtype: torch.dtype,
+    out: Optional[torch.Tensor] = None,
+    backend: Literal["cudnn"] = "cudnn",
+):
+    heuristic_backends = []
+    if CUDNN_AVAILABLE and "cudnn" in suitable_backends:
+        heuristic_backends.append("cudnn")
+    return heuristic_backends
+
+
+@backend_requirement(
+    {
+        "cudnn": _cudnn_bmm_mxfp8_requirement,
+    },
+    common_check=_check_bmm_mxfp8_problem_size,
+    heuristic_func=_heuristic_func_bmm_mxfp8,
+)
+@flashinfer_api
+def bmm_mxfp8(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    dtype: torch.dtype,
+    out: Optional[torch.Tensor] = None,
+    backend: Literal["cudnn"] = "cudnn",
+) -> torch.Tensor:
+    r"""BMM MXFP8
+
+    Parameters
+    ----------
+    A: torch.Tensor
+        Input tensor, shape (b, m, k), fp8 e4m3 or fp8 e5m2.
+
+    B: torch.Tensor
+        Mat2 tensor, shape (b, k, n), should be column major, fp8 e4m3 or fp8 e5m2.
+
+    A_scale: torch.Tensor
+        Scale tensor for A, uint8 (fp8 e8m0 format).
+
+    B_scale: torch.Tensor
+        Scale tensor for B, uint8 (fp8 e8m0 format).
+
+    dtype: torch.dtype
+        out dtype, bf16 or fp16.
+
+    out: Optional[torch.Tensor]
+        Out tensor, shape (b, m, n), bf16 or fp16, defaults to ``None``.
+
+    backend: Literal["cudnn"]
+        The backend to use for the operation. Defaults to ``"cudnn"``.
+
+    Returns
+    -------
+    out: torch.Tensor
+        Out tensor, shape (b, m, n), bf16 or fp16.
+    """
+
+    if backend != "cudnn":
+        raise ValueError(f"Invalid backend: {backend}")
+
+    if not CUDNN_AVAILABLE:
+        raise ValueError("cudnn is not available")
+
+    if out is None:
+        out = torch.empty(
+            (A.shape[0], A.shape[1], B.shape[2]),
+            device=A.device,
+            dtype=dtype,
+        )
+
+    workspace_buffer = _get_cache_buf(
+        "bmm_mxfp8_workspace", DEFAULT_WORKSPACE_SIZE, A.device
+    )
+
+    mxfp8_gemm_sm100(A, B, A_scale, B_scale, out, workspace_buffer, ["cudnn"])
     return out

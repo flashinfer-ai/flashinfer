@@ -63,6 +63,7 @@ from .utils import (
     _get_range_buf,
     _unpack_paged_kv_cache,
     canonicalize_torch_dtype,
+    determine_attention_backend,
     device_support_pdl,
     get_device_sm_count,
     is_float8,
@@ -706,7 +707,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             Only needed when ``use_cuda_graph`` is ``True``.
 
         backend : str
-            The implementation backend, could be ``auto``/``fa2`` or ``trtllm-gen``. Defaults to ``auto``.
+            The implementation backend, could be ``auto``/``fa2``/``fa3`` or ``trtllm-gen``. Defaults to ``auto``.
             If set to ``auto``, the wrapper will automatically choose the backend based on the
             device architecture and kernel availability.
 
@@ -721,7 +722,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 self._jit_module = get_batch_prefill_jit_module(
                     jit_args[0],
                     gen_customize_batch_prefill_module(
-                        "fa2", *jit_args
+                        backend, *jit_args
                     ).build_and_load(),
                 )
             else:
@@ -834,6 +835,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         logits_soft_cap: Optional[float] = None,
         q_data_type: Optional[Union[str, torch.dtype]] = "float16",
         kv_data_type: Optional[Union[str, torch.dtype]] = None,
+        o_data_type: Optional[Union[str, torch.dtype]] = None,
         data_type: Optional[Union[str, torch.dtype]] = None,
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
@@ -881,6 +883,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
         kv_data_type : Optional[Union[str, torch.dtype]]
             The data type of the key/value tensor. If None, will be set to
             ``q_data_type``. Defaults to ``None``.
+        o_data_type : Optional[Union[str, torch.dtype]]
+            The data type of the output tensor. If None, will be set to :attr:`q_data_type`.
+            For FP8 inputs, this should typically be set to torch.float16 or torch.bfloat16.
         data_type: Optional[Union[str, torch.dtype]]
             The data type of both the query and key/value tensors. Defaults to torch.float16.
             data_type is deprecated, please use q_data_type and kv_data_type instead.
@@ -966,6 +971,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
         if kv_data_type is None:
             kv_data_type = q_data_type
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
+        if o_data_type is None:
+            o_data_type = q_data_type
+        o_data_type = canonicalize_torch_dtype(o_data_type)
+
         if fixed_split_size is not None and not self.use_tensor_cores:
             raise ValueError(
                 "fixed_split_size is only supported by tensor core decode for now."
@@ -975,6 +984,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         self._cached_q_data_type = q_data_type
         self._cached_kv_data_type = kv_data_type
+        self._cached_o_data_type = o_data_type
         self._batch_size = batch_size
         self._num_qo_heads = num_qo_heads
         self._num_kv_heads = num_kv_heads
@@ -1014,7 +1024,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._cached_module = get_trtllm_gen_decode_module(
                 q_data_type,
                 kv_data_type,
-                q_data_type,
+                o_data_type,
                 indptr.dtype,
                 head_dim,
                 head_dim,
@@ -1029,11 +1039,20 @@ class BatchDecodeWithPagedKVCacheWrapper:
             if self._jit_module is not None:
                 self._cached_module = self._jit_module
             else:
+                if self._backend == "auto":
+                    self._backend = determine_attention_backend(
+                        self.device,
+                        PosEncodingMode[pos_encoding_mode].value,
+                        False,  # use_fp16_qk_reduction
+                        False,  # use_custom_mask
+                        q_data_type,
+                        kv_data_type,
+                    )
                 self._cached_module = get_batch_prefill_module(
-                    "fa2",
+                    self._backend,
                     q_data_type,
                     kv_data_type,
-                    q_data_type,
+                    o_data_type,
                     indptr.dtype,
                     head_dim,  # head_dim_qk
                     head_dim,  # head_dim_vo
@@ -1043,7 +1062,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     False,  # use_fp16_qk_reduction
                 )
 
-            self._plan_info = self._cached_module.plan(
+            args = [
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
                 self._pin_memory_int_workspace_buffer,
@@ -1060,9 +1079,13 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 head_dim,
                 False,  # causal
                 window_left,
-                fixed_split_size,
-                disable_split_kv,
-                0,  # num_colocated_ctas
+            ]
+            if self._backend == "fa2":
+                args.append(fixed_split_size)
+                args.append(disable_split_kv)
+                args.append(0)  # num_colocated_ctas
+            self._plan_info = self._cached_module.plan(
+                *args,
             )
         else:
             if self._jit_module is not None:
@@ -1071,7 +1094,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 self._cached_module = get_batch_decode_module(
                     q_data_type,
                     kv_data_type,
-                    q_data_type,
+                    o_data_type,
                     indptr.dtype,
                     head_dim,  # head_dim_qk
                     head_dim,  # head_dim_vo
@@ -1281,9 +1304,13 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 )
 
         if out is None:
-            out = torch.empty_like(q)
+            out_dtype = getattr(self, "_cached_o_data_type", None) or q.dtype
+            out = torch.empty(
+                q.shape[:-1] + v_cache.shape[-1:], dtype=out_dtype, device=q.device
+            )
         else:
-            check_shape_dtype_device(out, q.shape, q.dtype, q.device, "out")
+            out_dtype = getattr(self, "_cached_o_data_type", None) or q.dtype
+            check_shape_dtype_device(out, q.shape, out_dtype, q.device, "out")
 
         if self._backend == "trtllm-gen":
             q = q.view(q.size(0) // q_len_per_req, q_len_per_req, q.size(1), q.size(2))
@@ -1311,6 +1338,14 @@ class BatchDecodeWithPagedKVCacheWrapper:
             if self._jit_module is not None:
                 run_args.extend(list(args))
             else:
+                # Extract FP8 scale tensors from *args if q is FP8
+                fp8_scale_q = None
+                fp8_scale_k = None
+                fp8_scale_v = None
+                if is_float8(q) and len(args) >= 3:
+                    fp8_scale_q = args[0]
+                    fp8_scale_k = args[1]
+                    fp8_scale_v = args[2]
                 run_args += [
                     None,  # packed_custom_mask
                     None,  # mask_indptr_buf
@@ -1320,9 +1355,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     None,  # maybe_max_item_len_ptr
                     logits_soft_cap,
                     sm_scale,
-                    None,  # scale_q, not supported yet
-                    None,  # scale_k
-                    None,  # scale_v
+                    fp8_scale_q,
+                    fp8_scale_k,
+                    fp8_scale_v,
                     rope_scale,
                     rope_theta,
                     0,  # token_pos_in_items_len
@@ -1375,7 +1410,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 ]
 
             self._cached_module.run(*run_args)
-        if v_scale is not None:
+
+        is_float_one = isinstance(v_scale, float) and v_scale == 1.0
+        if v_scale is not None and not is_float_one:
             # TODO(Zihao): fused into kernel
             if is_float8(out):
                 out = (out.to(torch.float32) * v_scale).to(out.dtype)
@@ -1895,27 +1932,35 @@ class TrtllmGenDecodeModule:
         if isinstance(bmm2_scale, torch.Tensor):
             assert bmm2_scale.dtype == torch.float32
 
+        assert len(query.size()) == 4
+        batch_size = query.size(0)
+        max_q_len = query.size(1)
+        query = query.flatten(0, 1)  # [B*S, H, D]
+
         self._op.trtllm_paged_attention_decode(
             out,
             None,  # fp4 output not supported in wrapper api yet.
-            query,  # [B, S, H, D], w/ MTP here so second dim is S
+            query,  # [B * S, H, D], w/ MTP here so S dim is > 1
             k_cache,
             v_cache,
             workspace_buffer,
             block_tables,
             seq_lens,
+            max_q_len,
             max_seq_len,
             bmm1_scale,
             bmm2_scale,
             -1,  # o_sf_scale
             -1,  # o_sf_vec_size
             0,  # o_sf_start_index
+            batch_size,
             window_left,
             0,  # sparse_mla_top_k
             self._sm_count,
             enable_pdl,
             workspace_size,
             sinks,
+            None,  # cum_seq_lens_q
         )
         return out
 
@@ -2077,12 +2122,14 @@ def trtllm_batch_decode_with_kv_cache(
     q_len_per_req: Optional[int] = 1,
     o_scale: Optional[float] = 1.0,
     mask: Optional[torch.Tensor] = None,
+    max_q_len: Optional[int] = None,
+    cum_seq_lens_q: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, FP4Tensor]:
     """
     Parameters
     ----------
     query : torch.Tensor
-        query tensor with shape [num_tokens, num_heads, head_dim], num_tokens = batch_size * q_len_per_request
+        query tensor with shape [num_tokens, num_heads, head_dim], num_tokens = total query tokens in the batch.
 
     kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
         If kv_cache is a single tensor, it should be a tensor with shape [num_pages, 1 or 2, num_kv_heads, page_size, head_dim] if :attr:`kv_layout` is ``HND``,
@@ -2150,6 +2197,16 @@ def trtllm_batch_decode_with_kv_cache(
     mask : Optional[torch.Tensor] = None
         causal attention mask for xqa speculative decoding.
 
+    max_q_len: Optional[int] = None
+        The maximum query sequence length across all requests when using variable-length queries.
+        Only supported by trtllm-gen backend. Must be provided together with ``cum_seq_lens_q``.
+        When None, all requests use uniform query length specified by ``q_len_per_req``.
+
+    cum_seq_lens_q : Optional[torch.Tensor] = None
+        Cumulative query sequence lengths for variable-length query support, shape: ``[batch_size + 1]``, dtype: ``torch.int32``.
+        Only supported by trtllm-gen backend. Must be provided together with ``max_q_len``.
+        When None, all requests use uniform query length specified by ``q_len_per_req``.
+
     Returns
     -------
     out : Union[torch.Tensor, FP4Tensor]
@@ -2181,6 +2238,8 @@ def trtllm_batch_decode_with_kv_cache(
             raise ValueError("xqa backend does not support nvfp4 output")
         if o_sf_scale is not None or o_sf_vec_size is not None:
             raise ValueError("xqa backend does not support o_sf_scale or o_sf_vec_size")
+        if max_q_len is not None or cum_seq_lens_q is not None:
+            raise ValueError("xqa backend does not support cum_seq_lens_q")
 
         # Handle out and out_dtype
         if out_dtype is None:
@@ -2297,32 +2356,37 @@ def trtllm_batch_decode_with_kv_cache(
         if isinstance(bmm2_scale, torch.Tensor):
             assert bmm2_scale.dtype == torch.float32
 
+        if q_len_per_req is not None:
+            max_q_len = q_len_per_req
+            batch_size = query.size(0) // q_len_per_req
+        else:
+            assert max_q_len is not None
+            batch_size = cum_seq_lens_q.size(0) - 1
+
         run_func(
             out,
             out_scale_factor,
-            query.view(
-                query.size(0) // q_len_per_req,
-                q_len_per_req,
-                query.size(1),
-                query.size(2),
-            ),
+            query,
             k_cache,
             v_cache,
             workspace_buffer,
             block_tables,
             seq_lens,
+            max_q_len,
             max_seq_len,
             bmm1_scale,
             bmm2_scale,
             o_sf_scale or -1.0,
             o_sf_vec_size or -1,
             o_sf_start_index,
+            batch_size,
             window_left,
             0,  # sparse_mla_top_k
             sm_count,
             enable_pdl,
             workspace_buffer.numel() * workspace_buffer.element_size(),
             sinks,
+            cum_seq_lens_q,
         )
 
         return (
@@ -2597,8 +2661,8 @@ def fast_decode_plan(
             kv_lens_arr_host = get_seq_lens(indptr_host, last_page_len_host, page_size)
 
             try:
-                # Make sure we pass exactly 16 arguments for tensor core version
-                self._plan_info = self._cached_module.plan(
+                # Make sure we pass exactly 19 arguments for fa2 backend and 16 arguments for fa3 backend
+                args = [
                     self._float_workspace_buffer,
                     self._int_workspace_buffer,
                     self._pin_memory_int_workspace_buffer,
@@ -2615,9 +2679,13 @@ def fast_decode_plan(
                     head_dim,
                     False,  # causal
                     window_left,
-                    fixed_split_size,
-                    disable_split_kv,
-                    0,  # num_colocated_ctas
+                ]
+                if self._backend == "fa2":
+                    args.append(fixed_split_size)
+                    args.append(disable_split_kv)
+                    args.append(0)  # num_colocated_ctas
+                self._plan_info = self._cached_module.plan(
+                    *args,
                 )
             except Exception as e:
                 raise RuntimeError(f"Error in standard plan: {e}") from e

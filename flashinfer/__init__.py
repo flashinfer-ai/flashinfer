@@ -84,8 +84,10 @@ from .fused_moe import (
     trtllm_fp8_block_scale_moe,
     trtllm_fp8_per_tensor_scale_moe,
 )
+from .gdn_prefill import chunk_gated_delta_rule as chunk_gated_delta_rule
 from .gemm import SegmentGEMMWrapper as SegmentGEMMWrapper
 from .gemm import bmm_fp8 as bmm_fp8
+from .gemm import bmm_mxfp8 as bmm_mxfp8
 from .gemm import mm_fp4 as mm_fp4
 from .gemm import mm_fp8 as mm_fp8
 from .gemm import tgv_gemm_sm100 as tgv_gemm_sm100
@@ -95,6 +97,9 @@ from .norm import layernorm as layernorm
 from .norm import gemma_fused_add_rmsnorm as gemma_fused_add_rmsnorm
 from .norm import gemma_rmsnorm as gemma_rmsnorm
 from .norm import rmsnorm as rmsnorm
+
+from .norm import rmsnorm_fp4quant as rmsnorm_fp4quant
+from .norm import add_rmsnorm_fp4quant as add_rmsnorm_fp4quant
 from .page import append_paged_kv_cache as append_paged_kv_cache
 from .page import append_paged_mla_kv_cache as append_paged_mla_kv_cache
 from .page import get_batch_indices_positions as get_batch_indices_positions
@@ -143,6 +148,8 @@ from .sampling import top_p_renorm_probs as top_p_renorm_probs
 from .sampling import top_p_sampling_from_probs as top_p_sampling_from_probs
 from . import topk as topk
 from .topk import top_k as top_k
+from .topk import top_k_page_table_transform as top_k_page_table_transform
+from .topk import top_k_ragged_transform as top_k_ragged_transform
 from .sparse import BlockSparseAttentionWrapper as BlockSparseAttentionWrapper
 from .sparse import (
     VariableBlockSparseAttentionWrapper as VariableBlockSparseAttentionWrapper,

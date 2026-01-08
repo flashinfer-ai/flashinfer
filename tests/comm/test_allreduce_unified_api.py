@@ -5,10 +5,10 @@ from typing import Tuple
 
 import pytest
 import torch
-import torch.distributed as dist
 from mpi4py import MPI
 
 import flashinfer.comm.trtllm_mnnvl_ar as trtllm_mnnvl_ar
+from flashinfer.comm.mnnvl import TorchDistBackend
 
 # Unified API imports
 from flashinfer.comm import (
@@ -197,23 +197,17 @@ def run_allreduce_test(
     local_rank = rank % gpus_per_node
     torch.cuda.set_device(local_rank)
 
-    # Initialize torch.distributed for trtllm backend (needed for IPC workspace)
-    # TODO: check if it is ok to do this with auto backend
-    process_group = None
-    if backend in ("trtllm", "auto"):
-        init_torch_distributed_from_mpi()
-        process_group = dist.group.WORLD
-
     if local_rank == 0:
         print(f"Running AllReduce test with {world_size} ranks, backend={backend}")
         print(f"Rank {rank} using GPU {torch.cuda.current_device()}")
 
     eps = 1e-5
-    torch.manual_seed(42 + rank)
+    torch.manual_seed(0)
 
     workspace = None
 
     try:
+        init_torch_distributed_from_mpi()
         # Create workspace using unified API
         workspace = create_allreduce_fusion_workspace(
             backend=backend,
@@ -222,9 +216,8 @@ def run_allreduce_test(
             max_token_num=max(seq_lens),
             hidden_dim=hidden_size,
             dtype=dtype,
-            topology="single_node",
             gpus_per_node=gpus_per_node,
-            process_group=process_group,
+            comm_backend=TorchDistBackend(),
         )
 
         print(f"Rank {rank}: Created workspace with backend={workspace.backend}")

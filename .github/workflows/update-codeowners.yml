@@ -73,10 +73,6 @@ jobs:
             chore: update CODEOWNERS based on git history
 
             Auto-generated CODEOWNERS update based on commit activity over the last ${{ env.DAYS_BACK }} days.
-
-            🤖 Generated with [Claude Code](https://claude.com/claude-code)
-
-            Co-Authored-By: Claude <noreply@anthropic.com>
           branch: auto-update-codeowners
           base: main
           delete-branch: true

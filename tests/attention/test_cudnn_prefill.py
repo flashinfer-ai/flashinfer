@@ -202,8 +202,8 @@ def test_cudnn_prefill_fp8(
     return_lse,
     is_cuda_graph_compatible,
 ):
-    if cudnn.backend_version() < 91800:
-        pytest.skip("cuDNN backend version is less than 9.18.0, skipping test")
+    if cudnn.backend_version() < 91701:
+        pytest.skip("cuDNN backend version is less than 9.17.1, skipping test")
 
     head_dim = 128
     if s_qo > s_kv:
