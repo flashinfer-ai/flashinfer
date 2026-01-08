@@ -1904,7 +1904,7 @@ def get_trtllm_fmha_v2_module(
 
     return gen_trtllm_fmha_v2_sm90_module(
         dtype_q, seq_len, head_dim_qk, use_logits_soft_cap
-    )
+    ).build_and_load()
 
 
 def gen_trtllm_fmha_v2_sm120_module(device: torch.device) -> JitSpec:
@@ -2047,7 +2047,7 @@ def gen_fmha_v2_module(
     fmha_v2_src_dir = jit_env.FLASHINFER_CSRC_DIR / "fmha_v2"
 
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[11, 12]
+        supported_major_versions=[9]
     )
     nvcc_flags.extend(
         [
