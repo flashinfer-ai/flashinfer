@@ -56,10 +56,9 @@ __global__ void routingMainKernel(KernelParams params) {
     }
   }
 
-  // note that for invalid scores, we simply use a negative value:
-  // they work well even with the compacted format used in topK, and
-  // sigmoid / bias activated scores cannot be negative
-  static constexpr float invalidScoreFloat = -1.F;
+  // note that for invalid scores, we use a very negative value:
+  // needed for GLM-style routing where bias can be negative
+  static constexpr float invalidScoreFloat = -1e10F;
   const OutputT invalidScore = OutputT{invalidScoreFloat};
 
   // load bias already; each warp represents one expert group
@@ -101,8 +100,7 @@ __global__ void routingMainKernel(KernelParams params) {
       smemScoreSigmoid[threadExpert] = scoreSigmoid;
     }
     // get the score with bias
-    // note that with invalid values, because sigmoid is < 1 and bias is -1,
-    // we must get a negative value, which is smaller than any valid value
+    // note: with invalid values, invalidScoreFloat ensures values are always smaller than valid ones
     auto scoreBias = float{scoreSigmoid + float{biasVal}};
 
     if (expertSelected) {
