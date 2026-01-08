@@ -8,7 +8,15 @@ from .selective_state_update_triton import selective_state_update_triton
 
 
 def create_test_inputs(
-    batch_size, nheads, dim, dstate, ngroups, input_dtype, weight_dtype, matrixA_dtype, z_none=True
+    batch_size,
+    nheads,
+    dim,
+    dstate,
+    ngroups,
+    input_dtype,
+    weight_dtype,
+    matrixA_dtype,
+    z_none=True,
 ):
     # Set seed for reproducibility
     torch.manual_seed(0)
@@ -53,7 +61,11 @@ def create_test_inputs(
     ]
 
     # Create z tensor if z_none is False
-    z = None if z_none else torch.randn(batch_size, nheads, dim, dtype=input_dtype, device=device)
+    z = (
+        None
+        if z_none
+        else torch.randn(batch_size, nheads, dim, dtype=input_dtype, device=device)
+    )
 
     return {
         "state_cache": state_cache,
