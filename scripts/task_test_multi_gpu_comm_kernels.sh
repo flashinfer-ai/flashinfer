@@ -5,6 +5,9 @@ set -eo pipefail
 # Get the directory where this script is located
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Set MPI command prefix for multi-GPU tests
+: ${PYTEST_COMMAND_PREFIX:="mpirun -np 4"}
+
 # Source common test functions
 source "${SCRIPT_DIR}/common_test_functions.sh"
 
@@ -26,7 +29,7 @@ main() {
     install_and_verify
 
     # Print test files
-    echo "Multi-GPU comm kernel test files:"
+    echo "Multi-GPU comm kernel test files (running with: ${PYTEST_COMMAND_PREFIX}):"
     for test_file in $TEST_FILES; do
         echo "  $test_file"
     done

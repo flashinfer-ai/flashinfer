@@ -16,6 +16,9 @@ fi
 # Pytest configuration flags
 PYTEST_FLAGS="--continue-on-collection-errors -s"
 
+# Command prefix for pytest (e.g., "mpirun -np 4" for multi-GPU tests)
+: ${PYTEST_COMMAND_PREFIX:=""}
+
 # Global variables for test execution
 FAILED_TESTS=""
 TOTAL_TESTS=0
@@ -151,7 +154,7 @@ dry_run_full_file() {
     TOTAL_TESTS=$((TOTAL_TESTS + 1))
     JUNIT_FILENAME="${test_file//\//_}.xml"
     JUNIT_FLAG="--junitxml=${JUNIT_DIR}/${JUNIT_FILENAME}"
-    echo "$TOTAL_TESTS. pytest $PYTEST_FLAGS ${JUNIT_FLAG} \"${test_file}\""
+    echo "$TOTAL_TESTS. ${PYTEST_COMMAND_PREFIX} pytest $PYTEST_FLAGS ${JUNIT_FLAG} \"${test_file}\""
 }
 
 # Print dry run summary
@@ -242,7 +245,7 @@ run_sanity_test_file() {
     # Run pytest with the sampled node IDs
     TOTAL_TESTS=$((TOTAL_TESTS + 1))
 
-    if pytest $PYTEST_FLAGS "${JUNIT_FLAG}" "${SAMPLED_NODE_IDS_ARRAY[@]}"; then
+    if ${PYTEST_COMMAND_PREFIX} pytest $PYTEST_FLAGS "${JUNIT_FLAG}" "${SAMPLED_NODE_IDS_ARRAY[@]}"; then
         echo "✅ PASSED: $test_file ($SAMPLED_IN_FILE/$TOTAL_IN_FILE tests)"
         PASSED_TESTS=$((PASSED_TESTS + 1))
     else
@@ -261,12 +264,12 @@ run_full_test_file() {
     echo "=========================================="
     JUNIT_FILENAME="${test_file//\//_}.xml"
     JUNIT_FLAG="--junitxml=${JUNIT_DIR}/${JUNIT_FILENAME}"
-    echo "Running: pytest $PYTEST_FLAGS ${JUNIT_FLAG} \"${test_file}\""
+    echo "Running: ${PYTEST_COMMAND_PREFIX} pytest $PYTEST_FLAGS ${JUNIT_FLAG} \"${test_file}\""
     echo "=========================================="
 
     TOTAL_TESTS=$((TOTAL_TESTS + 1))
 
-    if pytest $PYTEST_FLAGS "${JUNIT_FLAG}" "${test_file}"; then
+    if ${PYTEST_COMMAND_PREFIX} pytest $PYTEST_FLAGS "${JUNIT_FLAG}" "${test_file}"; then
         echo "✅ PASSED: $test_file"
         PASSED_TESTS=$((PASSED_TESTS + 1))
     else
