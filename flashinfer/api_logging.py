@@ -17,12 +17,11 @@ limitations under the License.
 import enum
 import functools
 import inspect
-import json
 import logging
 import os
 import sys
 import uuid
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional
 import contextlib
 import torch
 
@@ -50,8 +49,15 @@ _BENCH_LOG_ENABLED = os.environ.get("FLASHINFER_BENCH_LOG", "0").lower() in (
     "true",
     "yes",
 )
+# Default bench log directory is under the flashinfer package directory
+_FLASHINFER_DIR = os.path.dirname(os.path.abspath(__file__))
+_DEFAULT_BENCH_LOG_DIR = os.path.join(_FLASHINFER_DIR, ".flashinfer_bench_cache")
 _BENCH_LOG_DIR = _substitute_process_id(
-    os.environ.get("FLASHINFER_BENCH_LOG_DIR", ".flashinfer_bench_cache")
+    os.environ.get("FLASHINFER_BENCH_LOG_DIR", _DEFAULT_BENCH_LOG_DIR)
+)
+# Maximum file size for bench dump (default: 10GB)
+_BENCH_MAX_FILE_SIZE = int(
+    os.environ.get("MAX_FLASHINFER_BENCH_DUMP_FILE_SIZE", str(10 * 1024 * 1024 * 1024))
 )
 
 # Create logger using Python's logging library
@@ -473,6 +479,157 @@ def _log_function_outputs(func_name: str, result: Any, level: int) -> None:
     _logger.debug("\n".join(lines))
 
 
+# =============================================================================
+# Bench Logging Functions (for flashinfer-bench workload dumping)
+# =============================================================================
+
+
+def _sanitize_api_name(func_name: str) -> str:
+    """
+    Sanitize API name to create a valid directory name.
+
+    Replaces dots and other special characters with underscores.
+    """
+    # Replace dots (from class.method) and other special chars with underscores
+    sanitized = func_name.replace(".", "_").replace("-", "_")
+    # Remove any other non-alphanumeric characters except underscore
+    sanitized = "".join(c if c.isalnum() or c == "_" else "_" for c in sanitized)
+    return sanitized
+
+
+def _dump_workload(
+    func: Callable, func_name: str, args: tuple, kwargs: dict
+) -> Optional[str]:
+    """
+    Dump all function arguments to a safetensors file.
+
+    Saves all tensor and scalar arguments to a safetensors file named by UUID,
+    organized under a folder named by the function.
+
+    Directory structure:
+        FLASHINFER_BENCH_LOG_DIR/
+            function_name/
+                <uuid>.safetensors
+                <uuid>.safetensors
+                ...
+
+    Parameters
+    ----------
+    func : Callable
+        The function being called
+    func_name : str
+        Name of the function (may include class name)
+    args : tuple
+        Positional arguments
+    kwargs : dict
+        Keyword arguments
+
+    Returns
+    -------
+    Optional[str]
+        Path to the safetensors file, or None if dumping failed
+    """
+    try:
+        from safetensors.torch import save_file
+    except ImportError:
+        _logger.warning(
+            "[BENCH LOG] safetensors not installed, skipping workload dump. "
+            "Install with: pip install safetensors"
+        )
+        return None
+
+    try:
+        # Create function-specific directory
+        sanitized_name = _sanitize_api_name(func_name)
+        func_dir = os.path.join(_BENCH_LOG_DIR, sanitized_name)
+        os.makedirs(func_dir, exist_ok=True)
+
+        # Get parameter names from function signature
+        try:
+            sig = inspect.signature(func)
+            param_names = list(sig.parameters.keys())
+        except Exception:
+            param_names = [f"arg{i}" for i in range(len(args))]
+
+        # Collect all tensors to save
+        tensors_to_save: Dict[str, torch.Tensor] = {}
+
+        # Process positional arguments
+        for i, arg in enumerate(args):
+            param_name = param_names[i] if i < len(param_names) else f"arg{i}"
+            _collect_tensors(arg, param_name, tensors_to_save)
+
+        # Process keyword arguments
+        for key, value in kwargs.items():
+            _collect_tensors(value, key, tensors_to_save)
+
+        if not tensors_to_save:
+            _logger.debug(f"[BENCH LOG] No tensors to dump for {func_name}")
+            return None
+
+        # Estimate file size (sum of tensor bytes)
+        estimated_size = sum(
+            tensor.numel() * tensor.element_size()
+            for tensor in tensors_to_save.values()
+            if tensor is not None
+        )
+
+        # Skip if estimated size exceeds limit
+        if estimated_size > _BENCH_MAX_FILE_SIZE:
+            _logger.debug(
+                f"[BENCH LOG] Skipping dump for {func_name}: estimated size "
+                f"{estimated_size / (1024**3):.2f}GB exceeds limit "
+                f"{_BENCH_MAX_FILE_SIZE / (1024**3):.2f}GB"
+            )
+            return None
+
+        # Move tensors to CPU for saving
+        cpu_tensors = {
+            key: tensor.detach().cpu()
+            for key, tensor in tensors_to_save.items()
+            if tensor is not None
+        }
+
+        # Generate UUID and save
+        file_uuid = uuid.uuid4().hex
+        file_path = os.path.join(func_dir, f"{file_uuid}.safetensors")
+        save_file(cpu_tensors, file_path)
+
+        return file_path
+
+    except Exception as e:
+        _logger.warning(f"[BENCH LOG] Failed to dump workload for {func_name}: {e}")
+        return None
+
+
+def _collect_tensors(
+    value: Any, name: str, tensors: Dict[str, torch.Tensor]
+) -> None:
+    """
+    Recursively collect tensors from a value into the tensors dict.
+
+    Parameters
+    ----------
+    value : Any
+        The value to extract tensors from
+    name : str
+        The parameter name (used as key prefix)
+    tensors : Dict[str, torch.Tensor]
+        Dictionary to collect tensors into (modified in place)
+    """
+    if value is None:
+        return
+
+    if isinstance(value, torch.Tensor):
+        tensors[name] = value
+    elif isinstance(value, (list, tuple)):
+        for i, item in enumerate(value):
+            _collect_tensors(item, f"{name}_{i}", tensors)
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            _collect_tensors(item, f"{name}_{key}", tensors)
+
+
 def flashinfer_api(func: Callable = None) -> Callable:
     """
     Decorator to FlashInfer's APIs.
@@ -502,14 +659,18 @@ def flashinfer_api(func: Callable = None) -> Callable:
     FLASHINFER_BENCH_LOG : str (default: "0")
         - "0", "false", "no": Disable workload dumping (zero overhead)
         - "1", "true", "yes": Enable workload dumping
-        When enabled, dumps API input arguments to files for later replay/benchmarking.
-        Creates:
-        - Safetensors files containing tensor arguments
-        - JSONL log files with workload metadata and references to tensors
+        When enabled, dumps all function tensor arguments to safetensors files.
+        Files are organized by function name and named by UUID:
+            FLASHINFER_BENCH_LOG_DIR/function_name/<uuid>.safetensors
 
-    FLASHINFER_BENCH_LOG_DIR : str (default: ".flashinfer_bench_cache")
-        Directory where workload dump files are saved.
+    FLASHINFER_BENCH_LOG_DIR : str (default: "<flashinfer_package>/.flashinfer_bench_cache")
+        Directory where workload safetensors files are saved.
+        By default, the cache is placed under the flashinfer package directory.
         - Use %i in path for process ID substitution (e.g., "bench_%i/" -> "bench_12345/")
+
+    MAX_FLASHINFER_BENCH_DUMP_FILE_SIZE : int (default: 10737418240, i.e., 10GB)
+        Maximum estimated file size in bytes for workload dumps.
+        Workloads exceeding this size will be skipped.
 
     Examples
     --------
@@ -543,9 +704,9 @@ def flashinfer_api(func: Callable = None) -> Callable:
     - The %i pattern is automatically replaced with the process ID for multi-process environments.
     - The logger does not propagate to the root logger to avoid duplicate logs.
     - **Workload Dumping**: When FLASHINFER_BENCH_LOG=1, all tensor arguments are saved to
-      safetensors files and metadata is written to JSONL files. This enables workload replay
-      for benchmarking and testing. The dumped workloads can be loaded using the safetensors
-      library and the JSONL metadata files.
+      safetensors files organized by function name (e.g., "func_name/<uuid>.safetensors").
+      Each API call creates a new safetensors file containing all input tensors.
+      Requires the safetensors package: pip install safetensors
     """
     # If both logging and bench logging are disabled, return original function with zero overhead
     if _API_LOG_LEVEL == 0 and not _BENCH_LOG_ENABLED:
