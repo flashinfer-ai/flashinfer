@@ -51,6 +51,8 @@ def level10_environment(tmp_path):
         "FLASHINFER_LOGLEVEL": os.environ.get("FLASHINFER_LOGLEVEL"),
         "FLASHINFER_LOGDEST": os.environ.get("FLASHINFER_LOGDEST"),
         "FLASHINFER_DUMP_DIR": os.environ.get("FLASHINFER_DUMP_DIR"),
+        "FLASHINFER_DUMP_INCLUDE": os.environ.get("FLASHINFER_DUMP_INCLUDE"),
+        "FLASHINFER_DUMP_EXCLUDE": os.environ.get("FLASHINFER_DUMP_EXCLUDE"),
     }
 
     # Set up test environment
@@ -60,6 +62,11 @@ def level10_environment(tmp_path):
     os.environ["FLASHINFER_DUMP_DIR"] = str(dump_dir)
     os.environ["FLASHINFER_DUMP_MAX_COUNT"] = "1000"
     os.environ["FLASHINFER_DUMP_MAX_SIZE_GB"] = "10"
+    # Clear any existing filters
+    if "FLASHINFER_DUMP_INCLUDE" in os.environ:
+        del os.environ["FLASHINFER_DUMP_INCLUDE"]
+    if "FLASHINFER_DUMP_EXCLUDE" in os.environ:
+        del os.environ["FLASHINFER_DUMP_EXCLUDE"]
 
     # Force reimport to pick up new environment variables
     _clean_flashinfer_modules()
@@ -346,6 +353,356 @@ def test_cli_replay(level10_environment):
     assert "Replaying session from" in result.output
     assert "Passed" in result.output
     assert "Summary: 1 passed" in result.output
+
+
+# =============================================================================
+# Tests for FLASHINFER_DUMP_INCLUDE / FLASHINFER_DUMP_EXCLUDE filtering
+# =============================================================================
+
+
+def test_dump_include_filter(tmp_path):
+    """Test that FLASHINFER_DUMP_INCLUDE only dumps matching functions."""
+    # Store original environment
+    original_env = {
+        "FLASHINFER_LOGLEVEL": os.environ.get("FLASHINFER_LOGLEVEL"),
+        "FLASHINFER_LOGDEST": os.environ.get("FLASHINFER_LOGDEST"),
+        "FLASHINFER_DUMP_DIR": os.environ.get("FLASHINFER_DUMP_DIR"),
+        "FLASHINFER_DUMP_INCLUDE": os.environ.get("FLASHINFER_DUMP_INCLUDE"),
+        "FLASHINFER_DUMP_EXCLUDE": os.environ.get("FLASHINFER_DUMP_EXCLUDE"),
+    }
+
+    try:
+        # Set up environment with include filter for decode only
+        dump_dir = tmp_path / "test_dumps_include"
+        os.environ["FLASHINFER_LOGLEVEL"] = "10"
+        os.environ["FLASHINFER_LOGDEST"] = "stdout"
+        os.environ["FLASHINFER_DUMP_DIR"] = str(dump_dir)
+        os.environ["FLASHINFER_DUMP_INCLUDE"] = "*decode*"
+        if "FLASHINFER_DUMP_EXCLUDE" in os.environ:
+            del os.environ["FLASHINFER_DUMP_EXCLUDE"]
+
+        # Force reimport
+        _clean_flashinfer_modules()
+
+        from flashinfer import single_decode_with_kv_cache, single_prefill_with_kv_cache
+
+        # Test configuration
+        kv_len = 128
+        num_qo_heads, num_kv_heads = 32, 8
+        head_dim = 128
+
+        # Call decode (should be dumped)
+        q = torch.randn(num_qo_heads, head_dim, device="cuda", dtype=torch.float16)
+        k = torch.randn(
+            kv_len, num_kv_heads, head_dim, device="cuda", dtype=torch.float16
+        )
+        v = torch.randn(
+            kv_len, num_kv_heads, head_dim, device="cuda", dtype=torch.float16
+        )
+        single_decode_with_kv_cache(q, k, v)
+
+        # Call prefill (should NOT be dumped due to include filter)
+        qo_len = 64
+        q_prefill = torch.randn(
+            qo_len, num_qo_heads, head_dim, device="cuda", dtype=torch.float16
+        )
+        k_prefill = torch.randn(
+            kv_len, num_kv_heads, head_dim, device="cuda", dtype=torch.float16
+        )
+        v_prefill = torch.randn(
+            kv_len, num_kv_heads, head_dim, device="cuda", dtype=torch.float16
+        )
+        single_prefill_with_kv_cache(q_prefill, k_prefill, v_prefill)
+
+        # Check that only decode was dumped
+        dump_dirs = list(dump_dir.iterdir()) if dump_dir.exists() else []
+        assert len(dump_dirs) == 1, f"Expected 1 dump, found {len(dump_dirs)}"
+
+        # Verify the dump is for decode
+        dump_name = dump_dirs[0].name
+        assert "decode" in dump_name.lower(), f"Expected decode dump, got {dump_name}"
+
+    finally:
+        # Restore environment
+        for key, value in original_env.items():
+            if value is not None:
+                os.environ[key] = value
+            elif key in os.environ:
+                del os.environ[key]
+        _clean_flashinfer_modules()
+
+
+def test_dump_exclude_filter(tmp_path):
+    """Test that FLASHINFER_DUMP_EXCLUDE skips matching functions."""
+    # Store original environment
+    original_env = {
+        "FLASHINFER_LOGLEVEL": os.environ.get("FLASHINFER_LOGLEVEL"),
+        "FLASHINFER_LOGDEST": os.environ.get("FLASHINFER_LOGDEST"),
+        "FLASHINFER_DUMP_DIR": os.environ.get("FLASHINFER_DUMP_DIR"),
+        "FLASHINFER_DUMP_INCLUDE": os.environ.get("FLASHINFER_DUMP_INCLUDE"),
+        "FLASHINFER_DUMP_EXCLUDE": os.environ.get("FLASHINFER_DUMP_EXCLUDE"),
+    }
+
+    try:
+        # Set up environment with exclude filter for prefill
+        dump_dir = tmp_path / "test_dumps_exclude"
+        os.environ["FLASHINFER_LOGLEVEL"] = "10"
+        os.environ["FLASHINFER_LOGDEST"] = "stdout"
+        os.environ["FLASHINFER_DUMP_DIR"] = str(dump_dir)
+        os.environ["FLASHINFER_DUMP_EXCLUDE"] = "*prefill*"
+        if "FLASHINFER_DUMP_INCLUDE" in os.environ:
+            del os.environ["FLASHINFER_DUMP_INCLUDE"]
+
+        # Force reimport
+        _clean_flashinfer_modules()
+
+        from flashinfer import single_decode_with_kv_cache, single_prefill_with_kv_cache
+
+        # Test configuration
+        kv_len = 128
+        num_qo_heads, num_kv_heads = 32, 8
+        head_dim = 128
+
+        # Call decode (should be dumped)
+        q = torch.randn(num_qo_heads, head_dim, device="cuda", dtype=torch.float16)
+        k = torch.randn(
+            kv_len, num_kv_heads, head_dim, device="cuda", dtype=torch.float16
+        )
+        v = torch.randn(
+            kv_len, num_kv_heads, head_dim, device="cuda", dtype=torch.float16
+        )
+        single_decode_with_kv_cache(q, k, v)
+
+        # Call prefill (should NOT be dumped due to exclude filter)
+        qo_len = 64
+        q_prefill = torch.randn(
+            qo_len, num_qo_heads, head_dim, device="cuda", dtype=torch.float16
+        )
+        k_prefill = torch.randn(
+            kv_len, num_kv_heads, head_dim, device="cuda", dtype=torch.float16
+        )
+        v_prefill = torch.randn(
+            kv_len, num_kv_heads, head_dim, device="cuda", dtype=torch.float16
+        )
+        single_prefill_with_kv_cache(q_prefill, k_prefill, v_prefill)
+
+        # Check that only decode was dumped
+        dump_dirs = list(dump_dir.iterdir()) if dump_dir.exists() else []
+        assert len(dump_dirs) == 1, f"Expected 1 dump, found {len(dump_dirs)}"
+
+        # Verify the dump is for decode
+        dump_name = dump_dirs[0].name
+        assert "decode" in dump_name.lower(), f"Expected decode dump, got {dump_name}"
+
+    finally:
+        # Restore environment
+        for key, value in original_env.items():
+            if value is not None:
+                os.environ[key] = value
+            elif key in os.environ:
+                del os.environ[key]
+        _clean_flashinfer_modules()
+
+
+def test_dump_include_and_exclude_combined(tmp_path):
+    """Test that FLASHINFER_DUMP_INCLUDE and FLASHINFER_DUMP_EXCLUDE work together."""
+    # Store original environment
+    original_env = {
+        "FLASHINFER_LOGLEVEL": os.environ.get("FLASHINFER_LOGLEVEL"),
+        "FLASHINFER_LOGDEST": os.environ.get("FLASHINFER_LOGDEST"),
+        "FLASHINFER_DUMP_DIR": os.environ.get("FLASHINFER_DUMP_DIR"),
+        "FLASHINFER_DUMP_INCLUDE": os.environ.get("FLASHINFER_DUMP_INCLUDE"),
+        "FLASHINFER_DUMP_EXCLUDE": os.environ.get("FLASHINFER_DUMP_EXCLUDE"),
+    }
+
+    try:
+        # Set up environment: include all single_* APIs but exclude prefill
+        dump_dir = tmp_path / "test_dumps_combined"
+        os.environ["FLASHINFER_LOGLEVEL"] = "10"
+        os.environ["FLASHINFER_LOGDEST"] = "stdout"
+        os.environ["FLASHINFER_DUMP_DIR"] = str(dump_dir)
+        os.environ["FLASHINFER_DUMP_INCLUDE"] = "single_*"
+        os.environ["FLASHINFER_DUMP_EXCLUDE"] = "*prefill*"
+
+        # Force reimport
+        _clean_flashinfer_modules()
+
+        from flashinfer import single_decode_with_kv_cache, single_prefill_with_kv_cache
+
+        # Test configuration
+        kv_len = 128
+        num_qo_heads, num_kv_heads = 32, 8
+        head_dim = 128
+
+        # Call decode (matches include, not excluded -> should be dumped)
+        q = torch.randn(num_qo_heads, head_dim, device="cuda", dtype=torch.float16)
+        k = torch.randn(
+            kv_len, num_kv_heads, head_dim, device="cuda", dtype=torch.float16
+        )
+        v = torch.randn(
+            kv_len, num_kv_heads, head_dim, device="cuda", dtype=torch.float16
+        )
+        single_decode_with_kv_cache(q, k, v)
+
+        # Call prefill (matches include BUT also matches exclude -> NOT dumped)
+        qo_len = 64
+        q_prefill = torch.randn(
+            qo_len, num_qo_heads, head_dim, device="cuda", dtype=torch.float16
+        )
+        k_prefill = torch.randn(
+            kv_len, num_kv_heads, head_dim, device="cuda", dtype=torch.float16
+        )
+        v_prefill = torch.randn(
+            kv_len, num_kv_heads, head_dim, device="cuda", dtype=torch.float16
+        )
+        single_prefill_with_kv_cache(q_prefill, k_prefill, v_prefill)
+
+        # Check that only decode was dumped
+        dump_dirs = list(dump_dir.iterdir()) if dump_dir.exists() else []
+        assert len(dump_dirs) == 1, f"Expected 1 dump, found {len(dump_dirs)}"
+
+        # Verify the dump is for decode
+        dump_name = dump_dirs[0].name
+        assert "decode" in dump_name.lower(), f"Expected decode dump, got {dump_name}"
+
+    finally:
+        # Restore environment
+        for key, value in original_env.items():
+            if value is not None:
+                os.environ[key] = value
+            elif key in os.environ:
+                del os.environ[key]
+        _clean_flashinfer_modules()
+
+
+def test_dump_include_no_match(tmp_path):
+    """Test that no dumps are created when include filter matches nothing."""
+    # Store original environment
+    original_env = {
+        "FLASHINFER_LOGLEVEL": os.environ.get("FLASHINFER_LOGLEVEL"),
+        "FLASHINFER_LOGDEST": os.environ.get("FLASHINFER_LOGDEST"),
+        "FLASHINFER_DUMP_DIR": os.environ.get("FLASHINFER_DUMP_DIR"),
+        "FLASHINFER_DUMP_INCLUDE": os.environ.get("FLASHINFER_DUMP_INCLUDE"),
+        "FLASHINFER_DUMP_EXCLUDE": os.environ.get("FLASHINFER_DUMP_EXCLUDE"),
+    }
+
+    try:
+        # Set up environment with include filter that matches nothing
+        dump_dir = tmp_path / "test_dumps_nomatch"
+        os.environ["FLASHINFER_LOGLEVEL"] = "10"
+        os.environ["FLASHINFER_LOGDEST"] = "stdout"
+        os.environ["FLASHINFER_DUMP_DIR"] = str(dump_dir)
+        os.environ["FLASHINFER_DUMP_INCLUDE"] = "nonexistent_function_xyz"
+        if "FLASHINFER_DUMP_EXCLUDE" in os.environ:
+            del os.environ["FLASHINFER_DUMP_EXCLUDE"]
+
+        # Force reimport
+        _clean_flashinfer_modules()
+
+        from flashinfer import single_decode_with_kv_cache
+
+        # Test configuration
+        kv_len = 128
+        num_qo_heads, num_kv_heads = 32, 8
+        head_dim = 128
+
+        # Call decode (should NOT be dumped - doesn't match include filter)
+        q = torch.randn(num_qo_heads, head_dim, device="cuda", dtype=torch.float16)
+        k = torch.randn(
+            kv_len, num_kv_heads, head_dim, device="cuda", dtype=torch.float16
+        )
+        v = torch.randn(
+            kv_len, num_kv_heads, head_dim, device="cuda", dtype=torch.float16
+        )
+        single_decode_with_kv_cache(q, k, v)
+
+        # Check that no dumps were created
+        dump_dirs = list(dump_dir.iterdir()) if dump_dir.exists() else []
+        assert len(dump_dirs) == 0, f"Expected 0 dumps, found {len(dump_dirs)}"
+
+    finally:
+        # Restore environment
+        for key, value in original_env.items():
+            if value is not None:
+                os.environ[key] = value
+            elif key in os.environ:
+                del os.environ[key]
+        _clean_flashinfer_modules()
+
+
+def test_dump_multiple_include_patterns(tmp_path):
+    """Test that multiple comma-separated include patterns work."""
+    # Store original environment
+    original_env = {
+        "FLASHINFER_LOGLEVEL": os.environ.get("FLASHINFER_LOGLEVEL"),
+        "FLASHINFER_LOGDEST": os.environ.get("FLASHINFER_LOGDEST"),
+        "FLASHINFER_DUMP_DIR": os.environ.get("FLASHINFER_DUMP_DIR"),
+        "FLASHINFER_DUMP_INCLUDE": os.environ.get("FLASHINFER_DUMP_INCLUDE"),
+        "FLASHINFER_DUMP_EXCLUDE": os.environ.get("FLASHINFER_DUMP_EXCLUDE"),
+    }
+
+    try:
+        # Set up environment with multiple include patterns
+        dump_dir = tmp_path / "test_dumps_multi"
+        os.environ["FLASHINFER_LOGLEVEL"] = "10"
+        os.environ["FLASHINFER_LOGDEST"] = "stdout"
+        os.environ["FLASHINFER_DUMP_DIR"] = str(dump_dir)
+        os.environ["FLASHINFER_DUMP_INCLUDE"] = "*decode*, *prefill*"
+        if "FLASHINFER_DUMP_EXCLUDE" in os.environ:
+            del os.environ["FLASHINFER_DUMP_EXCLUDE"]
+
+        # Force reimport
+        _clean_flashinfer_modules()
+
+        from flashinfer import single_decode_with_kv_cache, single_prefill_with_kv_cache
+
+        # Test configuration
+        kv_len = 128
+        num_qo_heads, num_kv_heads = 32, 8
+        head_dim = 128
+
+        # Call decode (should be dumped)
+        q = torch.randn(num_qo_heads, head_dim, device="cuda", dtype=torch.float16)
+        k = torch.randn(
+            kv_len, num_kv_heads, head_dim, device="cuda", dtype=torch.float16
+        )
+        v = torch.randn(
+            kv_len, num_kv_heads, head_dim, device="cuda", dtype=torch.float16
+        )
+        single_decode_with_kv_cache(q, k, v)
+
+        # Call prefill (should also be dumped)
+        qo_len = 64
+        q_prefill = torch.randn(
+            qo_len, num_qo_heads, head_dim, device="cuda", dtype=torch.float16
+        )
+        k_prefill = torch.randn(
+            kv_len, num_kv_heads, head_dim, device="cuda", dtype=torch.float16
+        )
+        v_prefill = torch.randn(
+            kv_len, num_kv_heads, head_dim, device="cuda", dtype=torch.float16
+        )
+        single_prefill_with_kv_cache(q_prefill, k_prefill, v_prefill)
+
+        # Check that both were dumped
+        dump_dirs = list(dump_dir.iterdir()) if dump_dir.exists() else []
+        assert len(dump_dirs) == 2, f"Expected 2 dumps, found {len(dump_dirs)}"
+
+        # Verify we have one decode and one prefill
+        dump_names = [d.name.lower() for d in dump_dirs]
+        has_decode = any("decode" in name for name in dump_names)
+        has_prefill = any("prefill" in name for name in dump_names)
+        assert has_decode, "Expected decode dump not found"
+        assert has_prefill, "Expected prefill dump not found"
+
+    finally:
+        # Restore environment
+        for key, value in original_env.items():
+            if value is not None:
+                os.environ[key] = value
+            elif key in os.environ:
+                del os.environ[key]
+        _clean_flashinfer_modules()
 
 
 if __name__ == "__main__":

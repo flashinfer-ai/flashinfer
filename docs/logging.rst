@@ -98,6 +98,78 @@ When FLASHINFER_LOGLEVEL is set to 10, the following environment variables can b
      - int
      - 1000
      - Maximum number of API calls to dump
+   * - ``FLASHINFER_DUMP_INCLUDE``
+     - str
+     - (empty)
+     - Comma-separated patterns to include (fnmatch-style)
+   * - ``FLASHINFER_DUMP_EXCLUDE``
+     - str
+     - (empty)
+     - Comma-separated patterns to exclude (fnmatch-style)
+
+Dump Filtering (Include/Exclude)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Use ``FLASHINFER_DUMP_INCLUDE`` and ``FLASHINFER_DUMP_EXCLUDE`` to control which API calls are dumped.
+This is especially useful when running end-to-end inference with many API calls but you only care about specific ones.
+
+**Pattern Syntax** (fnmatch-style):
+
+- ``*`` matches any number of characters
+- ``?`` matches a single character
+- Matching is case-sensitive
+- For class methods, the function name is formatted as ``ClassName.method_name``
+
+**Filter Logic**:
+
+1. If ``FLASHINFER_DUMP_INCLUDE`` is set, only APIs matching at least one pattern are dumped
+2. If ``FLASHINFER_DUMP_EXCLUDE`` is set, APIs matching any pattern are skipped
+3. Both can be combined: include filter is applied first, then exclude filter
+
+**Examples**:
+
+.. code-block:: bash
+
+    # Only dump decode-related APIs
+    export FLASHINFER_DUMP_INCLUDE="*decode*"
+
+    # Dump everything except __init__ and plan methods
+    export FLASHINFER_DUMP_EXCLUDE="*.__init__,*.plan"
+
+    # Only dump run() methods from wrapper classes
+    export FLASHINFER_DUMP_INCLUDE="*Wrapper.run"
+
+    # Dump all single_* APIs except prefill
+    export FLASHINFER_DUMP_INCLUDE="single_*"
+    export FLASHINFER_DUMP_EXCLUDE="*prefill*"
+
+    # Only dump a specific wrapper's run method
+    export FLASHINFER_DUMP_INCLUDE="BatchDecodeWithPagedKVCacheWrapper.run"
+
+    # Dump FP8 APIs but not quantization steps
+    export FLASHINFER_DUMP_INCLUDE="*fp8*,*FP8*"
+    export FLASHINFER_DUMP_EXCLUDE="*quantize*"
+
+**Common Patterns**:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 40 60
+
+   * - Pattern
+     - Matches
+   * - ``*decode*``
+     - ``single_decode_with_kv_cache``, ``BatchDecodeWithPagedKVCacheWrapper.run``
+   * - ``*Wrapper.run``
+     - ``BatchDecodeWithPagedKVCacheWrapper.run``, ``BatchPrefillWithPagedKVCacheWrapper.run``
+   * - ``*.__init__``
+     - All wrapper ``__init__`` methods
+   * - ``*.plan``
+     - All wrapper ``plan`` methods
+   * - ``mm_fp8``
+     - Exact match for ``mm_fp8`` function
+   * - ``single_*``
+     - ``single_decode_with_kv_cache``, ``single_prefill_with_kv_cache``
 
 Process ID Substitution
 ^^^^^^^^^^^^^^^^^^^^^^^^

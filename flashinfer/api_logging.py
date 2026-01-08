@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import enum
+import fnmatch
 import functools
 import inspect
 import json
@@ -50,6 +51,13 @@ _API_LOG_DEST = _substitute_process_id(os.environ.get("FLASHINFER_LOGDEST", "std
 _DUMP_DIR = os.environ.get("FLASHINFER_DUMP_DIR", "flashinfer_dumps")
 _DUMP_MAX_SIZE_GB = float(os.environ.get("FLASHINFER_DUMP_MAX_SIZE_GB", "20"))
 _DUMP_MAX_COUNT = int(os.environ.get("FLASHINFER_DUMP_MAX_COUNT", "1000"))
+
+# Dump filtering: include/exclude patterns (fnmatch-style, comma-separated)
+# Examples: "*decode*,*prefill*" or "BatchDecodeWrapper.run,mm_fp8"
+_DUMP_INCLUDE = os.environ.get("FLASHINFER_DUMP_INCLUDE", "")
+_DUMP_EXCLUDE = os.environ.get("FLASHINFER_DUMP_EXCLUDE", "")
+_DUMP_INCLUDE_PATTERNS = [p.strip() for p in _DUMP_INCLUDE.split(",") if p.strip()]
+_DUMP_EXCLUDE_PATTERNS = [p.strip() for p in _DUMP_EXCLUDE.split(",") if p.strip()]
 
 # Global tracking for dump limits (reset per process)
 _dump_count = 0
@@ -111,7 +119,51 @@ def _warn_dump():
             "set it to below 10. For more information, see https://docs.flashinfer.ai/logging.html"
         )
         print(f"Current dump directory is: {_DUMP_DIR}")
+        if _DUMP_INCLUDE_PATTERNS:
+            print(f"Include filter: {_DUMP_INCLUDE_PATTERNS}")
+        if _DUMP_EXCLUDE_PATTERNS:
+            print(f"Exclude filter: {_DUMP_EXCLUDE_PATTERNS}")
         print("=" * 80)
+
+
+def _should_dump_function(func_name: str) -> bool:
+    """
+    Check if a function should be dumped based on include/exclude filters.
+
+    Uses fnmatch-style patterns (wildcards: * for any chars, ? for single char).
+    Matching is case-sensitive.
+
+    Parameters
+    ----------
+    func_name : str
+        The function name to check. For class methods, this is formatted as
+        "ClassName.method_name" (e.g., "BatchDecodeWrapper.run").
+
+    Returns
+    -------
+    bool
+        True if the function should be dumped, False otherwise.
+
+    Filter Logic
+    ------------
+    1. If FLASHINFER_DUMP_INCLUDE is set:
+       - Function must match at least one include pattern
+       - If it doesn't match any, return False (skip dump)
+    2. If FLASHINFER_DUMP_EXCLUDE is set:
+       - If function matches any exclude pattern, return False (skip dump)
+    3. Otherwise, return True (dump the function)
+    """
+    # If include patterns are specified, func must match at least one
+    if _DUMP_INCLUDE_PATTERNS:
+        if not any(fnmatch.fnmatch(func_name, pat) for pat in _DUMP_INCLUDE_PATTERNS):
+            return False
+
+    # If exclude patterns are specified, func must not match any
+    if _DUMP_EXCLUDE_PATTERNS:
+        if any(fnmatch.fnmatch(func_name, pat) for pat in _DUMP_EXCLUDE_PATTERNS):
+            return False
+
+    return True
 
 
 def _get_tensor_size_bytes(tensor: torch.Tensor) -> int:
@@ -232,6 +284,13 @@ def _dump_function_inputs(
     """
     global _dump_count, _dump_total_size_bytes
 
+    # Check include/exclude filters first (before any work is done)
+    if not _should_dump_function(func_name):
+        _logger.debug(
+            f"Skipping dump for {func_name} (filtered by include/exclude patterns)"
+        )
+        return None
+
     if _dump_count >= _DUMP_MAX_COUNT:
         _logger.warning(
             f"Dump limit reached ({_DUMP_MAX_COUNT} dumps). Skipping dump for {func_name}. "
@@ -250,7 +309,8 @@ def _dump_function_inputs(
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[
             :-3
         ]  # Include milliseconds
-        dump_name = f"{timestamp}_{func_name}_call{call_seq:04d}"
+        pid = os.getpid()
+        dump_name = f"{timestamp}_pid{pid}_{func_name}_call{call_seq:04d}"
         dump_dir = Path(_DUMP_DIR) / dump_name
         dump_dir.mkdir(parents=True, exist_ok=True)
 
@@ -549,7 +609,7 @@ def replay_from_dump(
     compare_outputs: bool = False,
     device: str = "cuda",
     run: bool = False,
-    object_registry: Optional[Dict[int, Any]] = None,
+    object_registry: Optional[Dict[Tuple[int, int], Any]] = None,
 ) -> Any:
     """
     Replay a function call from a dumped directory.
@@ -575,9 +635,11 @@ def replay_from_dump(
         - "cuda:N": Load to specific CUDA device
     run : bool
         If True, try to resolve and execute the function
-    object_registry : Optional[Dict[int, Any]]
-        Registry of stateful objects mapped by their ID from the log.
-        Used to replay methods on the same object instance across calls.
+    object_registry : Optional[Dict[Tuple[int, int], Any]]
+        Registry of stateful objects mapped by (process_id, self_id) tuple.
+        This composite key ensures objects from different processes don't collide
+        in multi-GPU environments where different processes may have objects
+        at the same memory address.
 
     Returns
     -------
@@ -685,13 +747,18 @@ def replay_from_dump(
     if run:
         module_name = metadata.get("module")
         self_id = metadata.get("self_id")
+        process_id = metadata.get("process_id")
 
         func = None
         obj = None
 
         # Stateful replay logic for class methods calls.
         # Necessary for wrapped classes like BatchDecodeWithPagedKVCacheWrapper.
+        # Use (process_id, self_id) as composite key to avoid collisions across processes.
+        # In multi-GPU environments, different processes may have objects with the same
+        # memory address (self_id), so we need to scope by process_id.
         if self_id is not None:
+            registry_key = (process_id, self_id)
             if func_name.endswith(".__init__"):
                 # This is a constructor call
                 # Resolution: Get the class and instantiate it
@@ -704,13 +771,15 @@ def replay_from_dump(
                     # Note: args[0] is 'self' placeholder in the dump for __init__, skip it
                     real_args = args[1:] if len(args) > 0 else []
                     try:
-                        _logger.info(f"Instantiating {class_name} (ID: {self_id})...")
+                        _logger.info(
+                            f"Instantiating {class_name} (PID: {process_id}, ID: {self_id})..."
+                        )
                         # We need to handle the case where __init__ is called.
                         # The safest way is to just call the class constructor.
                         # We assume the logged args match the constructor args.
                         obj = cls_obj(*real_args, **kwargs)
                         if object_registry is not None:
-                            object_registry[self_id] = obj
+                            object_registry[registry_key] = obj
                         # __init__ returns None, but effectively we returned the object
                         execution_result = None
                         result_dict["execution_result"] = execution_result
@@ -728,8 +797,8 @@ def replay_from_dump(
                         return result_dict
             else:
                 # Instance method call
-                if object_registry is not None and self_id in object_registry:
-                    obj = object_registry[self_id]
+                if object_registry is not None and registry_key in object_registry:
+                    obj = object_registry[registry_key]
                     method_name = func_name.split(".")[-1]
                     if hasattr(obj, method_name):
                         func = getattr(obj, method_name)
@@ -739,7 +808,7 @@ def replay_from_dump(
                         _logger.warning(f"Object {obj} has no method {method_name}")
                 else:
                     _logger.warning(
-                        f"Object ID {self_id} not found in registry. Creating new instance if possible? No."
+                        f"Object (PID: {process_id}, ID: {self_id}) not found in registry."
                     )
 
         if func is None:
@@ -818,7 +887,7 @@ def replay_sequence(root_dir: str, device: str = "cuda") -> list:
         raise FileNotFoundError(f"Root dump directory not found: {root_dir}")
 
     # Find all subdirectories that look like dumps
-    # Pattern: YYYYMMDD_HHMMSS_milliseconds_funcname_callXXXX
+    # Pattern: YYYYMMDD_HHMMSS_milliseconds_pid<PID>_funcname_callXXXX
     dump_dirs = []
     for item in root_path.iterdir():
         if item.is_dir() and (item / "metadata.json").exists():
@@ -831,8 +900,9 @@ def replay_sequence(root_dir: str, device: str = "cuda") -> list:
     total = len(dump_dirs)
     _logger.info(f"Found {total} dumps to replay from {root_dir}")
 
-    # Registry for stateful objects (mapped by id(self))
-    object_registry: Dict[int, Any] = {}
+    # Registry for stateful objects (mapped by (process_id, self_id) tuple)
+    # This composite key prevents collisions in multi-GPU/multi-process environments
+    object_registry: Dict[Tuple[int, int], Any] = {}
 
     for i, dump_dir in enumerate(dump_dirs):
         _logger.info(f"[{i + 1}/{total}] Replaying {dump_dir.name}...")
