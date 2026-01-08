@@ -18,25 +18,45 @@ jobs:
       pull-requests: read
       issues: read
       id-token: write
-      members: read  # Required to check team membership
 
     steps:
       - name: Check team membership
         id: check-permission
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # GITHUB_TOKEN cannot access org team membership API (HTTP 403)
+          # Use a PAT with read:org scope stored as FLASHINFER_GITHUB_TOKEN secret
+          GH_TOKEN: ${{ secrets.FLASHINFER_GITHUB_TOKEN }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           ORG: ${{ github.repository_owner }}
+          TEAM: agent-users
+        shell: bash
         run: |
-          echo "Checking if $PR_AUTHOR is a member of agent-users team..."
+          echo "Checking if $PR_AUTHOR is a member of $ORG/$TEAM team..."
 
-          # Check if user is in the agent-users team
-          if gh api "/orgs/$ORG/teams/agent-users/memberships/$PR_AUTHOR" --silent 2>/dev/null; then
-            echo "✅ User $PR_AUTHOR is authorized (member of agent-users team)"
-            echo "authorized=true" >> $GITHUB_OUTPUT
+          # Verify token is set
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo "❌ Error: FLASHINFER_GITHUB_TOKEN secret is not set"
+            echo "authorized=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # List team members and check if PR author is in the list
+          MEMBERS=$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "/orgs/${ORG}/teams/${TEAM}/members" \
+            --jq '.[].login' 2>&1) || {
+            echo "❌ Error calling GitHub API: $MEMBERS"
+            echo "authorized=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+
+          if echo "$MEMBERS" | grep -qx "$PR_AUTHOR"; then
+            echo "✅ $PR_AUTHOR is a member of $TEAM"
+            echo "authorized=true" >> "$GITHUB_OUTPUT"
           else
-            echo "❌ User $PR_AUTHOR is not authorized (not a member of agent-users team)"
-            echo "authorized=false" >> $GITHUB_OUTPUT
+            echo "❌ $PR_AUTHOR is not a member of $TEAM"
+            echo "authorized=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Checkout repository
