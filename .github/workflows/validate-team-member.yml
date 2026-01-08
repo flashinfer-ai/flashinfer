@@ -1,12 +1,7 @@
 name: Validate team member
 
 on:
-  # Use pull_request_target instead of pull_request to access secrets for fork PRs
-  # SECURITY: This runs in base repo context with access to secrets, so we MUST:
-  # 1. Check authorization BEFORE checkout
-  # 2. Only checkout code if user is authorized team member
-  # 3. Pin checkout to specific SHA (head.sha) not branch
-  pull_request_target:
+  pull_request:
     types: [opened, synchronize, reopened]
     # Optional: Only run on specific file changes
     # paths:
@@ -70,7 +65,6 @@ jobs:
         if: steps.check-permission.outputs.authorized == 'true'
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 1
 
       - name: Run Claude Code Review
