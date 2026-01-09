@@ -379,12 +379,16 @@ def test_top_k_page_table_transform(num_rows, max_len, k, dtype):
 
 
 @pytest.mark.parametrize("num_rows", [1, 8, 32])
+@pytest.mark.parametrize("length_offset", [0, 1])
 @pytest.mark.parametrize("max_len", [1024, 4096, 8192])
 @pytest.mark.parametrize("k", [64, 256, 512])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_top_k_ragged_transform(num_rows, max_len, k, dtype):
+def test_top_k_ragged_transform(num_rows, length_offset, max_len, k, dtype):
     """Test top_k_ragged_transform returns correct indices with offsets."""
-    if k > max_len:
+
+    actual_length = max_len - length_offset
+
+    if k > actual_length:
         pytest.skip("k should be less than max_len")
 
     torch.manual_seed(42)
@@ -398,8 +402,8 @@ def test_top_k_ragged_transform(num_rows, max_len, k, dtype):
         0, num_rows * max_len, max_len, device=device, dtype=torch.int32
     )
 
-    # All rows have full length
-    lengths = torch.full((num_rows,), max_len, device=device, dtype=torch.int32)
+    # Rows have non-aligned lengths
+    lengths = torch.full((num_rows,), actual_length, device=device, dtype=torch.int32)
 
     # Test flashinfer implementation
     output = flashinfer.top_k_ragged_transform(scores, offsets, lengths, k)
@@ -412,6 +416,18 @@ def test_top_k_ragged_transform(num_rows, max_len, k, dtype):
         f"Expected shape {(num_rows, k)}, got {output.shape}"
     )
     assert output.dtype == torch.int32
+
+    for i in range(num_rows):
+        offset = offsets[i].item()
+        length = lengths[i].item()
+
+        valid_indices = output[i][output[i] >= 0]
+        relative_indices = valid_indices - offset
+
+        assert (relative_indices >= 0).all(), f"Row {i} has negative indices"
+        assert (relative_indices < length).all(), (
+            f"Row {i} has out-of-bound indices >= {length}. Max index was {relative_indices.max().item()}"
+        )
 
     # Check accuracy
     accuracy = compute_transform_accuracy(output, ref_output, num_rows, k)
@@ -1190,8 +1206,9 @@ if __name__ == "__main__":
     test_top_k_page_table_transform(8, 4096, 256, torch.float32)
     test_top_k_page_table_transform(8, 4096, 256, torch.float16)
     print("Testing ragged transform...")
-    test_top_k_ragged_transform(8, 4096, 256, torch.float32)
-    test_top_k_ragged_transform(8, 4096, 256, torch.float16)
+    test_top_k_ragged_transform(8, 0, 4096, 256, torch.float32)
+    test_top_k_ragged_transform(8, 0, 4096, 256, torch.float16)
+    test_top_k_ragged_transform(8, 1, 4096, 256, torch.float16)
     print("Testing trivial cases...")
     test_page_table_transform_trivial_case(8, 2048, 256)
     test_ragged_transform_trivial_case(8, 2048, 256)
