@@ -1950,6 +1950,27 @@ def gen_trtllm_fmha_v2_sm120_module(device: torch.device) -> JitSpec:
     )
 
 
+def get_fmha_v2_uri(
+    sm: int,
+    dtype_str: str,
+    head_dim_qk: int,
+    head_dim_v: int,
+    input_layout: int,
+    use_logits_soft_cap: bool,
+    use_alibi: bool,
+) -> str:
+    """Generate unique URI for FMHAv2 module."""
+    uri = f"fmha_v2_sm{sm}_{dtype_str}_h{head_dim_qk}"
+    if head_dim_v > 0:
+        uri += f"x{head_dim_v}"
+    uri += f"_layout{input_layout}"
+    if use_logits_soft_cap:
+        uri += "_softcap"
+    if use_alibi:
+        uri += "_alibi"
+    return uri
+
+
 def gen_fmha_v2_module(
     dtype_q: torch.dtype,
     head_dim_qk: int,
@@ -1960,27 +1981,6 @@ def gen_fmha_v2_module(
     return_softmax_stats: bool = False,
     sm: int = 90,
 ) -> JitSpec:
-    """
-    Generate a JIT-compiled FMHAv2 module for a specific kernel configuration.
-
-    This function generates:
-    - Kernel code (.cu): The actual kernel implementation with launcher
-    - Dispatcher code (.h): Declares launcher extern for linking
-    - Binding code (.cu): TVM FFI binding for Python interface
-
-    Args:
-        dtype_q: Data type of Q tensor (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
-        head_dim_qk: Head dimension for Q and K
-        head_dim_v: Head dimension for V (0 = same as head_dim_qk)
-        input_layout: 0=PACKED_QKV, 1=CONTIGUOUS_Q_KV, 2=Q_PAGED_KV, 3=SEPARATE_Q_K_V
-        use_logits_soft_cap: Enable attention logit softcapping
-        use_alibi: Enable ALiBi position encoding support
-        return_softmax_stats: Return softmax statistics (for training)
-        sm: Target SM version (90, 89, 80, etc.)
-
-    Returns:
-        JitSpec for compilation
-    """
     from .fmha_v2.fmha_library import (
         InputLayout,
         generate_jit_sources,
@@ -2016,51 +2016,64 @@ def gen_fmha_v2_module(
         "alibi": use_alibi,
     }
 
-    # Generate all source files
-    sources = generate_jit_sources(api_params)
-
-    # Create unique URI based on kernel configuration
-    uri = f"fmha_v2_sm{sm}_{dtype_str}_h{head_dim_qk}"
-    if head_dim_v > 0:
-        uri += f"x{head_dim_v}"
-    uri += f"_layout{input_layout}"
-    if use_logits_soft_cap:
-        uri += "_softcap"
-    if use_alibi:
-        uri += "_alibi"
+    # Create unique URI
+    uri = get_fmha_v2_uri(
+        sm,
+        dtype_str,
+        head_dim_qk,
+        head_dim_v,
+        input_layout,
+        use_logits_soft_cap,
+        use_alibi,
+    )
 
     # Setup generated source directory
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
     gen_directory.mkdir(parents=True, exist_ok=True)
 
-    # Write kernel .cu file (contains kernels + launcher)
+    # Source directories
+    csrc_dir = jit_env.FLASHINFER_CSRC_DIR
+    fmha_v2_src_dir = csrc_dir / "fmha_v2"
+
+    source_paths = []
+
+    # kernel code from jinja template
+    sources = generate_jit_sources(api_params)
     kernel_path = gen_directory / sources["kernel_filename"]
     write_if_different(kernel_path, sources["kernel_code"])
+    source_paths.append(kernel_path)
 
-    # Write dispatcher .h file (declares launcher extern, provides fixed-name wrapper)
+    # dispatcher header (declares launcher extern, provides wrapper)
+    with open(csrc_dir / "fmha_v2_dispatcher.jinja", "r") as f:
+        dispatcher_template = jinja2.Template(f.read())
+    dispatcher_code = dispatcher_template.render(launcher_name=sources["launcher_name"])
     dispatcher_path = gen_directory / "fmha_v2_dispatcher.h"
-    write_if_different(dispatcher_path, sources["dispatcher_code"])
+    write_if_different(dispatcher_path, dispatcher_code)
 
-    # Copy static binding .cu file
-    # The binding includes fmha_v2_dispatcher.h and calls the fixed-name wrapper
-    import shutil
+    # copy static fmha_v2_run.cu
+    static_run_path = csrc_dir / "fmha_v2_run.cu"
+    run_path = gen_directory / "fmha_v2_run.cu"
+    with open(static_run_path, "r") as f:
+        write_if_different(run_path, f.read())
+    source_paths.append(run_path)
 
-    static_binding_path = jit_env.FLASHINFER_CSRC_DIR / "fmha_v2" / "fmha_v2_binding.cu"
-    binding_path = gen_directory / "fmha_v2_binding.cu"
-    if static_binding_path.exists():
-        shutil.copy(static_binding_path, binding_path)
+    # copy static fmha_v2_jit_binding.cu
+    static_binding_path = csrc_dir / "fmha_v2_jit_binding.cu"
+    binding_path = gen_directory / "fmha_v2_jit_binding.cu"
+    with open(static_binding_path, "r") as f:
+        write_if_different(binding_path, f.read())
+    source_paths.append(binding_path)
 
     # Setup compilation flags
-    fmha_v2_src_dir = jit_env.FLASHINFER_CSRC_DIR / "fmha_v2"
-
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
         supported_major_versions=[9]
     )
     nvcc_flags.extend(
         [
             f"-I{fmha_v2_src_dir}",
-            f"-I{gen_directory}",  # For dispatcher include
+            f"-I{gen_directory}",  # For config.inc and dispatcher.h
             f"-I{jit_env.FLASHINFER_CSRC_DIR}",  # For tvm_ffi_utils.h
+            f"-I{jit_env.FLASHINFER_INCLUDE_DIR}",  # For flashinfer headers
             "-Wno-deprecated-gpu-targets",
         ]
     )
@@ -2072,9 +2085,6 @@ def gen_fmha_v2_module(
         nvcc_flags.append("-gencode=arch=compute_89,code=sm_89")
     elif sm >= 80:
         nvcc_flags.append("-gencode=arch=compute_80,code=sm_80")
-
-    # Compile kernel + binding together
-    source_paths = [kernel_path, binding_path]
 
     return gen_jit_spec(
         uri,

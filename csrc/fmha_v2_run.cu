@@ -14,46 +14,29 @@
  * limitations under the License.
  */
 
-/*
- * FMHAv2 JIT Binding (Static)
- *
- * This is the static TVM FFI binding for FMHAv2 kernels.
- * It includes the JIT-generated dispatcher header which provides
- * the fixed-name wrapper function `fmha_v2_run_kernel()`.
- */
-
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-#include <cuda_fp8.h>
-#include <cuda_runtime.h>
-#include <float.h>
-#include <fused_multihead_attention.h>
-#include <fused_multihead_attention_utils.h>
-#include <math.h>
-
 #include <algorithm>
 #include <cassert>
 #include <cstring>
 #include <numeric>
 
-#include "tvm_ffi_utils.h"
-
-// Include the JIT-generated dispatcher header
-// This defines fmha_v2_run_kernel() which wraps the actual launcher
 #include "fmha_v2_dispatcher.h"
+#include "tvm_ffi_utils.h"
 
 using tvm::ffi::Optional;
 
-using Params = bert::Fused_multihead_attention_params_v2;
 using Launch_params = bert::Fused_multihead_attention_launch_params;
 using Attention_mask_type = fmha::Attention_mask_type;
 using Attention_input_layout = fmha::Attention_input_layout;
 using Kv_block_array = fmha::Kv_block_array;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+// Helper functions
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 namespace flashinfer {
 
-static inline void set_params(Params& params, const Launch_params launch_params,
+static inline void set_params(bert::Fused_multihead_attention_params_v2& params,
+                              const Launch_params launch_params,
                               // types
                               Data_type data_type, Data_type acc_type, Data_type output_dtype,
                               // attention input layout
@@ -102,14 +85,22 @@ static inline void set_params(Params& params, const Launch_params launch_params,
   }
 
   if (input_layout == Attention_input_layout::PACKED_QKV) {
+    // For grouped- or multi-query attention (h denotes num_q_heads; h' denotes h_kv):
+    //   qkv_layout = [b, s, [q_hd, k_h'd, v_h'd]]
+    //   qkv_stride = (h+2*h')d * bytes_per_elt
+    // Otherwise:
+    //   qkv_layout = [b, s, 3, h, d] or [b, s, h, 3, d]
+    //   qkv_stride = 3hd * bytes_per_elt
     params.qkv_ptr = qkv_packed_d;
     params.q_stride_in_bytes = params.k_stride_in_bytes = params.v_stride_in_bytes =
         get_size_in_bytes(h * d + h_kv * d + h_kv * dv, data_type);
   } else {
+    // Layout [B, S, H, D].
     params.q_ptr = q_d;
     params.q_stride_in_bytes = get_size_in_bytes(h * d, data_type);
 
     if (input_layout == Attention_input_layout::CONTIGUOUS_Q_KV) {
+      // Layout [B, S, 2, H, D].
       params.kv_ptr = kv_d;
       params.k_stride_in_bytes = params.v_stride_in_bytes =
           get_size_in_bytes(h_kv * (d + dv), data_type);
@@ -123,7 +114,9 @@ static inline void set_params(Params& params, const Launch_params launch_params,
       params.k_stride_in_bytes = get_size_in_bytes(tokens_per_block * d, data_type);
       params.v_stride_in_bytes = get_size_in_bytes(tokens_per_block * dv, data_type);
     } else if (input_layout == Attention_input_layout::SEPARATE_Q_K_V) {
+      // Layout [B, S, H_kv, D].
       params.k_ptr = k_d;
+      // Layout [B, S, H_kv, Dv].
       params.v_ptr = v_d;
       params.k_stride_in_bytes = get_size_in_bytes(h_kv * d, data_type);
       params.v_stride_in_bytes = get_size_in_bytes(h_kv * dv, data_type);
@@ -132,6 +125,7 @@ static inline void set_params(Params& params, const Launch_params launch_params,
 
   // Packed mask.
   params.packed_mask_ptr = packed_mask_d;
+  // The N dimension has to be aligned.
   params.packed_mask_stride_in_bytes =
       (align_to(int64_t(s_kv), int64_t(fmha::FLASH_ATTEN_MASK_N_ALIGNMENT))) / 8;
 
@@ -141,12 +135,12 @@ static inline void set_params(Params& params, const Launch_params launch_params,
 #if defined(STORE_P)
   params.p_ptr = p_d;
   params.p_stride_in_bytes = get_size_in_bytes(b * h * s_kv, acc_type);
-#endif
+#endif  // defined(STORE_P)
 
 #if defined(STORE_S)
   params.s_ptr = s_d;
   params.s_stride_in_bytes = get_size_in_bytes(b * h * s_kv, data_type);
-#endif
+#endif  // defined(STORE_S)
 
   params.softmax_stats_ptr = softmax_stats_d;
   params.softmax_stats_stride_in_bytes = get_size_in_bytes(h * 2, DATA_TYPE_FP32);
@@ -188,6 +182,7 @@ static inline void set_params(Params& params, const Launch_params launch_params,
       enable_attn_logit_softcapping ? scale_bmm1 / softcapping_scale_bmm1 : scale_bmm1;
 
   // use specialized hopper kernels without alibi support.
+  // alibi or softcapping_scale cannot utilize the exp2f with fused_scale optimization.
   if (launch_params.warp_specialization && !has_alibi && !enable_attn_logit_softcapping) {
     set_alpha(params.scale_bmm1, fused_scale_bmm1 * float(M_LOG2E), DATA_TYPE_FP32);
   } else {
@@ -237,7 +232,7 @@ static inline void determine_launch_params(
   launch_params.attention_mask_type = attention_mask_type;
   launch_params.attention_input_layout = input_layout;
 
-  // Set SM count and L2 cache size
+  // Set SM count and L2 cache size (used to determine launch blocks/grids to maximum performance)
   launch_params.multi_processor_count = props.multiProcessorCount;
   launch_params.device_l2_cache_size = props.l2CacheSize;
 
@@ -246,10 +241,12 @@ static inline void determine_launch_params(
       (data_type == DATA_TYPE_FP16 || data_type == DATA_TYPE_BF16 || data_type == DATA_TYPE_E4M3) &&
       (s >= 16 && d >= 16) && !force_non_flash_attention;
 
-  // enable warp_specialized kernels on hopper
+  // enable warp_speialized kernels when s >= 512 on hopper
+  // note that warp_speialized kernels need flash attention + tma
   launch_params.warp_specialization =
       (data_type == DATA_TYPE_FP16 || data_type == DATA_TYPE_BF16 || data_type == DATA_TYPE_E4M3) &&
       sm == 90 && launch_params.flash_attention && !force_non_warp_specialization;
+  // warp specialization kernels on hopper need tma
   launch_params.use_tma = use_tma || launch_params.warp_specialization;
 
   // use granular tiling on Ampere-style flash attention
@@ -265,178 +262,77 @@ static inline void determine_launch_params(
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+// Main run function - called by fmha_v2_jit_binding.cu
+////////////////////////////////////////////////////////////////////////////////////////////////////
 
-/**
- * @brief TVM FFI binding for FMHAv2 JIT-compiled kernel
- *
- * This function provides a Python-callable interface for running attention.
- * The actual kernel is determined at JIT compile time and is called via
- * the fmha_v2_run_kernel() wrapper defined in the generated dispatcher.
- *
- * @param q Query tensor [batch, q_seqlen, num_heads, head_dim]
- * @param k Key tensor [batch, kv_seqlen, num_kv_heads, head_dim]
- * @param v Value tensor [batch, kv_seqlen, num_kv_heads, head_dim_v]
- * @param o Output tensor [batch, q_seqlen, num_heads, head_dim_v]
- * @param maybe_lse Optional log-sum-exp tensor for softmax statistics
- * @param num_heads Number of query heads
- * @param head_dim Head dimension for Q and K
- * @param seq_len Sequence length (unused, derived from tensors)
- * @param scale_softmax Softmax scale factor
- * @param scale_bmm1 Scale factor for the first GEMM (Q @ K^T)
- * @param scale_bmm2 Scale factor for the second GEMM (softmax @ V)
- * @param attention_mask_type_code Mask type: 0=PADDING, 1=CAUSAL, 2=SLIDING, 3=CUSTOM
- * @param input_layout_code Input layout: 0=PACKED_QKV, 1=CONTIGUOUS_Q_KV, 2=Q_PAGED_KV, 3=SEPARATE
- * @param data_type_code Data type: 0=FP16, 1=BF16, 2=E4M3
- * @param use_warp_specialization Whether to use warp-specialized kernels (SM90+)
- * @param use_alibi Enable ALiBi position encoding
- * @param softcapping_scale Softcapping scale (0 to disable)
- */
-void FMHAv2Run(TensorView q, TensorView k, TensorView v, TensorView o,
-               Optional<TensorView> maybe_lse, int64_t num_heads, int64_t head_dim, int64_t seq_len,
-               const float scale_softmax, const float scale_bmm1, const float scale_bmm2,
-               int64_t attention_mask_type_code, int64_t input_layout_code, int64_t data_type_code,
-               bool use_warp_specialization, bool use_alibi, float softcapping_scale) {
-  const int batch_size = q.shape()[0];
-  const int q_seqlen = q.shape()[1];
-  const int kv_seqlen = k.shape()[1];
-  assert(num_heads == q.shape()[2] &&
-         "num_heads must be equal to the number of heads in the query tensor");
-  const int num_kv_heads = k.shape()[2];
-  const int head_dim_v = v.shape()[3];
-
-  // Map data type code to Data_type enum
-  Data_type data_type;
-  Data_type output_dtype;
-  switch (data_type_code) {
-    case 0:
-      data_type = DATA_TYPE_FP16;
-      output_dtype = DATA_TYPE_FP16;
-      break;
-    case 1:
-      data_type = DATA_TYPE_BF16;
-      output_dtype = DATA_TYPE_BF16;
-      break;
-    case 2:
-      data_type = DATA_TYPE_E4M3;
-      output_dtype = DATA_TYPE_BF16;  // FP8 typically outputs BF16
-      break;
-    default:
-      data_type = DATA_TYPE_FP16;
-      output_dtype = DATA_TYPE_FP16;
-  }
-  Data_type acc_type = DATA_TYPE_FP32;
-
-  Attention_mask_type attention_mask_type =
-      static_cast<Attention_mask_type>(attention_mask_type_code);
-  Attention_input_layout input_layout = static_cast<Attention_input_layout>(input_layout_code);
-
+void fmha_v2_run(ffi::TensorView q, ffi::TensorView k, ffi::TensorView v, ffi::TensorView o,
+                 Optional<ffi::TensorView> maybe_lse, int64_t mask_mode_code, float scale_softmax,
+                 float scale_bmm1, float scale_bmm2, float softcapping_scale) {
   CudaDevice device;
-  int sm = device.sm;
-  cudaDeviceProp props = device.props;
+  // // Extract tensor dimensions
+  // const int64_t batch_size = q.size(0);
+  // const int64_t q_seqlen = q.size(1);
+  // const int64_t kv_seqlen = k.size(1);
+  // const int64_t num_heads = q.size(2);
+  // const int64_t num_kv_heads = k.size(2);
+  // const int64_t head_dim = q.size(3);
+  // const int64_t head_dim_v = v.size(3);
 
-  cudaStream_t stream = static_cast<cudaStream_t>(get_stream(q.device()));
+  // // Get device properties
+  // ffi::CUDADeviceGuard device_guard(q.device().device_id);
+  // cudaStream_t stream = get_stream(q.device());
 
-  Launch_params launch_params;
-  determine_launch_params(launch_params, data_type, sm, q_seqlen, head_dim, attention_mask_type,
-                          input_layout,
-                          false,                     // interleaved
-                          false,                     // ignore_b1opt
-                          false,                     // force_unroll
-                          use_warp_specialization,   // use_tma
-                          false,                     // force_non_flash_attention
-                          !use_warp_specialization,  // force_non_warp_specialization
-                          false,                     // force_non_granular_tiling
-                          true,                      // force_fp32_acc
-                          props);
+  // int device_id;
+  // cudaGetDevice(&device_id);
+  // cudaDeviceProp props;
+  // cudaGetDeviceProperties(&props, device_id);
+  // int sm = props.major * 10 + props.minor;
 
-  launch_params.total_q_seqlen = q_seqlen;
-  launch_params.total_kv_seqlen = kv_seqlen;
-  launch_params.enable_attn_logit_softcapping = (softcapping_scale != 0.0f);
+  // // Mask mode
+  // Attention_mask_type mask_mode = static_cast<Attention_mask_type>(mask_mode_code);
 
-  // device memory for scale_bmm2
-  void* scale_bmm2_d;
-  FMHA_CHECK_CUDA(cudaMalloc(&scale_bmm2_d, sizeof(uint32_t)));
+  // // Allocate cumulative sequence lengths on device
+  // std::vector<int32_t> cu_seqlens(batch_size + 1);
+  // for (int i = 0; i <= batch_size; i++) {
+  //     cu_seqlens[i] = i * q_seqlen;
+  // }
+  // void* cu_seqlens_d;
+  // cudaMalloc(&cu_seqlens_d, sizeof(int32_t) * cu_seqlens.size());
+  // cudaMemcpyAsync(cu_seqlens_d, cu_seqlens.data(), sizeof(int32_t) * cu_seqlens.size(),
+  //                 cudaMemcpyHostToDevice, stream);
 
-  // Cumulative sequence lengths
-  std::vector<uint32_t> cu_seqlens(batch_size + 1);
-  for (int i = 0; i <= batch_size; i++) {
-    cu_seqlens[i] = i * q_seqlen;
-  }
-  void* cu_seqlens_d;
-  FMHA_CHECK_CUDA(cudaMalloc(&cu_seqlens_d, sizeof(uint32_t) * cu_seqlens.size()));
-  FMHA_CHECK_CUDA(cudaMemcpy(cu_seqlens_d, cu_seqlens.data(), sizeof(uint32_t) * cu_seqlens.size(),
-                             cudaMemcpyHostToDevice));
+  // // Scale BMM2 device memory
+  // void* scale_bmm2_d;
+  // cudaMalloc(&scale_bmm2_d, sizeof(uint32_t));
 
-  if (maybe_lse.has_value()) {
-    FMHA_CHECK_CUDA(cudaMemset(maybe_lse.value().data_ptr(), 0,
-                               sizeof(float) * batch_size * q_seqlen * num_heads * 2));
-  }
+  // // Initialize params
+  // Params params;
+  // Launch_params launch_params;
 
-  Params params;
+  // determine_launch_params(launch_params, sm, q_seqlen, kv_seqlen, mask_mode, props);
 
-  // Determine pointers based on input layout
-  void* qkv_packed_ptr = nullptr;
-  void* q_ptr = nullptr;
-  void* k_ptr = nullptr;
-  void* v_ptr = nullptr;
-  void* kv_ptr = nullptr;
+  // set_params(
+  //     params, launch_params,
+  //     batch_size, q_seqlen, kv_seqlen,
+  //     num_heads, num_kv_heads,
+  //     head_dim, head_dim_v,
+  //     q.data_ptr(), k.data_ptr(), v.data_ptr(), o.data_ptr(),
+  //     maybe_lse.has_value() ? maybe_lse.value().data_ptr() : nullptr,
+  //     cu_seqlens_d, cu_seqlens_d,
+  //     scale_bmm1, scale_softmax, scale_bmm2,
+  //     softcapping_scale);
 
-  if (input_layout == Attention_input_layout::PACKED_QKV) {
-    qkv_packed_ptr = q.data_ptr();
-  } else if (input_layout == Attention_input_layout::SEPARATE_Q_K_V) {
-    q_ptr = q.data_ptr();
-    k_ptr = k.data_ptr();
-    v_ptr = v.data_ptr();
-  } else if (input_layout == Attention_input_layout::CONTIGUOUS_Q_KV) {
-    q_ptr = q.data_ptr();
-    kv_ptr = k.data_ptr();
-  }
+  // params.scale_bmm2_d = reinterpret_cast<uint32_t*>(scale_bmm2_d);
+  // cudaMemcpyAsync(params.scale_bmm2_d, &params.scale_bmm2, sizeof(uint32_t),
+  //                 cudaMemcpyHostToDevice, stream);
 
-  set_params(params, launch_params, data_type, acc_type, output_dtype, input_layout,
-             batch_size,         // b
-             q_seqlen,           // s_q
-             kv_seqlen,          // s_kv
-             num_heads,          // h
-             num_kv_heads,       // h_kv
-             head_dim,           // d
-             head_dim_v,         // dv
-             cu_seqlens.back(),  // total tokens
-             1,                  // num_grouped_heads
-             INT_MAX,            // sliding_window_size (disabled)
-             0,                  // chunked_attention_size (disabled)
-             64,                 // tokens_per_block
-             qkv_packed_ptr,     // qkv_packed_d
-             q_ptr,              // q_d
-             k_ptr,              // k_d
-             v_ptr,              // v_d
-             kv_ptr,             // kv_d
-             nullptr,            // paged_kv_pool_ptr
-             nullptr,            // paged_block_offsets
-             nullptr,            // packed_mask_d
-             nullptr,            // cu_mask_rows_d
-             nullptr,            // attention_sinks_d
-             cu_seqlens_d,       // cu_kv_seqlens_d
-             cu_seqlens_d,       // cu_q_seqlens_d
-             o.data_ptr(),       // o_packed_d
-             nullptr,            // p_d
-             nullptr,            // s_d
-             maybe_lse.has_value() ? maybe_lse.value().data_ptr() : nullptr, scale_bmm2_d,
-             scale_bmm1,         // scale_bmm1
-             scale_softmax,      // scale_softmax
-             scale_bmm2,         // scale_bmm2
-             softcapping_scale,  // softcapping_scale_bmm1
-             false,              // use_int8_scale_max
-             false,              // interleaved
-             false,              // is_s_padded
-             use_alibi);         // has_alibi
-
-  // Call the JIT-generated kernel through the fixed-name wrapper
+  // // Call the JIT-generated kernel through the fixed-name wrapper
+  // // The dispatcher routes to the actual launcher generated by get_kernel_code()
   fmha_v2_run_kernel(params, launch_params, stream);
 
-  FMHA_CHECK_CUDA(cudaFree(scale_bmm2_d));
-  FMHA_CHECK_CUDA(cudaFree(cu_seqlens_d));
+  // // Cleanup temporary allocations
+  // cudaFree(scale_bmm2_d);
+  // cudaFree(cu_seqlens_d);
 }
-
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, flashinfer::FMHAv2Run);
 
 }  // namespace flashinfer

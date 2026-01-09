@@ -522,84 +522,18 @@ def get_kernel_code(kspec, kname, lname):
     return code
 
 
-def get_dispatcher_code(kspec: FMHAv2KernelSpec, fname: str, lname: str) -> str:
-    """
-    Generate dispatcher header code.
-
-    The dispatcher:
-    1. Declares the actual kernel launcher function as extern
-    2. Defines a fixed-name wrapper function `fmha_v2_run_kernel()` that the static
-       binding can call
-
-    Args:
-        kspec: Kernel specification
-        fname: Kernel filename
-        lname: Launcher function name
-
-    Returns:
-        Generated dispatcher header code
-    """
-    template_dir = jit_env.FLASHINFER_CSRC_DIR / "fmha_v2" / "templates"
-    with open(template_dir / "fmha_v2_dispatcher.jinja", "r") as f:
-        template = jinja2.Template(f.read())
-
-    ctx = {
-        "copyright": copyright,
-        "fname": fname,
-        "launcher_name": lname,
-        "has_noloop": bool(kspec.has_noloop),
-        "tiled": bool(kspec.tiled),
-    }
-
-    return template.render(ctx)
-
-
 def generate_jit_sources(api_params: dict) -> dict:
-    """
-    Generate source files needed for JIT compilation of a single FMHAv2 kernel.
-
-    This is the main entry point for generating JIT sources. It produces:
-    - kernel_code: The kernel implementation (.cu file) with kernels and launcher
-    - dispatcher_code: The dispatcher header (.h file) that wraps the launcher
-
-    The binding file (fmha_v2_binding.cu) is a static file that includes the
-    generated dispatcher header and calls the fixed-name wrapper function.
-
-    Args:
-        api_params: Dictionary with kernel configuration including:
-            - sm: Target SM version (90, 89, 80, etc.)
-            - dtype: Data type ('fp16', 'bf16', 'e4m3', etc.)
-            - head_size: Head dimension for Q and K
-            - input_layout: InputLayout enum value
-            - scheduling_mode: Scheduling mode (default 1)
-            - enable_attn_logit_softcapping: Enable attention logit softcapping
-            - return_softmax_stats: Return softmax statistics
-            - alibi: Enable ALiBi support
-
-    Returns:
-        Dictionary with keys:
-            - 'kernel_code': Content of the kernel .cu file
-            - 'dispatcher_code': Content of the dispatcher .h file
-            - 'kernel_filename': Filename for the kernel file
-            - 'launcher_name': Name of the launcher function
-            - 'spec': The FMHAv2KernelSpec object
-    """
-    # Build kernel spec from API params
     kspec = get_kernel_spec_from_api(api_params)
-
     if not is_kernel_spec_valid(kspec):
         raise ValueError(f"Invalid kernel spec: {kspec}")
-
-    # Generate file/function names
     fname, lname, kname = encode_name(kspec)
-
-    # Generate kernel code (contains kernels + launcher)
     kernel_code = get_kernel_code(kspec, kname, lname)
     if kernel_code is None:
         raise ValueError(f"Failed to generate kernel code for spec: {kspec}")
 
-    # Generate dispatcher header (declares launcher extern, provides fixed-name wrapper)
-    dispatcher_code = get_dispatcher_code(kspec, fname, lname)
+    with open(jit_env.FLASHINFER_CSRC_DIR / "fmha_v2_dispatcher.jinja", "r") as f:
+        dispatcher_template = jinja2.Template(f.read())
+    dispatcher_code = dispatcher_template.render(launcher_name=lname)
 
     return {
         "kernel_code": kernel_code,
