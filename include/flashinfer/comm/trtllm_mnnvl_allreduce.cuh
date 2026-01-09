@@ -1175,7 +1175,7 @@ __device__ uint32_t cvt_warp_fp16_to_fp4(vec_t<T, VEC_SIZE>& vec, float SFScaleV
 // ============================== Quant Device Function ==============================
 template <typename T, typename PackedType, int ELTS_PER_THREAD>
 inline __device__ void quant_fp8(PackedVec<PackedType, T> packedAccum, void* quantOutPtr,
-                                 float* outputScale, uint32_t threadOffset) {
+                                 float invOutputScale, uint32_t threadOffset) {
   static_assert(ELTS_PER_THREAD == 8 || ELTS_PER_THREAD == 4, "ELTS_PER_THREAD must be 8 or 4");
   using QuantizedPackedType = std::conditional_t<ELTS_PER_THREAD == 8, float2, float>;
 
@@ -1184,7 +1184,7 @@ inline __device__ void quant_fp8(PackedVec<PackedType, T> packedAccum, void* qua
 #pragma unroll
   for (int i = 0; i < ELTS_PER_THREAD; i++) {
     quantizedAccum.elements[i] =
-        __nv_fp8_e4m3(toFloat<T>(packedAccum.elements[i]) * (*outputScale));
+        __nv_fp8_e4m3(toFloat<T>(packedAccum.elements[i]) * invOutputScale);
   }
   reinterpret_cast<QuantizedPackedType*>(&quantOut[threadOffset])[0] = quantizedAccum.packed;
 }
@@ -1373,7 +1373,8 @@ __global__ void __launch_bounds__(config::kMaxBlockSize) oneshotAllreduceFusionK
   }
 
   if constexpr (QType == QuantType::kFP8) {
-    quant::quant_fp8<T, PackedType, kELTS_PER_THREAD>(packedAccum, quantOutPtr, outputScale,
+    float invOutputScale = 1.0f / (*outputScale);  // We need to apply inv_scale to the output
+    quant::quant_fp8<T, PackedType, kELTS_PER_THREAD>(packedAccum, quantOutPtr, invOutputScale,
                                                       threadOffset);
   }
 #if CUDA_VERSION >= 12080
@@ -1805,7 +1806,8 @@ __global__ __launch_bounds__(config::kMaxBlockSize) void rmsNormLamport_fusion(
         *reinterpret_cast<float4*>(&outputNorm[blockLoadOffset + threadLoadOffset]) = rOut.packed;
       }
       if constexpr (QType == QuantType::kFP8) {
-        quant::quant_fp8<T, float4, kELTS_PER_LOAD>(rOut, quantOut, outputScale,
+        float invOutputScale = 1.0f / (*outputScale);
+        quant::quant_fp8<T, float4, kELTS_PER_LOAD>(rOut, quantOut, invOutputScale,
                                                     blockLoadOffset + threadLoadOffset);
       }
 #if CUDA_VERSION >= 12080
