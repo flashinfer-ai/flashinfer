@@ -504,12 +504,11 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, cudaStream_t
 
       auto nh = params.nheads;
       auto dim = params.dim;
-      auto B = params.state_cache_size;
 
       FLASHINFER_CHECK(reinterpret_cast<uintptr_t>(params.state) % 128 ==
                        0);  // TMA requires 128B aligned
-      auto tensorState =
-          tma::createTensorMap<state_t>(params.state, B * nh * dim, DSTATE, rowsPerStage, DSTATE);
+      auto tensorState = tma::createTensorMap<state_t>(
+          params.state, params.state_cache_size * nh * dim, DSTATE, rowsPerStage, DSTATE);
 
       scan_func<<<grid, block, 0, stream>>>(params, tensorState);
     };
