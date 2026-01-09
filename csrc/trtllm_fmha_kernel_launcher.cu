@@ -217,18 +217,15 @@ inline Data_type dl_dtype_to_tllm_data_type(const DLDataType dtype) {
 
 inline bool is_4bit(Data_type data_type) { return data_type == Data_type::DATA_TYPE_E2M1; }
 
-void trtllm_paged_attention_decode(TensorView out, Optional<TensorView> out_scale_factor,
-                                   TensorView query, TensorView key_cache, TensorView value_cache,
-                                   TensorView workspace_buffer, TensorView block_tables,
-                                   TensorView seq_lens, int64_t max_q_len, int64_t max_kv_len,
-                                   Variant<double, ffi::Tensor> bmm1_scale,
-                                   Variant<double, ffi::Tensor> bmm2_scale, double o_sf_scale,
-                                   int64_t o_sf_vec_size, int64_t o_sf_start_index,
-                                   int64_t batch_size, int64_t window_left,
-                                   int64_t sparse_mla_top_k, int64_t sm_count, bool enable_pdl,
-                                   bool batch_invariant, int64_t workspace_size,
-                                   Optional<TensorView> attention_sinks,
-                                   Optional<TensorView> cum_seq_lens_q) {
+void trtllm_paged_attention_decode(
+    TensorView out, Optional<TensorView> out_scale_factor, TensorView query, TensorView key_cache,
+    TensorView value_cache, TensorView workspace_buffer, TensorView block_tables,
+    TensorView seq_lens, int64_t max_q_len, int64_t max_kv_len,
+    Variant<double, ffi::Tensor> bmm1_scale, Variant<double, ffi::Tensor> bmm2_scale,
+    double o_sf_scale, int64_t o_sf_vec_size, int64_t o_sf_start_index, int64_t batch_size,
+    int64_t window_left, int64_t sparse_mla_top_k, int64_t sm_count, bool enable_pdl,
+    bool batch_invariant, int64_t workspace_size, Optional<TensorView> attention_sinks,
+    Optional<TensorView> cum_seq_lens_q) {
   auto q_data_type = dl_dtype_to_tllm_data_type(query.dtype());
   auto kv_data_type = dl_dtype_to_tllm_data_type(key_cache.dtype());
   TVM_FFI_ICHECK_EQ(key_cache.ndim(), value_cache.ndim());
@@ -310,15 +307,17 @@ void trtllm_paged_attention_decode(TensorView out, Optional<TensorView> out_scal
       sparse_mla_top_k, sm_count, enable_pdl, batch_invariant, workspace_size, stream);
 }
 
-void trtllm_paged_attention_context(
-    TensorView out, Optional<TensorView> out_scale_factor, TensorView query, TensorView key_cache,
-    TensorView value_cache, TensorView workspace_buffer, TensorView block_tables,
-    TensorView seq_lens, int64_t max_q_len, int64_t max_kv_len,
-    Variant<double, ffi::Tensor> bmm1_scale, Variant<double, ffi::Tensor> bmm2_scale,
-    double o_sf_scale, int64_t o_sf_vec_size, int64_t o_sf_start_index, int64_t batch_size,
-    int64_t window_left, TensorView cum_seq_lens_q, TensorView cum_seq_lens_kv, int64_t sm_count,
-    bool enable_pdl, bool batch_invariant, int64_t workspace_size,
-    Optional<TensorView> attention_sinks) {
+void trtllm_paged_attention_context(TensorView out, Optional<TensorView> out_scale_factor,
+                                    TensorView query, TensorView key_cache, TensorView value_cache,
+                                    TensorView workspace_buffer, TensorView block_tables,
+                                    TensorView seq_lens, int64_t max_q_len, int64_t max_kv_len,
+                                    Variant<double, ffi::Tensor> bmm1_scale,
+                                    Variant<double, ffi::Tensor> bmm2_scale, double o_sf_scale,
+                                    int64_t o_sf_vec_size, int64_t o_sf_start_index,
+                                    int64_t batch_size, int64_t window_left,
+                                    TensorView cum_seq_lens_q, TensorView cum_seq_lens_kv,
+                                    int64_t sm_count, bool enable_pdl, bool batch_invariant,
+                                    int64_t workspace_size, Optional<TensorView> attention_sinks) {
   auto q_data_type = dl_dtype_to_tllm_data_type(query.dtype());
   auto kv_data_type = dl_dtype_to_tllm_data_type(key_cache.dtype());
   auto o_data_type = dl_dtype_to_tllm_data_type(out.dtype());
