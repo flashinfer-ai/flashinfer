@@ -445,6 +445,24 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, cudaStream_t
   if (sm_major < 9)  // pre-Hopper
 #endif
   {
+    using Load = VectorizedLoadTraits<input_t, weight_t, state_t>;
+    constexpr size_t vec_size = sizeof(typename Load::input);
+    constexpr size_t state_vec_size = sizeof(typename Load::state);
+    if (Load::chunk_size > 1) {
+      FLASHINFER_CHECK(reinterpret_cast<uintptr_t>(params.state) % state_vec_size == 0,
+                       "state pointer must be aligned to ", state_vec_size, " bytes");
+      FLASHINFER_CHECK(reinterpret_cast<uintptr_t>(params.B) % vec_size == 0,
+                       "B pointer must be aligned to ", vec_size, " bytes");
+      FLASHINFER_CHECK(reinterpret_cast<uintptr_t>(params.C) % vec_size == 0,
+                       "C pointer must be aligned to ", vec_size, " bytes");
+      FLASHINFER_CHECK((params.B_stride_batch * sizeof(input_t)) % vec_size == 0,
+                       "B batch stride must be aligned to ", vec_size, " bytes");
+      FLASHINFER_CHECK((params.C_stride_batch * sizeof(input_t)) % vec_size == 0,
+                       "C batch stride must be aligned to ", vec_size, " bytes");
+      FLASHINFER_CHECK((params.dim * params.dstate * sizeof(state_t)) % state_vec_size == 0,
+                       "state head stride must be aligned to ", state_vec_size, " bytes");
+    }
+
     auto dispatch_dstate = [&]<int DSTATE>() {
       constexpr int numWarps = 2;
       int const blocks_per_dim = (params.dim + 32 * numWarps - 1) / (32 * numWarps);
