@@ -2001,7 +2001,8 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
         atomicAdd(&s_histogram[bin], 1);
       }
     }
-  }  __syncthreads();
+  }
+  __syncthreads();
 
   // Suffix sum
   const auto run_cumsum = [&]() {
