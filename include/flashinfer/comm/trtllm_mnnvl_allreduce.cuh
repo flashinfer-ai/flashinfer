@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#pragma once
+
 #include <cooperative_groups.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -25,7 +27,6 @@
 #include <cuda_pipeline.h>
 #include <cuda_runtime.h>
 
-#include <iostream>
 #include <optional>
 #include <type_traits>
 
@@ -38,38 +39,64 @@
 namespace flashinfer {
 namespace trtllm_mnnvl_allreduce {
 
-// TODO: Same; This enum defination is duplicated
+// ======================= Configuration Constants =======================
+namespace config {
+static constexpr int kMaxBlockSize = 1024;
+static constexpr int kPreferredBlockSize = 128;
+static constexpr int kMaxClusterSize = 8;
+static constexpr int kMaxLoadsPerThread = 8;
+}  // namespace config
+
+// TODO:  This enum definition is duplicated
 enum class QuantType : int {
   kNone = 0,
   kFP8 = 1,
   kFP4 = 2,
 };
 
+/**
+ * @brief Parameters for MNNVL AllReduce fusion operations.
+ *
+ * This structure configures the allreduce kernel for multi-node NVLink
+ * communication with optional RMSNorm and quantization fusion.
+ */
 struct AllReduceFusionParams {
-  int nRanks;
-  int rank;
-  int numTokens;
-  int tokenDim;
-  void** bufferPtrsDev;
-  void* bufferPtrLocal;
-  void* multicastPtr;
-  uint32_t* bufferFlags;
-  bool rmsNormFusion = false;
-  bool launchWithPdl = false;
+  // Communication topology
+  int nRanks;  ///< Number of ranks participating in allreduce
+  int rank;    ///< Current rank index (0-based)
 
-  void const* input;
-  void const* residualIn = nullptr;
-  void const* gamma = nullptr;
-  double epsilon = 1e-5;
-  float* outputScale = nullptr;
+  // Problem dimensions
+  int numTokens;  ///< Number of tokens to process
+  int tokenDim;   ///< Hidden dimension per token
+
+  // Communication buffers
+  void** bufferPtrsDev;   ///< Device array of unicast pointers for each rank
+  void* bufferPtrLocal;   ///< Local rank's buffer pointer
+  void* multicastPtr;     ///< Multicast buffer pointer for broadcast
+  uint32_t* bufferFlags;  ///< Lamport clock flags for synchronization
+
+  // Fusion options
+  bool rmsNormFusion = false;  ///< Enable RMSNorm fusion after allreduce
+  bool launchWithPdl = false;  ///< Enable programmatic dependent launch
+
+  // Input tensors
+  void const* input;                 ///< Input tensor to allreduce
+  void const* residualIn = nullptr;  ///< Residual input for fusion (required if rmsNormFusion=true)
+  void const* gamma = nullptr;       ///< RMSNorm gamma weights (required if rmsNormFusion=true)
+  double epsilon = 1e-5;             ///< RMSNorm epsilon for numerical stability
+  float* outputScale = nullptr;  ///< Pointer to output scale factor for quantization, should be a 4
+                                 ///< byte, float32 value in GPU memory.
+
+  // Quantization options
   QuantizationSFLayout sfLayout = QuantizationSFLayout::SWIZZLED_128x4;
   QuantType quantType = QuantType::kNone;
 
-  void* residualOut = nullptr;
-  void* output = nullptr;
-  void* quantOut = nullptr;
-  void* scalingFactorOut = nullptr;
-  cudaStream_t stream = nullptr;
+  // Output tensors
+  void* residualOut = nullptr;       ///< Output for residual (pre-norm result)
+  void* output = nullptr;            ///< Output for normalized result
+  void* quantOut = nullptr;          ///< Output for quantized result
+  void* scalingFactorOut = nullptr;  ///< Output for quantization scaling factors (for NVFP4 only)
+  cudaStream_t stream = nullptr;     ///< CUDA stream for kernel execution
 };
 
 namespace utils {
@@ -471,8 +498,8 @@ inline __device__ T blockReduceSum(T val) {
 std::tuple<int, int, int> adjustGridConfig(int numTokens, int dim, int eltsPerThread,
                                            int smVersionMajor) {
   // Start with preferred block_size and cluster_size
-  int clusterSize = smVersionMajor >= 9 ? 8 : 1;
-  int blockSize = 128;
+  int clusterSize = smVersionMajor >= 9 ? config::kMaxClusterSize : 1;
+  int blockSize = config::kPreferredBlockSize;
   // ========================== Adjust the grid configuration ==========================
   int threadsNeeded = ceil_div(dim, eltsPerThread);
   int loadsPerThread = 1;
@@ -483,26 +510,27 @@ std::tuple<int, int, int> adjustGridConfig(int numTokens, int dim, int eltsPerTh
       clusterSize /= 2;
     }
     blockSize = ceil_div(threadsNeeded, clusterSize);
-    while (blockSize < 128 && clusterSize >= 2) {
+    while (blockSize < config::kPreferredBlockSize && clusterSize >= 2) {
       blockSize *= 2;
       clusterSize /= 2;
     }
     int smCount = GetCudaMultiProcessorCount();
-    while (numTokens * clusterSize > smCount && clusterSize > 1 && blockSize <= 512) {
+    while (numTokens * clusterSize > smCount && clusterSize > 1 &&
+           blockSize <= config::kMaxBlockSize / 2) {
       blockSize *= 2;
       clusterSize /= 2;
     }
   }
-  // Trying to scale up use multiple loads or CGA
-  while (blockSize > 1024) {
+  // Trying to scale up using multiple loads or CGA
+  while (blockSize > config::kMaxBlockSize) {
     if (smVersionMajor >= 9) {
-      if (clusterSize < 8) {
+      if (clusterSize < config::kMaxClusterSize) {
         clusterSize = clusterSize << 1;
       } else {
         break;
       }
     } else {
-      if (loadsPerThread < 8) {
+      if (loadsPerThread < config::kMaxLoadsPerThread) {
         loadsPerThread += 1;
       } else {
         break;
@@ -520,6 +548,12 @@ using utils::toFloat;
 
 // TODO: These code are shared with trtllm_allreduce_fusion.cuh, and moe_allreduce_fusion; Should we
 // move them to a shared header?
+/**
+ * @brief Quantization utilities for FP8 and FP4 output quantization.
+ *
+ * Contains type casting, math operations, and conversion functions used
+ * for post-allreduce quantization fusion.
+ */
 namespace quant {
 
 namespace details {
@@ -1140,44 +1174,44 @@ __device__ uint32_t cvt_warp_fp16_to_fp4(vec_t<T, VEC_SIZE>& vec, float SFScaleV
 
 // ============================== Quant Device Function ==============================
 template <typename T, typename PackedType, int ELTS_PER_THREAD>
-inline __device__ void quant_fp8(PackedVec<PackedType, T> packed_accum, void* quant_out_ptr,
-                                 float* output_scale, uint32_t thread_offset) {
+inline __device__ void quant_fp8(PackedVec<PackedType, T> packedAccum, void* quantOutPtr,
+                                 float* outputScale, uint32_t threadOffset) {
   static_assert(ELTS_PER_THREAD == 8 || ELTS_PER_THREAD == 4, "ELTS_PER_THREAD must be 8 or 4");
   using QuantizedPackedType = std::conditional_t<ELTS_PER_THREAD == 8, float2, float>;
 
-  auto quant_out = reinterpret_cast<__nv_fp8_e4m3*>(quant_out_ptr);
-  PackedVec<QuantizedPackedType, __nv_fp8_e4m3> quantized_accum;
+  auto quantOut = reinterpret_cast<__nv_fp8_e4m3*>(quantOutPtr);
+  PackedVec<QuantizedPackedType, __nv_fp8_e4m3> quantizedAccum;
 #pragma unroll
   for (int i = 0; i < ELTS_PER_THREAD; i++) {
-    quantized_accum.elements[i] =
-        __nv_fp8_e4m3(toFloat<T>(packed_accum.elements[i]) * (*output_scale));
+    quantizedAccum.elements[i] =
+        __nv_fp8_e4m3(toFloat<T>(packedAccum.elements[i]) * (*outputScale));
   }
-  reinterpret_cast<QuantizedPackedType*>(&quant_out[thread_offset])[0] = quantized_accum.packed;
+  reinterpret_cast<QuantizedPackedType*>(&quantOut[threadOffset])[0] = quantizedAccum.packed;
 }
 
 template <typename T, typename PackedType, int ELTS_PER_THREAD>
-inline __device__ void quant_nvfp4(PackedVec<PackedType, T> packed_accum, void* quant_out_ptr,
-                                   void* sf_out_ptr, float* output_scale, uint32_t token_idx,
-                                   uint32_t token_dim, uint32_t packed_idx,
-                                   QuantizationSFLayout sf_layout) {
+inline __device__ void quant_nvfp4(PackedVec<PackedType, T> packedAccum, void* quantOutPtr,
+                                   void* sfOutPtr, float* outputScale, uint32_t tokenIdx,
+                                   uint32_t tokenDim, uint32_t packedIdx,
+                                   QuantizationSFLayout sfLayout) {
   static_assert(
       ELTS_PER_THREAD == 8 && (std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16>),
       "NVFP4 quantization fusion is only supported for FP16/BF16!");
 
   // Cast the packed accumulator
-  auto packed_accum_ = *reinterpret_cast<vec_t<T, ELTS_PER_THREAD>*>(&packed_accum);
+  auto packedAccum_ = *reinterpret_cast<vec_t<T, ELTS_PER_THREAD>*>(&packedAccum);
   // SFType is only the pointer type; It does not affect the internal logic of offset calculation.
   // Get the target pointer to the SF output.
-  auto sf_out =
+  auto sfOut =
       cvt_quant_to_fp4_get_sf_out_offset<uint32_t, details::CVT_FP4_SF_VEC_SIZE / ELTS_PER_THREAD>(
-          std::nullopt, token_idx, packed_idx, std::nullopt, token_dim /* numCols, don't divide*/,
-          reinterpret_cast<uint32_t*>(sf_out_ptr), sf_layout);
+          std::nullopt, tokenIdx, packedIdx, std::nullopt, tokenDim /* numCols, don't divide*/,
+          reinterpret_cast<uint32_t*>(sfOutPtr), sfLayout);
 
   // Calculate the offset in packed item granularity for the quant output
-  uint32_t quant_out_offset = token_idx * token_dim / ELTS_PER_THREAD + packed_idx;
+  uint32_t quantOutOffset = tokenIdx * tokenDim / ELTS_PER_THREAD + packedIdx;
   // Each packedvec has 8 elements -> 1 float4 in input -> 1 uint32_t in output
-  reinterpret_cast<uint32_t*>(quant_out_ptr)[quant_out_offset] =
-      cvt_warp_fp16_to_fp4<T, ELTS_PER_THREAD, false>(packed_accum_, *output_scale, sf_out);
+  reinterpret_cast<uint32_t*>(quantOutPtr)[quantOutOffset] =
+      cvt_warp_fp16_to_fp4<T, ELTS_PER_THREAD, false>(packedAccum_, *outputScale, sfOut);
 }
 };  // namespace quant
 
@@ -1189,7 +1223,7 @@ using utils::loadPackedVolatile;
 
 template <uint8_t WorldSize, typename T, bool RMSNormFusion = false,
           QuantType QType = QuantType::kNone, typename PackedType = float4>
-__global__ void __launch_bounds__(1024) oneshotAllreduceFusionKernel(
+__global__ void __launch_bounds__(config::kMaxBlockSize) oneshotAllreduceFusionKernel(
     /* output ptrs*/
     T* outputPtr, T* prenormedPtr, void* quantOutPtr, void* scalingFactorOutPtr,
     /* input ptrs*/
@@ -1341,11 +1375,14 @@ __global__ void __launch_bounds__(1024) oneshotAllreduceFusionKernel(
   if constexpr (QType == QuantType::kFP8) {
     quant::quant_fp8<T, PackedType, kELTS_PER_THREAD>(packedAccum, quantOutPtr, outputScale,
                                                       threadOffset);
-  } else if constexpr (QType == QuantType::kFP4) {
+  }
+#if CUDA_VERSION >= 12080
+  else if constexpr (QType == QuantType::kFP4) {
     quant::quant_nvfp4<T, PackedType, kELTS_PER_THREAD>(packedAccum, quantOutPtr,
                                                         scalingFactorOutPtr, outputScale, token,
                                                         tokenDim, packedIdx, sfLayout);
   }
+#endif
   flag.waitAndUpdate(
       {static_cast<uint32_t>(numTokens * tokenDim * WorldSize * kELT_SIZE), 0, 0, 0});
 }
@@ -1372,9 +1409,10 @@ cudaError_t oneshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
       numTokens, clusterSize, blockSize, clusterSize, loadsPerThread,
       ceil_div(tokenDim, eltsPerThread));
 
-  FLASHINFER_CHECK(blockSize <= 1024 && loadsPerThread == 1,
-                   "Hidden Dimension %d exceeds the maximum supported hidden dimension (%d)",
-                   tokenDim, 1024 * (kSMVersionMajor >= 9 ? 8 : 1) * eltsPerThread);
+  FLASHINFER_CHECK(
+      blockSize <= config::kMaxBlockSize && loadsPerThread == 1,
+      "Hidden Dimension %d exceeds the maximum supported hidden dimension (%d)", tokenDim,
+      config::kMaxBlockSize * (kSMVersionMajor >= 9 ? config::kMaxClusterSize : 1) * eltsPerThread);
 
   cudaLaunchAttribute attrs[2];
   attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
@@ -1469,7 +1507,7 @@ enum MNNVLTwoShotStage : uint8_t {
 };
 
 template <uint8_t WorldSize, typename T, typename PackedType = float4>
-__global__ __launch_bounds__(128) void twoshotAllreduceKernel(
+__global__ __launch_bounds__(config::kPreferredBlockSize) void twoshotAllreduceKernel(
     T* outputPtr, T const* shardPtr, T** inputPtrs, T* mcastPtr, uint32_t const numTokens,
     uint32_t const tokenDim, uint32_t const rank, uint32_t* bufferFlags,
     bool const wait_for_results) {
@@ -1606,7 +1644,7 @@ using utils::copyF4;
 //      2. Set loads_per_thread >1. Which can be used if CGA is not supported. Note that this will
 //      be limited by the shared memory size and register count.
 template <typename T, QuantType QType = QuantType::kNone, int LoadsPerThread = 1>
-__global__ __launch_bounds__(1024) void rmsNormLamport_fusion(
+__global__ __launch_bounds__(config::kMaxBlockSize) void rmsNormLamport_fusion(
     /* Output ptrs */
     T* outputPreNorm, T* outputNorm, void* quantOut, void* scalingFactorOut,
     /* Input ptrs */
@@ -1752,28 +1790,31 @@ __global__ __launch_bounds__(1024) void rmsNormLamport_fusion(
 
 #pragma unroll
   for (int i = 0; i < LoadsPerThread; i++) {
-    PackedVec<float4, T> r_out;
+    PackedVec<float4, T> rOut;
     uint32_t threadLoadOffset = (i * loadStride + threadOffset) * kELTS_PER_LOAD;
-    uint32_t token_offset = blockOffset * blockChunkSize + threadLoadOffset;
-    if (token_offset < dim) {
+    uint32_t tokenOffset = blockOffset * blockChunkSize + threadLoadOffset;
+    if (tokenOffset < dim) {
       PackedVec<float4, T> gamma = {.packed = loadPacked<float4>(&smemGamma[threadLoadOffset])};
 
 #pragma unroll
       for (uint32_t j = 0; j < kELTS_PER_LOAD; j++) {
-        r_out.elements[j] =
+        rOut.elements[j] =
             fromFloat<T>(toFloat<T>(gamma.elements[j]) * rInput[i * kELTS_PER_LOAD + j] * rcpRms);
       }
       if (outputNorm != nullptr) {
-        *reinterpret_cast<float4*>(&outputNorm[blockLoadOffset + threadLoadOffset]) = r_out.packed;
+        *reinterpret_cast<float4*>(&outputNorm[blockLoadOffset + threadLoadOffset]) = rOut.packed;
       }
       if constexpr (QType == QuantType::kFP8) {
-        quant::quant_fp8<T, float4, kELTS_PER_LOAD>(r_out, quantOut, outputScale,
+        quant::quant_fp8<T, float4, kELTS_PER_LOAD>(rOut, quantOut, outputScale,
                                                     blockLoadOffset + threadLoadOffset);
-      } else if constexpr (QType == QuantType::kFP4) {
-        quant::quant_nvfp4<T, float4, kELTS_PER_LOAD>(r_out, quantOut, scalingFactorOut,
-                                                      outputScale, token, dim,
-                                                      token_offset / kELTS_PER_LOAD, sfLayout);
       }
+#if CUDA_VERSION >= 12080
+      else if constexpr (QType == QuantType::kFP4) {
+        quant::quant_nvfp4<T, float4, kELTS_PER_LOAD>(rOut, quantOut, scalingFactorOut, outputScale,
+                                                      token, dim, tokenOffset / kELTS_PER_LOAD,
+                                                      sfLayout);
+      }
+#endif
     }
   }
   constexpr int kELTS_SIZE = sizeof(T);
@@ -1796,7 +1837,7 @@ cudaError_t twoshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
                    "[MNNVL AllReduceTwoShot] token_dim must be divisible by %d", numEltsPerThread);
 
   int const arNumThreads = ceil_div(tokenDim, numEltsPerThread);
-  int const arNumBlocksPerToken = ceil_div(arNumThreads, 128);
+  int const arNumBlocksPerToken = ceil_div(arNumThreads, config::kPreferredBlockSize);
 
   dim3 arGrid(numTokens, arNumBlocksPerToken);
 
@@ -1806,15 +1847,15 @@ cudaError_t twoshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
 
   cudaLaunchConfig_t arConfig{
       .gridDim = arGrid,
-      .blockDim = 128,
+      .blockDim = config::kPreferredBlockSize,
       .dynamicSmemBytes = 0,
       .stream = params.stream,
       .attrs = arAttrs,
       .numAttrs = 1,
   };
 
-  FLASHINFER_LOG_DEBUG("[MNNVL AllReduceTwoShot] Dispatch: grid size: (%d, %d, 1), block_size: 128",
-                       numTokens, arNumBlocksPerToken);
+  FLASHINFER_LOG_DEBUG("[MNNVL AllReduceTwoShot] Dispatch: grid size: (%d, %d, 1), block_size: %d",
+                       numTokens, arNumBlocksPerToken, config::kPreferredBlockSize);
 
 #define LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE)                                               \
   FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(                                                \

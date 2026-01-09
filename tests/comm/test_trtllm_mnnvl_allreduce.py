@@ -80,7 +80,7 @@ def row_linear_residual_norm_fusion_forward(
                     workspace,
                     eps,
                     launch_with_pdl=use_pdl,
-                    strategy=trtllm_mnnvl_ar.MNNVLAllreduceFusionStrategy.AUTO,
+                    strategy=trtllm_mnnvl_ar.MNNVLAllreduceFusionStrategy.ONESHOT,
                 )
             )
 
@@ -228,6 +228,7 @@ def row_linear_residual_norm_fusion_forward(
         )
 
 
+# TODO: Remove this legacy test when the deprecated API is removed.
 @torch.inference_mode()
 def row_linear_residual_norm_fusion_forward_legacy(
     x: torch.Tensor,
@@ -603,6 +604,7 @@ def test_mnnvl_allreduce_refactored(
     )
 
 
+# TODO: Remove this legacy test when the deprecated API is removed.
 @pytest.mark.parametrize("seq_lens", [[1], [4], [15], [27, 11, 24], [127]])
 @pytest.mark.parametrize(
     "pattern",
@@ -620,4 +622,14 @@ def test_mnnvl_allreduce_legacy(
     """Test MNNVL AllReduce with legacy API."""
     run_mnnvl_ar_full(
         monkeypatch, seq_lens, pattern, dtype, hidden_size, legacy_api=True
+    )
+
+
+if __name__ == "__main__":
+    test_mnnvl_allreduce_refactored(
+        None,
+        seq_lens=[998],
+        pattern=AllReduceFusionPattern.kAllReduce,
+        dtype=torch.float16,
+        hidden_size=16384,
     )
