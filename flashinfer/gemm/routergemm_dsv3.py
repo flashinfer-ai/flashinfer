@@ -124,6 +124,7 @@ def get_dsv3_router_gemm_module():
     )
 
 
+@flashinfer_api
 @backend_requirement({}, common_check=_mm_M1_16_K7168_N128_shape_checks)
 def mm_M1_16_K7168_N128(
     mat_a: torch.Tensor,
