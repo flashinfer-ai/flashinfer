@@ -4,6 +4,8 @@ import torch
 import flashinfer
 import cudnn
 
+from flashinfer.utils import get_compute_capability
+
 
 @pytest.mark.parametrize("batch_size", [1, 4])
 @pytest.mark.parametrize("s_qo", [8, 17, 700])
@@ -213,6 +215,13 @@ def test_cudnn_prefill_fp8(
     seed = 1
     torch.manual_seed(seed)
     device = "cuda:0"
+
+    major, _ = get_compute_capability(torch.device(device))
+
+    if major != 10:
+        pytest.skip(
+            f"cuDNN FP8 prefill is not supported on compute capability {major}, skipping test"
+        )
 
     actual_seq_lens_q = torch.randint(
         1, s_qo + 1, (batch_size, 1, 1, 1), dtype=torch.int32, device=device
