@@ -1918,6 +1918,7 @@ class TrtllmGenDecodeModule:
         workspace_size: int,
         window_left: int = -1,
         enable_pdl: bool = None,
+        batch_invariant: bool = False,
         out: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -1958,6 +1959,7 @@ class TrtllmGenDecodeModule:
             0,  # sparse_mla_top_k
             self._sm_count,
             enable_pdl,
+            batch_invariant,
             workspace_size,
             sinks,
             None,  # cum_seq_lens_q

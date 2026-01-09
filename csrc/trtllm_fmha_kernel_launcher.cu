@@ -151,6 +151,8 @@ void trtllm_paged_attention_launcher(
 
   AlignedAllocator float_allocator(workspace_buffer, workspace_size);
   if (mode == TllmPagedAttentionMode::Context) {
+    // Note: batch_invariant parameter has no effect in context mode, as context mode
+    // always uses Persistent scheduler and disables multi-CTA optimization.
     runner_params.mMaskType = TrtllmGenAttentionMaskType::Causal;
     runner_params.mKernelType = FmhaKernelType::Context;
     runner_params.mTileScheduler = TileScheduler::Persistent;
