@@ -393,7 +393,7 @@ __global__ void selective_state_update_kernel_producer_consumer_vertical(
       for (auto dd = warp; dd < rowsPerStage; dd += consumerWarps) {
         auto d = dBegin + dd;
         float const x_value = toFloat(sram.x[d]);
-        float out_value = toFloat(d_value) * x_value * int(lane == 0);  // first lane has the value
+        float out_value = d_value * x_value * int(lane == 0);  // first lane has the value
 
         for (int i = lane; i < DSTATE; i += warpSize) {
           auto const state_value = (state_batch != params.pad_slot_id)
