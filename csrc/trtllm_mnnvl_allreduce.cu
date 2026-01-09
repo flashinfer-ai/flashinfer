@@ -93,7 +93,7 @@ void trtllm_mnnvl_allreduce_fusion(
         << "residual_in, residual_out, gamma, and epsilon must be provided if rmsnorm_fusion is "
            "true";
     TVM_FFI_ICHECK(quant_type_enum == QuantType::kNone || (rmsnorm_fusion && sizeof(c_type) == 2))
-        << "Qaunt fusion is only supported with RMSNorm fusion and FP16/BF16 dtype.";
+        << "Quant fusion is only supported with RMSNorm fusion and FP16/BF16 dtype.";
 
     if (rmsnorm_fusion) {
       TVM_FFI_ICHECK(residual_in.value().size(0) == num_tokens &&
@@ -118,7 +118,18 @@ void trtllm_mnnvl_allreduce_fusion(
               << ")";
           break;
         case QuantType::kFP4:
-          // TODO: Check FP4 output shape?
+          // FP4 packs 2 elements per byte, assuming input tensor is of uint8 or FP4X2 dtype, so
+          // quant_out has half the token_dim
+          TVM_FFI_ICHECK(quant_out.has_value() && quant_out.value().size(0) == num_tokens &&
+                         quant_out.value().size(1) == token_dim / 2)
+              << "quant_out shape mismatch for FP4: expected (" << num_tokens << ", "
+              << token_dim / 2 << ") but got (" << quant_out.value().size(0) << ", "
+              << quant_out.value().size(1) << ")";
+          // We only check the sf out size to be large enough.
+          TVM_FFI_ICHECK(sf_out.has_value() &&
+                         sf_out.value().numel() >= (num_tokens * token_dim / 16))
+              << "sf_out size mismatch for FP4: expected at least " << num_tokens * token_dim / 16
+              << " elements but got " << sf_out.value().numel();
           break;
       }
     }
