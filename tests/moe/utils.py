@@ -52,7 +52,7 @@ def skip_checks(
     is_fp4_moe = type(moe_impl).__name__ == "FP4Moe"
     is_fp8_block_scale_moe = type(moe_impl).__name__ == "FP8BlockScaleMoe"
 
-    # Skip checking zero input for FP8 Block Scale MoE
+    # Skip zero hidden states tests for non-FP8 Block Scale MoE implementations
     if zero_hidden_states and not is_fp8_block_scale_moe:
         pytest.skip("Skipping zero hidden states tests for non-FP8 Block Scale MoE.")
 
