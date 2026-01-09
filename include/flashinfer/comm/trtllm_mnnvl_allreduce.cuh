@@ -1768,7 +1768,8 @@ __global__ __launch_bounds__(1024) void rmsNormLamport_fusion(
         *reinterpret_cast<float4*>(&outputNorm[blockLoadOffset + threadLoadOffset]) = r_out.packed;
       }
       if constexpr (QType == QuantType::kFP8) {
-        quant::quant_fp8<T, float4, kELTS_PER_LOAD>(r_out, quantOut, outputScale, threadOffset);
+        quant::quant_fp8<T, float4, kELTS_PER_LOAD>(r_out, quantOut, outputScale,
+                                                    blockLoadOffset + threadLoadOffset);
       } else if constexpr (QType == QuantType::kFP4) {
         quant::quant_nvfp4<T, float4, kELTS_PER_LOAD>(r_out, quantOut, scalingFactorOut,
                                                       outputScale, token, dim,
