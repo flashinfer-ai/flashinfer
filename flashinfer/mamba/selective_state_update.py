@@ -20,18 +20,30 @@ from typing import Optional
 import torch
 
 from ..api_logging import flashinfer_api
-from ..jit.mamba import gen_selective_state_update_module
-from ..utils import register_custom_op, register_fake_op
+from ..jit.mamba import (
+    gen_selective_state_update_module,
+    gen_selective_state_update_sm90_module,
+)
+from ..utils import get_compute_capability, register_custom_op, register_fake_op
 
 
 @functools.cache
-def get_selective_state_update_module():
-    """Get cached JIT-compiled selective_state_update module.
-
-    This uses @functools.cache for in-memory caching of loaded modules.
-    The JIT system also caches compiled .so files on disk in ~/.cache/flashinfer/
-    """
+def get_selective_state_update_module_base():
+    """Get cached JIT-compiled selective_state_update module (base version)."""
     return gen_selective_state_update_module().build_and_load()
+
+
+@functools.cache
+def get_selective_state_update_module_sm90():
+    """Get cached JIT-compiled selective_state_update module (SM90+ version)."""
+    return gen_selective_state_update_sm90_module().build_and_load()
+
+
+def get_selective_state_update_module(device: torch.device):
+    if get_compute_capability(device)[0] >= 9:
+        return get_selective_state_update_module_sm90()
+    else:
+        return get_selective_state_update_module_base()
 
 
 @flashinfer_api
@@ -141,7 +153,7 @@ def _selective_state_update(
     pad_slot_id: int,
 ) -> None:
     """Internal function registered with torch.library for torch.compile() support."""
-    get_selective_state_update_module().selective_state_update(
+    get_selective_state_update_module(state.device).selective_state_update(
         state,
         x,
         dt,

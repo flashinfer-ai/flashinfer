@@ -15,7 +15,7 @@ limitations under the License.
 """
 
 from .. import env as jit_env
-from ..core import JitSpec, gen_jit_spec, sm90a_nvcc_flags
+from ..core import JitSpec, common_nvcc_flags, gen_jit_spec
 
 
 def gen_selective_state_update_module() -> JitSpec:
@@ -34,10 +34,13 @@ def gen_selective_state_update_module() -> JitSpec:
 
 
 def gen_selective_state_update_sm90_module() -> JitSpec:
-    nvcc_flags = sm90a_nvcc_flags + [
+    # Use generic SM90 flags to support SM90, SM100 and future architectures
+    # code=compute_90 embeds PTX for forward compatibility
+    nvcc_flags = [
+        "-gencode=arch=compute_90,code=[sm_90,compute_90]",
         "-DENABLE_BF16",
         "-DFLASHINFER_MAMBA_ENABLE_SM90",
-    ]
+    ] + common_nvcc_flags
 
     return gen_jit_spec(
         "mamba_selective_state_update_sm90",
