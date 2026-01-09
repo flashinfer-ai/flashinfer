@@ -1996,9 +1996,12 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
     for (int j = 0; j < VEC_SIZE; ++j) {
       const auto bin = Traits::ToCoarseKey(score_vec[j]);
       atomicAdd(&s_histogram[bin], 1);
+      if (base + j < length) {
+        const auto bin = Traits::ToCoarseKey(score_vec[j]);
+        atomicAdd(&s_histogram[bin], 1);
+      }
     }
-  }
-  __syncthreads();
+  }  __syncthreads();
 
   // Suffix sum
   const auto run_cumsum = [&]() {
@@ -2038,10 +2041,12 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
       score_vec.cast_load(&score[base]);
 #pragma unroll
       for (int j = 0; j < VEC_SIZE; ++j) {
-        const auto bin = static_cast<int>(Traits::ToCoarseKey(score_vec[j]));
-        if (bin > threshold_bin) {
-          const auto pos = atomicAdd(&s_counter, 1);
-          s_indices[pos] = base + j;
+        if (bin + j < length) {
+          const auto bin = static_cast<int>(Traits::ToCoarseKey(score_vec[j]));
+          if (bin > threshold_bin) {
+            const auto pos = atomicAdd(&s_counter, 1);
+            s_indices[pos] = base + j;
+          }
         }
       }
     }
@@ -2057,18 +2062,20 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
       score_vec.cast_load(&score[base]);
 #pragma unroll
       for (int j = 0; j < VEC_SIZE; ++j) {
-        const auto raw_input = score_vec[j];
-        const auto bin = static_cast<int>(Traits::ToCoarseKey(raw_input));
-        if (bin > threshold_bin) {
-          const auto pos = atomicAdd(&s_counter, 1);
-          s_indices[pos] = base + j;
-        } else if (bin == threshold_bin) {
-          const auto pos = atomicAdd(&s_num_input[0], 1);
-          if (__builtin_expect(pos < SMEM_INPUT_SIZE, 1)) {
-            s_input_idx[0][pos] = base + j;
-            const auto ordered = Traits::ToOrdered(raw_input);
-            const auto sub_bin = (ordered >> FIRST_SHIFT) & 0xFF;
-            atomicAdd(&s_histogram[sub_bin], 1);
+        if (base + j < length) {
+          const auto raw_input = score_vec[j];
+          const auto bin = static_cast<int>(Traits::ToCoarseKey(raw_input));
+          if (bin > threshold_bin) {
+            const auto pos = atomicAdd(&s_counter, 1);
+            s_indices[pos] = base + j;
+          } else if (bin == threshold_bin) {
+            const auto pos = atomicAdd(&s_num_input[0], 1);
+            if (__builtin_expect(pos < SMEM_INPUT_SIZE, 1)) {
+              s_input_idx[0][pos] = base + j;
+              const auto ordered = Traits::ToOrdered(raw_input);
+              const auto sub_bin = (ordered >> FIRST_SHIFT) & 0xFF;
+              atomicAdd(&s_histogram[sub_bin], 1);
+            }
           }
         }
       }
