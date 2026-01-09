@@ -527,6 +527,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
     bmm2_scale: Union[float, torch.Tensor] = 1.0,
     sinks: Optional[List[torch.Tensor]] = None,
     enable_pdl: bool = None,
+    batch_invariant: bool = False,
     backend: str = "auto",
 ) -> torch.Tensor:
     """
@@ -548,6 +549,12 @@ def trtllm_batch_decode_with_kv_cache_mla(
     bmm2_scale: fused scale for mla bmm2 input.
         when using trtllm-gen backend, it can be a torch.Tensor with dtype torch.float32.
     sinks: additional value per head in the denominator of the softmax.
+    batch_invariant: bool = False
+        Whether to enable batch-invariant mode. When enabled, the kernel disables multi-CTA
+        (Cooperative Thread Array) optimization, which ensures the output is invariant to the
+        batch size. This is useful when you want to call the function on individual requests
+        and expect the same output as calling it on the entire batch.
+        Only effective when backend is ``trtllm-gen``.
     backend : str = "auto"
         The implementation backend, could be ``auto``/``xqa`` or ``trtllm-gen``. Defaults to ``auto``.
         When set to ``auto``, the backend will be chosen based on the device architecture and kernel availability.
@@ -675,6 +682,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
             sparse_mla_top_k,
             sm_count,
             enable_pdl,
+            batch_invariant,
             workspace_buffer.numel() * workspace_buffer.element_size(),
             sinks,
             None,  # cum_seq_lens_q
