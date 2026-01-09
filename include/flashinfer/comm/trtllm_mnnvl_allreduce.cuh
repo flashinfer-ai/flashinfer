@@ -1170,9 +1170,8 @@ inline __device__ void quant_nvfp4(PackedVec<PackedType, T> packed_accum, void* 
   // Get the target pointer to the SF output.
   auto sf_out =
       cvt_quant_to_fp4_get_sf_out_offset<uint32_t, details::CVT_FP4_SF_VEC_SIZE / ELTS_PER_THREAD>(
-          std::nullopt, token_idx, packed_idx, std::nullopt,
-          token_dim / details::CVT_FP4_SF_VEC_SIZE, reinterpret_cast<uint32_t*>(sf_out_ptr),
-          sf_layout);
+          std::nullopt, token_idx, packed_idx, std::nullopt, token_dim /* numCols, don't divide*/,
+          reinterpret_cast<uint32_t*>(sf_out_ptr), sf_layout);
 
   // Calculate the offset in packed item granularity for the quant output
   uint32_t quant_out_offset = token_idx * token_dim / ELTS_PER_THREAD + packed_idx;

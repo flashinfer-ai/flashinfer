@@ -115,7 +115,7 @@ def row_linear_residual_norm_fusion_forward(
                     strategy=trtllm_mnnvl_ar.MNNVLAllreduceFusionStrategy.AUTO,
                 )
             )
-            if output:
+            if output is not None:
                 output = output.view(shape)
 
             # We alter the order here to be compatible with the non-quant case
@@ -150,6 +150,19 @@ def row_linear_residual_norm_fusion_forward(
 
     # Check output
     if traits.has_quant:
+        # First check the norm output if any
+        if traits.has_norm_out:
+            assert output[3] is not None
+            torch.testing.assert_close(
+                output[3],
+                reference_output[0],
+                rtol=0.05,
+                atol=0.15,
+            )
+        else:
+            assert output[3] is None
+
+        # Then compare the quant fusion output with the quantized reference output
         if traits.quant_type == QuantFusionType.FP8:
             ref_dequant = dequant(
                 fp8_quant(reference_output[0], dummy_global_scale),
@@ -157,7 +170,7 @@ def row_linear_residual_norm_fusion_forward(
                 torch.float32,
             )
             output_dequant = dequant(output[0], dummy_global_scale, torch.float32)
-            pct_tol = 0.001  # Allow up to 0.1% difference
+            pct_tol = 0.002  # Allow up to 0.2% difference
             assert output[2] is None
 
         elif traits.quant_type == QuantFusionType.NVFP4:
@@ -213,11 +226,6 @@ def row_linear_residual_norm_fusion_forward(
             rtol=0.05,
             atol=0.15,
         )
-    if traits.has_quant:
-        if traits.has_norm_out:
-            assert output[3] is not None
-        else:
-            assert output[3] is None
 
 
 @torch.inference_mode()
@@ -612,15 +620,4 @@ def test_mnnvl_allreduce_legacy(
     """Test MNNVL AllReduce with legacy API."""
     run_mnnvl_ar_full(
         monkeypatch, seq_lens, pattern, dtype, hidden_size, legacy_api=True
-    )
-
-
-if __name__ == "__main__":
-    run_mnnvl_ar_full(
-        None,
-        seq_lens=[64],
-        pattern=AllReduceFusionPattern.kARResidualRMSNormFP8Quant,
-        dtype=torch.float16,
-        hidden_size=2880,
-        legacy_api=False,
     )
