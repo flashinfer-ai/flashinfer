@@ -152,6 +152,7 @@ def can_implement_filtered_topk() -> bool:
     return get_topk_module().can_implement_filtered_topk()
 
 
+@flashinfer_api
 def top_k(
     input: torch.Tensor,
     k: int,

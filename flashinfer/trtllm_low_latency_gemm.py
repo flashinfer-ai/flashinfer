@@ -19,6 +19,7 @@ from typing import Dict, List
 
 import functools
 
+from flashinfer.api_logging import flashinfer_api
 from flashinfer.fused_moe.core import (
     convert_to_block_layout,
     get_w2_permute_indices_with_cache,
@@ -193,6 +194,7 @@ def trtllm_low_latency_gemm(
     return out
 
 
+@flashinfer_api
 def prepare_low_latency_gemm_weights(
     w: torch.Tensor, permutation_indices_cache: Dict[torch.Size, torch.Tensor]
 ) -> torch.Tensor:
