@@ -784,7 +784,7 @@ def test_ragged_transform_offset_correctness():
 
 
 @pytest.mark.parametrize("length_offset", [1, 2, 3, 5, 6, 7])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 def test_ragged_transform_unaligned_length_bounds(length_offset, dtype):
     """Test ragged transform with unaligned lengths doesn't return out-of-bounds indices.
 
