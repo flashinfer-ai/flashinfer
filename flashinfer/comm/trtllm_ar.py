@@ -598,7 +598,7 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     lamport_buffer_size = lamport_comm_size * 3
 
     device = torch.device(f"cuda:{torch.cuda.current_device()}")
-    group_name = group.group_name
+    group_name = group.group_name if group is not None else torch.distributed.group.WORLD.group_name
     symm_refs: list[torch.Tensor] = []
     # we should init 3 buffers for all reduce fusion:
     # [buffer_size, flag_size, lamport_buffer_size]
@@ -628,17 +628,27 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
             symm_refs.append((tensor, handle))
             ipc_handles.append(ptrs)
         else:
-            symm_mem = SymmDeviceMemory(
+            # symm_mem = SymmDeviceMemory(
+            #     aligned_size,
+            #     tp_size,
+            #     tp_rank,
+            #     torch.device("cuda", tp_rank).index,
+            #     comm_backend,
+            #     enable_multicast=False,
+            #     allocate_signal_pads=False,
+            # )
+            # ipc_handles.append(symm_mem.uc_ptrs)
+            # mem_handles.append(symm_mem)
+            ptrs, tensor, handle = _alloc_symm_buffer_bytes(
                 aligned_size,
                 tp_size,
-                tp_rank,
-                torch.device("cuda", tp_rank).index,
-                comm_backend,
-                enable_multicast=False,
-                allocate_signal_pads=False,
+                dtype,
+                device,
+                group_name,
             )
-            ipc_handles.append(symm_mem.uc_ptrs)
-            mem_handles.append(symm_mem)
+            symm_refs.append((tensor, handle))
+            ipc_handles.append(ptrs)
+            mem_handles.append(handle)
 
     print(
         f"rank {tp_rank} allocated ipc_handles: {[[hex(handle) for handle in sublist] for sublist in ipc_handles]}"
