@@ -494,7 +494,8 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, cudaStream_t
       constexpr auto numWarps = 1 + numConsumers;
       constexpr auto numStages = 3;
       constexpr auto rowsPerStage = 4 * numConsumers;
-      FLASHINFER_CHECK(params.dim % rowsPerStage == 0);
+      FLASHINFER_CHECK(params.dim % rowsPerStage == 0, "dim must be divisible by ", rowsPerStage,
+                       " for SM90+ kernel");
       auto scan_func = selective_state_update_kernel_producer_consumer_vertical<
           input_t, weight_t, matrixA_t, state_t, DIM, DSTATE, numConsumers, rowsPerStage,
           numStages>;
