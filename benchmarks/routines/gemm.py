@@ -1038,13 +1038,12 @@ def testMmFp4(args):
         input_fp4, input_inv_s = flashinfer.mxfp4_quantize(input)
         mat2_fp4, mat2_inv_s = flashinfer.mxfp4_quantize(mat2)
 
-    if "trtllm" in backends:
-        mat2_fp4_trtllm, mat2_inv_s_trtllm = flashinfer.nvfp4_quantize(
-            mat2,
-            global_sf_mat2,
-            sfLayout=flashinfer.SfLayout.layout_128x4,
-            do_shuffle=True,
-        )
+    mat2_fp4_trtllm, mat2_inv_s_trtllm = flashinfer.nvfp4_quantize(
+        mat2,
+        global_sf_mat2,
+        sfLayout=flashinfer.SfLayout.layout_128x4,
+        do_shuffle=True,
+    )
 
     if args.verbose >= 2:
         print(f"[VVERBOSE] {input_fp4.shape = }")
