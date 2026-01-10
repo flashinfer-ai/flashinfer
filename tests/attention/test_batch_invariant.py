@@ -28,38 +28,28 @@ def create_workspace_buffers(device):
 
 @pytest.mark.parametrize("kv_layout", ["HND"])
 @pytest.mark.parametrize(
-    "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size",
+    "batch_size,page_size,num_kv_heads,head_grp_size",
     [
-        (4, 1, 16, 8, 4),
+        (4, 16, 8, 4),
     ],
 )
 @pytest.mark.parametrize("window_left", [-1])
-@pytest.mark.parametrize(
-    "q_dtype,kv_dtype,o_dtype",
-    [
-        ("bf16", "bf16", "bf16"),
-    ],
-)
+@pytest.mark.parametrize("q_dtype", ["bf16"])
 @pytest.mark.parametrize("enable_pdl", [None])
-@pytest.mark.parametrize("max_in_kv_len", [2048])
 @pytest.mark.parametrize("head_dim", [128])
 def test_trtllm_batch_decode_batch_invariant(
     kv_layout,
     batch_size,
-    q_len_per_req,
     page_size,
     num_kv_heads,
     head_grp_size,
     window_left,
     q_dtype,
-    o_dtype,
-    kv_dtype,
     enable_pdl,
-    max_in_kv_len,
     head_dim,
 ):
     """Test that batch_invariant parameter produces consistent results across different batch sizes."""
-    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    compute_capability = get_compute_capability(torch.device(GPU_DEVICE))
 
     # trtllm-gen backend requires SM100 and SM103 GPUs
     if compute_capability[0] != 10:
@@ -74,16 +64,25 @@ def test_trtllm_batch_decode_batch_invariant(
     seq_len1 = 128  # Fixed KV seq length
 
     # Single request test
-    q_single = torch.randn(1, num_qo_heads, head_dim, device=GPU_DEVICE, dtype=q_dtype_torch)
+    q_single = torch.randn(
+        1, num_qo_heads, head_dim, device=GPU_DEVICE, dtype=q_dtype_torch
+    )
     seq_lens_single = torch.tensor([seq_len1], dtype=torch.int32, device=GPU_DEVICE)
 
     # Create KV cache for single request
     num_pages_single = (seq_len1 + page_size - 1) // page_size
     kv_cache_single = torch.randn(
-        num_pages_single, 2, num_kv_heads, page_size, head_dim,
-        device=GPU_DEVICE, dtype=q_dtype_torch
+        num_pages_single,
+        2,
+        num_kv_heads,
+        page_size,
+        head_dim,
+        device=GPU_DEVICE,
+        dtype=q_dtype_torch,
     )
-    page_table_single = torch.arange(num_pages_single, dtype=torch.int32, device=GPU_DEVICE).unsqueeze(0)
+    page_table_single = torch.arange(
+        num_pages_single, dtype=torch.int32, device=GPU_DEVICE
+    ).unsqueeze(0)
 
     workspace_buffer_single = create_workspace_buffers(GPU_DEVICE)
 
@@ -110,16 +109,23 @@ def test_trtllm_batch_decode_batch_invariant(
 
     # Now test with a batch containing the same request replicated
     q_batch = q_single.repeat(batch_size, 1, 1)
-    seq_lens_batch = torch.full((batch_size,), seq_len1, dtype=torch.int32, device=GPU_DEVICE)
+    seq_lens_batch = torch.full(
+        (batch_size,), seq_len1, dtype=torch.int32, device=GPU_DEVICE
+    )
 
     # Create KV cache for batch (replicate the same pages)
     kv_cache_batch = kv_cache_single.repeat(batch_size, 1, 1, 1, 1)
 
     # Create page table for batch
-    page_table_batch = torch.zeros(batch_size, num_pages_single, dtype=torch.int32, device=GPU_DEVICE)
+    page_table_batch = torch.zeros(
+        batch_size, num_pages_single, dtype=torch.int32, device=GPU_DEVICE
+    )
     for i in range(batch_size):
         page_table_batch[i] = torch.arange(
-            i * num_pages_single, (i+1) * num_pages_single, dtype=torch.int32, device=GPU_DEVICE
+            i * num_pages_single,
+            (i + 1) * num_pages_single,
+            dtype=torch.int32,
+            device=GPU_DEVICE,
         )
 
     workspace_buffer_batch = create_workspace_buffers(GPU_DEVICE)
@@ -149,7 +155,7 @@ def test_trtllm_batch_decode_batch_invariant(
         output_batch[0],
         rtol=rtol,
         atol=atol,
-        msg="Output with batch_invariant=True should be identical for same request in different batch sizes"
+        msg="Output with batch_invariant=True should be identical for same request in different batch sizes",
     )
 
     # Also verify all batch outputs are identical (since we replicated the same request)
@@ -159,44 +165,32 @@ def test_trtllm_batch_decode_batch_invariant(
             output_batch[i],
             rtol=rtol,
             atol=atol,
-            msg=f"All outputs in batch should be identical when using same input (batch index {i})"
+            msg=f"All outputs in batch should be identical when using same input (batch index {i})",
         )
 
 
 @pytest.mark.parametrize("kv_layout", ["HND"])
 @pytest.mark.parametrize(
-    "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size",
+    "batch_size,page_size,num_kv_heads,head_grp_size",
     [
-        (4, 1, 16, 8, 4),
+        (4, 16, 8, 4),
     ],
 )
 @pytest.mark.parametrize("window_left", [-1])
-@pytest.mark.parametrize(
-    "q_dtype,kv_dtype,o_dtype",
-    [
-        ("bf16", "bf16", "bf16"),
-    ],
-)
+@pytest.mark.parametrize("q_dtype", ["bf16"])
 @pytest.mark.parametrize("enable_pdl", [None])
-@pytest.mark.parametrize("max_in_kv_len", [2048])
-@pytest.mark.parametrize("head_dim", [128])
 def test_trtllm_mla_batch_decode_batch_invariant(
     kv_layout,
     batch_size,
-    q_len_per_req,
     page_size,
     num_kv_heads,
     head_grp_size,
     window_left,
     q_dtype,
-    o_dtype,
-    kv_dtype,
     enable_pdl,
-    max_in_kv_len,
-    head_dim,
 ):
     """Test that batch_invariant parameter works for MLA decode functions."""
-    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    compute_capability = get_compute_capability(torch.device(GPU_DEVICE))
 
     # MLA requires SM100+
     if compute_capability[0] < 10:
@@ -214,20 +208,32 @@ def test_trtllm_mla_batch_decode_batch_invariant(
     seq_len1 = 128
 
     # Single request
-    q_single = torch.randn(1, num_qo_heads, head_dim_qk, device=GPU_DEVICE, dtype=q_dtype_torch)
+    q_single = torch.randn(
+        1, num_qo_heads, head_dim_qk, device=GPU_DEVICE, dtype=q_dtype_torch
+    )
     seq_lens_single = torch.tensor([seq_len1], dtype=torch.int32, device=GPU_DEVICE)
 
     num_pages_single = (seq_len1 + page_size - 1) // page_size
     # For MLA: K has head_dim_qk, V has head_dim_vo
     k_cache_single = torch.randn(
-        num_pages_single, num_kv_heads, page_size, head_dim_qk,
-        device=GPU_DEVICE, dtype=q_dtype_torch
+        num_pages_single,
+        num_kv_heads,
+        page_size,
+        head_dim_qk,
+        device=GPU_DEVICE,
+        dtype=q_dtype_torch,
     )
     v_cache_single = torch.randn(
-        num_pages_single, num_kv_heads, page_size, head_dim_vo,
-        device=GPU_DEVICE, dtype=q_dtype_torch
+        num_pages_single,
+        num_kv_heads,
+        page_size,
+        head_dim_vo,
+        device=GPU_DEVICE,
+        dtype=q_dtype_torch,
     )
-    page_table_single = torch.arange(num_pages_single, dtype=torch.int32, device=GPU_DEVICE).unsqueeze(0)
+    page_table_single = torch.arange(
+        num_pages_single, dtype=torch.int32, device=GPU_DEVICE
+    ).unsqueeze(0)
 
     workspace_buffer_single = create_workspace_buffers(GPU_DEVICE)
 
@@ -254,15 +260,22 @@ def test_trtllm_mla_batch_decode_batch_invariant(
 
     # Batch test
     q_batch = q_single.repeat(batch_size, 1, 1)
-    seq_lens_batch = torch.full((batch_size,), seq_len1, dtype=torch.int32, device=GPU_DEVICE)
+    seq_lens_batch = torch.full(
+        (batch_size,), seq_len1, dtype=torch.int32, device=GPU_DEVICE
+    )
 
     k_cache_batch = k_cache_single.repeat(batch_size, 1, 1, 1)
     v_cache_batch = v_cache_single.repeat(batch_size, 1, 1, 1)
 
-    page_table_batch = torch.zeros(batch_size, num_pages_single, dtype=torch.int32, device=GPU_DEVICE)
+    page_table_batch = torch.zeros(
+        batch_size, num_pages_single, dtype=torch.int32, device=GPU_DEVICE
+    )
     for i in range(batch_size):
         page_table_batch[i] = torch.arange(
-            i * num_pages_single, (i+1) * num_pages_single, dtype=torch.int32, device=GPU_DEVICE
+            i * num_pages_single,
+            (i + 1) * num_pages_single,
+            dtype=torch.int32,
+            device=GPU_DEVICE,
         )
 
     workspace_buffer_batch = create_workspace_buffers(GPU_DEVICE)
@@ -290,7 +303,7 @@ def test_trtllm_mla_batch_decode_batch_invariant(
         output_batch[0],
         rtol=rtol,
         atol=atol,
-        msg="MLA output with batch_invariant=True should be identical for same request in different batch sizes"
+        msg="MLA output with batch_invariant=True should be identical for same request in different batch sizes",
     )
 
     for i in range(1, batch_size):
@@ -299,5 +312,5 @@ def test_trtllm_mla_batch_decode_batch_invariant(
             output_batch[i],
             rtol=rtol,
             atol=atol,
-            msg=f"All MLA outputs in batch should be identical when using same input (batch index {i})"
+            msg=f"All MLA outputs in batch should be identical when using same input (batch index {i})",
         )
