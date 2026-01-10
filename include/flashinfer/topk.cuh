@@ -361,6 +361,9 @@ __device__ __forceinline__ void RadixSelectOneRound(
       }
     }
 
+    // Ensure all threads in leading CTA finish clearing before signaling barrier
+    __syncthreads();
+
     // Barrier: wait for all CTAs to finish atomicAdd and clearing
     if (tx == 0) {
       red_release(&state->arrival_counter, 1);
@@ -499,10 +502,19 @@ __device__ __forceinline__ OrderedType RadixSelectFromSharedMemory(
     barrier_phase++;
     __syncthreads();
 
-    // CTA 0 clears output counter AFTER barrier
-    if (cta_in_group == 0 && tx == 0) {
-      st_release(&state->output_counter, 0);
+    // CTA 0 clears output counter and first round's histogram AFTER barrier
+    // The histogram clearing is necessary because k>=vocab iterations skip radix select
+    // and don't clear histograms, leaving stale data for subsequent iterations
+    if (cta_in_group == 0) {
+      uint32_t first_round_hist_idx = (iter * NUM_ROUNDS) % 3;
+      for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
+        state->histogram[first_round_hist_idx][i] = 0;
+      }
+      if (tx == 0) {
+        st_release(&state->output_counter, 0);
+      }
     }
+    __syncthreads();  // Ensure histogram clearing completes before any CTA proceeds
   }
 
   // NUM_ROUNDS of radix select
@@ -553,6 +565,8 @@ __device__ __forceinline__ OrderedType RadixSelectFromSharedMemory(
           next_hist[i] = 0;
         }
       }
+      // Ensure all threads in leading CTA finish clearing before signaling barrier
+      __syncthreads();
       if (tx == 0) {
         red_release(&state->arrival_counter, 1);
       }
