@@ -52,6 +52,7 @@ from ..jit.gemm import gen_gemm_sm120_module
 from ..jit.gemm import gen_gemm_sm120_module_cutlass_fp4
 from ..jit.gemm import gen_gemm_sm100_module_cutlass_fp4
 from ..jit.gemm import gen_gemm_sm100_module_cutlass_fp8
+from ..jit.gemm import gen_gemm_sm100_module_cutlass_bf16
 from ..jit.gemm import gen_trtllm_gen_gemm_module
 from ..jit.gemm import gen_tgv_gemm_sm10x_module
 from ..jit.gemm import gen_deepgemm_sm100_module
@@ -181,10 +182,335 @@ def get_gemm_module():
     return _gemm_module
 
 
+@supported_compute_capability([100, 103])
+def _cutlass_mm_bf16_requirement(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    bias: Optional[torch.Tensor] = None,
+    pdl: bool = False,
+    backend: Literal["cutlass", "tgv", "auto"] = "tgv",
+):
+    if bias is not None:
+        raise ValueError(
+            "You cannot use the CUTLASS backend with a bias. Use the TGV backend instead."
+        )
+    if pdl:
+        raise ValueError(
+            "The CUTLASS backend does not support PDL. Use the TGV backend instead."
+        )
+
+    _validate_bf16_output_dtype(out_dtype)
+
+    return True
+
+
+@supported_compute_capability([100, 103])
+def _tgv_gemm_requirement(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    bias: Optional[torch.Tensor] = None,
+    pdl: bool = False,
+    backend: Literal["cutlass", "tgv", "auto"] = "tgv",
+):
+    if out_dtype != torch.bfloat16:
+        raise ValueError(
+            "You cannot provide an output dtype to the TGV backend. Use the CUTLASS backend instead."
+        )
+    return True
+
+
+def _check_mm_bf16_problem_size(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    pdl: bool = False,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    backend: Literal["cutlass", "tgv", "auto"] = "tgv",
+):
+    if a.dtype != torch.bfloat16:
+        raise ValueError(
+            f"First tensor has unsupported dtype {a.dtype}. Only bfloat16 is supported."
+        )
+    if b.dtype != torch.bfloat16:
+        raise ValueError(
+            f"Second tensor has unsupported dtype {b.dtype}. Only bfloat16 is supported."
+        )
+
+    if bias is not None and bias.dtype != torch.bfloat16:
+        raise ValueError(
+            f"Bias tensor has unsupported dtype {bias.dtype}. Only bfloat16 is supported."
+        )
+
+    return True
+
+
+def _heuristic_func_mm_bf16(
+    suitable_backends: List[str],
+    a: torch.Tensor,
+    b: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    pdl: bool = False,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    backend: Literal["cutlass", "tgv", "auto"] = "tgv",
+):
+    heuristic_backends = []
+    if bias is not None or pdl:
+        if "tgv" in suitable_backends:
+            heuristic_backends.append("tgv")
+    else:
+        if "cutlass" in suitable_backends:
+            heuristic_backends.append("cutlass")
+        if "tgv" in suitable_backends:
+            heuristic_backends.append("tgv")
+    return heuristic_backends
+
+
+@backend_requirement(
+    {
+        "cutlass": _cutlass_mm_bf16_requirement,
+        "tgv": _tgv_gemm_requirement,
+    },
+    common_check=_check_mm_bf16_problem_size,
+    heuristic_func=_heuristic_func_mm_bf16,
+)
+@flashinfer_api
+def mm_bf16(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    pdl: bool = False,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    backend: Literal["cutlass", "tgv", "auto"] = "tgv",
+) -> torch.Tensor:
+    r"""MM BF16
+
+    Parameters
+    ----------
+    a: torch.Tensor
+        Input tensor, shape (m, k), bf16 in row-major layout.
+
+    b: torch.Tensor
+        Weight tensor, shape (k, n), bf16 in column-major layout.
+
+    bias: Optional[torch.Tensor]
+        Optional bias tensor, shape (n,). If provided, can only be used with the TGV backend. Defaults to ``None``.
+
+    pdl: bool
+        Whether to use persistant data loader mode. Can only be used with the TGV backend. Defaults to ``False``.
+
+    out: Optional[torch.Tensor]
+        Out tensor, shape (m, n), bf16 or fp16. If provided, can only be used with the CUTLASS backend. Defaults to ``None``.
+
+    out_dtype: torch.dtype
+        Output dtype, bf16 or fp16. If provided, can only be used with the CUTLASS backend. Defaults to ``torch.bfloat16``.
+
+    backend: Literal["cutlass", "tgv", "auto"]
+        The backend to use for the operation. Defaults to ``"tgv"``.
+        ``"auto"`` allows selecting the best tactic from all available backends when autotune is enabled.
+
+    Returns
+    -------
+    torch.Tensor
+        Out tensor, shape (m, n), bf16 or fp16 in row-major layout.
+
+    Examples
+    --------
+    >>> import torch
+    >>> import flashinfer
+    >>> # Using the TGV backend
+    >>> a = torch.randn([48, 64], device="cuda", dtype=torch.bfloat16)
+    >>> b = torch.randn([80, 64], device="cuda", dtype=torch.bfloat16).transpose(-2, -1)
+    >>> bias = torch.randn([80], device="cuda", dtype=torch.bfloat16)
+    >>> out = flashinfer.mm_bf16(a, b, bias=bias, pdl=True, backend="tgv")
+    >>> out.shape
+    torch.Size([48, 80])
+    >>> out.dtype
+    torch.bfloat16
+    >>> # Using the CUTLASS backend
+    >>> fp16_out = torch.empty([48, 80], device="cuda", dtype=torch.float16)
+    >>> out = flashinfer.mm_bf16(a, b, out=fp16_out, out_dtype=torch.float16, backend="cutlass")
+    >>> out.shape
+    torch.Size([48, 80])
+    >>> out.dtype
+    torch.float16
+    """
+
+    if out is None:
+        out = torch.empty(
+            (a.shape[0], b.shape[1]),
+            device=a.device,
+            dtype=out_dtype,
+        )
+    else:
+        if out.shape != (a.shape[0], b.shape[1]):
+            raise ValueError(
+                f"Output shape mismatch. Expected {(a.shape[0], b.shape[1])}, got {out.shape}."
+            )
+        if out.device != a.device:
+            raise ValueError(
+                f"Output device mismatch. Expected {a.device}, got {out.device}."
+            )
+        if out.dtype != out_dtype:
+            raise ValueError(
+                f"Output dtype mismatch. Expected {out_dtype}, got {out.dtype}."
+            )
+
+    workspace_buffer = _get_cache_buf(
+        "mm_bf16_workspace", DEFAULT_WORKSPACE_SIZE, a.device
+    )
+    if backend == "auto":
+        backends = mm_bf16.suitable_auto_backends
+    elif backend == "cutlass":
+        backends = _heuristic_func_mm_bf16(
+            ["cutlass"], a, b, None, False, out, out_dtype, backend
+        )
+    elif backend == "tgv":
+        backends = _heuristic_func_mm_bf16(
+            ["tgv"], a, b, bias, pdl, out, out_dtype, backend
+        )
+    else:
+        backends = [backend]
+
+    bf16_gemm_sm100(a, b, bias, pdl, out, workspace_buffer, backends)
+    return out
+
+
+@supported_compute_capability([100, 103])
+def _cutlass_bmm_bf16_requirement(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    backend: Literal["cutlass"] = "cutlass",
+):
+    _validate_bf16_output_dtype(out_dtype)
+
+    return True
+
+
+def _check_bmm_bf16_problem_size(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    backend: Literal["cutlass"] = "cutlass",
+):
+    if A.dtype != torch.bfloat16:
+        raise ValueError(
+            f"First tensor has unsupported dtype {A.dtype}. Only bfloat16 is supported."
+        )
+    if B.dtype != torch.bfloat16:
+        raise ValueError(
+            f"Second tensor has unsupported dtype {B.dtype}. Only bfloat16 is supported."
+        )
+
+    return True
+
+
+def _heuristic_func_bmm_bf16(
+    suitable_backends: List[str],
+    A: torch.Tensor,
+    B: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    backend: Literal["cutlass"] = "cutlass",
+):
+    heuristic_backends = []
+    if "cutlass" in suitable_backends:
+        heuristic_backends.append("cutlass")
+    return heuristic_backends
+
+
+@backend_requirement(
+    {
+        "cutlass": _cutlass_bmm_bf16_requirement,
+    },
+    common_check=_check_bmm_bf16_problem_size,
+    heuristic_func=_heuristic_func_bmm_bf16,
+)
+@flashinfer_api
+def bmm_bf16(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    backend: Literal["cutlass"] = "cutlass",
+) -> torch.Tensor:
+    r"""BMM BF16
+
+    Parameters
+    ----------
+    A: torch.Tensor
+        Input tensor, shape (b, m, k), bf16 in row-major layout.
+
+    B: torch.Tensor
+        Weight tensor, shape (b, k, n), bf16 in column-major layout.
+
+    out: Optional[torch.Tensor]
+        Out tensor, shape (b, m, n), bf16 or fp16, defaults to ``None``.
+
+    out_dtype: torch.dtype
+        Output dtype, bf16 (default) or fp16.
+
+    backend: Literal["cutlass"]
+        Backend to use, defaults to "cutlass".
+
+    Returns
+    -------
+    torch.Tensor
+        Out tensor, shape (b, m, n), bf16 or fp16 in row-major layout.
+
+    Examples
+    --------
+    >>> import torch
+    >>> import flashinfer
+    >>> input = torch.randn([16, 48, 64], device="cuda", dtype=torch.bfloat16)
+    >>> weight = torch.randn([16, 80, 64], device="cuda", dtype=torch.bfloat16).transpose(-2, -1)
+    >>> out = flashinfer.bmm_bf16(input, weight)
+    >>> out.shape
+    torch.Size([16, 48, 80])
+    >>> out.dtype
+    torch.bfloat16
+    """
+
+    expected_shape = (A.shape[0], A.shape[1], B.shape[2])
+    if out is None:
+        out = torch.empty(
+            expected_shape,
+            device=A.device,
+            dtype=out_dtype,
+        )
+    else:
+        if out.shape != expected_shape:
+            raise ValueError(
+                f"Output shape mismatch. Expected {expected_shape}, got {out.shape}."
+            )
+        if out.device != A.device:
+            raise ValueError(
+                f"Output device mismatch. Expected {A.device}, got {out.device}."
+            )
+        if out.dtype != out_dtype:
+            raise ValueError(
+                f"Output dtype mismatch. Expected {out_dtype}, got {out.dtype}."
+            )
+
+    workspace_buffer = _get_cache_buf(
+        "bmm_bf16_workspace", DEFAULT_WORKSPACE_SIZE, A.device
+    )
+    bf16_gemm_sm100(A, B, None, False, out, workspace_buffer, ["cutlass"])
+    return out
+
+
 @functools.cache
 def get_gemm_sm100_module():
     module = gen_gemm_sm100_module().build_and_load()
-
     return module
 
 
@@ -431,6 +757,93 @@ _FP8_GEMM_SM100_TUNING_CONFIG = TuningConfig(
 )
 
 
+@functools.cache
+def get_gemm_sm100_module_cutlass_bf16():
+    module = gen_gemm_sm100_module_cutlass_bf16().build_and_load()
+
+    def cutlass_bf16_gemm_runner():
+        class CutlassBf16GemmRunner(TunableRunner):
+            def get_valid_tactics(
+                self,
+                inputs: List[torch.Tensor],
+                profile: OptimizationProfile,
+            ) -> List[int]:
+                return list(range(module.bf16_gemm_tactic_num()))
+
+            def forward(
+                self,
+                inputs: List[torch.Tensor],
+                tactic: int = -1,
+                do_preparation: bool = False,
+                **kwargs,
+            ) -> torch.Tensor:
+                a, b, _, _, out, workspace_buffer = inputs
+                module.bf16_gemm(
+                    a,
+                    b.transpose(-2, -1),
+                    out,
+                    workspace_buffer,
+                    tactic,
+                )
+                return out
+
+        return CutlassBf16GemmRunner()
+
+    return SimpleNamespace(
+        cutlass_bf16_gemm_runner=cutlass_bf16_gemm_runner,
+    )
+
+
+_BF16_GEMM_SM100_TUNING_CONFIG = TuningConfig(
+    dynamic_tensor_specs=(
+        DynamicTensorSpec(
+            (0,),  # a_tensor_index
+            (-2,),
+            get_last_power_of_2_num_tokens_buckets,
+            last_positive_power_of_2,
+        ),
+    ),
+    constraint_specs=(
+        ConstraintSpec(
+            4,  # out_tensor_index
+            -2,
+            lambda shapes: shapes[0][-2],
+        ),
+    ),
+)
+
+
+def bf16_gemm_sm100(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    bias: torch.Tensor,
+    pdl: bool,
+    out: torch.Tensor,
+    workspace_buffer: torch.Tensor,
+    runner_names: List[str],
+) -> None:
+    runners = []
+    use_sm_100f = is_sm100f_supported(a.device)
+    if "cutlass" in runner_names:
+        runners.append(get_gemm_sm100_module_cutlass_bf16().cutlass_bf16_gemm_runner())
+    if "tgv" in runner_names:
+        runners.append(
+            get_tgv_gemm_sm10x_module(a.dtype, use_sm_100f).tgv_gemm_runner()
+        )
+    assert runners, "No suitable runners found"
+    tuner = AutoTuner.get()
+
+    inputs = [a, b, bias, pdl, out, workspace_buffer]
+    runner, tactic = tuner.choose_one(
+        "bf16_gemm",
+        runners,
+        _BF16_GEMM_SM100_TUNING_CONFIG,
+        inputs,
+    )
+
+    runner(inputs=inputs, tactic=tactic)
+
+
 def fp8_gemm_sm100(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -578,17 +991,14 @@ def get_tgv_gemm_sm10x_module(
                 do_preparation: bool = False,
                 **kwargs,
             ) -> torch.Tensor:
-                a, b, bias = inputs
-                pdl = kwargs.get("pdl", False)
+                a, b, bias, pdl, out, *_ = inputs
+
                 # swap gemm m and n by swapping b and a
                 # tgv_gemm takes mat1 as weights and mat2 as input tensor
                 # from [m,k]x[k,n]+[n,] to [n,k]x[k,m]+[n,]
                 gemm_fn = module.tgv_gemm
-                c = torch.empty(
-                    (a.shape[0], b.shape[1]), dtype=a.dtype, device=a.device
-                )
-                gemm_fn(b.t(), a.t(), bias, tactic, c, pdl)
-                return c
+                gemm_fn(b.t(), a.t(), bias, tactic, out, pdl)
+                return out
 
         return TGVGemmRunner()
 
@@ -604,6 +1014,7 @@ def tgv_gemm_sm100(
     b: torch.Tensor,
     bias: torch.Tensor,
     pdl: bool = False,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Perform TGV GEMM on SM100 architecture with automatic dtype detection.
@@ -615,6 +1026,7 @@ def tgv_gemm_sm100(
         b: Second input tensor of shape (K, N) in column-major layout
         bias: Bias tensor of shape (N,)
         pdl: Whether to use PDL (persistent data loader), defaults to False
+        out: Optional output tensor, shape (M, N), defaults to None.
 
     Returns:
         Output tensor of shape (M, N) in row-major layout
@@ -643,6 +1055,26 @@ def tgv_gemm_sm100(
             f"Input tensors must have the same dtype. Got {a.dtype} and {b.dtype}."
         )
 
+    if out is None:
+        out = torch.empty(
+            (a.shape[0], b.shape[1]),
+            device=a.device,
+            dtype=a.dtype,
+        )
+    else:
+        if out.shape != (a.shape[0], b.shape[1]):
+            raise ValueError(
+                f"Output shape mismatch. Expected {(a.shape[0], b.shape[1])}, got {out.shape}."
+            )
+        if out.device != a.device:
+            raise ValueError(
+                f"Output device mismatch. Expected {a.device}, got {out.device}."
+            )
+        if out.dtype != a.dtype:
+            raise ValueError(
+                f"Output dtype mismatch. Expected {a.dtype}, got {out.dtype}."
+            )
+
     runners = []
     use_sm_100f = is_sm100f_supported(a.device)
     runners.append(get_tgv_gemm_sm10x_module(a.dtype, use_sm_100f).tgv_gemm_runner())
@@ -658,10 +1090,16 @@ def tgv_gemm_sm100(
                 last_positive_power_of_2,
             ),
         ),
-        constraint_specs=(),
+        constraint_specs=(
+            ConstraintSpec(
+                4,  # out_tensor_index
+                -2,
+                lambda shapes: shapes[0][-2],
+            ),
+        ),
     )
 
-    inputs = [a, b, bias]
+    inputs = [a, b, bias, pdl, out]
     dtype_str = "bf16" if a.dtype == torch.bfloat16 else "fp16"
     runner, tactic = tuner.choose_one(
         f"{dtype_str}_tgv_gemm",
@@ -670,7 +1108,7 @@ def tgv_gemm_sm100(
         inputs,
     )
 
-    return runner(inputs=inputs, tactic=tactic, pdl=pdl)
+    return runner(inputs=inputs, tactic=tactic)
 
 
 @functools.cache
@@ -1206,6 +1644,15 @@ def _validate_fp8_output_dtype(dtype: torch.dtype):
         raise ValueError(
             f"Unsupported output dtype: {dtype}. "
             f"Only torch.bfloat16 and torch.float16 are supported for FP8 GEMM operations."
+        )
+
+
+def _validate_bf16_output_dtype(dtype: torch.dtype):
+    """Validate that the output dtype is either bf16 or fp16."""
+    if dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(
+            f"Unsupported output dtype: {dtype}. "
+            f"Only torch.bfloat16 and torch.float16 are supported for BF16 GEMM operations."
         )
 
 
@@ -3447,7 +3894,7 @@ def group_deepgemm_fp8_nt_groupwise(
     if out is None:
         out_dtype = out_dtype or torch.bfloat16
         out = torch.empty(a.shape[0], b.shape[1], dtype=out_dtype, device=a.device)
-    print("GOT HERE")
+
     m_grouped_fp8_gemm_nt_contiguous(
         (a, a_scale), (b, b_scale), out, m_indices, scale_granularity_mnk
     )

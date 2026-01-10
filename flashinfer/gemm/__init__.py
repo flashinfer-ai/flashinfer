@@ -1,6 +1,8 @@
 from .gemm_base import SegmentGEMMWrapper as SegmentGEMMWrapper
+from .gemm_base import bmm_bf16 as bmm_bf16
 from .gemm_base import bmm_fp8 as bmm_fp8
 from .gemm_base import bmm_mxfp8 as bmm_mxfp8
+from .gemm_base import mm_bf16 as mm_bf16
 from .gemm_base import mm_fp4 as mm_fp4
 from .gemm_base import mm_fp8 as mm_fp8
 from .gemm_base import tgv_gemm_sm100 as tgv_gemm_sm100
@@ -22,8 +24,10 @@ from .routergemm_dsv3 import (
 
 __all__ = [
     "SegmentGEMMWrapper",
+    "bmm_bf16",
     "bmm_fp8",
     "bmm_mxfp8",
+    "mm_bf16",
     "mm_fp4",
     "mm_fp8",
     "tgv_gemm_sm100",
