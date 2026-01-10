@@ -502,23 +502,10 @@ __device__ __forceinline__ OrderedType RadixSelectFromSharedMemory(
     barrier_phase++;
     __syncthreads();
 
-    // CTA 0 clears output counter and first histogram AFTER barrier
-    // Only clear on iter==0 (buffer might be uninitialized on first kernel launch)
-    // For iter>0, k>=vocab iterations clear the next histogram at their end
-    // Per-round clearing handles subsequent rounds within the same iteration
-    if (cta_in_group == 0) {
-      if (iter == 0) {
-        // First iteration: clear first round's histogram (buffer might be uninitialized)
-        // Per-round clearing will handle histograms for rounds 1-3
-        for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
-          state->histogram[0][i] = 0;
-        }
-      }
-      if (tx == 0) {
-        st_release(&state->output_counter, 0);
-      }
+    // CTA 0 clears output counter AFTER barrier
+    if (cta_in_group == 0 && tx == 0) {
+      st_release(&state->output_counter, 0);
     }
-    __syncthreads();  // Ensure histogram clearing completes before any CTA proceeds
   }
 
   // NUM_ROUNDS of radix select
