@@ -2691,6 +2691,22 @@ def test_renormalize_routing(
             },
             id="DSLite",
         ),
+        pytest.param(
+            {
+                "num_experts": 160,
+                "top_k": 8,
+                "padding": 8,
+                "n_groups": 1,
+                "top_k_groups": 1,
+                "routed_scaling": 2.5,
+                "has_routing_bias": True,
+                "routing_method_type": RoutingMethodType.DeepSeekV3,
+                "compatible_moe_impls": [FP4Moe, FP8BlockScaleMoe, BF16Moe],
+                "compatible_intermediate_size": [512, 1024, 1536],
+                "enable_autotune": False,
+            },
+            id="GLM4_MoE",
+        ),
     ],
 )
 @pytest.mark.parametrize(
