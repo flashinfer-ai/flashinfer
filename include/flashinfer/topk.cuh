@@ -502,13 +502,17 @@ __device__ __forceinline__ OrderedType RadixSelectFromSharedMemory(
     barrier_phase++;
     __syncthreads();
 
-    // CTA 0 clears output counter and first round's histogram AFTER barrier
-    // The histogram clearing is necessary because k>=vocab iterations skip radix select
-    // and don't clear histograms, leaving stale data for subsequent iterations
+    // CTA 0 clears output counter and first histogram AFTER barrier
+    // Only clear on iter==0 (buffer might be uninitialized on first kernel launch)
+    // For iter>0, k>=vocab iterations clear the next histogram at their end
+    // Per-round clearing handles subsequent rounds within the same iteration
     if (cta_in_group == 0) {
-      uint32_t first_round_hist_idx = (iter * NUM_ROUNDS) % 3;
-      for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
-        state->histogram[first_round_hist_idx][i] = 0;
+      if (iter == 0) {
+        // First iteration: clear first round's histogram (buffer might be uninitialized)
+        // Per-round clearing will handle histograms for rounds 1-3
+        for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
+          state->histogram[0][i] = 0;
+        }
       }
       if (tx == 0) {
         st_release(&state->output_counter, 0);
@@ -911,6 +915,16 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKKernel_Unified(
                 input[row_idx * stride + chunk_start + i];
           }
         }
+        // Clear histogram for next iteration (in case it's k < length)
+        if constexpr (!SINGLE_CTA) {
+          constexpr uint32_t NUM_ROUNDS = sizeof(OrderedType) * 8 / 8;
+          uint32_t next_first_hist_idx = ((iter + 1) * NUM_ROUNDS) % 3;
+          if (cta_in_group == 0) {
+            for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
+              state->histogram[next_first_hist_idx][i] = 0;
+            }
+          }
+        }
         continue;
       }
     } else if constexpr (MODE == RadixTopKMode::PageTableTransform) {
@@ -920,6 +934,16 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKKernel_Unified(
         for (uint32_t i = tx; i < top_k_val; i += BLOCK_THREADS) {
           row_output[i] = (i < length) ? src_page_entry[i] : static_cast<IdType>(-1);
         }
+        // Clear histogram for next iteration
+        if constexpr (!SINGLE_CTA) {
+          constexpr uint32_t NUM_ROUNDS = sizeof(OrderedType) * 8 / 8;
+          uint32_t next_first_hist_idx = ((iter + 1) * NUM_ROUNDS) % 3;
+          if (cta_in_group == 0) {
+            for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
+              state->histogram[next_first_hist_idx][i] = 0;
+            }
+          }
+        }
         continue;
       }
     } else {  // RaggedTransform
@@ -927,6 +951,16 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKKernel_Unified(
       if (length <= top_k_val) {
         for (uint32_t i = tx; i < top_k_val; i += BLOCK_THREADS) {
           row_output[i] = (i < length) ? static_cast<IdType>(i) + offset : static_cast<IdType>(-1);
+        }
+        // Clear histogram for next iteration
+        if constexpr (!SINGLE_CTA) {
+          constexpr uint32_t NUM_ROUNDS = sizeof(OrderedType) * 8 / 8;
+          uint32_t next_first_hist_idx = ((iter + 1) * NUM_ROUNDS) % 3;
+          if (cta_in_group == 0) {
+            for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
+              state->histogram[next_first_hist_idx][i] = 0;
+            }
+          }
         }
         continue;
       }
@@ -1097,6 +1131,19 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKMaskLogitsKernel_Multi
       for (uint32_t i = aligned_size + tx; i < actual_chunk_size; i += BLOCK_THREADS) {
         masked_logits[row_idx * vocab_size + chunk_start + i] =
             logits[row_idx * vocab_size + chunk_start + i];
+      }
+
+      // Clear histogram for next iteration (in case it's k < vocab_size)
+      // Only needed for multi-CTA mode; single-CTA uses shared memory cleared each iteration
+      if constexpr (!SINGLE_CTA) {
+        constexpr uint32_t NUM_ROUNDS = sizeof(OrderedType) * 8 / 8;  // ORDERED_BITS / RADIX_BITS
+        uint32_t next_first_hist_idx = ((iter + 1) * NUM_ROUNDS) % 3;
+        if (cta_in_group == 0) {
+          for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
+            state->histogram[next_first_hist_idx][i] = 0;
+          }
+        }
+        // No sync needed - next iteration's barrier will ensure visibility
       }
       continue;
     }
@@ -1373,6 +1420,20 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKRenormProbKernel_Multi
       for (uint32_t i = aligned_size + tx; i < actual_chunk_size; i += BLOCK_THREADS) {
         renormed_prob[row_idx * vocab_size + chunk_start + i] =
             DType(float(probs[row_idx * vocab_size + chunk_start + i]) * normalizer);
+      }
+
+      // Clear histogram for next iteration (in case it's k < vocab_size)
+      // Only needed for multi-CTA mode; single-CTA uses shared memory cleared each iteration
+      // Next iteration (iter+1) will use histogram[((iter+1)*NUM_ROUNDS) % 3] for its first round
+      if constexpr (!SINGLE_CTA) {
+        constexpr uint32_t NUM_ROUNDS = sizeof(OrderedType) * 8 / 8;  // ORDERED_BITS / RADIX_BITS
+        uint32_t next_first_hist_idx = ((iter + 1) * NUM_ROUNDS) % 3;
+        if (cta_in_group == 0) {
+          for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
+            state->histogram[next_first_hist_idx][i] = 0;
+          }
+        }
+        // No sync needed - next iteration's barrier will ensure visibility
       }
       continue;
     }
