@@ -163,7 +163,10 @@ cudaError_t CutlassGroupwiseScaledGEMMSM100SmallBatchSize(void* float_buffer, si
     A: (m, k) row major    => (k, m) column major
     B: (k, n) column major => (n, k) row major
     D: (m, n) row major    => (n, m) column major
+
+    So instead of a row-column-row gemm we perform a row-column-column gemm.
   */
+
   // Compute the transpose GEMM:
   //   D^T = B^T @ A^T
   // so we swap (m, n) and swap (A, B) (+their scale tensors). The output is written as
@@ -177,6 +180,15 @@ cudaError_t CutlassGroupwiseScaledGEMMSM100SmallBatchSize(void* float_buffer, si
   float* tmp_sf_ptr = SFA_ptr;
   SFA_ptr = SFB_ptr;
   SFB_ptr = tmp_sf_ptr;
+  // Do the swap here as well
+  using ScaleConfig = std::conditional_t<
+      ScaleMajorK,
+      cutlass::detail::Sm100BlockwiseScaleConfig<ScaleGranularityN, ScaleGranularityM,
+                                                  ScaleGranularityK, UMMA::Major::K, UMMA::Major::K>,
+      cutlass::detail::Sm100BlockwiseScaleConfig<ScaleGranularityN, ScaleGranularityM,
+                                                  ScaleGranularityK, UMMA::Major::MN,
+                                                  UMMA::Major::MN>>;
+
   using ElementA = DTypeIn;
   using LayoutA = cutlass::layout::RowMajor;
   constexpr int AlignmentA =
@@ -202,15 +214,6 @@ cudaError_t CutlassGroupwiseScaledGEMMSM100SmallBatchSize(void* float_buffer, si
 
   using MmaTileShape_MNK = Shape<cute::Int<128>, _16, _128>;
   using ClusterShape_MNK = Shape<int, int, _1>;
-
-  using ScaleConfig = std::conditional_t<
-      ScaleMajorK,
-      // NOTE: We swapped M/N above (and swapped A/B), so swap the scale granularity for M/N too.
-      cutlass::detail::Sm100BlockwiseScaleConfig<ScaleGranularityN, ScaleGranularityM,
-                                                 ScaleGranularityK, UMMA::Major::K, UMMA::Major::K>,
-      cutlass::detail::Sm100BlockwiseScaleConfig<ScaleGranularityN, ScaleGranularityM,
-                                                 ScaleGranularityK, UMMA::Major::MN,
-                                                 UMMA::Major::MN>>;
 
   using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
   using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
