@@ -155,10 +155,10 @@ cudaError_t CutlassGroupwiseScaledGEMMSM100SmallBatchSize(void* float_buffer, si
                                             float* SFB_ptr, DTypeOut* D_ptr, int m, int n, int k,
                                             int l, cudaStream_t stream) {
   /*
-    For small batch sizes (M) - typically we can only have at minimum M tile size of 64 - because of tcgen05.mma shapes.
-    This causes wasted work in the M dimension and less CTAs in the M dimension.
+    For small batch sizes (M) like 8, 16, 32 - typically we can only have at minimum M tile size of 64 - because of tcgen05.mma shapes.
+    This causes wasted work in the M dimension and less CTAs being able to do work.
     So one trick we can do is instead of calculating D = A @ B, we can calculate D.T = B.T @ A.T
-    This allows us to use a smaller N tile size and more CTAs in the N dimension.
+    This allows us to use a smaller N tile size and more CTAs being able to do work.
     We can transpose by doing swapping row major and column major layouts.
     A: (m, k) row major    => (k, m) column major
     B: (k, n) column major => (n, k) row major
