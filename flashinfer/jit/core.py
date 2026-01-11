@@ -301,6 +301,8 @@ class JitSpec:
         return tvm_ffi.load_module(str(so_path))
 
     def build_and_load(self):
+        print(f"Building and loading {self.name} from {self.jit_library_path} with aot {self.is_aot}")
+        print(f"AOT path: {self.aot_path}")
         if self.is_aot:
             return self.load(self.aot_path)
 
