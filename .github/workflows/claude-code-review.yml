@@ -65,6 +65,19 @@ jobs:
         with:
           fetch-depth: 1
 
+      - name: Setup Python
+        if: steps.check-permission.outputs.authorized == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install and configure pre-commit with auto-fix
+        if: steps.check-permission.outputs.authorized == 'true'
+        run: |
+          pip install pre-commit
+          chmod +x .github/scripts/setup-auto-fix-precommit.sh
+          .github/scripts/setup-auto-fix-precommit.sh
+
       - name: Run Claude Code Review
         if: steps.check-permission.outputs.authorized == 'true'
         id: claude-review
