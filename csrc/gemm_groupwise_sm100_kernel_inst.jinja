@@ -35,7 +35,7 @@ CutlassGroupwiseScaledGEMMSM100<
     {{ dtype_out }}>(
         void* float_buffer, size_t float_buffer_size_in_bytes,
         {{ dtype_in }}* A_ptr, {{ dtype_in }}* B_ptr, float* SFA_ptr, float* SFB_ptr,
-        {{ dtype_out }}* C_ptr, int m, int n, int k, int l, cudaStream_t stream);
+        {{ dtype_out }}* D_ptr, int m, int n, int k, int l, cudaStream_t stream);
 
 {% if scale_granularity_m == 1 %}
 template cudaError_t
