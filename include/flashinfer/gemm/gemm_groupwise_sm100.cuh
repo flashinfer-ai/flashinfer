@@ -151,19 +151,20 @@ cudaError_t CutlassGroupwiseScaledGEMMSM100(void* float_buffer, size_t float_buf
 
 template <int ScaleGranularityM, int ScaleGranularityN, int ScaleGranularityK, bool ScaleMajorK,
           int MmaSM, typename DTypeIn, typename DTypeOut>
-cudaError_t CutlassGroupwiseScaledGEMMSM100SmallBatchSize(void* float_buffer, size_t float_buffer_size_in_bytes,
-                                            DTypeIn* A_ptr, DTypeIn* B_ptr, float* SFA_ptr,
-                                            float* SFB_ptr, DTypeOut* D_ptr, int m, int n, int k,
-                                            int l, cudaStream_t stream) {
+cudaError_t CutlassGroupwiseScaledGEMMSM100SmallBatchSize(void* float_buffer,
+                                                          size_t float_buffer_size_in_bytes,
+                                                          DTypeIn* A_ptr, DTypeIn* B_ptr,
+                                                          float* SFA_ptr, float* SFB_ptr,
+                                                          DTypeOut* D_ptr, int m, int n, int k,
+                                                          int l, cudaStream_t stream) {
   /*
-    For small batch sizes (M) like 8, 16, 32 - typically we can only have at minimum M tile size of 64 - because of tcgen05.mma shapes.
-    This causes wasted work in the M dimension and less CTAs being able to do work.
-    So one trick we can do is instead of calculating D = A @ B, we can calculate D.T = B.T @ A.T
-    This allows us to use a smaller N tile size and more CTAs being able to do work.
-    We can transpose by doing swapping row major and column major layouts.
-    A: (m, k) row major    => (k, m) column major
-    B: (k, n) column major => (n, k) row major
-    D: (m, n) row major    => (n, m) column major
+    For small batch sizes (M) like 8, 16, 32 - typically we can only have at minimum M tile size of
+    64 - because of tcgen05.mma shapes. This causes wasted work in the M dimension and less CTAs
+    being able to do work. So one trick we can do is instead of calculating D = A @ B, we can
+    calculate D.T = B.T @ A.T This allows us to use a smaller N tile size and more CTAs being able
+    to do work. We can transpose by doing swapping row major and column major layouts. A: (m, k) row
+    major    => (k, m) column major B: (k, n) column major => (n, k) row major D: (m, n) row major
+    => (n, m) column major
 
     So instead of a row-column-row gemm we perform a row-column-column gemm.
   */
@@ -179,25 +180,22 @@ cudaError_t CutlassGroupwiseScaledGEMMSM100SmallBatchSize(void* float_buffer, si
   using ScaleConfig = std::conditional_t<
       ScaleMajorK,
       cutlass::detail::Sm100BlockwiseScaleConfig<ScaleGranularityN, ScaleGranularityM,
-                                                  ScaleGranularityK, UMMA::Major::K, UMMA::Major::K>,
+                                                 ScaleGranularityK, UMMA::Major::K, UMMA::Major::K>,
       cutlass::detail::Sm100BlockwiseScaleConfig<ScaleGranularityN, ScaleGranularityM,
-                                                  ScaleGranularityK, UMMA::Major::MN,
-                                                  UMMA::Major::MN>>;
+                                                 ScaleGranularityK, UMMA::Major::MN,
+                                                 UMMA::Major::MN>>;
 
   using ElementA = DTypeIn;
   using LayoutA = cutlass::layout::RowMajor;
-  constexpr int AlignmentA =
-      128 / cutlass::sizeof_bits<ElementA>::value;
+  constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
 
   using ElementB = DTypeIn;
   using LayoutB = cutlass::layout::ColumnMajor;
-  constexpr int AlignmentB =
-      128 / cutlass::sizeof_bits<ElementB>::value;
+  constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
 
   using ElementC = DTypeOut;
   using LayoutC = cutlass::layout::ColumnMajor;
-  constexpr int AlignmentC =
-      128 / cutlass::sizeof_bits<ElementC>::value;
+  constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
 
   using ElementD = ElementC;
   using LayoutD = LayoutC;
@@ -214,39 +212,25 @@ cudaError_t CutlassGroupwiseScaledGEMMSM100SmallBatchSize(void* float_buffer, si
   using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
 
   using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-    cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp,
-    MmaTileShape_MNK,
-    ClusterShape_MNK,
-    cutlass::epilogue::collective::EpilogueTileAuto,
-    float, float,
-    void, LayoutC, AlignmentC,
-    ElementD, LayoutD, AlignmentD,
-    cutlass::epilogue::TmaWarpSpecialized1Sm,
-    cutlass::epilogue::fusion::LinearCombination<
-        ElementD,
-        float,
-        void,
-        float
-    >
-    >::CollectiveOp;
+      cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp, MmaTileShape_MNK, ClusterShape_MNK,
+      cutlass::epilogue::collective::EpilogueTileAuto, float, float, void, LayoutC, AlignmentC,
+      ElementD, LayoutD, AlignmentD, cutlass::epilogue::TmaWarpSpecialized1Sm,
+      cutlass::epilogue::fusion::LinearCombination<ElementD, float, void, float>>::CollectiveOp;
 
   using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
-      /*ArchTag=*/cutlass::arch::Sm100, /*OpClass=*/cutlass::arch::OpClassTensorOp,
-      ElementA,/*GemmLayoutA=*/cute::tuple<LayoutA, LayoutSFA>, AlignmentA,
-      ElementB, /*GemmLayoutB=*/cute::tuple<LayoutB, LayoutSFB>, AlignmentB,
-      ElementAccumulator,
+      /*ArchTag=*/cutlass::arch::Sm100, /*OpClass=*/cutlass::arch::OpClassTensorOp, ElementA,
+      /*GemmLayoutA=*/cute::tuple<LayoutA, LayoutSFA>, AlignmentA, ElementB,
+      /*GemmLayoutB=*/cute::tuple<LayoutB, LayoutSFB>, AlignmentB, ElementAccumulator,
       /*TileShapeMNK=*/MmaTileShape_MNK, ClusterShape_MNK,
-      /*StageCountType=*/cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
+      /*StageCountType=*/
+      cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
           sizeof(typename CollectiveEpilogue::SharedStorage))>,
-      /*KernelScheduleType=*/cutlass::gemm::KernelTmaWarpSpecializedBlockwise1SmSm100
-    >::CollectiveOp;
-
+      /*KernelScheduleType=*/cutlass::gemm::KernelTmaWarpSpecializedBlockwise1SmSm100>::
+      CollectiveOp;
 
   using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
-      /*ProblemShapeOrThreadblockMma_=*/Shape<int, int, int, int>,
-      CollectiveMainloop,
-      CollectiveEpilogue,
-      void>;
+      /*ProblemShapeOrThreadblockMma_=*/Shape<int, int, int, int>, CollectiveMainloop,
+      CollectiveEpilogue, void>;
 
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 
@@ -263,34 +247,35 @@ cudaError_t CutlassGroupwiseScaledGEMMSM100SmallBatchSize(void* float_buffer, si
   auto layout_SFA = ScaleConfig::tile_atom_to_shape_SFA(make_shape(m, n, k, l));
   auto layout_SFB = ScaleConfig::tile_atom_to_shape_SFB(make_shape(m, n, k, l));
 
-  typename Gemm::Arguments arguments{cutlass::gemm::GemmUniversalMode::kGemm,
-                                     {m, n, k, l},
-                                     {
-                                         A_ptr,
-                                         stride_A,
-                                         B_ptr,
-                                         stride_B,
-                                         SFA_ptr,
-                                         layout_SFA,
-                                         SFB_ptr,
-                                         layout_SFB,
-                                     },
-                                     {
-                                         {},  // epilogue.thread
-                                         nullptr,
-                                         stride_C,
-                                         D_ptr,
-                                         stride_D,
-                                     },
-                                     // KernelHardwareInfo
-                                     []() {
-                                       // For some reason can_implement fails if this is not defined
-                                       auto hw_info = cutlass::KernelHardwareInfo::make_kernel_hardware_info<GemmKernel>();
-                                       hw_info.cluster_shape = {1, 1, 1};
-                                       hw_info.cluster_shape_fallback = {1, 1, 1};
-                                       return hw_info;
-                                     }(),
-                                    };
+  typename Gemm::Arguments arguments{
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      {m, n, k, l},
+      {
+          A_ptr,
+          stride_A,
+          B_ptr,
+          stride_B,
+          SFA_ptr,
+          layout_SFA,
+          SFB_ptr,
+          layout_SFB,
+      },
+      {
+          {},  // epilogue.thread
+          nullptr,
+          stride_C,
+          D_ptr,
+          stride_D,
+      },
+      // KernelHardwareInfo
+      []() {
+        // For some reason can_implement fails if this is not defined
+        auto hw_info = cutlass::KernelHardwareInfo::make_kernel_hardware_info<GemmKernel>();
+        hw_info.cluster_shape = {1, 1, 1};
+        hw_info.cluster_shape_fallback = {1, 1, 1};
+        return hw_info;
+      }(),
+  };
   auto& fusion_args = arguments.epilogue.thread;
   fusion_args.alpha = 1.0f;
   fusion_args.beta = 0.0f;
@@ -299,8 +284,8 @@ cudaError_t CutlassGroupwiseScaledGEMMSM100SmallBatchSize(void* float_buffer, si
 
   size_t workspace_size = Gemm::get_workspace_size(arguments);
   AlignedAllocator float_allocator(float_buffer, float_buffer_size_in_bytes);
-  auto workspace_ptr = float_allocator.aligned_alloc<void>(workspace_size, 16,
-                                                           "sm100_groupwise_gemm_small_batch_size_float_workspace");
+  auto workspace_ptr = float_allocator.aligned_alloc<void>(
+      workspace_size, 16, "sm100_groupwise_gemm_small_batch_size_float_workspace");
 
   CUTLASS_CHECK(gemm.can_implement(arguments));
   CUTLASS_CHECK(gemm.initialize(arguments, workspace_ptr));
@@ -311,6 +296,5 @@ cudaError_t CutlassGroupwiseScaledGEMMSM100SmallBatchSize(void* float_buffer, si
 }  // namespace gemm
 
 }  // namespace flashinfer
-
 
 #endif  // FLASHINFER_GEMM_GROUPWISE_SM100_CUH_

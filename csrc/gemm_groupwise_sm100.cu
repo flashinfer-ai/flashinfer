@@ -85,10 +85,12 @@ cudaError_t CutlassGroupwiseScaledGEMMSM100(void* float_buffer, size_t float_buf
 
 template <int ScaleGranularityM, int ScaleGranularityN, int ScaleGranularityK, bool ScaleMajorK,
           int MmaSM, typename DTypeIn, typename DTypeOut>
-cudaError_t CutlassGroupwiseScaledGEMMSM100SmallBatchSize(
-    void* float_buffer, size_t float_buffer_size_in_bytes, DTypeIn* A_ptr, DTypeIn* B_ptr,
-    float* SFA_ptr, float* SFB_ptr, DTypeOut* D_ptr, int m, int n, int k, int l,
-    cudaStream_t stream);
+cudaError_t CutlassGroupwiseScaledGEMMSM100SmallBatchSize(void* float_buffer,
+                                                          size_t float_buffer_size_in_bytes,
+                                                          DTypeIn* A_ptr, DTypeIn* B_ptr,
+                                                          float* SFA_ptr, float* SFB_ptr,
+                                                          DTypeOut* D_ptr, int m, int n, int k,
+                                                          int l, cudaStream_t stream);
 
 }  // namespace gemm
 }  // namespace flashinfer
@@ -117,27 +119,24 @@ void CutlassGemmGroupwiseScaledSM100(TensorView float_workspace_buffer, TensorVi
               constexpr bool can_use_small_batch = (SCALE_GRANULARITY_M == 1);
               if (can_use_small_batch && m <= 32) {
                 status = flashinfer::gemm::CutlassGroupwiseScaledGEMMSM100SmallBatchSize<
-                    SCALE_GRANULARITY_M, SCALE_GRANULARITY_N, SCALE_GRANULARITY_K,
-                    SCALE_MAJOR_K, MMA_SM>(
+                    SCALE_GRANULARITY_M, SCALE_GRANULARITY_N, SCALE_GRANULARITY_K, SCALE_MAJOR_K,
+                    MMA_SM>(
                     static_cast<float*>(float_workspace_buffer.data_ptr()),
-                    get_element_size(float_workspace_buffer) *
-                        float_workspace_buffer.size(0),
+                    get_element_size(float_workspace_buffer) * float_workspace_buffer.size(0),
                     static_cast<cutlass_t_in*>(A.data_ptr()),
-                    static_cast<cutlass_t_in*>(B.data_ptr()),
-                    static_cast<float*>(SFA.data_ptr()),
-                    static_cast<float*>(SFB.data_ptr()),
-                    static_cast<cutlass_t_out*>(C.data_ptr()), m, n, k, 1, stream);
+                    static_cast<cutlass_t_in*>(B.data_ptr()), static_cast<float*>(SFA.data_ptr()),
+                    static_cast<float*>(SFB.data_ptr()), static_cast<cutlass_t_out*>(C.data_ptr()),
+                    m, n, k, 1, stream);
               } else {
                 status = flashinfer::gemm::CutlassGroupwiseScaledGEMMSM100<
                     SCALE_GRANULARITY_M, SCALE_GRANULARITY_N, SCALE_GRANULARITY_K, SCALE_MAJOR_K,
-                    MMA_SM>(static_cast<float*>(float_workspace_buffer.data_ptr()),
-                            get_element_size(float_workspace_buffer) *
-                                float_workspace_buffer.size(0),
-                            static_cast<cutlass_t_in*>(A.data_ptr()),
-                            static_cast<cutlass_t_in*>(B.data_ptr()),
-                            static_cast<float*>(SFA.data_ptr()),
-                            static_cast<float*>(SFB.data_ptr()),
-                            static_cast<cutlass_t_out*>(C.data_ptr()), m, n, k, 1, stream);
+                    MMA_SM>(
+                    static_cast<float*>(float_workspace_buffer.data_ptr()),
+                    get_element_size(float_workspace_buffer) * float_workspace_buffer.size(0),
+                    static_cast<cutlass_t_in*>(A.data_ptr()),
+                    static_cast<cutlass_t_in*>(B.data_ptr()), static_cast<float*>(SFA.data_ptr()),
+                    static_cast<float*>(SFB.data_ptr()), static_cast<cutlass_t_out*>(C.data_ptr()),
+                    m, n, k, 1, stream);
               }
               TVM_FFI_ICHECK_EQ(status, cudaSuccess)
                   << "Failed to run cutlass gemm groupwise scaled sm100"
