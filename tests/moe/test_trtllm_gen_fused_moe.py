@@ -2287,6 +2287,7 @@ def run_moe_test(
     weight_processing,
     gated_act_type,
     cache_permute_indices,
+    zero_hidden_states=False,
 ):
     """Common test logic for all routing methods."""
     skip_checks(
@@ -2297,6 +2298,7 @@ def run_moe_test(
         num_tokens,
         hidden_size,
         intermediate_size,
+        zero_hidden_states=zero_hidden_states,
     )
 
     torch.cuda.synchronize()
@@ -2340,7 +2342,8 @@ def run_moe_test(
     else:
         routing_bias = None
 
-    hidden_states = 2 * torch.randn(
+    hidden_states_fn = torch.zeros if zero_hidden_states else torch.randn
+    hidden_states = 2 * hidden_states_fn(
         (num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16
     )
     gemm1_weights = torch.randn(
@@ -2471,6 +2474,13 @@ def run_moe_test(
 
 
 # Test: Renormalize routing
+@pytest.mark.parametrize(
+    "zero_hidden_states",
+    [
+        pytest.param(True, id="ZeroHiddenStates"),
+        pytest.param(False, id="RandomHiddenStates"),
+    ],
+)
 @pytest.mark.parametrize("num_tokens", [8, 768, 3072])
 @pytest.mark.parametrize("hidden_size", [1024])
 @pytest.mark.parametrize("intermediate_size", [1024, 768, 512, 384])
@@ -2606,6 +2616,7 @@ def test_renormalize_routing(
     weight_processing,
     gated_act_type,
     cache_permute_indices,
+    zero_hidden_states,
 ):
     """Test Renormalize routing configurations."""
     run_moe_test(
@@ -2617,6 +2628,7 @@ def test_renormalize_routing(
         weight_processing,
         gated_act_type,
         cache_permute_indices,
+        zero_hidden_states=zero_hidden_states,
     )
 
 

@@ -16,6 +16,7 @@
  */
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <vector>
 
@@ -107,10 +108,12 @@ struct BatchedGemmOptions : public gemmGatedAct::GemmGatedActOptions {
       // GemmGatedActOptions
       gemmGatedAct::ActType actType, bool clampBeforeAct,
       // BatchedGemmOptions
-      std::vector<int> batchedM, std::vector<int> batchedN, BatchMode batchMode, bool fusedAct,
-      bool gridWaitForPrimaryRouting, bool isStaticBatch, int numBatches, int numRegsPerThreadLoadB,
-      int numRegsPerThreadLoadSfB, int numTokens, int numWarpsLoadB, int numWarpsLoadSfB,
-      RouteImpl routeImpl, std::optional<RouteImpl> routeSfsImpl, bool useTmaOobOpt)
+      std::vector<int> batchedM, std::vector<int> batchedN, BatchMode batchMode,
+      int32_t batchStrideInTokens, bool fusedAct, bool gridWaitForPrimaryRouting,
+      bool isStaticBatch, bool isUniformNumTokensPerBatch, int numBatches,
+      int numRegsPerThreadLoadB, int numRegsPerThreadLoadSfB, int numTokens, int numWarpsLoadB,
+      int numWarpsLoadSfB, RouteImpl routeImpl, std::optional<RouteImpl> routeSfsImpl,
+      bool useTmaOobOpt)
       : gemmGatedAct::GemmGatedActOptions(
             gemm::GemmOptions(
                 allReduceAlgo, biasType, blockK, clusterDimX, clusterDimY, clusterDimZ,
@@ -134,9 +137,11 @@ struct BatchedGemmOptions : public gemmGatedAct::GemmGatedActOptions {
         mBatchedM(batchedM),
         mBatchedN(batchedN),
         mBatchMode(BatchMode(batchMode)),
+        mBatchStrideInTokens(batchStrideInTokens),
         mFusedAct(fusedAct),
         mGridWaitForPrimaryRouting(gridWaitForPrimaryRouting),
         mIsStaticBatch(isStaticBatch),
+        mIsUniformNumTokensPerBatch(isUniformNumTokensPerBatch),
         mNumBatches(numBatches),
         mNumRegsPerThreadLoadB{numRegsPerThreadLoadB},
         mNumRegsPerThreadLoadSfB{numRegsPerThreadLoadSfB},
@@ -153,6 +158,8 @@ struct BatchedGemmOptions : public gemmGatedAct::GemmGatedActOptions {
   std::vector<int> mBatchedN;
   // Whether batching M or N.
   BatchMode mBatchMode{BatchMode::BatchM};
+  // Stride between batches in tokens dimension for input matrix.
+  int32_t mBatchStrideInTokens{-1};
   // Whether to perform a fused gated activation.
   bool mFusedAct{false};
   // Whether the loads that load from ptrRouteMap, ptrTotalNumPaddedTokens,
@@ -160,6 +167,8 @@ struct BatchedGemmOptions : public gemmGatedAct::GemmGatedActOptions {
   bool mGridWaitForPrimaryRouting{true};
   // Whether the batch size is static (i.e. known at kernel launch time).
   bool mIsStaticBatch{true};
+  // Whether the number of tokens in each entry of the batch is the same.
+  bool mIsUniformNumTokensPerBatch{false};
   // Number of Gemm batches.
   int mNumBatches;
   // Number of registers per thread for load B
@@ -366,6 +375,58 @@ inline bool checkAndUpdateBatchedGemmOptions(BatchedGemmOptions& options, tg::Cu
                      "change the input routing data layout to be padded to clusterDimX size.");
   }
 
+  // Check if all elements in mBatchedM or mBatchedN are the same (uniform tokens per batch) and
+  // set mIsUniformNumTokensPerBatch and mBatchStride.
+  if (options.mIsUniformNumTokensPerBatch) {
+    int32_t firstValue = 0;
+    bool isUniformNumTokensPerBatch = false;
+    if (batchM && !options.mBatchedM.empty()) {
+      firstValue = options.mBatchedM[0];
+      isUniformNumTokensPerBatch = std::all_of(options.mBatchedM.begin(), options.mBatchedM.end(),
+                                               [firstValue](int32_t v) { return v == firstValue; });
+    } else if (!batchM && !options.mBatchedN.empty()) {
+      firstValue = options.mBatchedN[0];
+      isUniformNumTokensPerBatch = std::all_of(options.mBatchedN.begin(), options.mBatchedN.end(),
+                                               [firstValue](int32_t v) { return v == firstValue; });
+    } else {
+      TLLM_CHECK_ERROR(
+          false, "mBatchedM or mBatchedN must be specified when using uniform tokens per batch.");
+    }
+    auto tileTokensDim = batchM ? options.mTileM : options.mTileN;
+    TLLM_CHECK_ERROR(isUniformNumTokensPerBatch,
+                     "All elements in mBatchedM or mBatchedN must be the same when using uniform "
+                     "tokens per batch.");
+    TLLM_CHECK_ERROR(options.mBatchStrideInTokens >= 0,
+                     "Batch stride in tokens must be greater or equal to 0 when using uniform "
+                     "tokens per batch.");
+    TLLM_CHECK_ERROR_FMT(
+        options.mBatchStrideInTokens == 0 ||
+            options.mBatchStrideInTokens == gemm::divUpMul(firstValue, tileTokensDim),
+        "Batch stride in tokens must be a 0 or a multiple of %s {%d} when using "
+        "uniform tokens per batch.",
+        batchM ? "TileM" : "TileN", tileTokensDim);
+    TLLM_CHECK_ERROR(
+        !options.mUseDeepSeekFp8,
+        "Uniform number of tokens per batch is not supported when using DeepSeek Fp8.");
+    TLLM_CHECK_ERROR(
+        !options.mUsePerTokenSfA && !options.mUsePerTokenSfB,
+        "Uniform number of tokens per batch is not supported when using per-token SF.");
+    TLLM_CHECK_ERROR(options.mBiasType == gemm::BiasType::None,
+                     "Uniform number of tokens per batch is not supported when using bias.");
+    TLLM_CHECK_ERROR(options.mRouteImpl == RouteImpl::NoRoute,
+                     "Uniform number of tokens per batch is not supported when using routing.");
+    TLLM_CHECK_ERROR(
+        !options.mFusedAct,
+        "Uniform number of tokens per batch is not supported when using fused gated activation.");
+    TLLM_CHECK_ERROR(!tg::dtypeIsBlockFmt(options.mDtypeA) &&
+                         !tg::dtypeIsBlockFmt(options.mDtypeB) &&
+                         !tg::dtypeIsBlockFmt(options.mDtypeC),
+                     "Uniform number of tokens per batch is not supported when using block "
+                     "format for dtypeA, dtypeB, or dtypeC.");
+  } else if (options.mBatchStrideInTokens >= 0) {
+    TLLM_LOG_WARNING("Batch stride in tokens is set to ", options.mBatchStrideInTokens,
+                     " but it is not used when not using uniform tokens per batch.");
+  }
   return isValid;
 }
 
@@ -404,9 +465,13 @@ inline std::string dumpOptions(BatchedGemmOptions const& options, bool dumpRunti
   }
   ss << "mBatchMode=batchedGemm::BatchedGemmOptions::BatchMode("
      << static_cast<int32_t>(options.mBatchMode) << ")," << std::endl;
+  if (dumpRuntimeParams) {
+    ss << "mBatchStrideInTokens=" << options.mBatchStrideInTokens << "," << std::endl;
+  }
   ss << "mFusedAct=" << options.mFusedAct << "," << std::endl;
   ss << "mGridWaitForPrimaryRouting=" << options.mGridWaitForPrimaryRouting << "," << std::endl;
   ss << "mIsStaticBatch=" << options.mIsStaticBatch << "," << std::endl;
+  ss << "mIsUniformNumTokensPerBatch=" << options.mIsUniformNumTokensPerBatch << "," << std::endl;
   if (dumpRuntimeParams) {
     ss << "mNumBatches=" << options.mNumBatches << "," << std::endl;
   }

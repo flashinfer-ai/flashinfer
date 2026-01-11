@@ -446,40 +446,30 @@ inline std::string toString(trtllm::gen::MmaKind e) {
 
 inline std::string dumpOptions(GemmOptions const& options, bool dumpRuntimeParams = true) {
   std::stringstream ss;
-  ss << "mAllReduceAlgo="
-     << "gemm::AllReduceAlgo(" << static_cast<int32_t>(options.mAllReduceAlgo) << ")"
-     << "," << std::endl;
-  ss << "mBiasType="
-     << "gemm::BiasType(" << static_cast<int32_t>(options.mBiasType) << ")"
-     << "," << std::endl;
+  ss << "mAllReduceAlgo=" << "gemm::AllReduceAlgo(" << static_cast<int32_t>(options.mAllReduceAlgo)
+     << ")" << "," << std::endl;
+  ss << "mBiasType=" << "gemm::BiasType(" << static_cast<int32_t>(options.mBiasType) << ")" << ","
+     << std::endl;
   ss << "mBlockK=" << options.mBlockK << "," << std::endl;
   ss << "mClusterDimX=" << options.mClusterDimX << "," << std::endl;
   ss << "mClusterDimY=" << options.mClusterDimY << "," << std::endl;
   ss << "mClusterDimZ=" << options.mClusterDimZ << "," << std::endl;
-  ss << "mCtaSwizzleType="
-     << "gemm::CtaSwizzleType(" << static_cast<int32_t>(options.mCtaSwizzleType) << ")"
+  ss << "mCtaSwizzleType=" << "gemm::CtaSwizzleType("
+     << static_cast<int32_t>(options.mCtaSwizzleType) << ")" << "," << std::endl;
+  ss << "mDtypeAcc=" << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mDtypeAcc) << ")"
      << "," << std::endl;
-  ss << "mDtypeAcc="
-     << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mDtypeAcc) << ")"
+  ss << "mDtypeA=" << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mDtypeA) << ")" << ","
+     << std::endl;
+  ss << "mDtypeB=" << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mDtypeB) << ")" << ","
+     << std::endl;
+  ss << "mDtypeC=" << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mDtypeC) << ")" << ","
+     << std::endl;
+  ss << "mDtypeMmaA=" << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mDtypeMmaA) << ")"
      << "," << std::endl;
-  ss << "mDtypeA="
-     << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mDtypeA) << ")"
+  ss << "mDtypeMmaB=" << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mDtypeMmaB) << ")"
      << "," << std::endl;
-  ss << "mDtypeB="
-     << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mDtypeB) << ")"
-     << "," << std::endl;
-  ss << "mDtypeC="
-     << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mDtypeC) << ")"
-     << "," << std::endl;
-  ss << "mDtypeMmaA="
-     << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mDtypeMmaA) << ")"
-     << "," << std::endl;
-  ss << "mDtypeMmaB="
-     << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mDtypeMmaB) << ")"
-     << "," << std::endl;
-  ss << "mEltwiseActType="
-     << "gemm::EltwiseActType(" << static_cast<int32_t>(options.mEltwiseActType) << ")"
-     << "," << std::endl;
+  ss << "mEltwiseActType=" << "gemm::EltwiseActType("
+     << static_cast<int32_t>(options.mEltwiseActType) << ")" << "," << std::endl;
   ss << "mEnablesEarlyExit=" << options.mEnablesEarlyExit << "," << std::endl;
   ss << "mEnablesDelayedEarlyExit=" << options.mEnablesDelayedEarlyExit << "," << std::endl;
   ss << "mEnablesGlobalPtxKnobs=" << options.mEnablesGlobalPtxKnobs << "," << std::endl;
@@ -498,18 +488,16 @@ inline std::string dumpOptions(GemmOptions const& options, bool dumpRuntimeParam
   if (dumpRuntimeParams) {
     ss << "mK=" << options.mK << "," << std::endl;
   }
-  ss << "mKernelTraits={}"
-     << "," << std::endl;
-  ss << "mLayoutA=gemm::MatrixLayout(" << static_cast<int32_t>(options.mLayoutA) << ")"
-     << "," << std::endl;
-  ss << "mLayoutB=gemm::MatrixLayout(" << static_cast<int32_t>(options.mLayoutB) << ")"
-     << "," << std::endl;
+  ss << "mKernelTraits={}" << "," << std::endl;
+  ss << "mLayoutA=gemm::MatrixLayout(" << static_cast<int32_t>(options.mLayoutA) << ")" << ","
+     << std::endl;
+  ss << "mLayoutB=gemm::MatrixLayout(" << static_cast<int32_t>(options.mLayoutB) << ")" << ","
+     << std::endl;
   if (dumpRuntimeParams) {
     ss << "mM=" << options.mM << "," << std::endl;
   }
   ss << "mMmaK=" << options.mMmaK << "," << std::endl;
-  ss << "mMmaKind="
-     << "trtllm::gen::MmaKind(" << static_cast<int32_t>(options.mMmaKind) << ")"
+  ss << "mMmaKind=" << "trtllm::gen::MmaKind(" << static_cast<int32_t>(options.mMmaKind) << ")"
      << "," << std::endl;
   ss << "mMmaM=" << options.mMmaM << "," << std::endl;
   ss << "mMmaN=" << options.mMmaN << "," << std::endl;
@@ -536,30 +524,23 @@ inline std::string dumpOptions(GemmOptions const& options, bool dumpRuntimeParam
   if (options.mSfBlockSizeA.has_value()) {
     ss << "mSfBlockSizeA=" << options.mSfBlockSizeA.value() << "," << std::endl;
   } else {
-    ss << "mSfBlockSizeA="
-       << "std::nullopt"
-       << ", " << std::endl;
+    ss << "mSfBlockSizeA=" << "std::nullopt" << ", " << std::endl;
   }
-  ss << "mSfLayoutA="
-     << "trtllm::gen::SfLayout(" << static_cast<int32_t>(options.mSfLayoutA) << ")"
+  ss << "mSfLayoutA=" << "trtllm::gen::SfLayout(" << static_cast<int32_t>(options.mSfLayoutA) << ")"
      << "," << std::endl;
-  ss << "mSfLayoutB="
-     << "trtllm::gen::SfLayout(" << static_cast<int32_t>(options.mSfLayoutB) << ")"
+  ss << "mSfLayoutB=" << "trtllm::gen::SfLayout(" << static_cast<int32_t>(options.mSfLayoutB) << ")"
      << "," << std::endl;
-  ss << "mSfLayoutC="
-     << "trtllm::gen::SfLayout(" << static_cast<int32_t>(options.mSfLayoutC) << ")"
+  ss << "mSfLayoutC=" << "trtllm::gen::SfLayout(" << static_cast<int32_t>(options.mSfLayoutC) << ")"
      << "," << std::endl;
   ss << "mSfReshapeFactor=" << options.mSfReshapeFactor << "," << std::endl;
   ss << "mSliceK=" << options.mSliceK << "," << std::endl;
-  ss << "mSplitK="
-     << "gemm::SplitK(" << static_cast<int32_t>(options.mSplitK) << ")"
-     << "," << std::endl;
+  ss << "mSplitK=" << "gemm::SplitK(" << static_cast<int32_t>(options.mSplitK) << ")" << ","
+     << std::endl;
   ss << "mTileK=" << options.mTileK << "," << std::endl;
   ss << "mTileM=" << options.mTileM << "," << std::endl;
   ss << "mTileN=" << options.mTileN << "," << std::endl;
-  ss << "mTileScheduler="
-     << "gemm::TileScheduler(" << static_cast<int32_t>(options.mTileScheduler) << ")"
-     << "," << std::endl;
+  ss << "mTileScheduler=" << "gemm::TileScheduler(" << static_cast<int32_t>(options.mTileScheduler)
+     << ")" << "," << std::endl;
   ss << "mTransposeMmaOutput=" << options.mTransposeMmaOutput << "," << std::endl;
   ss << "mUseCustomMmaSchedule=" << options.mUseCustomMmaSchedule << "," << std::endl;
   ss << "mUseDeepSeekFp8=" << options.mUseDeepSeekFp8 << "," << std::endl;
@@ -770,16 +751,19 @@ inline bool checkAndUpdateGemmOptions(GemmOptions& options, tg::CudaArch cudaArc
     }
   }
 
-  if ((options.mMmaKind == tg::MmaKind::Fp8Fp6Fp4 ||
-       options.mMmaKind == tg::MmaKind::MxFp8Fp6Fp4) &&
-      options.mMmaK != 32) {
-    TLLM_LOG_WARNING("Unsupported MmaK (", options.mMmaK,
-                     ") for MmaKind=", gemm::toString(options.mMmaKind), ". Setting MmaK to 32");
-    if (updateOptions) {
-      options.mMmaK = 32;
-      options.mTileK = std::max(options.mMmaK, options.mTileK);
-    } else {
-      return false;
+  if (options.mMmaKind == tg::MmaKind::Fp8Fp6Fp4) {
+    int mmaK = 32;
+
+    if (options.mMmaK != mmaK) {
+      TLLM_LOG_WARNING("Unsupported MmaK (", options.mMmaK,
+                       ") for MmaKind=", gemm::toString(options.mMmaKind), ". Setting MmaK to ",
+                       mmaK);
+      if (updateOptions) {
+        options.mMmaK = mmaK;
+        options.mTileK = std::max(options.mMmaK, options.mTileK);
+      } else {
+        return false;
+      }
     }
   }
 
@@ -807,7 +791,7 @@ inline bool checkAndUpdateGemmOptions(GemmOptions& options, tg::CudaArch cudaArc
         options.mEpilogueLdtmDps, "dp", options.mEpilogueLdtmBits, "bit.");
   }
 
-  // Constraints for NvFp4 and MxFp8.
+  // Constraints for NvFp4, MxFp8, and MxFp4.
   if ((options.mMmaKind == tg::MmaKind::MxFp4NvFp4 ||
        options.mMmaKind == tg::MmaKind::MxFp8Fp6Fp4 || options.mDtypeC == tg::Dtype::MxE4m3) &&
       options.mMmaM != 128) {
@@ -837,12 +821,11 @@ inline bool checkAndUpdateGemmOptions(GemmOptions& options, tg::CudaArch cudaArc
 
     int mmaK = 32;
     if (options.mMmaKind == tg::MmaKind::MxFp4NvFp4) {
+      mmaK = 64;
       if (options.mMmaK == 96) {
         mmaK = 96;
         TLLM_CHECK_ERROR(options.mTileK == 768, "When mmaK == 96, only tileK == 768 is supported");
         TLLM_CHECK_ERROR(options.mTileN <= 128, "When mmaK == 96, only tileN <= 128 is supported");
-      } else {
-        mmaK = 64;
       }
     }
     if (options.mMmaK != mmaK) {
@@ -1491,6 +1474,15 @@ inline bool getDoesScaleAb(tg::Dtype dtypeA, tg::Dtype dtypeB, bool useDeepSeekF
       dtypeA == tg::Dtype::E2m1 || dtypeB == tg::Dtype::E2m1 ||
       ((dtypeA == tg::Dtype::E4m3 || dtypeB == tg::Dtype::E4m3) && !useDeepSeekFp8)};
   return doesScaleAb;
+}
+
+//////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline bool getDoesScaleAct(tg::Dtype dtypeA, tg::Dtype dtypeB, bool useDeepSeekFp8,
+                            EltwiseActType eltwiseActType) {
+  // Only non-linear activations require separate scaleAct.
+  bool const isLinearAct = eltwiseActType == EltwiseActType::None;
+  return !isLinearAct && getDoesScaleAb(dtypeA, dtypeB, useDeepSeekFp8);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
