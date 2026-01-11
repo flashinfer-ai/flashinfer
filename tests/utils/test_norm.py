@@ -19,6 +19,8 @@ import torch
 import torch.nn.functional as F
 
 import flashinfer
+from flashinfer.jit import env as jit_env
+from flashinfer.jit.core import gen_jit_spec
 from flashinfer.utils import device_support_pdl
 
 
@@ -335,6 +337,36 @@ def test_layernorm(batch_size, hidden_size, dtype):
     out_ref = F.layer_norm(x.float(), (hidden_size,), gamma, beta, eps).to(dtype)
 
     torch.testing.assert_close(out, out_ref, rtol=1e-2, atol=1e-2)
+
+
+def test_norm_compilation_without_fp8():
+    """Test that norm module compiles successfully without ENABLE_FP8 flag.
+
+    This test verifies the fix for issue #2271 where batchWarpReduceSum in
+    reduceKernelUtils.cuh depends on PackType which is only defined when
+    ENABLE_FP8 is set. The fix guards batchWarpReduceSum with #ifdef ENABLE_FP8.
+    """
+    # Create a JIT spec for norm module without ENABLE_FP8 flag
+    nvcc_flags = [
+        "-DENABLE_BF16",
+        # Note: ENABLE_FP8 is intentionally omitted to test compilation without it
+    ]
+    spec = gen_jit_spec(
+        "norm_without_fp8_test",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "norm.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "flashinfer_norm_binding.cu",
+        ],
+        extra_cuda_cflags=nvcc_flags,
+    )
+
+    # This should compile successfully without errors
+    # If batchWarpReduceSum is not properly guarded, this will fail with:
+    # "error: incomplete type is not allowed" for PackType
+    module = spec.build_and_load()
+
+    # Verify the module loaded successfully
+    assert module is not None
 
 
 if __name__ == "__main__":
