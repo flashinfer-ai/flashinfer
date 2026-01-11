@@ -533,7 +533,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
     Parameters
     ----------
     query: [batch_size, q_len_per_request, num_heads, head_dim_qk], head_dim_qk = qk_nope_head_dim (kv_lora_rank) + qk_rope_head_dim, should be concated q_nope + q_rope; q_len_per_request is the MTP query length.
-    kv_cache: [num_pages, page_size, head_dim_ckv + head_dim_kpe], should be concated ckv_cache + kpe_cache
+    kv_cache: [num_pages, 1, page_size, head_dim_ckv + head_dim_kpe], should be concated ckv_cache + kpe_cache
     workspace_buffer: [num_semaphores, 4], used for multi_block mode. Must be initialized to 0 for its first use.
     qk_nope_head_dim: qk_nope_head_dim, must be 128
     kv_lora_rank: kv_lora_rank, must be 512
@@ -705,7 +705,7 @@ def xqa_batch_decode_with_kv_cache_mla(
     """
     Parameters:
     query: [batch_size, q_len_per_request, num_heads, head_dim_qk], head_dim_qk = qk_nope_head_dim (kv_lora_rank) + qk_rope_head_dim, should be concated q_nope + q_rope; q_len_per_request is the MTP query length.
-    kv_cache: [num_pages, page_size, head_dim_ckv + head_dim_kpe], should be concated ckv_cache + kpe_cache
+    kv_cache: [num_pages, 1, page_size, head_dim_ckv + head_dim_kpe], should be concated ckv_cache + kpe_cache
     workspace_buffer: torch.Tensor. Must be initialized to 0 for its first use.
     qk_nope_head_dim: qk_nope_head_dim, must be 128
     kv_lora_rank: kv_lora_rank, must be 512
