@@ -151,12 +151,12 @@ cudaError_t CutlassGroupwiseScaledGEMMSM100(void* float_buffer, size_t float_buf
 
 template <int ScaleGranularityM, int ScaleGranularityN, int ScaleGranularityK, bool ScaleMajorK,
           int MmaSM, typename DTypeIn, typename DTypeOut>
-cudaError_t CutlassGroupwiseScaledGEMMSM100SmallBatchSize(void* float_buffer,
-                                                          size_t float_buffer_size_in_bytes,
-                                                          DTypeIn* A_ptr, DTypeIn* B_ptr,
-                                                          float* SFA_ptr, float* SFB_ptr,
-                                                          DTypeOut* D_ptr, int m, int n, int k,
-                                                          int l, cudaStream_t stream) {
+cudaError_t CutlassGroupwiseScaledGEMMSM100LowLatency(void* float_buffer,
+                                                      size_t float_buffer_size_in_bytes,
+                                                      DTypeIn* A_ptr, DTypeIn* B_ptr,
+                                                      float* SFA_ptr, float* SFB_ptr,
+                                                      DTypeOut* D_ptr, int m, int n, int k, int l,
+                                                      cudaStream_t stream) {
   /*
     For small batch sizes (M) like 8, 16, 32 - typically we can only have at minimum M tile size of
     64 - because of tcgen05.mma shapes. This causes wasted work in the M dimension and less CTAs

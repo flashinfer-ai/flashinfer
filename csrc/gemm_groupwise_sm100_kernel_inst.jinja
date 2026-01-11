@@ -39,7 +39,7 @@ CutlassGroupwiseScaledGEMMSM100<
 
 {% if scale_granularity_m == 1 %}
 template cudaError_t
-CutlassGroupwiseScaledGEMMSM100SmallBatchSize<
+CutlassGroupwiseScaledGEMMSM100LowLatency<
     {{ scale_granularity_m }},
     {{ scale_granularity_n }},
     {{ scale_granularity_k }},

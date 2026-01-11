@@ -85,12 +85,12 @@ cudaError_t CutlassGroupwiseScaledGEMMSM100(void* float_buffer, size_t float_buf
 
 template <int ScaleGranularityM, int ScaleGranularityN, int ScaleGranularityK, bool ScaleMajorK,
           int MmaSM, typename DTypeIn, typename DTypeOut>
-cudaError_t CutlassGroupwiseScaledGEMMSM100SmallBatchSize(void* float_buffer,
-                                                          size_t float_buffer_size_in_bytes,
-                                                          DTypeIn* A_ptr, DTypeIn* B_ptr,
-                                                          float* SFA_ptr, float* SFB_ptr,
-                                                          DTypeOut* D_ptr, int m, int n, int k,
-                                                          int l, cudaStream_t stream);
+cudaError_t CutlassGroupwiseScaledGEMMSM100LowLatency(void* float_buffer,
+                                                      size_t float_buffer_size_in_bytes,
+                                                      DTypeIn* A_ptr, DTypeIn* B_ptr,
+                                                      float* SFA_ptr, float* SFB_ptr,
+                                                      DTypeOut* D_ptr, int m, int n, int k, int l,
+                                                      cudaStream_t stream);
 
 }  // namespace gemm
 }  // namespace flashinfer
@@ -118,7 +118,7 @@ void CutlassGemmGroupwiseScaledSM100(TensorView float_workspace_buffer, TensorVi
               // Small-batch-size kernel is not compatible with (scale_granularity_m=128).
               constexpr bool can_use_small_batch = (SCALE_GRANULARITY_M == 1);
               if (can_use_small_batch && m <= 32) {
-                status = flashinfer::gemm::CutlassGroupwiseScaledGEMMSM100SmallBatchSize<
+                status = flashinfer::gemm::CutlassGroupwiseScaledGEMMSM100LowLatency<
                     SCALE_GRANULARITY_M, SCALE_GRANULARITY_N, SCALE_GRANULARITY_K, SCALE_MAJOR_K,
                     MMA_SM>(
                     static_cast<float*>(float_workspace_buffer.data_ptr()),
