@@ -17,6 +17,7 @@
 #define FLASHINFER_GEMM_GROUPWISE_SM100_CUH_
 
 #include <type_traits>
+#include <utility>
 
 #include "../allocator.h"
 #include "../cutlass_utils.cuh"
@@ -171,15 +172,9 @@ cudaError_t CutlassGroupwiseScaledGEMMSM100SmallBatchSize(void* float_buffer, si
   //   D^T = B^T @ A^T
   // so we swap (m, n) and swap (A, B) (+their scale tensors). The output is written as
   // column-major (n, m), which matches the original row-major (m, n) memory layout.
-  int tmp_m = m;
-  m = n;
-  n = tmp_m;
-  DTypeIn* tmp_ptr = A_ptr;
-  A_ptr = B_ptr;
-  B_ptr = tmp_ptr;
-  float* tmp_sf_ptr = SFA_ptr;
-  SFA_ptr = SFB_ptr;
-  SFB_ptr = tmp_sf_ptr;
+  std::swap(m, n);
+  std::swap(A_ptr, B_ptr);
+  std::swap(SFA_ptr, SFB_ptr);
   // Do the swap here as well
   using ScaleConfig = std::conditional_t<
       ScaleMajorK,
