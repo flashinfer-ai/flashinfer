@@ -20,8 +20,10 @@
 --routine bmm_fp8 --batch_size 64 --m 4 --n 1024 --k 7168 --input_dtype fp8_e4m3 --mat2_dtype fp8_e4m3 --out_dtype bfloat16 --backends cudnn cublas cutlass --refcheck -vv --generate_repro_command
 
 ## FP8 GEMM with groupwise scaling
+--routine gemm_fp8_nt_groupwise --m 1 --n 1024 --k 7168 --mma_sm 1 --scale_major_mode MN --backends cutlass --refcheck -vv --generate_repro_command
 --routine gemm_fp8_nt_groupwise --m 4 --n 1024 --k 7168 --mma_sm 1 --scale_major_mode MN --backends cutlass --refcheck -vv --generate_repro_command
 --routine gemm_fp8_nt_groupwise --m 16 --n 1024 --k 7168 --mma_sm 1 --scale_major_mode MN --backends cutlass --refcheck -vv --generate_repro_command
+--routine gemm_fp8_nt_groupwise --m 32 --n 1024 --k 7168 --mma_sm 1 --scale_major_mode MN --backends cutlass --refcheck -vv --generate_repro_command
 
 ## FP8 group GEMM with groupwise scaling
 --routine group_gemm_fp8_nt_groupwise --m 4 --n 1024 --k 7168 --mma_sm 1 --group_size 2 --scale_major_mode MN --refcheck -vv --generate_repro_command
