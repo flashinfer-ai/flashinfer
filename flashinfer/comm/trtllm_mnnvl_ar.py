@@ -623,7 +623,10 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant(
         if quant_out is None:
             # TODO: PyTorch supports fp4x2 dtype, do we want to use that?
             quant_out = torch.empty(
-                input.shape[0], input.shape[1] // 2, dtype=torch.uint8
+                input.shape[0],
+                input.shape[1] // 2,
+                dtype=torch.uint8,
+                device=input.device,
             )
         # TODO: Do we need further check on the shape?
         elif len(quant_out.shape) != 2:

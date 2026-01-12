@@ -32,7 +32,7 @@ void trtllm_mnnvl_allreduce_fusion(
     // Primary I/O
     TensorView input,             // Input shard to be reduced
     Optional<TensorView> output,  // Output result; w/ rmsnorm fusion, it is the normed output; This
-                                  // tensor can be empty if quant fusion is enabled and thr normed
+                                  // tensor can be empty if quant fusion is enabled and the normed
                                   // result is not needed.
 
     // Communication infrastructure
@@ -92,9 +92,13 @@ void trtllm_mnnvl_allreduce_fusion(
                    !rmsnorm_fusion)
         << "residual_in, residual_out, gamma, and epsilon must be provided if rmsnorm_fusion is "
            "true";
-    TVM_FFI_ICHECK(quant_type_enum == QuantType::kNone || (rmsnorm_fusion && sizeof(c_type) == 2))
-        << "Quant fusion is only supported with RMSNorm fusion and FP16/BF16 dtype.";
-
+    TVM_FFI_ICHECK(quant_type_enum != QuantType::kFP4 || (rmsnorm_fusion && sizeof(c_type) == 2))
+        << "NVFP4 Quant fusion is only supported with RMSNorm fusion and FP16/BF16 dtype.";
+    TVM_FFI_ICHECK(quant_type_enum == QuantType::kNone ||
+                   (output_scale.has_value() &&
+                    encode_dlpack_dtype(output_scale.value().dtype()) == float32_code))
+        << "output_scale must be provided when quant_type_enum != QuantType::kNone and must be "
+           "float32 dtype";
     if (rmsnorm_fusion) {
       TVM_FFI_ICHECK(residual_in.value().size(0) == num_tokens &&
                      residual_in.value().size(1) == token_dim)

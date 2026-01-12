@@ -27,7 +27,7 @@
 #include <cuda_pipeline.h>
 #include <cuda_runtime.h>
 
-#include <optional>
+#include <cuda/std/optional>
 #include <type_traits>
 
 #include "../exception.h"
@@ -818,7 +818,7 @@ __device__ inline __nv_bfloat162 cuda_cast<__nv_bfloat162, half2>(half2 val) {
 // // ============================== Abs ==============================
 template <typename T>
 __device__ inline T cuda_abs(T val) {
-  assert(false);
+  static_assert(sizeof(T) == 0, "cuda_abs not specialized for this type");
   return {};
 }
 
@@ -1194,6 +1194,7 @@ inline __device__ void quant_nvfp4(PackedVec<PackedType, T> packedAccum, void* q
                                    void* sfOutPtr, float* outputScale, uint32_t tokenIdx,
                                    uint32_t tokenDim, uint32_t packedIdx,
                                    QuantizationSFLayout sfLayout) {
+#if CUDA_VERSION >= 12080
   static_assert(
       ELTS_PER_THREAD == 8 && (std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16>),
       "NVFP4 quantization fusion is only supported for FP16/BF16!");
@@ -1212,6 +1213,9 @@ inline __device__ void quant_nvfp4(PackedVec<PackedType, T> packedAccum, void* q
   // Each packedvec has 8 elements -> 1 float4 in input -> 1 uint32_t in output
   reinterpret_cast<uint32_t*>(quantOutPtr)[quantOutOffset] =
       cvt_warp_fp16_to_fp4<T, ELTS_PER_THREAD, false>(packedAccum_, *outputScale, sfOut);
+#else
+#error "NVFP4 quantization fusion is not supported on CUDA versions older than 12.8."
+#endif
 }
 };  // namespace quant
 
@@ -1462,6 +1466,40 @@ cudaError_t oneshotAllreduceFusionDispatch(AllReduceFusionParams const& params) 
     }                                                                                \
   } else {                                                                           \
     LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, false, QuantType::kNone);                    \
+  }
+
+  // Runtime validation for quantization parameters
+  if (!params.rmsNormFusion && params.quantType != QuantType::kNone) {
+    FLASHINFER_ERROR(
+        "oneshotAllreduceFusionDispatch: Quantization requires RMSNorm fusion. "
+        "params.rmsNormFusion is false but params.quantType is " +
+        std::to_string(static_cast<int>(params.quantType)));
+    return cudaErrorInvalidValue;
+  }
+
+  if (params.quantType != QuantType::kNone) {
+    if (params.quantOut == nullptr) {
+      FLASHINFER_ERROR(
+          "oneshotAllreduceFusionDispatch: params.quantOut must be non-null when "
+          "params.quantType != QuantType::kNone");
+      return cudaErrorInvalidValue;
+    }
+    if (params.outputScale == nullptr) {
+      FLASHINFER_ERROR(
+          "oneshotAllreduceFusionDispatch: params.outputScale must be non-null when "
+          "params.quantType != QuantType::kNone");
+      return cudaErrorInvalidValue;
+    }
+  }
+
+  if (params.quantType == QuantType::kFP4) {
+#if CUDA_VERSION < 12080
+    FLASHINFER_ERROR(
+        "oneshotAllreduceFusionDispatch: FP4 quantization requires CUDA_VERSION >= 12080. "
+        "Current CUDA_VERSION is " +
+        std::to_string(CUDA_VERSION));
+    return cudaErrorInvalidValue;
+#endif
   }
 
   T** ucPtrs = reinterpret_cast<T**>(params.bufferPtrsDev);

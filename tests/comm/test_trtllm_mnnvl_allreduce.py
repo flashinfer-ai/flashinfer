@@ -1,7 +1,5 @@
 # Check torch version:
-import sys
 import traceback
-from pathlib import Path
 from typing import Tuple, Optional
 
 import pytest
@@ -16,13 +14,7 @@ from flashinfer.comm.mnnvl import TorchDistBackend
 # Use flashinfer.norm.rmsnorm as reference implementation.
 from flashinfer.norm import rmsnorm
 
-# Add project root to path for direct script execution
-_project_root = Path(__file__).resolve().parents[2]
-if str(_project_root) not in sys.path:
-    sys.path.insert(0, str(_project_root))
-
 from tests.test_helpers.comm import init_torch_distributed_from_mpi
-from .conftest import mnnvl_available
 # Note: torch.distributed cleanup is handled by tests/comm/conftest.py
 
 
@@ -422,9 +414,6 @@ def run_mnnvl_ar_full(
 
     gpus_per_node = torch.cuda.device_count()
 
-    if gpus_per_node == 0:
-        pytest.skip("MNNVL allreduce test requires at least one CUDA device per node")
-
     # Initialize torch.distributed (safe to call if already initialized)
     init_torch_distributed_from_mpi()
 
@@ -574,6 +563,10 @@ def run_mnnvl_ar_full(
 # Multi-node test:srun -A coreai_libraries_cudnn -N4 --container-image=<flashinfer_image> -J --mpi=pmix -- bash -c 'hostname && cd <path_to_flashinfer> && pip install -e . && python -m pytest tests/comm/test_trtllm_mnnvl_allreduce.py'
 
 
+@pytest.mark.skipif(
+    torch.cuda.device_count() < 2,
+    reason="MNNVL allreduce test requires at least 2 CUDA devices",
+)
 @pytest.mark.parametrize(
     "seq_lens",
     [[1], [4], [15], [27, 11, 24, 256], [127], [998, 2048]],
@@ -591,10 +584,6 @@ def run_mnnvl_ar_full(
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("hidden_size", [2880, 5120, 7168, 8192, 16384])
-@pytest.mark.skipif(
-    not mnnvl_available(),
-    reason="Mnnvl memory is not supported on this platform or container lacks SYS_PTRACE capability",
-)
 def test_mnnvl_allreduce_refactored(
     monkeypatch,
     seq_lens: list[int],
@@ -609,6 +598,10 @@ def test_mnnvl_allreduce_refactored(
 
 
 # TODO: Remove this legacy test when the deprecated API is removed.
+@pytest.mark.skipif(
+    torch.cuda.device_count() < 2,
+    reason="MNNVL allreduce test requires at least 2 CUDA devices",
+)
 @pytest.mark.parametrize("seq_lens", [[1], [4], [15], [27, 11, 24], [127]])
 @pytest.mark.parametrize(
     "pattern",
@@ -616,10 +609,6 @@ def test_mnnvl_allreduce_refactored(
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("hidden_size", [2048, 4096, 5120, 7168, 8192, 16384])
-@pytest.mark.skipif(
-    not mnnvl_available(),
-    reason="Mnnvl memory is not supported on this platform or container lacks SYS_PTRACE capability",
-)
 def test_mnnvl_allreduce_legacy(
     monkeypatch,
     seq_lens: list[int],
