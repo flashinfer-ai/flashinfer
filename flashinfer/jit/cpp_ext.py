@@ -282,14 +282,14 @@ def generate_ninja_build_for_op(
         object_suffix = ".cuda.o" if is_cuda else ".o"
         cmd = "cuda_compile" if is_cuda else "compile"
         obj_name = source.with_suffix(object_suffix).name
-        obj = f"$name/{obj_name}"
+        obj = obj_name
         objects.append(obj)
         lines.append(f"build {obj}: {cmd} {source.resolve()}")
 
     lines.append("")
     link_rule = "nvcc_link" if needs_device_linking else "link"
-    lines.append(f"build $name/$name.so: {link_rule} " + " ".join(objects))
-    lines.append("default $name/$name.so")
+    lines.append(f"build $name.so: {link_rule} " + " ".join(objects))
+    lines.append("default $name.so")
     lines.append("")
 
     return "\n".join(lines)

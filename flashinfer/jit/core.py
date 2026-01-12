@@ -295,7 +295,7 @@ class JitSpec:
             # Write ninja file if it doesn't exist (deferred case)
             if not self.is_ninja_generated:
                 self.write_ninja()
-            run_ninja(jit_env.FLASHINFER_JIT_DIR, self.ninja_path, verbose)
+            run_ninja(self.ninja_path.parent, self.ninja_path, verbose)
 
     def load(self, so_path: Path):
         return tvm_ffi.load_module(str(so_path))
@@ -479,21 +479,17 @@ def build_jit_specs(
     verbose: bool = False,
     skip_prebuilt: bool = True,
 ) -> None:
-    lines: List[str] = []
+    specs_to_build = []
     for spec in specs:
         if skip_prebuilt and spec.aot_path.exists():
             continue
-        lines.append(f"subninja {spec.ninja_path}")
         if not spec.is_ninja_generated:
             with FileLock(spec.lock_path, thread_local=False):
                 spec.write_ninja()
-    if not lines:
+        specs_to_build.append(spec)
+
+    if not specs_to_build:
         return
 
-    lines = ["ninja_required_version = 1.3"] + lines + [""]
-
-    tmpdir = get_tmpdir()
-    with FileLock(tmpdir / "flashinfer_jit.lock", thread_local=False):
-        ninja_path = tmpdir / "flashinfer_jit.ninja"
-        write_if_different(ninja_path, "\n".join(lines))
-        run_ninja(jit_env.FLASHINFER_JIT_DIR, ninja_path, verbose)
+    for spec in specs_to_build:
+        run_ninja(spec.ninja_path.parent, spec.ninja_path, verbose)
