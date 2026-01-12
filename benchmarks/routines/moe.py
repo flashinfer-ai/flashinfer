@@ -318,7 +318,10 @@ def create_trtllm_moe_test_data(
     # Create routing bias if needed - always bfloat16
     routing_bias = None
     if use_routing_bias:
-        routing_bias = torch.randn(num_experts, device=device, dtype=torch.bfloat16)
+        # Use uniform routing bias for less skewed expert distribution
+        routing_bias = (
+            torch.ones(num_experts, device=device, dtype=torch.bfloat16) * 0.1
+        )
 
     # Create hidden states - always start with bfloat16 for proper quantization
     hidden_states = 2 * torch.randn(
