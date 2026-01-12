@@ -37,8 +37,9 @@ def create_test_inputs(
     dt = torch.randn(batch_size, nheads, dtype=weight_dtype, device=device).as_strided(
         (batch_size, nheads, dim), (nheads, 1, 0)
     )
-
-    A_base = -torch.rand(nheads, dtype=matrixA_dtype, device=device)
+    # The dtype of A is separate in nemotron nano v3.
+    # A only has one value per head (as discussed in mamba 2 block) hence the strides.
+    A_base = torch.rand(nheads, dtype=matrixA_dtype, device=device)
     A = A_base.as_strided((nheads, dim, dstate), (1, 0, 0))
     assert A.stride() == (1, 0, 0)
 
