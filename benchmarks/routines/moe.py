@@ -432,6 +432,7 @@ def calculate_moe_bandwidth(
     weight_format: Optional[str] = None,
     routing_logits_dtype: Optional[torch.dtype] = torch.float32,
     active_experts: Optional[int] = None,
+    verbose: int = 0,
 ) -> float:
     """
     Calculate memory bandwidth for MOE operation in TB/sec.
@@ -476,6 +477,9 @@ def calculate_moe_bandwidth(
         num_active_experts = active_experts
     else:
         num_active_experts = min(num_experts, top_k * num_tokens)
+    if verbose >= 2:
+        print(f"[VVERBOSE] num_active_experts = {num_active_experts}")
+
     weight_bytes = num_active_experts * weight_bytes_per_expert
 
     # Output memory (typically full precision)
@@ -863,6 +867,7 @@ def testTrtllmFp4BlockScaleMoe(args):
         weight_format="nvfp4",
         routing_logits_dtype=routing_logits.dtype,
         active_experts=int(selected_experts.unique().numel()),
+        verbose=args.verbose,
     )
 
     print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
