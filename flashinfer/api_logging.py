@@ -469,8 +469,6 @@ def flashinfer_api(func: Callable = None) -> Callable:
     This decorator integrates with Python's standard logging infrastructure while
     maintaining zero overhead when disabled (FLASHINFER_LOGLEVEL=0).
 
-    NOTE/TODO: Not all FlashInfer APIs are decorated with this decorator yet. This is a work in progress.
-
     Environment Variables
     ---------------------
     FLASHINFER_LOGLEVEL : int (default: 0)

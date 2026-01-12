@@ -1989,14 +1989,20 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
 
   vec_t<DType, VEC_SIZE> score_vec;
 
+  const int aligned_length = (length / VEC_SIZE) * VEC_SIZE;
 #pragma unroll 2
-  for (int base = tx * VEC_SIZE; base < length; base += BLOCK_SIZE * VEC_SIZE) {
+  for (int base = tx * VEC_SIZE; base < aligned_length; base += BLOCK_SIZE * VEC_SIZE) {
     score_vec.cast_load(&score[base]);
 #pragma unroll
     for (int j = 0; j < VEC_SIZE; ++j) {
       const auto bin = Traits::ToCoarseKey(score_vec[j]);
       atomicAdd(&s_histogram[bin], 1);
     }
+  }
+  // Handle tail
+  for (int i = aligned_length + tx; i < length; i += BLOCK_SIZE) {
+    const auto bin = Traits::ToCoarseKey(score[i]);
+    atomicAdd(&s_histogram[bin], 1);
   }
   __syncthreads();
 
@@ -2034,7 +2040,7 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
   if (topk == 0) {
     // Collect indices where bin > threshold
 #pragma unroll 2
-    for (int base = tx * VEC_SIZE; base < length; base += BLOCK_SIZE * VEC_SIZE) {
+    for (int base = tx * VEC_SIZE; base < aligned_length; base += BLOCK_SIZE * VEC_SIZE) {
       score_vec.cast_load(&score[base]);
 #pragma unroll
       for (int j = 0; j < VEC_SIZE; ++j) {
@@ -2045,6 +2051,14 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
         }
       }
     }
+    // Handle tail
+    for (int i = aligned_length + tx; i < length; i += BLOCK_SIZE) {
+      const auto bin = static_cast<int>(Traits::ToCoarseKey(score[i]));
+      if (bin > threshold_bin) {
+        const auto pos = atomicAdd(&s_counter, 1);
+        s_indices[pos] = i;
+      }
+    }
     __syncthreads();
   } else {
     __syncthreads();
@@ -2052,26 +2066,32 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
     __syncthreads();
 
     // Filter + histogram for refinement
+    auto filter_and_add_to_histogram = [&](auto raw_input, int index) {
+      const auto bin = static_cast<int>(Traits::ToCoarseKey(raw_input));
+      if (bin > threshold_bin) {
+        const auto pos = atomicAdd(&s_counter, 1);
+        s_indices[pos] = index;
+      } else if (bin == threshold_bin) {
+        const auto pos = atomicAdd(&s_num_input[0], 1);
+        if (__builtin_expect(pos < SMEM_INPUT_SIZE, 1)) {
+          s_input_idx[0][pos] = index;
+          const auto ordered = Traits::ToOrdered(raw_input);
+          const auto sub_bin = (ordered >> FIRST_SHIFT) & 0xFF;
+          atomicAdd(&s_histogram[sub_bin], 1);
+        }
+      }
+    };
 #pragma unroll 2
-    for (int base = tx * VEC_SIZE; base < length; base += BLOCK_SIZE * VEC_SIZE) {
+    for (int base = tx * VEC_SIZE; base < aligned_length; base += BLOCK_SIZE * VEC_SIZE) {
       score_vec.cast_load(&score[base]);
 #pragma unroll
       for (int j = 0; j < VEC_SIZE; ++j) {
-        const auto raw_input = score_vec[j];
-        const auto bin = static_cast<int>(Traits::ToCoarseKey(raw_input));
-        if (bin > threshold_bin) {
-          const auto pos = atomicAdd(&s_counter, 1);
-          s_indices[pos] = base + j;
-        } else if (bin == threshold_bin) {
-          const auto pos = atomicAdd(&s_num_input[0], 1);
-          if (__builtin_expect(pos < SMEM_INPUT_SIZE, 1)) {
-            s_input_idx[0][pos] = base + j;
-            const auto ordered = Traits::ToOrdered(raw_input);
-            const auto sub_bin = (ordered >> FIRST_SHIFT) & 0xFF;
-            atomicAdd(&s_histogram[sub_bin], 1);
-          }
-        }
+        filter_and_add_to_histogram(score_vec[j], base + j);
       }
+    }
+    // Handle tail
+    for (int i = aligned_length + tx; i < length; i += BLOCK_SIZE) {
+      filter_and_add_to_histogram(score[i], i);
     }
     __syncthreads();
 

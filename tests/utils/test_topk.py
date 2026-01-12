@@ -419,6 +419,54 @@ def test_top_k_ragged_transform(num_rows, max_len, k, dtype):
     assert accuracy >= min_accuracy, f"Accuracy {accuracy:.4f} < {min_accuracy}"
 
 
+@pytest.mark.parametrize("num_rows", [1, 8, 32])
+@pytest.mark.parametrize("max_len", [1024, 4096, 8192])
+@pytest.mark.parametrize("k", [64, 256, 512])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_top_k_ragged_transform_out_of_length(num_rows, max_len, k, dtype):
+    """Test top_k_ragged_transform returns correct indices with offsets."""
+    if k > max_len:
+        pytest.skip("k should be less than max_len")
+
+    torch.manual_seed(42)
+    device = "cuda"
+
+    # Generate random scores
+    scores = torch.randn(num_rows, max_len, device=device, dtype=dtype)
+
+    # Generate naive offsets (cumulative sum style)
+    offsets = torch.zeros(num_rows, device=device, dtype=torch.int32)
+
+    # Random in [1, max_len]
+    lengths = torch.randint(
+        1, max_len + 1, (num_rows,), device=device, dtype=torch.int32
+    )
+
+    # Test flashinfer implementation
+    output = flashinfer.top_k_ragged_transform(scores, offsets, lengths, k)
+
+    # Reference implementation
+    ref_output = reference_ragged_transform(scores, offsets, lengths, k)
+
+    # Check output shape
+    assert output.shape == (num_rows, k), (
+        f"Expected shape {(num_rows, k)}, got {output.shape}"
+    )
+    assert output.dtype == torch.int32
+
+    # Check accuracy
+    accuracy = compute_transform_accuracy(output, ref_output, num_rows, k)
+    min_accuracy = 0.95
+    assert accuracy >= min_accuracy, f"Accuracy {accuracy:.4f} < {min_accuracy}"
+    # Check out of length
+    valid_min = offsets
+    valid_max = offsets + lengths
+    output = output.clamp_min(0)
+    assert torch.all((output >= valid_min[:, None]) & (output < valid_max[:, None])), (
+        f"Out of length Error. {valid_min=}, {valid_max=}, {output.max(dim=1).values=}, {output.min(dim=1).values=}"
+    )
+
+
 @pytest.mark.parametrize("num_rows", [4, 16])
 @pytest.mark.parametrize("max_len", [2048])
 @pytest.mark.parametrize("k", [256, 512])
