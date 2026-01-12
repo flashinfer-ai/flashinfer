@@ -93,6 +93,38 @@ void sampling_from_probs(TensorView probs, TensorView output, Optional<TensorVie
   });
 }
 
+void sampling_from_probs_per_request(TensorView probs, TensorView output,
+                                     Optional<TensorView> maybe_indices, bool deterministic,
+                                     TensorView seed_arr, TensorView offset_arr) {
+  CHECK_INPUT(probs);
+  CHECK_DIM(2, probs);  // probs: (batch_size, vocab_size)
+  CHECK_INPUT(seed_arr);
+  CHECK_INPUT(offset_arr);
+  CHECK_DIM(1, seed_arr);    // seed_arr: (batch_size,)
+  CHECK_DIM(1, offset_arr);  // offset_arr: (batch_size,)
+  CHECK_MAYBE_INPUT_TYPES(maybe_indices, dl_int32, dl_int64);
+  CHECK_MAYBE_SAME_DTYPE(maybe_indices, output);
+  unsigned int batch_size = output.size(0);
+  unsigned int vocab_size = probs.size(1);
+  TVM_FFI_ICHECK_EQ(seed_arr.size(0), batch_size);
+  TVM_FFI_ICHECK_EQ(offset_arr.size(0), batch_size);
+
+  ffi::CUDADeviceGuard device_guard(probs.device().device_id);
+  auto stream = get_stream(probs.device());
+
+  DISPATCH_DLPACK_IDTYPE_TO_CTYPE(output.dtype(), IdType, [&] {
+    cudaError_t status = sampling::SamplingFromProb<float, IdType>(
+        static_cast<float*>(probs.data_ptr()), static_cast<IdType*>(output.data_ptr()),
+        maybe_indices.has_value() ? static_cast<IdType*>(maybe_indices.value().data_ptr())
+                                  : nullptr,
+        batch_size, vocab_size, deterministic, static_cast<uint64_t*>(seed_arr.data_ptr()),
+        static_cast<uint64_t*>(offset_arr.data_ptr()), stream);
+    TVM_FFI_ICHECK(status == cudaSuccess)
+        << "SamplingFromProbs (per-request) failed with error code " << cudaGetErrorString(status);
+    return true;
+  });
+}
+
 void top_p_sampling_from_probs(TensorView probs, TensorView output,
                                Optional<TensorView> maybe_indices,
                                Optional<TensorView> maybe_top_p_arr, double top_p_val,

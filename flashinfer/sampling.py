@@ -32,9 +32,27 @@ from .utils import (
 
 def get_seed_and_offset(
     increment: int,
-    generator: Optional[torch.Generator] = None,
+    generator: Optional[Union[torch.Generator, Tuple[torch.Tensor, torch.Tensor]]] = None,
     device: Optional[torch.device] = None,
-) -> Tuple[int, int]:
+) -> Union[Tuple[int, int], Tuple[torch.Tensor, torch.Tensor]]:
+    """Get seed and offset for RNG operations.
+
+    Args:
+        increment: Amount to increment the offset by
+        generator: Either a torch.Generator or a tuple of (seed_tensor, offset_tensor) for per-request generators
+        device: Device for default generator if generator is None
+
+    Returns:
+        Either (seed, offset) scalars for torch.Generator input,
+        or (seed_tensor, offset_tensor) for per-request generator input
+    """
+    # Per-request generator path: tuple of (seed_tensor, offset_tensor)
+    if isinstance(generator, tuple):
+        seed_arr, offset_arr = generator
+        # Return tensors as-is; offset will be updated in-place by kernel
+        return seed_arr, offset_arr
+
+    # Standard torch.Generator path
     if generator is None:
         generator = get_default_generators(device)
     # add mutex if multi-trheading needed
@@ -133,7 +151,7 @@ def get_sampling_module():
         probs: torch.Tensor,
         indices: Optional[torch.Tensor],
         deterministic: bool,
-        generator: Optional[torch.Generator],
+        generator: Optional[Union[torch.Generator, Tuple[torch.Tensor, torch.Tensor]]],
         seed: Optional[int] = None,
         offset: Optional[int] = None,
     ) -> torch.Tensor:
@@ -143,15 +161,31 @@ def get_sampling_module():
         out_dtype = indices.dtype if indices is not None else torch.int32
         samples = torch.empty(batch_size, dtype=out_dtype, device=device)
         if seed is None or offset is None:
-            seed, offset = get_seed_and_offset(batch_size, generator, device)
-        module.sampling_from_probs(
-            probs,
-            samples,
-            indices,
-            deterministic,
-            seed,
-            offset,
-        )
+            seed_or_arr, offset_or_arr = get_seed_and_offset(batch_size, generator, device)
+        else:
+            seed_or_arr, offset_or_arr = seed, offset
+
+        # Dispatch based on whether we have tensor generators
+        if isinstance(seed_or_arr, torch.Tensor):
+            # Per-request generator path
+            module.sampling_from_probs_per_request(
+                probs,
+                samples,
+                indices,
+                deterministic,
+                seed_or_arr,
+                offset_or_arr,
+            )
+        else:
+            # Scalar generator path
+            module.sampling_from_probs(
+                probs,
+                samples,
+                indices,
+                deterministic,
+                seed_or_arr,
+                offset_or_arr,
+            )
         return samples
 
     # torch library for sampling_from_probs

@@ -944,3 +944,53 @@ if __name__ == "__main__":
     # test_top_k_mask_logits(99, 989, 10)
     # test_chain_speculative_sampling(3, 111, 3, False)
     # test_chain_speculative_sampling(3, 111, 3, True)
+
+
+@pytest.mark.parametrize("batch_size", [1, 16, 99])
+@pytest.mark.parametrize("vocab_size", [111, 1000])
+def test_sampling_from_probs_per_request(batch_size, vocab_size):
+    """Test per-request generator support with tensor-based seed/offset arrays."""
+    torch.manual_seed(42)
+    device = torch.device("cuda:0")
+
+    # Create random probabilities
+    logits = torch.randn(batch_size, vocab_size, device=device)
+    probs = torch.softmax(logits, dim=-1)
+
+    # Create per-request seed/offset tensors
+    seed_arr = torch.randint(0, 2**32, (batch_size,), dtype=torch.int64, device=device)
+    offset_arr = torch.zeros(batch_size, dtype=torch.int64, device=device)
+
+    # Sample using per-request generators (pass as tuple)
+    generator_tuple = (seed_arr, offset_arr)
+    samples = flashinfer.sampling.sampling_from_probs(probs, generator=generator_tuple)
+
+    # Verify output shape and dtype
+    assert samples.shape == (batch_size,)
+    assert samples.dtype == torch.int32
+
+    # Verify samples are valid indices
+    assert torch.all(samples >= 0) and torch.all(samples < vocab_size)
+
+    # Verify offsets were updated in-place (should be incremented by 4)
+    assert torch.all(offset_arr == 4), f"Expected offsets to be 4, got {offset_arr}"
+
+    # Test reproducibility: same seeds should give same results
+    seed_arr_copy = seed_arr.clone()
+    offset_arr_copy = torch.zeros(batch_size, dtype=torch.int64, device=device)
+    generator_tuple_copy = (seed_arr_copy, offset_arr_copy)
+    samples_2 = flashinfer.sampling.sampling_from_probs(probs, generator=generator_tuple_copy)
+
+    assert torch.all(samples == samples_2), "Same seeds should produce same samples"
+
+    # Test different seeds produce different results (with high probability)
+    seed_arr_diff = torch.randint(0, 2**32, (batch_size,), dtype=torch.int64, device=device)
+    offset_arr_diff = torch.zeros(batch_size, dtype=torch.int64, device=device)
+    generator_tuple_diff = (seed_arr_diff, offset_arr_diff)
+    samples_diff = flashinfer.sampling.sampling_from_probs(
+        probs, generator=generator_tuple_diff
+    )
+
+    # At least some samples should be different (with overwhelming probability for random seeds)
+    if batch_size > 1 or vocab_size > 10:
+        assert not torch.all(samples == samples_diff), "Different seeds should produce different samples"

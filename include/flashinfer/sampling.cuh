@@ -785,6 +785,66 @@ __global__ void SamplingFromProbKernel(DType* probs, IdType* output, IdType* ind
   output[bx] = sampled_id;
 }
 
+// Per-request generator variant: accepts seed/offset arrays instead of scalars
+template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
+          BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
+          typename DType, typename IdType>
+__global__ void SamplingFromProbKernelPerRequest(DType* probs, IdType* output, IdType* indices,
+                                                  uint32_t d, uint64_t* seed_arr,
+                                                  uint64_t* offset_arr) {
+  curandStatePhilox4_32_10_t state;
+  const uint32_t bx = blockIdx.x, tx = threadIdx.x;
+
+  // Load per-request seed and offset
+  uint64_t philox_seed = seed_arr[bx];
+  uint64_t philox_offset = offset_arr[bx];
+
+  curand_init(philox_seed, 0, philox_offset, &state);
+  const uint32_t row_idx = indices == nullptr ? bx : indices[bx];
+
+  extern __shared__ __align__(
+      alignof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>))
+      uint8_t smem_sampling[];
+  auto& temp_storage =
+      reinterpret_cast<SamplingTempStorage<BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>&>(
+          smem_sampling);
+  temp_storage.sampled_id = d;
+  __syncthreads();
+
+  vec_t<float, VEC_SIZE> probs_vec;
+  float aggregate(0);
+  float u = curand_uniform(&state);
+
+#pragma unroll 2
+  for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
+    probs_vec.fill(0);
+    if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
+      probs_vec.cast_load(probs + row_idx * d + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
+    }
+
+    DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM,
+                           DETERMINISTIC>(
+        i, d, [](float x) { return x > 0; }, u, probs_vec, aggregate, &temp_storage);
+    if (float(aggregate) > u) {
+      break;
+    }
+  }
+  int sampled_id = temp_storage.sampled_id;
+  if (sampled_id == d) {
+    // NOTE(Zihao): this would happen when u is very close to 1
+    // and the sum of probabilities is smaller than u
+    // In this case, we use the last valid index as the sampled id
+    sampled_id = temp_storage.last_valid_id;
+  }
+  output[bx] = sampled_id;
+
+  // Update offset in-place atomically (only thread 0)
+  if (tx == 0) {
+    // Increment by 4 to align with Philox counter increment pattern
+    atomicAdd(reinterpret_cast<unsigned long long*>(&offset_arr[bx]), 4ULL);
+  }
+}
+
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
           typename DType, typename IdType>
@@ -1396,6 +1456,31 @@ cudaError_t SamplingFromProb(T* probs, IdType* output, IdType* indices, uint32_t
         vec_size, VEC_SIZE, {DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, {
           auto kernel = SamplingFromProbKernel<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO, VEC_SIZE,
                                                DETERMINISTIC, T, IdType>;
+          FLASHINFER_CUDA_CALL(
+              cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+        })});
+    return cudaSuccess;
+  });
+}
+
+// Per-request generator overload: accepts seed/offset arrays
+template <typename T, typename IdType>
+cudaError_t SamplingFromProb(T* probs, IdType* output, IdType* indices, uint32_t batch_size,
+                             uint32_t d, bool deterministic, uint64_t* seed_arr,
+                             uint64_t* offset_arr, cudaStream_t stream = 0) {
+  const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
+
+  auto compute_capacity = GetCudaComputeCapability();
+  DISPATCH_COMPUTE_CAP_NUM_THREADS(compute_capacity, BLOCK_THREADS, {
+    dim3 nblks(batch_size);
+    dim3 nthrs(BLOCK_THREADS);
+    void* args[] = {&probs, &output, &indices, &d, &seed_arr, &offset_arr};
+    const uint32_t smem_size = sizeof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
+
+    DISPATCH_ALIGNED_VEC_SIZE(
+        vec_size, VEC_SIZE, {DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, {
+          auto kernel = SamplingFromProbKernelPerRequest<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO,
+                                                         VEC_SIZE, DETERMINISTIC, T, IdType>;
           FLASHINFER_CUDA_CALL(
               cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
         })});

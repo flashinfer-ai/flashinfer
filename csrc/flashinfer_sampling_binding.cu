@@ -23,6 +23,10 @@ void softmax(TensorView workspace_buffer, TensorView logits, TensorView output,
 void sampling_from_probs(TensorView probs, TensorView output, Optional<TensorView> maybe_indices,
                          bool deterministic, uint64_t philox_seed, uint64_t philox_offset);
 
+void sampling_from_probs_per_request(TensorView probs, TensorView output,
+                                     Optional<TensorView> maybe_indices, bool deterministic,
+                                     TensorView seed_arr, TensorView offset_arr);
+
 void sampling_from_logits(TensorView logits, TensorView output, Optional<TensorView> maybe_indices,
                           bool deterministic, uint64_t philox_seed, uint64_t philox_offset);
 
@@ -69,6 +73,8 @@ void chain_speculative_sampling(TensorView draft_probs, TensorView draft_token_i
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(softmax, softmax);
 // Sample from probabilities
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sampling_from_probs, sampling_from_probs);
+// Sample from probabilities with per-request generators
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(sampling_from_probs_per_request, sampling_from_probs_per_request);
 // Sample from logits
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sampling_from_logits, sampling_from_logits);
 // Top-k sampling from probabilities
