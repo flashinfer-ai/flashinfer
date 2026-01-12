@@ -285,26 +285,10 @@ def test_selective_state_update_with_z():
 
     atol = 1e-3
     rtol = 1e-2
-    outputs_match = torch.allclose(y_ref, y_test, atol=atol, rtol=rtol)
-
-    if outputs_match:
-        print(f"✓ Outputs match within tolerance (atol={atol}, rtol={rtol})")
-    else:
-        print(f"✗ Outputs do NOT match within tolerance (atol={atol}, rtol={rtol})")
-
-    assert outputs_match
-
-    # Check if states match within tolerance
-    states_match = torch.allclose(
+    torch.testing.assert_allclose(y_ref, y_test, atol=atol, rtol=rtol)
+    torch.testing.assert_allclose(
         state_ref[inputs["slot_idx"]],
         state[inputs["slot_idx"]],
         atol=atol,
         rtol=rtol,
     )
-
-    if states_match:
-        print(f"✓ States match within tolerance (atol={atol}, rtol={rtol})")
-    else:
-        print(f"✗ States do NOT match within tolerance (atol={atol}, rtol={rtol})")
-
-    assert states_match
