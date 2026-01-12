@@ -22,7 +22,7 @@ if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
 from tests.test_helpers.comm import init_torch_distributed_from_mpi
-
+from .conftest import mnnvl_available
 # Note: torch.distributed cleanup is handled by tests/comm/conftest.py
 
 
@@ -80,7 +80,7 @@ def row_linear_residual_norm_fusion_forward(
                     workspace,
                     eps,
                     launch_with_pdl=use_pdl,
-                    strategy=trtllm_mnnvl_ar.MNNVLAllreduceFusionStrategy.ONESHOT,
+                    strategy=trtllm_mnnvl_ar.MNNVLAllreduceFusionStrategy.AUTO,
                 )
             )
 
@@ -591,6 +591,10 @@ def run_mnnvl_ar_full(
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("hidden_size", [2880, 5120, 7168, 8192, 16384])
+@pytest.mark.skipif(
+    not mnnvl_available(),
+    reason="Mnnvl memory is not supported on this platform or container lacks SYS_PTRACE capability",
+)
 def test_mnnvl_allreduce_refactored(
     monkeypatch,
     seq_lens: list[int],
@@ -612,6 +616,10 @@ def test_mnnvl_allreduce_refactored(
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("hidden_size", [2048, 4096, 5120, 7168, 8192, 16384])
+@pytest.mark.skipif(
+    not mnnvl_available(),
+    reason="Mnnvl memory is not supported on this platform or container lacks SYS_PTRACE capability",
+)
 def test_mnnvl_allreduce_legacy(
     monkeypatch,
     seq_lens: list[int],
