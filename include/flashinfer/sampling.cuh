@@ -738,6 +738,53 @@ __global__ void SamplingFromLogitsKernel(DType* logits, IdType* output, IdType* 
   }
 }
 
+// Per-request generator variant
+template <uint32_t BLOCK_THREADS, BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE,
+          typename DType, typename IdType>
+__global__ void SamplingFromLogitsKernelPerRequest(DType* logits, IdType* output, IdType* indices,
+                                                     uint32_t d, uint64_t* seed_arr,
+                                                     uint64_t* offset_arr) {
+  const uint32_t bx = blockIdx.x, tx = threadIdx.x;
+  uint64_t philox_seed = seed_arr[bx];
+  uint64_t philox_offset = offset_arr[bx];
+
+  const uint32_t row_idx = indices == nullptr ? bx : indices[bx];
+  using SharedMem = typename BlockReduce<DataAndIndex<DType, IdType>, BLOCK_THREADS,
+                                         REDUCE_ALGORITHM>::TempStorage;
+  extern __shared__ __align__(alignof(SharedMem)) uint8_t smem_sampling_logit[];
+  auto& temp_storage = reinterpret_cast<SharedMem&>(smem_sampling_logit);
+
+  vec_t<DType, VEC_SIZE> logits_vec;
+  DataAndIndex<DType, IdType> max_data = {-cuda::std::numeric_limits<DType>::infinity(), 0};
+  for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
+    logits_vec.fill(-cuda::std::numeric_limits<DType>::infinity());
+    if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
+      logits_vec.cast_load(logits + row_idx * d + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
+    }
+
+    vec_t<DType, VEC_SIZE> gumbel_noise = GenerateGumbelNoise<DType, VEC_SIZE>(
+        philox_seed, philox_offset,
+        static_cast<uint64_t>(bx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE));
+    DataAndIndex<DType, IdType> cur_data[VEC_SIZE];
+#pragma unroll
+    for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+      cur_data[j].data = (i * BLOCK_THREADS + tx) * VEC_SIZE + j < d
+                             ? logits_vec[j] + gumbel_noise[j]
+                             : -cuda::std::numeric_limits<DType>::infinity();
+      cur_data[j].index = (i * BLOCK_THREADS + tx) * VEC_SIZE + j;
+    }
+
+    max_data +=
+        BlockReduce<DataAndIndex<DType, IdType>, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage)
+            .template Sum<VEC_SIZE>(cur_data);
+  }
+  if (tx == 0) {
+    output[bx] = max_data.index;
+    // Update offset in-place
+    atomicAdd(reinterpret_cast<unsigned long long*>(&offset_arr[bx]), 4ULL);
+  }
+}
+
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
           typename DType, typename IdType>
