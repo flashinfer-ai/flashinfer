@@ -228,6 +228,10 @@ class JitSpec:
         return jit_env.FLASHINFER_JIT_DIR / self.name / "build.ninja"
 
     @property
+    def build_dir(self) -> Path:
+        return jit_env.FLASHINFER_JIT_DIR / self.name
+
+    @property
     def jit_library_path(self) -> Path:
         return jit_env.FLASHINFER_JIT_DIR / self.name / f"{self.name}.so"
 
@@ -238,7 +242,7 @@ class JitSpec:
 
     def get_object_paths(self) -> List[Path]:
         object_paths = []
-        jit_dir = self.jit_library_path.parent
+        jit_dir = self.build_dir
         for source in self.sources:
             is_cuda = source.suffix == ".cu"
             object_suffix = ".cuda.o" if is_cuda else ".o"
@@ -264,7 +268,7 @@ class JitSpec:
 
     def write_ninja(self) -> None:
         ninja_path = self.ninja_path
-        ninja_path.parent.mkdir(parents=True, exist_ok=True)
+        self.build_dir.mkdir(parents=True, exist_ok=True)
         content = generate_ninja_build_for_op(
             name=self.name,
             sources=self.sources,
@@ -295,7 +299,7 @@ class JitSpec:
             # Write ninja file if it doesn't exist (deferred case)
             if not self.is_ninja_generated:
                 self.write_ninja()
-            run_ninja(self.ninja_path.parent, self.ninja_path, verbose)
+            run_ninja(self.build_dir, self.ninja_path, verbose)
 
     def load(self, so_path: Path):
         return tvm_ffi.load_module(str(so_path))
@@ -362,7 +366,7 @@ class JitSpec:
         nvcc = os.environ.get("FLASHINFER_NVCC", f"{cuda_home}/bin/nvcc")
 
         # Build directory
-        build_dir = str(self.jit_library_path.parent.resolve())
+        build_dir = str(self.build_dir.resolve())
 
         # Generate entries for each source file
         compile_commands = []
@@ -492,4 +496,4 @@ def build_jit_specs(
         return
 
     for spec in specs_to_build:
-        run_ninja(spec.ninja_path.parent, spec.ninja_path, verbose)
+        run_ninja(spec.build_dir, spec.ninja_path, verbose)
