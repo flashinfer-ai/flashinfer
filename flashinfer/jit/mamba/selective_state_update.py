@@ -30,7 +30,8 @@ def gen_selective_state_update_module() -> JitSpec:
 
 
 def gen_selective_state_update_sm90_module() -> JitSpec:
-    # Use CompilationContext to get nvcc flags filtered by supported major versions
+    # We use a specialized model for Hopper+ GPUs due to the explicit use
+    # of TMA device functions.
     # This supports SM90 (Hopper) and future architectures
     compilation_context = CompilationContext()
     nvcc_flags = compilation_context.get_nvcc_flags_list(
