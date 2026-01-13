@@ -22,6 +22,7 @@
 #include "tensorrt_llm/common/quantTypeUtils.cuh"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include "tensorrt_llm/kernels/quantization.h"
+#include "tensorrt_llm/kernels/quantization_utils.cuh"
 
 using namespace tensorrt_llm::common;
 
@@ -87,88 +88,6 @@ __global__ static void quantizedKernel(char4* dst, __nv_bfloat162 const* src,
   }
 }
 #endif
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-template <typename T, int NUM_ELTS>
-struct DstVec {
-  static_assert("not implemented.");
-};
-
-template <>
-struct DstVec<float2, 2> {
-  using Type = uint32_t;
-};
-
-template <>
-struct DstVec<half2, 4> {
-  using Type = uint2;
-};
-
-#ifdef ENABLE_BF16
-
-template <>
-struct DstVec<__nv_bfloat162, 4> {
-  using Type = uint2;
-};
-
-#endif  // ENABLE_BF16
-
-template <typename T>
-struct DstVec<T, 4> {
-  static_assert(sizeof(T) == 4, "not implemented.");
-  using Type = uint32_t;
-};
-
-template <typename T>
-struct DstVec<T, 8> {
-  static_assert(sizeof(T) == 2, "not implemented.");
-  using Type = uint2;
-};
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-// Helper function of getting the absMax of all elements in the vector after clamping.
-// Pack two elements in order to use possible hmax2 instructions.
-template <typename T>
-inline __device__ void clampAndAbsMax(T& localMax, uint4& vec, T const clampMin, T const clampMax) {
-  static constexpr int NUM_ELTS = sizeof(uint4) / sizeof(T);
-
-#pragma unroll
-  for (int i = 0; i < NUM_ELTS; ++i) {
-    T& val = reinterpret_cast<T*>(&vec)[i];
-    val = cuda_clamp(val, clampMin, clampMax);
-    localMax = cuda_max(localMax, cuda_abs(val));
-  }
-}
-
-// Helper function of quantizing the vector and storing it to global memory.
-// Pack two elements in order to use fast convert instructions.
-template <typename T, typename QuantT, bool USE_SMEM>
-inline __device__ void quantizeAndStore(QuantT* dstPtr, uint4 vec, T const clampMin,
-                                        T const clampMax, float const scaleOrigQuant) {
-  static constexpr int NUM_ELTS = sizeof(uint4) / sizeof(T);
-
-  using DstVecType = typename DstVec<T, NUM_ELTS>::Type;
-  DstVecType dstVec;
-#pragma unroll
-  for (int i = 0; i < NUM_ELTS; ++i) {
-    T val = reinterpret_cast<T*>(&vec)[i];
-    // Values loaded from smem has already been clamped.
-    if constexpr (!USE_SMEM) {
-      val = cuda_clamp(val, clampMin, clampMax);
-    }
-    float2 val2 = cuda_cast<float2>(val);
-    val2.x *= scaleOrigQuant;
-    val2.y *= scaleOrigQuant;
-    QuantT quantVal = cuda_cast<QuantT>(val2);
-    reinterpret_cast<QuantT*>(&dstVec)[i] = quantVal;
-  }
-  // Store to destination buffer.
-  *reinterpret_cast<DstVecType*>(dstPtr) = dstVec;
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename T, typename QuantT, bool USE_SMEM>
 __global__ void perTokenQuantization(QuantT* dst, T const* src, int64_t const numRows,
@@ -253,7 +172,7 @@ __global__ void perTokenQuantization(QuantT* dst, T const* src, int64_t const nu
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-// FP4/MXFP8 Quantization
+// FP4/MXFP8 Quantization Constants
 
 constexpr int CVT_FP4_ELTS_PER_THREAD = 8;
 constexpr int CVT_FP4_SF_VEC_SIZE = 16;
@@ -261,482 +180,8 @@ constexpr int CVT_ELTS_PER_THREAD = 8;
 constexpr int CVT_FP4_THREADS_PER_WARP = 32;
 constexpr int CVT_FP8_TO_FP4_ELTS_PER_THREAD = 16;
 
-// Convert 8 float32 values into 8 e2m1 values (represented as one uint32_t).
-inline __device__ uint32_t fp32_vec_to_e2m1(float (&array)[8]) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-  uint32_t val;
-  asm volatile(
-      "{\n"
-      ".reg .b8 byte0;\n"
-      ".reg .b8 byte1;\n"
-      ".reg .b8 byte2;\n"
-      ".reg .b8 byte3;\n"
-      "cvt.rn.satfinite.e2m1x2.f32   byte0, %2, %1;\n"
-      "cvt.rn.satfinite.e2m1x2.f32   byte1, %4, %3;\n"
-      "cvt.rn.satfinite.e2m1x2.f32   byte2, %6, %5;\n"
-      "cvt.rn.satfinite.e2m1x2.f32   byte3, %8, %7;\n"
-      "mov.b32 %0, {byte0, byte1, byte2, byte3};\n"
-      "}"
-      : "=r"(val)
-      : "f"(array[0]), "f"(array[1]), "f"(array[2]), "f"(array[3]), "f"(array[4]), "f"(array[5]),
-        "f"(array[6]), "f"(array[7]));
-  return val;
-#else
-  // static_assert(false, "not supported.");
-  return 0;
-#endif
-}
-
-// Convert 4 float2 values into 8 e2m1 values (represented as one uint32_t).
-inline __device__ uint32_t fp32_vec_to_e2m1(float2 (&array)[4]) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-  uint32_t val;
-  asm volatile(
-      "{\n"
-      ".reg .b8 byte0;\n"
-      ".reg .b8 byte1;\n"
-      ".reg .b8 byte2;\n"
-      ".reg .b8 byte3;\n"
-      "cvt.rn.satfinite.e2m1x2.f32   byte0, %2, %1;\n"
-      "cvt.rn.satfinite.e2m1x2.f32   byte1, %4, %3;\n"
-      "cvt.rn.satfinite.e2m1x2.f32   byte2, %6, %5;\n"
-      "cvt.rn.satfinite.e2m1x2.f32   byte3, %8, %7;\n"
-      "mov.b32 %0, {byte0, byte1, byte2, byte3};\n"
-      "}"
-      : "=r"(val)
-      : "f"(array[0].x), "f"(array[0].y), "f"(array[1].x), "f"(array[1].y), "f"(array[2].x),
-        "f"(array[2].y), "f"(array[3].x), "f"(array[3].y));
-  return val;
-#else
-  // static_assert(false, "not supported.");
-  return 0;
-#endif
-}
-
-// Convert 8 float2 values into 16 e2m1 values (represented as one uint64_t).
-inline __device__ uint64_t fp32_vec_to_e2m1(float2 (&array)[8]) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-  uint64_t val;
-  asm volatile(
-      "{\n"
-      ".reg .b8 byte0;\n"
-      ".reg .b8 byte1;\n"
-      ".reg .b8 byte2;\n"
-      ".reg .b8 byte3;\n"
-      ".reg .b8 byte4;\n"
-      ".reg .b8 byte5;\n"
-      ".reg .b8 byte6;\n"
-      ".reg .b8 byte7;\n"
-      ".reg .b32 val0;\n"
-      ".reg .b32 val1;\n"
-      "cvt.rn.satfinite.e2m1x2.f32   byte0,  %2,  %1;\n"
-      "cvt.rn.satfinite.e2m1x2.f32   byte1,  %4,  %3;\n"
-      "cvt.rn.satfinite.e2m1x2.f32   byte2,  %6,  %5;\n"
-      "cvt.rn.satfinite.e2m1x2.f32   byte3,  %8,  %7;\n"
-      "cvt.rn.satfinite.e2m1x2.f32   byte4, %10,  %9;\n"
-      "cvt.rn.satfinite.e2m1x2.f32   byte5, %12, %11;\n"
-      "cvt.rn.satfinite.e2m1x2.f32   byte6, %14, %13;\n"
-      "cvt.rn.satfinite.e2m1x2.f32   byte7, %16, %15;\n"
-      "mov.b32 val0, {byte0, byte1, byte2, byte3};\n"
-      "mov.b32 val1, {byte4, byte5, byte6, byte7};\n"
-      "mov.b64 %0, {val0, val1};\n"
-      "}"
-      : "=l"(val)
-      : "f"(array[0].x), "f"(array[0].y), "f"(array[1].x), "f"(array[1].y), "f"(array[2].x),
-        "f"(array[2].y), "f"(array[3].x), "f"(array[3].y), "f"(array[4].x), "f"(array[4].y),
-        "f"(array[5].x), "f"(array[5].y), "f"(array[6].x), "f"(array[6].y), "f"(array[7].x),
-        "f"(array[7].y));
-  return val;
-#else
-  // static_assert(false, "not supported.");
-  return 0;
-#endif
-}
-
-// Convert 4 float2 values into 8 e4m3 values (represented as one uint64_t).
-inline __device__ uint64_t fp32_vec_to_e4m3(float2 (&array)[4]) {
-  union {
-    uint64_t val;
-    __nv_fp8x2_e4m3 elts[4];
-  } u;
-
-  static_assert(sizeof(u.val) == sizeof(u.elts),
-                "Expected to alias uint64_t and __nv_fp8x2_e4m3[4]");
-
-  u.elts[0] = __nv_fp8x2_e4m3(array[0]);
-  u.elts[1] = __nv_fp8x2_e4m3(array[1]);
-  u.elts[2] = __nv_fp8x2_e4m3(array[2]);
-  u.elts[3] = __nv_fp8x2_e4m3(array[3]);
-  return u.val;
-}
-
-// Fast reciprocal.
-inline __device__ float reciprocal_approximate_ftz(float a) {
-  float b;
-  asm volatile("rcp.approx.ftz.f32 %0, %1;\n" : "=f"(b) : "f"(a));
-  return b;
-}
-
-__device__ __forceinline__ float exp2f_rcp(uint8_t exp) {
-  constexpr uint32_t FP32_EXPONENT_BIAS = 127;
-  return (exp == 0) ? 1 : exp2f(FP32_EXPONENT_BIAS - static_cast<float>(exp));
-}
-
-// Define a 16 bytes packed data type.
-template <class Type>
-struct PackedVec {
-  typename TypeConverter<Type>::Type elts[4];
-  static_assert(sizeof(elts) == sizeof(Type) * CVT_ELTS_PER_THREAD,
-                "Vector size should match the number of elements per thread.");
-};
-
-template <>
-struct PackedVec<__nv_fp8_e4m3> {
-  __nv_fp8x2_e4m3 elts[8];
-  static_assert(sizeof(elts) == sizeof(__nv_fp8_e4m3) * CVT_FP8_TO_FP4_ELTS_PER_THREAD,
-                "Vector size should match the number of elements per thread.");
-};
-
-// Quantizes the provided PackedVec into the uint32_t output
-template <class Type, int SF_VEC_SIZE, bool UE8M0_SF>
-__device__ uint32_t cvt_warp_fp16_to_fp4(PackedVec<Type>& vec, float SFScaleVal, uint8_t* SFout) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-  // Get absolute maximum values among the local 8 values.
-  auto localMax = cuda_abs(vec.elts[0]);
-
-// Local maximum value.
-#pragma unroll
-  for (int i = 1; i < CVT_ELTS_PER_THREAD / 2; i++) {
-    localMax = cuda_max(localMax, cuda_abs(vec.elts[i]));
-  }
-
-  constexpr int CVT_NUM_THREADS_PER_SF = SF_VEC_SIZE / CVT_ELTS_PER_THREAD;
-  // Get the absolute maximum among all 16 values (two threads for 16, four threads for 32).
-  localMax = cuda_max(__shfl_xor_sync(uint32_t(-1), localMax, 1), localMax);
-  if constexpr (CVT_NUM_THREADS_PER_SF == 4) {
-    localMax = cuda_max(__shfl_xor_sync(uint32_t(-1), localMax, 2), localMax);
-  }
-  // Get the final absolute maximum values.
-  float vecMax = float(cuda_max(localMax.x, localMax.y));
-
-  // 8 bits representation of the SF.
-  uint8_t fp8SFVal;
-  float outputScale;
-  // Write the SF to global memory (STG.8).
-  if constexpr (UE8M0_SF) {
-    __nv_fp8_e8m0 tmp;
-    // Scale the max value to the range of E2m1.
-    vecMax *= reciprocal_approximate_ftz(6.0f);
-    tmp.__x = __nv_cvt_float_to_e8m0(vecMax, __NV_SATFINITE, cudaRoundPosInf);
-
-    fp8SFVal = tmp.__x;
-    outputScale = vecMax != 0 ? exp2f_rcp(fp8SFVal) : 0.0f;
-  } else {
-    // Get the SF (max value of the vector / max value of e2m1).
-    // maximum value of e2m1 = 6.0.
-    // TODO: use half as compute data type.
-    auto SFValue = SFScaleVal * (vecMax * reciprocal_approximate_ftz(6.0f));
-
-    // Here SFValue is always positive, so E4M3 is the same as UE4M3.
-    __nv_fp8_e4m3 tmp = __nv_fp8_e4m3(SFValue);
-    fp8SFVal = tmp.__x;
-    SFValue = static_cast<float>(tmp);
-    // Get the output scale.
-    // Recipe: final_scale = reciprocal(fp32(fp8(SFValue * SFScaleVal)) * reciprocal(SFScaleVal))
-    outputScale = vecMax != 0
-                      ? reciprocal_approximate_ftz(SFValue * reciprocal_approximate_ftz(SFScaleVal))
-                      : 0.0f;
-  }
-
-  if (SFout) {
-    // Write the SF to global memory (STG.8).
-    *SFout = fp8SFVal;
-  }
-
-  // Convert the input to float.
-  float2 fp2Vals[CVT_ELTS_PER_THREAD / 2];
-
-#pragma unroll
-  for (int i = 0; i < CVT_ELTS_PER_THREAD / 2; i++) {
-    if constexpr (std::is_same_v<Type, half>) {
-      fp2Vals[i] = __half22float2(vec.elts[i]);
-    } else {
-      fp2Vals[i] = __bfloat1622float2(vec.elts[i]);
-    }
-    fp2Vals[i].x *= outputScale;
-    fp2Vals[i].y *= outputScale;
-  }
-
-  // Convert to e2m1 values.
-  uint32_t e2m1Vec = fp32_vec_to_e2m1(fp2Vals);
-
-  // Write the e2m1 values to global memory.
-  return e2m1Vec;
-#else
-  return 0;
-#endif
-}
-
-template <class Type, int SF_VEC_SIZE, bool UE8M0_SF>
-__device__ uint64_t cvt_warp_fp8_to_fp4(PackedVec<Type>& vec, float SFScaleVal, uint8_t* SFout) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-
-  float const dequant_to_fp16_scale = 6.f * reciprocal_approximate_ftz(SFScaleVal);
-
-  // Dequant fp8 to fp16
-  __half2 vec_half2[8];
-#pragma unroll
-  for (int i = 0; i < CVT_FP8_TO_FP4_ELTS_PER_THREAD / 2; i++) {
-    float2 tmp = static_cast<float2>(vec.elts[i]);
-    tmp.x *= dequant_to_fp16_scale;
-    tmp.y *= dequant_to_fp16_scale;
-    vec_half2[i] = __float22half2_rn(tmp);
-  }
-
-  // Get absolute maximum values among the local 8 values.
-  auto localMax = __habs2(vec_half2[0]);
-  // Local maximum value.
-#pragma unroll
-  for (int i = 1; i < CVT_FP8_TO_FP4_ELTS_PER_THREAD / 2; i++) {
-    localMax = __hmax2(localMax, __habs2(vec_half2[i]));
-  }
-
-  constexpr int CVT_NUM_THREADS_PER_SF = SF_VEC_SIZE / CVT_FP8_TO_FP4_ELTS_PER_THREAD;
-  if constexpr (CVT_NUM_THREADS_PER_SF == 2) {
-    // For block 32, we need to reduce the local max across two threads.
-    localMax = __hmax2(__shfl_xor_sync(uint32_t(-1), localMax, 1), localMax);
-  }
-
-  // Get the final absolute maximum values.
-  float vecMax = float(__hmax(localMax.x, localMax.y));
-
-  // Get the SF (max value of the vector / max value of e2m1).
-  // maximum value of e2m1 = 6.0.
-  // TODO: use half as compute data type.
-  float SFValue = SFScaleVal * (vecMax * reciprocal_approximate_ftz(6.0f));
-  float SFValueNarrow;
-  // 8 bits representation of the SF.
-  uint8_t fp8SFVal;
-  // Write the SF to global memory (STG.8).
-  if constexpr (UE8M0_SF) {
-    __nv_fp8_e8m0 tmp;
-    tmp.__x = __nv_cvt_float_to_e8m0(SFValue, __NV_SATFINITE, cudaRoundPosInf);
-    SFValueNarrow = static_cast<float>(tmp);
-    fp8SFVal = tmp.__x;
-  } else {
-    // Here SFValue is always positive, so E4M3 is the same as UE4M3.
-    __nv_fp8_e4m3 tmp = __nv_fp8_e4m3(SFValue);
-    fp8SFVal = tmp.__x;
-    SFValueNarrow = static_cast<float>(tmp);
-  }
-  // Get the output scale.
-  // Recipe: final_scale = reciprocal(fp32(fp8(SFValue * SFScaleVal))) * reciprocal(SFScaleVal))
-  float outputScale = SFValue != 0 ? SFScaleVal * reciprocal_approximate_ftz(SFValueNarrow) : 0.0f;
-
-  if (SFout) {
-    // Write the SF to global memory (STG.8).
-    *SFout = fp8SFVal;
-  }
-
-  // Convert the input to float.
-  float2 fp2Vals[CVT_FP8_TO_FP4_ELTS_PER_THREAD / 2];
-
-#pragma unroll
-  for (int i = 0; i < CVT_FP8_TO_FP4_ELTS_PER_THREAD / 2; i++) {
-    fp2Vals[i] = __half22float2(vec_half2[i]);
-    fp2Vals[i].x *= outputScale;
-    fp2Vals[i].y *= outputScale;
-  }
-
-  // Convert to e2m1 values.
-  uint64_t e2m1Vec = fp32_vec_to_e2m1(fp2Vals);
-
-  // Write the e2m1 values to global memory.
-  return e2m1Vec;
-#else
-  return 0;
-#endif
-}
-
-// Quantizes the provided PackedVec into the uint64_t output
-template <class Type, int SF_VEC_SIZE>
-__device__ uint64_t cvt_warp_fp16_to_mxfp8(PackedVec<Type>& vec, uint8_t* SFout) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-  // Get absolute maximum values among the local 8 values.
-  auto localMax = cuda_abs(vec.elts[0]);
-
-// Local maximum value.
-#pragma unroll
-  for (int i = 1; i < CVT_ELTS_PER_THREAD / 2; i++) {
-    localMax = cuda_max(localMax, cuda_abs(vec.elts[i]));
-  }
-
-  constexpr int CVT_NUM_THREADS_PER_SF = SF_VEC_SIZE / CVT_ELTS_PER_THREAD;
-  // Get the absolute maximum among all 16 values (two threads for 16, four threads for 32).
-  localMax = cuda_max(__shfl_xor_sync(uint32_t(-1), localMax, 1), localMax);
-  if constexpr (CVT_NUM_THREADS_PER_SF == 4) {
-    localMax = cuda_max(__shfl_xor_sync(uint32_t(-1), localMax, 2), localMax);
-  }
-  // Get the final absolute maximum values.
-  float vecMax = float(cuda_max(localMax.x, localMax.y));
-
-  // Get the SF (max value of the vector / max value of mxfp8).
-  float SFValue = vecMax * reciprocal_approximate_ftz(448.0f);
-  // 8 bits representation of the SF.
-  uint8_t fp8SFVal;
-  // Write the SF to global memory (STG.8).
-  __nv_fp8_e8m0 tmpSFVal;
-  tmpSFVal.__x = __nv_cvt_float_to_e8m0(SFValue, __NV_SATFINITE, cudaRoundPosInf);
-  SFValue = static_cast<float>(tmpSFVal);
-  fp8SFVal = tmpSFVal.__x;
-  // Get the output scale (reciprocal of the SFValue).
-  float outputScale = vecMax != 0.f ? reciprocal_approximate_ftz(SFValue) : 0.0f;
-
-  if (SFout) {
-    // Write the SF to global memory (STG.8).
-    *SFout = fp8SFVal;
-  }
-
-  // Convert the input to float.
-  float2 fp2Vals[CVT_ELTS_PER_THREAD / 2];
-
-#pragma unroll
-  for (int i = 0; i < CVT_ELTS_PER_THREAD / 2; i++) {
-    if constexpr (std::is_same_v<Type, half>) {
-      fp2Vals[i] = __half22float2(vec.elts[i]);
-    } else {
-      fp2Vals[i] = __bfloat1622float2(vec.elts[i]);
-    }
-    fp2Vals[i].x *= outputScale;
-    fp2Vals[i].y *= outputScale;
-  }
-
-  // Convert to e4m3 values.
-  uint64_t e4m3Vec = fp32_vec_to_e4m3(fp2Vals);
-
-  // Write the e4m3 values to global memory.
-  return e4m3Vec;
-#else
-  return 0;
-#endif
-}
-
-inline __device__ __host__ int64_t get_sf_out_offset_128x4(std::optional<int> batchIdx, int mIdx,
-                                                           int kIdx, std::optional<int> numRows,
-                                                           int numColVecs) {
-  // SF layout [numMTiles, numKTiles, 32 (mTile), 4 (mTile), 4(kTile)]
-  // --> index [mTileIdx, kTileIdx, outerMIdx, innerMIdx, innerKIdx]
-
-  // batched tensor
-  // SF layout [numBTiles, numMTiles, numKTiles, 32 (mTile), 4 (mTile), 4(kTile)]
-  // --> index [bTileIdx, mTileIdx, kTileIdx, outerMIdx, innerMIdx, innerKIdx]
-
-  int32_t innerKIdx = (kIdx % 4);
-  int64_t innerKStride = 1;
-
-  int32_t innerMIdx = (mIdx % (32 * 4)) / 32;
-  int64_t innerMStride = 4 * innerKStride;  // 4
-
-  // M tile layout [32, 4] is column-major.
-  int32_t outerMIdx = (mIdx % 32);
-  int64_t outerMStride = 4 * innerMStride;  // 16
-
-  int32_t kTileIdx = (kIdx / 4);
-  int64_t kTileStride = 32 * outerMStride;  // 512
-
-  // SF vector size 16 or 32. We round the "numCols" up to a multiple of 64 or 128.
-  // It is the same as rounding the "numColVecs" up to a multiple of 4.
-  int32_t numKTiles = (numColVecs + 4 - 1) / 4;
-
-  int32_t mTileIdx = mIdx / (32 * 4);
-  int64_t mTileStride = numKTiles * kTileStride;
-
-  // Each SF block has 128 rows so pad rows to the multiple of 128.
-  int32_t numMTiles = (numRows.value_or(0) + 128 - 1) / 128;
-  int64_t bTileStride = numMTiles * mTileStride;
-
-  // Compute the global offset.
-  int64_t SFOffset = batchIdx.value_or(0) * bTileStride + mTileIdx * mTileStride +
-                     kTileIdx * kTileStride + outerMIdx * outerMStride + innerMIdx * innerMStride +
-                     innerKIdx * innerKStride;
-
-  return SFOffset;
-}
-
-inline __device__ __host__ int64_t get_sf_out_offset_8x4(std::optional<int> batchIdx, int mIdx,
-                                                         int kIdx, std::optional<int> numRows,
-                                                         int numCols) {
-  // SF layout [numMTiles, numKTiles, 8 (mTile), 4(kTile)]
-  // --> index [mTileIdx, kTileIdx, innerMIdx, innerKIdx]
-
-  // batched tensor
-  // SF layout [numBTiles, numMTiles, numKTiles, 8 (mTile), 4(kTile)]
-  // --> index [bTileIdx, mTileIdx, kTileIdx, innerMIdx, innerKIdx]
-  const int32_t mTile = 8;
-  int32_t innerKIdx = (kIdx % 4);
-  int64_t innerKStride = 1;
-
-  int32_t innerMIdx = (mIdx % mTile);
-  int64_t mStride = 4 * innerKStride;
-
-  int32_t kTileIdx = (kIdx / 4);
-  int64_t kTileStride = mTile * mStride;
-
-  int32_t numKTiles = (numCols + 4 - 1) / 4;
-  int32_t mTileIdx = mIdx / mTile;
-  int64_t mTileStride = numKTiles * kTileStride;
-
-  int32_t numMTiles = (numRows.value_or(0) + 8 - 1) / 8;
-  int64_t bTileStride = numMTiles * mTileStride;
-
-  int64_t SFOffset = batchIdx.value_or(0) * bTileStride + mTileIdx * mTileStride +
-                     kTileIdx * kTileStride + innerMIdx * mStride + innerKIdx * innerKStride;
-
-  return SFOffset;
-}
-
-template <class SFType, int CVT_NUM_THREADS_PER_SF>
-__device__ uint8_t* cvt_quant_get_sf_out_offset(std::optional<int> batchIdx, int rowIdx,
-                                                int colVecIdx, std::optional<int> numRows,
-                                                int numColVecs, SFType* SFout,
-                                                QuantizationSFLayout layout) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-  static_assert(CVT_NUM_THREADS_PER_SF == 1 || CVT_NUM_THREADS_PER_SF == 2 ||
-                CVT_NUM_THREADS_PER_SF == 4);
-
-  // One pair of threads write one SF to global memory.
-  // TODO: stage through smem for packed STG.32
-  // is it better than STG.8 from 4 threads ?
-  if (threadIdx.x % CVT_NUM_THREADS_PER_SF == 0) {
-    if (layout == QuantizationSFLayout::SWIZZLED_128x4 ||
-        layout == QuantizationSFLayout::SWIZZLED_8x4) {
-      // SF vector index (16 elements share one SF in the K dimension).
-      // numRows and numCols are unpadded.
-      int32_t kIdx = colVecIdx / CVT_NUM_THREADS_PER_SF;
-      int32_t mIdx = rowIdx;
-
-      auto SFOffset = layout == QuantizationSFLayout::SWIZZLED_128x4
-                          ? get_sf_out_offset_128x4(batchIdx, mIdx, kIdx, numRows, numColVecs)
-                          : get_sf_out_offset_8x4(batchIdx, mIdx, kIdx, numRows, numColVecs);
-      return reinterpret_cast<uint8_t*>(SFout) + SFOffset;
-    } else if (layout == QuantizationSFLayout::LINEAR) {
-      // Linear row-major layout, no padding required.
-      int32_t KTileIdx = colVecIdx / CVT_NUM_THREADS_PER_SF;
-
-      int32_t numKTiles = numColVecs;
-      int64_t mTileStride = numKTiles;
-
-      int64_t BTileStride = numRows.value_or(0) * mTileStride;
-
-      int64_t SFOffset = batchIdx.value_or(0) * BTileStride + rowIdx * mTileStride + KTileIdx;
-      return reinterpret_cast<uint8_t*>(SFout) + SFOffset;
-    } else {
-      return nullptr;
-    }
-  }
-#endif
-  return nullptr;
-}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// FP4/MXFP8 Quantization Kernels
 
 template <BlockScaleQuantizationType quantization_type, class Type, int SF_VEC_SIZE, bool UE8M0_SF>
 __global__ void
@@ -754,9 +199,9 @@ quantize_with_block_size(
                                              ? CVT_FP8_TO_FP4_ELTS_PER_THREAD
                                              : CVT_ELTS_PER_THREAD;
 
-  using PackedVec = PackedVec<Type>;
+  using PackedVecT = PackedVec<Type, ELTS_PER_THREAD>;
   static constexpr int CVT_NUM_THREADS_PER_SF = SF_VEC_SIZE / ELTS_PER_THREAD;  // 2 or 4
-  static_assert(sizeof(PackedVec) == sizeof(Type) * ELTS_PER_THREAD, "Vec size is not matched.");
+  static_assert(sizeof(PackedVecT) == sizeof(Type) * ELTS_PER_THREAD, "Vec size is not matched.");
 
   // Get the global scaling factor, which will be applied to the SF.
   // Note SFScale is the same as next GEMM's alpha, which is (448.f / (Alpha_A / 6.f)).
@@ -844,19 +289,19 @@ quantize_with_block_size(
             }
           } else {
             // Load the input vector.
-            PackedVec in_vec = reinterpret_cast<PackedVec const*>(in)[inOffset];
+            PackedVecT in_vec = reinterpret_cast<PackedVecT const*>(in)[inOffset];
 
             // Dispatch the quantization kernel.
             if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_FP4) {
               reinterpret_cast<uint32_t*>(out)[outOffset] =
-                  cvt_warp_fp16_to_fp4<Type, SF_VEC_SIZE, UE8M0_SF>(in_vec, SFScaleVal, sf_out);
+                  cvt_warp_fp16_to_fp4<Type, SF_VEC_SIZE, ELTS_PER_THREAD, UE8M0_SF>(in_vec, SFScaleVal, sf_out);
             } else if constexpr (quantization_type == BlockScaleQuantizationType::FP8_TO_FP4) {
               reinterpret_cast<uint64_t*>(out)[outOffset] =
-                  cvt_warp_fp8_to_fp4<__nv_fp8_e4m3, SF_VEC_SIZE, UE8M0_SF>(in_vec, SFScaleVal,
+                  cvt_warp_fp8_to_fp4<__nv_fp8_e4m3, SF_VEC_SIZE, ELTS_PER_THREAD, UE8M0_SF>(in_vec, SFScaleVal,
                                                                             sf_out);
             } else if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_MXFP8) {
               reinterpret_cast<uint64_t*>(out)[outOffset] =
-                  cvt_warp_fp16_to_mxfp8<Type, SF_VEC_SIZE>(in_vec, sf_out);
+                  cvt_warp_fp16_to_mxfp8<Type, SF_VEC_SIZE, ELTS_PER_THREAD>(in_vec, sf_out);
             }
           }
         }
@@ -865,77 +310,6 @@ quantize_with_block_size(
   }
   asm volatile("griddepcontrol.launch_dependents;");
 #endif
-}
-
-template <class SFType, int CVT_FP4_NUM_THREADS_PER_SF>
-__device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(int rowIdx, int colIdx, int numCols,
-                                                       SFType* SFout) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-  static_assert(CVT_FP4_NUM_THREADS_PER_SF == 1 || CVT_FP4_NUM_THREADS_PER_SF == 2);
-
-  // One pair of threads write one SF to global memory.
-  // TODO: stage through smem for packed STG.32
-  // is it better than STG.8 from 4 threads ?
-  if (threadIdx.x % CVT_FP4_NUM_THREADS_PER_SF == 0) {
-    // SF vector index (16 elements share one SF in the K dimension).
-    int32_t kIdx = colIdx / CVT_FP4_NUM_THREADS_PER_SF;
-    int32_t mIdx = rowIdx;
-
-    // SF layout [numMTiles, numKTiles, 32 (mTile), 4 (mTile), 4(kTile)]
-    // --> index [mTileIdx, kTileIdx, outerMIdx, innerMIdx, innerKIdx]
-
-    int32_t mTileIdx = mIdx / (32 * 4);
-    // SF vector size 16.
-    int factor = CVT_FP4_SF_VEC_SIZE * 4;
-    int32_t numKTiles = (numCols + factor - 1) / factor;
-    int64_t mTileStride = numKTiles * 32 * 4 * 4;
-
-    int32_t kTileIdx = (kIdx / 4);
-    int64_t kTileStride = 32 * 4 * 4;
-
-    // M tile layout [32, 4] is column-major.
-    int32_t outerMIdx = (mIdx % 32);
-    int64_t outerMStride = 4 * 4;
-
-    int32_t innerMIdx = (mIdx % (32 * 4)) / 32;
-    int64_t innerMStride = 4;
-
-    int32_t innerKIdx = (kIdx % 4);
-    int64_t innerKStride = 1;
-
-    // Compute the global offset.
-    int64_t SFOffset = mTileIdx * mTileStride + kTileIdx * kTileStride + outerMIdx * outerMStride +
-                       innerMIdx * innerMStride + innerKIdx * innerKStride;
-
-    return reinterpret_cast<uint8_t*>(SFout) + SFOffset;
-  }
-#endif
-  return nullptr;
-}
-
-__device__ __forceinline__ float silu(const float& val) { return val / (1.0f + __expf(-val)); }
-
-template <class Type>
-inline __device__ void silu_and_mul(PackedVec<Type>& x_vec, const PackedVec<Type>& y_vec) {
-  float2 x[CVT_FP4_ELTS_PER_THREAD / 2];
-  float2 y[CVT_FP4_ELTS_PER_THREAD / 2];
-
-#pragma unroll
-  for (int i = 0; i < CVT_FP4_ELTS_PER_THREAD / 2; i++) {
-    if constexpr (std::is_same_v<Type, half>) {
-      x[i] = __half22float2(x_vec.elts[i]);
-      y[i] = __half22float2(y_vec.elts[i]);
-      x[i].x = silu(x[i].x) * y[i].x;
-      x[i].y = silu(x[i].y) * y[i].y;
-      x_vec.elts[i] = __float22half2_rn(x[i]);
-    } else {
-      x[i] = __bfloat1622float2(x_vec.elts[i]);
-      y[i] = __bfloat1622float2(y_vec.elts[i]);
-      x[i].x = silu(x[i].x) * y[i].x;
-      x[i].y = silu(x[i].y) * y[i].y;
-      x_vec.elts[i] = __float22bfloat162_rn(x[i]);
-    }
-  }
 }
 
 // Use UE4M3 by default.
@@ -949,9 +323,9 @@ cvt_fp16_to_fp4_expert(
     int32_t numRows, int32_t numCols, Type const* in, float const* SFScale, uint32_t* out,
     uint32_t* SFout, int32_t* mask, bool use_silu_and_mul, int n_experts) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-  using PackedVec = PackedVec<Type>;
+  using PackedVecT = PackedVec<Type, CVT_FP4_ELTS_PER_THREAD>;
   static constexpr int CVT_FP4_NUM_THREADS_PER_SF = (CVT_FP4_SF_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD);
-  static_assert(sizeof(PackedVec) == sizeof(Type) * CVT_FP4_ELTS_PER_THREAD,
+  static_assert(sizeof(PackedVecT) == sizeof(Type) * CVT_FP4_ELTS_PER_THREAD,
                 "Vec size is not matched.");
 
   // Input tensor row/col loops.
@@ -1003,10 +377,10 @@ cvt_fp16_to_fp4_expert(
     }
 
     int64_t inOffset = rowIdx * actualColsPerRow + colIdx;
-    PackedVec in_vec = reinterpret_cast<PackedVec const*>(in)[inOffset];
+    PackedVecT in_vec = reinterpret_cast<PackedVecT const*>(in)[inOffset];
     if (use_silu_and_mul) {
-      PackedVec in_vec_mul = reinterpret_cast<PackedVec const*>(in)[inOffset + colsPerRow];
-      silu_and_mul(in_vec, in_vec_mul);
+      PackedVecT in_vec_mul = reinterpret_cast<PackedVecT const*>(in)[inOffset + colsPerRow];
+      silu_and_mul<Type, CVT_FP4_ELTS_PER_THREAD>(in_vec, in_vec_mul);
     }
 
     // Get the output tensor offset.
@@ -1025,10 +399,10 @@ cvt_fp16_to_fp4_expert(
     int numCols_SFout = numCols_padded / CVT_FP4_SF_VEC_SIZE / 4;
     uint32_t* SFout_in_expert = SFout + expert_idx * padded_m * numCols_SFout;
 
-    auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, CVT_FP4_NUM_THREADS_PER_SF>(
+    auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, CVT_FP4_SF_VEC_SIZE, CVT_FP4_NUM_THREADS_PER_SF>(
         rowIdx_in_expert, colIdx, numCols, SFout_in_expert);
 
-    out_pos = cvt_warp_fp16_to_fp4<Type, CVT_FP4_SF_VEC_SIZE, UE8M0_SF>(in_vec, SFScaleVal, sf_out);
+    out_pos = cvt_warp_fp16_to_fp4<Type, CVT_FP4_SF_VEC_SIZE, CVT_FP4_ELTS_PER_THREAD, UE8M0_SF>(in_vec, SFScaleVal, sf_out);
   }
 #endif
 }
