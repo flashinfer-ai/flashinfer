@@ -142,16 +142,24 @@ def get_sampling_module():
         batch_size = indices.size(0) if indices is not None else probs.size(0)
         out_dtype = indices.dtype if indices is not None else torch.int32
         samples = torch.empty(batch_size, dtype=out_dtype, device=device)
-        if seed is None or offset is None:
-            seed, offset = get_seed_and_offset(batch_size, generator, device)
-        module.sampling_from_probs(
-            probs,
-            samples,
-            indices,
-            deterministic,
-            seed,
-            offset,
-        )
+
+        # Check if generator is a tuple of tensors (per-request generators)
+        if isinstance(generator, tuple):
+            seed_arr, offset_arr = generator
+            module.sampling_from_probs(
+                probs, samples, indices, deterministic,
+                0, 0,  # scalar seed/offset (ignored when arrays provided)
+                seed_arr, offset_arr
+            )
+        else:
+            # Traditional single generator path
+            if seed is None or offset is None:
+                seed, offset = get_seed_and_offset(batch_size, generator, device)
+            module.sampling_from_probs(
+                probs, samples, indices, deterministic,
+                seed, offset,
+                None, None  # no per-request generators
+            )
         return samples
 
     # torch library for sampling_from_probs
@@ -666,7 +674,7 @@ def sampling_from_probs(
     probs: torch.Tensor,
     indices: Optional[torch.Tensor] = None,
     deterministic: bool = True,
-    generator: Optional[torch.Generator] = None,
+    generator: Optional[Union[torch.Generator, Tuple[torch.Tensor, torch.Tensor]]] = None,
     check_nan: bool = False,
     seed: Optional[int] = None,
     offset: Optional[int] = None,
@@ -689,8 +697,12 @@ def sampling_from_probs(
         and output dtype defaults to ``torch.int32``.
     deterministic: bool
         Whether to use deterministic kernel implementation, default is ``True``.
-    generator: Optional[torch.Generator]
-        A random number generator for the operation.
+    generator: Optional[Union[torch.Generator, Tuple[torch.Tensor, torch.Tensor]]]
+        Random number generator. Can be either:
+        - A ``torch.Generator`` for traditional single-generator sampling (default)
+        - A tuple of ``(seed_arr, offset_arr)`` tensors for per-request generators,
+          where both are int64 tensors of shape ``(batch_size,)`` on CUDA.
+          Offsets are automatically updated in-place after sampling.
     check_nan: bool
         Whether to check nan in :attr:`probs`, default is ``False``.
     seed: Optional[int]

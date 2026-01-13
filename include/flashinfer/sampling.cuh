@@ -742,10 +742,16 @@ template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
           typename DType, typename IdType>
 __global__ void SamplingFromProbKernel(DType* probs, IdType* output, IdType* indices, uint32_t d,
-                                       uint64_t philox_seed, uint64_t philox_offset) {
+                                       uint64_t philox_seed, uint64_t philox_offset,
+                                       uint64_t* seed_arr = nullptr, uint64_t* offset_arr = nullptr) {
   curandStatePhilox4_32_10_t state;
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
-  curand_init(philox_seed, bx, philox_offset, &state);
+
+  // Use per-request seed/offset if arrays provided, otherwise use scalar values
+  uint64_t seed = (seed_arr != nullptr) ? seed_arr[bx] : philox_seed;
+  uint64_t offset = (offset_arr != nullptr) ? offset_arr[bx] : philox_offset;
+
+  curand_init(seed, bx, offset, &state);
   const uint32_t row_idx = indices == nullptr ? bx : indices[bx];
 
   extern __shared__ __align__(
@@ -783,6 +789,12 @@ __global__ void SamplingFromProbKernel(DType* probs, IdType* output, IdType* ind
     sampled_id = temp_storage.last_valid_id;
   }
   output[bx] = sampled_id;
+
+  // Atomically update offset if using per-request generators
+  // Each curand_uniform call consumes 4 values from the RNG state
+  if (tx == 0 && offset_arr != nullptr) {
+    atomicAdd(&offset_arr[bx], 4);
+  }
 }
 
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
@@ -790,11 +802,17 @@ template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           typename DType, typename IdType>
 __global__ void TopKSamplingFromProbKernel(DType* probs, IdType* output, IdType* indices,
                                            IdType* top_k_arr, uint32_t top_k_val, uint32_t d,
-                                           uint64_t philox_seed, uint64_t philox_offset) {
+                                           uint64_t philox_seed, uint64_t philox_offset,
+                                           uint64_t* seed_arr = nullptr, uint64_t* offset_arr = nullptr) {
   const uint32_t batch_size = gridDim.x;
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
+
+  // Use per-request seed/offset if arrays provided, otherwise use scalar values
+  uint64_t seed = (seed_arr != nullptr) ? seed_arr[bx] : philox_seed;
+  uint64_t offset = (offset_arr != nullptr) ? offset_arr[bx] : philox_offset;
+
   curandStatePhilox4_32_10_t state;
-  curand_init(philox_seed, bx, philox_offset, &state);
+  curand_init(seed, bx, offset, &state);
   const uint32_t k = top_k_arr == nullptr ? top_k_val : top_k_arr[bx];
   const uint32_t row_idx = indices == nullptr ? bx : indices[bx];
 
@@ -899,6 +917,13 @@ __global__ void TopKSamplingFromProbKernel(DType* probs, IdType* output, IdType*
   __syncthreads();
   if (tx == 0) {
     output[bx] = sampled_id;
+
+    // Atomically update offset if using per-request generators
+    // TopK sampling calls curand_uniform once per round (variable count)
+    // We increment by round * 4 since each call consumes 4 values
+    if (offset_arr != nullptr) {
+      atomicAdd(&offset_arr[bx], static_cast<uint64_t>(round * 4));
+    }
   }
 }
 
@@ -907,11 +932,17 @@ template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           typename DType, typename IdType>
 __global__ void TopPSamplingFromProbKernel(DType* probs, IdType* output, IdType* indices,
                                            float* top_p_arr, float top_p_val, uint32_t d,
-                                           uint64_t philox_seed, uint64_t philox_offset) {
+                                           uint64_t philox_seed, uint64_t philox_offset,
+                                           uint64_t* seed_arr = nullptr, uint64_t* offset_arr = nullptr) {
   const uint32_t batch_size = gridDim.x;
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
+
+  // Use per-request seed/offset if arrays provided, otherwise use scalar values
+  uint64_t seed = (seed_arr != nullptr) ? seed_arr[bx] : philox_seed;
+  uint64_t offset = (offset_arr != nullptr) ? offset_arr[bx] : philox_offset;
+
   curandStatePhilox4_32_10_t state;
-  curand_init(philox_seed, bx, philox_offset, &state);
+  curand_init(seed, bx, offset, &state);
   const uint32_t row_idx = indices == nullptr ? bx : indices[bx];
   float top_p = (top_p_arr == nullptr) ? top_p_val : top_p_arr[row_idx];
 
@@ -927,7 +958,9 @@ __global__ void TopPSamplingFromProbKernel(DType* probs, IdType* output, IdType*
   float q = 1;
   double low = 0, high = 1.f;
   int sampled_id;
+  int round = 0;
   do {
+    round += 1;
     temp_storage.sampled_id = d;
     __syncthreads();
     float u = curand_uniform(&state) * q;
@@ -1010,6 +1043,13 @@ __global__ void TopPSamplingFromProbKernel(DType* probs, IdType* output, IdType*
   __syncthreads();
   if (tx == 0) {
     output[bx] = sampled_id;
+
+    // Atomically update offset if using per-request generators
+    // TopP sampling calls curand_uniform once per round (variable count)
+    // We increment by round * 4 since each call consumes 4 values
+    if (offset_arr != nullptr) {
+      atomicAdd(&offset_arr[bx], static_cast<uint64_t>(round * 4));
+    }
   }
 }
 
@@ -1018,11 +1058,17 @@ template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           typename DType, typename IdType>
 __global__ void MinPSamplingFromProbKernel(DType* probs, float* min_p_arr, IdType* output,
                                            IdType* indices, float min_p_val, uint32_t d,
-                                           uint64_t philox_seed, uint64_t philox_offset) {
+                                           uint64_t philox_seed, uint64_t philox_offset,
+                                           uint64_t* seed_arr = nullptr, uint64_t* offset_arr = nullptr) {
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
   float p = (min_p_arr == nullptr) ? min_p_val : min_p_arr[bx];
+
+  // Use per-request seed/offset if arrays provided, otherwise use scalar values
+  uint64_t seed = (seed_arr != nullptr) ? seed_arr[bx] : philox_seed;
+  uint64_t offset = (offset_arr != nullptr) ? offset_arr[bx] : philox_offset;
+
   curandStatePhilox4_32_10_t state;
-  curand_init(philox_seed, bx, philox_offset, &state);
+  curand_init(seed, bx, offset, &state);
   const uint32_t row_idx = indices == nullptr ? bx : indices[bx];
 
   extern __shared__ __align__(
@@ -1091,6 +1137,12 @@ __global__ void MinPSamplingFromProbKernel(DType* probs, float* min_p_arr, IdTyp
     sampled_id = temp_storage.last_valid_id;
   }
   output[bx] = sampled_id;
+
+  // Atomically update offset if using per-request generators
+  // MinP sampling calls curand_uniform once
+  if (tx == 0 && offset_arr != nullptr) {
+    atomicAdd(&offset_arr[bx], 4);
+  }
 }
 
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
@@ -1099,11 +1151,17 @@ template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
 __global__ void TopKTopPSamplingFromProbKernel(DType* probs, IdType* top_k_arr, float* top_p_arr,
                                                IdType* output, IdType* indices, IdType top_k_val,
                                                float top_p_val, uint32_t d, uint64_t philox_seed,
-                                               uint64_t philox_offset) {
+                                               uint64_t philox_offset,
+                                               uint64_t* seed_arr = nullptr, uint64_t* offset_arr = nullptr) {
   const uint32_t batch_size = gridDim.x;
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
+
+  // Use per-request seed/offset if arrays provided, otherwise use scalar values
+  uint64_t seed = (seed_arr != nullptr) ? seed_arr[bx] : philox_seed;
+  uint64_t offset = (offset_arr != nullptr) ? offset_arr[bx] : philox_offset;
+
   curandStatePhilox4_32_10_t state;
-  curand_init(philox_seed, bx, philox_offset, &state);
+  curand_init(seed, bx, offset, &state);
   const uint32_t row_idx = indices == nullptr ? bx : indices[bx];
   const uint32_t k = top_k_arr == nullptr ? top_k_val : top_k_arr[row_idx];
   const float p = top_p_arr == nullptr ? top_p_val : top_p_arr[row_idx];
@@ -1120,7 +1178,9 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs, IdType* top_k_arr, 
   float q = 1;
   double low = 0, high = 1.f;
   int sampled_id;
+  int round = 0;
   do {
+    round += 1;
     temp_storage.sampled_id = d;
     __syncthreads();
     float u = curand_uniform(&state) * q;
@@ -1208,6 +1268,13 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs, IdType* top_k_arr, 
   __syncthreads();
   if (tx == 0) {
     output[bx] = sampled_id;
+
+    // Atomically update offset if using per-request generators
+    // TopKTopP sampling calls curand_uniform once per round (variable count)
+    // We increment by round * 4 since each call consumes 4 values
+    if (offset_arr != nullptr) {
+      atomicAdd(&offset_arr[bx], static_cast<uint64_t>(round * 4));
+    }
   }
 }
 
@@ -1382,14 +1449,15 @@ cudaError_t SamplingFromLogits(T* logits, IdType* output, IdType* indices, uint3
 template <typename T, typename IdType>
 cudaError_t SamplingFromProb(T* probs, IdType* output, IdType* indices, uint32_t batch_size,
                              uint32_t d, bool deterministic, uint64_t philox_seed,
-                             uint64_t philox_offset, cudaStream_t stream = 0) {
+                             uint64_t philox_offset, uint64_t* seed_arr = nullptr,
+                             uint64_t* offset_arr = nullptr, cudaStream_t stream = 0) {
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
   auto compute_capacity = GetCudaComputeCapability();
   DISPATCH_COMPUTE_CAP_NUM_THREADS(compute_capacity, BLOCK_THREADS, {
     dim3 nblks(batch_size);
     dim3 nthrs(BLOCK_THREADS);
-    void* args[] = {&probs, &output, &indices, &d, &philox_seed, &philox_offset};
+    void* args[] = {&probs, &output, &indices, &d, &philox_seed, &philox_offset, &seed_arr, &offset_arr};
     const uint32_t smem_size = sizeof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
 
     DISPATCH_ALIGNED_VEC_SIZE(
@@ -1407,6 +1475,7 @@ template <typename T, typename IdType>
 cudaError_t TopKSamplingFromProb(T* probs, IdType* output, IdType* indices, T* top_k_arr,
                                  uint32_t batch_size, uint32_t top_k_val, uint32_t d,
                                  bool deterministic, uint64_t philox_seed, uint64_t philox_offset,
+                                 uint64_t* seed_arr = nullptr, uint64_t* offset_arr = nullptr,
                                  cudaStream_t stream = 0) {
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
@@ -1416,7 +1485,7 @@ cudaError_t TopKSamplingFromProb(T* probs, IdType* output, IdType* indices, T* t
     dim3 nblks(batch_size);
     dim3 nthrs(BLOCK_THREADS);
     void* args[] = {&probs,     &output, &indices,     &top_k_arr,
-                    &top_k_val, &d,      &philox_seed, &philox_offset};
+                    &top_k_val, &d,      &philox_seed, &philox_offset, &seed_arr, &offset_arr};
 
     DISPATCH_ALIGNED_VEC_SIZE(
         vec_size, VEC_SIZE, {DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, {
@@ -1435,6 +1504,7 @@ template <typename T, typename IdType>
 cudaError_t TopPSamplingFromProb(T* probs, IdType* output, IdType* indices, T* top_p_arr,
                                  uint32_t batch_size, T top_p_val, uint32_t d, bool deterministic,
                                  uint64_t philox_seed, uint64_t philox_offset,
+                                 uint64_t* seed_arr = nullptr, uint64_t* offset_arr = nullptr,
                                  cudaStream_t stream = 0) {
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
@@ -1444,7 +1514,7 @@ cudaError_t TopPSamplingFromProb(T* probs, IdType* output, IdType* indices, T* t
     dim3 nblks(batch_size);
     dim3 nthrs(BLOCK_THREADS);
     void* args[] = {&probs,     &output, &indices,     &top_p_arr,
-                    &top_p_val, &d,      &philox_seed, &philox_offset};
+                    &top_p_val, &d,      &philox_seed, &philox_offset, &seed_arr, &offset_arr};
 
     DISPATCH_ALIGNED_VEC_SIZE(
         vec_size, VEC_SIZE, {DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, {
@@ -1463,6 +1533,7 @@ template <typename T, typename IdType>
 cudaError_t MinPSamplingFromProb(T* probs, T* min_p_arr, IdType* output, IdType* indices,
                                  uint32_t batch_size, float min_p_val, uint32_t d,
                                  bool deterministic, uint64_t philox_seed, uint64_t philox_offset,
+                                 uint64_t* seed_arr = nullptr, uint64_t* offset_arr = nullptr,
                                  cudaStream_t stream = 0) {
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
@@ -1472,7 +1543,7 @@ cudaError_t MinPSamplingFromProb(T* probs, T* min_p_arr, IdType* output, IdType*
     dim3 nblks(batch_size);
     dim3 nthrs(BLOCK_THREADS);
     void* args[] = {&probs,     &min_p_arr, &output,      &indices,
-                    &min_p_val, &d,         &philox_seed, &philox_offset};
+                    &min_p_val, &d,         &philox_seed, &philox_offset, &seed_arr, &offset_arr};
 
     DISPATCH_ALIGNED_VEC_SIZE(
         vec_size, VEC_SIZE, {DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, {
@@ -1492,6 +1563,7 @@ cudaError_t TopKTopPSamplingFromProb(T* probs, IdType* top_k_arr, T* top_p_arr, 
                                      IdType* indices, uint32_t batch_size, IdType top_k_val,
                                      T top_p_val, uint32_t d, bool deterministic,
                                      uint64_t philox_seed, uint64_t philox_offset,
+                                     uint64_t* seed_arr = nullptr, uint64_t* offset_arr = nullptr,
                                      cudaStream_t stream = 0) {
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
@@ -1501,7 +1573,7 @@ cudaError_t TopKTopPSamplingFromProb(T* probs, IdType* top_k_arr, T* top_p_arr, 
     dim3 nblks(batch_size);
     dim3 nthrs(BLOCK_THREADS);
     void* args[] = {&probs,     &top_k_arr, &top_p_arr, &output,      &indices,
-                    &top_k_val, &top_p_val, &d,         &philox_seed, &philox_offset};
+                    &top_k_val, &top_p_val, &d,         &philox_seed, &philox_offset, &seed_arr, &offset_arr};
 
     DISPATCH_ALIGNED_VEC_SIZE(
         vec_size, VEC_SIZE, {DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, {
