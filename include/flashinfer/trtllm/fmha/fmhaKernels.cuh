@@ -46,6 +46,8 @@ static const std::string tllm_gen_fmha_metainfo_hash = std::string(TLLM_GEN_FMHA
 static_assert(false, "TLLM_GEN_FMHA_METAINFO_HASH macro is not defined when compiling");
 #endif
 
+// #define SAM_DEBUG
+
 namespace flashinfer::trtllm_cubin_loader {
 std::string getCubin(const std::string& kernelName, const std::string& sha256);
 }  // namespace flashinfer::trtllm_cubin_loader
@@ -297,6 +299,57 @@ class TllmGenFmhaKernel {
           continue;
         }
       }
+
+#ifdef SAM_DEBUG
+      // ===== DEBUG: Print all kernel launch parameters =====
+      printf("\n========== TRTLLM-Gen Kernel Launch Debug Info ==========\n");
+      printf("Kernel Name: %s\n", kernelMeta.mFuncName);
+      printf("Data Types: Q=%s(%d), KV=%s(%d), Out=%s(%d), SM=%d\n", toStr(mDtypeQ),
+             static_cast<int>(mDtypeQ), toStr(mDtypeKv), static_cast<int>(mDtypeKv),
+             toStr(mDtypeOut), static_cast<int>(mDtypeOut), mSM);
+
+      printf("\n--- Launch Config ---\n");
+      printf("Grid:  (%d, %d, %d)\n", ctaLaunchParams.mNumCtasX, ctaLaunchParams.mNumCtasY,
+             ctaLaunchParams.mNumCtasZ);
+      printf("Block: (%d, %d, %d)\n", kernelMeta.mThreadsPerCTA, 1, 1);
+      printf("Cluster: (%d, %d, %d)\n", ctaLaunchParams.mClusterDimX, 1, 1);
+      printf("Shared Memory: %d bytes\n", kernelMeta.mSharedMemBytes);
+      printf("Stream: %p\n", params.stream);
+
+      printf("\n--- Kernel Meta Info ---\n");
+      printf("QKV Layout: %d\n", kernelMeta.mQkvLayout);
+      printf("Mask Type: %d\n", kernelMeta.mMaskType);
+      printf("Kernel Type: %d\n", kernelMeta.mKernelType);
+      printf("Tile Scheduler: %d\n", kernelMeta.mTileScheduler);
+      printf("MultiCtasKvMode: %d\n", kernelMeta.mMultiCtasKvMode);
+      printf("HeadDim: PerCtaV=%d, Qk=%d, V=%d\n", kernelMeta.mHeadDimPerCtaV,
+             kernelMeta.mHeadDimQk, kernelMeta.mHeadDimV);
+      printf("TileSize: Q=%d, Kv=%d\n", kernelMeta.mTileSizeQ, kernelMeta.mTileSizeKv);
+      printf("Step: Q=%d, Kv=%d\n", kernelMeta.mStepQ, kernelMeta.mStepKv);
+      printf("NumTokensPerPage: %d\n", kernelMeta.mNumTokensPerPage);
+      printf("GroupsHeadsQ: %d\n", kernelMeta.mGroupsHeadsQ);
+      printf("ReuseSmemKForV: %d\n", kernelMeta.mReuseSmemKForV);
+      printf("2CtaMma: %d\n", kernelMeta.m2CtaMma);
+
+      printf("\n--- CTA and Cluster Config ---\n");
+      printf("MaxNumCtas: Q=%d, Kv=%d\n", ctaLaunchParams.mMaxNumCtasQ,
+             ctaLaunchParams.mMaxNumCtasKv);
+      printf("NumCtas: X=%d, Y=%d, Z=%d\n", ctaLaunchParams.mNumCtasX, ctaLaunchParams.mNumCtasY,
+             ctaLaunchParams.mNumCtasZ);
+      printf("ClusterDim X: %d\n", ctaLaunchParams.mClusterDimX);
+
+      printf("\n--- Cluster Scheduling ---\n");
+      printf("Scheduling Policy: %d\n", ctaLaunchParams.mClusterDimX > 1
+                                            ? CU_CLUSTER_SCHEDULING_POLICY_SPREAD
+                                            : CU_CLUSTER_SCHEDULING_POLICY_DEFAULT);
+      printf("Programmatic Stream Serialization: %d\n", params.enable_pdl);
+
+      kernelParams.printKernelParams();
+
+      printf("=========================================================\n\n");
+      fflush(stdout);
+      // ===== END DEBUG =====
+#endif
       cuErrCheck(cuLaunchKernelEx(&launch_config, func, kernelParamsList, nullptr));
 
       // Run the separate reduction kernel if needed.
@@ -329,6 +382,17 @@ class TllmGenFmhaKernel {
     // Do we need to select a new kernel ?
     selectKernelParams.mSelectNewKernel = false;
 
+#ifdef SAM_DEBUG
+    // print mMaxSeqLenQ, mStepQ, mMaxSeqLenQ, mGroupsTokensHeadsQ, mNumHeadsQPerKv
+    printf(
+        "[numCtasX trace] mMaxSeqLenQ = %d, mStepQ = %d, mGroupsTokensHeadsQ = %d, mNumHeadsQPerKv "
+        "= %d, mGroupsHeadsQ = %d, mNumHeadsQ = %d, mHeadDimPerCtaV = %d\n",
+        params.mMaxSeqLenQ, kernelMeta.mStepQ, kernelMeta.mGroupsTokensHeadsQ,
+        params.mNumHeadsQPerKv, kernelMeta.mGroupsHeadsQ, params.mNumHeadsQ,
+        selectKernelParams.mHeadDimPerCtaV);
+    // fflush(stdout);
+#endif
+
     // The number of Ctas per Q sequence.
     int numCtasPerSeqQ = (params.mMaxSeqLenQ + kernelMeta.mStepQ - 1) / kernelMeta.mStepQ;
     // The generation-phase kernels might need to group both tokensQ and headsQ into one CTA.
@@ -344,6 +408,7 @@ class TllmGenFmhaKernel {
         numCtasPerSeqQ = flashinfer::ceil_div(params.mMaxSeqLenQ, numTokensPerCtaQ);
       }
     }
+    // printf("[numCtasX trace] numCtasPerSeqQ = %d\n", numCtasPerSeqQ);
 
     // Compute the grid dimension Y.
     int numHeadsPerCta =
@@ -357,6 +422,9 @@ class TllmGenFmhaKernel {
     int numCtasPerHeadDim = kernelMeta.mHeadDimV / selectKernelParams.mHeadDimPerCtaV;
     // Compute the current numCtasX.
     int numCtasX = numCtasPerSeqQ;
+    // printf("[numCtasX trace] Initial: numCtasX = %d (numCtasPerSeqQ = %d)\n", numCtasX,
+    // numCtasPerSeqQ);
+    fflush(stdout);
     // Update the numCtasY.
     int numCtasY = numCtasForAllHeadsQ * numCtasPerHeadDim;
     // Compute the grid dimension Z.
@@ -367,7 +435,10 @@ class TllmGenFmhaKernel {
     if (isMlaGenKernel(params) && selectKernelParams.mUses2CtaMma) {
       FLASHINFER_CHECK(numCtasForAllHeadsQ == 2 && numCtasPerHeadDim == 2,
                        "Internal error: numCtasPerHeadDim should be 2.");
+      // int oldNumCtasX = numCtasX;
       numCtasX *= 2;
+      // printf("[numCtasX trace] After 2CtaMma: numCtasX = %d (was %d, multiplied by 2)\n",
+      // numCtasX, oldNumCtasX); fflush(stdout);
       numCtasY /= (numCtasForAllHeadsQ * numCtasPerHeadDim);
     }
 
@@ -400,12 +471,20 @@ class TllmGenFmhaKernel {
       // benefits of a shorter mainloop.
       int const maxNumCtasPerSeqKv =
           (maxAttentionWindow + 2 * kernelMeta.mStepKv - 1) / (2 * kernelMeta.mStepKv);
+      // printf("[numCtasX trace] maxAttentionWindow = %d, kernelMeta.mStepKv = %d,
+      // maxNumCtasPerSeqKv = %d\n",
+      //        maxAttentionWindow, kernelMeta.mStepKv, maxNumCtasPerSeqKv);
       // Compute numCtasPerSeqKv.
       numCtasPerSeqKv = std::min(
           maxNumCtasPerSeqKv,
           std::max(1, int32_t(params.mMultiProcessorCount / (numCtasX * numCtasY * numCtasZ))));
       // Update the numCtasX.
+      int oldNumCtasX = numCtasX;
       numCtasX *= numCtasPerSeqKv;
+      // printf("[numCtasX trace] After multiCtasKv: numCtasX = %d (was %d, multiplied by
+      // numCtasPerSeqKv=%d), maxNumCtasPerSeqKv= %d\n", numCtasX, oldNumCtasX, numCtasPerSeqKv,
+      // maxNumCtasPerSeqKv);
+      fflush(stdout);
       // The current total number of CTAs.
       int totalNumCtas = numCtasX * numCtasZ * numCtasY;
       // Disable the multiCtasKvMode if there is only one CtaKv.

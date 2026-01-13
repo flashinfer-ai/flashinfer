@@ -301,6 +301,95 @@ struct TllmGenFmhaRunnerParams {
   // Whether to enable PDL (Programmatic Dependent Launch).
   bool enable_pdl;
 
+  // Print all member variables
+  void print() const {
+    printf("=== TllmGenFmhaRunnerParams ===\n");
+
+    // Enums and layout
+    printf("mQkvLayout: %d\n", static_cast<int>(mQkvLayout));
+    printf("mMaskType: %d\n", static_cast<int>(mMaskType));
+    printf("mKernelType: %d\n", static_cast<int>(mKernelType));
+    printf("mTileScheduler: %d\n", static_cast<int>(mTileScheduler));
+    printf("mMultiCtasKvMode: %d\n", mMultiCtasKvMode);
+
+    // Input QKV buffers (pointers)
+    printf("qPtr: %p\n", qPtr);
+    printf("kPtr: %p\n", kPtr);
+    printf("vPtr: %p\n", vPtr);
+    printf("kvPtr: %p\n", kvPtr);
+    printf("qkvPtr: %p\n", qkvPtr);
+    printf("kSfBasePtr: %p\n", kSfBasePtr);
+    printf("vSfBasePtr: %p\n", vSfBasePtr);
+    printf("customMaskPtr: %p\n", static_cast<const void*>(customMaskPtr));
+    printf("customMaskOffsetsPtr: %p\n", static_cast<const void*>(customMaskOffsetsPtr));
+    printf("firstSparseMaskOffsetsKvPtr: %p\n",
+           static_cast<const void*>(firstSparseMaskOffsetsKvPtr));
+    printf("multiCtasKvCounterPtr: %p\n", static_cast<void*>(multiCtasKvCounterPtr));
+    printf("seqLensKvPtr: %p\n", static_cast<const void*>(seqLensKvPtr));
+    printf("cumSeqLensQPtr: %p\n", static_cast<const void*>(cumSeqLensQPtr));
+    printf("cumSeqLensKvPtr: %p\n", static_cast<const void*>(cumSeqLensKvPtr));
+    printf("kvPageIdxPtr: %p\n", static_cast<const void*>(kvPageIdxPtr));
+    printf("useGmemScale: %d\n", useGmemScale);
+    printf("outputScalePtr: %p\n", static_cast<const void*>(outputScalePtr));
+    printf("outputScale: %f\n", outputScale);
+    printf("scaleSoftmaxLog2Ptr: %p\n", static_cast<const void*>(scaleSoftmaxLog2Ptr));
+    printf("scaleSoftmaxLog2: %f\n", scaleSoftmaxLog2);
+    printf("kvSfScalePtr: %p\n", static_cast<const void*>(kvSfScalePtr));
+    printf("oSfScalePtr: %p\n", static_cast<const void*>(oSfScalePtr));
+    printf("multiCtasKvScratchPtr: %p\n", multiCtasKvScratchPtr);
+    printf("softmaxStatsPtr: %p\n", static_cast<void*>(softmaxStatsPtr));
+    printf("lsePtr: %p\n", static_cast<void*>(lsePtr));
+    printf("ptrAttentionSinks: %p\n", static_cast<const void*>(ptrAttentionSinks));
+    printf("oPtr: %p\n", oPtr);
+    printf("oSfPtr: %p\n", oSfPtr);
+
+    // Stride parameters (integers)
+    printf("qStrideTokens: %d\n", qStrideTokens);
+    printf("qStrideHeads: %d\n", qStrideHeads);
+    printf("kStrideKeysValues: %d\n", kStrideKeysValues);
+    printf("kStrideHeads: %d\n", kStrideHeads);
+    printf("kStrideBatch: %d\n", kStrideBatch);
+    printf("vStrideKeysValues: %d\n", vStrideKeysValues);
+    printf("vStrideHeads: %d\n", vStrideHeads);
+    printf("vStrideBatch: %d\n", vStrideBatch);
+
+    // Head and batch parameters (integers)
+    printf("mHeadDimQk: %d\n", mHeadDimQk);
+    printf("mHeadDimV: %d\n", mHeadDimV);
+    printf("mNumHeadsQ: %d\n", mNumHeadsQ);
+    printf("mNumHeadsKv: %d\n", mNumHeadsKv);
+    printf("mNumHeadsQPerKv: %d\n", mNumHeadsQPerKv);
+    printf("mBatchSize: %d\n", mBatchSize);
+    printf("mMaxSeqLenCacheKv: %d\n", mMaxSeqLenCacheKv);
+    printf("mMaxSeqLenQ: %d\n", mMaxSeqLenQ);
+    printf("mMaxSeqLenKv: %d\n", mMaxSeqLenKv);
+    printf("mAttentionWindowSize: %d\n", mAttentionWindowSize);
+    printf("mChunkedAttentionSize: %d\n", mChunkedAttentionSize);
+    printf("mSumOfSeqLensQ: %d\n", mSumOfSeqLensQ);
+    printf("mSumOfSeqLensKv: %d\n", mSumOfSeqLensKv);
+    printf("mMaxNumPagesPerSeqKv: %d\n", mMaxNumPagesPerSeqKv);
+    printf("mNumTokensPerPage: %d\n", mNumTokensPerPage);
+    printf("mNumPagesInMemPool: %d\n", mNumPagesInMemPool);
+    printf("mMultiProcessorCount: %d\n", mMultiProcessorCount);
+
+    // Scaling factors (floats)
+    printf("mScaleQ: %f\n", mScaleQ);
+    printf("mScaleOutput: %f\n", mScaleOutput);
+    printf("mSfStartTokenIdx: %d\n", mSfStartTokenIdx);
+    printf("mScaleSfKv: %f\n", mScaleSfKv);
+    printf("mScaleSfO: %f\n", mScaleSfO);
+
+    // Sparse MLA parameters
+    printf("mSparseMla: %d\n", mSparseMla);
+    printf("mSparseMlaTopK: %d\n", mSparseMlaTopK);
+
+    // Stream and PDL
+    printf("stream: %p\n", static_cast<void*>(stream));
+    printf("enable_pdl: %d\n", enable_pdl);
+
+    printf("===============================\n");
+  }
+
   // set the attention mask type
   TllmGenFmhaRunnerParams& setAttentionMaskType(std::int8_t maskType) {
     // maskType is the enum of tensorrt_llm::kernels::ContextAttentionMaskType

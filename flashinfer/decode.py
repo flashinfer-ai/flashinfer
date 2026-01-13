@@ -2087,6 +2087,9 @@ def trtllm_batch_decode_with_kv_cache(
     mask: Optional[torch.Tensor] = None,
     max_q_len: Optional[int] = None,
     cum_seq_lens_q: Optional[torch.Tensor] = None,
+    kv_block_scales: Optional[
+        Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+    ] = None,
 ) -> Union[torch.Tensor, FP4Tensor]:
     """
     Parameters
@@ -2190,6 +2193,33 @@ def trtllm_batch_decode_with_kv_cache(
             # it doesn't change underlying storage
             k_cache, v_cache = kv_cache.unbind(dim=1)
 
+    is_nvfp4_kvcache = (
+        k_cache.dtype == torch.uint8
+        and v_cache.dtype == torch.uint8
+        and kv_block_scales is not None
+    )
+
+    k_block_scales = None
+    v_block_scales = None
+    if is_nvfp4_kvcache:
+        if isinstance(kv_block_scales, tuple):
+            k_block_scales, v_block_scales = kv_block_scales
+        else:
+            if kv_block_scales.shape[1] == 1:
+                k_block_scales, v_block_scales = kv_block_scales, kv_block_scales
+            else:
+                assert kv_block_scales.shape[1] == 2, (
+                    "When kv_block_scales is a single tensor, the second dimension must be 1 or 2"
+                )
+                # NOTE(Zihao): unbind transforms [num_pages, 2, ...] to ([num_pages, ...], [num_pages, ...])
+                # it doesn't change underlying storage
+                k_block_scales, v_block_scales = kv_block_scales.unbind(dim=1)
+
+        assert (
+            k_block_scales.dtype == torch.float8_e4m3fn
+            and v_block_scales.dtype == torch.float8_e4m3fn
+        ), "k/v_block_scales should be float8 dtype."
+
     if backend == "auto":
         backend = (
             "trtllm-gen" if get_compute_capability(query.device)[0] == 10 else "xqa"
@@ -2235,6 +2265,9 @@ def trtllm_batch_decode_with_kv_cache(
             # For NHD: [..., N, H, D] -> HND: [..., H, N, D]
             k_cache = k_cache.transpose(-3, -2)
             v_cache = v_cache.transpose(-3, -2)
+            if is_nvfp4_kvcache:
+                k_block_scales = k_block_scales.transpose(-3, -2)
+                v_block_scales = v_block_scales.transpose(-3, -2)
 
         run_func = get_trtllm_gen_fmha_module().trtllm_paged_attention_decode
         sm_count = get_device_sm_count(query.device)
@@ -2350,6 +2383,8 @@ def trtllm_batch_decode_with_kv_cache(
             workspace_buffer.numel() * workspace_buffer.element_size(),
             sinks,
             cum_seq_lens_q,
+            k_block_scales,
+            v_block_scales,
         )
 
         return (
