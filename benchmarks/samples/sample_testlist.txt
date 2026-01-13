@@ -23,7 +23,6 @@
 --routine gemm_fp8_nt_groupwise --m 1 --n 1024 --k 7168 --mma_sm 1 --scale_major_mode MN --backends cutlass --refcheck -vv --generate_repro_command
 --routine gemm_fp8_nt_groupwise --m 4 --n 1024 --k 7168 --mma_sm 1 --scale_major_mode MN --backends cutlass --refcheck -vv --generate_repro_command
 --routine gemm_fp8_nt_groupwise --m 16 --n 1024 --k 7168 --mma_sm 1 --scale_major_mode MN --backends cutlass --refcheck -vv --generate_repro_command
---routine gemm_fp8_nt_groupwise --m 32 --n 1024 --k 7168 --mma_sm 1 --scale_major_mode MN --backends cutlass --refcheck -vv --generate_repro_command
 
 ## FP8 group GEMM with groupwise scaling
 --routine group_gemm_fp8_nt_groupwise --m 4 --n 1024 --k 7168 --mma_sm 1 --group_size 2 --scale_major_mode MN --refcheck -vv --generate_repro_command
