@@ -496,9 +496,8 @@ def build_jit_specs(
 
     lines = ["ninja_required_version = 1.3"] + lines + [""]
 
-    jit_dir = jit_env.FLASHINFER_JIT_DIR
     tmpdir = get_tmpdir()
     with FileLock(tmpdir / "flashinfer_jit.lock", thread_local=False):
-        ninja_path = jit_dir / "flashinfer_jit.ninja"
+        ninja_path = tmpdir / "flashinfer_jit.ninja"
         write_if_different(ninja_path, "\n".join(lines))
-        run_ninja(jit_dir, ninja_path, verbose)
+        run_ninja(jit_env.FLASHINFER_JIT_DIR, ninja_path, verbose)
