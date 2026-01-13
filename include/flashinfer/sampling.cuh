@@ -742,10 +742,16 @@ template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
           typename DType, typename IdType>
 __global__ void SamplingFromProbKernel(DType* probs, IdType* output, IdType* indices, uint32_t d,
-                                       uint64_t philox_seed, uint64_t philox_offset) {
+                                       uint64_t philox_seed, uint64_t philox_offset,
+                                       uint64_t* seed_arr = nullptr, uint64_t* offset_arr = nullptr) {
   curandStatePhilox4_32_10_t state;
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
-  curand_init(philox_seed, bx, philox_offset, &state);
+
+  // Use per-request generators if provided, otherwise use scalar seed/offset
+  uint64_t seed = (seed_arr != nullptr) ? seed_arr[bx] : philox_seed;
+  uint64_t offset = (offset_arr != nullptr) ? offset_arr[bx] : philox_offset;
+  curand_init(seed, bx, offset, &state);
+
   const uint32_t row_idx = indices == nullptr ? bx : indices[bx];
 
   extern __shared__ __align__(
@@ -783,6 +789,12 @@ __global__ void SamplingFromProbKernel(DType* probs, IdType* output, IdType* ind
     sampled_id = temp_storage.last_valid_id;
   }
   output[bx] = sampled_id;
+
+  // Atomically update offset for per-request generators
+  // curand_uniform consumes 4 rounds of Philox
+  if (offset_arr != nullptr && tx == 0) {
+    atomicAdd(&offset_arr[bx], 4);
+  }
 }
 
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
@@ -1382,14 +1394,15 @@ cudaError_t SamplingFromLogits(T* logits, IdType* output, IdType* indices, uint3
 template <typename T, typename IdType>
 cudaError_t SamplingFromProb(T* probs, IdType* output, IdType* indices, uint32_t batch_size,
                              uint32_t d, bool deterministic, uint64_t philox_seed,
-                             uint64_t philox_offset, cudaStream_t stream = 0) {
+                             uint64_t philox_offset, uint64_t* seed_arr = nullptr,
+                             uint64_t* offset_arr = nullptr, cudaStream_t stream = 0) {
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
   auto compute_capacity = GetCudaComputeCapability();
   DISPATCH_COMPUTE_CAP_NUM_THREADS(compute_capacity, BLOCK_THREADS, {
     dim3 nblks(batch_size);
     dim3 nthrs(BLOCK_THREADS);
-    void* args[] = {&probs, &output, &indices, &d, &philox_seed, &philox_offset};
+    void* args[] = {&probs, &output, &indices, &d, &philox_seed, &philox_offset, &seed_arr, &offset_arr};
     const uint32_t smem_size = sizeof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
 
     DISPATCH_ALIGNED_VEC_SIZE(

@@ -21,7 +21,8 @@ void softmax(TensorView workspace_buffer, TensorView logits, TensorView output,
              Optional<TensorView> maybe_temperature_arr, double temperature_val, bool enable_pdl);
 
 void sampling_from_probs(TensorView probs, TensorView output, Optional<TensorView> maybe_indices,
-                         bool deterministic, uint64_t philox_seed, uint64_t philox_offset);
+                         bool deterministic, uint64_t philox_seed, uint64_t philox_offset,
+                         Optional<TensorView> maybe_seed_arr, Optional<TensorView> maybe_offset_arr);
 
 void sampling_from_logits(TensorView logits, TensorView output, Optional<TensorView> maybe_indices,
                           bool deterministic, uint64_t philox_seed, uint64_t philox_offset);
