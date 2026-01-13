@@ -58,7 +58,7 @@ __global__ void routingMainKernel(KernelParams params) {
     }
   }
 
-  // note that for invalid scores, we use a very negative value:
+  // note that for invalid scores, we use negative infinity,
   // needed for GLM-style routing where bias can be negative
   static constexpr float invalidScoreFloat = -float(INFINITY);
   const OutputT invalidScore = OutputT{invalidScoreFloat};
