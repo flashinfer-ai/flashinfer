@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include <cmath>
+
 #include "flashinfer/exception.h"
 #include "flashinfer/trtllm/fused_moe/RoutingKernel.cuh"
 
@@ -58,7 +60,7 @@ __global__ void routingMainKernel(KernelParams params) {
 
   // note that for invalid scores, we use a very negative value:
   // needed for GLM-style routing where bias can be negative
-  static constexpr float invalidScoreFloat = -1e10F;
+  static constexpr float invalidScoreFloat = -float(INFINITY);
   const OutputT invalidScore = OutputT{invalidScoreFloat};
 
   // load bias already; each warp represents one expert group
