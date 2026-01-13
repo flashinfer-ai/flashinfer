@@ -483,17 +483,22 @@ def build_jit_specs(
     verbose: bool = False,
     skip_prebuilt: bool = True,
 ) -> None:
-    specs_to_build = []
+    lines: List[str] = []
     for spec in specs:
         if skip_prebuilt and spec.aot_path.exists():
             continue
+        lines.append(f"subninja {spec.ninja_path}")
         if not spec.is_ninja_generated:
             with FileLock(spec.lock_path, thread_local=False):
                 spec.write_ninja()
-        specs_to_build.append(spec)
-
-    if not specs_to_build:
+    if not lines:
         return
 
-    for spec in specs_to_build:
-        run_ninja(spec.build_dir, spec.ninja_path, verbose)
+    lines = ["ninja_required_version = 1.3"] + lines + [""]
+
+    jit_dir = jit_env.FLASHINFER_JIT_DIR
+    tmpdir = get_tmpdir()
+    with FileLock(tmpdir / "flashinfer_jit.lock", thread_local=False):
+        ninja_path = jit_dir / "flashinfer_jit.ninja"
+        write_if_different(ninja_path, "\n".join(lines))
+        run_ninja(jit_dir, ninja_path, verbose)
