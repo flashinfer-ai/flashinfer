@@ -14,7 +14,10 @@
  * limitations under the License.
  */
 
+#include <cutlass/arch/barrier.h>
 #include <float.h>
+
+#include <cute/arch/copy_sm90_tma.hpp>
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
@@ -25,6 +28,7 @@
 #include "tensorrt_llm/kernels/quantization_utils.cuh"
 
 using namespace tensorrt_llm::common;
+using Barrier = cutlass::arch::ClusterTransactionBarrier;
 
 namespace tensorrt_llm {
 namespace kernels {
@@ -294,16 +298,202 @@ quantize_with_block_size(
             // Dispatch the quantization kernel.
             if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_FP4) {
               reinterpret_cast<uint32_t*>(out)[outOffset] =
-                  cvt_warp_fp16_to_fp4<Type, SF_VEC_SIZE, ELTS_PER_THREAD, UE8M0_SF>(in_vec, SFScaleVal, sf_out);
+                  cvt_warp_fp16_to_fp4<Type, SF_VEC_SIZE, ELTS_PER_THREAD, UE8M0_SF>(
+                      in_vec, SFScaleVal, sf_out);
             } else if constexpr (quantization_type == BlockScaleQuantizationType::FP8_TO_FP4) {
               reinterpret_cast<uint64_t*>(out)[outOffset] =
-                  cvt_warp_fp8_to_fp4<__nv_fp8_e4m3, SF_VEC_SIZE, ELTS_PER_THREAD, UE8M0_SF>(in_vec, SFScaleVal,
-                                                                            sf_out);
+                  cvt_warp_fp8_to_fp4<__nv_fp8_e4m3, SF_VEC_SIZE, ELTS_PER_THREAD, UE8M0_SF>(
+                      in_vec, SFScaleVal, sf_out);
             } else if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_MXFP8) {
               reinterpret_cast<uint64_t*>(out)[outOffset] =
                   cvt_warp_fp16_to_mxfp8<Type, SF_VEC_SIZE, ELTS_PER_THREAD>(in_vec, sf_out);
             }
           }
+        }
+      }
+    }
+  }
+  asm volatile("griddepcontrol.launch_dependents;");
+#endif
+}
+
+// quantize with TMA in high throughput mode
+template <BlockScaleQuantizationType quantization_type, class Type, int SF_VEC_SIZE, bool UE8M0_SF>
+__global__ void
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+__launch_bounds__(288, 2) quantize_with_block_size_tma(
+#else
+quantize_with_block_size_tma(
+#endif
+    int32_t numbatches, int32_t numRows, int32_t numCols, int32_t numPaddedCols, Type const* in,
+    float const* SFScale, uint32_t* out, uint32_t* SFout, QuantizationSFLayout layout,
+    const __grid_constant__ CUtensorMap tensor_map) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  using Traits = TmaKernelTraits<Type>;
+  using SmemType = typename Traits::SmemType;
+
+  static constexpr int ELTS_PER_THREAD = Traits::ELTS_PER_THREAD;
+  static constexpr int CVT_NUM_THREADS_PER_SF = SF_VEC_SIZE / ELTS_PER_THREAD;
+  static constexpr int TMA_ROW_TILE = Traits::TMA_ROW_TILE;
+  static constexpr int TMA_COL_TILE = Traits::TMA_COL_TILE;
+  static constexpr int NUM_STAGES = Traits::NUM_STAGES;
+  static constexpr int THREADS_PER_ROW = Traits::THREADS_PER_ROW;
+  static constexpr int ROWS_PER_WARP = Traits::ROWS_PER_WARP;
+  static constexpr int ROW_ITERATIONS = Traits::ROW_ITERATIONS;
+  static constexpr int SMEM_STAGE_SIZE = Traits::SMEM_STAGE_SIZE;
+
+  using PackedVecT = PackedVec<Type, ELTS_PER_THREAD>;
+  static_assert(sizeof(PackedVecT) == sizeof(Type) * ELTS_PER_THREAD, "Vec size is not matched.");
+  static_assert(SF_VEC_SIZE == 16, "Only support SF_VEC_SIZE = 16 for TMA quantization.");
+
+  int warpIdx = threadIdx.x / 32;
+  int numWarp = blockDim.x / 32;
+  int laneIdx = threadIdx.x % 32;
+
+  // IMPORTANT: TMA with SWIZZLE_128B requires 128-byte aligned shared memory.
+  extern __shared__ __align__(1024) uint8_t smem_raw[];
+
+  // SMEM data starts at the beginning of dynamic shared memory (128-byte aligned)
+  SmemType* smem = reinterpret_cast<SmemType*>(smem_raw);
+
+  // Place barriers at the end of dynamic shared memory
+  Barrier* barrier_start_ptr = reinterpret_cast<Barrier*>(smem_raw + Traits::SMEM_DATA_SIZE);
+
+  auto full_barriers = PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (i); });
+  auto empty_barriers =
+      PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (NUM_STAGES + i); });
+
+  // Get the global scaling factor
+  float const SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[0];
+
+  // Is it swizzled layout?
+  bool isSfSwizzledLayout = layout == QuantizationSFLayout::SWIZZLED_128x4 ||
+                            layout == QuantizationSFLayout::SWIZZLED_8x4;
+
+  // The number of padded rows considering 128x4 or 8x4 SF layout.
+  int rowTile = (layout == QuantizationSFLayout::SWIZZLED_128x4) ? 128 : 8;
+  int numPaddedRowsForSf = isSfSwizzledLayout ? PadUpFn(numRows, rowTile) : numRows;
+  int numColsForSf = isSfSwizzledLayout ? PadUpFn(numPaddedCols, 4 * SF_VEC_SIZE) : numPaddedCols;
+
+  asm volatile("griddepcontrol.wait;");
+
+  // TMA barrier initialization.
+  constexpr int NUM_CONSUMER_WARPS = 8;
+  if (warpIdx == 0 and laneIdx == 0) {
+#pragma unroll
+    for (int i = 0; i < NUM_STAGES; i++) {
+      full_barriers[i]->init(1);
+      empty_barriers[i]->init(NUM_CONSUMER_WARPS);
+#pragma unroll
+      for (int j = 0; j < NUM_CONSUMER_WARPS; j++) {
+        empty_barriers[i]->arrive();
+      }
+    }
+    cutlass::arch::fence_barrier_init();
+  }
+  __syncthreads();
+
+  uint32_t stage_idx = 0, phase = 0;
+
+  if (warpIdx == 0 and elect_one_sync()) {
+    // Producer warp - TMA loads
+    for (int rowIdx = blockIdx.x * TMA_ROW_TILE; rowIdx < numPaddedRowsForSf;
+         rowIdx += gridDim.x * TMA_ROW_TILE) {
+      for (int batchIdx = 0; batchIdx < numbatches; batchIdx++) {
+        for (int colIdx = 0; colIdx < numCols; colIdx += NUM_CONSUMER_WARPS * TMA_COL_TILE) {
+          empty_barriers[stage_idx]->wait(phase);
+
+          cute::SM90_TMA_LOAD_3D::copy(
+              &tensor_map, reinterpret_cast<uint64_t*>(full_barriers[stage_idx]), 0ULL,
+              smem + stage_idx * SMEM_STAGE_SIZE, 0, rowIdx, colIdx / TMA_COL_TILE);
+          full_barriers[stage_idx]->arrive_and_expect_tx(SMEM_STAGE_SIZE * sizeof(SmemType));
+
+          stage_idx = stage_idx == NUM_STAGES - 1 ? 0 : stage_idx + 1;
+          phase ^= stage_idx == 0;
+        }
+      }
+    }
+  } else if (warpIdx >= 1 and warpIdx <= 8) {
+    // Consumer warps
+    int consumerWarpIdx = warpIdx - 1;
+    typename Traits::ThreadIndexing tidx(laneIdx, consumerWarpIdx);
+
+    for (int rowIdx = blockIdx.x * TMA_ROW_TILE; rowIdx < numPaddedRowsForSf;
+         rowIdx += gridDim.x * TMA_ROW_TILE) {
+      for (int batchIdx = 0; batchIdx < numbatches; batchIdx++) {
+        std::optional<int> optionalBatchIdx = batchIdx;
+        std::optional<int> optionalNumRows = numRows;
+        tidx.reset();  // Reset column indices for each row iteration
+
+        int threadRowIdxGlobal;
+        int64_t rowOffset, threadOutOffset;
+
+        for (int colIdx = 0; colIdx < numCols; colIdx += NUM_CONSUMER_WARPS * TMA_COL_TILE) {
+          threadRowIdxGlobal = rowIdx + tidx.rowIdxLocal;
+          rowOffset = static_cast<int64_t>(batchIdx * numRows + threadRowIdxGlobal) * numPaddedCols;
+          threadOutOffset = (rowOffset + tidx.colIdx) >> 4;
+
+          full_barriers[stage_idx]->wait(phase);
+
+#pragma unroll
+          for (int i = 0; i < ROW_ITERATIONS; i++) {
+            auto sf_out = cvt_quant_get_sf_out_offset<uint32_t, CVT_NUM_THREADS_PER_SF>(
+                optionalBatchIdx, threadRowIdxGlobal, tidx.colVecIdx, optionalNumRows,
+                numPaddedCols / SF_VEC_SIZE, SFout, layout);
+
+            // Set padded columns to 0
+            if (threadRowIdxGlobal < numRows && tidx.colIdx >= numCols &&
+                tidx.colIdx < numPaddedCols) {
+              reinterpret_cast<uint64_t*>(out)[threadOutOffset] = 0ull;
+            }
+
+            // Set SF padding to 0
+            if (threadRowIdxGlobal >= numRows || tidx.colIdx >= numCols) {
+              if (sf_out != nullptr) {
+                sf_out[0] = 0x00;
+              }
+            } else {
+              SmemType* smem_stage = smem + stage_idx * SMEM_STAGE_SIZE;
+              float4 const* base_float4 = reinterpret_cast<float4 const*>(
+                  smem_stage + consumerWarpIdx * TMA_COL_TILE * TMA_ROW_TILE +
+                  i * TMA_COL_TILE * ROWS_PER_WARP);
+
+              // Load input vector from shared memory
+              PackedVecT in_vec = Traits::template load_input_vec<PackedVecT>(
+                  base_float4, tidx.rowIdxLocal, tidx.colIdxLocal);
+
+              // Dispatch the quantization kernel
+              if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_FP4) {
+                reinterpret_cast<uint64_t*>(out)[threadOutOffset] =
+                    cvt_warp_fp16_to_fp4<Type, SF_VEC_SIZE, ELTS_PER_THREAD, UE8M0_SF>(
+                        in_vec, SFScaleVal, sf_out);
+              } else if constexpr (quantization_type == BlockScaleQuantizationType::FP8_TO_FP4) {
+                reinterpret_cast<uint64_t*>(out)[threadOutOffset] =
+                    cvt_warp_fp8_to_fp4<__nv_fp8_e4m3, SF_VEC_SIZE, ELTS_PER_THREAD, UE8M0_SF>(
+                        in_vec, SFScaleVal, sf_out);
+              } else if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_MXFP8) {
+                reinterpret_cast<uint64_t*>(out)[threadOutOffset] =
+                    cvt_warp_fp16_to_mxfp8<Type, SF_VEC_SIZE, ELTS_PER_THREAD>(in_vec, sf_out);
+              }
+            }
+
+            // Update row index and output offset
+            threadRowIdxGlobal += ROWS_PER_WARP;
+            rowOffset =
+                static_cast<int64_t>(batchIdx * numRows + threadRowIdxGlobal) * numPaddedCols;
+            threadOutOffset = (rowOffset + tidx.colIdx) >> 4;
+          }
+
+          // Update column offset
+          tidx.advance_col();
+          threadOutOffset = (rowOffset + tidx.colIdx) >> 4;
+
+          if (laneIdx == 0) {
+            empty_barriers[stage_idx]->arrive();
+          }
+
+          stage_idx = stage_idx == NUM_STAGES - 1 ? 0 : stage_idx + 1;
+          phase ^= stage_idx == 0;
         }
       }
     }
@@ -399,10 +589,12 @@ cvt_fp16_to_fp4_expert(
     int numCols_SFout = numCols_padded / CVT_FP4_SF_VEC_SIZE / 4;
     uint32_t* SFout_in_expert = SFout + expert_idx * padded_m * numCols_SFout;
 
-    auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, CVT_FP4_SF_VEC_SIZE, CVT_FP4_NUM_THREADS_PER_SF>(
+    auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, CVT_FP4_SF_VEC_SIZE,
+                                                     CVT_FP4_NUM_THREADS_PER_SF>(
         rowIdx_in_expert, colIdx, numCols, SFout_in_expert);
 
-    out_pos = cvt_warp_fp16_to_fp4<Type, CVT_FP4_SF_VEC_SIZE, CVT_FP4_ELTS_PER_THREAD, UE8M0_SF>(in_vec, SFScaleVal, sf_out);
+    out_pos = cvt_warp_fp16_to_fp4<Type, CVT_FP4_SF_VEC_SIZE, CVT_FP4_ELTS_PER_THREAD, UE8M0_SF>(
+        in_vec, SFScaleVal, sf_out);
   }
 #endif
 }

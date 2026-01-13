@@ -274,9 +274,11 @@ struct PackedVec<__nv_fp8_e4m3, NUM_ELTS> {
 
 // Quantizes the provided PackedVec into the uint32_t or uint64_t output
 template <class Type, int SF_VEC_SIZE, int CVT_ELTS_PER_THREAD, bool UE8M0_SF>
-__device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt_warp_fp16_to_fp4(PackedVec<Type, CVT_ELTS_PER_THREAD>& vec, float SFScaleVal, uint8_t* SFout) {
+__device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt_warp_fp16_to_fp4(
+    PackedVec<Type, CVT_ELTS_PER_THREAD>& vec, float SFScaleVal, uint8_t* SFout) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-  static_assert(CVT_ELTS_PER_THREAD == 8 || CVT_ELTS_PER_THREAD == 16, "CVT_ELTS_PER_THREAD must be 8 or 16");
+  static_assert(CVT_ELTS_PER_THREAD == 8 || CVT_ELTS_PER_THREAD == 16,
+                "CVT_ELTS_PER_THREAD must be 8 or 16");
 
   using ReturnType = std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t>;
 
@@ -359,7 +361,8 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
 }
 
 template <class Type, int SF_VEC_SIZE, int CVT_ELTS_PER_THREAD, bool UE8M0_SF>
-__device__ uint64_t cvt_warp_fp8_to_fp4(PackedVec<Type, CVT_ELTS_PER_THREAD>& vec, float SFScaleVal, uint8_t* SFout) {
+__device__ uint64_t cvt_warp_fp8_to_fp4(PackedVec<Type, CVT_ELTS_PER_THREAD>& vec, float SFScaleVal,
+                                        uint8_t* SFout) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 
   // Because the return value is a uint64_t, we need to ensure that the CVT_ELTS_PER_THREAD is 16.
@@ -444,7 +447,8 @@ __device__ uint64_t cvt_warp_fp8_to_fp4(PackedVec<Type, CVT_ELTS_PER_THREAD>& ve
 
 // Quantizes the provided PackedVec into the uint64_t output
 template <class Type, int SF_VEC_SIZE, int CVT_ELTS_PER_THREAD>
-__device__ uint64_t cvt_warp_fp16_to_mxfp8(PackedVec<Type, CVT_ELTS_PER_THREAD>& vec, uint8_t* SFout) {
+__device__ uint64_t cvt_warp_fp16_to_mxfp8(PackedVec<Type, CVT_ELTS_PER_THREAD>& vec,
+                                           uint8_t* SFout) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   // Get absolute maximum values among the local 8 values.
   auto localMax = cuda_abs(vec.elts[0]);
@@ -676,7 +680,8 @@ __device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(int rowIdx, int colIdx, i
 __device__ __forceinline__ float silu(const float& val) { return val / (1.0f + __expf(-val)); }
 
 template <class Type, int CVT_ELTS_PER_THREAD>
-inline __device__ void silu_and_mul(PackedVec<Type, CVT_ELTS_PER_THREAD>& x_vec, const PackedVec<Type, CVT_ELTS_PER_THREAD>& y_vec) {
+inline __device__ void silu_and_mul(PackedVec<Type, CVT_ELTS_PER_THREAD>& x_vec,
+                                    const PackedVec<Type, CVT_ELTS_PER_THREAD>& y_vec) {
   float2 x[CVT_ELTS_PER_THREAD / 2];
   float2 y[CVT_ELTS_PER_THREAD / 2];
 
@@ -699,6 +704,169 @@ inline __device__ void silu_and_mul(PackedVec<Type, CVT_ELTS_PER_THREAD>& x_vec,
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+// Helper functions for quantization kernel with TMA in high throughput mode
+
+template <typename FuncT>
+struct PatternVisitor {
+  FuncT func;
+
+  __device__ __host__ explicit PatternVisitor(FuncT&& func) : func(std::forward<FuncT>(func)) {}
+
+  __device__ __host__ auto operator[](const uint32_t& i) { return func(i); }
+};
+
+template <class InputType>
+struct TmaKernelTraits;
+
+// Base template for 2-byte types (half, __nv_bfloat16)
+// 2 bytes per element, 16 elements per thread = 32 bytes = 2 float4s
+template <class T>
+struct TmaKernelTraitsTwoBytes {
+  using InputType = T;
+  using SmemType = T;
+
+  static constexpr int TMA_ROW_TILE = 16;
+  static constexpr int TMA_COL_TILE = 64;  // 64 elements = 128 bytes
+  static constexpr int NUM_STAGES = 4;
+  static constexpr int SMEM_ROWS = TMA_ROW_TILE;      // Must match TMA_ROW_TILE for TMA loads
+  static constexpr int SMEM_COLS = 8 * TMA_COL_TILE;  // 8 warps * 64 cols
+  static constexpr int THREADS_PER_ROW = 4;           // laneIdx % 4
+  static constexpr int ROWS_PER_WARP = 8;             // 32 / 4
+  static constexpr int ROW_ITERATIONS = TMA_ROW_TILE / ROWS_PER_WARP;  // 2
+  static constexpr int ELTS_PER_THREAD = 16;
+  static constexpr int NUM_CONSUMER_WARPS = 8;
+
+  static constexpr size_t SMEM_DATA_SIZE = NUM_STAGES * SMEM_ROWS * SMEM_COLS * sizeof(SmemType);
+  static constexpr int SMEM_STAGE_SIZE = SMEM_ROWS * SMEM_COLS;
+
+  // Thread indexing helper - encapsulates all index calculations
+  struct ThreadIndexing {
+    int const colIdxLocal;    // Thread's local column index within warp tile (constant)
+    int const rowIdxLocal;    // Thread's local row index within warp (constant)
+    int const baseColIdx;     // Base column index for this thread (constant)
+    int const baseColVecIdx;  // Base column vector index (constant)
+    int colIdx;               // Thread's global column index (in elements)
+    int colVecIdx;            // Thread's column index in SF vector units
+
+    __device__ ThreadIndexing(int laneIdx, int consumerWarpIdx)
+        : colIdxLocal(laneIdx % THREADS_PER_ROW),
+          rowIdxLocal(laneIdx / THREADS_PER_ROW),
+          baseColIdx(consumerWarpIdx * TMA_COL_TILE + colIdxLocal * ELTS_PER_THREAD),
+          baseColVecIdx(consumerWarpIdx * (TMA_COL_TILE / ELTS_PER_THREAD) + colIdxLocal),
+          colIdx(baseColIdx),
+          colVecIdx(baseColVecIdx) {}
+
+    __device__ void reset() {
+      colIdx = baseColIdx;
+      colVecIdx = baseColVecIdx;
+    }
+
+    __device__ void advance_col() {
+      colIdx += NUM_CONSUMER_WARPS * TMA_COL_TILE;
+      colVecIdx = colIdx / ELTS_PER_THREAD;
+    }
+  };
+
+  // Load input vector from shared memory for 2-byte types
+  // Uses SWIZZLE_128B indexing, loads 2 float4s (32 bytes = 16 elements)
+  template <typename PackedVecT>
+  __device__ static PackedVecT load_input_vec(float4 const* base_float4, int threadRowIdxLocal,
+                                              int threadColIdxLocal) {
+    // Compute swizzled indices for SWIZZLE_128B
+    int swizzled_col = threadColIdxLocal * 2;  // Each thread reads 2 float4s
+    int col_after_swizzle_0 = threadRowIdxLocal ^ swizzled_col;
+    int col_after_swizzle_1 = threadRowIdxLocal ^ (swizzled_col + 1);
+    int float4_idx_0 = threadRowIdxLocal * TMA_COL_TILE / 8 + col_after_swizzle_0;
+    int float4_idx_1 = threadRowIdxLocal * TMA_COL_TILE / 8 + col_after_swizzle_1;
+
+    // Load 2 float4s (32 bytes)
+    float4 load_data[2];
+    load_data[0] = base_float4[float4_idx_0];
+    load_data[1] = base_float4[float4_idx_1];
+    return reinterpret_cast<PackedVecT&>(load_data[0]);
+  }
+};
+
+// Specialization for half
+template <>
+struct TmaKernelTraits<half> : TmaKernelTraitsTwoBytes<half> {};
+
+// Specialization for BF16
+#ifdef ENABLE_BF16
+template <>
+struct TmaKernelTraits<__nv_bfloat16> : TmaKernelTraitsTwoBytes<__nv_bfloat16> {};
+#endif
+
+// Specialization for FP8 input (FP8_TO_FP4 native)
+// FP8: 1 byte per element, 16 elements per thread = 16 bytes = 1 float4
+template <>
+struct TmaKernelTraits<__nv_fp8_e4m3> {
+  using InputType = __nv_fp8_e4m3;
+  using SmemType = __nv_fp8_e4m3;
+
+  static constexpr int TMA_ROW_TILE = 8;
+  static constexpr int TMA_COL_TILE = 128;  // 128 FP8 elements = 128 bytes
+  static constexpr int NUM_STAGES = 6;
+  static constexpr int SMEM_ROWS = TMA_ROW_TILE;      // Must match TMA_ROW_TILE for TMA loads
+  static constexpr int SMEM_COLS = 8 * TMA_COL_TILE;  // 8 warps * 128 cols
+  static constexpr int THREADS_PER_ROW = 8;           // laneIdx % 8
+  static constexpr int ROWS_PER_WARP = 4;             // 32 / 8
+  static constexpr int ROW_ITERATIONS = TMA_ROW_TILE / ROWS_PER_WARP;  // 2
+  static constexpr int ELTS_PER_THREAD = 16;
+  static constexpr int NUM_CONSUMER_WARPS = 8;
+
+  static constexpr size_t SMEM_DATA_SIZE = NUM_STAGES * SMEM_ROWS * SMEM_COLS * sizeof(SmemType);
+  static constexpr int SMEM_STAGE_SIZE = SMEM_ROWS * SMEM_COLS;
+
+  // Thread indexing helper - encapsulates all index calculations
+  struct ThreadIndexing {
+    int const colIdxLocal;    // Thread's local column index within warp tile (constant)
+    int const rowIdxLocal;    // Thread's local row index within warp (constant)
+    int const baseColIdx;     // Base column index for this thread (constant)
+    int const baseColVecIdx;  // Base column vector index (constant)
+    int colIdx;               // Thread's global column index (in elements)
+    int colVecIdx;            // Thread's column index in SF vector units
+
+    __device__ ThreadIndexing(int laneIdx, int consumerWarpIdx)
+        : colIdxLocal(laneIdx % THREADS_PER_ROW),
+          rowIdxLocal(laneIdx / THREADS_PER_ROW),
+          baseColIdx(consumerWarpIdx * TMA_COL_TILE + colIdxLocal * ELTS_PER_THREAD),
+          baseColVecIdx(consumerWarpIdx * (TMA_COL_TILE / ELTS_PER_THREAD) + colIdxLocal),
+          colIdx(baseColIdx),
+          colVecIdx(baseColVecIdx) {}
+
+    __device__ void reset() {
+      colIdx = baseColIdx;
+      colVecIdx = baseColVecIdx;
+    }
+
+    __device__ void advance_col() {
+      colIdx += NUM_CONSUMER_WARPS * TMA_COL_TILE;
+      colVecIdx = colIdx / ELTS_PER_THREAD;
+    }
+  };
+
+  // Load input vector from shared memory for FP8
+  // Uses linear indexing (no swizzle), loads 1 float4 (16 bytes = 16 FP8 elements)
+  template <typename PackedVecT>
+  __device__ static PackedVecT load_input_vec(float4 const* base_float4, int threadRowIdxLocal,
+                                              int threadColIdxLocal) {
+    // Linear indexing: compute float4 offset directly
+    int float4_idx = threadRowIdxLocal * (TMA_COL_TILE / 16) + threadColIdxLocal;
+
+    // Load 1 float4 (16 bytes)
+    float4 load_data = base_float4[float4_idx];
+    return reinterpret_cast<PackedVecT&>(load_data);
+  }
+};
+
+// Shared memory size constants (for kernel launch)
+constexpr size_t TMA_BARRIER_SECTION_SIZE = 1024;  // Reserved for barriers (aligned)
+
+template <class InputType>
+constexpr size_t get_tma_smem_size() {
+  return TMA_BARRIER_SECTION_SIZE + TmaKernelTraits<InputType>::SMEM_DATA_SIZE;
+}
 
 }  // namespace kernels
 }  // namespace tensorrt_llm
