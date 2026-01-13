@@ -361,9 +361,6 @@ __device__ __forceinline__ void RadixSelectOneRound(
       }
     }
 
-    // Ensure all threads in leading CTA finish clearing before signaling barrier
-    __syncthreads();
-
     // Barrier: wait for all CTAs to finish atomicAdd and clearing
     if (tx == 0) {
       red_release(&state->arrival_counter, 1);
@@ -556,8 +553,6 @@ __device__ __forceinline__ OrderedType RadixSelectFromSharedMemory(
           next_hist[i] = 0;
         }
       }
-      // Ensure all threads in leading CTA finish clearing before signaling barrier
-      __syncthreads();
       if (tx == 0) {
         red_release(&state->arrival_counter, 1);
       }
