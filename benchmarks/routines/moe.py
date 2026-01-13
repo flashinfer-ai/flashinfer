@@ -1233,6 +1233,7 @@ def testCutlassFusedMoe(args):
         weight_format=variant,
         routing_logits_dtype=router_logits.dtype,
         active_experts=int(selected_experts.unique().numel()),
+        verbose=args.verbose,
     )
 
     print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
@@ -1502,6 +1503,7 @@ def testTrtllmFp8BlockScaleMoe(args):
         weight_format="fp8",
         routing_logits_dtype=routing_logits.dtype,
         active_experts=int(selected_experts.unique().numel()),
+        verbose=args.verbose,
     )
 
     backend = "trtllm"
@@ -1733,6 +1735,7 @@ def testTrtllmFp8PerTensorScaleMoe(args):
         weight_format="fp8",
         routing_logits_dtype=routing_logits.dtype,
         active_experts=int(selected_experts.unique().numel()),
+        verbose=args.verbose,
     )
 
     backend = "trtllm"
