@@ -27,7 +27,7 @@ license-files = ["LICENSE", "LICENSE*.txt"]
 flashinfer = "flashinfer.__main__:cli"
 
 [build-system]
-requires = ["setuptools>=77", "packaging>=24", "apache-tvm-ffi>=0.1.6,<0.2"]
+requires = ["setuptools>=77", "packaging>=24", "apache-tvm-ffi>=0.1.6,!=0.1.8,!=0.1.8.post0,<0.2"]
 build-backend = "build_backend"
 backend-path = ["."]
 
