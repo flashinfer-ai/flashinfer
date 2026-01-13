@@ -42,7 +42,9 @@ def get_seed_and_offset(
     seed, offset = state.view(torch.int64)
     offset += (increment + 3) // 4 * 4
     generator.set_state(
-        torch.tensor([seed, offset], dtype=torch.int64, device=torch.device("cpu")).view(torch.uint8)
+        torch.tensor(
+            [seed, offset], dtype=torch.int64, device=torch.device("cpu")
+        ).view(torch.uint8)
     )
     return int(seed), int(offset)
 
