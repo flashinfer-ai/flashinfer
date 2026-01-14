@@ -87,12 +87,17 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install and configure pre-commit with auto-fix
+      - name: Configure git for Claude
+        if: steps.check-permission.outputs.authorized == 'true'
+        run: |
+          git config --global user.name "Claude Sonnet 4.5"
+          git config --global user.email "noreply@anthropic.com"
+
+      - name: Install pre-commit
         if: steps.check-permission.outputs.authorized == 'true'
         run: |
           pip install pre-commit
-          chmod +x .github/scripts/setup-auto-fix-precommit.sh
-          .github/scripts/setup-auto-fix-precommit.sh
+          pre-commit install
 
       - name: Run Claude Code
         if: steps.check-permission.outputs.authorized == 'true'
