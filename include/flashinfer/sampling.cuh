@@ -793,7 +793,7 @@ __global__ void SamplingFromProbKernel(DType* probs, IdType* output, IdType* ind
   // Atomically update offset if using per-request generators
   // Each curand_uniform call consumes 4 values from the RNG state
   if (tx == 0 && offset_arr != nullptr) {
-    atomicAdd(&offset_arr[bx], 4);
+    atomicAdd(&offset_arr[bx], 4UL);
   }
 }
 
@@ -1141,7 +1141,7 @@ __global__ void MinPSamplingFromProbKernel(DType* probs, float* min_p_arr, IdTyp
   // Atomically update offset if using per-request generators
   // MinP sampling calls curand_uniform once
   if (tx == 0 && offset_arr != nullptr) {
-    atomicAdd(&offset_arr[bx], 4);
+    atomicAdd(&offset_arr[bx], 4UL);
   }
 }
 
