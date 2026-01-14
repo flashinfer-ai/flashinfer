@@ -341,6 +341,7 @@ quantize_with_block_size_tma(
   static constexpr int ROWS_PER_WARP = Traits::ROWS_PER_WARP;
   static constexpr int ROW_ITERATIONS = Traits::ROW_ITERATIONS;
   static constexpr int SMEM_STAGE_SIZE = Traits::SMEM_STAGE_SIZE;
+  static constexpr int NUM_CONSUMER_WARPS = Traits::NUM_CONSUMER_WARPS;
 
   using PackedVecT = PackedVec<Type, ELTS_PER_THREAD>;
   static_assert(sizeof(PackedVecT) == sizeof(Type) * ELTS_PER_THREAD, "Vec size is not matched.");
@@ -378,7 +379,6 @@ quantize_with_block_size_tma(
   asm volatile("griddepcontrol.wait;");
 
   // TMA barrier initialization.
-  constexpr int NUM_CONSUMER_WARPS = 8;
   if (warpIdx == 0 and laneIdx == 0) {
 #pragma unroll
     for (int i = 0; i < NUM_STAGES; i++) {

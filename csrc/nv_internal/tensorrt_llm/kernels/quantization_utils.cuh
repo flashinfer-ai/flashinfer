@@ -202,6 +202,22 @@ inline __device__ uint64_t fp32_vec_to_e2m1(float2 (&array)[8]) {
 #endif
 }
 
+inline __device__ uint32_t elect_one_sync() {
+  uint32_t pred = 0;
+  uint32_t laneid = 0;
+  asm volatile(
+      "{\n"
+      ".reg .b32 %%rx;\n"
+      ".reg .pred %%px;\n"
+      "     elect.sync %%rx|%%px, %2;\n"
+      "@%%px mov.s32 %1, 1;\n"
+      "     mov.s32 %0, %%rx;\n"
+      "}\n"
+      : "+r"(laneid), "+r"(pred)
+      : "r"(0xFFFFFFFF));
+  return pred;
+}
+
 // Convert 4 float2 values into 8 e4m3 values (represented as one uint64_t).
 inline __device__ uint64_t fp32_vec_to_e4m3(float2 (&array)[4]) {
   union {
