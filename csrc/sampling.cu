@@ -71,7 +71,8 @@ void sampling_from_logits(TensorView logits, TensorView output, Optional<TensorV
 
 void sampling_from_probs(TensorView probs, TensorView output, Optional<TensorView> maybe_indices,
                          bool deterministic, uint64_t philox_seed, uint64_t philox_offset,
-                         Optional<TensorView> maybe_seed_arr, Optional<TensorView> maybe_offset_arr) {
+                         Optional<TensorView> maybe_seed_arr,
+                         Optional<TensorView> maybe_offset_arr) {
   CHECK_INPUT(probs);
   CHECK_DIM(2, probs);  // probs: (batch_size, vocab_size)
   CHECK_MAYBE_INPUT_TYPES(maybe_indices, dl_int32, dl_int64);
@@ -88,8 +89,10 @@ void sampling_from_probs(TensorView probs, TensorView output, Optional<TensorVie
         maybe_indices.has_value() ? static_cast<IdType*>(maybe_indices.value().data_ptr())
                                   : nullptr,
         batch_size, vocab_size, deterministic, philox_seed, philox_offset,
-        maybe_seed_arr.has_value() ? static_cast<uint64_t*>(maybe_seed_arr.value().data_ptr()) : nullptr,
-        maybe_offset_arr.has_value() ? static_cast<uint64_t*>(maybe_offset_arr.value().data_ptr()) : nullptr,
+        maybe_seed_arr.has_value() ? static_cast<uint64_t*>(maybe_seed_arr.value().data_ptr())
+                                   : nullptr,
+        maybe_offset_arr.has_value() ? static_cast<uint64_t*>(maybe_offset_arr.value().data_ptr())
+                                     : nullptr,
         stream);
     TVM_FFI_ICHECK(status == cudaSuccess)
         << "SamplingFromProbs failed with error code " << cudaGetErrorString(status);
@@ -101,7 +104,8 @@ void top_p_sampling_from_probs(TensorView probs, TensorView output,
                                Optional<TensorView> maybe_indices,
                                Optional<TensorView> maybe_top_p_arr, double top_p_val,
                                bool deterministic, uint64_t philox_seed, uint64_t philox_offset,
-                               Optional<TensorView> maybe_seed_arr, Optional<TensorView> maybe_offset_arr) {
+                               Optional<TensorView> maybe_seed_arr,
+                               Optional<TensorView> maybe_offset_arr) {
   CHECK_INPUT(probs);
   CHECK_DIM(2, probs);  // probs: (batch_size, vocab_size)
   CHECK_MAYBE_INPUT_TYPES(maybe_indices, dl_int32, dl_int64);
@@ -121,8 +125,10 @@ void top_p_sampling_from_probs(TensorView probs, TensorView output,
                                   : nullptr,
         has_top_p_arr ? static_cast<float*>(maybe_top_p_arr.value().data_ptr()) : nullptr,
         batch_size, top_p_val, vocab_size, deterministic, philox_seed, philox_offset,
-        maybe_seed_arr.has_value() ? static_cast<uint64_t*>(maybe_seed_arr.value().data_ptr()) : nullptr,
-        maybe_offset_arr.has_value() ? static_cast<uint64_t*>(maybe_offset_arr.value().data_ptr()) : nullptr,
+        maybe_seed_arr.has_value() ? static_cast<uint64_t*>(maybe_seed_arr.value().data_ptr())
+                                   : nullptr,
+        maybe_offset_arr.has_value() ? static_cast<uint64_t*>(maybe_offset_arr.value().data_ptr())
+                                     : nullptr,
         stream);
     TVM_FFI_ICHECK(status == cudaSuccess)
         << "TopPSamplingFromProbs failed with error code " << cudaGetErrorString(status);
@@ -134,7 +140,8 @@ void top_k_sampling_from_probs(TensorView probs, TensorView output,
                                Optional<TensorView> maybe_indices,
                                Optional<TensorView> maybe_top_k_arr, int64_t top_k_val,
                                bool deterministic, uint64_t philox_seed, uint64_t philox_offset,
-                               Optional<TensorView> maybe_seed_arr, Optional<TensorView> maybe_offset_arr) {
+                               Optional<TensorView> maybe_seed_arr,
+                               Optional<TensorView> maybe_offset_arr) {
   CHECK_INPUT(probs);
   CHECK_INPUT(output);
   CHECK_DEVICE(output, probs);
@@ -157,8 +164,10 @@ void top_k_sampling_from_probs(TensorView probs, TensorView output,
                                   : nullptr,
         has_top_k_arr ? static_cast<float*>(maybe_top_k_arr.value().data_ptr()) : nullptr,
         batch_size, top_k_val, vocab_size, deterministic, philox_seed, philox_offset,
-        maybe_seed_arr.has_value() ? static_cast<uint64_t*>(maybe_seed_arr.value().data_ptr()) : nullptr,
-        maybe_offset_arr.has_value() ? static_cast<uint64_t*>(maybe_offset_arr.value().data_ptr()) : nullptr,
+        maybe_seed_arr.has_value() ? static_cast<uint64_t*>(maybe_seed_arr.value().data_ptr())
+                                   : nullptr,
+        maybe_offset_arr.has_value() ? static_cast<uint64_t*>(maybe_offset_arr.value().data_ptr())
+                                     : nullptr,
         stream);
     TVM_FFI_ICHECK(status == cudaSuccess)
         << "TopKSamplingFromProbs failed with error code " << cudaGetErrorString(status);
@@ -170,7 +179,8 @@ void min_p_sampling_from_probs(TensorView probs, TensorView output,
                                Optional<TensorView> maybe_indices,
                                Optional<TensorView> maybe_min_p_arr, double min_p_val,
                                bool deterministic, uint64_t philox_seed, uint64_t philox_offset,
-                               Optional<TensorView> maybe_seed_arr, Optional<TensorView> maybe_offset_arr) {
+                               Optional<TensorView> maybe_seed_arr,
+                               Optional<TensorView> maybe_offset_arr) {
   CHECK_INPUT(probs);
   CHECK_INPUT(output);
   CHECK_DEVICE(output, probs);
@@ -194,8 +204,10 @@ void min_p_sampling_from_probs(TensorView probs, TensorView output,
         maybe_indices.has_value() ? static_cast<IdType*>(maybe_indices.value().data_ptr())
                                   : nullptr,
         batch_size, min_p_val, vocab_size, deterministic, philox_seed, philox_offset,
-        maybe_seed_arr.has_value() ? static_cast<uint64_t*>(maybe_seed_arr.value().data_ptr()) : nullptr,
-        maybe_offset_arr.has_value() ? static_cast<uint64_t*>(maybe_offset_arr.value().data_ptr()) : nullptr,
+        maybe_seed_arr.has_value() ? static_cast<uint64_t*>(maybe_seed_arr.value().data_ptr())
+                                   : nullptr,
+        maybe_offset_arr.has_value() ? static_cast<uint64_t*>(maybe_offset_arr.value().data_ptr())
+                                     : nullptr,
         stream);
     TVM_FFI_ICHECK(status == cudaSuccess)
         << "MinPSamplingFromProb failed with error code " << cudaGetErrorString(status);
@@ -208,8 +220,8 @@ void top_k_top_p_sampling_from_probs(TensorView probs, TensorView output,
                                      Optional<TensorView> maybe_top_k_arr, double top_k_val,
                                      Optional<TensorView> maybe_top_p_arr, double top_p_val,
                                      bool deterministic, uint64_t philox_seed,
-                                     uint64_t philox_offset,
-                                     Optional<TensorView> maybe_seed_arr, Optional<TensorView> maybe_offset_arr) {
+                                     uint64_t philox_offset, Optional<TensorView> maybe_seed_arr,
+                                     Optional<TensorView> maybe_offset_arr) {
   CHECK_INPUT(probs);
   CHECK_INPUT(output);
   CHECK_DEVICE(output, probs);
@@ -236,8 +248,10 @@ void top_k_top_p_sampling_from_probs(TensorView probs, TensorView output,
         maybe_indices.has_value() ? static_cast<IdType*>(maybe_indices.value().data_ptr())
                                   : nullptr,
         batch_size, top_k_val, top_p_val, vocab_size, deterministic, philox_seed, philox_offset,
-        maybe_seed_arr.has_value() ? static_cast<uint64_t*>(maybe_seed_arr.value().data_ptr()) : nullptr,
-        maybe_offset_arr.has_value() ? static_cast<uint64_t*>(maybe_offset_arr.value().data_ptr()) : nullptr,
+        maybe_seed_arr.has_value() ? static_cast<uint64_t*>(maybe_seed_arr.value().data_ptr())
+                                   : nullptr,
+        maybe_offset_arr.has_value() ? static_cast<uint64_t*>(maybe_offset_arr.value().data_ptr())
+                                     : nullptr,
         stream);
     TVM_FFI_ICHECK(status == cudaSuccess)
         << "TopKTopPSamplingFromProbs failed with error code " << cudaGetErrorString(status);
