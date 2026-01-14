@@ -408,6 +408,9 @@ def is_fa3_backend_supported(
         return False
     if use_fp16_qk_reductions:
         return False
+    # FA3 backend does not support FP8 KV cache
+    if dtype_kv in [torch.float8_e4m3fn, torch.float8_e5m2]:
+        return False
     return True
 
 
