@@ -18,17 +18,17 @@ csrc/nv_internal/cpp/ @wenscarl @bkryu @yongwww @djmmoss @joker-eph
 csrc/nv_internal/include/ @nv-yunzheq @wenscarl
 csrc/nv_internal/tensorrt_llm/ @djmmoss @wenscarl @yzh119 @nv-yunzheq @yongwww
 csrc/xqa/ @cyx-6 @yzh119
-docs/ @yzh119 @bkryu @cyx-6 @wenscarl @nv-yunzheq
-flashinfer/ @yzh119 @bkryu @cyx-6 @nvmbreughe @jimmyzho
+docs/ @yzh119 @bkryu @cyx-6 @wenscarl
+flashinfer/ @yzh119 @cyx-6 @bkryu @jimmyzho @nvmbreughe
 flashinfer-cubin/ @yzh119 @cyx-6
 flashinfer-cubin/flashinfer_cubin/ @yzh119
 flashinfer-jit-cache/ @yzh119 @cyx-6
 flashinfer-jit-cache/flashinfer_jit_cache/ @yzh119
-flashinfer/comm/ @nvmbreughe @yzh119 @cyx-6 @wenscarl @djmmoss
+flashinfer/comm/ @nvmbreughe @yzh119 @cyx-6 @wenscarl @bkryu
 flashinfer/cudnn/ @Anerudhan @yzh119 @bkryu @cyx-6
-flashinfer/cute_dsl/ @aleozlx @bkryu @yzh119 @kaixih @jimmyzho
+flashinfer/cute_dsl/ @bkryu @yzh119 @aleozlx @kaixih @jimmyzho
 flashinfer/dsv3_ops/ @nv-yunzheq @jiahanc @nvmbreughe
-flashinfer/fused_moe/ @nv-yunzheq @yzh119 @jiahanc @djmmoss @cyx-6
+flashinfer/fused_moe/ @nv-yunzheq @yzh119 @bkryu @jiahanc @djmmoss
 flashinfer/gemm/ @bkryu @nvmbreughe @yongwww @jimmyzho
 flashinfer/jit/ @yzh119 @jimmyzho @cyx-6 @jiahanc @aleozlx
 flashinfer/jit/attention/ @yzh119 @jimmyzho @cyx-6
@@ -40,9 +40,9 @@ flashinfer/triton/kernels/ @yzh119
 flashinfer/tuning_configs/ @kaixih
 include/ @yzh119 @jiahanc @kahyunnam @IwakuraRein @nv-yunzheq
 include/flashinfer/ @yzh119 @jiahanc @kahyunnam @IwakuraRein @nv-yunzheq
-include/flashinfer/attention/ @yzh119 @kahyunnam @joker-eph
-include/flashinfer/comm/ @yongwww @nvmbreughe @djmmoss @yzh119
+include/flashinfer/attention/ @yzh119 @kahyunnam
+include/flashinfer/comm/ @yongwww @djmmoss @nvmbreughe
 include/flashinfer/gemm/ @ttyio @yongwww @yzh119 @nvmbreughe @aleozlx
-include/flashinfer/trtllm/ @yzh119 @jiahanc @aleozlx @joker-eph @IwakuraRein
+include/flashinfer/trtllm/ @yzh119 @jiahanc @aleozlx @IwakuraRein @joker-eph
 profiler/ @cyx-6
 scripts/ @yzh119 @nvmbreughe @kahyunnam @jimmyzho @dierksen
