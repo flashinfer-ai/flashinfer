@@ -4,6 +4,7 @@
 #
 # - Spot retry: Handled by aws infrastructure
 # - Test scripts: Reuses existing task_*.sh scripts
+# - Docker tag: Reads from ci/docker-tags.yml (single source of truth)
 
 name: PR Test
 
@@ -33,23 +34,28 @@ concurrency:
 permissions:
   contents: read
 
-env:
-  # Docker image tag - matches ci/docker-tags.yml
-  DOCKER_TAG: "20260105-a97b5d7"
-
 jobs:
   # ===========================================================================
-  # Skip Check - Replicate Jenkins should_skip_build() logic
+  # Setup - Read docker tag from ci/docker-tags.yml
   # ===========================================================================
-  check-skip:
-    name: Check Skip Conditions
+  setup:
+    name: Setup
     runs-on: ubuntu-latest
     outputs:
+      docker_tag: ${{ steps.get-tag.outputs.tag }}
       skip_build: ${{ steps.check.outputs.skip }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Get Docker Tag
+        id: get-tag
+        run: |
+          # Read tag from ci/docker-tags.yml (all images use the same tag)
+          TAG=$(grep 'flashinfer/flashinfer-ci-cu129:' ci/docker-tags.yml | cut -d':' -f2 | tr -d ' ')
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "Docker tag: $TAG"
 
       - name: Check if only docs/config changed
         id: check
@@ -84,9 +90,9 @@ jobs:
   # ===========================================================================
   aot-build-x64:
     name: AOT Build (x64, ${{ matrix.cuda }})
-    needs: check-skip
+    needs: setup
     if: |
-      needs.check-skip.outputs.skip_build != 'true' &&
+      needs.setup.outputs.skip_build != 'true' &&
       (github.event.inputs.skip_aot != 'true' || github.event.inputs.skip_aot == '')
     runs-on: [self-hosted, linux, x64, cpu]
     timeout-minutes: 60
@@ -95,7 +101,7 @@ jobs:
       matrix:
         cuda: [cu126, cu128, cu129, cu130]
     container:
-      image: flashinfer/flashinfer-ci-${{ matrix.cuda }}:${{ env.DOCKER_TAG }}
+      image: flashinfer/flashinfer-ci-${{ matrix.cuda }}:${{ needs.setup.outputs.docker_tag }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -116,9 +122,9 @@ jobs:
   # ===========================================================================
   aot-build-arm64:
     name: AOT Build (arm64, ${{ matrix.cuda }})
-    needs: check-skip
+    needs: setup
     if: |
-      needs.check-skip.outputs.skip_build != 'true' &&
+      needs.setup.outputs.skip_build != 'true' &&
       (github.event.inputs.skip_aot != 'true' || github.event.inputs.skip_aot == '')
     runs-on: [self-hosted, linux, arm64, cpu]
     timeout-minutes: 60
@@ -127,7 +133,7 @@ jobs:
       matrix:
         cuda: [cu126, cu128, cu129, cu130]
     container:
-      image: flashinfer/flashinfer-ci-${{ matrix.cuda }}:${{ env.DOCKER_TAG }}
+      image: flashinfer/flashinfer-ci-${{ matrix.cuda }}:${{ needs.setup.outputs.docker_tag }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -148,9 +154,9 @@ jobs:
   # ===========================================================================
   gpu-tests-sm86:
     name: JIT Unittest ${{ matrix.shard }} (SM86/A10G)
-    needs: check-skip
+    needs: setup
     if: |
-      needs.check-skip.outputs.skip_build != 'true' &&
+      needs.setup.outputs.skip_build != 'true' &&
       (github.event.inputs.skip_gpu != 'true' || github.event.inputs.skip_gpu == '')
     runs-on: [self-hosted, linux, x64, gpu, sm86]
     timeout-minutes: 120
@@ -159,7 +165,7 @@ jobs:
       matrix:
         shard: [1, 2, 3, 4, 5]
     container:
-      image: flashinfer/flashinfer-ci-cu129:${{ env.DOCKER_TAG }}
+      image: flashinfer/flashinfer-ci-cu129:${{ needs.setup.outputs.docker_tag }}
       options: --gpus all --shm-size=16g
     steps:
       - uses: actions/checkout@v4
@@ -185,14 +191,14 @@ jobs:
   # ===========================================================================
   gpu-tests-sm75:
     name: JIT Unittest G4 (SM75/T4)
-    needs: check-skip
+    needs: setup
     if: |
-      needs.check-skip.outputs.skip_build != 'true' &&
+      needs.setup.outputs.skip_build != 'true' &&
       (github.event.inputs.skip_gpu != 'true' || github.event.inputs.skip_gpu == '')
     runs-on: [self-hosted, linux, x64, gpu, sm75]
     timeout-minutes: 90
     container:
-      image: flashinfer/flashinfer-ci-cu129:${{ env.DOCKER_TAG }}
+      image: flashinfer/flashinfer-ci-cu129:${{ needs.setup.outputs.docker_tag }}
       options: --gpus all --shm-size=16g
     steps:
       - uses: actions/checkout@v4
@@ -217,7 +223,7 @@ jobs:
   ci-summary:
     name: CI Summary
     if: always()
-    needs: [check-skip, aot-build-x64, aot-build-arm64, gpu-tests-sm86, gpu-tests-sm75]
+    needs: [setup, aot-build-x64, aot-build-arm64, gpu-tests-sm86, gpu-tests-sm75]
     runs-on: ubuntu-latest
     steps:
       - name: Check Results
@@ -226,7 +232,7 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
 
           # Check skip
-          if [ "${{ needs.check-skip.outputs.skip_build }}" == "true" ]; then
+          if [ "${{ needs.setup.outputs.skip_build }}" == "true" ]; then
             echo "Build skipped (docs/config only changes)" >> $GITHUB_STEP_SUMMARY
             exit 0
           fi
