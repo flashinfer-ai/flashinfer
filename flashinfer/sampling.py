@@ -72,14 +72,21 @@ def _validate_per_request_generator(
     ValueError
         If tensors are not on CUDA device or have incorrect shape
     """
-    if seed_arr.dtype != torch.int64 or offset_arr.dtype != torch.int64:
-        raise TypeError("seed_arr and offset_arr must be int64 tensors")
-    if not seed_arr.is_cuda or not offset_arr.is_cuda:
-        raise ValueError("seed_arr and offset_arr must be on CUDA device")
-    if seed_arr.shape != (batch_size,) or offset_arr.shape != (batch_size,):
+    if seed_arr.dtype != torch.int64:
+        raise TypeError(f"seed_arr must be int64 tensor, got {seed_arr.dtype}")
+    if offset_arr.dtype != torch.int64:
+        raise TypeError(f"offset_arr must be int64 tensor, got {offset_arr.dtype}")
+    if not seed_arr.is_cuda:
+        raise ValueError(f"seed_arr must be on CUDA device, got {seed_arr.device}")
+    if not offset_arr.is_cuda:
+        raise ValueError(f"offset_arr must be on CUDA device, got {offset_arr.device}")
+    if seed_arr.shape != (batch_size,):
         raise ValueError(
-            f"seed_arr and offset_arr must have shape ({batch_size},), "
-            f"got {seed_arr.shape} and {offset_arr.shape}"
+            f"seed_arr must have shape ({batch_size},), got {seed_arr.shape}"
+        )
+    if offset_arr.shape != (batch_size,):
+        raise ValueError(
+            f"offset_arr must have shape ({batch_size},), got {offset_arr.shape}"
         )
 
 
@@ -834,10 +841,36 @@ def sampling_from_probs(
         Whether to use deterministic kernel implementation, default is ``True``.
     generator: Optional[Union[torch.Generator, Tuple[torch.Tensor, torch.Tensor]]]
         Random number generator. Can be either:
+
         - A ``torch.Generator`` for traditional single-generator sampling (default)
         - A tuple of ``(seed_arr, offset_arr)`` tensors for per-request generators,
           where both are int64 tensors of shape ``(batch_size,)`` on CUDA.
-          Offsets are automatically updated in-place after sampling.
+
+        **Per-request generator behavior:**
+
+        - Each request uses its own seed from ``seed_arr[i]``
+        - Offsets track RNG state and are automatically updated in-place after sampling
+        - Each RNG call consumes 4 values, so offsets increment by 4 per call
+        - For iterative samplers (top_p, top_k, top_k_top_p), offsets increment by ``4 * num_rounds``
+          where ``num_rounds`` varies based on the sampling algorithm
+        - Sequential calls with the same generator tuple will use updated offsets (cumulative)
+
+        **Example with per-request generators:**
+
+        .. code-block:: python
+
+            # Create per-request generators
+            seed_arr = torch.randint(0, 2**32, (batch_size,), dtype=torch.int64, device="cuda")
+            offset_arr = torch.zeros(batch_size, dtype=torch.int64, device="cuda")
+
+            # First sampling call
+            samples1 = sampling_from_probs(probs1, generator=(seed_arr, offset_arr))
+            # offset_arr is now [4, 4, 4, ...] (automatically updated)
+
+            # Second sampling call reuses same generators with updated offsets
+            samples2 = sampling_from_probs(probs2, generator=(seed_arr, offset_arr))
+            # offset_arr is now [8, 8, 8, ...] (cumulative)
+
     check_nan: bool
         Whether to check nan in :attr:`probs`, default is ``False``.
     seed: Optional[int]

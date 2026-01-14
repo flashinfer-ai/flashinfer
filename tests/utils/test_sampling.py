@@ -1154,30 +1154,41 @@ def test_per_request_generator_offset_update(batch_size, vocab_size, sampling_fu
         flashinfer.sampling.sampling_from_probs(
             normalized_prob, generator=(seed_arr, offset_arr)
         )
-        # Simple samplers increment by 4
-        expected_min = 4
-        expected_max = 4
+        # Simple samplers: fixed increment of 4
+        assert torch.all(offset_arr == 4), (
+            f"{sampling_func}: Offsets should be exactly 4, got {offset_arr}"
+        )
     elif sampling_func == "top_p_sampling_from_probs":
         flashinfer.sampling.top_p_sampling_from_probs(
             normalized_prob, 0.9, generator=(seed_arr, offset_arr)
         )
-        # Iterative samplers: variable increments (at least 4, typically more)
-        expected_min = 4
-        expected_max = 128  # Conservative upper bound
+        # Iterative samplers: variable increments (multiples of 4)
+        assert torch.all(offset_arr > 0), (
+            f"{sampling_func}: All offsets should be updated (> 0)"
+        )
+        assert torch.all(offset_arr % 4 == 0), (
+            f"{sampling_func}: All offsets should be multiples of 4"
+        )
     elif sampling_func == "top_k_sampling_from_probs":
         k = min(100, vocab_size)
         flashinfer.sampling.top_k_sampling_from_probs(
             normalized_prob, k, generator=(seed_arr, offset_arr)
         )
-        expected_min = 4
-        expected_max = 128
+        # Iterative samplers: variable increments (multiples of 4)
+        assert torch.all(offset_arr > 0), (
+            f"{sampling_func}: All offsets should be updated (> 0)"
+        )
+        assert torch.all(offset_arr % 4 == 0), (
+            f"{sampling_func}: All offsets should be multiples of 4"
+        )
     elif sampling_func == "min_p_sampling_from_probs":
         flashinfer.sampling.min_p_sampling_from_probs(
             normalized_prob, 0.1, generator=(seed_arr, offset_arr)
         )
         # Simple sampler: fixed increment of 4
-        expected_min = 4
-        expected_max = 4
+        assert torch.all(offset_arr == 4), (
+            f"{sampling_func}: Offsets should be exactly 4, got {offset_arr}"
+        )
     elif sampling_func == "top_k_top_p_sampling_from_probs":
         k = min(100, vocab_size)
         flashinfer.sampling.top_k_top_p_sampling_from_probs(
@@ -1187,21 +1198,13 @@ def test_per_request_generator_offset_update(batch_size, vocab_size, sampling_fu
             generator=(seed_arr, offset_arr),
             filter_apply_order="joint",
         )
-        expected_min = 4
-        expected_max = 128
-
-    # Check that offsets were updated
-    assert torch.all(offset_arr >= expected_min), (
-        f"{sampling_func}: Offsets should be at least {expected_min}, "
-        f"got min={offset_arr.min().item()}"
-    )
-    assert torch.all(offset_arr <= expected_max), (
-        f"{sampling_func}: Offsets should be at most {expected_max}, "
-        f"got max={offset_arr.max().item()}"
-    )
-    assert torch.all(offset_arr > 0), (
-        f"{sampling_func}: All offsets should be updated (> 0)"
-    )
+        # Iterative samplers: variable increments (multiples of 4)
+        assert torch.all(offset_arr > 0), (
+            f"{sampling_func}: All offsets should be updated (> 0)"
+        )
+        assert torch.all(offset_arr % 4 == 0), (
+            f"{sampling_func}: All offsets should be multiples of 4"
+        )
 
 
 @pytest.mark.parametrize("batch_size", [8, 32])

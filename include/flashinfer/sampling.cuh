@@ -751,8 +751,11 @@ __global__ void SamplingFromProbKernel(DType* probs, IdType* output, IdType* ind
   // Use per-request seed/offset if arrays provided, otherwise use scalar values
   uint64_t seed = (seed_arr != nullptr) ? seed_arr[bx] : philox_seed;
   uint64_t offset = (offset_arr != nullptr) ? offset_arr[bx] : philox_offset;
+  // When using per-request seeds, subsequence should be 0 since bx is already incorporated via
+  // seed_arr[bx] When using scalar seed, use bx as subsequence to differentiate between blocks
+  uint64_t subsequence = (seed_arr != nullptr) ? 0 : bx;
 
-  curand_init(seed, bx, offset, &state);
+  curand_init(seed, subsequence, offset, &state);
   const uint32_t row_idx = indices == nullptr ? bx : indices[bx];
 
   extern __shared__ __align__(
@@ -812,9 +815,12 @@ __global__ void TopKSamplingFromProbKernel(DType* probs, IdType* output, IdType*
   // Use per-request seed/offset if arrays provided, otherwise use scalar values
   uint64_t seed = (seed_arr != nullptr) ? seed_arr[bx] : philox_seed;
   uint64_t offset = (offset_arr != nullptr) ? offset_arr[bx] : philox_offset;
+  // When using per-request seeds, subsequence should be 0 since bx is already incorporated via
+  // seed_arr[bx] When using scalar seed, use bx as subsequence to differentiate between blocks
+  uint64_t subsequence = (seed_arr != nullptr) ? 0 : bx;
 
   curandStatePhilox4_32_10_t state;
-  curand_init(seed, bx, offset, &state);
+  curand_init(seed, subsequence, offset, &state);
   const uint32_t k = top_k_arr == nullptr ? top_k_val : top_k_arr[bx];
   const uint32_t row_idx = indices == nullptr ? bx : indices[bx];
 
@@ -923,6 +929,7 @@ __global__ void TopKSamplingFromProbKernel(DType* probs, IdType* output, IdType*
     // Atomically update offset if using per-request generators
     // TopK sampling calls curand_uniform once per round (variable count)
     // We increment by round * 4 since each call consumes 4 values
+    // Note: All threads converge to same round count due to __syncthreads() in loop
     if (offset_arr != nullptr) {
       atomicAdd(&offset_arr[bx], static_cast<uint64_t>(round * 4));
     }
@@ -943,9 +950,12 @@ __global__ void TopPSamplingFromProbKernel(DType* probs, IdType* output, IdType*
   // Use per-request seed/offset if arrays provided, otherwise use scalar values
   uint64_t seed = (seed_arr != nullptr) ? seed_arr[bx] : philox_seed;
   uint64_t offset = (offset_arr != nullptr) ? offset_arr[bx] : philox_offset;
+  // When using per-request seeds, subsequence should be 0 since bx is already incorporated via
+  // seed_arr[bx] When using scalar seed, use bx as subsequence to differentiate between blocks
+  uint64_t subsequence = (seed_arr != nullptr) ? 0 : bx;
 
   curandStatePhilox4_32_10_t state;
-  curand_init(seed, bx, offset, &state);
+  curand_init(seed, subsequence, offset, &state);
   const uint32_t row_idx = indices == nullptr ? bx : indices[bx];
   float top_p = (top_p_arr == nullptr) ? top_p_val : top_p_arr[row_idx];
 
@@ -1050,6 +1060,7 @@ __global__ void TopPSamplingFromProbKernel(DType* probs, IdType* output, IdType*
     // Atomically update offset if using per-request generators
     // TopP sampling calls curand_uniform once per round (variable count)
     // We increment by round * 4 since each call consumes 4 values
+    // Note: All threads converge to same round count due to __syncthreads() in loop
     if (offset_arr != nullptr) {
       atomicAdd(&offset_arr[bx], static_cast<uint64_t>(round * 4));
     }
@@ -1070,9 +1081,12 @@ __global__ void MinPSamplingFromProbKernel(DType* probs, float* min_p_arr, IdTyp
   // Use per-request seed/offset if arrays provided, otherwise use scalar values
   uint64_t seed = (seed_arr != nullptr) ? seed_arr[bx] : philox_seed;
   uint64_t offset = (offset_arr != nullptr) ? offset_arr[bx] : philox_offset;
+  // When using per-request seeds, subsequence should be 0 since bx is already incorporated via
+  // seed_arr[bx] When using scalar seed, use bx as subsequence to differentiate between blocks
+  uint64_t subsequence = (seed_arr != nullptr) ? 0 : bx;
 
   curandStatePhilox4_32_10_t state;
-  curand_init(seed, bx, offset, &state);
+  curand_init(seed, subsequence, offset, &state);
   const uint32_t row_idx = indices == nullptr ? bx : indices[bx];
 
   extern __shared__ __align__(
@@ -1163,9 +1177,12 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs, IdType* top_k_arr, 
   // Use per-request seed/offset if arrays provided, otherwise use scalar values
   uint64_t seed = (seed_arr != nullptr) ? seed_arr[bx] : philox_seed;
   uint64_t offset = (offset_arr != nullptr) ? offset_arr[bx] : philox_offset;
+  // When using per-request seeds, subsequence should be 0 since bx is already incorporated via
+  // seed_arr[bx] When using scalar seed, use bx as subsequence to differentiate between blocks
+  uint64_t subsequence = (seed_arr != nullptr) ? 0 : bx;
 
   curandStatePhilox4_32_10_t state;
-  curand_init(seed, bx, offset, &state);
+  curand_init(seed, subsequence, offset, &state);
   const uint32_t row_idx = indices == nullptr ? bx : indices[bx];
   const uint32_t k = top_k_arr == nullptr ? top_k_val : top_k_arr[row_idx];
   const float p = top_p_arr == nullptr ? top_p_val : top_p_arr[row_idx];
@@ -1276,6 +1293,7 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs, IdType* top_k_arr, 
     // Atomically update offset if using per-request generators
     // TopKTopP sampling calls curand_uniform once per round (variable count)
     // We increment by round * 4 since each call consumes 4 values
+    // Note: All threads converge to same round count due to __syncthreads() in loop
     if (offset_arr != nullptr) {
       atomicAdd(&offset_arr[bx], static_cast<uint64_t>(round * 4));
     }
