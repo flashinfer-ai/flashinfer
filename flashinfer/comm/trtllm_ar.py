@@ -615,40 +615,49 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
         # todo(review): confirm we need this alignment
         # all sizes should be aligned to 1LU << 21 bytes (2MB)
         aligned_size = round_up(size, 1 << 21)
-
-        if not use_symm_dev_mem:
-            #ipc_handles.append(create_shared_buffer(aligned_size, group))
-            ptrs, tensor, handle = _alloc_symm_buffer_bytes(
-                aligned_size,
-                tp_size,
-                dtype,
-                device,
-                group_name,
-            )
-            symm_refs.append((tensor, handle))
-            ipc_handles.append(ptrs)
-        else:
-            # symm_mem = SymmDeviceMemory(
-            #     aligned_size,
-            #     tp_size,
-            #     tp_rank,
-            #     torch.device("cuda", tp_rank).index,
-            #     comm_backend,
-            #     enable_multicast=False,
-            #     allocate_signal_pads=False,
-            # )
-            # ipc_handles.append(symm_mem.uc_ptrs)
-            # mem_handles.append(symm_mem)
-            ptrs, tensor, handle = _alloc_symm_buffer_bytes(
-                aligned_size,
-                tp_size,
-                dtype,
-                device,
-                group_name,
-            )
-            symm_refs.append((tensor, handle))
-            ipc_handles.append(ptrs)
-            mem_handles.append(handle)
+        # if not use_symm_dev_mem:
+        #     #ipc_handles.append(create_shared_buffer(aligned_size, group))
+        #     ptrs, tensor, handle = _alloc_symm_buffer_bytes(
+        #         aligned_size,
+        #         tp_size,
+        #         dtype,
+        #         device,
+        #         group_name,
+        #     )
+        #     symm_refs.append((tensor, handle))
+        #     ipc_handles.append(ptrs)
+        # else:
+        #     # symm_mem = SymmDeviceMemory(
+        #     #     aligned_size,
+        #     #     tp_size,
+        #     #     tp_rank,
+        #     #     torch.device("cuda", tp_rank).index,
+        #     #     comm_backend,
+        #     #     enable_multicast=False,
+        #     #     allocate_signal_pads=False,
+        #     # )
+        #     # ipc_handles.append(symm_mem.uc_ptrs)
+        #     # mem_handles.append(symm_mem)
+        #     ptrs, tensor, handle = _alloc_symm_buffer_bytes(
+        #         aligned_size,
+        #         tp_size,
+        #         dtype,
+        #         device,
+        #         group_name,
+        #     )
+        #     symm_refs.append((tensor, handle))
+        #     ipc_handles.append(ptrs)
+        #     mem_handles.append(handle)
+        ptrs, tensor, handle = _alloc_symm_buffer_bytes(
+            aligned_size,
+            tp_size,
+            dtype,
+            device,
+            group_name,
+        )
+        symm_refs.append((tensor, handle))
+        ipc_handles.append(ptrs)
+        mem_handles.append(handle)
 
     print(
         f"rank {tp_rank} allocated ipc_handles: {[[hex(handle) for handle in sublist] for sublist in ipc_handles]}"
