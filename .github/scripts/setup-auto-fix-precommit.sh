@@ -12,14 +12,12 @@ mkdir -p .git/hooks
 # Create the pre-commit hook
 cat > .git/hooks/pre-commit << 'EOF'
 #!/bin/bash
+set -e
 # Auto-fixing pre-commit hook for Claude Code
 # Runs pre-commit and automatically adds any fixes it makes
 
-# Store the list of staged files before pre-commit runs
-STAGED_FILES=$(git diff --cached --name-only --diff-filter=ACM)
-
 # Run pre-commit on staged files
-if ! pre-commit run --files $STAGED_FILES 2>&1; then
+if ! pre-commit run 2>&1; then
     # Pre-commit failed, which could mean:
     # 1. It auto-fixed files (e.g., formatting)
     # 2. There are errors that can't be auto-fixed
