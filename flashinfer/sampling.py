@@ -42,7 +42,9 @@ def get_seed_and_offset(
     seed, offset = state.view(torch.int64)
     offset += (increment + 3) // 4 * 4
     generator.set_state(
-        torch.tensor([seed, offset], dtype=torch.int64).view(torch.uint8)
+        torch.tensor(
+            [seed, offset], dtype=torch.int64, device=torch.device("cpu")
+        ).view(torch.uint8)
     )
     return int(seed), int(offset)
 
@@ -182,18 +184,28 @@ def get_sampling_module():
             seed_arr, offset_arr = generator
             _validate_per_request_generator(seed_arr, offset_arr, batch_size)
             module.sampling_from_probs(
-                probs, samples, indices, deterministic,
-                0, 0,  # scalar seed/offset (ignored when arrays provided)
-                seed_arr, offset_arr
+                probs,
+                samples,
+                indices,
+                deterministic,
+                0,
+                0,  # scalar seed/offset (ignored when arrays provided)
+                seed_arr,
+                offset_arr,
             )
         else:
             # Traditional single generator path
             if seed is None or offset is None:
                 seed, offset = get_seed_and_offset(batch_size, generator, device)
             module.sampling_from_probs(
-                probs, samples, indices, deterministic,
-                seed, offset,
-                None, None  # no per-request generators
+                probs,
+                samples,
+                indices,
+                deterministic,
+                seed,
+                offset,
+                None,
+                None,  # no per-request generators
             )
         return samples
 
@@ -237,18 +249,32 @@ def get_sampling_module():
             seed_arr, offset_arr = generator
             _validate_per_request_generator(seed_arr, offset_arr, batch_size)
             module.top_p_sampling_from_probs(
-                probs, samples, indices, maybe_top_p_arr, top_p_val, deterministic,
-                0, 0,  # scalar seed/offset (ignored when arrays provided)
-                seed_arr, offset_arr
+                probs,
+                samples,
+                indices,
+                maybe_top_p_arr,
+                top_p_val,
+                deterministic,
+                0,
+                0,  # scalar seed/offset (ignored when arrays provided)
+                seed_arr,
+                offset_arr,
             )
         else:
             # Traditional single generator path
             if seed is None or offset is None:
                 seed, offset = get_seed_and_offset(batch_size * 32, generator, device)
             module.top_p_sampling_from_probs(
-                probs, samples, indices, maybe_top_p_arr, top_p_val, deterministic,
-                seed, offset,
-                None, None  # no per-request generators
+                probs,
+                samples,
+                indices,
+                maybe_top_p_arr,
+                top_p_val,
+                deterministic,
+                seed,
+                offset,
+                None,
+                None,  # no per-request generators
             )
         return samples
 
@@ -291,18 +317,32 @@ def get_sampling_module():
             seed_arr, offset_arr = generator
             _validate_per_request_generator(seed_arr, offset_arr, batch_size)
             module.top_k_sampling_from_probs(
-                probs, samples, indices, maybe_top_k_arr, top_k_val, deterministic,
-                0, 0,  # scalar seed/offset (ignored when arrays provided)
-                seed_arr, offset_arr
+                probs,
+                samples,
+                indices,
+                maybe_top_k_arr,
+                top_k_val,
+                deterministic,
+                0,
+                0,  # scalar seed/offset (ignored when arrays provided)
+                seed_arr,
+                offset_arr,
             )
         else:
             # Traditional single generator path
             if seed is None or offset is None:
                 seed, offset = get_seed_and_offset(batch_size * 32, generator, device)
             module.top_k_sampling_from_probs(
-                probs, samples, indices, maybe_top_k_arr, top_k_val, deterministic,
-                seed, offset,
-                None, None  # no per-request generators
+                probs,
+                samples,
+                indices,
+                maybe_top_k_arr,
+                top_k_val,
+                deterministic,
+                seed,
+                offset,
+                None,
+                None,  # no per-request generators
             )
         return samples
 
@@ -347,18 +387,32 @@ def get_sampling_module():
             seed_arr, offset_arr = generator
             _validate_per_request_generator(seed_arr, offset_arr, batch_size)
             module.min_p_sampling_from_probs(
-                probs, samples, indices, maybe_min_p_arr, min_p_val, deterministic,
-                0, 0,  # scalar seed/offset (ignored when arrays provided)
-                seed_arr, offset_arr
+                probs,
+                samples,
+                indices,
+                maybe_min_p_arr,
+                min_p_val,
+                deterministic,
+                0,
+                0,  # scalar seed/offset (ignored when arrays provided)
+                seed_arr,
+                offset_arr,
             )
         else:
             # Traditional single generator path
             if seed is None or offset is None:
                 seed, offset = get_seed_and_offset(batch_size, generator, device)
             module.min_p_sampling_from_probs(
-                probs, samples, indices, maybe_min_p_arr, min_p_val, deterministic,
-                seed, offset,
-                None, None  # no per-request generators
+                probs,
+                samples,
+                indices,
+                maybe_min_p_arr,
+                min_p_val,
+                deterministic,
+                seed,
+                offset,
+                None,
+                None,  # no per-request generators
             )
         return samples
 
@@ -392,20 +446,36 @@ def get_sampling_module():
             seed_arr, offset_arr = generator
             _validate_per_request_generator(seed_arr, offset_arr, batch_size)
             module.top_k_top_p_sampling_from_probs(
-                probs, samples, indices, maybe_top_k_arr, top_k_val,
-                maybe_top_p_arr, top_p_val, deterministic,
-                0, 0,  # scalar seed/offset (ignored when arrays provided)
-                seed_arr, offset_arr
+                probs,
+                samples,
+                indices,
+                maybe_top_k_arr,
+                top_k_val,
+                maybe_top_p_arr,
+                top_p_val,
+                deterministic,
+                0,
+                0,  # scalar seed/offset (ignored when arrays provided)
+                seed_arr,
+                offset_arr,
             )
         else:
             # Traditional single generator path
             if seed is None or offset is None:
                 seed, offset = get_seed_and_offset(batch_size * 32, generator, device)
             module.top_k_top_p_sampling_from_probs(
-                probs, samples, indices, maybe_top_k_arr, top_k_val,
-                maybe_top_p_arr, top_p_val, deterministic,
-                seed, offset,
-                None, None  # no per-request generators
+                probs,
+                samples,
+                indices,
+                maybe_top_k_arr,
+                top_k_val,
+                maybe_top_p_arr,
+                top_p_val,
+                deterministic,
+                seed,
+                offset,
+                None,
+                None,  # no per-request generators
             )
         return samples
 
@@ -737,7 +807,9 @@ def sampling_from_probs(
     probs: torch.Tensor,
     indices: Optional[torch.Tensor] = None,
     deterministic: bool = True,
-    generator: Optional[Union[torch.Generator, Tuple[torch.Tensor, torch.Tensor]]] = None,
+    generator: Optional[
+        Union[torch.Generator, Tuple[torch.Tensor, torch.Tensor]]
+    ] = None,
     check_nan: bool = False,
     seed: Optional[int] = None,
     offset: Optional[int] = None,
@@ -815,7 +887,9 @@ def top_p_sampling_from_probs(
     top_p: Union[torch.Tensor, float],
     indices: Optional[torch.Tensor] = None,
     deterministic: bool = True,
-    generator: Optional[Union[torch.Generator, Tuple[torch.Tensor, torch.Tensor]]] = None,
+    generator: Optional[
+        Union[torch.Generator, Tuple[torch.Tensor, torch.Tensor]]
+    ] = None,
     check_nan: bool = False,
     seed: Optional[int] = None,
     offset: Optional[int] = None,
@@ -916,7 +990,9 @@ def top_k_sampling_from_probs(
     top_k: Union[torch.Tensor, int],
     indices: Optional[torch.Tensor] = None,
     deterministic: bool = True,
-    generator: Optional[Union[torch.Generator, Tuple[torch.Tensor, torch.Tensor]]] = None,
+    generator: Optional[
+        Union[torch.Generator, Tuple[torch.Tensor, torch.Tensor]]
+    ] = None,
     check_nan: bool = False,
     seed: Optional[int] = None,
     offset: Optional[int] = None,
@@ -1017,7 +1093,9 @@ def min_p_sampling_from_probs(
     min_p: Union[torch.Tensor, float],
     indices: Optional[torch.Tensor] = None,
     deterministic: bool = True,
-    generator: Optional[Union[torch.Generator, Tuple[torch.Tensor, torch.Tensor]]] = None,
+    generator: Optional[
+        Union[torch.Generator, Tuple[torch.Tensor, torch.Tensor]]
+    ] = None,
     check_nan: bool = False,
     seed: Optional[int] = None,
     offset: Optional[int] = None,
@@ -1116,7 +1194,9 @@ def top_k_top_p_sampling_from_logits(
     indices: Optional[torch.Tensor] = None,
     filter_apply_order: str = "top_k_first",
     deterministic: bool = True,
-    generator: Optional[Union[torch.Generator, Tuple[torch.Tensor, torch.Tensor]]] = None,
+    generator: Optional[
+        Union[torch.Generator, Tuple[torch.Tensor, torch.Tensor]]
+    ] = None,
     check_nan: bool = False,
     seed: Optional[int] = None,
     offset: Optional[int] = None,
@@ -1253,7 +1333,9 @@ def top_k_top_p_sampling_from_probs(
     indices: Optional[torch.Tensor] = None,
     filter_apply_order: str = "top_k_first",
     deterministic: bool = True,
-    generator: Optional[Union[torch.Generator, Tuple[torch.Tensor, torch.Tensor]]] = None,
+    generator: Optional[
+        Union[torch.Generator, Tuple[torch.Tensor, torch.Tensor]]
+    ] = None,
     check_nan: bool = False,
     seed: Optional[int] = None,
     offset: Optional[int] = None,

@@ -13,7 +13,9 @@ from flashinfer.fused_moe import (
     trtllm_fp8_per_tensor_scale_moe,
     cutlass_fused_moe,
     convert_to_block_layout,
+    fused_topk_deepseek,
 )
+from flashinfer.fused_moe.core import RoutingMethodType
 from flashinfer import fp4_quantize, shuffle_matrix_a
 from flashinfer.testing.utils import (
     bench_gpu_time,
@@ -316,7 +318,10 @@ def create_trtllm_moe_test_data(
     # Create routing bias if needed - always bfloat16
     routing_bias = None
     if use_routing_bias:
-        routing_bias = torch.randn(num_experts, device=device, dtype=torch.bfloat16)
+        # Use uniform routing bias for less skewed expert distribution
+        routing_bias = (
+            torch.ones(num_experts, device=device, dtype=torch.bfloat16) * 0.1
+        )
 
     # Create hidden states - always start with bfloat16 for proper quantization
     hidden_states = 2 * torch.randn(
@@ -430,21 +435,24 @@ def calculate_moe_bandwidth(
     weight_format: Optional[str] = None,
     routing_logits_dtype: Optional[torch.dtype] = torch.float32,
     active_experts: Optional[int] = None,
+    verbose: int = 0,
 ) -> float:
     """
     Calculate memory bandwidth for MOE operation in TB/sec.
 
     Args:
-        input_format: Override for input representation ("fp8" or "fp4"); None uses dtype.itemsize
-        weight_format: Override for weight representation ("fp8" or "fp4"); None uses dtype.itemsize
+        input_format: Override for input representation; None uses dtype.itemsize
+        weight_format: Override for weight representation; None uses dtype.itemsize
         routing_logits_dtype: Dtype for routing logits memory accounting (default float32)
     """
 
     # Get effective byte sizes
     def get_effective_bytes(dtype: torch.dtype, fmt: Optional[str]) -> float:
-        if fmt == "fp4":
-            return 0.5
-        if fmt == "fp8":
+        if fmt == "nvfp4":
+            return 0.5 + 1 / 16
+        elif fmt == "mxfp4":
+            return 0.5 + 1 / 32
+        elif fmt == "fp8":
             return 1.0
         return dtype.itemsize
 
@@ -472,6 +480,9 @@ def calculate_moe_bandwidth(
         num_active_experts = active_experts
     else:
         num_active_experts = min(num_experts, top_k * num_tokens)
+    if verbose >= 2:
+        print(f"[VVERBOSE] num_active_experts = {num_active_experts}")
+
     weight_bytes = num_active_experts * weight_bytes_per_expert
 
     # Output memory (typically full precision)
@@ -488,6 +499,68 @@ def _compute_routing(router_logits: torch.Tensor, top_k: int):
     routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
     routing_weights = routing_weights.float()
     return routing_weights, selected_experts
+
+
+def _compute_routing_for_method(
+    routing_logits: torch.Tensor,
+    routing_bias: Optional[torch.Tensor],
+    top_k: int,
+    routing_method_type: int,
+    n_group: Optional[int] = None,
+    topk_group: Optional[int] = None,
+    routed_scaling_factor: Optional[float] = None,
+) -> torch.Tensor:
+    """
+    Compute selected experts based on routing method type.
+    Returns only the selected expert indices tensor.
+
+    Args:
+        routing_logits: [num_tokens, num_experts] routing scores
+        routing_bias: Optional [num_experts] routing bias
+        top_k: Number of experts to select per token
+        routing_method_type: Type of routing method (see RoutingMethodType enum)
+        n_group: Number of expert groups (for DeepSeekV3)
+        topk_group: Number of top groups (for DeepSeekV3)
+        routed_scaling_factor: Scaling factor (for DeepSeekV3)
+
+    Returns:
+        selected_experts: [num_tokens, top_k] tensor of selected expert indices
+    """
+    num_tokens = routing_logits.shape[0]
+    device = routing_logits.device
+
+    if routing_method_type == RoutingMethodType.DeepSeekV3:
+        # Use fused_topk_deepseek for accurate DeepSeekV3 routing
+        if n_group is None or topk_group is None or routed_scaling_factor is None:
+            raise ValueError(
+                "DeepSeekV3 routing requires n_group, topk_group, and routed_scaling_factor"
+            )
+        if routing_bias is None:
+            routing_bias = torch.zeros(
+                routing_logits.shape[1], device=device, dtype=routing_logits.dtype
+            )
+
+        # Allocate output tensors
+        topk_values = torch.empty(num_tokens, top_k, device=device, dtype=torch.float32)
+        topk_indices = torch.empty(num_tokens, top_k, device=device, dtype=torch.int32)
+
+        fused_topk_deepseek(
+            scores=routing_logits.float(),
+            bias=routing_bias.float(),
+            n_group=n_group,
+            topk_group=topk_group,
+            topk=top_k,
+            routed_scaling_factor=routed_scaling_factor,
+            topk_values=topk_values,
+            topk_indices=topk_indices,
+        )
+        return topk_indices
+    else:
+        # For other routing methods, use simple top-k as approximation
+        # This is accurate for Default, Renormalize, RenormalizeNaive, TopK
+        # and approximate for Llama4
+        _, selected_experts = _compute_routing(routing_logits.float(), top_k)
+        return selected_experts
 
 
 def _dynamic_per_tensor_fp8_quant(x: torch.Tensor):
@@ -586,6 +659,18 @@ def testTrtllmFp4BlockScaleMoe(args):
             device,
             moe_kernel_type="fp4_block_scale",
         )
+    )
+
+    # Compute selected experts for accurate bandwidth calculation
+    # Use the actual routing method to get correct expert assignments
+    selected_experts = _compute_routing_for_method(
+        routing_logits=routing_logits,
+        routing_bias=routing_bias,
+        top_k=top_k,
+        routing_method_type=routing_method_type,
+        n_group=n_group,
+        topk_group=topk_group,
+        routed_scaling_factor=routed_scaling_factor,
     )
 
     # For FP4, we need to properly quantize weights and create scales
@@ -781,9 +866,11 @@ def testTrtllmFp4BlockScaleMoe(args):
         median_time,
         input_dtype,
         weight_dtype,
-        input_format="fp4",
-        weight_format="fp4",
+        input_format="nvfp4",
+        weight_format="nvfp4",
         routing_logits_dtype=routing_logits.dtype,
+        active_experts=int(selected_experts.unique().numel()),
+        verbose=args.verbose,
     )
 
     print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
@@ -1142,20 +1229,11 @@ def testCutlassFusedMoe(args):
         median_time,
         input_dtype,
         input_dtype,
-        input_format=(
-            "fp8"
-            if variant == "fp8"
-            else (
-                "fp4"
-                if (variant == "nvfp4" and getattr(args, "quantized_input", False))
-                else None
-            )
-        ),
-        weight_format=(
-            "fp8" if variant == "fp8" else ("fp4" if variant == "nvfp4" else None)
-        ),
+        input_format=variant,
+        weight_format=variant,
         routing_logits_dtype=router_logits.dtype,
         active_experts=int(selected_experts.unique().numel()),
+        verbose=args.verbose,
     )
 
     print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
@@ -1276,6 +1354,18 @@ def testTrtllmFp8BlockScaleMoe(args):
             device,
             moe_kernel_type="fp8_block_scale",
         )
+    )
+
+    # Compute selected experts for accurate bandwidth calculation
+    # Use the actual routing method to get correct expert assignments
+    selected_experts = _compute_routing_for_method(
+        routing_logits=routing_logits,
+        routing_bias=routing_bias,
+        top_k=top_k,
+        routing_method_type=routing_method_type,
+        n_group=n_group,
+        topk_group=topk_group,
+        routed_scaling_factor=routed_scaling_factor,
     )
 
     # For FP8 block scale, create quantized weights and block scales
@@ -1412,6 +1502,8 @@ def testTrtllmFp8BlockScaleMoe(args):
         input_format="fp8",
         weight_format="fp8",
         routing_logits_dtype=routing_logits.dtype,
+        active_experts=int(selected_experts.unique().numel()),
+        verbose=args.verbose,
     )
 
     backend = "trtllm"
@@ -1533,6 +1625,18 @@ def testTrtllmFp8PerTensorScaleMoe(args):
         )
     )
 
+    # Compute selected experts for accurate bandwidth calculation
+    # Use the actual routing method to get correct expert assignments
+    selected_experts = _compute_routing_for_method(
+        routing_logits=routing_logits,
+        routing_bias=routing_bias,
+        top_k=top_k,
+        routing_method_type=routing_method_type,
+        n_group=n_group,
+        topk_group=topk_group,
+        routed_scaling_factor=routed_scaling_factor,
+    )
+
     # For FP8 per-tensor scale, create quantized weights and per-tensor scales
     # Quantize to FP8
     gemm1_weights_fp8 = gemm1_weights.to(torch.float8_e4m3fn)
@@ -1630,6 +1734,8 @@ def testTrtllmFp8PerTensorScaleMoe(args):
         input_format="fp8",
         weight_format="fp8",
         routing_logits_dtype=routing_logits.dtype,
+        active_experts=int(selected_experts.unique().numel()),
+        verbose=args.verbose,
     )
 
     backend = "trtllm"

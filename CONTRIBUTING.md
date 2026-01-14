@@ -43,4 +43,8 @@ When incrementing a version and creating a release, follow a "right-shifted" ver
 * _patch_ increment signals small backwards-compatible features (e.g. new kernels, new SM support, etc) and backwards-compatible bug fixes
 * _post1_ is an optional suffix for a quick follow up release with just backwards-compatible bug fixes
 
+Like the vLLM scheme, this versioning scheme is similar to [SemVer](https://semver.org/) for compatibility purposes, except that backwards compatibility is only guaranteed for a limited number of minor releases (see the [vLLM deprecation policy](https://docs.vllm.ai/en/latest/contributing/deprecation_policy) for details).
+
+To reduce disruption during deprecation and removal, we prefer "keyword only" (after an `*`, see [PEP-3102](https://peps.python.org/pep-3102/)) for parameters that are likely to come and go (e.g. perf parameters).
+
 [^1]: We have not followed this strictly through v0.4.0. But after v0.4.0, the versioning should follow this "right-shifted" versioning scheme.

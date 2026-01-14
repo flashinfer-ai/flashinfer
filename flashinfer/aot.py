@@ -63,6 +63,10 @@ from .jit.gemm import (
 )
 from .jit.spdlog import gen_spdlog_module
 from .jit.mla import gen_mla_module
+from .jit.mamba import (
+    gen_selective_state_update_module,
+    gen_selective_state_update_sm90_module,
+)
 from .jit.norm import gen_norm_module
 from .jit.page import gen_page_module
 from .jit.quantization import gen_quantization_module
@@ -533,8 +537,10 @@ def gen_all_modules(
             gen_rope_module(),
             gen_sampling_module(),
             gen_topk_module(),
+            gen_selective_state_update_module(),
         ]
         if has_sm90:
+            jit_specs.append(gen_selective_state_update_sm90_module())
             jit_specs.append(gen_trtllm_utils_module())
             jit_specs.append(gen_gdn_prefill_sm90_module())
 
