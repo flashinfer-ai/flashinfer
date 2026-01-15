@@ -211,9 +211,9 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         # self.uc_ptr_local = self.mcast_buffer_handle.get_unicast_ptr(self.rank)
         # self.mc_ptr = self.mcast_buffer_handle.get_multicast_ptr()
 
-        self.uc_ptrs_dev = self.handle.get_buffer_ptrs_dev()
-        self.uc_ptr_local = self.handle.get_buffer_ptrs()[self.rank]
-        self.mc_ptr = self.handle.get_multicast_ptr()
+        self.uc_ptrs_dev = self.handle.buffer_ptrs_dev
+        self.uc_ptr_local = self.handle.buffer_ptrs[self.rank]
+        self.mc_ptr = self.handle.multicast_ptr
 
     @functools.cache
     def is_buffer_size_sufficient(
