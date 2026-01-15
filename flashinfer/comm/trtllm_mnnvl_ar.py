@@ -158,7 +158,7 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         # Get the actual usable buffer size after allocation (buf_size is updated by McastGPUBuffer)
         #TODO(asamani): do we need this?
         #allocated_size = self.mcast_buffer_handle.buf_size
-        allocated_size = self.handle.buffer_size-self.handle.get_signal_pad_size
+        allocated_size = self.handle.buffer_size-self.handle.signal_pad_size
         # We want the buffer size to be aligned to 16B which is the granularity for buffer management.
         self.buffer_size_bytes = (
             math.floor(allocated_size / self.NUM_LAMPORT_BUFFERS) // 16 * 16
@@ -176,6 +176,7 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         neg_zero = 0x80000000
         dsize = 4
         num_elements = (allocated_size) // dsize
+        #TODO (asamani): should I use handle.memset32?
         checkCudaErrors(
             cuda.cuMemsetD32(int(self.ptrs[mapping.tp_rank]), neg_zero, num_elements)
         )
