@@ -227,6 +227,12 @@ class Moe(ABC):
     def __init__(self):
         self.name = self.__class__.__name__
 
+    @property
+    @abstractmethod
+    def quant_mode(self) -> QuantMode:
+        """Get the quantization mode of this MoE implementation."""
+        pass
+
     @abstractmethod
     def quantize_weights(self, gemm1_weights, gemm2_weights, hidden_states_sample):
         """Quantize static weights and compute global scale factors (done offline)."""
@@ -305,12 +311,16 @@ class FP4Moe(Moe):
 
     def __init__(self, quant_mode: QuantMode):
         super().__init__()
-        self.quant_mode = quant_mode
+        self._quant_mode = quant_mode
         self.is_mxfp4 = (
             quant_mode == QuantMode.FP4_MXFP4_MXFP8
             or quant_mode == QuantMode.FP4_MXFP4_Bf16
         )
         self.sf_vec_size = 32 if self.is_mxfp4 else 16
+
+    @property
+    def quant_mode(self) -> QuantMode:
+        return self._quant_mode
 
     def quantize_weights(self, gemm1_weights, gemm2_weights, hidden_states_sample):
         """Quantize weights to FP4 format and compute global scale factors."""
@@ -622,6 +632,10 @@ def mxint4_quantize(
 class MxInt4BlockScaleMoe(Moe):
     """MxInt4 MoE implementation with block scaling (DeepSeek style)."""
 
+    @property
+    def quant_mode(self) -> QuantMode:
+        return QuantMode.MXINT4_BF16_BF16
+
     def quantize_weights(self, gemm1_weights, gemm2_weights, hidden_states_sample):
         """Quantize weights to MxInt4 with block scaling."""
         num_experts = gemm1_weights.shape[0]
@@ -815,6 +829,10 @@ class MxInt4BlockScaleMoe(Moe):
 
 class FP8BlockScaleMoe(Moe):
     """FP8 MoE implementation with block scaling (DeepSeek style)."""
+
+    @property
+    def quant_mode(self) -> QuantMode:
+        return QuantMode.FP8_BLOCK_SCALE
 
     def quantize_weights(self, gemm1_weights, gemm2_weights, hidden_states_sample):
         """Quantize weights to FP8 with block scaling."""
@@ -1037,6 +1055,10 @@ class FP8BlockScaleMoe(Moe):
 class FP8PerTensorMoe(Moe):
     """FP8 MoE implementation with per-tensor scaling (Llama4 style)."""
 
+    @property
+    def quant_mode(self) -> QuantMode:
+        return QuantMode.FP8_PER_TENSOR
+
     def quantize_weights(self, gemm1_weights, gemm2_weights, hidden_states_sample):
         """Quantize weights to FP8 per-tensor and compute global scale factors."""
         # Compute global scale factor for hidden states (offline calibration)
@@ -1226,6 +1248,10 @@ class FP8PerTensorMoe(Moe):
 
 class BF16Moe(Moe):
     """BF16 MoE implementation."""
+
+    @property
+    def quant_mode(self) -> QuantMode:
+        return QuantMode.BF16
 
     def quantize_weights(self, gemm1_weights, gemm2_weights, hidden_states_sample):
         """No scaling for weights."""
@@ -2878,6 +2904,7 @@ def test_topk_routing(
     "moe_impl",
     [
         pytest.param(FP8PerTensorMoe(), id="FP8_Tensor"),
+        pytest.param(FP4Moe(QuantMode.FP4_NVFP4_NVFP4), id="FP4"),
     ],
 )
 @pytest.mark.parametrize(
@@ -2893,7 +2920,7 @@ def test_topk_routing(
                 "routed_scaling": 2.5,
                 "has_routing_bias": True,
                 "routing_method_type": RoutingMethodType.Llama4,
-                "compatible_moe_impls": [FP8PerTensorMoe],
+                "compatible_moe_impls": [FP8PerTensorMoe, FP4Moe],
                 "compatible_intermediate_size": [1024, 2048],
                 "enable_autotune": True,
             },
