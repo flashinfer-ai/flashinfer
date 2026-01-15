@@ -143,8 +143,6 @@ benchmark_apis = {
     ],
     "moe_comm": [
         "moe_a2a_dispatch_combine",
-        "moe_a2a_dispatch",
-        "moe_a2a_combine",
     ],
     "norm": [
         "rmsnorm",

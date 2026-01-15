@@ -44,14 +44,25 @@ Launch examples:
         --num_tokens 1024 --hidden_size 7168 --num_experts 256 --top_k 8 \
         --validate
 
+    # With per-phase timing (less accurate but shows dispatch and combine times separately)
+    mpirun -np 8 python benchmarks/flashinfer_benchmark.py \
+        --routine moe_a2a_dispatch_combine \
+        --num_tokens 1024 --hidden_size 7168 --num_experts 256 --top_k 8 \
+        --per_phase_timing
+
 Options:
     --quant_dtype fp8    : FP8 (float8_e4m3fn) with float32 per-tensor scale
     --quant_dtype nvfp4  : NVFP4 (4-bit) with float8_e4m3fn block scales
-    --validate            : Run correctness validation before benchmarking.
-                            Uses a deterministic fake MoE to verify round-trip
-                            communication. For non-quantized mode, performs exact
-                            comparison. For quantized mode, validates output
-                            shape and numerical validity.
+    --validate           : Run correctness validation before benchmarking.
+                           Uses a deterministic fake MoE to verify round-trip
+                           communication. For non-quantized mode, performs exact
+                           comparison. For quantized mode, validates output
+                           shape and numerical validity.
+    --per_phase_timing   : Enable per-phase timing (dispatch/combine). Adds slight
+                           overhead from CUDA events.
+                           This is less accurate than the total timing but shows
+                           dispatch and combine times separately.
+    --nvtx               : Enable NVTX markers for Nsight Systems profiling.
 """
 
 from collections import defaultdict
@@ -207,7 +218,7 @@ def parse_moe_comm_args(line, parser):
         required=False,
         default=None,
         choices=["fp8", "nvfp4"],
-        help="Quantization format for hidden states. If set, hidden states are quantized and scaling factors are communicated. nvfp4: scale_dtype=float8_e4m3fn; fp8: scale_dtype=float32.",
+        help="Quantization format for hidden states. If set, hidden states are quantized and block-scale scale factors are communicated.",
     )
     parser.add_argument(
         "--max_num_tokens",
@@ -282,16 +293,22 @@ def _calculate_fp4_global_scale(tensor: torch.Tensor) -> torch.Tensor:
 
 def _quantize_to_fp8(
     hidden_states: torch.Tensor,
+    scale: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize hidden states to FP8 (per-tensor scale).
+
+    Args:
+        hidden_states: Input tensor to quantize
+        scale: Optional pre-computed scale. If None, computed from hidden_states.
 
     Returns:
         Tuple of (quantized_hidden_states, scale_factor)
     """
     fp8_max = torch.finfo(torch.float8_e4m3fn).max
-    amax = hidden_states.abs().max().float().clamp(min=1e-6)
-    scale = amax / fp8_max
+    if scale is None:
+        amax = hidden_states.abs().max().float().clamp(min=1e-6)
+        scale = amax / fp8_max
     inv_scale = 1.0 / scale if scale != 0.0 else 0.0
     quantized = (
         (hidden_states.float() * inv_scale)
@@ -301,11 +318,35 @@ def _quantize_to_fp8(
     return quantized, scale.view(1)
 
 
+def _dequantize_fp8_to_dtype(
+    tensor_fp8: torch.Tensor,
+    scale: torch.Tensor,
+    dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """
+    Dequantize FP8 tensor back to high precision.
+
+    Args:
+        tensor_fp8: FP8 quantized tensor (float8_e4m3fn)
+        scale: Per-tensor scale factor
+        dtype: Output dtype
+
+    Returns:
+        Dequantized tensor in specified dtype
+    """
+    return (tensor_fp8.float() * scale.float()).to(dtype)
+
+
 def _quantize_to_nvfp4(
     hidden_states: torch.Tensor,
+    global_scale: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Quantize hidden states to NVFP4 (block scale).
+
+    Args:
+        hidden_states: Input tensor to quantize
+        global_scale: Optional pre-computed global scale. If None, computed from hidden_states.
 
     Returns:
         Tuple of (quantized_hidden_states, block_scale_factors, global_scale_factor)
@@ -313,7 +354,8 @@ def _quantize_to_nvfp4(
         - block_scale_factors: float8_e4m3fn tensor, shape [num_tokens, hidden_size // 16]
         - global_scale_factor: float32 scalar
     """
-    global_sf = _calculate_fp4_global_scale(hidden_states)
+    if global_scale is None:
+        global_scale = _calculate_fp4_global_scale(hidden_states)
     sf_vec_size = 16
     use_ue8m0 = False
 
@@ -322,7 +364,7 @@ def _quantize_to_nvfp4(
 
     # Returns (quantized_data, block_scales)
     quantized, block_scales = fp4_quantize(
-        hidden_states, global_sf, sf_vec_size, use_ue8m0, is_sf_swizzled_layout
+        hidden_states, global_scale, sf_vec_size, use_ue8m0, is_sf_swizzled_layout
     )
 
     # Reshape quantized data: pack 2 FP4 values into 1 byte
@@ -334,7 +376,7 @@ def _quantize_to_nvfp4(
         num_tokens, hidden_size // sf_vec_size
     )
 
-    return quantized_packed, block_scales_reshaped, global_sf
+    return quantized_packed, block_scales_reshaped, global_scale
 
 
 # Copied/adapted from tests/moe/test_trtllm_cutlass_fused_moe.py
@@ -390,8 +432,15 @@ def _create_moe_inputs(
     input_dtype: torch.dtype,
     quant_dtype: Optional[str],
     device: torch.device,
+    comm: MPI.Comm,
 ) -> Tuple[
-    torch.Tensor, torch.Tensor, torch.Tensor, List[torch.Tensor], Optional[torch.Tensor]
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    List[torch.Tensor],
 ]:
     """
     Create input tensors for MoE A2A benchmark.
@@ -404,6 +453,7 @@ def _create_moe_inputs(
         input_dtype: Data type for hidden states (before quantization)
         quant_dtype: None, "fp8", or "nvfp4"
         device: CUDA device
+        comm: MPI communicator for syncing global scale
 
     Returns:
         Tuple of (hidden_states, hidden_states_original, token_selected_experts, token_final_scales, scale_factor, global_scale, input_payloads)
@@ -411,8 +461,8 @@ def _create_moe_inputs(
         - hidden_states_original: The original unquantized hidden states for validation purpose
         - token_selected_experts: Expert indices
         - token_final_scales: Routing weights
-        - scale_factor: Block scale factor tensor if quantized, None otherwise
-        - global_scale: Global scale factor tensor for NVFP4, None otherwise (scalar shape [1])
+        - scale_factor: Block scale factor tensor for NVFP4 (in A2A payloads), None otherwise
+        - global_scale: Global/per-tensor scale factor for quantized dtype (synced via MPI max, same across ranks), None otherwise
         - input_payloads: List of all payloads for dispatch
     """
     # Generate original hidden states in input_dtype
@@ -435,16 +485,32 @@ def _create_moe_inputs(
     )
 
     # Handle quantization
+    # Global scale is synced via MPI max reduction to mimic the fact that it is part of model ckpt
     scale_factor = None
     global_scale = None
     if quant_dtype == "nvfp4":
-        # NVFP4 quantization: uint8 packed + float8_e4m3fn block scales + float32 global scale
+        # Compute local global scale, sync via max, then quantize
+        local_global_scale = _calculate_fp4_global_scale(hidden_states_original)
+        synced_global_scale = comm.allreduce(
+            local_global_scale.cpu().item(), op=MPI.MAX
+        )
+        global_scale = torch.tensor(
+            synced_global_scale, dtype=torch.float32, device=device
+        )
         hidden_states, scale_factor, global_scale = _quantize_to_nvfp4(
-            hidden_states_original
+            hidden_states_original, global_scale
         )
     elif quant_dtype == "fp8":
-        # FP8 quantization: float8_e4m3fn + float32 per-tensor scale
-        hidden_states, scale_factor = _quantize_to_fp8(hidden_states_original)
+        # Compute local amax, sync via max, then quantize with synced scale
+        fp8_max = torch.finfo(torch.float8_e4m3fn).max
+        local_amax = hidden_states_original.abs().max().float().clamp(min=1e-6).item()
+        synced_amax = comm.allreduce(local_amax, op=MPI.MAX)
+        synced_scale = torch.tensor(
+            synced_amax / fp8_max, dtype=torch.float32, device=device
+        )
+        hidden_states, global_scale = _quantize_to_fp8(
+            hidden_states_original, synced_scale
+        )
     else:
         # No quantization
         hidden_states = hidden_states_original
@@ -501,9 +567,9 @@ def _calculate_comm_bandwidth(
         # Block scales: float8_e4m3fn, one per 16 elements
         scale_bytes = num_tokens * (hidden_size // 16) * 1  # float8_e4m3fn = 1 byte
     elif quant_dtype == "fp8":
-        # FP8: 1 byte per element + per-tensor scale
+        # FP8: 1 byte per element, no scale payload in A2A
         hidden_states_bytes = num_tokens * hidden_size * 1  # float8_e4m3fn = 1 byte
-        scale_bytes = 4  # float32 per-tensor scale
+        scale_bytes = 0
     else:
         # No quantization
         element_size = torch.tensor([], dtype=input_dtype).element_size()
@@ -635,7 +701,7 @@ def _validate_moe_a2a(
         hidden_size: Hidden dimension
         input_dtype: Data type for hidden states
         quant_dtype: Quantization format
-        global_scale: Global scale factor for NVFP4 (scalar), None otherwise
+        global_scale: Per-tensor scale factor for quantized dtype (e.g., fp8 or nvfp4), None otherwise
         num_experts: Total number of experts
         ep_size: Expert parallel size
         rank: Current rank
@@ -664,32 +730,33 @@ def _validate_moe_a2a(
             f"[VVERBOSE][VALIDATE][Rank {rank}] token_selected_experts shape: {token_selected_experts.shape} [num_tokens, top_k]:\n{token_selected_experts[:8, :]}"
         )
 
+    # Unpack recv_tensors
     recv_hidden = recv_tensors[0]
     recv_experts = recv_tensors[1]
     _ = recv_tensors[2]  # recv_token_final_scales
     recv_scale_factor = recv_tensors[3] if len(recv_tensors) > 3 else None
 
     # Note: For quantized dispatch, recv_tensors[0] is quantized.
+    # Per-tensor scale factor is part of model ckpts, not in A2A payloads.
     recv_hidden_dequant = torch.zeros(
         (ep_size, runtime_max_tokens_per_rank, hidden_size),
         dtype=input_dtype,
         device=recv_hidden.device,
     )
     if quant_dtype == "nvfp4":
-        # Get global scales from all ranks via MPI (scalar [1] per rank)
-        all_global_scales = comm.allgather(global_scale.cpu().numpy())
-        # Convert to tensor: [ep_size] array of scalars
-        all_global_scales_tensor = torch.tensor(
-            [gs.item() for gs in all_global_scales],
-            dtype=torch.float32,
-            device=recv_hidden.device,
-        )
         for i in range(recv_hidden.shape[0]):
             recv_hidden_dequant[i] = _dequantize_nvfp4_to_dtype(
                 recv_hidden[i],
                 recv_scale_factor[i],
-                all_global_scales_tensor[i],  # Use sender rank's global scale
+                global_scale,
                 block_size=16,
+                dtype=input_dtype,
+            )
+    elif quant_dtype == "fp8":
+        for i in range(recv_hidden.shape[0]):
+            recv_hidden_dequant[i] = _dequantize_fp8_to_dtype(
+                recv_hidden[i],
+                global_scale,
                 dtype=input_dtype,
             )
     else:
@@ -895,6 +962,7 @@ def test_moe_a2a_dispatch_combine(args):
         input_dtype,
         quant_dtype,
         device,
+        comm,
     )
 
     # Run validation if requested
@@ -925,7 +993,7 @@ def test_moe_a2a_dispatch_combine(args):
                 print("[ERROR] Validation failed. Aborting benchmark.")
             return res
 
-    # Storage for per-phase CUDA events (populated during benchmark)
+    # Storage for per-phase CUDA events to be populated later during benchmark
     # Deferred timing: collect events during iterations, compute times after single sync
     dispatch_events = []
     combine_events = []
@@ -974,8 +1042,7 @@ def test_moe_a2a_dispatch_combine(args):
     comm.Barrier()
     torch.cuda.synchronize()
 
-    # Use bench_gpu_time with cold L2 cache (buffer rotation)
-    # Note: use_cuda_graph=False because CUDA graphs don't support per-iteration event timing
+    # Use bench_gpu_time with cold L2 cache
     total_times = bench_gpu_time(
         fn=run_dispatch_combine,
         input_args=(token_selected_experts, *input_payloads),
@@ -983,6 +1050,7 @@ def test_moe_a2a_dispatch_combine(args):
         repeat_iters=args.num_iters,
         sleep_after_run=False,
         enable_cupti=args.use_cupti,
+        # Note: disable use_cuda_graph when per_phase_timing=True, which inserts CUDA events in the middle
         use_cuda_graph=(not args.no_cuda_graph and not enable_per_phase_timing),
         cold_l2_cache=True,
     )
@@ -1029,7 +1097,10 @@ def test_moe_a2a_dispatch_combine(args):
             phase="dispatch_combine",
         )
 
-        # Per-phase statistics (only if enabled)
+        # Per-phase statistics if enabled --per_phase_timing flag
+        median_time_dispatch, std_time_dispatch = np.nan, np.nan
+        median_time_combine, std_time_combine = np.nan, np.nan
+        tb_per_sec_dispatch, tb_per_sec_combine = np.nan, np.nan
         if enable_per_phase_timing:
             dispatch_per_iter_max = [
                 max(t[i] for t in all_dispatch_times) for i in range(num_measure_iters)
