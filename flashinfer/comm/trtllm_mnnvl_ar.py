@@ -21,7 +21,19 @@ from .mnnvl import McastGPUBuffer, CommBackend, MPIBackend
 from .workspace_base import AllReduceFusionWorkspace
 from .torch_symmetric_memory import _alloc_symm_buffer_bytes
 from ..cuda_utils import checkCudaErrors
-import cuda
+try:
+    # cuda-python >= 12.9 (has cuda.bindings.driver)
+    from cuda.bindings import driver as cuda
+except ImportError:
+    try:
+        # cuda-python < 12.9 (no cuda.bindings.driver, use cuda as driver)
+        # from cuda import cuda is not available in cuda-python >= 13.0
+        from cuda import cuda
+    except ImportError as e:
+        raise ImportError(
+            "Could not import the 'cuda' module. "
+            "Please install cuda-python that matches your CUDA version."
+        ) from e
 
 def mpi_barrier():
     from mpi4py import MPI
