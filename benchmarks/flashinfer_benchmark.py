@@ -9,6 +9,7 @@ from routines.flashinfer_benchmark_utils import (
 )
 from routines.gemm import parse_gemm_args, run_gemm_test
 from routines.moe import parse_moe_args, run_moe_test
+from routines.norm import parse_norm_args, run_norm_test
 
 
 def run_test(args):
@@ -26,6 +27,8 @@ def run_test(args):
         res = run_gemm_test(args)
     elif args.routine in benchmark_apis["moe"]:
         res = run_moe_test(args)
+    elif args.routine in benchmark_apis["norm"]:
+        res = run_norm_test(args)
     else:
         raise ValueError(f"Unsupported routine: {args.routine}")
 
@@ -34,7 +37,9 @@ def run_test(args):
         with open(args.output_path, "a") as fout:
             for cur_res in res:
                 for key in output_column_dict["general"]:
-                    cur_res[key] = getattr(args, key)
+                    # Use getattr with default "" for optional columns like batch_size/hidden_size
+                    # that may not be present in all routine types
+                    cur_res[key] = getattr(args, key, "")
 
                 output_line = ",".join(
                     [str(cur_res[col]) for col in full_output_columns]
@@ -65,7 +70,8 @@ def parse_args(line=sys.argv[1:]):
         required=True,
         choices=list(benchmark_apis["attention"])
         + list(benchmark_apis["gemm"])
-        + list(benchmark_apis["moe"]),
+        + list(benchmark_apis["moe"])
+        + list(benchmark_apis["norm"]),
     )
     args, _ = parser.parse_known_args(line[:])
 
@@ -156,6 +162,8 @@ def parse_args(line=sys.argv[1:]):
         args = parse_gemm_args(line, parser)
     elif args.routine in benchmark_apis["moe"]:
         args = parse_moe_args(line, parser)
+    elif args.routine in benchmark_apis["norm"]:
+        args = parse_norm_args(line, parser)
     else:
         raise ValueError(f"Unsupported routine: {args.routine}")
 

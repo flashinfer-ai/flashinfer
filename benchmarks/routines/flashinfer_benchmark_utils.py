@@ -15,7 +15,6 @@ output_column_dict = {
     ],
     "attention": [
         "page_size",
-        "batch_size",
         "s_qo",
         "s_kv",
         "num_qo_heads",
@@ -37,14 +36,12 @@ output_column_dict = {
         "group_size",
         "tile_size",
         "scale_major_mode",
-        "out_dtype",
         "mma_sm",
         "use_128x4_sf_layout",
         "use_nvfp4",
     ],
     "moe": [
         "num_tokens",
-        "hidden_size",
         "intermediate_size",
         "num_experts",
         "top_k",
@@ -58,7 +55,6 @@ output_column_dict = {
         "weight_layout",
         "use_routing_bias",
         "use_routing_scales_on_input",
-        "input_dtype",
         "weight_dtype",
         "gated_act",
         # CUTLASS fused MoE specific
@@ -69,7 +65,19 @@ output_column_dict = {
         "ep_size",
         "ep_rank",
     ],
+    "norm": [
+        "num_heads",
+        "scale",
+        "eps",
+        "enable_pdl",
+        "use_global_scale",
+        "is_sf_swizzled_layout",
+    ],
     "general": [
+        "batch_size",
+        "hidden_size",
+        "input_dtype",
+        "out_dtype",
         "refcheck",
         "no_cuda_graph",
         "use_cupti",
@@ -86,6 +94,7 @@ full_output_columns = (
     + output_column_dict["attention"]
     + output_column_dict["gemm"]
     + output_column_dict["moe"]
+    + output_column_dict["norm"]
     + output_column_dict["general"]
 )
 
@@ -108,6 +117,13 @@ benchmark_apis = {
         "trtllm_fp8_block_scale_moe",
         "trtllm_fp8_per_tensor_scale_moe",
         "cutlass_fused_moe",
+    ],
+    "norm": [
+        "rmsnorm",
+        "rmsnorm_quant",
+        "fused_add_rmsnorm_quant",
+        "rmsnorm_fp4quant",
+        "add_rmsnorm_fp4quant",
     ],
 }
 
@@ -287,6 +303,58 @@ routine_cc_to_supported_backends = {
         "9.0": [],
         "10.0": ["cutlass"],
         "10.3": ["cutlass"],
+        "12.0": [],
+    },
+    # NORM
+    "rmsnorm": {
+        "7.5": ["cuda"],
+        "8.0": ["cuda"],
+        "8.6": ["cuda"],
+        "8.9": ["cuda"],
+        "9.0": ["cuda"],
+        "10.0": ["cuda"],
+        "10.3": ["cuda"],
+        "12.0": ["cuda"],
+    },
+    "rmsnorm_quant": {
+        "7.5": ["cuda"],
+        "8.0": ["cuda"],
+        "8.6": ["cuda"],
+        "8.9": ["cuda"],
+        "9.0": ["cuda"],
+        "10.0": ["cuda"],
+        "10.3": ["cuda"],
+        "12.0": ["cuda"],
+    },
+    "fused_add_rmsnorm_quant": {
+        "7.5": ["cuda"],
+        "8.0": ["cuda"],
+        "8.6": ["cuda"],
+        "8.9": ["cuda"],
+        "9.0": ["cuda"],
+        "10.0": ["cuda"],
+        "10.3": ["cuda"],
+        "12.0": ["cuda"],
+    },
+    # NORM - FP4 Quantization (Blackwell SM100+ only, CuTe-DSL kernels)
+    "rmsnorm_fp4quant": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": ["cute-dsl"],
+        "10.3": ["cute-dsl"],
+        "12.0": [],
+    },
+    "add_rmsnorm_fp4quant": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": ["cute-dsl"],
+        "10.3": ["cute-dsl"],
         "12.0": [],
     },
 }
