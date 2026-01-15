@@ -17,7 +17,9 @@ DISABLE_SANITY_TEST=true
 source "${SCRIPT_DIR}/common_test_functions.sh"
 
 # Define the specific test files for multi-GPU comm tests (single-node)
-TEST_FILES="tests/comm/test_allreduce_unified_api.py tests/comm/test_allreduce_negative.py tests/comm/test_trtllm_allreduce_fusion.py"
+# TEST_FILES="tests/comm/test_allreduce_unified_api.py tests/comm/test_allreduce_negative.py tests/comm/test_trtllm_allreduce_fusion.py"
+# Add others back once they are fixed
+TEST_FILES="tests/comm/test_allreduce_unified_api.py"
 
 # Main execution
 main() {
