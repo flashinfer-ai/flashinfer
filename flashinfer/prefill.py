@@ -2698,7 +2698,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             and lead to a varied number of launched CTAs.
         disable_split_kv : bool,
             Whether to disable the split-kv for determinism in CUDA Graph, defaults to ``False``.
-                seq_lens: Optional[torch.Tensor]
+        seq_lens: Optional[torch.Tensor]
             A uint32 1D tensor indicating the kv sequence length of each prompt. shape: ``[batch_size]``.
         seq_lens_q: Optional[torch.Tensor]
             A uint32 1D tensor indicating the q sequence length of each prompt. shape: ``[batch_size]``.
@@ -3103,7 +3103,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 batch_offsets_k=self._kv_indptr_buf,
                 batch_offsets_v=self._v_indptr_buf,
                 batch_offsets_o=self._o_indptr_buf,
-                is_cuda_graph_compatible=True,
+                is_cuda_graph_compatible=self._use_cuda_graph,
                 out=out,
                 lse=lse,
             )
