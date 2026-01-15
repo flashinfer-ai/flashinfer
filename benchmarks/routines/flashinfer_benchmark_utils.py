@@ -72,7 +72,7 @@ output_column_dict = {
         "top_k",
         "ep_size",
         "input_dtype",
-        "quant_format",
+        "quant_dtype",
         "max_num_tokens",
     ],
     "norm": [

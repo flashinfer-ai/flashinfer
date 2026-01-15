@@ -503,7 +503,7 @@ def _create_moe_inputs(
     elif quant_dtype == "fp8":
         # Compute local amax, sync via max, then quantize with synced scale
         fp8_max = torch.finfo(torch.float8_e4m3fn).max
-        local_amax = hidden_states_original.abs().max().float().clamp(min=1e-6).item()
+        local_amax = hidden_states_original.abs().max().float().item()
         synced_amax = comm.allreduce(local_amax, op=MPI.MAX)
         synced_scale = torch.tensor(
             synced_amax / fp8_max, dtype=torch.float32, device=device
