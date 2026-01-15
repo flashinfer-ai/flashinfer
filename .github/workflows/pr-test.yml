@@ -110,10 +110,25 @@ jobs:
       - name: Show Work Directory
         run: ls -alh
 
+      - name: Show System Info
+        run: |
+          echo "=== Disk Space ==="
+          df -h
+          echo ""
+          echo "=== Memory ==="
+          free -h
+          echo ""
+          echo "=== CPU ==="
+          nproc
+          lscpu | head -20
+
       - name: Show Node Info
         run: ./scripts/task_show_node_info.sh
         env:
           NODE_NAME: ${{ runner.name }}
+          EXECUTOR_NUMBER: "0"
+          WORKSPACE: ${{ github.workspace }}
+          BUILD_NUMBER: ${{ github.run_number }}
 
       - name: Test JIT Cache Package Build and Import
         run: ./scripts/task_test_jit_cache_package_build_import.sh
@@ -151,10 +166,25 @@ jobs:
       - name: Show Work Directory
         run: ls -alh
 
+      - name: Show System Info
+        run: |
+          echo "=== Disk Space ==="
+          df -h
+          echo ""
+          echo "=== Memory ==="
+          free -h
+          echo ""
+          echo "=== CPU ==="
+          nproc
+          lscpu | head -20
+
       - name: Show Node Info
         run: ./scripts/task_show_node_info.sh
         env:
           NODE_NAME: ${{ runner.name }}
+          EXECUTOR_NUMBER: "0"
+          WORKSPACE: ${{ github.workspace }}
+          BUILD_NUMBER: ${{ github.run_number }}
 
       - name: Test JIT Cache Package Build and Import
         run: ./scripts/task_test_jit_cache_package_build_import.sh
@@ -193,13 +223,34 @@ jobs:
       - name: Show Work Directory
         run: ls -alh
 
+      - name: Show System Info
+        run: |
+          echo "=== Disk Space ==="
+          df -h
+          echo ""
+          echo "=== Memory ==="
+          free -h
+          echo ""
+          echo "=== CPU ==="
+          nproc
+          lscpu | head -20
+          echo ""
+          echo "=== GPU ==="
+          nvidia-smi
+          echo ""
+          echo "=== Docker Images ==="
+          docker images --format "table {{.Repository}}\t{{.Tag}}\t{{.Size}}" | head -20
+          echo ""
+          echo "=== Docker Disk Usage ==="
+          docker system df || true
+
       - name: Show Node Info
         run: ./scripts/task_show_node_info.sh
         env:
           NODE_NAME: ${{ runner.name }}
-
-      - name: Show GPU Info
-        run: nvidia-smi
+          EXECUTOR_NUMBER: "0"
+          WORKSPACE: ${{ github.workspace }}
+          BUILD_NUMBER: ${{ github.run_number }}
 
       - name: Run JIT Unittest Part ${{ matrix.shard }}
         run: ./scripts/task_jit_run_tests_part${{ matrix.shard }}.sh
@@ -237,13 +288,34 @@ jobs:
       - name: Show Work Directory
         run: ls -alh
 
+      - name: Show System Info
+        run: |
+          echo "=== Disk Space ==="
+          df -h
+          echo ""
+          echo "=== Memory ==="
+          free -h
+          echo ""
+          echo "=== CPU ==="
+          nproc
+          lscpu | head -20
+          echo ""
+          echo "=== GPU ==="
+          nvidia-smi
+          echo ""
+          echo "=== Docker Images ==="
+          docker images --format "table {{.Repository}}\t{{.Tag}}\t{{.Size}}" | head -20
+          echo ""
+          echo "=== Docker Disk Usage ==="
+          docker system df || true
+
       - name: Show Node Info
         run: ./scripts/task_show_node_info.sh
         env:
           NODE_NAME: ${{ runner.name }}
-
-      - name: Show GPU Info
-        run: nvidia-smi
+          EXECUTOR_NUMBER: "0"
+          WORKSPACE: ${{ github.workspace }}
+          BUILD_NUMBER: ${{ github.run_number }}
 
       - name: Run JIT Unittest Part 3 (SM75)
         run: ./scripts/task_jit_run_tests_part3.sh
