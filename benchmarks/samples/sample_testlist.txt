@@ -49,6 +49,20 @@
 --routine cutlass_fused_moe --num_tokens 32 --hidden_size 128 --intermediate_size 128 --num_experts 2 --top_k 2 --cutlass_variant nvfp4 --quantized_input --input_dtype float16 -vv --generate_repro_command --case_tag "cutlass_moe_nvfp4_weights_quantized"
 --routine cutlass_fused_moe --num_tokens 32 --hidden_size 128 --intermediate_size 128 --num_experts 8 --top_k 2 --cutlass_variant base --input_dtype float16 --tp_size 2 --tp_rank 0 --ep_size 4 --ep_rank 0 -vv --generate_repro_command --case_tag "cutlass_moe_nvfp4_ep_tp"
 
+## MoE Communication (requires mpirun, e.g.: mpirun -np 8 python benchmarks/flashinfer_benchmark.py ...)
+# Basic A2A dispatch+combine without quantization
+#--routine moe_a2a_dispatch_combine --num_tokens 1024 --hidden_size 7168 --num_experts 256 --top_k 8 -vv --generate_repro_command --case_tag "moe_a2a_basic"
+# With FP8 per-tensor quantization
+#--routine moe_a2a_dispatch_combine --num_tokens 1024 --hidden_size 7168 --num_experts 256 --top_k 8 --quant_dtype fp8 -vv --generate_repro_command --case_tag "moe_a2a_fp8"
+# With NVFP4 block-scale quantization
+#--routine moe_a2a_dispatch_combine --num_tokens 1024 --hidden_size 7168 --num_experts 256 --top_k 8 --quant_dtype nvfp4 -vv --generate_repro_command --case_tag "moe_a2a_nvfp4"
+# With FP8 block-scale quantization
+#--routine moe_a2a_dispatch_combine --num_tokens 1024 --hidden_size 7168 --num_experts 256 --top_k 8 --quant_dtype fp8_block_scale -vv --generate_repro_command --case_tag "moe_a2a_fp8_block_scale"
+# With real MoE kernel (NVFP4)
+#--routine moe_a2a_dispatch_combine --num_tokens 1024 --hidden_size 7168 --num_experts 256 --top_k 8 --quant_dtype nvfp4 --real_math --intermediate_size 18432 --per_phase_timing -vv --generate_repro_command --case_tag "moe_a2a_nvfp4_real_math"
+# With real MoE kernel (FP8 block-scale)
+#--routine moe_a2a_dispatch_combine --num_tokens 1024 --hidden_size 7168 --num_experts 256 --top_k 8 --quant_dtype fp8_block_scale --real_math --intermediate_size 18432 --per_phase_timing -vv --generate_repro_command --case_tag "moe_a2a_fp8_bs_real_math"
+
 ## RMSNorm
 # Basic RMSNorm with 2D input shape
 --routine rmsnorm --batch_size 32 --hidden_size 4096 --input_dtype bfloat16 --refcheck -vv --generate_repro_command --case_tag "rmsnorm_llama_hidden"
