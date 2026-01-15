@@ -534,6 +534,96 @@ def _create_moe_inputs(
     )
 
 
+def _calculate_exact_comm_traffic(
+    all_token_selected_experts: List[np.ndarray],
+    num_experts: int,
+    ep_size: int,
+    hidden_size: int,
+    input_dtype: torch.dtype,
+    quant_dtype: Optional[str] = None,
+) -> Tuple[int, int]:
+    """
+    Calculate exact inter-rank traffic from actual expert assignments.
+
+    For MoE A2A, each token is sent to the rank that owns the selected expert.
+    Assuming that expert `e` is owned by rank `e // num_experts_per_rank`.
+
+    If a token selects multiple experts on the same remote rank,
+    the data should be sent only once and counted accordingly.
+
+    Args:
+        all_token_selected_experts: List of expert assignments from all ranks [ep_size][num_tokens, top_k]
+        num_experts: Total number of experts
+        ep_size: Expert parallel size (number of ranks)
+        hidden_size: Hidden dimension size
+        input_dtype: Data type of hidden states (before quantization)
+        quant_dtype: None, "fp8", or "nvfp4"
+
+    Returns:
+        Tuple of (dispatch_bytes, combine_bytes) for actual inter-rank traffic
+    """
+    num_experts_per_rank = num_experts // ep_size
+
+    # Calculate per-element sizes based on quant_dtype
+    if quant_dtype == "nvfp4":
+        # NVFP4: 0.5 bytes per element + block scales
+        hidden_bytes_per_token = hidden_size // 2
+        scale_bytes_per_token = (hidden_size // 16) * 1  # float8_e4m3fn
+    elif quant_dtype == "fp8":
+        # FP8: 1 byte per element
+        hidden_bytes_per_token = hidden_size * 1
+        scale_bytes_per_token = 0
+    else:
+        # No quantization
+        element_size = torch.tensor([], dtype=input_dtype).element_size()
+        hidden_bytes_per_token = hidden_size * element_size
+        scale_bytes_per_token = 0
+
+    # Activation dtype element size for combine phase
+    combine_element_bytes = torch.tensor([], dtype=input_dtype).element_size()
+    # Expert IDs/scales are sent for each selection
+    token_topk_id_and_weight_bytes = 4 + 4
+
+    # Count unique inter-rank transfers
+    total_dispatch_bytes = 0
+    total_combine_bytes = 0
+
+    for src_rank, experts_on_rank in enumerate(all_token_selected_experts):
+        # experts_on_rank: [num_tokens, top_k]
+        num_tokens = experts_on_rank.shape[0]
+        top_k = experts_on_rank.shape[1]
+
+        for token_idx in range(num_tokens):
+            # Find unique destination ranks for this token
+            dst_ranks_for_token = set()
+            num_expert_ids_per_dst = {}  # Count expert selections per dst rank
+
+            for k in range(top_k):
+                expert_id = experts_on_rank[token_idx, k]
+                dst_rank = expert_id // num_experts_per_rank
+
+                if dst_rank != src_rank:
+                    dst_ranks_for_token.add(dst_rank)
+                    num_expert_ids_per_dst[dst_rank] = (
+                        num_expert_ids_per_dst.get(dst_rank, 0) + 1
+                    )
+
+            # For each unique dst_rank, token is sent once
+            for dst_rank in dst_ranks_for_token:
+                num_experts_to_dst = num_expert_ids_per_dst[dst_rank]
+
+                # Dispatch: hidden states sent once
+                total_dispatch_bytes += (
+                    hidden_bytes_per_token
+                    + scale_bytes_per_token
+                    + num_experts_to_dst * token_topk_id_and_weight_bytes
+                )
+                # Combine: one output per token per dst_rank
+                total_combine_bytes += hidden_size * combine_element_bytes
+
+    return total_dispatch_bytes, total_combine_bytes
+
+
 def _calculate_comm_bandwidth(
     num_tokens: int,
     hidden_size: int,
@@ -543,6 +633,7 @@ def _calculate_comm_bandwidth(
     input_dtype: torch.dtype,
     quant_dtype: Optional[str] = None,
     phase: str = "dispatch_combine",
+    actual_traffic: Optional[Tuple[int, int]] = None,
 ) -> float:
     """
     Calculate memory bandwidth for MoE A2A communication in TB/sec.
@@ -556,49 +647,60 @@ def _calculate_comm_bandwidth(
         input_dtype: Data type of hidden states (before quantization)
         quant_dtype: None, "fp8", or "nvfp4"
         phase: "dispatch", "combine", or "dispatch_combine"
+        actual_traffic: Optional tuple of (dispatch_bytes, combine_bytes) from actual routing.
+                       If provided, uses exact traffic instead of uniform distribution estimate.
 
     Returns:
         Bandwidth in TB/sec
     """
-    # Calculate hidden states payload size based on quant_dtype
-    if quant_dtype == "nvfp4":
-        # NVFP4: 0.5 bytes per element (packed uint8) + block scales
-        hidden_states_bytes = num_tokens * hidden_size // 2  # packed FP4
-        # Block scales: float8_e4m3fn, one per 16 elements
-        scale_bytes = num_tokens * (hidden_size // 16) * 1  # float8_e4m3fn = 1 byte
-    elif quant_dtype == "fp8":
-        # FP8: 1 byte per element, no scale payload in A2A
-        hidden_states_bytes = num_tokens * hidden_size * 1  # float8_e4m3fn = 1 byte
-        scale_bytes = 0
+    if actual_traffic is not None:
+        # Use actual traffic from expert routing analysis
+        dispatch_bytes, combine_bytes = actual_traffic
+        if phase == "dispatch":
+            total_bytes = dispatch_bytes
+        elif phase == "combine":
+            total_bytes = combine_bytes
+        else:  # dispatch_combine
+            total_bytes = dispatch_bytes + combine_bytes
     else:
-        # No quantization
+        # Estimate assuming uniform distribution (fallback)
+        if quant_dtype == "nvfp4":
+            # NVFP4: 0.5 bytes per element (packed uint8) + block scales
+            hidden_states_bytes = num_tokens * hidden_size // 2  # packed FP4
+            # Block scales: float8_e4m3fn, one per 16 elements
+            scale_bytes = num_tokens * (hidden_size // 16) * 1  # float8_e4m3fn = 1 byte
+        elif quant_dtype == "fp8":
+            # FP8: 1 byte per element, no scale payload in A2A
+            hidden_states_bytes = num_tokens * hidden_size * 1  # float8_e4m3fn = 1 byte
+            scale_bytes = 0
+        else:
+            # No quantization
+            element_size = torch.tensor([], dtype=input_dtype).element_size()
+            hidden_states_bytes = num_tokens * hidden_size * element_size
+            scale_bytes = 0
+
+        # Dispatch phase: send hidden_states, expert_ids, scales, and quant scales
+        dispatch_bytes = (
+            hidden_states_bytes
+            + num_tokens * top_k * 4  # token_selected_experts (int32)
+            + num_tokens * top_k * 4  # token_final_scales (float32)
+            + scale_bytes
+        )
+
+        # Combine phase: receive processed hidden_states back
+        # Combine ALWAYS uses activation dtype (bfloat16/float16), not quantized format
         element_size = torch.tensor([], dtype=input_dtype).element_size()
-        hidden_states_bytes = num_tokens * hidden_size * element_size
-        scale_bytes = 0
+        combine_bytes = num_tokens * hidden_size * element_size
 
-    # Dispatch phase: send hidden_states, expert_ids, scales, and quant scales
-    dispatch_bytes = (
-        hidden_states_bytes
-        + num_tokens * top_k * 4  # token_selected_experts (int32)
-        + num_tokens * top_k * 4  # token_final_scales (float32)
-        + scale_bytes
-    )
+        if phase == "dispatch":
+            total_bytes = dispatch_bytes
+        elif phase == "combine":
+            total_bytes = combine_bytes
+        else:  # dispatch_combine
+            total_bytes = dispatch_bytes + combine_bytes
 
-    # Combine phase: receive processed hidden_states back
-    # Combine ALWAYS uses activation dtype (bfloat16/float16), not quantized format
-    # This matches the real MoE flow: quantized dispatch -> expert compute -> activation dtype combine
-    element_size = torch.tensor([], dtype=input_dtype).element_size()
-    combine_bytes = num_tokens * hidden_size * element_size
-
-    if phase == "dispatch":
-        total_bytes = dispatch_bytes
-    elif phase == "combine":
-        total_bytes = combine_bytes
-    else:  # dispatch_combine
-        total_bytes = dispatch_bytes + combine_bytes
-
-    # Account for multi-rank communication: data crosses ranks
-    total_bytes *= (ep_size - 1) / ep_size if ep_size > 1 else 1
+        # Account for multi-rank communication: assume uniform distribution
+        total_bytes *= (ep_size - 1) / ep_size if ep_size > 1 else 1
 
     tb_per_sec = total_bytes / (time_ms * 1e-3) / 1e12
     return tb_per_sec
@@ -993,6 +1095,21 @@ def test_moe_a2a_dispatch_combine(args):
                 print("[ERROR] Validation failed. Aborting benchmark.")
             return res
 
+    # Gather expert assignments from all ranks to calculate actual traffic
+    all_token_selected_experts = comm.allgather(token_selected_experts.cpu().numpy())
+    dispatch_bytes, combine_bytes = _calculate_exact_comm_traffic(
+        all_token_selected_experts,
+        num_experts,
+        ep_size,
+        hidden_size,
+        input_dtype,
+        quant_dtype,
+    )
+    if rank == 0 and args.verbose >= 1:
+        print(
+            f"[INFO] Actual inter-rank traffic: dispatch={dispatch_bytes / 1024**2:.3f} MiB, combine={combine_bytes / 1024**2:.3f} MiB"
+        )
+
     # Storage for per-phase CUDA events to be populated later during benchmark
     # Deferred timing: collect events during iterations, compute times after single sync
     dispatch_events = []
@@ -1085,7 +1202,7 @@ def test_moe_a2a_dispatch_combine(args):
         median_time = np.median(total_per_iter_max)
         std_time = np.std(total_per_iter_max)
 
-        # Calculate total bandwidth
+        # Calculate total bandwidth using actual traffic from expert routing
         tb_per_sec_total = _calculate_comm_bandwidth(
             num_tokens,
             hidden_size,
@@ -1095,6 +1212,7 @@ def test_moe_a2a_dispatch_combine(args):
             input_dtype,
             quant_dtype,
             phase="dispatch_combine",
+            actual_traffic=(dispatch_bytes, combine_bytes),
         )
 
         # Per-phase statistics if enabled --per_phase_timing flag
@@ -1122,6 +1240,7 @@ def test_moe_a2a_dispatch_combine(args):
                 input_dtype,
                 quant_dtype,
                 phase="dispatch",
+                actual_traffic=(dispatch_bytes, combine_bytes),
             )
             tb_per_sec_combine = _calculate_comm_bandwidth(
                 num_tokens,
@@ -1132,6 +1251,7 @@ def test_moe_a2a_dispatch_combine(args):
                 input_dtype,
                 quant_dtype,
                 phase="combine",
+                actual_traffic=(dispatch_bytes, combine_bytes),
             )
 
             # Print per-phase metrics
@@ -1153,6 +1273,9 @@ def test_moe_a2a_dispatch_combine(args):
         # Always print total
         print_perf_metrics(
             "a2a_total", median_time, std_time, torch.nan, tb_per_sec_total
+        )
+        print(
+            "[INFO] The reported achieved tb_per_sec is the aggregate bandwidth of all participating ranks."
         )
 
         if args.output_path is not None:
