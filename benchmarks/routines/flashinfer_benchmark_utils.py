@@ -73,6 +73,17 @@ output_column_dict = {
         "use_global_scale",
         "is_sf_swizzled_layout",
     ],
+    "quantization": [
+        "m",
+        "k",
+        "is_sf_swizzled_layout",
+        "alignment",
+        "enable_pdl",
+        "global_scale",
+        "sf_layout",
+        "do_shuffle",
+        "sf_vec_size",
+    ],
     "general": [
         "batch_size",
         "hidden_size",
@@ -95,6 +106,7 @@ full_output_columns = (
     + output_column_dict["gemm"]
     + output_column_dict["moe"]
     + output_column_dict["norm"]
+    + output_column_dict["quantization"]
     + output_column_dict["general"]
 )
 
@@ -124,6 +136,12 @@ benchmark_apis = {
         "fused_add_rmsnorm_quant",
         "rmsnorm_fp4quant",
         "add_rmsnorm_fp4quant",
+    ],
+    "quantization": [
+        "mxfp8_quantize",
+        "mxfp4_quantize",
+        "nvfp4_quantize",
+        "nvfp4_batched_quantize",
     ],
 }
 
@@ -355,6 +373,47 @@ routine_cc_to_supported_backends = {
         "9.0": [],
         "10.0": ["cute-dsl"],
         "10.3": ["cute-dsl"],
+        "12.0": [],
+    },
+    # QUANTIZATION
+    "mxfp8_quantize": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": ["cuda"],
+        "10.3": ["cuda"],
+        "12.0": [],
+    },
+    "mxfp4_quantize": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": ["cuda"],
+        "10.3": ["cuda"],
+        "12.0": [],
+    },
+    "nvfp4_quantize": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": ["cuda"],
+        "10.3": ["cuda"],
+        "12.0": [],
+    },
+    "nvfp4_batched_quantize": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": ["cuda"],
+        "10.3": ["cuda"],
         "12.0": [],
     },
 }

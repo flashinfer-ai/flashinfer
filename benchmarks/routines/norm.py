@@ -384,7 +384,12 @@ def testRmsnormQuant(args):
     def run_backend(backend, out_tensor, input_tensor, weight):
         if backend == "cuda":
             flashinfer.norm.rmsnorm_quant(
-                out_tensor, input_tensor, weight, scale=scale, eps=eps, enable_pdl=enable_pdl
+                out_tensor,
+                input_tensor,
+                weight,
+                scale=scale,
+                eps=eps,
+                enable_pdl=enable_pdl,
             )
             return out_tensor
         else:
@@ -396,11 +401,13 @@ def testRmsnormQuant(args):
         rms = torch.sqrt(
             torch.mean(input_tensor.float() ** 2, dim=-1, keepdim=True) + eps
         )
-        rmsnorm_output = (input_tensor.float() / rms * weight.float())
+        rmsnorm_output = input_tensor.float() / rms * weight.float()
         # Quantize to output dtype
-        reference_output = (rmsnorm_output * scale).clamp(
-            torch.finfo(out_dtype).min, torch.finfo(out_dtype).max
-        ).to(out_dtype)
+        reference_output = (
+            (rmsnorm_output * scale)
+            .clamp(torch.finfo(out_dtype).min, torch.finfo(out_dtype).max)
+            .to(out_dtype)
+        )
         has_reference_output = True
 
     # Storage for timing results and outputs
@@ -410,9 +417,9 @@ def testRmsnormQuant(args):
         # Create fresh output tensor for each run
         cur_out = torch.empty(input_shape, dtype=out_dtype, device=device)
         if run_refcheck:
-            outputs[cur_backend] = run_backend(
-                cur_backend, cur_out, input_tensor, weight
-            ).detach().clone()
+            outputs[cur_backend] = (
+                run_backend(cur_backend, cur_out, input_tensor, weight).detach().clone()
+            )
         backend_times[cur_backend] = bench_gpu_time(
             fn=run_backend,
             dry_run_iters=args.dry_run_iters,
@@ -559,8 +566,13 @@ def testFusedAddRmsnormQuant(args):
     def run_backend(backend, out_tensor, input_tensor, residual_tensor, weight):
         if backend == "cuda":
             flashinfer.norm.fused_add_rmsnorm_quant(
-                out_tensor, input_tensor, residual_tensor, weight,
-                scale=scale, eps=eps, enable_pdl=enable_pdl
+                out_tensor,
+                input_tensor,
+                residual_tensor,
+                weight,
+                scale=scale,
+                eps=eps,
+                enable_pdl=enable_pdl,
             )
             return out_tensor
         else:
@@ -577,11 +589,13 @@ def testFusedAddRmsnormQuant(args):
         rms = torch.sqrt(
             torch.mean(ref_residual.float() ** 2, dim=-1, keepdim=True) + eps
         )
-        rmsnorm_output = (ref_residual.float() / rms * weight.float())
+        rmsnorm_output = ref_residual.float() / rms * weight.float()
         # Quantize to output dtype
-        reference_output = (rmsnorm_output * scale).clamp(
-            torch.finfo(out_dtype).min, torch.finfo(out_dtype).max
-        ).to(out_dtype)
+        reference_output = (
+            (rmsnorm_output * scale)
+            .clamp(torch.finfo(out_dtype).min, torch.finfo(out_dtype).max)
+            .to(out_dtype)
+        )
         has_reference_output = True
 
     # Storage for timing results and outputs
@@ -592,9 +606,11 @@ def testFusedAddRmsnormQuant(args):
         cur_out = torch.empty(input_shape, dtype=out_dtype, device=device)
         cur_residual = residual_tensor.clone()
         if run_refcheck:
-            outputs[cur_backend] = run_backend(
-                cur_backend, cur_out, input_tensor, cur_residual, weight
-            ).detach().clone()
+            outputs[cur_backend] = (
+                run_backend(cur_backend, cur_out, input_tensor, cur_residual, weight)
+                .detach()
+                .clone()
+            )
         # For timing, use fresh residual each iteration
         backend_times[cur_backend] = bench_gpu_time(
             fn=run_backend,
@@ -602,7 +618,13 @@ def testFusedAddRmsnormQuant(args):
             repeat_iters=args.num_iters,
             enable_cupti=args.use_cupti,
             use_cuda_graph=is_cuda_graph_compatible,
-            input_args=(cur_backend, out_tensor, input_tensor, residual_tensor.clone(), weight),
+            input_args=(
+                cur_backend,
+                out_tensor,
+                input_tensor,
+                residual_tensor.clone(),
+                weight,
+            ),
         )
 
     tested_backends = list(outputs.keys())
@@ -768,8 +790,12 @@ def testRmsnormFp4quant(args):
     def run_backend(backend, input_tensor, weight):
         if backend == "cute-dsl":
             return flashinfer.rmsnorm_fp4quant(
-                input_tensor, weight, eps=eps, block_size=block_size,
-                global_scale=global_scale, is_sf_swizzled_layout=is_sf_swizzled_layout
+                input_tensor,
+                weight,
+                eps=eps,
+                block_size=block_size,
+                global_scale=global_scale,
+                is_sf_swizzled_layout=is_sf_swizzled_layout,
             )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
@@ -777,14 +803,9 @@ def testRmsnormFp4quant(args):
     # Reference: PyTorch implementation of RMSNorm + FP4 quantization
     has_reference_output = False
     if run_refcheck:
-        rms = torch.sqrt(
-            torch.mean(input_tensor.float() ** 2, dim=-1, keepdim=True) + eps
-        )
-        rmsnorm_output = (input_tensor.float() / rms * weight.float())
-        # For FP4 quantization reference, we just verify the RMSNorm part
+        # For FP4 quantization, we verify output shapes and dtypes
         # since FP4 quantization details are complex and implementation-specific
         has_reference_output = True
-        reference_rmsnorm = rmsnorm_output.to(input_dtype)
 
     # Storage for timing results and outputs
     backend_times = {backend: [] for backend in backends}
@@ -792,7 +813,10 @@ def testRmsnormFp4quant(args):
     for cur_backend in backends:
         if run_refcheck:
             out_fp4, out_scale = run_backend(cur_backend, input_tensor, weight)
-            outputs[cur_backend] = (out_fp4.detach().clone(), out_scale.detach().clone())
+            outputs[cur_backend] = (
+                out_fp4.detach().clone(),
+                out_scale.detach().clone(),
+            )
         backend_times[cur_backend] = bench_gpu_time(
             fn=run_backend,
             dry_run_iters=args.dry_run_iters,
@@ -809,7 +833,9 @@ def testRmsnormFp4quant(args):
             for i in range(len(tested_backends)):
                 out_fp4, out_scale = outputs[tested_backends[i]]
                 if args.verbose >= 2:
-                    print(f"[VVERBOSE] Backend {tested_backends[i]}: out_fp4.shape = {out_fp4.shape}, out_scale.shape = {out_scale.shape}")
+                    print(
+                        f"[VVERBOSE] Backend {tested_backends[i]}: out_fp4.shape = {out_fp4.shape}, out_scale.shape = {out_scale.shape}"
+                    )
 
     for backend in backends:
         if len(backend_times[backend]) > 0:
@@ -956,22 +982,21 @@ def testAddRmsnormFp4quant(args):
     def run_backend(backend, input_tensor, residual_tensor, weight):
         if backend == "cute-dsl":
             return flashinfer.add_rmsnorm_fp4quant(
-                input_tensor, residual_tensor, weight, eps=eps, block_size=block_size,
-                global_scale=global_scale, is_sf_swizzled_layout=is_sf_swizzled_layout
+                input_tensor,
+                residual_tensor,
+                weight,
+                eps=eps,
+                block_size=block_size,
+                global_scale=global_scale,
+                is_sf_swizzled_layout=is_sf_swizzled_layout,
             )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
 
-    # Reference: PyTorch implementation of Add + RMSNorm + FP4 quantization
+    # Reference: For FP4 quantization, we verify output shapes and dtypes
+    # since FP4 quantization details are complex and implementation-specific
     has_reference_output = False
     if run_refcheck:
-        # Step 1: h = input + residual
-        h = input_tensor + residual_tensor
-        # Step 2: RMSNorm on h
-        rms = torch.sqrt(
-            torch.mean(h.float() ** 2, dim=-1, keepdim=True) + eps
-        )
-        rmsnorm_output = (h.float() / rms * weight.float())
         has_reference_output = True
 
     # Storage for timing results and outputs
@@ -982,7 +1007,11 @@ def testAddRmsnormFp4quant(args):
             out_fp4, out_scale, out_h = run_backend(
                 cur_backend, input_tensor, residual_tensor.clone(), weight
             )
-            outputs[cur_backend] = (out_fp4.detach().clone(), out_scale.detach().clone(), out_h.detach().clone())
+            outputs[cur_backend] = (
+                out_fp4.detach().clone(),
+                out_scale.detach().clone(),
+                out_h.detach().clone(),
+            )
         backend_times[cur_backend] = bench_gpu_time(
             fn=run_backend,
             dry_run_iters=args.dry_run_iters,
@@ -999,7 +1028,9 @@ def testAddRmsnormFp4quant(args):
             for i in range(len(tested_backends)):
                 out_fp4, out_scale, out_h = outputs[tested_backends[i]]
                 if args.verbose >= 2:
-                    print(f"[VVERBOSE] Backend {tested_backends[i]}: out_fp4.shape = {out_fp4.shape}, out_scale.shape = {out_scale.shape}, out_h.shape = {out_h.shape}")
+                    print(
+                        f"[VVERBOSE] Backend {tested_backends[i]}: out_fp4.shape = {out_fp4.shape}, out_scale.shape = {out_scale.shape}, out_h.shape = {out_h.shape}"
+                    )
 
     for backend in backends:
         if len(backend_times[backend]) > 0:
@@ -1044,4 +1075,3 @@ def testAddRmsnormFp4quant(args):
             cur_res["case_tag"] = args.case_tag
             res.append(cur_res)
     return res
-

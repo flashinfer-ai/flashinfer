@@ -110,3 +110,44 @@
 
 # 3D input shape (batch, num_heads, head_dim)
 --routine add_rmsnorm_fp4quant --batch_size 32 --num_heads 32 --hidden_size 128 --input_dtype bfloat16 -vv --generate_repro_command --case_tag "add_rmsnorm_fp4quant_3d"
+
+## Quantization (Blackwell SM10.0+ only)
+# MxFP8 Quantization - basic
+--routine mxfp8_quantize --m 1024 --k 4096 --input_dtype bfloat16 -vv --generate_repro_command --case_tag "mxfp8_quantize_basic"
+--routine mxfp8_quantize --m 2048 --k 8192 --input_dtype bfloat16 -vv --generate_repro_command --case_tag "mxfp8_quantize_large"
+
+# MxFP8 Quantization - float16 input
+--routine mxfp8_quantize --m 1024 --k 4096 --input_dtype float16 -vv --generate_repro_command --case_tag "mxfp8_quantize_fp16"
+
+# MxFP8 Quantization - with swizzled layout disabled
+--routine mxfp8_quantize --m 1024 --k 4096 --input_dtype bfloat16 --no_sf_swizzled_layout -vv --generate_repro_command --case_tag "mxfp8_quantize_no_swizzle"
+
+# MxFP8 Quantization - with PDL enabled
+--routine mxfp8_quantize --m 2048 --k 8192 --input_dtype bfloat16 --enable_pdl -vv --generate_repro_command --case_tag "mxfp8_quantize_pdl"
+
+# MxFP8 Quantization - with refcheck (round-trip verification)
+--routine mxfp8_quantize --m 1024 --k 4096 --input_dtype bfloat16 --refcheck -vv --generate_repro_command --case_tag "mxfp8_quantize_refcheck"
+
+# MxFP4 Quantization (Blackwell SM10.0+ only)
+--routine mxfp4_quantize --m 1024 --k 4096 --input_dtype bfloat16 -vv --generate_repro_command --case_tag "mxfp4_quantize_basic"
+--routine mxfp4_quantize --m 2048 --k 8192 --input_dtype bfloat16 -vv --generate_repro_command --case_tag "mxfp4_quantize_large"
+--routine mxfp4_quantize --m 1024 --k 4096 --input_dtype bfloat16 --refcheck -vv --generate_repro_command --case_tag "mxfp4_quantize_refcheck"
+
+# NVFP4 Quantization (Blackwell SM10.0+ only)
+# With 128x4 layout (default, for large tileN GEMMs)
+--routine nvfp4_quantize --m 1024 --k 4096 --input_dtype bfloat16 --global_scale 1.0 --sf_layout 128x4 -vv --generate_repro_command --case_tag "nvfp4_quantize_128x4"
+--routine nvfp4_quantize --m 2048 --k 8192 --input_dtype bfloat16 --global_scale 1.0 --sf_layout 128x4 -vv --generate_repro_command --case_tag "nvfp4_quantize_128x4_large"
+
+# With 8x4 layout (for small tileN GEMMs)
+--routine nvfp4_quantize --m 1024 --k 4096 --input_dtype bfloat16 --global_scale 1.0 --sf_layout 8x4 -vv --generate_repro_command --case_tag "nvfp4_quantize_8x4"
+
+# With shuffle for TRTLLM backend
+--routine nvfp4_quantize --m 1024 --k 4096 --input_dtype bfloat16 --global_scale 1.0 --do_shuffle -vv --generate_repro_command --case_tag "nvfp4_quantize_shuffle"
+
+# With PDL enabled
+--routine nvfp4_quantize --m 1024 --k 4096 --input_dtype bfloat16 --global_scale 1.0 --enable_pdl -vv --generate_repro_command --case_tag "nvfp4_quantize_pdl"
+
+# NVFP4 Batched Quantization (Blackwell SM10.0+ only)
+--routine nvfp4_batched_quantize --batch_size 4 --m 1024 --k 4096 --input_dtype bfloat16 --global_scale 1.0 -vv --generate_repro_command --case_tag "nvfp4_batched_basic"
+--routine nvfp4_batched_quantize --batch_size 8 --m 2048 --k 8192 --input_dtype bfloat16 --global_scale 1.0 -vv --generate_repro_command --case_tag "nvfp4_batched_large"
+--routine nvfp4_batched_quantize --batch_size 4 --m 1024 --k 4096 --input_dtype float16 --global_scale 1.0 -vv --generate_repro_command --case_tag "nvfp4_batched_fp16"
