@@ -339,10 +339,11 @@ static KernelParams setKernelParams(
       }
 
       // The number of CTAs.
-      int32_t numCtas = batchM ? (mM + options.mTileM - 1) / options.mTileM
+      int32_t numCtas = batchM ? (mM + options.mTileM * options.mClusterDimX - 1) /
+                                     (options.mTileM * options.mClusterDimX) * options.mClusterDimX
                                : (mN + options.mTileN - 1) / options.mTileN;
       // The size of the tile.
-      int32_t tile = batchM ? options.mTileM : options.mTileN;
+      int32_t tile = batchM ? options.mTileM * options.mClusterDimX : options.mTileN;
       // The problem size.
       int32_t mn = batchM ? mM : mN;
       int32_t tokensPerTile = mn;
@@ -366,7 +367,7 @@ static KernelParams setKernelParams(
     params.totalNumOutputPaddedTokens = params.totalNumPaddedTokens;
   } else if (options.mIsStaticBatch && options.mIsUniformNumTokensPerBatch) {
     auto numTokens = batchM ? options.mBatchedM[0] : options.mBatchedN[0];
-    auto tileTokensDim = batchM ? options.mTileM : options.mTileN;
+    auto tileTokensDim = batchM ? options.mTileM * options.mClusterDimX : options.mTileN;
     params.batchStrideInCtas = (options.mBatchStrideInTokens + tileTokensDim - 1) / tileTokensDim;
     params.ctasInTokenDimPerBatch = (numTokens + tileTokensDim - 1) / tileTokensDim;
     params.totalNumOutputPaddedTokens =
@@ -538,15 +539,17 @@ static KernelParams setKernelParams(
                                                 const_cast<void*>(ptrB), doPadB,
                                                 /*doSwizzle=*/true);
 
-    if (options.mRouteImpl == batchedGemm::RouteImpl::NoRoute) {
+    if (!batchedGemm::doesRouteImplUseLdgsts(options.mRouteImpl)) {
       // A is the activation
       // Shape/stride for gmem tensor A.
       // The input is padded:
       // [act0, padding, padding, ... tileM size .., act1, padding, padding, ...]
       auto const inputNumTokens = ctaOffset * options.mTileM;
+      bool useRouteAct = batchedGemm::doesRouteImplUseTma(options.mRouteImpl);
       auto [shapeA, strideA, tileShapeA] = makeTmaShapeStrideAbc(
-          options, inputNumTokens, options.mN, options.mK, options.mTileM, options.mTileN,
-          options.mTileK, MatrixType::MatrixA, inputNumTokens, options.mValidN, options.mValidK);
+          options, useRouteAct ? options.mNumTokens : inputNumTokens, options.mN, options.mK,
+          useRouteAct ? 1 : options.mTileM, options.mTileN, options.mTileK, MatrixType::MatrixA,
+          useRouteAct ? options.mNumTokens : inputNumTokens, options.mValidN, options.mValidK);
       // Build tma descriptor for A.
       params.tmaA[0] = gemm::buildNdTmaDescriptor(options.mDtypeA, shapeA, strideA, tileShapeA,
                                                   const_cast<void*>(ptrA), doPadA,

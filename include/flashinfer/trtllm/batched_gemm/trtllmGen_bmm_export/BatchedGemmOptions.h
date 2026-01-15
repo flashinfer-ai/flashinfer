@@ -102,7 +102,7 @@ struct BatchedGemmOptions : public gemmGatedAct::GemmGatedActOptions {
       tg::SfLayout sfLayoutC, int32_t sfReshapeFactor, bool sliceK, gemm::SplitK splitK, int tileK,
       int tileM, int tileN, gemm::TileScheduler tileScheduler, bool transposeMmaOutput,
       bool useCustomMmaSchedule, bool useDeepSeekFp8, bool useHoistTryWaitForCustomMmaSchedule,
-      bool useMaxTmemOverlap, bool usePerTokenSfA, bool usePerTokenSfB, bool useShuffledMatrixA,
+      bool useMaxTmemOverlap, bool usePerTokenSfA, bool usePerTokenSfB, bool useShuffledMatrix,
       bool useTmaStore, bool useTwoTmaLoadWarps, bool useTwoMmaWarps, bool useUnrollLoop2xForMma,
       int validM, int validN, int validK, int worldSize,
       // GemmGatedActOptions
@@ -111,9 +111,10 @@ struct BatchedGemmOptions : public gemmGatedAct::GemmGatedActOptions {
       std::vector<int> batchedM, std::vector<int> batchedN, BatchMode batchMode,
       int32_t batchStrideInTokens, bool fusedAct, bool gridWaitForPrimaryRouting,
       bool isStaticBatch, bool isUniformNumTokensPerBatch, int numBatches,
-      int numRegsPerThreadLoadB, int numRegsPerThreadLoadSfB, int numTokens, int numWarpsLoadB,
-      int numWarpsLoadSfB, RouteImpl routeImpl, std::optional<RouteImpl> routeSfsImpl,
-      bool useTmaOobOpt)
+      int numRegsPerThreadLoadA, int numRegsPerThreadLoadB, int numRegsPerThreadLoadSfA,
+      int numRegsPerThreadLoadSfB, int numTokens, int numWarpsLoadA, int numWarpsLoadB,
+      int numWarpsLoadSfA, int numWarpsLoadSfB, RouteImpl routeImpl,
+      std::optional<RouteImpl> routeSfsImpl, bool useTmaOobOpt)
       : gemmGatedAct::GemmGatedActOptions(
             gemm::GemmOptions(
                 allReduceAlgo, biasType, blockK, clusterDimX, clusterDimY, clusterDimZ,
@@ -131,7 +132,7 @@ struct BatchedGemmOptions : public gemmGatedAct::GemmGatedActOptions {
                 sfReshapeFactor, sliceK, splitK, tileK, tileM, tileN, tileScheduler,
                 transposeMmaOutput, useCustomMmaSchedule, useDeepSeekFp8,
                 useHoistTryWaitForCustomMmaSchedule, useMaxTmemOverlap, usePerTokenSfA,
-                usePerTokenSfB, useShuffledMatrixA, useTmaStore, useTwoTmaLoadWarps, useTwoMmaWarps,
+                usePerTokenSfB, useShuffledMatrix, useTmaStore, useTwoTmaLoadWarps, useTwoMmaWarps,
                 useUnrollLoop2xForMma, validM, validN, validK, worldSize),
             actType, clampBeforeAct),
         mBatchedM(batchedM),
@@ -143,10 +144,14 @@ struct BatchedGemmOptions : public gemmGatedAct::GemmGatedActOptions {
         mIsStaticBatch(isStaticBatch),
         mIsUniformNumTokensPerBatch(isUniformNumTokensPerBatch),
         mNumBatches(numBatches),
+        mNumRegsPerThreadLoadA{numRegsPerThreadLoadA},
         mNumRegsPerThreadLoadB{numRegsPerThreadLoadB},
+        mNumRegsPerThreadLoadSfA{numRegsPerThreadLoadSfA},
         mNumRegsPerThreadLoadSfB{numRegsPerThreadLoadSfB},
         mNumTokens(numTokens),
+        mNumWarpsLoadA{numWarpsLoadA},
         mNumWarpsLoadB{numWarpsLoadB},
+        mNumWarpsLoadSfA{numWarpsLoadSfA},
         mNumWarpsLoadSfB{numWarpsLoadSfB},
         mRouteImpl(routeImpl),
         mRouteSfsImpl(routeSfsImpl),
@@ -171,14 +176,22 @@ struct BatchedGemmOptions : public gemmGatedAct::GemmGatedActOptions {
   bool mIsUniformNumTokensPerBatch{false};
   // Number of Gemm batches.
   int mNumBatches;
+  // Number of registers per thread for load A
+  int mNumRegsPerThreadLoadA{0};
   // Number of registers per thread for load B
   int mNumRegsPerThreadLoadB{0};
+  // Number of registers per thread for load SfA
+  int mNumRegsPerThreadLoadSfA{0};
   // Number of registers per thread for load SfB
   int mNumRegsPerThreadLoadSfB{0};
   // Total number of tokens.
   int mNumTokens{32};
+  // Number of warps for load A
+  int mNumWarpsLoadA{0};
   // Number of warps for load B
   int mNumWarpsLoadB{0};
+  // Number of warps for load SfA
+  int mNumWarpsLoadSfA{0};
   // Number of warps for load SfB
   int mNumWarpsLoadSfB{0};
   // Whether load the input tokens and do routing.
@@ -287,7 +300,6 @@ inline bool checkAndUpdateBatchedGemmOptions(BatchedGemmOptions& options, tg::Cu
                    "LdgPlusSts does not support routing the tokens");
 
   if (options.mRouteSfsImpl.has_value() && options.mRouteSfsImpl.value() == RouteImpl::LdgPlusSts) {
-    TLLM_CHECK_ERROR(!batchM, "LdgPlusSts only supports batch N");
     TLLM_CHECK_ERROR(options.mTileK <= 512 && options.mTileK >= 128,
                      "LdgPlusSts only supports 128 <= tileK <= 512");
   }
@@ -336,10 +348,6 @@ inline bool checkAndUpdateBatchedGemmOptions(BatchedGemmOptions& options, tg::Cu
       }
     }
 
-    if (options.mClusterDimX > 1) {
-      TLLM_CHECK_ERROR(!batchM, "2CTA Gemm currently only supports batch N.");
-    }
-
     if (!batchM || doesRouteImplUseNoRoute(options.mRouteImpl)) {
       TLLM_CHECK_ERROR(options.mSfLayoutA == tg::SfLayout::R128c4,
                        "options.mSfLayoutA has to be tg::SfLayout::R128c4 when not being routed");
@@ -369,10 +377,9 @@ inline bool checkAndUpdateBatchedGemmOptions(BatchedGemmOptions& options, tg::Cu
                      "K must be a multiple of tileK when using Ldg based SF routing");
   }
 
-  if (options.mClusterDimX > 1 && batchM && options.mRouteImpl != RouteImpl::NoRoute) {
-    TLLM_CHECK_ERROR(false,
-                     "2CTA BatchedGemm does not support routing along M dimension. To support it, "
-                     "change the input routing data layout to be padded to clusterDimX size.");
+  if (options.mClusterDimX > 1 && batchM && options.mRouteSfsImpl.has_value()) {
+    TLLM_CHECK_ERROR(options.mRouteSfsImpl.value() != RouteImpl::Tma,
+                     "2CTA BatchedGemm does not support routing Sf along M dimension with TMA.");
   }
 
   // Check if all elements in mBatchedM or mBatchedN are the same (uniform tokens per batch) and
@@ -475,12 +482,16 @@ inline std::string dumpOptions(BatchedGemmOptions const& options, bool dumpRunti
   if (dumpRuntimeParams) {
     ss << "mNumBatches=" << options.mNumBatches << "," << std::endl;
   }
+  ss << "mNumRegsPerThreadLoadA=" << options.mNumRegsPerThreadLoadA << "," << std::endl;
   ss << "mNumRegsPerThreadLoadB=" << options.mNumRegsPerThreadLoadB << "," << std::endl;
+  ss << "mNumRegsPerThreadLoadSfA=" << options.mNumRegsPerThreadLoadSfA << "," << std::endl;
   ss << "mNumRegsPerThreadLoadSfB=" << options.mNumRegsPerThreadLoadSfB << "," << std::endl;
   if (dumpRuntimeParams) {
     ss << "mNumTokens=" << options.mNumTokens << "," << std::endl;
   }
+  ss << "mNumWarpsLoadA=" << options.mNumWarpsLoadA << "," << std::endl;
   ss << "mNumWarpsLoadB=" << options.mNumWarpsLoadB << "," << std::endl;
+  ss << "mNumWarpsLoadSfA=" << options.mNumWarpsLoadSfA << "," << std::endl;
   ss << "mNumWarpsLoadSfB=" << options.mNumWarpsLoadSfB << "," << std::endl;
   ss << "mRouteImpl=batchedGemm::RouteImpl(" << static_cast<int32_t>(options.mRouteImpl) << "),"
      << std::endl;
