@@ -787,6 +787,10 @@ def testRmsnormFp4quant(args):
         print(f"[VVERBOSE] {use_global_scale = }")
         print(f"[VVERBOSE] {is_sf_swizzled_layout = }")
 
+    # Warn user that refcheck is not supported for FP4 quantization fusion
+    if run_refcheck:
+        print("[WARNING] --refcheck is not supported for rmsnorm_fp4quant.")
+
     def run_backend(backend, input_tensor, weight):
         if backend == "cute-dsl":
             return flashinfer.rmsnorm_fp4quant(
@@ -800,23 +804,9 @@ def testRmsnormFp4quant(args):
         else:
             raise ValueError(f"Unsupported backend: {backend}")
 
-    # Reference: PyTorch implementation of RMSNorm + FP4 quantization
-    has_reference_output = False
-    if run_refcheck:
-        # For FP4 quantization, we verify output shapes and dtypes
-        # since FP4 quantization details are complex and implementation-specific
-        has_reference_output = True
-
     # Storage for timing results and outputs
     backend_times = {backend: [] for backend in backends}
-    outputs = {}
     for cur_backend in backends:
-        if run_refcheck:
-            out_fp4, out_scale = run_backend(cur_backend, input_tensor, weight)
-            outputs[cur_backend] = (
-                out_fp4.detach().clone(),
-                out_scale.detach().clone(),
-            )
         backend_times[cur_backend] = bench_gpu_time(
             fn=run_backend,
             dry_run_iters=args.dry_run_iters,
@@ -825,17 +815,6 @@ def testRmsnormFp4quant(args):
             use_cuda_graph=is_cuda_graph_compatible,
             input_args=(cur_backend, input_tensor, weight),
         )
-
-    tested_backends = list(outputs.keys())
-    if len(tested_backends) > 0:
-        if run_refcheck and has_reference_output:
-            # For FP4, we just verify output shapes are correct
-            for i in range(len(tested_backends)):
-                out_fp4, out_scale = outputs[tested_backends[i]]
-                if args.verbose >= 2:
-                    print(
-                        f"[VVERBOSE] Backend {tested_backends[i]}: out_fp4.shape = {out_fp4.shape}, out_scale.shape = {out_scale.shape}"
-                    )
 
     for backend in backends:
         if len(backend_times[backend]) > 0:
@@ -979,6 +958,10 @@ def testAddRmsnormFp4quant(args):
         print(f"[VVERBOSE] {use_global_scale = }")
         print(f"[VVERBOSE] {is_sf_swizzled_layout = }")
 
+    # Warn user that refcheck is not supported for FP4 quantization fusion
+    if run_refcheck:
+        print("[WARNING] --refcheck is not supported for add_rmsnorm_fp4quant. ")
+
     def run_backend(backend, input_tensor, residual_tensor, weight):
         if backend == "cute-dsl":
             return flashinfer.add_rmsnorm_fp4quant(
@@ -993,25 +976,9 @@ def testAddRmsnormFp4quant(args):
         else:
             raise ValueError(f"Unsupported backend: {backend}")
 
-    # Reference: For FP4 quantization, we verify output shapes and dtypes
-    # since FP4 quantization details are complex and implementation-specific
-    has_reference_output = False
-    if run_refcheck:
-        has_reference_output = True
-
     # Storage for timing results and outputs
     backend_times = {backend: [] for backend in backends}
-    outputs = {}
     for cur_backend in backends:
-        if run_refcheck:
-            out_fp4, out_scale, out_h = run_backend(
-                cur_backend, input_tensor, residual_tensor.clone(), weight
-            )
-            outputs[cur_backend] = (
-                out_fp4.detach().clone(),
-                out_scale.detach().clone(),
-                out_h.detach().clone(),
-            )
         backend_times[cur_backend] = bench_gpu_time(
             fn=run_backend,
             dry_run_iters=args.dry_run_iters,
@@ -1020,17 +987,6 @@ def testAddRmsnormFp4quant(args):
             use_cuda_graph=is_cuda_graph_compatible,
             input_args=(cur_backend, input_tensor, residual_tensor.clone(), weight),
         )
-
-    tested_backends = list(outputs.keys())
-    if len(tested_backends) > 0:
-        if run_refcheck and has_reference_output:
-            # For FP4, we just verify output shapes are correct
-            for i in range(len(tested_backends)):
-                out_fp4, out_scale, out_h = outputs[tested_backends[i]]
-                if args.verbose >= 2:
-                    print(
-                        f"[VVERBOSE] Backend {tested_backends[i]}: out_fp4.shape = {out_fp4.shape}, out_scale.shape = {out_scale.shape}, out_h.shape = {out_h.shape}"
-                    )
 
     for backend in backends:
         if len(backend_times[backend]) > 0:

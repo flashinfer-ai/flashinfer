@@ -363,7 +363,7 @@ routine_cc_to_supported_backends = {
         "9.0": [],
         "10.0": ["cute-dsl"],
         "10.3": ["cute-dsl"],
-        "12.0": [],
+        "12.0": ["cute-dsl"],
     },
     "add_rmsnorm_fp4quant": {
         "7.5": [],
@@ -373,7 +373,7 @@ routine_cc_to_supported_backends = {
         "9.0": [],
         "10.0": ["cute-dsl"],
         "10.3": ["cute-dsl"],
-        "12.0": [],
+        "12.0": ["cute-dsl"],
     },
     # QUANTIZATION
     "mxfp8_quantize": {
@@ -384,7 +384,7 @@ routine_cc_to_supported_backends = {
         "9.0": [],
         "10.0": ["cuda"],
         "10.3": ["cuda"],
-        "12.0": [],
+        "12.0": ["cuda"],
     },
     "mxfp4_quantize": {
         "7.5": [],
@@ -394,7 +394,7 @@ routine_cc_to_supported_backends = {
         "9.0": [],
         "10.0": ["cuda"],
         "10.3": ["cuda"],
-        "12.0": [],
+        "12.0": ["cuda"],
     },
     "nvfp4_quantize": {
         "7.5": [],
@@ -404,7 +404,7 @@ routine_cc_to_supported_backends = {
         "9.0": [],
         "10.0": ["cuda"],
         "10.3": ["cuda"],
-        "12.0": [],
+        "12.0": ["cuda"],
     },
     "nvfp4_batched_quantize": {
         "7.5": [],
@@ -414,7 +414,7 @@ routine_cc_to_supported_backends = {
         "9.0": [],
         "10.0": ["cuda"],
         "10.3": ["cuda"],
-        "12.0": [],
+        "12.0": ["cuda"],
     },
 }
 

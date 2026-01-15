@@ -544,6 +544,13 @@ def testNvfp4Quantize(args):
     run_refcheck = args.refcheck
     res = []
 
+    # do_shuffle involves CPU index generation which is not CUDA graph compatible
+    if do_shuffle and is_cuda_graph_compatible:
+        print(
+            "[WARNING] do_shuffle=True is not CUDA graph compatible. Disabling CUDA graph."
+        )
+        is_cuda_graph_compatible = False
+
     # Convert sf_layout string to enum
     sf_layout_map = {
         "128x4": SfLayout.layout_128x4,
