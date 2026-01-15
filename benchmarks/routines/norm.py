@@ -774,9 +774,10 @@ def testRmsnormFp4quant(args):
     weight = torch.randn(hidden_size, dtype=input_dtype, device=device)
 
     # Prepare global_scale if using NVFP4 format
+    # Note: API expects a 1D tensor of shape [1], not a 0D scalar
     global_scale = None
     if use_global_scale:
-        global_scale = torch.tensor(1.0, dtype=torch.float32, device=device)
+        global_scale = torch.tensor([1.0], dtype=torch.float32, device=device)
 
     if args.verbose >= 2:
         print(f"[VVERBOSE] {input_tensor.shape = }")
@@ -944,9 +945,10 @@ def testAddRmsnormFp4quant(args):
     weight = torch.randn(hidden_size, dtype=input_dtype, device=device)
 
     # Prepare global_scale if using NVFP4 format
+    # Note: API expects a 1D tensor of shape [1], not a 0D scalar
     global_scale = None
     if use_global_scale:
-        global_scale = torch.tensor(1.0, dtype=torch.float32, device=device)
+        global_scale = torch.tensor([1.0], dtype=torch.float32, device=device)
 
     if args.verbose >= 2:
         print(f"[VVERBOSE] {input_tensor.shape = }")

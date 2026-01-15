@@ -95,17 +95,32 @@ $ python3 flashinfer_benchmark.py --routine BatchPrefillWithRaggedKVCacheWrapper
 
 # RMSNorm with FP8 quantized output
 $ python3 flashinfer_benchmark.py --routine rmsnorm_quant --batch_size 32 --hidden_size 4096 --input_dtype bfloat16 --out_dtype fp8_e4m3 --scale 1.0 --refcheck -vv --generate_repro_command --case_tag "rmsnorm_quant_fp8_e4m3"
-[INFO] args = Namespace(routine='rmsnorm_quant', ...)
 [INFO] Running testRmsnormQuant
 [INFO] FlashInfer version: 0.6.1
-[PERF] cuda           :: median time 0.005 ms; std 0.000 ms; achieved tflops 0.131 TFLOPs/sec; achieved tb_per_sec 0.132 TB/sec
+[VVERBOSE] gpu_name = 'NVIDIA_B300_SXM6_AC'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine rmsnorm_quant --batch_size 32 --hidden_size 4096 --input_dtype bfloat16 --out_dtype fp8_e4m3 --scale 1.0 --refcheck -vv --generate_repro_command --case_tag rmsnorm_quant_fp8_e4m3
+[VVERBOSE] input_tensor.shape = torch.Size([32, 4096])
+[VVERBOSE] input_tensor.dtype = torch.bfloat16
+[VVERBOSE] weight.shape = torch.Size([4096])
+[VVERBOSE] out_tensor.dtype = torch.float8_e4m3fn
+[VVERBOSE] scale = 1.0
+[PERF] cuda           :: median time 0.003 ms; std 0.000 ms; achieved tflops 0.229 TFLOPs/sec; achieved tb_per_sec 0.140 TB/sec
 
 # MxFP8 Quantization (Blackwell SM10.0+ only)
 $ python3 flashinfer_benchmark.py --routine mxfp8_quantize --m 2048 --k 8192 --input_dtype bfloat16 --refcheck -vv --generate_repro_command --case_tag "mxfp8_quantize"
-[INFO] args = Namespace(routine='mxfp8_quantize', ...)
+[INFO] args = Namespace(routine='mxfp8_quantize', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='mxfp8_quantize', generate_repro_command=True, repro_command='', m=2048, k=8192, input_dtype='bfloat16', is_sf_swizzled_layout=True, no_sf_swizzled_layout=False, alignment=32, enable_pdl=False, backends=['cuda'], batch_size=None, global_scale=1.0, sf_layout='128x4', do_shuffle=False, sf_vec_size=16)
 [INFO] Running testMxfp8Quantize
 [INFO] FlashInfer version: 0.6.1
-[PERF] cuda           :: median time 0.041 ms; std 0.000 ms; achieved tflops 1.228 TFLOPs/sec; achieved tb_per_sec 1.240 TB/sec
+[VVERBOSE] gpu_name = 'NVIDIA_B300_SXM6_AC'
+[INFO] To reproduce this test case, run the following command: python3 flashinfer_benchmark.py --routine mxfp8_quantize --m 2048 --k 8192 --input_dtype bfloat16 --refcheck -vv --generate_repro_command --case_tag mxfp8_quantize
+[VVERBOSE] input_tensor.shape = torch.Size([2048, 8192])
+[VVERBOSE] input_tensor.dtype = torch.bfloat16
+[VVERBOSE] is_sf_swizzled_layout = True
+[VVERBOSE] alignment = 32
+[VVERBOSE] enable_pdl = False
+[VVERBOSE] Backend cuda: x_q.shape = torch.Size([2048, 8192]), x_q.dtype = torch.float8_e4m3fn, sf.shape = torch.Size([524288]), sf.dtype = torch.uint8
+[VVERBOSE] Round-trip error: 0/16777216 (0.00%) elements differ
+[PERF] cuda           :: median time 0.016 ms; std 0.000 ms; achieved tflops 3.118 TFLOPs/sec; achieved tb_per_sec 3.150 TB/sec
 ```
 
 ### Batch Testing
