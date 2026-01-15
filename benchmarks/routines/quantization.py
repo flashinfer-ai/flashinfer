@@ -1,5 +1,5 @@
 """
-Copyright (c) 2023 by FlashInfer team.
+Copyright (c) 2025 by FlashInfer team.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -328,22 +328,22 @@ def testMxfp8Quantize(args):
 
             print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
 
-        if args.output_path is not None:
-            cur_res = defaultdict(str)
-            cur_res["routine"] = args.routine
-            cur_res["median_time"] = median_time
-            cur_res["std_time"] = std_time
-            cur_res["tflops"] = tflops
-            cur_res["tb_per_sec"] = tb_per_sec
-            cur_res["m"] = m
-            cur_res["k"] = k
-            cur_res["input_dtype"] = str(input_dtype)
-            cur_res["is_sf_swizzled_layout"] = is_sf_swizzled_layout
-            cur_res["alignment"] = alignment
-            cur_res["enable_pdl"] = enable_pdl
-            cur_res["backend"] = backend
-            cur_res["case_tag"] = args.case_tag
-            res.append(cur_res)
+            if args.output_path is not None:
+                cur_res = defaultdict(str)
+                cur_res["routine"] = args.routine
+                cur_res["median_time"] = median_time
+                cur_res["std_time"] = std_time
+                cur_res["tflops"] = tflops
+                cur_res["tb_per_sec"] = tb_per_sec
+                cur_res["m"] = m
+                cur_res["k"] = k
+                cur_res["input_dtype"] = str(input_dtype)
+                cur_res["is_sf_swizzled_layout"] = is_sf_swizzled_layout
+                cur_res["alignment"] = alignment
+                cur_res["enable_pdl"] = enable_pdl
+                cur_res["backend"] = backend
+                cur_res["case_tag"] = args.case_tag
+                res.append(cur_res)
     return res
 
 
@@ -485,19 +485,19 @@ def testMxfp4Quantize(args):
 
             print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
 
-        if args.output_path is not None:
-            cur_res = defaultdict(str)
-            cur_res["routine"] = args.routine
-            cur_res["median_time"] = median_time
-            cur_res["std_time"] = std_time
-            cur_res["tflops"] = tflops
-            cur_res["tb_per_sec"] = tb_per_sec
-            cur_res["m"] = m
-            cur_res["k"] = k
-            cur_res["input_dtype"] = str(input_dtype)
-            cur_res["backend"] = backend
-            cur_res["case_tag"] = args.case_tag
-            res.append(cur_res)
+            if args.output_path is not None:
+                cur_res = defaultdict(str)
+                cur_res["routine"] = args.routine
+                cur_res["median_time"] = median_time
+                cur_res["std_time"] = std_time
+                cur_res["tflops"] = tflops
+                cur_res["tb_per_sec"] = tb_per_sec
+                cur_res["m"] = m
+                cur_res["k"] = k
+                cur_res["input_dtype"] = str(input_dtype)
+                cur_res["backend"] = backend
+                cur_res["case_tag"] = args.case_tag
+                res.append(cur_res)
     return res
 
 
@@ -647,24 +647,24 @@ def testNvfp4Quantize(args):
 
             print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
 
-        if args.output_path is not None:
-            cur_res = defaultdict(str)
-            cur_res["routine"] = args.routine
-            cur_res["median_time"] = median_time
-            cur_res["std_time"] = std_time
-            cur_res["tflops"] = tflops
-            cur_res["tb_per_sec"] = tb_per_sec
-            cur_res["m"] = m
-            cur_res["k"] = k
-            cur_res["input_dtype"] = str(input_dtype)
-            cur_res["global_scale"] = global_scale
-            cur_res["sf_layout"] = sf_layout_str
-            cur_res["do_shuffle"] = do_shuffle
-            cur_res["sf_vec_size"] = sf_vec_size
-            cur_res["enable_pdl"] = enable_pdl
-            cur_res["backend"] = backend
-            cur_res["case_tag"] = args.case_tag
-            res.append(cur_res)
+            if args.output_path is not None:
+                cur_res = defaultdict(str)
+                cur_res["routine"] = args.routine
+                cur_res["median_time"] = median_time
+                cur_res["std_time"] = std_time
+                cur_res["tflops"] = tflops
+                cur_res["tb_per_sec"] = tb_per_sec
+                cur_res["m"] = m
+                cur_res["k"] = k
+                cur_res["input_dtype"] = str(input_dtype)
+                cur_res["global_scale"] = global_scale
+                cur_res["sf_layout"] = sf_layout_str
+                cur_res["do_shuffle"] = do_shuffle
+                cur_res["sf_vec_size"] = sf_vec_size
+                cur_res["enable_pdl"] = enable_pdl
+                cur_res["backend"] = backend
+                cur_res["case_tag"] = args.case_tag
+                res.append(cur_res)
     return res
 
 
@@ -799,21 +799,20 @@ def testNvfp4BatchedQuantize(args):
 
             print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
 
-        if args.output_path is not None:
-            cur_res = defaultdict(str)
-            cur_res["routine"] = args.routine
-            cur_res["median_time"] = median_time
-            cur_res["std_time"] = std_time
-            cur_res["tflops"] = tflops
-            cur_res["tb_per_sec"] = tb_per_sec
-            cur_res["batch_size"] = batch_size
-            cur_res["m"] = m
-            cur_res["k"] = k
-            cur_res["input_dtype"] = str(input_dtype)
-            cur_res["global_scale"] = global_scale
-            cur_res["sf_vec_size"] = sf_vec_size
-            cur_res["backend"] = backend
-            cur_res["case_tag"] = args.case_tag
-            res.append(cur_res)
+            if args.output_path is not None:
+                cur_res = defaultdict(str)
+                cur_res["routine"] = args.routine
+                cur_res["median_time"] = median_time
+                cur_res["std_time"] = std_time
+                cur_res["tflops"] = tflops
+                cur_res["tb_per_sec"] = tb_per_sec
+                cur_res["batch_size"] = batch_size
+                cur_res["m"] = m
+                cur_res["k"] = k
+                cur_res["input_dtype"] = str(input_dtype)
+                cur_res["global_scale"] = global_scale
+                cur_res["sf_vec_size"] = sf_vec_size
+                cur_res["backend"] = backend
+                cur_res["case_tag"] = args.case_tag
+                res.append(cur_res)
     return res
-

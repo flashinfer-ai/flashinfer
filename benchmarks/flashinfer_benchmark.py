@@ -40,9 +40,10 @@ def run_test(args):
         with open(args.output_path, "a") as fout:
             for cur_res in res:
                 for key in output_column_dict["general"]:
-                    # Use getattr with default "" for optional columns like batch_size/hidden_size
-                    # that may not be present in all routine types
-                    cur_res[key] = getattr(args, key, "")
+                    # Only set from args if the routine hasn't already set a value
+                    # This preserves routine-specific formatting while providing defaults
+                    if key not in cur_res or cur_res[key] == "":
+                        cur_res[key] = getattr(args, key, "")
 
                 output_line = ",".join(
                     [str(cur_res[col]) for col in full_output_columns]

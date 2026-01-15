@@ -1,5 +1,5 @@
 """
-Copyright (c) 2023 by FlashInfer team.
+Copyright (c) 2025 by FlashInfer team.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -293,20 +293,20 @@ def testRmsnorm(args):
 
             print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
 
-        if args.output_path is not None:
-            cur_res = defaultdict(str)
-            cur_res["routine"] = args.routine
-            cur_res["median_time"] = median_time
-            cur_res["std_time"] = std_time
-            cur_res["tflops"] = tflops
-            cur_res["tb_per_sec"] = tb_per_sec
-            cur_res["num_heads"] = num_heads if num_heads else ""
-            cur_res["input_dtype"] = str(input_dtype)
-            cur_res["eps"] = eps
-            cur_res["enable_pdl"] = enable_pdl
-            cur_res["backend"] = backend
-            cur_res["case_tag"] = args.case_tag
-            res.append(cur_res)
+            if args.output_path is not None:
+                cur_res = defaultdict(str)
+                cur_res["routine"] = args.routine
+                cur_res["median_time"] = median_time
+                cur_res["std_time"] = std_time
+                cur_res["tflops"] = tflops
+                cur_res["tb_per_sec"] = tb_per_sec
+                cur_res["num_heads"] = num_heads if num_heads else ""
+                cur_res["input_dtype"] = str(input_dtype)
+                cur_res["eps"] = eps
+                cur_res["enable_pdl"] = enable_pdl
+                cur_res["backend"] = backend
+                cur_res["case_tag"] = args.case_tag
+                res.append(cur_res)
     return res
 
 
@@ -472,21 +472,21 @@ def testRmsnormQuant(args):
 
             print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
 
-        if args.output_path is not None:
-            cur_res = defaultdict(str)
-            cur_res["routine"] = args.routine
-            cur_res["median_time"] = median_time
-            cur_res["std_time"] = std_time
-            cur_res["tflops"] = tflops
-            cur_res["tb_per_sec"] = tb_per_sec
-            cur_res["input_dtype"] = str(input_dtype)
-            cur_res["out_dtype"] = str(out_dtype)
-            cur_res["scale"] = scale
-            cur_res["eps"] = eps
-            cur_res["enable_pdl"] = enable_pdl
-            cur_res["backend"] = backend
-            cur_res["case_tag"] = args.case_tag
-            res.append(cur_res)
+            if args.output_path is not None:
+                cur_res = defaultdict(str)
+                cur_res["routine"] = args.routine
+                cur_res["median_time"] = median_time
+                cur_res["std_time"] = std_time
+                cur_res["tflops"] = tflops
+                cur_res["tb_per_sec"] = tb_per_sec
+                cur_res["input_dtype"] = str(input_dtype)
+                cur_res["out_dtype"] = str(out_dtype)
+                cur_res["scale"] = scale
+                cur_res["eps"] = eps
+                cur_res["enable_pdl"] = enable_pdl
+                cur_res["backend"] = backend
+                cur_res["case_tag"] = args.case_tag
+                res.append(cur_res)
     return res
 
 
@@ -672,21 +672,21 @@ def testFusedAddRmsnormQuant(args):
 
             print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
 
-        if args.output_path is not None:
-            cur_res = defaultdict(str)
-            cur_res["routine"] = args.routine
-            cur_res["median_time"] = median_time
-            cur_res["std_time"] = std_time
-            cur_res["tflops"] = tflops
-            cur_res["tb_per_sec"] = tb_per_sec
-            cur_res["input_dtype"] = str(input_dtype)
-            cur_res["out_dtype"] = str(out_dtype)
-            cur_res["scale"] = scale
-            cur_res["eps"] = eps
-            cur_res["enable_pdl"] = enable_pdl
-            cur_res["backend"] = backend
-            cur_res["case_tag"] = args.case_tag
-            res.append(cur_res)
+            if args.output_path is not None:
+                cur_res = defaultdict(str)
+                cur_res["routine"] = args.routine
+                cur_res["median_time"] = median_time
+                cur_res["std_time"] = std_time
+                cur_res["tflops"] = tflops
+                cur_res["tb_per_sec"] = tb_per_sec
+                cur_res["input_dtype"] = str(input_dtype)
+                cur_res["out_dtype"] = str(out_dtype)
+                cur_res["scale"] = scale
+                cur_res["eps"] = eps
+                cur_res["enable_pdl"] = enable_pdl
+                cur_res["backend"] = backend
+                cur_res["case_tag"] = args.case_tag
+                res.append(cur_res)
     return res
 
 
@@ -861,22 +861,22 @@ def testRmsnormFp4quant(args):
 
             print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
 
-        if args.output_path is not None:
-            cur_res = defaultdict(str)
-            cur_res["routine"] = args.routine
-            cur_res["median_time"] = median_time
-            cur_res["std_time"] = std_time
-            cur_res["tflops"] = tflops
-            cur_res["tb_per_sec"] = tb_per_sec
-            cur_res["num_heads"] = num_heads if num_heads else ""
-            cur_res["input_dtype"] = str(input_dtype)
-            cur_res["out_dtype"] = out_dtype
-            cur_res["eps"] = eps
-            cur_res["use_global_scale"] = use_global_scale
-            cur_res["is_sf_swizzled_layout"] = is_sf_swizzled_layout
-            cur_res["backend"] = backend
-            cur_res["case_tag"] = args.case_tag
-            res.append(cur_res)
+            if args.output_path is not None:
+                cur_res = defaultdict(str)
+                cur_res["routine"] = args.routine
+                cur_res["median_time"] = median_time
+                cur_res["std_time"] = std_time
+                cur_res["tflops"] = tflops
+                cur_res["tb_per_sec"] = tb_per_sec
+                cur_res["num_heads"] = num_heads if num_heads else ""
+                cur_res["input_dtype"] = str(input_dtype)
+                cur_res["out_dtype"] = out_dtype
+                cur_res["eps"] = eps
+                cur_res["use_global_scale"] = use_global_scale
+                cur_res["is_sf_swizzled_layout"] = is_sf_swizzled_layout
+                cur_res["backend"] = backend
+                cur_res["case_tag"] = args.case_tag
+                res.append(cur_res)
     return res
 
 
@@ -1058,20 +1058,20 @@ def testAddRmsnormFp4quant(args):
 
             print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
 
-        if args.output_path is not None:
-            cur_res = defaultdict(str)
-            cur_res["routine"] = args.routine
-            cur_res["median_time"] = median_time
-            cur_res["std_time"] = std_time
-            cur_res["tflops"] = tflops
-            cur_res["tb_per_sec"] = tb_per_sec
-            cur_res["num_heads"] = num_heads if num_heads else ""
-            cur_res["input_dtype"] = str(input_dtype)
-            cur_res["out_dtype"] = out_dtype
-            cur_res["eps"] = eps
-            cur_res["use_global_scale"] = use_global_scale
-            cur_res["is_sf_swizzled_layout"] = is_sf_swizzled_layout
-            cur_res["backend"] = backend
-            cur_res["case_tag"] = args.case_tag
-            res.append(cur_res)
+            if args.output_path is not None:
+                cur_res = defaultdict(str)
+                cur_res["routine"] = args.routine
+                cur_res["median_time"] = median_time
+                cur_res["std_time"] = std_time
+                cur_res["tflops"] = tflops
+                cur_res["tb_per_sec"] = tb_per_sec
+                cur_res["num_heads"] = num_heads if num_heads else ""
+                cur_res["input_dtype"] = str(input_dtype)
+                cur_res["out_dtype"] = out_dtype
+                cur_res["eps"] = eps
+                cur_res["use_global_scale"] = use_global_scale
+                cur_res["is_sf_swizzled_layout"] = is_sf_swizzled_layout
+                cur_res["backend"] = backend
+                cur_res["case_tag"] = args.case_tag
+                res.append(cur_res)
     return res
