@@ -65,7 +65,8 @@ jobs:
             CHANGED=$(git diff --name-only origin/${{ github.base_ref }}...HEAD)
 
             # Skip patterns (same as Jenkins)
-            SKIP_PATTERNS="README.md|^\.github/|^docs/|^docker/|^licenses/|^LICENSE$|^NOTICE$|^version\.txt$"
+            # TODO (yongwww): Add back ^\.github/ before merging to main
+            SKIP_PATTERNS="README.md|^docs/|^docker/|^licenses/|^LICENSE$|^NOTICE$|^version\.txt$"
 
             # Check if all changes match skip patterns
             SKIP=true
