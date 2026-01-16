@@ -18,6 +18,7 @@
 
 #include <cuda.h>
 
+#include <cfloat>
 #include <cstdint>
 #include <iterator>
 #include <memory>
