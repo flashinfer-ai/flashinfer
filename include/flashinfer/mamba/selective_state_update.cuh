@@ -228,16 +228,18 @@ __global__ void selective_state_update_kernel_simple(SelectiveStateUpdateParams 
 
   __syncthreads();
 
-  auto d = warp * rowsPerWarp + lane;
-  if (d < DIM) {
-    auto out_value = sram.out[d];
-    if (z) {
-      float z_value = toFloat(sram.z[d]);
-      float sig_z = __fdividef(1.f, (1.f + __expf(0.f - z_value)));
-      float silu_z = z_value * sig_z;
-      out_value *= silu_z;
+  for (int l = lane; l < rowsPerWarp; l += warpSize) {
+    auto d = warp * rowsPerWarp + l;
+    if (d < DIM) {
+      auto out_value = sram.out[d];
+      if (z) {
+        float z_value = toFloat(sram.z[d]);
+        float sig_z = __fdividef(1.f, (1.f + __expf(0.f - z_value)));
+        float silu_z = z_value * sig_z;
+        out_value *= silu_z;
+      }
+      convertAndStore(&output[batch * params.out_stride_batch + head * DIM + d], out_value);
     }
-    convertAndStore(&output[batch * params.out_stride_batch + head * DIM + d], out_value);
   }
 }
 
