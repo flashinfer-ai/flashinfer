@@ -224,13 +224,20 @@ jobs:
             exit 0
           fi
 
-          echo "AOT Build: ${{ needs.aot-build-import.result }}" >> $GITHUB_STEP_SUMMARY
-          echo "GPU Tests (A10G): ${{ needs.gpu-tests-a10g.result }}" >> $GITHUB_STEP_SUMMARY
-          echo "GPU Tests (T4): ${{ needs.gpu-tests-t4.result }}" >> $GITHUB_STEP_SUMMARY
+          AOT="${{ needs.aot-build-import.result }}"
+          A10G="${{ needs.gpu-tests-a10g.result }}"
+          T4="${{ needs.gpu-tests-t4.result }}"
+          SKIP_AOT="${{ github.event.inputs.skip_aot }}"
+          SKIP_GPU="${{ github.event.inputs.skip_gpu }}"
 
-          if [ "${{ needs.aot-build-import.result }}" == "failure" ] || \
-             [ "${{ needs.gpu-tests-a10g.result }}" == "failure" ] || \
-             [ "${{ needs.gpu-tests-t4.result }}" == "failure" ]; then
+          echo "AOT Build: $AOT" >> $GITHUB_STEP_SUMMARY
+          echo "GPU Tests (A10G): $A10G" >> $GITHUB_STEP_SUMMARY
+          echo "GPU Tests (T4): $T4" >> $GITHUB_STEP_SUMMARY
+
+          # Fail if any required job is not success (unless explicitly skipped)
+          if { [ "$AOT" != "success" ] && [ "$SKIP_AOT" != "true" ]; } || \
+             { [ "$A10G" != "success" ] && [ "$SKIP_GPU" != "true" ]; } || \
+             { [ "$T4" != "success" ] && [ "$SKIP_GPU" != "true" ]; }; then
             echo "**CI Failed**" >> $GITHUB_STEP_SUMMARY
             exit 1
           fi
