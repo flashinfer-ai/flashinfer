@@ -73,7 +73,9 @@ jobs:
           done <<< "$CHANGED"
 
           echo "skip=$SKIP" >> $GITHUB_OUTPUT
-          [ "$SKIP" == "true" ] && echo "::notice::Skipping build - only docs/config files changed"
+          if [ "$SKIP" == "true" ]; then
+            echo "::notice::Skipping build - only docs/config files changed"
+          fi
 
   # ---------------------------------------------------------------------------
   # AOT Build Tests - x86_64 and aarch64 (multiple CUDA versions)
