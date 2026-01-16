@@ -285,9 +285,10 @@ def _setup_mpi_and_device() -> Tuple[MPI.Comm, int, int, int]:
 def _calculate_fp4_global_scale(tensor: torch.Tensor) -> torch.Tensor:
     """Calculate global scale factor for FP4 quantization."""
     tensor_amax = tensor.abs().max().to(torch.float32)
-    global_scale = (
-        (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX) / tensor_amax if tensor_amax != 0.0 else 0.0
-    )
+    if tensor_amax == 0.0:
+        global_scale = torch.tensor(0.0, dtype=torch.float32, device=tensor.device)
+    else:
+        global_scale = (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX) / tensor_amax
     return global_scale
 
 
