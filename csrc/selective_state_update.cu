@@ -187,13 +187,33 @@ void selective_state_update(TensorView state, TensorView x, TensorView dt, Tenso
   auto dtype_key =
       std::make_tuple(state_dtype_code, input_dtype_code, weight_dtype_code, matrixA_dtype_code);
 
-  // Currently only support: input_t = weight_t = state_t = bfloat16, matrixA_t = float
-  if (dtype_key == std::make_tuple(bfloat16_code, bfloat16_code, bfloat16_code, float32_code)) {
+  if (dtype_key == std::make_tuple(/*state*/ bfloat16_code, /*input */ bfloat16_code,
+                                   /*weight */ bfloat16_code, /*matrixA */ float32_code)) {
     using state_t = nv_bfloat16;
     using input_t = nv_bfloat16;
     using weight_t = nv_bfloat16;
     using matrixA_t = float;
-
+    invokeSelectiveStateUpdate<input_t, weight_t, matrixA_t, state_t>(p, stream);
+  } else if (dtype_key == std::make_tuple(/*state*/ bfloat16_code, /*input */ bfloat16_code,
+                                          /*weight */ float32_code, /*matrixA */ float32_code)) {
+    using state_t = nv_bfloat16;
+    using input_t = nv_bfloat16;
+    using weight_t = float;
+    using matrixA_t = float;
+    invokeSelectiveStateUpdate<input_t, weight_t, matrixA_t, state_t>(p, stream);
+  } else if (dtype_key == std::make_tuple(/*state*/ float16_code, /*input */ bfloat16_code,
+                                          /*weight */ float32_code, /*matrixA */ float32_code)) {
+    using state_t = half;
+    using input_t = nv_bfloat16;
+    using weight_t = float;
+    using matrixA_t = float;
+    invokeSelectiveStateUpdate<input_t, weight_t, matrixA_t, state_t>(p, stream);
+  } else if (dtype_key == std::make_tuple(/*state*/ float32_code, /*input */ bfloat16_code,
+                                          /*weight */ float32_code, /*matrixA */ float32_code)) {
+    using state_t = float;
+    using input_t = nv_bfloat16;
+    using weight_t = float;
+    using matrixA_t = float;
     invokeSelectiveStateUpdate<input_t, weight_t, matrixA_t, state_t>(p, stream);
   } else {
     // Default case: unsupported dtype combination
