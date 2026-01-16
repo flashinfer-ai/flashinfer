@@ -1,5 +1,6 @@
 # CI workflow using AWS self-hosted runners.
 # Runs AOT build tests and GPU unit tests on push/PR to main.
+# Uses ci/bash.sh for Docker execution (same as Jenkins).
 
 name: PR Test
 
@@ -27,7 +28,6 @@ permissions:
   contents: read
 
 env:
-  # Jenkins compatibility variables (used by task_show_node_info.sh)
   EXECUTOR_NUMBER: "0"
 
 jobs:
@@ -79,6 +79,7 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # AOT Build Tests - x86_64 and aarch64 (multiple CUDA versions)
+  # Uses ci/bash.sh with --no-gpu (same as Jenkins)
   # ---------------------------------------------------------------------------
   aot-build-import:
     name: AOT Build (${{ matrix.arch }}, ${{ matrix.cuda }})
@@ -95,8 +96,8 @@ jobs:
       matrix:
         arch: [X64, ARM64]
         cuda: [cu126, cu128, cu129, cu130]
-    container:
-      image: flashinfer/flashinfer-ci-${{ matrix.cuda }}:${{ needs.setup.outputs.docker_tag }}
+    env:
+      DOCKER_IMAGE: flashinfer/flashinfer-ci-${{ matrix.cuda }}:${{ needs.setup.outputs.docker_tag }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -104,7 +105,8 @@ jobs:
 
       - name: Show System Info
         run: |
-          echo "=== System ===" && df -h && free -h && nproc && lscpu | head -15
+          echo "=== Host System ===" && df -h && free -h && nproc
+          echo "=== Docker ===" && docker --version
 
       - name: Show Node Info
         run: ./scripts/task_show_node_info.sh
@@ -114,14 +116,17 @@ jobs:
           BUILD_NUMBER: ${{ github.run_number }}
 
       - name: Test JIT Cache Package Build and Import
-        run: ./scripts/task_test_jit_cache_package_build_import.sh
+        run: bash ci/bash.sh ${DOCKER_IMAGE} --no-gpu ./scripts/task_test_jit_cache_package_build_import.sh
 
       - name: Cleanup
         if: always()
-        run: rm -rf $GITHUB_WORKSPACE/* ~/.cache/flashinfer_jit || true
+        run: |
+          rm -rf ~/.cache/flashinfer_jit || true
+          docker system prune -f || true
 
   # ---------------------------------------------------------------------------
   # GPU JIT Tests - SM86 (A10G) - 5 Shards
+  # Uses ci/bash.sh with GPU (same as Jenkins)
   # ---------------------------------------------------------------------------
   gpu-tests-a10g:
     name: JIT Unittest ${{ matrix.shard }} (A10G)
@@ -133,9 +138,8 @@ jobs:
       fail-fast: true
       matrix:
         shard: [1, 2, 3, 4, 5]
-    container:
-      image: flashinfer/flashinfer-ci-cu129:${{ needs.setup.outputs.docker_tag }}
-      options: --gpus all --shm-size=16g
+    env:
+      DOCKER_IMAGE: flashinfer/flashinfer-ci-cu129:${{ needs.setup.outputs.docker_tag }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -143,8 +147,9 @@ jobs:
 
       - name: Show System Info
         run: |
-          echo "=== System ===" && df -h && free -h && nproc
-          echo "=== GPU ===" && nvidia-smi && nvcc --version || true
+          echo "=== Host System ===" && df -h && free -h && nproc
+          echo "=== GPU ===" && nvidia-smi
+          echo "=== Docker ===" && docker --version
 
       - name: Show Node Info
         run: ./scripts/task_show_node_info.sh
@@ -154,14 +159,17 @@ jobs:
           BUILD_NUMBER: ${{ github.run_number }}
 
       - name: Run JIT Unittest Part ${{ matrix.shard }}
-        run: ./scripts/task_jit_run_tests_part${{ matrix.shard }}.sh
+        run: bash ci/bash.sh ${DOCKER_IMAGE} ./scripts/task_jit_run_tests_part${{ matrix.shard }}.sh
 
       - name: Cleanup
         if: always()
-        run: rm -rf $GITHUB_WORKSPACE/* ~/.cache/flashinfer_jit || true
+        run: |
+          rm -rf ~/.cache/flashinfer_jit || true
+          docker system prune -f || true
 
   # ---------------------------------------------------------------------------
   # GPU JIT Tests - SM75 (T4) - sampling tests only
+  # Uses ci/bash.sh with GPU (same as Jenkins)
   # ---------------------------------------------------------------------------
   gpu-tests-t4:
     name: JIT Unittest G4 (T4)
@@ -169,9 +177,8 @@ jobs:
     if: needs.setup.outputs.skip_build != 'true' && github.event.inputs.skip_gpu != 'true'
     runs-on: [self-hosted, Linux, X64, gpu, sm75]
     timeout-minutes: 300
-    container:
-      image: flashinfer/flashinfer-ci-cu129:${{ needs.setup.outputs.docker_tag }}
-      options: --gpus all --shm-size=16g
+    env:
+      DOCKER_IMAGE: flashinfer/flashinfer-ci-cu129:${{ needs.setup.outputs.docker_tag }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -179,8 +186,9 @@ jobs:
 
       - name: Show System Info
         run: |
-          echo "=== System ===" && df -h && free -h && nproc
-          echo "=== GPU ===" && nvidia-smi && nvcc --version || true
+          echo "=== Host System ===" && df -h && free -h && nproc
+          echo "=== GPU ===" && nvidia-smi
+          echo "=== Docker ===" && docker --version
 
       - name: Show Node Info
         run: ./scripts/task_show_node_info.sh
@@ -190,11 +198,13 @@ jobs:
           BUILD_NUMBER: ${{ github.run_number }}
 
       - name: Run JIT Unittest Part 3 (T4)
-        run: ./scripts/task_jit_run_tests_part3.sh
+        run: bash ci/bash.sh ${DOCKER_IMAGE} ./scripts/task_jit_run_tests_part3.sh
 
       - name: Cleanup
         if: always()
-        run: rm -rf $GITHUB_WORKSPACE/* ~/.cache/flashinfer_jit || true
+        run: |
+          rm -rf ~/.cache/flashinfer_jit || true
+          docker system prune -f || true
 
   # ---------------------------------------------------------------------------
   # CI Summary
