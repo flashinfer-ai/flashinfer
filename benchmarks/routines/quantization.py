@@ -86,16 +86,17 @@ def parse_quantization_args(line, parser):
     )
     parser.add_argument(
         "--is_sf_swizzled_layout",
+        dest="is_sf_swizzled_layout",
         action="store_true",
-        default=True,
-        help="Use swizzled layout for scale factors. Default: True",
+        help="Use swizzled layout for scale factors. (default)",
     )
     parser.add_argument(
         "--no_sf_swizzled_layout",
-        action="store_true",
-        default=False,
+        dest="is_sf_swizzled_layout",
+        action="store_false",
         help="Disable swizzled layout for scale factors.",
     )
+    parser.set_defaults(is_sf_swizzled_layout=True)
     parser.add_argument(
         "--alignment",
         type=int,
@@ -157,10 +158,6 @@ def parse_quantization_args(line, parser):
 
     args = parser.parse_args(line)
 
-    # Handle swizzled layout flag
-    if args.no_sf_swizzled_layout:
-        args.is_sf_swizzled_layout = False
-
     if args.verbose >= 1:
         print(f"[INFO] {args = }")
     return args
@@ -205,9 +202,10 @@ def testMxfp8Quantize(args):
     run_refcheck = args.refcheck
     res = []
 
-    # Validate k is divisible by 32 (sf_vec_size)
-    if k % 32 != 0:
-        raise ValueError(f"k ({k}) must be divisible by 32 (sf_vec_size)")
+    # Validate k is divisible by alignment (sf_vec_size)
+    sf_vec_size = alignment
+    if k % sf_vec_size != 0:
+        raise ValueError(f"k ({k}) must be divisible by {sf_vec_size} (sf_vec_size)")
 
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
     if len(backends) == 0:
@@ -301,6 +299,17 @@ def testMxfp8Quantize(args):
                             f"[VVERBOSE] Round-trip error: {num_different_elements}/{num_elements} "
                             f"({num_different_elements_percentage:.2f}%) elements differ"
                         )
+                    # Enforce refcheck: fail or warn on mismatches
+                    if num_different_elements > 0:
+                        mismatch_msg = (
+                            f"[mxfp8_quantize] Round-trip mismatch: "
+                            f"{num_different_elements}/{num_elements} "
+                            f"({num_different_elements_percentage:.2f}%) elements differ"
+                        )
+                        if args.allow_output_mismatch:
+                            print(f"[WARNING] {mismatch_msg}")
+                        else:
+                            raise AssertionError(mismatch_msg)
                 except Exception as e:
                     if args.verbose >= 1:
                         print(f"[WARNING] Dequantize check failed: {e}")
@@ -314,7 +323,6 @@ def testMxfp8Quantize(args):
             # Read: input tensor
             # Write: quantized tensor (fp8) + scale factors
             num_elements = m * k
-            sf_vec_size = 32
             num_scale_factors = num_elements // sf_vec_size
             problem_bytes = (
                 num_elements * input_dtype.itemsize  # input read
@@ -382,6 +390,13 @@ def testMxfp4Quantize(args):
     is_cuda_graph_compatible = not args.no_cuda_graph
     run_refcheck = args.refcheck
     res = []
+
+    # mxfp4 uses sf_vec_size=32 (hardcoded in the API)
+    sf_vec_size = 32
+    if k % sf_vec_size != 0:
+        raise ValueError(
+            f"k ({k}) must be divisible by sf_vec_size ({sf_vec_size}) for mxfp4_quantize"
+        )
 
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
     if len(backends) == 0:
@@ -459,6 +474,17 @@ def testMxfp4Quantize(args):
                             f"[VVERBOSE] Round-trip error: {num_different_elements}/{num_elements} "
                             f"({num_different_elements_percentage:.2f}%) elements differ"
                         )
+                    # Enforce refcheck: fail or warn on mismatches
+                    if num_different_elements > 0:
+                        mismatch_msg = (
+                            f"[mxfp4_quantize] Round-trip mismatch: "
+                            f"{num_different_elements}/{num_elements} "
+                            f"({num_different_elements_percentage:.2f}%) elements differ"
+                        )
+                        if args.allow_output_mismatch:
+                            print(f"[WARNING] {mismatch_msg}")
+                        else:
+                            raise AssertionError(mismatch_msg)
                 except Exception as e:
                     if args.verbose >= 1:
                         print(f"[WARNING] Dequantize check failed: {e}")
@@ -558,6 +584,12 @@ def testNvfp4Quantize(args):
         "linear": SfLayout.layout_linear,
     }
     sf_layout = sf_layout_map[sf_layout_str]
+
+    # Validate k is divisible by sf_vec_size
+    if k % sf_vec_size != 0:
+        raise ValueError(
+            f"k ({k}) must be divisible by sf_vec_size ({sf_vec_size}) for nvfp4_quantize"
+        )
 
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
     if len(backends) == 0:
@@ -716,6 +748,12 @@ def testNvfp4BatchedQuantize(args):
 
     if batch_size is None:
         raise ValueError("--batch_size is required for nvfp4_batched_quantize")
+
+    # Validate k is divisible by sf_vec_size
+    if k % sf_vec_size != 0:
+        raise ValueError(
+            f"k ({k}) must be divisible by sf_vec_size ({sf_vec_size}) for nvfp4_batched_quantize"
+        )
 
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
     if len(backends) == 0:

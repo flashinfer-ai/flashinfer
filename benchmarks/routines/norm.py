@@ -752,6 +752,13 @@ def testRmsnormFp4quant(args):
             f"Unsupported out_dtype for FP4 quant: {out_dtype}. Supported: nvfp4, mxfp4."
         )
 
+    # Validate alignment: hidden_size must be divisible by block_size
+    if hidden_size % block_size != 0:
+        raise ValueError(
+            f"hidden_size ({hidden_size}) must be divisible by block_size ({block_size}) "
+            f"for {out_dtype} quantization."
+        )
+
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
     if len(backends) == 0:
         print("[ERROR] No backends to test. Exiting.")
@@ -920,6 +927,13 @@ def testAddRmsnormFp4quant(args):
     else:
         raise ValueError(
             f"Unsupported out_dtype for FP4 quant: {out_dtype}. Supported: nvfp4, mxfp4."
+        )
+
+    # Validate alignment: hidden_size must be divisible by block_size
+    if hidden_size % block_size != 0:
+        raise ValueError(
+            f"hidden_size ({hidden_size}) must be divisible by block_size ({block_size}) "
+            f"for {out_dtype} quantization."
         )
 
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
