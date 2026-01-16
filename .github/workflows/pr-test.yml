@@ -95,7 +95,7 @@ jobs:
       needs.setup.outputs.skip_build != 'true' &&
       (github.event.inputs.skip_aot != 'true' || github.event.inputs.skip_aot == '')
     runs-on: [self-hosted, Linux, X64, cpu]
-    timeout-minutes: 60
+    timeout-minutes: 240
     strategy:
       fail-fast: true
       matrix:
@@ -151,7 +151,7 @@ jobs:
       needs.setup.outputs.skip_build != 'true' &&
       (github.event.inputs.skip_aot != 'true' || github.event.inputs.skip_aot == '')
     runs-on: [self-hosted, Linux, ARM64, cpu]
-    timeout-minutes: 60
+    timeout-minutes: 240
     strategy:
       fail-fast: true
       matrix:
@@ -238,11 +238,8 @@ jobs:
           echo "=== GPU ==="
           nvidia-smi
           echo ""
-          echo "=== Docker Images ==="
-          docker images --format "table {{.Repository}}\t{{.Tag}}\t{{.Size}}" | head -20
-          echo ""
-          echo "=== Docker Disk Usage ==="
-          docker system df || true
+          echo "=== CUDA Version ==="
+          nvcc --version || echo "nvcc not in PATH"
 
       - name: Show Node Info
         run: ./scripts/task_show_node_info.sh
@@ -261,8 +258,6 @@ jobs:
           # Clean up workspace and caches to save disk space
           rm -rf $GITHUB_WORKSPACE/* || true
           rm -rf ~/.cache/flashinfer_jit || true
-          # Clean up Docker to free more space
-          docker system prune -af --volumes || true
 
   # ===========================================================================
   # GPU JIT Tests - SM75 (T4) - Part 3 Only
@@ -303,11 +298,8 @@ jobs:
           echo "=== GPU ==="
           nvidia-smi
           echo ""
-          echo "=== Docker Images ==="
-          docker images --format "table {{.Repository}}\t{{.Tag}}\t{{.Size}}" | head -20
-          echo ""
-          echo "=== Docker Disk Usage ==="
-          docker system df || true
+          echo "=== CUDA Version ==="
+          nvcc --version || echo "nvcc not in PATH"
 
       - name: Show Node Info
         run: ./scripts/task_show_node_info.sh
@@ -326,8 +318,6 @@ jobs:
           # Clean up workspace and caches to save disk space
           rm -rf $GITHUB_WORKSPACE/* || true
           rm -rf ~/.cache/flashinfer_jit || true
-          # Clean up Docker to free more space
-          docker system prune -af --volumes || true
 
   # ===========================================================================
   # CI Summary - Reports overall status
