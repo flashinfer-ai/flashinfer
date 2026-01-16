@@ -312,7 +312,11 @@ def testMxfp8Quantize(args):
                             raise AssertionError(mismatch_msg)
                 except Exception as e:
                     if args.verbose >= 1:
-                        print(f"[WARNING] Dequantize check failed: {e}")
+                        print(
+                            f"[WARNING] [mxfp8_quantize] Dequantize check failed: {e}"
+                        )
+                    if not args.allow_output_mismatch:
+                        raise
 
     for backend in backends:
         if len(backend_times[backend]) > 0:
@@ -487,7 +491,11 @@ def testMxfp4Quantize(args):
                             raise AssertionError(mismatch_msg)
                 except Exception as e:
                     if args.verbose >= 1:
-                        print(f"[WARNING] Dequantize check failed: {e}")
+                        print(
+                            f"[WARNING] [mxfp4_quantize] Dequantize check failed: {e}"
+                        )
+                    if not args.allow_output_mismatch:
+                        raise
 
     for backend in backends:
         if len(backend_times[backend]) > 0:
