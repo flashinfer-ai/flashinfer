@@ -101,11 +101,11 @@ __device__ __forceinline__ float warpReduceSum(float val) {
 
 template <typename input_t, int dim, int dstate>
 struct SharedStorageSimple {
-  input_t x[dim];
+  alignas(alignof(PackedAligned<input_t>)) input_t x[dim];
   float out[dim];
-  input_t z[dim];
-  input_t B[dstate];
-  input_t C[dstate];
+  alignas(alignof(PackedAligned<input_t>)) input_t z[dim];
+  alignas(alignof(PackedAligned<input_t>)) input_t B[dstate];
+  alignas(alignof(PackedAligned<input_t>)) input_t C[dstate];
 };
 
 template <typename input_t, typename weight_t, typename matrixA_t, typename state_t, int DIM,
@@ -245,11 +245,11 @@ template <typename input_t, typename weight_t, typename matrixA_t, typename stat
           int rowsPerStage, int dim, int dstate, uint8_t numStages>
 struct SharedStorage {
   alignas(128) state_t state[numStages][rowsPerStage * dstate];
-  input_t x[dim];
+  alignas(alignof(PackedAligned<input_t>)) input_t x[dim];
   float out[dim];  // dt is special cause we're gonna store input in there as well
-  input_t z[dim];
-  input_t B[dstate];
-  input_t C[dstate];
+  alignas(alignof(PackedAligned<input_t>)) input_t z[dim];
+  alignas(alignof(PackedAligned<input_t>)) input_t B[dstate];
+  alignas(alignof(PackedAligned<input_t>)) input_t C[dstate];
 
   using barrier_t = cuda::barrier<cuda::thread_scope_block>;
   barrier_t bar_empty[numStages];
