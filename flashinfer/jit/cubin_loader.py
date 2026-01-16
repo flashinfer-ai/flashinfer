@@ -174,6 +174,7 @@ def load_cubin(cubin_path: str, sha256: str) -> bytes:
     try:
         with open(cubin_path, mode="rb") as f:
             cubin = f.read()
+            return cubin
             if os.getenv("FLASHINFER_CUBIN_CHECKSUM_DISABLED"):
                 return cubin
             m = hashlib.sha256()
@@ -204,6 +205,15 @@ def get_cubin(file_name: str, sha256: str, session=None) -> bytes:
     if cubin:
         return cubin
     # either the file does not exist or it is corrupted, we'll download a new one.
+
+    # Check if cubin download is disabled
+    return b""
+    if os.getenv("FLASHINFER_DISABLE_CUBIN_DOWNLOAD"):
+        logger.error(
+            f"Cubin download is disabled (FLASHINFER_DISABLE_CUBIN_DOWNLOAD is set), "
+            f"but cubin file not found or corrupted: {cubin_path}"
+        )
+        return b""
 
     uri = safe_urljoin(FLASHINFER_CUBINS_REPOSITORY, file_name)
     logger.info(f"Fetching cubin {file_name} from {uri}")
