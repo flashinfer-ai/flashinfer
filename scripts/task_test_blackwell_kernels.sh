@@ -2,6 +2,9 @@
 
 set -eo pipefail
 
+# Source test environment setup (handles package overrides like TVM-FFI)
+source "$(dirname "${BASH_SOURCE[0]}")/setup_test_env.sh"
+
 : ${JUNIT_DIR:=$(realpath ./junit)}
 : ${MAX_JOBS:=$(nproc)}
 : ${CUDA_VISIBLE_DEVICES:=0}

@@ -6,6 +6,9 @@ set -x
 : ${CUDA_VISIBLE_DEVICES:=0}
 : ${SKIP_INSTALL:=0}
 
+# Source test environment setup (handles package overrides like TVM-FFI)
+source "$(dirname "${BASH_SOURCE[0]}")/setup_test_env.sh"
+
 if [ "$SKIP_INSTALL" = "0" ]; then
   pip install -e . -v
 fi

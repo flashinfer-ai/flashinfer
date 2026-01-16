@@ -3,6 +3,9 @@
 set -eo pipefail
 set -x
 
+# Source test environment setup (handles package overrides like TVM-FFI)
+source "$(dirname "${BASH_SOURCE[0]}")/setup_test_env.sh"
+
 echo "========================================"
 echo "Starting flashinfer-jit-cache test script"
 echo "========================================"
