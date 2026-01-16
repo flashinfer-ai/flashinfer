@@ -524,6 +524,24 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, cudaStream_t
 #endif
   {
     auto dispatch_dim_dstate = [&]<int DIM, int DSTATE>() {
+      // Alignment checks for vectorized loads in simple kernel
+      constexpr auto stateLoadSize = getVectorLoadSizeForFullUtilization<state_t, DSTATE>();
+      constexpr size_t state_vec_size = stateLoadSize * sizeof(state_t);
+      constexpr size_t vec_size = sizeof(float4);  // PackedAligned<input_t> uses float4 size
+
+      FLASHINFER_CHECK(reinterpret_cast<uintptr_t>(params.state) % state_vec_size == 0,
+                       "state pointer must be aligned to ", state_vec_size, " bytes");
+      FLASHINFER_CHECK(reinterpret_cast<uintptr_t>(params.B) % vec_size == 0,
+                       "B pointer must be aligned to ", vec_size, " bytes");
+      FLASHINFER_CHECK(reinterpret_cast<uintptr_t>(params.C) % vec_size == 0,
+                       "C pointer must be aligned to ", vec_size, " bytes");
+      FLASHINFER_CHECK((params.B_stride_batch * sizeof(input_t)) % vec_size == 0,
+                       "B batch stride must be aligned to ", vec_size, " bytes");
+      FLASHINFER_CHECK((params.C_stride_batch * sizeof(input_t)) % vec_size == 0,
+                       "C batch stride must be aligned to ", vec_size, " bytes");
+      FLASHINFER_CHECK((params.dim * params.dstate * sizeof(state_t)) % state_vec_size == 0,
+                       "state head stride must be aligned to ", state_vec_size, " bytes");
+
       constexpr int numWarps = 4;
       dim3 block(warpSize, numWarps);
       dim3 grid(params.batch, params.nheads);
@@ -562,6 +580,20 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, cudaStream_t
   else {
 
     auto dispatch_dim_dstate = [&]<int DIM, int DSTATE>() {
+      // Alignment checks for vectorized loads in Hopper kernel
+      // Note: State uses TMA which requires 128B alignment (checked below)
+      // B and C use PackedAligned<input_t> which uses float4 size
+      constexpr size_t vec_size = sizeof(float4);
+
+      FLASHINFER_CHECK(reinterpret_cast<uintptr_t>(params.B) % vec_size == 0,
+                       "B pointer must be aligned to ", vec_size, " bytes");
+      FLASHINFER_CHECK(reinterpret_cast<uintptr_t>(params.C) % vec_size == 0,
+                       "C pointer must be aligned to ", vec_size, " bytes");
+      FLASHINFER_CHECK((params.B_stride_batch * sizeof(input_t)) % vec_size == 0,
+                       "B batch stride must be aligned to ", vec_size, " bytes");
+      FLASHINFER_CHECK((params.C_stride_batch * sizeof(input_t)) % vec_size == 0,
+                       "C batch stride must be aligned to ", vec_size, " bytes");
+
       constexpr auto numConsumers = 4;
       constexpr auto numWarps = 1 + numConsumers;
       constexpr auto numStages = 3;
