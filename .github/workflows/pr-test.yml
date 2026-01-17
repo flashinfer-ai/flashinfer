@@ -49,6 +49,10 @@ jobs:
         id: get-tag
         run: |
           TAG=$(grep 'flashinfer/flashinfer-ci-cu129:' ci/docker-tags.yml | cut -d':' -f2 | tr -d ' ')
+          if [ -z "$TAG" ]; then
+            echo "::error::Failed to extract Docker tag from ci/docker-tags.yml"
+            exit 1
+          fi
           echo "tag=$TAG" >> $GITHUB_OUTPUT
           echo "Docker tag: $TAG"
 
@@ -60,7 +64,10 @@ jobs:
             exit 0
           fi
 
-          CHANGED=$(git diff --name-only origin/${{ github.base_ref }}...HEAD)
+          # Use PR event SHAs for reliable diff (avoids issues with origin refs)
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          CHANGED=$(git diff --name-only "$BASE_SHA...$HEAD_SHA")
           # TODO (yongwww): Add back ^\.github/ before merging to main
           SKIP_PATTERNS="README.md|^docs/|^docker/|^licenses/|^LICENSE$|^NOTICE$|^version\.txt$"
 
