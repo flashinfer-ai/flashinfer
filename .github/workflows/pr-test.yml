@@ -110,11 +110,6 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Show System Info
-        run: |
-          echo "=== Host System ===" && df -h && free -h && nproc
-          echo "=== Docker ===" && docker --version
-
       - name: Show Node Info
         run: ./scripts/task_show_node_info.sh
         env:
@@ -153,12 +148,6 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Show System Info
-        run: |
-          echo "=== Host System ===" && df -h && free -h && nproc
-          echo "=== GPU ===" && nvidia-smi
-          echo "=== Docker ===" && docker --version
-
       - name: Show Node Info
         run: ./scripts/task_show_node_info.sh
         env:
@@ -192,12 +181,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-
-      - name: Show System Info
-        run: |
-          echo "=== Host System ===" && df -h && free -h && nproc
-          echo "=== GPU ===" && nvidia-smi
-          echo "=== Docker ===" && docker --version
 
       - name: Show Node Info
         run: ./scripts/task_show_node_info.sh
