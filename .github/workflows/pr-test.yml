@@ -78,11 +78,11 @@ jobs:
           fi
 
   # ---------------------------------------------------------------------------
-  # AOT Build Tests - x86_64 and aarch64 (multiple CUDA versions)
+  # AOT Build Import Tests - x86_64 and aarch64 (multiple CUDA versions)
   # Uses ci/bash.sh with --no-gpu (same as Jenkins)
   # ---------------------------------------------------------------------------
   aot-build-import:
-    name: AOT Build (${{ matrix.arch }}, ${{ matrix.cuda }})
+    name: AOT Build Import (${{ matrix.arch }}, ${{ matrix.cuda }})
     needs: setup
     if: needs.setup.outputs.skip_build != 'true' && github.event.inputs.skip_aot != 'true'
     runs-on:
@@ -139,10 +139,16 @@ jobs:
     steps:
       - name: Cleanup
         run: |
+          # Stop all Docker containers to free GPU memory
+          docker stop $(docker ps -q) 2>/dev/null || true
+          docker rm $(docker ps -aq) 2>/dev/null || true
+          # Clean workspace and caches
           sudo rm -rf ${{ github.workspace }}/* || true
           sudo rm -rf ${{ github.workspace }}/.[!.]* || true
           rm -rf ~/.cache/flashinfer_jit || true
           docker system prune -f || true
+          # Verify GPU is free
+          nvidia-smi || true
 
       - uses: actions/checkout@v4
         with:
@@ -173,10 +179,16 @@ jobs:
     steps:
       - name: Cleanup
         run: |
+          # Stop all Docker containers to free GPU memory
+          docker stop $(docker ps -q) 2>/dev/null || true
+          docker rm $(docker ps -aq) 2>/dev/null || true
+          # Clean workspace and caches
           sudo rm -rf ${{ github.workspace }}/* || true
           sudo rm -rf ${{ github.workspace }}/.[!.]* || true
           rm -rf ~/.cache/flashinfer_jit || true
           docker system prune -f || true
+          # Verify GPU is free
+          nvidia-smi || true
 
       - uses: actions/checkout@v4
         with:
@@ -216,7 +228,7 @@ jobs:
           SKIP_AOT="${{ github.event.inputs.skip_aot }}"
           SKIP_GPU="${{ github.event.inputs.skip_gpu }}"
 
-          echo "AOT Build: $AOT" >> $GITHUB_STEP_SUMMARY
+          echo "AOT Build Import: $AOT" >> $GITHUB_STEP_SUMMARY
           echo "GPU Tests (A10G): $A10G" >> $GITHUB_STEP_SUMMARY
           echo "GPU Tests (T4): $T4" >> $GITHUB_STEP_SUMMARY
 
