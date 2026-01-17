@@ -88,18 +88,19 @@ def create_test_inputs(
 @pytest.mark.parametrize("dim", [64, 128])
 @pytest.mark.parametrize("dstate", [64, 128, 256])
 @pytest.mark.parametrize("state_dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("weight_dtype", [torch.float32, torch.bfloat16])
 def test_selective_state_update(
     batch,
     nheads,
     dim,
     dstate,
     state_dtype,
+    weight_dtype,
 ):
     """Test selective_state_update correctness against reference implementation."""
     ngroups = 8
     delta_softplus = True
     input_dtype = torch.bfloat16
-    weight_dtype = torch.float32
     matrixA_dtype = torch.float32
 
     inputs = create_test_inputs(
