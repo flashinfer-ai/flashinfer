@@ -193,17 +193,17 @@ jobs:
         run: bash ci/bash.sh ${DOCKER_IMAGE} ./scripts/task_jit_run_tests_part3.sh
 
   # ---------------------------------------------------------------------------
-  # CI Summary
+  # Test Results Summary
   # ---------------------------------------------------------------------------
-  ci-summary:
-    name: CI Summary
+  test-results-summary:
+    name: Test Results Summary
     if: always()
     needs: [setup, aot-build-import, gpu-tests-a10g, gpu-tests-t4]
     runs-on: ubuntu-latest
     steps:
       - name: Check Results
         run: |
-          echo "## CI Results Summary" >> $GITHUB_STEP_SUMMARY
+          echo "## Test Results Summary" >> $GITHUB_STEP_SUMMARY
 
           if [ "${{ needs.setup.outputs.skip_build }}" == "true" ]; then
             echo "Build skipped (docs/config only changes)" >> $GITHUB_STEP_SUMMARY
@@ -224,8 +224,8 @@ jobs:
           if { [ "$AOT" != "success" ] && [ "$SKIP_AOT" != "true" ]; } || \
              { [ "$A10G" != "success" ] && [ "$SKIP_GPU" != "true" ]; } || \
              { [ "$T4" != "success" ] && [ "$SKIP_GPU" != "true" ]; }; then
-            echo "**CI Failed**" >> $GITHUB_STEP_SUMMARY
+            echo "**Tests Failed**" >> $GITHUB_STEP_SUMMARY
             exit 1
           fi
 
-          echo "**CI Passed**" >> $GITHUB_STEP_SUMMARY
+          echo "**Tests Passed**" >> $GITHUB_STEP_SUMMARY
