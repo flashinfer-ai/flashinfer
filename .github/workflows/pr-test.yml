@@ -92,7 +92,7 @@ jobs:
       - cpu
     timeout-minutes: 300
     strategy:
-      fail-fast: true
+      fail-fast: false
       matrix:
         arch: [X64, ARM64]
         cuda: [cu126, cu128, cu129, cu130]
@@ -136,7 +136,7 @@ jobs:
     runs-on: [self-hosted, Linux, X64, gpu, sm86]
     timeout-minutes: 300
     strategy:
-      fail-fast: true
+      fail-fast: false
       matrix:
         shard: [1, 2, 3, 4, 5]
     env:
