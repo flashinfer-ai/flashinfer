@@ -99,6 +99,13 @@ jobs:
     env:
       DOCKER_IMAGE: flashinfer/flashinfer-ci-${{ matrix.cuda }}:${{ needs.setup.outputs.docker_tag }}
     steps:
+      - name: Cleanup
+        run: |
+          sudo rm -rf ${{ github.workspace }}/* || true
+          sudo rm -rf ${{ github.workspace }}/.[!.]* || true
+          rm -rf ~/.cache/flashinfer_jit || true
+          docker system prune -f || true
+
       - uses: actions/checkout@v4
         with:
           submodules: recursive
@@ -118,12 +125,6 @@ jobs:
       - name: Test JIT Cache Package Build and Import
         run: bash ci/bash.sh ${DOCKER_IMAGE} --no-gpu ./scripts/task_test_jit_cache_package_build_import.sh
 
-      - name: Cleanup
-        if: always()
-        run: |
-          rm -rf ~/.cache/flashinfer_jit || true
-          docker system prune -f || true
-
   # ---------------------------------------------------------------------------
   # GPU JIT Tests - SM86 (A10G) - 5 Shards
   # Uses ci/bash.sh with GPU (same as Jenkins)
@@ -141,6 +142,13 @@ jobs:
     env:
       DOCKER_IMAGE: flashinfer/flashinfer-ci-cu129:${{ needs.setup.outputs.docker_tag }}
     steps:
+      - name: Cleanup
+        run: |
+          sudo rm -rf ${{ github.workspace }}/* || true
+          sudo rm -rf ${{ github.workspace }}/.[!.]* || true
+          rm -rf ~/.cache/flashinfer_jit || true
+          docker system prune -f || true
+
       - uses: actions/checkout@v4
         with:
           submodules: recursive
@@ -161,12 +169,6 @@ jobs:
       - name: Run JIT Unittest Part ${{ matrix.shard }}
         run: bash ci/bash.sh ${DOCKER_IMAGE} ./scripts/task_jit_run_tests_part${{ matrix.shard }}.sh
 
-      - name: Cleanup
-        if: always()
-        run: |
-          rm -rf ~/.cache/flashinfer_jit || true
-          docker system prune -f || true
-
   # ---------------------------------------------------------------------------
   # GPU JIT Tests - SM75 (T4) - sampling tests only
   # Uses ci/bash.sh with GPU (same as Jenkins)
@@ -180,6 +182,13 @@ jobs:
     env:
       DOCKER_IMAGE: flashinfer/flashinfer-ci-cu129:${{ needs.setup.outputs.docker_tag }}
     steps:
+      - name: Cleanup
+        run: |
+          sudo rm -rf ${{ github.workspace }}/* || true
+          sudo rm -rf ${{ github.workspace }}/.[!.]* || true
+          rm -rf ~/.cache/flashinfer_jit || true
+          docker system prune -f || true
+
       - uses: actions/checkout@v4
         with:
           submodules: recursive
@@ -199,12 +208,6 @@ jobs:
 
       - name: Run JIT Unittest Part 3 (T4)
         run: bash ci/bash.sh ${DOCKER_IMAGE} ./scripts/task_jit_run_tests_part3.sh
-
-      - name: Cleanup
-        if: always()
-        run: |
-          rm -rf ~/.cache/flashinfer_jit || true
-          docker system prune -f || true
 
   # ---------------------------------------------------------------------------
   # CI Summary
