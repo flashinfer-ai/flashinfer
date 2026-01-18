@@ -381,9 +381,9 @@ __global__ void selective_state_update_kernel_producer_consumer_vertical(
 
   using sram_t =
       SharedStorage<input_t, weight_t, matrixA_t, state_t, rowsPerStage, DIM, DSTATE, numStages>;
-#pragma nv_diag_suppress 20054
-  __shared__ sram_t sram;
-#pragma nv_diag_default 20054
+  // Use dynamic shared memory to allow opting into extended shared memory on SM90+
+  extern __shared__ __align__(128) char smem[];
+  sram_t& sram = *reinterpret_cast<sram_t*>(smem);
 
   namespace cde = cuda::device::experimental;
   namespace cg = cooperative_groups;
@@ -637,7 +637,13 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, cudaStream_t
       auto tensorState = tma::createTensorMap<state_t>(
           params.state, params.state_cache_size * nh * dim, DSTATE, rowsPerStage, DSTATE);
 
-      scan_func<<<grid, block, 0, stream>>>(params, tensorState);
+      // Calculate shared memory size and opt-in to extended shared memory
+      using sram_t = SharedStorage<input_t, weight_t, matrixA_t, state_t, rowsPerStage, DIM, DSTATE,
+                                   numStages>;
+      constexpr size_t smem_size = sizeof(sram_t);
+      cudaFuncSetAttribute(scan_func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+
+      scan_func<<<grid, block, smem_size, stream>>>(params, tensorState);
     };
 
     auto dispatch_dstate = [&]<int DIM>() {
