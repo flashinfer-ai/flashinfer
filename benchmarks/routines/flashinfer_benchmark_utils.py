@@ -65,6 +65,16 @@ output_column_dict = {
         "ep_size",
         "ep_rank",
     ],
+    "moe_comm": [
+        "num_tokens",
+        "hidden_size",
+        "num_experts",
+        "top_k",
+        "ep_size",
+        "input_dtype",
+        "quant_dtype",
+        "max_num_tokens",
+    ],
     "norm": [
         "num_heads",
         "scale",
@@ -105,6 +115,7 @@ full_output_columns = (
     + output_column_dict["attention"]
     + output_column_dict["gemm"]
     + output_column_dict["moe"]
+    + output_column_dict["moe_comm"]
     + output_column_dict["norm"]
     + output_column_dict["quantization"]
     + output_column_dict["general"]
@@ -129,6 +140,9 @@ benchmark_apis = {
         "trtllm_fp8_block_scale_moe",
         "trtllm_fp8_per_tensor_scale_moe",
         "cutlass_fused_moe",
+    ],
+    "moe_comm": [
+        "moe_a2a_dispatch_combine",
     ],
     "norm": [
         "rmsnorm",
