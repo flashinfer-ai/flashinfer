@@ -522,6 +522,7 @@ def get_gemm_sm100_module_cutlass_fp4():
         module, "flashinfer::cutlass_fp4_gemm", "cutlass_fp4_gemm"
     )
 
+
 @functools.cache
 def get_gemm_sm103_module_cutlass_fp4():
     """Get the SM103 FP4 GEMM module."""
@@ -529,6 +530,7 @@ def get_gemm_sm103_module_cutlass_fp4():
     return _create_cutlass_fp4_gemm_module(
         module, "flashinfer::cutlass_fp4_gemm", "cutlass_fp4_gemm"
     )
+
 
 @functools.cache
 def get_gemm_sm120_module_cutlass_fp4():
@@ -2292,7 +2294,9 @@ def mm_fp4(
         "trtllm": lambda: get_trtllm_fp4_gemm_module().trtllm_fp4_gemm_runner(
             use_8x4_sf_layout
         ),
-        "cutlass": lambda: get_cutlass_fp4_gemm_module(major, minor).cutlass_fp4_gemm_runner(),
+        "cutlass": lambda: get_cutlass_fp4_gemm_module(
+            major, minor
+        ).cutlass_fp4_gemm_runner(),
     }
     runners = [backend_to_runner_factory[cur_backend]() for cur_backend in backends]
 

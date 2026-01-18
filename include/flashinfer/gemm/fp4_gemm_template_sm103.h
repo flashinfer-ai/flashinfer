@@ -56,7 +56,8 @@ struct SMTypeAdapter_sm103<_1SM_sm103> {
   static int const Scale = 1;
   using AtomThrShape = cute::Shape<_1, _1, _1>;
   using EpilogueSchedule = cutlass::epilogue::NoSmemWarpSpecialized1Sm;
-  using MainloopSchedule = cutlass::gemm::KernelTmaWarpSpecialized1SmBlockScaledMxNvf4UltraVs16Sm103;
+  using MainloopSchedule =
+      cutlass::gemm::KernelTmaWarpSpecialized1SmBlockScaledMxNvf4UltraVs16Sm103;
 };
 
 template <>
@@ -64,7 +65,8 @@ struct SMTypeAdapter_sm103<_2SM_sm103> {
   static int const Scale = 2;
   using AtomThrShape = cute::Shape<_2, _1, _1>;
   using EpilogueSchedule = cutlass::epilogue::NoSmemWarpSpecialized2Sm;
-  using MainloopSchedule = cutlass::gemm::KernelTmaWarpSpecialized2SmBlockScaledMxNvf4UltraVs16Sm103;
+  using MainloopSchedule =
+      cutlass::gemm::KernelTmaWarpSpecialized2SmBlockScaledMxNvf4UltraVs16Sm103;
 };
 
 template <typename>
@@ -72,20 +74,21 @@ constexpr auto always_false_sm103 = false;
 
 template <typename T, typename CTA_M_, typename CTA_N_, typename CTA_K_, typename CGA_M_,
           typename CGA_N_, typename CGA_K_, typename XSM_>
-size_t genericFp4UltraGemmKernelLauncher(void* D, void const* A, void const* B, void const* input_sf,
-                                    void const* weight_sf, float const* global_sf, int m, int n,
-                                    int k, int batch_count, CutlassGemmConfig gemmConfig,
-                                    char* workspace, size_t const workspaceBytes,
-                                    cudaStream_t stream, int* occupancy);
+size_t genericFp4UltraGemmKernelLauncher(void* D, void const* A, void const* B,
+                                         void const* input_sf, void const* weight_sf,
+                                         float const* global_sf, int m, int n, int k,
+                                         int batch_count, CutlassGemmConfig gemmConfig,
+                                         char* workspace, size_t const workspaceBytes,
+                                         cudaStream_t stream, int* occupancy);
 
 #ifdef PLACEHOLDER_KERNELS
 
-#define INSTANTIATE_FP4_ULTRA_GEMM_KERNEL_LAUNCHER(T, CTA_M_, CTA_N_, CTA_K_, CGA_M_, CGA_N_, CGA_K_,   \
-                                             XSM_)                                                \
+#define INSTANTIATE_FP4_ULTRA_GEMM_KERNEL_LAUNCHER(T, CTA_M_, CTA_N_, CTA_K_, CGA_M_, CGA_N_,     \
+                                                   CGA_K_, XSM_)                                  \
   template <>                                                                                     \
-  size_t                                                                                          \
-  genericFp4UltraGemmKernelLauncher<T, cute::Int<CTA_M_>, cute::Int<CTA_N_>, cute::Int<CTA_K_>,        \
-                               cute::Int<CGA_M_>, cute::Int<CGA_N_>, cute::Int<CGA_K_>, XSM_>(    \
+  size_t genericFp4UltraGemmKernelLauncher<T, cute::Int<CTA_M_>, cute::Int<CTA_N_>,               \
+                                           cute::Int<CTA_K_>, cute::Int<CGA_M_>,                  \
+                                           cute::Int<CGA_N_>, cute::Int<CGA_K_>, XSM_>(           \
       void* D, void const* A, void const* B, void const* input_sf, void const* weight_sf,         \
       float const* global_sf, int m, int n, int k, int batch_count, CutlassGemmConfig gemmConfig, \
       char* workspace, const size_t workspaceBytes, cudaStream_t stream, int* occupancy) {        \
@@ -96,8 +99,8 @@ size_t genericFp4UltraGemmKernelLauncher(void* D, void const* A, void const* B, 
 
 #else
 
-#define INSTANTIATE_FP4_ULTRA_GEMM_KERNEL_LAUNCHER(T, CTA_M_, CTA_N_, CTA_K_, CGA_M_, CGA_N_, CGA_K_,              \
-                                             XSM_)                                                           \
+#define INSTANTIATE_FP4_ULTRA_GEMM_KERNEL_LAUNCHER(T, CTA_M_, CTA_N_, CTA_K_, CGA_M_, CGA_N_,                \
+                                                   CGA_K_, XSM_)                                             \
   struct                                                                                                     \
       DeviceGemmFp4GemmSm103_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##_##CGA_M_##_##CGA_N_##_##CGA_K_##XSM_ {   \
     using OutElementType = flashinfer::cutlass_dtype<T>::type;                                               \
@@ -126,9 +129,9 @@ size_t genericFp4UltraGemmKernelLauncher(void* D, void const* A, void const* B, 
     using EpilogueTileType = std::conditional_t<CTA_M_ == 128 && CTA_N_ == 256 && CTA_K_ == 768,             \
                                                 cute::Shape<cute::_128, cute::_64>,                          \
                                                 cutlass::epilogue::collective::EpilogueTileAuto>;            \
-    using EpilogueSchedule = SMTypeAdapter_sm103<XSM_>::EpilogueSchedule;                                          \
-    using MainloopSchedule = SMTypeAdapter_sm103<XSM_>::MainloopSchedule;                                          \
-    using MmaTileShape = cute::Shape<cute::Int<CTA_M_ * SMTypeAdapter_sm103<XSM_>::Scale>,                         \
+    using EpilogueSchedule = SMTypeAdapter_sm103<XSM_>::EpilogueSchedule;                                    \
+    using MainloopSchedule = SMTypeAdapter_sm103<XSM_>::MainloopSchedule;                                    \
+    using MmaTileShape = cute::Shape<cute::Int<CTA_M_ * SMTypeAdapter_sm103<XSM_>::Scale>,                   \
                                      cute::Int<CTA_N_>, cute::Int<CTA_K_>>;                                  \
     using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<                    \
         Arch, OperatorClass, MmaTileShape, ClusterShape, EpilogueTileType, ElementAccumulator,               \
@@ -146,32 +149,31 @@ size_t genericFp4UltraGemmKernelLauncher(void* D, void const* A, void const* B, 
         MainloopSchedule>::CollectiveOp;                                                                     \
                                                                                                              \
     template <typename Base>                                                                                 \
-    struct Sm103Only : Base {                                                                             \
+    struct Sm103Only : Base {                                                                                \
       using typename Base::Params;                                                                           \
       CUTLASS_DEVICE                                                                                         \
       void operator()(Params const& params, char* smem_buf) {                                                \
-        if constexpr (flashinfer::arch::is_match_v<103>) {                \
+        if constexpr (flashinfer::arch::is_match_v<103>) {                                                   \
           this->Base::operator()(params, smem_buf);                                                          \
         } else {                                                                                             \
           if (cute::thread0()) {                                                                             \
-            printf("%s : This kernel shall only run on SM103 devices.\n",                          \
-                   __PRETTY_FUNCTION__);                                                                     \
+            printf("%s : This kernel shall only run on SM103 devices.\n", __PRETTY_FUNCTION__);              \
             __trap();                                                                                        \
           }                                                                                                  \
         }                                                                                                    \
       }                                                                                                      \
     };                                                                                                       \
     using GemmKernel =                                                                                       \
-        Sm103Only<cutlass::gemm::kernel::GemmUniversal<cute::Shape<int, int, int, int>,                   \
-                                                          CollectiveMainloop, CollectiveEpilogue,            \
-                                                          cutlass::gemm::PersistentScheduler>>;              \
+        Sm103Only<cutlass::gemm::kernel::GemmUniversal<cute::Shape<int, int, int, int>,                      \
+                                                       CollectiveMainloop, CollectiveEpilogue,               \
+                                                       cutlass::gemm::PersistentScheduler>>;                 \
                                                                                                              \
     using Gemm = typename cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;                           \
   };                                                                                                         \
                                                                                                              \
   template <typename Gemm>                                                                                   \
   typename Gemm::Arguments                                                                                   \
-      prepareGemmArgsSm103_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##_##CGA_M_##_##CGA_N_##_##CGA_K_##XSM_(           \
+      prepareGemmArgsSm103_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##_##CGA_M_##_##CGA_N_##_##CGA_K_##XSM_(      \
           void* D, void const* A, void const* B, void const* input_sf, void const* weight_sf,                \
           float const* global_sf, int m, int n, int k, int batch_count) {                                    \
     using Sm1xxBlkScaledConfig =                                                                             \
@@ -223,15 +225,15 @@ size_t genericFp4UltraGemmKernelLauncher(void* D, void const* A, void const* B, 
       operator_args.scheduler.raster_order = Enum_t::Heuristic;                                              \
     }                                                                                                        \
     operator_args.hw_info.cluster_shape = dim3(CGA_M_, CGA_N_, CGA_K_);                                      \
-    operator_args.hw_info.cluster_shape_fallback = dim3(SMTypeAdapter_sm103<XSM_>::Scale, 1, 1);                   \
+    operator_args.hw_info.cluster_shape_fallback = dim3(SMTypeAdapter_sm103<XSM_>::Scale, 1, 1);             \
                                                                                                              \
     return operator_args;                                                                                    \
   }                                                                                                          \
                                                                                                              \
   template <>                                                                                                \
-  size_t                                                                                                     \
-  genericFp4UltraGemmKernelLauncher<T, cute::Int<CTA_M_>, cute::Int<CTA_N_>, cute::Int<CTA_K_>,                   \
-                               cute::Int<CGA_M_>, cute::Int<CGA_N_>, cute::Int<CGA_K_>, XSM_>(               \
+  size_t genericFp4UltraGemmKernelLauncher<T, cute::Int<CTA_M_>, cute::Int<CTA_N_>,                          \
+                                           cute::Int<CTA_K_>, cute::Int<CGA_M_>,                             \
+                                           cute::Int<CGA_N_>, cute::Int<CGA_K_>, XSM_>(                      \
       void* D, void const* A, void const* B, void const* input_sf, void const* weight_sf,                    \
       float const* global_sf, int m, int n, int k, int batch_count, CutlassGemmConfig gemmConfig,            \
       char* workspace, const size_t workspaceBytes, cudaStream_t stream, int* occupancy) {                   \
@@ -241,7 +243,7 @@ size_t genericFp4UltraGemmKernelLauncher(void* D, void const* A, void const* B, 
     using ElementOutput_ = typename cutlass::platform::conditional<                                          \
         cutlass::platform::is_same<ElementOutput__, float>::value, float, ElementOutput__>::type;            \
     using ElementOutput = typename cutlass::platform::conditional<                                           \
-        cutlass::platform::is_same<ElementOutput_, SafeBF16_sm103>::value, cutlass::bfloat16_t,                    \
+        cutlass::platform::is_same<ElementOutput_, SafeBF16_sm103>::value, cutlass::bfloat16_t,              \
         ElementOutput_>::type;                                                                               \
                                                                                                              \
     using Fp4GemmOperator =                                                                                  \
@@ -249,7 +251,7 @@ size_t genericFp4UltraGemmKernelLauncher(void* D, void const* A, void const* B, 
             Gemm;                                                                                            \
     Fp4GemmOperator gemm;                                                                                    \
     auto args =                                                                                              \
-        prepareGemmArgsSm103_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##_##CGA_M_##_##CGA_N_##_##CGA_K_##XSM_<         \
+        prepareGemmArgsSm103_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##_##CGA_M_##_##CGA_N_##_##CGA_K_##XSM_<    \
             Fp4GemmOperator>(D, A, B, input_sf, weight_sf, global_sf, m, n, k, batch_count);                 \
     /* // Return workspace size */                                                                           \
     if (!A && !B && !D) {                                                                                    \

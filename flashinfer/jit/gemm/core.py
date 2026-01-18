@@ -104,11 +104,7 @@ def gen_gemm_sm103_module_cutlass_fp4() -> JitSpec:
     with open(jit_env.FLASHINFER_CSRC_DIR / "fp4_gemm_cutlass_sm103.jinja") as f:
         kernel_inst_templ = jinja2.Template(f.read())
         dtype_list = ["__nv_bfloat16", "half"]
-        cta_m_n_k_list = [           
-            (128, 128, 768),
-            (128, 192, 768),
-            (128, 256, 768)
-        ]
+        cta_m_n_k_list = [(128, 128, 768), (128, 192, 768), (128, 256, 768)]
         for cta_m, cta_n, cta_k in cta_m_n_k_list:
             for dtype in dtype_list:
                 dest_path = (

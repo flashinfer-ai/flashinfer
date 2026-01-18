@@ -225,11 +225,11 @@ constexpr auto get_tile_shape() {
     return cute::Shape<_128, _128, _128>{};
   } else if constexpr (Shape_MNK == TileShape::TileShape_128x256x128) {
     return cute::Shape<_128, _256, _128>{};
-  } else if constexpr (Shape_MNK == TileShape::TileShape_128x128x768) { // SM103
+  } else if constexpr (Shape_MNK == TileShape::TileShape_128x128x768) {  // SM103
     return cute::Shape<_128, _128, _768>{};
-  } else if constexpr (Shape_MNK == TileShape::TileShape_128x192x768) { // SM103
+  } else if constexpr (Shape_MNK == TileShape::TileShape_128x192x768) {  // SM103
     return cute::Shape<_128, _192, _768>{};
-  } else if constexpr (Shape_MNK == TileShape::TileShape_128x256x768) { // SM103
+  } else if constexpr (Shape_MNK == TileShape::TileShape_128x256x768) {  // SM103
     return cute::Shape<_128, _256, _768>{};
   }
 }
@@ -257,11 +257,11 @@ static auto get_tile_shape_name(TileShape Shape_MNK) {
     return "128x128x128";
   } else if (Shape_MNK == TileShape::TileShape_128x256x128) {
     return "128x256x128";
-  } else if (Shape_MNK == TileShape::TileShape_128x128x768) { // SM103
+  } else if (Shape_MNK == TileShape::TileShape_128x128x768) {  // SM103
     return "128x128x768";
-  } else if (Shape_MNK == TileShape::TileShape_128x192x768) { // SM103
+  } else if (Shape_MNK == TileShape::TileShape_128x192x768) {  // SM103
     return "128x192x768";
-  } else if (Shape_MNK == TileShape::TileShape_128x256x768) { // SM103
+  } else if (Shape_MNK == TileShape::TileShape_128x256x768) {  // SM103
     return "128x256x768";
   }
   return "Unknown shape";

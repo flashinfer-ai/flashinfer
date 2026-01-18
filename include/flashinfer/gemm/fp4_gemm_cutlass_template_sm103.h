@@ -120,56 +120,56 @@ size_t dispatchNVFP4xNVFP4GemmClusterShapeSm103(T* D, void const* A, void const*
                                                 cudaStream_t stream, int* occupancy = nullptr) {
   switch (gemmConfig.cluster_shape) {
     case ClusterShape::ClusterShape_1x1x1:
-      return genericFp4UltraGemmKernelLauncher<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<1>, cute::Int<1>,
-                                          cute::Int<1>, _1SM_sm103>(
+      return genericFp4UltraGemmKernelLauncher<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<1>,
+                                               cute::Int<1>, cute::Int<1>, _1SM_sm103>(
           D, A, B, input_sf, weight_sf, global_sf, m, n, k, batch_count, gemmConfig, workspace,
           workspaceBytes, stream, occupancy);
       break;
     case ClusterShape::ClusterShape_2x1x1:
-      return genericFp4UltraGemmKernelLauncher<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<2>, cute::Int<1>,
-                                          cute::Int<1>, _2SM_sm103>(
+      return genericFp4UltraGemmKernelLauncher<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<2>,
+                                               cute::Int<1>, cute::Int<1>, _2SM_sm103>(
           D, A, B, input_sf, weight_sf, global_sf, m, n, k, batch_count, gemmConfig, workspace,
           workspaceBytes, stream, occupancy);
       break;
     case ClusterShape::ClusterShape_1x2x1:
-      return genericFp4UltraGemmKernelLauncher<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<1>, cute::Int<2>,
-                                          cute::Int<1>, _1SM_sm103>(
+      return genericFp4UltraGemmKernelLauncher<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<1>,
+                                               cute::Int<2>, cute::Int<1>, _1SM_sm103>(
           D, A, B, input_sf, weight_sf, global_sf, m, n, k, batch_count, gemmConfig, workspace,
           workspaceBytes, stream, occupancy);
       break;
     case ClusterShape::ClusterShape_2x2x1:
-      return genericFp4UltraGemmKernelLauncher<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<2>, cute::Int<2>,
-                                          cute::Int<1>, _2SM_sm103>(
+      return genericFp4UltraGemmKernelLauncher<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<2>,
+                                               cute::Int<2>, cute::Int<1>, _2SM_sm103>(
           D, A, B, input_sf, weight_sf, global_sf, m, n, k, batch_count, gemmConfig, workspace,
           workspaceBytes, stream, occupancy);
       break;
     case ClusterShape::ClusterShape_1x4x1:
-      return genericFp4UltraGemmKernelLauncher<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<1>, cute::Int<4>,
-                                          cute::Int<1>, _1SM_sm103>(
+      return genericFp4UltraGemmKernelLauncher<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<1>,
+                                               cute::Int<4>, cute::Int<1>, _1SM_sm103>(
           D, A, B, input_sf, weight_sf, global_sf, m, n, k, batch_count, gemmConfig, workspace,
           workspaceBytes, stream, occupancy);
       break;
     case ClusterShape::ClusterShape_4x2x1:
-      return genericFp4UltraGemmKernelLauncher<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<4>, cute::Int<2>,
-                                          cute::Int<1>, _2SM_sm103>(
+      return genericFp4UltraGemmKernelLauncher<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<4>,
+                                               cute::Int<2>, cute::Int<1>, _2SM_sm103>(
           D, A, B, input_sf, weight_sf, global_sf, m, n, k, batch_count, gemmConfig, workspace,
           workspaceBytes, stream, occupancy);
       break;
     case ClusterShape::ClusterShape_2x4x1:
-      return genericFp4UltraGemmKernelLauncher<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<2>, cute::Int<4>,
-                                          cute::Int<1>, _2SM_sm103>(
+      return genericFp4UltraGemmKernelLauncher<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<2>,
+                                               cute::Int<4>, cute::Int<1>, _2SM_sm103>(
           D, A, B, input_sf, weight_sf, global_sf, m, n, k, batch_count, gemmConfig, workspace,
           workspaceBytes, stream, occupancy);
       break;
     case ClusterShape::ClusterShape_4x4x1:
-      return genericFp4UltraGemmKernelLauncher<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<4>, cute::Int<4>,
-                                          cute::Int<1>, _2SM_sm103>(
+      return genericFp4UltraGemmKernelLauncher<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<4>,
+                                               cute::Int<4>, cute::Int<1>, _2SM_sm103>(
           D, A, B, input_sf, weight_sf, global_sf, m, n, k, batch_count, gemmConfig, workspace,
           workspaceBytes, stream, occupancy);
       break;
     case ClusterShape::ClusterShape_4x1x1:
-      return genericFp4UltraGemmKernelLauncher<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<4>, cute::Int<1>,
-                                          cute::Int<1>, _2SM_sm103>(
+      return genericFp4UltraGemmKernelLauncher<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<4>,
+                                               cute::Int<1>, cute::Int<1>, _2SM_sm103>(
           D, A, B, input_sf, weight_sf, global_sf, m, n, k, batch_count, gemmConfig, workspace,
           workspaceBytes, stream, occupancy);
       break;
@@ -289,12 +289,9 @@ std::vector<CutlassGemmConfig> CutlassFp4GemmRunner<T, fp4GemmType>::getConfigs(
   std::vector<CutlassGemmConfig> candidateConfigs;
 
   std::vector<CutlassTileConfigSM100> tilesSm100 = {
-      CutlassTileConfigSM100::CtaShape128x64x128B,
-      CutlassTileConfigSM100::CtaShape128x256x128B,
-      CutlassTileConfigSM100::CtaShape128x128x256B,
-      CutlassTileConfigSM100::CtaShape128x256x256B,
-      CutlassTileConfigSM100::CtaShape128x128x768B,
-      CutlassTileConfigSM100::CtaShape128x192x768B,
+      CutlassTileConfigSM100::CtaShape128x64x128B,  CutlassTileConfigSM100::CtaShape128x256x128B,
+      CutlassTileConfigSM100::CtaShape128x128x256B, CutlassTileConfigSM100::CtaShape128x256x256B,
+      CutlassTileConfigSM100::CtaShape128x128x768B, CutlassTileConfigSM100::CtaShape128x192x768B,
       CutlassTileConfigSM100::CtaShape128x256x768B,
   };
   std::vector<ClusterShape> clusterShapes = {
@@ -335,11 +332,11 @@ size_t CutlassFp4GemmRunner<T, fp4GemmType>::getWorkspaceSizeImpl(int const m, i
   size_t workspace_size = 0;
   auto gemmConfigs = CutlassFp4GemmRunner<T, fp4GemmType>{}.getConfigs();
   for (auto const& gemmConfig : gemmConfigs) {
-    try {      
+    try {
       size_t curr_workspace_size = CutlassFp4GemmRunner<T, fp4GemmType>::dispatchToArch(
           nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, m, n, k, batch_count, gemmConfig,
           nullptr, 0, 0);
-      workspace_size = std::max(workspace_size, curr_workspace_size);      
+      workspace_size = std::max(workspace_size, curr_workspace_size);
     } catch (std::runtime_error& e) {
       // Swallow errors when SMEM exceeds maximum allowed
       continue;
