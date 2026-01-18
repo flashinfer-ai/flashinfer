@@ -19,6 +19,7 @@ from .cutlass_library import (
 )
 from ...cpp_ext import is_cuda_version_at_least
 
+from ...core import logger
 
 ################################################################################
 # Epilogue Tag enum and string utils
