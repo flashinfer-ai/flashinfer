@@ -16,7 +16,7 @@ Currently supports testing attention, gemm, fused MOE, normalization, and quanti
     - `BatchPrefillWithPagedKVCacheWrapper` - Prefill attention with paged KV cache.
         - Also supports computationally similar `cudnn_batch_prefill_with_kv_cache` and  `trtllm_batch_context_with_kv_cache`.
     - `BatchPrefillWithRaggedKVCacheWrapper` - Prefill attention with ragged KV cache.
-        - Also supports computationally similar `cudnn_batch_prefill_with_kv_cache` and  `trtllm_ragged_attention_deepseek`.
+        - Also supports computationally similar `cudnn_batch_prefill_with_kv_cache` (cudnn-native) and  `trtllm_ragged_attention_deepseek`.
     - `BatchMLAPagedAttentionWrapper` - MLA attention proposed in DeepSeek series of models.
         - Also supports computationally similar `trtllm_batch_decode_with_kv_cache_mla`.
 - GEMM:
@@ -280,7 +280,8 @@ Legend:
 - fa2: FlashAttention-2
 - fa2_tc: FlashAttention-2 (Tensor Core)
 - fa3: FlashAttention-3
-- cudnn: cuDNN
+- cudnn: cuDNN (via wrapper API)
+- cudnn-native: cuDNN (direct API call)
 - cutlass: CUTLASS
 - trtllm: TensorRT-LLM
 - trtllm-gen: TensorRT-LLM (generic wrapper)
@@ -289,8 +290,8 @@ Legend:
 | Routine | 7.5 | 8.0 | 8.6 | 8.9 | 9.0 | 10.0 | 10.3 | 12.0 |
 |---------|-----|-----|-----|-----|-----|-------|-------|-------|
 | **BatchDecodeWithPagedKVCacheWrapper** | fa2 | fa2, fa2_tc, cudnn | fa2, fa2_tc, cudnn | fa2, fa2_tc, cudnn | fa2, fa2_tc, cudnn | fa2, fa2_tc, cudnn, trtllm-gen, trtllm-native | fa2, fa2_tc, cudnn, trtllm-gen, trtllm-native | fa2, fa2_tc, cudnn |
-| **BatchPrefillWithPagedKVCacheWrapper** |  | fa2, cudnn | fa2, cudnn | fa2, cudnn | fa2, fa3, cudnn | fa2, cudnn, trtllm-gen, trtllm-native | fa2, cudnn, trtllm-gen, trtllm-native | fa2, cudnn |
-| **BatchPrefillWithRaggedKVCacheWrapper** |  | fa2, cudnn | fa2, cudnn | fa2, cudnn | fa2, fa3, cudnn | fa2, cudnn, cutlass, trtllm-native | fa2, cudnn, cutlass, trtllm-native | fa2, cudnn |
+| **BatchPrefillWithPagedKVCacheWrapper** |  | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, fa3, cudnn, cudnn-native | fa2, cudnn, cudnn-native, trtllm-gen, trtllm-native | fa2, cudnn, cudnn-native, trtllm-gen, trtllm-native | fa2, cudnn, cudnn-native |
+| **BatchPrefillWithRaggedKVCacheWrapper** |  | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, fa3, cudnn, cudnn-native | fa2, cudnn, cudnn-native, cutlass, trtllm-native | fa2, cudnn, cudnn-native, cutlass, trtllm-native | fa2, cudnn, cudnn-native |
 | **BatchMLAPagedAttentionWrapper** |  | fa2 | fa2 | fa2 | fa2, fa3 | fa2, cutlass, trtllm-native | fa2, cutlass, trtllm-native | fa2 |
 | **gemm_fp8_nt_groupwise** |  |  |  |  |  | cutlass | cutlass |  |
 | **group_gemm_fp8_nt_groupwise** |  |  |  |  |  | cutlass | cutlass |  |
@@ -314,8 +315,9 @@ Backend Legend:
 - fa2: FlashAttention2
 - fa2_tc: FlashAttention2 (with Tensor Cores for `BatchDecodeWithPagedKVCacheWrapper`)
 - fa3: FlashAttention-3
-- cudnn: cuDNN
 - cublas: cuBLAS
+- cudnn: cuDNN (via wrapper API)
+- cudnn-native: cuDNN (direct API call)
 - cutlass: CUTLASS
 - trtllm: TensorRT-LLM
 - trtllm-gen: TensorRT-LLM
