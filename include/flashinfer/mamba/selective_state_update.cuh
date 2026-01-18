@@ -641,7 +641,8 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, cudaStream_t
       using sram_t = SharedStorage<input_t, weight_t, matrixA_t, state_t, rowsPerStage, DIM, DSTATE,
                                    numStages>;
       constexpr size_t smem_size = sizeof(sram_t);
-      cudaFuncSetAttribute(scan_func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+      FLASHINFER_CUDA_CALL(
+          cudaFuncSetAttribute(scan_func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
       scan_func<<<grid, block, smem_size, stream>>>(params, tensorState);
     };
