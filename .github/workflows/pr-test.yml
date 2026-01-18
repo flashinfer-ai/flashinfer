@@ -1,0 +1,250 @@
+# CI workflow using AWS self-hosted runners.
+# Runs AOT build tests and GPU unit tests on push/PR to main.
+# Uses ci/bash.sh for Docker execution (same as Jenkins).
+
+name: PR Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      skip_aot:
+        description: 'Skip AOT build tests'
+        type: boolean
+        default: false
+      skip_gpu:
+        description: 'Skip GPU tests'
+        type: boolean
+        default: false
+
+concurrency:
+  group: pr-test-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  EXECUTOR_NUMBER: "0"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Setup - Read docker tag and check if build should be skipped
+  # ---------------------------------------------------------------------------
+  setup:
+    name: Setup
+    runs-on: ubuntu-latest
+    outputs:
+      docker_tag: ${{ steps.get-tag.outputs.tag }}
+      skip_build: ${{ steps.check.outputs.skip }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get Docker Tag
+        id: get-tag
+        run: |
+          TAG=$(grep 'flashinfer/flashinfer-ci-cu129:' ci/docker-tags.yml | cut -d':' -f2 | tr -d ' ')
+          if [ -z "$TAG" ]; then
+            echo "::error::Failed to extract Docker tag from ci/docker-tags.yml"
+            exit 1
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "Docker tag: $TAG"
+
+      - name: Check Skip Conditions
+        id: check
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "skip=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Use PR event SHAs for reliable diff (avoids issues with origin refs)
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          CHANGED=$(git diff --name-only "$BASE_SHA...$HEAD_SHA")
+          # TODO (yongwww): Add back ^\.github/ before merging to main
+          SKIP_PATTERNS="README.md|^docs/|^docker/|^licenses/|^LICENSE$|^NOTICE$|^version\.txt$"
+
+          SKIP=true
+          while IFS= read -r file; do
+            if [ -n "$file" ] && ! echo "$file" | grep -qE "$SKIP_PATTERNS"; then
+              SKIP=false
+              break
+            fi
+          done <<< "$CHANGED"
+
+          echo "skip=$SKIP" >> $GITHUB_OUTPUT
+          if [ "$SKIP" == "true" ]; then
+            echo "::notice::Skipping build - only docs/config files changed"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # AOT Build Import Tests - x86_64 and aarch64 (multiple CUDA versions)
+  # Uses ci/bash.sh with --no-gpu (same as Jenkins)
+  # ---------------------------------------------------------------------------
+  aot-build-import:
+    name: AOT Build Import (${{ matrix.arch }}, ${{ matrix.cuda }})
+    needs: setup
+    if: needs.setup.outputs.skip_build != 'true' && github.event.inputs.skip_aot != 'true'
+    runs-on:
+      - self-hosted
+      - Linux
+      - ${{ matrix.arch }}
+      - cpu
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [X64, ARM64]
+        cuda: [cu126, cu128, cu129, cu130]
+    env:
+      DOCKER_IMAGE: flashinfer/flashinfer-ci-${{ matrix.cuda }}:${{ needs.setup.outputs.docker_tag }}
+    steps:
+      - name: Cleanup
+        run: |
+          sudo rm -rf ${{ github.workspace }}/* || true
+          sudo rm -rf ${{ github.workspace }}/.[!.]* || true
+          rm -rf ~/.cache/flashinfer_jit || true
+          docker system prune -f || true
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Show Node Info
+        run: ./scripts/task_show_node_info.sh
+        env:
+          NODE_NAME: ${{ runner.name }}
+          WORKSPACE: ${{ github.workspace }}
+          BUILD_NUMBER: ${{ github.run_number }}
+
+      - name: Test JIT Cache Package Build and Import
+        run: bash ci/bash.sh ${DOCKER_IMAGE} --no-gpu ./scripts/task_test_jit_cache_package_build_import.sh
+
+  # ---------------------------------------------------------------------------
+  # GPU JIT Tests - SM86 (A10G) - 5 Shards
+  # Uses ci/bash.sh with GPU (same as Jenkins)
+  # ---------------------------------------------------------------------------
+  gpu-tests-a10g:
+    name: JIT Unittest ${{ matrix.shard }} (A10G)
+    needs: setup
+    if: needs.setup.outputs.skip_build != 'true' && github.event.inputs.skip_gpu != 'true'
+    runs-on: [self-hosted, Linux, X64, gpu, sm86]
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5]
+    env:
+      DOCKER_IMAGE: flashinfer/flashinfer-ci-cu129:${{ needs.setup.outputs.docker_tag }}
+    steps:
+      - name: Cleanup
+        run: |
+          # Stop all Docker containers to free GPU memory
+          docker stop $(docker ps -q) 2>/dev/null || true
+          docker rm $(docker ps -aq) 2>/dev/null || true
+          # Clean workspace and caches
+          sudo rm -rf ${{ github.workspace }}/* || true
+          sudo rm -rf ${{ github.workspace }}/.[!.]* || true
+          rm -rf ~/.cache/flashinfer_jit || true
+          docker system prune -f || true
+          # Verify GPU is free
+          nvidia-smi || true
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Show Node Info
+        run: ./scripts/task_show_node_info.sh
+        env:
+          NODE_NAME: ${{ runner.name }}
+          WORKSPACE: ${{ github.workspace }}
+          BUILD_NUMBER: ${{ github.run_number }}
+
+      - name: Run JIT Unittest Part ${{ matrix.shard }}
+        run: bash ci/bash.sh ${DOCKER_IMAGE} ./scripts/task_jit_run_tests_part${{ matrix.shard }}.sh
+
+  # ---------------------------------------------------------------------------
+  # GPU JIT Tests - SM75 (T4) - sampling tests only
+  # Uses ci/bash.sh with GPU (same as Jenkins)
+  # ---------------------------------------------------------------------------
+  gpu-tests-t4:
+    name: JIT Unittest (T4)
+    needs: setup
+    if: needs.setup.outputs.skip_build != 'true' && github.event.inputs.skip_gpu != 'true'
+    runs-on: [self-hosted, Linux, X64, gpu, sm75]
+    timeout-minutes: 300
+    env:
+      DOCKER_IMAGE: flashinfer/flashinfer-ci-cu129:${{ needs.setup.outputs.docker_tag }}
+    steps:
+      - name: Cleanup
+        run: |
+          # Stop all Docker containers to free GPU memory
+          docker stop $(docker ps -q) 2>/dev/null || true
+          docker rm $(docker ps -aq) 2>/dev/null || true
+          # Clean workspace and caches
+          sudo rm -rf ${{ github.workspace }}/* || true
+          sudo rm -rf ${{ github.workspace }}/.[!.]* || true
+          rm -rf ~/.cache/flashinfer_jit || true
+          docker system prune -f || true
+          # Verify GPU is free
+          nvidia-smi || true
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Show Node Info
+        run: ./scripts/task_show_node_info.sh
+        env:
+          NODE_NAME: ${{ runner.name }}
+          WORKSPACE: ${{ github.workspace }}
+          BUILD_NUMBER: ${{ github.run_number }}
+
+      - name: Run JIT Unittest Part 3 (T4)
+        run: bash ci/bash.sh ${DOCKER_IMAGE} ./scripts/task_jit_run_tests_part3.sh
+
+  # ---------------------------------------------------------------------------
+  # Test Results Summary
+  # ---------------------------------------------------------------------------
+  test-results-summary:
+    name: Test Results Summary
+    if: always()
+    needs: [setup, aot-build-import, gpu-tests-a10g, gpu-tests-t4]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check Results
+        run: |
+          echo "## Test Results Summary" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ needs.setup.outputs.skip_build }}" == "true" ]; then
+            echo "Build skipped (docs/config only changes)" >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+
+          AOT="${{ needs.aot-build-import.result }}"
+          A10G="${{ needs.gpu-tests-a10g.result }}"
+          T4="${{ needs.gpu-tests-t4.result }}"
+          SKIP_AOT="${{ github.event.inputs.skip_aot }}"
+          SKIP_GPU="${{ github.event.inputs.skip_gpu }}"
+
+          echo "AOT Build Import: $AOT" >> $GITHUB_STEP_SUMMARY
+          echo "GPU Tests (A10G): $A10G" >> $GITHUB_STEP_SUMMARY
+          echo "GPU Tests (T4): $T4" >> $GITHUB_STEP_SUMMARY
+
+          # Fail if any required job is not success (unless explicitly skipped)
+          if { [ "$AOT" != "success" ] && [ "$SKIP_AOT" != "true" ]; } || \
+             { [ "$A10G" != "success" ] && [ "$SKIP_GPU" != "true" ]; } || \
+             { [ "$T4" != "success" ] && [ "$SKIP_GPU" != "true" ]; }; then
+            echo "**Tests Failed**" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+
+          echo "**Tests Passed**" >> $GITHUB_STEP_SUMMARY
