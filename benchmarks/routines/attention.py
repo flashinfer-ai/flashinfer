@@ -1396,6 +1396,17 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
         if remove_cudnn:
             backends.remove("cudnn")
 
+    if "cudnn-native" in backends:
+        remove_cudnn_native = False
+        if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2] or kv_dtype in [
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+        ]:
+            print("[INFO] CUDNN-native backend does not support FP8. Skipping.")
+            remove_cudnn_native = True
+        if remove_cudnn_native:
+            backends.remove("cudnn-native")
+
     if "cutlass" in backends:
         remove_cutlass = False
         if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2] or kv_dtype in [
@@ -1609,6 +1620,34 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 q_data_type=q_dtype,
                 kv_data_type=kv_dtype,
             )
+        elif backend == "cudnn":
+            # cuDNN uses NHD layout and the wrapper API
+            backend_wrappers[backend] = (
+                flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
+                    workspace_buffer,
+                    "NHD",
+                    backend="cudnn",
+                )
+            )
+            backend_wrappers[backend].plan(
+                qo_indptr=q_indptr,
+                kv_indptr=k_indptr,
+                num_qo_heads=num_qo_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim_qk=head_dim_qk,
+                head_dim_vo=head_dim_vo,
+                causal=causal,
+                sm_scale=scale,
+                q_data_type=q_dtype,
+                kv_data_type=kv_dtype,
+                o_data_type=q_dtype,
+                seq_lens=actual_seq_lens_kv_device,
+                seq_lens_q=actual_seq_lens_q_device,
+                max_token_per_sequence=s_qo,
+                max_sequence_kv=s_kv,
+                v_indptr=v_indptr,
+                o_indptr=o_indptr,
+            )
 
     k_scale, v_scale = None, None
     if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
@@ -1639,6 +1678,10 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
         if backend in ["cutlass", "fa2", "fa3", "trtllm-gen"]:
             return backend_wrappers[backend].run_return_lse(q, k, v)[0]
         elif backend == "cudnn":
+            # cuDNN uses wrapper API
+            return backend_wrappers[backend].run(q, k, v)
+        elif backend == "cudnn-native":
+            # Direct cudnn_batch_prefill_with_kv_cache call
             return flashinfer.prefill.cudnn_batch_prefill_with_kv_cache(
                 q,
                 k,

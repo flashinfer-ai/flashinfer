@@ -2478,7 +2478,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             will be used in attention computation.
 
         backend : str
-            The implementation backend, could be ``auto``/``fa2``/``fa3`` or ``cutlass``.
+            The implementation backend, could be ``auto``/``fa2``/``fa3``/``cudnn`` or ``cutlass``.
             Defaults to ``auto``.
             If set to ``auto``, the wrapper will automatically choose the backend based on the
             device architecture and kernel availability.
@@ -2598,6 +2598,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         max_item_len_ptr: Optional[torch.Tensor] = None,
         fixed_split_size: Optional[int] = None,
         disable_split_kv: bool = False,
+        seq_lens: Optional[torch.Tensor] = None,
+        seq_lens_q: Optional[torch.Tensor] = None,
+        max_token_per_sequence: Optional[int] = None,
+        max_sequence_kv: Optional[int] = None,
+        v_indptr: Optional[torch.Tensor] = None,
+        o_indptr: Optional[torch.Tensor] = None,
     ) -> None:
         r"""Plan batch prefill/append attention on Ragged KV-Cache for given problem specification.
 
@@ -2692,6 +2698,19 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             and lead to a varied number of launched CTAs.
         disable_split_kv : bool,
             Whether to disable the split-kv for determinism in CUDA Graph, defaults to ``False``.
+        seq_lens: Optional[torch.Tensor]
+            A uint32 1D tensor indicating the kv sequence length of each prompt. shape: ``[batch_size]``.
+        seq_lens_q: Optional[torch.Tensor]
+            A uint32 1D tensor indicating the q sequence length of each prompt. shape: ``[batch_size]``.
+            If not provided, will be set to the same value as ``seq_lens``.
+        max_token_per_sequence: Optional[int],
+            Required for cudnn backend. This is the scalar max token length of each sequence.
+        max_sequence_kv: Optional[int],
+            Required for cudnn backend. This is the scalar max sequence length of each sequence in kv cache.
+        v_indptr: Optional[torch.Tensor]
+            Required for cudnn backend. This is the indptr of the value tensor.
+        o_indptr: Optional[torch.Tensor]
+            Required for cudnn backend. This is the indptr of the output tensor.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -2781,6 +2800,17 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     self.device, non_blocking=non_blocking
                 )
 
+        self._o_indptr_buf = (
+            o_indptr.to(self.device, non_blocking=non_blocking)
+            if o_indptr is not None
+            else self._qo_indptr_buf
+        )
+        self._v_indptr_buf = (
+            v_indptr.to(self.device, non_blocking=non_blocking)
+            if v_indptr is not None
+            else self._kv_indptr_buf
+        )
+
         self._cached_q_data_type = q_data_type
         self._cached_kv_data_type = kv_data_type
         self._cached_o_data_type = o_data_type
@@ -2790,6 +2820,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._token_pos_in_items_ptr = token_pos_in_items_ptr
         self._token_pos_in_items_len = token_pos_in_items_len
         self._max_item_len_ptr = max_item_len_ptr
+
+        self._seq_lens_q = seq_lens_q
+        self._seq_lens_kv = seq_lens
+        self._max_token_per_sequence = max_token_per_sequence
+        self._max_sequence_kv = max_sequence_kv
 
         if self._jit_module is not None:
             self._cached_module = self._jit_module
@@ -2822,7 +2857,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     get_module_args[:9] + (qo_indptr.device,) + get_module_args[9:]
                 )
                 self._cached_module = get_fmha_module(*new_get_module_args)
-            else:
+            elif self._backend != "cudnn":
                 self._cached_module = get_batch_prefill_module(
                     self._backend, *get_module_args
                 )
@@ -2832,7 +2867,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self._cached_module, qo_indptr, kv_indptr, num_qo_heads, causal
             )
             self._max_qo_len = torch.max(qo_indptr[1:] - qo_indptr[:-1]).item()
-        else:
+        elif self._backend != "cudnn":
             assert self._cached_module is not None, "cached module is not initialized"
             args = [
                 self._float_workspace_buffer,
@@ -3039,6 +3074,40 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 out=out,
                 lse=lse,
             )
+            return (out, lse) if return_lse else out
+        elif self._backend == "cudnn":
+            if self._seq_lens_q.dim() == 1:
+                batch_size = self._seq_lens_q.shape[0]
+            if self._seq_lens_q is not None and self._seq_lens_q.dim() == 1:
+                self._seq_lens_q = self._seq_lens_q.reshape(batch_size, 1, 1, 1)
+
+            if self._seq_lens_kv is not None and self._seq_lens_kv.dim() == 1:
+                self._seq_lens_kv = self._seq_lens_kv.reshape(batch_size, 1, 1, 1)
+
+            cudnn_batch_prefill_with_kv_cache(
+                q,
+                k,
+                v,
+                sm_scale,
+                self._float_workspace_buffer,
+                max_token_per_sequence=self._max_token_per_sequence,
+                max_sequence_kv=self._max_sequence_kv,
+                actual_seq_lens_q=self._seq_lens_q,
+                actual_seq_lens_kv=self._seq_lens_kv,
+                return_lse=return_lse,
+                causal=self._causal,
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                batch_offsets_q=self._qo_indptr_buf,
+                batch_offsets_k=self._kv_indptr_buf,
+                batch_offsets_v=self._v_indptr_buf,
+                batch_offsets_o=self._o_indptr_buf,
+                is_cuda_graph_compatible=self._use_cuda_graph,
+                out=out,
+                lse=lse,
+            )
+
             return (out, lse) if return_lse else out
 
         # Skip FP8->FP16 conversion for FA3 backend with FP8 support
