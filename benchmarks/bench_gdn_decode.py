@@ -23,17 +23,17 @@ import torch
 from flashinfer.gdn_decode import (
     gated_delta_rule_decode_pretranspose,
     gated_delta_rule_decode,
-    gated_delta_rule_verify,
+    gated_delta_rule_mtp,
 )
 
 
 def parse_trace_file(trace_file: str, version: str = 'pretranspose'):
     """
-    Parse a torch profiler trace file and extract GDN decode kernel timings.
+    Parse a torch profiler trace file and extract GDN kernel timings.
 
     Args:
         trace_file: Path to the trace JSON file
-        version: 'pretranspose' or 'nontranspose'
+        version: 'pretranspose', 'nontranspose', or 'mtp'
 
     Returns:
         dict with 'kernel_times' list (in microseconds)
@@ -41,7 +41,7 @@ def parse_trace_file(trace_file: str, version: str = 'pretranspose'):
     with open(trace_file, 'r') as f:
         trace_data = json.load(f)
 
-    # GDN decode kernel patterns (CuTe DSL kernels)
+    # GDN kernel patterns (CuTe DSL kernels)
     if version == 'pretranspose':
         kernel_patterns = [
             'gdn_decode_kernel_small_batch_pretranspose',  # Small batch kernel
@@ -51,6 +51,10 @@ def parse_trace_file(trace_file: str, version: str = 'pretranspose'):
         kernel_patterns = [
             'gdn_decode_kernel_small_batch_nontranspose',  # Small batch kernel
             'gdn_decode_kernel_big_batch_nontranspose',    # Big batch kernel
+        ]
+    elif version == 'mtp':
+        kernel_patterns = [
+            'gdn_verify_kernel_mtp',  # MTP kernel
         ]
     else:
         raise ValueError(f"Unknown version: {version}")
@@ -64,7 +68,7 @@ def parse_trace_file(trace_file: str, version: str = 'pretranspose'):
         name = event.get('name', '')
         dur = event.get('dur', 0)  # duration in microseconds
 
-        # Check if it's a GDN decode kernel
+        # Check if it's a GDN kernel
         if any(pattern in name for pattern in kernel_patterns):
             kernel_durations.append(dur)
 
@@ -77,11 +81,14 @@ def gdn_decode_flops(
     num_k_heads: int,
     num_v_heads: int,
     head_size: int,
+    seq_len: int = 1,
 ) -> int:
     """
-    Calculate FLOPs for Gated Delta Rule (GDN) decode (single token).
+    Calculate FLOPs for Gated Delta Rule (GDN).
 
-    Delta Rule decode formula (per token):
+    Supports both decode (seq_len=1) and MTP (seq_len>1).
+
+    Delta Rule formula (per token):
         g = -exp(A_log) * softplus(a + dt_bias)           # Log-space decay
         beta = sigmoid(b)                                  # Update gate
         state = state * exp(g)                             # State decay
@@ -99,9 +106,9 @@ def gdn_decode_flops(
     """
     num_o_heads = max(num_q_heads, num_v_heads)
 
-    # Decode processes 1 token per request, batch_size requests in parallel
     # Per token per head: 6 * d^2 FLOPs (d = head_size)
-    total_flops = 6 * batch_size * num_o_heads * head_size * head_size
+    # Total: seq_len * batch_size * num_heads * 6 * d^2
+    total_flops = 6 * seq_len * batch_size * num_o_heads * head_size * head_size
     return total_flops
 
 
@@ -112,115 +119,35 @@ def gdn_decode_bytes(
     num_v_heads: int,
     head_size: int,
     dtype: torch.dtype,
+    seq_len: int = 1,
 ) -> int:
     """
-    Calculate memory bytes for GDN decode.
+    Calculate memory bytes for GDN.
 
-    Includes:
-    - Q, K, V tensors (input): [B, 1, H, K] - dtype
-    - State tensor (input/output): [B, HV, K, V] - float32
-    - GDN parameters: A_log (float32), a (dtype), dt_bias (dtype), b (dtype)
-    - Output tensor: [B, 1, HV, V] - dtype
-    """
-    num_o_heads = max(num_q_heads, num_v_heads)
-    num_sab_heads = num_o_heads
-    elem_size = dtype.itemsize
+    Supports both decode (seq_len=1) and MTP (seq_len>1).
 
-    # Input tensors: [B, 1, H, K]
-    q_bytes = batch_size * 1 * num_q_heads * head_size * elem_size
-    k_bytes = batch_size * 1 * num_k_heads * head_size * elem_size
-    v_bytes = batch_size * 1 * num_v_heads * head_size * elem_size
-
-    # Output tensor: [B, 1, HV, V]
-    o_bytes = batch_size * 1 * num_o_heads * head_size * elem_size
-
-    # State tensor (float32): [B, HV, K, V] - read and write
-    state_bytes = 2 * batch_size * num_sab_heads * head_size * head_size * 4
-
-    # GDN parameters
-    # A_log: [HV] - float32
-    A_log_bytes = num_sab_heads * 4
-    # a: [B, 1, HV] - dtype
-    a_bytes = batch_size * 1 * num_sab_heads * elem_size
-    # dt_bias: [HV] - dtype
-    dt_bias_bytes = num_sab_heads * elem_size
-    # b: [B, 1, HV] - dtype
-    b_bytes = batch_size * 1 * num_sab_heads * elem_size
-
-    total_bytes = (
-        q_bytes
-        + k_bytes
-        + v_bytes
-        + o_bytes
-        + state_bytes
-        + A_log_bytes
-        + a_bytes
-        + dt_bias_bytes
-        + b_bytes
-    )
-    return total_bytes
-
-
-def gdn_mtp_flops(
-    batch_size: int,
-    seq_len: int,  # T > 1
-    num_q_heads: int,
-    num_k_heads: int,
-    num_v_heads: int,
-    head_size: int,
-) -> int:
-    """
-    Calculate FLOPs for Gated Delta Rule (GDN) MTP (multiple tokens).
-    
-    MTP processes T tokens sequentially, updating state after each token.
-    Per token per head: 6 * K * V FLOPs (same as decode)
-    Total: T * batch_size * num_heads * 6 * d^2
-    """
-    num_o_heads = max(num_q_heads, num_v_heads)
-    
-    # MTP processes T tokens per request, batch_size requests in parallel
-    # Per token per head: 6 * d^2 FLOPs (d = head_size)
-    total_flops = 6 * seq_len * batch_size * num_o_heads * head_size * head_size
-    return total_flops
-
-
-def gdn_mtp_bytes(
-    batch_size: int,
-    seq_len: int,  # T > 1
-    num_q_heads: int,
-    num_k_heads: int,
-    num_v_heads: int,
-    head_size: int,
-    dtype: torch.dtype,
-) -> int:
-    """
-    Calculate memory bytes for GDN MTP.
-    
     Includes:
     - Q, K, V tensors (input): [B, T, H, K] - dtype
-    - Initial state tensor: [pool_size, HV, V, K] - float32
-    - Intermediate states (optional): [pool_size, T, HV, V, K] - float32
+    - State tensor (input/output): [B, HV, K, V] - float32
+    - Intermediate states (MTP only): [B, T, HV, K, V] - float32
     - GDN parameters: A_log (float32), a (dtype), dt_bias (dtype), b (dtype)
     - Output tensor: [B, T, HV, V] - dtype
     """
     num_o_heads = max(num_q_heads, num_v_heads)
     num_sab_heads = num_o_heads
     elem_size = dtype.itemsize
-    
+
     # Input tensors: [B, T, H, K]
     q_bytes = batch_size * seq_len * num_q_heads * head_size * elem_size
     k_bytes = batch_size * seq_len * num_k_heads * head_size * elem_size
     v_bytes = batch_size * seq_len * num_v_heads * head_size * elem_size
-    
+
     # Output tensor: [B, T, HV, V]
     o_bytes = batch_size * seq_len * num_o_heads * head_size * elem_size
-    
-    # Initial state tensor (float32): [B, HV, V, K] - read and write
+
+    # State tensor (float32): [B, HV, K, V] - read and write
     state_bytes = 2 * batch_size * num_sab_heads * head_size * head_size * 4
-    
-    # Intermediate states (float32): [B, T, HV, V, K] - write
-    intermediate_bytes = batch_size * seq_len * num_sab_heads * head_size * head_size * 4
-    
+
     # GDN parameters
     # A_log: [HV] - float32
     A_log_bytes = num_sab_heads * 4
@@ -230,7 +157,12 @@ def gdn_mtp_bytes(
     dt_bias_bytes = num_sab_heads * elem_size
     # b: [B, T, HV] - dtype
     b_bytes = batch_size * seq_len * num_sab_heads * elem_size
-    
+
+    # Intermediate states (float32): [B, T, HV, V, K] - only for MTP (seq_len > 1)
+    intermediate_bytes = 0
+    if seq_len > 1:
+        intermediate_bytes = batch_size * seq_len * num_sab_heads * head_size * head_size * 4
+
     total_bytes = (
         q_bytes
         + k_bytes
@@ -452,7 +384,7 @@ def bench_gdn_mtp(
     
     # Warmup
     for _ in range(warmup_iters):
-        _, _ = gated_delta_rule_verify(
+        _, _ = gated_delta_rule_mtp(
             q, k, v, initial_state, initial_state_indices,
             A_log, a, dt_bias, b, scale, output,
             intermediate_states_buffer, disable_state_update=True,
@@ -474,7 +406,7 @@ def bench_gdn_mtp(
     ) as profiler:
         for i in range(bench_iters):
             with torch.profiler.record_function(f"gdn_mtp_iter{i}"):
-                _, _ = gated_delta_rule_verify(
+                _, _ = gated_delta_rule_mtp(
                     q, k, v, initial_state, initial_state_indices,
                     A_log, a, dt_bias, b, scale, output,
                     intermediate_states_buffer, disable_state_update=True,
@@ -484,29 +416,20 @@ def bench_gdn_mtp(
     profiler.export_chrome_trace(trace_file)
     
     # Parse trace file for kernel-level timing
-    # MTP kernel pattern
-    with open(trace_file, 'r') as f:
-        trace_data = json.load(f)
-    
-    kernel_durations = []
-    for event in trace_data.get('traceEvents', []):
-        if event.get('cat') != 'kernel':
-            continue
-        name = event.get('name', '')
-        if 'gdn_verify_kernel_mtp' in name:
-            kernel_durations.append(event.get('dur', 0))
+    trace_results = parse_trace_file(trace_file, version='mtp')
+    kernel_times = trace_results['kernel_times']  # in microseconds
     
     # Calculate statistics from kernel trace
-    kernel_median_us = np.median(kernel_durations) if kernel_durations else 0
-    kernel_mean_us = np.mean(kernel_durations) if kernel_durations else 0
-    kernel_std_us = np.std(kernel_durations) if kernel_durations else 0
+    kernel_median_us = np.median(kernel_times) if kernel_times else 0
+    kernel_mean_us = np.mean(kernel_times) if kernel_times else 0
+    kernel_std_us = np.std(kernel_times) if kernel_times else 0
     
     # Calculate metrics
-    flops = gdn_mtp_flops(
-        batch_size, seq_len, num_q_heads, num_k_heads, num_v_heads, head_size
+    flops = gdn_decode_flops(
+        batch_size, num_q_heads, num_k_heads, num_v_heads, head_size, seq_len
     )
-    bytes_accessed = gdn_mtp_bytes(
-        batch_size, seq_len, num_q_heads, num_k_heads, num_v_heads, head_size, dtype
+    bytes_accessed = gdn_decode_bytes(
+        batch_size, num_q_heads, num_k_heads, num_v_heads, head_size, dtype, seq_len
     )
     
     kernel_median_ms = kernel_median_us / 1000
@@ -630,7 +553,6 @@ def main():
             )
             print("-" * 100)
             
-            all_results = []
             for batch_size in args.batch_size:
                 for seq_len in args.seq_len:
                     result = bench_gdn_mtp(
@@ -653,8 +575,6 @@ def main():
                         f"{result['batch_size']:>6} {result['seq_len']:>8} {kernel_time_us:>10.2f} "
                         f"{result['kernel_tflops']:>10.2f} {result['kernel_tb_per_sec']:>10.2f}"
                     )
-                    
-                    all_results.append(result)
             
             print("-" * 100)
             continue
@@ -672,7 +592,6 @@ def main():
         )
         print("-" * 90)
 
-        all_results = []
         for batch_size in args.batch_size:
             result = bench_gdn_decode(
                 batch_size=batch_size,
@@ -701,8 +620,6 @@ def main():
                 f"{result['kernel_tflops']:>10.2f} {result['kernel_tb_per_sec']:>10.2f} "
                 f"{kernel_variant:>15}"
             )
-            
-            all_results.append(result)
 
         print("-" * 90)
 

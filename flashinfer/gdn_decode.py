@@ -312,7 +312,7 @@ def gdn_decode_kernel_small_batch_pretranspose(
                 sum_hq += cute.arch.shuffle_sync_bfly(sum_hq, offset=offset, mask=-1, mask_and_clamp=31)
 
             o_idx = v_tiles * TILE_V + row + row_offset
-            if lane_id == 0:
+            if lane_id == 0 and o_idx < V:
                 sOutput[o_idx] = cutlass.BFloat16(sum_hq)
 
     # ===================================================================
@@ -538,7 +538,7 @@ def gdn_decode_kernel_big_batch_pretranspose(
                 sum_hq += cute.arch.shuffle_sync_bfly(sum_hq, offset=offset, mask=-1, mask_and_clamp=31)
 
             o_idx = v_tiles * TILE_V + row + row_offset
-            if lane_id == 0:
+            if lane_id == 0 and o_idx < V:
                 sOutput[o_idx] = cutlass.BFloat16(sum_hq)
 
     # ===================================================================
@@ -720,14 +720,16 @@ def run_gdn_decode_kernel_big_batch_pretranspose(
 # ============================================================================
 
 @functools.cache
-def _get_compiled_decode_kernel(B: int, T: int, H: int, HV: int, K: int, V: int, dtype: torch.dtype):
+def _get_compiled_decode_kernel(B: int, T: int, H: int, HV: int, K: int, V: int, dtype: torch.dtype, 
+                                scale: float, use_qk_l2norm: bool):
     """Cache compiled kernel for given configuration (pretranspose version)."""
     # This will be populated on first call
     return {}
 
 
 @functools.cache
-def _get_compiled_decode_kernel_nontranspose(B: int, T: int, H: int, HV: int, K: int, V: int, dtype: torch.dtype):
+def _get_compiled_decode_kernel_nontranspose(B: int, T: int, H: int, HV: int, K: int, V: int, dtype: torch.dtype,
+                                             scale: float, use_qk_l2norm: bool):
     """Cache compiled kernel for given configuration (nontranspose version)."""
     # This will be populated on first call
     return {}
@@ -798,6 +800,10 @@ def gated_delta_rule_decode_pretranspose(
     assert state.shape == (B, HV, V, K), \
         f"Expected state shape [B={B}, HV={HV}, V={V}, K={K}], got {state.shape}"
     
+    # Validate K and V constraints
+    assert K >= 128, f"K must be at least 128, got K={K}"
+    assert V % 4 == 0, f"V must be a multiple of 4 for vectorized loads, got V={V}"
+    
     # Validate dtypes
     assert q.dtype in (torch.float16, torch.bfloat16), f"q must be float16/bfloat16, got {q.dtype}"
     assert state.dtype == torch.float32, f"state must be float32, got {state.dtype}"
@@ -837,7 +843,7 @@ def gated_delta_rule_decode_pretranspose(
     cu_seqlens_tensor = from_dlpack(cu_seqlens, assumed_align=16)
 
     # Compile kernel (cached)
-    cache_key = (B, T, H, HV, K, V, q.dtype)
+    cache_key = (B, T, H, HV, K, V, q.dtype, scale, use_qk_l2norm)
     cache = _get_compiled_decode_kernel(*cache_key)
     
     if 'compiled' not in cache:
@@ -878,8 +884,7 @@ def gated_delta_rule_decode_pretranspose(
         stream
     )
     
-    # Sync and reshape state back
-    torch.cuda.synchronize()
+    # Reshape state back (no sync needed - PyTorch handles stream ordering)
     state.copy_(h0_source.reshape(B, HV, V, K))
     
     # Convert output to target dtype if needed (kernel outputs bfloat16)
@@ -1577,6 +1582,10 @@ def gated_delta_rule_decode(
     assert state.shape == (B, HV, K, V), \
         f"Expected state shape [B={B}, HV={HV}, K={K}, V={V}], got {state.shape}"
     
+    # Validate K and V constraints
+    assert K >= 128, f"K must be at least 128, got K={K}"
+    assert V % 4 == 0, f"V must be a multiple of 4 for vectorized loads, got V={V}"
+    
     # Validate dtypes
     assert q.dtype in (torch.float16, torch.bfloat16), f"q must be float16/bfloat16, got {q.dtype}"
     assert state.dtype == torch.float32, f"state must be float32, got {state.dtype}"
@@ -1616,7 +1625,7 @@ def gated_delta_rule_decode(
     cu_seqlens_tensor = from_dlpack(cu_seqlens, assumed_align=16)
     
     # Compile kernel (cached)
-    cache_key = (B, T, H, HV, K, V, q.dtype)
+    cache_key = (B, T, H, HV, K, V, q.dtype, scale, use_qk_l2norm)
     cache = _get_compiled_decode_kernel_nontranspose(*cache_key)
     
     if 'compiled' not in cache:
@@ -1677,8 +1686,8 @@ def gated_delta_rule_decode(
         stream,
     )
     
-    # Sync and copy state back (h0_source is already [B, HV, K, V])
-    torch.cuda.synchronize()
+    # Copy state back (no sync needed - PyTorch handles stream ordering)
+    # h0_source is already [B, HV, K, V]
     state.copy_(h0_source)
     
     # Convert output to target dtype if needed (kernel outputs bfloat16)
@@ -2039,13 +2048,13 @@ def run_gdn_verify_kernel_mtp(
 @functools.cache
 def _get_compiled_mtp_kernel(B: int, T: int, H: int, HV: int, K: int, V: int, pool_size: int, 
                               cache_steps: int, disable_state_update: bool, 
-                              cache_intermediate_states: bool, use_qk_l2norm: bool):
+                              cache_intermediate_states: bool, scale: float, use_qk_l2norm: bool):
     """Cache compiled MTP kernel for given configuration."""
     return {}
 
 
 @flashinfer_api
-def gated_delta_rule_verify(
+def gated_delta_rule_mtp(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -2062,7 +2071,7 @@ def gated_delta_rule_verify(
     use_qk_l2norm: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Gated Delta Rule Verify Kernel (MTP - Multiple Token Processing).
+    Gated Delta Rule MTP Kernel (Multiple Token Processing).
     
     This function processes multiple tokens (T > 1) in sequence, typically used for 
     speculative decoding verification. It supports intermediate state caching for 
@@ -2143,6 +2152,11 @@ def gated_delta_rule_verify(
     if cache_intermediate_states:
         buffer_size = intermediate_states_buffer.shape[0]
         cache_steps = intermediate_states_buffer.shape[1]
+        
+        # Validate buffer length matches query sequence length
+        assert cache_steps >= T, \
+            f"intermediate_states_buffer second dimension (cache_steps={cache_steps}) must be at least T={T} to prevent out-of-bounds indexing"
+        
         intermediate_states = intermediate_states_buffer.to(torch.float32).reshape(
             buffer_size * cache_steps * HV, V, K
         ).contiguous()
@@ -2169,7 +2183,7 @@ def gated_delta_rule_verify(
     
     # Compile kernel (cached)
     cache_key = (B, T, H, HV, K, V, pool_size, cache_steps, disable_state_update, 
-                 cache_intermediate_states, use_qk_l2norm)
+                 cache_intermediate_states, scale, use_qk_l2norm)
     cache = _get_compiled_mtp_kernel(*cache_key)
     
     if 'compiled' not in cache:
@@ -2208,8 +2222,7 @@ def gated_delta_rule_verify(
         stream,
     )
     
-    # Sync and copy state back if needed
-    torch.cuda.synchronize()
+    # Copy state back if needed (no sync needed - PyTorch handles stream ordering)
     if not disable_state_update:
         initial_state.copy_(h0_source.reshape(pool_size, HV, V, K))
     
