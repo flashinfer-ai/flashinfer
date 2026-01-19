@@ -513,7 +513,7 @@ def decode_delta_rule(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Reference implementation for single-step decode with GDN formula.
-    
+
     Strictly follows the Triton kernel logic from fused_sigmoid_gating_recurrent.py:
         1. Compute g = -exp(A_log) * softplus(a + dt_bias)
         2. Compute beta = sigmoid(b)
@@ -523,7 +523,7 @@ def decode_delta_rule(
         6. v_new *= beta                  # Apply update gate
         7. h += k @ v_new^T               # Update state (outer product)
         8. o = q^T @ h                    # Compute output (h is [K,V], q is [K])
-    
+
     Args:
         q: Query [B, num_q_heads, K]
         k: Key [B, num_k_heads, K]
@@ -537,7 +537,7 @@ def decode_delta_rule(
         softplus_beta: Beta parameter for softplus activation
         softplus_threshold: Threshold for softplus numerical stability
         use_l2_norm: Whether to apply L2 normalization to q and k
-        
+
     Returns:
         output: [B, num_heads, V]
         new_state: [B, num_heads, K, V]
@@ -548,44 +548,44 @@ def decode_delta_rule(
     num_v_heads = v.size(1)
     K = q.size(2)
     V = v.size(2)
-    
+
     # State and output are always based on num_v_heads (matches kernel's HV dimension)
     num_heads = num_v_heads
-    
+
     device = q.device
     dtype = torch.float32
-    
+
     # Convert to float32 for computation
     A_log = A_log.to(dtype).to(device)
     a = a.to(dtype).to(device)
     dt_bias = dt_bias.to(dtype).to(device)
     b = b.to(dtype).to(device)
-    
+
     # ============================================
     # Compute gating values (following Triton kernel exactly)
     # ============================================
-    
+
     # Step 1: Compute g = -exp(A_log) * softplus(a + dt_bias)
     # Triton kernel lines 100-109
     x = a + dt_bias  # [B, num_heads]
     beta_x = softplus_beta * x
-    
+
     # Apply softplus with numerical stability
     # softplus(x) = (1/beta) * log(1 + exp(beta*x)) if beta*x <= threshold, else x
     softplus_x = torch.where(
         beta_x <= softplus_threshold,
         (1.0 / softplus_beta) * torch.log(1.0 + torch.exp(beta_x)),
-        x
+        x,
     )
-    
+
     # Compute g (log-space decay gate)
     # Triton kernel line 109: b_g = -tl.exp(b_A_log) * softplus_x
     g = -torch.exp(A_log) * softplus_x  # [B, num_heads]
-    
+
     # Step 2: Compute beta = sigmoid(b)
     # Triton kernel line 112: b_beta = 1.0 / (1.0 + tl.exp(-b_b))
     beta = 1.0 / (1.0 + torch.exp(-b))  # [B, num_heads]
-    
+
     # Expand heads if needed (for GQA/GVA)
     # The reference works at v_heads level
     # For GQA (num_q_heads > num_v_heads): k and q need to be averaged/pooled per v_head
@@ -600,26 +600,26 @@ def decode_delta_rule(
         q = q.reshape(B, num_v_heads, num_q_heads // num_v_heads, K).mean(dim=2)
         if num_k_heads == num_q_heads:
             k = k.reshape(B, num_v_heads, num_k_heads // num_v_heads, K).mean(dim=2)
-    
+
     q = q.to(dtype)
     k = k.to(dtype)
     v = v.to(dtype)
     state = state.to(dtype)
-    
+
     # Apply L2 normalization if requested
     if use_l2_norm:
         q = F.normalize(q, p=2.0, dim=-1)
         k = F.normalize(k, p=2.0, dim=-1)
-    
+
     # Apply scale to q
     q = q * scale_factor
-    
+
     # ============================================
     # Process each batch and head
     # ============================================
     new_state = torch.zeros(B, num_heads, K, V, device=device, dtype=dtype)
     output = torch.zeros(B, num_heads, V, device=device, dtype=dtype)
-    
+
     for b_idx in range(B):
         for h_idx in range(num_heads):
             # Get current vectors
@@ -627,41 +627,41 @@ def decode_delta_rule(
             k_h = k[b_idx, h_idx]  # [K]
             v_h = v[b_idx, h_idx]  # [V]
             h_state = state[b_idx, h_idx].clone()  # [K, V] (matches Triton's [BK, BV])
-            
+
             # Get gating values for this batch and head
-            g_val = g[b_idx, h_idx]      # scalar
+            g_val = g[b_idx, h_idx]  # scalar
             beta_val = beta[b_idx, h_idx]  # scalar
-            
+
             # ============================================
             # Recurrent update (following Triton kernel lines 121-134)
             # ============================================
-            
+
             # Step 1: Apply gating to hidden state: h *= exp(g)
             # Triton kernel line 122: b_h *= tl.exp(b_g)
             h_state = h_state * torch.exp(g_val)
-            
+
             # Step 2: Delta rule: v -= sum(h * k, dim=0)
             # Triton kernel line 125: b_v -= tl.sum(b_h * b_k[:, None], 0)
             # Triton: b_h is [BK, BV], b_k is [BK]
             # b_k[:, None] makes it [BK, 1]
             # b_h * b_k[:, None] gives [BK, BV] (element-wise per row)
             # tl.sum(..., 0) sums over BK dimension -> [BV]
-            # 
+            #
             # Equivalent to: k^T @ h where h is [K, V]
             # [K] @ [K, V] = [V]
             v_new = v_h - (k_h @ h_state)
-            
+
             # Step 3: Apply beta gating: v *= beta
             # Triton kernel line 128: b_v *= b_beta
             v_new = v_new * beta_val
-            
+
             # Step 4: Update hidden state: h += k[:, None] * v[None, :]
             # Triton kernel line 131: b_h += b_k[:, None] * b_v[None, :]
             # Triton: [BK, BV] += [BK, 1] * [1, BV]
             # This is outer product: k @ v^T
             # [K, V] += [K, 1] @ [1, V]
             h_state = h_state + k_h.unsqueeze(1) @ v_new.unsqueeze(0)
-            
+
             # Step 5: Compute output: o = sum(h * q, dim=0)
             # Triton kernel line 134: b_o = tl.sum(b_h * b_q[:, None], 0)
             # Triton: b_h is [BK, BV], b_q is [BK]
@@ -672,10 +672,10 @@ def decode_delta_rule(
             # Equivalent to: q^T @ h where h is [K, V]
             # [K] @ [K, V] = [V]
             output[b_idx, h_idx] = q_h @ h_state
-            
+
             # Store updated state
             new_state[b_idx, h_idx] = h_state
-    
+
     return output, new_state
 
 
@@ -697,10 +697,10 @@ def verify_delta_rule(
 ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """
     Reference implementation for multi-token (verify mode) delta rule.
-    
+
     Processes T tokens sequentially, updating the state after each token.
     Optionally caches intermediate states for rollback in speculative decoding.
-    
+
     Args:
         q: Query tensor [B, T, num_q_heads, K]
         k: Key tensor [B, T, num_k_heads, K]
@@ -715,7 +715,7 @@ def verify_delta_rule(
         softplus_threshold: Threshold for softplus approximation
         use_l2_norm: Whether to apply L2 normalization
         cache_intermediate_states: Whether to cache state at each time step
-    
+
     Returns:
         output: Output tensor [B, T, num_heads, V]
         new_state: Final state tensor [B, num_heads, K, V]
@@ -725,20 +725,20 @@ def verify_delta_rule(
     _, _, num_k_heads, _ = k.shape
     _, _, num_v_heads, V = v.shape
     num_heads = state.shape[1]
-    
+
     # Handle GQA/GVA: expand or average heads
     if num_q_heads != num_heads:
         # Expand q heads to match num_heads (num_v_heads)
         assert num_heads % num_q_heads == 0
         repeat_factor = num_heads // num_q_heads
         q = q.repeat_interleave(repeat_factor, dim=2)  # [B, T, num_heads, K]
-    
+
     if num_k_heads != num_heads:
         # Expand k heads to match num_heads (num_v_heads)
         assert num_heads % num_k_heads == 0
         repeat_factor = num_heads // num_k_heads
         k = k.repeat_interleave(repeat_factor, dim=2)  # [B, T, num_heads, K]
-    
+
     # Convert to float32 for computation
     q = q.float()
     k = k.float()
@@ -748,42 +748,46 @@ def verify_delta_rule(
     a = a.float()
     dt_bias = dt_bias.float()
     b = b.float()
-    
+
     # Pre-compute gating values for all time steps
     # Shape: [B, T, num_heads]
     x = a + dt_bias.unsqueeze(0).unsqueeze(0)  # [B, T, num_heads]
     beta_x = softplus_beta * x
-    
+
     # Softplus with threshold
     softplus_x = torch.where(
         beta_x <= softplus_threshold,
         (1.0 / softplus_beta) * torch.log(1.0 + torch.exp(beta_x)),
-        x
+        x,
     )
-    
+
     # Compute g (decay factor, already includes exp)
-    g = torch.exp(-torch.exp(A_log.unsqueeze(0).unsqueeze(0)) * softplus_x)  # [B, T, num_heads]
-    
+    g = torch.exp(
+        -torch.exp(A_log.unsqueeze(0).unsqueeze(0)) * softplus_x
+    )  # [B, T, num_heads]
+
     # Compute beta (update gate)
     beta = 1.0 / (1.0 + torch.exp(-b))  # [B, T, num_heads]
-    
+
     # Apply L2 normalization if needed
     if use_l2_norm:
         q = torch.nn.functional.normalize(q, p=2, dim=-1)
         k = torch.nn.functional.normalize(k, p=2, dim=-1)
-    
+
     # Apply scaling to q
     q = q * scale_factor
-    
+
     # Initialize output and intermediate states
     output = torch.zeros(B, T, num_heads, V, dtype=torch.float32, device=q.device)
     current_state = state.clone()  # [B, num_heads, K, V]
-    
+
     if cache_intermediate_states:
-        intermediate_states = torch.zeros(B, T, num_heads, K, V, dtype=torch.float32, device=q.device)
+        intermediate_states = torch.zeros(
+            B, T, num_heads, K, V, dtype=torch.float32, device=q.device
+        )
     else:
         intermediate_states = None
-    
+
     # Process each time step sequentially
     for t in range(T):
         q_t = q[:, t]  # [B, num_heads, K]
@@ -791,7 +795,7 @@ def verify_delta_rule(
         v_t = v[:, t]  # [B, num_heads, V]
         g_t = g[:, t]  # [B, num_heads]
         beta_t = beta[:, t]  # [B, num_heads]
-        
+
         # Process each batch and head
         for b_idx in range(B):
             for h_idx in range(num_heads):
@@ -801,29 +805,31 @@ def verify_delta_rule(
                 h_state = current_state[b_idx, h_idx].clone()  # [K, V]
                 g_val = g_t[b_idx, h_idx]
                 beta_val = beta_t[b_idx, h_idx]
-                
+
                 # Recurrent update (following Triton kernel)
                 # 1. Apply decay
                 h_state = h_state * g_val
-                
+
                 # 2. Compute prediction error: v - k^T @ h
                 v_pred = k_h @ h_state  # [K] @ [K, V] = [V]
                 v_new = v_h - v_pred
-                
+
                 # 3. Apply gating
                 v_new = v_new * beta_val
-                
+
                 # 4. Update state: h = h + k ⊗ v_new
-                h_state = h_state + k_h.unsqueeze(1) @ v_new.unsqueeze(0)  # [K, V] + [K, 1] @ [1, V]
-                
+                h_state = h_state + k_h.unsqueeze(1) @ v_new.unsqueeze(
+                    0
+                )  # [K, V] + [K, 1] @ [1, V]
+
                 # 5. Compute output: o = q^T @ h
                 output[b_idx, t, h_idx] = q_h @ h_state  # [K] @ [K, V] = [V]
-                
+
                 # Update current state
                 current_state[b_idx, h_idx] = h_state
-                
+
                 # Cache intermediate state if requested
                 if cache_intermediate_states:
                     intermediate_states[b_idx, t, h_idx] = h_state
-    
+
     return output, current_state, intermediate_states
