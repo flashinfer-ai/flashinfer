@@ -175,7 +175,7 @@ jobs:
             -w /workspace \
             ${{ env.DOCKER_IMAGE }} \
             bash /workspace/scripts/build_flashinfer_jit_cache_whl.sh
-        timeout-minutes: 240
+        timeout-minutes: 300
 
       - name: Display wheel size
         run: du -h flashinfer-jit-cache/dist/*
