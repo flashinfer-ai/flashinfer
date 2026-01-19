@@ -5,11 +5,11 @@ The aim of `flashinfer_benchmark.py` is to provide a single framework for benchm
 ## Overview
 
 This framework provides tools to:
-- Benchmark FlashInfer's Attention, GEMM, MOE, Norm, and Quantization API performance from different kernel backends such as FlashAttention2/3, cuDNN, cuBLAS, CUTLASS, CuTe-DSL, and TensorRT-LLM
+- Benchmark FlashInfer's Attention, GEMM, MOE, Norm, Quantization, and Sampling API performance from different kernel backends such as FlashAttention2/3, cuDNN, cuBLAS, CUTLASS, CuTe-DSL, and TensorRT-LLM
 - Compare performance across different configurations
 - Batch performance test multiple test cases
 
-Currently supports testing attention, gemm, fused MOE, normalization, and quantization APIs:
+Currently supports testing attention, gemm, fused MOE, normalization, quantization, and sampling APIs:
 - Attention:
     - `BatchDecodeWithPagedKVCacheWrapper` - Decode attention with paged KV cache.
         - Also supports computationally similar `cudnn_batch_decode_with_kv_cache` and `trtllm_batch_decode_with_kv_cache`.
@@ -42,6 +42,14 @@ Currently supports testing attention, gemm, fused MOE, normalization, and quanti
     - `mxfp4_quantize` - Quantize tensor to MxFP4 format (Blackwell SM10.0+).
     - `nvfp4_quantize` - Quantize tensor to NVFP4 format with configurable scale factor layout (Blackwell SM10.0+).
     - `nvfp4_batched_quantize` - Batched NVFP4 quantization (Blackwell SM10.0+).
+- Sampling:
+    - `sampling_from_probs` - Basic category sampling from probability distributions.
+    - `top_p_sampling_from_probs` - Top-p (nucleus) sampling from probabilities.
+    - `top_k_sampling_from_probs` - Top-k sampling from probabilities.
+    - `top_k_top_p_sampling_from_probs` - Combined top-k and top-p sampling from probabilities.
+    - `top_k_renorm_probs` - Renormalize probabilities by top-k thresholding.
+    - `top_p_renorm_probs` - Renormalize probabilities by top-p thresholding.
+    - `top_k_mask_logits` - Mask logits by top-k thresholding.
 
 ## Quick Start
 ### Single Test Run
@@ -316,6 +324,17 @@ mpirun -np 8 python benchmarks/flashinfer_benchmark.py \
 | `--sf_vec_size`          | Scale factor vector size for NVFP4 quantization. Default: 16                                               |
 | `--backends`             | Backend to test. Default: `cuda`                                                                           |
 
+### Sampling Flags
+| Flag                     | Description                                                                                                 |
+|--------------------------|-------------------------------------------------------------------------------------------------------------|
+| `--batch_size`           | Batch size (number of sequences to sample from)                                                            |
+| `--vocab_size`           | Vocabulary size. Default: 128256 (Llama 3 vocab size)                                                      |
+| `--input_dtype`          | Input data type: `float32` (default), `float16`, or `bfloat16`                                             |
+| `--top_p`                | Top-p threshold for nucleus sampling. Default: 0.9                                                         |
+| `--top_k`                | Top-k threshold for top-k sampling. Default: 50                                                            |
+| `--no_deterministic`     | Disable deterministic sampling. Default: deterministic is enabled                                          |
+| `--backends`             | Backend to test. Default: `cuda`                                                                           |
+
 ## `flashinfer_benchmark.py` Routine & Backend Support Matrix
 The following table summarizes the support surface of each routine & backend's on various [CUDA Compute Capabilities](https://developer.nvidia.com/cuda-gpus).
 
@@ -357,6 +376,13 @@ Legend:
 | **mxfp4_quantize** |  |  |  |  |  | cuda | cuda |  |
 | **nvfp4_quantize** |  |  |  |  |  | cuda | cuda |  |
 | **nvfp4_batched_quantize** |  |  |  |  |  | cuda | cuda |  |
+| **sampling_from_probs** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
+| **top_p_sampling_from_probs** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
+| **top_k_sampling_from_probs** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
+| **top_k_top_p_sampling_from_probs** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
+| **top_k_renorm_probs** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
+| **top_p_renorm_probs** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
+| **top_k_mask_logits** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
 
 Backend Legend:
 - fa2: FlashAttention2
