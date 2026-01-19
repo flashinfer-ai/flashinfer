@@ -31,7 +31,8 @@ from .flashinfer_benchmark_utils import (
 
 
 def run_sampling_test(args):
-    """Run a sampling test.
+    """Run a sampling test. We expose all sampling API in this benchmark.
+    TopK is under sampling_topk.py- please see it for topk benchmark.
 
     Args:
         args: Parsed command line arguments containing test configuration
@@ -128,9 +129,12 @@ def testSamplingFromProbs(args):
     """Test sampling_from_probs API.
 
     This test:
-    1. Generates random probability distributions
+    Sampling rng is not compatible with CUDA Graphs
+    in the specific implementation in flashinfer,
+    so we disable them for test.
+    1. Generates random probability distributions and normalize them in FP32
     2. Runs sampling_from_probs
-    3. Measures performance metrics
+    3. Fetch performance numbers.
 
     Args:
         args: Parsed command line arguments containing test configuration
@@ -225,12 +229,12 @@ def testSamplingFromProbs(args):
                 cur_res = defaultdict(str)
                 cur_res["routine"] = args.routine
                 cur_res["median_time"] = median_time
-                cur_res["std_time"] = std_time
+                cur_res["std_time"] = str(std_time)
                 cur_res["tflops"] = tflops
                 cur_res["tb_per_sec"] = tb_per_sec
                 cur_res["input_dtype"] = str(input_dtype)
                 cur_res["vocab_size"] = vocab_size
-                cur_res["deterministic"] = deterministic
+                cur_res["deterministic"] = str(deterministic)
                 cur_res["backend"] = backend
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
@@ -241,9 +245,9 @@ def testTopPSamplingFromProbs(args):
     """Test top_p_sampling_from_probs API.
 
     This test:
-    1. Generates random probability distributions
+    1. Generates random probability distributions and normalize them in FP32
     2. Runs top_p_sampling_from_probs (nucleus sampling)
-    3. Measures performance metrics
+    3. Fetch performance numbers.
 
     Args:
         args: Parsed command line arguments containing test configuration
@@ -337,13 +341,13 @@ def testTopPSamplingFromProbs(args):
                 cur_res = defaultdict(str)
                 cur_res["routine"] = args.routine
                 cur_res["median_time"] = median_time
-                cur_res["std_time"] = std_time
+                cur_res["std_time"] = str(std_time)
                 cur_res["tflops"] = tflops
                 cur_res["tb_per_sec"] = tb_per_sec
                 cur_res["input_dtype"] = str(input_dtype)
                 cur_res["vocab_size"] = vocab_size
                 cur_res["top_p"] = top_p
-                cur_res["deterministic"] = deterministic
+                cur_res["deterministic"] = str(deterministic)
                 cur_res["backend"] = backend
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
@@ -450,13 +454,13 @@ def testTopKSamplingFromProbs(args):
                 cur_res = defaultdict(str)
                 cur_res["routine"] = args.routine
                 cur_res["median_time"] = median_time
-                cur_res["std_time"] = std_time
+                cur_res["std_time"] = str(std_time)
                 cur_res["tflops"] = tflops
                 cur_res["tb_per_sec"] = tb_per_sec
                 cur_res["input_dtype"] = str(input_dtype)
                 cur_res["vocab_size"] = vocab_size
                 cur_res["top_k"] = top_k
-                cur_res["deterministic"] = deterministic
+                cur_res["deterministic"] = str(deterministic)
                 cur_res["backend"] = backend
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
@@ -467,9 +471,9 @@ def testTopKTopPSamplingFromProbs(args):
     """Test top_k_top_p_sampling_from_probs API.
 
     This test:
-    1. Generates random probability distributions
+    1. Generates random probability distributions and normalize them in FP32
     2. Runs top_k_top_p_sampling_from_probs (combined top-k and top-p)
-    3. Measures performance metrics
+    3. Fetch performance numbers.
 
     Args:
         args: Parsed command line arguments containing test configuration
@@ -566,14 +570,14 @@ def testTopKTopPSamplingFromProbs(args):
                 cur_res = defaultdict(str)
                 cur_res["routine"] = args.routine
                 cur_res["median_time"] = median_time
-                cur_res["std_time"] = std_time
+                cur_res["std_time"] = str(std_time)
                 cur_res["tflops"] = tflops
                 cur_res["tb_per_sec"] = tb_per_sec
                 cur_res["input_dtype"] = str(input_dtype)
                 cur_res["vocab_size"] = vocab_size
                 cur_res["top_k"] = top_k
                 cur_res["top_p"] = top_p
-                cur_res["deterministic"] = deterministic
+                cur_res["deterministic"] = str(deterministic)
                 cur_res["backend"] = backend
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
@@ -584,9 +588,9 @@ def testTopKRenormProbs(args):
     """Test top_k_renorm_probs API.
 
     This test:
-    1. Generates random probability distributions
+    1. Generates random probability distributions and normalize them in FP32
     2. Runs top_k_renorm_probs (renormalize by top-k thresholding)
-    3. Measures performance metrics
+    3. Fetch performance numbers.
 
     Args:
         args: Parsed command line arguments containing test configuration
@@ -713,7 +717,7 @@ def testTopKRenormProbs(args):
                 cur_res = defaultdict(str)
                 cur_res["routine"] = args.routine
                 cur_res["median_time"] = median_time
-                cur_res["std_time"] = std_time
+                cur_res["std_time"] = str(std_time)
                 cur_res["tflops"] = tflops
                 cur_res["tb_per_sec"] = tb_per_sec
                 cur_res["input_dtype"] = str(input_dtype)
@@ -819,7 +823,7 @@ def testTopPRenormProbs(args):
                 cur_res = defaultdict(str)
                 cur_res["routine"] = args.routine
                 cur_res["median_time"] = median_time
-                cur_res["std_time"] = std_time
+                cur_res["std_time"] = str(std_time)
                 cur_res["tflops"] = tflops
                 cur_res["tb_per_sec"] = tb_per_sec
                 cur_res["input_dtype"] = str(input_dtype)
@@ -977,7 +981,7 @@ def testTopKMaskLogits(args):
                 cur_res = defaultdict(str)
                 cur_res["routine"] = args.routine
                 cur_res["median_time"] = median_time
-                cur_res["std_time"] = std_time
+                cur_res["std_time"] = str(std_time)
                 cur_res["tflops"] = tflops
                 cur_res["tb_per_sec"] = tb_per_sec
                 cur_res["input_dtype"] = str(input_dtype)
