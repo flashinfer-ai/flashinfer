@@ -226,7 +226,7 @@ CUtensorMap make_3d_tma_copy_desc(T* global_address, uint64_t gmem_dim[3],
       encode_func(&tensor_map, data_type, rank, global_address, gmem_dim, stride_in_bytes, smem_dim,
                   elem_strides, CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle_type,
                   CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_NONE,
-                  CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+                  CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NAN_REQUEST_ZERO_FMA);
   TLLM_CHECK_WITH_INFO(result == CUDA_SUCCESS, "Failed to encode TMA tensor map");
   return tensor_map;
 }
@@ -260,13 +260,14 @@ void launchFP4QuantizationTma(int b, int m, int n, T const* input, float const* 
 
   // Create 3D TMA tensor map descriptor
   // The TMA kernel loads a box of [TMA_COL_TILE, TMA_ROW_TILE, NUM_CONSUMER_WARPS] elements per TMA
-  // call Global tensor is treated as [TMA_COL_TILE, M, num_tiles] where num_tiles = N /
-  // TMA_COL_TILE
+  // call Global tensor is treated as [TMA_COL_TILE, B*M, num_tiles] where num_tiles = N /
+  // TMA_COL_TILE. We use b * m (not b * effectiveRows) because batches are stored contiguously
+  // without padding between them.
   int num_col_tiles = (n + TMA_COL_TILE - 1) / TMA_COL_TILE;
   uint64_t gmem_dim[3] = {
-      static_cast<uint64_t>(TMA_COL_TILE),   // Elements per tile (contiguous in memory)
-      static_cast<uint64_t>(effectiveRows),  // Number of rows
-      static_cast<uint64_t>(num_col_tiles)   // Number of column tiles
+      static_cast<uint64_t>(TMA_COL_TILE),  // Elements per tile (contiguous in memory)
+      static_cast<uint64_t>(b * m),         // Total rows across all batches
+      static_cast<uint64_t>(num_col_tiles)  // Number of column tiles
   };
   uint64_t stride_in_bytes[2] = {
       static_cast<uint64_t>(n * sizeof(T)),            // Stride between rows (in bytes)
@@ -318,10 +319,10 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
 #ifdef ENABLE_FP8
   if constexpr (std::is_same_v<T, __nv_fp8_e4m3>) {
     // Use TMA kernel for large m (high throughput mode)
-    // Use if constexpr for SF_VEC_SIZE to avoid instantiating TMA kernel for unsupported sizes
+    // TODO: fix the issue when n is not a multiple of NUM_CONSUMER_WARPS * TMA_COL_TILE
+    constexpr int TMA_COL_CHUNK = 8 * 64;  // NUM_CONSUMER_WARPS * TMA_COL_TILE
     if constexpr (SF_VEC_SIZE == 16) {
-      // TODO: Debug TMA tensor map configuration - temporarily disabled
-      if (SF_VEC_SIZE == 16 && m >= 1024) {
+      if (SF_VEC_SIZE == 16 && m >= 1024 && n % TMA_COL_CHUNK == 0) {
         launchFP4QuantizationTma<BlockScaleQuantizationType::FP8_TO_FP4, T, SF_VEC_SIZE>(
             b, m, n, input, SFScale, output, SFOuput, useUE8M0, layout, multiProcessorCount,
             enable_pdl, stream);
@@ -350,10 +351,10 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
 #endif
   {
     // Use TMA kernel for large m (high throughput mode)
-    // Use if constexpr for SF_VEC_SIZE to avoid instantiating TMA kernel for unsupported sizes
+    // TODO: fix the issue when n is not a multiple of NUM_CONSUMER_WARPS * TMA_COL_TILE
+    constexpr int TMA_COL_CHUNK = 8 * 64;  // NUM_CONSUMER_WARPS * TMA_COL_TILE
     if constexpr (SF_VEC_SIZE == 16) {
-      // TODO: Debug TMA tensor map configuration - temporarily disabled
-      if (SF_VEC_SIZE == 16 && m >= 1024) {
+      if (SF_VEC_SIZE == 16 && m >= 1024 && n % TMA_COL_CHUNK == 0) {
         launchFP4QuantizationTma<BlockScaleQuantizationType::FP16_TO_FP4, T, SF_VEC_SIZE>(
             b, m, n, input, SFScale, output, SFOuput, useUE8M0, layout, multiProcessorCount,
             enable_pdl, stream);

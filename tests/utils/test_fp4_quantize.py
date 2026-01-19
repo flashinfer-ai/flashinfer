@@ -20,7 +20,13 @@ from flashinfer.utils import is_sm100a_supported
 DTYPES = [torch.float16, torch.bfloat16]
 # The batch dimension doesn't need to be multiple of 128
 SHAPES = [(128, 64), (256, 128), (120, 64), (200, 256), (2048, 2048)]
-BATCH_SHAPES = [(1, 256, 128), (2, 128, 64), (3, 256, 128), (1, 120, 64)]
+BATCH_SHAPES = [
+    (1, 256, 128),
+    (2, 128, 64),
+    (3, 256, 128),
+    (1, 120, 64),
+    (128, 2048, 2048),
+]
 SEEDS = [42]
 CUDA_DEVICES = ["cuda:0"]
 

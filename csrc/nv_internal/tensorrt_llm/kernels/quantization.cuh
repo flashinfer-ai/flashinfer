@@ -403,9 +403,12 @@ quantize_with_block_size_tma(
         for (int colIdx = 0; colIdx < numCols; colIdx += NUM_CONSUMER_WARPS * TMA_COL_TILE) {
           empty_barriers[stage_idx]->wait(phase);
 
-          cute::SM90_TMA_LOAD_3D::copy(
-              &tensor_map, reinterpret_cast<uint64_t*>(full_barriers[stage_idx]), 0ULL,
-              smem + stage_idx * SMEM_STAGE_SIZE, 0, rowIdx, colIdx / TMA_COL_TILE);
+          // Use batchIdx * numRows + rowIdx to access the correct batch in the flattened
+          // [B*M, N] tensor. The tensor map is created with total rows = B * M.
+          cute::SM90_TMA_LOAD_3D::copy(&tensor_map,
+                                       reinterpret_cast<uint64_t*>(full_barriers[stage_idx]), 0ULL,
+                                       smem + stage_idx * SMEM_STAGE_SIZE, 0,
+                                       batchIdx * numRows + rowIdx, colIdx / TMA_COL_TILE);
           full_barriers[stage_idx]->arrive_and_expect_tx(SMEM_STAGE_SIZE * sizeof(SmemType));
 
           stage_idx = stage_idx == NUM_STAGES - 1 ? 0 : stage_idx + 1;
