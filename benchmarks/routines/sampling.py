@@ -651,7 +651,9 @@ def testTopKRenormProbs(args):
     if run_refcheck:
         # PyTorch reference: keep top-k, set rest to 0, renormalize
         topk_vals, topk_indices = torch.topk(probs.float(), k=top_k, dim=-1)
-        reference_output = torch.zeros_like(probs, dtype=torch.float32)
+        reference_output = torch.zeros_like(probs)
+        # NOTE: dont explicitly specify dtype here
+        # keep it the same as input.
         reference_output.scatter_(-1, topk_indices, topk_vals)
         reference_output = reference_output / reference_output.sum(dim=-1, keepdim=True)
         reference_output = reference_output.to(input_dtype)
@@ -899,7 +901,9 @@ def testTopKMaskLogits(args):
     if run_refcheck:
         # PyTorch reference: keep top-k logits, set rest to -inf
         topk_vals, topk_indices = torch.topk(logits.float(), k=top_k, dim=-1)
-        reference_output = torch.full_like(logits, float("-inf"), dtype=torch.float32)
+        reference_output = torch.full_like(logits, float("-inf"))
+        # NOTE: dont explicitly specify dtype here
+        # keep it the same as input.
         reference_output.scatter_(-1, topk_indices, topk_vals)
         reference_output = reference_output.to(input_dtype)
         has_reference_output = True
