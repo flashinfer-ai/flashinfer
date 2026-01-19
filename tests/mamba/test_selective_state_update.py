@@ -16,6 +16,7 @@ def create_test_inputs(
     input_dtype,
     weight_dtype,
     matrixA_dtype,
+    state_dtype,
     z_none=True,
 ):
     # Set seed for reproducibility
@@ -29,7 +30,7 @@ def create_test_inputs(
     ssm_state_cache_size = max(384, int(2 * batch_size))
 
     state_cache = torch.randn(
-        ssm_state_cache_size, nheads, dim, dstate, dtype=input_dtype, device=device
+        ssm_state_cache_size, nheads, dim, dstate, dtype=state_dtype, device=device
     )
 
     x = torch.randn(batch_size, nheads, dim, dtype=input_dtype, device=device)
@@ -86,23 +87,22 @@ def create_test_inputs(
 @pytest.mark.parametrize("nheads", [8, 64])
 @pytest.mark.parametrize("dim", [64, 128])
 @pytest.mark.parametrize("dstate", [64, 128, 256])
-@pytest.mark.parametrize("ngroups", [8])
-@pytest.mark.parametrize("delta_softplus", [True])
-@pytest.mark.parametrize("input_dtype", [torch.bfloat16])
-@pytest.mark.parametrize("weight_dtype", [torch.bfloat16])
-@pytest.mark.parametrize("matrixA_dtype", [torch.float32])
+@pytest.mark.parametrize("state_dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("weight_dtype", [torch.float32, torch.bfloat16])
 def test_selective_state_update(
     batch,
     nheads,
     dim,
     dstate,
-    ngroups,
-    delta_softplus,
-    input_dtype,
+    state_dtype,
     weight_dtype,
-    matrixA_dtype,
 ):
     """Test selective_state_update correctness against reference implementation."""
+    ngroups = 8
+    delta_softplus = True
+    input_dtype = torch.bfloat16
+    matrixA_dtype = torch.float32
+
     inputs = create_test_inputs(
         batch,
         nheads,
@@ -112,6 +112,7 @@ def test_selective_state_update(
         input_dtype,
         weight_dtype,
         matrixA_dtype,
+        state_dtype=state_dtype,
         z_none=True,
     )
 
@@ -238,6 +239,7 @@ def test_selective_state_update_with_z():
     input_dtype = torch.bfloat16
     weight_dtype = torch.bfloat16
     matrixA_dtype = torch.float32
+    state_dtype = torch.bfloat16
 
     inputs = create_test_inputs(
         batch,
@@ -248,6 +250,7 @@ def test_selective_state_update_with_z():
         input_dtype,
         weight_dtype,
         matrixA_dtype,
+        state_dtype=state_dtype,
         z_none=False,
     )
 
@@ -285,8 +288,8 @@ def test_selective_state_update_with_z():
 
     atol = 1e-3
     rtol = 1e-2
-    torch.testing.assert_allclose(y_ref, y_test, atol=atol, rtol=rtol)
-    torch.testing.assert_allclose(
+    torch.testing.assert_close(y_ref, y_test, atol=atol, rtol=rtol)
+    torch.testing.assert_close(
         state_ref[inputs["slot_idx"]],
         state[inputs["slot_idx"]],
         atol=atol,
