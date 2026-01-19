@@ -1,5 +1,4 @@
-"""
-Copyright (c) 2025 by FlashInfer team.
+"""Copyright (c) 2025 by FlashInfer team.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -24,44 +23,42 @@ from flashinfer.testing.utils import bench_gpu_time
 
 from .flashinfer_benchmark_utils import (
     dtype_str_to_torch_dtype,
-    get_device,
-    print_perf_metrics,
-    is_close_stats,
     filter_backends_by_compute_capability,
+    get_device,
+    is_close_stats,
+    print_perf_metrics,
 )
 
 
 def run_sampling_test(args):
-    """
-    Run a sampling test.
+    """Run a sampling test.
 
     Args:
         args: Parsed command line arguments containing test configuration
 
     Returns:
         dict: List of dictionaries containing performance results
+
     """
     if args.routine == "sampling_from_probs":
         return testSamplingFromProbs(args)
-    elif args.routine == "top_p_sampling_from_probs":
+    if args.routine == "top_p_sampling_from_probs":
         return testTopPSamplingFromProbs(args)
-    elif args.routine == "top_k_sampling_from_probs":
+    if args.routine == "top_k_sampling_from_probs":
         return testTopKSamplingFromProbs(args)
-    elif args.routine == "top_k_top_p_sampling_from_probs":
+    if args.routine == "top_k_top_p_sampling_from_probs":
         return testTopKTopPSamplingFromProbs(args)
-    elif args.routine == "top_k_renorm_probs":
+    if args.routine == "top_k_renorm_probs":
         return testTopKRenormProbs(args)
-    elif args.routine == "top_p_renorm_probs":
+    if args.routine == "top_p_renorm_probs":
         return testTopPRenormProbs(args)
-    elif args.routine == "top_k_mask_logits":
+    if args.routine == "top_k_mask_logits":
         return testTopKMaskLogits(args)
-    else:
-        raise ValueError(f"Unsupported routine: {args.routine}")
+    raise ValueError(f"Unsupported routine: {args.routine}")
 
 
 def parse_sampling_args(line, parser):
-    """
-    Parse command line arguments for sampling test configuration.
+    """Parse command line arguments for sampling test configuration.
 
     Args:
         line: Command line arguments
@@ -69,6 +66,7 @@ def parse_sampling_args(line, parser):
 
     Returns:
         Parsed argument namespace
+
     """
     parser.add_argument(
         "--batch_size",
@@ -127,8 +125,7 @@ def parse_sampling_args(line, parser):
 
 
 def testSamplingFromProbs(args):
-    """
-    Test sampling_from_probs API.
+    """Test sampling_from_probs API.
 
     This test:
     1. Generates random probability distributions
@@ -140,6 +137,7 @@ def testSamplingFromProbs(args):
 
     Returns:
         dict: List of dictionaries containing performance results
+
     """
     if args.verbose >= 1:
         print("[INFO] Running testSamplingFromProbs")
@@ -148,7 +146,7 @@ def testSamplingFromProbs(args):
     device = get_device(args)
     if args.generate_repro_command:
         print(
-            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}",
         )
 
     ## Parse input arguments
@@ -166,7 +164,7 @@ def testSamplingFromProbs(args):
     input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
     if input_dtype not in [torch.float32, torch.float16, torch.bfloat16]:
         raise ValueError(
-            f"Unsupported input dtype: {args.input_dtype}. Supported dtypes are float32, float16, bfloat16."
+            f"Unsupported input dtype: {args.input_dtype}. Supported dtypes are float32, float16, bfloat16.",
         )
 
     # Sampling uses RNG which is incompatible with CUDA graph capture
@@ -186,10 +184,10 @@ def testSamplingFromProbs(args):
     def run_backend(backend, probs):
         if backend == "cuda":
             return flashinfer.sampling.sampling_from_probs(
-                probs, deterministic=deterministic
+                probs,
+                deterministic=deterministic,
             )
-        else:
-            raise ValueError(f"Unsupported backend: {backend}")
+        raise ValueError(f"Unsupported backend: {backend}")
 
     # Storage for timing results
     backend_times = {backend: [] for backend in backends}
@@ -240,8 +238,7 @@ def testSamplingFromProbs(args):
 
 
 def testTopPSamplingFromProbs(args):
-    """
-    Test top_p_sampling_from_probs API.
+    """Test top_p_sampling_from_probs API.
 
     This test:
     1. Generates random probability distributions
@@ -253,6 +250,7 @@ def testTopPSamplingFromProbs(args):
 
     Returns:
         dict: List of dictionaries containing performance results
+
     """
     if args.verbose >= 1:
         print("[INFO] Running testTopPSamplingFromProbs")
@@ -261,7 +259,7 @@ def testTopPSamplingFromProbs(args):
     device = get_device(args)
     if args.generate_repro_command:
         print(
-            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}",
         )
 
     ## Parse input arguments
@@ -280,7 +278,7 @@ def testTopPSamplingFromProbs(args):
     input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
     if input_dtype not in [torch.float32, torch.float16, torch.bfloat16]:
         raise ValueError(
-            f"Unsupported input dtype: {args.input_dtype}. Supported dtypes are float32, float16, bfloat16."
+            f"Unsupported input dtype: {args.input_dtype}. Supported dtypes are float32, float16, bfloat16.",
         )
 
     # Sampling uses RNG which is incompatible with CUDA graph capture
@@ -301,10 +299,11 @@ def testTopPSamplingFromProbs(args):
     def run_backend(backend, probs):
         if backend == "cuda":
             return flashinfer.sampling.top_p_sampling_from_probs(
-                probs, top_p=top_p, deterministic=deterministic
+                probs,
+                top_p=top_p,
+                deterministic=deterministic,
             )
-        else:
-            raise ValueError(f"Unsupported backend: {backend}")
+        raise ValueError(f"Unsupported backend: {backend}")
 
     # Storage for timing results
     backend_times = {backend: [] for backend in backends}
@@ -352,8 +351,7 @@ def testTopPSamplingFromProbs(args):
 
 
 def testTopKSamplingFromProbs(args):
-    """
-    Test top_k_sampling_from_probs API.
+    """Test top_k_sampling_from_probs API.
 
     This test:
     1. Generates random probability distributions
@@ -365,6 +363,7 @@ def testTopKSamplingFromProbs(args):
 
     Returns:
         dict: List of dictionaries containing performance results
+
     """
     if args.verbose >= 1:
         print("[INFO] Running testTopKSamplingFromProbs")
@@ -373,7 +372,7 @@ def testTopKSamplingFromProbs(args):
     device = get_device(args)
     if args.generate_repro_command:
         print(
-            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}",
         )
 
     ## Parse input arguments
@@ -392,7 +391,7 @@ def testTopKSamplingFromProbs(args):
     input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
     if input_dtype not in [torch.float32, torch.float16, torch.bfloat16]:
         raise ValueError(
-            f"Unsupported input dtype: {args.input_dtype}. Supported dtypes are float32, float16, bfloat16."
+            f"Unsupported input dtype: {args.input_dtype}. Supported dtypes are float32, float16, bfloat16.",
         )
 
     # Sampling uses RNG which is incompatible with CUDA graph capture
@@ -413,10 +412,11 @@ def testTopKSamplingFromProbs(args):
     def run_backend(backend, probs):
         if backend == "cuda":
             return flashinfer.sampling.top_k_sampling_from_probs(
-                probs, top_k=top_k, deterministic=deterministic
+                probs,
+                top_k=top_k,
+                deterministic=deterministic,
             )
-        else:
-            raise ValueError(f"Unsupported backend: {backend}")
+        raise ValueError(f"Unsupported backend: {backend}")
 
     # Storage for timing results
     backend_times = {backend: [] for backend in backends}
@@ -464,8 +464,7 @@ def testTopKSamplingFromProbs(args):
 
 
 def testTopKTopPSamplingFromProbs(args):
-    """
-    Test top_k_top_p_sampling_from_probs API.
+    """Test top_k_top_p_sampling_from_probs API.
 
     This test:
     1. Generates random probability distributions
@@ -477,6 +476,7 @@ def testTopKTopPSamplingFromProbs(args):
 
     Returns:
         dict: List of dictionaries containing performance results
+
     """
     if args.verbose >= 1:
         print("[INFO] Running testTopKTopPSamplingFromProbs")
@@ -485,7 +485,7 @@ def testTopKTopPSamplingFromProbs(args):
     device = get_device(args)
     if args.generate_repro_command:
         print(
-            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}",
         )
 
     ## Parse input arguments
@@ -505,7 +505,7 @@ def testTopKTopPSamplingFromProbs(args):
     input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
     if input_dtype not in [torch.float32, torch.float16, torch.bfloat16]:
         raise ValueError(
-            f"Unsupported input dtype: {args.input_dtype}. Supported dtypes are float32, float16, bfloat16."
+            f"Unsupported input dtype: {args.input_dtype}. Supported dtypes are float32, float16, bfloat16.",
         )
 
     # Sampling uses RNG which is incompatible with CUDA graph capture
@@ -527,10 +527,12 @@ def testTopKTopPSamplingFromProbs(args):
     def run_backend(backend, probs):
         if backend == "cuda":
             return flashinfer.sampling.top_k_top_p_sampling_from_probs(
-                probs, top_k=top_k, top_p=top_p, deterministic=deterministic
+                probs,
+                top_k=top_k,
+                top_p=top_p,
+                deterministic=deterministic,
             )
-        else:
-            raise ValueError(f"Unsupported backend: {backend}")
+        raise ValueError(f"Unsupported backend: {backend}")
 
     # Storage for timing results
     backend_times = {backend: [] for backend in backends}
@@ -579,8 +581,7 @@ def testTopKTopPSamplingFromProbs(args):
 
 
 def testTopKRenormProbs(args):
-    """
-    Test top_k_renorm_probs API.
+    """Test top_k_renorm_probs API.
 
     This test:
     1. Generates random probability distributions
@@ -592,6 +593,7 @@ def testTopKRenormProbs(args):
 
     Returns:
         dict: List of dictionaries containing performance results
+
     """
     if args.verbose >= 1:
         print("[INFO] Running testTopKRenormProbs")
@@ -600,7 +602,7 @@ def testTopKRenormProbs(args):
     device = get_device(args)
     if args.generate_repro_command:
         print(
-            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}",
         )
 
     ## Parse input arguments
@@ -620,7 +622,7 @@ def testTopKRenormProbs(args):
     input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
     if input_dtype not in [torch.float32, torch.float16, torch.bfloat16]:
         raise ValueError(
-            f"Unsupported input dtype: {args.input_dtype}. Supported dtypes are float32, float16, bfloat16."
+            f"Unsupported input dtype: {args.input_dtype}. Supported dtypes are float32, float16, bfloat16.",
         )
 
     ## Prepare input tensors
@@ -638,8 +640,7 @@ def testTopKRenormProbs(args):
     def run_backend(backend, probs):
         if backend == "cuda":
             return flashinfer.sampling.top_k_renorm_probs(probs, top_k=top_k)
-        else:
-            raise ValueError(f"Unsupported backend: {backend}")
+        raise ValueError(f"Unsupported backend: {backend}")
 
     # Reference implementation for refcheck
     has_reference_output = False
@@ -685,11 +686,11 @@ def testTopKRenormProbs(args):
                 if num_different_elements > 0:
                     print(
                         f"[ERROR] Output tensor mismatch from backend {tested_backends[i]}: "
-                        f"{num_different_elements}/{num_elements} ({num_different_elements_percentage:.2f}%) elements differ"
+                        f"{num_different_elements}/{num_elements} ({num_different_elements_percentage:.2f}%) elements differ",
                     )
                     if not args.allow_output_mismatch:
                         raise AssertionError(
-                            f"[ERROR] Backend {tested_backends[i]} output mismatch with {num_different_elements} elements"
+                            f"[ERROR] Backend {tested_backends[i]} output mismatch with {num_different_elements} elements",
                         )
 
     for backend in backends:
@@ -725,8 +726,7 @@ def testTopKRenormProbs(args):
 
 
 def testTopPRenormProbs(args):
-    """
-    Test top_p_renorm_probs API.
+    """Test top_p_renorm_probs API.
 
     This test:
     1. Generates random probability distributions
@@ -738,6 +738,7 @@ def testTopPRenormProbs(args):
 
     Returns:
         dict: List of dictionaries containing performance results
+
     """
     if args.verbose >= 1:
         print("[INFO] Running testTopPRenormProbs")
@@ -746,7 +747,7 @@ def testTopPRenormProbs(args):
     device = get_device(args)
     if args.generate_repro_command:
         print(
-            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}",
         )
 
     ## Parse input arguments
@@ -765,7 +766,7 @@ def testTopPRenormProbs(args):
     input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
     if input_dtype not in [torch.float32, torch.float16, torch.bfloat16]:
         raise ValueError(
-            f"Unsupported input dtype: {args.input_dtype}. Supported dtypes are float32, float16, bfloat16."
+            f"Unsupported input dtype: {args.input_dtype}. Supported dtypes are float32, float16, bfloat16.",
         )
 
     ## Prepare input tensors
@@ -783,8 +784,7 @@ def testTopPRenormProbs(args):
     def run_backend(backend, probs):
         if backend == "cuda":
             return flashinfer.sampling.top_p_renorm_probs(probs, top_p=top_p)
-        else:
-            raise ValueError(f"Unsupported backend: {backend}")
+        raise ValueError(f"Unsupported backend: {backend}")
 
     # Storage for timing results
     backend_times = {backend: [] for backend in backends}
@@ -832,8 +832,7 @@ def testTopPRenormProbs(args):
 
 
 def testTopKMaskLogits(args):
-    """
-    Test top_k_mask_logits API.
+    """Test top_k_mask_logits API.
 
     This test:
     1. Generates random logits
@@ -845,6 +844,7 @@ def testTopKMaskLogits(args):
 
     Returns:
         dict: List of dictionaries containing performance results
+
     """
     if args.verbose >= 1:
         print("[INFO] Running testTopKMaskLogits")
@@ -853,7 +853,7 @@ def testTopKMaskLogits(args):
     device = get_device(args)
     if args.generate_repro_command:
         print(
-            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}",
         )
 
     ## Parse input arguments
@@ -873,7 +873,7 @@ def testTopKMaskLogits(args):
     input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
     if input_dtype not in [torch.float32, torch.float16, torch.bfloat16]:
         raise ValueError(
-            f"Unsupported input dtype: {args.input_dtype}. Supported dtypes are float32, float16, bfloat16."
+            f"Unsupported input dtype: {args.input_dtype}. Supported dtypes are float32, float16, bfloat16.",
         )
 
     ## Prepare input tensors
@@ -888,8 +888,7 @@ def testTopKMaskLogits(args):
     def run_backend(backend, logits):
         if backend == "cuda":
             return flashinfer.sampling.top_k_mask_logits(logits, top_k=top_k)
-        else:
-            raise ValueError(f"Unsupported backend: {backend}")
+        raise ValueError(f"Unsupported backend: {backend}")
 
     # Reference implementation for refcheck
     has_reference_output = False
@@ -935,7 +934,7 @@ def testTopKMaskLogits(args):
                     print(f"[ERROR] Mask mismatch from backend {tested_backends[i]}")
                     if not args.allow_output_mismatch:
                         raise AssertionError(
-                            f"[ERROR] Backend {tested_backends[i]} mask mismatch"
+                            f"[ERROR] Backend {tested_backends[i]} mask mismatch",
                         )
 
                 # Check that unmasked values match the reference (original top-k logits)
@@ -951,11 +950,11 @@ def testTopKMaskLogits(args):
                     if num_different_elements > 0:
                         print(
                             f"[ERROR] Unmasked values mismatch from backend {tested_backends[i]}: "
-                            f"{num_different_elements}/{num_elements} ({num_different_elements_percentage:.2f}%) elements differ"
+                            f"{num_different_elements}/{num_elements} ({num_different_elements_percentage:.2f}%) elements differ",
                         )
                         if not args.allow_output_mismatch:
                             raise AssertionError(
-                                f"[ERROR] Backend {tested_backends[i]} unmasked values mismatch"
+                                f"[ERROR] Backend {tested_backends[i]} unmasked values mismatch",
                             )
 
     for backend in backends:
