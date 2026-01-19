@@ -823,26 +823,13 @@ def gated_delta_rule_decode_pretranspose(
         output = torch.zeros((B, T, HV, V), dtype=torch.bfloat16, device=q.device)
     
     # Convert state from [B, HV, V, K] to [B*HV, V, K] for kernel
-    h0_source = state.reshape(B * HV, V, K).contiguous()
-    
-    # Convert tensors to CuTe format
-    h0_source_tensor = from_dlpack(h0_source, assumed_align=16)
-    A_log_tensor = from_dlpack(A_log, assumed_align=16)
-    a_tensor = from_dlpack(a, assumed_align=16)
-    dt_bias_tensor = from_dlpack(dt_bias, assumed_align=16)
-    q_tensor = from_dlpack(q, assumed_align=16)
-    k_tensor = from_dlpack(k, assumed_align=16)
-    v_tensor = from_dlpack(v, assumed_align=16)
-    b_tensor = from_dlpack(b, assumed_align=16)
-    o_tensor = from_dlpack(output, assumed_align=16)
+    h0_source = state.reshape(B * HV, V, K)
     
     # Create dummy tensors for unused parameters
     h0_indices = torch.zeros(B, dtype=torch.int32, device=q.device)
     cu_seqlens = torch.zeros(B + 1, dtype=torch.int32, device=q.device)
-    h0_indices_tensor = from_dlpack(h0_indices, assumed_align=16)
-    cu_seqlens_tensor = from_dlpack(cu_seqlens, assumed_align=16)
 
-    # Compile kernel (cached)
+    # Compile kernel with TVM FFI (cached)
     cache_key = (B, T, H, HV, K, V, q.dtype, scale, use_qk_l2norm)
     cache = _get_compiled_decode_kernel(*cache_key)
     
@@ -855,6 +842,20 @@ def gated_delta_rule_decode_pretranspose(
         else:
             run_func = run_gdn_decode_kernel_big_batch_pretranspose
         
+        # Convert tensors to CuTe format for compilation only
+        h0_source_tensor = from_dlpack(h0_source, assumed_align=16)
+        A_log_tensor = from_dlpack(A_log, assumed_align=16)
+        a_tensor = from_dlpack(a, assumed_align=16)
+        dt_bias_tensor = from_dlpack(dt_bias, assumed_align=16)
+        q_tensor = from_dlpack(q, assumed_align=16)
+        k_tensor = from_dlpack(k, assumed_align=16)
+        v_tensor = from_dlpack(v, assumed_align=16)
+        b_tensor = from_dlpack(b, assumed_align=16)
+        o_tensor = from_dlpack(output, assumed_align=16)
+        h0_indices_tensor = from_dlpack(h0_indices, assumed_align=16)
+        cu_seqlens_tensor = from_dlpack(cu_seqlens, assumed_align=16)
+        
+        # Use TVM FFI to reduce runtime overhead
         compiled = cute.compile(
             run_func,
             h0_source_tensor,
@@ -869,18 +870,19 @@ def gated_delta_rule_decode_pretranspose(
             use_qk_l2norm=use_qk_l2norm,
             is_varlen=False,
             stream=stream,
+            options="--enable-tvm-ffi",
         )
         cache['compiled'] = compiled
     else:
         compiled = cache['compiled']
     
-    # Run kernel
+    # Run kernel directly with PyTorch tensors (no from_dlpack needed)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     cache['compiled'](
-        h0_source_tensor,
-        A_log_tensor, a_tensor, dt_bias_tensor,
-        q_tensor, k_tensor, v_tensor, b_tensor, o_tensor,
-        h0_indices_tensor, cu_seqlens_tensor,
+        h0_source,
+        A_log, a, dt_bias,
+        q, k, v, b, output,
+        h0_indices, cu_seqlens,
         stream
     )
     
@@ -1607,24 +1609,11 @@ def gated_delta_rule_decode(
     # Use state directly as pooled view: pool_size=B, each batch is its own pool
     h0_source = state.contiguous()
     
-    # Convert tensors to CuTe format
-    h0_source_tensor = from_dlpack(h0_source, assumed_align=16)
-    A_log_tensor = from_dlpack(A_log, assumed_align=16)
-    a_tensor = from_dlpack(a, assumed_align=16)
-    dt_bias_tensor = from_dlpack(dt_bias, assumed_align=16)
-    q_tensor = from_dlpack(q, assumed_align=16)
-    k_tensor = from_dlpack(k, assumed_align=16)
-    v_tensor = from_dlpack(v, assumed_align=16)
-    b_tensor = from_dlpack(b, assumed_align=16)
-    o_tensor = from_dlpack(output, assumed_align=16)
-    
     # Create h0_indices: each batch points to its own pool index
     h0_indices = torch.arange(B, dtype=torch.int32, device=q.device)
     cu_seqlens = torch.zeros(B + 1, dtype=torch.int32, device=q.device)
-    h0_indices_tensor = from_dlpack(h0_indices, assumed_align=16)
-    cu_seqlens_tensor = from_dlpack(cu_seqlens, assumed_align=16)
     
-    # Compile kernel (cached)
+    # Compile kernel with TVM FFI (cached)
     cache_key = (B, T, H, HV, K, V, q.dtype, scale, use_qk_l2norm)
     cache = _get_compiled_decode_kernel_nontranspose(*cache_key)
     
@@ -1639,6 +1628,20 @@ def gated_delta_rule_decode(
         else:
             run_func = run_gdn_decode_kernel_big_batch_nontranspose
         
+        # Convert tensors to CuTe format for compilation only
+        h0_source_tensor = from_dlpack(h0_source, assumed_align=16)
+        A_log_tensor = from_dlpack(A_log, assumed_align=16)
+        a_tensor = from_dlpack(a, assumed_align=16)
+        dt_bias_tensor = from_dlpack(dt_bias, assumed_align=16)
+        q_tensor = from_dlpack(q, assumed_align=16)
+        k_tensor = from_dlpack(k, assumed_align=16)
+        v_tensor = from_dlpack(v, assumed_align=16)
+        b_tensor = from_dlpack(b, assumed_align=16)
+        o_tensor = from_dlpack(output, assumed_align=16)
+        h0_indices_tensor = from_dlpack(h0_indices, assumed_align=16)
+        cu_seqlens_tensor = from_dlpack(cu_seqlens, assumed_align=16)
+        
+        # Use TVM FFI to reduce runtime overhead
         compiled = cute.compile(
             run_func,
             cu_seqlens_tensor,
@@ -1664,25 +1667,26 @@ def gated_delta_rule_decode(
             use_initial_state=True,
             use_qk_l2norm=use_qk_l2norm,
             stream=stream,
+            options="--enable-tvm-ffi",
         )
         cache['compiled'] = compiled
     else:
         compiled = cache['compiled']
     
-    # Run kernel
+    # Run kernel directly with PyTorch tensors (no from_dlpack needed)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     compiled(
-        cu_seqlens_tensor,
-        q_tensor,
-        k_tensor,
-        v_tensor,
-        a_tensor,
-        b_tensor,
-        A_log_tensor,
-        dt_bias_tensor,
-        h0_source_tensor,
-        h0_indices_tensor,
-        o_tensor,
+        cu_seqlens,
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        h0_source,
+        h0_indices,
+        output,
         stream,
     )
     
@@ -2145,7 +2149,7 @@ def gated_delta_rule_mtp(
         output = torch.zeros((B, T, HV, V), dtype=torch.bfloat16, device=q.device)
     
     # Reshape initial_state from [pool_size, HV, V, K] to [pool_size * HV, V, K]
-    h0_source = initial_state.to(torch.float32).reshape(pool_size * HV, V, K).contiguous()
+    h0_source = initial_state.to(torch.float32).reshape(pool_size * HV, V, K)
     
     # Handle intermediate states
     cache_intermediate_states = intermediate_states_buffer is not None
@@ -2164,24 +2168,10 @@ def gated_delta_rule_mtp(
         cache_steps = T
         intermediate_states = torch.zeros(1, 1, 1, dtype=torch.float32, device=q.device)
     
-    # Convert tensors to CuTe format
-    h0_source_tensor = from_dlpack(h0_source, assumed_align=16)
-    intermediate_states_tensor = from_dlpack(intermediate_states, assumed_align=16)
-    A_log_tensor = from_dlpack(A_log, assumed_align=16)
-    a_tensor = from_dlpack(a, assumed_align=16)
-    dt_bias_tensor = from_dlpack(dt_bias, assumed_align=16)
-    q_tensor = from_dlpack(q, assumed_align=16)
-    k_tensor = from_dlpack(k, assumed_align=16)
-    v_tensor = from_dlpack(v, assumed_align=16)
-    b_tensor = from_dlpack(b, assumed_align=16)
-    o_tensor = from_dlpack(output, assumed_align=16)
-    
-    # Create h0_indices and cu_seqlens
-    h0_indices_tensor = from_dlpack(initial_state_indices, assumed_align=16)
+    # Create cu_seqlens
     cu_seqlens = torch.zeros(B + 1, dtype=torch.int32, device=q.device)
-    cu_seqlens_tensor = from_dlpack(cu_seqlens, assumed_align=16)
     
-    # Compile kernel (cached)
+    # Compile kernel with TVM FFI (cached)
     cache_key = (B, T, H, HV, K, V, pool_size, cache_steps, disable_state_update, 
                  cache_intermediate_states, scale, use_qk_l2norm)
     cache = _get_compiled_mtp_kernel(*cache_key)
@@ -2189,6 +2179,21 @@ def gated_delta_rule_mtp(
     if 'compiled' not in cache:
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
         
+        # Convert tensors to CuTe format for compilation only
+        h0_source_tensor = from_dlpack(h0_source, assumed_align=16)
+        intermediate_states_tensor = from_dlpack(intermediate_states, assumed_align=16)
+        A_log_tensor = from_dlpack(A_log, assumed_align=16)
+        a_tensor = from_dlpack(a, assumed_align=16)
+        dt_bias_tensor = from_dlpack(dt_bias, assumed_align=16)
+        q_tensor = from_dlpack(q, assumed_align=16)
+        k_tensor = from_dlpack(k, assumed_align=16)
+        v_tensor = from_dlpack(v, assumed_align=16)
+        b_tensor = from_dlpack(b, assumed_align=16)
+        o_tensor = from_dlpack(output, assumed_align=16)
+        h0_indices_tensor = from_dlpack(initial_state_indices, assumed_align=16)
+        cu_seqlens_tensor = from_dlpack(cu_seqlens, assumed_align=16)
+        
+        # Use TVM FFI to reduce runtime overhead
         compiled = cute.compile(
             run_gdn_verify_kernel_mtp,
             h0_source_tensor,
@@ -2206,19 +2211,20 @@ def gated_delta_rule_mtp(
             disable_state_update=disable_state_update,
             cache_intermediate_states=cache_intermediate_states,
             stream=stream,
+            options="--enable-tvm-ffi",
         )
         cache['compiled'] = compiled
     else:
         compiled = cache['compiled']
     
-    # Run kernel
+    # Run kernel directly with PyTorch tensors (no from_dlpack needed)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     compiled(
-        h0_source_tensor,
-        intermediate_states_tensor,
-        A_log_tensor, a_tensor, dt_bias_tensor,
-        q_tensor, k_tensor, v_tensor, b_tensor, o_tensor,
-        h0_indices_tensor, cu_seqlens_tensor,
+        h0_source,
+        intermediate_states,
+        A_log, a, dt_bias,
+        q, k, v, b, output,
+        initial_state_indices, cu_seqlens,
         stream,
     )
     
