@@ -266,7 +266,6 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         if getattr(self, "_destroyed", False):
             return  # Already destroyed, nothing to do
 
-        #del self.mcast_buffer_handle
         del self.buffer_flags
         del self.uc_ptrs_dev
         del self.uc_ptr_local
