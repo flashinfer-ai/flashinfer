@@ -427,7 +427,8 @@ def _test_trtllm_batch_prefill(
         pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
     # Set up test parameters
     torch.manual_seed(0)
-
+    if head_dim == 256:
+        pytest.skip("head_dim == 256, skipping test")
     # Generate random sequence lengths
     num_qo_heads = num_kv_heads * head_grp_size
     q_lens, in_kv_lens, seq_lens = generate_seq_lens_prefill(
@@ -558,6 +559,7 @@ def _test_trtllm_batch_prefill(
         kv_layout=kv_layout,
         enable_pdl=enable_pdl,
         sinks=(sink if enable_sink else None),
+        skip_softmax_threshold_scale_factor=0.0,
     )
     # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
     # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future

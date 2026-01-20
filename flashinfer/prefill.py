@@ -223,6 +223,7 @@ def get_trtllm_gen_prefill_module():
         window_left: int = -1,
         out: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
+        skip_softmax_threshold_scale_factor: Optional[float] = None,
     ) -> torch.Tensor:
         sm_count = get_device_sm_count(query.device)
         if out is None:
@@ -256,6 +257,7 @@ def get_trtllm_gen_prefill_module():
             enable_pdl,
             workspace_size,
             sinks,
+            skip_softmax_threshold_scale_factor,
         )
         return out
 
@@ -3556,6 +3558,7 @@ def trtllm_batch_context_with_kv_cache(
     kv_layout: str = "HND",
     enable_pdl: Optional[bool] = None,
     sinks: Optional[List[torch.Tensor]] = None,
+    skip_softmax_threshold_scale_factor: Optional[float] = None,
 ) -> Union[torch.Tensor, FP4Tensor]:
     """
     Parameters
@@ -3608,7 +3611,8 @@ def trtllm_batch_context_with_kv_cache(
         Layout of kv-cache, can be "HND" or "NHD", default is "HND".
     sinks : Optional[List[torch.Tensor]] = None
         additional value per head in the denominator of the softmax.
-
+    skip_softmax_threshold_scale_factor: Optional[float] = None
+        threshold scale factor for skipping softmax.
     Returns
     -------
     out: Union[torch.Tensor, FP4Tensor]
@@ -3742,6 +3746,7 @@ def trtllm_batch_context_with_kv_cache(
         enable_pdl,
         workspace_size,
         sinks,
+        skip_softmax_threshold_scale_factor,
     )
     return (
         out

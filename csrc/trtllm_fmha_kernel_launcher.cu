@@ -84,7 +84,8 @@ void trtllm_paged_attention_launcher(
     int64_t kv_stride_batch, int64_t max_num_blocks_per_seq, double bmm1_scale, double bmm2_scale,
     const float* bmm1_scale_log2_ptr, const float* bmm2_scale_ptr, double o_sf_scale,
     int64_t o_sf_vec_size, int64_t o_sf_start_index, int64_t window_left, int64_t sum_seq_q,
-    int64_t sparse_mla_top_k, int64_t sm_count, bool enable_pdl, int64_t workspace_size,
+    int64_t sparse_mla_top_k, float skip_softmax_threshold_scale_factor, bool skips_softmax,
+    int64_t sm_count, bool enable_pdl, int64_t workspace_size,
     cudaStream_t stream) {
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
@@ -185,6 +186,10 @@ void trtllm_paged_attention_launcher(
     runner_params.multiCtasKvScratchPtr =
         float_allocator.aligned_alloc<void>(0, 16, "trtllm_gen_scratch_workspace");
   }
+
+  // Params for skipping softmax.
+  runner_params.mSkipsSoftmaxWhenPossible = skips_softmax;
+  runner_params.mSkipSoftmaxThresholdScaleFactor = skip_softmax_threshold_scale_factor;
 
   auto [foundKernels, kinfo] = fmha_runner->isSupportedWithInfo(runner_params);
   if (!foundKernels) {
@@ -296,6 +301,11 @@ void trtllm_paged_attention_decode(TensorView out, Optional<TensorView> out_scal
   float* bmm2_scale_ptr = maybe_bmm2_scale_tensor.has_value()
                               ? static_cast<float*>(maybe_bmm2_scale_tensor.value().data_ptr())
                               : nullptr;
+
+  // TODO: enable skip softmax for decode.
+  bool const skips_softmax = false;
+  float const skip_softmax_threshold_scale_factor_value = 0.0f;
+
   trtllm_paged_attention_launcher(
       out.data_ptr(), output_sf_ptr, query.data_ptr(), key_cache.data_ptr(), value_cache.data_ptr(),
       workspace_buffer.data_ptr(), static_cast<int*>(block_tables.data_ptr()),
@@ -306,7 +316,8 @@ void trtllm_paged_attention_decode(TensorView out, Optional<TensorView> out_scal
       q_stride_heads, kv_stride_keys_values, kv_stride_heads, kv_stride_batch,
       max_num_blocks_per_seq, bmm1_scale_value, bmm2_scale_value, bmm1_scale_log2_ptr,
       bmm2_scale_ptr, o_sf_scale, o_sf_vec_size, o_sf_start_index, window_left, sum_seq_q,
-      sparse_mla_top_k, sm_count, enable_pdl, workspace_size, stream);
+      sparse_mla_top_k, skip_softmax_threshold_scale_factor_value, skips_softmax,
+      sm_count, enable_pdl, workspace_size, stream);
 }
 
 void trtllm_paged_attention_context(
@@ -316,7 +327,7 @@ void trtllm_paged_attention_context(
     Variant<double, ffi::Tensor> bmm1_scale, Variant<double, ffi::Tensor> bmm2_scale,
     double o_sf_scale, int64_t o_sf_vec_size, int64_t o_sf_start_index, int64_t batch_size,
     int64_t window_left, TensorView cum_seq_lens_q, TensorView cum_seq_lens_kv, int64_t sm_count,
-    bool enable_pdl, int64_t workspace_size, Optional<TensorView> attention_sinks) {
+    bool enable_pdl, int64_t workspace_size, Optional<TensorView> attention_sinks, Optional<float> skip_softmax_threshold_scale_factor) {
   auto q_data_type = dl_dtype_to_tllm_data_type(query.dtype());
   auto kv_data_type = dl_dtype_to_tllm_data_type(key_cache.dtype());
   auto o_data_type = dl_dtype_to_tllm_data_type(out.dtype());
@@ -379,6 +390,11 @@ void trtllm_paged_attention_context(
                               ? static_cast<float*>(maybe_bmm2_scale_tensor.value().data_ptr())
                               : nullptr;
 
+  bool const skips_softmax = skip_softmax_threshold_scale_factor.has_value();
+  float const skip_softmax_threshold_scale_factor_value = skip_softmax_threshold_scale_factor.value_or(0.0f);
+
+  printf("*** CALLING WITH SKIPS_SOFTMAX: %d AND SKIP_SOFTMAX_THRESHOLD_SCALE_FACTOR: %f ***\n", skips_softmax, skip_softmax_threshold_scale_factor_value);
+
   trtllm_paged_attention_launcher(
       out.data_ptr(), output_sf_ptr, query.data_ptr(), key_cache.data_ptr(), value_cache.data_ptr(),
       workspace_buffer.data_ptr(), static_cast<int*>(block_tables.data_ptr()),
@@ -390,7 +406,8 @@ void trtllm_paged_attention_context(
       head_dim_o, page_size, q_stride_tokens, q_stride_heads, kv_stride_keys_values,
       kv_stride_heads, kv_stride_batch, max_num_blocks_per_seq, bmm1_scale_value, bmm2_scale_value,
       bmm1_scale_log2_ptr, bmm2_scale_ptr, o_sf_scale, o_sf_vec_size, o_sf_start_index, window_left,
-      sum_seq_q, /*sparse_mla_top_k=*/0, sm_count, enable_pdl, workspace_size, stream);
+      sum_seq_q, /*sparse_mla_top_k=*/0, skip_softmax_threshold_scale_factor_value, skips_softmax,
+      sm_count, enable_pdl, workspace_size, stream);
 }
 
 void trtllm_ragged_attention_launcher(
