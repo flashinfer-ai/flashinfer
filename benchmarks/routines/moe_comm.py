@@ -93,6 +93,7 @@ from .flashinfer_benchmark_utils import (
     print_perf_metrics,
 )
 from .moe_utils import (
+    add_common_moe_args,
     calculate_fp4_global_scale,
     quantize_fp4,
     dequantize_nvfp4,
@@ -199,38 +200,8 @@ def parse_moe_comm_args(line, parser):
     Returns:
         Parsed argument namespace
     """
-    parser.add_argument(
-        "--num_tokens",
-        type=int,
-        required=True,
-        help="Number of tokens per rank (local batch size).",
-    )
-    parser.add_argument(
-        "--hidden_size",
-        type=int,
-        required=True,
-        help="Hidden dimension size.",
-    )
-    parser.add_argument(
-        "--num_experts",
-        type=int,
-        required=True,
-        help="Total number of experts across all ranks.",
-    )
-    parser.add_argument(
-        "--top_k",
-        type=int,
-        required=True,
-        help="Number of experts to route each token to.",
-    )
-    parser.add_argument(
-        "--input_dtype",
-        type=str,
-        required=False,
-        default="bfloat16",
-        choices=["bfloat16", "float16"],
-        help="Data type for hidden states payload (before quantization if quant_dtype is set).",
-    )
+    # Parse num_tokens/hidden_size/num_experts/top_k/input_dtype in add_common_moe_args
+    add_common_moe_args(parser)
     parser.add_argument(
         "--quant_dtype",
         type=str,
@@ -281,7 +252,7 @@ def parse_moe_comm_args(line, parser):
         args.max_num_tokens = args.num_tokens
 
     # Default intermediate_size to hidden_size * 4 if not specified
-    if args.real_math is True:
+    if args.real_math:
         assert args.intermediate_size is not None, (
             "intermediate_size must be specified if real_math=True"
         )
@@ -1146,6 +1117,7 @@ def test_moe_a2a_dispatch_combine(args):
     # Synchronize all_num_tokens across ranks
     all_num_tokens = comm.allgather(num_tokens)
     runtime_max_tokens_per_rank = max(all_num_tokens)
+    sum_all_num_tokens = sum(all_num_tokens)
 
     # Create input data
     torch.manual_seed(args.random_seed + rank)
@@ -1205,6 +1177,10 @@ def test_moe_a2a_dispatch_combine(args):
         hidden_size,
         input_dtype,
         quant_dtype,
+    )
+    # Compute total active experts across all ranks
+    total_active_experts = int(
+        np.unique(np.concatenate(all_token_selected_experts).flatten()).size
     )
     if rank == 0 and args.verbose >= 1:
         print(
@@ -1529,22 +1505,22 @@ def test_moe_a2a_dispatch_combine(args):
                 tb_per_sec_dispatch,
             )
             # Only print MoE timing when real_math is enabled
-            if not np.isnan(median_time_moe):
-                # MoE kernel processes ep_size * max_tokens_per_rank tokens
-                total_moe_tokens = ep_size * runtime_max_tokens_per_rank
+            if args.real_math:
+                # This is the total FLOPS of all ranks, not per rank
                 tflops_moe = calculate_moe_tflops(
-                    total_moe_tokens,
+                    sum_all_num_tokens,
                     hidden_size,
                     intermediate_size,
-                    num_experts_local,
+                    num_experts,  # Actually not used
                     top_k,
                     median_time_moe,
                 )
+                # This is the total bandwidth of all ranks, not per rank
                 tb_per_sec_moe = calculate_moe_kernel_bandwidth(
-                    total_moe_tokens,
+                    sum_all_num_tokens,
                     hidden_size,
                     intermediate_size,
-                    num_experts_local,
+                    num_experts,
                     top_k,
                     median_time_moe,
                     input_dtype,
@@ -1552,7 +1528,7 @@ def test_moe_a2a_dispatch_combine(args):
                     input_format=quant_dtype,
                     weight_format=quant_dtype,
                     routing_logits_dtype=None,  # No routing logits in routed MoE
-                    active_experts=num_experts_local,
+                    active_experts=total_active_experts,
                 )
                 print_perf_metrics(
                     "moe_kernel",
@@ -1574,7 +1550,7 @@ def test_moe_a2a_dispatch_combine(args):
             "a2a_total", median_time, std_time, torch.nan, tb_per_sec_total
         )
         print(
-            "[INFO] The reported achieved tb_per_sec is the aggregate bandwidth of all participating ranks."
+            "[INFO] The reported achieved tflops/tb_per_sec is the aggregate FLOPS/bandwidth of all participating ranks based on timing results of rank 0. Could observe rank-to-rank variations."
         )
 
         if args.output_path is not None:

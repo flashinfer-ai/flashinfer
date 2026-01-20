@@ -623,7 +623,7 @@ def add_common_moe_args(parser: argparse.ArgumentParser) -> None:
         "--num_tokens",
         type=int,
         required=True,
-        help="Number of input tokens.",
+        help="Number of tokens per rank (local batch size).",
     )
     parser.add_argument(
         "--hidden_size",

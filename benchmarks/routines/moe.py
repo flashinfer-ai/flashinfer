@@ -76,14 +76,14 @@ def parse_moe_args(line, parser):
         Parsed argument namespace
     """
     add_common_moe_args(parser)
-    # Note: --num_tokens/hidden_size is added by add_common_moe_args
+    # Note: num_tokens/hidden_size is added by add_common_moe_args
     parser.add_argument(
         "--intermediate_size",
         type=int,
         required=True,
         help="Intermediate dimension size.",
     )
-    # Note: --num_experts/top_k is added by add_common_moe_args
+    # Note: num_experts/top_k is added by add_common_moe_args
     parser.add_argument(
         "--n_group",
         type=int,
@@ -161,7 +161,7 @@ def parse_moe_args(line, parser):
         default=False,
         help="Whether to use routing scales on input (for Llama4 routing).",
     )
-    # Note: --input_dtype is added by add_common_moe_args
+    # Note: input_dtype is added by add_common_moe_args
     parser.add_argument(
         "--weight_dtype",
         type=str,
