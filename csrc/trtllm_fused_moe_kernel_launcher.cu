@@ -817,7 +817,9 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
     }
 
     args->mUseDeepSeekFp8 = true;
-    if (expert_indices.data_ptr() != nullptr) {
+    // Check ndim==2 and size>0 because empty placeholder tensors may have non-null data_ptr
+    bool has_precomputed_indices = expert_indices.ndim() == 2 && expert_indices.size(0) > 0;
+    if (has_precomputed_indices) {
       // Use expert_indices directly
       workspace.routing_expert_indexes =
           static_cast<int*>(const_cast<void*>(expert_indices.data_ptr()));
@@ -951,31 +953,25 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
     cudaStream_t routing_stream = get_stream(hidden_states.device());
     tensorrt_llm::kernels::trtllmgen_moe::Routing::Runner routing_runner(tile_tokens_dim);
 
-    // When using pre-computed routing, use expert_indices directly
-    // Otherwise use the base class allocated expert_indexes buffer for output
     // Check ndim==2 and size>0 because empty placeholder tensors may have non-null data_ptr
     bool use_precomputed = expert_indices.ndim() == 2 && expert_indices.size(0) > 0;
-    int* routing_expert_idx_ptr =
-        use_precomputed ? static_cast<int*>(const_cast<void*>(expert_indices.data_ptr()))
-                        : static_cast<int*>(FusedMoeLauncher::expert_indexes.data_ptr());
-    void* routing_weights_ptr = use_precomputed ? const_cast<void*>(expert_weights.data_ptr())
-                                                : FusedMoeLauncher::expert_weights.data_ptr();
-
-    routing_runner.run(args->routing_logits, args->routing_bias, args->num_tokens,
-                       args->num_experts, args->top_k, args->n_group, args->topk_group,
-                       args->local_expert_offset, args->local_num_experts,
-                       args->routed_scaling_factor, routing_expert_idx_ptr,
-                       static_cast<int*>(expert_count_histogram.data_ptr()),
-                       static_cast<int*>(total_num_padded_tokens.data_ptr()),
-                       static_cast<int*>(expanded_idx_to_permuted_idx.data_ptr()),
-                       nullptr /*permuted_idx_to_expanded_idx.data_ptr()*/,
-                       static_cast<int*>(permuted_idx_to_token_idx.data_ptr()), routing_weights_ptr,
-                       static_cast<int*>(num_tokens_per_expert.data_ptr()),
-                       static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr()),
-                       static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr()),
-                       static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt,
-                       mRoutingBiasDtype, use_routing_scales_on_input, use_deep_seek_fp8,
-                       static_cast<RoutingMethodType>(routing_method_type), routing_stream);
+    // When using pre-computed routing, pass nullptr as routing_logits to tell the
+    // routing runner to use the pre-computed expert indices from workspace.routing_expert_indexes
+    routing_runner.run(
+        use_precomputed ? nullptr : args->routing_logits, args->routing_bias, args->num_tokens,
+        args->num_experts, args->top_k, args->n_group, args->topk_group, args->local_expert_offset,
+        args->local_num_experts, args->routed_scaling_factor, workspace.routing_expert_indexes,
+        static_cast<int*>(expert_count_histogram.data_ptr()),
+        static_cast<int*>(total_num_padded_tokens.data_ptr()),
+        static_cast<int*>(expanded_idx_to_permuted_idx.data_ptr()),
+        nullptr /*permuted_idx_to_expanded_idx.data_ptr()*/,
+        static_cast<int*>(permuted_idx_to_token_idx.data_ptr()), workspace.expert_weights,
+        static_cast<int*>(num_tokens_per_expert.data_ptr()),
+        static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr()),
+        static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr()),
+        static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt, mRoutingBiasDtype,
+        use_routing_scales_on_input, use_deep_seek_fp8,
+        static_cast<RoutingMethodType>(routing_method_type), routing_stream);
 
     check_moe();
     prepare_moe(moe_tactic);
