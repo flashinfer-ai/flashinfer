@@ -85,11 +85,13 @@ jobs:
         if: steps.check-permission.outputs.authorized == 'true'
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install pre-commit
         if: steps.check-permission.outputs.authorized == 'true'
-        run: pip install pre-commit
+        run: |
+          pip install pre-commit
+          pre-commit install
 
       - name: Run Claude Code
         if: steps.check-permission.outputs.authorized == 'true'
