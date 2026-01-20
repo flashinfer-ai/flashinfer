@@ -567,8 +567,9 @@ def gdn_decode_kernel_big_batch_pretranspose(
     # All threads write (V=128, NUM_THREADS=128)
     # ===================================================================
     cute.arch.barrier()  # Ensure all writes to sOutput are complete
-
-    o[(i_n, i_t, i_hv, tidx)] = sOutput[tidx]
+    
+    if tidx < V:
+        o[(i_n, i_t, i_hv, tidx)] = sOutput[tidx]
 
 
 @cute.jit
@@ -896,8 +897,14 @@ def gated_delta_rule_decode_pretranspose(
 
     # Validate K and V constraints
     assert K >= 128, f"K must be at least 128, got K={K}"
+<<<<<<< HEAD
     assert V % 4 == 0, f"V must be a multiple of 4 for vectorized loads, got V={V}"
 
+=======
+    assert V >= 128, f"V must be at least 128, got V={V}"
+    assert V % TILE_V == 0, f"V must be divisible by {TILE_V} to prevent out-of-bounds access, got V={V}"
+    
+>>>>>>> dfd4f528 (Fix bw test and details)
     # Validate dtypes
     assert q.dtype in (torch.float16, torch.bfloat16), (
         f"q must be float16/bfloat16, got {q.dtype}"
@@ -1189,7 +1196,7 @@ def gdn_decode_kernel_small_batch_nontranspose(
             r_v = cutlass.Float32(v[i_n, 0, i_hv, v_global])
 
             sum_hk = 0.0
-            for k_iter in range(NUM_K_ITERS_SMALL):
+            for k_iter in range(NUM_K_ITERS_SMALL, unroll=16):
                 k_base = k_iter * ROWS_PER_ITER_SMALL
                 k_idx = k_base + k_local
                 h_val = sData[(k_idx, v_idx, stage)] * r_g
@@ -1232,7 +1239,11 @@ def gdn_decode_kernel_small_batch_nontranspose(
 
             cute.arch.barrier()
 
+<<<<<<< HEAD
             for k_iter in range(NUM_K_ITERS_SMALL, unroll=16):  # type: ignore[call-overload]
+=======
+            for k_iter in range(NUM_K_ITERS_SMALL):
+>>>>>>> dfd4f528 (Fix bw test and details)
                 flat_idx = tidx + k_iter * 128
                 k_write = flat_idx // TILE_V_SMALL_NT
                 v_write = flat_idx % TILE_V_SMALL_NT
@@ -1696,8 +1707,17 @@ def gated_delta_rule_decode(
 
     # Validate K and V constraints
     assert K >= 128, f"K must be at least 128, got K={K}"
+<<<<<<< HEAD
     assert V % 4 == 0, f"V must be a multiple of 4 for vectorized loads, got V={V}"
 
+=======
+    assert V >= 128, f"V must be at least 128, got V={V}"
+    # V must be divisible by tile size to prevent out-of-bounds access
+    # For small batch: TILE_V_SMALL_NT=16, for large batch: TILE_V_NT=32
+    # Use the more restrictive constraint (32) to cover both cases
+    assert V % TILE_V_NT == 0, f"V must be divisible by {TILE_V_NT} to prevent out-of-bounds access, got V={V}"
+    
+>>>>>>> dfd4f528 (Fix bw test and details)
     # Validate dtypes
     assert q.dtype in (torch.float16, torch.bfloat16), (
         f"q must be float16/bfloat16, got {q.dtype}"
@@ -2107,7 +2127,8 @@ def gdn_verify_kernel_mtp(
         cute.arch.barrier()
 
         for i_t in range(T):
-            o[(i_n, i_t, i_hv, tidx)] = cutlass.BFloat16(sOutput[(i_t, tidx)])
+            if tidx < V:
+                o[(i_n, i_t, i_hv, tidx)] = cutlass.BFloat16(sOutput[(i_t, tidx)])
 
 
 @cute.jit
@@ -2312,8 +2333,17 @@ def gated_delta_rule_mtp(
     # Validate state shape
     assert initial_state.shape == (pool_size, HV, V, K), (
         f"Expected initial_state shape [pool_size={pool_size}, HV={HV}, V={V}, K={K}], got {initial_state.shape}"
+<<<<<<< HEAD
     )
 
+=======
+    
+    # Validate K and V constraints
+    assert K >= 128, f"K must be at least 128, got K={K}"
+    assert V >= 128, f"V must be at least 128, got V={V}"
+    assert V % TILE_V_MTP == 0, f"V must be divisible by {TILE_V_MTP} to prevent out-of-bounds access, got V={V}"
+    
+>>>>>>> dfd4f528 (Fix bw test and details)
     # Validate dtypes
     assert q.dtype in (torch.float16, torch.bfloat16), (
         f"q must be float16/bfloat16, got {q.dtype}"
