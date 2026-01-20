@@ -626,6 +626,13 @@ class TllmGenFmhaKernel {
       // Load the kernel.
       std::tie(func, kernelMeta) = loadKernel(params, selectKernelParamsCopy);
 
+      // Handle the exception where computeCtaAndClusterConfig results in numTokensPerCtaQ == 0.
+      if (kernelMeta.mGroupsTokensHeadsQ) {
+        if (kernelMeta.mStepQ < params.mNumHeadsQPerKv) {
+          continue; // Skip this candidate as it's invalid
+        }
+      }
+
       // Compute the number of CTAs.
       computeCtaAndClusterConfig(ctaLaunchParams, params, kernelMeta, selectKernelParamsCopy);
 
