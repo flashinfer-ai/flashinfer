@@ -897,14 +897,9 @@ def gated_delta_rule_decode_pretranspose(
 
     # Validate K and V constraints
     assert K >= 128, f"K must be at least 128, got K={K}"
-<<<<<<< HEAD
-    assert V % 4 == 0, f"V must be a multiple of 4 for vectorized loads, got V={V}"
-
-=======
     assert V >= 128, f"V must be at least 128, got V={V}"
     assert V % TILE_V == 0, f"V must be divisible by {TILE_V} to prevent out-of-bounds access, got V={V}"
     
->>>>>>> dfd4f528 (Fix bw test and details)
     # Validate dtypes
     assert q.dtype in (torch.float16, torch.bfloat16), (
         f"q must be float16/bfloat16, got {q.dtype}"
@@ -1239,11 +1234,7 @@ def gdn_decode_kernel_small_batch_nontranspose(
 
             cute.arch.barrier()
 
-<<<<<<< HEAD
-            for k_iter in range(NUM_K_ITERS_SMALL, unroll=16):  # type: ignore[call-overload]
-=======
             for k_iter in range(NUM_K_ITERS_SMALL):
->>>>>>> dfd4f528 (Fix bw test and details)
                 flat_idx = tidx + k_iter * 128
                 k_write = flat_idx // TILE_V_SMALL_NT
                 v_write = flat_idx % TILE_V_SMALL_NT
@@ -1707,17 +1698,12 @@ def gated_delta_rule_decode(
 
     # Validate K and V constraints
     assert K >= 128, f"K must be at least 128, got K={K}"
-<<<<<<< HEAD
-    assert V % 4 == 0, f"V must be a multiple of 4 for vectorized loads, got V={V}"
-
-=======
     assert V >= 128, f"V must be at least 128, got V={V}"
     # V must be divisible by tile size to prevent out-of-bounds access
     # For small batch: TILE_V_SMALL_NT=16, for large batch: TILE_V_NT=32
     # Use the more restrictive constraint (32) to cover both cases
     assert V % TILE_V_NT == 0, f"V must be divisible by {TILE_V_NT} to prevent out-of-bounds access, got V={V}"
     
->>>>>>> dfd4f528 (Fix bw test and details)
     # Validate dtypes
     assert q.dtype in (torch.float16, torch.bfloat16), (
         f"q must be float16/bfloat16, got {q.dtype}"
@@ -2333,17 +2319,13 @@ def gated_delta_rule_mtp(
     # Validate state shape
     assert initial_state.shape == (pool_size, HV, V, K), (
         f"Expected initial_state shape [pool_size={pool_size}, HV={HV}, V={V}, K={K}], got {initial_state.shape}"
-<<<<<<< HEAD
     )
-
-=======
     
     # Validate K and V constraints
     assert K >= 128, f"K must be at least 128, got K={K}"
     assert V >= 128, f"V must be at least 128, got V={V}"
     assert V % TILE_V_MTP == 0, f"V must be divisible by {TILE_V_MTP} to prevent out-of-bounds access, got V={V}"
     
->>>>>>> dfd4f528 (Fix bw test and details)
     # Validate dtypes
     assert q.dtype in (torch.float16, torch.bfloat16), (
         f"q must be float16/bfloat16, got {q.dtype}"
