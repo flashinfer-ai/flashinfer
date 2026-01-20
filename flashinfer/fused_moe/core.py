@@ -2291,8 +2291,113 @@ def trtllm_fp8_block_scale_moe(
     output = torch.empty(
         hidden_states.shape, dtype=torch.bfloat16, device=hidden_states.device
     )
+    # Create dummy topk_ids and expert_weights for non-routed variant
+    num_tokens = hidden_states.shape[0]
+    topk_ids = torch.empty(
+        num_tokens, top_k, dtype=torch.int32, device=hidden_states.device
+    )
+    expert_weights = torch.empty(
+        num_tokens, top_k, dtype=routing_logits.dtype, device=hidden_states.device
+    )
     return get_trtllm_moe_sm100_module().trtllm_fp8_block_scale_moe(
         routing_logits,
+        topk_ids,
+        expert_weights,
+        routing_bias,
+        hidden_states,
+        hidden_states_scale,
+        gemm1_weights,
+        gemm1_weights_scale,
+        gemm2_weights,
+        gemm2_weights_scale,
+        output,
+        num_experts,
+        top_k,
+        n_group,
+        topk_group,
+        intermediate_size,
+        local_expert_offset,
+        local_num_experts,
+        routed_scaling_factor,
+        routing_method_type,
+        use_shuffled_weight,
+        weight_layout,
+        enable_pdl,
+        tune_max_num_tokens,
+    )
+
+
+@flashinfer_api
+def trtllm_fp8_block_scale_routed_moe(
+    topk_ids: torch.Tensor,
+    routing_bias: Optional[torch.Tensor],
+    hidden_states: torch.Tensor,
+    hidden_states_scale: torch.Tensor,
+    gemm1_weights: torch.Tensor,
+    gemm1_weights_scale: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    gemm2_weights_scale: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+    n_group: Optional[int],
+    topk_group: Optional[int],
+    intermediate_size: int,
+    local_expert_offset: int,
+    local_num_experts: int,
+    routed_scaling_factor: Optional[float],
+    routing_method_type: int = 0,
+    use_shuffled_weight: bool = False,
+    weight_layout: int = 0,
+    enable_pdl: Optional[bool] = None,
+    tune_max_num_tokens: int = 8192,
+) -> torch.Tensor:
+    """FP8 block scale MoE operation with pre-computed routing (routed variant).
+
+    This function skips the routing computation and accepts pre-computed top-k expert
+    indices and weights. This is useful when routing is computed separately or when
+    integrating with custom routing strategies.
+
+    Args:
+        topk_ids: [seq_len, top_k] tensor of top-k indices and expert weights.
+            Dtype must be int32. It must represent a packed value where the most
+            significant 16 bits represent the score (bfloat16) and the least
+            significant 16 bits represent the index of the chosen expert (unsigned).
+        routing_bias: [num_experts] tensor of routing bias
+        hidden_states: [seq_len, hidden_size] tensor of input hidden states
+        hidden_states_scale: [hidden_size//128, seq_len] tensor of hidden states block scales
+        gemm1_weights: [num_experts, 2*intermediate_size, hidden_size] tensor of first layer weights
+        gemm1_weights_scale: [num_experts, 2*intermediate_size//128, hidden_size//128] tensor of first layer block scales
+        gemm2_weights: [num_experts, hidden_size, intermediate_size] tensor of second layer weights
+        gemm2_weights_scale: [num_experts, hidden_size//128, intermediate_size//128] tensor of second layer block scales
+        num_experts: Total number of experts
+        top_k: Number of experts to route to per token
+        n_group: Number of expert groups
+        topk_group: Number of groups to consider for top-k routing
+        intermediate_size: Size of intermediate layer
+        local_expert_offset: Offset of local experts in global expert space
+        local_num_experts: Number of experts handled by this device
+        routed_scaling_factor: Scaling factor for routing
+        routing_method_type: Type of routing method to use (default: 0)
+        use_shuffled_weight: Whether to use shuffled weight layout (default: False)
+        weight_layout: Weight layout type (default: 0)
+        enable_pdl: Whether to enable Programmatic Dependent Launch (PDL). Auto-enabled for >= sm90.
+        tune_max_num_tokens: Maximum number of tokens for tuning. (default: 8192)
+
+    Returns:
+        torch.Tensor: Output tensor of shape [seq_len, hidden_size]
+    """
+    output = torch.empty(
+        hidden_states.shape, dtype=torch.bfloat16, device=hidden_states.device
+    )
+    # Create empty expert_weights tensor (weights are packed in topk_ids)
+    num_tokens = hidden_states.shape[0]
+    expert_weights = torch.empty(
+        num_tokens, top_k, dtype=torch.bfloat16, device=hidden_states.device
+    )
+    return get_trtllm_moe_sm100_module().trtllm_fp8_block_scale_moe(
+        None,  # routing_logits (None for routed variant)
+        topk_ids,
+        expert_weights,  # empty tensor, weights are packed in topk_ids
         routing_bias,
         hidden_states,
         hidden_states_scale,
