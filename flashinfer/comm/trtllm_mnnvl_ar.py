@@ -145,19 +145,8 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             f"[MNNVL Allreduce] TP size: {mapping.tp_size}, rank: {mapping.tp_rank}, Allocating workspace with requested size {buffer_size_in_bytes} bytes per buffer."
         )
 
-        # Allocate the workspace
-        # self.mcast_buffer_handle = McastGPUBuffer(
-        #     requested_workspace_size,
-        #     mapping.tp_size,
-        #     mapping.tp_rank,
-        #     torch.device("cuda", mapping.local_rank),
-        #     comm_backend,
-        # )
-
-        #TODO (asamani): check if this is correct
-        #device = torch.device(f"cuda:{torch.cuda.current_device()}")
         device=torch.device("cuda", mapping.local_rank)
-        #TODO (asamani): fix group
+        #TODO (asamani): fix group based on comm_backend?
         group = torch.distributed.group.WORLD
         group_name = group.group_name if group is not None else torch.distributed.group.WORLD.group_name
         self.ptrs, self.tensor, self.handle = _alloc_symm_buffer_bytes(
