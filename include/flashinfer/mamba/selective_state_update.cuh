@@ -33,6 +33,8 @@ namespace flashinfer::mamba {
 
 using namespace conversion;
 
+constexpr unsigned warpSize = 32;
+
 struct SelectiveStateUpdateParams {
   uint32_t batch{}, nheads{}, dim{}, dstate{}, ngroups{}, state_cache_size{};
   int32_t pad_slot_id{-1};
@@ -86,13 +88,11 @@ template <typename T, int DSTATE>
 inline constexpr auto getVectorLoadSizeForFullUtilization() -> unsigned {
   static_assert(sizeof(float4) >= sizeof(T));
   constexpr unsigned maxHardwareLoadSize = sizeof(float4) / sizeof(T);
-  constexpr unsigned warpSize = 32;
   constexpr unsigned maxLogicalLoadSize = (unsigned)DSTATE / warpSize;
   return maxHardwareLoadSize < maxLogicalLoadSize ? maxHardwareLoadSize : maxLogicalLoadSize;
 }
 
 __device__ __forceinline__ float warpReduceSum(float val) {
-  constexpr auto warpSize = 32;
   for (int s = warpSize / 2; s > 0; s /= 2) {
     val += __shfl_down_sync(UINT32_MAX, val, s);
   }
@@ -135,7 +135,6 @@ __global__ void selective_state_update_kernel_simple(SelectiveStateUpdateParams 
   int const nheads = params.nheads;
   int const ngroups = params.ngroups;
 
-  constexpr auto warpSize = 32;
   constexpr auto rowsPerWarp = (DIM + numWarps - 1) / numWarps;
 
   auto const batch = blockIdx.x;
@@ -368,7 +367,6 @@ __global__ void selective_state_update_kernel_producer_consumer_vertical(
   int const nheads = params.nheads;
   int const ngroups = params.ngroups;
 
-  constexpr auto warpSize = 32;
   constexpr auto numWarps = 1 + consumerWarps;
 
   auto const batch = blockIdx.x;
@@ -515,13 +513,365 @@ __global__ void selective_state_update_kernel_producer_consumer_vertical(
 #endif
 }
 
+// =============================================================================
+// Horizontal Producer-Consumer Kernel for SM100+ (Blackwell and newer)
+// =============================================================================
+
+#ifdef FLASHINFER_MAMBA_ENABLE_SM100
+
+template <typename input_t, typename weight_t, typename matrixA_t,
+          typename state_t,  //
+          int dim, int dstate, int stageCols, uint8_t numStages>
+struct SharedStorageHorizontal {
+  alignas(128) state_t state[numStages][dim * stageCols];
+  alignas(alignof(PackedAligned<input_t>)) input_t B[dstate];
+  alignas(alignof(PackedAligned<input_t>)) input_t C[dstate];
+
+  using barrier_t = cuda::barrier<cuda::thread_scope_block>;
+  barrier_t bar_empty[numStages];
+  barrier_t bar_full[numStages];
+  barrier_t bar_consumers;
+};
+
+template <typename state_t, int DIM, int DSTATE, int colsPerStage, int numStages,
+          bool useStateCache, typename SramT>
+__device__ __forceinline__ void producer_func_horizontal(SramT& sram,
+                                                         CUtensorMap const& tensorState,
+                                                         int state_offset) {
+  namespace cde = cuda::device::experimental;
+
+  auto constexpr stagesReadOnly = numStages;
+  auto constexpr stagesBoth = DSTATE / colsPerStage - numStages;
+  auto constexpr stagesWriteOnly = numStages;
+
+  auto constexpr bytesState = DIM * colsPerStage * sizeof(state_t);
+  auto constexpr bytesToArrive = bytesState;
+
+  // Phase 1: Read only (filling the pipeline)
+#pragma unroll
+  for (int iter = 0; iter < stagesReadOnly; ++iter) {
+    auto const stage = iter % numStages;
+    auto const i = iter * colsPerStage;
+
+    sram.bar_empty[stage].wait(sram.bar_empty[stage].arrive());
+
+    if constexpr (useStateCache) {
+      cde::cp_async_bulk_tensor_2d_global_to_shared(&sram.state[stage][0], &tensorState, /*x*/ i,
+                                                    /*y*/ state_offset, sram.bar_full[stage]);
+      auto const _ = cuda::device::barrier_arrive_tx(sram.bar_full[stage], 1, bytesToArrive);
+    } else {
+      auto const _ = sram.bar_full[stage].arrive();
+    }
+  }
+
+  // Phase 2: Both read and write (steady state)
+#pragma unroll
+  for (int iter = 0; iter < stagesBoth; ++iter) {
+    auto const stage = (stagesReadOnly + iter) % numStages;
+    auto const i_read = (stagesReadOnly + iter) * colsPerStage;
+    auto const i_write = iter * colsPerStage;
+
+    sram.bar_empty[stage].wait(sram.bar_empty[stage].arrive());
+
+    if constexpr (useStateCache) {
+      // Unblock async proxy for writeback
+      cde::fence_proxy_async_shared_cta();
+      // Writeback
+      cde::cp_async_bulk_tensor_2d_shared_to_global(&tensorState, /*x*/ i_write,
+                                                    /*y*/ state_offset, &sram.state[stage][0]);
+      cde::cp_async_bulk_commit_group();
+      cde::cp_async_bulk_wait_group_read<0>();
+
+      // Read next
+      cde::cp_async_bulk_tensor_2d_global_to_shared(&sram.state[stage][0], &tensorState,
+                                                    /*x*/ i_read, /*y*/ state_offset,
+                                                    sram.bar_full[stage]);
+      auto const _ = cuda::device::barrier_arrive_tx(sram.bar_full[stage], 1, bytesToArrive);
+    } else {
+      auto const _ = sram.bar_full[stage].arrive();
+    }
+  }
+
+  // Phase 3: Write only (draining the pipeline)
+#pragma unroll
+  for (int iter = 0; iter < stagesWriteOnly; ++iter) {
+    auto const stage = (stagesReadOnly + stagesBoth + iter) % numStages;
+    auto const i_write = (stagesBoth + iter) * colsPerStage;
+
+    sram.bar_empty[stage].wait(sram.bar_empty[stage].arrive());
+
+    if constexpr (useStateCache) {
+      // Unblock async proxy for writeback
+      cde::fence_proxy_async_shared_cta();
+      cde::cp_async_bulk_tensor_2d_shared_to_global(&tensorState, /*x*/ i_write,
+                                                    /*y*/ state_offset, &sram.state[stage][0]);
+      cde::cp_async_bulk_commit_group();
+      cde::cp_async_bulk_wait_group_read<0>();
+    }
+  }
+}
+
+template <typename input_t, typename weight_t, typename matrixA_t, typename state_t, int DIM,
+          int DSTATE, int consumerWarps, int colsPerStage, int numStages, bool useStateCache>
+__device__ __forceinline__ void consumer_func_horizontal(
+    int d, int member, float A_value, float dt_value, float x_value,
+    SharedStorageHorizontal<input_t, weight_t, matrixA_t, state_t, DIM, DSTATE, colsPerStage,
+                            numStages>& sram,
+    float& out_value) {
+  namespace cde = cuda::device::experimental;
+  constexpr auto lanesPerRow = (consumerWarps * warpSize) / DIM;
+  constexpr auto itemsPerThread = colsPerStage / lanesPerRow;
+  auto const group = d % (warpSize / lanesPerRow);
+
+  // #pragma unroll 1
+  for (int iBegin = 0, stage = 0; iBegin < DSTATE;
+       iBegin += colsPerStage, stage = (stage + 1) % numStages) {
+    // wait for the producer
+    sram.bar_full[stage].wait(sram.bar_full[stage].arrive());
+
+    constexpr auto bankSize = sizeof(uint32_t);
+    constexpr auto stateValuesPerBank = bankSize / sizeof(state_t);
+    constexpr auto numBanks = 32;
+    if constexpr (sizeof(state_t) == sizeof(input_t)) {
+#pragma unroll
+      for (int item = 0; item < itemsPerThread; item += stateValuesPerBank) {
+        auto const baseCol = item + member * itemsPerThread;
+        // If I just use baseCol as the index, a lot of bank conflicts will arise.
+        //
+        // Without permutation (baseCol directly):
+        //   Thread 0 -> Bank 0, Thread 32 -> Bank 0, Thread 64 -> Bank 0  (conflict!)
+        //
+        // With permutation (adding bankCycle offset):
+        //   bankCycle = which "round" of 32 banks we're in
+        //   By offsetting each round by 1 bank:
+        //   Thread 0  -> Bank 0
+        //   Thread 32 -> Bank 1  (offset by 1)
+        //   Thread 64 -> Bank 2  (offset by 2)
+        //
+        // Visual: (stateValuesPerBank=1, numBanks=32, colsPerStage=128)
+        //   baseCol:    0  1  2 ... 31 | 32 33 34 ... 63 | 64 ...
+        //   bankCycle:  0  0  0 ...  0 |  1  1  1 ...  1 |  2 ...
+        //   ii:         0  1  2 ... 31 | 33 34 35 ... 64 | 66 ...  (mod colsPerStage)
+        //
+        auto const seq_index = group * colsPerStage + baseCol;
+        auto const bankCycle = (seq_index / stateValuesPerBank) / numBanks;
+        auto const ii = (baseCol + stateValuesPerBank * bankCycle) % colsPerStage;
+
+        auto const i = iBegin + ii;
+
+        auto* sState_ptr = reinterpret_cast<uint*>(&sram.state[stage][d * colsPerStage + ii]);
+        uint32_t rState = *sState_ptr;
+        auto* rState_ptr = reinterpret_cast<state_t*>(&rState);
+
+        uint32_t rB = *reinterpret_cast<uint32_t const*>(&sram.B[i]);
+        auto* rB_ptr = reinterpret_cast<input_t const*>(&rB);
+
+        uint32_t rC = *reinterpret_cast<uint32_t const*>(&sram.C[i]);
+        auto* rC_ptr = reinterpret_cast<input_t const*>(&rC);
+
+        for (int e = 0; e < stateValuesPerBank; e++) {
+          float state_value;
+          if constexpr (!useStateCache) {
+            state_value = 0.f;
+          } else {
+            state_value = toFloat(rState_ptr[e]);
+          }
+
+          auto const B_value = toFloat(rB_ptr[e]);
+          auto const C_value = toFloat(rC_ptr[e]);
+
+          auto const dA = __expf(A_value * dt_value);
+          auto const dB = B_value * dt_value;
+          auto const new_state = state_value * dA + dB * x_value;
+
+          convertAndStore(&rState_ptr[e], new_state);
+          out_value += new_state * C_value;
+        }
+        *sState_ptr = rState;
+      }
+    } else {
+      for (int item = 0; item < itemsPerThread; item += stateValuesPerBank) {
+        auto const ii = (item + member * itemsPerThread + (group / 4) * 2) % colsPerStage;
+        auto const i = iBegin + ii;
+
+        auto* sState_ptr = reinterpret_cast<uint*>(&sram.state[stage][d * colsPerStage + ii]);
+        uint32_t rState = *sState_ptr;
+        auto* rState_ptr = reinterpret_cast<state_t*>(&rState);
+
+        for (int e = 0; e < stateValuesPerBank; e++) {
+          float state_value;
+          if constexpr (!useStateCache) {
+            state_value = 0.f;
+          } else {
+            state_value = toFloat(rState_ptr[e]);
+          }
+
+          auto const B_value = toFloat(sram.B[i + e]);
+          auto const C_value = toFloat(sram.C[i + e]);
+
+          auto const dA = __expf(A_value * dt_value);
+          auto const dB = B_value * dt_value;
+          auto const new_state = state_value * dA + dB * x_value;
+
+          convertAndStore(&rState_ptr[e], new_state);
+          out_value += new_state * C_value;
+        }
+        *sState_ptr = rState;
+      }
+    }
+
+    auto _ = sram.bar_empty[stage].arrive();
+  }
+}
+
+template <typename input_t, typename weight_t, typename matrixA_t, typename state_t, int DIM,
+          int DSTATE, int consumerWarps, int colsPerStage, int headsGroupsRatio, int numStages = 1>
+__global__ void selective_state_update_kernel_producer_consumer_horizontal(
+    SelectiveStateUpdateParams params, __grid_constant__ CUtensorMap const tensorState) {
+  auto* __restrict__ output = reinterpret_cast<input_t*>(params.output);
+  auto const* __restrict__ x = reinterpret_cast<input_t const*>(params.x);
+  auto const* __restrict__ dt = reinterpret_cast<weight_t const*>(params.dt);
+  auto const* __restrict__ A = reinterpret_cast<matrixA_t const*>(params.A);
+  auto const* __restrict__ B = reinterpret_cast<input_t const*>(params.B);
+  auto const* __restrict__ C = reinterpret_cast<input_t const*>(params.C);
+  auto const* __restrict__ D = reinterpret_cast<weight_t const*>(params.D);
+  auto const* __restrict__ dt_bias = reinterpret_cast<weight_t const*>(params.dt_bias);
+  auto const* __restrict__ z = reinterpret_cast<input_t const*>(params.z);
+  auto const* __restrict__ state_batch_indices =
+      reinterpret_cast<int const*>(params.state_batch_indices);
+
+  int const nheads = params.nheads;
+
+  constexpr auto numWarps = 1 + consumerWarps;
+
+  auto const batch = blockIdx.x;
+  auto const head = blockIdx.y;
+  auto const group = head / headsGroupsRatio;
+  auto lane = threadIdx.x % warpSize;
+  auto warp = threadIdx.y;
+
+  auto const state_batch = (state_batch_indices) ? state_batch_indices[batch] : batch;
+
+  extern __shared__ uint8_t sbuffer[];
+  using sram_t = SharedStorageHorizontal<input_t, weight_t, matrixA_t, state_t, DIM, DSTATE,
+                                         colsPerStage, numStages>;
+  auto& sram = *reinterpret_cast<sram_t*>(sbuffer);
+
+  namespace cde = cuda::device::experimental;
+  namespace cg = cooperative_groups;
+
+  for (int stage = warp; stage < numStages; stage += numWarps) {
+    if (lane > 0) continue;
+    constexpr auto num_arrivals = 1 + consumerWarps * warpSize;
+    init(&sram.bar_empty[stage], num_arrivals);
+    init(&sram.bar_full[stage], num_arrivals);
+    // signal to async proxy that barriers are initilized
+    cde::fence_proxy_async_shared_cta();
+  }
+  if (lane == 0 && warp == 0) {
+    init(&sram.bar_consumers, warpSize * consumerWarps);
+  }
+  __syncthreads();
+
+  if (warp == consumerWarps)  // producer
+  {
+    auto const state_offset = (state_batch * nheads + head) * DIM;
+
+    cg::invoke_one(cg::coalesced_threads(), [&]() {
+      if (state_batch != params.pad_slot_id)
+        producer_func_horizontal<state_t, DIM, DSTATE, colsPerStage, numStages, true>(
+            sram, tensorState, state_offset);
+      else
+        producer_func_horizontal<state_t, DIM, DSTATE, colsPerStage, numStages, false>(
+            sram, tensorState, state_offset);
+    });
+  } else {  // consumers
+
+    using load_t = PackedAligned<input_t>;
+
+    // Unblock the producer
+#pragma unroll
+    for (auto stage = 0; stage < numStages; ++stage) {
+      auto const _ = sram.bar_empty[stage].arrive();
+    }
+
+    // Load A
+    auto const A_value = toFloat(A[head]);
+
+    // Load D
+    auto const d_value = D ? toFloat(D[head]) : 0.f;
+
+    // load dt_value
+    auto dt_value = toFloat(dt[batch * params.dt_stride_batch + head]);
+    if (dt_bias) dt_value += toFloat(dt_bias[head]);
+    if (params.dt_softplus) {
+      dt_value = thresholded_softplus(dt_value);
+    }
+
+    if (warp == 0) {  // Load B
+      for (auto d = lane * load_t::count; d < DSTATE; d += warpSize * load_t::count) {
+        auto* dst = reinterpret_cast<load_t*>(&sram.B[d]);
+        *dst = *reinterpret_cast<load_t const*>(
+            &B[batch * params.B_stride_batch + group * DSTATE + d]);
+      }
+    } else if (warp == 1) {  // Load C
+      for (auto i = lane * load_t::count; i < DSTATE; i += warpSize * load_t::count) {
+        auto* dst = reinterpret_cast<load_t*>(&sram.C[i]);
+        *dst = *reinterpret_cast<load_t const*>(
+            &C[batch * params.C_stride_batch + group * DSTATE + i]);
+      }
+    }
+
+    constexpr auto lanesPerRow = (consumerWarps * warpSize) / DIM;
+    static_assert(lanesPerRow >= 1);
+    constexpr auto rowsPerWarp = warpSize / lanesPerRow;
+    auto const group = lane % rowsPerWarp;
+    auto const member = lane / rowsPerWarp;
+    auto const d = warp * rowsPerWarp + group;
+    auto const x_value = toFloat(x[batch * params.x_stride_batch + head * DIM + d]);
+    auto const z_value = z ? toFloat(z[batch * nheads * DIM + head * DIM + d]) : 0.f;
+
+    sram.bar_consumers.wait(sram.bar_consumers.arrive());
+
+    // Thread
+    float out_value = 0.f;
+    if (state_batch != params.pad_slot_id)
+      consumer_func_horizontal<input_t, weight_t, matrixA_t, state_t, DIM, DSTATE, consumerWarps,
+                               colsPerStage, numStages, true>(d, member, A_value, dt_value, x_value,
+                                                              sram, out_value);
+    else
+      consumer_func_horizontal<input_t, weight_t, matrixA_t, state_t, DIM, DSTATE, consumerWarps,
+                               colsPerStage, numStages, false>(d, member, A_value, dt_value,
+                                                               x_value, sram, out_value);
+
+    out_value += __shfl_down_sync(UINT32_MAX, out_value, 16);
+    if constexpr (lanesPerRow == 4) {
+      out_value += __shfl_down_sync(UINT32_MAX, out_value, 8);
+    }
+
+    if (member == 0) {
+      out_value += d_value * x_value;
+
+      // Write output
+      if (z) {
+        float sig_z = __fdividef(1.f, (1.f + __expf(0.f - z_value)));
+        float silu_z = z_value * sig_z;
+        out_value *= silu_z;
+      }
+      convertAndStore(&output[batch * params.out_stride_batch + head * DIM + d], out_value);
+    }
+  }
+}
+
+#endif  // FLASHINFER_MAMBA_ENABLE_SM100
+
 template <typename input_t, typename weight_t, typename matrixA_t, typename state_t>
 void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, cudaStream_t stream) {
   auto [sm_major, sm_minor] = GetCudaComputeCapability();
 
-  constexpr auto warpSize = 32;
-
-#ifdef FLASHINFER_MAMBA_ENABLE_SM90
+#ifdef FLASHINFER_MAMBA_ENABLE_SM100
+  if (sm_major < 10)  // pre-Blackwell
+#elif defined(FLASHINFER_MAMBA_ENABLE_SM90)
   if (sm_major < 9)  // pre-Hopper
 #endif
   {
@@ -626,7 +976,7 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, cudaStream_t
           input_t, weight_t, matrixA_t, state_t, DIM, DSTATE, numConsumers, rowsPerStage,
           numStages>;
 
-      dim3 block(32, numWarps);
+      dim3 block(warpSize, numWarps);
       dim3 grid(params.batch, params.nheads);
 
       auto nh = params.nheads;
@@ -645,6 +995,116 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, cudaStream_t
           cudaFuncSetAttribute(scan_func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
       scan_func<<<grid, block, smem_size, stream>>>(params, tensorState);
+    };
+
+    auto dispatch_dstate = [&]<int DIM>() {
+      switch (params.dstate) {
+        case 64:
+          dispatch_dim_dstate.template operator()<DIM, 64>();
+          break;
+        case 128:
+          dispatch_dim_dstate.template operator()<DIM, 128>();
+          break;
+        case 256:
+          dispatch_dim_dstate.template operator()<DIM, 256>();
+          break;
+        default:
+          FLASHINFER_CHECK(false, "Unsupported dstate value. Supported values are: 64, 128, 256");
+      }
+    };
+
+    switch (params.dim) {
+      case 64:
+        dispatch_dstate.template operator()<64>();
+        break;
+      case 128:
+        dispatch_dstate.template operator()<128>();
+        break;
+      default:
+        FLASHINFER_CHECK(false, "Unsupported dim value. Supported values are: 64, 128");
+    }
+  }
+#endif
+
+#ifdef FLASHINFER_MAMBA_ENABLE_SM100
+  else {
+    // SM100+ (Blackwell and newer) uses horizontal producer-consumer kernel
+    auto dispatch_dim_dstate = [&]<int DIM, int DSTATE>() {
+      // Alignment checks for vectorized loads in Blackwell kernel
+      using load_input_t = PackedAligned<input_t>;
+
+      FLASHINFER_CHECK(reinterpret_cast<uintptr_t>(params.x) % sizeof(load_input_t) == 0,
+                       "x pointer must be aligned to ", sizeof(load_input_t), " bytes");
+      FLASHINFER_CHECK((params.x_stride_batch * sizeof(input_t)) % sizeof(load_input_t) == 0,
+                       "x batch stride must be aligned to ", sizeof(load_input_t), " bytes");
+      if (params.z) {
+        FLASHINFER_CHECK(reinterpret_cast<uintptr_t>(params.z) % sizeof(load_input_t) == 0,
+                         "z pointer must be aligned to ", sizeof(load_input_t), " bytes");
+        FLASHINFER_CHECK((params.z_stride_batch * sizeof(input_t)) % sizeof(load_input_t) == 0,
+                         "z batch stride must be aligned to ", sizeof(load_input_t), " bytes");
+      }
+      FLASHINFER_CHECK(reinterpret_cast<uintptr_t>(params.B) % sizeof(load_input_t) == 0,
+                       "B pointer must be aligned to ", sizeof(load_input_t), " bytes");
+      FLASHINFER_CHECK(reinterpret_cast<uintptr_t>(params.C) % sizeof(load_input_t) == 0,
+                       "C pointer must be aligned to ", sizeof(load_input_t), " bytes");
+      FLASHINFER_CHECK((params.B_stride_batch * sizeof(input_t)) % sizeof(load_input_t) == 0,
+                       "B batch stride must be aligned to ", sizeof(load_input_t), " bytes");
+      FLASHINFER_CHECK((params.C_stride_batch * sizeof(input_t)) % sizeof(load_input_t) == 0,
+                       "C batch stride must be aligned to ", sizeof(load_input_t), " bytes");
+
+      // profiling showed that it's good to have 4 producers per 64 rows
+      constexpr auto numConsumers = (DIM / 64) * 4;
+      constexpr auto numProducers = 1;
+      constexpr auto numWarps = numProducers + numConsumers;
+
+      constexpr auto sectorSize = 32;  // bytes
+      constexpr auto stageCols = 2 * sectorSize / sizeof(state_t);
+
+      constexpr auto totalStages = DSTATE / stageCols;
+      constexpr auto numStages = (totalStages >= 4) ? 4 : totalStages;
+
+      auto dispatch_heads_groups_ratio = [&]<int headsGroupsRatio>() {
+        auto scan_func = selective_state_update_kernel_producer_consumer_horizontal<
+            input_t, weight_t, matrixA_t, state_t, DIM, DSTATE, numConsumers, stageCols,
+            headsGroupsRatio, numStages>;
+
+        dim3 block(warpSize, numWarps);
+        dim3 grid(params.batch, params.nheads);
+
+        auto nh = params.nheads;
+        auto dim = params.dim;
+
+        FLASHINFER_CHECK(reinterpret_cast<uintptr_t>(params.state) % 128 ==
+                         0);  // TMA requires 128B aligned
+        auto tensorState = tma::createTensorMap<state_t>(
+            params.state, params.state_cache_size * nh * dim, DSTATE, DIM, stageCols);
+        static_assert(DSTATE % stageCols == 0 && DSTATE >= stageCols);
+
+        // Calculate shared memory size and opt-in to extended shared memory
+        using sram_t = SharedStorageHorizontal<input_t, weight_t, matrixA_t, state_t, DIM, DSTATE,
+                                               stageCols, numStages>;
+        constexpr size_t smem_size = sizeof(sram_t);
+        cudaFuncSetAttribute(scan_func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+
+        scan_func<<<grid, block, smem_size, stream>>>(params, tensorState);
+        cudaDeviceSynchronize();  // Force completion
+      };
+
+      switch (params.nheads / params.ngroups) {
+        case 1:
+          dispatch_heads_groups_ratio.template operator()<1>();
+          break;
+        case 8:
+          dispatch_heads_groups_ratio.template operator()<8>();
+          break;
+        case 16:
+          dispatch_heads_groups_ratio.template operator()<16>();
+          break;
+        default:
+          FLASHINFER_CHECK(false,
+                           "Unsupported nheads/ngroups ratio: ", params.nheads / params.ngroups,
+                           ". Supported values are: 1, 8, 16");
+      }
     };
 
     auto dispatch_dstate = [&]<int DIM>() {
