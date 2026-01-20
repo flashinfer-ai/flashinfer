@@ -1084,10 +1084,10 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, cudaStream_t
         using sram_t = SharedStorageHorizontal<input_t, weight_t, matrixA_t, state_t, DIM, DSTATE,
                                                stageCols, numStages>;
         constexpr size_t smem_size = sizeof(sram_t);
-        cudaFuncSetAttribute(scan_func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+        FLASHINFER_CUDA_CHECK(cudaFuncSetAttribute(
+            scan_func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
         scan_func<<<grid, block, smem_size, stream>>>(params, tensorState);
-        cudaDeviceSynchronize();  // Force completion
       };
 
       switch (params.nheads / params.ngroups) {
