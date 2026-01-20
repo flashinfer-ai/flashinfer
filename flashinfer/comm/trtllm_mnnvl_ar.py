@@ -155,22 +155,20 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         # )
 
         #TODO (asamani): check if this is correct
-        device = torch.device(f"cuda:{torch.cuda.current_device()}")
-        #device=torch.device("cuda", mapping.local_rank)
+        #device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        device=torch.device("cuda", mapping.local_rank)
         #TODO (asamani): fix group
         group = torch.distributed.group.WORLD
         group_name = group.group_name if group is not None else torch.distributed.group.WORLD.group_name
         self.ptrs, self.tensor, self.handle = _alloc_symm_buffer_bytes(
             requested_workspace_size,
             mapping.tp_size,
-            torch.float32,#dtype, #TODO(asamani): is this correct?
+            torch.float32, #TODO(asamani): should this always be f32 or dtype?
             device,
             group_name,
         )
         # Get the actual usable buffer size after allocation (buf_size is updated by McastGPUBuffer)
-        #TODO(asamani): do we need this?
-        #allocated_size = self.mcast_buffer_handle.buf_size
-        allocated_size = self.handle.buffer_size-self.handle.signal_pad_size
+        allocated_size = self.handle.buffer_size - self.handle.signal_pad_size
         # We want the buffer size to be aligned to 16B which is the granularity for buffer management.
         self.buffer_size_bytes = (
             math.floor(allocated_size / self.NUM_LAMPORT_BUFFERS) // 16 * 16
@@ -183,15 +181,8 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         )
 
         # We use FP32 for sentinel value regardless of the real dtype
-        #self.mcast_buffer_handle.lamport_initialize(mapping.tp_rank, torch.float32)
-        # lamport init
-        neg_zero = 0x80000000
-        dsize = 4
-        num_elements = (allocated_size) // dsize
-        #TODO (asamani): should I use handle.memset32?
-        checkCudaErrors(
-            cuda.cuMemsetD32(int(self.ptrs[mapping.tp_rank]), neg_zero, num_elements)
-        )
+        self.lamport_initialize(mapping.tp_rank, torch.float32, allocated_size)
+
         # Wait until the initialization is done
         torch.cuda.synchronize()
         comm_backend.barrier()
@@ -207,13 +198,26 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             device=torch.device("cuda", mapping.local_rank),
         )
 
-        # self.uc_ptrs_dev = self.mcast_buffer_handle.get_buffer_ptrs_dev()
-        # self.uc_ptr_local = self.mcast_buffer_handle.get_unicast_ptr(self.rank)
-        # self.mc_ptr = self.mcast_buffer_handle.get_multicast_ptr()
-
         self.uc_ptrs_dev = self.handle.buffer_ptrs_dev
         self.uc_ptr_local = self.handle.buffer_ptrs[self.rank]
         self.mc_ptr = self.handle.multicast_ptr
+
+    def lamport_initialize(self, rank: int, dtype: torch.dtype, allocated_size: int):
+        if dtype == torch.bfloat16 or dtype == torch.float16:
+            neg_zero = 0x8000
+            dsize = 2
+            memset_func = cuda.cuMemsetD16
+        elif dtype == torch.float32:
+            neg_zero = 0x80000000
+            dsize = 4
+            memset_func = cuda.cuMemsetD32
+        else:
+            raise ValueError(f"Unsupported dtype: {dtype}")
+        
+        num_elements = (allocated_size) // dsize
+        checkCudaErrors(
+            memset_func(int(self.ptrs[rank]), neg_zero, num_elements)
+        )
 
     @functools.cache
     def is_buffer_size_sufficient(
