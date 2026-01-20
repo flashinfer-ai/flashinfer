@@ -204,6 +204,10 @@ class TestAddRMSNormFP4QuantCuteDSL:
             dtype=torch.float8_e4m3fn,
         )
 
+        # Compute reference BEFORE kernel call (kernel modifies r in-place)
+        h_ref = x + r
+        ref_rmsnorm = llama_rms_norm(h_ref, weight, eps=eps)
+
         add_rmsnorm_fp4quant(
             x, r, weight, y_fp4, block_scale, eps=eps, block_size=block_size
         )
@@ -213,10 +217,6 @@ class TestAddRMSNormFP4QuantCuteDSL:
         assert block_scale.shape == (batch_size, hidden_size // block_size)
         assert y_fp4.dtype == torch.float4_e2m1fn_x2
         assert block_scale.dtype == torch.float8_e4m3fn
-
-        # Reference computation: h = x + r, then RMSNorm(h)
-        h = x + r
-        ref_rmsnorm = llama_rms_norm(h, weight, eps=eps)
 
         # Dequantize FP4 output for value-level comparison
         # Tolerance based on separate FP4 roundtrip test (rtol=0.3, atol=0.5)
@@ -264,6 +264,10 @@ class TestAddRMSNormFP4QuantCuteDSL:
             dtype=torch.float8_e4m3fn,
         )
 
+        # Compute reference BEFORE kernel call (kernel modifies r in-place)
+        h_ref = x + r
+        ref_rmsnorm = llama_rms_norm(h_ref, weight, eps=eps)
+
         add_rmsnorm_fp4quant(
             x, r, weight, y_fp4, block_scale, eps=eps, block_size=block_size
         )
@@ -273,10 +277,6 @@ class TestAddRMSNormFP4QuantCuteDSL:
         assert block_scale.shape == (batch_size, seq_len, hidden_size // block_size)
         assert y_fp4.dtype == torch.float4_e2m1fn_x2
         assert block_scale.dtype == torch.float8_e4m3fn
-
-        # Reference computation
-        h = x + r
-        ref_rmsnorm = llama_rms_norm(h, weight, eps=eps)
 
         # Tolerance based on separate FP4 roundtrip test (rtol=0.3, atol=0.5)
         y_dequant = dequantize_fp4_output(y_fp4, block_scale, block_size)
@@ -322,13 +322,15 @@ class TestAddRMSNormFP4QuantCuteDSL:
             dtype=torch.float8_e4m3fn,
         )
 
+        # Reference computation (sample first 10 rows for speed)
+        # Compute BEFORE kernel call (kernel modifies r in-place)
+        h_ref = x[:10] + r[:10]
+        ref_rmsnorm = llama_rms_norm(h_ref, weight, eps=eps)
+
         add_rmsnorm_fp4quant(
             x, r, weight, y_fp4, block_scale, eps=eps, block_size=block_size
         )
 
-        # Reference computation (sample first 10 rows for speed)
-        h = x[:10] + r[:10]
-        ref_rmsnorm = llama_rms_norm(h, weight, eps=eps)
         y_dequant = dequantize_fp4_output(y_fp4[:10], block_scale[:10], block_size)
 
         torch.testing.assert_close(
@@ -369,6 +371,10 @@ class TestAddRMSNormFP4QuantMXFP4:
             batch_size, hidden_size // block_size, device="cuda", dtype=torch.uint8
         )
 
+        # Compute reference BEFORE kernel call (kernel modifies r in-place)
+        h_ref = x + r
+        ref_rmsnorm = llama_rms_norm(h_ref, weight, eps=eps)
+
         add_rmsnorm_fp4quant(
             x,
             r,
@@ -385,10 +391,6 @@ class TestAddRMSNormFP4QuantMXFP4:
         assert block_scale.shape == (batch_size, hidden_size // block_size)
         assert y_fp4.dtype == torch.float4_e2m1fn_x2
         assert block_scale.dtype == torch.uint8
-
-        # Reference computation
-        h = x + r
-        ref_rmsnorm = llama_rms_norm(h, weight, eps=eps)
 
         # Dequantize FP4 output
         # MXFP4 uses power-of-2 scales which can introduce more quantization error
@@ -429,6 +431,10 @@ class TestVsSeparateFlashInfer:
         r = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
         weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
 
+        # Reference: torch.add + rmsnorm (compute BEFORE kernel call since kernel modifies r)
+        h_ref = x + r
+        y_ref = rmsnorm(h_ref, weight, eps=eps)
+
         # Fused kernel
         y_fp4_fused = torch.empty(
             batch_size, hidden_size // 2, device="cuda", dtype=torch.float4_e2m1fn_x2
@@ -443,10 +449,6 @@ class TestVsSeparateFlashInfer:
         add_rmsnorm_fp4quant(
             x, r, weight, y_fp4_fused, block_scale_fused, eps=eps, block_size=block_size
         )
-
-        # Reference: torch.add + rmsnorm
-        h = x + r
-        y_ref = rmsnorm(h, weight, eps=eps)
 
         # Verify output shapes
         assert y_fp4_fused.shape == (batch_size, hidden_size // 2)
@@ -505,6 +507,11 @@ class TestFusedVsSeparateFP4Quantize:
         # Compute global_scale for NVFP4
         global_scale = compute_global_scale(x, r, weight, eps=eps)
 
+        # === Separate path: add + RMSNorm + fp4_quantize ===
+        # Compute BEFORE kernel call (kernel modifies r in-place)
+        h_ref = x + r
+        y_rmsnorm = llama_rms_norm(h_ref, weight, eps=eps)
+
         # === Fused kernel path ===
         y_fp4_fused = torch.empty(
             batch_size, hidden_size // 2, device="cuda", dtype=torch.float4_e2m1fn_x2
@@ -526,10 +533,6 @@ class TestFusedVsSeparateFP4Quantize:
             block_size=block_size,
             is_sf_swizzled_layout=False,  # Use unswizzled for easier comparison
         )
-
-        # === Separate path: add + RMSNorm + fp4_quantize ===
-        h = x + r
-        y_rmsnorm = llama_rms_norm(h, weight, eps=eps)
         y_fp4_separate, block_scale_separate = fp4_quantize(
             y_rmsnorm,
             global_scale,
@@ -609,6 +612,11 @@ class TestFusedVsSeparateFP4Quantize:
         # MXFP4 uses global_scale=1.0
         global_scale_val = torch.tensor(1.0, dtype=torch.float32, device="cuda")
 
+        # === Separate path: add + RMSNorm + fp4_quantize ===
+        # Compute BEFORE kernel call (kernel modifies r in-place)
+        h_ref = x + r
+        y_rmsnorm = llama_rms_norm(h_ref, weight, eps=eps)
+
         # === Fused kernel path ===
         y_fp4_fused = torch.empty(
             batch_size, hidden_size // 2, device="cuda", dtype=torch.float4_e2m1fn_x2
@@ -627,10 +635,6 @@ class TestFusedVsSeparateFP4Quantize:
             scale_format="ue8m0",
             is_sf_swizzled_layout=False,
         )
-
-        # === Separate path: add + RMSNorm + fp4_quantize ===
-        h = x + r
-        y_rmsnorm = llama_rms_norm(h, weight, eps=eps)
         y_fp4_separate, block_scale_separate = fp4_quantize(
             y_rmsnorm,
             global_scale_val,
@@ -705,6 +709,9 @@ class TestFusedVsSeparateFP4Quantize:
         # Run with computed global_scale
         global_scale = compute_global_scale(x, r, weight, eps=eps)
 
+        # Clone r since kernel modifies it in-place and we need to run twice
+        r_clone = r.clone()
+
         y_fp4_gs, block_scale_gs = add_rmsnorm_fp4quant(
             x,
             r,
@@ -720,7 +727,7 @@ class TestFusedVsSeparateFP4Quantize:
 
         y_fp4_no_gs, block_scale_no_gs = add_rmsnorm_fp4quant(
             x,
-            r,
+            r_clone,
             weight,
             global_scale=global_scale_one,
             eps=eps,
@@ -772,6 +779,12 @@ class TestLargeHiddenSize:
         r = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
         weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
 
+        # Sample first few rows for value comparison (full dequant is slow)
+        # Compute BEFORE kernel call (kernel modifies r in-place)
+        num_check = min(10, batch_size)
+        h_ref = x[:num_check] + r[:num_check]
+        ref_rmsnorm = llama_rms_norm(h_ref, weight, eps=eps)
+
         y_fp4 = torch.empty(
             batch_size, hidden_size // 2, device="cuda", dtype=torch.float4_e2m1fn_x2
         )
@@ -793,10 +806,6 @@ class TestLargeHiddenSize:
         assert y_fp4.dtype == torch.float4_e2m1fn_x2
         assert block_scale.dtype == torch.float8_e4m3fn
 
-        # Sample first few rows for value comparison (full dequant is slow)
-        num_check = min(10, batch_size)
-        h = x[:num_check] + r[:num_check]
-        ref_rmsnorm = llama_rms_norm(h, weight, eps=eps)
         y_dequant = dequantize_fp4_output(
             y_fp4[:num_check], block_scale[:num_check], block_size
         )
@@ -825,6 +834,12 @@ class TestLargeHiddenSize:
         r = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
         weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
 
+        # Sample first few rows for value comparison (full dequant is slow)
+        # Compute BEFORE kernel call (kernel modifies r in-place)
+        num_check = min(10, batch_size)
+        h_ref = x[:num_check] + r[:num_check]
+        ref_rmsnorm = llama_rms_norm(h_ref, weight, eps=eps)
+
         y_fp4 = torch.empty(
             batch_size, hidden_size // 2, device="cuda", dtype=torch.float4_e2m1fn_x2
         )
@@ -850,10 +865,6 @@ class TestLargeHiddenSize:
         assert y_fp4.dtype == torch.float4_e2m1fn_x2
         assert block_scale.dtype == torch.uint8
 
-        # Sample first few rows for value comparison (full dequant is slow)
-        num_check = min(10, batch_size)
-        h = x[:num_check] + r[:num_check]
-        ref_rmsnorm = llama_rms_norm(h, weight, eps=eps)
         y_dequant = dequantize_fp4_output(
             y_fp4[:num_check], block_scale[:num_check], block_size
         )
@@ -924,6 +935,9 @@ class TestSwizzledScaleFactors:
         r = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
         weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
 
+        # Clone r since kernel modifies it in-place and we need to run twice
+        r_clone = r.clone()
+
         # Non-swizzled output
         y_fp4_ref = torch.empty(
             batch_size, hidden_size // 2, device="cuda", dtype=torch.float4_e2m1fn_x2
@@ -959,7 +973,7 @@ class TestSwizzledScaleFactors:
         )
         add_rmsnorm_fp4quant(
             x,
-            r,
+            r_clone,
             weight,
             y_fp4_swizzled,
             block_scale_swizzled,
@@ -999,6 +1013,9 @@ class TestSwizzledScaleFactors:
         r = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
         weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
 
+        # Clone r since kernel modifies it in-place and we need to run twice
+        r_clone = r.clone()
+
         # Non-swizzled output
         y_fp4_ref = torch.empty(
             batch_size, hidden_size // 2, device="cuda", dtype=torch.float4_e2m1fn_x2
@@ -1031,7 +1048,7 @@ class TestSwizzledScaleFactors:
         )
         add_rmsnorm_fp4quant(
             x,
-            r,
+            r_clone,
             weight,
             y_fp4_swizzled,
             block_scale_swizzled,
@@ -1073,6 +1090,10 @@ class TestAutoAllocation:
         r = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
         weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
 
+        # Reference computation (before kernel call since kernel modifies r in-place)
+        h_ref = x + r
+        ref_rmsnorm = llama_rms_norm(h_ref, weight, eps=eps)
+
         # Call without providing y_fp4 and block_scale
         y_fp4, block_scale = add_rmsnorm_fp4quant(
             x, r, weight, eps=eps, block_size=block_size
@@ -1085,10 +1106,6 @@ class TestAutoAllocation:
         # Verify output dtypes
         assert y_fp4.dtype == torch.float4_e2m1fn_x2
         assert block_scale.dtype == torch.float8_e4m3fn
-
-        # Reference computation
-        h = x + r
-        ref_rmsnorm = llama_rms_norm(h, weight, eps=eps)
 
         # Dequantize and verify values
         y_dequant = dequantize_fp4_output(y_fp4, block_scale, block_size)
@@ -1115,6 +1132,10 @@ class TestAutoAllocation:
         r = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=dtype)
         weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
 
+        # Reference computation (before kernel call since kernel modifies r in-place)
+        h_ref = x + r
+        ref_rmsnorm = llama_rms_norm(h_ref, weight, eps=eps)
+
         # Call without providing y_fp4 and block_scale
         y_fp4, block_scale = add_rmsnorm_fp4quant(
             x, r, weight, eps=eps, block_size=block_size
@@ -1127,10 +1148,6 @@ class TestAutoAllocation:
         # Verify output dtypes
         assert y_fp4.dtype == torch.float4_e2m1fn_x2
         assert block_scale.dtype == torch.float8_e4m3fn
-
-        # Reference computation
-        h = x + r
-        ref_rmsnorm = llama_rms_norm(h, weight, eps=eps)
 
         # Dequantize and verify values
         y_dequant = dequantize_fp4_output(y_fp4, block_scale, block_size)
@@ -1156,6 +1173,10 @@ class TestAutoAllocation:
         r = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
         weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
 
+        # Reference computation (before kernel call since kernel modifies r in-place)
+        h_ref = x + r
+        ref_rmsnorm = llama_rms_norm(h_ref, weight, eps=eps)
+
         # Call without providing y_fp4 and block_scale
         y_fp4, block_scale = add_rmsnorm_fp4quant(
             x, r, weight, eps=eps, block_size=block_size, scale_format="ue8m0"
@@ -1168,10 +1189,6 @@ class TestAutoAllocation:
         # Verify output dtypes
         assert y_fp4.dtype == torch.float4_e2m1fn_x2
         assert block_scale.dtype == torch.uint8  # UE8M0 uses uint8
-
-        # Reference computation
-        h = x + r
-        ref_rmsnorm = llama_rms_norm(h, weight, eps=eps)
 
         # Dequantize and verify values
         y_dequant = dequantize_fp4_output(y_fp4, block_scale, block_size)
@@ -1196,6 +1213,9 @@ class TestAutoAllocation:
         x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
         r = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
         weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
+
+        # Clone r since kernel modifies it in-place and we need to run twice
+        r_clone = r.clone()
 
         # Call without providing y_fp4 and block_scale, with swizzled layout
         y_fp4, block_scale = add_rmsnorm_fp4quant(
@@ -1226,7 +1246,13 @@ class TestAutoAllocation:
             dtype=torch.float8_e4m3fn,
         )
         add_rmsnorm_fp4quant(
-            x, r, weight, y_fp4_ref, block_scale_ref, eps=eps, block_size=block_size
+            x,
+            r_clone,
+            weight,
+            y_fp4_ref,
+            block_scale_ref,
+            eps=eps,
+            block_size=block_size,
         )
 
         # FP4 values should be identical (view as uint8 for comparison)
@@ -1255,6 +1281,9 @@ class TestAutoAllocation:
         r = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
         weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
 
+        # Clone r since kernel modifies it in-place and we need to run twice
+        r_clone = r.clone()
+
         # Pre-allocated version
         y_fp4_pre = torch.empty(
             batch_size, hidden_size // 2, device="cuda", dtype=torch.float4_e2m1fn_x2
@@ -1271,7 +1300,7 @@ class TestAutoAllocation:
 
         # Auto-allocated version
         y_fp4_auto, block_scale_auto = add_rmsnorm_fp4quant(
-            x, r, weight, eps=eps, block_size=block_size
+            x, r_clone, weight, eps=eps, block_size=block_size
         )
 
         # Results should be identical (view as uint8 for comparison)
@@ -1280,6 +1309,312 @@ class TestAutoAllocation:
         )
         torch.testing.assert_close(
             block_scale_auto.view(torch.uint8), block_scale_pre.view(torch.uint8)
+        )
+
+
+@cute_dsl_available
+@blackwell_required
+class TestResidualInPlaceUpdate:
+    """Tests to verify that the residual tensor is updated in-place with input + residual."""
+
+    @pytest.mark.parametrize("batch_size", [1, 4, 16, 128, 512])
+    @pytest.mark.parametrize("hidden_size", [256, 512, 1024, 4096])
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_residual_inplace_update_2d(self, batch_size, hidden_size, dtype):
+        """Test that residual is updated in-place for 2D input."""
+        from flashinfer.cute_dsl.add_rmsnorm_fp4quant import add_rmsnorm_fp4quant
+
+        torch.manual_seed(42)
+        block_size = 16
+        eps = 1e-6
+
+        x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        r = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
+
+        # Store original values before kernel call
+        r_original = r.clone()
+        expected_residual = x + r_original
+
+        # Call kernel - residual should be modified in-place
+        y_fp4, block_scale = add_rmsnorm_fp4quant(
+            x, r, weight, eps=eps, block_size=block_size
+        )
+
+        # Verify residual is updated in-place to input + original_residual
+        torch.testing.assert_close(
+            r,
+            expected_residual,
+            rtol=0,
+            atol=0,
+            msg="Residual should be exactly input + original_residual",
+        )
+
+    @pytest.mark.parametrize("batch_size", [1, 4, 16])
+    @pytest.mark.parametrize("seq_len", [16, 64, 128])
+    @pytest.mark.parametrize("hidden_size", [256, 1024, 4096])
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_residual_inplace_update_3d(self, batch_size, seq_len, hidden_size, dtype):
+        """Test that residual is updated in-place for 3D input."""
+        from flashinfer.cute_dsl.add_rmsnorm_fp4quant import add_rmsnorm_fp4quant
+
+        torch.manual_seed(42)
+        block_size = 16
+        eps = 1e-6
+
+        x = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=dtype)
+        r = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=dtype)
+        weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
+
+        # Store original values before kernel call
+        r_original = r.clone()
+        expected_residual = x + r_original
+
+        # Call kernel - residual should be modified in-place
+        y_fp4, block_scale = add_rmsnorm_fp4quant(
+            x, r, weight, eps=eps, block_size=block_size
+        )
+
+        # Verify residual is updated in-place to input + original_residual
+        torch.testing.assert_close(
+            r,
+            expected_residual,
+            rtol=0,
+            atol=0,
+            msg="Residual should be exactly input + original_residual",
+        )
+
+    @pytest.mark.parametrize("batch_size", [1, 16, 128])
+    @pytest.mark.parametrize("hidden_size", [256, 1024, 2048])
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_residual_inplace_update_mxfp4(self, batch_size, hidden_size, dtype):
+        """Test that residual is updated in-place for MXFP4 format (block_size=32)."""
+        from flashinfer.cute_dsl.add_rmsnorm_fp4quant import add_rmsnorm_fp4quant
+
+        torch.manual_seed(42)
+        block_size = 32  # MXFP4
+        eps = 1e-6
+
+        x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        r = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
+
+        # Store original values before kernel call
+        r_original = r.clone()
+        expected_residual = x + r_original
+
+        # Call kernel - residual should be modified in-place
+        y_fp4, block_scale = add_rmsnorm_fp4quant(
+            x, r, weight, eps=eps, block_size=block_size, scale_format="ue8m0"
+        )
+
+        # Verify residual is updated in-place to input + original_residual
+        torch.testing.assert_close(
+            r,
+            expected_residual,
+            rtol=0,
+            atol=0,
+            msg="Residual should be exactly input + original_residual",
+        )
+
+    @pytest.mark.parametrize("batch_size", [1, 16, 128])
+    @pytest.mark.parametrize("hidden_size", [16384, 32768])
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_residual_inplace_update_large_hidden(self, batch_size, hidden_size, dtype):
+        """Test residual in-place update with large hidden sizes (cluster sync path)."""
+        from flashinfer.cute_dsl.add_rmsnorm_fp4quant import add_rmsnorm_fp4quant
+
+        torch.manual_seed(42)
+        block_size = 16
+        eps = 1e-6
+
+        x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        r = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
+
+        # Store original values before kernel call
+        r_original = r.clone()
+        expected_residual = x + r_original
+
+        # Call kernel - residual should be modified in-place
+        y_fp4, block_scale = add_rmsnorm_fp4quant(
+            x, r, weight, eps=eps, block_size=block_size
+        )
+
+        # Verify residual is updated in-place to input + original_residual
+        torch.testing.assert_close(
+            r,
+            expected_residual,
+            rtol=0,
+            atol=0,
+            msg="Residual should be exactly input + original_residual",
+        )
+
+    @pytest.mark.parametrize("batch_size", [16, 128])
+    @pytest.mark.parametrize("hidden_size", [512, 1024])
+    def test_residual_used_for_rmsnorm(self, batch_size, hidden_size):
+        """
+        Test that the updated residual (input + original_residual) is used for RMSNorm.
+
+        This verifies the correct sequence of operations:
+        1. residual = input + residual (in-place)
+        2. output = RMSNorm(residual) * weight
+        3. quantize output to FP4
+        """
+        from flashinfer.cute_dsl.add_rmsnorm_fp4quant import add_rmsnorm_fp4quant
+
+        torch.manual_seed(42)
+        block_size = 16
+        eps = 1e-6
+        dtype = torch.float16
+
+        x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        r = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
+
+        # Store original residual and compute expected values
+        r_original = r.clone()
+        expected_h = x + r_original
+        expected_rmsnorm = llama_rms_norm(expected_h, weight, eps=eps)
+
+        # Call kernel
+        y_fp4, block_scale = add_rmsnorm_fp4quant(
+            x, r, weight, eps=eps, block_size=block_size
+        )
+
+        # Verify residual is updated
+        torch.testing.assert_close(r, expected_h, rtol=0, atol=0)
+
+        # Verify FP4 output matches RMSNorm of the updated residual
+        y_dequant = dequantize_fp4_output(y_fp4, block_scale, block_size)
+        assert_close_with_tiered_tolerance(
+            y_dequant,
+            expected_rmsnorm.float(),
+            tight_rtol=0.3,
+            tight_atol=0.5,
+            loose_rtol=0.5,
+            loose_atol=2.0,
+            tight_pct=0.99,
+            msg="FP4 output should match RMSNorm of updated residual",
+        )
+
+    @pytest.mark.parametrize("batch_size", [16, 128])
+    @pytest.mark.parametrize("hidden_size", [512, 1024])
+    def test_residual_inplace_with_preallocated_outputs(self, batch_size, hidden_size):
+        """Test residual in-place update when using pre-allocated output tensors."""
+        from flashinfer.cute_dsl.add_rmsnorm_fp4quant import add_rmsnorm_fp4quant
+
+        torch.manual_seed(42)
+        block_size = 16
+        eps = 1e-6
+        dtype = torch.float16
+
+        x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        r = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
+
+        # Pre-allocate output tensors
+        y_fp4 = torch.empty(
+            batch_size, hidden_size // 2, device="cuda", dtype=torch.float4_e2m1fn_x2
+        )
+        block_scale = torch.empty(
+            batch_size,
+            hidden_size // block_size,
+            device="cuda",
+            dtype=torch.float8_e4m3fn,
+        )
+
+        # Store original residual
+        r_original = r.clone()
+        expected_residual = x + r_original
+
+        # Call kernel with pre-allocated outputs
+        add_rmsnorm_fp4quant(
+            x, r, weight, y_fp4, block_scale, eps=eps, block_size=block_size
+        )
+
+        # Verify residual is updated in-place
+        torch.testing.assert_close(
+            r,
+            expected_residual,
+            rtol=0,
+            atol=0,
+            msg="Residual should be updated in-place even with pre-allocated outputs",
+        )
+
+    @pytest.mark.parametrize("batch_size", [16, 128])
+    @pytest.mark.parametrize("hidden_size", [512, 1024])
+    def test_residual_inplace_swizzled_layout(self, batch_size, hidden_size):
+        """Test residual in-place update with swizzled scale factor layout."""
+        from flashinfer.cute_dsl.add_rmsnorm_fp4quant import add_rmsnorm_fp4quant
+
+        torch.manual_seed(42)
+        block_size = 16
+        eps = 1e-6
+        dtype = torch.float16
+
+        x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        r = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
+
+        # Store original residual
+        r_original = r.clone()
+        expected_residual = x + r_original
+
+        # Call kernel with swizzled layout
+        y_fp4, block_scale = add_rmsnorm_fp4quant(
+            x, r, weight, eps=eps, block_size=block_size, is_sf_swizzled_layout=True
+        )
+
+        # Verify residual is updated in-place
+        torch.testing.assert_close(
+            r,
+            expected_residual,
+            rtol=0,
+            atol=0,
+            msg="Residual should be updated in-place with swizzled layout",
+        )
+
+    def test_residual_not_aliased_with_input(self):
+        """Test that the kernel handles non-aliased input and residual correctly."""
+        from flashinfer.cute_dsl.add_rmsnorm_fp4quant import add_rmsnorm_fp4quant
+
+        torch.manual_seed(42)
+        batch_size = 64
+        hidden_size = 1024
+        block_size = 16
+        eps = 1e-6
+        dtype = torch.float16
+
+        x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        r = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
+
+        # Ensure x and r are separate tensors (not views of each other)
+        assert x.data_ptr() != r.data_ptr()
+
+        # Store originals
+        x_original = x.clone()
+        r_original = r.clone()
+        expected_residual = x_original + r_original
+
+        # Call kernel
+        y_fp4, block_scale = add_rmsnorm_fp4quant(
+            x, r, weight, eps=eps, block_size=block_size
+        )
+
+        # Verify x is unchanged
+        torch.testing.assert_close(
+            x, x_original, rtol=0, atol=0, msg="Input tensor should not be modified"
+        )
+
+        # Verify r is updated
+        torch.testing.assert_close(
+            r,
+            expected_residual,
+            rtol=0,
+            atol=0,
+            msg="Residual should be updated in-place",
         )
 
 
