@@ -9,12 +9,9 @@ Usage:
     # Specify GPU type
     modal run scripts/modal_runner.py --gpu H100 --command "pytest tests/attention/test_hopper.py -v"
 
-    # Skip installation (for faster iteration)
-    modal run scripts/modal_runner.py --no-install --command "pytest tests/utils/test_norm.py -v"
-
 Requirements:
     pip install modal
-    modal token new  # First-time setup
+    python3 -m modal setup
 """
 
 import sys
