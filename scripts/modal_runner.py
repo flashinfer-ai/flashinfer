@@ -116,6 +116,7 @@ def _run_flashinfer_command(command: str) -> str:
     # Run the user command
     print(f"=== Running command: {command} ===")
     import shlex
+
     result = subprocess.run(
         shlex.split(command),
         text=True,
