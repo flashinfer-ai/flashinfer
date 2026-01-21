@@ -322,7 +322,7 @@ def dequantize_fp8_block_scale(
 
     Args:
         tensor_fp8: FP8 quantized tensor [num_tokens, hidden_size]
-        block_scales: Block scales [num_tokens, hidden_size // block_size]
+        block_scales: Block scales [hidden_size // block_size, num_tokens]
         block_size: Number of elements per scale block
         dtype: Output dtype
 
@@ -335,8 +335,11 @@ def dequantize_fp8_block_scale(
     # Reshape tensor for block-wise dequantization
     reshaped = tensor_fp8.float().reshape(num_tokens, num_blocks, block_size)
 
+    # Transpose scales from [num_blocks, num_tokens] to [num_tokens, num_blocks]
+    block_scales_t = block_scales.transpose(0, 1).contiguous()
+
     # Apply scales
-    scales_expanded = block_scales.unsqueeze(-1)  # [num_tokens, num_blocks, 1]
+    scales_expanded = block_scales_t.unsqueeze(-1)  # [num_tokens, num_blocks, 1]
     dequantized = reshaped * scales_expanded
 
     return dequantized.reshape(num_tokens, hidden_size).to(dtype)
@@ -479,6 +482,8 @@ def calculate_moe_tflops(
     Returns:
         TFLOPS value
     """
+    _ = num_experts  # kept for backward compatibility
+
     # FLOPS per token per expert
     flops_per_token_per_expert = (
         2 * hidden_size * 2 * intermediate_size  # First GEMM
@@ -675,18 +680,16 @@ def process_fp8_weight_layout(
     Returns:
         Processed tensor (as float8_e4m3fn view)
     """
-    if not use_shuffled_weight:
-        return tensor
-
-    # Shuffle the weight matrix
-    shuffled = shuffle_matrix_a(tensor.view(torch.uint8), epilogue_tile_m)
+    if use_shuffled_weight:
+        # Shuffle the weight matrix
+        tensor = shuffle_matrix_a(tensor.view(torch.uint8), epilogue_tile_m)
 
     # Apply block layout conversion if needed
     if weight_layout == WeightLayout.BlockMajorK:
         block_k = 128
-        shuffled = convert_to_block_layout(shuffled, block_k)
+        tensor = convert_to_block_layout(tensor, block_k)
 
-    return shuffled.view(torch.float8_e4m3fn)
+    return tensor.view(torch.float8_e4m3fn)
 
 
 def create_moe_output_scale_scalars(
@@ -758,13 +761,6 @@ def quantize_and_pack_nvfp4(
 
     # Validate scale shape
     expected_scale_elems = (num_tokens * hidden_size) // sf_vec_size
-    if block_scales_reshaped.numel() != expected_scale_elems:
-        # Fallback: create scales with expected shape
-        block_scales_reshaped = torch.ones(
-            num_tokens,
-            hidden_size // sf_vec_size,
-            device=tensor.device,
-            dtype=torch.float8_e4m3fn,
-        )
+    assert block_scales_reshaped.numel() == expected_scale_elems, "Invalid scale shape"
 
     return quantized_packed, block_scales_reshaped, global_scale

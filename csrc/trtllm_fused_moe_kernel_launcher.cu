@@ -1655,7 +1655,8 @@ Tensor trtllm_fp8_block_scale_moe(
   // Either routing_logits or expert_indices must be provided
   // expert_indices is a packed tensor: (expert_id << 16) | (weight_bf16.view(int16))
   bool use_routing_logits = routing_logits.has_value();
-  bool use_precomputed_routing = expert_indices.data_ptr() != nullptr;
+  // Check ndim==2 and size>0 because empty placeholder tensors may have non-null data_ptr
+  bool use_precomputed_routing = expert_indices.ndim() == 2 && expert_indices.size(0) > 0;
 
   TVM_FFI_ICHECK(use_routing_logits || use_precomputed_routing)
       << "Either routing_logits or expert_indices must be provided.";

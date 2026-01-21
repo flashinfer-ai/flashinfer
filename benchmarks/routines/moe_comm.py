@@ -105,7 +105,6 @@ from .moe_utils import (
     calculate_moe_tflops,
     calculate_moe_kernel_bandwidth,
     generate_moe_weights,
-    process_fp8_weight_layout,
     create_moe_output_scale_scalars,
     quantize_and_pack_nvfp4,
 )
@@ -251,11 +250,13 @@ def parse_moe_comm_args(line, parser):
     if args.max_num_tokens is None:
         args.max_num_tokens = args.num_tokens
 
-    # Default intermediate_size to hidden_size * 4 if not specified
     if args.real_math:
+        # Must specify intermediate_size if real_math=True
         assert args.intermediate_size is not None, (
             "intermediate_size must be specified if real_math=True"
         )
+        # Must specify quant_dtype as one of the following: nvfp4, fp8_block_scale
+        # Other quant_dtype support is TBD
         assert args.quant_dtype in [
             "nvfp4",
             "fp8_block_scale",
@@ -304,11 +305,11 @@ def _init_moe_weights(
     intermediate_size: int,
     quant_dtype: str,
     device: torch.device,
-    use_shuffled_weight: bool = False,
-    weight_layout: WeightLayout = WeightLayout.MajorK,
 ) -> dict:
     """
-    Initialize MoE weights for real computation mode.
+    Initialize MoE weights for MoE.
+    The function does not do weight shuffling required for TRTLLM-Gen MoE as it serves benchmark purposes only.
+    However, A2A with fake MoE kernel can be validated through flags (--validate).
 
     Args:
         num_experts_local: Number of local experts on this rank
@@ -316,19 +317,18 @@ def _init_moe_weights(
         intermediate_size: Intermediate FFN size
         quant_dtype: "nvfp4" or "fp8_block_scale"
         device: CUDA device
-        use_shuffled_weight: Whether to shuffle weights for kernel
-        weight_layout: Weight layout (RowMajor or BlockMajorK)
 
     Returns:
         Dictionary containing weights and scales for MoE computation
     """
     weights = {}
 
+    # Create quantized weights
+    # Note: Generate and quantize one expert at a time to avoid OOM with large expert counts
+    # gemm1: [num_experts, 2*intermediate_size, hidden_size]
+    # gemm2: [num_experts, hidden_size, intermediate_size]
     if quant_dtype == "nvfp4":
         # Create FP4 quantized weights
-        # gemm1: [num_experts, 2*intermediate_size, hidden_size]
-        # gemm2: [num_experts, hidden_size, intermediate_size]
-        # Note: Generate and quantize one expert at a time to avoid OOM with large expert counts
 
         # Quantize to FP4 using swizzled layout for weights
         sf_vec_size = 16
@@ -369,6 +369,10 @@ def _init_moe_weights(
                 use_ue8m0=use_ue8m0,
                 is_sf_swizzled_layout=is_sf_swizzled_layout,
             )
+
+            # NOTE: the script chooses not to do weight shuffling as it is intended for benchmarks;
+            # only A2A with fake MoE kernel is validated
+
             gemm2_fp4_list.append(quantized.view(torch.uint8))
             gemm2_sf_list.append(sf.view(torch.float8_e4m3fn))
             gemm2_global_sf_list.append(global_sf)
@@ -397,60 +401,31 @@ def _init_moe_weights(
 
     elif quant_dtype == "fp8_block_scale":
         # Create FP8 block-scaled weights
-        # Note: Generate FP8 directly to avoid OOM with large expert counts
 
         # Optionally shuffle weights using shared utility
-        if use_shuffled_weight:
-            gemm1_shuffled = []
-            gemm2_shuffled = []
-            for _ in range(num_experts_local):
-                # Generate bf16 weights for this expert using shared utility
-                w1_batch, w2_batch = generate_moe_weights(
-                    1, hidden_size, intermediate_size, device, dtype=torch.bfloat16
-                )
-                expert_w1_bf16 = w1_batch.squeeze(0)
-                expert_w2_bf16 = w2_batch.squeeze(0)
-                del w1_batch, w2_batch
-
-                expert_w1_fp8 = expert_w1_bf16.to(torch.float8_e4m3fn)
-                expert_w2_fp8 = expert_w2_bf16.to(torch.float8_e4m3fn)
-                del expert_w1_bf16, expert_w2_bf16  # Free memory immediately
-
-                # Process weights using shared utility
-                tmp_w1 = process_fp8_weight_layout(
-                    expert_w1_fp8, use_shuffled_weight, weight_layout
-                )
-                tmp_w2 = process_fp8_weight_layout(
-                    expert_w2_fp8, use_shuffled_weight, weight_layout
-                )
-                del expert_w1_fp8, expert_w2_fp8  # Free memory immediately
-
-                gemm1_shuffled.append(tmp_w1.view(torch.uint8))
-                gemm2_shuffled.append(tmp_w2.view(torch.uint8))
-            weights["gemm1_weights"] = torch.stack(gemm1_shuffled).view(
-                torch.float8_e4m3fn
+        gemm1_weights = []
+        gemm2_weights = []
+        for _ in range(num_experts_local):
+            # Generate bf16 weights for this expert using shared utility
+            w1_batch, w2_batch = generate_moe_weights(
+                1, hidden_size, intermediate_size, device, dtype=torch.bfloat16
             )
-            weights["gemm2_weights"] = torch.stack(gemm2_shuffled).view(
-                torch.float8_e4m3fn
-            )
-        else:
-            # Generate FP8 weights directly one expert at a time
-            gemm1_fp8_list = []
-            gemm2_fp8_list = []
-            for _ in range(num_experts_local):
-                # Generate bf16 weights for this expert using shared utility
-                w1_batch, w2_batch = generate_moe_weights(
-                    1, hidden_size, intermediate_size, device, dtype=torch.bfloat16
-                )
-                expert_w1_bf16 = w1_batch.squeeze(0)
-                expert_w2_bf16 = w2_batch.squeeze(0)
-                del w1_batch, w2_batch
+            expert_w1_bf16 = w1_batch.squeeze(0)
+            expert_w2_bf16 = w2_batch.squeeze(0)
+            del w1_batch, w2_batch
 
-                gemm1_fp8_list.append(expert_w1_bf16.to(torch.float8_e4m3fn))
-                gemm2_fp8_list.append(expert_w2_bf16.to(torch.float8_e4m3fn))
-                del expert_w1_bf16, expert_w2_bf16  # Free memory immediately
-            weights["gemm1_weights"] = torch.stack(gemm1_fp8_list)
-            weights["gemm2_weights"] = torch.stack(gemm2_fp8_list)
+            expert_w1_fp8 = expert_w1_bf16.to(torch.float8_e4m3fn)
+            expert_w2_fp8 = expert_w2_bf16.to(torch.float8_e4m3fn)
+            del expert_w1_bf16, expert_w2_bf16  # Free memory immediately
+
+            # NOTE: the script chooses not to do weight shuffling as it is intended for benchmarks;
+            # only A2A with fake MoE kernel is validated
+
+            gemm1_weights.append(expert_w1_fp8)
+            gemm2_weights.append(expert_w2_fp8)
+            del expert_w1_fp8, expert_w2_fp8  # Free memory immediately
+        weights["gemm1_weights"] = torch.stack(gemm1_weights)
+        weights["gemm2_weights"] = torch.stack(gemm2_weights)
 
         # Block scales: [num_experts, out_dim // 128, in_dim // 128]
         weights["gemm1_weights_scale"] = 2.0 * torch.ones(
@@ -924,7 +899,9 @@ def _validate_moe_a2a(
             )
     elif quant_dtype == "fp8_block_scale":
         for i in range(recv_hidden.shape[0]):
-            scales_transposed = recv_scale_factor[i]
+            # Transpose scales from [max_tokens, hidden_size // block_size] to
+            # [hidden_size // block_size, max_tokens]
+            scales_transposed = recv_scale_factor[i].transpose(0, 1).contiguous()
             recv_hidden_dequant[i] = dequantize_fp8_block_scale(
                 recv_hidden[i],
                 scales_transposed,
@@ -1237,7 +1214,7 @@ def test_moe_a2a_dispatch_combine(args):
                 runtime_max_tokens_per_rank,
             )
 
-        # Expert processing: either fake math or real MoE kernel
+        # Expert processing in benchmark runs either no-op or real MoE kernel depending on --real_math flag
         with nvtx_range("moe_compute", enable_nvtx):
             combine_payload = moe_a2a.get_combine_payload_tensor_in_workspace(
                 runtime_max_tokens_per_rank,
