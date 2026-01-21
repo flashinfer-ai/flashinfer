@@ -393,8 +393,6 @@ void trtllm_paged_attention_context(
   bool const skips_softmax = skip_softmax_threshold_scale_factor.has_value();
   float const skip_softmax_threshold_scale_factor_value = skip_softmax_threshold_scale_factor.value_or(0.0f);
 
-  printf("*** CALLING WITH SKIPS_SOFTMAX: %d AND SKIP_SOFTMAX_THRESHOLD_SCALE_FACTOR: %f ***\n", skips_softmax, skip_softmax_threshold_scale_factor_value);
-
   trtllm_paged_attention_launcher(
       out.data_ptr(), output_sf_ptr, query.data_ptr(), key_cache.data_ptr(), value_cache.data_ptr(),
       workspace_buffer.data_ptr(), static_cast<int*>(block_tables.data_ptr()),

@@ -421,14 +421,14 @@ def _test_trtllm_batch_prefill(
     device_scale,
     head_dim,
     non_contiguous_query=False,
+    skips_softmax=False,
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] != 10:
         pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
     # Set up test parameters
     torch.manual_seed(0)
-    if head_dim == 256:
-        pytest.skip("head_dim == 256, skipping test")
+
     # Generate random sequence lengths
     num_qo_heads = num_kv_heads * head_grp_size
     q_lens, in_kv_lens, seq_lens = generate_seq_lens_prefill(
@@ -538,6 +538,9 @@ def _test_trtllm_batch_prefill(
     else:
         q_input = q.contiguous()
 
+    # Using 0.0 threshold should give the same result as normal attention.
+    skip_softmax_threshold_scale_factor = 0.0 if skips_softmax else None
+
     output = flashinfer.prefill.trtllm_batch_context_with_kv_cache(
         q_input,
         kv_cache,
@@ -559,7 +562,7 @@ def _test_trtllm_batch_prefill(
         kv_layout=kv_layout,
         enable_pdl=enable_pdl,
         sinks=(sink if enable_sink else None),
-        skip_softmax_threshold_scale_factor=0.0,
+        skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
     )
     # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
     # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
@@ -656,6 +659,7 @@ def _test_trtllm_batch_prefill(
 @pytest.mark.parametrize("max_kv_len", [2047])
 @pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("non_contiguous_query", [False, True])
+@pytest.mark.parametrize("skips_softmax", [False, True])
 def test_trtllm_batch_prefill(
     kv_layout,
     batch_size,
@@ -672,6 +676,7 @@ def test_trtllm_batch_prefill(
     max_kv_len,
     head_dim,
     non_contiguous_query,
+    skips_softmax,
 ):
     _test_trtllm_batch_prefill(
         kv_layout,
@@ -690,6 +695,7 @@ def test_trtllm_batch_prefill(
         kv_dtype == "fp8",
         head_dim,
         non_contiguous_query=non_contiguous_query,
+        skips_softmax=skips_softmax,
     )
 
 
@@ -712,6 +718,7 @@ def test_trtllm_batch_prefill(
 @pytest.mark.parametrize("max_q_len", [8192])
 @pytest.mark.parametrize("max_kv_len", [8192])
 @pytest.mark.parametrize("head_dim", [128, 256])
+@pytest.mark.parametrize("skips_softmax", [False, True])
 def test_trtllm_batch_prefill_bs1(
     kv_layout,
     batch_size,
@@ -727,6 +734,7 @@ def test_trtllm_batch_prefill_bs1(
     max_q_len,
     max_kv_len,
     head_dim,
+    skips_softmax,
 ):
     _test_trtllm_batch_prefill(
         kv_layout,
@@ -744,6 +752,7 @@ def test_trtllm_batch_prefill_bs1(
         max_kv_len,
         False,
         head_dim,
+        skips_softmax=skips_softmax,
     )
 
 
