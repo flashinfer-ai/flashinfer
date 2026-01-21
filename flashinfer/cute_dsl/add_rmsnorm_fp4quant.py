@@ -2308,13 +2308,13 @@ def add_rmsnorm_fp4quant(
     weight: torch.Tensor,
     y_fp4: torch.Tensor | None = None,
     block_scale: torch.Tensor | None = None,
-    block_scale_unswizzled: torch.Tensor | None = None,
     global_scale: torch.Tensor | None = None,
     eps: float = 1e-6,
     block_size: int = 16,
     scale_format: str | None = None,
     is_sf_swizzled_layout: bool = False,
     output_both_sf_layouts: bool = False,
+    block_scale_unswizzled: torch.Tensor | None = None,
 ) -> Union[
     Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 ]:
@@ -2358,13 +2358,6 @@ def add_rmsnorm_fp4quant(
 
         Dtype should be ``torch.float8_e4m3fn`` for E4M3 format or ``torch.uint8``
         for UE8M0 format. If ``None``, will be allocated automatically.
-    block_scale_unswizzled : torch.Tensor, optional
-        Output tensor for unswizzled per-block scale factors (row-major layout).
-        Only used when ``output_both_sf_layouts=True``.
-        Shape is ``(batch_size, hidden_size // block_size)`` or matching 3D input.
-        Dtype should be ``torch.float8_e4m3fn`` for E4M3 format or ``torch.uint8``
-        for UE8M0 format. If ``None``, will be allocated automatically when
-        ``output_both_sf_layouts=True``.
     global_scale : torch.Tensor, optional
         Global scale factor tensor of shape ``(1,)`` with dtype ``torch.float32``.
         If provided, the RMSNorm output is divided by this value before quantization:
@@ -2396,6 +2389,13 @@ def add_rmsnorm_fp4quant(
         ``block_scale_unswizzled`` contains the row-major layout.
         This overrides ``is_sf_swizzled_layout``.
         Default is ``False``.
+    block_scale_unswizzled : torch.Tensor, optional
+        Output tensor for unswizzled per-block scale factors (row-major layout).
+        Only used when ``output_both_sf_layouts=True``.
+        Shape is ``(batch_size, hidden_size // block_size)`` or matching 3D input.
+        Dtype should be ``torch.float8_e4m3fn`` for E4M3 format or ``torch.uint8``
+        for UE8M0 format. If ``None``, will be allocated automatically when
+        ``output_both_sf_layouts=True``.
 
     Returns
     -------
