@@ -1618,5 +1618,594 @@ class TestResidualInPlaceUpdate:
         )
 
 
+@cute_dsl_available
+@blackwell_required
+class TestOutputBothSFLayouts:
+    """Tests for output_both_sf_layouts=True which returns both swizzled and unswizzled SFs."""
+
+    @pytest.mark.parametrize("batch_size", [1, 16, 128, 256])
+    @pytest.mark.parametrize("hidden_size", [256, 512, 1024, 4096])
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_nvfp4_both_sf_layouts_basic(self, batch_size, hidden_size, dtype):
+        """
+        Test that output_both_sf_layouts=True returns 3 tensors and both SFs are correct.
+        Uses NVFP4 format (block_size=16, E4M3 scales).
+        """
+        from flashinfer.cute_dsl import add_rmsnorm_fp4quant
+
+        block_size = 16
+        eps = 1e-6
+        torch.manual_seed(42)
+
+        x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        r = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
+
+        # Clone r since kernel modifies it in-place
+        r_clone1 = r.clone()
+
+        # Call with output_both_sf_layouts=True
+        result = add_rmsnorm_fp4quant(
+            x,
+            r,
+            weight,
+            eps=eps,
+            block_size=block_size,
+            output_both_sf_layouts=True,
+        )
+
+        # Should return 3 tensors
+        assert len(result) == 3, f"Expected 3 tensors, got {len(result)}"
+        y_fp4_both, block_scale_swizzled, block_scale_unswizzled = result
+
+        # Verify shapes
+        assert y_fp4_both.shape == (batch_size, hidden_size // 2)
+        assert block_scale_unswizzled.shape == (batch_size, hidden_size // block_size)
+
+        # Swizzled layout should be 1D
+        factor = block_size * 4
+        num_m_tiles = (batch_size + 127) // 128
+        num_k_tiles = (hidden_size + factor - 1) // factor
+        expected_swizzled_size = num_m_tiles * num_k_tiles * 32 * 4 * 4
+        assert block_scale_swizzled.shape == (expected_swizzled_size,)
+
+        # Verify dtypes
+        assert y_fp4_both.dtype == torch.float4_e2m1fn_x2
+        assert block_scale_swizzled.dtype == torch.float8_e4m3fn
+        assert block_scale_unswizzled.dtype == torch.float8_e4m3fn
+
+        # Compare against separate calls with is_sf_swizzled_layout=False
+        y_fp4_unswizzled_only, block_scale_ref_unswizzled = add_rmsnorm_fp4quant(
+            x,
+            r_clone1,
+            weight,
+            eps=eps,
+            block_size=block_size,
+            is_sf_swizzled_layout=False,
+        )
+
+        # FP4 values should be identical
+        torch.testing.assert_close(
+            y_fp4_both.view(torch.uint8), y_fp4_unswizzled_only.view(torch.uint8)
+        )
+
+        # Unswizzled SF should match the reference unswizzled
+        torch.testing.assert_close(
+            block_scale_unswizzled.view(torch.uint8),
+            block_scale_ref_unswizzled.view(torch.uint8),
+        )
+
+        # Verify swizzled SF is correct by unswizzling and comparing
+        block_scale_from_swizzled = unswizzle_sf(
+            block_scale_swizzled.view(torch.uint8), batch_size, hidden_size, block_size
+        ).view(torch.float8_e4m3fn)
+        torch.testing.assert_close(
+            block_scale_from_swizzled.view(torch.uint8),
+            block_scale_ref_unswizzled.view(torch.uint8),
+        )
+
+    @pytest.mark.parametrize("batch_size", [1, 16, 128, 256])
+    @pytest.mark.parametrize("hidden_size", [256, 512, 1024, 4096])
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_mxfp4_both_sf_layouts_basic(self, batch_size, hidden_size, dtype):
+        """
+        Test that output_both_sf_layouts=True returns 3 tensors for MXFP4 format.
+        Uses MXFP4 format (block_size=32, UE8M0 scales).
+        """
+        from flashinfer.cute_dsl import add_rmsnorm_fp4quant
+
+        block_size = 32
+        eps = 1e-6
+        torch.manual_seed(42)
+
+        x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        r = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
+
+        # Clone r since kernel modifies it in-place
+        r_clone1 = r.clone()
+
+        # Call with output_both_sf_layouts=True
+        result = add_rmsnorm_fp4quant(
+            x,
+            r,
+            weight,
+            eps=eps,
+            block_size=block_size,
+            scale_format="ue8m0",
+            output_both_sf_layouts=True,
+        )
+
+        # Should return 3 tensors
+        assert len(result) == 3, f"Expected 3 tensors, got {len(result)}"
+        y_fp4_both, block_scale_swizzled, block_scale_unswizzled = result
+
+        # Verify shapes
+        assert y_fp4_both.shape == (batch_size, hidden_size // 2)
+        assert block_scale_unswizzled.shape == (batch_size, hidden_size // block_size)
+
+        # Verify dtypes (UE8M0 uses uint8)
+        assert y_fp4_both.dtype == torch.float4_e2m1fn_x2
+        assert block_scale_swizzled.dtype == torch.uint8
+        assert block_scale_unswizzled.dtype == torch.uint8
+
+        # Compare against separate calls with is_sf_swizzled_layout=False
+        y_fp4_unswizzled_only, block_scale_ref_unswizzled = add_rmsnorm_fp4quant(
+            x,
+            r_clone1,
+            weight,
+            eps=eps,
+            block_size=block_size,
+            scale_format="ue8m0",
+            is_sf_swizzled_layout=False,
+        )
+
+        # FP4 values should be identical
+        torch.testing.assert_close(
+            y_fp4_both.view(torch.uint8), y_fp4_unswizzled_only.view(torch.uint8)
+        )
+
+        # Unswizzled SF should match the reference unswizzled
+        torch.testing.assert_close(block_scale_unswizzled, block_scale_ref_unswizzled)
+
+        # Verify swizzled SF is correct by unswizzling and comparing
+        block_scale_from_swizzled = unswizzle_sf(
+            block_scale_swizzled, batch_size, hidden_size, block_size
+        )
+        torch.testing.assert_close(
+            block_scale_from_swizzled, block_scale_ref_unswizzled
+        )
+
+    @pytest.mark.parametrize("batch_size", [1, 16, 128])
+    @pytest.mark.parametrize("hidden_size", [512, 1024, 4096])
+    @pytest.mark.parametrize("dtype", [torch.float16])
+    def test_both_sf_layouts_consistency(self, batch_size, hidden_size, dtype):
+        """
+        Test that unswizzling the swizzled SF matches the unswizzled SF.
+        This verifies internal consistency of the dual output.
+        """
+        from flashinfer.cute_dsl import add_rmsnorm_fp4quant
+
+        block_size = 16
+        eps = 1e-6
+        torch.manual_seed(42)
+
+        x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        r = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
+
+        # Call with output_both_sf_layouts=True
+        y_fp4, block_scale_swizzled, block_scale_unswizzled = add_rmsnorm_fp4quant(
+            x,
+            r,
+            weight,
+            eps=eps,
+            block_size=block_size,
+            output_both_sf_layouts=True,
+        )
+
+        # Unswizzle the swizzled SF
+        block_scale_unswizzled_from_swizzled = unswizzle_sf(
+            block_scale_swizzled.view(torch.uint8), batch_size, hidden_size, block_size
+        ).view(torch.float8_e4m3fn)
+
+        # Should match the directly returned unswizzled SF
+        torch.testing.assert_close(
+            block_scale_unswizzled_from_swizzled.view(torch.uint8),
+            block_scale_unswizzled.view(torch.uint8),
+        )
+
+    @pytest.mark.parametrize("batch_size", [1, 4, 8])
+    @pytest.mark.parametrize("seq_len", [16, 64, 128])
+    @pytest.mark.parametrize("hidden_size", [256, 1024])
+    @pytest.mark.parametrize("dtype", [torch.float16])
+    def test_both_sf_layouts_3d_input(self, batch_size, seq_len, hidden_size, dtype):
+        """Test output_both_sf_layouts=True with 3D input tensors."""
+        from flashinfer.cute_dsl import add_rmsnorm_fp4quant
+
+        block_size = 16
+        eps = 1e-6
+        torch.manual_seed(42)
+
+        x = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=dtype)
+        r = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=dtype)
+        weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
+
+        # Reference computation before kernel call
+        h_ref = x + r
+        ref_rmsnorm = llama_rms_norm(h_ref, weight, eps=eps)
+
+        # Call with output_both_sf_layouts=True
+        result = add_rmsnorm_fp4quant(
+            x,
+            r,
+            weight,
+            eps=eps,
+            block_size=block_size,
+            output_both_sf_layouts=True,
+        )
+
+        assert len(result) == 3
+        y_fp4, block_scale_swizzled, block_scale_unswizzled = result
+
+        # Verify shapes
+        assert y_fp4.shape == (batch_size, seq_len, hidden_size // 2)
+        assert block_scale_unswizzled.shape == (
+            batch_size,
+            seq_len,
+            hidden_size // block_size,
+        )
+
+        # Verify dtypes
+        assert y_fp4.dtype == torch.float4_e2m1fn_x2
+        assert block_scale_swizzled.dtype == torch.float8_e4m3fn
+        assert block_scale_unswizzled.dtype == torch.float8_e4m3fn
+
+        # Dequantize using unswizzled SF and verify values
+        y_dequant = dequantize_fp4_output(y_fp4, block_scale_unswizzled, block_size)
+        assert_close_with_tiered_tolerance(
+            y_dequant,
+            ref_rmsnorm.float(),
+            tight_rtol=0.3,
+            tight_atol=0.5,
+            loose_rtol=0.5,
+            loose_atol=2.0,
+            tight_pct=0.99,
+        )
+
+    @pytest.mark.parametrize("batch_size", [16, 128])
+    @pytest.mark.parametrize("hidden_size", [512, 1024])
+    @pytest.mark.parametrize("dtype", [torch.float16])
+    def test_both_sf_layouts_with_global_scale(self, batch_size, hidden_size, dtype):
+        """Test output_both_sf_layouts=True with global_scale applied."""
+        from flashinfer.cute_dsl import add_rmsnorm_fp4quant
+
+        block_size = 16
+        eps = 1e-6
+        torch.manual_seed(42)
+
+        x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        r = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
+
+        # Compute global_scale
+        global_scale = compute_global_scale(x, r, weight, eps=eps)
+
+        # Clone r since kernel modifies it in-place
+        r_clone = r.clone()
+
+        # Call with output_both_sf_layouts=True and global_scale
+        result = add_rmsnorm_fp4quant(
+            x,
+            r,
+            weight,
+            global_scale=global_scale,
+            eps=eps,
+            block_size=block_size,
+            output_both_sf_layouts=True,
+        )
+
+        assert len(result) == 3
+        y_fp4_both, block_scale_swizzled, block_scale_unswizzled = result
+
+        # Compare with is_sf_swizzled_layout=False (unswizzled only)
+        y_fp4_ref, block_scale_ref = add_rmsnorm_fp4quant(
+            x,
+            r_clone,
+            weight,
+            global_scale=global_scale,
+            eps=eps,
+            block_size=block_size,
+            is_sf_swizzled_layout=False,
+        )
+
+        # FP4 values should be identical
+        torch.testing.assert_close(
+            y_fp4_both.view(torch.uint8), y_fp4_ref.view(torch.uint8)
+        )
+
+        # Unswizzled SF should match
+        torch.testing.assert_close(
+            block_scale_unswizzled.view(torch.uint8),
+            block_scale_ref.view(torch.uint8),
+        )
+
+    @pytest.mark.parametrize("batch_size", [16, 128])
+    @pytest.mark.parametrize("hidden_size", [512, 1024])
+    def test_both_sf_layouts_with_preallocated_tensors(self, batch_size, hidden_size):
+        """Test output_both_sf_layouts=True with pre-allocated output tensors."""
+        from flashinfer.cute_dsl import add_rmsnorm_fp4quant
+
+        block_size = 16
+        eps = 1e-6
+        dtype = torch.float16
+        torch.manual_seed(42)
+
+        x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        r = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
+
+        # Pre-allocate output tensors
+        y_fp4 = torch.empty(
+            batch_size, hidden_size // 2, device="cuda", dtype=torch.float4_e2m1fn_x2
+        )
+
+        # Swizzled scale factors
+        factor = block_size * 4
+        num_m_tiles = (batch_size + 127) // 128
+        num_k_tiles = (hidden_size + factor - 1) // factor
+        swizzled_size = num_m_tiles * num_k_tiles * 32 * 4 * 4
+        block_scale_swizzled = torch.empty(
+            swizzled_size, device="cuda", dtype=torch.float8_e4m3fn
+        )
+
+        # Unswizzled scale factors
+        block_scale_unswizzled = torch.empty(
+            batch_size,
+            hidden_size // block_size,
+            device="cuda",
+            dtype=torch.float8_e4m3fn,
+        )
+
+        # Clone r for comparison
+        r_clone = r.clone()
+
+        # Call with pre-allocated tensors
+        result = add_rmsnorm_fp4quant(
+            x,
+            r,
+            weight,
+            y_fp4=y_fp4,
+            block_scale=block_scale_swizzled,
+            block_scale_unswizzled=block_scale_unswizzled,
+            eps=eps,
+            block_size=block_size,
+            output_both_sf_layouts=True,
+        )
+
+        assert len(result) == 3
+        y_fp4_out, block_scale_swizzled_out, block_scale_unswizzled_out = result
+
+        # Verify the returned tensors are the same as pre-allocated
+        assert y_fp4_out.data_ptr() == y_fp4.data_ptr()
+        assert block_scale_swizzled_out.data_ptr() == block_scale_swizzled.data_ptr()
+        assert (
+            block_scale_unswizzled_out.data_ptr() == block_scale_unswizzled.data_ptr()
+        )
+
+        # Compare with auto-allocated version
+        y_fp4_auto, block_scale_swizzled_auto, block_scale_unswizzled_auto = (
+            add_rmsnorm_fp4quant(
+                x,
+                r_clone,
+                weight,
+                eps=eps,
+                block_size=block_size,
+                output_both_sf_layouts=True,
+            )
+        )
+
+        # FP4 and unswizzled SF should be identical
+        torch.testing.assert_close(
+            y_fp4.view(torch.uint8), y_fp4_auto.view(torch.uint8)
+        )
+        torch.testing.assert_close(
+            block_scale_unswizzled.view(torch.uint8),
+            block_scale_unswizzled_auto.view(torch.uint8),
+        )
+
+        # For swizzled SF, compare by unswizzling (to avoid padding differences)
+        block_scale_from_swizzled = unswizzle_sf(
+            block_scale_swizzled.view(torch.uint8), batch_size, hidden_size, block_size
+        ).view(torch.float8_e4m3fn)
+        block_scale_from_swizzled_auto = unswizzle_sf(
+            block_scale_swizzled_auto.view(torch.uint8),
+            batch_size,
+            hidden_size,
+            block_size,
+        ).view(torch.float8_e4m3fn)
+        torch.testing.assert_close(
+            block_scale_from_swizzled.view(torch.uint8),
+            block_scale_from_swizzled_auto.view(torch.uint8),
+        )
+
+    @pytest.mark.parametrize("batch_size", [1, 16, 128])
+    @pytest.mark.parametrize("hidden_size", [16384, 32768])
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_both_sf_layouts_large_hidden(self, batch_size, hidden_size, dtype):
+        """Test output_both_sf_layouts=True with large hidden sizes (cluster sync path)."""
+        from flashinfer.cute_dsl import add_rmsnorm_fp4quant
+
+        block_size = 16
+        eps = 1e-6
+        torch.manual_seed(42)
+
+        x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        r = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
+
+        # Sample first few rows for value comparison (full dequant is slow)
+        num_check = min(10, batch_size)
+        h_ref = x[:num_check] + r[:num_check]
+        ref_rmsnorm = llama_rms_norm(h_ref, weight, eps=eps)
+
+        # Clone r for comparison
+        r_clone1 = r.clone()
+
+        # Call with output_both_sf_layouts=True
+        result = add_rmsnorm_fp4quant(
+            x,
+            r,
+            weight,
+            eps=eps,
+            block_size=block_size,
+            output_both_sf_layouts=True,
+        )
+
+        assert len(result) == 3
+        y_fp4_both, block_scale_swizzled, block_scale_unswizzled = result
+
+        # Compare with separate call using is_sf_swizzled_layout=False
+        y_fp4_unswizzled, block_scale_ref_unswizzled = add_rmsnorm_fp4quant(
+            x,
+            r_clone1,
+            weight,
+            eps=eps,
+            block_size=block_size,
+            is_sf_swizzled_layout=False,
+        )
+
+        # FP4 values should be identical
+        torch.testing.assert_close(
+            y_fp4_both.view(torch.uint8), y_fp4_unswizzled.view(torch.uint8)
+        )
+
+        # Unswizzled scale factors should match
+        torch.testing.assert_close(
+            block_scale_unswizzled.view(torch.uint8),
+            block_scale_ref_unswizzled.view(torch.uint8),
+        )
+
+        # Verify swizzled SF by unswizzling and comparing
+        block_scale_from_swizzled = unswizzle_sf(
+            block_scale_swizzled.view(torch.uint8), batch_size, hidden_size, block_size
+        ).view(torch.float8_e4m3fn)
+        torch.testing.assert_close(
+            block_scale_from_swizzled.view(torch.uint8),
+            block_scale_ref_unswizzled.view(torch.uint8),
+        )
+
+        # Verify dequantized values
+        y_dequant = dequantize_fp4_output(
+            y_fp4_both[:num_check], block_scale_unswizzled[:num_check], block_size
+        )
+        torch.testing.assert_close(
+            y_dequant,
+            ref_rmsnorm.float(),
+            rtol=0.3,
+            atol=0.5,
+        )
+
+    @pytest.mark.parametrize("batch_size", [16, 128])
+    @pytest.mark.parametrize("hidden_size", [512, 1024])
+    def test_both_sf_layouts_residual_inplace(self, batch_size, hidden_size):
+        """Test that residual is updated in-place when output_both_sf_layouts=True."""
+        from flashinfer.cute_dsl import add_rmsnorm_fp4quant
+
+        block_size = 16
+        eps = 1e-6
+        dtype = torch.float16
+        torch.manual_seed(42)
+
+        x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        r = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
+
+        # Store original residual
+        r_original = r.clone()
+        expected_residual = x + r_original
+
+        # Call kernel
+        y_fp4, block_scale_swizzled, block_scale_unswizzled = add_rmsnorm_fp4quant(
+            x, r, weight, eps=eps, block_size=block_size, output_both_sf_layouts=True
+        )
+
+        # Verify residual is updated in-place
+        torch.testing.assert_close(
+            r,
+            expected_residual,
+            rtol=0,
+            atol=0,
+            msg="Residual should be updated in-place with output_both_sf_layouts=True",
+        )
+
+    def test_is_sf_swizzled_layout_ignored_when_output_both(self):
+        """
+        Test that is_sf_swizzled_layout is effectively ignored when output_both_sf_layouts=True.
+        Both True and False values should produce identical results.
+        """
+        from flashinfer.cute_dsl import add_rmsnorm_fp4quant
+
+        batch_size = 64
+        hidden_size = 1024
+        block_size = 16
+        eps = 1e-6
+        dtype = torch.float16
+        torch.manual_seed(42)
+
+        x = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        r = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
+        weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
+
+        # Clone r for both calls
+        r_clone = r.clone()
+
+        # Call with is_sf_swizzled_layout=False and output_both_sf_layouts=True
+        result1 = add_rmsnorm_fp4quant(
+            x,
+            r,
+            weight,
+            eps=eps,
+            block_size=block_size,
+            is_sf_swizzled_layout=False,
+            output_both_sf_layouts=True,
+        )
+
+        # Call with is_sf_swizzled_layout=True and output_both_sf_layouts=True
+        result2 = add_rmsnorm_fp4quant(
+            x,
+            r_clone,
+            weight,
+            eps=eps,
+            block_size=block_size,
+            is_sf_swizzled_layout=True,
+            output_both_sf_layouts=True,
+        )
+
+        # Both should return 3 tensors
+        assert len(result1) == 3
+        assert len(result2) == 3
+
+        y_fp4_1, swizzled_1, unswizzled_1 = result1
+        y_fp4_2, swizzled_2, unswizzled_2 = result2
+
+        # FP4 outputs should be identical
+        torch.testing.assert_close(y_fp4_1.view(torch.uint8), y_fp4_2.view(torch.uint8))
+
+        # Unswizzled outputs should be identical
+        torch.testing.assert_close(
+            unswizzled_1.view(torch.uint8), unswizzled_2.view(torch.uint8)
+        )
+
+        # For swizzled outputs, compare by unswizzling (to avoid padding differences)
+        swizzled_1_unswizzled = unswizzle_sf(
+            swizzled_1.view(torch.uint8), batch_size, hidden_size, block_size
+        )
+        swizzled_2_unswizzled = unswizzle_sf(
+            swizzled_2.view(torch.uint8), batch_size, hidden_size, block_size
+        )
+        torch.testing.assert_close(swizzled_1_unswizzled, swizzled_2_unswizzled)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
