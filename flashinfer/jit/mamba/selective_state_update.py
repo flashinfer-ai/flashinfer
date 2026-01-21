@@ -35,7 +35,7 @@ def gen_selective_state_update_sm90_module() -> JitSpec:
     # This supports SM90 (Hopper) only.
     #
     # Technically, all the kernels in this module can be executed on newer GPUs than Hopper,
-    # but this kernel ends up being slower then an alternatice sm100 module.
+    # but this kernel ends up being slower than the alternative SM100 module.
     # Therefore, this is excluded to reduce the amount of compilation.
     compilation_context = CompilationContext()
     nvcc_flags = compilation_context.get_nvcc_flags_list(supported_major_versions=[9])
