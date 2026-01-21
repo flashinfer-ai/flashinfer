@@ -839,7 +839,7 @@ __global__ void selective_state_update_kernel_producer_consumer_horizontal(
     auto const member = lane / rowsPerWarp;
     auto const d = warp * rowsPerWarp + group;
     auto const x_value = toFloat(x[batch * params.x_stride_batch + head * DIM + d]);
-    auto const z_value = z ? toFloat(z[batch * nheads * DIM + head * DIM + d]) : 0.f;
+    auto const z_value = z ? toFloat(z[batch * params.z_stride_batch + head * DIM + d]) : 0.f;
 
     sram.bar_consumers.wait(sram.bar_consumers.arrive());
 
