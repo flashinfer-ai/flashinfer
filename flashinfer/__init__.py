@@ -163,3 +163,9 @@ from .utils import next_positive_power_of_2 as next_positive_power_of_2
 from .xqa import xqa as xqa
 from .xqa import xqa_mla as xqa_mla
 from . import mamba as mamba
+from .moe_utils import get_max_num_tiles as get_max_num_tiles
+from .moe_utils import get_max_num_permuted_tokens as get_max_num_permuted_tokens
+from .moe_utils import moe_sort as moe_sort
+from .moe_utils import moe_permute as moe_permute
+from .moe_utils import moe_unpermute as moe_unpermute
+from .moe_utils import moe_output_memset as moe_output_memset
