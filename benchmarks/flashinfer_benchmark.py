@@ -12,6 +12,7 @@ from routines.moe import parse_moe_args, run_moe_test
 from routines.moe_comm import parse_moe_comm_args, run_moe_comm_test
 from routines.norm import parse_norm_args, run_norm_test
 from routines.quantization import parse_quantization_args, run_quantization_test
+from routines.sampling import parse_sampling_args, run_sampling_test
 
 
 def run_test(args):
@@ -35,6 +36,8 @@ def run_test(args):
         res = run_norm_test(args)
     elif args.routine in benchmark_apis["quantization"]:
         res = run_quantization_test(args)
+    elif args.routine in benchmark_apis["sampling"]:
+        res = run_sampling_test(args)
     else:
         raise ValueError(f"Unsupported routine: {args.routine}")
 
@@ -80,7 +83,8 @@ def parse_args(line=sys.argv[1:]):
         + list(benchmark_apis["moe"])
         + list(benchmark_apis["moe_comm"])
         + list(benchmark_apis["norm"])
-        + list(benchmark_apis["quantization"]),
+        + list(benchmark_apis["quantization"])
+        + list(benchmark_apis["sampling"]),
     )
     args, _ = parser.parse_known_args(line[:])
 
@@ -177,6 +181,8 @@ def parse_args(line=sys.argv[1:]):
         args = parse_norm_args(line, parser)
     elif args.routine in benchmark_apis["quantization"]:
         args = parse_quantization_args(line, parser)
+    elif args.routine in benchmark_apis["sampling"]:
+        args = parse_sampling_args(line, parser)
     else:
         raise ValueError(f"Unsupported routine: {args.routine}")
 
