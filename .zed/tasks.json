@@ -1,0 +1,61 @@
+// Project tasks configuration. See https://zed.dev/docs/tasks for documentation.
+//
+// Example:
+[
+    {
+        "label": "[test] selective_state_update",
+        "command": "docker",
+        // "args": ["exec", "-it", "flashinfer-cu130-dev-ishovkun", "bash", "-c",
+        //   "\"pytest ${ZED_WORKTREE_ROOT}/tests/mamba -k test_selective_state_update -v -s\""
+        // ],
+
+        "args": [
+            "exec", "-it", "-w", "${ZED_WORKTREE_ROOT}/tests/mamba",
+            "flashinfer-cu130-dev-ishovkun",
+            "pytest",
+            "-k",
+            "test_selective_state_update",
+            "-v -s -x"
+        ],
+
+        "use_new_terminal": false,
+        "allow_concurrent_runs": false,
+        "reveal": "always",
+        "reveal_target": "dock",
+        "hide": "never",
+        "shell": {
+            "program": "zsh"
+        },
+        "show_summary": true,
+        "show_command": true
+    },
+    {
+      "label": "print beer",
+      "command": "echo \"beer\"",
+      "shell": {
+          "program": "bash"
+      },
+    }
+
+    // ,
+    // {
+    //     "label": "pre-commit",
+    //     "command": "docker exec -it flashinfer-cu130-dev-ishovkun",
+    //     "args": [
+    //         "bash -c \"",
+    //         "pip install pre-commit && pre-commit install && pre-commit run --all-files",
+    //         "\""
+    //     ],
+    //     "env": {
+    //         "SCRATCH": "/home/scratch.ishovkun_gpu"
+    //     },
+    //     "use_new_terminal": false,
+    //     "allow_concurrent_runs": false,
+    //     "reveal": "always",
+    //     "reveal_target": "dock",
+    //     "hide": "never",
+    //     "shell": "system",
+    //     "show_summary": true,
+    //     "show_command": true
+    // }
+]

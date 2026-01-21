@@ -691,7 +691,9 @@ __device__ __forceinline__ void consumer_func_horizontal(
       }
     } else {
       for (int item = 0; item < itemsPerThread; item += stateValuesPerBank) {
-        auto const ii = (item + member * itemsPerThread + (group / 4) * 2) % colsPerStage;
+        auto const seq_index = group * colsPerStage + baseCol;
+        auto const bankCycle = (seq_index / stateValuesPerBank) / numBanks;
+        auto const ii = (baseCol + stateValuesPerBank * bankCycle) % colsPerStage;
         auto const i = iBegin + ii;
 
         auto* sState_ptr = reinterpret_cast<uint*>(&sram.state[stage][d * colsPerStage + ii]);
