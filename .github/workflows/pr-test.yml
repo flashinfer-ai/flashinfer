@@ -122,7 +122,7 @@ jobs:
           if [[ "$EXISTING" -eq 0 ]]; then
             gh pr comment ${{ github.event.pull_request.number }} \
               --repo ${{ github.repository }} \
-              --body "⏸️ **CI is paused for external contributors.**
+              --body "**CI is paused for external contributors.**
 
           A maintainer can approve by commenting:
           - \`@flashinfer-bot run\` - Trigger CI tests
@@ -362,7 +362,7 @@ jobs:
           # Check if CI was skipped due to permissions
           if [ "${{ needs.gate.outputs.authorized }}" != "true" ]; then
             echo "CI skipped (pending authorization)" >> $GITHUB_STEP_SUMMARY
-            echo "A maintainer can comment \`@flashinfer-bot run\` to approve." >> $GITHUB_STEP_SUMMARY
+            echo "A contributor in @flashinfer-ai/ci-users can comment \`@flashinfer-bot run\` to approve." >> $GITHUB_STEP_SUMMARY
             exit 0
           fi
 

@@ -41,6 +41,6 @@ jobs:
           # Post a comment explaining why
           gh pr comment ${{ github.event.pull_request.number }} \
             --repo ${{ github.repository }} \
-            --body "🔄 New commits detected. The \`run-ci\` label has been removed for security.
+            --body "New commits detected. The \`run-ci\` label has been removed for security.
 
           A maintainer can re-approve by commenting \`@flashinfer-bot run\`"

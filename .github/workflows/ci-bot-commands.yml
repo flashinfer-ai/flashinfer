@@ -4,7 +4,7 @@
 #   @flashinfer-bot rerun        - Rerun all jobs
 #   @flashinfer-bot rerun-failed - Rerun only failed jobs
 
-name: Bot Commands
+name: CI Bot Commands
 
 on:
   issue_comment:
@@ -65,7 +65,7 @@ jobs:
         id: parse
         run: |
           BODY="${{ github.event.comment.body }}"
-          
+
           if echo "$BODY" | grep -qi "@flashinfer-bot run-failed\|@flashinfer-bot rerun-failed"; then
             echo "command=rerun-failed" >> "$GITHUB_OUTPUT"
           elif echo "$BODY" | grep -qi "@flashinfer-bot rerun"; then
@@ -82,18 +82,18 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "Adding run-ci label to PR #${{ github.event.issue.number }}"
-          
+
           # Add run-ci label
           gh pr edit ${{ github.event.issue.number }} \
             --repo ${{ github.repository }} \
             --add-label "run-ci"
-          
+
           # React with thumbs up
           gh api \
             -X POST \
             "/repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
             -f content='+1'
-          
+
           echo "Label added successfully"
 
       - name: Handle @flashinfer-bot rerun
@@ -102,14 +102,14 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "Rerunning all jobs for PR #${{ github.event.issue.number }}"
-          
+
           # Get PR head SHA
           PR_SHA=$(gh pr view ${{ github.event.issue.number }} \
             --repo ${{ github.repository }} \
             --json headRefOid -q '.headRefOid')
-          
+
           echo "PR HEAD SHA: $PR_SHA"
-          
+
           # Rerun all workflow runs for this commit
           gh run list \
             --repo ${{ github.repository }} \
@@ -121,13 +121,13 @@ jobs:
               gh run rerun "$run_id" --repo ${{ github.repository }} || true
             fi
           done
-          
+
           # React with thumbs up
           gh api \
             -X POST \
             "/repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
             -f content='+1'
-          
+
           echo "Rerun triggered successfully"
 
       - name: Handle @flashinfer-bot rerun-failed
@@ -136,14 +136,14 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "Rerunning failed jobs for PR #${{ github.event.issue.number }}"
-          
+
           # Get PR head SHA
           PR_SHA=$(gh pr view ${{ github.event.issue.number }} \
             --repo ${{ github.repository }} \
             --json headRefOid -q '.headRefOid')
-          
+
           echo "PR HEAD SHA: $PR_SHA"
-          
+
           # Rerun failed workflow runs for this commit
           RERUN_COUNT=0
           gh run list \
@@ -158,13 +158,13 @@ jobs:
               RERUN_COUNT=$((RERUN_COUNT + 1))
             fi
           done
-          
+
           # React with thumbs up
           gh api \
             -X POST \
             "/repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
             -f content='+1'
-          
+
           echo "Rerun-failed triggered successfully"
 
       - name: Unauthorized user
@@ -173,7 +173,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "User ${{ github.event.comment.user.login }} is not authorized"
-          
+
           # React with confused emoji
           gh api \
             -X POST \
