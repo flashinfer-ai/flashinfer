@@ -567,7 +567,7 @@ def gdn_decode_kernel_big_batch_pretranspose(
     # All threads write (V=128, NUM_THREADS=128)
     # ===================================================================
     cute.arch.barrier()  # Ensure all writes to sOutput are complete
-    
+
     if tidx < V:
         o[(i_n, i_t, i_hv, tidx)] = sOutput[tidx]
 
@@ -898,8 +898,10 @@ def gated_delta_rule_decode_pretranspose(
     # Validate K and V constraints
     assert K >= 128, f"K must be at least 128, got K={K}"
     assert V >= 128, f"V must be at least 128, got V={V}"
-    assert V % TILE_V == 0, f"V must be divisible by {TILE_V} to prevent out-of-bounds access, got V={V}"
-    
+    assert V % TILE_V == 0, (
+        f"V must be divisible by {TILE_V} to prevent out-of-bounds access, got V={V}"
+    )
+
     # Validate dtypes
     assert q.dtype in (torch.float16, torch.bfloat16), (
         f"q must be float16/bfloat16, got {q.dtype}"
@@ -1191,7 +1193,7 @@ def gdn_decode_kernel_small_batch_nontranspose(
             r_v = cutlass.Float32(v[i_n, 0, i_hv, v_global])
 
             sum_hk = 0.0
-            for k_iter in range(NUM_K_ITERS_SMALL, unroll=16):
+            for k_iter in range(NUM_K_ITERS_SMALL, unroll=16):  # type: ignore[call-overload]
                 k_base = k_iter * ROWS_PER_ITER_SMALL
                 k_idx = k_base + k_local
                 h_val = sData[(k_idx, v_idx, stage)] * r_g
@@ -1702,8 +1704,10 @@ def gated_delta_rule_decode(
     # V must be divisible by tile size to prevent out-of-bounds access
     # For small batch: TILE_V_SMALL_NT=16, for large batch: TILE_V_NT=32
     # Use the more restrictive constraint (32) to cover both cases
-    assert V % TILE_V_NT == 0, f"V must be divisible by {TILE_V_NT} to prevent out-of-bounds access, got V={V}"
-    
+    assert V % TILE_V_NT == 0, (
+        f"V must be divisible by {TILE_V_NT} to prevent out-of-bounds access, got V={V}"
+    )
+
     # Validate dtypes
     assert q.dtype in (torch.float16, torch.bfloat16), (
         f"q must be float16/bfloat16, got {q.dtype}"
@@ -2320,12 +2324,14 @@ def gated_delta_rule_mtp(
     assert initial_state.shape == (pool_size, HV, V, K), (
         f"Expected initial_state shape [pool_size={pool_size}, HV={HV}, V={V}, K={K}], got {initial_state.shape}"
     )
-    
+
     # Validate K and V constraints
     assert K >= 128, f"K must be at least 128, got K={K}"
     assert V >= 128, f"V must be at least 128, got V={V}"
-    assert V % TILE_V_MTP == 0, f"V must be divisible by {TILE_V_MTP} to prevent out-of-bounds access, got V={V}"
-    
+    assert V % TILE_V_MTP == 0, (
+        f"V must be divisible by {TILE_V_MTP} to prevent out-of-bounds access, got V={V}"
+    )
+
     # Validate dtypes
     assert q.dtype in (torch.float16, torch.bfloat16), (
         f"q must be float16/bfloat16, got {q.dtype}"

@@ -133,7 +133,7 @@ def gdn_decode_bytes(
     - Intermediate states (MTP only): [B, T, HV, K, V] - float32
     - GDN parameters: A_log (float32), a (dtype), dt_bias (dtype), b (dtype)
     - Output tensor: [B, T, HV, V] - dtype
-    
+
     Note: When disable_state_update=True, state is only read, not written back.
     """
     num_o_heads = max(num_q_heads, num_v_heads)
@@ -303,8 +303,14 @@ def bench_gdn_decode(
         batch_size, num_q_heads, num_k_heads, num_v_heads, head_size
     )
     bytes_accessed = gdn_decode_bytes(
-        batch_size, num_q_heads, num_k_heads, num_v_heads, head_size, dtype,
-        seq_len=1, disable_state_update=False  # Decode mode: state is read + written
+        batch_size,
+        num_q_heads,
+        num_k_heads,
+        num_v_heads,
+        head_size,
+        dtype,
+        seq_len=1,
+        disable_state_update=False,  # Decode mode: state is read + written
     )
 
     kernel_median_ms = kernel_median_us / 1000
@@ -469,8 +475,14 @@ def bench_gdn_mtp(
         batch_size, num_q_heads, num_k_heads, num_v_heads, head_size, seq_len
     )
     bytes_accessed = gdn_decode_bytes(
-        batch_size, num_q_heads, num_k_heads, num_v_heads, head_size, dtype, seq_len,
-        disable_state_update=True  # MTP mode: state is not written back
+        batch_size,
+        num_q_heads,
+        num_k_heads,
+        num_v_heads,
+        head_size,
+        dtype,
+        seq_len,
+        disable_state_update=True,  # MTP mode: state is not written back
     )
 
     kernel_median_ms = kernel_median_us / 1000
