@@ -126,6 +126,7 @@ jobs:
         with:
           username: flashinfer
           password: ${{ secrets.DOCKERHUB_TOKEN }}
+        continue-on-error: true  # Don't fail if secret is unavailable (e.g., fork PRs)
 
       - name: Show Node Info
         run: ./scripts/task_show_node_info.sh
@@ -175,6 +176,7 @@ jobs:
         with:
           username: flashinfer
           password: ${{ secrets.DOCKERHUB_TOKEN }}
+        continue-on-error: true  # Don't fail if secret is unavailable (e.g., fork PRs)
 
       - name: Show Node Info
         run: ./scripts/task_show_node_info.sh
@@ -220,6 +222,7 @@ jobs:
         with:
           username: flashinfer
           password: ${{ secrets.DOCKERHUB_TOKEN }}
+        continue-on-error: true  # Don't fail if secret is unavailable (e.g., fork PRs)
 
       - name: Show Node Info
         run: ./scripts/task_show_node_info.sh
