@@ -99,6 +99,30 @@ __device__ __forceinline__ float warpReduceSum(float val) {
   return val;
 }
 
+// Computes a conflict-free column index for shared memory access.
+// This permutation avoids bank conflicts when threads access strided patterns.
+//
+// Without permutation (baseCol directly):
+//   Thread 0 -> Bank 0, Thread 32 -> Bank 0, Thread 64 -> Bank 0  (conflict!)
+//
+// With permutation (adding bankCycle offset):
+//   bankCycle = which "round" of 32 banks we're in
+//   By offsetting each round by 1 bank:
+//   Thread 0  -> Bank 0
+//   Thread 32 -> Bank 1  (offset by 1)
+//   Thread 64 -> Bank 2  (offset by 2)
+//
+// Visual: (stateValuesPerBank=1, numBanks=32, colsPerStage=128)
+//   baseCol:    0  1  2 ... 31 | 32 33 34 ... 63 | 64 ...
+//   bankCycle:  0  0  0 ...  0 |  1  1  1 ...  1 |  2 ...
+//   ii:         0  1  2 ... 31 | 33 34 35 ... 64 | 66 ...  (mod colsPerStage)
+template <int colsPerStage, int stateValuesPerBank, int numBanks>
+__device__ __forceinline__ int conflict_free_column(int group, int baseCol) {
+  auto const seq_index = group * colsPerStage + baseCol;
+  auto const bankCycle = (seq_index / stateValuesPerBank) / numBanks;
+  return (baseCol + stateValuesPerBank * bankCycle) % colsPerStage;
+}
+
 template <typename input_t, int dim, int dstate>
 struct SharedStorageSimple {
   alignas(alignof(PackedAligned<input_t>)) input_t x[dim];
@@ -638,24 +662,8 @@ __device__ __forceinline__ void consumer_func_horizontal(
         auto const baseCol = item + member * itemsPerThread;
         // If I just use baseCol as the index, a lot of bank conflicts will arise.
         //
-        // Without permutation (baseCol directly):
-        //   Thread 0 -> Bank 0, Thread 32 -> Bank 0, Thread 64 -> Bank 0  (conflict!)
-        //
-        // With permutation (adding bankCycle offset):
-        //   bankCycle = which "round" of 32 banks we're in
-        //   By offsetting each round by 1 bank:
-        //   Thread 0  -> Bank 0
-        //   Thread 32 -> Bank 1  (offset by 1)
-        //   Thread 64 -> Bank 2  (offset by 2)
-        //
-        // Visual: (stateValuesPerBank=1, numBanks=32, colsPerStage=128)
-        //   baseCol:    0  1  2 ... 31 | 32 33 34 ... 63 | 64 ...
-        //   bankCycle:  0  0  0 ...  0 |  1  1  1 ...  1 |  2 ...
-        //   ii:         0  1  2 ... 31 | 33 34 35 ... 64 | 66 ...  (mod colsPerStage)
-        //
-        auto const seq_index = group * colsPerStage + baseCol;
-        auto const bankCycle = (seq_index / stateValuesPerBank) / numBanks;
-        auto const ii = (baseCol + stateValuesPerBank * bankCycle) % colsPerStage;
+        auto const ii =
+            conflict_free_column<colsPerStage, stateValuesPerBank, numBanks>(group, baseCol);
 
         auto const i = iBegin + ii;
 
@@ -691,9 +699,9 @@ __device__ __forceinline__ void consumer_func_horizontal(
       }
     } else {
       for (int item = 0; item < itemsPerThread; item += stateValuesPerBank) {
-        auto const seq_index = group * colsPerStage + baseCol;
-        auto const bankCycle = (seq_index / stateValuesPerBank) / numBanks;
-        auto const ii = (baseCol + stateValuesPerBank * bankCycle) % colsPerStage;
+        auto const baseCol = item + member * itemsPerThread;
+        auto const ii =
+            conflict_free_column<colsPerStage, stateValuesPerBank, numBanks>(group, baseCol);
         auto const i = iBegin + ii;
 
         auto* sState_ptr = reinterpret_cast<uint*>(&sram.state[stage][d * colsPerStage + ii]);
