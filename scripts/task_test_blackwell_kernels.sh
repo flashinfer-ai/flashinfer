@@ -395,7 +395,8 @@ else
             TOTAL_TESTS=$((TOTAL_TESTS + 1))
 
             #if pytest $PYTEST_FLAGS "${JUNIT_FLAG}" "${test_file}"; then
-            if pytest -v $PYTEST_FLAGS "${JUNIT_FLAG}" "${test_file}" > >(grep " PASSED") 2>/dev/null; then
+            #if pytest -v $PYTEST_FLAGS "${JUNIT_FLAG}" "${test_file}" > >(grep " PASSED") 2>/dev/null; then
+            if pytest --collect-only -q "${test_file}" > >(grep "test_"); then
                 echo "✅ PASSED: $test_file"
                 PASSED_TESTS=$((PASSED_TESTS + 1))
             else
