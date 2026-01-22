@@ -5,11 +5,10 @@ This is factored out from test_cli_cmds.py because these tests require a GPU.
 """
 
 import pytest
-from flashinfer.utils import get_compute_capability
+import torch
 
-# Skip the entire module if no supported GPU is available
-_cc = get_compute_capability()
-if _cc is None:
+# Skip the entire module if no CUDA GPU is available
+if not torch.cuda.is_available():
     pytest.skip("Requires CUDA GPU for CLI GPU tests.", allow_module_level=True)
 
 from cli_cmd_helpers import _test_cmd_helper
