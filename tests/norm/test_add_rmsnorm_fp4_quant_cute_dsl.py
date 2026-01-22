@@ -1685,24 +1685,24 @@ class TestOutputBothSFLayouts:
         )
 
         # FP4 values should be identical
-        torch.testing.assert_close(
+        assert torch.equal(
             y_fp4_both.view(torch.uint8), y_fp4_unswizzled_only.view(torch.uint8)
-        )
+        ), "FP4 outputs should be bitwise identical"
 
         # Unswizzled SF should match the reference unswizzled
-        torch.testing.assert_close(
+        assert torch.equal(
             block_scale_unswizzled.view(torch.uint8),
             block_scale_ref_unswizzled.view(torch.uint8),
-        )
+        ), "Unswizzled scale factors should be bitwise identical"
 
         # Verify swizzled SF is correct by unswizzling and comparing
         block_scale_from_swizzled = unswizzle_sf(
             block_scale_swizzled.view(torch.uint8), batch_size, hidden_size, block_size
         ).view(torch.float8_e4m3fn)
-        torch.testing.assert_close(
+        assert torch.equal(
             block_scale_from_swizzled.view(torch.uint8),
             block_scale_ref_unswizzled.view(torch.uint8),
-        )
+        ), "Unswizzled-from-swizzled scale factors should match reference"
 
     @pytest.mark.parametrize("batch_size", [1, 16, 128, 256])
     @pytest.mark.parametrize("hidden_size", [256, 512, 1024, 4096])
@@ -1761,19 +1761,21 @@ class TestOutputBothSFLayouts:
         )
 
         # FP4 values should be identical
-        torch.testing.assert_close(
+        assert torch.equal(
             y_fp4_both.view(torch.uint8), y_fp4_unswizzled_only.view(torch.uint8)
-        )
+        ), "FP4 outputs should be bitwise identical"
 
         # Unswizzled SF should match the reference unswizzled
-        torch.testing.assert_close(block_scale_unswizzled, block_scale_ref_unswizzled)
+        assert torch.equal(block_scale_unswizzled, block_scale_ref_unswizzled), (
+            "Unswizzled scale factors should be bitwise identical"
+        )
 
         # Verify swizzled SF is correct by unswizzling and comparing
         block_scale_from_swizzled = unswizzle_sf(
             block_scale_swizzled, batch_size, hidden_size, block_size
         )
-        torch.testing.assert_close(
-            block_scale_from_swizzled, block_scale_ref_unswizzled
+        assert torch.equal(block_scale_from_swizzled, block_scale_ref_unswizzled), (
+            "Unswizzled-from-swizzled scale factors should match reference"
         )
 
     @pytest.mark.parametrize("batch_size", [1, 16, 128])
@@ -1810,10 +1812,10 @@ class TestOutputBothSFLayouts:
         ).view(torch.float8_e4m3fn)
 
         # Should match the directly returned unswizzled SF
-        torch.testing.assert_close(
+        assert torch.equal(
             block_scale_unswizzled_from_swizzled.view(torch.uint8),
             block_scale_unswizzled.view(torch.uint8),
-        )
+        ), "Unswizzled-from-swizzled SF should match directly returned unswizzled SF"
 
     @pytest.mark.parametrize("batch_size", [1, 4, 8])
     @pytest.mark.parametrize("seq_len", [16, 64, 128])
@@ -1920,15 +1922,15 @@ class TestOutputBothSFLayouts:
         )
 
         # FP4 values should be identical
-        torch.testing.assert_close(
-            y_fp4_both.view(torch.uint8), y_fp4_ref.view(torch.uint8)
+        assert torch.equal(y_fp4_both.view(torch.uint8), y_fp4_ref.view(torch.uint8)), (
+            "FP4 outputs should be bitwise identical"
         )
 
         # Unswizzled SF should match
-        torch.testing.assert_close(
+        assert torch.equal(
             block_scale_unswizzled.view(torch.uint8),
             block_scale_ref.view(torch.uint8),
-        )
+        ), "Unswizzled scale factors should be bitwise identical"
 
     @pytest.mark.parametrize("batch_size", [16, 128])
     @pytest.mark.parametrize("hidden_size", [512, 1024])
@@ -2006,13 +2008,13 @@ class TestOutputBothSFLayouts:
         )
 
         # FP4 and unswizzled SF should be identical
-        torch.testing.assert_close(
-            y_fp4.view(torch.uint8), y_fp4_auto.view(torch.uint8)
+        assert torch.equal(y_fp4.view(torch.uint8), y_fp4_auto.view(torch.uint8)), (
+            "FP4 outputs should be bitwise identical"
         )
-        torch.testing.assert_close(
+        assert torch.equal(
             block_scale_unswizzled.view(torch.uint8),
             block_scale_unswizzled_auto.view(torch.uint8),
-        )
+        ), "Unswizzled scale factors should be bitwise identical"
 
         # For swizzled SF, compare by unswizzling (to avoid padding differences)
         block_scale_from_swizzled = unswizzle_sf(
@@ -2024,10 +2026,10 @@ class TestOutputBothSFLayouts:
             hidden_size,
             block_size,
         ).view(torch.float8_e4m3fn)
-        torch.testing.assert_close(
+        assert torch.equal(
             block_scale_from_swizzled.view(torch.uint8),
             block_scale_from_swizzled_auto.view(torch.uint8),
-        )
+        ), "Unswizzled-from-swizzled scale factors should match"
 
     @pytest.mark.parametrize("batch_size", [1, 16, 128])
     @pytest.mark.parametrize("hidden_size", [16384, 32768])
@@ -2076,24 +2078,24 @@ class TestOutputBothSFLayouts:
         )
 
         # FP4 values should be identical
-        torch.testing.assert_close(
+        assert torch.equal(
             y_fp4_both.view(torch.uint8), y_fp4_unswizzled.view(torch.uint8)
-        )
+        ), "FP4 outputs should be bitwise identical"
 
         # Unswizzled scale factors should match
-        torch.testing.assert_close(
+        assert torch.equal(
             block_scale_unswizzled.view(torch.uint8),
             block_scale_ref_unswizzled.view(torch.uint8),
-        )
+        ), "Unswizzled scale factors should be bitwise identical"
 
         # Verify swizzled SF by unswizzling and comparing
         block_scale_from_swizzled = unswizzle_sf(
             block_scale_swizzled.view(torch.uint8), batch_size, hidden_size, block_size
         ).view(torch.float8_e4m3fn)
-        torch.testing.assert_close(
+        assert torch.equal(
             block_scale_from_swizzled.view(torch.uint8),
             block_scale_ref_unswizzled.view(torch.uint8),
-        )
+        ), "Unswizzled-from-swizzled scale factors should match reference"
 
         # Verify dequantized values
         y_dequant = dequantize_fp4_output(
@@ -2131,12 +2133,8 @@ class TestOutputBothSFLayouts:
         )
 
         # Verify residual is updated in-place
-        torch.testing.assert_close(
-            r,
-            expected_residual,
-            rtol=0,
-            atol=0,
-            msg="Residual should be updated in-place with output_both_sf_layouts=True",
+        assert torch.equal(r, expected_residual), (
+            "Residual should be updated in-place with output_both_sf_layouts=True"
         )
 
     def test_is_sf_swizzled_layout_ignored_when_output_both(self):
@@ -2190,11 +2188,15 @@ class TestOutputBothSFLayouts:
         y_fp4_2, swizzled_2, unswizzled_2 = result2
 
         # FP4 outputs should be identical
-        torch.testing.assert_close(y_fp4_1.view(torch.uint8), y_fp4_2.view(torch.uint8))
+        assert torch.equal(y_fp4_1.view(torch.uint8), y_fp4_2.view(torch.uint8)), (
+            "FP4 outputs should be bitwise identical regardless of is_sf_swizzled_layout"
+        )
 
         # Unswizzled outputs should be identical
-        torch.testing.assert_close(
+        assert torch.equal(
             unswizzled_1.view(torch.uint8), unswizzled_2.view(torch.uint8)
+        ), (
+            "Unswizzled outputs should be bitwise identical regardless of is_sf_swizzled_layout"
         )
 
         # For swizzled outputs, compare by unswizzling (to avoid padding differences)
@@ -2204,7 +2206,9 @@ class TestOutputBothSFLayouts:
         swizzled_2_unswizzled = unswizzle_sf(
             swizzled_2.view(torch.uint8), batch_size, hidden_size, block_size
         )
-        torch.testing.assert_close(swizzled_1_unswizzled, swizzled_2_unswizzled)
+        assert torch.equal(swizzled_1_unswizzled, swizzled_2_unswizzled), (
+            "Swizzled outputs should be identical regardless of is_sf_swizzled_layout"
+        )
 
 
 if __name__ == "__main__":
