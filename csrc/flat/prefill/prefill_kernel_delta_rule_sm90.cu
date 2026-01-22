@@ -17,6 +17,10 @@
 
 #include "prefill_kernel_delta_rule_sm90.cuh"
 
+// Extern template declarations prevent implicit instantiation here.
+// Explicit instantiations are in separate generated files for parallel compilation.
+#include "prefill_kernel_delta_rule_sm90_extern.inc"
+
 namespace flat {
 
 using namespace cute;
@@ -86,6 +90,8 @@ void launch_delta_rule_prefill_kernel(cudaStream_t stream, TO* output, TState* o
 #undef LAUNCH
 }
 
+// Explicit instantiations for the outer dispatch function only.
+// The inner launch_delta_rule_prefill_kernel_gbai instantiations are in separate files.
 template void launch_delta_rule_prefill_kernel<cutlass::arch::Sm90, half, half, float>(
     cudaStream_t stream, half* output, float* state, half const* q, half const* k, half const* v,
     float const* input_state, float const* alpha, float const* beta, int64_t const* cu_seqlens,
