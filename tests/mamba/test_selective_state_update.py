@@ -89,6 +89,7 @@ def create_test_inputs(
 @pytest.mark.parametrize("dstate", [64, 128, 256])
 @pytest.mark.parametrize("state_dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("weight_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("use_out_tensor", [False, True])
 def test_selective_state_update(
     batch,
     nheads,
@@ -96,6 +97,7 @@ def test_selective_state_update(
     dstate,
     state_dtype,
     weight_dtype,
+    use_out_tensor,
 ):
     """Test selective_state_update correctness against reference implementation."""
     ngroups = 8
@@ -133,6 +135,12 @@ def test_selective_state_update(
         pad_slot_id=-1,
     )
 
+    # Prepare output tensor if use_out_tensor is True
+    if use_out_tensor:
+        out = torch.empty(batch, nheads, dim, dtype=input_dtype, device="cuda")
+    else:
+        out = None
+
     y_test = flashinfer.mamba.selective_state_update(
         state,
         inputs["x"],
@@ -146,7 +154,14 @@ def test_selective_state_update(
         dt_softplus=delta_softplus,
         state_batch_indices=inputs["slot_idx"],
         pad_slot_id=-1,
+        out=out,
     )
+
+    # Verify the returned tensor is the same object as the provided output tensor
+    if use_out_tensor:
+        assert y_test.data_ptr() == out.data_ptr(), (
+            "Returned tensor should be the same object as the provided output tensor"
+        )
 
     atol = 1e-3
     rtol = 1e-2
@@ -228,7 +243,8 @@ def test_selective_state_update(
     assert states_match
 
 
-def test_selective_state_update_with_z():
+@pytest.mark.parametrize("use_out_tensor", [False, True])
+def test_selective_state_update_with_z(use_out_tensor):
     """Test selective_state_update with z tensor (not None)."""
     batch = 1
     nheads = 8
@@ -271,6 +287,12 @@ def test_selective_state_update_with_z():
         pad_slot_id=-1,
     )
 
+    # Prepare output tensor if use_out_tensor is True
+    if use_out_tensor:
+        out = torch.empty(batch, nheads, dim, dtype=input_dtype, device="cuda")
+    else:
+        out = None
+
     y_test = flashinfer.mamba.selective_state_update(
         state,
         inputs["x"],
@@ -284,7 +306,14 @@ def test_selective_state_update_with_z():
         dt_softplus=delta_softplus,
         state_batch_indices=inputs["slot_idx"],
         pad_slot_id=-1,
+        out=out,
     )
+
+    # Verify the returned tensor is the same object as the provided output tensor
+    if use_out_tensor:
+        assert y_test.data_ptr() == out.data_ptr(), (
+            "Returned tensor should be the same object as the provided output tensor"
+        )
 
     atol = 1e-3
     rtol = 1e-2
