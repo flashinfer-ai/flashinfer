@@ -268,7 +268,7 @@ jobs:
           RUN_ID="${{ github.run_id }}"
           SPOT_TERMINATION=false
           # Include both failed and cancelled jobs (spot termination can cause either)
-          FAILED_JOBS=$(gh api "/repos/${{ github.repository }}/actions/runs/${RUN_ID}/jobs" \
+          FAILED_JOBS=$(gh api "/repos/${{ github.repository }}/actions/runs/${RUN_ID}/jobs?per_page=100" \
             --jq '.jobs[] | select(.name | startswith("AOT")) | select(.conclusion == "failure" or .conclusion == "cancelled") | .id')
           if [ -z "$FAILED_JOBS" ]; then
             echo "is_spot_termination=false" >> $GITHUB_OUTPUT
@@ -458,7 +458,7 @@ jobs:
           RUN_ID="${{ github.run_id }}"
           SPOT_TERMINATION=false
           # Include both failed and cancelled jobs (spot termination can cause either)
-          FAILED_JOBS=$(gh api "/repos/${{ github.repository }}/actions/runs/${RUN_ID}/jobs" \
+          FAILED_JOBS=$(gh api "/repos/${{ github.repository }}/actions/runs/${RUN_ID}/jobs?per_page=100" \
             --jq '.jobs[] | select(.name | contains("A10G")) | select(.conclusion == "failure" or .conclusion == "cancelled") | .id')
           if [ -z "$FAILED_JOBS" ]; then
             echo "is_spot_termination=false" >> $GITHUB_OUTPUT
@@ -632,7 +632,7 @@ jobs:
           RUN_ID="${{ github.run_id }}"
           SPOT_TERMINATION=false
           # Include both failed and cancelled jobs (spot termination can cause either)
-          FAILED_JOBS=$(gh api "/repos/${{ github.repository }}/actions/runs/${RUN_ID}/jobs" \
+          FAILED_JOBS=$(gh api "/repos/${{ github.repository }}/actions/runs/${RUN_ID}/jobs?per_page=100" \
             --jq '.jobs[] | select(.name | contains("T4")) | select(.conclusion == "failure" or .conclusion == "cancelled") | .id')
           if [ -z "$FAILED_JOBS" ]; then
             echo "is_spot_termination=false" >> $GITHUB_OUTPUT
