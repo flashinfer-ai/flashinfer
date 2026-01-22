@@ -79,7 +79,7 @@ jobs:
       - name: Handle @flashinfer-bot run
         if: steps.check-permission.outputs.authorized == 'true' && steps.parse.outputs.command == 'run'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.FLASHINFER_BOT_TOKEN }}
         run: |
           echo "Adding run-ci label to PR #${{ github.event.issue.number }}"
 
@@ -99,7 +99,7 @@ jobs:
       - name: Handle @flashinfer-bot rerun
         if: steps.check-permission.outputs.authorized == 'true' && steps.parse.outputs.command == 'rerun'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.FLASHINFER_BOT_TOKEN }}
         run: |
           echo "Rerunning all jobs for PR #${{ github.event.issue.number }}"
 
@@ -133,7 +133,7 @@ jobs:
       - name: Handle @flashinfer-bot rerun-failed
         if: steps.check-permission.outputs.authorized == 'true' && steps.parse.outputs.command == 'rerun-failed'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.FLASHINFER_BOT_TOKEN }}
         run: |
           echo "Rerunning failed jobs for PR #${{ github.event.issue.number }}"
 
@@ -170,7 +170,7 @@ jobs:
       - name: Unauthorized user
         if: steps.check-permission.outputs.authorized != 'true' && steps.parse.outputs.command != 'unknown'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.FLASHINFER_BOT_TOKEN }}
         run: |
           echo "User ${{ github.event.comment.user.login }} is not authorized"
 
