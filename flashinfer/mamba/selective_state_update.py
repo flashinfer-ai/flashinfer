@@ -23,6 +23,7 @@ from ..api_logging import flashinfer_api
 from ..jit.mamba import (
     gen_selective_state_update_module,
     gen_selective_state_update_sm90_module,
+    gen_selective_state_update_sm100_module,
 )
 from ..utils import get_compute_capability, register_custom_op, register_fake_op
 
@@ -35,14 +36,26 @@ def get_selective_state_update_module_base():
 
 @functools.cache
 def get_selective_state_update_module_sm90():
-    """Get cached JIT-compiled selective_state_update module (SM90+ version)."""
+    """Get cached JIT-compiled selective_state_update module (SM90/Hopper version)."""
     return gen_selective_state_update_sm90_module().build_and_load()
 
 
+@functools.cache
+def get_selective_state_update_module_sm100():
+    """Get cached JIT-compiled selective_state_update module (SM100+/Blackwell version)."""
+    return gen_selective_state_update_sm100_module().build_and_load()
+
+
 def get_selective_state_update_module(device: torch.device):
-    if get_compute_capability(device)[0] >= 9:
+    major, _ = get_compute_capability(device)
+    if major >= 10:
+        # SM100+ (Blackwell and newer) uses horizontal producer-consumer kernel
+        return get_selective_state_update_module_sm100()
+    elif major == 9:
+        # SM90 (Hopper) uses vertical producer-consumer kernel
         return get_selective_state_update_module_sm90()
     else:
+        # Pre-Hopper uses simple kernel
         return get_selective_state_update_module_base()
 
 
