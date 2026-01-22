@@ -97,7 +97,7 @@ jobs:
       - Linux
       - ${{ matrix.arch }}
       - cpu
-    timeout-minutes: 300
+    timeout-minutes: 360
     strategy:
       fail-fast: false
       matrix:
@@ -108,6 +108,10 @@ jobs:
     steps:
       - name: Cleanup
         run: |
+          # Stop all Docker containers to free memory
+          docker stop $(docker ps -q) 2>/dev/null || true
+          docker rm $(docker ps -aq) 2>/dev/null || true
+          # Clean workspace and caches
           sudo rm -rf ${{ github.workspace }}/* || true
           sudo rm -rf ${{ github.workspace }}/.[!.]* || true
           rm -rf ~/.cache/flashinfer_jit || true
@@ -116,6 +120,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: flashinfer
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+        continue-on-error: true  # Don't fail if secret is unavailable (e.g., fork PRs)
 
       - name: Show Node Info
         run: ./scripts/task_show_node_info.sh
@@ -136,7 +147,7 @@ jobs:
     needs: setup
     if: needs.setup.outputs.skip_build != 'true' && github.event.inputs.skip_gpu != 'true'
     runs-on: [self-hosted, Linux, X64, gpu, sm86]
-    timeout-minutes: 300
+    timeout-minutes: 360
     strategy:
       fail-fast: false
       matrix:
@@ -154,12 +165,18 @@ jobs:
           sudo rm -rf ${{ github.workspace }}/.[!.]* || true
           rm -rf ~/.cache/flashinfer_jit || true
           docker system prune -f || true
-          # Verify GPU is free
           nvidia-smi || true
 
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: flashinfer
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+        continue-on-error: true  # Don't fail if secret is unavailable (e.g., fork PRs)
 
       - name: Show Node Info
         run: ./scripts/task_show_node_info.sh
@@ -180,7 +197,7 @@ jobs:
     needs: setup
     if: needs.setup.outputs.skip_build != 'true' && github.event.inputs.skip_gpu != 'true'
     runs-on: [self-hosted, Linux, X64, gpu, sm75]
-    timeout-minutes: 300
+    timeout-minutes: 360
     env:
       DOCKER_IMAGE: flashinfer/flashinfer-ci-cu129:${{ needs.setup.outputs.docker_tag }}
     steps:
@@ -194,12 +211,18 @@ jobs:
           sudo rm -rf ${{ github.workspace }}/.[!.]* || true
           rm -rf ~/.cache/flashinfer_jit || true
           docker system prune -f || true
-          # Verify GPU is free
           nvidia-smi || true
 
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: flashinfer
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+        continue-on-error: true  # Don't fail if secret is unavailable (e.g., fork PRs)
 
       - name: Show Node Info
         run: ./scripts/task_show_node_info.sh

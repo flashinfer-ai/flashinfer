@@ -40,5 +40,5 @@ ec2_metadata public-hostname
 echo "===== RUNNER INFO ====="
 df --human-readable
 lscpu
-free
+free -h
 nvidia-smi 2>/dev/null || echo "cuda not found"
