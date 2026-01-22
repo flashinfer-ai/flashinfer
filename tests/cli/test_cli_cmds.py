@@ -80,7 +80,7 @@ def test_download_cubin_cmd_mocked(monkeypatch):
     assert "All cubin download tasks completed successfully" in out
 
 
-def test_list_cubins_cmd_real(monkeypatch):
+def test_list_cubins_cmd_real():
     out = _test_cmd_helper(["list-cubins"])
     assert "Cubin" in out and "Status" in out
 
