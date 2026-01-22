@@ -201,7 +201,16 @@ jobs:
         run: |
           (
             while true; do
-              if curl -sf http://169.254.169.254/latest/meta-data/spot/instance-action 2>/dev/null | grep -q "terminate"; then
+              # Support both IMDSv2 (token-based) and IMDSv1 (legacy)
+              IMDS_URL="http://169.254.169.254/latest/meta-data/spot/instance-action"
+              TOKEN=$(curl -s --max-time 2 -X PUT "http://169.254.169.254/latest/api/token" \
+                -H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>/dev/null || true)
+              if [ -n "$TOKEN" ]; then
+                META=$(curl -sf --max-time 2 -H "X-aws-ec2-metadata-token: $TOKEN" "$IMDS_URL" 2>/dev/null || true)
+              else
+                META=$(curl -sf --max-time 2 "$IMDS_URL" 2>/dev/null || true)
+              fi
+              if echo "$META" | grep -q "terminate"; then
                 echo "::error::FLASHINFER_SPOT_TERMINATION_DETECTED"
                 echo "AWS Spot Termination Notice received at $(date)"
                 exit 0
@@ -245,7 +254,7 @@ jobs:
   analyze-aot-failure:
     name: Analyze AOT Failure
     needs: [setup, aot-build-import]
-    if: !cancelled() && needs.aot-build-import.result == 'failure'
+    if: "!cancelled() && (needs.aot-build-import.result == 'failure' || needs.aot-build-import.result == 'cancelled')"
     runs-on: ubuntu-latest
     outputs:
       is_spot_termination: ${{ steps.analyze.outputs.is_spot_termination }}
@@ -258,15 +267,23 @@ jobs:
         run: |
           RUN_ID="${{ github.run_id }}"
           SPOT_TERMINATION=false
+          # Include both failed and cancelled jobs (spot termination can cause either)
           FAILED_JOBS=$(gh api "/repos/${{ github.repository }}/actions/runs/${RUN_ID}/jobs" \
-            --jq '.jobs[] | select(.name | startswith("AOT")) | select(.conclusion == "failure") | .id')
+            --jq '.jobs[] | select(.name | startswith("AOT")) | select(.conclusion == "failure" or .conclusion == "cancelled") | .id')
           if [ -z "$FAILED_JOBS" ]; then
             echo "is_spot_termination=false" >> $GITHUB_OUTPUT
             exit 0
           fi
           for JOB_ID in $FAILED_JOBS; do
-            if ! gh api "/repos/${{ github.repository }}/actions/jobs/${JOB_ID}/logs" > job_log.txt 2>/dev/null; then
+            # Download logs (may be ZIP or plain text depending on GitHub API)
+            if ! gh api "/repos/${{ github.repository }}/actions/jobs/${JOB_ID}/logs" > job_log.zip 2>/dev/null; then
               continue
+            fi
+            # Try to unzip if it's a ZIP file, otherwise use as-is
+            if file job_log.zip | grep -q "Zip archive"; then
+              unzip -p job_log.zip > job_log.txt 2>/dev/null || mv job_log.zip job_log.txt
+            else
+              mv job_log.zip job_log.txt
             fi
             if grep -q "FLASHINFER_SPOT_TERMINATION_DETECTED" job_log.txt; then
               echo "Detected: AWS spot termination marker (job $JOB_ID)"
@@ -373,7 +390,16 @@ jobs:
         run: |
           (
             while true; do
-              if curl -sf http://169.254.169.254/latest/meta-data/spot/instance-action 2>/dev/null | grep -q "terminate"; then
+              # Support both IMDSv2 (token-based) and IMDSv1 (legacy)
+              IMDS_URL="http://169.254.169.254/latest/meta-data/spot/instance-action"
+              TOKEN=$(curl -s --max-time 2 -X PUT "http://169.254.169.254/latest/api/token" \
+                -H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>/dev/null || true)
+              if [ -n "$TOKEN" ]; then
+                META=$(curl -sf --max-time 2 -H "X-aws-ec2-metadata-token: $TOKEN" "$IMDS_URL" 2>/dev/null || true)
+              else
+                META=$(curl -sf --max-time 2 "$IMDS_URL" 2>/dev/null || true)
+              fi
+              if echo "$META" | grep -q "terminate"; then
                 echo "::error::FLASHINFER_SPOT_TERMINATION_DETECTED"
                 echo "AWS Spot Termination Notice received at $(date)"
                 exit 0
@@ -418,7 +444,7 @@ jobs:
   analyze-gpu-a10g-failure:
     name: Analyze GPU A10G Failure
     needs: [setup, gpu-tests-a10g]
-    if: !cancelled() && needs.gpu-tests-a10g.result == 'failure'
+    if: "!cancelled() && (needs.gpu-tests-a10g.result == 'failure' || needs.gpu-tests-a10g.result == 'cancelled')"
     runs-on: ubuntu-latest
     outputs:
       is_spot_termination: ${{ steps.analyze.outputs.is_spot_termination }}
@@ -431,15 +457,23 @@ jobs:
         run: |
           RUN_ID="${{ github.run_id }}"
           SPOT_TERMINATION=false
+          # Include both failed and cancelled jobs (spot termination can cause either)
           FAILED_JOBS=$(gh api "/repos/${{ github.repository }}/actions/runs/${RUN_ID}/jobs" \
-            --jq '.jobs[] | select(.name | contains("A10G")) | select(.conclusion == "failure") | .id')
+            --jq '.jobs[] | select(.name | contains("A10G")) | select(.conclusion == "failure" or .conclusion == "cancelled") | .id')
           if [ -z "$FAILED_JOBS" ]; then
             echo "is_spot_termination=false" >> $GITHUB_OUTPUT
             exit 0
           fi
           for JOB_ID in $FAILED_JOBS; do
-            if ! gh api "/repos/${{ github.repository }}/actions/jobs/${JOB_ID}/logs" > job_log.txt 2>/dev/null; then
+            # Download logs (may be ZIP or plain text depending on GitHub API)
+            if ! gh api "/repos/${{ github.repository }}/actions/jobs/${JOB_ID}/logs" > job_log.zip 2>/dev/null; then
               continue
+            fi
+            # Try to unzip if it's a ZIP file, otherwise use as-is
+            if file job_log.zip | grep -q "Zip archive"; then
+              unzip -p job_log.zip > job_log.txt 2>/dev/null || mv job_log.zip job_log.txt
+            else
+              mv job_log.zip job_log.txt
             fi
             if grep -q "FLASHINFER_SPOT_TERMINATION_DETECTED" job_log.txt; then
               echo "Detected: AWS spot termination marker (job $JOB_ID)"
@@ -531,7 +565,16 @@ jobs:
         run: |
           (
             while true; do
-              if curl -sf http://169.254.169.254/latest/meta-data/spot/instance-action 2>/dev/null | grep -q "terminate"; then
+              # Support both IMDSv2 (token-based) and IMDSv1 (legacy)
+              IMDS_URL="http://169.254.169.254/latest/meta-data/spot/instance-action"
+              TOKEN=$(curl -s --max-time 2 -X PUT "http://169.254.169.254/latest/api/token" \
+                -H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>/dev/null || true)
+              if [ -n "$TOKEN" ]; then
+                META=$(curl -sf --max-time 2 -H "X-aws-ec2-metadata-token: $TOKEN" "$IMDS_URL" 2>/dev/null || true)
+              else
+                META=$(curl -sf --max-time 2 "$IMDS_URL" 2>/dev/null || true)
+              fi
+              if echo "$META" | grep -q "terminate"; then
                 echo "::error::FLASHINFER_SPOT_TERMINATION_DETECTED"
                 echo "AWS Spot Termination Notice received at $(date)"
                 exit 0
@@ -576,7 +619,7 @@ jobs:
   analyze-gpu-t4-failure:
     name: Analyze GPU T4 Failure
     needs: [setup, gpu-tests-t4]
-    if: !cancelled() && needs.gpu-tests-t4.result == 'failure'
+    if: "!cancelled() && (needs.gpu-tests-t4.result == 'failure' || needs.gpu-tests-t4.result == 'cancelled')"
     runs-on: ubuntu-latest
     outputs:
       is_spot_termination: ${{ steps.analyze.outputs.is_spot_termination }}
@@ -588,15 +631,23 @@ jobs:
         run: |
           RUN_ID="${{ github.run_id }}"
           SPOT_TERMINATION=false
+          # Include both failed and cancelled jobs (spot termination can cause either)
           FAILED_JOBS=$(gh api "/repos/${{ github.repository }}/actions/runs/${RUN_ID}/jobs" \
-            --jq '.jobs[] | select(.name | contains("T4")) | select(.conclusion == "failure") | .id')
+            --jq '.jobs[] | select(.name | contains("T4")) | select(.conclusion == "failure" or .conclusion == "cancelled") | .id')
           if [ -z "$FAILED_JOBS" ]; then
             echo "is_spot_termination=false" >> $GITHUB_OUTPUT
             exit 0
           fi
           for JOB_ID in $FAILED_JOBS; do
-            if ! gh api "/repos/${{ github.repository }}/actions/jobs/${JOB_ID}/logs" > job_log.txt 2>/dev/null; then
+            # Download logs (may be ZIP or plain text depending on GitHub API)
+            if ! gh api "/repos/${{ github.repository }}/actions/jobs/${JOB_ID}/logs" > job_log.zip 2>/dev/null; then
               continue
+            fi
+            # Try to unzip if it's a ZIP file, otherwise use as-is
+            if file job_log.zip | grep -q "Zip archive"; then
+              unzip -p job_log.zip > job_log.txt 2>/dev/null || mv job_log.zip job_log.txt
+            else
+              mv job_log.zip job_log.txt
             fi
             if grep -q "FLASHINFER_SPOT_TERMINATION_DETECTED" job_log.txt; then
               echo "Detected: AWS spot termination marker (job $JOB_ID)"
