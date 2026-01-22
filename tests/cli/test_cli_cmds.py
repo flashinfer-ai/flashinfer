@@ -150,5 +150,36 @@ def test_clear_cubin_cmd_mocked(monkeypatch):
     assert "Cubin cleared successfully" in out
 
 
-# TODO: add test that actually clears the cubins
-# need to check that there aren't side effects if we do this
+def test_clear_cubin_cmd_real(monkeypatch, tmp_path):
+    """
+    Test that clear-cubin command actually clears the cubin directory.
+
+    Uses a temporary directory to avoid side effects on the real cubins.
+    """
+    # Create a temporary cubin directory with some dummy cubin files
+    temp_cubin_dir = tmp_path / "cubins"
+    temp_cubin_dir.mkdir(parents=True, exist_ok=True)
+
+    # Create some dummy cubin files to simulate real cubins
+    dummy_cubin_subdir = temp_cubin_dir / "trtllm_gen_fmha"
+    dummy_cubin_subdir.mkdir(parents=True, exist_ok=True)
+    (dummy_cubin_subdir / "test_kernel.cubin").write_text("dummy cubin data")
+    (dummy_cubin_subdir / "checksums.txt").write_text("abc123 test_kernel.cubin")
+
+    # Monkeypatch FLASHINFER_CUBIN_DIR to point to our temp directory
+    # Need to patch it in multiple places where it's imported
+    monkeypatch.setattr("flashinfer.artifacts.FLASHINFER_CUBIN_DIR", temp_cubin_dir)
+    monkeypatch.setattr(
+        "flashinfer.jit.cubin_loader.FLASHINFER_CUBIN_DIR", temp_cubin_dir
+    )
+
+    # Verify the cubin directory exists before clearing
+    assert temp_cubin_dir.exists()
+    assert (dummy_cubin_subdir / "test_kernel.cubin").exists()
+
+    # Run the clear-cubin command
+    out = _test_cmd_helper(["clear-cubin"])
+    assert "Cubin cleared successfully" in out
+
+    # Verify the cubin directory has been removed
+    assert not temp_cubin_dir.exists()
