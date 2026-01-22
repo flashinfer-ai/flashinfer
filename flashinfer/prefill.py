@@ -625,6 +625,7 @@ def get_batch_prefill_module(backend, *args):
         cum_seq_lens_q: Optional[torch.Tensor] = None,
         cum_seq_lens_kv: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
+        skip_softmax_threshold_scale_factor: Optional[float] = None,
     ) -> None:
         if backend == "trtllm-gen":
             assert maybe_lse is None
@@ -658,6 +659,7 @@ def get_batch_prefill_module(backend, *args):
                 window_left,
                 out=o,
                 sinks=sinks,
+                skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
             )
         elif backend == "fa2":
             assert not is_float8(q)
@@ -2062,6 +2064,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         enable_pdl: Optional[bool] = None,
         window_left: Optional[int] = None,
         sinks: Optional[torch.Tensor] = None,
+        skip_softmax_threshold_scale_factor: Optional[float] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch prefill/append attention between query and paged kv-cache.
 
@@ -2274,6 +2277,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     self._qo_indptr_buf,
                     self._paged_kv_indptr_buf,
                     sinks,
+                    skip_softmax_threshold_scale_factor,
                 ]
 
             assert self._cached_module is not None, "cached module is not initialized"
