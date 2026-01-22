@@ -66,6 +66,7 @@ from .jit.mla import gen_mla_module
 from .jit.mamba import (
     gen_selective_state_update_module,
     gen_selective_state_update_sm90_module,
+    gen_selective_state_update_sm100_module,
 )
 from .jit.norm import gen_norm_module
 from .jit.page import gen_page_module
@@ -543,6 +544,8 @@ def gen_all_modules(
             jit_specs.append(gen_selective_state_update_sm90_module())
             jit_specs.append(gen_trtllm_utils_module())
             jit_specs.append(gen_gdn_prefill_sm90_module())
+        if has_sm100:
+            jit_specs.append(gen_selective_state_update_sm100_module())
 
     if (
         add_xqa and get_cuda_version() > Version("12.8")
