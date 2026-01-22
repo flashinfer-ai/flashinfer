@@ -107,8 +107,35 @@ def test_clear_cache_cmd_mocked(monkeypatch):
     assert "Cache cleared successfully" in out
 
 
-# TODO: add test that actually clears the cache
-# need to check that there aren't side effects if we do this
+def test_clear_cache_cmd_real(monkeypatch, tmp_path):
+    """
+    Test that clear-cache command actually clears the cache directory.
+
+    Uses a temporary directory to avoid side effects on the real cache.
+    """
+    # Create a temporary JIT directory with some dummy cache files
+    temp_jit_dir = tmp_path / "cached_ops"
+    temp_jit_dir.mkdir(parents=True, exist_ok=True)
+
+    # Create some dummy cached files to simulate a real cache
+    dummy_module_dir = temp_jit_dir / "test_module_abc123"
+    dummy_module_dir.mkdir(parents=True, exist_ok=True)
+    (dummy_module_dir / "test_module.so").write_text("dummy shared library")
+    (dummy_module_dir / "build.ninja").write_text("dummy build file")
+
+    # Monkeypatch the FLASHINFER_JIT_DIR to point to our temp directory
+    monkeypatch.setattr("flashinfer.jit.core.jit_env.FLASHINFER_JIT_DIR", temp_jit_dir)
+
+    # Verify the cache directory exists before clearing
+    assert temp_jit_dir.exists()
+    assert (dummy_module_dir / "test_module.so").exists()
+
+    # Run the clear-cache command
+    out = _test_cmd_helper(["clear-cache"])
+    assert "Cache cleared successfully" in out
+
+    # Verify the cache directory has been removed
+    assert not temp_jit_dir.exists()
 
 
 def test_clear_cubin_cmd_mocked(monkeypatch):
