@@ -63,14 +63,14 @@ jobs:
 
       - name: Parse command
         id: parse
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
         run: |
-          BODY="${{ github.event.comment.body }}"
-
-          if echo "$BODY" | grep -qi "@flashinfer-bot run-failed\|@flashinfer-bot rerun-failed"; then
+          if echo "$COMMENT_BODY" | grep -qi "@flashinfer-bot run-failed\|@flashinfer-bot rerun-failed"; then
             echo "command=rerun-failed" >> "$GITHUB_OUTPUT"
-          elif echo "$BODY" | grep -qi "@flashinfer-bot rerun"; then
+          elif echo "$COMMENT_BODY" | grep -qi "@flashinfer-bot rerun"; then
             echo "command=rerun" >> "$GITHUB_OUTPUT"
-          elif echo "$BODY" | grep -qi "@flashinfer-bot run"; then
+          elif echo "$COMMENT_BODY" | grep -qi "@flashinfer-bot run"; then
             echo "command=run" >> "$GITHUB_OUTPUT"
           else
             echo "command=unknown" >> "$GITHUB_OUTPUT"
