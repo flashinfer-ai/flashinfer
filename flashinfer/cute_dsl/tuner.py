@@ -29,7 +29,6 @@ Reference: TensorRT-LLM/tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py
 - Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner.get_valid_tactics (line 1163)
 """
 
-import functools
 import itertools
 from typing import Any, Callable, Dict, List, Tuple
 
@@ -228,6 +227,14 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         - gemm1_tactic: (mma_tiler_mn, cluster_shape_mn, raster_along_m)
         - gemm2_tactic: (mma_tiler_mn, cluster_shape_mn, raster_along_m)
 
+    Input tensor indices (for dynamic_tensor_specs):
+        0: x (num_tokens, hidden_size//2) - FP4 packed input
+        1: x_sf (num_tokens, hidden_size//sf_vec_size) - input scale factors
+        2: token_selected_experts (num_tokens, top_k) - expert assignments
+        3: token_final_scales (num_tokens, top_k) - routing weights
+        4-10: weight tensors (fixed size, don't depend on num_tokens)
+        11: moe_output (num_tokens, hidden_size) - output buffer
+
     Args:
         forward_impl: The actual MoE implementation function.
         num_experts: Total number of experts.
@@ -238,46 +245,40 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         output_dtype: Output data type (default: torch.bfloat16).
     """
 
-    # Custom tensor initializers for profiling (indices 0-3 are dynamic)
-    # Input tensor indices:
-    # 0: x (num_tokens, hidden_size//2) - packed FP4
-    # 1: x_sf (num_tokens, hidden_size//sf_vec_size) - FP8 scale factors
-    # 2: token_selected_experts (num_tokens, top_k) - int32
-    # 3: token_final_scales (num_tokens, top_k) - float32
+    # Tensor initializers for dynamic tensors (indices 0, 1, 2, 3, 11)
+    # These create valid dummy tensors for profiling with different num_tokens
     dynamic_tensor_initializers = [
-        # x: FP4 quantized input (uint8 packed)
+        # 0: x - FP4 quantized input (uint8 packed)
         lambda shapes, dtype, device: torch.randint(
             0, 256, shapes, dtype=torch.uint8, device=device
         ),
-        # x_sf: FP8 scale factors (uint8)
+        # 1: x_sf - FP8 scale factors (uint8)
         lambda shapes, dtype, device: torch.randint(
             1, 128, shapes, dtype=torch.uint8, device=device
         ),
-        # token_selected_experts: expert indices (int32)
+        # 2: token_selected_experts - expert indices (int32, 0 to num_experts-1)
         lambda shapes, dtype, device: torch.randint(
             0,
             8,
             shapes,
             dtype=torch.int32,
-            device=device,  # num_experts=8 is typical
+            device=device,  # num_experts=8 typical
         ),
-        # token_final_scales: routing weights (float32)
+        # 3: token_final_scales - routing weights (float32, softmax normalized)
         lambda shapes, dtype, device: torch.softmax(
             torch.randn(shapes, device=device), dim=-1
         ).to(torch.float32),
+        # 11: moe_output - output buffer (bfloat16)
+        lambda shapes, dtype, device: torch.empty(shapes, dtype=dtype, device=device),
     ]
 
-    # Default tuning config - will be updated by refine_tuning_config
+    # Tuning config with dynamic tensor specs for num_tokens dimension
+    # Indices 0, 1, 2, 3, 11 all have num_tokens as their first dimension
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(
             DynamicTensorSpec(
-                input_idx=(
-                    0,
-                    1,
-                    2,
-                    3,
-                ),  # x, x_sf, token_selected_experts, token_final_scales
-                dim_idx=(0, 0, 0, 0),  # First dimension is num_tokens for all
+                input_idx=(0, 1, 2, 3, 11),  # x, x_sf, experts, scales, moe_output
+                dim_idx=(0, 0, 0, 0, 0),  # First dimension is num_tokens for all
                 gen_tuning_buckets=get_last_power_of_2_num_tokens_buckets(8192),
                 map_to_tuning_buckets=lambda x: min(last_positive_power_of_2(x), 8192),
                 tensor_initializers=dynamic_tensor_initializers,
@@ -313,33 +314,6 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                 self.use_fused_finalize,
                 self.output_dtype,
             )
-        )
-
-    @classmethod
-    @functools.lru_cache(maxsize=None)
-    def refine_tuning_config(cls, tune_max_num_tokens: int):
-        """Refine the tuning config with a specific max_num_tokens.
-
-        This method updates the class-level tuning_config with a new
-        bucket range. Results are cached via lru_cache.
-
-        Args:
-            tune_max_num_tokens: Maximum number of tokens for tuning buckets.
-        """
-        cls.tuning_config = TuningConfig(
-            dynamic_tensor_specs=(
-                DynamicTensorSpec(
-                    input_idx=(0, 1, 2, 3),
-                    dim_idx=(0, 0, 0, 0),
-                    gen_tuning_buckets=get_last_power_of_2_num_tokens_buckets(
-                        tune_max_num_tokens
-                    ),
-                    map_to_tuning_buckets=lambda x: min(
-                        last_positive_power_of_2(x), tune_max_num_tokens
-                    ),
-                    tensor_initializers=cls.dynamic_tensor_initializers,
-                ),
-            ),
         )
 
     def get_valid_tactics(  # type: ignore[override]

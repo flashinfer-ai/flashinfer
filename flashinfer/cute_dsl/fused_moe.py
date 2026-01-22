@@ -233,8 +233,6 @@ def cute_dsl_fused_moe_nvfp4(
     moe_output: Optional[torch.Tensor] = None,
     # Stream optimization (for fused finalize)
     aux_stream: Optional[torch.cuda.Stream] = None,
-    # Auto-tuning
-    tune_max_num_tokens: int = 8192,
 ) -> torch.Tensor:
     """
     Run fused MoE computation using CuteDSL NVFP4 kernels on Blackwell GPUs.
@@ -289,8 +287,6 @@ def cute_dsl_fused_moe_nvfp4(
                     If None, will be allocated.
         aux_stream: Auxiliary CUDA stream for moe_output_memset.
                     If None and use_fused_finalize, a new stream will be created.
-        tune_max_num_tokens: Maximum number of tokens for auto-tuning. Default: 8192.
-                            Controls the range of power-of-2 buckets used for tuning.
 
     Returns:
         Output tensor. Shape: [num_tokens, hidden_size]. Dtype: output_dtype.
@@ -345,9 +341,8 @@ def cute_dsl_fused_moe_nvfp4(
             device=x.device,
         )
 
-    # Get auto-tuner and refine tuning config based on tune_max_num_tokens
+    # Get auto-tuner
     tuner = AutoTuner.get()
-    CuteDslFusedMoENvfp4Runner.refine_tuning_config(tune_max_num_tokens)
 
     runner = CuteDslFusedMoENvfp4Runner(
         forward_impl=_cute_dsl_fused_moe_nvfp4_impl,
