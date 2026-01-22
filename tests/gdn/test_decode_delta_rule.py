@@ -42,6 +42,13 @@ from flashinfer.gdn_decode import (
 from flashinfer.utils import get_compute_capability
 
 
+def _skip_if_not_sm90_or_later():
+    """Skip test if not Hopper (SM90+) or Blackwell (SM100+) architecture."""
+    cc = get_compute_capability(torch.device("cuda"))
+    if cc[0] not in [9, 10, 11, 12]:
+        pytest.skip(f"GDN decode requires SM90+ or SM100+, but got SM{cc[0]}{cc[1]}")
+
+
 # ============================================================================
 # Test decode kernel with pretranspose version ([B*HV, V, K])
 # ============================================================================
@@ -60,14 +67,7 @@ def _test_decode_kernel_pretranspose(
     seed: int | None = None,
 ):
     """Test single decode step"""
-
-    # Check GPU architecture: require Hopper (SM90/SM90a) or Blackwell (SM100+)
-    compute_capability = get_compute_capability(torch.device("cuda"))
-    if compute_capability[0] not in [9, 10, 11, 12]:
-        pytest.skip(
-            f"GDN decode tests require Hopper (SM90+) or Blackwell (SM100+) architecture, "
-            f"but got SM{compute_capability[0]}{compute_capability[1]}"
-        )
+    _skip_if_not_sm90_or_later()
 
     random.seed(seed)
     torch.random.manual_seed(seed)
@@ -239,14 +239,7 @@ def _test_decode_kernel_nontranspose(
     seed: int | None = None,
 ):
     """Test single decode step with nontranspose version (K-major layout)"""
-
-    # Check GPU architecture: require Hopper (SM90/SM90a) or Blackwell (SM100+)
-    compute_capability = get_compute_capability(torch.device("cuda"))
-    if compute_capability[0] not in [9, 10, 11, 12]:
-        pytest.skip(
-            f"GDN decode tests require Hopper (SM90+) or Blackwell (SM100+) architecture, "
-            f"but got SM{compute_capability[0]}{compute_capability[1]}"
-        )
+    _skip_if_not_sm90_or_later()
 
     random.seed(seed)
     torch.random.manual_seed(seed)
@@ -413,14 +406,7 @@ def _test_verify_kernel_mtp(
     seed: int = 0,
 ):
     """Test gated_delta_rule_mtp API (MTP version) against reference."""
-
-    # Check GPU architecture: require Hopper (SM90/SM90a) or Blackwell (SM100+)
-    compute_capability = get_compute_capability(torch.device("cuda"))
-    if compute_capability[0] not in [9, 10, 11, 12]:
-        pytest.skip(
-            f"GDN decode tests require Hopper (SM90+) or Blackwell (SM100+) architecture, "
-            f"but got SM{compute_capability[0]}{compute_capability[1]}"
-        )
+    _skip_if_not_sm90_or_later()
 
     import math
 

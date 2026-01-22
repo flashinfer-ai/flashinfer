@@ -19,20 +19,6 @@ import functools
 import pytest
 import torch
 
-from flashinfer.utils import get_compute_capability
-
-
-@pytest.fixture(autouse=True)
-def skip_if_not_supported_arch():
-    """Skip GDN tests if not Hopper (SM90+) or Blackwell (SM100+) architecture."""
-    compute_capability = get_compute_capability(torch.device("cuda"))
-    major = compute_capability[0]
-    if major not in [9, 10, 11, 12]:
-        pytest.skip(
-            f"GDN requires Hopper (SM90+) or Blackwell (SM100+) architecture, "
-            f"but got SM{compute_capability[0]}{compute_capability[1]}"
-        )
-
 
 def multidist_randn(
     num_dists, dim, mean_mean=0.0, mean_std=1.0, scale_lower=0.5, scale_upper=1.5
