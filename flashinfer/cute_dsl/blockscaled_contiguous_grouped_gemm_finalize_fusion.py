@@ -53,6 +53,7 @@ from .utils import (
     get_cutlass_dtype,
     cutlass_to_torch_dtype,
     get_num_sm,
+    get_max_active_clusters,
     make_ptr,
 )
 
@@ -416,9 +417,8 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
     if sm_count is None:
         sm_count = get_num_sm(a.device)
 
-    # Compute max active clusters
-    hardware_info = cutlass.utils.HardwareInfo()
-    max_active_clusters = hardware_info.get_max_active_clusters(
+    # Compute max active clusters (cached to avoid expensive HardwareInfo queries)
+    max_active_clusters = get_max_active_clusters(
         cluster_shape_mn[0] * cluster_shape_mn[1]
     )
 

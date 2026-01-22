@@ -50,6 +50,7 @@ from .utils import (
     get_cutlass_dtype,
     cutlass_to_torch_dtype,
     get_num_sm,
+    get_max_active_clusters,
 )
 
 # Import the TRT-LLM kernel implementation
@@ -430,9 +431,8 @@ def blockscaled_contiguous_grouped_gemm_nvfp4(
         cluster_shape_mn=cluster_shape_mn,
     )
 
-    # Compute max active clusters
-    hardware_info = cutlass.utils.HardwareInfo()
-    max_active_clusters = hardware_info.get_max_active_clusters(
+    # Compute max active clusters (cached to avoid expensive HardwareInfo queries)
+    max_active_clusters = get_max_active_clusters(
         cluster_shape_mn[0] * cluster_shape_mn[1]
     )
 

@@ -81,6 +81,35 @@ def get_num_sm(device: torch.device) -> int:
     return torch.cuda.get_device_properties(device).multi_processor_count
 
 
+# Cache for HardwareInfo - it's expensive to create on every call
+_hardware_info_cache: "cutlass.utils.HardwareInfo | None" = None
+
+
+def get_hardware_info() -> "cutlass.utils.HardwareInfo":
+    """Get cached HardwareInfo singleton.
+
+    HardwareInfo queries CUDA device capabilities, which can be expensive.
+    This function caches the singleton to avoid repeated queries.
+    """
+    global _hardware_info_cache
+    if _hardware_info_cache is None:
+        _hardware_info_cache = cutlass.utils.HardwareInfo()
+    return _hardware_info_cache
+
+
+@functools.cache
+def get_max_active_clusters(cluster_size: int) -> int:
+    """Get max active clusters for a given cluster size (cached).
+
+    Args:
+        cluster_size: Product of cluster_shape_mn dimensions.
+
+    Returns:
+        Maximum number of active clusters supported by hardware.
+    """
+    return get_hardware_info().get_max_active_clusters(cluster_size)
+
+
 # WAR for CuTeDSL make_ptr implementation for flashinfer
 class _Pointer(Pointer):
     """Runtime representation of a pointer that can inter-operate with
