@@ -269,14 +269,17 @@ jobs:
               continue
             fi
             if grep -q "FLASHINFER_SPOT_TERMINATION_DETECTED" job_log.txt; then
+              echo "Detected: AWS spot termination marker (job $JOB_ID)"
               SPOT_TERMINATION=true
               break
             fi
             if grep -qiE "connection reset by peer|context canceled|grpc.*closing|The self-hosted runner.*lost" job_log.txt; then
+              echo "Detected: infrastructure error pattern (job $JOB_ID)"
               SPOT_TERMINATION=true
               break
             fi
           done
+          echo "is_spot_termination=$SPOT_TERMINATION"
           echo "is_spot_termination=$SPOT_TERMINATION" >> $GITHUB_OUTPUT
 
       - name: Build rerun matrix
@@ -439,14 +442,17 @@ jobs:
               continue
             fi
             if grep -q "FLASHINFER_SPOT_TERMINATION_DETECTED" job_log.txt; then
+              echo "Detected: AWS spot termination marker (job $JOB_ID)"
               SPOT_TERMINATION=true
               break
             fi
             if grep -qiE "connection reset by peer|context canceled|grpc.*closing|The self-hosted runner.*lost" job_log.txt; then
+              echo "Detected: infrastructure error pattern (job $JOB_ID)"
               SPOT_TERMINATION=true
               break
             fi
           done
+          echo "is_spot_termination=$SPOT_TERMINATION"
           echo "is_spot_termination=$SPOT_TERMINATION" >> $GITHUB_OUTPUT
 
       - name: Build rerun matrix
@@ -593,14 +599,17 @@ jobs:
               continue
             fi
             if grep -q "FLASHINFER_SPOT_TERMINATION_DETECTED" job_log.txt; then
+              echo "Detected: AWS spot termination marker (job $JOB_ID)"
               SPOT_TERMINATION=true
               break
             fi
             if grep -qiE "connection reset by peer|context canceled|grpc.*closing|The self-hosted runner.*lost" job_log.txt; then
+              echo "Detected: infrastructure error pattern (job $JOB_ID)"
               SPOT_TERMINATION=true
               break
             fi
           done
+          echo "is_spot_termination=$SPOT_TERMINATION"
           echo "is_spot_termination=$SPOT_TERMINATION" >> $GITHUB_OUTPUT
 
   gpu-tests-t4-rerun:
