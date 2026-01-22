@@ -69,7 +69,7 @@ jobs:
 
           # Check if PR author is a member of ci-users team
           AUTHOR="${{ github.event.pull_request.user.login }}"
-          ORG="flashinfer-ai"
+          ORG="${{ github.repository_owner }}"
           TEAM="ci-users"
 
           echo "Checking if $AUTHOR is a member of $ORG/$TEAM..."

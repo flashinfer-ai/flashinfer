@@ -28,7 +28,7 @@ jobs:
         id: check-permission
         env:
           GH_TOKEN: ${{ secrets.FLASHINFER_GITHUB_TOKEN }}
-          ORG: flashinfer-ai
+          ORG: ${{ github.repository_owner }}
           TEAM: ci-users
           ACTOR: ${{ github.event.comment.user.login }}
         run: |
