@@ -426,6 +426,12 @@ def _test_trtllm_batch_prefill(
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] != 10:
         pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+
+    if skips_softmax and q_dtype != kv_dtype:
+        pytest.skip(
+            "skips_softmax does not currently support Q and Kv types being different"
+        )
+
     # Set up test parameters
     torch.manual_seed(0)
 
@@ -775,6 +781,7 @@ def _test_trtllm_batch_decode(
     device_scale=False,
     max_q_len=None,
     non_contiguous_query=False,
+    skips_softmax=False,
 ):
     """
     Common function for testing trtllm-gen decode.
@@ -788,6 +795,14 @@ def _test_trtllm_batch_decode(
         pytest.skip("trtllm-gen backend requires SM100 and SM103 GPUs.")
     if backend == "xqa" and compute_capability[0] < 9:
         pytest.skip("xqa backend requires SM90+ GPUs.")
+
+    if backend == "xqa" and skips_softmax:
+        pytest.skip("xqa backend does not support skips_softmax")
+
+    if skips_softmax and q_dtype != kv_dtype:
+        pytest.skip(
+            "skips_softmax does not currently support Q and Kv types being different"
+        )
 
     # xqa backend doesn't support nvfp4 output
     if backend == "xqa" and o_dtype == "nvfp4":
@@ -944,6 +959,9 @@ def _test_trtllm_batch_decode(
     else:
         q_input = q.contiguous()
 
+    # Using 0.0 threshold should give the same result as normal attention.
+    skip_softmax_threshold_scale_factor = 0.0 if skips_softmax else None
+
     output = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
         q_input,
         kv_cache,
@@ -967,6 +985,7 @@ def _test_trtllm_batch_decode(
         mask=mask,
         max_q_len=max_q_len if max_q_len is not None else None,
         cum_seq_lens_q=q_indptr if max_q_len is not None else None,
+        skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
     )
     if backend == "trtllm-gen":
         # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
@@ -1112,6 +1131,7 @@ def _test_trtllm_batch_decode(
 @pytest.mark.parametrize("max_in_kv_len", [110])
 @pytest.mark.parametrize("head_dim", [128])
 @pytest.mark.parametrize("non_contiguous_query", [False, True])
+@pytest.mark.parametrize("skips_softmax", [True])
 def test_trtllm_batch_decode(
     backend,
     kv_layout,
@@ -1129,6 +1149,7 @@ def test_trtllm_batch_decode(
     max_in_kv_len,
     head_dim,
     non_contiguous_query,
+    skips_softmax,
 ):
     # xqa backend does not support non-contiguous query yet
     if backend == "xqa" and non_contiguous_query:
@@ -1153,6 +1174,7 @@ def test_trtllm_batch_decode(
         head_dim,
         kv_dtype == "fp8",
         non_contiguous_query=non_contiguous_query,
+        skips_softmax=skips_softmax,
     )
 
 
@@ -1176,6 +1198,7 @@ def test_trtllm_batch_decode(
 @pytest.mark.parametrize("max_in_kv_len", [4096, 8192])
 @pytest.mark.parametrize("head_dim", [128])
 @pytest.mark.parametrize("device_scale", [True, False])
+@pytest.mark.parametrize("skips_softmax", [False, True])
 def test_trtllm_batch_decode_bs1(
     kv_layout,
     batch_size,
@@ -1192,6 +1215,7 @@ def test_trtllm_batch_decode_bs1(
     max_in_kv_len,
     head_dim,
     device_scale,
+    skips_softmax,
 ):
     # Small number of test cases for batch size 1
     _test_trtllm_batch_decode(
@@ -1211,6 +1235,7 @@ def test_trtllm_batch_decode_bs1(
         max_in_kv_len,
         head_dim,
         device_scale,
+        skips_softmax=skips_softmax,
     )
 
 
@@ -1244,6 +1269,7 @@ def test_trtllm_batch_decode_bs1(
 @pytest.mark.parametrize("max_in_kv_len", [110])
 @pytest.mark.parametrize("head_dim", [256])
 @pytest.mark.parametrize("device_scale", [True, False])
+@pytest.mark.parametrize("skips_softmax", [False, True])
 def test_trtllm_batch_decode_head_dim_256(
     kv_layout,
     batch_size,
@@ -1260,6 +1286,7 @@ def test_trtllm_batch_decode_head_dim_256(
     max_in_kv_len,
     head_dim,
     device_scale,
+    skips_softmax,
 ):
     # Small number of test cases for head_dim = 256
     _test_trtllm_batch_decode(
@@ -1279,6 +1306,7 @@ def test_trtllm_batch_decode_head_dim_256(
         max_in_kv_len,
         head_dim,
         device_scale,
+        skips_softmax=skips_softmax,
     )
 
 
@@ -1553,6 +1581,7 @@ def make_query_non_contiguous(q, num_qo_heads, head_dim):
 @pytest.mark.parametrize("enable_sink", [True, False])
 @pytest.mark.parametrize("max_in_kv_len", [110])
 @pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("skips_softmax", [False, True])
 def test_trtllm_batch_decode_spec(
     backend,
     kv_layout,
@@ -1569,6 +1598,7 @@ def test_trtllm_batch_decode_spec(
     enable_sink,
     max_in_kv_len,
     head_dim,
+    skips_softmax,
 ):
     _test_trtllm_batch_decode(
         backend,
@@ -1587,4 +1617,5 @@ def test_trtllm_batch_decode_spec(
         max_in_kv_len,
         head_dim,
         max_q_len=max_q_len,
+        skips_softmax=skips_softmax,
     )

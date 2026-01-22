@@ -1920,6 +1920,7 @@ class TrtllmGenDecodeModule:
         enable_pdl: bool = None,
         out: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
+        skip_softmax_threshold_scale_factor: Optional[float] = None,
     ) -> torch.Tensor:
         if out is None:
             out = torch.empty_like(query)
@@ -1961,6 +1962,7 @@ class TrtllmGenDecodeModule:
             workspace_size,
             sinks,
             None,  # cum_seq_lens_q
+            skip_softmax_threshold_scale_factor,
         )
         return out
 
@@ -2124,6 +2126,7 @@ def trtllm_batch_decode_with_kv_cache(
     mask: Optional[torch.Tensor] = None,
     max_q_len: Optional[int] = None,
     cum_seq_lens_q: Optional[torch.Tensor] = None,
+    skip_softmax_threshold_scale_factor: Optional[float] = None,
 ) -> Union[torch.Tensor, FP4Tensor]:
     """
     Parameters
@@ -2206,6 +2209,9 @@ def trtllm_batch_decode_with_kv_cache(
         Cumulative query sequence lengths for variable-length query support, shape: ``[batch_size + 1]``, dtype: ``torch.int32``.
         Only supported by trtllm-gen backend. Must be provided together with ``max_q_len``.
         When None, all requests use uniform query length specified by ``q_len_per_req``.
+
+    skip_softmax_threshold_scale_factor: Optional[float] = None
+        threshold scale factor for skipping softmax.
 
     Returns
     -------
@@ -2387,6 +2393,7 @@ def trtllm_batch_decode_with_kv_cache(
             workspace_buffer.numel() * workspace_buffer.element_size(),
             sinks,
             cum_seq_lens_q,
+            skip_softmax_threshold_scale_factor,
         )
 
         return (
