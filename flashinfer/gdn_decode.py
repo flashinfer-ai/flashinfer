@@ -223,9 +223,9 @@ def gdn_decode_kernel_small_batch_pretranspose(
         if beta_x <= softplus_threshold:
             # softplus(x) = (1/beta) * log(1 + exp(beta*x))
             # Compute in Float32
-            exp_beta_x = cute.exp(beta_x)
+            exp_beta_x = cute.exp(beta_x, fastmath=True)
             log_input = cutlass.Float32(1.0 + exp_beta_x)
-            log_result = cutlass.Float32(cute.log(log_input))
+            log_result = cutlass.Float32(cute.log(log_input, fastmath=True))
             softplus_x = cutlass.Float32(
                 (cutlass.Float32(1.0) / softplus_beta) * log_result
             )
@@ -233,13 +233,13 @@ def gdn_decode_kernel_small_batch_pretranspose(
             softplus_x = x
 
         # Compute g = exp(A_log) * softplus_x
-        r_g_value = -cute.exp(r_A_log) * softplus_x
+        r_g_value = -cute.exp(r_A_log, fastmath=True) * softplus_x
 
         # Compute beta = 1 / (1 + exp(-b))
-        r_beta = 1.0 / (1.0 + cute.exp(-r_b))
+        r_beta = 1.0 / (1.0 + cute.exp(-r_b, fastmath=True))
 
         # Store to scalar (Float32)
-        r_g = cute.exp(r_g_value)
+        r_g = cute.exp(r_g_value, fastmath=True)
 
     r_g = cute.arch.shuffle_sync(r_g, 0)
     r_beta = cute.arch.shuffle_sync(r_beta, 0)
@@ -260,11 +260,11 @@ def gdn_decode_kernel_small_batch_pretranspose(
                 sum_k, offset=offset, mask=-1, mask_and_clamp=31
             )
 
-        norm_q = cute.sqrt(sum_q + 1e-6)
-        norm_k = cute.sqrt(sum_k + 1e-6)
+        inv_norm_q = cute.rsqrt(sum_q + 1e-6, fastmath=True)
+        inv_norm_k = cute.rsqrt(sum_k + 1e-6, fastmath=True)
         for i in range(vec_size):
-            r_q[i] = r_q[i] / norm_q
-            r_k[i] = r_k[i] / norm_k
+            r_q[i] = r_q[i] * inv_norm_q
+            r_k[i] = r_k[i] * inv_norm_k
 
     # Apply scaling in Float32
     for i in range(vec_size):
@@ -459,9 +459,9 @@ def gdn_decode_kernel_big_batch_pretranspose(
         if beta_x <= softplus_threshold:
             # softplus(x) = (1/beta) * log(1 + exp(beta*x))
             # Compute in Float32
-            exp_beta_x = cute.exp(beta_x)
+            exp_beta_x = cute.exp(beta_x, fastmath=True)
             log_input = cutlass.Float32(1.0 + exp_beta_x)
-            log_result = cutlass.Float32(cute.log(log_input))
+            log_result = cutlass.Float32(cute.log(log_input, fastmath=True))
             softplus_x = cutlass.Float32(
                 (cutlass.Float32(1.0) / softplus_beta) * log_result
             )
@@ -469,13 +469,13 @@ def gdn_decode_kernel_big_batch_pretranspose(
             softplus_x = x
 
         # Compute g = exp(A_log) * softplus_x
-        r_g_value = -cute.exp(r_A_log) * softplus_x
+        r_g_value = -cute.exp(r_A_log, fastmath=True) * softplus_x
 
         # Compute beta = 1 / (1 + exp(-b))
-        r_beta = 1.0 / (1.0 + cute.exp(-r_b))
+        r_beta = 1.0 / (1.0 + cute.exp(-r_b, fastmath=True))
 
         # Store to scalar (Float32)
-        r_g = cute.exp(r_g_value)
+        r_g = cute.exp(r_g_value, fastmath=True)
 
     r_g = cute.arch.shuffle_sync(r_g, 0)
     r_beta = cute.arch.shuffle_sync(r_beta, 0)
@@ -496,11 +496,11 @@ def gdn_decode_kernel_big_batch_pretranspose(
                 sum_k, offset=offset, mask=-1, mask_and_clamp=31
             )
 
-        norm_q = cute.sqrt(sum_q + 1e-6)
-        norm_k = cute.sqrt(sum_k + 1e-6)
+        inv_norm_q = cute.rsqrt(sum_q + 1e-6, fastmath=True)
+        inv_norm_k = cute.rsqrt(sum_k + 1e-6, fastmath=True)
         for i in range(vec_size):
-            r_q[i] = r_q[i] / norm_q
-            r_k[i] = r_k[i] / norm_k
+            r_q[i] = r_q[i] * inv_norm_q
+            r_k[i] = r_k[i] * inv_norm_k
 
     # Apply scaling in Float32
     for i in range(vec_size):
@@ -925,13 +925,16 @@ def gated_delta_rule_decode_pretranspose(
     # Convert state from [B, HV, V, K] to [B*HV, V, K] for kernel
     h0_source = state.reshape(B * HV, V, K)
 
-    # Create dummy tensors for unused parameters
-    h0_indices = torch.zeros(B, dtype=torch.int32, device=q.device)
-    cu_seqlens = torch.zeros(B + 1, dtype=torch.int32, device=q.device)
-
     # Compile kernel with TVM FFI (cached)
     cache_key = (B, T, H, HV, K, V, q.dtype, scale, use_qk_l2norm)
     cache = _get_compiled_decode_kernel(*cache_key)
+
+    # Get or create h0_indices and cu_seqlens (cached per config)
+    if "h0_indices" not in cache or cache["h0_indices"].device != q.device:
+        cache["h0_indices"] = torch.zeros(B, dtype=torch.int32, device=q.device)
+        cache["cu_seqlens"] = torch.zeros(B + 1, dtype=torch.int32, device=q.device)
+    h0_indices = cache["h0_indices"]
+    cu_seqlens = cache["cu_seqlens"]
 
     if "compiled" not in cache:
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -994,8 +997,10 @@ def gated_delta_rule_decode_pretranspose(
         h0_source, A_log, a, dt_bias, q, k, v, b, output, h0_indices, cu_seqlens, stream
     )
 
-    # Reshape state back (no sync needed - PyTorch handles stream ordering)
-    state.copy_(h0_source.reshape(B, HV, V, K))
+    # Copy state back only if state was not contiguous
+    # (if contiguous, reshape returns a view and kernel updated state in-place)
+    if not state.is_contiguous():
+        state.copy_(h0_source.reshape(B, HV, V, K))
 
     # Convert output to target dtype if needed (kernel outputs bfloat16)
     if output.dtype != target_dtype:
@@ -1100,17 +1105,17 @@ def gdn_decode_kernel_small_batch_nontranspose(
             beta_x = softplus_beta * x
             softplus_x = 0.0
             if beta_x <= softplus_threshold:
-                exp_beta_x = cute.exp(beta_x)
+                exp_beta_x = cute.exp(beta_x, fastmath=True)
                 log_input = cutlass.Float32(1.0 + exp_beta_x)
-                log_result = cutlass.Float32(cute.log(log_input))
+                log_result = cutlass.Float32(cute.log(log_input, fastmath=True))
                 softplus_x = cutlass.Float32(
                     (cutlass.Float32(1.0) / softplus_beta) * log_result
                 )
             else:
                 softplus_x = x
-            r_g_value = -cute.exp(r_A_log) * softplus_x
-            r_beta = 1.0 / (1.0 + cute.exp(-r_b))
-            r_g = cute.exp(r_g_value)
+            r_g_value = -cute.exp(r_A_log, fastmath=True) * softplus_x
+            r_beta = 1.0 / (1.0 + cute.exp(-r_b, fastmath=True))
+            r_g = cute.exp(r_g_value, fastmath=True)
 
         r_g = cute.arch.shuffle_sync(r_g, 0)
         r_beta = cute.arch.shuffle_sync(r_beta, 0)
@@ -1155,8 +1160,8 @@ def gdn_decode_kernel_small_batch_nontranspose(
                         local_sum_k, offset=offset, mask=-1, mask_and_clamp=31
                     )
                 if in_warp_tid == 0:
-                    smem_o[0] = cute.rsqrt(local_sum_q + 1e-6)
-                    smem_o[1] = cute.rsqrt(local_sum_k + 1e-6)
+                    smem_o[0] = cute.rsqrt(local_sum_q + 1e-6, fastmath=True)
+                    smem_o[1] = cute.rsqrt(local_sum_k + 1e-6, fastmath=True)
             cute.arch.barrier()
 
             inv_norm_q = smem_o[0]
@@ -1327,17 +1332,17 @@ def gdn_decode_kernel_big_batch_nontranspose(
             beta_x = softplus_beta * x
             softplus_x = 0.0
             if beta_x <= softplus_threshold:
-                exp_beta_x = cute.exp(beta_x)
+                exp_beta_x = cute.exp(beta_x, fastmath=True)
                 log_input = cutlass.Float32(1.0 + exp_beta_x)
-                log_result = cutlass.Float32(cute.log(log_input))
+                log_result = cutlass.Float32(cute.log(log_input, fastmath=True))
                 softplus_x = cutlass.Float32(
                     (cutlass.Float32(1.0) / softplus_beta) * log_result
                 )
             else:
                 softplus_x = x
-            r_g_value = -cute.exp(r_A_log) * softplus_x
-            r_beta = 1.0 / (1.0 + cute.exp(-r_b))
-            r_g = cute.exp(r_g_value)
+            r_g_value = -cute.exp(r_A_log, fastmath=True) * softplus_x
+            r_beta = 1.0 / (1.0 + cute.exp(-r_b, fastmath=True))
+            r_g = cute.exp(r_g_value, fastmath=True)
 
         r_g = cute.arch.shuffle_sync(r_g, 0)
         r_beta = cute.arch.shuffle_sync(r_beta, 0)
@@ -1382,8 +1387,8 @@ def gdn_decode_kernel_big_batch_nontranspose(
                         local_sum_k, offset=offset, mask=-1, mask_and_clamp=31
                     )
                 if in_warp_tid == 0:
-                    smem_o[0] = cute.rsqrt(local_sum_q + 1e-6)
-                    smem_o[1] = cute.rsqrt(local_sum_k + 1e-6)
+                    smem_o[0] = cute.rsqrt(local_sum_q + 1e-6, fastmath=True)
+                    smem_o[1] = cute.rsqrt(local_sum_k + 1e-6, fastmath=True)
             cute.arch.barrier()
 
             inv_norm_q = smem_o[0]
@@ -1731,13 +1736,16 @@ def gated_delta_rule_decode(
     # Use state directly as pooled view: pool_size=B, each batch is its own pool
     h0_source = state.contiguous()
 
-    # Create h0_indices: each batch points to its own pool index
-    h0_indices = torch.arange(B, dtype=torch.int32, device=q.device)
-    cu_seqlens = torch.zeros(B + 1, dtype=torch.int32, device=q.device)
-
     # Compile kernel with TVM FFI (cached)
     cache_key = (B, T, H, HV, K, V, q.dtype, scale, use_qk_l2norm)
     cache = _get_compiled_decode_kernel_nontranspose(*cache_key)
+
+    # Get or create h0_indices and cu_seqlens (cached per config)
+    if "h0_indices" not in cache or cache["h0_indices"].device != q.device:
+        cache["h0_indices"] = torch.arange(B, dtype=torch.int32, device=q.device)
+        cache["cu_seqlens"] = torch.zeros(B + 1, dtype=torch.int32, device=q.device)
+    h0_indices = cache["h0_indices"]
+    cu_seqlens = cache["cu_seqlens"]
 
     if "compiled" not in cache:
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -1812,9 +1820,10 @@ def gated_delta_rule_decode(
         stream,
     )
 
-    # Copy state back (no sync needed - PyTorch handles stream ordering)
-    # h0_source is already [B, HV, K, V]
-    state.copy_(h0_source)
+    # Copy state back only if state was not contiguous
+    # (if contiguous, h0_source is state itself, so kernel updated state in-place)
+    if h0_source is not state:
+        state.copy_(h0_source)
 
     # Convert output to target dtype if needed (kernel outputs bfloat16)
     if output.dtype != target_dtype:
@@ -1943,18 +1952,18 @@ def gdn_verify_kernel_mtp(
                 softplus_x = 0.0
 
                 if beta_x <= softplus_threshold:
-                    exp_beta_x = cute.exp(beta_x)
+                    exp_beta_x = cute.exp(beta_x, fastmath=True)
                     log_input = cutlass.Float32(1.0 + exp_beta_x)
-                    log_result = cutlass.Float32(cute.log(log_input))
+                    log_result = cutlass.Float32(cute.log(log_input, fastmath=True))
                     softplus_x = cutlass.Float32(
                         (cutlass.Float32(1.0) / softplus_beta) * log_result
                     )
                 else:
                     softplus_x = x
 
-                r_g_value = -cute.exp(r_A_log) * softplus_x
-                r_beta = 1.0 / (1.0 + cute.exp(-r_b))
-                r_g = cute.exp(r_g_value)
+                r_g_value = -cute.exp(r_A_log, fastmath=True) * softplus_x
+                r_beta = 1.0 / (1.0 + cute.exp(-r_b, fastmath=True))
+                r_g = cute.exp(r_g_value, fastmath=True)
 
             r_g = cute.arch.shuffle_sync(r_g, 0)
             r_beta = cute.arch.shuffle_sync(r_beta, 0)
@@ -1975,8 +1984,8 @@ def gdn_verify_kernel_mtp(
                         sum_k, offset=offset, mask=-1, mask_and_clamp=31
                     )
 
-                inv_norm_q = cute.rsqrt(sum_q + 1e-6)
-                inv_norm_k = cute.rsqrt(sum_k + 1e-6)
+                inv_norm_q = cute.rsqrt(sum_q + 1e-6, fastmath=True)
+                inv_norm_k = cute.rsqrt(sum_k + 1e-6, fastmath=True)
 
                 for i in range(vec_size):
                     r_q[i] = r_q[i] * inv_norm_q
@@ -2375,9 +2384,6 @@ def gated_delta_rule_mtp(
         cache_steps = T
         intermediate_states = torch.zeros(1, 1, 1, dtype=torch.float32, device=q.device)
 
-    # Create cu_seqlens
-    cu_seqlens = torch.zeros(B + 1, dtype=torch.int32, device=q.device)
-
     # Compile kernel with TVM FFI (cached)
     cache_key = (
         B,
@@ -2394,6 +2400,11 @@ def gated_delta_rule_mtp(
         use_qk_l2norm,
     )
     cache = _get_compiled_mtp_kernel(*cache_key)
+
+    # Get or create cu_seqlens (cached per config)
+    if "cu_seqlens" not in cache or cache["cu_seqlens"].device != q.device:
+        cache["cu_seqlens"] = torch.zeros(B + 1, dtype=torch.int32, device=q.device)
+    cu_seqlens = cache["cu_seqlens"]
 
     if "compiled" not in cache:
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -2467,7 +2478,9 @@ def gated_delta_rule_mtp(
     )
 
     # Copy state back if needed (no sync needed - PyTorch handles stream ordering)
-    if not disable_state_update:
+    # Only copy if state update is enabled AND initial_state was not contiguous
+    # (if contiguous, reshape returns a view and kernel updated state in-place)
+    if not disable_state_update and not initial_state.is_contiguous():
         initial_state.copy_(h0_source.reshape(pool_size, HV, V, K))
 
     # Convert output to target dtype if needed

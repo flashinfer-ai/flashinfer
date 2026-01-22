@@ -15,9 +15,7 @@ limitations under the License.
 """
 
 import argparse
-import json
 import numpy as np
-import os
 import torch
 
 from flashinfer.gdn_decode import (
@@ -25,54 +23,7 @@ from flashinfer.gdn_decode import (
     gated_delta_rule_decode,
     gated_delta_rule_mtp,
 )
-
-
-def parse_trace_file(trace_file: str, version: str = "pretranspose"):
-    """
-    Parse a torch profiler trace file and extract GDN kernel timings.
-
-    Args:
-        trace_file: Path to the trace JSON file
-        version: 'pretranspose', 'nontranspose', or 'mtp'
-
-    Returns:
-        dict with 'kernel_times' list (in microseconds)
-    """
-    with open(trace_file, "r") as f:
-        trace_data = json.load(f)
-
-    # GDN kernel patterns (CuTe DSL kernels)
-    if version == "pretranspose":
-        kernel_patterns = [
-            "gdn_decode_kernel_small_batch_pretranspose",  # Small batch kernel
-            "gdn_decode_kernel_big_batch_pretranspose",  # Big batch kernel
-        ]
-    elif version == "nontranspose":
-        kernel_patterns = [
-            "gdn_decode_kernel_small_batch_nontranspose",  # Small batch kernel
-            "gdn_decode_kernel_big_batch_nontranspose",  # Big batch kernel
-        ]
-    elif version == "mtp":
-        kernel_patterns = [
-            "gdn_verify_kernel_mtp",  # MTP kernel
-        ]
-    else:
-        raise ValueError(f"Unknown version: {version}")
-
-    kernel_durations = []
-
-    for event in trace_data.get("traceEvents", []):
-        if event.get("cat") != "kernel":
-            continue
-
-        name = event.get("name", "")
-        dur = event.get("dur", 0)  # duration in microseconds
-
-        # Check if it's a GDN kernel
-        if any(pattern in name for pattern in kernel_patterns):
-            kernel_durations.append(dur)
-
-    return {"kernel_times": kernel_durations}
+from flashinfer.testing import bench_gpu_time
 
 
 def gdn_decode_flops(
@@ -205,7 +156,7 @@ def bench_gdn_decode(
     warmup_iters: int = 10,
     bench_iters: int = 100,
 ):
-    """Benchmark GDN decode kernel using torch.profiler.
+    """Benchmark GDN decode kernel using bench_gpu_time with CUPTI.
 
     Args:
         version: 'pretranspose' or 'nontranspose'
@@ -262,43 +213,18 @@ def bench_gdn_decode(
     else:
         raise ValueError(f"Unknown version: {version}")
 
-    # Warmup
-    for _ in range(warmup_iters):
-        _, _ = decode_func(
+    # Benchmark with bench_gpu_time (CUPTI for accurate kernel timing)
+    kernel_times_ms = bench_gpu_time(
+        lambda: decode_func(
             q, k, v, state, A_log, a, dt_bias, b, scale, output, use_qk_l2norm
-        )
-    torch.cuda.synchronize()
+        ),
+        enable_cupti=True,
+        dry_run_iters=warmup_iters,
+        repeat_iters=bench_iters,
+    )
 
-    # Benchmark with torch.profiler
-    trace_dir = "gdn_decode_traces"
-    os.makedirs(trace_dir, exist_ok=True)
-    trace_file = os.path.join(trace_dir, f"trace_{version}_B{batch_size}.json")
-
-    with torch.profiler.profile(
-        activities=[
-            torch.profiler.ProfilerActivity.CPU,
-            torch.profiler.ProfilerActivity.CUDA,
-        ],
-        record_shapes=True,
-    ) as profiler:
-        for i in range(bench_iters):
-            with torch.profiler.record_function(f"gdn_decode_iter{i}"):
-                _, _ = decode_func(
-                    q, k, v, state, A_log, a, dt_bias, b, scale, output, use_qk_l2norm
-                )
-
-    profiler.export_chrome_trace(trace_file)
-
-    # Parse trace file for kernel-level timing
-    trace_results = parse_trace_file(trace_file, version=version)
-    kernel_times = trace_results["kernel_times"]  # in microseconds
-
-    # Calculate statistics from kernel trace
-    kernel_median_us = np.median(kernel_times) if kernel_times else 0
-    kernel_mean_us = np.mean(kernel_times) if kernel_times else 0
-    kernel_std_us = np.std(kernel_times) if kernel_times else 0
-
-    # Calculate metrics (convert us to ms for FLOPS calculation)
+    # Calculate metrics
+    kernel_median_ms = np.median(kernel_times_ms)
     flops = gdn_decode_flops(
         batch_size, num_q_heads, num_k_heads, num_v_heads, head_size
     )
@@ -313,7 +239,6 @@ def bench_gdn_decode(
         disable_state_update=False,  # Decode mode: state is read + written
     )
 
-    kernel_median_ms = kernel_median_us / 1000
     kernel_tflops = flops / kernel_median_ms / 1e9 if kernel_median_ms > 0 else 0
     kernel_tb_per_sec = (
         bytes_accessed / kernel_median_ms / 1e9 if kernel_median_ms > 0 else 0
@@ -321,17 +246,9 @@ def bench_gdn_decode(
 
     return {
         "batch_size": batch_size,
-        "num_q_heads": num_q_heads,
-        "num_k_heads": num_k_heads,
-        "num_v_heads": num_v_heads,
-        "head_size": head_size,
-        "dtype": str(dtype).replace("torch.", ""),
-        "kernel_median_us": kernel_median_us,
-        "kernel_mean_us": kernel_mean_us,
-        "kernel_std_us": kernel_std_us,
+        "kernel_median_us": kernel_median_ms * 1000,
         "kernel_tflops": kernel_tflops,
         "kernel_tb_per_sec": kernel_tb_per_sec,
-        "trace_file": trace_file,
     }
 
 
@@ -350,7 +267,7 @@ def bench_gdn_mtp(
     warmup_iters: int = 10,
     bench_iters: int = 100,
 ):
-    """Benchmark GDN MTP kernel using torch.profiler."""
+    """Benchmark GDN MTP kernel using bench_gpu_time with CUPTI."""
     num_o_heads = max(num_q_heads, num_v_heads)
     num_sab_heads = num_o_heads
 
@@ -408,9 +325,9 @@ def bench_gdn_mtp(
     # Scale factor
     scale = 1.0 / (head_size**0.5)
 
-    # Warmup
-    for _ in range(warmup_iters):
-        _, _ = gated_delta_rule_mtp(
+    # Benchmark with bench_gpu_time (CUPTI for accurate kernel timing)
+    kernel_times_ms = bench_gpu_time(
+        lambda: gated_delta_rule_mtp(
             q,
             k,
             v,
@@ -425,52 +342,14 @@ def bench_gdn_mtp(
             intermediate_states_buffer,
             disable_state_update=True,
             use_qk_l2norm=use_qk_l2norm,
-        )
-    torch.cuda.synchronize()
-
-    # Benchmark with torch.profiler
-    trace_dir = "gdn_decode_traces"
-    os.makedirs(trace_dir, exist_ok=True)
-    trace_file = os.path.join(trace_dir, f"trace_mtp_B{batch_size}_T{seq_len}.json")
-
-    with torch.profiler.profile(
-        activities=[
-            torch.profiler.ProfilerActivity.CPU,
-            torch.profiler.ProfilerActivity.CUDA,
-        ],
-        record_shapes=True,
-    ) as profiler:
-        for i in range(bench_iters):
-            with torch.profiler.record_function(f"gdn_mtp_iter{i}"):
-                _, _ = gated_delta_rule_mtp(
-                    q,
-                    k,
-                    v,
-                    initial_state,
-                    initial_state_indices,
-                    A_log,
-                    a,
-                    dt_bias,
-                    b,
-                    scale,
-                    output,
-                    intermediate_states_buffer,
-                    disable_state_update=True,
-                    use_qk_l2norm=use_qk_l2norm,
-                )
-
-    profiler.export_chrome_trace(trace_file)
-
-    # Parse trace file for kernel-level timing
-    trace_results = parse_trace_file(trace_file, version="mtp")
-    kernel_times = trace_results["kernel_times"]  # in microseconds
-
-    # Calculate statistics from kernel trace
-    kernel_median_us = np.median(kernel_times) if kernel_times else 0
-    kernel_mean_us = np.mean(kernel_times) if kernel_times else 0
-    kernel_std_us = np.std(kernel_times) if kernel_times else 0
+        ),
+        enable_cupti=True,
+        dry_run_iters=warmup_iters,
+        repeat_iters=bench_iters,
+    )
 
     # Calculate metrics
+    kernel_median_ms = np.median(kernel_times_ms)
     flops = gdn_decode_flops(
         batch_size, num_q_heads, num_k_heads, num_v_heads, head_size, seq_len
     )
@@ -485,7 +364,6 @@ def bench_gdn_mtp(
         disable_state_update=True,  # MTP mode: state is not written back
     )
 
-    kernel_median_ms = kernel_median_us / 1000
     kernel_tflops = flops / kernel_median_ms / 1e9 if kernel_median_ms > 0 else 0
     kernel_tb_per_sec = (
         bytes_accessed / kernel_median_ms / 1e9 if kernel_median_ms > 0 else 0
@@ -494,17 +372,9 @@ def bench_gdn_mtp(
     return {
         "batch_size": batch_size,
         "seq_len": seq_len,
-        "num_q_heads": num_q_heads,
-        "num_k_heads": num_k_heads,
-        "num_v_heads": num_v_heads,
-        "head_size": head_size,
-        "dtype": str(dtype).replace("torch.", ""),
-        "kernel_median_us": kernel_median_us,
-        "kernel_mean_us": kernel_mean_us,
-        "kernel_std_us": kernel_std_us,
+        "kernel_median_us": kernel_median_ms * 1000,
         "kernel_tflops": kernel_tflops,
         "kernel_tb_per_sec": kernel_tb_per_sec,
-        "trace_file": trace_file,
     }
 
 
