@@ -4,6 +4,14 @@ Tests the module-status and list-modules commands
 This is factored out from test_cli_cmds.py because these tests require a GPU.
 """
 
+import pytest
+from flashinfer.utils import get_compute_capability
+
+# Skip the entire module if no supported GPU is available
+_cc = get_compute_capability()
+if _cc is None:
+    pytest.skip("Requires CUDA GPU for CLI GPU tests.", allow_module_level=True)
+
 from cli_cmd_helpers import _test_cmd_helper
 from datetime import datetime
 from dataclasses import dataclass
