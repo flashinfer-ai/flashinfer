@@ -73,6 +73,7 @@ def selective_state_update(
     dt_softplus: bool = False,
     state_batch_indices: Optional[torch.Tensor] = None,
     pad_slot_id: int = -1,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     r"""Selective state update operation for Mamba layers (the generation phase).
 
@@ -104,6 +105,8 @@ def selective_state_update(
         If state_batch_indices is passed, lets the kernel identify padded entries
         that will not be processed. For example: state_batch_indices = [pad_slot_id, 1, 20, pad_slot_id]
         in this case, the kernel will not process entries at indices 0 and 3
+    out : torch.Tensor | None
+        Optional output tensor
 
     Returns
     -------
@@ -128,7 +131,10 @@ def selective_state_update(
         z = z.unsqueeze(1)
     if dt_bias is not None and dt_bias.dim() == 1:
         dt_bias = dt_bias.unsqueeze(0)
-    output = torch.empty_like(x)
+    if out is None:
+        output = torch.empty_like(x)
+    else:
+        output = out
     _selective_state_update(
         state,
         x,
