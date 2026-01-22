@@ -245,7 +245,7 @@ jobs:
   analyze-aot-failure:
     name: Analyze AOT Failure
     needs: [setup, aot-build-import]
-    if: always() && needs.aot-build-import.result == 'failure'
+    if: !cancelled() && needs.aot-build-import.result == 'failure'
     runs-on: ubuntu-latest
     outputs:
       is_spot_termination: ${{ steps.analyze.outputs.is_spot_termination }}
@@ -299,7 +299,7 @@ jobs:
     name: AOT Build Import Rerun (${{ matrix.arch }}, ${{ matrix.cuda }})
     needs: [setup, analyze-aot-failure]
     if: |
-      always() &&
+      !cancelled() &&
       needs.analyze-aot-failure.outputs.is_spot_termination == 'true' &&
       needs.analyze-aot-failure.outputs.rerun_matrix != ''
     runs-on:
@@ -418,7 +418,7 @@ jobs:
   analyze-gpu-a10g-failure:
     name: Analyze GPU A10G Failure
     needs: [setup, gpu-tests-a10g]
-    if: always() && needs.gpu-tests-a10g.result == 'failure'
+    if: !cancelled() && needs.gpu-tests-a10g.result == 'failure'
     runs-on: ubuntu-latest
     outputs:
       is_spot_termination: ${{ steps.analyze.outputs.is_spot_termination }}
@@ -465,7 +465,7 @@ jobs:
     name: JIT Rerun ${{ matrix.shard }} (A10G)
     needs: [setup, analyze-gpu-a10g-failure]
     if: |
-      always() &&
+      !cancelled() &&
       needs.analyze-gpu-a10g-failure.outputs.is_spot_termination == 'true' &&
       needs.analyze-gpu-a10g-failure.outputs.rerun_matrix != ''
     runs-on: [self-hosted, Linux, X64, gpu, sm86, on-demand]
@@ -576,7 +576,7 @@ jobs:
   analyze-gpu-t4-failure:
     name: Analyze GPU T4 Failure
     needs: [setup, gpu-tests-t4]
-    if: always() && needs.gpu-tests-t4.result == 'failure'
+    if: !cancelled() && needs.gpu-tests-t4.result == 'failure'
     runs-on: ubuntu-latest
     outputs:
       is_spot_termination: ${{ steps.analyze.outputs.is_spot_termination }}
@@ -616,7 +616,7 @@ jobs:
     name: JIT Rerun (T4)
     needs: [setup, analyze-gpu-t4-failure]
     if: |
-      always() &&
+      !cancelled() &&
       needs.analyze-gpu-t4-failure.outputs.is_spot_termination == 'true'
     runs-on: [self-hosted, Linux, X64, gpu, sm75, on-demand]
     timeout-minutes: 360
@@ -661,9 +661,9 @@ jobs:
   # ---------------------------------------------------------------------------
   test-results-summary:
     name: Test Results Summary
-    if: always()
-    needs: [gate, setup, aot-build-import, gpu-tests-a10g, gpu-tests-t4]
+    if: "!cancelled()"
     needs:
+      - gate
       - setup
       - aot-build-import
       - analyze-aot-failure
