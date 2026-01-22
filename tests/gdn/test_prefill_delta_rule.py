@@ -25,8 +25,15 @@ import pytest
 
 from .reference_delta_rule import exclusive_cumsum, blockwise_delta_rule
 
-
+from flashinfer.utils import get_compute_capability
 from flashinfer.gdn_prefill import chunk_gated_delta_rule
+
+
+def _skip_if_not_sm90():
+    """Skip test if not SM90 architecture."""
+    cc = get_compute_capability(torch.device("cuda"))
+    if cc[0] != 9:
+        pytest.skip(f"GDN prefill requires SM90, but got SM{cc[0]}{cc[1]}")
 
 
 def _test_prefill_kernel(
@@ -43,6 +50,7 @@ def _test_prefill_kernel(
     beta: bool,
     seed: int | None = None,
 ):
+    _skip_if_not_sm90()
     if not alpha and not beta:
         pytest.skip(
             "large diff due to output value amplitude explosion along token dimension"
@@ -232,6 +240,7 @@ def _test_chunked_prefill(
     beta: bool,
     seed: int | None = None,
 ):
+    _skip_if_not_sm90()
     if not alpha and not beta:
         pytest.skip(
             "large diff due to output value amplitude explosion along token dimension"
