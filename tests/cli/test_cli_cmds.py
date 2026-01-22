@@ -71,10 +71,22 @@ def test_download_cubin_cmd_mocked(monkeypatch):
     """
     # Return a real cubin path relative to the repository so it can be downloaded
     fmha_cubin = "fmhaSm100aKernel_QE4m3KvE2m1OE4m3H128PagedKvCausalP32VarSeqQ128Kv128PersistentContext.cubin"
+
+    # Mock get_subdir_file_list to return a list with (filename, checksum) tuples
+    def mock_get_subdir_file_list():
+        return [(f"{ArtifactPath.TRTLLM_GEN_FMHA}/{fmha_cubin}", "fake_checksum_12345")]
+
     monkeypatch.setattr(
-        "flashinfer.artifacts.get_cubin_file_list",
-        lambda: [f"{ArtifactPath.TRTLLM_GEN_FMHA}/{fmha_cubin}"],
+        "flashinfer.artifacts.get_subdir_file_list", mock_get_subdir_file_list
     )
+
+    # Mock download_file to avoid actual network calls
+    monkeypatch.setattr(
+        "flashinfer.artifacts.download_file", lambda *args, **kwargs: True
+    )
+
+    # Mock verify_cubin to always return True
+    monkeypatch.setattr("flashinfer.artifacts.verify_cubin", lambda *args: True)
 
     out = _test_cmd_helper(["--download-cubin"])
     assert "All cubin download tasks completed successfully" in out
