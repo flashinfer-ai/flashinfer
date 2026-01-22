@@ -20,6 +20,13 @@ High-performance fused kernel for element-wise addition followed by RMS normaliz
 and FP4 quantization. Supports both NVFP4 (block_size=16, E4M3 scales) and MXFP4
 (block_size=32, UE8M0 scales) formats.
 
+Operation:
+    1. residual = residual + input (in-place update)
+    2. output = (residual / sqrt(mean(residual²) + eps)) * weight
+    3. quantize output to FP4
+
+The residual tensor is modified in-place to contain the fused value (input + residual).
+
 """
 
 import functools
@@ -826,7 +833,12 @@ class AddRMSNormFP4QuantKernel:
     """
     Fused Add + RMSNorm + FP4 Quantization Kernel.
 
-    Computes: h = x + r, y = RMSNorm(h) * w, then quantizes y to FP4.
+    Computes:
+        1. residual = input + residual (in-place update)
+        2. y = RMSNorm(residual) * weight
+        3. quantize y to FP4
+
+    The residual tensor is modified in-place.
     Supports both NVFP4 (block_size=16) and MXFP4 (block_size=32) formats.
     """
 
@@ -1018,8 +1030,8 @@ class AddRMSNormFP4QuantKernel:
         """Host function to launch the kernel.
 
         Takes tensors directly via TVM-FFI.
-        - mX: Input tensor, shape (M, H), row-major
-        - mR: Residual tensor, shape (M, H), row-major
+        - mX: Input tensor, shape (M, H), row-major (read-only)
+        - mR: Residual tensor, shape (M, H), row-major (modified in-place to input + residual)
         - mW: Weight tensor, shape (H,)
         - mY: Output FP4 tensor, shape (M, H // 2), row-major (packed)
         - mS: Scale factor tensor, shape depends on swizzle mode
@@ -1062,6 +1074,11 @@ class AddRMSNormFP4QuantKernel:
         tiler_mn: cute.Shape,
     ):
         """Device kernel with cluster sync and Half2 SIMD.
+
+        Performs:
+        1. h = input + residual (writes h back to mR in-place)
+        2. y = h * rstd * w / global_scale = rmsnorm(h, w) / global_scale
+        3. quantizes y to FP4
 
         mGlobalScale contains the global scale value. The kernel reads it and
         computes 1/global_scale, which is multiplied with rstd to apply:
@@ -1154,25 +1171,37 @@ class AddRMSNormFP4QuantKernel:
             mW_2d = cute.make_tensor(mW.iterator, mW_expanded_layout)
             gW = cute.local_tile(mW_2d, tiler_mn, (0, cluster_y))
 
-        # TiledCopy
+        # TiledCopy for loads
         copy_atom_load_async = cute.make_copy_atom(
             cute.nvgpu.cpasync.CopyG2SOp(),
             mX.element_type,
             num_bits_per_copy=COPY_BITS,
         )
 
+        # TiledCopy for stores (to write h back to residual)
+        copy_atom_store = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            mR.element_type,
+            num_bits_per_copy=COPY_BITS,
+        )
+
         tiled_copy_load = cute.make_tiled_copy(
             copy_atom_load_async, tv_layout, tiler_mn
         )
+        tiled_copy_store = cute.make_tiled_copy(copy_atom_store, tv_layout, tiler_mn)
 
         thr_copy_X = tiled_copy_load.get_slice(tidx)
         thr_copy_R = tiled_copy_load.get_slice(tidx)
+        thr_copy_R_store = tiled_copy_store.get_slice(tidx)
 
         tXgX = thr_copy_X.partition_S(gX)
         tXsX = thr_copy_X.partition_D(sX)
         tRgR = thr_copy_R.partition_S(gR)
         tRsR = thr_copy_R.partition_D(sR)
         tXcX = thr_copy_X.partition_S(cX)
+
+        # Output partition for writing h back to residual (in-place update)
+        tRgO = thr_copy_R_store.partition_D(gR)
 
         if cutlass.const_expr(cluster_n == 1):
             thr_copy_W = tiled_copy_load.get_slice(tidx)
@@ -1182,6 +1211,7 @@ class AddRMSNormFP4QuantKernel:
 
         tXrX = cute.make_fragment_like(tXgX)
         tRrR = cute.make_fragment_like(tRgR)
+        tRrO = cute.make_fragment_like(tRgO)  # Register fragment for residual output
 
         # Bounds checking
         tXpX = predicate_k(tXcX, limit=H)
@@ -1209,6 +1239,9 @@ class AddRMSNormFP4QuantKernel:
         h_vals = x_vals + r_vals
         h_sq = h_vals * h_vals
 
+        # Store h to residual output registers (for in-place update of residual)
+        tRrO.store(h_vals.to(self.dtype))
+
         if cutlass.const_expr(cluster_n == 1):
             h_elem = h_vals.to(mX.element_type)
             tHsH.store(h_elem)
@@ -1235,6 +1268,10 @@ class AddRMSNormFP4QuantKernel:
             cute.arch.cluster_wait()
         else:
             cute.arch.barrier()
+
+        # Write h back to residual tensor (in-place update: residual = input + residual)
+        if row_in_bounds:
+            cute.copy(copy_atom_store, tRrO, tRgO, pred=tXpX)
 
         actual_row_idx = bidx * rows_per_block + row_in_block
 
@@ -1386,38 +1423,22 @@ class AddRMSNormFP4QuantKernel:
 
                         else:
                             # Global memory path (cluster mode)
+                            # mR now contains h = x + r (written earlier), so read h directly
                             h_ptr0 = get_ptr_as_int64(
-                                mX, actual_row_idx * H + block_start
-                            )
-                            h_ptr1 = get_ptr_as_int64(
-                                mX, actual_row_idx * H + block_start + Int32(8)
-                            )
-                            r_ptr0 = get_ptr_as_int64(
                                 mR, actual_row_idx * H + block_start
                             )
-                            r_ptr1 = get_ptr_as_int64(
+                            h_ptr1 = get_ptr_as_int64(
                                 mR, actual_row_idx * H + block_start + Int32(8)
                             )
                             w_ptr0 = get_ptr_as_int64(mW, block_start)
                             w_ptr1 = get_ptr_as_int64(mW, block_start + Int32(8))
 
-                            x0, x1, x2, x3 = ld_global_v4_u32(h_ptr0)
-                            x4, x5, x6, x7 = ld_global_v4_u32(h_ptr1)
-                            r0, r1, r2, r3 = ld_global_v4_u32(r_ptr0)
-                            r4, r5, r6, r7 = ld_global_v4_u32(r_ptr1)
+                            h0, h1, h2, h3 = ld_global_v4_u32(h_ptr0)
+                            h4, h5, h6, h7 = ld_global_v4_u32(h_ptr1)
                             w0, w1, w2, w3 = ld_global_v4_u32(w_ptr0)
                             w4, w5, w6, w7 = ld_global_v4_u32(w_ptr1)
 
                             if cutlass.const_expr(is_fp16):
-                                h0 = hadd2(x0, r0)
-                                h1 = hadd2(x1, r1)
-                                h2 = hadd2(x2, r2)
-                                h3 = hadd2(x3, r3)
-                                h4 = hadd2(x4, r4)
-                                h5 = hadd2(x5, r5)
-                                h6 = hadd2(x6, r6)
-                                h7 = hadd2(x7, r7)
-
                                 hw0 = half2_mul(h0, w0)
                                 hw1 = half2_mul(h1, w1)
                                 hw2 = half2_mul(h2, w2)
@@ -1456,15 +1477,7 @@ class AddRMSNormFP4QuantKernel:
                                 y12, y13 = half2_to_float2_scaled(hw6, rstd)
                                 y14, y15 = half2_to_float2_scaled(hw7, rstd)
                             else:
-                                h0 = bfloat2_add(x0, r0)
-                                h1 = bfloat2_add(x1, r1)
-                                h2 = bfloat2_add(x2, r2)
-                                h3 = bfloat2_add(x3, r3)
-                                h4 = bfloat2_add(x4, r4)
-                                h5 = bfloat2_add(x5, r5)
-                                h6 = bfloat2_add(x6, r6)
-                                h7 = bfloat2_add(x7, r7)
-
+                                # h0-h7 already contain h = x + r (loaded from mR)
                                 hw0 = bfloat2_mul(h0, w0)
                                 hw1 = bfloat2_mul(h1, w1)
                                 hw2 = bfloat2_mul(h2, w2)
@@ -1806,30 +1819,17 @@ class AddRMSNormFP4QuantKernel:
 
                         else:
                             # Global memory path for MXFP4 (cluster mode)
-                            # Load x, r, w as 4 x 128-bit loads each
-                            x_ptr0 = get_ptr_as_int64(
-                                mX, actual_row_idx * H + block_start
-                            )
-                            x_ptr1 = get_ptr_as_int64(
-                                mX, actual_row_idx * H + block_start + Int32(8)
-                            )
-                            x_ptr2 = get_ptr_as_int64(
-                                mX, actual_row_idx * H + block_start + Int32(16)
-                            )
-                            x_ptr3 = get_ptr_as_int64(
-                                mX, actual_row_idx * H + block_start + Int32(24)
-                            )
-
-                            r_ptr0 = get_ptr_as_int64(
+                            # mR now contains h = x + r (written earlier), so read h directly
+                            h_ptr0 = get_ptr_as_int64(
                                 mR, actual_row_idx * H + block_start
                             )
-                            r_ptr1 = get_ptr_as_int64(
+                            h_ptr1 = get_ptr_as_int64(
                                 mR, actual_row_idx * H + block_start + Int32(8)
                             )
-                            r_ptr2 = get_ptr_as_int64(
+                            h_ptr2 = get_ptr_as_int64(
                                 mR, actual_row_idx * H + block_start + Int32(16)
                             )
-                            r_ptr3 = get_ptr_as_int64(
+                            h_ptr3 = get_ptr_as_int64(
                                 mR, actual_row_idx * H + block_start + Int32(24)
                             )
 
@@ -1838,15 +1838,10 @@ class AddRMSNormFP4QuantKernel:
                             w_ptr2 = get_ptr_as_int64(mW, block_start + Int32(16))
                             w_ptr3 = get_ptr_as_int64(mW, block_start + Int32(24))
 
-                            x0, x1, x2, x3 = ld_global_v4_u32(x_ptr0)
-                            x4, x5, x6, x7 = ld_global_v4_u32(x_ptr1)
-                            x8, x9, x10, x11 = ld_global_v4_u32(x_ptr2)
-                            x12, x13, x14, x15 = ld_global_v4_u32(x_ptr3)
-
-                            r0, r1, r2, r3 = ld_global_v4_u32(r_ptr0)
-                            r4, r5, r6, r7 = ld_global_v4_u32(r_ptr1)
-                            r8, r9, r10, r11 = ld_global_v4_u32(r_ptr2)
-                            r12, r13, r14, r15 = ld_global_v4_u32(r_ptr3)
+                            h0, h1, h2, h3 = ld_global_v4_u32(h_ptr0)
+                            h4, h5, h6, h7 = ld_global_v4_u32(h_ptr1)
+                            h8, h9, h10, h11 = ld_global_v4_u32(h_ptr2)
+                            h12, h13, h14, h15 = ld_global_v4_u32(h_ptr3)
 
                             w0, w1, w2, w3 = ld_global_v4_u32(w_ptr0)
                             w4, w5, w6, w7 = ld_global_v4_u32(w_ptr1)
@@ -1854,23 +1849,6 @@ class AddRMSNormFP4QuantKernel:
                             w12, w13, w14, w15 = ld_global_v4_u32(w_ptr3)
 
                             if cutlass.const_expr(is_fp16):
-                                h0 = hadd2(x0, r0)
-                                h1 = hadd2(x1, r1)
-                                h2 = hadd2(x2, r2)
-                                h3 = hadd2(x3, r3)
-                                h4 = hadd2(x4, r4)
-                                h5 = hadd2(x5, r5)
-                                h6 = hadd2(x6, r6)
-                                h7 = hadd2(x7, r7)
-                                h8 = hadd2(x8, r8)
-                                h9 = hadd2(x9, r9)
-                                h10 = hadd2(x10, r10)
-                                h11 = hadd2(x11, r11)
-                                h12 = hadd2(x12, r12)
-                                h13 = hadd2(x13, r13)
-                                h14 = hadd2(x14, r14)
-                                h15 = hadd2(x15, r15)
-
                                 hw0 = half2_mul(h0, w0)
                                 hw1 = half2_mul(h1, w1)
                                 hw2 = half2_mul(h2, w2)
@@ -1941,23 +1919,7 @@ class AddRMSNormFP4QuantKernel:
                                 y28, y29 = half2_to_float2_scaled(hw14, rstd)
                                 y30, y31 = half2_to_float2_scaled(hw15, rstd)
                             else:
-                                h0 = bfloat2_add(x0, r0)
-                                h1 = bfloat2_add(x1, r1)
-                                h2 = bfloat2_add(x2, r2)
-                                h3 = bfloat2_add(x3, r3)
-                                h4 = bfloat2_add(x4, r4)
-                                h5 = bfloat2_add(x5, r5)
-                                h6 = bfloat2_add(x6, r6)
-                                h7 = bfloat2_add(x7, r7)
-                                h8 = bfloat2_add(x8, r8)
-                                h9 = bfloat2_add(x9, r9)
-                                h10 = bfloat2_add(x10, r10)
-                                h11 = bfloat2_add(x11, r11)
-                                h12 = bfloat2_add(x12, r12)
-                                h13 = bfloat2_add(x13, r13)
-                                h14 = bfloat2_add(x14, r14)
-                                h15 = bfloat2_add(x15, r15)
-
+                                # h0-h15 already contain h = x + r (loaded from mR)
                                 hw0 = bfloat2_mul(h0, w0)
                                 hw1 = bfloat2_mul(h1, w1)
                                 hw2 = bfloat2_mul(h2, w2)
@@ -2264,17 +2226,22 @@ def add_rmsnorm_fp4quant(
     """
     Fused Add + RMS normalization + FP4 quantization using CuTe-DSL.
 
-    Computes: ``h = input + residual``, then ``y = RMSNorm(h) * weight``,
-    optionally applies global scaling (``y = y / global_scale``),
-    and finally quantizes ``y`` to FP4.
+    Computes:
+        1. ``residual = residual + input`` (in-place update)
+        2. ``y = RMSNorm(residual) * weight``
+        3. Optionally applies global scaling (``y = y / global_scale``)
+        4. Quantizes ``y`` to FP4
+
+    The residual tensor is modified in-place to contain the fused value.
 
     Parameters
     ----------
     input : torch.Tensor
         Input tensor, shape ``(batch_size, hidden_size)`` or ``(batch_size, seq_len, hidden_size)``.
-        Must be ``torch.float16`` or ``torch.bfloat16``.
+        Must be ``torch.float16`` or ``torch.bfloat16``. Read-only.
     residual : torch.Tensor
-        Residual tensor to add to input. Must have the same shape and dtype as ``input``.
+        Residual tensor. Must have the same shape and dtype as ``input``.
+        **Modified in-place** to contain ``residual + input``.
     weight : torch.Tensor
         Weight tensor for RMSNorm, shape ``(hidden_size,)``.
         Must have the same dtype as input.

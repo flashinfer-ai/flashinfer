@@ -873,7 +873,10 @@ def testAddRmsnormFp4quant(args):
 
     This test:
     1. Generates random input and residual tensors
-    2. Runs add_rmsnorm_fp4quant (h = input + residual, then RMSNorm with FP4 quantized output)
+    2. Runs add_rmsnorm_fp4quant:
+       - residual is updated in-place: residual = input + residual
+       - RMSNorm is computed on the updated residual
+       - Output is FP4 quantized
     3. Runs reference check
     4. Measures performance metrics (memory bandwidth)
 
@@ -1011,7 +1014,7 @@ def testAddRmsnormFp4quant(args):
 
             # Memory bandwidth calculation for Add + RMSNorm + FP4 Quant
             # Read: input tensor + residual tensor + weight tensor
-            # Write: FP4 output + scale factors + h tensor (residual updated)
+            # Write: residual tensor (in-place update with input + residual) + FP4 output + scale factors
             num_elements = np.prod(input_shape)
             num_scale_elements = num_elements // block_size
             # FP4: 2 elements per byte (4 bits each)
@@ -1020,9 +1023,10 @@ def testAddRmsnormFp4quant(args):
                 num_elements * input_dtype.itemsize  # input read
                 + num_elements * input_dtype.itemsize  # residual read
                 + hidden_size * input_dtype.itemsize  # weight read
+                + num_elements
+                * input_dtype.itemsize  # residual write (in-place: input + residual)
                 + fp4_output_bytes  # FP4 output write
                 + num_scale_elements  # scale factors write (1 byte each)
-                + num_elements * input_dtype.itemsize  # h output write
             )
             problem_flops = num_elements * 6  # rough estimate (add + rmsnorm ops)
             tflops = problem_flops / (10**9 * median_time)  # in TFLOPs/sec
