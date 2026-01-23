@@ -10,7 +10,7 @@ In general there can be two types of tests for each command:
 These tests don't require a GPU. CLI tests that require a GPU are in test_cli_cmds_gpu.py.
 """
 
-from cli_cmd_helpers import _test_cmd_helper
+from .cli_cmd_helpers import _test_cmd_helper
 from flashinfer.artifacts import ArtifactPath
 
 
