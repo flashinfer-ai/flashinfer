@@ -413,17 +413,25 @@ def _cudnn_bmm_bf16_requirement(
     a_shape, a_stride = _get_bf16_3d_shape_stride(A)
     b_shape, b_stride = _get_bf16_3d_shape_stride(B)
 
-    # Build the bf16 cudnn graph. This graph will be cached & reused in bmm_bf16()
-    # because the graph is constructed with @functools.cache decorator
-    graph = create_cudnn_bf16_gemm_graph(
-        a_shape,
-        a_stride,
-        b_shape,
-        b_stride,
-        _torch_data_type_to_cudnn_data_type(out_dtype),
-        A.device,
-    )
-    graph.check_support()
+    # Build the bf16 cudnn graph and execution plans. This validates support
+    # and caches the fully-built graph for reuse in bmm_bf16().
+    # We call build_cudnn_bf16_gemm_plans (not just create + check_support)
+    # because check_support() and build_plans() must be called together
+    # on the same graph object to avoid state inconsistencies.
+    # Note: On some architectures (e.g., SM103), cuDNN's check_support() may pass
+    # but build_plans() fails for certain configurations (e.g., bf16->fp16).
+    # We catch the exception here so the backend is properly skipped.
+    try:
+        build_cudnn_bf16_gemm_plans(
+            a_shape,
+            a_stride,
+            b_shape,
+            b_stride,
+            _torch_data_type_to_cudnn_data_type(out_dtype),
+            A.device,
+        )
+    except cudnn._compiled_module.cudnnGraphNotSupportedError:
+        return False
 
     return True
 
