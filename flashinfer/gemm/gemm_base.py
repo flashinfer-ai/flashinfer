@@ -183,7 +183,6 @@ def get_gemm_module():
 
 
 @supported_compute_capability([100, 103])
-@supported_compute_capability([100, 103])
 def _cutlass_mm_bf16_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
