@@ -2109,6 +2109,24 @@ def _cudnn_gemm_fp8_runner():
     return CudnnFp8GemmRunner()
 
 
+def _get_bf16_3d_shape_stride(tensor: torch.Tensor):
+    """
+    Get 3D shape and stride for bf16 tensor, expanding 2D tensors to 3D with batch=1.
+
+    This function is used to create a unified cuDNN graph that works for both
+    mm (2D) and bmm (3D) operations, similar to how FP4 handles this.
+    """
+    shape = list(tensor.shape)
+    stride = list(tensor.stride())
+
+    # cuDNN bf16 matmul requires 3D tensors, so we insert batch dimension if 2D
+    if len(shape) == 2:
+        shape.insert(0, 1)
+        stride.insert(0, tensor.numel())
+
+    return (tuple(shape), tuple(stride))
+
+
 @functools.cache
 def build_cudnn_gemm_bf16_graph(a_shape, a_stride, b_shape, b_stride, o_type, device):
     _check_cudnn_availability()
@@ -2164,11 +2182,17 @@ def _cudnn_gemm_bf16(
     workspace: torch.Tensor, a: torch.Tensor, b: torch.Tensor, out: torch.Tensor
 ):
     _check_cudnn_availability()
+
+    # Get 3D shapes/strides - cuDNN bf16 matmul requires 3D tensors
+    # This allows the same graph to work for both mm (2D) and bmm (3D)
+    a_shape, a_stride = _get_bf16_3d_shape_stride(a)
+    b_shape, b_stride = _get_bf16_3d_shape_stride(b)
+
     graph = build_cudnn_gemm_bf16_graph(
-        a.shape,
-        a.stride(),
-        b.shape,
-        b.stride(),
+        a_shape,
+        a_stride,
+        b_shape,
+        b_stride,
         _torch_data_type_to_cudnn_data_type(out.dtype),
         a.device,
     )
