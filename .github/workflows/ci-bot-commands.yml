@@ -1,8 +1,9 @@
 # Bot command handler for CI permissions
 # Authorized users (ci-users team) can comment to control CI:
 #   @flashinfer-bot run          - Add run-ci label to trigger CI
-#   @flashinfer-bot rerun        - Rerun all jobs
+#   @flashinfer-bot rerun        - Rerun all jobs (cancel in-progress first)
 #   @flashinfer-bot rerun-failed - Rerun only failed jobs
+#   @flashinfer-bot stop         - Cancel all in-progress workflows
 
 name: CI Bot Commands
 
@@ -70,6 +71,8 @@ jobs:
             echo "command=rerun-failed" >> "$GITHUB_OUTPUT"
           elif echo "$COMMENT_BODY" | grep -qi "@flashinfer-bot rerun"; then
             echo "command=rerun" >> "$GITHUB_OUTPUT"
+          elif echo "$COMMENT_BODY" | grep -qi "@flashinfer-bot stop"; then
+            echo "command=stop" >> "$GITHUB_OUTPUT"
           elif echo "$COMMENT_BODY" | grep -qi "@flashinfer-bot run"; then
             echo "command=run" >> "$GITHUB_OUTPUT"
           else
@@ -110,11 +113,28 @@ jobs:
 
           echo "PR HEAD SHA: $PR_SHA"
 
-          # Rerun all workflow runs for this commit
+          # Cancel in-progress and queued runs first
+          echo "Cancelling in-progress runs..."
           gh run list \
             --repo ${{ github.repository }} \
             --commit "$PR_SHA" \
-            --json databaseId,status -q '.[] | select(.status != "in_progress") | .databaseId' | \
+            --json databaseId,status -q '.[] | select(.status == "in_progress" or .status == "queued") | .databaseId' | \
+          while read -r run_id; do
+            if [ -n "$run_id" ]; then
+              echo "Cancelling workflow $run_id..."
+              gh run cancel "$run_id" --repo ${{ github.repository }} || true
+            fi
+          done
+
+          # Wait a moment for cancellations to complete
+          sleep 2
+
+          # Rerun all workflow runs for this commit
+          echo "Rerunning all workflows..."
+          gh run list \
+            --repo ${{ github.repository }} \
+            --commit "$PR_SHA" \
+            --json databaseId -q '.[].databaseId' | \
           while read -r run_id; do
             if [ -n "$run_id" ]; then
               echo "Rerunning workflow $run_id..."
@@ -166,6 +186,42 @@ jobs:
             -f content='+1'
 
           echo "Rerun-failed triggered successfully"
+
+      - name: Handle @flashinfer-bot stop
+        if: steps.check-permission.outputs.authorized == 'true' && steps.parse.outputs.command == 'stop'
+        env:
+          GH_TOKEN: ${{ secrets.FLASHINFER_BOT_TOKEN }}
+        run: |
+          echo "Stopping all workflows for PR #${{ github.event.issue.number }}"
+
+          # Get PR head SHA
+          PR_SHA=$(gh pr view ${{ github.event.issue.number }} \
+            --repo ${{ github.repository }} \
+            --json headRefOid -q '.headRefOid')
+
+          echo "PR HEAD SHA: $PR_SHA"
+
+          # Cancel all in-progress and queued runs
+          CANCEL_COUNT=0
+          gh run list \
+            --repo ${{ github.repository }} \
+            --commit "$PR_SHA" \
+            --json databaseId,status -q '.[] | select(.status == "in_progress" or .status == "queued") | .databaseId' | \
+          while read -r run_id; do
+            if [ -n "$run_id" ]; then
+              echo "Cancelling workflow $run_id..."
+              gh run cancel "$run_id" --repo ${{ github.repository }} || true
+              CANCEL_COUNT=$((CANCEL_COUNT + 1))
+            fi
+          done
+
+          # React with thumbs up
+          gh api \
+            -X POST \
+            "/repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
+            -f content='+1'
+
+          echo "Stop triggered successfully"
 
       - name: Unauthorized user
         if: steps.check-permission.outputs.authorized != 'true' && steps.parse.outputs.command != 'unknown'
