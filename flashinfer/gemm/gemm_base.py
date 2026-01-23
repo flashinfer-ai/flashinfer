@@ -406,6 +406,25 @@ def _cudnn_bmm_bf16_requirement(
 ):
     _validate_bf16_output_dtype(out_dtype)
     _check_cudnn_availability()
+
+    # The bf16 cudnn graph will be shared for both mm and bmm, so
+    # here we need to get the 3d shape and stride including the
+    # batch dimension for both input tensors.
+    a_shape, a_stride = _get_bf16_3d_shape_stride(A)
+    b_shape, b_stride = _get_bf16_3d_shape_stride(B)
+
+    # Build the bf16 cudnn graph. This graph will be cached & reused in bmm_bf16()
+    # because the graph is constructed with @functools.cache decorator
+    graph = create_cudnn_bf16_gemm_graph(
+        a_shape,
+        a_stride,
+        b_shape,
+        b_stride,
+        _torch_data_type_to_cudnn_data_type(out_dtype),
+        A.device,
+    )
+    graph.check_support()
+
     return True
 
 
@@ -2072,8 +2091,32 @@ def _cudnn_gemm_fp8_runner():
     return CudnnFp8GemmRunner()
 
 
+def _get_bf16_3d_shape_stride(tensor: torch.Tensor):
+    """
+    Get 3D shape and stride for bf16 tensor, expanding 2D tensors to 3D with batch=1.
+
+    This function is used to create a unified cuDNN graph that works for both
+    mm (2D) and bmm (3D) operations.
+    """
+    shape = list(tensor.shape)
+    stride = list(tensor.stride())
+
+    # If 2D tensor, insert batch dimension of 1
+    if len(shape) == 2:
+        shape.insert(0, 1)
+        stride.insert(0, tensor.numel())
+
+    return (tuple(shape), tuple(stride))
+
+
 @functools.cache
-def build_cudnn_gemm_bf16_graph(a_shape, a_stride, b_shape, b_stride, o_type, device):
+def create_cudnn_bf16_gemm_graph(a_shape, a_stride, b_shape, b_stride, o_type, device):
+    """
+    Create cuDNN graph for bf16 GEMM with execution plans, but don't validate or build.
+
+    This function creates the graph and execution plans, which will be cached.
+    The graph should be validated with check_support() before use.
+    """
     _check_cudnn_availability()
 
     stream = torch.cuda.current_stream(device)
@@ -2099,10 +2142,27 @@ def build_cudnn_gemm_bf16_graph(a_shape, a_stride, b_shape, b_stride, o_type, de
         graph.validate()
         graph.build_operation_graph()
         graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
-        graph.check_support()
-        graph.build_plans()
 
         return graph
+
+
+@functools.cache
+def build_cudnn_bf16_gemm_plans(a_shape, a_stride, b_shape, b_stride, o_type, device):
+    """
+    Get cuDNN bf16 GEMM graph and build execution plans.
+
+    This function retrieves the cached graph, validates support, and builds plans.
+    Should only be called after the graph has been validated in the requirement check.
+    """
+    # Graph should have been already cached when we ran _cudnn_bmm_bf16_requirement
+    graph = create_cudnn_bf16_gemm_graph(
+        a_shape, a_stride, b_shape, b_stride, o_type, device
+    )
+
+    graph.check_support()
+    graph.build_plans()
+
+    return graph
 
 
 def execute_cudnn_gemm_bf16_graph(graph, a, b, c_final, workspace):
@@ -2127,11 +2187,17 @@ def _cudnn_gemm_bf16(
     workspace: torch.Tensor, a: torch.Tensor, b: torch.Tensor, out: torch.Tensor
 ):
     _check_cudnn_availability()
-    graph = build_cudnn_gemm_bf16_graph(
-        a.shape,
-        a.stride(),
-        b.shape,
-        b.stride(),
+
+    # Get 3D shapes/strides to match the cached graph from requirement check
+    a_shape, a_stride = _get_bf16_3d_shape_stride(a)
+    b_shape, b_stride = _get_bf16_3d_shape_stride(b)
+
+    # Graph should have been already cached when we ran _cudnn_bmm_bf16_requirement
+    graph = build_cudnn_bf16_gemm_plans(
+        a_shape,
+        a_stride,
+        b_shape,
+        b_stride,
         _torch_data_type_to_cudnn_data_type(out.dtype),
         a.device,
     )
