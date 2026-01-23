@@ -22,6 +22,13 @@ def test_bmm_bf16(b, m, n, k, res_dtype, backend):
         )
     if not bmm_bf16.is_backend_supported(backend, compute_capability_number):
         pytest.skip(f"{backend} backend not supported on current compute capability.")
+    # cuDNN on SM103 does not support bf16 input -> fp16 output
+    if (
+        backend == "cudnn"
+        and compute_capability_number == 103
+        and res_dtype == torch.float16
+    ):
+        pytest.skip("cuDNN bf16 GEMM with fp16 output not supported on SM103.")
     torch.manual_seed(7)
     input = torch.randn([b, m, k], device="cuda", dtype=torch.bfloat16)
     mat2 = torch.randn([b, n, k], device="cuda", dtype=torch.bfloat16).transpose(-2, -1)
