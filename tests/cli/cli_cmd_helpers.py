@@ -3,7 +3,7 @@ from click.testing import CliRunner
 from flashinfer.__main__ import cli
 
 
-def _test_cmd_helper(cmd: [str]):
+def _test_cmd_helper(cmd: list[str]):
     """
     Helper for command tests
     """
