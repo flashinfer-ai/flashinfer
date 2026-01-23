@@ -183,6 +183,7 @@ def get_gemm_module():
 
 
 @supported_compute_capability([100, 103])
+@supported_compute_capability([100, 103])
 def _cutlass_mm_bf16_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -190,7 +191,7 @@ def _cutlass_mm_bf16_requirement(
     out_dtype: torch.dtype = torch.bfloat16,
     bias: Optional[torch.Tensor] = None,
     pdl: bool = False,
-    backend: Literal["cutlass", "tgv", "auto"] = "tgv",
+    backend: Literal["cudnn", "cutlass", "tgv", "auto"] = "tgv",
 ):
     if bias is not None:
         raise ValueError(
@@ -207,6 +208,31 @@ def _cutlass_mm_bf16_requirement(
 
 
 @supported_compute_capability([100, 103])
+def _cudnn_mm_bf16_requirement(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    bias: Optional[torch.Tensor] = None,
+    pdl: bool = False,
+    backend: Literal["cudnn", "cutlass", "tgv", "auto"] = "tgv",
+):
+    if bias is not None:
+        raise ValueError(
+            "You cannot use the cuDNN backend with a bias. Use the TGV backend instead."
+        )
+    if pdl:
+        raise ValueError(
+            "The cuDNN backend does not support PDL. Use the TGV backend instead."
+        )
+
+    _validate_bf16_output_dtype(out_dtype)
+    _check_cudnn_availability()
+
+    return True
+
+
+@supported_compute_capability([100, 103])
 def _tgv_gemm_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -214,7 +240,7 @@ def _tgv_gemm_requirement(
     out_dtype: torch.dtype = torch.bfloat16,
     bias: Optional[torch.Tensor] = None,
     pdl: bool = False,
-    backend: Literal["cutlass", "tgv", "auto"] = "tgv",
+    backend: Literal["cudnn", "cutlass", "tgv", "auto"] = "tgv",
 ):
     if out_dtype != torch.bfloat16:
         raise ValueError(
@@ -230,7 +256,7 @@ def _check_mm_bf16_problem_size(
     pdl: bool = False,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
-    backend: Literal["cutlass", "tgv", "auto"] = "tgv",
+    backend: Literal["cudnn", "cutlass", "tgv", "auto"] = "tgv",
 ):
     if a.dtype != torch.bfloat16:
         raise ValueError(
@@ -271,13 +297,16 @@ def _heuristic_func_mm_bf16(
     pdl: bool = False,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
-    backend: Literal["cutlass", "tgv", "auto"] = "tgv",
+    backend: Literal["cudnn", "cutlass", "tgv", "auto"] = "tgv",
 ):
     heuristic_backends = []
     if bias is not None or pdl:
+        # cuDNN and CUTLASS don't support bias/pdl, only TGV does
         if "tgv" in suitable_backends:
             heuristic_backends.append("tgv")
     else:
+        if "cudnn" in suitable_backends:
+            heuristic_backends.append("cudnn")
         if "cutlass" in suitable_backends:
             heuristic_backends.append("cutlass")
         if "tgv" in suitable_backends:
@@ -287,6 +316,7 @@ def _heuristic_func_mm_bf16(
 
 @backend_requirement(
     {
+        "cudnn": _cudnn_mm_bf16_requirement,
         "cutlass": _cutlass_mm_bf16_requirement,
         "tgv": _tgv_gemm_requirement,
     },
@@ -301,7 +331,7 @@ def mm_bf16(
     pdl: bool = False,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
-    backend: Literal["cutlass", "tgv", "auto"] = "tgv",
+    backend: Literal["cudnn", "cutlass", "tgv", "auto"] = "tgv",
 ) -> torch.Tensor:
     r"""MM BF16
 
@@ -323,10 +353,13 @@ def mm_bf16(
         Out tensor, shape (m, n), bf16 or fp16. If provided, can only be used with the CUTLASS backend. Defaults to ``None``.
 
     out_dtype: torch.dtype
-        Output dtype, bf16 or fp16. If provided, can only be used with the CUTLASS backend. Defaults to ``torch.bfloat16``.
+        Output dtype, bf16 or fp16. Can be used with the CUTLASS or cuDNN backends. Defaults to ``torch.bfloat16``.
 
-    backend: Literal["cutlass", "tgv", "auto"]
+    backend: Literal["cudnn", "cutlass", "tgv", "auto"]
         The backend to use for the operation. Defaults to ``"tgv"``.
+        ``"cudnn"`` uses the cuDNN backend (no bias/pdl support).
+        ``"cutlass"`` uses the CUTLASS backend (no bias/pdl support).
+        ``"tgv"`` uses the TGV backend (supports bias/pdl, bf16 output only).
         ``"auto"`` allows selecting the best tactic from all available backends when autotune is enabled.
 
     Returns
@@ -368,6 +401,10 @@ def mm_bf16(
     )
     if backend == "auto":
         backends = mm_bf16.suitable_auto_backends
+    elif backend == "cudnn":
+        backends = _heuristic_func_mm_bf16(
+            ["cudnn"], a, b, None, False, out, out_dtype, backend
+        )
     elif backend == "cutlass":
         backends = _heuristic_func_mm_bf16(
             ["cutlass"], a, b, None, False, out, out_dtype, backend
