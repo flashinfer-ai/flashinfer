@@ -3765,23 +3765,351 @@ def fmha_v2_prefill_deepseek(
         return out
 
 
+@flashinfer_api
 def trtllm_fmha_v2_prefill(
     query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    out: torch.Tensor,
-    num_heads: int,
-    head_dim: int,
-    seq_len: int,
-    scale_softmax: float,
-    scale_bmm1: Optional[float] = None,
-    scale_bmm2: Optional[float] = None,
-    return_lse: bool = False,
-    lse: Optional[torch.Tensor] = None,
-):
-    if not is_sm90a_supported(query.device):
-        raise ValueError("trtllm_fmha_v2_prefill is only supported on SM90 GPUs.")
+    kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+    workspace_buffer: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_q_len: int,
+    max_kv_len: int,
+    bmm1_scale: float,
+    bmm2_scale: float,
+    batch_size: int,
+    cum_seq_lens_q: torch.Tensor,
+    cum_seq_lens_kv: torch.Tensor,
+    out: Optional[Union[torch.Tensor, FP4Tensor]] = None,
+    out_dtype: Optional[Union[torch.dtype, str]] = None,
+    kv_layout: str = "HND",
+    input_layout: str = "PACKED_QKV",
+    sinks: Optional[List[torch.Tensor]] = None,
+    pos_encoding_mode: Optional[str] = "NONE",
+    logits_soft_cap_scale: Optional[float] = None,
+    mask_mode: Optional[str] = "causal",
+    window_left: int = -1,
+    chunked_attention_size: Optional[int] = 0,
+    non_blocking: Optional[bool] = True,
+    save_softmax_stats: Optional[bool] = False,
+    # enable_pdl: Optional[bool] = None,
+) -> torch.Tensor:
+    """
+    TRT-LLM FMHAv2 prefill (context) attention.
 
-    module = get_trtllm_fmha_v2_module(
-        query.dtype, seq_len, head_dim, use_logits_soft_cap=False
+    This function provides a unified interface to the TRT-LLM FMHAv2 kernel library,
+    supporting multiple GPU architectures (Ampere, Ada, Hopper) with automatic kernel
+    selection based on hardware capabilities and feature requirements.
+
+    Parameters
+    ----------
+    query : torch.Tensor
+        query tensor with shape [num_tokens, num_heads, head_dim]
+    kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        If kv_cache is a single tensor, it should be a tensor with shape [num_pages, 1 or 2, num_kv_heads, page_size, head_dim] if :attr:`kv_layout` is "HND",
+        or [num_pages, 1 or 2, page_size, num_kv_heads, head_dim] if :attr:`kv_layout` is "NHD".
+        If kv_cache is a tuple of two tensors, it should be a tuple of two tensors with shape [num_pages, num_kv_heads, page_size, head_dim] if :attr:`kv_layout` is "HND",
+        or [num_pages, page_size, num_kv_heads, head_dim] if :attr:`kv_layout` is "NHD".
+        The first tensor is the key cache, the second tensor is the value cache.
+    workspace_buffer : torch.Tensor. Must be initialized to 0 for its first use.
+        workspace
+    block_tables : torch.Tensor
+        page_table of kv cache, [batch_size, num_pages]
+    seq_lens : torch.Tensor
+        A uint32 1D tensor indicating the kv sequence length of each prompt. shape: ``[batch_size]``
+    max_q_len : int
+        max sequence length for query
+    max_kv_len : int
+        max sequence length for kv_cache
+    bmm1_scale : float
+        fused scale for bmm1 input.
+    bmm2_scale : float
+        fused scale for bmm2 input.
+    batch_size : int
+        batch size
+    cum_seq_lens_q : torch.Tensor
+        cumulative sequence length for query. shape: ``[batch_size + 1]``
+    cum_seq_lens_kv : torch.Tensor
+        cumulative sequence length for kv_cache. shape: ``[batch_size + 1]``
+    out : Optional[Union[torch.Tensor, FP4Tensor]] = None
+        output tensor, if not provided, will be allocated with ``out_dtype``, if ``out_dtype`` is not provided, will use the type of ``query``.
+    out_dtype : Optional[Union[torch.dtype, str]] = None
+        output dtype, if not provided, will use the type of ``out``.
+    kv_layout : str = "HND"
+        Layout of kv-cache, can be "HND" or "NHD", default is "HND".
+    input_layout : str = "PACKED_QKV"
+        Input layout, can be "PACKED_QKV", "CONTIGUOUS_Q_KV", "Q_PAGED_KV", "SEPARATE_Q_K_V". Defaults to "PACKED_QKV".
+    sinks : Optional[List[torch.Tensor]] = None
+        additional value per head in the denominator of the softmax.
+    pos_encoding_mode: Optional[str] = None
+        position encoding mode, can be "ALIBI" or "NONE". Defaults to "NONE".
+    logits_soft_cap_scale: Optional[float] = None
+        logits soft cap scale. Defaults to None, which means no soft cap.
+    mask_mode: Optional[str] = "CAUSAL"
+        mask mode, can be "CAUSAL", "SLIDING_WINDOW", "CHUNKED". Defaults to "CAUSAL".
+    window_left : int = -1
+        The left (inclusive) window size for the attention window, when set to ``-1``, the window
+        size will be set to the full length of the sequence. Defaults to ``-1``. Only enabled when mask_mode is "SLIDING_WINDOW".
+    chunked_attention_size: Optional[int] = 0
+        chunked attention size. Defaults to None, which means no chunked attention. Only enabled when mask_mode is "CHUNKED". Must be a power of 2.
+    non_blocking: Optional[bool] = True
+        Whether to copy the input tensors to the device asynchronously. Defaults to True.
+    save_softmax_stats: Optional[bool] = False
+        Whether to save the softmax statistics. Defaults to False.
+
+    (TODO)
+    enable_pdl : Optional[bool] = None
+        Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
+        Defaults to ``None``, which means it will be enabled if the device supports PDL.
+    Returns
+    -------
+    out: Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]
+        output torch.Tensor or tuple[torch.Tensor, torch.Tensor].
+        If return_lse is True, the output will be a tuple of two tensors, the first is the output tensor, the second is the lse tensor.
+        If return_lse is False, the output will be a single tensor.
+    """
+
+    """
+    plan:
+        num_heads, head_dim_qk, head_dim_vo, page_size, custom_mask (maybe not now),
+        causal, pos_encoding_mode (alibi or none), window_left, logits_soft_cap, sm_scale,
+        q_data_type, kv_data_type, o_data_type, non_blocking (schedule_mode)
+
+    run:
+        q, paged_kv_cache, out, lse, save_softmax_stats, enable_pdl, sinks
+
+    fused_multihead_attention.cpp:
+        params.b batch size
+        params.h query heads
+        params.d head_dim_qk
+        params.dv head_dim_v
+        s_kv seqlen
+        params.s_q query seqlen (TODO) look at q seqlen when q shorter than kv, cu_q_seqlens and cu_kv_seqlens
+
+        input layout (contiguous, separate, paged) (TODO) only paged for now
+        causal
+        sliding window
+        chunked
+        custom mask
+
+        scale_bmm1 scale for bmm1
+        scale-softmax
+        scale-bmm2
+        softcap-bmm1
+        attention-sinks
+
+        alibi
+        save-softmax
+
+    """
+    if isinstance(kv_cache, tuple):
+        k_cache, v_cache = kv_cache
+    else:
+        if kv_cache.shape[1] == 1:
+            k_cache, v_cache = kv_cache, kv_cache
+        else:
+            assert kv_cache.shape[1] == 2, (
+                "When kv_cache is a single tensor, the second dimension must be 1 or 2"
+            )
+            # unbind transforms [num_pages, 2, ...] to ([num_pages, ...], [num_pages, ...])
+            k_cache, v_cache = kv_cache.unbind(dim=1)
+
+    if kv_layout == "HND":
+        # For NHD: [..., N, H, D] -> HND: [..., H, N, D]
+        k_cache = k_cache.transpose(-3, -2)
+        v_cache = v_cache.transpose(-3, -2)
+
+    num_qo_heads = query.shape[1]
+    head_dim_qk = query.shape[2]
+    kv_dtype = k_cache.dtype
+    num_kv_heads = k_cache.shape[1]
+    page_size = k_cache.shape[2]
+    head_dim_vo = v_cache.shape[2] if v_cache.shape[3] != head_dim_qk else 0
+
+    # Determine output dtype
+    if out is not None:
+        o_dtype = out.dtype
+    elif out_dtype is not None:
+        o_dtype = canonicalize_torch_dtype(out_dtype)
+    else:
+        o_dtype = query.dtype
+
+    # Allocate output tensor if not provided
+    if out is None:
+        out = torch.empty(
+            (query.shape[0], num_qo_heads, head_dim_vo),
+            dtype=o_dtype,
+            device=query.device,
+        )
+
+    # Allocate LSE tensor if saving softmax stats
+    lse = None
+    if save_softmax_stats:
+        lse = torch.empty(
+            (batch_size, max_q_len, num_qo_heads, 2),
+            dtype=torch.float32,
+            device=query.device,
+        )
+
+    # Convert mask_mode string to integer code
+    # 0=PADDING, 1=CAUSAL, 2=SLIDING_OR_CHUNKED_CAUSAL, 3=CUSTOM_MASK
+    mask_mode_map = {
+        "padding": 0,
+        "causal": 1,
+        "sliding_window": 2,
+        "chunked": 2,
+        "custom": 3,
+    }
+    mask_mode_code = mask_mode_map.get(mask_mode.lower(), 1)  # default to causal
+
+    # Convert input_layout string to integer code
+    # 0=PACKED_QKV, 1=CONTIGUOUS_Q_KV, 2=Q_PAGED_KV, 3=SEPARATE_Q_K_V
+    input_layout_map = {
+        "packed_qkv": 0,
+        "contiguous_q_kv": 1,
+        "q_paged_kv": 2,
+        "separate_q_k_v": 3,
+    }
+    input_layout_code = input_layout_map.get(
+        input_layout.lower(), 2
+    )  # default to Q_PAGED_KV
+
+    # Convert output dtype to Data_type integer code
+    # DATA_TYPE_FP16=0, DATA_TYPE_BF16=1, DATA_TYPE_FP32=2, DATA_TYPE_INT8=3, DATA_TYPE_E4M3=4
+    dtype_to_code_map = {
+        torch.float16: 0,
+        torch.bfloat16: 1,
+        torch.float32: 2,
+        torch.int8: 3,
+    }
+    if hasattr(torch, "float8_e4m3fn"):
+        dtype_to_code_map[torch.float8_e4m3fn] = 4
+    output_dtype_code = dtype_to_code_map.get(o_dtype, 0)  # default to FP16
+
+    # Handle scale parameters
+    scale_bmm1 = float(bmm1_scale)
+    scale_bmm2 = float(bmm2_scale)
+
+    # Softmax scale is typically 1.0 for FP8 and auto for FP16/BF16
+    is_e4m3 = (
+        query.dtype == torch.float8_e4m3fn if hasattr(torch, "float8_e4m3fn") else False
     )
+    scale_softmax = 1.0 if is_e4m3 else 1.0
+
+    # Softcapping scale (0.0 means disabled)
+    softcapping_scale = (
+        logits_soft_cap_scale if logits_soft_cap_scale is not None else 0.0
+    )
+
+    # Get the JIT-compiled module
+    module = get_trtllm_fmha_v2_module(
+        q_dtype=query.dtype,
+        kv_dtype=kv_dtype,
+        o_dtype=o_dtype,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim_qk=head_dim_qk,
+        head_dim_vo=head_dim_vo,
+        input_layout=input_layout,
+        page_size=page_size,
+        pos_encoding_mode=pos_encoding_mode,
+        use_logits_soft_cap=softcapping_scale > 0,
+        save_softmax_stats=save_softmax_stats,
+        mask_mode=mask_mode,
+        non_blocking=non_blocking,
+    )
+
+    module.run(
+        query,  # Q tensor
+        k_cache,  # K tensor
+        v_cache,  # V tensor
+        out,  # Output tensor
+        workspace_buffer,  # Workspace buffer
+        workspace_buffer.numel()
+        * workspace_buffer.element_size(),  # Workspace buffer size in bytes
+        block_tables,  # Block tables
+        page_size,
+        seq_lens,  # Sequence length for kv_cache
+        cum_seq_lens_q,  # Cumulative sequence length for query
+        cum_seq_lens_kv,  # Cumulative sequence length for kv_cache
+        input_layout_code,  # Input layout (int)
+        output_dtype_code,  # Output dtype (int)
+        max_q_len,  # Max sequence length for query
+        max_kv_len,  # Max sequence length for kv_cache
+        batch_size,  # Batch size
+        mask_mode_code,  # Attention mask type
+        scale_softmax,  # Softmax scale
+        scale_bmm1,  # BMM1 scale
+        scale_bmm2,  # BMM2 scale
+        window_left,  # Window left
+        chunked_attention_size,  # Chunked attention size
+        pos_encoding_mode == "ALIBI",  # Alibi mode
+        softcapping_scale,  # Softcapping scale (0.0 = disabled)
+        lse,  # Optional LSE tensor (None if not saving softmax stats)
+        sinks,  # Optional sinks tensor
+    )
+
+    # if input_layout == "PAGED_QKV":
+    #     # paged_run
+    #     module.paged_run(
+    #         query,           # Q tensor
+    #         k_cache,         # K tensor
+    #         v_cache,         # V tensor
+    #         out,             # Output tensor
+    #         workspace_buffer, # Workspace buffer
+    #         workspace_buffer.size() * workspace_buffer.element_size(), # Workspace buffer size in bytes
+    #         block_tables,    # Block tables
+    #         page_size,
+    #         seq_lens,        # Sequence length for kv_cache
+    #         cum_seq_lens_q,  # Cumulative sequence length for query
+    #         cum_seq_lens_kv,  # Cumulative sequence length for kv_cache
+    #         input_layout,    # Input layout
+    #         o_dtype,         # Output dtype
+    #         max_q_len,        # Max sequence length for query
+    #         max_kv_len,       # Max sequence length for kv_cache
+    #         batch_size,       # Batch size
+    #         mask_mode_code,  # Attention mask type
+    #         scale_softmax,   # Softmax scale
+    #         scale_bmm1,      # BMM1 scale
+    #         scale_bmm2,      # BMM2 scale
+    #         window_left,     # Window left
+    #         chunked_attention_size,  # Chunked attention size
+    #         pos_encoding_mode == "ALIBI",  # Alibi mode
+    #         softcapping_scale,  # Softcapping scale (0.0 = disabled)
+    #         lse,               # Optional LSE tensor (None if not saving softmax stats)
+    #         sinks,             # Optional sinks tensor
+    #     )
+    # else:
+    #     # ragged_run
+    #     module.ragged_run(
+    #         query,           # Q tensor
+    #         k_cache,         # K tensor
+    #         v_cache,         # V tensor
+    #         out,             # Output tensor
+    #         workspace_buffer, # Workspace buffer
+    #         workspace_buffer.size() * workspace_buffer.element_size(), # Workspace buffer size in bytes
+    #         block_tables,    # Block tables
+    #         page_size,
+    #         seq_lens,        # Sequence length for kv_cache
+    #         cum_seq_lens_q,  # Cumulative sequence length for query
+    #         cum_seq_lens_kv,  # Cumulative sequence length for kv_cache
+    #         input_layout,    # Input layout
+    #         o_dtype,         # Output dtype
+    #         max_q_len,        # Max sequence length for query
+    #         max_kv_len,       # Max sequence length for kv_cache
+    #         batch_size,       # Batch size
+    #         mask_mode_code,  # Attention mask type
+    #         scale_softmax,   # Softmax scale
+    #         scale_bmm1,      # BMM1 scale
+    #         scale_bmm2,      # BMM2 scale
+    #         window_left,     # Window left
+    #         chunked_attention_size,  # Chunked attention size
+    #         pos_encoding_mode == "ALIBI",  # Alibi mode
+    #         softcapping_scale,  # Softcapping scale (0.0 = disabled)
+    #         lse,               # Optional LSE tensor (None if not saving softmax stats)
+    #         sinks,             # Optional sinks tensor
+    #     )
+
+    if save_softmax_stats:
+        return out, lse
+    else:
+        return out

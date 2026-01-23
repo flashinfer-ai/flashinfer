@@ -14,26 +14,68 @@
  * limitations under the License.
  */
 
+#include <flashinfer/allocator.h>
+#include <fused_multihead_attention.h>
+
 #include <algorithm>
 #include <cassert>
+#include <climits>
+#include <cmath>
 #include <cstring>
 #include <numeric>
+#include <tuple>
 
 #include "fmha_v2_dispatcher.h"
 #include "tvm_ffi_utils.h"
 
 using tvm::ffi::Optional;
+namespace ffi = tvm::ffi;
 
 using Launch_params = bert::Fused_multihead_attention_launch_params;
 using Attention_mask_type = fmha::Attention_mask_type;
 using Attention_input_layout = fmha::Attention_input_layout;
 using Kv_block_array = fmha::Kv_block_array;
+using AlignedAllocator = flashinfer::AlignedAllocator;
+
+// Maximum number of storage loops per kernel (from fmha_library.py)
+constexpr int MAX_STGS_PER_LOOP = 4;
+
+inline std::tuple<size_t, size_t, size_t> get_warps(Launch_params& launch_params, int sm,
+                                                    Data_type data_type, size_t s, size_t b,
+                                                    size_t d, int version) {
+  size_t warps_m, warps_n, warps_k = 1;
+  // const bool interleaved         = launch_params.interleaved;
+  // const bool use_tma             = launch_params.use_tma;
+  // const bool force_unroll        = launch_params.force_unroll;
+  // const bool ignore_b1opt        = launch_params.ignore_b1opt;
+  // const bool use_flash_attention = launch_params.flash_attention;
+  // // tiled variant uses ldgsts
+  // const bool use_tiled           = launch_params.use_granular_tiling;
+  // const bool warp_specialization = launch_params.warp_specialization;
+  warps_m = 4;
+  warps_n = 1;
+
+  return std::make_tuple(warps_m, warps_n, warps_k);
+}
+
+// The number of CTAs and threads per CTA to launch the kernel.
+inline void get_grid_size(int& heads_per_wave, int& ctas_per_head, int sm, Data_type data_type,
+                          size_t b, size_t s, size_t h, size_t d, bool use_multi_ctas,
+                          int version) {
+  // Determine the number of CTAs per head (kernel constant).
+  int max_heads_per_wave = 0;
+  ctas_per_head = 1;
+  heads_per_wave = b * h;
+
+  // Adjust the number of heads per wave.
+  if (heads_per_wave > max_heads_per_wave) {
+    heads_per_wave = max_heads_per_wave;
+  }
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-// Helper functions
+// set_params - copied exactly from fused_multihead_attention.cpp
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-
-namespace flashinfer {
 
 static inline void set_params(bert::Fused_multihead_attention_params_v2& params,
                               const Launch_params launch_params,
@@ -215,6 +257,8 @@ static inline void set_params(bert::Fused_multihead_attention_params_v2& params,
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+// determine_launch_params - copied exactly from fused_multihead_attention.cpp
+////////////////////////////////////////////////////////////////////////////////////////////////////
 
 static inline void determine_launch_params(
     Launch_params& launch_params, Data_type data_type, int sm, const size_t s, const size_t d,
@@ -262,77 +306,394 @@ static inline void determine_launch_params(
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+// Helper function to convert DLDataType to Data_type enum
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+static inline Data_type dltype_to_data_type(DLDataType dtype) {
+  if (dtype.code == kDLFloat && dtype.bits == 16) {
+    return DATA_TYPE_FP16;
+  } else if (dtype.code == kDLBfloat && dtype.bits == 16) {
+    return DATA_TYPE_BF16;
+  } else if (dtype.code == kDLFloat8_e4m3fn && dtype.bits == 8) {
+    return DATA_TYPE_E4M3;
+  } else if (dtype.code == kDLFloat && dtype.bits == 32) {
+    return DATA_TYPE_FP32;
+  } else if (dtype.code == kDLInt && dtype.bits == 8) {
+    return DATA_TYPE_INT8;
+  }
+  assert(false && "Unsupported data type");
+  return DATA_TYPE_FP16;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
 // Main run function - called by fmha_v2_jit_binding.cu
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-void fmha_v2_run(ffi::TensorView q, ffi::TensorView k, ffi::TensorView v, ffi::TensorView o,
-                 Optional<ffi::TensorView> maybe_lse, int64_t mask_mode_code, float scale_softmax,
-                 float scale_bmm1, float scale_bmm2, float softcapping_scale) {
-  CudaDevice device;
-  // // Extract tensor dimensions
-  // const int64_t batch_size = q.size(0);
-  // const int64_t q_seqlen = q.size(1);
-  // const int64_t kv_seqlen = k.size(1);
-  // const int64_t num_heads = q.size(2);
-  // const int64_t num_kv_heads = k.size(2);
-  // const int64_t head_dim = q.size(3);
-  // const int64_t head_dim_v = v.size(3);
-
-  // // Get device properties
-  // ffi::CUDADeviceGuard device_guard(q.device().device_id);
-  // cudaStream_t stream = get_stream(q.device());
-
-  // int device_id;
-  // cudaGetDevice(&device_id);
-  // cudaDeviceProp props;
-  // cudaGetDeviceProperties(&props, device_id);
-  // int sm = props.major * 10 + props.minor;
-
-  // // Mask mode
-  // Attention_mask_type mask_mode = static_cast<Attention_mask_type>(mask_mode_code);
-
-  // // Allocate cumulative sequence lengths on device
-  // std::vector<int32_t> cu_seqlens(batch_size + 1);
-  // for (int i = 0; i <= batch_size; i++) {
-  //     cu_seqlens[i] = i * q_seqlen;
-  // }
-  // void* cu_seqlens_d;
-  // cudaMalloc(&cu_seqlens_d, sizeof(int32_t) * cu_seqlens.size());
-  // cudaMemcpyAsync(cu_seqlens_d, cu_seqlens.data(), sizeof(int32_t) * cu_seqlens.size(),
-  //                 cudaMemcpyHostToDevice, stream);
-
-  // // Scale BMM2 device memory
-  // void* scale_bmm2_d;
-  // cudaMalloc(&scale_bmm2_d, sizeof(uint32_t));
-
-  // // Initialize params
-  // Params params;
-  // Launch_params launch_params;
-
-  // determine_launch_params(launch_params, sm, q_seqlen, kv_seqlen, mask_mode, props);
-
-  // set_params(
-  //     params, launch_params,
-  //     batch_size, q_seqlen, kv_seqlen,
-  //     num_heads, num_kv_heads,
-  //     head_dim, head_dim_v,
-  //     q.data_ptr(), k.data_ptr(), v.data_ptr(), o.data_ptr(),
-  //     maybe_lse.has_value() ? maybe_lse.value().data_ptr() : nullptr,
-  //     cu_seqlens_d, cu_seqlens_d,
-  //     scale_bmm1, scale_softmax, scale_bmm2,
-  //     softcapping_scale);
-
-  // params.scale_bmm2_d = reinterpret_cast<uint32_t*>(scale_bmm2_d);
-  // cudaMemcpyAsync(params.scale_bmm2_d, &params.scale_bmm2, sizeof(uint32_t),
-  //                 cudaMemcpyHostToDevice, stream);
-
-  // // Call the JIT-generated kernel through the fixed-name wrapper
-  // // The dispatcher routes to the actual launcher generated by get_kernel_code()
-  fmha_v2_run_kernel(params, launch_params, stream);
-
-  // // Cleanup temporary allocations
-  // cudaFree(scale_bmm2_d);
-  // cudaFree(cu_seqlens_d);
+void fmha_v2_paged_run(ffi::TensorView q, ffi::TensorView k, ffi::TensorView v, ffi::TensorView o,
+                       ffi::TensorView workspace_buffer, size_t workspace_buffer_size_in_bytes,
+                       ffi::TensorView block_tables, int page_size, ffi::TensorView seq_lens,
+                       ffi::TensorView cum_seq_lens_q, ffi::TensorView cum_seq_lens_kv,
+                       Attention_input_layout input_layout, Data_type output_dtype, int max_q_len,
+                       int max_kv_len, int batch_size, int64_t mask_mode_code, float scale_softmax,
+                       float scale_bmm1, float scale_bmm2, int window_left,
+                       int chunked_attention_size, bool has_alibi, float softcapping_scale,
+                       Optional<ffi::TensorView> softmax_stats, Optional<ffi::TensorView> sinks) {
+  // TODO: Implement paged run
 }
 
-}  // namespace flashinfer
+void fmha_v2_ragged_run(ffi::TensorView q, ffi::TensorView k, ffi::TensorView v, ffi::TensorView o,
+                        ffi::TensorView workspace_buffer, size_t workspace_buffer_size_in_bytes,
+                        ffi::TensorView block_tables, int page_size, ffi::TensorView seq_lens,
+                        ffi::TensorView cum_seq_lens_q, ffi::TensorView cum_seq_lens_kv,
+                        Attention_input_layout input_layout, Data_type output_dtype, int max_q_len,
+                        int max_kv_len, int batch_size, int64_t mask_mode_code, float scale_softmax,
+                        float scale_bmm1, float scale_bmm2, int window_left,
+                        int chunked_attention_size, bool has_alibi, float softcapping_scale,
+                        Optional<ffi::TensorView> softmax_stats, Optional<ffi::TensorView> sinks) {
+  fmha_v2_paged_run(q, k, v, o, workspace_buffer, workspace_buffer_size_in_bytes, block_tables,
+                    page_size, seq_lens, cum_seq_lens_q, cum_seq_lens_kv, input_layout,
+                    output_dtype, max_q_len, max_kv_len, batch_size, mask_mode_code, scale_softmax,
+                    scale_bmm1, scale_bmm2, window_left, chunked_attention_size, has_alibi,
+                    softcapping_scale, softmax_stats, sinks);
+}
+
+void fmha_v2_run(
+    ffi::TensorView q,  // [batch, s_q, num_heads, head_dim]
+    ffi::TensorView k,  // [batch, s_kv, num_kv_heads, head_dim]
+    ffi::TensorView v,  // [batch, s_kv, num_kv_heads, head_dim_v]
+    ffi::TensorView o,  // [batch, s_q, num_heads, head_dim_v]
+    ffi::TensorView workspace_buffer, size_t workspace_buffer_size_in_bytes,
+    ffi::TensorView block_tables,  // [batch, num_pages]
+    int page_size,
+    ffi::TensorView seq_lens,         // [batch]
+    ffi::TensorView cum_seq_lens_q,   // [batch + 1]
+    ffi::TensorView cum_seq_lens_kv,  // [batch + 1]
+    int input_layout_int,             // Cast from int for TVM FFI compatibility
+    int output_dtype_int,             // Cast from int for TVM FFI compatibility
+    int max_q_len, int max_kv_len, int batch_size,
+    int64_t mask_mode_code,  // 0=PADDING, 1=CAUSAL, 2=SLIDING_OR_CHUNKED_CAUSAL, 3=CUSTOM_MASK
+    float scale_softmax, float scale_bmm1, float scale_bmm2, int window_left,
+    int chunked_attention_size, bool has_alibi, float softcapping_scale,
+    Optional<ffi::TensorView> softmax_stats,  // Optional [batch, s_q, num_heads, 2] for (max, sum)
+    Optional<ffi::TensorView> sinks) {
+  // Cast int parameters to enum types
+  Attention_input_layout input_layout = static_cast<Attention_input_layout>(input_layout_int);
+  Data_type output_dtype = static_cast<Data_type>(output_dtype_int);
+  // Get device properties
+  CudaDevice device;
+  int sm = device.sm;
+  cudaDeviceProp props = device.props;
+
+  cudaStream_t stream = static_cast<cudaStream_t>(get_stream(q.device()));
+
+  // Tensor passed in is always "HND" (num_heads, , head_dim) layout
+  // Extract dimensions from tensors (use parameter batch_size, not re-extract)
+  const size_t b = batch_size;
+  const size_t h = q.shape()[2];     // num_heads
+  const size_t h_kv = k.shape()[2];  // num_kv_heads
+  const size_t d = q.shape()[3];     // head_dim_qk
+  const size_t dv = v.shape()[3];    // head_dim_v
+  const size_t s_q = max_q_len;
+  const size_t s_kv = max_kv_len;
+  const size_t s = s_kv;  // For compatibility with existing code
+
+  // Determine data types from input tensors
+  Data_type data_type = dltype_to_data_type(q.dtype());
+  Data_type acc_type =
+      (data_type == DATA_TYPE_BF16 || data_type == DATA_TYPE_FP16) ? DATA_TYPE_FP32 : data_type;
+
+  int tokens_per_block = page_size;
+  float softcapping_scale_bmm1 = softcapping_scale;
+
+  bool force_fp32_acc = (acc_type == DATA_TYPE_FP32);
+
+  // Determine attention mask type from mask_mode_code
+  Attention_mask_type attention_mask_type = static_cast<Attention_mask_type>(mask_mode_code);
+
+  // Sliding window attention parameters
+  if (window_left > 0 && window_left < static_cast<int>(s)) {
+    assert(chunked_attention_size == 0 &&
+           "chunked_attention_size should not be used when sliding_window_size is set");
+    attention_mask_type = Attention_mask_type::SLIDING_OR_CHUNKED_CAUSAL;
+  }
+  // Chunked attention.
+  if (chunked_attention_size > 0) {
+    assert((chunked_attention_size & (chunked_attention_size - 1)) == 0 &&
+           "chunked_attention_size has to be a power of 2");
+    attention_mask_type = Attention_mask_type::SLIDING_OR_CHUNKED_CAUSAL;
+  }
+  size_t sliding_window_size = size_t(INT_MAX);
+  if (attention_mask_type == Attention_mask_type::SLIDING_OR_CHUNKED_CAUSAL) {
+    if (window_left != -1) {
+      sliding_window_size = size_t(window_left);
+    }
+  }
+
+  // Calculate total tokens for variable-length sequences
+  // UNCERTAIN: For paged KV cache, this might need to come from cum_seq_lens
+  uint32_t total = b * s_q;  // Conservative estimate
+
+  AlignedAllocator allocator(workspace_buffer.data_ptr(), workspace_buffer_size_in_bytes);
+
+  // Validation for softmax save with MLA
+  if (softmax_stats.has_value()) {
+    bool is_MLA = (d == 192 && dv == 128);
+    if (((!is_MLA) && input_layout != Attention_input_layout::CONTIGUOUS_Q_KV) ||
+        (is_MLA && input_layout != Attention_input_layout::SEPARATE_Q_K_V)) {
+      fprintf(stderr,
+              "For normal attention, only CONTIGUOUS_Q_KV layout supports saving softmax stats. "
+              "For MLA only SEPARATE_Q_K_V layout supports saving softmax stats.\n");
+      exit(1);
+    }
+  }
+
+  // Validate different q and kv lengths
+  if (s_q != s_kv) {
+    assert(input_layout != Attention_input_layout::PACKED_QKV &&
+           "Packed QKV input layout is not supported with different q and kv lengths.");
+    assert(s_kv >= s_q && "q seqlen has to be smaller than or equal to the kv seqlen!");
+  }
+
+  // Set the attention scale (default: 1/sqrt(d))
+  if (scale_bmm1 == 0.f) {
+    scale_bmm1 = 1.f / sqrtf(static_cast<float>(d));
+  }
+
+  // Adjust softmax scale for different data types
+  if (data_type == DATA_TYPE_FP16 && scale_softmax == 0.f) {
+    scale_softmax = 1.f;
+  } else if (data_type == DATA_TYPE_INT8 && scale_softmax == 0.f) {
+    scale_softmax = std::max(512.f, static_cast<float>(s));
+  } else if (data_type == DATA_TYPE_E4M3 && scale_softmax == 0.f) {
+    scale_softmax = 1.f;
+  }
+
+  // Enable causal mask if using alibi
+  if (has_alibi && attention_mask_type == Attention_mask_type::PADDING) {
+    attention_mask_type = Attention_mask_type::CAUSAL;
+  }
+
+  // BF16 only supports FP32 accumulation
+  if (data_type == DATA_TYPE_BF16 && acc_type != DATA_TYPE_FP32) {
+    fprintf(stderr, "Only FP32 accumulation is supported for BF16 I/O\n");
+    exit(1);
+  }
+
+  // Determine the launch params to select kernels
+  Launch_params launch_params;
+  determine_launch_params(launch_params, data_type, sm, s, d, attention_mask_type, input_layout,
+                          false, false, false, false, false, false, false, force_fp32_acc, props);
+
+  // The decomposition of threads and warps for BMM1.
+  size_t warps_m, warps_n, warps_k;
+  std::tie(warps_m, warps_n, warps_k) = get_warps(launch_params, sm, data_type, s, b, d, 2);
+
+  // For multi-CTA cases, determine the size of the CTA wave.
+  int heads_per_wave, ctas_per_head;
+  get_grid_size(heads_per_wave, ctas_per_head, sm, data_type, b, s, h, d,
+                false,  // disable multi-cta kernels by default
+                2);
+
+  // The number of threads per CTA.
+  const size_t threads_per_cta = warps_m * warps_n * warps_k * 32;
+  // The number of mmas in the M dimension. We use one uint32_t per MMA in the M dimension.
+  size_t mmas_m = (s + 16 * warps_m - 1) / (16 * warps_m);
+  // The number of mmas in the N dimension.
+  size_t mmas_n = (s + 16 * warps_n - 1) / (16 * warps_n);
+  // The packed mask for dropout (in the fused kernel). Layout is B * MMAS_M * THREADS_PER_CTA.
+  size_t packed_mask_size = b * mmas_m * threads_per_cta;
+
+  // Flash attention on Ampere and Hopper, which supports multiple mmas_n
+  if (attention_mask_type == Attention_mask_type::CUSTOM_MASK) {
+    // We need to align q and k sequence lengths.
+    size_t rounded_q_s = align_to(s, size_t(fmha::FLASH_ATTEN_MASK_M_ALIGNMENT));
+    size_t rounded_k_s = align_to(s, size_t(fmha::FLASH_ATTEN_MASK_N_ALIGNMENT));
+    // The number of mmas in the M dimension (MMA_M = 64).
+    mmas_m = rounded_q_s / fmha::FLASH_ATTEN_MASK_MMA_M;
+    // The number of mmas in the N dimension (MMA_N = 64).
+    mmas_n = rounded_k_s / fmha::FLASH_ATTEN_MASK_MMA_N;
+    // Each thread holds 32 bit (2 rows, 16 cols -> 8 core MMAs) in one MMA here.
+    packed_mask_size = b * mmas_m * mmas_n * threads_per_cta;
+  }
+  // The size in bytes.
+  const size_t packed_mask_size_in_bytes = packed_mask_size * sizeof(uint32_t);
+
+  // Packed mask (allocated conditionally for CUSTOM_MASK)
+  void* packed_mask_d =
+      (attention_mask_type == Attention_mask_type::CUSTOM_MASK)
+          ? allocator.aligned_alloc<void>(packed_mask_size_in_bytes, 128, "packed_mask_d")
+          : nullptr;
+
+  // Scale bmm2 (per-tensor scalar, single uint32_t)
+  void* scale_bmm2_d = allocator.aligned_alloc<void>(sizeof(uint32_t), 16, "scale_bmm2_d");
+
+  // The O matrix workspace (if needed for intermediate storage)
+  // UNCERTAIN: This might be redundant if we write directly to the output tensor
+  const size_t o_size = s * b * h * dv;
+  const size_t o_size_in_bytes = get_size_in_bytes(o_size, output_dtype);
+
+  // Softmax stats: stores (max, sum) per token, 2 floats per (b, s_q, h)
+  const size_t softmax_stats_size = 2 * sizeof(float) * b * s_q * h;
+  void* softmax_stats_d = allocator.aligned_alloc<void>(softmax_stats_size, 128, "softmax_stats_d");
+  void* softmax_stats_ptr = softmax_stats.has_value() ? softmax_stats_d : nullptr;
+  void* attention_sinks_d = nullptr;
+
+  // Initialize pointers for different input layouts
+  void* qkv_packed_d = nullptr;
+  void* q_d = nullptr;
+  void* k_d = nullptr;
+  void* v_d = nullptr;
+  void* contiguous_kv_d = nullptr;
+  void* kv_cache_pool_ptr = nullptr;
+  int32_t* kv_cache_block_offsets_d = nullptr;
+
+  switch (input_layout) {
+    case Attention_input_layout::PACKED_QKV:
+      qkv_packed_d = q.data_ptr();
+      break;
+    case Attention_input_layout::CONTIGUOUS_Q_KV:
+      q_d = q.data_ptr();
+      contiguous_kv_d = k.data_ptr();
+      // should kv both be packed when passed in together?? probably right
+      break;
+    case Attention_input_layout::SEPARATE_Q_K_V:
+      q_d = q.data_ptr();
+      k_d = k.data_ptr();
+      v_d = v.data_ptr();
+      break;
+    case Attention_input_layout::Q_PAGED_KV:
+      q_d = q.data_ptr();
+      kv_cache_pool_ptr = k.data_ptr();
+      kv_cache_block_offsets_d = static_cast<int32_t*>(block_tables.data_ptr());
+      break;
+    default:
+      assert(false && "Invalid input layout");
+      break;
+  }
+
+  // TODO: need to add/derive the following variables for set_params:
+  // - cu_mask_rows_d           (void*) cumulative mask rows
+  // - attention_sinks_d        (void*) attention sinks
+  // - cu_seqlens_d             (void*) cumulative kv sequence lengths
+  //
+  // Also undeclared but used elsewhere:
+  // - mqa_qkv_d, qkv_bsh3d_d, mqa_qkv_packed_d, qkv_packed_d (for qkv_d_view)
+  // - o_packed_d, o_packed_size (for o_d_view)
+  // - save_softmax (bool for softmax_stats_ptr)
+  // - q_seqlens, seqlens (for launch_params)
+
+  bert::Fused_multihead_attention_params_v2 params_v2;
+  // Print all param set values before calling set_params
+  bool debug = true;
+  if (debug) {
+    printf("=== set_params() arguments ===\n");
+    printf("launch_params: ...\n");  // For struct, maybe print pointer or describe
+    printf("data_type: %d\n", int(data_type));
+    printf("acc_type: %d\n", int(acc_type));
+    printf("output_dtype: %d\n", int(output_dtype));
+    printf("input_layout: %d\n", int(input_layout));
+    printf("b: %zu\n", size_t(b));
+    printf("s_q: %zu\n", size_t(s_q));
+    printf("s: %zu\n", size_t(s));
+    printf("h: %zu\n", size_t(h));
+    printf("h_kv: %zu\n", size_t(h_kv));
+    printf("d: %zu\n", size_t(d));
+    printf("dv: %zu\n", size_t(dv));
+    printf("total: %zu\n", size_t(total));
+    printf("sliding_window_size: %zu\n", size_t(sliding_window_size));
+    printf("chunked_attention_size: %zu\n", size_t(chunked_attention_size));
+    printf("tokens_per_block: %zu\n", size_t(tokens_per_block));
+    printf("qkv_packed_d: %p\n", qkv_packed_d);
+    printf("q_d: %p\n", q_d);
+    printf("k_d: %p\n", k_d);
+    printf("v_d: %p\n", v_d);
+    printf("contiguous_kv_d: %p\n", contiguous_kv_d);
+    printf("kv_cache_pool_ptr: %p\n", kv_cache_pool_ptr);
+    printf("kv_cache_block_offsets_d: %p\n", kv_cache_block_offsets_d);
+    printf("packed_mask_d: %p\n", packed_mask_d);
+    printf("attention_sinks_d: %p\n", attention_sinks_d);
+    printf("cum_seq_lens_kv: %p\n", cum_seq_lens_kv.data_ptr());
+    printf("cum_seq_lens_q: %p\n", cum_seq_lens_q.data_ptr());
+    printf("o: %p\n", o.data_ptr());
+    printf("softmax_stats_ptr: %p\n", softmax_stats_ptr);
+    printf("scale_bmm2_d: %p\n", scale_bmm2_d);
+    printf("scale_bmm1: %f\n", scale_bmm1);
+    printf("scale_softmax: %f\n", scale_softmax);
+    printf("scale_bmm2: %f\n", scale_bmm2);
+    printf("softcapping_scale_bmm1: %f\n", softcapping_scale_bmm1);
+    printf("has_alibi: %d\n", int(has_alibi));
+    printf("=============================\n");
+  }
+
+  set_params(params_v2, launch_params, data_type, acc_type, output_dtype, input_layout, b, s_q, s,
+             h, h_kv, d, dv, total, 1, sliding_window_size, chunked_attention_size,
+             // Paged kv cache.
+             tokens_per_block, qkv_packed_d, q_d, k_d, v_d, contiguous_kv_d, kv_cache_pool_ptr,
+             kv_cache_block_offsets_d, packed_mask_d, nullptr, attention_sinks_d,
+             static_cast<void*>(cum_seq_lens_kv.data_ptr()),
+             static_cast<void*>(cum_seq_lens_q.data_ptr()), o.data_ptr(), nullptr, nullptr,
+             softmax_stats_ptr, scale_bmm2_d, scale_bmm1, scale_softmax, scale_bmm2,
+             softcapping_scale_bmm1, false, false, false, has_alibi);
+
+  // total number of tokens is needed to set TMA desc on the host.
+  // Access cumulative sequence lengths from device memory
+  uint32_t* cum_seq_lens_q_ptr = static_cast<uint32_t*>(cum_seq_lens_q.data_ptr());
+  uint32_t* cum_seq_lens_kv_ptr = static_cast<uint32_t*>(cum_seq_lens_kv.data_ptr());
+  launch_params.total_q_seqlen = s_q * b;    // For now, use batch_size * max_q_len
+  launch_params.total_kv_seqlen = s_kv * b;  // For now, use batch_size * max_kv_len
+  // set enable_attn_logit_softcapping to select the right kernel.
+  launch_params.enable_attn_logit_softcapping = softcapping_scale_bmm1 != 0.f;
+
+  // Compute sizes for conditional allocations
+  size_t counters_sz = (ctas_per_head > 1) ? heads_per_wave * sizeof(int) : 0;
+  size_t softmax_scratch_sz =
+      (ctas_per_head > 1) ? heads_per_wave * ctas_per_head * threads_per_cta * sizeof(float) : 0;
+  size_t o_scratch_sz = (ctas_per_head > 1 && data_type != DATA_TYPE_FP16)
+                            ? heads_per_wave * threads_per_cta * MAX_STGS_PER_LOOP * sizeof(uint4)
+                            : 0;
+
+  // Allocate barriers and locks
+  void* counters_d = (counters_sz > 0)
+                         ? allocator.aligned_alloc<void>(3 * counters_sz, 16, "counters_d")
+                         : nullptr;
+  // Allocate scratch storage for softmax
+  void* max_scratch_d = (softmax_scratch_sz > 0) ? allocator.aligned_alloc<void>(
+                                                       softmax_scratch_sz, 128, "max_scratch_d")
+                                                 : nullptr;
+  void* sum_scratch_d = (softmax_scratch_sz > 0) ? allocator.aligned_alloc<void>(
+                                                       softmax_scratch_sz, 128, "sum_scratch_d")
+                                                 : nullptr;
+  // Allocate temporary storage for the parallel reduction
+  void* o_scratch_d = (o_scratch_sz > 0)
+                          ? allocator.aligned_alloc<void>(o_scratch_sz, 128, "o_scratch_d")
+                          : nullptr;
+  // Allocate tile id for dynamic scheduling
+  void* tile_id_counter_d =
+      allocator.aligned_alloc<void>(sizeof(uint32_t), 16, "tile_id_counter_d");
+
+  // The number of heads computed per wave.
+  params_v2.heads_per_wave = heads_per_wave;
+
+  // Barriers for the global sync in the multi-CTA kernel(s).
+  params_v2.counters = (int*)counters_d + 0 * heads_per_wave;
+  params_v2.max_barriers = (int*)counters_d + 0 * heads_per_wave;
+  params_v2.sum_barriers = (int*)counters_d + 1 * heads_per_wave;
+  params_v2.locks = (int*)counters_d + 2 * heads_per_wave;
+
+  // Scratch storage for softmax.
+  params_v2.max_scratch_ptr = (float*)max_scratch_d;
+  params_v2.sum_scratch_ptr = (float*)sum_scratch_d;
+
+  // Scratch storage for output.
+  params_v2.o_scratch_ptr = (int*)o_scratch_d;
+
+  // Tile id counter for dynamic scheduling
+  params_v2.tile_id_counter_ptr = (uint32_t*)tile_id_counter_d;
+
+  // V2 Custom Mask Packing (only if using CUSTOM_MASK)
+  // Note: You need to populate packed_mask_d with your custom mask data here
+  // using pack_flash_attention_mask() or provide pre-packed mask
+
+  // Run the V2 kernel
+  fmha_v2_run_kernel(params_v2, launch_params, stream);
+}

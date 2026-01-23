@@ -1,9 +1,11 @@
-from typing import Optional, Tuple
-from .generator_utils import InputLayout, spec_fields, kernel_spec
+from typing import Optional, Tuple, Dict, Any
+from .generator_utils import spec_fields, kernel_spec
 from collections import namedtuple
+from enum import IntEnum
 from ... import env as jit_env
 from dataclasses import dataclass, asdict
-
+import math
+import torch
 
 from .utils import (
     get_effective_sm_and_name,
@@ -18,13 +20,9 @@ from .utils import (
     hopper_dtype2traits,
     MAX_STGS_PER_LOOP,
     sm2name,
-    dtype2traits,
     dtype2OutputType,
-    dtype2bytes,
-    hopper_dtype2traits,
     hopper_traits2shape,
     dtype2typename,
-    pythonBoolean2cpp,
     AttentionMaskType,
     InputLayout,
     encode_name,
@@ -32,6 +30,23 @@ from .utils import (
 )
 
 import jinja2
+
+
+def select_kv_loop_step(head_size: int) -> int:
+    """
+    Select the KV loop step based on head size.
+
+    For warp-specialized Hopper kernels:
+    - Small heads (32-64): 256 step for better occupancy
+    - Medium heads (72-128): 128 step
+    - Large heads (160-256): 64 step to fit in registers
+    """
+    if head_size <= 64:
+        return 256
+    elif head_size <= 128:
+        return 128
+    else:
+        return 64
 
 
 @dataclass(frozen=True)
@@ -58,7 +73,6 @@ class FMHAv2KernelSpec:
     head_interleaved: bool = True
     flash_attention: bool = False
     kv_loop_step: int = 64
-    flash_attention_bh_upper_threshold: int = -1
     limit_qk_fragments: bool = False
     limit_v_fragments: bool = False
     tiled: int = 0
@@ -81,121 +95,200 @@ class FMHAv2KernelSpec:
 # BF16-QKV+BF16-out and BF16-Q + FP8-KV + BF16-out (or FP8-QKV+BF16-out)
 
 
-# Design:
-# logic for mapping API params into kernel-spec object
-# build up kernel-spec object
-# add to the spec, (don't call enumerate)
-# generate the kernel source using generator_utils.py (todo: use jinja templates later)
+def select_ldgsts(sm: int, warp_specialization: bool, head_size: int, dtype: str):
+    # TODO(jimmyzho): Implement this
+    return (False, False, False)
+    # if warp_specialization:
+    #     return (False, False, False)
+    # elif sm == 120:)
+    #     if dtype == "fp16":
+    #         # tune ldgsts
+    #         ldgsts_q = True
+    #         ldgsts_k = True
+    #         ldgsts_v = True
+    #         if head_size >= 256:
+    #             ldgsts_k = False
+    #             ldgsts_v = False
+    #         if head_size > 256:
+    #             ldgsts_q = False
+    #             ldgsts_k = False
+    #             ldgsts_v = False
+    #     elif dtype == "e4m3":
+    #         pass
+    #     return (ldgsts_q, ldgsts_k, ldgsts_v)
+    # else:
+    #     raise ValueError(f"Unsupported SM version: {sm}")
 
 
-def get_kernel_spec_from_api(api_params: dict) -> FMHAv2KernelSpec:
-    # (supporting flash attention on sm90)
+def generate_kernel_spec(
+    sm: int,
+    head_size: int,
+    dtype: str,
+    return_softmax: Optional[bool] = False,
+    enable_attn_logit_softcapping: Optional[bool] = False,
+    alibi: Optional[bool] = True,
+    is_mla: Optional[bool] = False,
+    head_size_v: Optional[int] = 0,
+    input_layout: Optional[InputLayout] = InputLayout.Q_PAGED_KV,
+    output_dtype: Optional[str] = None,
+):
+    """
+    Args:
+        sm: int -GPU SM version (90, 120)
+        head_size: int - Q/K head dimension
+        dtype: str - Data type ("fp16", "bf16", "e4m3", "e4m3_fp32")
+        return_softmax: Optional[bool] = False
+        is_mla: Optional[bool] = False - MLA mode
+        head_size_v: Optional[int] = 0 - V head dimension if is_mla
+    """
+
+    """
+    Non-default values need to be set:
+    # warps_m, warps_n, version, interleaved, ldgsts_q, ldgsts_k, ldgsts_v,
+    # share_smem_k_v, loop_step, has_noloop, noloop_step, unroll_threshold,
+    # has_scale_max, sm_mma,
+
+    Default values need to be set:
+    # flash_attention, kv_loop_step, limit_qk_fragments, limit_v_fragments, tiled, warp_specialization, q_tile_buffers, kv_tile_buffers
+
+    User passed values:
+    # sm, dtype, seq_len, head_size, head_size_v,
+    # alibi, enable_attn_logit_softcapping, return_softmax_stats, is_mtp
+    """
+    # Fixed variables for all kernels
+    warps_m, warps_n = 4, 1
+    version = 2
+    interleaved = False
+    share_smem_k_v = False
+    unroll_threshold = 1
+    has_scale_max = False
+    warp_specialization = sm == 90 and head_size >= 32
+    scheduling_mode = 1
+    seq_len = 0
     flash_attention = True
-    # user passing in:
-    # return_softmax -> if on, layout must be contiguous qkv
-    # seq_len: any
-    # dtype: 'fp16', 'bf16', 'fp16_fp32', 'e4m3'
-    # head size: [32, 40, 48, 64], [72, 80, 96, 104, 128], [160, 192, 256]
-    # input layout
-    # scheduling mode (default 1)
-    # enable_attn_logit_softcapping (default False)
-    spec = dict()
+    # input_layout is passed as parameter, default is Q_PAGED_KV
 
-    # determined by user inputs:
-    # kv_loop_step
-    #
-    if flash_attention:
-        dtype = api_params["dtype"]
-        if dtype in ["e4m3"]:
-            pass
-        elif dtype in ["fp16", "bf16", "fp16_fp32"]:
-            pass
+    ldgsts_q, ldgsts_k, ldgsts_v = select_ldgsts(
+        sm, warp_specialization, head_size, dtype
+    )
+    # enumerate_hgmma_flash_warpspec_kernels, enumerate_qgmma_flash_warpspec_kernels
+    if warp_specialization:
+        sm_mma = 90
+        loop_step = 64
+        has_noloop = 0
+        noloop_step = 64
+        limit_qk_fragments = False
+        limit_v_fragments = False
+        tiled = 0
+        q_tile_buffers = 1
+        kv_tile_buffers = 2
+
+        if dtype in ["fp16", "bf16"]:
+            # enumerate_hgmma_flash_warpspec_kernels
+            if head_size <= 64:
+                kv_loop_step = 256
+            elif head_size <= 128:
+                kv_loop_step = 128
+            else:
+                kv_loop_step = 64
+        elif dtype == "e4m3":
+            # enumerate_qgmma_flash_warpspec_kernels
+            if head_size <= 64:
+                kv_tile_buffers = 4
+            if head_size <= 128:
+                kv_loop_step = 256
+            else:
+                kv_loop_step = 128
         else:
-            raise ValueError(f"Invalid dtype: {dtype}")
+            raise ValueError(f"Unsupported dtype: {dtype}")
 
-        spec.update(
-            {
-                "sm_mma": 90,
-                "seq_len": 0,  # support any sequence length
-                "warps_m": 4,
-                "warps_n": 1,
-                "version": 2,
-                "interleaved": False,
-                "ldgsts_q": False,
-                "ldgsts_k": False,
-                "ldgsts_v": False,
-                "share_smem_k_v": False,
-                "loop_step": 64,
-                "q_tile_buffers": 1,
-                "has_noloop": 0,
-                "noloop_step": 64,
-                "kv_tile_buffers": 2,
-                "unroll_threshold": 1,
-                "has_scale_max": False,
-                "flash_attention": True,
-                "warp_specialization": True,
-                "sm": api_params["sm"],
-                "dtype": api_params["dtype"],
-                "head_size": api_params["head_size"],
-                "alibi": api_params["alibi"],
-                "enable_attn_logit_softcapping": api_params[
-                    "enable_attn_logit_softcapping"
-                ],
-                "return_softmax_stats": api_params["return_softmax_stats"],
-                "input_layout": api_params["input_layout"],
-                "scheduling_mode": api_params["scheduling_mode"],
-            }
-        )
-        head_size = spec["head_size"]
-        if head_size in [32, 40, 48, 64]:
-            spec["kv_loop_step"] = 256
-        elif head_size in [72, 80, 96, 104, 128]:
-            spec["kv_loop_step"] = 128
-        elif head_size in [160, 192, 256]:
-            spec["kv_loop_step"] = 64
+    elif sm == 120:
+        # enumerate_hmma_flash_kernels, enumerate_qmma_flash_kernels
+        sm_mma = 80
+        loop_step = 128 if head_size <= 64 else 64
+        has_noloop = 1
+        noloop_step = 64
+        limit_qk_fragments = False
+        limit_v_fragments = False
+        if dtype in ["fp16", "bf16"]:
+            if head_size <= 64:
+                q_loop_step = 128
+                kv_loop_step = 128
+            elif head_size <= 256:
+                q_loop_step = 64
+                kv_loop_step = 128
+            elif head_size <= 512:
+                q_loop_step = 64
+                kv_loop_step = 64
+            else:
+                raise ValueError(f"Unsupported head size: {head_size}")
+            noloop_step = q_loop_step
+            loop_step = q_loop_step
+            tiled = 1
+        elif dtype == "e4m3":
+            if is_mla:
+                # MLA kernels. (TODO)
+                # ((192, 128), (64, 64), 1),
+                # ((576, 512), (64, 64), 1),
+                pass
+            else:
+                tiled = 0
+                if head_size <= 64:
+                    q_loop_step = 128
+                    kv_loop_step = 128
+                elif head_size <= 256:
+                    q_loop_step = 64
+                    kv_loop_step = 32
+                loop_step = q_loop_step
+                has_noloop = 1
+                noloop_step = q_loop_step
+                tiled = 0
+    elif sm == 90:
+        raise ValueError(f"(jimmyzho): Only Warp Specialization is supported for SM 90")
 
+    spec = {
+        "sm": sm,
+        "dtype": dtype,
+        "seq_len": seq_len,
+        "head_size": head_size,
+        "head_size_v": head_size_v,
+        "warps_m": warps_m,
+        "warps_n": warps_n,
+        "version": version,
+        "interleaved": interleaved,
+        "ldgsts_q": ldgsts_q,
+        "ldgsts_k": ldgsts_k,
+        "ldgsts_v": ldgsts_v,
+        "share_smem_k_v": share_smem_k_v,
+        "loop_step": loop_step,
+        "has_noloop": has_noloop,
+        "noloop_step": noloop_step,
+        "unroll_threshold": unroll_threshold,
+        "has_scale_max": has_scale_max,
+        "sm_mma": sm_mma,
+        "flash_attention": flash_attention,
+        "kv_loop_step": kv_loop_step,
+        "limit_qk_fragments": limit_qk_fragments,
+        "limit_v_fragments": limit_v_fragments,
+        "tiled": tiled,
+        "warp_specialization": warp_specialization,
+        "q_tile_buffers": q_tile_buffers,
+        "kv_tile_buffers": kv_tile_buffers,
+        "scheduling_mode": scheduling_mode,
+        "input_layout": input_layout,
+        "alibi": alibi,
+        "enable_attn_logit_softcapping": enable_attn_logit_softcapping,
+        "return_softmax_stats": return_softmax,
+        "output_dtype": output_dtype,
+        "is_mtp": is_mla,
+    }
     return FMHAv2KernelSpec(**spec)
-
-    # fixed:
-    # warps_m: 4
-    # warps_n: 1
-    # version: 2
-    # interleaved: False
-    # ldgsts_q: False
-    # ldgsts_k: False
-    # ldgsts_v: False
-    # share_smem_k_v: False
-    # loop_step: 64
-    # q_tile_buffers: 1
-    # has_noloop: 0
-    # noloop_step: 64
-    # kv_tile_buffers: 2
-    # unroll_threshold: 1
-    # has_scale_max=False,
-    # flash_attention: True
-    # warp_specialization=True,
-
-
-# TMA-based (ldgsts=False) - Integrate these first
-# enumerate_hgmma_tma_kernels (basic TMA, non-flash)
-# enumerate_hgmma_flash_warpspec_kernels (FP16/BF16 flash)
-# enumerate_qgmma_flash_warpspec_kernels (FP8 flash)
-
-# LDGSTS-based (ldgsts=True, no TMA)
-# enumerate_hgmma_ldgsts_kernels (FP16/BF16 non-flash)
-# enumerate_igmma_kernels (INT8)
-# enumerate_qgmma_kernels (FP8 non-flash)
-
-# HMMA fallback (Ampere-style on Hopper)
-# enumerate_hmma_paged_kv_flash_kernels (paged KV)
-# enumerate_hmma_flash_kernels (MLA 192/128, 576/512)
-
-
-def get_kernel_spec(spec: FMHAv2KernelSpec) -> namedtuple:
-    return kernel_spec(**spec.__dict__)
 
 
 def is_kernel_spec_valid(kspec: FMHAv2KernelSpec) -> bool:
+    if kspec.alibi and kspec.enable_attn_logit_softcapping:
+        return False
+
     # Standard flash attention support
     flash_valid = (
         kspec.sm in [80, 86, 89, 90, 120]
@@ -231,7 +324,7 @@ def is_kernel_spec_valid(kspec: FMHAv2KernelSpec) -> bool:
         and kspec.input_layout != InputLayout.SEPARATE_Q_K_V
     )
     # Deepseek MLA (generation 576/512 paged)
-    mla_valid = (
+    mla_valid_576_512 = (
         kspec.sm in [90, 100, 120]
         and kspec.dtype in ["bf16", "e4m3_fp32"]
         and kspec.head_size == 576
@@ -245,7 +338,7 @@ def is_kernel_spec_valid(kspec: FMHAv2KernelSpec) -> bool:
         and kspec.tiled
     )
     # Deepseek MLA (context 192/128 separate-q-k-v)
-    mla_valid = (
+    mla_valid_192_128 = (
         kspec.sm in [90, 100, 120]
         and kspec.dtype in ["bf16", "e4m3", "e4m3_fp32"]
         and kspec.head_size == 192
@@ -262,7 +355,7 @@ def is_kernel_spec_valid(kspec: FMHAv2KernelSpec) -> bool:
         and not kspec.enable_attn_logit_softcapping
     )
     # SageAttention (warp_spec, head_size in (80, 128), packed QKV, padding mask)
-    sage_valid = (
+    sage_valid_sm90 = (
         kspec.sm == 90
         and kspec.head_size in [80, 128]
         and kspec.version == 2
@@ -275,7 +368,7 @@ def is_kernel_spec_valid(kspec: FMHAv2KernelSpec) -> bool:
         and not kspec.enable_attn_logit_softcapping
     )
     # SageAttention on Ada (head_size in (80, 128), packed QKV, padding mask)
-    sage_valid = (
+    sage_valid_sm89 = (
         kspec.sm == 89
         and kspec.head_size in [80, 128]
         and kspec.sage_block_sizes in [(64, 32, 32)]
@@ -287,8 +380,22 @@ def is_kernel_spec_valid(kspec: FMHAv2KernelSpec) -> bool:
         and kspec.input_layout == InputLayout.PACKED_QKV
     )
 
-    # TODO(jimmzhou): just concerned with standard flash attention now
-    return flash_valid
+    print(f"flash_valid: {flash_valid}")
+    print(f"non_flash_valid: {non_flash_valid}")
+    print(f"clip_valid: {clip_valid}")
+    print(f"mla_valid_576_512: {mla_valid_576_512}")
+    print(f"mla_valid_192_128: {mla_valid_192_128}")
+    print(f"sage_valid_sm90: {sage_valid_sm90}")
+    print(f"sage_valid_sm89: {sage_valid_sm89}")
+    return (
+        flash_valid
+        or non_flash_valid
+        or clip_valid
+        or mla_valid_576_512
+        or mla_valid_192_128
+        or sage_valid_sm90
+        or sage_valid_sm89
+    )
 
 
 def get_kernel_code(kspec, kname, lname):
@@ -522,8 +629,60 @@ def get_kernel_code(kspec, kname, lname):
     return code
 
 
-def generate_jit_sources(api_params: dict) -> dict:
-    kspec = get_kernel_spec_from_api(api_params)
+def generate_jit_sources(
+    sm: int,
+    head_size: int,
+    dtype: str,
+    input_layout: InputLayout = InputLayout.Q_PAGED_KV,
+    return_softmax: Optional[bool] = False,
+    enable_attn_logit_softcapping: Optional[bool] = False,
+    alibi: Optional[bool] = True,
+    is_mla: Optional[bool] = False,
+    head_size_v: Optional[int] = 0,
+    output_dtype: Optional[str] = None,
+) -> dict:
+    """
+    Generate JIT source code for FMHAv2 kernel.
+
+    Parameters
+    ----------
+    sm : int
+        GPU SM version (90, 120)
+    head_size : int
+        Q/K head dimension
+    dtype : str
+        Data type string: "fp16", "bf16", "e4m3", "e4m3_fp32"
+    input_layout : InputLayout
+        Input layout enum
+    return_softmax : bool
+        Return softmax statistics
+    enable_attn_logit_softcapping : bool
+        Enable logit softcapping
+    alibi : bool
+        Enable ALiBi positional encoding
+    is_mla : bool
+        MLA mode (different head sizes for Q/K and V)
+    head_size_v : int
+        V head dimension (0 = same as head_size)
+    output_dtype : Optional[str]
+        Output dtype string (None = same as input dtype)
+
+    Returns
+    -------
+    dict
+        Dictionary with kernel_code, dispatcher_code, kernel_filename, launcher_name, kernel_name
+    """
+    kspec = generate_kernel_spec(
+        sm=sm,
+        head_size=head_size,
+        dtype=dtype,
+        return_softmax=return_softmax,
+        enable_attn_logit_softcapping=enable_attn_logit_softcapping,
+        alibi=alibi,
+        input_layout=input_layout,
+        head_size_v=head_size_v,
+        output_dtype=output_dtype,
+    )
     if not is_kernel_spec_valid(kspec):
         raise ValueError(f"Invalid kernel spec: {kspec}")
     fname, lname, kname = encode_name(kspec)
@@ -541,5 +700,4 @@ def generate_jit_sources(api_params: dict) -> dict:
         "kernel_filename": fname,
         "launcher_name": lname,
         "kernel_name": kname,
-        "spec": kspec,
     }
