@@ -32,7 +32,7 @@ The residual tensor is modified in-place to contain the fused value (input + res
 import functools
 import math
 import operator
-from typing import Callable, Tuple
+from typing import Callable, Tuple, Union
 
 import cutlass
 import cutlass.cute as cute
@@ -851,6 +851,7 @@ class AddRMSNormFP4QuantKernel:
         is_fp16: bool,
         sm_version: int | None = None,
         scale_format: str | None = None,
+        output_both_sf_layouts: bool = False,
     ):
         self.dtype = dtype
         self.H = H
@@ -858,6 +859,7 @@ class AddRMSNormFP4QuantKernel:
         self.output_swizzled = output_swizzled
         self.is_fp16 = is_fp16
         self.sm_version = sm_version if sm_version is not None else get_sm_version()
+        self.output_both_sf_layouts = output_both_sf_layouts
 
         if scale_format is None:
             self.scale_format = "ue8m0" if block_size == 32 else "e4m3"
@@ -888,7 +890,8 @@ class AddRMSNormFP4QuantKernel:
 
         self.num_sf_blocks_per_row = H // block_size
 
-        if output_swizzled:
+        # Need swizzle params if output_swizzled or output_both_sf_layouts
+        if output_swizzled or output_both_sf_layouts:
             num_col_vecs = H // block_size
             self.num_k_tiles = (num_col_vecs + 3) // 4
             self.k_tile_stride = 512
@@ -1022,6 +1025,7 @@ class AddRMSNormFP4QuantKernel:
         mW: cute.Tensor,
         mY: cute.Tensor,
         mS: cute.Tensor,
+        mS_unswizzled: cute.Tensor,
         mGlobalScale: cute.Tensor,
         M: Int32,
         eps: Float32,
@@ -1035,6 +1039,7 @@ class AddRMSNormFP4QuantKernel:
         - mW: Weight tensor, shape (H,)
         - mY: Output FP4 tensor, shape (M, H // 2), row-major (packed)
         - mS: Scale factor tensor, shape depends on swizzle mode
+        - mS_unswizzled: Unswizzled scale factor tensor (used when output_both_sf_layouts=True)
         - mGlobalScale: Global scale tensor, shape (1,), float32
         """
 
@@ -1048,7 +1053,7 @@ class AddRMSNormFP4QuantKernel:
         tiler_mn = (self.rows_per_block, self.cols_per_tile)
 
         self.kernel(
-            mX, mR, mW, mY, mS, mGlobalScale, M, eps, tv_layout, tiler_mn
+            mX, mR, mW, mY, mS, mS_unswizzled, mGlobalScale, M, eps, tv_layout, tiler_mn
         ).launch(
             grid=[cute.ceil_div(M, self.rows_per_block), self.cluster_n, 1],
             block=[self.num_threads, 1, 1],
@@ -1067,6 +1072,7 @@ class AddRMSNormFP4QuantKernel:
         mW: cute.Tensor,
         mY: cute.Tensor,
         mS: cute.Tensor,
+        mS_unswizzled: cute.Tensor,
         mGlobalScale: cute.Tensor,
         M: Int32,
         eps: Float32,
@@ -1372,7 +1378,24 @@ class AddRMSNormFP4QuantKernel:
                                 * global_scale_val
                             )
 
-                            if cutlass.const_expr(self.output_swizzled):
+                            if cutlass.const_expr(self.output_both_sf_layouts):
+                                # Output both swizzled and unswizzled scale factors
+                                inner_k_idx = sf_idx % Int32(4)
+                                inner_m_idx = (actual_row_idx % Int32(128)) // Int32(32)
+                                outer_m_idx = actual_row_idx % Int32(32)
+                                k_tile_idx = sf_idx // Int32(4)
+                                m_tile_idx = actual_row_idx // Int32(128)
+                                m_tile_stride = self.num_k_tiles * self.k_tile_stride
+                                swizzled_offset = (
+                                    m_tile_idx * m_tile_stride
+                                    + k_tile_idx * self.k_tile_stride
+                                    + outer_m_idx * Int32(16)
+                                    + inner_m_idx * Int32(4)
+                                    + inner_k_idx
+                                )
+                                mS[swizzled_offset] = scale_fp8
+                                mS_unswizzled[actual_row_idx, sf_idx] = scale_fp8
+                            elif cutlass.const_expr(self.output_swizzled):
                                 inner_k_idx = sf_idx % Int32(4)
                                 inner_m_idx = (actual_row_idx % Int32(128)) // Int32(32)
                                 outer_m_idx = actual_row_idx % Int32(32)
@@ -1530,7 +1553,24 @@ class AddRMSNormFP4QuantKernel:
                                 * global_scale_val
                             )
 
-                            if cutlass.const_expr(self.output_swizzled):
+                            if cutlass.const_expr(self.output_both_sf_layouts):
+                                # Output both swizzled and unswizzled scale factors
+                                inner_k_idx = sf_idx % Int32(4)
+                                inner_m_idx = (actual_row_idx % Int32(128)) // Int32(32)
+                                outer_m_idx = actual_row_idx % Int32(32)
+                                k_tile_idx = sf_idx // Int32(4)
+                                m_tile_idx = actual_row_idx // Int32(128)
+                                m_tile_stride = self.num_k_tiles * self.k_tile_stride
+                                swizzled_offset = (
+                                    m_tile_idx * m_tile_stride
+                                    + k_tile_idx * self.k_tile_stride
+                                    + outer_m_idx * Int32(16)
+                                    + inner_m_idx * Int32(4)
+                                    + inner_k_idx
+                                )
+                                mS[swizzled_offset] = scale_fp8
+                                mS_unswizzled[actual_row_idx, sf_idx] = scale_fp8
+                            elif cutlass.const_expr(self.output_swizzled):
                                 inner_k_idx = sf_idx % Int32(4)
                                 inner_m_idx = (actual_row_idx % Int32(128)) // Int32(32)
                                 outer_m_idx = actual_row_idx % Int32(32)
@@ -1739,7 +1779,24 @@ class AddRMSNormFP4QuantKernel:
                                     * global_scale_val
                                 )
 
-                            if cutlass.const_expr(self.output_swizzled):
+                            if cutlass.const_expr(self.output_both_sf_layouts):
+                                # Output both swizzled and unswizzled scale factors
+                                inner_k_idx = sf_idx % Int32(4)
+                                inner_m_idx = (actual_row_idx % Int32(128)) // Int32(32)
+                                outer_m_idx = actual_row_idx % Int32(32)
+                                k_tile_idx = sf_idx // Int32(4)
+                                m_tile_idx = actual_row_idx // Int32(128)
+                                m_tile_stride = self.num_k_tiles * self.k_tile_stride
+                                swizzled_offset = (
+                                    m_tile_idx * m_tile_stride
+                                    + k_tile_idx * self.k_tile_stride
+                                    + outer_m_idx * Int32(16)
+                                    + inner_m_idx * Int32(4)
+                                    + inner_k_idx
+                                )
+                                mS[swizzled_offset] = scale_u8
+                                mS_unswizzled[actual_row_idx, sf_idx] = scale_u8
+                            elif cutlass.const_expr(self.output_swizzled):
                                 inner_k_idx = sf_idx % Int32(4)
                                 inner_m_idx = (actual_row_idx % Int32(128)) // Int32(32)
                                 outer_m_idx = actual_row_idx % Int32(32)
@@ -2012,7 +2069,24 @@ class AddRMSNormFP4QuantKernel:
                                     * global_scale_val
                                 )
 
-                            if cutlass.const_expr(self.output_swizzled):
+                            if cutlass.const_expr(self.output_both_sf_layouts):
+                                # Output both swizzled and unswizzled scale factors
+                                inner_k_idx = sf_idx % Int32(4)
+                                inner_m_idx = (actual_row_idx % Int32(128)) // Int32(32)
+                                outer_m_idx = actual_row_idx % Int32(32)
+                                k_tile_idx = sf_idx // Int32(4)
+                                m_tile_idx = actual_row_idx // Int32(128)
+                                m_tile_stride = self.num_k_tiles * self.k_tile_stride
+                                swizzled_offset = (
+                                    m_tile_idx * m_tile_stride
+                                    + k_tile_idx * self.k_tile_stride
+                                    + outer_m_idx * Int32(16)
+                                    + inner_m_idx * Int32(4)
+                                    + inner_k_idx
+                                )
+                                mS[swizzled_offset] = scale_u8
+                                mS_unswizzled[actual_row_idx, sf_idx] = scale_u8
+                            elif cutlass.const_expr(self.output_swizzled):
                                 inner_k_idx = sf_idx % Int32(4)
                                 inner_m_idx = (actual_row_idx % Int32(128)) // Int32(32)
                                 outer_m_idx = actual_row_idx % Int32(32)
@@ -2103,6 +2177,7 @@ def _get_compiled_kernel(
     sm_version: int,
     scale_format: str,
     is_sf_swizzled_layout: bool,
+    output_both_sf_layouts: bool = False,
 ) -> Callable:
     """
     Get a compiled kernel closure that takes torch.Tensor directly.
@@ -2119,6 +2194,7 @@ def _get_compiled_kernel(
         is_fp16=is_fp16,
         sm_version=sm_version,
         scale_format=scale_format,
+        output_both_sf_layouts=output_both_sf_layouts,
     )
 
     # Use symbolic size for dynamic M dimension
@@ -2139,8 +2215,8 @@ def _get_compiled_kernel(
         cutlass.Uint8, (sym_m, hidden_size // 2), stride_order=(1, 0), assumed_align=128
     )
 
-    # Scale factor tensor layout depends on swizzle mode
-    if is_sf_swizzled_layout:
+    # Scale factor tensor layout depends on swizzle mode or output_both_sf_layouts
+    if is_sf_swizzled_layout or output_both_sf_layouts:
         # For swizzled mode, use 1D layout - the swizzle pattern is computed in kernel
         # Size is: num_m_tiles * num_k_tiles * 512, which is independent of M
         # Use a separate symbolic variable for this size
@@ -2156,6 +2232,14 @@ def _get_compiled_kernel(
             stride_order=(1, 0),
             assumed_align=128,
         )
+
+    # Unswizzled scale factor tensor (always 2D row-major, used when output_both_sf_layouts=True)
+    s_unswizzled_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Uint8,
+        (sym_m, hidden_size // block_size),
+        stride_order=(1, 0),
+        assumed_align=128,
+    )
 
     # Create fake stream that uses environment stream at runtime
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
@@ -2173,6 +2257,7 @@ def _get_compiled_kernel(
         w_fake,
         y_fake,
         s_fake,
+        s_unswizzled_fake,
         global_scale_fake,
         Int32(1),  # Dummy M
         Float32(1e-6),  # Dummy eps
@@ -2186,14 +2271,19 @@ def _get_compiled_kernel(
         w: torch.Tensor,
         y: torch.Tensor,
         s: torch.Tensor,
+        s_unswizzled: torch.Tensor,
         global_scale: torch.Tensor,
         M: int,
         eps: float,
     ) -> None:
         """Runtime API that passes torch tensors directly via TVM-FFI."""
         nonlocal compiled_kernel
-        # For swizzled mode, flatten the scale tensor to 1D
-        s_tensor = s.flatten() if is_sf_swizzled_layout else s.contiguous()
+        # For swizzled mode or output_both_sf_layouts, flatten the scale tensor to 1D
+        s_tensor = (
+            s.flatten()
+            if (is_sf_swizzled_layout or output_both_sf_layouts)
+            else s.contiguous()
+        )
         # View y as uint8 since kernel expects uint8 but caller may pass float4_e2m1fn_x2
         y_uint8 = y.view(torch.uint8)
         compiled_kernel(
@@ -2202,6 +2292,7 @@ def _get_compiled_kernel(
             w,
             y_uint8,
             s_tensor,
+            s_unswizzled.contiguous(),
             global_scale,
             Int32(M),
             Float32(eps),
@@ -2222,7 +2313,11 @@ def add_rmsnorm_fp4quant(
     block_size: int = 16,
     scale_format: str | None = None,
     is_sf_swizzled_layout: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    output_both_sf_layouts: bool = False,
+    block_scale_unswizzled: torch.Tensor | None = None,
+) -> Union[
+    Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+]:
     """
     Fused Add + RMS normalization + FP4 quantization using CuTe-DSL.
 
@@ -2253,10 +2348,11 @@ def add_rmsnorm_fp4quant(
     block_scale : torch.Tensor, optional
         Output tensor for per-block scale factors.
 
-        - If ``is_sf_swizzled_layout=False`` (default): row-major layout with shape
-          ``(batch_size, hidden_size // block_size)`` or matching 3D input.
-        - If ``is_sf_swizzled_layout=True``: swizzled layout for efficient tensor core
-          access, with shape ``(batch_size * hidden_size // block_size,)`` flattened.
+        - If ``is_sf_swizzled_layout=False`` and ``output_both_sf_layouts=False``: row-major
+          layout with shape ``(batch_size, hidden_size // block_size)`` or matching 3D input.
+        - If ``is_sf_swizzled_layout=True`` or ``output_both_sf_layouts=True``: swizzled layout
+          for efficient tensor core access, with shape
+          ``(batch_size * hidden_size // block_size,)`` flattened.
           The swizzle pattern uses 128x4 tiles where scales are arranged as:
           ``[m_tile][k_tile][outer_m (32)][inner_m (4)][inner_k (4)]``.
 
@@ -2286,14 +2382,37 @@ def add_rmsnorm_fp4quant(
         ``[m_tile_idx * k_tiles * 512 + k_tile_idx * 512 + outer_m * 16 + inner_m * 4 + inner_k]``
         where ``outer_m = row % 32``, ``inner_m = (row % 128) // 32``, etc.
         Default is ``False`` (row-major layout).
+        Note: This parameter is ignored when ``output_both_sf_layouts=True``.
+    output_both_sf_layouts : bool
+        If ``True``, return both swizzled and unswizzled scale factors.
+        When enabled, ``block_scale`` contains the swizzled layout and
+        ``block_scale_unswizzled`` contains the row-major layout.
+        This overrides ``is_sf_swizzled_layout``.
+        Default is ``False``.
+    block_scale_unswizzled : torch.Tensor, optional
+        Output tensor for unswizzled per-block scale factors (row-major layout).
+        Only used when ``output_both_sf_layouts=True``.
+        Shape is ``(batch_size, hidden_size // block_size)`` or matching 3D input.
+        Dtype should be ``torch.float8_e4m3fn`` for E4M3 format or ``torch.uint8``
+        for UE8M0 format. If ``None``, will be allocated automatically when
+        ``output_both_sf_layouts=True``.
 
     Returns
     -------
-    Tuple[torch.Tensor, torch.Tensor]
-        A tuple of ``(y_fp4, block_scale)``:
+    Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
+        When ``output_both_sf_layouts=False``:
+            A tuple of ``(y_fp4, block_scale)``:
 
-        - ``y_fp4``: Quantized FP4 values packed as uint8.
-        - ``block_scale``: Per-block scale factors.
+            - ``y_fp4``: Quantized FP4 values packed as uint8.
+            - ``block_scale``: Per-block scale factors (swizzled or row-major based on
+              ``is_sf_swizzled_layout``).
+
+        When ``output_both_sf_layouts=True``:
+            A tuple of ``(y_fp4, block_scale, block_scale_unswizzled)``:
+
+            - ``y_fp4``: Quantized FP4 values packed as uint8.
+            - ``block_scale``: Per-block scale factors in swizzled layout.
+            - ``block_scale_unswizzled``: Per-block scale factors in row-major layout.
 
     Notes
     -----
@@ -2324,6 +2443,10 @@ def add_rmsnorm_fp4quant(
     )
     sm_version = get_sm_version(input.device)
 
+    # Determine scale dtype based on format
+    scale_dtype = torch.uint8 if actual_scale_format == "ue8m0" else torch.float8_e4m3fn
+    num_sf_blocks_per_row = hidden_size // block_size
+
     # Allocate output tensors if not provided
     if y_fp4 is None:
         if is_3d:
@@ -2340,13 +2463,8 @@ def add_rmsnorm_fp4quant(
             )
 
     if block_scale is None:
-        # Determine scale dtype based on format
-        scale_dtype = (
-            torch.uint8 if actual_scale_format == "ue8m0" else torch.float8_e4m3fn
-        )
-        num_sf_blocks_per_row = hidden_size // block_size
-
-        if is_sf_swizzled_layout:
+        # When output_both_sf_layouts=True, block_scale is always swizzled
+        if is_sf_swizzled_layout or output_both_sf_layouts:
             # Swizzled layout: flattened with 128x4 tile pattern
             num_m_tiles = (batch_size + 127) // 128
             num_k_tiles = (num_sf_blocks_per_row + 3) // 4
@@ -2369,15 +2487,37 @@ def add_rmsnorm_fp4quant(
                     device=input.device,
                 )
 
+    # Allocate unswizzled scale factor tensor
+    # When output_both_sf_layouts=False, we still need a correctly-shaped tensor
+    # for TVM-FFI validation, even though the kernel won't write to it
+    if block_scale_unswizzled is None:
+        if is_3d:
+            block_scale_unswizzled = torch.empty(
+                (B, S, num_sf_blocks_per_row),
+                dtype=scale_dtype,
+                device=input.device,
+            )
+        else:
+            block_scale_unswizzled = torch.empty(
+                (batch_size, num_sf_blocks_per_row),
+                dtype=scale_dtype,
+                device=input.device,
+            )
+
     # Get 2D views for kernel
     if is_3d:
         y_fp4_2d = y_fp4.view(B * S, -1)
         block_scale_2d = (
-            block_scale.view(B * S, -1) if not is_sf_swizzled_layout else block_scale
+            block_scale.view(B * S, -1)
+            if not (is_sf_swizzled_layout or output_both_sf_layouts)
+            else block_scale
         )
+        # Always convert to 2D for kernel call
+        block_scale_unswizzled_2d = block_scale_unswizzled.view(B * S, -1)
     else:
         y_fp4_2d = y_fp4
         block_scale_2d = block_scale
+        block_scale_unswizzled_2d = block_scale_unswizzled
 
     # Create global_scale tensor if not provided (1.0 = no scaling)
     if global_scale is None:
@@ -2390,6 +2530,7 @@ def add_rmsnorm_fp4quant(
         sm_version,
         actual_scale_format,
         is_sf_swizzled_layout,
+        output_both_sf_layouts,
     )
     tensor_api(
         input_2d.contiguous(),
@@ -2397,12 +2538,16 @@ def add_rmsnorm_fp4quant(
         weight.contiguous(),
         y_fp4_2d,
         block_scale_2d.view(torch.uint8),
+        block_scale_unswizzled_2d.view(torch.uint8),
         global_scale.contiguous(),
         batch_size,
         eps,
     )
 
-    return y_fp4, block_scale
+    if output_both_sf_layouts:
+        return y_fp4, block_scale, block_scale_unswizzled
+    else:
+        return y_fp4, block_scale
 
 
 __all__ = [
