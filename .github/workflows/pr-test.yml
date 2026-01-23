@@ -108,30 +108,6 @@ jobs:
             echo "$AUTHOR is not a member of $TEAM, not authorized"
           fi
 
-      - name: Post skip message
-        if: steps.check.outputs.authorized != 'true' && github.event_name == 'pull_request'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # Check if we already posted a skip message
-          EXISTING=$(gh pr view ${{ github.event.pull_request.number }} \
-            --repo ${{ github.repository }} \
-            --json comments \
-            --jq '.comments[].body' | grep -c "CI is paused" || true)
-
-          if [[ "$EXISTING" -eq 0 ]]; then
-            gh pr comment ${{ github.event.pull_request.number }} \
-              --repo ${{ github.repository }} \
-              --body "**CI is paused for external contributors.**
-
-          A maintainer can approve by commenting:
-          - \`@flashinfer-bot run\` - Trigger CI tests
-
-          After approval, if tests fail:
-          - \`@flashinfer-bot rerun\` - Rerun all jobs
-          - \`@flashinfer-bot rerun-failed\` - Rerun only failed jobs"
-          fi
-
   # ---------------------------------------------------------------------------
   # Setup - Read docker tag and check if build should be skipped
   # ---------------------------------------------------------------------------
