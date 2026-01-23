@@ -73,6 +73,42 @@ def interleave_linear_and_gate(
     return x
 
 
+def quant_dequant_fp4_reference(
+    tensor: torch.Tensor,
+    global_scale: torch.Tensor,
+    sf_vec_size: int = 16,
+) -> torch.Tensor:
+    """
+    Simulate FP4 quantization and dequantization for reference computation.
+
+    This models the quantization error introduced when intermediate activations
+    are quantized to FP4 format between GEMM1 and GEMM2.
+    """
+    from flashinfer.fp4_quantization import fp4_quantize, e2m1_and_ufp8sf_scale_to_float
+
+    # Quantize to FP4
+    tensor_bf16 = tensor.to(torch.bfloat16)
+    fp4_packed, sf = fp4_quantize(
+        tensor_bf16,
+        global_scale=global_scale,
+        sf_vec_size=sf_vec_size,
+        is_sf_swizzled_layout=False,
+    )
+
+    # Dequantize back to float
+    sf_uint8 = sf.view(torch.uint8).reshape(-1)
+    dequantized = e2m1_and_ufp8sf_scale_to_float(
+        fp4_packed.cpu(),
+        sf_uint8.cpu(),
+        (1.0 / global_scale).cpu(),
+        sf_vec_size=sf_vec_size,
+        ufp8_type=1,  # UFP8 E4M3
+        is_sf_swizzled_layout=False,
+    ).to(tensor.device)
+
+    return dequantized.float()
+
+
 def compute_reference_moe_fp4(
     hidden_states: torch.Tensor,
     gemm1_weights: torch.Tensor,
@@ -84,6 +120,7 @@ def compute_reference_moe_fp4(
     top_k: int,
     hidden_size: int,
     intermediate_size: int,
+    fc2_input_scale: torch.Tensor = None,
 ) -> torch.Tensor:
     """
     Compute reference MoE output using PyTorch operations.
@@ -92,8 +129,13 @@ def compute_reference_moe_fp4(
     1. For each token-expert pair:
        - GEMM1: hidden @ W1.T -> [2 * intermediate_size]
        - SwiGLU: linear * silu(gate) -> [intermediate_size]
+       - FP4 quantize/dequantize (simulates intermediate quantization)
        - GEMM2: intermediate @ W2.T -> [hidden_size]
     2. Accumulate with routing weights
+
+    Args:
+        fc2_input_scale: Global scale for intermediate FP4 quantization.
+                         If None, skips intermediate quantization (original behavior).
     """
     device = hidden_states.device
     output = torch.zeros((num_tokens, hidden_size), dtype=torch.float32, device=device)
@@ -114,6 +156,12 @@ def compute_reference_moe_fp4(
             linear = gemm1_out[:, :intermediate_size]
             gate = gemm1_out[:, intermediate_size:]
             swiglu_out = silu(gate) * linear
+
+            # Simulate intermediate FP4 quantization if scale is provided
+            if fc2_input_scale is not None:
+                swiglu_out = quant_dequant_fp4_reference(
+                    swiglu_out, fc2_input_scale, sf_vec_size=16
+                )
 
             w2 = gemm2_weights[expert_idx]
             gemm2_out = swiglu_out @ w2.T
@@ -331,6 +379,7 @@ class TestCuteDslFusedMoeAccuracy:
             top_k=top_k,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
+            fc2_input_scale=tensors["fc2_input_scale"],
         )
 
         passed, percent_within, atol = check_accuracy(result, ref_output)
@@ -449,6 +498,7 @@ class TestCuteDslFusedMoeAccuracy:
             top_k=top_k,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
+            fc2_input_scale=tensors["fc2_input_scale"],
         )
 
         passed, percent_within, atol = check_accuracy(result, ref_output)
