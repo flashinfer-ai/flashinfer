@@ -563,10 +563,6 @@ def bmm_bf16(
 
     if backend == "auto":
         backends = bmm_bf16.suitable_auto_backends
-    elif backend == "cudnn":
-        backends = _heuristic_func_bmm_bf16(["cudnn"], A, B, out, out_dtype, backend)
-    elif backend == "cutlass":
-        backends = _heuristic_func_bmm_bf16(["cutlass"], A, B, out, out_dtype, backend)
     else:
         backends = [backend]
 
@@ -2160,7 +2156,7 @@ def build_cudnn_gemm_bf16_graph(a_shape, a_stride, b_shape, b_stride, o_type, de
         return graph
 
 
-def execute_cudnn_gemm_bf16_graph(graph, a, b, c_final, workspace):
+def execute_cudnn_gemm_bf16_graph(graph, a, b, c_final, workspace, tactic: int = -1):
     variant_pack = {
         UIDs.A_UID.value: a,
         UIDs.B_UID.value: b,
@@ -2175,11 +2171,20 @@ def execute_cudnn_gemm_bf16_graph(graph, a, b, c_final, workspace):
             graph.get_workspace_size(), device=a.device, dtype=torch.uint8
         )
 
-    graph.execute(variant_pack, workspace, handle=cudnn_handle)
+    if tactic == -1:
+        graph.execute(variant_pack, workspace, handle=cudnn_handle)
+    else:
+        graph.execute_plan_at_index(
+            variant_pack, workspace, tactic, handle=cudnn_handle
+        )
 
 
 def _cudnn_gemm_bf16(
-    workspace: torch.Tensor, a: torch.Tensor, b: torch.Tensor, out: torch.Tensor
+    workspace: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    out: torch.Tensor,
+    tactic: int = -1,
 ):
     _check_cudnn_availability()
 
@@ -2196,7 +2201,7 @@ def _cudnn_gemm_bf16(
         _torch_data_type_to_cudnn_data_type(out.dtype),
         a.device,
     )
-    execute_cudnn_gemm_bf16_graph(graph, a, b, out, workspace)
+    execute_cudnn_gemm_bf16_graph(graph, a, b, out, workspace, tactic=tactic)
     return out
 
 
@@ -2207,8 +2212,19 @@ def _cudnn_gemm_bf16_runner():
             inputs: List[torch.Tensor],
             profile: OptimizationProfile,
         ) -> List[int]:
-            # Should we do something more special here?
-            return [0]
+            a, b, _, _, out, _ = inputs
+            a_shape, a_stride = _get_bf16_3d_shape_stride(a)
+            b_shape, b_stride = _get_bf16_3d_shape_stride(b)
+
+            graph = build_cudnn_gemm_bf16_graph(
+                a_shape,
+                a_stride,
+                b_shape,
+                b_stride,
+                _torch_data_type_to_cudnn_data_type(out.dtype),
+                a.device,
+            )
+            return list(range(graph.get_execution_plan_count()))
 
         def forward(
             self,
@@ -2222,7 +2238,7 @@ def _cudnn_gemm_bf16_runner():
                 raise ValueError("cudnn bf16 gemm does not support bias.")
             if pdl:
                 raise ValueError("cudnn bf16 gemm does not support pdl.")
-            _cudnn_gemm_bf16(workspace_buffer, a, b, out)
+            _cudnn_gemm_bf16(workspace_buffer, a, b, out, tactic=tactic)
             return out
 
     return CudnnBf16GemmRunner()
