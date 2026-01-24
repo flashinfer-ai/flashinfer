@@ -647,7 +647,6 @@ jobs:
   # ---------------------------------------------------------------------------
   # GPU JIT Tests - B200 (Blackwell) - Capacity Block
   # Triggers dynamic CB purchase via EventBridge → CB Manager Lambda
-  # Only runs when explicitly enabled via workflow_dispatch
   # ---------------------------------------------------------------------------
   gpu-tests-b200:
     name: JIT Unittest (B200)
@@ -695,6 +694,55 @@ jobs:
         run: bash ci/bash.sh ${DOCKER_IMAGE} ./scripts/task_test_blackwell_kernels.sh
 
   # ---------------------------------------------------------------------------
+  # GPU JIT Tests - H100 (Hopper) - Capacity Block
+  # Triggers dynamic CB purchase via EventBridge → CB Manager Lambda
+  # ---------------------------------------------------------------------------
+  gpu-tests-h100:
+    name: JIT Unittest (H100)
+    needs: setup
+    if: needs.setup.outputs.skip_build != 'true' && github.event.inputs.skip_gpu != 'true'
+    runs-on: [self-hosted, Linux, X64, gpu, h100]
+    timeout-minutes: 360
+    env:
+      DOCKER_IMAGE: flashinfer/flashinfer-ci-cu129:${{ needs.setup.outputs.docker_tag }}
+    steps:
+      - name: Cleanup
+        run: |
+          # Stop all Docker containers to free GPU memory
+          docker stop $(docker ps -q) 2>/dev/null || true
+          docker rm $(docker ps -aq) 2>/dev/null || true
+          # Clean workspace and caches
+          sudo rm -rf ${{ github.workspace }}/* || true
+          sudo rm -rf ${{ github.workspace }}/.[!.]* || true
+          rm -rf ~/.cache/flashinfer_jit || true
+          docker system prune -f || true
+          # Show GPU info (should show 1 GPU due to CUDA_VISIBLE_DEVICES)
+          echo "=== GPU Info ==="
+          nvidia-smi || true
+          echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: flashinfer
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+        continue-on-error: true
+
+      - name: Show Node Info
+        run: ./scripts/task_show_node_info.sh
+        env:
+          NODE_NAME: ${{ runner.name }}
+          WORKSPACE: ${{ github.workspace }}
+          BUILD_NUMBER: ${{ github.run_number }}
+
+      - name: Run H100 Kernel Tests
+        run: bash ci/bash.sh ${DOCKER_IMAGE} ./scripts/task_test_blackwell_kernels.sh
+
+  # ---------------------------------------------------------------------------
   # Test Results Summary
   # ---------------------------------------------------------------------------
   test-results-summary:
@@ -713,6 +761,7 @@ jobs:
       - analyze-gpu-t4-failure
       - gpu-tests-t4-rerun
       - gpu-tests-b200
+      - gpu-tests-h100
     runs-on: ubuntu-latest
     steps:
       - name: Check Results
@@ -777,6 +826,14 @@ jobs:
           B200="${{ needs.gpu-tests-b200.result }}"
           echo "GPU Tests (B200): $B200" >> $GITHUB_STEP_SUMMARY
           if [ "$B200" != "success" ] && [ "$B200" != "skipped" ] && [ "${{ github.event.inputs.skip_gpu }}" != "true" ]; then
+            FAILED=true
+          fi
+
+          # H100 tests (no rerun logic yet - CB instances don't get spot terminated)
+          echo "" >> $GITHUB_STEP_SUMMARY
+          H100="${{ needs.gpu-tests-h100.result }}"
+          echo "GPU Tests (H100): $H100" >> $GITHUB_STEP_SUMMARY
+          if [ "$H100" != "success" ] && [ "$H100" != "skipped" ] && [ "${{ github.event.inputs.skip_gpu }}" != "true" ]; then
             FAILED=true
           fi
 
