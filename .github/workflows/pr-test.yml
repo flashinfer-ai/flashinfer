@@ -34,6 +34,10 @@ on:
         description: 'Skip GPU tests'
         type: boolean
         default: false
+      run_b200:
+        description: 'Run B200 tests'
+        type: boolean
+        default: false
 
 concurrency:
   group: pr-test-${{ github.ref }}
@@ -645,6 +649,56 @@ jobs:
         run: bash ci/bash.sh ${DOCKER_IMAGE} ./scripts/task_jit_run_tests_part3.sh
 
   # ---------------------------------------------------------------------------
+  # GPU JIT Tests - B200 (Blackwell) - Capacity Block
+  # Triggers dynamic CB purchase via EventBridge → CB Manager Lambda
+  # Only runs when explicitly enabled via workflow_dispatch
+  # ---------------------------------------------------------------------------
+  gpu-tests-b200:
+    name: JIT Unittest (B200)
+    needs: setup
+    if: needs.setup.outputs.skip_build != 'true' && github.event.inputs.run_b200 == 'true'
+    runs-on: [self-hosted, Linux, X64, gpu, b200]
+    timeout-minutes: 360
+    env:
+      DOCKER_IMAGE: flashinfer/flashinfer-ci-cu130:${{ needs.setup.outputs.docker_tag }}
+    steps:
+      - name: Cleanup
+        run: |
+          # Stop all Docker containers to free GPU memory
+          docker stop $(docker ps -q) 2>/dev/null || true
+          docker rm $(docker ps -aq) 2>/dev/null || true
+          # Clean workspace and caches
+          sudo rm -rf ${{ github.workspace }}/* || true
+          sudo rm -rf ${{ github.workspace }}/.[!.]* || true
+          rm -rf ~/.cache/flashinfer_jit || true
+          docker system prune -f || true
+          # Show GPU info (should show 1 GPU due to CUDA_VISIBLE_DEVICES)
+          echo "=== GPU Info ==="
+          nvidia-smi || true
+          echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: flashinfer
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+        continue-on-error: true
+
+      - name: Show Node Info
+        run: ./scripts/task_show_node_info.sh
+        env:
+          NODE_NAME: ${{ runner.name }}
+          WORKSPACE: ${{ github.workspace }}
+          BUILD_NUMBER: ${{ github.run_number }}
+
+      - name: Run B200 Kernel Tests
+        run: bash ci/bash.sh ${DOCKER_IMAGE} ./scripts/task_test_blackwell_kernels.sh
+
+  # ---------------------------------------------------------------------------
   # Test Results Summary
   # ---------------------------------------------------------------------------
   test-results-summary:
@@ -662,6 +716,7 @@ jobs:
       - gpu-tests-t4
       - analyze-gpu-t4-failure
       - gpu-tests-t4-rerun
+      - gpu-tests-b200
     runs-on: ubuntu-latest
     steps:
       - name: Check Results
@@ -720,6 +775,17 @@ jobs:
             "${{ needs.gpu-tests-t4.result }}" \
             "${{ needs.analyze-gpu-t4-failure.outputs.is_spot_termination }}" \
             "${{ needs.gpu-tests-t4-rerun.result }}" || FAILED=true
+
+          # B200 tests (optional, no rerun logic yet)
+          echo "" >> $GITHUB_STEP_SUMMARY
+          B200="${{ needs.gpu-tests-b200.result }}"
+          RUN_B200="${{ github.event.inputs.run_b200 }}"
+          if [ "$RUN_B200" == "true" ]; then
+            echo "GPU Tests (B200): $B200" >> $GITHUB_STEP_SUMMARY
+            if [ "$B200" != "success" ] && [ "$B200" != "skipped" ]; then
+              FAILED=true
+            fi
+          fi
 
           echo "" >> $GITHUB_STEP_SUMMARY
           if [ "$FAILED" == "true" ]; then
