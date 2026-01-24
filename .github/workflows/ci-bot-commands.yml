@@ -1,8 +1,8 @@
 # Bot command handler for CI permissions
 # Authorized users (ci-users team) can comment to control CI:
 #   @flashinfer-bot run          - Add run-ci label to trigger CI
-#   @flashinfer-bot rerun        - Rerun all jobs (cancel in-progress first)
-#   @flashinfer-bot rerun-failed - Rerun only failed jobs
+#   @flashinfer-bot rerun        - Cancel and rerun all workflows
+#   @flashinfer-bot rerun failed - Rerun only failed jobs
 #   @flashinfer-bot stop         - Cancel all in-progress workflows
 
 name: CI Bot Commands
@@ -67,7 +67,7 @@ jobs:
         env:
           COMMENT_BODY: ${{ github.event.comment.body }}
         run: |
-          if echo "$COMMENT_BODY" | grep -qi "@flashinfer-bot run-failed\|@flashinfer-bot rerun-failed"; then
+          if echo "$COMMENT_BODY" | grep -qi "@flashinfer-bot rerun failed"; then
             echo "command=rerun-failed" >> "$GITHUB_OUTPUT"
           elif echo "$COMMENT_BODY" | grep -qi "@flashinfer-bot rerun"; then
             echo "command=rerun" >> "$GITHUB_OUTPUT"
@@ -126,7 +126,7 @@ jobs:
             fi
           done
 
-          # Wait a moment for cancellations to complete
+          # Wait for cancellations to complete
           sleep 2
 
           # Rerun all workflow runs for this commit
@@ -150,7 +150,7 @@ jobs:
 
           echo "Rerun triggered successfully"
 
-      - name: Handle @flashinfer-bot rerun-failed
+      - name: Handle @flashinfer-bot rerun failed
         if: steps.check-permission.outputs.authorized == 'true' && steps.parse.outputs.command == 'rerun-failed'
         env:
           GH_TOKEN: ${{ secrets.FLASHINFER_BOT_TOKEN }}
