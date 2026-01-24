@@ -2,7 +2,7 @@
 # Authorized users (ci-users team) can comment to control CI:
 #   @flashinfer-bot run          - Add run-ci label to trigger CI
 #   @flashinfer-bot rerun        - Cancel and rerun all workflows
-#   @flashinfer-bot rerun failed - Rerun only failed jobs
+#   @flashinfer-bot rerun failed - Rerun failed and cancelled jobs
 #   @flashinfer-bot stop         - Cancel all in-progress workflows
 
 name: CI Bot Commands
@@ -155,7 +155,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.FLASHINFER_BOT_TOKEN }}
         run: |
-          echo "Rerunning failed jobs for PR #${{ github.event.issue.number }}"
+          echo "Rerunning failed/cancelled jobs for PR #${{ github.event.issue.number }}"
 
           # Get PR head SHA
           PR_SHA=$(gh pr view ${{ github.event.issue.number }} \
@@ -164,19 +164,20 @@ jobs:
 
           echo "PR HEAD SHA: $PR_SHA"
 
-          # Rerun failed workflow runs for this commit
-          RERUN_COUNT=0
-          gh run list \
-            --repo ${{ github.repository }} \
-            --commit "$PR_SHA" \
-            --status failure \
-            --json databaseId -q '.[].databaseId' | \
-          while read -r run_id; do
-            if [ -n "$run_id" ]; then
-              echo "Rerunning failed jobs in workflow $run_id..."
-              gh run rerun "$run_id" --repo ${{ github.repository }} --failed || true
-              RERUN_COUNT=$((RERUN_COUNT + 1))
-            fi
+          # Rerun failed and cancelled workflow runs for this commit
+          # (cancelled jobs are common with fail-fast when one job fails)
+          for STATUS in failure cancelled; do
+            gh run list \
+              --repo ${{ github.repository }} \
+              --commit "$PR_SHA" \
+              --status "$STATUS" \
+              --json databaseId -q '.[].databaseId' | \
+            while read -r run_id; do
+              if [ -n "$run_id" ]; then
+                echo "Rerunning $STATUS workflow $run_id..."
+                gh run rerun "$run_id" --repo ${{ github.repository }} --failed || true
+              fi
+            done
           done
 
           # React with thumbs up
