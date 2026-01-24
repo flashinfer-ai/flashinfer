@@ -34,10 +34,6 @@ on:
         description: 'Skip GPU tests'
         type: boolean
         default: false
-      run_b200:
-        description: 'Run B200 tests'
-        type: boolean
-        default: false
 
 concurrency:
   group: pr-test-${{ github.ref }}
@@ -656,7 +652,7 @@ jobs:
   gpu-tests-b200:
     name: JIT Unittest (B200)
     needs: setup
-    if: needs.setup.outputs.skip_build != 'true' && github.event.inputs.run_b200 == 'true'
+    if: needs.setup.outputs.skip_build != 'true' && github.event.inputs.skip_gpu != 'true'
     runs-on: [self-hosted, Linux, X64, gpu, b200]
     timeout-minutes: 360
     env:
@@ -776,15 +772,12 @@ jobs:
             "${{ needs.analyze-gpu-t4-failure.outputs.is_spot_termination }}" \
             "${{ needs.gpu-tests-t4-rerun.result }}" || FAILED=true
 
-          # B200 tests (optional, no rerun logic yet)
+          # B200 tests (no rerun logic yet - CB instances don't get spot terminated)
           echo "" >> $GITHUB_STEP_SUMMARY
           B200="${{ needs.gpu-tests-b200.result }}"
-          RUN_B200="${{ github.event.inputs.run_b200 }}"
-          if [ "$RUN_B200" == "true" ]; then
-            echo "GPU Tests (B200): $B200" >> $GITHUB_STEP_SUMMARY
-            if [ "$B200" != "success" ] && [ "$B200" != "skipped" ]; then
-              FAILED=true
-            fi
+          echo "GPU Tests (B200): $B200" >> $GITHUB_STEP_SUMMARY
+          if [ "$B200" != "success" ] && [ "$B200" != "skipped" ] && [ "${{ github.event.inputs.skip_gpu }}" != "true" ]; then
+            FAILED=true
           fi
 
           echo "" >> $GITHUB_STEP_SUMMARY
