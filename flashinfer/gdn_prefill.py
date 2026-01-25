@@ -24,6 +24,7 @@ from .jit.gdn import gen_gdn_prefill_sm90_module
 from .utils import (
     register_custom_op,
     register_fake_op,
+    get_device_sm_count,
 )
 
 
@@ -45,6 +46,7 @@ def get_gdn_prefill_module():
         g: Optional[torch.Tensor],
         beta: Optional[torch.Tensor],
         scale: float,
+        workspace_buffer: torch.Tensor,
     ) -> None:
         module.gdn_prefill(
             output,
@@ -57,6 +59,7 @@ def get_gdn_prefill_module():
             g,
             beta,
             scale,
+            workspace_buffer,
         )
 
     @register_fake_op("flashinfer::gdn_prefill")
@@ -71,6 +74,7 @@ def get_gdn_prefill_module():
         g: Optional[torch.Tensor],
         beta: Optional[torch.Tensor],
         scale: float,
+        workspace_buffer: torch.Tensor,
     ) -> None:
         pass
 
@@ -183,6 +187,14 @@ def chunk_gated_delta_rule(
             device=q.device,
         )
 
+    # 128B tensormap for each SM on Hopper architecture
+    workspace_size = get_device_sm_count(q.device) * 128
+    workspace_buffer = torch.empty(
+        (workspace_size,),
+        dtype=torch.uint8,
+        device=q.device,
+    )
+
     get_gdn_prefill_module().gdn_prefill(
         output,
         output_state,
@@ -194,6 +206,7 @@ def chunk_gated_delta_rule(
         g,
         beta,
         scale if scale is not None else 0.0,
+        workspace_buffer,
     )
 
     if output_final_state:

@@ -34,7 +34,7 @@ template <bool IsGVA, bool NeedsBeta, bool NeedsAlpha, bool InitStateFromInput, 
 void launch_delta_rule_prefill_kernel_gbai(cudaStream_t stream, TO* output, TState* output_state,
                                            TQKV const* q, TQKV const* k, TQKV const* v,
                                            TState const* input_state, float const* alpha,
-                                           float const* beta, int64_t const* cu_seqlens,
+                                           float const* beta, int64_t const* cu_seqlens, uint8_t* workspace_buffer,
                                            int32_t num_seqs, int32_t num_q_heads,
                                            int32_t num_k_heads, int32_t num_v_heads,
                                            int32_t num_o_heads, int32_t head_size,
@@ -128,16 +128,13 @@ void launch_delta_rule_prefill_kernel_gbai(cudaStream_t stream, TO* output, TSta
         },  // clang-format on
                         .hw_info = hw_info};
 
-    size_t workspace_size = op.get_workspace_size(arguments);
-    cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
-
     cutlass::Status status;
     status = op.can_implement(arguments);
     if (status != cutlass::Status::kSuccess) {
       throw std::runtime_error("can_implement failed");
     }
 
-    status = op.initialize(arguments, workspace.get(), stream);
+    status = op.initialize(arguments, workspace_buffer, stream);
     if (status != cutlass::Status::kSuccess) {
       throw std::runtime_error("initialize failed");
     }
