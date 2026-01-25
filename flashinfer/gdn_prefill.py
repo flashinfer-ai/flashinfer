@@ -25,6 +25,7 @@ from .utils import (
     register_custom_op,
     register_fake_op,
     get_device_sm_count,
+    _get_cache_buf,
 )
 
 
@@ -190,11 +191,7 @@ def chunk_gated_delta_rule(
     # Prepare workspace buffer for TMA Store in kernel
     # 128B tensormap for each SM on Hopper architecture
     workspace_size = get_device_sm_count(q.device) * 128
-    workspace_buffer = torch.empty(
-        (workspace_size,),
-        dtype=torch.uint8,
-        device=q.device,
-    )
+    workspace_buffer = _get_cache_buf("gdn_prefill_workspace", workspace_size, q.device)
 
     get_gdn_prefill_module().gdn_prefill(
         output,
