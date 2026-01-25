@@ -187,6 +187,7 @@ def chunk_gated_delta_rule(
             device=q.device,
         )
 
+    # Prepare workspace buffer for TMA Store in kernel
     # 128B tensormap for each SM on Hopper architecture
     workspace_size = get_device_sm_count(q.device) * 128
     workspace_buffer = torch.empty(
