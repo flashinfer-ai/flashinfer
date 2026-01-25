@@ -374,9 +374,6 @@ jobs:
       needs.gate.outputs.authorized == 'true' &&
       needs.setup.outputs.skip_build != 'true' &&
       github.event.inputs.skip_gpu != 'true'
-    runs-on: [self-hosted, Linux, X64, gpu, sm86]
-    needs: setup
-    if: needs.setup.outputs.skip_build != 'true' && github.event.inputs.skip_gpu != 'true'
     runs-on: [self-hosted, Linux, X64, gpu, sm86, spot]
     timeout-minutes: 360
     strategy:
@@ -553,9 +550,6 @@ jobs:
       needs.gate.outputs.authorized == 'true' &&
       needs.setup.outputs.skip_build != 'true' &&
       github.event.inputs.skip_gpu != 'true'
-    runs-on: [self-hosted, Linux, X64, gpu, sm75]
-    needs: setup
-    if: needs.setup.outputs.skip_build != 'true' && github.event.inputs.skip_gpu != 'true'
     runs-on: [self-hosted, Linux, X64, gpu, sm75, spot]
     timeout-minutes: 360
     env:
