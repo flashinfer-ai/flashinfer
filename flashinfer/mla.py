@@ -554,6 +554,14 @@ def trtllm_batch_decode_with_kv_cache_mla(
         This ensures the output is invariant to batch size, allowing per-request
         processing without a for loop while maintaining consistent results.
         Only supported by trtllm-gen backend. Defaults to False.
+
+        **Important**: For MLA attention, batch invariance may not be fully guaranteed
+        even with this flag enabled. The MLA implementation uses a reduction kernel
+        that combines partial results from split-KV optimization, and the number of
+        splits is determined by a heuristic that depends on batch size
+        (split_kv ~ sm_count / batch_size). This means different batch sizes may still
+        produce slightly different numerical results due to different reduction patterns,
+        even though multi-CTA is disabled in the main generation kernel.
     backend : str = "auto"
         The implementation backend, could be ``auto``/``xqa`` or ``trtllm-gen``. Defaults to ``auto``.
         When set to ``auto``, the backend will be chosen based on the device architecture and kernel availability.
