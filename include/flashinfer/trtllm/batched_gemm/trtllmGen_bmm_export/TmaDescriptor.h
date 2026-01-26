@@ -46,7 +46,8 @@ inline CUtensorMap buildNdTmaDescriptor(tg::Dtype dtype, std::vector<uint64_t> c
   CUtensorMap desc{};
   // The data type.
   CUtensorMapDataType tmaDataFormat{CU_TENSOR_MAP_DATA_TYPE_FLOAT32};
-  if (dtype == tg::Dtype::E4m3 || dtype == tg::Dtype::MxE4m3 || dtype == tg::Dtype::UE8m0) {
+  if (dtype == tg::Dtype::E4m3 || dtype == tg::Dtype::MxE4m3 || dtype == tg::Dtype::UE8m0 ||
+      dtype == tg::Dtype::UInt8) {
     tmaDataFormat = CU_TENSOR_MAP_DATA_TYPE_UINT8;
   } else if (dtype == tg::Dtype::Fp16) {
     tmaDataFormat = CU_TENSOR_MAP_DATA_TYPE_FLOAT16;
@@ -79,9 +80,9 @@ inline CUtensorMap buildNdTmaDescriptor(tg::Dtype dtype, std::vector<uint64_t> c
       swizzleType = CU_TENSOR_MAP_SWIZZLE_64B;
     } else if ((fastestDimTileSizeBytes % 32) == 0) {
       swizzleType = CU_TENSOR_MAP_SWIZZLE_32B;
-      // This path is only for the scaling factors.
     } else if ((fastestDimTileSizeBytes % 16) == 0 &&
-               (dtype == tg::Dtype::UE8m0 || dtype == tg::Dtype::E4m3)) {
+               (dtype == tg::Dtype::UE8m0 || dtype == tg::Dtype::E4m3 || dtype == tg::Dtype::E2m1 ||
+                dtype == tg::Dtype::UInt8)) {
       swizzleType = CU_TENSOR_MAP_SWIZZLE_NONE;
     } else {
       std::cerr << "buildNdTmaDescriptor: unexpected fastestDimTileSizeBytes "
