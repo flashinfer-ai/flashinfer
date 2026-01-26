@@ -23,6 +23,7 @@ from ..api_logging import flashinfer_api
 from ..jit.mamba import (
     gen_selective_state_update_module,
     gen_selective_state_update_sm90_module,
+    gen_selective_state_update_sm100_module,
 )
 from ..utils import get_compute_capability, register_custom_op, register_fake_op
 
@@ -35,14 +36,26 @@ def get_selective_state_update_module_base():
 
 @functools.cache
 def get_selective_state_update_module_sm90():
-    """Get cached JIT-compiled selective_state_update module (SM90+ version)."""
+    """Get cached JIT-compiled selective_state_update module (SM90/Hopper version)."""
     return gen_selective_state_update_sm90_module().build_and_load()
 
 
+@functools.cache
+def get_selective_state_update_module_sm100():
+    """Get cached JIT-compiled selective_state_update module (SM100+/Blackwell version)."""
+    return gen_selective_state_update_sm100_module().build_and_load()
+
+
 def get_selective_state_update_module(device: torch.device):
-    if get_compute_capability(device)[0] >= 9:
+    major, _ = get_compute_capability(device)
+    if major >= 10:
+        # SM100+ (Blackwell and newer) uses horizontal producer-consumer kernel
+        return get_selective_state_update_module_sm100()
+    elif major == 9:
+        # SM90 (Hopper) uses vertical producer-consumer kernel
         return get_selective_state_update_module_sm90()
     else:
+        # Pre-Hopper uses simple kernel
         return get_selective_state_update_module_base()
 
 
@@ -60,6 +73,7 @@ def selective_state_update(
     dt_softplus: bool = False,
     state_batch_indices: Optional[torch.Tensor] = None,
     pad_slot_id: int = -1,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     r"""Selective state update operation for Mamba layers (the generation phase).
 
@@ -91,6 +105,8 @@ def selective_state_update(
         If state_batch_indices is passed, lets the kernel identify padded entries
         that will not be processed. For example: state_batch_indices = [pad_slot_id, 1, 20, pad_slot_id]
         in this case, the kernel will not process entries at indices 0 and 3
+    out : torch.Tensor | None
+        Optional output tensor
 
     Returns
     -------
@@ -115,7 +131,10 @@ def selective_state_update(
         z = z.unsqueeze(1)
     if dt_bias is not None and dt_bias.dim() == 1:
         dt_bias = dt_bias.unsqueeze(0)
-    output = torch.empty_like(x)
+    if out is None:
+        output = torch.empty_like(x)
+    else:
+        output = out
     _selective_state_update(
         state,
         x,

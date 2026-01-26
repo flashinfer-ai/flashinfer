@@ -47,21 +47,24 @@ def compute_bandwidth_gb_s(
     1. Read input x: [batch_size, hidden_size] in fp16/bf16 (2 bytes/elem)
     2. Read residual r: [batch_size, hidden_size] in fp16/bf16 (2 bytes/elem)
     3. Read weight: [hidden_size] in fp16/bf16 (2 bytes/elem)
-    4. Write y_fp4: [batch_size, hidden_size/2] packed uint8 (1 byte per 2 FP4 values)
-    5. Write block_scale: [batch_size, hidden_size/block_size] in fp8/uint8 (1 byte/elem)
+    4. Write residual r: [batch_size, hidden_size] in fp16/bf16 (2 bytes/elem) - in-place update with x + r
+    5. Write y_fp4: [batch_size, hidden_size/2] packed uint8 (1 byte per 2 FP4 values)
+    6. Write block_scale: [batch_size, hidden_size/block_size] in fp8/uint8 (1 byte/elem)
 
     Formula:
         read_bytes  = batch_size * hidden_size * 2 * 2 + hidden_size * 2
-        write_bytes = batch_size * hidden_size / 2 + batch_size * hidden_size / block_size
+        write_bytes = batch_size * hidden_size * 2 + batch_size * hidden_size / 2 + batch_size * hidden_size / block_size
         total_bytes = read_bytes + write_bytes
         bandwidth   = total_bytes / time_in_seconds / 1e9  (GB/s)
     """
     # Read: x (fp16) + r (fp16) + weight (fp16)
     read_bytes = batch_size * hidden_size * 2 * 2 + hidden_size * 2
 
-    # Write: y_fp4 (packed uint8) + block_scale (fp8/uint8)
-    write_bytes = batch_size * (hidden_size // 2) + batch_size * (
-        hidden_size // block_size
+    # Write: r (fp16, in-place update) + y_fp4 (packed uint8) + block_scale (fp8/uint8)
+    write_bytes = (
+        batch_size * hidden_size * 2  # residual write-back (in-place update with x + r)
+        + batch_size * (hidden_size // 2)  # y_fp4
+        + batch_size * (hidden_size // block_size)  # block_scale
     )
 
     total_bytes = read_bytes + write_bytes
@@ -191,6 +194,9 @@ def sanity_check_outputs(dtype=torch.float16, block_size=16, global_scale=None):
         r = torch.randn(batch_size, hidden_size, device="cuda", dtype=dtype)
         weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
 
+        # Compute reference h BEFORE fused kernel (since fused kernel modifies r in-place)
+        h_ref = x + r
+
         # CuTe-DSL fused path
         y_fp4_fused = torch.empty(
             batch_size, hidden_size // 2, device="cuda", dtype=torch.float4_e2m1fn_x2
@@ -222,7 +228,8 @@ def sanity_check_outputs(dtype=torch.float16, block_size=16, global_scale=None):
         )
 
         # Separate path: torch.add + rmsnorm + fp4_quantize
-        h = x + r
+        # Use h_ref computed before fused kernel (r was modified in-place)
+        h = h_ref
         y_normed = torch.empty_like(x)
         rmsnorm(h, weight, eps=eps, out=y_normed)
 
