@@ -21,6 +21,9 @@ Usage:
     # Custom token counts
     python bench_moe_deepseek.py --num-tokens 64,128,256
 
+    # Disable CUDA graph (useful for debugging or profiling)
+    python bench_moe_deepseek.py --no-cuda-graph
+
 Metrics:
     - ms: Latency in milliseconds
     - TFLOPS: Computational throughput
@@ -179,7 +182,12 @@ def create_inputs(n, dev="cuda"):
 
 
 def bench_cute_dsl(
-    inputs, warmup=10, iters=100, num_local_experts=None, local_expert_offset=0
+    inputs,
+    warmup=10,
+    iters=100,
+    num_local_experts=None,
+    local_expert_offset=0,
+    use_cuda_graph=True,
 ):
     from flashinfer.fused_moe import fused_topk_deepseek
     from flashinfer.cute_dsl import cute_dsl_fused_moe_nvfp4
@@ -267,13 +275,18 @@ def bench_cute_dsl(
         repeat_iters=iters,
         cold_l2_cache=True,
         enable_cupti=True,
-        use_cuda_graph=True,
+        use_cuda_graph=use_cuda_graph,
     )
     return np.median(times)
 
 
 def bench_cutlass(
-    inputs, warmup=10, iters=100, num_local_experts=None, local_expert_offset=0
+    inputs,
+    warmup=10,
+    iters=100,
+    num_local_experts=None,
+    local_expert_offset=0,
+    use_cuda_graph=True,
 ):
     from flashinfer.fused_moe import fused_topk_deepseek, cutlass_fused_moe
     from flashinfer.fp4_quantization import fp4_quantize
@@ -335,13 +348,18 @@ def bench_cutlass(
         repeat_iters=iters,
         cold_l2_cache=True,
         enable_cupti=True,
-        use_cuda_graph=True,
+        use_cuda_graph=use_cuda_graph,
     )
     return np.median(times)
 
 
 def bench_trtllm(
-    inputs, warmup=10, iters=100, num_local_experts=None, local_expert_offset=0
+    inputs,
+    warmup=10,
+    iters=100,
+    num_local_experts=None,
+    local_expert_offset=0,
+    use_cuda_graph=True,
 ):
     from flashinfer.fused_moe import trtllm_fp4_block_scale_moe
     from flashinfer.fused_moe.core import (
@@ -447,7 +465,7 @@ def bench_trtllm(
         repeat_iters=iters,
         cold_l2_cache=True,
         enable_cupti=True,
-        use_cuda_graph=True,
+        use_cuda_graph=use_cuda_graph,
     )
     return np.median(times)
 
@@ -692,6 +710,7 @@ def run_benchmark(
     ep_config="EP1",
     do_autotune=True,
     verbose=True,
+    use_cuda_graph=True,
 ):
     """
     Unified benchmark for DeepSeek-V3 MoE backends.
@@ -703,6 +722,7 @@ def run_benchmark(
         ep_config: Expert Parallelism config ("EP1", "EP8", "EP16")
         do_autotune: Whether to run autotune before benchmarking
         verbose: Print results to stdout
+        use_cuda_graph: Whether to use CUDA graph for benchmarking
 
     Returns:
         List of BenchResult objects
@@ -712,18 +732,20 @@ def run_benchmark(
     num_local = ep_cfg["num_local_experts"]
     local_offset = ep_cfg["local_expert_offset"]
 
-    # Print header
-    if verbose:
-        _print_header(ep_config, num_local)
-
-    # Run autotune if requested
+    # Run autotune if requested (BEFORE printing header to avoid interleaved output)
     if do_autotune:
         run_autotune(create_inputs(max(token_counts)), verbose=verbose)
+
+    # Print header AFTER autotune completes
+    if verbose:
+        _print_header(ep_config, num_local, use_cuda_graph)
 
     # Run benchmarks
     results = []
     for n in token_counts:
-        row = _benchmark_single(n, warmup, iters, num_local, local_offset)
+        row = _benchmark_single(
+            n, warmup, iters, num_local, local_offset, use_cuda_graph
+        )
         results.extend(row)
         if verbose:
             _print_row(row)
@@ -735,15 +757,21 @@ def run_benchmark(
     return results
 
 
-def _benchmark_single(n, warmup, iters, num_local, local_offset):
+def _benchmark_single(n, warmup, iters, num_local, local_offset, use_cuda_graph):
     """Benchmark all backends for a single token count."""
     inputs = create_inputs(n)
 
     # Run all three backends
     lat = {
-        "CuteDSL": bench_cute_dsl(inputs, warmup, iters, num_local, local_offset),
-        "CUTLASS": bench_cutlass(inputs, warmup, iters, num_local, local_offset),
-        "TRTLLM": bench_trtllm(inputs, warmup, iters, num_local, local_offset),
+        "CuteDSL": bench_cute_dsl(
+            inputs, warmup, iters, num_local, local_offset, use_cuda_graph
+        ),
+        "CUTLASS": bench_cutlass(
+            inputs, warmup, iters, num_local, local_offset, use_cuda_graph
+        ),
+        "TRTLLM": bench_trtllm(
+            inputs, warmup, iters, num_local, local_offset, use_cuda_graph
+        ),
     }
 
     # Build results
@@ -761,7 +789,7 @@ def _benchmark_single(n, warmup, iters, num_local, local_offset):
     return results
 
 
-def _print_header(ep_config, num_local):
+def _print_header(ep_config, num_local, use_cuda_graph):
     """Print benchmark header."""
     print("\n" + "=" * 120)
     print(f"DeepSeek-V3 MoE Benchmark: CuteDSL vs CUTLASS vs TRTLLM ({ep_config})")
@@ -773,6 +801,7 @@ def _print_header(ep_config, num_local):
     print(
         f"EP Config: {num_local} local experts (simulating {CFG.num_experts // num_local}-way parallelism)"
     )
+    print(f"CUDA Graph: {'enabled' if use_cuda_graph else 'disabled'}")
     print("-" * 120)
     print(
         f"{'Tokens':>6} | "
@@ -848,6 +877,11 @@ def main():
         choices=["EP1", "EP8", "EP16"],
         help="Expert Parallelism: EP1 (256 local), EP8 (32 local), EP16 (16 local)",
     )
+    parser.add_argument(
+        "--no-cuda-graph",
+        action="store_true",
+        help="Disable CUDA graph for benchmarking (enabled by default)",
+    )
     args = parser.parse_args()
 
     if not is_blackwell():
@@ -872,6 +906,7 @@ def main():
         ep_config=args.ep,
         do_autotune=not args.no_autotune,
         verbose=not args.quiet,
+        use_cuda_graph=not args.no_cuda_graph,
     )
 
     return 0
