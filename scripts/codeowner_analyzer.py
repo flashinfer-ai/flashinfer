@@ -28,6 +28,7 @@ class CodeOwnersAnalyzer:
         allowed_users: Optional[List[str]] = None,
         max_depth: int = 3,
         top_n_owners: int = 3,
+        owner_overrides: Optional[Dict[str, List[str]]] = None,
     ):
         """
         Initialize the code owners analyzer.
@@ -40,6 +41,8 @@ class CodeOwnersAnalyzer:
             allowed_users: Optional list of GitHub usernames to include (filters out others)
             max_depth: Maximum directory depth for module detection (default: 3)
             top_n_owners: Number of top owners to include in CODEOWNERS file (default: 3)
+            owner_overrides: Dict mapping module paths to lists of GitHub usernames that
+                should always be included as owners (prepended to computed owners)
         """
         self.repo_path = Path(repo_path).resolve()
         self.min_commits = min_commits
@@ -53,6 +56,8 @@ class CodeOwnersAnalyzer:
         self.allowed_users = (
             set(u.lower() for u in allowed_users) if allowed_users else None
         )
+        # Manual overrides: module path -> list of GitHub usernames to always include
+        self.owner_overrides = owner_overrides or {}
 
         # Default exclude patterns
         self.exclude_patterns = [
@@ -510,6 +515,43 @@ class CodeOwnersAnalyzer:
 
         return results
 
+    def _merge_owners_with_overrides(
+        self, module: str, computed_usernames: List[str]
+    ) -> List[str]:
+        """Merge manual overrides with computed owners.
+
+        Override users are prepended to the list (indicating primary ownership),
+        and duplicates are removed. The final list is limited to top_n_owners.
+
+        Args:
+            module: The module path (e.g., "flashinfer/fused_moe")
+            computed_usernames: List of GitHub usernames from git history analysis
+                (with @ prefix, e.g., ["@alice", "@bob"])
+
+        Returns:
+            Merged list of usernames with overrides first, limited to top_n_owners
+        """
+        if not self.owner_overrides:
+            return computed_usernames[: self.top_n_owners]
+
+        # Get override users for this module (without @ prefix in the config)
+        override_users = self.owner_overrides.get(module, [])
+        if not override_users:
+            return computed_usernames[: self.top_n_owners]
+
+        # Normalize override users to have @ prefix
+        override_usernames = [
+            f"@{u}" if not u.startswith("@") else u for u in override_users
+        ]
+
+        # Build merged list: overrides first, then computed (excluding duplicates)
+        merged = list(override_usernames)
+        for username in computed_usernames:
+            if username not in merged:
+                merged.append(username)
+
+        return merged[: self.top_n_owners]
+
     def generate_codeowners_file(
         self, results: Dict[str, Any], output_file: str = "CODEOWNERS"
     ) -> None:
@@ -518,9 +560,14 @@ class CodeOwnersAnalyzer:
             f.write("# Code Owners File\n")
             f.write("# Generated automatically from git history analysis\n")
             f.write(f"# Analysis period: {self.days_back} days\n")
-            f.write(f"# Minimum commits threshold: {self.min_commits}\n\n")
+            f.write(f"# Minimum commits threshold: {self.min_commits}\n")
+            if self.owner_overrides:
+                f.write("# Manual overrides applied from overrides file\n")
+            f.write("\n")
 
             for module, data in results.items():
+                # Extract GitHub usernames from computed owners
+                computed_usernames = []
                 if data["owners"]:
                     # Take top N owners or those with ownership score > 0.1
                     top_owners = [
@@ -529,21 +576,23 @@ class CodeOwnersAnalyzer:
                         if owner["ownership_score"] > 0.1
                     ]
 
-                    if top_owners:
-                        # Extract GitHub usernames from author strings
-                        github_usernames = []
-                        for owner in top_owners:
-                            github_username = self.get_github_username(owner["author"])
-                            if github_username:
-                                github_usernames.append(f"@{github_username}")
-                            else:
-                                # Fallback to email if no GitHub username found
-                                email = owner["author"].split("<")[1].rstrip(">")
-                                github_usernames.append(email)
+                    for owner in top_owners:
+                        github_username = self.get_github_username(owner["author"])
+                        if github_username:
+                            computed_usernames.append(f"@{github_username}")
+                        else:
+                            # Fallback to email if no GitHub username found
+                            email = owner["author"].split("<")[1].rstrip(">")
+                            computed_usernames.append(email)
 
-                        if github_usernames:
-                            owners_list = " ".join(github_usernames)
-                            f.write(f"{module}/ {owners_list}\n")
+                # Merge with overrides
+                final_usernames = self._merge_owners_with_overrides(
+                    module, computed_usernames
+                )
+
+                if final_usernames:
+                    owners_list = " ".join(final_usernames)
+                    f.write(f"{module}/ {owners_list}\n")
 
     def print_detailed_report(self, results: Dict[str, Any]) -> None:
         """Print a detailed ownership report."""
@@ -596,6 +645,7 @@ Examples:
   %(prog)s --json-output owners.json # Export detailed JSON
   %(prog)s --allowed-users user1 user2 # Only include specific GitHub users
   %(prog)s --allowed-users-file team.txt # Load allowed users from file
+  %(prog)s --overrides-file overrides.json # Apply manual owner overrides
         """,
     )
     parser.add_argument("--repo-path", default=".", help="Path to git repository")
@@ -642,6 +692,10 @@ Examples:
         default=3,
         help="Number of top owners to include in CODEOWNERS file (default: 3)",
     )
+    parser.add_argument(
+        "--overrides-file",
+        help="JSON file with manual owner overrides (module path -> list of usernames)",
+    )
 
     args = parser.parse_args()
 
@@ -671,6 +725,46 @@ Examples:
     # Remove duplicates
     allowed_users = list(set(allowed_users)) if allowed_users else None
 
+    # Load owner overrides file if provided
+    owner_overrides = None
+    if args.overrides_file:
+        try:
+            with open(args.overrides_file, "r") as f:
+                owner_overrides = json.load(f)
+            if not isinstance(owner_overrides, dict):
+                print(
+                    "Error: Overrides file must contain a JSON object (dict)",
+                    file=sys.stderr,
+                )
+                return 1
+            # Validate structure: all values should be lists of strings
+            for path, users in owner_overrides.items():
+                if not isinstance(users, list):
+                    print(
+                        f"Error: Override for '{path}' must be a list of usernames",
+                        file=sys.stderr,
+                    )
+                    return 1
+                for user in users:
+                    if not isinstance(user, str):
+                        print(
+                            f"Error: Override users for '{path}' must be strings",
+                            file=sys.stderr,
+                        )
+                        return 1
+        except FileNotFoundError:
+            print(
+                f"Error: Overrides file not found: {args.overrides_file}",
+                file=sys.stderr,
+            )
+            return 1
+        except json.JSONDecodeError as e:
+            print(f"Error: Invalid JSON in overrides file: {e}", file=sys.stderr)
+            return 1
+        except Exception as e:
+            print(f"Error reading overrides file: {e}", file=sys.stderr)
+            return 1
+
     try:
         analyzer = CodeOwnersAnalyzer(
             repo_path=args.repo_path,
@@ -680,6 +774,7 @@ Examples:
             allowed_users=allowed_users,
             max_depth=args.depth,
             top_n_owners=args.top_n,
+            owner_overrides=owner_overrides,
         )
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
@@ -698,6 +793,8 @@ Examples:
             print(
                 f"👥 Filtering to {len(allowed_users)} allowed users: {', '.join(allowed_users[:10])}{'...' if len(allowed_users) > 10 else ''}"
             )
+        if owner_overrides:
+            print(f"📌 Manual overrides for {len(owner_overrides)} modules")
 
     results = analyzer.analyze_all_modules(verbose=not args.quiet)
 

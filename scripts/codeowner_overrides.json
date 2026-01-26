@@ -1,0 +1,5 @@
+{
+  "flashinfer/fused_moe": ["aleozlx"],
+  "csrc/fused_moe": ["aleozlx"],
+  "tests/moe": ["aleozlx"]
+}
