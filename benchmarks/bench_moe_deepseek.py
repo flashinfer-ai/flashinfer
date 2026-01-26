@@ -1,9 +1,31 @@
 #!/usr/bin/env python3
-"""DeepSeek-V3 MoE Performance Benchmark - CuteDSL vs CUTLASS vs TRTLLM Gen.
+"""DeepSeek-V3 MoE Performance Benchmark - CuteDSL vs CUTLASS vs TRTLLM.
+
+Compares three NVFP4 MoE backends on DeepSeek-V3 configuration:
+- CuteDSL: FlashInfer's CuteDSL-based implementation
+- CUTLASS: NVIDIA CUTLASS-based implementation
+- TRTLLM: TensorRT-LLM's implementation
 
 Usage:
-    python bench_moe_deepseek.py                       # Run perf test with default token counts
-    python bench_moe_deepseek.py --num-tokens 128,256  # Custom token counts
+    # Throughput benchmark (large batches: 128-4096 tokens)
+    python bench_moe_deepseek.py
+
+    # Generation phase benchmark (small batches: 1-128 tokens)
+    python bench_moe_deepseek.py --gen-phase
+
+    # With Expert Parallelism simulation
+    python bench_moe_deepseek.py --ep EP1   # 256 local experts (no parallelism)
+    python bench_moe_deepseek.py --ep EP8   # 32 local experts (8-way EP)
+    python bench_moe_deepseek.py --ep EP16  # 16 local experts (16-way EP)
+
+    # Custom token counts
+    python bench_moe_deepseek.py --num-tokens 64,128,256
+
+Metrics:
+    - ms: Latency in milliseconds
+    - TFLOPS: Computational throughput
+    - us/tok: Microseconds per token (key for generation latency)
+    - Speedup: CuteDSL latency / other backend latency (>1 = CuteDSL faster)
 """
 
 import argparse
@@ -25,6 +47,19 @@ class DeepSeekConfig:
 
 CFG = DeepSeekConfig()
 TOKEN_COUNTS = [128, 256, 512, 1024, 2048, 4096]
+
+# Generation phase token counts (small batches typical in decode)
+GEN_PHASE_TOKENS = [1, 2, 4, 8, 16, 32, 64, 128]
+
+# Expert Parallelism configurations
+# EP=1: all 256 experts on single GPU
+# EP=8: 32 experts per GPU (256/8)
+# EP=16: 16 experts per GPU (256/16)
+EP_CONFIGS = {
+    "EP1": {"num_local_experts": 256, "local_expert_offset": 0},
+    "EP8": {"num_local_experts": 32, "local_expert_offset": 0},
+    "EP16": {"num_local_experts": 16, "local_expert_offset": 0},
+}
 
 
 def is_blackwell():
@@ -143,12 +178,17 @@ def create_inputs(n, dev="cuda"):
 # =============================================================================
 
 
-def bench_cute_dsl(inputs, warmup=10, iters=100):
+def bench_cute_dsl(
+    inputs, warmup=10, iters=100, num_local_experts=None, local_expert_offset=0
+):
     from flashinfer.fused_moe import fused_topk_deepseek
     from flashinfer.cute_dsl import cute_dsl_fused_moe_nvfp4
     from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
     from flashinfer.fp4_quantization import fp4_quantize
     from flashinfer.testing.utils import bench_gpu_time
+
+    if num_local_experts is None:
+        num_local_experts = CFG.num_experts
 
     n, sv, dev = inputs["router_logits"].shape[0], 16, "cuda"
     gs1 = torch.tensor([1.0], device=dev)
@@ -159,25 +199,32 @@ def bench_cute_dsl(inputs, warmup=10, iters=100):
     xf, xs = fp4_quantize(inputs["hidden_bf16"], gs1, sv, False, False)
     xs = xs.unsqueeze(-1)
 
-    w1i = interleave(inputs["w1_bf16"], 64)
-    w1f = w1i.view(CFG.num_experts * 2 * CFG.intermediate_size, CFG.hidden_size)
+    # Expert range for this EP partition
+    expert_start = local_expert_offset
+    expert_end = local_expert_offset + num_local_experts
+
+    # Slice weights to LOCAL experts only
+    w1_local = inputs["w1_bf16"][expert_start:expert_end]
+    w2_local = inputs["w2_bf16"][expert_start:expert_end]
+
+    w1i = interleave(w1_local, 64)
+    w1f = w1i.view(num_local_experts * 2 * CFG.intermediate_size, CFG.hidden_size)
     w1q, w1s = fp4_quantize(w1f, gs1, sv, False, True)
-    w1q = w1q.view(CFG.num_experts, 2 * CFG.intermediate_size, CFG.hidden_size // 2)
+    w1q = w1q.view(num_local_experts, 2 * CFG.intermediate_size, CFG.hidden_size // 2)
     w1s = convert_sf_to_mma_layout(
-        w1s, 2 * CFG.intermediate_size, CFG.hidden_size, CFG.num_experts, sv
+        w1s, 2 * CFG.intermediate_size, CFG.hidden_size, num_local_experts, sv
     )
 
-    w2f = inputs["w2_bf16"].view(
-        CFG.num_experts * CFG.hidden_size, CFG.intermediate_size
-    )
+    w2f = w2_local.view(num_local_experts * CFG.hidden_size, CFG.intermediate_size)
     w2q, w2s = fp4_quantize(w2f, gs1, sv, False, True)
-    w2q = w2q.view(CFG.num_experts, CFG.hidden_size, CFG.intermediate_size // 2)
+    w2q = w2q.view(num_local_experts, CFG.hidden_size, CFG.intermediate_size // 2)
     w2s = convert_sf_to_mma_layout(
-        w2s, CFG.hidden_size, CFG.intermediate_size, CFG.num_experts, sv
+        w2s, CFG.hidden_size, CFG.intermediate_size, num_local_experts, sv
     )
 
+    # Alpha sized for LOCAL experts only
     alpha, fc2sc = (
-        torch.ones(CFG.num_experts, device=dev),
+        torch.ones(num_local_experts, device=dev),
         torch.tensor([1.0], device=dev),
     )
 
@@ -192,6 +239,10 @@ def bench_cute_dsl(inputs, warmup=10, iters=100):
             topk_values=tv,
             topk_indices=ti,
         )
+        # Note: Unlike TRTLLM which has EP-aware internal routing, CuteDSL
+        # receives routing to all experts. The moe_sort filters non-local
+        # experts but there's overhead in processing all token-expert pairs.
+        # This is a known limitation - CuteDSL doesn't show strong EP scaling.
         return cute_dsl_fused_moe_nvfp4(
             x=xf,
             x_sf=xs,
@@ -206,20 +257,31 @@ def bench_cute_dsl(inputs, warmup=10, iters=100):
             w2_alpha=alpha,
             num_experts=CFG.num_experts,
             top_k=CFG.top_k,
-            num_local_experts=CFG.num_experts,
-            local_expert_offset=0,
+            num_local_experts=num_local_experts,
+            local_expert_offset=local_expert_offset,
         )
 
     times = bench_gpu_time(
-        run, dry_run_iters=warmup, repeat_iters=iters, cold_l2_cache=True
+        run,
+        dry_run_iters=warmup,
+        repeat_iters=iters,
+        cold_l2_cache=True,
+        enable_cupti=True,
     )
     return np.median(times)
 
 
-def bench_cutlass(inputs, warmup=10, iters=100):
+def bench_cutlass(
+    inputs, warmup=10, iters=100, num_local_experts=None, local_expert_offset=0
+):
     from flashinfer.fused_moe import fused_topk_deepseek, cutlass_fused_moe
     from flashinfer.fp4_quantization import fp4_quantize
     from flashinfer.testing.utils import bench_gpu_time
+
+    # Note: CUTLASS backend doesn't support EP natively in this benchmark
+    # We keep the parameters for API consistency
+    if num_local_experts is None:
+        num_local_experts = CFG.num_experts
 
     n, sv, dev = inputs["router_logits"].shape[0], 16, "cuda"
 
@@ -267,12 +329,18 @@ def bench_cutlass(inputs, warmup=10, iters=100):
         return output
 
     times = bench_gpu_time(
-        run, dry_run_iters=warmup, repeat_iters=iters, cold_l2_cache=True
+        run,
+        dry_run_iters=warmup,
+        repeat_iters=iters,
+        cold_l2_cache=True,
+        enable_cupti=True,
     )
     return np.median(times)
 
 
-def bench_trtllm(inputs, warmup=10, iters=100):
+def bench_trtllm(
+    inputs, warmup=10, iters=100, num_local_experts=None, local_expert_offset=0
+):
     from flashinfer.fused_moe import trtllm_fp4_block_scale_moe
     from flashinfer.fused_moe.core import (
         RoutingMethodType,
@@ -282,8 +350,15 @@ def bench_trtllm(inputs, warmup=10, iters=100):
     from flashinfer.fp4_quantization import fp4_quantize, block_scale_interleave
     from flashinfer.testing.utils import bench_gpu_time
 
+    if num_local_experts is None:
+        num_local_experts = CFG.num_experts
+
     n, dev = inputs["router_logits"].shape[0], inputs["router_logits"].device
     sv, etm, cache = 16, 128, {}
+
+    # Expert range for this EP partition
+    expert_start = local_expert_offset
+    expert_end = local_expert_offset + num_local_experts
 
     hg = inputs["hidden_gs"]
     hfp, hsf = fp4_quantize(inputs["hidden_bf16"], hg, sv, False, True)
@@ -295,8 +370,9 @@ def bench_trtllm(inputs, warmup=10, iters=100):
     )
 
     def prep(bf16, gs, M, K):
+        """Prepare weights for LOCAL experts only."""
         fl, sl = [], []
-        for e in range(CFG.num_experts):
+        for e in range(expert_start, expert_end):
             q, s = fp4_quantize(bf16[e], gs[e], sv, False, False)
             fl.append(q.view(torch.uint8).reshape(M, K // 2))
             sl.append(s.view(torch.float8_e4m3fn).reshape(M, K // sv))
@@ -310,8 +386,9 @@ def bench_trtllm(inputs, warmup=10, iters=100):
     )
 
     def shuf(fp4, sf, perm_fn):
+        """Shuffle weights for LOCAL experts only."""
         fsh, ssh = [], []
-        for i in range(CFG.num_experts):
+        for i in range(num_local_experts):
             p = perm_fn(cache, fp4[i], etm)
             fsh.append(fp4[i][p.to(dev)].contiguous())
             ps = perm_fn(cache, sf[i].view(torch.uint8), etm, sv)
@@ -323,13 +400,14 @@ def bench_trtllm(inputs, warmup=10, iters=100):
     w1f, w1s = shuf(w1f, w1s, _maybe_get_cached_w3_w1_permute_indices)
     w2f, w2s = shuf(w2f, w2s, get_w2_permute_indices_with_cache)
     w1s = w1s.view(torch.float8_e4m3fn).reshape(
-        CFG.num_experts, 2 * CFG.intermediate_size, CFG.hidden_size // sv
+        num_local_experts, 2 * CFG.intermediate_size, CFG.hidden_size // sv
     )
     w2s = w2s.view(torch.float8_e4m3fn).reshape(
-        CFG.num_experts, CFG.hidden_size, CFG.intermediate_size // sv
+        num_local_experts, CFG.hidden_size, CFG.intermediate_size // sv
     )
 
-    sc = torch.ones(CFG.num_experts, device=dev, dtype=torch.float32)
+    # Scale tensors sized for LOCAL experts only
+    sc = torch.ones(num_local_experts, device=dev, dtype=torch.float32)
 
     def run():
         return trtllm_fp4_block_scale_moe(
@@ -354,15 +432,19 @@ def bench_trtllm(inputs, warmup=10, iters=100):
             n_group=CFG.n_group,
             topk_group=CFG.topk_group,
             intermediate_size=CFG.intermediate_size,
-            local_expert_offset=0,
-            local_num_experts=CFG.num_experts,
+            local_expert_offset=local_expert_offset,
+            local_num_experts=num_local_experts,
             routed_scaling_factor=CFG.routed_scaling_factor,
             routing_method_type=RoutingMethodType.DeepSeekV3,
             do_finalize=True,
         )
 
     times = bench_gpu_time(
-        run, dry_run_iters=warmup, repeat_iters=iters, cold_l2_cache=True
+        run,
+        dry_run_iters=warmup,
+        repeat_iters=iters,
+        cold_l2_cache=True,
+        enable_cupti=True,
     )
     return np.median(times)
 
@@ -590,84 +672,151 @@ def run_autotune(inputs, verbose=True):
 
 
 @dataclass
-class PerfResult:
+class BenchResult:
+    """Single benchmark result for one backend at one token count."""
+
     backend: str
-    num_tokens: int
+    tokens: int
     latency_ms: float
     tflops: float
-    tb_s: float
+    us_per_token: float
 
 
-def run_perf_test(token_counts, warmup=10, iters=100, do_autotune=True, verbose=True):
+def run_benchmark(
+    token_counts,
+    warmup=10,
+    iters=100,
+    ep_config="EP1",
+    do_autotune=True,
+    verbose=True,
+):
+    """
+    Unified benchmark for DeepSeek-V3 MoE backends.
+
+    Args:
+        token_counts: List of token counts to benchmark
+        warmup: Warmup iterations
+        iters: Benchmark iterations
+        ep_config: Expert Parallelism config ("EP1", "EP8", "EP16")
+        do_autotune: Whether to run autotune before benchmarking
+        verbose: Print results to stdout
+
+    Returns:
+        List of BenchResult objects
+    """
+    # Get EP configuration
+    ep_cfg = EP_CONFIGS.get(ep_config, EP_CONFIGS["EP1"])
+    num_local = ep_cfg["num_local_experts"]
+    local_offset = ep_cfg["local_expert_offset"]
+
+    # Print header
     if verbose:
-        print("\n" + "=" * 120)
-        print("Performance Benchmark: CuteDSL vs CUTLASS vs TRTLLM Gen (DeepSeek-V3)")
-        print("=" * 120)
-        print(
-            f"Config: hidden={CFG.hidden_size}, inter={CFG.intermediate_size}, "
-            f"experts={CFG.num_experts}, top_k={CFG.top_k}"
-        )
+        _print_header(ep_config, num_local)
 
+    # Run autotune if requested
     if do_autotune:
         run_autotune(create_inputs(max(token_counts)), verbose=verbose)
 
+    # Run benchmarks
     results = []
-    if verbose:
-        print("-" * 120)
-        print(
-            f"{'Tokens':<8} | {'CuteDSL':<20} | {'CUTLASS':<20} | {'TRTLLM':<20} | "
-            f"{'CuteDSL/CUTLASS':>15} {'CuteDSL/TRTLLM':>15} | {'Fastest':<10}"
-        )
-        print(
-            f"{'':8} | {'ms':>8} {'TFLOPS':>10} | {'ms':>8} {'TFLOPS':>10} | {'ms':>8} {'TFLOPS':>10} |"
-        )
-        print("-" * 120)
-
     for n in token_counts:
-        inputs = create_inputs(n)
-
-        # Benchmark all three backends
-        lat_cute = bench_cute_dsl(inputs, warmup, iters)
-        lat_cutlass = bench_cutlass(inputs, warmup, iters)
-        lat_trtllm = bench_trtllm(inputs, warmup, iters)
-
-        tflops_cute = calc_tflops(n, lat_cute)
-        tflops_cutlass = calc_tflops(n, lat_cutlass)
-        tflops_trtllm = calc_tflops(n, lat_trtllm)
-
-        results.append(
-            PerfResult("CuteDSL", n, lat_cute, tflops_cute, calc_bw(n, lat_cute))
-        )
-        results.append(
-            PerfResult(
-                "CUTLASS", n, lat_cutlass, tflops_cutlass, calc_bw(n, lat_cutlass)
-            )
-        )
-        results.append(
-            PerfResult("TRTLLM", n, lat_trtllm, tflops_trtllm, calc_bw(n, lat_trtllm))
-        )
-
-        # Calculate speedups (CuteDSL / others, > 1 means CuteDSL is faster)
-        speedup_vs_cutlass = lat_cutlass / lat_cute
-        speedup_vs_trtllm = lat_trtllm / lat_cute
-
-        # Determine fastest backend
-        latencies = {"CuteDSL": lat_cute, "CUTLASS": lat_cutlass, "TRTLLM": lat_trtllm}
-        fastest = min(latencies, key=latencies.get)
-
+        row = _benchmark_single(n, warmup, iters, num_local, local_offset)
+        results.extend(row)
         if verbose:
-            print(
-                f"{n:<8} | {lat_cute:>8.3f} {tflops_cute:>10.1f} | "
-                f"{lat_cutlass:>8.3f} {tflops_cutlass:>10.1f} | "
-                f"{lat_trtllm:>8.3f} {tflops_trtllm:>10.1f} | "
-                f"{speedup_vs_cutlass:>14.2f}x {speedup_vs_trtllm:>14.2f}x | {fastest:<10}"
-            )
+            _print_row(row)
 
+    # Print footer
     if verbose:
-        print("-" * 120)
-        print("Note: Speedup > 1.0 means CuteDSL is faster")
+        _print_footer(ep_config, num_local)
 
     return results
+
+
+def _benchmark_single(n, warmup, iters, num_local, local_offset):
+    """Benchmark all backends for a single token count."""
+    inputs = create_inputs(n)
+
+    # Run all three backends
+    lat = {
+        "CuteDSL": bench_cute_dsl(inputs, warmup, iters, num_local, local_offset),
+        "CUTLASS": bench_cutlass(inputs, warmup, iters, num_local, local_offset),
+        "TRTLLM": bench_trtllm(inputs, warmup, iters, num_local, local_offset),
+    }
+
+    # Build results
+    results = []
+    for backend, latency in lat.items():
+        results.append(
+            BenchResult(
+                backend=backend,
+                tokens=n,
+                latency_ms=latency,
+                tflops=calc_tflops(n, latency),
+                us_per_token=(latency * 1000) / n,
+            )
+        )
+    return results
+
+
+def _print_header(ep_config, num_local):
+    """Print benchmark header."""
+    print("\n" + "=" * 120)
+    print(f"DeepSeek-V3 MoE Benchmark: CuteDSL vs CUTLASS vs TRTLLM ({ep_config})")
+    print("=" * 120)
+    print(
+        f"Model: hidden={CFG.hidden_size}, intermediate={CFG.intermediate_size}, "
+        f"experts={CFG.num_experts}, top_k={CFG.top_k}"
+    )
+    print(
+        f"EP Config: {num_local} local experts (simulating {CFG.num_experts // num_local}-way parallelism)"
+    )
+    print("-" * 120)
+    print(
+        f"{'Tokens':>6} | "
+        f"{'CuteDSL':^22} | "
+        f"{'CUTLASS':^22} | "
+        f"{'TRTLLM':^22} | "
+        f"{'Speedup (CuteDSL/X)':^18} | "
+        f"{'Winner':^8}"
+    )
+    print(
+        f"{'':>6} | "
+        f"{'ms':>7} {'TFLOPS':>7} {'us/tok':>6} | "
+        f"{'ms':>7} {'TFLOPS':>7} {'us/tok':>6} | "
+        f"{'ms':>7} {'TFLOPS':>7} {'us/tok':>6} | "
+        f"{'CUTLASS':>8} {'TRTLLM':>8} |"
+    )
+    print("-" * 120)
+
+
+def _print_row(results):
+    """Print a single row of benchmark results."""
+    # Extract values by backend
+    r = {r.backend: r for r in results}
+    cute, cutlass, trtllm = r["CuteDSL"], r["CUTLASS"], r["TRTLLM"]
+
+    # Calculate speedups (> 1.0 means CuteDSL is faster)
+    speedup_cutlass = cutlass.latency_ms / cute.latency_ms
+    speedup_trtllm = trtllm.latency_ms / cute.latency_ms
+
+    # Find winner
+    winner = min(r.values(), key=lambda x: x.latency_ms).backend
+
+    print(
+        f"{cute.tokens:>6} | "
+        f"{cute.latency_ms:>7.3f} {cute.tflops:>7.1f} {cute.us_per_token:>6.1f} | "
+        f"{cutlass.latency_ms:>7.3f} {cutlass.tflops:>7.1f} {cutlass.us_per_token:>6.1f} | "
+        f"{trtllm.latency_ms:>7.3f} {trtllm.tflops:>7.1f} {trtllm.us_per_token:>6.1f} | "
+        f"{speedup_cutlass:>7.2f}x {speedup_trtllm:>7.2f}x | "
+        f"{winner:^8}"
+    )
+
+
+def _print_footer(ep_config, num_local):
+    """Print benchmark footer."""
+    print("-" * 120)
+    print("Speedup > 1.0 means CuteDSL is faster than that backend")
+    print("us/tok = latency in microseconds per token (lower is better for generation)")
 
 
 def main():
@@ -678,29 +827,49 @@ def main():
         "--num-tokens",
         type=str,
         default=None,
-        help="Comma-separated token counts (e.g., 128,256,512)",
+        help="Comma-separated token counts (default: 128-4096 for throughput, 1-128 for gen-phase)",
     )
     parser.add_argument("--warmup", type=int, default=10, help="Warmup iterations")
     parser.add_argument("--iters", type=int, default=100, help="Benchmark iterations")
     parser.add_argument("--no-autotune", action="store_true", help="Disable autotune")
     parser.add_argument("--quiet", action="store_true", help="Minimal output")
+    parser.add_argument(
+        "--gen-phase",
+        action="store_true",
+        help="Use generation phase token counts (1-128 instead of 128-4096)",
+    )
+    parser.add_argument(
+        "--ep",
+        type=str,
+        default="EP1",
+        choices=["EP1", "EP8", "EP16"],
+        help="Expert Parallelism: EP1 (256 local), EP8 (32 local), EP16 (16 local)",
+    )
     args = parser.parse_args()
 
     if not is_blackwell():
         print("ERROR: Requires Blackwell GPU (SM100+)")
         return 1
 
-    tokens = (
-        [int(x) for x in args.num_tokens.split(",")]
-        if args.num_tokens
-        else TOKEN_COUNTS
-    )
-    verbose = not args.quiet
+    # Determine token counts
+    if args.num_tokens:
+        tokens = [int(x) for x in args.num_tokens.split(",")]
+    elif args.gen_phase:
+        tokens = GEN_PHASE_TOKENS  # [1, 2, 4, 8, 16, 32, 64, 128]
+    else:
+        tokens = TOKEN_COUNTS  # [128, 256, 512, 1024, 2048, 4096]
 
     print("\nDeepSeek-V3 MoE Performance Benchmark")
     print(f"GPU: {torch.cuda.get_device_name(0)}")
 
-    run_perf_test(tokens, args.warmup, args.iters, not args.no_autotune, verbose)
+    run_benchmark(
+        token_counts=tokens,
+        warmup=args.warmup,
+        iters=args.iters,
+        ep_config=args.ep,
+        do_autotune=not args.no_autotune,
+        verbose=not args.quiet,
+    )
 
     return 0
 
