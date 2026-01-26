@@ -59,18 +59,6 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
                  int32_t* ctaIdxXyToMnLimit, int32_t* numNonExitingCtas, btg::Dtype dtypeElt,
                  btg::Dtype dtypeBias, bool useRoutingScalesOnInput, bool useDeepSeekFp8,
                  RoutingMethodType routingMethodType, cudaStream_t stream) {
-  // Check for pre-computed routing (routingLogits is nullptr and expertIds is provided)
-  if (routingLogits == nullptr && expertIds != nullptr) {
-    // Pre-computed routing: expertIds and expertWeights are already populated
-    // We still need to compute permutation and scheduling metadata
-    // TODO(flashinfer#2373): Implement permutation metadata computation from pre-computed topk
-    FLASHINFER_LOG_AND_THROW(NotImplementedError)
-        << "Pre-computed routing support (nullptr routingLogits with expertIds) is not yet "
-        << "fully implemented. This requires implementing permutation and dispatch metadata "
-        << "computation from pre-computed topk_ids and topk_weights. "
-        << "See https://github.com/flashinfer-ai/flashinfer/issues/2373";
-  }
-
   if (routingMethodType == RoutingMethodType::DeepSeekV3) {
     FLASHINFER_CHECK(topK <= 8, "For DeepSeek routing method, must have topK <= 8");
     FLASHINFER_CHECK(topkGroup <= 4, "For DeepSeek routing method, must have topkGroup <= 4");
@@ -96,7 +84,10 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
 
     // input:
     routingData.mPtrRoutingBias = routingBias;
-    routingData.mPtrScores = reinterpret_cast<float*>(routingLogits);
+    // Pre-computed routing support: when expertIds is provided, use it directly
+    routingData.mPtrScores =
+        expertIds == nullptr ? reinterpret_cast<float*>(routingLogits) : nullptr;
+    routingData.mPtrTopKIds = expertIds;
     routingData.mNumTokens = numTokens;
     routingData.mNumExperts = numExperts;
     routingData.mNumExpertGroups = nGroup;
@@ -133,7 +124,9 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mPtrNumNonExitingCtas = numNonExitingCtas;
 
     // input:
-    routingData.mPtrScores = routingLogits;
+    // Pre-computed routing support: when expertIds is provided, use it directly
+    routingData.mPtrScores = expertIds == nullptr ? routingLogits : nullptr;
+    routingData.mPtrTopKIds = expertIds;
     routingData.mNumTokens = numTokens;
     routingData.mNumExperts = numExperts;
     routingData.mTopK = topK;
@@ -159,7 +152,9 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mNormTopkProb = routingMethodType == RoutingMethodType::RenormalizeNaive;
     routingData.mApplySoftmaxAfterTopK = routingMethodType == RoutingMethodType::Renormalize;
 
-    routingData.mPtrScores = routingLogits;
+    // Pre-computed routing support: when expertIds is provided, use it directly
+    routingData.mPtrScores = expertIds == nullptr ? routingLogits : nullptr;
+    routingData.mPtrTopKIds = expertIds;
 
     //
     // Outputs
