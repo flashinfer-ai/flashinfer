@@ -8,6 +8,9 @@ In general there can be two types of tests for each command:
   create deterministic state so we can check for expected output (e.g. number of cubins)
 
 These tests don't require a GPU. CLI tests that require a GPU are in test_cli_cmds_gpu.py.
+
+Note: The `replay` command is tested in tests/utils/test_logging_replay.py alongside
+the other logging/replay functionality tests, since it's tightly coupled with that feature.
 """
 
 from .cli_cmd_helpers import (
