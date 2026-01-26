@@ -4,6 +4,8 @@ Tests the module-status and list-modules commands
 This is factored out from test_cli_cmds.py because these tests require a GPU.
 """
 
+from .cli_cmd_helpers import _assert_output_contains_all
+
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -94,10 +96,10 @@ def test_module_status_cmd_mocked(mock_module_registry):
     Test that module-status command runs without error and sanity checks the output.
     """
     out = _test_cmd_helper(["module-status"])
-    assert "=== Summary ===" in out
-    assert "Total modules:" in out
-    assert "Compiled:" in out
-    assert "Not compiled:" in out
+
+    _assert_output_contains_all(
+        out, "=== Summary ===", "Total modules:", "Compiled:", "Not compiled:"
+    )
 
 
 def test_module_status_cmd_with_filters(mock_module_registry):
@@ -124,11 +126,9 @@ def test_module_status_cmd_detailed(mock_module_registry):
     out = _test_cmd_helper(["module-status", "--detailed"])
 
     # Detailed view should show module-specific information
-    assert "Module:" in out
-    assert "Status:" in out
-    assert "Sources:" in out
-    assert "Created:" in out
-    assert "=== Summary ===" in out
+    _assert_output_contains_all(
+        out, "Module:", "Status:", "Sources:", "Created:", "=== Summary ==="
+    )
 
 
 def test_list_modules_cmd_mocked(mock_module_registry):
@@ -162,11 +162,14 @@ def test_list_modules_cmd_with_module_name(mock_module_registry, monkeypatch):
 
     # Test with existing module name
     out = _test_cmd_helper(["list-modules", "test_module_fp16"])
-    assert "Module: test_module_fp16" in out
-    assert "Status:" in out
-    assert "Library Path:" in out
-    assert "Source Files:" in out
-    assert "Device Linking:" in out
+    _assert_output_contains_all(
+        out,
+        "Module: test_module_fp16",
+        "Status:",
+        "Library Path:",
+        "Source Files:",
+        "Device Linking:",
+    )
 
     # Test with non-existent module name
     out = _test_cmd_helper(["list-modules", "nonexistent_module"])
