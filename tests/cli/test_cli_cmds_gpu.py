@@ -91,7 +91,8 @@ def mock_module_registry(monkeypatch):
     )
 
 
-def test_module_status_cmd_mocked(mock_module_registry):
+@pytest.mark.usefixtures("mock_module_registry")
+def test_module_status_cmd_mocked():
     """
     Test that module-status command runs without error and sanity checks the output.
     """
@@ -102,7 +103,8 @@ def test_module_status_cmd_mocked(mock_module_registry):
     )
 
 
-def test_module_status_cmd_with_filters(mock_module_registry):
+@pytest.mark.usefixtures("mock_module_registry")
+def test_module_status_cmd_with_filters():
     """
     Test that module-status command works with different filter options.
     """
@@ -119,7 +121,8 @@ def test_module_status_cmd_with_filters(mock_module_registry):
     assert "=== Summary ===" in out
 
 
-def test_module_status_cmd_detailed(mock_module_registry):
+@pytest.mark.usefixtures("mock_module_registry")
+def test_module_status_cmd_detailed():
     """
     Test that module-status command works with detailed output.
     """
@@ -131,7 +134,8 @@ def test_module_status_cmd_detailed(mock_module_registry):
     )
 
 
-def test_list_modules_cmd_mocked(mock_module_registry):
+@pytest.mark.usefixtures("mock_module_registry")
+def test_list_modules_cmd_mocked():
     """
     Test that list-modules command runs without error and sanity checks the output.
     """
@@ -139,7 +143,8 @@ def test_list_modules_cmd_mocked(mock_module_registry):
     assert "Available compilation modules:" in out
 
 
-def test_list_modules_cmd_with_module_name(mock_module_registry, monkeypatch):
+@pytest.mark.usefixtures("mock_module_registry")
+def test_list_modules_cmd_with_module_name(monkeypatch):
     """
     Test that list-modules command can inspect a specific module.
     """
