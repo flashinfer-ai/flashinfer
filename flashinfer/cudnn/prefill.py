@@ -185,12 +185,13 @@ if CUDNN_AVAILABLE:
             # Create tensors from the input tensors
             if q.dim() == 3:
                 h_qo, d_qk = q.shape[1], q.shape[2]
+                s_stride, h_stride, d_stride = q.stride()
             elif q.dim() == 4:
                 h_qo, d_qk = q.shape[2], q.shape[3]
+                s_stride, h_stride, d_stride = q.stride()
             else:
                 raise ValueError(f"Invalid query tensor shape: {q.shape}")
 
-            s_stride, h_stride, d_stride = q.stride()
             cudnn_q = g.tensor(
                 name="q",
                 dim=(graph_b, h_qo, graph_s_qo, d_qk),
@@ -208,7 +209,7 @@ if CUDNN_AVAILABLE:
                     stride=(1, 1, 1, 1),
                     data_type=cudnn.data_type.FLOAT,
                 )
-                
+
                 cudnn_k_scale = g.tensor(
                     name="k_scale",
                     dim=(1, 1, 1, 1),
@@ -283,6 +284,9 @@ if CUDNN_AVAILABLE:
                     ragged_k.set_uid(UIDs.RAGGED_K_UID.value)
                     cudnn_k_cache.set_ragged_offset(ragged_k)
 
+                assert v_cache.dim() == 3, (
+                    "v_cache must have 3 dimensions since k_cache has 3 dimensions"
+                )
                 s_stride, h_stride, d_stride = v_cache.stride()
                 cudnn_v_cache = g.tensor(
                     name="v_cache",
