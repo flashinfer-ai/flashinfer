@@ -506,29 +506,60 @@ class TestCuteDslFusedMoeAccuracy:
             f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
         )
 
-    def test_cuda_graph_capture(self):
-        """Test that cute_dsl_fused_moe_nvfp4 works with CUDA graph capture.
+    @pytest.mark.parametrize(
+        "num_tokens,top_k,hidden_size,intermediate_size,num_experts,ep_size",
+        [
+            # Basic configuration
+            (128, 2, 256, 512, 8, 1),
+            # Different top_k
+            (256, 1, 256, 512, 8, 1),
+            # Larger model size
+            (256, 2, 1024, 2048, 8, 1),
+            # Expert parallelism (ep_size > 1)
+            (256, 2, 256, 512, 64, 8),
+        ],
+    )
+    def test_cuda_graph_capture_and_accuracy(
+        self,
+        num_tokens: int,
+        top_k: int,
+        hidden_size: int,
+        intermediate_size: int,
+        num_experts: int,
+        ep_size: int,
+    ):
+        """Consolidated CUDA graph test: capture, replay, consistency, and accuracy.
 
-        This verifies that:
-        1. moe_sort does not use .item() (which causes CPU-GPU sync)
-        2. CUDA events and streams are pre-allocated (not created during capture)
+        This test verifies:
+        1. CUDA graph capture succeeds (no CPU-GPU sync during capture)
+        2. Graph replay produces valid outputs (no NaN/Inf)
+        3. Multiple replays produce consistent results
+        4. Output matches reference implementation
+
+        Covers basic configs, different top_k, larger models, and expert parallelism.
         """
         from flashinfer.cute_dsl import cute_dsl_fused_moe_nvfp4
 
-        num_tokens = 128
-        hidden_size = 256
-        intermediate_size = 512
-        num_experts = 8
-        top_k = 2
+        num_local_experts = num_experts // ep_size
+        local_expert_offset = 0
 
         tensors = create_moe_tensors(
             num_tokens=num_tokens,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             num_experts=num_experts,
-            num_local_experts=num_experts,
+            num_local_experts=num_local_experts,
             top_k=top_k,
         )
+
+        # For expert parallelism, filter routing to local experts only
+        token_selected_experts = tensors["token_selected_experts"]
+        if ep_size > 1:
+            token_selected_experts = token_selected_experts.clone()
+            mask = (token_selected_experts >= local_expert_offset) & (
+                token_selected_experts < local_expert_offset + num_local_experts
+            )
+            token_selected_experts[~mask] = local_expert_offset
 
         # Pre-allocate output buffer (required for CUDA graph - size must be fixed)
         moe_output = torch.empty(
@@ -539,10 +570,10 @@ class TestCuteDslFusedMoeAccuracy:
 
         # Warmup runs (required before CUDA graph capture)
         for _ in range(3):
-            result = cute_dsl_fused_moe_nvfp4(
+            cute_dsl_fused_moe_nvfp4(
                 x=tensors["x"],
                 x_sf=tensors["x_sf"],
-                token_selected_experts=tensors["token_selected_experts"],
+                token_selected_experts=token_selected_experts,
                 token_final_scales=tensors["token_final_scales"],
                 w1_weight=tensors["w1_weight"],
                 w1_weight_sf=tensors["w1_weight_sf"],
@@ -553,7 +584,8 @@ class TestCuteDslFusedMoeAccuracy:
                 w2_alpha=tensors["w2_alpha"],
                 num_experts=num_experts,
                 top_k=top_k,
-                num_local_experts=num_experts,
+                num_local_experts=num_local_experts,
+                local_expert_offset=local_expert_offset if ep_size > 1 else 0,
                 moe_output=moe_output,
             )
         torch.cuda.synchronize()
@@ -564,7 +596,7 @@ class TestCuteDslFusedMoeAccuracy:
             result = cute_dsl_fused_moe_nvfp4(
                 x=tensors["x"],
                 x_sf=tensors["x_sf"],
-                token_selected_experts=tensors["token_selected_experts"],
+                token_selected_experts=token_selected_experts,
                 token_final_scales=tensors["token_final_scales"],
                 w1_weight=tensors["w1_weight"],
                 w1_weight_sf=tensors["w1_weight_sf"],
@@ -575,19 +607,51 @@ class TestCuteDslFusedMoeAccuracy:
                 w2_alpha=tensors["w2_alpha"],
                 num_experts=num_experts,
                 top_k=top_k,
-                num_local_experts=num_experts,
+                num_local_experts=num_local_experts,
+                local_expert_offset=local_expert_offset if ep_size > 1 else 0,
                 moe_output=moe_output,
             )
 
-        # Replay the graph
-        g.replay()
-        torch.cuda.synchronize()
+        # Test multiple replays for consistency
+        results = []
+        for _ in range(3):
+            g.replay()
+            torch.cuda.synchronize()
+            results.append(result.clone())
 
-        # Verify output is valid
+        # Verify output shape and validity
         assert result.shape == (num_tokens, hidden_size)
         assert result.dtype == torch.bfloat16
         assert not torch.isnan(result).any(), "Output contains NaN after graph replay"
         assert not torch.isinf(result).any(), "Output contains Inf after graph replay"
+
+        # Verify all replays produce identical results
+        for i in range(1, len(results)):
+            assert torch.allclose(results[0], results[i]), (
+                f"Replay {i} differs from replay 0"
+            )
+
+        # Verify accuracy against reference implementation
+        ref_output = compute_reference_moe_fp4(
+            hidden_states=tensors["x_bf16"].float().cuda(),
+            gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
+            gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
+            token_selected_experts=token_selected_experts,
+            token_final_scales=tensors["token_final_scales"],
+            num_tokens=num_tokens,
+            num_experts=num_local_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            fc2_input_scale=tensors["fc2_input_scale"],
+        )
+
+        passed, percent_within, atol = check_accuracy(result, ref_output)
+        assert passed, (
+            f"CUDA graph accuracy failed for tokens={num_tokens}, top_k={top_k}, "
+            f"hidden={hidden_size}, ep_size={ep_size}: "
+            f"{percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
+        )
 
 
 if __name__ == "__main__":

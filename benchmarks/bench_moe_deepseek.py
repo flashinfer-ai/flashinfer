@@ -24,6 +24,9 @@ Usage:
     # Disable CUDA graph (useful for debugging or profiling)
     python bench_moe_deepseek.py --no-cuda-graph
 
+    # Disable CUPTI (use CUDA events for timing instead)
+    python bench_moe_deepseek.py --no-cupti
+
 Metrics:
     - ms: Latency in milliseconds
     - TFLOPS: Computational throughput
@@ -188,6 +191,7 @@ def bench_cute_dsl(
     num_local_experts=None,
     local_expert_offset=0,
     use_cuda_graph=True,
+    use_cupti=True,
 ):
     from flashinfer.fused_moe import fused_topk_deepseek
     from flashinfer.cute_dsl import cute_dsl_fused_moe_nvfp4
@@ -236,26 +240,31 @@ def bench_cute_dsl(
         torch.tensor([1.0], device=dev),
     )
 
-    def run():
+    # Pre-convert routing bias to float32
+    routing_bias_f32 = inputs["routing_bias"].float()
+
+    # Define run function that includes routing (for fair comparison with TRTLLM)
+    # Note: Unlike TRTLLM which has EP-aware internal routing, CuteDSL
+    # receives routing to all experts. The moe_sort filters non-local
+    # experts but there's overhead in processing all token-expert pairs.
+    # This is a known limitation - CuteDSL doesn't show strong EP scaling.
+    def run(x, x_sf, router_logits, routing_bias, topk_values, topk_indices):
+        # Routing (included in timing for fair comparison with TRTLLM)
         fused_topk_deepseek(
-            scores=inputs["router_logits"],
-            bias=inputs["routing_bias"].float(),
+            scores=router_logits,
+            bias=routing_bias,
             n_group=CFG.n_group,
             topk_group=CFG.topk_group,
             topk=CFG.top_k,
             routed_scaling_factor=CFG.routed_scaling_factor,
-            topk_values=tv,
-            topk_indices=ti,
+            topk_values=topk_values,
+            topk_indices=topk_indices,
         )
-        # Note: Unlike TRTLLM which has EP-aware internal routing, CuteDSL
-        # receives routing to all experts. The moe_sort filters non-local
-        # experts but there's overhead in processing all token-expert pairs.
-        # This is a known limitation - CuteDSL doesn't show strong EP scaling.
         return cute_dsl_fused_moe_nvfp4(
-            x=xf,
-            x_sf=xs,
-            token_selected_experts=ti,
-            token_final_scales=tv,
+            x=x,
+            x_sf=x_sf,
+            token_selected_experts=topk_indices,
+            token_final_scales=topk_values,
             w1_weight=w1q,
             w1_weight_sf=w1s,
             w1_alpha=alpha,
@@ -269,13 +278,24 @@ def bench_cute_dsl(
             local_expert_offset=local_expert_offset,
         )
 
+    # Pass input tensors via input_kwargs for cold L2 cache rotation
+    input_kwargs = {
+        "x": xf,
+        "x_sf": xs,
+        "router_logits": inputs["router_logits"],
+        "routing_bias": routing_bias_f32,
+        "topk_values": tv,
+        "topk_indices": ti,
+    }
+
     times = bench_gpu_time(
         run,
         dry_run_iters=warmup,
         repeat_iters=iters,
         cold_l2_cache=True,
-        enable_cupti=True,
+        enable_cupti=use_cupti,
         use_cuda_graph=use_cuda_graph,
+        input_kwargs=input_kwargs,
     )
     return np.median(times)
 
@@ -287,6 +307,7 @@ def bench_cutlass(
     num_local_experts=None,
     local_expert_offset=0,
     use_cuda_graph=True,
+    use_cupti=True,
 ):
     from flashinfer.fused_moe import fused_topk_deepseek, cutlass_fused_moe
     from flashinfer.fp4_quantization import fp4_quantize
@@ -318,37 +339,55 @@ def bench_cutlass(
     hidden_fp4, input_sf = fp4_quantize(inputs["hidden_bf16"], a1_gs, sv, False, True)
     output = torch.empty(n, CFG.hidden_size, dtype=torch.bfloat16, device=dev)
 
-    def run():
+    # Pre-convert routing bias to float32
+    routing_bias_f32 = inputs["routing_bias"].float()
+
+    # Pre-compute values that need conversion
+    w1_fp4_view = inputs["w1_fp4"].contiguous().view(torch.long)
+    w2_fp4_view = inputs["w2_fp4"].contiguous().view(torch.long)
+
+    def run(hidden, sf, router_logits, routing_bias, topk_values, topk_indices):
+        # Routing (included in timing for fair comparison with TRTLLM)
         fused_topk_deepseek(
-            scores=inputs["router_logits"],
-            bias=inputs["routing_bias"].float(),
+            scores=router_logits,
+            bias=routing_bias,
             n_group=CFG.n_group,
             topk_group=CFG.topk_group,
             topk=CFG.top_k,
             routed_scaling_factor=CFG.routed_scaling_factor,
-            topk_values=tv,
-            topk_indices=ti,
+            topk_values=topk_values,
+            topk_indices=topk_indices,
         )
         cutlass_fused_moe(
-            hidden_fp4,
-            ti.to(torch.int),
-            tv,
-            inputs["w1_fp4"].contiguous().view(torch.long),
-            inputs["w2_fp4"].contiguous().view(torch.long),
+            hidden,
+            topk_indices.to(torch.int),
+            topk_values,
+            w1_fp4_view,
+            w2_fp4_view,
             torch.bfloat16,
             quant_scales=quant_scales,
-            input_sf=input_sf,
+            input_sf=sf,
             output=output,
         )
         return output
+
+    input_kwargs = {
+        "hidden": hidden_fp4,
+        "sf": input_sf,
+        "router_logits": inputs["router_logits"],
+        "routing_bias": routing_bias_f32,
+        "topk_values": tv,
+        "topk_indices": ti,
+    }
 
     times = bench_gpu_time(
         run,
         dry_run_iters=warmup,
         repeat_iters=iters,
         cold_l2_cache=True,
-        enable_cupti=True,
+        enable_cupti=use_cupti,
         use_cuda_graph=use_cuda_graph,
+        input_kwargs=input_kwargs,
     )
     return np.median(times)
 
@@ -360,6 +399,7 @@ def bench_trtllm(
     num_local_experts=None,
     local_expert_offset=0,
     use_cuda_graph=True,
+    use_cupti=True,
 ):
     from flashinfer.fused_moe import trtllm_fp4_block_scale_moe
     from flashinfer.fused_moe.core import (
@@ -429,12 +469,12 @@ def bench_trtllm(
     # Scale tensors sized for LOCAL experts only
     sc = torch.ones(num_local_experts, device=dev, dtype=torch.float32)
 
-    def run():
+    def run(routing_logits, routing_bias, hidden_states, hidden_states_scale):
         return trtllm_fp4_block_scale_moe(
-            routing_logits=inputs["router_logits"],
-            routing_bias=inputs["routing_bias"],
-            hidden_states=hfp,
-            hidden_states_scale=hsc,
+            routing_logits=routing_logits,
+            routing_bias=routing_bias,
+            hidden_states=hidden_states,
+            hidden_states_scale=hidden_states_scale,
             gemm1_weights=w1f,
             gemm1_weights_scale=w1s,
             gemm1_bias=None,
@@ -459,13 +499,21 @@ def bench_trtllm(
             do_finalize=True,
         )
 
+    input_kwargs = {
+        "routing_logits": inputs["router_logits"],
+        "routing_bias": inputs["routing_bias"],
+        "hidden_states": hfp,
+        "hidden_states_scale": hsc,
+    }
+
     times = bench_gpu_time(
         run,
         dry_run_iters=warmup,
         repeat_iters=iters,
         cold_l2_cache=True,
-        enable_cupti=True,
+        enable_cupti=use_cupti,
         use_cuda_graph=use_cuda_graph,
+        input_kwargs=input_kwargs,
     )
     return np.median(times)
 
@@ -711,6 +759,7 @@ def run_benchmark(
     do_autotune=True,
     verbose=True,
     use_cuda_graph=True,
+    use_cupti=True,
 ):
     """
     Unified benchmark for DeepSeek-V3 MoE backends.
@@ -723,6 +772,7 @@ def run_benchmark(
         do_autotune: Whether to run autotune before benchmarking
         verbose: Print results to stdout
         use_cuda_graph: Whether to use CUDA graph for benchmarking
+        use_cupti: Whether to use CUPTI for accurate GPU timing
 
     Returns:
         List of BenchResult objects
@@ -738,13 +788,13 @@ def run_benchmark(
 
     # Print header AFTER autotune completes
     if verbose:
-        _print_header(ep_config, num_local, use_cuda_graph)
+        _print_header(ep_config, num_local, use_cuda_graph, use_cupti)
 
     # Run benchmarks
     results = []
     for n in token_counts:
         row = _benchmark_single(
-            n, warmup, iters, num_local, local_offset, use_cuda_graph
+            n, warmup, iters, num_local, local_offset, use_cuda_graph, use_cupti
         )
         results.extend(row)
         if verbose:
@@ -757,20 +807,22 @@ def run_benchmark(
     return results
 
 
-def _benchmark_single(n, warmup, iters, num_local, local_offset, use_cuda_graph):
+def _benchmark_single(
+    n, warmup, iters, num_local, local_offset, use_cuda_graph, use_cupti
+):
     """Benchmark all backends for a single token count."""
     inputs = create_inputs(n)
 
     # Run all three backends
     lat = {
         "CuteDSL": bench_cute_dsl(
-            inputs, warmup, iters, num_local, local_offset, use_cuda_graph
+            inputs, warmup, iters, num_local, local_offset, use_cuda_graph, use_cupti
         ),
         "CUTLASS": bench_cutlass(
-            inputs, warmup, iters, num_local, local_offset, use_cuda_graph
+            inputs, warmup, iters, num_local, local_offset, use_cuda_graph, use_cupti
         ),
         "TRTLLM": bench_trtllm(
-            inputs, warmup, iters, num_local, local_offset, use_cuda_graph
+            inputs, warmup, iters, num_local, local_offset, use_cuda_graph, use_cupti
         ),
     }
 
@@ -789,7 +841,7 @@ def _benchmark_single(n, warmup, iters, num_local, local_offset, use_cuda_graph)
     return results
 
 
-def _print_header(ep_config, num_local, use_cuda_graph):
+def _print_header(ep_config, num_local, use_cuda_graph, use_cupti):
     """Print benchmark header."""
     print("\n" + "=" * 120)
     print(f"DeepSeek-V3 MoE Benchmark: CuteDSL vs CUTLASS vs TRTLLM ({ep_config})")
@@ -801,7 +853,9 @@ def _print_header(ep_config, num_local, use_cuda_graph):
     print(
         f"EP Config: {num_local} local experts (simulating {CFG.num_experts // num_local}-way parallelism)"
     )
-    print(f"CUDA Graph: {'enabled' if use_cuda_graph else 'disabled'}")
+    print(
+        f"CUDA Graph: {'enabled' if use_cuda_graph else 'disabled'}, CUPTI: {'enabled' if use_cupti else 'disabled'}"
+    )
     print("-" * 120)
     print(
         f"{'Tokens':>6} | "
@@ -882,6 +936,11 @@ def main():
         action="store_true",
         help="Disable CUDA graph for benchmarking (enabled by default)",
     )
+    parser.add_argument(
+        "--no-cupti",
+        action="store_true",
+        help="Disable CUPTI for GPU timing (enabled by default)",
+    )
     args = parser.parse_args()
 
     if not is_blackwell():
@@ -907,6 +966,7 @@ def main():
         do_autotune=not args.no_autotune,
         verbose=not args.quiet,
         use_cuda_graph=not args.no_cuda_graph,
+        use_cupti=not args.no_cupti,
     )
 
     return 0
