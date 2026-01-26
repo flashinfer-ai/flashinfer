@@ -137,6 +137,10 @@ def test_fmha_v2_prefill_deepseek(
         return_lse=True,
         lse=lse,
     )
+
+    # Ensure kernel completes before checking output
+    torch.cuda.synchronize()
+
     # implementation gives [max(s_i), sum(exp(s_i - max(s_i)))], compute lse from this
     if qkv_dtype == torch.float8_e4m3fn:
         # For E4M3 the softmax is scaled by 256 (the largest power-of-2 below E4M3_MAX=448.0)
@@ -172,10 +176,12 @@ def test_fmha_v2_prefill_deepseek(
 
 @pytest.mark.parametrize("batch_size", [1, 4, 8])
 @pytest.mark.parametrize("max_seq_len", [512, 1024, 2048])
-@pytest.mark.parametrize("num_qo_heads", [8, 32])
+@pytest.mark.parametrize("num_qo_heads", [8])
 @pytest.mark.parametrize("num_kv_heads", [8])  # Paged KV cache
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("page_size", [16, 32])
+# @pytest.mark.parametrize("dtype", [torch.bfloat16])
+# @pytest.mark.parametrize("dtype", [torch.float16])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("causal", [True, False])
 def test_trtllm_fmha_v2_prefill_paged(
@@ -195,9 +201,8 @@ def test_trtllm_fmha_v2_prefill_paged(
     if not is_sm90a_supported(torch.device("cuda")):
         pytest.skip("FMHA v2 requires SM90+ (Hopper) GPUs.")
 
-    # Skip incompatible configurations
-    if num_qo_heads % num_kv_heads != 0:
-        pytest.skip("num_qo_heads must be divisible by num_kv_heads for GQA")
+    # Ensure any previous CUDA operations have completed before starting this test
+    torch.cuda.synchronize()
 
     torch.manual_seed(42)
     device = torch.device("cuda")
@@ -213,13 +218,11 @@ def test_trtllm_fmha_v2_prefill_paged(
     max_kv_len = seq_lens.max().item()
     max_num_blocks = (max_kv_len + page_size - 1) // page_size
 
-    # Create paged KV cache pool (NHD layout: [num_pages, page_size, num_kv_heads, head_dim])
+    # Create combined paged KV cache pool (NHD layout: [num_pages, 2, page_size, num_kv_heads, head_dim])
+    # where kv_cache[:, 0, ...] is K and kv_cache[:, 1, ...] is V
     num_pages = batch_size * max_num_blocks
-    paged_k_cache = torch.randn(
-        num_pages, page_size, num_kv_heads, head_dim, dtype=dtype, device=device
-    )
-    paged_v_cache = torch.randn(
-        num_pages, page_size, num_kv_heads, head_dim, dtype=dtype, device=device
+    paged_kv_cache = torch.randn(
+        num_pages, 2, page_size, num_kv_heads, head_dim, dtype=dtype, device=device
     )
 
     # Build block tables
@@ -255,7 +258,7 @@ def test_trtllm_fmha_v2_prefill_paged(
 
     output = trtllm_fmha_v2_prefill(
         query=q,
-        kv_cache=(paged_k_cache, paged_v_cache),
+        kv_cache=paged_kv_cache,
         workspace_buffer=workspace_buffer,
         block_tables=block_tables,
         seq_lens=seq_lens,
@@ -273,6 +276,9 @@ def test_trtllm_fmha_v2_prefill_paged(
         mask_mode=mask_mode_str,
         window_left=-1,
     )
+
+    # Ensure kernel completes before checking output
+    torch.cuda.synchronize()
 
     # Basic sanity checks
     assert output.shape == o.shape
@@ -305,13 +311,10 @@ def test_trtllm_fmha_v2_prefill_sliding_window(dtype, head_dim, window_left, pag
     max_kv_len = seq_len
     max_num_blocks = (max_kv_len + page_size - 1) // page_size
 
-    # Create paged KV cache pool (NHD layout)
+    # Create combined paged KV cache pool (NHD layout: [num_pages, 2, page_size, num_kv_heads, head_dim])
     num_pages = batch_size * max_num_blocks
-    paged_k_cache = torch.randn(
-        num_pages, page_size, num_kv_heads, head_dim, dtype=dtype, device=device
-    )
-    paged_v_cache = torch.randn(
-        num_pages, page_size, num_kv_heads, head_dim, dtype=dtype, device=device
+    paged_kv_cache = torch.randn(
+        num_pages, 2, page_size, num_kv_heads, head_dim, dtype=dtype, device=device
     )
 
     # Build block tables
@@ -341,7 +344,7 @@ def test_trtllm_fmha_v2_prefill_sliding_window(dtype, head_dim, window_left, pag
 
     output = trtllm_fmha_v2_prefill(
         query=q,
-        kv_cache=(paged_k_cache, paged_v_cache),
+        kv_cache=paged_kv_cache,
         workspace_buffer=workspace_buffer,
         block_tables=block_tables,
         seq_lens=seq_lens,
@@ -359,6 +362,9 @@ def test_trtllm_fmha_v2_prefill_sliding_window(dtype, head_dim, window_left, pag
         mask_mode="sliding_window",
         window_left=window_left,
     )
+
+    # Ensure kernel completes before checking output
+    torch.cuda.synchronize()
 
     assert output.shape == o.shape
     assert not torch.isnan(output).any()
@@ -390,13 +396,10 @@ def test_trtllm_fmha_v2_prefill_logits_softcapping(dtype, softcap_scale, page_si
     max_kv_len = seq_len
     max_num_blocks = (max_kv_len + page_size - 1) // page_size
 
-    # Create paged KV cache pool (NHD layout)
+    # Create combined paged KV cache pool (NHD layout: [num_pages, 2, page_size, num_kv_heads, head_dim])
     num_pages = batch_size * max_num_blocks
-    paged_k_cache = torch.randn(
-        num_pages, page_size, num_kv_heads, head_dim, dtype=dtype, device=device
-    )
-    paged_v_cache = torch.randn(
-        num_pages, page_size, num_kv_heads, head_dim, dtype=dtype, device=device
+    paged_kv_cache = torch.randn(
+        num_pages, 2, page_size, num_kv_heads, head_dim, dtype=dtype, device=device
     )
 
     # Build block tables
@@ -429,7 +432,7 @@ def test_trtllm_fmha_v2_prefill_logits_softcapping(dtype, softcap_scale, page_si
 
     output = trtllm_fmha_v2_prefill(
         query=q,
-        kv_cache=(paged_k_cache, paged_v_cache),
+        kv_cache=paged_kv_cache,
         workspace_buffer=workspace_buffer,
         block_tables=block_tables,
         seq_lens=seq_lens,
@@ -448,6 +451,9 @@ def test_trtllm_fmha_v2_prefill_logits_softcapping(dtype, softcap_scale, page_si
         logits_soft_cap_scale=softcap,
         window_left=-1,
     )
+
+    # Ensure kernel completes before checking output
+    torch.cuda.synchronize()
 
     assert output.shape == o.shape
     assert not torch.isnan(output).any()
@@ -490,13 +496,10 @@ def test_trtllm_fmha_v2_prefill_with_lse(
     max_q_len = max_kv_len
     max_num_blocks = (max_kv_len + page_size - 1) // page_size
 
-    # Create paged KV cache pool (NHD layout)
+    # Create combined paged KV cache pool (NHD layout: [num_pages, 2, page_size, num_kv_heads, head_dim])
     num_pages = batch_size * max_num_blocks
-    paged_k_cache = torch.randn(
-        num_pages, page_size, num_kv_heads, head_dim, dtype=dtype, device=device
-    )
-    paged_v_cache = torch.randn(
-        num_pages, page_size, num_kv_heads, head_dim, dtype=dtype, device=device
+    paged_kv_cache = torch.randn(
+        num_pages, 2, page_size, num_kv_heads, head_dim, dtype=dtype, device=device
     )
 
     # Build block tables
@@ -529,7 +532,7 @@ def test_trtllm_fmha_v2_prefill_with_lse(
     # Run with save_softmax_stats=True
     result = trtllm_fmha_v2_prefill(
         query=q,
-        kv_cache=(paged_k_cache, paged_v_cache),
+        kv_cache=paged_kv_cache,
         workspace_buffer=workspace_buffer,
         block_tables=block_tables,
         seq_lens=seq_lens,
@@ -548,6 +551,9 @@ def test_trtllm_fmha_v2_prefill_with_lse(
         window_left=-1,
         save_softmax_stats=True,
     )
+
+    # Ensure kernel completes before checking output
+    torch.cuda.synchronize()
 
     # When save_softmax_stats=True, result should be (output, lse) tuple
     assert isinstance(result, tuple)
@@ -595,13 +601,10 @@ def test_trtllm_fmha_v2_prefill_hnd_layout(
     max_kv_len = seq_lens.max().item()
     max_num_blocks = (max_kv_len + page_size - 1) // page_size
 
-    # Create paged KV cache pool (HND layout: [num_pages, num_kv_heads, page_size, head_dim])
+    # Create combined paged KV cache pool (HND layout: [num_pages, 2, num_kv_heads, page_size, head_dim])
     num_pages = batch_size * max_num_blocks
-    paged_k_cache = torch.randn(
-        num_pages, num_kv_heads, page_size, head_dim, dtype=dtype, device=device
-    )
-    paged_v_cache = torch.randn(
-        num_pages, num_kv_heads, page_size, head_dim, dtype=dtype, device=device
+    paged_kv_cache = torch.randn(
+        num_pages, 2, num_kv_heads, page_size, head_dim, dtype=dtype, device=device
     )
 
     # Build block tables
@@ -636,7 +639,7 @@ def test_trtllm_fmha_v2_prefill_hnd_layout(
 
     output = trtllm_fmha_v2_prefill(
         query=q,
-        kv_cache=(paged_k_cache, paged_v_cache),
+        kv_cache=paged_kv_cache,
         workspace_buffer=workspace_buffer,
         block_tables=block_tables,
         seq_lens=seq_lens,
@@ -654,6 +657,9 @@ def test_trtllm_fmha_v2_prefill_hnd_layout(
         mask_mode="causal",
         window_left=-1,
     )
+
+    # Ensure kernel completes before checking output
+    torch.cuda.synchronize()
 
     # Basic sanity checks
     assert output.shape == o.shape

@@ -3768,7 +3768,7 @@ def fmha_v2_prefill_deepseek(
 @flashinfer_api
 def trtllm_fmha_v2_prefill(
     query: torch.Tensor,
-    kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+    kv_cache: torch.Tensor,
     workspace_buffer: torch.Tensor,
     block_tables: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -3804,12 +3804,14 @@ def trtllm_fmha_v2_prefill(
     ----------
     query : torch.Tensor
         query tensor with shape [num_tokens, num_heads, head_dim]
-    kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
-        If kv_cache is a single tensor, it should be a tensor with shape [num_pages, 1 or 2, num_kv_heads, page_size, head_dim] if :attr:`kv_layout` is "HND",
-        or [num_pages, 1 or 2, page_size, num_kv_heads, head_dim] if :attr:`kv_layout` is "NHD".
-        If kv_cache is a tuple of two tensors, it should be a tuple of two tensors with shape [num_pages, num_kv_heads, page_size, head_dim] if :attr:`kv_layout` is "HND",
-        or [num_pages, page_size, num_kv_heads, head_dim] if :attr:`kv_layout` is "NHD".
-        The first tensor is the key cache, the second tensor is the value cache.
+    kv_cache : torch.Tensor
+        Combined KV cache tensor with shape [num_pages, 2, num_kv_heads, page_size, head_dim]
+        if :attr:`kv_layout` is "HND", or [num_pages, 2, page_size, num_kv_heads, head_dim]
+        if :attr:`kv_layout` is "NHD". The second dimension must be 2, where kv_cache[:, 0, ...]
+        is the key cache and kv_cache[:, 1, ...] is the value cache.
+
+        Note: Tuple format (k_cache, v_cache) is NOT supported. If you have separate K and V
+        tensors, combine them using: ``kv_cache = torch.stack([k_cache, v_cache], dim=1)``
     workspace_buffer : torch.Tensor. Must be initialized to 0 for its first use.
         workspace
     block_tables : torch.Tensor
@@ -3901,17 +3903,23 @@ def trtllm_fmha_v2_prefill(
         save-softmax
 
     """
+    # Validate kv_cache format - must be combined tensor, NOT tuple
     if isinstance(kv_cache, tuple):
-        k_cache, v_cache = kv_cache
-    else:
-        if kv_cache.shape[1] == 1:
-            k_cache, v_cache = kv_cache, kv_cache
-        else:
-            assert kv_cache.shape[1] == 2, (
-                "When kv_cache is a single tensor, the second dimension must be 1 or 2"
-            )
-            # unbind transforms [num_pages, 2, ...] to ([num_pages, ...], [num_pages, ...])
-            k_cache, v_cache = kv_cache.unbind(dim=1)
+        raise ValueError(
+            "Tuple format (k_cache, v_cache) is not supported. "
+            "Please provide a combined KV cache tensor with shape [num_pages, 2, ...]. "
+            "You can combine separate tensors using: kv_cache = torch.stack([k_cache, v_cache], dim=1)"
+        )
+
+    if kv_cache.dim() < 2 or kv_cache.shape[1] != 2:
+        raise ValueError(
+            f"kv_cache must have shape [num_pages, 2, ...] where the second dimension is 2 "
+            f"(for K and V). Got shape {kv_cache.shape}. "
+            "Combine K and V using: kv_cache = torch.stack([k_cache, v_cache], dim=1)"
+        )
+
+    # unbind transforms [num_pages, 2, ...] to ([num_pages, ...], [num_pages, ...])
+    k_cache, v_cache = kv_cache.unbind(dim=1)
 
     if kv_layout == "HND":
         # For NHD: [..., N, H, D] -> HND: [..., H, N, D]
@@ -3921,9 +3929,20 @@ def trtllm_fmha_v2_prefill(
     num_qo_heads = query.shape[1]
     head_dim_qk = query.shape[2]
     kv_dtype = k_cache.dtype
-    num_kv_heads = k_cache.shape[1]
-    page_size = k_cache.shape[2]
-    head_dim_vo = v_cache.shape[2] if v_cache.shape[3] != head_dim_qk else 0
+    # After transpose (if any), tensor layout is:
+    #   HND: [num_pages, num_kv_heads, page_size, head_dim]
+    #   NHD: [num_pages, page_size, num_kv_heads, head_dim]
+    if kv_layout == "HND":
+        num_kv_heads = k_cache.shape[1]
+        page_size = k_cache.shape[2]
+    else:  # NHD
+        num_kv_heads = k_cache.shape[2]
+        page_size = k_cache.shape[1]
+    # head_dim_v is at index 3 in both layouts
+    # head_dim_vo = 0 means "same as head_dim_qk" (standard attention)
+    # head_dim_vo = actual value for MLA where head_dim_v != head_dim_qk
+    head_dim_v = v_cache.shape[3]
+    head_dim_vo = head_dim_v if head_dim_v != head_dim_qk else 0
 
     # Determine output dtype
     if out is not None:
@@ -4018,6 +4037,10 @@ def trtllm_fmha_v2_prefill(
         non_blocking=non_blocking,
     )
 
+    # Compute total tokens from cumulative sequence lengths (avoids cudaMemcpy in C++)
+    total_q_tokens = int(cum_seq_lens_q[-1].item())
+    total_kv_tokens = int(cum_seq_lens_kv[-1].item())
+
     module.run(
         query,  # Q tensor
         k_cache,  # K tensor
@@ -4036,6 +4059,8 @@ def trtllm_fmha_v2_prefill(
         max_q_len,  # Max sequence length for query
         max_kv_len,  # Max sequence length for kv_cache
         batch_size,  # Batch size
+        total_q_tokens,  # Total Q tokens (cum_seq_lens_q[-1])
+        total_kv_tokens,  # Total KV tokens (cum_seq_lens_kv[-1])
         mask_mode_code,  # Attention mask type
         scale_softmax,  # Softmax scale
         scale_bmm1,  # BMM1 scale

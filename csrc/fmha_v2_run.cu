@@ -24,6 +24,7 @@
 #include <cstring>
 #include <numeric>
 #include <tuple>
+#include <vector>
 
 #include "fmha_v2_dispatcher.h"
 #include "tvm_ffi_utils.h"
@@ -370,7 +371,8 @@ void fmha_v2_run(
     ffi::TensorView cum_seq_lens_kv,  // [batch + 1]
     int input_layout_int,             // Cast from int for TVM FFI compatibility
     int output_dtype_int,             // Cast from int for TVM FFI compatibility
-    int max_q_len, int max_kv_len, int batch_size,
+    int max_q_len, int max_kv_len, int batch_size, int total_q_tokens,
+    int total_kv_tokens,     // Totals from cum_seq_lens (computed in Python)
     int64_t mask_mode_code,  // 0=PADDING, 1=CAUSAL, 2=SLIDING_OR_CHUNKED_CAUSAL, 3=CUSTOM_MASK
     float scale_softmax, float scale_bmm1, float scale_bmm2, int window_left,
     int chunked_attention_size, bool has_alibi, float softcapping_scale,
@@ -386,13 +388,14 @@ void fmha_v2_run(
 
   cudaStream_t stream = static_cast<cudaStream_t>(get_stream(q.device()));
 
-  // Tensor passed in is always "HND" (num_heads, , head_dim) layout
-  // Extract dimensions from tensors (use parameter batch_size, not re-extract)
+  // Query tensor is 3D ragged [total_tokens, num_heads, head_dim] (not 4D [batch, s_q, num_heads,
+  // head_dim]) K/V tensors for paged KV are 4D [num_pages, page_size, num_kv_heads, head_dim] (NHD
+  // layout) Extract dimensions from tensors (use parameter batch_size, not re-extract)
   const size_t b = batch_size;
-  const size_t h = q.shape()[2];     // num_heads
-  const size_t h_kv = k.shape()[2];  // num_kv_heads
-  const size_t d = q.shape()[3];     // head_dim_qk
-  const size_t dv = v.shape()[3];    // head_dim_v
+  const size_t h = q.shape()[1];     // num_heads (index 1 in 3D ragged tensor)
+  const size_t h_kv = k.shape()[2];  // num_kv_heads (index 2 in paged KV)
+  const size_t d = q.shape()[2];     // head_dim_qk (index 2 in 3D ragged tensor)
+  const size_t dv = v.shape()[3];    // head_dim_v (index 3 in paged KV)
   const size_t s_q = max_q_len;
   const size_t s_kv = max_kv_len;
   const size_t s = s_kv;  // For compatibility with existing code
@@ -429,9 +432,10 @@ void fmha_v2_run(
     }
   }
 
-  // Calculate total tokens for variable-length sequences
-  // UNCERTAIN: For paged KV cache, this might need to come from cum_seq_lens
-  uint32_t total = b * s_q;  // Conservative estimate
+  // Total tokens passed from Python (computed as cum_seq_lens[-1].item())
+  // This avoids cudaMemcpy synchronization overhead
+  uint32_t total =
+      static_cast<uint32_t>(total_q_tokens);  // Used for stride calculations in interleaved mode
 
   AlignedAllocator allocator(workspace_buffer.data_ptr(), workspace_buffer_size_in_bytes);
 
@@ -527,11 +531,6 @@ void fmha_v2_run(
   // Scale bmm2 (per-tensor scalar, single uint32_t)
   void* scale_bmm2_d = allocator.aligned_alloc<void>(sizeof(uint32_t), 16, "scale_bmm2_d");
 
-  // The O matrix workspace (if needed for intermediate storage)
-  // UNCERTAIN: This might be redundant if we write directly to the output tensor
-  const size_t o_size = s * b * h * dv;
-  const size_t o_size_in_bytes = get_size_in_bytes(o_size, output_dtype);
-
   // Softmax stats: stores (max, sum) per token, 2 floats per (b, s_q, h)
   const size_t softmax_stats_size = 2 * sizeof(float) * b * s_q * h;
   void* softmax_stats_d = allocator.aligned_alloc<void>(softmax_stats_size, 128, "softmax_stats_d");
@@ -547,6 +546,12 @@ void fmha_v2_run(
   void* kv_cache_pool_ptr = nullptr;
   int32_t* kv_cache_block_offsets_d = nullptr;
 
+  // For Q_PAGED_KV layout, we need to expand block_tables from [B, M] to [B, 2, M]
+  // because TRT-LLM kernel expects separate K and V block offset arrays.
+  // In FlashInfer's layout, K and V are co-located in each page, so K and V offsets are identical.
+  int32_t* expanded_block_offsets_d = nullptr;
+  int block_table_max_blocks = 0;  // Set in Q_PAGED_KV case to actual block_tables.shape()[1]
+
   switch (input_layout) {
     case Attention_input_layout::PACKED_QKV:
       qkv_packed_d = q.data_ptr();
@@ -561,11 +566,53 @@ void fmha_v2_run(
       k_d = k.data_ptr();
       v_d = v.data_ptr();
       break;
-    case Attention_input_layout::Q_PAGED_KV:
+    case Attention_input_layout::Q_PAGED_KV: {
       q_d = q.data_ptr();
       kv_cache_pool_ptr = k.data_ptr();
-      kv_cache_block_offsets_d = static_cast<int32_t*>(block_tables.data_ptr());
-      break;
+
+      // Get the number of blocks per sequence from block_tables shape
+      // block_tables has shape [batch_size, max_num_blocks]
+      block_table_max_blocks = block_tables.shape()[1];
+
+      // Allocate expanded block offsets [B, 2, M] from workspace
+      size_t expanded_offsets_size = b * 2 * block_table_max_blocks * sizeof(int32_t);
+      expanded_block_offsets_d =
+          allocator.aligned_alloc<int32_t>(expanded_offsets_size, 128, "expanded_block_offsets");
+
+      // Expand block_offsets: transform page indices to interleaved K/V block indices
+      // FlashInfer layout: [num_pages, 2, page_size, num_kv_heads, head_dim]
+      // - K for page i is at block index 2*i (even blocks)
+      // - V for page i is at block index 2*i+1 (odd blocks)
+      // TRT-LLM kernel expects: [K_offsets_batch_0, V_offsets_batch_0, K_offsets_batch_1, ...]
+      int32_t* src_offsets = static_cast<int32_t*>(block_tables.data_ptr());
+
+      // We need a CPU-side buffer to transform the indices, then copy to GPU
+      std::vector<int32_t> expanded_offsets_host(b * 2 * block_table_max_blocks);
+
+      // First, copy source offsets to host
+      std::vector<int32_t> src_offsets_host(b * block_table_max_blocks);
+      FMHA_CHECK_CUDA(cudaMemcpy(src_offsets_host.data(), src_offsets,
+                                 b * block_table_max_blocks * sizeof(int32_t),
+                                 cudaMemcpyDeviceToHost));
+
+      for (size_t batch_idx = 0; batch_idx < b; batch_idx++) {
+        for (int block_idx = 0; block_idx < block_table_max_blocks; block_idx++) {
+          int32_t page_idx = src_offsets_host[batch_idx * block_table_max_blocks + block_idx];
+          // K block offset = page_idx * 2 (even block in interleaved layout)
+          expanded_offsets_host[batch_idx * 2 * block_table_max_blocks + block_idx] = page_idx * 2;
+          // V block offset = page_idx * 2 + 1 (odd block in interleaved layout)
+          expanded_offsets_host[batch_idx * 2 * block_table_max_blocks + block_table_max_blocks +
+                                block_idx] = page_idx * 2 + 1;
+        }
+      }
+
+      // Copy expanded offsets to device
+      FMHA_CHECK_CUDA(cudaMemcpy(expanded_block_offsets_d, expanded_offsets_host.data(),
+                                 b * 2 * block_table_max_blocks * sizeof(int32_t),
+                                 cudaMemcpyHostToDevice));
+
+      kv_cache_block_offsets_d = expanded_block_offsets_d;
+    } break;
     default:
       assert(false && "Invalid input layout");
       break;
@@ -614,6 +661,8 @@ void fmha_v2_run(
     printf("attention_sinks_d: %p\n", attention_sinks_d);
     printf("cum_seq_lens_kv: %p\n", cum_seq_lens_kv.data_ptr());
     printf("cum_seq_lens_q: %p\n", cum_seq_lens_q.data_ptr());
+    printf("total_q_tokens: %d\n", total_q_tokens);
+    printf("total_kv_tokens: %d\n", total_kv_tokens);
     printf("o: %p\n", o.data_ptr());
     printf("softmax_stats_ptr: %p\n", softmax_stats_ptr);
     printf("scale_bmm2_d: %p\n", scale_bmm2_d);
@@ -635,12 +684,16 @@ void fmha_v2_run(
              softmax_stats_ptr, scale_bmm2_d, scale_bmm1, scale_softmax, scale_bmm2,
              softcapping_scale_bmm1, false, false, false, has_alibi);
 
-  // total number of tokens is needed to set TMA desc on the host.
-  // Access cumulative sequence lengths from device memory
-  uint32_t* cum_seq_lens_q_ptr = static_cast<uint32_t*>(cum_seq_lens_q.data_ptr());
-  uint32_t* cum_seq_lens_kv_ptr = static_cast<uint32_t*>(cum_seq_lens_kv.data_ptr());
-  launch_params.total_q_seqlen = s_q * b;    // For now, use batch_size * max_q_len
-  launch_params.total_kv_seqlen = s_kv * b;  // For now, use batch_size * max_kv_len
+  // For Q_PAGED_KV layout, override mMaxBlocksPerSeq to match the actual block_tables stride
+  // that we used when expanding the block offsets from [B, M] to [B, 2, M]
+  if (input_layout == Attention_input_layout::Q_PAGED_KV && block_table_max_blocks > 0) {
+    params_v2.paged_kv_cache.mMaxBlocksPerSeq = block_table_max_blocks;
+  }
+
+  // Total number of tokens is needed to set TMA desc on the host.
+  // Values passed from Python to avoid cudaMemcpy synchronization overhead.
+  launch_params.total_q_seqlen = static_cast<uint32_t>(total_q_tokens);
+  launch_params.total_kv_seqlen = static_cast<uint32_t>(total_kv_tokens);
   // set enable_attn_logit_softcapping to select the right kernel.
   launch_params.enable_attn_logit_softcapping = softcapping_scale_bmm1 != 0.f;
 

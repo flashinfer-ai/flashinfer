@@ -683,6 +683,7 @@ def generate_jit_sources(
         head_size_v=head_size_v,
         output_dtype=output_dtype,
     )
+    print(f"kspec: {kspec}")
     if not is_kernel_spec_valid(kspec):
         raise ValueError(f"Invalid kernel spec: {kspec}")
     fname, lname, kname = encode_name(kspec)
