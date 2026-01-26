@@ -267,6 +267,7 @@ def bench_cute_dsl(
         repeat_iters=iters,
         cold_l2_cache=True,
         enable_cupti=True,
+        use_cuda_graph=True,
     )
     return np.median(times)
 
@@ -334,6 +335,7 @@ def bench_cutlass(
         repeat_iters=iters,
         cold_l2_cache=True,
         enable_cupti=True,
+        use_cuda_graph=True,
     )
     return np.median(times)
 
@@ -445,6 +447,7 @@ def bench_trtllm(
         repeat_iters=iters,
         cold_l2_cache=True,
         enable_cupti=True,
+        use_cuda_graph=True,
     )
     return np.median(times)
 

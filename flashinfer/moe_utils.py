@@ -334,7 +334,7 @@ def moe_sort(
     torch.Tensor,  # tile_idx_to_mn_limit
     torch.Tensor,  # expanded_idx_to_permuted_idx
     torch.Tensor,  # permuted_idx_to_expanded_idx
-    int,  # total_num_padded_tokens
+    torch.Tensor,  # total_num_padded_tokens [1], int32 (device tensor for CUDA graph compatibility)
     torch.Tensor,  # num_non_exiting_tiles
 ]:
     """
@@ -370,8 +370,8 @@ def moe_sort(
                 -1 indicates a masked/non-local expert.
             - permuted_idx_to_expanded_idx: [max_num_permuted_tokens], int32
                 Mapping from permuted index to expanded index.
-            - total_num_padded_tokens: int
-                Total number of padded tokens.
+            - total_num_padded_tokens: [1], int32 (device tensor)
+                Total number of padded tokens. Returned as tensor for CUDA graph compatibility.
             - num_non_exiting_tiles: [1], int32 (device tensor)
                 Number of non-exiting (active) tiles.
 
@@ -477,15 +477,14 @@ def moe_sort(
         expert_counts_ptr,
     )
 
-    # Get total_num_padded_tokens as Python int
-    total_num_padded_tokens = total_num_padded_tokens_tensor.item()
-
+    # Return total_num_padded_tokens as tensor for CUDA graph compatibility
+    # (avoiding .item() which causes CPU-GPU sync)
     return (
         tile_idx_to_expert_idx,
         tile_idx_to_mn_limit,
         expanded_idx_to_permuted_idx,
         permuted_idx_to_expanded_idx,
-        total_num_padded_tokens,
+        total_num_padded_tokens_tensor,
         num_non_exiting_tiles,
     )
 

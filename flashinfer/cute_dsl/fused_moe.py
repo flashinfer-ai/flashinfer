@@ -36,15 +36,41 @@ Auto-tuning Usage:
         >>> # With auto-tuning
         >>> with autotune(True):
         ...     output = cute_dsl_fused_moe_nvfp4(x, x_sf, ..., num_experts=8, top_k=2)
+
+CUDA Graph Compatibility:
+    This module is designed to be compatible with CUDA graph capture. Key features:
+    - moe_sort returns tensors (no CPU-GPU sync with .item())
+    - CUDA events and streams are pre-allocated at module level
+    - When using CUDA graphs, pre-allocate the moe_output buffer before capture
 """
 
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, Any
 
 import torch
 
 from ..api_logging import flashinfer_api
 from ..autotuner import AutoTuner
 from ..moe_utils import moe_sort, moe_output_memset, get_max_num_permuted_tokens
+
+
+# Module-level cache for CUDA graph resources (events and streams)
+# Pre-allocating these outside of CUDA graph capture is required for compatibility
+_cuda_graph_resources: Dict[str, Any] = {}
+
+
+def _get_cuda_graph_resources() -> Dict[str, Any]:
+    """Get or create pre-allocated CUDA events and streams for CUDA graph compatibility.
+
+    These resources must be created outside of CUDA graph capture to ensure
+    that event.wait() and stream operations work correctly during graph capture.
+    """
+    if not _cuda_graph_resources:
+        _cuda_graph_resources["main_event"] = torch.cuda.Event()
+        _cuda_graph_resources["memset_event"] = torch.cuda.Event()
+        _cuda_graph_resources["aux_stream"] = torch.cuda.Stream()
+    return _cuda_graph_resources
+
+
 from .blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion import (
     blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_nvfp4,
 )
@@ -125,12 +151,14 @@ def _cute_dsl_fused_moe_nvfp4_impl(
     )
 
     # Set up stream synchronization for fused finalize
+    # Use pre-allocated resources for CUDA graph compatibility
     if use_fused_finalize:
-        main_event = torch.cuda.Event()
-        memset_event = torch.cuda.Event()
+        resources = _get_cuda_graph_resources()
+        main_event = resources["main_event"]
+        memset_event = resources["memset_event"]
 
         if aux_stream is None:
-            aux_stream = torch.cuda.Stream()
+            aux_stream = resources["aux_stream"]
 
         main_event.record()
         moe_output.record_stream(aux_stream)
@@ -286,10 +314,17 @@ def cute_dsl_fused_moe_nvfp4(
         moe_output: Pre-allocated output buffer. Shape: [num_tokens, hidden_size].
                     If None, will be allocated.
         aux_stream: Auxiliary CUDA stream for moe_output_memset.
-                    If None and use_fused_finalize, a new stream will be created.
+                    If None and use_fused_finalize, a module-level cached stream
+                    will be used (enables CUDA graph compatibility).
 
     Returns:
         Output tensor. Shape: [num_tokens, hidden_size]. Dtype: output_dtype.
+
+    Note:
+        This function is CUDA graph compatible. When using CUDA graphs:
+        - Pre-allocate moe_output buffer before graph capture
+        - The aux_stream parameter can be None (uses cached stream) or a
+          pre-allocated stream created before graph capture
 
     Example:
         >>> import torch

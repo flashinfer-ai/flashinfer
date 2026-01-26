@@ -506,6 +506,89 @@ class TestCuteDslFusedMoeAccuracy:
             f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
         )
 
+    def test_cuda_graph_capture(self):
+        """Test that cute_dsl_fused_moe_nvfp4 works with CUDA graph capture.
+
+        This verifies that:
+        1. moe_sort does not use .item() (which causes CPU-GPU sync)
+        2. CUDA events and streams are pre-allocated (not created during capture)
+        """
+        from flashinfer.cute_dsl import cute_dsl_fused_moe_nvfp4
+
+        num_tokens = 128
+        hidden_size = 256
+        intermediate_size = 512
+        num_experts = 8
+        top_k = 2
+
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+        )
+
+        # Pre-allocate output buffer (required for CUDA graph - size must be fixed)
+        moe_output = torch.empty(
+            (num_tokens, hidden_size),
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+
+        # Warmup runs (required before CUDA graph capture)
+        for _ in range(3):
+            result = cute_dsl_fused_moe_nvfp4(
+                x=tensors["x"],
+                x_sf=tensors["x_sf"],
+                token_selected_experts=tensors["token_selected_experts"],
+                token_final_scales=tensors["token_final_scales"],
+                w1_weight=tensors["w1_weight"],
+                w1_weight_sf=tensors["w1_weight_sf"],
+                w1_alpha=tensors["w1_alpha"],
+                fc2_input_scale=tensors["fc2_input_scale"],
+                w2_weight=tensors["w2_weight"],
+                w2_weight_sf=tensors["w2_weight_sf"],
+                w2_alpha=tensors["w2_alpha"],
+                num_experts=num_experts,
+                top_k=top_k,
+                num_local_experts=num_experts,
+                moe_output=moe_output,
+            )
+        torch.cuda.synchronize()
+
+        # Capture CUDA graph
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            result = cute_dsl_fused_moe_nvfp4(
+                x=tensors["x"],
+                x_sf=tensors["x_sf"],
+                token_selected_experts=tensors["token_selected_experts"],
+                token_final_scales=tensors["token_final_scales"],
+                w1_weight=tensors["w1_weight"],
+                w1_weight_sf=tensors["w1_weight_sf"],
+                w1_alpha=tensors["w1_alpha"],
+                fc2_input_scale=tensors["fc2_input_scale"],
+                w2_weight=tensors["w2_weight"],
+                w2_weight_sf=tensors["w2_weight_sf"],
+                w2_alpha=tensors["w2_alpha"],
+                num_experts=num_experts,
+                top_k=top_k,
+                num_local_experts=num_experts,
+                moe_output=moe_output,
+            )
+
+        # Replay the graph
+        g.replay()
+        torch.cuda.synchronize()
+
+        # Verify output is valid
+        assert result.shape == (num_tokens, hidden_size)
+        assert result.dtype == torch.bfloat16
+        assert not torch.isnan(result).any(), "Output contains NaN after graph replay"
+        assert not torch.isinf(result).any(), "Output contains Inf after graph replay"
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
