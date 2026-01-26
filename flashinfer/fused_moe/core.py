@@ -2450,6 +2450,7 @@ def trtllm_fp4_block_scale_moe(
 @flashinfer_api
 def trtllm_fp4_block_scale_routed_moe(
     topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
     routing_bias: Optional[torch.Tensor],
     hidden_states: torch.Tensor,
     hidden_states_scale: Optional[torch.Tensor],
@@ -2484,9 +2485,11 @@ def trtllm_fp4_block_scale_routed_moe(
 
     Args:
         topk_ids (torch.Tensor): shape [seq_len, top_k]
-            Tensor of top-k indices and expert weights. Dtype must be int32.
-            It must represent a packed value. The most significant 16/32 bits represent the score and
-            the least significant 16 bits represent the index of the chosen expert (unsigned).
+            Tensor of top-k expert indices. Dtype must be int32.
+            Each element contains the index of the selected expert.
+        topk_weights (torch.Tensor): shape [seq_len, top_k]
+            Tensor of top-k routing weights. Dtype must be bfloat16.
+            Each element contains the routing score/weight for the corresponding expert.
         routing_bias (Optional[torch.Tensor]): shape [num_experts]
             Tensor of routing bias. Can be None for some routing methods. Must be the same type as routing logits.
         hidden_states (torch.Tensor): shape [seq_len, hidden_size // 2 if nvfp4 else hidden_size]
@@ -2546,7 +2549,7 @@ def trtllm_fp4_block_scale_routed_moe(
     return get_trtllm_moe_sm100_module().trtllm_fp4_block_scale_moe(
         None,
         topk_ids,
-        None,
+        topk_weights,
         routing_bias,
         hidden_states,
         hidden_states_scale,

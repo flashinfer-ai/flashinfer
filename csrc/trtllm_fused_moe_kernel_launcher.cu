@@ -214,6 +214,13 @@ class FusedMoeLauncher {
 
     check_routing_logits_shape();
 
+    // If routing_logits is not provided, we expect pre-computed routing
+    // This will be validated in the prepare_routing phase where expert_indexes/weights are checked
+    if (!routing_logits.has_value()) {
+      // Pre-computed routing mode - expert_indexes and expert_weights will be validated later
+      // They are allocated/set in prepare_routing() by derived classes
+    }
+
     if (routing_bias.has_value()) {
       check_routing_bias_shape();
     }
@@ -325,6 +332,19 @@ class FusedMoeLauncher {
     workspace.bmm2_workspace = workspace_fc2.data_ptr();
   }
 
+  // Compute routing metadata from pre-computed topk_ids and topk_weights
+  virtual void compute_routing_metadata_from_precomputed(cudaStream_t stream) {
+    // When routing is pre-computed, expert_indexes and expert_weights are already populated
+    // This function computes the dispatch metadata needed by MoE kernels
+    // TODO(flashinfer#2373): Implement permutation and scheduling metadata computation
+    // For now, throw an error to indicate this path needs implementation
+    TVM_FFI_LOG_AND_THROW(NotImplementedError)
+        << "Pre-computed routing support (nullptr routing_logits) is not yet fully implemented. "
+        << "This requires implementing permutation and dispatch metadata computation from "
+        << "pre-computed topk_ids and topk_weights. "
+        << "See https://github.com/flashinfer-ai/flashinfer/issues/2373";
+  }
+
  public:
   virtual void check_routing() const = 0;
   virtual void prepare_routing() = 0;
@@ -340,25 +360,34 @@ class FusedMoeLauncher {
     check_routing();
     prepare_routing();
 
-    // Execute routing
-    tensorrt_llm::kernels::trtllmgen_moe::Routing::Runner routing_runner(tile_tokens_dim);
     cudaStream_t routing_stream = get_stream(hidden_states.device());
 
-    routing_runner.run(
-        args->routing_logits, args->routing_bias, args->num_tokens, args->num_experts, args->top_k,
-        args->n_group, args->topk_group, args->local_expert_offset, args->local_num_experts,
-        args->routed_scaling_factor, static_cast<int*>(expert_indexes.data_ptr()),
-        static_cast<int*>(expert_count_histogram.data_ptr()),
-        static_cast<int*>(total_num_padded_tokens.data_ptr()),
-        static_cast<int*>(expanded_idx_to_permuted_idx.data_ptr()),
-        nullptr /*permuted_idx_to_expanded_idx.data_ptr()*/,
-        static_cast<int*>(permuted_idx_to_token_idx.data_ptr()), expert_weights.data_ptr(),
-        static_cast<int*>(num_tokens_per_expert.data_ptr()),
-        static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr()),
-        static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr()),
-        static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt, mRoutingBiasDtype,
-        use_routing_scales_on_input, use_deep_seek_fp8,
-        static_cast<RoutingMethodType>(routing_method_type), routing_stream);
+    // Check if routing is pre-computed (routing_logits is nullptr)
+    if (args->routing_logits == nullptr) {
+      // Pre-computed routing: expert_indexes and expert_weights are already populated
+      // We still need to compute the dispatch metadata for the MoE kernels
+      compute_routing_metadata_from_precomputed(routing_stream);
+    } else {
+      // Execute routing from logits
+      tensorrt_llm::kernels::trtllmgen_moe::Routing::Runner routing_runner(tile_tokens_dim);
+
+      routing_runner.run(args->routing_logits, args->routing_bias, args->num_tokens,
+                         args->num_experts, args->top_k, args->n_group, args->topk_group,
+                         args->local_expert_offset, args->local_num_experts,
+                         args->routed_scaling_factor, static_cast<int*>(expert_indexes.data_ptr()),
+                         static_cast<int*>(expert_count_histogram.data_ptr()),
+                         static_cast<int*>(total_num_padded_tokens.data_ptr()),
+                         static_cast<int*>(expanded_idx_to_permuted_idx.data_ptr()),
+                         nullptr /*permuted_idx_to_expanded_idx.data_ptr()*/,
+                         static_cast<int*>(permuted_idx_to_token_idx.data_ptr()),
+                         expert_weights.data_ptr(),
+                         static_cast<int*>(num_tokens_per_expert.data_ptr()),
+                         static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr()),
+                         static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr()),
+                         static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt,
+                         mRoutingBiasDtype, use_routing_scales_on_input, use_deep_seek_fp8,
+                         static_cast<RoutingMethodType>(routing_method_type), routing_stream);
+    }
 
     check_moe();
     prepare_moe(moe_tactic);
