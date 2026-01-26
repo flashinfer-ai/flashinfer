@@ -195,3 +195,110 @@ def test_clear_cubin_cmd_real(monkeypatch, tmp_path):
 
     # Verify the cubin directory has been removed
     assert not temp_cubin_dir.exists()
+
+
+class MockJitSpec:
+    """Mock JitSpec for testing export-compile-commands."""
+
+    def __init__(self, name, compile_commands):
+        self.name = name
+        self._compile_commands = compile_commands
+
+    def get_compile_commands(self):
+        return self._compile_commands
+
+
+def test_export_compile_commands_mocked(monkeypatch, tmp_path):
+    """
+    Test that export-compile-commands writes correct JSON output.
+    """
+    # Create mock specs with compile commands
+    mock_specs = {
+        "module_a": MockJitSpec(
+            "module_a",
+            [
+                {
+                    "directory": "/path/to/build",
+                    "command": "nvcc -c kernel_a.cu",
+                    "file": "kernel_a.cu",
+                }
+            ],
+        ),
+        "module_b": MockJitSpec(
+            "module_b",
+            [
+                {
+                    "directory": "/path/to/build",
+                    "command": "nvcc -c kernel_b.cu",
+                    "file": "kernel_b.cu",
+                }
+            ],
+        ),
+    }
+
+    monkeypatch.setattr("flashinfer.__main__._ensure_modules_registered", lambda: [])
+    monkeypatch.setattr(
+        "flashinfer.__main__.jit_spec_registry.get_all_specs", lambda: mock_specs
+    )
+
+    # Use tmp_path to write output file
+    output_file = tmp_path / "compile_commands.json"
+    out = _test_cmd_helper(["export-compile-commands", str(output_file)])
+
+    assert "Successfully exported 2 compile commands" in out
+    assert output_file.exists()
+
+    # Verify JSON content
+    import json
+
+    with open(output_file) as f:
+        commands = json.load(f)
+
+    assert len(commands) == 2
+    assert commands[0]["file"] == "kernel_a.cu"
+    assert commands[1]["file"] == "kernel_b.cu"
+
+
+def test_export_compile_commands_output_option(monkeypatch, tmp_path):
+    """
+    Test that --output option overrides PATH argument.
+    """
+    mock_specs = {
+        "module_a": MockJitSpec(
+            "module_a",
+            [{"directory": "/build", "command": "nvcc -c a.cu", "file": "a.cu"}],
+        ),
+    }
+
+    monkeypatch.setattr("flashinfer.__main__._ensure_modules_registered", lambda: [])
+    monkeypatch.setattr(
+        "flashinfer.__main__.jit_spec_registry.get_all_specs", lambda: mock_specs
+    )
+
+    # PATH argument should be ignored when --output is specified
+    output_file = tmp_path / "custom_output.json"
+    ignored_file = tmp_path / "ignored.json"
+    out = _test_cmd_helper(
+        ["export-compile-commands", str(ignored_file), "--output", str(output_file)]
+    )
+
+    assert "Successfully exported 1 compile commands" in out
+    assert output_file.exists()
+    assert not ignored_file.exists()
+
+
+def test_export_compile_commands_no_modules(monkeypatch, tmp_path):
+    """
+    Test that export-compile-commands handles empty module registry.
+    """
+    monkeypatch.setattr("flashinfer.__main__._ensure_modules_registered", lambda: [])
+    monkeypatch.setattr(
+        "flashinfer.__main__.jit_spec_registry.get_all_specs", lambda: {}
+    )
+
+    output_file = tmp_path / "compile_commands.json"
+    out = _test_cmd_helper(["export-compile-commands", str(output_file)])
+
+    assert "No modules found" in out
+    # File should not be created when no modules exist
+    assert not output_file.exists()
