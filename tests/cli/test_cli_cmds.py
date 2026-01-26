@@ -92,11 +92,11 @@ def test_download_cubin_cmd_mocked(monkeypatch):
 
     # Mock download_file to avoid actual network calls
     monkeypatch.setattr(
-        "flashinfer.artifacts.download_file", lambda *args, **kwargs: True
+        "flashinfer.artifacts.download_file", lambda *_args, **_kwargs: True
     )
 
     # Mock verify_cubin to always return True
-    monkeypatch.setattr("flashinfer.artifacts.verify_cubin", lambda *args: True)
+    monkeypatch.setattr("flashinfer.artifacts.verify_cubin", lambda *_args: True)
 
     out = _test_cmd_helper(["--download-cubin"])
     assert "All cubin download tasks completed successfully" in out
