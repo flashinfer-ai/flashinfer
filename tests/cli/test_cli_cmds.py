@@ -10,7 +10,11 @@ In general there can be two types of tests for each command:
 These tests don't require a GPU. CLI tests that require a GPU are in test_cli_cmds_gpu.py.
 """
 
-from .cli_cmd_helpers import _test_cmd_helper
+from .cli_cmd_helpers import (
+    _test_cmd_helper,
+    _assert_output_contains_all,
+    _assert_output_contains_any,
+)
 from flashinfer.artifacts import ArtifactPath
 
 
@@ -21,10 +25,13 @@ def test_show_config_cmd_real():
     out = _test_cmd_helper(["show-config"])
 
     # Basic sections present
-    assert "=== Torch Version Info ===" in out
-    assert "=== Environment Variables ===" in out
-    assert "=== Artifact Path ===" in out
-    assert "=== Downloaded Cubins ===" in out
+    _assert_output_contains_all(
+        out,
+        "=== Torch Version Info ===",
+        "=== Environment Variables ===",
+        "=== Artifact Path ===",
+        "=== Downloaded Cubins ===",
+    )
 
 
 def test_show_config_cmd_mocked(monkeypatch):
@@ -53,7 +60,7 @@ def test_cli_group_help_real():
     Test that the CLI group runs without error and sanity checks the output
     """
     out = _test_cmd_helper([])
-    assert "FlashInfer CLI" in out or "Usage" in out
+    _assert_output_contains_any(out, "FlashInfer CLI", "Usage")
 
 
 def test_download_cubin_flag_mocked(monkeypatch):
@@ -94,7 +101,8 @@ def test_download_cubin_cmd_mocked(monkeypatch):
 
 def test_list_cubins_cmd_real():
     out = _test_cmd_helper(["list-cubins"])
-    assert "Cubin" in out and "Status" in out
+
+    _assert_output_contains_all(out, "Cubin", "Status")
 
 
 def test_list_cubins_cmd_mocked(monkeypatch):
@@ -104,7 +112,7 @@ def test_list_cubins_cmd_mocked(monkeypatch):
     )
 
     out = _test_cmd_helper(["list-cubins"])
-    assert "foo.cubin" in out and "bar.cubin" in out
+    _assert_output_contains_all(out, "foo.cubin", "bar.cubin")
 
 
 def test_clear_cache_cmd_mocked(monkeypatch):
