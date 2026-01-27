@@ -14,9 +14,9 @@ Usage:
     python bench_moe_deepseek.py --gen-phase
 
     # With Expert Parallelism simulation
-    python bench_moe_deepseek.py --ep EP1   # 256 local experts (no parallelism)
-    python bench_moe_deepseek.py --ep EP8   # 32 local experts (8-way EP)
-    python bench_moe_deepseek.py --ep EP16  # 16 local experts (16-way EP)
+    python bench_moe_deepseek.py --ep 1    # 256 local experts (no parallelism)
+    python bench_moe_deepseek.py --ep 8    # 32 local experts (8-way EP)
+    python bench_moe_deepseek.py --ep 16   # 16 local experts (16-way EP)
 
     # Custom token counts
     python bench_moe_deepseek.py --num-tokens 64,128,256
@@ -62,9 +62,9 @@ GEN_PHASE_TOKENS = [1, 2, 4, 8, 16, 32, 64, 128]
 # EP=8: 32 experts per GPU (256/8)
 # EP=16: 16 experts per GPU (256/16)
 EP_CONFIGS = {
-    "EP1": {"num_local_experts": 256, "local_expert_offset": 0},
-    "EP8": {"num_local_experts": 32, "local_expert_offset": 0},
-    "EP16": {"num_local_experts": 16, "local_expert_offset": 0},
+    1: {"num_local_experts": 256, "local_expert_offset": 0},
+    8: {"num_local_experts": 32, "local_expert_offset": 0},
+    16: {"num_local_experts": 16, "local_expert_offset": 0},
 }
 
 
@@ -356,8 +356,6 @@ def bench_cutlass(
     from flashinfer.fp4_quantization import fp4_quantize
     from flashinfer.testing.utils import bench_gpu_time
 
-    # Note: CUTLASS backend doesn't support EP natively in this benchmark
-    # We keep the parameters for API consistency
     if num_local_experts is None:
         num_local_experts = CFG.num_experts
 
@@ -366,17 +364,29 @@ def bench_cutlass(
     tv = torch.empty(n, CFG.top_k, dtype=torch.float32, device=dev)
     ti = torch.empty(n, CFG.top_k, dtype=torch.int32, device=dev)
 
+    # Expert range for this EP partition
+    expert_start = local_expert_offset
+    expert_end = local_expert_offset + num_local_experts
+
+    # Slice weights to LOCAL experts only (for fair EP comparison)
+    w1_fp4_local = inputs["w1_fp4"][expert_start:expert_end]
+    w1_sf_local = inputs["w1_sf"][expert_start:expert_end]
+    w1_gs_local = inputs["w1_gs"][expert_start:expert_end]
+    w2_fp4_local = inputs["w2_fp4"][expert_start:expert_end]
+    w2_sf_local = inputs["w2_sf"][expert_start:expert_end]
+    w2_gs_local = inputs["w2_gs"][expert_start:expert_end]
+
     # Prepare CUTLASS inputs
     a1_gs = torch.tensor(1.0, device=dev, dtype=torch.float32)
     a2_gs = torch.tensor(1.0, device=dev, dtype=torch.float32)
 
     quant_scales = [
         a1_gs,
-        inputs["w1_sf"].view(torch.int32),
-        1.0 / (a1_gs * inputs["w1_gs"]),
+        w1_sf_local.view(torch.int32),
+        1.0 / (a1_gs * w1_gs_local),
         a2_gs,
-        inputs["w2_sf"].view(torch.int32),
-        1.0 / (a2_gs * inputs["w2_gs"]),
+        w2_sf_local.view(torch.int32),
+        1.0 / (a2_gs * w2_gs_local),
     ]
 
     hidden_fp4, input_sf = fp4_quantize(inputs["hidden_bf16"], a1_gs, sv, False, True)
@@ -386,8 +396,11 @@ def bench_cutlass(
     routing_bias_f32 = inputs["routing_bias"].float()
 
     # Pre-compute values that need conversion
-    w1_fp4_view = inputs["w1_fp4"].contiguous().view(torch.long)
-    w2_fp4_view = inputs["w2_fp4"].contiguous().view(torch.long)
+    w1_fp4_view = w1_fp4_local.contiguous().view(torch.long)
+    w2_fp4_view = w2_fp4_local.contiguous().view(torch.long)
+
+    # Compute EP size from config
+    ep_size = CFG.num_experts // num_local_experts
 
     def run(hidden, sf, router_logits, routing_bias, topk_values, topk_indices):
         # Routing (included in timing for fair comparison with TRTLLM)
@@ -411,6 +424,8 @@ def bench_cutlass(
             quant_scales=quant_scales,
             input_sf=sf,
             output=output,
+            ep_size=ep_size,
+            ep_rank=0,  # Simulating rank 0 of EP
         )
         return output
 
@@ -798,7 +813,7 @@ def run_benchmark(
     token_counts,
     warmup=10,
     iters=100,
-    ep_config="EP1",
+    ep_config=1,
     do_autotune=True,
     verbose=True,
     use_cuda_graph=True,
@@ -812,7 +827,7 @@ def run_benchmark(
         token_counts: List of token counts to benchmark
         warmup: Warmup iterations
         iters: Benchmark iterations
-        ep_config: Expert Parallelism config ("EP1", "EP8", "EP16")
+        ep_config: Expert Parallelism config (1, 8, or 16)
         do_autotune: Whether to run autotune before benchmarking
         verbose: Print results to stdout
         use_cuda_graph: Whether to use CUDA graph for benchmarking
@@ -823,7 +838,7 @@ def run_benchmark(
         List of BenchResult objects
     """
     # Get EP configuration
-    ep_cfg = EP_CONFIGS.get(ep_config, EP_CONFIGS["EP1"])
+    ep_cfg = EP_CONFIGS.get(ep_config, EP_CONFIGS[1])
     num_local = ep_cfg["num_local_experts"]
     local_offset = ep_cfg["local_expert_offset"]
 
@@ -914,7 +929,7 @@ def _benchmark_single(
 def _print_header(ep_config, num_local, use_cuda_graph, use_cupti):
     """Print benchmark header."""
     print("\n" + "=" * 120)
-    print(f"DeepSeek-V3 MoE Benchmark: CuteDSL vs CUTLASS vs TRTLLM ({ep_config})")
+    print(f"DeepSeek-V3 MoE Benchmark: CuteDSL vs CUTLASS vs TRTLLM (EP={ep_config})")
     print("=" * 120)
     print(
         f"Model: hidden={CFG.hidden_size}, intermediate={CFG.intermediate_size}, "
@@ -996,10 +1011,10 @@ def main():
     )
     parser.add_argument(
         "--ep",
-        type=str,
-        default="EP1",
-        choices=["EP1", "EP8", "EP16"],
-        help="Expert Parallelism: EP1 (256 local), EP8 (32 local), EP16 (16 local)",
+        type=int,
+        default=1,
+        choices=[1, 8, 16],
+        help="Expert Parallelism: 1 (256 local), 8 (32 local), 16 (16 local)",
     )
     parser.add_argument(
         "--no-cuda-graph",
