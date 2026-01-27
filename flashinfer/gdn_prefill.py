@@ -147,7 +147,7 @@ def chunk_gated_delta_rule(
     Note:
         - Supports GQA: ``num_q_heads > num_k_heads = num_v_heads``
         - Supports GVA: ``num_v_heads > num_q_heads = num_k_heads``
-        - The final state is in k-major layout ``[N, H, K, V]``.
+        - The final state is in k-last layout ``[N, H, V, K]``.
         - Requires SM90 (Hopper) architecture.
     """
     assert cu_seqlens is not None, "cu_seqlens is required for varlen mode"
