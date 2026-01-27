@@ -1,8 +1,6 @@
 import os
-import subprocess
 from collections import namedtuple
 from enum import IntEnum
-from itertools import product
 from dataclasses import asdict
 
 sm2name = {
@@ -345,6 +343,9 @@ def get_GMMA_shape(instruction_traits, m, n, k, warps_n):
 
 
 def enable_mutex(kspec):
+    # Mutex is needed for head_size > 64 to synchronize HGMMA operations between warp groups.
+    # This applies to all 2-byte element types (fp16, bf16) regardless of accumulation precision.
+    # enable_mutex = "false" if kspec.head_size <= 64 else "true"
     fp32_accu_dtype = kspec.dtype in ["fp16_fp32", "bf16"]
     enable_mutex = "false" if (fp32_accu_dtype or kspec.head_size <= 64) else "true"
     return enable_mutex

@@ -1,12 +1,6 @@
-from typing import Optional, Tuple, Dict, Any
-from .generator_utils import spec_fields, kernel_spec
-from collections import namedtuple
-from enum import IntEnum
+from typing import Optional, Tuple
 from ... import env as jit_env
 from dataclasses import dataclass, asdict
-import math
-import torch
-
 from .utils import (
     get_effective_sm_and_name,
     get_hopper_instruction_traits,
@@ -19,14 +13,9 @@ from .utils import (
     dtype2traits,
     hopper_dtype2traits,
     MAX_STGS_PER_LOOP,
-    sm2name,
     dtype2OutputType,
-    hopper_traits2shape,
-    dtype2typename,
-    AttentionMaskType,
     InputLayout,
     encode_name,
-    copyright,
 )
 
 import jinja2
@@ -244,7 +233,7 @@ def generate_kernel_spec(
                 noloop_step = q_loop_step
                 tiled = 0
     elif sm == 90:
-        raise ValueError(f"(jimmyzho): Only Warp Specialization is supported for SM 90")
+        raise ValueError("(jimmyzho): Only Warp Specialization is supported for SM 90")
 
     spec = {
         "sm": sm,
@@ -290,7 +279,7 @@ def is_kernel_spec_valid(kspec: FMHAv2KernelSpec) -> bool:
         return False
 
     # Standard flash attention support
-    flash_valid = (
+    flash_valid: bool = (
         kspec.sm in [80, 86, 89, 90, 120]
         and kspec.dtype in ["fp16", "bf16", "fp16_fp32", "e4m3", "e4m3_fp32"]
         and kspec.head_size <= 256
@@ -302,17 +291,17 @@ def is_kernel_spec_valid(kspec: FMHAv2KernelSpec) -> bool:
         and kspec.input_layout != InputLayout.SEPARATE_Q_K_V
     )
     # SM90 non-flash ldgsts support (fixed seq len)
-    non_flash_valid = (
+    non_flash_valid: bool = (
         kspec.sm == 90
         and kspec.dtype in ["fp16", "bf16", "fp16_fp32"]
         and kspec.head_size <= 256
-        and kspec.ldgsts_q
+        and bool(kspec.ldgsts_q)
         and kspec.version == 2
         and not kspec.cross_mha
         and not kspec.flash_attention
     )
     # Clip/SigLip support
-    clip_valid = (
+    clip_valid: bool = (
         kspec.sm == 100
         and kspec.dtype in ["fp16", "bf16", "fp16_fp32", "e4m3", "e4m3_fp32"]
         and kspec.head_size == 80
@@ -324,7 +313,7 @@ def is_kernel_spec_valid(kspec: FMHAv2KernelSpec) -> bool:
         and kspec.input_layout != InputLayout.SEPARATE_Q_K_V
     )
     # Deepseek MLA (generation 576/512 paged)
-    mla_valid_576_512 = (
+    mla_valid_576_512: bool = (
         kspec.sm in [90, 100, 120]
         and kspec.dtype in ["bf16", "e4m3_fp32"]
         and kspec.head_size == 576
@@ -335,10 +324,10 @@ def is_kernel_spec_valid(kspec: FMHAv2KernelSpec) -> bool:
         and not kspec.cross_mha
         and kspec.flash_attention
         and not kspec.warp_specialization
-        and kspec.tiled
+        and bool(kspec.tiled)
     )
     # Deepseek MLA (context 192/128 separate-q-k-v)
-    mla_valid_192_128 = (
+    mla_valid_192_128: bool = (
         kspec.sm in [90, 100, 120]
         and kspec.dtype in ["bf16", "e4m3", "e4m3_fp32"]
         and kspec.head_size == 192
@@ -350,12 +339,12 @@ def is_kernel_spec_valid(kspec: FMHAv2KernelSpec) -> bool:
         and kspec.flash_attention
         and (
             (kspec.warp_specialization and not kspec.alibi)  # sm90
-            or (not kspec.warp_specialization and kspec.tiled)
+            or (not kspec.warp_specialization and bool(kspec.tiled))
         )  # non-sm90
         and not kspec.enable_attn_logit_softcapping
     )
     # SageAttention (warp_spec, head_size in (80, 128), packed QKV, padding mask)
-    sage_valid_sm90 = (
+    sage_valid_sm90: bool = (
         kspec.sm == 90
         and kspec.head_size in [80, 128]
         and kspec.version == 2
@@ -368,7 +357,7 @@ def is_kernel_spec_valid(kspec: FMHAv2KernelSpec) -> bool:
         and not kspec.enable_attn_logit_softcapping
     )
     # SageAttention on Ada (head_size in (80, 128), packed QKV, padding mask)
-    sage_valid_sm89 = (
+    sage_valid_sm89: bool = (
         kspec.sm == 89
         and kspec.head_size in [80, 128]
         and kspec.sage_block_sizes in [(64, 32, 32)]
@@ -380,13 +369,13 @@ def is_kernel_spec_valid(kspec: FMHAv2KernelSpec) -> bool:
         and kspec.input_layout == InputLayout.PACKED_QKV
     )
 
-    print(f"flash_valid: {flash_valid}")
-    print(f"non_flash_valid: {non_flash_valid}")
-    print(f"clip_valid: {clip_valid}")
-    print(f"mla_valid_576_512: {mla_valid_576_512}")
-    print(f"mla_valid_192_128: {mla_valid_192_128}")
-    print(f"sage_valid_sm90: {sage_valid_sm90}")
-    print(f"sage_valid_sm89: {sage_valid_sm89}")
+    # print(f"flash_valid: {flash_valid}")
+    # print(f"non_flash_valid: {non_flash_valid}")
+    # print(f"clip_valid: {clip_valid}")
+    # print(f"mla_valid_576_512: {mla_valid_576_512}")
+    # print(f"mla_valid_192_128: {mla_valid_192_128}")
+    # print(f"sage_valid_sm90: {sage_valid_sm90}")
+    # print(f"sage_valid_sm89: {sage_valid_sm89}")
     return (
         flash_valid
         or non_flash_valid

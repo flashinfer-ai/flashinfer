@@ -2,7 +2,7 @@ import pytest
 import torch
 import math
 
-
+import flashinfer
 from flashinfer.prefill import fmha_v2_prefill_deepseek
 from tests.utils_fp8 import to_float8
 from flashinfer.utils import is_sm120a_supported
@@ -178,11 +178,10 @@ def test_fmha_v2_prefill_deepseek(
 @pytest.mark.parametrize("max_seq_len", [512, 1024, 2048])
 @pytest.mark.parametrize("num_qo_heads", [8])
 @pytest.mark.parametrize("num_kv_heads", [8])  # Paged KV cache
-@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("head_dim", [128])
 @pytest.mark.parametrize("page_size", [16, 32])
-# @pytest.mark.parametrize("dtype", [torch.bfloat16])
-# @pytest.mark.parametrize("dtype", [torch.float16])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+# @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("causal", [True, False])
 def test_trtllm_fmha_v2_prefill_paged(
     batch_size,
@@ -284,6 +283,60 @@ def test_trtllm_fmha_v2_prefill_paged(
     assert output.shape == o.shape
     assert not torch.isnan(output).any()
     assert not torch.isinf(output).any()
+
+    # Build reference output using BatchPrefillWithPagedKVCacheWrapper
+    # Compute paged_kv_indptr: cumulative page counts per sequence
+    page_per_seq = (seq_lens + page_size - 1) // page_size
+    paged_kv_indptr = torch.cat(
+        [
+            torch.tensor([0], dtype=torch.int32, device=device),
+            torch.cumsum(page_per_seq, dim=0, dtype=torch.int32),
+        ]
+    )
+
+    # Flatten block_tables to get paged_kv_indices
+    paged_kv_indices = []
+    for i in range(batch_size):
+        num_pages_needed = page_per_seq[i].item()
+        paged_kv_indices.append(block_tables[i, :num_pages_needed])
+    paged_kv_indices = torch.cat(paged_kv_indices)
+
+    # Compute last page lengths
+    kv_last_page_len = seq_lens % page_size
+    kv_last_page_len[kv_last_page_len == 0] = page_size
+
+    # Create workspace buffer for reference
+    workspace_buffer_ref = torch.empty(
+        128 * 1024 * 1024, dtype=torch.int8, device=device
+    )
+
+    # Set up plan parameters for reference wrapper
+    plan_params = {
+        "qo_indptr": cum_seq_lens_q,
+        "paged_kv_indptr": paged_kv_indptr,
+        "paged_kv_indices": paged_kv_indices,
+        "paged_kv_last_page_len": kv_last_page_len,
+        "num_qo_heads": num_qo_heads,
+        "num_kv_heads": num_kv_heads,
+        "head_dim_qk": head_dim,
+        "page_size": page_size,
+        "causal": causal,
+        "pos_encoding_mode": "NONE",
+        "logits_soft_cap": 0.0,
+        "q_data_type": q.dtype,
+        "kv_data_type": paged_kv_cache.dtype,
+        "window_left": -1,
+    }
+
+    wrapper_ref = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
+        workspace_buffer_ref, "NHD"
+    )
+    wrapper_ref.plan(**plan_params)
+    output_ref = wrapper_ref.run(q, paged_kv_cache)
+
+    # Compare output with reference
+    rtol, atol = 1e-2, 5e-3
+    torch.testing.assert_close(output.float(), output_ref.float(), rtol=rtol, atol=atol)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])

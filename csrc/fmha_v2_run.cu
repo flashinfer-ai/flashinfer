@@ -63,15 +63,10 @@ inline std::tuple<size_t, size_t, size_t> get_warps(Launch_params& launch_params
 inline void get_grid_size(int& heads_per_wave, int& ctas_per_head, int sm, Data_type data_type,
                           size_t b, size_t s, size_t h, size_t d, bool use_multi_ctas,
                           int version) {
-  // Determine the number of CTAs per head (kernel constant).
-  int max_heads_per_wave = 0;
+  // For single-CTA kernels (the default), each CTA processes one head.
+  // Multi-CTA support (ctas_per_head > 1) requires additional grid configuration.
   ctas_per_head = 1;
   heads_per_wave = b * h;
-
-  // Adjust the number of heads per wave.
-  if (heads_per_wave > max_heads_per_wave) {
-    heads_per_wave = max_heads_per_wave;
-  }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -389,11 +384,11 @@ void fmha_v2_run(
   cudaStream_t stream = static_cast<cudaStream_t>(get_stream(q.device()));
 
   // Query tensor is 3D ragged [total_tokens, num_heads, head_dim] (not 4D [batch, s_q, num_heads,
-  // head_dim]) K/V tensors for paged KV are 4D [num_pages, page_size, num_kv_heads, head_dim] (NHD
+  // head_dim]) K/V tensors for paged KV are 4D [num_pages, num_kv_heads, page_size, head_dim] (HND
   // layout) Extract dimensions from tensors (use parameter batch_size, not re-extract)
   const size_t b = batch_size;
   const size_t h = q.shape()[1];     // num_heads (index 1 in 3D ragged tensor)
-  const size_t h_kv = k.shape()[2];  // num_kv_heads (index 2 in paged KV)
+  const size_t h_kv = k.shape()[1];  // num_kv_heads (index 1 in HND paged KV)
   const size_t d = q.shape()[2];     // head_dim_qk (index 2 in 3D ragged tensor)
   const size_t dv = v.shape()[3];    // head_dim_v (index 3 in paged KV)
   const size_t s_q = max_q_len;
@@ -631,7 +626,7 @@ void fmha_v2_run(
 
   bert::Fused_multihead_attention_params_v2 params_v2;
   // Print all param set values before calling set_params
-  bool debug = true;
+  bool debug = false;
   if (debug) {
     printf("=== set_params() arguments ===\n");
     printf("launch_params: ...\n");  // For struct, maybe print pointer or describe

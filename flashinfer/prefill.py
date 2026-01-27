@@ -55,7 +55,6 @@ from .utils import (
     device_support_pdl,
     get_device_sm_count,
     is_float8,
-    is_sm90a_supported,
     is_sm100a_supported,
     is_sm110a_supported,
     is_sm120a_supported,
@@ -3918,26 +3917,24 @@ def trtllm_fmha_v2_prefill(
             "Combine K and V using: kv_cache = torch.stack([k_cache, v_cache], dim=1)"
         )
 
-    # unbind transforms [num_pages, 2, ...] to ([num_pages, ...], [num_pages, ...])
-    k_cache, v_cache = kv_cache.unbind(dim=1)
+    # TRT-LLM kernel expects HND layout within each page and K/V interleaved at block level.
+    # The combined kv_cache must be converted to [num_pages, 2, num_kv_heads, page_size, head_dim]
+    # before unbinding, so that k.data_ptr() points to the correctly laid out combined pool.
+    if kv_layout == "NHD":
+        # Input: [num_pages, 2, page_size, num_kv_heads, head_dim]
+        # Convert to: [num_pages, 2, num_kv_heads, page_size, head_dim]
+        kv_cache = kv_cache.transpose(-3, -2).contiguous()
 
-    if kv_layout == "HND":
-        # For NHD: [..., N, H, D] -> HND: [..., H, N, D]
-        k_cache = k_cache.transpose(-3, -2)
-        v_cache = v_cache.transpose(-3, -2)
+    # unbind transforms [num_pages, 2, H, N, D] to ([num_pages, H, N, D], [num_pages, H, N, D])
+    # Both tensors share storage with the converted kv_cache, preserving the K/V interleaving
+    k_cache, v_cache = kv_cache.unbind(dim=1)
 
     num_qo_heads = query.shape[1]
     head_dim_qk = query.shape[2]
     kv_dtype = k_cache.dtype
-    # After transpose (if any), tensor layout is:
-    #   HND: [num_pages, num_kv_heads, page_size, head_dim]
-    #   NHD: [num_pages, page_size, num_kv_heads, head_dim]
-    if kv_layout == "HND":
-        num_kv_heads = k_cache.shape[1]
-        page_size = k_cache.shape[2]
-    else:  # NHD
-        num_kv_heads = k_cache.shape[2]
-        page_size = k_cache.shape[1]
+    # After conversion, tensor layout is always HND: [num_pages, num_kv_heads, page_size, head_dim]
+    num_kv_heads = k_cache.shape[1]
+    page_size = k_cache.shape[2]
     # head_dim_v is at index 3 in both layouts
     # head_dim_vo = 0 means "same as head_dim_qk" (standard attention)
     # head_dim_vo = actual value for MLA where head_dim_v != head_dim_qk
@@ -3953,9 +3950,10 @@ def trtllm_fmha_v2_prefill(
         o_dtype = query.dtype
 
     # Allocate output tensor if not provided
+    # Use head_dim_v (actual value) not head_dim_vo (0 means "same as head_dim_qk")
     if out is None:
         out = torch.empty(
-            (query.shape[0], num_qo_heads, head_dim_vo),
+            (query.shape[0], num_qo_heads, head_dim_v),
             dtype=o_dtype,
             device=query.device,
         )
@@ -3996,9 +3994,8 @@ def trtllm_fmha_v2_prefill(
     # DATA_TYPE_FP16=0, DATA_TYPE_BF16=1, DATA_TYPE_FP32=2, DATA_TYPE_INT8=3, DATA_TYPE_E4M3=4
     dtype_to_code_map = {
         torch.float16: 0,
-        torch.bfloat16: 1,
-        torch.float32: 2,
-        torch.int8: 3,
+        torch.float32: 1,
+        torch.bfloat16: 4,
     }
     if hasattr(torch, "float8_e4m3fn"):
         dtype_to_code_map[torch.float8_e4m3fn] = 4
