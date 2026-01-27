@@ -2448,7 +2448,7 @@ def trtllm_fp4_block_scale_moe(
 
 
 @flashinfer_api
-def trtllm_fp4_block_scale_routed_moe(
+def trtllm_fp4_block_scale_prerouted_moe(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
     routing_bias: Optional[torch.Tensor],
@@ -2481,7 +2481,11 @@ def trtllm_fp4_block_scale_routed_moe(
     output: Optional[torch.Tensor] = None,
     tune_max_num_tokens: int = 8192,
 ) -> List[torch.Tensor]:
-    """FP4 block scale MoE operation.
+    """FP4 block scale MoE operation with pre-computed routing.
+
+    This function accepts pre-computed top-k expert assignments (topk_ids and topk_weights)
+    instead of computing routing from logits. Use this when routing decisions are made
+    externally (e.g., for load balancing across GPUs or custom routing logic).
 
     Args:
         topk_ids (torch.Tensor): shape [seq_len, top_k]
@@ -2489,9 +2493,10 @@ def trtllm_fp4_block_scale_routed_moe(
             Each element contains the index of the selected expert.
         topk_weights (torch.Tensor): shape [seq_len, top_k]
             Tensor of top-k routing weights. Dtype must be bfloat16.
-            Each element contains the routing score/weight for the corresponding expert.
+            Each element contains the routing weight for the corresponding expert.
+            These weights are used in the final weighted sum of expert outputs.
         routing_bias (Optional[torch.Tensor]): shape [num_experts]
-            Tensor of routing bias. Can be None for some routing methods. Must be the same type as routing logits.
+            Tensor of routing bias. Can be None for pre-routed mode.
         hidden_states (torch.Tensor): shape [seq_len, hidden_size // 2 if nvfp4 else hidden_size]
             Tensor of input hidden states. Supports bfloat16, mxfp8, and nvfp4 (packed into uint8)
         hidden_states_scale (Optional[torch.Tensor]): shape [seq_len, hidden_size // (32 if mxfp8, 16 if mxfp4)]
@@ -2544,12 +2549,112 @@ def trtllm_fp4_block_scale_routed_moe(
 
     Returns:
         List[torch.Tensor]: List of output tensors. If do_finalize=True, returns the final MoE output.
-            Otherwise, returns intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
+            Otherwise, returns intermediate results that need further processing.
     """
+    # routing_logits=None triggers pre-computed routing path in the kernel
     return get_trtllm_moe_sm100_module().trtllm_fp4_block_scale_moe(
-        None,
+        None,  # routing_logits
         topk_ids,
         topk_weights,
+        routing_bias,
+        hidden_states,
+        hidden_states_scale,
+        gemm1_weights,
+        gemm1_weights_scale,
+        gemm1_bias,
+        gemm1_alpha,
+        gemm1_beta,
+        gemm1_clamp_limit,
+        gemm2_weights,
+        gemm2_weights_scale,
+        gemm2_bias,
+        output1_scale_scalar,
+        output1_scale_gate_scalar,
+        output2_scale_scalar,
+        num_experts,
+        top_k,
+        n_group,
+        topk_group,
+        intermediate_size,
+        local_expert_offset,
+        local_num_experts,
+        routed_scaling_factor,
+        routing_method_type,
+        do_finalize,
+        enable_pdl,
+        gated_act_type,
+        output,
+        tune_max_num_tokens,
+    )
+
+
+def trtllm_fp4_block_scale_routed_moe(
+    topk_ids: torch.Tensor,
+    routing_bias: Optional[torch.Tensor],
+    hidden_states: torch.Tensor,
+    hidden_states_scale: Optional[torch.Tensor],
+    gemm1_weights: torch.Tensor,
+    gemm1_weights_scale: torch.Tensor,
+    gemm1_bias: Optional[torch.Tensor],
+    gemm1_alpha: Optional[torch.Tensor],
+    gemm1_beta: Optional[torch.Tensor],
+    gemm1_clamp_limit: Optional[torch.Tensor],
+    gemm2_weights: torch.Tensor,
+    gemm2_weights_scale: torch.Tensor,
+    gemm2_bias: Optional[torch.Tensor],
+    output1_scale_scalar: Optional[torch.Tensor],
+    output1_scale_gate_scalar: Optional[torch.Tensor],
+    output2_scale_scalar: Optional[torch.Tensor],
+    num_experts: int,
+    top_k: int,
+    n_group: Optional[int],
+    topk_group: Optional[int],
+    intermediate_size: int,
+    local_expert_offset: int,
+    local_num_experts: int,
+    routed_scaling_factor: Optional[float],
+    routing_method_type: int = 0,
+    do_finalize: bool = True,
+    enable_pdl: Optional[bool] = None,
+    gated_act_type: int = 0,
+    output: Optional[torch.Tensor] = None,
+    tune_max_num_tokens: int = 8192,
+) -> List[torch.Tensor]:
+    """FP4 block scale MoE operation with packed routing input.
+
+    .. deprecated::
+        This function is deprecated and will be removed in a future version.
+        Use :func:`trtllm_fp4_block_scale_prerouted_moe` instead, which accepts
+        separate ``topk_ids`` and ``topk_weights`` tensors.
+
+    Args:
+        topk_ids (torch.Tensor): shape [seq_len, top_k]
+            Tensor of packed top-k indices and weights. Dtype must be int32.
+            The most significant 16/32 bits represent the score and
+            the least significant 16 bits represent the expert index.
+        routing_bias (Optional[torch.Tensor]): shape [num_experts]
+            Tensor of routing bias. Can be None.
+        hidden_states (torch.Tensor): Input hidden states.
+        ... (other args same as trtllm_fp4_block_scale_prerouted_moe)
+
+    Returns:
+        List[torch.Tensor]: Output tensors.
+    """
+    import warnings
+
+    warnings.warn(
+        "trtllm_fp4_block_scale_routed_moe is deprecated and will be removed in version 0.8. "
+        "Use trtllm_fp4_block_scale_prerouted_moe instead, which accepts separate "
+        "topk_ids (int32) and topk_weights (bfloat16) tensors.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    # Old API uses packed format - pass to kernel with topk_weights=None
+    # The kernel will use mPtrTopKPacked path instead of mPtrTopKIds + mPtrTopKWeights
+    return get_trtllm_moe_sm100_module().trtllm_fp4_block_scale_moe(
+        None,  # routing_logits
+        topk_ids,  # packed format
+        None,  # topk_weights (None for packed format)
         routing_bias,
         hidden_states,
         hidden_states_scale,

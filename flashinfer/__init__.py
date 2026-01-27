@@ -80,6 +80,7 @@ from .fused_moe import (
     cutlass_fused_moe,
     reorder_rows_for_gated_act_gemm,
     trtllm_fp4_block_scale_moe,
+    trtllm_fp4_block_scale_prerouted_moe,
     trtllm_fp4_block_scale_routed_moe,
     trtllm_fp8_block_scale_moe,
     trtllm_fp8_per_tensor_scale_moe,
