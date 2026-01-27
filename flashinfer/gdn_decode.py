@@ -201,7 +201,7 @@ def gdn_decode_kernel_small_batch_pretranspose(
         cute.copy(tiled_copy_load, thr_gSrc, thr_sData)
         cute.arch.cp_async_commit_group()
 
-    for i in range(vec_size):
+    for i in cutlass.range_constexpr(vec_size):
         r_q[i] = cutlass.Float32(q[i_n, i_t, i_h, i * 32 + lane_id])
         r_k[i] = cutlass.Float32(k[i_n, i_t, i_h, i * 32 + lane_id])
         # Store v to shared memory instead of register
@@ -248,7 +248,7 @@ def gdn_decode_kernel_small_batch_pretranspose(
         # Compute L2 norm of q and k
         sum_q = 0.0
         sum_k = 0.0
-        for i in range(vec_size):
+        for i in cutlass.range_constexpr(vec_size):
             sum_q += r_q[i] * r_q[i]
             sum_k += r_k[i] * r_k[i]
         # Warp-level reduction using butterfly shuffle
@@ -262,12 +262,12 @@ def gdn_decode_kernel_small_batch_pretranspose(
 
         inv_norm_q = cute.rsqrt(sum_q + 1e-6, fastmath=True)
         inv_norm_k = cute.rsqrt(sum_k + 1e-6, fastmath=True)
-        for i in range(vec_size):
+        for i in cutlass.range_constexpr(vec_size):
             r_q[i] = r_q[i] * inv_norm_q
             r_k[i] = r_k[i] * inv_norm_k
 
     # Apply scaling in Float32
-    for i in range(vec_size):
+    for i in cutlass.range_constexpr(vec_size):
         r_q[i] = r_q[i] * scale
 
     # ===================================================================
@@ -296,10 +296,10 @@ def gdn_decode_kernel_small_batch_pretranspose(
             cute.arch.cp_async_commit_group()
 
         # Step 3: Compute using data from current stage
-        for row in range(0, TILE_V, 4):
+        for row in cutlass.range_constexpr(0, TILE_V, 4):
             row_offset = tidx // 32
             sum_hk = 0.0
-            for i in range(vec_size):
+            for i in cutlass.range_constexpr(vec_size):
                 r_h[i] = sData[(row + row_offset, i * 32 + lane_id, stage)]
                 r_h[i] = r_h[i] * r_g
                 sum_hk += r_h[i] * r_k[i]
@@ -313,7 +313,7 @@ def gdn_decode_kernel_small_batch_pretranspose(
             v_new = v_new * r_beta
 
             sum_hq = 0.0
-            for i in range(vec_size):
+            for i in cutlass.range_constexpr(vec_size):
                 r_h[i] += r_k[i] * v_new
                 gDst[(0, row + row_offset, i * 32 + lane_id, v_tiles)] = r_h[i]
                 sum_hq += r_h[i] * r_q[i]
@@ -437,7 +437,7 @@ def gdn_decode_kernel_big_batch_pretranspose(
         cute.copy(tiled_copy_load, thr_gSrc, thr_sData)
         cute.arch.cp_async_commit_group()
 
-    for i in range(vec_size):
+    for i in cutlass.range_constexpr(vec_size):
         r_q[i] = cutlass.Float32(q[i_n, i_t, i_h, i * 32 + lane_id])
         r_k[i] = cutlass.Float32(k[i_n, i_t, i_h, i * 32 + lane_id])
         # Store v to shared memory instead of register
@@ -484,7 +484,7 @@ def gdn_decode_kernel_big_batch_pretranspose(
         # Compute L2 norm of q and k
         sum_q = 0.0
         sum_k = 0.0
-        for i in range(vec_size):
+        for i in cutlass.range_constexpr(vec_size):
             sum_q += r_q[i] * r_q[i]
             sum_k += r_k[i] * r_k[i]
         # Warp-level reduction using butterfly shuffle
@@ -498,12 +498,12 @@ def gdn_decode_kernel_big_batch_pretranspose(
 
         inv_norm_q = cute.rsqrt(sum_q + 1e-6, fastmath=True)
         inv_norm_k = cute.rsqrt(sum_k + 1e-6, fastmath=True)
-        for i in range(vec_size):
+        for i in cutlass.range_constexpr(vec_size):
             r_q[i] = r_q[i] * inv_norm_q
             r_k[i] = r_k[i] * inv_norm_k
 
     # Apply scaling in Float32
-    for i in range(vec_size):
+    for i in cutlass.range_constexpr(vec_size):
         r_q[i] = r_q[i] * scale
 
     # ===================================================================
@@ -531,10 +531,10 @@ def gdn_decode_kernel_big_batch_pretranspose(
             cute.arch.cp_async_commit_group()
 
         # Step 3: Compute using data from current stage
-        for row in range(0, TILE_V, 4):
+        for row in cutlass.range_constexpr(0, TILE_V, 4):
             row_offset = tidx // 32
             sum_hk = 0.0
-            for i in range(vec_size):
+            for i in cutlass.range_constexpr(vec_size):
                 r_h[i] = sData[(row + row_offset, i * 32 + lane_id, stage)]
                 r_h[i] = r_h[i] * r_g
                 sum_hk += r_h[i] * r_k[i]
@@ -548,7 +548,7 @@ def gdn_decode_kernel_big_batch_pretranspose(
             v_new = v_new * r_beta
 
             sum_hq = 0.0
-            for i in range(vec_size):
+            for i in cutlass.range_constexpr(vec_size):
                 r_h[i] += r_k[i] * v_new
                 gDst[(0, row + row_offset, i * 32 + lane_id, v_tiles)] = r_h[i]
                 sum_hq += r_h[i] * r_q[i]
@@ -599,6 +599,7 @@ def run_gdn_decode_kernel_small_batch_pretranspose(
     is_varlen: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
+    """Launch original pipelined kernel for small batch pretranspose."""
     # h0_source: (B*HV, V, K)
     batch_size, v_dim, k_dim = (
         h0_source.layout.shape[0],
@@ -628,12 +629,6 @@ def run_gdn_decode_kernel_small_batch_pretranspose(
     vec_size = (
         TILE_K // 32
     )  # Each thread in a warp processes this many elements (always 4 for TILE_K=128)
-
-    # print(f"Batched CP.ASYNC Load + Store (bypass L1 cache)")
-    # print(f"  {batch_size} batches x {v_dim}x{k_dim} matrices")
-    # print(f"  Tile: {TILE_V}x{TILE_K}, {num_v_tiles} tiles/batch")
-    # print(f"  Threads: {NUM_THREADS} ({NUM_THREADS // 32} warps), vec_size: {vec_size}")
-    # print(f"  Total: {total_data_mb:.1f} MB\n")
 
     # Create SMEM layout
     smem_layout_staged = cute.make_layout(
@@ -939,12 +934,6 @@ def gated_delta_rule_decode_pretranspose(
     if "compiled" not in cache:
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
-        # Choose kernel based on batch size
-        if B <= 32:
-            run_func = run_gdn_decode_kernel_small_batch_pretranspose
-        else:
-            run_func = run_gdn_decode_kernel_big_batch_pretranspose
-
         # Convert tensors to CuTe format for compilation only
         h0_source_tensor = from_dlpack(h0_source, assumed_align=16)
         A_log_tensor = from_dlpack(A_log, assumed_align=16)
@@ -957,6 +946,12 @@ def gated_delta_rule_decode_pretranspose(
         o_tensor = from_dlpack(output, assumed_align=16)
         h0_indices_tensor = from_dlpack(h0_indices, assumed_align=16)
         cu_seqlens_tensor = from_dlpack(cu_seqlens, assumed_align=16)
+
+        # Choose kernel based on batch size
+        if B <= 32:
+            run_func = run_gdn_decode_kernel_small_batch_pretranspose
+        else:
+            run_func = run_gdn_decode_kernel_big_batch_pretranspose
 
         # Use TVM FFI to reduce runtime overhead
         compiled = cute.compile(
@@ -1241,7 +1236,7 @@ def gdn_decode_kernel_small_batch_nontranspose(
 
             cute.arch.barrier()
 
-            for k_iter in range(NUM_K_ITERS_SMALL):
+            for k_iter in cutlass.range_constexpr(NUM_K_ITERS_SMALL):
                 flat_idx = tidx + k_iter * 128
                 k_write = flat_idx // TILE_V_SMALL_NT
                 v_write = flat_idx % TILE_V_SMALL_NT
@@ -1460,7 +1455,7 @@ def gdn_decode_kernel_big_batch_nontranspose(
 
             cute.arch.barrier()
 
-            for k_iter in range(NUM_K_ITERS_NT):
+            for k_iter in cutlass.range_constexpr(NUM_K_ITERS_NT):
                 flat_idx = tidx + k_iter * 256
                 k_write = flat_idx // TILE_V_NT
                 v_write = flat_idx % TILE_V_NT
@@ -1920,7 +1915,7 @@ def gdn_verify_kernel_mtp(
     )
 
     # Initialize output accumulator to zero
-    for i_t in range(T):
+    for i_t in cutlass.range_constexpr(T):
         sOutput[(i_t, tidx)] = 0.0
 
     cute.arch.barrier()
@@ -1931,9 +1926,9 @@ def gdn_verify_kernel_mtp(
     # Early exit optimization: skip pre-computation for padding slots
     if cache_idx >= 0:
         # Pre-compute q, k, v, g, beta for all time steps (outside v_tiles loop)
-        for i_t in range(T):
+        for i_t in cutlass.range_constexpr(T):
             # Load q, k into register arrays
-            for i in range(vec_size):
+            for i in cutlass.range_constexpr(vec_size):
                 r_q[i] = cutlass.Float32(q[i_n, i_t, i_h, i * 32 + lane_id])
                 r_k[i] = cutlass.Float32(k[i_n, i_t, i_h, i * 32 + lane_id])
                 # Load v for all V elements
@@ -1972,7 +1967,7 @@ def gdn_verify_kernel_mtp(
             if use_qk_l2norm:
                 sum_q = 0.0
                 sum_k = 0.0
-                for i in range(vec_size):
+                for i in cutlass.range_constexpr(vec_size):
                     sum_q += r_q[i] * r_q[i]
                     sum_k += r_k[i] * r_k[i]
 
@@ -1987,16 +1982,16 @@ def gdn_verify_kernel_mtp(
                 inv_norm_q = cute.rsqrt(sum_q + 1e-6, fastmath=True)
                 inv_norm_k = cute.rsqrt(sum_k + 1e-6, fastmath=True)
 
-                for i in range(vec_size):
+                for i in cutlass.range_constexpr(vec_size):
                     r_q[i] = r_q[i] * inv_norm_q
                     r_k[i] = r_k[i] * inv_norm_k
 
             # Apply scaling to q
-            for i in range(vec_size):
+            for i in cutlass.range_constexpr(vec_size):
                 r_q[i] = r_q[i] * scale
 
             # Store pre-computed values to shared memory
-            for i in range(vec_size):
+            for i in cutlass.range_constexpr(vec_size):
                 sQ[(i_t, i * 32 + lane_id)] = r_q[i]
                 sK[(i_t, i * 32 + lane_id)] = r_k[i]
 
@@ -2051,9 +2046,9 @@ def gdn_verify_kernel_mtp(
                 cute.arch.cp_async_commit_group()
 
             # Inner loop: all time steps for this v_tile
-            for i_t in range(T):
+            for i_t in cutlass.range_constexpr(T):
                 # Load pre-computed values from shared memory
-                for i in range(vec_size):
+                for i in cutlass.range_constexpr(vec_size):
                     r_q[i] = sQ[(i_t, i * 32 + lane_id)]
                     r_k[i] = sK[(i_t, i * 32 + lane_id)]
 
@@ -2061,18 +2056,18 @@ def gdn_verify_kernel_mtp(
                 r_beta = sBeta[i_t]
 
                 # Compute delta rule for this v_tile
-                for row in range(0, TILE_V_MTP, 4):
+                for row in cutlass.range_constexpr(0, TILE_V_MTP, 4):
                     row_offset = tidx // 32
 
                     # Load h from sData, apply decay
-                    for i in range(vec_size):
+                    for i in cutlass.range_constexpr(vec_size):
                         r_h[i] = (
                             sData[(row + row_offset, i * 32 + lane_id, stage)] * r_g
                         )
 
                     # Compute sum_hk = h @ k
                     sum_hk = 0.0
-                    for i in range(vec_size):
+                    for i in cutlass.range_constexpr(vec_size):
                         sum_hk += r_h[i] * r_k[i]
 
                     for offset in [16, 8, 4, 2, 1]:
@@ -2086,7 +2081,7 @@ def gdn_verify_kernel_mtp(
                     v_new = v_new * r_beta
 
                     # Update h and write back to sData
-                    for i in range(vec_size):
+                    for i in cutlass.range_constexpr(vec_size):
                         r_h[i] += r_k[i] * v_new
                         sData[(row + row_offset, i * 32 + lane_id, stage)] = r_h[i]
 
@@ -2094,14 +2089,14 @@ def gdn_verify_kernel_mtp(
                     if cache_intermediate_states:
                         flat_idx = i_n * T * HV + i_t * HV + i_hv
                         if v_idx < V:
-                            for i in range(vec_size):
+                            for i in cutlass.range_constexpr(vec_size):
                                 intermediate_states[
                                     (flat_idx, v_idx, i * 32 + lane_id)
                                 ] = r_h[i]
 
                     # Compute sum_hq = h @ q (overlaps with store above)
                     sum_hq = 0.0
-                    for i in range(vec_size):
+                    for i in cutlass.range_constexpr(vec_size):
                         sum_hq += r_h[i] * r_q[i]
 
                     for offset in [16, 8, 4, 2, 1]:
@@ -2115,9 +2110,9 @@ def gdn_verify_kernel_mtp(
 
             # Write final h for this v_tile to h0_source
             if not disable_state_update:
-                for row in range(0, TILE_V_MTP, 4):
+                for row in cutlass.range_constexpr(0, TILE_V_MTP, 4):
                     row_offset = tidx // 32
-                    for i in range(vec_size):
+                    for i in cutlass.range_constexpr(vec_size):
                         gDst_h0[(0, row + row_offset, i * 32 + lane_id, v_tiles)] = (
                             sData[(row + row_offset, i * 32 + lane_id, stage)]
                         )
@@ -2125,7 +2120,7 @@ def gdn_verify_kernel_mtp(
         # Final writeback
         cute.arch.barrier()
 
-        for i_t in range(T):
+        for i_t in cutlass.range_constexpr(T):
             if tidx < V:
                 o[(i_n, i_t, i_hv, tidx)] = cutlass.BFloat16(sOutput[(i_t, tidx)])
 

@@ -640,6 +640,256 @@ if TRITON_AVAILABLE:
 
         return output, state
 
+    @triton.jit
+    def fused_sigmoid_gating_delta_rule_kernel_pretranspose(
+        # Pointers to matrices
+        Q,
+        K,
+        V,
+        O,
+        H,  # Hidden state [B, HV, V, K] - V-major (pretranspose) layout
+        A_LOG,  # Log decay [HV]
+        A,  # Input-dependent decay [B, HV]
+        DT_BIAS,  # Decay bias [HV]
+        B_GATE,  # Update gate [B, HV]
+        # Strides
+        stride_qb,
+        stride_qh,
+        stride_qk,
+        stride_kb,
+        stride_kh,
+        stride_kk,
+        stride_vb,
+        stride_vh,
+        stride_vv,
+        stride_ob,
+        stride_oh,
+        stride_ov,
+        stride_hb,
+        stride_hh,
+        stride_hv,  # V dimension stride
+        stride_hk,  # K dimension stride
+        # Parameters
+        softplus_beta: tl.constexpr,
+        softplus_threshold: tl.constexpr,
+        scale: tl.constexpr,
+        use_qk_l2norm: tl.constexpr,
+        B: tl.constexpr,
+        HV: tl.constexpr,
+        H_Q: tl.constexpr,
+        H_K: tl.constexpr,
+        K_DIM: tl.constexpr,
+        V_DIM: tl.constexpr,
+        BK: tl.constexpr,
+        BV: tl.constexpr,
+    ):
+        """
+        Triton kernel for pretranspose layout [B, HV, V, K].
+
+        Key difference from nontranspose:
+        - State layout: [B, HV, V, K] instead of [B, HV, K, V]
+        - h is [BV, BK] instead of [BK, BV]
+        - h @ k = sum(h * k[None, :], axis=1) -> [BV]
+        - h += outer(v, k) = v[:, None] * k[None, :]
+        - o = h @ q = sum(h * q[None, :], axis=1) -> [BV]
+        """
+        # Block indices
+        i_bh = tl.program_id(0)
+        i_k = tl.program_id(1)
+        i_v = tl.program_id(2)
+
+        i_b = i_bh // HV
+        i_hv = i_bh % HV
+
+        # GVA head mapping (num_v_heads > num_q_heads)
+        h_ratio_q = HV // H_Q
+        h_ratio_k = HV // H_K
+        i_hq = i_hv // h_ratio_q
+        i_hk = i_hv // h_ratio_k
+
+        # Load A_log and dt_bias for this head
+        b_A_log = tl.load(A_LOG + i_hv).to(tl.float32)
+        b_dt_bias = tl.load(DT_BIAS + i_hv).to(tl.float32)
+
+        # Load a (input-dependent decay) for this batch and head
+        b_a = tl.load(A + i_b * HV + i_hv).to(tl.float32)
+
+        # Load b (update gate) for this batch and head
+        b_b = tl.load(B_GATE + i_b * HV + i_hv).to(tl.float32)
+
+        # Compute softplus: softplus(x) = (1/beta) * log(1 + exp(beta*x))
+        x = b_a + b_dt_bias
+        beta_x = softplus_beta * x
+        softplus_x = tl.where(
+            beta_x <= softplus_threshold,
+            (1.0 / softplus_beta) * tl.log(1.0 + tl.exp(beta_x)),
+            x,
+        )
+
+        # Compute g = -exp(A_log) * softplus(a + dt_bias)
+        b_g = -tl.exp(b_A_log) * softplus_x
+
+        # Compute beta = sigmoid(b)
+        b_beta = 1.0 / (1.0 + tl.exp(-b_b))
+
+        # Block offsets
+        o_k = i_k * BK + tl.arange(0, BK)
+        o_v = i_v * BV + tl.arange(0, BV)
+
+        # Load q, k, v
+        p_q = Q + i_b * stride_qb + i_hq * stride_qh + o_k * stride_qk
+        p_k = K + i_b * stride_kb + i_hk * stride_kh + o_k * stride_kk
+        p_v = V + i_b * stride_vb + i_hv * stride_vh + o_v * stride_vv
+
+        b_q = tl.load(p_q, mask=o_k < K_DIM, other=0.0).to(tl.float32)
+        b_k = tl.load(p_k, mask=o_k < K_DIM, other=0.0).to(tl.float32)
+        b_v = tl.load(p_v, mask=o_v < V_DIM, other=0.0).to(tl.float32)
+
+        # Apply L2 normalization (if enabled)
+        if use_qk_l2norm:
+            q_norm = tl.sqrt(tl.sum(b_q * b_q) + 1e-8)
+            k_norm = tl.sqrt(tl.sum(b_k * b_k) + 1e-8)
+            b_q = b_q / q_norm
+            b_k = b_k / k_norm
+
+        # Apply scale to q
+        b_q = b_q * scale
+
+        # Load hidden state h[V, K] from state[B, HV, V, K] - pretranspose layout
+        p_h = (
+            H
+            + i_b * stride_hb
+            + i_hv * stride_hh
+            + o_v[:, None] * stride_hv
+            + o_k[None, :] * stride_hk
+        )
+        b_h = tl.load(
+            p_h, mask=(o_v[:, None] < V_DIM) & (o_k[None, :] < K_DIM), other=0.0
+        ).to(tl.float32)  # [BV, BK]
+
+        # Step 1: Apply decay to hidden state: h *= exp(g)
+        b_h = b_h * tl.exp(b_g)
+
+        # Step 2: Delta rule: v -= h @ k = sum(h * k[None, :], axis=1)
+        # b_h is [BV, BK], b_k is [BK]
+        b_v = b_v - tl.sum(b_h * b_k[None, :], 1)
+
+        # Step 3: Apply beta gating: v *= beta
+        b_v = b_v * b_beta
+
+        # Step 4: Update hidden state: h += outer(v, k) = v[:, None] * k[None, :]
+        b_h = b_h + b_v[:, None] * b_k[None, :]
+
+        # Step 5: Compute output: o = h @ q = sum(h * q[None, :], axis=1)
+        b_o = tl.sum(b_h * b_q[None, :], 1)
+
+        # Store output
+        p_o = O + i_b * stride_ob + i_hv * stride_oh + o_v * stride_ov
+        tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=o_v < V_DIM)
+
+        # Store updated hidden state
+        tl.store(
+            p_h,
+            b_h.to(p_h.dtype.element_ty),
+            mask=(o_v[:, None] < V_DIM) & (o_k[None, :] < K_DIM),
+        )
+
+    def triton_gdn_decode_pretranspose(
+        q: torch.Tensor,  # [B, 1, H_Q, K]
+        k: torch.Tensor,  # [B, 1, H_K, K]
+        v: torch.Tensor,  # [B, 1, HV, V]
+        state: torch.Tensor,  # [B, HV, V, K] - pretranspose layout
+        A_log: torch.Tensor,  # [HV]
+        a: torch.Tensor,  # [B, 1, HV]
+        dt_bias: torch.Tensor,  # [HV]
+        b: torch.Tensor,  # [B, 1, HV]
+        scale: float,
+        output: torch.Tensor,  # [B, 1, HV, V]
+        use_qk_l2norm: bool = True,
+        softplus_beta: float = 1.0,
+        softplus_threshold: float = 20.0,
+    ):
+        """
+        Triton-based GDN decode for pretranspose layout [B, HV, V, K].
+        """
+        B, T, H_Q, K_DIM = q.shape
+        _, _, H_K, _ = k.shape
+        _, _, HV, V_DIM = v.shape
+
+        assert T == 1, "Triton kernel only supports decode (T=1)"
+
+        # Reshape inputs for kernel
+        q_flat = q.squeeze(1)  # [B, H_Q, K]
+        k_flat = k.squeeze(1)  # [B, H_K, K]
+        v_flat = v.squeeze(1)  # [B, HV, V]
+        a_flat = a.squeeze(1)  # [B, HV]
+        b_flat = b.squeeze(1)  # [B, HV]
+        o_flat = output.squeeze(1)  # [B, HV, V]
+
+        # Block sizes
+        BK = triton.next_power_of_2(K_DIM)
+        BV = triton.next_power_of_2(V_DIM)
+
+        # Limit block sizes (BV smaller to allow more V blocks)
+        BV = min(BV, 32)
+
+        # Number of blocks
+        NK = triton.cdiv(K_DIM, BK)
+        NV = triton.cdiv(V_DIM, BV)
+
+        assert NK == 1, f"Multi-block K not supported: NK={NK}"
+
+        # Launch kernel
+        grid = (B * HV, NK, NV)
+
+        fused_sigmoid_gating_delta_rule_kernel_pretranspose[grid](
+            q_flat,
+            k_flat,
+            v_flat,
+            o_flat,
+            state,
+            A_log,
+            a_flat,
+            dt_bias,
+            b_flat,
+            # Strides for q [B, H_Q, K]
+            q_flat.stride(0),
+            q_flat.stride(1),
+            q_flat.stride(2),
+            # Strides for k [B, H_K, K]
+            k_flat.stride(0),
+            k_flat.stride(1),
+            k_flat.stride(2),
+            # Strides for v [B, HV, V]
+            v_flat.stride(0),
+            v_flat.stride(1),
+            v_flat.stride(2),
+            # Strides for o [B, HV, V]
+            o_flat.stride(0),
+            o_flat.stride(1),
+            o_flat.stride(2),
+            # Strides for h [B, HV, V, K] - pretranspose layout
+            state.stride(0),
+            state.stride(1),
+            state.stride(2),
+            state.stride(3),
+            # Parameters
+            softplus_beta=softplus_beta,
+            softplus_threshold=softplus_threshold,
+            scale=scale,
+            use_qk_l2norm=use_qk_l2norm,
+            B=B,
+            HV=HV,
+            H_Q=H_Q,
+            H_K=H_K,
+            K_DIM=K_DIM,
+            V_DIM=V_DIM,
+            BK=BK,
+            BV=BV,
+        )
+
+        return output, state
+
     def triton_gdn_mtp(
         q: torch.Tensor,  # [B, T, H_Q, K]
         k: torch.Tensor,  # [B, T, H_K, K]
@@ -1105,6 +1355,111 @@ def bench_comparison(
     }
 
 
+def bench_comparison_pretranspose(
+    batch_size: int,
+    num_q_heads: int,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_size: int,
+    dtype: torch.dtype,
+    use_qk_l2norm: bool = True,
+    warmup_iters: int = 10,
+    bench_iters: int = 100,
+):
+    """Benchmark both FlashInfer and Triton pretranspose implementations."""
+    if not TRITON_AVAILABLE:
+        raise RuntimeError("Triton is not available. Install with: pip install triton")
+
+    num_o_heads = max(num_q_heads, num_v_heads)
+    num_sab_heads = num_o_heads
+
+    # Create inputs (T=1 for decode)
+    T = 1
+    q = torch.randn(batch_size, T, num_q_heads, head_size, dtype=dtype, device="cuda")
+    k = torch.randn(batch_size, T, num_k_heads, head_size, dtype=dtype, device="cuda")
+    v = torch.randn(batch_size, T, num_v_heads, head_size, dtype=dtype, device="cuda")
+
+    # GDN-specific parameters
+    A_log = torch.randn(num_sab_heads, dtype=torch.float32, device="cuda")
+    a = torch.randn(batch_size, T, num_sab_heads, dtype=dtype, device="cuda")
+    dt_bias = torch.randn(num_sab_heads, dtype=dtype, device="cuda")
+    b = torch.randn(batch_size, T, num_sab_heads, dtype=dtype, device="cuda")
+
+    # Scale factor
+    scale = 1.0 / (head_size**0.5)
+
+    # ========== FlashInfer Benchmark ==========
+    # State for FlashInfer pretranspose (V-major layout) [B, HV, V, K]
+    state_fi = torch.randn(
+        batch_size,
+        num_sab_heads,
+        head_size,
+        head_size,
+        dtype=torch.float32,
+        device="cuda",
+    )
+    output_fi = torch.empty(
+        batch_size, T, num_o_heads, head_size, dtype=dtype, device="cuda"
+    )
+
+    flashinfer_times = bench_gpu_time(
+        lambda: gated_delta_rule_decode_pretranspose(
+            q, k, v, state_fi, A_log, a, dt_bias, b, scale, output_fi, use_qk_l2norm
+        ),
+        enable_cupti=True,
+        dry_run_iters=warmup_iters,
+        repeat_iters=bench_iters,
+    )
+    flashinfer_median_us = np.median(flashinfer_times) * 1000
+
+    # ========== Triton Benchmark ==========
+    # State [B, HV, V, K] - pretranspose layout
+    state_tr = torch.randn(
+        batch_size,
+        num_sab_heads,
+        head_size,
+        head_size,
+        dtype=torch.float32,
+        device="cuda",
+    )
+    output_tr = torch.empty(
+        batch_size, T, num_o_heads, head_size, dtype=dtype, device="cuda"
+    )
+
+    triton_times = bench_gpu_time(
+        lambda: triton_gdn_decode_pretranspose(
+            q, k, v, state_tr, A_log, a, dt_bias, b, scale, output_tr, use_qk_l2norm
+        ),
+        enable_cupti=True,
+        dry_run_iters=warmup_iters,
+        repeat_iters=bench_iters,
+    )
+    triton_median_us = np.median(triton_times) * 1000
+
+    # Calculate metrics
+    flops = gdn_decode_flops(
+        batch_size, num_q_heads, num_k_heads, num_v_heads, head_size
+    )
+
+    flashinfer_tflops = (
+        flops / (flashinfer_median_us / 1000) / 1e9 if flashinfer_median_us > 0 else 0
+    )
+    triton_tflops = (
+        flops / (triton_median_us / 1000) / 1e9 if triton_median_us > 0 else 0
+    )
+
+    speedup = triton_median_us / flashinfer_median_us if flashinfer_median_us > 0 else 0
+
+    return {
+        "batch_size": batch_size,
+        "flashinfer_us": flashinfer_median_us,
+        "triton_us": triton_median_us,
+        "flashinfer_tflops": flashinfer_tflops,
+        "triton_tflops": triton_tflops,
+        "speedup": speedup,
+    }
+
+
 def bench_mtp_comparison(
     batch_size: int,
     seq_len: int,
@@ -1331,21 +1686,107 @@ def verify_correctness(
         q, k, v, state_tr, A_log, a, dt_bias, b, scale, output_tr, use_qk_l2norm
     )
 
-    # Compare outputs
-    output_close = torch.allclose(
-        output_fi.float(), output_tr.float(), rtol=rtol, atol=atol
-    )
-    state_close = torch.allclose(
-        state_fi.float(), state_tr.float(), rtol=rtol, atol=atol
+    # Compare outputs using torch.testing.assert_close
+    try:
+        torch.testing.assert_close(
+            output_fi.float(), output_tr.float(), rtol=rtol, atol=atol
+        )
+        output_close = True
+    except AssertionError as e:
+        output_close = False
+        print(f"  Output mismatch: {e}")
+
+    try:
+        torch.testing.assert_close(
+            state_fi.float(), state_tr.float(), rtol=rtol, atol=atol
+        )
+        state_close = True
+    except AssertionError as e:
+        state_close = False
+        print(f"  State mismatch: {e}")
+
+    return output_close and state_close
+
+
+def verify_correctness_pretranspose(
+    batch_size: int,
+    num_q_heads: int,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_size: int,
+    dtype: torch.dtype,
+    use_qk_l2norm: bool = True,
+    rtol: float = 1e-2,
+    atol: float = 1e-2,
+):
+    """Verify FlashInfer and Triton pretranspose produce similar results."""
+    if not TRITON_AVAILABLE:
+        raise RuntimeError("Triton is not available. Install with: pip install triton")
+
+    num_o_heads = max(num_q_heads, num_v_heads)
+    num_sab_heads = num_o_heads
+
+    # Create inputs (T=1 for decode)
+    T = 1
+    q = torch.randn(batch_size, T, num_q_heads, head_size, dtype=dtype, device="cuda")
+    k = torch.randn(batch_size, T, num_k_heads, head_size, dtype=dtype, device="cuda")
+    v = torch.randn(batch_size, T, num_v_heads, head_size, dtype=dtype, device="cuda")
+
+    # GDN-specific parameters
+    A_log = torch.randn(num_sab_heads, dtype=torch.float32, device="cuda")
+    a = torch.randn(batch_size, T, num_sab_heads, dtype=dtype, device="cuda")
+    dt_bias = torch.randn(num_sab_heads, dtype=dtype, device="cuda")
+    b = torch.randn(batch_size, T, num_sab_heads, dtype=dtype, device="cuda")
+
+    # Scale factor
+    scale = 1.0 / (head_size**0.5)
+
+    # Same initial state for both [B, HV, V, K] - pretranspose layout
+    state_init = torch.randn(
+        batch_size,
+        num_sab_heads,
+        head_size,
+        head_size,
+        dtype=torch.float32,
+        device="cuda",
     )
 
-    if not output_close:
-        max_diff = (output_fi.float() - output_tr.float()).abs().max().item()
-        print(f"  Output max diff: {max_diff:.6f}")
+    # FlashInfer
+    state_fi = state_init.clone()
+    output_fi = torch.empty(
+        batch_size, T, num_o_heads, head_size, dtype=dtype, device="cuda"
+    )
+    gated_delta_rule_decode_pretranspose(
+        q, k, v, state_fi, A_log, a, dt_bias, b, scale, output_fi, use_qk_l2norm
+    )
 
-    if not state_close:
-        max_diff = (state_fi.float() - state_tr.float()).abs().max().item()
-        print(f"  State max diff: {max_diff:.6f}")
+    # Triton
+    state_tr = state_init.clone()
+    output_tr = torch.empty(
+        batch_size, T, num_o_heads, head_size, dtype=dtype, device="cuda"
+    )
+    triton_gdn_decode_pretranspose(
+        q, k, v, state_tr, A_log, a, dt_bias, b, scale, output_tr, use_qk_l2norm
+    )
+
+    # Compare outputs using torch.testing.assert_close
+    try:
+        torch.testing.assert_close(
+            output_fi.float(), output_tr.float(), rtol=rtol, atol=atol
+        )
+        output_close = True
+    except AssertionError as e:
+        output_close = False
+        print(f"  Output mismatch: {e}")
+
+    try:
+        torch.testing.assert_close(
+            state_fi.float(), state_tr.float(), rtol=rtol, atol=atol
+        )
+        state_close = True
+    except AssertionError as e:
+        state_close = False
+        print(f"  State mismatch: {e}")
 
     return output_close and state_close
 
@@ -1457,19 +1898,31 @@ def run_comparison_benchmark(args, dtype, use_qk_l2norm):
 
     # Verify correctness first if requested
     if args.verify:
-        print("\n=== Correctness Verification ===")
+        version_name = args.version.upper() if args.version != "all" else "NONTRANSPOSE"
+        print(f"\n=== Correctness Verification ({version_name}) ===")
         # Use larger batch sizes to avoid alignment issues with small batches
         for batch_size in [8, 16, 32, 64]:
             try:
-                passed = verify_correctness(
-                    batch_size=batch_size,
-                    num_q_heads=args.num_q_heads,
-                    num_k_heads=args.num_k_heads,
-                    num_v_heads=args.num_v_heads,
-                    head_size=args.head_size,
-                    dtype=dtype,
-                    use_qk_l2norm=use_qk_l2norm,
-                )
+                if args.version == "pretranspose":
+                    passed = verify_correctness_pretranspose(
+                        batch_size=batch_size,
+                        num_q_heads=args.num_q_heads,
+                        num_k_heads=args.num_k_heads,
+                        num_v_heads=args.num_v_heads,
+                        head_size=args.head_size,
+                        dtype=dtype,
+                        use_qk_l2norm=use_qk_l2norm,
+                    )
+                else:
+                    passed = verify_correctness(
+                        batch_size=batch_size,
+                        num_q_heads=args.num_q_heads,
+                        num_k_heads=args.num_k_heads,
+                        num_v_heads=args.num_v_heads,
+                        head_size=args.head_size,
+                        dtype=dtype,
+                        use_qk_l2norm=use_qk_l2norm,
+                    )
                 status = "PASS" if passed else "FAIL"
                 print(f"Batch={batch_size}: {status}")
             except Exception as e:
@@ -1518,9 +1971,46 @@ def run_comparison_benchmark(args, dtype, use_qk_l2norm):
                 )
 
         print("-" * 110)
+    elif args.version == "pretranspose":
+        # Pretranspose decode comparison
+        print("\nGDN Decode Comparison (PRETRANSPOSE): FlashInfer (CuTe DSL) vs Triton")
+        print(
+            f"Config: q_heads={args.num_q_heads}, k_heads={args.num_k_heads}, "
+            f"v_heads={args.num_v_heads}, head_size={args.head_size}, dtype={args.dtype}, "
+            f"qk_l2norm={'ON' if use_qk_l2norm else 'OFF'}"
+        )
+        print("-" * 100)
+        print(
+            f"{'batch':>6} {'FlashInfer(us)':>14} {'Triton(us)':>12} "
+            f"{'FI TFLOPS':>10} {'TR TFLOPS':>10} {'Speedup':>10}"
+        )
+        print("-" * 100)
+
+        results = []
+        for batch_size in args.batch_size:
+            result = bench_comparison_pretranspose(
+                batch_size=batch_size,
+                num_q_heads=args.num_q_heads,
+                num_k_heads=args.num_k_heads,
+                num_v_heads=args.num_v_heads,
+                head_size=args.head_size,
+                dtype=dtype,
+                use_qk_l2norm=use_qk_l2norm,
+                warmup_iters=args.warmup,
+                bench_iters=args.iters,
+            )
+            results.append(result)
+
+            print(
+                f"{result['batch_size']:>6} {result['flashinfer_us']:>14.2f} "
+                f"{result['triton_us']:>12.2f} {result['flashinfer_tflops']:>10.2f} "
+                f"{result['triton_tflops']:>10.2f} {result['speedup']:>10.2f}x"
+            )
+
+        print("-" * 100)
     else:
-        # Decode comparison
-        print("\nGDN Decode Comparison: FlashInfer (CuTe DSL) vs Triton")
+        # Nontranspose decode comparison
+        print("\nGDN Decode Comparison (NONTRANSPOSE): FlashInfer (CuTe DSL) vs Triton")
         print(
             f"Config: q_heads={args.num_q_heads}, k_heads={args.num_k_heads}, "
             f"v_heads={args.num_v_heads}, head_size={args.head_size}, dtype={args.dtype}, "
