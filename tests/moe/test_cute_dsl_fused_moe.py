@@ -117,8 +117,32 @@ def compute_reference_moe_fp4(
     hidden_size: int,
     intermediate_size: int,
     fc2_input_scale: torch.Tensor = None,
+    num_local_experts: int = None,
+    local_expert_offset: int = 0,
 ) -> torch.Tensor:
-    """Compute reference MoE output using PyTorch operations."""
+    """Compute reference MoE output using PyTorch operations.
+
+    Args:
+        hidden_states: Input hidden states [num_tokens, hidden_size]
+        gemm1_weights: GEMM1 weights [num_local_experts, 2*intermediate_size, hidden_size]
+        gemm2_weights: GEMM2 weights [num_local_experts, hidden_size, intermediate_size]
+        token_selected_experts: Selected expert IDs (global) [num_tokens, top_k]
+        token_final_scales: Routing weights [num_tokens, top_k]
+        num_tokens: Number of tokens
+        num_experts: Total number of experts (global)
+        top_k: Number of experts per token
+        hidden_size: Hidden dimension
+        intermediate_size: Intermediate dimension
+        fc2_input_scale: Optional scale for FC2 input quantization
+        num_local_experts: Number of local experts (for EP). Defaults to num_experts.
+        local_expert_offset: Starting expert ID for this EP rank. Defaults to 0.
+
+    Returns:
+        Output tensor [num_tokens, hidden_size]
+    """
+    if num_local_experts is None:
+        num_local_experts = num_experts
+
     device = hidden_states.device
     output = torch.zeros((num_tokens, hidden_size), dtype=torch.float32, device=device)
 
@@ -129,10 +153,17 @@ def compute_reference_moe_fp4(
             expert_idx = token_selected_experts[token_idx, k].item()
             scale = token_final_scales[token_idx, k].item()
 
+            # Skip invalid expert IDs
             if expert_idx < 0 or expert_idx >= num_experts:
                 continue
 
-            w1 = gemm1_weights[expert_idx]
+            # Convert global expert ID to local index for EP
+            local_idx = expert_idx - local_expert_offset
+            if local_idx < 0 or local_idx >= num_local_experts:
+                # This expert is not on this EP rank, skip
+                continue
+
+            w1 = gemm1_weights[local_idx]
             gemm1_out = token_input @ w1.T
 
             linear = gemm1_out[:, :intermediate_size]
@@ -144,7 +175,7 @@ def compute_reference_moe_fp4(
                     swiglu_out, fc2_input_scale, sf_vec_size=16
                 )
 
-            w2 = gemm2_weights[expert_idx]
+            w2 = gemm2_weights[local_idx]
             gemm2_out = swiglu_out @ w2.T
 
             output[token_idx] += scale * gemm2_out.squeeze(0)
@@ -731,14 +762,23 @@ class TestExpertParallelism:
     """Tests for expert parallelism (EP) configurations."""
 
     @pytest.mark.parametrize("ep_size", [1, 8, 32])
-    def test_wrapper_with_ep(self, ep_size: int):
-        """Test wrapper API with expert parallelism."""
+    @pytest.mark.parametrize("ep_rank", [0, -1])  # -1 means last rank
+    def test_wrapper_with_ep(self, ep_size: int, ep_rank: int):
+        """Test wrapper API with expert parallelism and numerical accuracy.
+
+        Tests different EP ranks to ensure local_expert_offset handling is correct.
+        ep_rank=-1 is converted to the last rank (ep_size-1) to test non-zero offsets.
+        """
         from flashinfer.cute_dsl import CuteDslMoEWrapper
+
+        # Convert -1 to last rank
+        if ep_rank == -1:
+            ep_rank = ep_size - 1
 
         num_tokens, hidden_size, intermediate_size = 256, 256, 512
         num_experts, top_k = 256, 8
         num_local_experts = num_experts // ep_size
-        local_expert_offset = 0
+        local_expert_offset = ep_rank * num_local_experts
 
         tensors = create_moe_tensors(
             num_tokens=num_tokens,
@@ -749,12 +789,9 @@ class TestExpertParallelism:
             top_k=top_k,
         )
 
-        # Filter routing to local experts
+        # Keep original routing - the kernel should handle filtering
+        # based on local_expert_offset and num_local_experts
         token_selected_experts = tensors["token_selected_experts"].clone()
-        mask = (token_selected_experts >= local_expert_offset) & (
-            token_selected_experts < local_expert_offset + num_local_experts
-        )
-        token_selected_experts[~mask] = local_expert_offset
 
         moe = CuteDslMoEWrapper(
             num_experts=num_experts,
@@ -782,6 +819,96 @@ class TestExpertParallelism:
         assert result.shape == (num_tokens, hidden_size)
         assert not torch.isnan(result).any()
         assert not torch.isinf(result).any()
+
+        # Numerical accuracy verification against reference
+        ref_output = compute_reference_moe_fp4(
+            hidden_states=tensors["x_bf16"].float().cuda(),
+            gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
+            gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
+            token_selected_experts=token_selected_experts,
+            token_final_scales=tensors["token_final_scales"],
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            fc2_input_scale=tensors["fc2_input_scale"],
+            num_local_experts=num_local_experts,
+            local_expert_offset=local_expert_offset,
+        )
+
+        passed, percent_within, atol = check_accuracy(result, ref_output)
+        assert passed, (
+            f"EP accuracy test failed (ep_size={ep_size}, ep_rank={ep_rank}, "
+            f"offset={local_expert_offset}): {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
+        )
+
+    @pytest.mark.parametrize("ep_size", [8])
+    def test_functional_with_ep(self, ep_size: int):
+        """Test functional API with expert parallelism and numerical accuracy."""
+        from flashinfer.cute_dsl import cute_dsl_fused_moe_nvfp4
+
+        # Test middle rank to ensure offset handling works
+        ep_rank = ep_size // 2
+
+        num_tokens, hidden_size, intermediate_size = 256, 256, 512
+        num_experts, top_k = 256, 8
+        num_local_experts = num_experts // ep_size
+        local_expert_offset = ep_rank * num_local_experts
+
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_local_experts,
+            top_k=top_k,
+        )
+
+        result = cute_dsl_fused_moe_nvfp4(
+            x=tensors["x"],
+            x_sf=tensors["x_sf"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=num_local_experts,
+            local_expert_offset=local_expert_offset,
+        )
+
+        assert result.shape == (num_tokens, hidden_size)
+        assert not torch.isnan(result).any()
+        assert not torch.isinf(result).any()
+
+        # Numerical accuracy verification
+        ref_output = compute_reference_moe_fp4(
+            hidden_states=tensors["x_bf16"].float().cuda(),
+            gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
+            gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            fc2_input_scale=tensors["fc2_input_scale"],
+            num_local_experts=num_local_experts,
+            local_expert_offset=local_expert_offset,
+        )
+
+        passed, percent_within, atol = check_accuracy(result, ref_output)
+        assert passed, (
+            f"EP functional API accuracy test failed (ep_size={ep_size}, ep_rank={ep_rank}): "
+            f"{percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
+        )
 
 
 if __name__ == "__main__":
