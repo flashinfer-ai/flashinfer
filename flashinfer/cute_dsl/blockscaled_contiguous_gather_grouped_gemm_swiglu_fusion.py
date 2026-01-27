@@ -213,6 +213,11 @@ def _get_compiled_gather_kernel(
     norm_const_ptr,
     max_active_clusters: int,
     stream,
+    # Dtype parameters (compile-time - IN cache key)
+    # cute.compile specializes on pointer types, so dtype must be in cache key
+    ab_dtype: str,
+    sf_dtype: str,
+    c_dtype: str,
     # Tactic parameters (compile-time - IN cache key)
     sf_vec_size: int,
     tile_size: int,
@@ -224,8 +229,12 @@ def _get_compiled_gather_kernel(
 ):
     """Get or compile the gather grouped GEMM with SwiGLU kernel.
 
-    This function caches compiled kernels by tactic parameters only.
+    This function caches compiled kernels by tactic and dtype parameters.
     Problem dimensions (m, n, k, num_experts) are runtime parameters.
+
+    The cache key includes dtype parameters because cute.compile specializes
+    on the types of pointer arguments. Using the same compiled kernel with
+    different dtypes would cause incorrect results or crashes.
 
     This matches TRT-LLM's approach where the same compiled kernel can be
     reused for different problem sizes, significantly reducing JIT compilation
@@ -233,8 +242,11 @@ def _get_compiled_gather_kernel(
     """
     global _gather_kernel_cache
 
-    # Cache key only includes tactic parameters, NOT problem dimensions
+    # Cache key includes dtype and tactic parameters, NOT problem dimensions
     cache_key = (
+        ab_dtype,
+        sf_dtype,
+        c_dtype,
         sf_vec_size,
         tile_size,
         topk,
@@ -540,7 +552,7 @@ def blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_nvfp4(
     torch_stream = torch.cuda.current_stream()
     stream = cuda.CUstream(torch_stream.cuda_stream)
 
-    # Get or compile the kernel (cached by tactic parameters only)
+    # Get or compile the kernel (cached by dtype and tactic parameters)
     compiled_gemm = _get_compiled_gather_kernel(
         # Runtime parameters (problem dimensions)
         orig_m=seq_len,
@@ -563,6 +575,10 @@ def blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_nvfp4(
         norm_const_ptr=norm_const_ptr,
         max_active_clusters=max_active_clusters,
         stream=stream,
+        # Dtype parameters (compile-time, in cache key)
+        ab_dtype=ab_dtype,
+        sf_dtype=sf_dtype,
+        c_dtype=c_dtype,
         # Tactic parameters (compile-time, cached)
         sf_vec_size=sf_vec_size,
         tile_size=tile_size,
