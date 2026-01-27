@@ -66,6 +66,7 @@ if is_cute_dsl_available():
     )
     from .fused_moe import (
         cute_dsl_fused_moe_nvfp4,
+        CuteDslMoEWrapper,
     )
     from .tuner import (
         CuteDslFusedMoENvfp4Runner,
@@ -119,6 +120,7 @@ if is_cute_dsl_available():
         "AddRMSNormFP4QuantKernel",
         # Fused MoE (high-level API)
         "cute_dsl_fused_moe_nvfp4",
+        "CuteDslMoEWrapper",
         # Auto-tuner for CuteDSL MoE
         "CuteDslFusedMoENvfp4Runner",
         "get_gemm1_valid_tactics",

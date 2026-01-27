@@ -192,9 +192,15 @@ def bench_cute_dsl(
     local_expert_offset=0,
     use_cuda_graph=True,
     use_cupti=True,
+    use_wrapper=False,
 ):
+    """Benchmark CuteDSL MoE.
+
+    Args:
+        use_wrapper: If True, use CuteDslMoEWrapper API (recommended for CUDA graph).
+                    If False, use cute_dsl_fused_moe_nvfp4 functional API.
+    """
     from flashinfer.fused_moe import fused_topk_deepseek
-    from flashinfer.cute_dsl import cute_dsl_fused_moe_nvfp4
     from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
     from flashinfer.fp4_quantization import fp4_quantize
     from flashinfer.testing.utils import bench_gpu_time
@@ -243,40 +249,77 @@ def bench_cute_dsl(
     # Pre-convert routing bias to float32
     routing_bias_f32 = inputs["routing_bias"].float()
 
-    # Define run function that includes routing (for fair comparison with TRTLLM)
-    # Note: Unlike TRTLLM which has EP-aware internal routing, CuteDSL
-    # receives routing to all experts. The moe_sort filters non-local
-    # experts but there's overhead in processing all token-expert pairs.
-    # This is a known limitation - CuteDSL doesn't show strong EP scaling.
-    def run(x, x_sf, router_logits, routing_bias, topk_values, topk_indices):
-        # Routing (included in timing for fair comparison with TRTLLM)
-        fused_topk_deepseek(
-            scores=router_logits,
-            bias=routing_bias,
-            n_group=CFG.n_group,
-            topk_group=CFG.topk_group,
-            topk=CFG.top_k,
-            routed_scaling_factor=CFG.routed_scaling_factor,
-            topk_values=topk_values,
-            topk_indices=topk_indices,
-        )
-        return cute_dsl_fused_moe_nvfp4(
-            x=x,
-            x_sf=x_sf,
-            token_selected_experts=topk_indices,
-            token_final_scales=topk_values,
-            w1_weight=w1q,
-            w1_weight_sf=w1s,
-            w1_alpha=alpha,
-            fc2_input_scale=fc2sc,
-            w2_weight=w2q,
-            w2_weight_sf=w2s,
-            w2_alpha=alpha,
+    if use_wrapper:
+        # Use CuteDslMoEWrapper (recommended for CUDA graph)
+        from flashinfer.cute_dsl import CuteDslMoEWrapper
+
+        moe = CuteDslMoEWrapper(
             num_experts=CFG.num_experts,
             top_k=CFG.top_k,
+            hidden_size=CFG.hidden_size,
+            intermediate_size=CFG.intermediate_size,
+            use_cuda_graph=use_cuda_graph,
+            max_num_tokens=n,
             num_local_experts=num_local_experts,
             local_expert_offset=local_expert_offset,
         )
+
+        def run(x, x_sf, router_logits, routing_bias, topk_values, topk_indices):
+            fused_topk_deepseek(
+                scores=router_logits,
+                bias=routing_bias,
+                n_group=CFG.n_group,
+                topk_group=CFG.topk_group,
+                topk=CFG.top_k,
+                routed_scaling_factor=CFG.routed_scaling_factor,
+                topk_values=topk_values,
+                topk_indices=topk_indices,
+            )
+            return moe.run(
+                x=x,
+                x_sf=x_sf,
+                token_selected_experts=topk_indices,
+                token_final_scales=topk_values,
+                w1_weight=w1q,
+                w1_weight_sf=w1s,
+                w1_alpha=alpha,
+                fc2_input_scale=fc2sc,
+                w2_weight=w2q,
+                w2_weight_sf=w2s,
+                w2_alpha=alpha,
+            )
+    else:
+        # Use functional API
+        from flashinfer.cute_dsl import cute_dsl_fused_moe_nvfp4
+
+        def run(x, x_sf, router_logits, routing_bias, topk_values, topk_indices):
+            fused_topk_deepseek(
+                scores=router_logits,
+                bias=routing_bias,
+                n_group=CFG.n_group,
+                topk_group=CFG.topk_group,
+                topk=CFG.top_k,
+                routed_scaling_factor=CFG.routed_scaling_factor,
+                topk_values=topk_values,
+                topk_indices=topk_indices,
+            )
+            return cute_dsl_fused_moe_nvfp4(
+                x=x,
+                x_sf=x_sf,
+                token_selected_experts=topk_indices,
+                token_final_scales=topk_values,
+                w1_weight=w1q,
+                w1_weight_sf=w1s,
+                w1_alpha=alpha,
+                fc2_input_scale=fc2sc,
+                w2_weight=w2q,
+                w2_weight_sf=w2s,
+                w2_alpha=alpha,
+                num_experts=CFG.num_experts,
+                top_k=CFG.top_k,
+                num_local_experts=num_local_experts,
+                local_expert_offset=local_expert_offset,
+            )
 
     # Pass input tensors via input_kwargs for cold L2 cache rotation
     input_kwargs = {
@@ -760,6 +803,7 @@ def run_benchmark(
     verbose=True,
     use_cuda_graph=True,
     use_cupti=True,
+    use_wrapper=True,
 ):
     """
     Unified benchmark for DeepSeek-V3 MoE backends.
@@ -773,6 +817,7 @@ def run_benchmark(
         verbose: Print results to stdout
         use_cuda_graph: Whether to use CUDA graph for benchmarking
         use_cupti: Whether to use CUPTI for accurate GPU timing
+        use_wrapper: Whether to use CuteDslMoEWrapper API (recommended)
 
     Returns:
         List of BenchResult objects
@@ -794,7 +839,14 @@ def run_benchmark(
     results = []
     for n in token_counts:
         row = _benchmark_single(
-            n, warmup, iters, num_local, local_offset, use_cuda_graph, use_cupti
+            n,
+            warmup,
+            iters,
+            num_local,
+            local_offset,
+            use_cuda_graph,
+            use_cupti,
+            use_wrapper=use_wrapper,
         )
         results.extend(row)
         if verbose:
@@ -808,15 +860,33 @@ def run_benchmark(
 
 
 def _benchmark_single(
-    n, warmup, iters, num_local, local_offset, use_cuda_graph, use_cupti
+    n,
+    warmup,
+    iters,
+    num_local,
+    local_offset,
+    use_cuda_graph,
+    use_cupti,
+    use_wrapper=True,
 ):
-    """Benchmark all backends for a single token count."""
+    """Benchmark all backends for a single token count.
+
+    Args:
+        use_wrapper: If True, use CuteDslMoEWrapper API for CuteDSL.
+    """
     inputs = create_inputs(n)
 
     # Run all three backends
     lat = {
         "CuteDSL": bench_cute_dsl(
-            inputs, warmup, iters, num_local, local_offset, use_cuda_graph, use_cupti
+            inputs,
+            warmup,
+            iters,
+            num_local,
+            local_offset,
+            use_cuda_graph,
+            use_cupti,
+            use_wrapper=use_wrapper,
         ),
         "CUTLASS": bench_cutlass(
             inputs, warmup, iters, num_local, local_offset, use_cuda_graph, use_cupti
@@ -941,6 +1011,11 @@ def main():
         action="store_true",
         help="Disable CUPTI for GPU timing (enabled by default)",
     )
+    parser.add_argument(
+        "--functional-api",
+        action="store_true",
+        help="Use functional API instead of CuteDslMoEWrapper for CuteDSL benchmark",
+    )
     args = parser.parse_args()
 
     if not is_blackwell():
@@ -957,6 +1032,7 @@ def main():
 
     print("\nDeepSeek-V3 MoE Performance Benchmark")
     print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print(f"CuteDSL API: {'Functional' if args.functional_api else 'Wrapper'}")
 
     run_benchmark(
         token_counts=tokens,
@@ -967,6 +1043,7 @@ def main():
         verbose=not args.quiet,
         use_cuda_graph=not args.no_cuda_graph,
         use_cupti=not args.no_cupti,
+        use_wrapper=not args.functional_api,
     )
 
     return 0

@@ -282,7 +282,10 @@ void moe_sort(
     int64_t total_num_padded_tokens_ptr, int64_t num_non_exiting_tiles_ptr,
     // Optional: expert counts buffer for large token counts (>1024)
     // Should be size 2 * num_experts, int32
-    int64_t expert_counts_ptr) {
+    int64_t expert_counts_ptr,
+    // Optional: explicit CUDA stream pointer for CUDA graph compatibility
+    // If 0, uses TVM FFI's current stream
+    int64_t cuda_stream_ptr) {
   // Set up the routing data structure
   moe::dev::routing::routingDeepSeek::Data routingData;
 
@@ -333,7 +336,10 @@ void moe_sort(
   routingData.mUseRoutingSoftmax = false;
 
   // Run the routing kernel
-  cudaStream_t stream = get_current_stream();
+  // Use explicit stream if provided (for CUDA graph compatibility), otherwise fall back to TVM FFI
+  // stream
+  cudaStream_t stream =
+      cuda_stream_ptr != 0 ? reinterpret_cast<cudaStream_t>(cuda_stream_ptr) : get_current_stream();
   moe::dev::routing::routingDeepSeek::run(routingData, stream);
 }
 
