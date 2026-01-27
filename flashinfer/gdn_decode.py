@@ -1107,7 +1107,9 @@ def gdn_decode_kernel_small_batch_nontranspose(
             sK[tidx] = cutlass.Float32(k[i_n, 0, i_h, tidx])
             sQ[tidx] = cutlass.Float32(q[i_n, 0, i_h, tidx])
 
-        gSrc_batch = h0_source[(pool_idx, i_hv, None, None)]
+        # Compute flat index for flattened state [B*HV, K, V]
+        flat_idx = pool_idx * HV + i_hv
+        gSrc_batch = h0_source[(flat_idx, None, None)]
         gSrc = cute.local_tile(gSrc_batch, (TILE_K_NT, TILE_V_SMALL_NT), (0, None))
         thr_copy_load = tiled_copy_load.get_slice(tidx)
 
@@ -1271,13 +1273,14 @@ def gdn_decode_kernel_small_batch_nontranspose(
             cute.arch.barrier()
 
             for k_iter in cutlass.range_constexpr(NUM_K_ITERS_SMALL):
-                flat_idx = tidx + k_iter * 128
-                k_write = flat_idx // TILE_V_SMALL_NT
-                v_write = flat_idx % TILE_V_SMALL_NT
+                flat_tid = tidx + k_iter * 128
+                k_write = flat_tid // TILE_V_SMALL_NT
+                v_write = flat_tid % TILE_V_SMALL_NT
                 if k_write < TILE_K_NT:
                     h_val = sData[(k_write, v_write, stage)]
                     v_global_write = v_tile * TILE_V_SMALL_NT + v_write
-                    h0_source[(pool_idx, i_hv, k_write, v_global_write)] = h_val
+                    # Use flat index for flattened state [B*HV, K, V]
+                    h0_source[(flat_idx, k_write, v_global_write)] = h_val
 
             cute.arch.barrier()
 
@@ -1335,7 +1338,9 @@ def gdn_decode_kernel_big_batch_nontranspose(
             sK[tidx] = cutlass.Float32(k[i_n, 0, i_h, tidx])
             sQ[tidx] = cutlass.Float32(q[i_n, 0, i_h, tidx])
 
-        gSrc_batch = h0_source[(pool_idx, i_hv, None, None)]
+        # Compute flat index for flattened state [B*HV, K, V]
+        flat_idx = pool_idx * HV + i_hv
+        gSrc_batch = h0_source[(flat_idx, None, None)]
         gSrc = cute.local_tile(gSrc_batch, (TILE_K_NT, TILE_V_NT), (0, None))
         thr_copy_load = tiled_copy_load.get_slice(tidx)
 
@@ -1490,13 +1495,14 @@ def gdn_decode_kernel_big_batch_nontranspose(
             cute.arch.barrier()
 
             for k_iter in cutlass.range_constexpr(NUM_K_ITERS_NT):
-                flat_idx = tidx + k_iter * 256
-                k_write = flat_idx // TILE_V_NT
-                v_write = flat_idx % TILE_V_NT
+                flat_tid = tidx + k_iter * 256
+                k_write = flat_tid // TILE_V_NT
+                v_write = flat_tid % TILE_V_NT
                 if k_write < TILE_K_NT:
                     h_val = sData[(k_write, v_write, stage)]
                     v_global_write = v_tile * TILE_V_NT + v_write
-                    h0_source[(pool_idx, i_hv, k_write, v_global_write)] = h_val
+                    # Use flat index for flattened state [B*HV, K, V]
+                    h0_source[(flat_idx, k_write, v_global_write)] = h_val
 
             cute.arch.barrier()
 
@@ -1527,9 +1533,10 @@ def run_gdn_decode_kernel_small_batch_nontranspose(
     use_qk_l2norm: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
-    pool_size, hv_dim, k_dim, v_dim = h0_source.layout.shape
-    n_indices = h0_indices.layout.shape[0]
-    batch_size = n_indices * hv_dim
+    # h0_source is flattened to [B*HV, K, V] to ensure proper alignment for SIMT async copy
+    batch_hv_dim, k_dim, v_dim = h0_source.layout.shape
+    h0_indices.layout.shape[0]
+    batch_size = batch_hv_dim  # batch_hv_dim = B * HV
 
     copy_atom = cute.make_copy_atom(
         cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
@@ -1607,9 +1614,10 @@ def run_gdn_decode_kernel_big_batch_nontranspose(
     use_qk_l2norm: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
-    pool_size, hv_dim, k_dim, v_dim = h0_source.layout.shape
-    n_indices = h0_indices.layout.shape[0]
-    batch_size = n_indices * hv_dim
+    # h0_source is flattened to [B*HV, K, V] to ensure proper alignment for SIMT async copy
+    batch_hv_dim, k_dim, v_dim = h0_source.layout.shape
+    h0_indices.layout.shape[0]
+    batch_size = batch_hv_dim  # batch_hv_dim = B * HV
 
     copy_atom = cute.make_copy_atom(
         cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
@@ -1761,9 +1769,11 @@ def gated_delta_rule_decode(
         # Kernel outputs bfloat16, allocate in that dtype first
         output = torch.zeros((B, T, HV, V), dtype=torch.bfloat16, device=q.device)
 
-    # State is already in K-major layout [B, HV, K, V]
-    # Use state directly as pooled view: pool_size=B, each batch is its own pool
-    h0_source = state.contiguous()
+    # State is in K-major layout [B, HV, K, V]
+    # Flatten to [B*HV, K, V] to ensure proper alignment for SIMT async copy
+    # This avoids alignment issues when B=1 (zero strides cause alignment failures)
+    state_contiguous = state.contiguous()
+    h0_source = state_contiguous.view(B * HV, K, V)
 
     # Compile kernel with TVM FFI (cached)
     cache_key = (B, T, H, HV, K, V, q.dtype, scale, use_qk_l2norm)
@@ -1850,9 +1860,9 @@ def gated_delta_rule_decode(
     )
 
     # Copy state back only if state was not contiguous
-    # (if contiguous, h0_source is state itself, so kernel updated state in-place)
-    if h0_source is not state:
-        state.copy_(h0_source)
+    # (if contiguous, state_contiguous is state itself, so kernel updated state in-place)
+    if state_contiguous.data_ptr() != state.data_ptr():
+        state.copy_(state_contiguous)
 
     # Convert output to target dtype if needed (kernel outputs bfloat16)
     if output.dtype != target_dtype:

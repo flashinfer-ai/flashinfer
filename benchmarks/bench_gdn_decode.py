@@ -18,18 +18,22 @@ limitations under the License.
 GDN Decode Benchmark
 
 This benchmark supports:
-1. FlashInfer-only benchmark (default)
-2. Comparison benchmark: FlashInfer (CuTe DSL) vs Triton kernel
+1. All layouts comparison (default for decode): FlashInfer/Triton x pretranspose/nontranspose
+2. Single layout comparison: FlashInfer (CuTe DSL) vs Triton kernel (--compare)
+3. MTP benchmark (--version mtp)
 
 Usage:
-    # FlashInfer-only decode benchmark
+    # Default: All layouts comparison (FlashInfer/Triton x pretranspose/nontranspose)
     python benchmarks/bench_gdn_decode.py --batch-size 1 4 8 16 32 64 128 256 512
 
-    # FlashInfer-only MTP benchmark
+    # Single layout comparison: FlashInfer vs Triton
+    python benchmarks/bench_gdn_decode.py --compare --batch-size 1 4 8 16 32 64 128 256 512
+
+    # MTP benchmark (FlashInfer only)
     python benchmarks/bench_gdn_decode.py --version mtp --batch-size 1 32 128
 
-    # Comparison: FlashInfer vs Triton
-    python benchmarks/bench_gdn_decode.py --compare --batch-size 1 4 8 16 32 64 128 256 512
+    # MTP comparison: FlashInfer vs Triton
+    python benchmarks/bench_gdn_decode.py --version mtp --compare --batch-size 1 32 128
 
     # Use Qwen3-Next preset
     python benchmarks/bench_gdn_decode.py --preset qwen3-next --batch-size 1 32 128 512
@@ -1792,6 +1796,281 @@ def verify_correctness_pretranspose(
 
 
 # ============================================================================
+# All Layouts Comparison Benchmark
+# ============================================================================
+
+
+def format_time(t):
+    """Format time value, returning 'N/A' if None."""
+    return f"{t:>8.2f}" if t is not None else "     N/A"
+
+
+def format_speedup(base, other):
+    """Calculate and format speedup."""
+    if base is None or other is None or base == 0:
+        return "    N/A"
+    return f"{other / base:>7.2f}x"
+
+
+def bench_all_layouts(
+    batch_size: int,
+    num_q_heads: int,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_size: int,
+    dtype: torch.dtype,
+    use_qk_l2norm: bool = True,
+    warmup_iters: int = 10,
+    bench_iters: int = 100,
+):
+    """Benchmark all 4 implementations: FlashInfer/Triton x pretranspose/nontranspose."""
+    num_o_heads = max(num_q_heads, num_v_heads)
+    num_sab_heads = num_o_heads
+
+    # Create inputs (T=1 for decode)
+    T = 1
+    q = torch.randn(batch_size, T, num_q_heads, head_size, dtype=dtype, device="cuda")
+    k = torch.randn(batch_size, T, num_k_heads, head_size, dtype=dtype, device="cuda")
+    v = torch.randn(batch_size, T, num_v_heads, head_size, dtype=dtype, device="cuda")
+
+    # GDN-specific parameters
+    A_log = torch.randn(num_sab_heads, dtype=torch.float32, device="cuda")
+    a = torch.randn(batch_size, T, num_sab_heads, dtype=dtype, device="cuda")
+    dt_bias = torch.randn(num_sab_heads, dtype=dtype, device="cuda")
+    b = torch.randn(batch_size, T, num_sab_heads, dtype=dtype, device="cuda")
+
+    scale = 1.0 / (head_size**0.5)
+
+    results = {"batch_size": batch_size}
+
+    # ========== FlashInfer Pretranspose ==========
+    state = torch.randn(
+        batch_size,
+        num_sab_heads,
+        head_size,
+        head_size,
+        dtype=torch.float32,
+        device="cuda",
+    )
+    output = torch.empty(
+        batch_size, T, num_o_heads, head_size, dtype=dtype, device="cuda"
+    )
+
+    try:
+        times = bench_gpu_time(
+            lambda: gated_delta_rule_decode_pretranspose(
+                q, k, v, state, A_log, a, dt_bias, b, scale, output, use_qk_l2norm
+            ),
+            enable_cupti=True,
+            dry_run_iters=warmup_iters,
+            repeat_iters=bench_iters,
+        )
+        results["fi_pretrans_us"] = np.median(times) * 1000
+    except Exception as e:
+        results["fi_pretrans_us"] = None
+        print(f"  FlashInfer pretranspose failed: {type(e).__name__}")
+
+    # ========== FlashInfer Nontranspose ==========
+    state = torch.randn(
+        batch_size,
+        num_sab_heads,
+        head_size,
+        head_size,
+        dtype=torch.float32,
+        device="cuda",
+    )
+    output = torch.empty(
+        batch_size, T, num_o_heads, head_size, dtype=dtype, device="cuda"
+    )
+
+    try:
+        times = bench_gpu_time(
+            lambda: gated_delta_rule_decode(
+                q, k, v, state, A_log, a, dt_bias, b, scale, output, use_qk_l2norm
+            ),
+            enable_cupti=True,
+            dry_run_iters=warmup_iters,
+            repeat_iters=bench_iters,
+        )
+        results["fi_nontrans_us"] = np.median(times) * 1000
+    except Exception as e:
+        results["fi_nontrans_us"] = None
+        print(f"  FlashInfer nontranspose failed: {type(e).__name__}")
+
+    # ========== Triton Pretranspose ==========
+    if TRITON_AVAILABLE:
+        state = torch.randn(
+            batch_size,
+            num_sab_heads,
+            head_size,
+            head_size,
+            dtype=torch.float32,
+            device="cuda",
+        )
+        output = torch.empty(
+            batch_size, T, num_o_heads, head_size, dtype=dtype, device="cuda"
+        )
+
+        try:
+            times = bench_gpu_time(
+                lambda: triton_gdn_decode_pretranspose(
+                    q, k, v, state, A_log, a, dt_bias, b, scale, output, use_qk_l2norm
+                ),
+                enable_cupti=True,
+                dry_run_iters=warmup_iters,
+                repeat_iters=bench_iters,
+            )
+            results["tr_pretrans_us"] = np.median(times) * 1000
+        except Exception as e:
+            results["tr_pretrans_us"] = None
+            print(f"  Triton pretranspose failed: {type(e).__name__}")
+
+        # ========== Triton Nontranspose ==========
+        state = torch.randn(
+            batch_size,
+            num_sab_heads,
+            head_size,
+            head_size,
+            dtype=torch.float32,
+            device="cuda",
+        )
+        output = torch.empty(
+            batch_size, T, num_o_heads, head_size, dtype=dtype, device="cuda"
+        )
+
+        try:
+            times = bench_gpu_time(
+                lambda: triton_gdn_decode(
+                    q, k, v, state, A_log, a, dt_bias, b, scale, output, use_qk_l2norm
+                ),
+                enable_cupti=True,
+                dry_run_iters=warmup_iters,
+                repeat_iters=bench_iters,
+            )
+            results["tr_nontrans_us"] = np.median(times) * 1000
+        except Exception as e:
+            results["tr_nontrans_us"] = None
+            print(f"  Triton nontranspose failed: {type(e).__name__}")
+    else:
+        results["tr_pretrans_us"] = None
+        results["tr_nontrans_us"] = None
+
+    return results
+
+
+def run_all_layouts_benchmark(args, dtype, use_qk_l2norm):
+    """Run benchmark comparing all layouts: FlashInfer/Triton x pretranspose/nontranspose."""
+    # Verify correctness first if requested
+    if args.verify and TRITON_AVAILABLE:
+        print("\n=== Correctness Verification ===")
+        for batch_size in [8, 16, 32, 64]:
+            print(f"Batch={batch_size}:")
+            # Pretranspose
+            try:
+                passed = verify_correctness_pretranspose(
+                    batch_size=batch_size,
+                    num_q_heads=args.num_q_heads,
+                    num_k_heads=args.num_k_heads,
+                    num_v_heads=args.num_v_heads,
+                    head_size=args.head_size,
+                    dtype=dtype,
+                    use_qk_l2norm=use_qk_l2norm,
+                )
+                print(f"  Pretranspose: {'PASS' if passed else 'FAIL'}")
+            except Exception as e:
+                print(f"  Pretranspose: ERROR - {type(e).__name__}")
+            # Nontranspose
+            try:
+                passed = verify_correctness(
+                    batch_size=batch_size,
+                    num_q_heads=args.num_q_heads,
+                    num_k_heads=args.num_k_heads,
+                    num_v_heads=args.num_v_heads,
+                    head_size=args.head_size,
+                    dtype=dtype,
+                    use_qk_l2norm=use_qk_l2norm,
+                )
+                print(f"  Nontranspose: {'PASS' if passed else 'FAIL'}")
+            except Exception as e:
+                print(f"  Nontranspose: ERROR - {type(e).__name__}")
+        print()
+
+    print("\n" + "=" * 120)
+    print("GDN Decode Benchmark: FlashInfer vs Triton, Pretranspose vs Nontranspose")
+    print(
+        f"Config: q_heads={args.num_q_heads}, k_heads={args.num_k_heads}, "
+        f"v_heads={args.num_v_heads}, head_size={args.head_size}, "
+        f"dtype={args.dtype}, qk_l2norm={'ON' if use_qk_l2norm else 'OFF'}"
+    )
+    print("=" * 120)
+    print()
+    print(
+        f"{'batch':>6} | {'FI-PreTr':>8} {'FI-NonTr':>8} | {'TR-PreTr':>8} {'TR-NonTr':>8} | "
+        f"{'FI/TR-Pre':>9} {'FI/TR-Non':>9} | {'Pre/Non-FI':>10} {'Pre/Non-TR':>10}"
+    )
+    print(
+        f"{'':>6} | {'(us)':>8} {'(us)':>8} | {'(us)':>8} {'(us)':>8} | "
+        f"{'speedup':>9} {'speedup':>9} | {'speedup':>10} {'speedup':>10}"
+    )
+    print("-" * 120)
+
+    all_results = []
+    for batch_size in args.batch_size:
+        result = bench_all_layouts(
+            batch_size=batch_size,
+            num_q_heads=args.num_q_heads,
+            num_k_heads=args.num_k_heads,
+            num_v_heads=args.num_v_heads,
+            head_size=args.head_size,
+            dtype=dtype,
+            use_qk_l2norm=use_qk_l2norm,
+            warmup_iters=args.warmup,
+            bench_iters=args.iters,
+        )
+        all_results.append(result)
+
+        fi_pre = result.get("fi_pretrans_us")
+        fi_non = result.get("fi_nontrans_us")
+        tr_pre = result.get("tr_pretrans_us")
+        tr_non = result.get("tr_nontrans_us")
+
+        # FI/TR speedup (>1 means FI faster)
+        fi_tr_pre = format_speedup(fi_pre, tr_pre)
+        fi_tr_non = format_speedup(fi_non, tr_non)
+
+        # Pre/Non speedup (>1 means pretranspose faster)
+        pre_non_fi = format_speedup(fi_pre, fi_non)
+        pre_non_tr = format_speedup(tr_pre, tr_non)
+
+        print(
+            f"{batch_size:>6} | {format_time(fi_pre)} {format_time(fi_non)} | "
+            f"{format_time(tr_pre)} {format_time(tr_non)} | "
+            f"{fi_tr_pre} {fi_tr_non} | {pre_non_fi} {pre_non_tr}"
+        )
+
+    print("-" * 120)
+    print()
+    print("Legend:")
+    print("  FI-PreTr  = FlashInfer Pretranspose [B, HV, V, K]")
+    print("  FI-NonTr  = FlashInfer Nontranspose [B, HV, K, V]")
+    print("  TR-PreTr  = Triton Pretranspose [B, HV, V, K]")
+    print("  TR-NonTr  = Triton Nontranspose [B, HV, K, V]")
+    print("  FI/TR speedup > 1.0 means FlashInfer is faster than Triton")
+    print("  Pre/Non speedup > 1.0 means Pretranspose is faster than Nontranspose")
+    print()
+
+    # Summary statistics
+    fi_pre_times = [r["fi_pretrans_us"] for r in all_results if r.get("fi_pretrans_us")]
+    tr_pre_times = [r["tr_pretrans_us"] for r in all_results if r.get("tr_pretrans_us")]
+
+    if fi_pre_times and tr_pre_times:
+        speedups = [tr / fi for fi, tr in zip(fi_pre_times, tr_pre_times, strict=False)]
+        print(
+            f"FlashInfer vs Triton (Pretranspose) - Average speedup: {np.mean(speedups):.2f}x"
+        )
+
+
+# ============================================================================
 # Main Entry Points
 # ============================================================================
 
@@ -2078,20 +2357,20 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # FlashInfer-only decode benchmark
+  # Default: All layouts comparison (FlashInfer/Triton x pretranspose/nontranspose)
   python benchmarks/bench_gdn_decode.py --batch-size 1 4 8 16 32 64 128 256 512
 
-  # FlashInfer-only MTP benchmark
-  python benchmarks/bench_gdn_decode.py --version mtp --batch-size 1 32 128
-
-  # Comparison: FlashInfer vs Triton
+  # Single layout comparison: FlashInfer vs Triton (nontranspose)
   python benchmarks/bench_gdn_decode.py --compare --batch-size 1 4 8 16 32 64 128 256 512
 
-  # Comparison with verification
-  python benchmarks/bench_gdn_decode.py --compare --verify --batch-size 1 4 8 16 32 64 128 256 512
+  # Single layout comparison: FlashInfer vs Triton (pretranspose)
+  python benchmarks/bench_gdn_decode.py --compare --version pretranspose --batch-size 1 4 8 16 32 64 128 256 512
 
-  # MTP comparison with verification
-  python benchmarks/bench_gdn_decode.py --compare --version mtp --verify --batch-size 1 32 128
+  # MTP benchmark (FlashInfer only)
+  python benchmarks/bench_gdn_decode.py --version mtp --batch-size 1 32 128
+
+  # MTP comparison: FlashInfer vs Triton
+  python benchmarks/bench_gdn_decode.py --version mtp --compare --batch-size 1 32 128
 """,
     )
     parser.add_argument(
@@ -2181,10 +2460,15 @@ Examples:
     dtype = getattr(torch, args.dtype)
     use_qk_l2norm = not args.no_qk_l2norm
 
-    if args.compare:
-        run_comparison_benchmark(args, dtype, use_qk_l2norm)
+    if args.version == "mtp":
+        # MTP mode: use comparison or flashinfer-only
+        if args.compare:
+            run_comparison_benchmark(args, dtype, use_qk_l2norm)
+        else:
+            run_flashinfer_only_benchmark(args, dtype, use_qk_l2norm)
     else:
-        run_flashinfer_only_benchmark(args, dtype, use_qk_l2norm)
+        # Non-MTP: always run all layouts comparison (FlashInfer/Triton x pretranspose/nontranspose)
+        run_all_layouts_benchmark(args, dtype, use_qk_l2norm)
 
 
 if __name__ == "__main__":
