@@ -30,798 +30,55 @@ The residual tensor is modified in-place to contain the fused value (input + res
 """
 
 import functools
-import math
-import operator
 from typing import Callable, Tuple, Union
 
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import Float32, Int32, Int64, Uint32, Uint64, Uint8
-from cutlass.cutlass_dsl import T, dsl_user_op
-from cutlass._mlir.dialects import llvm
+from cutlass import Float32, Int32, Int64, Uint32, Uint8
 
 from ..api_logging import flashinfer_api
-
-# =============================================================================
-# Constants
-# =============================================================================
-
-FLOAT4_E2M1_MAX = 6.0
-FLOAT8_E4M3_MAX = 448.0
-SF_VEC_SIZE = 16
-COPY_BITS = 128
-
-
-# =============================================================================
-# Architecture Detection
-# =============================================================================
-
-
-@functools.lru_cache(maxsize=16)
-def get_sm_version(device: int | torch.device | str | None = None) -> int:
-    """Get the SM version of a CUDA device.
-
-    Args:
-        device: CUDA device to query. Can be an int (device index), torch.device,
-            device string (e.g., 'cuda:0'), or None to use current device.
-
-    Returns:
-        SM version as an integer (e.g., 100 for SM100).
-    """
-    if not torch.cuda.is_available():
-        return 80
-    if device is None:
-        device = torch.cuda.current_device()
-    props = torch.cuda.get_device_properties(device)
-    return props.major * 10 + props.minor
-
-
-# =============================================================================
-# PTX Intrinsics - Cluster Operations
-# =============================================================================
-
-
-@dsl_user_op
-def set_block_rank(
-    smem_ptr: cute.Pointer, peer_cta_rank_in_cluster: Int32, *, loc=None, ip=None
-) -> Int32:
-    """Map smem pointer to address at another CTA rank in the cluster."""
-    smem_ptr_i32 = smem_ptr.toint(loc=loc, ip=ip).ir_value()
-    return Int32(
-        llvm.inline_asm(
-            T.i32(),
-            [smem_ptr_i32, peer_cta_rank_in_cluster.ir_value()],
-            "mapa.shared::cluster.u32 $0, $1, $2;",
-            "=r,r,r",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
-@dsl_user_op
-def store_shared_remote(
-    val: Float32,
-    smem_ptr: cute.Pointer,
-    mbar_ptr: cute.Pointer,
-    peer_cta_rank_in_cluster: Int32,
-    *,
-    loc=None,
-    ip=None,
-) -> None:
-    """Store Float32 value to shared memory on a remote CTA in the cluster."""
-    remote_smem_ptr_i32 = set_block_rank(
-        smem_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip
-    ).ir_value()
-    remote_mbar_ptr_i32 = set_block_rank(
-        mbar_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip
-    ).ir_value()
-    llvm.inline_asm(
-        None,
-        [remote_smem_ptr_i32, val.ir_value(loc=loc, ip=ip), remote_mbar_ptr_i32],
-        "st.async.shared::cluster.mbarrier::complete_tx::bytes.f32 [$0], $1, [$2];",
-        "r,f,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
-
-
-@dsl_user_op
-def elem_pointer(x: cute.Tensor, coord, *, loc=None, ip=None) -> cute.Pointer:
-    """Get pointer to element at coordinate in tensor."""
-    return x.iterator + cute.crd2idx(coord, x.layout, loc=loc, ip=ip)
-
-
-# =============================================================================
-# PTX Intrinsics - Basic Operations
-# =============================================================================
-
-
-@dsl_user_op
-def st_global_u64(base_ptr: Int64, value: Uint64, *, loc=None, ip=None):
-    """Store 64 bits to global memory."""
-    llvm.inline_asm(
-        None,
-        [
-            Int64(base_ptr).ir_value(loc=loc, ip=ip),
-            Uint64(value).ir_value(loc=loc, ip=ip),
-        ],
-        "st.global.u64 [$0], $1;",
-        "l,l",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
-
-
-@dsl_user_op
-def get_ptr_as_int64(tensor: cute.Tensor, offset: Int32, *, loc=None, ip=None) -> Int64:
-    """Get the memory address of tensor[offset] as Int64."""
-    elem_ptr = tensor.iterator + Int32(offset)
-    ptr_int = llvm.ptrtoint(T.i64(), elem_ptr.llvm_ptr, loc=loc, ip=ip)
-    return Int64(ptr_int)
-
-
-@dsl_user_op
-def rcp_approx_ftz(a: Float32, *, loc=None, ip=None) -> Float32:
-    """Fast reciprocal using PTX rcp.approx.ftz.f32."""
-    return Float32(
-        llvm.inline_asm(
-            T.f32(),
-            [Float32(a).ir_value(loc=loc, ip=ip)],
-            "rcp.approx.ftz.f32 $0, $1;",
-            "=f,f",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
-@dsl_user_op
-def fabs_f32(val: Float32, *, loc=None, ip=None) -> Float32:
-    """Compute absolute value of float32."""
-    return Float32(
-        llvm.inline_asm(
-            T.f32(),
-            [Float32(val).ir_value(loc=loc, ip=ip)],
-            "abs.f32 $0, $1;",
-            "=f,f",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
-@dsl_user_op
-def fmax_f32(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
-    """Compute max of two float32 values."""
-    return Float32(
-        llvm.inline_asm(
-            T.f32(),
-            [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
-            "max.f32 $0, $1, $2;",
-            "=f,f,f",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
-@dsl_user_op
-def fmin_f32(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
-    """Compute min of two float32 values (branchless clamping)."""
-    return Float32(
-        llvm.inline_asm(
-            T.f32(),
-            [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
-            "min.f32 $0, $1, $2;",
-            "=f,f,f",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
-@dsl_user_op
-def ld_global_v4_u32(
-    base_ptr: Int64, *, loc=None, ip=None
-) -> Tuple[Uint32, Uint32, Uint32, Uint32]:
-    """Load 128 bits (4 x uint32) from global memory."""
-    result = llvm.inline_asm(
-        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
-        [Int64(base_ptr).ir_value(loc=loc, ip=ip)],
-        "ld.global.v4.u32 {$0, $1, $2, $3}, [$4];",
-        "=r,=r,=r,=r,l",
-        has_side_effects=False,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-
-    v0 = llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)
-    v1 = llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)
-    v2 = llvm.extractvalue(T.i32(), result, [2], loc=loc, ip=ip)
-    v3 = llvm.extractvalue(T.i32(), result, [3], loc=loc, ip=ip)
-
-    return Uint32(v0), Uint32(v1), Uint32(v2), Uint32(v3)
-
-
-# =============================================================================
-# FP8 E4M3 and UE8M0 Intrinsics
-# =============================================================================
-
-
-@dsl_user_op
-def cvt_f32_to_e4m3(val: Float32, *, loc=None, ip=None) -> Uint32:
-    """Convert float32 to FP8 E4M3."""
-    return Uint32(
-        llvm.inline_asm(
-            T.i32(),
-            [Float32(val).ir_value(loc=loc, ip=ip)],
-            """
-            {
-                .reg .b16 fp8_pair;
-                .reg .f32 zero;
-                mov.f32 zero, 0f00000000;
-                cvt.rn.satfinite.e4m3x2.f32 fp8_pair, zero, $1;
-                cvt.u32.u16 $0, fp8_pair;
-            }
-            """,
-            "=r,f",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
-@dsl_user_op
-def fp8_e4m3_to_f32_and_rcp(fp8_val: Uint32, *, loc=None, ip=None) -> Float32:
-    """Convert FP8 E4M3 to float32 and compute reciprocal."""
-    return Float32(
-        llvm.inline_asm(
-            T.f32(),
-            [Uint32(fp8_val).ir_value(loc=loc, ip=ip)],
-            """
-            {
-                .reg .pred p_zero;
-                .reg .u32 exp_u, mant_u;
-                .reg .s32 exp_s;
-                .reg .f32 exp_f, mant_f, fp8_float, result;
-                setp.eq.u32 p_zero, $1, 0;
-                and.b32 mant_u, $1, 7;
-                shr.b32 exp_u, $1, 3;
-                and.b32 exp_u, exp_u, 15;
-                sub.s32 exp_s, exp_u, 7;
-                cvt.rn.f32.s32 exp_f, exp_s;
-                ex2.approx.f32 exp_f, exp_f;
-                cvt.rn.f32.u32 mant_f, mant_u;
-                fma.rn.f32 mant_f, mant_f, 0f3E000000, 0f3F800000;
-                mul.f32 fp8_float, exp_f, mant_f;
-                rcp.approx.ftz.f32 result, fp8_float;
-                selp.f32 $0, 0f00000000, result, p_zero;
-            }
-            """,
-            "=f,r",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
-@dsl_user_op
-def cvt_f32_to_ue8m0(max_val: Float32, *, loc=None, ip=None) -> Uint32:
-    """Convert float32 max value to UE8M0 scale factor."""
-    return Uint32(
-        llvm.inline_asm(
-            T.i32(),
-            [Float32(max_val).ir_value(loc=loc, ip=ip)],
-            """
-            {
-                .reg .pred p_zero, p_neg, p_ovf;
-                .reg .f32 log2_val;
-                .reg .s32 exp_int, result;
-                setp.le.f32 p_zero, $1, 0f00000000;
-                lg2.approx.f32 log2_val, $1;
-                cvt.rpi.s32.f32 exp_int, log2_val;
-                add.s32 result, exp_int, 127;
-                setp.lt.s32 p_neg, result, 0;
-                setp.gt.s32 p_ovf, result, 255;
-                selp.s32 result, 0, result, p_neg;
-                selp.s32 result, 255, result, p_ovf;
-                selp.s32 $0, 0, result, p_zero;
-            }
-            """,
-            "=r,f",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
-@dsl_user_op
-def ue8m0_to_output_scale(ue8m0_val: Uint32, *, loc=None, ip=None) -> Float32:
-    """Convert UE8M0 to output_scale (1 / 2^(ue8m0 - 127))."""
-    return Float32(
-        llvm.inline_asm(
-            T.f32(),
-            [Uint32(ue8m0_val).ir_value(loc=loc, ip=ip)],
-            """
-            {
-                .reg .pred p_zero;
-                .reg .s32 neg_exp;
-                .reg .f32 neg_exp_f, result;
-                setp.eq.u32 p_zero, $1, 0;
-                sub.s32 neg_exp, 127, $1;
-                cvt.rn.f32.s32 neg_exp_f, neg_exp;
-                ex2.approx.f32 result, neg_exp_f;
-                selp.f32 $0, 0f00000000, result, p_zero;
-            }
-            """,
-            "=f,r",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
-# =============================================================================
-# Half2 SIMD Intrinsics
-# =============================================================================
-
-
-@dsl_user_op
-def half2_mul(a: Uint32, b: Uint32, *, loc=None, ip=None) -> Uint32:
-    """Multiply two Half2 values element-wise."""
-    return Uint32(
-        llvm.inline_asm(
-            T.i32(),
-            [Uint32(a).ir_value(loc=loc, ip=ip), Uint32(b).ir_value(loc=loc, ip=ip)],
-            "mul.f16x2 $0, $1, $2;",
-            "=r,r,r",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
-@dsl_user_op
-def bfloat2_mul(a: Uint32, b: Uint32, *, loc=None, ip=None) -> Uint32:
-    """Multiply two BFloat2 values element-wise."""
-    return Uint32(
-        llvm.inline_asm(
-            T.i32(),
-            [Uint32(a).ir_value(loc=loc, ip=ip), Uint32(b).ir_value(loc=loc, ip=ip)],
-            "mul.bf16x2 $0, $1, $2;",
-            "=r,r,r",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
-@dsl_user_op
-def habs2(x: Uint32, *, loc=None, ip=None) -> Uint32:
-    """Half2 absolute value."""
-    return Uint32(
-        llvm.inline_asm(
-            T.i32(),
-            [Uint32(x).ir_value(loc=loc, ip=ip)],
-            "and.b32 $0, $1, 0x7FFF7FFF;",
-            "=r,r",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
-@dsl_user_op
-def hmax2(a: Uint32, b: Uint32, *, loc=None, ip=None) -> Uint32:
-    """Half2 max - element-wise max of 2 fp16 pairs."""
-    return Uint32(
-        llvm.inline_asm(
-            T.i32(),
-            [Uint32(a).ir_value(loc=loc, ip=ip), Uint32(b).ir_value(loc=loc, ip=ip)],
-            "max.f16x2 $0, $1, $2;",
-            "=r,r,r",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
-@dsl_user_op
-def hmax_to_f32(x: Uint32, *, loc=None, ip=None) -> Float32:
-    """Extract max of 2 fp16 values in half2 as float32."""
-    return Float32(
-        llvm.inline_asm(
-            T.f32(),
-            [Uint32(x).ir_value(loc=loc, ip=ip)],
-            """
-            {
-                .reg .b16 h0, h1;
-                .reg .f32 f0, f1;
-                mov.b32 {h0, h1}, $1;
-                cvt.f32.f16 f0, h0;
-                cvt.f32.f16 f1, h1;
-                max.f32 $0, f0, f1;
-            }
-            """,
-            "=f,r",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
-@dsl_user_op
-def bfloat2_habs2(x: Uint32, *, loc=None, ip=None) -> Uint32:
-    """BFloat16x2 absolute value."""
-    return Uint32(
-        llvm.inline_asm(
-            T.i32(),
-            [Uint32(x).ir_value(loc=loc, ip=ip)],
-            "and.b32 $0, $1, 0x7FFF7FFF;",
-            "=r,r",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
-@dsl_user_op
-def bfloat2_hmax2(a: Uint32, b: Uint32, *, loc=None, ip=None) -> Uint32:
-    """BFloat16x2 max."""
-    return Uint32(
-        llvm.inline_asm(
-            T.i32(),
-            [Uint32(a).ir_value(loc=loc, ip=ip), Uint32(b).ir_value(loc=loc, ip=ip)],
-            "max.bf16x2 $0, $1, $2;",
-            "=r,r,r",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
-@dsl_user_op
-def bfloat2_hmax_to_f32(x: Uint32, *, loc=None, ip=None) -> Float32:
-    """Extract max of 2 bf16 values as float32."""
-    return Float32(
-        llvm.inline_asm(
-            T.f32(),
-            [Uint32(x).ir_value(loc=loc, ip=ip)],
-            """
-            {
-                .reg .b32 lo, hi;
-                .reg .f32 f0, f1;
-                and.b32 lo, $1, 0xFFFF;
-                shr.b32 hi, $1, 16;
-                shl.b32 lo, lo, 16;
-                shl.b32 hi, hi, 16;
-                mov.b32 f0, lo;
-                mov.b32 f1, hi;
-                max.f32 $0, f0, f1;
-            }
-            """,
-            "=f,r",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
-@dsl_user_op
-def half2_to_float2_scaled(
-    h2: Uint32, scale: Float32, *, loc=None, ip=None
-) -> Tuple[Float32, Float32]:
-    """Convert half2 to float2 and multiply by scale."""
-    result = llvm.inline_asm(
-        llvm.StructType.get_literal([T.f32(), T.f32()]),
-        [Uint32(h2).ir_value(loc=loc, ip=ip), Float32(scale).ir_value(loc=loc, ip=ip)],
-        """
-        {
-            .reg .b16 h0, h1;
-            .reg .f32 f0, f1;
-            mov.b32 {h0, h1}, $2;
-            cvt.f32.f16 f0, h0;
-            cvt.f32.f16 f1, h1;
-            mul.f32 $0, f0, $3;
-            mul.f32 $1, f1, $3;
-        }
-        """,
-        "=f,=f,r,f",
-        has_side_effects=False,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-
-    f0 = llvm.extractvalue(T.f32(), result, [0], loc=loc, ip=ip)
-    f1 = llvm.extractvalue(T.f32(), result, [1], loc=loc, ip=ip)
-
-    return Float32(f0), Float32(f1)
-
-
-@dsl_user_op
-def bfloat2_to_float2_scaled(
-    bf2: Uint32, scale: Float32, *, loc=None, ip=None
-) -> Tuple[Float32, Float32]:
-    """Convert bfloat16x2 to float2 and multiply by scale."""
-    result = llvm.inline_asm(
-        llvm.StructType.get_literal([T.f32(), T.f32()]),
-        [Uint32(bf2).ir_value(loc=loc, ip=ip), Float32(scale).ir_value(loc=loc, ip=ip)],
-        """
-        {
-            .reg .b32 lo, hi;
-            .reg .f32 f0, f1;
-            and.b32 lo, $2, 0xFFFF;
-            shr.b32 hi, $2, 16;
-            shl.b32 lo, lo, 16;
-            shl.b32 hi, hi, 16;
-            mov.b32 f0, lo;
-            mov.b32 f1, hi;
-            mul.f32 $0, f0, $3;
-            mul.f32 $1, f1, $3;
-        }
-        """,
-        "=f,=f,r,f",
-        has_side_effects=False,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-
-    f0 = llvm.extractvalue(T.f32(), result, [0], loc=loc, ip=ip)
-    f1 = llvm.extractvalue(T.f32(), result, [1], loc=loc, ip=ip)
-
-    return Float32(f0), Float32(f1)
-
-
-@dsl_user_op
-def hadd2(a: Uint32, b: Uint32, *, loc=None, ip=None) -> Uint32:
-    """Add two Half2 values element-wise."""
-    return Uint32(
-        llvm.inline_asm(
-            T.i32(),
-            [Uint32(a).ir_value(loc=loc, ip=ip), Uint32(b).ir_value(loc=loc, ip=ip)],
-            "add.f16x2 $0, $1, $2;",
-            "=r,r,r",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
-@dsl_user_op
-def bfloat2_add(a: Uint32, b: Uint32, *, loc=None, ip=None) -> Uint32:
-    """Add two BFloat2 values element-wise."""
-    return Uint32(
-        llvm.inline_asm(
-            T.i32(),
-            [Uint32(a).ir_value(loc=loc, ip=ip), Uint32(b).ir_value(loc=loc, ip=ip)],
-            "add.bf16x2 $0, $1, $2;",
-            "=r,r,r",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
-@dsl_user_op
-def cvt_e2m1x8_f32(
-    v0: Float32,
-    v1: Float32,
-    v2: Float32,
-    v3: Float32,
-    v4: Float32,
-    v5: Float32,
-    v6: Float32,
-    v7: Float32,
-    *,
-    loc=None,
-    ip=None,
-) -> Uint32:
-    """Convert eight float32 values to eight E2M1 (4-bit) values packed into uint32."""
-    return Uint32(
-        llvm.inline_asm(
-            T.i32(),
-            [
-                Float32(v0).ir_value(loc=loc, ip=ip),
-                Float32(v1).ir_value(loc=loc, ip=ip),
-                Float32(v2).ir_value(loc=loc, ip=ip),
-                Float32(v3).ir_value(loc=loc, ip=ip),
-                Float32(v4).ir_value(loc=loc, ip=ip),
-                Float32(v5).ir_value(loc=loc, ip=ip),
-                Float32(v6).ir_value(loc=loc, ip=ip),
-                Float32(v7).ir_value(loc=loc, ip=ip),
-            ],
-            """
-            {
-                .reg .b8 byte0, byte1, byte2, byte3;
-                cvt.rn.satfinite.e2m1x2.f32 byte0, $2, $1;
-                cvt.rn.satfinite.e2m1x2.f32 byte1, $4, $3;
-                cvt.rn.satfinite.e2m1x2.f32 byte2, $6, $5;
-                cvt.rn.satfinite.e2m1x2.f32 byte3, $8, $7;
-                mov.b32 $0, {byte0, byte1, byte2, byte3};
-            }
-            """,
-            "=r,f,f,f,f,f,f,f,f",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
-# =============================================================================
-# Warp, Block, and Cluster Reduction Utilities
-# =============================================================================
-
-
-@cute.jit
-def warp_reduce(val, op, width: cutlass.Constexpr[int] = 32):
-    """Reduce across threads in a warp using butterfly shuffle."""
-    if cutlass.const_expr(isinstance(val, cute.TensorSSA)):
-        res = cute.make_rmem_tensor(val.shape, val.dtype)
-        res.store(val)
-        for i in cutlass.range_constexpr(cute.size(val.shape)):
-            res[i] = warp_reduce(res[i], op, width)
-        return res.load()
-    else:
-        for i in cutlass.range_constexpr(int(math.log2(width))):
-            val = op(val, cute.arch.shuffle_sync_bfly(val, offset=1 << i))
-        return val
-
-
-@cute.jit
-def block_reduce(
-    val: Float32,
-    op: Callable,
-    reduction_buffer: cute.Tensor,
-    init_val: Float32,
-) -> Float32:
-    """Block reduction across multiple warps using shared memory."""
-    lane_idx = cute.arch.lane_idx()
-    warp_idx = cute.arch.warp_idx()
-    warps_per_row = cute.size(reduction_buffer.shape[1])
-    row_idx = warp_idx // warps_per_row
-    col_idx = warp_idx % warps_per_row
-
-    if lane_idx == 0:
-        reduction_buffer[row_idx, col_idx] = val
-    cute.arch.barrier()
-
-    block_reduce_val = init_val
-    if lane_idx < warps_per_row:
-        block_reduce_val = reduction_buffer[row_idx, lane_idx]
-    return warp_reduce(block_reduce_val, op)
-
-
-@cute.jit
-def cluster_reduce(
-    val: Float32,
-    op: Callable,
-    reduction_buffer: cute.Tensor,
-    mbar_ptr: cute.Pointer,
-    cluster_n: cutlass.Constexpr[int],
-    init_val: Float32,
-) -> Float32:
-    """Cluster reduction across multiple CTAs using mbarrier."""
-    cta_rank_in_cluster = cute.arch.block_idx_in_cluster()
-    lane_idx = cute.arch.lane_idx()
-    warp_idx = cute.arch.warp_idx()
-
-    rows_per_block = reduction_buffer.shape[0]
-    warps_per_row = reduction_buffer.shape[1][0]
-
-    row_idx = warp_idx // warps_per_row
-    col_idx = warp_idx % warps_per_row
-
-    if warp_idx == 0:
-        with cute.arch.elect_one():
-            num_warps = rows_per_block * warps_per_row
-            expected_bytes = num_warps * cluster_n * 4
-            cute.arch.mbarrier_arrive_and_expect_tx(mbar_ptr, expected_bytes)
-
-    if lane_idx < cluster_n:
-        store_shared_remote(
-            val,
-            elem_pointer(reduction_buffer, (row_idx, (col_idx, cta_rank_in_cluster))),
-            mbar_ptr,
-            peer_cta_rank_in_cluster=lane_idx,
-        )
-
-    cute.arch.mbarrier_wait(mbar_ptr, phase=0)
-
-    num_total = warps_per_row * cluster_n
-    num_iter = cute.ceil_div(num_total, 32)
-
-    block_reduce_val = init_val
-    for i in cutlass.range_constexpr(num_iter):
-        idx = lane_idx + i * 32
-        if idx < num_total:
-            block_reduce_val = op(block_reduce_val, reduction_buffer[row_idx, idx])
-
-    return warp_reduce(block_reduce_val, op)
-
-
-@cute.jit
-def row_reduce(
-    x: cute.TensorSSA,
-    op: cute.ReductionOp,
-    threads_per_row: cutlass.Constexpr[int],
-    reduction_buffer: cute.Tensor,
-    mbar_ptr,
-    cluster_n: cutlass.Constexpr[int],
-    init_val: Float32,
-):
-    """Row reduction with optional cluster support."""
-    local_val = x.reduce(op, init_val=init_val, reduction_profile=0)
-
-    warp_op = {
-        cute.ReductionOp.ADD: operator.add,
-        cute.ReductionOp.MAX: cute.arch.fmax,
-    }[op]
-    warp_width = min(threads_per_row, 32)
-    warp_val = warp_reduce(local_val, warp_op, width=warp_width)
-
-    warps_per_row = max(threads_per_row // 32, 1)
-
-    if cutlass.const_expr(warps_per_row > 1 or cluster_n > 1):
-        if cutlass.const_expr(cluster_n == 1):
-            return block_reduce(warp_val, warp_op, reduction_buffer, init_val)
-        else:
-            return cluster_reduce(
-                warp_val, warp_op, reduction_buffer, mbar_ptr, cluster_n, init_val
-            )
-    else:
-        return warp_val
-
-
-@cute.jit
-def predicate_k(tXcX: cute.Tensor, limit: int) -> cute.Tensor:
-    """Create predicate tensor for bounds checking."""
-    tXpX = cute.make_rmem_tensor(
-        cute.make_layout(
-            (
-                cute.size(tXcX, mode=[0, 1]),
-                cute.size(tXcX, mode=[1]),
-                cute.size(tXcX, mode=[2]),
-            ),
-            stride=(cute.size(tXcX, mode=[2]), 0, 1),
-        ),
-        cutlass.Boolean,
-    )
-    for rest_v in cutlass.range_constexpr(tXpX.shape[0]):
-        for rest_k in cutlass.range_constexpr(tXpX.shape[2]):
-            tXpX[rest_v, 0, rest_k] = cute.elem_less(
-                tXcX[(0, rest_v), 0, rest_k][1], limit
-            )
-    return tXpX
+from .fp4_common import (
+    # Constants
+    FLOAT4_E2M1_MAX,
+    FLOAT8_E4M3_MAX,
+    COPY_BITS,
+    # Architecture detection
+    get_sm_version,
+    # PTX intrinsics - basic ops
+    st_global_u64,
+    get_ptr_as_int64,
+    rcp_approx_ftz,
+    fmin_f32,
+    fmax_f32,
+    # Half2 SIMD intrinsics
+    hmax2,
+    hmax_to_f32,
+    # BFloat2 SIMD intrinsics
+    bfloat2_hmax2,
+    bfloat2_hmax_to_f32,
+    # FP8 and FP4 conversion
+    cvt_f32_to_e4m3,
+    fp8_e4m3_to_f32_and_rcp,
+    cvt_f32_to_ue8m0,
+    ue8m0_to_output_scale,
+    # Reduction utilities
+    row_reduce,
+    # Predicate utility
+    predicate_k,
+    # Helper functions for SF block processing
+    load_8_half2,
+    half2_mul_8,
+    bfloat2_mul_8,
+    half2_max_abs_8,
+    bfloat2_max_abs_8,
+    half2_to_float16,
+    bfloat2_to_float16,
+    quantize_and_pack_16,
+    # Helper functions for Float32 shared memory processing
+    load_f32_16_from_smem,
+    compute_y_and_max_abs_f32,
+)
 
 
 # =============================================================================
@@ -1295,91 +552,26 @@ class AddRMSNormFP4QuantKernel:
 
                     if cutlass.const_expr(block_size == 16):
                         if cutlass.const_expr(cluster_n == 1):
-                            # Shared memory path
-                            sh0 = Float32(sH[row_in_block, block_start + 0])
-                            sh1 = Float32(sH[row_in_block, block_start + 1])
-                            sh2 = Float32(sH[row_in_block, block_start + 2])
-                            sh3 = Float32(sH[row_in_block, block_start + 3])
-                            sh4 = Float32(sH[row_in_block, block_start + 4])
-                            sh5 = Float32(sH[row_in_block, block_start + 5])
-                            sh6 = Float32(sH[row_in_block, block_start + 6])
-                            sh7 = Float32(sH[row_in_block, block_start + 7])
-                            sh8 = Float32(sH[row_in_block, block_start + 8])
-                            sh9 = Float32(sH[row_in_block, block_start + 9])
-                            sh10 = Float32(sH[row_in_block, block_start + 10])
-                            sh11 = Float32(sH[row_in_block, block_start + 11])
-                            sh12 = Float32(sH[row_in_block, block_start + 12])
-                            sh13 = Float32(sH[row_in_block, block_start + 13])
-                            sh14 = Float32(sH[row_in_block, block_start + 14])
-                            sh15 = Float32(sH[row_in_block, block_start + 15])
-
-                            sw0 = Float32(sW[row_in_block, block_start + 0])
-                            sw1 = Float32(sW[row_in_block, block_start + 1])
-                            sw2 = Float32(sW[row_in_block, block_start + 2])
-                            sw3 = Float32(sW[row_in_block, block_start + 3])
-                            sw4 = Float32(sW[row_in_block, block_start + 4])
-                            sw5 = Float32(sW[row_in_block, block_start + 5])
-                            sw6 = Float32(sW[row_in_block, block_start + 6])
-                            sw7 = Float32(sW[row_in_block, block_start + 7])
-                            sw8 = Float32(sW[row_in_block, block_start + 8])
-                            sw9 = Float32(sW[row_in_block, block_start + 9])
-                            sw10 = Float32(sW[row_in_block, block_start + 10])
-                            sw11 = Float32(sW[row_in_block, block_start + 11])
-                            sw12 = Float32(sW[row_in_block, block_start + 12])
-                            sw13 = Float32(sW[row_in_block, block_start + 13])
-                            sw14 = Float32(sW[row_in_block, block_start + 14])
-                            sw15 = Float32(sW[row_in_block, block_start + 15])
-
-                            y0 = sh0 * rstd * sw0
-                            y1 = sh1 * rstd * sw1
-                            y2 = sh2 * rstd * sw2
-                            y3 = sh3 * rstd * sw3
-                            y4 = sh4 * rstd * sw4
-                            y5 = sh5 * rstd * sw5
-                            y6 = sh6 * rstd * sw6
-                            y7 = sh7 * rstd * sw7
-                            y8 = sh8 * rstd * sw8
-                            y9 = sh9 * rstd * sw9
-                            y10 = sh10 * rstd * sw10
-                            y11 = sh11 * rstd * sw11
-                            y12 = sh12 * rstd * sw12
-                            y13 = sh13 * rstd * sw13
-                            y14 = sh14 * rstd * sw14
-                            y15 = sh15 * rstd * sw15
-
-                            max_abs = fabs_f32(y0)
-                            max_abs = fmax_f32(max_abs, fabs_f32(y1))
-                            max_abs = fmax_f32(max_abs, fabs_f32(y2))
-                            max_abs = fmax_f32(max_abs, fabs_f32(y3))
-                            max_abs = fmax_f32(max_abs, fabs_f32(y4))
-                            max_abs = fmax_f32(max_abs, fabs_f32(y5))
-                            max_abs = fmax_f32(max_abs, fabs_f32(y6))
-                            max_abs = fmax_f32(max_abs, fabs_f32(y7))
-                            max_abs = fmax_f32(max_abs, fabs_f32(y8))
-                            max_abs = fmax_f32(max_abs, fabs_f32(y9))
-                            max_abs = fmax_f32(max_abs, fabs_f32(y10))
-                            max_abs = fmax_f32(max_abs, fabs_f32(y11))
-                            max_abs = fmax_f32(max_abs, fabs_f32(y12))
-                            max_abs = fmax_f32(max_abs, fabs_f32(y13))
-                            max_abs = fmax_f32(max_abs, fabs_f32(y14))
-                            max_abs = fmax_f32(max_abs, fabs_f32(y15))
+                            # Shared memory path - use helper functions
+                            h_f32 = load_f32_16_from_smem(sH, row_in_block, block_start)
+                            w_f32 = load_f32_16_from_smem(sW, row_in_block, block_start)
+                            y_f32, max_abs = compute_y_and_max_abs_f32(
+                                h_f32, w_f32, rstd
+                            )
 
                             # E4M3: global_scale is incorporated into block scale
-                            # Formula: scale = global_scale * max_abs / FP4_MAX
                             scale_float = global_scale_val * max_abs * fp4_max_rcp
                             scale_float = fmin_f32(
                                 scale_float, Float32(FLOAT8_E4M3_MAX)
                             )
                             scale_fp8_u32 = cvt_f32_to_e4m3(scale_float)
                             scale_fp8 = Uint8(scale_fp8_u32 & Uint32(0xFF))
-                            # inv_scale = global_scale / scale_float to cancel global_scale
                             inv_scale = (
                                 fp8_e4m3_to_f32_and_rcp(scale_fp8_u32)
                                 * global_scale_val
                             )
 
                             if cutlass.const_expr(self.output_both_sf_layouts):
-                                # Output both swizzled and unswizzled scale factors
                                 inner_k_idx = sf_idx % Int32(4)
                                 inner_m_idx = (actual_row_idx % Int32(128)) // Int32(32)
                                 outer_m_idx = actual_row_idx % Int32(32)
@@ -1413,31 +605,7 @@ class AddRMSNormFP4QuantKernel:
                             else:
                                 mS[actual_row_idx, sf_idx] = scale_fp8
 
-                            q0 = y0 * inv_scale
-                            q1 = y1 * inv_scale
-                            q2 = y2 * inv_scale
-                            q3 = y3 * inv_scale
-                            q4 = y4 * inv_scale
-                            q5 = y5 * inv_scale
-                            q6 = y6 * inv_scale
-                            q7 = y7 * inv_scale
-                            q8 = y8 * inv_scale
-                            q9 = y9 * inv_scale
-                            q10 = y10 * inv_scale
-                            q11 = y11 * inv_scale
-                            q12 = y12 * inv_scale
-                            q13 = y13 * inv_scale
-                            q14 = y14 * inv_scale
-                            q15 = y15 * inv_scale
-
-                            packed_lo = cvt_e2m1x8_f32(q0, q1, q2, q3, q4, q5, q6, q7)
-                            packed_hi = cvt_e2m1x8_f32(
-                                q8, q9, q10, q11, q12, q13, q14, q15
-                            )
-                            packed64 = (Uint64(packed_hi) << Uint64(32)) | Uint64(
-                                packed_lo
-                            )
-
+                            packed64 = quantize_and_pack_16(y_f32, inv_scale)
                             out_offset = block_start // 2
                             out_ptr = get_ptr_as_int64(
                                 mY, actual_row_idx * (H // 2) + out_offset
@@ -1445,116 +613,38 @@ class AddRMSNormFP4QuantKernel:
                             st_global_u64(out_ptr, packed64)
 
                         else:
-                            # Global memory path (cluster mode)
-                            # mR now contains h = x + r (written earlier), so read h directly
-                            h_ptr0 = get_ptr_as_int64(
-                                mR, actual_row_idx * H + block_start
+                            # Global memory path (cluster mode) - use helper functions
+                            # mR contains h = x + r, so load from mR
+                            h_h2, w_h2 = load_8_half2(
+                                mR, mW, actual_row_idx, block_start, H
                             )
-                            h_ptr1 = get_ptr_as_int64(
-                                mR, actual_row_idx * H + block_start + Int32(8)
-                            )
-                            w_ptr0 = get_ptr_as_int64(mW, block_start)
-                            w_ptr1 = get_ptr_as_int64(mW, block_start + Int32(8))
-
-                            h0, h1, h2, h3 = ld_global_v4_u32(h_ptr0)
-                            h4, h5, h6, h7 = ld_global_v4_u32(h_ptr1)
-                            w0, w1, w2, w3 = ld_global_v4_u32(w_ptr0)
-                            w4, w5, w6, w7 = ld_global_v4_u32(w_ptr1)
 
                             if cutlass.const_expr(is_fp16):
-                                hw0 = half2_mul(h0, w0)
-                                hw1 = half2_mul(h1, w1)
-                                hw2 = half2_mul(h2, w2)
-                                hw3 = half2_mul(h3, w3)
-                                hw4 = half2_mul(h4, w4)
-                                hw5 = half2_mul(h5, w5)
-                                hw6 = half2_mul(h6, w6)
-                                hw7 = half2_mul(h7, w7)
-
-                                abs0 = habs2(hw0)
-                                abs1 = habs2(hw1)
-                                abs2 = habs2(hw2)
-                                abs3 = habs2(hw3)
-                                abs4 = habs2(hw4)
-                                abs5 = habs2(hw5)
-                                abs6 = habs2(hw6)
-                                abs7 = habs2(hw7)
-
-                                max01 = hmax2(abs0, abs1)
-                                max23 = hmax2(abs2, abs3)
-                                max45 = hmax2(abs4, abs5)
-                                max67 = hmax2(abs6, abs7)
-                                max0123 = hmax2(max01, max23)
-                                max4567 = hmax2(max45, max67)
-                                max_hw = hmax2(max0123, max4567)
-
+                                hw_h2 = half2_mul_8(h_h2, w_h2)
+                                max_hw = half2_max_abs_8(hw_h2)
                                 max_xw = hmax_to_f32(max_hw)
-                                max_abs = max_xw * rstd
-
-                                y0, y1 = half2_to_float2_scaled(hw0, rstd)
-                                y2, y3 = half2_to_float2_scaled(hw1, rstd)
-                                y4, y5 = half2_to_float2_scaled(hw2, rstd)
-                                y6, y7 = half2_to_float2_scaled(hw3, rstd)
-                                y8, y9 = half2_to_float2_scaled(hw4, rstd)
-                                y10, y11 = half2_to_float2_scaled(hw5, rstd)
-                                y12, y13 = half2_to_float2_scaled(hw6, rstd)
-                                y14, y15 = half2_to_float2_scaled(hw7, rstd)
+                                y_f32 = half2_to_float16(hw_h2, rstd)
                             else:
-                                # h0-h7 already contain h = x + r (loaded from mR)
-                                hw0 = bfloat2_mul(h0, w0)
-                                hw1 = bfloat2_mul(h1, w1)
-                                hw2 = bfloat2_mul(h2, w2)
-                                hw3 = bfloat2_mul(h3, w3)
-                                hw4 = bfloat2_mul(h4, w4)
-                                hw5 = bfloat2_mul(h5, w5)
-                                hw6 = bfloat2_mul(h6, w6)
-                                hw7 = bfloat2_mul(h7, w7)
-
-                                abs0 = bfloat2_habs2(hw0)
-                                abs1 = bfloat2_habs2(hw1)
-                                abs2 = bfloat2_habs2(hw2)
-                                abs3 = bfloat2_habs2(hw3)
-                                abs4 = bfloat2_habs2(hw4)
-                                abs5 = bfloat2_habs2(hw5)
-                                abs6 = bfloat2_habs2(hw6)
-                                abs7 = bfloat2_habs2(hw7)
-
-                                max01 = bfloat2_hmax2(abs0, abs1)
-                                max23 = bfloat2_hmax2(abs2, abs3)
-                                max45 = bfloat2_hmax2(abs4, abs5)
-                                max67 = bfloat2_hmax2(abs6, abs7)
-                                max0123 = bfloat2_hmax2(max01, max23)
-                                max4567 = bfloat2_hmax2(max45, max67)
-                                max_hw = bfloat2_hmax2(max0123, max4567)
-
+                                hw_h2 = bfloat2_mul_8(h_h2, w_h2)
+                                max_hw = bfloat2_max_abs_8(hw_h2)
                                 max_xw = bfloat2_hmax_to_f32(max_hw)
-                                max_abs = max_xw * rstd
+                                y_f32 = bfloat2_to_float16(hw_h2, rstd)
 
-                                y0, y1 = bfloat2_to_float2_scaled(hw0, rstd)
-                                y2, y3 = bfloat2_to_float2_scaled(hw1, rstd)
-                                y4, y5 = bfloat2_to_float2_scaled(hw2, rstd)
-                                y6, y7 = bfloat2_to_float2_scaled(hw3, rstd)
-                                y8, y9 = bfloat2_to_float2_scaled(hw4, rstd)
-                                y10, y11 = bfloat2_to_float2_scaled(hw5, rstd)
-                                y12, y13 = bfloat2_to_float2_scaled(hw6, rstd)
-                                y14, y15 = bfloat2_to_float2_scaled(hw7, rstd)
+                            max_abs = max_xw * rstd
 
                             # E4M3: global_scale is incorporated into block scale
-                            # Formula: scale = global_scale * max_abs / FP4_MAX
                             scale_float = global_scale_val * max_abs * fp4_max_rcp
                             scale_float = fmin_f32(
                                 scale_float, Float32(FLOAT8_E4M3_MAX)
                             )
                             scale_fp8_u32 = cvt_f32_to_e4m3(scale_float)
                             scale_fp8 = Uint8(scale_fp8_u32 & Uint32(0xFF))
-                            # inv_scale = global_scale / scale_float to cancel global_scale
                             inv_scale = (
                                 fp8_e4m3_to_f32_and_rcp(scale_fp8_u32)
                                 * global_scale_val
                             )
 
                             if cutlass.const_expr(self.output_both_sf_layouts):
-                                # Output both swizzled and unswizzled scale factors
                                 inner_k_idx = sf_idx % Int32(4)
                                 inner_m_idx = (actual_row_idx % Int32(128)) // Int32(32)
                                 outer_m_idx = actual_row_idx % Int32(32)
@@ -1588,31 +678,7 @@ class AddRMSNormFP4QuantKernel:
                             else:
                                 mS[actual_row_idx, sf_idx] = scale_fp8
 
-                            q0 = y0 * inv_scale
-                            q1 = y1 * inv_scale
-                            q2 = y2 * inv_scale
-                            q3 = y3 * inv_scale
-                            q4 = y4 * inv_scale
-                            q5 = y5 * inv_scale
-                            q6 = y6 * inv_scale
-                            q7 = y7 * inv_scale
-                            q8 = y8 * inv_scale
-                            q9 = y9 * inv_scale
-                            q10 = y10 * inv_scale
-                            q11 = y11 * inv_scale
-                            q12 = y12 * inv_scale
-                            q13 = y13 * inv_scale
-                            q14 = y14 * inv_scale
-                            q15 = y15 * inv_scale
-
-                            packed_lo = cvt_e2m1x8_f32(q0, q1, q2, q3, q4, q5, q6, q7)
-                            packed_hi = cvt_e2m1x8_f32(
-                                q8, q9, q10, q11, q12, q13, q14, q15
-                            )
-                            packed64 = (Uint64(packed_hi) << Uint64(32)) | Uint64(
-                                packed_lo
-                            )
-
+                            packed64 = quantize_and_pack_16(y_f32, inv_scale)
                             out_offset = block_start // 2
                             out_ptr = get_ptr_as_int64(
                                 mY, actual_row_idx * (H // 2) + out_offset
@@ -1620,167 +686,53 @@ class AddRMSNormFP4QuantKernel:
                             st_global_u64(out_ptr, packed64)
 
                     else:
-                        # block_size == 32 (MXFP4)
+                        # block_size == 32 (MXFP4) - process in two chunks of 16
                         if cutlass.const_expr(cluster_n == 1):
-                            # Shared memory path for MXFP4 - fully unrolled
-                            sh0 = Float32(sH[row_in_block, block_start + Int32(0)])
-                            sh1 = Float32(sH[row_in_block, block_start + Int32(1)])
-                            sh2 = Float32(sH[row_in_block, block_start + Int32(2)])
-                            sh3 = Float32(sH[row_in_block, block_start + Int32(3)])
-                            sh4 = Float32(sH[row_in_block, block_start + Int32(4)])
-                            sh5 = Float32(sH[row_in_block, block_start + Int32(5)])
-                            sh6 = Float32(sH[row_in_block, block_start + Int32(6)])
-                            sh7 = Float32(sH[row_in_block, block_start + Int32(7)])
-                            sh8 = Float32(sH[row_in_block, block_start + Int32(8)])
-                            sh9 = Float32(sH[row_in_block, block_start + Int32(9)])
-                            sh10 = Float32(sH[row_in_block, block_start + Int32(10)])
-                            sh11 = Float32(sH[row_in_block, block_start + Int32(11)])
-                            sh12 = Float32(sH[row_in_block, block_start + Int32(12)])
-                            sh13 = Float32(sH[row_in_block, block_start + Int32(13)])
-                            sh14 = Float32(sH[row_in_block, block_start + Int32(14)])
-                            sh15 = Float32(sH[row_in_block, block_start + Int32(15)])
-                            sh16 = Float32(sH[row_in_block, block_start + Int32(16)])
-                            sh17 = Float32(sH[row_in_block, block_start + Int32(17)])
-                            sh18 = Float32(sH[row_in_block, block_start + Int32(18)])
-                            sh19 = Float32(sH[row_in_block, block_start + Int32(19)])
-                            sh20 = Float32(sH[row_in_block, block_start + Int32(20)])
-                            sh21 = Float32(sH[row_in_block, block_start + Int32(21)])
-                            sh22 = Float32(sH[row_in_block, block_start + Int32(22)])
-                            sh23 = Float32(sH[row_in_block, block_start + Int32(23)])
-                            sh24 = Float32(sH[row_in_block, block_start + Int32(24)])
-                            sh25 = Float32(sH[row_in_block, block_start + Int32(25)])
-                            sh26 = Float32(sH[row_in_block, block_start + Int32(26)])
-                            sh27 = Float32(sH[row_in_block, block_start + Int32(27)])
-                            sh28 = Float32(sH[row_in_block, block_start + Int32(28)])
-                            sh29 = Float32(sH[row_in_block, block_start + Int32(29)])
-                            sh30 = Float32(sH[row_in_block, block_start + Int32(30)])
-                            sh31 = Float32(sH[row_in_block, block_start + Int32(31)])
+                            # Shared memory path - use helper functions
+                            # Load and compute first 16 elements
+                            h_f32_c0 = load_f32_16_from_smem(
+                                sH, row_in_block, block_start
+                            )
+                            w_f32_c0 = load_f32_16_from_smem(
+                                sW, row_in_block, block_start
+                            )
+                            y_f32_c0, max_abs_c0 = compute_y_and_max_abs_f32(
+                                h_f32_c0, w_f32_c0, rstd
+                            )
 
-                            sw0 = Float32(sW[row_in_block, block_start + Int32(0)])
-                            sw1 = Float32(sW[row_in_block, block_start + Int32(1)])
-                            sw2 = Float32(sW[row_in_block, block_start + Int32(2)])
-                            sw3 = Float32(sW[row_in_block, block_start + Int32(3)])
-                            sw4 = Float32(sW[row_in_block, block_start + Int32(4)])
-                            sw5 = Float32(sW[row_in_block, block_start + Int32(5)])
-                            sw6 = Float32(sW[row_in_block, block_start + Int32(6)])
-                            sw7 = Float32(sW[row_in_block, block_start + Int32(7)])
-                            sw8 = Float32(sW[row_in_block, block_start + Int32(8)])
-                            sw9 = Float32(sW[row_in_block, block_start + Int32(9)])
-                            sw10 = Float32(sW[row_in_block, block_start + Int32(10)])
-                            sw11 = Float32(sW[row_in_block, block_start + Int32(11)])
-                            sw12 = Float32(sW[row_in_block, block_start + Int32(12)])
-                            sw13 = Float32(sW[row_in_block, block_start + Int32(13)])
-                            sw14 = Float32(sW[row_in_block, block_start + Int32(14)])
-                            sw15 = Float32(sW[row_in_block, block_start + Int32(15)])
-                            sw16 = Float32(sW[row_in_block, block_start + Int32(16)])
-                            sw17 = Float32(sW[row_in_block, block_start + Int32(17)])
-                            sw18 = Float32(sW[row_in_block, block_start + Int32(18)])
-                            sw19 = Float32(sW[row_in_block, block_start + Int32(19)])
-                            sw20 = Float32(sW[row_in_block, block_start + Int32(20)])
-                            sw21 = Float32(sW[row_in_block, block_start + Int32(21)])
-                            sw22 = Float32(sW[row_in_block, block_start + Int32(22)])
-                            sw23 = Float32(sW[row_in_block, block_start + Int32(23)])
-                            sw24 = Float32(sW[row_in_block, block_start + Int32(24)])
-                            sw25 = Float32(sW[row_in_block, block_start + Int32(25)])
-                            sw26 = Float32(sW[row_in_block, block_start + Int32(26)])
-                            sw27 = Float32(sW[row_in_block, block_start + Int32(27)])
-                            sw28 = Float32(sW[row_in_block, block_start + Int32(28)])
-                            sw29 = Float32(sW[row_in_block, block_start + Int32(29)])
-                            sw30 = Float32(sW[row_in_block, block_start + Int32(30)])
-                            sw31 = Float32(sW[row_in_block, block_start + Int32(31)])
+                            # Load and compute second 16 elements
+                            h_f32_c1 = load_f32_16_from_smem(
+                                sH, row_in_block, block_start + Int32(16)
+                            )
+                            w_f32_c1 = load_f32_16_from_smem(
+                                sW, row_in_block, block_start + Int32(16)
+                            )
+                            y_f32_c1, max_abs_c1 = compute_y_and_max_abs_f32(
+                                h_f32_c1, w_f32_c1, rstd
+                            )
 
-                            # Compute normalized output: y = h * rstd * w
-                            y0 = sh0 * rstd * sw0
-                            y1 = sh1 * rstd * sw1
-                            y2 = sh2 * rstd * sw2
-                            y3 = sh3 * rstd * sw3
-                            y4 = sh4 * rstd * sw4
-                            y5 = sh5 * rstd * sw5
-                            y6 = sh6 * rstd * sw6
-                            y7 = sh7 * rstd * sw7
-                            y8 = sh8 * rstd * sw8
-                            y9 = sh9 * rstd * sw9
-                            y10 = sh10 * rstd * sw10
-                            y11 = sh11 * rstd * sw11
-                            y12 = sh12 * rstd * sw12
-                            y13 = sh13 * rstd * sw13
-                            y14 = sh14 * rstd * sw14
-                            y15 = sh15 * rstd * sw15
-                            y16 = sh16 * rstd * sw16
-                            y17 = sh17 * rstd * sw17
-                            y18 = sh18 * rstd * sw18
-                            y19 = sh19 * rstd * sw19
-                            y20 = sh20 * rstd * sw20
-                            y21 = sh21 * rstd * sw21
-                            y22 = sh22 * rstd * sw22
-                            y23 = sh23 * rstd * sw23
-                            y24 = sh24 * rstd * sw24
-                            y25 = sh25 * rstd * sw25
-                            y26 = sh26 * rstd * sw26
-                            y27 = sh27 * rstd * sw27
-                            y28 = sh28 * rstd * sw28
-                            y29 = sh29 * rstd * sw29
-                            y30 = sh30 * rstd * sw30
-                            y31 = sh31 * rstd * sw31
+                            # Combine max_abs from both chunks
+                            max_abs = fmax_f32(max_abs_c0, max_abs_c1)
 
-                            # Find max absolute value for scale computation
-                            max_abs = fabs_f32(y0)
-                            max_abs = fmax_f32(max_abs, fabs_f32(y1))
-                            max_abs = fmax_f32(max_abs, fabs_f32(y2))
-                            max_abs = fmax_f32(max_abs, fabs_f32(y3))
-                            max_abs = fmax_f32(max_abs, fabs_f32(y4))
-                            max_abs = fmax_f32(max_abs, fabs_f32(y5))
-                            max_abs = fmax_f32(max_abs, fabs_f32(y6))
-                            max_abs = fmax_f32(max_abs, fabs_f32(y7))
-                            max_abs = fmax_f32(max_abs, fabs_f32(y8))
-                            max_abs = fmax_f32(max_abs, fabs_f32(y9))
-                            max_abs = fmax_f32(max_abs, fabs_f32(y10))
-                            max_abs = fmax_f32(max_abs, fabs_f32(y11))
-                            max_abs = fmax_f32(max_abs, fabs_f32(y12))
-                            max_abs = fmax_f32(max_abs, fabs_f32(y13))
-                            max_abs = fmax_f32(max_abs, fabs_f32(y14))
-                            max_abs = fmax_f32(max_abs, fabs_f32(y15))
-                            max_abs = fmax_f32(max_abs, fabs_f32(y16))
-                            max_abs = fmax_f32(max_abs, fabs_f32(y17))
-                            max_abs = fmax_f32(max_abs, fabs_f32(y18))
-                            max_abs = fmax_f32(max_abs, fabs_f32(y19))
-                            max_abs = fmax_f32(max_abs, fabs_f32(y20))
-                            max_abs = fmax_f32(max_abs, fabs_f32(y21))
-                            max_abs = fmax_f32(max_abs, fabs_f32(y22))
-                            max_abs = fmax_f32(max_abs, fabs_f32(y23))
-                            max_abs = fmax_f32(max_abs, fabs_f32(y24))
-                            max_abs = fmax_f32(max_abs, fabs_f32(y25))
-                            max_abs = fmax_f32(max_abs, fabs_f32(y26))
-                            max_abs = fmax_f32(max_abs, fabs_f32(y27))
-                            max_abs = fmax_f32(max_abs, fabs_f32(y28))
-                            max_abs = fmax_f32(max_abs, fabs_f32(y29))
-                            max_abs = fmax_f32(max_abs, fabs_f32(y30))
-                            max_abs = fmax_f32(max_abs, fabs_f32(y31))
-
-                            # Compute scale factor (E4M3 or UE8M0 based on scale_format)
-                            # For E4M3: global_scale is incorporated into block scale
-                            # For UE8M0 (MXFP4): global_scale is not used
+                            # Compute scale factor (E4M3 or UE8M0)
                             if cutlass.const_expr(self.scale_format == "ue8m0"):
                                 scale_float = max_abs * fp4_max_rcp
                                 scale_ue8m0 = cvt_f32_to_ue8m0(scale_float)
                                 scale_u8 = Uint8(scale_ue8m0 & Uint32(0xFF))
                                 inv_scale = ue8m0_to_output_scale(scale_ue8m0)
                             else:
-                                # E4M3: scale = global_scale * max_abs / FP4_MAX
                                 scale_float = global_scale_val * max_abs * fp4_max_rcp
                                 scale_float = fmin_f32(
                                     scale_float, Float32(FLOAT8_E4M3_MAX)
                                 )
                                 scale_fp8_u32 = cvt_f32_to_e4m3(scale_float)
                                 scale_u8 = Uint8(scale_fp8_u32 & Uint32(0xFF))
-                                # inv_scale = global_scale / scale_float to cancel global_scale
                                 inv_scale = (
                                     fp8_e4m3_to_f32_and_rcp(scale_fp8_u32)
                                     * global_scale_val
                                 )
 
                             if cutlass.const_expr(self.output_both_sf_layouts):
-                                # Output both swizzled and unswizzled scale factors
                                 inner_k_idx = sf_idx % Int32(4)
                                 inner_m_idx = (actual_row_idx % Int32(128)) // Int32(32)
                                 outer_m_idx = actual_row_idx % Int32(32)
@@ -1814,263 +766,68 @@ class AddRMSNormFP4QuantKernel:
                             else:
                                 mS[actual_row_idx, sf_idx] = scale_u8
 
-                            # Quantize to FP4
-                            q0 = y0 * inv_scale
-                            q1 = y1 * inv_scale
-                            q2 = y2 * inv_scale
-                            q3 = y3 * inv_scale
-                            q4 = y4 * inv_scale
-                            q5 = y5 * inv_scale
-                            q6 = y6 * inv_scale
-                            q7 = y7 * inv_scale
-                            q8 = y8 * inv_scale
-                            q9 = y9 * inv_scale
-                            q10 = y10 * inv_scale
-                            q11 = y11 * inv_scale
-                            q12 = y12 * inv_scale
-                            q13 = y13 * inv_scale
-                            q14 = y14 * inv_scale
-                            q15 = y15 * inv_scale
-                            q16 = y16 * inv_scale
-                            q17 = y17 * inv_scale
-                            q18 = y18 * inv_scale
-                            q19 = y19 * inv_scale
-                            q20 = y20 * inv_scale
-                            q21 = y21 * inv_scale
-                            q22 = y22 * inv_scale
-                            q23 = y23 * inv_scale
-                            q24 = y24 * inv_scale
-                            q25 = y25 * inv_scale
-                            q26 = y26 * inv_scale
-                            q27 = y27 * inv_scale
-                            q28 = y28 * inv_scale
-                            q29 = y29 * inv_scale
-                            q30 = y30 * inv_scale
-                            q31 = y31 * inv_scale
-
-                            packed_lo_0 = cvt_e2m1x8_f32(q0, q1, q2, q3, q4, q5, q6, q7)
-                            packed_hi_0 = cvt_e2m1x8_f32(
-                                q8, q9, q10, q11, q12, q13, q14, q15
-                            )
-                            packed64_0 = (Uint64(packed_hi_0) << Uint64(32)) | Uint64(
-                                packed_lo_0
-                            )
-
-                            packed_lo_1 = cvt_e2m1x8_f32(
-                                q16, q17, q18, q19, q20, q21, q22, q23
-                            )
-                            packed_hi_1 = cvt_e2m1x8_f32(
-                                q24, q25, q26, q27, q28, q29, q30, q31
-                            )
-                            packed64_1 = (Uint64(packed_hi_1) << Uint64(32)) | Uint64(
-                                packed_lo_1
-                            )
+                            # Quantize and store both chunks
+                            packed64_c0 = quantize_and_pack_16(y_f32_c0, inv_scale)
+                            packed64_c1 = quantize_and_pack_16(y_f32_c1, inv_scale)
 
                             fp4_offset = actual_row_idx * (H // 2) + sf_idx * (
                                 block_size // 2
                             )
                             fp4_ptr_0 = get_ptr_as_int64(mY, fp4_offset)
                             fp4_ptr_1 = get_ptr_as_int64(mY, fp4_offset + Int32(8))
-                            st_global_u64(fp4_ptr_0, packed64_0)
-                            st_global_u64(fp4_ptr_1, packed64_1)
+                            st_global_u64(fp4_ptr_0, packed64_c0)
+                            st_global_u64(fp4_ptr_1, packed64_c1)
 
                         else:
-                            # Global memory path for MXFP4 (cluster mode)
-                            # mR now contains h = x + r (written earlier), so read h directly
-                            h_ptr0 = get_ptr_as_int64(
-                                mR, actual_row_idx * H + block_start
+                            # Global memory path (cluster mode) - use helper functions
+                            # mR contains h = x + r, load in two chunks
+                            h_h2_c0, w_h2_c0 = load_8_half2(
+                                mR, mW, actual_row_idx, block_start, H
                             )
-                            h_ptr1 = get_ptr_as_int64(
-                                mR, actual_row_idx * H + block_start + Int32(8)
+                            h_h2_c1, w_h2_c1 = load_8_half2(
+                                mR, mW, actual_row_idx, block_start + Int32(16), H
                             )
-                            h_ptr2 = get_ptr_as_int64(
-                                mR, actual_row_idx * H + block_start + Int32(16)
-                            )
-                            h_ptr3 = get_ptr_as_int64(
-                                mR, actual_row_idx * H + block_start + Int32(24)
-                            )
-
-                            w_ptr0 = get_ptr_as_int64(mW, block_start)
-                            w_ptr1 = get_ptr_as_int64(mW, block_start + Int32(8))
-                            w_ptr2 = get_ptr_as_int64(mW, block_start + Int32(16))
-                            w_ptr3 = get_ptr_as_int64(mW, block_start + Int32(24))
-
-                            h0, h1, h2, h3 = ld_global_v4_u32(h_ptr0)
-                            h4, h5, h6, h7 = ld_global_v4_u32(h_ptr1)
-                            h8, h9, h10, h11 = ld_global_v4_u32(h_ptr2)
-                            h12, h13, h14, h15 = ld_global_v4_u32(h_ptr3)
-
-                            w0, w1, w2, w3 = ld_global_v4_u32(w_ptr0)
-                            w4, w5, w6, w7 = ld_global_v4_u32(w_ptr1)
-                            w8, w9, w10, w11 = ld_global_v4_u32(w_ptr2)
-                            w12, w13, w14, w15 = ld_global_v4_u32(w_ptr3)
 
                             if cutlass.const_expr(is_fp16):
-                                hw0 = half2_mul(h0, w0)
-                                hw1 = half2_mul(h1, w1)
-                                hw2 = half2_mul(h2, w2)
-                                hw3 = half2_mul(h3, w3)
-                                hw4 = half2_mul(h4, w4)
-                                hw5 = half2_mul(h5, w5)
-                                hw6 = half2_mul(h6, w6)
-                                hw7 = half2_mul(h7, w7)
-                                hw8 = half2_mul(h8, w8)
-                                hw9 = half2_mul(h9, w9)
-                                hw10 = half2_mul(h10, w10)
-                                hw11 = half2_mul(h11, w11)
-                                hw12 = half2_mul(h12, w12)
-                                hw13 = half2_mul(h13, w13)
-                                hw14 = half2_mul(h14, w14)
-                                hw15 = half2_mul(h15, w15)
-
-                                abs0 = habs2(hw0)
-                                abs1 = habs2(hw1)
-                                abs2 = habs2(hw2)
-                                abs3 = habs2(hw3)
-                                abs4 = habs2(hw4)
-                                abs5 = habs2(hw5)
-                                abs6 = habs2(hw6)
-                                abs7 = habs2(hw7)
-                                abs8 = habs2(hw8)
-                                abs9 = habs2(hw9)
-                                abs10 = habs2(hw10)
-                                abs11 = habs2(hw11)
-                                abs12 = habs2(hw12)
-                                abs13 = habs2(hw13)
-                                abs14 = habs2(hw14)
-                                abs15 = habs2(hw15)
-
-                                max01 = hmax2(abs0, abs1)
-                                max23 = hmax2(abs2, abs3)
-                                max45 = hmax2(abs4, abs5)
-                                max67 = hmax2(abs6, abs7)
-                                max89 = hmax2(abs8, abs9)
-                                maxab = hmax2(abs10, abs11)
-                                maxcd = hmax2(abs12, abs13)
-                                maxef = hmax2(abs14, abs15)
-                                max0123 = hmax2(max01, max23)
-                                max4567 = hmax2(max45, max67)
-                                max89ab = hmax2(max89, maxab)
-                                maxcdef = hmax2(maxcd, maxef)
-                                max_lo = hmax2(max0123, max4567)
-                                max_hi = hmax2(max89ab, maxcdef)
-                                max_hw = hmax2(max_lo, max_hi)
-
+                                hw_h2_c0 = half2_mul_8(h_h2_c0, w_h2_c0)
+                                hw_h2_c1 = half2_mul_8(h_h2_c1, w_h2_c1)
+                                max_c0_h2 = half2_max_abs_8(hw_h2_c0)
+                                max_c1_h2 = half2_max_abs_8(hw_h2_c1)
+                                max_hw = hmax2(max_c0_h2, max_c1_h2)
                                 max_xw = hmax_to_f32(max_hw)
-                                max_abs = max_xw * rstd
-
-                                y0, y1 = half2_to_float2_scaled(hw0, rstd)
-                                y2, y3 = half2_to_float2_scaled(hw1, rstd)
-                                y4, y5 = half2_to_float2_scaled(hw2, rstd)
-                                y6, y7 = half2_to_float2_scaled(hw3, rstd)
-                                y8, y9 = half2_to_float2_scaled(hw4, rstd)
-                                y10, y11 = half2_to_float2_scaled(hw5, rstd)
-                                y12, y13 = half2_to_float2_scaled(hw6, rstd)
-                                y14, y15 = half2_to_float2_scaled(hw7, rstd)
-                                y16, y17 = half2_to_float2_scaled(hw8, rstd)
-                                y18, y19 = half2_to_float2_scaled(hw9, rstd)
-                                y20, y21 = half2_to_float2_scaled(hw10, rstd)
-                                y22, y23 = half2_to_float2_scaled(hw11, rstd)
-                                y24, y25 = half2_to_float2_scaled(hw12, rstd)
-                                y26, y27 = half2_to_float2_scaled(hw13, rstd)
-                                y28, y29 = half2_to_float2_scaled(hw14, rstd)
-                                y30, y31 = half2_to_float2_scaled(hw15, rstd)
+                                y_f32_c0 = half2_to_float16(hw_h2_c0, rstd)
+                                y_f32_c1 = half2_to_float16(hw_h2_c1, rstd)
                             else:
-                                # h0-h15 already contain h = x + r (loaded from mR)
-                                hw0 = bfloat2_mul(h0, w0)
-                                hw1 = bfloat2_mul(h1, w1)
-                                hw2 = bfloat2_mul(h2, w2)
-                                hw3 = bfloat2_mul(h3, w3)
-                                hw4 = bfloat2_mul(h4, w4)
-                                hw5 = bfloat2_mul(h5, w5)
-                                hw6 = bfloat2_mul(h6, w6)
-                                hw7 = bfloat2_mul(h7, w7)
-                                hw8 = bfloat2_mul(h8, w8)
-                                hw9 = bfloat2_mul(h9, w9)
-                                hw10 = bfloat2_mul(h10, w10)
-                                hw11 = bfloat2_mul(h11, w11)
-                                hw12 = bfloat2_mul(h12, w12)
-                                hw13 = bfloat2_mul(h13, w13)
-                                hw14 = bfloat2_mul(h14, w14)
-                                hw15 = bfloat2_mul(h15, w15)
-
-                                abs0 = bfloat2_habs2(hw0)
-                                abs1 = bfloat2_habs2(hw1)
-                                abs2 = bfloat2_habs2(hw2)
-                                abs3 = bfloat2_habs2(hw3)
-                                abs4 = bfloat2_habs2(hw4)
-                                abs5 = bfloat2_habs2(hw5)
-                                abs6 = bfloat2_habs2(hw6)
-                                abs7 = bfloat2_habs2(hw7)
-                                abs8 = bfloat2_habs2(hw8)
-                                abs9 = bfloat2_habs2(hw9)
-                                abs10 = bfloat2_habs2(hw10)
-                                abs11 = bfloat2_habs2(hw11)
-                                abs12 = bfloat2_habs2(hw12)
-                                abs13 = bfloat2_habs2(hw13)
-                                abs14 = bfloat2_habs2(hw14)
-                                abs15 = bfloat2_habs2(hw15)
-
-                                max01 = bfloat2_hmax2(abs0, abs1)
-                                max23 = bfloat2_hmax2(abs2, abs3)
-                                max45 = bfloat2_hmax2(abs4, abs5)
-                                max67 = bfloat2_hmax2(abs6, abs7)
-                                max89 = bfloat2_hmax2(abs8, abs9)
-                                maxab = bfloat2_hmax2(abs10, abs11)
-                                maxcd = bfloat2_hmax2(abs12, abs13)
-                                maxef = bfloat2_hmax2(abs14, abs15)
-                                max0123 = bfloat2_hmax2(max01, max23)
-                                max4567 = bfloat2_hmax2(max45, max67)
-                                max89ab = bfloat2_hmax2(max89, maxab)
-                                maxcdef = bfloat2_hmax2(maxcd, maxef)
-                                max_lo = bfloat2_hmax2(max0123, max4567)
-                                max_hi = bfloat2_hmax2(max89ab, maxcdef)
-                                max_hw = bfloat2_hmax2(max_lo, max_hi)
-
+                                hw_h2_c0 = bfloat2_mul_8(h_h2_c0, w_h2_c0)
+                                hw_h2_c1 = bfloat2_mul_8(h_h2_c1, w_h2_c1)
+                                max_c0_h2 = bfloat2_max_abs_8(hw_h2_c0)
+                                max_c1_h2 = bfloat2_max_abs_8(hw_h2_c1)
+                                max_hw = bfloat2_hmax2(max_c0_h2, max_c1_h2)
                                 max_xw = bfloat2_hmax_to_f32(max_hw)
-                                max_abs = max_xw * rstd
+                                y_f32_c0 = bfloat2_to_float16(hw_h2_c0, rstd)
+                                y_f32_c1 = bfloat2_to_float16(hw_h2_c1, rstd)
 
-                                y0, y1 = bfloat2_to_float2_scaled(hw0, rstd)
-                                y2, y3 = bfloat2_to_float2_scaled(hw1, rstd)
-                                y4, y5 = bfloat2_to_float2_scaled(hw2, rstd)
-                                y6, y7 = bfloat2_to_float2_scaled(hw3, rstd)
-                                y8, y9 = bfloat2_to_float2_scaled(hw4, rstd)
-                                y10, y11 = bfloat2_to_float2_scaled(hw5, rstd)
-                                y12, y13 = bfloat2_to_float2_scaled(hw6, rstd)
-                                y14, y15 = bfloat2_to_float2_scaled(hw7, rstd)
-                                y16, y17 = bfloat2_to_float2_scaled(hw8, rstd)
-                                y18, y19 = bfloat2_to_float2_scaled(hw9, rstd)
-                                y20, y21 = bfloat2_to_float2_scaled(hw10, rstd)
-                                y22, y23 = bfloat2_to_float2_scaled(hw11, rstd)
-                                y24, y25 = bfloat2_to_float2_scaled(hw12, rstd)
-                                y26, y27 = bfloat2_to_float2_scaled(hw13, rstd)
-                                y28, y29 = bfloat2_to_float2_scaled(hw14, rstd)
-                                y30, y31 = bfloat2_to_float2_scaled(hw15, rstd)
+                            max_abs = max_xw * rstd
 
-                            # Compute scale factor (E4M3 or UE8M0 based on scale_format)
-                            # For E4M3: global_scale is incorporated into block scale
-                            # For UE8M0 (MXFP4): global_scale is not used
+                            # Compute scale factor (E4M3 or UE8M0)
                             if cutlass.const_expr(self.scale_format == "ue8m0"):
                                 scale_float = max_abs * fp4_max_rcp
                                 scale_ue8m0 = cvt_f32_to_ue8m0(scale_float)
                                 scale_u8 = Uint8(scale_ue8m0 & Uint32(0xFF))
                                 inv_scale = ue8m0_to_output_scale(scale_ue8m0)
                             else:
-                                # E4M3: scale = global_scale * max_abs / FP4_MAX
                                 scale_float = global_scale_val * max_abs * fp4_max_rcp
                                 scale_float = fmin_f32(
                                     scale_float, Float32(FLOAT8_E4M3_MAX)
                                 )
                                 scale_fp8_u32 = cvt_f32_to_e4m3(scale_float)
                                 scale_u8 = Uint8(scale_fp8_u32 & Uint32(0xFF))
-                                # inv_scale = global_scale / scale_float to cancel global_scale
                                 inv_scale = (
                                     fp8_e4m3_to_f32_and_rcp(scale_fp8_u32)
                                     * global_scale_val
                                 )
 
                             if cutlass.const_expr(self.output_both_sf_layouts):
-                                # Output both swizzled and unswizzled scale factors
                                 inner_k_idx = sf_idx % Int32(4)
                                 inner_m_idx = (actual_row_idx % Int32(128)) // Int32(32)
                                 outer_m_idx = actual_row_idx % Int32(32)
@@ -2104,64 +861,17 @@ class AddRMSNormFP4QuantKernel:
                             else:
                                 mS[actual_row_idx, sf_idx] = scale_u8
 
-                            q0 = y0 * inv_scale
-                            q1 = y1 * inv_scale
-                            q2 = y2 * inv_scale
-                            q3 = y3 * inv_scale
-                            q4 = y4 * inv_scale
-                            q5 = y5 * inv_scale
-                            q6 = y6 * inv_scale
-                            q7 = y7 * inv_scale
-                            q8 = y8 * inv_scale
-                            q9 = y9 * inv_scale
-                            q10 = y10 * inv_scale
-                            q11 = y11 * inv_scale
-                            q12 = y12 * inv_scale
-                            q13 = y13 * inv_scale
-                            q14 = y14 * inv_scale
-                            q15 = y15 * inv_scale
-                            q16 = y16 * inv_scale
-                            q17 = y17 * inv_scale
-                            q18 = y18 * inv_scale
-                            q19 = y19 * inv_scale
-                            q20 = y20 * inv_scale
-                            q21 = y21 * inv_scale
-                            q22 = y22 * inv_scale
-                            q23 = y23 * inv_scale
-                            q24 = y24 * inv_scale
-                            q25 = y25 * inv_scale
-                            q26 = y26 * inv_scale
-                            q27 = y27 * inv_scale
-                            q28 = y28 * inv_scale
-                            q29 = y29 * inv_scale
-                            q30 = y30 * inv_scale
-                            q31 = y31 * inv_scale
-
-                            packed_lo_0 = cvt_e2m1x8_f32(q0, q1, q2, q3, q4, q5, q6, q7)
-                            packed_hi_0 = cvt_e2m1x8_f32(
-                                q8, q9, q10, q11, q12, q13, q14, q15
-                            )
-                            packed64_0 = (Uint64(packed_hi_0) << Uint64(32)) | Uint64(
-                                packed_lo_0
-                            )
-
-                            packed_lo_1 = cvt_e2m1x8_f32(
-                                q16, q17, q18, q19, q20, q21, q22, q23
-                            )
-                            packed_hi_1 = cvt_e2m1x8_f32(
-                                q24, q25, q26, q27, q28, q29, q30, q31
-                            )
-                            packed64_1 = (Uint64(packed_hi_1) << Uint64(32)) | Uint64(
-                                packed_lo_1
-                            )
+                            # Quantize and store both chunks
+                            packed64_c0 = quantize_and_pack_16(y_f32_c0, inv_scale)
+                            packed64_c1 = quantize_and_pack_16(y_f32_c1, inv_scale)
 
                             fp4_offset = actual_row_idx * (H // 2) + sf_idx * (
                                 block_size // 2
                             )
                             fp4_ptr_0 = get_ptr_as_int64(mY, fp4_offset)
                             fp4_ptr_1 = get_ptr_as_int64(mY, fp4_offset + Int32(8))
-                            st_global_u64(fp4_ptr_0, packed64_0)
-                            st_global_u64(fp4_ptr_1, packed64_1)
+                            st_global_u64(fp4_ptr_0, packed64_c0)
+                            st_global_u64(fp4_ptr_1, packed64_c1)
 
 
 # =============================================================================
