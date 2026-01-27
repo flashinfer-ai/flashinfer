@@ -1,7 +1,7 @@
 {
-  "flashinfer/fused_moe": ["aleozlx"],
-  "csrc/fused_moe": ["aleozlx"],
-  "tests/moe": ["aleozlx"],
-  "flashinfer/comm": ["aleozlx"],
-  "tests/comm": ["aleozlx"]
+  "flashinfer/fused_moe": ["@flashinfer-ai/moe-owners"],
+  "csrc/fused_moe": ["@flashinfer-ai/moe-owners"],
+  "tests/moe": ["@flashinfer-ai/moe-owners"],
+  "flashinfer/comm": ["@flashinfer-ai/comm-owners"],
+  "tests/comm": ["@flashinfer-ai/comm-owners"]
 }
