@@ -125,6 +125,16 @@
 # 3D input shape (batch, num_heads, head_dim)
 --routine add_rmsnorm_fp4quant --batch_size 32 --num_heads 32 --hidden_size 128 --input_dtype bfloat16 -vv --generate_repro_command --case_tag "add_rmsnorm_fp4quant_3d"
 
+# Output both swizzled and unswizzled scale factors (for dual-use scenarios)
+--routine add_rmsnorm_fp4quant --batch_size 32 --hidden_size 4096 --input_dtype bfloat16 --output_both_sf_layouts -vv --generate_repro_command --case_tag "add_rmsnorm_fp4quant_both_sf"
+--routine add_rmsnorm_fp4quant --batch_size 64 --hidden_size 8192 --input_dtype bfloat16 --output_both_sf_layouts -vv --generate_repro_command --case_tag "add_rmsnorm_fp4quant_both_sf_large"
+
+# Both SF layouts with global scale
+--routine add_rmsnorm_fp4quant --batch_size 32 --hidden_size 4096 --input_dtype bfloat16 --use_global_scale --output_both_sf_layouts -vv --generate_repro_command --case_tag "add_rmsnorm_fp4quant_both_sf_global"
+
+# Both SF layouts with MXFP4 format
+--routine add_rmsnorm_fp4quant --batch_size 32 --hidden_size 4096 --input_dtype bfloat16 --out_dtype mxfp4 --output_both_sf_layouts -vv --generate_repro_command --case_tag "add_rmsnorm_fp4quant_mxfp4_both_sf"
+
 ## Quantization (Blackwell SM10.0+ only)
 # MxFP8 Quantization - basic
 --routine mxfp8_quantize --m 1024 --k 4096 --input_dtype bfloat16 -vv --generate_repro_command --case_tag "mxfp8_quantize_basic"
