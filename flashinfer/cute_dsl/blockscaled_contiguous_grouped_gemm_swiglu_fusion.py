@@ -66,12 +66,8 @@ __all__ = [
 ]
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _get_compiled_swiglu_kernel(
-    permuted_m: int,
-    n: int,  # This is 2*intermediate_size
-    k: int,
-    num_experts: int,
     ab_dtype_name: str,
     sf_dtype_name: str,
     c_dtype_name: str,
@@ -83,6 +79,8 @@ def _get_compiled_swiglu_kernel(
     """Get or compile the grouped GEMM with SwiGLU kernel.
 
     This function is cached to avoid recompilation for the same parameters.
+    Shape parameters (permuted_m, n, k, num_experts) are not included in the
+    cache key since the kernel is shape-agnostic.
     """
     ab_dtype = get_cutlass_dtype(ab_dtype_name)
     sf_dtype = get_cutlass_dtype(sf_dtype_name)
@@ -277,10 +275,6 @@ def blockscaled_contiguous_grouped_gemm_swiglu_fusion_nvfp4(
 
     # Get or compile the kernel
     gemm, _, _, _ = _get_compiled_swiglu_kernel(
-        permuted_m=permuted_m,
-        n=n,
-        k=k,
-        num_experts=num_experts,
         ab_dtype_name=ab_dtype,
         sf_dtype_name=sf_dtype,
         c_dtype_name=c_dtype,
