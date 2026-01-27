@@ -72,26 +72,28 @@ def is_blackwell():
     return torch.cuda.is_available() and torch.cuda.get_device_properties(0).major >= 10
 
 
-def calc_tflops(n, ms):
+def calc_tflops(n, ms, num_local_experts=None):
+    """Calculate TFLOPS for MoE computation.
+
+    With EP, only tokens routed to local experts are computed.
+    Assumes uniform routing distribution across experts.
+    """
+    if num_local_experts is None:
+        num_local_experts = CFG.num_experts
+
+    # Fraction of work done locally (assuming uniform distribution)
+    local_fraction = num_local_experts / CFG.num_experts
+
     flops = (
         n
         * CFG.top_k
+        * local_fraction  # Only local expert pairs are computed
         * (
             2 * CFG.hidden_size * 2 * CFG.intermediate_size
             + 2 * CFG.intermediate_size * CFG.hidden_size
         )
     )
     return flops / (ms * 1e-3) / 1e12
-
-
-def calc_bw(n, ms):
-    bpe = 0.5 + 1 / 16
-    w = (
-        2 * CFG.intermediate_size * CFG.hidden_size
-        + CFG.hidden_size * CFG.intermediate_size
-    ) * bpe
-    act = min(CFG.num_experts, CFG.top_k * n)
-    return (act * w + n * CFG.hidden_size * (bpe + 2)) / (ms * 1e-3) / 1e12
 
 
 def interleave(x, gs=64):
@@ -919,7 +921,7 @@ def _benchmark_single(
                 backend=backend,
                 tokens=n,
                 latency_ms=latency,
-                tflops=calc_tflops(n, latency),
+                tflops=calc_tflops(n, latency, num_local),
                 us_per_token=(latency * 1000) / n,
             )
         )
