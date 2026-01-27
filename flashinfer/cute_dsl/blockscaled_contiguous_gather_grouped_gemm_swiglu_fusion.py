@@ -414,9 +414,9 @@ def blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_nvfp4(
 
     # Check compute capability
     major, minor = get_compute_capability(a.device)
-    if major < 10:
+    if major != 10:
         raise ValueError(
-            f"Blockscaled contiguous gather grouped GEMM with SwiGLU requires SM100 (Blackwell) or later. "
+            f"Blockscaled contiguous gather grouped GEMM with SwiGLU requires SM100 family (Blackwell: SM100, SM103, SM110). "
             f"Got SM{major}{minor}."
         )
 

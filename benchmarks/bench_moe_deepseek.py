@@ -30,7 +30,6 @@ Usage:
 Metrics:
     - ms: Latency in milliseconds
     - TFLOPS: Computational throughput
-    - us/tok: Microseconds per token (key for generation latency)
     - Speedup: CuteDSL latency / other backend latency (>1 = CuteDSL faster)
 """
 
@@ -68,8 +67,16 @@ EP_CONFIGS = {
 }
 
 
-def is_blackwell():
-    return torch.cuda.is_available() and torch.cuda.get_device_properties(0).major >= 10
+def is_sm100_family():
+    """Check for SM100 family (Blackwell: SM100, SM103, SM110).
+
+    CuteDSL MoE NVFP4 kernels are optimized for SM100 architecture.
+    SM120+ (Rubin) may have different shared memory/TMEM configurations.
+    """
+    if not torch.cuda.is_available():
+        return False
+    props = torch.cuda.get_device_properties(0)
+    return props.major == 10
 
 
 def calc_tflops(n, ms, num_local_experts=None):
@@ -808,7 +815,6 @@ class BenchResult:
     tokens: int
     latency_ms: float
     tflops: float
-    us_per_token: float
 
 
 def run_benchmark(
@@ -922,7 +928,6 @@ def _benchmark_single(
                 tokens=n,
                 latency_ms=latency,
                 tflops=calc_tflops(n, latency, num_local),
-                us_per_token=(latency * 1000) / n,
             )
         )
     return results
@@ -930,9 +935,9 @@ def _benchmark_single(
 
 def _print_header(ep_config, num_local, use_cuda_graph, use_cupti):
     """Print benchmark header."""
-    print("\n" + "=" * 120)
+    print("\n" + "=" * 100)
     print(f"DeepSeek-V3 MoE Benchmark: CuteDSL vs CUTLASS vs TRTLLM (EP={ep_config})")
-    print("=" * 120)
+    print("=" * 100)
     print(
         f"Model: hidden={CFG.hidden_size}, intermediate={CFG.intermediate_size}, "
         f"experts={CFG.num_experts}, top_k={CFG.top_k}"
@@ -943,23 +948,23 @@ def _print_header(ep_config, num_local, use_cuda_graph, use_cupti):
     print(
         f"CUDA Graph: {'enabled' if use_cuda_graph else 'disabled'}, CUPTI: {'enabled' if use_cupti else 'disabled'}"
     )
-    print("-" * 120)
+    print("-" * 100)
     print(
         f"{'Tokens':>6} | "
-        f"{'CuteDSL':^22} | "
-        f"{'CUTLASS':^22} | "
-        f"{'TRTLLM':^22} | "
+        f"{'CuteDSL':^15} | "
+        f"{'CUTLASS':^15} | "
+        f"{'TRTLLM':^15} | "
         f"{'Speedup (CuteDSL/X)':^18} | "
         f"{'Winner':^8}"
     )
     print(
         f"{'':>6} | "
-        f"{'ms':>7} {'TFLOPS':>7} {'us/tok':>6} | "
-        f"{'ms':>7} {'TFLOPS':>7} {'us/tok':>6} | "
-        f"{'ms':>7} {'TFLOPS':>7} {'us/tok':>6} | "
+        f"{'ms':>7} {'TFLOPS':>7} | "
+        f"{'ms':>7} {'TFLOPS':>7} | "
+        f"{'ms':>7} {'TFLOPS':>7} | "
         f"{'CUTLASS':>8} {'TRTLLM':>8} |"
     )
-    print("-" * 120)
+    print("-" * 100)
 
 
 def _print_row(results):
@@ -977,9 +982,9 @@ def _print_row(results):
 
     print(
         f"{cute.tokens:>6} | "
-        f"{cute.latency_ms:>7.3f} {cute.tflops:>7.1f} {cute.us_per_token:>6.1f} | "
-        f"{cutlass.latency_ms:>7.3f} {cutlass.tflops:>7.1f} {cutlass.us_per_token:>6.1f} | "
-        f"{trtllm.latency_ms:>7.3f} {trtllm.tflops:>7.1f} {trtllm.us_per_token:>6.1f} | "
+        f"{cute.latency_ms:>7.3f} {cute.tflops:>7.1f} | "
+        f"{cutlass.latency_ms:>7.3f} {cutlass.tflops:>7.1f} | "
+        f"{trtllm.latency_ms:>7.3f} {trtllm.tflops:>7.1f} | "
         f"{speedup_cutlass:>7.2f}x {speedup_trtllm:>7.2f}x | "
         f"{winner:^8}"
     )
@@ -987,9 +992,8 @@ def _print_row(results):
 
 def _print_footer(ep_config, num_local):
     """Print benchmark footer."""
-    print("-" * 120)
+    print("-" * 100)
     print("Speedup > 1.0 means CuteDSL is faster than that backend")
-    print("us/tok = latency in microseconds per token (lower is better for generation)")
 
 
 def main():
@@ -1035,8 +1039,8 @@ def main():
     )
     args = parser.parse_args()
 
-    if not is_blackwell():
-        print("ERROR: Requires Blackwell GPU (SM100+)")
+    if not is_sm100_family():
+        print("ERROR: Requires SM100 family GPU (Blackwell: SM100, SM103, SM110)")
         return 1
 
     # Determine token counts

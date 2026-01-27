@@ -35,20 +35,25 @@ from torch.nn import functional as F
 from flashinfer.cute_dsl import is_cute_dsl_available
 
 
-def is_blackwell():
-    """Check if running on Blackwell GPU (SM100+)."""
+def is_sm100_family():
+    """Check for SM100 family (Blackwell: SM100, SM103, SM110).
+
+    CuteDSL MoE NVFP4 kernels are optimized for SM100 architecture.
+    SM120+ (Rubin) may have different shared memory/TMEM configurations.
+    """
     if not torch.cuda.is_available():
         return False
     props = torch.cuda.get_device_properties(0)
-    return props.major >= 10
+    return props.major == 10
 
 
 # Skip decorators
 cute_dsl_available = pytest.mark.skipif(
     not is_cute_dsl_available(), reason="CuteDSL not available"
 )
-blackwell_required = pytest.mark.skipif(
-    not is_blackwell(), reason="Requires Blackwell GPU (SM100+)"
+sm100_required = pytest.mark.skipif(
+    not is_sm100_family(),
+    reason="Requires SM100 family GPU (Blackwell: SM100, SM103, SM110)",
 )
 
 
@@ -286,7 +291,7 @@ def check_accuracy(
 
 
 @cute_dsl_available
-@blackwell_required
+@sm100_required
 class TestCuteDslFusedMoeFunctional:
     """Tests for the functional API: cute_dsl_fused_moe_nvfp4."""
 
@@ -398,7 +403,7 @@ class TestCuteDslFusedMoeFunctional:
 
 
 @cute_dsl_available
-@blackwell_required
+@sm100_required
 class TestCuteDslMoEWrapper:
     """Tests for the wrapper API: CuteDslMoEWrapper."""
 
@@ -642,7 +647,7 @@ class TestCuteDslMoEWrapper:
 
 
 @cute_dsl_available
-@blackwell_required
+@sm100_required
 class TestApiConsistency:
     """Tests verifying consistency between functional and wrapper APIs."""
 
@@ -721,7 +726,7 @@ class TestApiConsistency:
 
 
 @cute_dsl_available
-@blackwell_required
+@sm100_required
 class TestExpertParallelism:
     """Tests for expert parallelism (EP) configurations."""
 
