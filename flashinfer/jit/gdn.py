@@ -16,6 +16,7 @@ limitations under the License.
 
 import itertools
 import os
+import pathlib
 
 import jinja2
 
@@ -65,14 +66,17 @@ def gen_gdn_prefill_sm90_module() -> JitSpec:
             )
             write_if_different(dest_path, source)
 
-    # Use original source files directly (they have relative includes that work with csrc path)
-    source_paths.append(jit_env.FLASHINFER_CSRC_DIR / "gdn_prefill_launcher.cu")
-    source_paths.append(
-        jit_env.FLASHINFER_CSRC_DIR
-        / "flat"
-        / "prefill"
-        / "prefill_kernel_delta_rule_sm90.cu"
-    )
+    # Copy source files to gen_directory (like POD module does)
+    for filename in [
+        "gdn_prefill_launcher.cu",
+        "flat/prefill/prefill_kernel_delta_rule_sm90.cu",
+    ]:
+        src_path = jit_env.FLASHINFER_CSRC_DIR / filename
+        dest_path = gen_directory / pathlib.Path(filename).name
+        source_paths.append(dest_path)
+        with open(src_path, "r") as f:
+            source = f.read()
+        write_if_different(dest_path, source)
 
     return gen_jit_spec(
         uri,
