@@ -214,13 +214,6 @@ class FusedMoeLauncher {
 
     check_routing_logits_shape();
 
-    // If routing_logits is not provided, we expect pre-computed routing
-    // This will be validated in the prepare_routing phase where expert_indexes/weights are checked
-    if (!routing_logits.has_value()) {
-      // Pre-computed routing mode - expert_indexes and expert_weights will be validated later
-      // They are allocated/set in prepare_routing() by derived classes
-    }
-
     if (routing_bias.has_value()) {
       check_routing_bias_shape();
     }
@@ -1123,8 +1116,8 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
       TensorView const& gemm2_weights, TensorView const& gemm2_weights_scale,
       Optional<TensorView> const& gemm2_bias, Optional<TensorView> const& output1_scales_scalar,
       Optional<TensorView> const& output1_scales_gate_scalar,
-      Optional<TensorView> const& output2_scales_scalar, TensorView const& expert_indices,
-      TensorView const& expert_weights)
+      Optional<TensorView> const& output2_scales_scalar, TensorView const& topk_ids,
+      TensorView const& topk_weights)
       : FusedMoeLauncher(routing_logits, routing_bias, hidden_states, gemm1_weights,
                          output1_scales_scalar, output1_scales_gate_scalar, gemm2_weights,
                          output2_scales_scalar),
@@ -1136,8 +1129,8 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
         gemm1_clamp_limit(gemm1_clamp_limit),
         gemm2_weights_scale(gemm2_weights_scale),
         gemm2_bias(gemm2_bias),
-        expert_indices(expert_indices),
-        expert_weights(expert_weights) {}
+        topk_ids(topk_ids),
+        topk_weights(topk_weights) {}
 
   void init(std::unique_ptr<tensorrt_llm::kernels::trtllmgen_moe::MoE::MoERunnerArgs>&& args,
             int64_t tile_tokens_dim, int64_t routing_method_type, bool use_shuffled_weight,
@@ -1198,9 +1191,8 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     workspace.total_num_padded_tokens = static_cast<int*>(total_num_padded_tokens.data_ptr());
     workspace.total_max_padded_tokens = max_num_padded_tokens;
     workspace.ProjUpTileN = tile_tokens_dim;
-    workspace.routing_expert_indexes =
-        static_cast<int*>(const_cast<void*>(expert_indices.data_ptr()));
-    workspace.expert_weights = const_cast<void*>(expert_weights.data_ptr());
+    workspace.routing_expert_indexes = static_cast<int*>(const_cast<void*>(topk_ids.data_ptr()));
+    workspace.expert_weights = const_cast<void*>(topk_weights.data_ptr());
     workspace.permuted_idx_size = static_cast<int*>(total_num_padded_tokens.data_ptr());
     workspace.expanded_idx_to_permuted_idx =
         static_cast<int*>(expanded_idx_to_permuted_idx.data_ptr());
@@ -1339,8 +1331,8 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
   int32_t max_num_padded_tokens_gemm1{};
   int32_t max_num_padded_tokens_gemm2{};
   Optional<Tensor> gemm1_output_scale;
-  TensorView expert_indices;
-  TensorView expert_weights;
+  TensorView topk_ids;      // [num_tokens, top_k] - pre-computed or output top-k expert indices
+  TensorView topk_weights;  // [num_tokens, top_k] - pre-computed or output top-k routing weights
 
  public:
   Array<Tensor> run(int64_t moe_tactic, bool enable_pdl = true,
@@ -1353,17 +1345,20 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     tensorrt_llm::kernels::trtllmgen_moe::Routing::Runner routing_runner(tile_tokens_dim);
     cudaStream_t routing_stream = get_stream(hidden_states.device());
 
+    // When routing_logits is nullptr, use pre-computed topk_ids and topk_weights as inputs
+    // Otherwise, compute routing from logits and write results to topk_ids/topk_weights
+    int32_t* precomputed_topk_ids =
+        args->routing_logits == nullptr ? static_cast<int32_t*>(topk_ids.data_ptr()) : nullptr;
     routing_runner.run(
         args->routing_logits, args->routing_bias, args->num_tokens, args->num_experts, args->top_k,
         args->n_group, args->topk_group, args->local_expert_offset, args->local_num_experts,
-        args->routed_scaling_factor, static_cast<int*>(expert_indices.data_ptr()),
+        args->routed_scaling_factor, static_cast<int*>(topk_ids.data_ptr()),
         static_cast<int*>(expert_count_histogram.data_ptr()),
         static_cast<int*>(total_num_padded_tokens.data_ptr()),
         static_cast<int*>(expanded_idx_to_permuted_idx.data_ptr()),
-        nullptr /*permuted_idx_to_expanded_idx.data_ptr()*/,
-        static_cast<int*>(permuted_idx_to_token_idx.data_ptr()), expert_weights.data_ptr(),
-        nullptr /*expertIds - not used when computing from logits*/,
-        static_cast<int*>(num_tokens_per_expert.data_ptr()),
+        nullptr /*permuted_idx_to_expanded_idx*/,
+        static_cast<int*>(permuted_idx_to_token_idx.data_ptr()), topk_weights.data_ptr(),
+        precomputed_topk_ids, static_cast<int*>(num_tokens_per_expert.data_ptr()),
         static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr()),
         static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr()),
         static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt, mRoutingBiasDtype,
@@ -1658,7 +1653,7 @@ Tensor trtllm_fp8_block_scale_moe(
 }
 
 Array<Tensor> trtllm_fp4_block_scale_moe(
-    Optional<TensorView> routing_logits, TensorView topk_ids, TensorView expert_weights,
+    Optional<TensorView> routing_logits, TensorView topk_ids, TensorView topk_weights,
     Optional<TensorView> routing_bias, TensorView hidden_states,
     Optional<TensorView> hidden_states_scale, TensorView gemm1_weights,
     TensorView gemm1_weights_scale, Optional<TensorView> gemm1_bias,
@@ -1772,7 +1767,7 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
         routing_logits, routing_bias, hidden_states, hidden_states_scale, gemm1_weights,
         gemm1_weights_scale, gemm1_bias, gemm1_alpha, gemm1_beta, gemm1_clamp_limit, gemm2_weights,
         gemm2_weights_scale, gemm2_bias, output1_scales_scalar, output1_scales_gate_scalar,
-        output2_scales_scalar, topk_ids, expert_weights);
+        output2_scales_scalar, topk_ids, topk_weights);
     launcher->init(std::move(args), curr_tile_N, routing_method_type, /*use_shuffled_weight=*/true,
                    /*weight_layout=*/0, gated_act_type, mDtypeAct, mDtypeWeights);
 
