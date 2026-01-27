@@ -333,6 +333,7 @@ class CuteDslMoEWrapper:
         ...     output = moe.run(x, x_sf, topk_ids, topk_weights, w1, w1_sf, ...)
     """
 
+    @flashinfer_api
     def __init__(
         self,
         num_experts: int,
@@ -505,6 +506,7 @@ class CuteDslMoEWrapper:
             use_async_memset=True,
         )
 
+    @flashinfer_api
     def run(
         self,
         x: torch.Tensor,
