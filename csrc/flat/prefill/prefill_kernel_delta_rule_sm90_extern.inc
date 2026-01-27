@@ -22,167 +22,38 @@ namespace flat {
 
 // clang-format off
 
-// Extern template declarations for half (16 combinations)
-extern template void launch_delta_rule_prefill_kernel_gbai<false, false, false, false, cutlass::arch::Sm90, half, half, float>(
-    cudaStream_t, half*, float*, half const*, half const*, half const*,
-    float const*, float const*, float const*, int64_t const*, int32_t, int32_t,
+#define FOR_EACH_BOOL_4(MACRO, ...) \
+    MACRO(false, false, false, false, __VA_ARGS__) \
+    MACRO(false, false, false, true, __VA_ARGS__) \
+    MACRO(false, false, true, false, __VA_ARGS__) \
+    MACRO(false, false, true, true, __VA_ARGS__) \
+    MACRO(false, true, false, false, __VA_ARGS__) \
+    MACRO(false, true, false, true, __VA_ARGS__) \
+    MACRO(false, true, true, false, __VA_ARGS__) \
+    MACRO(false, true, true, true, __VA_ARGS__) \
+    MACRO(true, false, false, false, __VA_ARGS__) \
+    MACRO(true, false, false, true, __VA_ARGS__) \
+    MACRO(true, false, true, false, __VA_ARGS__) \
+    MACRO(true, false, true, true, __VA_ARGS__) \
+    MACRO(true, true, false, false, __VA_ARGS__) \
+    MACRO(true, true, false, true, __VA_ARGS__) \
+    MACRO(true, true, true, false, __VA_ARGS__) \
+    MACRO(true, true, true, true, __VA_ARGS__)
+
+#define DECLARE_TEMPLATE_INSTANCE(is_gva, needs_beta, needs_alpha, init_state, ctype) \
+extern template void launch_delta_rule_prefill_kernel_gbai<is_gva, needs_beta, needs_alpha, init_state, cutlass::arch::Sm90, ctype, ctype, float>( \
+    cudaStream_t, ctype*, float*, ctype const*, ctype const*, ctype const*, \
+    float const*, float const*, float const*, int64_t const*, int32_t, int32_t, \
     int32_t, int32_t, int32_t, int32_t, int64_t, float, int32_t);
 
-extern template void launch_delta_rule_prefill_kernel_gbai<false, false, false, true, cutlass::arch::Sm90, half, half, float>(
-    cudaStream_t, half*, float*, half const*, half const*, half const*,
-    float const*, float const*, float const*, int64_t const*, int32_t, int32_t,
-    int32_t, int32_t, int32_t, int32_t, int64_t, float, int32_t);
+// Extern template declarations for half
+FOR_EACH_BOOL_4(DECLARE_TEMPLATE_INSTANCE, half)
 
-extern template void launch_delta_rule_prefill_kernel_gbai<false, false, true, false, cutlass::arch::Sm90, half, half, float>(
-    cudaStream_t, half*, float*, half const*, half const*, half const*,
-    float const*, float const*, float const*, int64_t const*, int32_t, int32_t,
-    int32_t, int32_t, int32_t, int32_t, int64_t, float, int32_t);
+// Extern template declarations for nv_bfloat16
+FOR_EACH_BOOL_4(DECLARE_TEMPLATE_INSTANCE, nv_bfloat16)
 
-extern template void launch_delta_rule_prefill_kernel_gbai<false, false, true, true, cutlass::arch::Sm90, half, half, float>(
-    cudaStream_t, half*, float*, half const*, half const*, half const*,
-    float const*, float const*, float const*, int64_t const*, int32_t, int32_t,
-    int32_t, int32_t, int32_t, int32_t, int64_t, float, int32_t);
-
-extern template void launch_delta_rule_prefill_kernel_gbai<false, true, false, false, cutlass::arch::Sm90, half, half, float>(
-    cudaStream_t, half*, float*, half const*, half const*, half const*,
-    float const*, float const*, float const*, int64_t const*, int32_t, int32_t,
-    int32_t, int32_t, int32_t, int32_t, int64_t, float, int32_t);
-
-extern template void launch_delta_rule_prefill_kernel_gbai<false, true, false, true, cutlass::arch::Sm90, half, half, float>(
-    cudaStream_t, half*, float*, half const*, half const*, half const*,
-    float const*, float const*, float const*, int64_t const*, int32_t, int32_t,
-    int32_t, int32_t, int32_t, int32_t, int64_t, float, int32_t);
-
-extern template void launch_delta_rule_prefill_kernel_gbai<false, true, true, false, cutlass::arch::Sm90, half, half, float>(
-    cudaStream_t, half*, float*, half const*, half const*, half const*,
-    float const*, float const*, float const*, int64_t const*, int32_t, int32_t,
-    int32_t, int32_t, int32_t, int32_t, int64_t, float, int32_t);
-
-extern template void launch_delta_rule_prefill_kernel_gbai<false, true, true, true, cutlass::arch::Sm90, half, half, float>(
-    cudaStream_t, half*, float*, half const*, half const*, half const*,
-    float const*, float const*, float const*, int64_t const*, int32_t, int32_t,
-    int32_t, int32_t, int32_t, int32_t, int64_t, float, int32_t);
-
-extern template void launch_delta_rule_prefill_kernel_gbai<true, false, false, false, cutlass::arch::Sm90, half, half, float>(
-    cudaStream_t, half*, float*, half const*, half const*, half const*,
-    float const*, float const*, float const*, int64_t const*, int32_t, int32_t,
-    int32_t, int32_t, int32_t, int32_t, int64_t, float, int32_t);
-
-extern template void launch_delta_rule_prefill_kernel_gbai<true, false, false, true, cutlass::arch::Sm90, half, half, float>(
-    cudaStream_t, half*, float*, half const*, half const*, half const*,
-    float const*, float const*, float const*, int64_t const*, int32_t, int32_t,
-    int32_t, int32_t, int32_t, int32_t, int64_t, float, int32_t);
-
-extern template void launch_delta_rule_prefill_kernel_gbai<true, false, true, false, cutlass::arch::Sm90, half, half, float>(
-    cudaStream_t, half*, float*, half const*, half const*, half const*,
-    float const*, float const*, float const*, int64_t const*, int32_t, int32_t,
-    int32_t, int32_t, int32_t, int32_t, int64_t, float, int32_t);
-
-extern template void launch_delta_rule_prefill_kernel_gbai<true, false, true, true, cutlass::arch::Sm90, half, half, float>(
-    cudaStream_t, half*, float*, half const*, half const*, half const*,
-    float const*, float const*, float const*, int64_t const*, int32_t, int32_t,
-    int32_t, int32_t, int32_t, int32_t, int64_t, float, int32_t);
-
-extern template void launch_delta_rule_prefill_kernel_gbai<true, true, false, false, cutlass::arch::Sm90, half, half, float>(
-    cudaStream_t, half*, float*, half const*, half const*, half const*,
-    float const*, float const*, float const*, int64_t const*, int32_t, int32_t,
-    int32_t, int32_t, int32_t, int32_t, int64_t, float, int32_t);
-
-extern template void launch_delta_rule_prefill_kernel_gbai<true, true, false, true, cutlass::arch::Sm90, half, half, float>(
-    cudaStream_t, half*, float*, half const*, half const*, half const*,
-    float const*, float const*, float const*, int64_t const*, int32_t, int32_t,
-    int32_t, int32_t, int32_t, int32_t, int64_t, float, int32_t);
-
-extern template void launch_delta_rule_prefill_kernel_gbai<true, true, true, false, cutlass::arch::Sm90, half, half, float>(
-    cudaStream_t, half*, float*, half const*, half const*, half const*,
-    float const*, float const*, float const*, int64_t const*, int32_t, int32_t,
-    int32_t, int32_t, int32_t, int32_t, int64_t, float, int32_t);
-
-extern template void launch_delta_rule_prefill_kernel_gbai<true, true, true, true, cutlass::arch::Sm90, half, half, float>(
-    cudaStream_t, half*, float*, half const*, half const*, half const*,
-    float const*, float const*, float const*, int64_t const*, int32_t, int32_t,
-    int32_t, int32_t, int32_t, int32_t, int64_t, float, int32_t);
-
-// Extern template declarations for nv_bfloat16 (16 combinations)
-extern template void launch_delta_rule_prefill_kernel_gbai<false, false, false, false, cutlass::arch::Sm90, nv_bfloat16, nv_bfloat16, float>(
-    cudaStream_t, nv_bfloat16*, float*, nv_bfloat16 const*, nv_bfloat16 const*, nv_bfloat16 const*,
-    float const*, float const*, float const*, int64_t const*, int32_t, int32_t,
-    int32_t, int32_t, int32_t, int32_t, int64_t, float, int32_t);
-
-extern template void launch_delta_rule_prefill_kernel_gbai<false, false, false, true, cutlass::arch::Sm90, nv_bfloat16, nv_bfloat16, float>(
-    cudaStream_t, nv_bfloat16*, float*, nv_bfloat16 const*, nv_bfloat16 const*, nv_bfloat16 const*,
-    float const*, float const*, float const*, int64_t const*, int32_t, int32_t,
-    int32_t, int32_t, int32_t, int32_t, int64_t, float, int32_t);
-
-extern template void launch_delta_rule_prefill_kernel_gbai<false, false, true, false, cutlass::arch::Sm90, nv_bfloat16, nv_bfloat16, float>(
-    cudaStream_t, nv_bfloat16*, float*, nv_bfloat16 const*, nv_bfloat16 const*, nv_bfloat16 const*,
-    float const*, float const*, float const*, int64_t const*, int32_t, int32_t,
-    int32_t, int32_t, int32_t, int32_t, int64_t, float, int32_t);
-
-extern template void launch_delta_rule_prefill_kernel_gbai<false, false, true, true, cutlass::arch::Sm90, nv_bfloat16, nv_bfloat16, float>(
-    cudaStream_t, nv_bfloat16*, float*, nv_bfloat16 const*, nv_bfloat16 const*, nv_bfloat16 const*,
-    float const*, float const*, float const*, int64_t const*, int32_t, int32_t,
-    int32_t, int32_t, int32_t, int32_t, int64_t, float, int32_t);
-
-extern template void launch_delta_rule_prefill_kernel_gbai<false, true, false, false, cutlass::arch::Sm90, nv_bfloat16, nv_bfloat16, float>(
-    cudaStream_t, nv_bfloat16*, float*, nv_bfloat16 const*, nv_bfloat16 const*, nv_bfloat16 const*,
-    float const*, float const*, float const*, int64_t const*, int32_t, int32_t,
-    int32_t, int32_t, int32_t, int32_t, int64_t, float, int32_t);
-
-extern template void launch_delta_rule_prefill_kernel_gbai<false, true, false, true, cutlass::arch::Sm90, nv_bfloat16, nv_bfloat16, float>(
-    cudaStream_t, nv_bfloat16*, float*, nv_bfloat16 const*, nv_bfloat16 const*, nv_bfloat16 const*,
-    float const*, float const*, float const*, int64_t const*, int32_t, int32_t,
-    int32_t, int32_t, int32_t, int32_t, int64_t, float, int32_t);
-
-extern template void launch_delta_rule_prefill_kernel_gbai<false, true, true, false, cutlass::arch::Sm90, nv_bfloat16, nv_bfloat16, float>(
-    cudaStream_t, nv_bfloat16*, float*, nv_bfloat16 const*, nv_bfloat16 const*, nv_bfloat16 const*,
-    float const*, float const*, float const*, int64_t const*, int32_t, int32_t,
-    int32_t, int32_t, int32_t, int32_t, int64_t, float, int32_t);
-
-extern template void launch_delta_rule_prefill_kernel_gbai<false, true, true, true, cutlass::arch::Sm90, nv_bfloat16, nv_bfloat16, float>(
-    cudaStream_t, nv_bfloat16*, float*, nv_bfloat16 const*, nv_bfloat16 const*, nv_bfloat16 const*,
-    float const*, float const*, float const*, int64_t const*, int32_t, int32_t,
-    int32_t, int32_t, int32_t, int32_t, int64_t, float, int32_t);
-
-extern template void launch_delta_rule_prefill_kernel_gbai<true, false, false, false, cutlass::arch::Sm90, nv_bfloat16, nv_bfloat16, float>(
-    cudaStream_t, nv_bfloat16*, float*, nv_bfloat16 const*, nv_bfloat16 const*, nv_bfloat16 const*,
-    float const*, float const*, float const*, int64_t const*, int32_t, int32_t,
-    int32_t, int32_t, int32_t, int32_t, int64_t, float, int32_t);
-
-extern template void launch_delta_rule_prefill_kernel_gbai<true, false, false, true, cutlass::arch::Sm90, nv_bfloat16, nv_bfloat16, float>(
-    cudaStream_t, nv_bfloat16*, float*, nv_bfloat16 const*, nv_bfloat16 const*, nv_bfloat16 const*,
-    float const*, float const*, float const*, int64_t const*, int32_t, int32_t,
-    int32_t, int32_t, int32_t, int32_t, int64_t, float, int32_t);
-
-extern template void launch_delta_rule_prefill_kernel_gbai<true, false, true, false, cutlass::arch::Sm90, nv_bfloat16, nv_bfloat16, float>(
-    cudaStream_t, nv_bfloat16*, float*, nv_bfloat16 const*, nv_bfloat16 const*, nv_bfloat16 const*,
-    float const*, float const*, float const*, int64_t const*, int32_t, int32_t,
-    int32_t, int32_t, int32_t, int32_t, int64_t, float, int32_t);
-
-extern template void launch_delta_rule_prefill_kernel_gbai<true, false, true, true, cutlass::arch::Sm90, nv_bfloat16, nv_bfloat16, float>(
-    cudaStream_t, nv_bfloat16*, float*, nv_bfloat16 const*, nv_bfloat16 const*, nv_bfloat16 const*,
-    float const*, float const*, float const*, int64_t const*, int32_t, int32_t,
-    int32_t, int32_t, int32_t, int32_t, int64_t, float, int32_t);
-
-extern template void launch_delta_rule_prefill_kernel_gbai<true, true, false, false, cutlass::arch::Sm90, nv_bfloat16, nv_bfloat16, float>(
-    cudaStream_t, nv_bfloat16*, float*, nv_bfloat16 const*, nv_bfloat16 const*, nv_bfloat16 const*,
-    float const*, float const*, float const*, int64_t const*, int32_t, int32_t,
-    int32_t, int32_t, int32_t, int32_t, int64_t, float, int32_t);
-
-extern template void launch_delta_rule_prefill_kernel_gbai<true, true, false, true, cutlass::arch::Sm90, nv_bfloat16, nv_bfloat16, float>(
-    cudaStream_t, nv_bfloat16*, float*, nv_bfloat16 const*, nv_bfloat16 const*, nv_bfloat16 const*,
-    float const*, float const*, float const*, int64_t const*, int32_t, int32_t,
-    int32_t, int32_t, int32_t, int32_t, int64_t, float, int32_t);
-
-extern template void launch_delta_rule_prefill_kernel_gbai<true, true, true, false, cutlass::arch::Sm90, nv_bfloat16, nv_bfloat16, float>(
-    cudaStream_t, nv_bfloat16*, float*, nv_bfloat16 const*, nv_bfloat16 const*, nv_bfloat16 const*,
-    float const*, float const*, float const*, int64_t const*, int32_t, int32_t,
-    int32_t, int32_t, int32_t, int32_t, int64_t, float, int32_t);
-
-extern template void launch_delta_rule_prefill_kernel_gbai<true, true, true, true, cutlass::arch::Sm90, nv_bfloat16, nv_bfloat16, float>(
-    cudaStream_t, nv_bfloat16*, float*, nv_bfloat16 const*, nv_bfloat16 const*, nv_bfloat16 const*,
-    float const*, float const*, float const*, int64_t const*, int32_t, int32_t,
-    int32_t, int32_t, int32_t, int32_t, int64_t, float, int32_t);
+#undef DECLARE_TEMPLATE_INSTANCE
+#undef FOR_EACH_BOOL_4
 
 // clang-format on
 
