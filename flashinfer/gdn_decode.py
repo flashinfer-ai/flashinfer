@@ -1945,7 +1945,7 @@ def gdn_verify_kernel_mtp(
                 r_k[i] = cutlass.Float32(k[i_n, i_t, i_h, i * 32 + lane_id])
 
             # Apply L2 normalization to q, k (with scale fused for q)
-            if use_qk_l2norm:
+            if cutlass.const_expr(use_qk_l2norm):
                 sum_q = 0.0
                 sum_k = 0.0
                 for i in cutlass.range_constexpr(vec_size):
@@ -2055,7 +2055,7 @@ def gdn_verify_kernel_mtp(
                         r_h[i] += r_k[i] * v_new
 
                     # Cache intermediate state if needed
-                    if cache_intermediate_states:
+                    if cutlass.const_expr(cache_intermediate_states):
                         flat_idx = i_n * T * HV + i_t * HV + i_hv
                         for i in cutlass.range_constexpr(vec_size):
                             intermediate_states[(flat_idx, v_idx, i * 32 + lane_id)] = (
@@ -2077,7 +2077,7 @@ def gdn_verify_kernel_mtp(
                         o[(i_n, i_t, i_hv, v_idx)] = cutlass.BFloat16(sum_hq)
 
                 # Write final state back (if not disabled)
-                if not disable_state_update:
+                if cutlass.const_expr(not disable_state_update):
                     for i in cutlass.range_constexpr(vec_size):
                         h0_source[(flat_state_idx, v_idx, i * 32 + lane_id)] = r_h[i]
 
