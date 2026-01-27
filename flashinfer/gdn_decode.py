@@ -1944,7 +1944,7 @@ def gdn_verify_kernel_mtp(
                 r_q[i] = cutlass.Float32(q[i_n, i_t, i_h, i * 32 + lane_id])
                 r_k[i] = cutlass.Float32(k[i_n, i_t, i_h, i * 32 + lane_id])
 
-            # Apply L2 normalization to q, k
+            # Apply L2 normalization to q, k (with scale fused for q)
             if use_qk_l2norm:
                 sum_q = 0.0
                 sum_k = 0.0
@@ -1960,49 +1960,51 @@ def gdn_verify_kernel_mtp(
                         sum_k, offset=offset, mask=-1, mask_and_clamp=31
                     )
 
-                inv_norm_q = cute.rsqrt(sum_q + 1e-6, fastmath=True)
+                # Fuse scale into q's normalization factor
+                inv_norm_q_scaled = cute.rsqrt(sum_q + 1e-6, fastmath=True) * scale
                 inv_norm_k = cute.rsqrt(sum_k + 1e-6, fastmath=True)
 
                 for i in cutlass.range_constexpr(vec_size):
-                    r_q[i] = r_q[i] * inv_norm_q
+                    r_q[i] = r_q[i] * inv_norm_q_scaled
                     r_k[i] = r_k[i] * inv_norm_k
-
-            # Apply scaling to q
-            for i in cutlass.range_constexpr(vec_size):
-                r_q[i] = r_q[i] * scale
+            else:
+                # No L2 norm, just apply scale to q
+                for i in cutlass.range_constexpr(vec_size):
+                    r_q[i] = r_q[i] * scale
 
             # Store to shared memory
             for i in cutlass.range_constexpr(vec_size):
                 sQ[(i_t, i * 32 + lane_id)] = r_q[i]
                 sK[(i_t, i * 32 + lane_id)] = r_k[i]
 
-            # Compute g, beta (only lane 0)
+            # Compute g, beta - all lanes compute (redundant but no divergence)
             r_a = cutlass.Float32(a[i_n, i_t, i_hv])
             r_b = cutlass.Float32(b[i_n, i_t, i_hv])
-            r_g = 0.0
-            r_beta = 0.0
-            if lane_id == 0:
-                x = r_a + r_dt_bias
-                beta_x = softplus_beta * x
-                softplus_x = 0.0
 
-                if beta_x <= softplus_threshold:
-                    exp_beta_x = cute.exp(beta_x, fastmath=True)
-                    log_input = cutlass.Float32(1.0 + exp_beta_x)
-                    log_result = cutlass.Float32(cute.log(log_input, fastmath=True))
-                    softplus_x = cutlass.Float32(
-                        (cutlass.Float32(1.0) / softplus_beta) * log_result
-                    )
-                else:
-                    softplus_x = x
+            x = r_a + r_dt_bias
+            beta_x = softplus_beta * x
 
-                r_g_value = -cute.exp(r_A_log, fastmath=True) * softplus_x
-                r_beta = 1.0 / (1.0 + cute.exp(-r_b, fastmath=True))
-                r_g = cute.exp(r_g_value, fastmath=True)
+            # Branchless softplus
+            exp_beta_x = cute.exp(beta_x, fastmath=True)
+            softplus_val = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
+                cutlass.Float32(1.0) + exp_beta_x, fastmath=True
+            )
+            use_softplus = (
+                cutlass.Float32(1.0)
+                if beta_x <= softplus_threshold
+                else cutlass.Float32(0.0)
+            )
+            softplus_x = (
+                use_softplus * softplus_val + (cutlass.Float32(1.0) - use_softplus) * x
+            )
 
-            r_g = cute.arch.shuffle_sync(r_g, 0)
-            r_beta = cute.arch.shuffle_sync(r_beta, 0)
+            r_g_value = -cute.exp(r_A_log, fastmath=True) * softplus_x
+            r_beta = cutlass.Float32(1.0) / (
+                cutlass.Float32(1.0) + cute.exp(-r_b, fastmath=True)
+            )
+            r_g = cute.exp(r_g_value, fastmath=True)
 
+            # Only thread 0 stores to shared memory
             if tidx == 0:
                 sG[i_t] = r_g
                 sBeta[i_t] = r_beta
