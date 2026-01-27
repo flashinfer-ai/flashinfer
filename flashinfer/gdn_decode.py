@@ -102,12 +102,28 @@ TILE_K_MTP = 128  # Full K dimension (shared across all configs)
 NUM_THREADS_MTP = 128  # 4 warps (shared across all configs)
 
 
+def get_vec_size_mtp(batch_size: int) -> int:
+    """Select vec_size for MTP kernel based on batch size.
+
+    B <= 4: vec_size=4 (full warp reduction, 5 shuffles) - better for small batch
+    B > 4: vec_size=8 (half-warp reduction, 4 shuffles) - better for large batch
+    """
+    if batch_size <= 4:
+        return 4  # Full warp: 32 threads * 4 elements = 128
+    else:
+        return 8  # Half-warp: 16 threads * 8 elements = 128
+
+
 def get_tile_v_mtp(batch_size: int) -> int:
-    """Select optimal TILE_V for MTP kernel based on batch size."""
-    if batch_size <= 2:
-        return 4
+    """Select optimal TILE_V for MTP kernel based on batch size.
+
+    For vec_size=4 (B<=4): 4 groups per block, tile_v >= 4
+    For vec_size=8 (B>4): 8 groups per block, tile_v >= 8
+    """
+    if batch_size == 1:
+        return 4  # Optimal for B=1
     elif batch_size <= 4:
-        return 8
+        return 8  # Better for B=2,3,4
     elif batch_size <= 8:
         return 16
     else:
@@ -1897,6 +1913,19 @@ def gdn_verify_kernel_mtp(
     lane_id = tidx % 32
     warp_idx = cute.arch.warp_idx()
     warp_idx = cute.arch.make_warp_uniform(warp_idx)
+
+    # Compute thread grouping based on vec_size:
+    # vec_size=8: 16 threads per group (half-warp), 8 groups per block
+    # vec_size=4: 32 threads per group (full warp), 4 groups per block
+    threads_per_group: cutlass.Constexpr[int] = K // vec_size  # 16 or 32
+    groups_per_warp: cutlass.Constexpr[int] = 32 // threads_per_group  # 2 or 1
+    num_groups: cutlass.Constexpr[int] = 4 * groups_per_warp  # 8 or 4
+
+    # Lane position within group and group index
+    lane_in_group = lane_id % threads_per_group
+    group_in_warp = lane_id // threads_per_group
+    group_idx = warp_idx * groups_per_warp + group_in_warp
+
     batch_idx, _, _ = cute.arch.block_idx()
 
     # Decode block index: (i_n, i_hv, i_v) from batch_idx
@@ -1939,10 +1968,14 @@ def gdn_verify_kernel_mtp(
     if cache_idx >= 0:
         # Pre-compute q, k, g, beta for ALL time steps ONCE (shared across warps)
         for i_t in cutlass.range_constexpr(T):
-            # Load q, k into registers
+            # Load q, k into registers (threads_per_group * vec_size = 128)
             for i in cutlass.range_constexpr(vec_size):
-                r_q[i] = cutlass.Float32(q[i_n, i_t, i_h, i * 32 + lane_id])
-                r_k[i] = cutlass.Float32(k[i_n, i_t, i_h, i * 32 + lane_id])
+                r_q[i] = cutlass.Float32(
+                    q[i_n, i_t, i_h, i * threads_per_group + lane_in_group]
+                )
+                r_k[i] = cutlass.Float32(
+                    k[i_n, i_t, i_h, i * threads_per_group + lane_in_group]
+                )
 
             # Apply L2 normalization to q, k (with scale fused for q)
             if cutlass.const_expr(use_qk_l2norm):
@@ -1952,13 +1985,25 @@ def gdn_verify_kernel_mtp(
                     sum_q += r_q[i] * r_q[i]
                     sum_k += r_k[i] * r_k[i]
 
-                for offset in [16, 8, 4, 2, 1]:
-                    sum_q += cute.arch.shuffle_sync_bfly(
-                        sum_q, offset=offset, mask=-1, mask_and_clamp=31
-                    )
-                    sum_k += cute.arch.shuffle_sync_bfly(
-                        sum_k, offset=offset, mask=-1, mask_and_clamp=31
-                    )
+                # Reduction based on threads_per_group:
+                # vec_size=8 (16 threads): [8,4,2,1]
+                # vec_size=4 (32 threads): [16,8,4,2,1]
+                if cutlass.const_expr(vec_size == 8):
+                    for offset in [8, 4, 2, 1]:
+                        sum_q += cute.arch.shuffle_sync_bfly(
+                            sum_q, offset=offset, mask=-1, mask_and_clamp=31
+                        )
+                        sum_k += cute.arch.shuffle_sync_bfly(
+                            sum_k, offset=offset, mask=-1, mask_and_clamp=31
+                        )
+                else:
+                    for offset in [16, 8, 4, 2, 1]:
+                        sum_q += cute.arch.shuffle_sync_bfly(
+                            sum_q, offset=offset, mask=-1, mask_and_clamp=31
+                        )
+                        sum_k += cute.arch.shuffle_sync_bfly(
+                            sum_k, offset=offset, mask=-1, mask_and_clamp=31
+                        )
 
                 # Fuse scale into q's normalization factor
                 inv_norm_q_scaled = cute.rsqrt(sum_q + 1e-6, fastmath=True) * scale
@@ -1972,10 +2017,11 @@ def gdn_verify_kernel_mtp(
                 for i in cutlass.range_constexpr(vec_size):
                     r_q[i] = r_q[i] * scale
 
-            # Store to shared memory
-            for i in cutlass.range_constexpr(vec_size):
-                sQ[(i_t, i * 32 + lane_id)] = r_q[i]
-                sK[(i_t, i * 32 + lane_id)] = r_k[i]
+            # Store to shared memory (only first group writes)
+            if tidx < threads_per_group:
+                for i in cutlass.range_constexpr(vec_size):
+                    sQ[(i_t, i * threads_per_group + lane_in_group)] = r_q[i]
+                    sK[(i_t, i * threads_per_group + lane_in_group)] = r_k[i]
 
             # Compute g, beta - all lanes compute (redundant but no divergence)
             r_a = cutlass.Float32(a[i_n, i_t, i_hv])
@@ -2011,23 +2057,25 @@ def gdn_verify_kernel_mtp(
 
         cute.arch.barrier()
 
-        # Each warp handles tile_v/4 V rows
-        rows_per_warp: cutlass.Constexpr[int] = tile_v // 4
-        for row_in_warp in cutlass.range_constexpr(rows_per_warp):
-            v_idx = i_v * tile_v + warp_idx * rows_per_warp + row_in_warp
+        # Each group handles tile_v/num_groups V rows
+        rows_per_group: cutlass.Constexpr[int] = tile_v // num_groups
+        for row_in_group in cutlass.range_constexpr(rows_per_group):
+            v_idx = i_v * tile_v + group_idx * rows_per_group + row_in_group
 
             if v_idx < V:
                 # Load h[v_idx, :] into registers
                 flat_state_idx = cache_idx * HV + i_hv
                 for i in cutlass.range_constexpr(vec_size):
-                    r_h[i] = h0_source[(flat_state_idx, v_idx, i * 32 + lane_id)]
+                    r_h[i] = h0_source[
+                        (flat_state_idx, v_idx, i * threads_per_group + lane_in_group)
+                    ]
 
                 # Process all T time steps with h in registers
                 for i_t in cutlass.range_constexpr(T):
                     # Load pre-computed q, k, g, beta from shared memory
                     for i in cutlass.range_constexpr(vec_size):
-                        r_q[i] = sQ[(i_t, i * 32 + lane_id)]
-                        r_k[i] = sK[(i_t, i * 32 + lane_id)]
+                        r_q[i] = sQ[(i_t, i * threads_per_group + lane_in_group)]
+                        r_k[i] = sK[(i_t, i * threads_per_group + lane_in_group)]
 
                     r_g = sG[i_t]
                     r_beta = sBeta[i_t]
@@ -2036,15 +2084,21 @@ def gdn_verify_kernel_mtp(
                     for i in cutlass.range_constexpr(vec_size):
                         r_h[i] = r_h[i] * r_g
 
-                    # Step 2: Compute sum_hk = h @ k (reduction over K)
+                    # Step 2: Compute sum_hk = h @ k (group reduction)
                     sum_hk = 0.0
                     for i in cutlass.range_constexpr(vec_size):
                         sum_hk += r_h[i] * r_k[i]
 
-                    for offset in [16, 8, 4, 2, 1]:
-                        sum_hk += cute.arch.shuffle_sync_bfly(
-                            sum_hk, offset=offset, mask=-1, mask_and_clamp=31
-                        )
+                    if cutlass.const_expr(vec_size == 8):
+                        for offset in [8, 4, 2, 1]:
+                            sum_hk += cute.arch.shuffle_sync_bfly(
+                                sum_hk, offset=offset, mask=-1, mask_and_clamp=31
+                            )
+                    else:
+                        for offset in [16, 8, 4, 2, 1]:
+                            sum_hk += cute.arch.shuffle_sync_bfly(
+                                sum_hk, offset=offset, mask=-1, mask_and_clamp=31
+                            )
 
                     # Step 3: Load v for this v_idx and time step, apply delta rule
                     r_v = cutlass.Float32(v[i_n, i_t, i_hv, v_idx])
@@ -2058,28 +2112,40 @@ def gdn_verify_kernel_mtp(
                     if cutlass.const_expr(cache_intermediate_states):
                         flat_idx = i_n * T * HV + i_t * HV + i_hv
                         for i in cutlass.range_constexpr(vec_size):
-                            intermediate_states[(flat_idx, v_idx, i * 32 + lane_id)] = (
-                                r_h[i]
-                            )
+                            intermediate_states[
+                                (flat_idx, v_idx, i * threads_per_group + lane_in_group)
+                            ] = r_h[i]
 
-                    # Step 5: Compute output: sum_hq = h @ q (reduction over K)
+                    # Step 5: Compute output: sum_hq = h @ q (group reduction)
                     sum_hq = 0.0
                     for i in cutlass.range_constexpr(vec_size):
                         sum_hq += r_h[i] * r_q[i]
 
-                    for offset in [16, 8, 4, 2, 1]:
-                        sum_hq += cute.arch.shuffle_sync_bfly(
-                            sum_hq, offset=offset, mask=-1, mask_and_clamp=31
-                        )
+                    if cutlass.const_expr(vec_size == 8):
+                        for offset in [8, 4, 2, 1]:
+                            sum_hq += cute.arch.shuffle_sync_bfly(
+                                sum_hq, offset=offset, mask=-1, mask_and_clamp=31
+                            )
+                    else:
+                        for offset in [16, 8, 4, 2, 1]:
+                            sum_hq += cute.arch.shuffle_sync_bfly(
+                                sum_hq, offset=offset, mask=-1, mask_and_clamp=31
+                            )
 
-                    # Write output (only lane 0)
-                    if lane_id == 0:
+                    # Write output (only lane 0 of each group)
+                    if lane_in_group == 0:
                         o[(i_n, i_t, i_hv, v_idx)] = cutlass.BFloat16(sum_hq)
 
                 # Write final state back (if not disabled)
                 if cutlass.const_expr(not disable_state_update):
                     for i in cutlass.range_constexpr(vec_size):
-                        h0_source[(flat_state_idx, v_idx, i * 32 + lane_id)] = r_h[i]
+                        h0_source[
+                            (
+                                flat_state_idx,
+                                v_idx,
+                                i * threads_per_group + lane_in_group,
+                            )
+                        ] = r_h[i]
 
 
 @cute.jit
@@ -2106,6 +2172,7 @@ def run_gdn_verify_kernel_mtp(
     K: cutlass.Constexpr[int],
     V: cutlass.Constexpr[int],
     tile_v: cutlass.Constexpr[int],  # TILE_V - configurable for batch size
+    vec_size: cutlass.Constexpr[int],  # 4 for full warp, 8 for half-warp
     use_initial_state: cutlass.Constexpr[bool],
     use_qk_l2norm: cutlass.Constexpr[bool],
     is_varlen: cutlass.Constexpr[bool],
@@ -2120,7 +2187,6 @@ def run_gdn_verify_kernel_mtp(
     )
 
     num_v_tiles = cute.ceil_div(v_dim, tile_v)
-    vec_size = TILE_K_MTP // 32  # Each thread in a warp processes this many elements
 
     # Grid: (B * HV * num_v_tiles, 1, 1) - parallelize across V dimension
     grid_size = B * HV * num_v_tiles
@@ -2187,6 +2253,7 @@ def _get_compiled_mtp_kernel(
     scale: float,
     use_qk_l2norm: bool,
     tile_v: int,  # TILE_V - configurable for batch size
+    vec_size: int,  # 4 for full warp, 8 for half-warp
 ):
     """Cache compiled MTP kernel for given configuration."""
     return {}
@@ -2263,8 +2330,9 @@ def gated_delta_rule_mtp(
     _, _, HV, V = v.shape
     pool_size = initial_state.shape[0]
 
-    # Dynamic TILE_V selection based on batch size
+    # Dynamic TILE_V and vec_size selection based on batch size
     tile_v = get_tile_v_mtp(B)
+    vec_size = get_vec_size_mtp(B)
 
     # Validate state shape
     assert initial_state.shape == (pool_size, HV, V, K), (
@@ -2336,6 +2404,7 @@ def gated_delta_rule_mtp(
         scale,
         use_qk_l2norm,
         tile_v,
+        vec_size,
     )
     cache = _get_compiled_mtp_kernel(*cache_key)
 
@@ -2386,6 +2455,7 @@ def gated_delta_rule_mtp(
             K=K,
             V=V,
             tile_v=tile_v,
+            vec_size=vec_size,
             use_initial_state=True,
             use_qk_l2norm=use_qk_l2norm,
             is_varlen=False,
