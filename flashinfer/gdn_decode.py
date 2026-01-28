@@ -1973,19 +1973,35 @@ def gdn_verify_kernel_mtp(
     r_h = cute.make_rmem_tensor(
         cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32
     )
+    # BF16 register tensors for vectorized q, k loading
+    r_q_bf16 = cute.make_rmem_tensor(
+        cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16
+    )
+    r_k_bf16 = cute.make_rmem_tensor(
+        cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16
+    )
 
     # Only process valid batch entries (cache_idx >= 0)
     if cache_idx >= 0:
-        # Compute k_start once (used throughout)
+        # Compute k_start once (used for shared memory writes)
         k_start = lane_in_group * vec_size
 
         # Pre-compute q, k, g, beta for ALL time steps ONCE (shared across warps)
         for i_t in cutlass.range_constexpr(T):
-            # Load q, k into registers - contiguous access pattern
-            # Each thread reads vec_size consecutive elements
+            # Load q, k into BF16 registers using autovec_copy (coalesced)
+            q_tile = cute.local_tile(
+                q, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane_in_group)
+            )
+            k_tile = cute.local_tile(
+                k, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane_in_group)
+            )
+            cute.autovec_copy(q_tile, r_q_bf16)
+            cute.autovec_copy(k_tile, r_k_bf16)
+
+            # Convert BF16 to FP32 for computation
             for i in cutlass.range_constexpr(vec_size):
-                r_q[i] = cutlass.Float32(q[i_n, i_t, i_h, k_start + i])
-                r_k[i] = cutlass.Float32(k[i_n, i_t, i_h, k_start + i])
+                r_q[i] = cutlass.Float32(r_q_bf16[i])
+                r_k[i] = cutlass.Float32(r_k_bf16[i])
 
             # Apply L2 normalization to q, k (with scale fused for q)
             if cutlass.const_expr(use_qk_l2norm):
