@@ -256,8 +256,9 @@ def gen_trtllm_gen_fused_moe_sm100_module() -> JitSpec:
     for file in header_files:
         uri_path = f"{header_path}/{file}"
         file_hash = get_meta_hash(checksum, file)
-        file_path = jit_env.FLASHINFER_CUBIN_DIR / "trtllmGen_bmm_export" / file
-        get_file(uri_path, file_hash, file_path)
+        file_path = str(jit_env.FLASHINFER_CUBIN_DIR / "trtllmGen_bmm_export" / file)
+        result = get_file(uri_path, file_hash, file_path)
+        assert result, f"{file} not found"
     # Create directory flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export pointing to trtllmGen_bmm_export
 
     symlink_parent = str(

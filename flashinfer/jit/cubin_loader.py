@@ -197,8 +197,8 @@ def make_symlink(src: str, symlink_parent: str, symlink_name: str) -> None:
     Create a symlink from {src} to {symlink_parent}/{symlink_name}.
     If the symlink does not exist, create the parent directory and create the symlink.
     """
-    symlink_path = safe_urljoin(symlink_parent, symlink_name)
-    if not os.path.exists(symlink_path):
+    symlink_path = os.path.join(symlink_parent, symlink_name)
+    if not os.path.lexists(symlink_path):
         os.makedirs(symlink_parent, exist_ok=True)
         os.symlink(src, symlink_path)
 
@@ -206,7 +206,7 @@ def make_symlink(src: str, symlink_parent: str, symlink_name: str) -> None:
 def get_file(
     uri_path: str,
     sha256: str,
-    file_path: str = None,
+    file_path: str,
     session=None,
 ) -> bytes:
     """
