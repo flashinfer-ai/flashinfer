@@ -248,10 +248,6 @@ void TrtllmGenBatchedGemmRunner::run(
   int32_t multiProcessorCount;
   cudaDeviceGetAttribute(&multiProcessorCount, cudaDevAttrMultiProcessorCount, device);
 
-  gemmData.mProblemDimensions.mValidM = gemmData.mProblemDimensions.mM;
-  gemmData.mProblemDimensions.mValidN = gemmData.mProblemDimensions.mN;
-  gemmData.mProblemDimensions.mValidK = gemmData.mProblemDimensions.mK;
-
   // FIXME once we start using all-reduce in the epilogue of the bmm this can be moved elsewhere
   bmm.runInitBeforeWorldSync(config, gemmData, static_cast<void*>(stream));
 

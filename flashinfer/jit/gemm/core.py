@@ -446,7 +446,7 @@ def gen_trtllm_gen_gemm_module() -> JitSpec:
     for file in header_files:
         uri_path = f"{header_path}/{file}"
         file_hash = get_meta_hash(checksum, file)
-        file_path = jit_env.FLASHINFER_CUBIN_DIR / "trtllmGen_gemm_export" / file
+        file_path = str(jit_env.FLASHINFER_CUBIN_DIR / "trtllmGen_gemm_export" / file)
         get_file(uri_path, file_hash, file_path)
     # Create directory flashinfer/trtllm/gemm/trtllmGen_gemm_export pointing to trtllmGen_gemm_export
     symlink_parent = str(jit_env.FLASHINFER_CUBIN_DIR / "flashinfer/trtllm/gemm")
@@ -629,8 +629,9 @@ def gen_trtllm_low_latency_gemm_module() -> JitSpec:
     for file in header_files:
         uri_path = f"{header_path}/{file}"
         file_hash = get_meta_hash(checksum, file)
-        file_path = jit_env.FLASHINFER_CUBIN_DIR / "trtllmGen_gemm_export" / file
-        get_file(uri_path, file_hash, file_path)
+        file_path = str(jit_env.FLASHINFER_CUBIN_DIR / "trtllmGen_gemm_export" / file)
+        result = get_file(uri_path, file_hash, file_path)
+        assert result, f"{file} not found"
     # Create directory flashinfer/trtllm/gemm/trtllmGen_gemm_export pointing to trtllmGen_gemm_export
     symlink_parent = str(jit_env.FLASHINFER_CUBIN_DIR / "flashinfer/trtllm/gemm")
     make_symlink(
