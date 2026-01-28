@@ -467,3 +467,5 @@ def _layernorm_fake(
 
 # CuTe-DSL fused RMSNorm + FP4 Quantization kernels
 # These require SM100+ (Blackwell) GPUs
+from .cute_dsl import rmsnorm_fp4quant as rmsnorm_fp4quant
+from .cute_dsl import add_rmsnorm_fp4quant as add_rmsnorm_fp4quant
