@@ -5,6 +5,7 @@ import numpy as np
 import torch
 
 import flashinfer
+from flashinfer import ActivationType
 from flashinfer.autotuner import autotune
 from flashinfer.fused_moe import (
     WeightLayout,
@@ -175,12 +176,12 @@ def parse_moe_args(line, parser):
         help="Data type of the weights (before quantization).",
     )
     parser.add_argument(
-        "--gated_act",
-        type=str,
+        "--activation-type",
+        type=ActivationType,
+        choices=list(ActivationType),
         required=False,
-        default="swiglu",
-        choices=["swiglu", "geglu"],
-        help="Type of gated activation function: swiglu | geglu.",
+        default=ActivationType.Swiglu,
+        help=f"Type of gated activation function: {list(ActivationType)}",
     )
     parser.add_argument(
         "--autotune",
@@ -247,13 +248,7 @@ def parse_moe_args(line, parser):
     }
     args.routing_method_type = routing_method_name_to_type[args.routing_method]
 
-    # Normalize gated act type (map string to internal int expected by kernels)
-    gated_act_name_to_type = {
-        "swiglu": 0,
-        "geglu": 1,
-    }
-    args.gated_act_type = gated_act_name_to_type[args.gated_act]
-
+    args.activation_type = args.activation_type
     if args.verbose >= 1:
         print(f"[INFO] {args = }")
     return args
@@ -630,7 +625,7 @@ def testTrtllmFp4BlockScaleMoe(args):
     use_shuffled_weight = args.use_shuffled_weight
     weight_layout = args.weight_layout
     is_cuda_graph_compatible = not args.no_cuda_graph
-    gated_act_type = args.gated_act_type
+    activation_type = args.activation_type
     res = []
 
     backends = ["trtllm"]
@@ -795,7 +790,7 @@ def testTrtllmFp4BlockScaleMoe(args):
             local_num_experts=local_num_experts,
             routed_scaling_factor=routed_scaling_factor,
             routing_method_type=routing_method_type,
-            gated_act_type=gated_act_type,
+            activation_type=activation_type.value,
             do_finalize=True,
         )
 
@@ -1671,6 +1666,7 @@ def testTrtllmFp8PerTensorScaleMoe(args):
         output1_scales_gate_scalar,
         gemm2_weights_fp8,
         output2_scales_scalar,
+        activation_type,
     ):
         # Note: FP8 per-tensor MOE expects int64_t for n_group/topk_group, not Optional[int64_t]
         # So we convert None to 0 to indicate "no groups" mode
@@ -1693,6 +1689,7 @@ def testTrtllmFp8PerTensorScaleMoe(args):
             routed_scaling_factor=routed_scaling_factor,
             use_routing_scales_on_input=use_routing_scales_on_input,
             routing_method_type=routing_method_type,
+            activation_type=activation_type.value,
         )
 
     # Benchmark timing
@@ -1713,6 +1710,7 @@ def testTrtllmFp8PerTensorScaleMoe(args):
             output1_scales_gate_scalar,
             gemm2_weights_fp8,
             output2_scales_scalar,
+            args.activation_type
         ),
     )
 

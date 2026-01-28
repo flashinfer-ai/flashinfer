@@ -39,6 +39,7 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
     top_k: int,
     warmups: int,
     iterations: int,
+    activation_type: ActivationType,
 ):
     device = torch.device("cuda:0")
     enable_pdl = device_support_pdl(device)
@@ -97,6 +98,10 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
     )
 
     if is_block_scale:
+        if activation_type != ActivationType.Swiglu:
+            raise ValueError(
+                "Only Swiglu activation is supported for FP8 block scale MoE."
+            )
         fn = lambda: trtllm_fp8_block_scale_moe(
             routing_logits,
             routing_bias,
@@ -144,6 +149,7 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
             RoutingMethodType.TopK.value,
             enable_pdl,
             num_tokens if tune_max_num_tokens is None else tune_max_num_tokens,
+            activation_type.value,
         )
 
     def bench(do_autotune):
@@ -348,6 +354,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--iterations", type=int, default=100, help="Number of benchmark iterations"
     )
+    parser.add_argument(
+        "--activation-type",
+        type=ActivationType,
+        choices=list(ActivationType),
+        required=False,
+        default=ActivationType.Swiglu,
+        help=f"Type of gated activation function: {list(ActivationType)}",
+    )
     args = parser.parse_args()
     if args.quant_mode in ["Fp8-Per-Tensor", "Fp8-Block"]:
         bench_trtllm_gen_fused_moe_autotuner_fp8(
@@ -360,6 +374,7 @@ if __name__ == "__main__":
             args.top_k,
             args.warmups,
             args.iterations,
+            args.activation_type,
         )
     else:
         bench_trtllm_gen_fused_moe_autotuner_fp4(
