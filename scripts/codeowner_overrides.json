@@ -15,5 +15,8 @@
 
   "flashinfer/comm": ["@flashinfer-ai/comm-owners"],
   "include/flashinfer/comm": ["@flashinfer-ai/comm-owners"],
-  "tests/comm": ["@flashinfer-ai/comm-owners"]
+  "tests/comm": ["@flashinfer-ai/comm-owners"],
+
+  "flashinfer/norm.py": ["@flashinfer-ai/misc-op-owners"],
+  "tests/norm": ["@flashinfer-ai/misc-op-owners"]
 }
