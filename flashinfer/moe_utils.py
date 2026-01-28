@@ -890,24 +890,3 @@ def moe_relu(
         tile_size=tile_size,
         enable_pdl=enable_pdl,
     )
-
-
-__all__ = [
-    # Helper functions
-    "get_max_num_tiles",
-    "get_max_num_permuted_tokens",
-    # Sorting/Routing
-    "moe_sort",
-    # Permute/Unpermute
-    "moe_permute",
-    "moe_unpermute",
-    "moe_output_memset",
-    # Activation functions
-    "MoeActivationType",
-    "moe_activation",
-    "moe_swiglu",
-    "moe_geglu",
-    "moe_gelu",
-    "moe_silu",
-    "moe_relu",
-]

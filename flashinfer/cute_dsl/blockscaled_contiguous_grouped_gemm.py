@@ -60,13 +60,6 @@ from .blackwell.blockscaled_contiguous_grouped_gemm import (
 )
 
 # Re-export the kernel class
-__all__ = [
-    "Sm100BlockScaledContiguousGroupedGemmKernel",
-    "cvt_sf_MKL_to_M32x4xrm_K4xrk_L",
-    "blockscaled_contiguous_grouped_gemm_nvfp4",
-    "create_tile_mapping",
-    "create_scale_factor_tensor",
-]
 
 
 def create_tile_mapping(

@@ -70,7 +70,6 @@ from .blockscaled_contiguous_grouped_gemm_finalize_fusion import (
 from .tuner import (
     ALL_MOE_TACTICS,
     CuteDslFusedMoENvfp4Runner,
-    DEFAULT_MOE_TACTIC,
 )
 
 
@@ -768,5 +767,4 @@ def cute_dsl_fused_moe_nvfp4(
 __all__ = [
     "cute_dsl_fused_moe_nvfp4",
     "CuteDslMoEWrapper",
-    "DEFAULT_MOE_TACTIC",
 ]

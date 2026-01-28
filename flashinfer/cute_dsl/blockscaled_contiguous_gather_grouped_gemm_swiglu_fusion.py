@@ -66,11 +66,6 @@ from .blackwell.blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion import 
 )
 
 # Re-export the kernel class
-__all__ = [
-    "BlockScaledContiguousGatherGroupedGemmKernel",
-    "blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_nvfp4",
-    "create_gather_gemm_tensors",
-]
 
 
 def create_gather_gemm_tensors(

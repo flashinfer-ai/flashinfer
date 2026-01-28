@@ -63,11 +63,6 @@ from .blackwell.blockscaled_contiguous_grouped_gemm_finalize_fusion import (
 )
 
 # Re-export the kernel class
-__all__ = [
-    "Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel",
-    "blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4",
-    "create_finalize_fusion_tensors",
-]
 
 
 def create_finalize_fusion_tensors(

@@ -45,14 +45,6 @@ from ..fused_moe.utils import (
     last_positive_power_of_2,
 )
 
-__all__ = [
-    "CuteDslFusedMoENvfp4Runner",
-    "get_gemm1_valid_tactics",
-    "get_gemm2_valid_tactics",
-    "get_moe_valid_tactics",
-    "DEFAULT_MOE_TACTIC",
-]
-
 
 # =============================================================================
 # GEMM1 Tactics (Gather + SwiGLU Fusion)

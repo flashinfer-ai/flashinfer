@@ -68,14 +68,6 @@ if is_cute_dsl_available():
         cute_dsl_fused_moe_nvfp4,
         CuteDslMoEWrapper,
     )
-    from .tuner import (
-        CuteDslFusedMoENvfp4Runner,
-        get_gemm1_valid_tactics,
-        get_gemm2_valid_tactics,
-        get_moe_valid_tactics,
-        ALL_MOE_TACTICS,
-        DEFAULT_MOE_TACTIC,
-    )
 
 __all__ = [
     # Utils (always available)
@@ -91,26 +83,6 @@ __all__ = [
 
 if is_cute_dsl_available():
     __all__ += [
-        # Blockscaled GEMM
-        "grouped_gemm_nt_masked",
-        "Sm100BlockScaledPersistentDenseGemmKernel",
-        # Blockscaled Contiguous Grouped GEMM (for MoE)
-        "blockscaled_contiguous_grouped_gemm_nvfp4",
-        "create_tile_mapping",
-        "create_scale_factor_tensor",
-        "Sm100BlockScaledContiguousGroupedGemmKernel",
-        "cvt_sf_MKL_to_M32x4xrm_K4xrk_L",
-        # Blockscaled Contiguous Grouped GEMM with SwiGLU Fusion (for MoE)
-        "Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel",
-        "blockscaled_contiguous_grouped_gemm_swiglu_fusion_nvfp4",
-        # Blockscaled Contiguous Grouped GEMM with Finalize Fusion (for MoE)
-        "Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel",
-        "blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4",
-        "create_finalize_fusion_tensors",
-        # Blockscaled Contiguous Gather Grouped GEMM with SwiGLU Fusion (for MoE)
-        "BlockScaledContiguousGatherGroupedGemmKernel",
-        "blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_nvfp4",
-        "create_gather_gemm_tensors",
         # RMSNorm + FP4 Quantization
         "rmsnorm_fp4quant",
         "RMSNormFP4QuantKernel",
@@ -121,11 +93,4 @@ if is_cute_dsl_available():
         # Fused MoE (high-level API)
         "cute_dsl_fused_moe_nvfp4",
         "CuteDslMoEWrapper",
-        # Auto-tuner for CuteDSL MoE
-        "CuteDslFusedMoENvfp4Runner",
-        "get_gemm1_valid_tactics",
-        "get_gemm2_valid_tactics",
-        "get_moe_valid_tactics",
-        "ALL_MOE_TACTICS",
-        "DEFAULT_MOE_TACTIC",
     ]

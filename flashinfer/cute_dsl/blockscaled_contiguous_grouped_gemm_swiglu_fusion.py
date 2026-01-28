@@ -60,10 +60,6 @@ from .blackwell.blockscaled_contiguous_grouped_gemm_swiglu_fusion import (
 )
 
 # Re-export the kernel class
-__all__ = [
-    "Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel",
-    "blockscaled_contiguous_grouped_gemm_swiglu_fusion_nvfp4",
-]
 
 
 @functools.cache
