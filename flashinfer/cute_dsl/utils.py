@@ -17,13 +17,18 @@ limitations under the License.
 import ctypes
 import functools
 import importlib.util
-from typing import Union
+from typing import Union, Tuple
 
 import cutlass
 import cutlass._mlir.dialects.cute as _cute_ir
 import torch
 from cutlass._mlir import ir
 from cutlass.cute.typing import AddressSpace, Numeric, Pointer, Type
+
+
+def ceil_div(a: int, b: int) -> int:
+    """Ceiling division."""
+    return (a + b - 1) // b
 
 
 def is_cute_dsl_available() -> bool:
@@ -60,6 +65,7 @@ def cutlass_to_torch_dtype(cutlass_dtype):
         cutlass.Float8E5M2: torch.float8_e5m2,
         cutlass.Float8E4M3FN: torch.float8_e4m3fn,
         cutlass.Float8E4M3B11FNUZ: torch.float8_e4m3fnuz,
+        cutlass.Float4E2M1FN: torch.float4_e2m1fn_x2,  # FP4 packed (2 values per byte)
     }
     if torch_dtype is None:
         torch_dtype = torch_type_map.get(cutlass_dtype)
@@ -73,6 +79,35 @@ def cutlass_to_torch_dtype(cutlass_dtype):
 def get_num_sm(device: torch.device) -> int:
     # get the compute capability of the device, which would be cached
     return torch.cuda.get_device_properties(device).multi_processor_count
+
+
+# Cache for HardwareInfo - it's expensive to create on every call
+_hardware_info_cache: "cutlass.utils.HardwareInfo | None" = None
+
+
+def get_hardware_info() -> "cutlass.utils.HardwareInfo":
+    """Get cached HardwareInfo singleton.
+
+    HardwareInfo queries CUDA device capabilities, which can be expensive.
+    This function caches the singleton to avoid repeated queries.
+    """
+    global _hardware_info_cache
+    if _hardware_info_cache is None:
+        _hardware_info_cache = cutlass.utils.HardwareInfo()
+    return _hardware_info_cache
+
+
+@functools.cache
+def get_max_active_clusters(cluster_size: int) -> int:
+    """Get max active clusters for a given cluster size (cached).
+
+    Args:
+        cluster_size: Product of cluster_shape_mn dimensions.
+
+    Returns:
+        Maximum number of active clusters supported by hardware.
+    """
+    return get_hardware_info().get_max_active_clusters(cluster_size)
 
 
 # WAR for CuTeDSL make_ptr implementation for flashinfer
@@ -221,3 +256,141 @@ def make_ptr(
         )
 
     return _Pointer(address_value, dtype, mem_space, assumed_align=assumed_align)
+
+
+def convert_sf_to_mma_layout(
+    sf: torch.Tensor,
+    m: int,
+    k: int,
+    num_groups: int = 1,
+    sf_vec_size: int = 16,
+) -> torch.Tensor:
+    """Convert scale factors from swizzled 2D layout to 6D MMA-compatible layout.
+
+    This function converts scale factors produced by `fp4_quantize(..., is_sf_swizzled_layout=True)`
+    to the 6D layout expected by CuteDSL grouped GEMM kernels.
+
+    The swizzled scale factors from `fp4_quantize` have shape `(M, K/sf_vec_size)` but are
+    stored in a swizzled pattern internally. This function reshapes them to the explicit
+    6D MMA-compatible layout: `(32, 4, m_tiles, 4, k_tiles, num_groups)` with the
+    physical storage order `(num_groups, m_tiles, k_tiles, 32, 4, 4)`.
+
+    Layout mapping (from linear (m, k) position):
+        - m_tile = m // 128
+        - outer_m = m % 32
+        - inner_m = (m % 128) // 32
+        - k_tile = k // 4
+        - inner_k = k % 4
+        - 6D position: (outer_m, inner_m, m_tile, inner_k, k_tile, group)
+
+    Args:
+        sf: Scale factor tensor from `fp4_quantize(..., is_sf_swizzled_layout=True)`.
+            Shape: `(M, K/sf_vec_size)` or `(num_groups * M, K/sf_vec_size)`.
+        m: The M dimension (rows) of the original matrix before quantization.
+        k: The K dimension (columns) of the original matrix before quantization.
+        num_groups: Number of groups (e.g., experts). Default: 1.
+        sf_vec_size: Scale factor vector size. Default: 16.
+
+    Returns:
+        Scale factors in 6D MMA layout: `(32, 4, m_tiles, 4, k_tiles, num_groups)`.
+        This is a strided view (not contiguous) with physical storage order
+        `(num_groups, m_tiles, k_tiles, 32, 4, 4)`.
+
+    Example:
+        >>> # Quantize weight tensor
+        >>> w_q, w_sf = fp4_quantize(weight, global_scale=gs, is_sf_swizzled_layout=True)
+        >>> # Convert scale factors to MMA layout
+        >>> w_sf_mma = convert_sf_to_mma_layout(w_sf, m=weight.shape[0], k=weight.shape[1])
+
+    Note:
+        - The input `sf` must be produced with `is_sf_swizzled_layout=True`.
+        - M and K dimensions must be multiples of 128 and 64 respectively for proper alignment.
+        - For grouped tensors (e.g., expert weights), reshape to `(num_groups * M, K)`
+          before quantization, then use this function with the appropriate `num_groups`.
+        - The returned tensor is a strided view, NOT contiguous. This is intentional as
+          the CuteDSL kernel expects the specific physical memory layout.
+    """
+    sf_k = ceil_div(k, sf_vec_size)
+    m_tiles = ceil_div(m, 128)
+    k_tiles = ceil_div(sf_k, 4)
+
+    # Verify input shape
+    expected_elements = num_groups * m_tiles * k_tiles * 32 * 4 * 4
+    actual_elements = sf.numel()
+    if actual_elements != expected_elements:
+        raise ValueError(
+            f"Scale factor tensor has {actual_elements} elements, "
+            f"expected {expected_elements} for m={m}, k={k}, num_groups={num_groups}"
+        )
+
+    # Reshape from flat 2D to 6D physical storage order
+    # Physical storage: (num_groups, m_tiles, k_tiles, 32, 4, 4)
+    sf_6d = sf.view(num_groups, m_tiles, k_tiles, 32, 4, 4)
+
+    # Permute to MMA logical order: (32, 4, m_tiles, 4, k_tiles, num_groups)
+    # This creates a strided view (non-contiguous), which is what the kernel expects
+    sf_6d = sf_6d.permute(3, 4, 1, 5, 2, 0)
+
+    return sf_6d  # Return strided view, NOT contiguous
+
+
+def convert_sf_from_mma_layout(
+    sf_6d: torch.Tensor,
+    m: int,
+    k: int,
+    num_groups: int = 1,
+    sf_vec_size: int = 16,
+) -> torch.Tensor:
+    """Convert scale factors from 6D MMA layout back to 2D swizzled layout.
+
+    This is the inverse of `convert_sf_to_mma_layout`.
+
+    Args:
+        sf_6d: Scale factors in 6D MMA layout: `(32, 4, m_tiles, 4, k_tiles, num_groups)`.
+               Can be either a strided view or contiguous.
+        m: The M dimension (rows) of the original matrix.
+        k: The K dimension (columns) of the original matrix.
+        num_groups: Number of groups. Default: 1.
+        sf_vec_size: Scale factor vector size. Default: 16.
+
+    Returns:
+        Scale factors in 2D swizzled layout: `(num_groups * M_padded, K_padded/sf_vec_size)`.
+    """
+    sf_k = ceil_div(k, sf_vec_size)
+    m_tiles = ceil_div(m, 128)
+    k_tiles = ceil_div(sf_k, 4)
+
+    # Permute from MMA logical order back to storage order
+    # From: (32, 4, m_tiles, 4, k_tiles, num_groups)
+    # To: (num_groups, m_tiles, k_tiles, 32, 4, 4)
+    sf_storage = sf_6d.permute(5, 2, 4, 0, 1, 3).contiguous()
+
+    # Reshape to 2D
+    padded_m = m_tiles * 128
+    padded_sf_k = k_tiles * 4
+    sf_2d = sf_storage.reshape(num_groups * padded_m, padded_sf_k)
+
+    return sf_2d
+
+
+def get_mma_sf_shape(
+    m: int,
+    k: int,
+    num_groups: int = 1,
+    sf_vec_size: int = 16,
+) -> Tuple[int, int, int, int, int, int]:
+    """Get the 6D MMA-compatible scale factor shape.
+
+    Args:
+        m: The M dimension (rows) of the matrix.
+        k: The K dimension (columns) of the matrix.
+        num_groups: Number of groups. Default: 1.
+        sf_vec_size: Scale factor vector size. Default: 16.
+
+    Returns:
+        Shape tuple: (32, 4, m_tiles, 4, k_tiles, num_groups)
+    """
+    sf_k = ceil_div(k, sf_vec_size)
+    m_tiles = ceil_div(m, 128)
+    k_tiles = ceil_div(sf_k, 4)
+    return (32, 4, m_tiles, 4, k_tiles, num_groups)
