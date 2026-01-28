@@ -1666,8 +1666,11 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
   if (hidden_states_scale.has_value()) {
     hidden_states_scale_vec_size = (num_tokens * hidden_size) / hidden_states_scale.value().numel();
   }
+  int64_t intermediate_size_factor =
+      isGatedActivation(static_cast<ActivationType>(act_type)) ? 2 : 1;
   int weight_scale_vec_size =
-      (local_num_experts * intermediate_size * 2 * hidden_size) / gemm1_weights_scale.numel();
+      (local_num_experts * intermediate_size * intermediate_size_factor * hidden_size) /
+      gemm1_weights_scale.numel();
 
   TVM_FFI_ICHECK(weight_scale_vec_size == 16 || weight_scale_vec_size == 32)
       << "unsupported weight_scale_vec_size.";
