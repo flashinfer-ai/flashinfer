@@ -103,31 +103,30 @@ NUM_THREADS_MTP = 128  # 4 warps (shared across all configs)
 
 
 def get_vec_size_mtp(batch_size: int, seq_len: int = 1) -> int:
-    """Select vec_size for MTP kernel based on batch size and sequence length.
+    """Select vec_size for MTP kernel.
 
-    vec_size=4: 32 threads per group (full warp), 4 groups per block, stride=16B
-    vec_size=8: 16 threads per group (half warp), 8 groups per block, stride=32B
-
-    vec_size=8 is generally better because:
-    - More groups (8 vs 4) allows larger tile_v with same rows_per_group
-    - Larger tile_v reduces grid size and precompute overhead
+    Always use vec_size=4 (32 threads per group = full warp, 4 groups per block).
+    Full warp shuffle is more efficient and achieves >= 1.0x speedup vs Triton.
     """
-    return 8
+    return 4
 
 
 def get_tile_v_mtp(batch_size: int, seq_len: int = 1) -> int:
     """Select optimal TILE_V for MTP kernel based on batch size and sequence length.
 
-    With vec_size=8, num_groups=8, rows_per_group = tile_v / 8.
+    With vec_size=4, num_groups=4, rows_per_group = tile_v / 4.
+    Tuned via grid search for optimal performance.
     """
     if batch_size <= 2:
-        return 8  # Small batch: prioritize parallelism
+        return 4  # Small batch needs max parallelism
     elif batch_size <= 4:
-        return 16  # Medium batch
+        return 8
     elif batch_size <= 8:
-        return 32  # B=5-8: match Triton's BV=32
+        return 16
+    elif batch_size <= 16:
+        return 32
     else:
-        return 64  # B>8: larger tile_v for better efficiency
+        return 64
 
 
 @cute.kernel
@@ -2079,25 +2078,14 @@ def gdn_verify_kernel_mtp(
                     sum_q += r_q[i] * r_q[i]
                     sum_k += r_k[i] * r_k[i]
 
-                # Reduction based on threads_per_group:
-                # vec_size=8 (16 threads): [8,4,2,1]
-                # vec_size=4 (32 threads): [16,8,4,2,1]
-                if cutlass.const_expr(vec_size == 8):
-                    for offset in [8, 4, 2, 1]:
-                        sum_q += cute.arch.shuffle_sync_bfly(
-                            sum_q, offset=offset, mask=-1, mask_and_clamp=31
-                        )
-                        sum_k += cute.arch.shuffle_sync_bfly(
-                            sum_k, offset=offset, mask=-1, mask_and_clamp=31
-                        )
-                else:
-                    for offset in [16, 8, 4, 2, 1]:
-                        sum_q += cute.arch.shuffle_sync_bfly(
-                            sum_q, offset=offset, mask=-1, mask_and_clamp=31
-                        )
-                        sum_k += cute.arch.shuffle_sync_bfly(
-                            sum_k, offset=offset, mask=-1, mask_and_clamp=31
-                        )
+                # Warp-level reduction (32 threads per group with vec_size=4)
+                for offset in [16, 8, 4, 2, 1]:
+                    sum_q += cute.arch.shuffle_sync_bfly(
+                        sum_q, offset=offset, mask=-1, mask_and_clamp=31
+                    )
+                    sum_k += cute.arch.shuffle_sync_bfly(
+                        sum_k, offset=offset, mask=-1, mask_and_clamp=31
+                    )
 
                 # Fuse scale into q's normalization factor
                 inv_norm_q_scaled = cute.rsqrt(sum_q + 1e-6, fastmath=True) * scale
@@ -2184,16 +2172,11 @@ def gdn_verify_kernel_mtp(
                     for i in cutlass.range_constexpr(vec_size):
                         sum_hk += r_h[i] * r_k[i]
 
-                    if cutlass.const_expr(vec_size == 8):
-                        for offset in [8, 4, 2, 1]:
-                            sum_hk += cute.arch.shuffle_sync_bfly(
-                                sum_hk, offset=offset, mask=-1, mask_and_clamp=31
-                            )
-                    else:
-                        for offset in [16, 8, 4, 2, 1]:
-                            sum_hk += cute.arch.shuffle_sync_bfly(
-                                sum_hk, offset=offset, mask=-1, mask_and_clamp=31
-                            )
+                    # Warp-level reduction
+                    for offset in [16, 8, 4, 2, 1]:
+                        sum_hk += cute.arch.shuffle_sync_bfly(
+                            sum_hk, offset=offset, mask=-1, mask_and_clamp=31
+                        )
 
                     # Step 3: Load v for this v_idx and time step, apply delta rule
                     r_v = cutlass.Float32(v[i_n, i_t, i_hv, v_idx])
@@ -2218,16 +2201,11 @@ def gdn_verify_kernel_mtp(
                     for i in cutlass.range_constexpr(vec_size):
                         sum_hq += r_h[i] * r_q[i]
 
-                    if cutlass.const_expr(vec_size == 8):
-                        for offset in [8, 4, 2, 1]:
-                            sum_hq += cute.arch.shuffle_sync_bfly(
-                                sum_hq, offset=offset, mask=-1, mask_and_clamp=31
-                            )
-                    else:
-                        for offset in [16, 8, 4, 2, 1]:
-                            sum_hq += cute.arch.shuffle_sync_bfly(
-                                sum_hq, offset=offset, mask=-1, mask_and_clamp=31
-                            )
+                    # Warp-level reduction
+                    for offset in [16, 8, 4, 2, 1]:
+                        sum_hq += cute.arch.shuffle_sync_bfly(
+                            sum_hq, offset=offset, mask=-1, mask_and_clamp=31
+                        )
 
                     # Write output (only lane 0 of each group)
                     if lane_in_group == 0:
