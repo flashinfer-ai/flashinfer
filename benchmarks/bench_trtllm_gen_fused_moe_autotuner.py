@@ -17,6 +17,7 @@ from flashinfer.fused_moe import (
 from flashinfer.autotuner import autotune
 from flashinfer.testing.utils import bench_gpu_time
 from flashinfer.utils import device_support_pdl
+from routines.flashinfer_benchmark_utils import enum_type
 
 FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 FLOAT4_E2M1_MAX = 6.0
@@ -356,11 +357,11 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--activation-type",
-        type=ActivationType,
+        type=enum_type(ActivationType),
         choices=list(ActivationType),
         required=False,
         default=ActivationType.Swiglu,
-        help=f"Type of gated activation function: {list(ActivationType)}",
+        help=f"Type of gated activation function: {[e.name for e in ActivationType]}",
     )
     args = parser.parse_args()
     if args.quant_mode in ["Fp8-Per-Tensor", "Fp8-Block"]:
