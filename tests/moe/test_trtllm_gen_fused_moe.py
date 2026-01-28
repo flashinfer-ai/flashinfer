@@ -2379,7 +2379,7 @@ def run_moe_test(
 
     # Validation checks
     assert top_k <= num_experts
-    assert top_k <= 10
+    assert top_k <= 22
     if (top_k_groups is not None) and (n_groups is not None) and (n_groups > 0):
         assert top_k_groups <= 4
         assert num_experts > n_groups
@@ -2699,10 +2699,11 @@ def test_renormalize_routing(
 # Test: DeepSeekV3 routing
 @pytest.mark.parametrize("num_tokens", [8, 768, 3072])
 @pytest.mark.parametrize("hidden_size", [1024])
-@pytest.mark.parametrize("intermediate_size", [2048, 1024, 768, 512, 384])
+@pytest.mark.parametrize("intermediate_size", [2688, 2048, 1024, 768, 512, 384])
 @pytest.mark.parametrize(
     "moe_impl",
     [
+        pytest.param(FP8PerTensorMoe(), id="FP8_PerTensor"),
         pytest.param(FP8BlockScaleMoe(), id="FP8_Block"),
         pytest.param(FP4Moe(quant_mode=QuantMode.FP4_NVFP4_NVFP4), id="NvFP4xNvFP4"),
         pytest.param(FP4Moe(quant_mode=QuantMode.FP4_MXFP4_MXFP8), id="MxFP4xMxFP8"),
@@ -2714,6 +2715,22 @@ def test_renormalize_routing(
 @pytest.mark.parametrize(
     "routing_config",
     [
+        pytest.param(
+            {
+                "num_experts": 512,
+                "top_k": 22,
+                "padding": 8,
+                "n_groups": 1,
+                "top_k_groups": 1,
+                "routed_scaling": 2.5,
+                "has_routing_bias": True,
+                "routing_method_type": RoutingMethodType.DeepSeekV3,
+                "compatible_moe_impls": [FP8PerTensorMoe, FP4Moe, BF16Moe],
+                "compatible_intermediate_size": [1024, 2688],
+                "enable_autotune": True,
+            },
+            id="nemotron_3",
+        ),
         pytest.param(
             {
                 "num_experts": 384,
@@ -2823,6 +2840,7 @@ def test_renormalize_routing(
     [
         pytest.param(ActivationType.Swiglu, id="Swiglu"),
         pytest.param(ActivationType.Geglu, id="Geglu"),
+        pytest.param(ActivationType.Relu2, id="Relu2"),
     ],
 )
 def test_deepseekv3_routing(
@@ -2898,7 +2916,6 @@ def test_deepseekv3_routing(
     [
         pytest.param(ActivationType.Swiglu, id="Swiglu"),
         pytest.param(ActivationType.Geglu, id="Geglu"),
-        pytest.param(ActivationType.Relu2, id="Relu2"),
     ],
 )
 def test_topk_routing(
