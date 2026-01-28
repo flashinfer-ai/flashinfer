@@ -40,5 +40,7 @@ TensorRT-LLM Fused MoE
     :toctree: ../generated
 
     trtllm_fp4_block_scale_moe
+    trtllm_fp4_block_scale_routed_moe
     trtllm_fp8_block_scale_moe
+    trtllm_fp8_block_scale_routed_moe
     trtllm_fp8_per_tensor_scale_moe
