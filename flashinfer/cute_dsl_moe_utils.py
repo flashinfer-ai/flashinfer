@@ -20,7 +20,6 @@ from typing import Dict, Optional, Tuple
 
 import torch
 
-from .api_logging import flashinfer_api
 from .jit.moe_utils import gen_moe_utils_module
 
 
@@ -130,7 +129,6 @@ def _get_dtype_suffix(dtype: torch.dtype) -> str:
         raise ValueError(f"Unsupported dtype: {dtype}")
 
 
-@flashinfer_api
 def moe_permute(
     input: torch.Tensor,
     permuted_output: torch.Tensor,
@@ -204,7 +202,6 @@ def moe_permute(
     )
 
 
-@flashinfer_api
 def moe_unpermute(
     permuted_input: torch.Tensor,
     output: torch.Tensor,
@@ -269,7 +266,6 @@ def moe_unpermute(
     )
 
 
-@flashinfer_api
 def moe_output_memset(
     output: torch.Tensor,
     tile_idx_to_mn_limit: torch.Tensor,
@@ -405,7 +401,6 @@ def allocate_moe_sort_buffers(
     }
 
 
-@flashinfer_api
 def moe_sort(
     token_selected_experts: torch.Tensor,
     token_final_scales: torch.Tensor,
@@ -490,7 +485,7 @@ def moe_sort(
 
     Example:
         >>> import torch
-        >>> from flashinfer import moe_sort
+        >>> from flashinfer.cute_dsl_moe_utils import moe_sort
         >>>
         >>> num_tokens, num_experts, top_k = 128, 8, 2
         >>> token_selected_experts = torch.randint(0, num_experts, (num_tokens, top_k),
@@ -641,7 +636,6 @@ def moe_sort(
 # ============================== Activation Functions ==============================
 
 
-@flashinfer_api
 def moe_activation(
     input: torch.Tensor,
     output: torch.Tensor,
@@ -695,7 +689,6 @@ def moe_activation(
     )
 
 
-@flashinfer_api
 def moe_swiglu(
     input: torch.Tensor,
     output: torch.Tensor,
@@ -735,7 +728,6 @@ def moe_swiglu(
     )
 
 
-@flashinfer_api
 def moe_geglu(
     input: torch.Tensor,
     output: torch.Tensor,
@@ -775,7 +767,6 @@ def moe_geglu(
     )
 
 
-@flashinfer_api
 def moe_gelu(
     input: torch.Tensor,
     output: torch.Tensor,
@@ -814,7 +805,6 @@ def moe_gelu(
     )
 
 
-@flashinfer_api
 def moe_silu(
     input: torch.Tensor,
     output: torch.Tensor,
@@ -853,7 +843,6 @@ def moe_silu(
     )
 
 
-@flashinfer_api
 def moe_relu(
     input: torch.Tensor,
     output: torch.Tensor,
