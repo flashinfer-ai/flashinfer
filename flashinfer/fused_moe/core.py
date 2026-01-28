@@ -1420,7 +1420,7 @@ def get_trtllm_moe_sm100_module():
         routing_method_type: int = 0,
         enable_pdl: Optional[bool] = None,
         tune_max_num_tokens: int = 8192,
-        activation_type: ActivationType = ActivationType.Identity,
+        activation_type: ActivationType = ActivationType.Swiglu,
     ) -> torch.Tensor:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(hidden_states.device)
@@ -1531,7 +1531,7 @@ def get_trtllm_moe_sm100_module():
         use_routing_scales_on_input: bool,
         routing_method_type: int = 0,
         enable_pdl: Optional[bool] = None,
-        activation_type: int = ActivationType.Identity.value,
+        activation_type: int = ActivationType.Swiglu.value,
     ):
         seq_len = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1]
@@ -2188,7 +2188,7 @@ def trtllm_fp8_per_tensor_scale_moe(
     routing_method_type: int = 0,
     enable_pdl: Optional[bool] = None,
     tune_max_num_tokens: int = 8192,
-    activation_type: int = ActivationType.Identity.value,
+    activation_type: int = ActivationType.Swiglu.value,
 ) -> torch.Tensor:
     """FP8 per tensor scale MoE operation.
 
@@ -2213,7 +2213,7 @@ def trtllm_fp8_per_tensor_scale_moe(
         routing_method_type: Type of routing method to use (default: 0)
         enable_pdl: Whether to enable Programmatic Dependent Launch (PDL). Auto-enabled for >= sm90.
         tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 8192)
-        activation_type (int): Type of activation function (default: 7 - Identity)
+        activation_type (int): Type of activation function (default: 3 - Swiglu)
             - 0: Gelu
             - 1: Relu
             - 2: Silu
