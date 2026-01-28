@@ -2124,7 +2124,9 @@ def trtllm_batch_decode_with_kv_cache(
     mask: Optional[torch.Tensor] = None,
     max_q_len: Optional[int] = None,
     cum_seq_lens_q: Optional[torch.Tensor] = None,
-) -> Union[torch.Tensor, FP4Tensor]:
+    return_lse: bool = False,
+    lse: Optional[torch.Tensor] = None,
+) -> Union[torch.Tensor, FP4Tensor, Tuple[Union[torch.Tensor, FP4Tensor], torch.Tensor]]:
     """
     Parameters
     ----------
@@ -2207,10 +2209,21 @@ def trtllm_batch_decode_with_kv_cache(
         Only supported by trtllm-gen backend. Must be provided together with ``max_q_len``.
         When None, all requests use uniform query length specified by ``q_len_per_req``.
 
+    return_lse : bool = False
+        Whether to return Log-Sum-Exp (LSE) values.
+        Only supported by trtllm-gen backend. XQA backend does not support LSE return.
+
+    lse : Optional[torch.Tensor] = None
+        LSE tensor to write into. If not provided and return_lse is True, a new tensor will be allocated.
+        Shape should be ``[num_tokens, num_heads]``, dtype: ``torch.float32``.
+
     Returns
     -------
-    out : Union[torch.Tensor, FP4Tensor]
-        output torch.Tensor or FP4Tensor.
+    out : Union[torch.Tensor, FP4Tensor, Tuple[Union[torch.Tensor, FP4Tensor], torch.Tensor]]
+        If :attr:`return_lse` is ``False``, the attention output (torch.Tensor or FP4Tensor).
+        If :attr:`return_lse` is ``True``, a tuple of two tensors:
+        - The attention output (torch.Tensor or FP4Tensor)
+        - The LSE tensor (torch.Tensor with dtype float32)
     """
     enable_pdl = device_support_pdl(query.device) if enable_pdl is None else enable_pdl
 
@@ -2240,6 +2253,8 @@ def trtllm_batch_decode_with_kv_cache(
             raise ValueError("xqa backend does not support o_sf_scale or o_sf_vec_size")
         if max_q_len is not None or cum_seq_lens_q is not None:
             raise ValueError("xqa backend does not support cum_seq_lens_q")
+        if return_lse:
+            raise ValueError("xqa backend does not support return_lse")
 
         # Handle out and out_dtype
         if out_dtype is None:
@@ -2363,6 +2378,12 @@ def trtllm_batch_decode_with_kv_cache(
             assert max_q_len is not None
             batch_size = cum_seq_lens_q.size(0) - 1
 
+        # Allocate LSE tensor if return_lse is True and lse is not provided
+        if return_lse and lse is None:
+            lse = torch.empty(
+                query.shape[0], query.shape[1], device=query.device, dtype=torch.float32
+            )
+
         run_func(
             out,
             out_scale_factor,
@@ -2387,13 +2408,15 @@ def trtllm_batch_decode_with_kv_cache(
             workspace_buffer.numel() * workspace_buffer.element_size(),
             sinks,
             cum_seq_lens_q,
+            lse if return_lse else None,
         )
 
-        return (
+        out_tensor = (
             out
             if out_dtype != "nvfp4"
             else FP4Tensor(out, out_scale_factor, o_sf_start_index, query.shape)
         )
+        return (out_tensor, lse) if return_lse else out_tensor
     else:
         raise KeyError(f"Backend {backend} not supported")
 
