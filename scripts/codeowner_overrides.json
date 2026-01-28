@@ -1,0 +1,22 @@
+{
+  "flashinfer/attention.py": ["@flashinfer-ai/attention-owners"],
+  "include/flashinfer/attention": ["@flashinfer-ai/attention-owners"],
+  "csrc/fmha_v2": ["@flashinfer-ai/attention-owners"],
+  "csrc/xqa": ["@flashinfer-ai/attention-owners"],
+  "tests/attention": ["@flashinfer-ai/attention-owners"],
+
+  "flashinfer/gemm": ["@flashinfer-ai/gemm-owners"],
+  "include/flashinfer/gemm": ["@flashinfer-ai/gemm-owners"],
+  "tests/gemm": ["@flashinfer-ai/gemm-owners"],
+
+  "flashinfer/fused_moe": ["@flashinfer-ai/moe-owners"],
+  "csrc/fused_moe": ["@flashinfer-ai/moe-owners"],
+  "tests/moe": ["@flashinfer-ai/moe-owners"],
+
+  "flashinfer/comm": ["@flashinfer-ai/comm-owners"],
+  "include/flashinfer/comm": ["@flashinfer-ai/comm-owners"],
+  "tests/comm": ["@flashinfer-ai/comm-owners"],
+
+  "flashinfer/norm.py": ["@flashinfer-ai/misc-op-owners"],
+  "tests/norm": ["@flashinfer-ai/misc-op-owners"]
+}
