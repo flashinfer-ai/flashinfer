@@ -1,0 +1,42 @@
+/*
+ * Copyright (c) 2025 by FlashInfer team.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+// Auto-generated file for separate compilation of GDN prefill kernel variants.
+// Template parameters: dtype={{ dtype }}, is_gva={{ is_gva }}, needs_beta={{ needs_beta }},
+//                      needs_alpha={{ needs_alpha }}, init_state={{ init_state }}
+
+#include <cuda_bf16.h>
+
+// Use full path since generated files are in a different directory
+#include "flat/prefill/prefill_kernel_delta_rule_sm90.cuh"
+
+namespace flat {
+
+// Explicit template instantiation for launch_delta_rule_prefill_kernel_gbai
+template void launch_delta_rule_prefill_kernel_gbai<
+    /*IsGVA=*/{{ is_gva }},
+    /*NeedsBeta=*/{{ needs_beta }},
+    /*NeedsAlpha=*/{{ needs_alpha }},
+    /*InitStateFromInput=*/{{ init_state }},
+    cutlass::arch::Sm90,
+    {{ dtype }}, {{ dtype }}, float>(
+    cudaStream_t stream, {{ dtype }}* output, float* output_state,
+    {{ dtype }} const* q, {{ dtype }} const* k, {{ dtype }} const* v,
+    float const* input_state, float const* alpha, float const* beta,
+    int64_t const* cu_seqlens, int32_t num_seqs, int32_t num_q_heads,
+    int32_t num_k_heads, int32_t num_v_heads, int32_t num_o_heads,
+    int32_t head_size, int64_t total_seqlen, float scale, int32_t sm_count);
+
+}  // namespace flat
