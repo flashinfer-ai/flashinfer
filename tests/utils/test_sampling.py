@@ -1069,6 +1069,219 @@ def test_int64_indices_sampling(batch_size, vocab_size, sampling_type, indices_d
     assert torch.all(samples < vocab_size) and torch.all(samples >= 0)
 
 
+@pytest.mark.parametrize("batch_size", [1, 32, 128])
+@pytest.mark.parametrize("vocab_size", [111, 32000])
+def test_per_request_generator_reproducibility(batch_size, vocab_size):
+    """Test that per-request generators produce reproducible results."""
+    torch.manual_seed(42)
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
+    normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+
+    # Create per-request generator tensors
+    seed_arr = torch.randint(
+        0, 2**32, (batch_size,), dtype=torch.int64, device="cuda:0"
+    )
+    offset_arr1 = torch.zeros(batch_size, dtype=torch.int64, device="cuda:0")
+    offset_arr2 = torch.zeros(batch_size, dtype=torch.int64, device="cuda:0")
+
+    # Same seeds and offsets should produce identical samples
+    samples1 = flashinfer.sampling.sampling_from_probs(
+        normalized_prob, generator=(seed_arr, offset_arr1)
+    )
+    samples2 = flashinfer.sampling.sampling_from_probs(
+        normalized_prob, generator=(seed_arr.clone(), offset_arr2)
+    )
+
+    assert torch.all(samples1 == samples2), (
+        "Per-request generators with same seeds should produce identical samples"
+    )
+
+
+@pytest.mark.parametrize("batch_size", [8, 32])
+@pytest.mark.parametrize("vocab_size", [111, 32000])
+def test_per_request_generator_independence(batch_size, vocab_size):
+    """Test that different per-request seeds produce different samples."""
+    torch.manual_seed(42)
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
+    normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+
+    # Different seeds for each request
+    seed_arr1 = torch.arange(batch_size, dtype=torch.int64, device="cuda:0")
+    seed_arr2 = torch.arange(batch_size, dtype=torch.int64, device="cuda:0") + 1000
+    offset_arr1 = torch.zeros(batch_size, dtype=torch.int64, device="cuda:0")
+    offset_arr2 = torch.zeros(batch_size, dtype=torch.int64, device="cuda:0")
+
+    samples1 = flashinfer.sampling.sampling_from_probs(
+        normalized_prob, generator=(seed_arr1, offset_arr1)
+    )
+    samples2 = flashinfer.sampling.sampling_from_probs(
+        normalized_prob, generator=(seed_arr2, offset_arr2)
+    )
+
+    # Different seeds should produce mostly different samples
+    match_rate = (samples1 == samples2).float().mean().item()
+    assert match_rate < 0.9, (
+        f"Different per-request seeds should produce mostly different samples, "
+        f"got {match_rate:.2%} match rate"
+    )
+
+
+@pytest.mark.parametrize("batch_size", [8, 32])
+@pytest.mark.parametrize("vocab_size", [111, 32000])
+@pytest.mark.parametrize(
+    "sampling_func",
+    [
+        "sampling_from_probs",
+        "top_p_sampling_from_probs",
+        "top_k_sampling_from_probs",
+        "min_p_sampling_from_probs",
+        "top_k_top_p_sampling_from_probs",
+    ],
+)
+def test_per_request_generator_offset_update(batch_size, vocab_size, sampling_func):
+    """Test that offset_arr is correctly updated after sampling."""
+    torch.manual_seed(42)
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
+    normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+
+    seed_arr = torch.randint(
+        0, 2**32, (batch_size,), dtype=torch.int64, device="cuda:0"
+    )
+    offset_arr = torch.zeros(batch_size, dtype=torch.int64, device="cuda:0")
+
+    # Call sampling function
+    if sampling_func == "sampling_from_probs":
+        flashinfer.sampling.sampling_from_probs(
+            normalized_prob, generator=(seed_arr, offset_arr)
+        )
+        # Simple samplers: fixed increment of 4
+        assert torch.all(offset_arr == 4), (
+            f"{sampling_func}: Offsets should be exactly 4, got {offset_arr}"
+        )
+    elif sampling_func == "top_p_sampling_from_probs":
+        flashinfer.sampling.top_p_sampling_from_probs(
+            normalized_prob, 0.9, generator=(seed_arr, offset_arr)
+        )
+        # Iterative samplers: variable increments (multiples of 4)
+        assert torch.all(offset_arr > 0), (
+            f"{sampling_func}: All offsets should be updated (> 0)"
+        )
+        assert torch.all(offset_arr % 4 == 0), (
+            f"{sampling_func}: All offsets should be multiples of 4"
+        )
+    elif sampling_func == "top_k_sampling_from_probs":
+        k = min(100, vocab_size)
+        flashinfer.sampling.top_k_sampling_from_probs(
+            normalized_prob, k, generator=(seed_arr, offset_arr)
+        )
+        # Iterative samplers: variable increments (multiples of 4)
+        assert torch.all(offset_arr > 0), (
+            f"{sampling_func}: All offsets should be updated (> 0)"
+        )
+        assert torch.all(offset_arr % 4 == 0), (
+            f"{sampling_func}: All offsets should be multiples of 4"
+        )
+    elif sampling_func == "min_p_sampling_from_probs":
+        flashinfer.sampling.min_p_sampling_from_probs(
+            normalized_prob, 0.1, generator=(seed_arr, offset_arr)
+        )
+        # Simple sampler: fixed increment of 4
+        assert torch.all(offset_arr == 4), (
+            f"{sampling_func}: Offsets should be exactly 4, got {offset_arr}"
+        )
+    elif sampling_func == "top_k_top_p_sampling_from_probs":
+        k = min(100, vocab_size)
+        flashinfer.sampling.top_k_top_p_sampling_from_probs(
+            normalized_prob,
+            k,
+            0.9,
+            generator=(seed_arr, offset_arr),
+            filter_apply_order="joint",
+        )
+        # Iterative samplers: variable increments (multiples of 4)
+        assert torch.all(offset_arr > 0), (
+            f"{sampling_func}: All offsets should be updated (> 0)"
+        )
+        assert torch.all(offset_arr % 4 == 0), (
+            f"{sampling_func}: All offsets should be multiples of 4"
+        )
+
+
+@pytest.mark.parametrize("batch_size", [8, 32])
+@pytest.mark.parametrize("vocab_size", [111, 32000])
+def test_per_request_generator_validation(batch_size, vocab_size):
+    """Test that invalid per-request generator inputs are rejected."""
+    torch.manual_seed(42)
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
+    normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+
+    # Test 1: Wrong dtype (float instead of int64)
+    seed_arr = torch.randint(
+        0, 2**32, (batch_size,), dtype=torch.float32, device="cuda:0"
+    )
+    offset_arr = torch.zeros(batch_size, dtype=torch.int64, device="cuda:0")
+    with pytest.raises(
+        TypeError, match="seed_arr and offset_arr must be int64 tensors"
+    ):
+        flashinfer.sampling.sampling_from_probs(
+            normalized_prob, generator=(seed_arr, offset_arr)
+        )
+
+    # Test 2: Wrong device (CPU instead of CUDA)
+    seed_arr = torch.randint(0, 2**32, (batch_size,), dtype=torch.int64, device="cpu")
+    offset_arr = torch.zeros(batch_size, dtype=torch.int64, device="cuda:0")
+    with pytest.raises(
+        ValueError, match="seed_arr and offset_arr must be on CUDA device"
+    ):
+        flashinfer.sampling.sampling_from_probs(
+            normalized_prob, generator=(seed_arr, offset_arr)
+        )
+
+    # Test 3: Wrong shape
+    seed_arr = torch.randint(
+        0, 2**32, (batch_size + 1,), dtype=torch.int64, device="cuda:0"
+    )
+    offset_arr = torch.zeros(batch_size, dtype=torch.int64, device="cuda:0")
+    with pytest.raises(ValueError, match="seed_arr and offset_arr must have shape"):
+        flashinfer.sampling.sampling_from_probs(
+            normalized_prob, generator=(seed_arr, offset_arr)
+        )
+
+
+@pytest.mark.parametrize("batch_size", [8, 32])
+@pytest.mark.parametrize("vocab_size", [111, 32000])
+def test_per_request_generator_vs_traditional(batch_size, vocab_size):
+    """Test that per-request generator produces valid samples (no correctness comparison)."""
+    torch.manual_seed(42)
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
+    normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+
+    # Per-request generators
+    seed_arr = torch.randint(
+        0, 2**32, (batch_size,), dtype=torch.int64, device="cuda:0"
+    )
+    offset_arr = torch.zeros(batch_size, dtype=torch.int64, device="cuda:0")
+    samples_per_request = flashinfer.sampling.sampling_from_probs(
+        normalized_prob, generator=(seed_arr, offset_arr)
+    )
+
+    # Traditional generator
+    gen = torch.Generator("cuda:0")
+    gen.manual_seed(42)
+    samples_traditional = flashinfer.sampling.sampling_from_probs(
+        normalized_prob, generator=gen
+    )
+
+    # Both should produce valid samples
+    assert torch.all(samples_per_request < vocab_size) and torch.all(
+        samples_per_request >= 0
+    )
+    assert torch.all(samples_traditional < vocab_size) and torch.all(
+        samples_traditional >= 0
+    )
+    # We don't expect them to match since they use different RNG mechanisms
+
+
 @pytest.mark.parametrize("batch_size", [1, 19, 99])
 @pytest.mark.parametrize("vocab_size", [111, 32000])
 def test_sampling_with_default_device_cuda(batch_size, vocab_size):
