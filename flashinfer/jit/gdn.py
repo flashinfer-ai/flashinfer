@@ -67,16 +67,21 @@ def gen_gdn_prefill_sm90_module() -> JitSpec:
             write_if_different(dest_path, source)
 
     # Copy source files to gen_directory (like POD module does)
+    # Include .cuh and .inc files so relative includes work
     for filename in [
         "gdn_prefill_launcher.cu",
         "flat/prefill/prefill_kernel_delta_rule_sm90.cu",
+        "flat/prefill/prefill_kernel_delta_rule_sm90.cuh",
+        "flat/prefill/prefill_kernel_delta_rule_sm90_extern.inc",
     ]:
         src_path = jit_env.FLASHINFER_CSRC_DIR / filename
         dest_path = gen_directory / pathlib.Path(filename).name
-        source_paths.append(dest_path)
         with open(src_path, "r") as f:
             source = f.read()
         write_if_different(dest_path, source)
+        # Only add .cu files to source_paths for compilation
+        if filename.endswith(".cu"):
+            source_paths.append(dest_path)
 
     return gen_jit_spec(
         uri,
