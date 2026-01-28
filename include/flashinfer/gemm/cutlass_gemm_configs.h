@@ -133,6 +133,11 @@ enum class CutlassTileConfigSM100 {
   CtaShape256x64x128B,
   CtaShape256x128x128B,
   CtaShape256x256x128B,
+
+  // SM103
+  CtaShape128x128x768B,
+  CtaShape128x192x768B,
+  CtaShape128x256x768B,
 };
 
 enum class CutlassTileConfigSM120 {
@@ -188,7 +193,11 @@ enum class TileShape {
   TileShape_128x32x128,
   TileShape_128x64x128,
   TileShape_128x128x128,
-  TileShape_128x256x128
+  TileShape_128x256x128,
+  // SM103
+  TileShape_128x128x768,
+  TileShape_128x192x768,
+  TileShape_128x256x768
 };
 
 template <TileShape Shape_MNK>
@@ -216,6 +225,12 @@ constexpr auto get_tile_shape() {
     return cute::Shape<_128, _128, _128>{};
   } else if constexpr (Shape_MNK == TileShape::TileShape_128x256x128) {
     return cute::Shape<_128, _256, _128>{};
+  } else if constexpr (Shape_MNK == TileShape::TileShape_128x128x768) {  // SM103
+    return cute::Shape<_128, _128, _768>{};
+  } else if constexpr (Shape_MNK == TileShape::TileShape_128x192x768) {  // SM103
+    return cute::Shape<_128, _192, _768>{};
+  } else if constexpr (Shape_MNK == TileShape::TileShape_128x256x768) {  // SM103
+    return cute::Shape<_128, _256, _768>{};
   }
 }
 
@@ -242,6 +257,12 @@ static auto get_tile_shape_name(TileShape Shape_MNK) {
     return "128x128x128";
   } else if (Shape_MNK == TileShape::TileShape_128x256x128) {
     return "128x256x128";
+  } else if (Shape_MNK == TileShape::TileShape_128x128x768) {  // SM103
+    return "128x128x768";
+  } else if (Shape_MNK == TileShape::TileShape_128x192x768) {  // SM103
+    return "128x192x768";
+  } else if (Shape_MNK == TileShape::TileShape_128x256x768) {  // SM103
+    return "128x256x768";
   }
   return "Unknown shape";
 }
@@ -256,7 +277,8 @@ enum class ClusterShape {
   ClusterShape_2x4x1,
   ClusterShape_4x4x1,
   ClusterShape_1x8x1,
-  ClusterShape_8x1x1
+  ClusterShape_8x1x1,
+  ClusterShape_4x1x1
 };
 
 static auto get_cluster_shape_name(ClusterShape Shape_MNK) {
@@ -272,6 +294,8 @@ static auto get_cluster_shape_name(ClusterShape Shape_MNK) {
     return "1x8x1";
   } else if (Shape_MNK == ClusterShape::ClusterShape_8x1x1) {
     return "8x1x1";
+  } else if (Shape_MNK == ClusterShape::ClusterShape_4x1x1) {
+    return "4x1x1";
   }
   return "Unknown shape";
 }
@@ -291,6 +315,8 @@ constexpr auto get_cluster_shape() {
     return cute::Shape<_1, _8, _1>{};
   } else if constexpr (Shape_MNK == ClusterShape::ClusterShape_8x1x1) {
     return cute::Shape<_8, _1, _1>{};
+  } else if constexpr (Shape_MNK == ClusterShape::ClusterShape_4x1x1) {
+    return cute::Shape<_4, _1, _1>{};
   }
 }
 
