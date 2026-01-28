@@ -994,7 +994,7 @@ def get_trtllm_moe_sm100_module():
             use_deepseek_fp8: bool,
             hidden_size: int,
             intermediate_size: int,
-            gated_act_type: int = GatedActType.SwiGlu,
+            activation_type: int = ActivationType.Swiglu,
             use_shuffled_weight: bool = False,
             weight_layout: int = WeightLayout.MajorK,
             use_packed_weights: bool = False,
@@ -1007,7 +1007,7 @@ def get_trtllm_moe_sm100_module():
             self.top_k = top_k
             self.hidden_size = hidden_size
             self.intermediate_size = intermediate_size
-            self.gated_act_type = GatedActType(gated_act_type)
+            self.activation_type = ActivationType(activation_type)
             self.use_shuffled_weight = use_shuffled_weight
             self.weight_layout = WeightLayout(weight_layout)
             self.use_packed_weights = use_packed_weights
@@ -1035,7 +1035,7 @@ def get_trtllm_moe_sm100_module():
                 self.hidden_size,
                 self.intermediate_size,
                 self.num_local_experts,
-                self.gated_act_type,
+                self.activation_type,
                 self.use_shuffled_weight,
                 self.weight_layout,
                 num_tokens,
@@ -1237,7 +1237,7 @@ def get_trtllm_moe_sm100_module():
                     kwargs["routing_method_type"],
                     kwargs["enable_pdl"],
                     kwargs["do_finalize"],
-                    self.gated_act_type,
+                    self.activation_type,
                     output,
                     [-1, -1] if tactic == -1 else tactic,
                 )
@@ -1326,7 +1326,7 @@ def get_trtllm_moe_sm100_module():
             intermediate_size=intermediate_size,
             weight_layout=weight_layout,
             use_shuffled_weight=use_shuffled_weight,
-            gated_act_type=GatedActType.SwiGlu,  # Default for BF16
+            activation_type=ActivationType.Swiglu,  # Default for BF16
         )
 
         inputs = [output, routing_logits, topk_ids, expert_weights, hidden_states]
@@ -1424,6 +1424,7 @@ def get_trtllm_moe_sm100_module():
         routing_method_type: int = 0,
         enable_pdl: Optional[bool] = None,
         tune_max_num_tokens: int = 8192,
+        activation_type: ActivationType = ActivationType.Identity,
     ) -> torch.Tensor:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(hidden_states.device)
@@ -1458,6 +1459,7 @@ def get_trtllm_moe_sm100_module():
             intermediate_size=intermediate_size,
             weight_layout=WeightLayout.MajorK,
             use_shuffled_weight=True,
+            activation_type=activation_type,
         )
 
         inputs = [output, routing_logits, topk_ids, expert_weights, hidden_states]
@@ -1482,6 +1484,7 @@ def get_trtllm_moe_sm100_module():
             use_routing_scales_on_input=use_routing_scales_on_input,
             routing_method_type=routing_method_type,
             enable_pdl=enable_pdl,
+            activation_type=activation_type.value,
         )
         # Call the C++ function
         result = moe_op.trtllm_fp8_per_tensor_scale_moe(
@@ -1506,6 +1509,7 @@ def get_trtllm_moe_sm100_module():
             routing_method_type,
             enable_pdl,
             [-1, -1] if tactic == -1 else tactic,
+            activation_type.value,
         )
 
         return result
@@ -1722,7 +1726,7 @@ def get_trtllm_moe_sm100_module():
         routing_method_type: int,
         do_finalize: bool,
         enable_pdl: Optional[bool] = None,
-        gated_act_type: int = 0,
+        activation_type: int = 0,
         output: Optional[torch.Tensor] = None,
         tune_max_num_tokens: int = 8192,
     ) -> List[torch.Tensor]:
@@ -1782,7 +1786,7 @@ def get_trtllm_moe_sm100_module():
             use_deepseek_fp8=False,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
-            gated_act_type=gated_act_type,
+            activation_type=activation_type,
             weight_layout=WeightLayout.MajorK,
             use_shuffled_weight=True,
         )
@@ -1829,7 +1833,7 @@ def get_trtllm_moe_sm100_module():
             routing_method_type=routing_method_type,
             enable_pdl=enable_pdl,
             do_finalize=do_finalize,
-            gated_act_type=gated_act_type,
+            activation_type=activation_type,
         )
 
         # Call the C++ function for block scale MoE
@@ -1863,7 +1867,7 @@ def get_trtllm_moe_sm100_module():
             routing_method_type,
             do_finalize,
             enable_pdl,
-            gated_act_type,
+            activation_type,
             output,
             [-1, -1] if tactic == -1 else tactic,
         )
@@ -1908,7 +1912,7 @@ def get_trtllm_moe_sm100_module():
         routing_method_type: int,
         do_finalize: bool,
         enable_pdl: bool,
-        gated_act_type: int,
+        activation_type: int,
         output: Optional[torch.Tensor],
         tune_max_num_tokens: int,
     ):
@@ -1980,7 +1984,7 @@ def get_trtllm_moe_sm100_module():
             use_deepseek_fp8=False,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
-            gated_act_type=GatedActType.SwiGlu,
+            activation_type=ActivationType.Swiglu,
             weight_layout=WeightLayout.BlockMajorK,
             use_shuffled_weight=True,
         )
@@ -2187,6 +2191,7 @@ def trtllm_fp8_per_tensor_scale_moe(
     routing_method_type: int = 0,
     enable_pdl: Optional[bool] = None,
     tune_max_num_tokens: int = 8192,
+    activation_type: ActivationType = ActivationType.Identity,
 ) -> torch.Tensor:
     """FP8 per tensor scale MoE operation.
 
@@ -2236,6 +2241,7 @@ def trtllm_fp8_per_tensor_scale_moe(
         routing_method_type,
         enable_pdl,
         tune_max_num_tokens,
+        activation_type,
     )
 
 
@@ -2346,7 +2352,7 @@ def trtllm_fp4_block_scale_moe(
     routing_method_type: int = 0,
     do_finalize: bool = True,
     enable_pdl: Optional[bool] = None,
-    gated_act_type: int = 0,
+    activation_type: int = 0,
     output: Optional[torch.Tensor] = None,
     tune_max_num_tokens: int = 8192,
 ) -> List[torch.Tensor]:
@@ -2441,7 +2447,7 @@ def trtllm_fp4_block_scale_moe(
         routing_method_type,
         do_finalize,
         enable_pdl,
-        gated_act_type,
+        activation_type,
         output,
         tune_max_num_tokens,
     )
