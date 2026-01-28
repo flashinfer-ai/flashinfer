@@ -40,7 +40,11 @@ NON_GATED_ACTIVATION_SUPPORTED_QUANT_MODES = [
 
 
 def is_gated_activation(activation_type: ActivationType) -> bool:
-    return activation_type in [ActivationType.Swiglu, ActivationType.Geglu]
+    return activation_type in [
+        ActivationType.Swiglu,
+        ActivationType.Geglu,
+        ActivationType.SwigluBias,
+    ]
 
 
 def skip_checks(
