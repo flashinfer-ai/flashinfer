@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-#include <cmath>
 #include <algorithm>
+#include <cmath>
 
 #include "flashinfer/exception.h"
 #include "flashinfer/trtllm/fused_moe/RoutingKernel.cuh"
