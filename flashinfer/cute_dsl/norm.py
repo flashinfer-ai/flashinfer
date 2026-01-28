@@ -71,38 +71,6 @@ def rcp_approx_ftz(a: Float32, *, loc=None, ip=None) -> Float32:
 
 
 @dsl_user_op
-def fmin_f32(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
-    """Compute min of two float32 values using PTX min.f32."""
-    return Float32(
-        llvm.inline_asm(
-            T.f32(),
-            [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
-            "min.f32 $0, $1, $2;",
-            "=f,f,f",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
-@dsl_user_op
-def fmax_f32(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
-    """Compute max of two float32 values using PTX max.f32."""
-    return Float32(
-        llvm.inline_asm(
-            T.f32(),
-            [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
-            "max.f32 $0, $1, $2;",
-            "=f,f,f",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
-@dsl_user_op
 def cvt_and_store_f32_to_e4m3(val: Float32, addr: Int64, *, loc=None, ip=None):
     """Convert float32 to E4M3 and store single byte to global memory.
 
@@ -438,7 +406,6 @@ class RMSNormKernel:
 
         # Expand weight to 2D for consistent tiling
         mW_2d = cute.prepend_ones(mW, up_to_rank=2)
-        gW = cute.local_tile(mW_2d, tiler_mn, (0, 0))
 
         # Create TiledCopy for load and store (both use CopyUniversalOp for sync operations)
         copy_atom = cute.make_copy_atom(
@@ -452,7 +419,7 @@ class RMSNormKernel:
 
         # Partition tensors
         tXgX = thr_copy.partition_S(gX)
-        tXgW = thr_copy.partition_S(gW)
+        tXgW = thr_copy.partition_S(mW_2d)
         tXgY = thr_copy.partition_D(gY)
         tXcX = thr_copy.partition_S(cX)
 
@@ -636,8 +603,19 @@ class QKRMSNormKernel:
         tiled_copy = cute.make_tiled_copy(copy_atom, tv_layout, tiler_2d)
         thr_copy = tiled_copy.get_slice(lane_idx)
 
-        # Create 2D identity tensor for bounds checking
-        id2d = cute.make_identity_tensor((1, head_dim))
+        # Create identity tensor matching tile shape for bounds checking
+        id2d = cute.make_identity_tensor(tiler_2d)
+
+        # Weight and predicate are the same for all rows - compute once
+        tXgW = thr_copy.partition_S(mW_2d)
+        tXcX = thr_copy.partition_S(id2d)
+        tXpX = predicate_k(tXcX, limit=head_dim)
+
+        # Load weight once (same for all rows)
+        tXrW = cute.make_rmem_tensor(tXgW.shape, mW.element_type)
+        tXrW.store(cute.zeros_like(tXrW, dtype=mW.element_type))
+        cute.copy(copy_atom, tXgW, tXrW, pred=tXpX)
+        w = tXrW.load().to(Float32)
 
         # Each warp processes multiple rows with grid-stride loop
         row_idx = worker_idx
@@ -645,45 +623,29 @@ class QKRMSNormKernel:
             batch_idx = row_idx // N
             head_idx = row_idx % N
 
-            # Use slice to get 1D row, then prepend_ones to make 2D
-            # local_tile uses mX's stride to compute correct address
-            gX_row = cute.local_tile(
-                mX, (1, 1, self.cols_per_tile), (batch_idx, head_idx, 0)
-            )
-            gY_row = cute.local_tile(
-                mY, (1, 1, self.cols_per_tile), (batch_idx, head_idx, 0)
-            )
-
-            # Flatten the first two dims (both size 1) to get 2D tensor for tiled_copy
-            gX = cute.make_tensor(
-                gX_row.iterator,
-                cute.make_layout(
-                    (1, self.cols_per_tile), stride=(self.cols_per_tile, 1)
+            # Get 3D tile and collapse first two dims (both size 1) to 2D for tiled_copy
+            gX = cute.group_modes(
+                cute.local_tile(
+                    mX, (1, 1, self.cols_per_tile), (batch_idx, head_idx, 0)
                 ),
+                0,
+                2,
             )
-            gY = cute.make_tensor(
-                gY_row.iterator,
-                cute.make_layout(
-                    (1, self.cols_per_tile), stride=(self.cols_per_tile, 1)
+            gY = cute.group_modes(
+                cute.local_tile(
+                    mY, (1, 1, self.cols_per_tile), (batch_idx, head_idx, 0)
                 ),
+                0,
+                2,
             )
-            cX = cute.local_tile(id2d, tiler_2d, (0, 0))
-            gW = cute.local_tile(mW_2d, tiler_2d, (0, 0))
 
             # Partition tensors for this thread
             tXgX = thr_copy.partition_S(gX)
-            tXgW = thr_copy.partition_S(gW)
             tXgY = thr_copy.partition_D(gY)
-            tXcX = thr_copy.partition_S(cX)
 
-            # Register fragments - initialize to zero
+            # Register fragment for input - initialize to zero
             tXrX = cute.make_rmem_tensor(tXgX.shape, mX.element_type)
-            tXrW = cute.make_rmem_tensor(tXgW.shape, mW.element_type)
             tXrX.store(cute.zeros_like(tXrX, dtype=mX.element_type))
-            tXrW.store(cute.zeros_like(tXrW, dtype=mW.element_type))
-
-            # Bounds checking predicate (2D)
-            tXpX = predicate_k(tXcX, limit=head_dim)
 
             # Phase 1: Load input and compute sum of squares
             cute.copy(copy_atom, tXgX, tXrX, pred=tXpX)
@@ -703,12 +665,8 @@ class QKRMSNormKernel:
             mean_sq = sum_sq / Float32(head_dim)
             rstd = cute.math.rsqrt(mean_sq + eps, fastmath=True)
 
-            # Phase 2: Load weight, normalize, and store
-            cute.copy(copy_atom, tXgW, tXrW, pred=tXpX)
-
-            w = tXrW.load().to(Float32)
-
             # output = input * rstd * (weight + weight_bias)
+            # w is already loaded outside the loop
             y = x * rstd * (w + Float32(weight_bias))
 
             # Store output
@@ -832,7 +790,6 @@ class RMSNormQuantKernel:
         cX = cute.local_tile(idX, tiler_mn, (bidx, 0))
 
         mW_2d = cute.prepend_ones(mW, up_to_rank=2)
-        gW = cute.local_tile(mW_2d, tiler_mn, (0, 0))
 
         copy_atom_load = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(), mX.element_type, num_bits_per_copy=copy_bits
@@ -842,7 +799,7 @@ class RMSNormQuantKernel:
         thr_copy_load = tiled_copy_load.get_slice(tidx)
 
         tXgX = thr_copy_load.partition_S(gX)
-        tXgW = thr_copy_load.partition_S(gW)
+        tXgW = thr_copy_load.partition_S(mW_2d)
         tXcX = thr_copy_load.partition_S(cX)
 
         # Register fragments - initialize to zero for proper handling of out-of-bounds threads
@@ -882,8 +839,8 @@ class RMSNormQuantKernel:
                 if idx < H:
                     # Clamp and convert - use flat index for register tensor
                     flat_idx = v * vec_size + e
-                    clamped = fmax_f32(tYrY_f32[flat_idx], Float32(-FLOAT8_E4M3_MAX))
-                    clamped = fmin_f32(clamped, Float32(FLOAT8_E4M3_MAX))
+                    clamped = max(tYrY_f32[flat_idx], Float32(-FLOAT8_E4M3_MAX))
+                    clamped = min(clamped, Float32(FLOAT8_E4M3_MAX))
                     # Use PTX to convert and store FP8 byte
                     out_offset = bidx * H + idx
                     out_ptr = get_ptr_as_int64(mY, Int32(out_offset))
@@ -992,7 +949,6 @@ class FusedAddRMSNormKernel:
         cX = cute.local_tile(idX, tiler_mn, (bidx, 0))
 
         mW_2d = cute.prepend_ones(mW, up_to_rank=2)
-        gW = cute.local_tile(mW_2d, tiler_mn, (0, 0))
 
         copy_atom = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),
@@ -1005,7 +961,7 @@ class FusedAddRMSNormKernel:
 
         tXgX = thr_copy.partition_S(gX)
         tXgR = thr_copy.partition_S(gR)
-        tXgW = thr_copy.partition_S(gW)
+        tXgW = thr_copy.partition_S(mW_2d)
         tXcX = thr_copy.partition_S(cX)
         tYgX = thr_copy.partition_D(gX)
         tYgR = thr_copy.partition_D(gR)
@@ -1168,7 +1124,6 @@ class FusedAddRMSNormQuantKernel:
         cX = cute.local_tile(idX, tiler_mn, (bidx, 0))
 
         mW_2d = cute.prepend_ones(mW, up_to_rank=2)
-        gW = cute.local_tile(mW_2d, tiler_mn, (0, 0))
 
         copy_atom_load = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),
@@ -1181,7 +1136,7 @@ class FusedAddRMSNormQuantKernel:
 
         tXgX = thr_copy_load.partition_S(gX)
         tXgR = thr_copy_load.partition_S(gR)
-        tXgW = thr_copy_load.partition_S(gW)
+        tXgW = thr_copy_load.partition_S(mW_2d)
         tXcX = thr_copy_load.partition_S(cX)
         tYgR = thr_copy_load.partition_D(gR)
 
@@ -1237,8 +1192,8 @@ class FusedAddRMSNormQuantKernel:
                 if idx < H:
                     # Clamp and convert - use flat index for register tensor
                     flat_idx = v * vec_size + e
-                    clamped = fmax_f32(tYrY_f32[flat_idx], Float32(-FLOAT8_E4M3_MAX))
-                    clamped = fmin_f32(clamped, Float32(FLOAT8_E4M3_MAX))
+                    clamped = max(tYrY_f32[flat_idx], Float32(-FLOAT8_E4M3_MAX))
+                    clamped = min(clamped, Float32(FLOAT8_E4M3_MAX))
                     # Use PTX to convert and store FP8 byte
                     out_offset = bidx * H + idx
                     out_ptr = get_ptr_as_int64(mY, Int32(out_offset))
@@ -1425,10 +1380,7 @@ class LayerNormKernel:
 
         # Expand gamma and beta to 2D for tiled copy (float32)
         mGamma_2d = cute.prepend_ones(mGamma, up_to_rank=2)
-        gGamma = cute.local_tile(mGamma_2d, tiler_mn_f32, (0, 0))
-
         mBeta_2d = cute.prepend_ones(mBeta, up_to_rank=2)
-        gBeta = cute.local_tile(mBeta_2d, tiler_mn_f32, (0, 0))
 
         # Identity tensor for gamma/beta bounds checking
         idGamma = cute.make_identity_tensor(mGamma_2d.shape)
@@ -1462,9 +1414,9 @@ class LayerNormKernel:
         tXcX = thr_copy_load.partition_S(cX)
 
         # Partitions for gamma/beta (float32)
-        tGgGamma = thr_copy_load_f32.partition_S(gGamma)
+        tGgGamma = thr_copy_load_f32.partition_S(mGamma_2d)
         tGsGamma = thr_copy_load_f32.partition_D(sGamma_f32)
-        tGgBeta = thr_copy_load_f32.partition_S(gBeta)
+        tGgBeta = thr_copy_load_f32.partition_S(mBeta_2d)
         tGsBeta = thr_copy_load_f32.partition_D(sBeta_f32)
         tGcGamma = thr_copy_load_f32.partition_S(cGamma)
 
