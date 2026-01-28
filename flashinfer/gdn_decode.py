@@ -2073,19 +2073,18 @@ def gdn_verify_kernel_mtp(
             v_idx = i_v * tile_v + group_idx * rows_per_group + row_in_group
 
             if v_idx < V:
-                # Load h[v_idx, :] into registers using local_tile + autovec_copy
+                # Load h[v_idx, :] into registers using 3D local_tile + autovec_copy
                 flat_state_idx = cache_idx * HV + i_hv
-                h_row = h0_source[(flat_state_idx, v_idx, None)]  # (K,)
-                h_tile = cute.local_tile(h_row, (vec_size,), (lane_in_group,))
+                h_tile = cute.local_tile(
+                    h0_source, (1, 1, vec_size), (flat_state_idx, v_idx, lane_in_group)
+                )
                 cute.autovec_copy(h_tile, r_h)
 
                 # Process all T time steps with h in registers
                 for i_t in cutlass.range_constexpr(T):
-                    # Load pre-computed q, k from shared memory using local_tile
-                    sQ_row = sQ[(i_t, None)]  # (K,)
-                    sK_row = sK[(i_t, None)]  # (K,)
-                    sQ_tile = cute.local_tile(sQ_row, (vec_size,), (lane_in_group,))
-                    sK_tile = cute.local_tile(sK_row, (vec_size,), (lane_in_group,))
+                    # Load pre-computed q, k from shared memory using 2D local_tile
+                    sQ_tile = cute.local_tile(sQ, (1, vec_size), (i_t, lane_in_group))
+                    sK_tile = cute.local_tile(sK, (1, vec_size), (i_t, lane_in_group))
                     cute.autovec_copy(sQ_tile, r_q)
                     cute.autovec_copy(sK_tile, r_k)
 
@@ -2120,12 +2119,13 @@ def gdn_verify_kernel_mtp(
                     for i in cutlass.range_constexpr(vec_size):
                         r_h[i] += r_k[i] * v_new
 
-                    # Cache intermediate state if needed using local_tile + autovec_copy
+                    # Cache intermediate state if needed using 3D local_tile + autovec_copy
                     if cutlass.const_expr(cache_intermediate_states):
                         flat_idx = i_n * T * HV + i_t * HV + i_hv
-                        inter_row = intermediate_states[(flat_idx, v_idx, None)]
                         inter_tile = cute.local_tile(
-                            inter_row, (vec_size,), (lane_in_group,)
+                            intermediate_states,
+                            (1, 1, vec_size),
+                            (flat_idx, v_idx, lane_in_group),
                         )
                         cute.autovec_copy(r_h, inter_tile)
 
@@ -2149,11 +2149,12 @@ def gdn_verify_kernel_mtp(
                     if lane_in_group == 0:
                         o[(i_n, i_t, i_hv, v_idx)] = cutlass.BFloat16(sum_hq)
 
-                # Write final state back (if not disabled) using local_tile + autovec_copy
+                # Write final state back (if not disabled) using 3D local_tile + autovec_copy
                 if cutlass.const_expr(not disable_state_update):
-                    h_row_out = h0_source[(flat_state_idx, v_idx, None)]
                     h_tile_out = cute.local_tile(
-                        h_row_out, (vec_size,), (lane_in_group,)
+                        h0_source,
+                        (1, 1, vec_size),
+                        (flat_state_idx, v_idx, lane_in_group),
                     )
                     cute.autovec_copy(r_h, h_tile_out)
 
