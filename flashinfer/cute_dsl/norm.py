@@ -34,7 +34,7 @@ from typing import Callable
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import Float32, Int32, Int64, Uint32
+from cutlass import Float32, Int32, Int64
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
 
@@ -52,22 +52,6 @@ COPY_BITS = 128  # 128-bit vectorized loads
 # =============================================================================
 # PTX Intrinsics
 # =============================================================================
-
-
-@dsl_user_op
-def rsqrt_approx_f32(a: Float32, *, loc=None, ip=None) -> Float32:
-    """Fast reciprocal square root using PTX rsqrt.approx.f32."""
-    return Float32(
-        llvm.inline_asm(
-            T.f32(),
-            [Float32(a).ir_value(loc=loc, ip=ip)],
-            "rsqrt.approx.f32 $0, $1;",
-            "=f,f",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
 
 
 @dsl_user_op
@@ -111,94 +95,6 @@ def fmax_f32(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
             [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
             "max.f32 $0, $1, $2;",
             "=f,f,f",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
-@dsl_user_op
-def half2_mul(a: Uint32, b: Uint32, *, loc=None, ip=None) -> Uint32:
-    """Multiply two Half2 values element-wise: (a.x*b.x, a.y*b.y)."""
-    return Uint32(
-        llvm.inline_asm(
-            T.i32(),
-            [Uint32(a).ir_value(loc=loc, ip=ip), Uint32(b).ir_value(loc=loc, ip=ip)],
-            "mul.f16x2 $0, $1, $2;",
-            "=r,r,r",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
-@dsl_user_op
-def half2_add(a: Uint32, b: Uint32, *, loc=None, ip=None) -> Uint32:
-    """Add two Half2 values element-wise: (a.x+b.x, a.y+b.y)."""
-    return Uint32(
-        llvm.inline_asm(
-            T.i32(),
-            [Uint32(a).ir_value(loc=loc, ip=ip), Uint32(b).ir_value(loc=loc, ip=ip)],
-            "add.f16x2 $0, $1, $2;",
-            "=r,r,r",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
-@dsl_user_op
-def bfloat2_mul(a: Uint32, b: Uint32, *, loc=None, ip=None) -> Uint32:
-    """Multiply two BFloat2 values element-wise: (a.x*b.x, a.y*b.y)."""
-    return Uint32(
-        llvm.inline_asm(
-            T.i32(),
-            [Uint32(a).ir_value(loc=loc, ip=ip), Uint32(b).ir_value(loc=loc, ip=ip)],
-            "mul.bf16x2 $0, $1, $2;",
-            "=r,r,r",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
-@dsl_user_op
-def bfloat2_add(a: Uint32, b: Uint32, *, loc=None, ip=None) -> Uint32:
-    """Add two BFloat2 values element-wise: (a.x+b.x, a.y+b.y)."""
-    return Uint32(
-        llvm.inline_asm(
-            T.i32(),
-            [Uint32(a).ir_value(loc=loc, ip=ip), Uint32(b).ir_value(loc=loc, ip=ip)],
-            "add.bf16x2 $0, $1, $2;",
-            "=r,r,r",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
-@dsl_user_op
-def cvt_f32_to_e4m3(a: Float32, *, loc=None, ip=None) -> Uint32:
-    """Convert float32 to E4M3 using native cvt.rn.satfinite.e4m3x2.f32."""
-    return Uint32(
-        llvm.inline_asm(
-            T.i32(),
-            [Float32(a).ir_value(loc=loc, ip=ip)],
-            """
-            {
-                .reg .b16 fp8_pair;
-                .reg .f32 zero;
-                mov.f32 zero, 0f00000000;
-                cvt.rn.satfinite.e4m3x2.f32 fp8_pair, zero, $1;
-                cvt.u32.u16 $0, fp8_pair;
-            }
-            """,
-            "=r,f",
             has_side_effects=False,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
