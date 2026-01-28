@@ -203,6 +203,19 @@ def gdn_decode_kernel_small_batch_pretranspose(
     r_h = cute.make_rmem_tensor(
         cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32
     )
+    # BF16 register tensors for vectorized q, k, v loading
+    r_q_bf16 = cute.make_rmem_tensor(
+        cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16
+    )
+    r_k_bf16 = cute.make_rmem_tensor(
+        cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16
+    )
+    r_v_bf16 = cute.make_rmem_tensor(
+        cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16
+    )
+
+    # Compute k_start for contiguous access pattern
+    k_start = lane_id * vec_size
 
     cute.arch.barrier()
 
@@ -235,12 +248,22 @@ def gdn_decode_kernel_small_batch_pretranspose(
         cute.copy(tiled_copy_load, thr_gSrc, thr_sData)
         cute.arch.cp_async_commit_group()
 
+    # Load q, k into BF16 registers using autovec_copy (contiguous pattern)
+    q_tile = cute.local_tile(q, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane_id))
+    k_tile = cute.local_tile(k, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane_id))
+    cute.autovec_copy(q_tile, r_q_bf16)
+    cute.autovec_copy(k_tile, r_k_bf16)
+
+    # Convert BF16 to FP32
     for i in cutlass.range_constexpr(vec_size):
-        r_q[i] = cutlass.Float32(q[i_n, i_t, i_h, i * 32 + lane_id])
-        r_k[i] = cutlass.Float32(k[i_n, i_t, i_h, i * 32 + lane_id])
-        # Store v to shared memory instead of register
-        v_val = cutlass.Float32(v[i_n, i_t, i_hv, i * 32 + lane_id])
-        sV[i * 32 + lane_id] = v_val
+        r_q[i] = cutlass.Float32(r_q_bf16[i])
+        r_k[i] = cutlass.Float32(r_k_bf16[i])
+
+    # Load v into BF16 registers using autovec_copy, convert to FP32, store to sV
+    v_tile = cute.local_tile(v, (1, 1, 1, vec_size), (i_n, i_t, i_hv, lane_id))
+    cute.autovec_copy(v_tile, r_v_bf16)
+    for i in cutlass.range_constexpr(vec_size):
+        sV[k_start + i] = cutlass.Float32(r_v_bf16[i])
 
     cute.arch.barrier()  # Ensure all threads finish writing to sV
 
@@ -329,12 +352,18 @@ def gdn_decode_kernel_small_batch_pretranspose(
             cute.copy(tiled_copy_load, thr_gSrc, thr_sData)
             cute.arch.cp_async_commit_group()
 
-        # Step 3: Compute using data from current stage
+        # Step 3: Compute using data from current stage (contiguous access pattern)
         for row in cutlass.range_constexpr(0, TILE_V, 4):
             row_offset = tidx // 32
             sum_hk = 0.0
+
+            # Load h from sData using 3D local_tile + autovec_copy (contiguous in K)
+            sData_tile = cute.local_tile(
+                sData, (1, vec_size, 1), (row + row_offset, lane_id, stage)
+            )
+            cute.autovec_copy(sData_tile, r_h)
+
             for i in cutlass.range_constexpr(vec_size):
-                r_h[i] = sData[(row + row_offset, i * 32 + lane_id, stage)]
                 r_h[i] = r_h[i] * r_g
                 sum_hk += r_h[i] * r_k[i]
 
@@ -349,8 +378,13 @@ def gdn_decode_kernel_small_batch_pretranspose(
             sum_hq = 0.0
             for i in cutlass.range_constexpr(vec_size):
                 r_h[i] += r_k[i] * v_new
-                gDst[(0, row + row_offset, i * 32 + lane_id, v_tiles)] = r_h[i]
                 sum_hq += r_h[i] * r_q[i]
+
+            # Write h to gDst using 4D local_tile + autovec_copy (contiguous in K)
+            gDst_tile = cute.local_tile(
+                gDst, (1, 1, vec_size, 1), (0, row + row_offset, lane_id, v_tiles)
+            )
+            cute.autovec_copy(r_h, gDst_tile)
 
             for offset in [16, 8, 4, 2, 1]:
                 sum_hq += cute.arch.shuffle_sync_bfly(
@@ -440,6 +474,19 @@ def gdn_decode_kernel_big_batch_pretranspose(
     r_h = cute.make_rmem_tensor(
         cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32
     )
+    # BF16 register tensors for vectorized q, k, v loading
+    r_q_bf16 = cute.make_rmem_tensor(
+        cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16
+    )
+    r_k_bf16 = cute.make_rmem_tensor(
+        cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16
+    )
+    r_v_bf16 = cute.make_rmem_tensor(
+        cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16
+    )
+
+    # Compute k_start for contiguous access pattern
+    k_start = lane_id * vec_size
 
     cute.arch.barrier()
 
@@ -471,12 +518,22 @@ def gdn_decode_kernel_big_batch_pretranspose(
         cute.copy(tiled_copy_load, thr_gSrc, thr_sData)
         cute.arch.cp_async_commit_group()
 
+    # Load q, k into BF16 registers using autovec_copy (contiguous pattern)
+    q_tile = cute.local_tile(q, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane_id))
+    k_tile = cute.local_tile(k, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane_id))
+    cute.autovec_copy(q_tile, r_q_bf16)
+    cute.autovec_copy(k_tile, r_k_bf16)
+
+    # Convert BF16 to FP32
     for i in cutlass.range_constexpr(vec_size):
-        r_q[i] = cutlass.Float32(q[i_n, i_t, i_h, i * 32 + lane_id])
-        r_k[i] = cutlass.Float32(k[i_n, i_t, i_h, i * 32 + lane_id])
-        # Store v to shared memory instead of register
-        v_val = cutlass.Float32(v[i_n, i_t, i_hv, i * 32 + lane_id])
-        sV[i * 32 + lane_id] = v_val
+        r_q[i] = cutlass.Float32(r_q_bf16[i])
+        r_k[i] = cutlass.Float32(r_k_bf16[i])
+
+    # Load v into BF16 registers using autovec_copy, convert to FP32, store to sV
+    v_tile = cute.local_tile(v, (1, 1, 1, vec_size), (i_n, i_t, i_hv, lane_id))
+    cute.autovec_copy(v_tile, r_v_bf16)
+    for i in cutlass.range_constexpr(vec_size):
+        sV[k_start + i] = cutlass.Float32(r_v_bf16[i])
 
     cute.arch.barrier()  # Ensure all threads finish writing to sV
 
@@ -564,12 +621,18 @@ def gdn_decode_kernel_big_batch_pretranspose(
             cute.copy(tiled_copy_load, thr_gSrc, thr_sData)
             cute.arch.cp_async_commit_group()
 
-        # Step 3: Compute using data from current stage
+        # Step 3: Compute using data from current stage (contiguous access pattern)
         for row in cutlass.range_constexpr(0, TILE_V, 4):
             row_offset = tidx // 32
             sum_hk = 0.0
+
+            # Load h from sData using 3D local_tile + autovec_copy (contiguous in K)
+            sData_tile = cute.local_tile(
+                sData, (1, vec_size, 1), (row + row_offset, lane_id, stage)
+            )
+            cute.autovec_copy(sData_tile, r_h)
+
             for i in cutlass.range_constexpr(vec_size):
-                r_h[i] = sData[(row + row_offset, i * 32 + lane_id, stage)]
                 r_h[i] = r_h[i] * r_g
                 sum_hk += r_h[i] * r_k[i]
 
@@ -584,8 +647,13 @@ def gdn_decode_kernel_big_batch_pretranspose(
             sum_hq = 0.0
             for i in cutlass.range_constexpr(vec_size):
                 r_h[i] += r_k[i] * v_new
-                gDst[(0, row + row_offset, i * 32 + lane_id, v_tiles)] = r_h[i]
                 sum_hq += r_h[i] * r_q[i]
+
+            # Write h to gDst using 4D local_tile + autovec_copy (contiguous in K)
+            gDst_tile = cute.local_tile(
+                gDst, (1, 1, vec_size, 1), (0, row + row_offset, lane_id, v_tiles)
+            )
+            cute.autovec_copy(r_h, gDst_tile)
 
             for offset in [16, 8, 4, 2, 1]:
                 sum_hq += cute.arch.shuffle_sync_bfly(
