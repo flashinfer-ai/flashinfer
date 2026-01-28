@@ -35,6 +35,22 @@ if is_cute_dsl_available():
         add_rmsnorm_fp4quant,
         AddRMSNormFP4QuantKernel,
     )
+    from .norm import (
+        # Kernel classes
+        RMSNormKernel,
+        QKRMSNormKernel,
+        RMSNormQuantKernel,
+        FusedAddRMSNormKernel,
+        FusedAddRMSNormQuantKernel,
+        LayerNormKernel,
+        # Python API functions
+        rmsnorm_cute,
+        qk_rmsnorm_cute,
+        rmsnorm_quant_cute,
+        fused_add_rmsnorm_cute,
+        fused_add_rmsnorm_quant_cute,
+        layernorm_cute,
+    )
 
 __all__ = [
     # Utils (always available)
@@ -56,4 +72,17 @@ if is_cute_dsl_available():
         # Add + RMSNorm + FP4 Quantization
         "add_rmsnorm_fp4quant",
         "AddRMSNormFP4QuantKernel",
+        # Norm kernels (CuTe DSL)
+        "RMSNormKernel",
+        "QKRMSNormKernel",
+        "RMSNormQuantKernel",
+        "FusedAddRMSNormKernel",
+        "FusedAddRMSNormQuantKernel",
+        "LayerNormKernel",
+        "rmsnorm_cute",
+        "qk_rmsnorm_cute",
+        "rmsnorm_quant_cute",
+        "fused_add_rmsnorm_cute",
+        "fused_add_rmsnorm_quant_cute",
+        "layernorm_cute",
     ]

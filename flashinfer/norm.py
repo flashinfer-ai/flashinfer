@@ -15,18 +15,32 @@ limitations under the License.
 """
 
 import functools
+import os
 from typing import Optional
 
 import torch
 
 from .api_logging import flashinfer_api
-from .jit.norm import gen_norm_module
 from .utils import device_support_pdl, register_custom_op, register_fake_op
 
+# Use CUDA JIT implementation instead of CuTe DSL (for debugging/fallback)
+_USE_CUDA_NORM = os.environ.get("FLASHINFER_USE_CUDA_NORM", "0") == "1"
 
-@functools.cache
-def get_norm_module():
-    return gen_norm_module().build_and_load()
+if _USE_CUDA_NORM:
+    from .jit.norm import gen_norm_module
+
+    @functools.cache
+    def get_norm_module():
+        return gen_norm_module().build_and_load()
+else:
+    from .cute_dsl.norm import (
+        rmsnorm_cute,
+        qk_rmsnorm_cute,
+        rmsnorm_quant_cute,
+        fused_add_rmsnorm_cute,
+        fused_add_rmsnorm_quant_cute,
+        layernorm_cute,
+    )
 
 
 @flashinfer_api
@@ -60,8 +74,6 @@ def rmsnorm(
     output: torch.Tensor
         Normalized tensor, 2D shape (batch_size, hidden_size) or 3D shape (batch_size, num_heads, hidden_size).
     """
-    if enable_pdl is None:
-        enable_pdl = device_support_pdl(input.device)
     if out is None:
         out = torch.empty_like(input)
     _rmsnorm(out, input, weight, eps, enable_pdl)
@@ -78,7 +90,17 @@ def _rmsnorm(
 ) -> None:
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)
-    get_norm_module().rmsnorm(out, input, weight, eps, enable_pdl)
+    if _USE_CUDA_NORM:
+        get_norm_module().rmsnorm(out, input, weight, eps, enable_pdl)
+    else:
+        if input.dim() == 3:
+            qk_rmsnorm_cute(
+                input, weight, out, eps, weight_bias=0.0, enable_pdl=enable_pdl
+            )
+        else:
+            rmsnorm_cute(
+                input, weight, out, eps, weight_bias=0.0, enable_pdl=enable_pdl
+            )
 
 
 @register_fake_op("flashinfer::rmsnorm")
@@ -129,7 +151,12 @@ def rmsnorm_quant(
     """
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)
-    get_norm_module().rmsnorm_quant(out, input, weight, scale, eps, enable_pdl)
+    if _USE_CUDA_NORM:
+        get_norm_module().rmsnorm_quant(out, input, weight, scale, eps, enable_pdl)
+    else:
+        rmsnorm_quant_cute(
+            out, input, weight, scale, eps, weight_bias=0.0, enable_pdl=enable_pdl
+        )
 
 
 @register_fake_op("flashinfer::rmsnorm_quant")
@@ -177,7 +204,12 @@ def fused_add_rmsnorm(
     """
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)
-    get_norm_module().fused_add_rmsnorm(input, residual, weight, eps, enable_pdl)
+    if _USE_CUDA_NORM:
+        get_norm_module().fused_add_rmsnorm(input, residual, weight, eps, enable_pdl)
+    else:
+        fused_add_rmsnorm_cute(
+            input, residual, weight, eps, weight_bias=0.0, enable_pdl=enable_pdl
+        )
 
 
 @register_fake_op("flashinfer::fused_add_rmsnorm")
@@ -232,9 +264,21 @@ def fused_add_rmsnorm_quant(
     """
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)
-    get_norm_module().fused_add_rmsnorm_quant(
-        out, input, residual, weight, scale, eps, enable_pdl
-    )
+    if _USE_CUDA_NORM:
+        get_norm_module().fused_add_rmsnorm_quant(
+            out, input, residual, weight, scale, eps, enable_pdl
+        )
+    else:
+        fused_add_rmsnorm_quant_cute(
+            out,
+            input,
+            residual,
+            weight,
+            scale,
+            eps,
+            weight_bias=0.0,
+            enable_pdl=enable_pdl,
+        )
 
 
 @register_fake_op("flashinfer::fused_add_rmsnorm_quant")
@@ -281,8 +325,6 @@ def gemma_rmsnorm(
     output: torch.Tensor
         Gemma Normalized tensor, shape (batch_size, hidden_size).
     """
-    if enable_pdl is None:
-        enable_pdl = device_support_pdl(input.device)
     if out is None:
         out = torch.empty_like(input)
     _gemma_rmsnorm(out, input, weight, eps, enable_pdl)
@@ -299,7 +341,17 @@ def _gemma_rmsnorm(
 ) -> None:
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)
-    get_norm_module().gemma_rmsnorm(out, input, weight, eps, enable_pdl)
+    if _USE_CUDA_NORM:
+        get_norm_module().gemma_rmsnorm(out, input, weight, eps, enable_pdl)
+    else:
+        if input.dim() == 3:
+            qk_rmsnorm_cute(
+                input, weight, out, eps, weight_bias=1.0, enable_pdl=enable_pdl
+            )
+        else:
+            rmsnorm_cute(
+                input, weight, out, eps, weight_bias=1.0, enable_pdl=enable_pdl
+            )
 
 
 @register_fake_op("flashinfer::gemma_rmsnorm")
@@ -348,7 +400,14 @@ def gemma_fused_add_rmsnorm(
     """
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)
-    get_norm_module().gemma_fused_add_rmsnorm(input, residual, weight, eps, enable_pdl)
+    if _USE_CUDA_NORM:
+        get_norm_module().gemma_fused_add_rmsnorm(
+            input, residual, weight, eps, enable_pdl
+        )
+    else:
+        fused_add_rmsnorm_cute(
+            input, residual, weight, eps, weight_bias=1.0, enable_pdl=enable_pdl
+        )
 
 
 @register_fake_op("flashinfer::gemma_fused_add_rmsnorm")
@@ -388,7 +447,10 @@ def layernorm(
         Layer Normalized tensor, shape (batch_size, hidden_size). Same dtype as input.
     """
     out = torch.empty_like(input)
-    get_norm_module().layernorm(out, input, gemma, beta, eps)
+    if _USE_CUDA_NORM:
+        get_norm_module().layernorm(out, input, gemma, beta, eps)
+    else:
+        layernorm_cute(out, input, gemma, beta, eps)
     return out
 
 
@@ -404,10 +466,4 @@ def _layernorm_fake(
 
 
 # CuTe-DSL fused RMSNorm + FP4 Quantization kernels
-# These require CuTe-DSL to be available and SM100+ (Blackwell) GPUs
-try:
-    from .cute_dsl import rmsnorm_fp4quant, add_rmsnorm_fp4quant
-except ImportError:
-    # CuTe-DSL not available
-    rmsnorm_fp4quant = None  # type: ignore[misc,assignment]
-    add_rmsnorm_fp4quant = None  # type: ignore[misc,assignment]
+# These require SM100+ (Blackwell) GPUs
