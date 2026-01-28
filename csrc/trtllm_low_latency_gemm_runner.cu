@@ -49,6 +49,9 @@ gemm::gemm::GemmData createGemmData(int64_t m, int64_t n, int64_t k) {
   gemmData.mProblemDimensions.mM = n;
   gemmData.mProblemDimensions.mN = m;
   gemmData.mProblemDimensions.mK = k;
+  gemmData.mProblemDimensions.mValidM = gemmData.mProblemDimensions.mM;
+  gemmData.mProblemDimensions.mValidN = gemmData.mProblemDimensions.mN;
+  gemmData.mProblemDimensions.mValidK = gemmData.mProblemDimensions.mK;
   gemmData.mProblemDimensions.mRank = 0;
   gemmData.mProblemDimensions.mWorldSize = 1;
 
