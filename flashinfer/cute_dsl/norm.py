@@ -1774,14 +1774,17 @@ def _get_compiled_rmsnorm_kernel(dtype_str: str, H: int, weight_bias: float):
 
     # Use symbolic size for dynamic M dimension
     sym_m = cute.sym_int()
+    # Use symbolic stride for arbitrary row stride (last dim must be contiguous)
+    sym_row_stride_x = cute.sym_int(divisibility=kernel_obj.vec_size)
+    sym_row_stride_y = cute.sym_int(divisibility=kernel_obj.vec_size)
 
-    # Create fake tensors for compilation with TVM-FFI
-    x_fake = cute.runtime.make_fake_compact_tensor(
-        dtype, (sym_m, H), stride_order=(1, 0), assumed_align=128
+    # Create fake tensors with symbolic stride for arbitrary stride support
+    x_fake = cute.runtime.make_fake_tensor(
+        dtype, (sym_m, H), (sym_row_stride_x, 1), assumed_align=16
     )
     w_fake = cute.runtime.make_fake_compact_tensor(dtype, (H,), assumed_align=128)
-    y_fake = cute.runtime.make_fake_compact_tensor(
-        dtype, (sym_m, H), stride_order=(1, 0), assumed_align=128
+    y_fake = cute.runtime.make_fake_tensor(
+        dtype, (sym_m, H), (sym_row_stride_y, 1), assumed_align=16
     )
 
     # Create fake stream that uses environment stream at runtime
@@ -1902,13 +1905,15 @@ def _get_compiled_rmsnorm_quant_kernel(
     kernel_obj = RMSNormQuantKernel(dtype, H, weight_bias)
 
     sym_m = cute.sym_int()
+    sym_row_stride_x = cute.sym_int(divisibility=kernel_obj.vec_size)
+    sym_row_stride_y = cute.sym_int(divisibility=kernel_obj.vec_size_out)
 
-    x_fake = cute.runtime.make_fake_compact_tensor(
-        dtype, (sym_m, H), stride_order=(1, 0), assumed_align=128
+    x_fake = cute.runtime.make_fake_tensor(
+        dtype, (sym_m, H), (sym_row_stride_x, 1), assumed_align=16
     )
     w_fake = cute.runtime.make_fake_compact_tensor(dtype, (H,), assumed_align=128)
-    y_fake = cute.runtime.make_fake_compact_tensor(
-        out_dtype, (sym_m, H), stride_order=(1, 0), assumed_align=128
+    y_fake = cute.runtime.make_fake_tensor(
+        out_dtype, (sym_m, H), (sym_row_stride_y, 1), assumed_align=16
     )
 
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
@@ -1952,12 +1957,14 @@ def _get_compiled_fused_add_rmsnorm_kernel(dtype_str: str, H: int, weight_bias: 
     kernel_obj = FusedAddRMSNormKernel(dtype, H, weight_bias)
 
     sym_m = cute.sym_int()
+    sym_row_stride_x = cute.sym_int(divisibility=kernel_obj.vec_size)
+    sym_row_stride_r = cute.sym_int(divisibility=kernel_obj.vec_size)
 
-    x_fake = cute.runtime.make_fake_compact_tensor(
-        dtype, (sym_m, H), stride_order=(1, 0), assumed_align=128
+    x_fake = cute.runtime.make_fake_tensor(
+        dtype, (sym_m, H), (sym_row_stride_x, 1), assumed_align=16
     )
-    r_fake = cute.runtime.make_fake_compact_tensor(
-        dtype, (sym_m, H), stride_order=(1, 0), assumed_align=128
+    r_fake = cute.runtime.make_fake_tensor(
+        dtype, (sym_m, H), (sym_row_stride_r, 1), assumed_align=16
     )
     w_fake = cute.runtime.make_fake_compact_tensor(dtype, (H,), assumed_align=128)
 
@@ -2002,15 +2009,18 @@ def _get_compiled_fused_add_rmsnorm_quant_kernel(
     kernel_obj = FusedAddRMSNormQuantKernel(dtype, H, weight_bias)
 
     sym_m = cute.sym_int()
+    sym_row_stride_y = cute.sym_int(divisibility=kernel_obj.vec_size)
+    sym_row_stride_x = cute.sym_int(divisibility=kernel_obj.vec_size)
+    sym_row_stride_r = cute.sym_int(divisibility=kernel_obj.vec_size)
 
-    y_fake = cute.runtime.make_fake_compact_tensor(
-        out_dtype, (sym_m, H), stride_order=(1, 0), assumed_align=128
+    y_fake = cute.runtime.make_fake_tensor(
+        out_dtype, (sym_m, H), (sym_row_stride_y, 1), assumed_align=16
     )
-    x_fake = cute.runtime.make_fake_compact_tensor(
-        dtype, (sym_m, H), stride_order=(1, 0), assumed_align=128
+    x_fake = cute.runtime.make_fake_tensor(
+        dtype, (sym_m, H), (sym_row_stride_x, 1), assumed_align=16
     )
-    r_fake = cute.runtime.make_fake_compact_tensor(
-        dtype, (sym_m, H), stride_order=(1, 0), assumed_align=128
+    r_fake = cute.runtime.make_fake_tensor(
+        dtype, (sym_m, H), (sym_row_stride_r, 1), assumed_align=16
     )
     w_fake = cute.runtime.make_fake_compact_tensor(dtype, (H,), assumed_align=128)
 
@@ -2059,12 +2069,14 @@ def _get_compiled_layernorm_kernel(dtype_str: str, gamma_dtype_str: str, H: int)
     kernel_obj = LayerNormKernel(dtype, H)
 
     sym_m = cute.sym_int()
+    sym_row_stride_y = cute.sym_int(divisibility=kernel_obj.vec_size)
+    sym_row_stride_x = cute.sym_int(divisibility=kernel_obj.vec_size)
 
-    y_fake = cute.runtime.make_fake_compact_tensor(
-        dtype, (sym_m, H), stride_order=(1, 0), assumed_align=128
+    y_fake = cute.runtime.make_fake_tensor(
+        dtype, (sym_m, H), (sym_row_stride_y, 1), assumed_align=16
     )
-    x_fake = cute.runtime.make_fake_compact_tensor(
-        dtype, (sym_m, H), stride_order=(1, 0), assumed_align=128
+    x_fake = cute.runtime.make_fake_tensor(
+        dtype, (sym_m, H), (sym_row_stride_x, 1), assumed_align=16
     )
     gamma_fake = cute.runtime.make_fake_compact_tensor(
         gamma_dtype, (H,), assumed_align=128
@@ -2115,20 +2127,27 @@ def rmsnorm_cute(
     weight_bias: float = 0.0,
     enable_pdl: bool = False,
 ) -> None:
-    """CuTe DSL RMSNorm implementation."""
+    """CuTe DSL RMSNorm implementation.
+
+    Supports arbitrary stride - no need to call contiguous().
+    Last dimension must be contiguous (stride[-1] == 1).
+    """
     H = input.shape[-1]
+    assert input.stride(-1) == 1, "Last dimension of input must be contiguous"
+    assert out.stride(-1) == 1, "Last dimension of output must be contiguous"
+
     if input.dim() == 3:
         M = input.shape[0] * input.shape[1]
-        input_2d = input.view(M, H).contiguous()
+        input_2d = input.view(M, H)
         out_2d = out.view(M, H)
     else:
         M = input.shape[0]
-        input_2d = input.contiguous()
+        input_2d = input
         out_2d = out
 
     dtype_str = _torch_dtype_to_str(input.dtype)
     kernel = _get_compiled_rmsnorm_kernel(dtype_str, H, weight_bias)
-    kernel(input_2d, weight.contiguous(), out_2d, M, eps)
+    kernel(input_2d, weight, out_2d, M, eps)
 
 
 def qk_rmsnorm_cute(
@@ -2176,7 +2195,8 @@ def qk_rmsnorm_cute(
     )
 
     # Pass 3D tensors directly - kernel handles arbitrary stride
-    kernel(input, weight.contiguous(), output, batch_size, num_heads, eps, num_blocks)
+    assert weight.is_contiguous(), "Weight must be contiguous"
+    kernel(input, weight, output, batch_size, num_heads, eps, num_blocks)
 
 
 def rmsnorm_quant_cute(
@@ -2188,7 +2208,15 @@ def rmsnorm_quant_cute(
     weight_bias: float = 0.0,
     enable_pdl: bool = False,
 ) -> None:
-    """CuTe DSL RMSNorm + FP8 quantization implementation."""
+    """CuTe DSL RMSNorm + FP8 quantization implementation.
+
+    Supports arbitrary stride - no need to call contiguous().
+    Last dimension must be contiguous (stride[-1] == 1).
+    """
+    assert input.stride(-1) == 1, "Last dimension of input must be contiguous"
+    assert out.stride(-1) == 1, "Last dimension of output must be contiguous"
+    assert weight.is_contiguous(), "Weight must be contiguous"
+
     H = input.shape[-1]
     M = input.shape[0]
 
@@ -2197,7 +2225,7 @@ def rmsnorm_quant_cute(
     kernel = _get_compiled_rmsnorm_quant_kernel(
         dtype_str, out_dtype_str, H, weight_bias
     )
-    kernel(out, input.contiguous(), weight.contiguous(), M, scale, eps)
+    kernel(out, input, weight, M, scale, eps)
 
 
 def fused_add_rmsnorm_cute(
@@ -2208,13 +2236,21 @@ def fused_add_rmsnorm_cute(
     weight_bias: float = 0.0,
     enable_pdl: bool = False,
 ) -> None:
-    """CuTe DSL Fused Add + RMSNorm implementation."""
+    """CuTe DSL Fused Add + RMSNorm implementation.
+
+    Supports arbitrary stride - no need to call contiguous().
+    Last dimension must be contiguous (stride[-1] == 1).
+    """
+    assert input.stride(-1) == 1, "Last dimension of input must be contiguous"
+    assert residual.stride(-1) == 1, "Last dimension of residual must be contiguous"
+    assert weight.is_contiguous(), "Weight must be contiguous"
+
     H = input.shape[-1]
     M = input.shape[0]
 
     dtype_str = _torch_dtype_to_str(input.dtype)
     kernel = _get_compiled_fused_add_rmsnorm_kernel(dtype_str, H, weight_bias)
-    kernel(input.contiguous(), residual.contiguous(), weight.contiguous(), M, eps)
+    kernel(input, residual, weight, M, eps)
 
 
 def fused_add_rmsnorm_quant_cute(
@@ -2227,7 +2263,16 @@ def fused_add_rmsnorm_quant_cute(
     weight_bias: float = 0.0,
     enable_pdl: bool = False,
 ) -> None:
-    """CuTe DSL Fused Add + RMSNorm + FP8 quantization implementation."""
+    """CuTe DSL Fused Add + RMSNorm + FP8 quantization implementation.
+
+    Supports arbitrary stride - no need to call contiguous().
+    Last dimension must be contiguous (stride[-1] == 1).
+    """
+    assert input.stride(-1) == 1, "Last dimension of input must be contiguous"
+    assert residual.stride(-1) == 1, "Last dimension of residual must be contiguous"
+    assert out.stride(-1) == 1, "Last dimension of output must be contiguous"
+    assert weight.is_contiguous(), "Weight must be contiguous"
+
     H = input.shape[-1]
     M = input.shape[0]
 
@@ -2238,9 +2283,9 @@ def fused_add_rmsnorm_quant_cute(
     )
     kernel(
         out,
-        input.contiguous(),
-        residual.contiguous(),
-        weight.contiguous(),
+        input,
+        residual,
+        weight,
         M,
         scale,
         eps,
@@ -2254,11 +2299,20 @@ def layernorm_cute(
     beta: torch.Tensor,
     eps: float = 1e-6,
 ) -> None:
-    """CuTe DSL LayerNorm implementation."""
+    """CuTe DSL LayerNorm implementation.
+
+    Supports arbitrary stride - no need to call contiguous().
+    Last dimension must be contiguous (stride[-1] == 1).
+    """
+    assert input.stride(-1) == 1, "Last dimension of input must be contiguous"
+    assert out.stride(-1) == 1, "Last dimension of output must be contiguous"
+    assert gamma.is_contiguous(), "Gamma must be contiguous"
+    assert beta.is_contiguous(), "Beta must be contiguous"
+
     H = input.shape[-1]
     M = input.shape[0]
 
     dtype_str = _torch_dtype_to_str(input.dtype)
     gamma_dtype_str = _torch_dtype_to_str(gamma.dtype)
     kernel = _get_compiled_layernorm_kernel(dtype_str, gamma_dtype_str, H)
-    kernel(out, input.contiguous(), gamma.contiguous(), beta.contiguous(), M, eps)
+    kernel(out, input, gamma, beta, M, eps)
