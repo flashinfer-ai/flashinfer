@@ -1073,7 +1073,7 @@ class MxInt4BlockScaleLauncher : public FusedMoeLauncher {
           btg::Dtype::Bfloat16, btg::Dtype::MxInt4,
           false,  // useDeepSeekFp8
           tile_N, ActivationType::Swiglu,
-          /*useShuffledMatrixA*/ true, batchedGemm::gemm::MatrixLayout::BlockMajorK);
+          /*useShuffledMatrix*/ true, batchedGemm::gemm::MatrixLayout::BlockMajorK);
 
       auto cfgs = moe_runner->getValidConfigIndices(top_k, hidden_size, intermediate_size,
                                                     num_local_experts, num_tokens);
@@ -1384,7 +1384,7 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
           dtype_act, dtype_weights,
           false,  // useDeepSeekFp8
           tile_N, static_cast<ActivationType>(act_type),
-          /*useShuffledMatrixA*/ true);  // FP4 uses shuffled weights
+          /*useShuffledMatrix*/ true);  // FP4 uses shuffled weights
 
       auto cfgs = moe_runner->getValidConfigIndices(top_k, hidden_size, intermediate_size,
                                                     num_local_experts, num_tokens);
@@ -1505,7 +1505,7 @@ Tensor trtllm_fp8_per_tensor_scale_moe(
   auto const hidden_size = hidden_states.size(1);
 
   // Use default values that match the original function behavior
-  bool use_shuffled_weight = true;  // Original uses /*useShuffledMatrixA*/ true
+  bool use_shuffled_weight = true;  // Original uses /*useShuffledMatrix*/ true
   int64_t weight_layout = 0;        // Default to MajorK
 
   // Calculate supported tile sizes
