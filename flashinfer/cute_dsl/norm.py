@@ -299,6 +299,31 @@ def compute_threads_per_row(H: int, vec_size: int) -> int:
     return min(threads, 1024)
 
 
+def make_tv_layout(threads_per_row: int, vec_size: int, num_vec_blocks: int) -> tuple:
+    """Create Thread-Value layout for coalesced vectorized memory access.
+
+    This layout distributes work across threads where each thread handles
+    vec_size consecutive elements, and threads are arranged for coalesced access.
+
+    Args:
+        threads_per_row: Number of threads processing one row
+        vec_size: Number of elements each thread processes per vector load
+        num_vec_blocks: Number of vector blocks per row
+
+    Returns:
+        Tuple of (shape, stride) for creating cute.Layout
+    """
+    shape = (
+        (threads_per_row, 1),
+        (vec_size, num_vec_blocks),
+    )
+    stride = (
+        (vec_size, 1),
+        (1, vec_size * threads_per_row),
+    )
+    return shape, stride
+
+
 # =============================================================================
 # RMSNormKernel
 # =============================================================================
@@ -343,23 +368,6 @@ class RMSNormKernel:
         )
         self.cols_per_tile = self.vec_size * self.num_vec_blocks * self.threads_per_row
 
-    @staticmethod
-    def _make_tv_layout(
-        threads_per_row: int,
-        vec_size: int,
-        num_vec_blocks: int,
-    ) -> tuple:
-        """Create Thread-Value layout for coalesced vectorized memory access."""
-        shape = (
-            (threads_per_row, 1),
-            (vec_size, num_vec_blocks),
-        )
-        stride = (
-            (vec_size, 1),
-            (1, vec_size * threads_per_row),
-        )
-        return shape, stride
-
     def _smem_size_in_bytes(self) -> int:
         """Calculate shared memory requirement."""
         # Only reduction buffer needed (no shared memory for input/weight)
@@ -376,7 +384,7 @@ class RMSNormKernel:
         stream,
     ):
         """Launch the RMSNorm kernel."""
-        tv_shape, tv_stride = self._make_tv_layout(
+        tv_shape, tv_stride = make_tv_layout(
             self.threads_per_row,
             self.vec_size,
             self.num_vec_blocks,
@@ -428,11 +436,8 @@ class RMSNormKernel:
         gY = cute.local_tile(mY, tiler_mn, (bidx, 0))
         cX = cute.local_tile(idX, tiler_mn, (bidx, 0))
 
-        # Expand weight to 2D
-        mW_expanded_layout = cute.prepend(
-            mW.layout, cute.make_layout((1,), stride=(0,))
-        )
-        mW_2d = cute.make_tensor(mW.iterator, mW_expanded_layout)
+        # Expand weight to 2D for consistent tiling
+        mW_2d = cute.prepend_ones(mW, up_to_rank=2)
         gW = cute.local_tile(mW_2d, tiler_mn, (0, 0))
 
         # Create TiledCopy for load and store (both use CopyUniversalOp for sync operations)
@@ -537,22 +542,6 @@ class QKRMSNormKernel:
         )
         self.cols_per_tile = self.vec_size * self.num_vec_blocks * self.threads_per_warp
 
-    @staticmethod
-    def _make_warp_tv_layout(
-        vec_size: int,
-        num_vec_blocks: int,
-    ) -> tuple:
-        """Create Thread-Value layout for warp-level vectorized memory access."""
-        shape = (
-            (32, 1),  # 32 threads per warp
-            (vec_size, num_vec_blocks),
-        )
-        stride = (
-            (vec_size, 1),
-            (1, vec_size * 32),
-        )
-        return shape, stride
-
     def _smem_size_in_bytes(self) -> int:
         # No shared memory needed - warp-only reduction
         return 0
@@ -583,10 +572,8 @@ class QKRMSNormKernel:
             num_blocks: Number of blocks to launch.
             stream: CUDA stream.
         """
-        tv_shape, tv_stride = self._make_warp_tv_layout(
-            self.vec_size,
-            self.num_vec_blocks,
-        )
+        # Use 32 threads per warp for warp-level layout
+        tv_shape, tv_stride = make_tv_layout(32, self.vec_size, self.num_vec_blocks)
         tv_layout = cute.make_layout(tv_shape, stride=tv_stride)
 
         self.kernel(mX, mW, mY, B, N, eps, enable_pdl, tv_layout).launch(
@@ -641,18 +628,12 @@ class QKRMSNormKernel:
             num_bits_per_copy=copy_bits,
         )
 
-        # For 3D tensor with arbitrary stride, we access one (batch, head) row at a time.
-        # Create a 2D view pointer for each row by computing the offset.
-
         # Expand weight to 2D for consistent tiling: [1, H]
-        mW_expanded_layout = cute.prepend(
-            mW.layout, cute.make_layout((1,), stride=(0,))
-        )
-        mW_2d = cute.make_tensor(mW.iterator, mW_expanded_layout)
+        mW_2d = cute.prepend_ones(mW, up_to_rank=2)
 
         # Create tiled copy for warp-level access (32 threads)
-        tiler_mh = (1, self.cols_per_tile)  # 2D tiler
-        tiled_copy = cute.make_tiled_copy(copy_atom, tv_layout, tiler_mh)
+        tiler_2d = (1, self.cols_per_tile)
+        tiled_copy = cute.make_tiled_copy(copy_atom, tv_layout, tiler_2d)
         thr_copy = tiled_copy.get_slice(lane_idx)
 
         # Create 2D identity tensor for bounds checking
@@ -661,36 +642,33 @@ class QKRMSNormKernel:
         # Each warp processes multiple rows with grid-stride loop
         row_idx = worker_idx
         while row_idx < M:
-            # Convert row_idx to (batch_idx, head_idx)
             batch_idx = row_idx // N
             head_idx = row_idx % N
 
-            # Compute pointer offset for this (batch, head) row
-            # Access mX[batch_idx, head_idx, :] and mY[batch_idx, head_idx, :]
-            # We create 2D views: [1, H] at the correct offset
-            batch_stride_x = mX.layout.stride[0]
-            head_stride_x = mX.layout.stride[1]
-            offset_x = batch_idx * batch_stride_x + head_idx * head_stride_x
-
-            batch_stride_y = mY.layout.stride[0]
-            head_stride_y = mY.layout.stride[1]
-            offset_y = batch_idx * batch_stride_y + head_idx * head_stride_y
-
-            # Create 2D tensor views for this row
-            mX_row = cute.make_tensor(
-                mX.iterator + offset_x,
-                cute.make_layout((1, head_dim), stride=(head_dim, 1)),
+            # Use slice to get 1D row, then prepend_ones to make 2D
+            # local_tile uses mX's stride to compute correct address
+            gX_row = cute.local_tile(
+                mX, (1, 1, self.cols_per_tile), (batch_idx, head_idx, 0)
             )
-            mY_row = cute.make_tensor(
-                mY.iterator + offset_y,
-                cute.make_layout((1, head_dim), stride=(head_dim, 1)),
+            gY_row = cute.local_tile(
+                mY, (1, 1, self.cols_per_tile), (batch_idx, head_idx, 0)
             )
 
-            # Get tiles for this row
-            gX = cute.local_tile(mX_row, tiler_mh, (0, 0))
-            gY = cute.local_tile(mY_row, tiler_mh, (0, 0))
-            cX = cute.local_tile(id2d, tiler_mh, (0, 0))
-            gW = cute.local_tile(mW_2d, tiler_mh, (0, 0))
+            # Flatten the first two dims (both size 1) to get 2D tensor for tiled_copy
+            gX = cute.make_tensor(
+                gX_row.iterator,
+                cute.make_layout(
+                    (1, self.cols_per_tile), stride=(self.cols_per_tile, 1)
+                ),
+            )
+            gY = cute.make_tensor(
+                gY_row.iterator,
+                cute.make_layout(
+                    (1, self.cols_per_tile), stride=(self.cols_per_tile, 1)
+                ),
+            )
+            cX = cute.local_tile(id2d, tiler_2d, (0, 0))
+            gW = cute.local_tile(mW_2d, tiler_2d, (0, 0))
 
             # Partition tensors for this thread
             tXgX = thr_copy.partition_S(gX)
@@ -791,12 +769,6 @@ class RMSNormQuantKernel:
         )
         self.cols_per_tile = self.vec_size * self.num_vec_blocks * self.threads_per_row
 
-    @staticmethod
-    def _make_tv_layout(threads_per_row: int, vec_size: int, num_vec_blocks: int):
-        shape = ((threads_per_row, 1), (vec_size, num_vec_blocks))
-        stride = ((vec_size, 1), (1, vec_size * threads_per_row))
-        return shape, stride
-
     def _smem_size_in_bytes(self) -> int:
         # Only reduction buffer needed
         return self.num_warps * 4
@@ -812,7 +784,7 @@ class RMSNormQuantKernel:
         eps: Float32,
         stream,
     ):
-        tv_shape, tv_stride = self._make_tv_layout(
+        tv_shape, tv_stride = make_tv_layout(
             self.threads_per_row, self.vec_size, self.num_vec_blocks
         )
         tv_layout = cute.make_layout(tv_shape, stride=tv_stride)
@@ -857,13 +829,9 @@ class RMSNormQuantKernel:
 
         idX = cute.make_identity_tensor(mX.shape)
         gX = cute.local_tile(mX, tiler_mn, (bidx, 0))
-        cute.local_tile(mY, tiler_mn, (bidx, 0))
         cX = cute.local_tile(idX, tiler_mn, (bidx, 0))
 
-        mW_expanded_layout = cute.prepend(
-            mW.layout, cute.make_layout((1,), stride=(0,))
-        )
-        mW_2d = cute.make_tensor(mW.iterator, mW_expanded_layout)
+        mW_2d = cute.prepend_ones(mW, up_to_rank=2)
         gW = cute.local_tile(mW_2d, tiler_mn, (0, 0))
 
         copy_atom_load = cute.make_copy_atom(
@@ -961,22 +929,6 @@ class FusedAddRMSNormKernel:
         )
         self.cols_per_tile = self.vec_size * self.num_vec_blocks * self.threads_per_row
 
-    @staticmethod
-    def _make_tv_layout(
-        threads_per_row: int,
-        vec_size: int,
-        num_vec_blocks: int,
-    ) -> tuple:
-        shape = (
-            (threads_per_row, 1),
-            (vec_size, num_vec_blocks),
-        )
-        stride = (
-            (vec_size, 1),
-            (1, vec_size * threads_per_row),
-        )
-        return shape, stride
-
     def _smem_size_in_bytes(self) -> int:
         # Only reduction buffer needed (register-based approach)
         return self.num_warps * 4
@@ -991,7 +943,7 @@ class FusedAddRMSNormKernel:
         eps: Float32,
         stream,
     ):
-        tv_shape, tv_stride = self._make_tv_layout(
+        tv_shape, tv_stride = make_tv_layout(
             self.threads_per_row,
             self.vec_size,
             self.num_vec_blocks,
@@ -1039,10 +991,7 @@ class FusedAddRMSNormKernel:
         gR = cute.local_tile(mR, tiler_mn, (bidx, 0))
         cX = cute.local_tile(idX, tiler_mn, (bidx, 0))
 
-        mW_expanded_layout = cute.prepend(
-            mW.layout, cute.make_layout((1,), stride=(0,))
-        )
-        mW_2d = cute.make_tensor(mW.iterator, mW_expanded_layout)
+        mW_2d = cute.prepend_ones(mW, up_to_rank=2)
         gW = cute.local_tile(mW_2d, tiler_mn, (0, 0))
 
         copy_atom = cute.make_copy_atom(
@@ -1148,22 +1097,6 @@ class FusedAddRMSNormQuantKernel:
         )
         self.cols_per_tile = self.vec_size * self.num_vec_blocks * self.threads_per_row
 
-    @staticmethod
-    def _make_tv_layout(
-        threads_per_row: int,
-        vec_size: int,
-        num_vec_blocks: int,
-    ) -> tuple:
-        shape = (
-            (threads_per_row, 1),
-            (vec_size, num_vec_blocks),
-        )
-        stride = (
-            (vec_size, 1),
-            (1, vec_size * threads_per_row),
-        )
-        return shape, stride
-
     def _smem_size_in_bytes(self) -> int:
         # Only reduction buffer needed (register-based approach)
         return self.num_warps * 4
@@ -1180,7 +1113,7 @@ class FusedAddRMSNormQuantKernel:
         eps: Float32,
         stream,
     ):
-        tv_shape, tv_stride = self._make_tv_layout(
+        tv_shape, tv_stride = make_tv_layout(
             self.threads_per_row,
             self.vec_size,
             self.num_vec_blocks,
@@ -1230,15 +1163,11 @@ class FusedAddRMSNormQuantKernel:
 
         idX = cute.make_identity_tensor(mX.shape)
 
-        cute.local_tile(mY, tiler_mn, (bidx, 0))
         gX = cute.local_tile(mX, tiler_mn, (bidx, 0))
         gR = cute.local_tile(mR, tiler_mn, (bidx, 0))
         cX = cute.local_tile(idX, tiler_mn, (bidx, 0))
 
-        mW_expanded_layout = cute.prepend(
-            mW.layout, cute.make_layout((1,), stride=(0,))
-        )
-        mW_2d = cute.make_tensor(mW.iterator, mW_expanded_layout)
+        mW_2d = cute.prepend_ones(mW, up_to_rank=2)
         gW = cute.local_tile(mW_2d, tiler_mn, (0, 0))
 
         copy_atom_load = cute.make_copy_atom(
@@ -1365,22 +1294,6 @@ class LayerNormKernel:
             self.vec_size_f32 * self.num_vec_blocks_f32 * self.threads_per_row
         )
 
-    @staticmethod
-    def _make_tv_layout(
-        threads_per_row: int,
-        vec_size: int,
-        num_vec_blocks: int,
-    ) -> tuple:
-        shape = (
-            (threads_per_row, 1),
-            (vec_size, num_vec_blocks),
-        )
-        stride = (
-            (vec_size, 1),
-            (1, vec_size * threads_per_row),
-        )
-        return shape, stride
-
     def _smem_size_in_bytes(self) -> int:
         # Shared memory for:
         # - gamma/beta f32 tiles: cols_per_tile_f32 * 4 * 2
@@ -1405,7 +1318,7 @@ class LayerNormKernel:
         stream,
     ):
         # Layout for input (float16/bfloat16)
-        tv_shape, tv_stride = self._make_tv_layout(
+        tv_shape, tv_stride = make_tv_layout(
             self.threads_per_row,
             self.vec_size,
             self.num_vec_blocks,
@@ -1414,7 +1327,7 @@ class LayerNormKernel:
         tiler_mn = (1, self.cols_per_tile)
 
         # Layout for gamma/beta (float32)
-        tv_shape_f32, tv_stride_f32 = self._make_tv_layout(
+        tv_shape_f32, tv_stride_f32 = make_tv_layout(
             self.threads_per_row,
             self.vec_size_f32,
             self.num_vec_blocks_f32,
@@ -1511,16 +1424,10 @@ class LayerNormKernel:
         cX = cute.local_tile(idX, tiler_mn, (bidx, 0))
 
         # Expand gamma and beta to 2D for tiled copy (float32)
-        mGamma_expanded_layout = cute.prepend(
-            mGamma.layout, cute.make_layout((1,), stride=(0,))
-        )
-        mGamma_2d = cute.make_tensor(mGamma.iterator, mGamma_expanded_layout)
+        mGamma_2d = cute.prepend_ones(mGamma, up_to_rank=2)
         gGamma = cute.local_tile(mGamma_2d, tiler_mn_f32, (0, 0))
 
-        mBeta_expanded_layout = cute.prepend(
-            mBeta.layout, cute.make_layout((1,), stride=(0,))
-        )
-        mBeta_2d = cute.make_tensor(mBeta.iterator, mBeta_expanded_layout)
+        mBeta_2d = cute.prepend_ones(mBeta, up_to_rank=2)
         gBeta = cute.local_tile(mBeta_2d, tiler_mn_f32, (0, 0))
 
         # Identity tensor for gamma/beta bounds checking
