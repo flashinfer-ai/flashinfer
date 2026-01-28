@@ -16,7 +16,6 @@ limitations under the License.
 
 import itertools
 import os
-import pathlib
 
 import jinja2
 
@@ -67,21 +66,22 @@ def gen_gdn_prefill_sm90_module() -> JitSpec:
             write_if_different(dest_path, source)
 
     # Copy source files to gen_directory (like POD module does)
-    # Include .cuh and .inc files so relative includes work
     for filename in [
         "gdn_prefill_launcher.cu",
         "flat/prefill/prefill_kernel_delta_rule_sm90.cu",
+    ]:
+        src_path = jit_env.FLASHINFER_CSRC_DIR / filename
+        dest_path = gen_directory / src_path.name
+        source_paths.append(dest_path)
+        write_if_different(dest_path, src_path.read_text())
+
+    # Copy header files so relative includes work
+    for filename in [
         "flat/prefill/prefill_kernel_delta_rule_sm90.cuh",
         "flat/prefill/prefill_kernel_delta_rule_sm90_extern.inc",
     ]:
         src_path = jit_env.FLASHINFER_CSRC_DIR / filename
-        dest_path = gen_directory / pathlib.Path(filename).name
-        with open(src_path, "r") as f:
-            source = f.read()
-        write_if_different(dest_path, source)
-        # Only add .cu files to source_paths for compilation
-        if filename.endswith(".cu"):
-            source_paths.append(dest_path)
+        write_if_different(gen_directory / src_path.name, src_path.read_text())
 
     return gen_jit_spec(
         uri,
