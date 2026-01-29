@@ -393,7 +393,6 @@ def bench_trtllm_gen_fused_moe_autotuner_mxint4(
         trtllm_mxint4_block_scale_moe,
         routing_logits=routing_logits,
         routing_bias=routing_bias,
-        hidden_states=hidden_states,
         gemm1_alpha=None,
         gemm1_beta=None,
         gemm1_clamp_limit=None,

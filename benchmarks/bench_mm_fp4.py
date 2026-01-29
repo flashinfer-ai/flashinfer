@@ -38,21 +38,21 @@ def _bench_mm_fp4(
         print(
             f"Skipping test for {backend} because it is not supported on compute capability {compute_capability_number}."
         )
-        return
+        return 0, 0
 
     if backend == "trtllm":
         if res_dtype == torch.float16:
             print("Skipping test for trtllm fp4 with float16")
-            return
+            return 0, 0
         if compute_capability[0] in [11, 12]:
             print("trtllm gemm does not support SM110/SM120/SM121 GPUs.")
-            return
+            return 0, 0
     if not use_128x4_sf_layout and backend != "trtllm":
         print("Skipping test for non-trtllm fp4 with use_128x4_sf_layout=False")
-        return
+        return 0, 0
     if not use_nvfp4 and backend not in ["cudnn", "auto"]:
         print("mx_fp4 is only supported for cudnn and auto backends")
-        return
+        return 0, 0
 
     input = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
     mat2 = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
