@@ -788,6 +788,12 @@ Examples:
                             file=sys.stderr,
                         )
                         return 1
+
+            # Normalize paths: strip leading "./" and trailing "/"
+            owner_overrides = {
+                path.lstrip("./").rstrip("/"): users
+                for path, users in owner_overrides.items()
+            }
         except FileNotFoundError:
             print(
                 f"Error: Overrides file not found: {args.overrides_file}",
