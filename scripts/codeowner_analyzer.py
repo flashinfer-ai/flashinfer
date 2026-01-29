@@ -515,6 +515,15 @@ class CodeOwnersAnalyzer:
 
         return results
 
+    def _is_file_path(self, path: str) -> bool:
+        """Check if a path looks like a file (has an extension) vs a directory."""
+        basename = os.path.basename(path)
+        return "." in basename and not basename.startswith(".")
+
+    def _normalize_usernames(self, users: List[str]) -> List[str]:
+        """Normalize usernames to have @ prefix."""
+        return [f"@{u}" if not u.startswith("@") else u for u in users]
+
     def _merge_owners_with_overrides(
         self, module: str, computed_usernames: List[str]
     ) -> List[str]:
@@ -522,6 +531,9 @@ class CodeOwnersAnalyzer:
 
         Override users are prepended to the list (indicating primary ownership),
         and duplicates are removed. The final list is limited to top_n_owners.
+
+        Note: File-level overrides are handled separately in generate_codeowners_file(),
+        since there's no computed ownership for individual files.
 
         Args:
             module: The module path (e.g., "flashinfer/fused_moe")
@@ -534,15 +546,17 @@ class CodeOwnersAnalyzer:
         if not self.owner_overrides:
             return computed_usernames[: self.top_n_owners]
 
+        # Skip file-level overrides (handled separately)
+        if self._is_file_path(module):
+            return computed_usernames[: self.top_n_owners]
+
         # Get override users for this module (without @ prefix in the config)
         override_users = self.owner_overrides.get(module, [])
         if not override_users:
             return computed_usernames[: self.top_n_owners]
 
         # Normalize override users to have @ prefix
-        override_usernames = [
-            f"@{u}" if not u.startswith("@") else u for u in override_users
-        ]
+        override_usernames = self._normalize_usernames(override_users)
 
         # Build merged list: overrides first, then computed (excluding duplicates)
         merged = list(override_usernames)
@@ -565,6 +579,21 @@ class CodeOwnersAnalyzer:
                 f.write("# Manual overrides applied from overrides file\n")
             f.write("\n")
 
+            # Write file-level overrides first (these are not merged with computed)
+            if self.owner_overrides:
+                file_overrides = [
+                    (path, users)
+                    for path, users in self.owner_overrides.items()
+                    if self._is_file_path(path)
+                ]
+                if file_overrides:
+                    f.write("# File-level overrides\n")
+                    for path, users in sorted(file_overrides):
+                        usernames = self._normalize_usernames(users)
+                        f.write(f"{path} {' '.join(usernames)}\n")
+                    f.write("\n")
+
+            # Write directory entries (computed + merged overrides)
             for module, data in results.items():
                 # Extract GitHub usernames from computed owners
                 computed_usernames = []
