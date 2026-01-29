@@ -5,82 +5,7 @@ import torch
 import flashinfer
 
 from .selective_state_update_triton import selective_state_update_triton
-
-
-def create_test_inputs(
-    batch_size,
-    nheads,
-    dim,
-    dstate,
-    ngroups,
-    input_dtype,
-    weight_dtype,
-    matrixA_dtype,
-    state_dtype,
-    z_none=True,
-):
-    # Set seed for reproducibility
-    torch.manual_seed(0)
-
-    device = torch.device("cuda")
-
-    # if we use the cache, then the state indices are taken from a specific slot
-    # so the state in the kernel will have batch as the first dimension, but it will
-    # only come from a particular slot; the full tensor first dim is larger
-    ssm_state_cache_size = max(384, int(2 * batch_size))
-
-    state_cache = torch.randn(
-        ssm_state_cache_size, nheads, dim, dstate, dtype=state_dtype, device=device
-    )
-
-    x = torch.randn(batch_size, nheads, dim, dtype=input_dtype, device=device)
-
-    dt = torch.randn(batch_size, nheads, dtype=weight_dtype, device=device).as_strided(
-        (batch_size, nheads, dim), (nheads, 1, 0)
-    )
-    # The dtype of A is separate in nemotron nano v3.
-    # A only has one value per head (as discussed in mamba 2 block) hence the strides.
-    A_base = torch.rand(nheads, dtype=matrixA_dtype, device=device)
-    A = A_base.as_strided((nheads, dim, dstate), (1, 0, 0))
-    assert A.stride() == (1, 0, 0)
-
-    # B and C - (batch_size, ngroups, dstate)
-    B = torch.randn(batch_size, ngroups, dstate, dtype=input_dtype, device=device)
-    C = torch.randn(batch_size, ngroups, dstate, dtype=input_dtype, device=device)
-
-    # D - (nheads, dim) with strides (1, 0) - one value per head
-    D = torch.randn(nheads, dtype=weight_dtype, device=device).as_strided(
-        (nheads, dim), (1, 0)
-    )
-
-    dt_bias = torch.randn(nheads, dtype=weight_dtype, device=device).as_strided(
-        (nheads, dim), (1, 0)
-    )
-
-    # Slot indices for state batching - (batch_size,)
-    slot_idx = torch.randperm(ssm_state_cache_size, dtype=torch.int32, device=device)[
-        :batch_size
-    ]
-
-    # Create z tensor if z_none is False
-    z = (
-        None
-        if z_none
-        else torch.randn(batch_size, nheads, dim, dtype=input_dtype, device=device)
-    )
-
-    return {
-        "state_cache": state_cache,
-        "x": x,
-        "dt": dt,
-        "A": A,
-        "B": B,
-        "C": C,
-        "D": D,
-        "z": z,
-        "dt_bias": dt_bias,
-        "slot_idx": slot_idx,
-    }
+from .test_utils import create_test_inputs
 
 
 @pytest.mark.parametrize("batch", [1, 64])
@@ -112,10 +37,11 @@ def test_selective_state_update(
         dstate,
         ngroups,
         input_dtype,
-        weight_dtype,
-        matrixA_dtype,
+        weight_dtype=weight_dtype,
+        matrixA_dtype=matrixA_dtype,
         state_dtype=state_dtype,
-        z_none=True,
+        generate_z=False,
+        seed=0,
     )
 
     state = inputs["state_cache"]
@@ -128,7 +54,7 @@ def test_selective_state_update(
         inputs["B"],
         inputs["C"],
         D=inputs["D"],
-        z=inputs["z"],
+        z=inputs.get("z"),
         dt_bias=inputs["dt_bias"],
         dt_softplus=delta_softplus,
         state_batch_indices=inputs["slot_idx"],
@@ -149,7 +75,7 @@ def test_selective_state_update(
         inputs["B"],
         inputs["C"],
         D=inputs["D"],
-        z=inputs["z"],
+        z=inputs.get("z"),
         dt_bias=inputs["dt_bias"],
         dt_softplus=delta_softplus,
         state_batch_indices=inputs["slot_idx"],
@@ -264,10 +190,11 @@ def test_selective_state_update_with_z(use_out_tensor):
         dstate,
         ngroups,
         input_dtype,
-        weight_dtype,
-        matrixA_dtype,
+        weight_dtype=weight_dtype,
+        matrixA_dtype=matrixA_dtype,
         state_dtype=state_dtype,
-        z_none=False,
+        generate_z=True,
+        seed=0,
     )
 
     state = inputs["state_cache"]
@@ -280,7 +207,7 @@ def test_selective_state_update_with_z(use_out_tensor):
         inputs["B"],
         inputs["C"],
         D=inputs["D"],
-        z=inputs["z"],
+        z=inputs.get("z"),
         dt_bias=inputs["dt_bias"],
         dt_softplus=delta_softplus,
         state_batch_indices=inputs["slot_idx"],
@@ -301,7 +228,7 @@ def test_selective_state_update_with_z(use_out_tensor):
         inputs["B"],
         inputs["C"],
         D=inputs["D"],
-        z=inputs["z"],
+        z=inputs.get("z"),
         dt_bias=inputs["dt_bias"],
         dt_softplus=delta_softplus,
         state_batch_indices=inputs["slot_idx"],
