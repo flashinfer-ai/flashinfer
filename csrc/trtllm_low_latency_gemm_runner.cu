@@ -166,7 +166,7 @@ class TrtllmLowLatencyGemmRunner {
           configOptions.mDtypeC == mOptions.outputType &&
           configOptions.mTransposeMmaOutput == true &&
           configOptions.mLayoutA == gemm::gemm::MatrixLayout::BlockMajorK &&
-          configOptions.mUseShuffledMatrix) {
+          configOptions.mUseShuffledMatrixA) {
         mPassingConfigIndices.push_back(i);
       }
     }
