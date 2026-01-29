@@ -73,7 +73,11 @@ def selective_state_update(
     dt_softplus: bool = False,
     state_batch_indices: Optional[torch.Tensor] = None,
     pad_slot_id: int = -1,
-    out: torch.Tensor | None = None,
+    out: Optional[torch.Tensor] = None,
+    disable_state_update: bool = False,
+    intermediate_states_buffer: Optional[torch.Tensor] = None,
+    intermediate_state_indices: Optional[torch.Tensor] = None,
+    cache_steps: int = 0,
 ) -> torch.Tensor:
     r"""Selective state update operation for Mamba layers (the generation phase).
 
@@ -82,36 +86,52 @@ def selective_state_update(
     state : torch.Tensor
         State tensor with shape (state_cache_size, dim, dstate) or (state_cache_size, nheads, dim, dstate)
     x : torch.Tensor
-        Input tensor with shape (batch, dim) or (batch, nheads, dim)
+        Input tensor with shape (batch, dim) or (batch, nheads, dim) for single-token
+        or (batch, T, nheads, dim) for multi-token
     dt : torch.Tensor
-        Delta time tensor with shape (batch, dim) or (batch, nheads, dim)
+        Delta time tensor with shape (batch, dim) or (batch, nheads, dim) for single-token
+        or (batch, T, nheads, dim) for multi-token
     A : torch.Tensor
         A matrix with shape (dim, dstate) or (nheads, dim, dstate)
     B : torch.Tensor
-        B matrix with shape (batch, dstate) or (batch, ngroups, dstate)
+        B matrix with shape (batch, dstate) or (batch, ngroups, dstate) for single-token
+        or (batch, T, ngroups, dstate) for multi-token
     C : torch.Tensor
-        C matrix with shape (batch, dstate) or (batch, ngroups, dstate)
+        C matrix with shape (batch, dstate) or (batch, ngroups, dstate) for single-token
+        or (batch, T, ngroups, dstate) for multi-token
     D : torch.Tensor
         D vector with shape (dim,) or (nheads, dim)
     z : Optional[torch.Tensor]
-        Optional z tensor with shape (batch, dim) or (batch, nheads, dim)
+        Optional z tensor with shape (batch, dim) or (batch, nheads, dim) for single-token
+        or (batch, T, nheads, dim) for multi-token
     dt_bias : Optional[torch.Tensor]
         Optional dt bias with shape (dim,) or (nheads, dim)
     dt_softplus : bool
         Whether to apply softplus to dt
     state_batch_indices : Optional[torch.Tensor]
-        Optional batch indices for cache processing
+        Optional batch indices for cache processing with shape (batch,)
     pad_slot_id : int
         If state_batch_indices is passed, lets the kernel identify padded entries
         that will not be processed. For example: state_batch_indices = [pad_slot_id, 1, 20, pad_slot_id]
         in this case, the kernel will not process entries at indices 0 and 3
-    out : torch.Tensor | None
-        Optional output tensor
+    out : Optional[torch.Tensor]
+        Optional output tensor (same shape as x)
+    disable_state_update : bool
+        If True, skip updating the state tensor (useful for speculative decoding verification)
+    intermediate_states_buffer : Optional[torch.Tensor]
+        Optional buffer for caching intermediate states during speculative decoding
+        with shape (batch, cache_steps, nheads, dim, dstate)
+    intermediate_state_indices : Optional[torch.Tensor]
+        Optional indices mapping batch elements to intermediate state buffer positions
+        with shape (batch,)
+    cache_steps : int
+        Number of steps/tokens to cache for speculative decoding
 
     Returns
     -------
     output : torch.Tensor
-        Output tensor with shape (batch, dim) or (batch, nheads, dim)
+        Output tensor with shape (batch, dim) or (batch, nheads, dim) for single-token
+        or (batch, T, nheads, dim) for multi-token
     """
     if state.dim() == 3:
         state = state.unsqueeze(1)
@@ -139,7 +159,6 @@ def selective_state_update(
         state,
         x,
         dt,
-        output,
         A,
         B,
         C,
@@ -149,18 +168,23 @@ def selective_state_update(
         dt_softplus,
         state_batch_indices,
         pad_slot_id,
+        output,
+        disable_state_update,
+        intermediate_states_buffer,
+        intermediate_state_indices,
+        cache_steps,
     )
     return output
 
 
 @register_custom_op(
-    "flashinfer::selective_state_update", mutates_args=("state", "output")
+    "flashinfer::selective_state_update",
+    mutates_args=("state", "output", "intermediate_states_buffer"),
 )
 def _selective_state_update(
     state: torch.Tensor,
     x: torch.Tensor,
     dt: torch.Tensor,
-    output: torch.Tensor,
     A: torch.Tensor,
     B: torch.Tensor,
     C: torch.Tensor,
@@ -170,13 +194,17 @@ def _selective_state_update(
     dt_softplus: bool,
     state_batch_indices: Optional[torch.Tensor],
     pad_slot_id: int,
+    output: torch.Tensor,
+    disable_state_update: bool,
+    intermediate_states_buffer: Optional[torch.Tensor],
+    intermediate_state_indices: Optional[torch.Tensor],
+    cache_steps: int,
 ) -> None:
     """Internal function registered with torch.library for torch.compile() support."""
     get_selective_state_update_module(state.device).selective_state_update(
         state,
         x,
         dt,
-        output,
         A,
         B,
         C,
@@ -186,6 +214,11 @@ def _selective_state_update(
         dt_softplus,
         state_batch_indices,
         pad_slot_id,
+        output,
+        disable_state_update,
+        intermediate_states_buffer,
+        intermediate_state_indices,
+        cache_steps,
     )
 
 
@@ -194,7 +227,6 @@ def _selective_state_update_fake(
     state: torch.Tensor,
     x: torch.Tensor,
     dt: torch.Tensor,
-    output: torch.Tensor,
     A: torch.Tensor,
     B: torch.Tensor,
     C: torch.Tensor,
@@ -204,6 +236,11 @@ def _selective_state_update_fake(
     dt_softplus: bool,
     state_batch_indices: Optional[torch.Tensor],
     pad_slot_id: int,
+    output: torch.Tensor,
+    disable_state_update: bool,
+    intermediate_states_buffer: Optional[torch.Tensor],
+    intermediate_state_indices: Optional[torch.Tensor],
+    cache_steps: int,
 ) -> None:
     """Fake implementation for torch.compile() meta tensor propagation."""
     pass

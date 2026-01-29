@@ -22,10 +22,25 @@ using tvm::ffi::Optional;
 
 namespace flashinfer::mamba {
 
-void selective_state_update(TensorView state, TensorView x, TensorView dt, TensorView output,
-                            TensorView A, TensorView B, TensorView C, TensorView D,
-                            Optional<TensorView> z, Optional<TensorView> dt_bias, bool dt_softplus,
-                            Optional<TensorView> state_batch_indices, int64_t pad_slot_id) {
+// New function signature with multi-token support
+void selective_state_update(TensorView state, TensorView x, TensorView dt, TensorView A,
+                            TensorView B, TensorView C, TensorView D, Optional<TensorView> z,
+                            Optional<TensorView> dt_bias, bool dt_softplus,
+                            Optional<TensorView> state_batch_indices, int64_t pad_slot_id,
+                            TensorView output, bool disable_state_update,
+                            Optional<TensorView> intermediate_states_buffer,
+                            Optional<TensorView> intermediate_state_indices, int64_t cache_steps) {
+  //   // TODO: Implement multi-token support
+  //   FLASHINFER_CHECK(false, "selective_state_update with new signature not yet implemented");
+  // }
+
+  // Old function - commented out for reference
+  // void selective_state_update_old(TensorView state, TensorView x, TensorView dt, TensorView
+  // output,
+  //                             TensorView A, TensorView B, TensorView C, TensorView D,
+  //                             Optional<TensorView> z, Optional<TensorView> dt_bias, bool
+  //                             dt_softplus, Optional<TensorView> state_batch_indices, int64_t
+  //                             pad_slot_id) {
   auto const batch = x.size(0);
   auto const state_cache_size = state.size(0);
   auto const nheads = state.size(1);
@@ -187,43 +202,42 @@ void selective_state_update(TensorView state, TensorView x, TensorView dt, Tenso
   auto dtype_key =
       std::make_tuple(state_dtype_code, input_dtype_code, weight_dtype_code, matrixA_dtype_code);
 
-  if (dtype_key == std::make_tuple(/*state*/ bfloat16_code, /*input */ bfloat16_code,
-                                   /*weight */ bfloat16_code, /*matrixA */ float32_code)) {
+  if (dtype_key == std::make_tuple(bfloat16_code, bfloat16_code, bfloat16_code, float32_code)) {
     using state_t = nv_bfloat16;
     using input_t = nv_bfloat16;
     using weight_t = nv_bfloat16;
     using matrixA_t = float;
     invokeSelectiveStateUpdate<input_t, weight_t, matrixA_t, state_t>(p, stream);
-  } else if (dtype_key == std::make_tuple(/*state*/ float16_code, /*input */ bfloat16_code,
-                                          /*weight */ bfloat16_code, /*matrixA */ float32_code)) {
+  } else if (dtype_key ==
+             std::make_tuple(float16_code, bfloat16_code, bfloat16_code, float32_code)) {
     using state_t = half;
     using input_t = nv_bfloat16;
     using weight_t = nv_bfloat16;
     using matrixA_t = float;
     invokeSelectiveStateUpdate<input_t, weight_t, matrixA_t, state_t>(p, stream);
-  } else if (dtype_key == std::make_tuple(/*state*/ float32_code, /*input */ bfloat16_code,
-                                          /*weight */ bfloat16_code, /*matrixA */ float32_code)) {
+  } else if (dtype_key ==
+             std::make_tuple(float32_code, bfloat16_code, bfloat16_code, float32_code)) {
     using state_t = float;
     using input_t = nv_bfloat16;
     using weight_t = nv_bfloat16;
     using matrixA_t = float;
     invokeSelectiveStateUpdate<input_t, weight_t, matrixA_t, state_t>(p, stream);
-  } else if (dtype_key == std::make_tuple(/*state*/ bfloat16_code, /*input */ bfloat16_code,
-                                          /*weight */ float32_code, /*matrixA */ float32_code)) {
+  } else if (dtype_key ==
+             std::make_tuple(bfloat16_code, bfloat16_code, float32_code, float32_code)) {
     using state_t = nv_bfloat16;
     using input_t = nv_bfloat16;
     using weight_t = float;
     using matrixA_t = float;
     invokeSelectiveStateUpdate<input_t, weight_t, matrixA_t, state_t>(p, stream);
-  } else if (dtype_key == std::make_tuple(/*state*/ float16_code, /*input */ bfloat16_code,
-                                          /*weight */ float32_code, /*matrixA */ float32_code)) {
+  } else if (dtype_key ==
+             std::make_tuple(float16_code, bfloat16_code, float32_code, float32_code)) {
     using state_t = half;
     using input_t = nv_bfloat16;
     using weight_t = float;
     using matrixA_t = float;
     invokeSelectiveStateUpdate<input_t, weight_t, matrixA_t, state_t>(p, stream);
-  } else if (dtype_key == std::make_tuple(/*state*/ float32_code, /*input */ bfloat16_code,
-                                          /*weight */ float32_code, /*matrixA */ float32_code)) {
+  } else if (dtype_key ==
+             std::make_tuple(float32_code, bfloat16_code, float32_code, float32_code)) {
     using state_t = float;
     using input_t = nv_bfloat16;
     using weight_t = float;
