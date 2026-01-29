@@ -895,7 +895,7 @@ def testTrtllmFp4BlockScaleMoe(args):
         cur_res["use_routing_scales_on_input"] = args.use_routing_scales_on_input
         cur_res["input_dtype"] = input_dtype
         cur_res["weight_dtype"] = weight_dtype
-        cur_res["gated_act"] = args.gated_act
+        cur_res["activation_type"] = args.activation_type.name
         res.append(cur_res)
 
     return res
@@ -1762,6 +1762,7 @@ def testTrtllmFp8PerTensorScaleMoe(args):
         cur_res["use_routing_scales_on_input"] = use_routing_scales_on_input
         cur_res["input_dtype"] = input_dtype
         cur_res["weight_dtype"] = weight_dtype
+        cur_res["activation_type"] = args.activation_type.name
         res.append(cur_res)
 
     return res
