@@ -1,3 +1,10 @@
+"""
+Multi-Token Prediction (MTP) tests for selective_state_update.
+
+These tests verify the selective_state_update kernel works correctly with
+multi-token inputs (batch, T, nheads, dim) for speculative decoding scenarios.
+"""
+
 import numpy as np
 import pytest
 import torch
@@ -8,8 +15,8 @@ from .selective_state_update_triton import selective_state_update_triton
 from .test_utils import create_test_inputs, clone_preserving_strides
 
 
-class TestSelectiveStateUpdate:
-    """Test class for selective state update kernels."""
+class TestSelectiveStateUpdateMTP:
+    """Test class for multi-token selective state update kernels."""
 
     # Test configuration
     ATOL = 1e-3
@@ -18,11 +25,11 @@ class TestSelectiveStateUpdate:
     INPUT_DTYPE = torch.bfloat16
     MATRIX_A_DTYPE = torch.float32
 
-    @pytest.fixture(params=[1, 64])
+    @pytest.fixture(params=[1, 4])
     def batch(self, request):
         return request.param
 
-    @pytest.fixture(params=[8, 64])
+    @pytest.fixture(params=[8, 32])
     def nheads(self, request):
         return request.param
 
@@ -30,15 +37,20 @@ class TestSelectiveStateUpdate:
     def dim(self, request):
         return request.param
 
-    @pytest.fixture(params=[64, 128, 256])
+    @pytest.fixture(params=[64, 128])
     def dstate(self, request):
         return request.param
 
-    @pytest.fixture(params=[torch.float16, torch.bfloat16, torch.float32])
-    def state_dtype(self, request):
+    @pytest.fixture(params=[1, 4, 8])
+    def cache_steps(self, request):
+        """Number of tokens in multi-token mode (T dimension)."""
         return request.param
 
     @pytest.fixture(params=[torch.float32, torch.bfloat16])
+    def state_dtype(self, request):
+        return request.param
+
+    @pytest.fixture(params=[torch.float32])
     def weight_dtype(self, request):
         return request.param
 
@@ -47,7 +59,9 @@ class TestSelectiveStateUpdate:
         return request.param
 
     @pytest.fixture
-    def inputs(self, batch, nheads, dim, dstate, state_dtype, weight_dtype):
+    def inputs(
+        self, batch, nheads, dim, dstate, cache_steps, state_dtype, weight_dtype
+    ):
         """Create test inputs for given parameters."""
         return create_test_inputs(
             batch,
@@ -60,13 +74,15 @@ class TestSelectiveStateUpdate:
             matrixA_dtype=self.MATRIX_A_DTYPE,
             state_dtype=state_dtype,
             generate_z=False,
+            generate_intermediate_states_buffer=False,
+            cache_steps=cache_steps,
             seed=0,
         )
 
     @pytest.fixture
     def reference_output(self, inputs):
         """Compute reference output using triton implementation."""
-        state_ref = inputs["state_cache"].clone()
+        state_ref = clone_preserving_strides(inputs["state_cache"])
         y_ref = selective_state_update_triton(
             state_ref,
             inputs["x"],
@@ -83,7 +99,7 @@ class TestSelectiveStateUpdate:
         )
         return y_ref, state_ref
 
-    def run_kernel(self, inputs, out=None):
+    def run_kernel(self, inputs, out=None, disable_state_update=False):
         """Run the flashinfer kernel and return output."""
         return flashinfer.mamba.selective_state_update(
             inputs["state_cache"],
@@ -99,6 +115,7 @@ class TestSelectiveStateUpdate:
             state_batch_indices=inputs["slot_idx"],
             pad_slot_id=-1,
             out=out,
+            disable_state_update=disable_state_update,
         )
 
     def assert_outputs_match(self, y_ref, y_test, msg_prefix=""):
@@ -171,10 +188,7 @@ class TestSelectiveStateUpdate:
 
         # Prepare output tensor if requested
         if use_out_tensor:
-            batch = inputs["x"].shape[0]
-            nheads = inputs["x"].shape[1]
-            dim = inputs["x"].shape[2]
-            out = torch.empty(batch, nheads, dim, dtype=self.INPUT_DTYPE, device="cuda")
+            out = torch.empty_like(inputs["x"])
         else:
             out = None
 
@@ -190,10 +204,10 @@ class TestSelectiveStateUpdate:
         self.assert_states_match(state_ref, inputs["state_cache"], inputs["slot_idx"])
 
 
-class TestSelectiveStateUpdateWithZ(TestSelectiveStateUpdate):
-    """Test selective_state_update with z tensor (gating)."""
+class TestSelectiveStateUpdateMTPWithZ(TestSelectiveStateUpdateMTP):
+    """Test multi-token selective_state_update with z tensor (gating)."""
 
-    @pytest.fixture(params=[1])
+    @pytest.fixture(params=[4])
     def batch(self, request):
         return request.param
 
@@ -205,20 +219,26 @@ class TestSelectiveStateUpdateWithZ(TestSelectiveStateUpdate):
     def dim(self, request):
         return request.param
 
-    @pytest.fixture(params=[128])
+    @pytest.fixture(params=[64])
     def dstate(self, request):
+        return request.param
+
+    @pytest.fixture(params=[4])
+    def cache_steps(self, request):
         return request.param
 
     @pytest.fixture(params=[torch.bfloat16])
     def state_dtype(self, request):
         return request.param
 
-    @pytest.fixture(params=[torch.bfloat16])
+    @pytest.fixture(params=[torch.float32])
     def weight_dtype(self, request):
         return request.param
 
     @pytest.fixture
-    def inputs(self, batch, nheads, dim, dstate, state_dtype, weight_dtype):
+    def inputs(
+        self, batch, nheads, dim, dstate, cache_steps, state_dtype, weight_dtype
+    ):
         """Create test inputs with z tensor."""
         return create_test_inputs(
             batch,
@@ -231,55 +251,42 @@ class TestSelectiveStateUpdateWithZ(TestSelectiveStateUpdate):
             matrixA_dtype=self.MATRIX_A_DTYPE,
             state_dtype=state_dtype,
             generate_z=True,
+            generate_intermediate_states_buffer=False,
+            cache_steps=cache_steps,
             seed=0,
         )
 
 
-class TestSelectiveStateUpdateDisableStateUpdate(TestSelectiveStateUpdate):
-    """Test selective_state_update with disable_state_update=True."""
+class TestSelectiveStateUpdateMTPDisableStateUpdate(TestSelectiveStateUpdateMTP):
+    """Test multi-token selective_state_update with disable_state_update=True."""
 
-    @pytest.fixture(params=[1])
+    @pytest.fixture(params=[4])
     def batch(self, request):
         return request.param
 
-    @pytest.fixture(params=[8])
+    @pytest.fixture(params=[32])
     def nheads(self, request):
         return request.param
 
-    @pytest.fixture(params=[128])
+    @pytest.fixture(params=[64])
     def dim(self, request):
         return request.param
 
-    @pytest.fixture(params=[64])
+    @pytest.fixture(params=[64, 128])
     def dstate(self, request):
+        return request.param
+
+    @pytest.fixture(params=[4, 8])
+    def cache_steps(self, request):
         return request.param
 
     @pytest.fixture(params=[torch.bfloat16])
     def state_dtype(self, request):
         return request.param
 
-    @pytest.fixture(params=[torch.bfloat16])
+    @pytest.fixture(params=[torch.float32])
     def weight_dtype(self, request):
         return request.param
-
-    def run_kernel(self, inputs, out=None):
-        """Run the flashinfer kernel with disable_state_update=True."""
-        return flashinfer.mamba.selective_state_update(
-            inputs["state_cache"],
-            inputs["x"],
-            inputs["dt"],
-            inputs["A"],
-            inputs["B"],
-            inputs["C"],
-            D=inputs["D"],
-            z=inputs.get("z"),
-            dt_bias=inputs["dt_bias"],
-            dt_softplus=True,
-            state_batch_indices=inputs["slot_idx"],
-            pad_slot_id=-1,
-            out=out,
-            disable_state_update=True,
-        )
 
     def test_output_correctness(self, inputs, reference_output, use_out_tensor):
         """Test that kernel output matches reference but state is not updated."""
@@ -290,14 +297,11 @@ class TestSelectiveStateUpdateDisableStateUpdate(TestSelectiveStateUpdate):
 
         # Prepare output tensor if requested
         if use_out_tensor:
-            batch = inputs["x"].shape[0]
-            nheads = inputs["x"].shape[1]
-            dim = inputs["x"].shape[2]
-            out = torch.empty(batch, nheads, dim, dtype=self.INPUT_DTYPE, device="cuda")
+            out = torch.empty_like(inputs["x"])
         else:
             out = None
 
-        y_test = self.run_kernel(inputs, out=out)
+        y_test = self.run_kernel(inputs, out=out, disable_state_update=True)
 
         # Verify output tensor identity if provided
         if use_out_tensor:
@@ -336,11 +340,27 @@ class TestSelectiveStateUpdateDisableStateUpdate(TestSelectiveStateUpdate):
         )
 
 
-class TestSelectiveStateUpdateNonContiguous(TestSelectiveStateUpdate):
-    """Test selective_state_update with non-contiguous state cache."""
+class TestSelectiveStateUpdateMTPWithIntermediateStates(TestSelectiveStateUpdateMTP):
+    """Test multi-token selective_state_update with intermediate states buffer."""
 
-    @pytest.fixture(params=[128])
+    @pytest.fixture(params=[4])
+    def batch(self, request):
+        return request.param
+
+    @pytest.fixture(params=[32])
+    def nheads(self, request):
+        return request.param
+
+    @pytest.fixture(params=[64])
+    def dim(self, request):
+        return request.param
+
+    @pytest.fixture(params=[64, 128])
     def dstate(self, request):
+        return request.param
+
+    @pytest.fixture(params=[2, 4, 8])
+    def cache_steps(self, request):
         return request.param
 
     @pytest.fixture(params=[torch.bfloat16])
@@ -352,7 +372,154 @@ class TestSelectiveStateUpdateNonContiguous(TestSelectiveStateUpdate):
         return request.param
 
     @pytest.fixture
-    def inputs(self, batch, nheads, dim, dstate, state_dtype, weight_dtype):
+    def inputs(
+        self, batch, nheads, dim, dstate, cache_steps, state_dtype, weight_dtype
+    ):
+        """Create test inputs with intermediate states buffer."""
+        return create_test_inputs(
+            batch,
+            nheads,
+            dim,
+            dstate,
+            self.NGROUPS,
+            self.INPUT_DTYPE,
+            weight_dtype=weight_dtype,
+            matrixA_dtype=self.MATRIX_A_DTYPE,
+            state_dtype=state_dtype,
+            generate_z=False,
+            generate_intermediate_states_buffer=True,
+            cache_steps=cache_steps,
+            seed=0,
+        )
+
+    @pytest.fixture
+    def reference_output(self, inputs):
+        """Compute reference output using triton implementation with intermediate states."""
+        state_ref = clone_preserving_strides(inputs["state_cache"])
+        intermediate_states_ref = inputs["intermediate_states_buffer"].clone()
+
+        y_ref = selective_state_update_triton(
+            state_ref,
+            inputs["x"],
+            inputs["dt"],
+            inputs["A"],
+            inputs["B"],
+            inputs["C"],
+            D=inputs["D"],
+            z=inputs.get("z"),
+            dt_bias=inputs["dt_bias"],
+            dt_softplus=True,
+            state_batch_indices=inputs["slot_idx"],
+            pad_slot_id=-1,
+            disable_state_update=True,
+            intermediate_states_buffer=intermediate_states_ref,
+            cache_steps=inputs["cache_steps"],
+            intermediate_state_indices=inputs["intermediate_slot_idx"],
+        )
+        return y_ref, state_ref, intermediate_states_ref
+
+    def run_kernel_with_intermediate_states(self, inputs, out=None):
+        """Run the flashinfer kernel with intermediate states buffer."""
+        return flashinfer.mamba.selective_state_update(
+            inputs["state_cache"],
+            inputs["x"],
+            inputs["dt"],
+            inputs["A"],
+            inputs["B"],
+            inputs["C"],
+            D=inputs["D"],
+            z=inputs.get("z"),
+            dt_bias=inputs["dt_bias"],
+            dt_softplus=True,
+            state_batch_indices=inputs["slot_idx"],
+            pad_slot_id=-1,
+            out=out,
+            disable_state_update=True,
+            intermediate_states_buffer=inputs["intermediate_states_buffer"],
+            intermediate_state_indices=inputs["intermediate_slot_idx"],
+            cache_steps=inputs["cache_steps"],
+        )
+
+    def test_output_correctness(self, inputs, reference_output, use_out_tensor):
+        """Test that kernel output matches and intermediate states are cached correctly."""
+        y_ref, state_ref, intermediate_states_ref = reference_output
+
+        # Prepare output tensor if requested
+        if use_out_tensor:
+            out = torch.empty_like(inputs["x"])
+        else:
+            out = None
+
+        y_test = self.run_kernel_with_intermediate_states(inputs, out=out)
+
+        # Verify output tensor identity if provided
+        if use_out_tensor:
+            assert y_test.data_ptr() == out.data_ptr(), (
+                "Returned tensor should be the same object as the provided output tensor"
+            )
+
+        # Check output
+        self.assert_outputs_match(y_ref, y_test, msg_prefix="[intermediate_states] ")
+
+        # Check intermediate states were cached correctly
+        cache_steps = inputs["cache_steps"]
+        intermediate_states_test = inputs["intermediate_states_buffer"]
+
+        for t in range(cache_steps):
+            cached_state_ref = intermediate_states_ref[:, t, :, :, :]
+            cached_state_test = intermediate_states_test[:, t, :, :, :]
+
+            states_match = torch.allclose(
+                cached_state_ref, cached_state_test, atol=self.ATOL, rtol=self.RTOL
+            )
+
+            max_diff = (cached_state_ref - cached_state_test).abs().max().item()
+            if states_match:
+                print(f"✓ Intermediate state {t} matches (max_diff={max_diff:.6e})")
+            else:
+                print(f"✗ Intermediate state {t} mismatch (max_diff={max_diff:.6e})")
+                self._print_mismatch_details(
+                    cached_state_ref, cached_state_test, f"intermediate_state_{t}"
+                )
+
+            assert states_match, f"Intermediate state at step {t} mismatch"
+
+
+class TestSelectiveStateUpdateMTPNonContiguous(TestSelectiveStateUpdateMTP):
+    """Test multi-token selective_state_update with non-contiguous state cache."""
+
+    @pytest.fixture(params=[4])
+    def batch(self, request):
+        return request.param
+
+    @pytest.fixture(params=[8])
+    def nheads(self, request):
+        return request.param
+
+    @pytest.fixture(params=[64])
+    def dim(self, request):
+        return request.param
+
+    @pytest.fixture(params=[64])
+    def dstate(self, request):
+        return request.param
+
+    @pytest.fixture(params=[4])
+    def cache_steps(self, request):
+        return request.param
+
+    @pytest.fixture(params=[torch.bfloat16])
+    def state_dtype(self, request):
+        return request.param
+
+    @pytest.fixture(params=[torch.float32])
+    def weight_dtype(self, request):
+        return request.param
+
+    @pytest.fixture
+    def inputs(
+        self, batch, nheads, dim, dstate, cache_steps, state_dtype, weight_dtype
+    ):
         """Create test inputs with non-contiguous state cache (2x batch stride)."""
         noncontiguous_batch_stride = 2 * nheads * dim * dstate
 
@@ -367,7 +534,9 @@ class TestSelectiveStateUpdateNonContiguous(TestSelectiveStateUpdate):
             matrixA_dtype=self.MATRIX_A_DTYPE,
             state_dtype=state_dtype,
             generate_z=False,
+            generate_intermediate_states_buffer=False,
             state_cache_batch_stride=noncontiguous_batch_stride,
+            cache_steps=cache_steps,
             seed=0,
         )
 
@@ -392,10 +561,10 @@ class TestSelectiveStateUpdateNonContiguous(TestSelectiveStateUpdate):
         return y_ref, state_ref
 
 
-class TestSelectiveStateUpdateInt32Indices(TestSelectiveStateUpdate):
-    """Test selective_state_update with int32 state_batch_indices."""
+class TestSelectiveStateUpdateMTPInt32Indices(TestSelectiveStateUpdateMTP):
+    """Test multi-token selective_state_update with int32 state_batch_indices."""
 
-    @pytest.fixture(params=[1])
+    @pytest.fixture(params=[4])
     def batch(self, request):
         return request.param
 
@@ -407,19 +576,23 @@ class TestSelectiveStateUpdateInt32Indices(TestSelectiveStateUpdate):
     def dim(self, request):
         return request.param
 
-    @pytest.fixture(params=[128])
+    @pytest.fixture(params=[64])
     def dstate(self, request):
+        return request.param
+
+    @pytest.fixture(params=[4])
+    def cache_steps(self, request):
         return request.param
 
     @pytest.fixture(params=[torch.bfloat16])
     def state_dtype(self, request):
         return request.param
 
-    @pytest.fixture(params=[torch.bfloat16])
+    @pytest.fixture(params=[torch.float32])
     def weight_dtype(self, request):
         return request.param
 
-    def run_kernel(self, inputs, out=None):
+    def run_kernel(self, inputs, out=None, disable_state_update=False):
         """Run the flashinfer kernel with int32 state_batch_indices."""
         # Cast slot_idx to int32
         slot_idx_int32 = inputs["slot_idx"].to(torch.int32)
@@ -438,4 +611,104 @@ class TestSelectiveStateUpdateInt32Indices(TestSelectiveStateUpdate):
             state_batch_indices=slot_idx_int32,
             pad_slot_id=-1,
             out=out,
+            disable_state_update=disable_state_update,
         )
+
+
+class TestSelectiveStateUpdateMTPVariousNgroups(TestSelectiveStateUpdateMTP):
+    """Test multi-token selective_state_update with various ngroups values."""
+
+    NGROUPS = None  # Will be set by fixture
+
+    @pytest.fixture(params=[1, 2, 4, 8])
+    def ngroups(self, request):
+        return request.param
+
+    @pytest.fixture(params=[4])
+    def batch(self, request):
+        return request.param
+
+    @pytest.fixture(params=[32])
+    def nheads(self, request):
+        return request.param
+
+    @pytest.fixture(params=[64])
+    def dim(self, request):
+        return request.param
+
+    @pytest.fixture(params=[64])
+    def dstate(self, request):
+        return request.param
+
+    @pytest.fixture(params=[4])
+    def cache_steps(self, request):
+        return request.param
+
+    @pytest.fixture(params=[torch.bfloat16])
+    def state_dtype(self, request):
+        return request.param
+
+    @pytest.fixture(params=[torch.float32])
+    def weight_dtype(self, request):
+        return request.param
+
+    @pytest.fixture
+    def inputs(
+        self,
+        batch,
+        nheads,
+        dim,
+        dstate,
+        cache_steps,
+        state_dtype,
+        weight_dtype,
+        ngroups,
+    ):
+        """Create test inputs with specified ngroups."""
+        return create_test_inputs(
+            batch,
+            nheads,
+            dim,
+            dstate,
+            ngroups,
+            self.INPUT_DTYPE,
+            weight_dtype=weight_dtype,
+            matrixA_dtype=self.MATRIX_A_DTYPE,
+            state_dtype=state_dtype,
+            generate_z=False,
+            generate_intermediate_states_buffer=False,
+            cache_steps=cache_steps,
+            seed=0,
+        )
+
+
+class TestSelectiveStateUpdateMTPLargeBatch(TestSelectiveStateUpdateMTP):
+    """Test multi-token selective_state_update with larger batch sizes."""
+
+    @pytest.fixture(params=[16, 64])
+    def batch(self, request):
+        return request.param
+
+    @pytest.fixture(params=[32])
+    def nheads(self, request):
+        return request.param
+
+    @pytest.fixture(params=[64])
+    def dim(self, request):
+        return request.param
+
+    @pytest.fixture(params=[64])
+    def dstate(self, request):
+        return request.param
+
+    @pytest.fixture(params=[4, 8])
+    def cache_steps(self, request):
+        return request.param
+
+    @pytest.fixture(params=[torch.bfloat16])
+    def state_dtype(self, request):
+        return request.param
+
+    @pytest.fixture(params=[torch.float32])
+    def weight_dtype(self, request):
+        return request.param

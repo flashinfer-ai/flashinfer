@@ -4,6 +4,15 @@ import numpy as np
 import torch
 
 
+def clone_preserving_strides(tensor):
+    """Clone a tensor while preserving its strides (non-contiguous layout)."""
+    result = torch.empty_strided(
+        tensor.size(), tensor.stride(), dtype=tensor.dtype, device=tensor.device
+    )
+    result.copy_(tensor)
+    return result
+
+
 def create_test_inputs(
     batch_size: int,
     nheads: int,
@@ -155,7 +164,7 @@ def create_test_inputs(
     dt_bias = dt_bias_base.as_strided((nheads, dim), (1, 0))
 
     # Slot indices for state batching - (batch_size,)
-    slot_idx = torch.randperm(ssm_state_cache_size, dtype=torch.int32, device=device)[
+    slot_idx = torch.randperm(ssm_state_cache_size, dtype=torch.int64, device=device)[
         :batch_size
     ]
 
