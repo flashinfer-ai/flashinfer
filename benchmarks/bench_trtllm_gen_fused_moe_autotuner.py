@@ -358,10 +358,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--activation-type",
         type=enum_type(ActivationType),
-        choices=list(ActivationType),
+        choices=[e.name for e in ActivationType],
         required=False,
         default=ActivationType.Swiglu,
-        help=f"Type of gated activation function: {[e.name for e in ActivationType]}",
+        help=f"Type of activation function: {[e.name for e in ActivationType]}",
     )
     args = parser.parse_args()
     if args.quant_mode in ["Fp8-Per-Tensor", "Fp8-Block"]:

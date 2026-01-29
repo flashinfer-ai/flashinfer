@@ -461,12 +461,11 @@ def enum_type(enum_class):
 
     def converter(value):
         try:
-            formatted_value = value[0].upper() + value[1:].lower()
-            return enum_class[formatted_value]
+            lower_name_to_member = {m.name.lower(): m for m in enum_class}
+            return lower_name_to_member[value.lower()]
         except KeyError as e:
-            valid_options = [m.name for m in enum_class]
             raise argparse.ArgumentTypeError(
-                f"Invalid value '{value}'. Must be one of: {', '.join(valid_options)}"
+                f"Invalid value '{value}'. Must be one of: {', '.join([m.name for m in enum_class])}"
             ) from e
 
     return converter
