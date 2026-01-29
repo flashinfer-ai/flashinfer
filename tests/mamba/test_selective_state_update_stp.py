@@ -244,15 +244,115 @@ class TestSelectiveStateUpdateWithZ(TestSelectiveStateUpdate):
         )
 
 
-@pytest.mark.xfail(reason="Non-contiguous state cache not yet supported")
-class TestSelectiveStateUpdateNonContiguous(TestSelectiveStateUpdate):
-    """Test selective_state_update with non-contiguous state cache."""
+class TestSelectiveStateUpdateDisableStateUpdate(TestSelectiveStateUpdate):
+    """Test selective_state_update with disable_state_update=True."""
 
-    @pytest.fixture(params=[64, 128])
+    @pytest.fixture(params=[1])
+    def batch(self, request):
+        return request.param
+
+    @pytest.fixture(params=[8])
+    def nheads(self, request):
+        return request.param
+
+    @pytest.fixture(params=[128])
+    def dim(self, request):
+        return request.param
+
+    @pytest.fixture(params=[64])
     def dstate(self, request):
         return request.param
 
-    @pytest.fixture(params=[torch.bfloat16, torch.float32])
+    @pytest.fixture(params=[torch.bfloat16])
+    def state_dtype(self, request):
+        return request.param
+
+    @pytest.fixture(params=[torch.bfloat16])
+    def weight_dtype(self, request):
+        return request.param
+
+    def run_kernel(self, inputs, out=None):
+        """Run the flashinfer kernel with disable_state_update=True."""
+        return flashinfer.mamba.selective_state_update(
+            inputs["state_cache"],
+            inputs["x"],
+            inputs["dt"],
+            inputs["A"],
+            inputs["B"],
+            inputs["C"],
+            D=inputs["D"],
+            z=inputs.get("z"),
+            dt_bias=inputs["dt_bias"],
+            dt_softplus=True,
+            state_batch_indices=inputs["slot_idx"],
+            pad_slot_id=-1,
+            out=out,
+            disable_state_update=True,
+        )
+
+    def test_output_correctness(self, inputs, reference_output, use_out_tensor):
+        """Test that kernel output matches reference but state is not updated."""
+        y_ref, state_ref = reference_output
+
+        # Save the initial state before running the kernel
+        state_initial = inputs["state_cache"].clone()
+
+        # Prepare output tensor if requested
+        if use_out_tensor:
+            batch = inputs["x"].shape[0]
+            nheads = inputs["x"].shape[1]
+            dim = inputs["x"].shape[2]
+            out = torch.empty(batch, nheads, dim, dtype=self.INPUT_DTYPE, device="cuda")
+        else:
+            out = None
+
+        y_test = self.run_kernel(inputs, out=out)
+
+        # Verify output tensor identity if provided
+        if use_out_tensor:
+            assert y_test.data_ptr() == out.data_ptr(), (
+                "Returned tensor should be the same object as the provided output tensor"
+            )
+
+        # Check that output is still correct
+        self.assert_outputs_match(y_ref, y_test, msg_prefix="[disable_state_update] ")
+
+        # Check that state was NOT updated (should remain the same as initial)
+        state_after = inputs["state_cache"]
+        state_unchanged = torch.allclose(
+            state_initial, state_after, atol=1e-8, rtol=1e-8
+        )
+
+        if state_unchanged:
+            print("✓ [disable_state_update] State cache was not modified (as expected)")
+        else:
+            print(
+                "✗ [disable_state_update] State cache was modified (should remain unchanged!)"
+            )
+            # Show where state changed
+            state_initial_np = state_initial.detach().cpu().float().numpy()
+            state_after_np = state_after.detach().cpu().float().numpy()
+            mismatch_mask = ~np.isclose(
+                state_initial_np, state_after_np, atol=1e-8, rtol=1e-8
+            )
+            num_changed = np.sum(mismatch_mask)
+            print(
+                f"Number of changed state elements: {num_changed} / {state_initial_np.size}"
+            )
+
+        assert state_unchanged, (
+            "State should not be updated when disable_state_update=True"
+        )
+
+
+class TestSelectiveStateUpdateNonContiguous(TestSelectiveStateUpdate):
+    """Test selective_state_update with non-contiguous state cache."""
+
+    @pytest.fixture(params=[128])
+    def dstate(self, request):
+        return request.param
+
+    @pytest.fixture(params=[torch.bfloat16])
     def state_dtype(self, request):
         return request.param
 

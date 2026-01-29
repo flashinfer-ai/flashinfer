@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include <flashinfer/mamba/selective_state_update.cuh>
+#include <sstream>
 
 #include "tvm_ffi_utils.h"
 
@@ -123,6 +124,51 @@ inline void validate_dtypes(
     FLASHINFER_CHECK(intermediate_states_buffer.value().dtype() == state_dtype,
                      "intermediate_states_buffer must have the same dtype as state");
   }
+}
+
+// Helper to convert dtype code to string for error messages
+inline const char* dtype_code_to_string(int64_t code) {
+  if (code == bfloat16_code) return "bfloat16";
+  if (code == float16_code) return "float16";
+  if (code == float32_code) return "float32";
+  return "unknown";
+}
+
+// Type traits to map dtype codes to C++ types
+template <int64_t code>
+struct DTypeToType;
+
+template <>
+struct DTypeToType<bfloat16_code> {
+  using type = nv_bfloat16;
+};
+template <>
+struct DTypeToType<float16_code> {
+  using type = half;
+};
+template <>
+struct DTypeToType<float32_code> {
+  using type = float;
+};
+
+// Allowed dtype combinations: {state_code, input_code, weight_code, matrixA_code}
+constexpr std::tuple<int64_t, int64_t, int64_t, int64_t> allowed_dtype_combos[] = {
+    {bfloat16_code, bfloat16_code, bfloat16_code, float32_code},
+    {float16_code, bfloat16_code, bfloat16_code, float32_code},
+    {float32_code, bfloat16_code, bfloat16_code, float32_code},
+    {bfloat16_code, bfloat16_code, float32_code, float32_code},
+    {float16_code, bfloat16_code, float32_code, float32_code},
+    {float32_code, bfloat16_code, float32_code, float32_code},
+};
+
+// Helper to dispatch to the right template instantiation
+template <int64_t state_code, int64_t input_code, int64_t weight_code, int64_t matrixA_code>
+void dispatchCombo(SelectiveStateUpdateParams& p, cudaStream_t stream) {
+  using state_t = typename DTypeToType<state_code>::type;
+  using input_t = typename DTypeToType<input_code>::type;
+  using weight_t = typename DTypeToType<weight_code>::type;
+  using matrixA_t = typename DTypeToType<matrixA_code>::type;
+  invokeSelectiveStateUpdate<input_t, weight_t, matrixA_t, state_t>(p, stream);
 }
 
 void run_selective_state_update_stp(TensorView const& state, TensorView const& x,
@@ -286,61 +332,41 @@ void run_selective_state_update_stp(TensorView const& state, TensorView const& x
   auto dtype_key =
       std::make_tuple(state_dtype_code, input_dtype_code, weight_dtype_code, matrixA_dtype_code);
 
-  if (dtype_key == std::make_tuple(bfloat16_code, bfloat16_code, bfloat16_code, float32_code)) {
-    using state_t = nv_bfloat16;
-    using input_t = nv_bfloat16;
-    using weight_t = nv_bfloat16;
-    using matrixA_t = float;
-    invokeSelectiveStateUpdate<input_t, weight_t, matrixA_t, state_t>(p, stream);
-  } else if (dtype_key ==
-             std::make_tuple(float16_code, bfloat16_code, bfloat16_code, float32_code)) {
-    using state_t = half;
-    using input_t = nv_bfloat16;
-    using weight_t = nv_bfloat16;
-    using matrixA_t = float;
-    invokeSelectiveStateUpdate<input_t, weight_t, matrixA_t, state_t>(p, stream);
-  } else if (dtype_key ==
-             std::make_tuple(float32_code, bfloat16_code, bfloat16_code, float32_code)) {
-    using state_t = float;
-    using input_t = nv_bfloat16;
-    using weight_t = nv_bfloat16;
-    using matrixA_t = float;
-    invokeSelectiveStateUpdate<input_t, weight_t, matrixA_t, state_t>(p, stream);
-  } else if (dtype_key ==
-             std::make_tuple(bfloat16_code, bfloat16_code, float32_code, float32_code)) {
-    using state_t = nv_bfloat16;
-    using input_t = nv_bfloat16;
-    using weight_t = float;
-    using matrixA_t = float;
-    invokeSelectiveStateUpdate<input_t, weight_t, matrixA_t, state_t>(p, stream);
-  } else if (dtype_key ==
-             std::make_tuple(float16_code, bfloat16_code, float32_code, float32_code)) {
-    using state_t = half;
-    using input_t = nv_bfloat16;
-    using weight_t = float;
-    using matrixA_t = float;
-    invokeSelectiveStateUpdate<input_t, weight_t, matrixA_t, state_t>(p, stream);
-  } else if (dtype_key ==
-             std::make_tuple(float32_code, bfloat16_code, float32_code, float32_code)) {
-    using state_t = float;
-    using input_t = nv_bfloat16;
-    using weight_t = float;
-    using matrixA_t = float;
-    invokeSelectiveStateUpdate<input_t, weight_t, matrixA_t, state_t>(p, stream);
-  } else {
-    // Default case: unsupported dtype combination
-    TVM_FFI_ICHECK(false)
-        << "Unsupported dtype combination for selective_state_update: " << "state_dtype="
-        << state_dtype.code << ":" << state_dtype.bits << ", " << "input_dtype=" << input_dtype.code
-        << ":" << input_dtype.bits << ", " << "weight_dtype=" << weight_dtype.code << ":"
-        << weight_dtype.bits << ", " << "matrixA_dtype=" << matrixA_dtype.code << ":"
-        << matrixA_dtype.bits << ". Supported combos include:\n"
-        << "  (state=bfloat16, input=bfloat16, weight=bfloat16, matrixA=float32)\n"
-        << "  (state=float16, input=bfloat16, weight=bfloat16, matrixA=float32)\n"
-        << "  (state=float32, input=bfloat16, weight=bfloat16, matrixA=float32)\n"
-        << "  (state=bfloat16, input=bfloat16, weight=float32, matrixA=float32)\n"
-        << "  (state=float16, input=bfloat16, weight=float32, matrixA=float32)\n"
-        << "  (state=float32, input=bfloat16, weight=float32, matrixA=float32)";
+  // Compile-time recursive dispatcher using Y-combinator pattern for lambda self-recursion
+  auto tryDispatch = [&](const auto& key, auto idx, auto& self) -> bool {
+    constexpr size_t I = decltype(idx)::value;
+    if constexpr (I < std::size(allowed_dtype_combos)) {
+      constexpr auto combo = allowed_dtype_combos[I];
+      if (key == combo) {
+        constexpr auto s = std::get<0>(combo);
+        constexpr auto i = std::get<1>(combo);
+        constexpr auto w = std::get<2>(combo);
+        constexpr auto m = std::get<3>(combo);
+        dispatchCombo<s, i, w, m>(p, stream);
+        return true;
+      }
+      return self(key, std::integral_constant<size_t, I + 1>{}, self);
+    }
+    return false;
+  };
+
+  // Dispatch using compile-time type traits
+  if (!tryDispatch(dtype_key, std::integral_constant<size_t, 0>{}, tryDispatch)) {
+    // Unsupported dtype combination - build error message dynamically
+    std::ostringstream error_msg;
+    error_msg << "Unsupported dtype combination for selective_state_update: "
+              << "state_dtype=" << state_dtype.code << ":" << state_dtype.bits << ", "
+              << "input_dtype=" << input_dtype.code << ":" << input_dtype.bits << ", "
+              << "weight_dtype=" << weight_dtype.code << ":" << weight_dtype.bits << ", "
+              << "matrixA_dtype=" << matrixA_dtype.code << ":" << matrixA_dtype.bits
+              << ". Supported combos include:\n";
+    for (const auto& combo : allowed_dtype_combos) {
+      error_msg << "  (state=" << dtype_code_to_string(std::get<0>(combo))
+                << ", input=" << dtype_code_to_string(std::get<1>(combo))
+                << ", weight=" << dtype_code_to_string(std::get<2>(combo))
+                << ", matrixA=" << dtype_code_to_string(std::get<3>(combo)) << ")\n";
+    }
+    TVM_FFI_ICHECK(false) << error_msg.str();
   }
 }
 
