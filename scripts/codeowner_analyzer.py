@@ -589,20 +589,6 @@ class CodeOwnersAnalyzer:
                 f.write("# Manual overrides applied from overrides file\n")
             f.write("\n")
 
-            # Write file-level overrides first (these are not merged with computed)
-            if self.owner_overrides:
-                file_overrides = [
-                    (path, users)
-                    for path, users in self.owner_overrides.items()
-                    if self._is_file_path(path)
-                ]
-                if file_overrides:
-                    f.write("# File-level overrides\n")
-                    for path, users in sorted(file_overrides):
-                        usernames = self._normalize_usernames(users)
-                        f.write(f"{path} {' '.join(usernames)}\n")
-                    f.write("\n")
-
             # Write directory entries (computed + merged overrides)
             for module, data in results.items():
                 # Extract GitHub usernames from computed owners
@@ -632,6 +618,22 @@ class CodeOwnersAnalyzer:
                 if final_usernames:
                     owners_list = " ".join(final_usernames)
                     f.write(f"{module}/ {owners_list}\n")
+
+            # Write file-level overrides LAST (CODEOWNERS uses last-match-wins)
+            # This ensures file-specific overrides take precedence over directory patterns
+            if self.owner_overrides:
+                file_overrides = [
+                    (path, users)
+                    for path, users in self.owner_overrides.items()
+                    if self._is_file_path(path)
+                ]
+                if file_overrides:
+                    f.write(
+                        "\n# File-level overrides (must come last for precedence)\n"
+                    )
+                    for path, users in sorted(file_overrides):
+                        usernames = self._normalize_usernames(users)
+                        f.write(f"{path} {' '.join(usernames)}\n")
 
     def print_detailed_report(self, results: Dict[str, Any]) -> None:
         """Print a detailed ownership report."""
