@@ -6,14 +6,16 @@ from flashinfer import (
     nvfp4_quantize,
     mxfp4_quantize,
 )
+from flashinfer.jit.core import logger
 from flashinfer.testing.utils import bench_gpu_time
 from flashinfer.utils import get_compute_capability
 
+import argparse
+from functools import partial
+from itertools import product
 import logging
 import numpy as np
 from typing import Literal
-
-from functools import partial
 
 
 def _bench_mm_fp4(
@@ -94,49 +96,68 @@ def _bench_mm_fp4(
         use_nvfp4=use_nvfp4,
     )
 
-    def bench(do_autotune: bool) -> float:
-        with autotune(do_autotune):
-            fn(
-                a=input_fp4,
-                b=mat2_fp4.T,
-                a_descale=input_inv_s,
-                b_descale=mat2_inv_s.T,
+    input_kwargs = {
+        "a": input_fp4,
+        "b": mat2_fp4.T,
+        "a_descale": input_inv_s,
+        "b_descale": mat2_inv_s.T,
+    }
+    try:
+
+        def bench(do_autotune: bool) -> float:
+            with autotune(do_autotune):
+                fn(**input_kwargs)
+            ms_list = bench_gpu_time(
+                fn,
+                dry_run_iters=warmups,
+                repeat_iters=iterations,
+                enable_cupti=False,  # FIXME: Cupti causes CUDA Illegal Memory Access
+                use_cuda_graph=True,
+                input_kwargs=input_kwargs,
+                cold_l2_cache=True,
             )
-        ms_list = bench_gpu_time(
-            fn,
-            dry_run_iters=warmups,
-            repeat_iters=iterations,
-            use_cuda_graph=True,
-            input_kwargs={
-                "a": input_fp4,
-                "b": mat2_fp4.T,
-                "a_descale": input_inv_s,
-                "b_descale": mat2_inv_s.T,
-            },
-            cold_l2_cache=True,
-        )
-        median_ms = np.median(ms_list)
-        return median_ms
+            median_ms = np.median(ms_list)
+            return median_ms
 
-    ms = bench(do_autotune=do_autotune)
-    tflops = 2 * m * n * k * 1e-9 / ms
-    return ms, tflops
+        ms = bench(do_autotune=do_autotune)
+        tflops = 2 * m * n * k * 1e-9 / ms
+        return ms, tflops
+    except Exception as e:
+        print(f"    Error: {e}")
+        return 0, 0
 
-
-logging.basicConfig(level="WARNING")  # suppress autotuner's logs
 
 if __name__ == "__main__":
-    for m in [1, 2, 4, 8, 16, 32, 64]:
-        for n in [2560, 5120, 8192]:
-            for k in [16384, 32768]:
-                print(f"m={m}, n={n}, k={k}".center(100, "-"))
-                for backend in ["cudnn", "trtllm", "cutlass"]:
-                    print(f"  {backend}:")
-                    ms, tflops = _bench_mm_fp4(
-                        m, n, k, torch.bfloat16, backend, True, "nvfp4", False
-                    )
-                    print(f"    w/o autotune: {ms:.3f} ms, {tflops:.3f} TFLOPs/s")
-                    ms, tflops = _bench_mm_fp4(
-                        m, n, k, torch.bfloat16, backend, True, "nvfp4", True
-                    )
-                    print(f"    with autotune: {ms:.3f} ms, {tflops:.3f} TFLOPs/s")
+    # suppress autotuner's logs
+    logger.setLevel(logging.WARNING)
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--m", type=int, nargs="+", default=[1, 64, 128, 1024, 2048, 4096, 8192]
+    )
+    parser.add_argument("--n", type=int, nargs="+", default=[1024, 2048, 4096, 8192])
+    parser.add_argument(
+        "--k", type=int, nargs="+", default=[1024, 2048, 4096, 8192, 16384, 32768]
+    )
+    parser.add_argument(
+        "--backend", type=str, nargs="+", default=["cudnn", "trtllm", "cutlass"]
+    )
+    args = parser.parse_args()
+
+    for m, n, k in product(args.m, args.n, args.k):
+        print(f"m={m}, n={n}, k={k}".center(100, "-"))
+        for backend in args.backend:
+            print(f"  {backend}:")
+            ms, tflops = _bench_mm_fp4(
+                m, n, k, torch.bfloat16, backend, True, "nvfp4", False
+            )
+            us = ms * 1e3
+            print(
+                f"    w/o autotune: {f'{us:.3f} us' if us < 1000 else f'{us / 1000:.3f} ms'}, {tflops:.2f} TFLOPs/s"
+            )
+            ms, tflops = _bench_mm_fp4(
+                m, n, k, torch.bfloat16, backend, True, "nvfp4", True
+            )
+            us = ms * 1e3
+            print(
+                f"    with autotune: {f'{us:.3f} us' if us < 1000 else f'{us / 1000:.3f} ms'}, {tflops:.2f} TFLOPs/s"
+            )
