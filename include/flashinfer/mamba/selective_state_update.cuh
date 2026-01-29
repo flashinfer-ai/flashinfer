@@ -1014,12 +1014,39 @@ void dispatchRatio(SelectiveStateUpdateParams& params, std::integer_sequence<int
                    ".\nSupported values: ", format_array(allowed_ratios));
 }
 
+// Check alignment for common input variables (x, z, B, C)
+template <typename input_t>
+void check_ptr_alignment_input_vars(const SelectiveStateUpdateParams& params) {
+  using load_input_t = PackedAligned<input_t>;
+  FLASHINFER_CHECK(reinterpret_cast<uintptr_t>(params.x) % sizeof(load_input_t) == 0,
+                   "x pointer must be aligned to ", sizeof(load_input_t), " bytes");
+  FLASHINFER_CHECK((params.x_stride_batch * sizeof(input_t)) % sizeof(load_input_t) == 0,
+                   "x batch stride must be aligned to ", sizeof(load_input_t), " bytes");
+  if (params.z) {
+    FLASHINFER_CHECK(reinterpret_cast<uintptr_t>(params.z) % sizeof(load_input_t) == 0,
+                     "z pointer must be aligned to ", sizeof(load_input_t), " bytes");
+    FLASHINFER_CHECK((params.z_stride_batch * sizeof(input_t)) % sizeof(load_input_t) == 0,
+                     "z batch stride must be aligned to ", sizeof(load_input_t), " bytes");
+  }
+  FLASHINFER_CHECK(reinterpret_cast<uintptr_t>(params.B) % sizeof(load_input_t) == 0,
+                   "B pointer must be aligned to ", sizeof(load_input_t), " bytes");
+  FLASHINFER_CHECK(reinterpret_cast<uintptr_t>(params.C) % sizeof(load_input_t) == 0,
+                   "C pointer must be aligned to ", sizeof(load_input_t), " bytes");
+  FLASHINFER_CHECK((params.B_stride_batch * sizeof(input_t)) % sizeof(load_input_t) == 0,
+                   "B batch stride must be aligned to ", sizeof(load_input_t), " bytes");
+  FLASHINFER_CHECK((params.C_stride_batch * sizeof(input_t)) % sizeof(load_input_t) == 0,
+                   "C batch stride must be aligned to ", sizeof(load_input_t), " bytes");
+}
+
 template <typename input_t, typename weight_t, typename matrixA_t, typename state_t>
 void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, cudaStream_t stream) {
   auto [sm_major, sm_minor] = GetCudaComputeCapability();
 
   constexpr int allowed_dstates[] = {64, 128, 256};
   constexpr int allowed_dims[] = {64, 128, 256};
+
+  // Common alignment checks for all kernels
+  check_ptr_alignment_input_vars<input_t>(params);
 
 #ifdef FLASHINFER_MAMBA_ENABLE_SM100
   if (sm_major < 10)  // pre-Blackwell
@@ -1028,31 +1055,12 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, cudaStream_t
 #endif
   {
     auto kernel_launcher = [&]<int DIM, int DSTATE>() {
-      // Alignment checks for vectorized loads in simple kernel
+      // Additional alignment checks specific to simple kernel
       constexpr auto stateLoadSize = getVectorLoadSizeForFullUtilization<state_t, DSTATE>();
       using load_state_t = PackedAligned<state_t, stateLoadSize>;
-      using load_input_t = PackedAligned<input_t>;
 
       FLASHINFER_CHECK(reinterpret_cast<uintptr_t>(params.state) % sizeof(load_state_t) == 0,
                        "state pointer must be aligned to ", sizeof(load_state_t), " bytes");
-      FLASHINFER_CHECK(reinterpret_cast<uintptr_t>(params.x) % sizeof(load_input_t) == 0,
-                       "x pointer must be aligned to ", sizeof(load_input_t), " bytes");
-      FLASHINFER_CHECK((params.x_stride_batch * sizeof(input_t)) % sizeof(load_input_t) == 0,
-                       "x batch stride must be aligned to ", sizeof(load_input_t), " bytes");
-      if (params.z) {
-        FLASHINFER_CHECK(reinterpret_cast<uintptr_t>(params.z) % sizeof(load_input_t) == 0,
-                         "z pointer must be aligned to ", sizeof(load_input_t), " bytes");
-        FLASHINFER_CHECK((params.z_stride_batch * sizeof(input_t)) % sizeof(load_input_t) == 0,
-                         "z batch stride must be aligned to ", sizeof(load_input_t), " bytes");
-      }
-      FLASHINFER_CHECK(reinterpret_cast<uintptr_t>(params.B) % sizeof(load_input_t) == 0,
-                       "B pointer must be aligned to ", sizeof(load_input_t), " bytes");
-      FLASHINFER_CHECK(reinterpret_cast<uintptr_t>(params.C) % sizeof(load_input_t) == 0,
-                       "C pointer must be aligned to ", sizeof(load_input_t), " bytes");
-      FLASHINFER_CHECK((params.B_stride_batch * sizeof(input_t)) % sizeof(load_input_t) == 0,
-                       "B batch stride must be aligned to ", sizeof(load_input_t), " bytes");
-      FLASHINFER_CHECK((params.C_stride_batch * sizeof(input_t)) % sizeof(load_input_t) == 0,
-                       "C batch stride must be aligned to ", sizeof(load_input_t), " bytes");
       FLASHINFER_CHECK((params.dim * params.dstate * sizeof(state_t)) % sizeof(load_state_t) == 0,
                        "state head stride must be aligned to ", sizeof(load_state_t), " bytes");
 
@@ -1070,30 +1078,7 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, cudaStream_t
   else {
 
     auto kernel_launcher = [&]<int DIM, int DSTATE>() {
-      // Alignment checks for vectorized loads in Hopper kernel
       // Note: State uses TMA which requires 128B alignment (checked below)
-      // x, z, B, and C use PackedAligned<input_t>
-      using load_input_t = PackedAligned<input_t>;
-
-      FLASHINFER_CHECK(reinterpret_cast<uintptr_t>(params.x) % sizeof(load_input_t) == 0,
-                       "x pointer must be aligned to ", sizeof(load_input_t), " bytes");
-      FLASHINFER_CHECK((params.x_stride_batch * sizeof(input_t)) % sizeof(load_input_t) == 0,
-                       "x batch stride must be aligned to ", sizeof(load_input_t), " bytes");
-      if (params.z) {
-        FLASHINFER_CHECK(reinterpret_cast<uintptr_t>(params.z) % sizeof(load_input_t) == 0,
-                         "z pointer must be aligned to ", sizeof(load_input_t), " bytes");
-        FLASHINFER_CHECK((params.z_stride_batch * sizeof(input_t)) % sizeof(load_input_t) == 0,
-                         "z batch stride must be aligned to ", sizeof(load_input_t), " bytes");
-      }
-      FLASHINFER_CHECK(reinterpret_cast<uintptr_t>(params.B) % sizeof(load_input_t) == 0,
-                       "B pointer must be aligned to ", sizeof(load_input_t), " bytes");
-      FLASHINFER_CHECK(reinterpret_cast<uintptr_t>(params.C) % sizeof(load_input_t) == 0,
-                       "C pointer must be aligned to ", sizeof(load_input_t), " bytes");
-      FLASHINFER_CHECK((params.B_stride_batch * sizeof(input_t)) % sizeof(load_input_t) == 0,
-                       "B batch stride must be aligned to ", sizeof(load_input_t), " bytes");
-      FLASHINFER_CHECK((params.C_stride_batch * sizeof(input_t)) % sizeof(load_input_t) == 0,
-                       "C batch stride must be aligned to ", sizeof(load_input_t), " bytes");
-
       constexpr auto numConsumers = 4;
       constexpr auto numWarps = 1 + numConsumers;
       constexpr auto numStages = 3;
@@ -1135,28 +1120,6 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, cudaStream_t
   else {
     // SM100+ (Blackwell and newer) uses horizontal producer-consumer kernel
     auto kernel_launcher = [&]<int DIM, int DSTATE>() {
-      // Alignment checks for vectorized loads in Blackwell kernel
-      using load_input_t = PackedAligned<input_t>;
-
-      FLASHINFER_CHECK(reinterpret_cast<uintptr_t>(params.x) % sizeof(load_input_t) == 0,
-                       "x pointer must be aligned to ", sizeof(load_input_t), " bytes");
-      FLASHINFER_CHECK((params.x_stride_batch * sizeof(input_t)) % sizeof(load_input_t) == 0,
-                       "x batch stride must be aligned to ", sizeof(load_input_t), " bytes");
-      if (params.z) {
-        FLASHINFER_CHECK(reinterpret_cast<uintptr_t>(params.z) % sizeof(load_input_t) == 0,
-                         "z pointer must be aligned to ", sizeof(load_input_t), " bytes");
-        FLASHINFER_CHECK((params.z_stride_batch * sizeof(input_t)) % sizeof(load_input_t) == 0,
-                         "z batch stride must be aligned to ", sizeof(load_input_t), " bytes");
-      }
-      FLASHINFER_CHECK(reinterpret_cast<uintptr_t>(params.B) % sizeof(load_input_t) == 0,
-                       "B pointer must be aligned to ", sizeof(load_input_t), " bytes");
-      FLASHINFER_CHECK(reinterpret_cast<uintptr_t>(params.C) % sizeof(load_input_t) == 0,
-                       "C pointer must be aligned to ", sizeof(load_input_t), " bytes");
-      FLASHINFER_CHECK((params.B_stride_batch * sizeof(input_t)) % sizeof(load_input_t) == 0,
-                       "B batch stride must be aligned to ", sizeof(load_input_t), " bytes");
-      FLASHINFER_CHECK((params.C_stride_batch * sizeof(input_t)) % sizeof(load_input_t) == 0,
-                       "C batch stride must be aligned to ", sizeof(load_input_t), " bytes");
-
       // profiling showed that it's good to have 4 producers per 64 rows
       constexpr auto numConsumers = (DIM / 64) * 4;
       constexpr auto numProducers = 1;
