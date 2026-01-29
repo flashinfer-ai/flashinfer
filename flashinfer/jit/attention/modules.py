@@ -1966,7 +1966,6 @@ def get_trtllm_fmha_v2_module(
 
     return gen_fmha_v2_module(
         dtype_q=q_dtype,
-        seq_len=0,
         head_dim_qk=head_dim_qk,
         head_dim_v=head_dim_vo,
         input_layout=input_layout,
@@ -2030,7 +2029,6 @@ def gen_trtllm_fmha_v2_sm120_module(device: torch.device) -> JitSpec:
 
 def gen_fmha_v2_module(
     dtype_q: torch.dtype,
-    seq_len: int,
     head_dim_qk: int,
     head_dim_v: int = 0,
     input_layout: str = "Q_PAGED_KV",
@@ -2099,8 +2097,6 @@ def gen_fmha_v2_module(
     csrc_dir = jit_env.FLASHINFER_CSRC_DIR
     fmha_v2_src_dir = csrc_dir / "fmha_v2"
 
-    source_paths = []
-
     # Convert string input_layout to InputLayout enum
     input_layout_map = {
         "PACKED_QKV": InputLayout.PACKED_QKV,
@@ -2114,28 +2110,7 @@ def gen_fmha_v2_module(
             f"Invalid input_layout: {input_layout}. Must be one of {list(input_layout_map.keys())}"
         )
 
-    sources = generate_jit_sources(
-        sm=90,
-        head_size=head_dim_qk,
-        dtype=dtype_str,
-        return_softmax=return_softmax_stats,
-        enable_attn_logit_softcapping=enable_softcapping,
-        alibi=use_alibi,
-        input_layout=layout,
-        head_size_v=head_dim_v,
-        output_dtype=output_dtype,
-    )
-
-    kernel_path = gen_directory / sources["kernel_filename"]
-    write_if_different(kernel_path, sources["kernel_code"])
-    source_paths.append(kernel_path)
-
-    # dispatcher header (declares launcher extern, provides wrapper)
-    with open(csrc_dir / "fmha_v2_dispatcher.jinja", "r") as f:
-        dispatcher_template = jinja2.Template(f.read())
-    dispatcher_code = dispatcher_template.render(launcher_name=sources["launcher_name"])
-    dispatcher_path = gen_directory / "fmha_v2_dispatcher.h"
-    write_if_different(dispatcher_path, dispatcher_code)
+    source_paths = generate_jit_sources()
 
     # copy static fmha_v2_run.cu
     static_run_path = csrc_dir / "fmha_v2_run.cu"
@@ -2158,7 +2133,7 @@ def gen_fmha_v2_module(
     nvcc_flags.extend(
         [
             f"-I{fmha_v2_src_dir}",
-            f"-I{gen_directory}",  # For config.inc and dispatcher.h
+            f"-I{gen_directory}",  # For fmha_v2_api.h
             f"-I{jit_env.FLASHINFER_CSRC_DIR / 'fmha_v2'}",
             f"-I{jit_env.FLASHINFER_INCLUDE_DIR}",  # For flashinfer headers
             "-Wno-deprecated-gpu-targets",

@@ -86,6 +86,45 @@ def _split_scale_param(scale):
         return None, float(scale)
 
 
+def _create_scale_bmm2_d_tensor(
+    scale_bmm2: float, data_dtype: torch.dtype, device: torch.device
+) -> torch.Tensor:
+    """Create a scale_bmm2_d tensor with the correct bit pattern for the TRT-LLM FMHAv2 kernel.
+
+    This function replicates the C++ set_alpha logic for scale_type2 to avoid
+    cudaMemcpy synchronization in the kernel. The scale value is converted to
+    the appropriate floating-point format and stored as int32 bits on device.
+
+    The scale_type2 logic (from C++):
+    - FP16 input -> scale stored as FP16 bits in lower 16 bits of uint32
+    - BF16 input -> scale stored as BF16 bits in lower 16 bits of uint32
+    - Other (FP8, INT8, etc.) -> scale stored as FP32 bits in uint32
+
+    Args:
+        scale_bmm2: The scale value for BMM2 (typically 1.0)
+        data_dtype: The input tensor dtype (determines scale_type2)
+        device: The target device for the tensor
+
+    Returns:
+        A 1-element int32 tensor on device containing the scale bits
+    """
+    if data_dtype == torch.float16:
+        # Create int32 buffer on device, write FP16 value to lower 16 bits via view
+        result = torch.zeros(1, dtype=torch.int32, device=device)
+        result.view(torch.float16)[0] = scale_bmm2
+        return result
+    elif data_dtype == torch.bfloat16:
+        # Create int32 buffer on device, write BF16 value to lower 16 bits via view
+        result = torch.zeros(1, dtype=torch.int32, device=device)
+        result.view(torch.bfloat16)[0] = scale_bmm2
+        return result
+    else:
+        # FP8, INT8, etc. use FP32 accumulation - create FP32 tensor and view as int32
+        return torch.tensor([scale_bmm2], dtype=torch.float32, device=device).view(
+            torch.int32
+        )
+
+
 @functools.cache
 def get_fmha_module(
     dtype_q: torch.dtype,
@@ -3766,10 +3805,12 @@ def fmha_v2_prefill_deepseek(
 
 @flashinfer_api
 def trtllm_fmha_v2_prefill(
-    query: torch.Tensor,
-    kv_cache: torch.Tensor,
+    qkv: Union[
+        torch.Tensor,
+        Tuple[torch.Tensor, torch.Tensor],
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ],
     workspace_buffer: torch.Tensor,
-    block_tables: torch.Tensor,
     seq_lens: torch.Tensor,
     max_q_len: int,
     max_kv_len: int,
@@ -3778,39 +3819,32 @@ def trtllm_fmha_v2_prefill(
     batch_size: int,
     cum_seq_lens_q: torch.Tensor,
     cum_seq_lens_kv: torch.Tensor,
+    block_tables: Optional[torch.Tensor] = None,
     out: Optional[Union[torch.Tensor, FP4Tensor]] = None,
     out_dtype: Optional[Union[torch.dtype, str]] = None,
-    kv_layout: str = "HND",
-    input_layout: str = "PACKED_QKV",
+    kv_layout: Optional[str] = "HND",
+    input_layout: Optional[str] = "PACKED_QKV",
     sinks: Optional[List[torch.Tensor]] = None,
     pos_encoding_mode: Optional[str] = "NONE",
     logits_soft_cap_scale: Optional[float] = None,
     mask_mode: Optional[str] = "causal",
-    window_left: int = -1,
+    window_left: Optional[int] = -1,
     chunked_attention_size: Optional[int] = 0,
     non_blocking: Optional[bool] = True,
     save_softmax_stats: Optional[bool] = False,
-    # enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
     """
-    TRT-LLM FMHAv2 prefill (context) attention.
-
-    This function provides a unified interface to the TRT-LLM FMHAv2 kernel library,
-    supporting multiple GPU architectures (Ampere, Ada, Hopper) with automatic kernel
-    selection based on hardware capabilities and feature requirements.
-
     Parameters
     ----------
-    query : torch.Tensor
-        query tensor with shape [num_tokens, num_heads, head_dim]
-    kv_cache : torch.Tensor
-        Combined KV cache tensor with shape [num_pages, 2, num_kv_heads, page_size, head_dim]
-        if :attr:`kv_layout` is "HND", or [num_pages, 2, page_size, num_kv_heads, head_dim]
-        if :attr:`kv_layout` is "NHD". The second dimension must be 2, where kv_cache[:, 0, ...]
-        is the key cache and kv_cache[:, 1, ...] is the value cache.
-
-        Note: Tuple format (k_cache, v_cache) is NOT supported. If you have separate K and V
-        tensors, combine them using: ``kv_cache = torch.stack([k_cache, v_cache], dim=1)``
+    qkv: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+        If qkv is a torch.Tensor, it is a packed QKV tensor with shape [tokens, 3, H, D]
+        If qkv is a tuple of two tensors, it is a tuple of (Q, paged_KV) where paged_KV tensor is combined KV cache tensor
+        with shape [num_pages, 2, num_kv_heads, page_size, head_dim] if :attr:`kv_layout` is "HND",
+        or [num_pages, 2, page_size, num_kv_heads, head_dim] if :attr:`kv_layout` is "NHD".
+        The second dimension must be 2, where kv_cache[:, 0, ...] is the key cache and kv_cache[:, 1, ...] is the value cache.
+        Q is query tensor with shape [num_tokens, num_heads, head_dim]
+        If qkv is a tuple of three tensors, it is a tuple of (Q, K, V) where
+        K and V are key and value tensors with shape [num_tokens, num_kv_heads, page_size, head_dim]. Q is same as in (Q, paged_KV) format.
     workspace_buffer : torch.Tensor. Must be initialized to 0 for its first use.
         workspace
     block_tables : torch.Tensor
@@ -3856,11 +3890,6 @@ def trtllm_fmha_v2_prefill(
         Whether to copy the input tensors to the device asynchronously. Defaults to True.
     save_softmax_stats: Optional[bool] = False
         Whether to save the softmax statistics. Defaults to False.
-
-    (TODO)
-    enable_pdl : Optional[bool] = None
-        Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
-        Defaults to ``None``, which means it will be enabled if the device supports PDL.
     Returns
     -------
     out: Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]
@@ -3868,77 +3897,94 @@ def trtllm_fmha_v2_prefill(
         If return_lse is True, the output will be a tuple of two tensors, the first is the output tensor, the second is the lse tensor.
         If return_lse is False, the output will be a single tensor.
     """
+    # Check for input layout against qkv format
+    if isinstance(qkv, torch.Tensor):
+        # Packed QKV: [tokens, 3, H, D]
+        if qkv.dim() < 2 or qkv.shape[1] != 3:
+            raise ValueError(
+                f"Packed QKV tensor must have shape [tokens, 3, H, D] with dim 1 == 3. "
+                f"Got shape {qkv.shape}"
+            )
+        # For PACKED_QKV layout, C++ kernel expects the full packed tensor, not unbinded.
+        # Pass the packed tensor as query; k_cache and v_cache are placeholders for API compatibility.
+        # C++ will use q.data_ptr() as qkv_packed_d.
+        query = qkv  # Full packed tensor [tokens, 3, H, D]
+        k_cache, v_cache = qkv, qkv
+        input_layout = "PACKED_QKV"
 
-    """
-    plan:
-        num_heads, head_dim_qk, head_dim_vo, page_size, custom_mask (maybe not now),
-        causal, pos_encoding_mode (alibi or none), window_left, logits_soft_cap, sm_scale,
-        q_data_type, kv_data_type, o_data_type, non_blocking (schedule_mode)
+    elif isinstance(qkv, tuple):
+        if len(qkv) == 2:
+            # (Q, paged_KV) format
+            query, kv_cache = qkv
 
-    run:
-        q, paged_kv_cache, out, lse, save_softmax_stats, enable_pdl, sinks
+            # Validate paged KV cache format
+            if kv_cache.dim() < 2 or kv_cache.shape[1] != 2:
+                raise ValueError(
+                    f"Paged KV cache must have shape [num_pages, 2, ...] where dim 1 == 2. "
+                    f"Got shape {kv_cache.shape}. "
+                    "For separate K/V tensors, use tuple of 3: (Q, K, V)"
+                )
 
-    fused_multihead_attention.cpp:
-        params.b batch size
-        params.h query heads
-        params.d head_dim_qk
-        params.dv head_dim_v
-        s_kv seqlen
-        params.s_q query seqlen (TODO) look at q seqlen when q shorter than kv, cu_q_seqlens and cu_kv_seqlens
+            # TRT-LLM kernel expects HND layout within each page
+            # Convert NHD -> HND if needed
+            if kv_layout == "NHD":
+                # Input: [num_pages, 2, page_size, num_kv_heads, head_dim]
+                # Convert to: [num_pages, 2, num_kv_heads, page_size, head_dim]
+                kv_cache = kv_cache.transpose(-3, -2).contiguous()
 
-        input layout (contiguous, separate, paged) (TODO) only paged for now
-        causal
-        sliding window
-        chunked
-        custom mask
+            # Unbind: [num_pages, 2, H, N, D] -> ([num_pages, H, N, D], [num_pages, H, N, D])
+            k_cache, v_cache = kv_cache.unbind(dim=1)
+            input_layout = "Q_PAGED_KV"
 
-        scale_bmm1 scale for bmm1
-        scale-softmax
-        scale-bmm2
-        softcap-bmm1
-        attention-sinks
+        elif len(qkv) == 3:
+            # (Q, K, V) separate format
+            # For SEPARATE_Q_K_V layout, tensors are 3D: [tokens, heads, head_dim]
+            # NHD format for 3D tensors means [tokens, heads, head_dim] which is
+            # already the expected format - no transpose needed (unlike paged KV
+            # which uses 5D tensors where NHD means a different dimension ordering)
+            query, k_cache, v_cache = qkv
+            input_layout = "SEPARATE_Q_K_V"
 
-        alibi
-        save-softmax
-
-    """
-    # Validate kv_cache format - must be combined tensor, NOT tuple
-    if isinstance(kv_cache, tuple):
-        raise ValueError(
-            "Tuple format (k_cache, v_cache) is not supported. "
-            "Please provide a combined KV cache tensor with shape [num_pages, 2, ...]. "
-            "You can combine separate tensors using: kv_cache = torch.stack([k_cache, v_cache], dim=1)"
+        else:
+            raise ValueError(
+                f"qkv tuple must have 2 or 3 elements: (Q, paged_KV) or (Q, K, V). "
+                f"Got {len(qkv)} elements"
+            )
+    else:
+        raise TypeError(
+            f"qkv must be a torch.Tensor or tuple. Got {type(qkv).__name__}"
         )
 
-    if kv_cache.dim() < 2 or kv_cache.shape[1] != 2:
-        raise ValueError(
-            f"kv_cache must have shape [num_pages, 2, ...] where the second dimension is 2 "
-            f"(for K and V). Got shape {kv_cache.shape}. "
-            "Combine K and V using: kv_cache = torch.stack([k_cache, v_cache], dim=1)"
-        )
+    # ==========================================================================
+    # Extract tensor metadata based on input layout
+    # ==========================================================================
+    if input_layout == "PACKED_QKV":
+        # Packed QKV: query is [tokens, 3, H, D]
+        num_qo_heads = query.shape[2]
+        head_dim_qk = query.shape[3]
+        kv_dtype = query.dtype
+        num_kv_heads = query.shape[2]  # Assume MHA for packed QKV
+        page_size = 0  # Not applicable for packed layouts
+        head_dim_v = query.shape[3]  # Assume same as head_dim_qk
+    elif input_layout == "Q_PAGED_KV":
+        # Q is 3D: [tokens, H, D], Paged KV is 4D: [num_pages, H_kv, page_size, D]
+        num_qo_heads = query.shape[1]
+        head_dim_qk = query.shape[2]
+        kv_dtype = k_cache.dtype
+        num_kv_heads = k_cache.shape[1]
+        page_size = k_cache.shape[2]
+        head_dim_v = v_cache.shape[3]
+    else:
+        # SEPARATE_Q_K_V or CONTIGUOUS_Q_KV: all 3D ragged [tokens, H, D]
+        num_qo_heads = query.shape[1]
+        head_dim_qk = query.shape[2]
+        kv_dtype = k_cache.dtype
+        num_kv_heads = k_cache.shape[1]
+        page_size = 0  # Not applicable for non-paged layouts
+        head_dim_v = v_cache.shape[2]
 
-    # TRT-LLM kernel expects HND layout within each page and K/V interleaved at block level.
-    # The combined kv_cache must be converted to [num_pages, 2, num_kv_heads, page_size, head_dim]
-    # before unbinding, so that k.data_ptr() points to the correctly laid out combined pool.
-    if kv_layout == "NHD":
-        # Input: [num_pages, 2, page_size, num_kv_heads, head_dim]
-        # Convert to: [num_pages, 2, num_kv_heads, page_size, head_dim]
-        kv_cache = kv_cache.transpose(-3, -2).contiguous()
-
-    # unbind transforms [num_pages, 2, H, N, D] to ([num_pages, H, N, D], [num_pages, H, N, D])
-    # Both tensors share storage with the converted kv_cache, preserving the K/V interleaving
-    k_cache, v_cache = kv_cache.unbind(dim=1)
-
-    num_qo_heads = query.shape[1]
-    head_dim_qk = query.shape[2]
-    kv_dtype = k_cache.dtype
-    # After conversion, tensor layout is always HND: [num_pages, num_kv_heads, page_size, head_dim]
-    num_kv_heads = k_cache.shape[1]
-    page_size = k_cache.shape[2]
-    # head_dim_v is at index 3 in both layouts
     # head_dim_vo = 0 means "same as head_dim_qk" (standard attention)
     # head_dim_vo = actual value for MLA where head_dim_v != head_dim_qk
-    head_dim_v = v_cache.shape[3]
     head_dim_vo = head_dim_v if head_dim_v != head_dim_qk else 0
 
     # Determine output dtype
@@ -3967,8 +4013,7 @@ def trtllm_fmha_v2_prefill(
             device=query.device,
         )
 
-    # Convert mask_mode string to integer code
-    # 0=PADDING, 1=CAUSAL, 2=SLIDING_OR_CHUNKED_CAUSAL, 3=CUSTOM_MASK
+    # TODO: See if we can not use these mapping codes for clealiness
     mask_mode_map = {
         "padding": 0,
         "causal": 1,
@@ -3977,9 +4022,6 @@ def trtllm_fmha_v2_prefill(
         "custom": 3,
     }
     mask_mode_code = mask_mode_map.get(mask_mode.lower(), 1)  # default to causal
-
-    # Convert input_layout string to integer code
-    # 0=PACKED_QKV, 1=CONTIGUOUS_Q_KV, 2=Q_PAGED_KV, 3=SEPARATE_Q_K_V
     input_layout_map = {
         "packed_qkv": 0,
         "contiguous_q_kv": 1,
@@ -3989,9 +4031,6 @@ def trtllm_fmha_v2_prefill(
     input_layout_code = input_layout_map.get(
         input_layout.lower(), 2
     )  # default to Q_PAGED_KV
-
-    # Convert output dtype to Data_type integer code
-    # DATA_TYPE_FP16=0, DATA_TYPE_BF16=1, DATA_TYPE_FP32=2, DATA_TYPE_INT8=3, DATA_TYPE_E4M3=4
     dtype_to_code_map = {
         torch.float16: 0,
         torch.float32: 1,
@@ -4038,6 +4077,19 @@ def trtllm_fmha_v2_prefill(
     total_q_tokens = int(cum_seq_lens_q[-1].item())
     total_kv_tokens = int(cum_seq_lens_kv[-1].item())
 
+    # For Q_PAGED_KV layout, expand block_tables from [B, M] to [B, 2, M]
+    # TRT-LLM kernel expects separate K and V block offset arrays.
+    # FlashInfer layout: K for page i is at block index 2*i, V at 2*i+1
+    expanded_block_tables = None
+    if block_tables is not None and input_layout.lower() == "q_paged_kv":
+        # K offsets = page_idx * 2 (even blocks)
+        # V offsets = page_idx * 2 + 1 (odd blocks)
+        expanded_block_tables = torch.stack(
+            [block_tables * 2, block_tables * 2 + 1], dim=1
+        ).contiguous()  # [B, 2, M]
+
+    scale_bmm2_d = _create_scale_bmm2_d_tensor(scale_bmm2, query.dtype, query.device)
+
     module.run(
         query,  # Q tensor
         k_cache,  # K tensor
@@ -4046,7 +4098,7 @@ def trtllm_fmha_v2_prefill(
         workspace_buffer,  # Workspace buffer
         workspace_buffer.numel()
         * workspace_buffer.element_size(),  # Workspace buffer size in bytes
-        block_tables,  # Block tables
+        expanded_block_tables,  # Expanded block tables [B, 2, M] or None
         page_size,
         seq_lens,  # Sequence length for kv_cache
         cum_seq_lens_q,  # Cumulative sequence length for query
@@ -4061,75 +4113,15 @@ def trtllm_fmha_v2_prefill(
         mask_mode_code,  # Attention mask type
         scale_softmax,  # Softmax scale
         scale_bmm1,  # BMM1 scale
-        scale_bmm2,  # BMM2 scale
+        scale_bmm2,  # BMM2 scale (float, still needed for set_alpha in C++)
         window_left,  # Window left
         chunked_attention_size,  # Chunked attention size
         pos_encoding_mode == "ALIBI",  # Alibi mode
         softcapping_scale,  # Softcapping scale (0.0 = disabled)
+        scale_bmm2_d,  # Pre-populated scale_bmm2 on device (avoids cudaMemcpy)
         lse,  # Optional LSE tensor (None if not saving softmax stats)
         sinks,  # Optional sinks tensor
     )
-
-    # if input_layout == "PAGED_QKV":
-    #     # paged_run
-    #     module.paged_run(
-    #         query,           # Q tensor
-    #         k_cache,         # K tensor
-    #         v_cache,         # V tensor
-    #         out,             # Output tensor
-    #         workspace_buffer, # Workspace buffer
-    #         workspace_buffer.size() * workspace_buffer.element_size(), # Workspace buffer size in bytes
-    #         block_tables,    # Block tables
-    #         page_size,
-    #         seq_lens,        # Sequence length for kv_cache
-    #         cum_seq_lens_q,  # Cumulative sequence length for query
-    #         cum_seq_lens_kv,  # Cumulative sequence length for kv_cache
-    #         input_layout,    # Input layout
-    #         o_dtype,         # Output dtype
-    #         max_q_len,        # Max sequence length for query
-    #         max_kv_len,       # Max sequence length for kv_cache
-    #         batch_size,       # Batch size
-    #         mask_mode_code,  # Attention mask type
-    #         scale_softmax,   # Softmax scale
-    #         scale_bmm1,      # BMM1 scale
-    #         scale_bmm2,      # BMM2 scale
-    #         window_left,     # Window left
-    #         chunked_attention_size,  # Chunked attention size
-    #         pos_encoding_mode == "ALIBI",  # Alibi mode
-    #         softcapping_scale,  # Softcapping scale (0.0 = disabled)
-    #         lse,               # Optional LSE tensor (None if not saving softmax stats)
-    #         sinks,             # Optional sinks tensor
-    #     )
-    # else:
-    #     # ragged_run
-    #     module.ragged_run(
-    #         query,           # Q tensor
-    #         k_cache,         # K tensor
-    #         v_cache,         # V tensor
-    #         out,             # Output tensor
-    #         workspace_buffer, # Workspace buffer
-    #         workspace_buffer.size() * workspace_buffer.element_size(), # Workspace buffer size in bytes
-    #         block_tables,    # Block tables
-    #         page_size,
-    #         seq_lens,        # Sequence length for kv_cache
-    #         cum_seq_lens_q,  # Cumulative sequence length for query
-    #         cum_seq_lens_kv,  # Cumulative sequence length for kv_cache
-    #         input_layout,    # Input layout
-    #         o_dtype,         # Output dtype
-    #         max_q_len,        # Max sequence length for query
-    #         max_kv_len,       # Max sequence length for kv_cache
-    #         batch_size,       # Batch size
-    #         mask_mode_code,  # Attention mask type
-    #         scale_softmax,   # Softmax scale
-    #         scale_bmm1,      # BMM1 scale
-    #         scale_bmm2,      # BMM2 scale
-    #         window_left,     # Window left
-    #         chunked_attention_size,  # Chunked attention size
-    #         pos_encoding_mode == "ALIBI",  # Alibi mode
-    #         softcapping_scale,  # Softcapping scale (0.0 = disabled)
-    #         lse,               # Optional LSE tensor (None if not saving softmax stats)
-    #         sinks,             # Optional sinks tensor
-    #     )
 
     if save_softmax_stats:
         return out, lse

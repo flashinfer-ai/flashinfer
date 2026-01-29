@@ -3,6 +3,25 @@ from collections import namedtuple
 from enum import IntEnum
 from dataclasses import asdict
 
+copyright = r"""/*
+* SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION &
+* AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
+*
+* Licensed under the Apache License, Version 2.0 (the "License");
+* you may not use this file except in compliance with the License.
+* You may obtain a copy of the License at
+*
+* http://www.apache.org/licenses/LICENSE-2.0
+*
+* Unless required by applicable law or agreed to in writing, software
+* distributed under the License is distributed on an "AS IS" BASIS,
+* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+* See the License for the specific language governing permissions and
+* limitations under the License.
+*/
+"""
+
+
 sm2name = {
     70: "volta",
     72: "volta",
@@ -263,23 +282,26 @@ def encode_name(kernel_spec):
             tma_or_ldgsts = "_tma"
         if kernel_spec.warp_specialization:
             warp_specialization_tag = "_ws"
-            # hopper warp-specialized kernels has specialized optimization for cases without alibi.
-            if kernel_spec.alibi:
-                feature_tags += "_alibi"
-            if kernel_spec.return_softmax_stats:
-                feature_tags += "_softmax"
         else:
             warp_specialization_tag = ""
     else:
         tma_or_ldgsts = ""
         warp_specialization_tag = ""
 
+    # Add alibi and return_softmax_stats to feature_tags for all kernels
+    # to ensure unique filenames across all kernel configurations
+    if kernel_spec.alibi:
+        feature_tags += "_alibi"
+    if kernel_spec.return_softmax_stats:
+        feature_tags += "_softmax"
     if kernel_spec.enable_attn_logit_softcapping:
         feature_tags += "_softcapping"
     if kernel_spec.sage_block_sizes:
         feature_tags += f"_sage_{'_'.join(map(str, kernel_spec.sage_block_sizes))}"
     if kernel_spec.output_dtype:
         feature_tags += f"_output_{kernel_spec.output_dtype}"
+    if kernel_spec.is_mtp:
+        feature_tags += "_mtp"
     if kernel_spec.ctas_per_head > 1:
         fmt = (
             "fmha_v{version}{il_tag}_{dtype}_"
