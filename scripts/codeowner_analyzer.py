@@ -561,14 +561,17 @@ class CodeOwnersAnalyzer:
 
         # Build merged list: overrides first, then computed (excluding duplicates)
         # Override users are always preserved; only computed users are truncated
+        # Use case-insensitive comparison since GitHub usernames are case-insensitive
         merged = list(override_usernames)
+        merged_lower = {u.lower() for u in merged}
         num_overrides = len(merged)
         remaining_slots = max(0, self.top_n_owners - num_overrides)
 
         for username in computed_usernames:
-            if username not in merged:
+            if username.lower() not in merged_lower:
                 if remaining_slots > 0:
                     merged.append(username)
+                    merged_lower.add(username.lower())
                     remaining_slots -= 1
 
         return merged
