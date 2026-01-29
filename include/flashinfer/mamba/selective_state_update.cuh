@@ -264,7 +264,7 @@ __global__ void selective_state_update_kernel_simple(SelectiveStateUpdateParams 
 
 template <typename input_t, typename weight_t, typename matrixA_t, typename state_t,
           int rowsPerStage, int dim, int dstate, uint8_t numStages>
-struct SharedStorage {
+struct SharedStorageVertical {
   alignas(128) state_t state[numStages][rowsPerStage * dstate];
   alignas(alignof(PackedAligned<input_t>)) input_t x[dim];
   float out[dim];  // dt is special cause we're gonna store input in there as well
@@ -278,12 +278,100 @@ struct SharedStorage {
   barrier_t bar_consumers;
 };
 
+template <typename state_t, int DIM, int DSTATE, int rowsPerStage, int numStages, bool readState,
+          bool writeState, typename SramT>
+__device__ __forceinline__ void producer_func_vertical(SramT& sram, CUtensorMap const& tensorState,
+                                                       int batch, int head) {
+#ifdef FLASHINFER_MAMBA_ENABLE_SM90
+  namespace cde = cuda::device::experimental;
+
+  auto constexpr stagesReadOnly = numStages;
+  auto constexpr stagesBoth = DIM / rowsPerStage - numStages;
+  auto constexpr stagesWriteOnly = numStages;
+
+  auto constexpr bytesState = rowsPerStage * DSTATE * sizeof(state_t);
+  auto constexpr bytesToArrive = bytesState;
+
+  // Phase 1: Read only (filling the pipeline)
+#pragma unroll
+  for (int iter = 0; iter < stagesReadOnly; ++iter) {
+    auto const stage = iter % numStages;
+    auto const d = iter * rowsPerStage;
+
+    sram.bar_empty[stage].wait(sram.bar_empty[stage].arrive());
+
+    if constexpr (readState) {
+      cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.state[stage][0], &tensorState, 0, d, head,
+                                                    batch, sram.bar_full[stage]);
+
+      auto const _ = cuda::device::barrier_arrive_tx(sram.bar_full[stage], 1, bytesToArrive);
+    } else {
+      auto const _ = sram.bar_full[stage].arrive();
+    }
+  }
+
+  // Phase 2: Both read and write (steady state)
+#pragma unroll
+  for (int iter = 0; iter < stagesBoth; ++iter) {
+    auto const stage = (stagesReadOnly + iter) % numStages;
+    auto const d_read = (stagesReadOnly + iter) * rowsPerStage;
+    auto const d_write = iter * rowsPerStage;
+
+    sram.bar_empty[stage].wait(sram.bar_empty[stage].arrive());
+
+    if constexpr (readState || writeState) {
+      // Unblock async proxy for writeback
+      cde::fence_proxy_async_shared_cta();
+      // Writeback
+      if constexpr (writeState) {
+        cde::cp_async_bulk_tensor_4d_shared_to_global(&tensorState, 0, d_write, head, batch,
+                                                      &sram.state[stage][0]);
+
+        cde::cp_async_bulk_commit_group();
+        cde::cp_async_bulk_wait_group_read<0>();
+      }
+
+      // Read next
+      if constexpr (readState) {
+        cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.state[stage][0], &tensorState, 0,
+                                                      d_read, head, batch, sram.bar_full[stage]);
+        auto const _ = cuda::device::barrier_arrive_tx(sram.bar_full[stage], 1, bytesToArrive);
+      } else {
+        auto const _ = sram.bar_full[stage].arrive();
+      }
+    } else {
+      auto const _ = sram.bar_full[stage].arrive();
+    }
+  }
+
+  // Phase 3: Write only (draining the pipeline)
+#pragma unroll
+  for (int iter = 0; iter < stagesWriteOnly; ++iter) {
+    auto const stage = (stagesReadOnly + stagesBoth + iter) % numStages;
+    auto const d_write = (stagesBoth + iter) * rowsPerStage;
+
+    sram.bar_empty[stage].wait(sram.bar_empty[stage].arrive());
+
+    if constexpr (writeState) {
+      // Unblock async proxy for writeback
+      cde::fence_proxy_async_shared_cta();
+      cde::cp_async_bulk_tensor_4d_shared_to_global(&tensorState, 0, d_write, head, batch,
+                                                    &sram.state[stage][0]);
+
+      cde::cp_async_bulk_commit_group();
+      cde::cp_async_bulk_wait_group_read<0>();
+    }
+  }
+#endif
+}
+
 template <typename input_t, typename weight_t, typename matrixA_t, typename state_t, int DIM,
           int DSTATE, int consumerWarps, int rowsPerStage, int numStages, bool useStateCache>
 __device__ __forceinline__ void consumer_func_vertical(
     int lane, int warp, float d_value, float dt_value, float dA,
-    SharedStorage<input_t, weight_t, matrixA_t, state_t, rowsPerStage, DIM, DSTATE, numStages>&
-        sram) {
+    SharedStorageVertical<input_t, weight_t, matrixA_t, state_t, rowsPerStage, DIM, DSTATE,
+                          numStages>& sram) {
+#ifdef FLASHINFER_MAMBA_ENABLE_SM90
   namespace cde = cuda::device::experimental;
   for (auto dBegin = 0, stage = 0; dBegin < DIM;
        dBegin += rowsPerStage, stage = (stage + 1) % numStages) {
@@ -364,6 +452,7 @@ __device__ __forceinline__ void consumer_func_vertical(
     cde::fence_proxy_async_shared_cta();
     auto _ = sram.bar_empty[stage].arrive();
   }
+#endif
 }
 
 template <typename input_t, typename weight_t, typename matrixA_t, typename state_t, int DIM,
@@ -397,11 +486,10 @@ __global__ void selective_state_update_kernel_producer_consumer_vertical(
 
   auto const state_batch = (state_batch_indices) ? state_batch_indices[batch] : batch;
 
-  using sram_t =
-      SharedStorage<input_t, weight_t, matrixA_t, state_t, rowsPerStage, DIM, DSTATE, numStages>;
-  // Use dynamic shared memory to allow opting into extended shared memory on SM90+
-  extern __shared__ __align__(128) char smem[];
-  sram_t& sram = *reinterpret_cast<sram_t*>(smem);
+  extern __shared__ uint8_t sbuffer[];
+  using sram_t = SharedStorageVertical<input_t, weight_t, matrixA_t, state_t, rowsPerStage, DIM,
+                                       DSTATE, numStages>;
+  auto& sram = *reinterpret_cast<sram_t*>(sbuffer);
 
   namespace cde = cuda::device::experimental;
   namespace cg = cooperative_groups;
@@ -421,41 +509,22 @@ __global__ void selective_state_update_kernel_producer_consumer_vertical(
 
   if (warp == consumerWarps)  // producer
   {
-    auto const state_offset = (state_batch * nheads + head) * DIM;
+    // auto const state_offset = (state_batch * nheads + head) * DIM;
+    auto const read_state = (state_batch != params.pad_slot_id);
+    auto const write_state = read_state && params.update_state;
 
-    for (int d = 0, stage = 0; d < DIM + rowsPerStage * numStages;
-         d += rowsPerStage, stage = (stage + 1) % numStages) {
-      if (lane == 0) {
-        cg::invoke_one(cg::coalesced_threads(), [&]() {
-          sram.bar_empty[stage].wait(sram.bar_empty[stage].arrive());
-
-          if (state_batch != params.pad_slot_id) {
-            // Writeback
-            if (d >= rowsPerStage * numStages) {
-              cde::cp_async_bulk_tensor_2d_shared_to_global(
-                  &tensorState,
-                  /*x*/ 0,
-                  /*y*/ state_offset + d - rowsPerStage * numStages, &sram.state[stage][0]);
-              cde::cp_async_bulk_commit_group();
-              cde::cp_async_bulk_wait_group_read<0>();
-            }
-
-            if (d < DIM) {
-              cde::cp_async_bulk_tensor_2d_global_to_shared(&sram.state[stage][0], &tensorState,
-                                                            /*x*/ 0, /*y*/ state_offset + d,
-                                                            sram.bar_full[stage]);
-
-              // Unblock the consumers
-              auto constexpr bytesState = rowsPerStage * DSTATE * sizeof(state_t);
-              auto constexpr bytesToArrive = bytesState;
-              auto const _ =
-                  cuda::device::barrier_arrive_tx(sram.bar_full[stage], 1, bytesToArrive);
-            }
-          } else {
-            auto const _ = sram.bar_full[stage].arrive();
-          }
-        });
-      }
+    if (lane == 0) {
+      cg::invoke_one(cg::coalesced_threads(), [&]() {
+        if (read_state && write_state)
+          producer_func_vertical<state_t, DIM, DSTATE, rowsPerStage, numStages, true, true>(
+              sram, tensorState, state_batch, head);
+        else if (read_state && !write_state)
+          producer_func_vertical<state_t, DIM, DSTATE, rowsPerStage, numStages, true, false>(
+              sram, tensorState, state_batch, head);
+        else
+          producer_func_vertical<state_t, DIM, DSTATE, rowsPerStage, numStages, false, false>(
+              sram, tensorState, state_batch, head);
+      });
     }
   } else {  // consumers
 
@@ -553,11 +622,11 @@ struct SharedStorageHorizontal {
   barrier_t bar_consumers;
 };
 
-template <typename state_t, int DIM, int DSTATE, int colsPerStage, int numStages,
-          bool useStateCache, typename SramT>
+template <typename state_t, int DIM, int DSTATE, int colsPerStage, int numStages, bool readState,
+          bool writeState, typename SramT>
 __device__ __forceinline__ void producer_func_horizontal(SramT& sram,
-                                                         CUtensorMap const& tensorState,
-                                                         int state_offset) {
+                                                         CUtensorMap const& tensorState, int batch,
+                                                         int head) {
   namespace cde = cuda::device::experimental;
 
   auto constexpr stagesReadOnly = numStages;
@@ -575,9 +644,9 @@ __device__ __forceinline__ void producer_func_horizontal(SramT& sram,
 
     sram.bar_empty[stage].wait(sram.bar_empty[stage].arrive());
 
-    if constexpr (useStateCache) {
-      cde::cp_async_bulk_tensor_2d_global_to_shared(&sram.state[stage][0], &tensorState, /*x*/ i,
-                                                    /*y*/ state_offset, sram.bar_full[stage]);
+    if constexpr (readState) {
+      cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.state[stage][0], &tensorState, i, 0, head,
+                                                    batch, sram.bar_full[stage]);
       auto const _ = cuda::device::barrier_arrive_tx(sram.bar_full[stage], 1, bytesToArrive);
     } else {
       auto const _ = sram.bar_full[stage].arrive();
@@ -593,20 +662,25 @@ __device__ __forceinline__ void producer_func_horizontal(SramT& sram,
 
     sram.bar_empty[stage].wait(sram.bar_empty[stage].arrive());
 
-    if constexpr (useStateCache) {
+    if constexpr (readState || writeState) {
       // Unblock async proxy for writeback
       cde::fence_proxy_async_shared_cta();
       // Writeback
-      cde::cp_async_bulk_tensor_2d_shared_to_global(&tensorState, /*x*/ i_write,
-                                                    /*y*/ state_offset, &sram.state[stage][0]);
-      cde::cp_async_bulk_commit_group();
-      cde::cp_async_bulk_wait_group_read<0>();
+      if constexpr (writeState) {
+        cde::cp_async_bulk_tensor_4d_shared_to_global(&tensorState, i_write, 0, head, batch,
+                                                      &sram.state[stage][0]);
+        cde::cp_async_bulk_commit_group();
+        cde::cp_async_bulk_wait_group_read<0>();
+      }
 
       // Read next
-      cde::cp_async_bulk_tensor_2d_global_to_shared(&sram.state[stage][0], &tensorState,
-                                                    /*x*/ i_read, /*y*/ state_offset,
-                                                    sram.bar_full[stage]);
-      auto const _ = cuda::device::barrier_arrive_tx(sram.bar_full[stage], 1, bytesToArrive);
+      if constexpr (readState) {
+        cde::cp_async_bulk_tensor_4d_global_to_shared(&sram.state[stage][0], &tensorState, i_read,
+                                                      0, head, batch, sram.bar_full[stage]);
+        auto const _ = cuda::device::barrier_arrive_tx(sram.bar_full[stage], 1, bytesToArrive);
+      } else {
+        auto const _ = sram.bar_full[stage].arrive();
+      }
     } else {
       auto const _ = sram.bar_full[stage].arrive();
     }
@@ -620,11 +694,11 @@ __device__ __forceinline__ void producer_func_horizontal(SramT& sram,
 
     sram.bar_empty[stage].wait(sram.bar_empty[stage].arrive());
 
-    if constexpr (useStateCache) {
+    if constexpr (writeState) {
       // Unblock async proxy for writeback
       cde::fence_proxy_async_shared_cta();
-      cde::cp_async_bulk_tensor_2d_shared_to_global(&tensorState, /*x*/ i_write,
-                                                    /*y*/ state_offset, &sram.state[stage][0]);
+      cde::cp_async_bulk_tensor_4d_shared_to_global(&tensorState, i_write, 0, head, batch,
+                                                    &sram.state[stage][0]);
       cde::cp_async_bulk_commit_group();
       cde::cp_async_bulk_wait_group_read<0>();
     }
@@ -781,15 +855,19 @@ __global__ void selective_state_update_kernel_producer_consumer_horizontal(
 
   if (warp == consumerWarps)  // producer
   {
-    auto const state_offset = (state_batch * nheads + head) * DIM;
+    auto const read_state = (state_batch != params.pad_slot_id);
+    auto const write_state = read_state && params.update_state;
 
     cg::invoke_one(cg::coalesced_threads(), [&]() {
-      if (state_batch != params.pad_slot_id)
-        producer_func_horizontal<state_t, DIM, DSTATE, colsPerStage, numStages, true>(
-            sram, tensorState, state_offset);
+      if (read_state && write_state)
+        producer_func_horizontal<state_t, DIM, DSTATE, colsPerStage, numStages, true, true>(
+            sram, tensorState, state_batch, head);
+      else if (read_state && !write_state)
+        producer_func_horizontal<state_t, DIM, DSTATE, colsPerStage, numStages, true, false>(
+            sram, tensorState, state_batch, head);
       else
-        producer_func_horizontal<state_t, DIM, DSTATE, colsPerStage, numStages, false>(
-            sram, tensorState, state_offset);
+        producer_func_horizontal<state_t, DIM, DSTATE, colsPerStage, numStages, false, false>(
+            sram, tensorState, state_batch, head);
     });
   } else {  // consumers
 
@@ -1000,19 +1078,20 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, cudaStream_t
       auto nh = params.nheads;
       auto dim = params.dim;
 
-      FLASHINFER_CHECK(reinterpret_cast<uintptr_t>(params.state) % 128 ==
-                       0);  // TMA requires 128B aligned
-      auto tensorState = tma::createTensorMap<state_t>(
-          params.state, params.state_cache_size * nh * dim, DSTATE, rowsPerStage, DSTATE);
+      auto state_tensor =
+          tma::buildNdDescriptor(typeid(state_t),
+                                 /*shapes*/ {DSTATE, DIM, nh, params.state_cache_size},
+                                 /*strides*/ {1, DSTATE, DSTATE * DIM, params.state_stride_batch},
+                                 /*tiles*/ {DSTATE, rowsPerStage, 1, 1}, params.state);
 
       // Calculate shared memory size and opt-in to extended shared memory
-      using sram_t = SharedStorage<input_t, weight_t, matrixA_t, state_t, rowsPerStage, DIM, DSTATE,
-                                   numStages>;
+      using sram_t = SharedStorageVertical<input_t, weight_t, matrixA_t, state_t, rowsPerStage, DIM,
+                                           DSTATE, numStages>;
       constexpr size_t smem_size = sizeof(sram_t);
       FLASHINFER_CUDA_CHECK(
           cudaFuncSetAttribute(scan_func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
-      scan_func<<<grid, block, smem_size, stream>>>(params, tensorState);
+      scan_func<<<grid, block, smem_size, stream>>>(params, state_tensor);
     };
 
     auto dispatch_dstate = [&]<int DIM, int DSTATE>() {
@@ -1094,10 +1173,16 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, cudaStream_t
           auto nh = params.nheads;
           auto dim = params.dim;
 
-          FLASHINFER_CHECK(reinterpret_cast<uintptr_t>(params.state) % 128 ==
-                           0);  // TMA requires 128B aligned
-          auto tensorState = tma::createTensorMap<state_t>(
-              params.state, params.state_cache_size * nh * dim, DSTATE, DIM, stageCols);
+          // FLASHINFER_CHECK(reinterpret_cast<uintptr_t>(params.state) % 128 ==
+          //                  0);  // TMA requires 128B aligned
+          // auto tensorState = tma::createTensorMap<state_t>(
+          //     params.state, params.state_cache_size * nh * dim, DSTATE, DIM, stageCols);
+
+          auto state_tensor = tma::buildNdDescriptor(
+              typeid(state_t),
+              /*shapes*/ {DSTATE, DIM, nh, params.state_cache_size},
+              /*strides*/ {1, DSTATE, DSTATE * DIM, params.state_stride_batch},
+              /*tiles*/ {stageCols, DIM, 1, 1}, params.state);
           static_assert(DSTATE % stageCols == 0 && DSTATE >= stageCols);
 
           // Calculate shared memory size and opt-in to extended shared memory
@@ -1107,7 +1192,7 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, cudaStream_t
           FLASHINFER_CUDA_CHECK(cudaFuncSetAttribute(
               scan_func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
-          scan_func<<<grid, block, smem_size, stream>>>(params, tensorState);
+          scan_func<<<grid, block, smem_size, stream>>>(params, state_tensor);
           return true;
         }
         return false;
