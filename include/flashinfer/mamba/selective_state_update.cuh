@@ -38,10 +38,9 @@ constexpr unsigned warpSize = 32;
 struct SelectiveStateUpdateParams {
   uint32_t batch{}, nheads{}, dim{}, dstate{}, ngroups{}, state_cache_size{};
   int32_t pad_slot_id{-1};
-  bool dt_softplus{false};
 
   int64_t x_stride_batch{}, dt_stride_batch{}, B_stride_batch{}, C_stride_batch{},
-      out_stride_batch{}, z_stride_batch{};
+      out_stride_batch{}, z_stride_batch{}, state_stride_batch{};
 
   void* __restrict__ state{nullptr};  // state_t: (state_cache_size, nheads, dim, dstate)
   void* __restrict__ x{nullptr};      // input_t: (batch, nheads, dim)
@@ -55,6 +54,9 @@ struct SelectiveStateUpdateParams {
   void* __restrict__ z{nullptr};  // input_t: (batch, nheads, dim)
   void* __restrict__ output{nullptr};               // input_t: (batch, nheads, dim)
   void* __restrict__ state_batch_indices{nullptr};  // state_batch_indices: (batch,)
+
+  bool dt_softplus{false};
+  bool update_state{true};
 };
 
 __forceinline__ __device__ float softplus(float x) { return __logf(1.f + __expf(x)); }
@@ -135,20 +137,14 @@ struct SharedStorageSimple {
 template <typename input_t, typename weight_t, typename matrixA_t, typename state_t, int DIM,
           int DSTATE, int numWarps>
 __global__ void selective_state_update_kernel_simple(SelectiveStateUpdateParams params) {
-  auto* __restrict__ output =
-      reinterpret_cast<input_t*>(params.output);  // output: (batch, nheads, dim)
-  auto* __restrict__ state =
-      reinterpret_cast<state_t*>(params.state);  // state: (batch, nheads, dim, dstate)
+  auto* __restrict__ output = reinterpret_cast<input_t*>(params.output);
+  auto* __restrict__ state = reinterpret_cast<state_t*>(params.state);
 
-  auto const* __restrict__ x =
-      reinterpret_cast<input_t const*>(params.x);  // x: (batch, nheads, dim)
-  auto const* __restrict__ dt =
-      reinterpret_cast<weight_t const*>(params.dt);                           // dt: (batch, nheads)
-  auto const* __restrict__ A = reinterpret_cast<matrixA_t const*>(params.A);  // A: (nheads)
-  auto const* __restrict__ B =
-      reinterpret_cast<input_t const*>(params.B);  // B: (batch, ngroups, dstate)
-  auto const* __restrict__ C =
-      reinterpret_cast<input_t const*>(params.C);  // C: (batch, ngroups, dstate)
+  auto const* __restrict__ x = reinterpret_cast<input_t const*>(params.x);
+  auto const* __restrict__ dt = reinterpret_cast<weight_t const*>(params.dt);
+  auto const* __restrict__ A = reinterpret_cast<matrixA_t const*>(params.A);
+  auto const* __restrict__ B = reinterpret_cast<input_t const*>(params.B);
+  auto const* __restrict__ C = reinterpret_cast<input_t const*>(params.C);
   auto const* __restrict__ D = reinterpret_cast<weight_t const*>(params.D);  // D: (nheads, dim)
   auto const* __restrict__ dt_bias = reinterpret_cast<weight_t const*>(params.dt_bias);  // (nheads)
   auto const* __restrict__ z = reinterpret_cast<input_t const*>(params.z);
@@ -168,7 +164,7 @@ __global__ void selective_state_update_kernel_simple(SelectiveStateUpdateParams 
   auto warp = threadIdx.y;
 
   auto const state_batch = (state_batch_indices) ? state_batch_indices[batch] : batch;
-  state += (state_batch * nheads + head) * DIM * DSTATE;
+  state += state_batch * params.state_stride_batch + head * DIM * DSTATE;
 
   __shared__ SharedStorageSimple<input_t, DIM, DSTATE> sram;
 
@@ -875,9 +871,22 @@ __global__ void selective_state_update_kernel_producer_consumer_horizontal(
 
 #endif  // FLASHINFER_MAMBA_ENABLE_SM100
 
+template <typename T, size_t N>
+std::string format_array(const T (&arr)[N]) {
+  std::ostringstream oss;
+  for (size_t i = 0; i < N; ++i) {
+    if (i > 0) oss << ", ";
+    oss << arr[i];
+  }
+  return oss.str();
+}
+
 template <typename input_t, typename weight_t, typename matrixA_t, typename state_t>
 void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, cudaStream_t stream) {
   auto [sm_major, sm_minor] = GetCudaComputeCapability();
+
+  constexpr int allowed_dstates[] = {64, 128, 256};
+  constexpr int allowed_dims[] = {64, 128, 256};
 
 #ifdef FLASHINFER_MAMBA_ENABLE_SM100
   if (sm_major < 10)  // pre-Blackwell
@@ -921,32 +930,31 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, cudaStream_t
                                            numWarps><<<grid, block, 0, stream>>>(params);
     };
 
-    auto dispatch_dstate = [&]<int DIM>() {
-      switch (params.dstate) {
-        case 64:
-          dispatch_dim_dstate.template operator()<DIM, 64>();
-          break;
-        case 128:
-          dispatch_dim_dstate.template operator()<DIM, 128>();
-          break;
-        case 256:
-          dispatch_dim_dstate.template operator()<DIM, 256>();
-          break;
-        default:
-          FLASHINFER_CHECK(false, "Unsupported dstate value. Supported values are: 64, 128, 256");
+    auto dispatch_dstate = [&]<int DIM, int DSTATE>() {
+      if (params.dstate == DSTATE) {
+        dispatch_dim_dstate.template operator()<DIM, DSTATE>();
+        return true;
       }
+      return false;
     };
 
-    switch (params.dim) {
-      case 64:
-        dispatch_dstate.template operator()<64>();
-        break;
-      case 128:
-        dispatch_dstate.template operator()<128>();
-        break;
-      default:
-        FLASHINFER_CHECK(false, "Unsupported dim value. Supported values are: 64, 128");
-    }
+    auto dispatch_dim = [&]<int DIM>() {
+      if (params.dim == DIM) {
+        bool dispatched = [&]<int... Ds>(std::integer_sequence<int, Ds...>) {
+          return (dispatch_dstate.template operator()<DIM, allowed_dstates[Ds]>() || ...);
+        }(std::make_integer_sequence<int, sizeof(allowed_dstates) / sizeof(allowed_dstates[0])>{});
+        FLASHINFER_CHECK(dispatched, "Unsupported dstate value: ", params.dstate,
+                         ".\nSupported values: ", format_array(allowed_dstates));
+        return true;
+      }
+      return false;
+    };
+
+    bool dim_dispatched = [&]<int... Ds>(std::integer_sequence<int, Ds...>) {
+      return (dispatch_dim.template operator()<allowed_dims[Ds]>() || ...);
+    }(std::make_integer_sequence<int, sizeof(allowed_dims) / sizeof(allowed_dims[0])>{});
+    FLASHINFER_CHECK(dim_dispatched, "Unsupported dim value: ", params.dim,
+                     ".\nSupported values: ", format_array(allowed_dims));
   }
 #ifdef FLASHINFER_MAMBA_ENABLE_SM90
   else {
@@ -1007,38 +1015,39 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, cudaStream_t
       scan_func<<<grid, block, smem_size, stream>>>(params, tensorState);
     };
 
-    auto dispatch_dstate = [&]<int DIM>() {
-      switch (params.dstate) {
-        case 64:
-          dispatch_dim_dstate.template operator()<DIM, 64>();
-          break;
-        case 128:
-          dispatch_dim_dstate.template operator()<DIM, 128>();
-          break;
-        case 256:
-          dispatch_dim_dstate.template operator()<DIM, 256>();
-          break;
-        default:
-          FLASHINFER_CHECK(false, "Unsupported dstate value. Supported values are: 64, 128, 256");
+    auto dispatch_dstate = [&]<int DIM, int DSTATE>() {
+      if (params.dstate == DSTATE) {
+        dispatch_dim_dstate.template operator()<DIM, DSTATE>();
+        return true;
       }
+      return false;
     };
 
-    switch (params.dim) {
-      case 64:
-        dispatch_dstate.template operator()<64>();
-        break;
-      case 128:
-        dispatch_dstate.template operator()<128>();
-        break;
-      default:
-        FLASHINFER_CHECK(false, "Unsupported dim value. Supported values are: 64, 128");
-    }
+    auto dispatch_dim = [&]<int DIM>() {
+      if (params.dim == DIM) {
+        bool dispatched = [&]<int... Ds>(std::integer_sequence<int, Ds...>) {
+          return (dispatch_dstate.template operator()<DIM, allowed_dstates[Ds]>() || ...);
+        }(std::make_integer_sequence<int, sizeof(allowed_dstates) / sizeof(allowed_dstates[0])>{});
+        FLASHINFER_CHECK(dispatched, "Unsupported dstate value: ", params.dstate,
+                         ".\nSupported values: ", format_array(allowed_dstates));
+        return true;
+      }
+      return false;
+    };
+
+    bool dim_dispatched = [&]<int... Ds>(std::integer_sequence<int, Ds...>) {
+      return (dispatch_dim.template operator()<allowed_dims[Ds]>() || ...);
+    }(std::make_integer_sequence<int, sizeof(allowed_dims) / sizeof(allowed_dims[0])>{});
+    FLASHINFER_CHECK(dim_dispatched, "Unsupported dim value: ", params.dim,
+                     ".\nSupported values: ", format_array(allowed_dims));
   }
 #endif
 
 #ifdef FLASHINFER_MAMBA_ENABLE_SM100
   else {
     // SM100+ (Blackwell and newer) uses horizontal producer-consumer kernel
+    constexpr int allowed_heads_groups_ratios[] = {1, 8, 16};
+
     auto dispatch_dim_dstate = [&]<int DIM, int DSTATE>() {
       // Alignment checks for vectorized loads in Blackwell kernel
       using load_input_t = PackedAligned<input_t>;
@@ -1073,76 +1082,72 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, cudaStream_t
       constexpr auto totalStages = DSTATE / stageCols;
       constexpr auto numStages = (totalStages >= 4) ? 4 : totalStages;
 
-      auto dispatch_heads_groups_ratio = [&]<int headsGroupsRatio>() {
-        auto scan_func = selective_state_update_kernel_producer_consumer_horizontal<
-            input_t, weight_t, matrixA_t, state_t, DIM, DSTATE, numConsumers, stageCols,
-            headsGroupsRatio, numStages>;
+      auto dispatch_ratio = [&]<int RATIO>() {
+        if (params.nheads / params.ngroups == RATIO) {
+          auto scan_func = selective_state_update_kernel_producer_consumer_horizontal<
+              input_t, weight_t, matrixA_t, state_t, DIM, DSTATE, numConsumers, stageCols, RATIO,
+              numStages>;
 
-        dim3 block(warpSize, numWarps);
-        dim3 grid(params.batch, params.nheads);
+          dim3 block(warpSize, numWarps);
+          dim3 grid(params.batch, params.nheads);
 
-        auto nh = params.nheads;
-        auto dim = params.dim;
+          auto nh = params.nheads;
+          auto dim = params.dim;
 
-        FLASHINFER_CHECK(reinterpret_cast<uintptr_t>(params.state) % 128 ==
-                         0);  // TMA requires 128B aligned
-        auto tensorState = tma::createTensorMap<state_t>(
-            params.state, params.state_cache_size * nh * dim, DSTATE, DIM, stageCols);
-        static_assert(DSTATE % stageCols == 0 && DSTATE >= stageCols);
+          FLASHINFER_CHECK(reinterpret_cast<uintptr_t>(params.state) % 128 ==
+                           0);  // TMA requires 128B aligned
+          auto tensorState = tma::createTensorMap<state_t>(
+              params.state, params.state_cache_size * nh * dim, DSTATE, DIM, stageCols);
+          static_assert(DSTATE % stageCols == 0 && DSTATE >= stageCols);
 
-        // Calculate shared memory size and opt-in to extended shared memory
-        using sram_t = SharedStorageHorizontal<input_t, weight_t, matrixA_t, state_t, DIM, DSTATE,
-                                               stageCols, numStages>;
-        constexpr size_t smem_size = sizeof(sram_t);
-        FLASHINFER_CUDA_CHECK(cudaFuncSetAttribute(
-            scan_func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+          // Calculate shared memory size and opt-in to extended shared memory
+          using sram_t = SharedStorageHorizontal<input_t, weight_t, matrixA_t, state_t, DIM, DSTATE,
+                                                 stageCols, numStages>;
+          constexpr size_t smem_size = sizeof(sram_t);
+          FLASHINFER_CUDA_CHECK(cudaFuncSetAttribute(
+              scan_func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
-        scan_func<<<grid, block, smem_size, stream>>>(params, tensorState);
+          scan_func<<<grid, block, smem_size, stream>>>(params, tensorState);
+          return true;
+        }
+        return false;
       };
 
-      switch (params.nheads / params.ngroups) {
-        case 1:
-          dispatch_heads_groups_ratio.template operator()<1>();
-          break;
-        case 8:
-          dispatch_heads_groups_ratio.template operator()<8>();
-          break;
-        case 16:
-          dispatch_heads_groups_ratio.template operator()<16>();
-          break;
-        default:
-          FLASHINFER_CHECK(false,
-                           "Unsupported nheads/ngroups ratio: ", params.nheads / params.ngroups,
-                           ". Supported values are: 1, 8, 16");
-      }
+      bool ratio_dispatched =
+          [&]<int... Rs>(std::integer_sequence<int, Rs...>) {
+            return (dispatch_ratio.template operator()<allowed_heads_groups_ratios[Rs]>() || ...);
+          }(std::make_integer_sequence<int, sizeof(allowed_heads_groups_ratios) /
+                                                sizeof(allowed_heads_groups_ratios[0])>{});
+      FLASHINFER_CHECK(ratio_dispatched,
+                       "Unsupported nheads/ngroups ratio: ", params.nheads / params.ngroups,
+                       ".\nSupported values: ", format_array(allowed_heads_groups_ratios));
     };
 
-    auto dispatch_dstate = [&]<int DIM>() {
-      switch (params.dstate) {
-        case 64:
-          dispatch_dim_dstate.template operator()<DIM, 64>();
-          break;
-        case 128:
-          dispatch_dim_dstate.template operator()<DIM, 128>();
-          break;
-        case 256:
-          dispatch_dim_dstate.template operator()<DIM, 256>();
-          break;
-        default:
-          FLASHINFER_CHECK(false, "Unsupported dstate value. Supported values are: 64, 128, 256");
+    auto dispatch_dstate = [&]<int DIM, int DSTATE>() {
+      if (params.dstate == DSTATE) {
+        dispatch_dim_dstate.template operator()<DIM, DSTATE>();
+        return true;
       }
+      return false;
     };
 
-    switch (params.dim) {
-      case 64:
-        dispatch_dstate.template operator()<64>();
-        break;
-      case 128:
-        dispatch_dstate.template operator()<128>();
-        break;
-      default:
-        FLASHINFER_CHECK(false, "Unsupported dim value. Supported values are: 64, 128");
-    }
+    auto dispatch_dim = [&]<int DIM>() {
+      if (params.dim == DIM) {
+        bool dispatched = [&]<int... Ds>(std::integer_sequence<int, Ds...>) {
+          return (dispatch_dstate.template operator()<DIM, allowed_dstates[Ds]>() || ...);
+        }(std::make_integer_sequence<int, sizeof(allowed_dstates) / sizeof(allowed_dstates[0])>{});
+        FLASHINFER_CHECK(dispatched, "Unsupported dstate value: ", params.dstate,
+                         ".\nSupported values: ", format_array(allowed_dstates));
+        return true;
+      }
+      return false;
+    };
+
+    bool dim_dispatched = [&]<int... Ds>(std::integer_sequence<int, Ds...>) {
+      return (dispatch_dim.template operator()<allowed_dims[Ds]>() || ...);
+    }(std::make_integer_sequence<int, sizeof(allowed_dims) / sizeof(allowed_dims[0])>{});
+    FLASHINFER_CHECK(dim_dispatched, "Unsupported dim value: ", params.dim,
+                     ".\nSupported values: ", format_array(allowed_dims));
   }
 #endif
 }
