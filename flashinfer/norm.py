@@ -24,7 +24,21 @@ from .api_logging import flashinfer_api
 from .utils import device_support_pdl, register_custom_op, register_fake_op
 
 # Use CUDA JIT implementation instead of CuTe DSL (for debugging/fallback)
+# Also fallback to CUDA JIT if nvidia-cutlass-dsl is not installed
 _USE_CUDA_NORM = os.environ.get("FLASHINFER_USE_CUDA_NORM", "0") == "1"
+
+if not _USE_CUDA_NORM:
+    try:
+        from .cute_dsl.norm import (
+            rmsnorm_cute,
+            qk_rmsnorm_cute,
+            rmsnorm_quant_cute,
+            fused_add_rmsnorm_cute,
+            fused_add_rmsnorm_quant_cute,
+            layernorm_cute,
+        )
+    except ImportError:
+        _USE_CUDA_NORM = True
 
 if _USE_CUDA_NORM:
     from .jit.norm import gen_norm_module
@@ -32,15 +46,6 @@ if _USE_CUDA_NORM:
     @functools.cache
     def get_norm_module():
         return gen_norm_module().build_and_load()
-else:
-    from .cute_dsl.norm import (
-        rmsnorm_cute,
-        qk_rmsnorm_cute,
-        rmsnorm_quant_cute,
-        fused_add_rmsnorm_cute,
-        fused_add_rmsnorm_quant_cute,
-        layernorm_cute,
-    )
 
 
 @flashinfer_api
@@ -466,6 +471,10 @@ def _layernorm_fake(
 
 
 # CuTe-DSL fused RMSNorm + FP4 Quantization kernels
-# These require SM100+ (Blackwell) GPUs
-from .cute_dsl import rmsnorm_fp4quant as rmsnorm_fp4quant
-from .cute_dsl import add_rmsnorm_fp4quant as add_rmsnorm_fp4quant
+# These require SM100+ (Blackwell) GPUs and nvidia-cutlass-dsl
+try:
+    from .cute_dsl import rmsnorm_fp4quant as rmsnorm_fp4quant
+    from .cute_dsl import add_rmsnorm_fp4quant as add_rmsnorm_fp4quant
+except ImportError:
+    # nvidia-cutlass-dsl not installed, these functions will not be available
+    pass

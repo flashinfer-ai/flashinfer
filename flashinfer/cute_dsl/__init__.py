@@ -18,10 +18,19 @@ FlashInfer CuTe-DSL Kernels
 This module provides high-performance GPU kernels implemented using NVIDIA CuTe-DSL.
 """
 
-from .utils import is_cute_dsl_available, make_ptr, get_cutlass_dtype, get_num_sm
+import importlib.util
 
-# Conditionally import CuTe-DSL kernels
+
+def is_cute_dsl_available() -> bool:
+    return (
+        importlib.util.find_spec("cutlass") is not None
+        and importlib.util.find_spec("cutlass.cute") is not None
+    )
+
+
+# Conditionally import CuTe-DSL kernels (including utils which requires cutlass)
 if is_cute_dsl_available():
+    from .utils import make_ptr, get_cutlass_dtype, get_num_sm
     from .blockscaled_gemm import (
         grouped_gemm_nt_masked,
         Sm100BlockScaledPersistentDenseGemmKernel,
@@ -53,15 +62,16 @@ if is_cute_dsl_available():
     )
 
 __all__ = [
-    # Utils (always available)
+    # Always available
     "is_cute_dsl_available",
-    "make_ptr",
-    "get_cutlass_dtype",
-    "get_num_sm",
 ]
 
 if is_cute_dsl_available():
     __all__ += [
+        # Utils (require cutlass)
+        "make_ptr",
+        "get_cutlass_dtype",
+        "get_num_sm",
         # Blockscaled GEMM
         "grouped_gemm_nt_masked",
         "Sm100BlockScaledPersistentDenseGemmKernel",
