@@ -530,7 +530,8 @@ class CodeOwnersAnalyzer:
         """Merge manual overrides with computed owners.
 
         Override users are prepended to the list (indicating primary ownership),
-        and duplicates are removed. The final list is limited to top_n_owners.
+        and duplicates are removed. Override users are always included, even if
+        that exceeds top_n_owners. Only computed owners are subject to truncation.
 
         Note: File-level overrides are handled separately in generate_codeowners_file(),
         since there's no computed ownership for individual files.
@@ -541,7 +542,7 @@ class CodeOwnersAnalyzer:
                 (with @ prefix, e.g., ["@alice", "@bob"])
 
         Returns:
-            Merged list of usernames with overrides first, limited to top_n_owners
+            Merged list of usernames with overrides first (all overrides preserved)
         """
         if not self.owner_overrides:
             return computed_usernames[: self.top_n_owners]
@@ -559,12 +560,18 @@ class CodeOwnersAnalyzer:
         override_usernames = self._normalize_usernames(override_users)
 
         # Build merged list: overrides first, then computed (excluding duplicates)
+        # Override users are always preserved; only computed users are truncated
         merged = list(override_usernames)
+        num_overrides = len(merged)
+        remaining_slots = max(0, self.top_n_owners - num_overrides)
+
         for username in computed_usernames:
             if username not in merged:
-                merged.append(username)
+                if remaining_slots > 0:
+                    merged.append(username)
+                    remaining_slots -= 1
 
-        return merged[: self.top_n_owners]
+        return merged
 
     def generate_codeowners_file(
         self, results: Dict[str, Any], output_file: str = "CODEOWNERS"
