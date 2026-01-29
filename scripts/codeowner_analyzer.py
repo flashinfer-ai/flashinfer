@@ -277,7 +277,7 @@ class CodeOwnersAnalyzer:
                 continue
 
             # Skip test directories unless specifically analyzing tests
-            if "test" in file_path.lower() and not file_path.startswith("./tests/"):
+            if "test" in file_path.lower() and not file_path.startswith("tests/"):
                 continue
 
             # Get directory of the file
