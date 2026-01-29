@@ -2114,10 +2114,8 @@ def trtllm_bf16_moe(
             Must be bfloat16 if provided.
         hidden_states: [seq_len, hidden_size] tensor of input hidden states.
             Must be bfloat16.
-        gemm1_weights: [num_experts, 2*intermediate_size, hidden_size] tensor of first layer weights.
-            Must be bfloat16.
-        gemm2_weights: [num_experts, hidden_size, intermediate_size] tensor of second layer weights.
-            Must be bfloat16.
+        gemm1_weights: [num_experts, 2*intermediate_size // 128, hidden_size // 128, 128] tensor of first layer weights. must be bfloat16.
+        gemm2_weights: [num_experts, hidden_size//128, intermediate_size, 128] tensor of second layer weights. must be bfloat16.
         num_experts: Total number of experts.
         top_k: Number of experts to route to per token.
         n_group: Number of expert groups.
@@ -2133,10 +2131,7 @@ def trtllm_bf16_moe(
             - 3: Llama4 (Top1 -> Sigmoid)
             - 4: RenormalizeNaive (Softmax -> TopK -> Renormalize)
         use_shuffled_weight: Whether to use shuffled weight layout for optimization (default: True).
-        weight_layout: Weight layout format (default: WeightLayout.BlockMajorK).
-            - 0: MajorK - K-major layout [Mn, K]
-            - 1: MajorMn - M-major for A and N-major for B [K, Mn]
-            - 2: BlockMajorK - Blocked along K dimension [K/blockK, Mn, blockK]
+        weight_layout: Weight layout format. must be WeightLayout.BlockMajorK ([K/blockK, Mn, blockK])
         enable_pdl: Whether to enable Programmatic Dependent Launch. Auto-enabled for >= sm90.
         tune_max_num_tokens: Maximum number of tokens for autotuning (default: 8192).
 
@@ -2270,9 +2265,13 @@ def trtllm_fp8_block_scale_moe(
         routing_bias: [num_experts] tensor of routing bias
         hidden_states: [seq_len, hidden_size] tensor of input hidden states
         hidden_states_scale: [hidden_size//128, seq_len] tensor of hidden states block scales
-        gemm1_weights: [num_experts, 2*intermediate_size, hidden_size] tensor of first layer weights
+        gemm1_weights: tensor of first layer weights
+            - [num_experts, 2*intermediate_size, hidden_size] if weight_layout == WeightLayout.MajorK
+            - [num_experts, 2*intermediate_size // 128, hidden_size, 128] if weight_layout == WeightLayout.BlockMajorK
         gemm1_weights_scale: [num_experts, 2*intermediate_size//128, hidden_size//128] tensor of first layer block scales
-        gemm2_weights: [num_experts, hidden_size, intermediate_size] tensor of second layer weights
+        gemm2_weights: tensor of second layer weights
+            - [num_experts, hidden_size, intermediate_size] if weight_layout == WeightLayout.MajorK
+            - [num_experts, hidden_size//128, intermediate_size, 128] if weight_layout == WeightLayout.BlockMajorK
         gemm2_weights_scale: [num_experts, hidden_size//128, intermediate_size//128] tensor of second layer block scales
         num_experts: Total number of experts
         top_k: Number of experts to route to per token
@@ -2283,6 +2282,9 @@ def trtllm_fp8_block_scale_moe(
         local_num_experts: Number of experts handled by this device
         routed_scaling_factor: Scaling factor for routing
         routing_method_type: Type of routing method to use (default: 0)
+        weight_layout: Weight layout format (default: WeightLayout.MajorK). Supported layouts:
+            - 0: MajorK - K-major layout [Mn, K]
+            - 2: BlockMajorK - Blocked along K dimension [K/blockK, Mn, blockK]
         enable_pdl: Whether to enable Programmatic Dependent Launch (PDL). Auto-enabled for >= sm90.
         tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 8192)
     Returns:

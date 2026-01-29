@@ -131,8 +131,8 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
             local_num_experts=num_experts,
             routed_scaling_factor=2.5,
             routing_method_type=RoutingMethodType.DeepSeekV3.value,
-            use_shuffled_weight=True,
-            weight_layout=WeightLayout.BlockMajorK.value,  # weight_layout
+            use_shuffled_weight=False,
+            weight_layout=WeightLayout.MajorK.value,  # weight_layout
             enable_pdl=enable_pdl,
             tune_max_num_tokens=num_tokens
             if tune_max_num_tokens is None
