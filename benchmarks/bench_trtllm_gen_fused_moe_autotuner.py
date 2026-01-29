@@ -358,7 +358,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--activation-type",
         type=enum_type(ActivationType),
-        choices=[e.name for e in ActivationType],
+        metavar=str([e.name for e in ActivationType]),
         required=False,
         default=ActivationType.Swiglu,
         help=f"Type of activation function: {[e.name for e in ActivationType]}",
