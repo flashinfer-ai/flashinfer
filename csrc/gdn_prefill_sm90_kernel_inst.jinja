@@ -18,6 +18,10 @@
 //                      needs_alpha={{ needs_alpha }}, init_state={{ init_state }}
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
+// Ensure cutlass arch types are defined
+#include "cutlass/arch/arch.h"
 
 // Use full path since generated files are in a different directory
 #include "flat/prefill/prefill_kernel_delta_rule_sm90.cuh"
