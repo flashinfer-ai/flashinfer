@@ -19,9 +19,9 @@ from typing import Tuple
 
 import torch
 
-from .api_logging import flashinfer_api
-from .jit.quantization import gen_quantization_module
-from .utils import register_custom_op, register_fake_op
+from ..api_logging import flashinfer_api
+from ..jit.quantization import gen_quantization_module
+from ..utils import register_custom_op, register_fake_op
 
 
 @functools.cache

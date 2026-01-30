@@ -35,7 +35,9 @@ if is_cute_dsl_available():
         add_rmsnorm_fp4quant,
         AddRMSNormFP4QuantKernel,
     )
-    from .mxfp8_quantize import (
+
+    # MXFP8 Quantization - re-exported from quantization module for backward compatibility
+    from ..quantization.mxfp8_quantize_cute_dsl import (
         mxfp8_quantize_cute_dsl,
         MXFP8QuantizeLinearKernel,
         MXFP8QuantizeSwizzledKernel,
