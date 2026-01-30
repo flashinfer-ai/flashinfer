@@ -20,9 +20,11 @@ quantization kernels.
 """
 
 import cutlass.cute as cute
-from cutlass import Float32, Int32, Uint32, Uint64, Uint8
+from cutlass import Float32, Int32, Uint32, Uint64
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
+
+from .fp4_common import habs2, hmax2, bfloat2_habs2, bfloat2_hmax2
 
 
 # =============================================================================
@@ -32,11 +34,8 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 # Scale factor vector size: each scale factor covers 32 elements
 SF_VEC_SIZE = 32
 
-# Maximum representable value in FP8 E4M3 format
-FLOAT8_E4M3_MAX = 448.0
-
-# Precomputed constants
-INV_FLOAT8_E4M3_MAX = 1.0 / FLOAT8_E4M3_MAX  # 1/448
+# Inverse of max representable value in FP8 E4M3 format (1/448)
+INV_FLOAT8_E4M3_MAX = 1.0 / 448.0
 
 # Thread organization constants
 WARP_SIZE = 32
@@ -201,7 +200,10 @@ def half2_to_fp8x2_scaled(
     return Uint32(
         llvm.inline_asm(
             T.i32(),
-            [Uint32(h2).ir_value(loc=loc, ip=ip), Float32(inv_scale).ir_value(loc=loc, ip=ip)],
+            [
+                Uint32(h2).ir_value(loc=loc, ip=ip),
+                Float32(inv_scale).ir_value(loc=loc, ip=ip),
+            ],
             """
             {
                 .reg .b16 h0, h1;
@@ -235,7 +237,10 @@ def bfloat2_to_fp8x2_scaled(
     return Uint32(
         llvm.inline_asm(
             T.i32(),
-            [Uint32(bf2).ir_value(loc=loc, ip=ip), Float32(inv_scale).ir_value(loc=loc, ip=ip)],
+            [
+                Uint32(bf2).ir_value(loc=loc, ip=ip),
+                Float32(inv_scale).ir_value(loc=loc, ip=ip),
+            ],
             """
             {
                 .reg .b32 lo, hi;
@@ -322,6 +327,7 @@ def shuffle_xor_f32(val: Float32, offset: int) -> Float32:
 def reduce_max_4threads(val: Float32) -> Float32:
     """Reduce max across 4 consecutive threads using 2 XOR shuffles."""
     from .fp4_common import fmax_f32
+
     other = shuffle_xor_f32(val, 1)
     val = fmax_f32(val, other)
     other = shuffle_xor_f32(val, 2)
@@ -369,51 +375,99 @@ def compute_sf_index_swizzled_128x4_gpu(
 
 
 # =============================================================================
-# Swizzled SF Size Computation (Host-side)
+# High-Level Helper Functions for MXFP8 Quantization
 # =============================================================================
 
 
-def compute_swizzled_sf_size(M: int, K: int) -> int:
-    """Compute the size of the swizzled scale factor tensor.
-
-    For swizzled layout, scale factors are organized in 128x4 blocks.
-    Each 128x4 block contains 128*4 = 512 scale factor elements.
-
-    Args:
-        M: Number of rows
-        K: Number of columns
-
-    Returns:
-        Total number of scale factor elements needed (including padding)
+@cute.jit
+def half2_max_abs_4(v0: Uint32, v1: Uint32, v2: Uint32, v3: Uint32) -> Uint32:
     """
-    num_sf_per_row = (K + SF_VEC_SIZE - 1) // SF_VEC_SIZE
-    # Pad rows to multiple of 128 for swizzled layout
-    padded_rows = ((M + 127) // 128) * 128
-    # Pad SF columns to multiple of 4
-    padded_sf_cols = ((num_sf_per_row + 3) // 4) * 4
-    return padded_rows * padded_sf_cols
+    Compute max absolute value across 4 half2 values (8 FP16 elements).
+
+    Uses tree reduction: 4 -> 2 -> 1 half2 values.
+    Returns a half2 containing the max absolute value in both lanes.
+    """
+    abs0 = habs2(v0)
+    abs1 = habs2(v1)
+    abs2 = habs2(v2)
+    abs3 = habs2(v3)
+    max01 = hmax2(abs0, abs1)
+    max23 = hmax2(abs2, abs3)
+    return hmax2(max01, max23)
+
+
+@cute.jit
+def bfloat2_max_abs_4(v0: Uint32, v1: Uint32, v2: Uint32, v3: Uint32) -> Uint32:
+    """
+    Compute max absolute value across 4 bfloat2 values (8 BF16 elements).
+
+    Uses tree reduction: 4 -> 2 -> 1 bfloat2 values.
+    Returns a bfloat2 containing the max absolute value in both lanes.
+    """
+    abs0 = bfloat2_habs2(v0)
+    abs1 = bfloat2_habs2(v1)
+    abs2 = bfloat2_habs2(v2)
+    abs3 = bfloat2_habs2(v3)
+    max01 = bfloat2_hmax2(abs0, abs1)
+    max23 = bfloat2_hmax2(abs2, abs3)
+    return bfloat2_hmax2(max01, max23)
+
+
+@cute.jit
+def half2x4_to_fp8x8_packed(
+    v0: Uint32, v1: Uint32, v2: Uint32, v3: Uint32, inv_scale: Float32
+) -> Uint64:
+    """
+    Convert 4 half2 values (8 FP16) to 8 FP8 E4M3 and pack into u64.
+
+    Each half2 is converted to 2 FP8 values using the inverse scale,
+    then all 8 FP8 values are packed into a single 64-bit value for
+    efficient vectorized store.
+    """
+    fp8_01 = half2_to_fp8x2_scaled(v0, inv_scale)
+    fp8_23 = half2_to_fp8x2_scaled(v1, inv_scale)
+    fp8_45 = half2_to_fp8x2_scaled(v2, inv_scale)
+    fp8_67 = half2_to_fp8x2_scaled(v3, inv_scale)
+    return pack_fp8x8_to_u64(fp8_01, fp8_23, fp8_45, fp8_67)
+
+
+@cute.jit
+def bfloat2x4_to_fp8x8_packed(
+    v0: Uint32, v1: Uint32, v2: Uint32, v3: Uint32, inv_scale: Float32
+) -> Uint64:
+    """
+    Convert 4 bfloat2 values (8 BF16) to 8 FP8 E4M3 and pack into u64.
+
+    Each bfloat2 is converted to 2 FP8 values using the inverse scale,
+    then all 8 FP8 values are packed into a single 64-bit value for
+    efficient vectorized store.
+    """
+    fp8_01 = bfloat2_to_fp8x2_scaled(v0, inv_scale)
+    fp8_23 = bfloat2_to_fp8x2_scaled(v1, inv_scale)
+    fp8_45 = bfloat2_to_fp8x2_scaled(v2, inv_scale)
+    fp8_67 = bfloat2_to_fp8x2_scaled(v3, inv_scale)
+    return pack_fp8x8_to_u64(fp8_01, fp8_23, fp8_45, fp8_67)
 
 
 __all__ = [
     # Constants
     "SF_VEC_SIZE",
-    "FLOAT8_E4M3_MAX",
     "INV_FLOAT8_E4M3_MAX",
     "WARP_SIZE",
     "ELTS_PER_THREAD",
     "THREADS_PER_SF",
     "SF_BLOCKS_PER_WARP",
     "ROW_TILE_SIZE",
-    # Intrinsics
+    # Low-level intrinsics (used directly by kernels)
     "hmax_reduce_to_f32",
     "bfloat2_hmax_reduce_to_f32",
     "float_to_ue8m0_fast",
     "ue8m0_to_inv_scale_fast",
-    "half2_to_fp8x2_scaled",
-    "bfloat2_to_fp8x2_scaled",
-    "pack_fp8x8_to_u64",
-    "shuffle_xor_f32",
     "reduce_max_4threads",
     "compute_sf_index_swizzled_128x4_gpu",
-    "compute_swizzled_sf_size",
+    # High-level helper functions
+    "half2_max_abs_4",
+    "bfloat2_max_abs_4",
+    "half2x4_to_fp8x8_packed",
+    "bfloat2x4_to_fp8x8_packed",
 ]
