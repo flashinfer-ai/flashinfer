@@ -55,7 +55,9 @@ echo "::endgroup::"
 echo "Cleaning previous builds..."
 rm -rf dist build *.egg-info
 
-# Build the wheel using the build module
+# Build the wheel using the build module.
+# Use --no-isolation to build against the host environment's dependencies (e.g. nvshmem)
+# and avoid version mismatches at runtime.
 echo "Building wheel..."
 python -m build --wheel --no-isolation
 
