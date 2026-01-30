@@ -243,6 +243,23 @@ def _get_cache_alibi_slopes_buf(
     return buf
 
 
+def _get_sink_buf(
+    sinks: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    """Convert sinks tensor to proper format for CUDA kernels.
+
+    Args:
+        sinks: Optional tensor of shape [num_qo_heads] with sink values per head
+
+    Returns:
+        Contiguous float32 tensor or None if sinks is None
+    """
+    if sinks is None:
+        return None
+    # Ensure it's float32 and contiguous as expected by CUDA kernels
+    return sinks.to(torch.float32).contiguous()
+
+
 def canonicalize_torch_dtype(dtype: Union[torch.dtype, str]) -> torch.dtype:
     if isinstance(dtype, str):
         return getattr(torch, dtype)
