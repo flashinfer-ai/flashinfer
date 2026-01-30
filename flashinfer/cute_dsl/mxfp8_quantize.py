@@ -40,10 +40,6 @@ from .fp4_common import (
     ld_global_v4_u32,
     st_global_u64,
     get_ptr_as_int64,
-    habs2,
-    hmax2,
-    bfloat2_habs2,
-    bfloat2_hmax2,
 )
 from .quantization_utils import (
     # Constants
@@ -54,16 +50,18 @@ from .quantization_utils import (
     THREADS_PER_SF,
     SF_BLOCKS_PER_WARP,
     ROW_TILE_SIZE,
-    # Intrinsics
+    # Low-level intrinsics
     hmax_reduce_to_f32,
     bfloat2_hmax_reduce_to_f32,
     float_to_ue8m0_fast,
     ue8m0_to_inv_scale_fast,
-    half2_to_fp8x2_scaled,
-    bfloat2_to_fp8x2_scaled,
-    pack_fp8x8_to_u64,
     reduce_max_4threads,
     compute_sf_index_swizzled_128x4_gpu,
+    # High-level helpers
+    half2_max_abs_4,
+    bfloat2_max_abs_4,
+    half2x4_to_fp8x8_packed,
+    bfloat2x4_to_fp8x8_packed,
 )
 
 
@@ -95,7 +93,7 @@ class MXFP8QuantizeLinearKernel:
     ):
         self.dtype = dtype
         self.K = K
-        self.is_bfloat16 = (dtype == cutlass.BFloat16)
+        self.is_bfloat16 = dtype == cutlass.BFloat16
         self.enable_pdl = enable_pdl
 
         assert K % SF_VEC_SIZE == 0
@@ -115,8 +113,7 @@ class MXFP8QuantizeLinearKernel:
 
         # Compute grid size at runtime
         num_blocks = cutlass.min(
-            cute.ceil_div(total_sf_blocks, sf_blocks_per_tb),
-            _TARGET_GRID
+            cute.ceil_div(total_sf_blocks, sf_blocks_per_tb), _TARGET_GRID
         )
 
         self.kernel(mInput, mOutput, mScales, total_sf_blocks).launch(
@@ -149,7 +146,9 @@ class MXFP8QuantizeLinearKernel:
         sf_blocks_per_tb = self.WARPS_PER_BLOCK * SF_BLOCKS_PER_WARP
         num_sf_blocks_per_row = self.num_sf_blocks_per_row
 
-        sf_idx_base = bidx * sf_blocks_per_tb + warp_idx * SF_BLOCKS_PER_WARP + sf_idx_in_warp
+        sf_idx_base = (
+            bidx * sf_blocks_per_tb + warp_idx * SF_BLOCKS_PER_WARP + sf_idx_in_warp
+        )
 
         sf_idx = sf_idx_base
         while sf_idx < total_sf_blocks:
@@ -165,46 +164,31 @@ class MXFP8QuantizeLinearKernel:
 
             v0, v1, v2, v3 = ld_global_v4_u32(input_ptr_i64)
 
+            # Compute max absolute value across 8 elements (4 half2/bfloat2)
             if cutlass.const_expr(self.is_bfloat16):
-                abs0 = bfloat2_habs2(v0)
-                abs1 = bfloat2_habs2(v1)
-                abs2 = bfloat2_habs2(v2)
-                abs3 = bfloat2_habs2(v3)
-                max01 = bfloat2_hmax2(abs0, abs1)
-                max23 = bfloat2_hmax2(abs2, abs3)
-                max0123 = bfloat2_hmax2(max01, max23)
+                max0123 = bfloat2_max_abs_4(v0, v1, v2, v3)
                 local_max = bfloat2_hmax_reduce_to_f32(max0123)
             else:
-                abs0 = habs2(v0)
-                abs1 = habs2(v1)
-                abs2 = habs2(v2)
-                abs3 = habs2(v3)
-                max01 = hmax2(abs0, abs1)
-                max23 = hmax2(abs2, abs3)
-                max0123 = hmax2(max01, max23)
+                max0123 = half2_max_abs_4(v0, v1, v2, v3)
                 local_max = hmax_reduce_to_f32(max0123)
 
+            # 4-thread reduction for this SF block
             global_max = reduce_max_4threads(local_max)
 
+            # Compute UE8M0 scale factor
             inv_e4m3_max = Float32(INV_FLOAT8_E4M3_MAX)
             normalized_max = global_max * inv_e4m3_max
             scale_ue8m0_u32 = float_to_ue8m0_fast(normalized_max)
             scale_ue8m0 = scale_ue8m0_u32.to(Uint8)
 
+            # Compute inverse scale for quantization
             inv_scale = ue8m0_to_inv_scale_fast(scale_ue8m0_u32)
 
+            # Quantize to FP8 E4M3 and pack for vectorized store
             if cutlass.const_expr(self.is_bfloat16):
-                fp8_01 = bfloat2_to_fp8x2_scaled(v0, inv_scale)
-                fp8_23 = bfloat2_to_fp8x2_scaled(v1, inv_scale)
-                fp8_45 = bfloat2_to_fp8x2_scaled(v2, inv_scale)
-                fp8_67 = bfloat2_to_fp8x2_scaled(v3, inv_scale)
+                fp8_packed = bfloat2x4_to_fp8x8_packed(v0, v1, v2, v3, inv_scale)
             else:
-                fp8_01 = half2_to_fp8x2_scaled(v0, inv_scale)
-                fp8_23 = half2_to_fp8x2_scaled(v1, inv_scale)
-                fp8_45 = half2_to_fp8x2_scaled(v2, inv_scale)
-                fp8_67 = half2_to_fp8x2_scaled(v3, inv_scale)
-
-            fp8_packed = pack_fp8x8_to_u64(fp8_01, fp8_23, fp8_45, fp8_67)
+                fp8_packed = half2x4_to_fp8x8_packed(v0, v1, v2, v3, inv_scale)
 
             row_output = mOutput[row_idx, None]
             output_ptr_i64 = get_ptr_as_int64(row_output, elem_idx)
@@ -248,7 +232,7 @@ class MXFP8QuantizeSwizzledKernel:
     ):
         self.dtype = dtype
         self.K = K
-        self.is_bfloat16 = (dtype == cutlass.BFloat16)
+        self.is_bfloat16 = dtype == cutlass.BFloat16
         self.enable_pdl = enable_pdl
 
         assert K % SF_VEC_SIZE == 0
@@ -330,7 +314,9 @@ class MXFP8QuantizeSwizzledKernel:
                 sf_col_idx = col_unit_idx
                 while sf_col_idx < num_sf_blocks_per_row:
                     # Calculate element position
-                    elem_idx = sf_col_idx * SF_VEC_SIZE + thread_in_unit * ELTS_PER_THREAD
+                    elem_idx = (
+                        sf_col_idx * SF_VEC_SIZE + thread_in_unit * ELTS_PER_THREAD
+                    )
 
                     row_input = mInput[row_idx, None]
                     input_ptr_i64 = get_ptr_as_int64(row_input, elem_idx)
@@ -338,51 +324,33 @@ class MXFP8QuantizeSwizzledKernel:
                     # Load 8 FP16 values (128 bits)
                     v0, v1, v2, v3 = ld_global_v4_u32(input_ptr_i64)
 
-                    # Compute local max using Half2 SIMD
+                    # Compute max absolute value across 8 elements (4 half2/bfloat2)
                     if cutlass.const_expr(self.is_bfloat16):
-                        abs0 = bfloat2_habs2(v0)
-                        abs1 = bfloat2_habs2(v1)
-                        abs2 = bfloat2_habs2(v2)
-                        abs3 = bfloat2_habs2(v3)
-                        max01 = bfloat2_hmax2(abs0, abs1)
-                        max23 = bfloat2_hmax2(abs2, abs3)
-                        max0123 = bfloat2_hmax2(max01, max23)
+                        max0123 = bfloat2_max_abs_4(v0, v1, v2, v3)
                         local_max = bfloat2_hmax_reduce_to_f32(max0123)
                     else:
-                        abs0 = habs2(v0)
-                        abs1 = habs2(v1)
-                        abs2 = habs2(v2)
-                        abs3 = habs2(v3)
-                        max01 = hmax2(abs0, abs1)
-                        max23 = hmax2(abs2, abs3)
-                        max0123 = hmax2(max01, max23)
+                        max0123 = half2_max_abs_4(v0, v1, v2, v3)
                         local_max = hmax_reduce_to_f32(max0123)
 
                     # 4-thread reduction for this SF block
                     global_max = reduce_max_4threads(local_max)
 
-                    # Compute scale
+                    # Compute UE8M0 scale factor
                     inv_e4m3_max = Float32(INV_FLOAT8_E4M3_MAX)
                     normalized_max = global_max * inv_e4m3_max
                     scale_ue8m0_u32 = float_to_ue8m0_fast(normalized_max)
                     scale_ue8m0 = scale_ue8m0_u32.to(Uint8)
 
-                    # Compute inverse scale
+                    # Compute inverse scale for quantization
                     inv_scale = ue8m0_to_inv_scale_fast(scale_ue8m0_u32)
 
-                    # Quantize
+                    # Quantize to FP8 E4M3 and pack for vectorized store
                     if cutlass.const_expr(self.is_bfloat16):
-                        fp8_01 = bfloat2_to_fp8x2_scaled(v0, inv_scale)
-                        fp8_23 = bfloat2_to_fp8x2_scaled(v1, inv_scale)
-                        fp8_45 = bfloat2_to_fp8x2_scaled(v2, inv_scale)
-                        fp8_67 = bfloat2_to_fp8x2_scaled(v3, inv_scale)
+                        fp8_packed = bfloat2x4_to_fp8x8_packed(
+                            v0, v1, v2, v3, inv_scale
+                        )
                     else:
-                        fp8_01 = half2_to_fp8x2_scaled(v0, inv_scale)
-                        fp8_23 = half2_to_fp8x2_scaled(v1, inv_scale)
-                        fp8_45 = half2_to_fp8x2_scaled(v2, inv_scale)
-                        fp8_67 = half2_to_fp8x2_scaled(v3, inv_scale)
-
-                    fp8_packed = pack_fp8x8_to_u64(fp8_01, fp8_23, fp8_45, fp8_67)
+                        fp8_packed = half2x4_to_fp8x8_packed(v0, v1, v2, v3, inv_scale)
 
                     # Store FP8 output
                     row_output = mOutput[row_idx, None]
@@ -463,20 +431,7 @@ def _get_compiled_kernel_linear(
         options="--enable-tvm-ffi",
     )
 
-    def tensor_api(
-        input_tensor: torch.Tensor,
-        output_tensor: torch.Tensor,
-        scales_tensor: torch.Tensor,
-        total_sf_blocks: int,
-    ) -> None:
-        compiled_kernel(
-            input_tensor,
-            output_tensor,
-            scales_tensor,
-            total_sf_blocks,
-        )
-
-    return tensor_api
+    return compiled_kernel
 
 
 @functools.cache
@@ -521,22 +476,7 @@ def _get_compiled_kernel_swizzled(
         options="--enable-tvm-ffi",
     )
 
-    def tensor_api(
-        input_tensor: torch.Tensor,
-        output_tensor: torch.Tensor,
-        scales_tensor: torch.Tensor,
-        M: int,
-        padded_M: int,
-    ) -> None:
-        compiled_kernel(
-            input_tensor,
-            output_tensor,
-            scales_tensor,
-            M,
-            padded_M,
-        )
-
-    return tensor_api
+    return compiled_kernel
 
 
 @flashinfer_api
@@ -582,7 +522,6 @@ def mxfp8_quantize_cute_dsl(
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)
 
-    orig_shape = input.shape
     if input.dim() > 2:
         m = input.numel() // input.shape[-1]
         k = input.shape[-1]
@@ -590,7 +529,9 @@ def mxfp8_quantize_cute_dsl(
     else:
         m, k = input.shape
 
-    assert k % SF_VEC_SIZE == 0, f"K ({k}) must be divisible by SF_VEC_SIZE={SF_VEC_SIZE}"
+    assert k % SF_VEC_SIZE == 0, (
+        f"K ({k}) must be divisible by SF_VEC_SIZE={SF_VEC_SIZE}"
+    )
 
     padded_k = ((k + alignment - 1) // alignment) * alignment
 
@@ -615,7 +556,9 @@ def mxfp8_quantize_cute_dsl(
         kernel_fn = _get_compiled_kernel_swizzled(is_bfloat16, padded_k, enable_pdl)
 
         fp8_output = torch.empty(m, padded_k, dtype=torch.uint8, device=input.device)
-        scale_output = torch.empty(scale_output_size, dtype=torch.uint8, device=input.device)
+        scale_output = torch.empty(
+            scale_output_size, dtype=torch.uint8, device=input.device
+        )
 
         kernel_fn(input_padded, fp8_output, scale_output, m, padded_m)
     else:
@@ -626,7 +569,9 @@ def mxfp8_quantize_cute_dsl(
         kernel_fn = _get_compiled_kernel_linear(is_bfloat16, padded_k, enable_pdl)
 
         fp8_output = torch.empty(m, padded_k, dtype=torch.uint8, device=input.device)
-        scale_output = torch.empty(scale_output_size, dtype=torch.uint8, device=input.device)
+        scale_output = torch.empty(
+            scale_output_size, dtype=torch.uint8, device=input.device
+        )
 
         kernel_fn(input_padded, fp8_output, scale_output, total_sf_blocks)
 

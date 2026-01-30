@@ -371,15 +371,23 @@ def test_cute_dsl_compilation_cache_m_agnostic(is_sf_swizzled_layout):
     a2 = torch.randn([16, K], dtype=dtype, device="cuda")
     mxfp8_quantize(a2, is_sf_swizzled_layout, backend="cute-dsl")
     cache_info_after_m16 = cache_fn.cache_info()
-    assert cache_info_after_m16.misses == 1, "Second call with different M should still be 1 miss"
-    assert cache_info_after_m16.hits == 1, "Second call should be a cache hit (M-agnostic)"
+    assert cache_info_after_m16.misses == 1, (
+        "Second call with different M should still be 1 miss"
+    )
+    assert cache_info_after_m16.hits == 1, (
+        "Second call should be a cache hit (M-agnostic)"
+    )
 
     # Third call with M=1024 (different M again, same K) - should reuse cached kernel
     a3 = torch.randn([1024, K], dtype=dtype, device="cuda")
     mxfp8_quantize(a3, is_sf_swizzled_layout, backend="cute-dsl")
     cache_info_after_m1024 = cache_fn.cache_info()
-    assert cache_info_after_m1024.misses == 1, "Third call with different M should still be 1 miss"
-    assert cache_info_after_m1024.hits == 2, "Third call should be a cache hit (M-agnostic)"
+    assert cache_info_after_m1024.misses == 1, (
+        "Third call with different M should still be 1 miss"
+    )
+    assert cache_info_after_m1024.hits == 2, (
+        "Third call should be a cache hit (M-agnostic)"
+    )
 
     # Clean up
     cache_fn.cache_clear()
@@ -427,14 +435,20 @@ def test_cute_dsl_compilation_cache_k_specific(is_sf_swizzled_layout):
     a2 = torch.randn([M, 2048], dtype=dtype, device="cuda")
     mxfp8_quantize(a2, is_sf_swizzled_layout, backend="cute-dsl")
     cache_info_after_k2048 = cache_fn.cache_info()
-    assert cache_info_after_k2048.misses == 2, "Second call with different K should be a cache miss"
+    assert cache_info_after_k2048.misses == 2, (
+        "Second call with different K should be a cache miss"
+    )
 
     # Third call with K=1024 again - should hit cache
     a3 = torch.randn([M, 1024], dtype=dtype, device="cuda")
     mxfp8_quantize(a3, is_sf_swizzled_layout, backend="cute-dsl")
     cache_info_after_k1024_again = cache_fn.cache_info()
-    assert cache_info_after_k1024_again.misses == 2, "Third call with same K=1024 should not add miss"
-    assert cache_info_after_k1024_again.hits >= 1, "Third call with same K=1024 should hit cache"
+    assert cache_info_after_k1024_again.misses == 2, (
+        "Third call with same K=1024 should not add miss"
+    )
+    assert cache_info_after_k1024_again.hits >= 1, (
+        "Third call with same K=1024 should hit cache"
+    )
 
     # Clean up
     cache_fn.cache_clear()
@@ -481,14 +495,20 @@ def test_cute_dsl_compilation_cache_dtype_specific(is_sf_swizzled_layout):
     a2 = torch.randn([M, K], dtype=torch.bfloat16, device="cuda")
     mxfp8_quantize(a2, is_sf_swizzled_layout, backend="cute-dsl")
     cache_info_after_bf16 = cache_fn.cache_info()
-    assert cache_info_after_bf16.misses == 2, "Second call (bf16) should be a cache miss (dtype-specific)"
+    assert cache_info_after_bf16.misses == 2, (
+        "Second call (bf16) should be a cache miss (dtype-specific)"
+    )
 
     # Third call with float16 again - should hit cache
     a3 = torch.randn([M, K], dtype=torch.float16, device="cuda")
     mxfp8_quantize(a3, is_sf_swizzled_layout, backend="cute-dsl")
     cache_info_after_fp16_again = cache_fn.cache_info()
-    assert cache_info_after_fp16_again.misses == 2, "Third call (fp16 again) should not add miss"
-    assert cache_info_after_fp16_again.hits >= 1, "Third call (fp16 again) should hit cache"
+    assert cache_info_after_fp16_again.misses == 2, (
+        "Third call (fp16 again) should not add miss"
+    )
+    assert cache_info_after_fp16_again.hits >= 1, (
+        "Third call (fp16 again) should hit cache"
+    )
 
     # Clean up
     cache_fn.cache_clear()
