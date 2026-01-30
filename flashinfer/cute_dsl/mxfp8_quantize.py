@@ -24,6 +24,7 @@ Key features:
 - 4-thread cooperation per scale factor block
 - Dual-path optimization: linear layout (SF-block based) and swizzled layout (row-based)
 - Vectorized 128-bit global loads/stores
+- M-agnostic compilation: kernels are compiled once per K dimension
 """
 
 import functools
@@ -66,6 +67,10 @@ from .quantization_utils import (
 )
 
 
+# Target grid size for occupancy
+_TARGET_GRID = 132 * 4
+
+
 # =============================================================================
 # CuTe-DSL Kernel Class for Linear Layout
 # =============================================================================
@@ -75,6 +80,9 @@ class MXFP8QuantizeLinearKernel:
     """
     MXFP8 quantization kernel optimized for LINEAR layout.
     Uses SF-block based iteration for efficient memory access.
+
+    This kernel is M-agnostic: compiled once per (K, dtype, pdl) combination.
+    M-dependent values (total_sf_blocks) are passed at runtime.
     """
 
     WARPS_PER_BLOCK = 16  # 16 warps = 512 threads per block
@@ -82,26 +90,16 @@ class MXFP8QuantizeLinearKernel:
     def __init__(
         self,
         dtype: cutlass.Numeric,
-        M: int,
         K: int,
         enable_pdl: bool = False,
     ):
         self.dtype = dtype
-        self.M = M
         self.K = K
         self.is_bfloat16 = (dtype == cutlass.BFloat16)
         self.enable_pdl = enable_pdl
 
         assert K % SF_VEC_SIZE == 0
         self.num_sf_blocks_per_row = K // SF_VEC_SIZE
-        self.total_sf_blocks = M * self.num_sf_blocks_per_row
-        self.scale_output_size = self.total_sf_blocks
-
-    def _compute_grid_size(self) -> int:
-        sf_blocks_per_tb = self.WARPS_PER_BLOCK * SF_BLOCKS_PER_WARP
-        min_grid = (self.total_sf_blocks + sf_blocks_per_tb - 1) // sf_blocks_per_tb
-        target_grid = 132 * 4
-        return min(min_grid, target_grid)
 
     @cute.jit
     def __call__(
@@ -109,12 +107,19 @@ class MXFP8QuantizeLinearKernel:
         mInput: cute.Tensor,
         mOutput: cute.Tensor,
         mScales: cute.Tensor,
+        total_sf_blocks: Int32,
         stream,
     ):
         threads_per_block = self.WARPS_PER_BLOCK * WARP_SIZE
-        num_blocks = self._compute_grid_size()
+        sf_blocks_per_tb = self.WARPS_PER_BLOCK * SF_BLOCKS_PER_WARP
 
-        self.kernel(mInput, mOutput, mScales).launch(
+        # Compute grid size at runtime
+        num_blocks = cutlass.min(
+            cute.ceil_div(total_sf_blocks, sf_blocks_per_tb),
+            _TARGET_GRID
+        )
+
+        self.kernel(mInput, mOutput, mScales, total_sf_blocks).launch(
             grid=[num_blocks, 1, 1],
             block=[threads_per_block, 1, 1],
             max_number_threads=[512, 1, 1],
@@ -129,6 +134,7 @@ class MXFP8QuantizeLinearKernel:
         mInput: cute.Tensor,
         mOutput: cute.Tensor,
         mScales: cute.Tensor,
+        total_sf_blocks: Int32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
@@ -141,7 +147,6 @@ class MXFP8QuantizeLinearKernel:
         thread_in_sf = lane_idx % THREADS_PER_SF
 
         sf_blocks_per_tb = self.WARPS_PER_BLOCK * SF_BLOCKS_PER_WARP
-        total_sf_blocks = self.total_sf_blocks
         num_sf_blocks_per_row = self.num_sf_blocks_per_row
 
         sf_idx_base = bidx * sf_blocks_per_tb + warp_idx * SF_BLOCKS_PER_WARP + sf_idx_in_warp
@@ -228,6 +233,9 @@ class MXFP8QuantizeSwizzledKernel:
     - Row-based iteration instead of SF-block iteration
     - Padding row fast path - only zero out scale factors
     - Column loop inside kernel for better locality
+
+    This kernel is M-agnostic: compiled once per (K, dtype, pdl) combination.
+    M-dependent values (M, padded_M) are passed at runtime.
     """
 
     WARPS_PER_BLOCK = 16  # 16 warps = 512 threads per block
@@ -235,12 +243,10 @@ class MXFP8QuantizeSwizzledKernel:
     def __init__(
         self,
         dtype: cutlass.Numeric,
-        M: int,
         K: int,
         enable_pdl: bool = False,
     ):
         self.dtype = dtype
-        self.M = M
         self.K = K
         self.is_bfloat16 = (dtype == cutlass.BFloat16)
         self.enable_pdl = enable_pdl
@@ -249,32 +255,22 @@ class MXFP8QuantizeSwizzledKernel:
         self.num_sf_blocks_per_row = K // SF_VEC_SIZE
         self.padded_sf_cols = ((self.num_sf_blocks_per_row + 3) // 4) * 4
 
-        # For swizzled layout, pad M to multiple of 128
-        self.padded_M = ((M + ROW_TILE_SIZE - 1) // ROW_TILE_SIZE) * ROW_TILE_SIZE
-        self.scale_output_size = self.padded_M * self.padded_sf_cols
-
-        # Number of column threads (each thread processes 8 elements = 1 SF block worth)
-        self.num_col_units = self.num_sf_blocks_per_row
-
-    def _compute_grid_size(self) -> int:
-        """Grid size = number of padded rows (one block per row with grid-stride)."""
-        target_blocks_per_sm = 4
-        estimated_sm_count = 132
-        target_grid = estimated_sm_count * target_blocks_per_sm
-        return min(self.padded_M, target_grid)
-
     @cute.jit
     def __call__(
         self,
         mInput: cute.Tensor,
         mOutput: cute.Tensor,
         mScales: cute.Tensor,
+        M: Int32,
+        padded_M: Int32,
         stream,
     ):
         threads_per_block = self.WARPS_PER_BLOCK * WARP_SIZE
-        num_blocks = self._compute_grid_size()
 
-        self.kernel(mInput, mOutput, mScales).launch(
+        # Compute grid size at runtime
+        num_blocks = cutlass.min(padded_M, _TARGET_GRID)
+
+        self.kernel(mInput, mOutput, mScales, M, padded_M).launch(
             grid=[num_blocks, 1, 1],
             block=[threads_per_block, 1, 1],
             max_number_threads=[512, 1, 1],
@@ -289,6 +285,8 @@ class MXFP8QuantizeSwizzledKernel:
         mInput: cute.Tensor,
         mOutput: cute.Tensor,
         mScales: cute.Tensor,
+        M: Int32,
+        padded_M: Int32,
     ):
         """
         Row-based kernel for swizzled layout.
@@ -300,8 +298,6 @@ class MXFP8QuantizeSwizzledKernel:
         bidx, _, _ = cute.arch.block_idx()
         grid_dim_x, _, _ = cute.arch.grid_dim()
 
-        M = self.M
-        padded_M = self.padded_M
         num_sf_blocks_per_row = self.num_sf_blocks_per_row
         padded_sf_cols = self.padded_sf_cols
 
@@ -429,13 +425,16 @@ class MXFP8QuantizeSwizzledKernel:
 @functools.cache
 def _get_compiled_kernel_linear(
     is_bfloat16: bool,
-    M: int,
     K: int,
     enable_pdl: bool = False,
-) -> Tuple[Callable, int]:
-    """Get or compile LINEAR layout kernel with TVM-FFI."""
+) -> Callable:
+    """
+    Get or compile LINEAR layout kernel with TVM-FFI.
+
+    Cached by (K, dtype, pdl) - M-agnostic compilation.
+    """
     cutlass_dtype = cutlass.BFloat16 if is_bfloat16 else cutlass.Float16
-    kernel_obj = MXFP8QuantizeLinearKernel(cutlass_dtype, M, K, enable_pdl)
+    kernel_obj = MXFP8QuantizeLinearKernel(cutlass_dtype, K, enable_pdl)
 
     # Use symbolic M for dynamic batch sizes
     sym_m = cute.sym_int()
@@ -447,7 +446,7 @@ def _get_compiled_kernel_linear(
     output_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Uint8, (sym_m, K), stride_order=(1, 0), assumed_align=16
     )
-    # Scale output size for linear layout = M * (K // SF_VEC_SIZE)
+    # Scale output size is dynamic (M-dependent)
     sym_scale_size = cute.sym_int()
     scales_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Uint8, (sym_scale_size,), assumed_align=16
@@ -459,36 +458,40 @@ def _get_compiled_kernel_linear(
         input_fake,
         output_fake,
         scales_fake,
+        Int32(1),  # Dummy total_sf_blocks - actual value passed at runtime
         stream_fake,
         options="--enable-tvm-ffi",
     )
-
-    scale_output_size = kernel_obj.scale_output_size
 
     def tensor_api(
         input_tensor: torch.Tensor,
         output_tensor: torch.Tensor,
         scales_tensor: torch.Tensor,
+        total_sf_blocks: int,
     ) -> None:
         compiled_kernel(
             input_tensor,
             output_tensor,
             scales_tensor,
+            total_sf_blocks,
         )
 
-    return tensor_api, scale_output_size
+    return tensor_api
 
 
 @functools.cache
 def _get_compiled_kernel_swizzled(
     is_bfloat16: bool,
-    M: int,
     K: int,
     enable_pdl: bool = False,
-) -> Tuple[Callable, int]:
-    """Get or compile SWIZZLED layout kernel with TVM-FFI."""
+) -> Callable:
+    """
+    Get or compile SWIZZLED layout kernel with TVM-FFI.
+
+    Cached by (K, dtype, pdl) - M-agnostic compilation.
+    """
     cutlass_dtype = cutlass.BFloat16 if is_bfloat16 else cutlass.Float16
-    kernel_obj = MXFP8QuantizeSwizzledKernel(cutlass_dtype, M, K, enable_pdl)
+    kernel_obj = MXFP8QuantizeSwizzledKernel(cutlass_dtype, K, enable_pdl)
 
     # Use symbolic M for dynamic batch sizes
     sym_m = cute.sym_int()
@@ -500,7 +503,7 @@ def _get_compiled_kernel_swizzled(
     output_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Uint8, (sym_m, K), stride_order=(1, 0), assumed_align=16
     )
-    # Scale output size for swizzled layout
+    # Scale output size is dynamic (M-dependent)
     sym_scale_size = cute.sym_int()
     scales_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Uint8, (sym_scale_size,), assumed_align=16
@@ -512,24 +515,28 @@ def _get_compiled_kernel_swizzled(
         input_fake,
         output_fake,
         scales_fake,
+        Int32(1),  # Dummy M - actual value passed at runtime
+        Int32(128),  # Dummy padded_M - actual value passed at runtime
         stream_fake,
         options="--enable-tvm-ffi",
     )
-
-    scale_output_size = kernel_obj.scale_output_size
 
     def tensor_api(
         input_tensor: torch.Tensor,
         output_tensor: torch.Tensor,
         scales_tensor: torch.Tensor,
+        M: int,
+        padded_M: int,
     ) -> None:
         compiled_kernel(
             input_tensor,
             output_tensor,
             scales_tensor,
+            M,
+            padded_M,
         )
 
-    return tensor_api, scale_output_size
+    return tensor_api
 
 
 @flashinfer_api
@@ -545,6 +552,9 @@ def mxfp8_quantize_cute_dsl(
     This is a GPU implementation with dual-path optimization:
     - LINEAR layout: SF-block based iteration (fast)
     - SWIZZLED layout: Row-based iteration with padding fast path (optimized)
+
+    The kernel is compiled once per (K, dtype, pdl) combination and handles
+    varying M (batch size) at runtime without recompilation.
 
     Args:
         input: Input tensor of shape [M, K] with dtype fp16/bf16
@@ -593,19 +603,32 @@ def mxfp8_quantize_cute_dsl(
 
     is_bfloat16 = input.dtype == torch.bfloat16
 
+    # Compute M-dependent values outside the cached kernel
+    num_sf_blocks_per_row = padded_k // SF_VEC_SIZE
+
     if is_sf_swizzled_layout:
-        kernel_fn, scale_output_size = _get_compiled_kernel_swizzled(
-            is_bfloat16, m, padded_k, enable_pdl
-        )
+        # Swizzled layout: compute padded_M and scale_output_size
+        padded_m = ((m + ROW_TILE_SIZE - 1) // ROW_TILE_SIZE) * ROW_TILE_SIZE
+        padded_sf_cols = ((num_sf_blocks_per_row + 3) // 4) * 4
+        scale_output_size = padded_m * padded_sf_cols
+
+        kernel_fn = _get_compiled_kernel_swizzled(is_bfloat16, padded_k, enable_pdl)
+
+        fp8_output = torch.empty(m, padded_k, dtype=torch.uint8, device=input.device)
+        scale_output = torch.empty(scale_output_size, dtype=torch.uint8, device=input.device)
+
+        kernel_fn(input_padded, fp8_output, scale_output, m, padded_m)
     else:
-        kernel_fn, scale_output_size = _get_compiled_kernel_linear(
-            is_bfloat16, m, padded_k, enable_pdl
-        )
+        # Linear layout: compute total_sf_blocks
+        total_sf_blocks = m * num_sf_blocks_per_row
+        scale_output_size = total_sf_blocks
 
-    fp8_output = torch.empty(m, padded_k, dtype=torch.uint8, device=input.device)
-    scale_output = torch.empty(scale_output_size, dtype=torch.uint8, device=input.device)
+        kernel_fn = _get_compiled_kernel_linear(is_bfloat16, padded_k, enable_pdl)
 
-    kernel_fn(input_padded, fp8_output, scale_output)
+        fp8_output = torch.empty(m, padded_k, dtype=torch.uint8, device=input.device)
+        scale_output = torch.empty(scale_output_size, dtype=torch.uint8, device=input.device)
+
+        kernel_fn(input_padded, fp8_output, scale_output, total_sf_blocks)
 
     fp8_tensor = fp8_output.view(torch.float8_e4m3fn)
 
