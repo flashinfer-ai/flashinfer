@@ -740,10 +740,23 @@ def sampling_from_logits(
         A random number generator for the operation.
     check_nan: bool
         Whether to check nan in :attr:`logits`, default is ``False``.
-    seed: Optional[int]
-        seed value to use for the rng during the sampling operation.
-    offset: Optional[int]
-        offset value to use for the rng during the sampling operation.
+    seed: Optional[Union[int, torch.Tensor]]
+        Random seed value for the sampling operation. Can be either an integer or a torch.Tensor.
+        When provided as a torch.Tensor, it must be int64 or uint64 dtype, 1D, and length 1 or batch_size.
+        Using torch.Tensor is required for CUDA graph compatibility.
+
+        Warning: If you provide seed and offset explicitly, you are responsible for updating
+        their values between calls to ensure different random samples. Common approaches include:
+        - Incrementing offset by the number of random values consumed
+        - Updating seed based on the number of calls to the operation
+    offset: Optional[Union[int, torch.Tensor]]
+        Random offset value for the sampling operation. Can be either an integer or a torch.Tensor.
+        When provided as a torch.Tensor, it must be int64 or uint64 dtype, 1D, and length 1 or batch_size.
+        Using torch.Tensor is required for CUDA graph compatibility.
+
+        Warning: If you provide seed and offset explicitly, you are responsible for updating
+        their values between calls to ensure different random samples. The offset should be
+        incremented based on the number of random values consumed by the operation.
     Returns
     -------
     samples: torch.Tensor
@@ -806,10 +819,23 @@ def sampling_from_probs(
         A random number generator for the operation.
     check_nan: bool
         Whether to check nan in :attr:`probs`, default is ``False``.
-    seed: Optional[int]
-        seed value to use for the rng during the sampling operation.
-    offset: Optional[int]
-        offset value to use for the rng during the sampling operation.
+    seed: Optional[Union[int, torch.Tensor]]
+        Random seed value for the sampling operation. Can be either an integer or a torch.Tensor.
+        When provided as a torch.Tensor, it must be int64 or uint64 dtype, 1D, and length 1 or batch_size.
+        Using torch.Tensor is required for CUDA graph compatibility.
+
+        Warning: If you provide seed and offset explicitly, you are responsible for updating
+        their values between calls to ensure different random samples. Common approaches include:
+        - Incrementing offset by the number of random values consumed
+        - Updating seed based on the number of calls to the operation
+    offset: Optional[Union[int, torch.Tensor]]
+        Random offset value for the sampling operation. Can be either an integer or a torch.Tensor.
+        When provided as a torch.Tensor, it must be int64 or uint64 dtype, 1D, and length 1 or batch_size.
+        Using torch.Tensor is required for CUDA graph compatibility.
+
+        Warning: If you provide seed and offset explicitly, you are responsible for updating
+        their values between calls to ensure different random samples. The offset should be
+        incremented based on the number of random values consumed by the operation.
 
     Returns
     -------
@@ -889,10 +915,23 @@ def top_p_sampling_from_probs(
         A random number generator for the operation.
     check_nan: bool
         Whether to check nan in :attr:`probs`, default is ``False``.
-    seed: Optional[int]
-        seed value to use for the rng during the sampling operation.
-    offset: Optional[int]
-        offset value to use for the rng during the sampling operation.
+    seed: Optional[Union[int, torch.Tensor]]
+        Random seed value for the sampling operation. Can be either an integer or a torch.Tensor.
+        When provided as a torch.Tensor, it must be int64 or uint64 dtype, 1D, and length 1 or batch_size.
+        Using torch.Tensor is required for CUDA graph compatibility.
+
+        Warning: If you provide seed and offset explicitly, you are responsible for updating
+        their values between calls to ensure different random samples. Common approaches include:
+        - Incrementing offset by the number of random values consumed
+        - Updating seed based on the number of calls to the operation
+    offset: Optional[Union[int, torch.Tensor]]
+        Random offset value for the sampling operation. Can be either an integer or a torch.Tensor.
+        When provided as a torch.Tensor, it must be int64 or uint64 dtype, 1D, and length 1 or batch_size.
+        Using torch.Tensor is required for CUDA graph compatibility.
+
+        Warning: If you provide seed and offset explicitly, you are responsible for updating
+        their values between calls to ensure different random samples. The offset should be
+        incremented based on the number of random values consumed by the operation.
 
     Returns
     -------
@@ -986,10 +1025,23 @@ def top_k_sampling_from_probs(
         A random number generator for the operation.
     check_nan: bool
         Whether to check nan in :attr:`probs`, default is ``False``.
-    seed: Optional[int]
-        seed value to use for the rng during the sampling operation.
-    offset: Optional[int]
-        offset value to use for the rng during the sampling operation.
+    seed: Optional[Union[int, torch.Tensor]]
+        Random seed value for the sampling operation. Can be either an integer or a torch.Tensor.
+        When provided as a torch.Tensor, it must be int64 or uint64 dtype, 1D, and length 1 or batch_size.
+        Using torch.Tensor is required for CUDA graph compatibility.
+
+        Warning: If you provide seed and offset explicitly, you are responsible for updating
+        their values between calls to ensure different random samples. Common approaches include:
+        - Incrementing offset by the number of random values consumed
+        - Updating seed based on the number of calls to the operation
+    offset: Optional[Union[int, torch.Tensor]]
+        Random offset value for the sampling operation. Can be either an integer or a torch.Tensor.
+        When provided as a torch.Tensor, it must be int64 or uint64 dtype, 1D, and length 1 or batch_size.
+        Using torch.Tensor is required for CUDA graph compatibility.
+
+        Warning: If you provide seed and offset explicitly, you are responsible for updating
+        their values between calls to ensure different random samples. The offset should be
+        incremented based on the number of random values consumed by the operation.
 
     Returns
     -------
@@ -1084,10 +1136,23 @@ def min_p_sampling_from_probs(
         A random number generator for the operation.
     check_nan: bool
         Whether to check nan in :attr:`probs`, default is ``False``.
-    seed: Optional[int]
-        seed value to use for the rng during the sampling operation.
-    offset: Optional[int]
-        offset value to use for the rng during the sampling operation.
+    seed: Optional[Union[int, torch.Tensor]]
+        Random seed value for the sampling operation. Can be either an integer or a torch.Tensor.
+        When provided as a torch.Tensor, it must be int64 or uint64 dtype, 1D, and length 1 or batch_size.
+        Using torch.Tensor is required for CUDA graph compatibility.
+
+        Warning: If you provide seed and offset explicitly, you are responsible for updating
+        their values between calls to ensure different random samples. Common approaches include:
+        - Incrementing offset by the number of random values consumed
+        - Updating seed based on the number of calls to the operation
+    offset: Optional[Union[int, torch.Tensor]]
+        Random offset value for the sampling operation. Can be either an integer or a torch.Tensor.
+        When provided as a torch.Tensor, it must be int64 or uint64 dtype, 1D, and length 1 or batch_size.
+        Using torch.Tensor is required for CUDA graph compatibility.
+
+        Warning: If you provide seed and offset explicitly, you are responsible for updating
+        their values between calls to ensure different random samples. The offset should be
+        incremented based on the number of random values consumed by the operation.
 
     Returns
     -------
@@ -1187,10 +1252,23 @@ def top_k_top_p_sampling_from_logits(
         A random number generator for the operation.
     check_nan: bool
         Whether to check nan in :attr:`probs`, default is ``False``.
-    seed: Optional[int]
-        seed value to use for the rng during the sampling operation.
-    offset: Optional[int]
-        offset value to use for the rng during the sampling operation.
+    seed: Optional[Union[int, torch.Tensor]]
+        Random seed value for the sampling operation. Can be either an integer or a torch.Tensor.
+        When provided as a torch.Tensor, it must be int64 or uint64 dtype, 1D, and length 1 or batch_size.
+        Using torch.Tensor is required for CUDA graph compatibility.
+
+        Warning: If you provide seed and offset explicitly, you are responsible for updating
+        their values between calls to ensure different random samples. Common approaches include:
+        - Incrementing offset by the number of random values consumed
+        - Updating seed based on the number of calls to the operation
+    offset: Optional[Union[int, torch.Tensor]]
+        Random offset value for the sampling operation. Can be either an integer or a torch.Tensor.
+        When provided as a torch.Tensor, it must be int64 or uint64 dtype, 1D, and length 1 or batch_size.
+        Using torch.Tensor is required for CUDA graph compatibility.
+
+        Warning: If you provide seed and offset explicitly, you are responsible for updating
+        their values between calls to ensure different random samples. The offset should be
+        incremented based on the number of random values consumed by the operation.
 
     Returns
     -------
@@ -1320,10 +1398,23 @@ def top_k_top_p_sampling_from_probs(
         A random number generator for the operation.
     check_nan: bool
         Whether to check nan in :attr:`probs`, default is ``False``.
-    seed: Optional[int]
-        seed value to use for the rng during the sampling operation.
-    offset: Optional[int]
-        offset value to use for the rng during the sampling operation.
+    seed: Optional[Union[int, torch.Tensor]]
+        Random seed value for the sampling operation. Can be either an integer or a torch.Tensor.
+        When provided as a torch.Tensor, it must be int64 or uint64 dtype, 1D, and length 1 or batch_size.
+        Using torch.Tensor is required for CUDA graph compatibility.
+
+        Warning: If you provide seed and offset explicitly, you are responsible for updating
+        their values between calls to ensure different random samples. Common approaches include:
+        - Incrementing offset by the number of random values consumed
+        - Updating seed based on the number of calls to the operation
+    offset: Optional[Union[int, torch.Tensor]]
+        Random offset value for the sampling operation. Can be either an integer or a torch.Tensor.
+        When provided as a torch.Tensor, it must be int64 or uint64 dtype, 1D, and length 1 or batch_size.
+        Using torch.Tensor is required for CUDA graph compatibility.
+
+        Warning: If you provide seed and offset explicitly, you are responsible for updating
+        their values between calls to ensure different random samples. The offset should be
+        incremented based on the number of random values consumed by the operation.
 
     Returns
     -------
@@ -1654,10 +1745,23 @@ def chain_speculative_sampling(
         Whether to use deterministic kernel implementation, default is ``True``.
     generator: Optional[torch.Generator]
         A random number generator for the operation.
-    seed: Optional[int]
-        seed value to use for the rng during the sampling operation.
-    offset: Optional[int]
-        offset value to use for the rng during the sampling operation.
+    seed: Optional[Union[int, torch.Tensor]]
+        Random seed value for the sampling operation. Can be either an integer or a torch.Tensor.
+        When provided as a torch.Tensor, it must be int64 or uint64 dtype, 1D, and length 1 or batch_size.
+        Using torch.Tensor is required for CUDA graph compatibility.
+
+        Warning: If you provide seed and offset explicitly, you are responsible for updating
+        their values between calls to ensure different random samples. Common approaches include:
+        - Incrementing offset by the number of random values consumed
+        - Updating seed based on the number of calls to the operation
+    offset: Optional[Union[int, torch.Tensor]]
+        Random offset value for the sampling operation. Can be either an integer or a torch.Tensor.
+        When provided as a torch.Tensor, it must be int64 or uint64 dtype, 1D, and length 1 or batch_size.
+        Using torch.Tensor is required for CUDA graph compatibility.
+
+        Warning: If you provide seed and offset explicitly, you are responsible for updating
+        their values between calls to ensure different random samples. The offset should be
+        incremented based on the number of random values consumed by the operation.
 
     Returns
     -------

@@ -21,43 +21,42 @@ void softmax(TensorView workspace_buffer, TensorView logits, TensorView output,
              Optional<TensorView> maybe_temperature_arr, double temperature_val, bool enable_pdl);
 
 void sampling_from_probs(TensorView probs, TensorView output, Optional<TensorView> maybe_indices,
-                         bool deterministic,
-                         Optional<TensorView> maybe_seed_arr, uint64_t seed_val,
+                         bool deterministic, Optional<TensorView> maybe_seed_arr, uint64_t seed_val,
                          Optional<TensorView> maybe_offset_arr, uint64_t offset_val);
 
 void sampling_from_logits(TensorView logits, TensorView output, Optional<TensorView> maybe_indices,
-                          bool deterministic,
-                          Optional<TensorView> maybe_seed_arr, uint64_t seed_val,
-                          Optional<TensorView> maybe_offset_arr, uint64_t offset_val);
+                          bool deterministic, Optional<TensorView> maybe_seed_arr,
+                          uint64_t seed_val, Optional<TensorView> maybe_offset_arr,
+                          uint64_t offset_val);
 
 void top_p_sampling_from_probs(TensorView probs, TensorView output,
                                Optional<TensorView> maybe_indices,
                                Optional<TensorView> maybe_top_p_arr, double top_p_val,
-                               bool deterministic,
-                               Optional<TensorView> maybe_seed_arr, uint64_t seed_val,
-                               Optional<TensorView> maybe_offset_arr, uint64_t offset_val);
+                               bool deterministic, Optional<TensorView> maybe_seed_arr,
+                               uint64_t seed_val, Optional<TensorView> maybe_offset_arr,
+                               uint64_t offset_val);
 
 void top_k_sampling_from_probs(TensorView probs, TensorView output,
                                Optional<TensorView> maybe_indices,
                                Optional<TensorView> maybe_top_k_arr, int64_t top_k_val,
-                               bool deterministic,
-                               Optional<TensorView> maybe_seed_arr, uint64_t seed_val,
-                               Optional<TensorView> maybe_offset_arr, uint64_t offset_val);
+                               bool deterministic, Optional<TensorView> maybe_seed_arr,
+                               uint64_t seed_val, Optional<TensorView> maybe_offset_arr,
+                               uint64_t offset_val);
 
 void min_p_sampling_from_probs(TensorView probs, TensorView output,
                                Optional<TensorView> maybe_indices,
                                Optional<TensorView> maybe_min_p_arr, double min_p_val,
-                               bool deterministic,
-                               Optional<TensorView> maybe_seed_arr, uint64_t seed_val,
-                               Optional<TensorView> maybe_offset_arr, uint64_t offset_val);
+                               bool deterministic, Optional<TensorView> maybe_seed_arr,
+                               uint64_t seed_val, Optional<TensorView> maybe_offset_arr,
+                               uint64_t offset_val);
 
 void top_k_top_p_sampling_from_probs(TensorView probs, TensorView output,
                                      Optional<TensorView> maybe_indices,
                                      Optional<TensorView> maybe_top_k_arr, double top_k_val,
                                      Optional<TensorView> maybe_top_p_arr, double top_p_val,
-                                     bool deterministic,
-                                     Optional<TensorView> maybe_seed_arr, uint64_t seed_val,
-                                     Optional<TensorView> maybe_offset_arr, uint64_t offset_val);
+                                     bool deterministic, Optional<TensorView> maybe_seed_arr,
+                                     uint64_t seed_val, Optional<TensorView> maybe_offset_arr,
+                                     uint64_t offset_val);
 
 void top_p_renorm_probs(TensorView probs, TensorView renorm_probs,
                         Optional<TensorView> maybe_top_p_arr, double top_p_val);
