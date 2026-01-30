@@ -49,6 +49,8 @@ export LD_LIBRARY_PATH="/usr/local/cuda/lib64:/usr/local/cuda/lib64/stubs:$LD_LI
 
 echo "::group::Install build system"
 pip install --upgrade build
+# Install build dependencies for --no-isolation that may not be in the current environment.
+pip install --upgrade "setuptools>=77" wheel
 echo "::endgroup::"
 
 # Clean any previous builds
