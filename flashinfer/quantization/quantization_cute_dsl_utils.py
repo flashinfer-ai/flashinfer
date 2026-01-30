@@ -24,7 +24,7 @@ from cutlass import Float32, Int32, Uint32, Uint64
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-from .fp4_common import habs2, hmax2, bfloat2_habs2, bfloat2_hmax2
+from ..cute_dsl.fp4_common import habs2, hmax2, bfloat2_habs2, bfloat2_hmax2
 
 
 # =============================================================================
@@ -326,7 +326,7 @@ def shuffle_xor_f32(val: Float32, offset: int) -> Float32:
 @cute.jit
 def reduce_max_4threads(val: Float32) -> Float32:
     """Reduce max across 4 consecutive threads using 2 XOR shuffles."""
-    from .fp4_common import fmax_f32
+    from ..cute_dsl.fp4_common import fmax_f32
 
     other = shuffle_xor_f32(val, 1)
     val = fmax_f32(val, other)

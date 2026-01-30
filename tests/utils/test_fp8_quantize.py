@@ -342,7 +342,7 @@ def test_cute_dsl_compilation_cache_m_agnostic(is_sf_swizzled_layout):
     if not is_cute_dsl_available():
         pytest.skip("CuTe-DSL is not available")
 
-    from flashinfer.cute_dsl.mxfp8_quantize import (
+    from flashinfer.quantization.mxfp8_quantize_cute_dsl import (
         _get_compiled_kernel_linear,
         _get_compiled_kernel_swizzled,
     )
@@ -408,7 +408,7 @@ def test_cute_dsl_compilation_cache_k_specific(is_sf_swizzled_layout):
     if not is_cute_dsl_available():
         pytest.skip("CuTe-DSL is not available")
 
-    from flashinfer.cute_dsl.mxfp8_quantize import (
+    from flashinfer.quantization.mxfp8_quantize_cute_dsl import (
         _get_compiled_kernel_linear,
         _get_compiled_kernel_swizzled,
     )
@@ -468,7 +468,7 @@ def test_cute_dsl_compilation_cache_dtype_specific(is_sf_swizzled_layout):
     if not is_cute_dsl_available():
         pytest.skip("CuTe-DSL is not available")
 
-    from flashinfer.cute_dsl.mxfp8_quantize import (
+    from flashinfer.quantization.mxfp8_quantize_cute_dsl import (
         _get_compiled_kernel_linear,
         _get_compiled_kernel_swizzled,
     )

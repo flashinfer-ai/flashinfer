@@ -36,12 +36,12 @@ import torch
 from cutlass import Float32, Int32, Uint8
 
 from ..api_logging import flashinfer_api
-from .fp4_common import (
+from ..cute_dsl.fp4_common import (
     ld_global_v4_u32,
     st_global_u64,
     get_ptr_as_int64,
 )
-from .quantization_utils import (
+from .quantization_cute_dsl_utils import (
     # Constants
     SF_VEC_SIZE,
     INV_FLOAT8_E4M3_MAX,
@@ -782,4 +782,6 @@ __all__ = [
     "MXFP8QuantizeLinearKernel",
     "MXFP8QuantizeSwizzledKernel",
     "mxfp8_quantize_cute_dsl",
+    "_get_compiled_kernel_linear",
+    "_get_compiled_kernel_swizzled",
 ]
