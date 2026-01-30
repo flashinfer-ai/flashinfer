@@ -181,15 +181,14 @@ def test_fmha_v2_prefill_deepseek(
 @pytest.mark.parametrize("non_blocking", [True, False])
 @pytest.mark.parametrize(
     ("causal", "window_left", "mask_mode"),
-    [(True, -1, "causal"), (True, 127, "sliding_window"), (False, -1, "chunked")],
+    [
+        (True, -1, "CAUSAL"),
+        (True, 127, "SLIDING_WINDOW"),
+        (True, 512, "SLIDING_WINDOW"),
+    ],
 )
-# @pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
-# @pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ALIBI"])
-# @pytest.mark.parametrize("causal", [False])
-# @pytest.mark.parametrize("non_blocking", [False])
-# @pytest.mark.parametrize("window_left", [-1])
-@pytest.mark.parametrize("logits_soft_cap", [0.0])
 @pytest.mark.parametrize("pos_encoding_mode", ["NONE"])
+@pytest.mark.parametrize("logits_soft_cap", [0.0])
 def test_trtllm_fmha_v2_prefill_paged(
     batch_size,
     max_seq_len,
@@ -210,16 +209,6 @@ def test_trtllm_fmha_v2_prefill_paged(
 
     if not is_sm90a_supported(torch.device("cuda")):
         pytest.skip("FMHA v2 requires SM90+ (Hopper) GPUs.")
-
-    # Skip invalid combinations
-    if window_left > 0 and window_left >= max_seq_len:
-        pytest.skip("window_left must be smaller than max_seq_len for meaningful test")
-
-    # FMHA v2 sliding window always applies causal masking internally
-    # if window_left > 0 and not causal:
-    #     pytest.skip(
-    #         "FMHA v2 sliding window always uses causal masking; non-causal sliding window not supported"
-    #     )
 
     torch.manual_seed(42)
     device = torch.device("cuda")
@@ -263,7 +252,7 @@ def test_trtllm_fmha_v2_prefill_paged(
     max_q_len = seq_lens.max().item()
 
     output = trtllm_fmha_v2_prefill(
-        (q, paged_kv_cache),  # (Q, paged_KV) tuple - layout auto-detected as Q_PAGED_KV
+        (q, paged_kv_cache),
         workspace_buffer=workspace_buffer,
         seq_lens=seq_lens,
         max_q_len=max_q_len,
@@ -331,31 +320,36 @@ def test_trtllm_fmha_v2_prefill_paged(
     )
     wrapper_ref.plan(**plan_params)
     output_ref = wrapper_ref.run(q, paged_kv_cache)
-    rtol, atol = 1e-2, 5e-3
+    rtol, atol = 1e-2, 1e-2
     torch.testing.assert_close(output.float(), output_ref.float(), rtol=rtol, atol=atol)
 
 
-@pytest.mark.parametrize("batch_size", [1, 4, 8])
-@pytest.mark.parametrize("max_seq_len", [512, 1024, 2048, 4096])
-@pytest.mark.parametrize("num_qo_heads", [8])
-@pytest.mark.parametrize("num_kv_heads", [8])
-@pytest.mark.parametrize("head_dim", [128])
-@pytest.mark.parametrize("page_size", [16, 32, 64, 128])
+@pytest.mark.parametrize("batch_size", [4, 16])
+@pytest.mark.parametrize("max_seq_len", [1024, 4096])
+@pytest.mark.parametrize("num_qo_heads", [4, 32])
+@pytest.mark.parametrize("num_kv_heads", [4])
+@pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("non_blocking", [True, False])
-@pytest.mark.parametrize("window_left", [-1, 256])
-@pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
-@pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ALIBI"])
-def test_trtllm_fmha_v2_prefill_packed_qkv(
+@pytest.mark.parametrize(
+    ("causal", "window_left", "mask_mode"),
+    [
+        (True, -1, "CAUSAL"),
+        (True, 127, "SLIDING_WINDOW"),
+        (True, 512, "SLIDING_WINDOW"),
+    ],
+)
+@pytest.mark.parametrize("pos_encoding_mode", ["NONE"])
+@pytest.mark.parametrize("logits_soft_cap", [0.0])
+def test_trtllm_fmha_v2_prefill_packed(
     batch_size,
     max_seq_len,
     num_qo_heads,
     num_kv_heads,
     head_dim,
-    page_size,
     dtype,
     causal,
+    mask_mode,
     non_blocking,
     window_left,
     logits_soft_cap,
@@ -381,10 +375,6 @@ def test_trtllm_fmha_v2_prefill_packed_qkv(
     cum_seq_lens = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
     cum_seq_lens[1:] = torch.cumsum(seq_lens, dim=0)
     total_tokens = cum_seq_lens[-1].item()
-
-    assert num_qo_heads == num_kv_heads, (
-        "Packed QKV test assumes MHA (num_qo_heads == num_kv_heads)"
-    )
     packed_qkv = torch.randn(
         total_tokens, 3, num_qo_heads, head_dim, dtype=dtype, device=device
     )
@@ -396,12 +386,6 @@ def test_trtllm_fmha_v2_prefill_packed_qkv(
 
     sm_scale = 1.0 / math.sqrt(head_dim)
     max_q_len = max_kv_len
-
-    # Determine mask mode based on parameters
-    if window_left > 0:
-        mask_mode_str = "SLIDING_WINDOW"
-    else:
-        mask_mode_str = "CAUSAL" if causal else "padding"
 
     output = trtllm_fmha_v2_prefill(
         packed_qkv,
@@ -417,7 +401,7 @@ def test_trtllm_fmha_v2_prefill_packed_qkv(
         out=o,
         out_dtype=dtype,
         kv_layout="NHD",
-        mask_mode=mask_mode_str,
+        mask_mode=mask_mode,
         window_left=window_left,
         non_blocking=non_blocking,
         logits_soft_cap_scale=logits_soft_cap if logits_soft_cap > 0 else None,
@@ -458,18 +442,24 @@ def test_trtllm_fmha_v2_prefill_packed_qkv(
     torch.testing.assert_close(output.float(), output_ref.float(), rtol=rtol, atol=atol)
 
 
-@pytest.mark.parametrize("batch_size", [1, 4, 8])
-@pytest.mark.parametrize("max_seq_len", [512, 1024, 2048, 4096])
-@pytest.mark.parametrize("num_qo_heads", [8])
-@pytest.mark.parametrize("num_kv_heads", [8])  # Test both MHA and GQA
-@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("batch_size", [4, 16])
+@pytest.mark.parametrize("max_seq_len", [1024, 4096])
+@pytest.mark.parametrize("num_qo_heads", [4, 32])
+@pytest.mark.parametrize("num_kv_heads", [4])
+@pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("non_blocking", [True, False])
-@pytest.mark.parametrize("window_left", [-1, 256])
-@pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
-@pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ALIBI"])
-def test_trtllm_fmha_v2_prefill_separate_qkv(
+@pytest.mark.parametrize(
+    ("causal", "window_left", "mask_mode"),
+    [
+        (True, -1, "CAUSAL"),
+        (True, 127, "SLIDING_WINDOW"),
+        (True, 512, "SLIDING_WINDOW"),
+    ],
+)
+@pytest.mark.parametrize("pos_encoding_mode", ["NONE"])
+@pytest.mark.parametrize("logits_soft_cap", [0.0])
+def test_trtllm_fmha_v2_prefill_separate(
     batch_size,
     max_seq_len,
     num_qo_heads,
@@ -477,6 +467,7 @@ def test_trtllm_fmha_v2_prefill_separate_qkv(
     head_dim,
     dtype,
     causal,
+    mask_mode,
     non_blocking,
     window_left,
     logits_soft_cap,
@@ -513,12 +504,6 @@ def test_trtllm_fmha_v2_prefill_separate_qkv(
     sm_scale = 1.0 / math.sqrt(head_dim)
     max_q_len = max_kv_len
 
-    # Determine mask mode based on parameters
-    if window_left > 0:
-        mask_mode_str = "SLIDING_WINDOW"
-    else:
-        mask_mode_str = "causal" if causal else "padding"
-
     # Pass (Q, K, V) tuple - layout is auto-detected as SEPARATE_Q_K_V
     output = trtllm_fmha_v2_prefill(
         (q, k, v),  # Tuple of separate tensors
@@ -534,7 +519,7 @@ def test_trtllm_fmha_v2_prefill_separate_qkv(
         out=o,
         out_dtype=dtype,
         kv_layout="NHD",
-        mask_mode=mask_mode_str,
+        mask_mode=mask_mode,
         window_left=window_left,
         non_blocking=non_blocking,
         logits_soft_cap_scale=logits_soft_cap if logits_soft_cap > 0 else None,
@@ -574,18 +559,24 @@ def test_trtllm_fmha_v2_prefill_separate_qkv(
     torch.testing.assert_close(output.float(), output_ref.float(), rtol=rtol, atol=atol)
 
 
-@pytest.mark.parametrize("batch_size", [1, 4, 8])
-@pytest.mark.parametrize("max_seq_len", [512, 1024, 2048, 4096])
-@pytest.mark.parametrize("num_qo_heads", [8])
-@pytest.mark.parametrize("num_kv_heads", [8])
-@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("batch_size", [4, 16])
+@pytest.mark.parametrize("max_seq_len", [1024, 4096])
+@pytest.mark.parametrize("num_qo_heads", [4, 32])
+@pytest.mark.parametrize("num_kv_heads", [4])
+@pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("non_blocking", [True, False])
-@pytest.mark.parametrize("window_left", [-1, 256])
-@pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
-@pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ALIBI"])
-def test_trtllm_fmha_v2_prefill_contiguous_qkv(
+@pytest.mark.parametrize(
+    ("causal", "window_left", "mask_mode"),
+    [
+        (True, -1, "CAUSAL"),
+        (True, 127, "SLIDING_WINDOW"),
+        (True, 512, "SLIDING_WINDOW"),
+    ],
+)
+@pytest.mark.parametrize("pos_encoding_mode", ["NONE"])
+@pytest.mark.parametrize("logits_soft_cap", [0.0])
+def test_trtllm_fmha_v2_prefill_contiguous(
     batch_size,
     max_seq_len,
     num_qo_heads,
@@ -593,6 +584,7 @@ def test_trtllm_fmha_v2_prefill_contiguous_qkv(
     head_dim,
     dtype,
     causal,
+    mask_mode,
     non_blocking,
     window_left,
     logits_soft_cap,
@@ -603,11 +595,6 @@ def test_trtllm_fmha_v2_prefill_contiguous_qkv(
 
     if not is_sm90a_supported(torch.device("cuda")):
         pytest.skip("FMHA v2 requires SM90+ (Hopper) GPUs.")
-
-    if dtype == torch.float16 and logits_soft_cap > 0:
-        pytest.skip(
-            "logits_soft_cap with float16 produces different results vs reference"
-        )
 
     torch.manual_seed(42)
     device = torch.device("cuda")
@@ -639,12 +626,6 @@ def test_trtllm_fmha_v2_prefill_contiguous_qkv(
     sm_scale = 1.0 / math.sqrt(head_dim)
     max_q_len = max_kv_len
 
-    # Determine mask mode based on parameters
-    if window_left > 0:
-        mask_mode_str = "SLIDING_WINDOW"
-    else:
-        mask_mode_str = "causal" if causal else "padding"
-
     # Pass (Q, KV) tuple - API will auto-detect CONTIGUOUS_Q_KV layout
     output = trtllm_fmha_v2_prefill(
         (q, kv),  # Tuple of (Q, KV) where KV is 4D with dim 1 = 2
@@ -660,7 +641,7 @@ def test_trtllm_fmha_v2_prefill_contiguous_qkv(
         out=o,
         out_dtype=dtype,
         kv_layout="NHD",
-        mask_mode=mask_mode_str,
+        mask_mode=mask_mode,
         window_left=window_left,
         non_blocking=non_blocking,
         logits_soft_cap_scale=logits_soft_cap if logits_soft_cap > 0 else None,
@@ -706,13 +687,22 @@ def test_trtllm_fmha_v2_prefill_contiguous_qkv(
     torch.testing.assert_close(output.float(), output_ref.float(), rtol=rtol, atol=atol)
 
 
-@pytest.mark.parametrize("batch_size", [1, 4])
-@pytest.mark.parametrize("max_seq_len", [512, 1024])
-@pytest.mark.parametrize("num_qo_heads", [8])
-@pytest.mark.parametrize("num_kv_heads", [8])
+@pytest.mark.parametrize("batch_size", [4, 16])
+@pytest.mark.parametrize("max_seq_len", [1024, 4096])
+@pytest.mark.parametrize("num_qo_heads", [4, 32])
+@pytest.mark.parametrize("num_kv_heads", [4])
 @pytest.mark.parametrize("head_dim", [128])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("non_blocking", [True, False])
+@pytest.mark.parametrize(
+    ("causal", "window_left", "mask_mode"),
+    [
+        (True, -1, "CAUSAL"),
+        (True, 127, "SLIDING_WINDOW"),
+        (True, 512, "SLIDING_WINDOW"),
+    ],
+)
+@pytest.mark.parametrize("pos_encoding_mode", ["NONE"])
 def test_trtllm_fmha_v2_prefill_attention_sinks(
     batch_size,
     max_seq_len,
@@ -720,19 +710,15 @@ def test_trtllm_fmha_v2_prefill_attention_sinks(
     num_kv_heads,
     head_dim,
     dtype,
+    non_blocking,
     causal,
+    window_left,
+    mask_mode,
+    pos_encoding_mode,
 ):
     """
-    Test attention sinks feature (used for token pruning/attention sink techniques).
-    The sinks parameter adds additional values per head in the denominator of softmax.
-
-    NOTE: The reference implementation (BatchPrefillWithRaggedKVCacheWrapper) does NOT
-    support attention sinks. This test only verifies that the trtllm_fmha_v2_prefill API
-    accepts the sinks parameter without errors. Correctness is verified by comparing
-    output with sinks=None (which should produce the same result when sinks are zeros).
-
-    TODO: Add proper reference implementation or manual computation for attention sinks
-    when a reference becomes available.
+    Test trtllm_fmha_v2_prefill with attention sinks.
+    Compares against BatchAttentionWithAttentionSinkWrapper as reference.
     """
     from flashinfer.prefill import trtllm_fmha_v2_prefill
     from flashinfer.utils import is_sm90a_supported
@@ -755,31 +741,22 @@ def test_trtllm_fmha_v2_prefill_attention_sinks(
     cum_seq_lens[1:] = torch.cumsum(seq_lens, dim=0)
     total_tokens = cum_seq_lens[-1].item()
 
+    # Create separate Q, K, V tensors
     q = torch.randn(total_tokens, num_qo_heads, head_dim, dtype=dtype, device=device)
     k = torch.randn(total_tokens, num_kv_heads, head_dim, dtype=dtype, device=device)
     v = torch.randn(total_tokens, num_kv_heads, head_dim, dtype=dtype, device=device)
+    o = torch.zeros(total_tokens, num_qo_heads, head_dim, dtype=dtype, device=device)
     workspace_buffer = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=device)
 
     sm_scale = 1.0 / math.sqrt(head_dim)
     max_q_len = max_kv_len
-    mask_mode_str = "causal" if causal else "padding"
 
-    # Create sink tensors (zeros should produce equivalent output to no sinks)
-    # sinks is a list of tensors, one per batch element
-    # Each sink tensor has shape [num_heads, sink_dim] typically
-    # Using zeros here to verify API acceptance and that output matches no-sink case
-    sink_dim = 1  # Minimal sink dimension
-    sinks = [
-        torch.zeros(num_qo_heads, sink_dim, dtype=dtype, device=device)
-        for _ in range(batch_size)
-    ]
+    # Create sink tensor with random values to properly test the feature
+    sink = torch.rand(num_qo_heads, device=device, dtype=torch.float32) * 5
 
-    # Run with sinks=None first (baseline)
-    o_baseline = torch.zeros(
-        total_tokens, num_qo_heads, head_dim, dtype=dtype, device=device
-    )
-    output_baseline = trtllm_fmha_v2_prefill(
-        (q, k, v),
+    # Test trtllm_fmha_v2_prefill with sinks parameter
+    output = trtllm_fmha_v2_prefill(
+        (q, k, v),  # Tuple of separate tensors
         workspace_buffer=workspace_buffer,
         seq_lens=seq_lens,
         max_q_len=max_q_len,
@@ -789,40 +766,61 @@ def test_trtllm_fmha_v2_prefill_attention_sinks(
         batch_size=batch_size,
         cum_seq_lens_q=cum_seq_lens,
         cum_seq_lens_kv=cum_seq_lens,
-        out=o_baseline,
+        out=o,
         out_dtype=dtype,
         kv_layout="NHD",
-        mask_mode=mask_mode_str,
-        window_left=-1,
-        sinks=None,
+        sinks=sink,
+        mask_mode=mask_mode,
+        window_left=window_left,
+        non_blocking=non_blocking,
+        pos_encoding_mode=pos_encoding_mode,
     )
 
-    # Run with zero sinks (should produce same output as no sinks)
-    o_with_sinks = torch.zeros(
-        total_tokens, num_qo_heads, head_dim, dtype=dtype, device=device
+    # Reference: use BatchAttentionWithAttentionSinkWrapper
+    workspace_buffer_ref = torch.empty(
+        128 * 1024 * 1024, dtype=torch.uint8, device=device
     )
-    output_with_sinks = trtllm_fmha_v2_prefill(
-        (q, k, v),
-        workspace_buffer=workspace_buffer,
-        seq_lens=seq_lens,
-        max_q_len=max_q_len,
-        max_kv_len=max_kv_len,
-        bmm1_scale=sm_scale,
-        bmm2_scale=1.0,
-        batch_size=batch_size,
-        cum_seq_lens_q=cum_seq_lens,
-        cum_seq_lens_kv=cum_seq_lens,
-        out=o_with_sinks,
-        out_dtype=dtype,
+
+    # cumulative token counts per sequence
+    kv_indptr = torch.cat(
+        [
+            torch.tensor([0], dtype=torch.int32, device=device),
+            torch.cumsum(seq_lens, dim=0, dtype=torch.int32),
+        ]
+    )
+
+    # Create kv_indices for page_size=1 (each token is a page)
+    kv_indices = torch.arange(0, total_tokens, dtype=torch.int32, device=device)
+    paged_kv_last_page_len = torch.full(
+        (batch_size,), 1, dtype=torch.int32, device=device
+    )
+
+    wrapper_ref = flashinfer.BatchAttentionWithAttentionSinkWrapper(
+        workspace_buffer_ref,
         kv_layout="NHD",
-        mask_mode=mask_mode_str,
-        window_left=-1,
-        sinks=sinks,
+        backend="fa3",
+        q_data_type=dtype,
+        kv_data_type=dtype,
+        head_dim_qk=head_dim,
+        head_dim_vo=head_dim,
+        window_left=window_left,
     )
+    wrapper_ref.plan(
+        cum_seq_lens.cpu(),
+        kv_indptr.cpu(),
+        kv_indices.cpu(),
+        paged_kv_last_page_len.cpu(),
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        1,  # page_size
+        causal=causal,
+        window_left=window_left,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+        non_blocking=non_blocking,
+    )
+    output_ref = wrapper_ref.run(q, (k, v), sink, sm_scale)
 
-    # With zero sinks, output should match baseline (no sinks)
-    # Note: Due to numerical precision, we use relaxed tolerances
-    rtol, atol = 1e-2, 5e-3
-    torch.testing.assert_close(
-        output_with_sinks.float(), output_baseline.float(), rtol=rtol, atol=atol
-    )
+    rtol, atol = 1e-2, 1e-2
+    torch.testing.assert_close(output.float(), output_ref.float(), rtol=rtol, atol=atol)

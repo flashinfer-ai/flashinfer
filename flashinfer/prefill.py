@@ -3837,132 +3837,118 @@ def trtllm_fmha_v2_prefill(
     non_blocking: Optional[bool] = True,
     save_softmax_stats: Optional[bool] = False,
 ) -> torch.Tensor:
-    """
+    r"""TRT-LLM FMHAv2 prefill attention.
+
     Parameters
     ----------
-    qkv: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
-        If qkv is a torch.Tensor, it is a packed QKV tensor with shape [tokens, 3, H, D]
-        If qkv is a tuple of two tensors, it is a tuple of (Q, paged_KV) where paged_KV tensor is combined KV cache tensor
-        with shape [num_pages, 2, num_kv_heads, page_size, head_dim] if :attr:`kv_layout` is "HND",
-        or [num_pages, 2, page_size, num_kv_heads, head_dim] if :attr:`kv_layout` is "NHD".
-        The second dimension must be 2, where kv_cache[:, 0, ...] is the key cache and kv_cache[:, 1, ...] is the value cache.
-        Q is query tensor with shape [num_tokens, num_heads, head_dim]
-        If qkv is a tuple of three tensors, it is a tuple of (Q, K, V) where
-        K and V are key and value tensors with shape [num_tokens, num_kv_heads, page_size, head_dim]. Q is same as in (Q, paged_KV) format.
-    workspace_buffer : torch.Tensor. Must be initialized to 0 for its first use.
-        workspace
-    block_tables : torch.Tensor
-        page_table of kv cache, [batch_size, num_pages]
+    qkv : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
+        The query, key, value tensors. Accepts multiple formats:
+        - **Packed QKV** (torch.Tensor): shape ``[num_tokens, 3, num_heads, head_dim]``.
+        - **Tuple of two tensors** (Q, KV): Two sub-formats supported:
+          - *Contiguous Q+KV*: Q with shape ``[num_tokens, num_heads, head_dim]``,
+            KV with shape ``[num_tokens, 2, num_kv_heads, head_dim]`` where
+            ``KV[:, 0, ...]`` is key and ``KV[:, 1, ...]`` is value.
+          - *Q + Paged KV*: Q with shape ``[num_tokens, num_heads, head_dim]``,
+            paged_KV with shape ``[num_pages, 2, num_kv_heads, page_size, head_dim]``
+            if :attr:`kv_layout` is ``HND``, or
+            ``[num_pages, 2, page_size, num_kv_heads, head_dim]`` if :attr:`kv_layout`
+            is ``NHD``. The second dimension is 2, where ``paged_KV[:, 0, ...]`` is
+            key cache and ``paged_KV[:, 1, ...]`` is value cache.
+        - **Tuple of three tensors** (Q, K, V): Q with shape
+          ``[num_tokens, num_heads, head_dim]``, K and V with shape
+          ``[num_tokens, num_kv_heads, head_dim]``.
+    workspace_buffer : torch.Tensor
+        The workspace buffer. Must be initialized to 0 for its first use.
     seq_lens : torch.Tensor
-        A uint32 1D tensor indicating the kv sequence length of each prompt. shape: ``[batch_size]``
+        The KV sequence length of each request, shape: ``[batch_size]``.
     max_q_len : int
-        max sequence length for query
+        The maximum sequence length for query.
     max_kv_len : int
-        max sequence length for kv_cache
+        The maximum sequence length for KV cache.
     bmm1_scale : float
-        fused scale for bmm1 input.
+        The fused scale for BMM1 (QK^T) computation.
     bmm2_scale : float
-        fused scale for bmm2 input.
+        The fused scale for BMM2 (softmax(QK^T) * V) computation.
     batch_size : int
-        batch size
+        The batch size.
     cum_seq_lens_q : torch.Tensor
-        cumulative sequence length for query. shape: ``[batch_size + 1]``
+        The cumulative sequence lengths for query, shape: ``[batch_size + 1]``.
     cum_seq_lens_kv : torch.Tensor
-        cumulative sequence length for kv_cache. shape: ``[batch_size + 1]``
-    out : Optional[Union[torch.Tensor, FP4Tensor]] = None
-        output tensor, if not provided, will be allocated with ``out_dtype``, if ``out_dtype`` is not provided, will use the type of ``query``.
-    out_dtype : Optional[Union[torch.dtype, str]] = None
-        output dtype, if not provided, will use the type of ``out``.
-    kv_layout : str = "HND"
-        Layout of kv-cache, can be "HND" or "NHD", default is "HND".
-    sinks : Optional[List[torch.Tensor]] = None
-        additional value per head in the denominator of the softmax.
-    pos_encoding_mode: Optional[str] = None
-        position encoding mode, can be "ALIBI" or "NONE". Defaults to "NONE".
-    logits_soft_cap_scale: Optional[float] = None
-        logits soft cap scale. Defaults to None, which means no soft cap.
-    mask_mode: Optional[str] = "CAUSAL"
-        mask mode, can be "CAUSAL", "SLIDING_WINDOW", "CHUNKED". Defaults to "CAUSAL".
-    window_left : int = -1
-        The left (inclusive) window size for the attention window, when set to ``-1``, the window
-        size will be set to the full length of the sequence. Defaults to ``-1``. Only enabled when mask_mode is "SLIDING_WINDOW".
-    chunked_attention_size: Optional[int] = 0
-        chunked attention size. Defaults to None, which means no chunked attention. Only enabled when mask_mode is "CHUNKED". Must be a power of 2.
-    non_blocking: Optional[bool] = True
-        Whether to copy the input tensors to the device asynchronously. Defaults to True.
-    save_softmax_stats: Optional[bool] = False
-        Whether to save the softmax statistics. Defaults to False.
+        The cumulative sequence lengths for KV cache, shape: ``[batch_size + 1]``.
+    block_tables : Optional[torch.Tensor]
+        The page table for KV cache, shape: ``[batch_size, max_num_pages_per_seq]``.
+        Required when using paged KV cache format.
+    out : Optional[Union[torch.Tensor, FP4Tensor]]
+        The output tensor. If not provided, will be allocated with ``out_dtype``.
+        If ``out_dtype`` is also not provided, will use the dtype of query.
+    out_dtype : Optional[Union[torch.dtype, str]]
+        The output dtype. If not provided, will use the dtype of ``out`` or query.
+    kv_layout : Optional[str]
+        The layout of KV cache, could be ``HND`` or ``NHD``. Defaults to ``HND``.
+    sinks : Optional[List[torch.Tensor]]
+        Additional value per head in the denominator of the softmax.
+    pos_encoding_mode : Optional[str]
+        The position encoding mode, could be ``NONE`` or ``ALIBI``. Defaults to ``NONE``.
+    logits_soft_cap_scale : Optional[float]
+        The logits soft cap scale. Defaults to ``None``, which means no soft cap.
+    mask_mode : Optional[str]
+        The mask mode, could be ``causal``, ``sliding_window``, or ``chunked``.
+        Defaults to ``causal``.
+    window_left : Optional[int]
+        The left (inclusive) window size for the attention window, when set to ``-1``,
+        the window size will be set to the full length of the sequence. Defaults to ``-1``.
+        Only effective when :attr:`mask_mode` is ``sliding_window``.
+    chunked_attention_size : Optional[int]
+        The chunked attention size. Defaults to ``0``, which means no chunked attention.
+        Only effective when :attr:`mask_mode` is ``chunked``. Must be a power of 2.
+    non_blocking : Optional[bool]
+        Whether to copy the input tensors to the device asynchronously. Defaults to ``True``.
+    save_softmax_stats : Optional[bool]
+        Whether to save the softmax statistics. Defaults to ``False``.
+
     Returns
     -------
-    out: Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]
-        output torch.Tensor or tuple[torch.Tensor, torch.Tensor].
-        If return_lse is True, the output will be a tuple of two tensors, the first is the output tensor, the second is the lse tensor.
-        If return_lse is False, the output will be a single tensor.
+    Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        If :attr:`save_softmax_stats` is ``False``, the attention output tensor.
+        If :attr:`save_softmax_stats` is ``True``, a tuple of two tensors:
+
+        * The attention output tensor.
+        * The softmax statistics tensor (LSE).
     """
-    # Check for input layout against qkv format
+
     if isinstance(qkv, torch.Tensor):
         # Packed QKV: [tokens, 3, H, D]
+        input_layout = "PACKED_QKV"
         if qkv.dim() < 2 or qkv.shape[1] != 3:
             raise ValueError(
                 f"Packed QKV tensor must have shape [tokens, 3, H, D] with dim 1 == 3. "
                 f"Got shape {qkv.shape}"
             )
-        # For PACKED_QKV layout, C++ kernel expects the full packed tensor, not unbinded.
-        # Pass the packed tensor as query; k_cache and v_cache are placeholders for API compatibility.
-        # C++ will use q.data_ptr() as qkv_packed_d.
         query = qkv  # Full packed tensor [tokens, 3, H, D]
-        k_cache, v_cache = qkv, qkv
-        input_layout = "PACKED_QKV"
+        k_cache, v_cache = qkv, qkv  # placeholder
     elif isinstance(qkv, tuple):
         if len(qkv) == 2:
             query, kv_or_paged = qkv
-
-            # Distinguish between CONTIGUOUS_Q_KV and Q_PAGED_KV based on tensor shape:
-            # - CONTIGUOUS_Q_KV: KV is 4D [total_tokens, 2, H_kv, D] (variable-length)
-            # - Q_PAGED_KV: KV is 5D [num_pages, 2, H_kv, page_size, D] or [num_pages, 2, page_size, H_kv, D]
-            #
-            # The key difference: CONTIGUOUS_Q_KV is 4D, Q_PAGED_KV is 5D
             if kv_or_paged.dim() == 4 and kv_or_paged.shape[1] == 2:
-                # CONTIGUOUS_Q_KV: (Q, KV) format
-                # Q: [total_tokens, H, D]
-                # KV: [total_tokens, 2, H_kv, D] where dim 1 has K and V
+                input_layout = "CONTIGUOUS_Q_KV"
                 kv_cache = kv_or_paged
                 k_cache = kv_cache  # Pass KV tensor as k_cache for C++ kernel
                 v_cache = kv_cache  # v_cache is placeholder (not used for this layout)
-                input_layout = "CONTIGUOUS_Q_KV"
 
             elif kv_or_paged.dim() == 5 and kv_or_paged.shape[1] == 2:
-                # Q_PAGED_KV: (Q, paged_KV) format
-                kv_cache = kv_or_paged
-
-                # TRT-LLM kernel expects HND layout within each page
-                # Convert NHD -> HND if needed
-                if kv_layout == "NHD":
-                    # Input: [num_pages, 2, page_size, num_kv_heads, head_dim]
-                    # Convert to: [num_pages, 2, num_kv_heads, page_size, head_dim]
-                    kv_cache = kv_cache.transpose(-3, -2).contiguous()
-
-                # Unbind: [num_pages, 2, H, N, D] -> ([num_pages, H, N, D], [num_pages, H, N, D])
-                k_cache, v_cache = kv_cache.unbind(dim=1)
                 input_layout = "Q_PAGED_KV"
-
+                kv_cache = kv_or_paged
+                if kv_layout == "NHD":
+                    kv_cache = kv_cache.transpose(-3, -2).contiguous()
+                k_cache, v_cache = kv_cache.unbind(dim=1)
             else:
                 raise ValueError(
-                    f"For 2-element tuple (Q, KV), expected:\n"
-                    f"  - CONTIGUOUS_Q_KV: KV shape [total_tokens, 2, H_kv, D] (4D with dim 1 == 2)\n"
-                    f"  - Q_PAGED_KV: KV shape [num_pages, 2, ...] (5D with dim 1 == 2)\n"
-                    f"Got KV shape {kv_or_paged.shape} (dim={kv_or_paged.dim()}). "
-                    "For separate K/V tensors, use tuple of 3: (Q, K, V)"
+                    "Invalid shape for CONTIGUOUS_Q_KV or Q_PAGED_KV format."
                 )
 
         elif len(qkv) == 3:
-            # (Q, K, V) separate format
-            # For SEPARATE_Q_K_V layout, tensors are 3D: [tokens, heads, head_dim]
-            # NHD format for 3D tensors means [tokens, heads, head_dim] which is
-            # already the expected format - no transpose needed (unlike paged KV
-            # which uses 5D tensors where NHD means a different dimension ordering)
-            query, k_cache, v_cache = qkv
             input_layout = "SEPARATE_Q_K_V"
+            query, k_cache, v_cache = qkv
 
         else:
             raise ValueError(
@@ -3974,42 +3960,28 @@ def trtllm_fmha_v2_prefill(
             f"qkv must be a torch.Tensor or tuple. Got {type(qkv).__name__}"
         )
 
-    # ==========================================================================
-    # Extract tensor metadata based on input layout
-    # ==========================================================================
     if input_layout == "PACKED_QKV":
         # Packed QKV: query is [tokens, 3, H, D]
         num_qo_heads = query.shape[2]
-        head_dim_qk = query.shape[3]
-        num_kv_heads = query.shape[2]  # Assume MHA for packed QKV
         page_size = 0  # Not applicable for packed layouts
         head_dim_v = query.shape[3]  # Assume same as head_dim_qk
     elif input_layout == "Q_PAGED_KV":
         # Q is 3D: [tokens, H, D], Paged KV is 4D: [num_pages, H_kv, page_size, D]
         num_qo_heads = query.shape[1]
-        head_dim_qk = query.shape[2]
-        num_kv_heads = k_cache.shape[1]
         page_size = k_cache.shape[2]
         head_dim_v = v_cache.shape[3]
     elif input_layout == "CONTIGUOUS_Q_KV":
         # Q is 3D: [tokens, H, D], KV is 4D: [tokens, 2, H_kv, D]
         # k_cache holds the combined KV tensor
         num_qo_heads = query.shape[1]
-        head_dim_qk = query.shape[2]
-        num_kv_heads = k_cache.shape[2]  # KV shape is [tokens, 2, H_kv, D]
         page_size = 0  # Not applicable for non-paged layouts
         head_dim_v = k_cache.shape[3]  # D from KV tensor
     else:
         # SEPARATE_Q_K_V: all 3D ragged [tokens, H, D]
         num_qo_heads = query.shape[1]
-        head_dim_qk = query.shape[2]
-        num_kv_heads = k_cache.shape[1]
         page_size = 0  # Not applicable for non-paged layouts
         head_dim_v = v_cache.shape[2]
 
-    # Validate sliding window / chunked attention requires causal masking
-    # The kernel only supports SLIDING_OR_CHUNKED_CAUSAL (mask version 4), which
-    # inherits from CAUSAL (mask version 3). Non-causal variants are not supported.
     uses_sliding_window = window_left is not None and window_left >= 0
     uses_chunked = chunked_attention_size is not None and chunked_attention_size > 0
     is_non_causal = mask_mode is not None and mask_mode.lower() == "padding"
@@ -4019,7 +3991,6 @@ def trtllm_fmha_v2_prefill(
         raise ValueError(
             f"{feature} attention requires causal masking. "
             f"The underlying kernel only supports SLIDING_OR_CHUNKED_CAUSAL mode. "
-            f"Use mask_mode='causal', 'sliding_window', or 'chunked' instead of 'padding'."
         )
 
     # Determine output dtype
@@ -4084,16 +4055,11 @@ def trtllm_fmha_v2_prefill(
         query.dtype == torch.float8_e4m3fn if hasattr(torch, "float8_e4m3fn") else False
     )
     scale_softmax = 1.0 if is_e4m3 else 1.0
-
-    # Softcapping scale (0.0 means disabled)
     softcapping_scale = (
         logits_soft_cap_scale if logits_soft_cap_scale is not None else 0.0
     )
 
-    # Get the JIT-compiled module
     module = get_trtllm_fmha_v2_module()
-
-    # Compute total tokens from cumulative sequence lengths (avoids cudaMemcpy in C++)
     total_q_tokens = int(cum_seq_lens_q[-1].item())
     total_kv_tokens = int(cum_seq_lens_kv[-1].item())
 

@@ -424,16 +424,12 @@ void fmha_v2_run(
   size_t sliding_window_size = size_t(INT_MAX);
   if (attention_mask_type == Attention_mask_type::SLIDING_OR_CHUNKED_CAUSAL) {
     if (window_left != -1) {
-      // FlashInfer's window_left means: attend to positions [qo_idx - window_left, qo_idx]
-      // This is window_left + 1 positions total.
-      // FMHA v2's sliding_window_size means: attend to [row + 1 - sliding_window_size, row]
-      // This is sliding_window_size positions total.
-      // To match semantics: sliding_window_size = window_left + 1
+      // Adjust sliding_window_size so that FMHA v2 matches FlashInfer's window_left semantics.
+      // Set sliding_window_size = window_left + 1.
       sliding_window_size = size_t(window_left + 1);
     }
   }
 
-  // Total tokens passed from Python (computed as cum_seq_lens[-1].item())
   uint32_t total =
       static_cast<uint32_t>(total_q_tokens);  // Used for stride calculations in interleaved mode
 
@@ -535,7 +531,7 @@ void fmha_v2_run(
   const size_t softmax_stats_size = 2 * sizeof(float) * b * s_q * h;
   void* softmax_stats_d = allocator.aligned_alloc<void>(softmax_stats_size, 128, "softmax_stats_d");
   void* softmax_stats_ptr = softmax_stats.has_value() ? softmax_stats_d : nullptr;
-  void* attention_sinks_d = nullptr;
+  void* attention_sinks_d = sinks.has_value() ? sinks.value().data_ptr() : nullptr;
 
   // Initialize pointers for different input layouts
   void* qkv_packed_d = nullptr;
@@ -580,20 +576,9 @@ void fmha_v2_run(
       break;
   }
 
-  // TODO: need to add/derive the following variables for set_params:
-  // - cu_mask_rows_d           (void*) cumulative mask rows
-  // - attention_sinks_d        (void*) attention sinks
-  // - cu_seqlens_d             (void*) cumulative kv sequence lengths
-  //
-  // Also undeclared but used elsewhere:
-  // - mqa_qkv_d, qkv_bsh3d_d, mqa_qkv_packed_d, qkv_packed_d (for qkv_d_view)
-  // - o_packed_d, o_packed_size (for o_d_view)
-  // - save_softmax (bool for softmax_stats_ptr)
-  // - q_seqlens, seqlens (for launch_params)
-
   bert::Fused_multihead_attention_params_v2 params_v2;
   // Print all param set values before calling set_params
-  bool debug = true;
+  bool debug = false;
   if (debug) {
     printf("=== set_params() arguments ===\n");
     printf("launch_params: ...\n");  // For struct, maybe print pointer or describe
