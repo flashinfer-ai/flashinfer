@@ -55,9 +55,9 @@ echo "::endgroup::"
 echo "Cleaning previous builds..."
 rm -rf dist build *.egg-info
 
-# Build the wheel using the build module for better isolation
+# Build the wheel using the build module
 echo "Building wheel..."
-python -m build --wheel
+python -m build --wheel --no-isolation
 
 echo ""
 echo "✓ Build completed successfully"
