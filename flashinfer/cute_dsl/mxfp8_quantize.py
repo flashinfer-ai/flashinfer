@@ -68,6 +68,60 @@ from .quantization_utils import (
 # Target grid size for occupancy
 _TARGET_GRID = 132 * 4
 
+# Warp configuration bounds
+_MIN_WARPS = 4  # Minimum for reasonable occupancy (128 threads)
+_MAX_WARPS = 32  # Maximum to avoid register pressure (1024 threads)
+_DEFAULT_WARPS = 16  # Default when no optimization needed
+
+
+def _compute_optimal_warps_for_k(K: int) -> int:
+    """
+    Compute optimal WARPS_PER_BLOCK for 100% thread utilization.
+
+    For the swizzled kernel, we need:
+        (WARPS × 8) % num_sf_blocks == 0
+
+    where num_sf_blocks = K / 32.
+
+    This ensures that col_units_per_block is evenly divisible by
+    num_sf_blocks_per_row, so all threads are utilized.
+
+    We prefer LARGER warp counts (up to _MAX_WARPS) for better occupancy,
+    while maintaining 100% thread utilization.
+
+    Args:
+        K: Number of columns (must be divisible by 32)
+
+    Returns:
+        Optimal number of warps per block
+    """
+    import math
+
+    num_sf_blocks = K // SF_VEC_SIZE  # K / 32
+
+    # For 100% utilization: (WARPS * 8) % num_sf_blocks == 0
+    # WARPS must be a multiple of: num_sf_blocks / gcd(num_sf_blocks, 8)
+    gcd_val = math.gcd(num_sf_blocks, 8)
+    warp_multiple = num_sf_blocks // gcd_val
+
+    # Find LARGEST valid WARPS in range [_MIN_WARPS, _MAX_WARPS]
+    # that is a multiple of warp_multiple (for best occupancy)
+    if warp_multiple <= _MAX_WARPS:
+        # Find largest multiple of warp_multiple that fits in [_MIN_WARPS, _MAX_WARPS]
+        warps = (_MAX_WARPS // warp_multiple) * warp_multiple
+        if warps >= _MIN_WARPS:
+            return warps
+        # If largest multiple is below _MIN_WARPS, use the smallest valid one
+        warps = warp_multiple
+        while warps < _MIN_WARPS:
+            warps += warp_multiple
+        if warps <= _MAX_WARPS:
+            return warps
+
+    # If warp_multiple is too large, fall back to default
+    # This shouldn't happen for reasonable K values
+    return _DEFAULT_WARPS
+
 
 # =============================================================================
 # CuTe-DSL Kernel Class for Linear Layout
@@ -214,15 +268,18 @@ class MXFP8QuantizeSwizzledKernel:
     MXFP8 quantization kernel optimized for SWIZZLED layout.
 
     Key optimizations:
-    - Row-based iteration instead of SF-block iteration
+    - Multi-row processing: threads process multiple rows per block when K is small
+    - Row-based iteration with grid-stride loop
     - Padding row fast path - only zero out scale factors
-    - Column loop inside kernel for better locality
+
+    Thread utilization optimization:
+    - Dynamic WARPS_PER_BLOCK based on K for 100% thread utilization
+    - For small K: Multiple rows processed per block iteration
+    - For large K: Single row with column loop
 
     This kernel is M-agnostic: compiled once per (K, dtype, pdl) combination.
     M-dependent values (M, padded_M) are passed at runtime.
     """
-
-    WARPS_PER_BLOCK = 16  # 16 warps = 512 threads per block
 
     def __init__(
         self,
@@ -239,6 +296,25 @@ class MXFP8QuantizeSwizzledKernel:
         self.num_sf_blocks_per_row = K // SF_VEC_SIZE
         self.padded_sf_cols = ((self.num_sf_blocks_per_row + 3) // 4) * 4
 
+        # Compute optimal warps for 100% thread utilization
+        self.warps_per_block = _compute_optimal_warps_for_k(K)
+
+        # Multi-row processing constants (compile-time)
+        threads_per_block = self.warps_per_block * WARP_SIZE
+        col_units_per_block = threads_per_block // THREADS_PER_SF
+
+        # threads_per_row = num_sf_blocks_per_row * THREADS_PER_SF = K / 8
+        self.threads_per_row = self.num_sf_blocks_per_row * THREADS_PER_SF
+
+        # rows_per_block = col_units_per_block // num_sf_blocks_per_row
+        # With optimal warps, this should divide evenly for small K
+        if self.num_sf_blocks_per_row <= col_units_per_block:
+            self.rows_per_block = col_units_per_block // self.num_sf_blocks_per_row
+            self.needs_col_loop = False
+        else:
+            self.rows_per_block = 1
+            self.needs_col_loop = True
+
     @cute.jit
     def __call__(
         self,
@@ -249,15 +325,18 @@ class MXFP8QuantizeSwizzledKernel:
         padded_M: Int32,
         stream,
     ):
-        threads_per_block = self.WARPS_PER_BLOCK * WARP_SIZE
+        threads_per_block = self.warps_per_block * WARP_SIZE
+        rows_per_block = self.rows_per_block
 
         # Compute grid size at runtime
-        num_blocks = cutlass.min(padded_M, _TARGET_GRID)
+        # Grid covers row batches, not individual rows
+        total_row_batches = cute.ceil_div(padded_M, rows_per_block)
+        num_blocks = cutlass.min(total_row_batches, _TARGET_GRID)
 
         self.kernel(mInput, mOutput, mScales, M, padded_M).launch(
             grid=[num_blocks, 1, 1],
             block=[threads_per_block, 1, 1],
-            max_number_threads=[512, 1, 1],
+            max_number_threads=[threads_per_block, 1, 1],
             min_blocks_per_mp=4,
             stream=stream,
             use_pdl=self.enable_pdl,
@@ -273,112 +352,188 @@ class MXFP8QuantizeSwizzledKernel:
         padded_M: Int32,
     ):
         """
-        Row-based kernel for swizzled layout.
+        Multi-row kernel for swizzled layout.
 
-        Each block processes one or more rows (grid-stride).
-        Within each row, threads iterate over columns.
+        When K is small: each block processes multiple rows simultaneously.
+        When K is large: each block processes one row with column loop.
         """
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         grid_dim_x, _, _ = cute.arch.grid_dim()
 
+        # Compile-time constants
         num_sf_blocks_per_row = self.num_sf_blocks_per_row
         padded_sf_cols = self.padded_sf_cols
+        threads_per_row = self.threads_per_row
+        rows_per_block = self.rows_per_block
 
-        # Thread organization within a row:
-        # - Each "column unit" needs 4 threads (THREADS_PER_SF)
-        # - tidx determines which column unit and which thread within unit
-        col_unit_idx = tidx // THREADS_PER_SF
-        thread_in_unit = tidx % THREADS_PER_SF
+        if cutlass.const_expr(self.needs_col_loop):
+            # Large K path: single row per block iteration with column loop
+            # This is the original algorithm for K > 4096
+            col_unit_idx = tidx // THREADS_PER_SF
+            thread_in_unit = tidx % THREADS_PER_SF
+            threads_per_block = self.warps_per_block * WARP_SIZE
+            col_units_per_block = threads_per_block // THREADS_PER_SF
 
-        threads_per_block = self.WARPS_PER_BLOCK * WARP_SIZE
-        col_units_per_block = threads_per_block // THREADS_PER_SF  # 512/4 = 128
+            row_idx = bidx
+            while row_idx < padded_M:
+                is_padding_row = row_idx >= M
 
-        # Grid-stride loop over rows
-        row_idx = bidx
-        while row_idx < padded_M:
-            is_padding_row = row_idx >= M
-
-            if is_padding_row:
-                # Fast path: padding row - only zero out scale factors
-                sf_col_idx = col_unit_idx
-                while sf_col_idx < padded_sf_cols:
-                    if thread_in_unit == Int32(0):
-                        sf_offset = compute_sf_index_swizzled_128x4_gpu(
-                            row_idx, sf_col_idx, padded_sf_cols
+                if is_padding_row:
+                    # Fast path: padding row - only zero out scale factors
+                    sf_col_idx = col_unit_idx
+                    while sf_col_idx < padded_sf_cols:
+                        if thread_in_unit == Int32(0):
+                            sf_offset = compute_sf_index_swizzled_128x4_gpu(
+                                row_idx, sf_col_idx, padded_sf_cols
+                            )
+                            mScales[sf_offset] = Uint8(0)
+                        sf_col_idx = sf_col_idx + col_units_per_block
+                else:
+                    # Normal path: process actual data row with column loop
+                    sf_col_idx = col_unit_idx
+                    while sf_col_idx < num_sf_blocks_per_row:
+                        elem_idx = (
+                            sf_col_idx * SF_VEC_SIZE + thread_in_unit * ELTS_PER_THREAD
                         )
-                        mScales[sf_offset] = Uint8(0)
-                    sf_col_idx = sf_col_idx + col_units_per_block
-            else:
-                # Normal path: process actual data row
-                sf_col_idx = col_unit_idx
-                while sf_col_idx < num_sf_blocks_per_row:
-                    # Calculate element position
-                    elem_idx = (
-                        sf_col_idx * SF_VEC_SIZE + thread_in_unit * ELTS_PER_THREAD
-                    )
 
-                    row_input = mInput[row_idx, None]
-                    input_ptr_i64 = get_ptr_as_int64(row_input, elem_idx)
+                        row_input = mInput[row_idx, None]
+                        input_ptr_i64 = get_ptr_as_int64(row_input, elem_idx)
+                        v0, v1, v2, v3 = ld_global_v4_u32(input_ptr_i64)
 
-                    # Load 8 FP16 values (128 bits)
-                    v0, v1, v2, v3 = ld_global_v4_u32(input_ptr_i64)
+                        if cutlass.const_expr(self.is_bfloat16):
+                            max0123 = bfloat2_max_abs_4(v0, v1, v2, v3)
+                            local_max = bfloat2_hmax_reduce_to_f32(max0123)
+                        else:
+                            max0123 = half2_max_abs_4(v0, v1, v2, v3)
+                            local_max = hmax_reduce_to_f32(max0123)
 
-                    # Compute max absolute value across 8 elements (4 half2/bfloat2)
-                    if cutlass.const_expr(self.is_bfloat16):
-                        max0123 = bfloat2_max_abs_4(v0, v1, v2, v3)
-                        local_max = bfloat2_hmax_reduce_to_f32(max0123)
+                        global_max = reduce_max_4threads(local_max)
+                        inv_e4m3_max = Float32(INV_FLOAT8_E4M3_MAX)
+                        normalized_max = global_max * inv_e4m3_max
+                        scale_ue8m0_u32 = float_to_ue8m0_fast(normalized_max)
+                        scale_ue8m0 = scale_ue8m0_u32.to(Uint8)
+                        inv_scale = ue8m0_to_inv_scale_fast(scale_ue8m0_u32)
+
+                        if cutlass.const_expr(self.is_bfloat16):
+                            fp8_packed = bfloat2x4_to_fp8x8_packed(
+                                v0, v1, v2, v3, inv_scale
+                            )
+                        else:
+                            fp8_packed = half2x4_to_fp8x8_packed(
+                                v0, v1, v2, v3, inv_scale
+                            )
+
+                        row_output = mOutput[row_idx, None]
+                        output_ptr_i64 = get_ptr_as_int64(row_output, elem_idx)
+                        st_global_u64(output_ptr_i64, fp8_packed)
+
+                        if thread_in_unit == Int32(0):
+                            sf_offset = compute_sf_index_swizzled_128x4_gpu(
+                                row_idx, sf_col_idx, padded_sf_cols
+                            )
+                            mScales[sf_offset] = scale_ue8m0
+
+                        sf_col_idx = sf_col_idx + col_units_per_block
+
+                    # Handle padding columns
+                    sf_col_idx = num_sf_blocks_per_row + col_unit_idx
+                    while sf_col_idx < padded_sf_cols:
+                        if thread_in_unit == Int32(0):
+                            sf_offset = compute_sf_index_swizzled_128x4_gpu(
+                                row_idx, sf_col_idx, padded_sf_cols
+                            )
+                            mScales[sf_offset] = Uint8(0)
+                        sf_col_idx = sf_col_idx + col_units_per_block
+
+                row_idx = row_idx + grid_dim_x
+        else:
+            # Small K path: multi-row processing (K <= 4096)
+            # Each block processes rows_per_block rows simultaneously
+            # Thread mapping: tidx -> (row_in_block, sf_col_idx, thread_in_unit)
+            row_in_block = tidx // threads_per_row
+            local_tidx = tidx % threads_per_row
+            sf_col_idx = local_tidx // THREADS_PER_SF
+            thread_in_unit = local_tidx % THREADS_PER_SF
+
+            # Grid-stride loop over row batches
+            row_batch_idx = bidx
+            # Initialize row_idx before while loop (CuTe DSL requires variables
+            # modified in while loops to be defined before the loop)
+            row_idx = row_batch_idx * rows_per_block + row_in_block
+            while row_batch_idx * rows_per_block < padded_M:
+                # Check if this thread's row is valid
+                if row_idx < padded_M:
+                    is_padding_row = row_idx >= M
+
+                    if is_padding_row:
+                        # Fast path: padding row - zero out scale factors
+                        # Each thread handles one SF column (no column loop needed)
+                        if sf_col_idx < padded_sf_cols and thread_in_unit == Int32(0):
+                            sf_offset = compute_sf_index_swizzled_128x4_gpu(
+                                row_idx, sf_col_idx, padded_sf_cols
+                            )
+                            mScales[sf_offset] = Uint8(0)
                     else:
-                        max0123 = half2_max_abs_4(v0, v1, v2, v3)
-                        local_max = hmax_reduce_to_f32(max0123)
+                        # Normal path: process actual data
+                        if sf_col_idx < num_sf_blocks_per_row:
+                            elem_idx = (
+                                sf_col_idx * SF_VEC_SIZE
+                                + thread_in_unit * ELTS_PER_THREAD
+                            )
 
-                    # 4-thread reduction for this SF block
-                    global_max = reduce_max_4threads(local_max)
+                            row_input = mInput[row_idx, None]
+                            input_ptr_i64 = get_ptr_as_int64(row_input, elem_idx)
+                            v0, v1, v2, v3 = ld_global_v4_u32(input_ptr_i64)
 
-                    # Compute UE8M0 scale factor
-                    inv_e4m3_max = Float32(INV_FLOAT8_E4M3_MAX)
-                    normalized_max = global_max * inv_e4m3_max
-                    scale_ue8m0_u32 = float_to_ue8m0_fast(normalized_max)
-                    scale_ue8m0 = scale_ue8m0_u32.to(Uint8)
+                            if cutlass.const_expr(self.is_bfloat16):
+                                max0123 = bfloat2_max_abs_4(v0, v1, v2, v3)
+                                local_max = bfloat2_hmax_reduce_to_f32(max0123)
+                            else:
+                                max0123 = half2_max_abs_4(v0, v1, v2, v3)
+                                local_max = hmax_reduce_to_f32(max0123)
 
-                    # Compute inverse scale for quantization
-                    inv_scale = ue8m0_to_inv_scale_fast(scale_ue8m0_u32)
+                            global_max = reduce_max_4threads(local_max)
+                            inv_e4m3_max = Float32(INV_FLOAT8_E4M3_MAX)
+                            normalized_max = global_max * inv_e4m3_max
+                            scale_ue8m0_u32 = float_to_ue8m0_fast(normalized_max)
+                            scale_ue8m0 = scale_ue8m0_u32.to(Uint8)
+                            inv_scale = ue8m0_to_inv_scale_fast(scale_ue8m0_u32)
 
-                    # Quantize to FP8 E4M3 and pack for vectorized store
-                    if cutlass.const_expr(self.is_bfloat16):
-                        fp8_packed = bfloat2x4_to_fp8x8_packed(
-                            v0, v1, v2, v3, inv_scale
-                        )
-                    else:
-                        fp8_packed = half2x4_to_fp8x8_packed(v0, v1, v2, v3, inv_scale)
+                            if cutlass.const_expr(self.is_bfloat16):
+                                fp8_packed = bfloat2x4_to_fp8x8_packed(
+                                    v0, v1, v2, v3, inv_scale
+                                )
+                            else:
+                                fp8_packed = half2x4_to_fp8x8_packed(
+                                    v0, v1, v2, v3, inv_scale
+                                )
 
-                    # Store FP8 output
-                    row_output = mOutput[row_idx, None]
-                    output_ptr_i64 = get_ptr_as_int64(row_output, elem_idx)
-                    st_global_u64(output_ptr_i64, fp8_packed)
+                            row_output = mOutput[row_idx, None]
+                            output_ptr_i64 = get_ptr_as_int64(row_output, elem_idx)
+                            st_global_u64(output_ptr_i64, fp8_packed)
 
-                    # Thread 0 of the 4-thread group stores swizzled scale factor
-                    if thread_in_unit == Int32(0):
-                        sf_offset = compute_sf_index_swizzled_128x4_gpu(
-                            row_idx, sf_col_idx, padded_sf_cols
-                        )
-                        mScales[sf_offset] = scale_ue8m0
+                            if thread_in_unit == Int32(0):
+                                sf_offset = compute_sf_index_swizzled_128x4_gpu(
+                                    row_idx, sf_col_idx, padded_sf_cols
+                                )
+                                mScales[sf_offset] = scale_ue8m0
 
-                    # Move to next column unit
-                    sf_col_idx = sf_col_idx + col_units_per_block
+                        # Handle padding SF columns (for this row)
+                        # Threads with sf_col_idx in [num_sf_blocks_per_row, padded_sf_cols)
+                        if (
+                            sf_col_idx >= num_sf_blocks_per_row
+                            and sf_col_idx < padded_sf_cols
+                            and thread_in_unit == Int32(0)
+                        ):
+                            sf_offset = compute_sf_index_swizzled_128x4_gpu(
+                                row_idx, sf_col_idx, padded_sf_cols
+                            )
+                            mScales[sf_offset] = Uint8(0)
 
-                # Handle padding columns if needed (zero out scale factors)
-                sf_col_idx = num_sf_blocks_per_row + col_unit_idx
-                while sf_col_idx < padded_sf_cols:
-                    if thread_in_unit == Int32(0):
-                        sf_offset = compute_sf_index_swizzled_128x4_gpu(
-                            row_idx, sf_col_idx, padded_sf_cols
-                        )
-                        mScales[sf_offset] = Uint8(0)
-                    sf_col_idx = sf_col_idx + col_units_per_block
-
-            # Move to next row (grid-stride)
-            row_idx = row_idx + grid_dim_x
+                row_batch_idx = row_batch_idx + grid_dim_x
+                # Update row_idx for next iteration
+                row_idx = row_batch_idx * rows_per_block + row_in_block
 
         # PDL: Signal that dependent kernels can start early
         if cutlass.const_expr(self.enable_pdl):
