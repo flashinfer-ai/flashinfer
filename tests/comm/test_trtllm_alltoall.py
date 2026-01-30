@@ -18,6 +18,14 @@ import pytest
 import torch
 
 import flashinfer.comm.trtllm_alltoall as tllm_alltoall
+from flashinfer.utils import get_compute_capability
+
+# Skip all tests on SM110 (Thor) devices due to known issues
+pytestmark = pytest.mark.skipif(
+    torch.cuda.is_available()
+    and get_compute_capability(torch.device("cuda:0"))[0] == 11,
+    reason="Skipping trtllm_alltoall tests on SM110 (Thor) devices",
+)
 
 has_setup_max_sm_count = False
 
