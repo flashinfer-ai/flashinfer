@@ -38,6 +38,7 @@ from ..utils import (
 )
 from .utils import generate_additional_params
 from .fmha_v2.generate_kernels import enumerate_kernels
+from .fmha_v2.fmha_library import generate_jit_sources
 
 
 def get_single_decode_uri(
@@ -1899,12 +1900,7 @@ def gen_cudnn_fmha_module():
     )
 
 
-def get_trtllm_fmha_v2_module():
-    module = gen_trtllm_fmha_v2_module().build_and_load()
-    return module
-
-
-def gen_trtllm_fmha_v2_module() -> JitSpec:
+def gen_trtllm_fmha_v2_sm120_module(device: torch.device) -> JitSpec:
     uri = "trtllm_fmha_v2"
     cached_ops = jit_env.FLASHINFER_JIT_DIR / uri
     cached_ops.mkdir(parents=True, exist_ok=True)
@@ -1932,6 +1928,53 @@ def gen_trtllm_fmha_v2_module() -> JitSpec:
     )
     nvcc_flags.append(f"-I{jit_env.FLASHINFER_CSRC_DIR / 'fmha_v2'}")
     nvcc_flags.append("-Wno-deprecated-gpu-targets")
+
+    return gen_jit_spec(
+        uri,
+        source_paths,
+        extra_cuda_cflags=nvcc_flags,
+    )
+
+
+def gen_fmha_v2_module() -> JitSpec:
+    uri = "trtllm_fmha_v2"
+
+    # Setup generated source directory
+    gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
+    gen_directory.mkdir(parents=True, exist_ok=True)
+
+    # Source directories
+    csrc_dir = jit_env.FLASHINFER_CSRC_DIR
+    fmha_v2_src_dir = csrc_dir / "fmha_v2"
+    source_paths = generate_jit_sources()
+
+    # copy static fmha_v2_run.cu
+    static_run_path = csrc_dir / "fmha_v2_run.cu"
+    run_path = gen_directory / "fmha_v2_run.cu"
+    with open(static_run_path, "r") as f:
+        write_if_different(run_path, f.read())
+    source_paths.append(run_path)
+
+    # copy static fmha_v2_jit_binding.cu
+    static_binding_path = csrc_dir / "fmha_v2_jit_binding.cu"
+    binding_path = gen_directory / "fmha_v2_jit_binding.cu"
+    with open(static_binding_path, "r") as f:
+        write_if_different(binding_path, f.read())
+    source_paths.append(binding_path)
+
+    # Setup compilation flags
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[9, 12]
+    )
+    nvcc_flags.extend(
+        [
+            f"-I{fmha_v2_src_dir}",
+            f"-I{gen_directory}",  # For fmha_v2_api.h
+            f"-I{jit_env.FLASHINFER_CSRC_DIR / 'fmha_v2'}",
+            f"-I{jit_env.FLASHINFER_INCLUDE_DIR}",  # For flashinfer headers
+            "-Wno-deprecated-gpu-targets",
+        ]
+    )
 
     return gen_jit_spec(
         uri,
