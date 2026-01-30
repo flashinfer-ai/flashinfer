@@ -496,7 +496,10 @@ __device__ uint64_t cvt_warp_fp16_to_mxfp8(PackedVec<Type, CVT_ELTS_PER_THREAD>&
   SFValue = static_cast<float>(tmpSFVal);
   fp8SFVal = tmpSFVal.__x;
   // Get the output scale (reciprocal of the SFValue).
-  float outputScale = vecMax != 0.f ? reciprocal_approximate_ftz(SFValue) : 0.0f;
+  // Note: Check SFValue != 0 (not vecMax != 0) because E8M0 conversion can underflow
+  // very small vecMax values to zero. Using vecMax != 0 would cause division by zero
+  // (reciprocal of 0 = infinity), leading to NaN when multiplied with denormal inputs.
+  float outputScale = SFValue != 0.f ? reciprocal_approximate_ftz(SFValue) : 0.0f;
 
   if (SFout) {
     // Write the SF to global memory (STG.8).

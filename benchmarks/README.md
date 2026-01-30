@@ -29,6 +29,8 @@ Currently supports testing attention, gemm, fused MOE, normalization, and quanti
     - `trtllm_fp8_block_scale_moe` - MOE with FP8 quantized weights and block-wise scaling.
     - `trtllm_fp8_per_tensor_scale_moe` - MOE with FP8 quantized weights and per-tensor scaling.
     - `cutlass_fused_moe` - CUTLASS fused MoE (base/fp8/nvfp4 variants with optional TP/EP)
+- MOE Communication:
+    - `moe_a2a_dispatch_combine` - MoE All-to-All dispatch + combine benchmark for multi-GPU expert-parallel inference. Requires `mpirun` for multi-GPU execution. Supports optional quantization (FP8, NVFP4, FP8 block-scale) and real MoE kernel computation.
 - Norm:
     - `rmsnorm` - Root Mean Square Layer Normalization.
     - `rmsnorm_quant` - RMSNorm with FP8 quantized output.
@@ -238,6 +240,50 @@ Notes:
 - FP8 MOE kernels require integer values for group parameters, while FP4 MOE kernels accept optional values.
 - CUTLASS fused MoE (`cutlass_fused_moe`) ignores `--routing_method`, `--n_group`, and `--topk_group`; it computes routing via softmax+top-k internally from the provided logits.
 
+### MoE Communication Flags (moe_a2a_dispatch_combine)
+The `moe_a2a_dispatch_combine` routine benchmarks MoE All-to-All communication for multi-GPU expert-parallel inference. It must be launched with `mpirun`.
+
+| Flag                     | Description                                                                                                 |
+|--------------------------|-------------------------------------------------------------------------------------------------------------|
+| `--num_tokens`           | Number of tokens per rank (local batch size)                                                               |
+| `--hidden_size`          | Hidden dimension size                                                                                      |
+| `--num_experts`          | Total number of experts across all ranks                                                                   |
+| `--top_k`                | Number of experts to route each token to                                                                   |
+| `--input_dtype`          | Data type for hidden states payload: `bfloat16` (default) or `float16`                                     |
+| `--quant_dtype`          | Quantization format: `fp8` (per-tensor), `nvfp4` (block-scale FP4), `fp8_block_scale` (block-scale FP8)    |
+| `--real_math`            | Run actual MoE kernels instead of fake computation. Requires `--intermediate_size` and `--quant_dtype` to be `nvfp4` or `fp8_block_scale` |
+| `--intermediate_size`    | Intermediate FFN size. Required if `--real_math` is set                                                    |
+| `--max_num_tokens`       | Max tokens per rank for workspace allocation. Defaults to `--num_tokens`                                   |
+| `--validate`             | Run correctness validation before benchmarking using deterministic fake MoE                                |
+| `--per_phase_timing`     | Enable per-phase timing (dispatch/combine/moe_kernel). Adds slight overhead from CUDA events               |
+| `--nvtx`                 | Enable NVTX markers for Nsight Systems profiling                                                           |
+
+**Launch Examples:**
+```bash
+# Basic (no quantization)
+mpirun -np 8 python benchmarks/flashinfer_benchmark.py \
+    --routine moe_a2a_dispatch_combine \
+    --num_tokens 1024 --hidden_size 7168 --num_experts 256 --top_k 8
+
+# With FP8 quantization
+mpirun -np 8 python benchmarks/flashinfer_benchmark.py \
+    --routine moe_a2a_dispatch_combine \
+    --num_tokens 1024 --hidden_size 7168 --num_experts 256 --top_k 8 \
+    --quant_dtype fp8
+
+# With NVFP4 quantization and real MoE kernel
+mpirun -np 8 python benchmarks/flashinfer_benchmark.py \
+    --routine moe_a2a_dispatch_combine \
+    --num_tokens 1024 --hidden_size 7168 --num_experts 256 --top_k 8 \
+    --quant_dtype nvfp4 --real_math --intermediate_size 18432
+
+# With validation and per-phase timing
+mpirun -np 8 python benchmarks/flashinfer_benchmark.py \
+    --routine moe_a2a_dispatch_combine \
+    --num_tokens 1024 --hidden_size 7168 --num_experts 256 --top_k 8 \
+    --validate --per_phase_timing
+```
+
 ### Norm Flags
 | Flag                     | Description                                                                                                 |
 |--------------------------|-------------------------------------------------------------------------------------------------------------|
@@ -301,6 +347,7 @@ Legend:
 | **trtllm_fp8_block_scale_moe** |  |  |  |  |  | trtllm | trtllm |  |
 | **trtllm_fp8_per_tensor_scale_moe** |  |  |  |  |  | trtllm | trtllm |  |
 | **cutlass_fused_moe** |  |  |  |  |  | cutlass | cutlass |  |
+| **moe_a2a_dispatch_combine** |  |  |  |  |  | moe_a2a | moe_a2a |  |
 | **rmsnorm** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
 | **rmsnorm_quant** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
 | **fused_add_rmsnorm_quant** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
@@ -324,3 +371,4 @@ Backend Legend:
 - trtllm-native: TensorRT-LLM (out-of-wrapper)
 - cuda: FlashInfer CUDA kernels
 - cute-dsl: FlashInfer CuTe-DSL kernels (Blackwell SM10.0+)
+- moe_a2a: MoE All-to-All communication (requires mpirun, Blackwell SM10.0+ with MNNVL)
