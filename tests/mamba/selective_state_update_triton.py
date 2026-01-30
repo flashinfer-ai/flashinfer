@@ -154,6 +154,7 @@ def _selective_scan_update_kernel(
         state_batch_idx = tl.load(state_batch_indices_ptr).to(tl.int64)
         state_ptr += state_batch_idx * stride_state_batch + pid_h * stride_state_head
     else:
+        state_batch_idx = pid_b
         state_ptr += pid_b * stride_state_batch + pid_h * stride_state_head
 
     x_ptr += pid_b * stride_x_batch + pid_h * stride_x_head
@@ -261,20 +262,17 @@ def _selective_scan_update_kernel(
         state = state * dA + dB * x[:, None]
 
         if CACHE_INTERMEDIATE_STATES:
-            if HAS_STATE_BATCH_INDICES:
-                if state_batch_idx != pad_slot_id:
-                    cache_ptr_base = (
-                        intermediate_states_buffer
-                        + cache_idx * cache_steps * nheads * dim * dstate
-                        + current_step_idx * nheads * dim * dstate
-                        + pid_h * dim * dstate
-                    )
-                    cache_ptrs = cache_ptr_base + (
-                        offs_m[:, None] * dstate + offs_n[None, :]
-                    )
-                    tl.store(
-                        cache_ptrs, state.to(cache_ptrs.dtype.element_ty), mask=mask
-                    )
+            if state_batch_idx != pad_slot_id:
+                cache_ptr_base = (
+                    intermediate_states_buffer
+                    + cache_idx * cache_steps * nheads * dim * dstate
+                    + current_step_idx * nheads * dim * dstate
+                    + pid_h * dim * dstate
+                )
+                cache_ptrs = cache_ptr_base + (
+                    offs_m[:, None] * dstate + offs_n[None, :]
+                )
+                tl.store(cache_ptrs, state.to(cache_ptrs.dtype.element_ty), mask=mask)
 
         out = tl.sum(state * C[None, :], axis=1)
         if HAS_D:
