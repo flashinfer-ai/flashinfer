@@ -166,7 +166,7 @@ __global__ void selective_state_update_kernel_simple(SelectiveStateUpdateParams 
 
         out_value += new_state * C_value;
       }
-      if (state_batch != params.pad_slot_id)
+      if (params.update_state && state_batch != params.pad_slot_id)
         *reinterpret_cast<load_state_t*>(&state[d * DSTATE + i]) = rState;
     }
 
