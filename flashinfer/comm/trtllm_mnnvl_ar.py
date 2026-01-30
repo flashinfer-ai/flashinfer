@@ -19,7 +19,21 @@ from ..jit import gen_trtllm_mnnvl_comm_module
 from ..utils import register_custom_op
 from .mnnvl import McastGPUBuffer, CommBackend, MPIBackend
 from .workspace_base import AllReduceFusionWorkspace
-
+from .torch_symmetric_memory import _alloc_symm_buffer_bytes
+from ..cuda_utils import checkCudaErrors
+try:
+    # cuda-python >= 12.9 (has cuda.bindings.driver)
+    from cuda.bindings import driver as cuda
+except ImportError:
+    try:
+        # cuda-python < 12.9 (no cuda.bindings.driver, use cuda as driver)
+        # from cuda import cuda is not available in cuda-python >= 13.0
+        from cuda import cuda
+    except ImportError as e:
+        raise ImportError(
+            "Could not import the 'cuda' module. "
+            "Please install cuda-python that matches your CUDA version."
+        ) from e
 
 def mpi_barrier():
     from mpi4py import MPI
@@ -131,17 +145,19 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             f"[MNNVL Allreduce] TP size: {mapping.tp_size}, rank: {mapping.tp_rank}, Allocating workspace with requested size {buffer_size_in_bytes} bytes per buffer."
         )
 
-        # Allocate the workspace
-        self.mcast_buffer_handle = McastGPUBuffer(
+        device=torch.device("cuda", mapping.local_rank)
+        #TODO (asamani): fix group based on comm_backend?
+        group = torch.distributed.group.WORLD
+        group_name = group.group_name if group is not None else torch.distributed.group.WORLD.group_name
+        self.ptrs, self.tensor, self.handle = _alloc_symm_buffer_bytes(
             requested_workspace_size,
             mapping.tp_size,
-            mapping.tp_rank,
-            torch.device("cuda", mapping.local_rank),
-            comm_backend,
+            torch.float32, #TODO(asamani): should this always be f32 or dtype?
+            device,
+            group_name,
         )
-
         # Get the actual usable buffer size after allocation (buf_size is updated by McastGPUBuffer)
-        allocated_size = self.mcast_buffer_handle.buf_size
+        allocated_size = self.handle.buffer_size - self.handle.signal_pad_size
         # We want the buffer size to be aligned to 16B which is the granularity for buffer management.
         self.buffer_size_bytes = (
             math.floor(allocated_size / self.NUM_LAMPORT_BUFFERS) // 16 * 16
@@ -154,7 +170,8 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         )
 
         # We use FP32 for sentinel value regardless of the real dtype
-        self.mcast_buffer_handle.lamport_initialize(mapping.tp_rank, torch.float32)
+        self.lamport_initialize(mapping.tp_rank, torch.float32, allocated_size)
+
         # Wait until the initialization is done
         torch.cuda.synchronize()
         comm_backend.barrier()
@@ -170,9 +187,26 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             device=torch.device("cuda", mapping.local_rank),
         )
 
-        self.uc_ptrs_dev = self.mcast_buffer_handle.get_buffer_ptrs_dev()
-        self.uc_ptr_local = self.mcast_buffer_handle.get_unicast_ptr(self.rank)
-        self.mc_ptr = self.mcast_buffer_handle.get_multicast_ptr()
+        self.uc_ptrs_dev = self.handle.buffer_ptrs_dev
+        self.uc_ptr_local = self.handle.buffer_ptrs[self.rank]
+        self.mc_ptr = self.handle.multicast_ptr
+
+    def lamport_initialize(self, rank: int, dtype: torch.dtype, allocated_size: int):
+        if dtype == torch.bfloat16 or dtype == torch.float16:
+            neg_zero = 0x8000
+            dsize = 2
+            memset_func = cuda.cuMemsetD16
+        elif dtype == torch.float32:
+            neg_zero = 0x80000000
+            dsize = 4
+            memset_func = cuda.cuMemsetD32
+        else:
+            raise ValueError(f"Unsupported dtype: {dtype}")
+        
+        num_elements = (allocated_size) // dsize
+        checkCudaErrors(
+            memset_func(int(self.ptrs[rank]), neg_zero, num_elements)
+        )
 
     @functools.cache
     def is_buffer_size_sufficient(
@@ -232,11 +266,13 @@ class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         if getattr(self, "_destroyed", False):
             return  # Already destroyed, nothing to do
 
-        del self.mcast_buffer_handle
         del self.buffer_flags
         del self.uc_ptrs_dev
         del self.uc_ptr_local
         del self.mc_ptr
+        del self.tensor
+        del self.handle
+        del self.ptrs
         self._destroyed = True
 
 
