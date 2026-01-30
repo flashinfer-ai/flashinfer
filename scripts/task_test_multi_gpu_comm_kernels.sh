@@ -14,7 +14,7 @@ DISABLE_SANITY_TEST=true
 
 # Source common test functions
 # shellcheck disable=SC1091  # File exists, checked separately
-source "${SCRIPT_DIR}/common_test_functions.sh"
+source "${SCRIPT_DIR}/test_utils.sh"
 
 # Define the specific test files for multi-GPU comm tests (single-node)
 # TEST_FILES="tests/comm/test_allreduce_unified_api.py tests/comm/test_allreduce_negative.py tests/comm/test_trtllm_allreduce_fusion.py"
@@ -25,9 +25,6 @@ TEST_FILES="tests/comm/test_allreduce_unified_api.py"
 main() {
     # Parse command line arguments
     parse_args "$@"
-
-    # Clean Python cache
-    clean_python_cache
 
     # Print test mode banner
     print_test_mode_banner

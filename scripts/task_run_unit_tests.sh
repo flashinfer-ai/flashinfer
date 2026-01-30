@@ -9,7 +9,7 @@ source "${SCRIPT_DIR}/setup_test_env.sh"
 
 # Source common test functions
 # shellcheck disable=SC1091  # File exists, checked separately
-source "${SCRIPT_DIR}/common_test_functions.sh"
+source "${SCRIPT_DIR}/test_utils.sh"
 
 # Find and filter test files based on pytest.ini exclusions
 find_test_files() {
@@ -71,9 +71,6 @@ find_test_files() {
 main() {
     # Parse command line arguments
     parse_args "$@"
-
-    # Clean Python cache
-    clean_python_cache
 
     # Print test mode banner
     print_test_mode_banner

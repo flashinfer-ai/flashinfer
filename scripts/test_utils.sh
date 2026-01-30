@@ -14,7 +14,7 @@ if [ -z "${SAMPLE_OFFSET:-}" ]; then
 fi
 
 # Pytest configuration flags
-PYTEST_FLAGS="--continue-on-collection-errors -s"
+PYTEST_FLAGS="--continue-on-collection-errors"
 
 # Command prefix for pytest (e.g., "mpirun -np 4" for multi-GPU tests)
 : "${PYTEST_COMMAND_PREFIX:=}"
@@ -27,15 +27,6 @@ TOTAL_TEST_CASES=0
 SAMPLED_TEST_CASES=0
 # shellcheck disable=SC2034  # EXIT_CODE is used by calling scripts
 EXIT_CODE=0
-
-# Clean Python bytecode cache to avoid stale imports
-clean_python_cache() {
-    echo "Cleaning Python bytecode cache..."
-    find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
-    find . -type f -name '*.pyc' -delete 2>/dev/null || true
-    echo "Cache cleaned."
-    echo ""
-}
 
 # Parse command line arguments
 # Set DISABLE_SANITY_TEST=true before sourcing to disable sanity testing
