@@ -683,8 +683,11 @@ jobs:
   # ---------------------------------------------------------------------------
   gpu-tests-b200:
     name: JIT Unittest (B200)
-    needs: setup
-    if: needs.setup.outputs.skip_build != 'true' && github.event.inputs.skip_gpu != 'true'
+    needs: [gate, setup]
+    if: |
+      needs.gate.outputs.authorized == 'true' &&
+      needs.setup.outputs.skip_build != 'true' &&
+      github.event.inputs.skip_gpu != 'true'
     runs-on: [self-hosted, Linux, X64, gpu, b200]
     timeout-minutes: 360
     env:
@@ -732,8 +735,11 @@ jobs:
   # ---------------------------------------------------------------------------
   gpu-tests-h100:
     name: JIT Unittest (H100)
-    needs: setup
-    if: needs.setup.outputs.skip_build != 'true' && github.event.inputs.skip_gpu != 'true'
+    needs: [gate, setup]
+    if: |
+      needs.gate.outputs.authorized == 'true' &&
+      needs.setup.outputs.skip_build != 'true' &&
+      github.event.inputs.skip_gpu != 'true'
     runs-on: [self-hosted, Linux, X64, gpu, h100]
     timeout-minutes: 360
     env:
