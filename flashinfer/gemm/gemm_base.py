@@ -345,22 +345,22 @@ def mm_bf16(
         Weight tensor, shape (k, n), bf16 in column-major layout.
 
     bias: Optional[torch.Tensor]
-        Optional bias tensor, shape (n,). If provided, can only be used with the TGV backend. Defaults to ``None``.
+        Optional bias tensor, shape (n,). Enabled for TGV backend. Defaults to ``None``.
 
     pdl: bool
-        Whether to use persistant data loader mode. Can only be used with the TGV backend. Defaults to ``False``.
+        Whether to use persistant data loader mode. Enabled for TGV backend. Defaults to ``False``.
 
     out: Optional[torch.Tensor]
-        Out tensor, shape (m, n), bf16 or fp16. If provided, can only be used with the CUTLASS backend. Defaults to ``None``.
+        Out tensor, shape (m, n), bf16 or fp16. Enabled for CUTLASS backend. Defaults to ``None``.
 
     out_dtype: torch.dtype
-        Output dtype, bf16 or fp16. Can be used with the CUTLASS or cuDNN backends. Defaults to ``torch.bfloat16``.
+        Output dtype, bf16 or fp16. Enabled for CUTLASS and cuDNN backends. Defaults to ``torch.bfloat16``.
 
     backend: Literal["cudnn", "cutlass", "tgv", "auto"]
         The backend to use for the operation. Defaults to ``"tgv"``.
-        ``"cudnn"`` uses the cuDNN backend (no bias/pdl support).
-        ``"cutlass"`` uses the CUTLASS backend (no bias/pdl support).
-        ``"tgv"`` uses the TGV backend (supports bias/pdl, bf16 output only).
+        ``"cudnn"`` uses the cuDNN backend.
+        ``"cutlass"`` uses the CUTLASS backend.
+        ``"tgv"`` uses the TGV backend.
         ``"auto"`` allows selecting the best tactic from all available backends when autotune is enabled.
 
     Returns
