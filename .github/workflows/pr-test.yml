@@ -256,9 +256,20 @@ jobs:
             exit 0
           fi
           for JOB_ID in $FAILED_JOBS; do
-            # Download logs (may be ZIP or plain text depending on GitHub API)
+            # First check job metadata for runner communication errors
+            # This catches "The operation was canceled" which appears in annotations, not logs
+            JOB_INFO=$(gh api "/repos/${{ github.repository }}/actions/jobs/${JOB_ID}" 2>/dev/null || true)
+            if echo "$JOB_INFO" | grep -qiE "operation was canceled|runner.*lost|lost communication"; then
+              echo "Detected: Runner lost communication or operation canceled (job $JOB_ID)"
+              SPOT_TERMINATION=true
+              break
+            fi
+
+            # Try to download logs - if we can't, likely infrastructure failure
             if ! gh api "/repos/${{ github.repository }}/actions/jobs/${JOB_ID}/logs" > job_log.zip 2>/dev/null; then
-              continue
+              echo "Detected: Cannot download logs, likely infrastructure failure (job $JOB_ID)"
+              SPOT_TERMINATION=true
+              break
             fi
             # Try to unzip if it's a ZIP file, otherwise use as-is
             if file job_log.zip | grep -q "Zip archive"; then
@@ -424,9 +435,20 @@ jobs:
             exit 0
           fi
           for JOB_ID in $FAILED_JOBS; do
-            # Download logs (may be ZIP or plain text depending on GitHub API)
+            # First check job metadata for runner communication errors
+            # This catches "The operation was canceled" which appears in annotations, not logs
+            JOB_INFO=$(gh api "/repos/${{ github.repository }}/actions/jobs/${JOB_ID}" 2>/dev/null || true)
+            if echo "$JOB_INFO" | grep -qiE "operation was canceled|runner.*lost|lost communication"; then
+              echo "Detected: Runner lost communication or operation canceled (job $JOB_ID)"
+              SPOT_TERMINATION=true
+              break
+            fi
+
+            # Try to download logs - if we can't, likely infrastructure failure
             if ! gh api "/repos/${{ github.repository }}/actions/jobs/${JOB_ID}/logs" > job_log.zip 2>/dev/null; then
-              continue
+              echo "Detected: Cannot download logs, likely infrastructure failure (job $JOB_ID)"
+              SPOT_TERMINATION=true
+              break
             fi
             # Try to unzip if it's a ZIP file, otherwise use as-is
             if file job_log.zip | grep -q "Zip archive"; then
@@ -576,9 +598,20 @@ jobs:
             exit 0
           fi
           for JOB_ID in $FAILED_JOBS; do
-            # Download logs (may be ZIP or plain text depending on GitHub API)
+            # First check job metadata for runner communication errors
+            # This catches "The operation was canceled" which appears in annotations, not logs
+            JOB_INFO=$(gh api "/repos/${{ github.repository }}/actions/jobs/${JOB_ID}" 2>/dev/null || true)
+            if echo "$JOB_INFO" | grep -qiE "operation was canceled|runner.*lost|lost communication"; then
+              echo "Detected: Runner lost communication or operation canceled (job $JOB_ID)"
+              SPOT_TERMINATION=true
+              break
+            fi
+
+            # Try to download logs - if we can't, likely infrastructure failure
             if ! gh api "/repos/${{ github.repository }}/actions/jobs/${JOB_ID}/logs" > job_log.zip 2>/dev/null; then
-              continue
+              echo "Detected: Cannot download logs, likely infrastructure failure (job $JOB_ID)"
+              SPOT_TERMINATION=true
+              break
             fi
             # Try to unzip if it's a ZIP file, otherwise use as-is
             if file job_log.zip | grep -q "Zip archive"; then
