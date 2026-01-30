@@ -27,12 +27,12 @@ from .jit import (
     gen_batch_prefill_module,
     gen_customize_batch_prefill_module,
     gen_fmha_cutlass_sm100a_module,
+    gen_fmha_v2_module,
     gen_single_prefill_module,
     get_batch_prefill_uri,
     get_single_prefill_uri,
     setup_cubin_loader,
     gen_trtllm_gen_fmha_module,
-    get_trtllm_fmha_v2_module,
 )
 from .cudnn import cudnn_batch_prefill_with_kv_cache
 from .page import get_seq_lens
@@ -3803,6 +3803,11 @@ def fmha_v2_prefill_deepseek(
         return out
 
 
+@functools.cache
+def get_trtllm_fmha_v2_module():
+    return gen_fmha_v2_module().build_and_load()
+
+
 @flashinfer_api
 def trtllm_fmha_v2_prefill(
     qkv: Union[
@@ -3823,7 +3828,6 @@ def trtllm_fmha_v2_prefill(
     out: Optional[Union[torch.Tensor, FP4Tensor]] = None,
     out_dtype: Optional[Union[torch.dtype, str]] = None,
     kv_layout: Optional[str] = "HND",
-    input_layout: Optional[str] = "PACKED_QKV",
     sinks: Optional[List[torch.Tensor]] = None,
     pos_encoding_mode: Optional[str] = "NONE",
     logits_soft_cap_scale: Optional[float] = None,
@@ -3871,8 +3875,6 @@ def trtllm_fmha_v2_prefill(
         output dtype, if not provided, will use the type of ``out``.
     kv_layout : str = "HND"
         Layout of kv-cache, can be "HND" or "NHD", default is "HND".
-    input_layout : str = "PACKED_QKV"
-        Input layout, can be "PACKED_QKV", "CONTIGUOUS_Q_KV", "Q_PAGED_KV", "SEPARATE_Q_K_V". Defaults to "PACKED_QKV".
     sinks : Optional[List[torch.Tensor]] = None
         additional value per head in the denominator of the softmax.
     pos_encoding_mode: Optional[str] = None
@@ -3911,30 +3913,47 @@ def trtllm_fmha_v2_prefill(
         query = qkv  # Full packed tensor [tokens, 3, H, D]
         k_cache, v_cache = qkv, qkv
         input_layout = "PACKED_QKV"
-
     elif isinstance(qkv, tuple):
         if len(qkv) == 2:
-            # (Q, paged_KV) format
-            query, kv_cache = qkv
+            query, kv_or_paged = qkv
 
-            # Validate paged KV cache format
-            if kv_cache.dim() < 2 or kv_cache.shape[1] != 2:
+            # Distinguish between CONTIGUOUS_Q_KV and Q_PAGED_KV based on tensor shape:
+            # - CONTIGUOUS_Q_KV: KV is 4D [total_tokens, 2, H_kv, D] (variable-length)
+            # - Q_PAGED_KV: KV is 5D [num_pages, 2, H_kv, page_size, D] or [num_pages, 2, page_size, H_kv, D]
+            #
+            # The key difference: CONTIGUOUS_Q_KV is 4D, Q_PAGED_KV is 5D
+            if kv_or_paged.dim() == 4 and kv_or_paged.shape[1] == 2:
+                # CONTIGUOUS_Q_KV: (Q, KV) format
+                # Q: [total_tokens, H, D]
+                # KV: [total_tokens, 2, H_kv, D] where dim 1 has K and V
+                kv_cache = kv_or_paged
+                k_cache = kv_cache  # Pass KV tensor as k_cache for C++ kernel
+                v_cache = kv_cache  # v_cache is placeholder (not used for this layout)
+                input_layout = "CONTIGUOUS_Q_KV"
+
+            elif kv_or_paged.dim() == 5 and kv_or_paged.shape[1] == 2:
+                # Q_PAGED_KV: (Q, paged_KV) format
+                kv_cache = kv_or_paged
+
+                # TRT-LLM kernel expects HND layout within each page
+                # Convert NHD -> HND if needed
+                if kv_layout == "NHD":
+                    # Input: [num_pages, 2, page_size, num_kv_heads, head_dim]
+                    # Convert to: [num_pages, 2, num_kv_heads, page_size, head_dim]
+                    kv_cache = kv_cache.transpose(-3, -2).contiguous()
+
+                # Unbind: [num_pages, 2, H, N, D] -> ([num_pages, H, N, D], [num_pages, H, N, D])
+                k_cache, v_cache = kv_cache.unbind(dim=1)
+                input_layout = "Q_PAGED_KV"
+
+            else:
                 raise ValueError(
-                    f"Paged KV cache must have shape [num_pages, 2, ...] where dim 1 == 2. "
-                    f"Got shape {kv_cache.shape}. "
+                    f"For 2-element tuple (Q, KV), expected:\n"
+                    f"  - CONTIGUOUS_Q_KV: KV shape [total_tokens, 2, H_kv, D] (4D with dim 1 == 2)\n"
+                    f"  - Q_PAGED_KV: KV shape [num_pages, 2, ...] (5D with dim 1 == 2)\n"
+                    f"Got KV shape {kv_or_paged.shape} (dim={kv_or_paged.dim()}). "
                     "For separate K/V tensors, use tuple of 3: (Q, K, V)"
                 )
-
-            # TRT-LLM kernel expects HND layout within each page
-            # Convert NHD -> HND if needed
-            if kv_layout == "NHD":
-                # Input: [num_pages, 2, page_size, num_kv_heads, head_dim]
-                # Convert to: [num_pages, 2, num_kv_heads, page_size, head_dim]
-                kv_cache = kv_cache.transpose(-3, -2).contiguous()
-
-            # Unbind: [num_pages, 2, H, N, D] -> ([num_pages, H, N, D], [num_pages, H, N, D])
-            k_cache, v_cache = kv_cache.unbind(dim=1)
-            input_layout = "Q_PAGED_KV"
 
         elif len(qkv) == 3:
             # (Q, K, V) separate format
@@ -3962,7 +3981,6 @@ def trtllm_fmha_v2_prefill(
         # Packed QKV: query is [tokens, 3, H, D]
         num_qo_heads = query.shape[2]
         head_dim_qk = query.shape[3]
-        kv_dtype = query.dtype
         num_kv_heads = query.shape[2]  # Assume MHA for packed QKV
         page_size = 0  # Not applicable for packed layouts
         head_dim_v = query.shape[3]  # Assume same as head_dim_qk
@@ -3970,22 +3988,39 @@ def trtllm_fmha_v2_prefill(
         # Q is 3D: [tokens, H, D], Paged KV is 4D: [num_pages, H_kv, page_size, D]
         num_qo_heads = query.shape[1]
         head_dim_qk = query.shape[2]
-        kv_dtype = k_cache.dtype
         num_kv_heads = k_cache.shape[1]
         page_size = k_cache.shape[2]
         head_dim_v = v_cache.shape[3]
-    else:
-        # SEPARATE_Q_K_V or CONTIGUOUS_Q_KV: all 3D ragged [tokens, H, D]
+    elif input_layout == "CONTIGUOUS_Q_KV":
+        # Q is 3D: [tokens, H, D], KV is 4D: [tokens, 2, H_kv, D]
+        # k_cache holds the combined KV tensor
         num_qo_heads = query.shape[1]
         head_dim_qk = query.shape[2]
-        kv_dtype = k_cache.dtype
+        num_kv_heads = k_cache.shape[2]  # KV shape is [tokens, 2, H_kv, D]
+        page_size = 0  # Not applicable for non-paged layouts
+        head_dim_v = k_cache.shape[3]  # D from KV tensor
+    else:
+        # SEPARATE_Q_K_V: all 3D ragged [tokens, H, D]
+        num_qo_heads = query.shape[1]
+        head_dim_qk = query.shape[2]
         num_kv_heads = k_cache.shape[1]
         page_size = 0  # Not applicable for non-paged layouts
         head_dim_v = v_cache.shape[2]
 
-    # head_dim_vo = 0 means "same as head_dim_qk" (standard attention)
-    # head_dim_vo = actual value for MLA where head_dim_v != head_dim_qk
-    head_dim_vo = head_dim_v if head_dim_v != head_dim_qk else 0
+    # Validate sliding window / chunked attention requires causal masking
+    # The kernel only supports SLIDING_OR_CHUNKED_CAUSAL (mask version 4), which
+    # inherits from CAUSAL (mask version 3). Non-causal variants are not supported.
+    uses_sliding_window = window_left is not None and window_left >= 0
+    uses_chunked = chunked_attention_size is not None and chunked_attention_size > 0
+    is_non_causal = mask_mode is not None and mask_mode.lower() == "padding"
+
+    if (uses_sliding_window or uses_chunked) and is_non_causal:
+        feature = "Sliding window" if uses_sliding_window else "Chunked"
+        raise ValueError(
+            f"{feature} attention requires causal masking. "
+            f"The underlying kernel only supports SLIDING_OR_CHUNKED_CAUSAL mode. "
+            f"Use mask_mode='causal', 'sliding_window', or 'chunked' instead of 'padding'."
+        )
 
     # Determine output dtype
     if out is not None:
@@ -4056,22 +4091,7 @@ def trtllm_fmha_v2_prefill(
     )
 
     # Get the JIT-compiled module
-    module = get_trtllm_fmha_v2_module(
-        q_dtype=query.dtype,
-        kv_dtype=kv_dtype,
-        o_dtype=o_dtype,
-        num_qo_heads=num_qo_heads,
-        num_kv_heads=num_kv_heads,
-        head_dim_qk=head_dim_qk,
-        head_dim_vo=head_dim_vo,
-        input_layout=input_layout,
-        page_size=page_size,
-        pos_encoding_mode=pos_encoding_mode,
-        use_logits_soft_cap=softcapping_scale > 0,
-        save_softmax_stats=save_softmax_stats,
-        mask_mode=mask_mode,
-        non_blocking=non_blocking,
-    )
+    module = get_trtllm_fmha_v2_module()
 
     # Compute total tokens from cumulative sequence lengths (avoids cudaMemcpy in C++)
     total_q_tokens = int(cum_seq_lens_q[-1].item())

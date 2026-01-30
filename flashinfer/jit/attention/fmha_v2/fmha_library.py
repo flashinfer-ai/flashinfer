@@ -21,7 +21,7 @@ from .utils import (
     copyright,
 )
 
-from ...utils import write_if_different, dtype_map
+from ...utils import write_if_different
 
 import jinja2
 
@@ -1130,38 +1130,13 @@ inline void get_grid_size(int &heads_per_wave,
 
 
 def generate_jit_sources() -> list:
-    """
-    Generate kernel sources and dispatch configuration for FMHAv2.
-
-    Runtime dispatch is over (dtype, head_dim_qk, head_dim_vo).
-    Other parameters are fixed at JIT compile time.
-
-    Args:
-        dtype: Base dtype (used for output_dtype if not specified)
-        head_size_qk: Q/K head dimension
-        head_size_v: V head dimension (0 = same as head_size_qk)
-        output_dtype: Output data type
-        sm: SM version (90 or 120)
-        input_layout: Input tensor layout
-        return_softmax: Return softmax stats
-        enable_attn_logit_softcapping: Enable logit softcapping
-        alibi: Enable ALiBi
-        is_mla: MLA mode
-    """
     uri = "trtllm_fmha_v2"
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
     source_paths = []
     specs_names = []
-    # Mapping from dtype string to (C++ type, Data_type enum)
-    dtype_to_cpp_and_enum = {
-        "fp16": ("__half", "DATA_TYPE_FP16"),
-        "bf16": ("__nv_bfloat16", "DATA_TYPE_BF16"),
-        "e4m3": ("__nv_fp8_e4m3", "DATA_TYPE_E4M3"),
-    }
-
-    sm_values = [90]
     dtype_values = ["fp16", "bf16"]
-    head_size_qk_values = [64, 128]
+    head_size_qk_values = [16, 32, 64, 128, 256, 512]
+    head_size_qk_warpspec_values = [32, 40, 48, 64, 80, 96, 104, 128, 160, 192, 256]
     head_size_v_values = [
         0
     ]  # 0 means head_size_v = head_size_qk (required for flash_valid)
@@ -1169,6 +1144,7 @@ def generate_jit_sources() -> list:
         InputLayout.Q_PAGED_KV,
         InputLayout.PACKED_QKV,
         InputLayout.SEPARATE_Q_K_V,
+        InputLayout.CONTIGUOUS_Q_KV,
     ]
     output_dtype_values = ["fp16", "bf16"]
     is_mla_values = [False]
@@ -1181,20 +1157,21 @@ def generate_jit_sources() -> list:
     # is_mla_values = [True, False]
     # input_layout_values = [InputLayout.PACKED_QKV, InputLayout.CONTIGUOUS_Q_KV, InputLayout.Q_PAGED_KV, InputLayout.SEPARATE_Q_K_V]
     # output_dtype_values = [None, "fp16", "bf16", "e4m3"]
+    warp_spec_configs = itertools.product(
+        [90],
+        dtype_values,
+        head_size_qk_warpspec_values,
+        head_size_v_values,
+        enable_attn_logit_softcapping_values,
+        return_softmax_values,
+        alibi_values,
+        is_mla_values,
+        input_layout_values,
+        output_dtype_values,
+    )
 
-    for (
-        sm_iter,
-        dtype_iter,
-        head_size_qk_iter,
-        head_size_v_iter,
-        enable_attn_logit_softcapping_iter,
-        return_softmax_iter,
-        alibi_iter,
-        is_mla_iter,
-        input_layout_iter,
-        output_dtype_iter,
-    ) in itertools.product(
-        sm_values,
+    other_configs = itertools.product(
+        [],
         dtype_values,
         head_size_qk_values,
         head_size_v_values,
@@ -1204,32 +1181,46 @@ def generate_jit_sources() -> list:
         is_mla_values,
         input_layout_values,
         output_dtype_values,
-    ):
-        kspec = generate_kernel_spec(
-            sm=sm_iter,
-            head_size=head_size_qk_iter,
-            dtype=dtype_iter,
-            return_softmax=return_softmax_iter,
-            enable_attn_logit_softcapping=enable_attn_logit_softcapping_iter,
-            alibi=alibi_iter,
-            is_mla=is_mla_iter,
-            input_layout=input_layout_iter,
-            head_size_v=head_size_v_iter,
-            output_dtype=output_dtype_iter,
-        )
-        if not is_kernel_spec_valid(kspec):
-            continue
+    )
 
-        fname, lname, kname = encode_name(kspec)
-        kernel_code = get_kernel_code(kspec, kname, lname)
-        if kernel_code is None:
-            continue
+    for config_list in [warp_spec_configs, other_configs]:
+        for (
+            sm_iter,
+            dtype_iter,
+            head_size_qk_iter,
+            head_size_v_iter,
+            enable_attn_logit_softcapping_iter,
+            return_softmax_iter,
+            alibi_iter,
+            is_mla_iter,
+            input_layout_iter,
+            output_dtype_iter,
+        ) in config_list:
+            kspec = generate_kernel_spec(
+                sm=sm_iter,
+                head_size=head_size_qk_iter,
+                dtype=dtype_iter,
+                return_softmax=return_softmax_iter,
+                enable_attn_logit_softcapping=enable_attn_logit_softcapping_iter,
+                alibi=alibi_iter,
+                is_mla=is_mla_iter,
+                input_layout=input_layout_iter,
+                head_size_v=head_size_v_iter,
+                output_dtype=output_dtype_iter,
+            )
+            if not is_kernel_spec_valid(kspec):
+                continue
 
-        # Write kernel source file
-        kernel_path = gen_directory / fname
-        write_if_different(kernel_path, kernel_code)
-        source_paths.append(kernel_path)
-        specs_names.append((kspec, fname, lname, kname))
+            fname, lname, kname = encode_name(kspec)
+            kernel_code = get_kernel_code(kspec, kname, lname)
+            if kernel_code is None:
+                continue
+
+            # Write kernel source file
+            kernel_path = gen_directory / fname
+            write_if_different(kernel_path, kernel_code)
+            source_paths.append(kernel_path)
+            specs_names.append((kspec, fname, lname, kname))
 
     api_code = get_api_code(specs_names)
     api_path = gen_directory / "fmha_v2_api.h"

@@ -358,7 +358,7 @@ void fmha_v2_run(
   // - PACKED_QKV: q is 4D [total_tokens, 3, num_heads, head_dim], k/v are same as q
   // - Q_PAGED_KV: q is 3D [total_tokens, num_heads, head_dim], k/v are 4D paged
   // - SEPARATE_Q_K_V: q/k/v are all 3D [total_tokens, num_heads, head_dim]
-  // - CONTIGUOUS_Q_KV: q is 3D, kv packed 3D
+  // - CONTIGUOUS_Q_KV: q is 3D [total_tokens, H, D], k is 4D [total_tokens, 2, H_kv, D]
   const size_t b = batch_size;
   size_t h, h_kv, d, dv;
   if (input_layout == Attention_input_layout::PACKED_QKV) {
@@ -373,8 +373,15 @@ void fmha_v2_run(
     h_kv = k.shape()[1];
     d = q.shape()[2];
     dv = v.shape()[3];
+  } else if (input_layout == Attention_input_layout::CONTIGUOUS_Q_KV) {
+    // q is 3D: [total_tokens, H, D], k is 4D: [total_tokens, 2, H_kv, D]
+    // k holds the combined KV tensor where dim 1 = 2 (K and V interleaved)
+    h = q.shape()[1];
+    h_kv = k.shape()[2];  // KV shape is [tokens, 2, H_kv, D]
+    d = q.shape()[2];
+    dv = k.shape()[3];  // D from KV tensor
   } else {
-    // SEPARATE_Q_K_V or CONTIGUOUS_Q_KV: all 3D ragged [total_tokens, H, D]
+    // SEPARATE_Q_K_V: all 3D ragged [total_tokens, H, D]
     h = q.shape()[1];
     h_kv = k.shape()[1];
     d = q.shape()[2];
@@ -417,7 +424,12 @@ void fmha_v2_run(
   size_t sliding_window_size = size_t(INT_MAX);
   if (attention_mask_type == Attention_mask_type::SLIDING_OR_CHUNKED_CAUSAL) {
     if (window_left != -1) {
-      sliding_window_size = size_t(window_left);
+      // FlashInfer's window_left means: attend to positions [qo_idx - window_left, qo_idx]
+      // This is window_left + 1 positions total.
+      // FMHA v2's sliding_window_size means: attend to [row + 1 - sliding_window_size, row]
+      // This is sliding_window_size positions total.
+      // To match semantics: sliding_window_size = window_left + 1
+      sliding_window_size = size_t(window_left + 1);
     }
   }
 

@@ -15,7 +15,7 @@ limitations under the License.
 """
 
 import os
-from typing import List, Optional, Tuple
+from typing import List
 
 import jinja2
 import torch
@@ -38,6 +38,7 @@ from ..utils import (
 )
 from .utils import generate_additional_params
 from .fmha_v2.generate_kernels import enumerate_kernels
+from .fmha_v2.fmha_library import generate_jit_sources
 
 
 def get_single_decode_uri(
@@ -1899,98 +1900,6 @@ def gen_cudnn_fmha_module():
     )
 
 
-# def get_trtllm_fmha_v2_module(
-#     dtype_q: torch.dtype,
-#     head_dim_qk: int,
-#     head_dim_v: int,
-#     enable_softcapping: bool,
-#     use_alibi: bool,
-#     return_softmax_stats: bool,
-# ):
-def get_trtllm_fmha_v2_module(
-    q_dtype: torch.dtype,
-    kv_dtype: torch.dtype,
-    o_dtype: torch.dtype,
-    num_qo_heads: int,
-    num_kv_heads: int,
-    head_dim_qk: int,
-    head_dim_vo: int,
-    input_layout: str,
-    page_size: int,
-    pos_encoding_mode: str,
-    use_logits_soft_cap: bool,
-    save_softmax_stats: bool,
-    mask_mode: str,
-    non_blocking: bool,
-):
-    """
-    Get a JIT-compiled FMHAv2 kernel module with the given configuration.
-
-    Parameters
-    ----------
-    q_dtype : torch.dtype
-        Query tensor dtype
-    kv_dtype : torch.dtype
-        Key/Value cache dtype
-    o_dtype : torch.dtype
-        Output tensor dtype
-    num_qo_heads : int
-        Number of query/output heads
-    num_kv_heads : int
-        Number of key/value heads
-    head_dim_qk : int
-        Q/K head dimension
-    head_dim_vo : int
-        V/O head dimension (0 = same as head_dim_qk)
-    input_layout : str
-        Input layout string: "PACKED_QKV", "CONTIGUOUS_Q_KV", "Q_PAGED_KV", "SEPARATE_Q_K_V"
-    page_size : int
-        Page size for paged KV cache
-    pos_encoding_mode : str
-        Position encoding mode: "NONE" or "ALIBI"
-    use_logits_soft_cap : bool
-        Enable logit softcapping
-    save_softmax_stats : bool
-        Return log-sum-exp statistics
-    mask_mode : str
-        Mask mode: "padding", "causal", "sliding_window", "chunked", "custom"
-    non_blocking : bool
-        Non-blocking mode for scheduling
-
-    Returns
-    -------
-    Module
-        JIT-compiled FMHAv2 module
-    """
-    use_alibi = pos_encoding_mode == "ALIBI"
-
-    return gen_fmha_v2_module(
-        dtype_q=q_dtype,
-        head_dim_qk=head_dim_qk,
-        head_dim_v=head_dim_vo,
-        input_layout=input_layout,
-        enable_softcapping=use_logits_soft_cap,
-        use_alibi=use_alibi,
-        return_softmax_stats=save_softmax_stats,
-    ).build_and_load()
-    # if sm == 120:
-    #     return gen_trtllm_fmha_v2_sm120_module().build_and_load()
-    # elif sm == 90:
-    #     return gen_trtllm_fmha_v2_sm90_module().build_and_load()
-    # else:
-    #     raise ValueError(f"Invalid SM: {sm}")
-
-    # return gen_trtllm_fmha_v2_sm90_module(
-    #     dtype_q=dtype_q,
-    #     head_dim_qk=head_dim_qk,
-    #     head_dim_v=head_dim_v,
-    #     input_layout=input_layout,
-    #     enable_softcapping=enable_softcapping,
-    #     use_alibi=use_alibi,
-    #     return_softmax_stats=return_softmax_stats,
-    # ).build_and_load()
-
-
 def gen_trtllm_fmha_v2_sm120_module(device: torch.device) -> JitSpec:
     uri = "trtllm_fmha_v2"
     cached_ops = jit_env.FLASHINFER_JIT_DIR / uri
@@ -2027,66 +1936,7 @@ def gen_trtllm_fmha_v2_sm120_module(device: torch.device) -> JitSpec:
     )
 
 
-def gen_fmha_v2_module(
-    dtype_q: torch.dtype,
-    head_dim_qk: int,
-    head_dim_v: int = 0,
-    input_layout: str = "Q_PAGED_KV",
-    enable_softcapping: Optional[bool] = False,
-    use_alibi: Optional[bool] = True,
-    return_softmax_stats: Optional[bool] = False,
-    output_dtype: Optional[str] = None,
-) -> JitSpec:
-    """
-    Generate a JIT-compiled FMHAv2 kernel module.
-
-    This function builds and returns a JitSpec for the FMHAv2 kernel with the
-    specified configuration. The kernel is JIT-compiled on first use.
-
-    Parameters
-    ----------
-    dtype_q : torch.dtype
-        Query tensor dtype (float16, bfloat16, float8_e4m3fn)
-    seq_len : int
-        Maximum sequence length (0 for flash attention)
-    head_dim_qk : int
-        Q/K head dimension (32-256)
-    head_dim_v : int
-        V head dimension (0 = same as head_dim_qk, for MLA use different value)
-    input_layout : str
-        Input layout string: "PACKED_QKV", "CONTIGUOUS_Q_KV", "Q_PAGED_KV", "SEPARATE_Q_K_V"
-    enable_softcapping : bool
-        Enable logit softcapping (Gemma-2 style)
-    use_alibi : bool
-        Enable ALiBi positional encoding
-    return_softmax_stats : bool
-        Return log-sum-exp statistics
-    output_dtype : Optional[str]
-        Output dtype string (None = same as input dtype)
-
-    Returns
-    -------
-    JitSpec
-        JIT specification that can be built and loaded
-    """
-    from .fmha_v2.fmha_library import (
-        InputLayout,
-        generate_jit_sources,
-    )
-
-    # Map torch dtypes to fmha_v2 dtype strings
-    dtype_map = {
-        torch.float16: "fp16",
-        torch.bfloat16: "bf16",
-        torch.float32: "fp16_fp32",
-    }
-    if hasattr(torch, "float8_e4m3fn"):
-        dtype_map[torch.float8_e4m3fn] = "e4m3_fp32"
-
-    dtype_str = dtype_map.get(dtype_q)
-    if dtype_str is None:
-        raise ValueError(f"Unsupported dtype: {dtype_q}")
-
+def gen_fmha_v2_module() -> JitSpec:
     uri = "trtllm_fmha_v2"
 
     # Setup generated source directory
@@ -2096,20 +1946,6 @@ def gen_fmha_v2_module(
     # Source directories
     csrc_dir = jit_env.FLASHINFER_CSRC_DIR
     fmha_v2_src_dir = csrc_dir / "fmha_v2"
-
-    # Convert string input_layout to InputLayout enum
-    input_layout_map = {
-        "PACKED_QKV": InputLayout.PACKED_QKV,
-        "CONTIGUOUS_Q_KV": InputLayout.CONTIGUOUS_Q_KV,
-        "Q_PAGED_KV": InputLayout.Q_PAGED_KV,
-        "SEPARATE_Q_K_V": InputLayout.SEPARATE_Q_K_V,
-    }
-    layout = input_layout_map.get(input_layout.upper())
-    if layout is None:
-        raise ValueError(
-            f"Invalid input_layout: {input_layout}. Must be one of {list(input_layout_map.keys())}"
-        )
-
     source_paths = generate_jit_sources()
 
     # copy static fmha_v2_run.cu
