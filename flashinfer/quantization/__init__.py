@@ -36,16 +36,12 @@ from .fp4_quantization import (
 )
 
 # CuTe-DSL kernels (conditionally exported)
+# Note: is_cute_dsl_available is used internally but not re-exported;
+# users should import from flashinfer.cute_dsl
 from ..cute_dsl import is_cute_dsl_available
 
 if is_cute_dsl_available():
-    from .mxfp8_quantize_cute_dsl import (
-        mxfp8_quantize_cute_dsl,
-        MXFP8QuantizeLinearKernel,
-        MXFP8QuantizeSwizzledKernel,
-        _get_compiled_kernel_linear,
-        _get_compiled_kernel_swizzled,
-    )
+    from .mxfp8_quantize_cute_dsl import mxfp8_quantize_cute_dsl
 
 __all__ = [
     # Packbits
@@ -69,15 +65,9 @@ __all__ = [
     "shuffle_matrix_sf_a",
     "scaled_fp4_grouped_quantize",
     "get_fp4_quantization_module",
-    # CuTe-DSL availability check
-    "is_cute_dsl_available",
 ]
 
 if is_cute_dsl_available():
     __all__ += [
         "mxfp8_quantize_cute_dsl",
-        "MXFP8QuantizeLinearKernel",
-        "MXFP8QuantizeSwizzledKernel",
-        "_get_compiled_kernel_linear",
-        "_get_compiled_kernel_swizzled",
     ]
