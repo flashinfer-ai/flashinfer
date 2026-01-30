@@ -1131,7 +1131,7 @@ def _test_trtllm_batch_decode(
 @pytest.mark.parametrize("max_in_kv_len", [110])
 @pytest.mark.parametrize("head_dim", [128])
 @pytest.mark.parametrize("non_contiguous_query", [False, True])
-@pytest.mark.parametrize("skips_softmax", [True])
+@pytest.mark.parametrize("skips_softmax", [False, True])
 def test_trtllm_batch_decode(
     backend,
     kv_layout,
@@ -1336,6 +1336,7 @@ def test_trtllm_batch_decode_head_dim_256(
 @pytest.mark.parametrize("max_in_kv_len", [4096, 8192, 16384, 32768, 65536, 131072])
 @pytest.mark.parametrize("head_dim", [128])
 @pytest.mark.parametrize("device_scale", [True, False])
+@pytest.mark.parametrize("skips_softmax", [False])
 def test_trtllm_batch_decode_long_sequence_length(
     kv_layout,
     batch_size,
@@ -1352,6 +1353,7 @@ def test_trtllm_batch_decode_long_sequence_length(
     max_in_kv_len,
     head_dim,
     device_scale,
+    skips_softmax,
 ):
     # Small number of test cases for long sequence length
     _test_trtllm_batch_decode(
@@ -1371,6 +1373,7 @@ def test_trtllm_batch_decode_long_sequence_length(
         max_in_kv_len,
         head_dim,
         device_scale,
+        skips_softmax=skips_softmax,
     )
 
 
