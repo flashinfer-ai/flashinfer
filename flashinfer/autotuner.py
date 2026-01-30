@@ -479,7 +479,10 @@ class AutoTuner:
                         # TODO: use FakeTensor here.
                         valid_tactics = r.get_valid_tactics(tensors, p)
                         runner_arg_names = runner_arg_names_map[r]
-                        if "do_preparation" in runner_arg_names and len(valid_tactics) > 0:
+                        if (
+                            "do_preparation" in runner_arg_names
+                            and len(valid_tactics) > 0
+                        ):
                             r(tensors, tactic=-1, do_preparation=True, **kwargs)
                         for tac in valid_tactics:
                             try:
@@ -515,24 +518,29 @@ class AutoTuner:
                                 min_time = time_measured
                                 runner_id, tactic = r_id, tac
 
+                    if runner_id is not None:
+                        # At least one valid (runner, tactic) pair is found
+                        cache_key = AutoTuner._get_cache_key(
+                            custom_op,
+                            runners[runner_id],
+                            p.get_opt_shapes(),
+                            tuning_config,
+                        )
+                        # inspect call stack
+                        self.profiling_cache[cache_key] = (runner_id, tactic, p)
+                        self.stats.tuned_op_successful_configs[custom_op] = (
+                            self.stats.tuned_op_successful_configs.get(custom_op, 0) + 1
+                        )
+                        logger.debug(
+                            f"[Autotuner]: profiling chosen runner: {runners[runner_id]} {tactic} for {cache_key}"
+                        )
+
             except torch.cuda.OutOfMemoryError:
                 torch.cuda.empty_cache()
-                logger.warning("[Autotuner]: OOM detected, falling back to default tactic")
+                logger.warning(
+                    "[Autotuner]: OOM detected, falling back to default tactic"
+                )
                 return runners[0], -1
-            
-            if runner_id is not None:
-                # At least one valid (runner, tactic) pair is found
-                cache_key = AutoTuner._get_cache_key(
-                    custom_op, runners[runner_id], p.get_opt_shapes(), tuning_config
-                )
-                # inspect call stack
-                self.profiling_cache[cache_key] = (runner_id, tactic, p)
-                self.stats.tuned_op_successful_configs[custom_op] = (
-                    self.stats.tuned_op_successful_configs.get(custom_op, 0) + 1
-                )
-                logger.debug(
-                    f"[Autotuner]: profiling chosen runner: {runners[runner_id]} {tactic} for {cache_key}"
-                )
 
         # Get the best runner and tactic from cache
         # If no valid tactic is found, the fallback runner and tactic will be used
