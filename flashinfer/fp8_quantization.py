@@ -149,6 +149,7 @@ def mxfp8_quantize(
     is_sf_swizzled_layout: bool = True,
     alignment: int = 32,
     enable_pdl: Optional[bool] = None,
+    backend: str = "cuda",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Quantize input tensor to MxFP8 format.
 
@@ -160,7 +161,10 @@ def mxfp8_quantize(
         is_sf_swizzled_layout (bool, optional): Whether to use swizzled layout for scale factors. Defaults to True.
         alignment (int, optional): sfVecSize. Defaults to 32.
         enable_pdl (Optional[bool], optional): Whether to enable PDL (Programmatic Dependent Launch).
-            If None, automatically detects based on device capability. Defaults to None.
+            If None, automatically detects based on device capability (SM >= 9.0). Defaults to None.
+        backend (str, optional): Backend to use for quantization. Options are:
+            - "cuda": Use JIT-compiled CUDA kernel (default)
+            - "cute-dsl": Use CuTe-DSL kernel
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
             - Quantized tensor of shape [M, K] with dtype FLOAT8_E4M3
@@ -169,15 +173,37 @@ def mxfp8_quantize(
     sf_vec_size = 32
 
     assert input.shape[-1] % sf_vec_size == 0
-    if enable_pdl is None:
-        enable_pdl = device_support_pdl(input.device)
-    x_q, sf = get_mxfp8_quantization_sm100_module().mxfp8_quantize_sm100(
-        input,
-        is_sf_swizzled_layout,
-        alignment,
-        enable_pdl,
+    assert backend in ("cuda", "cute-dsl"), (
+        f"backend must be 'cuda' or 'cute-dsl', got '{backend}'"
     )
-    return x_q, sf
+
+    if backend == "cute-dsl":
+        from .cute_dsl import is_cute_dsl_available
+
+        if not is_cute_dsl_available():
+            raise RuntimeError(
+                "CuTe-DSL backend requested but CuTe-DSL is not available. "
+                "Please install nvidia-cutlass-dsl package."
+            )
+        from .cute_dsl import mxfp8_quantize_cute_dsl
+
+        return mxfp8_quantize_cute_dsl(
+            input,
+            is_sf_swizzled_layout=is_sf_swizzled_layout,
+            alignment=alignment,
+            enable_pdl=enable_pdl,
+        )
+    else:
+        # backend == "cuda"
+        if enable_pdl is None:
+            enable_pdl = device_support_pdl(input.device)
+        x_q, sf = get_mxfp8_quantization_sm100_module().mxfp8_quantize_sm100(
+            input,
+            is_sf_swizzled_layout,
+            alignment,
+            enable_pdl,
+        )
+        return x_q, sf
 
 
 @flashinfer_api

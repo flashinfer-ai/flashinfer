@@ -5,12 +5,23 @@ from flashinfer import mxfp8_dequantize_host, mxfp8_quantize
 from flashinfer.utils import get_compute_capability
 
 
+def is_cute_dsl_available():
+    """Check if CuTe-DSL is available."""
+    try:
+        from flashinfer.cute_dsl import is_cute_dsl_available as _is_available
+
+        return _is_available()
+    except ImportError:
+        return False
+
+
 @pytest.mark.parametrize("m", [1, 1024])
 @pytest.mark.parametrize("k", [1024])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
 @pytest.mark.parametrize("device", ["cuda", "cpu"])
-def test_mxfp8_quantize_torch(m, k, dtype, is_sf_swizzled_layout, device):
+@pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
+def test_mxfp8_quantize_torch(m, k, dtype, is_sf_swizzled_layout, device, backend):
     if device == "cuda":
         major, _ = get_compute_capability(torch.device(device))
         if major < 10:
@@ -18,12 +29,19 @@ def test_mxfp8_quantize_torch(m, k, dtype, is_sf_swizzled_layout, device):
                 "mxfp8 quantization is not supported on compute capability < 10"
             )
 
+    # Skip cute-dsl backend for CPU or if not available
+    if backend == "cute-dsl":
+        if device == "cpu":
+            pytest.skip("cute-dsl backend only supports CUDA")
+        if not is_cute_dsl_available():
+            pytest.skip("CuTe-DSL is not available")
+
     a = 16 * torch.randn([m, k], dtype=dtype).to(device).contiguous()
 
     if device == "cpu":
         a = a.float()
 
-    a_fp8, a_sf = mxfp8_quantize(a, is_sf_swizzled_layout)
+    a_fp8, a_sf = mxfp8_quantize(a, is_sf_swizzled_layout, backend=backend)
 
     if device == "cuda":
         a_fp8 = a_fp8.cpu()
@@ -97,15 +115,19 @@ def test_mxfp8_quantize_torch_host(m, k, dtype, is_sf_swizzled_layout):
 @pytest.mark.parametrize("k", [512, 1024])
 @pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
 @pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
-def test_mxfp8_quantize_torch_device(m, k, dtype, is_sf_swizzled_layout):
+@pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
+def test_mxfp8_quantize_torch_device(m, k, dtype, is_sf_swizzled_layout, backend):
     major, _ = get_compute_capability(torch.device("cuda:0"))
     if major < 10:
         pytest.skip("mxfp8 quantization is not supported on compute capability < 10")
 
+    if backend == "cute-dsl" and not is_cute_dsl_available():
+        pytest.skip("CuTe-DSL is not available")
+
     torch.random.manual_seed(0)
     a = (torch.randn([m, k], dtype=torch.float) * 16).to(dtype).cuda().contiguous()
 
-    a_fp8, a_sf = mxfp8_quantize(a, is_sf_swizzled_layout, 32)
+    a_fp8, a_sf = mxfp8_quantize(a, is_sf_swizzled_layout, 32, backend=backend)
     a_pt = mxfp8_dequantize_host(
         a_fp8.cpu().view(torch.uint8),
         a_sf.cpu().view(torch.uint8),
@@ -123,19 +145,23 @@ def test_mxfp8_quantize_torch_device(m, k, dtype, is_sf_swizzled_layout):
 @pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
 @pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
 @pytest.mark.parametrize("alignment", [64, 128])
+@pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
 def test_mxfp8_quantize_alignment_torch_device(
-    m, k, dtype, is_sf_swizzled_layout, alignment
+    m, k, dtype, is_sf_swizzled_layout, alignment, backend
 ):
     major, _ = get_compute_capability(torch.device("cuda:0"))
     if major < 10:
         pytest.skip("mxfp8 quantization is not supported on compute capability < 10")
+
+    if backend == "cute-dsl" and not is_cute_dsl_available():
+        pytest.skip("CuTe-DSL is not available")
 
     torch.random.manual_seed(0)
     a = (torch.randn([m, k], dtype=torch.float) * 16).to(dtype).cuda().contiguous()
     padded_k = ((k + alignment - 1) // alignment) * alignment
 
     # Quantize it on device.
-    a_fp8, a_sf = mxfp8_quantize(a, is_sf_swizzled_layout, alignment)
+    a_fp8, a_sf = mxfp8_quantize(a, is_sf_swizzled_layout, alignment, backend=backend)
     assert a_fp8.shape[1] == padded_k
 
     # Dequantize it on host.

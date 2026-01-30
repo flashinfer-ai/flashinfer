@@ -35,6 +35,11 @@ if is_cute_dsl_available():
         add_rmsnorm_fp4quant,
         AddRMSNormFP4QuantKernel,
     )
+    from .mxfp8_quantize import (
+        mxfp8_quantize_cute_dsl,
+        MXFP8QuantizeLinearKernel,
+        MXFP8QuantizeSwizzledKernel,
+    )
 
 __all__ = [
     # Utils (always available)
@@ -56,4 +61,8 @@ if is_cute_dsl_available():
         # Add + RMSNorm + FP4 Quantization
         "add_rmsnorm_fp4quant",
         "AddRMSNormFP4QuantKernel",
+        # MXFP8 Quantization
+        "mxfp8_quantize_cute_dsl",
+        "MXFP8QuantizeLinearKernel",
+        "MXFP8QuantizeSwizzledKernel",
     ]

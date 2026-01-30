@@ -397,9 +397,9 @@ routine_cc_to_supported_backends = {
         "8.6": [],
         "8.9": [],
         "9.0": [],
-        "10.0": ["cuda"],
-        "10.3": ["cuda"],
-        "12.0": ["cuda"],
+        "10.0": ["cuda", "cute-dsl"],
+        "10.3": ["cuda", "cute-dsl"],
+        "12.0": ["cuda", "cute-dsl"],
     },
     "mxfp4_quantize": {
         "7.5": [],
