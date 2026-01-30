@@ -16,22 +16,17 @@
 #ifndef FLASHINFER_MAMBA_SELECTIVE_STATE_UPDATE_CUH_
 #define FLASHINFER_MAMBA_SELECTIVE_STATE_UPDATE_CUH_
 
-// #include <cooperative_groups.h>
-// #include <cooperative_groups/memcpy_async.h>
-// #include <cuda_runtime_api.h>
-
-// #include <cmath>
 #include <cstdint>
-// #include <cuda/barrier>
-
-// #include "../utils.cuh"
-// #include "../vec_dtypes.cuh"
-// #include "conversion.cuh"
-// #include "create_tensor_map.cuh"
+#include <utility>
 
 namespace flashinfer::mamba {
 
-constexpr unsigned warpSize = 32;
+// =============================================================================
+// Allowed dispatch values for kernel instantiation
+// =============================================================================
+using AllowedDims = std::integer_sequence<int, 64, 128, 256>;
+using AllowedDstates = std::integer_sequence<int, 64, 128, 256>;
+using AllowedNtokens = std::integer_sequence<int, 1, 2, 4, 6, 8, 12, 16>;
 
 struct SelectiveStateUpdateParams {
   uint32_t batch{}, nheads{}, dim{}, dstate{}, ngroups{}, state_cache_size{};
@@ -40,64 +35,21 @@ struct SelectiveStateUpdateParams {
   int64_t x_stride_batch{}, dt_stride_batch{}, B_stride_batch{}, C_stride_batch{},
       out_stride_batch{}, z_stride_batch{}, state_stride_batch{};
 
-  void* __restrict__ state{nullptr};  // state_t: (state_cache_size, nheads, dim, dstate)
-  void* __restrict__ x{nullptr};      // input_t: (batch, nheads, dim)
-  void* __restrict__ dt{
-      nullptr};  // weight_t: (batch, nheads) but pretends to be (batch, nheads, dim)
-  void* __restrict__ dt_bias{nullptr};  // weight_t (nheads) but pretends to be (nheads, dim)
-  void* __restrict__ A{nullptr};  // matrixA_t: (nheads) but pretends to be (nheads, dim, dstate)
-  void* __restrict__ B{nullptr};  // input_t: (batch, ngroups, dstate)
-  void* __restrict__ C{nullptr};  // input_t: (batch, ngroups, dstate)
-  void* __restrict__ D{nullptr};  // weight_t: (nheads) but pretends to be (nheads, dim)
-  void* __restrict__ z{nullptr};  // input_t: (batch, nheads, dim)
-  void* __restrict__ output{nullptr};               // input_t: (batch, nheads, dim)
-  void* __restrict__ state_batch_indices{nullptr};  // state_batch_indices: (batch,)
+  void* __restrict__ state{nullptr};
+  void* __restrict__ x{nullptr};
+  void* __restrict__ dt{nullptr};
+  void* __restrict__ dt_bias{nullptr};
+  void* __restrict__ A{nullptr};
+  void* __restrict__ B{nullptr};
+  void* __restrict__ C{nullptr};
+  void* __restrict__ D{nullptr};
+  void* __restrict__ z{nullptr};
+  void* __restrict__ output{nullptr};
+  void* __restrict__ state_batch_indices{nullptr};
 
   bool dt_softplus{false};
   bool update_state{true};
 };
-
-__forceinline__ __device__ float softplus(float x) { return __logf(1.f + __expf(x)); }
-
-__device__ __forceinline__ float thresholded_softplus(float dt_value) {
-  constexpr float threshold = 20.f;
-  return (dt_value <= threshold) ? softplus(dt_value) : dt_value;
-}
-
-// Simple packed vector type for loading N elements of type T
-template <typename T, int N = sizeof(float4) / sizeof(T)>
-struct alignas(N * sizeof(T)) PackedAligned {
-  T val[N];
-  static constexpr int count = N;
-  using dtype = T;
-};
-
-template <class load_t>
-__device__ __forceinline__ auto make_zeros() -> load_t {
-  load_t ret{};
-#pragma unroll
-  for (int i = 0; i < ret.count; i++)
-    ret.val[i] = typename load_t::dtype{};  // default initialization
-  return ret;
-};
-
-// Computes the vector load size that ensures full warp utilization.
-// Avoids cases like: dstate=64, load_t = sizeof(float4)/sizeof(f16), warpsize=32 (32 * 8 > 64)
-// in which case a part of the warp would be idle.
-template <typename T, int DSTATE>
-inline constexpr auto getVectorLoadSizeForFullUtilization() -> unsigned {
-  static_assert(sizeof(float4) >= sizeof(T));
-  constexpr unsigned maxHardwareLoadSize = sizeof(float4) / sizeof(T);
-  constexpr unsigned maxLogicalLoadSize = (unsigned)DSTATE / warpSize;
-  return maxHardwareLoadSize < maxLogicalLoadSize ? maxHardwareLoadSize : maxLogicalLoadSize;
-}
-
-__device__ __forceinline__ float warpReduceSum(float val) {
-  for (int s = warpSize / 2; s > 0; s /= 2) {
-    val += __shfl_down_sync(UINT32_MAX, val, s);
-  }
-  return val;
-}
 
 namespace mtp {
 // Extended params struct for multi-token prediction (MTP)
@@ -117,6 +69,7 @@ struct SelectiveStateMTPParams : public SelectiveStateUpdateParams {
 
 }  // namespace flashinfer::mamba
 
-#include "selective_state_update_stp.cuh"
+#include "kernel_selective_state_update_mtp.cuh"
+#include "kernel_selective_state_update_stp.cuh"
 
 #endif  // FLASHINFER_MAMBA_SELECTIVE_STATE_UPDATE_CUH_

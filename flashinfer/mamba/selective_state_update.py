@@ -133,24 +133,47 @@ def selective_state_update(
         Output tensor with shape (batch, dim) or (batch, nheads, dim) for single-token
         or (batch, T, nheads, dim) for multi-token
     """
+    # Determine if we're in multi-token mode (more than 1 token)
+    is_mtp = cache_steps >= 1
+
     if state.dim() == 3:
         state = state.unsqueeze(1)
-    if x.dim() == 2:
-        x = x.unsqueeze(1)
-    if dt.dim() == 2:
-        dt = dt.unsqueeze(1)
     if A.dim() == 2:
         A = A.unsqueeze(0)
-    if B.dim() == 2:
-        B = B.unsqueeze(1)
-    if C.dim() == 2:
-        C = C.unsqueeze(1)
     if D.dim() == 1:
         D = D.unsqueeze(0)
-    if z is not None and z.dim() == 2:
-        z = z.unsqueeze(1)
     if dt_bias is not None and dt_bias.dim() == 1:
         dt_bias = dt_bias.unsqueeze(0)
+
+    # Handle x, dt, B, C, z dimensions based on mode
+    # For single-token: 2D -> 3D (batch, nheads, dim)
+    # For multi-token: 3D -> 4D (batch, T, nheads, dim)
+    if x.dim() == 2:
+        x = x.unsqueeze(1)
+    if is_mtp and x.dim() == 3:
+        # Add T dimension for MTP mode: (batch, nheads, dim) -> (batch, T, nheads, dim)
+        x = x.unsqueeze(1)
+
+    if dt.dim() == 2:
+        dt = dt.unsqueeze(1)
+    if is_mtp and dt.dim() == 3:
+        dt = dt.unsqueeze(1)
+
+    if B.dim() == 2:
+        B = B.unsqueeze(1)
+    if is_mtp and B.dim() == 3:
+        B = B.unsqueeze(1)
+
+    if C.dim() == 2:
+        C = C.unsqueeze(1)
+    if is_mtp and C.dim() == 3:
+        C = C.unsqueeze(1)
+
+    if z is not None:
+        if z.dim() == 2:
+            z = z.unsqueeze(1)
+        if is_mtp and z.dim() == 3:
+            z = z.unsqueeze(1)
     if out is None:
         output = torch.empty_like(x)
     else:

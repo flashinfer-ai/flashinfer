@@ -21,11 +21,11 @@
 #include <cuda_runtime_api.h>
 
 #include <cmath>
-#include <cstdint>
 #include <cuda/barrier>
 
 #include "../utils.cuh"
 #include "../vec_dtypes.cuh"
+#include "common.cuh"
 #include "conversion.cuh"
 #include "create_tensor_map.cuh"
 
@@ -60,10 +60,10 @@ __device__ __forceinline__ int conflict_free_column(int group, int baseCol) {
 template <typename input_t, int dim, int dstate>
 struct SharedStorageSimple {
   alignas(alignof(PackedAligned<input_t>)) input_t x[dim];
-  float out[dim];
   alignas(alignof(PackedAligned<input_t>)) input_t z[dim];
   alignas(alignof(PackedAligned<input_t>)) input_t B[dstate];
   alignas(alignof(PackedAligned<input_t>)) input_t C[dstate];
+  float out[dim];
 };
 
 template <typename input_t, typename weight_t, typename matrixA_t, typename state_t,
@@ -199,10 +199,10 @@ template <typename input_t, typename weight_t, typename matrixA_t, typename stat
 struct SharedStorageVertical {
   alignas(128) state_t state[numStages][rowsPerStage * dstate];
   alignas(alignof(PackedAligned<input_t>)) input_t x[dim];
-  float out[dim];  // dt is special cause we're gonna store input in there as well
   alignas(alignof(PackedAligned<input_t>)) input_t z[dim];
   alignas(alignof(PackedAligned<input_t>)) input_t B[dstate];
   alignas(alignof(PackedAligned<input_t>)) input_t C[dstate];
+  float out[dim];  // dt is special cause we're gonna store input in there as well
 
   using barrier_t = cuda::barrier<cuda::thread_scope_block>;
   barrier_t bar_empty[numStages];
@@ -883,102 +883,10 @@ __global__ void selective_state_update_kernel_producer_consumer_horizontal(
 
 #endif  // FLASHINFER_MAMBA_ENABLE_SM100
 
-template <typename T, size_t N>
-std::string format_array(const T (&arr)[N]) {
-  std::ostringstream oss;
-  for (size_t i = 0; i < N; ++i) {
-    if (i > 0) oss << ", ";
-    oss << arr[i];
-  }
-  return oss.str();
-}
-
-// Helper function to dispatch dim and dstate with a kernel launcher
-template <typename KernelLauncher, int... AllowedDims, int... AllowedDstates>
-void dispatchDimDstate(SelectiveStateUpdateParams& params,
-                       std::integer_sequence<int, AllowedDims...>,
-                       std::integer_sequence<int, AllowedDstates...>, KernelLauncher&& launcher) {
-  constexpr int allowed_dims[] = {AllowedDims...};
-  constexpr int allowed_dstates[] = {AllowedDstates...};
-
-  auto dispatch_dim_dstate = [&]<int DIM, int DSTATE>() {
-    launcher.template operator()<DIM, DSTATE>();
-  };
-
-  auto dispatch_dstate = [&]<int DIM, int DSTATE>() {
-    if (params.dstate == DSTATE) {
-      dispatch_dim_dstate.template operator()<DIM, DSTATE>();
-      return true;
-    }
-    return false;
-  };
-
-  auto dispatch_dim = [&]<int DIM>() {
-    if (params.dim == DIM) {
-      bool dispatched = (dispatch_dstate.template operator()<DIM, AllowedDstates>() || ...);
-      FLASHINFER_CHECK(dispatched, "Unsupported dstate value: ", params.dstate,
-                       ".\nSupported values: ", format_array(allowed_dstates));
-      return true;
-    }
-    return false;
-  };
-
-  bool dim_dispatched = (dispatch_dim.template operator()<AllowedDims>() || ...);
-  FLASHINFER_CHECK(dim_dispatched, "Unsupported dim value: ", params.dim,
-                   ".\nSupported values: ", format_array(allowed_dims));
-}
-
-// Helper function to dispatch ratio with a kernel launcher
-template <typename KernelLauncher, int... AllowedRatios>
-void dispatchRatio(SelectiveStateUpdateParams& params, std::integer_sequence<int, AllowedRatios...>,
-                   KernelLauncher&& launcher) {
-  constexpr int allowed_ratios[] = {AllowedRatios...};
-
-  auto dispatch_single_ratio = [&]<int RATIO>() {
-    if (params.nheads / params.ngroups == RATIO) {
-      launcher.template operator()<RATIO>();
-      return true;
-    }
-    return false;
-  };
-
-  bool ratio_dispatched = (dispatch_single_ratio.template operator()<AllowedRatios>() || ...);
-  FLASHINFER_CHECK(ratio_dispatched,
-                   "Unsupported nheads/ngroups ratio: ", params.nheads / params.ngroups,
-                   ".\nSupported values: ", format_array(allowed_ratios));
-}
-
-// Check alignment for common input variables (x, z, B, C)
-template <typename input_t>
-void check_ptr_alignment_input_vars(const SelectiveStateUpdateParams& params) {
-  using load_input_t = PackedAligned<input_t>;
-  FLASHINFER_CHECK(reinterpret_cast<uintptr_t>(params.x) % sizeof(load_input_t) == 0,
-                   "x pointer must be aligned to ", sizeof(load_input_t), " bytes");
-  FLASHINFER_CHECK((params.x_stride_batch * sizeof(input_t)) % sizeof(load_input_t) == 0,
-                   "x batch stride must be aligned to ", sizeof(load_input_t), " bytes");
-  if (params.z) {
-    FLASHINFER_CHECK(reinterpret_cast<uintptr_t>(params.z) % sizeof(load_input_t) == 0,
-                     "z pointer must be aligned to ", sizeof(load_input_t), " bytes");
-    FLASHINFER_CHECK((params.z_stride_batch * sizeof(input_t)) % sizeof(load_input_t) == 0,
-                     "z batch stride must be aligned to ", sizeof(load_input_t), " bytes");
-  }
-  FLASHINFER_CHECK(reinterpret_cast<uintptr_t>(params.B) % sizeof(load_input_t) == 0,
-                   "B pointer must be aligned to ", sizeof(load_input_t), " bytes");
-  FLASHINFER_CHECK(reinterpret_cast<uintptr_t>(params.C) % sizeof(load_input_t) == 0,
-                   "C pointer must be aligned to ", sizeof(load_input_t), " bytes");
-  FLASHINFER_CHECK((params.B_stride_batch * sizeof(input_t)) % sizeof(load_input_t) == 0,
-                   "B batch stride must be aligned to ", sizeof(load_input_t), " bytes");
-  FLASHINFER_CHECK((params.C_stride_batch * sizeof(input_t)) % sizeof(load_input_t) == 0,
-                   "C batch stride must be aligned to ", sizeof(load_input_t), " bytes");
-}
-
 template <typename input_t, typename weight_t, typename matrixA_t, typename state_t,
           typename stateIndex_t>
 void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, cudaStream_t stream) {
   auto [sm_major, sm_minor] = GetCudaComputeCapability();
-
-  constexpr int allowed_dstates[] = {64, 128, 256};
-  constexpr int allowed_dims[] = {64, 128, 256};
 
   // Common alignment checks for all kernels
   check_ptr_alignment_input_vars<input_t>(params);
@@ -1006,8 +914,7 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, cudaStream_t
                                            DSTATE, numWarps><<<grid, block, 0, stream>>>(params);
     };
 
-    dispatchDimDstate(params, std::integer_sequence<int, 64, 128, 256>{},
-                      std::integer_sequence<int, 64, 128, 256>{}, kernel_launcher);
+    dispatchDimDstate(params, AllowedDims{}, AllowedDstates{}, kernel_launcher);
   }
 #ifdef FLASHINFER_MAMBA_ENABLE_SM90
   else {
@@ -1046,8 +953,7 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, cudaStream_t
       scan_func<<<grid, block, smem_size, stream>>>(params, state_tensor);
     };
 
-    dispatchDimDstate(params, std::integer_sequence<int, 64, 128, 256>{},
-                      std::integer_sequence<int, 64, 128, 256>{}, kernel_launcher);
+    dispatchDimDstate(params, AllowedDims{}, AllowedDstates{}, kernel_launcher);
   }
 #endif
 
@@ -1096,8 +1002,7 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, cudaStream_t
       dispatchRatio(params, std::integer_sequence<int, 1, 8, 16>{}, ratio_launcher);
     };
 
-    dispatchDimDstate(params, std::integer_sequence<int, 64, 128, 256>{},
-                      std::integer_sequence<int, 64, 128, 256>{}, kernel_launcher);
+    dispatchDimDstate(params, AllowedDims{}, AllowedDstates{}, kernel_launcher);
   }
 #endif
 }

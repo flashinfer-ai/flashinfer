@@ -712,3 +712,62 @@ class TestSelectiveStateUpdateMTPLargeBatch(TestSelectiveStateUpdateMTP):
     @pytest.fixture(params=[torch.float32])
     def weight_dtype(self, request):
         return request.param
+
+
+class TestSelectiveStateUpdateMTPIndicesDtypeMismatch:
+    """Test that selective_state_update fails with dtype mismatch between indices."""
+
+    def test_state_batch_idx_and_intermediate_idx_dtype_mismatch_should_fail(self):
+        """Test that state_batch_indices and intermediate_state_indices dtype mismatch raises an error."""
+        batch = 4
+        nheads = 32
+        dim = 64
+        dstate = 128
+        ngroups = 8
+        cache_steps = 4
+
+        # Create inputs with intermediate states buffer
+        inputs = create_test_inputs(
+            batch,
+            nheads,
+            dim,
+            dstate,
+            ngroups,
+            input_dtype=torch.bfloat16,
+            weight_dtype=torch.float32,
+            matrixA_dtype=torch.float32,
+            state_dtype=torch.bfloat16,
+            generate_z=False,
+            generate_intermediate_states_buffer=True,
+            cache_steps=cache_steps,
+            seed=0,
+        )
+
+        # Convert state_batch_indices to int64 (default is typically int64)
+        inputs["slot_idx"] = inputs["slot_idx"].to(torch.int64)
+
+        # Convert intermediate_state_indices to int32 (different dtype)
+        inputs["intermediate_slot_idx"] = inputs["intermediate_slot_idx"].to(
+            torch.int32
+        )
+
+        # This should fail due to dtype mismatch between indices
+        with pytest.raises((RuntimeError, ValueError)):
+            flashinfer.mamba.selective_state_update(
+                inputs["state_cache"],
+                inputs["x"],
+                inputs["dt"],
+                inputs["A"],
+                inputs["B"],
+                inputs["C"],
+                D=inputs["D"],
+                z=inputs.get("z"),
+                dt_bias=inputs["dt_bias"],
+                dt_softplus=True,
+                state_batch_indices=inputs["slot_idx"],
+                pad_slot_id=-1,
+                disable_state_update=True,
+                intermediate_states_buffer=inputs["intermediate_states_buffer"],
+                intermediate_state_indices=inputs["intermediate_slot_idx"],
+                cache_steps=inputs["cache_steps"],
+            )

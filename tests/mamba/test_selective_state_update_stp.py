@@ -439,3 +439,50 @@ class TestSelectiveStateUpdateInt32Indices(TestSelectiveStateUpdate):
             pad_slot_id=-1,
             out=out,
         )
+
+
+class TestSelectiveStateUpdateDtypeMismatch:
+    """Test that selective_state_update fails with dtype mismatch between D and dt."""
+
+    def test_d_f32_dt_bf16_should_fail(self):
+        """Test that D (f32) and dt (bf16) dtype mismatch raises an error."""
+        batch = 1
+        nheads = 8
+        dim = 64
+        dstate = 128
+        ngroups = 8
+
+        # Create inputs with standard dtypes
+        inputs = create_test_inputs(
+            batch,
+            nheads,
+            dim,
+            dstate,
+            ngroups,
+            input_dtype=torch.bfloat16,
+            weight_dtype=torch.bfloat16,
+            matrixA_dtype=torch.float32,
+            state_dtype=torch.bfloat16,
+            generate_z=False,
+            seed=0,
+        )
+
+        # Override D to be float32 (while dt remains bfloat16)
+        inputs["D"] = inputs["D"].to(torch.float32)
+
+        # This should fail due to dtype mismatch
+        with pytest.raises((RuntimeError, ValueError)):
+            flashinfer.mamba.selective_state_update(
+                inputs["state_cache"],
+                inputs["x"],
+                inputs["dt"],
+                inputs["A"],
+                inputs["B"],
+                inputs["C"],
+                D=inputs["D"],
+                z=inputs.get("z"),
+                dt_bias=inputs["dt_bias"],
+                dt_softplus=True,
+                state_batch_indices=inputs["slot_idx"],
+                pad_slot_id=-1,
+            )

@@ -211,7 +211,7 @@ def create_test_inputs(
         result["cache_steps"] = cache_steps
         # Also generate indices mapping batch elements to intermediate state buffer positions
         intermediate_slot_idx = torch.arange(
-            batch_size, dtype=torch.int32, device=device
+            batch_size, dtype=torch.int64, device=device
         )
         result["intermediate_slot_idx"] = intermediate_slot_idx
 
@@ -225,7 +225,7 @@ def create_test_inputs(
         # Token 0: parent = -1 (initial state)
         # Token t: parent = t - 1 (previous token)
         retrieve_parent_token = torch.zeros(
-            batch_size, T, dtype=torch.int32, device=device
+            batch_size, T, dtype=torch.int64, device=device
         )
         retrieve_parent_token[:, 0] = -1  # First token uses initial state
         for t in range(1, T):
