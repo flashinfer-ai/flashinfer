@@ -184,7 +184,7 @@ jobs:
       github.event.inputs.skip_aot != 'true'
     runs-on:
       - self-hosted
-      - Linux
+      - linux
       - ${{ matrix.arch }}
       - cpu
       - spot
@@ -192,7 +192,7 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        arch: [X64, ARM64]
+        arch: [x64, arm64]
         cuda: [cu126, cu128, cu129, cu130]
     env:
       DOCKER_IMAGE: flashinfer/flashinfer-ci-${{ matrix.cuda }}:${{ needs.setup.outputs.docker_tag }}
@@ -296,7 +296,7 @@ jobs:
         if: steps.analyze.outputs.is_spot_termination == 'true'
         run: |
           MATRIX='{"include":['
-          for arch in X64 ARM64; do
+          for arch in x64 arm64; do
             for cuda in cu126 cu128 cu129 cu130; do
               MATRIX+='{"arch":"'$arch'","cuda":"'$cuda'"},'
             done
@@ -313,7 +313,7 @@ jobs:
       needs.analyze-aot-failure.outputs.rerun_matrix != ''
     runs-on:
       - self-hosted
-      - Linux
+      - linux
       - ${{ matrix.arch }}
       - cpu
       - on-demand
@@ -366,7 +366,7 @@ jobs:
       needs.gate.outputs.authorized == 'true' &&
       needs.setup.outputs.skip_build != 'true' &&
       github.event.inputs.skip_gpu != 'true'
-    runs-on: [self-hosted, Linux, X64, gpu, sm86, spot]
+    runs-on: [self-hosted, linux, x64, gpu, sm86, spot]
     timeout-minutes: 360
     strategy:
       fail-fast: true
@@ -483,7 +483,7 @@ jobs:
       !cancelled() &&
       needs.analyze-gpu-a10g-failure.outputs.is_spot_termination == 'true' &&
       needs.analyze-gpu-a10g-failure.outputs.rerun_matrix != ''
-    runs-on: [self-hosted, Linux, X64, gpu, sm86, on-demand]
+    runs-on: [self-hosted, linux, x64, gpu, sm86, on-demand]
     timeout-minutes: 360
     strategy:
       fail-fast: true
@@ -534,7 +534,7 @@ jobs:
       needs.gate.outputs.authorized == 'true' &&
       needs.setup.outputs.skip_build != 'true' &&
       github.event.inputs.skip_gpu != 'true'
-    runs-on: [self-hosted, Linux, X64, gpu, sm75, spot]
+    runs-on: [self-hosted, linux, x64, gpu, sm75, spot]
     timeout-minutes: 360
     env:
       DOCKER_IMAGE: flashinfer/flashinfer-ci-cu129:${{ needs.setup.outputs.docker_tag }}
@@ -639,7 +639,7 @@ jobs:
     if: |
       !cancelled() &&
       needs.analyze-gpu-t4-failure.outputs.is_spot_termination == 'true'
-    runs-on: [self-hosted, Linux, X64, gpu, sm75, on-demand]
+    runs-on: [self-hosted, linux, x64, gpu, sm75, on-demand]
     timeout-minutes: 360
     env:
       DOCKER_IMAGE: flashinfer/flashinfer-ci-cu129:${{ needs.setup.outputs.docker_tag }}
@@ -679,7 +679,7 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # GPU JIT Tests - B200 (Blackwell) - Capacity Block
-  # Triggers dynamic CB purchase via EventBridge → CB Manager Lambda
+  # Requires manually purchased CB via AWS Console
   # ---------------------------------------------------------------------------
   gpu-tests-b200:
     name: JIT Unittest (B200)
@@ -688,7 +688,7 @@ jobs:
       needs.gate.outputs.authorized == 'true' &&
       needs.setup.outputs.skip_build != 'true' &&
       github.event.inputs.skip_gpu != 'true'
-    runs-on: [self-hosted, Linux, X64, gpu, b200]
+    runs-on: [self-hosted, linux, x64, gpu, b200, 1gpu]
     timeout-minutes: 360
     env:
       DOCKER_IMAGE: flashinfer/flashinfer-ci-cu130:${{ needs.setup.outputs.docker_tag }}
@@ -731,7 +731,7 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # GPU JIT Tests - H100 (Hopper) - Capacity Block
-  # Triggers dynamic CB purchase via EventBridge → CB Manager Lambda
+  # Requires manually purchased CB via AWS Console
   # ---------------------------------------------------------------------------
   gpu-tests-h100:
     name: JIT Unittest (H100)
@@ -740,7 +740,7 @@ jobs:
       needs.gate.outputs.authorized == 'true' &&
       needs.setup.outputs.skip_build != 'true' &&
       github.event.inputs.skip_gpu != 'true'
-    runs-on: [self-hosted, Linux, X64, gpu, h100]
+    runs-on: [self-hosted, linux, x64, gpu, h100, 1gpu]
     timeout-minutes: 360
     env:
       DOCKER_IMAGE: flashinfer/flashinfer-ci-cu129:${{ needs.setup.outputs.docker_tag }}
