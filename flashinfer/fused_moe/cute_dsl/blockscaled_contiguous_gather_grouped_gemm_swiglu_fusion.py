@@ -52,7 +52,7 @@ import torch
 
 from flashinfer.utils import get_compute_capability
 from flashinfer.api_logging import flashinfer_api
-from .utils import (
+from flashinfer.cute_dsl.utils import (
     get_cutlass_dtype,
     cutlass_to_torch_dtype,
     get_num_sm,

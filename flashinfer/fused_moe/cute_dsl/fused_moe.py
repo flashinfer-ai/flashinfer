@@ -53,9 +53,9 @@ from typing import Any, Dict, Optional, Tuple
 
 import torch
 
-from ..api_logging import flashinfer_api
-from ..autotuner import AutoTuner
-from ..cute_dsl_moe_utils import (
+from ...api_logging import flashinfer_api
+from ...autotuner import AutoTuner
+from .moe_utils import (
     allocate_moe_sort_buffers,
     get_max_num_permuted_tokens,
     moe_output_memset,

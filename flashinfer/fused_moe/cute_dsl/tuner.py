@@ -34,13 +34,13 @@ from typing import Any, Callable, Dict, List, Tuple
 
 import torch
 
-from ..autotuner import (
+from ...autotuner import (
     DynamicTensorSpec,
     OptimizationProfile,
     TunableRunner,
     TuningConfig,
 )
-from ..fused_moe.utils import (
+from ..utils import (
     get_last_power_of_2_num_tokens_buckets,
     last_positive_power_of_2,
 )

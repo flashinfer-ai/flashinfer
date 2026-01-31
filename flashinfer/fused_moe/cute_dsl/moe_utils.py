@@ -20,7 +20,7 @@ from typing import Dict, Optional, Tuple
 
 import torch
 
-from .jit.moe_utils import gen_moe_utils_module
+from ...jit.moe_utils import gen_moe_utils_module
 
 
 def _get_cuda_stream_ptr() -> int:

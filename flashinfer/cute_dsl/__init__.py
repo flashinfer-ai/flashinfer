@@ -34,27 +34,6 @@ if is_cute_dsl_available():
         grouped_gemm_nt_masked,
         Sm100BlockScaledPersistentDenseGemmKernel,
     )
-    from .blockscaled_contiguous_grouped_gemm import (
-        blockscaled_contiguous_grouped_gemm_nvfp4,
-        create_tile_mapping,
-        create_scale_factor_tensor,
-        Sm100BlockScaledContiguousGroupedGemmKernel,
-        cvt_sf_MKL_to_M32x4xrm_K4xrk_L,
-    )
-    from .blockscaled_contiguous_grouped_gemm_swiglu_fusion import (
-        Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel,
-        blockscaled_contiguous_grouped_gemm_swiglu_fusion_nvfp4,
-    )
-    from .blockscaled_contiguous_grouped_gemm_finalize_fusion import (
-        Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel,
-        blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4,
-        create_finalize_fusion_tensors,
-    )
-    from .blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion import (
-        BlockScaledContiguousGatherGroupedGemmKernel,
-        blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_nvfp4,
-        create_gather_gemm_tensors,
-    )
     from .rmsnorm_fp4quant import (
         rmsnorm_fp4quant,
         RMSNormFP4QuantKernel,
@@ -63,10 +42,6 @@ if is_cute_dsl_available():
     from .add_rmsnorm_fp4quant import (
         add_rmsnorm_fp4quant,
         AddRMSNormFP4QuantKernel,
-    )
-    from .fused_moe import (
-        cute_dsl_fused_moe_nvfp4,
-        CuteDslMoEWrapper,
     )
 
 __all__ = [
@@ -83,6 +58,9 @@ __all__ = [
 
 if is_cute_dsl_available():
     __all__ += [
+        # Dense GEMM
+        "grouped_gemm_nt_masked",
+        "Sm100BlockScaledPersistentDenseGemmKernel",
         # RMSNorm + FP4 Quantization
         "rmsnorm_fp4quant",
         "RMSNormFP4QuantKernel",
@@ -90,7 +68,4 @@ if is_cute_dsl_available():
         # Add + RMSNorm + FP4 Quantization
         "add_rmsnorm_fp4quant",
         "AddRMSNormFP4QuantKernel",
-        # Fused MoE (high-level API)
-        "cute_dsl_fused_moe_nvfp4",
-        "CuteDslMoEWrapper",
     ]
