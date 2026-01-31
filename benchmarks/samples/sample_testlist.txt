@@ -175,3 +175,34 @@
 --routine nvfp4_batched_quantize --batch_size 4 --m 1024 --k 4096 --input_dtype bfloat16 --global_scale 1.0 -vv --generate_repro_command --case_tag "nvfp4_batched_basic"
 --routine nvfp4_batched_quantize --batch_size 8 --m 2048 --k 8192 --input_dtype bfloat16 --global_scale 1.0 -vv --generate_repro_command --case_tag "nvfp4_batched_large"
 --routine nvfp4_batched_quantize --batch_size 4 --m 1024 --k 4096 --input_dtype float16 --global_scale 1.0 -vv --generate_repro_command --case_tag "nvfp4_batched_fp16"
+
+## Sampling
+# Basic sampling from probabilities
+--routine sampling_from_probs --batch_size 32 --vocab_size 128256 --input_dtype float32 -vv --generate_repro_command --case_tag "sampling_basic"
+--routine sampling_from_probs --batch_size 128 --vocab_size 128256 --input_dtype float32 -vv --generate_repro_command --case_tag "sampling_large_batch"
+
+# Top-p (nucleus) sampling
+--routine top_p_sampling_from_probs --batch_size 32 --vocab_size 128256 --top_p 0.9 --input_dtype float32 -vv --generate_repro_command --case_tag "top_p_sampling_p09"
+--routine top_p_sampling_from_probs --batch_size 32 --vocab_size 128256 --top_p 0.95 --input_dtype float32 -vv --generate_repro_command --case_tag "top_p_sampling_p095"
+--routine top_p_sampling_from_probs --batch_size 128 --vocab_size 128256 --top_p 0.9 --input_dtype float32 -vv --generate_repro_command --case_tag "top_p_sampling_large_batch"
+
+# Top-k sampling
+--routine top_k_sampling_from_probs --batch_size 32 --vocab_size 128256 --top_k 50 --input_dtype float32 -vv --generate_repro_command --case_tag "top_k_sampling_k50"
+--routine top_k_sampling_from_probs --batch_size 32 --vocab_size 128256 --top_k 10 --input_dtype float32 -vv --generate_repro_command --case_tag "top_k_sampling_k10"
+--routine top_k_sampling_from_probs --batch_size 128 --vocab_size 128256 --top_k 50 --input_dtype float32 -vv --generate_repro_command --case_tag "top_k_sampling_large_batch"
+
+# Combined top-k and top-p sampling
+--routine top_k_top_p_sampling_from_probs --batch_size 32 --vocab_size 128256 --top_k 50 --top_p 0.9 --input_dtype float32 -vv --generate_repro_command --case_tag "top_k_top_p_sampling"
+--routine top_k_top_p_sampling_from_probs --batch_size 128 --vocab_size 128256 --top_k 50 --top_p 0.95 --input_dtype float32 -vv --generate_repro_command --case_tag "top_k_top_p_sampling_large"
+
+# Top-k renormalize probabilities
+--routine top_k_renorm_probs --batch_size 32 --vocab_size 128256 --top_k 50 --input_dtype float32 --refcheck -vv --generate_repro_command --case_tag "top_k_renorm_probs"
+--routine top_k_renorm_probs --batch_size 32 --vocab_size 128256 --top_k 10 --input_dtype bfloat16 -vv --generate_repro_command --case_tag "top_k_renorm_probs_bf16"
+
+# Top-p renormalize probabilities
+--routine top_p_renorm_probs --batch_size 32 --vocab_size 128256 --top_p 0.9 --input_dtype float32 -vv --generate_repro_command --case_tag "top_p_renorm_probs"
+--routine top_p_renorm_probs --batch_size 32 --vocab_size 128256 --top_p 0.5 --input_dtype float32 -vv --generate_repro_command --case_tag "top_p_renorm_probs_p05"
+
+# Top-k mask logits
+--routine top_k_mask_logits --batch_size 32 --vocab_size 128256 --top_k 50 --input_dtype float32 --refcheck -vv --generate_repro_command --case_tag "top_k_mask_logits"
+--routine top_k_mask_logits --batch_size 32 --vocab_size 128256 --top_k 10 --input_dtype bfloat16 -vv --generate_repro_command --case_tag "top_k_mask_logits_bf16"

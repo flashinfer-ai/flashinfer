@@ -95,6 +95,12 @@ output_column_dict = {
         "do_shuffle",
         "sf_vec_size",
     ],
+    "sampling": [
+        "vocab_size",
+        "top_p",
+        "top_k",
+        "deterministic",
+    ],
     "general": [
         "batch_size",
         "hidden_size",
@@ -119,6 +125,7 @@ full_output_columns = (
     + output_column_dict["moe_comm"]
     + output_column_dict["norm"]
     + output_column_dict["quantization"]
+    + output_column_dict["sampling"]
     + output_column_dict["general"]
 )
 
@@ -157,6 +164,15 @@ benchmark_apis = {
         "mxfp4_quantize",
         "nvfp4_quantize",
         "nvfp4_batched_quantize",
+    ],
+    "sampling": [
+        "sampling_from_probs",
+        "top_p_sampling_from_probs",
+        "top_k_sampling_from_probs",
+        "top_k_top_p_sampling_from_probs",
+        "top_k_renorm_probs",
+        "top_p_renorm_probs",
+        "top_k_mask_logits",
     ],
 }
 
@@ -428,6 +444,77 @@ routine_cc_to_supported_backends = {
         "8.6": [],
         "8.9": [],
         "9.0": [],
+        "10.0": ["cuda"],
+        "10.3": ["cuda"],
+        "12.0": ["cuda"],
+    },
+    # SAMPLING - supported on all architectures
+    "sampling_from_probs": {
+        "7.5": ["cuda"],
+        "8.0": ["cuda"],
+        "8.6": ["cuda"],
+        "8.9": ["cuda"],
+        "9.0": ["cuda"],
+        "10.0": ["cuda"],
+        "10.3": ["cuda"],
+        "12.0": ["cuda"],
+    },
+    "top_p_sampling_from_probs": {
+        "7.5": ["cuda"],
+        "8.0": ["cuda"],
+        "8.6": ["cuda"],
+        "8.9": ["cuda"],
+        "9.0": ["cuda"],
+        "10.0": ["cuda"],
+        "10.3": ["cuda"],
+        "12.0": ["cuda"],
+    },
+    "top_k_sampling_from_probs": {
+        "7.5": ["cuda"],
+        "8.0": ["cuda"],
+        "8.6": ["cuda"],
+        "8.9": ["cuda"],
+        "9.0": ["cuda"],
+        "10.0": ["cuda"],
+        "10.3": ["cuda"],
+        "12.0": ["cuda"],
+    },
+    "top_k_top_p_sampling_from_probs": {
+        "7.5": ["cuda"],
+        "8.0": ["cuda"],
+        "8.6": ["cuda"],
+        "8.9": ["cuda"],
+        "9.0": ["cuda"],
+        "10.0": ["cuda"],
+        "10.3": ["cuda"],
+        "12.0": ["cuda"],
+    },
+    "top_k_renorm_probs": {
+        "7.5": ["cuda"],
+        "8.0": ["cuda"],
+        "8.6": ["cuda"],
+        "8.9": ["cuda"],
+        "9.0": ["cuda"],
+        "10.0": ["cuda"],
+        "10.3": ["cuda"],
+        "12.0": ["cuda"],
+    },
+    "top_p_renorm_probs": {
+        "7.5": ["cuda"],
+        "8.0": ["cuda"],
+        "8.6": ["cuda"],
+        "8.9": ["cuda"],
+        "9.0": ["cuda"],
+        "10.0": ["cuda"],
+        "10.3": ["cuda"],
+        "12.0": ["cuda"],
+    },
+    "top_k_mask_logits": {
+        "7.5": ["cuda"],
+        "8.0": ["cuda"],
+        "8.6": ["cuda"],
+        "8.9": ["cuda"],
+        "9.0": ["cuda"],
         "10.0": ["cuda"],
         "10.3": ["cuda"],
         "12.0": ["cuda"],
