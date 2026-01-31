@@ -206,7 +206,8 @@ jobs:
           sudo rm -rf ${{ github.workspace }}/* || true
           sudo rm -rf ${{ github.workspace }}/.[!.]* || true
           rm -rf ~/.cache/flashinfer_jit || true
-          docker system prune -f || true
+          docker image prune -f || true
+          docker builder prune -f --filter "until=24h" || true
 
       - uses: actions/checkout@v4
         with:
@@ -333,7 +334,8 @@ jobs:
           sudo rm -rf ${{ github.workspace }}/* || true
           sudo rm -rf ${{ github.workspace }}/.[!.]* || true
           rm -rf ~/.cache/flashinfer_jit || true
-          docker system prune -f || true
+          docker image prune -f || true
+          docker builder prune -f --filter "until=24h" || true
 
       - uses: actions/checkout@v4
         with:
@@ -384,7 +386,8 @@ jobs:
           sudo rm -rf ${{ github.workspace }}/* || true
           sudo rm -rf ${{ github.workspace }}/.[!.]* || true
           rm -rf ~/.cache/flashinfer_jit || true
-          docker system prune -f || true
+          docker image prune -f || true
+          docker builder prune -f --filter "until=24h" || true
           nvidia-smi || true
 
       - uses: actions/checkout@v4
@@ -500,7 +503,8 @@ jobs:
           sudo rm -rf ${{ github.workspace }}/* || true
           sudo rm -rf ${{ github.workspace }}/.[!.]* || true
           rm -rf ~/.cache/flashinfer_jit || true
-          docker system prune -f || true
+          docker image prune -f || true
+          docker builder prune -f --filter "until=24h" || true
           nvidia-smi || true
 
       - uses: actions/checkout@v4
@@ -548,7 +552,8 @@ jobs:
           sudo rm -rf ${{ github.workspace }}/* || true
           sudo rm -rf ${{ github.workspace }}/.[!.]* || true
           rm -rf ~/.cache/flashinfer_jit || true
-          docker system prune -f || true
+          docker image prune -f || true
+          docker builder prune -f --filter "until=24h" || true
           nvidia-smi || true
 
       - uses: actions/checkout@v4
@@ -653,7 +658,8 @@ jobs:
           sudo rm -rf ${{ github.workspace }}/* || true
           sudo rm -rf ${{ github.workspace }}/.[!.]* || true
           rm -rf ~/.cache/flashinfer_jit || true
-          docker system prune -f || true
+          docker image prune -f || true
+          docker builder prune -f --filter "until=24h" || true
           nvidia-smi || true
 
       - uses: actions/checkout@v4
@@ -702,7 +708,8 @@ jobs:
           sudo rm -rf ${{ github.workspace }}/* || true
           sudo rm -rf ${{ github.workspace }}/.[!.]* || true
           rm -rf ~/.cache/flashinfer_jit || true
-          docker system prune -f || true
+          docker image prune -f || true
+          docker builder prune -f --filter "until=24h" || true
           # Show GPU info (should show 1 GPU due to CUDA_VISIBLE_DEVICES)
           echo "=== GPU Info ==="
           nvidia-smi || true
@@ -754,7 +761,8 @@ jobs:
           sudo rm -rf ${{ github.workspace }}/* || true
           sudo rm -rf ${{ github.workspace }}/.[!.]* || true
           rm -rf ~/.cache/flashinfer_jit || true
-          docker system prune -f || true
+          docker image prune -f || true
+          docker builder prune -f --filter "until=24h" || true
           # Show GPU info (should show 1 GPU due to CUDA_VISIBLE_DEVICES)
           echo "=== GPU Info ==="
           nvidia-smi || true
