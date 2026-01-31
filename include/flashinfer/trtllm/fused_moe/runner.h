@@ -136,48 +136,25 @@ class Runner {
 }  // namespace Routing
 
 namespace MoE {
-// The type of activation function
+// The type of gated activation function
 // Please keep this in sync with the counterpart defined in flashinfer/flashinfer/fused_moe/core.py
-enum class ActivationType : int64_t {
-  Gelu = 0,
-  Relu = 1,
-  Silu = 2,
-  Swiglu = 3,
-  Geglu = 4,
-  SwigluBias = 5,
-  Relu2 = 6,
-  Identity = 7,
-  InvalidType = 8,  // Must be last
+enum class GatedActType : int64_t {
+  // SwiGlu
+  SwiGlu = 0,
+  // GeGlu
+  GeGlu = 1,
 };
 
-inline std::string serializeActivationType(ActivationType activationType) {
-  switch (activationType) {
-    case ActivationType::Gelu:
-      return "Gelu";
-    case ActivationType::Relu:
-      return "Relu";
-    case ActivationType::Silu:
-      return "Silu";
-    case ActivationType::Swiglu:
-      return "Swiglu";
-    case ActivationType::Geglu:
-      return "Geglu";
-    case ActivationType::SwigluBias:
-      return "SwigluBias";
-    case ActivationType::Relu2:
-      return "Relu2";
-    case ActivationType::Identity:
-      return "Identity";
+inline std::string serializeGatedActType(GatedActType gatedActType) {
+  switch (gatedActType) {
+    case GatedActType::SwiGlu:
+      return "SwiGlu";
+    case GatedActType::GeGlu:
+      return "GeGlu";
     default:
-      return "InvalidActivationType";  // TODO throw error
+      return "InvalidGatedActType";  // TODO throw error
   };
 }
-
-inline bool isGatedActivation(ActivationType activationType) {
-  return activationType == ActivationType::Swiglu || activationType == ActivationType::Geglu ||
-         activationType == ActivationType::SwigluBias;
-}
-
 }  // namespace MoE
 
 namespace PermuteGemm1 {
@@ -185,7 +162,7 @@ class Runner {
  public:
   explicit Runner(batchedGemm::trtllm::gen::Dtype dtypeAct,
                   batchedGemm::trtllm::gen::Dtype dtypeWeights, bool useDeepSeekFp8,
-                  int tileTokensDim, MoE::ActivationType activationType, bool useShuffledMatrix,
+                  int tileTokensDim, MoE::GatedActType gatedActType, bool useShuffledMatrixA,
                   batchedGemm::gemm::MatrixLayout weight_layout);
 
   size_t getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
@@ -216,7 +193,6 @@ class Runner {
   batchedGemm::trtllm::gen::Dtype mDtypeWeights;
   int32_t mTileTokensDim;
   tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner mRunner;
-  tensorrt_llm::kernels::trtllmgen_moe::MoE::ActivationType mActType;
 };
 }  // namespace PermuteGemm1
 
@@ -226,7 +202,7 @@ class Runner {
   explicit Runner(batchedGemm::trtllm::gen::Dtype dtypeAct,
                   batchedGemm::trtllm::gen::Dtype dtypeWeights,
                   batchedGemm::trtllm::gen::Dtype outputDtype, bool useDeepSeekFp8,
-                  int tileTokensDim, bool useShuffledMatrix,
+                  int tileTokensDim, bool useShuffledMatrixA,
                   batchedGemm::gemm::MatrixLayout weight_layout);
 
   size_t getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
@@ -282,8 +258,6 @@ struct MoERunnerArgs {
   float* gemm1_beta = nullptr;
   float* gemm1_clamp_limit = nullptr;
   float* gemm2_bias = nullptr;
-
-  ActivationType activation_type = ActivationType::Swiglu;
 
   int32_t num_tokens{0};
   int32_t num_experts{0};
@@ -382,10 +356,10 @@ class Runner {
   // FIXME: tileTokensDim is hardcoded for now
   Runner(batchedGemm::trtllm::gen::Dtype dtypeAct, batchedGemm::trtllm::gen::Dtype dtypeWeights,
          bool useDeepSeekFp8, int tileTokensDim = 8,
-         ActivationType activationType = ActivationType::Swiglu, bool useShuffledMatrix = false,
+         GatedActType gatedActType = GatedActType::SwiGlu, bool useShuffledMatrixA = false,
          batchedGemm::gemm::MatrixLayout weight_layout = batchedGemm::gemm::MatrixLayout::MajorK);
   Runner(batchedGemm::trtllm::gen::Dtype dtypeElt, bool useDeepSeekFp8, int tileTokensDim = 8,
-         bool useShuffledMatrix = false,
+         bool useShuffledMatrixA = false,
          batchedGemm::gemm::MatrixLayout weight_layout = batchedGemm::gemm::MatrixLayout::MajorK);
 
   void run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int device,
