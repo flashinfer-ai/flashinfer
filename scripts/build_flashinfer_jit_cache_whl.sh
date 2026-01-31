@@ -49,19 +49,15 @@ export LD_LIBRARY_PATH="/usr/local/cuda/lib64:/usr/local/cuda/lib64/stubs:$LD_LI
 
 echo "::group::Install build system"
 pip install --upgrade build
-# Install build dependencies for --no-isolation that may not be in the current environment.
-pip install --upgrade "setuptools>=77" wheel
 echo "::endgroup::"
 
 # Clean any previous builds
 echo "Cleaning previous builds..."
 rm -rf dist build *.egg-info
 
-# Build the wheel using the build module.
-# Use --no-isolation to build against the host environment's dependencies (e.g. nvshmem)
-# and avoid version mismatches at runtime.
+# Build the wheel using the build module for better isolation
 echo "Building wheel..."
-python -m build --wheel --no-isolation
+python -m build --wheel
 
 echo ""
 echo "✓ Build completed successfully"
