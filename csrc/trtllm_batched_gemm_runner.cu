@@ -101,8 +101,7 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
         options.mTransposeMmaOutput == mOptions.transposeMmaOutput &&
         (!doesRouteImplUseNoRoute(options.mRouteImpl)) == mOptions.routeAct &&
         options.mFusedAct == mOptions.fusedAct && options.mIsStaticBatch == mOptions.staticBatch &&
-        tileSize == mOptions.tileSize &&
-        options.mUseShuffledMatrix == mOptions.useShuffledMatrixA &&
+        tileSize == mOptions.tileSize && options.mUseShuffledMatrix == mOptions.useShuffledMatrix &&
         options.mLayoutA == mOptions.weightLayout) {
       if (options.mFusedAct) {
         if (options.mActType != static_cast<batchedGemm::gemmGatedAct::ActType>(mOptions.actType)) {

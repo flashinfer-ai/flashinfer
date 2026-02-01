@@ -184,7 +184,7 @@ class Runner {
  public:
   explicit Runner(batchedGemm::trtllm::gen::Dtype dtypeAct,
                   batchedGemm::trtllm::gen::Dtype dtypeWeights, bool useDeepSeekFp8,
-                  int tileTokensDim, MoE::ActivationType activationType, bool useShuffledMatrixA,
+                  int tileTokensDim, MoE::ActivationType activationType, bool useShuffledMatrix,
                   batchedGemm::gemm::MatrixLayout weight_layout);
 
   size_t getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
@@ -225,7 +225,7 @@ class Runner {
   explicit Runner(batchedGemm::trtllm::gen::Dtype dtypeAct,
                   batchedGemm::trtllm::gen::Dtype dtypeWeights,
                   batchedGemm::trtllm::gen::Dtype outputDtype, bool useDeepSeekFp8,
-                  int tileTokensDim, bool useShuffledMatrixA,
+                  int tileTokensDim, bool useShuffledMatrix,
                   batchedGemm::gemm::MatrixLayout weight_layout);
 
   size_t getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
@@ -381,10 +381,10 @@ class Runner {
   // FIXME: tileTokensDim is hardcoded for now
   Runner(batchedGemm::trtllm::gen::Dtype dtypeAct, batchedGemm::trtllm::gen::Dtype dtypeWeights,
          bool useDeepSeekFp8, int tileTokensDim = 8,
-         ActivationType activationType = ActivationType::Swiglu, bool useShuffledMatrixA = false,
+         ActivationType activationType = ActivationType::Swiglu, bool useShuffledMatrix = false,
          batchedGemm::gemm::MatrixLayout weight_layout = batchedGemm::gemm::MatrixLayout::MajorK);
   Runner(batchedGemm::trtllm::gen::Dtype dtypeElt, bool useDeepSeekFp8, int tileTokensDim = 8,
-         bool useShuffledMatrixA = false,
+         bool useShuffledMatrix = false,
          batchedGemm::gemm::MatrixLayout weight_layout = batchedGemm::gemm::MatrixLayout::MajorK);
 
   void run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int device,
