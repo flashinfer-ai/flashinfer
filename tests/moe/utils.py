@@ -33,6 +33,10 @@ class QuantMode(IntEnum):
     MXINT4_BF16_BF16 = 7
 
 
+def is_gated_activation(activation_type: ActivationType) -> bool:
+    return activation_type in [ActivationType.Swiglu, ActivationType.Geglu]
+
+
 def skip_checks(
     moe_impl,
     routing_config,
