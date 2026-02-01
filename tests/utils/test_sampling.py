@@ -1119,6 +1119,9 @@ def test_sampling_nan_input(batch_size, vocab_size):
 
     probs[0, :] = float("nan")
 
+    result = flashinfer.sampling.sampling_from_probs(probs)
+    assert result[0].item() == 0
+
     result_top_k = flashinfer.sampling.top_k_sampling_from_probs(probs, top_k=50)
     assert result_top_k[0].item() == 0
 

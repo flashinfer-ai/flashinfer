@@ -761,6 +761,7 @@ __global__ void SamplingFromProbKernel(DType* probs, IdType* output, IdType* ind
       reinterpret_cast<SamplingTempStorage<BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>&>(
           smem_sampling);
   temp_storage.sampled_id = d;
+  temp_storage.last_valid_id = -1;
   __syncthreads();
 
   vec_t<float, VEC_SIZE> probs_vec;
@@ -786,6 +787,12 @@ __global__ void SamplingFromProbKernel(DType* probs, IdType* output, IdType* ind
     // NOTE(Zihao): this would happen when u is very close to 1
     // and the sum of probabilities is smaller than u
     // In this case, we use the last valid index as the sampled id
+    if (temp_storage.last_valid_id == -1) {
+      if (tx == 0) {
+        output[bx] = 0;
+      }
+      return;
+    }
     sampled_id = temp_storage.last_valid_id;
   }
   output[bx] = sampled_id;
