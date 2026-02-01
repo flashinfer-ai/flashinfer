@@ -8,7 +8,7 @@ from flashinfer.fused_moe import (
     trtllm_fp8_block_scale_moe,
 )
 from .utils import skip_checks, QuantMode
-from flashinfer import GatedActType
+from flashinfer import ActivationType
 
 
 def dequant_fp8_block_scaled(
@@ -616,7 +616,7 @@ def test_correctness_dpsk_fp8_fused_moe(
         moe_impl=moe_impl,
         routing_config=routing_config,
         weight_processing=weight_processing,
-        gated_act_type=GatedActType.SwiGlu,
+        gated_act_type=ActivationType.Swiglu,
         num_tokens=seq_len,
         hidden_size=7168,  # DeepSeek-V3 hidden size
         intermediate_size=intermediate_size,

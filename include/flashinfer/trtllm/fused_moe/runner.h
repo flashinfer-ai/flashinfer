@@ -169,7 +169,7 @@ inline std::string serializeActivationType(ActivationType activationType) {
     case ActivationType::Identity:
       return "Identity";
     default:
-      return "InvalidType";  // TODO throw error
+      return "InvalidActivationType";  // TODO throw error
   };
 }
 

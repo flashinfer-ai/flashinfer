@@ -4,7 +4,7 @@ import torch
 import numpy as np
 from flashinfer import (
     RoutingMethodType,
-    GatedActType,
+    ActivationType,
     fp4_quantize,
     mxfp8_quantize,
 )
@@ -288,7 +288,7 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
         RoutingMethodType.Renormalize.value,
         True,
         enable_pdl,
-        GatedActType.SwiGlu.value,  # gated_act_type
+        ActivationType.Swiglu.value,  # act_type
         None,
         num_tokens if tune_max_num_tokens is None else tune_max_num_tokens,
     )
