@@ -408,13 +408,16 @@ class FP4Moe(Moe):
         )
 
         # Convert quantized weights to proper formats
+        intermediate_size_factor = 2 if is_gated_activation(args.activation_type) else 1
         gemm1_weights_fp4 = args.gemm1_weights.view(torch.float8_e4m3fn).reshape(
-            num_experts, 2 * intermediate_size, hidden_size // 2
+            num_experts, intermediate_size_factor * intermediate_size, hidden_size // 2
         )  # packed fp4
         gemm1_scales_linear_fp4 = gemm1_scales_linear_fp4_bytes.view(
             torch.float8_e4m3fn
         ).reshape(
-            num_experts, 2 * intermediate_size, hidden_size // self.sf_vec_size
+            num_experts,
+            intermediate_size_factor * intermediate_size,
+            hidden_size // self.sf_vec_size,
         )  # fp8 scaling factors
 
         gemm2_weights_fp4 = args.gemm2_weights.view(torch.float8_e4m3fn).reshape(
@@ -440,6 +443,7 @@ class FP4Moe(Moe):
                 self._cache_permute_indices,
                 gemm1_weights_fp4[i].view(torch.uint8),
                 epilogue_tile_m,
+                is_gated_act_gemm=is_gated_activation(args.activation_type),
             )
             gemm1_weights_fp4_shuffled.append(
                 gemm1_weights_fp4[i]
@@ -452,6 +456,7 @@ class FP4Moe(Moe):
                 gemm1_scales_linear_fp4[i].view(torch.uint8),
                 epilogue_tile_m,
                 num_elts_per_sf=16,
+                is_gated_act_gemm=is_gated_activation(args.activation_type),
             )
             gemm1_scales_fp4_shuffled.append(
                 block_scale_interleave(
@@ -496,7 +501,9 @@ class FP4Moe(Moe):
             torch.stack(gemm1_scales_fp4_shuffled)
             .view(torch.float8_e4m3fn)
             .reshape(
-                num_experts, 2 * intermediate_size, hidden_size // self.sf_vec_size
+                num_experts,
+                intermediate_size_factor * intermediate_size,
+                hidden_size // self.sf_vec_size,
             )
         )
 
@@ -508,11 +515,16 @@ class FP4Moe(Moe):
         )
 
         # Calculate scaling factors that depend on weights
-        scale_c_fc1 = (
-            args_dequant.c_global_sf
-            * (1.0 / args.gemm1_scales_global)
-            * (1.0 / args.hidden_states_scale_global)
-        )
+        if is_gated_activation(args.activation_type):
+            scale_c_fc1 = (
+                args_dequant.c_global_sf
+                * (1.0 / args.gemm1_scales_global)
+                * (1.0 / args.hidden_states_scale_global)
+            )
+        else:
+            scale_c_fc1 = torch.full_like(
+                args.gemm1_scales_global, args_dequant.c_global_sf
+            )
         scale_gate_fc1 = (1.0 / args.gemm1_scales_global) * (
             1.0 / args.hidden_states_scale_global
         )
@@ -2848,6 +2860,7 @@ def test_deepseekv3_routing(
     [
         pytest.param(ActivationType.Swiglu, id="Swiglu"),
         pytest.param(ActivationType.Geglu, id="Geglu"),
+        pytest.param(ActivationType.Relu2, id="Relu2"),
     ],
 )
 def test_topk_routing(
