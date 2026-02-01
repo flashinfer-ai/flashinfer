@@ -66,9 +66,9 @@ struct SMTypeAdapter<_2SM> {
 template <typename T, typename arch, int32_t CTA_M_, int32_t CTA_N_, int32_t CTA_K_,
           typename ClusterShape_, typename XSM_>
 size_t genericBf16GemmKernelLauncherSm100(__nv_bfloat16 const* A, __nv_bfloat16 const* B, T* D,
-                                          int m, int n, int k, int b, CutlassGemmConfig config,
-                                          char* workspacePtr, size_t const workspaceBytes,
-                                          cudaStream_t stream) {
+                                          T* bias, int m, int n, int k, int b,
+                                          CutlassGemmConfig config, char* workspacePtr,
+                                          size_t const workspaceBytes, cudaStream_t stream) {
   using namespace cute;
 
   using ElementA = cutlass::bfloat16_t;
@@ -137,6 +137,11 @@ size_t genericBf16GemmKernelLauncherSm100(__nv_bfloat16 const* A, __nv_bfloat16 
   auto stride_C = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(m, n, b));
   auto stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(m, n, b));
 
+  // TODO(flashinfer): Implement bias fusion via CUTLASS epilogue visitor tree
+  // For now, bias is ignored and will be implemented in a follow-up
+  // See TGV GEMM implementation in tgv_gemm.cuh for reference on bias handling
+  (void)bias;  // Suppress unused parameter warning
+
   typename Gemm::Arguments arguments{
       cutlass::gemm::GemmUniversalMode::kGemm,
       {m, n, k, b},
@@ -185,8 +190,8 @@ size_t genericBf16GemmKernelLauncherSm100(__nv_bfloat16 const* A, __nv_bfloat16 
   template size_t genericBf16GemmKernelLauncherSm100<                                          \
       RET_TYPE, cutlass::arch::Sm100, TILE_M, TILE_N, TILE_K,                                  \
       cute::Shape<cute::Int<CGA_M_>, cute::Int<CGA_N_>, cute::Int<CGA_K_>>, SM_TYPE>(          \
-      __nv_bfloat16 const* A, __nv_bfloat16 const* B, RET_TYPE* D, int m, int n, int k, int b, \
-      CutlassGemmConfig config, char* workspacePtr, size_t const workspaceBytes,               \
-      cudaStream_t stream);
+      __nv_bfloat16 const* A, __nv_bfloat16 const* B, RET_TYPE* D, RET_TYPE* bias, int m,      \
+      int n, int k, int b, CutlassGemmConfig config, char* workspacePtr,                       \
+      size_t const workspaceBytes, cudaStream_t stream);
 
 #endif  // FLASHINFER_BF16_GEMM_TEMPLATE_SM100_H_
