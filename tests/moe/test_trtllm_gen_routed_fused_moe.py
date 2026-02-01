@@ -20,7 +20,7 @@ import torch
 
 from flashinfer import (
     RoutingMethodType,
-    ActivationType,
+    GatedActType,
     fp4_quantize,
     mxfp8_quantize,
 )
@@ -185,7 +185,7 @@ def test_trtllm_gen_routed_fused_moe(
         routing_method_type.value,
         True,  # do_finalize
         enable_pdl,
-        ActivationType.Swiglu.value,  # act_type
+        GatedActType.SwiGlu.value,  # gated_act_type
         None,
     )[0].to(torch.float)
 
@@ -238,7 +238,7 @@ def test_trtllm_gen_routed_fused_moe(
         routing_method_type.value,
         True,  # do_finalize
         enable_pdl,
-        ActivationType.Swiglu.value,  # act_type
+        GatedActType.SwiGlu.value,  # gated_act_type
         None,
     )[0].to(torch.float)
 

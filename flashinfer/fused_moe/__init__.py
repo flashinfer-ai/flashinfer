@@ -15,8 +15,8 @@ limitations under the License.
 """
 
 from .core import (
-    ActivationType,
     RoutingMethodType,
+    GatedActType,
     WeightLayout,
     convert_to_block_layout,
     cutlass_fused_moe,
@@ -51,9 +51,8 @@ except ImportError:
     _cute_dsl_available = False
 
 __all__ = [
-    # Core MOE APIs
-    "ActivationType",
     "RoutingMethodType",
+    "GatedActType",
     "WeightLayout",
     "convert_to_block_layout",
     "cutlass_fused_moe",
