@@ -621,7 +621,7 @@ __device__ __forceinline__ void DeviceSamplingFromProb(
   int max_valid_index =
       BlockReduce<int, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage->block_prim.reduce_int)
           .Reduce(valid_index, MaxReduceOp{});
-  if (tx == 0 && max_valid_index != -1) {
+  if (tx == 0 && max_valid_index != -1 && max_valid_index < (int)d) {
     temp_storage->last_valid_id = max_valid_index;
   }
   __syncthreads();
