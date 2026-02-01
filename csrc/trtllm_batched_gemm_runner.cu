@@ -223,7 +223,7 @@ void TrtllmGenBatchedGemmRunner::run(
   gemmData.mInputBuffers.mPtrSfB = mOptions.transposeMmaOutput ? sfA : sfB;
   gemmData.mInputBuffers.mPtrScaleC = scaleC;
   gemmData.mInputBuffers.mPtrScaleGate = scaleGateC;
-  // TODO amitz-nv: Do we want to pass scaleAct instead of using scaleGateC?
+  // For simplicity pass set scaleAct to scaleGateC
   gemmData.mInputBuffers.mPtrScaleAct = scaleGateC;
   gemmData.mInputBuffers.mPtrPerTokenSfA =
       mOptions.transposeMmaOutput ? perTokensSfB : perTokensSfA;
