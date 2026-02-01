@@ -16,7 +16,8 @@ from .cpp_ext import generate_ninja_build_for_op, run_ninja
 from .utils import write_if_different
 
 os.makedirs(jit_env.FLASHINFER_WORKSPACE_DIR, exist_ok=True)
-os.makedirs(jit_env.FLASHINFER_CSRC_DIR, exist_ok=True)
+# Note: Do NOT create FLASHINFER_CSRC_DIR here - it's the package directory
+# which may be read-only after installation
 
 
 class MissingJITCacheError(RuntimeError):

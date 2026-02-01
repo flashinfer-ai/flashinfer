@@ -111,9 +111,10 @@ def gen_cutlass_fused_moe_module(
     """
     Generate a JitSpec for the cutlass fused moe module.
     """
+    # Use FLASHINFER_GEN_SRC_DIR (user's writable cache) instead of FLASHINFER_CSRC_DIR
+    # (package directory which may be read-only after installation)
     output_dir = (
-        jit_env.FLASHINFER_CSRC_DIR
-        / f"nv_internal/tensorrt_llm/cutlass_instantiations/{device_arch}"
+        jit_env.FLASHINFER_GEN_SRC_DIR / f"cutlass_instantiations/{device_arch}"
     )
 
     try:
@@ -205,6 +206,8 @@ def gen_cutlass_fused_moe_module(
             / "tensorrt_llm"
             / "kernels"
             / "cutlass_kernels",
+            # Include the generated output directory for header files
+            output_dir,
         ],
     )
 
