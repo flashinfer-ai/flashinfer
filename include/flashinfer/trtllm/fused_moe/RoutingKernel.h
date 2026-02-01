@@ -176,15 +176,14 @@ struct Data : public DataBase {
   bool mUseRoutingSoftmax;
 };
 
-template <typename InputT_, typename BiasT_, typename OutputT_, int MaxNumExperts_,
-          int MaxNumTopExperts_, bool UseGroups_, bool isPow2_, bool UsePdl_>
+template <typename InputT_, typename BiasT_, typename OutputT_, int MaxNumExperts_, bool UseGroups_,
+          bool isPow2_, bool UsePdl_>
 struct KernelParams : public KernelParamsBase<InputT_, OutputT_, MaxNumExperts_, isPow2_, UsePdl_> {
   using InputT = InputT_;
   using BiasT = BiasT_;
   using OutputT = OutputT_;
 
   static constexpr bool UseGroups = UseGroups_;
-  static constexpr int MaxNumTopExperts = MaxNumTopExperts_;
 
   PackedScoreIdx<OutputT>* mPtrTopKPacked = nullptr;
 
