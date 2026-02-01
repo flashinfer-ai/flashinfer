@@ -92,7 +92,7 @@ def skip_checks(
         )
 
     # Skip large intermediate sizes for configurations with many experts
-    if routing_config["num_experts"] >= 512 and intermediate_size > 512:
+    if routing_config["num_experts"] > 512 and intermediate_size > 512:
         pytest.skip(
             f"Skipping for testing speed: intermediate_size={intermediate_size} with {routing_config['num_experts']} experts"
         )
