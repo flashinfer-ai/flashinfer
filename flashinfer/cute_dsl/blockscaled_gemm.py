@@ -57,7 +57,13 @@ from cutlass._mlir.dialects import llvm
 from flashinfer.utils import get_compute_capability
 from flashinfer.api_logging import flashinfer_api
 from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
-from .utils import get_cutlass_dtype, cutlass_to_torch_dtype, get_num_sm, make_ptr
+from .utils import (
+    get_cutlass_dtype,
+    cutlass_to_torch_dtype,
+    get_num_sm,
+    get_max_active_clusters,
+    make_ptr,
+)
 from typing import Callable, List
 
 
@@ -2613,10 +2619,9 @@ class MaskedBatchedMatmulCuteDSL:
                 f"MaskedBatchedMatmulCuteDSL: Unsupported with {ab_dtype}, {sf_dtype}, {sf_vec_size}, {c_dtype},  {mma_tiler_mn}, {cluster_shape_mn}, {m}, {n}, {k}, {l}, {a_major}, {b_major}, {c_major}"
             )
 
-        # Compute max active clusters on current device
-        hardware_info = cutlass.utils.HardwareInfo()
+        # Compute max active clusters on current device (cached to avoid expensive queries)
         self._max_active_clusters = min(
-            hardware_info.get_max_active_clusters(
+            get_max_active_clusters(
                 self._cluster_shape_mn[0] * self._cluster_shape_mn[1]
             ),
             sm_count,
