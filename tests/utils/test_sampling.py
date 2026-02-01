@@ -1110,6 +1110,22 @@ def test_sampling_with_default_device_cuda(batch_size, vocab_size):
         torch.set_default_device(original_device)
 
 
+@pytest.mark.parametrize("batch_size", [1, 4, 8])
+@pytest.mark.parametrize("vocab_size", [111, 32000])
+def test_sampling_nan_input(batch_size, vocab_size):
+    torch.manual_seed(42)
+    probs = torch.rand(batch_size, vocab_size, device="cuda:0", dtype=torch.float32)
+    probs = probs / probs.sum(dim=-1, keepdim=True)
+
+    probs[0, :] = float("nan")
+
+    result_top_k = flashinfer.sampling.top_k_sampling_from_probs(probs, top_k=50)
+    assert result_top_k[0].item() == 0
+
+    result_top_p = flashinfer.sampling.top_p_sampling_from_probs(probs, top_p=0.9)
+    assert result_top_p[0].item() == 0
+
+
 if __name__ == "__main__":
     # test_sampling_freq(128256, gumbel_distribution(0.1), 0.5)
     test_sampling_from_logits_freq(128256, gumbel_distribution(0.1))
