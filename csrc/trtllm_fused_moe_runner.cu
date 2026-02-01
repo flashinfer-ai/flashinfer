@@ -302,8 +302,10 @@ size_t Runner::getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t
                                        int32_t configIndex) const {
   auto maxNumCtasInBatchDim =
       Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
-  return mRunner.getWorkspaceSizeInBytes(numTokens, intermediateSize, hiddenSize, {}, numTokens,
-                                         numExperts, maxNumCtasInBatchDim, configIndex);
+  int32_t intermediateSizeFactor = (isGatedActivation(mActType) ? 2 : 1);
+  return mRunner.getWorkspaceSizeInBytes(numTokens, intermediateSizeFactor * intermediateSize,
+                                         hiddenSize, {}, numTokens, numExperts,
+                                         maxNumCtasInBatchDim, configIndex);
 }
 
 int32_t Runner::getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize,
@@ -311,8 +313,10 @@ int32_t Runner::getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize,
                                            int32_t numTokens) const {
   auto maxNumCtasInBatchDim =
       Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
-  return mRunner.getDefaultValidConfigIndex(numTokens, intermediateSize, hiddenSize, {},
-                                            numTokens, numExperts, maxNumCtasInBatchDim);
+  int32_t intermediateSizeFactor = (isGatedActivation(mActType) ? 2 : 1);
+  return mRunner.getDefaultValidConfigIndex(numTokens, intermediateSizeFactor * intermediateSize,
+                                            hiddenSize, {}, numTokens, numExperts,
+                                            maxNumCtasInBatchDim);
 }
 
 bool Runner::isValidConfigIndex(int32_t configIndex, int32_t topK, int32_t hiddenSize,
@@ -321,9 +325,10 @@ bool Runner::isValidConfigIndex(int32_t configIndex, int32_t topK, int32_t hidde
   auto maxNumCtasInBatchDim =
       Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
 
+  int32_t intermediateSizeFactor = (isGatedActivation(mActType) ? 2 : 1);
   auto const isValid =
-      mRunner.isValidConfigIndex(configIndex, numTokens, intermediateSize, hiddenSize, {},
-                                 numTokens, numExperts, maxNumCtasInBatchDim);
+      mRunner.isValidConfigIndex(configIndex, numTokens, intermediateSizeFactor * intermediateSize,
+                                 hiddenSize, {}, numTokens, numExperts, maxNumCtasInBatchDim);
 
   return isValid;
 }
