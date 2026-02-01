@@ -1748,7 +1748,7 @@ def get_trtllm_moe_sm100_module():
         routing_method_type: int,
         do_finalize: bool,
         enable_pdl: Optional[bool] = None,
-        activation_type: int = 0,
+        activation_type: int = ActivationType.Swiglu.value,
         output: Optional[torch.Tensor] = None,
         tune_max_num_tokens: int = 8192,
     ) -> List[torch.Tensor]:
@@ -2474,7 +2474,7 @@ def trtllm_fp4_block_scale_moe(
     routing_method_type: int = 0,
     do_finalize: bool = True,
     enable_pdl: Optional[bool] = None,
-    activation_type: int = 0,
+    activation_type: int = ActivationType.Swiglu.value,
     output: Optional[torch.Tensor] = None,
     tune_max_num_tokens: int = 8192,
 ) -> List[torch.Tensor]:
@@ -2529,7 +2529,7 @@ def trtllm_fp4_block_scale_moe(
             - 4: RenormalizeNaive (Softmax -> TopK -> Renormalize)
         do_finalize (bool): Whether to finalize the output (default: False)
         enable_pdl (Optional[bool]): Whether to enable Programmatic Dependent Launch (PDL). Auto-enabled for >= sm90.
-        activation_type (int): Type of activation function (default: 0)
+        activation_type (int): Type of activation function (default: 3 - Swiglu)
             - 0: Gelu
             - 1: Relu
             - 2: Silu
