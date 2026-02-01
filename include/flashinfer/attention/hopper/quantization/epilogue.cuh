@@ -14,6 +14,7 @@
 #include "../named_barrier.cuh"
 #include "../utils.cuh"
 #include "cute/tensor.hpp"
+#include "cutlass/epilogue/collective/detail.hpp"
 #include "cutlass/gemm/collective/collective_builder.hpp"
 
 namespace flashinfer {
@@ -39,7 +40,13 @@ struct FP8CollectiveEpilogue {
                                    decltype(cute::get<2>(TileShape_QKD{}))>());
   using SmemLayoutO = decltype(tile_to_shape(SmemLayoutAtomO{}, select<0, 2>(TileShape_QKD{})));
 
-  using SmemCopyAtomO = Copy_Atom<cute::SM90_U32x4_STSM_N, DTypeO>;
+  using StrideO = cute::Shape<int64_t, _1, int64_t>;
+  using EpilogueTile_MN = decltype(select<0, 2>(TileShape_QKD{}));
+  // Use sm90_get_smem_store_op_for_accumulator to get the correct copy op for FP8 accumulators
+  using CopyOpR2S =
+      decltype(cutlass::epilogue::collective::detail::sm90_get_smem_store_op_for_accumulator<
+               StrideO, DTypeO, EpilogueTile_MN>());
+  using SmemCopyAtomO = Copy_Atom<CopyOpR2S, DTypeO>;
   using SharedStorage = cute::array_aligned<DTypeO, cute::cosize_v<SmemLayoutO>>;
 
   using ShapeT = cute::Shape<int32_t, int32_t, int32_t>;
