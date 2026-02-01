@@ -174,7 +174,8 @@ inline std::string serializeActivationType(ActivationType activationType) {
 }
 
 inline bool isGatedActivation(ActivationType activationType) {
-  return activationType == ActivationType::Swiglu || activationType == ActivationType::Geglu;
+  return activationType == ActivationType::Swiglu || activationType == ActivationType::Geglu ||
+         activationType == ActivationType::SwigluBias;
 }
 
 }  // namespace MoE
