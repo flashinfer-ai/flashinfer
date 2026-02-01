@@ -99,9 +99,9 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
     )
 
     if is_block_scale:
-        if activation_type == ActivationType.Relu2:
+        if activation_type != ActivationType.Swiglu:
             raise ValueError(
-                "Relu2 activation is not supported for FP8 block scale MoE."
+                "Only Swiglu activation is supported for FP8 block scale MoE."
             )
         fn = lambda: trtllm_fp8_block_scale_moe(
             routing_logits,
