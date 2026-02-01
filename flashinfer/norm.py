@@ -98,13 +98,13 @@ def rmsnorm_quant(
     out: torch.Tensor,
     input: torch.Tensor,
     weight: torch.Tensor,
-    scale: float,
+    scale: torch.Tensor,
     eps: float = 1e-6,
     enable_pdl: Optional[bool] = None,
-) -> torch.Tensor:
-    r"""Root mean square normalization.
+) -> None:
+    r"""Root mean square normalization + fp8 quantization.
 
-    ``out[i] = (input[i] / RMS(input)) * weight[i]``
+    ``out[i] = ((input[i] / RMS(input)) * weight[i]).to(fp8)``
 
     Parameters
     ----------
@@ -114,18 +114,13 @@ def rmsnorm_quant(
         Input tensor, 2D shape (batch_size, hidden_size).
     weight: torch.Tensor
         Weight tensor, shape (hidden_size,).
-    scale: float
-        Scale factor for quantization.
+    scale: torch.Tensor
+        Scale factor for quantization, shape (1,).
     eps: float
         Epsilon for numerical stability.
     enable_pdl: bool
         Whether to enable `programmatic dependent launch
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
-
-    Returns
-    -------
-    output: torch.Tensor
-        Normalized tensor, 2D shape (batch_size, hidden_size).
     """
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)
@@ -137,7 +132,7 @@ def _rmsnorm_quant_fake(
     out: torch.Tensor,
     input: torch.Tensor,
     weight: torch.Tensor,
-    scale: float,
+    scale: torch.Tensor,
     eps: float,
     enable_pdl: Optional[bool],
 ) -> None:
@@ -200,17 +195,17 @@ def fused_add_rmsnorm_quant(
     input: torch.Tensor,
     residual: torch.Tensor,
     weight: torch.Tensor,
-    scale: float,
+    scale: torch.Tensor,
     eps: float = 1e-6,
     enable_pdl: Optional[bool] = None,
 ) -> None:
-    r"""Fused add root mean square normalization.
+    r"""Fused add root mean square normalization + fp8 quantization.
 
     Step 1:
     ``residual[i] += input[i]``
 
     Step 2:
-    ``input[i] = (residual[i] / RMS(residual)) * weight[i]``
+    ``input[i] = ((residual[i] / RMS(residual)) * weight[i]).to(fp8)``
 
     Parameters
     ----------
@@ -222,8 +217,8 @@ def fused_add_rmsnorm_quant(
         Residual tensor, shape (batch_size, hidden_size).
     weight: torch.Tensor
         Weight tensor, shape (hidden_size,).
-    scale: float
-        Scale factor for quantization.
+    scale: torch.Tensor
+        Scale factor for quantization, shape (1,).
     eps: float
         Epsilon for numerical stability.
     enable_pdl: bool
@@ -243,7 +238,7 @@ def _fused_add_rmsnorm_quant_fake(
     input: torch.Tensor,
     residual: torch.Tensor,
     weight: torch.Tensor,
-    scale: float,
+    scale: torch.Tensor,
     eps: float = 1e-6,
     enable_pdl: Optional[bool] = None,
 ) -> None:
