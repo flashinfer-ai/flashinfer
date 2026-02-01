@@ -22,6 +22,7 @@ from flashinfer.testing.utils import (
 
 from .flashinfer_benchmark_utils import (
     dtype_str_to_torch_dtype,
+    enum_type,
     get_device,
     print_perf_metrics,
     filter_backends_by_compute_capability,
@@ -172,11 +173,11 @@ def parse_moe_args(line, parser):
     )
     parser.add_argument(
         "--activation-type",
-        type=ActivationType,
+        type=enum_type(ActivationType),
         choices=list(ActivationType),
         required=False,
         default=ActivationType.Swiglu,
-        help=f"Type of gated activation function: {list(ActivationType)}",
+        help=f"Type of gated activation function: {[e.name for e in ActivationType]}",
     )
     parser.add_argument(
         "--autotune",
