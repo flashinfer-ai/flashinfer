@@ -17,7 +17,7 @@ limitations under the License.
 import pytest
 import torch
 from enum import IntEnum
-from flashinfer import GatedActType, RoutingMethodType
+from flashinfer import ActivationType, RoutingMethodType
 from flashinfer.utils import get_compute_capability
 
 
@@ -37,7 +37,7 @@ def skip_checks(
     moe_impl,
     routing_config,
     weight_processing,
-    gated_act_type,
+    activation_type,
     num_tokens,
     hidden_size,
     intermediate_size,
@@ -57,20 +57,20 @@ def skip_checks(
         pytest.skip("Skipping zero hidden states tests for non-FP8 Block Scale MoE.")
 
     # Skip incompatible combinations
-    if gated_act_type == GatedActType.GeGlu and (
+    if activation_type == ActivationType.Geglu and (
         not is_fp4_moe
         or moe_impl.quant_mode != QuantMode.FP4_NVFP4_NVFP4
         or routing_config["routing_method_type"] != RoutingMethodType.TopK
         or num_tokens > 128
     ):
         pytest.skip(
-            f"Incompatible: {moe_impl.name} + {gated_act_type} + {routing_config['routing_method_type']} + {num_tokens}"
+            f"Incompatible: {moe_impl.name} + {activation_type} + {routing_config['routing_method_type']} + {num_tokens}"
         )
-    elif gated_act_type == GatedActType.SwiGlu and (
+    elif activation_type == ActivationType.Swiglu and (
         hidden_size > 1024 or intermediate_size > 1024
     ):
         pytest.skip(
-            f"Skip for testing speed: {gated_act_type} + {hidden_size} + {intermediate_size}"
+            f"Skip for testing speed: {activation_type} + {hidden_size} + {intermediate_size}"
         )
 
     # Skip large intermediate sizes for configurations with many experts
