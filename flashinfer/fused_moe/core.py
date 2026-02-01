@@ -1170,6 +1170,7 @@ def get_trtllm_moe_sm100_module():
                         kwargs["routing_method_type"],
                         kwargs["enable_pdl"],
                         [-1, -1] if tactic == -1 else tactic,
+                        self.activation_type,
                     )
             elif (
                 self.dtype_act == DtypeTrtllmGen.Bfloat16
@@ -1528,6 +1529,7 @@ def get_trtllm_moe_sm100_module():
         use_routing_scales_on_input: bool,
         routing_method_type: int = 0,
         enable_pdl: Optional[bool] = None,
+        activation_type: int = ActivationType.Identity.value,
     ):
         seq_len = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1]
