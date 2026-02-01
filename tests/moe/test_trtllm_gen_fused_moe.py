@@ -1123,7 +1123,9 @@ class FP8PerTensorMoe(Moe):
                 * (1.0 / args.hidden_states_scale_global)
             )
         else:
-            scale_c_fc1 = args_dequant.c_global_sf * torch.ones_like(args.gemm1_scales_global)
+            scale_c_fc1 = torch.full_like(
+                args.gemm1_scales_global, args_dequant.c_global_sf
+            )
         scale_gate_fc1 = (1.0 / args.gemm1_scales_global) * (
             1.0 / args.hidden_states_scale_global
         )
