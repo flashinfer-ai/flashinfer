@@ -15,8 +15,8 @@ limitations under the License.
 """
 
 from .core import (
-    ActivationType,
     RoutingMethodType,
+    GatedActType,
     WeightLayout,
     convert_to_block_layout,
     cutlass_fused_moe,
@@ -40,8 +40,8 @@ from .fused_routing_dsv3 import (  # noqa: F401
 )
 
 __all__ = [
-    "ActivationType",
     "RoutingMethodType",
+    "GatedActType",
     "WeightLayout",
     "convert_to_block_layout",
     "cutlass_fused_moe",

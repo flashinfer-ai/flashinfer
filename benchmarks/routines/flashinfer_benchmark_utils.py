@@ -1,4 +1,3 @@
-import argparse
 import torch
 
 from flashinfer.testing.utils import set_seed
@@ -454,18 +453,3 @@ def filter_backends_by_compute_capability(backends, routine, device):
             f"[WARNING] {backend} for routine {routine} is not supported on compute capability {compute_capability}. Skipping."
         )
     return backends
-
-
-def enum_type(enum_class):
-    """Generic factory for argparse enum types."""
-
-    def converter(value):
-        try:
-            lower_name_to_member = {m.name.lower(): m for m in enum_class}
-            return lower_name_to_member[value.lower()]
-        except KeyError as e:
-            raise argparse.ArgumentTypeError(
-                f"Invalid value '{value}'. Must be one of: {', '.join([m.name for m in enum_class])}"
-            ) from e
-
-    return converter

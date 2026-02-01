@@ -17,7 +17,7 @@ limitations under the License.
 import pytest
 import torch
 from enum import IntEnum
-from flashinfer import ActivationType, RoutingMethodType
+from flashinfer import GatedActType, RoutingMethodType
 from flashinfer.utils import get_compute_capability
 
 
@@ -33,25 +33,11 @@ class QuantMode(IntEnum):
     MXINT4_BF16_BF16 = 7
 
 
-NON_GATED_ACTIVATION_SUPPORTED_QUANT_MODES = [
-    QuantMode.FP4_NVFP4_NVFP4,
-    QuantMode.FP8_PER_TENSOR,
-]
-
-
-def is_gated_activation(activation_type: ActivationType) -> bool:
-    return activation_type in [
-        ActivationType.Swiglu,
-        ActivationType.Geglu,
-        ActivationType.SwigluBias,
-    ]
-
-
 def skip_checks(
     moe_impl,
     routing_config,
     weight_processing,
-    activation_type,
+    gated_act_type,
     num_tokens,
     hidden_size,
     intermediate_size,
@@ -71,32 +57,24 @@ def skip_checks(
         pytest.skip("Skipping zero hidden states tests for non-FP8 Block Scale MoE.")
 
     # Skip incompatible combinations
-    if activation_type == ActivationType.Geglu and (
+    if gated_act_type == GatedActType.GeGlu and (
         not is_fp4_moe
         or moe_impl.quant_mode != QuantMode.FP4_NVFP4_NVFP4
         or routing_config["routing_method_type"] != RoutingMethodType.TopK
         or num_tokens > 128
     ):
         pytest.skip(
-            f"Incompatible: {moe_impl.name} + {activation_type} + {routing_config['routing_method_type']} + {num_tokens}"
+            f"Incompatible: {moe_impl.name} + {gated_act_type} + {routing_config['routing_method_type']} + {num_tokens}"
         )
-    elif activation_type == ActivationType.Swiglu and (
+    elif gated_act_type == GatedActType.SwiGlu and (
         hidden_size > 1024 or intermediate_size > 1024
     ):
         pytest.skip(
-            f"Skip for testing speed: {activation_type} + {hidden_size} + {intermediate_size}"
-        )
-
-    if (
-        not is_gated_activation(activation_type)
-        and moe_impl.quant_mode not in NON_GATED_ACTIVATION_SUPPORTED_QUANT_MODES
-    ):
-        pytest.skip(
-            f"Incompatible: {moe_impl.name} + {activation_type=} + quant_mode={moe_impl.quant_mode}: non-gated activations only supported with these quant modes: {NON_GATED_ACTIVATION_SUPPORTED_QUANT_MODES}"
+            f"Skip for testing speed: {gated_act_type} + {hidden_size} + {intermediate_size}"
         )
 
     # Skip large intermediate sizes for configurations with many experts
-    if routing_config["num_experts"] > 512 and intermediate_size > 512:
+    if routing_config["num_experts"] >= 512 and intermediate_size > 512:
         pytest.skip(
             f"Skipping for testing speed: intermediate_size={intermediate_size} with {routing_config['num_experts']} experts"
         )
@@ -114,7 +92,7 @@ def skip_checks(
             f"Incompatible: intermediate_size={intermediate_size} with {routing_config['routing_method_type'].name} routing ({routing_config['num_experts']} experts)"
         )
 
-    if moe_impl.quant_mode == QuantMode.MXINT4_BF16_BF16 and (
+    if type(moe_impl).__name__ == "MxInt4BlockScaleMoe" and (
         intermediate_size % 256 != 0 or hidden_size % 256 != 0
     ):
         pytest.skip(
