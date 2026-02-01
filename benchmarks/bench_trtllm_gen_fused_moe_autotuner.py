@@ -99,9 +99,9 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
     )
 
     if is_block_scale:
-        if activation_type != ActivationType.Swiglu:
+        if activation_type == ActivationType.Relu2:
             raise ValueError(
-                "Only Swiglu activation is supported for FP8 block scale MoE."
+                "Relu2 activation is not supported for FP8 block scale MoE."
             )
         fn = lambda: trtllm_fp8_block_scale_moe(
             routing_logits,
@@ -182,6 +182,7 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
     top_k: int,
     warmups: int,
     iterations: int,
+    activation_type: ActivationType,
 ):
     device = torch.device("cuda:0")
     enable_pdl = device_support_pdl(device)
@@ -241,6 +242,10 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
         w13_global_scale = 1.0 / 448.0 / 6.0
         w2_global_scale = 1.0 / 448.0 / 6.0
     else:
+        if activation_type == ActivationType.Relu2:
+            raise ValueError(
+                "Relu2 activation is supported for FP4 only with 'NvFP4xNvFP4' quant mode"
+            )
         w13, w13_scale = fp4_quantize(
             w13, torch.tensor([1.0], device=device), sf_vec_size=32, sf_use_ue8m0=True
         )
@@ -295,7 +300,7 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
         RoutingMethodType.Renormalize.value,
         True,
         enable_pdl,
-        ActivationType.Swiglu.value,  # act_type
+        activation_type.value,  # act_type
         None,
         num_tokens if tune_max_num_tokens is None else tune_max_num_tokens,
     )
@@ -388,4 +393,5 @@ if __name__ == "__main__":
             args.top_k,
             args.warmups,
             args.iterations,
+            args.activation_type,
         )
