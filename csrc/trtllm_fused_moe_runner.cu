@@ -201,7 +201,8 @@ static inline ActType activationTypeToGatedActType(ActivationType actType) {
       return ActType::GeGlu;
     default:
       FLASHINFER_CHECK(false, "Unsupported gated activation type ",
-                       serializeActivationType(actType), " of enum ", static_cast<int64_t>(actType));
+                       serializeActivationType(actType), " of enum ",
+                       static_cast<int64_t>(actType));
   }
   return ActType::SwiGlu;
 }
@@ -214,7 +215,8 @@ static inline EltwiseActType activationTypeToEltwiseActType(ActivationType actTy
       return EltwiseActType::None;
     default:
       FLASHINFER_CHECK(false, "Unsupported eltwise activation type ",
-                       serializeActivationType(actType), " of enum ", static_cast<int64_t>(actType));
+                       serializeActivationType(actType), " of enum ",
+                       static_cast<int64_t>(actType));
   }
   return EltwiseActType::None;
 }
@@ -224,8 +226,9 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
     ActivationType activationType, bool useShuffledMatrix,
     batchedGemm::gemm::MatrixLayout weightLayout) {
   int64_t actTypeInt = static_cast<int64_t>(activationType);
-  FLASHINFER_CHECK(0 <= actTypeInt && actTypeInt < static_cast<int64_t>(ActivationType::InvalidType),
-                   "Unknown activation type", serializeActivationType(activationType), "of enum", actTypeInt);
+  FLASHINFER_CHECK(
+      0 <= actTypeInt && actTypeInt < static_cast<int64_t>(ActivationType::InvalidType),
+      "Unknown activation type", serializeActivationType(activationType), "of enum", actTypeInt);
   bool isGatedAct = isGatedActivation(activationType);
   if (isGatedAct) {
     ActType actType = activationTypeToGatedActType(activationType);
@@ -289,12 +292,13 @@ void Runner::run(void* hiddenState, void* hiddenStateScale, void* weights, void*
   auto maxNumCtasInBatchDim =
       Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
   int32_t intermediateSizeFactor = (isGatedActivation(mActType) ? 2 : 1);
-  mRunner.run(numTokens, intermediateSizeFactor * intermediateSize, hiddenSize, {}, numTokens, numExperts,
-              maxNumCtasInBatchDim, hiddenState, hiddenStateScale, weights, weightsScale,
-              expertWeights, /* perTokensSfB */ nullptr, outputScalesScalar, outputScalesGateScalar,
-              ptrBias, ptrAlpha, ptrBeta, ptrClampLimit, output, outputScale, permutedIdxToTokenIdx,
-              ptrTotalNumPaddedTokens, ptrCtaIdxXyToBatchIdx, ptrCtaIdxXyToMnLimit,
-              ptrNumNonExitingCtas, bmm1Workspace, stream, device, configIndex, enable_pdl);
+  mRunner.run(numTokens, intermediateSizeFactor * intermediateSize, hiddenSize, {}, numTokens,
+              numExperts, maxNumCtasInBatchDim, hiddenState, hiddenStateScale, weights,
+              weightsScale, expertWeights, /* perTokensSfB */ nullptr, outputScalesScalar,
+              outputScalesGateScalar, ptrBias, ptrAlpha, ptrBeta, ptrClampLimit, output,
+              outputScale, permutedIdxToTokenIdx, ptrTotalNumPaddedTokens, ptrCtaIdxXyToBatchIdx,
+              ptrCtaIdxXyToMnLimit, ptrNumNonExitingCtas, bmm1Workspace, stream, device,
+              configIndex, enable_pdl);
 }
 
 size_t Runner::getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
@@ -477,8 +481,7 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
   activationData.inDqSfsPtr = workspace.gemm1_output_scale;
   activationData.outDqSfsPtr = workspace.activation_output_scale;
   activationData.innerDim =
-      args.intermediate_size *
-      (isGatedActivation(args.activation_type) ? 2 : 1);
+      args.intermediate_size * (isGatedActivation(args.activation_type) ? 2 : 1);
   activationData.topK = args.top_k;
   activationData.numTokens = args.num_tokens;
   activationData.expandedIdxToPermutedIdx = workspace.expanded_idx_to_permuted_idx;
