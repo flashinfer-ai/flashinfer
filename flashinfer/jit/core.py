@@ -446,8 +446,14 @@ def gen_jit_spec(
         cuda_cflags += ["-lineinfo"]
 
     if extra_cflags is not None:
+        # If extra_cflags contains a -std flag, remove the default one to avoid conflicts
+        if any(f.startswith("-std=") for f in extra_cflags):
+            cflags = [f for f in cflags if not f.startswith("-std=")]
         cflags += extra_cflags
     if extra_cuda_cflags is not None:
+        # If extra_cuda_cflags contains a -std flag, remove the default one to avoid conflicts
+        if any(f.startswith("-std=") for f in extra_cuda_cflags):
+            cuda_cflags = [f for f in cuda_cflags if not f.startswith("-std=")]
         cuda_cflags += extra_cuda_cflags
 
     spec = JitSpec(

@@ -106,7 +106,7 @@ def _test_prefill_kernel(
 
     torch.cuda.synchronize()
 
-    # postprocessing raw output, ref_state is v-major, our_state is k-major, unify to v-major for testing
+    # postprocessing raw output: ref_state is v-last [H,K,V], our_state is k-last [H,V,K], transpose to match
     our_state = our_state.transpose(-1, -2)
 
     ref_o, ref_state = blockwise_delta_rule(
@@ -330,7 +330,7 @@ def _test_chunked_prefill(
 
     torch.cuda.synchronize()
 
-    # postprocessing raw output, ref_state is v-major, our_state is k-major, unify to v-major for testing
+    # postprocessing raw output: ref_state is v-last [H,K,V], our_state is k-last [H,V,K], transpose to match
     our_state = our_state.transpose(-1, -2)
 
     def concat_varlen(t1, cu_seq_lens1, t2, cu_seq_lens2):
