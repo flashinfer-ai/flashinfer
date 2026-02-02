@@ -565,9 +565,6 @@ void runImpl(Data& data, void* stream) {
   FLASHINFER_CHECK(data.mTopK * data.mNumLimitedGroups <= WarpSize,
                    "Routing kernel expects top K * top groups <= warp size (for now), got %d * %d",
                    data.mTopK, data.mNumLimitedGroups);
-  FLASHINFER_CHECK(data.mNumExperts >= MaxSupportedTopExperts,
-                   "Routing kernel expects %d to be at most #experts %d", MaxSupportedTopExperts,
-                   data.mNumExperts);
   FLASHINFER_CHECK(data.mNumExperts <= MaxSupportedExpertCount,
                    "Routing kernel expects #experts %d  <= #threads %d", data.mNumExperts,
                    MaxSupportedExpertCount);
