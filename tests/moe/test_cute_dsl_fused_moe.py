@@ -122,6 +122,9 @@ def compute_reference_moe_fp4(
 ) -> torch.Tensor:
     """Compute reference MoE output using PyTorch operations.
 
+    Computation is done on CPU to avoid cuBLAS issues with certain tensor layouts,
+    then moved back to the original device.
+
     Args:
         hidden_states: Input hidden states [num_tokens, hidden_size]
         gemm1_weights: GEMM1 weights [num_local_experts, 2*intermediate_size, hidden_size]
@@ -144,14 +147,22 @@ def compute_reference_moe_fp4(
         num_local_experts = num_experts
 
     device = hidden_states.device
-    output = torch.zeros((num_tokens, hidden_size), dtype=torch.float32, device=device)
+
+    # Move to CPU for reference computation to avoid cuBLAS layout issues
+    hidden_states_cpu = hidden_states.float().cpu()
+    gemm1_weights_cpu = gemm1_weights.float().cpu()
+    gemm2_weights_cpu = gemm2_weights.float().cpu()
+    token_selected_experts_cpu = token_selected_experts.cpu()
+    token_final_scales_cpu = token_final_scales.cpu()
+
+    output = torch.zeros((num_tokens, hidden_size), dtype=torch.float32)
 
     for token_idx in range(num_tokens):
-        token_input = hidden_states[token_idx : token_idx + 1]
+        token_input = hidden_states_cpu[token_idx : token_idx + 1]
 
         for k in range(top_k):
-            expert_idx = token_selected_experts[token_idx, k].item()
-            scale = token_final_scales[token_idx, k].item()
+            expert_idx = token_selected_experts_cpu[token_idx, k].item()
+            scale = token_final_scales_cpu[token_idx, k].item()
 
             # Skip invalid expert IDs
             if expert_idx < 0 or expert_idx >= num_experts:
@@ -163,7 +174,7 @@ def compute_reference_moe_fp4(
                 # This expert is not on this EP rank, skip
                 continue
 
-            w1 = gemm1_weights[local_idx]
+            w1 = gemm1_weights_cpu[local_idx]
             gemm1_out = token_input @ w1.T
 
             linear = gemm1_out[:, :intermediate_size]
@@ -172,15 +183,15 @@ def compute_reference_moe_fp4(
 
             if fc2_input_scale is not None:
                 swiglu_out = quant_dequant_fp4_reference(
-                    swiglu_out, fc2_input_scale, sf_vec_size=16
-                )
+                    swiglu_out.to(device), fc2_input_scale, sf_vec_size=16
+                ).cpu()
 
-            w2 = gemm2_weights[local_idx]
+            w2 = gemm2_weights_cpu[local_idx]
             gemm2_out = swiglu_out @ w2.T
 
             output[token_idx] += scale * gemm2_out.squeeze(0)
 
-    return output
+    return output.to(device)
 
 
 def create_moe_tensors(
@@ -331,13 +342,18 @@ class TestCuteDslFusedMoeFunctional:
     )
     @pytest.mark.parametrize("top_k", [1, 2, 8])
     @pytest.mark.parametrize("num_tokens", [128, 515, 1024])
+    @pytest.mark.parametrize("num_experts", [256, 384])
     def test_numerical_accuracy(
-        self, num_tokens: int, top_k: int, hidden_size: int, intermediate_size: int
+        self,
+        num_tokens: int,
+        top_k: int,
+        hidden_size: int,
+        intermediate_size: int,
+        num_experts: int,
     ):
         """Accuracy test for functional API across configurations."""
         from flashinfer import cute_dsl_fused_moe_nvfp4
 
-        num_experts = 8
         num_local_experts = num_experts
 
         tensors = create_moe_tensors(
@@ -396,7 +412,7 @@ class TestCuteDslFusedMoeFunctional:
         from flashinfer import cute_dsl_fused_moe_nvfp4
 
         num_tokens, hidden_size, intermediate_size = 256, 256, 512
-        num_experts, top_k = 8, 2
+        num_experts, top_k = 256, 2
 
         tensors = create_moe_tensors(
             num_tokens=num_tokens,
@@ -440,12 +456,12 @@ class TestCuteDslMoEWrapper:
 
     @pytest.mark.parametrize("num_tokens", [128, 256, 512])
     @pytest.mark.parametrize("top_k", [2, 8])
-    def test_wrapper_accuracy(self, num_tokens: int, top_k: int):
+    @pytest.mark.parametrize("num_experts", [256, 384])
+    def test_wrapper_accuracy(self, num_tokens: int, top_k: int, num_experts: int):
         """Accuracy test for wrapper API."""
         from flashinfer import CuteDslMoEWrapper
 
         hidden_size, intermediate_size = 256, 512
-        num_experts = 8
 
         tensors = create_moe_tensors(
             num_tokens=num_tokens,
@@ -503,12 +519,13 @@ class TestCuteDslMoEWrapper:
         )
 
     @pytest.mark.parametrize("num_tokens", [64, 128, 256])
-    def test_wrapper_cuda_graph(self, num_tokens: int):
+    @pytest.mark.parametrize("num_experts", [256, 384])
+    def test_wrapper_cuda_graph(self, num_tokens: int, num_experts: int):
         """Test wrapper API with CUDA graph capture and replay."""
         from flashinfer import CuteDslMoEWrapper
 
         hidden_size, intermediate_size = 256, 512
-        num_experts, top_k = 8, 2
+        top_k = 2
 
         tensors = create_moe_tensors(
             num_tokens=num_tokens,
@@ -615,7 +632,7 @@ class TestCuteDslMoEWrapper:
         from flashinfer import CuteDslMoEWrapper
 
         num_tokens, hidden_size, intermediate_size = 256, 256, 512
-        num_experts, top_k = 8, 2
+        num_experts, top_k = 256, 2
 
         tensors = create_moe_tensors(
             num_tokens=num_tokens,
@@ -687,7 +704,7 @@ class TestApiConsistency:
         from flashinfer import CuteDslMoEWrapper, cute_dsl_fused_moe_nvfp4
 
         num_tokens, hidden_size, intermediate_size = 128, 256, 512
-        num_experts, top_k = 8, 2
+        num_experts, top_k = 256, 2
 
         tensors = create_moe_tensors(
             num_tokens=num_tokens,
