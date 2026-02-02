@@ -103,7 +103,7 @@ from .norm import rmsnorm as rmsnorm
 try:
     from .norm import rmsnorm_fp4quant as rmsnorm_fp4quant
     from .norm import add_rmsnorm_fp4quant as add_rmsnorm_fp4quant
-except ImportError:
+except (ImportError, AttributeError):
     pass  # nvidia-cutlass-dsl not installed
 from .page import append_paged_kv_cache as append_paged_kv_cache
 from .page import append_paged_mla_kv_cache as append_paged_mla_kv_cache

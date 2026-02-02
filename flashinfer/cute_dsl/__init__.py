@@ -44,7 +44,9 @@ if is_cute_dsl_available():
         add_rmsnorm_fp4quant,
         AddRMSNormFP4QuantKernel,
     )
-    from .norm import (
+
+    # Backwards-compatible re-exports from flashinfer.norm.kernels submodule
+    from ..norm.kernels import (
         # Kernel classes
         RMSNormKernel,
         QKRMSNormKernel,
@@ -82,7 +84,7 @@ if is_cute_dsl_available():
         # Add + RMSNorm + FP4 Quantization
         "add_rmsnorm_fp4quant",
         "AddRMSNormFP4QuantKernel",
-        # Norm kernels (CuTe DSL)
+        # Norm kernels (CuTe DSL) - backwards-compatible re-exports
         "RMSNormKernel",
         "QKRMSNormKernel",
         "RMSNormQuantKernel",

@@ -12,6 +12,16 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
+
+FlashInfer Normalization Kernels
+================================
+
+This package provides high-performance normalization kernels:
+
+- RMSNorm: Root Mean Square Normalization
+- LayerNorm: Layer Normalization
+- Fused Add + RMSNorm: Combined residual add and RMSNorm
+- Quantized variants with FP8/FP4 output
 """
 
 import functools
@@ -20,8 +30,11 @@ from typing import Optional
 
 import torch
 
-from .api_logging import flashinfer_api
-from .utils import device_support_pdl, register_custom_op, register_fake_op
+from ..api_logging import flashinfer_api
+from ..utils import device_support_pdl, register_custom_op, register_fake_op
+
+# Always import gen_norm_module for JIT warmup and CUDA fallback
+from ..jit.norm import gen_norm_module
 
 # Use CUDA JIT implementation instead of CuTe DSL (for debugging/fallback)
 # Also fallback to CUDA JIT if nvidia-cutlass-dsl is not installed
@@ -29,7 +42,7 @@ _USE_CUDA_NORM = os.environ.get("FLASHINFER_USE_CUDA_NORM", "0") == "1"
 
 if not _USE_CUDA_NORM:
     try:
-        from .cute_dsl.norm import (
+        from .kernels import (
             rmsnorm_cute,
             qk_rmsnorm_cute,
             rmsnorm_quant_cute,
@@ -37,11 +50,11 @@ if not _USE_CUDA_NORM:
             fused_add_rmsnorm_quant_cute,
             layernorm_cute,
         )
-    except ImportError:
+    except (ImportError, AttributeError):
+        # nvidia-cutlass-dsl not installed or incompatible version
         _USE_CUDA_NORM = True
 
 if _USE_CUDA_NORM:
-    from .jit.norm import gen_norm_module
 
     @functools.cache
     def get_norm_module():
@@ -81,12 +94,12 @@ def rmsnorm(
     """
     if out is None:
         out = torch.empty_like(input)
-    _rmsnorm(out, input, weight, eps, enable_pdl)
+    _rmsnorm_impl(out, input, weight, eps, enable_pdl)
     return out
 
 
 @register_custom_op("flashinfer::rmsnorm", mutates_args=("out",))
-def _rmsnorm(
+def _rmsnorm_impl(
     out: torch.Tensor,
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -109,7 +122,7 @@ def _rmsnorm(
 
 
 @register_fake_op("flashinfer::rmsnorm")
-def _rmsnorm_fake(
+def _rmsnorm_impl_fake(
     out: torch.Tensor,
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -332,12 +345,12 @@ def gemma_rmsnorm(
     """
     if out is None:
         out = torch.empty_like(input)
-    _gemma_rmsnorm(out, input, weight, eps, enable_pdl)
+    _gemma_rmsnorm_impl(out, input, weight, eps, enable_pdl)
     return out
 
 
 @register_custom_op("flashinfer::gemma_rmsnorm", mutates_args=("out",))
-def _gemma_rmsnorm(
+def _gemma_rmsnorm_impl(
     out: torch.Tensor,
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -360,7 +373,7 @@ def _gemma_rmsnorm(
 
 
 @register_fake_op("flashinfer::gemma_rmsnorm")
-def _gemma_rmsnorm_fake(
+def _gemma_rmsnorm_impl_fake(
     out: torch.Tensor,
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -473,8 +486,23 @@ def _layernorm_fake(
 # CuTe-DSL fused RMSNorm + FP4 Quantization kernels
 # These require SM100+ (Blackwell) GPUs and nvidia-cutlass-dsl
 try:
-    from .cute_dsl import rmsnorm_fp4quant as rmsnorm_fp4quant
-    from .cute_dsl import add_rmsnorm_fp4quant as add_rmsnorm_fp4quant
+    from ..cute_dsl import rmsnorm_fp4quant as rmsnorm_fp4quant
+    from ..cute_dsl import add_rmsnorm_fp4quant as add_rmsnorm_fp4quant
 except ImportError:
     # nvidia-cutlass-dsl not installed, these functions will not be available
     pass
+
+
+# Public API exports
+__all__ = [
+    # JIT module generator (always available)
+    "gen_norm_module",
+    # Public APIs
+    "rmsnorm",
+    "rmsnorm_quant",
+    "fused_add_rmsnorm",
+    "fused_add_rmsnorm_quant",
+    "gemma_rmsnorm",
+    "gemma_fused_add_rmsnorm",
+    "layernorm",
+]
