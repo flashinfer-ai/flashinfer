@@ -260,7 +260,7 @@ def bench_cute_dsl(
 
     if use_wrapper:
         # Use CuteDslMoEWrapper (recommended for CUDA graph)
-        from flashinfer.cute_dsl import CuteDslMoEWrapper
+        from flashinfer import CuteDslMoEWrapper
 
         moe = CuteDslMoEWrapper(
             num_experts=CFG.num_experts,
@@ -299,7 +299,7 @@ def bench_cute_dsl(
             )
     else:
         # Use functional API
-        from flashinfer.cute_dsl import cute_dsl_fused_moe_nvfp4
+        from flashinfer import cute_dsl_fused_moe_nvfp4
 
         def run(x, x_sf, router_logits, routing_bias, topk_values, topk_indices):
             fused_topk_deepseek(
@@ -601,7 +601,7 @@ def run_autotune(inputs, verbose=True):
         _maybe_get_cached_w3_w1_permute_indices,
         get_w2_permute_indices_with_cache,
     )
-    from flashinfer.cute_dsl import cute_dsl_fused_moe_nvfp4
+    from flashinfer import cute_dsl_fused_moe_nvfp4
     from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
     from flashinfer.fp4_quantization import fp4_quantize, block_scale_interleave
     from flashinfer.autotuner import autotune

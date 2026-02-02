@@ -335,7 +335,7 @@ class TestCuteDslFusedMoeFunctional:
         self, num_tokens: int, top_k: int, hidden_size: int, intermediate_size: int
     ):
         """Accuracy test for functional API across configurations."""
-        from flashinfer.cute_dsl import cute_dsl_fused_moe_nvfp4
+        from flashinfer import cute_dsl_fused_moe_nvfp4
 
         num_experts = 8
         num_local_experts = num_experts
@@ -393,7 +393,7 @@ class TestCuteDslFusedMoeFunctional:
     def test_with_autotune(self):
         """Test functional API with autotune context."""
         from flashinfer import autotune
-        from flashinfer.cute_dsl import cute_dsl_fused_moe_nvfp4
+        from flashinfer import cute_dsl_fused_moe_nvfp4
 
         num_tokens, hidden_size, intermediate_size = 256, 256, 512
         num_experts, top_k = 8, 2
@@ -442,7 +442,7 @@ class TestCuteDslMoEWrapper:
     @pytest.mark.parametrize("top_k", [2, 8])
     def test_wrapper_accuracy(self, num_tokens: int, top_k: int):
         """Accuracy test for wrapper API."""
-        from flashinfer.cute_dsl import CuteDslMoEWrapper
+        from flashinfer import CuteDslMoEWrapper
 
         hidden_size, intermediate_size = 256, 512
         num_experts = 8
@@ -505,7 +505,7 @@ class TestCuteDslMoEWrapper:
     @pytest.mark.parametrize("num_tokens", [64, 128, 256])
     def test_wrapper_cuda_graph(self, num_tokens: int):
         """Test wrapper API with CUDA graph capture and replay."""
-        from flashinfer.cute_dsl import CuteDslMoEWrapper
+        from flashinfer import CuteDslMoEWrapper
 
         hidden_size, intermediate_size = 256, 512
         num_experts, top_k = 8, 2
@@ -612,7 +612,7 @@ class TestCuteDslMoEWrapper:
     def test_wrapper_with_autotune(self):
         """Test wrapper API with autotune context."""
         from flashinfer import autotune
-        from flashinfer.cute_dsl import CuteDslMoEWrapper
+        from flashinfer import CuteDslMoEWrapper
 
         num_tokens, hidden_size, intermediate_size = 256, 256, 512
         num_experts, top_k = 8, 2
@@ -684,7 +684,7 @@ class TestApiConsistency:
 
     def test_functional_vs_wrapper_output(self):
         """Verify functional and wrapper APIs produce the same output."""
-        from flashinfer.cute_dsl import CuteDslMoEWrapper, cute_dsl_fused_moe_nvfp4
+        from flashinfer import CuteDslMoEWrapper, cute_dsl_fused_moe_nvfp4
 
         num_tokens, hidden_size, intermediate_size = 128, 256, 512
         num_experts, top_k = 8, 2
@@ -769,7 +769,7 @@ class TestExpertParallelism:
         Tests different EP ranks to ensure local_expert_offset handling is correct.
         ep_rank=-1 is converted to the last rank (ep_size-1) to test non-zero offsets.
         """
-        from flashinfer.cute_dsl import CuteDslMoEWrapper
+        from flashinfer import CuteDslMoEWrapper
 
         # Convert -1 to last rank
         if ep_rank == -1:
@@ -846,7 +846,7 @@ class TestExpertParallelism:
     @pytest.mark.parametrize("ep_size", [8])
     def test_functional_with_ep(self, ep_size: int):
         """Test functional API with expert parallelism and numerical accuracy."""
-        from flashinfer.cute_dsl import cute_dsl_fused_moe_nvfp4
+        from flashinfer import cute_dsl_fused_moe_nvfp4
 
         # Test middle rank to ensure offset handling works
         ep_rank = ep_size // 2
