@@ -557,9 +557,18 @@ void runImpl(Data& data, void* stream) {
   FLASHINFER_CHECK(data.mNumLimitedGroups <= MaxNumTopGroups,
                    "Routing kernel expects <= %d top groups, got %d", MaxNumTopGroups,
                    data.mNumLimitedGroups);
-  FLASHINFER_CHECK(data.mTopK <= MaxSupportedTopExperts,
-                   "Routing kernel expects topK experts <= %d, got %d", MaxSupportedTopExperts,
-                   data.mTopK);
+  // Test limits according to values passed in launch, see definition of LAUNCH_ROUTING_DEEPSEEK
+  if (data.mNumExperts <= NumKimiK2Experts) {
+    FLASHINFER_CHECK(
+        data.mTopK <= DefaultMaxNumTopExperts,
+        "When NumExperts <= NumKimiK2Experts, routing kernel expects topK experts <= %d, got %d",
+        DefaultMaxNumTopExperts, data.mTopK);
+  } else {
+    FLASHINFER_CHECK(
+        data.mTopK <= MaxSupportedTopExperts,
+        "When NumExperts > NumKimiK2Experts, routing kernel expects topK experts <= %d, got %d",
+        MaxSupportedTopExperts, data.mTopK);
+  }
   FLASHINFER_CHECK(data.mTopK <= WarpSize, "Routing kernel expects top K <= warp size, got %d",
                    data.mTopK);
   FLASHINFER_CHECK(data.mTopK * data.mNumLimitedGroups <= WarpSize,
