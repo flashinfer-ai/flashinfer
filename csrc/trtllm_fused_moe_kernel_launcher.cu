@@ -1192,18 +1192,8 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     workspace.total_max_padded_tokens = max_num_padded_tokens;
     workspace.ProjUpTileN = tile_tokens_dim;
     workspace.routing_expert_indexes = static_cast<int*>(const_cast<void*>(topk_ids.data_ptr()));
-
-    // Allocate expert_weights buffer for packed format or "from logits" paths
-    // - Unpacked pre-computed format (topk_weights provided): use user's buffer directly
-    // - Packed format or computing from logits: allocate buffer for routing kernel to write weights
-    if (!topk_weights.has_value() || args->routing_logits != nullptr) {
-      expert_weights =
-          alloc_tensor({args->num_tokens, args->top_k}, dl_bfloat16, hidden_states.device());
-      workspace.expert_weights = expert_weights.data_ptr();
-    } else {
-      workspace.expert_weights = const_cast<void*>(topk_weights.value().data_ptr());
-    }
-
+    workspace.expert_weights =
+        topk_weights.has_value() ? const_cast<void*>(topk_weights.value().data_ptr()) : nullptr;
     workspace.permuted_idx_size = static_cast<int*>(total_num_padded_tokens.data_ptr());
     workspace.expanded_idx_to_permuted_idx =
         static_cast<int*>(expanded_idx_to_permuted_idx.data_ptr());
