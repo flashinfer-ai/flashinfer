@@ -216,12 +216,6 @@ jobs:
       - name: Start spot termination monitor
         run: ./scripts/task_monitor_spot.sh &
 
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: flashinfer
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-        continue-on-error: true
 
       - name: Show Node Info
         run: ./scripts/task_show_node_info.sh
@@ -242,55 +236,17 @@ jobs:
       is_spot_termination: ${{ steps.analyze.outputs.is_spot_termination }}
       rerun_matrix: ${{ steps.matrix.outputs.rerun_matrix }}
     steps:
+      - name: Checkout scripts
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts
+          sparse-checkout-cone-mode: false
+
       - name: Analyze failure from job logs
         id: analyze
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          RUN_ID="${{ github.run_id }}"
-          SPOT_TERMINATION=false
-          # Include both failed and cancelled jobs (spot termination can cause either)
-          FAILED_JOBS=$(gh api "/repos/${{ github.repository }}/actions/runs/${RUN_ID}/jobs?per_page=100" \
-            --jq '.jobs[] | select(.name | startswith("AOT")) | select(.conclusion == "failure" or .conclusion == "cancelled") | .id')
-          if [ -z "$FAILED_JOBS" ]; then
-            echo "is_spot_termination=false" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-          for JOB_ID in $FAILED_JOBS; do
-            # First check job metadata for runner communication errors
-            # This catches "The operation was canceled" which appears in annotations, not logs
-            JOB_INFO=$(gh api "/repos/${{ github.repository }}/actions/jobs/${JOB_ID}" 2>/dev/null || true)
-            if echo "$JOB_INFO" | grep -qiE "operation was canceled|runner.*lost|lost communication"; then
-              echo "Detected: Runner lost communication or operation canceled (job $JOB_ID)"
-              SPOT_TERMINATION=true
-              break
-            fi
-
-            # Try to download logs - if we can't, likely infrastructure failure
-            if ! gh api "/repos/${{ github.repository }}/actions/jobs/${JOB_ID}/logs" > job_log.zip 2>/dev/null; then
-              echo "Detected: Cannot download logs, likely infrastructure failure (job $JOB_ID)"
-              SPOT_TERMINATION=true
-              break
-            fi
-            # Try to unzip if it's a ZIP file, otherwise use as-is
-            if file job_log.zip | grep -q "Zip archive"; then
-              unzip -p job_log.zip > job_log.txt 2>/dev/null || mv job_log.zip job_log.txt
-            else
-              mv job_log.zip job_log.txt
-            fi
-            if grep -q "FLASHINFER_SPOT_TERMINATION_DETECTED" job_log.txt; then
-              echo "Detected: AWS spot termination marker (job $JOB_ID)"
-              SPOT_TERMINATION=true
-              break
-            fi
-            if grep -qiE "connection reset by peer|context canceled|grpc.*closing|The self-hosted runner.*lost" job_log.txt; then
-              echo "Detected: infrastructure error pattern (job $JOB_ID)"
-              SPOT_TERMINATION=true
-              break
-            fi
-          done
-          echo "is_spot_termination=$SPOT_TERMINATION"
-          echo "is_spot_termination=$SPOT_TERMINATION" >> $GITHUB_OUTPUT
+        run: ./scripts/task_analyze_spot.sh 'startswith("AOT")' '${{ github.repository }}' '${{ github.run_id }}'
 
       - name: Build rerun matrix
         id: matrix
@@ -341,12 +297,6 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: flashinfer
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-        continue-on-error: true
 
       - name: Show Node Info
         run: ./scripts/task_show_node_info.sh
@@ -397,12 +347,6 @@ jobs:
       - name: Start spot termination monitor
         run: ./scripts/task_monitor_spot.sh &
 
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: flashinfer
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-        continue-on-error: true
 
       - name: Show Node Info
         run: ./scripts/task_show_node_info.sh
@@ -423,55 +367,17 @@ jobs:
       is_spot_termination: ${{ steps.analyze.outputs.is_spot_termination }}
       rerun_matrix: ${{ steps.matrix.outputs.rerun_matrix }}
     steps:
+      - name: Checkout scripts
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts
+          sparse-checkout-cone-mode: false
+
       - name: Analyze failure from job logs
         id: analyze
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          RUN_ID="${{ github.run_id }}"
-          SPOT_TERMINATION=false
-          # Include both failed and cancelled jobs (spot termination can cause either)
-          FAILED_JOBS=$(gh api "/repos/${{ github.repository }}/actions/runs/${RUN_ID}/jobs?per_page=100" \
-            --jq '.jobs[] | select(.name | contains("A10G")) | select(.conclusion == "failure" or .conclusion == "cancelled") | .id')
-          if [ -z "$FAILED_JOBS" ]; then
-            echo "is_spot_termination=false" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-          for JOB_ID in $FAILED_JOBS; do
-            # First check job metadata for runner communication errors
-            # This catches "The operation was canceled" which appears in annotations, not logs
-            JOB_INFO=$(gh api "/repos/${{ github.repository }}/actions/jobs/${JOB_ID}" 2>/dev/null || true)
-            if echo "$JOB_INFO" | grep -qiE "operation was canceled|runner.*lost|lost communication"; then
-              echo "Detected: Runner lost communication or operation canceled (job $JOB_ID)"
-              SPOT_TERMINATION=true
-              break
-            fi
-
-            # Try to download logs - if we can't, likely infrastructure failure
-            if ! gh api "/repos/${{ github.repository }}/actions/jobs/${JOB_ID}/logs" > job_log.zip 2>/dev/null; then
-              echo "Detected: Cannot download logs, likely infrastructure failure (job $JOB_ID)"
-              SPOT_TERMINATION=true
-              break
-            fi
-            # Try to unzip if it's a ZIP file, otherwise use as-is
-            if file job_log.zip | grep -q "Zip archive"; then
-              unzip -p job_log.zip > job_log.txt 2>/dev/null || mv job_log.zip job_log.txt
-            else
-              mv job_log.zip job_log.txt
-            fi
-            if grep -q "FLASHINFER_SPOT_TERMINATION_DETECTED" job_log.txt; then
-              echo "Detected: AWS spot termination marker (job $JOB_ID)"
-              SPOT_TERMINATION=true
-              break
-            fi
-            if grep -qiE "connection reset by peer|context canceled|grpc.*closing|The self-hosted runner.*lost" job_log.txt; then
-              echo "Detected: infrastructure error pattern (job $JOB_ID)"
-              SPOT_TERMINATION=true
-              break
-            fi
-          done
-          echo "is_spot_termination=$SPOT_TERMINATION"
-          echo "is_spot_termination=$SPOT_TERMINATION" >> $GITHUB_OUTPUT
+        run: ./scripts/task_analyze_spot.sh 'contains("A10G")' '${{ github.repository }}' '${{ github.run_id }}'
 
       - name: Build rerun matrix
         id: matrix
@@ -511,12 +417,6 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: flashinfer
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-        continue-on-error: true
 
       - name: Show Node Info
         run: ./scripts/task_show_node_info.sh
@@ -563,12 +463,6 @@ jobs:
       - name: Start spot termination monitor
         run: ./scripts/task_monitor_spot.sh &
 
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: flashinfer
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-        continue-on-error: true
 
       - name: Show Node Info
         run: ./scripts/task_show_node_info.sh
@@ -588,55 +482,17 @@ jobs:
     outputs:
       is_spot_termination: ${{ steps.analyze.outputs.is_spot_termination }}
     steps:
+      - name: Checkout scripts
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts
+          sparse-checkout-cone-mode: false
+
       - name: Analyze failure from job logs
         id: analyze
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          RUN_ID="${{ github.run_id }}"
-          SPOT_TERMINATION=false
-          # Include both failed and cancelled jobs (spot termination can cause either)
-          FAILED_JOBS=$(gh api "/repos/${{ github.repository }}/actions/runs/${RUN_ID}/jobs?per_page=100" \
-            --jq '.jobs[] | select(.name | contains("T4")) | select(.conclusion == "failure" or .conclusion == "cancelled") | .id')
-          if [ -z "$FAILED_JOBS" ]; then
-            echo "is_spot_termination=false" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-          for JOB_ID in $FAILED_JOBS; do
-            # First check job metadata for runner communication errors
-            # This catches "The operation was canceled" which appears in annotations, not logs
-            JOB_INFO=$(gh api "/repos/${{ github.repository }}/actions/jobs/${JOB_ID}" 2>/dev/null || true)
-            if echo "$JOB_INFO" | grep -qiE "operation was canceled|runner.*lost|lost communication"; then
-              echo "Detected: Runner lost communication or operation canceled (job $JOB_ID)"
-              SPOT_TERMINATION=true
-              break
-            fi
-
-            # Try to download logs - if we can't, likely infrastructure failure
-            if ! gh api "/repos/${{ github.repository }}/actions/jobs/${JOB_ID}/logs" > job_log.zip 2>/dev/null; then
-              echo "Detected: Cannot download logs, likely infrastructure failure (job $JOB_ID)"
-              SPOT_TERMINATION=true
-              break
-            fi
-            # Try to unzip if it's a ZIP file, otherwise use as-is
-            if file job_log.zip | grep -q "Zip archive"; then
-              unzip -p job_log.zip > job_log.txt 2>/dev/null || mv job_log.zip job_log.txt
-            else
-              mv job_log.zip job_log.txt
-            fi
-            if grep -q "FLASHINFER_SPOT_TERMINATION_DETECTED" job_log.txt; then
-              echo "Detected: AWS spot termination marker (job $JOB_ID)"
-              SPOT_TERMINATION=true
-              break
-            fi
-            if grep -qiE "connection reset by peer|context canceled|grpc.*closing|The self-hosted runner.*lost" job_log.txt; then
-              echo "Detected: infrastructure error pattern (job $JOB_ID)"
-              SPOT_TERMINATION=true
-              break
-            fi
-          done
-          echo "is_spot_termination=$SPOT_TERMINATION"
-          echo "is_spot_termination=$SPOT_TERMINATION" >> $GITHUB_OUTPUT
+        run: ./scripts/task_analyze_spot.sh 'contains("T4")' '${{ github.repository }}' '${{ github.run_id }}'
 
   gpu-tests-t4-rerun:
     name: JIT Rerun (T4)
@@ -666,12 +522,6 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: flashinfer
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-        continue-on-error: true
 
       - name: Show Node Info
         run: ./scripts/task_show_node_info.sh
@@ -719,12 +569,6 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: flashinfer
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-        continue-on-error: true
 
       - name: Show Node Info
         run: ./scripts/task_show_node_info.sh
@@ -772,12 +616,6 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: flashinfer
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-        continue-on-error: true
 
       - name: Show Node Info
         run: ./scripts/task_show_node_info.sh
