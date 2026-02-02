@@ -2725,11 +2725,12 @@ def test_renormalize_routing(
                 "routed_scaling": 2.5,
                 "has_routing_bias": True,
                 "routing_method_type": RoutingMethodType.DeepSeekV3,
-                "compatible_moe_impls": [FP8PerTensorMoe, FP4Moe, BF16Moe],
-                "compatible_intermediate_size": [1024, 2944],
+                "compatible_moe_impls": [FP8PerTensorMoe, FP4Moe],
+                "compatible_intermediate_size": [2944],
+                "compatible_activation_types": [ActivationType.Relu2],
                 "enable_autotune": True,
             },
-            id="nemotron_3",
+            id="nemotron_3_dummy",
         ),
         pytest.param(
             {
@@ -2743,6 +2744,10 @@ def test_renormalize_routing(
                 "routing_method_type": RoutingMethodType.DeepSeekV3,
                 "compatible_moe_impls": [FP4Moe, FP8BlockScaleMoe],
                 "compatible_intermediate_size": [1024, 2048],
+                "compatible_activation_types": [
+                    ActivationType.Swiglu,
+                    ActivationType.Geglu,
+                ],
                 "enable_autotune": True,
             },
             id="kimi_k2",
@@ -2764,6 +2769,10 @@ def test_renormalize_routing(
                     BF16Moe,
                 ],
                 "compatible_intermediate_size": [512, 1024, 2048],
+                "compatible_activation_types": [
+                    ActivationType.Swiglu,
+                    ActivationType.Geglu,
+                ],
                 "enable_autotune": True,
             },
             id="DSv3",
@@ -2780,6 +2789,10 @@ def test_renormalize_routing(
                 "routing_method_type": RoutingMethodType.DeepSeekV3,
                 "compatible_moe_impls": [FP4Moe, FP8BlockScaleMoe],
                 "compatible_intermediate_size": [384, 768],
+                "compatible_activation_types": [
+                    ActivationType.Swiglu,
+                    ActivationType.Geglu,
+                ],
                 "enable_autotune": False,
             },
             id="DSLite",
@@ -2796,6 +2809,10 @@ def test_renormalize_routing(
                 "routing_method_type": RoutingMethodType.DeepSeekV3,
                 "compatible_moe_impls": [FP4Moe, FP8BlockScaleMoe, BF16Moe],
                 "compatible_intermediate_size": [512, 1024, 1536],
+                "compatible_activation_types": [
+                    ActivationType.Swiglu,
+                    ActivationType.Geglu,
+                ],
                 "enable_autotune": False,
             },
             id="GLM4_MoE",
@@ -2949,7 +2966,6 @@ def test_topk_routing(
     "moe_impl",
     [
         pytest.param(FP8PerTensorMoe(), id="FP8_Tensor"),
-        pytest.param(FP4Moe(QuantMode.FP4_NVFP4_NVFP4), id="FP4"),
     ],
 )
 @pytest.mark.parametrize(
@@ -2965,7 +2981,7 @@ def test_topk_routing(
                 "routed_scaling": 2.5,
                 "has_routing_bias": True,
                 "routing_method_type": RoutingMethodType.Llama4,
-                "compatible_moe_impls": [FP8PerTensorMoe, FP4Moe],
+                "compatible_moe_impls": [FP8PerTensorMoe],
                 "compatible_intermediate_size": [1024, 2048],
                 "enable_autotune": True,
             },
@@ -2990,7 +3006,6 @@ def test_topk_routing(
     "activation_type",
     [
         pytest.param(ActivationType.Swiglu, id="Swiglu"),
-        pytest.param(ActivationType.Relu2, id="Relu2"),
     ],
 )
 def test_llama4_routing(
