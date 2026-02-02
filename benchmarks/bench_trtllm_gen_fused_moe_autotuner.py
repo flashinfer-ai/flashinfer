@@ -42,12 +42,12 @@ def mxint4_quantize(
     scales = amax / 8.0
     x_scaled = x_reshaped * scales.reciprocal()
     x_int8 = (
-        x_scaled.round().clamp(-8, 7).to(torch.uint8).reshape(-1, sf_vec_size // 2, 2)
+        x_scaled.round().clamp(-8, 7).to(torch.int8).reshape(-1, sf_vec_size // 2, 2)
     )
     x_int4 = (x_int8[..., 0] & 0x0F) | ((x_int8[..., 1] & 0x0F) << 4)
-    return x_int4.reshape(*x.shape[:-1], x.shape[-1] // 2), scales.reshape(
-        -1, sf_vec_size
-    )
+    return x_int4.reshape(*x.shape[:-1], x.shape[-1] // 2).view(
+        torch.uint8
+    ), scales.reshape(-1, sf_vec_size)
 
 
 def bench_trtllm_gen_fused_moe_autotuner_fp8(
