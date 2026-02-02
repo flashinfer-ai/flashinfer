@@ -87,8 +87,13 @@ def skip_checks(
             f"Skip for testing speed: {activation_type} + {hidden_size} + {intermediate_size}"
         )
 
-    compatible_activation_types = routing_config.get("compatible_activation_types", [])
-    if activation_type not in compatible_activation_types:
+    compatible_activation_types = routing_config.get(
+        "compatible_activation_types", None
+    )
+    if (
+        compatible_activation_types is not None
+        and activation_type not in compatible_activation_types
+    ):
         pytest.skip(
             f"Incompatible: activation_type={activation_type} not in compatible_activation_types ({compatible_activation_types})"
         )
