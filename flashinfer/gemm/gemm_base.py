@@ -2662,7 +2662,7 @@ def _cudnn_gemm_fp4_requirement(
         _torch_data_type_to_cudnn_data_type(out_dtype),
         block_size,
         a.device,
-        alpha,
+        alpha is not None,
         use_nvfp4,
     )
     graph.check_support()
