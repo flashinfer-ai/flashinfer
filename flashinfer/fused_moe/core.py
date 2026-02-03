@@ -2485,7 +2485,7 @@ def trtllm_fp4_block_scale_moe(
 
 @flashinfer_api
 def trtllm_fp4_block_scale_routed_moe(
-    topk_ids: torch.Tensor,
+    topk_ids: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
     routing_bias: Optional[torch.Tensor],
     hidden_states: torch.Tensor,
     hidden_states_scale: Optional[torch.Tensor],
@@ -2516,13 +2516,20 @@ def trtllm_fp4_block_scale_routed_moe(
     output: Optional[torch.Tensor] = None,
     tune_max_num_tokens: int = 8192,
 ) -> List[torch.Tensor]:
-    """FP4 block scale MoE operation.
+    """FP4 block scale MoE operation with pre-computed routing.
+
+    This function supports two pre-computed routing formats:
+    1. Packed format: topk_ids is a single tensor with packed (score << 16 | expert_id)
+    2. Unpacked format: topk_ids is a tuple of (topk_ids, topk_weights) tensors
 
     Args:
-        topk_ids (torch.Tensor): shape [seq_len, top_k]
-            Tensor of top-k indices and expert weights. Dtype must be int32.
-            It must represent a packed value. The most significant 16/32 bits represent the score and
-            the least significant 16 bits represent the index of the chosen expert (unsigned).
+        topk_ids (Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]):
+            Either a single tensor or a tuple of two tensors:
+            - Single tensor (packed format): shape [seq_len, top_k], dtype int32.
+              Must be packed value with (score << 16 | expert_id).
+            - Tuple (unpacked format): (topk_ids, topk_weights) where
+              topk_ids has shape [seq_len, top_k], dtype int32 (plain expert indices)
+              topk_weights has shape [seq_len, top_k], dtype bfloat16 (routing weights)
         routing_bias (Optional[torch.Tensor]): shape [num_experts]
             Tensor of routing bias. Can be None for some routing methods. Must be the same type as routing logits.
         hidden_states (torch.Tensor): shape [seq_len, hidden_size // 2 if nvfp4 else hidden_size]
@@ -2579,11 +2586,22 @@ def trtllm_fp4_block_scale_routed_moe(
         List[torch.Tensor]: List of output tensors. If do_finalize=True, returns the final MoE output.
             Otherwise, returns intermediate results (gemm2_output, topk_weights, expanded_idx_to_permuted_idx) that need further processing.
     """
+    # Determine routing mode based on input format
+    if isinstance(topk_ids, tuple):
+        # Unpacked format: (topk_ids, topk_weights)
+        topk_ids_tensor, topk_weights = topk_ids
+        routing_mode = RoutingInputMode.UnpackedPrecomputed
+    else:
+        # Packed format: single tensor with (score << 16 | expert_id)
+        topk_ids_tensor = topk_ids
+        topk_weights = None
+        routing_mode = RoutingInputMode.PackedPrecomputed
+
     return get_trtllm_moe_sm100_module().trtllm_fp4_block_scale_moe(
-        RoutingInputMode.PackedPrecomputed,
+        routing_mode,
         None,
-        topk_ids,
-        None,
+        topk_ids_tensor,
+        topk_weights,
         routing_bias,
         hidden_states,
         hidden_states_scale,
