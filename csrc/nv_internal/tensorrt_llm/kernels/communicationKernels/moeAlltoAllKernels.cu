@@ -399,7 +399,11 @@ __global__ void moeA2ADispatchKernel(
 #if !DISABLE_SYNC_FOR_PROFILING
       uint32_t expected_value = *ptrs.flag_val;
 
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
       asm volatile("fence.release.sys;");
+#else
+      __threadfence_system();
+#endif
 #pragma unroll 1  // No unroll as one iter is typically enough
       for (int target_rank = lane_id; target_rank < ep_size; target_rank += warpSize) {
         uint32_t* flag_addr = &ptrs.completion_flags[target_rank][rank_id];
