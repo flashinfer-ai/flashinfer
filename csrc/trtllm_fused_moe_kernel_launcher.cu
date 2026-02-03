@@ -2024,7 +2024,8 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
     int64_t local_expert_offset, int64_t local_num_experts, Optional<double> routed_scaling_factor,
     int64_t routing_method_type, bool use_shuffled_weight, int64_t weight_layout, bool do_finalize,
     bool enable_pdl, Array<int64_t> config_index, Fp8QuantizationType quantization_type,
-    int64_t act_type, bool norm_topk_prob, Optional<TensorView> routing_replay_out) {
+    int64_t act_type, bool norm_topk_prob, Optional<TensorView> routing_replay_out,
+    Optional<int64_t> valid_hidden_size, Optional<int64_t> valid_intermediate_size) {
   auto activation_type = validateAndCastActivationType(act_type);
   // DeepSeekFp8 currently uses a TRTLLM runner that hardwires Swiglu activation semantics.
   // Fail for any other activation to avoid silently running incorrect activation behavior.
@@ -2114,6 +2115,13 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
     args->do_finalize = do_finalize;
     args->output = output.data_ptr();
     args->output_scale = nullptr;
+    // Set valid (unpadded) dimensions if provided
+    if (valid_hidden_size.has_value()) {
+      args->valid_hidden_size = static_cast<int32_t>(valid_hidden_size.value());
+    }
+    if (valid_intermediate_size.has_value()) {
+      args->valid_intermediate_size = static_cast<int32_t>(valid_intermediate_size.value());
+    }
 
     // Create and initialize launcher for this tile size
     auto launcher = std::make_unique<Fp8BlockScaleLauncher>(
@@ -2156,7 +2164,8 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
     int64_t intermediate_size, int64_t local_expert_offset, int64_t local_num_experts,
     Optional<double> routed_scaling_factor, int64_t routing_method_type, bool do_finalize,
     bool enable_pdl, int64_t act_type, TensorView output, Array<int64_t> config_index,
-    bool norm_topk_prob, Optional<TensorView> routing_replay_out) {
+    bool norm_topk_prob, Optional<TensorView> routing_replay_out,
+    Optional<int64_t> valid_hidden_size, Optional<int64_t> valid_intermediate_size) {
   // Determine data types based on input format
   int const num_tokens = hidden_states.size(0);
   int hidden_size = hidden_states.size(1);
@@ -2258,6 +2267,13 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
     args->do_finalize = do_finalize;
     args->output = output.data_ptr();
     args->output_scale = nullptr;
+    // Set valid (unpadded) dimensions if provided
+    if (valid_hidden_size.has_value()) {
+      args->valid_hidden_size = static_cast<int32_t>(valid_hidden_size.value());
+    }
+    if (valid_intermediate_size.has_value()) {
+      args->valid_intermediate_size = static_cast<int32_t>(valid_intermediate_size.value());
+    }
 
     // Create and initialize launcher for this tile size
     auto launcher = std::make_unique<FP4BlockScaleLauncher>(
@@ -2295,7 +2311,8 @@ Array<Tensor> trtllm_mxint4_block_scale_moe(
     Optional<int64_t> n_group, Optional<int64_t> topk_group, int64_t intermediate_size,
     int64_t local_expert_offset, int64_t local_num_experts, Optional<double> routed_scaling_factor,
     int64_t routing_method_type, bool do_finalize, bool enable_pdl, TensorView output,
-    Array<int64_t> config_index, bool norm_topk_prob, Optional<TensorView> routing_replay_out) {
+    Array<int64_t> config_index, bool norm_topk_prob, Optional<TensorView> routing_replay_out,
+    Optional<int64_t> valid_hidden_size, Optional<int64_t> valid_intermediate_size) {
   // Determine data types based on input format
   int const num_tokens = hidden_states.size(0);
   int hidden_size = hidden_states.size(1);
@@ -2352,6 +2369,13 @@ Array<Tensor> trtllm_mxint4_block_scale_moe(
     args->do_finalize = do_finalize;
     args->output = output.data_ptr();
     args->output_scale = nullptr;
+    // Set valid (unpadded) dimensions if provided
+    if (valid_hidden_size.has_value()) {
+      args->valid_hidden_size = static_cast<int32_t>(valid_hidden_size.value());
+    }
+    if (valid_intermediate_size.has_value()) {
+      args->valid_intermediate_size = static_cast<int32_t>(valid_intermediate_size.value());
+    }
 
     // Create and initialize launcher for this tile size
     auto launcher = std::make_unique<MxInt4BlockScaleLauncher>(
