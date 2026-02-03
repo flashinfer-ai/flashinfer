@@ -416,9 +416,19 @@ def gen_jit_spec(
     verbose_env = os.environ.get("FLASHINFER_JIT_VERBOSE", "0")
     debug = (debug_env if debug_env is not None else verbose_env) == "1"
 
-    cflags = ["-std=c++17", "-Wno-switch-bool"]
+    # Only add default C++ standard if not specified in extra flags
+    cflags_has_std = extra_cflags is not None and any(
+        f.startswith("-std=") for f in extra_cflags
+    )
+    cuda_cflags_has_std = extra_cuda_cflags is not None and any(
+        f.startswith("-std=") for f in extra_cuda_cflags
+    )
+
+    cflags = ["-Wno-switch-bool"]
+    if not cflags_has_std:
+        cflags.insert(0, "-std=c++17")
+
     cuda_cflags = [
-        "-std=c++17",
         f"--threads={os.environ.get('FLASHINFER_NVCC_THREADS', '1')}",
         "-use_fast_math",
         "-DFLASHINFER_ENABLE_F16",
@@ -426,6 +436,9 @@ def gen_jit_spec(
         "-DFLASHINFER_ENABLE_FP8_E4M3",
         "-DFLASHINFER_ENABLE_FP8_E5M2",
     ]
+    if not cuda_cflags_has_std:
+        cuda_cflags.insert(0, "-std=c++17")
+
     if debug:
         cflags += ["-O0", "-g"]
         cuda_cflags += [
@@ -446,14 +459,8 @@ def gen_jit_spec(
         cuda_cflags += ["-lineinfo"]
 
     if extra_cflags is not None:
-        # If extra_cflags contains a -std flag, remove the default one to avoid conflicts
-        if any(f.startswith("-std=") for f in extra_cflags):
-            cflags = [f for f in cflags if not f.startswith("-std=")]
         cflags += extra_cflags
     if extra_cuda_cflags is not None:
-        # If extra_cuda_cflags contains a -std flag, remove the default one to avoid conflicts
-        if any(f.startswith("-std=") for f in extra_cuda_cflags):
-            cuda_cflags = [f for f in cuda_cflags if not f.startswith("-std=")]
         cuda_cflags += extra_cuda_cflags
 
     spec = JitSpec(
