@@ -1120,19 +1120,21 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
   }
 
   FP4BlockScaleLauncher(
-      Optional<TensorView> const& routing_logits, Optional<TensorView> const& routing_bias,
-      TensorView const& hidden_states, Optional<TensorView> const& hidden_states_scale,
-      TensorView const& gemm1_weights, TensorView const& gemm1_weights_scale,
-      Optional<TensorView> const& gemm1_bias, Optional<TensorView> const& gemm1_alpha,
-      Optional<TensorView> const& gemm1_beta, Optional<TensorView> const& gemm1_clamp_limit,
-      TensorView const& gemm2_weights, TensorView const& gemm2_weights_scale,
-      Optional<TensorView> const& gemm2_bias, Optional<TensorView> const& output1_scales_scalar,
+      RoutingInputMode routing_input_mode, Optional<TensorView> const& routing_logits,
+      Optional<TensorView> const& routing_bias, TensorView const& hidden_states,
+      Optional<TensorView> const& hidden_states_scale, TensorView const& gemm1_weights,
+      TensorView const& gemm1_weights_scale, Optional<TensorView> const& gemm1_bias,
+      Optional<TensorView> const& gemm1_alpha, Optional<TensorView> const& gemm1_beta,
+      Optional<TensorView> const& gemm1_clamp_limit, TensorView const& gemm2_weights,
+      TensorView const& gemm2_weights_scale, Optional<TensorView> const& gemm2_bias,
+      Optional<TensorView> const& output1_scales_scalar,
       Optional<TensorView> const& output1_scales_gate_scalar,
       Optional<TensorView> const& output2_scales_scalar, TensorView const& topk_ids,
       TensorView const& topk_weights)
       : FusedMoeLauncher(routing_logits, routing_bias, hidden_states, gemm1_weights,
                          output1_scales_scalar, output1_scales_gate_scalar, gemm2_weights,
                          output2_scales_scalar),
+        routing_input_mode_(routing_input_mode),
         hidden_states_scale(hidden_states_scale),
         gemm1_weights_scale(gemm1_weights_scale),
         gemm1_bias(gemm1_bias),
@@ -1332,6 +1334,7 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
   }
 
  private:
+  RoutingInputMode routing_input_mode_;
   Optional<TensorView> hidden_states_scale;
   TensorView gemm1_weights_scale;
   Optional<TensorView> gemm1_bias;
@@ -1357,34 +1360,27 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     tensorrt_llm::kernels::trtllmgen_moe::Routing::Runner routing_runner(tile_tokens_dim);
     cudaStream_t routing_stream = get_stream(hidden_states.device());
 
-    // Detect routing input mode (see RoutingInputMode enum for detailed documentation)
-    // Currently only Mode 1 (FromLogits) and Mode 2 (PackedPrecomputed) are supported.
-    // Mode 3 (UnpackedPrecomputed) will be added in the future.
-    RoutingInputMode routing_input_mode = (args->routing_logits != nullptr)
-                                              ? RoutingInputMode::FromLogits
-                                              : RoutingInputMode::PackedPrecomputed;
-
-    // Set routing kernel parameters based on mode
+    // Set routing kernel parameters based on mode (see RoutingInputMode enum for documentation)
     int32_t* expert_ids_param = nullptr;   // INPUT: pre-computed expert IDs (Mode 3 only)
     void* expert_weights_param = nullptr;  // INPUT or OUTPUT depending on mode
 
-    switch (routing_input_mode) {
+    switch (routing_input_mode_) {
       case RoutingInputMode::FromLogits:
+        // Mode 1: Kernel computes routing, writes weights to expert_weights_param (OUTPUT)
         expert_ids_param = nullptr;
         expert_weights_param = topk_weights.data_ptr();
         break;
 
       case RoutingInputMode::PackedPrecomputed:
+        // Mode 2: Kernel unpacks from topk_ids, writes weights to expert_weights_param (OUTPUT)
         expert_ids_param = nullptr;
         expert_weights_param = topk_weights.data_ptr();
         break;
 
       case RoutingInputMode::UnpackedPrecomputed:
-        // Mode 3: Both are INPUTS, kernel uses them directly (not yet implemented)
-        // expert_ids_param = static_cast<int32_t*>(precomputed_topk_ids.data_ptr());
-        // expert_weights_param = precomputed_topk_weights.data_ptr();
-        TVM_FFI_LOG_AND_THROW(NotImplementedError)
-            << "UnpackedPrecomputed routing mode is not yet implemented";
+        // Mode 3: Both are INPUTS, kernel uses them directly
+        expert_ids_param = static_cast<int32_t*>(topk_ids.data_ptr());
+        expert_weights_param = topk_weights.data_ptr();
         break;
     }
 
@@ -1692,8 +1688,8 @@ Tensor trtllm_fp8_block_scale_moe(
 }
 
 Array<Tensor> trtllm_fp4_block_scale_moe(
-    Optional<TensorView> routing_logits, TensorView topk_ids, TensorView topk_weights,
-    Optional<TensorView> routing_bias, TensorView hidden_states,
+    int64_t routing_input_mode, Optional<TensorView> routing_logits, TensorView topk_ids,
+    TensorView topk_weights, Optional<TensorView> routing_bias, TensorView hidden_states,
     Optional<TensorView> hidden_states_scale, TensorView gemm1_weights,
     TensorView gemm1_weights_scale, Optional<TensorView> gemm1_bias,
     Optional<TensorView> gemm1_alpha, Optional<TensorView> gemm1_beta,
@@ -1705,29 +1701,6 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
     int64_t local_expert_offset, int64_t local_num_experts, Optional<double> routed_scaling_factor,
     int64_t routing_method_type, bool do_finalize, bool enable_pdl, int64_t gated_act_type,
     TensorView output, Array<int64_t> config_index) {
-  // DEBUG: Probe what TVM-FFI passes for topk_ids and topk_weights
-  std::cerr << "=== DEBUG trtllm_fp4_block_scale_moe ===" << std::endl;
-  std::cerr << "routing_logits.has_value(): " << routing_logits.has_value() << std::endl;
-  std::cerr << "topk_ids.data_ptr(): " << topk_ids.data_ptr() << std::endl;
-  std::cerr << "topk_ids.ndim(): " << topk_ids.ndim() << std::endl;
-  if (topk_ids.ndim() > 0) {
-    std::cerr << "topk_ids.shape: [";
-    for (int i = 0; i < topk_ids.ndim(); i++) {
-      std::cerr << topk_ids.size(i) << (i < topk_ids.ndim() - 1 ? ", " : "");
-    }
-    std::cerr << "]" << std::endl;
-  }
-  std::cerr << "topk_weights.data_ptr(): " << topk_weights.data_ptr() << std::endl;
-  std::cerr << "topk_weights.ndim(): " << topk_weights.ndim() << std::endl;
-  if (topk_weights.ndim() > 0) {
-    std::cerr << "topk_weights.shape: [";
-    for (int i = 0; i < topk_weights.ndim(); i++) {
-      std::cerr << topk_weights.size(i) << (i < topk_weights.ndim() - 1 ? ", " : "");
-    }
-    std::cerr << "]" << std::endl;
-  }
-  std::cerr << "========================================" << std::endl;
-
   // Determine data types based on input format
   int const num_tokens = hidden_states.size(0);
   int hidden_size = hidden_states.size(1);
@@ -1826,10 +1799,11 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
 
     // Create and initialize launcher for this tile size
     auto launcher = std::make_unique<FP4BlockScaleLauncher>(
-        routing_logits, routing_bias, hidden_states, hidden_states_scale, gemm1_weights,
-        gemm1_weights_scale, gemm1_bias, gemm1_alpha, gemm1_beta, gemm1_clamp_limit, gemm2_weights,
-        gemm2_weights_scale, gemm2_bias, output1_scales_scalar, output1_scales_gate_scalar,
-        output2_scales_scalar, topk_ids, topk_weights);
+        static_cast<RoutingInputMode>(routing_input_mode), routing_logits, routing_bias,
+        hidden_states, hidden_states_scale, gemm1_weights, gemm1_weights_scale, gemm1_bias,
+        gemm1_alpha, gemm1_beta, gemm1_clamp_limit, gemm2_weights, gemm2_weights_scale, gemm2_bias,
+        output1_scales_scalar, output1_scales_gate_scalar, output2_scales_scalar, topk_ids,
+        topk_weights);
     launcher->init(std::move(args), curr_tile_N, routing_method_type, /*use_shuffled_weight=*/true,
                    /*weight_layout=*/0, gated_act_type, mDtypeAct, mDtypeWeights);
 

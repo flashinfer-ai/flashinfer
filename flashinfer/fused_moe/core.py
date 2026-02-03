@@ -182,6 +182,26 @@ class GatedActType(IntEnum):
     GeGlu = 1
 
 
+# Routing input modes for FusedMoE launcher
+# Please keep this in sync with the counterpart defined in csrc/trtllm_fused_moe_kernel_launcher.cu
+class RoutingInputMode(IntEnum):
+    # Mode 1: Compute routing from logits
+    # - Input: routing_logits tensor provided
+    # - topk_ids: OUTPUT buffer for computed expert indices
+    # - topk_weights: OUTPUT buffer for computed weights
+    FromLogits = 0
+    # Mode 2: Pre-computed routing with packed format
+    # - Input: topk_ids contains packed (score << 16 | expert_id)
+    # - topk_ids: INPUT with packed values
+    # - topk_weights: OUTPUT buffer for extracted weights
+    PackedPrecomputed = 1
+    # Mode 3: Pre-computed routing with separate tensors
+    # - Input: separate topk_ids (expert indices) and topk_weights (routing weights)
+    # - topk_ids: INPUT - pre-computed expert indices
+    # - topk_weights: INPUT - pre-computed routing weights
+    UnpackedPrecomputed = 2
+
+
 @functools.cache
 def is_trtllm_moe_supported(
     dtype_weights: DtypeTrtllmGen,
@@ -950,7 +970,7 @@ def get_trtllm_moe_sm100_module():
             ),  # topk_ids buffer. empty since routing_logits is used. [num_tokens, topk]
             lambda shapes, dtype, device: torch.empty(
                 shapes, device=device, dtype=dtype
-            ),  # expert_weights buffer. empty since routing_logits is used. [num_tokens, topk]
+            ),  # topk_weights buffer. empty since routing_logits is used. [num_tokens, topk]
             lambda shapes, dtype, device: torch.randn(shapes, device=device).to(
                 dtype
             ),  # hidden_states, [num_tokens, hidden_size]
@@ -1021,7 +1041,7 @@ def get_trtllm_moe_sm100_module():
                 output,
                 routing_logits,
                 topk_ids,
-                expert_weights,
+                topk_weights,
                 hidden_states,
                 *extra_inputs,
             ) = inputs
@@ -1062,7 +1082,7 @@ def get_trtllm_moe_sm100_module():
                 output,
                 routing_logits,
                 topk_ids,
-                expert_weights,
+                topk_weights,
                 hidden_states,
                 *extra_inputs,
             ) = inputs
@@ -1081,8 +1101,8 @@ def get_trtllm_moe_sm100_module():
             assert topk_ids.shape[0] == num_tokens, (
                 "topk_ids's first dimension must be batch size."
             )
-            assert expert_weights.shape[0] == num_tokens, (
-                "expert_weights's first dimension must be batch size."
+            assert topk_weights.shape[0] == num_tokens, (
+                "topk_weights's first dimension must be batch size."
             )
             assert hidden_states.shape[0] == num_tokens, (
                 "hidden_states's first dimension must be batch size."
@@ -1207,10 +1227,12 @@ def get_trtllm_moe_sm100_module():
                     [-1, -1] if tactic == -1 else tactic,
                 )
             else:
+                # Tuning always uses Mode 1 (FromLogits)
                 moe_op.trtllm_fp4_block_scale_moe(
+                    RoutingInputMode.FromLogits,
                     routing_logits,
                     topk_ids,
-                    expert_weights,
+                    topk_weights,
                     kwargs["routing_bias"],
                     hidden_states,
                     hidden_states_scale,  # hidden_states_scale
@@ -1309,7 +1331,7 @@ def get_trtllm_moe_sm100_module():
         topk_ids = torch.empty(
             num_tokens, top_k, dtype=torch.int32, device=hidden_states.device
         )
-        expert_weights = torch.empty(
+        topk_weights = torch.empty(
             num_tokens, top_k, dtype=routing_logits.dtype, device=hidden_states.device
         )
 
@@ -1329,7 +1351,7 @@ def get_trtllm_moe_sm100_module():
             gated_act_type=GatedActType.SwiGlu,  # Default for BF16
         )
 
-        inputs = [output, routing_logits, topk_ids, expert_weights, hidden_states]
+        inputs = [output, routing_logits, topk_ids, topk_weights, hidden_states]
 
         _, tactic = tuner.choose_one(
             "flashinfer::trtllm_bf16_moe",
@@ -1441,7 +1463,7 @@ def get_trtllm_moe_sm100_module():
         topk_ids = torch.empty(
             num_tokens, top_k, dtype=torch.int32, device=hidden_states.device
         )
-        expert_weights = torch.empty(
+        topk_weights = torch.empty(
             num_tokens, top_k, dtype=routing_logits.dtype, device=hidden_states.device
         )
 
@@ -1460,7 +1482,7 @@ def get_trtllm_moe_sm100_module():
             use_shuffled_weight=True,
         )
 
-        inputs = [output, routing_logits, topk_ids, expert_weights, hidden_states]
+        inputs = [output, routing_logits, topk_ids, topk_weights, hidden_states]
 
         _, tactic = tuner.choose_one(
             "flashinfer::trtllm_fp8_per_tensor_scale_moe",
@@ -1582,7 +1604,7 @@ def get_trtllm_moe_sm100_module():
         topk_ids = torch.empty(
             num_tokens, top_k, dtype=torch.int32, device=hidden_states.device
         )
-        expert_weights = torch.empty(
+        topk_weights = torch.empty(
             num_tokens, top_k, dtype=routing_logits.dtype, device=hidden_states.device
         )
 
@@ -1605,7 +1627,7 @@ def get_trtllm_moe_sm100_module():
             output,
             routing_logits,
             topk_ids,
-            expert_weights,
+            topk_weights,
             hidden_states,
             hidden_states_scale,
         ]
@@ -1693,9 +1715,10 @@ def get_trtllm_moe_sm100_module():
         mutates_args=(""),
     )
     def trtllm_fp4_block_scale_moe_op(
+        routing_input_mode: int,
         routing_logits: Optional[torch.Tensor],
         topk_ids: Optional[torch.Tensor],
-        expert_weights: Optional[torch.Tensor],
+        topk_weights: Optional[torch.Tensor],
         routing_bias: Optional[torch.Tensor],
         hidden_states: torch.Tensor,
         hidden_states_scale: Optional[torch.Tensor],
@@ -1740,14 +1763,24 @@ def get_trtllm_moe_sm100_module():
         num_tokens = hidden_states.shape[0]
 
         # workspace buffers required by trtllm-gen
-        if topk_ids is None:
-            topk_ids = torch.empty(
-                num_tokens, top_k, dtype=torch.int32, device=hidden_states.device
+        # For Mode 3 (UnpackedPrecomputed), topk_ids and topk_weights are user-provided INPUTS
+        if routing_input_mode == RoutingInputMode.UnpackedPrecomputed:
+            assert topk_ids is not None, (
+                "topk_ids must be provided for UnpackedPrecomputed mode"
             )
-        if expert_weights is None:
-            expert_weights = torch.empty(
-                num_tokens, top_k, dtype=routing_dtype, device=hidden_states.device
+            assert topk_weights is not None, (
+                "topk_weights must be provided for UnpackedPrecomputed mode"
             )
+        else:
+            # For Mode 1 (FromLogits) and Mode 2 (PackedPrecomputed), allocate OUTPUT buffers
+            if topk_ids is None:
+                topk_ids = torch.empty(
+                    num_tokens, top_k, dtype=torch.int32, device=hidden_states.device
+                )
+            if topk_weights is None:
+                topk_weights = torch.empty(
+                    num_tokens, top_k, dtype=routing_dtype, device=hidden_states.device
+                )
         if enable_pdl is None:
             enable_pdl = device_support_pdl(hidden_states.device)
         if output is None:
@@ -1797,7 +1830,7 @@ def get_trtllm_moe_sm100_module():
             if routing_logits is None
             else routing_logits,
             topk_ids,
-            expert_weights,
+            topk_weights,
             hidden_states,
         ]
         if hidden_states_scale is not None:
@@ -1834,9 +1867,10 @@ def get_trtllm_moe_sm100_module():
 
         # Call the C++ function for block scale MoE
         intermediate_output = moe_op.trtllm_fp4_block_scale_moe(
+            routing_input_mode,
             routing_logits,
             topk_ids,
-            expert_weights,
+            topk_weights,
             routing_bias,
             hidden_states,
             hidden_states_scale,
@@ -1873,15 +1907,16 @@ def get_trtllm_moe_sm100_module():
             gemm2_output, expanded_idx_to_permuted_idx = intermediate_output
             return [
                 torch.from_dlpack(gemm2_output),
-                expert_weights,
+                topk_weights,
                 torch.from_dlpack(expanded_idx_to_permuted_idx),
             ]
 
     @register_fake_op("flashinfer::trtllm_fp4_block_scale_moe")
     def _fake_trtllm_fp4_block_scale_moe(
+        routing_input_mode: int,
         routing_logits: torch.Tensor,
         topk_ids: Optional[torch.Tensor],
-        expert_weights: Optional[torch.Tensor],
+        topk_weights: Optional[torch.Tensor],
         routing_bias: Optional[torch.Tensor],
         hidden_states: torch.Tensor,
         hidden_states_scale: torch.Tensor,
@@ -1955,7 +1990,7 @@ def get_trtllm_moe_sm100_module():
         topk_ids = torch.empty(
             num_tokens, top_k, dtype=torch.int32, device=hidden_states.device
         )
-        expert_weights = torch.empty(
+        topk_weights = torch.empty(
             num_tokens, top_k, dtype=routing_dtype, device=hidden_states.device
         )
         if enable_pdl is None:
@@ -1989,7 +2024,7 @@ def get_trtllm_moe_sm100_module():
             output,
             routing_logits,
             topk_ids,
-            expert_weights,
+            topk_weights,
             hidden_states,
         ]
 
@@ -2409,9 +2444,10 @@ def trtllm_fp4_block_scale_moe(
             Optional inplace output tensor.
     Returns:
         List[torch.Tensor]: List of output tensors. If do_finalize=True, returns the final MoE output.
-            Otherwise, returns intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
+            Otherwise, returns intermediate results (gemm2_output, topk_weights, expanded_idx_to_permuted_idx) that need further processing.
     """
     return get_trtllm_moe_sm100_module().trtllm_fp4_block_scale_moe(
+        RoutingInputMode.FromLogits,
         routing_logits,
         None,
         None,
@@ -2541,9 +2577,10 @@ def trtllm_fp4_block_scale_routed_moe(
 
     Returns:
         List[torch.Tensor]: List of output tensors. If do_finalize=True, returns the final MoE output.
-            Otherwise, returns intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
+            Otherwise, returns intermediate results (gemm2_output, topk_weights, expanded_idx_to_permuted_idx) that need further processing.
     """
     return get_trtllm_moe_sm100_module().trtllm_fp4_block_scale_moe(
+        RoutingInputMode.PackedPrecomputed,
         None,
         topk_ids,
         None,
