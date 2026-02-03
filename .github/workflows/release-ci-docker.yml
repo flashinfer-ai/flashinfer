@@ -61,10 +61,10 @@ jobs:
           file: docker/Dockerfile.${{ matrix.cuda }}
           platforms: linux/${{ matrix.arch }}
           push: ${{ github.event_name != 'pull_request' }}
+          pull: true  # Always pull the latest base image
+          no-cache: true  # Disable all caching
           tags: |
             flashinfer/flashinfer-ci-${{ matrix.cuda }}:${{ matrix.arch }}-${{ needs.generate-tag.outputs.date_sha }}
-          cache-from: type=registry,ref=flashinfer/flashinfer-ci-${{ matrix.cuda }}:buildcache-${{ matrix.arch }}
-          cache-to: ${{ github.event_name != 'pull_request' && format('type=registry,ref=flashinfer/flashinfer-ci-{0}:buildcache-{1},mode=max', matrix.cuda, matrix.arch) || '' }}
           provenance: false
           sbom: false
 
