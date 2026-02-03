@@ -108,6 +108,7 @@ class LayerNormKernel:
         mBeta: cute.Tensor,
         M: Int32,
         eps: Float32,
+        enable_pdl: cutlass.Constexpr[bool],
         stream,
     ):
         # Layout for input (float16/bfloat16)
@@ -135,6 +136,7 @@ class LayerNormKernel:
             mBeta,
             M,
             eps,
+            enable_pdl,
             tv_layout,
             tiler_mn,
             tv_layout_f32,
@@ -144,6 +146,7 @@ class LayerNormKernel:
             block=[self.num_threads, 1, 1],
             smem=self._smem_size_in_bytes(),
             stream=stream,
+            use_pdl=enable_pdl,
         )
 
     @cute.kernel
@@ -155,6 +158,7 @@ class LayerNormKernel:
         mBeta: cute.Tensor,
         M: Int32,
         eps: Float32,
+        enable_pdl: cutlass.Constexpr[bool],
         tv_layout: cute.Layout,
         tiler_mn: cute.Shape,
         tv_layout_f32: cute.Layout,
@@ -162,6 +166,10 @@ class LayerNormKernel:
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
+
+        # PDL: Wait for previous kernel (SM90+ only)
+        if enable_pdl:
+            cute.arch.griddepcontrol_wait()
 
         H = self.H
         threads_per_row = tv_layout.shape[0][0]
@@ -343,6 +351,10 @@ class LayerNormKernel:
 
         cute.copy(copy_atom_load, tXrY, tXgY, pred=tXpX)
 
+        # PDL: Signal dependent kernels (SM90+ only)
+        if enable_pdl:
+            cute.arch.griddepcontrol_launch_dependents()
+
 
 # =============================================================================
 # Compiled Kernel Getter
@@ -350,7 +362,9 @@ class LayerNormKernel:
 
 
 @functools.cache
-def _get_compiled_layernorm_kernel(dtype_str: str, gamma_dtype_str: str, H: int):
+def _get_compiled_layernorm_kernel(
+    dtype_str: str, gamma_dtype_str: str, H: int, enable_pdl: bool
+):
     """Get a compiled LayerNorm kernel using TVM-FFI."""
     dtype = get_cutlass_dtype(dtype_str)
     gamma_dtype = get_cutlass_dtype(gamma_dtype_str)
@@ -383,6 +397,7 @@ def _get_compiled_layernorm_kernel(dtype_str: str, gamma_dtype_str: str, H: int)
         beta_fake,
         Int32(1),
         Float32(1e-6),
+        enable_pdl,
         stream_fake,
         options="--enable-tvm-ffi",
     )
@@ -418,6 +433,7 @@ def layernorm_cute(
     gamma: torch.Tensor,
     beta: torch.Tensor,
     eps: float = 1e-6,
+    enable_pdl: bool = False,
 ) -> None:
     """CuTe DSL LayerNorm implementation.
 
@@ -430,7 +446,7 @@ def layernorm_cute(
 
     dtype_str = _torch_dtype_to_str(input.dtype)
     gamma_dtype_str = _torch_dtype_to_str(gamma.dtype)
-    kernel = _get_compiled_layernorm_kernel(dtype_str, gamma_dtype_str, H)
+    kernel = _get_compiled_layernorm_kernel(dtype_str, gamma_dtype_str, H, enable_pdl)
     kernel(out, input, gamma, beta, M, eps)
 
 

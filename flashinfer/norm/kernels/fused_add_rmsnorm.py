@@ -95,6 +95,7 @@ class FusedAddRMSNormKernel:
         mW: cute.Tensor,
         M: Int32,
         eps: Float32,
+        enable_pdl: cutlass.Constexpr[bool],
         stream,
     ):
         tv_shape, tv_stride = make_tv_layout(
@@ -105,11 +106,12 @@ class FusedAddRMSNormKernel:
         tv_layout = cute.make_layout(tv_shape, stride=tv_stride)
         tiler_mn = (1, self.cols_per_tile)
 
-        self.kernel(mX, mR, mW, M, eps, tv_layout, tiler_mn).launch(
+        self.kernel(mX, mR, mW, M, eps, enable_pdl, tv_layout, tiler_mn).launch(
             grid=[M, 1, 1],
             block=[self.num_threads, 1, 1],
             smem=self._smem_size_in_bytes(),
             stream=stream,
+            use_pdl=enable_pdl,
         )
 
     @cute.kernel
@@ -120,11 +122,16 @@ class FusedAddRMSNormKernel:
         mW: cute.Tensor,
         M: Int32,
         eps: Float32,
+        enable_pdl: cutlass.Constexpr[bool],
         tv_layout: cute.Layout,
         tiler_mn: cute.Shape,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
+
+        # PDL: Wait for previous kernel (SM90+ only)
+        if enable_pdl:
+            cute.arch.griddepcontrol_wait()
 
         H = self.H
         weight_bias = self.weight_bias
@@ -210,6 +217,10 @@ class FusedAddRMSNormKernel:
 
         cute.copy(copy_atom, tXrY, tYgX, pred=tXpX)
 
+        # PDL: Signal dependent kernels (SM90+ only)
+        if enable_pdl:
+            cute.arch.griddepcontrol_launch_dependents()
+
 
 # =============================================================================
 # FusedAddRMSNormQuantKernel
@@ -264,6 +275,7 @@ class FusedAddRMSNormQuantKernel:
         M: Int32,
         scale: Float32,
         eps: Float32,
+        enable_pdl: cutlass.Constexpr[bool],
         stream,
     ):
         tv_shape, tv_stride = make_tv_layout(
@@ -274,11 +286,14 @@ class FusedAddRMSNormQuantKernel:
         tv_layout = cute.make_layout(tv_shape, stride=tv_stride)
         tiler_mn = (1, self.cols_per_tile)
 
-        self.kernel(mY, mX, mR, mW, M, scale, eps, tv_layout, tiler_mn).launch(
+        self.kernel(
+            mY, mX, mR, mW, M, scale, eps, enable_pdl, tv_layout, tiler_mn
+        ).launch(
             grid=[M, 1, 1],
             block=[self.num_threads, 1, 1],
             smem=self._smem_size_in_bytes(),
             stream=stream,
+            use_pdl=enable_pdl,
         )
 
     @cute.kernel
@@ -291,11 +306,16 @@ class FusedAddRMSNormQuantKernel:
         M: Int32,
         scale: Float32,
         eps: Float32,
+        enable_pdl: cutlass.Constexpr[bool],
         tv_layout: cute.Layout,
         tiler_mn: cute.Shape,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
+
+        # PDL: Wait for previous kernel (SM90+ only)
+        if enable_pdl:
+            cute.arch.griddepcontrol_wait()
 
         H = self.H
         weight_bias = self.weight_bias
@@ -396,6 +416,10 @@ class FusedAddRMSNormQuantKernel:
                     out_ptr = get_ptr_as_int64(mY, Int32(out_offset))
                     cvt_and_store_f32_to_e4m3(clamped, out_ptr)
 
+        # PDL: Signal dependent kernels (SM90+ only)
+        if enable_pdl:
+            cute.arch.griddepcontrol_launch_dependents()
+
 
 # =============================================================================
 # Compiled Kernel Getters
@@ -403,7 +427,9 @@ class FusedAddRMSNormQuantKernel:
 
 
 @functools.cache
-def _get_compiled_fused_add_rmsnorm_kernel(dtype_str: str, H: int, weight_bias: float):
+def _get_compiled_fused_add_rmsnorm_kernel(
+    dtype_str: str, H: int, weight_bias: float, enable_pdl: bool
+):
     """Get a compiled Fused Add + RMSNorm kernel using TVM-FFI."""
     dtype = get_cutlass_dtype(dtype_str)
     kernel_obj = FusedAddRMSNormKernel(dtype, H, weight_bias)
@@ -429,6 +455,7 @@ def _get_compiled_fused_add_rmsnorm_kernel(dtype_str: str, H: int, weight_bias: 
         w_fake,
         Int32(1),
         Float32(1e-6),
+        enable_pdl,
         stream_fake,
         options="--enable-tvm-ffi",
     )
@@ -453,7 +480,7 @@ def _get_compiled_fused_add_rmsnorm_kernel(dtype_str: str, H: int, weight_bias: 
 
 @functools.cache
 def _get_compiled_fused_add_rmsnorm_quant_kernel(
-    dtype_str: str, out_dtype_str: str, H: int, weight_bias: float
+    dtype_str: str, out_dtype_str: str, H: int, weight_bias: float, enable_pdl: bool
 ):
     """Get a compiled Fused Add + RMSNorm + Quant kernel using TVM-FFI."""
     dtype = get_cutlass_dtype(dtype_str)
@@ -487,6 +514,7 @@ def _get_compiled_fused_add_rmsnorm_quant_kernel(
         Int32(1),
         Float32(1.0),  # scale
         Float32(1e-6),
+        enable_pdl,
         stream_fake,
         options="--enable-tvm-ffi",
     )
@@ -536,7 +564,9 @@ def fused_add_rmsnorm_cute(
     M = input.shape[0]
 
     dtype_str = _torch_dtype_to_str(input.dtype)
-    kernel = _get_compiled_fused_add_rmsnorm_kernel(dtype_str, H, weight_bias)
+    kernel = _get_compiled_fused_add_rmsnorm_kernel(
+        dtype_str, H, weight_bias, enable_pdl
+    )
     kernel(input, residual, weight, M, eps)
 
 
@@ -562,7 +592,7 @@ def fused_add_rmsnorm_quant_cute(
     dtype_str = _torch_dtype_to_str(input.dtype)
     out_dtype_str = _torch_dtype_to_str(out.dtype)
     kernel = _get_compiled_fused_add_rmsnorm_quant_kernel(
-        dtype_str, out_dtype_str, H, weight_bias
+        dtype_str, out_dtype_str, H, weight_bias, enable_pdl
     )
     kernel(
         out,

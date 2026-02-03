@@ -105,6 +105,7 @@ class RMSNormKernel:
         mY: cute.Tensor,
         M: Int32,
         eps: Float32,
+        enable_pdl: cutlass.Constexpr[bool],
         stream,
     ):
         """Launch the RMSNorm kernel."""
@@ -116,11 +117,12 @@ class RMSNormKernel:
         tv_layout = cute.make_layout(tv_shape, stride=tv_stride)
         tiler_mn = (1, self.cols_per_tile)
 
-        self.kernel(mX, mW, mY, M, eps, tv_layout, tiler_mn).launch(
+        self.kernel(mX, mW, mY, M, eps, enable_pdl, tv_layout, tiler_mn).launch(
             grid=[M, 1, 1],
             block=[self.num_threads, 1, 1],
             smem=self._smem_size_in_bytes(),
             stream=stream,
+            use_pdl=enable_pdl,
         )
 
     @cute.kernel
@@ -131,12 +133,17 @@ class RMSNormKernel:
         mY: cute.Tensor,
         M: Int32,
         eps: Float32,
+        enable_pdl: cutlass.Constexpr[bool],
         tv_layout: cute.Layout,
         tiler_mn: cute.Shape,
     ):
         """Device kernel for RMSNorm."""
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
+
+        # PDL: Wait for previous kernel (SM90+ only)
+        if enable_pdl:
+            cute.arch.griddepcontrol_wait()
 
         H = self.H
         weight_bias = self.weight_bias
@@ -217,6 +224,10 @@ class RMSNormKernel:
         tXrY.store(tYrY)
 
         cute.copy(copy_atom, tXrY, tXgY, pred=tXpX)
+
+        # PDL: Signal dependent kernels (SM90+ only)
+        if enable_pdl:
+            cute.arch.griddepcontrol_launch_dependents()
 
 
 # =============================================================================
@@ -496,6 +507,7 @@ class RMSNormQuantKernel:
         M: Int32,
         scale: Float32,
         eps: Float32,
+        enable_pdl: cutlass.Constexpr[bool],
         stream,
     ):
         tv_shape, tv_stride = make_tv_layout(
@@ -504,11 +516,12 @@ class RMSNormQuantKernel:
         tv_layout = cute.make_layout(tv_shape, stride=tv_stride)
         tiler_mn = (1, self.cols_per_tile)
 
-        self.kernel(mX, mW, mY, M, scale, eps, tv_layout, tiler_mn).launch(
+        self.kernel(mX, mW, mY, M, scale, eps, enable_pdl, tv_layout, tiler_mn).launch(
             grid=[M, 1, 1],
             block=[self.num_threads, 1, 1],
             smem=self._smem_size_in_bytes(),
             stream=stream,
+            use_pdl=enable_pdl,
         )
 
     @cute.kernel
@@ -520,11 +533,16 @@ class RMSNormQuantKernel:
         M: Int32,
         scale: Float32,
         eps: Float32,
+        enable_pdl: cutlass.Constexpr[bool],
         tv_layout: cute.Layout,
         tiler_mn: cute.Shape,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
+
+        # PDL: Wait for previous kernel (SM90+ only)
+        if enable_pdl:
+            cute.arch.griddepcontrol_wait()
 
         H = self.H
         weight_bias = self.weight_bias
@@ -602,6 +620,10 @@ class RMSNormQuantKernel:
                     out_ptr = get_ptr_as_int64(mY, Int32(out_offset))
                     cvt_and_store_f32_to_e4m3(clamped, out_ptr)
 
+        # PDL: Signal dependent kernels (SM90+ only)
+        if enable_pdl:
+            cute.arch.griddepcontrol_launch_dependents()
+
 
 # =============================================================================
 # Compiled Kernel Getters
@@ -609,7 +631,9 @@ class RMSNormQuantKernel:
 
 
 @functools.cache
-def _get_compiled_rmsnorm_kernel(dtype_str: str, H: int, weight_bias: float):
+def _get_compiled_rmsnorm_kernel(
+    dtype_str: str, H: int, weight_bias: float, enable_pdl: bool
+):
     """Get a compiled RMSNorm kernel using TVM-FFI."""
     dtype = get_cutlass_dtype(dtype_str)
     kernel_obj = RMSNormKernel(dtype, H, weight_bias)
@@ -640,6 +664,7 @@ def _get_compiled_rmsnorm_kernel(dtype_str: str, H: int, weight_bias: float):
         y_fake,
         Int32(1),  # Dummy M
         Float32(1e-6),  # Dummy eps
+        enable_pdl,
         stream_fake,
         options="--enable-tvm-ffi",
     )
@@ -664,7 +689,7 @@ def _get_compiled_rmsnorm_kernel(dtype_str: str, H: int, weight_bias: float):
 
 @functools.cache
 def _get_compiled_qk_rmsnorm_kernel(
-    dtype_str: str, head_dim: int, weight_bias: float, num_warps: int
+    dtype_str: str, head_dim: int, weight_bias: float, num_warps: int, enable_pdl: bool
 ):
     """Get a compiled QKRMSNorm kernel for 3D tensors with arbitrary stride."""
     dtype = get_cutlass_dtype(dtype_str)
@@ -707,7 +732,7 @@ def _get_compiled_qk_rmsnorm_kernel(
         Int32(1),  # Dummy B
         Int32(1),  # Dummy N
         Float32(1e-6),  # Dummy eps
-        False,  # enable_pdl
+        enable_pdl,
         Int32(1),  # Dummy num_blocks
         stream_fake,
         options="--enable-tvm-ffi",
@@ -737,7 +762,7 @@ def _get_compiled_qk_rmsnorm_kernel(
 
 @functools.cache
 def _get_compiled_rmsnorm_quant_kernel(
-    dtype_str: str, out_dtype_str: str, H: int, weight_bias: float
+    dtype_str: str, out_dtype_str: str, H: int, weight_bias: float, enable_pdl: bool
 ):
     """Get a compiled RMSNorm + Quant kernel using TVM-FFI."""
     dtype = get_cutlass_dtype(dtype_str)
@@ -766,6 +791,7 @@ def _get_compiled_rmsnorm_quant_kernel(
         Int32(1),
         Float32(1.0),  # scale
         Float32(1e-6),  # eps
+        enable_pdl,
         stream_fake,
         options="--enable-tvm-ffi",
     )
@@ -819,7 +845,7 @@ def rmsnorm_cute(
         out_2d = out
 
     dtype_str = _torch_dtype_to_str(input.dtype)
-    kernel = _get_compiled_rmsnorm_kernel(dtype_str, H, weight_bias)
+    kernel = _get_compiled_rmsnorm_kernel(dtype_str, H, weight_bias, enable_pdl)
     kernel(input_2d, weight, out_2d, M, eps)
 
 
@@ -862,7 +888,7 @@ def qk_rmsnorm_cute(
 
     dtype_str = _torch_dtype_to_str(input.dtype)
     kernel = _get_compiled_qk_rmsnorm_kernel(
-        dtype_str, head_dim, weight_bias, num_warps
+        dtype_str, head_dim, weight_bias, num_warps, enable_pdl
     )
 
     # Pass 3D tensors directly - kernel handles arbitrary stride
@@ -890,7 +916,7 @@ def rmsnorm_quant_cute(
     dtype_str = _torch_dtype_to_str(input.dtype)
     out_dtype_str = _torch_dtype_to_str(out.dtype)
     kernel = _get_compiled_rmsnorm_quant_kernel(
-        dtype_str, out_dtype_str, H, weight_bias
+        dtype_str, out_dtype_str, H, weight_bias, enable_pdl
     )
     kernel(out, input, weight, M, scale, eps)
 
