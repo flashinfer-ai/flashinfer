@@ -87,5 +87,5 @@ def gen_gdn_prefill_sm90_module() -> JitSpec:
         uri,
         source_paths,
         extra_cuda_cflags=sm90a_nvcc_flags + ["-DFLAT_SM90A_ENABLED", "-std=c++20"],
-        extra_include_paths=[jit_env.FLASHINFER_CSRC_DIR],
+        extra_include_paths=[gen_directory, jit_env.FLASHINFER_CSRC_DIR],
     )

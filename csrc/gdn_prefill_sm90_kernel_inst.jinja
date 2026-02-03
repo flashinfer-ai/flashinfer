@@ -17,13 +17,12 @@
 // Template parameters: dtype={{ dtype }}, is_gva={{ is_gva }}, needs_beta={{ needs_beta }},
 //                      needs_alpha={{ needs_alpha }}, init_state={{ init_state }}
 
+// CUDA type definitions for half and nv_bfloat16
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
-// Ensure cutlass arch types are defined
-#include "cutlass/arch/arch.h"
-
-// Use relative include since the header is copied to the same directory
+// Include the header which defines the function template
+// The header includes all necessary CUTLASS type definitions
 #include "prefill_kernel_delta_rule_sm90.cuh"
 
 namespace flat {
