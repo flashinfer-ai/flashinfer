@@ -368,7 +368,7 @@ mpirun -np 8 python benchmarks/flashinfer_benchmark.py \
 | `--rotary_dim`           | Rotary dimension (defaults to head_dim if not specified)                                                   |
 | `--no_rope_dim`          | Number of dimensions without RoPE (for MLA). Default: 0                                                    |
 | `--input_dtype`          | Input data type: `float16` (default) or `bfloat16`                                                         |
-| `--quant_dtype`          | Quantized data type for FP8 routines: `float8_e4m3fn` (default) or `float8_e5m2`                           |
+| `--quant_dtype`          | Quantized data type for FP8 routines: `fp8_e4m3` (default) or `fp8_e5m2`                                   |
 | `--rope_scale`           | RoPE scaling factor. Default: 1.0                                                                          |
 | `--rope_theta`           | RoPE theta base frequency. Default: 10000.0                                                                |
 | `--interleave`           | Use interleaved rotary embedding (GPT-J style)                                                             |

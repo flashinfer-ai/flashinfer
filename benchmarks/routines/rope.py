@@ -127,8 +127,8 @@ def parse_rope_args(line, parser):
         "--quant_dtype",
         type=str,
         required=False,
-        default="float8_e4m3fn",
-        choices=["float8_e4m3fn", "float8_e5m2"],
+        default="fp8_e4m3",
+        choices=["fp8_e4m3", "fp8_e5m2"],
         help="Quantized data type for FP8 routines.",
     )
     parser.add_argument(

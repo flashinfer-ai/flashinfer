@@ -238,12 +238,12 @@
 --routine apply_rope_with_cos_sin_cache --batch_size 32 --seq_len 2048 --num_qo_heads 64 --num_kv_heads 8 --head_dim 128 --input_dtype bfloat16 --interleave -vv --generate_repro_command --case_tag "apply_rope_cos_sin_cache_interleave"
 
 # MLA RoPE with FP8 quantization (SM8.9+ required)
---routine mla_rope_quantize_fp8 --batch_size 16 --seq_len 1024 --num_qo_heads 128 --num_kv_heads 128 --head_dim 192 --no_rope_dim 64 --input_dtype bfloat16 --quant_dtype float8_e4m3fn -vv --generate_repro_command --case_tag "mla_rope_fp8_deepseek"
+--routine mla_rope_quantize_fp8 --batch_size 16 --seq_len 1024 --num_qo_heads 128 --num_kv_heads 128 --head_dim 192 --no_rope_dim 64 --input_dtype bfloat16 --quant_dtype fp8_e4m3 -vv --generate_repro_command --case_tag "mla_rope_fp8_deepseek"
 
 # RoPE with FP8 quantization (SM8.9+ required)
---routine rope_quantize_fp8 --batch_size 16 --seq_len 1024 --num_qo_heads 32 --num_kv_heads 8 --head_dim 128 --input_dtype bfloat16 --quant_dtype float8_e4m3fn -vv --generate_repro_command --case_tag "rope_fp8_llama"
---routine rope_quantize_fp8 --batch_size 32 --seq_len 2048 --num_qo_heads 64 --num_kv_heads 8 --head_dim 128 --input_dtype bfloat16 --quant_dtype float8_e4m3fn -vv --generate_repro_command --case_tag "rope_fp8_llama70b"
+--routine rope_quantize_fp8 --batch_size 16 --seq_len 1024 --num_qo_heads 32 --num_kv_heads 8 --head_dim 128 --input_dtype bfloat16 --quant_dtype fp8_e4m3 -vv --generate_repro_command --case_tag "rope_fp8_llama"
+--routine rope_quantize_fp8 --batch_size 32 --seq_len 2048 --num_qo_heads 64 --num_kv_heads 8 --head_dim 128 --input_dtype bfloat16 --quant_dtype fp8_e4m3 -vv --generate_repro_command --case_tag "rope_fp8_llama70b"
 
 # RoPE with FP8 quantization and paged KV cache append (SM8.9+ required)
---routine rope_quantize_fp8_append_paged_kv_cache --batch_size 16 --seq_len 64 --num_qo_heads 32 --num_kv_heads 8 --head_dim 128 --page_size 16 --kv_layout NHD --input_dtype bfloat16 --quant_dtype float8_e4m3fn -vv --generate_repro_command --case_tag "rope_fp8_paged_kv"
---routine rope_quantize_fp8_append_paged_kv_cache --batch_size 32 --seq_len 64 --num_qo_heads 64 --num_kv_heads 8 --head_dim 128 --page_size 16 --kv_layout HND --input_dtype bfloat16 --quant_dtype float8_e4m3fn -vv --generate_repro_command --case_tag "rope_fp8_paged_kv_hnd"
+--routine rope_quantize_fp8_append_paged_kv_cache --batch_size 16 --seq_len 64 --num_qo_heads 32 --num_kv_heads 8 --head_dim 128 --page_size 16 --kv_layout NHD --input_dtype bfloat16 --quant_dtype fp8_e4m3 -vv --generate_repro_command --case_tag "rope_fp8_paged_kv"
+--routine rope_quantize_fp8_append_paged_kv_cache --batch_size 32 --seq_len 64 --num_qo_heads 64 --num_kv_heads 8 --head_dim 128 --page_size 16 --kv_layout HND --input_dtype bfloat16 --quant_dtype fp8_e4m3 -vv --generate_repro_command --case_tag "rope_fp8_paged_kv_hnd"

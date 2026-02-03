@@ -14,11 +14,8 @@ output_column_dict = {
         "backend",
     ],
     "attention": [
-        "page_size",
         "s_qo",
         "s_kv",
-        "num_qo_heads",
-        "num_kv_heads",
         "head_dim_qk",
         "head_dim_vo",
         "head_dim_ckv",
@@ -30,9 +27,7 @@ output_column_dict = {
         "random_actual_seq_len",
     ],
     "gemm": [
-        "m",
         "n",
-        "k",
         "group_size",
         "tile_size",
         "scale_major_mode",
@@ -67,28 +62,19 @@ output_column_dict = {
     ],
     "moe_comm": [
         "num_tokens",
-        "hidden_size",
         "num_experts",
         "top_k",
         "ep_size",
-        "input_dtype",
-        "quant_dtype",
         "max_num_tokens",
     ],
     "norm": [
         "num_heads",
         "scale",
         "eps",
-        "enable_pdl",
         "use_global_scale",
-        "is_sf_swizzled_layout",
     ],
     "quantization": [
-        "m",
-        "k",
-        "is_sf_swizzled_layout",
         "alignment",
-        "enable_pdl",
         "global_scale",
         "sf_layout",
         "do_shuffle",
@@ -107,16 +93,12 @@ output_column_dict = {
     ],
     "rope": [
         "seq_len",
-        "num_qo_heads",
-        "num_kv_heads",
         "head_dim",
         "rotary_dim",
         "no_rope_dim",
         "rope_theta",
         "rope_scale",
         "interleave",
-        "quant_dtype",
-        "page_size",
         "kv_layout",
     ],
     "general": [
@@ -124,6 +106,14 @@ output_column_dict = {
         "hidden_size",
         "input_dtype",
         "out_dtype",
+        "quant_dtype",
+        "m",
+        "k",
+        "num_qo_heads",
+        "num_kv_heads",
+        "page_size",
+        "enable_pdl",
+        "is_sf_swizzled_layout",
         "refcheck",
         "no_cuda_graph",
         "use_cupti",
@@ -256,10 +246,6 @@ def dtype_str_to_torch_dtype(dtype_str):
     elif dtype_str == "fp8_e4m3":
         return torch.float8_e4m3fn
     elif dtype_str == "fp8_e5m2":
-        return torch.float8_e5m2
-    elif dtype_str == "float8_e4m3fn":
-        return torch.float8_e4m3fn
-    elif dtype_str == "float8_e5m2":
         return torch.float8_e5m2
     else:
         raise ValueError(f"Unsupported dtype: {dtype_str}")
