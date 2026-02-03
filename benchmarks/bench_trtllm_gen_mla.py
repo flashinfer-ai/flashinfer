@@ -82,7 +82,7 @@ def bench_trtllm_mla(batch_size, q_len_per_request, seq_len, page_size, dtype):
         bmm1_scale=1.0 / ((128 + 64) ** 0.5),
         bmm2_scale=1.0,
     )
-    # benchmark using CUPTI
+    # benchmark
     measurements = bench_gpu_time(
         lambda: flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
             query=query,
