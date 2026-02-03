@@ -971,6 +971,7 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
     bool use_precomputed = expert_indices.ndim() == 2 && expert_indices.size(0) > 0;
     // When using pre-computed routing, pass nullptr as routing_logits to tell the
     // routing runner to use the pre-computed expert indices from workspace.routing_expert_indexes
+    // FP8 only supports Mode 1 (FromLogits) and Mode 2 (PackedPrecomputed), so expertIds is nullptr
     routing_runner.run(
         use_precomputed ? nullptr : args->routing_logits, args->routing_bias, args->num_tokens,
         args->num_experts, args->top_k, args->n_group, args->topk_group, args->local_expert_offset,
@@ -979,8 +980,9 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
         static_cast<int*>(total_num_padded_tokens.data_ptr()),
         static_cast<int*>(expanded_idx_to_permuted_idx.data_ptr()),
         nullptr /*permuted_idx_to_expanded_idx.data_ptr()*/,
-        static_cast<int*>(permuted_idx_to_token_idx.data_ptr()), workspace.expert_weights,
-        static_cast<int*>(num_tokens_per_expert.data_ptr()),
+        static_cast<int*>(permuted_idx_to_token_idx.data_ptr()),
+        nullptr,  // expertIds - FP8 doesn't support UnpackedPrecomputed mode
+        workspace.expert_weights, static_cast<int*>(num_tokens_per_expert.data_ptr()),
         static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr()),
         static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr()),
         static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt, mRoutingBiasDtype,
