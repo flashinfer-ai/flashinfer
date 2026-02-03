@@ -1,5 +1,5 @@
 """
-Copyright (c) 2025 by FlashInfer team.
+Copyright (c) 2026 by FlashInfer team.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -320,8 +320,10 @@ def testSamplingFromProbs(args):
     backends = args.backends[:]
     batch_size = args.batch_size
     vocab_size = args.vocab_size
-    # Sampling functions with RNG are not CUDA graph compatible
-    is_cuda_graph_compatible = False
+    # Use explicit seed/offset to enable CUDA graph compatibility
+    seed = args.random_seed
+    offset = 0
+    is_cuda_graph_compatible = not args.no_cuda_graph
     res = []
 
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
@@ -339,7 +341,9 @@ def testSamplingFromProbs(args):
 
     def run_backend(backend, probs):
         if backend == "cuda":
-            return flashinfer.sampling.sampling_from_probs(probs)
+            return flashinfer.sampling.sampling_from_probs(
+                probs, seed=seed, offset=offset
+            )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
 
@@ -415,8 +419,10 @@ def testSamplingFromLogits(args):
     backends = args.backends[:]
     batch_size = args.batch_size
     vocab_size = args.vocab_size
-    # Sampling functions with RNG are not CUDA graph compatible
-    is_cuda_graph_compatible = False
+    # Use explicit seed/offset to enable CUDA graph compatibility
+    seed = args.random_seed
+    offset = 0
+    is_cuda_graph_compatible = not args.no_cuda_graph
     res = []
 
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
@@ -435,7 +441,9 @@ def testSamplingFromLogits(args):
 
     def run_backend(backend, logits):
         if backend == "cuda":
-            return flashinfer.sampling.sampling_from_logits(logits)
+            return flashinfer.sampling.sampling_from_logits(
+                logits, seed=seed, offset=offset
+            )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
 
@@ -512,8 +520,10 @@ def testTopKSamplingFromProbs(args):
     batch_size = args.batch_size
     vocab_size = args.vocab_size
     top_k = args.top_k
-    # Sampling functions with RNG are not CUDA graph compatible
-    is_cuda_graph_compatible = False
+    # Use explicit seed/offset to enable CUDA graph compatibility
+    seed = args.random_seed
+    offset = 0
+    is_cuda_graph_compatible = not args.no_cuda_graph
     res = []
 
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
@@ -532,7 +542,9 @@ def testTopKSamplingFromProbs(args):
 
     def run_backend(backend, probs):
         if backend == "cuda":
-            return flashinfer.sampling.top_k_sampling_from_probs(probs, top_k)
+            return flashinfer.sampling.top_k_sampling_from_probs(
+                probs, top_k, seed=seed, offset=offset
+            )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
 
@@ -610,8 +622,10 @@ def testTopPSamplingFromProbs(args):
     batch_size = args.batch_size
     vocab_size = args.vocab_size
     top_p = args.top_p
-    # Sampling functions with RNG are not CUDA graph compatible
-    is_cuda_graph_compatible = False
+    # Use explicit seed/offset to enable CUDA graph compatibility
+    seed = args.random_seed
+    offset = 0
+    is_cuda_graph_compatible = not args.no_cuda_graph
     res = []
 
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
@@ -630,7 +644,9 @@ def testTopPSamplingFromProbs(args):
 
     def run_backend(backend, probs):
         if backend == "cuda":
-            return flashinfer.sampling.top_p_sampling_from_probs(probs, top_p)
+            return flashinfer.sampling.top_p_sampling_from_probs(
+                probs, top_p, seed=seed, offset=offset
+            )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
 
@@ -710,8 +726,10 @@ def testTopKTopPSamplingFromProbs(args):
     top_k = args.top_k
     top_p = args.top_p
     filter_apply_order = args.filter_apply_order
-    # Sampling functions with RNG are not CUDA graph compatible
-    is_cuda_graph_compatible = False
+    # Use explicit seed/offset to enable CUDA graph compatibility
+    seed = args.random_seed
+    offset = 0
+    is_cuda_graph_compatible = not args.no_cuda_graph
     res = []
 
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
@@ -733,7 +751,12 @@ def testTopKTopPSamplingFromProbs(args):
     def run_backend(backend, probs):
         if backend == "cuda":
             return flashinfer.sampling.top_k_top_p_sampling_from_probs(
-                probs, top_k, top_p, filter_apply_order=filter_apply_order
+                probs,
+                top_k,
+                top_p,
+                filter_apply_order=filter_apply_order,
+                seed=seed,
+                offset=offset,
             )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
@@ -816,8 +839,10 @@ def testTopKTopPSamplingFromLogits(args):
     top_k = args.top_k
     top_p = args.top_p
     filter_apply_order = args.filter_apply_order
-    # Sampling functions with RNG are not CUDA graph compatible
-    is_cuda_graph_compatible = False
+    # Use explicit seed/offset to enable CUDA graph compatibility
+    seed = args.random_seed
+    offset = 0
+    is_cuda_graph_compatible = not args.no_cuda_graph
     res = []
 
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
@@ -840,7 +865,12 @@ def testTopKTopPSamplingFromLogits(args):
     def run_backend(backend, logits):
         if backend == "cuda":
             return flashinfer.sampling.top_k_top_p_sampling_from_logits(
-                logits, top_k, top_p, filter_apply_order=filter_apply_order
+                logits,
+                top_k,
+                top_p,
+                filter_apply_order=filter_apply_order,
+                seed=seed,
+                offset=offset,
             )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
@@ -921,8 +951,10 @@ def testMinPSamplingFromProbs(args):
     batch_size = args.batch_size
     vocab_size = args.vocab_size
     min_p = args.min_p
-    # Sampling functions with RNG are not CUDA graph compatible
-    is_cuda_graph_compatible = False
+    # Use explicit seed/offset to enable CUDA graph compatibility
+    seed = args.random_seed
+    offset = 0
+    is_cuda_graph_compatible = not args.no_cuda_graph
     res = []
 
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
@@ -941,7 +973,9 @@ def testMinPSamplingFromProbs(args):
 
     def run_backend(backend, probs):
         if backend == "cuda":
-            return flashinfer.sampling.min_p_sampling_from_probs(probs, min_p)
+            return flashinfer.sampling.min_p_sampling_from_probs(
+                probs, min_p, seed=seed, offset=offset
+            )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
 
@@ -1313,8 +1347,10 @@ def testChainSpeculativeSampling(args):
     batch_size = args.batch_size
     vocab_size = args.vocab_size
     num_speculate_tokens = args.num_speculate_tokens
-    # Sampling functions with RNG are not CUDA graph compatible
-    is_cuda_graph_compatible = False
+    # Use explicit seed/offset to enable CUDA graph compatibility
+    seed = args.random_seed
+    offset = 0
+    is_cuda_graph_compatible = not args.no_cuda_graph
     res = []
 
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
@@ -1349,7 +1385,7 @@ def testChainSpeculativeSampling(args):
     def run_backend(backend, draft_probs, draft_token_ids, target_probs):
         if backend == "cuda":
             return flashinfer.sampling.chain_speculative_sampling(
-                draft_probs, draft_token_ids, target_probs
+                draft_probs, draft_token_ids, target_probs, seed=seed, offset=offset
             )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
