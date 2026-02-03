@@ -20,7 +20,7 @@
 #include "cute/tensor.hpp"
 #include "cutlass/cutlass.h"
 #include "cutlass/epilogue/collective/collective_builder.hpp"
-#include "flat/cute_ext.hpp"
+#include "flashinfer/flat/cute_ext.hpp"
 
 namespace flat::collective {
 

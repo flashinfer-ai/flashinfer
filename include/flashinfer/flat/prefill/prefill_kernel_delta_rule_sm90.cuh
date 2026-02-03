@@ -21,9 +21,9 @@
 #include "cutlass/cutlass.h"
 #include "cutlass/kernel_hardware_info.h"
 #include "cutlass/util/device_memory.h"
-#include "flat/common.hpp"
-#include "flat/hopper/device/device_universal.hpp"
-#include "flat/hopper/kernel/flat_kernel_builder_delta_rule.hpp"
+#include "flashinfer/flat/common.hpp"
+#include "flashinfer/flat/hopper/device/device_universal.hpp"
+#include "flashinfer/flat/hopper/kernel/flat_kernel_builder_delta_rule.hpp"
 
 namespace flat {
 

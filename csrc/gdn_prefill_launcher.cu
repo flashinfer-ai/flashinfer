@@ -25,7 +25,7 @@
 #include <iostream>
 #include <sstream>
 
-#include "flat/prefill/prefill_kernel.hpp"
+#include "flashinfer/flat/prefill/prefill_kernel.hpp"
 
 using tvm::ffi::Optional;
 using tvm::ffi::TensorView;

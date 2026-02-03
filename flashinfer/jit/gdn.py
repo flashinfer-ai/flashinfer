@@ -65,7 +65,8 @@ def gen_gdn_prefill_sm90_module() -> JitSpec:
             )
             write_if_different(dest_path, source)
 
-    # Copy source files to gen_directory (like POD module does)
+    # Copy source files to gen_directory for compilation
+    # Headers are now in include/flashinfer/flat/ and accessible via standard include paths
     for filename in [
         "gdn_prefill_launcher.cu",
         "flat/prefill/prefill_kernel_delta_rule_sm90.cu",
@@ -75,17 +76,8 @@ def gen_gdn_prefill_sm90_module() -> JitSpec:
         source_paths.append(dest_path)
         write_if_different(dest_path, src_path.read_text())
 
-    # Copy header files so relative includes work
-    for filename in [
-        "flat/prefill/prefill_kernel_delta_rule_sm90.cuh",
-        "flat/prefill/prefill_kernel_delta_rule_sm90_extern.inc",
-    ]:
-        src_path = jit_env.FLASHINFER_CSRC_DIR / filename
-        write_if_different(gen_directory / src_path.name, src_path.read_text())
-
     return gen_jit_spec(
         uri,
         source_paths,
         extra_cuda_cflags=sm90a_nvcc_flags + ["-DFLAT_SM90A_ENABLED", "-std=c++20"],
-        extra_include_paths=[gen_directory, jit_env.FLASHINFER_CSRC_DIR],
     )

@@ -15,11 +15,11 @@
  */
 #include <cuda_bf16.h>
 
-#include "prefill_kernel_delta_rule_sm90.cuh"
+#include "flashinfer/flat/prefill/prefill_kernel_delta_rule_sm90.cuh"
 
 // Extern template declarations prevent implicit instantiation here.
 // Explicit instantiations are in separate generated files for parallel compilation.
-#include "prefill_kernel_delta_rule_sm90_extern.inc"
+#include "flat_prefill_kernel_delta_rule_sm90_extern.inc"
 
 namespace flat {
 
