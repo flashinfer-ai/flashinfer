@@ -2,7 +2,7 @@ import numpy as np
 import torch
 
 import flashinfer
-from flashinfer.testing.utils import bench_gpu_time_with_cudagraph
+from flashinfer.testing.utils import bench_gpu_time
 
 num_q_heads = 128
 qk_nope_head_dim = 128
@@ -29,6 +29,7 @@ def bench_trtllm_mla(batch_size, q_len_per_request, seq_len, page_size, dtype):
     # Sequence lengths and block tables
     seq_lens = [torch.randint(1, seq_len, (1,)).item() for _ in range(batch_size)]
     seq_lens[-1] = seq_len
+    print(f"Average sequence length: {np.mean(seq_lens)}")
     max_seq_len = max(seq_lens)
     seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int, device=device)
 
@@ -82,8 +83,8 @@ def bench_trtllm_mla(batch_size, q_len_per_request, seq_len, page_size, dtype):
         bmm1_scale=1.0 / ((128 + 64) ** 0.5),
         bmm2_scale=1.0,
     )
-    # benchmark
-    measurements = bench_gpu_time_with_cudagraph(
+    # benchmark using CUPTI
+    measurements = bench_gpu_time(
         lambda: flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
             query=query,
             kv_cache=kv_cache.unsqueeze(1),
@@ -97,35 +98,53 @@ def bench_trtllm_mla(batch_size, q_len_per_request, seq_len, page_size, dtype):
             bmm1_scale=1.0 / ((128 + 64) ** 0.5),
             bmm2_scale=1.0,
         ),
-        dry_run_time_ms=100,
-        repeat_time_ms=1000,
-    )
-    io = (
-        query.numel() * query.element_size()
-        + kv_cache.numel() * kv_cache.element_size()
+        dry_run_iters=5,
+        repeat_iters=30,
+        enable_cupti=True,
+        use_cuda_graph=False,
+        cold_l2_cache=True,
     )
     ms = np.median(measurements)
+
+    # Memory bandwidth calculation based on actual bytes accessed
+    elem_size = query.element_size()
+    # Query bytes: batch_size * q_len_per_request * num_heads * head_dim
+    q_mem_bytes = query.numel() * elem_size
+    # KV cache bytes: actual tokens accessed (sum of seq_lens), not full allocation
+    actual_kv_tokens = sum(seq_lens)
+    kv_mem_bytes = actual_kv_tokens * (kv_lora_rank + qk_rope_head_dim) * elem_size
+    # Output bytes: batch_size * q_len_per_request * num_heads * kv_lora_rank
+    o_mem_bytes = (
+        batch_size * q_len_per_request * num_q_heads * kv_lora_rank * elem_size
+    )
+    total_mem_bytes = q_mem_bytes + kv_mem_bytes + o_mem_bytes
+
     flops = (
         2
         * num_q_heads
         * (2 * kv_lora_rank + qk_rope_head_dim)
-        * sum(seq_lens)
+        * actual_kv_tokens
         * q_len_per_request
     )
     print(
         f"batch_size={batch_size}, q_len_per_request={q_len_per_request}, seq_len={seq_len}, num_q_heads={num_q_heads}, qk_nope_head_dim={qk_nope_head_dim}, qk_rope_head_dim={qk_rope_head_dim}, kv_lora_rank={kv_lora_rank}, page_size={page_size}"
     )
     print(f"execution time: {ms} ms")
-    print(f"memory bandwidth: {io / ms / 1024 / 1024:.2f} GB/s")
-    print(f"FLOPs: {flops * 1e-9 / ms:.2f} TFLOPs/s")
+    print(f"memory bandwidth: {total_mem_bytes / ms / 1e12:.2f} TB/s")
+    print(f"FLOPs: {flops / ms / 1e9:.2f} TFLOPs/s")
 
 
 if __name__ == "__main__":
-    for dtype in [torch.bfloat16, torch.float8_e4m3fn]:
-        for page_size in [32, 64]:
-            for batch_size in [1, 2, 4, 16, 32, 64, 128, 256, 512, 768, 1024]:
-                for seq_len in [1024, 4096, 8192]:
-                    for q_len_per_request in [1, 2, 4, 8, 16]:
+    # for dtype in [torch.bfloat16, torch.float8_e4m3fn]:
+    for dtype in [torch.float8_e4m3fn]:
+        # for page_size in [32, 64]:
+        for page_size in [64]:
+            # for batch_size in [1, 2, 4, 16, 32, 64, 128, 256, 512, 768, 1024]:
+            for batch_size in [1024]:
+                # for seq_len in [1024, 4096, 8192]:
+                for seq_len in [8192]:
+                    # for q_len_per_request in [1, 2, 4, 8, 16]:
+                    for q_len_per_request in [1]:
                         bench_trtllm_mla(
                             batch_size, q_len_per_request, seq_len, page_size, dtype
                         )
