@@ -129,7 +129,7 @@ def bench_trtllm_mla(batch_size, q_len_per_request, seq_len, page_size, dtype):
         f"batch_size={batch_size}, q_len_per_request={q_len_per_request}, seq_len={seq_len}, num_q_heads={num_q_heads}, qk_nope_head_dim={qk_nope_head_dim}, qk_rope_head_dim={qk_rope_head_dim}, kv_lora_rank={kv_lora_rank}, page_size={page_size}"
     )
     print(f"execution time: {ms} ms")
-    print(f"memory bandwidth: {total_mem_bytes / ms / 1e12:.2f} TB/s")
+    print(f"memory bandwidth: {total_mem_bytes / ms / 1e9:.2f} TB/s")
     print(f"FLOPs: {flops / ms / 1e9:.2f} TFLOPs/s")
 
 
