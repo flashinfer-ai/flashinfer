@@ -23,8 +23,8 @@
 // Ensure cutlass arch types are defined
 #include "cutlass/arch/arch.h"
 
-// Use full path since generated files are in a different directory
-#include "flat/prefill/prefill_kernel_delta_rule_sm90.cuh"
+// Use relative include since the header is copied to the same directory
+#include "prefill_kernel_delta_rule_sm90.cuh"
 
 namespace flat {
 
