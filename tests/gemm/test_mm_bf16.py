@@ -12,7 +12,7 @@ from flashinfer.utils import get_compute_capability
 @pytest.mark.parametrize("res_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("enable_bias", [True, False])
 @pytest.mark.parametrize("pdl", [True, False])
-@pytest.mark.parametrize("backend", ["cutlass", "tgv"])
+@pytest.mark.parametrize("backend", ["cudnn", "cutlass", "tgv"])
 def test_mm_bf16(
     m: int,
     n: int,
@@ -29,7 +29,13 @@ def test_mm_bf16(
             f"mm_bf16 not supported on current compute capability."
             f"Detected sm{compute_capability_number}."
         )
+    if not mm_bf16.is_backend_supported(backend, compute_capability_number):
+        pytest.skip(f"{backend} backend not supported on current compute capability.")
 
+    if backend == "cudnn" and (enable_bias or pdl):
+        pytest.skip(
+            "mm_bf16 with cuDNN backend does not support bias or pdl arguments."
+        )
     if backend == "cutlass" and (enable_bias or pdl):
         pytest.skip(
             "mm_bf16 with CUTLASS backend does not support bias or pdl arguments."
@@ -38,6 +44,13 @@ def test_mm_bf16(
         pytest.skip(
             "mm_bf16 with TGV backend does not support specifying non-bfloat16 result dtypes."
         )
+    # cuDNN on SM103 does not support bf16 input -> fp16 output
+    if (
+        backend == "cudnn"
+        and compute_capability_number == 103
+        and res_dtype == torch.float16
+    ):
+        pytest.skip("cuDNN bf16 GEMM with fp16 output not supported on SM103.")
 
     torch.manual_seed(42)
     input = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)

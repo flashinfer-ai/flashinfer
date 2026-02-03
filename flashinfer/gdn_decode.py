@@ -90,10 +90,43 @@ SMALL_BATCH_THRESHOLD_NT = 32
 # ============================================================================
 # Global configuration for MTP (Multiple Token Processing) version
 # ============================================================================
-TILE_V_MTP = 8
-TILE_K_MTP = 128
-NUM_STAGES_MTP = 2
-NUM_THREADS_MTP = 128  # 4 warps
+# Dynamic kernel selection based on batch size:
+# - Small batch (B <= threshold): Use smaller TILE_V for more parallelism
+# Optimal TILE_V depends on batch size (empirically determined):
+#   B=1-2: TILE_V=4  (more blocks, better parallelism for tiny batches)
+#   B=4:   TILE_V=8  (intermediate parallelism)
+#   B=8:   TILE_V=16 (balance between parallelism and efficiency)
+#   B>=16: TILE_V=32 (fewer blocks, better efficiency for large batches)
+
+TILE_K_MTP = 128  # Full K dimension (shared across all configs)
+NUM_THREADS_MTP = 128  # 4 warps (shared across all configs)
+
+
+def get_vec_size_mtp(batch_size: int, seq_len: int = 1) -> int:
+    """Select vec_size for MTP kernel.
+
+    Always use vec_size=4 (32 threads per group = full warp, 4 groups per block).
+    Full warp shuffle is more efficient and achieves >= 1.0x speedup vs Triton.
+    """
+    return 4
+
+
+def get_tile_v_mtp(batch_size: int, seq_len: int = 1) -> int:
+    """Select optimal TILE_V for MTP kernel based on batch size and sequence length.
+
+    With vec_size=4, num_groups=4, rows_per_group = tile_v / 4.
+    Tuned via grid search for optimal performance.
+    """
+    if batch_size <= 2:
+        return 4  # Small batch needs max parallelism
+    elif batch_size <= 4:
+        return 8
+    elif batch_size <= 8:
+        return 16
+    elif batch_size <= 16:
+        return 32
+    else:
+        return 64
 
 
 @cute.kernel
@@ -169,6 +202,19 @@ def gdn_decode_kernel_small_batch_pretranspose(
     r_h = cute.make_rmem_tensor(
         cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32
     )
+    # BF16 register tensors for vectorized q, k, v loading
+    r_q_bf16 = cute.make_rmem_tensor(
+        cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16
+    )
+    r_k_bf16 = cute.make_rmem_tensor(
+        cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16
+    )
+    r_v_bf16 = cute.make_rmem_tensor(
+        cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16
+    )
+
+    # Compute k_start for contiguous access pattern
+    k_start = lane_id * vec_size
 
     cute.arch.barrier()
 
@@ -201,12 +247,22 @@ def gdn_decode_kernel_small_batch_pretranspose(
         cute.copy(tiled_copy_load, thr_gSrc, thr_sData)
         cute.arch.cp_async_commit_group()
 
-    for i in range(vec_size):
-        r_q[i] = cutlass.Float32(q[i_n, i_t, i_h, i * 32 + lane_id])
-        r_k[i] = cutlass.Float32(k[i_n, i_t, i_h, i * 32 + lane_id])
-        # Store v to shared memory instead of register
-        v_val = cutlass.Float32(v[i_n, i_t, i_hv, i * 32 + lane_id])
-        sV[i * 32 + lane_id] = v_val
+    # Load q, k into BF16 registers using autovec_copy (contiguous pattern)
+    q_tile = cute.local_tile(q, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane_id))
+    k_tile = cute.local_tile(k, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane_id))
+    cute.autovec_copy(q_tile, r_q_bf16)
+    cute.autovec_copy(k_tile, r_k_bf16)
+
+    # Convert BF16 to FP32
+    for i in cutlass.range_constexpr(vec_size):
+        r_q[i] = cutlass.Float32(r_q_bf16[i])
+        r_k[i] = cutlass.Float32(r_k_bf16[i])
+
+    # Load v into BF16 registers using autovec_copy, convert to FP32, store to sV
+    v_tile = cute.local_tile(v, (1, 1, 1, vec_size), (i_n, i_t, i_hv, lane_id))
+    cute.autovec_copy(v_tile, r_v_bf16)
+    for i in cutlass.range_constexpr(vec_size):
+        sV[k_start + i] = cutlass.Float32(r_v_bf16[i])
 
     cute.arch.barrier()  # Ensure all threads finish writing to sV
 
@@ -223,9 +279,9 @@ def gdn_decode_kernel_small_batch_pretranspose(
         if beta_x <= softplus_threshold:
             # softplus(x) = (1/beta) * log(1 + exp(beta*x))
             # Compute in Float32
-            exp_beta_x = cute.exp(beta_x)
+            exp_beta_x = cute.exp(beta_x, fastmath=True)
             log_input = cutlass.Float32(1.0 + exp_beta_x)
-            log_result = cutlass.Float32(cute.log(log_input))
+            log_result = cutlass.Float32(cute.log(log_input, fastmath=True))
             softplus_x = cutlass.Float32(
                 (cutlass.Float32(1.0) / softplus_beta) * log_result
             )
@@ -233,13 +289,13 @@ def gdn_decode_kernel_small_batch_pretranspose(
             softplus_x = x
 
         # Compute g = exp(A_log) * softplus_x
-        r_g_value = -cute.exp(r_A_log) * softplus_x
+        r_g_value = -cute.exp(r_A_log, fastmath=True) * softplus_x
 
         # Compute beta = 1 / (1 + exp(-b))
-        r_beta = 1.0 / (1.0 + cute.exp(-r_b))
+        r_beta = 1.0 / (1.0 + cute.exp(-r_b, fastmath=True))
 
         # Store to scalar (Float32)
-        r_g = cute.exp(r_g_value)
+        r_g = cute.exp(r_g_value, fastmath=True)
 
     r_g = cute.arch.shuffle_sync(r_g, 0)
     r_beta = cute.arch.shuffle_sync(r_beta, 0)
@@ -248,7 +304,7 @@ def gdn_decode_kernel_small_batch_pretranspose(
         # Compute L2 norm of q and k
         sum_q = 0.0
         sum_k = 0.0
-        for i in range(vec_size):
+        for i in cutlass.range_constexpr(vec_size):
             sum_q += r_q[i] * r_q[i]
             sum_k += r_k[i] * r_k[i]
         # Warp-level reduction using butterfly shuffle
@@ -260,14 +316,14 @@ def gdn_decode_kernel_small_batch_pretranspose(
                 sum_k, offset=offset, mask=-1, mask_and_clamp=31
             )
 
-        norm_q = cute.sqrt(sum_q + 1e-6)
-        norm_k = cute.sqrt(sum_k + 1e-6)
-        for i in range(vec_size):
-            r_q[i] = r_q[i] / norm_q
-            r_k[i] = r_k[i] / norm_k
+        inv_norm_q = cute.rsqrt(sum_q + 1e-6, fastmath=True)
+        inv_norm_k = cute.rsqrt(sum_k + 1e-6, fastmath=True)
+        for i in cutlass.range_constexpr(vec_size):
+            r_q[i] = r_q[i] * inv_norm_q
+            r_k[i] = r_k[i] * inv_norm_k
 
     # Apply scaling in Float32
-    for i in range(vec_size):
+    for i in cutlass.range_constexpr(vec_size):
         r_q[i] = r_q[i] * scale
 
     # ===================================================================
@@ -295,12 +351,18 @@ def gdn_decode_kernel_small_batch_pretranspose(
             cute.copy(tiled_copy_load, thr_gSrc, thr_sData)
             cute.arch.cp_async_commit_group()
 
-        # Step 3: Compute using data from current stage
-        for row in range(0, TILE_V, 4):
+        # Step 3: Compute using data from current stage (contiguous access pattern)
+        for row in cutlass.range_constexpr(0, TILE_V, 4):
             row_offset = tidx // 32
             sum_hk = 0.0
-            for i in range(vec_size):
-                r_h[i] = sData[(row + row_offset, i * 32 + lane_id, stage)]
+
+            # Load h from sData using 3D local_tile + autovec_copy (contiguous in K)
+            sData_tile = cute.local_tile(
+                sData, (1, vec_size, 1), (row + row_offset, lane_id, stage)
+            )
+            cute.autovec_copy(sData_tile, r_h)
+
+            for i in cutlass.range_constexpr(vec_size):
                 r_h[i] = r_h[i] * r_g
                 sum_hk += r_h[i] * r_k[i]
 
@@ -313,10 +375,15 @@ def gdn_decode_kernel_small_batch_pretranspose(
             v_new = v_new * r_beta
 
             sum_hq = 0.0
-            for i in range(vec_size):
+            for i in cutlass.range_constexpr(vec_size):
                 r_h[i] += r_k[i] * v_new
-                gDst[(0, row + row_offset, i * 32 + lane_id, v_tiles)] = r_h[i]
                 sum_hq += r_h[i] * r_q[i]
+
+            # Write h to gDst using 4D local_tile + autovec_copy (contiguous in K)
+            gDst_tile = cute.local_tile(
+                gDst, (1, 1, vec_size, 1), (0, row + row_offset, lane_id, v_tiles)
+            )
+            cute.autovec_copy(r_h, gDst_tile)
 
             for offset in [16, 8, 4, 2, 1]:
                 sum_hq += cute.arch.shuffle_sync_bfly(
@@ -406,6 +473,19 @@ def gdn_decode_kernel_big_batch_pretranspose(
     r_h = cute.make_rmem_tensor(
         cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32
     )
+    # BF16 register tensors for vectorized q, k, v loading
+    r_q_bf16 = cute.make_rmem_tensor(
+        cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16
+    )
+    r_k_bf16 = cute.make_rmem_tensor(
+        cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16
+    )
+    r_v_bf16 = cute.make_rmem_tensor(
+        cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16
+    )
+
+    # Compute k_start for contiguous access pattern
+    k_start = lane_id * vec_size
 
     cute.arch.barrier()
 
@@ -437,12 +517,22 @@ def gdn_decode_kernel_big_batch_pretranspose(
         cute.copy(tiled_copy_load, thr_gSrc, thr_sData)
         cute.arch.cp_async_commit_group()
 
-    for i in range(vec_size):
-        r_q[i] = cutlass.Float32(q[i_n, i_t, i_h, i * 32 + lane_id])
-        r_k[i] = cutlass.Float32(k[i_n, i_t, i_h, i * 32 + lane_id])
-        # Store v to shared memory instead of register
-        v_val = cutlass.Float32(v[i_n, i_t, i_hv, i * 32 + lane_id])
-        sV[i * 32 + lane_id] = v_val
+    # Load q, k into BF16 registers using autovec_copy (contiguous pattern)
+    q_tile = cute.local_tile(q, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane_id))
+    k_tile = cute.local_tile(k, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane_id))
+    cute.autovec_copy(q_tile, r_q_bf16)
+    cute.autovec_copy(k_tile, r_k_bf16)
+
+    # Convert BF16 to FP32
+    for i in cutlass.range_constexpr(vec_size):
+        r_q[i] = cutlass.Float32(r_q_bf16[i])
+        r_k[i] = cutlass.Float32(r_k_bf16[i])
+
+    # Load v into BF16 registers using autovec_copy, convert to FP32, store to sV
+    v_tile = cute.local_tile(v, (1, 1, 1, vec_size), (i_n, i_t, i_hv, lane_id))
+    cute.autovec_copy(v_tile, r_v_bf16)
+    for i in cutlass.range_constexpr(vec_size):
+        sV[k_start + i] = cutlass.Float32(r_v_bf16[i])
 
     cute.arch.barrier()  # Ensure all threads finish writing to sV
 
@@ -459,9 +549,9 @@ def gdn_decode_kernel_big_batch_pretranspose(
         if beta_x <= softplus_threshold:
             # softplus(x) = (1/beta) * log(1 + exp(beta*x))
             # Compute in Float32
-            exp_beta_x = cute.exp(beta_x)
+            exp_beta_x = cute.exp(beta_x, fastmath=True)
             log_input = cutlass.Float32(1.0 + exp_beta_x)
-            log_result = cutlass.Float32(cute.log(log_input))
+            log_result = cutlass.Float32(cute.log(log_input, fastmath=True))
             softplus_x = cutlass.Float32(
                 (cutlass.Float32(1.0) / softplus_beta) * log_result
             )
@@ -469,13 +559,13 @@ def gdn_decode_kernel_big_batch_pretranspose(
             softplus_x = x
 
         # Compute g = exp(A_log) * softplus_x
-        r_g_value = -cute.exp(r_A_log) * softplus_x
+        r_g_value = -cute.exp(r_A_log, fastmath=True) * softplus_x
 
         # Compute beta = 1 / (1 + exp(-b))
-        r_beta = 1.0 / (1.0 + cute.exp(-r_b))
+        r_beta = 1.0 / (1.0 + cute.exp(-r_b, fastmath=True))
 
         # Store to scalar (Float32)
-        r_g = cute.exp(r_g_value)
+        r_g = cute.exp(r_g_value, fastmath=True)
 
     r_g = cute.arch.shuffle_sync(r_g, 0)
     r_beta = cute.arch.shuffle_sync(r_beta, 0)
@@ -484,7 +574,7 @@ def gdn_decode_kernel_big_batch_pretranspose(
         # Compute L2 norm of q and k
         sum_q = 0.0
         sum_k = 0.0
-        for i in range(vec_size):
+        for i in cutlass.range_constexpr(vec_size):
             sum_q += r_q[i] * r_q[i]
             sum_k += r_k[i] * r_k[i]
         # Warp-level reduction using butterfly shuffle
@@ -496,14 +586,14 @@ def gdn_decode_kernel_big_batch_pretranspose(
                 sum_k, offset=offset, mask=-1, mask_and_clamp=31
             )
 
-        norm_q = cute.sqrt(sum_q + 1e-6)
-        norm_k = cute.sqrt(sum_k + 1e-6)
-        for i in range(vec_size):
-            r_q[i] = r_q[i] / norm_q
-            r_k[i] = r_k[i] / norm_k
+        inv_norm_q = cute.rsqrt(sum_q + 1e-6, fastmath=True)
+        inv_norm_k = cute.rsqrt(sum_k + 1e-6, fastmath=True)
+        for i in cutlass.range_constexpr(vec_size):
+            r_q[i] = r_q[i] * inv_norm_q
+            r_k[i] = r_k[i] * inv_norm_k
 
     # Apply scaling in Float32
-    for i in range(vec_size):
+    for i in cutlass.range_constexpr(vec_size):
         r_q[i] = r_q[i] * scale
 
     # ===================================================================
@@ -530,12 +620,18 @@ def gdn_decode_kernel_big_batch_pretranspose(
             cute.copy(tiled_copy_load, thr_gSrc, thr_sData)
             cute.arch.cp_async_commit_group()
 
-        # Step 3: Compute using data from current stage
-        for row in range(0, TILE_V, 4):
+        # Step 3: Compute using data from current stage (contiguous access pattern)
+        for row in cutlass.range_constexpr(0, TILE_V, 4):
             row_offset = tidx // 32
             sum_hk = 0.0
-            for i in range(vec_size):
-                r_h[i] = sData[(row + row_offset, i * 32 + lane_id, stage)]
+
+            # Load h from sData using 3D local_tile + autovec_copy (contiguous in K)
+            sData_tile = cute.local_tile(
+                sData, (1, vec_size, 1), (row + row_offset, lane_id, stage)
+            )
+            cute.autovec_copy(sData_tile, r_h)
+
+            for i in cutlass.range_constexpr(vec_size):
                 r_h[i] = r_h[i] * r_g
                 sum_hk += r_h[i] * r_k[i]
 
@@ -548,10 +644,15 @@ def gdn_decode_kernel_big_batch_pretranspose(
             v_new = v_new * r_beta
 
             sum_hq = 0.0
-            for i in range(vec_size):
+            for i in cutlass.range_constexpr(vec_size):
                 r_h[i] += r_k[i] * v_new
-                gDst[(0, row + row_offset, i * 32 + lane_id, v_tiles)] = r_h[i]
                 sum_hq += r_h[i] * r_q[i]
+
+            # Write h to gDst using 4D local_tile + autovec_copy (contiguous in K)
+            gDst_tile = cute.local_tile(
+                gDst, (1, 1, vec_size, 1), (0, row + row_offset, lane_id, v_tiles)
+            )
+            cute.autovec_copy(r_h, gDst_tile)
 
             for offset in [16, 8, 4, 2, 1]:
                 sum_hq += cute.arch.shuffle_sync_bfly(
@@ -599,6 +700,7 @@ def run_gdn_decode_kernel_small_batch_pretranspose(
     is_varlen: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
+    """Launch original pipelined kernel for small batch pretranspose."""
     # h0_source: (B*HV, V, K)
     batch_size, v_dim, k_dim = (
         h0_source.layout.shape[0],
@@ -628,12 +730,6 @@ def run_gdn_decode_kernel_small_batch_pretranspose(
     vec_size = (
         TILE_K // 32
     )  # Each thread in a warp processes this many elements (always 4 for TILE_K=128)
-
-    # print(f"Batched CP.ASYNC Load + Store (bypass L1 cache)")
-    # print(f"  {batch_size} batches x {v_dim}x{k_dim} matrices")
-    # print(f"  Tile: {TILE_V}x{TILE_K}, {num_v_tiles} tiles/batch")
-    # print(f"  Threads: {NUM_THREADS} ({NUM_THREADS // 32} warps), vec_size: {vec_size}")
-    # print(f"  Total: {total_data_mb:.1f} MB\n")
 
     # Create SMEM layout
     smem_layout_staged = cute.make_layout(
@@ -925,22 +1021,19 @@ def gated_delta_rule_decode_pretranspose(
     # Convert state from [B, HV, V, K] to [B*HV, V, K] for kernel
     h0_source = state.reshape(B * HV, V, K)
 
-    # Create dummy tensors for unused parameters
-    h0_indices = torch.zeros(B, dtype=torch.int32, device=q.device)
-    cu_seqlens = torch.zeros(B + 1, dtype=torch.int32, device=q.device)
-
     # Compile kernel with TVM FFI (cached)
     cache_key = (B, T, H, HV, K, V, q.dtype, scale, use_qk_l2norm)
     cache = _get_compiled_decode_kernel(*cache_key)
 
+    # Get or create h0_indices and cu_seqlens (cached per config)
+    if "h0_indices" not in cache or cache["h0_indices"].device != q.device:
+        cache["h0_indices"] = torch.zeros(B, dtype=torch.int32, device=q.device)
+        cache["cu_seqlens"] = torch.zeros(B + 1, dtype=torch.int32, device=q.device)
+    h0_indices = cache["h0_indices"]
+    cu_seqlens = cache["cu_seqlens"]
+
     if "compiled" not in cache:
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-
-        # Choose kernel based on batch size
-        if B <= 32:
-            run_func = run_gdn_decode_kernel_small_batch_pretranspose
-        else:
-            run_func = run_gdn_decode_kernel_big_batch_pretranspose
 
         # Convert tensors to CuTe format for compilation only
         h0_source_tensor = from_dlpack(h0_source, assumed_align=16)
@@ -954,6 +1047,12 @@ def gated_delta_rule_decode_pretranspose(
         o_tensor = from_dlpack(output, assumed_align=16)
         h0_indices_tensor = from_dlpack(h0_indices, assumed_align=16)
         cu_seqlens_tensor = from_dlpack(cu_seqlens, assumed_align=16)
+
+        # Choose kernel based on batch size
+        if B <= 32:
+            run_func = run_gdn_decode_kernel_small_batch_pretranspose
+        else:
+            run_func = run_gdn_decode_kernel_big_batch_pretranspose
 
         # Use TVM FFI to reduce runtime overhead
         compiled = cute.compile(
@@ -994,8 +1093,10 @@ def gated_delta_rule_decode_pretranspose(
         h0_source, A_log, a, dt_bias, q, k, v, b, output, h0_indices, cu_seqlens, stream
     )
 
-    # Reshape state back (no sync needed - PyTorch handles stream ordering)
-    state.copy_(h0_source.reshape(B, HV, V, K))
+    # Copy state back only if state was not contiguous
+    # (if contiguous, reshape returns a view and kernel updated state in-place)
+    if not state.is_contiguous():
+        state.copy_(h0_source.reshape(B, HV, V, K))
 
     # Convert output to target dtype if needed (kernel outputs bfloat16)
     if output.dtype != target_dtype:
@@ -1073,7 +1174,9 @@ def gdn_decode_kernel_small_batch_nontranspose(
             sK[tidx] = cutlass.Float32(k[i_n, 0, i_h, tidx])
             sQ[tidx] = cutlass.Float32(q[i_n, 0, i_h, tidx])
 
-        gSrc_batch = h0_source[(pool_idx, i_hv, None, None)]
+        # Compute flat index for flattened state [B*HV, K, V]
+        flat_idx = pool_idx * HV + i_hv
+        gSrc_batch = h0_source[(flat_idx, None, None)]
         gSrc = cute.local_tile(gSrc_batch, (TILE_K_NT, TILE_V_SMALL_NT), (0, None))
         thr_copy_load = tiled_copy_load.get_slice(tidx)
 
@@ -1100,17 +1203,17 @@ def gdn_decode_kernel_small_batch_nontranspose(
             beta_x = softplus_beta * x
             softplus_x = 0.0
             if beta_x <= softplus_threshold:
-                exp_beta_x = cute.exp(beta_x)
+                exp_beta_x = cute.exp(beta_x, fastmath=True)
                 log_input = cutlass.Float32(1.0 + exp_beta_x)
-                log_result = cutlass.Float32(cute.log(log_input))
+                log_result = cutlass.Float32(cute.log(log_input, fastmath=True))
                 softplus_x = cutlass.Float32(
                     (cutlass.Float32(1.0) / softplus_beta) * log_result
                 )
             else:
                 softplus_x = x
-            r_g_value = -cute.exp(r_A_log) * softplus_x
-            r_beta = 1.0 / (1.0 + cute.exp(-r_b))
-            r_g = cute.exp(r_g_value)
+            r_g_value = -cute.exp(r_A_log, fastmath=True) * softplus_x
+            r_beta = 1.0 / (1.0 + cute.exp(-r_b, fastmath=True))
+            r_g = cute.exp(r_g_value, fastmath=True)
 
         r_g = cute.arch.shuffle_sync(r_g, 0)
         r_beta = cute.arch.shuffle_sync(r_beta, 0)
@@ -1155,8 +1258,8 @@ def gdn_decode_kernel_small_batch_nontranspose(
                         local_sum_k, offset=offset, mask=-1, mask_and_clamp=31
                     )
                 if in_warp_tid == 0:
-                    smem_o[0] = cute.rsqrt(local_sum_q + 1e-6)
-                    smem_o[1] = cute.rsqrt(local_sum_k + 1e-6)
+                    smem_o[0] = cute.rsqrt(local_sum_q + 1e-6, fastmath=True)
+                    smem_o[1] = cute.rsqrt(local_sum_k + 1e-6, fastmath=True)
             cute.arch.barrier()
 
             inv_norm_q = smem_o[0]
@@ -1236,14 +1339,15 @@ def gdn_decode_kernel_small_batch_nontranspose(
 
             cute.arch.barrier()
 
-            for k_iter in range(NUM_K_ITERS_SMALL):
-                flat_idx = tidx + k_iter * 128
-                k_write = flat_idx // TILE_V_SMALL_NT
-                v_write = flat_idx % TILE_V_SMALL_NT
+            for k_iter in cutlass.range_constexpr(NUM_K_ITERS_SMALL):
+                flat_tid = tidx + k_iter * 128
+                k_write = flat_tid // TILE_V_SMALL_NT
+                v_write = flat_tid % TILE_V_SMALL_NT
                 if k_write < TILE_K_NT:
                     h_val = sData[(k_write, v_write, stage)]
                     v_global_write = v_tile * TILE_V_SMALL_NT + v_write
-                    h0_source[(pool_idx, i_hv, k_write, v_global_write)] = h_val
+                    # Use flat index for flattened state [B*HV, K, V]
+                    h0_source[(flat_idx, k_write, v_global_write)] = h_val
 
             cute.arch.barrier()
 
@@ -1301,7 +1405,9 @@ def gdn_decode_kernel_big_batch_nontranspose(
             sK[tidx] = cutlass.Float32(k[i_n, 0, i_h, tidx])
             sQ[tidx] = cutlass.Float32(q[i_n, 0, i_h, tidx])
 
-        gSrc_batch = h0_source[(pool_idx, i_hv, None, None)]
+        # Compute flat index for flattened state [B*HV, K, V]
+        flat_idx = pool_idx * HV + i_hv
+        gSrc_batch = h0_source[(flat_idx, None, None)]
         gSrc = cute.local_tile(gSrc_batch, (TILE_K_NT, TILE_V_NT), (0, None))
         thr_copy_load = tiled_copy_load.get_slice(tidx)
 
@@ -1327,17 +1433,17 @@ def gdn_decode_kernel_big_batch_nontranspose(
             beta_x = softplus_beta * x
             softplus_x = 0.0
             if beta_x <= softplus_threshold:
-                exp_beta_x = cute.exp(beta_x)
+                exp_beta_x = cute.exp(beta_x, fastmath=True)
                 log_input = cutlass.Float32(1.0 + exp_beta_x)
-                log_result = cutlass.Float32(cute.log(log_input))
+                log_result = cutlass.Float32(cute.log(log_input, fastmath=True))
                 softplus_x = cutlass.Float32(
                     (cutlass.Float32(1.0) / softplus_beta) * log_result
                 )
             else:
                 softplus_x = x
-            r_g_value = -cute.exp(r_A_log) * softplus_x
-            r_beta = 1.0 / (1.0 + cute.exp(-r_b))
-            r_g = cute.exp(r_g_value)
+            r_g_value = -cute.exp(r_A_log, fastmath=True) * softplus_x
+            r_beta = 1.0 / (1.0 + cute.exp(-r_b, fastmath=True))
+            r_g = cute.exp(r_g_value, fastmath=True)
 
         r_g = cute.arch.shuffle_sync(r_g, 0)
         r_beta = cute.arch.shuffle_sync(r_beta, 0)
@@ -1382,8 +1488,8 @@ def gdn_decode_kernel_big_batch_nontranspose(
                         local_sum_k, offset=offset, mask=-1, mask_and_clamp=31
                     )
                 if in_warp_tid == 0:
-                    smem_o[0] = cute.rsqrt(local_sum_q + 1e-6)
-                    smem_o[1] = cute.rsqrt(local_sum_k + 1e-6)
+                    smem_o[0] = cute.rsqrt(local_sum_q + 1e-6, fastmath=True)
+                    smem_o[1] = cute.rsqrt(local_sum_k + 1e-6, fastmath=True)
             cute.arch.barrier()
 
             inv_norm_q = smem_o[0]
@@ -1455,14 +1561,15 @@ def gdn_decode_kernel_big_batch_nontranspose(
 
             cute.arch.barrier()
 
-            for k_iter in range(NUM_K_ITERS_NT):
-                flat_idx = tidx + k_iter * 256
-                k_write = flat_idx // TILE_V_NT
-                v_write = flat_idx % TILE_V_NT
+            for k_iter in cutlass.range_constexpr(NUM_K_ITERS_NT):
+                flat_tid = tidx + k_iter * 256
+                k_write = flat_tid // TILE_V_NT
+                v_write = flat_tid % TILE_V_NT
                 if k_write < TILE_K_NT:
                     h_val = sData[(k_write, v_write, stage)]
                     v_global_write = v_tile * TILE_V_NT + v_write
-                    h0_source[(pool_idx, i_hv, k_write, v_global_write)] = h_val
+                    # Use flat index for flattened state [B*HV, K, V]
+                    h0_source[(flat_idx, k_write, v_global_write)] = h_val
 
             cute.arch.barrier()
 
@@ -1493,9 +1600,10 @@ def run_gdn_decode_kernel_small_batch_nontranspose(
     use_qk_l2norm: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
-    pool_size, hv_dim, k_dim, v_dim = h0_source.layout.shape
-    n_indices = h0_indices.layout.shape[0]
-    batch_size = n_indices * hv_dim
+    # h0_source is flattened to [B*HV, K, V] to ensure proper alignment for SIMT async copy
+    batch_hv_dim, k_dim, v_dim = h0_source.layout.shape
+    h0_indices.layout.shape[0]
+    batch_size = batch_hv_dim  # batch_hv_dim = B * HV
 
     copy_atom = cute.make_copy_atom(
         cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
@@ -1573,9 +1681,10 @@ def run_gdn_decode_kernel_big_batch_nontranspose(
     use_qk_l2norm: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
-    pool_size, hv_dim, k_dim, v_dim = h0_source.layout.shape
-    n_indices = h0_indices.layout.shape[0]
-    batch_size = n_indices * hv_dim
+    # h0_source is flattened to [B*HV, K, V] to ensure proper alignment for SIMT async copy
+    batch_hv_dim, k_dim, v_dim = h0_source.layout.shape
+    h0_indices.layout.shape[0]
+    batch_size = batch_hv_dim  # batch_hv_dim = B * HV
 
     copy_atom = cute.make_copy_atom(
         cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
@@ -1727,17 +1836,22 @@ def gated_delta_rule_decode(
         # Kernel outputs bfloat16, allocate in that dtype first
         output = torch.zeros((B, T, HV, V), dtype=torch.bfloat16, device=q.device)
 
-    # State is already in K-major layout [B, HV, K, V]
-    # Use state directly as pooled view: pool_size=B, each batch is its own pool
-    h0_source = state.contiguous()
-
-    # Create h0_indices: each batch points to its own pool index
-    h0_indices = torch.arange(B, dtype=torch.int32, device=q.device)
-    cu_seqlens = torch.zeros(B + 1, dtype=torch.int32, device=q.device)
+    # State is in K-major layout [B, HV, K, V]
+    # Flatten to [B*HV, K, V] to ensure proper alignment for SIMT async copy
+    # This avoids alignment issues when B=1 (zero strides cause alignment failures)
+    state_contiguous = state.contiguous()
+    h0_source = state_contiguous.view(B * HV, K, V)
 
     # Compile kernel with TVM FFI (cached)
     cache_key = (B, T, H, HV, K, V, q.dtype, scale, use_qk_l2norm)
     cache = _get_compiled_decode_kernel_nontranspose(*cache_key)
+
+    # Get or create h0_indices and cu_seqlens (cached per config)
+    if "h0_indices" not in cache or cache["h0_indices"].device != q.device:
+        cache["h0_indices"] = torch.arange(B, dtype=torch.int32, device=q.device)
+        cache["cu_seqlens"] = torch.zeros(B + 1, dtype=torch.int32, device=q.device)
+    h0_indices = cache["h0_indices"]
+    cu_seqlens = cache["cu_seqlens"]
 
     if "compiled" not in cache:
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -1812,9 +1926,10 @@ def gated_delta_rule_decode(
         stream,
     )
 
-    # Copy state back (no sync needed - PyTorch handles stream ordering)
-    # h0_source is already [B, HV, K, V]
-    state.copy_(h0_source)
+    # Copy state back only if state was not contiguous
+    # (if contiguous, state_contiguous is state itself, so kernel updated state in-place)
+    if state_contiguous.data_ptr() != state.data_ptr():
+        state.copy_(state_contiguous)
 
     # Convert output to target dtype if needed (kernel outputs bfloat16)
     if output.dtype != target_dtype:
@@ -1830,12 +1945,11 @@ def gated_delta_rule_decode(
 
 @cute.kernel
 def gdn_verify_kernel_mtp(
-    tiled_copy_load: cute.TiledCopy,
     h0_source: cute.Tensor,  # [pool_size * HV, V, K] - initial state pool (K-last)
     intermediate_states: cute.Tensor,  # [pool_size * T * HV, V, K] - intermediate state cache
-    smem_layout_staged: cute.ComposedLayout,  # Swizzled layout to avoid bank conflicts
     vec_size: cutlass.Constexpr[int],
     num_v_tiles: cutlass.Constexpr[int],
+    tile_v: cutlass.Constexpr[int],  # TILE_V - configurable for batch size
     A_log: cute.Tensor,  # [HV]
     a: cute.Tensor,  # [B, T, HV]
     dt_bias: cute.Tensor,  # [HV]
@@ -1862,44 +1976,61 @@ def gdn_verify_kernel_mtp(
     cache_intermediate_states: cutlass.Constexpr[bool],
 ):
     """
-    Verify kernel with optimized loop order: (v_tiles outer, time_steps inner)
+    Parallel MTP kernel - each block handles one [TILE_V, TILE_K] tile.
 
-    Uses cute.make_rmem_tensor for register arrays (same style as decode kernel).
-    Store-compute overlap: cache data in registers, store during next iteration.
+    Grid: (B * HV * num_v_tiles, 1, 1)
+    Each block:
+    - Loads its v_tile of state into registers
+    - Processes all T time steps with state in registers
+    - Writes output and optionally updates state
+
+    This matches Triton's parallelization strategy for better small-batch performance.
     """
-
     tidx, _, _ = cute.arch.thread_idx()
     lane_id = tidx % 32
     warp_idx = cute.arch.warp_idx()
     warp_idx = cute.arch.make_warp_uniform(warp_idx)
+
+    # Compute thread grouping based on vec_size:
+    # vec_size=8: 16 threads per group (half-warp), 8 groups per block
+    # vec_size=4: 32 threads per group (full warp), 4 groups per block
+    threads_per_group: cutlass.Constexpr[int] = K // vec_size  # 16 or 32
+    groups_per_warp: cutlass.Constexpr[int] = 32 // threads_per_group  # 2 or 1
+    num_groups: cutlass.Constexpr[int] = 4 * groups_per_warp  # 8 or 4
+
+    # Lane position within group and group index
+    lane_in_group = lane_id % threads_per_group
+    group_in_warp = lane_id // threads_per_group
+    group_idx = warp_idx * groups_per_warp + group_in_warp
+
     batch_idx, _, _ = cute.arch.block_idx()
-    i_n = batch_idx // HV
-    i_hv = batch_idx % HV
+
+    # Decode block index: (i_n, i_hv, i_v) from batch_idx
+    i_v = batch_idx % num_v_tiles
+    tmp = batch_idx // num_v_tiles
+    i_hv = tmp % HV
+    i_n = tmp // HV
     i_h = i_hv // (HV // H)
+
+    # Get initial state index for this batch
+    cache_idx = h0_indices[i_n]
 
     # Load A_log and dt_bias once (they don't vary with time)
     r_A_log = cutlass.Float32(A_log[i_hv])
     r_dt_bias = cutlass.Float32(dt_bias[i_hv])
 
+    # Allocate shared memory for pre-computed values (broadcast to all warps)
     smem = cutlass.utils.SmemAllocator()
-
-    # Allocate shared memory with padding to avoid bank conflicts
-    sData = smem.allocate_tensor(cutlass.Float32, smem_layout_staged, 128)
-    sOutput = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T, V)), 16)
-    # Pre-computed shared memory for all time steps (with padding for bank conflict avoidance)
     sQ = smem.allocate_tensor(
         cutlass.Float32, cute.make_layout((T, K), stride=(K + 8, 1)), 16
     )
     sK = smem.allocate_tensor(
         cutlass.Float32, cute.make_layout((T, K), stride=(K + 8, 1)), 16
     )
-    sV = smem.allocate_tensor(
-        cutlass.Float32, cute.make_layout((T, V), stride=(V + 8, 1)), 16
-    )
     sG = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T,)), 16)
     sBeta = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T,)), 16)
 
-    # Allocate register tensors
+    # Register arrays for computation
     r_q = cute.make_rmem_tensor(
         cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32
     )
@@ -1909,64 +2040,45 @@ def gdn_verify_kernel_mtp(
     r_h = cute.make_rmem_tensor(
         cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32
     )
+    # BF16 register tensors for vectorized q, k loading
+    r_q_bf16 = cute.make_rmem_tensor(
+        cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16
+    )
+    r_k_bf16 = cute.make_rmem_tensor(
+        cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16
+    )
 
-    # Initialize output accumulator to zero
-    for i_t in range(T):
-        sOutput[(i_t, tidx)] = 0.0
-
-    cute.arch.barrier()
-
-    # Get initial state index for this batch
-    cache_idx = h0_indices[i_n]
-
-    # Early exit optimization: skip pre-computation for padding slots
+    # Only process valid batch entries (cache_idx >= 0)
     if cache_idx >= 0:
-        # Pre-compute q, k, v, g, beta for all time steps (outside v_tiles loop)
-        for i_t in range(T):
-            # Load q, k into register arrays
-            for i in range(vec_size):
-                r_q[i] = cutlass.Float32(q[i_n, i_t, i_h, i * 32 + lane_id])
-                r_k[i] = cutlass.Float32(k[i_n, i_t, i_h, i * 32 + lane_id])
-                # Load v for all V elements
-                sV[(i_t, i * 32 + lane_id)] = cutlass.Float32(
-                    v[i_n, i_t, i_hv, i * 32 + lane_id]
-                )
+        # Compute k_start once (used for shared memory writes)
+        k_start = lane_in_group * vec_size
 
-            # Compute g and beta
-            r_a = cutlass.Float32(a[i_n, i_t, i_hv])
-            r_b = cutlass.Float32(b[i_n, i_t, i_hv])
-            r_g = 0.0
-            r_beta = 0.0
-            if lane_id == 0:
-                x = r_a + r_dt_bias
-                beta_x = softplus_beta * x
-                softplus_x = 0.0
+        # Pre-compute q, k, g, beta for ALL time steps ONCE (shared across warps)
+        for i_t in cutlass.range_constexpr(T):
+            # Load q, k into BF16 registers using autovec_copy (coalesced)
+            q_tile = cute.local_tile(
+                q, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane_in_group)
+            )
+            k_tile = cute.local_tile(
+                k, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane_in_group)
+            )
+            cute.autovec_copy(q_tile, r_q_bf16)
+            cute.autovec_copy(k_tile, r_k_bf16)
 
-                if beta_x <= softplus_threshold:
-                    exp_beta_x = cute.exp(beta_x)
-                    log_input = cutlass.Float32(1.0 + exp_beta_x)
-                    log_result = cutlass.Float32(cute.log(log_input))
-                    softplus_x = cutlass.Float32(
-                        (cutlass.Float32(1.0) / softplus_beta) * log_result
-                    )
-                else:
-                    softplus_x = x
+            # Convert BF16 to FP32 for computation
+            for i in cutlass.range_constexpr(vec_size):
+                r_q[i] = cutlass.Float32(r_q_bf16[i])
+                r_k[i] = cutlass.Float32(r_k_bf16[i])
 
-                r_g_value = -cute.exp(r_A_log) * softplus_x
-                r_beta = 1.0 / (1.0 + cute.exp(-r_b))
-                r_g = cute.exp(r_g_value)
-
-            r_g = cute.arch.shuffle_sync(r_g, 0)
-            r_beta = cute.arch.shuffle_sync(r_beta, 0)
-
-            # Apply L2 normalization
-            if use_qk_l2norm:
+            # Apply L2 normalization to q, k (with scale fused for q)
+            if cutlass.const_expr(use_qk_l2norm):
                 sum_q = 0.0
                 sum_k = 0.0
-                for i in range(vec_size):
+                for i in cutlass.range_constexpr(vec_size):
                     sum_q += r_q[i] * r_q[i]
                     sum_k += r_k[i] * r_k[i]
 
+                # Warp-level reduction (32 threads per group with vec_size=4)
                 for offset in [16, 8, 4, 2, 1]:
                     sum_q += cute.arch.shuffle_sync_bfly(
                         sum_q, offset=offset, mask=-1, mask_and_clamp=31
@@ -1975,150 +2087,138 @@ def gdn_verify_kernel_mtp(
                         sum_k, offset=offset, mask=-1, mask_and_clamp=31
                     )
 
-                inv_norm_q = cute.rsqrt(sum_q + 1e-6)
-                inv_norm_k = cute.rsqrt(sum_k + 1e-6)
+                # Fuse scale into q's normalization factor
+                inv_norm_q_scaled = cute.rsqrt(sum_q + 1e-6, fastmath=True) * scale
+                inv_norm_k = cute.rsqrt(sum_k + 1e-6, fastmath=True)
 
-                for i in range(vec_size):
-                    r_q[i] = r_q[i] * inv_norm_q
+                for i in cutlass.range_constexpr(vec_size):
+                    r_q[i] = r_q[i] * inv_norm_q_scaled
                     r_k[i] = r_k[i] * inv_norm_k
+            else:
+                # No L2 norm, just apply scale to q
+                for i in cutlass.range_constexpr(vec_size):
+                    r_q[i] = r_q[i] * scale
 
-            # Apply scaling to q
-            for i in range(vec_size):
-                r_q[i] = r_q[i] * scale
+            # Store to shared memory (only first group writes) - contiguous layout
+            if tidx < threads_per_group:
+                for i in cutlass.range_constexpr(vec_size):
+                    sQ[(i_t, k_start + i)] = r_q[i]
+                    sK[(i_t, k_start + i)] = r_k[i]
 
-            # Store pre-computed values to shared memory
-            for i in range(vec_size):
-                sQ[(i_t, i * 32 + lane_id)] = r_q[i]
-                sK[(i_t, i * 32 + lane_id)] = r_k[i]
+            # Compute g, beta - all lanes compute (redundant but no divergence)
+            r_a = cutlass.Float32(a[i_n, i_t, i_hv])
+            r_b = cutlass.Float32(b[i_n, i_t, i_hv])
 
-            # Store g and beta (only one thread needs to do this)
+            x = r_a + r_dt_bias
+            beta_x = softplus_beta * x
+
+            # Branchless softplus
+            exp_beta_x = cute.exp(beta_x, fastmath=True)
+            softplus_val = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
+                cutlass.Float32(1.0) + exp_beta_x, fastmath=True
+            )
+            use_softplus = (
+                cutlass.Float32(1.0)
+                if beta_x <= softplus_threshold
+                else cutlass.Float32(0.0)
+            )
+            softplus_x = (
+                use_softplus * softplus_val + (cutlass.Float32(1.0) - use_softplus) * x
+            )
+
+            r_g_value = -cute.exp(r_A_log, fastmath=True) * softplus_x
+            r_beta = cutlass.Float32(1.0) / (
+                cutlass.Float32(1.0) + cute.exp(-r_b, fastmath=True)
+            )
+            r_g = cute.exp(r_g_value, fastmath=True)
+
+            # Only thread 0 stores to shared memory
             if tidx == 0:
                 sG[i_t] = r_g
                 sBeta[i_t] = r_beta
 
-    # All threads must participate in barrier (CUDA requirement)
-    cute.arch.barrier()
+        cute.arch.barrier()
 
-    # Main computation only for valid batch entries
-    if cache_idx >= 0:
-        # Setup source tensor for initial state loading
-        gSrc_batch = h0_source[(cache_idx * HV + i_hv, None, None)]
-        gDst_h0 = cute.local_tile(
-            h0_source, (1, TILE_V_MTP, TILE_K_MTP), (cache_idx * HV + i_hv, None, 0)
-        )
-        gSrc = cute.local_tile(gSrc_batch, (TILE_V_MTP, TILE_K_MTP), (None, 0))
+        # Each group handles tile_v/num_groups V rows
+        rows_per_group: cutlass.Constexpr[int] = tile_v // num_groups
+        for row_in_group in cutlass.range_constexpr(rows_per_group):
+            v_idx = i_v * tile_v + group_idx * rows_per_group + row_in_group
 
-        thr_copy_load = tiled_copy_load.get_slice(tidx)
+            if v_idx < V:
+                # Load h[v_idx, :] into registers using 3D local_tile + autovec_copy
+                flat_state_idx = cache_idx * HV + i_hv
+                h_tile = cute.local_tile(
+                    h0_source, (1, 1, vec_size), (flat_state_idx, v_idx, lane_in_group)
+                )
+                cute.autovec_copy(h_tile, r_h)
 
-        # Main loop: v_tiles (outer) x time_steps (inner)
-        prefetch_count = cutlass.min(NUM_STAGES_MTP - 1, num_v_tiles)
+                # Process all T time steps with h in registers
+                for i_t in cutlass.range_constexpr(T):
+                    # Load pre-computed q, k from shared memory using 2D local_tile
+                    sQ_tile = cute.local_tile(sQ, (1, vec_size), (i_t, lane_in_group))
+                    sK_tile = cute.local_tile(sK, (1, vec_size), (i_t, lane_in_group))
+                    cute.autovec_copy(sQ_tile, r_q)
+                    cute.autovec_copy(sK_tile, r_k)
 
-        # Prefetch first v_tile(s)
-        for v_tiles in range(prefetch_count):
-            stage = v_tiles % NUM_STAGES_MTP
-            gSrc_tile = gSrc[(None, None, v_tiles)]
-            sData_stage = sData[(None, None, stage)]
-            thr_gSrc = thr_copy_load.partition_S(gSrc_tile)
-            thr_sData = thr_copy_load.partition_D(sData_stage)
-            cute.copy(tiled_copy_load, thr_gSrc, thr_sData)
-            cute.arch.cp_async_commit_group()
+                    r_g = sG[i_t]
+                    r_beta = sBeta[i_t]
 
-        # Process each v_tile
-        for v_tiles in range(num_v_tiles):
-            stage = v_tiles % NUM_STAGES_MTP
+                    # Step 1: Apply decay to h
+                    for i in cutlass.range_constexpr(vec_size):
+                        r_h[i] = r_h[i] * r_g
 
-            cute.arch.cp_async_wait_group(0)
-            cute.arch.barrier()
-
-            # Prefetch next v_tile
-            next_v_tiles = v_tiles + prefetch_count
-            if next_v_tiles < num_v_tiles:
-                next_stage = next_v_tiles % NUM_STAGES_MTP
-                gSrc_next = gSrc[(None, None, next_v_tiles)]
-                sData_next = sData[(None, None, next_stage)]
-                thr_gSrc = thr_copy_load.partition_S(gSrc_next)
-                thr_sData = thr_copy_load.partition_D(sData_next)
-                cute.copy(tiled_copy_load, thr_gSrc, thr_sData)
-                cute.arch.cp_async_commit_group()
-
-            # Inner loop: all time steps for this v_tile
-            for i_t in range(T):
-                # Load pre-computed values from shared memory
-                for i in range(vec_size):
-                    r_q[i] = sQ[(i_t, i * 32 + lane_id)]
-                    r_k[i] = sK[(i_t, i * 32 + lane_id)]
-
-                r_g = sG[i_t]
-                r_beta = sBeta[i_t]
-
-                # Compute delta rule for this v_tile
-                for row in range(0, TILE_V_MTP, 4):
-                    row_offset = tidx // 32
-
-                    # Load h from sData, apply decay
-                    for i in range(vec_size):
-                        r_h[i] = (
-                            sData[(row + row_offset, i * 32 + lane_id, stage)] * r_g
-                        )
-
-                    # Compute sum_hk = h @ k
+                    # Step 2: Compute sum_hk = h @ k (group reduction)
                     sum_hk = 0.0
-                    for i in range(vec_size):
+                    for i in cutlass.range_constexpr(vec_size):
                         sum_hk += r_h[i] * r_k[i]
 
+                    # Warp-level reduction
                     for offset in [16, 8, 4, 2, 1]:
                         sum_hk += cute.arch.shuffle_sync_bfly(
                             sum_hk, offset=offset, mask=-1, mask_and_clamp=31
                         )
 
-                    # Delta rule update
-                    v_idx = v_tiles * TILE_V_MTP + row + row_offset
-                    v_new = sV[(i_t, v_idx)] - sum_hk
-                    v_new = v_new * r_beta
+                    # Step 3: Load v for this v_idx and time step, apply delta rule
+                    r_v = cutlass.Float32(v[i_n, i_t, i_hv, v_idx])
+                    v_new = (r_v - sum_hk) * r_beta
 
-                    # Update h and write back to sData
-                    for i in range(vec_size):
+                    # Step 4: Update h: h += k * v_new
+                    for i in cutlass.range_constexpr(vec_size):
                         r_h[i] += r_k[i] * v_new
-                        sData[(row + row_offset, i * 32 + lane_id, stage)] = r_h[i]
 
-                    # Store intermediate state
-                    if cache_intermediate_states:
+                    # Cache intermediate state if needed using 3D local_tile + autovec_copy
+                    if cutlass.const_expr(cache_intermediate_states):
                         flat_idx = i_n * T * HV + i_t * HV + i_hv
-                        if v_idx < V:
-                            for i in range(vec_size):
-                                intermediate_states[
-                                    (flat_idx, v_idx, i * 32 + lane_id)
-                                ] = r_h[i]
+                        inter_tile = cute.local_tile(
+                            intermediate_states,
+                            (1, 1, vec_size),
+                            (flat_idx, v_idx, lane_in_group),
+                        )
+                        cute.autovec_copy(r_h, inter_tile)
 
-                    # Compute sum_hq = h @ q (overlaps with store above)
+                    # Step 5: Compute output: sum_hq = h @ q (group reduction)
                     sum_hq = 0.0
-                    for i in range(vec_size):
+                    for i in cutlass.range_constexpr(vec_size):
                         sum_hq += r_h[i] * r_q[i]
 
+                    # Warp-level reduction
                     for offset in [16, 8, 4, 2, 1]:
                         sum_hq += cute.arch.shuffle_sync_bfly(
                             sum_hq, offset=offset, mask=-1, mask_and_clamp=31
                         )
 
-                    o_idx = v_tiles * TILE_V_MTP + row + row_offset
-                    if lane_id == 0 and o_idx < V:
-                        sOutput[(i_t, o_idx)] = cutlass.Float32(sum_hq)
+                    # Write output (only lane 0 of each group)
+                    if lane_in_group == 0:
+                        o[(i_n, i_t, i_hv, v_idx)] = cutlass.BFloat16(sum_hq)
 
-            # Write final h for this v_tile to h0_source
-            if not disable_state_update:
-                for row in range(0, TILE_V_MTP, 4):
-                    row_offset = tidx // 32
-                    for i in range(vec_size):
-                        gDst_h0[(0, row + row_offset, i * 32 + lane_id, v_tiles)] = (
-                            sData[(row + row_offset, i * 32 + lane_id, stage)]
-                        )
-
-        # Final writeback
-        cute.arch.barrier()
-
-        for i_t in range(T):
-            if tidx < V:
-                o[(i_n, i_t, i_hv, tidx)] = cutlass.BFloat16(sOutput[(i_t, tidx)])
+                # Write final state back (if not disabled) using 3D local_tile + autovec_copy
+                if cutlass.const_expr(not disable_state_update):
+                    h_tile_out = cute.local_tile(
+                        h0_source,
+                        (1, 1, vec_size),
+                        (flat_state_idx, v_idx, lane_in_group),
+                    )
+                    cute.autovec_copy(r_h, h_tile_out)
 
 
 @cute.jit
@@ -2144,6 +2244,8 @@ def run_gdn_verify_kernel_mtp(
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
     V: cutlass.Constexpr[int],
+    tile_v: cutlass.Constexpr[int],  # TILE_V - configurable for batch size
+    vec_size: cutlass.Constexpr[int],  # 4 for full warp, 8 for half-warp
     use_initial_state: cutlass.Constexpr[bool],
     use_qk_l2norm: cutlass.Constexpr[bool],
     is_varlen: cutlass.Constexpr[bool],
@@ -2157,47 +2259,26 @@ def run_gdn_verify_kernel_mtp(
         h0_source.layout.shape[2],
     )
 
-    num_v_tiles = cute.ceil_div(v_dim, TILE_V_MTP)
-    batch_size = B * HV
-    vec_size = TILE_K_MTP // 32  # Each thread in a warp processes this many elements
+    num_v_tiles = cute.ceil_div(v_dim, tile_v)
 
-    # Composed Swizzle Layout to avoid shared memory bank conflicts
-    base_smem_layout = cute.make_layout(
-        (TILE_V_MTP, TILE_K_MTP, NUM_STAGES_MTP),
-        stride=(TILE_K_MTP, 1, TILE_V_MTP * TILE_K_MTP),
-    )
-    swizzle = cute.make_swizzle(2, 3, 7)  # Swizzle<2, 3, 7>
-    smem_layout_staged = cute.make_composed_layout(swizzle, 0, base_smem_layout)
+    # Grid: (B * HV * num_v_tiles, 1, 1) - parallelize across V dimension
+    grid_size = B * HV * num_v_tiles
 
-    # Create tiled copy for G2S load
-    copy_atom = cute.make_copy_atom(
-        cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
-        cutlass.Float32,
-        num_bits_per_copy=128,
-    )
-    thread_layout = cute.make_layout((4, 32), stride=(32, 1))
-    val_layout = cute.make_layout((1, 4))
-    tiled_copy_load = cute.make_tiled_copy_tv(copy_atom, thread_layout, val_layout)
-
-    # Calculate shared memory size
+    # Shared memory for pre-computed q, k, g, beta
     smem_bytes = (
-        4 * TILE_V_MTP * TILE_K_MTP * NUM_STAGES_MTP
-        + 4 * T * v_dim
-        + 4 * T * (k_dim + 8)
-        + 4 * T * (k_dim + 8)
-        + 4 * T * (v_dim + 8)
-        + 4 * T
-        + 4 * T
-        + 128
+        4 * T * (k_dim + 8)  # sQ
+        + 4 * T * (k_dim + 8)  # sK
+        + 4 * T  # sG
+        + 4 * T  # sBeta
+        + 128  # alignment
     )
 
     gdn_verify_kernel_mtp(
-        tiled_copy_load,
         h0_source,
         intermediate_states,
-        smem_layout_staged,
         vec_size,
         num_v_tiles,
+        tile_v,
         A_log,
         a,
         dt_bias,
@@ -2223,7 +2304,7 @@ def run_gdn_verify_kernel_mtp(
         disable_state_update,
         cache_intermediate_states,
     ).launch(
-        grid=(batch_size, 1, 1),
+        grid=(grid_size, 1, 1),
         block=[NUM_THREADS_MTP, 1, 1],
         smem=smem_bytes,
         stream=stream,
@@ -2244,6 +2325,8 @@ def _get_compiled_mtp_kernel(
     cache_intermediate_states: bool,
     scale: float,
     use_qk_l2norm: bool,
+    tile_v: int,  # TILE_V - configurable for batch size
+    vec_size: int,  # 4 for full warp, 8 for half-warp
 ):
     """Cache compiled MTP kernel for given configuration."""
     return {}
@@ -2320,6 +2403,10 @@ def gated_delta_rule_mtp(
     _, _, HV, V = v.shape
     pool_size = initial_state.shape[0]
 
+    # Dynamic TILE_V and vec_size selection based on batch size and sequence length
+    tile_v = get_tile_v_mtp(B, T)
+    vec_size = get_vec_size_mtp(B, T)
+
     # Validate state shape
     assert initial_state.shape == (pool_size, HV, V, K), (
         f"Expected initial_state shape [pool_size={pool_size}, HV={HV}, V={V}, K={K}], got {initial_state.shape}"
@@ -2328,8 +2415,8 @@ def gated_delta_rule_mtp(
     # Validate K and V constraints
     assert K >= 128, f"K must be at least 128, got K={K}"
     assert V >= 128, f"V must be at least 128, got V={V}"
-    assert V % TILE_V_MTP == 0, (
-        f"V must be divisible by {TILE_V_MTP} to prevent out-of-bounds access, got V={V}"
+    assert V % tile_v == 0, (
+        f"V must be divisible by {tile_v} to prevent out-of-bounds access, got V={V}"
     )
 
     # Validate dtypes
@@ -2375,9 +2462,6 @@ def gated_delta_rule_mtp(
         cache_steps = T
         intermediate_states = torch.zeros(1, 1, 1, dtype=torch.float32, device=q.device)
 
-    # Create cu_seqlens
-    cu_seqlens = torch.zeros(B + 1, dtype=torch.int32, device=q.device)
-
     # Compile kernel with TVM FFI (cached)
     cache_key = (
         B,
@@ -2392,8 +2476,15 @@ def gated_delta_rule_mtp(
         cache_intermediate_states,
         scale,
         use_qk_l2norm,
+        tile_v,
+        vec_size,
     )
     cache = _get_compiled_mtp_kernel(*cache_key)
+
+    # Get or create cu_seqlens (cached per config)
+    if "cu_seqlens" not in cache or cache["cu_seqlens"].device != q.device:
+        cache["cu_seqlens"] = torch.zeros(B + 1, dtype=torch.int32, device=q.device)
+    cu_seqlens = cache["cu_seqlens"]
 
     if "compiled" not in cache:
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -2436,6 +2527,8 @@ def gated_delta_rule_mtp(
             H=H,
             K=K,
             V=V,
+            tile_v=tile_v,
+            vec_size=vec_size,
             use_initial_state=True,
             use_qk_l2norm=use_qk_l2norm,
             is_varlen=False,
@@ -2467,7 +2560,9 @@ def gated_delta_rule_mtp(
     )
 
     # Copy state back if needed (no sync needed - PyTorch handles stream ordering)
-    if not disable_state_update:
+    # Only copy if state update is enabled AND initial_state was not contiguous
+    # (if contiguous, reshape returns a view and kernel updated state in-place)
+    if not disable_state_update and not initial_state.is_contiguous():
         initial_state.copy_(h0_source.reshape(pool_size, HV, V, K))
 
     # Convert output to target dtype if needed

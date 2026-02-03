@@ -166,6 +166,24 @@ struct KernelParams {
   // Dtype is Dtype::E4m3 for NvFp4, Dtype::UE8m0 for Mx formats.
   CUtensorMap tmaSfB[1];
 
+  // TMA descriptor for the sparsity information of A, if structured sparsity is used.
+  // Must be setup using gemm::buildNdTmaDescriptor with shapes and strides from
+  // makeTmaShapeStrideSparsityInfoA.
+  //
+  // When sparsityA is Any_2_4:
+  //     2 elements are non-zero in any chunk of 4 elements.
+  //     A 4-bit index indicates the position of the non-zero elements.
+  //     The shape in UInt8 is: [B, M, K / 8]
+  //
+  // When sparsityA is Pairwise_4_8:
+  //     4 elements are non-zero in any chunk of 8 elements.
+  //     The zero and non-zero elements are grouped in pairs.
+  //     A 4-bit index indicates the position of the non-zero pairs.
+  //     The shape in UInt8 is: [B, M, K / 16]
+  //
+  // Dtype is Dtype::UInt8.
+  CUtensorMap tmaSparsityInfoA;
+
   // The input matrix A.
   // If (routeAct == true && batchM), the shape is [M, K]. tmaA is not used.
   // Otherwise, check layout of tmaA to see the shape and strides.
