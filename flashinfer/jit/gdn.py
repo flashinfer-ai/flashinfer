@@ -69,7 +69,7 @@ def gen_gdn_prefill_sm90_module() -> JitSpec:
     # Headers are now in include/flashinfer/flat/ and accessible via standard include paths
     for filename in [
         "gdn_prefill_launcher.cu",
-        "flat/prefill/prefill_kernel_delta_rule_sm90.cu",
+        "prefill_kernel_delta_rule_sm90.cu",
     ]:
         src_path = jit_env.FLASHINFER_CSRC_DIR / filename
         dest_path = gen_directory / src_path.name
