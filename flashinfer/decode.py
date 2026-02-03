@@ -1168,6 +1168,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
         return_lse: Literal[False] = False,
         enable_pdl: Optional[bool] = None,
         window_left: Optional[int] = None,
+        sinks: Optional[torch.Tensor] = None,
+        q_len_per_req: Optional[int] = 1,
+        skip_softmax_threshold_scale_factor: Optional[float] = None,
     ) -> torch.Tensor: ...
 
     @overload
@@ -1184,6 +1187,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
         return_lse: Literal[True] = True,
         enable_pdl: Optional[bool] = None,
         window_left: Optional[int] = None,
+        sinks: Optional[torch.Tensor] = None,
+        q_len_per_req: Optional[int] = 1,
+        skip_softmax_threshold_scale_factor: Optional[float] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
     @flashinfer_api
@@ -1202,6 +1208,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         window_left: Optional[int] = None,
         sinks: Optional[torch.Tensor] = None,
         q_len_per_req: Optional[int] = 1,
+        skip_softmax_threshold_scale_factor: Optional[float] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch decode attention between query and paged kv cache.
 
@@ -1241,6 +1248,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
             Only supported for >= sm90, and currently only for FA2 and CUDA core decode.
         q_len_per_req : int
             The number of query tokens per request, if not provided, will be set to ``1``.
+        skip_softmax_threshold_scale_factor: Optional[float] = None
+            threshold scale factor for skipping softmax.
         Returns
         -------
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -1370,6 +1379,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     page_size,
                     self._max_kv_len,
                     sinks,
+                    skip_softmax_threshold_scale_factor,
                 ]
 
             self._cached_module.paged_run(*run_args)
@@ -2024,6 +2034,7 @@ def get_trtllm_gen_decode_module(*args):
         page_size: Optional[int] = None,
         max_kv_len: Optional[int] = None,
         sinks: Optional[torch.Tensor] = None,
+        skip_softmax_threshold_scale_factor: Optional[float] = None,
     ) -> None:
         assert maybe_lse is None
         assert paged_kv_cache is not None
@@ -2050,6 +2061,7 @@ def get_trtllm_gen_decode_module(*args):
             enable_pdl,
             out=o,
             sinks=sinks,
+            skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
         )
 
     @register_fake_op(f"flashinfer::{uri}_paged_run")
@@ -2089,6 +2101,7 @@ def get_trtllm_gen_decode_module(*args):
         page_size: Optional[int] = None,
         max_kv_len: Optional[int] = None,
         sinks: Optional[torch.Tensor] = None,
+        skip_softmax_threshold_scale_factor: Optional[float] = None,
     ) -> None:
         pass
 
