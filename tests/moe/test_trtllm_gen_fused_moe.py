@@ -2164,7 +2164,7 @@ def run_moe_reference_dsfp8(args):
         gemm2_weights_dequant,
         args.permute_info,
         args.use_routing_scales_on_input,
-        args.activation_type.value,
+        args.activation_type,
     )
 
     return run_moe_dequant(args_dequant, QuantMode.FP8_BLOCK_SCALE), args_dequant
@@ -2201,7 +2201,7 @@ def run_moe_reference_per_tensor_scale_fp8(args):
         gemm2_weights_dequant,
         args.permute_info,
         args.use_routing_scales_on_input,
-        args.activation_type.value,
+        args.activation_type,
     )
 
     return run_moe_dequant(args_dequant, QuantMode.FP8_PER_TENSOR), args_dequant
@@ -2232,7 +2232,7 @@ def run_moe_reference_bf16(args):
         gemm2_weights_dequant,
         args.permute_info,
         args.use_routing_scales_on_input,
-        args.activation_type.value,
+        args.activation_type,
     )
 
     return run_moe_dequant(args_dequant, QuantMode.BF16), args_dequant
