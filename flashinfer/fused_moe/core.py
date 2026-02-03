@@ -2348,6 +2348,40 @@ def trtllm_fp8_block_scale_moe(
     )
 
 
+def unpack_topk_ids(packed_topk_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Unpack the combined expert IDs and routing weights tensor.
+    
+    This function is used to extract the expert indices and routing weights
+    from the packed format used in routed MoE operations.
+    
+    Args:
+        packed_topk_ids: [seq_len, top_k] tensor of packed expert indices and weights (int32).
+            Format: (expert_id << 16) | (weight_bf16.view(int16))
+    
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
+            - expert_ids: [seq_len, top_k] tensor of expert indices (int32)
+            - expert_weights: [seq_len, top_k] tensor of routing weights (bfloat16)
+    
+    Example:
+        >>> # Create packed tensor
+        >>> topk_ids = torch.tensor([[0, 1], [2, 3]], device='cuda', dtype=torch.int32)
+        >>> weights = torch.tensor([[0.5, 0.5], [0.6, 0.4]], device='cuda', dtype=torch.bfloat16)
+        >>> packed = (topk_ids << 16) | weights.view(torch.int16).to(torch.int32)
+        >>> # Unpack
+        >>> expert_ids, expert_weights = unpack_topk_ids(packed)
+    """
+    # Extract expert IDs from upper 16 bits
+    expert_ids = packed_topk_ids >> 16
+    
+    # Extract weights from lower 16 bits
+    # Mask to get lower 16 bits, then reinterpret as bfloat16
+    weight_bits = packed_topk_ids & 0xFFFF
+    expert_weights = weight_bits.to(torch.int16).view(torch.bfloat16)
+    
+    return expert_ids, expert_weights
+
+
 @flashinfer_api
 def trtllm_fp8_block_scale_routed_moe(
     topk_ids: torch.Tensor,

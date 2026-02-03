@@ -384,3 +384,38 @@ def test_trtllm_gen_fp8_routed_fused_moe(
     # mismatch percentage
     mismatch_pct = (~mask).float().mean().item() * 100
     assert mismatch_pct < 10, f"Mismatch percentage is {mismatch_pct:.2f}%"
+
+
+@pytest.mark.parametrize("num_tokens", [1, 8, 64])
+@pytest.mark.parametrize("top_k", [2, 4, 8])
+def test_unpack_topk_ids(num_tokens: int, top_k: int):
+    """Test unpacking of packed topk_ids tensor."""
+    from flashinfer.fused_moe import unpack_topk_ids
+
+    torch.manual_seed(42)
+    device = torch.device("cuda:0")
+
+    # Create original expert IDs and weights
+    num_experts = 128
+    expert_ids_original = torch.randint(
+        0, num_experts, (num_tokens, top_k), device=device, dtype=torch.int32
+    )
+    expert_weights_original = torch.rand(
+        num_tokens, top_k, device=device, dtype=torch.bfloat16
+    )
+
+    # Pack them together
+    packed_topk_ids = (expert_ids_original << 16) | expert_weights_original.view(
+        torch.int16
+    ).to(torch.int32)
+
+    # Unpack using the utility function
+    expert_ids_unpacked, expert_weights_unpacked = unpack_topk_ids(packed_topk_ids)
+
+    # Verify that unpacked values match the original
+    assert torch.equal(
+        expert_ids_unpacked, expert_ids_original
+    ), "Expert IDs don't match after unpacking"
+    assert torch.equal(
+        expert_weights_unpacked, expert_weights_original
+    ), "Expert weights don't match after unpacking"
