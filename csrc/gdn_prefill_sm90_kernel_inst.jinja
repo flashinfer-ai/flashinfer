@@ -31,7 +31,7 @@ namespace flat {
 // Parameter types must exactly match the extern template declaration in prefill_kernel_delta_rule_sm90_extern.inc
 template void launch_delta_rule_prefill_kernel_gbai<{{ is_gva }}, {{ needs_beta }}, {{ needs_alpha }}, {{ init_state }}, cutlass::arch::Sm90, {{ dtype }}, {{ dtype }}, float>(
     cudaStream_t, {{ dtype }}*, float*, {{ dtype }} const*, {{ dtype }} const*, {{ dtype }} const*,
-    float const*, float const*, float const*, int64_t const*, int32_t, int32_t,
+    float const*, float const*, float const*, int64_t const*, uint8_t*, int32_t, int32_t,
     int32_t, int32_t, int32_t, int32_t, int64_t, float, int32_t);
 
 }  // namespace flat

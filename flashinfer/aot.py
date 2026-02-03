@@ -443,9 +443,6 @@ def gen_all_modules(
     add_misc: bool,
     add_xqa: bool,
 ) -> List[JitSpec]:
-    # TEMPORARY: Only compile gdn_prefill_sm90 for testing
-    return [gen_gdn_prefill_sm90_module()]
-
     jit_specs: List[JitSpec] = []
     jit_specs.append(gen_spdlog_module())
     has_sm90 = sm_capabilities.get("sm90", False)
