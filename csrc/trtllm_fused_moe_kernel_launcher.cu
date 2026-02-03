@@ -1705,6 +1705,29 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
     int64_t local_expert_offset, int64_t local_num_experts, Optional<double> routed_scaling_factor,
     int64_t routing_method_type, bool do_finalize, bool enable_pdl, int64_t gated_act_type,
     TensorView output, Array<int64_t> config_index) {
+  // DEBUG: Probe what TVM-FFI passes for topk_ids and topk_weights
+  std::cerr << "=== DEBUG trtllm_fp4_block_scale_moe ===" << std::endl;
+  std::cerr << "routing_logits.has_value(): " << routing_logits.has_value() << std::endl;
+  std::cerr << "topk_ids.data_ptr(): " << topk_ids.data_ptr() << std::endl;
+  std::cerr << "topk_ids.ndim(): " << topk_ids.ndim() << std::endl;
+  if (topk_ids.ndim() > 0) {
+    std::cerr << "topk_ids.shape: [";
+    for (int i = 0; i < topk_ids.ndim(); i++) {
+      std::cerr << topk_ids.size(i) << (i < topk_ids.ndim() - 1 ? ", " : "");
+    }
+    std::cerr << "]" << std::endl;
+  }
+  std::cerr << "topk_weights.data_ptr(): " << topk_weights.data_ptr() << std::endl;
+  std::cerr << "topk_weights.ndim(): " << topk_weights.ndim() << std::endl;
+  if (topk_weights.ndim() > 0) {
+    std::cerr << "topk_weights.shape: [";
+    for (int i = 0; i < topk_weights.ndim(); i++) {
+      std::cerr << topk_weights.size(i) << (i < topk_weights.ndim() - 1 ? ", " : "");
+    }
+    std::cerr << "]" << std::endl;
+  }
+  std::cerr << "========================================" << std::endl;
+
   // Determine data types based on input format
   int const num_tokens = hidden_states.size(0);
   int hidden_size = hidden_states.size(1);
