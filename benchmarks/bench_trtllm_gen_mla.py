@@ -29,7 +29,6 @@ def bench_trtllm_mla(batch_size, q_len_per_request, seq_len, page_size, dtype):
     # Sequence lengths and block tables
     seq_lens = [torch.randint(1, seq_len, (1,)).item() for _ in range(batch_size)]
     seq_lens[-1] = seq_len
-    print(f"Average sequence length: {np.mean(seq_lens)}")
     max_seq_len = max(seq_lens)
     seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int, device=device)
 
@@ -135,16 +134,11 @@ def bench_trtllm_mla(batch_size, q_len_per_request, seq_len, page_size, dtype):
 
 
 if __name__ == "__main__":
-    # for dtype in [torch.bfloat16, torch.float8_e4m3fn]:
-    for dtype in [torch.float8_e4m3fn]:
-        # for page_size in [32, 64]:
-        for page_size in [64]:
-            # for batch_size in [1, 2, 4, 16, 32, 64, 128, 256, 512, 768, 1024]:
-            for batch_size in [1024]:
-                # for seq_len in [1024, 4096, 8192]:
-                for seq_len in [8192]:
-                    # for q_len_per_request in [1, 2, 4, 8, 16]:
-                    for q_len_per_request in [1]:
+    for dtype in [torch.bfloat16, torch.float8_e4m3fn]:
+        for page_size in [32, 64]:
+            for batch_size in [1, 2, 4, 16, 32, 64, 128, 256, 512, 768, 1024]:
+                for seq_len in [1024, 4096, 8192]:
+                    for q_len_per_request in [1, 2, 4, 8, 16]:
                         bench_trtllm_mla(
                             batch_size, q_len_per_request, seq_len, page_size, dtype
                         )
