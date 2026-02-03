@@ -41,6 +41,12 @@ using tensorrt_llm::kernels::trtllmgen_moe::Routing::RoutingMethodType;
 using tvm::ffi::Array;
 using tvm::ffi::Optional;
 
+enum class RoutingInputMode {
+  FromLogits,          // Mode 1: Compute routing from logits
+  PackedPrecomputed,   // Mode 2: Pre-computed with packed (score << 16 | id) format
+  UnpackedPrecomputed  // Mode 3: Pre-computed with separate topk_ids and topk_weights
+};
+
 // Utility function to compute the next power of two
 inline int32_t nextPowerOfTwo(float value) {
   int32_t n = static_cast<int32_t>(std::ceil(value));
@@ -342,8 +348,15 @@ class FusedMoeLauncher {
 
     cudaStream_t routing_stream = get_stream(hidden_states.device());
 
-    // Execute routing (handles both pre-computed and from-logits paths)
+    // Execute routing
     tensorrt_llm::kernels::trtllmgen_moe::Routing::Runner routing_runner(tile_tokens_dim);
+
+    // This base class only supports Mode 1 (FromLogits) - compute routing from logits
+    constexpr RoutingInputMode routing_input_mode = RoutingInputMode::FromLogits;
+
+    // Mode 1: expertIds is nullptr, expertWeights is OUTPUT buffer for computed weights
+    int32_t* expert_ids_param = nullptr;
+    void* expert_weights_param = expert_weights.data_ptr();
 
     routing_runner.run(
         args->routing_logits, args->routing_bias, args->num_tokens, args->num_experts, args->top_k,
@@ -353,10 +366,8 @@ class FusedMoeLauncher {
         static_cast<int*>(total_num_padded_tokens.data_ptr()),
         static_cast<int*>(expanded_idx_to_permuted_idx.data_ptr()),
         nullptr /*permuted_idx_to_expanded_idx.data_ptr()*/,
-        static_cast<int*>(permuted_idx_to_token_idx.data_ptr()),
-        nullptr /*expertIds - not used when computing from logits*/,
-        expert_weights.data_ptr(),
-        static_cast<int*>(num_tokens_per_expert.data_ptr()),
+        static_cast<int*>(permuted_idx_to_token_idx.data_ptr()), expert_ids_param,
+        expert_weights_param, static_cast<int*>(num_tokens_per_expert.data_ptr()),
         static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr()),
         static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr()),
         static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt, mRoutingBiasDtype,
@@ -1346,13 +1357,37 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     tensorrt_llm::kernels::trtllmgen_moe::Routing::Runner routing_runner(tile_tokens_dim);
     cudaStream_t routing_stream = get_stream(hidden_states.device());
 
-    // Determine routing mode based on inputs:
-    // - If routing_logits != nullptr: compute routing from logits
-    // - If routing_logits == nullptr: pre-computed routing (packed format)
-    // Note: Unpacked pre-computed format would require passing topk_ids.data_ptr() as expertIds,
-    // but for now we only support packed format, so expertIds is always nullptr
-    int32_t* precomputed_topk_ids = nullptr;  // nullptr = packed format
-    void* topk_weights_ptr = topk_weights.data_ptr();
+    // Detect routing input mode (see RoutingInputMode enum for detailed documentation)
+    // Currently only Mode 1 (FromLogits) and Mode 2 (PackedPrecomputed) are supported.
+    // Mode 3 (UnpackedPrecomputed) will be added in the future.
+    RoutingInputMode routing_input_mode = (args->routing_logits != nullptr)
+                                              ? RoutingInputMode::FromLogits
+                                              : RoutingInputMode::PackedPrecomputed;
+
+    // Set routing kernel parameters based on mode
+    int32_t* expert_ids_param = nullptr;   // INPUT: pre-computed expert IDs (Mode 3 only)
+    void* expert_weights_param = nullptr;  // INPUT or OUTPUT depending on mode
+
+    switch (routing_input_mode) {
+      case RoutingInputMode::FromLogits:
+        expert_ids_param = nullptr;
+        expert_weights_param = topk_weights.data_ptr();
+        break;
+
+      case RoutingInputMode::PackedPrecomputed:
+        expert_ids_param = nullptr;
+        expert_weights_param = topk_weights.data_ptr();
+        break;
+
+      case RoutingInputMode::UnpackedPrecomputed:
+        // Mode 3: Both are INPUTS, kernel uses them directly (not yet implemented)
+        // expert_ids_param = static_cast<int32_t*>(precomputed_topk_ids.data_ptr());
+        // expert_weights_param = precomputed_topk_weights.data_ptr();
+        TVM_FFI_LOG_AND_THROW(NotImplementedError)
+            << "UnpackedPrecomputed routing mode is not yet implemented";
+        break;
+    }
+
     routing_runner.run(args->routing_logits, args->routing_bias, args->num_tokens,
                        args->num_experts, args->top_k, args->n_group, args->topk_group,
                        args->local_expert_offset, args->local_num_experts,
@@ -1361,9 +1396,8 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
                        static_cast<int*>(total_num_padded_tokens.data_ptr()),
                        static_cast<int*>(expanded_idx_to_permuted_idx.data_ptr()),
                        nullptr /*permuted_idx_to_expanded_idx*/,
-                       static_cast<int*>(permuted_idx_to_token_idx.data_ptr()),
-                       precomputed_topk_ids, topk_weights_ptr,
-                       static_cast<int*>(num_tokens_per_expert.data_ptr()),
+                       static_cast<int*>(permuted_idx_to_token_idx.data_ptr()), expert_ids_param,
+                       expert_weights_param, static_cast<int*>(num_tokens_per_expert.data_ptr()),
                        static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr()),
                        static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr()),
                        static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt,
