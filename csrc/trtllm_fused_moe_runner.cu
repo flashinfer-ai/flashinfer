@@ -236,15 +236,22 @@ void Runner::run(void* hiddenState, void* hiddenStateScale, void* weights, void*
                  int32_t* permutedIdxToTokenIdx, int32_t* ptrNumNonExitingCtas,
                  int32_t* ptrTotalNumPaddedTokens, int32_t* ptrCtaIdxXyToBatchIdx,
                  int32_t* ptrCtaIdxXyToMnLimit, void* bmm1Workspace, bool useRoutingScalesOnInput,
-                 int device, cudaStream_t stream, int32_t configIndex, bool enable_pdl) {
+                 int device, cudaStream_t stream, int32_t configIndex, bool enable_pdl,
+                 int32_t validHiddenSize, int32_t validIntermediateSize) {
   auto maxNumCtasInBatchDim =
       Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
+  // GEMM1: [numTokens, hiddenSize] @ [hiddenSize, 2*intermediateSize] -> [numTokens,
+  // 2*intermediateSize] For batched GEMM with transposeMmaOutput: M=numTokens,
+  // N=2*intermediateSize, K=hiddenSize validN = 2*validIntermediateSize, validK = validHiddenSize
+  int32_t validN = (validIntermediateSize >= 0) ? 2 * validIntermediateSize : -1;
+  int32_t validK = validHiddenSize;
   mRunner.run(numTokens, 2 * intermediateSize, hiddenSize, {}, numTokens, numExperts,
               maxNumCtasInBatchDim, hiddenState, hiddenStateScale, weights, weightsScale,
               expertWeights, /* perTokensSfB */ nullptr, outputScalesScalar, outputScalesGateScalar,
               ptrBias, ptrAlpha, ptrBeta, ptrClampLimit, output, outputScale, permutedIdxToTokenIdx,
               ptrTotalNumPaddedTokens, ptrCtaIdxXyToBatchIdx, ptrCtaIdxXyToMnLimit,
-              ptrNumNonExitingCtas, bmm1Workspace, stream, device, configIndex, enable_pdl);
+              ptrNumNonExitingCtas, bmm1Workspace, stream, device, configIndex, enable_pdl,
+              /* validM */ -1, validN, validK);
 }
 
 size_t Runner::getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
@@ -321,9 +328,15 @@ void Runner::run(void* permutedHiddenState, void* permutedHiddenStateScale, void
                  int32_t numExperts, int32_t numTokens, int32_t* ptrNumNonExitingCtas,
                  int32_t* ptrTotalNumPaddedTokens, int32_t* ptrCtaIdxXyToBatchIdx,
                  int32_t* ptrCtaIdxXyToMnLimit, void* bmm2Workspace, int device,
-                 cudaStream_t stream, int32_t configIndex, bool enable_pdl) {
+                 cudaStream_t stream, int32_t configIndex, bool enable_pdl,
+                 int32_t validIntermediateSize, int32_t validHiddenSize) {
   auto maxNumCtasInBatchDim =
       Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
+  // GEMM2: [numTokens, intermediateSize] @ [intermediateSize, hiddenSize] -> [numTokens,
+  // hiddenSize] For batched GEMM with transposeMmaOutput: M=numTokens, N=hiddenSize,
+  // K=intermediateSize validN = validHiddenSize, validK = validIntermediateSize
+  int32_t validN = validHiddenSize;
+  int32_t validK = validIntermediateSize;
   mRunner.run(
       numTokens, hiddenSize, intermediateSize, {}, numTokens, numExperts, maxNumCtasInBatchDim,
       permutedHiddenState, permutedHiddenStateScale, weights, weightsScale,
@@ -332,7 +345,7 @@ void Runner::run(void* permutedHiddenState, void* permutedHiddenStateScale, void
       /* ptrAlpha */ nullptr, /* ptrBeta */ nullptr, /* clampLimit */ nullptr, output, outputScale,
       /* permutedIdxToTokenIdx */ nullptr, ptrTotalNumPaddedTokens, ptrCtaIdxXyToBatchIdx,
       ptrCtaIdxXyToMnLimit, ptrNumNonExitingCtas, bmm2Workspace, stream, device, configIndex,
-      enable_pdl);
+      enable_pdl, /* validM */ -1, validN, validK);
 }
 
 size_t Runner::getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
@@ -517,16 +530,20 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
 
   auto const& config = mPassingConfigs[configIndex];
 
-  mPermuteGemm1.run(args.hidden_states, hidden_states_scale_linear, args.gemm1_weights,
-                    args.gemm1_weights_scale, workspace.token_scales, args.output1_scales_scalar,
-                    args.output1_scales_gate_scalar, args.gemm1_bias, args.gemm1_alpha,
-                    args.gemm1_beta, args.gemm1_clamp_limit, workspace.gemm1_output,
-                    workspace.gemm1_output_scale, args.top_k, args.hidden_size,
-                    args.intermediate_size, args.local_num_experts, args.num_tokens,
-                    workspace.permuted_idx_to_token_idx, workspace.num_non_exiting_ctas,
-                    workspace.total_num_padded_tokens, workspace.cta_idx_xy_to_batch_idx,
-                    workspace.cta_idx_xy_to_mn_limit, workspace.bmm1_workspace,
-                    args.mUseRoutingScalesOnInput, device, stream, config.gemm1Config, enable_pdl);
+  // Pass valid dimensions: validHiddenSize (K for GEMM1), validIntermediateSize (N/2 for GEMM1)
+  int32_t validHiddenSize = args.valid_hidden_size.value_or(-1);
+  int32_t validIntermediateSize = args.valid_intermediate_size.value_or(-1);
+
+  mPermuteGemm1.run(
+      args.hidden_states, hidden_states_scale_linear, args.gemm1_weights, args.gemm1_weights_scale,
+      workspace.token_scales, args.output1_scales_scalar, args.output1_scales_gate_scalar,
+      args.gemm1_bias, args.gemm1_alpha, args.gemm1_beta, args.gemm1_clamp_limit,
+      workspace.gemm1_output, workspace.gemm1_output_scale, args.top_k, args.hidden_size,
+      args.intermediate_size, args.local_num_experts, args.num_tokens,
+      workspace.permuted_idx_to_token_idx, workspace.num_non_exiting_ctas,
+      workspace.total_num_padded_tokens, workspace.cta_idx_xy_to_batch_idx,
+      workspace.cta_idx_xy_to_mn_limit, workspace.bmm1_workspace, args.mUseRoutingScalesOnInput,
+      device, stream, config.gemm1Config, enable_pdl, validHiddenSize, validIntermediateSize);
 
   // We do not fuse activation with FC1 for DeepSeek FP8 due to the weights shuffling constraint.
   void* gemm2_input = workspace.gemm1_output;
@@ -540,13 +557,14 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
   }
 
   // Run gemm2
+  // Pass valid dimensions: validIntermediateSize (K for GEMM2), validHiddenSize (N for GEMM2)
   mGemm2.run(gemm2_input, gemm2_input_scale, args.gemm2_weights, args.gemm2_weights_scale,
              args.output2_scales_scalar, args.gemm2_bias, workspace.gemm2_output,
              workspace.gemm2_output_scale, args.top_k, args.hidden_size, args.intermediate_size,
              args.local_num_experts, args.num_tokens, workspace.num_non_exiting_ctas,
              workspace.total_num_padded_tokens, workspace.cta_idx_xy_to_batch_idx,
              workspace.cta_idx_xy_to_mn_limit, workspace.bmm2_workspace, device, stream,
-             config.gemm2Config, enable_pdl);
+             config.gemm2Config, enable_pdl, validIntermediateSize, validHiddenSize);
 
   // Run finalize
   if (args.do_finalize) {

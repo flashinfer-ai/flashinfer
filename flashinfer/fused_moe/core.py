@@ -2291,6 +2291,8 @@ def trtllm_fp8_block_scale_moe(
     weight_layout: int = 0,
     enable_pdl: Optional[bool] = None,
     tune_max_num_tokens: int = 8192,
+    valid_hidden_size: Optional[int] = None,
+    valid_intermediate_size: Optional[int] = None,
 ) -> torch.Tensor:
     """FP8 block scale MoE operation.
 
@@ -2314,6 +2316,11 @@ def trtllm_fp8_block_scale_moe(
         routing_method_type: Type of routing method to use (default: 0)
         enable_pdl: Whether to enable Programmatic Dependent Launch (PDL). Auto-enabled for >= sm90.
         tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 8192)
+        valid_hidden_size (Optional[int]): Valid (unpadded) hidden dimension. If provided,
+            the hidden_size from tensor shape is treated as padded, and only the valid region
+            is computed. Defaults to None (uses full hidden_size).
+        valid_intermediate_size (Optional[int]): Valid (unpadded) intermediate dimension.
+            If provided, the intermediate_size is treated as padded. Defaults to None.
     Returns:
         torch.Tensor: Output tensor of shape [seq_len, hidden_size]
     """
@@ -2345,6 +2352,8 @@ def trtllm_fp8_block_scale_moe(
         weight_layout,
         enable_pdl,
         tune_max_num_tokens,
+        valid_hidden_size,
+        valid_intermediate_size,
     )
 
 
@@ -2372,6 +2381,8 @@ def trtllm_fp8_block_scale_routed_moe(
     enable_pdl: Optional[bool] = None,
     output: Optional[torch.Tensor] = None,
     tune_max_num_tokens: int = 8192,
+    valid_hidden_size: Optional[int] = None,
+    valid_intermediate_size: Optional[int] = None,
 ) -> torch.Tensor:
     """FP8 block scale MoE operation with pre-computed routing (packed format).
 
@@ -2406,6 +2417,11 @@ def trtllm_fp8_block_scale_routed_moe(
         output (Optional[torch.Tensor]): shape [seq_len, hidden_size]
             Optional inplace output tensor.
         tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 8192)
+        valid_hidden_size (Optional[int]): Valid (unpadded) hidden dimension. If provided,
+            the hidden_size from tensor shape is treated as padded, and only the valid region
+            is computed. Defaults to None (uses full hidden_size).
+        valid_intermediate_size (Optional[int]): Valid (unpadded) intermediate dimension.
+            If provided, the intermediate_size is treated as padded. Defaults to None.
     Returns:
         torch.Tensor: Output tensor of shape [seq_len, hidden_size]
     """
@@ -2434,6 +2450,8 @@ def trtllm_fp8_block_scale_routed_moe(
         weight_layout,
         enable_pdl,
         tune_max_num_tokens,
+        valid_hidden_size,
+        valid_intermediate_size,
     )
 
 
@@ -2469,6 +2487,8 @@ def trtllm_fp4_block_scale_moe(
     gated_act_type: int = 0,
     output: Optional[torch.Tensor] = None,
     tune_max_num_tokens: int = 8192,
+    valid_hidden_size: Optional[int] = None,
+    valid_intermediate_size: Optional[int] = None,
 ) -> List[torch.Tensor]:
     """FP4 block scale MoE operation.
 
@@ -2527,6 +2547,12 @@ def trtllm_fp4_block_scale_moe(
         tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 8192)
         output (Optional[torch.Tensor]): shape [seq_len, hidden_size]
             Optional inplace output tensor.
+        valid_hidden_size (Optional[int]): Valid (unpadded) hidden dimension. If provided,
+            the hidden_size from tensor shape is treated as padded, and only the valid region
+            is computed. This allows tensors to be padded for alignment while computing only
+            the valid region. Defaults to None (uses full hidden_size).
+        valid_intermediate_size (Optional[int]): Valid (unpadded) intermediate dimension.
+            If provided, the intermediate_size is treated as padded. Defaults to None.
     Returns:
         List[torch.Tensor]: List of output tensors. If do_finalize=True, returns the final MoE output.
             Otherwise, returns intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
@@ -2564,6 +2590,8 @@ def trtllm_fp4_block_scale_moe(
         gated_act_type,
         output,
         tune_max_num_tokens,
+        valid_hidden_size,
+        valid_intermediate_size,
     )
 
 
@@ -2599,6 +2627,8 @@ def trtllm_fp4_block_scale_routed_moe(
     gated_act_type: int = 0,
     output: Optional[torch.Tensor] = None,
     tune_max_num_tokens: int = 8192,
+    valid_hidden_size: Optional[int] = None,
+    valid_intermediate_size: Optional[int] = None,
 ) -> List[torch.Tensor]:
     """FP4 block scale MoE operation.
 
@@ -2658,6 +2688,12 @@ def trtllm_fp4_block_scale_routed_moe(
         tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 8192)
         output (Optional[torch.Tensor]): shape [seq_len, hidden_size]
             Optional inplace output tensor.
+        valid_hidden_size (Optional[int]): Valid (unpadded) hidden dimension. If provided,
+            the hidden_size from tensor shape is treated as padded, and only the valid region
+            is computed. This allows tensors to be padded for alignment while computing only
+            the valid region. Defaults to None (uses full hidden_size).
+        valid_intermediate_size (Optional[int]): Valid (unpadded) intermediate dimension.
+            If provided, the intermediate_size is treated as padded. Defaults to None.
 
     Returns:
         List[torch.Tensor]: List of output tensors. If do_finalize=True, returns the final MoE output.
@@ -2696,6 +2732,8 @@ def trtllm_fp4_block_scale_routed_moe(
         gated_act_type,
         output,
         tune_max_num_tokens,
+        valid_hidden_size,
+        valid_intermediate_size,
     )
 
 
@@ -2723,6 +2761,8 @@ def trtllm_mxint4_block_scale_moe(
     enable_pdl: Optional[bool] = None,
     output: Optional[torch.Tensor] = None,
     tune_max_num_tokens: int = 8192,
+    valid_hidden_size: Optional[int] = None,
+    valid_intermediate_size: Optional[int] = None,
 ) -> List[torch.Tensor]:
     """MxInt4 block scale MoE operation.
 
@@ -2765,6 +2805,12 @@ def trtllm_mxint4_block_scale_moe(
         tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 8192)
         output (Optional[torch.Tensor]): shape [seq_len, hidden_size]
             Optional inplace output tensor.
+        valid_hidden_size (Optional[int]): Valid (unpadded) hidden dimension. If provided,
+            the hidden_size from tensor shape is treated as padded, and only the valid region
+            is computed. This allows tensors to be padded for alignment while computing only
+            the valid region. Defaults to None (uses full hidden_size).
+        valid_intermediate_size (Optional[int]): Valid (unpadded) intermediate dimension.
+            If provided, the intermediate_size is treated as padded. Defaults to None.
     Returns:
         torch.Tensor: returns the final MoE output.
     """
@@ -2791,4 +2837,6 @@ def trtllm_mxint4_block_scale_moe(
         enable_pdl,
         output,
         tune_max_num_tokens,
+        valid_hidden_size,
+        valid_intermediate_size,
     )

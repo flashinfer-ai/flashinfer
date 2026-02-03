@@ -178,6 +178,10 @@ class Runner {
 
   [[nodiscard]] std::vector<int64_t> getPassingConfigIndices() const;
 
+  // GEMM1: [numTokens, hiddenSize] @ [hiddenSize, 2*intermediateSize] -> [numTokens,
+  // 2*intermediateSize] validHiddenSize: valid K dimension (unpadded). If negative, uses
+  // hiddenSize. validIntermediateSize: valid N/2 dimension (unpadded). If negative, uses
+  // intermediateSize.
   void run(void* hiddenState, void* hiddenStateScale, void* weight, void* weightScale,
            void* expertWeights, float* outputScalesScalar, float* outputScalesGateScalar,
            float* ptrBias, float* ptrGatedActAlpha, float* ptrGatedActBeta, float* ptrClampLimit,
@@ -186,7 +190,8 @@ class Runner {
            int32_t* permutedIdxToTokenIdx, int32_t* ptrNumNonExitingCtas,
            int32_t* ptrTotalNumPaddedTokens, int32_t* ptrCtaIdxXyToBatchIdx,
            int32_t* ptrCtaIdxXyToMnLimit, void* bmm1Workspace, bool useRoutingScalesOnInput,
-           int device, cudaStream_t stream, int32_t configIndex, bool enable_pdl);
+           int device, cudaStream_t stream, int32_t configIndex, bool enable_pdl,
+           int32_t validHiddenSize = -1, int32_t validIntermediateSize = -1);
 
  private:
   batchedGemm::trtllm::gen::Dtype mDtypeAct;
@@ -218,13 +223,17 @@ class Runner {
 
   [[nodiscard]] std::vector<int64_t> getPassingConfigIndices() const;
 
+  // GEMM2: [numTokens, intermediateSize] @ [intermediateSize, hiddenSize] -> [numTokens,
+  // hiddenSize] validIntermediateSize: valid K dimension (unpadded). If negative, uses
+  // intermediateSize. validHiddenSize: valid N dimension (unpadded). If negative, uses hiddenSize.
   void run(void* permutedHiddenState, void* permutedHiddenStateScale, void* weight,
            void* weightScale, float* outputScalesScalar, float* ptrBias, void* output,
            void* outputScale, int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
            int32_t numExperts, int32_t numTokens, int32_t* ptrNumNonExitingCtas,
            int32_t* ptrTotalNumPaddedTokens, int32_t* ptrCtaIdxXyToBatchIdx,
            int32_t* ptrCtaIdxXyToMnLimit, void* bmm2Workspace, int device, cudaStream_t stream,
-           int32_t configIndex, bool enable_pdl);
+           int32_t configIndex, bool enable_pdl, int32_t validIntermediateSize = -1,
+           int32_t validHiddenSize = -1);
 
  private:
   batchedGemm::trtllm::gen::Dtype mDtypeAct;
@@ -273,6 +282,17 @@ struct MoERunnerArgs {
   int32_t topk_group{0};
   float routed_scaling_factor{0.0f};
   int32_t intermediate_size{0};
+
+  // Valid (unpadded) dimensions for GEMM computation.
+  // These allow tensor dimensions to be padded for alignment while computing only the valid region.
+  // If not provided, they default to the corresponding padded dimensions.
+  // - valid_hidden_size: Valid K dimension for GEMM1, valid N dimension for GEMM2
+  // - valid_intermediate_size: Valid N/2 dimension for GEMM1, valid K dimension for GEMM2
+  // - valid_hidden_size_output: Valid output dimension (used by finalize kernel)
+  std::optional<int32_t> valid_hidden_size;
+  std::optional<int32_t> valid_intermediate_size;
+  std::optional<int32_t> valid_hidden_size_output;
+
   int32_t local_expert_offset{0};
   int32_t local_num_experts{0};
   // TODO: support other types
