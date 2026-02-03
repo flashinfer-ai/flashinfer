@@ -152,6 +152,7 @@ def get_customize_batch_prefill_module(
     use_logits_soft_cap: bool = False,
     use_fp16_qk_reduction: bool = False,
     fp8_enabled: bool = False,
+    mask_modes: Optional[List[int]] = None,
 ):
     return gen_customize_batch_prefill_module(
         backend,
@@ -173,6 +174,7 @@ def get_customize_batch_prefill_module(
         use_logits_soft_cap,
         use_fp16_qk_reduction,
         fp8_enabled,
+        mask_modes,
     ).build_and_load()
 
 
@@ -1491,6 +1493,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._seq_lens_kv = None
         self._seq_lens_q = None
         self._block_tables = None
+        self._mask_mode = None
 
     @property
     def is_cuda_graph_enabled(self) -> bool:
@@ -1555,6 +1558,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         max_sequence_kv: Optional[int] = None,
         fixed_split_size: Optional[int] = None,
         disable_split_kv: bool = False,
+        mask_mode: Optional[int] = None,
     ) -> None:
         r"""Plan batch prefill/append attention on Paged KV-Cache for given problem specification.
 
@@ -1917,6 +1921,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._rope_theta = rope_theta
         self._seq_lens_kv = seq_lens
         self._seq_lens_q = seq_lens_q if seq_lens_q is not None else seq_lens
+        self._mask_mode = mask_mode  # 可选：覆盖默认 mask_mode (e.g., MaskMode.BLOCK_EXPANDING)
 
     begin_forward = plan
 
@@ -2097,6 +2102,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         if self._custom_mask_buf is not None:
             mask_mode = MaskMode.CUSTOM.value
+        elif self._mask_mode is not None:
+            mask_mode = self._mask_mode
         else:
             if self._causal:
                 mask_mode = MaskMode.CAUSAL.value
@@ -2464,6 +2471,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._max_total_num_rows: Optional[int] = None
         self._backend = backend
         self._cached_module = None
+        self._mask_mode = None
 
     @property
     def is_cuda_graph_enabled(self) -> bool:
@@ -2520,6 +2528,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         max_item_len_ptr: Optional[torch.Tensor] = None,
         fixed_split_size: Optional[int] = None,
         disable_split_kv: bool = False,
+        mask_mode:Optional[int] = None,
     ) -> None:
         r"""Plan batch prefill/append attention on Ragged KV-Cache for given problem specification.
 
@@ -2783,6 +2792,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._sm_scale = sm_scale
         self._rope_scale = rope_scale
         self._rope_theta = rope_theta
+        self._mask_mode = mask_mode  # 可选：覆盖默认 mask_mode (e.g., MaskMode.BLOCK_EXPANDING)
 
     begin_forward = plan
 
@@ -2942,6 +2952,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
 
         if self._custom_mask_buf is not None:
             mask_mode = MaskMode.CUSTOM.value
+        elif self._mask_mode is not None:
+            mask_mode = self._mask_mode
         else:
             if self._causal:
                 mask_mode = MaskMode.CAUSAL.value

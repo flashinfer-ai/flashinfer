@@ -76,6 +76,22 @@ struct RaggedParams {
   __host__ __device__ __forceinline__ uint32_t get_kv_len(uint32_t batch_idx) const {
     return kv_indptr[batch_idx + 1] - kv_indptr[batch_idx];
   }
+
+  __host__ __device__ __forceinline__ uint32_t get_q_block_expanding_offset(uint32_t batch_idx) const {
+{% if 'maybe_q_block_expanding_offset' in additional_params_decl %}
+    return (maybe_q_block_expanding_offset != nullptr) ? maybe_q_block_expanding_offset[batch_idx] : 0;
+{% else %}
+    return 0;
+{% endif %}
+  }
+
+  __host__ __device__ __forceinline__ uint32_t get_kv_block_expanding_offset(uint32_t batch_idx) const {
+{% if 'maybe_kv_block_expanding_offset' in additional_params_decl %}
+    return (maybe_kv_block_expanding_offset != nullptr) ? maybe_kv_block_expanding_offset[batch_idx] : 0;
+{% else %}
+    return 0;
+{% endif %}
+  }
 };
 
 struct PagedParams {
@@ -115,6 +131,22 @@ struct PagedParams {
 
   __host__ __device__ __forceinline__ uint32_t get_kv_len(uint32_t batch_idx) const {
     return paged_kv.get_length(batch_idx);
+  }
+
+  __host__ __device__ __forceinline__ uint32_t get_q_block_expanding_offset(uint32_t batch_idx) const {
+{% if 'maybe_q_block_expanding_offset' in additional_params_decl %}
+    return (maybe_q_block_expanding_offset != nullptr) ? maybe_q_block_expanding_offset[batch_idx] : 0;
+{% else %}
+    return 0;
+{% endif %}
+  }
+
+  __host__ __device__ __forceinline__ uint32_t get_kv_block_expanding_offset(uint32_t batch_idx) const {
+{% if 'maybe_kv_block_expanding_offset' in additional_params_decl %}
+    return (maybe_kv_block_expanding_offset != nullptr) ? maybe_kv_block_expanding_offset[batch_idx] : 0;
+{% else %}
+    return 0;
+{% endif %}
   }
 };
 
