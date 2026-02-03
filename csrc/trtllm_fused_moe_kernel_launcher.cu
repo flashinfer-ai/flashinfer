@@ -353,8 +353,9 @@ class FusedMoeLauncher {
         static_cast<int*>(total_num_padded_tokens.data_ptr()),
         static_cast<int*>(expanded_idx_to_permuted_idx.data_ptr()),
         nullptr /*permuted_idx_to_expanded_idx.data_ptr()*/,
-        static_cast<int*>(permuted_idx_to_token_idx.data_ptr()), expert_weights.data_ptr(),
+        static_cast<int*>(permuted_idx_to_token_idx.data_ptr()),
         nullptr /*expertIds - not used when computing from logits*/,
+        expert_weights.data_ptr(),
         static_cast<int*>(num_tokens_per_expert.data_ptr()),
         static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr()),
         static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr()),
@@ -1117,7 +1118,7 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
       Optional<TensorView> const& gemm2_bias, Optional<TensorView> const& output1_scales_scalar,
       Optional<TensorView> const& output1_scales_gate_scalar,
       Optional<TensorView> const& output2_scales_scalar, TensorView const& topk_ids,
-      Optional<TensorView> const& topk_weights)
+      TensorView const& topk_weights)
       : FusedMoeLauncher(routing_logits, routing_bias, hidden_states, gemm1_weights,
                          output1_scales_scalar, output1_scales_gate_scalar, gemm2_weights,
                          output2_scales_scalar),
@@ -1192,8 +1193,7 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     workspace.total_max_padded_tokens = max_num_padded_tokens;
     workspace.ProjUpTileN = tile_tokens_dim;
     workspace.routing_expert_indexes = static_cast<int*>(const_cast<void*>(topk_ids.data_ptr()));
-    workspace.expert_weights =
-        topk_weights.has_value() ? const_cast<void*>(topk_weights.value().data_ptr()) : nullptr;
+    workspace.expert_weights = const_cast<void*>(topk_weights.data_ptr());
     workspace.permuted_idx_size = static_cast<int*>(total_num_padded_tokens.data_ptr());
     workspace.expanded_idx_to_permuted_idx =
         static_cast<int*>(expanded_idx_to_permuted_idx.data_ptr());
@@ -1333,8 +1333,7 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
   int32_t max_num_padded_tokens_gemm2{};
   Optional<Tensor> gemm1_output_scale;
   TensorView topk_ids;  // [num_tokens, top_k] - pre-computed or output top-k expert indices
-  Optional<TensorView> topk_weights;  // [num_tokens, top_k] - pre-computed or output top-k routing
-                                      // weights (optional for packed format)
+  TensorView topk_weights;  // [num_tokens, top_k] - pre-computed or output top-k routing weights
 
  public:
   Array<Tensor> run(int64_t moe_tactic, bool enable_pdl = true,
@@ -1349,13 +1348,11 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
 
     // Determine routing mode based on inputs:
     // - If routing_logits != nullptr: compute routing from logits
-    // - If routing_logits == nullptr && topk_weights has value: unpacked pre-computed (mPtrTopKIds
-    // + mPtrTopKWeights)
-    // - If routing_logits == nullptr && topk_weights is None: packed pre-computed (mPtrTopKPacked)
-    bool use_unpacked_prerouted = args->routing_logits == nullptr && topk_weights.has_value();
-    int32_t* precomputed_topk_ids =
-        use_unpacked_prerouted ? static_cast<int32_t*>(topk_ids.data_ptr()) : nullptr;
-    void* topk_weights_ptr = topk_weights.has_value() ? topk_weights.value().data_ptr() : nullptr;
+    // - If routing_logits == nullptr: pre-computed routing (packed format)
+    // Note: Unpacked pre-computed format would require passing topk_ids.data_ptr() as expertIds,
+    // but for now we only support packed format, so expertIds is always nullptr
+    int32_t* precomputed_topk_ids = nullptr;  // nullptr = packed format
+    void* topk_weights_ptr = topk_weights.data_ptr();
     routing_runner.run(args->routing_logits, args->routing_bias, args->num_tokens,
                        args->num_experts, args->top_k, args->n_group, args->topk_group,
                        args->local_expert_offset, args->local_num_experts,
@@ -1364,8 +1361,9 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
                        static_cast<int*>(total_num_padded_tokens.data_ptr()),
                        static_cast<int*>(expanded_idx_to_permuted_idx.data_ptr()),
                        nullptr /*permuted_idx_to_expanded_idx*/,
-                       static_cast<int*>(permuted_idx_to_token_idx.data_ptr()), topk_weights_ptr,
-                       precomputed_topk_ids, static_cast<int*>(num_tokens_per_expert.data_ptr()),
+                       static_cast<int*>(permuted_idx_to_token_idx.data_ptr()),
+                       precomputed_topk_ids, topk_weights_ptr,
+                       static_cast<int*>(num_tokens_per_expert.data_ptr()),
                        static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr()),
                        static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr()),
                        static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt,
@@ -1660,7 +1658,7 @@ Tensor trtllm_fp8_block_scale_moe(
 }
 
 Array<Tensor> trtllm_fp4_block_scale_moe(
-    Optional<TensorView> routing_logits, TensorView topk_ids, Optional<TensorView> topk_weights,
+    Optional<TensorView> routing_logits, TensorView topk_ids, TensorView topk_weights,
     Optional<TensorView> routing_bias, TensorView hidden_states,
     Optional<TensorView> hidden_states_scale, TensorView gemm1_weights,
     TensorView gemm1_weights_scale, Optional<TensorView> gemm1_bias,
