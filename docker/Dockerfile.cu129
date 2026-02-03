@@ -19,6 +19,9 @@ RUN echo "source activate py312" >> ~/.bashrc
 ENV PATH="/opt/conda/bin:$PATH"
 ENV PATH="/opt/conda/envs/py312/bin:$PATH"
 
+# Ensure pip-installed nvidia-cublas takes precedence over system libraries
+ENV LD_LIBRARY_PATH="/opt/conda/envs/py312/lib/python3.12/site-packages/nvidia/cublas/lib/:$LD_LIBRARY_PATH"
+
 # Triton
 ENV TRITON_PTXAS_PATH="/usr/local/cuda/bin/ptxas"
 
