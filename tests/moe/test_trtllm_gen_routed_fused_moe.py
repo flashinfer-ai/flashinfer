@@ -419,3 +419,36 @@ def test_unpack_topk_ids(num_tokens: int, top_k: int):
     assert torch.equal(
         expert_weights_unpacked, expert_weights_original
     ), "Expert weights don't match after unpacking"
+
+
+@pytest.mark.parametrize("num_tokens", [1, 8, 64])
+@pytest.mark.parametrize("top_k", [2, 4, 8])
+def test_pack_unpack_topk_ids_roundtrip(num_tokens: int, top_k: int):
+    """Test pack and unpack round-trip of topk_ids tensor."""
+    from flashinfer.fused_moe import pack_topk_ids, unpack_topk_ids
+
+    torch.manual_seed(42)
+    device = torch.device("cuda:0")
+
+    # Create original expert IDs and weights
+    num_experts = 128
+    expert_ids_original = torch.randint(
+        0, num_experts, (num_tokens, top_k), device=device, dtype=torch.int32
+    )
+    expert_weights_original = torch.rand(
+        num_tokens, top_k, device=device, dtype=torch.bfloat16
+    )
+
+    # Pack using the utility function
+    packed_topk_ids = pack_topk_ids(expert_ids_original, expert_weights_original)
+
+    # Unpack using the utility function
+    expert_ids_unpacked, expert_weights_unpacked = unpack_topk_ids(packed_topk_ids)
+
+    # Verify that unpacked values match the original
+    assert torch.equal(
+        expert_ids_unpacked, expert_ids_original
+    ), "Expert IDs don't match after pack/unpack round-trip"
+    assert torch.equal(
+        expert_weights_unpacked, expert_weights_original
+    ), "Expert weights don't match after pack/unpack round-trip"

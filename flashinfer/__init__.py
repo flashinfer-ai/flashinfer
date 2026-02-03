@@ -82,7 +82,10 @@ from .fused_moe import (
     trtllm_fp4_block_scale_moe,
     trtllm_fp4_block_scale_routed_moe,
     trtllm_fp8_block_scale_moe,
+    trtllm_fp8_block_scale_routed_moe,
     trtllm_fp8_per_tensor_scale_moe,
+    pack_topk_ids,
+    unpack_topk_ids,
 )
 from .gdn_prefill import chunk_gated_delta_rule as chunk_gated_delta_rule
 from .gemm import SegmentGEMMWrapper as SegmentGEMMWrapper

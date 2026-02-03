@@ -2348,6 +2348,30 @@ def trtllm_fp8_block_scale_moe(
     )
 
 
+def pack_topk_ids(
+    expert_ids: torch.Tensor, expert_weights: torch.Tensor
+) -> torch.Tensor:
+    """Pack expert IDs and routing weights into a single tensor.
+    
+    This function combines expert indices and routing weights into the packed format
+    expected by routed MoE operations.
+    
+    Args:
+        expert_ids: [seq_len, top_k] tensor of expert indices (int32)
+        expert_weights: [seq_len, top_k] tensor of routing weights (bfloat16)
+    
+    Returns:
+        torch.Tensor: [seq_len, top_k] tensor of packed expert indices and weights (int32).
+            Format: (expert_id << 16) | (weight_bf16.view(int16))
+    
+    Example:
+        >>> expert_ids = torch.tensor([[0, 1], [2, 3]], device='cuda', dtype=torch.int32)
+        >>> weights = torch.tensor([[0.5, 0.5], [0.6, 0.4]], device='cuda', dtype=torch.bfloat16)
+        >>> packed = pack_topk_ids(expert_ids, weights)
+    """
+    return (expert_ids << 16) | expert_weights.view(torch.int16).to(torch.int32)
+
+
 def unpack_topk_ids(packed_topk_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """Unpack the combined expert IDs and routing weights tensor.
     
@@ -2367,7 +2391,7 @@ def unpack_topk_ids(packed_topk_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.
         >>> # Create packed tensor
         >>> topk_ids = torch.tensor([[0, 1], [2, 3]], device='cuda', dtype=torch.int32)
         >>> weights = torch.tensor([[0.5, 0.5], [0.6, 0.4]], device='cuda', dtype=torch.bfloat16)
-        >>> packed = (topk_ids << 16) | weights.view(torch.int16).to(torch.int32)
+        >>> packed = pack_topk_ids(topk_ids, weights)
         >>> # Unpack
         >>> expert_ids, expert_weights = unpack_topk_ids(packed)
     """
