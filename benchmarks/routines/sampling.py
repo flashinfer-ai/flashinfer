@@ -1,0 +1,1709 @@
+"""
+Copyright (c) 2025 by FlashInfer team.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
+from collections import defaultdict
+
+import numpy as np
+import torch
+
+import flashinfer
+from flashinfer.testing.utils import bench_gpu_time
+
+from .flashinfer_benchmark_utils import (
+    dtype_str_to_torch_dtype,
+    get_device,
+    print_perf_metrics,
+    filter_backends_by_compute_capability,
+)
+
+
+def run_sampling_test(args):
+    """
+    Run a sampling test.
+
+    Args:
+        args: Parsed command line arguments containing test configuration
+
+    Returns:
+        dict: List of dictionaries containing performance results
+    """
+    if args.routine == "softmax":
+        return testSoftmax(args)
+    elif args.routine == "sampling_from_probs":
+        return testSamplingFromProbs(args)
+    elif args.routine == "sampling_from_logits":
+        return testSamplingFromLogits(args)
+    elif args.routine == "top_k_sampling_from_probs":
+        return testTopKSamplingFromProbs(args)
+    elif args.routine == "top_p_sampling_from_probs":
+        return testTopPSamplingFromProbs(args)
+    elif args.routine == "top_k_top_p_sampling_from_probs":
+        return testTopKTopPSamplingFromProbs(args)
+    elif args.routine == "top_k_top_p_sampling_from_logits":
+        return testTopKTopPSamplingFromLogits(args)
+    elif args.routine == "min_p_sampling_from_probs":
+        return testMinPSamplingFromProbs(args)
+    elif args.routine == "top_k_renorm_probs":
+        return testTopKRenormProbs(args)
+    elif args.routine == "top_p_renorm_probs":
+        return testTopPRenormProbs(args)
+    elif args.routine == "top_k_mask_logits":
+        return testTopKMaskLogits(args)
+    elif args.routine == "chain_speculative_sampling":
+        return testChainSpeculativeSampling(args)
+    elif args.routine == "top_k":
+        return testTopK(args)
+    elif args.routine == "top_k_page_table_transform":
+        return testTopKPageTableTransform(args)
+    elif args.routine == "top_k_ragged_transform":
+        return testTopKRaggedTransform(args)
+    else:
+        raise ValueError(f"Unsupported routine: {args.routine}")
+
+
+def parse_sampling_args(line, parser):
+    """
+    Parse command line arguments for sampling test configuration.
+
+    Args:
+        line: Command line arguments
+        parser: ArgumentParser object already populated with shared arguments
+
+    Returns:
+        Parsed argument namespace
+    """
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        required=True,
+        help="Batch size.",
+    )
+    parser.add_argument(
+        "--vocab_size",
+        type=int,
+        required=True,
+        help="Vocabulary size.",
+    )
+    parser.add_argument(
+        "--input_dtype",
+        type=str,
+        required=False,
+        default="float32",
+        choices=["float32", "float16", "bfloat16"],
+        help="Data type of the input tensor.",
+    )
+    parser.add_argument(
+        "--top_k",
+        type=int,
+        required=False,
+        default=50,
+        help="Top-K value for top-k sampling.",
+    )
+    parser.add_argument(
+        "--top_p",
+        type=float,
+        required=False,
+        default=0.9,
+        help="Top-P threshold for top-p sampling.",
+    )
+    parser.add_argument(
+        "--min_p",
+        type=float,
+        required=False,
+        default=0.1,
+        help="Min-P threshold for min-p sampling.",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        required=False,
+        default=1.0,
+        help="Temperature for softmax.",
+    )
+    parser.add_argument(
+        "--filter_apply_order",
+        type=str,
+        required=False,
+        default="top_k_first",
+        choices=["top_k_first", "joint"],
+        help="Order of applying top-k and top-p filters.",
+    )
+    parser.add_argument(
+        "--num_speculate_tokens",
+        type=int,
+        required=False,
+        default=5,
+        help="Number of speculative tokens for chain speculative sampling.",
+    )
+    parser.add_argument(
+        "--max_len",
+        type=int,
+        required=False,
+        default=4096,
+        help="Max sequence length for top_k_page_table_transform and top_k_ragged_transform.",
+    )
+    parser.add_argument(
+        "--num_rows",
+        type=int,
+        required=False,
+        default=None,
+        help="Number of rows for top_k_page_table_transform and top_k_ragged_transform. Defaults to batch_size.",
+    )
+    parser.add_argument(
+        "--backends",
+        type=str,
+        required=False,
+        nargs="+",
+        default=["cuda"],
+        choices=["cuda"],
+        help="Kernel backends to test. Default: cuda",
+    )
+
+    args = parser.parse_args(line)
+
+    # Default num_rows to batch_size if not specified
+    if args.num_rows is None:
+        args.num_rows = args.batch_size
+
+    if args.verbose >= 1:
+        print(f"[INFO] {args = }")
+    return args
+
+
+def testSoftmax(args):
+    """
+    Test softmax API.
+
+    This test:
+    1. Generates random input logits
+    2. Runs flashinfer.sampling.softmax
+    3. Measures performance metrics (TB/sec)
+
+    Args:
+        args: Parsed command line arguments containing test configuration
+
+    Returns:
+        dict: List of dictionaries containing performance results
+    """
+    if args.verbose >= 1:
+        print("[INFO] Running testSoftmax")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+
+    device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
+
+    ## Parse input arguments
+    backends = args.backends[:]
+    batch_size = args.batch_size
+    vocab_size = args.vocab_size
+    temperature = args.temperature
+    is_cuda_graph_compatible = not args.no_cuda_graph
+    res = []
+
+    backends = filter_backends_by_compute_capability(backends, args.routine, device)
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
+
+    input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
+
+    ## Prepare input tensors
+    logits = torch.randn(batch_size, vocab_size, dtype=input_dtype, device=device)
+
+    if args.verbose >= 2:
+        print(f"[VVERBOSE] {logits.shape = }")
+        print(f"[VVERBOSE] {logits.dtype = }")
+
+    def run_backend(backend, logits):
+        if backend == "cuda":
+            return flashinfer.sampling.softmax(logits, temperature=temperature)
+        else:
+            raise ValueError(f"Unsupported backend: {backend}")
+
+    # Storage for timing results
+    backend_times = {backend: [] for backend in backends}
+    for cur_backend in backends:
+        backend_times[cur_backend] = bench_gpu_time(
+            fn=run_backend,
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
+            enable_cupti=args.use_cupti,
+            use_cuda_graph=is_cuda_graph_compatible,
+            input_args=(cur_backend, logits),
+        )
+
+    for backend in backends:
+        if len(backend_times[backend]) > 0:
+            median_time = np.median(backend_times[backend])
+            std_time = np.std(backend_times[backend])
+
+            # Memory bandwidth calculation for softmax
+            # Read: logits (input)
+            # Write: probs (float32 output)
+            problem_bytes = (
+                batch_size * vocab_size * input_dtype.itemsize  # input read
+                + batch_size * vocab_size * 4  # output write (float32)
+            )
+            tflops = 0  # Memory-bound operation
+            tb_per_sec = problem_bytes / (10**9 * median_time)  # in TB/sec
+
+            print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
+
+            if args.output_path is not None:
+                cur_res = defaultdict(str)
+                cur_res["routine"] = args.routine
+                cur_res["median_time"] = median_time
+                cur_res["std_time"] = std_time
+                cur_res["tflops"] = tflops
+                cur_res["tb_per_sec"] = tb_per_sec
+                cur_res["vocab_size"] = vocab_size
+                cur_res["temperature"] = temperature
+                cur_res["backend"] = backend
+                cur_res["case_tag"] = args.case_tag
+                res.append(cur_res)
+    return res
+
+
+def testSamplingFromProbs(args):
+    """
+    Test sampling_from_probs API.
+
+    This test:
+    1. Generates random input probabilities
+    2. Runs flashinfer.sampling.sampling_from_probs
+    3. Measures performance metrics (TB/sec)
+
+    Args:
+        args: Parsed command line arguments containing test configuration
+
+    Returns:
+        dict: List of dictionaries containing performance results
+    """
+    if args.verbose >= 1:
+        print("[INFO] Running testSamplingFromProbs")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+
+    device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
+
+    ## Parse input arguments
+    backends = args.backends[:]
+    batch_size = args.batch_size
+    vocab_size = args.vocab_size
+    is_cuda_graph_compatible = not args.no_cuda_graph
+    res = []
+
+    backends = filter_backends_by_compute_capability(backends, args.routine, device)
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
+
+    ## Prepare input tensors (probs are always float32)
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device=device)
+    probs = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+
+    if args.verbose >= 2:
+        print(f"[VVERBOSE] {probs.shape = }")
+        print(f"[VVERBOSE] {probs.dtype = }")
+
+    def run_backend(backend, probs):
+        if backend == "cuda":
+            return flashinfer.sampling.sampling_from_probs(probs)
+        else:
+            raise ValueError(f"Unsupported backend: {backend}")
+
+    # Storage for timing results
+    backend_times = {backend: [] for backend in backends}
+    for cur_backend in backends:
+        backend_times[cur_backend] = bench_gpu_time(
+            fn=run_backend,
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
+            enable_cupti=args.use_cupti,
+            use_cuda_graph=is_cuda_graph_compatible,
+            input_args=(cur_backend, probs),
+        )
+
+    for backend in backends:
+        if len(backend_times[backend]) > 0:
+            median_time = np.median(backend_times[backend])
+            std_time = np.std(backend_times[backend])
+
+            # Memory bandwidth calculation
+            # Read: probs (float32)
+            # Write: samples (int32)
+            problem_bytes = (
+                batch_size * vocab_size * 4  # probs read (float32)
+                + batch_size * 4  # samples write (int32)
+            )
+            tflops = 0  # Memory-bound operation
+            tb_per_sec = problem_bytes / (10**9 * median_time)  # in TB/sec
+
+            print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
+
+            if args.output_path is not None:
+                cur_res = defaultdict(str)
+                cur_res["routine"] = args.routine
+                cur_res["median_time"] = median_time
+                cur_res["std_time"] = std_time
+                cur_res["tflops"] = tflops
+                cur_res["tb_per_sec"] = tb_per_sec
+                cur_res["vocab_size"] = vocab_size
+                cur_res["backend"] = backend
+                cur_res["case_tag"] = args.case_tag
+                res.append(cur_res)
+    return res
+
+
+def testSamplingFromLogits(args):
+    """
+    Test sampling_from_logits API.
+
+    This test:
+    1. Generates random input logits
+    2. Runs flashinfer.sampling.sampling_from_logits
+    3. Measures performance metrics (TB/sec)
+
+    Args:
+        args: Parsed command line arguments containing test configuration
+
+    Returns:
+        dict: List of dictionaries containing performance results
+    """
+    if args.verbose >= 1:
+        print("[INFO] Running testSamplingFromLogits")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+
+    device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
+
+    ## Parse input arguments
+    backends = args.backends[:]
+    batch_size = args.batch_size
+    vocab_size = args.vocab_size
+    is_cuda_graph_compatible = not args.no_cuda_graph
+    res = []
+
+    backends = filter_backends_by_compute_capability(backends, args.routine, device)
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
+
+    input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
+
+    ## Prepare input tensors
+    logits = torch.randn(batch_size, vocab_size, dtype=input_dtype, device=device)
+
+    if args.verbose >= 2:
+        print(f"[VVERBOSE] {logits.shape = }")
+        print(f"[VVERBOSE] {logits.dtype = }")
+
+    def run_backend(backend, logits):
+        if backend == "cuda":
+            return flashinfer.sampling.sampling_from_logits(logits)
+        else:
+            raise ValueError(f"Unsupported backend: {backend}")
+
+    # Storage for timing results
+    backend_times = {backend: [] for backend in backends}
+    for cur_backend in backends:
+        backend_times[cur_backend] = bench_gpu_time(
+            fn=run_backend,
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
+            enable_cupti=args.use_cupti,
+            use_cuda_graph=is_cuda_graph_compatible,
+            input_args=(cur_backend, logits),
+        )
+
+    for backend in backends:
+        if len(backend_times[backend]) > 0:
+            median_time = np.median(backend_times[backend])
+            std_time = np.std(backend_times[backend])
+
+            # Memory bandwidth calculation
+            # Read: logits (input_dtype)
+            # Write: samples (int32)
+            problem_bytes = (
+                batch_size * vocab_size * input_dtype.itemsize  # logits read
+                + batch_size * 4  # samples write (int32)
+            )
+            tflops = 0  # Memory-bound operation
+            tb_per_sec = problem_bytes / (10**9 * median_time)  # in TB/sec
+
+            print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
+
+            if args.output_path is not None:
+                cur_res = defaultdict(str)
+                cur_res["routine"] = args.routine
+                cur_res["median_time"] = median_time
+                cur_res["std_time"] = std_time
+                cur_res["tflops"] = tflops
+                cur_res["tb_per_sec"] = tb_per_sec
+                cur_res["vocab_size"] = vocab_size
+                cur_res["backend"] = backend
+                cur_res["case_tag"] = args.case_tag
+                res.append(cur_res)
+    return res
+
+
+def testTopKSamplingFromProbs(args):
+    """
+    Test top_k_sampling_from_probs API.
+
+    This test:
+    1. Generates random input probabilities
+    2. Runs flashinfer.sampling.top_k_sampling_from_probs
+    3. Measures performance metrics (TB/sec)
+
+    Args:
+        args: Parsed command line arguments containing test configuration
+
+    Returns:
+        dict: List of dictionaries containing performance results
+    """
+    if args.verbose >= 1:
+        print("[INFO] Running testTopKSamplingFromProbs")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+
+    device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
+
+    ## Parse input arguments
+    backends = args.backends[:]
+    batch_size = args.batch_size
+    vocab_size = args.vocab_size
+    top_k = args.top_k
+    is_cuda_graph_compatible = not args.no_cuda_graph
+    res = []
+
+    backends = filter_backends_by_compute_capability(backends, args.routine, device)
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
+
+    ## Prepare input tensors
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device=device)
+    probs = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+
+    if args.verbose >= 2:
+        print(f"[VVERBOSE] {probs.shape = }")
+        print(f"[VVERBOSE] {probs.dtype = }")
+        print(f"[VVERBOSE] {top_k = }")
+
+    def run_backend(backend, probs):
+        if backend == "cuda":
+            return flashinfer.sampling.top_k_sampling_from_probs(probs, top_k)
+        else:
+            raise ValueError(f"Unsupported backend: {backend}")
+
+    # Storage for timing results
+    backend_times = {backend: [] for backend in backends}
+    for cur_backend in backends:
+        backend_times[cur_backend] = bench_gpu_time(
+            fn=run_backend,
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
+            enable_cupti=args.use_cupti,
+            use_cuda_graph=is_cuda_graph_compatible,
+            input_args=(cur_backend, probs),
+        )
+
+    for backend in backends:
+        if len(backend_times[backend]) > 0:
+            median_time = np.median(backend_times[backend])
+            std_time = np.std(backend_times[backend])
+
+            # Memory bandwidth calculation
+            # Read: probs (float32)
+            # Write: samples (int32)
+            problem_bytes = (
+                batch_size * vocab_size * 4  # probs read (float32)
+                + batch_size * 4  # samples write (int32)
+            )
+            tflops = 0  # Memory-bound operation
+            tb_per_sec = problem_bytes / (10**9 * median_time)  # in TB/sec
+
+            print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
+
+            if args.output_path is not None:
+                cur_res = defaultdict(str)
+                cur_res["routine"] = args.routine
+                cur_res["median_time"] = median_time
+                cur_res["std_time"] = std_time
+                cur_res["tflops"] = tflops
+                cur_res["tb_per_sec"] = tb_per_sec
+                cur_res["vocab_size"] = vocab_size
+                cur_res["top_k"] = top_k
+                cur_res["backend"] = backend
+                cur_res["case_tag"] = args.case_tag
+                res.append(cur_res)
+    return res
+
+
+def testTopPSamplingFromProbs(args):
+    """
+    Test top_p_sampling_from_probs API.
+
+    This test:
+    1. Generates random input probabilities
+    2. Runs flashinfer.sampling.top_p_sampling_from_probs
+    3. Measures performance metrics (TB/sec)
+
+    Args:
+        args: Parsed command line arguments containing test configuration
+
+    Returns:
+        dict: List of dictionaries containing performance results
+    """
+    if args.verbose >= 1:
+        print("[INFO] Running testTopPSamplingFromProbs")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+
+    device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
+
+    ## Parse input arguments
+    backends = args.backends[:]
+    batch_size = args.batch_size
+    vocab_size = args.vocab_size
+    top_p = args.top_p
+    is_cuda_graph_compatible = not args.no_cuda_graph
+    res = []
+
+    backends = filter_backends_by_compute_capability(backends, args.routine, device)
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
+
+    ## Prepare input tensors
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device=device)
+    probs = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+
+    if args.verbose >= 2:
+        print(f"[VVERBOSE] {probs.shape = }")
+        print(f"[VVERBOSE] {probs.dtype = }")
+        print(f"[VVERBOSE] {top_p = }")
+
+    def run_backend(backend, probs):
+        if backend == "cuda":
+            return flashinfer.sampling.top_p_sampling_from_probs(probs, top_p)
+        else:
+            raise ValueError(f"Unsupported backend: {backend}")
+
+    # Storage for timing results
+    backend_times = {backend: [] for backend in backends}
+    for cur_backend in backends:
+        backend_times[cur_backend] = bench_gpu_time(
+            fn=run_backend,
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
+            enable_cupti=args.use_cupti,
+            use_cuda_graph=is_cuda_graph_compatible,
+            input_args=(cur_backend, probs),
+        )
+
+    for backend in backends:
+        if len(backend_times[backend]) > 0:
+            median_time = np.median(backend_times[backend])
+            std_time = np.std(backend_times[backend])
+
+            # Memory bandwidth calculation
+            # Read: probs (float32)
+            # Write: samples (int32)
+            problem_bytes = (
+                batch_size * vocab_size * 4  # probs read (float32)
+                + batch_size * 4  # samples write (int32)
+            )
+            tflops = 0  # Memory-bound operation
+            tb_per_sec = problem_bytes / (10**9 * median_time)  # in TB/sec
+
+            print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
+
+            if args.output_path is not None:
+                cur_res = defaultdict(str)
+                cur_res["routine"] = args.routine
+                cur_res["median_time"] = median_time
+                cur_res["std_time"] = std_time
+                cur_res["tflops"] = tflops
+                cur_res["tb_per_sec"] = tb_per_sec
+                cur_res["vocab_size"] = vocab_size
+                cur_res["top_p"] = top_p
+                cur_res["backend"] = backend
+                cur_res["case_tag"] = args.case_tag
+                res.append(cur_res)
+    return res
+
+
+def testTopKTopPSamplingFromProbs(args):
+    """
+    Test top_k_top_p_sampling_from_probs API.
+
+    This test:
+    1. Generates random input probabilities
+    2. Runs flashinfer.sampling.top_k_top_p_sampling_from_probs
+    3. Measures performance metrics (TB/sec)
+
+    Args:
+        args: Parsed command line arguments containing test configuration
+
+    Returns:
+        dict: List of dictionaries containing performance results
+    """
+    if args.verbose >= 1:
+        print("[INFO] Running testTopKTopPSamplingFromProbs")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+
+    device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
+
+    ## Parse input arguments
+    backends = args.backends[:]
+    batch_size = args.batch_size
+    vocab_size = args.vocab_size
+    top_k = args.top_k
+    top_p = args.top_p
+    filter_apply_order = args.filter_apply_order
+    is_cuda_graph_compatible = not args.no_cuda_graph
+    res = []
+
+    backends = filter_backends_by_compute_capability(backends, args.routine, device)
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
+
+    ## Prepare input tensors
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device=device)
+    probs = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+
+    if args.verbose >= 2:
+        print(f"[VVERBOSE] {probs.shape = }")
+        print(f"[VVERBOSE] {probs.dtype = }")
+        print(f"[VVERBOSE] {top_k = }")
+        print(f"[VVERBOSE] {top_p = }")
+        print(f"[VVERBOSE] {filter_apply_order = }")
+
+    def run_backend(backend, probs):
+        if backend == "cuda":
+            return flashinfer.sampling.top_k_top_p_sampling_from_probs(
+                probs, top_k, top_p, filter_apply_order=filter_apply_order
+            )
+        else:
+            raise ValueError(f"Unsupported backend: {backend}")
+
+    # Storage for timing results
+    backend_times = {backend: [] for backend in backends}
+    for cur_backend in backends:
+        backend_times[cur_backend] = bench_gpu_time(
+            fn=run_backend,
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
+            enable_cupti=args.use_cupti,
+            use_cuda_graph=is_cuda_graph_compatible,
+            input_args=(cur_backend, probs),
+        )
+
+    for backend in backends:
+        if len(backend_times[backend]) > 0:
+            median_time = np.median(backend_times[backend])
+            std_time = np.std(backend_times[backend])
+
+            # Memory bandwidth calculation
+            # Read: probs (float32)
+            # Write: samples (int32)
+            problem_bytes = (
+                batch_size * vocab_size * 4  # probs read (float32)
+                + batch_size * 4  # samples write (int32)
+            )
+            tflops = 0  # Memory-bound operation
+            tb_per_sec = problem_bytes / (10**9 * median_time)  # in TB/sec
+
+            print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
+
+            if args.output_path is not None:
+                cur_res = defaultdict(str)
+                cur_res["routine"] = args.routine
+                cur_res["median_time"] = median_time
+                cur_res["std_time"] = std_time
+                cur_res["tflops"] = tflops
+                cur_res["tb_per_sec"] = tb_per_sec
+                cur_res["vocab_size"] = vocab_size
+                cur_res["top_k"] = top_k
+                cur_res["top_p"] = top_p
+                cur_res["filter_apply_order"] = filter_apply_order
+                cur_res["backend"] = backend
+                cur_res["case_tag"] = args.case_tag
+                res.append(cur_res)
+    return res
+
+
+def testTopKTopPSamplingFromLogits(args):
+    """
+    Test top_k_top_p_sampling_from_logits API.
+
+    This test:
+    1. Generates random input logits
+    2. Runs flashinfer.sampling.top_k_top_p_sampling_from_logits
+    3. Measures performance metrics (TB/sec)
+
+    Args:
+        args: Parsed command line arguments containing test configuration
+
+    Returns:
+        dict: List of dictionaries containing performance results
+    """
+    if args.verbose >= 1:
+        print("[INFO] Running testTopKTopPSamplingFromLogits")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+
+    device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
+
+    ## Parse input arguments
+    backends = args.backends[:]
+    batch_size = args.batch_size
+    vocab_size = args.vocab_size
+    top_k = args.top_k
+    top_p = args.top_p
+    filter_apply_order = args.filter_apply_order
+    is_cuda_graph_compatible = not args.no_cuda_graph
+    res = []
+
+    backends = filter_backends_by_compute_capability(backends, args.routine, device)
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
+
+    input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
+
+    ## Prepare input tensors
+    logits = torch.randn(batch_size, vocab_size, dtype=input_dtype, device=device)
+
+    if args.verbose >= 2:
+        print(f"[VVERBOSE] {logits.shape = }")
+        print(f"[VVERBOSE] {logits.dtype = }")
+        print(f"[VVERBOSE] {top_k = }")
+        print(f"[VVERBOSE] {top_p = }")
+        print(f"[VVERBOSE] {filter_apply_order = }")
+
+    def run_backend(backend, logits):
+        if backend == "cuda":
+            return flashinfer.sampling.top_k_top_p_sampling_from_logits(
+                logits, top_k, top_p, filter_apply_order=filter_apply_order
+            )
+        else:
+            raise ValueError(f"Unsupported backend: {backend}")
+
+    # Storage for timing results
+    backend_times = {backend: [] for backend in backends}
+    for cur_backend in backends:
+        backend_times[cur_backend] = bench_gpu_time(
+            fn=run_backend,
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
+            enable_cupti=args.use_cupti,
+            use_cuda_graph=is_cuda_graph_compatible,
+            input_args=(cur_backend, logits),
+        )
+
+    for backend in backends:
+        if len(backend_times[backend]) > 0:
+            median_time = np.median(backend_times[backend])
+            std_time = np.std(backend_times[backend])
+
+            # Memory bandwidth calculation
+            # Read: logits (input_dtype)
+            # Write: samples (int32)
+            problem_bytes = (
+                batch_size * vocab_size * input_dtype.itemsize  # logits read
+                + batch_size * 4  # samples write (int32)
+            )
+            tflops = 0  # Memory-bound operation
+            tb_per_sec = problem_bytes / (10**9 * median_time)  # in TB/sec
+
+            print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
+
+            if args.output_path is not None:
+                cur_res = defaultdict(str)
+                cur_res["routine"] = args.routine
+                cur_res["median_time"] = median_time
+                cur_res["std_time"] = std_time
+                cur_res["tflops"] = tflops
+                cur_res["tb_per_sec"] = tb_per_sec
+                cur_res["vocab_size"] = vocab_size
+                cur_res["top_k"] = top_k
+                cur_res["top_p"] = top_p
+                cur_res["filter_apply_order"] = filter_apply_order
+                cur_res["backend"] = backend
+                cur_res["case_tag"] = args.case_tag
+                res.append(cur_res)
+    return res
+
+
+def testMinPSamplingFromProbs(args):
+    """
+    Test min_p_sampling_from_probs API.
+
+    This test:
+    1. Generates random input probabilities
+    2. Runs flashinfer.sampling.min_p_sampling_from_probs
+    3. Measures performance metrics (TB/sec)
+
+    Args:
+        args: Parsed command line arguments containing test configuration
+
+    Returns:
+        dict: List of dictionaries containing performance results
+    """
+    if args.verbose >= 1:
+        print("[INFO] Running testMinPSamplingFromProbs")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+
+    device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
+
+    ## Parse input arguments
+    backends = args.backends[:]
+    batch_size = args.batch_size
+    vocab_size = args.vocab_size
+    min_p = args.min_p
+    is_cuda_graph_compatible = not args.no_cuda_graph
+    res = []
+
+    backends = filter_backends_by_compute_capability(backends, args.routine, device)
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
+
+    ## Prepare input tensors
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device=device)
+    probs = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+
+    if args.verbose >= 2:
+        print(f"[VVERBOSE] {probs.shape = }")
+        print(f"[VVERBOSE] {probs.dtype = }")
+        print(f"[VVERBOSE] {min_p = }")
+
+    def run_backend(backend, probs):
+        if backend == "cuda":
+            return flashinfer.sampling.min_p_sampling_from_probs(probs, min_p)
+        else:
+            raise ValueError(f"Unsupported backend: {backend}")
+
+    # Storage for timing results
+    backend_times = {backend: [] for backend in backends}
+    for cur_backend in backends:
+        backend_times[cur_backend] = bench_gpu_time(
+            fn=run_backend,
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
+            enable_cupti=args.use_cupti,
+            use_cuda_graph=is_cuda_graph_compatible,
+            input_args=(cur_backend, probs),
+        )
+
+    for backend in backends:
+        if len(backend_times[backend]) > 0:
+            median_time = np.median(backend_times[backend])
+            std_time = np.std(backend_times[backend])
+
+            # Memory bandwidth calculation
+            # Read: probs (float32)
+            # Write: samples (int32)
+            problem_bytes = (
+                batch_size * vocab_size * 4  # probs read (float32)
+                + batch_size * 4  # samples write (int32)
+            )
+            tflops = 0  # Memory-bound operation
+            tb_per_sec = problem_bytes / (10**9 * median_time)  # in TB/sec
+
+            print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
+
+            if args.output_path is not None:
+                cur_res = defaultdict(str)
+                cur_res["routine"] = args.routine
+                cur_res["median_time"] = median_time
+                cur_res["std_time"] = std_time
+                cur_res["tflops"] = tflops
+                cur_res["tb_per_sec"] = tb_per_sec
+                cur_res["vocab_size"] = vocab_size
+                cur_res["min_p"] = min_p
+                cur_res["backend"] = backend
+                cur_res["case_tag"] = args.case_tag
+                res.append(cur_res)
+    return res
+
+
+def testTopKRenormProbs(args):
+    """
+    Test top_k_renorm_probs API.
+
+    This test:
+    1. Generates random input probabilities
+    2. Runs flashinfer.sampling.top_k_renorm_probs
+    3. Measures performance metrics (TB/sec)
+
+    Args:
+        args: Parsed command line arguments containing test configuration
+
+    Returns:
+        dict: List of dictionaries containing performance results
+    """
+    if args.verbose >= 1:
+        print("[INFO] Running testTopKRenormProbs")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+
+    device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
+
+    ## Parse input arguments
+    backends = args.backends[:]
+    batch_size = args.batch_size
+    vocab_size = args.vocab_size
+    top_k = args.top_k
+    is_cuda_graph_compatible = not args.no_cuda_graph
+    res = []
+
+    backends = filter_backends_by_compute_capability(backends, args.routine, device)
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
+
+    input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
+
+    ## Prepare input tensors
+    pre_norm_prob = torch.rand(batch_size, vocab_size, dtype=input_dtype, device=device)
+    probs = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+
+    if args.verbose >= 2:
+        print(f"[VVERBOSE] {probs.shape = }")
+        print(f"[VVERBOSE] {probs.dtype = }")
+        print(f"[VVERBOSE] {top_k = }")
+
+    def run_backend(backend, probs):
+        if backend == "cuda":
+            return flashinfer.sampling.top_k_renorm_probs(probs, top_k)
+        else:
+            raise ValueError(f"Unsupported backend: {backend}")
+
+    # Storage for timing results
+    backend_times = {backend: [] for backend in backends}
+    for cur_backend in backends:
+        backend_times[cur_backend] = bench_gpu_time(
+            fn=run_backend,
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
+            enable_cupti=args.use_cupti,
+            use_cuda_graph=is_cuda_graph_compatible,
+            input_args=(cur_backend, probs),
+        )
+
+    for backend in backends:
+        if len(backend_times[backend]) > 0:
+            median_time = np.median(backend_times[backend])
+            std_time = np.std(backend_times[backend])
+
+            # Memory bandwidth calculation
+            # Read: probs (input_dtype)
+            # Write: renorm_probs (input_dtype)
+            problem_bytes = (
+                batch_size * vocab_size * input_dtype.itemsize  # probs read
+                + batch_size * vocab_size * input_dtype.itemsize  # renorm_probs write
+            )
+            tflops = 0  # Memory-bound operation
+            tb_per_sec = problem_bytes / (10**9 * median_time)  # in TB/sec
+
+            print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
+
+            if args.output_path is not None:
+                cur_res = defaultdict(str)
+                cur_res["routine"] = args.routine
+                cur_res["median_time"] = median_time
+                cur_res["std_time"] = std_time
+                cur_res["tflops"] = tflops
+                cur_res["tb_per_sec"] = tb_per_sec
+                cur_res["vocab_size"] = vocab_size
+                cur_res["top_k"] = top_k
+                cur_res["backend"] = backend
+                cur_res["case_tag"] = args.case_tag
+                res.append(cur_res)
+    return res
+
+
+def testTopPRenormProbs(args):
+    """
+    Test top_p_renorm_probs API.
+
+    This test:
+    1. Generates random input probabilities
+    2. Runs flashinfer.sampling.top_p_renorm_probs
+    3. Measures performance metrics (TB/sec)
+
+    Args:
+        args: Parsed command line arguments containing test configuration
+
+    Returns:
+        dict: List of dictionaries containing performance results
+    """
+    if args.verbose >= 1:
+        print("[INFO] Running testTopPRenormProbs")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+
+    device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
+
+    ## Parse input arguments
+    backends = args.backends[:]
+    batch_size = args.batch_size
+    vocab_size = args.vocab_size
+    top_p = args.top_p
+    is_cuda_graph_compatible = not args.no_cuda_graph
+    res = []
+
+    backends = filter_backends_by_compute_capability(backends, args.routine, device)
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
+
+    ## Prepare input tensors (top_p_renorm_probs uses float32)
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device=device)
+    probs = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+
+    if args.verbose >= 2:
+        print(f"[VVERBOSE] {probs.shape = }")
+        print(f"[VVERBOSE] {probs.dtype = }")
+        print(f"[VVERBOSE] {top_p = }")
+
+    def run_backend(backend, probs):
+        if backend == "cuda":
+            return flashinfer.sampling.top_p_renorm_probs(probs, top_p)
+        else:
+            raise ValueError(f"Unsupported backend: {backend}")
+
+    # Storage for timing results
+    backend_times = {backend: [] for backend in backends}
+    for cur_backend in backends:
+        backend_times[cur_backend] = bench_gpu_time(
+            fn=run_backend,
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
+            enable_cupti=args.use_cupti,
+            use_cuda_graph=is_cuda_graph_compatible,
+            input_args=(cur_backend, probs),
+        )
+
+    for backend in backends:
+        if len(backend_times[backend]) > 0:
+            median_time = np.median(backend_times[backend])
+            std_time = np.std(backend_times[backend])
+
+            # Memory bandwidth calculation
+            # Read: probs (float32)
+            # Write: renorm_probs (float32)
+            problem_bytes = (
+                batch_size * vocab_size * 4  # probs read (float32)
+                + batch_size * vocab_size * 4  # renorm_probs write (float32)
+            )
+            tflops = 0  # Memory-bound operation
+            tb_per_sec = problem_bytes / (10**9 * median_time)  # in TB/sec
+
+            print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
+
+            if args.output_path is not None:
+                cur_res = defaultdict(str)
+                cur_res["routine"] = args.routine
+                cur_res["median_time"] = median_time
+                cur_res["std_time"] = std_time
+                cur_res["tflops"] = tflops
+                cur_res["tb_per_sec"] = tb_per_sec
+                cur_res["vocab_size"] = vocab_size
+                cur_res["top_p"] = top_p
+                cur_res["backend"] = backend
+                cur_res["case_tag"] = args.case_tag
+                res.append(cur_res)
+    return res
+
+
+def testTopKMaskLogits(args):
+    """
+    Test top_k_mask_logits API.
+
+    This test:
+    1. Generates random input logits
+    2. Runs flashinfer.sampling.top_k_mask_logits
+    3. Measures performance metrics (TB/sec)
+
+    Args:
+        args: Parsed command line arguments containing test configuration
+
+    Returns:
+        dict: List of dictionaries containing performance results
+    """
+    if args.verbose >= 1:
+        print("[INFO] Running testTopKMaskLogits")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+
+    device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
+
+    ## Parse input arguments
+    backends = args.backends[:]
+    batch_size = args.batch_size
+    vocab_size = args.vocab_size
+    top_k = args.top_k
+    is_cuda_graph_compatible = not args.no_cuda_graph
+    res = []
+
+    backends = filter_backends_by_compute_capability(backends, args.routine, device)
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
+
+    input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
+
+    ## Prepare input tensors
+    logits = torch.randn(batch_size, vocab_size, dtype=input_dtype, device=device)
+
+    if args.verbose >= 2:
+        print(f"[VVERBOSE] {logits.shape = }")
+        print(f"[VVERBOSE] {logits.dtype = }")
+        print(f"[VVERBOSE] {top_k = }")
+
+    def run_backend(backend, logits):
+        if backend == "cuda":
+            return flashinfer.sampling.top_k_mask_logits(logits, top_k)
+        else:
+            raise ValueError(f"Unsupported backend: {backend}")
+
+    # Storage for timing results
+    backend_times = {backend: [] for backend in backends}
+    for cur_backend in backends:
+        backend_times[cur_backend] = bench_gpu_time(
+            fn=run_backend,
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
+            enable_cupti=args.use_cupti,
+            use_cuda_graph=is_cuda_graph_compatible,
+            input_args=(cur_backend, logits),
+        )
+
+    for backend in backends:
+        if len(backend_times[backend]) > 0:
+            median_time = np.median(backend_times[backend])
+            std_time = np.std(backend_times[backend])
+
+            # Memory bandwidth calculation
+            # Read: logits (input_dtype)
+            # Write: masked_logits (input_dtype)
+            problem_bytes = (
+                batch_size * vocab_size * input_dtype.itemsize  # logits read
+                + batch_size * vocab_size * input_dtype.itemsize  # masked_logits write
+            )
+            tflops = 0  # Memory-bound operation
+            tb_per_sec = problem_bytes / (10**9 * median_time)  # in TB/sec
+
+            print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
+
+            if args.output_path is not None:
+                cur_res = defaultdict(str)
+                cur_res["routine"] = args.routine
+                cur_res["median_time"] = median_time
+                cur_res["std_time"] = std_time
+                cur_res["tflops"] = tflops
+                cur_res["tb_per_sec"] = tb_per_sec
+                cur_res["vocab_size"] = vocab_size
+                cur_res["top_k"] = top_k
+                cur_res["backend"] = backend
+                cur_res["case_tag"] = args.case_tag
+                res.append(cur_res)
+    return res
+
+
+def testChainSpeculativeSampling(args):
+    """
+    Test chain_speculative_sampling API.
+
+    This test:
+    1. Generates random draft and target probabilities
+    2. Runs flashinfer.sampling.chain_speculative_sampling
+    3. Measures performance metrics (TB/sec)
+
+    Args:
+        args: Parsed command line arguments containing test configuration
+
+    Returns:
+        dict: List of dictionaries containing performance results
+    """
+    if args.verbose >= 1:
+        print("[INFO] Running testChainSpeculativeSampling")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+
+    device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
+
+    ## Parse input arguments
+    backends = args.backends[:]
+    batch_size = args.batch_size
+    vocab_size = args.vocab_size
+    num_speculate_tokens = args.num_speculate_tokens
+    is_cuda_graph_compatible = not args.no_cuda_graph
+    res = []
+
+    backends = filter_backends_by_compute_capability(backends, args.routine, device)
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
+
+    ## Prepare input tensors
+    # Draft probs: (batch_size, num_speculate_tokens, vocab_size)
+    pre_norm_draft_prob = torch.rand(
+        batch_size, num_speculate_tokens, vocab_size, device=device
+    )
+    draft_probs = pre_norm_draft_prob / pre_norm_draft_prob.sum(dim=-1, keepdim=True)
+
+    # Draft token IDs: (batch_size, num_speculate_tokens)
+    draft_token_ids = torch.randint(
+        vocab_size, (batch_size, num_speculate_tokens), device=device, dtype=torch.int32
+    )
+
+    # Target probs: (batch_size, num_speculate_tokens + 1, vocab_size)
+    pre_norm_target_prob = torch.rand(
+        batch_size, num_speculate_tokens + 1, vocab_size, device=device
+    )
+    target_probs = pre_norm_target_prob / pre_norm_target_prob.sum(dim=-1, keepdim=True)
+
+    if args.verbose >= 2:
+        print(f"[VVERBOSE] {draft_probs.shape = }")
+        print(f"[VVERBOSE] {draft_token_ids.shape = }")
+        print(f"[VVERBOSE] {target_probs.shape = }")
+        print(f"[VVERBOSE] {num_speculate_tokens = }")
+
+    def run_backend(backend, draft_probs, draft_token_ids, target_probs):
+        if backend == "cuda":
+            return flashinfer.sampling.chain_speculative_sampling(
+                draft_probs, draft_token_ids, target_probs
+            )
+        else:
+            raise ValueError(f"Unsupported backend: {backend}")
+
+    # Storage for timing results
+    backend_times = {backend: [] for backend in backends}
+    for cur_backend in backends:
+        backend_times[cur_backend] = bench_gpu_time(
+            fn=run_backend,
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
+            enable_cupti=args.use_cupti,
+            use_cuda_graph=is_cuda_graph_compatible,
+            input_args=(cur_backend, draft_probs, draft_token_ids, target_probs),
+        )
+
+    for backend in backends:
+        if len(backend_times[backend]) > 0:
+            median_time = np.median(backend_times[backend])
+            std_time = np.std(backend_times[backend])
+
+            n = num_speculate_tokens
+            # Memory bandwidth calculation
+            # Read: draft_probs + draft_token_ids + target_probs
+            # Write: output_token_ids + accepted_num + emitted_num
+            problem_bytes = (
+                batch_size * n * vocab_size * 4  # draft_probs read (float32)
+                + batch_size * n * 4  # draft_token_ids read (int32)
+                + batch_size * (n + 1) * vocab_size * 4  # target_probs read (float32)
+                + batch_size * (n + 1) * 4  # output_token_ids write (int32)
+                + batch_size * 4  # accepted_num write (int32)
+                + batch_size * 4  # emitted_num write (int32)
+            )
+            tflops = 0  # Memory-bound operation
+            tb_per_sec = problem_bytes / (10**9 * median_time)  # in TB/sec
+
+            print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
+
+            if args.output_path is not None:
+                cur_res = defaultdict(str)
+                cur_res["routine"] = args.routine
+                cur_res["median_time"] = median_time
+                cur_res["std_time"] = std_time
+                cur_res["tflops"] = tflops
+                cur_res["tb_per_sec"] = tb_per_sec
+                cur_res["vocab_size"] = vocab_size
+                cur_res["num_speculate_tokens"] = num_speculate_tokens
+                cur_res["backend"] = backend
+                cur_res["case_tag"] = args.case_tag
+                res.append(cur_res)
+    return res
+
+
+def testTopK(args):
+    """
+    Test top_k API (radix-based top-k selection).
+
+    This test:
+    1. Generates random input tensor
+    2. Runs flashinfer.top_k
+    3. Measures performance metrics (TB/sec)
+
+    Args:
+        args: Parsed command line arguments containing test configuration
+
+    Returns:
+        dict: List of dictionaries containing performance results
+    """
+    if args.verbose >= 1:
+        print("[INFO] Running testTopK")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+
+    device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
+
+    ## Parse input arguments
+    backends = args.backends[:]
+    batch_size = args.batch_size
+    vocab_size = args.vocab_size
+    top_k = args.top_k
+    is_cuda_graph_compatible = not args.no_cuda_graph
+    res = []
+
+    backends = filter_backends_by_compute_capability(backends, args.routine, device)
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
+
+    input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
+
+    ## Prepare input tensors
+    input_tensor = torch.randn(batch_size, vocab_size, dtype=input_dtype, device=device)
+
+    if args.verbose >= 2:
+        print(f"[VVERBOSE] {input_tensor.shape = }")
+        print(f"[VVERBOSE] {input_tensor.dtype = }")
+        print(f"[VVERBOSE] {top_k = }")
+
+    def run_backend(backend, input_tensor):
+        if backend == "cuda":
+            return flashinfer.top_k(input_tensor, top_k)
+        else:
+            raise ValueError(f"Unsupported backend: {backend}")
+
+    # Storage for timing results
+    backend_times = {backend: [] for backend in backends}
+    for cur_backend in backends:
+        backend_times[cur_backend] = bench_gpu_time(
+            fn=run_backend,
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
+            enable_cupti=args.use_cupti,
+            use_cuda_graph=is_cuda_graph_compatible,
+            input_args=(cur_backend, input_tensor),
+        )
+
+    for backend in backends:
+        if len(backend_times[backend]) > 0:
+            median_time = np.median(backend_times[backend])
+            std_time = np.std(backend_times[backend])
+
+            # Memory bandwidth calculation
+            # Read: input (input_dtype)
+            # Write: values (input_dtype) + indices (int64)
+            problem_bytes = (
+                batch_size * vocab_size * input_dtype.itemsize  # input read
+                + batch_size * top_k * input_dtype.itemsize  # values write
+                + batch_size * top_k * 8  # indices write (int64)
+            )
+            tflops = 0  # Memory-bound operation
+            tb_per_sec = problem_bytes / (10**9 * median_time)  # in TB/sec
+
+            print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
+
+            if args.output_path is not None:
+                cur_res = defaultdict(str)
+                cur_res["routine"] = args.routine
+                cur_res["median_time"] = median_time
+                cur_res["std_time"] = std_time
+                cur_res["tflops"] = tflops
+                cur_res["tb_per_sec"] = tb_per_sec
+                cur_res["vocab_size"] = vocab_size
+                cur_res["top_k"] = top_k
+                cur_res["backend"] = backend
+                cur_res["case_tag"] = args.case_tag
+                res.append(cur_res)
+    return res
+
+
+def testTopKPageTableTransform(args):
+    """
+    Test top_k_page_table_transform API.
+
+    This test:
+    1. Generates random input scores and page table
+    2. Runs flashinfer.top_k_page_table_transform
+    3. Measures performance metrics (TB/sec)
+
+    Args:
+        args: Parsed command line arguments containing test configuration
+
+    Returns:
+        dict: List of dictionaries containing performance results
+    """
+    if args.verbose >= 1:
+        print("[INFO] Running testTopKPageTableTransform")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+
+    device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
+
+    ## Parse input arguments
+    backends = args.backends[:]
+    batch_size = args.batch_size
+    num_rows = args.num_rows
+    max_len = args.max_len
+    top_k = args.top_k
+    is_cuda_graph_compatible = not args.no_cuda_graph
+    res = []
+
+    backends = filter_backends_by_compute_capability(backends, args.routine, device)
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
+
+    input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
+
+    ## Prepare input tensors
+    # Input scores: (num_rows, max_len)
+    input_scores = torch.randn(num_rows, max_len, dtype=input_dtype, device=device)
+
+    # Source page table: (batch_size, max_len)
+    src_page_table = torch.randint(
+        0, 1000, (batch_size, max_len), dtype=torch.int32, device=device
+    )
+
+    # Lengths: (num_rows,)
+    lengths = torch.full((num_rows,), max_len, dtype=torch.int32, device=device)
+
+    if args.verbose >= 2:
+        print(f"[VVERBOSE] {input_scores.shape = }")
+        print(f"[VVERBOSE] {input_scores.dtype = }")
+        print(f"[VVERBOSE] {src_page_table.shape = }")
+        print(f"[VVERBOSE] {lengths.shape = }")
+        print(f"[VVERBOSE] {top_k = }")
+
+    def run_backend(backend, input_scores, src_page_table, lengths):
+        if backend == "cuda":
+            return flashinfer.top_k_page_table_transform(
+                input_scores, src_page_table, lengths, top_k
+            )
+        else:
+            raise ValueError(f"Unsupported backend: {backend}")
+
+    # Storage for timing results
+    backend_times = {backend: [] for backend in backends}
+    for cur_backend in backends:
+        backend_times[cur_backend] = bench_gpu_time(
+            fn=run_backend,
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
+            enable_cupti=args.use_cupti,
+            use_cuda_graph=is_cuda_graph_compatible,
+            input_args=(cur_backend, input_scores, src_page_table, lengths),
+        )
+
+    for backend in backends:
+        if len(backend_times[backend]) > 0:
+            median_time = np.median(backend_times[backend])
+            std_time = np.std(backend_times[backend])
+
+            # Memory bandwidth calculation
+            # Read: input_scores + src_page_table
+            # Write: output_page_table
+            problem_bytes = (
+                num_rows * max_len * input_dtype.itemsize  # input_scores read
+                + batch_size * max_len * 4  # src_page_table read (int32)
+                + num_rows * top_k * 4  # output_page_table write (int32)
+            )
+            tflops = 0  # Memory-bound operation
+            tb_per_sec = problem_bytes / (10**9 * median_time)  # in TB/sec
+
+            print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
+
+            if args.output_path is not None:
+                cur_res = defaultdict(str)
+                cur_res["routine"] = args.routine
+                cur_res["median_time"] = median_time
+                cur_res["std_time"] = std_time
+                cur_res["tflops"] = tflops
+                cur_res["tb_per_sec"] = tb_per_sec
+                cur_res["max_len"] = max_len
+                cur_res["num_rows"] = num_rows
+                cur_res["top_k"] = top_k
+                cur_res["backend"] = backend
+                cur_res["case_tag"] = args.case_tag
+                res.append(cur_res)
+    return res
+
+
+def testTopKRaggedTransform(args):
+    """
+    Test top_k_ragged_transform API.
+
+    This test:
+    1. Generates random input scores
+    2. Runs flashinfer.top_k_ragged_transform
+    3. Measures performance metrics (TB/sec)
+
+    Args:
+        args: Parsed command line arguments containing test configuration
+
+    Returns:
+        dict: List of dictionaries containing performance results
+    """
+    if args.verbose >= 1:
+        print("[INFO] Running testTopKRaggedTransform")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+
+    device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
+
+    ## Parse input arguments
+    backends = args.backends[:]
+    num_rows = args.num_rows
+    max_len = args.max_len
+    top_k = args.top_k
+    is_cuda_graph_compatible = not args.no_cuda_graph
+    res = []
+
+    backends = filter_backends_by_compute_capability(backends, args.routine, device)
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return res
+
+    input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
+
+    ## Prepare input tensors
+    # Input scores: (num_rows, max_len)
+    input_scores = torch.randn(num_rows, max_len, dtype=input_dtype, device=device)
+
+    # Offsets: (num_rows,)
+    offsets = torch.arange(
+        0, num_rows * max_len, max_len, dtype=torch.int32, device=device
+    )
+
+    # Lengths: (num_rows,)
+    lengths = torch.full((num_rows,), max_len, dtype=torch.int32, device=device)
+
+    if args.verbose >= 2:
+        print(f"[VVERBOSE] {input_scores.shape = }")
+        print(f"[VVERBOSE] {input_scores.dtype = }")
+        print(f"[VVERBOSE] {offsets.shape = }")
+        print(f"[VVERBOSE] {lengths.shape = }")
+        print(f"[VVERBOSE] {top_k = }")
+
+    def run_backend(backend, input_scores, offsets, lengths):
+        if backend == "cuda":
+            return flashinfer.top_k_ragged_transform(
+                input_scores, offsets, lengths, top_k
+            )
+        else:
+            raise ValueError(f"Unsupported backend: {backend}")
+
+    # Storage for timing results
+    backend_times = {backend: [] for backend in backends}
+    for cur_backend in backends:
+        backend_times[cur_backend] = bench_gpu_time(
+            fn=run_backend,
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
+            enable_cupti=args.use_cupti,
+            use_cuda_graph=is_cuda_graph_compatible,
+            input_args=(cur_backend, input_scores, offsets, lengths),
+        )
+
+    for backend in backends:
+        if len(backend_times[backend]) > 0:
+            median_time = np.median(backend_times[backend])
+            std_time = np.std(backend_times[backend])
+
+            # Memory bandwidth calculation
+            # Read: input_scores
+            # Write: output_indices
+            problem_bytes = (
+                num_rows * max_len * input_dtype.itemsize  # input_scores read
+                + num_rows * top_k * 4  # output_indices write (int32)
+            )
+            tflops = 0  # Memory-bound operation
+            tb_per_sec = problem_bytes / (10**9 * median_time)  # in TB/sec
+
+            print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
+
+            if args.output_path is not None:
+                cur_res = defaultdict(str)
+                cur_res["routine"] = args.routine
+                cur_res["median_time"] = median_time
+                cur_res["std_time"] = std_time
+                cur_res["tflops"] = tflops
+                cur_res["tb_per_sec"] = tb_per_sec
+                cur_res["max_len"] = max_len
+                cur_res["num_rows"] = num_rows
+                cur_res["top_k"] = top_k
+                cur_res["backend"] = backend
+                cur_res["case_tag"] = args.case_tag
+                res.append(cur_res)
+    return res
