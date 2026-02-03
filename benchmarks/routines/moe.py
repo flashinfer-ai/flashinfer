@@ -281,32 +281,25 @@ def create_trtllm_moe_test_data(
     # Different MOE kernels have different routing_logits dtype requirements:
 
     if moe_kernel_type == "fp8_block_scale":
-        # FP8 block scale MOE always expects float32 routing logits (line 333 in kernel_launcher.cu)
+        # DeepSeekV3 routing uses float32, others use bfloat16
+        routing_dtype = torch.float32 if routing_method_type == 2 else torch.bfloat16
         routing_logits = torch.randn(
-            (num_tokens, num_experts), device=device, dtype=torch.float32
+            (num_tokens, num_experts), device=device, dtype=routing_dtype
         )
     elif moe_kernel_type == "fp8_per_tensor":
         # FP8 per-tensor MOE dtype depends on use_routing_scales_on_input parameter
         # For Llama4: use_routing_scales_on_input=True -> bfloat16
         # For others: use_routing_scales_on_input=False -> float32
-        if routing_method_type == 3:  # Llama4 uses routing scales on input
-            routing_logits = torch.randn(
-                (num_tokens, num_experts), device=device, dtype=torch.bfloat16
-            )
-        else:
-            routing_logits = torch.randn(
-                (num_tokens, num_experts), device=device, dtype=torch.float32
-            )
+        routing_dtype = torch.bfloat16 if routing_method_type == 3 else torch.float32
+        routing_logits = torch.randn(
+            (num_tokens, num_experts), device=device, dtype=routing_dtype
+        )
     elif moe_kernel_type == "fp4_block_scale":
         # FP4 block scale MOE follows the test pattern: float32 for DeepSeekV3, bfloat16 for others
-        if routing_method_type == 2:  # DeepSeekV3 - uses float32
-            routing_logits = torch.randn(
-                (num_tokens, num_experts), device=device, dtype=torch.float32
-            )
-        else:  # All other routing methods (Renormalize, RenormalizeNaive, Llama4) - use bfloat16
-            routing_logits = torch.randn(
-                (num_tokens, num_experts), device=device, dtype=torch.bfloat16
-            )
+        routing_dtype = torch.float32 if routing_method_type == 2 else torch.bfloat16
+        routing_logits = torch.randn(
+            (num_tokens, num_experts), device=device, dtype=routing_dtype
+        )
     else:
         raise ValueError(f"Unknown MOE kernel type: {moe_kernel_type}")
 
