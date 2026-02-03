@@ -5,6 +5,9 @@ set -eo pipefail
 # Get the directory where this script is located
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Source test environment setup (handles package overrides like TVM-FFI)
+source "${SCRIPT_DIR}/setup_test_env.sh"
+
 # Set MPI command prefix for multi-GPU tests
 : "${PYTEST_COMMAND_PREFIX:=mpirun -np 4}"
 
