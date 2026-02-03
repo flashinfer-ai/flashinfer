@@ -281,10 +281,14 @@ def create_trtllm_moe_test_data(
     # Different MOE kernels have different routing_logits dtype requirements:
 
     if moe_kernel_type == "fp8_block_scale":
-        # FP8 block scale MOE always expects float32 routing logits (line 333 in kernel_launcher.cu)
-        routing_logits = torch.randn(
-            (num_tokens, num_experts), device=device, dtype=torch.float32
-        )
+        if routing_method_type == 2:  # DeepSeekV3 - uses float32
+            routing_logits = torch.randn(
+                (num_tokens, num_experts), device=device, dtype=torch.float32
+            )
+        else:
+            routing_logits = torch.randn(
+                (num_tokens, num_experts), device=device, dtype=torch.bfloat16
+            )
     elif moe_kernel_type == "fp8_per_tensor":
         # FP8 per-tensor MOE dtype depends on use_routing_scales_on_input parameter
         # For Llama4: use_routing_scales_on_input=True -> bfloat16
