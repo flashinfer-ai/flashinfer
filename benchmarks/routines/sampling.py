@@ -85,6 +85,16 @@ def parse_sampling_args(line, parser):
     Returns:
         Parsed argument namespace
     """
+    # Routines that don't use vocab_size (they use max_len instead)
+    routines_without_vocab_size = [
+        "top_k_page_table_transform",
+        "top_k_ragged_transform",
+    ]
+
+    # Pre-parse to check routine for conditional requirements
+    pre_parser = parser
+    pre_args, _ = pre_parser.parse_known_args(line[:])
+
     parser.add_argument(
         "--batch_size",
         type=int,
@@ -94,7 +104,8 @@ def parse_sampling_args(line, parser):
     parser.add_argument(
         "--vocab_size",
         type=int,
-        required=True,
+        required=(pre_args.routine not in routines_without_vocab_size),
+        default=None,
         help="Vocabulary size.",
     )
     parser.add_argument(
@@ -309,7 +320,8 @@ def testSamplingFromProbs(args):
     backends = args.backends[:]
     batch_size = args.batch_size
     vocab_size = args.vocab_size
-    is_cuda_graph_compatible = not args.no_cuda_graph
+    # Sampling functions with RNG are not CUDA graph compatible
+    is_cuda_graph_compatible = False
     res = []
 
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
@@ -403,7 +415,8 @@ def testSamplingFromLogits(args):
     backends = args.backends[:]
     batch_size = args.batch_size
     vocab_size = args.vocab_size
-    is_cuda_graph_compatible = not args.no_cuda_graph
+    # Sampling functions with RNG are not CUDA graph compatible
+    is_cuda_graph_compatible = False
     res = []
 
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
@@ -499,7 +512,8 @@ def testTopKSamplingFromProbs(args):
     batch_size = args.batch_size
     vocab_size = args.vocab_size
     top_k = args.top_k
-    is_cuda_graph_compatible = not args.no_cuda_graph
+    # Sampling functions with RNG are not CUDA graph compatible
+    is_cuda_graph_compatible = False
     res = []
 
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
@@ -596,7 +610,8 @@ def testTopPSamplingFromProbs(args):
     batch_size = args.batch_size
     vocab_size = args.vocab_size
     top_p = args.top_p
-    is_cuda_graph_compatible = not args.no_cuda_graph
+    # Sampling functions with RNG are not CUDA graph compatible
+    is_cuda_graph_compatible = False
     res = []
 
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
@@ -695,7 +710,8 @@ def testTopKTopPSamplingFromProbs(args):
     top_k = args.top_k
     top_p = args.top_p
     filter_apply_order = args.filter_apply_order
-    is_cuda_graph_compatible = not args.no_cuda_graph
+    # Sampling functions with RNG are not CUDA graph compatible
+    is_cuda_graph_compatible = False
     res = []
 
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
@@ -800,7 +816,8 @@ def testTopKTopPSamplingFromLogits(args):
     top_k = args.top_k
     top_p = args.top_p
     filter_apply_order = args.filter_apply_order
-    is_cuda_graph_compatible = not args.no_cuda_graph
+    # Sampling functions with RNG are not CUDA graph compatible
+    is_cuda_graph_compatible = False
     res = []
 
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
@@ -904,7 +921,8 @@ def testMinPSamplingFromProbs(args):
     batch_size = args.batch_size
     vocab_size = args.vocab_size
     min_p = args.min_p
-    is_cuda_graph_compatible = not args.no_cuda_graph
+    # Sampling functions with RNG are not CUDA graph compatible
+    is_cuda_graph_compatible = False
     res = []
 
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
@@ -1295,7 +1313,8 @@ def testChainSpeculativeSampling(args):
     batch_size = args.batch_size
     vocab_size = args.vocab_size
     num_speculate_tokens = args.num_speculate_tokens
-    is_cuda_graph_compatible = not args.no_cuda_graph
+    # Sampling functions with RNG are not CUDA graph compatible
+    is_cuda_graph_compatible = False
     res = []
 
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
