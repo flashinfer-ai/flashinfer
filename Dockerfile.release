@@ -44,8 +44,8 @@ RUN sed -i 's/name = "flashinfer-python"/name = "ant-deepxpu-flashinfer-python"/
 RUN python -m pip wheel . --no-deps --no-build-isolation -w /flashinfer/dist/ -v
 
 
-RUN cd flashinfer-jit-cache && \
-    python -m pip wheel . --no-deps --no-build-isolation -w /flashinfer/dist/ -v
+# RUN cd flashinfer-jit-cache && \
+#     python -m pip wheel . --no-deps --no-build-isolation -w /flashinfer/dist/ -v
 
 FROM reg.docker.alibaba-inc.com/alipay/7u2-common:202202.0T
 
