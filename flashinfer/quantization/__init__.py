@@ -42,6 +42,7 @@ from ..cute_dsl import is_cute_dsl_available
 
 if is_cute_dsl_available():
     from .mxfp8_quantize_cute_dsl import mxfp8_quantize_cute_dsl
+    from .mxfp4_quantize_cute_dsl import mxfp4_quantize_cute_dsl
 
 __all__ = [
     # Packbits
@@ -70,4 +71,5 @@ __all__ = [
 if is_cute_dsl_available():
     __all__ += [
         "mxfp8_quantize_cute_dsl",
+        "mxfp4_quantize_cute_dsl",
     ]

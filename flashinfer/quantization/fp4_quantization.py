@@ -874,21 +874,49 @@ def nvfp4_quantize(
 
 
 @flashinfer_api
-def mxfp4_quantize(a):
+def mxfp4_quantize(
+    a: torch.Tensor,
+    backend: str = "cuda",
+    enable_pdl: Optional[bool] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize input tensor to MXFP4 format.
 
     Parameters:
         a (torch.Tensor): Input tensor of shape [M, K] with dtype fp16/bf16.
+        backend (str, optional): Backend to use for quantization.
+            - "cuda": Use CUDA kernel (default)
+            - "cute-dsl": Use CuTe-DSL kernel (requires SM100+)
+        enable_pdl (Optional[bool], optional): Whether to enable PDL (Programmatic
+            Dependent Launch). Only used when backend="cute-dsl".
+            If None, automatically detects based on device capability.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
             - Quantized tensor of shape [M, K/2] with dtype uint8 (FLOAT4_E2M1X2)
             - Scale factors tensor with shape determined by layout and sf_vec_size (uint8)
+
+    Note:
+        The CuTe-DSL backend provides an alternative implementation that may offer
+        better performance on certain hardware configurations (e.g., SM100+).
     """
-    a_global_sf = (448 * 6) / a.float().abs().nan_to_num().max()
-    a_fp4, a_sf = fp4_quantize(a.cuda(), a_global_sf.cuda(), 32, True, True)
-    return a_fp4, a_sf
+    if backend == "cute-dsl":
+        from ..cute_dsl import is_cute_dsl_available
+
+        if not is_cute_dsl_available():
+            raise RuntimeError(
+                "CuTe-DSL backend requested but CuTe-DSL is not available. "
+                "Please install the required dependencies."
+            )
+        from .mxfp4_quantize_cute_dsl import mxfp4_quantize_cute_dsl
+
+        return mxfp4_quantize_cute_dsl(a, enable_pdl=enable_pdl)
+    elif backend == "cuda":
+        a_global_sf = (448 * 6) / a.float().abs().nan_to_num().max()
+        a_fp4, a_sf = fp4_quantize(a.cuda(), a_global_sf.cuda(), 32, True, True)
+        return a_fp4, a_sf
+    else:
+        raise ValueError(f"Unknown backend: {backend}. Must be 'cuda' or 'cute-dsl'.")
 
 
 @flashinfer_api
