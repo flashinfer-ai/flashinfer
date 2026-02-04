@@ -2513,7 +2513,9 @@ def _check_mm_mxfp8_problem_size(
     if b_descale.dtype != torch.uint8:
         raise ValueError(f"b_descale must be a uint8 tensor, got {b_descale.dtype=}")
 
+    # MXFP8 block size
     sf_vec_size = 32
+
     if a_descale.ndim == 1:
         expected_len = _mxfp8_swizzled_scale_len(a.shape[0], a.shape[1])
         if a_descale.shape[0] != expected_len:
@@ -2522,6 +2524,11 @@ def _check_mm_mxfp8_problem_size(
                 f"Expected {(expected_len,)}, got {a_descale.shape}."
             )
     elif a_descale.ndim == 2:
+        if a.shape[1] % sf_vec_size != 0:
+            raise ValueError(
+                "a_descale shape mismatch for non-swizzled layout. "
+                f"a.shape[1] must be divisible by {sf_vec_size}, got {a.shape[1]}."
+            )
         expected_shape = (a.shape[0], a.shape[1] // sf_vec_size)
         if a_descale.shape != expected_shape:
             raise ValueError(
@@ -2541,6 +2548,11 @@ def _check_mm_mxfp8_problem_size(
                 f"Expected {(expected_len,)}, got {b_descale.shape}."
             )
     elif b_descale.ndim == 2:
+        if b.shape[0] % sf_vec_size != 0:
+            raise ValueError(
+                "b_descale shape mismatch for non-swizzled layout. "
+                f"b.shape[0] must be divisible by {sf_vec_size}, got {b.shape[0]}."
+            )
         expected_shape = (b.shape[0] // sf_vec_size, b.shape[1])
         if b_descale.shape != expected_shape:
             raise ValueError(
