@@ -185,7 +185,7 @@ def mxfp8_quantize(
                 "CuTe-DSL backend requested but CuTe-DSL is not available. "
                 "Please install nvidia-cutlass-dsl package."
             )
-        from .mxfp8_quantize_cute_dsl import mxfp8_quantize_cute_dsl
+        from .kernels.mxfp8_quantize import mxfp8_quantize_cute_dsl
 
         return mxfp8_quantize_cute_dsl(
             input,

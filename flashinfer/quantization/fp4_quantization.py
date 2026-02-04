@@ -908,7 +908,7 @@ def mxfp4_quantize(
                 "CuTe-DSL backend requested but CuTe-DSL is not available. "
                 "Please install the required dependencies."
             )
-        from .mxfp4_quantize_cute_dsl import mxfp4_quantize_cute_dsl
+        from .kernels.mxfp4_quantize import mxfp4_quantize_cute_dsl
 
         return mxfp4_quantize_cute_dsl(a, enable_pdl=enable_pdl)
     elif backend == "cuda":

@@ -41,8 +41,8 @@ from .fp4_quantization import (
 from ..cute_dsl import is_cute_dsl_available
 
 if is_cute_dsl_available():
-    from .mxfp8_quantize_cute_dsl import mxfp8_quantize_cute_dsl
-    from .mxfp4_quantize_cute_dsl import mxfp4_quantize_cute_dsl
+    from .kernels.mxfp8_quantize import mxfp8_quantize_cute_dsl
+    from .kernels.mxfp4_quantize import mxfp4_quantize_cute_dsl
 
 __all__ = [
     # Packbits

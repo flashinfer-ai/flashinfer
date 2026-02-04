@@ -35,13 +35,13 @@ import cutlass.cute as cute
 import torch
 from cutlass import Float32, Int32, Uint8
 
-from ..api_logging import flashinfer_api
-from ..cute_dsl.fp4_common import (
+from ...api_logging import flashinfer_api
+from ...cute_dsl.fp4_common import (
     ld_global_v4_u32,
     st_global_u64,
     get_ptr_as_int64,
 )
-from .quantization_cute_dsl_utils import (
+from ..quantization_cute_dsl_utils import (
     # Constants
     SF_VEC_SIZE,
     INV_FLOAT8_E4M3_MAX,
@@ -699,7 +699,7 @@ def mxfp8_quantize_cute_dsl(
             - fp8_tensor: Quantized tensor of shape [M, padded_K] with dtype float8_e4m3fn
             - scale_tensor: Scale factors as uint8 tensor
     """
-    from ..utils import device_support_pdl
+    from ...utils import device_support_pdl
 
     assert input.dtype in (torch.float16, torch.bfloat16), (
         f"Input dtype must be float16 or bfloat16, got {input.dtype}"
