@@ -889,7 +889,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKKernel_Unified(
       if (k >= length) {
         // k >= vocab_size: return all indices
         const uint32_t chunk_start = cta_in_group * chunk_size;
-        const uint32_t chunk_end = min(chunk_start + chunk_size, length);
+        const uint32_t chunk_end = min(chunk_start + chunk_size, stride);
         for (uint32_t i = tx; i < chunk_end - chunk_start; i += BLOCK_THREADS) {
           if (chunk_start + i < k) {
             row_output[chunk_start + i] = static_cast<IdType>(chunk_start + i);
@@ -949,7 +949,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKKernel_Unified(
     }
 
     const uint32_t chunk_start = cta_in_group * chunk_size;
-    const uint32_t chunk_end = min(chunk_start + chunk_size, length);
+    const uint32_t chunk_end = min(chunk_start + chunk_size, stride);
     const uint32_t actual_chunk_size = chunk_end - chunk_start;
 
     // Stage 1: Load and convert to ordered representation
