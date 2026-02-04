@@ -97,18 +97,6 @@ size_t dispatchMXFP8xMXFP8GemmClusterShapeSm100(T* D, void const* A, void const*
           D, A, B, input_sf, weight_sf, m, n, k, batch_count, gemmConfig, workspace, workspaceBytes,
           stream, occupancy);
       break;
-    case ClusterShape::ClusterShape_1x8x1:
-      return genericMxfp8GemmKernelLauncher<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<1>, cute::Int<8>,
-                                            cute::Int<1>, _1SM>(
-          D, A, B, input_sf, weight_sf, m, n, k, batch_count, gemmConfig, workspace, workspaceBytes,
-          stream, occupancy);
-      break;
-    case ClusterShape::ClusterShape_8x1x1:
-      return genericMxfp8GemmKernelLauncher<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<8>, cute::Int<1>,
-                                            cute::Int<1>, _2SM>(
-          D, A, B, input_sf, weight_sf, m, n, k, batch_count, gemmConfig, workspace, workspaceBytes,
-          stream, occupancy);
-      break;
     default:
       throw std::runtime_error(
           "[Error][MXFP8][dispatch_gemm_cluster_shape] Config is invalid for MXFP8 GEMM.");
@@ -219,7 +207,6 @@ std::vector<CutlassGemmConfig> CutlassMxfp8GemmRunner<T, mxfp8GemmType>::getConf
       ClusterShape::ClusterShape_2x1x1, ClusterShape::ClusterShape_2x2x1,
       ClusterShape::ClusterShape_1x4x1, ClusterShape::ClusterShape_2x4x1,
       ClusterShape::ClusterShape_4x2x1, ClusterShape::ClusterShape_4x4x1,
-      ClusterShape::ClusterShape_1x8x1, ClusterShape::ClusterShape_8x1x1,
   };
   for (auto const& tile_config : tilesSm100) {
     for (auto const& cluster_config : clusterShapes) {
