@@ -885,8 +885,8 @@ def mxfp4_quantize(
     Parameters:
         a (torch.Tensor): Input tensor of shape [M, K] with dtype fp16/bf16.
         backend (str, optional): Backend to use for quantization.
-            - "cuda": Use CUDA kernel (default)
-            - "cute-dsl": Use CuTe-DSL kernel (requires SM100+)
+            - "cuda": Use CUDA kernel (default, stable)
+            - "cute-dsl": Use CuTe-DSL kernel (requires SM100+, **experimental**)
         enable_pdl (Optional[bool], optional): Whether to enable PDL (Programmatic
             Dependent Launch). Only used when backend="cute-dsl".
             If None, automatically detects based on device capability.
@@ -896,9 +896,10 @@ def mxfp4_quantize(
             - Quantized tensor of shape [M, K/2] with dtype uint8 (FLOAT4_E2M1X2)
             - Scale factors tensor with shape determined by layout and sf_vec_size (uint8)
 
-    Note:
-        The CuTe-DSL backend provides an alternative implementation that may offer
-        better performance on certain hardware configurations (e.g., SM100+).
+    Warning:
+        The "cute-dsl" backend is **experimental** and not part of the stable API.
+        It may change or be removed in future versions without notice.
+        Use at your own risk for production workloads.
     """
     if backend == "cute-dsl":
         from ..cute_dsl import is_cute_dsl_available

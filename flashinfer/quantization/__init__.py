@@ -35,7 +35,8 @@ from .fp4_quantization import (
     get_fp4_quantization_module,  # Used by activation.py
 )
 
-# CuTe-DSL kernels (conditionally exported)
+# CuTe-DSL kernels (conditionally exported, EXPERIMENTAL)
+# Warning: These are experimental APIs and may change without notice.
 # Note: is_cute_dsl_available is used internally but not re-exported;
 # users should import from flashinfer.cute_dsl
 from ..cute_dsl import is_cute_dsl_available

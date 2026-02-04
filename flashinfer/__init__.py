@@ -58,7 +58,7 @@ from .decode import (
 )
 from .decode import cudnn_batch_decode_with_kv_cache as cudnn_batch_decode_with_kv_cache
 from .decode import single_decode_with_kv_cache as single_decode_with_kv_cache
-from .fp4_quantization import (
+from .quantization.fp4_quantization import (
     SfLayout,
     block_scale_interleave,
     nvfp4_block_scale_interleave,
@@ -73,7 +73,7 @@ from .fp4_quantization import (
     shuffle_matrix_sf_a,
     scaled_fp4_grouped_quantize,
 )
-from .fp8_quantization import mxfp8_dequantize_host, mxfp8_quantize
+from .quantization.fp8_quantization import mxfp8_dequantize_host, mxfp8_quantize
 from .fused_moe import (
     RoutingMethodType,
     GatedActType,

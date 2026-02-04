@@ -13,11 +13,17 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-CuTe-DSL Quantization Kernels
-=============================
+CuTe-DSL Quantization Kernels (EXPERIMENTAL)
+============================================
+
+.. warning::
+    This subpackage is **experimental** and not part of the stable FlashInfer API.
+    The interfaces, implementations, and behaviors may change or be removed
+    in future versions without notice. Use at your own risk for production workloads.
 
 This subpackage contains high-performance CuTe-DSL implementations of
-quantization kernels for MXFP4 and MXFP8 formats.
+quantization kernels for MXFP4 and MXFP8 formats. These kernels require
+SM100+ (Blackwell) GPUs and the nvidia-cutlass-dsl package.
 """
 
 from .mxfp4_quantize import (

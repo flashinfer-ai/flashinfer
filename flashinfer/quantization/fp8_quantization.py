@@ -163,12 +163,18 @@ def mxfp8_quantize(
         enable_pdl (Optional[bool], optional): Whether to enable PDL (Programmatic Dependent Launch).
             If None, automatically detects based on device capability (SM >= 9.0). Defaults to None.
         backend (str, optional): Backend to use for quantization. Options are:
-            - "cuda": Use JIT-compiled CUDA kernel (default)
-            - "cute-dsl": Use CuTe-DSL kernel
+            - "cuda": Use JIT-compiled CUDA kernel (default, stable)
+            - "cute-dsl": Use CuTe-DSL kernel (requires SM100+, **experimental**)
+
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
             - Quantized tensor of shape [M, K] with dtype FLOAT8_E4M3
             - Scale factors tensor with shape determined by layout and sf_vec_size
+
+    Warning:
+        The "cute-dsl" backend is **experimental** and not part of the stable API.
+        It may change or be removed in future versions without notice.
+        Use at your own risk for production workloads.
     """
     sf_vec_size = 32
 
