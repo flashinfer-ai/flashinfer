@@ -15,13 +15,13 @@
  */
 #pragma once
 
-#include "../kernel/flat_options.hpp"
 #include "cutlass/arch/arch.h"
 #include "cutlass/arch/reg_reconfig.h"
 #include "cutlass/cutlass.h"
 #include "cutlass/pipeline/pipeline.hpp"
-#include "flat/common.hpp"
-#include "flat/unused.hpp"
+#include "flashinfer/flat/common.hpp"
+#include "flashinfer/flat/hopper/kernel/flat_options.hpp"
+#include "flashinfer/flat/unused.hpp"
 
 namespace flat::kernel {
 

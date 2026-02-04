@@ -1131,6 +1131,8 @@ def get_trtllm_moe_sm100_module():
                     )
                     moe_op.trtllm_fp8_block_scale_moe(
                         routing_logits,
+                        topk_ids,
+                        expert_weights,
                         kwargs["routing_bias"],
                         hidden_states,
                         current_hidden_states_scale,
@@ -1542,7 +1544,9 @@ def get_trtllm_moe_sm100_module():
         mutates_args=(""),
     )
     def trtllm_fp8_block_scale_moe_op(
-        routing_logits: torch.Tensor,
+        routing_logits: Optional[torch.Tensor],
+        topk_ids: Optional[torch.Tensor],
+        expert_weights: Optional[torch.Tensor],
         routing_bias: Optional[torch.Tensor],
         hidden_states: torch.Tensor,
         hidden_states_scale: torch.Tensor,
@@ -1565,6 +1569,16 @@ def get_trtllm_moe_sm100_module():
         enable_pdl: Optional[bool] = None,
         tune_max_num_tokens: int = 8192,
     ) -> torch.Tensor:
+        # Determine routing mode: compute from logits or use pre-computed
+        if routing_logits is None:
+            assert topk_ids is not None, (
+                "either topk_ids or routing_logits must be provided."
+            )
+            assert topk_ids.dtype == torch.int32, "topk_ids must be an int32 tensor."
+            routing_dtype = torch.bfloat16
+        else:
+            routing_dtype = routing_logits.dtype
+
         if enable_pdl is None:
             enable_pdl = device_support_pdl(hidden_states.device)
 
@@ -1579,12 +1593,22 @@ def get_trtllm_moe_sm100_module():
         output = torch.empty(
             num_tokens, hidden_size, dtype=torch.bfloat16, device=hidden_states.device
         )
-        topk_ids = torch.empty(
-            num_tokens, top_k, dtype=torch.int32, device=hidden_states.device
-        )
-        expert_weights = torch.empty(
-            num_tokens, top_k, dtype=routing_logits.dtype, device=hidden_states.device
-        )
+        if routing_logits is not None:
+            # When routing_logits is provided, we must pass topk_ids/expert_weights with no allocation
+            topk_ids = torch.empty(0, dtype=torch.int32, device=hidden_states.device)
+            expert_weights = torch.empty(
+                0, dtype=routing_dtype, device=hidden_states.device
+            )
+        else:
+            # When routing_logits is provided, we either have topk_ids/expert_weights,
+            # packed into a single tensor as topk_id
+            # or have them individually as topk_ids and expert_weights respectively
+            topk_ids = topk_ids
+            expert_weights = (
+                expert_weights
+                if expert_weights is not None
+                else torch.empty(0, dtype=routing_dtype, device=hidden_states.device)
+            )
 
         dtype_act = DtypeTrtllmGen.E4m3  # FP8 activation
         dtype_weights = DtypeTrtllmGen.E4m3  # FP8 weights
@@ -1634,6 +1658,8 @@ def get_trtllm_moe_sm100_module():
         # Call the C++ function for block scale MoE
         result = moe_op.trtllm_fp8_block_scale_moe(
             routing_logits,
+            topk_ids,
+            expert_weights,
             routing_bias,
             hidden_states,
             hidden_states_scale,
@@ -1661,7 +1687,9 @@ def get_trtllm_moe_sm100_module():
 
     @register_fake_op("flashinfer::trtllm_fp8_block_scale_moe")
     def _fake_trtllm_fp8_block_scale_moe(
-        routing_logits: torch.Tensor,
+        routing_logits: Optional[torch.Tensor],
+        topk_ids: Optional[torch.Tensor],
+        expert_weights: Optional[torch.Tensor],
         routing_bias: Optional[torch.Tensor],
         hidden_states: torch.Tensor,
         hidden_states_scale: torch.Tensor,
@@ -1682,6 +1710,7 @@ def get_trtllm_moe_sm100_module():
         use_shuffled_weight: bool = False,
         weight_layout: int = 0,
         enable_pdl: Optional[bool] = None,
+        tune_max_num_tokens: int = 8192,
     ):
         seq_len = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1]
@@ -2293,6 +2322,97 @@ def trtllm_fp8_block_scale_moe(
     )
     return get_trtllm_moe_sm100_module().trtllm_fp8_block_scale_moe(
         routing_logits,
+        None,  # topk_ids - will be computed from routing_logits
+        None,  # expert_weights - will be computed from routing_logits
+        routing_bias,
+        hidden_states,
+        hidden_states_scale,
+        gemm1_weights,
+        gemm1_weights_scale,
+        gemm2_weights,
+        gemm2_weights_scale,
+        output,
+        num_experts,
+        top_k,
+        n_group,
+        topk_group,
+        intermediate_size,
+        local_expert_offset,
+        local_num_experts,
+        routed_scaling_factor,
+        routing_method_type,
+        use_shuffled_weight,
+        weight_layout,
+        enable_pdl,
+        tune_max_num_tokens,
+    )
+
+
+@flashinfer_api
+def trtllm_fp8_block_scale_routed_moe(
+    topk_ids: torch.Tensor,
+    routing_bias: Optional[torch.Tensor],
+    hidden_states: torch.Tensor,
+    hidden_states_scale: torch.Tensor,
+    gemm1_weights: torch.Tensor,
+    gemm1_weights_scale: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    gemm2_weights_scale: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+    n_group: Optional[int],
+    topk_group: Optional[int],
+    intermediate_size: int,
+    local_expert_offset: int,
+    local_num_experts: int,
+    routed_scaling_factor: Optional[float],
+    routing_method_type: int = 0,
+    use_shuffled_weight: bool = False,
+    weight_layout: int = 0,
+    enable_pdl: Optional[bool] = None,
+    output: Optional[torch.Tensor] = None,
+    tune_max_num_tokens: int = 8192,
+) -> torch.Tensor:
+    """FP8 block scale MoE operation with pre-computed routing (packed format).
+
+    This function is used when routing decisions have already been computed
+    and packed into a single tensor. This is useful for:
+    - CUDA Graph capture (avoids CPU-GPU sync from routing_logits processing)
+    - Distributed MoE where routing is computed elsewhere
+
+    Args:
+        topk_ids: [seq_len, top_k] tensor of packed expert indices and weights (int32).
+            Format: (expert_id << 16) | (weight_bf16.view(int16))
+            Can be created as: (topk_ids.int32 << 16) | expert_weights.bfloat16.view(int16)
+        routing_bias: [num_experts] tensor of routing bias (can be None)
+        hidden_states: [seq_len, hidden_size] tensor of input hidden states
+        hidden_states_scale: [hidden_size//128, seq_len] tensor of hidden states block scales
+        gemm1_weights: [num_experts, 2*intermediate_size, hidden_size] tensor of first layer weights
+        gemm1_weights_scale: [num_experts, 2*intermediate_size//128, hidden_size//128] tensor of first layer block scales
+        gemm2_weights: [num_experts, hidden_size, intermediate_size] tensor of second layer weights
+        gemm2_weights_scale: [num_experts, hidden_size//128, intermediate_size//128] tensor of second layer block scales
+        num_experts: Total number of experts
+        top_k: Number of experts to route to per token
+        n_group: Number of expert groups
+        topk_group: Number of groups to consider for top-k routing
+        intermediate_size: Size of intermediate layer
+        local_expert_offset: Offset of local experts in global expert space
+        local_num_experts: Number of experts handled by this device
+        routed_scaling_factor: Scaling factor for routing
+        routing_method_type: Type of routing method to use (default: 0)
+        use_shuffled_weight: Whether to use shuffled weights
+        weight_layout: Weight layout (0 = MajorK, 1 = BlockMajorK)
+        enable_pdl: Whether to enable Programmatic Dependent Launch (PDL). Auto-enabled for >= sm90.
+        output (Optional[torch.Tensor]): shape [seq_len, hidden_size]
+            Optional inplace output tensor.
+        tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 8192)
+    Returns:
+        torch.Tensor: Output tensor of shape [seq_len, hidden_size]
+    """
+    return get_trtllm_moe_sm100_module().trtllm_fp8_block_scale_moe(
+        None,  # routing_logits
+        topk_ids,
+        None,  # expert_weights
         routing_bias,
         hidden_states,
         hidden_states_scale,
