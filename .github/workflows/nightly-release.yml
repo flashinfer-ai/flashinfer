@@ -155,9 +155,9 @@ jobs:
           export CUDA_MINOR
           export FLASHINFER_LOCAL_VERSION="cu${CUDA_MAJOR}${CUDA_MINOR}"
 
-          chown -R $(id -u):$(id -g) ${{ github.workspace }}
+          sudo chown -R $(id -u):$(id -g) ${{ github.workspace }}
           mkdir -p ${{ github.workspace }}/ci-cache
-          chown -R $(id -u):$(id -g) ${{ github.workspace }}/ci-cache
+          sudo chown -R $(id -u):$(id -g) ${{ github.workspace }}/ci-cache
 
           # Run the build script inside the container with proper mounts
           docker run --rm \
