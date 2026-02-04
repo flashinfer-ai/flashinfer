@@ -241,7 +241,8 @@ def test_mm_mxfp8_invalid_ndim():
     a_descale = a_scale.view(1, -1, 1)
     b_descale = b_scale.view(1, -1, 1)
     with pytest.raises(
-        ValueError, match="a_descale must be 1D \(swizzled\) or 2D \(non-swizzled\)"
+        ValueError,
+        match=r"a_descale must be 1D \(swizzled\) or 2D \(non-swizzled\)",
     ):
         mm_mxfp8(
             a_mx,
