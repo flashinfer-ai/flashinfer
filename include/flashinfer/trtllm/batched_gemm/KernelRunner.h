@@ -74,6 +74,9 @@ class TrtllmGenBatchedGemmRunner {
                                                int32_t configIndex) const;
 
   // Generic GEMM interface
+  // When validM/validN/validK are non-negative, they specify the valid (unpadded) region
+  // of the M/N/K dimensions for computation while the full m/n/k dimensions describe the
+  // padded tensor memory layout. If negative (default), they are set equal to m/n/k.
   void run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens,
            int32_t numTokens, int32_t numBatches, int32_t maxNumCtasInBatchDim, void const* a,
            void const* sfA, void const* b, void const* sfB, void const* perTokensSfA,
@@ -82,7 +85,8 @@ class TrtllmGenBatchedGemmRunner {
            float const* clampLimit, void* c, void* outSfC, int32_t const* routeMap,
            int32_t const* totalNumPaddedTokens, int32_t const* ctaIdxXyToBatchIdx,
            int32_t const* ctaIdxXyToMnLimit, int32_t const* numNonExitingCtas, void* workspace,
-           CUstream stream, int device, int32_t configIndex, bool enable_pdl);
+           CUstream stream, int device, int32_t configIndex, bool enable_pdl, int32_t validM = -1,
+           int32_t validN = -1, int32_t validK = -1);
 
   // NVFP4 per-block scaling GEMM
   void run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens,

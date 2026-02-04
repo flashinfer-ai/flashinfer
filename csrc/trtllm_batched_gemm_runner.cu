@@ -167,7 +167,8 @@ void TrtllmGenBatchedGemmRunner::run(
     float const* ptrClampLimit, void* c, void* outSfC, int32_t const* routeMap,
     int32_t const* totalNumPaddedTokens, int32_t const* ctaIdxXyToBatchIdx,
     int32_t const* ctaIdxXyToMnLimit, int32_t const* numNonExitingCtas, void* workspace,
-    CUstream stream, int device, int32_t configIndex, bool enable_pdl) {
+    CUstream stream, int device, int32_t configIndex, bool enable_pdl, int32_t validM,
+    int32_t validN, int32_t validK) {
   auto bmm = BatchedGemmInterface();
 
   BatchedGemmData gemmData;
@@ -245,9 +246,11 @@ void TrtllmGenBatchedGemmRunner::run(
   int32_t multiProcessorCount;
   cudaDeviceGetAttribute(&multiProcessorCount, cudaDevAttrMultiProcessorCount, device);
 
-  gemmData.mProblemDimensions.mValidM = gemmData.mProblemDimensions.mM;
-  gemmData.mProblemDimensions.mValidN = gemmData.mProblemDimensions.mN;
-  gemmData.mProblemDimensions.mValidK = gemmData.mProblemDimensions.mK;
+  // Use valid dimensions if provided (non-negative), otherwise default to padded dimensions.
+  // This allows tensor dimensions to be padded for alignment while computing only the valid region.
+  gemmData.mProblemDimensions.mValidM = (validM >= 0) ? validM : gemmData.mProblemDimensions.mM;
+  gemmData.mProblemDimensions.mValidN = (validN >= 0) ? validN : gemmData.mProblemDimensions.mN;
+  gemmData.mProblemDimensions.mValidK = (validK >= 0) ? validK : gemmData.mProblemDimensions.mK;
 
   // FIXME once we start using all-reduce in the epilogue of the bmm this can be moved elsewhere
   bmm.runInitBeforeWorldSync(config, gemmData, static_cast<void*>(stream));
