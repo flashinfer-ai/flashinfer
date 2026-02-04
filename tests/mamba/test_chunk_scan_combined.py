@@ -1,32 +1,18 @@
 """
 Test for Mamba2 SSD (Structured State-Space Duality) chunk scan combined kernel.
 
-Compares the CUTLASS CuTe DSL Blackwell implementation against the production
-Triton implementation.
+Compares the FlashInfer SSD combined implementation (CuTe DSL + Triton)
+against the production Triton implementation.
 """
-
-import sys
-from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
 
-# Add CUTLASS mamba2_ssd path
-CUTLASS_MAMBA2_SSD_PATH = (
-    Path(__file__).resolve().parents[2]
-    / "3rdparty"
-    / "cutlass"
-    / "examples"
-    / "python"
-    / "CuTeDSL"
-    / "blackwell"
-    / "mamba2_ssd"
-)
-sys.path.insert(0, str(CUTLASS_MAMBA2_SSD_PATH))
+# Import FlashInfer SSD combined API
+from flashinfer.mamba import ssd_combined_fwd
 
-# Import Triton reference
-from .triton_reference.ssd_chunk_state import _chunk_cumsum_fwd
+# Import Triton reference for comparison
 from .triton_reference.ssd_combined import _mamba_chunk_scan_combined_fwd
 
 
@@ -34,7 +20,7 @@ def is_blackwell_available():
     """Check if Blackwell GPU (SM100) is available."""
     if not torch.cuda.is_available():
         return False
-    major, minor = torch.cuda.get_device_capability()
+    major, _ = torch.cuda.get_device_capability()
     return major >= 10  # SM100 = Blackwell
 
 
@@ -43,337 +29,6 @@ pytestmark = pytest.mark.skipif(
     not is_blackwell_available(),
     reason="Blackwell GPU (SM100+) required for CuTe DSL Mamba2 SSD kernel",
 )
-
-
-def import_cutlass_modules():
-    """Import CUTLASS modules (only when needed, as they require SM100)."""
-    import cuda.bindings.driver as cuda
-    import cutlass
-    import cutlass.cute as cute
-    import cutlass.torch as cutlass_torch
-    from cutlass.cute.runtime import from_dlpack
-    from mamba2_ssd import SSDKernel
-
-    return {
-        "cuda": cuda,
-        "cutlass": cutlass,
-        "cute": cute,
-        "cutlass_torch": cutlass_torch,
-        "from_dlpack": from_dlpack,
-        "SSDKernel": SSDKernel,
-    }
-
-
-class CutlassSSDWrapper:
-    """
-    Wrapper around CUTLASS CuTe DSL SSD kernel to match Triton API.
-
-    The CUTLASS kernel expects:
-    - Preprocessed cumsum_delta (step 1 already done)
-    - Specific tensor layouts different from Triton
-    - Output tensors preallocated
-
-    This wrapper:
-    1. Computes cumsum using Triton's step 1 (_chunk_cumsum_fwd)
-    2. Converts tensors to CUTLASS layout
-    3. Calls CUTLASS kernel
-    4. Converts output back to Triton layout
-    """
-
-    def __init__(
-        self,
-        chunk_size: int,
-        headdim: int,
-        dstate: int,
-        has_d: bool = True,
-        d_has_hdim: bool = False,
-        io_dtype=None,
-        cumsum_dtype=None,
-        acc_dtype=None,
-    ):
-        """
-        Initialize the wrapper.
-
-        Args:
-            chunk_size: L - size of each chunk
-            headdim: D - head dimension
-            dstate: N - state dimension
-            has_d: Whether to fuse D scaling (Y += X*D)
-            d_has_hdim: If True, D is (headdim, nheads), else (1, nheads)
-            io_dtype: Input/output dtype (default: cutlass.BFloat16)
-            cumsum_dtype: Cumsum intermediate dtype (default: cutlass.Float32)
-            acc_dtype: Accumulator dtype (default: cutlass.Float32)
-        """
-        self.modules = import_cutlass_modules()
-        cutlass = self.modules["cutlass"]
-
-        self.chunk_size = chunk_size
-        self.headdim = headdim
-        self.dstate = dstate
-        self.has_d = has_d
-        self.d_has_hdim = d_has_hdim
-
-        self.io_dtype = io_dtype or cutlass.BFloat16
-        self.cumsum_dtype = cumsum_dtype or cutlass.Float32
-        self.acc_dtype = acc_dtype or cutlass.Float32
-
-        # Create the kernel
-        SSDKernel = self.modules["SSDKernel"]
-        self.kernel = SSDKernel(
-            self.io_dtype,
-            self.cumsum_dtype,
-            self.acc_dtype,
-            chunk_size,
-            headdim,
-            dstate,
-            has_d,
-            d_has_hdim,
-        )
-
-        self._compiled_kernel = None
-
-    def _create_cutlass_tensor(self, shape, permute_order, dtype, dynamic_modes):
-        """
-        Create a tensor using the exact logic from mamba2_ssd.py to ensure compatibility.
-
-        Args:
-            shape: Base shape of the tensor (before permutation)
-            permute_order: Order to permute dimensions
-            dtype: CUTLASS dtype
-            dynamic_modes: List of modes to mark as dynamic
-
-        Returns:
-            (cute_tensor, torch_tensor): The CuTe tensor wrapper and the underlying PyTorch tensor on GPU
-        """
-        cutlass_torch = self.modules["cutlass_torch"]
-        from_dlpack = self.modules["from_dlpack"]
-
-        # Create a dummy CPU tensor with the base layout to establish the permutation pattern
-        # mimicking create_and_permute_tensor from mamba2_ssd.py
-        base_tensor = torch.empty(*shape, dtype=torch.float32)
-        permuted_tensor = base_tensor.permute(permute_order)
-
-        # Move to GPU with target dtype - this creates the specific layout CUTLASS expects
-        torch_dtype = cutlass_torch.dtype(dtype)
-        dst_tensor = permuted_tensor.to(torch_dtype).cuda()
-
-        # Create CuTe tensor
-        cute_tensor = from_dlpack(dst_tensor, assumed_align=16)
-        for mode in dynamic_modes:
-            cute_tensor = cute_tensor.mark_compact_shape_dynamic(
-                mode=mode, stride_order=dst_tensor.dim_order()
-            )
-
-        return cute_tensor, dst_tensor
-
-    def __call__(
-        self,
-        x,
-        dt,
-        A,
-        B,
-        C,
-        chunk_size,
-        D=None,
-        z=None,
-        dt_bias=None,
-        initial_states=None,
-        seq_idx=None,
-        dt_softplus=False,
-        dt_limit=(0.0, float("inf")),
-    ):
-        """
-        Run the SSD kernel with Triton-compatible API.
-
-        Args:
-            x: (batch, seqlen, nheads, headdim)
-            dt: (batch, seqlen, nheads)
-            A: (nheads,)
-            B: (batch, seqlen, ngroups, dstate)
-            C: (batch, seqlen, ngroups, dstate)
-            chunk_size: Size of chunks
-            D: Optional (nheads, headdim) or (nheads,)
-            z: Optional gating tensor (not supported yet)
-            dt_bias: Optional (nheads,)
-            initial_states: Optional (batch, nheads, headdim, dstate)
-            seq_idx: Optional sequence indices (not supported yet)
-            dt_softplus: Whether to apply softplus to dt
-            dt_limit: Limits for dt values
-
-        Returns:
-            out: (batch, seqlen, nheads, headdim)
-            final_states: (batch, nheads, headdim, dstate)
-        """
-        cutlass = self.modules["cutlass"]
-        cute = self.modules["cute"]
-
-        # Validate inputs
-        batch, seqlen, nheads, headdim = x.shape
-        _, _, ngroups, dstate = B.shape
-        nchunks = seqlen // chunk_size
-
-        assert seqlen % chunk_size == 0, (
-            f"seqlen ({seqlen}) must be divisible by chunk_size ({chunk_size})"
-        )
-        assert headdim == self.headdim, f"headdim mismatch: {headdim} vs {self.headdim}"
-        assert dstate == self.dstate, f"dstate mismatch: {dstate} vs {self.dstate}"
-        assert chunk_size == self.chunk_size, (
-            f"chunk_size mismatch: {chunk_size} vs {self.chunk_size}"
-        )
-
-        if z is not None:
-            raise NotImplementedError("z (gating) not yet supported in CUTLASS wrapper")
-        if seq_idx is not None:
-            raise NotImplementedError("seq_idx not yet supported in CUTLASS wrapper")
-        if initial_states is not None:
-            raise NotImplementedError(
-                "initial_states not yet supported in CUTLASS wrapper"
-            )
-
-        # Step 1: Compute cumsum using Triton kernel
-        # dA_cumsum: (batch, nheads, nchunks, chunk_size)
-        # dt_processed: (batch, nheads, nchunks, chunk_size) - after softplus/bias
-        dA_cumsum, dt_processed = _chunk_cumsum_fwd(
-            dt,
-            A,
-            chunk_size,
-            dt_bias=dt_bias,
-            dt_softplus=dt_softplus,
-            dt_limit=dt_limit,
-        )
-
-        # Convert tensors to CUTLASS layout using the same pattern as mamba2_ssd.py
-        # Key: create contiguous tensor in base shape, then permute to get correct strides
-        # CUTLASS expects specific permuted layouts for each tensor
-
-        # x: Triton (batch, seqlen, nheads, headdim) -> CUTLASS (headdim, chunk_size, nchunks, nheads, batch)
-        x_reshaped = x.reshape(batch, nchunks, chunk_size, nheads, headdim)
-        x_tensor, x_dst = self._create_cutlass_tensor(
-            [batch, nheads, headdim, nchunks, chunk_size],
-            [2, 4, 3, 1, 0],
-            self.io_dtype,
-            [2, 3, 4],
-        )
-        x_dst.copy_(x_reshaped.permute(4, 2, 1, 3, 0).to(x_dst.dtype))
-
-        # delta (dt_processed): (batch, nheads, nchunks, chunk_size) -> (chunk_size, nchunks, nheads, batch)
-        delta_tensor, delta_dst = self._create_cutlass_tensor(
-            [batch, nheads, nchunks, chunk_size], [3, 2, 1, 0], self.io_dtype, [1, 2, 3]
-        )
-        delta_dst.copy_(dt_processed.permute(3, 2, 1, 0).to(delta_dst.dtype))
-
-        # cumsum_delta (dA_cumsum): same layout as delta
-        cumsum_delta_tensor, cumsum_delta_dst = self._create_cutlass_tensor(
-            [batch, nheads, nchunks, chunk_size],
-            [3, 2, 1, 0],
-            self.cumsum_dtype,
-            [1, 2, 3],
-        )
-        cumsum_delta_dst.copy_(dA_cumsum.permute(3, 2, 1, 0).to(cumsum_delta_dst.dtype))
-
-        # B: Triton (batch, seqlen, ngroups, dstate) -> CUTLASS (chunk_size, dstate, nchunks, ngroups, batch)
-        B_reshaped = B.reshape(batch, nchunks, chunk_size, ngroups, dstate)
-        b_tensor, b_dst = self._create_cutlass_tensor(
-            [batch, ngroups, dstate, nchunks, chunk_size],
-            [4, 2, 3, 1, 0],
-            self.io_dtype,
-            [2, 3, 4],
-        )
-        b_dst.copy_(B_reshaped.permute(2, 4, 1, 3, 0).to(b_dst.dtype))
-
-        # C: same layout as B
-        C_reshaped = C.reshape(batch, nchunks, chunk_size, ngroups, dstate)
-        c_tensor, c_dst = self._create_cutlass_tensor(
-            [batch, ngroups, dstate, nchunks, chunk_size],
-            [4, 2, 3, 1, 0],
-            self.io_dtype,
-            [2, 3, 4],
-        )
-        c_dst.copy_(C_reshaped.permute(2, 4, 1, 3, 0).to(c_dst.dtype))
-
-        # D: (nheads,) -> CUTLASS (1, nheads) or (headdim, nheads)
-        if self.has_d and D is not None:
-            if self.d_has_hdim:
-                # D is (nheads, headdim) -> (headdim, nheads)
-                if D.dim() == 1:
-                    D = D.unsqueeze(1).expand(-1, headdim)
-                d_tensor, d_dst = self._create_cutlass_tensor(
-                    [nheads, headdim], [1, 0], self.io_dtype, [1]
-                )
-                d_dst.copy_(D.t().to(d_dst.dtype))
-            else:
-                # D is (nheads,) -> (1, nheads)
-                if D.dim() == 2:
-                    D = D[:, 0]
-                d_tensor, d_dst = self._create_cutlass_tensor(
-                    [nheads, 1], [1, 0], self.io_dtype, [1]
-                )
-                d_dst.copy_(D.unsqueeze(0).to(d_dst.dtype))
-        else:
-            d_tensor = None
-
-        # Output tensors
-        # y: (chunk_size, headdim, nchunks, nheads, batch)
-        y_tensor, y_cutlass = self._create_cutlass_tensor(
-            [batch, nheads, headdim, nchunks, chunk_size],
-            [4, 2, 3, 1, 0],
-            self.io_dtype,
-            [2, 3, 4],
-        )
-
-        # fstate: (headdim, dstate, nheads, batch)
-        fstate_tensor, fstate_cutlass = self._create_cutlass_tensor(
-            [batch, nheads, headdim, dstate], [2, 3, 1, 0], self.io_dtype, [2, 3]
-        )
-
-        # Get max active clusters
-        hardware_info = cutlass.utils.HardwareInfo()
-        max_active_clusters = hardware_info.get_max_active_clusters(1)
-
-        stream = cutlass.cuda.default_stream()
-
-        # Compile kernel if not already done
-        if self._compiled_kernel is None:
-            self._compiled_kernel = cute.compile(
-                self.kernel,
-                x_tensor,
-                cumsum_delta_tensor,
-                delta_tensor,
-                b_tensor,
-                c_tensor,
-                y_tensor,
-                fstate_tensor,
-                d_tensor,
-                max_active_clusters,
-                stream,
-            )
-
-        # Run kernel
-        self._compiled_kernel(
-            x_tensor,
-            cumsum_delta_tensor,
-            delta_tensor,
-            b_tensor,
-            c_tensor,
-            y_tensor,
-            fstate_tensor,
-            d_tensor,
-            stream,
-        )
-
-        # Convert outputs back to Triton layout
-        # y_cutlass is (L, D, C, EH, B)
-        # We need to map it back to (batch, seqlen, nheads, headdim)
-        # Permute (L, D, C, EH, B) -> (B, C, L, EH, D)
-        y_permuted = y_cutlass.permute(4, 2, 0, 3, 1)
-        y_out = y_permuted.reshape(batch, seqlen, nheads, headdim)
-
-        # fstate_cutlass is (D, N, EH, B)
-        # We need (batch, nheads, headdim, dstate)
-        # Permute (D, N, EH, B) -> (B, EH, D, N)
-        fstate_out = fstate_cutlass.permute(3, 2, 0, 1).contiguous()
-
-        return y_out, fstate_out
 
 
 class TestChunkScanCombined:
@@ -513,20 +168,11 @@ class TestChunkScanCombined:
                 )
 
     def test_output_correctness(self, inputs, reference_output):
-        """Test that CUTLASS kernel output matches Triton reference."""
+        """Test that FlashInfer SSD combined kernel output matches Triton reference."""
         out_ref, final_states_ref = reference_output
 
-        # Create CUTLASS wrapper
-        wrapper = CutlassSSDWrapper(
-            chunk_size=inputs["chunk_size"],
-            headdim=inputs["headdim"],
-            dstate=inputs["dstate"],
-            has_d=True,
-            d_has_hdim=False,  # D is (nheads,) not (nheads, headdim)
-        )
-
-        # Run CUTLASS kernel
-        out_test, final_states_test = wrapper(
+        # Run FlashInfer SSD combined kernel
+        out_test, final_states_test = ssd_combined_fwd(
             inputs["x"],
             inputs["dt"],
             inputs["A"],
@@ -648,15 +294,8 @@ class TestChunkScanCombinedNoD(TestChunkScanCombined):
         """Test without D scaling."""
         out_ref, final_states_ref = reference_output
 
-        wrapper = CutlassSSDWrapper(
-            chunk_size=inputs["chunk_size"],
-            headdim=inputs["headdim"],
-            dstate=inputs["dstate"],
-            has_d=False,
-            d_has_hdim=False,
-        )
-
-        out_test, final_states_test = wrapper(
+        # Run FlashInfer SSD combined kernel without D
+        out_test, final_states_test = ssd_combined_fwd(
             inputs["x"],
             inputs["dt"],
             inputs["A"],
