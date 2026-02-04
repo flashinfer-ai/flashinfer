@@ -55,6 +55,7 @@ from flashinfer.utils import get_compute_capability
     ],
 )
 @pytest.mark.parametrize("quant_mode", ["NvFP4xNvFP4", "MxFP4xMxFP8", "MxFP4xBf16"])
+@pytest.mark.parametrize("routing_format", ["packed", "unpacked"])
 def test_trtllm_gen_routed_fused_moe(
     num_tokens: int,
     hidden_size: int,
@@ -63,6 +64,7 @@ def test_trtllm_gen_routed_fused_moe(
     num_experts: int,
     routing_method_type: RoutingMethodType,
     quant_mode: Literal["NvFP4xNvFP4", "MxFP4xMxFP8", "MxFP4xBf16"],
+    routing_format: Literal["packed", "unpacked"],
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] not in [10]:
@@ -202,16 +204,22 @@ def test_trtllm_gen_routed_fused_moe(
             routing_logits, top_k, num_experts, 8
         )
     topk_ids = permute_info["topKIndices"].to(torch.int32)
-    expert_weights = expert_weights.view(num_tokens, num_experts)[
+    topk_weights = expert_weights.view(num_tokens, num_experts)[
         torch.arange(num_tokens).unsqueeze(1), topk_ids
     ].to(torch.bfloat16)
 
-    packed_tensor = (topk_ids.to(torch.int32) << 16) | expert_weights.to(
-        torch.bfloat16
-    ).view(torch.int16)
+    # Prepare routing input based on format
+    if routing_format == "packed":
+        # Packed format: (score << 16 | expert_id)
+        routing_input = (topk_ids.to(torch.int32) << 16) | topk_weights.view(
+            torch.int16
+        )
+    else:
+        # Unpacked format: (topk_ids, topk_weights) tuple
+        routing_input = (topk_ids, topk_weights)
 
     output = trtllm_fp4_block_scale_routed_moe(
-        packed_tensor,
+        routing_input,
         None,  # routing_bias
         hidden_states,
         hidden_states_scale,
@@ -341,19 +349,17 @@ def test_trtllm_gen_fp8_routed_fused_moe(
     ).to(torch.float)
 
     # Compute routing using reference implementation
-    permute_info, expert_weights_ref = routing_reference_renormalize(
+    permute_info, topk_weights_ref = routing_reference_renormalize(
         routing_logits, top_k, num_experts, 8
     )
     topk_ids = permute_info["topKIndices"].to(torch.int32)
-    expert_weights = expert_weights_ref.view(num_tokens, num_experts)[
+    topk_weights = topk_weights_ref.view(num_tokens, num_experts)[
         torch.arange(num_tokens, device=device).unsqueeze(1), topk_ids
     ].to(torch.bfloat16)
 
-    # Pack topk_ids and expert_weights into single tensor
+    # Pack topk_ids and topk_weights into single tensor
     # Format: (expert_id << 16) | (weight_bf16.view(int16))
-    packed_topk_ids = (topk_ids << 16) | expert_weights.view(torch.int16).to(
-        torch.int32
-    )
+    packed_topk_ids = (topk_ids << 16) | topk_weights.view(torch.int16).to(torch.int32)
 
     # Run with pre-computed routing (packed format)
     output = trtllm_fp8_block_scale_routed_moe(
