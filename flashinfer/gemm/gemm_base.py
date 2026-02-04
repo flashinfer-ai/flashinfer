@@ -2499,6 +2499,16 @@ def _check_mm_mxfp8_problem_size(
             f"K dimension mismatch in mm_mxfp8. got {a.shape[1]=}, {b.shape[0]=}"
         )
 
+    # The output may contain NaN/Inf if the dimensions are too small
+    min_m = 32
+    min_n = 128
+    min_k = 128
+    if a.shape[0] < min_m or b.shape[1] < min_n or a.shape[1] < min_k:
+        raise ValueError(
+            f"MXFP8 requires m >= {min_m}, n >= {min_n}, k >= {min_k} for CUTLASS MXFP8. "
+            f"got m={a.shape[0]}, n={b.shape[1]}, k={a.shape[1]}."
+        )
+
     # Input dtype as returned by mxfp8_quantize_sm100
     if a.dtype != torch.float8_e4m3fn:
         raise ValueError(f"a must be a float8_e4m3fn tensor, got {a.dtype=}")
