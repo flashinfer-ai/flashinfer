@@ -46,6 +46,18 @@ def _assert_cosine_similarity(
     return cos_sim
 
 
+def _skip_if_unsupported(backend: str = "cutlass"):
+    if backend == "auto":
+        backend = "cutlass"
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    compute_capability_number = compute_capability[0] * 10 + compute_capability[1]
+    if not mm_mxfp8.is_backend_supported(backend, compute_capability_number):
+        pytest.skip(
+            "Skipping test because mm_mxfp8 cutlass is not supported on compute "
+            f"capability {compute_capability_number}."
+        )
+
+
 def _run_mm_mxfp8(
     m,
     n,
@@ -57,11 +69,7 @@ def _run_mm_mxfp8(
     auto_tuning,
     provide_out,
 ):
-    compute_capability = get_compute_capability(torch.device("cuda"))
-    if compute_capability[0] in [11, 12]:
-        pytest.skip("Not tested on SM110/SM120/SM121")
-    if compute_capability[0] < 10:
-        pytest.skip("mm_mxfp8 is only supported on SM100 and above GPUs.")
+    _skip_if_unsupported(backend)
 
     input = torch.randn([m, k], device="cuda", dtype=input_dtype)
     mat2 = torch.randn([n, k], device="cuda", dtype=input_dtype)
@@ -183,14 +191,6 @@ def test_mm_mxfp8_small_m(m, n, k):
         auto_tuning=False,
         provide_out=True,
     )
-
-
-def _skip_if_unsupported():
-    compute_capability = get_compute_capability(torch.device("cuda"))
-    if compute_capability[0] in [11, 12]:
-        pytest.skip("Not tested on SM110/SM120/SM121")
-    if compute_capability[0] < 10:
-        pytest.skip("mm_mxfp8 is only supported on SM100 and above GPUs.")
 
 
 def test_mm_mxfp8_invalid_input_dtype():
