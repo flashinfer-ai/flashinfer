@@ -340,3 +340,130 @@ class TestChunkScanCombinedNoD(TestChunkScanCombined):
 
         assert out_match
         assert states_match
+
+
+class TestChunkScanCombinedWithInitialStates(TestChunkScanCombined):
+    """Test chunk scan with initial states passed in."""
+
+    @pytest.fixture(params=[1, 2])
+    def batch(self, request):
+        return request.param
+
+    @pytest.fixture(params=[1, 4])
+    def nchunks(self, request):
+        return request.param
+
+    @pytest.fixture
+    def inputs(self, batch, nheads, headdim, dstate, chunk_size, nchunks, ngroups):
+        """Create test inputs with initial states."""
+        torch.manual_seed(42)
+
+        seqlen = chunk_size * nchunks
+
+        x = torch.randn(
+            batch, seqlen, nheads, headdim, dtype=self.INPUT_DTYPE, device="cuda"
+        )
+        dt = torch.randn(batch, seqlen, nheads, dtype=torch.float32, device="cuda")
+        A = -torch.rand(nheads, dtype=torch.float32, device="cuda") - 1.0
+        B = torch.randn(
+            batch, seqlen, ngroups, dstate, dtype=self.INPUT_DTYPE, device="cuda"
+        )
+        C = torch.randn(
+            batch, seqlen, ngroups, dstate, dtype=self.INPUT_DTYPE, device="cuda"
+        )
+        D = torch.randn(nheads, dtype=self.INPUT_DTYPE, device="cuda")
+        dt_bias = torch.rand(nheads, dtype=torch.float32, device="cuda") - 4.0
+
+        # Initial states: (batch, nheads, headdim, dstate)
+        initial_states = torch.randn(
+            batch, nheads, headdim, dstate, dtype=self.INPUT_DTYPE, device="cuda"
+        )
+
+        return {
+            "x": x,
+            "dt": dt,
+            "A": A,
+            "B": B,
+            "C": C,
+            "D": D,
+            "dt_bias": dt_bias,
+            "chunk_size": chunk_size,
+            "seqlen": seqlen,
+            "nheads": nheads,
+            "headdim": headdim,
+            "dstate": dstate,
+            "ngroups": ngroups,
+            "initial_states": initial_states,
+        }
+
+    @pytest.fixture
+    def reference_output(self, inputs):
+        """Compute reference output using Triton implementation with initial states."""
+        out, dt_out, dA_cumsum, states, final_states = _mamba_chunk_scan_combined_fwd(
+            inputs["x"],
+            inputs["dt"],
+            inputs["A"],
+            inputs["B"],
+            inputs["C"],
+            inputs["chunk_size"],
+            D=inputs["D"],
+            z=None,
+            dt_bias=inputs["dt_bias"],
+            initial_states=inputs["initial_states"],
+            seq_idx=None,
+            dt_softplus=True,
+        )
+        return out, final_states
+
+    @pytest.mark.xfail(reason="initial_states not yet implemented in ssd_combined_fwd")
+    def test_output_correctness(self, inputs, reference_output):
+        """Test with initial states."""
+        out_ref, final_states_ref = reference_output
+
+        # Run FlashInfer SSD combined kernel with initial states
+        out_test, final_states_test = ssd_combined_fwd(
+            inputs["x"],
+            inputs["dt"],
+            inputs["A"],
+            inputs["B"],
+            inputs["C"],
+            inputs["chunk_size"],
+            D=inputs["D"],
+            dt_bias=inputs["dt_bias"],
+            dt_softplus=True,
+            initial_states=inputs["initial_states"],  # This param doesn't exist yet
+        )
+
+        # Cast to same dtype for comparison
+        out_ref_cmp = out_ref.to(out_test.dtype)
+        final_states_ref_cmp = final_states_ref.to(final_states_test.dtype)
+
+        out_match = torch.allclose(
+            out_ref_cmp, out_test, atol=self.ATOL, rtol=self.RTOL
+        )
+        states_match = torch.allclose(
+            final_states_ref_cmp, final_states_test, atol=self.ATOL, rtol=self.RTOL
+        )
+
+        if out_match:
+            print("✓ [InitialStates] Outputs match within tolerance")
+        else:
+            print("✗ [InitialStates] Outputs do NOT match")
+            self._print_mismatch_details(
+                out_ref_cmp, out_test, "output", self.ATOL, self.RTOL
+            )
+
+        if states_match:
+            print("✓ [InitialStates] Final states match within tolerance")
+        else:
+            print("✗ [InitialStates] Final states do NOT match")
+            self._print_mismatch_details(
+                final_states_ref_cmp,
+                final_states_test,
+                "final_states",
+                self.ATOL,
+                self.RTOL,
+            )
+
+        assert out_match, "Output mismatch with initial states"
+        assert states_match, "Final states mismatch with initial states"
