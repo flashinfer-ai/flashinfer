@@ -15,11 +15,11 @@
  */
 #pragma once
 
-#include "../collective/flat_collective_tma_warpspecialized_delta_rule.hpp"
-#include "../kernel/flat_kernel_tma_warpspecialized_delta_rule.hpp"
-#include "../kernel/flat_options.hpp"
-#include "../kernel/flat_tile_scheduler.hpp"
-#include "flat/type_traits.hpp"
+#include "flashinfer/flat/hopper/collective/flat_collective_tma_warpspecialized_delta_rule.hpp"
+#include "flashinfer/flat/hopper/kernel/flat_kernel_tma_warpspecialized_delta_rule.hpp"
+#include "flashinfer/flat/hopper/kernel/flat_options.hpp"
+#include "flashinfer/flat/hopper/kernel/flat_tile_scheduler.hpp"
+#include "flashinfer/flat/type_traits.hpp"
 
 namespace flat::kernel {
 

@@ -15,18 +15,18 @@
  */
 #pragma once
 
-#include "../../cute_ext.hpp"
-#include "../../math_order_barrier.hpp"
-#include "../../unused.hpp"
-#include "../collective/flat_collective_load.hpp"
-#include "../collective/flat_collective_store.hpp"
-#include "../collective/flat_common.hpp"
-#include "../collective/flat_named_barriers.hpp"
-#include "../kernel/flat_options.hpp"
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/collective/collective_builder.hpp"
-#include "flat/ampere/collective/flat_collective_inverse.hpp"
-#include "flat/ampere/collective/flat_collective_load.hpp"
+#include "flashinfer/flat/ampere/collective/flat_collective_inverse.hpp"
+#include "flashinfer/flat/ampere/collective/flat_collective_load.hpp"
+#include "flashinfer/flat/cute_ext.hpp"
+#include "flashinfer/flat/hopper/collective/flat_collective_load.hpp"
+#include "flashinfer/flat/hopper/collective/flat_collective_store.hpp"
+#include "flashinfer/flat/hopper/collective/flat_common.hpp"
+#include "flashinfer/flat/hopper/collective/flat_named_barriers.hpp"
+#include "flashinfer/flat/hopper/kernel/flat_options.hpp"
+#include "flashinfer/flat/math_order_barrier.hpp"
+#include "flashinfer/flat/unused.hpp"
 
 // #define INLINE_LAMBDA [[gnu::always_inline]]
 #define INLINE_LAMBDA __attribute__((always_inline))
