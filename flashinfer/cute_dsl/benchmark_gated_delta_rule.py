@@ -14,10 +14,12 @@ def get_l2_cache_size():
     return torch.cuda.get_device_properties(0).L2_cache_size
 
 
-def benchmark(func, num_iterations=100, n_warmup=10, flush_l2=True, use_dummy_matmul=True):
+def benchmark(
+    func, num_iterations=100, n_warmup=10, flush_l2=True, use_dummy_matmul=True
+):
     """
     Benchmark a kernel with L2 flushing and return median time in microseconds.
-    
+
     Args:
         func: Function to benchmark
         num_iterations: Number of timed iterations
@@ -55,7 +57,9 @@ def benchmark(func, num_iterations=100, n_warmup=10, flush_l2=True, use_dummy_ma
         end_events[i].record()
 
     torch.cuda.synchronize()
-    times_us = [s.elapsed_time(e) * 1000 for s, e in zip(start_events, end_events)]
+    times_us = [
+        s.elapsed_time(e) * 1000 for s, e in zip(start_events, end_events, strict=True)
+    ]
     return statistics.median(times_us)
 
 
@@ -122,7 +126,12 @@ def main():
                     scale=inputs["scale"],
                 )
 
-            time_us = benchmark(run_kernel, num_iterations=num_iterations, flush_l2=True, use_dummy_matmul=True)
+            time_us = benchmark(
+                run_kernel,
+                num_iterations=num_iterations,
+                flush_l2=True,
+                use_dummy_matmul=True,
+            )
             results[T][B] = time_us
             print(f"  B={B:>3}: {time_us:>7.1f} us")
 

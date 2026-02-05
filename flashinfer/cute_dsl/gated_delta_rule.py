@@ -131,9 +131,7 @@ def compute_single_gate(
         softplus_x = x
     g = -cute.math.exp(A_log_val) * softplus_x
     g_exp = cute.math.exp(g)
-    beta = cutlass.Float32(1.0) / (
-        cutlass.Float32(1.0) + cute.math.exp(-beta_raw)
-    )
+    beta = cutlass.Float32(1.0) / (cutlass.Float32(1.0) + cute.math.exp(-beta_raw))
     return g_exp, beta
 
 
