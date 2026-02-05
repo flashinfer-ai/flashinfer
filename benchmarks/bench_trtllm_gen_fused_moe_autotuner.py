@@ -120,7 +120,9 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
     )
 
     if is_block_scale:
-        assert activation_type == ActivationType.Swiglu, "Only Swiglu activation is supported for FP8 block scale MoE."
+        assert activation_type == ActivationType.Swiglu, (
+            "Only Swiglu activation is supported for FP8 block scale MoE."
+        )
         fn = partial(
             trtllm_fp8_block_scale_moe,
             routing_logits=routing_logits,
@@ -268,7 +270,9 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
         w13_global_scale = 1.0 / 448.0 / 6.0
         w2_global_scale = 1.0 / 448.0 / 6.0
     else:
-        assert activation_type != ActivationType.Relu2, "Relu2 activation is supported for FP4 only with 'NvFP4xNvFP4' quant mode"
+        assert activation_type != ActivationType.Relu2, (
+            "Relu2 activation is supported for FP4 only with 'NvFP4xNvFP4' quant mode"
+        )
         w13, w13_scale = fp4_quantize(
             w13, torch.tensor([1.0], device=device), sf_vec_size=32, sf_use_ue8m0=True
         )
@@ -316,7 +320,7 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
         routing_method_type=RoutingMethodType.Renormalize.value,
         do_finalize=True,
         enable_pdl=enable_pdl,
-        gated_act_type=activation_type.value,
+        activation_type=activation_type.value,
         output=None,
         tune_max_num_tokens=num_tokens
         if tune_max_num_tokens is None
@@ -396,7 +400,9 @@ def bench_trtllm_gen_fused_moe_autotuner_mxint4(
         intermediate_size // 32,
     )
 
-    assert activation_type == ActivationType.SwiGlu, "only SwiGlu activation is supported for MxInt4 MoE currently"
+    assert activation_type == ActivationType.Swiglu, (
+        "only SwiGlu activation is supported for MxInt4 MoE currently"
+    )
     fn = partial(
         trtllm_mxint4_block_scale_moe,
         routing_logits=routing_logits,
