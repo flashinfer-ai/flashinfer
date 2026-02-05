@@ -110,7 +110,7 @@ class CheckSumHash:
         "e014d7a54c396733ef012b223603c1be2861019f88faa5dcc882ed1ecfe5c2d9"
     )
     TRTLLM_GEN_BMM: str = (
-        "89f44c5c3fb1f2132f8682c11652db627b103f86712aa309459004dd950e35be"
+        "b9121fed5dd7700b7c2a0dcbcf2ef022483855cf585263324275b0072cca6bb7"
     )
     DEEPGEMM: str = "1a2a166839042dbd2a57f48051c82cd1ad032815927c753db269a4ed10d0ffbf"
     TRTLLM_GEN_GEMM: str = (

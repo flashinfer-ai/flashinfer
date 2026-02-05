@@ -19,6 +19,7 @@ import torch
 from enum import IntEnum
 from flashinfer import GatedActType, RoutingMethodType
 from flashinfer.utils import get_compute_capability
+from flashinfer.fused_moe import WeightLayout
 
 
 class QuantMode(IntEnum):
@@ -88,6 +89,19 @@ def skip_checks(
         pytest.skip(
             f"Incompatible: {moe_impl.name} + {weight_processing['use_shuffled_weight']} + {weight_processing['layout']}"
         )
+    if (
+        is_fp8_block_scale_moe
+        and moe_impl.fp8_quantization_type == QuantMode.FP8_BLOCK_SCALE_MXFP8
+        and not weight_processing["use_shuffled_weight"]
+    ):
+        pytest.skip("use_shuffled_weight must be true for MxFp8.")
+    if (
+        is_fp8_block_scale_moe
+        and moe_impl.fp8_quantization_type == QuantMode.FP8_BLOCK_SCALE_MXFP8
+        and weight_processing["layout"] != WeightLayout.MajorK
+    ):
+        pytest.skip("weight_layout must be MajorK for MxFp8.")
+
     if intermediate_size not in routing_config["compatible_intermediate_size"]:
         pytest.skip(
             f"Incompatible: intermediate_size={intermediate_size} with {routing_config['routing_method_type'].name} routing ({routing_config['num_experts']} experts)"

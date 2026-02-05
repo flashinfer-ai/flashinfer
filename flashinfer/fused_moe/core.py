@@ -1130,17 +1130,28 @@ def get_trtllm_moe_sm100_module():
                 and self.dtype_weights == DtypeTrtllmGen.E4m3
             ):
                 # FP8 operations
-                if self.fp8_quantization_type == QuantizationType.DeepSeekFp8 or self.fp8_quantization_type == QuantizationType.MxFp8:
+                if (
+                    self.fp8_quantization_type == Fp8QuantizationType.DeepSeekFp8
+                    or self.fp8_quantization_type == Fp8QuantizationType.MxFp8
+                ):
                     # FP8 block scale
                     current_num_tokens = hidden_states.shape[0]
                     current_hidden_size = hidden_states.shape[1]
-                    if self.fp8_quantization_type == QuantizationType.DeepSeekFp8:
+                    if self.fp8_quantization_type == Fp8QuantizationType.DeepSeekFp8:
                         current_hidden_states_scale = torch.full(
                             (current_hidden_size // 128, current_num_tokens),
                             2.0,
                             dtype=torch.float,
                             device=hidden_states.device,
                         )
+                    elif self.fp8_quantization_type == Fp8QuantizationType.MxFp8:
+                        current_hidden_states_scale = extra_inputs[0]
+
+                    else:
+                        raise ValueError(
+                            f"Unsupported FP8 quantization type: {self.fp8_quantization_type}"
+                        )
+
                     moe_op.trtllm_fp8_block_scale_moe(
                         routing_logits,
                         topk_ids,
@@ -2307,6 +2318,7 @@ def trtllm_fp8_block_scale_moe(
     weight_layout: int = 0,
     enable_pdl: Optional[bool] = None,
     tune_max_num_tokens: int = 8192,
+    fp8_quantization_type: Fp8QuantizationType = Fp8QuantizationType.DeepSeekFp8,
 ) -> torch.Tensor:
     """FP8 block scale MoE operation.
 
@@ -2330,6 +2342,7 @@ def trtllm_fp8_block_scale_moe(
         routing_method_type: Type of routing method to use (default: 0)
         enable_pdl: Whether to enable Programmatic Dependent Launch (PDL). Auto-enabled for >= sm90.
         tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 8192)
+        fp8_quantization_type: Type of FP8 quantization to use (default: DeepSeekFp8)
     Returns:
         torch.Tensor: Output tensor of shape [seq_len, hidden_size]
     """
@@ -2361,6 +2374,7 @@ def trtllm_fp8_block_scale_moe(
         weight_layout,
         enable_pdl,
         tune_max_num_tokens,
+        fp8_quantization_type,
     )
 
 
@@ -2388,6 +2402,7 @@ def trtllm_fp8_block_scale_routed_moe(
     enable_pdl: Optional[bool] = None,
     output: Optional[torch.Tensor] = None,
     tune_max_num_tokens: int = 8192,
+    fp8_quantization_type: Fp8QuantizationType = Fp8QuantizationType.DeepSeekFp8,
 ) -> torch.Tensor:
     """FP8 block scale MoE operation with pre-computed routing (packed format).
 
@@ -2422,6 +2437,7 @@ def trtllm_fp8_block_scale_routed_moe(
         output (Optional[torch.Tensor]): shape [seq_len, hidden_size]
             Optional inplace output tensor.
         tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 8192)
+        fp8_quantization_type: Type of FP8 quantization to use (default: DeepSeekFp8)
     Returns:
         torch.Tensor: Output tensor of shape [seq_len, hidden_size]
     """
@@ -2450,6 +2466,7 @@ def trtllm_fp8_block_scale_routed_moe(
         weight_layout,
         enable_pdl,
         tune_max_num_tokens,
+        fp8_quantization_type,
     )
 
 

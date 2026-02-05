@@ -45,6 +45,7 @@ enum class Fp8QuantizationType {
   NoneFp8,
   DeepSeekFp8,
   MxFp8,
+  PerTensorFp8,
 };
 
 // Utility function to compute the next power of two
@@ -866,9 +867,9 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
       TVM_FFI_ICHECK_EQ(hidden_states_scale.size(0), hidden_states.size(1) / 128)
           << "hidden_states_scale dim0 must match hidden_states dim1 / 128.";
       TVM_FFI_ICHECK_EQ(hidden_states_scale.size(1), args->num_tokens)
-        << "hidden_states_scale dim1 must match num_tokens.";
+          << "hidden_states_scale dim1 must match num_tokens.";
     } else if (quantization_type == Fp8QuantizationType::MxFp8) {
-      TVM_FFI_ICHECK_EQ(hidden_states_scale.dtype(), dl_uint8)
+      TVM_FFI_ICHECK_EQ(hidden_states_scale.dtype(), dl_uint8);
     }
 
     TVM_FFI_ICHECK_EQ(gemm1_weights.dtype(), dl_float8_e4m3fn) << "gemm1_weights must be fp8.";
@@ -934,19 +935,19 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
     if (quantization_type == Fp8QuantizationType::DeepSeekFp8) {
       gemm1_output_scale =
           alloc_tensor({2 * args->intermediate_size / 128, workspace.total_max_padded_tokens},
-                      dl_float32, hidden_states.device());
+                       dl_float32, hidden_states.device());
     } else if (quantization_type == Fp8QuantizationType::MxFp8) {
-      int64_t sf_size = tensorrt_llm::computeSwizzledLayoutSFSize(
-        max_num_padded_tokens_gemm1, args->intermediate_size / sf_vec_size);
+      int64_t sf_size = tensorrt_llm::computeSwizzledLayoutSFSize(max_num_padded_tokens_gemm1,
+                                                                  args->intermediate_size / 32);
       gemm1_output_scale = alloc_tensor({sf_size}, dl_uint8, hidden_states.device());
     }
 
     if (quantization_type == Fp8QuantizationType::DeepSeekFp8) {
       activation_output = alloc_tensor({max_num_padded_tokens_gemm1, args->intermediate_size},
-                                      dl_uint8, hidden_states.device());
+                                       dl_uint8, hidden_states.device());
       activation_output_scale =
           alloc_tensor({args->intermediate_size / 128, max_num_padded_tokens_gemm1}, dl_float32,
-                      hidden_states.device());
+                       hidden_states.device());
     }
 
     gemm2_output = alloc_tensor({max_num_padded_tokens_gemm2, args->hidden_size}, dl_bfloat16,
@@ -1030,7 +1031,8 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
   static Array<Array<int64_t>> getValidConfigs(int64_t top_k, int64_t hidden_size,
                                                int64_t intermediate_size, int64_t num_local_experts,
                                                int64_t num_tokens, bool use_shuffled_weight,
-                                               int64_t weight_layout, btg::Dtype dtype_weights, Fp8QuantizationType quantization_type) {
+                                               int64_t weight_layout, btg::Dtype dtype_weights,
+                                               Fp8QuantizationType quantization_type) {
     Array<Array<int64_t>> valid_configs;
 
     std::vector<int32_t> supported_tile_nums(mSupportedTileNums.begin(), mSupportedTileNums.end());
@@ -1042,8 +1044,8 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
 
     for (int32_t tile_N : selected_tile_nums) {
       auto moe_runner = std::make_unique<tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner>(
-          dtype_weights,  // dtype_weights for DeepSeek FP8
-          quantization_type == Fp8QuantizationType::DeepSeekFp8,           // useDeepSeekFp8
+          dtype_weights,                                          // dtype_weights for DeepSeek FP8
+          quantization_type == Fp8QuantizationType::DeepSeekFp8,  // useDeepSeekFp8
           tile_N, use_shuffled_weight, static_cast<batchedGemm::gemm::MatrixLayout>(weight_layout));
 
       auto cfgs = moe_runner->getValidConfigIndices(top_k, hidden_size, intermediate_size,
@@ -1716,8 +1718,13 @@ Tensor trtllm_fp8_block_scale_moe(
   }
   TVM_FFI_ICHECK(dtype == dl_float16 || dtype == dl_bfloat16 || dtype == dl_float8_e4m3fn)
       << "FP8 block scale MoE: hidden_states must be fp16, bf16, or fp8.";
-  TVM_FFI_ICHECK_EQ(hidden_states_scale.dtype(), dl_float32)
-      << "FP8 block scale MoE: hidden_states_scale must be float32.";
+  if (quantization_type == Fp8QuantizationType::DeepSeekFp8) {
+    TVM_FFI_ICHECK_EQ(hidden_states_scale.dtype(), dl_float32)
+        << "FP8 block scale MoE: hidden_states_scale must be float32.";
+  } else if (quantization_type == Fp8QuantizationType::MxFp8) {
+    TVM_FFI_ICHECK_EQ(hidden_states_scale.dtype(), dl_uint8)
+        << "FP8 block scale MoE: hidden_states_scale must be uint8.";
+  }
   TVM_FFI_ICHECK_EQ(gemm1_weights.dtype(), dl_float8_e4m3fn)
       << "FP8 block scale MoE: gemm1_weights must be fp8.";
   TVM_FFI_ICHECK_EQ(gemm2_weights.dtype(), dl_float8_e4m3fn)
@@ -1732,6 +1739,11 @@ Tensor trtllm_fp8_block_scale_moe(
         << "FP8 block scale MoE: gemm1_weights_scale must be uint8.";
     TVM_FFI_ICHECK_EQ(gemm2_weights_scale.dtype(), dl_uint8)
         << "FP8 block scale MoE: gemm2_weights_scale must be uint8.";
+  }
+
+  if (quantization_type == Fp8QuantizationType::MxFp8) {
+    TVM_FFI_ICHECK(use_shuffled_weight) << "use_shuffled_weight must be true for MxFp8.";
+    TVM_FFI_ICHECK(weight_layout == 0) << "weight_layout must be 0 for MxFp8.";
   }
 
   auto const num_tokens = hidden_states.size(0);
@@ -1766,7 +1778,8 @@ Tensor trtllm_fp8_block_scale_moe(
     // Create and initialize launcher for this tile size
     auto launcher = std::make_unique<Fp8BlockScaleLauncher>(
         routing_logits, routing_bias, hidden_states, hidden_states_scale, gemm1_weights,
-        gemm1_weights_scale, gemm2_weights, gemm2_weights_scale, expert_indices, expert_weights, quantization_type);
+        gemm1_weights_scale, gemm2_weights, gemm2_weights_scale, expert_indices, expert_weights,
+        quantization_type);
     launcher->init(std::move(args), curr_tile_N, routing_method_type, use_shuffled_weight,
                    weight_layout);
 
@@ -1786,8 +1799,9 @@ Tensor trtllm_fp8_block_scale_moe(
   auto& selected_launcher = launchers_map.at(tile_N);
 
   // Run the launcher with DeepSeek FP8 enabled - it will create its own runner internally
-  auto result = selected_launcher->run(config, enable_pdl, false /* use_routing_scales_on_input */,
-                                       quantization_type == Fp8QuantizationType::DeepSeekFp8 /* use_deep_seek_fp8 */)[0];
+  auto result = selected_launcher->run(
+      config, enable_pdl, false /* use_routing_scales_on_input */,
+      quantization_type == Fp8QuantizationType::DeepSeekFp8 /* use_deep_seek_fp8 */)[0];
   // Return the result tensor
   return result;
 }
@@ -2040,16 +2054,17 @@ Array<Array<int64_t>> trtllm_get_valid_moe_configs(
 
   } else if (dtype_act == btg::Dtype::E4m3 && dtype_weights == btg::Dtype::E4m3) {
     // FP8
-    if (quantization_type == Fp8QuantizationType::PerTensorFp8) {
-      // FP8 per-tensor scale
-      return Fp8PerTensorLauncher::getValidConfigs(
-          top_k, hidden_size, intermediate_size, num_local_experts, num_tokens, gated_act_type,
-          use_shuffled_weight, weight_layout, dtype_act, dtype_weights);
-    } else {
+    if (quantization_type == Fp8QuantizationType::DeepSeekFp8 ||
+        quantization_type == Fp8QuantizationType::MxFp8) {
       // FP8 block scale
       return Fp8BlockScaleLauncher::getValidConfigs(
           top_k, hidden_size, intermediate_size, num_local_experts, num_tokens, use_shuffled_weight,
           weight_layout, dtype_weights, quantization_type);
+    } else {
+      // FP8 per-tensor scale
+      return Fp8PerTensorLauncher::getValidConfigs(
+          top_k, hidden_size, intermediate_size, num_local_experts, num_tokens, gated_act_type,
+          use_shuffled_weight, weight_layout, dtype_act, dtype_weights);
     }
   } else if (dtype_weights == btg::Dtype::E2m1 || dtype_weights == btg::Dtype::MxE2m1) {
     // FP4 block scale

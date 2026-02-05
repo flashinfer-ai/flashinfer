@@ -45,6 +45,7 @@ from flashinfer.fused_moe import (
 from flashinfer.fused_moe.core import (
     get_w2_permute_indices_with_cache,
     _maybe_get_cached_w3_w1_permute_indices,
+    Fp8QuantizationType,
 )
 from .utils import skip_checks, QuantMode
 
@@ -804,7 +805,9 @@ class MxInt4BlockScaleMoe(Moe):
 class FP8BlockScaleMoe(Moe):
     """FP8 MoE implementation with block scaling (DeepSeek style or MxFp8 x MxFp8)."""
 
-    def __init__(self, fp8_quantization_type: Fp8QuantizationType = Fp8QuantizationType.DeepSeekFp8):
+    def __init__(
+        self, fp8_quantization_type: QuantMode = QuantMode.FP8_BLOCK_SCALE_DEEPSEEK
+    ):
         super().__init__()
         self.fp8_quantization_type = fp8_quantization_type
 
@@ -816,7 +819,7 @@ class FP8BlockScaleMoe(Moe):
             2
         ]  # [num_experts, 2*intermediate_size, hidden_size]
 
-        if self.fp8_quantization_type == Fp8QuantizationType.DeepSeekFp8:
+        if self.fp8_quantization_type == QuantMode.FP8_BLOCK_SCALE_DEEPSEEK:
             # Quantize weights to FP8
             gemm1_weights_fp8 = gemm1_weights.to(torch.float8_e4m3fn)
             gemm1_scales = 2 * torch.rand(
@@ -826,11 +829,20 @@ class FP8BlockScaleMoe(Moe):
 
             gemm2_weights_fp8 = gemm2_weights.to(torch.float8_e4m3fn)
             gemm2_scales = 2 * torch.rand(
-                (num_experts, hidden_size // 128, intermediate_size // 128), device="cuda"
+                (num_experts, hidden_size // 128, intermediate_size // 128),
+                device="cuda",
             ).to(torch.float)
-        elif self.fp8_quantization_type == Fp8QuantizationType.MxFp8:
-            gemm1_weights_fp8, gemm1_scales = mxfp8_quantize_batches(gemm1_weights, True)
-            gemm2_weights_fp8, gemm2_scales = mxfp8_quantize_batches(gemm2_weights, True)
+        elif self.fp8_quantization_type == QuantMode.FP8_BLOCK_SCALE_MXFP8:
+            gemm1_weights_fp8, gemm1_scales = mxfp8_quantize_batches(
+                gemm1_weights, True
+            )
+            gemm2_weights_fp8, gemm2_scales = mxfp8_quantize_batches(
+                gemm2_weights, True
+            )
+        else:
+            raise ValueError(
+                f"Unsupported FP8 quantization type: {self.fp8_quantization_type}"
+            )
 
         return {
             "hidden_states_scale_global": None,  # Block scales computed at runtime
@@ -842,7 +854,12 @@ class FP8BlockScaleMoe(Moe):
             "gemm2_scales_global": None,
         }
 
-    def quantize_inputs(self, hidden_states: torch.Tensor, hidden_states_scale_global):
+    def quantize_inputs(
+        self,
+        hidden_states: torch.Tensor,
+        hidden_states_scale_global: torch.Tensor = None,
+        is_swizzling: bool = True,
+    ):
         """For FP8 block scaling, no pre-quantization - everything happens at runtime."""
 
         def to_float8_blockwise(
@@ -901,14 +918,20 @@ class FP8BlockScaleMoe(Moe):
             return quantized_x, scales
 
         # todo(Yingyi):quantize bf16 to fp8
-        if self.fp8_quantization_type == Fp8QuantizationType.DeepSeekFp8:
-            hidden_states_quant, hidden_states_scale = to_float8_blockwise(hidden_states)
-        elif self.fp8_quantization_type == Fp8QuantizationType.MxFp8:
+        if self.fp8_quantization_type == QuantMode.FP8_BLOCK_SCALE_DEEPSEEK:
+            hidden_states_quant, hidden_states_scale = to_float8_blockwise(
+                hidden_states
+            )
+        elif self.fp8_quantization_type == QuantMode.FP8_BLOCK_SCALE_MXFP8:
             hidden_states_quant, hidden_states_scale = mxfp8_quantize(
                 hidden_states, is_swizzling
             )
-            hidden_states_scale = hidden_states_scale.view(torch.float8_e4m3fn).reshape(
+            hidden_states_scale = hidden_states_scale.view(torch.uint8).reshape(
                 *hidden_states.shape[:-1], -1
+            )
+        else:
+            raise ValueError(
+                f"Unsupported FP8 quantization type: {self.fp8_quantization_type}"
             )
         return {
             "hidden_states": hidden_states_quant,
@@ -934,10 +957,14 @@ class FP8BlockScaleMoe(Moe):
 
         if use_shuffled_weight:
             # FIXME: this depends on the kernel internals
-            epilogue_tile_m = 64 if self.fp8_quantization_type == Fp8QuantizationType.DeepSeekFp8 else 128
+            epilogue_tile_m = (
+                64
+                if self.fp8_quantization_type == QuantMode.FP8_BLOCK_SCALE_DEEPSEEK
+                else 128
+            )
 
             gemm1_weights_fp8_interleaved = args.gemm1_weights.clone()
-            if self.fp8_quantization_type == Fp8QuantizationType.MxFp8:
+            if self.fp8_quantization_type == QuantMode.FP8_BLOCK_SCALE_MXFP8:
                 # Reorder rows of W1 for fused gated activation
                 gemm1_weights_fp8_interleaved = []
                 for i in range(num_experts):
@@ -1011,6 +1038,15 @@ class FP8BlockScaleMoe(Moe):
             "NaN detected in hidden_states_fp8"
         )
 
+        if self.fp8_quantization_type == QuantMode.FP8_BLOCK_SCALE_MXFP8:
+            quantization_mode = Fp8QuantizationType.MxFp8
+        elif self.fp8_quantization_type == QuantMode.FP8_BLOCK_SCALE_DEEPSEEK:
+            quantization_mode = Fp8QuantizationType.DeepSeekFp8
+        else:
+            raise ValueError(
+                f"Unsupported FP8 quantization type: {self.fp8_quantization_type}"
+            )
+
         # Use autotuner for optimal kernel selection
         with autotune(enable_autotune):
             output = trtllm_fp8_block_scale_moe(
@@ -1035,18 +1071,20 @@ class FP8BlockScaleMoe(Moe):
                 weight_layout=static_data["weight_layout"],
                 enable_pdl=enable_pdl,
                 tune_max_num_tokens=TUNE_MAX_NUM_TOKENS,
-                fp8_quantization_type=self.fp8_quantization_type,
+                fp8_quantization_type=quantization_mode,
             )
         return output.to(torch.float)
 
     def compute_reference(self, args):
         """FP8 block-scale reference implementation."""
-        if self.fp8_quantization_type == Fp8QuantizationType.DeepSeekFp8:
+        if self.fp8_quantization_type == QuantMode.FP8_BLOCK_SCALE_DEEPSEEK:
             return run_moe_reference_dsfp8(args)
-        elif self.fp8_quantization_type == Fp8QuantizationType.MxFp8:
+        elif self.fp8_quantization_type == QuantMode.FP8_BLOCK_SCALE_MXFP8:
             return run_moe_reference_mxfp8(args)
         else:
-            raise ValueError(f"Unsupported FP8 quantization type: {self.fp8_quantization_type}")
+            raise ValueError(
+                f"Unsupported FP8 quantization type: {self.fp8_quantization_type}"
+            )
 
     def get_tolerances(self):
         """Get FP8 block-scale accuracy tolerances."""
@@ -1389,9 +1427,11 @@ class BF16Moe(Moe):
 def get_moe_impl(quant_mode: QuantMode):
     """Factory function to get the appropriate MoE implementation."""
     if quant_mode == QuantMode.FP8_BLOCK_SCALE_DEEPSEEK:
-        return FP8BlockScaleMoe(fp8_quantization_type=Fp8QuantizationType.DeepSeekFp8)
+        return FP8BlockScaleMoe(
+            fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_DEEPSEEK
+        )
     elif quant_mode == QuantMode.FP8_BLOCK_SCALE_MXFP8:
-        return FP8BlockScaleMoe(fp8_quantization_type=Fp8QuantizationType.MxFp8)
+        return FP8BlockScaleMoe(fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_MXFP8)
     elif quant_mode == QuantMode.FP8_PER_TENSOR:
         return FP8PerTensorMoe()
     else:
@@ -1876,6 +1916,7 @@ def dequant_reference_dsfp8(input, scale, transpose_scale, block_m, block_n):
     output = input * scale
     return output
 
+
 def mxfp8_quantize_batches(a, is_swizzling=True):
     """MxFp8 batch quantization function with centralized global scale factor calculation."""
     num_batches = a.size(0)
@@ -1884,7 +1925,7 @@ def mxfp8_quantize_batches(a, is_swizzling=True):
     for i in range(num_batches):
         mx_fp8_quant, mx_fp8_scale = mxfp8_quantize(a[i], is_swizzling)
         a_quant.append(mx_fp8_quant)
-        a_scales.append(mx_fp8_scale)
+        a_scales.append(mx_fp8_scale.view(torch.uint8))
 
     result_a_quant = torch.stack(a_quant)
     result_a_scales = torch.stack(a_scales)
@@ -1897,7 +1938,11 @@ def mxfp8_dequantize_batches(a, a_scales, is_swizzling=True):
     num_batches = a.size(0)
     a_dequant = []
     for i in range(num_batches):
-        mx_fp8_dequant = mxfp8_dequantize_host(a[i].cpu().view(torch.uint8), a_scales[i].cpu().view(torch.uint8).reshape(-1), is_swizzling)
+        mx_fp8_dequant = mxfp8_dequantize_host(
+            a[i].cpu().view(torch.uint8),
+            a_scales[i].cpu().view(torch.uint8).reshape(-1),
+            is_swizzling,
+        )
         a_dequant.append(mx_fp8_dequant.cuda())
 
     result_a_dequant = torch.stack(a_dequant)
@@ -1995,7 +2040,10 @@ def run_moe_dequant(args, quant_mode: QuantMode):
         )
         activation_output = activation_output.to(torch.float)
         args.c_global_sf = c_global_sf
-    elif quant_mode == QuantMode.FP4_MXFP4_MXFP8 or quant_mode == QuantMode.FP8_BLOCK_SCALE_MXFP8:
+    elif (
+        quant_mode == QuantMode.FP4_MXFP4_MXFP8
+        or quant_mode == QuantMode.FP8_BLOCK_SCALE_MXFP8
+    ):
         activation_output, scale_bytes = mxfp8_quantize(
             activation_output.to(torch.bfloat16), True
         )
@@ -2209,7 +2257,9 @@ def run_moe_reference_dsfp8(args):
         GatedActType.SwiGlu.value,  # gated_act_type
     )
 
-    return run_moe_dequant(args_dequant, QuantMode.FP8_BLOCK_SCALE_DEEPSEEK), args_dequant
+    return run_moe_dequant(
+        args_dequant, QuantMode.FP8_BLOCK_SCALE_DEEPSEEK
+    ), args_dequant
 
 
 def run_moe_reference_per_tensor_scale_fp8(args):
@@ -2590,7 +2640,14 @@ def run_moe_test(
     "moe_impl",
     [
         pytest.param(BF16Moe(), id="BF16xBF16"),
-        pytest.param(FP8BlockScaleMoe(), id="FP8_Block"),
+        pytest.param(
+            FP8BlockScaleMoe(fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_DEEPSEEK),
+            id="FP8_Block_DeepSeek",
+        ),
+        pytest.param(
+            FP8BlockScaleMoe(fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_MXFP8),
+            id="FP8_Block_MxFp8",
+        ),
         pytest.param(FP8PerTensorMoe(), id="FP8_Tensor"),
         pytest.param(FP4Moe(quant_mode=QuantMode.FP4_NVFP4_NVFP4), id="NvFP4xNvFP4"),
         pytest.param(FP4Moe(quant_mode=QuantMode.FP4_MXFP4_MXFP8), id="MxFP4xMxFP8"),
@@ -2741,7 +2798,14 @@ def test_renormalize_routing(
 @pytest.mark.parametrize(
     "moe_impl",
     [
-        pytest.param(FP8BlockScaleMoe(), id="FP8_Block"),
+        pytest.param(
+            FP8BlockScaleMoe(fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_DEEPSEEK),
+            id="FP8_Block_DeepSeek",
+        ),
+        pytest.param(
+            FP8BlockScaleMoe(fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_MXFP8),
+            id="FP8_Block_MxFp8",
+        ),
         pytest.param(FP4Moe(quant_mode=QuantMode.FP4_NVFP4_NVFP4), id="NvFP4xNvFP4"),
         pytest.param(FP4Moe(quant_mode=QuantMode.FP4_MXFP4_MXFP8), id="MxFP4xMxFP8"),
         pytest.param(FP4Moe(quant_mode=QuantMode.FP4_MXFP4_Bf16), id="MxFP4xBf16"),
