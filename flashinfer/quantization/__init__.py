@@ -14,6 +14,9 @@ Licensed under the Apache License, Version 2.0.
 # Re-export packbits functions
 from .packbits import packbits, segment_packbits
 
+# Re-export JIT module generator (used by tests and AOT compilation)
+from ..jit.quantization import gen_quantization_module
+
 # Re-export FP8 quantization
 from .fp8_quantization import mxfp8_quantize, mxfp8_dequantize_host
 
@@ -37,18 +40,25 @@ from .fp4_quantization import (
 
 # CuTe-DSL kernels (conditionally exported, EXPERIMENTAL)
 # Warning: These are experimental APIs and may change without notice.
-# Note: is_cute_dsl_available is used internally but not re-exported;
-# users should import from flashinfer.cute_dsl
-from ..cute_dsl import is_cute_dsl_available
+# Import is guarded to handle environments where cutlass is not installed.
+_cute_dsl_available = False
+try:
+    from ..cute_dsl import is_cute_dsl_available
 
-if is_cute_dsl_available():
-    from .kernels.mxfp8_quantize import mxfp8_quantize_cute_dsl
-    from .kernels.mxfp4_quantize import mxfp4_quantize_cute_dsl
+    if is_cute_dsl_available():
+        from .kernels.mxfp8_quantize import mxfp8_quantize_cute_dsl
+        from .kernels.mxfp4_quantize import mxfp4_quantize_cute_dsl
+
+        _cute_dsl_available = True
+except ImportError:
+    pass
 
 __all__ = [
     # Packbits
     "packbits",
     "segment_packbits",
+    # JIT module generator
+    "gen_quantization_module",
     # FP8
     "mxfp8_quantize",
     "mxfp8_dequantize_host",
@@ -69,7 +79,7 @@ __all__ = [
     "get_fp4_quantization_module",
 ]
 
-if is_cute_dsl_available():
+if _cute_dsl_available:
     __all__ += [
         "mxfp8_quantize_cute_dsl",
         "mxfp4_quantize_cute_dsl",
