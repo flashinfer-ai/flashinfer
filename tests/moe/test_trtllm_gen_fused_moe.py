@@ -839,7 +839,7 @@ class FP8BlockScaleMoe(Moe):
 
     @property
     def quant_mode(self) -> QuantMode:
-        return QuantMode.FP8_BLOCK_SCALE
+        return self.fp8_quantization_type
 
     def quantize_weights(self, gemm1_weights, gemm2_weights, hidden_states_sample):
         """Quantize weights to FP8 with block scaling."""
@@ -2249,7 +2249,7 @@ def run_moe_reference_mxfp8(args):
         gemm2_weights_dequant,
         args.permute_info,
         args.use_routing_scales_on_input,
-        args.gated_act_type,
+        args.activation_type,
     )
 
     return run_moe_dequant(args_dequant, QuantMode.FP8_BLOCK_SCALE_MXFP8), args_dequant
