@@ -25,6 +25,7 @@ from flashinfer.testing.utils import bench_gpu_time
 from .flashinfer_benchmark_utils import (
     dtype_str_to_torch_dtype,
     get_device,
+    is_close_stats,
     print_perf_metrics,
     filter_backends_by_compute_capability,
 )
@@ -225,6 +226,7 @@ def testSoftmax(args):
     vocab_size = args.vocab_size
     temperature = args.temperature
     is_cuda_graph_compatible = not args.no_cuda_graph
+    run_refcheck = args.refcheck
     res = []
 
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
@@ -247,9 +249,12 @@ def testSoftmax(args):
         else:
             raise ValueError(f"Unsupported backend: {backend}")
 
-    # Storage for timing results
+    # Storage for timing results and outputs for refcheck
     backend_times = {backend: [] for backend in backends}
+    outputs = {}
     for cur_backend in backends:
+        if run_refcheck:
+            outputs[cur_backend] = run_backend(cur_backend, logits).detach()
         backend_times[cur_backend] = bench_gpu_time(
             fn=run_backend,
             dry_run_iters=args.dry_run_iters,
@@ -258,6 +263,23 @@ def testSoftmax(args):
             use_cuda_graph=is_cuda_graph_compatible,
             input_args=(cur_backend, logits),
         )
+
+    # Reference check: compare against PyTorch softmax
+    if run_refcheck and outputs:
+        reference_output = torch.softmax(logits.float() / temperature, dim=-1)
+        for backend, output in outputs.items():
+            num_diff, num_total, pct_diff = is_close_stats(
+                reference_output, output.float(), rtol=1e-3, atol=1e-5
+            )
+            if num_diff > 0:
+                print(
+                    f"[REFCHECK] Backend {backend}: {num_diff}/{num_total} "
+                    f"({pct_diff:.2f}%) elements differ from PyTorch reference"
+                )
+                if not args.allow_output_mismatch:
+                    raise AssertionError(
+                        f"[ERROR] Backend {backend} output mismatch with {num_diff} elements"
+                    )
 
     for backend in backends:
         if len(backend_times[backend]) > 0:
@@ -1054,6 +1076,7 @@ def testTopKRenormProbs(args):
     vocab_size = args.vocab_size
     top_k = args.top_k
     is_cuda_graph_compatible = not args.no_cuda_graph
+    run_refcheck = args.refcheck
     res = []
 
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
@@ -1078,9 +1101,12 @@ def testTopKRenormProbs(args):
         else:
             raise ValueError(f"Unsupported backend: {backend}")
 
-    # Storage for timing results
+    # Storage for timing results and outputs for refcheck
     backend_times = {backend: [] for backend in backends}
+    outputs = {}
     for cur_backend in backends:
+        if run_refcheck:
+            outputs[cur_backend] = run_backend(cur_backend, probs).detach()
         backend_times[cur_backend] = bench_gpu_time(
             fn=run_backend,
             dry_run_iters=args.dry_run_iters,
@@ -1089,6 +1115,36 @@ def testTopKRenormProbs(args):
             use_cuda_graph=is_cuda_graph_compatible,
             input_args=(cur_backend, probs),
         )
+
+    # Reference check: PyTorch implementation of top-k renormalization
+    # Keep top-k values, set rest to 0, then renormalize
+    # Note: Small mismatches can occur due to tie-breaking at the k-th boundary
+    if run_refcheck and outputs:
+        topk_vals, topk_indices = torch.topk(probs.float(), k=top_k, dim=-1)
+        reference_output = torch.zeros_like(probs, dtype=torch.float32)
+        reference_output.scatter_(-1, topk_indices, topk_vals)
+        reference_output = reference_output / reference_output.sum(dim=-1, keepdim=True)
+        reference_output = reference_output.to(input_dtype)
+
+        for backend, output in outputs.items():
+            num_diff, num_total, pct_diff = is_close_stats(
+                reference_output.float(), output.float(), rtol=1e-2, atol=1e-2
+            )
+            # Allow tiny mismatch percentage (<0.01%) due to tie-breaking at k-th boundary
+            if pct_diff > 0.01:
+                print(
+                    f"[REFCHECK] Backend {backend}: {num_diff}/{num_total} "
+                    f"({pct_diff:.2f}%) elements differ from PyTorch reference"
+                )
+                if not args.allow_output_mismatch:
+                    raise AssertionError(
+                        f"[ERROR] Backend {backend} output mismatch with {num_diff} elements"
+                    )
+            elif num_diff > 0 and args.verbose >= 1:
+                print(
+                    f"[REFCHECK] Backend {backend}: {num_diff}/{num_total} "
+                    f"({pct_diff:.4f}%) elements differ (within acceptable threshold)"
+                )
 
     for backend in backends:
         if len(backend_times[backend]) > 0:
@@ -1153,6 +1209,7 @@ def testTopPRenormProbs(args):
     vocab_size = args.vocab_size
     top_p = args.top_p
     is_cuda_graph_compatible = not args.no_cuda_graph
+    run_refcheck = args.refcheck
     res = []
 
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
@@ -1175,9 +1232,12 @@ def testTopPRenormProbs(args):
         else:
             raise ValueError(f"Unsupported backend: {backend}")
 
-    # Storage for timing results
+    # Storage for timing results and outputs for refcheck
     backend_times = {backend: [] for backend in backends}
+    outputs = {}
     for cur_backend in backends:
+        if run_refcheck:
+            outputs[cur_backend] = run_backend(cur_backend, probs).detach()
         backend_times[cur_backend] = bench_gpu_time(
             fn=run_backend,
             dry_run_iters=args.dry_run_iters,
@@ -1186,6 +1246,42 @@ def testTopPRenormProbs(args):
             use_cuda_graph=is_cuda_graph_compatible,
             input_args=(cur_backend, probs),
         )
+
+    # Reference check: PyTorch implementation of top-p renormalization
+    # Sort probs descending, compute cumsum, threshold at top_p, renormalize
+    if run_refcheck and outputs:
+        sorted_probs, sorted_indices = torch.sort(
+            probs.float(), dim=-1, descending=True
+        )
+        cumsum_probs = torch.cumsum(sorted_probs, dim=-1)
+        # Create mask: keep probs where cumsum <= top_p (shift by 1 to include the boundary element)
+        cumsum_shifted = torch.cat(
+            [torch.zeros_like(cumsum_probs[:, :1]), cumsum_probs[:, :-1]], dim=-1
+        )
+        mask = cumsum_shifted < top_p
+        # Keep at least one element per row
+        mask[:, 0] = True
+        # Zero out elements beyond top-p threshold
+        sorted_probs_masked = sorted_probs * mask.float()
+        # Scatter back to original positions
+        reference_output = torch.zeros_like(probs)
+        reference_output.scatter_(-1, sorted_indices, sorted_probs_masked)
+        # Renormalize
+        reference_output = reference_output / reference_output.sum(dim=-1, keepdim=True)
+
+        for backend, output in outputs.items():
+            num_diff, num_total, pct_diff = is_close_stats(
+                reference_output, output.float(), rtol=1e-2, atol=1e-3
+            )
+            if num_diff > 0:
+                print(
+                    f"[REFCHECK] Backend {backend}: {num_diff}/{num_total} "
+                    f"({pct_diff:.2f}%) elements differ from PyTorch reference"
+                )
+                if not args.allow_output_mismatch:
+                    raise AssertionError(
+                        f"[ERROR] Backend {backend} output mismatch with {num_diff} elements"
+                    )
 
     for backend in backends:
         if len(backend_times[backend]) > 0:
@@ -1250,6 +1346,7 @@ def testTopKMaskLogits(args):
     vocab_size = args.vocab_size
     top_k = args.top_k
     is_cuda_graph_compatible = not args.no_cuda_graph
+    run_refcheck = args.refcheck
     res = []
 
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
@@ -1273,9 +1370,12 @@ def testTopKMaskLogits(args):
         else:
             raise ValueError(f"Unsupported backend: {backend}")
 
-    # Storage for timing results
+    # Storage for timing results and outputs for refcheck
     backend_times = {backend: [] for backend in backends}
+    outputs = {}
     for cur_backend in backends:
+        if run_refcheck:
+            outputs[cur_backend] = run_backend(cur_backend, logits).detach()
         backend_times[cur_backend] = bench_gpu_time(
             fn=run_backend,
             dry_run_iters=args.dry_run_iters,
@@ -1284,6 +1384,51 @@ def testTopKMaskLogits(args):
             use_cuda_graph=is_cuda_graph_compatible,
             input_args=(cur_backend, logits),
         )
+
+    # Reference check: PyTorch implementation of top-k masking
+    # Keep top-k logits, set rest to -inf
+    if run_refcheck and outputs:
+        topk_vals, topk_indices = torch.topk(logits.float(), k=top_k, dim=-1)
+        reference_output = torch.full_like(logits, float("-inf"), dtype=torch.float32)
+        reference_output.scatter_(-1, topk_indices, topk_vals)
+        reference_output = reference_output.to(input_dtype)
+
+        for backend, output in outputs.items():
+            out = output.float()
+            ref = reference_output.float()
+
+            # Check that the same positions are masked (-inf)
+            out_masked = torch.isinf(out) & (out < 0)
+            ref_masked = torch.isinf(ref) & (ref < 0)
+            mask_match = (out_masked == ref_masked).all()
+
+            if not mask_match:
+                num_mask_diff = (out_masked != ref_masked).sum().item()
+                print(
+                    f"[REFCHECK] Backend {backend}: Mask mismatch - "
+                    f"{num_mask_diff} positions have different masking"
+                )
+                if not args.allow_output_mismatch:
+                    raise AssertionError(f"[ERROR] Backend {backend} mask mismatch")
+            else:
+                # Check that unmasked values match the reference
+                unmasked_positions = ~out_masked
+                if unmasked_positions.any():
+                    num_diff, num_total, pct_diff = is_close_stats(
+                        ref[unmasked_positions],
+                        out[unmasked_positions],
+                        rtol=1e-3,
+                        atol=1e-5,
+                    )
+                    if num_diff > 0:
+                        print(
+                            f"[REFCHECK] Backend {backend}: {num_diff}/{num_total} "
+                            f"({pct_diff:.2f}%) unmasked elements differ"
+                        )
+                        if not args.allow_output_mismatch:
+                            raise AssertionError(
+                                f"[ERROR] Backend {backend} value mismatch"
+                            )
 
     for backend in backends:
         if len(backend_times[backend]) > 0:
@@ -1470,6 +1615,7 @@ def testTopK(args):
     vocab_size = args.vocab_size
     top_k = args.top_k
     is_cuda_graph_compatible = not args.no_cuda_graph
+    run_refcheck = args.refcheck
     res = []
 
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
@@ -1493,9 +1639,17 @@ def testTopK(args):
         else:
             raise ValueError(f"Unsupported backend: {backend}")
 
-    # Storage for timing results
+    # Storage for timing results and outputs for refcheck
     backend_times = {backend: [] for backend in backends}
+    outputs = {}
     for cur_backend in backends:
+        if run_refcheck:
+            outputs[cur_backend] = run_backend(cur_backend, input_tensor)
+            # top_k returns (values, indices) tuple - detach both
+            outputs[cur_backend] = (
+                outputs[cur_backend][0].detach(),
+                outputs[cur_backend][1].detach(),
+            )
         backend_times[cur_backend] = bench_gpu_time(
             fn=run_backend,
             dry_run_iters=args.dry_run_iters,
@@ -1504,6 +1658,43 @@ def testTopK(args):
             use_cuda_graph=is_cuda_graph_compatible,
             input_args=(cur_backend, input_tensor),
         )
+
+    # Reference check: compare against PyTorch torch.topk
+    # Note: FlashInfer top_k returns UNSORTED results by default, so we compare
+    # sorted values to verify the same elements are selected
+    if run_refcheck and outputs:
+        ref_values, ref_indices = torch.topk(input_tensor.float(), k=top_k, dim=-1)
+
+        for backend, (out_values, out_indices) in outputs.items():
+            # Sort both outputs to compare (FlashInfer returns unsorted by default)
+            ref_sorted, _ = torch.sort(ref_values, dim=-1, descending=True)
+            out_sorted, _ = torch.sort(out_values.float(), dim=-1, descending=True)
+
+            # Check sorted values match
+            num_diff_vals, num_total_vals, pct_diff_vals = is_close_stats(
+                ref_sorted, out_sorted, rtol=1e-3, atol=1e-5
+            )
+
+            # Verify indices point to correct values in original tensor
+            gathered_vals = torch.gather(
+                input_tensor.float(), dim=-1, index=out_indices
+            )
+            idx_vals_match = torch.allclose(
+                gathered_vals, out_values.float(), rtol=1e-3, atol=1e-5
+            )
+
+            if num_diff_vals > 0 or not idx_vals_match:
+                if num_diff_vals > 0:
+                    print(
+                        f"[REFCHECK] Backend {backend}: {num_diff_vals}/{num_total_vals} "
+                        f"({pct_diff_vals:.2f}%) sorted values differ from PyTorch reference"
+                    )
+                if not idx_vals_match:
+                    print(
+                        f"[REFCHECK] Backend {backend}: indices don't match their values"
+                    )
+                if not args.allow_output_mismatch:
+                    raise AssertionError(f"[ERROR] Backend {backend} output mismatch")
 
     for backend in backends:
         if len(backend_times[backend]) > 0:
@@ -1570,6 +1761,7 @@ def testTopKPageTableTransform(args):
     max_len = args.max_len
     top_k = args.top_k
     is_cuda_graph_compatible = not args.no_cuda_graph
+    run_refcheck = args.refcheck
     res = []
 
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
@@ -1606,9 +1798,14 @@ def testTopKPageTableTransform(args):
         else:
             raise ValueError(f"Unsupported backend: {backend}")
 
-    # Storage for timing results
+    # Storage for timing results and outputs for refcheck
     backend_times = {backend: [] for backend in backends}
+    outputs = {}
     for cur_backend in backends:
+        if run_refcheck:
+            outputs[cur_backend] = run_backend(
+                cur_backend, input_scores, src_page_table, lengths
+            ).detach()
         backend_times[cur_backend] = bench_gpu_time(
             fn=run_backend,
             dry_run_iters=args.dry_run_iters,
@@ -1617,6 +1814,36 @@ def testTopKPageTableTransform(args):
             use_cuda_graph=is_cuda_graph_compatible,
             input_args=(cur_backend, input_scores, src_page_table, lengths),
         )
+
+    # Reference check: PyTorch implementation of top-k + page table transform
+    # For each row i: output[i, j] = src_page_table[i, topk_indices[i, j]]
+    # Note: FlashInfer uses unsorted top-k internally, so we compare sorted sets per row
+    if run_refcheck and outputs:
+        # Get top-k indices
+        _, topk_indices = torch.topk(input_scores.float(), k=top_k, dim=-1)
+        # Gather from page table - row index maps to batch index (1:1 when row_to_batch is None)
+        reference_output = torch.gather(
+            src_page_table[:num_rows], dim=-1, index=topk_indices.int()
+        )
+
+        for backend, output in outputs.items():
+            # Sort both outputs per row to compare sets (order may differ due to unsorted top-k)
+            ref_sorted, _ = torch.sort(reference_output, dim=-1)
+            out_sorted, _ = torch.sort(output, dim=-1)
+
+            matches = (ref_sorted == out_sorted).all()
+            if not matches:
+                num_diff = (ref_sorted != out_sorted).sum().item()
+                num_total = reference_output.numel()
+                pct_diff = num_diff / num_total * 100.0
+                print(
+                    f"[REFCHECK] Backend {backend}: {num_diff}/{num_total} "
+                    f"({pct_diff:.2f}%) sorted page table entries differ from PyTorch reference"
+                )
+                if not args.allow_output_mismatch:
+                    raise AssertionError(
+                        f"[ERROR] Backend {backend} output mismatch with {num_diff} elements"
+                    )
 
     for backend in backends:
         if len(backend_times[backend]) > 0:
@@ -1683,6 +1910,7 @@ def testTopKRaggedTransform(args):
     max_len = args.max_len
     top_k = args.top_k
     is_cuda_graph_compatible = not args.no_cuda_graph
+    run_refcheck = args.refcheck
     res = []
 
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
@@ -1719,9 +1947,14 @@ def testTopKRaggedTransform(args):
         else:
             raise ValueError(f"Unsupported backend: {backend}")
 
-    # Storage for timing results
+    # Storage for timing results and outputs for refcheck
     backend_times = {backend: [] for backend in backends}
+    outputs = {}
     for cur_backend in backends:
+        if run_refcheck:
+            outputs[cur_backend] = run_backend(
+                cur_backend, input_scores, offsets, lengths
+            ).detach()
         backend_times[cur_backend] = bench_gpu_time(
             fn=run_backend,
             dry_run_iters=args.dry_run_iters,
@@ -1730,6 +1963,34 @@ def testTopKRaggedTransform(args):
             use_cuda_graph=is_cuda_graph_compatible,
             input_args=(cur_backend, input_scores, offsets, lengths),
         )
+
+    # Reference check: PyTorch implementation of top-k + ragged index transform
+    # For each row i: output_indices[i, j] = topk_indices[i, j] + offsets[i]
+    # Note: FlashInfer uses unsorted top-k internally, so we compare sorted sets per row
+    if run_refcheck and outputs:
+        # Get top-k indices
+        _, topk_indices = torch.topk(input_scores.float(), k=top_k, dim=-1)
+        # Add offsets to each row's indices
+        reference_output = topk_indices.int() + offsets.unsqueeze(-1)
+
+        for backend, output in outputs.items():
+            # Sort both outputs per row to compare sets (order may differ due to unsorted top-k)
+            ref_sorted, _ = torch.sort(reference_output, dim=-1)
+            out_sorted, _ = torch.sort(output, dim=-1)
+
+            matches = (ref_sorted == out_sorted).all()
+            if not matches:
+                num_diff = (ref_sorted != out_sorted).sum().item()
+                num_total = reference_output.numel()
+                pct_diff = num_diff / num_total * 100.0
+                print(
+                    f"[REFCHECK] Backend {backend}: {num_diff}/{num_total} "
+                    f"({pct_diff:.2f}%) sorted ragged indices differ from PyTorch reference"
+                )
+                if not args.allow_output_mismatch:
+                    raise AssertionError(
+                        f"[ERROR] Backend {backend} output mismatch with {num_diff} elements"
+                    )
 
     for backend in backends:
         if len(backend_times[backend]) > 0:
