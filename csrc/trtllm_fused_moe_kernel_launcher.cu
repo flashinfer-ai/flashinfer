@@ -1036,9 +1036,9 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
     Array<Array<int64_t>> valid_configs;
 
     std::vector<int32_t> supported_tile_nums(mSupportedTileNums.begin(), mSupportedTileNums.end());
-    if (quantization_type == Fp8QuantizationType::MxFp8) {
-      supported_tile_nums.push_back(256);
-    }
+    // if (quantization_type == Fp8QuantizationType::MxFp8) {
+    //   supported_tile_nums.push_back(256);
+    // }
     std::set<int32_t> selected_tile_nums =
         computeSelectedTileN(supported_tile_nums, num_tokens, top_k, num_local_experts);
 
@@ -1751,9 +1751,9 @@ Tensor trtllm_fp8_block_scale_moe(
 
   std::vector<int32_t> mSupportedTileN(Fp8BlockScaleLauncher::mSupportedTileNums.begin(),
                                        Fp8BlockScaleLauncher::mSupportedTileNums.end());
-  if (quantization_type == Fp8QuantizationType::MxFp8) {
-    mSupportedTileN.push_back(256);
-  }
+  // if (quantization_type == Fp8QuantizationType::MxFp8) {
+  //   mSupportedTileN.push_back(256);
+  // }
   std::set<int32_t> selected_tile_nums =
       computeSelectedTileN(mSupportedTileN, num_tokens, top_k, local_num_experts);
 

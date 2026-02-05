@@ -110,6 +110,10 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
         }
       }
 
+      if (options.mDtypeA == tg::Dtype::MxE4m3 && options.mDtypeB == tg::Dtype::MxE4m3 && options.mNumSlicesForSplitK > 1) {
+        continue;
+      }
+
       if (mOptions.transposeMmaOutput && options.mEpilogueTileM == mOptions.epilogueTileM) {
         mPassingConfigIndices.push_back(i);
       }
