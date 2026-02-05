@@ -807,6 +807,24 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
             hopper_inputs.isValid(),
             "Calling TMA warp specialized configuration with invalid hopper config");
 
+        // For NoSmem epilogue schedule, output N must be 256-bit aligned.
+        // No need to check isGatedActivation here - inputs.n is already set correctly:
+        //   fc1_out_size = is_gated_activation ? inter_size * 2 : inter_size
+        // So gated activations naturally have better alignment (2x the size).
+        // Also, FINALIZE fusion is not supported with NO_SMEM.
+        // This check is here so the autotuner can catch invalid tactics during profiling.
+        if (inputs.gemm_config.epilogue_schedule ==
+            cutlass_extensions::EpilogueScheduleType::NO_SMEM) {
+          TLLM_CHECK_WITH_INFO(
+              inputs.n % (256 / cutlass::sizeof_bits<OutputType>::value) == 0,
+              "Output N %ld does not meet minimum alignment requirements for NO_SMEM epilogue %d",
+              (long)inputs.n, (int)(256 / cutlass::sizeof_bits<OutputType>::value));
+          TLLM_CHECK_WITH_INFO(
+              inputs.gemm_config.epilogue_fusion_type !=
+                  cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE,
+              "NO_SMEM epilogue schedule is not supported with FINALIZE fusion");
+        }
+
         // Select the appropriate fusion function
         auto select_function = [&]() {
           switch (hopper_inputs.fusion) {
@@ -980,16 +998,6 @@ template <typename T, typename WeightType, typename OutputType, typename ScaleBi
 void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::moeGemmBiasAct(
     GroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> inputs,
     TmaWarpSpecializedGroupedGemmInput hopper_inputs) {
-  // For NoSmem epilogue schedule, output N must be 256-bit aligned.
-  // For gated activation, this is automatic if the usual alignment requirement is met.
-  // This check is here so the autotuner can catch invalid tactics during profiling.
-  if (inputs.gemm_config.epilogue_schedule == cutlass_extensions::EpilogueScheduleType::NO_SMEM &&
-      !isGatedActivation(inputs.activation_type)) {
-    TLLM_CHECK_WITH_INFO(
-        inputs.n % (256 / cutlass::sizeof_bits<OutputType>::value) == 0,
-        "Output N %ld does not meet minimum alignment requirements for NO_SMEM epilogue %d",
-        (long)inputs.n, (int)(256 / cutlass::sizeof_bits<OutputType>::value));
-  }
   switch (inputs.activation_type) {
     case ActivationType::Relu:
       runGemm<cutlass_extensions::EpilogueOpDefaultReLU>(inputs, hopper_inputs);
@@ -1022,18 +1030,6 @@ template <typename T, typename WeightType, typename OutputType, typename ScaleBi
 void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::moeGemm(
     GroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> inputs,
     TmaWarpSpecializedGroupedGemmInput hopper_inputs) {
-  // For NoSmem epilogue schedule, output N must be 256-bit aligned.
-  // Also, FINALIZE fusion is not supported with NO_SMEM.
-  // This check is here so the autotuner can catch invalid tactics during profiling.
-  if (inputs.gemm_config.epilogue_schedule == cutlass_extensions::EpilogueScheduleType::NO_SMEM) {
-    TLLM_CHECK_WITH_INFO(inputs.gemm_config.epilogue_fusion_type !=
-                             cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE,
-                         "NO_SMEM epilogue schedule is not supported with FINALIZE fusion");
-    TLLM_CHECK_WITH_INFO(
-        inputs.n % (256 / cutlass::sizeof_bits<OutputType>::value) == 0,
-        "Output N %ld does not meet minimum alignment requirements for NO_SMEM epilogue %d",
-        (long)inputs.n, (int)(256 / cutlass::sizeof_bits<OutputType>::value));
-  }
   runGemm<cutlass_extensions::EpilogueOpDefault>(inputs, hopper_inputs);
 }
 
