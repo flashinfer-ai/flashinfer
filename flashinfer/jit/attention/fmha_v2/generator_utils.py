@@ -150,6 +150,7 @@ spec_fields = (
     "sage_block_sizes",
     "output_dtype",
     "is_mtp",
+    "enable_skip_softmax",
 )
 kernel_spec = namedtuple("kernel_spec", spec_fields)  # type: ignore[misc]
 kernel_spec.__new__.__defaults__ = (
@@ -175,8 +176,9 @@ kernel_spec.__new__.__defaults__ = (
     0,  # head size of V
     None,  # sage_block_sizes
     None,  # output_dtype, same as dtype by default.
-    False,
-)  # use MTP or not
+    False,  # use MTP or not
+    False,  # enable skip softmax
+)
 
 generate_cu_trtllm = os.environ.get("GENERATE_CU_TRTLLM", "False").lower() == "true"
 
@@ -1467,6 +1469,7 @@ using Ktraits = {kernel_traits_header}
                 USE_TMA_STORE,
                 {enable_attn_logit_softcapping_flag},
                 {return_softmax_stats_flag},
+                {enable_skip_softmax_flag},
                 {output_dtype_},
                 {sage_block_size_q},
                 {sage_block_size_k},
@@ -1490,6 +1493,7 @@ using Ktraits_causal = {kernel_traits_header}
                        USE_TMA_STORE,
                        {enable_attn_logit_softcapping_flag},
                        {return_softmax_stats_flag},
+                       {enable_skip_softmax_flag},
                        {output_dtype_}>;
 
 using Ktraits_sliding_or_chunked_causal = {kernel_traits_header}
@@ -1510,6 +1514,7 @@ using Ktraits_sliding_or_chunked_causal = {kernel_traits_header}
                                       USE_TMA_STORE && false,
                                       {enable_attn_logit_softcapping_flag},
                                       {return_softmax_stats_flag},
+                                      {enable_skip_softmax_flag},
                                       {output_dtype_}>;
 
 using Ktraits_custom_mask = {kernel_traits_header}
@@ -1530,6 +1535,7 @@ using Ktraits_custom_mask = {kernel_traits_header}
                             USE_TMA_STORE && false,
                             {enable_attn_logit_softcapping_flag},
                             {return_softmax_stats_flag},
+                            {enable_skip_softmax_flag},
                             {output_dtype_}>;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1867,6 +1873,8 @@ def encode_name(kernel_spec):
 
     if kernel_spec.enable_attn_logit_softcapping:
         feature_tags += "_softcapping"
+    if kernel_spec.enable_skip_softmax:
+        feature_tags += "_skipSoftmax"
     if kernel_spec.sage_block_sizes:
         feature_tags += f"_sage_{'_'.join(map(str, kernel_spec.sage_block_sizes))}"
     if kernel_spec.output_dtype:
@@ -2192,6 +2200,8 @@ def get_kernel_code(kspec, kname, lname):
 
     return_softmax_stats_flag = pythonBoolean2cpp[kspec.return_softmax_stats]
 
+    enable_skip_softmax_flag = pythonBoolean2cpp[kspec.enable_skip_softmax]
+
     # needed by warpspec kernels.
     fp8_kernel = kspec.dtype in ["e4m3", "e4m3_fp32"]
     kernel_traits_header = (
@@ -2449,6 +2459,12 @@ def get_api_code(specs_names):
                 f"&& sage_block_size_q == {sage_block_size_q} "
                 f"&& sage_block_size_k == {sage_block_size_k} "
                 f"&& sage_block_size_v == {sage_block_size_v} "
+            )
+
+            il_check += (
+                "&& enable_skip_softmax "
+                if kspec.enable_skip_softmax
+                else "&& !enable_skip_softmax "
             )
 
         il_check += (
@@ -2756,6 +2772,7 @@ const bool warp_specialization               = launch_params.warp_specialization
 const bool use_tma                           = launch_params.use_tma;
 const bool use_flash_attention               = launch_params.flash_attention;
 const bool enable_attn_logit_softcapping     = launch_params.enable_attn_logit_softcapping;
+const bool enable_skip_softmax               = launch_params.enable_skip_softmax;
 const int  attention_input_layout            = static_cast<int>(launch_params.attention_input_layout);
 // tiled variant uses ldgsts
 const bool  use_tiled            = launch_params.use_granular_tiling;
@@ -2938,6 +2955,8 @@ def get_kernel_traits_code(specs_names):
             kspec.enable_attn_logit_softcapping
         ]
 
+        enable_skip_softmax_flag = pythonBoolean2cpp[kspec.enable_skip_softmax]
+
         tmp = dict(locals(), **kspec._asdict())
 
         if effective_sm < 90:
@@ -3065,7 +3084,8 @@ def get_kernel_traits_code(specs_names):
                                   {input_layout_flag},
                                   __use_tma_store__ /* USE_TMA_STORE */,
                                   {enable_attn_logit_softcapping_flag},
-                                  {return_softmax_stats_flag}>;
+                                  {return_softmax_stats_flag},
+                                  {enable_skip_softmax_flag}>;
 
             printf("%s %d %d %s %d %d\\n",
                 \"{kname}\",
@@ -3233,9 +3253,16 @@ def get_kernel_traits_code(specs_names):
 # For now:
 # 1. Hopper head_size 128 kernel uses cubins for performance regressions.
 # 2. Hopper sm89 with e4m3/e4m3_fp32 dtype uses cubins for accuracy regressions (will be fixed).
+# 3. For skip-softmax attention feature, we force not to use cubins.
 # You should set the condition `use_cubin_header` to false if you have modified the source codes of those kernels that use cubins.
 # This ensures that the kernels will be recompiled using the updated source code rather than relying on precompiled cubins.
-def use_cubin_header(sm, head_size, dtype):
+def use_cubin_header(
+    sm, head_size, dtype, output_dtype=None, enable_skip_softmax=False
+):
+    if enable_skip_softmax:
+        return False
+    if "e4m3" in dtype and output_dtype in ["bf16", "fp16"]:
+        return False
     return (sm == 90 and head_size == 128) or (sm == 89 and "e4m3" in dtype)
 
 
@@ -3246,7 +3273,11 @@ def get_cubin_header(kernel_traits, specs_names):
     cubin_lens_dict = {}
     for kspec, fname, lname, kname in specs_names:  # noqa: B007 (lname, kname used via locals())
         if generate_cu_trtllm and not use_cubin_header(
-            kspec.sm, kspec.head_size, kspec.dtype
+            kspec.sm,
+            kspec.head_size,
+            kspec.dtype,
+            kspec.output_dtype,
+            kspec.enable_skip_softmax
         ):
             continue
         name = fname.replace(".", "_")
@@ -3288,6 +3319,7 @@ def get_cubin_header(kernel_traits, specs_names):
             .replace("ws_", "")
             .replace("softcapping_", "")
             .replace("sage_", "")
+            .replace("skipSoftmax_", "")
             .replace("output_", "")
         )
         flash_attention = "flash_attention" in kname
@@ -3386,6 +3418,8 @@ def get_cubin_header(kernel_traits, specs_names):
             sm != "90" or (sm == "90" and "_softmax" in kname)
         ]
 
+        enable_skip_softmax_flag = pythonBoolean2cpp["_skipSoftmax" in kname]
+
         # meta_unroll_step
         meta_unroll_step = unroll_step if ("_nl" in kname or "_ws" in kname) else "0"
 
@@ -3410,7 +3444,7 @@ def get_cubin_header(kernel_traits, specs_names):
             if generate_cu_trtllm:
 
                 def get_lname_from_kname(kname: str) -> str:
-                    if use_cubin_header(int(sm), int(head_size), prec.lower()):
+                    if use_cubin_header(int(sm), int(head_size), prec.lower(), output_prec.lower(), enable_skip_softmax_flag):
                         return "nullptr"
                     lname = kname.replace("_kernel", "")
                     mask_types = [
@@ -3431,15 +3465,15 @@ def get_cubin_header(kernel_traits, specs_names):
 {sage_block_sizes[0]}, {sage_block_sizes[1]}, {sage_block_sizes[2]}, kSM_{sm}, {cubin_name}, \
 {cubin_name}_len, \"{kname}\", {smem}, {threads}, {meta_unroll_step}, {attention_mask_type_value}, \
 {attention_input_layout_value}, {is_il}, {is_flash_atten}, {is_warp_specialization}, {is_fp32_accu}, \
-{is_alibi_supported}, {is_tiled}, {has_softcapping_scale}, {return_softmax_stats_flag}, {lname}}}\
+{is_alibi_supported}, {is_tiled}, {has_softcapping_scale}, {return_softmax_stats_flag}, {enable_skip_softmax_flag}, {lname}}}\
 """.format(**locals())
-                    if use_cubin_header(int(sm), int(head_size), prec.lower())
+                    if use_cubin_header(int(sm), int(head_size), prec.lower(), output_prec.lower(), enable_skip_softmax_flag)
                     else """\
 {{ DATA_TYPE_{prec}, DATA_TYPE_{output_prec}, {seq_len}, {q_step}, {kv_step}, {head_size}, {head_size_v}, \
 {sage_block_sizes[0]}, {sage_block_sizes[1]}, {sage_block_sizes[2]}, kSM_{sm}, nullptr, \
 0, \"{kname}\", {smem}, {threads}, {meta_unroll_step}, {attention_mask_type_value}, \
 {attention_input_layout_value}, {is_il}, {is_flash_atten}, {is_warp_specialization}, {is_fp32_accu}, \
-{is_alibi_supported}, {is_tiled}, {has_softcapping_scale}, {return_softmax_stats_flag}, {lname}}}\
+{is_alibi_supported}, {is_tiled}, {has_softcapping_scale}, {return_softmax_stats_flag}, {enable_skip_softmax_flag}, {lname}}}\
 """.format(**locals())
                 )
             else:
@@ -3448,7 +3482,7 @@ def get_cubin_header(kernel_traits, specs_names):
 {sage_block_sizes[0]}, {sage_block_sizes[1]}, {sage_block_sizes[2]}, kSM_{sm}, {cubin_name}, \
 {cubin_name}_len, \"{kname}\", {smem}, {threads}, {meta_unroll_step}, {attention_mask_type_value}, \
 {attention_input_layout_value}, {is_il}, {is_flash_atten}, {is_warp_specialization}, {is_fp32_accu}, \
-{is_alibi_supported}, {is_tiled}, {has_softcapping_scale}, {return_softmax_stats_flag}}}\
+{is_alibi_supported}, {is_tiled}, {has_softcapping_scale}, {return_softmax_stats_flag}, {enable_skip_softmax_flag}}}\
 """.format(**locals())
             if sm in metadata_v2_dict:
                 metadata_v2_dict[sm].append(code)
@@ -3544,7 +3578,8 @@ static const struct FusedMultiHeadAttentionKernelMetaInfoV2
     bool mAlibiSupported;
     bool mTiled;
     bool mEnableAttnLogitSoftcapping;
-    bool mReturnSoftmaxStats;{launcher_line}
+    bool mReturnSoftmaxStats;
+    bool mEnableSkipSoftmax;{launcher_line}
 }} sMhaKernelMetaInfosV2[] = {{
 {metadata_v2}
 }};
@@ -3605,6 +3640,7 @@ static const struct TestMetaV2
     bool mTiled;
     bool mEnableAttnLogitSoftcapping;
     bool mReturnSoftmaxStats;
+    bool mEnableSkipSoftmax;
 }} metaV2[] = {{
 {metadata_v2}
 }};
@@ -3643,7 +3679,7 @@ extern uint32_t cubin_fmha_v2_flash_attention_fp16_64_128_S_q_paged_kv_128_sm80_
         return "\n".join(lines)
 
     target = "fmha_v2_flash_attention_fp16_64_128_S_q_paged_kv_128_causal_sm80_kernel_nl_tiled"
-    new_line = '{ DATA_TYPE_FP16, DATA_TYPE_FP16, 0, 64, 128, 128, 128, 0, 0, 0, kSM_80, cubin_fmha_v2_flash_attention_fp16_64_128_S_q_paged_kv_128_sm80_cu_cubin, cubin_fmha_v2_flash_attention_fp16_64_128_S_q_paged_kv_128_sm80_cu_cubin_len, "fmha_v2_flash_attention_fp16_64_128_S_q_paged_kv_128_causal_sm80_kernel_nl_tiled", 81920, 128, 64, 1, 2, false, true, false, false, true, true, false, true, nullptr},'
+    new_line = '{ DATA_TYPE_FP16, DATA_TYPE_FP16, 0, 64, 128, 128, 128, 0, 0, 0, kSM_80, cubin_fmha_v2_flash_attention_fp16_64_128_S_q_paged_kv_128_sm80_cu_cubin, cubin_fmha_v2_flash_attention_fp16_64_128_S_q_paged_kv_128_sm80_cu_cubin_len, "fmha_v2_flash_attention_fp16_64_128_S_q_paged_kv_128_causal_sm80_kernel_nl_tiled", 81920, 128, 64, 1, 2, false, true, false, false, true, true, false, true, false, nullptr},'
     result = modify_kernel_line(result, target, new_line)
 
     # make sure only one empty line at the end
@@ -3808,7 +3844,7 @@ def enumerate_hgmma_ldgsts_kernels(specs, sm=90, dtype="fp16"):
 
 
 # Note this will be used in TRT-LLM.
-def enumerate_hgmma_flash_warpspec_kernels(specs, sm=90, dtype="fp16"):
+def enumerate_hgmma_flash_warpspec_kernels(specs, sm=90, dtype="fp16", enable_skip_softmax=False):
     scheduling_mode = int(os.getenv("SCHEDULING_MODE", "1"))
 
     # use specialized kernels for cases without alibi scales.
@@ -3873,6 +3909,7 @@ def enumerate_hgmma_flash_warpspec_kernels(specs, sm=90, dtype="fp16"):
                     return_softmax_stats=return_softmax,
                     scheduling_mode=scheduling_mode,
                     input_layout=input_layout,
+                    enable_skip_softmax=enable_skip_softmax
                 )
             )
 
@@ -3906,6 +3943,7 @@ def enumerate_hgmma_flash_warpspec_kernels(specs, sm=90, dtype="fp16"):
                     return_softmax_stats=return_softmax,
                     scheduling_mode=scheduling_mode,
                     input_layout=input_layout,
+                    enable_skip_softmax=enable_skip_softmax
                 )
             )
 
@@ -3939,6 +3977,7 @@ def enumerate_hgmma_flash_warpspec_kernels(specs, sm=90, dtype="fp16"):
                     return_softmax_stats=return_softmax,
                     scheduling_mode=scheduling_mode,
                     input_layout=input_layout,
+                    enable_skip_softmax=enable_skip_softmax
                 )
             )
         """
@@ -3990,7 +4029,7 @@ def enumerate_hgmma_flash_warpspec_kernels(specs, sm=90, dtype="fp16"):
 
 # Note this will be used in TRT-LLM.
 def enumerate_qgmma_flash_warpspec_kernels(
-    specs, sm=90, dtype="e4m3", sage_block_sizes=None, output_dtype=None
+    specs, sm=90, dtype="e4m3", sage_block_sizes=None, output_dtype=None,enable_skip_softmax=False
 ):
     scheduling_mode = int(os.getenv("SCHEDULING_MODE", "1"))
 
@@ -4057,6 +4096,7 @@ def enumerate_qgmma_flash_warpspec_kernels(
                     input_layout=input_layout,
                     sage_block_sizes=sage_block_sizes,
                     output_dtype=output_dtype,
+                    enable_skip_softmax=enable_skip_softmax
                 )
             )
 
@@ -4093,6 +4133,7 @@ def enumerate_qgmma_flash_warpspec_kernels(
                     input_layout=input_layout,
                     sage_block_sizes=sage_block_sizes,
                     output_dtype=output_dtype,
+                    enable_skip_softmax=enable_skip_softmax
                 )
             )
 
@@ -4129,6 +4170,7 @@ def enumerate_qgmma_flash_warpspec_kernels(
                     input_layout=input_layout,
                     sage_block_sizes=sage_block_sizes,
                     output_dtype=output_dtype,
+                    enable_skip_softmax=enable_skip_softmax
                 )
             )
 
@@ -6675,12 +6717,21 @@ def enumerate_kernels():
     enumerate_igmma_kernels(specs, sm=90)
     enumerate_qgmma_kernels(specs, sm=90)
     # need to add bf16 kernels if needed
-    enumerate_hgmma_flash_warpspec_kernels(specs, sm=90, dtype="fp16")
-    enumerate_hgmma_flash_warpspec_kernels(specs, sm=90, dtype="bf16")
-    enumerate_qgmma_flash_warpspec_kernels(specs, sm=90, dtype="e4m3")
-    enumerate_qgmma_flash_warpspec_kernels(
-        specs, sm=90, dtype="e4m3", output_dtype="bf16"
-    )
+    for enable_skip_softmax in [False, True]:
+        if enable_skip_softmax and 'DISABLE_SKIP_SOFTMAX' in os.environ:
+            continue
+        enumerate_hgmma_flash_warpspec_kernels(
+            specs, sm=90, dtype='fp16', enable_skip_softmax=enable_skip_softmax)
+        enumerate_hgmma_flash_warpspec_kernels(
+            specs, sm=90, dtype='bf16', enable_skip_softmax=enable_skip_softmax)
+        enumerate_qgmma_flash_warpspec_kernels(
+            specs, sm=90, dtype='e4m3', enable_skip_softmax=enable_skip_softmax)
+        enumerate_qgmma_flash_warpspec_kernels(
+            specs,
+            sm=90,
+            dtype='e4m3',
+            output_dtype="bf16",
+            enable_skip_softmax=enable_skip_softmax)
 
     # For now SageAttention only needs BF16
     # block_size_q should be divisible by 64

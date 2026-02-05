@@ -12,6 +12,8 @@
 
 #pragma once
 
+#include "fmha/hopper/arrive_wait.h"
+
 #include <fmha/softmax.h>
 #include <fmha/traits.h>
 #include <fmha/utils.h>
@@ -71,6 +73,9 @@ struct Softmax_base {
   // Whether we need to check if local_max could be -inf or not.
   enum { CHECK_IF_NEG_INF_EXISTS = SLIDING_OR_CHUNKED_ATTENTION || USE_CUSTOM_MASK };
 
+  // There are 2 warpgroups so 0x3 and 0x4 are used
+  enum { SKIP_SOFTMAX_BARRIER = Kernel_traits::SKIP_SOFTMAX_BARRIER_ID };
+
   // Ctor.
   template <typename Params>
   inline __device__ Softmax_base(Params params, int tidx)
@@ -80,7 +85,12 @@ struct Softmax_base {
         sliding_window_size_(params.sliding_window_size),
         log2_chunked_attention_size_(params.log2_chunked_attention_size),
         packed_mask_ptr_{reinterpret_cast<uint32_t*>(params.packed_mask_ptr)},
-        params_packed_mask_stride_in_bytes_{params.packed_mask_stride_in_bytes} {
+        params_packed_mask_stride_in_bytes_{params.packed_mask_stride_in_bytes},
+#ifdef SKIP_SOFTMAX_STAT
+        total_blocks(0),
+        skipped_blocks(0),
+#endif
+        skip_softmax_threshold(0) {
     int warp = tidx / 32;
     int lane = tidx % 32;
     // The corresponding row/col for each thread after MMA.
@@ -253,25 +263,67 @@ struct Softmax_base {
   }
 
   // Calculate max/sum, and update flash-attention scales.
+  // Returns false if skipped due to skip-softmax attention feature.
   template <bool IS_FIRST_COL>
-  inline __device__ void compute_and_update_scale(float (&global_max)[Mma_tile_p::CORES_M],
-                                                  float (&global_sum)[Mma_tile_p::CORES_M]) {
+  inline __device__ bool compute_and_update_scale(float (&global_max)[Mma_tile_p::CORES_M],
+                                                  float (&global_sum)[Mma_tile_p::CORES_M],
+                                                  uint32_t* skip_softmax_vote) {
     float const scale = reinterpret_cast<float const&>(scale_bmm1_);
+
+    // whether this warpgroup skips the softmax
+    constexpr bool may_skip = Kernel_traits::ENABLE_SKIP_SOFTMAX && !IS_FIRST_COL;
+    bool skip = may_skip;
 
 // Row-wise max of current tile.
 #pragma unroll
     for (int mi = 0; mi < Mma_tile_p::CORES_M; mi++) {
-      if (IS_FIRST_COL) {
-        local_max_[mi] = elt_[mi][0];
-      } else {
-        local_max_[mi] = fmaxf(global_max[mi], elt_[mi][0]);
-      }
+      local_max_[mi] = elt_[mi][0];
 #pragma unroll
       for (int ni = 1; ni < Mma_tile_p::CORES_N * 2; ni++) {
         local_max_[mi] = fmaxf(local_max_[mi], elt_[mi][ni]);
       }
       local_max_[mi] = fmaxf(__shfl_xor_sync(uint32_t(-1), local_max_[mi], 1), local_max_[mi]);
       local_max_[mi] = fmaxf(__shfl_xor_sync(uint32_t(-1), local_max_[mi], 2), local_max_[mi]);
+
+      if constexpr (may_skip) {
+        // AND(&) the CORES_M results, then `skip` means whether to skip
+        // the CORES_M(=2) rows
+        if constexpr (!EXP2F_OPTIMIZATION) {
+          skip &= expf(local_max_[mi] - global_max[mi]) < skip_softmax_threshold;
+        } else {
+          skip &= exp2f((local_max_[mi] - global_max[mi]) * scale) < skip_softmax_threshold;
+        }
+      }
+
+      if (!IS_FIRST_COL) {
+        local_max_[mi] = fmaxf(local_max_[mi], global_max[mi]);
+      }
+    }
+
+    if constexpr (Kernel_traits::ENABLE_SKIP_SOFTMAX) {
+#ifdef SKIP_SOFTMAX_STAT
+      total_blocks++;
+#endif
+      if constexpr (may_skip) {
+        // AND(&) the results together in a warp, then `skip` means whether to skip
+        // all the 16 rows managed by this warp.
+        // each 4 threads (e.g. T0~T3) have the same `skip`, only 0x11111111 is needed
+        // instead of 0xffffffff. But the perf is the same.
+        skip = __all_sync(0xffffffff, skip);
+        if (threadIdx.x % 32 == 0) {
+          // The leader of each warp votes.
+          atomicAnd(skip_softmax_vote, uint32_t(skip));
+        }
+        // WG0 uses 0x3 barrier, WG1 uses 0x4 barrier
+        named_barrier_wait(SKIP_SOFTMAX_BARRIER + threadIdx.x / 128, 128);
+        skip = *((uint32_t volatile*)skip_softmax_vote);
+        if (skip) {
+#ifdef SKIP_SOFTMAX_STAT
+          skipped_blocks++;
+#endif
+          return false;
+        }
+      }
     }
 
 // Softmax Exp.
@@ -339,6 +391,7 @@ struct Softmax_base {
         global_max[mi] = max_new;
       }
     }
+    return true;
   }
 
   // Update flash attention scales and pack elements for BMM2.
@@ -407,6 +460,13 @@ struct Softmax_base {
   float correction_[Mma_tile_p::CORES_M];
   // The packed mask.
   uint4 packed_mask_;
+  // Skip softmax when exp(local_max - global_max) < skip_softmax_threshold.
+  float skip_softmax_threshold;
+#ifdef SKIP_SOFTMAX_STAT
+  // Statistics of skip-softmax
+  uint32_t total_blocks;
+  uint32_t skipped_blocks;
+#endif
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -676,29 +736,72 @@ struct Softmax<Hopper_qgmma_e4m3_fp32_traits, Kernel_traits>
   inline __device__ Softmax(Params const& params, int tidx) : Base(params, tidx) {}
 
   // Calculate max/sum, and update flash-attention scales.
+  // Returns false if skipped due to skip-softmax attention feature.
   template <bool IS_FIRST_COL>
-  inline __device__ void compute_and_update_scale(float (&global_max)[Mma_tile_p::CORES_M],
-                                                  float (&global_sum)[Mma_tile_p::CORES_M]) {
+  inline __device__ bool compute_and_update_scale(float (&global_max)[Mma_tile_p::CORES_M],
+                                                  float (&global_sum)[Mma_tile_p::CORES_M],
+                                                  uint32_t* skip_softmax_vote) {
     float const scale = reinterpret_cast<float const&>(this->scale_bmm1_);
     float(&local_max_)[Mma_tile_p::CORES_M] = this->local_max_;
     float(&local_sum_)[Mma_tile_p::CORES_M] = this->local_sum_;
     float(&correction_)[Mma_tile_p::CORES_M] = this->correction_;
     float(&elt_)[Mma_tile_p::CORES_M][Mma_tile_p::CORES_N * 2] = this->elt_;
 
+    // whether this warpgroup skips the softmax
+    constexpr bool may_skip = Kernel_traits::ENABLE_SKIP_SOFTMAX && !IS_FIRST_COL;
+    bool skip = may_skip;
+
 // Row-wise max of current tile.
 #pragma unroll
     for (int mi = 0; mi < Mma_tile_p::CORES_M; mi++) {
-      if (IS_FIRST_COL) {
-        local_max_[mi] = elt_[mi][0];
-      } else {
-        local_max_[mi] = fmaxf(global_max[mi], elt_[mi][0]);
-      }
+      local_max_[mi] = elt_[mi][0];
 #pragma unroll
       for (int ni = 1; ni < Mma_tile_p::CORES_N * 2; ni++) {
         local_max_[mi] = fmaxf(local_max_[mi], elt_[mi][ni]);
       }
       local_max_[mi] = fmaxf(__shfl_xor_sync(uint32_t(-1), local_max_[mi], 1), local_max_[mi]);
       local_max_[mi] = fmaxf(__shfl_xor_sync(uint32_t(-1), local_max_[mi], 2), local_max_[mi]);
+      // AND(&) the CORES_M results, then `skip` means whether to skip
+      // the CORES_M(=2) rows
+      if constexpr (may_skip) {
+        // AND(&) the CORES_M results, then `skip` means whether to skip
+        // the CORES_M(=2) rows
+        if constexpr (!EXP2F_OPTIMIZATION) {
+          skip &= expf(local_max_[mi] - global_max[mi]) < this->skip_softmax_threshold;
+        } else {
+          skip &= exp2f((local_max_[mi] - global_max[mi]) * scale) < this->skip_softmax_threshold;
+        }
+      }
+      if (!IS_FIRST_COL) {
+        local_max_[mi] = fmaxf(local_max_[mi], global_max[mi]);
+      }
+    }
+
+    if constexpr (Kernel_traits::ENABLE_SKIP_SOFTMAX) {
+#ifdef SKIP_SOFTMAX_STAT
+      this->total_blocks++;
+#endif
+
+      if constexpr (may_skip) {
+        // AND(&) the results together in a warp, then `skip` means whether to skip
+        // all the 16 rows managed by this warp.
+        // each 4 threads (e.g. T0~T3) have the same `skip`, only 0x11111111 is needed
+        // instead of 0xffffffff. But the perf is the same.
+        skip = __all_sync(0xffffffff, skip);
+        if (threadIdx.x % 32 == 0) {
+          // The leader of each warp votes.
+          atomicAnd(skip_softmax_vote, uint32_t(skip));
+        }
+        // WG0 uses 0x3 barrier, WG1 uses 0x4 barrier
+        named_barrier_wait(Base::SKIP_SOFTMAX_BARRIER + threadIdx.x / 128, 128);
+        skip = *((uint32_t volatile*)skip_softmax_vote);
+        if (skip) {
+#ifdef SKIP_SOFTMAX_STAT
+          this->skipped_blocks++;
+#endif
+          return false;
+        }
+      }
     }
 
 // Softmax Exp.
@@ -774,6 +877,7 @@ struct Softmax<Hopper_qgmma_e4m3_fp32_traits, Kernel_traits>
         global_max[mi] = max_new;
       }
     }
+    return true;
   }
 
   // Update flash attention scales and pack elements for BMM2.

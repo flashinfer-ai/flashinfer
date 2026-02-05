@@ -153,6 +153,7 @@ spec_fields = (
     "alibi",
     "enable_attn_logit_softcapping",
     "return_softmax_stats",
+    "enable_skip_softmax",
     "disabled_mask_types",
     "head_size_v",
     "sage_block_sizes",
@@ -180,6 +181,7 @@ kernel_spec.__new__.__defaults__ = (
     True,  # alibi
     False,  # enable_attn_logit_softcapping
     False,  # return_softmax_stats
+    False,  # enable_skip_softmax
     None,  # disabled_mask_types
     0,  # head size of V
     None,  # sage_block_sizes
@@ -296,6 +298,8 @@ def encode_name(kernel_spec):
         feature_tags += "_softmax"
     if kernel_spec.enable_attn_logit_softcapping:
         feature_tags += "_softcapping"
+    if kernel_spec.enable_skip_softmax:
+        feature_tags += "_skipSoftmax"
     if kernel_spec.sage_block_sizes:
         feature_tags += f"_sage_{'_'.join(map(str, kernel_spec.sage_block_sizes))}"
     if kernel_spec.output_dtype:
@@ -607,6 +611,12 @@ def get_api_code(specs_names):
                 f"&& sage_block_size_q == {sage_block_size_q} "
                 f"&& sage_block_size_k == {sage_block_size_k} "
                 f"&& sage_block_size_v == {sage_block_size_v} "
+            )
+            
+            il_check += (
+                "&& enable_skip_softmax "
+                if kspec.enable_skip_softmax
+                else "&& !enable_skip_softmax "
             )
 
         il_check += (
