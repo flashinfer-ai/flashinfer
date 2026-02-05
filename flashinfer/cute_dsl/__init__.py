@@ -22,9 +22,11 @@ from .utils import is_cute_dsl_available, make_ptr, get_cutlass_dtype, get_num_s
 
 # Conditionally import CuTe-DSL kernels
 if is_cute_dsl_available():
+    # Re-export from new location for backwards compatibility
     from .blockscaled_gemm import (
         grouped_gemm_nt_masked,
         Sm100BlockScaledPersistentDenseGemmKernel,
+        create_scale_factor_tensor,
     )
     from .rmsnorm_fp4quant import (
         rmsnorm_fp4quant,
@@ -49,6 +51,7 @@ if is_cute_dsl_available():
         # Blockscaled GEMM
         "grouped_gemm_nt_masked",
         "Sm100BlockScaledPersistentDenseGemmKernel",
+        "create_scale_factor_tensor",
         # RMSNorm + FP4 Quantization
         "rmsnorm_fp4quant",
         "RMSNormFP4QuantKernel",

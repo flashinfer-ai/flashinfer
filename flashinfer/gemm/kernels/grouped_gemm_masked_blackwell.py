@@ -57,7 +57,12 @@ from cutlass._mlir.dialects import llvm
 from flashinfer.utils import get_compute_capability
 from flashinfer.api_logging import flashinfer_api
 from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
-from .utils import get_cutlass_dtype, cutlass_to_torch_dtype, get_num_sm, make_ptr
+from flashinfer.cute_dsl.utils import (
+    get_cutlass_dtype,
+    cutlass_to_torch_dtype,
+    get_num_sm,
+    make_ptr,
+)
 from typing import Callable, List
 
 
@@ -556,7 +561,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         )
         self.mma_warp_id = 4
         self.tma_warp_id = 5
-        self.threads_per_cta = 32 * len(
+        self.threads_per_warp = 32
+        self.threads_per_cta = self.threads_per_warp * len(
             (self.mma_warp_id, self.tma_warp_id, *self.epilog_warp_id)
         )
         # Set barrier id for cta sync, epilogue sync and tmem ptr sync
@@ -1062,8 +1068,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
 
         # Initialize acc_pipeline (barrier) and states
         acc_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
-        num_acc_consumer_threads = len(self.epilog_warp_id) * (
-            2 if use_2cta_instrs else 1
+        num_acc_consumer_threads = (
+            self.threads_per_warp
+            * len(self.epilog_warp_id)
+            * (2 if use_2cta_instrs else 1)
         )
         acc_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, num_acc_consumer_threads
@@ -1374,7 +1382,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             #
             # Bar sync for retrieve tensor memory ptr from shared mem
             #
-            tmem_ptr_read_threads = 32 * len((self.mma_warp_id, *self.epilog_warp_id))
+            tmem_ptr_read_threads = self.threads_per_warp * len(
+                (self.mma_warp_id, *self.epilog_warp_id)
+            )
             cute.arch.barrier(
                 barrier_id=self.tmem_ptr_sync_bar_id,
                 number_of_threads=tmem_ptr_read_threads,
@@ -1587,7 +1597,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             #
             # Bar sync for retrieve tensor memory ptr from shared memory
             #
-            tmem_ptr_read_threads = 32 * len((self.mma_warp_id, *self.epilog_warp_id))
+            tmem_ptr_read_threads = self.threads_per_warp * len(
+                (self.mma_warp_id, *self.epilog_warp_id)
+            )
             cute.arch.barrier(
                 barrier_id=self.tmem_ptr_sync_bar_id,
                 number_of_threads=tmem_ptr_read_threads,
@@ -1639,8 +1651,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             # Threads/warps participating in tma store pipeline
             c_producer_group = pipeline.CooperativeGroup(
                 pipeline.Agent.Thread,
-                32 * len(self.epilog_warp_id),
-                32 * len(self.epilog_warp_id),
+                self.threads_per_warp * len(self.epilog_warp_id),
+                self.threads_per_warp * len(self.epilog_warp_id),
             )
             c_pipeline = pipeline.PipelineTmaStore.create(
                 num_stages=self.num_c_stage,
@@ -1723,11 +1735,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         tRS_sC[(None, None, None, c_buffer)],
                     )
                     # Fence and barrier to make sure shared memory store is visible to TMA store
-                    cute.arch.fence_proxy(
-                        cute.arch.ProxyKind.async_shared,
-                        space=cute.arch.SharedSpace.shared_cta,
-                    )
-                    epilog_threads = 32 * len(self.epilog_warp_id)
+                    cute.arch.fence_proxy("async.shared", space="cta")
+                    epilog_threads = self.threads_per_warp * len(self.epilog_warp_id)
                     cute.arch.barrier(
                         barrier_id=self.epilog_sync_bar_id,
                         number_of_threads=epilog_threads,
@@ -1793,8 +1802,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 #
                 # Async arrive accumulator buffer empty
                 #
-                with cute.arch.elect_one():
-                    acc_pipeline.consumer_release(acc_consumer_state)
+                acc_pipeline.consumer_release(acc_consumer_state)
                 acc_consumer_state.advance()
 
                 #
@@ -1812,7 +1820,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             #
             if warp_idx == self.epilog_warp_id[0]:
                 cute.arch.relinquish_tmem_alloc_permit(is_two_cta=use_2cta_instrs)
-            epilog_threads = 32 * len(self.epilog_warp_id)
+            epilog_threads = self.threads_per_warp * len(self.epilog_warp_id)
             cute.arch.barrier(
                 barrier_id=self.epilog_sync_bar_id, number_of_threads=epilog_threads
             )

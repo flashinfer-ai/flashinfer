@@ -1,5 +1,7 @@
 import json
 import random
+
+import numpy as np
 import cutlass
 from flashinfer.cute_dsl.blockscaled_gemm import (
     create_scale_factor_tensor,
@@ -8,7 +10,7 @@ from flashinfer.cute_dsl.blockscaled_gemm import (
 import torch
 import cutlass.torch as cutlass_torch
 from flashinfer.cute_dsl.utils import get_cutlass_dtype
-from flashinfer.testing.utils import bench_kineto, count_bytes
+from flashinfer.testing.utils import bench_gpu_time, count_bytes
 
 
 ab_dtype = "float4_e2m1fn"
@@ -44,11 +46,15 @@ def bench_one(num_groups, max_m, expected_m_per_group, n, k):
             alpha_dtype="float32",
         )
 
-    t = bench_kineto(
+    times = bench_gpu_time(
         test_func,
-        "Sm100BlockScaledPersistentDenseGemmKernel",
-        suppress_kineto_output=True,
+        dry_run_iters=10,
+        repeat_iters=30,
+        enable_cupti=True,
+        use_cuda_graph=False,
+        cold_l2_cache=True,
     )
+    t = np.median(times)
 
     valid_m = data["masked_m"].sum().item()
     t_calibrated = t / valid_m * (expected_m_per_group * num_groups)

@@ -23,6 +23,19 @@ from .routergemm_dsv3 import (
     mm_M1_16_K7168_N256 as mm_M1_16_K7168_N256,
 )
 
+# Import CuTe-DSL kernels if available
+try:
+    from flashinfer.cute_dsl.utils import is_cute_dsl_available
+
+    if is_cute_dsl_available():
+        from .kernels import (
+            grouped_gemm_nt_masked as grouped_gemm_nt_masked,
+            Sm100BlockScaledPersistentDenseGemmKernel as Sm100BlockScaledPersistentDenseGemmKernel,
+            create_scale_factor_tensor as create_scale_factor_tensor,
+        )
+except ImportError:
+    pass
+
 __all__ = [
     "SegmentGEMMWrapper",
     "bmm_bf16",
@@ -42,3 +55,16 @@ __all__ = [
     "mm_M1_16_K7168_N128",
     "mm_M1_16_K7168_N256",
 ]
+
+# Add CuTe-DSL kernels to __all__ if available
+try:
+    from flashinfer.cute_dsl.utils import is_cute_dsl_available
+
+    if is_cute_dsl_available():
+        __all__ += [
+            "grouped_gemm_nt_masked",
+            "Sm100BlockScaledPersistentDenseGemmKernel",
+            "create_scale_factor_tensor",
+        ]
+except ImportError:
+    pass
