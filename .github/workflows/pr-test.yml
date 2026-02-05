@@ -1,20 +1,18 @@
-# CI workflow using AWS self-hosted runners.
-# Runs AOT build tests and GPU unit tests on push/PR to main.
-# Uses ci/bash.sh for Docker execution (same as Jenkins).
+# CI Gateway workflow - Creates check runs and triggers test runner
+#
+# Architecture:
+# 1. This workflow (gateway) runs on pull_request/push/workflow_dispatch
+# 2. For PRs: Creates custom check runs via GitHub App
+# 3. Triggers pr-test-runner.yml to run actual tests
+# 4. PR status shows our check runs (not the runner's internal jobs)
+#
+# This design ensures failed spot attempts don't pollute the PR status.
 #
 # Permission Control:
 # - Push to main: Always runs
 # - PR from org members (ci-users team): Runs automatically
 # - PR from external contributors: Requires 'run-ci' label
 #   (added via @flashinfer-bot run command from authorized user)
-#
-# Rerun Strategy:
-# - Spot jobs run with fail-fast: true
-# - Background monitor checks AWS metadata for spot termination notice
-# - If termination detected, writes marker to log (captured by GitHub)
-# - Analyze job checks logs for marker to decide if should rerun
-# - Spot termination: rerun all failed/cancelled jobs on on-demand
-# - Real failure: no rerun, workflow fails fast
 
 name: PR Test
 
@@ -42,7 +40,7 @@ concurrency:
 permissions:
   contents: read
   pull-requests: write
-  actions: read
+  actions: write
 
 env:
   EXECUTOR_NUMBER: "0"
@@ -128,10 +126,20 @@ jobs:
     outputs:
       docker_tag: ${{ steps.get-tag.outputs.tag }}
       skip_build: ${{ steps.check.outputs.skip }}
+      head_sha: ${{ steps.get-sha.outputs.sha }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Get HEAD SHA
+        id: get-sha
+        run: |
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            echo "sha=${{ github.event.pull_request.head.sha }}" >> $GITHUB_OUTPUT
+          else
+            echo "sha=${{ github.sha }}" >> $GITHUB_OUTPUT
+          fi
 
       - name: Get Docker Tag
         id: get-tag
@@ -173,557 +181,133 @@ jobs:
           fi
 
   # ---------------------------------------------------------------------------
-  # AOT Build Import Tests (Spot + On-Demand Rerun)
+  # Orchestrator - Create check runs and trigger test runner
   # ---------------------------------------------------------------------------
-  aot-build-import:
-    name: AOT Build Import (${{ matrix.arch }}, ${{ matrix.cuda }})
+  orchestrator:
+    name: Orchestrate Tests
     needs: [gate, setup]
     if: |
       needs.gate.outputs.authorized == 'true' &&
-      needs.setup.outputs.skip_build != 'true' &&
-      github.event.inputs.skip_aot != 'true'
-    runs-on:
-      - self-hosted
-      - Linux
-      - ${{ matrix.arch }}
-      - cpu
-      - spot
-    timeout-minutes: 360
-    strategy:
-      fail-fast: true
-      matrix:
-        arch: [X64, ARM64]
-        cuda: [cu126, cu128, cu129, cu130]
-    env:
-      DOCKER_IMAGE: flashinfer/flashinfer-ci-${{ matrix.cuda }}:${{ needs.setup.outputs.docker_tag }}
-    steps:
-      - name: Cleanup
-        run: |
-          # Stop all Docker containers to free memory
-          docker stop $(docker ps -q) 2>/dev/null || true
-          docker rm $(docker ps -aq) 2>/dev/null || true
-          # Clean workspace and caches
-          sudo rm -rf ${{ github.workspace }}/* || true
-          sudo rm -rf ${{ github.workspace }}/.[!.]* || true
-          rm -rf ~/.cache/flashinfer_jit || true
-          docker system prune -f || true
-
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - name: Start spot termination monitor
-        run: ./scripts/task_monitor_spot.sh &
-
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: flashinfer
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-        continue-on-error: true
-
-      - name: Show Node Info
-        run: ./scripts/task_show_node_info.sh
-        env:
-          NODE_NAME: ${{ runner.name }}
-          WORKSPACE: ${{ github.workspace }}
-          BUILD_NUMBER: ${{ github.run_number }}
-
-      - name: Run Test
-        run: bash ci/bash.sh ${DOCKER_IMAGE} --no-gpu ./scripts/task_test_jit_cache_package_build_import.sh
-
-  analyze-aot-failure:
-    name: Analyze AOT Failure
-    needs: [setup, aot-build-import]
-    if: "!cancelled() && (needs.aot-build-import.result == 'failure' || needs.aot-build-import.result == 'cancelled')"
+      needs.setup.outputs.skip_build != 'true'
     runs-on: ubuntu-latest
-    outputs:
-      is_spot_termination: ${{ steps.analyze.outputs.is_spot_termination }}
-      rerun_matrix: ${{ steps.matrix.outputs.rerun_matrix }}
     steps:
-      - name: Analyze failure from job logs
-        id: analyze
+      - name: Generate GitHub App Token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.FLASHINFER_CI_APP_ID }}
+          private-key: ${{ secrets.FLASHINFER_CI_APP_PRIVATE_KEY }}
+
+      - name: Create Check Runs (PR only)
+        id: create-checks
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          SHA="${{ needs.setup.outputs.head_sha }}"
+          REPO="${{ github.repository }}"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          echo "Creating check runs for SHA: $SHA"
+
+          # Create AOT Build check run
+          if [ "${{ github.event.inputs.skip_aot }}" != "true" ]; then
+            AOT_CHECK=$(gh api repos/$REPO/check-runs \
+              -f name="CI: AOT Build Tests" \
+              -f head_sha="$SHA" \
+              -f status="in_progress" \
+              -F output[title]="Running AOT build tests..." \
+              -F output[summary]="Tests running on spot instances. [View workflow run]($RUN_URL)" \
+              --jq '.id')
+            echo "Created AOT check run: $AOT_CHECK"
+            echo "aot_check_id=$AOT_CHECK" >> $GITHUB_OUTPUT
+          fi
+
+          # Create GPU A10G check run
+          if [ "${{ github.event.inputs.skip_gpu }}" != "true" ]; then
+            A10G_CHECK=$(gh api repos/$REPO/check-runs \
+              -f name="CI: GPU Tests (A10G)" \
+              -f head_sha="$SHA" \
+              -f status="in_progress" \
+              -F output[title]="Running GPU tests on A10G..." \
+              -F output[summary]="Tests running on spot instances. [View workflow run]($RUN_URL)" \
+              --jq '.id')
+            echo "Created GPU A10G check run: $A10G_CHECK"
+            echo "gpu_a10g_check_id=$A10G_CHECK" >> $GITHUB_OUTPUT
+
+            # Create GPU T4 check run
+            T4_CHECK=$(gh api repos/$REPO/check-runs \
+              -f name="CI: GPU Tests (T4)" \
+              -f head_sha="$SHA" \
+              -f status="in_progress" \
+              -F output[title]="Running GPU tests on T4..." \
+              -F output[summary]="Tests running on spot instances. [View workflow run]($RUN_URL)" \
+              --jq '.id')
+            echo "Created GPU T4 check run: $T4_CHECK"
+            echo "gpu_t4_check_id=$T4_CHECK" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Trigger Test Runner
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          REPO="${{ github.repository }}"
+          REF="${{ github.ref }}"
+
+          # For PRs, use the PR head ref; for push/dispatch, use the current ref
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            # Use the base branch (main) to trigger workflow_dispatch
+            # The runner will checkout the PR SHA
+            DISPATCH_REF="main"
+          else
+            DISPATCH_REF="${{ github.ref_name }}"
+          fi
+
+          echo "Triggering pr-test-runner.yml on ref: $DISPATCH_REF"
+
+          gh workflow run pr-test-runner.yml \
+            --repo "$REPO" \
+            --ref "$DISPATCH_REF" \
+            -f pr_head_sha="${{ needs.setup.outputs.head_sha }}" \
+            -f docker_tag="${{ needs.setup.outputs.docker_tag }}" \
+            -f aot_check_id="${{ steps.create-checks.outputs.aot_check_id || '' }}" \
+            -f gpu_a10g_check_id="${{ steps.create-checks.outputs.gpu_a10g_check_id || '' }}" \
+            -f gpu_t4_check_id="${{ steps.create-checks.outputs.gpu_t4_check_id || '' }}" \
+            -f skip_aot="${{ github.event.inputs.skip_aot || 'false' }}" \
+            -f skip_gpu="${{ github.event.inputs.skip_gpu || 'false' }}"
+
+          echo "Test runner workflow triggered successfully"
+
+      - name: Summary
+        run: |
+          echo "## PR Test Gateway" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**SHA:** ${{ needs.setup.outputs.head_sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Docker Tag:** ${{ needs.setup.outputs.docker_tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            echo "### Check Runs Created" >> $GITHUB_STEP_SUMMARY
+            echo "- AOT Build: ${{ steps.create-checks.outputs.aot_check_id || 'skipped' }}" >> $GITHUB_STEP_SUMMARY
+            echo "- GPU A10G: ${{ steps.create-checks.outputs.gpu_a10g_check_id || 'skipped' }}" >> $GITHUB_STEP_SUMMARY
+            echo "- GPU T4: ${{ steps.create-checks.outputs.gpu_t4_check_id || 'skipped' }}" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Test runner workflow has been triggered." >> $GITHUB_STEP_SUMMARY
+
+  # ---------------------------------------------------------------------------
+  # Report unauthorized PRs
+  # ---------------------------------------------------------------------------
+  report-unauthorized:
+    name: Report Unauthorized
+    needs: gate
+    if: github.event_name == 'pull_request' && needs.gate.outputs.authorized != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post Comment
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          RUN_ID="${{ github.run_id }}"
-          SPOT_TERMINATION=false
-          # Include both failed and cancelled jobs (spot termination can cause either)
-          FAILED_JOBS=$(gh api "/repos/${{ github.repository }}/actions/runs/${RUN_ID}/jobs?per_page=100" \
-            --jq '.jobs[] | select(.name | startswith("AOT")) | select(.conclusion == "failure" or .conclusion == "cancelled") | .id')
-          if [ -z "$FAILED_JOBS" ]; then
-            echo "is_spot_termination=false" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-          for JOB_ID in $FAILED_JOBS; do
-            # Download logs (may be ZIP or plain text depending on GitHub API)
-            if ! gh api "/repos/${{ github.repository }}/actions/jobs/${JOB_ID}/logs" > job_log.zip 2>/dev/null; then
-              continue
-            fi
-            # Try to unzip if it's a ZIP file, otherwise use as-is
-            if file job_log.zip | grep -q "Zip archive"; then
-              unzip -p job_log.zip > job_log.txt 2>/dev/null || mv job_log.zip job_log.txt
-            else
-              mv job_log.zip job_log.txt
-            fi
-            if grep -q "FLASHINFER_SPOT_TERMINATION_DETECTED" job_log.txt; then
-              echo "Detected: AWS spot termination marker (job $JOB_ID)"
-              SPOT_TERMINATION=true
-              break
-            fi
-            if grep -qiE "connection reset by peer|context canceled|grpc.*closing|The self-hosted runner.*lost" job_log.txt; then
-              echo "Detected: infrastructure error pattern (job $JOB_ID)"
-              SPOT_TERMINATION=true
-              break
-            fi
-          done
-          echo "is_spot_termination=$SPOT_TERMINATION"
-          echo "is_spot_termination=$SPOT_TERMINATION" >> $GITHUB_OUTPUT
-
-      - name: Build rerun matrix
-        id: matrix
-        if: steps.analyze.outputs.is_spot_termination == 'true'
-        run: |
-          MATRIX='{"include":['
-          for arch in X64 ARM64; do
-            for cuda in cu126 cu128 cu129 cu130; do
-              MATRIX+='{"arch":"'$arch'","cuda":"'$cuda'"},'
-            done
-          done
-          MATRIX="${MATRIX%,}]}"
-          echo "rerun_matrix=$MATRIX" >> $GITHUB_OUTPUT
-
-  aot-build-import-rerun:
-    name: AOT Build Import Rerun (${{ matrix.arch }}, ${{ matrix.cuda }})
-    needs: [setup, analyze-aot-failure]
-    if: |
-      !cancelled() &&
-      needs.analyze-aot-failure.outputs.is_spot_termination == 'true' &&
-      needs.analyze-aot-failure.outputs.rerun_matrix != ''
-    runs-on:
-      - self-hosted
-      - Linux
-      - ${{ matrix.arch }}
-      - cpu
-      - on-demand
-    timeout-minutes: 360
-    strategy:
-      fail-fast: true
-      matrix: ${{ fromJSON(needs.analyze-aot-failure.outputs.rerun_matrix) }}
-    env:
-      DOCKER_IMAGE: flashinfer/flashinfer-ci-${{ matrix.cuda }}:${{ needs.setup.outputs.docker_tag }}
-    steps:
-      - name: Cleanup
-        run: |
-          # Stop all Docker containers to free memory
-          docker stop $(docker ps -q) 2>/dev/null || true
-          docker rm $(docker ps -aq) 2>/dev/null || true
-          # Clean workspace and caches
-          sudo rm -rf ${{ github.workspace }}/* || true
-          sudo rm -rf ${{ github.workspace }}/.[!.]* || true
-          rm -rf ~/.cache/flashinfer_jit || true
-          docker system prune -f || true
-
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: flashinfer
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-        continue-on-error: true
-
-      - name: Show Node Info
-        run: ./scripts/task_show_node_info.sh
-        env:
-          NODE_NAME: ${{ runner.name }}
-          WORKSPACE: ${{ github.workspace }}
-          BUILD_NUMBER: ${{ github.run_number }}
-
-      - name: Run Test
-        run: bash ci/bash.sh ${DOCKER_IMAGE} --no-gpu ./scripts/task_test_jit_cache_package_build_import.sh
-
-  # ---------------------------------------------------------------------------
-  # GPU JIT Tests - SM86 (A10G) - Spot + On-Demand Rerun
-  # ---------------------------------------------------------------------------
-  gpu-tests-a10g:
-    name: JIT Unittest ${{ matrix.shard }} (A10G)
-    needs: [gate, setup]
-    if: |
-      needs.gate.outputs.authorized == 'true' &&
-      needs.setup.outputs.skip_build != 'true' &&
-      github.event.inputs.skip_gpu != 'true'
-    runs-on: [self-hosted, Linux, X64, gpu, sm86, spot]
-    timeout-minutes: 360
-    strategy:
-      fail-fast: true
-      matrix:
-        shard: [1, 2, 3, 4, 5]
-    env:
-      DOCKER_IMAGE: flashinfer/flashinfer-ci-cu129:${{ needs.setup.outputs.docker_tag }}
-    steps:
-      - name: Cleanup
-        run: |
-          # Stop all Docker containers to free memory
-          docker stop $(docker ps -q) 2>/dev/null || true
-          docker rm $(docker ps -aq) 2>/dev/null || true
-          # Clean workspace and caches
-          sudo rm -rf ${{ github.workspace }}/* || true
-          sudo rm -rf ${{ github.workspace }}/.[!.]* || true
-          rm -rf ~/.cache/flashinfer_jit || true
-          docker system prune -f || true
-          nvidia-smi || true
-
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - name: Start spot termination monitor
-        run: ./scripts/task_monitor_spot.sh &
-
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: flashinfer
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-        continue-on-error: true
-
-      - name: Show Node Info
-        run: ./scripts/task_show_node_info.sh
-        env:
-          NODE_NAME: ${{ runner.name }}
-          WORKSPACE: ${{ github.workspace }}
-          BUILD_NUMBER: ${{ github.run_number }}
-
-      - name: Run JIT Unittest Part ${{ matrix.shard }}
-        run: bash ci/bash.sh ${DOCKER_IMAGE} ./scripts/task_jit_run_tests_part${{ matrix.shard }}.sh
-
-  analyze-gpu-a10g-failure:
-    name: Analyze GPU A10G Failure
-    needs: [setup, gpu-tests-a10g]
-    if: "!cancelled() && (needs.gpu-tests-a10g.result == 'failure' || needs.gpu-tests-a10g.result == 'cancelled')"
-    runs-on: ubuntu-latest
-    outputs:
-      is_spot_termination: ${{ steps.analyze.outputs.is_spot_termination }}
-      rerun_matrix: ${{ steps.matrix.outputs.rerun_matrix }}
-    steps:
-      - name: Analyze failure from job logs
-        id: analyze
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          RUN_ID="${{ github.run_id }}"
-          SPOT_TERMINATION=false
-          # Include both failed and cancelled jobs (spot termination can cause either)
-          FAILED_JOBS=$(gh api "/repos/${{ github.repository }}/actions/runs/${RUN_ID}/jobs?per_page=100" \
-            --jq '.jobs[] | select(.name | contains("A10G")) | select(.conclusion == "failure" or .conclusion == "cancelled") | .id')
-          if [ -z "$FAILED_JOBS" ]; then
-            echo "is_spot_termination=false" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-          for JOB_ID in $FAILED_JOBS; do
-            # Download logs (may be ZIP or plain text depending on GitHub API)
-            if ! gh api "/repos/${{ github.repository }}/actions/jobs/${JOB_ID}/logs" > job_log.zip 2>/dev/null; then
-              continue
-            fi
-            # Try to unzip if it's a ZIP file, otherwise use as-is
-            if file job_log.zip | grep -q "Zip archive"; then
-              unzip -p job_log.zip > job_log.txt 2>/dev/null || mv job_log.zip job_log.txt
-            else
-              mv job_log.zip job_log.txt
-            fi
-            if grep -q "FLASHINFER_SPOT_TERMINATION_DETECTED" job_log.txt; then
-              echo "Detected: AWS spot termination marker (job $JOB_ID)"
-              SPOT_TERMINATION=true
-              break
-            fi
-            if grep -qiE "connection reset by peer|context canceled|grpc.*closing|The self-hosted runner.*lost" job_log.txt; then
-              echo "Detected: infrastructure error pattern (job $JOB_ID)"
-              SPOT_TERMINATION=true
-              break
-            fi
-          done
-          echo "is_spot_termination=$SPOT_TERMINATION"
-          echo "is_spot_termination=$SPOT_TERMINATION" >> $GITHUB_OUTPUT
-
-      - name: Build rerun matrix
-        id: matrix
-        if: steps.analyze.outputs.is_spot_termination == 'true'
-        run: |
-          echo 'rerun_matrix={"include":[{"shard":1},{"shard":2},{"shard":3},{"shard":4},{"shard":5}]}' >> $GITHUB_OUTPUT
-
-  gpu-tests-a10g-rerun:
-    name: JIT Rerun ${{ matrix.shard }} (A10G)
-    needs: [setup, analyze-gpu-a10g-failure]
-    if: |
-      !cancelled() &&
-      needs.analyze-gpu-a10g-failure.outputs.is_spot_termination == 'true' &&
-      needs.analyze-gpu-a10g-failure.outputs.rerun_matrix != ''
-    runs-on: [self-hosted, Linux, X64, gpu, sm86, on-demand]
-    timeout-minutes: 360
-    strategy:
-      fail-fast: true
-      matrix: ${{ fromJSON(needs.analyze-gpu-a10g-failure.outputs.rerun_matrix) }}
-    env:
-      DOCKER_IMAGE: flashinfer/flashinfer-ci-cu129:${{ needs.setup.outputs.docker_tag }}
-    steps:
-      - name: Cleanup
-        run: |
-          # Stop all Docker containers to free memory
-          docker stop $(docker ps -q) 2>/dev/null || true
-          docker rm $(docker ps -aq) 2>/dev/null || true
-          # Clean workspace and caches
-          sudo rm -rf ${{ github.workspace }}/* || true
-          sudo rm -rf ${{ github.workspace }}/.[!.]* || true
-          rm -rf ~/.cache/flashinfer_jit || true
-          docker system prune -f || true
-          nvidia-smi || true
-
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: flashinfer
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-        continue-on-error: true
-
-      - name: Show Node Info
-        run: ./scripts/task_show_node_info.sh
-        env:
-          NODE_NAME: ${{ runner.name }}
-          WORKSPACE: ${{ github.workspace }}
-          BUILD_NUMBER: ${{ github.run_number }}
-
-      - name: Run JIT Unittest Part ${{ matrix.shard }}
-        run: bash ci/bash.sh ${DOCKER_IMAGE} ./scripts/task_jit_run_tests_part${{ matrix.shard }}.sh
-
-  # ---------------------------------------------------------------------------
-  # GPU JIT Tests - SM75 (T4) - Spot + On-Demand Rerun
-  # ---------------------------------------------------------------------------
-  gpu-tests-t4:
-    name: JIT Unittest (T4)
-    needs: [gate, setup]
-    if: |
-      needs.gate.outputs.authorized == 'true' &&
-      needs.setup.outputs.skip_build != 'true' &&
-      github.event.inputs.skip_gpu != 'true'
-    runs-on: [self-hosted, Linux, X64, gpu, sm75, spot]
-    timeout-minutes: 360
-    env:
-      DOCKER_IMAGE: flashinfer/flashinfer-ci-cu129:${{ needs.setup.outputs.docker_tag }}
-    steps:
-      - name: Cleanup
-        run: |
-          # Stop all Docker containers to free memory
-          docker stop $(docker ps -q) 2>/dev/null || true
-          docker rm $(docker ps -aq) 2>/dev/null || true
-          # Clean workspace and caches
-          sudo rm -rf ${{ github.workspace }}/* || true
-          sudo rm -rf ${{ github.workspace }}/.[!.]* || true
-          rm -rf ~/.cache/flashinfer_jit || true
-          docker system prune -f || true
-          nvidia-smi || true
-
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - name: Start spot termination monitor
-        run: ./scripts/task_monitor_spot.sh &
-
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: flashinfer
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-        continue-on-error: true
-
-      - name: Show Node Info
-        run: ./scripts/task_show_node_info.sh
-        env:
-          NODE_NAME: ${{ runner.name }}
-          WORKSPACE: ${{ github.workspace }}
-          BUILD_NUMBER: ${{ github.run_number }}
-
-      - name: Run JIT Unittest Part 3 (T4)
-        run: bash ci/bash.sh ${DOCKER_IMAGE} ./scripts/task_jit_run_tests_part3.sh
-
-  analyze-gpu-t4-failure:
-    name: Analyze GPU T4 Failure
-    needs: [setup, gpu-tests-t4]
-    if: "!cancelled() && (needs.gpu-tests-t4.result == 'failure' || needs.gpu-tests-t4.result == 'cancelled')"
-    runs-on: ubuntu-latest
-    outputs:
-      is_spot_termination: ${{ steps.analyze.outputs.is_spot_termination }}
-    steps:
-      - name: Analyze failure from job logs
-        id: analyze
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          RUN_ID="${{ github.run_id }}"
-          SPOT_TERMINATION=false
-          # Include both failed and cancelled jobs (spot termination can cause either)
-          FAILED_JOBS=$(gh api "/repos/${{ github.repository }}/actions/runs/${RUN_ID}/jobs?per_page=100" \
-            --jq '.jobs[] | select(.name | contains("T4")) | select(.conclusion == "failure" or .conclusion == "cancelled") | .id')
-          if [ -z "$FAILED_JOBS" ]; then
-            echo "is_spot_termination=false" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-          for JOB_ID in $FAILED_JOBS; do
-            # Download logs (may be ZIP or plain text depending on GitHub API)
-            if ! gh api "/repos/${{ github.repository }}/actions/jobs/${JOB_ID}/logs" > job_log.zip 2>/dev/null; then
-              continue
-            fi
-            # Try to unzip if it's a ZIP file, otherwise use as-is
-            if file job_log.zip | grep -q "Zip archive"; then
-              unzip -p job_log.zip > job_log.txt 2>/dev/null || mv job_log.zip job_log.txt
-            else
-              mv job_log.zip job_log.txt
-            fi
-            if grep -q "FLASHINFER_SPOT_TERMINATION_DETECTED" job_log.txt; then
-              echo "Detected: AWS spot termination marker (job $JOB_ID)"
-              SPOT_TERMINATION=true
-              break
-            fi
-            if grep -qiE "connection reset by peer|context canceled|grpc.*closing|The self-hosted runner.*lost" job_log.txt; then
-              echo "Detected: infrastructure error pattern (job $JOB_ID)"
-              SPOT_TERMINATION=true
-              break
-            fi
-          done
-          echo "is_spot_termination=$SPOT_TERMINATION"
-          echo "is_spot_termination=$SPOT_TERMINATION" >> $GITHUB_OUTPUT
-
-  gpu-tests-t4-rerun:
-    name: JIT Rerun (T4)
-    needs: [setup, analyze-gpu-t4-failure]
-    if: |
-      !cancelled() &&
-      needs.analyze-gpu-t4-failure.outputs.is_spot_termination == 'true'
-    runs-on: [self-hosted, Linux, X64, gpu, sm75, on-demand]
-    timeout-minutes: 360
-    env:
-      DOCKER_IMAGE: flashinfer/flashinfer-ci-cu129:${{ needs.setup.outputs.docker_tag }}
-    steps:
-      - name: Cleanup
-        run: |
-          # Stop all Docker containers to free memory
-          docker stop $(docker ps -q) 2>/dev/null || true
-          docker rm $(docker ps -aq) 2>/dev/null || true
-          # Clean workspace and caches
-          sudo rm -rf ${{ github.workspace }}/* || true
-          sudo rm -rf ${{ github.workspace }}/.[!.]* || true
-          rm -rf ~/.cache/flashinfer_jit || true
-          docker system prune -f || true
-          nvidia-smi || true
-
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: flashinfer
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-        continue-on-error: true
-
-      - name: Show Node Info
-        run: ./scripts/task_show_node_info.sh
-        env:
-          NODE_NAME: ${{ runner.name }}
-          WORKSPACE: ${{ github.workspace }}
-          BUILD_NUMBER: ${{ github.run_number }}
-
-      - name: Run JIT Unittest Part 3 (T4)
-        run: bash ci/bash.sh ${DOCKER_IMAGE} ./scripts/task_jit_run_tests_part3.sh
-
-  # ---------------------------------------------------------------------------
-  # Test Results Summary
-  # ---------------------------------------------------------------------------
-  test-results-summary:
-    name: Test Results Summary
-    if: "!cancelled()"
-    needs:
-      - gate
-      - setup
-      - aot-build-import
-      - analyze-aot-failure
-      - aot-build-import-rerun
-      - gpu-tests-a10g
-      - analyze-gpu-a10g-failure
-      - gpu-tests-a10g-rerun
-      - gpu-tests-t4
-      - analyze-gpu-t4-failure
-      - gpu-tests-t4-rerun
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check Results
-        run: |
-          echo "## Test Results Summary" >> $GITHUB_STEP_SUMMARY
-
-          # Check if CI was skipped due to permissions
-          if [ "${{ needs.gate.outputs.authorized }}" != "true" ]; then
-            echo "CI skipped (pending authorization)" >> $GITHUB_STEP_SUMMARY
-            echo "A contributor in @flashinfer-ai/ci-users can comment \`@flashinfer-bot run\` to approve." >> $GITHUB_STEP_SUMMARY
-            exit 0
-          fi
-          # Helper function to check job status
-          check_status() {
-            local name=$1 skip=$2 spot=$3 spot_term=$4 rerun=$5
-            echo "$name" >> $GITHUB_STEP_SUMMARY
-            if [ "$skip" == "true" ]; then
-              echo "- Status: Skipped" >> $GITHUB_STEP_SUMMARY
-            elif [ "$spot" == "success" ]; then
-              echo "- Status: Passed (spot)" >> $GITHUB_STEP_SUMMARY
-            elif [ "$spot_term" == "true" ] && [ "$rerun" == "success" ]; then
-              echo "- Status: Passed (on-demand rerun)" >> $GITHUB_STEP_SUMMARY
-            else
-              echo "- Status: Failed" >> $GITHUB_STEP_SUMMARY
-              return 1
-            fi
-            return 0
-          }
-
-          echo "Test Results Summary" >> $GITHUB_STEP_SUMMARY
+          echo "## CI Authorization Required" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-
-          if [ "${{ needs.setup.outputs.skip_build }}" == "true" ]; then
-            echo "Build skipped (docs/config only changes)" >> $GITHUB_STEP_SUMMARY
-            exit 0
-          fi
-
-          FAILED=false
-
-          check_status "AOT Build Import Tests" \
-            "${{ github.event.inputs.skip_aot }}" \
-            "${{ needs.aot-build-import.result }}" \
-            "${{ needs.analyze-aot-failure.outputs.is_spot_termination }}" \
-            "${{ needs.aot-build-import-rerun.result }}" || FAILED=true
-
-          echo "" >> $GITHUB_STEP_SUMMARY
-          check_status "GPU Tests (A10G)" \
-            "${{ github.event.inputs.skip_gpu }}" \
-            "${{ needs.gpu-tests-a10g.result }}" \
-            "${{ needs.analyze-gpu-a10g-failure.outputs.is_spot_termination }}" \
-            "${{ needs.gpu-tests-a10g-rerun.result }}" || FAILED=true
-
-          echo "" >> $GITHUB_STEP_SUMMARY
-          check_status "GPU Tests (T4)" \
-            "${{ github.event.inputs.skip_gpu }}" \
-            "${{ needs.gpu-tests-t4.result }}" \
-            "${{ needs.analyze-gpu-t4-failure.outputs.is_spot_termination }}" \
-            "${{ needs.gpu-tests-t4-rerun.result }}" || FAILED=true
-
-          echo "" >> $GITHUB_STEP_SUMMARY
-          if [ "$FAILED" == "true" ]; then
-            echo "Result: Tests Failed" >> $GITHUB_STEP_SUMMARY
-            exit 1
-          fi
-          echo "Result: Tests Passed" >> $GITHUB_STEP_SUMMARY
+          echo "This PR requires authorization to run CI." >> $GITHUB_STEP_SUMMARY
+          echo "A member of @flashinfer-ai/ci-users can comment \`@flashinfer-bot run\` to approve." >> $GITHUB_STEP_SUMMARY
