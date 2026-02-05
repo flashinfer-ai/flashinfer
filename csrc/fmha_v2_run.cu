@@ -291,37 +291,24 @@ static inline Data_type dltype_to_data_type(DLDataType dtype) {
   return DATA_TYPE_FP16;
 }
 
-////////////////////////////////////////////////////////////////////////////////////////////////////
-// Main run function - called by fmha_v2_jit_binding.cu
-////////////////////////////////////////////////////////////////////////////////////////////////////
 
-void fmha_v2_paged_run(ffi::TensorView q, ffi::TensorView k, ffi::TensorView v, ffi::TensorView o,
-                       ffi::TensorView workspace_buffer, size_t workspace_buffer_size_in_bytes,
-                       ffi::TensorView block_tables, int page_size, ffi::TensorView seq_lens,
-                       ffi::TensorView cum_seq_lens_q, ffi::TensorView cum_seq_lens_kv,
-                       Attention_input_layout input_layout, Data_type output_dtype, int max_q_len,
-                       int max_kv_len, int batch_size, int64_t mask_mode_code, float scale_softmax,
-                       float scale_bmm1, float scale_bmm2, int window_left,
-                       int chunked_attention_size, bool has_alibi, float softcapping_scale,
-                       Optional<ffi::TensorView> softmax_stats, Optional<ffi::TensorView> sinks) {
-  // TODO: Implement paged run
+static inline Attention_mask_type string_to_mask_type(const std::string& s) {
+  if (s == "padding") return Attention_mask_type::PADDING;
+  if (s == "causal") return Attention_mask_type::CAUSAL;
+  if (s == "sliding_window" || s == "chunked")
+    return Attention_mask_type::SLIDING_OR_CHUNKED_CAUSAL;
+  if (s == "custom") return Attention_mask_type::CUSTOM_MASK;
+  return Attention_mask_type::CAUSAL;  // default
 }
 
-void fmha_v2_ragged_run(ffi::TensorView q, ffi::TensorView k, ffi::TensorView v, ffi::TensorView o,
-                        ffi::TensorView workspace_buffer, size_t workspace_buffer_size_in_bytes,
-                        ffi::TensorView block_tables, int page_size, ffi::TensorView seq_lens,
-                        ffi::TensorView cum_seq_lens_q, ffi::TensorView cum_seq_lens_kv,
-                        Attention_input_layout input_layout, Data_type output_dtype, int max_q_len,
-                        int max_kv_len, int batch_size, int64_t mask_mode_code, float scale_softmax,
-                        float scale_bmm1, float scale_bmm2, int window_left,
-                        int chunked_attention_size, bool has_alibi, float softcapping_scale,
-                        Optional<ffi::TensorView> softmax_stats, Optional<ffi::TensorView> sinks) {
-  fmha_v2_paged_run(q, k, v, o, workspace_buffer, workspace_buffer_size_in_bytes, block_tables,
-                    page_size, seq_lens, cum_seq_lens_q, cum_seq_lens_kv, input_layout,
-                    output_dtype, max_q_len, max_kv_len, batch_size, mask_mode_code, scale_softmax,
-                    scale_bmm1, scale_bmm2, window_left, chunked_attention_size, has_alibi,
-                    softcapping_scale, softmax_stats, sinks);
+static inline Attention_input_layout string_to_input_layout(const std::string& s) {
+  if (s == "packed_qkv") return Attention_input_layout::PACKED_QKV;
+  if (s == "contiguous_q_kv") return Attention_input_layout::CONTIGUOUS_Q_KV;
+  if (s == "q_paged_kv") return Attention_input_layout::Q_PAGED_KV;
+  if (s == "separate_q_k_v") return Attention_input_layout::SEPARATE_Q_K_V;
+  return Attention_input_layout::Q_PAGED_KV;  // default
 }
+
 
 void fmha_v2_run(
     ffi::TensorView q,  // [batch, s_q, num_heads, head_dim]
@@ -334,19 +321,18 @@ void fmha_v2_run(
     ffi::TensorView seq_lens,         // [batch]
     ffi::TensorView cum_seq_lens_q,   // [batch + 1]
     ffi::TensorView cum_seq_lens_kv,  // [batch + 1]
-    int input_layout_int,             // Cast from int for TVM FFI compatibility
-    int output_dtype_int,             // Cast from int for TVM FFI compatibility
+    const std::string& input_layout_str,
     int max_q_len, int max_kv_len, int batch_size, int total_q_tokens,
     int total_kv_tokens,     // Totals from cum_seq_lens (computed in Python)
-    int64_t mask_mode_code,  // 0=PADDING, 1=CAUSAL, 2=SLIDING_OR_CHUNKED_CAUSAL, 3=CUSTOM_MASK
+    const std::string& mask_mode_str,
     float scale_softmax, float scale_bmm1, float scale_bmm2, int window_left,
     int chunked_attention_size, bool has_alibi, float softcapping_scale,
     ffi::TensorView scale_bmm2_d,             // Pre-populated scale_bmm2 on device [1] int32
     Optional<ffi::TensorView> softmax_stats,  // Optional [batch, s_q, num_heads, 2] for (max, sum)
     Optional<ffi::TensorView> sinks) {
-  // Cast int parameters to enum types
-  Attention_input_layout input_layout = static_cast<Attention_input_layout>(input_layout_int);
-  Data_type output_dtype = static_cast<Data_type>(output_dtype_int);
+  Attention_input_layout input_layout = string_to_input_layout(input_layout_str);
+  Attention_mask_type attention_mask_type = string_to_mask_type(mask_mode_str);
+  Data_type output_dtype = dltype_to_data_type(o.dtype());
   // Get device properties
   CudaDevice device;
   int sm = device.sm;
@@ -395,19 +381,17 @@ void fmha_v2_run(
   // Determine data types from input tensors
   Data_type data_type = dltype_to_data_type(q.dtype());
   Data_type acc_type =
-      (data_type == DATA_TYPE_BF16 || data_type == DATA_TYPE_FP16) ? DATA_TYPE_FP32 : data_type;
+      (data_type == DATA_TYPE_BF16 || data_type == DATA_TYPE_E4M3) ? DATA_TYPE_FP32 : data_type;
 
   int tokens_per_block = page_size;
   float softcapping_scale_bmm1 = softcapping_scale;
 
-  // BF16 requires FP32 accumulation, but FP16 kernels use FP16 accumulation.
+  // BF16 and E4M3 require FP32 accumulation, but FP16 kernels use FP16 accumulation.
   // The generated kernel dispatch expects:
   // - FP16 kernels: !force_fp32_acc (force_fp32_acc = false)
   // - BF16 kernels: force_fp32_acc (force_fp32_acc = true)
-  bool force_fp32_acc = (data_type == DATA_TYPE_BF16);
-
-  // Determine attention mask type from mask_mode_code
-  Attention_mask_type attention_mask_type = static_cast<Attention_mask_type>(mask_mode_code);
+  // - E4M3 kernels: force_fp32_acc (force_fp32_acc = true)
+  bool force_fp32_acc = (data_type == DATA_TYPE_BF16 || data_type == DATA_TYPE_E4M3);
 
   // Sliding window attention parameters
   if (window_left > 0 && window_left < static_cast<int>(s)) {
@@ -487,6 +471,13 @@ void fmha_v2_run(
   // The decomposition of threads and warps for BMM1.
   size_t warps_m, warps_n, warps_k;
   std::tie(warps_m, warps_n, warps_k) = get_warps(launch_params, sm, data_type, s, b, d, 2);
+
+  // Debug output for warps
+  printf("DEBUG: get_warps returned warps_m=%zu, warps_n=%zu, warps_k=%zu\n", warps_m, warps_n, warps_k);
+  printf("DEBUG: launch_params: flash_attention=%d, warp_specialization=%d, use_tma=%d\n",
+         launch_params.flash_attention, launch_params.warp_specialization, launch_params.use_tma);
+  printf("DEBUG: data_type=%d, sm=%d, s=%zu, d=%zu\n", int(data_type), sm, s, d);
+  fflush(stdout);
 
   // For multi-CTA cases, determine the size of the CTA wave.
   int heads_per_wave, ctas_per_head;
@@ -669,6 +660,15 @@ void fmha_v2_run(
   // Allocate tile id for dynamic scheduling
   void* tile_id_counter_d =
       allocator.aligned_alloc<void>(sizeof(uint32_t), 16, "tile_id_counter_d");
+
+  // Zero synchronization counters to avoid race conditions from stale workspace data.
+  // The workspace buffer may contain non-zero values from previous kernel executions.
+  if (tile_id_counter_d) {
+    cudaMemsetAsync(tile_id_counter_d, 0, sizeof(uint32_t), stream);
+  }
+  if (counters_d) {
+    cudaMemsetAsync(counters_d, 0, 3 * counters_sz, stream);
+  }
 
   // The number of heads computed per wave.
   params_v2.heads_per_wave = heads_per_wave;

@@ -41,6 +41,113 @@ def attention_ref(
     return o_ref, lse_ref
 
 
+def paged_attention_ref_torch(
+    q: torch.Tensor,  # [total_q_tokens, num_qo_heads, head_dim]
+    paged_kv_cache: torch.Tensor,  # [num_pages, 2, page_size, num_kv_heads, head_dim]
+    block_tables: torch.Tensor,  # [batch_size, max_num_blocks]
+    seq_lens: torch.Tensor,  # [batch_size]
+    cum_seq_lens_q: torch.Tensor,  # [batch_size + 1]
+    sm_scale: float,
+    q_scale: float = 1.0,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    causal: bool = True,
+    window_left: int = -1,
+) -> torch.Tensor:
+    """
+    Manual torch reference for paged attention with FP8 support.
+
+
+    This function dequantizes FP8 inputs and computes attention manually,
+    providing a ground truth that's independent of kernel-specific FP8 scaling.
+    """
+    device = q.device
+    batch_size = seq_lens.shape[0]
+    num_qo_heads = q.shape[1]
+    num_kv_heads = paged_kv_cache.shape[3]
+    head_dim = q.shape[2]
+    page_size = paged_kv_cache.shape[2]
+    heads_per_group = num_qo_heads // num_kv_heads
+
+    # Dequantize Q if FP8
+    q_float = q.float() * q_scale
+
+    # Process each sequence in the batch
+    outputs = []
+    for b in range(batch_size):
+        seq_len = seq_lens[b].item()
+        q_start = cum_seq_lens_q[b].item()
+        q_end = cum_seq_lens_q[b + 1].item()
+        q_len = q_end - q_start
+
+        # Get Q for this sequence: [q_len, num_qo_heads, head_dim]
+        q_seq = q_float[q_start:q_end]
+
+        # Gather K and V from paged cache
+        num_pages_needed = (seq_len + page_size - 1) // page_size
+        k_pages = []
+        v_pages = []
+        for p in range(num_pages_needed):
+            page_idx = block_tables[b, p].item()
+            k_pages.append(paged_kv_cache[page_idx, 0])  # [page_size, num_kv_heads, head_dim]
+            v_pages.append(paged_kv_cache[page_idx, 1])
+
+        # Concatenate pages: [total_page_tokens, num_kv_heads, head_dim]
+        k_seq = torch.cat(k_pages, dim=0)[:seq_len]  # Trim to actual seq_len
+        v_seq = torch.cat(v_pages, dim=0)[:seq_len]
+
+        # Dequantize K and V if FP8
+        k_seq = k_seq.float() * k_scale
+        v_seq = v_seq.float() * v_scale
+
+        # Compute attention for each query head
+        # q_seq: [q_len, num_qo_heads, head_dim]
+        # k_seq: [kv_len, num_kv_heads, head_dim]
+        # v_seq: [kv_len, num_kv_heads, head_dim]
+
+        o_seq = torch.zeros(q_len, num_qo_heads, head_dim, dtype=torch.float32, device=device)
+
+        for h in range(num_qo_heads):
+            kv_h = h // heads_per_group  # KV head index for GQA
+
+            # q: [q_len, head_dim], k: [kv_len, head_dim]
+            q_h = q_seq[:, h, :]  # [q_len, head_dim]
+            k_h = k_seq[:, kv_h, :]  # [kv_len, head_dim]
+            v_h = v_seq[:, kv_h, :]  # [kv_len, head_dim]
+
+            # Compute attention scores: [q_len, kv_len]
+            scores = torch.matmul(q_h, k_h.t()) * sm_scale
+
+            # Apply causal mask
+            if causal:
+                # For prefill with q_len == kv_len (self-attention)
+                q_indices = torch.arange(q_len, device=device).unsqueeze(1)
+                kv_indices = torch.arange(seq_len, device=device).unsqueeze(0)
+                # Causal: query position >= key position (accounting for offset if q_len < kv_len)
+                offset = seq_len - q_len
+                causal_mask = (q_indices + offset) >= kv_indices
+                scores = scores.masked_fill(~causal_mask, float('-inf'))
+
+            # Apply sliding window if specified
+            if window_left >= 0:
+                q_indices = torch.arange(q_len, device=device).unsqueeze(1)
+                kv_indices = torch.arange(seq_len, device=device).unsqueeze(0)
+                offset = seq_len - q_len
+                # Window: key position >= query position - window_left
+                window_mask = kv_indices >= (q_indices + offset - window_left)
+                scores = scores.masked_fill(~window_mask, float('-inf'))
+
+            # Softmax and output
+            attn = torch.softmax(scores, dim=-1)
+            o_h = torch.matmul(attn, v_h)  # [q_len, head_dim]
+            o_seq[:, h, :] = o_h
+
+        outputs.append(o_seq)
+
+    # Concatenate all sequences
+    return torch.cat(outputs, dim=0)
+
+
 @pytest.mark.parametrize("batch_size", [8])
 @pytest.mark.parametrize("num_heads", [8])
 @pytest.mark.parametrize("head_dim_qk", [192])
@@ -177,7 +284,12 @@ def test_fmha_v2_prefill_deepseek(
 @pytest.mark.parametrize("num_kv_heads", [4])  # Paged KV cache
 @pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("page_size", [32, 128])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(("dtype", "o_dtype"), [
+    (torch.float16, torch.float16),
+    (torch.bfloat16, torch.bfloat16),
+    (torch.float8_e4m3fn, torch.bfloat16),
+    (torch.float8_e4m3fn, torch.float16),
+])
 @pytest.mark.parametrize("non_blocking", [True, False])
 @pytest.mark.parametrize(
     ("causal", "window_left", "mask_mode"),
@@ -197,6 +309,7 @@ def test_trtllm_fmha_v2_prefill_paged(
     head_dim,
     page_size,
     dtype,
+    o_dtype,
     causal,
     mask_mode,
     non_blocking,
@@ -224,9 +337,20 @@ def test_trtllm_fmha_v2_prefill_paged(
     max_num_blocks = (max_kv_len + page_size - 1) // page_size
 
     num_pages = batch_size * max_num_blocks
-    paged_kv_cache = torch.randn(
-        num_pages, 2, page_size, num_kv_heads, head_dim, dtype=dtype, device=device
-    )
+
+    # Handle FP8 case: create in bfloat16 first, then convert
+    # For FP8, we need to capture the scales for proper dequantization
+    if dtype == torch.float8_e4m3fn:
+        paged_kv_cache_bf16 = torch.randn(
+            num_pages, 2, page_size, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device
+        )
+        paged_kv_cache, kv_scale = to_float8(paged_kv_cache_bf16, dtype=torch.float8_e4m3fn)
+        kv_scale = kv_scale.item()
+    else:
+        paged_kv_cache = torch.randn(
+            num_pages, 2, page_size, num_kv_heads, head_dim, dtype=dtype, device=device
+        )
+        kv_scale = 1.0
 
     block_tables = torch.zeros(
         batch_size, max_num_blocks, dtype=torch.int32, device=device
@@ -243,12 +367,28 @@ def test_trtllm_fmha_v2_prefill_paged(
 
     total_q_tokens = cum_seq_lens_q[-1].item()
 
-    q = torch.randn(total_q_tokens, num_qo_heads, head_dim, dtype=dtype, device=device)
-    o = torch.zeros(total_q_tokens, num_qo_heads, head_dim, dtype=dtype, device=device)
+    # Handle FP8 case: create in bfloat16 first, then convert
+    # For FP8, we need to capture the scales for proper dequantization
+    if dtype == torch.float8_e4m3fn:
+        q_bf16 = torch.randn(total_q_tokens, num_qo_heads, head_dim, dtype=torch.bfloat16, device=device)
+        q, q_scale = to_float8(q_bf16, dtype=torch.float8_e4m3fn)
+        q_scale = q_scale.item()
+    else:
+        q = torch.randn(total_q_tokens, num_qo_heads, head_dim, dtype=dtype, device=device)
+        q_scale = 1.0
+    o = torch.zeros(total_q_tokens, num_qo_heads, head_dim, dtype=o_dtype, device=device)
 
     workspace_buffer = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=device)
 
     sm_scale = 1.0 / math.sqrt(head_dim)
+    # For FP8: bmm1_scale = sm_scale * q_scale * k_scale, bmm2_scale = v_scale
+    # (k_scale and v_scale are the same since KV cache is quantized together)
+    if dtype == torch.float8_e4m3fn:
+        bmm1_scale = sm_scale * q_scale * kv_scale
+        bmm2_scale = kv_scale
+    else:
+        bmm1_scale = sm_scale
+        bmm2_scale = 1.0
     max_q_len = seq_lens.max().item()
 
     output = trtllm_fmha_v2_prefill(
@@ -257,14 +397,14 @@ def test_trtllm_fmha_v2_prefill_paged(
         seq_lens=seq_lens,
         max_q_len=max_q_len,
         max_kv_len=max_kv_len,
-        bmm1_scale=sm_scale,
-        bmm2_scale=1.0,
+        bmm1_scale=bmm1_scale,
+        bmm2_scale=bmm2_scale,
         batch_size=batch_size,
         cum_seq_lens_q=cum_seq_lens_q,
         cum_seq_lens_kv=cum_seq_lens_kv,
         block_tables=block_tables,
         out=o,
-        out_dtype=dtype,
+        out_dtype=o_dtype,
         kv_layout="NHD",
         mask_mode=mask_mode,
         window_left=window_left,
@@ -272,7 +412,6 @@ def test_trtllm_fmha_v2_prefill_paged(
         logits_soft_cap_scale=logits_soft_cap if logits_soft_cap > 0 else None,
         pos_encoding_mode=pos_encoding_mode,
     )
-    print(output)
 
     # cumulative page counts per sequence
     page_per_seq = (seq_lens + page_size - 1) // page_size
@@ -293,34 +432,59 @@ def test_trtllm_fmha_v2_prefill_paged(
     kv_last_page_len = seq_lens % page_size
     kv_last_page_len[kv_last_page_len == 0] = page_size
 
-    workspace_buffer_ref = torch.empty(
-        128 * 1024 * 1024, dtype=torch.int8, device=device
-    )
+    # For FP8 inputs, use manual torch reference to avoid FA3's different FP8 scaling semantics
+    # FA3 and TRT-LLM FMHAv2 have incompatible internal FP8 scaling (p_scale=448 vs 256)
+    if dtype == torch.float8_e4m3fn:
+        output_ref = paged_attention_ref_torch(
+            q=q,
+            paged_kv_cache=paged_kv_cache,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            cum_seq_lens_q=cum_seq_lens_q,
+            sm_scale=sm_scale,
+            q_scale=q_scale,
+            k_scale=kv_scale,
+            v_scale=kv_scale,
+            causal=causal,
+            window_left=window_left,
+        )
+        # FP8 has larger numerical error due to quantization
+        # Early tokens with small attention contexts can have slightly higher error
+        rtol, atol = 4e-2, 7e-2
+    else:
+        # For non-FP8, use FA3 reference which has compatible scaling
+        # Use zeros() to avoid uninitialized memory from previous tests
+        workspace_buffer_ref = torch.zeros(
+            128 * 1024 * 1024, dtype=torch.int8, device=device
+        )
 
-    plan_params = {
-        "qo_indptr": cum_seq_lens_q,
-        "paged_kv_indptr": paged_kv_indptr,
-        "paged_kv_indices": paged_kv_indices,
-        "paged_kv_last_page_len": kv_last_page_len,
-        "num_qo_heads": num_qo_heads,
-        "num_kv_heads": num_kv_heads,
-        "head_dim_qk": head_dim,
-        "page_size": page_size,
-        "causal": causal,
-        "pos_encoding_mode": pos_encoding_mode,
-        "logits_soft_cap": logits_soft_cap,
-        "q_data_type": q.dtype,
-        "kv_data_type": paged_kv_cache.dtype,
-        "window_left": window_left,
-        "non_blocking": non_blocking,
-    }
+        plan_params = {
+            "qo_indptr": cum_seq_lens_q,
+            "paged_kv_indptr": paged_kv_indptr,
+            "paged_kv_indices": paged_kv_indices,
+            "paged_kv_last_page_len": kv_last_page_len,
+            "num_qo_heads": num_qo_heads,
+            "num_kv_heads": num_kv_heads,
+            "head_dim_qk": head_dim,
+            "page_size": page_size,
+            "causal": causal,
+            "pos_encoding_mode": pos_encoding_mode,
+            "logits_soft_cap": logits_soft_cap,
+            "q_data_type": q.dtype,
+            "kv_data_type": paged_kv_cache.dtype,
+            "o_data_type": o_dtype,
+            "window_left": window_left,
+            "non_blocking": non_blocking,
+        }
 
-    wrapper_ref = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
-        workspace_buffer_ref, "NHD"
-    )
-    wrapper_ref.plan(**plan_params)
-    output_ref = wrapper_ref.run(q, paged_kv_cache)
-    rtol, atol = 1e-2, 1e-2
+        wrapper_ref = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
+            workspace_buffer_ref, "NHD"
+        )
+        wrapper_ref.plan(**plan_params)
+        output_ref = wrapper_ref.run(q, paged_kv_cache)
+        rtol, atol = 1e-2, 1e-2
+
+    # Ensure all GPU operations complete before comparison
     torch.testing.assert_close(output.float(), output_ref.float(), rtol=rtol, atol=atol)
 
 

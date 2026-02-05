@@ -3804,8 +3804,8 @@ def fmha_v2_prefill_deepseek(
 
 
 @functools.cache
-def get_trtllm_fmha_v2_module():
-    return gen_fmha_v2_module().build_and_load()
+def get_trtllm_fmha_v2_module(input_layout: str):
+    return gen_fmha_v2_module(input_layout).build_and_load()
 
 
 @flashinfer_api
@@ -3825,7 +3825,7 @@ def trtllm_fmha_v2_prefill(
     cum_seq_lens_q: torch.Tensor,
     cum_seq_lens_kv: torch.Tensor,
     block_tables: Optional[torch.Tensor] = None,
-    out: Optional[Union[torch.Tensor, FP4Tensor]] = None,
+    out: Optional[torch.Tensor] = None,
     out_dtype: Optional[Union[torch.dtype, str]] = None,
     kv_layout: Optional[str] = "HND",
     sinks: Optional[List[torch.Tensor]] = None,
@@ -3878,7 +3878,7 @@ def trtllm_fmha_v2_prefill(
     block_tables : Optional[torch.Tensor]
         The page table for KV cache, shape: ``[batch_size, max_num_pages_per_seq]``.
         Required when using paged KV cache format.
-    out : Optional[Union[torch.Tensor, FP4Tensor]]
+    out : Optional[torch.Tensor]
         The output tensor. If not provided, will be allocated with ``out_dtype``.
         If ``out_dtype`` is also not provided, will use the dtype of query.
     out_dtype : Optional[Union[torch.dtype, str]]
@@ -4019,38 +4019,12 @@ def trtllm_fmha_v2_prefill(
             device=query.device,
         )
 
-    # TODO: See if we can not use these mapping codes for clealiness
-    mask_mode_map = {
-        "padding": 0,
-        "causal": 1,
-        "sliding_window": 2,
-        "chunked": 2,
-        "custom": 3,
-    }
-    mask_mode_code = mask_mode_map.get(mask_mode.lower(), 1)  # default to causal
-    input_layout_map = {
-        "packed_qkv": 0,
-        "contiguous_q_kv": 1,
-        "q_paged_kv": 2,
-        "separate_q_k_v": 3,
-    }
-    input_layout_code = input_layout_map.get(
-        input_layout.lower(), 2
-    )  # default to Q_PAGED_KV
-    dtype_to_code_map = {
-        torch.float16: 0,
-        torch.float32: 1,
-        torch.bfloat16: 4,
-    }
-    if hasattr(torch, "float8_e4m3fn"):
-        dtype_to_code_map[torch.float8_e4m3fn] = 4
-    output_dtype_code = dtype_to_code_map.get(o_dtype, 0)  # default to FP16
-
     # Handle scale parameters
     scale_bmm1 = float(bmm1_scale)
     scale_bmm2 = float(bmm2_scale)
 
-    # Softmax scale is typically 1.0 for FP8 and auto for FP16/BF16
+    # Softmax scale: 1.0 for FP8, 0.0 (auto-detect) for FP16/BF16
+    # C++ kernel auto-sets to 1.0 for FP16/E4M3 when 0.0 is passed
     is_e4m3 = (
         query.dtype == torch.float8_e4m3fn if hasattr(torch, "float8_e4m3fn") else False
     )
@@ -4059,7 +4033,7 @@ def trtllm_fmha_v2_prefill(
         logits_soft_cap_scale if logits_soft_cap_scale is not None else 0.0
     )
 
-    module = get_trtllm_fmha_v2_module()
+    module = get_trtllm_fmha_v2_module(input_layout)
     total_q_tokens = int(cum_seq_lens_q[-1].item())
     total_kv_tokens = int(cum_seq_lens_kv[-1].item())
 
@@ -4089,14 +4063,13 @@ def trtllm_fmha_v2_prefill(
         seq_lens,  # Sequence length for kv_cache
         cum_seq_lens_q,  # Cumulative sequence length for query
         cum_seq_lens_kv,  # Cumulative sequence length for kv_cache
-        input_layout_code,  # Input layout (int)
-        output_dtype_code,  # Output dtype (int)
+        input_layout.lower(),  # Input layout (int)
         max_q_len,  # Max sequence length for query
         max_kv_len,  # Max sequence length for kv_cache
         batch_size,  # Batch size
         total_q_tokens,  # Total Q tokens (cum_seq_lens_q[-1])
         total_kv_tokens,  # Total KV tokens (cum_seq_lens_kv[-1])
-        mask_mode_code,  # Attention mask type
+        mask_mode.lower(),  # Attention mask type
         scale_softmax,  # Softmax scale
         scale_bmm1,  # BMM1 scale
         scale_bmm2,  # BMM2 scale (float, still needed for set_alpha in C++)

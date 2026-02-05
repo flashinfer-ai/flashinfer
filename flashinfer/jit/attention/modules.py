@@ -1936,7 +1936,7 @@ def gen_trtllm_fmha_v2_sm120_module(device: torch.device) -> JitSpec:
     )
 
 
-def gen_fmha_v2_module() -> JitSpec:
+def gen_fmha_v2_module(input_layout: str) -> JitSpec:
     uri = "trtllm_fmha_v2"
 
     # Setup generated source directory
@@ -1946,7 +1946,7 @@ def gen_fmha_v2_module() -> JitSpec:
     # Source directories
     csrc_dir = jit_env.FLASHINFER_CSRC_DIR
     fmha_v2_src_dir = csrc_dir / "fmha_v2"
-    source_paths = generate_jit_sources()
+    source_paths = generate_jit_sources(input_layout)
 
     # copy static fmha_v2_run.cu
     static_run_path = csrc_dir / "fmha_v2_run.cu"
