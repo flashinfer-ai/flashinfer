@@ -75,8 +75,8 @@ from .fp4_quantization import (
 )
 from .fp8_quantization import mxfp8_dequantize_host, mxfp8_quantize
 from .fused_moe import (
+    ActivationType,
     RoutingMethodType,
-    GatedActType,
     cutlass_fused_moe,
     reorder_rows_for_gated_act_gemm,
     trtllm_fp4_block_scale_moe,
@@ -86,8 +86,10 @@ from .fused_moe import (
 )
 from .gdn_prefill import chunk_gated_delta_rule as chunk_gated_delta_rule
 from .gemm import SegmentGEMMWrapper as SegmentGEMMWrapper
+from .gemm import bmm_bf16 as bmm_bf16
 from .gemm import bmm_fp8 as bmm_fp8
 from .gemm import bmm_mxfp8 as bmm_mxfp8
+from .gemm import mm_bf16 as mm_bf16
 from .gemm import mm_fp4 as mm_fp4
 from .gemm import mm_fp8 as mm_fp8
 from .gemm import tgv_gemm_sm100 as tgv_gemm_sm100
@@ -161,3 +163,4 @@ from .trtllm_low_latency_gemm import (
 from .utils import next_positive_power_of_2 as next_positive_power_of_2
 from .xqa import xqa as xqa
 from .xqa import xqa_mla as xqa_mla
+from . import mamba as mamba

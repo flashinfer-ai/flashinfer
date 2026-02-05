@@ -991,12 +991,12 @@ __device__ auto quantizePackedFPXValue(
     if constexpr (is_fp8) {
       return [](PackedVec<GemmOutputType>& vec, float /* ignored */, uint8_t* SFout) -> uint64_t {
         static_assert(TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize == VecSize);
-        return cvt_warp_fp16_to_mxfp8<GemmOutputType, VecSize>(vec, SFout);
+        return cvt_warp_fp16_to_mxfp8<GemmOutputType, VecSize, CVT_ELTS_PER_THREAD>(vec, SFout);
       };
     } else {
       return (scaling_type == TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4)
-                 ? &cvt_warp_fp16_to_fp4<GemmOutputType, VecSize, false>
-                 : &cvt_warp_fp16_to_fp4<GemmOutputType, VecSize, true>;
+                 ? &cvt_warp_fp16_to_fp4<GemmOutputType, VecSize, CVT_ELTS_PER_THREAD, false>
+                 : &cvt_warp_fp16_to_fp4<GemmOutputType, VecSize, CVT_ELTS_PER_THREAD, true>;
     }
   }();
 

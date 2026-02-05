@@ -53,6 +53,8 @@ from .workspace_base import AllReduceFusionWorkspace
 
 import torch
 
+from flashinfer.api_logging import flashinfer_api
+
 from .trtllm_ar import trtllm_allreduce_fusion
 from .trtllm_ar import trtllm_create_ipc_workspace_for_all_reduce_fusion
 from .trtllm_ar import check_trtllm_allreduce_fusion_workspace_metadata
@@ -270,6 +272,7 @@ def _workspace_creation_heuristic(
 # ============================================================================
 
 
+@flashinfer_api
 def create_allreduce_fusion_workspace(
     backend: Literal["trtllm", "mnnvl", "auto"] = "auto",
     world_size: int = None,
@@ -440,6 +443,7 @@ def create_allreduce_fusion_workspace(
 # ============================================================================
 
 
+@flashinfer_api
 def allreduce_fusion(
     input: torch.Tensor,
     workspace: AllReduceFusionWorkspace,

@@ -37,17 +37,17 @@ namespace tg = trtllm::gen;
 
 #ifdef TLLM_ENABLE_CUDA
 
-inline CUtensorMap buildNdTmaDescriptor(tg::Dtype dtype, tg::MmaKind mmaKind,
-                                        std::vector<uint64_t> const& shapes,
+inline CUtensorMap buildNdTmaDescriptor(tg::Dtype dtype, std::vector<uint64_t> const& shapes,
                                         std::vector<uint64_t> const& strides,
                                         std::vector<int32_t> const& tileShapes, void* gmemAddr,
-                                        bool doSwizzle = true) {
+                                        bool doPad, bool doSwizzle = true) {
   // The multiplication factor of the data padding in SMEM.
   int32_t padMultiplier = 1;
   CUtensorMap desc{};
   // The data type.
   CUtensorMapDataType tmaDataFormat{CU_TENSOR_MAP_DATA_TYPE_FLOAT32};
-  if (dtype == tg::Dtype::E4m3 || dtype == tg::Dtype::MxE4m3 || dtype == tg::Dtype::UE8m0) {
+  if (dtype == tg::Dtype::E4m3 || dtype == tg::Dtype::MxE4m3 || dtype == tg::Dtype::UE8m0 ||
+      dtype == tg::Dtype::UInt8) {
     tmaDataFormat = CU_TENSOR_MAP_DATA_TYPE_UINT8;
   } else if (dtype == tg::Dtype::Fp16) {
     tmaDataFormat = CU_TENSOR_MAP_DATA_TYPE_FLOAT16;
@@ -56,12 +56,10 @@ inline CUtensorMap buildNdTmaDescriptor(tg::Dtype dtype, tg::MmaKind mmaKind,
   } else if (dtype == tg::Dtype::E2m1) {
     tmaDataFormat = CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B;
   } else if (dtype == tg::Dtype::MxE2m1 || dtype == tg::Dtype::MxInt4) {
-    if (mmaKind == tg::MmaKind::MxFp8Fp6Fp4) {
+    if (doPad) {
       padMultiplier = 2;
       tmaDataFormat = CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B;
     } else {
-      // Note: this is used with the MMA kind MxFp4NvFp4 and also when casting to a higher-precision
-      // type such as Bfloat16 before the MMA.
       tmaDataFormat = CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B;
     }
   } else if (dtype == tg::Dtype::Fp32) {
@@ -82,9 +80,9 @@ inline CUtensorMap buildNdTmaDescriptor(tg::Dtype dtype, tg::MmaKind mmaKind,
       swizzleType = CU_TENSOR_MAP_SWIZZLE_64B;
     } else if ((fastestDimTileSizeBytes % 32) == 0) {
       swizzleType = CU_TENSOR_MAP_SWIZZLE_32B;
-      // This path is only for the scaling factors.
     } else if ((fastestDimTileSizeBytes % 16) == 0 &&
-               (dtype == tg::Dtype::UE8m0 || dtype == tg::Dtype::E4m3)) {
+               (dtype == tg::Dtype::UE8m0 || dtype == tg::Dtype::E4m3 || dtype == tg::Dtype::E2m1 ||
+                dtype == tg::Dtype::UInt8)) {
       swizzleType = CU_TENSOR_MAP_SWIZZLE_NONE;
     } else {
       std::cerr << "buildNdTmaDescriptor: unexpected fastestDimTileSizeBytes "
