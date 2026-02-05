@@ -35,10 +35,16 @@ struct KernelParams {
   // makeTmaShapeStrideAbc.
   //
   // If batchM:
-  //    Logical shape is [sum(divUpMul(M[bi], tileM) for bi in B), K].
-  //    Logical strides are [K, 1].
-  //    Tile box shape is [tileM, tileK].
-  //    Tile box strides are [tileK, 1].
+  //    If batchStrideInTokens > 0:
+  //       Logical shape is [sum(divUpMul(M[bi], tileM) for bi in B), K].
+  //       Logical strides are [K, 1].
+  //       Tile box shape is [tileM, tileK].
+  //       Tile box strides are [tileK, 1].
+  //    Else // batchStrideInTokens == 0:
+  //       Logical shape is [M, K].
+  //       Logical strides are [K, 1].
+  //       Tile box shape is [tileM, tileK].
+  //       Tile box strides are [tileK, 1].
   //
   // If batchN:
   //    If layoutA is MatrixLayout::MajorK
@@ -84,10 +90,16 @@ struct KernelParams {
   //       where blockK is 128B.
   //
   // If batchN:
-  //    Logical shape is [sum(divUpMul(N[bi], tileN) for bi in B), K].
-  //    Logical strides are [K, 1].
-  //    Tile box shape is [tileN, tileK].
-  //    Tile box strides are [tileK, 1].
+  //    If batchStrideInTokens > 0:
+  //       Logical shape is [sum(divUpMul(N[bi], tileN) for bi in B), K].
+  //       Logical strides are [K, 1].
+  //       Tile box shape is [tileN, tileK].
+  //       Tile box strides are [tileK, 1].
+  //    Else // batchStrideInTokens == 0:
+  //       Logical shape is [N, K].
+  //       Logical strides are [K, 1].
+  //       Tile box shape is [tileN, tileK].
+  //       Tile box strides are [tileK, 1].
   //
   // Dtype is set from options.mDtypeB.
   CUtensorMap tmaB[1];
@@ -154,6 +166,24 @@ struct KernelParams {
   // Dtype is Dtype::E4m3 for NvFp4, Dtype::UE8m0 for Mx formats.
   CUtensorMap tmaSfB[1];
 
+  // TMA descriptor for the sparsity information of A, if structured sparsity is used.
+  // Must be setup using gemm::buildNdTmaDescriptor with shapes and strides from
+  // makeTmaShapeStrideSparsityInfoA.
+  //
+  // When sparsityA is Any_2_4:
+  //     2 elements are non-zero in any chunk of 4 elements.
+  //     A 4-bit index indicates the position of the non-zero elements.
+  //     The shape in UInt8 is: [B, M, K / 8]
+  //
+  // When sparsityA is Pairwise_4_8:
+  //     4 elements are non-zero in any chunk of 8 elements.
+  //     The zero and non-zero elements are grouped in pairs.
+  //     A 4-bit index indicates the position of the non-zero pairs.
+  //     The shape in UInt8 is: [B, M, K / 16]
+  //
+  // Dtype is Dtype::UInt8.
+  CUtensorMap tmaSparsityInfoA;
+
   // The input matrix A.
   // If (routeAct == true && batchM), the shape is [M, K]. tmaA is not used.
   // Otherwise, check layout of tmaA to see the shape and strides.
@@ -194,6 +224,13 @@ struct KernelParams {
   // TensorRT-LLM API requires a scaling factor on the device.
   // Shape is [B]. One scaling factor per tensor in batch.
   float const* ptrScaleC{nullptr};
+
+  // The pre-activation scaling factor (typically dequantA * dequantB) for non-gated non-linear
+  // activation.
+  // Only used when non-linear activation is applied (e.g., GELU, Relu2).
+  // When used, scaleC should be quantScaleC only, and this scale is applied before the
+  // activation. Shape is [B].
+  float const* ptrScaleAct{nullptr};
 
   // The output gate scale for MxFp{4,8}, Fp8, NvFp4 and DeepSeek FP8 quantization.
   // TensorRT-LLM API requires a scaling factor on the device.
@@ -444,6 +481,10 @@ struct KernelParams {
   // If isStaticBatch == true, totalNumPaddedTokens is used, otherwise ptrTotalNumPaddedTokens.
   int32_t totalNumPaddedTokens;
 
+  // Total number of padded tokens - used as the stride for the output activation
+  // and C scaling factors. This is only used when isUniformNumTokensPerBatch is true.
+  int32_t totalNumOutputPaddedTokens;
+
   // A map from CTA index X/Y to batch index.
   // Check ptrCtaIdxXyToBatchIdx to see how it is computed.
   // If isStaticBatch == true, ctaIdxXyToBatchIdx is used, otherwise ptrCtaIdxXyToBatchIdx.
@@ -454,6 +495,14 @@ struct KernelParams {
   // Check ptrCtaIdxXyToMnLimit to see how it is computed.
   // If isStaticBatch == true, ctaIdxXyToMnLimit is used, otherwise ptrCtaIdxXyToMnLimit.
   int32_t ctaIdxXyToMnLimit[MaxNumCtas];
+
+  // Total number of CTAs in the token dimension per batch.
+  // Used only when isUniformNumTokensPerBatch is true.
+  int32_t ctasInTokenDimPerBatch{0};
+
+  // Stride for the batched dimension in the number of CTAs.
+  // Used only when isUniformNumTokensPerBatch is true.
+  int32_t batchStrideInCtas{0};
 
   //////////////////////////////////////////////////////////////////////////////////////////////////
   //

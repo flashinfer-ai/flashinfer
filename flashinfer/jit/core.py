@@ -16,7 +16,8 @@ from .cpp_ext import generate_ninja_build_for_op, run_ninja
 from .utils import write_if_different
 
 os.makedirs(jit_env.FLASHINFER_WORKSPACE_DIR, exist_ok=True)
-os.makedirs(jit_env.FLASHINFER_CSRC_DIR, exist_ok=True)
+# Note: Do NOT create FLASHINFER_CSRC_DIR here - it's the package directory
+# which may be read-only after installation
 
 
 class MissingJITCacheError(RuntimeError):
@@ -228,6 +229,10 @@ class JitSpec:
         return jit_env.FLASHINFER_JIT_DIR / self.name / "build.ninja"
 
     @property
+    def build_dir(self) -> Path:
+        return jit_env.FLASHINFER_JIT_DIR / self.name
+
+    @property
     def jit_library_path(self) -> Path:
         return jit_env.FLASHINFER_JIT_DIR / self.name / f"{self.name}.so"
 
@@ -238,7 +243,7 @@ class JitSpec:
 
     def get_object_paths(self) -> List[Path]:
         object_paths = []
-        jit_dir = self.jit_library_path.parent
+        jit_dir = self.build_dir
         for source in self.sources:
             is_cuda = source.suffix == ".cu"
             object_suffix = ".cuda.o" if is_cuda else ".o"
@@ -264,7 +269,7 @@ class JitSpec:
 
     def write_ninja(self) -> None:
         ninja_path = self.ninja_path
-        ninja_path.parent.mkdir(parents=True, exist_ok=True)
+        self.build_dir.mkdir(parents=True, exist_ok=True)
         content = generate_ninja_build_for_op(
             name=self.name,
             sources=self.sources,
@@ -295,7 +300,7 @@ class JitSpec:
             # Write ninja file if it doesn't exist (deferred case)
             if not self.is_ninja_generated:
                 self.write_ninja()
-            run_ninja(jit_env.FLASHINFER_JIT_DIR, self.ninja_path, verbose)
+            run_ninja(self.build_dir, self.ninja_path, verbose)
 
     def load(self, so_path: Path):
         return tvm_ffi.load_module(str(so_path))
@@ -362,7 +367,7 @@ class JitSpec:
         nvcc = os.environ.get("FLASHINFER_NVCC", f"{cuda_home}/bin/nvcc")
 
         # Build directory
-        build_dir = str(self.jit_library_path.parent.resolve())
+        build_dir = str(self.build_dir.resolve())
 
         # Generate entries for each source file
         compile_commands = []
@@ -412,9 +417,19 @@ def gen_jit_spec(
     verbose_env = os.environ.get("FLASHINFER_JIT_VERBOSE", "0")
     debug = (debug_env if debug_env is not None else verbose_env) == "1"
 
-    cflags = ["-std=c++17", "-Wno-switch-bool"]
+    # Only add default C++ standard if not specified in extra flags
+    cflags_has_std = extra_cflags is not None and any(
+        f.startswith("-std=") for f in extra_cflags
+    )
+    cuda_cflags_has_std = extra_cuda_cflags is not None and any(
+        f.startswith("-std=") for f in extra_cuda_cflags
+    )
+
+    cflags = ["-Wno-switch-bool"]
+    if not cflags_has_std:
+        cflags.insert(0, "-std=c++17")
+
     cuda_cflags = [
-        "-std=c++17",
         f"--threads={os.environ.get('FLASHINFER_NVCC_THREADS', '1')}",
         "-use_fast_math",
         "-DFLASHINFER_ENABLE_F16",
@@ -422,6 +437,9 @@ def gen_jit_spec(
         "-DFLASHINFER_ENABLE_FP8_E4M3",
         "-DFLASHINFER_ENABLE_FP8_E5M2",
     ]
+    if not cuda_cflags_has_std:
+        cuda_cflags.insert(0, "-std=c++17")
+
     if debug:
         cflags += ["-O0", "-g"]
         cuda_cflags += [

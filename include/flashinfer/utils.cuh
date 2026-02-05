@@ -57,6 +57,13 @@
   }
 #endif
 
+#define FLASHINFER_CUDA_CHECK(func)                                                         \
+  do {                                                                                      \
+    cudaError_t e = (func);                                                                 \
+    FLASHINFER_CHECK(e == cudaSuccess, "CUDA Error: ", cudaGetErrorString(e), " (", int(e), \
+                     ") at ", __FILE__, ":", __LINE__, " in ", STR(func));                  \
+  } while (0)
+
 #define DISPATCH_USE_FP16_QK_REDUCTION(use_fp16_qk_reduction, USE_FP16_QK_REDUCTION, ...) \
   if (use_fp16_qk_reduction) {                                                            \
     FLASHINFER_ERROR("FP16_QK_REDUCTION disabled at compile time");                       \

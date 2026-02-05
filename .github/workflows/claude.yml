@@ -81,6 +81,18 @@ jobs:
         with:
           fetch-depth: 1
 
+      - name: Setup Python
+        if: steps.check-permission.outputs.authorized == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install pre-commit
+        if: steps.check-permission.outputs.authorized == 'true'
+        run: |
+          pip install pre-commit
+          pre-commit install
+
       - name: Run Claude Code
         if: steps.check-permission.outputs.authorized == 'true'
         id: claude
@@ -95,7 +107,7 @@ jobs:
           # Optional: Give a custom prompt to Claude. If this is not specified, Claude will perform the instructions specified in the comment that tagged it.
           # prompt: 'Update the pull request description to include a summary of changes.'
 
-          # Optional: Add claude_args to customize behavior and configuration
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
-          # claude_args: '--allowed-tools Bash(gh pr:*)'
+          claude_args: |
+            --system-prompt "IMPORTANT: Before making any git commit, ALWAYS run `pre-commit run --all-files` first to auto-fix formatting issues. If pre-commit modifies files, stage them before committing. If pre-commit reports errors that cannot be auto-fixed, analyze the errors, fix them manually, then re-run pre-commit and commit again."

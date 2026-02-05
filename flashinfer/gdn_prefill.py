@@ -24,6 +24,8 @@ from .jit.gdn import gen_gdn_prefill_sm90_module
 from .utils import (
     register_custom_op,
     register_fake_op,
+    get_device_sm_count,
+    _get_cache_buf,
 )
 
 
@@ -45,6 +47,7 @@ def get_gdn_prefill_module():
         g: Optional[torch.Tensor],
         beta: Optional[torch.Tensor],
         scale: float,
+        workspace_buffer: torch.Tensor,
     ) -> None:
         module.gdn_prefill(
             output,
@@ -57,6 +60,7 @@ def get_gdn_prefill_module():
             g,
             beta,
             scale,
+            workspace_buffer,
         )
 
     @register_fake_op("flashinfer::gdn_prefill")
@@ -71,6 +75,7 @@ def get_gdn_prefill_module():
         g: Optional[torch.Tensor],
         beta: Optional[torch.Tensor],
         scale: float,
+        workspace_buffer: torch.Tensor,
     ) -> None:
         pass
 
@@ -147,7 +152,7 @@ def chunk_gated_delta_rule(
     Note:
         - Supports GQA: ``num_q_heads > num_k_heads = num_v_heads``
         - Supports GVA: ``num_v_heads > num_q_heads = num_k_heads``
-        - The final state is in k-major layout ``[N, H, K, V]``.
+        - The final state is in k-last layout ``[N, H, V, K]``.
         - Requires SM90 (Hopper) architecture.
     """
     assert cu_seqlens is not None, "cu_seqlens is required for varlen mode"
@@ -183,6 +188,11 @@ def chunk_gated_delta_rule(
             device=q.device,
         )
 
+    # Prepare workspace buffer for TMA Store in kernel
+    # 128B tensormap for each SM on Hopper architecture
+    workspace_size = get_device_sm_count(q.device) * 128
+    workspace_buffer = _get_cache_buf("gdn_prefill_workspace", workspace_size, q.device)
+
     get_gdn_prefill_module().gdn_prefill(
         output,
         output_state,
@@ -194,6 +204,7 @@ def chunk_gated_delta_rule(
         g,
         beta,
         scale if scale is not None else 0.0,
+        workspace_buffer,
     )
 
     if output_final_state:

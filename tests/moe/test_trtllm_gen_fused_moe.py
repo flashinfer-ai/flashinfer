@@ -22,8 +22,8 @@ from cuda.bindings import runtime
 from torch.nn import functional as F
 
 from flashinfer import (
+    ActivationType,
     RoutingMethodType,
-    GatedActType,
     e2m1_and_ufp8sf_scale_to_float,
     fp4_quantize,
     mxfp8_dequantize_host,
@@ -46,7 +46,7 @@ from flashinfer.fused_moe.core import (
     get_w2_permute_indices_with_cache,
     _maybe_get_cached_w3_w1_permute_indices,
 )
-from .utils import skip_checks, QuantMode
+from .utils import is_gated_activation, skip_checks, QuantMode
 
 
 # Max num tokens to tune for trtllm-gen fused moe
@@ -209,7 +209,7 @@ class CUDAGraphMoE:
             local_num_experts=self.config["num_experts"],
             routed_scaling_factor=self.config["routed_scaling"],
             routing_method_type=self.config["routing_method_type"],
-            gated_act_type=self.config["gated_act_type"],
+            activation_type=self.config["activation_type"],
             do_finalize=True,
             tune_max_num_tokens=TUNE_MAX_NUM_TOKENS,
         )
@@ -226,6 +226,12 @@ class Moe(ABC):
 
     def __init__(self):
         self.name = self.__class__.__name__
+
+    @property
+    @abstractmethod
+    def quant_mode(self) -> QuantMode:
+        """Get the quantization mode of this MoE implementation."""
+        pass
 
     @abstractmethod
     def quantize_weights(self, gemm1_weights, gemm2_weights, hidden_states_sample):
@@ -305,12 +311,16 @@ class FP4Moe(Moe):
 
     def __init__(self, quant_mode: QuantMode):
         super().__init__()
-        self.quant_mode = quant_mode
+        self._quant_mode = quant_mode
         self.is_mxfp4 = (
             quant_mode == QuantMode.FP4_MXFP4_MXFP8
             or quant_mode == QuantMode.FP4_MXFP4_Bf16
         )
         self.sf_vec_size = 32 if self.is_mxfp4 else 16
+
+    @property
+    def quant_mode(self) -> QuantMode:
+        return self._quant_mode
 
     def quantize_weights(self, gemm1_weights, gemm2_weights, hidden_states_sample):
         """Quantize weights to FP4 format and compute global scale factors."""
@@ -408,13 +418,16 @@ class FP4Moe(Moe):
         )
 
         # Convert quantized weights to proper formats
+        intermediate_size_factor = 2 if is_gated_activation(args.activation_type) else 1
         gemm1_weights_fp4 = args.gemm1_weights.view(torch.float8_e4m3fn).reshape(
-            num_experts, 2 * intermediate_size, hidden_size // 2
+            num_experts, intermediate_size_factor * intermediate_size, hidden_size // 2
         )  # packed fp4
         gemm1_scales_linear_fp4 = gemm1_scales_linear_fp4_bytes.view(
             torch.float8_e4m3fn
         ).reshape(
-            num_experts, 2 * intermediate_size, hidden_size // self.sf_vec_size
+            num_experts,
+            intermediate_size_factor * intermediate_size,
+            hidden_size // self.sf_vec_size,
         )  # fp8 scaling factors
 
         gemm2_weights_fp4 = args.gemm2_weights.view(torch.float8_e4m3fn).reshape(
@@ -440,6 +453,7 @@ class FP4Moe(Moe):
                 self._cache_permute_indices,
                 gemm1_weights_fp4[i].view(torch.uint8),
                 epilogue_tile_m,
+                is_gated_act_gemm=is_gated_activation(args.activation_type),
             )
             gemm1_weights_fp4_shuffled.append(
                 gemm1_weights_fp4[i]
@@ -452,6 +466,7 @@ class FP4Moe(Moe):
                 gemm1_scales_linear_fp4[i].view(torch.uint8),
                 epilogue_tile_m,
                 num_elts_per_sf=16,
+                is_gated_act_gemm=is_gated_activation(args.activation_type),
             )
             gemm1_scales_fp4_shuffled.append(
                 block_scale_interleave(
@@ -496,7 +511,9 @@ class FP4Moe(Moe):
             torch.stack(gemm1_scales_fp4_shuffled)
             .view(torch.float8_e4m3fn)
             .reshape(
-                num_experts, 2 * intermediate_size, hidden_size // self.sf_vec_size
+                num_experts,
+                intermediate_size_factor * intermediate_size,
+                hidden_size // self.sf_vec_size,
             )
         )
 
@@ -508,11 +525,16 @@ class FP4Moe(Moe):
         )
 
         # Calculate scaling factors that depend on weights
-        scale_c_fc1 = (
-            args_dequant.c_global_sf
-            * (1.0 / args.gemm1_scales_global)
-            * (1.0 / args.hidden_states_scale_global)
-        )
+        if is_gated_activation(args.activation_type):
+            scale_c_fc1 = (
+                args_dequant.c_global_sf
+                * (1.0 / args.gemm1_scales_global)
+                * (1.0 / args.hidden_states_scale_global)
+            )
+        else:
+            scale_c_fc1 = torch.full_like(
+                args.gemm1_scales_global, args_dequant.c_global_sf
+            )
         scale_gate_fc1 = (1.0 / args.gemm1_scales_global) * (
             1.0 / args.hidden_states_scale_global
         )
@@ -543,7 +565,7 @@ class FP4Moe(Moe):
         top_k_groups = kwargs["top_k_groups"]
         intermediate_size = kwargs["intermediate_size"]
         routed_scaling = kwargs["routed_scaling"]
-        gated_act_type = kwargs["gated_act_type"]
+        activation_type = kwargs["activation_type"]
         routing_method_type = kwargs["routing_method_type"]
         enable_autotune = kwargs.get("enable_autotune", True)
 
@@ -556,7 +578,7 @@ class FP4Moe(Moe):
             "top_k_groups": top_k_groups,
             "intermediate_size": intermediate_size,
             "routed_scaling": routed_scaling,
-            "gated_act_type": gated_act_type,
+            "activation_type": activation_type,
             "routing_method_type": routing_method_type,
             "enable_autotune": enable_autotune,
         }
@@ -609,6 +631,10 @@ def mxint4_quantize(
 
 class MxInt4BlockScaleMoe(Moe):
     """MxInt4 MoE implementation with block scaling (DeepSeek style)."""
+
+    @property
+    def quant_mode(self) -> QuantMode:
+        return QuantMode.MXINT4_BF16_BF16
 
     def quantize_weights(self, gemm1_weights, gemm2_weights, hidden_states_sample):
         """Quantize weights to MxInt4 with block scaling."""
@@ -803,6 +829,10 @@ class MxInt4BlockScaleMoe(Moe):
 
 class FP8BlockScaleMoe(Moe):
     """FP8 MoE implementation with block scaling (DeepSeek style)."""
+
+    @property
+    def quant_mode(self) -> QuantMode:
+        return QuantMode.FP8_BLOCK_SCALE
 
     def quantize_weights(self, gemm1_weights, gemm2_weights, hidden_states_sample):
         """Quantize weights to FP8 with block scaling."""
@@ -1025,6 +1055,10 @@ class FP8BlockScaleMoe(Moe):
 class FP8PerTensorMoe(Moe):
     """FP8 MoE implementation with per-tensor scaling (Llama4 style)."""
 
+    @property
+    def quant_mode(self) -> QuantMode:
+        return QuantMode.FP8_PER_TENSOR
+
     def quantize_weights(self, gemm1_weights, gemm2_weights, hidden_states_sample):
         """Quantize weights to FP8 per-tensor and compute global scale factors."""
         # Compute global scale factor for hidden states (offline calibration)
@@ -1080,14 +1114,20 @@ class FP8PerTensorMoe(Moe):
         # Reorder rows of W1 for fused gated activation
         gemm1_weights_fp8_interleaved = []
         for i in range(num_experts):
-            gemm1_weights_fp8_interleaved.append(
-                reorder_rows_for_gated_act_gemm(args.gemm1_weights[i].clone())
-            )
+            if is_gated_activation(args.activation_type):
+                weights = reorder_rows_for_gated_act_gemm(args.gemm1_weights[i].clone())
+            else:
+                weights = args.gemm1_weights[i].clone()
+            gemm1_weights_fp8_interleaved.append(weights)
 
         # Stack weights and scales for all experts
         gemm1_weights_fp8_interleaved = torch.stack(
             gemm1_weights_fp8_interleaved
-        ).reshape(num_experts, 2 * intermediate_size, hidden_size)
+        ).reshape(
+            num_experts,
+            (2 if is_gated_activation(args.activation_type) else 1) * intermediate_size,
+            hidden_size,
+        )
 
         # Shuffle weights and scaling factors for transposed mma output
         gemm1_weights_fp8_shuffled = []
@@ -1114,11 +1154,16 @@ class FP8PerTensorMoe(Moe):
         )
 
         # Calculate scaling factors that depend on weights
-        scale_c_fc1 = (
-            args_dequant.c_global_sf
-            * (1.0 / args.gemm1_scales_global)
-            * (1.0 / args.hidden_states_scale_global)
-        )
+        if is_gated_activation(args.activation_type):
+            scale_c_fc1 = (
+                args_dequant.c_global_sf
+                * (1.0 / args.gemm1_scales_global)
+                * (1.0 / args.hidden_states_scale_global)
+            )
+        else:
+            scale_c_fc1 = torch.full_like(
+                args.gemm1_scales_global, args_dequant.c_global_sf
+            )
         scale_gate_fc1 = (1.0 / args.gemm1_scales_global) * (
             1.0 / args.hidden_states_scale_global
         )
@@ -1148,6 +1193,7 @@ class FP8PerTensorMoe(Moe):
         routed_scaling = kwargs["routed_scaling"]
         routing_method_type = kwargs["routing_method_type"]
         enable_autotune = kwargs.get("enable_autotune", True)
+        activation_type = kwargs["activation_type"]
 
         # Quantize to FP8 per-tensor using pre-computed global scale factor
         hidden_states_fp8, _ = quant_fp8_per_tensor(
@@ -1181,6 +1227,7 @@ class FP8PerTensorMoe(Moe):
                 == RoutingMethodType.Llama4,  # Use_routing_scales_on_input
                 routing_method_type,
                 tune_max_num_tokens=TUNE_MAX_NUM_TOKENS,
+                activation_type=activation_type,
             )
 
         return output.to(torch.float)
@@ -1201,6 +1248,10 @@ class FP8PerTensorMoe(Moe):
 
 class BF16Moe(Moe):
     """BF16 MoE implementation."""
+
+    @property
+    def quant_mode(self) -> QuantMode:
+        return QuantMode.BF16
 
     def quantize_weights(self, gemm1_weights, gemm2_weights, hidden_states_sample):
         """No scaling for weights."""
@@ -1383,7 +1434,7 @@ class moe_args:
         gemm2_scales_global,
         permute_info,
         use_routing_scales_on_input,
-        gated_act_type,
+        activation_type,
     ):
         self.num_tokens = num_tokens
         self.num_experts = num_experts
@@ -1403,7 +1454,7 @@ class moe_args:
         self.gemm2_scales_global = gemm2_scales_global
         self.permute_info = permute_info
         self.use_routing_scales_on_input = use_routing_scales_on_input
-        self.gated_act_type = gated_act_type
+        self.activation_type = activation_type
 
 
 class moe_args_dequant:
@@ -1423,7 +1474,7 @@ class moe_args_dequant:
         gemm2_weights,
         permute_info,
         use_routing_scales_on_input,
-        gated_act_type,
+        activation_type,
         hidden_states_scale=None,
     ):
         self.num_tokens = num_tokens
@@ -1438,7 +1489,7 @@ class moe_args_dequant:
         self.gemm2_weights = gemm2_weights
         self.permute_info = permute_info
         self.use_routing_scales_on_input = use_routing_scales_on_input
-        self.gated_act_type = gated_act_type
+        self.activation_type = activation_type
         self.hidden_states_scale = hidden_states_scale
 
 
@@ -1862,7 +1913,11 @@ def run_moe_dequant(args, quant_mode: QuantMode):
 
     # Gemm1
     gemm1_output = torch.full(
-        (total_num_padded_tokens, 2 * args.intermediate_size),
+        (
+            total_num_padded_tokens,
+            (2 if is_gated_activation(args.activation_type) else 1)
+            * args.intermediate_size,
+        ),
         float("nan"),
         device="cuda",
     ).to(torch.float)
@@ -1897,12 +1952,13 @@ def run_moe_dequant(args, quant_mode: QuantMode):
         (total_num_padded_tokens, args.intermediate_size), float("nan"), device="cuda"
     ).to(torch.float)
 
-    gated_act_type = args.gated_act_type
-    gated_act_type_to_func = {
-        0: F.silu,
-        1: F.gelu,
+    activation_type = args.activation_type
+    activation_type_to_func = {
+        ActivationType.Swiglu: F.silu,
+        ActivationType.Geglu: F.gelu,
+        ActivationType.Relu2: lambda x: F.relu(x) ** 2,
     }
-    gated_act_func = gated_act_type_to_func[gated_act_type]
+    activation_func = activation_type_to_func[activation_type]
 
     i = 0
     for expert_idx in range(args.num_experts):
@@ -1910,9 +1966,13 @@ def run_moe_dequant(args, quant_mode: QuantMode):
         if my_num_tokens == 0:
             continue
         my_a = gemm1_output[i : i + my_num_tokens]
-        my_x1 = my_a[:, : args.intermediate_size]
-        my_x2 = my_a[:, args.intermediate_size :]
-        activation_output[i : i + my_num_tokens] = gated_act_func(my_x2) * my_x1
+        if is_gated_activation(args.activation_type):
+            my_x1 = my_a[:, : args.intermediate_size]
+            my_x2 = my_a[:, args.intermediate_size :]
+            activation_output[i : i + my_num_tokens] = activation_func(my_x2) * my_x1
+        else:
+            my_x1 = my_a[:, : args.intermediate_size]
+            activation_output[i : i + my_num_tokens] = activation_func(my_x1)
         i += my_num_tokens
         i = (i + args.padding - 1) // args.padding * args.padding
 
@@ -2039,7 +2099,7 @@ def run_moe_reference_fp4(args, quant_mode: QuantMode):
         gemm2_weights_dequant,
         args.permute_info,
         args.use_routing_scales_on_input,
-        args.gated_act_type,
+        args.activation_type,
     )
 
     return run_moe_dequant(args_dequant, quant_mode), args_dequant
@@ -2104,7 +2164,7 @@ def run_moe_reference_dsfp8(args):
         gemm2_weights_dequant,
         args.permute_info,
         args.use_routing_scales_on_input,
-        GatedActType.SwiGlu.value,  # gated_act_type
+        args.activation_type,
     )
 
     return run_moe_dequant(args_dequant, QuantMode.FP8_BLOCK_SCALE), args_dequant
@@ -2141,7 +2201,7 @@ def run_moe_reference_per_tensor_scale_fp8(args):
         gemm2_weights_dequant,
         args.permute_info,
         args.use_routing_scales_on_input,
-        GatedActType.SwiGlu.value,  # gated_act_type
+        args.activation_type,
     )
 
     return run_moe_dequant(args_dequant, QuantMode.FP8_PER_TENSOR), args_dequant
@@ -2172,7 +2232,7 @@ def run_moe_reference_bf16(args):
         gemm2_weights_dequant,
         args.permute_info,
         args.use_routing_scales_on_input,
-        GatedActType.SwiGlu.value,  # gated_act_type
+        args.activation_type,
     )
 
     return run_moe_dequant(args_dequant, QuantMode.BF16), args_dequant
@@ -2223,7 +2283,7 @@ def run_moe_reference_mxint4(args):
         gemm2_weights_dequant,
         args.permute_info,
         args.use_routing_scales_on_input,
-        args.gated_act_type,
+        args.activation_type,
     )
 
     return run_moe_dequant(args_dequant, QuantMode.MXINT4_BF16_BF16), args_dequant
@@ -2257,7 +2317,7 @@ def _compute_moe_actual_unified(moe_impl, args_dequant, args, **kwargs):
         "routed_scaling": kwargs["routed_scaling"],
         "routing_method_type": kwargs["routing_method_type"],
         "do_finalize": True,
-        "gated_act_type": args.gated_act_type,
+        "activation_type": args.activation_type,
         "hidden_states_scale": args.hidden_states_scale,
         "hidden_states_quant": kwargs["hidden_states_quant"],
         "enable_autotune": kwargs.get("enable_autotune", True),
@@ -2285,18 +2345,20 @@ def run_moe_test(
     moe_impl,
     routing_config,
     weight_processing,
-    gated_act_type,
+    activation_type,
     cache_permute_indices,
+    zero_hidden_states=False,
 ):
     """Common test logic for all routing methods."""
     skip_checks(
         moe_impl,
         routing_config,
         weight_processing,
-        gated_act_type,
+        activation_type,
         num_tokens,
         hidden_size,
         intermediate_size,
+        zero_hidden_states=zero_hidden_states,
     )
 
     torch.cuda.synchronize()
@@ -2317,7 +2379,7 @@ def run_moe_test(
 
     # Validation checks
     assert top_k <= num_experts
-    assert top_k <= 10
+    assert top_k <= 22
     if (top_k_groups is not None) and (n_groups is not None) and (n_groups > 0):
         assert top_k_groups <= 4
         assert num_experts > n_groups
@@ -2340,11 +2402,16 @@ def run_moe_test(
     else:
         routing_bias = None
 
-    hidden_states = 2 * torch.randn(
+    hidden_states_fn = torch.zeros if zero_hidden_states else torch.randn
+    hidden_states = 2 * hidden_states_fn(
         (num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16
     )
     gemm1_weights = torch.randn(
-        (num_experts, 2 * intermediate_size, hidden_size),
+        (
+            num_experts,
+            (2 if is_gated_activation(activation_type) else 1) * intermediate_size,
+            hidden_size,
+        ),
         device="cuda",
         dtype=torch.bfloat16,
     )
@@ -2429,7 +2496,7 @@ def run_moe_test(
         quant_data["gemm2_scales_global"],
         permute_info,
         use_routing_scales_on_input,
-        gated_act_type,
+        activation_type,
     )
 
     # Compute reference output
@@ -2471,6 +2538,13 @@ def run_moe_test(
 
 
 # Test: Renormalize routing
+@pytest.mark.parametrize(
+    "zero_hidden_states",
+    [
+        pytest.param(True, id="ZeroHiddenStates"),
+        pytest.param(False, id="RandomHiddenStates"),
+    ],
+)
 @pytest.mark.parametrize("num_tokens", [8, 768, 3072])
 @pytest.mark.parametrize("hidden_size", [1024])
 @pytest.mark.parametrize("intermediate_size", [1024, 768, 512, 384])
@@ -2591,10 +2665,10 @@ def run_moe_test(
     ],
 )
 @pytest.mark.parametrize(
-    "gated_act_type",
+    "activation_type",
     [
-        pytest.param(GatedActType.SwiGlu, id="SwiGlu"),
-        pytest.param(GatedActType.GeGlu, id="GeGlu"),
+        pytest.param(ActivationType.Swiglu, id="Swiglu"),
+        pytest.param(ActivationType.Geglu, id="Geglu"),
     ],
 )
 def test_renormalize_routing(
@@ -2604,8 +2678,9 @@ def test_renormalize_routing(
     moe_impl,
     routing_config,
     weight_processing,
-    gated_act_type,
+    activation_type,
     cache_permute_indices,
+    zero_hidden_states,
 ):
     """Test Renormalize routing configurations."""
     run_moe_test(
@@ -2615,18 +2690,20 @@ def test_renormalize_routing(
         moe_impl,
         routing_config,
         weight_processing,
-        gated_act_type,
+        activation_type,
         cache_permute_indices,
+        zero_hidden_states=zero_hidden_states,
     )
 
 
 # Test: DeepSeekV3 routing
 @pytest.mark.parametrize("num_tokens", [8, 768, 3072])
 @pytest.mark.parametrize("hidden_size", [1024])
-@pytest.mark.parametrize("intermediate_size", [2048, 1024, 768, 512, 384])
+@pytest.mark.parametrize("intermediate_size", [2944, 2048, 1024, 768, 512, 384])
 @pytest.mark.parametrize(
     "moe_impl",
     [
+        pytest.param(FP8PerTensorMoe(), id="FP8_PerTensor"),
         pytest.param(FP8BlockScaleMoe(), id="FP8_Block"),
         pytest.param(FP4Moe(quant_mode=QuantMode.FP4_NVFP4_NVFP4), id="NvFP4xNvFP4"),
         pytest.param(FP4Moe(quant_mode=QuantMode.FP4_MXFP4_MXFP8), id="MxFP4xMxFP8"),
@@ -2640,6 +2717,23 @@ def test_renormalize_routing(
     [
         pytest.param(
             {
+                "num_experts": 512,
+                "top_k": 22,
+                "padding": 8,
+                "n_groups": 1,
+                "top_k_groups": 1,
+                "routed_scaling": 2.5,
+                "has_routing_bias": True,
+                "routing_method_type": RoutingMethodType.DeepSeekV3,
+                "compatible_moe_impls": [FP8PerTensorMoe, FP4Moe],
+                "compatible_intermediate_size": [2944],
+                "compatible_activation_types": [ActivationType.Relu2],
+                "enable_autotune": True,
+            },
+            id="nemotron_3_dummy",
+        ),
+        pytest.param(
+            {
                 "num_experts": 384,
                 "top_k": 8,
                 "padding": 8,
@@ -2650,6 +2744,10 @@ def test_renormalize_routing(
                 "routing_method_type": RoutingMethodType.DeepSeekV3,
                 "compatible_moe_impls": [FP4Moe, FP8BlockScaleMoe],
                 "compatible_intermediate_size": [1024, 2048],
+                "compatible_activation_types": [
+                    ActivationType.Swiglu,
+                    ActivationType.Geglu,
+                ],
                 "enable_autotune": True,
             },
             id="kimi_k2",
@@ -2671,6 +2769,10 @@ def test_renormalize_routing(
                     BF16Moe,
                 ],
                 "compatible_intermediate_size": [512, 1024, 2048],
+                "compatible_activation_types": [
+                    ActivationType.Swiglu,
+                    ActivationType.Geglu,
+                ],
                 "enable_autotune": True,
             },
             id="DSv3",
@@ -2687,9 +2789,33 @@ def test_renormalize_routing(
                 "routing_method_type": RoutingMethodType.DeepSeekV3,
                 "compatible_moe_impls": [FP4Moe, FP8BlockScaleMoe],
                 "compatible_intermediate_size": [384, 768],
+                "compatible_activation_types": [
+                    ActivationType.Swiglu,
+                    ActivationType.Geglu,
+                ],
                 "enable_autotune": False,
             },
             id="DSLite",
+        ),
+        pytest.param(
+            {
+                "num_experts": 160,
+                "top_k": 8,
+                "padding": 8,
+                "n_groups": 1,
+                "top_k_groups": 1,
+                "routed_scaling": 2.5,
+                "has_routing_bias": True,
+                "routing_method_type": RoutingMethodType.DeepSeekV3,
+                "compatible_moe_impls": [FP4Moe, FP8BlockScaleMoe, BF16Moe],
+                "compatible_intermediate_size": [512, 1024, 1536],
+                "compatible_activation_types": [
+                    ActivationType.Swiglu,
+                    ActivationType.Geglu,
+                ],
+                "enable_autotune": False,
+            },
+            id="GLM4_MoE",
         ),
     ],
 )
@@ -2727,10 +2853,11 @@ def test_renormalize_routing(
     ],
 )
 @pytest.mark.parametrize(
-    "gated_act_type",
+    "activation_type",
     [
-        pytest.param(GatedActType.SwiGlu, id="SwiGlu"),
-        pytest.param(GatedActType.GeGlu, id="GeGlu"),
+        pytest.param(ActivationType.Swiglu, id="Swiglu"),
+        pytest.param(ActivationType.Geglu, id="Geglu"),
+        pytest.param(ActivationType.Relu2, id="Relu2"),
     ],
 )
 def test_deepseekv3_routing(
@@ -2740,7 +2867,7 @@ def test_deepseekv3_routing(
     moe_impl,
     routing_config,
     weight_processing,
-    gated_act_type,
+    activation_type,
     cache_permute_indices,
 ):
     """Test DeepSeekV3 routing configurations."""
@@ -2751,7 +2878,7 @@ def test_deepseekv3_routing(
         moe_impl,
         routing_config,
         weight_processing,
-        gated_act_type,
+        activation_type,
         cache_permute_indices,
     )
 
@@ -2802,10 +2929,10 @@ def test_deepseekv3_routing(
     ],
 )
 @pytest.mark.parametrize(
-    "gated_act_type",
+    "activation_type",
     [
-        pytest.param(GatedActType.SwiGlu, id="SwiGlu"),
-        pytest.param(GatedActType.GeGlu, id="GeGlu"),
+        pytest.param(ActivationType.Swiglu, id="Swiglu"),
+        pytest.param(ActivationType.Geglu, id="Geglu"),
     ],
 )
 def test_topk_routing(
@@ -2815,7 +2942,7 @@ def test_topk_routing(
     moe_impl,
     routing_config,
     weight_processing,
-    gated_act_type,
+    activation_type,
     cache_permute_indices,
 ):
     """Test TopK routing configuration."""
@@ -2826,7 +2953,7 @@ def test_topk_routing(
         moe_impl,
         routing_config,
         weight_processing,
-        gated_act_type,
+        activation_type,
         cache_permute_indices,
     )
 
@@ -2876,9 +3003,9 @@ def test_topk_routing(
     ],
 )
 @pytest.mark.parametrize(
-    "gated_act_type",
+    "activation_type",
     [
-        pytest.param(GatedActType.SwiGlu, id="SwiGlu"),
+        pytest.param(ActivationType.Swiglu, id="Swiglu"),
     ],
 )
 def test_llama4_routing(
@@ -2888,7 +3015,7 @@ def test_llama4_routing(
     moe_impl,
     routing_config,
     weight_processing,
-    gated_act_type,
+    activation_type,
     cache_permute_indices,
 ):
     """Test Llama4 routing configuration with FP8 per-tensor."""
@@ -2899,6 +3026,6 @@ def test_llama4_routing(
         moe_impl,
         routing_config,
         weight_processing,
-        gated_act_type,
+        activation_type,
         cache_permute_indices,
     )
