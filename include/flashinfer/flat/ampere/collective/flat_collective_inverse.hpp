@@ -18,7 +18,7 @@
 #include "cute/tensor.hpp"
 #include "cutlass/arch/barrier.h"
 #include "cutlass/cutlass.h"
-#include "flat/cute_ext.hpp"
+#include "flashinfer/flat/cute_ext.hpp"
 
 namespace flat::collective {
 

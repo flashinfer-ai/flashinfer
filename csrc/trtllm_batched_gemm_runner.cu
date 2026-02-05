@@ -101,13 +101,15 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
         options.mTransposeMmaOutput == mOptions.transposeMmaOutput &&
         (!doesRouteImplUseNoRoute(options.mRouteImpl)) == mOptions.routeAct &&
         options.mFusedAct == mOptions.fusedAct && options.mIsStaticBatch == mOptions.staticBatch &&
-        tileSize == mOptions.tileSize &&
-        options.mUseShuffledMatrix == mOptions.useShuffledMatrixA &&
+        tileSize == mOptions.tileSize && options.mUseShuffledMatrix == mOptions.useShuffledMatrix &&
         options.mLayoutA == mOptions.weightLayout) {
       if (options.mFusedAct) {
         if (options.mActType != static_cast<batchedGemm::gemmGatedAct::ActType>(mOptions.actType)) {
           continue;
         }
+      }
+      if ((int64_t)options.mEltwiseActType != (int64_t)mOptions.eltwiseActType) {
+        continue;
       }
 
       if (mOptions.transposeMmaOutput && options.mEpilogueTileM == mOptions.epilogueTileM) {
@@ -122,6 +124,8 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
             << ", mDtypeB: " << tg::dtypeToString(mOptions.dtypeB)
             << ", mDtypeC: " << tg::dtypeToString(mOptions.dtypeC)
             << ", mUseDeepSeekFp8: " << mOptions.deepSeekFp8
+            << ", mActType: " << (int64_t)mOptions.actType
+            << ", mEltwiseActType: " << (int64_t)mOptions.eltwiseActType
             << ", mTransposeMmaOutput: " << mOptions.transposeMmaOutput
             << ", mRouteAct: " << mOptions.routeAct << ", mFusedAct: " << mOptions.fusedAct
             << ", mIsStaticBatch: " << mOptions.staticBatch << ", mTileSize: " << mOptions.tileSize;
@@ -219,6 +223,8 @@ void TrtllmGenBatchedGemmRunner::run(
   gemmData.mInputBuffers.mPtrSfB = mOptions.transposeMmaOutput ? sfA : sfB;
   gemmData.mInputBuffers.mPtrScaleC = scaleC;
   gemmData.mInputBuffers.mPtrScaleGate = scaleGateC;
+  // For simplicity pass set scaleAct to scaleGateC
+  gemmData.mInputBuffers.mPtrScaleAct = scaleGateC;
   gemmData.mInputBuffers.mPtrPerTokenSfA =
       mOptions.transposeMmaOutput ? perTokensSfB : perTokensSfA;
   gemmData.mInputBuffers.mPtrPerTokenSfB =
