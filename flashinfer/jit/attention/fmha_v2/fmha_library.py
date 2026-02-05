@@ -137,6 +137,7 @@ def generate_kernel_spec(
         dtype: Data type ("fp16", "bf16", "e4m3", "e4m3_fp32")
         return_softmax: Return softmax statistics
         enable_attn_logit_softcapping: Enable logit softcapping
+        enable_skip_softmax: Enable Skip-Softmax (Sparse Attention)
         alibi: Enable ALiBi positional encoding
         is_mla: MLA mode (different head sizes for Q/K and V)
         head_size_v: V head dimension (0 = same as head_size)
@@ -1158,7 +1159,11 @@ def generate_jit_sources() -> list:
         InputLayout.SEPARATE_Q_K_V,
         InputLayout.CONTIGUOUS_Q_KV,
     ]
-    output_dtype_values = ["fp16", "bf16"]
+    # None means output_dtype == dtype
+    # otherwise it generates many useless kernels like fp16->bf16 or bf16->fp16
+    # output_dtype is intended for fp8 kernels
+    # output_dtype_values = ["fp16", "bf16"]
+    output_dtype_values = [None]
     is_mla_values = [False]
 
     # head_size_qk_values = [32, 64, 128, 256, 512]
@@ -1176,6 +1181,7 @@ def generate_jit_sources() -> list:
         head_size_v_values,
         enable_attn_logit_softcapping_values,
         return_softmax_values,
+        [False, True],  # enable_skip_softmax
         alibi_values,
         is_mla_values,
         input_layout_values,
@@ -1189,6 +1195,7 @@ def generate_jit_sources() -> list:
         head_size_v_values,
         enable_attn_logit_softcapping_values,
         return_softmax_values,
+        [False],  # only warp-spec kernels support skip-softmax
         alibi_values,
         is_mla_values,
         input_layout_values,
@@ -1203,6 +1210,7 @@ def generate_jit_sources() -> list:
             head_size_v_iter,
             enable_attn_logit_softcapping_iter,
             return_softmax_iter,
+            enable_skip_softmax,
             alibi_iter,
             is_mla_iter,
             input_layout_iter,
@@ -1212,6 +1220,7 @@ def generate_jit_sources() -> list:
                 sm=sm_iter,
                 head_size=head_size_qk_iter,
                 dtype=dtype_iter,
+                enable_skip_softmax=enable_skip_softmax,
                 return_softmax=return_softmax_iter,
                 enable_attn_logit_softcapping=enable_attn_logit_softcapping_iter,
                 alibi=alibi_iter,
