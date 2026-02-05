@@ -18,7 +18,7 @@
 #include "cute/tensor.hpp"
 #include "cutlass/cutlass.h"
 #include "cutlass/pipeline/sm90_pipeline.hpp"
-#include "flat/unused.hpp"
+#include "flashinfer/flat/unused.hpp"
 
 namespace flat::collective {
 

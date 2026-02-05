@@ -19,7 +19,7 @@
 #include <stdexcept>
 #include <string>
 
-#include "debug.hpp"
+#include "flashinfer/flat/debug.hpp"
 
 #define FLAT_UNUSED_PARAMETER(x) (void)x
 
