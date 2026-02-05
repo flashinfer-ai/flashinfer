@@ -191,18 +191,31 @@ jobs:
       needs.setup.outputs.skip_build != 'true'
     runs-on: ubuntu-latest
     steps:
-      - name: Generate GitHub App Token
-        id: app-token
+      - name: Generate Token for Check Runs (flashinfer only)
+        id: flashinfer-token
         uses: actions/create-github-app-token@v1
         with:
-          app-id: ${{ secrets.FLASHINFER_CI_APP_ID }}
-          private-key: ${{ secrets.FLASHINFER_CI_APP_KEY }}
+          app-id: ${{ secrets.GH_APP_ID }}
+          private-key: ${{ secrets.GH_APP_KEY }}
+          # Scoped to flashinfer only - for creating check runs
+          owner: flashinfer-ai
+          repositories: flashinfer
+
+      - name: Generate Token for CI-Infra (ci-infra only)
+        id: ci-infra-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.GH_APP_ID }}
+          private-key: ${{ secrets.GH_APP_KEY }}
+          # Scoped to ci-infra only - CANNOT access flashinfer code
+          owner: flashinfer-ai
+          repositories: ci-infra
 
       - name: Create Check Runs (PR only)
         id: create-checks
         if: github.event_name == 'pull_request'
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_TOKEN: ${{ steps.flashinfer-token.outputs.token }}
         run: |
           SHA="${{ needs.setup.outputs.head_sha }}"
           REPO="${{ github.repository }}"
@@ -213,10 +226,10 @@ jobs:
           # Create AOT Build check run
           if [ "${{ github.event.inputs.skip_aot }}" != "true" ]; then
             AOT_CHECK=$(gh api repos/$REPO/check-runs \
-              -f name="CI: AOT Build Tests" \
+              -f name="AOT Build Tests" \
               -f head_sha="$SHA" \
               -f status="in_progress" \
-              -F output[title]="Running AOT build tests..." \
+              -F output[title]="Running AOT build tests on spot instances..." \
               -F output[summary]="Tests running on spot instances. [View workflow run]($RUN_URL)" \
               --jq '.id')
             echo "Created AOT check run: $AOT_CHECK"
@@ -226,10 +239,10 @@ jobs:
           # Create GPU A10G check run
           if [ "${{ github.event.inputs.skip_gpu }}" != "true" ]; then
             A10G_CHECK=$(gh api repos/$REPO/check-runs \
-              -f name="CI: GPU Tests (A10G)" \
+              -f name="JIT Unittest (A10G)" \
               -f head_sha="$SHA" \
               -f status="in_progress" \
-              -F output[title]="Running GPU tests on A10G..." \
+              -F output[title]="Running JIT tests on A10G spot instances..." \
               -F output[summary]="Tests running on spot instances. [View workflow run]($RUN_URL)" \
               --jq '.id')
             echo "Created GPU A10G check run: $A10G_CHECK"
@@ -237,46 +250,49 @@ jobs:
 
             # Create GPU T4 check run
             T4_CHECK=$(gh api repos/$REPO/check-runs \
-              -f name="CI: GPU Tests (T4)" \
+              -f name="JIT Unittest (T4)" \
               -f head_sha="$SHA" \
               -f status="in_progress" \
-              -F output[title]="Running GPU tests on T4..." \
+              -F output[title]="Running JIT tests on T4 spot instances..." \
               -F output[summary]="Tests running on spot instances. [View workflow run]($RUN_URL)" \
               --jq '.id')
             echo "Created GPU T4 check run: $T4_CHECK"
             echo "gpu_t4_check_id=$T4_CHECK" >> $GITHUB_OUTPUT
           fi
 
+          # Create Test Results Summary check run (required status check)
+          SUMMARY_CHECK=$(gh api repos/$REPO/check-runs \
+            -f name="Test Results Summary" \
+            -f head_sha="$SHA" \
+            -f status="in_progress" \
+            -F output[title]="Waiting for test results..." \
+            -F output[summary]="Tests running. [View workflow run]($RUN_URL)" \
+            --jq '.id')
+          echo "Created summary check run: $SUMMARY_CHECK"
+          echo "summary_check_id=$SUMMARY_CHECK" >> $GITHUB_OUTPUT
+
       - name: Trigger Test Runner
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_TOKEN: ${{ steps.ci-infra-token.outputs.token }}
         run: |
-          REPO="${{ github.repository }}"
-          REF="${{ github.ref }}"
+          # Bootstrap: Use repository_dispatch to ci-infra
+          # After PR #2500 merges, this will be changed to workflow_dispatch
+          # targeting pr-test-runner.yml in this repo (see Stage B in docs)
 
-          # For PRs, use the PR head ref; for push/dispatch, use the current ref
-          if [ "${{ github.event_name }}" == "pull_request" ]; then
-            # Use the base branch (main) to trigger workflow_dispatch
-            # The runner will checkout the PR SHA
-            DISPATCH_REF="main"
-          else
-            DISPATCH_REF="${{ github.ref_name }}"
-          fi
+          echo "Triggering pr-test-runner.yml on ci-infra via repository_dispatch"
 
-          echo "Triggering pr-test-runner.yml on ref: $DISPATCH_REF"
+          gh api repos/flashinfer-ai/ci-infra/dispatches \
+            -f event_type="run-pr-test" \
+            -f client_payload[pr_head_sha]="${{ needs.setup.outputs.head_sha }}" \
+            -f client_payload[docker_tag]="${{ needs.setup.outputs.docker_tag }}" \
+            -f client_payload[aot_check_id]="${{ steps.create-checks.outputs.aot_check_id || '' }}" \
+            -f client_payload[gpu_a10g_check_id]="${{ steps.create-checks.outputs.gpu_a10g_check_id || '' }}" \
+            -f client_payload[gpu_t4_check_id]="${{ steps.create-checks.outputs.gpu_t4_check_id || '' }}" \
+            -f client_payload[summary_check_id]="${{ steps.create-checks.outputs.summary_check_id || '' }}" \
+            -f client_payload[skip_aot]="${{ github.event.inputs.skip_aot || 'false' }}" \
+            -f client_payload[skip_gpu]="${{ github.event.inputs.skip_gpu || 'false' }}"
 
-          gh workflow run pr-test-runner.yml \
-            --repo "$REPO" \
-            --ref "$DISPATCH_REF" \
-            -f pr_head_sha="${{ needs.setup.outputs.head_sha }}" \
-            -f docker_tag="${{ needs.setup.outputs.docker_tag }}" \
-            -f aot_check_id="${{ steps.create-checks.outputs.aot_check_id || '' }}" \
-            -f gpu_a10g_check_id="${{ steps.create-checks.outputs.gpu_a10g_check_id || '' }}" \
-            -f gpu_t4_check_id="${{ steps.create-checks.outputs.gpu_t4_check_id || '' }}" \
-            -f skip_aot="${{ github.event.inputs.skip_aot || 'false' }}" \
-            -f skip_gpu="${{ github.event.inputs.skip_gpu || 'false' }}"
-
-          echo "Test runner workflow triggered successfully"
+          echo "Test runner workflow triggered successfully on ci-infra"
 
       - name: Summary
         run: |
@@ -292,7 +308,9 @@ jobs:
             echo "- GPU T4: ${{ steps.create-checks.outputs.gpu_t4_check_id || 'skipped' }}" >> $GITHUB_STEP_SUMMARY
           fi
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Test runner workflow has been triggered." >> $GITHUB_STEP_SUMMARY
+          echo "Test runner triggered on [ci-infra](https://github.com/flashinfer-ai/ci-infra/actions) (bootstrap mode)." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "_After this PR merges, tests will run via pr-test-runner.yml in this repo._" >> $GITHUB_STEP_SUMMARY
 
   # ---------------------------------------------------------------------------
   # Report unauthorized PRs

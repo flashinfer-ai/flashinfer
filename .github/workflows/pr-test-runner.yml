@@ -33,6 +33,10 @@ on:
         description: 'GPU T4 check run ID'
         required: false
         type: string
+      summary_check_id:
+        description: 'Test Results Summary check run ID'
+        required: false
+        type: string
       skip_aot:
         description: 'Skip AOT build tests'
         required: false
@@ -506,8 +510,11 @@ jobs:
         id: app-token
         uses: actions/create-github-app-token@v1
         with:
-          app-id: ${{ secrets.FLASHINFER_CI_APP_ID }}
-          private-key: ${{ secrets.FLASHINFER_CI_APP_KEY }}
+          app-id: ${{ secrets.GH_APP_ID }}
+          private-key: ${{ secrets.GH_APP_KEY }}
+          # Scoped to flashinfer only - for updating check runs (checks:write)
+          owner: flashinfer-ai
+          repositories: flashinfer
 
       - name: Update AOT Check Run
         if: inputs.aot_check_id != '' && inputs.skip_aot != 'true'
@@ -553,16 +560,16 @@ jobs:
 
           if [ "$GPU_SPOT" == "success" ]; then
             CONCLUSION="success"
-            TITLE="GPU Tests (A10G) Passed"
-            SUMMARY="All GPU JIT tests passed on A10G spot instances."
+            TITLE="JIT Unittest (A10G) Passed"
+            SUMMARY="All JIT unittest passed on A10G spot instances."
           elif [ "$GPU_SPOT_TERM" == "true" ] && [ "$GPU_RERUN" == "success" ]; then
             CONCLUSION="success"
-            TITLE="GPU Tests (A10G) Passed (rerun)"
+            TITLE="JIT Unittest (A10G) Passed (rerun)"
             SUMMARY="Spot instance was terminated. Rerun on on-demand A10G instances passed."
           else
             CONCLUSION="failure"
-            TITLE="GPU Tests (A10G) Failed"
-            SUMMARY="GPU JIT tests on A10G failed. Check the workflow logs for details."
+            TITLE="JIT Unittest (A10G) Failed"
+            SUMMARY="JIT unittest on A10G failed. Check the workflow logs for details."
           fi
 
           gh api -X PATCH repos/${{ github.repository }}/check-runs/${{ inputs.gpu_a10g_check_id }} \
@@ -585,16 +592,16 @@ jobs:
 
           if [ "$GPU_SPOT" == "success" ]; then
             CONCLUSION="success"
-            TITLE="GPU Tests (T4) Passed"
-            SUMMARY="All GPU JIT tests passed on T4 spot instances."
+            TITLE="JIT Unittest (T4) Passed"
+            SUMMARY="All JIT unittest passed on T4 spot instances."
           elif [ "$GPU_SPOT_TERM" == "true" ] && [ "$GPU_RERUN" == "success" ]; then
             CONCLUSION="success"
-            TITLE="GPU Tests (T4) Passed (rerun)"
+            TITLE="JIT Unittest (T4) Passed (rerun)"
             SUMMARY="Spot instance was terminated. Rerun on on-demand T4 instances passed."
           else
             CONCLUSION="failure"
-            TITLE="GPU Tests (T4) Failed"
-            SUMMARY="GPU JIT tests on T4 failed. Check the workflow logs for details."
+            TITLE="JIT Unittest (T4) Failed"
+            SUMMARY="JIT unittest on T4 failed. Check the workflow logs for details."
           fi
 
           gh api -X PATCH repos/${{ github.repository }}/check-runs/${{ inputs.gpu_t4_check_id }} \
@@ -604,6 +611,84 @@ jobs:
             -F output[summary]="$SUMMARY"
 
           echo "Updated GPU T4 check run: $CONCLUSION"
+
+      - name: Update Test Results Summary
+        if: inputs.summary_check_id != ''
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          # Determine overall result from all test groups
+          AOT_SPOT="${{ needs.aot-build-import.result }}"
+          AOT_RERUN="${{ needs.aot-build-import-rerun.result }}"
+          AOT_SPOT_TERM="${{ needs.analyze-aot-failure.outputs.is_spot_termination }}"
+          GPU_A10G_SPOT="${{ needs.gpu-tests-a10g.result }}"
+          GPU_A10G_RERUN="${{ needs.gpu-tests-a10g-rerun.result }}"
+          GPU_A10G_SPOT_TERM="${{ needs.analyze-gpu-a10g-failure.outputs.is_spot_termination }}"
+          GPU_T4_SPOT="${{ needs.gpu-tests-t4.result }}"
+          GPU_T4_RERUN="${{ needs.gpu-tests-t4-rerun.result }}"
+          GPU_T4_SPOT_TERM="${{ needs.analyze-gpu-t4-failure.outputs.is_spot_termination }}"
+          SKIP_AOT="${{ inputs.skip_aot }}"
+          SKIP_GPU="${{ inputs.skip_gpu }}"
+
+          ALL_PASSED=true
+          SUMMARY_LINES=""
+
+          # Check AOT result
+          if [ "$SKIP_AOT" != "true" ]; then
+            if [ "$AOT_SPOT" == "success" ]; then
+              SUMMARY_LINES="${SUMMARY_LINES}- AOT Build Tests: Passed\n"
+            elif [ "$AOT_SPOT_TERM" == "true" ] && [ "$AOT_RERUN" == "success" ]; then
+              SUMMARY_LINES="${SUMMARY_LINES}- AOT Build Tests: Passed (rerun after spot termination)\n"
+            else
+              SUMMARY_LINES="${SUMMARY_LINES}- AOT Build Tests: Failed\n"
+              ALL_PASSED=false
+            fi
+          else
+            SUMMARY_LINES="${SUMMARY_LINES}- AOT Build Tests: Skipped\n"
+          fi
+
+          # Check GPU A10G result
+          if [ "$SKIP_GPU" != "true" ]; then
+            if [ "$GPU_A10G_SPOT" == "success" ]; then
+              SUMMARY_LINES="${SUMMARY_LINES}- JIT Unittest (A10G): Passed\n"
+            elif [ "$GPU_A10G_SPOT_TERM" == "true" ] && [ "$GPU_A10G_RERUN" == "success" ]; then
+              SUMMARY_LINES="${SUMMARY_LINES}- JIT Unittest (A10G): Passed (rerun after spot termination)\n"
+            else
+              SUMMARY_LINES="${SUMMARY_LINES}- JIT Unittest (A10G): Failed\n"
+              ALL_PASSED=false
+            fi
+
+            # Check GPU T4 result
+            if [ "$GPU_T4_SPOT" == "success" ]; then
+              SUMMARY_LINES="${SUMMARY_LINES}- JIT Unittest (T4): Passed\n"
+            elif [ "$GPU_T4_SPOT_TERM" == "true" ] && [ "$GPU_T4_RERUN" == "success" ]; then
+              SUMMARY_LINES="${SUMMARY_LINES}- JIT Unittest (T4): Passed (rerun after spot termination)\n"
+            else
+              SUMMARY_LINES="${SUMMARY_LINES}- JIT Unittest (T4): Failed\n"
+              ALL_PASSED=false
+            fi
+          else
+            SUMMARY_LINES="${SUMMARY_LINES}- JIT Unittest (A10G): Skipped\n"
+            SUMMARY_LINES="${SUMMARY_LINES}- JIT Unittest (T4): Skipped\n"
+          fi
+
+          if [ "$ALL_PASSED" == "true" ]; then
+            CONCLUSION="success"
+            TITLE="All tests passed"
+          else
+            CONCLUSION="failure"
+            TITLE="Some tests failed"
+          fi
+
+          SUMMARY=$(printf "$SUMMARY_LINES")
+
+          gh api -X PATCH repos/${{ github.repository }}/check-runs/${{ inputs.summary_check_id }} \
+            -f status="completed" \
+            -f conclusion="$CONCLUSION" \
+            -F output[title]="$TITLE" \
+            -F output[summary]="$SUMMARY"
+
+          echo "Updated Test Results Summary: $CONCLUSION"
 
       - name: Summary
         run: |
