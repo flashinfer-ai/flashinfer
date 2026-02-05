@@ -802,7 +802,11 @@ class MxInt4BlockScaleMoe(Moe):
 
 
 class FP8BlockScaleMoe(Moe):
-    """FP8 MoE implementation with block scaling (DeepSeek style)."""
+    """FP8 MoE implementation with block scaling (DeepSeek style or MxFp8 x MxFp8)."""
+
+    def __init__(self, fp8_quantization_type: Fp8QuantizationType = Fp8QuantizationType.DeepSeekFp8):
+        super().__init__()
+        self.fp8_quantization_type = fp8_quantization_type
 
     def quantize_weights(self, gemm1_weights, gemm2_weights, hidden_states_sample):
         """Quantize weights to FP8 with block scaling."""
@@ -812,17 +816,21 @@ class FP8BlockScaleMoe(Moe):
             2
         ]  # [num_experts, 2*intermediate_size, hidden_size]
 
-        # Quantize weights to FP8
-        gemm1_weights_fp8 = gemm1_weights.to(torch.float8_e4m3fn)
-        gemm1_scales = 2 * torch.rand(
-            (num_experts, 2 * intermediate_size // 128, hidden_size // 128),
-            device="cuda",
-        ).to(torch.float)
+        if self.fp8_quantization_type == Fp8QuantizationType.DeepSeekFp8:
+            # Quantize weights to FP8
+            gemm1_weights_fp8 = gemm1_weights.to(torch.float8_e4m3fn)
+            gemm1_scales = 2 * torch.rand(
+                (num_experts, 2 * intermediate_size // 128, hidden_size // 128),
+                device="cuda",
+            ).to(torch.float)
 
-        gemm2_weights_fp8 = gemm2_weights.to(torch.float8_e4m3fn)
-        gemm2_scales = 2 * torch.rand(
-            (num_experts, hidden_size // 128, intermediate_size // 128), device="cuda"
-        ).to(torch.float)
+            gemm2_weights_fp8 = gemm2_weights.to(torch.float8_e4m3fn)
+            gemm2_scales = 2 * torch.rand(
+                (num_experts, hidden_size // 128, intermediate_size // 128), device="cuda"
+            ).to(torch.float)
+        elif self.fp8_quantization_type == Fp8QuantizationType.MxFp8:
+            gemm1_weights_fp8, gemm1_scales = mxfp8_quantize_batches(gemm1_weights, True)
+            gemm2_weights_fp8, gemm2_scales = mxfp8_quantize_batches(gemm2_weights, True)
 
         return {
             "hidden_states_scale_global": None,  # Block scales computed at runtime
@@ -893,7 +901,15 @@ class FP8BlockScaleMoe(Moe):
             return quantized_x, scales
 
         # todo(Yingyi):quantize bf16 to fp8
-        hidden_states_quant, hidden_states_scale = to_float8_blockwise(hidden_states)
+        if self.fp8_quantization_type == Fp8QuantizationType.DeepSeekFp8:
+            hidden_states_quant, hidden_states_scale = to_float8_blockwise(hidden_states)
+        elif self.fp8_quantization_type == Fp8QuantizationType.MxFp8:
+            hidden_states_quant, hidden_states_scale = mxfp8_quantize(
+                hidden_states, is_swizzling
+            )
+            hidden_states_scale = hidden_states_scale.view(torch.float8_e4m3fn).reshape(
+                *hidden_states.shape[:-1], -1
+            )
         return {
             "hidden_states": hidden_states_quant,
             "hidden_states_scale": hidden_states_scale,
@@ -918,13 +934,27 @@ class FP8BlockScaleMoe(Moe):
 
         if use_shuffled_weight:
             # FIXME: this depends on the kernel internals
-            epilogue_tile_m = 64
+            epilogue_tile_m = 64 if self.fp8_quantization_type == Fp8QuantizationType.DeepSeekFp8 else 128
+
+            gemm1_weights_fp8_interleaved = args.gemm1_weights.clone()
+            if self.fp8_quantization_type == Fp8QuantizationType.MxFp8:
+                # Reorder rows of W1 for fused gated activation
+                gemm1_weights_fp8_interleaved = []
+                for i in range(num_experts):
+                    gemm1_weights_fp8_interleaved.append(
+                        reorder_rows_for_gated_act_gemm(args.gemm1_weights[i].clone())
+                    )
+
+                # Stack weights and scales for all experts
+                gemm1_weights_fp8_interleaved = torch.stack(
+                    gemm1_weights_fp8_interleaved
+                ).reshape(num_experts, 2 * intermediate_size, hidden_size)
 
             gemm1_weights_fp8_shuffled = []
             gemm2_weights_fp8_shuffled = []
             for i in range(num_experts):
                 tmp_weights1 = shuffle_matrix_a(
-                    args.gemm1_weights[i].view(torch.uint8), epilogue_tile_m
+                    gemm1_weights_fp8_interleaved[i].view(torch.uint8), epilogue_tile_m
                 )
                 tmp_weights2 = shuffle_matrix_a(
                     args.gemm2_weights[i].view(torch.uint8), epilogue_tile_m
@@ -1005,12 +1035,18 @@ class FP8BlockScaleMoe(Moe):
                 weight_layout=static_data["weight_layout"],
                 enable_pdl=enable_pdl,
                 tune_max_num_tokens=TUNE_MAX_NUM_TOKENS,
+                fp8_quantization_type=self.fp8_quantization_type,
             )
         return output.to(torch.float)
 
     def compute_reference(self, args):
         """FP8 block-scale reference implementation."""
-        return run_moe_reference_dsfp8(args)
+        if self.fp8_quantization_type == Fp8QuantizationType.DeepSeekFp8:
+            return run_moe_reference_dsfp8(args)
+        elif self.fp8_quantization_type == Fp8QuantizationType.MxFp8:
+            return run_moe_reference_mxfp8(args)
+        else:
+            raise ValueError(f"Unsupported FP8 quantization type: {self.fp8_quantization_type}")
 
     def get_tolerances(self):
         """Get FP8 block-scale accuracy tolerances."""
@@ -1352,8 +1388,10 @@ class BF16Moe(Moe):
 # ====================================================================================
 def get_moe_impl(quant_mode: QuantMode):
     """Factory function to get the appropriate MoE implementation."""
-    if quant_mode == QuantMode.FP8_BLOCK_SCALE:
-        return FP8BlockScaleMoe()
+    if quant_mode == QuantMode.FP8_BLOCK_SCALE_DEEPSEEK:
+        return FP8BlockScaleMoe(fp8_quantization_type=Fp8QuantizationType.DeepSeekFp8)
+    elif quant_mode == QuantMode.FP8_BLOCK_SCALE_MXFP8:
+        return FP8BlockScaleMoe(fp8_quantization_type=Fp8QuantizationType.MxFp8)
     elif quant_mode == QuantMode.FP8_PER_TENSOR:
         return FP8PerTensorMoe()
     else:
@@ -1838,6 +1876,34 @@ def dequant_reference_dsfp8(input, scale, transpose_scale, block_m, block_n):
     output = input * scale
     return output
 
+def mxfp8_quantize_batches(a, is_swizzling=True):
+    """MxFp8 batch quantization function with centralized global scale factor calculation."""
+    num_batches = a.size(0)
+    a_quant = []
+    a_scales = []
+    for i in range(num_batches):
+        mx_fp8_quant, mx_fp8_scale = mxfp8_quantize(a[i], is_swizzling)
+        a_quant.append(mx_fp8_quant)
+        a_scales.append(mx_fp8_scale)
+
+    result_a_quant = torch.stack(a_quant)
+    result_a_scales = torch.stack(a_scales)
+
+    return result_a_quant, result_a_scales
+
+
+def mxfp8_dequantize_batches(a, a_scales, is_swizzling=True):
+    """MxFp8 batch dequantization function."""
+    num_batches = a.size(0)
+    a_dequant = []
+    for i in range(num_batches):
+        mx_fp8_dequant = mxfp8_dequantize_host(a[i].cpu().view(torch.uint8), a_scales[i].cpu().view(torch.uint8).reshape(-1), is_swizzling)
+        a_dequant.append(mx_fp8_dequant.cuda())
+
+    result_a_dequant = torch.stack(a_dequant)
+
+    return result_a_dequant
+
 
 # ====================================================================================
 # Common MoE Reference Implementation
@@ -1929,7 +1995,7 @@ def run_moe_dequant(args, quant_mode: QuantMode):
         )
         activation_output = activation_output.to(torch.float)
         args.c_global_sf = c_global_sf
-    elif quant_mode == QuantMode.FP4_MXFP4_MXFP8:
+    elif quant_mode == QuantMode.FP4_MXFP4_MXFP8 or quant_mode == QuantMode.FP8_BLOCK_SCALE_MXFP8:
         activation_output, scale_bytes = mxfp8_quantize(
             activation_output.to(torch.bfloat16), True
         )
@@ -2045,8 +2111,44 @@ def run_moe_reference_fp4(args, quant_mode: QuantMode):
     return run_moe_dequant(args_dequant, quant_mode), args_dequant
 
 
+def run_moe_reference_mxfp8(args):
+    hidden_states_dequant = mxfp8_dequantize_host(
+        args.hidden_states.cpu().view(torch.uint8),
+        args.hidden_states_scale.cpu().view(torch.uint8).reshape(-1),
+        True,  # is_sf_swizzled_layout
+    ).cuda()
+
+    gemm1_weights_dequant = mxfp8_dequantize_batches(
+        args.gemm1_weights,
+        args.gemm1_scales,
+    ).cuda()
+
+    gemm2_weights_dequant = mxfp8_dequantize_batches(
+        args.gemm2_weights,
+        args.gemm2_scales,
+    ).cuda()
+
+    args_dequant = moe_args_dequant(
+        args.num_tokens,
+        args.num_experts,
+        args.hidden_size,
+        args.intermediate_size,
+        args.top_k,
+        args.padding,
+        hidden_states_dequant,
+        args.expert_logits,
+        gemm1_weights_dequant,
+        gemm2_weights_dequant,
+        args.permute_info,
+        args.use_routing_scales_on_input,
+        args.gated_act_type,
+    )
+
+    return run_moe_dequant(args_dequant, QuantMode.FP8_BLOCK_SCALE_MXFP8), args_dequant
+
+
 def run_moe_reference_dsfp8(args):
-    """FP8 block-scale reference implementation."""
+    """FP8 block-scale reference implementation (DeepSeek style)."""
     # Generate block scales at runtime for FP8 block scaling
 
     def dequant_reference_dsfp8(input, scale, transpose_scale, block_m, block_n):
@@ -2107,7 +2209,7 @@ def run_moe_reference_dsfp8(args):
         GatedActType.SwiGlu.value,  # gated_act_type
     )
 
-    return run_moe_dequant(args_dequant, QuantMode.FP8_BLOCK_SCALE), args_dequant
+    return run_moe_dequant(args_dequant, QuantMode.FP8_BLOCK_SCALE_DEEPSEEK), args_dequant
 
 
 def run_moe_reference_per_tensor_scale_fp8(args):

@@ -182,6 +182,17 @@ class GatedActType(IntEnum):
     GeGlu = 1
 
 
+# The type of FP8 quantization
+# Please keep this in sync with the counterpart defined in trtllm_fused_moe_kernel_launcher.cu
+class Fp8QuantizationType(IntEnum):
+    # No FP8 quantization
+    NoneFp8 = 0
+    # DeepSeek FP8
+    DeepSeekFp8 = 1
+    # MxFp8 x MxFp8
+    MxFp8 = 2
+
+
 @functools.cache
 def is_trtllm_moe_supported(
     dtype_weights: DtypeTrtllmGen,
@@ -991,7 +1002,7 @@ def get_trtllm_moe_sm100_module():
             num_local_experts: int,
             dtype_act: DtypeTrtllmGen,
             dtype_weights: DtypeTrtllmGen,
-            use_deepseek_fp8: bool,
+            fp8_quantization_type: Fp8QuantizationType,
             hidden_size: int,
             intermediate_size: int,
             gated_act_type: int = GatedActType.SwiGlu,
@@ -1003,7 +1014,7 @@ def get_trtllm_moe_sm100_module():
             self.top_k = top_k
             self.dtype_act = dtype_act
             self.dtype_weights = dtype_weights
-            self.use_deepseek_fp8 = use_deepseek_fp8
+            self.fp8_quantization_type = fp8_quantization_type
             self.top_k = top_k
             self.hidden_size = hidden_size
             self.intermediate_size = intermediate_size
@@ -1030,7 +1041,7 @@ def get_trtllm_moe_sm100_module():
             instance_key = (
                 self.dtype_act,
                 self.dtype_weights,
-                self.use_deepseek_fp8,
+                self.fp8_quantization_type,
                 self.top_k,
                 self.hidden_size,
                 self.intermediate_size,
@@ -1119,16 +1130,17 @@ def get_trtllm_moe_sm100_module():
                 and self.dtype_weights == DtypeTrtllmGen.E4m3
             ):
                 # FP8 operations
-                if self.use_deepseek_fp8:
+                if self.fp8_quantization_type == QuantizationType.DeepSeekFp8 or self.fp8_quantization_type == QuantizationType.MxFp8:
                     # FP8 block scale
                     current_num_tokens = hidden_states.shape[0]
                     current_hidden_size = hidden_states.shape[1]
-                    current_hidden_states_scale = torch.full(
-                        (current_hidden_size // 128, current_num_tokens),
-                        2.0,
-                        dtype=torch.float,
-                        device=hidden_states.device,
-                    )
+                    if self.fp8_quantization_type == QuantizationType.DeepSeekFp8:
+                        current_hidden_states_scale = torch.full(
+                            (current_hidden_size // 128, current_num_tokens),
+                            2.0,
+                            dtype=torch.float,
+                            device=hidden_states.device,
+                        )
                     moe_op.trtllm_fp8_block_scale_moe(
                         routing_logits,
                         topk_ids,
@@ -1154,6 +1166,7 @@ def get_trtllm_moe_sm100_module():
                         kwargs["weight_layout"],
                         kwargs["enable_pdl"],
                         [-1, -1] if tactic == -1 else tactic,
+                        self.fp8_quantization_type,
                     )
                 else:
                     # FP8 per tensor scale
@@ -1323,7 +1336,7 @@ def get_trtllm_moe_sm100_module():
             num_local_experts=local_num_experts,
             dtype_act=dtype_act,
             dtype_weights=dtype_weights,
-            use_deepseek_fp8=False,
+            fp8_quantization_type=Fp8QuantizationType.NoneFp8,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             weight_layout=weight_layout,
@@ -1455,7 +1468,7 @@ def get_trtllm_moe_sm100_module():
             num_local_experts=local_num_experts,
             dtype_act=dtype_act,
             dtype_weights=dtype_weights,
-            use_deepseek_fp8=False,  # per_tensor mode
+            fp8_quantization_type=Fp8QuantizationType.NoneFp8,  # per_tensor mode
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             weight_layout=WeightLayout.MajorK,
@@ -1568,6 +1581,7 @@ def get_trtllm_moe_sm100_module():
         weight_layout: int = 0,
         enable_pdl: Optional[bool] = None,
         tune_max_num_tokens: int = 8192,
+        fp8_quantization_type: Fp8QuantizationType = Fp8QuantizationType.DeepSeekFp8,
     ) -> torch.Tensor:
         # Determine routing mode: compute from logits or use pre-computed
         if routing_logits is None:
@@ -1618,7 +1632,7 @@ def get_trtllm_moe_sm100_module():
             num_local_experts=local_num_experts,
             dtype_act=dtype_act,
             dtype_weights=dtype_weights,
-            use_deepseek_fp8=True,  # block_scale mode
+            fp8_quantization_type=fp8_quantization_type,  # block_scale mode
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             weight_layout=weight_layout,
@@ -1681,6 +1695,7 @@ def get_trtllm_moe_sm100_module():
             weight_layout,
             enable_pdl,
             [-1, -1] if tactic == -1 else tactic,
+            fp8_quantization_type,
         )
 
         return result
@@ -1711,6 +1726,7 @@ def get_trtllm_moe_sm100_module():
         weight_layout: int = 0,
         enable_pdl: Optional[bool] = None,
         tune_max_num_tokens: int = 8192,
+        fp8_quantization_type: Fp8QuantizationType = Fp8QuantizationType.DeepSeekFp8,
     ):
         seq_len = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1]
@@ -1808,7 +1824,7 @@ def get_trtllm_moe_sm100_module():
             num_local_experts=num_local_experts,
             dtype_act=dtype_act,
             dtype_weights=dtype_weights,
-            use_deepseek_fp8=False,
+            fp8_quantization_type=Fp8QuantizationType.NoneFp8,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             gated_act_type=gated_act_type,
@@ -2006,7 +2022,7 @@ def get_trtllm_moe_sm100_module():
             num_local_experts=num_local_experts,
             dtype_act=dtype_act,
             dtype_weights=dtype_weights,
-            use_deepseek_fp8=False,
+            fp8_quantization_type=Fp8QuantizationType.NoneFp8,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             gated_act_type=GatedActType.SwiGlu,
