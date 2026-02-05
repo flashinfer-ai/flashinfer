@@ -612,7 +612,7 @@ def get_api_code(specs_names):
                 f"&& sage_block_size_k == {sage_block_size_k} "
                 f"&& sage_block_size_v == {sage_block_size_v} "
             )
-            
+
             il_check += (
                 "&& enable_skip_softmax "
                 if kspec.enable_skip_softmax

@@ -521,7 +521,7 @@ def get_kernel_code(kspec, kname, lname):
     ]
 
     return_softmax_stats_flag = pythonBoolean2cpp[kspec.return_softmax_stats]
-    
+
     enable_skip_softmax_flag = pythonBoolean2cpp[kspec.enable_skip_softmax]
 
     # needed by warpspec kernels.
@@ -737,7 +737,7 @@ def get_api_code(specs_names):
                 f"&& sage_block_size_k == {sage_block_size_k} "
                 f"&& sage_block_size_v == {sage_block_size_v} "
             )
-            
+
             il_check += (
                 "&& enable_skip_softmax "
                 if kspec.enable_skip_softmax

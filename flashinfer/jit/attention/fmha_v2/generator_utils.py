@@ -3277,7 +3277,7 @@ def get_cubin_header(kernel_traits, specs_names):
             kspec.head_size,
             kspec.dtype,
             kspec.output_dtype,
-            kspec.enable_skip_softmax
+            kspec.enable_skip_softmax,
         ):
             continue
         name = fname.replace(".", "_")
@@ -3444,7 +3444,13 @@ def get_cubin_header(kernel_traits, specs_names):
             if generate_cu_trtllm:
 
                 def get_lname_from_kname(kname: str) -> str:
-                    if use_cubin_header(int(sm), int(head_size), prec.lower(), output_prec.lower(), enable_skip_softmax_flag):
+                    if use_cubin_header(
+                        int(sm),
+                        int(head_size),
+                        prec.lower(),
+                        output_prec.lower(),
+                        enable_skip_softmax_flag,
+                    ):
                         return "nullptr"
                     lname = kname.replace("_kernel", "")
                     mask_types = [
@@ -3467,7 +3473,13 @@ def get_cubin_header(kernel_traits, specs_names):
 {attention_input_layout_value}, {is_il}, {is_flash_atten}, {is_warp_specialization}, {is_fp32_accu}, \
 {is_alibi_supported}, {is_tiled}, {has_softcapping_scale}, {return_softmax_stats_flag}, {enable_skip_softmax_flag}, {lname}}}\
 """.format(**locals())
-                    if use_cubin_header(int(sm), int(head_size), prec.lower(), output_prec.lower(), enable_skip_softmax_flag)
+                    if use_cubin_header(
+                        int(sm),
+                        int(head_size),
+                        prec.lower(),
+                        output_prec.lower(),
+                        enable_skip_softmax_flag,
+                    )
                     else """\
 {{ DATA_TYPE_{prec}, DATA_TYPE_{output_prec}, {seq_len}, {q_step}, {kv_step}, {head_size}, {head_size_v}, \
 {sage_block_sizes[0]}, {sage_block_sizes[1]}, {sage_block_sizes[2]}, kSM_{sm}, nullptr, \
@@ -3844,7 +3856,9 @@ def enumerate_hgmma_ldgsts_kernels(specs, sm=90, dtype="fp16"):
 
 
 # Note this will be used in TRT-LLM.
-def enumerate_hgmma_flash_warpspec_kernels(specs, sm=90, dtype="fp16", enable_skip_softmax=False):
+def enumerate_hgmma_flash_warpspec_kernels(
+    specs, sm=90, dtype="fp16", enable_skip_softmax=False
+):
     scheduling_mode = int(os.getenv("SCHEDULING_MODE", "1"))
 
     # use specialized kernels for cases without alibi scales.
@@ -3909,7 +3923,7 @@ def enumerate_hgmma_flash_warpspec_kernels(specs, sm=90, dtype="fp16", enable_sk
                     return_softmax_stats=return_softmax,
                     scheduling_mode=scheduling_mode,
                     input_layout=input_layout,
-                    enable_skip_softmax=enable_skip_softmax
+                    enable_skip_softmax=enable_skip_softmax,
                 )
             )
 
@@ -3943,7 +3957,7 @@ def enumerate_hgmma_flash_warpspec_kernels(specs, sm=90, dtype="fp16", enable_sk
                     return_softmax_stats=return_softmax,
                     scheduling_mode=scheduling_mode,
                     input_layout=input_layout,
-                    enable_skip_softmax=enable_skip_softmax
+                    enable_skip_softmax=enable_skip_softmax,
                 )
             )
 
@@ -3977,7 +3991,7 @@ def enumerate_hgmma_flash_warpspec_kernels(specs, sm=90, dtype="fp16", enable_sk
                     return_softmax_stats=return_softmax,
                     scheduling_mode=scheduling_mode,
                     input_layout=input_layout,
-                    enable_skip_softmax=enable_skip_softmax
+                    enable_skip_softmax=enable_skip_softmax,
                 )
             )
         """
@@ -4029,7 +4043,12 @@ def enumerate_hgmma_flash_warpspec_kernels(specs, sm=90, dtype="fp16", enable_sk
 
 # Note this will be used in TRT-LLM.
 def enumerate_qgmma_flash_warpspec_kernels(
-    specs, sm=90, dtype="e4m3", sage_block_sizes=None, output_dtype=None,enable_skip_softmax=False
+    specs,
+    sm=90,
+    dtype="e4m3",
+    sage_block_sizes=None,
+    output_dtype=None,
+    enable_skip_softmax=False,
 ):
     scheduling_mode = int(os.getenv("SCHEDULING_MODE", "1"))
 
@@ -4096,7 +4115,7 @@ def enumerate_qgmma_flash_warpspec_kernels(
                     input_layout=input_layout,
                     sage_block_sizes=sage_block_sizes,
                     output_dtype=output_dtype,
-                    enable_skip_softmax=enable_skip_softmax
+                    enable_skip_softmax=enable_skip_softmax,
                 )
             )
 
@@ -4133,7 +4152,7 @@ def enumerate_qgmma_flash_warpspec_kernels(
                     input_layout=input_layout,
                     sage_block_sizes=sage_block_sizes,
                     output_dtype=output_dtype,
-                    enable_skip_softmax=enable_skip_softmax
+                    enable_skip_softmax=enable_skip_softmax,
                 )
             )
 
@@ -4170,7 +4189,7 @@ def enumerate_qgmma_flash_warpspec_kernels(
                     input_layout=input_layout,
                     sage_block_sizes=sage_block_sizes,
                     output_dtype=output_dtype,
-                    enable_skip_softmax=enable_skip_softmax
+                    enable_skip_softmax=enable_skip_softmax,
                 )
             )
 
@@ -6718,20 +6737,24 @@ def enumerate_kernels():
     enumerate_qgmma_kernels(specs, sm=90)
     # need to add bf16 kernels if needed
     for enable_skip_softmax in [False, True]:
-        if enable_skip_softmax and 'DISABLE_SKIP_SOFTMAX' in os.environ:
+        if enable_skip_softmax and "DISABLE_SKIP_SOFTMAX" in os.environ:
             continue
         enumerate_hgmma_flash_warpspec_kernels(
-            specs, sm=90, dtype='fp16', enable_skip_softmax=enable_skip_softmax)
+            specs, sm=90, dtype="fp16", enable_skip_softmax=enable_skip_softmax
+        )
         enumerate_hgmma_flash_warpspec_kernels(
-            specs, sm=90, dtype='bf16', enable_skip_softmax=enable_skip_softmax)
+            specs, sm=90, dtype="bf16", enable_skip_softmax=enable_skip_softmax
+        )
         enumerate_qgmma_flash_warpspec_kernels(
-            specs, sm=90, dtype='e4m3', enable_skip_softmax=enable_skip_softmax)
+            specs, sm=90, dtype="e4m3", enable_skip_softmax=enable_skip_softmax
+        )
         enumerate_qgmma_flash_warpspec_kernels(
             specs,
             sm=90,
-            dtype='e4m3',
+            dtype="e4m3",
             output_dtype="bf16",
-            enable_skip_softmax=enable_skip_softmax)
+            enable_skip_softmax=enable_skip_softmax,
+        )
 
     # For now SageAttention only needs BF16
     # block_size_q should be divisible by 64

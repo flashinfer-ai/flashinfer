@@ -12,11 +12,11 @@
 
 #pragma once
 
-#include "fmha/hopper/arrive_wait.h"
-
 #include <fmha/softmax.h>
 #include <fmha/traits.h>
 #include <fmha/utils.h>
+
+#include "fmha/hopper/arrive_wait.h"
 
 namespace fmha {
 namespace ws {
