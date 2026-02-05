@@ -61,7 +61,7 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
     top_k: int,
     warmups: int,
     iterations: int,
-    activation_type: ActivationType,
+    activation_type: int,
 ):
     device = torch.device("cuda:0")
     enable_pdl = device_support_pdl(device)
@@ -120,7 +120,7 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
     )
 
     if is_block_scale:
-        assert activation_type == ActivationType.Swiglu, (
+        assert activation_type == ActivationType.Swiglu.value, (
             "Only Swiglu activation is supported for FP8 block scale MoE."
         )
         fn = partial(
@@ -165,7 +165,7 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
             tune_max_num_tokens=num_tokens
             if tune_max_num_tokens is None
             else tune_max_num_tokens,
-            activation_type=activation_type.value,
+            activation_type=activation_type,
         )
     input_kwargs = {
         "hidden_states": hidden_states,
@@ -210,7 +210,7 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
     top_k: int,
     warmups: int,
     iterations: int,
-    activation_type: ActivationType,
+    activation_type: int,
 ):
     device = torch.device("cuda:0")
     enable_pdl = device_support_pdl(device)
@@ -270,7 +270,7 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
         w13_global_scale = 1.0 / 448.0 / 6.0
         w2_global_scale = 1.0 / 448.0 / 6.0
     else:
-        assert activation_type != ActivationType.Relu2, (
+        assert activation_type != ActivationType.Relu2.value, (
             "Relu2 activation is supported for FP4 only with 'NvFP4xNvFP4' quant mode"
         )
         w13, w13_scale = fp4_quantize(
@@ -320,7 +320,7 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
         routing_method_type=RoutingMethodType.Renormalize.value,
         do_finalize=True,
         enable_pdl=enable_pdl,
-        activation_type=activation_type.value,
+        activation_type=activation_type,
         output=None,
         tune_max_num_tokens=num_tokens
         if tune_max_num_tokens is None
@@ -371,12 +371,12 @@ def bench_trtllm_gen_fused_moe_autotuner_mxint4(
     top_k: int,
     warmups: int,
     iterations: int,
-    activation_type: ActivationType,
+    activation_type: int,
 ):
     device = torch.device("cuda:0")
     enable_pdl = device_support_pdl(device)
     routing_logits = torch.rand(num_tokens, num_experts, device=device).float()
-    routing_bias = torch.randn(num_experts, device="cuda", dtype=torch.bfloat16)
+    routing_bias = torch.randn(num_experts, device=device, dtype=torch.bfloat16)
     hidden_states = torch.randn(num_tokens, hidden_size, device=device).to(
         torch.bfloat16
     )
