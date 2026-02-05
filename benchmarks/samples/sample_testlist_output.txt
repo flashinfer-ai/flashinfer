@@ -1,4 +1,4 @@
-flashinfer/benchmarks$ python3 flashinfer_benchmark.py --testlist samples/sample_testlist.txt --output_path samples/sample_testlist_output.csv 
+flashinfer/benchmarks$ python3 flashinfer_benchmark.py --testlist samples/sample_testlist.txt --output_path samples/sample_testlist_output.csv
 [INFO] args = Namespace(routine='BatchPrefillWithPagedKVCacheWrapper', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=True, allow_output_mismatch=True, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='Llama-3.1-70B', generate_repro_command=True, repro_command='', backends=['fa2', 'fa3', 'cudnn', 'trtllm-gen'], page_size=16, batch_size=1, s_qo=1024, s_kv=1024, num_qo_heads=64, num_kv_heads=8, head_dim_qk=128, head_dim_vo=128, head_dim_ckv=None, head_dim_kpe=None, q_dtype='bfloat16', kv_dtype='bfloat16', causal=True, random_actual_seq_len=True)
 [INFO] Running testBatchPrefillWithPagedKVCacheWrapper
 [INFO] FlashInfer version: 0.6.2
@@ -47,7 +47,7 @@ flashinfer/benchmarks$ python3 flashinfer_benchmark.py --testlist samples/sample
 [PERF] fa2            :: median time 0.508 ms; std 0.003 ms; achieved tflops 213.668 TFLOPs/sec; achieved tb_per_sec 1.692 TB/sec
 [PERF] cutlass        :: median time 0.516 ms; std 0.004 ms; achieved tflops 210.340 TFLOPs/sec; achieved tb_per_sec 1.665 TB/sec
 [PERF] cudnn          :: median time 0.292 ms; std 0.001 ms; achieved tflops 372.144 TFLOPs/sec; achieved tb_per_sec 2.946 TB/sec
-[WARNING] Backend name 'trtllm-gen-native' has been renamed to 'trtllm-native' and will be removed in a future release. 
+[WARNING] Backend name 'trtllm-gen-native' has been renamed to 'trtllm-native' and will be removed in a future release.
 [INFO] args = Namespace(routine='BatchDecodeWithPagedKVCacheWrapper', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=True, allow_output_mismatch=True, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='Llama-3.1-70B', generate_repro_command=True, repro_command='', backends=['fa2', 'fa2_tc', 'cudnn', 'trtllm-gen', 'trtllm-native'], page_size=16, batch_size=16, s_qo=1, s_kv=1024, num_qo_heads=64, num_kv_heads=8, head_dim_qk=128, head_dim_vo=128, head_dim_ckv=None, head_dim_kpe=None, q_dtype='bfloat16', kv_dtype='bfloat16', causal=False, random_actual_seq_len=True)
 [INFO] Running testBatchDecodeWithPagedKVCacheWrapper
 [INFO] FlashInfer version: 0.6.2
@@ -71,7 +71,7 @@ flashinfer/benchmarks$ python3 flashinfer_benchmark.py --testlist samples/sample
 [PERF] cudnn          :: median time 0.015 ms; std 0.000 ms; achieved tflops 17.359 TFLOPs/sec; achieved tb_per_sec 2.205 TB/sec
 [PERF] trtllm-gen     :: median time 0.014 ms; std 0.000 ms; achieved tflops 19.478 TFLOPs/sec; achieved tb_per_sec 2.474 TB/sec
 [PERF] trtllm-native  :: median time 0.013 ms; std 0.000 ms; achieved tflops 19.501 TFLOPs/sec; achieved tb_per_sec 2.476 TB/sec
-[WARNING] Backend name 'trtllm-gen-native' has been renamed to 'trtllm-native' and will be removed in a future release. 
+[WARNING] Backend name 'trtllm-gen-native' has been renamed to 'trtllm-native' and will be removed in a future release.
 [INFO] args = Namespace(routine='BatchMLAPagedAttentionWrapper', no_cuda_graph=False, use_cupti=False, use_cuda_events=False, refcheck=True, allow_output_mismatch=False, random_seed=42, verbose=2, output_path=None, num_iters=30, dry_run_iters=5, case_tag='DeepSeek-R1', generate_repro_command=True, repro_command='', backends=['trtllm-native', 'fa2', 'fa3'], page_size=32, batch_size=16, s_qo=1, s_kv=1024, num_qo_heads=128, num_kv_heads=128, head_dim_qk=None, head_dim_vo=None, head_dim_ckv=512, head_dim_kpe=64, q_dtype='bfloat16', kv_dtype='bfloat16', causal=False, random_actual_seq_len=True)
 [INFO] Running testBatchMLAPagedAttentionWrapper
 [INFO] FlashInfer version: 0.6.2
