@@ -55,7 +55,7 @@ env:
 jobs:
   aot-build-import:
     name: AOT Build Import (${{ matrix.arch }}, ${{ matrix.cuda }})
-    if: inputs.skip_aot != 'true' && inputs.aot_check_id != ''
+    if: inputs.skip_aot != 'true'
     runs-on:
       - self-hosted
       - Linux
@@ -213,7 +213,7 @@ jobs:
 
   gpu-tests-a10g:
     name: JIT Unittest ${{ matrix.shard }} (A10G)
-    if: inputs.skip_gpu != 'true' && inputs.gpu_a10g_check_id != ''
+    if: inputs.skip_gpu != 'true'
     runs-on: [self-hosted, Linux, X64, gpu, sm86, spot]
     timeout-minutes: 360
     strategy:
@@ -355,7 +355,7 @@ jobs:
 
   gpu-tests-t4:
     name: JIT Unittest (T4)
-    if: inputs.skip_gpu != 'true' && inputs.gpu_t4_check_id != ''
+    if: inputs.skip_gpu != 'true'
     runs-on: [self-hosted, Linux, X64, gpu, sm75, spot]
     timeout-minutes: 360
     env:
@@ -655,7 +655,7 @@ jobs:
             TITLE="Some tests failed"
           fi
 
-          SUMMARY=$(printf "$SUMMARY_LINES")
+          SUMMARY=$(printf '%b' "$SUMMARY_LINES")
 
           gh api -X PATCH repos/${{ github.repository }}/check-runs/${{ inputs.summary_check_id }} \
             -f status="completed" \
