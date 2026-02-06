@@ -198,26 +198,34 @@ class _SSDKernel:
         x_dst.copy_(x_reshaped.permute(4, 2, 1, 3, 0).to(x_dst.dtype))
 
         # delta (dt_processed): (batch, nheads, nchunks, chunk_size) -> (chunk_size, nchunks, nheads, batch)
-        delta_tensor, delta_dst = _create_cutlass_tensor(
-            [batch, nheads, nchunks, chunk_size],
-            [3, 2, 1, 0],
-            self.io_dtype,
-            [1, 2, 3],
-            cutlass_torch,
-            from_dlpack,
-        )
-        delta_dst.copy_(dt_processed.permute(3, 2, 1, 0).to(delta_dst.dtype))
+        # Need dtype conversion from float32 to bf16, but keep the non-contiguous permuted layout
+        # so that mode 0 (L) has stride 1 as the kernel expects
+        io_torch_dtype = cutlass_torch.dtype(self.io_dtype)
+        # First convert dtype (creates contiguous copy in original layout), then permute (zero-copy view)
+        dt_permuted = dt_processed.to(io_torch_dtype).permute(
+            3, 2, 1, 0
+        )  # (L, C, EH, B)
+        delta_tensor = from_dlpack(dt_permuted, assumed_align=16)
+        # Mark dynamic modes: C=1, EH=2, B=3 (L=0 is static)
+        for mode in [1, 2, 3]:
+            delta_tensor = delta_tensor.mark_compact_shape_dynamic(
+                mode=mode, stride_order=dt_permuted.dim_order()
+            )
 
-        # cumsum_delta (dA_cumsum): same layout as delta
-        cumsum_delta_tensor, cumsum_delta_dst = _create_cutlass_tensor(
-            [batch, nheads, nchunks, chunk_size],
-            [3, 2, 1, 0],
-            self.cumsum_dtype,
-            [1, 2, 3],
-            cutlass_torch,
-            from_dlpack,
+        assert dA_cumsum.dtype == cutlass_torch.dtype(self.cumsum_dtype), (
+            f"dA_cumsum dtype {dA_cumsum.dtype} doesn't match cumsum_dtype {self.cumsum_dtype}"
         )
-        cumsum_delta_dst.copy_(dA_cumsum.permute(3, 2, 1, 0).to(cumsum_delta_dst.dtype))
+        # cumsum_delta (dA_cumsum): same layout as delta
+        # Zero-copy: permute is just a view, from_dlpack sees modes in permuted order
+        cumsum_permuted = dA_cumsum.permute(
+            3, 2, 1, 0
+        )  # (L, C, EH, B) - zero-copy view
+        cumsum_delta_tensor = from_dlpack(cumsum_permuted, assumed_align=16)
+        # Mark dynamic modes: C=1, EH=2, B=3 (L=0 is static)
+        for mode in [1, 2, 3]:
+            cumsum_delta_tensor = cumsum_delta_tensor.mark_compact_shape_dynamic(
+                mode=mode, stride_order=cumsum_permuted.dim_order()
+            )
 
         # B: Triton (batch, seqlen, ngroups, dstate) -> CUTLASS (chunk_size, dstate, nchunks, ngroups, batch)
         B_reshaped = B.reshape(batch, nchunks, chunk_size, ngroups, dstate)
