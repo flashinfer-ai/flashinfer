@@ -40,13 +40,18 @@ void gdn_prefill_launcher(void* output, void* output_state, void* q, void* k, vo
                           int64_t head_size, int64_t packed_seq, float scale, int64_t sm_count,
                           DLDataType dtype, cudaStream_t stream) {
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(dtype, DType, [&] {
-    int dev_id;
-    cudaGetDevice(&dev_id);
-    cudaDeviceProp device_properties;
-    cudaGetDeviceProperties(&device_properties, dev_id);
+    // Cache device major version to avoid expensive cudaGetDeviceProperties per call
+    static thread_local int cached_device_major = -1;
+    if (cached_device_major < 0) {
+      int dev_id;
+      cudaGetDevice(&dev_id);
+      cudaDeviceProp device_properties;
+      cudaGetDeviceProperties(&device_properties, dev_id);
+      cached_device_major = device_properties.major;
+    }
 
 #if defined(FLAT_SM90A_ENABLED)
-    if (device_properties.major == 9) {
+    if (cached_device_major == 9) {
       flat::launch_delta_rule_prefill_kernel<cutlass::arch::Sm90, DType, DType, float>(
           stream, static_cast<DType*>(output), static_cast<float*>(output_state),
           static_cast<DType const*>(q), static_cast<DType const*>(k), static_cast<DType const*>(v),
@@ -57,7 +62,7 @@ void gdn_prefill_launcher(void* output, void* output_state, void* q, void* k, vo
     } else {
       std::ostringstream err_msg;
       err_msg << "delta rule kernel does not support this device major version: "
-              << device_properties.major;
+              << cached_device_major;
       FLASHINFER_ERROR(err_msg.str());
       return false;
     }
@@ -157,11 +162,16 @@ void gdn_prefill(TensorView output, TensorView output_state, TensorView q, Tenso
     scale = 1.0 / std::sqrt(head_size);
   }
 
-  int dev_id;
-  cudaGetDevice(&dev_id);
-  cudaDeviceProp device_properties;
-  cudaGetDeviceProperties(&device_properties, dev_id);
-  int32_t sm_count = device_properties.multiProcessorCount;
+  // Cache sm_count to avoid expensive cudaGetDeviceProperties per call
+  static thread_local int32_t cached_sm_count = -1;
+  if (cached_sm_count < 0) {
+    int dev_id;
+    cudaGetDevice(&dev_id);
+    cudaDeviceProp device_properties;
+    cudaGetDeviceProperties(&device_properties, dev_id);
+    cached_sm_count = device_properties.multiProcessorCount;
+  }
+  int32_t sm_count = cached_sm_count;
 
   auto stream = get_stream(q.device());
 
