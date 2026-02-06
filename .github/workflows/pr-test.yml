@@ -241,19 +241,48 @@ jobs:
 
       - name: Trigger Test Runner
         env:
-          GH_TOKEN: ${{ steps.ci-infra-token.outputs.token }}
+          GH_ACTION_TOKEN: ${{ github.token }}
+          CI_INFRA_TOKEN: ${{ steps.ci-infra-token.outputs.token }}
+          HEAD_SHA: ${{ needs.setup.outputs.head_sha }}
+          DOCKER_TAG: ${{ needs.setup.outputs.docker_tag }}
+          AOT_CHECK_ID: ${{ steps.create-checks.outputs.aot_check_id || '' }}
+          GPU_A10G_CHECK_ID: ${{ steps.create-checks.outputs.gpu_a10g_check_id || '' }}
+          GPU_T4_CHECK_ID: ${{ steps.create-checks.outputs.gpu_t4_check_id || '' }}
+          SUMMARY_CHECK_ID: ${{ steps.create-checks.outputs.summary_check_id || '' }}
+          SKIP_AOT: ${{ github.event.inputs.skip_aot || 'false' }}
+          SKIP_GPU: ${{ github.event.inputs.skip_gpu || 'false' }}
+          CONCURRENCY_KEY: pr-test-${{ github.ref }}
         run: |
-          gh api repos/flashinfer-ai/ci-infra/dispatches \
-            -f event_type="run-pr-test" \
-            -f client_payload[pr_head_sha]="${{ needs.setup.outputs.head_sha }}" \
-            -f client_payload[docker_tag]="${{ needs.setup.outputs.docker_tag }}" \
-            -f client_payload[aot_check_id]="${{ steps.create-checks.outputs.aot_check_id || '' }}" \
-            -f client_payload[gpu_a10g_check_id]="${{ steps.create-checks.outputs.gpu_a10g_check_id || '' }}" \
-            -f client_payload[gpu_t4_check_id]="${{ steps.create-checks.outputs.gpu_t4_check_id || '' }}" \
-            -f client_payload[summary_check_id]="${{ steps.create-checks.outputs.summary_check_id || '' }}" \
-            -f client_payload[skip_aot]="${{ github.event.inputs.skip_aot || 'false' }}" \
-            -f client_payload[skip_gpu]="${{ github.event.inputs.skip_gpu || 'false' }}" \
-            -f client_payload[concurrency_key]="pr-test-${{ github.ref }}"
+          # Try workflow_dispatch first (works after pr-test-runner.yml is on main)
+          # Uses GITHUB_TOKEN (has actions:write) - App token doesn't have Actions permission
+          if GH_TOKEN="$GH_ACTION_TOKEN" gh workflow run pr-test-runner.yml \
+            --repo "${{ github.repository }}" \
+            --ref main \
+            -f pr_head_sha="$HEAD_SHA" \
+            -f docker_tag="$DOCKER_TAG" \
+            -f aot_check_id="$AOT_CHECK_ID" \
+            -f gpu_a10g_check_id="$GPU_A10G_CHECK_ID" \
+            -f gpu_t4_check_id="$GPU_T4_CHECK_ID" \
+            -f summary_check_id="$SUMMARY_CHECK_ID" \
+            -f skip_aot="$SKIP_AOT" \
+            -f skip_gpu="$SKIP_GPU" \
+            -f concurrency_key="$CONCURRENCY_KEY" 2>/dev/null; then
+            echo "Triggered via workflow_dispatch (flashinfer)"
+          else
+            # Fallback: repository_dispatch to ci-infra (bootstrap)
+            GH_TOKEN="$CI_INFRA_TOKEN" gh api repos/flashinfer-ai/ci-infra/dispatches \
+              -f event_type="run-pr-test" \
+              -f client_payload[pr_head_sha]="$HEAD_SHA" \
+              -f client_payload[docker_tag]="$DOCKER_TAG" \
+              -f client_payload[aot_check_id]="$AOT_CHECK_ID" \
+              -f client_payload[gpu_a10g_check_id]="$GPU_A10G_CHECK_ID" \
+              -f client_payload[gpu_t4_check_id]="$GPU_T4_CHECK_ID" \
+              -f client_payload[summary_check_id]="$SUMMARY_CHECK_ID" \
+              -f client_payload[skip_aot]="$SKIP_AOT" \
+              -f client_payload[skip_gpu]="$SKIP_GPU" \
+              -f client_payload[concurrency_key]="$CONCURRENCY_KEY"
+            echo "Triggered via repository_dispatch (ci-infra bootstrap)"
+          fi
 
   report-unauthorized:
     name: Report Unauthorized
