@@ -40,6 +40,14 @@ on:
         required: false
         type: string
         default: 'false'
+      concurrency_key:
+        description: 'Concurrency group key for cancelling outdated runs'
+        required: false
+        type: string
+
+concurrency:
+  group: ${{ inputs.concurrency_key || github.run_id }}
+  cancel-in-progress: true
 
 env:
   EXECUTOR_NUMBER: "0"

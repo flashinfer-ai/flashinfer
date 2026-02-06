@@ -252,7 +252,8 @@ jobs:
             -f client_payload[gpu_t4_check_id]="${{ steps.create-checks.outputs.gpu_t4_check_id || '' }}" \
             -f client_payload[summary_check_id]="${{ steps.create-checks.outputs.summary_check_id || '' }}" \
             -f client_payload[skip_aot]="${{ github.event.inputs.skip_aot || 'false' }}" \
-            -f client_payload[skip_gpu]="${{ github.event.inputs.skip_gpu || 'false' }}"
+            -f client_payload[skip_gpu]="${{ github.event.inputs.skip_gpu || 'false' }}" \
+            -f client_payload[concurrency_key]="pr-test-${{ github.ref }}"
 
   report-unauthorized:
     name: Report Unauthorized
