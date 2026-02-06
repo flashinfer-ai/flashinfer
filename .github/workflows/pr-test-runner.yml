@@ -1,12 +1,5 @@
-# CI Test Runner - Triggered via workflow_dispatch
-# This workflow runs the actual tests and is NOT visible on PR status checks.
-# It updates check runs created by pr-test.yml (gateway).
-#
-# Architecture:
-# 1. pr-test.yml (gateway) creates check runs and triggers this workflow
-# 2. This workflow runs tests on spot/on-demand runners
-# 3. This workflow updates check runs when tests complete
-# 4. PR only sees the check runs, not this workflow's jobs
+# PR Test Runner - Runs tests and updates check runs.
+# Triggered by pr-test.yml via workflow_dispatch. Not visible on PR status.
 
 name: PR Test Runner
 
@@ -52,9 +45,6 @@ env:
   EXECUTOR_NUMBER: "0"
 
 jobs:
-  # ---------------------------------------------------------------------------
-  # AOT Build Import Tests (Spot)
-  # ---------------------------------------------------------------------------
   aot-build-import:
     name: AOT Build Import (${{ matrix.arch }}, ${{ matrix.cuda }})
     if: inputs.skip_aot != 'true' && inputs.aot_check_id != ''
@@ -213,9 +203,6 @@ jobs:
       - name: Run Test
         run: bash ci/bash.sh ${DOCKER_IMAGE} --no-gpu ./scripts/task_test_jit_cache_package_build_import.sh
 
-  # ---------------------------------------------------------------------------
-  # GPU JIT Tests - SM86 (A10G) - Spot
-  # ---------------------------------------------------------------------------
   gpu-tests-a10g:
     name: JIT Unittest ${{ matrix.shard }} (A10G)
     if: inputs.skip_gpu != 'true' && inputs.gpu_a10g_check_id != ''
@@ -358,9 +345,6 @@ jobs:
       - name: Run JIT Unittest Part ${{ matrix.shard }}
         run: bash ci/bash.sh ${DOCKER_IMAGE} ./scripts/task_jit_run_tests_part${{ matrix.shard }}.sh
 
-  # ---------------------------------------------------------------------------
-  # GPU JIT Tests - SM75 (T4) - Spot
-  # ---------------------------------------------------------------------------
   gpu-tests-t4:
     name: JIT Unittest (T4)
     if: inputs.skip_gpu != 'true' && inputs.gpu_t4_check_id != ''
@@ -488,9 +472,6 @@ jobs:
       - name: Run JIT Unittest Part 3 (T4)
         run: bash ci/bash.sh ${DOCKER_IMAGE} ./scripts/task_jit_run_tests_part3.sh
 
-  # ---------------------------------------------------------------------------
-  # Update Check Runs with Results
-  # ---------------------------------------------------------------------------
   update-check-runs:
     name: Update Check Runs
     if: always()
@@ -512,7 +493,6 @@ jobs:
         with:
           app-id: ${{ secrets.GH_APP_ID }}
           private-key: ${{ secrets.GH_APP_KEY }}
-          # Scoped to flashinfer only - for updating check runs (checks:write)
           owner: flashinfer-ai
           repositories: flashinfer
 
@@ -521,7 +501,6 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
-          # Determine AOT test result
           AOT_SPOT="${{ needs.aot-build-import.result }}"
           AOT_SPOT_TERM="${{ needs.analyze-aot-failure.outputs.is_spot_termination }}"
           AOT_RERUN="${{ needs.aot-build-import-rerun.result }}"
@@ -546,14 +525,11 @@ jobs:
             -F output[title]="$TITLE" \
             -F output[summary]="$SUMMARY"
 
-          echo "Updated AOT check run: $CONCLUSION"
-
       - name: Update GPU A10G Check Run
         if: inputs.gpu_a10g_check_id != '' && inputs.skip_gpu != 'true'
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
-          # Determine GPU A10G test result
           GPU_SPOT="${{ needs.gpu-tests-a10g.result }}"
           GPU_SPOT_TERM="${{ needs.analyze-gpu-a10g-failure.outputs.is_spot_termination }}"
           GPU_RERUN="${{ needs.gpu-tests-a10g-rerun.result }}"
@@ -578,14 +554,11 @@ jobs:
             -F output[title]="$TITLE" \
             -F output[summary]="$SUMMARY"
 
-          echo "Updated GPU A10G check run: $CONCLUSION"
-
       - name: Update GPU T4 Check Run
         if: inputs.gpu_t4_check_id != '' && inputs.skip_gpu != 'true'
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
-          # Determine GPU T4 test result
           GPU_SPOT="${{ needs.gpu-tests-t4.result }}"
           GPU_SPOT_TERM="${{ needs.analyze-gpu-t4-failure.outputs.is_spot_termination }}"
           GPU_RERUN="${{ needs.gpu-tests-t4-rerun.result }}"
@@ -610,14 +583,11 @@ jobs:
             -F output[title]="$TITLE" \
             -F output[summary]="$SUMMARY"
 
-          echo "Updated GPU T4 check run: $CONCLUSION"
-
       - name: Update Test Results Summary
         if: inputs.summary_check_id != ''
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
-          # Determine overall result from all test groups
           AOT_SPOT="${{ needs.aot-build-import.result }}"
           AOT_RERUN="${{ needs.aot-build-import-rerun.result }}"
           AOT_SPOT_TERM="${{ needs.analyze-aot-failure.outputs.is_spot_termination }}"
@@ -633,7 +603,6 @@ jobs:
           ALL_PASSED=true
           SUMMARY_LINES=""
 
-          # Check AOT result
           if [ "$SKIP_AOT" != "true" ]; then
             if [ "$AOT_SPOT" == "success" ]; then
               SUMMARY_LINES="${SUMMARY_LINES}- AOT Build Tests: Passed\n"
@@ -647,7 +616,6 @@ jobs:
             SUMMARY_LINES="${SUMMARY_LINES}- AOT Build Tests: Skipped\n"
           fi
 
-          # Check GPU A10G result
           if [ "$SKIP_GPU" != "true" ]; then
             if [ "$GPU_A10G_SPOT" == "success" ]; then
               SUMMARY_LINES="${SUMMARY_LINES}- JIT Unittest (A10G): Passed\n"
@@ -658,7 +626,6 @@ jobs:
               ALL_PASSED=false
             fi
 
-            # Check GPU T4 result
             if [ "$GPU_T4_SPOT" == "success" ]; then
               SUMMARY_LINES="${SUMMARY_LINES}- JIT Unittest (T4): Passed\n"
             elif [ "$GPU_T4_SPOT_TERM" == "true" ] && [ "$GPU_T4_RERUN" == "success" ]; then
@@ -689,15 +656,3 @@ jobs:
             -F output[summary]="$SUMMARY"
 
           echo "Updated Test Results Summary: $CONCLUSION"
-
-      - name: Summary
-        run: |
-          echo "## PR Test Runner Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Check runs updated for PR SHA: ${{ inputs.pr_head_sha }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Test | Spot | Rerun | Final |" >> $GITHUB_STEP_SUMMARY
-          echo "|------|------|-------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| AOT Build | ${{ needs.aot-build-import.result }} | ${{ needs.aot-build-import-rerun.result }} | - |" >> $GITHUB_STEP_SUMMARY
-          echo "| GPU A10G | ${{ needs.gpu-tests-a10g.result }} | ${{ needs.gpu-tests-a10g-rerun.result }} | - |" >> $GITHUB_STEP_SUMMARY
-          echo "| GPU T4 | ${{ needs.gpu-tests-t4.result }} | ${{ needs.gpu-tests-t4-rerun.result }} | - |" >> $GITHUB_STEP_SUMMARY
