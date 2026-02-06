@@ -1150,7 +1150,7 @@ def generate_jit_sources(
     enable_attn_logit_softcapping_values = [True, False]
     return_softmax_values = [True, False]
     alibi_values = [True, False]
-    warp_spec_configs = itertools.product(
+    warp_spec_configs: itertools.product = itertools.product(
         [90],
         dtype_values,
         head_size_qk_warpspec_values,
