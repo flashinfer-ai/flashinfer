@@ -750,8 +750,8 @@ def _get_compiled_kernel(
             y_uint8,
             s_tensor,
             global_scale,
-            Int32(M),
-            Float32(eps),
+            M,
+            eps,
         )
 
     return tensor_api

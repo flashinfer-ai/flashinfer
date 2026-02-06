@@ -1004,8 +1004,8 @@ def _get_compiled_kernel(
             s_tensor,
             s_unswizzled.contiguous(),
             global_scale,
-            Int32(M),
-            Float32(eps),
+            M,
+            eps,
         )
 
     return tensor_api
