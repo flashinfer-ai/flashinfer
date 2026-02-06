@@ -12,27 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-FlashInfer GEMM Kernels
-=======================
+FlashInfer GEMM Kernels (internal)
+===================================
 
-This module provides high-performance GPU GEMM kernels implemented using NVIDIA CuTe-DSL.
+Internal module containing GPU GEMM kernel implementations.
+Import from ``flashinfer.gemm`` for the public API.
 """
-
-from flashinfer.cute_dsl.utils import is_cute_dsl_available
-
-# Conditionally import CuTe-DSL kernels
-if is_cute_dsl_available():
-    from .grouped_gemm_masked_blackwell import (
-        grouped_gemm_nt_masked,
-        Sm100BlockScaledPersistentDenseGemmKernel,
-        create_scale_factor_tensor,
-    )
-
-__all__ = []
-
-if is_cute_dsl_available():
-    __all__ += [
-        "grouped_gemm_nt_masked",
-        "Sm100BlockScaledPersistentDenseGemmKernel",
-        "create_scale_factor_tensor",
-    ]

@@ -3,7 +3,7 @@ import random
 
 import numpy as np
 import cutlass
-from flashinfer.cute_dsl.blockscaled_gemm import (
+from flashinfer.gemm import (
     create_scale_factor_tensor,
     grouped_gemm_nt_masked,  # deepgemm-like python interface for DLFW integration
 )
