@@ -41,110 +41,132 @@ def attention_ref(
     return o_ref, lse_ref
 
 
-def paged_attention_ref_torch(
-    q: torch.Tensor,  # [total_q_tokens, num_qo_heads, head_dim]
-    paged_kv_cache: torch.Tensor,  # [num_pages, 2, page_size, num_kv_heads, head_dim]
-    block_tables: torch.Tensor,  # [batch_size, max_num_blocks]
-    seq_lens: torch.Tensor,  # [batch_size]
-    cum_seq_lens_q: torch.Tensor,  # [batch_size + 1]
+def attention_ref_torch(
+    qkv,
+    seq_lens: torch.Tensor,
+    cum_seq_lens_q: torch.Tensor,
     sm_scale: float,
     q_scale: float = 1.0,
     k_scale: float = 1.0,
     v_scale: float = 1.0,
     causal: bool = True,
     window_left: int = -1,
+    logits_soft_cap: float = 0.0,
+    block_tables: torch.Tensor = None,
+    cum_seq_lens_kv: torch.Tensor = None,
 ) -> torch.Tensor:
     """
-    Manual torch reference for paged attention with FP8 support.
+    Pure-torch reference for attention supporting multiple input layouts.
 
-
-    This function dequantizes FP8 inputs and computes attention manually,
-    providing a ground truth that's independent of kernel-specific FP8 scaling.
+    Layouts (auto-detected from qkv):
+      - Packed QKV: single tensor [total_tokens, 3, num_heads, head_dim]
+      - Separate Q, K, V: tuple (q, k, v)
+      - Contiguous Q + KV: tuple (q, kv) where kv is 4-D
+      - Paged Q + KV cache: tuple (q, paged_kv_cache) where paged_kv_cache is 5-D
+        (requires block_tables)
     """
-    device = q.device
+    device = seq_lens.device
     batch_size = seq_lens.shape[0]
-    num_qo_heads = q.shape[1]
-    num_kv_heads = paged_kv_cache.shape[3]
-    head_dim = q.shape[2]
-    page_size = paged_kv_cache.shape[2]
+
+    if cum_seq_lens_kv is None:
+        cum_seq_lens_kv = cum_seq_lens_q
+
+    # --- parse input layout ---
+    is_paged = False
+    if isinstance(qkv, torch.Tensor):
+        # Packed QKV: [total, 3, H, D]
+        q_flat = qkv[:, 0, :, :].contiguous()
+        k_flat = qkv[:, 1, :, :].contiguous()
+        v_flat = qkv[:, 2, :, :].contiguous()
+    elif isinstance(qkv, tuple):
+        if len(qkv) == 3:
+            q_flat, k_flat, v_flat = qkv
+        elif len(qkv) == 2:
+            q_flat = qkv[0]
+            second = qkv[1]
+            if second.ndim == 5:
+                # Paged: (q, paged_kv_cache[num_pages, 2, page_size, H_kv, D])
+                is_paged = True
+                paged_kv_cache = second
+                page_size = paged_kv_cache.shape[2]
+            else:
+                # Contiguous: (q, kv[total, 2, H_kv, D])
+                k_flat = second[:, 0, :, :].contiguous()
+                v_flat = second[:, 1, :, :].contiguous()
+        else:
+            raise ValueError(f"Unexpected tuple length: {len(qkv)}")
+    else:
+        raise TypeError(f"Unexpected qkv type: {type(qkv)}")
+
+    num_qo_heads = q_flat.shape[1]
+    head_dim = q_flat.shape[2]
+    if is_paged:
+        num_kv_heads = paged_kv_cache.shape[3]
+    else:
+        num_kv_heads = k_flat.shape[1]
     heads_per_group = num_qo_heads // num_kv_heads
 
-    # Dequantize Q if FP8
-    q_float = q.float() * q_scale
+    q_float = q_flat.float() * q_scale
 
-    # Process each sequence in the batch
     outputs = []
     for b in range(batch_size):
         seq_len = seq_lens[b].item()
         q_start = cum_seq_lens_q[b].item()
         q_end = cum_seq_lens_q[b + 1].item()
         q_len = q_end - q_start
-
-        # Get Q for this sequence: [q_len, num_qo_heads, head_dim]
         q_seq = q_float[q_start:q_end]
 
-        # Gather K and V from paged cache
-        num_pages_needed = (seq_len + page_size - 1) // page_size
-        k_pages = []
-        v_pages = []
-        for p in range(num_pages_needed):
-            page_idx = block_tables[b, p].item()
-            k_pages.append(paged_kv_cache[page_idx, 0])  # [page_size, num_kv_heads, head_dim]
-            v_pages.append(paged_kv_cache[page_idx, 1])
+        if is_paged:
+            num_pages_needed = (seq_len + page_size - 1) // page_size
+            k_pages = []
+            v_pages = []
+            for p in range(num_pages_needed):
+                page_idx = block_tables[b, p].item()
+                k_pages.append(paged_kv_cache[page_idx, 0])
+                v_pages.append(paged_kv_cache[page_idx, 1])
+            k_seq = torch.cat(k_pages, dim=0)[:seq_len].float() * k_scale
+            v_seq = torch.cat(v_pages, dim=0)[:seq_len].float() * v_scale
+        else:
+            kv_start = cum_seq_lens_kv[b].item()
+            kv_end = cum_seq_lens_kv[b + 1].item()
+            k_seq = k_flat[kv_start:kv_end].float() * k_scale
+            v_seq = v_flat[kv_start:kv_end].float() * v_scale
 
-        # Concatenate pages: [total_page_tokens, num_kv_heads, head_dim]
-        k_seq = torch.cat(k_pages, dim=0)[:seq_len]  # Trim to actual seq_len
-        v_seq = torch.cat(v_pages, dim=0)[:seq_len]
-
-        # Dequantize K and V if FP8
-        k_seq = k_seq.float() * k_scale
-        v_seq = v_seq.float() * v_scale
-
-        # Compute attention for each query head
-        # q_seq: [q_len, num_qo_heads, head_dim]
-        # k_seq: [kv_len, num_kv_heads, head_dim]
-        # v_seq: [kv_len, num_kv_heads, head_dim]
-
-        o_seq = torch.zeros(q_len, num_qo_heads, head_dim, dtype=torch.float32, device=device)
+        o_seq = torch.zeros(
+            q_len, num_qo_heads, head_dim, dtype=torch.float32, device=device
+        )
 
         for h in range(num_qo_heads):
-            kv_h = h // heads_per_group  # KV head index for GQA
+            kv_h = h // heads_per_group
 
-            # q: [q_len, head_dim], k: [kv_len, head_dim]
-            q_h = q_seq[:, h, :]  # [q_len, head_dim]
-            k_h = k_seq[:, kv_h, :]  # [kv_len, head_dim]
-            v_h = v_seq[:, kv_h, :]  # [kv_len, head_dim]
+            q_h = q_seq[:, h, :]
+            k_h = k_seq[:, kv_h, :]
+            v_h = v_seq[:, kv_h, :]
 
-            # Compute attention scores: [q_len, kv_len]
             scores = torch.matmul(q_h, k_h.t()) * sm_scale
 
-            # Apply causal mask
+            if logits_soft_cap > 0.0:
+                scores = logits_soft_cap * torch.tanh(scores / logits_soft_cap)
+
             if causal:
-                # For prefill with q_len == kv_len (self-attention)
                 q_indices = torch.arange(q_len, device=device).unsqueeze(1)
                 kv_indices = torch.arange(seq_len, device=device).unsqueeze(0)
-                # Causal: query position >= key position (accounting for offset if q_len < kv_len)
                 offset = seq_len - q_len
                 causal_mask = (q_indices + offset) >= kv_indices
-                scores = scores.masked_fill(~causal_mask, float('-inf'))
+                scores = scores.masked_fill(~causal_mask, float("-inf"))
 
-            # Apply sliding window if specified
             if window_left >= 0:
                 q_indices = torch.arange(q_len, device=device).unsqueeze(1)
                 kv_indices = torch.arange(seq_len, device=device).unsqueeze(0)
                 offset = seq_len - q_len
-                # Window: key position >= query position - window_left
                 window_mask = kv_indices >= (q_indices + offset - window_left)
-                scores = scores.masked_fill(~window_mask, float('-inf'))
+                scores = scores.masked_fill(~window_mask, float("-inf"))
 
-            # Softmax and output
             attn = torch.softmax(scores, dim=-1)
-            o_h = torch.matmul(attn, v_h)  # [q_len, head_dim]
-            o_seq[:, h, :] = o_h
+            o_seq[:, h, :] = torch.matmul(attn, v_h)
 
         outputs.append(o_seq)
 
-    # Concatenate all sequences
     return torch.cat(outputs, dim=0)
 
 
@@ -278,12 +300,21 @@ def test_fmha_v2_prefill_deepseek(
     torch.testing.assert_close(lse, lse_ref, rtol=1e-2, atol=1e-3)
 
 
+@pytest.mark.parametrize(
+    ("input_layout", "page_size"),
+    [
+        ("PACKED_QKV", None),
+        ("CONTIGUOUS_Q_KV", None),
+        ("SEPARATE_Q_K_V", None),
+        ("Q_PAGED_KV", 32),
+        ("Q_PAGED_KV", 128),
+    ],
+)
 @pytest.mark.parametrize("batch_size", [4, 16])
 @pytest.mark.parametrize("max_seq_len", [1024, 4096])
 @pytest.mark.parametrize("num_qo_heads", [4, 32])
-@pytest.mark.parametrize("num_kv_heads", [4])  # Paged KV cache
+@pytest.mark.parametrize("num_kv_heads", [4])
 @pytest.mark.parametrize("head_dim", [128, 256])
-@pytest.mark.parametrize("page_size", [32, 128])
 @pytest.mark.parametrize(("dtype", "o_dtype"), [
     (torch.float16, torch.float16),
     (torch.bfloat16, torch.bfloat16),
@@ -300,8 +331,9 @@ def test_fmha_v2_prefill_deepseek(
     ],
 )
 @pytest.mark.parametrize("pos_encoding_mode", ["NONE"])
-@pytest.mark.parametrize("logits_soft_cap", [0.0])
-def test_trtllm_fmha_v2_prefill_paged(
+@pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
+def test_trtllm_fmha_v2_prefill(
+    input_layout,
     batch_size,
     max_seq_len,
     num_qo_heads,
@@ -323,6 +355,12 @@ def test_trtllm_fmha_v2_prefill_paged(
     if not is_sm90a_supported(torch.device("cuda")):
         pytest.skip("FMHA v2 requires SM90+ (Hopper) GPUs.")
 
+    # Skip invalid combinations
+    if input_layout == "SEPARATE_Q_K_V" and dtype == torch.float8_e4m3fn:
+        pytest.skip("FP8 not supported for SEPARATE_Q_K_V layout")
+    if input_layout == "SEPARATE_Q_K_V" and logits_soft_cap > 0:
+        pytest.skip("Logits soft capping not supported for SEPARATE_Q_K_V layout")
+
     torch.manual_seed(42)
     device = torch.device("cuda")
 
@@ -334,65 +372,110 @@ def test_trtllm_fmha_v2_prefill_paged(
         device=device,
     )
     max_kv_len = seq_lens.max().item()
-    max_num_blocks = (max_kv_len + page_size - 1) // page_size
-
-    num_pages = batch_size * max_num_blocks
-
-    # Handle FP8 case: create in bfloat16 first, then convert
-    # For FP8, we need to capture the scales for proper dequantization
-    if dtype == torch.float8_e4m3fn:
-        paged_kv_cache_bf16 = torch.randn(
-            num_pages, 2, page_size, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device
-        )
-        paged_kv_cache, kv_scale = to_float8(paged_kv_cache_bf16, dtype=torch.float8_e4m3fn)
-        kv_scale = kv_scale.item()
-    else:
-        paged_kv_cache = torch.randn(
-            num_pages, 2, page_size, num_kv_heads, head_dim, dtype=dtype, device=device
-        )
-        kv_scale = 1.0
-
-    block_tables = torch.zeros(
-        batch_size, max_num_blocks, dtype=torch.int32, device=device
-    )
-    for i in range(batch_size):
-        num_blocks_needed = (seq_lens[i].item() + page_size - 1) // page_size
-        block_tables[i, :num_blocks_needed] = torch.arange(
-            i * max_num_blocks, i * max_num_blocks + num_blocks_needed, device=device
-        )
-
-    cum_seq_lens_q = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
-    cum_seq_lens_q[1:] = torch.cumsum(seq_lens, dim=0)
-    cum_seq_lens_kv = cum_seq_lens_q.clone()
-
-    total_q_tokens = cum_seq_lens_q[-1].item()
-
-    # Handle FP8 case: create in bfloat16 first, then convert
-    # For FP8, we need to capture the scales for proper dequantization
-    if dtype == torch.float8_e4m3fn:
-        q_bf16 = torch.randn(total_q_tokens, num_qo_heads, head_dim, dtype=torch.bfloat16, device=device)
-        q, q_scale = to_float8(q_bf16, dtype=torch.float8_e4m3fn)
-        q_scale = q_scale.item()
-    else:
-        q = torch.randn(total_q_tokens, num_qo_heads, head_dim, dtype=dtype, device=device)
-        q_scale = 1.0
-    o = torch.zeros(total_q_tokens, num_qo_heads, head_dim, dtype=o_dtype, device=device)
-
-    workspace_buffer = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+    cum_seq_lens = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+    cum_seq_lens[1:] = torch.cumsum(seq_lens, dim=0)
+    total_tokens = cum_seq_lens[-1].item()
 
     sm_scale = 1.0 / math.sqrt(head_dim)
-    # For FP8: bmm1_scale = sm_scale * q_scale * k_scale, bmm2_scale = v_scale
-    # (k_scale and v_scale are the same since KV cache is quantized together)
+    max_q_len = seq_lens.max().item()
+    block_tables = None
+
+    # --- Create inputs and scales per layout ---
+    if input_layout == "PACKED_QKV":
+        if dtype == torch.float8_e4m3fn:
+            packed_bf16 = torch.randn(
+                total_tokens, 3, num_qo_heads, head_dim,
+                dtype=torch.bfloat16, device=device,
+            )
+            packed_qkv, qkv_scale = to_float8(packed_bf16, dtype=torch.float8_e4m3fn)
+            qkv_scale = qkv_scale.item()
+        else:
+            packed_qkv = torch.randn(
+                total_tokens, 3, num_qo_heads, head_dim, dtype=dtype, device=device,
+            )
+            qkv_scale = 1.0
+        qkv_arg = packed_qkv
+        q_scale, k_scale, v_scale = qkv_scale, qkv_scale, qkv_scale
+
+    elif input_layout == "SEPARATE_Q_K_V":
+        q = torch.randn(total_tokens, num_qo_heads, head_dim, dtype=dtype, device=device)
+        k = torch.randn(total_tokens, num_kv_heads, head_dim, dtype=dtype, device=device)
+        v = torch.randn(total_tokens, num_kv_heads, head_dim, dtype=dtype, device=device)
+        qkv_arg = (q, k, v)
+        q_scale, k_scale, v_scale = 1.0, 1.0, 1.0
+
+    elif input_layout == "CONTIGUOUS_Q_KV":
+        if dtype == torch.float8_e4m3fn:
+            q_bf16 = torch.randn(
+                total_tokens, num_qo_heads, head_dim,
+                dtype=torch.bfloat16, device=device,
+            )
+            q, q_scale = to_float8(q_bf16, dtype=torch.float8_e4m3fn)
+            q_scale = q_scale.item()
+            kv_bf16 = torch.randn(
+                total_tokens, 2, num_kv_heads, head_dim,
+                dtype=torch.bfloat16, device=device,
+            )
+            kv, kv_scale = to_float8(kv_bf16, dtype=torch.float8_e4m3fn)
+            kv_scale = kv_scale.item()
+        else:
+            q = torch.randn(total_tokens, num_qo_heads, head_dim, dtype=dtype, device=device)
+            kv = torch.randn(
+                total_tokens, 2, num_kv_heads, head_dim, dtype=dtype, device=device,
+            )
+            q_scale, kv_scale = 1.0, 1.0
+        qkv_arg = (q, kv)
+        k_scale, v_scale = kv_scale, kv_scale
+
+    elif input_layout == "Q_PAGED_KV":
+        max_num_blocks = (max_kv_len + page_size - 1) // page_size
+        num_pages = batch_size * max_num_blocks
+        if dtype == torch.float8_e4m3fn:
+            paged_bf16 = torch.randn(
+                num_pages, 2, page_size, num_kv_heads, head_dim,
+                dtype=torch.bfloat16, device=device,
+            )
+            paged_kv_cache, kv_scale = to_float8(paged_bf16, dtype=torch.float8_e4m3fn)
+            kv_scale = kv_scale.item()
+            q_bf16 = torch.randn(
+                total_tokens, num_qo_heads, head_dim,
+                dtype=torch.bfloat16, device=device,
+            )
+            q, q_scale = to_float8(q_bf16, dtype=torch.float8_e4m3fn)
+            q_scale = q_scale.item()
+        else:
+            paged_kv_cache = torch.randn(
+                num_pages, 2, page_size, num_kv_heads, head_dim,
+                dtype=dtype, device=device,
+            )
+            q = torch.randn(total_tokens, num_qo_heads, head_dim, dtype=dtype, device=device)
+            q_scale, kv_scale = 1.0, 1.0
+        block_tables = torch.zeros(
+            batch_size, max_num_blocks, dtype=torch.int32, device=device,
+        )
+        for i in range(batch_size):
+            num_blocks_needed = (seq_lens[i].item() + page_size - 1) // page_size
+            block_tables[i, :num_blocks_needed] = torch.arange(
+                i * max_num_blocks, i * max_num_blocks + num_blocks_needed,
+                device=device,
+            )
+        qkv_arg = (q, paged_kv_cache)
+        k_scale, v_scale = kv_scale, kv_scale
+
+    # --- Compute BMM scales ---
     if dtype == torch.float8_e4m3fn:
-        bmm1_scale = sm_scale * q_scale * kv_scale
-        bmm2_scale = kv_scale
+        bmm1_scale = sm_scale * q_scale * k_scale
+        bmm2_scale = v_scale
     else:
         bmm1_scale = sm_scale
         bmm2_scale = 1.0
-    max_q_len = seq_lens.max().item()
 
+    o = torch.zeros(total_tokens, num_qo_heads, head_dim, dtype=o_dtype, device=device)
+    workspace_buffer = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+
+    # --- Run kernel ---
     output = trtllm_fmha_v2_prefill(
-        (q, paged_kv_cache),
+        qkv_arg,
         workspace_buffer=workspace_buffer,
         seq_lens=seq_lens,
         max_q_len=max_q_len,
@@ -400,8 +483,8 @@ def test_trtllm_fmha_v2_prefill_paged(
         bmm1_scale=bmm1_scale,
         bmm2_scale=bmm2_scale,
         batch_size=batch_size,
-        cum_seq_lens_q=cum_seq_lens_q,
-        cum_seq_lens_kv=cum_seq_lens_kv,
+        cum_seq_lens_q=cum_seq_lens,
+        cum_seq_lens_kv=cum_seq_lens,
         block_tables=block_tables,
         out=o,
         out_dtype=o_dtype,
@@ -413,441 +496,25 @@ def test_trtllm_fmha_v2_prefill_paged(
         pos_encoding_mode=pos_encoding_mode,
     )
 
-    # cumulative page counts per sequence
-    page_per_seq = (seq_lens + page_size - 1) // page_size
-    paged_kv_indptr = torch.cat(
-        [
-            torch.tensor([0], dtype=torch.int32, device=device),
-            torch.cumsum(page_per_seq, dim=0, dtype=torch.int32),
-        ]
+    # --- Reference ---
+    output_ref = attention_ref_torch(
+        qkv_arg,
+        seq_lens=seq_lens,
+        cum_seq_lens_q=cum_seq_lens,
+        sm_scale=sm_scale,
+        q_scale=q_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        causal=causal,
+        window_left=window_left,
+        logits_soft_cap=logits_soft_cap,
+        block_tables=block_tables,
     )
 
-    # Flatten block_tables to get paged_kv_indices
-    paged_kv_indices = []
-    for i in range(batch_size):
-        num_pages_needed = page_per_seq[i].item()
-        paged_kv_indices.append(block_tables[i, :num_pages_needed])
-    paged_kv_indices = torch.cat(paged_kv_indices)
-
-    kv_last_page_len = seq_lens % page_size
-    kv_last_page_len[kv_last_page_len == 0] = page_size
-
-    # For FP8 inputs, use manual torch reference to avoid FA3's different FP8 scaling semantics
-    # FA3 and TRT-LLM FMHAv2 have incompatible internal FP8 scaling (p_scale=448 vs 256)
     if dtype == torch.float8_e4m3fn:
-        output_ref = paged_attention_ref_torch(
-            q=q,
-            paged_kv_cache=paged_kv_cache,
-            block_tables=block_tables,
-            seq_lens=seq_lens,
-            cum_seq_lens_q=cum_seq_lens_q,
-            sm_scale=sm_scale,
-            q_scale=q_scale,
-            k_scale=kv_scale,
-            v_scale=kv_scale,
-            causal=causal,
-            window_left=window_left,
-        )
-        # FP8 has larger numerical error due to quantization
-        # Early tokens with small attention contexts can have slightly higher error
         rtol, atol = 4e-2, 7e-2
     else:
-        # For non-FP8, use FA3 reference which has compatible scaling
-        # Use zeros() to avoid uninitialized memory from previous tests
-        workspace_buffer_ref = torch.zeros(
-            128 * 1024 * 1024, dtype=torch.int8, device=device
-        )
-
-        plan_params = {
-            "qo_indptr": cum_seq_lens_q,
-            "paged_kv_indptr": paged_kv_indptr,
-            "paged_kv_indices": paged_kv_indices,
-            "paged_kv_last_page_len": kv_last_page_len,
-            "num_qo_heads": num_qo_heads,
-            "num_kv_heads": num_kv_heads,
-            "head_dim_qk": head_dim,
-            "page_size": page_size,
-            "causal": causal,
-            "pos_encoding_mode": pos_encoding_mode,
-            "logits_soft_cap": logits_soft_cap,
-            "q_data_type": q.dtype,
-            "kv_data_type": paged_kv_cache.dtype,
-            "o_data_type": o_dtype,
-            "window_left": window_left,
-            "non_blocking": non_blocking,
-        }
-
-        wrapper_ref = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
-            workspace_buffer_ref, "NHD"
-        )
-        wrapper_ref.plan(**plan_params)
-        output_ref = wrapper_ref.run(q, paged_kv_cache)
         rtol, atol = 1e-2, 1e-2
-
-    # Ensure all GPU operations complete before comparison
-    torch.testing.assert_close(output.float(), output_ref.float(), rtol=rtol, atol=atol)
-
-
-@pytest.mark.parametrize("batch_size", [4, 16])
-@pytest.mark.parametrize("max_seq_len", [1024, 4096])
-@pytest.mark.parametrize("num_qo_heads", [4, 32])
-@pytest.mark.parametrize("num_kv_heads", [4])
-@pytest.mark.parametrize("head_dim", [128, 256])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("non_blocking", [True, False])
-@pytest.mark.parametrize(
-    ("causal", "window_left", "mask_mode"),
-    [
-        (True, -1, "CAUSAL"),
-        (True, 127, "SLIDING_WINDOW"),
-        (True, 512, "SLIDING_WINDOW"),
-    ],
-)
-@pytest.mark.parametrize("pos_encoding_mode", ["NONE"])
-@pytest.mark.parametrize("logits_soft_cap", [0.0])
-def test_trtllm_fmha_v2_prefill_packed(
-    batch_size,
-    max_seq_len,
-    num_qo_heads,
-    num_kv_heads,
-    head_dim,
-    dtype,
-    causal,
-    mask_mode,
-    non_blocking,
-    window_left,
-    logits_soft_cap,
-    pos_encoding_mode,
-):
-    from flashinfer.prefill import trtllm_fmha_v2_prefill
-    from flashinfer.utils import is_sm90a_supported
-
-    if not is_sm90a_supported(torch.device("cuda")):
-        pytest.skip("FMHA v2 requires SM90+ (Hopper) GPUs.")
-
-    torch.manual_seed(42)
-    device = torch.device("cuda")
-
-    seq_lens = torch.randint(
-        max_seq_len // 2,
-        max_seq_len + 1,
-        (batch_size,),
-        dtype=torch.int32,
-        device=device,
-    )
-    max_kv_len = seq_lens.max().item()
-    cum_seq_lens = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
-    cum_seq_lens[1:] = torch.cumsum(seq_lens, dim=0)
-    total_tokens = cum_seq_lens[-1].item()
-    packed_qkv = torch.randn(
-        total_tokens, 3, num_qo_heads, head_dim, dtype=dtype, device=device
-    )
-    q_ref = packed_qkv[:, 0, :, :].contiguous()  # [total_tokens, H, D]
-    k_ref = packed_qkv[:, 1, :, :].contiguous()  # [total_tokens, H, D]
-    v_ref = packed_qkv[:, 2, :, :].contiguous()  # [total_tokens, H, D]
-    o = torch.zeros(total_tokens, num_qo_heads, head_dim, dtype=dtype, device=device)
-    workspace_buffer = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=device)
-
-    sm_scale = 1.0 / math.sqrt(head_dim)
-    max_q_len = max_kv_len
-
-    output = trtllm_fmha_v2_prefill(
-        packed_qkv,
-        workspace_buffer=workspace_buffer,
-        seq_lens=seq_lens,
-        max_q_len=max_q_len,
-        max_kv_len=max_kv_len,
-        bmm1_scale=sm_scale,
-        bmm2_scale=1.0,
-        batch_size=batch_size,
-        cum_seq_lens_q=cum_seq_lens,
-        cum_seq_lens_kv=cum_seq_lens,
-        out=o,
-        out_dtype=dtype,
-        kv_layout="NHD",
-        mask_mode=mask_mode,
-        window_left=window_left,
-        non_blocking=non_blocking,
-        logits_soft_cap_scale=logits_soft_cap if logits_soft_cap > 0 else None,
-        pos_encoding_mode=pos_encoding_mode,
-    )
-
-    workspace_buffer_ref = torch.empty(
-        128 * 1024 * 1024, dtype=torch.int8, device=device
-    )
-
-    # cumulative token counts per sequence
-    kv_indptr = torch.cat(
-        [
-            torch.tensor([0], dtype=torch.int32, device=device),
-            torch.cumsum(seq_lens, dim=0, dtype=torch.int32),
-        ]
-    )
-
-    wrapper_ref = flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
-        workspace_buffer_ref, "NHD"
-    )
-    wrapper_ref.plan(
-        qo_indptr=cum_seq_lens,
-        kv_indptr=kv_indptr,
-        num_qo_heads=num_qo_heads,
-        num_kv_heads=num_kv_heads,
-        head_dim_qk=head_dim,
-        causal=causal,
-        q_data_type=dtype,
-        kv_data_type=dtype,
-        window_left=window_left,
-        non_blocking=non_blocking,
-        logits_soft_cap=logits_soft_cap,
-        pos_encoding_mode=pos_encoding_mode,
-    )
-    output_ref = wrapper_ref.run(q_ref, k_ref, v_ref)
-    rtol, atol = 1e-2, 5e-3
-    torch.testing.assert_close(output.float(), output_ref.float(), rtol=rtol, atol=atol)
-
-
-@pytest.mark.parametrize("batch_size", [4, 16])
-@pytest.mark.parametrize("max_seq_len", [1024, 4096])
-@pytest.mark.parametrize("num_qo_heads", [4, 32])
-@pytest.mark.parametrize("num_kv_heads", [4])
-@pytest.mark.parametrize("head_dim", [128, 256])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("non_blocking", [True, False])
-@pytest.mark.parametrize(
-    ("causal", "window_left", "mask_mode"),
-    [
-        (True, -1, "CAUSAL"),
-        (True, 127, "SLIDING_WINDOW"),
-        (True, 512, "SLIDING_WINDOW"),
-    ],
-)
-@pytest.mark.parametrize("pos_encoding_mode", ["NONE"])
-@pytest.mark.parametrize("logits_soft_cap", [0.0])
-def test_trtllm_fmha_v2_prefill_separate(
-    batch_size,
-    max_seq_len,
-    num_qo_heads,
-    num_kv_heads,
-    head_dim,
-    dtype,
-    causal,
-    mask_mode,
-    non_blocking,
-    window_left,
-    logits_soft_cap,
-    pos_encoding_mode,
-):
-    from flashinfer.prefill import trtllm_fmha_v2_prefill
-    from flashinfer.utils import is_sm90a_supported
-
-    if not is_sm90a_supported(torch.device("cuda")):
-        pytest.skip("FMHA v2 requires SM90+ (Hopper) GPUs.")
-
-    torch.manual_seed(42)
-    device = torch.device("cuda")
-
-    seq_lens = torch.randint(
-        max_seq_len // 2,
-        max_seq_len + 1,
-        (batch_size,),
-        dtype=torch.int32,
-        device=device,
-    )
-    max_kv_len = seq_lens.max().item()
-    cum_seq_lens = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
-    cum_seq_lens[1:] = torch.cumsum(seq_lens, dim=0)
-    total_tokens = cum_seq_lens[-1].item()
-
-    # Create separate Q, K, V tensors
-    q = torch.randn(total_tokens, num_qo_heads, head_dim, dtype=dtype, device=device)
-    k = torch.randn(total_tokens, num_kv_heads, head_dim, dtype=dtype, device=device)
-    v = torch.randn(total_tokens, num_kv_heads, head_dim, dtype=dtype, device=device)
-    o = torch.zeros(total_tokens, num_qo_heads, head_dim, dtype=dtype, device=device)
-    workspace_buffer = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=device)
-
-    sm_scale = 1.0 / math.sqrt(head_dim)
-    max_q_len = max_kv_len
-
-    # Pass (Q, K, V) tuple - layout is auto-detected as SEPARATE_Q_K_V
-    output = trtllm_fmha_v2_prefill(
-        (q, k, v),  # Tuple of separate tensors
-        workspace_buffer=workspace_buffer,
-        seq_lens=seq_lens,
-        max_q_len=max_q_len,
-        max_kv_len=max_kv_len,
-        bmm1_scale=sm_scale,
-        bmm2_scale=1.0,
-        batch_size=batch_size,
-        cum_seq_lens_q=cum_seq_lens,
-        cum_seq_lens_kv=cum_seq_lens,
-        out=o,
-        out_dtype=dtype,
-        kv_layout="NHD",
-        mask_mode=mask_mode,
-        window_left=window_left,
-        non_blocking=non_blocking,
-        logits_soft_cap_scale=logits_soft_cap if logits_soft_cap > 0 else None,
-        pos_encoding_mode=pos_encoding_mode,
-    )
-    workspace_buffer_ref = torch.empty(
-        128 * 1024 * 1024, dtype=torch.int8, device=device
-    )
-
-    # cumulative token counts per sequence
-    kv_indptr = torch.cat(
-        [
-            torch.tensor([0], dtype=torch.int32, device=device),
-            torch.cumsum(seq_lens, dim=0, dtype=torch.int32),
-        ]
-    )
-
-    wrapper_ref = flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
-        workspace_buffer_ref, "NHD"
-    )
-    wrapper_ref.plan(
-        qo_indptr=cum_seq_lens,
-        kv_indptr=kv_indptr,
-        num_qo_heads=num_qo_heads,
-        num_kv_heads=num_kv_heads,
-        head_dim_qk=head_dim,
-        causal=causal,
-        q_data_type=dtype,
-        kv_data_type=dtype,
-        window_left=window_left,
-        non_blocking=non_blocking,
-        logits_soft_cap=logits_soft_cap,
-        pos_encoding_mode=pos_encoding_mode,
-    )
-    output_ref = wrapper_ref.run(q, k, v)
-    rtol, atol = 1e-2, 5e-3
-    torch.testing.assert_close(output.float(), output_ref.float(), rtol=rtol, atol=atol)
-
-
-@pytest.mark.parametrize("batch_size", [4, 16])
-@pytest.mark.parametrize("max_seq_len", [1024, 4096])
-@pytest.mark.parametrize("num_qo_heads", [4, 32])
-@pytest.mark.parametrize("num_kv_heads", [4])
-@pytest.mark.parametrize("head_dim", [128, 256])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("non_blocking", [True, False])
-@pytest.mark.parametrize(
-    ("causal", "window_left", "mask_mode"),
-    [
-        (True, -1, "CAUSAL"),
-        (True, 127, "SLIDING_WINDOW"),
-        (True, 512, "SLIDING_WINDOW"),
-    ],
-)
-@pytest.mark.parametrize("pos_encoding_mode", ["NONE"])
-@pytest.mark.parametrize("logits_soft_cap", [0.0])
-def test_trtllm_fmha_v2_prefill_contiguous(
-    batch_size,
-    max_seq_len,
-    num_qo_heads,
-    num_kv_heads,
-    head_dim,
-    dtype,
-    causal,
-    mask_mode,
-    non_blocking,
-    window_left,
-    logits_soft_cap,
-    pos_encoding_mode,
-):
-    from flashinfer.prefill import trtllm_fmha_v2_prefill
-    from flashinfer.utils import is_sm90a_supported
-
-    if not is_sm90a_supported(torch.device("cuda")):
-        pytest.skip("FMHA v2 requires SM90+ (Hopper) GPUs.")
-
-    torch.manual_seed(42)
-    device = torch.device("cuda")
-
-    seq_lens = torch.randint(
-        max_seq_len // 2,
-        max_seq_len + 1,
-        (batch_size,),
-        dtype=torch.int32,
-        device=device,
-    )
-    max_kv_len = seq_lens.max().item()
-    cum_seq_lens = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
-    cum_seq_lens[1:] = torch.cumsum(seq_lens, dim=0)
-    total_tokens = cum_seq_lens[-1].item()
-
-    # Create Q tensor: [total_tokens, num_qo_heads, head_dim]
-    q = torch.randn(total_tokens, num_qo_heads, head_dim, dtype=dtype, device=device)
-
-    # Create KV tensor: [total_tokens, 2, num_kv_heads, head_dim]
-    # where kv[:, 0, :, :] is K and kv[:, 1, :, :] is V
-    kv = torch.randn(
-        total_tokens, 2, num_kv_heads, head_dim, dtype=dtype, device=device
-    )
-
-    o = torch.zeros(total_tokens, num_qo_heads, head_dim, dtype=dtype, device=device)
-    workspace_buffer = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=device)
-
-    sm_scale = 1.0 / math.sqrt(head_dim)
-    max_q_len = max_kv_len
-
-    # Pass (Q, KV) tuple - API will auto-detect CONTIGUOUS_Q_KV layout
-    output = trtllm_fmha_v2_prefill(
-        (q, kv),  # Tuple of (Q, KV) where KV is 4D with dim 1 = 2
-        workspace_buffer=workspace_buffer,
-        seq_lens=seq_lens,
-        max_q_len=max_q_len,
-        max_kv_len=max_kv_len,
-        bmm1_scale=sm_scale,
-        bmm2_scale=1.0,
-        batch_size=batch_size,
-        cum_seq_lens_q=cum_seq_lens,
-        cum_seq_lens_kv=cum_seq_lens,
-        out=o,
-        out_dtype=dtype,
-        kv_layout="NHD",
-        mask_mode=mask_mode,
-        window_left=window_left,
-        non_blocking=non_blocking,
-        logits_soft_cap_scale=logits_soft_cap if logits_soft_cap > 0 else None,
-        pos_encoding_mode=pos_encoding_mode,
-    )
-
-    # Reference: use separate Q, K, V with the BatchPrefillWithRaggedKVCacheWrapper
-    workspace_buffer_ref = torch.empty(
-        128 * 1024 * 1024, dtype=torch.int8, device=device
-    )
-
-    # Extract K and V from the packed KV tensor for reference
-    k_ref = kv[:, 0, :, :].contiguous()  # [total_tokens, num_kv_heads, head_dim]
-    v_ref = kv[:, 1, :, :].contiguous()  # [total_tokens, num_kv_heads, head_dim]
-
-    # cumulative token counts per sequence
-    kv_indptr = torch.cat(
-        [
-            torch.tensor([0], dtype=torch.int32, device=device),
-            torch.cumsum(seq_lens, dim=0, dtype=torch.int32),
-        ]
-    )
-
-    wrapper_ref = flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
-        workspace_buffer_ref, "NHD"
-    )
-    wrapper_ref.plan(
-        qo_indptr=cum_seq_lens,
-        kv_indptr=kv_indptr,
-        num_qo_heads=num_qo_heads,
-        num_kv_heads=num_kv_heads,
-        head_dim_qk=head_dim,
-        causal=causal,
-        q_data_type=dtype,
-        kv_data_type=dtype,
-        window_left=window_left,
-        non_blocking=non_blocking,
-        logits_soft_cap=logits_soft_cap,
-        pos_encoding_mode=pos_encoding_mode,
-    )
-    output_ref = wrapper_ref.run(q, k_ref, v_ref)
-    rtol, atol = 1e-2, 5e-3
     torch.testing.assert_close(output.float(), output_ref.float(), rtol=rtol, atol=atol)
 
 

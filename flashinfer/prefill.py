@@ -3873,8 +3873,8 @@ def fmha_v2_prefill_deepseek(
 
 
 @functools.cache
-def get_trtllm_fmha_v2_module(input_layout: str):
-    return gen_fmha_v2_module(input_layout).build_and_load()
+def get_trtllm_fmha_v2_module(input_layout: str, input_dtype: torch.dtype, output_dtype: torch.dtype = None):
+    return gen_fmha_v2_module(input_layout, input_dtype, output_dtype).build_and_load()
 
 
 @flashinfer_api
@@ -4018,6 +4018,16 @@ def trtllm_fmha_v2_prefill(
         elif len(qkv) == 3:
             input_layout = "SEPARATE_Q_K_V"
             query, k_cache, v_cache = qkv
+            if hasattr(torch, "float8_e4m3fn") and query.dtype == torch.float8_e4m3fn:
+                raise ValueError(
+                    "FP8 (e4m3) is not supported for the SEPARATE_Q_K_V input layout. "
+                    "Use PACKED_QKV, CONTIGUOUS_Q_KV, or Q_PAGED_KV layout instead."
+                )
+            if logits_soft_cap_scale is not None and logits_soft_cap_scale > 0:
+                raise ValueError(
+                    "Logits soft capping is not supported for the SEPARATE_Q_K_V input layout. "
+                    "Use PACKED_QKV, CONTIGUOUS_Q_KV, or Q_PAGED_KV layout instead."
+                )
 
         else:
             raise ValueError(
@@ -4102,7 +4112,7 @@ def trtllm_fmha_v2_prefill(
         logits_soft_cap_scale if logits_soft_cap_scale is not None else 0.0
     )
 
-    module = get_trtllm_fmha_v2_module(input_layout)
+    module = get_trtllm_fmha_v2_module(input_layout, query.dtype, o_dtype if query.dtype == torch.float8_e4m3fn else None)
     total_q_tokens = int(cum_seq_lens_q[-1].item())
     total_kv_tokens = int(cum_seq_lens_kv[-1].item())
 

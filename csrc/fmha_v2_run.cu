@@ -291,7 +291,6 @@ static inline Data_type dltype_to_data_type(DLDataType dtype) {
   return DATA_TYPE_FP16;
 }
 
-
 static inline Attention_mask_type string_to_mask_type(const std::string& s) {
   if (s == "padding") return Attention_mask_type::PADDING;
   if (s == "causal") return Attention_mask_type::CAUSAL;
@@ -309,7 +308,6 @@ static inline Attention_input_layout string_to_input_layout(const std::string& s
   return Attention_input_layout::Q_PAGED_KV;  // default
 }
 
-
 void fmha_v2_run(
     ffi::TensorView q,  // [batch, s_q, num_heads, head_dim]
     ffi::TensorView k,  // [batch, s_kv, num_kv_heads, head_dim]
@@ -321,12 +319,11 @@ void fmha_v2_run(
     ffi::TensorView seq_lens,         // [batch]
     ffi::TensorView cum_seq_lens_q,   // [batch + 1]
     ffi::TensorView cum_seq_lens_kv,  // [batch + 1]
-    const std::string& input_layout_str,
-    int max_q_len, int max_kv_len, int batch_size, int total_q_tokens,
-    int total_kv_tokens,     // Totals from cum_seq_lens (computed in Python)
-    const std::string& mask_mode_str,
-    float scale_softmax, float scale_bmm1, float scale_bmm2, int window_left,
-    int chunked_attention_size, bool has_alibi, float softcapping_scale,
+    const std::string& input_layout_str, int max_q_len, int max_kv_len, int batch_size,
+    int total_q_tokens,
+    int total_kv_tokens,  // Totals from cum_seq_lens (computed in Python)
+    const std::string& mask_mode_str, float scale_softmax, float scale_bmm1, float scale_bmm2,
+    int window_left, int chunked_attention_size, bool has_alibi, float softcapping_scale,
     ffi::TensorView scale_bmm2_d,             // Pre-populated scale_bmm2 on device [1] int32
     Optional<ffi::TensorView> softmax_stats,  // Optional [batch, s_q, num_heads, 2] for (max, sum)
     Optional<ffi::TensorView> sinks) {
@@ -473,7 +470,8 @@ void fmha_v2_run(
   std::tie(warps_m, warps_n, warps_k) = get_warps(launch_params, sm, data_type, s, b, d, 2);
 
   // Debug output for warps
-  printf("DEBUG: get_warps returned warps_m=%zu, warps_n=%zu, warps_k=%zu\n", warps_m, warps_n, warps_k);
+  printf("DEBUG: get_warps returned warps_m=%zu, warps_n=%zu, warps_k=%zu\n", warps_m, warps_n,
+         warps_k);
   printf("DEBUG: launch_params: flash_attention=%d, warp_specialization=%d, use_tma=%d\n",
          launch_params.flash_attention, launch_params.warp_specialization, launch_params.use_tma);
   printf("DEBUG: data_type=%d, sm=%d, s=%zu, d=%zu\n", int(data_type), sm, s, d);
