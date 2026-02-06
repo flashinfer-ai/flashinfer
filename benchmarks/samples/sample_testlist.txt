@@ -247,3 +247,37 @@
 # RoPE with FP8 quantization and paged KV cache append (SM8.9+ required)
 --routine rope_quantize_fp8_append_paged_kv_cache --batch_size 16 --seq_len 64 --num_qo_heads 32 --num_kv_heads 8 --head_dim 128 --page_size 16 --kv_layout NHD --input_dtype bfloat16 --quant_dtype fp8_e4m3 -vv --generate_repro_command --case_tag "rope_fp8_paged_kv"
 --routine rope_quantize_fp8_append_paged_kv_cache --batch_size 32 --seq_len 64 --num_qo_heads 64 --num_kv_heads 8 --head_dim 128 --page_size 16 --kv_layout HND --input_dtype bfloat16 --quant_dtype fp8_e4m3 -vv --generate_repro_command --case_tag "rope_fp8_paged_kv_hnd"
+
+## Mamba (Selective State Space Models)
+# Single-token prediction (STP), Mamba-2 style (nheads/ngroups=8)
+--routine selective_state_update --batch_size 64 --nheads 64 --dim 128 --dstate 128 --ngroups 8 --input_dtype bfloat16 --backends flashinfer triton --refcheck -vv --generate_repro_command --case_tag "mamba2_stp_bf16"
+
+# STP with float32 state
+--routine selective_state_update --batch_size 64 --nheads 64 --dim 128 --dstate 128 --ngroups 8 --state_dtype float32 --backends flashinfer triton --refcheck -vv --generate_repro_command --case_tag "mamba2_stp_state_fp32"
+
+# STP with z gating enabled
+--routine selective_state_update --batch_size 64 --nheads 64 --dim 128 --dstate 128 --ngroups 8 --has_z --backends flashinfer triton --refcheck -vv --generate_repro_command --case_tag "mamba2_stp_with_z"
+
+# STP with dt_softplus enabled
+--routine selective_state_update --batch_size 64 --nheads 64 --dim 128 --dstate 128 --ngroups 8 --dt_softplus --backends flashinfer triton --refcheck -vv --generate_repro_command --case_tag "mamba2_stp_softplus"
+
+# STP with z gating and dt_softplus
+--routine selective_state_update --batch_size 64 --nheads 64 --dim 128 --dstate 128 --ngroups 8 --has_z --dt_softplus --backends flashinfer triton --refcheck -vv --generate_repro_command --case_tag "mamba2_stp_z_softplus"
+
+# STP with nheads/ngroups=1 (all heads in one group)
+--routine selective_state_update --batch_size 32 --nheads 16 --dim 128 --dstate 128 --ngroups 16 --backends flashinfer triton --refcheck -vv --generate_repro_command --case_tag "mamba2_stp_ratio1"
+
+# STP with nheads/ngroups=16
+--routine selective_state_update --batch_size 32 --nheads 128 --dim 128 --dstate 128 --ngroups 8 --backends flashinfer triton --refcheck -vv --generate_repro_command --case_tag "mamba2_stp_ratio16"
+
+# Multi-token prediction (MTP), cache_steps=1
+--routine selective_state_update --batch_size 64 --nheads 64 --dim 128 --dstate 128 --ngroups 8 --cache_steps 1 --backends flashinfer triton --refcheck -vv --generate_repro_command --case_tag "mamba2_mtp1"
+
+# MTP with cache_steps=2
+--routine selective_state_update --batch_size 64 --nheads 64 --dim 128 --dstate 128 --ngroups 8 --cache_steps 2 --backends flashinfer triton --refcheck -vv --generate_repro_command --case_tag "mamba2_mtp2"
+
+# Large batch size STP
+--routine selective_state_update --batch_size 256 --nheads 64 --dim 128 --dstate 128 --ngroups 8 --backends flashinfer triton -vv --generate_repro_command --case_tag "mamba2_stp_large_batch"
+
+# FlashInfer-only (no refcheck, perf focus)
+--routine selective_state_update --batch_size 128 --nheads 64 --dim 128 --dstate 128 --ngroups 8 --backends flashinfer -vv --generate_repro_command --case_tag "mamba2_stp_perf"
