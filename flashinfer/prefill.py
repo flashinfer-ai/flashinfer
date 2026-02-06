@@ -219,6 +219,7 @@ def get_trtllm_gen_prefill_module():
         cum_seq_lens_q: torch.Tensor,
         cum_seq_lens_kv: torch.Tensor,
         enable_pdl: bool,
+        batch_invariant: bool,
         workspace_size: int,
         window_left: int = -1,
         out: Optional[torch.Tensor] = None,
@@ -254,6 +255,7 @@ def get_trtllm_gen_prefill_module():
             cum_seq_lens_kv,
             sm_count,
             enable_pdl,
+            batch_invariant,
             workspace_size,
             sinks,
         )
@@ -3555,6 +3557,7 @@ def trtllm_batch_context_with_kv_cache(
     o_sf_vec_size: Optional[int] = None,
     kv_layout: str = "HND",
     enable_pdl: Optional[bool] = None,
+    batch_invariant: bool = False,
     sinks: Optional[List[torch.Tensor]] = None,
 ) -> Union[torch.Tensor, FP4Tensor]:
     """
@@ -3604,6 +3607,11 @@ def trtllm_batch_context_with_kv_cache(
     enable_pdl : Optional[bool] = None
         Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
         Defaults to ``None``, which means it will be enabled if the device supports PDL.
+    batch_invariant : bool = False
+        Whether to disable multi-CTA optimization to ensure output is invariant to batch size.
+        When True, uses Persistent scheduler instead of Static scheduler. Note that this parameter
+        has no effect in context mode (context mode always uses Persistent scheduler).
+        Defaults to ``False``.
     kv_layout : str = "HND"
         Layout of kv-cache, can be "HND" or "NHD", default is "HND".
     sinks : Optional[List[torch.Tensor]] = None
@@ -3740,6 +3748,7 @@ def trtllm_batch_context_with_kv_cache(
         cum_seq_lens_kv,
         sm_count,
         enable_pdl,
+        batch_invariant,
         workspace_size,
         sinks,
     )
