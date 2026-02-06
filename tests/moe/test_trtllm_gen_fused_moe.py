@@ -2223,7 +2223,7 @@ def run_moe_reference_mxfp8(args):
     hidden_states_dequant = mxfp8_dequantize_host(
         args.hidden_states.cpu().view(torch.uint8),
         args.hidden_states_scale.cpu().view(torch.uint8).reshape(-1),
-        True,  # is_sf_swizzled_layout
+        False,  # is_sf_swizzled_layout
     ).cuda()
 
     gemm1_weights_dequant = mxfp8_dequantize_batches(
