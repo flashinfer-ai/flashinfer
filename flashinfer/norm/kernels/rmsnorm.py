@@ -669,22 +669,7 @@ def _get_compiled_rmsnorm_kernel(
         options="--enable-tvm-ffi",
     )
 
-    def tensor_api(
-        input: torch.Tensor,
-        weight: torch.Tensor,
-        out: torch.Tensor,
-        M: int,
-        eps: float,
-    ) -> None:
-        compiled_kernel(
-            input,
-            weight,
-            out,
-            Int32(M),
-            Float32(eps),
-        )
-
-    return tensor_api
+    return compiled_kernel
 
 
 @functools.cache
@@ -738,26 +723,7 @@ def _get_compiled_qk_rmsnorm_kernel(
         options="--enable-tvm-ffi",
     )
 
-    def tensor_api(
-        input: torch.Tensor,
-        weight: torch.Tensor,
-        output: torch.Tensor,
-        B: int,
-        N: int,
-        eps: float,
-        num_blocks: int,
-    ) -> None:
-        compiled_kernel(
-            input,
-            weight,
-            output,
-            Int32(B),
-            Int32(N),
-            Float32(eps),
-            Int32(num_blocks),
-        )
-
-    return tensor_api
+    return compiled_kernel
 
 
 @functools.cache
@@ -796,24 +762,7 @@ def _get_compiled_rmsnorm_quant_kernel(
         options="--enable-tvm-ffi",
     )
 
-    def tensor_api(
-        out: torch.Tensor,
-        input: torch.Tensor,
-        weight: torch.Tensor,
-        M: int,
-        scale: float,
-        eps: float,
-    ) -> None:
-        compiled_kernel(
-            input,
-            weight,
-            out,
-            Int32(M),
-            Float32(scale),
-            Float32(eps),
-        )
-
-    return tensor_api
+    return compiled_kernel
 
 
 # =============================================================================

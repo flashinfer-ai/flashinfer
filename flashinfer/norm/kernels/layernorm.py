@@ -402,24 +402,7 @@ def _get_compiled_layernorm_kernel(
         options="--enable-tvm-ffi",
     )
 
-    def tensor_api(
-        out: torch.Tensor,
-        input: torch.Tensor,
-        gamma: torch.Tensor,
-        beta: torch.Tensor,
-        M: int,
-        eps: float,
-    ) -> None:
-        compiled_kernel(
-            out,
-            input,
-            gamma,
-            beta,
-            Int32(M),
-            Float32(eps),
-        )
-
-    return tensor_api
+    return compiled_kernel
 
 
 # =============================================================================
