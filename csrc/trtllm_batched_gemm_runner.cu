@@ -112,9 +112,11 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
         continue;
       }
 
-      if (options.mDtypeA == tg::Dtype::MxE4m3 && options.mDtypeB == tg::Dtype::MxE4m3 &&
-          options.mNumSlicesForSplitK > 1) {
-        continue;
+      if (options.mDtypeA == tg::Dtype::MxE4m3 && options.mDtypeB == tg::Dtype::MxE4m3) {
+        if (options.mNumSlicesForSplitK > 1 ||
+            (tileSize == 8 && options.mUseUnrollLoop2xForMma == 1)) {
+          continue;
+        }
       }
 
       if (mOptions.transposeMmaOutput && options.mEpilogueTileM == mOptions.epilogueTileM) {
