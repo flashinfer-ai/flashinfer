@@ -508,11 +508,12 @@ jobs:
         if: inputs.aot_check_id != '' && inputs.skip_aot != 'true'
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          CHECK_ID: ${{ inputs.aot_check_id }}
+          AOT_SPOT: ${{ needs.aot-build-import.result }}
+          AOT_SPOT_TERM: ${{ needs.analyze-aot-failure.outputs.is_spot_termination }}
+          AOT_RERUN: ${{ needs.aot-build-import-rerun.result }}
         run: |
-          AOT_SPOT="${{ needs.aot-build-import.result }}"
-          AOT_SPOT_TERM="${{ needs.analyze-aot-failure.outputs.is_spot_termination }}"
-          AOT_RERUN="${{ needs.aot-build-import-rerun.result }}"
-
           if [ "$AOT_SPOT" == "success" ]; then
             CONCLUSION="success"
             TITLE="AOT Build Tests Passed"
@@ -527,7 +528,7 @@ jobs:
             SUMMARY="AOT build tests failed. Check the workflow logs for details."
           fi
 
-          gh api -X PATCH repos/${{ github.repository }}/check-runs/${{ inputs.aot_check_id }} \
+          gh api -X PATCH "repos/${REPO}/check-runs/${CHECK_ID}" \
             -f status="completed" \
             -f conclusion="$CONCLUSION" \
             -F output[title]="$TITLE" \
@@ -537,11 +538,12 @@ jobs:
         if: inputs.gpu_a10g_check_id != '' && inputs.skip_gpu != 'true'
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          CHECK_ID: ${{ inputs.gpu_a10g_check_id }}
+          GPU_SPOT: ${{ needs.gpu-tests-a10g.result }}
+          GPU_SPOT_TERM: ${{ needs.analyze-gpu-a10g-failure.outputs.is_spot_termination }}
+          GPU_RERUN: ${{ needs.gpu-tests-a10g-rerun.result }}
         run: |
-          GPU_SPOT="${{ needs.gpu-tests-a10g.result }}"
-          GPU_SPOT_TERM="${{ needs.analyze-gpu-a10g-failure.outputs.is_spot_termination }}"
-          GPU_RERUN="${{ needs.gpu-tests-a10g-rerun.result }}"
-
           if [ "$GPU_SPOT" == "success" ]; then
             CONCLUSION="success"
             TITLE="JIT Unittest (A10G) Passed"
@@ -556,7 +558,7 @@ jobs:
             SUMMARY="JIT unittest on A10G failed. Check the workflow logs for details."
           fi
 
-          gh api -X PATCH repos/${{ github.repository }}/check-runs/${{ inputs.gpu_a10g_check_id }} \
+          gh api -X PATCH "repos/${REPO}/check-runs/${CHECK_ID}" \
             -f status="completed" \
             -f conclusion="$CONCLUSION" \
             -F output[title]="$TITLE" \
@@ -566,11 +568,12 @@ jobs:
         if: inputs.gpu_t4_check_id != '' && inputs.skip_gpu != 'true'
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          CHECK_ID: ${{ inputs.gpu_t4_check_id }}
+          GPU_SPOT: ${{ needs.gpu-tests-t4.result }}
+          GPU_SPOT_TERM: ${{ needs.analyze-gpu-t4-failure.outputs.is_spot_termination }}
+          GPU_RERUN: ${{ needs.gpu-tests-t4-rerun.result }}
         run: |
-          GPU_SPOT="${{ needs.gpu-tests-t4.result }}"
-          GPU_SPOT_TERM="${{ needs.analyze-gpu-t4-failure.outputs.is_spot_termination }}"
-          GPU_RERUN="${{ needs.gpu-tests-t4-rerun.result }}"
-
           if [ "$GPU_SPOT" == "success" ]; then
             CONCLUSION="success"
             TITLE="JIT Unittest (T4) Passed"
@@ -585,7 +588,7 @@ jobs:
             SUMMARY="JIT unittest on T4 failed. Check the workflow logs for details."
           fi
 
-          gh api -X PATCH repos/${{ github.repository }}/check-runs/${{ inputs.gpu_t4_check_id }} \
+          gh api -X PATCH "repos/${REPO}/check-runs/${CHECK_ID}" \
             -f status="completed" \
             -f conclusion="$CONCLUSION" \
             -F output[title]="$TITLE" \
@@ -595,19 +598,20 @@ jobs:
         if: inputs.summary_check_id != ''
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          CHECK_ID: ${{ inputs.summary_check_id }}
+          AOT_SPOT: ${{ needs.aot-build-import.result }}
+          AOT_RERUN: ${{ needs.aot-build-import-rerun.result }}
+          AOT_SPOT_TERM: ${{ needs.analyze-aot-failure.outputs.is_spot_termination }}
+          GPU_A10G_SPOT: ${{ needs.gpu-tests-a10g.result }}
+          GPU_A10G_RERUN: ${{ needs.gpu-tests-a10g-rerun.result }}
+          GPU_A10G_SPOT_TERM: ${{ needs.analyze-gpu-a10g-failure.outputs.is_spot_termination }}
+          GPU_T4_SPOT: ${{ needs.gpu-tests-t4.result }}
+          GPU_T4_RERUN: ${{ needs.gpu-tests-t4-rerun.result }}
+          GPU_T4_SPOT_TERM: ${{ needs.analyze-gpu-t4-failure.outputs.is_spot_termination }}
+          SKIP_AOT: ${{ inputs.skip_aot }}
+          SKIP_GPU: ${{ inputs.skip_gpu }}
         run: |
-          AOT_SPOT="${{ needs.aot-build-import.result }}"
-          AOT_RERUN="${{ needs.aot-build-import-rerun.result }}"
-          AOT_SPOT_TERM="${{ needs.analyze-aot-failure.outputs.is_spot_termination }}"
-          GPU_A10G_SPOT="${{ needs.gpu-tests-a10g.result }}"
-          GPU_A10G_RERUN="${{ needs.gpu-tests-a10g-rerun.result }}"
-          GPU_A10G_SPOT_TERM="${{ needs.analyze-gpu-a10g-failure.outputs.is_spot_termination }}"
-          GPU_T4_SPOT="${{ needs.gpu-tests-t4.result }}"
-          GPU_T4_RERUN="${{ needs.gpu-tests-t4-rerun.result }}"
-          GPU_T4_SPOT_TERM="${{ needs.analyze-gpu-t4-failure.outputs.is_spot_termination }}"
-          SKIP_AOT="${{ inputs.skip_aot }}"
-          SKIP_GPU="${{ inputs.skip_gpu }}"
-
           ALL_PASSED=true
           SUMMARY_LINES=""
 
@@ -657,7 +661,7 @@ jobs:
 
           SUMMARY=$(printf '%b' "$SUMMARY_LINES")
 
-          gh api -X PATCH repos/${{ github.repository }}/check-runs/${{ inputs.summary_check_id }} \
+          gh api -X PATCH "repos/${REPO}/check-runs/${CHECK_ID}" \
             -f status="completed" \
             -f conclusion="$CONCLUSION" \
             -F output[title]="$TITLE" \
