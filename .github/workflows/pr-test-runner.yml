@@ -140,7 +140,7 @@ jobs:
               SPOT_TERMINATION=true
               break
             fi
-            if grep -qiE "connection reset by peer|context canceled|grpc.*closing|The self-hosted runner.*lost" job_log.txt; then
+            if grep -qiE "connection reset by peer|context canceled|The operation was canceled|grpc.*closing|The self-hosted runner.*lost" job_log.txt; then
               SPOT_TERMINATION=true
               break
             fi
@@ -293,7 +293,7 @@ jobs:
               SPOT_TERMINATION=true
               break
             fi
-            if grep -qiE "connection reset by peer|context canceled|grpc.*closing|The self-hosted runner.*lost" job_log.txt; then
+            if grep -qiE "connection reset by peer|context canceled|The operation was canceled|grpc.*closing|The self-hosted runner.*lost" job_log.txt; then
               SPOT_TERMINATION=true
               break
             fi
@@ -430,7 +430,7 @@ jobs:
               SPOT_TERMINATION=true
               break
             fi
-            if grep -qiE "connection reset by peer|context canceled|grpc.*closing|The self-hosted runner.*lost" job_log.txt; then
+            if grep -qiE "connection reset by peer|context canceled|The operation was canceled|grpc.*closing|The self-hosted runner.*lost" job_log.txt; then
               SPOT_TERMINATION=true
               break
             fi
