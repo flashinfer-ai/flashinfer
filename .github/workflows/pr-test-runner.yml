@@ -45,6 +45,10 @@ on:
         required: false
         type: string
 
+permissions:
+  contents: read
+  actions: read
+
 concurrency:
   group: ${{ inputs.concurrency_key || github.run_id }}
   cancel-in-progress: true

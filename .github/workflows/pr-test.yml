@@ -252,12 +252,14 @@ jobs:
           SKIP_AOT: ${{ github.event.inputs.skip_aot || 'false' }}
           SKIP_GPU: ${{ github.event.inputs.skip_gpu || 'false' }}
           CONCURRENCY_KEY: pr-test-${{ github.ref }}
+          DISPATCH_REF: ${{ github.head_ref || github.ref_name }}
         run: |
           # Try workflow_dispatch first (works after pr-test-runner.yml is on main)
           # Uses GITHUB_TOKEN (has actions:write) - App token doesn't have Actions permission
+          # --ref uses PR branch (to test PR changes to runner) or main (for push)
           if GH_TOKEN="$GH_ACTION_TOKEN" gh workflow run pr-test-runner.yml \
             --repo "${{ github.repository }}" \
-            --ref main \
+            --ref "$DISPATCH_REF" \
             -f pr_head_sha="$HEAD_SHA" \
             -f docker_tag="$DOCKER_TAG" \
             -f aot_check_id="$AOT_CHECK_ID" \
