@@ -40,6 +40,7 @@ using Ktraits = {{ kernel_traits_header }}
                 USE_TMA_STORE,
                 {{ enable_attn_logit_softcapping_flag }},
                 {{ return_softmax_stats_flag }},
+                {{ enable_skip_softmax_flag }},
                 {{ output_dtype_ }},
                 {{ sage_block_size_q }},
                 {{ sage_block_size_k }},
@@ -63,6 +64,7 @@ using Ktraits_causal = {{ kernel_traits_header }}
                        USE_TMA_STORE,
                        {{ enable_attn_logit_softcapping_flag }},
                        {{ return_softmax_stats_flag }},
+                       {{ enable_skip_softmax_flag }},
                        {{ output_dtype_ }}>;
 
 using Ktraits_sliding_or_chunked_causal = {{ kernel_traits_header }}
@@ -83,6 +85,7 @@ using Ktraits_sliding_or_chunked_causal = {{ kernel_traits_header }}
                                       USE_TMA_STORE && false,
                                       {{ enable_attn_logit_softcapping_flag }},
                                       {{ return_softmax_stats_flag }},
+                                      {{ enable_skip_softmax_flag }},
                                       {{ output_dtype_ }}>;
 
 using Ktraits_custom_mask = {{ kernel_traits_header }}
@@ -103,6 +106,7 @@ using Ktraits_custom_mask = {{ kernel_traits_header }}
                             USE_TMA_STORE && false,
                             {{ enable_attn_logit_softcapping_flag }},
                             {{ return_softmax_stats_flag }},
+                            {{ enable_skip_softmax_flag }},
                             {{ output_dtype_ }}>;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
