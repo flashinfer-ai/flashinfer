@@ -38,6 +38,7 @@ import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import from_dlpack
+from torch.cuda.random import initial_seed
 
 from .ssd_tile_scheduler import (
     Mamba2SSDTileScheduler,
@@ -56,12 +57,14 @@ class SSDKernel:
         N: int,
         has_d: bool,
         d_has_hdim: bool,
+        has_init_states: bool,
     ):
         self.io_dtype: Type[cutlass.Numeric] = io_dtype
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
         self.cumsum_delta_dtype: Type[cutlass.Numeric] = cumsum_delta_dtype
         # has_d means epilog warp performs Y += X*D fusion
         self.has_d: bool = has_d
+        self.has_init_states: bool = has_init_states
         # d_has_hdim = True means D is (D, EH) shape and loaded by TMA
         # d_has_hdim = False means D is (1, EH) shape and loaded directly to register
         self.d_has_hdim: bool = d_has_hdim
@@ -97,7 +100,7 @@ class SSDKernel:
         self.mma_inter_warp_id = 0
         self.mma_intra_warp_id = 1
         self.tma_b_c_warp_id = 2
-        self.tma_deltas_x_d_warp_id = 3
+        self.tma_deltas_x_d_states_warp_id = 3
         self.pre_inter_warp_id = [4, 5, 6, 7]
         self.pre_intra_warp_id = [8, 9, 10, 11]
         self.epilog_warp_id = [12, 13, 14, 15]
@@ -106,7 +109,7 @@ class SSDKernel:
                 self.mma_inter_warp_id,
                 self.mma_intra_warp_id,
                 self.tma_b_c_warp_id,
-                self.tma_deltas_x_d_warp_id,
+                self.tma_deltas_x_d_states_warp_id,
                 *self.pre_inter_warp_id,
                 *self.pre_intra_warp_id,
                 *self.epilog_warp_id,
@@ -167,6 +170,7 @@ class SSDKernel:
         ) = self._compute_stages(
             self.smem_capacity,
         )
+        self.initial_state_load_stages = 1 if self.has_init_states else 0
 
         # Setup smem layouts
         # X is B operand (from smem) of INTRA2_MMA and INTER1_MMA
@@ -261,6 +265,29 @@ class SSDKernel:
             self.internal_stages,
         )
 
+        # For TMA load of initial states from gmem to smem.
+        # Only 1 stage needed (no pipelining) since initial states are loaded
+        # once per tile before the chunk loop, fully consumed, then the next
+        # tile resets and reuses the same buffer.
+        self.p_smem_layout_load = (
+            sm100_utils.make_smem_layout_epi(
+                self.io_dtype,
+                utils.LayoutEnum.ROW_MAJOR,
+                self.tile_shape_mnk_inter2[1:],
+                self.initial_state_load_stages,
+            )
+            if self.has_init_states
+            else None
+        )
+        self.num_init_state_load_bytes = (
+            cute.size_in_bytes(
+                self.io_dtype,
+                cute.slice_(self.p_smem_layout_load, (None, None, 0)),
+            )
+            if self.has_init_states
+            else 0
+        )
+
         # Y is ACC operand (from smem) of INTER2_MMA and INTRA2_MMA, after postprocessed and TMA stored by EPILOG
         self.y_smem_layout = sm100_utils.make_smem_layout_epi(
             self.io_dtype,
@@ -336,6 +363,7 @@ class SSDKernel:
         b: cute.Tensor,
         c: cute.Tensor,
         y: cute.Tensor,
+        init_states: cute.Tensor,
         fstate: cute.Tensor,
         d: cute.Tensor,
         max_active_clusters: cutlass.Constexpr,
@@ -452,6 +480,23 @@ class SSDKernel:
                 d_cta_v_layout,
             )
 
+        # TMA load for initial_state
+        tma_atom_initial_states = None
+        tma_tensor_initial_states = init_states
+        if cutlass.const_expr(self.has_init_states):
+            init_states_cta_v_layout = cute.slice_(
+                cute.make_identity_layout(init_states.shape), (None, None, 0, 0)
+            )
+            p_smem_layout_istate = cute.slice_(self.p_smem_layout_load, (None, None, 0))
+            tma_atom_initial_states, tma_tensor_initial_states = (
+                cpasync.make_tiled_tma_atom(
+                    cpasync.CopyBulkTensorTileG2SOp(),
+                    init_states,  # (D, N, EH, B)
+                    p_smem_layout_istate,
+                    init_states_cta_v_layout,
+                )
+            )
+
         # TMA store for y
         y_cta_v_layout = cute.composition(
             cute.make_identity_layout(y.shape), self.epi_tile
@@ -514,6 +559,13 @@ class SSDKernel:
             inter2_p_empty: cute.struct.MemRange[cutlass.Int64, self.internal_stages]  # type: ignore
             inter2_acc_full: cute.struct.MemRange[cutlass.Int64, self.internal_stages]  # type: ignore
             inter2_acc_empty: cute.struct.MemRange[cutlass.Int64, self.internal_stages]  # type: ignore
+            # initial state barriers
+            initial_states_full: cute.struct.MemRange[
+                cutlass.Int64, self.initial_state_load_stages
+            ]  # type: ignore
+            initial_states_empty: cute.struct.MemRange[
+                cutlass.Int64, self.initial_state_load_stages
+            ]  # type: ignore
             # Tmem holding buffer
             tmem_holding_buf: cutlass.Int32
             # Smem tensors
@@ -588,6 +640,8 @@ class SSDKernel:
             tma_tensor_cumsum_delta,
             tma_atom_d,
             tma_tensor_d,
+            tma_atom_initial_states,
+            tma_tensor_initial_states,
             self.cluster_layout_vmnk,
             self.x_smem_layout,
             self.xt_smem_layout,
@@ -599,6 +653,7 @@ class SSDKernel:
             self.p_smem_layout,
             self.q_tmem_layout,
             self.p_smem_layout_store,
+            self.p_smem_layout_load,
             self.y_smem_layout,
             self.delta_linear_smem_layout,
             self.cumsum_delta_linear_smem_layout,
@@ -633,6 +688,8 @@ class SSDKernel:
         tma_tensor_cumsum_delta: cute.Tensor,
         tma_atom_d: Optional[cute.CopyAtom],
         tma_tensor_d: cute.Tensor,
+        tma_atom_initial_states: Optional[cute.CopyAtom],
+        tma_tensor_initial_states: cute.Tensor,
         cluster_layout_vmnk: cute.Layout,
         x_smem_layout: cute.ComposedLayout,
         xt_smem_layout: cute.ComposedLayout,
@@ -644,6 +701,7 @@ class SSDKernel:
         p_smem_layout: cute.ComposedLayout,
         q_tmem_layout: cute.ComposedLayout,
         p_smem_layout_store: cute.ComposedLayout,
+        p_smem_layout_load: Optional[cute.ComposedLayout],
         y_smem_layout: cute.ComposedLayout,
         delta_linear_smem_layout: cute.Layout,
         cumsum_delta_linear_smem_layout: cute.Layout,
@@ -743,13 +801,18 @@ class SSDKernel:
         )
         smem_p = smem_storage.smem_p.get_tensor(
             p_smem_layout.outer, swizzle=p_smem_layout.inner
-        )
+        )  # tensor for INTER2_MMA
         smem_pt = smem_storage.smem_p.get_tensor(
             pt_smem_layout.outer, swizzle=pt_smem_layout.inner
-        )
+        )  # tensor for TMEM->SMEM->RMEM transfer
         smem_p_store = smem_storage.smem_p.get_tensor(
             p_smem_layout_store.outer, swizzle=p_smem_layout_store.inner
-        )
+        )  # for TMA SMEM->GMEM store
+        smem_p_load = None
+        if cutlass.const_expr(self.has_init_states):
+            smem_p_load = smem_storage.smem_p.get_tensor(
+                p_smem_layout_load.outer, swizzle=p_smem_layout_load.inner
+            )  # for TMA GMEM->SMEM load of initial states
         smem_y = smem_storage.smem_y.get_tensor(
             y_smem_layout.outer, swizzle=y_smem_layout.inner
         )
@@ -769,6 +832,9 @@ class SSDKernel:
             smem_storage.deltas_full.data_ptr()
         )
         d_pipeline = self.make_and_init_d_pipeline(smem_storage.d_full.data_ptr())
+        init_states_pipeline = self.make_and_init_initial_states_pipeline(
+            smem_storage.initial_states_full.data_ptr()
+        )
         intra1_acc_pipeline = self.make_and_init_intra1_acc_pipeline(
             smem_storage.intra1_acc_full.data_ptr()
         )
@@ -817,8 +883,8 @@ class SSDKernel:
             ptr_to_buffer_holding_addr=smem_storage.tmem_holding_buf,
         )
 
-        # Specialized TMA load Delta/CumsumDelta/X warp
-        if warp_idx == self.tma_deltas_x_d_warp_id:
+        # Specialized TMA load Delta/CumsumDelta/X/States warp
+        if warp_idx == self.tma_deltas_x_d_states_warp_id:
             # Dealloc regs for pre-inter/pre-intra warps
             cute.arch.warpgroup_reg_dealloc(self.num_regs_uniform_warps)
 
@@ -854,6 +920,18 @@ class SSDKernel:
                 (self.tile_shape_mnk_inter1[2],),
             )
 
+            tIstatesIstate = None
+            tIstategIstate_pre_slice = None
+            if cutlass.const_expr(self.has_init_states):
+                tIstatesIstate, tIstategIstate_pre_slice = (
+                    self.tma_partition_with_shape(
+                        tma_atom_initial_states,
+                        tma_tensor_initial_states,
+                        smem_p_load,  # Must match TMA atom's smem layout (p_smem_layout_load)
+                        (self.tile_shape_mnk_inter2[1:]),  # (D, N) shape
+                    )
+                )
+
             tDsD = None
             tDgD_pre_slice = None
             if cutlass.const_expr(self.d_has_hdim):
@@ -877,6 +955,10 @@ class SSDKernel:
                 d_producer_state = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Producer, self.input_stages
                 )
+            if cutlass.const_expr(self.has_init_states):
+                istate_producer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Producer, self.initial_state_load_stages
+                )
 
             while work_tile.is_valid_tile:
                 b_idx, eh_idx, g_idx = work_tile.tile_idx
@@ -893,6 +975,9 @@ class SSDKernel:
                     # ((ATOM_V, REST_V))
                     tDgD = tDgD_pre_slice[None, 0, eh_idx]
 
+                if cutlass.const_expr(self.has_init_states):
+                    istate_producer_state.reset_count()
+
                 # Reset count for pipeline state
                 x_producer_state.reset_count()
                 deltas_producer_state.reset_count()
@@ -906,6 +991,25 @@ class SSDKernel:
                 peek_deltas_empty_status = self.conditional_producer_try_acquire(
                     deltas_producer_state, deltas_pipeline, C
                 )
+
+                if cutlass.const_expr(self.has_init_states):
+                    tIstategIstate = tIstategIstate_pre_slice[
+                        None, 0, 0, eh_idx, b_idx
+                    ]
+
+                    # Wait for initial states buffer empty
+                    init_states_pipeline.producer_acquire(istate_producer_state)
+                    # TMA load initial states
+                    cute.copy(
+                        tma_atom_initial_states,
+                        tIstategIstate,
+                        tIstatesIstate[None, istate_producer_state.index],
+                        tma_bar_ptr=init_states_pipeline.producer_get_barrier(
+                            istate_producer_state
+                        ),
+                    )
+                    # Advance initial states producer state
+                    istate_producer_state.advance()
 
                 if cutlass.const_expr(self.d_has_hdim):
                     # Wait for D buffer empty
@@ -977,6 +1081,8 @@ class SSDKernel:
             # Producer tail for X/Deltas/D
             x_pipeline.producer_tail(x_producer_state)
             deltas_pipeline.producer_tail(deltas_producer_state)
+            if cutlass.const_expr(self.has_init_states):
+                init_states_pipeline.producer_tail(istate_producer_state)
             if cutlass.const_expr(self.d_has_hdim):
                 d_pipeline.producer_tail(d_producer_state)
         # END of specialized tma load X/Deltas/D warp
@@ -1569,12 +1675,21 @@ class SSDKernel:
             # Make fragment for register to hold P after post-processing (in acc dtype)
             tState = cute.make_fragment(tTR_rP.shape, self.acc_dtype)
 
-            # Make tiledCopy and partition smem/register tensor for smem store INTER2_P
+            # Make tiledCopy and partition smem/register tensor for:
+            # - Loading initial_states from SMEM to registers (S2R, reuses tRS_rP)
+            # - Storing INTER2_P from registers to SMEM (R2S)
             # ((R2S_ATOM_V, R2S_REST_V), R2S_M, R2S_N)
             # ((R2S_ATOM_V, R2S_REST_V), R2S_M, R2S_N, INTERNAL_STAGE)
             tiled_r2s_p, tRS_rP, tRS_sP = self.smem_store_and_partition_p_y(
                 local_tidx, smem_pt, tiled_t2r_inter1
             )
+
+            tiled_s2r_p = None
+            tS2R_sP = None
+            if cutlass.const_expr(self.has_init_states):
+                tiled_s2r_p, tS2R_sP = self.smem_load_and_partition_istate(
+                    local_tidx, smem_pt, tiled_t2r_inter1
+                )
 
             # Partition global/shared tensor for P (State)
             # ((ATOM_V, REST_V), INTERNAL_STAGE)
@@ -1604,6 +1719,11 @@ class SSDKernel:
             inter2_p_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.internal_stages
             )
+            istate_consumer_state = None
+            if cutlass.const_expr(self.has_init_states):
+                istate_consumer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Consumer, self.initial_state_load_stages
+                )
 
             # Pipeline TMA store P
             tma_p_pipeline = pipeline.PipelineTmaStore.create(
@@ -1626,9 +1746,26 @@ class SSDKernel:
                 inter1_b_producer_state.reset_count()
                 inter1_acc_consumer_state.reset_count()
                 inter2_p_producer_state.reset_count()
+                if cutlass.const_expr(self.has_init_states):
+                    istate_consumer_state.reset_count()
 
                 # State (P) init
-                tState.fill(0.0)
+                if cutlass.const_expr(self.has_init_states):
+                    init_states_pipeline.consumer_wait(istate_consumer_state)
+
+                    istate_coord = (None, None, None, istate_consumer_state.index)
+                    cute.copy(tiled_s2r_p, tS2R_sP[istate_coord], tRS_rP)
+
+                    for reg_idx in range(cute.size(tRS_rP)):
+                        tState[reg_idx] = tRS_rP[reg_idx].to(self.acc_dtype)
+
+                    # We're not gonna release the pipeline here to
+                    # prevent overwriting smem_p by another batch of
+                    # init states
+                else:
+                    tState.fill(0.0)
+
+
 
                 # Peek (try_wait) B/Delta/INTER1_B buffer full/full/empty status
                 peek_b_full_status = self.conditional_consumer_try_wait(
@@ -1648,6 +1785,11 @@ class SSDKernel:
                 tRS_rP.fill(0.0)
                 # Copy INTER2_P from register to smem
                 inter2_p_coord = (None, None, None, inter2_p_producer_state.index)
+                # Don't overwrite smem_p if we already have init states there
+                if cutlass.const_expr(self.has_init_states):
+                    # Convert tState to tRS_rP (same as done in chunk loop at line 1876-1878)
+                    for reg_idx in range(cute.size(tState)):
+                        tRS_rP[reg_idx] = tState[reg_idx].to(self.io_dtype)
                 cute.copy(tiled_r2s_p, tRS_rP, tRS_sP[inter2_p_coord])
 
                 # Fence for shared memory
@@ -1817,6 +1959,12 @@ class SSDKernel:
                     number_of_threads=len(self.pre_inter_warp_id) * 32,
                 )
                 tma_p_pipeline.producer_tail()
+
+                # release init_state_pipeline for the next tile
+                if cutlass.const_expr(self.has_init_states):
+                    init_states_pipeline.consumer_release(istate_consumer_state)
+                    istate_consumer_state.advance()
+
 
                 # Advance to next tile
                 tile_sched.advance_to_next_work()
@@ -2565,7 +2713,7 @@ class SSDKernel:
 
     def make_and_init_x_pipeline(self, x_full_mbar_ptr):
         x_producer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, len([self.tma_deltas_x_d_warp_id])
+            pipeline.Agent.Thread, len([self.tma_deltas_x_d_states_warp_id])
         )
         if not self.has_d:
             x_consumer_group = pipeline.CooperativeGroup(
@@ -2632,7 +2780,7 @@ class SSDKernel:
 
     def make_and_init_deltas_pipeline(self, deltas_full_mbar_ptr):
         deltas_producer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, len([self.tma_deltas_x_d_warp_id])
+            pipeline.Agent.Thread, len([self.tma_deltas_x_d_states_warp_id])
         )
         deltas_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread,
@@ -2652,12 +2800,32 @@ class SSDKernel:
             barrier_storage=deltas_full_mbar_ptr,
         )
 
+    def make_and_init_initial_states_pipeline(self, initial_states_full_mbar_ptr):
+        if self.has_init_states:
+            init_states_producer_group = pipeline.CooperativeGroup(
+                pipeline.Agent.Thread, len([self.tma_deltas_x_d_states_warp_id])
+            )
+            init_states_consumer_group = pipeline.CooperativeGroup(
+                pipeline.Agent.Thread,
+                len(self.pre_inter_warp_id),
+                len(self.pre_inter_warp_id),
+            )
+            return pipeline.PipelineTmaAsync.create(
+                num_stages=self.initial_state_load_stages,
+                producer_group=init_states_producer_group,
+                consumer_group=init_states_consumer_group,
+                tx_count=self.num_init_state_load_bytes,
+                barrier_storage=initial_states_full_mbar_ptr,
+            )
+        else:
+            return None
+
     def make_and_init_d_pipeline(self, d_full_mbar_ptr):
         if not self.d_has_hdim:
             return None
         else:
             d_producer_group = pipeline.CooperativeGroup(
-                pipeline.Agent.Thread, len([self.tma_deltas_x_d_warp_id])
+                pipeline.Agent.Thread, len([self.tma_deltas_x_d_states_warp_id])
             )
             d_consumer_group = pipeline.CooperativeGroup(
                 pipeline.Agent.Thread,
@@ -3188,6 +3356,23 @@ class SSDKernel:
             dtype,
         )
         return tiled_t2r, tTR_t, tTR_r
+
+    def smem_load_and_partition_istate(self, local_tidx, smem_pt, tiled_t2r_inter1):
+        copy_atom_s2r_p = cute.make_copy_atom(
+            cute.nvgpu.warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4),
+            smem_pt.element_type
+        )
+        # Use make_tiled_copy_D (not _S) so the thread-value layout comes from
+        # the destination (SMEM) side of tiled_t2r_inter1, matching the layout
+        # used by tiled_r2s_p / tRS_rP (which also uses the D side).
+        tiled_s2r_p = cute.make_tiled_copy_D(copy_atom_s2r_p, tiled_t2r_inter1)
+        thr_s2r_p = tiled_s2r_p.get_slice(local_tidx)
+        # Partition from smem_pt (same underlying buffer as smem_p_load, same physical
+        # layout since (D,N) ROW_MAJOR == (N,D) COL_MAJOR) so that the S2R partition
+        # shape matches tRS_rP which is also partitioned from smem_pt.
+        tS2R_sP = thr_s2r_p.partition_S(smem_pt)  # Source: SMEM
+        # Reuse tRS_rP as destination - shapes match since both use D-side layout
+        return tiled_s2r_p, tS2R_sP
 
     def smem_store_and_partition_p_y(self, local_tidx, smem_pt, tiled_t2r_inter1):
         dtype = smem_pt.element_type

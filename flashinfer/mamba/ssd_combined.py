@@ -99,6 +99,7 @@ class _SSDKernel:
         dstate: int,
         has_d: bool = True,
         d_has_hdim: bool = False,
+        has_init_states: bool = False,
         io_dtype=None,
         cumsum_dtype=None,
         acc_dtype=None,
@@ -112,6 +113,7 @@ class _SSDKernel:
             dstate: N - state dimension
             has_d: Whether to fuse D scaling (Y += X*D)
             d_has_hdim: If True, D is (headdim, nheads), else (1, nheads)
+            has_init_states: Whether initial states are provided
             io_dtype: Input/output dtype (default: cutlass.BFloat16)
             cumsum_dtype: Cumsum intermediate dtype (default: cutlass.Float32)
             acc_dtype: Accumulator dtype (default: cutlass.Float32)
@@ -124,6 +126,7 @@ class _SSDKernel:
         self.dstate = dstate
         self.has_d = has_d
         self.d_has_hdim = d_has_hdim
+        self.has_init_states = has_init_states
 
         self.io_dtype = io_dtype or cutlass.BFloat16
         self.cumsum_dtype = cumsum_dtype or cutlass.Float32
@@ -140,6 +143,7 @@ class _SSDKernel:
             dstate,
             has_d,
             d_has_hdim,
+            has_init_states,
         )
 
         self._compiled_kernel = None
@@ -152,6 +156,7 @@ class _SSDKernel:
         B: torch.Tensor,
         C: torch.Tensor,
         D: Optional[torch.Tensor] = None,
+        init_states: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Run the SSD kernel with preprocessed inputs.
@@ -163,6 +168,7 @@ class _SSDKernel:
             B: (batch, seqlen, ngroups, dstate)
             C: (batch, seqlen, ngroups, dstate)
             D: Optional (nheads, headdim) or (nheads,)
+            init_states: Optional (batch, nheads, headdim, dstate)
 
         Returns:
             out: (batch, seqlen, nheads, headdim)
@@ -268,6 +274,22 @@ class _SSDKernel:
         else:
             d_tensor = None
 
+        if self.has_init_states and init_states is not None:
+            # init_states: (batch, nheads, headdim, dstate) -> (headdim, dstate, nheads, batch)
+            # Kernel expects: (D, N, EH, B) = (headdim, dstate, nheads, batch)
+            init_states_reshaped = init_states.permute(2, 3, 1, 0)
+            init_states_tensor, init_states_dst = _create_cutlass_tensor(
+                [batch, nheads, headdim, dstate],
+                [2, 3, 1, 0],
+                self.io_dtype,
+                [2, 3],
+                cutlass_torch,
+                from_dlpack,
+            )
+            init_states_dst.copy_(init_states_reshaped.to(init_states_dst.dtype))
+        else:
+            init_states_tensor = None
+
         # Output tensors
         # y: (chunk_size, headdim, nchunks, nheads, batch)
         y_tensor, y_cutlass = _create_cutlass_tensor(
@@ -305,6 +327,7 @@ class _SSDKernel:
                 b_tensor,
                 c_tensor,
                 y_tensor,
+                init_states_tensor,
                 fstate_tensor,
                 d_tensor,
                 max_active_clusters,
@@ -319,6 +342,7 @@ class _SSDKernel:
             b_tensor,
             c_tensor,
             y_tensor,
+            init_states_tensor,
             fstate_tensor,
             d_tensor,
             stream,
@@ -346,6 +370,7 @@ def _get_ssd_kernel(
     dstate: int,
     has_d: bool,
     d_has_hdim: bool,
+    has_init_states: bool = False,
 ) -> _SSDKernel:
     """Get cached SSD kernel."""
     return _SSDKernel(
@@ -354,6 +379,7 @@ def _get_ssd_kernel(
         dstate=dstate,
         has_d=has_d,
         d_has_hdim=d_has_hdim,
+        has_init_states=has_init_states,
     )
 
 
@@ -369,6 +395,7 @@ def ssd_combined_fwd(
     dt_bias: Optional[torch.Tensor] = None,
     dt_softplus: bool = False,
     dt_limit: Tuple[float, float] = (0.0, float("inf")),
+    initial_states: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     SSD (Structured State-Space Duality) combined forward pass for Mamba2.
@@ -399,7 +426,8 @@ def ssd_combined_fwd(
         Whether to apply softplus to dt
     dt_limit : tuple
         (min, max) limits for dt values
-
+    initial_states: torch.Tensor, optional
+        Optional (batch, nheads, headdim, dstate)
     Returns
     -------
     out : torch.Tensor
@@ -434,6 +462,7 @@ def ssd_combined_fwd(
     # Step 2: Run SSD kernel
     has_d = D is not None
     d_has_hdim = has_d and D.dim() == 2
+    has_init_state = True if initial_states is not None else False
 
     kernel = _get_ssd_kernel(
         chunk_size=chunk_size,
@@ -441,6 +470,7 @@ def ssd_combined_fwd(
         dstate=dstate,
         has_d=has_d,
         d_has_hdim=d_has_hdim,
+        has_init_states=has_init_state,
     )
 
     out, final_states = kernel.run(
@@ -450,6 +480,7 @@ def ssd_combined_fwd(
         B=B,
         C=C,
         D=D,
+        init_states=initial_states,
     )
 
     return out, final_states
