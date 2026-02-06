@@ -58,8 +58,9 @@ CutlassGemmConfig getBf16GemmConfig(int64_t m, int64_t n, int64_t k, int64_t tac
 }
 
 template <typename T>
-void runGemm(TensorView out, TensorView mat1, TensorView mat2, int64_t m, int64_t n, int64_t k,
-             int64_t b, CutlassGemmConfig const& gemmConfig, TensorView workspace_buffer) {
+void runGemm(TensorView out, TensorView mat1, TensorView mat2, Optional<TensorView> bias,
+             int64_t m, int64_t n, int64_t k, int64_t b, CutlassGemmConfig const& gemmConfig,
+             TensorView workspace_buffer) {
   CutlassBf16GemmRunner<T> gemmRunner;
 
   int64_t const required_workspace_size = gemmRunner.getWorkspaceSize(m, n, k);
@@ -67,9 +68,10 @@ void runGemm(TensorView out, TensorView mat1, TensorView mat2, int64_t m, int64_
       workspace_buffer.numel() * get_element_size(workspace_buffer);
 
   auto runKernel = [&](void* workspace) {
+    T* bias_ptr = bias.has_value() ? static_cast<T*>(bias.value().data_ptr()) : nullptr;
     gemmRunner.gemm(static_cast<__nv_bfloat16*>(mat1.data_ptr()),
-                    static_cast<__nv_bfloat16*>(mat2.data_ptr()), out.data_ptr(), m, n, k, b,
-                    gemmConfig, static_cast<char*>(workspace), required_workspace_size,
+                    static_cast<__nv_bfloat16*>(mat2.data_ptr()), out.data_ptr(), bias_ptr, m, n,
+                    k, b, gemmConfig, static_cast<char*>(workspace), required_workspace_size,
                     get_stream(mat1.device()));
   };
 
@@ -82,10 +84,24 @@ void runGemm(TensorView out, TensorView mat1, TensorView mat2, int64_t m, int64_
   }
 }
 
-void bf16_bmm_impl(TensorView mat1, TensorView mat2, TensorView out, TensorView workspace_buffer,
-                   int64_t tactic) {
+void bf16_bmm_impl(TensorView mat1, TensorView mat2, Optional<TensorView> bias, TensorView out,
+                   TensorView workspace_buffer, int64_t tactic) {
   CHECK_INPUT_AND_TYPE(mat1, dl_bfloat16);
   CHECK_INPUT_AND_TYPE(mat2, dl_bfloat16);
+
+  // Validate bias if provided
+  if (bias.has_value()) {
+    TVM_FFI_ICHECK_EQ(bias.value().device().device_type, kDLCUDA) << "Bias tensor must be on CUDA";
+    TVM_FFI_ICHECK_EQ(bias.value().ndim(), 1) << "Bias tensor must be 1D";
+    // For 2D gemm: bias shape should be (n,) where n = mat2.size(0)
+    // For 3D bmm: bias shape should be (n,) where n = mat2.size(1)
+    int64_t expected_bias_size = mat2.ndim() == 2 ? mat2.size(0) : mat2.size(1);
+    TVM_FFI_ICHECK_EQ(bias.value().size(0), expected_bias_size)
+        << "Bias tensor size mismatch: expected " << expected_bias_size << ", got "
+        << bias.value().size(0);
+    TVM_FFI_ICHECK(bias.value().dtype() == dl_bfloat16 || bias.value().dtype() == dl_float16)
+        << "Bias tensor must be bfloat16 or float16, got " << bias.value().dtype();
+  }
 
   int64_t m, n, k, b;
   if (mat1.ndim() == 2) {
@@ -129,10 +145,10 @@ void bf16_bmm_impl(TensorView mat1, TensorView mat2, TensorView out, TensorView 
 
   switch (encode_dlpack_dtype(out.dtype())) {
     case float16_code:
-      runGemm<half>(out, mat1, mat2, m, n, k, b, config, workspace_buffer);
+      runGemm<half>(out, mat1, mat2, bias, m, n, k, b, config, workspace_buffer);
       break;
     case bfloat16_code:
-      runGemm<__nv_bfloat16>(out, mat1, mat2, m, n, k, b, config, workspace_buffer);
+      runGemm<__nv_bfloat16>(out, mat1, mat2, bias, m, n, k, b, config, workspace_buffer);
       break;
     default:
       TVM_FFI_LOG_AND_THROW(NotImplementedError) << "out_dtype must be one of fp16/bf16.";
@@ -141,9 +157,9 @@ void bf16_bmm_impl(TensorView mat1, TensorView mat2, TensorView out, TensorView 
 
 }  // namespace
 
-void bf16_gemm(TensorView mat1, TensorView mat2, TensorView out, TensorView workspace_buffer,
-               int64_t tactic) {
-  bf16_bmm_impl(mat1, mat2, out, workspace_buffer, tactic);
+void bf16_gemm(TensorView mat1, TensorView mat2, Optional<TensorView> bias, TensorView out,
+               TensorView workspace_buffer, int64_t tactic) {
+  bf16_bmm_impl(mat1, mat2, bias, out, workspace_buffer, tactic);
 }
 
 int64_t bf16_gemm_tactic_num() {
