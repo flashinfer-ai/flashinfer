@@ -23,16 +23,6 @@ All imports are re-exported here for backwards compatibility.
     Use ``flashinfer.gemm`` instead. This module will be removed in a future release.
 """
 
-import warnings
-
-warnings.warn(
-    "flashinfer.cute_dsl.blockscaled_gemm is deprecated. "
-    "Use flashinfer.gemm instead. "
-    "This module will be removed in a future release.",
-    DeprecationWarning,
-    stacklevel=2,
-)
-
 # Re-export everything from the new location
 from flashinfer.gemm.kernels.grouped_gemm_masked_blackwell import (
     grouped_gemm_nt_masked,
