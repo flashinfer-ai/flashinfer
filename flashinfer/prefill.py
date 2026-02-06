@@ -3873,7 +3873,9 @@ def fmha_v2_prefill_deepseek(
 
 
 @functools.cache
-def get_trtllm_fmha_v2_module(input_layout: str, input_dtype: torch.dtype, output_dtype: torch.dtype = None):
+def get_trtllm_fmha_v2_module(
+    input_layout: str, input_dtype: torch.dtype, output_dtype: torch.dtype = None
+):
     return gen_fmha_v2_module(input_layout, input_dtype, output_dtype).build_and_load()
 
 
@@ -4089,15 +4091,6 @@ def trtllm_fmha_v2_prefill(
             device=query.device,
         )
 
-    # Allocate LSE tensor if saving softmax stats
-    lse = None
-    if save_softmax_stats:
-        lse = torch.empty(
-            (batch_size, max_q_len, num_qo_heads, 2),
-            dtype=torch.float32,
-            device=query.device,
-        )
-
     # Handle scale parameters
     scale_bmm1 = float(bmm1_scale)
     scale_bmm2 = float(bmm2_scale)
@@ -4112,9 +4105,23 @@ def trtllm_fmha_v2_prefill(
         logits_soft_cap_scale if logits_soft_cap_scale is not None else 0.0
     )
 
-    module = get_trtllm_fmha_v2_module(input_layout, query.dtype, o_dtype if query.dtype == torch.float8_e4m3fn else None)
+    module = get_trtllm_fmha_v2_module(
+        input_layout,
+        query.dtype,
+        o_dtype if query.dtype == torch.float8_e4m3fn else None,
+    )
     total_q_tokens = int(cum_seq_lens_q[-1].item())
     total_kv_tokens = int(cum_seq_lens_kv[-1].item())
+
+    # Allocate LSE tensor if saving softmax stats
+    # Kernel writes in ragged (flat) format: [total_q_tokens, num_qo_heads, 2]
+    lse = None
+    if save_softmax_stats:
+        lse = torch.empty(
+            (total_q_tokens, num_qo_heads, 2),
+            dtype=torch.float32,
+            device=query.device,
+        )
 
     # For Q_PAGED_KV layout, expand block_tables from [B, M] to [B, 2, M]
     # TRT-LLM kernel expects separate K and V block offset arrays.

@@ -517,9 +517,14 @@ void fmha_v2_run(
   // to avoid cudaMemcpy synchronization in set_params().
 
   // Softmax stats: stores (max, sum) per token, 2 floats per (b, s_q, h)
-  const size_t softmax_stats_size = 2 * sizeof(float) * b * s_q * h;
-  void* softmax_stats_d = allocator.aligned_alloc<void>(softmax_stats_size, 128, "softmax_stats_d");
-  void* softmax_stats_ptr = softmax_stats.has_value() ? softmax_stats_d : nullptr;
+  // Write directly to user-provided tensor when available, otherwise use workspace.
+  void* softmax_stats_ptr;
+  if (softmax_stats.has_value()) {
+    softmax_stats_ptr = softmax_stats.value().data_ptr();
+  } else {
+    const size_t softmax_stats_size = 2 * sizeof(float) * b * s_q * h;
+    softmax_stats_ptr = allocator.aligned_alloc<void>(softmax_stats_size, 128, "softmax_stats_d");
+  }
   void* attention_sinks_d = sinks.has_value() ? sinks.value().data_ptr() : nullptr;
 
   // Initialize pointers for different input layouts
@@ -566,50 +571,6 @@ void fmha_v2_run(
   }
 
   bert::Fused_multihead_attention_params_v2 params_v2;
-  // Print all param set values before calling set_params
-  bool debug = false;
-  if (debug) {
-    printf("=== set_params() arguments ===\n");
-    printf("launch_params: ...\n");  // For struct, maybe print pointer or describe
-    printf("data_type: %d\n", int(data_type));
-    printf("acc_type: %d\n", int(acc_type));
-    printf("output_dtype: %d\n", int(output_dtype));
-    printf("input_layout: %d\n", int(input_layout));
-    printf("b: %zu\n", size_t(b));
-    printf("s_q: %zu\n", size_t(s_q));
-    printf("s: %zu\n", size_t(s));
-    printf("h: %zu\n", size_t(h));
-    printf("h_kv: %zu\n", size_t(h_kv));
-    printf("d: %zu\n", size_t(d));
-    printf("dv: %zu\n", size_t(dv));
-    printf("total: %zu\n", size_t(total));
-    printf("sliding_window_size: %zu\n", size_t(sliding_window_size));
-    printf("chunked_attention_size: %zu\n", size_t(chunked_attention_size));
-    printf("tokens_per_block: %zu\n", size_t(tokens_per_block));
-    printf("qkv_packed_d: %p\n", qkv_packed_d);
-    printf("q_d: %p\n", q_d);
-    printf("k_d: %p\n", k_d);
-    printf("v_d: %p\n", v_d);
-    printf("contiguous_kv_d: %p\n", contiguous_kv_d);
-    printf("kv_cache_pool_ptr: %p\n", kv_cache_pool_ptr);
-    printf("kv_cache_block_offsets_d: %p\n", kv_cache_block_offsets_d);
-    printf("packed_mask_d: %p\n", packed_mask_d);
-    printf("attention_sinks_d: %p\n", attention_sinks_d);
-    printf("cum_seq_lens_kv: %p\n", cum_seq_lens_kv.data_ptr());
-    printf("cum_seq_lens_q: %p\n", cum_seq_lens_q.data_ptr());
-    printf("total_q_tokens: %d\n", total_q_tokens);
-    printf("total_kv_tokens: %d\n", total_kv_tokens);
-    printf("o: %p\n", o.data_ptr());
-    printf("softmax_stats_ptr: %p\n", softmax_stats_ptr);
-    printf("scale_bmm2_d: %p\n", scale_bmm2_d.data_ptr());
-    printf("scale_bmm1: %f\n", scale_bmm1);
-    printf("scale_softmax: %f\n", scale_softmax);
-    printf("scale_bmm2: %f\n", scale_bmm2);
-    printf("softcapping_scale_bmm1: %f\n", softcapping_scale_bmm1);
-    printf("has_alibi: %d\n", int(has_alibi));
-    printf("=============================\n");
-  }
-
   set_params(params_v2, launch_params, data_type, acc_type, output_dtype, input_layout, b, s_q, s,
              h, h_kv, d, dv, total, 1, sliding_window_size, chunked_attention_size,
              // Paged kv cache.

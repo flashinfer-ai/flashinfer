@@ -748,10 +748,8 @@ if( data_type == {data_type} && output_data_type == {output_data_type} && s == {
     {il_check}) {{
 
     {unroll_check} {{
-        printf("Call {lname} kernel\\n");
         {lname}(params, launch_params, stream);
     }} else {{
-        printf("Call {lname}_nl kernel\\n");
         {lname}_nl(params, launch_params, stream);
     }}
 
@@ -773,7 +771,6 @@ if( data_type == {data_type} && output_data_type == {output_data_type} && s == {
 if( data_type == {data_type} && output_data_type == {output_data_type} && d == {head_size} && dv == {dv} && sm == {sm}
     {il_check} && use_tiled) {{
 
-    printf("Call {lname}_nl_tiled kernel\\n");
     {lname}_nl_tiled(params, launch_params, stream);
 }} """.format(  # type: ignore[str-format]
                     **asdict(kspec),
@@ -790,7 +787,6 @@ if( data_type == {data_type} && output_data_type == {output_data_type} && d == {
 if( data_type == {data_type} && output_data_type == {output_data_type} && d == {head_size} && dv == {dv} && sm == {sm}
     {il_check}) {{
 
-    printf("Call {lname} kernel\\n");
     {lname}(params, launch_params, stream);
 }} """.format(  # type: ignore[str-format]
                     **asdict(kspec),
@@ -806,7 +802,6 @@ if( data_type == {data_type} && output_data_type == {output_data_type} && d == {
 if( data_type == {data_type} && output_data_type == {output_data_type} && d == {head_size} && dv == {dv} && sm == {sm}
     && !use_tiled {il_check}) {{
 
-    printf("Call {lname}_nl kernel\\n");
     {lname}_nl(params, launch_params, stream);
 }} """.format(  # type: ignore[str-format]
                     **asdict(kspec),
@@ -822,7 +817,6 @@ if( data_type == {data_type} && output_data_type == {output_data_type} && d == {
 if( data_type == {data_type} && output_data_type == {output_data_type} && s == {slen} && d == {head_size} && sm == {sm}
     {il_check}) {{
 
-    printf("Call {lname} kernel\\n");
     {lname}(params, launch_params, stream);
 }} """.format(
                 **asdict(kspec),
@@ -1129,7 +1123,9 @@ inline void get_grid_size(int &heads_per_wave,
     return api_code
 
 
-def generate_jit_sources(uri: str, input_layout: str, input_dtype: str, output_dtype: str) -> list:
+def generate_jit_sources(
+    uri: str, input_layout: str, input_dtype: str, output_dtype: str
+) -> list:
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
     source_paths = []
     specs_names = []
@@ -1167,7 +1163,7 @@ def generate_jit_sources(uri: str, input_layout: str, input_dtype: str, output_d
         output_dtype_values,
     )
 
-    other_configs = itertools.product(
+    other_configs: itertools.product = itertools.product(
         [],
         dtype_values,
         head_size_qk_values,

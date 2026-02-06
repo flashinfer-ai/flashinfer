@@ -1936,11 +1936,13 @@ def gen_trtllm_fmha_v2_sm120_module(device: torch.device) -> JitSpec:
     )
 
 
-def gen_fmha_v2_module(input_layout: str, input_dtype: torch.dtype, output_dtype: torch.dtype = None) -> JitSpec:
+def gen_fmha_v2_module(
+    input_layout: str, input_dtype: torch.dtype, output_dtype: torch.dtype = None
+) -> JitSpec:
     # Setup generated source directory
     if output_dtype is None:
         output_dtype = input_dtype
-    
+
     dtype_map = {
         torch.float16: "fp16",
         torch.bfloat16: "bf16",
@@ -1957,7 +1959,9 @@ def gen_fmha_v2_module(input_layout: str, input_dtype: torch.dtype, output_dtype
     # Source directories
     csrc_dir = jit_env.FLASHINFER_CSRC_DIR
     fmha_v2_src_dir = csrc_dir / "fmha_v2"
-    source_paths = generate_jit_sources(uri, input_layout, input_dtype_str, output_dtype_str)
+    source_paths = generate_jit_sources(
+        uri, input_layout, input_dtype_str, output_dtype_str
+    )
 
     # copy static fmha_v2_run.cu
     static_run_path = csrc_dir / "fmha_v2_run.cu"

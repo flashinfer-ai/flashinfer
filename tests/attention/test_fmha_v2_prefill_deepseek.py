@@ -54,7 +54,8 @@ def attention_ref_torch(
     logits_soft_cap: float = 0.0,
     block_tables: torch.Tensor = None,
     cum_seq_lens_kv: torch.Tensor = None,
-) -> torch.Tensor:
+    return_lse: bool = False,
+):
     """
     Pure-torch reference for attention supporting multiple input layouts.
 
@@ -64,6 +65,9 @@ def attention_ref_torch(
       - Contiguous Q + KV: tuple (q, kv) where kv is 4-D
       - Paged Q + KV cache: tuple (q, paged_kv_cache) where paged_kv_cache is 5-D
         (requires block_tables)
+
+    Returns output tensor, or (output, lse) when return_lse=True.
+    LSE shape: [total_tokens, num_qo_heads].
     """
     device = seq_lens.device
     batch_size = seq_lens.shape[0]
@@ -109,6 +113,7 @@ def attention_ref_torch(
     q_float = q_flat.float() * q_scale
 
     outputs = []
+    lse_outputs = []
     for b in range(batch_size):
         seq_len = seq_lens[b].item()
         q_start = cum_seq_lens_q[b].item()
@@ -135,6 +140,10 @@ def attention_ref_torch(
         o_seq = torch.zeros(
             q_len, num_qo_heads, head_dim, dtype=torch.float32, device=device
         )
+        if return_lse:
+            lse_seq = torch.zeros(
+                q_len, num_qo_heads, dtype=torch.float32, device=device
+            )
 
         for h in range(num_qo_heads):
             kv_h = h // heads_per_group
@@ -162,12 +171,20 @@ def attention_ref_torch(
                 window_mask = kv_indices >= (q_indices + offset - window_left)
                 scores = scores.masked_fill(~window_mask, float("-inf"))
 
+            if return_lse:
+                lse_seq[:, h] = torch.logsumexp(scores, dim=-1)
+
             attn = torch.softmax(scores, dim=-1)
             o_seq[:, h, :] = torch.matmul(attn, v_h)
 
         outputs.append(o_seq)
+        if return_lse:
+            lse_outputs.append(lse_seq)
 
-    return torch.cat(outputs, dim=0)
+    out = torch.cat(outputs, dim=0)
+    if return_lse:
+        return out, torch.cat(lse_outputs, dim=0)
+    return out
 
 
 @pytest.mark.parametrize("batch_size", [8])
@@ -300,28 +317,32 @@ def test_fmha_v2_prefill_deepseek(
     torch.testing.assert_close(lse, lse_ref, rtol=1e-2, atol=1e-3)
 
 
-@pytest.mark.parametrize(
-    ("input_layout", "page_size"),
-    [
-        ("PACKED_QKV", None),
-        ("CONTIGUOUS_Q_KV", None),
-        ("SEPARATE_Q_K_V", None),
-        ("Q_PAGED_KV", 32),
-        ("Q_PAGED_KV", 128),
-    ],
-)
 @pytest.mark.parametrize("batch_size", [4, 16])
 @pytest.mark.parametrize("max_seq_len", [1024, 4096])
 @pytest.mark.parametrize("num_qo_heads", [4, 32])
 @pytest.mark.parametrize("num_kv_heads", [4])
 @pytest.mark.parametrize("head_dim", [128, 256])
-@pytest.mark.parametrize(("dtype", "o_dtype"), [
-    (torch.float16, torch.float16),
-    (torch.bfloat16, torch.bfloat16),
-    (torch.float8_e4m3fn, torch.bfloat16),
-    (torch.float8_e4m3fn, torch.float16),
-])
-@pytest.mark.parametrize("non_blocking", [True, False])
+@pytest.mark.parametrize(
+    ("dtype", "o_dtype"),
+    [
+        (torch.float16, torch.float16),
+        (torch.bfloat16, torch.bfloat16),
+        (torch.float8_e4m3fn, torch.bfloat16),
+        (torch.float8_e4m3fn, torch.float16),
+    ],
+)
+@pytest.mark.parametrize(
+    ("input_layout", "page_size", "save_softmax_stats"),
+    [
+        ("PACKED_QKV", None, False),
+        ("CONTIGUOUS_Q_KV", None, False),
+        ("SEPARATE_Q_K_V", None, False),
+        ("Q_PAGED_KV", 32, False),
+        ("Q_PAGED_KV", 128, False),
+        ("Q_PAGED_KV", 32, True),
+        ("Q_PAGED_KV", 128, True),
+    ],
+)
 @pytest.mark.parametrize(
     ("causal", "window_left", "mask_mode"),
     [
@@ -330,6 +351,7 @@ def test_fmha_v2_prefill_deepseek(
         (True, 512, "SLIDING_WINDOW"),
     ],
 )
+@pytest.mark.parametrize("non_blocking", [True, False])
 @pytest.mark.parametrize("pos_encoding_mode", ["NONE"])
 @pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
 def test_trtllm_fmha_v2_prefill(
@@ -348,6 +370,7 @@ def test_trtllm_fmha_v2_prefill(
     window_left,
     logits_soft_cap,
     pos_encoding_mode,
+    save_softmax_stats,
 ):
     from flashinfer.prefill import trtllm_fmha_v2_prefill
     from flashinfer.utils import is_sm90a_supported
@@ -360,6 +383,13 @@ def test_trtllm_fmha_v2_prefill(
         pytest.skip("FP8 not supported for SEPARATE_Q_K_V layout")
     if input_layout == "SEPARATE_Q_K_V" and logits_soft_cap > 0:
         pytest.skip("Logits soft capping not supported for SEPARATE_Q_K_V layout")
+    # save_softmax_stats only supported for CONTIGUOUS_Q_KV (normal attention)
+    if save_softmax_stats and input_layout != "CONTIGUOUS_Q_KV":
+        pytest.skip(
+            "For normal attention, Only CONTIGUOUS_Q_KV layout supports "
+            "save_softmax_stats. For MLA only SEPARATE_Q_K_V layout supports "
+            "save_softmax_stats."
+        )
 
     torch.manual_seed(42)
     device = torch.device("cuda")
@@ -384,44 +414,73 @@ def test_trtllm_fmha_v2_prefill(
     if input_layout == "PACKED_QKV":
         if dtype == torch.float8_e4m3fn:
             packed_bf16 = torch.randn(
-                total_tokens, 3, num_qo_heads, head_dim,
-                dtype=torch.bfloat16, device=device,
+                total_tokens,
+                3,
+                num_qo_heads,
+                head_dim,
+                dtype=torch.bfloat16,
+                device=device,
             )
             packed_qkv, qkv_scale = to_float8(packed_bf16, dtype=torch.float8_e4m3fn)
             qkv_scale = qkv_scale.item()
         else:
             packed_qkv = torch.randn(
-                total_tokens, 3, num_qo_heads, head_dim, dtype=dtype, device=device,
+                total_tokens,
+                3,
+                num_qo_heads,
+                head_dim,
+                dtype=dtype,
+                device=device,
             )
             qkv_scale = 1.0
         qkv_arg = packed_qkv
         q_scale, k_scale, v_scale = qkv_scale, qkv_scale, qkv_scale
 
     elif input_layout == "SEPARATE_Q_K_V":
-        q = torch.randn(total_tokens, num_qo_heads, head_dim, dtype=dtype, device=device)
-        k = torch.randn(total_tokens, num_kv_heads, head_dim, dtype=dtype, device=device)
-        v = torch.randn(total_tokens, num_kv_heads, head_dim, dtype=dtype, device=device)
+        q = torch.randn(
+            total_tokens, num_qo_heads, head_dim, dtype=dtype, device=device
+        )
+        k = torch.randn(
+            total_tokens, num_kv_heads, head_dim, dtype=dtype, device=device
+        )
+        v = torch.randn(
+            total_tokens, num_kv_heads, head_dim, dtype=dtype, device=device
+        )
         qkv_arg = (q, k, v)
         q_scale, k_scale, v_scale = 1.0, 1.0, 1.0
 
     elif input_layout == "CONTIGUOUS_Q_KV":
         if dtype == torch.float8_e4m3fn:
             q_bf16 = torch.randn(
-                total_tokens, num_qo_heads, head_dim,
-                dtype=torch.bfloat16, device=device,
+                total_tokens,
+                num_qo_heads,
+                head_dim,
+                dtype=torch.bfloat16,
+                device=device,
             )
             q, q_scale = to_float8(q_bf16, dtype=torch.float8_e4m3fn)
             q_scale = q_scale.item()
             kv_bf16 = torch.randn(
-                total_tokens, 2, num_kv_heads, head_dim,
-                dtype=torch.bfloat16, device=device,
+                total_tokens,
+                2,
+                num_kv_heads,
+                head_dim,
+                dtype=torch.bfloat16,
+                device=device,
             )
             kv, kv_scale = to_float8(kv_bf16, dtype=torch.float8_e4m3fn)
             kv_scale = kv_scale.item()
         else:
-            q = torch.randn(total_tokens, num_qo_heads, head_dim, dtype=dtype, device=device)
+            q = torch.randn(
+                total_tokens, num_qo_heads, head_dim, dtype=dtype, device=device
+            )
             kv = torch.randn(
-                total_tokens, 2, num_kv_heads, head_dim, dtype=dtype, device=device,
+                total_tokens,
+                2,
+                num_kv_heads,
+                head_dim,
+                dtype=dtype,
+                device=device,
             )
             q_scale, kv_scale = 1.0, 1.0
         qkv_arg = (q, kv)
@@ -432,31 +491,50 @@ def test_trtllm_fmha_v2_prefill(
         num_pages = batch_size * max_num_blocks
         if dtype == torch.float8_e4m3fn:
             paged_bf16 = torch.randn(
-                num_pages, 2, page_size, num_kv_heads, head_dim,
-                dtype=torch.bfloat16, device=device,
+                num_pages,
+                2,
+                page_size,
+                num_kv_heads,
+                head_dim,
+                dtype=torch.bfloat16,
+                device=device,
             )
             paged_kv_cache, kv_scale = to_float8(paged_bf16, dtype=torch.float8_e4m3fn)
             kv_scale = kv_scale.item()
             q_bf16 = torch.randn(
-                total_tokens, num_qo_heads, head_dim,
-                dtype=torch.bfloat16, device=device,
+                total_tokens,
+                num_qo_heads,
+                head_dim,
+                dtype=torch.bfloat16,
+                device=device,
             )
             q, q_scale = to_float8(q_bf16, dtype=torch.float8_e4m3fn)
             q_scale = q_scale.item()
         else:
             paged_kv_cache = torch.randn(
-                num_pages, 2, page_size, num_kv_heads, head_dim,
-                dtype=dtype, device=device,
+                num_pages,
+                2,
+                page_size,
+                num_kv_heads,
+                head_dim,
+                dtype=dtype,
+                device=device,
             )
-            q = torch.randn(total_tokens, num_qo_heads, head_dim, dtype=dtype, device=device)
+            q = torch.randn(
+                total_tokens, num_qo_heads, head_dim, dtype=dtype, device=device
+            )
             q_scale, kv_scale = 1.0, 1.0
         block_tables = torch.zeros(
-            batch_size, max_num_blocks, dtype=torch.int32, device=device,
+            batch_size,
+            max_num_blocks,
+            dtype=torch.int32,
+            device=device,
         )
         for i in range(batch_size):
             num_blocks_needed = (seq_lens[i].item() + page_size - 1) // page_size
             block_tables[i, :num_blocks_needed] = torch.arange(
-                i * max_num_blocks, i * max_num_blocks + num_blocks_needed,
+                i * max_num_blocks,
+                i * max_num_blocks + num_blocks_needed,
                 device=device,
             )
         qkv_arg = (q, paged_kv_cache)
@@ -474,7 +552,7 @@ def test_trtllm_fmha_v2_prefill(
     workspace_buffer = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=device)
 
     # --- Run kernel ---
-    output = trtllm_fmha_v2_prefill(
+    result = trtllm_fmha_v2_prefill(
         qkv_arg,
         workspace_buffer=workspace_buffer,
         seq_lens=seq_lens,
@@ -494,10 +572,16 @@ def test_trtllm_fmha_v2_prefill(
         non_blocking=non_blocking,
         logits_soft_cap_scale=logits_soft_cap if logits_soft_cap > 0 else None,
         pos_encoding_mode=pos_encoding_mode,
+        save_softmax_stats=save_softmax_stats,
     )
 
+    if save_softmax_stats:
+        output, kernel_lse = result
+    else:
+        output = result
+
     # --- Reference ---
-    output_ref = attention_ref_torch(
+    ref_result = attention_ref_torch(
         qkv_arg,
         seq_lens=seq_lens,
         cum_seq_lens_q=cum_seq_lens,
@@ -509,13 +593,34 @@ def test_trtllm_fmha_v2_prefill(
         window_left=window_left,
         logits_soft_cap=logits_soft_cap,
         block_tables=block_tables,
+        return_lse=save_softmax_stats,
     )
+
+    if save_softmax_stats:
+        output_ref, lse_ref = ref_result
+    else:
+        output_ref = ref_result
 
     if dtype == torch.float8_e4m3fn:
         rtol, atol = 4e-2, 7e-2
     else:
         rtol, atol = 1e-2, 1e-2
     torch.testing.assert_close(output.float(), output_ref.float(), rtol=rtol, atol=atol)
+
+    if save_softmax_stats:
+        # kernel_lse: [total_tokens, num_qo_heads, 2] -> [max, sum_exp] in ragged format
+        # The Softmax_saver_tma stores max / sqrt(head_dim).
+        # Non-softcap (exp2f path): max = max(raw_BMM_output), scores = raw * q_scale * k_scale * sm_scale
+        #   lse = kernel_max * q_scale * k_scale + ln(sum)  (since sqrt(d) * sm_scale = 1)
+        # Softcap (expf path): max = max(softcapped(scores * scale_bmm1)), scores already scaled
+        #   lse = kernel_max / sm_scale + ln(sum)  (i.e. kernel_max * sqrt(d))
+        kernel_max = kernel_lse[:, :, 0]
+        kernel_sum_exp = kernel_lse[:, :, 1]
+        if logits_soft_cap > 0:
+            lse_kernel = kernel_max / sm_scale + torch.log(kernel_sum_exp)
+        else:
+            lse_kernel = kernel_max * (q_scale * k_scale) + torch.log(kernel_sum_exp)
+        torch.testing.assert_close(lse_kernel, lse_ref, rtol=1e-2, atol=1e-2)
 
 
 @pytest.mark.parametrize("batch_size", [4, 16])
