@@ -396,13 +396,31 @@ def test_sanitize_expert_ids(world_size, num_tokens):
 
 
 def fake_moe(
-    hidden_states,
-    token_selected_experts,
-    num_experts,
-    is_ep=False,
-    ep_rank=None,
-    num_experts_per_rank=None,
-):
+    hidden_states: torch.Tensor,
+    token_selected_experts: torch.Tensor,
+    num_experts: int,
+    is_ep: bool = False,
+    ep_rank: int | None = None,
+    num_experts_per_rank: int | None = None,
+) -> torch.Tensor:
+    """
+    Apply a deterministic fake MoE transformation for validation.
+
+    Each expert applies a predictable scale: (expert_id + 1.0) / num_experts + 0.5
+    This allows verifying that communication correctly routes tokens to experts
+    and combines results.
+
+    Args:
+        hidden_states: Input tensor [num_tokens, hidden_size] or [world_size, num_tokens, hidden_size]
+        token_selected_experts: Expert assignments [num_tokens, top_k] or [world_size, num_tokens, top_k]
+        num_experts: Total number of experts
+        is_ep: If True, only process experts assigned to this rank
+        ep_rank: Rank for expert parallel filtering
+        num_experts_per_rank: Number of experts per rank
+
+    Returns:
+        Processed tensor with same shape as hidden_states
+    """
     target_shape = hidden_states.shape
     hidden_states = hidden_states.flatten(end_dim=-2)
     token_selected_experts = token_selected_experts.flatten(end_dim=-2)

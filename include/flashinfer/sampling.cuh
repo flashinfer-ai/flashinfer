@@ -657,9 +657,15 @@ __device__ __forceinline__ vec_t<DType, VEC_SIZE> GenerateGumbelNoise(uint64_t p
                                                                       uint64_t subsequence) {
   curandStatePhilox4_32_10_t state;
   vec_t<float, VEC_SIZE> noise;
-  constexpr float kEPSILON = 1e-20f;
+  constexpr float kSCALE = 1.0f - cuda::std::numeric_limits<float>::epsilon();
   constexpr float kLOG2 = 0.6931471806f;
-  auto uniform2gumbel = [](float x) { return -kLOG2 * log2f(-log2f(x + kEPSILON) + kEPSILON); };
+  auto uniform2gumbel = [](float x) {
+    // NB: cuRAND returns strictly positive normal floating point numbers, up to
+    //     and including 1.0. kSCALE is used to exclude 1.0, s.t.
+    //         1.18e-38 <= x * kSCALE <= 1.0f - epsilon
+    //      => -4.47    <= -log(-log(...))       <= 15.9
+    return -kLOG2 * log2f(-log2f((x * kSCALE)));
+  };
 // TODO: compare the speed of log2 and log
 #pragma unroll
   for (uint32_t i = 0; i + 4 <= VEC_SIZE; i += 4) {

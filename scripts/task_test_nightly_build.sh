@@ -3,6 +3,9 @@
 set -eo pipefail
 set -x
 
+# Source test environment setup (handles package overrides like TVM-FFI)
+source "$(dirname "${BASH_SOURCE[0]}")/setup_test_env.sh"
+
 # This script installs nightly build packages and runs tests
 # Expected dist directories to be in current directory or specified via env vars
 

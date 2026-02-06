@@ -158,6 +158,8 @@ __inline__ __device__ T blockAllReduceMax(T val) {
   return val;
 }
 
+#ifdef ENABLE_FP8
+// This function requires PackType which is only available when ENABLE_FP8 is defined
 template <typename T, int SZ>
 __inline__ __device__ typename PackType<T, SZ>::type batchWarpReduceSum(
     typename PackType<T, SZ>::type val) {
@@ -179,6 +181,7 @@ __inline__ __device__ typename PackType<T, SZ>::type batchWarpReduceSum(
   }
   return val;
 }
+#endif  // ENABLE_FP8
 
 template <typename T, int NUM>
 __inline__ __device__ T warpReduceSumV2(T* val) {

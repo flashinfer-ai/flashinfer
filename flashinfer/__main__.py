@@ -383,5 +383,78 @@ def export_compile_commands_cmd(path, output):
         click.secho(f"❌ Failed to write compile commands: {e}", fg="red")
 
 
+@cli.command("replay")
+@click.option(
+    "--dir",
+    "dump_dir",
+    required=True,
+    help="Directory containing dump files (or root directory of session)",
+)
+def replay_cmd(dump_dir):
+    """Replay API calls from dump directory"""
+    from .api_logging import replay_sequence, replay_from_dump
+
+    device = "cuda"
+
+    if not os.path.exists(dump_dir):
+        click.secho(f"❌ Directory not found: {dump_dir}", fg="red")
+        return
+
+    # Check if this is a single dump or a session / sequence root
+    is_single_dump = os.path.exists(os.path.join(dump_dir, "metadata.jsonl"))
+
+    try:
+        if is_single_dump:
+            click.secho(f"Replaying single dump from {dump_dir}...", fg="cyan")
+            result = replay_from_dump(
+                dump_dir, compare_outputs=True, device=device, run=True
+            )
+            if result.get("comparison_match"):
+                click.secho("✅ Replay passed (outputs matched)", fg="green")
+            elif result.get("execution_error"):
+                click.secho(
+                    f"❌ Execution failed: {result['execution_error']}", fg="red"
+                )
+            else:
+                click.secho("⚠️  Replay finished but outputs did not match", fg="yellow")
+        else:
+            # Session / sequence replay
+            click.secho(f"Replaying session from {dump_dir}...", fg="cyan")
+            results = replay_sequence(dump_dir, device=device)
+
+            passed = 0
+            failed = 0
+
+            for i, res in enumerate(results):
+                dump_name = (
+                    os.path.basename(res.get("dump_dir", ""))
+                    if "dump_dir" in res
+                    else f"call_{i + 1}"
+                )
+                # If replay_from_dump returned successfully, metadata might have the name
+                if "metadata" in res and "function_name" in res["metadata"]:
+                    func_name = res["metadata"]["function_name"]
+                    dump_name = f"{func_name} ({dump_name})"
+
+                if "error" in res:
+                    click.secho(
+                        f"[{i + 1}] {dump_name}: ❌ Error: {res['error']}", fg="red"
+                    )
+                    failed += 1
+                elif res.get("comparison_match"):
+                    click.secho(f"[{i + 1}] {dump_name}: ✅ Passed", fg="green")
+                    passed += 1
+                else:
+                    click.secho(f"[{i + 1}] {dump_name}: ⚠️  Mismatch", fg="yellow")
+                    failed += 1
+
+            click.secho(
+                f"\nSummary: {passed} passed, {failed} failed/mismatch", fg="white"
+            )
+
+    except Exception as e:
+        click.secho(f"❌ Replay failed: {e}", fg="red")
+
+
 if __name__ == "__main__":
     cli()

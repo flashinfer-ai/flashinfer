@@ -2517,7 +2517,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             will be used in attention computation.
 
         backend : str
-            The implementation backend, could be ``auto``/``fa2``/``fa3`` or ``cutlass``.
+            The implementation backend, could be ``auto``/``fa2``/``fa3``/``cudnn`` or ``cutlass``.
             Defaults to ``auto``.
             If set to ``auto``, the wrapper will automatically choose the backend based on the
             device architecture and kernel availability.
@@ -2637,6 +2637,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         max_item_len_ptr: Optional[torch.Tensor] = None,
         fixed_split_size: Optional[int] = None,
         disable_split_kv: bool = False,
+        seq_lens: Optional[torch.Tensor] = None,
+        seq_lens_q: Optional[torch.Tensor] = None,
+        max_token_per_sequence: Optional[int] = None,
+        max_sequence_kv: Optional[int] = None,
+        v_indptr: Optional[torch.Tensor] = None,
+        o_indptr: Optional[torch.Tensor] = None,
     ) -> None:
         r"""Plan batch prefill/append attention on Ragged KV-Cache for given problem specification.
 
@@ -2731,6 +2737,19 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             and lead to a varied number of launched CTAs.
         disable_split_kv : bool,
             Whether to disable the split-kv for determinism in CUDA Graph, defaults to ``False``.
+        seq_lens: Optional[torch.Tensor]
+            A uint32 1D tensor indicating the kv sequence length of each prompt. shape: ``[batch_size]``.
+        seq_lens_q: Optional[torch.Tensor]
+            A uint32 1D tensor indicating the q sequence length of each prompt. shape: ``[batch_size]``.
+            If not provided, will be set to the same value as ``seq_lens``.
+        max_token_per_sequence: Optional[int],
+            Required for cudnn backend. This is the scalar max token length of each sequence.
+        max_sequence_kv: Optional[int],
+            Required for cudnn backend. This is the scalar max sequence length of each sequence in kv cache.
+        v_indptr: Optional[torch.Tensor]
+            Required for cudnn backend. This is the indptr of the value tensor.
+        o_indptr: Optional[torch.Tensor]
+            Required for cudnn backend. This is the indptr of the output tensor.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -2820,6 +2839,17 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     self.device, non_blocking=non_blocking
                 )
 
+        self._o_indptr_buf = (
+            o_indptr.to(self.device, non_blocking=non_blocking)
+            if o_indptr is not None
+            else self._qo_indptr_buf
+        )
+        self._v_indptr_buf = (
+            v_indptr.to(self.device, non_blocking=non_blocking)
+            if v_indptr is not None
+            else self._kv_indptr_buf
+        )
+
         self._cached_q_data_type = q_data_type
         self._cached_kv_data_type = kv_data_type
         self._cached_o_data_type = o_data_type
@@ -2829,6 +2859,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._token_pos_in_items_ptr = token_pos_in_items_ptr
         self._token_pos_in_items_len = token_pos_in_items_len
         self._max_item_len_ptr = max_item_len_ptr
+
+        self._seq_lens_q = seq_lens_q
+        self._seq_lens_kv = seq_lens
+        self._max_token_per_sequence = max_token_per_sequence
+        self._max_sequence_kv = max_sequence_kv
 
         if self._jit_module is not None:
             self._cached_module = self._jit_module
@@ -2861,7 +2896,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     get_module_args[:9] + (qo_indptr.device,) + get_module_args[9:]
                 )
                 self._cached_module = get_fmha_module(*new_get_module_args)
-            else:
+            elif self._backend != "cudnn":
                 self._cached_module = get_batch_prefill_module(
                     self._backend, *get_module_args
                 )
@@ -2871,7 +2906,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self._cached_module, qo_indptr, kv_indptr, num_qo_heads, causal
             )
             self._max_qo_len = torch.max(qo_indptr[1:] - qo_indptr[:-1]).item()
-        else:
+        elif self._backend != "cudnn":
             assert self._cached_module is not None, "cached module is not initialized"
             args = [
                 self._float_workspace_buffer,
@@ -3078,6 +3113,40 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 out=out,
                 lse=lse,
             )
+            return (out, lse) if return_lse else out
+        elif self._backend == "cudnn":
+            if self._seq_lens_q.dim() == 1:
+                batch_size = self._seq_lens_q.shape[0]
+            if self._seq_lens_q is not None and self._seq_lens_q.dim() == 1:
+                self._seq_lens_q = self._seq_lens_q.reshape(batch_size, 1, 1, 1)
+
+            if self._seq_lens_kv is not None and self._seq_lens_kv.dim() == 1:
+                self._seq_lens_kv = self._seq_lens_kv.reshape(batch_size, 1, 1, 1)
+
+            cudnn_batch_prefill_with_kv_cache(
+                q,
+                k,
+                v,
+                sm_scale,
+                self._float_workspace_buffer,
+                max_token_per_sequence=self._max_token_per_sequence,
+                max_sequence_kv=self._max_sequence_kv,
+                actual_seq_lens_q=self._seq_lens_q,
+                actual_seq_lens_kv=self._seq_lens_kv,
+                return_lse=return_lse,
+                causal=self._causal,
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                batch_offsets_q=self._qo_indptr_buf,
+                batch_offsets_k=self._kv_indptr_buf,
+                batch_offsets_v=self._v_indptr_buf,
+                batch_offsets_o=self._o_indptr_buf,
+                is_cuda_graph_compatible=self._use_cuda_graph,
+                out=out,
+                lse=lse,
+            )
+
             return (out, lse) if return_lse else out
 
         # Skip FP8->FP16 conversion for FA3 backend with FP8 support
@@ -3804,8 +3873,8 @@ def fmha_v2_prefill_deepseek(
 
 
 @functools.cache
-def get_trtllm_fmha_v2_module():
-    return gen_fmha_v2_module().build_and_load()
+def get_trtllm_fmha_v2_module(input_layout: str, input_dtype: torch.dtype, output_dtype: torch.dtype = None):
+    return gen_fmha_v2_module(input_layout, input_dtype, output_dtype).build_and_load()
 
 
 @flashinfer_api
@@ -3825,7 +3894,7 @@ def trtllm_fmha_v2_prefill(
     cum_seq_lens_q: torch.Tensor,
     cum_seq_lens_kv: torch.Tensor,
     block_tables: Optional[torch.Tensor] = None,
-    out: Optional[Union[torch.Tensor, FP4Tensor]] = None,
+    out: Optional[torch.Tensor] = None,
     out_dtype: Optional[Union[torch.dtype, str]] = None,
     kv_layout: Optional[str] = "HND",
     sinks: Optional[List[torch.Tensor]] = None,
@@ -3878,7 +3947,7 @@ def trtllm_fmha_v2_prefill(
     block_tables : Optional[torch.Tensor]
         The page table for KV cache, shape: ``[batch_size, max_num_pages_per_seq]``.
         Required when using paged KV cache format.
-    out : Optional[Union[torch.Tensor, FP4Tensor]]
+    out : Optional[torch.Tensor]
         The output tensor. If not provided, will be allocated with ``out_dtype``.
         If ``out_dtype`` is also not provided, will use the dtype of query.
     out_dtype : Optional[Union[torch.dtype, str]]
@@ -3949,6 +4018,16 @@ def trtllm_fmha_v2_prefill(
         elif len(qkv) == 3:
             input_layout = "SEPARATE_Q_K_V"
             query, k_cache, v_cache = qkv
+            if hasattr(torch, "float8_e4m3fn") and query.dtype == torch.float8_e4m3fn:
+                raise ValueError(
+                    "FP8 (e4m3) is not supported for the SEPARATE_Q_K_V input layout. "
+                    "Use PACKED_QKV, CONTIGUOUS_Q_KV, or Q_PAGED_KV layout instead."
+                )
+            if logits_soft_cap_scale is not None and logits_soft_cap_scale > 0:
+                raise ValueError(
+                    "Logits soft capping is not supported for the SEPARATE_Q_K_V input layout. "
+                    "Use PACKED_QKV, CONTIGUOUS_Q_KV, or Q_PAGED_KV layout instead."
+                )
 
         else:
             raise ValueError(
@@ -4019,38 +4098,12 @@ def trtllm_fmha_v2_prefill(
             device=query.device,
         )
 
-    # TODO: See if we can not use these mapping codes for clealiness
-    mask_mode_map = {
-        "padding": 0,
-        "causal": 1,
-        "sliding_window": 2,
-        "chunked": 2,
-        "custom": 3,
-    }
-    mask_mode_code = mask_mode_map.get(mask_mode.lower(), 1)  # default to causal
-    input_layout_map = {
-        "packed_qkv": 0,
-        "contiguous_q_kv": 1,
-        "q_paged_kv": 2,
-        "separate_q_k_v": 3,
-    }
-    input_layout_code = input_layout_map.get(
-        input_layout.lower(), 2
-    )  # default to Q_PAGED_KV
-    dtype_to_code_map = {
-        torch.float16: 0,
-        torch.float32: 1,
-        torch.bfloat16: 4,
-    }
-    if hasattr(torch, "float8_e4m3fn"):
-        dtype_to_code_map[torch.float8_e4m3fn] = 4
-    output_dtype_code = dtype_to_code_map.get(o_dtype, 0)  # default to FP16
-
     # Handle scale parameters
     scale_bmm1 = float(bmm1_scale)
     scale_bmm2 = float(bmm2_scale)
 
-    # Softmax scale is typically 1.0 for FP8 and auto for FP16/BF16
+    # Softmax scale: 1.0 for FP8, 0.0 (auto-detect) for FP16/BF16
+    # C++ kernel auto-sets to 1.0 for FP16/E4M3 when 0.0 is passed
     is_e4m3 = (
         query.dtype == torch.float8_e4m3fn if hasattr(torch, "float8_e4m3fn") else False
     )
@@ -4059,7 +4112,7 @@ def trtllm_fmha_v2_prefill(
         logits_soft_cap_scale if logits_soft_cap_scale is not None else 0.0
     )
 
-    module = get_trtllm_fmha_v2_module()
+    module = get_trtllm_fmha_v2_module(input_layout, query.dtype, o_dtype if query.dtype == torch.float8_e4m3fn else None)
     total_q_tokens = int(cum_seq_lens_q[-1].item())
     total_kv_tokens = int(cum_seq_lens_kv[-1].item())
 
@@ -4089,14 +4142,13 @@ def trtllm_fmha_v2_prefill(
         seq_lens,  # Sequence length for kv_cache
         cum_seq_lens_q,  # Cumulative sequence length for query
         cum_seq_lens_kv,  # Cumulative sequence length for kv_cache
-        input_layout_code,  # Input layout (int)
-        output_dtype_code,  # Output dtype (int)
+        input_layout.lower(),  # Input layout (int)
         max_q_len,  # Max sequence length for query
         max_kv_len,  # Max sequence length for kv_cache
         batch_size,  # Batch size
         total_q_tokens,  # Total Q tokens (cum_seq_lens_q[-1])
         total_kv_tokens,  # Total KV tokens (cum_seq_lens_kv[-1])
-        mask_mode_code,  # Attention mask type
+        mask_mode.lower(),  # Attention mask type
         scale_softmax,  # Softmax scale
         scale_bmm1,  # BMM1 scale
         scale_bmm2,  # BMM2 scale (float, still needed for set_alpha in C++)

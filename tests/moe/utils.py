@@ -17,7 +17,7 @@ limitations under the License.
 import pytest
 import torch
 from enum import IntEnum
-from flashinfer import GatedActType, RoutingMethodType
+from flashinfer import ActivationType, RoutingMethodType
 from flashinfer.utils import get_compute_capability
 
 
@@ -33,42 +33,81 @@ class QuantMode(IntEnum):
     MXINT4_BF16_BF16 = 7
 
 
+NON_GATED_ACTIVATION_SUPPORTED_QUANT_MODES = [
+    QuantMode.FP4_NVFP4_NVFP4,
+    QuantMode.FP8_PER_TENSOR,
+]
+
+
+def is_gated_activation(activation_type: ActivationType) -> bool:
+    return activation_type in [
+        ActivationType.Swiglu,
+        ActivationType.Geglu,
+        ActivationType.SwigluBias,
+    ]
+
+
 def skip_checks(
     moe_impl,
     routing_config,
     weight_processing,
-    gated_act_type,
+    activation_type,
     num_tokens,
     hidden_size,
     intermediate_size,
+    zero_hidden_states=False,
 ):
     """Common skip logic for all tests."""
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] not in [10]:
         pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
 
-    # Check if moe_impl is FP4Moe by class name to avoid circular imports
+    # Check moe_impl class by name to avoid circular imports
     is_fp4_moe = type(moe_impl).__name__ == "FP4Moe"
+    is_fp8_block_scale_moe = type(moe_impl).__name__ == "FP8BlockScaleMoe"
+
+    # Skip zero hidden states tests for non-FP8 Block Scale MoE implementations
+    if zero_hidden_states and not is_fp8_block_scale_moe:
+        pytest.skip("Skipping zero hidden states tests for non-FP8 Block Scale MoE.")
 
     # Skip incompatible combinations
-    if gated_act_type == GatedActType.GeGlu and (
+    if activation_type == ActivationType.Geglu and (
         not is_fp4_moe
         or moe_impl.quant_mode != QuantMode.FP4_NVFP4_NVFP4
         or routing_config["routing_method_type"] != RoutingMethodType.TopK
         or num_tokens > 128
     ):
         pytest.skip(
-            f"Incompatible: {moe_impl.name} + {gated_act_type} + {routing_config['routing_method_type']} + {num_tokens}"
+            f"Incompatible: {moe_impl.name} + {activation_type} + {routing_config['routing_method_type']} + {num_tokens}"
         )
-    elif gated_act_type == GatedActType.SwiGlu and (
+    elif activation_type == ActivationType.Swiglu and (
         hidden_size > 1024 or intermediate_size > 1024
     ):
         pytest.skip(
-            f"Skip for testing speed: {gated_act_type} + {hidden_size} + {intermediate_size}"
+            f"Skip for testing speed: {activation_type} + {hidden_size} + {intermediate_size}"
+        )
+
+    compatible_activation_types = routing_config.get(
+        "compatible_activation_types", None
+    )
+    if (
+        compatible_activation_types is not None
+        and activation_type not in compatible_activation_types
+    ):
+        pytest.skip(
+            f"Incompatible: activation_type={activation_type} not in compatible_activation_types ({compatible_activation_types})"
+        )
+
+    if (
+        not is_gated_activation(activation_type)
+        and moe_impl.quant_mode not in NON_GATED_ACTIVATION_SUPPORTED_QUANT_MODES
+    ):
+        pytest.skip(
+            f"Incompatible: {moe_impl.name} + {activation_type=} + quant_mode={moe_impl.quant_mode}: non-gated activations only supported with these quant modes: {NON_GATED_ACTIVATION_SUPPORTED_QUANT_MODES}"
         )
 
     # Skip large intermediate sizes for configurations with many experts
-    if routing_config["num_experts"] >= 512 and intermediate_size > 512:
+    if routing_config["num_experts"] > 512 and intermediate_size > 512:
         pytest.skip(
             f"Skipping for testing speed: intermediate_size={intermediate_size} with {routing_config['num_experts']} experts"
         )
@@ -86,7 +125,7 @@ def skip_checks(
             f"Incompatible: intermediate_size={intermediate_size} with {routing_config['routing_method_type'].name} routing ({routing_config['num_experts']} experts)"
         )
 
-    if type(moe_impl).__name__ == "MxInt4BlockScaleMoe" and (
+    if moe_impl.quant_mode == QuantMode.MXINT4_BF16_BF16 and (
         intermediate_size % 256 != 0 or hidden_size % 256 != 0
     ):
         pytest.skip(

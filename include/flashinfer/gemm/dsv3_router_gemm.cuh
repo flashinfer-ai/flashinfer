@@ -39,9 +39,10 @@ __device__ __forceinline__ void bf16_uint4_to_float8(uint4 const& vec, float* ds
   }
 }
 
-template <typename T, int kBlockSize, int VPT, int kNumTokens, int kNumExperts, int kHiddenDim>
-__global__ __launch_bounds__(128, 1) void router_gemm_kernel(float* out, T const* mat_a,
-                                                             T const* mat_b) {
+template <typename Tin, typename Tout, int kBlockSize, int VPT, int kNumTokens, int kNumExperts,
+          int kHiddenDim>
+__global__ __launch_bounds__(128, 1) void router_gemm_kernel(Tout* out, Tin const* mat_a,
+                                                             Tin const* mat_b) {
   // Each block handles one expert column
   int const n_idx = blockIdx.x;
   int const tid = threadIdx.x;
@@ -58,7 +59,7 @@ __global__ __launch_bounds__(128, 1) void router_gemm_kernel(float* out, T const
   __shared__ float sm_reduction[kNumTokens][kNumWarps];  // kNumWarps
 
   // B matrix is in column-major order, so we can directly load a column for the n_idx expert
-  T const* b_col = mat_b + n_idx * kHiddenDim;
+  Tin const* b_col = mat_b + n_idx * kHiddenDim;
 
   // Pre-compute k_base values for each iteration to help compiler optimize
   // int k_bases[k_iterations];

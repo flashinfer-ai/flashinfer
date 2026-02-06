@@ -1142,38 +1142,31 @@ inline void get_grid_size(int &heads_per_wave,
     return api_code
 
 
-def generate_jit_sources() -> list:
-    uri = "trtllm_fmha_v2"
+def generate_jit_sources(uri: str, input_layout: str, input_dtype: str, output_dtype: str) -> list:
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
     source_paths = []
     specs_names = []
-    dtype_values = ["fp16", "bf16"]
     head_size_qk_values = [16, 32, 64, 128, 256, 512]
     head_size_qk_warpspec_values = [32, 40, 48, 64, 80, 96, 104, 128, 160, 192, 256]
-    head_size_v_values = [
-        0
-    ]  # 0 means head_size_v = head_size_qk (required for flash_valid)
-    input_layout_values = [
-        InputLayout.Q_PAGED_KV,
-        InputLayout.PACKED_QKV,
-        InputLayout.SEPARATE_Q_K_V,
-        InputLayout.CONTIGUOUS_Q_KV,
-    ]
-    # None means output_dtype == dtype
-    # otherwise it generates many useless kernels like fp16->bf16 or bf16->fp16
-    # output_dtype is intended for fp8 kernels
-    # output_dtype_values = ["fp16", "bf16"]
-    output_dtype_values = [None]
+
+    # 0 means head_size_v = head_size_qk (required for flash_valid)
+    head_size_v_values = [0]
+    map_input_layout = {
+        "q_paged_kv": InputLayout.Q_PAGED_KV,
+        "packed_qkv": InputLayout.PACKED_QKV,
+        "separate_q_k_v": InputLayout.SEPARATE_Q_K_V,
+        "contiguous_q_kv": InputLayout.CONTIGUOUS_Q_KV,
+    }
+
+    input_layout_values = [map_input_layout[input_layout.lower()]]
+    dtype_values = [input_dtype]
+    output_dtype_values = [output_dtype] if output_dtype is not None else [None]
+
     is_mla_values = [False]
 
-    # head_size_qk_values = [32, 64, 128, 256, 512]
-    # head_size_v_values = [0, 64, 128, 256, 512]
     enable_attn_logit_softcapping_values = [True, False]
     return_softmax_values = [True, False]
     alibi_values = [True, False]
-    # is_mla_values = [True, False]
-    # input_layout_values = [InputLayout.PACKED_QKV, InputLayout.CONTIGUOUS_Q_KV, InputLayout.Q_PAGED_KV, InputLayout.SEPARATE_Q_K_V]
-    # output_dtype_values = [None, "fp16", "bf16", "e4m3"]
     warp_spec_configs = itertools.product(
         [90],
         dtype_values,

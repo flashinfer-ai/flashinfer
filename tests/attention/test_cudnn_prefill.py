@@ -44,7 +44,7 @@ def test_cudnn_prefill(
     )
 
     cumsum_s_qo = torch.sum(actual_seq_lens_q)
-    q = torch.ones(
+    q = torch.randn(
         cumsum_s_qo, num_qo_heads, head_dim, device=device, dtype=torch.bfloat16
     )
 
@@ -60,7 +60,7 @@ def test_cudnn_prefill(
     total_num_pages = num_pages_per_seq * batch_size
 
     kv_cache_shape = (total_num_pages, 2, num_kv_heads, page_size, head_dim)
-    kv_cache = torch.ones(size=kv_cache_shape, dtype=torch.bfloat16).to(device)
+    kv_cache = torch.randn(size=kv_cache_shape, dtype=torch.bfloat16).to(device)
     kv_cache = kv_cache.as_strided(
         kv_cache.shape,
         (

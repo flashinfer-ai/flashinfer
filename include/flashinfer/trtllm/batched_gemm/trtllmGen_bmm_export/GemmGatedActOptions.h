@@ -76,6 +76,8 @@ enum class ActType {
   // where x0 and x1 are the raw numbers from Gemm, while scaleC and scaleGate are input scales,
   // beta' = beta / scaleAb, scaleC' = scaleC * scaleAb.
   GeGlu,
+  // Placeholder for no activation; not implemented in codegen
+  None,
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -121,6 +123,15 @@ struct GemmGatedActOptions : public gemm::GemmOptions {
 // Check if the options are valid or not.
 inline bool checkAndUpdateGemmGatedActOptions(gemmGatedAct::GemmGatedActOptions& options,
                                               tg::CudaArch cudaArch, bool updateOptions = true) {
+  auto isValid = gemm::checkAndUpdateGemmOptions(options, cudaArch,
+                                                 /* tpGrpSize */ 1, updateOptions);
+  if (!isValid) {
+    return false;
+  }
+
+  if (options.mActType == gemmGatedAct::ActType::None) {
+    TLLM_CHECK_ERROR(false, "ActType None is not supported");
+  }
   // tmpOut is already transposed at this stage
   auto const hiddenSizeStr = options.mTransposeMmaOutput ? "M" : "N";
   auto const hiddenSize = options.mTransposeMmaOutput ? options.mM : options.mN;
@@ -129,8 +140,8 @@ inline bool checkAndUpdateGemmGatedActOptions(gemmGatedAct::GemmGatedActOptions&
 
   TLLM_CHECK_ERROR(hiddenSize % 2 == 0, hiddenSizeStr, " must be a multiple of 2.");
 
-  TLLM_CHECK_ERROR((options.mTransposeMmaOutput ^ options.mUseShuffledMatrixA) == 0,
-                   "Transpose mma output can only be used with shuffled A matrix. And vice versa.");
+  TLLM_CHECK_ERROR((options.mTransposeMmaOutput && !options.mUseShuffledMatrix) == false,
+                   "Transpose mma output can only be used with shuffled matrix.");
 
   if (options.mUseTmaStore) {
     TLLM_CHECK_ERROR(
@@ -140,16 +151,9 @@ inline bool checkAndUpdateGemmGatedActOptions(gemmGatedAct::GemmGatedActOptions&
 
   if (options.mDtypeC == tg::Dtype::E2m1 || options.mDtypeC == tg::Dtype::MxE4m3) {
     int const outHiddenSize = (options.mTransposeMmaOutput ? options.mM : options.mN) / 2;
-    int const hiddenGranularity = 4 * tg::dtypeNumEltsPerSf(options.mDtypeC);
+    int const hiddenGranularity = 4 * options.mSfBlockSizeC;
     TLLM_CHECK_ERROR(outHiddenSize % hiddenGranularity == 0, "Output hidden size (", outHiddenSize,
                      ") must be a multiple of ", hiddenGranularity, " for block-scaled outputs.");
-  }
-
-  auto isValid = gemm::checkAndUpdateGemmOptions(options, cudaArch,
-                                                 /* tpGrpSize */ 1, updateOptions);
-
-  if (!isValid) {
-    return false;
   }
 
   auto const validHiddenSize = options.mTransposeMmaOutput ? options.mValidM : options.mValidN;
@@ -160,12 +164,12 @@ inline bool checkAndUpdateGemmGatedActOptions(gemmGatedAct::GemmGatedActOptions&
   }
 
   //
-  if (options.mUseShuffledMatrixA) {
+  if (options.mUseShuffledMatrix) {
     auto const shuffleBlockSize = gemm::getShuffleBlockSize(options.mEpilogueTileM);
     TLLM_CHECK_ERROR(
         hiddenSize % (2 * shuffleBlockSize) == 0 && validHiddenSize % (2 * shuffleBlockSize) == 0,
         "M/validM must be a multiple of 2 * shuffle block size (", 2 * shuffleBlockSize,
-        ") when useShuffledMatrixA");
+        ") when useShuffledMatrix");
   }
   if (options.mNumSlicesForSplitK > 1) {
     TLLM_CHECK_ERROR(doesSplitKUseDsmem(options.mSplitK),
@@ -185,8 +189,8 @@ inline bool checkAndUpdateGemmGatedActOptions(gemmGatedAct::GemmGatedActOptions&
 inline std::string dumpOptions(GemmGatedActOptions const& options, bool dumpRuntimeParams = true) {
   std::stringstream ss;
   ss << gemm::dumpOptions(options, dumpRuntimeParams) << ", ";
-  ss << "mActType="
-     << "gemmGatedAct::ActType(" << static_cast<int32_t>(options.mActType) << ")," << std::endl;
+  ss << "mActType=" << "gemmGatedAct::ActType(" << static_cast<int32_t>(options.mActType) << "),"
+     << std::endl;
   ss << "mClampBeforeAct=" << options.mClampBeforeAct << "" << std::endl;
   return ss.str();
 }

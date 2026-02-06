@@ -897,6 +897,16 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKKernel_Unified(
                 input[row_idx * stride + chunk_start + i];
           }
         }
+        // Clear histogram for next iteration (in case it's k < length)
+        if constexpr (!SINGLE_CTA) {
+          constexpr uint32_t NUM_ROUNDS = sizeof(OrderedType) * 8 / 8;
+          uint32_t next_first_hist_idx = ((iter + 1) * NUM_ROUNDS) % 3;
+          if (cta_in_group == 0) {
+            for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
+              state->histogram[next_first_hist_idx][i] = 0;
+            }
+          }
+        }
         continue;
       }
     } else if constexpr (MODE == RadixTopKMode::PageTableTransform) {
@@ -906,6 +916,16 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKKernel_Unified(
         for (uint32_t i = tx; i < top_k_val; i += BLOCK_THREADS) {
           row_output[i] = (i < length) ? src_page_entry[i] : static_cast<IdType>(-1);
         }
+        // Clear histogram for next iteration
+        if constexpr (!SINGLE_CTA) {
+          constexpr uint32_t NUM_ROUNDS = sizeof(OrderedType) * 8 / 8;
+          uint32_t next_first_hist_idx = ((iter + 1) * NUM_ROUNDS) % 3;
+          if (cta_in_group == 0) {
+            for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
+              state->histogram[next_first_hist_idx][i] = 0;
+            }
+          }
+        }
         continue;
       }
     } else {  // RaggedTransform
@@ -913,6 +933,16 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKKernel_Unified(
       if (length <= top_k_val) {
         for (uint32_t i = tx; i < top_k_val; i += BLOCK_THREADS) {
           row_output[i] = (i < length) ? static_cast<IdType>(i) + offset : static_cast<IdType>(-1);
+        }
+        // Clear histogram for next iteration
+        if constexpr (!SINGLE_CTA) {
+          constexpr uint32_t NUM_ROUNDS = sizeof(OrderedType) * 8 / 8;
+          uint32_t next_first_hist_idx = ((iter + 1) * NUM_ROUNDS) % 3;
+          if (cta_in_group == 0) {
+            for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
+              state->histogram[next_first_hist_idx][i] = 0;
+            }
+          }
         }
         continue;
       }
@@ -1083,6 +1113,19 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKMaskLogitsKernel_Multi
       for (uint32_t i = aligned_size + tx; i < actual_chunk_size; i += BLOCK_THREADS) {
         masked_logits[row_idx * vocab_size + chunk_start + i] =
             logits[row_idx * vocab_size + chunk_start + i];
+      }
+
+      // Clear histogram for next iteration (in case it's k < vocab_size)
+      // Only needed for multi-CTA mode; single-CTA uses shared memory cleared each iteration
+      if constexpr (!SINGLE_CTA) {
+        constexpr uint32_t NUM_ROUNDS = sizeof(OrderedType) * 8 / 8;  // ORDERED_BITS / RADIX_BITS
+        uint32_t next_first_hist_idx = ((iter + 1) * NUM_ROUNDS) % 3;
+        if (cta_in_group == 0) {
+          for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
+            state->histogram[next_first_hist_idx][i] = 0;
+          }
+        }
+        // No sync needed - next iteration's barrier will ensure visibility
       }
       continue;
     }
@@ -1359,6 +1402,20 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKRenormProbKernel_Multi
       for (uint32_t i = aligned_size + tx; i < actual_chunk_size; i += BLOCK_THREADS) {
         renormed_prob[row_idx * vocab_size + chunk_start + i] =
             DType(float(probs[row_idx * vocab_size + chunk_start + i]) * normalizer);
+      }
+
+      // Clear histogram for next iteration (in case it's k < vocab_size)
+      // Only needed for multi-CTA mode; single-CTA uses shared memory cleared each iteration
+      // Next iteration (iter+1) will use histogram[((iter+1)*NUM_ROUNDS) % 3] for its first round
+      if constexpr (!SINGLE_CTA) {
+        constexpr uint32_t NUM_ROUNDS = sizeof(OrderedType) * 8 / 8;  // ORDERED_BITS / RADIX_BITS
+        uint32_t next_first_hist_idx = ((iter + 1) * NUM_ROUNDS) % 3;
+        if (cta_in_group == 0) {
+          for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
+            state->histogram[next_first_hist_idx][i] = 0;
+          }
+        }
+        // No sync needed - next iteration's barrier will ensure visibility
       }
       continue;
     }
@@ -1989,14 +2046,20 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
 
   vec_t<DType, VEC_SIZE> score_vec;
 
+  const int aligned_length = (length / VEC_SIZE) * VEC_SIZE;
 #pragma unroll 2
-  for (int base = tx * VEC_SIZE; base < length; base += BLOCK_SIZE * VEC_SIZE) {
+  for (int base = tx * VEC_SIZE; base < aligned_length; base += BLOCK_SIZE * VEC_SIZE) {
     score_vec.cast_load(&score[base]);
 #pragma unroll
     for (int j = 0; j < VEC_SIZE; ++j) {
       const auto bin = Traits::ToCoarseKey(score_vec[j]);
       atomicAdd(&s_histogram[bin], 1);
     }
+  }
+  // Handle tail
+  for (int i = aligned_length + tx; i < length; i += BLOCK_SIZE) {
+    const auto bin = Traits::ToCoarseKey(score[i]);
+    atomicAdd(&s_histogram[bin], 1);
   }
   __syncthreads();
 
@@ -2034,7 +2097,7 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
   if (topk == 0) {
     // Collect indices where bin > threshold
 #pragma unroll 2
-    for (int base = tx * VEC_SIZE; base < length; base += BLOCK_SIZE * VEC_SIZE) {
+    for (int base = tx * VEC_SIZE; base < aligned_length; base += BLOCK_SIZE * VEC_SIZE) {
       score_vec.cast_load(&score[base]);
 #pragma unroll
       for (int j = 0; j < VEC_SIZE; ++j) {
@@ -2045,6 +2108,14 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
         }
       }
     }
+    // Handle tail
+    for (int i = aligned_length + tx; i < length; i += BLOCK_SIZE) {
+      const auto bin = static_cast<int>(Traits::ToCoarseKey(score[i]));
+      if (bin > threshold_bin) {
+        const auto pos = atomicAdd(&s_counter, 1);
+        s_indices[pos] = i;
+      }
+    }
     __syncthreads();
   } else {
     __syncthreads();
@@ -2052,26 +2123,32 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
     __syncthreads();
 
     // Filter + histogram for refinement
+    auto filter_and_add_to_histogram = [&](auto raw_input, int index) {
+      const auto bin = static_cast<int>(Traits::ToCoarseKey(raw_input));
+      if (bin > threshold_bin) {
+        const auto pos = atomicAdd(&s_counter, 1);
+        s_indices[pos] = index;
+      } else if (bin == threshold_bin) {
+        const auto pos = atomicAdd(&s_num_input[0], 1);
+        if (__builtin_expect(pos < SMEM_INPUT_SIZE, 1)) {
+          s_input_idx[0][pos] = index;
+          const auto ordered = Traits::ToOrdered(raw_input);
+          const auto sub_bin = (ordered >> FIRST_SHIFT) & 0xFF;
+          atomicAdd(&s_histogram[sub_bin], 1);
+        }
+      }
+    };
 #pragma unroll 2
-    for (int base = tx * VEC_SIZE; base < length; base += BLOCK_SIZE * VEC_SIZE) {
+    for (int base = tx * VEC_SIZE; base < aligned_length; base += BLOCK_SIZE * VEC_SIZE) {
       score_vec.cast_load(&score[base]);
 #pragma unroll
       for (int j = 0; j < VEC_SIZE; ++j) {
-        const auto raw_input = score_vec[j];
-        const auto bin = static_cast<int>(Traits::ToCoarseKey(raw_input));
-        if (bin > threshold_bin) {
-          const auto pos = atomicAdd(&s_counter, 1);
-          s_indices[pos] = base + j;
-        } else if (bin == threshold_bin) {
-          const auto pos = atomicAdd(&s_num_input[0], 1);
-          if (__builtin_expect(pos < SMEM_INPUT_SIZE, 1)) {
-            s_input_idx[0][pos] = base + j;
-            const auto ordered = Traits::ToOrdered(raw_input);
-            const auto sub_bin = (ordered >> FIRST_SHIFT) & 0xFF;
-            atomicAdd(&s_histogram[sub_bin], 1);
-          }
-        }
+        filter_and_add_to_histogram(score_vec[j], base + j);
       }
+    }
+    // Handle tail
+    for (int i = aligned_length + tx; i < length; i += BLOCK_SIZE) {
+      filter_and_add_to_histogram(score[i], i);
     }
     __syncthreads();
 
