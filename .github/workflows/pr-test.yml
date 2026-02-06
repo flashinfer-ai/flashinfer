@@ -204,8 +204,7 @@ jobs:
               -f name="AOT Build Tests" \
               -f head_sha="$SHA" \
               -f status="in_progress" \
-              -F output[title]="Running AOT build tests on spot instances..." \
-              -F output[summary]="Tests running on spot instances. [View workflow run]($RUN_URL)" \
+              -F output[summary]="Running AOT build tests: [workflow run]($RUN_URL)" \
               --jq '.id')
             echo "aot_check_id=$AOT_CHECK" >> $GITHUB_OUTPUT
           fi
@@ -215,8 +214,7 @@ jobs:
               -f name="JIT Unittest (A10G)" \
               -f head_sha="$SHA" \
               -f status="in_progress" \
-              -F output[title]="Running JIT tests on A10G spot instances..." \
-              -F output[summary]="Tests running on spot instances. [View workflow run]($RUN_URL)" \
+              -F output[summary]="Running JIT unittests on A10G instances: [workflow run]($RUN_URL)" \
               --jq '.id')
             echo "gpu_a10g_check_id=$A10G_CHECK" >> $GITHUB_OUTPUT
 
@@ -224,8 +222,7 @@ jobs:
               -f name="JIT Unittest (T4)" \
               -f head_sha="$SHA" \
               -f status="in_progress" \
-              -F output[title]="Running JIT tests on T4 spot instances..." \
-              -F output[summary]="Tests running on spot instances. [View workflow run]($RUN_URL)" \
+              -F output[summary]="Running JIT unittests on T4 instances: [workflow run]($RUN_URL)" \
               --jq '.id')
             echo "gpu_t4_check_id=$T4_CHECK" >> $GITHUB_OUTPUT
           fi
@@ -234,8 +231,7 @@ jobs:
             -f name="Test Results Summary" \
             -f head_sha="$SHA" \
             -f status="in_progress" \
-            -F output[title]="Waiting for test results..." \
-            -F output[summary]="Tests running. [View workflow run]($RUN_URL)" \
+            -F output[summary]="Waiting for test results: [workflow run]($RUN_URL)" \
             --jq '.id')
           echo "summary_check_id=$SUMMARY_CHECK" >> $GITHUB_OUTPUT
 
