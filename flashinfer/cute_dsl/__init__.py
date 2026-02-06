@@ -16,15 +16,25 @@ FlashInfer CuTe-DSL Kernels
 ===========================
 
 This module provides high-performance GPU kernels implemented using NVIDIA CuTe-DSL.
+
+.. deprecated::
+    Importing GEMM kernels (``grouped_gemm_nt_masked``,
+    ``Sm100BlockScaledPersistentDenseGemmKernel``, ``create_scale_factor_tensor``)
+    from ``flashinfer.cute_dsl`` is deprecated.
+    Use ``flashinfer.gemm`` instead. The old import paths will be
+    removed in a future release.
 """
 
 from .utils import is_cute_dsl_available, make_ptr, get_cutlass_dtype, get_num_sm
 
 # Conditionally import CuTe-DSL kernels
 if is_cute_dsl_available():
+    # Deprecated GEMM symbols: re-exported for backwards compatibility.
+    # Use flashinfer.gemm instead.
     from .blockscaled_gemm import (
         grouped_gemm_nt_masked,
         Sm100BlockScaledPersistentDenseGemmKernel,
+        create_scale_factor_tensor,
     )
     from .rmsnorm_fp4quant import (
         rmsnorm_fp4quant,
@@ -46,9 +56,10 @@ __all__ = [
 
 if is_cute_dsl_available():
     __all__ += [
-        # Blockscaled GEMM
+        # Blockscaled GEMM (deprecated, use flashinfer.gemm instead)
         "grouped_gemm_nt_masked",
         "Sm100BlockScaledPersistentDenseGemmKernel",
+        "create_scale_factor_tensor",
         # RMSNorm + FP4 Quantization
         "rmsnorm_fp4quant",
         "RMSNormFP4QuantKernel",
