@@ -646,24 +646,6 @@ def parse_mamba_args(line, parser):
             f"nheads ({args.nheads}) must be divisible by ngroups ({args.ngroups})."
         )
 
-    # Validate dim is supported by the CUDA kernel dispatch
-    supported_dims = [64, 128, 256]
-    if "flashinfer" in args.backends and args.dim not in supported_dims:
-        raise ValueError(
-            f"dim ({args.dim}) is not supported by the FlashInfer kernel. "
-            f"Supported dim values: {supported_dims}. "
-            f"Use --backends triton for unsupported dim values."
-        )
-
-    # Validate dstate is supported by the CUDA kernel dispatch
-    supported_dstates = [64, 128, 256]
-    if "flashinfer" in args.backends and args.dstate not in supported_dstates:
-        raise ValueError(
-            f"dstate ({args.dstate}) is not supported by the FlashInfer kernel. "
-            f"Supported dstate values: {supported_dstates}. "
-            f"Use --backends triton for unsupported dstate values."
-        )
-
     # Validate nheads/ngroups ratio is supported by the CUDA kernel
     supported_ratios = [1, 8, 16]
     ratio = args.nheads // args.ngroups
