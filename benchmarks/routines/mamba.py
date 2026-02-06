@@ -96,7 +96,7 @@ else:
     }
 )
 @triton.jit(do_not_specialize=["T"])
-def _selective_scan_update_kernel(
+def _selective_scan_update_kernel_reference(
     # Pointers to matrices
     state_ptr,
     x_ptr,
@@ -323,7 +323,7 @@ def _selective_scan_update_kernel(
         tl.store(state_ptrs, state.to(state_ptrs.dtype.element_ty), mask=mask)
 
 
-def selective_state_update_triton(
+def selective_state_update_triton_reference(
     state,
     x,
     dt,
@@ -452,7 +452,7 @@ def selective_state_update_triton(
     )
 
     with torch.cuda.device(x.device.index):
-        _selective_scan_update_kernel[grid](
+        _selective_scan_update_kernel_reference[grid](
             state,
             x,
             dt,
@@ -820,7 +820,7 @@ def testSelectiveStateUpdate(args):
                 cache_steps=cache_steps,
             )
         elif backend == "triton":
-            return selective_state_update_triton(
+            return selective_state_update_triton_reference(
                 state,
                 x,
                 dt,
@@ -846,7 +846,7 @@ def testSelectiveStateUpdate(args):
     if run_refcheck:
         ref_state = clean_state_snapshot.clone()
         reference_output = (
-            selective_state_update_triton(
+            selective_state_update_triton_reference(
                 ref_state,
                 x,
                 dt,
