@@ -989,7 +989,7 @@ def get_trtllm_moe_sm100_module():
             use_deepseek_fp8: bool,
             hidden_size: int,
             intermediate_size: int,
-            activation_type: int = ActivationType.Swiglu,
+            activation_type: int = ActivationType.Swiglu.value,
             use_shuffled_weight: bool = False,
             weight_layout: int = WeightLayout.MajorK,
             use_packed_weights: bool = False,
@@ -1422,7 +1422,7 @@ def get_trtllm_moe_sm100_module():
         routing_method_type: int = 0,
         enable_pdl: Optional[bool] = None,
         tune_max_num_tokens: int = 8192,
-        activation_type: ActivationType = ActivationType.Swiglu,
+        activation_type: int = ActivationType.Swiglu.value,
     ) -> torch.Tensor:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(hidden_states.device)
@@ -1482,7 +1482,7 @@ def get_trtllm_moe_sm100_module():
             use_routing_scales_on_input=use_routing_scales_on_input,
             routing_method_type=routing_method_type,
             enable_pdl=enable_pdl,
-            activation_type=activation_type.value,
+            activation_type=activation_type,
         )
         # Call the C++ function
         result = moe_op.trtllm_fp8_per_tensor_scale_moe(
@@ -1507,7 +1507,7 @@ def get_trtllm_moe_sm100_module():
             routing_method_type,
             enable_pdl,
             [-1, -1] if tactic == -1 else tactic,
-            activation_type.value,
+            activation_type,
         )
 
         return result
@@ -2276,7 +2276,7 @@ def trtllm_fp8_per_tensor_scale_moe(
         routing_method_type,
         enable_pdl,
         tune_max_num_tokens,
-        ActivationType(activation_type),
+        activation_type,
     )
 
 
