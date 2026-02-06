@@ -197,7 +197,7 @@ jobs:
         run: |
           SHA="${{ needs.setup.outputs.head_sha }}"
           REPO="${{ github.repository }}"
-          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          RUNNER_URL="https://github.com/flashinfer-ai/ci-infra/actions/workflows/pr-test-runner.yml"
 
           if [ "${{ github.event.inputs.skip_aot }}" != "true" ]; then
             AOT_CHECK=$(gh api repos/$REPO/check-runs \
@@ -205,7 +205,7 @@ jobs:
               -f head_sha="$SHA" \
               -f status="in_progress" \
               -F output[title]="In progress" \
-              -F output[summary]="Running AOT build tests: [workflow run]($RUN_URL)" \
+              -F output[summary]="Running AOT build tests: [view test runs]($RUNNER_URL)" \
               --jq '.id')
             echo "aot_check_id=$AOT_CHECK" >> $GITHUB_OUTPUT
           fi
@@ -216,7 +216,7 @@ jobs:
               -f head_sha="$SHA" \
               -f status="in_progress" \
               -F output[title]="In progress" \
-              -F output[summary]="Running JIT unittests on A10G instances: [workflow run]($RUN_URL)" \
+              -F output[summary]="Running JIT unittests on A10G instances: [view test runs]($RUNNER_URL)" \
               --jq '.id')
             echo "gpu_a10g_check_id=$A10G_CHECK" >> $GITHUB_OUTPUT
 
@@ -225,7 +225,7 @@ jobs:
               -f head_sha="$SHA" \
               -f status="in_progress" \
               -F output[title]="In progress" \
-              -F output[summary]="Running JIT unittests on T4 instances: [workflow run]($RUN_URL)" \
+              -F output[summary]="Running JIT unittests on T4 instances: [view test runs]($RUNNER_URL)" \
               --jq '.id')
             echo "gpu_t4_check_id=$T4_CHECK" >> $GITHUB_OUTPUT
           fi
@@ -235,7 +235,7 @@ jobs:
             -f head_sha="$SHA" \
             -f status="in_progress" \
             -F output[title]="In progress" \
-            -F output[summary]="Waiting for test results: [workflow run]($RUN_URL)" \
+            -F output[summary]="Waiting for test results: [view test runs]($RUNNER_URL)" \
             --jq '.id')
           echo "summary_check_id=$SUMMARY_CHECK" >> $GITHUB_OUTPUT
 
