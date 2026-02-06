@@ -888,7 +888,7 @@ class FP8BlockScaleMoe(Moe):
         self,
         hidden_states: torch.Tensor,
         hidden_states_scale_global: torch.Tensor = None,
-        is_swizzling: bool = True,
+        is_swizzling: bool = False,
     ):
         """For FP8 block scaling, no pre-quantization - everything happens at runtime."""
 
