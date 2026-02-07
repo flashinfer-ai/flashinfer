@@ -231,45 +231,43 @@ static inline void set_params(bert::Fused_multihead_attention_params_v1& params,
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-static inline void set_params(bert::Fused_multihead_attention_params_v2& params,
-                              const Launch_params launch_params,
-                              // types
-                              Data_type data_type, Data_type acc_type, Data_type output_dtype,
-                              // attention input layout
-                              Attention_input_layout input_layout,
-                              // sizes
-                              const size_t b, const size_t s_q, const size_t s_kv, const size_t h,
-                              const size_t h_kv, const size_t d, const size_t dv,
-                              const size_t total, const size_t num_grouped_heads,
-                              const size_t sliding_window_size, const size_t chunked_attention_size,
-                              // paged kv cache block size.
-                              const size_t tokens_per_block,
-                              // device pointers
-                              void* qkv_packed_d,
-                              // contiguous q.
-                              void* q_d,
-                              // separate k.
-                              void* k_d,
-                              // separate v.
-                              void* v_d,
-                              // contiguous kv.
-                              void* kv_d,
-                              // start address of the paged kv pool.
-                              void* paged_kv_pool_ptr,
-                              // offsets for different blocks in terms of the start address.
-                              int32_t* paged_block_offsets,
-                              // mask input.
-                              void* packed_mask_d, void* cu_mask_rows_d,
-                              // attention sinks.
-                              void* attention_sinks_d, void* cu_kv_seqlens_d, void* cu_q_seqlens_d,
-                              void* o_packed_d, void* p_d, void* s_d, void* softmax_stats_d,
-                              void* scale_bmm2_d,
-                              // scale factors
-                              float const scale_bmm1, float const scale_softmax,
-                              float const scale_bmm2, float const softcapping_scale_bmm1,
-                              // flags
-                              bool const use_int8_scale_max, bool const interleaved,
-                              bool const is_s_padded, bool const has_alibi) {
+static inline void set_params(
+    bert::Fused_multihead_attention_params_v2& params, const Launch_params launch_params,
+    // types
+    Data_type data_type, Data_type acc_type, Data_type output_dtype,
+    // attention input layout
+    Attention_input_layout input_layout,
+    // sizes
+    const size_t b, const size_t s_q, const size_t s_kv, const size_t h, const size_t h_kv,
+    const size_t d, const size_t dv, const size_t total, const size_t num_grouped_heads,
+    const size_t sliding_window_size, const size_t chunked_attention_size,
+    // paged kv cache block size.
+    const size_t tokens_per_block,
+    // device pointers
+    void* qkv_packed_d,
+    // contiguous q.
+    void* q_d,
+    // separate k.
+    void* k_d,
+    // separate v.
+    void* v_d,
+    // contiguous kv.
+    void* kv_d,
+    // start address of the paged kv pool.
+    void* paged_kv_pool_ptr,
+    // offsets for different blocks in terms of the start address.
+    int32_t* paged_block_offsets,
+    // mask input.
+    void* packed_mask_d, void* cu_mask_rows_d,
+    // attention sinks.
+    void* attention_sinks_d, void* cu_kv_seqlens_d, void* cu_q_seqlens_d, void* o_packed_d,
+    void* p_d, void* s_d, void* softmax_stats_d, void* scale_bmm2_d,
+    // scale factors
+    float const scale_bmm1, float const scale_softmax, float const scale_bmm2,
+    float const softcapping_scale_bmm1,
+    // flags
+    bool const use_int8_scale_max, bool const interleaved, bool const is_s_padded,
+    bool const has_alibi, float const skip_softmax_threshold_scale_factor) {
   memset(&params, 0, sizeof(params));
 
   params.o_ptr = o_packed_d;
@@ -408,6 +406,9 @@ static inline void set_params(bert::Fused_multihead_attention_params_v2& params,
     params.enable_i2f_trick = -double(1 << 22) * double(scale_bmm2) <= -128.f &&
                               double(1 << 22) * double(scale_bmm2) >= 127.f;
   }
+
+  // Skip-softmax attention
+  params.skip_softmax_threshold_scale_factor = skip_softmax_threshold_scale_factor;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -418,6 +419,7 @@ static inline void determine_launch_params(
     bool const interleaved, bool const ignore_b1opt, bool const force_unroll, bool const use_tma,
     bool const force_non_flash_attention, bool const force_non_warp_specialization,
     bool const force_non_granular_tiling, bool const force_fp32_acc,
+    float const skip_softmax_threshold_scale_factor,
     // device props
     const cudaDeviceProp props) {
   // Set launch params to choose kernels
@@ -455,6 +457,9 @@ static inline void determine_launch_params(
         "are not supported on Ada currently.\n");
     launch_params.use_granular_tiling = false;
   }
+
+  // Enable skip softmax attention or not.
+  launch_params.enable_skip_softmax = skip_softmax_threshold_scale_factor > 0.f;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -572,6 +577,9 @@ int main(int argc, char** argv) {
 
   // Use attention sinks (added to the denominator of softmax)
   bool use_attention_sinks = false;
+
+  // Skip-softmax attention
+  float skip_softmax_threshold_scale_factor = 0;
 
   // Read the parameters from the command-line.
   for (int ii = 1; ii < argc; ++ii) {
@@ -737,6 +745,8 @@ int main(int argc, char** argv) {
       sage_block_size_v = strtol(argv[ii], nullptr, 10);
     } else if (!strcmp(argv[ii], "-use-attention-sinks")) {
       use_attention_sinks = true;
+    } else if (!strcmp(argv[ii], "-skip-softmax-threshold-scale-factor") && ++ii < argc) {
+      skip_softmax_threshold_scale_factor = strtof(argv[ii], nullptr);
     } else {
       fprintf(stderr, "Unrecognized option: %s. Aborting!\n", argv[ii]);
       return -1;
@@ -886,10 +896,10 @@ int main(int argc, char** argv) {
 
   // determine the launch params to select kernels
   Launch_params launch_params;
-  determine_launch_params(launch_params, data_type, sm, s, d, attention_mask_type, input_layout,
-                          interleaved, ignore_b1opt, force_unroll, use_tma,
-                          force_non_flash_attention, force_non_warp_specialization,
-                          force_non_granular_tiling, force_fp32_acc, props);
+  determine_launch_params(
+      launch_params, data_type, sm, s, d, attention_mask_type, input_layout, interleaved,
+      ignore_b1opt, force_unroll, use_tma, force_non_flash_attention, force_non_warp_specialization,
+      force_non_granular_tiling, force_fp32_acc, skip_softmax_threshold_scale_factor, props);
 
   // The Q, K and V matrices are packed into one big matrix of size S x B x H x 3 x D.
   const size_t qkv_size = s * b * h * (2 * d + dv);
@@ -1554,7 +1564,13 @@ int main(int argc, char** argv) {
              kv_cache_block_offsets_d, packed_mask_d, cu_mask_rows_d, attention_sinks_d,
              cu_seqlens_d, cu_q_seqlens_d, o_d_view, p_d, s_d, softmax_stats_ptr, scale_bmm2_d,
              scale_bmm1, scale_softmax, scale_bmm2, softcapping_scale_bmm1, use_int8_scale_max,
-             interleaved, is_s_padded, has_alibi);
+             interleaved, is_s_padded, has_alibi, skip_softmax_threshold_scale_factor);
+#ifdef SKIP_SOFTMAX_STAT
+  FMHA_CHECK_CUDA(cudaMalloc(&params_v2.skip_softmax_total_blocks, sizeof(uint32_t)));
+  FMHA_CHECK_CUDA(cudaMalloc(&params_v2.skip_softmax_skipped_blocks, sizeof(uint32_t)));
+  FMHA_CHECK_CUDA(cudaMemset(params_v2.skip_softmax_total_blocks, 0, sizeof(uint32_t)));
+  FMHA_CHECK_CUDA(cudaMemset(params_v2.skip_softmax_skipped_blocks, 0, sizeof(uint32_t)));
+#endif
 
   // total number of tokens is needed to set TMA desc on the host.
   launch_params.total_q_seqlen = q_seqlens[b];
@@ -1917,6 +1933,17 @@ int main(int argc, char** argv) {
            total_flops / (fused_elapsed / float(runs) / 1e-9),
            total_bytes / (fused_elapsed / float(runs) / 1e-6));
   }
+#ifdef SKIP_SOFTMAX_STAT
+  if (skip_softmax_threshold_scale_factor > 0) {
+    uint32_t total_blocks, skipped_blocks;
+    FMHA_CHECK_CUDA(cudaMemcpy(&total_blocks, params_v2.skip_softmax_total_blocks, sizeof(uint32_t),
+                               cudaMemcpyDeviceToHost));
+    FMHA_CHECK_CUDA(cudaMemcpy(&skipped_blocks, params_v2.skip_softmax_skipped_blocks,
+                               sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    printf("Skip-Softmax .: %u / %u = %.2f%%\n", skipped_blocks, total_blocks,
+           total_blocks ? 100.f * skipped_blocks / total_blocks : 0.f);
+  }
+#endif
 #if defined(DEBUG_HAS_PRINT_BUFFER)
   FMHA_CHECK_CUDA(
       cuda_memcpy_d2h(print_buffer.data(), params.print_ptr, print_buffer.size(), DATA_TYPE_FP32));
@@ -1957,6 +1984,11 @@ int main(int argc, char** argv) {
   FMHA_CHECK_CUDA(cudaFree(kv_cache_block_offsets_d));
   FMHA_CHECK_CUDA(cudaFree(contiguous_kv_d));
   FMHA_CHECK_CUDA(cudaFree(softmax_stats_d));
+  FMHA_CHECK_CUDA(cudaFree(attention_sinks_d));
+#ifdef SKIP_SOFTMAX_STAT
+  FMHA_CHECK_CUDA(cudaFree(params_v2.skip_softmax_total_blocks));
+  FMHA_CHECK_CUDA(cudaFree(params_v2.skip_softmax_skipped_blocks));
+#endif
 
   free(qkv_h);
   free(mask_h);
