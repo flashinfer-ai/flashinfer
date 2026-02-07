@@ -298,7 +298,8 @@ cudaError_t SinglePrefillWithKVCacheKernelTraitsDispatched(Params& params, cudaS
   using CollectiveMainloop =
       CollectiveMainloop<typename Params::AdditionalParams, KernelTraits, CAUSAL>;
   using CollectiveEpilogue = CollectiveEpilogue<KernelTraits>;
-  using Scheduler = SingleTileScheduler;
+  // Use LPT scheduling for causal attention for better load balancing
+  using Scheduler = SingleTileScheduler</*LPT=*/CAUSAL>;
   typename CollectiveMainloop::Params mainloop_params = CollectiveMainloop::to_underlying_arguments(
       {params.q_ptr,
        get_gmem_layout(params.qo_len, params.num_qo_heads, KernelTraits::HEAD_DIM_QK,
