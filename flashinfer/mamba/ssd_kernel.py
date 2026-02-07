@@ -269,11 +269,13 @@ class SSDKernel:
         # Only 1 stage needed (no pipelining) since initial states are loaded
         # once per tile before the chunk loop, fully consumed, then the next
         # tile resets and reuses the same buffer.
+        # Shape is (N, D) COL_MAJOR to match zero-copy gmem layout (N, D, EH, B).
+        # Physical layout: (N, D) COL_MAJOR has N contiguous, same as pt_smem_layout.
         self.p_smem_layout_load = (
             sm100_utils.make_smem_layout_epi(
                 self.io_dtype,
-                utils.LayoutEnum.ROW_MAJOR,
-                self.tile_shape_mnk_inter2[1:],
+                utils.LayoutEnum.COL_MAJOR,
+                (self.tile_shape_mnk_inter2[2], self.tile_shape_mnk_inter2[1]),  # (N, D) instead of (D, N)
                 self.initial_state_load_stages,
             )
             if self.has_init_states
@@ -491,7 +493,7 @@ class SSDKernel:
             tma_atom_initial_states, tma_tensor_initial_states = (
                 cpasync.make_tiled_tma_atom(
                     cpasync.CopyBulkTensorTileG2SOp(),
-                    init_states,  # (D, N, EH, B)
+                    init_states,  # (N, D, EH, B)
                     p_smem_layout_istate,
                     init_states_cta_v_layout,
                 )
@@ -928,7 +930,7 @@ class SSDKernel:
                         tma_atom_initial_states,
                         tma_tensor_initial_states,
                         smem_p_load,  # Must match TMA atom's smem layout (p_smem_layout_load)
-                        (self.tile_shape_mnk_inter2[1:]),  # (D, N) shape
+                        (self.tile_shape_mnk_inter2[2], self.tile_shape_mnk_inter2[1]),  # (N, D) shape to match gmem
                     )
                 )
 
