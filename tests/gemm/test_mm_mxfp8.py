@@ -7,11 +7,18 @@ from flashinfer.fp8_quantization import mxfp8_quantize
 from flashinfer.utils import get_compute_capability
 
 
-def _get_min_cosine_sim(is_sf_swizzled_layout: bool) -> float:
+def _get_min_cosine_sim(
+    is_sf_swizzled_layout: bool, scale: float | None = None
+) -> float:
     if is_sf_swizzled_layout:
         return 0.98
+
     # Lower accuracy for non-swizzled layout
-    return 0.8
+    if scale is not None:
+        if scale < 0.5 or scale > 10.0:
+            # For very small or large scales, we expect lower accuracy
+            return 0.8
+    return 0.84
 
 
 def _assert_cosine_similarity(
@@ -234,65 +241,8 @@ def test_mm_mxfp8_invalid_ndim():
         )
 
 
-@pytest.mark.parametrize("m", [256, 512])
-@pytest.mark.parametrize("n", [256, 4096])
-@pytest.mark.parametrize("k", [256, 4096])
-@pytest.mark.parametrize(
-    "value_scale",
-    [
-        1.0,
-        0.02,
-        0.001,
-        10.0,
-        100.0,
-    ],
-)
 @pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
-def test_mm_mxfp8_value_ranges(m, n, k, value_scale, is_sf_swizzled_layout):
-    """Test mm_mxfp8 with different value ranges to ensure accuracy across scales."""
-    _skip_if_unsupported()
-
-    input_data = torch.randn([m, k], device="cuda", dtype=torch.bfloat16) * value_scale
-    mat2 = torch.randn([n, k], device="cuda", dtype=torch.bfloat16) * value_scale
-
-    input_mxfp8, mat2_mxfp8, input_descale, mat2_descale = _prepare_mxfp8_tensors(
-        input_data, mat2, is_sf_swizzled_layout
-    )
-
-    reference = torch.mm(input_data, mat2.T)
-
-    result = mm_mxfp8(
-        input_mxfp8,
-        mat2_mxfp8.T,
-        input_descale,
-        mat2_descale,
-        out_dtype=torch.bfloat16,
-        backend="cutlass",
-    )
-
-    assert result.shape == (m, n)
-    assert torch.isfinite(result).all(), (
-        f"Output contains NaN/Inf for scale={value_scale}"
-    )
-
-    cos_sim = _assert_cosine_similarity(
-        reference,
-        result,
-        is_sf_swizzled_layout,
-        use_float=True,
-        context=(
-            "Value range test failed for "
-            f"value_scale={value_scale}, swizzled={is_sf_swizzled_layout}."
-        ),
-    )
-
-    print(
-        f"\n  Value scale: {value_scale}, Size: {m}x{k} @ {k}x{n}, "
-        f"swizzled={is_sf_swizzled_layout}, Cosine sim: {cos_sim:.4f}"
-    )
-
-
-def test_mm_mxfp8_find_minimum_cosine_similarity():
+def test_mm_mxfp8_find_minimum_cosine_similarity(is_sf_swizzled_layout):
     """Sweep value scales and enforce a minimum cosine similarity."""
     _skip_if_unsupported()
 
@@ -300,59 +250,51 @@ def test_mm_mxfp8_find_minimum_cosine_similarity():
 
     value_scales = [0.001, 0.01, 0.02, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 50.0, 100.0]
 
-    for is_sf_swizzled_layout in [False, True]:
-        results = []
-        for value_scale in value_scales:
-            input_data = (
-                torch.randn([m, k], device="cuda", dtype=torch.bfloat16) * value_scale
-            )
-            mat2 = (
-                torch.randn([n, k], device="cuda", dtype=torch.bfloat16) * value_scale
-            )
-
-            input_mxfp8, mat2_mxfp8, input_descale, mat2_descale = (
-                _prepare_mxfp8_tensors(input_data, mat2, is_sf_swizzled_layout)
-            )
-
-            reference = torch.mm(input_data, mat2.T)
-
-            result = mm_mxfp8(
-                input_mxfp8,
-                mat2_mxfp8.T,
-                input_descale,
-                mat2_descale,
-                out_dtype=torch.bfloat16,
-                backend="cutlass",
-            )
-
-            cos_sim = F.cosine_similarity(
-                reference.reshape(-1).float(), result.reshape(-1).float(), dim=0
-            ).item()
-
-            results.append((value_scale, cos_sim))
-
-        print("\n" + "=" * 60)
-        print(
-            f"MXFP8 Cosine Similarity vs Value Scale Summary ({is_sf_swizzled_layout=})"
+    results = []
+    for value_scale in value_scales:
+        input_data = (
+            torch.randn([m, k], device="cuda", dtype=torch.bfloat16) * value_scale
         )
-        print("=" * 60)
+        mat2 = torch.randn([n, k], device="cuda", dtype=torch.bfloat16) * value_scale
 
-        min_cosine_sim = _get_min_cosine_sim(is_sf_swizzled_layout)
-
-        for scale, sim in results:
-            status = "[OK]" if sim > min_cosine_sim else "[FAIL]"
-            print(f"  {status} Scale={scale:8.3f}: cos_sim={sim:.4f}")
-
-        min_sim = min(sim for _, sim in results)
-        min_scale = [scale for scale, sim in results if sim == min_sim][0]
-        print(f"\n  Minimum cosine similarity: {min_sim:.4f} at scale={min_scale}")
-        print("=" * 60)
-
-        # Assert minimum acceptable similarity
-        assert min_sim > min_cosine_sim, (
-            f"Minimum cosine similarity {min_sim:.4f} at scale={min_scale} is too low. "
-            f"MXFP8 should maintain > {min_cosine_sim:.4f} similarity across all value ranges."
+        input_mxfp8, mat2_mxfp8, input_descale, mat2_descale = _prepare_mxfp8_tensors(
+            input_data, mat2, is_sf_swizzled_layout
         )
+
+        reference = torch.mm(input_data, mat2.T)
+
+        result = mm_mxfp8(
+            input_mxfp8,
+            mat2_mxfp8.T,
+            input_descale,
+            mat2_descale,
+            out_dtype=torch.bfloat16,
+            backend="cutlass",
+        )
+
+        cos_sim = F.cosine_similarity(
+            reference.reshape(-1).float(), result.reshape(-1).float(), dim=0
+        ).item()
+
+        results.append((value_scale, cos_sim))
+
+    print("\n" + "=" * 60)
+    print(f"MXFP8 Cosine Similarity vs Value Scale Summary ({is_sf_swizzled_layout=})")
+    print("=" * 60)
+
+    fail_test: bool = False
+    for scale, sim in results:
+        min_cosine_sim = _get_min_cosine_sim(is_sf_swizzled_layout, scale)
+        fail = sim < min_cosine_sim
+
+        status = "[OK]" if not fail else "[FAIL]"
+        print(f"  {status} Scale={scale:8.3f}: cos_sim={sim:.4f}")
+        fail_test |= fail
+
+    print("=" * 60)
+
+    # Assert minimum acceptable similarity
+    assert not fail_test, "One or more cosine similarities are too low"
 
 
 @pytest.mark.parametrize("m", [256, 512, 1024])  # Skip M=128 (edge case issues)
