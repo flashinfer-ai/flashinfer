@@ -273,7 +273,6 @@ def _moe_core_impl(
         out=moe_output,
         mma_tiler_mn=gemm2_mma_tiler_mn,
         cluster_shape_mn=gemm2_cluster_shape_mn,
-        zero_output=False,
     )
 
     return moe_output[:num_tokens]
