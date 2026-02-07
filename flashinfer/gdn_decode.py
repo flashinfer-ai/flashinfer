@@ -158,6 +158,7 @@ def gdn_decode_kernel_small_batch_pretranspose(
     use_initial_state: cutlass.Constexpr[bool],
     use_qk_l2norm: cutlass.Constexpr[bool],
     is_varlen: cutlass.Constexpr[bool],
+    use_pool_indexing: cutlass.Constexpr[bool] = False,
 ):
     """Each block uses pipeline to load one batch and vectorized writeback"""
 
@@ -218,189 +219,208 @@ def gdn_decode_kernel_small_batch_pretranspose(
 
     cute.arch.barrier()
 
-    # Get current batch
-    gSrc_batch = h0_source[(batch_idx, None, None)]  # (V, K)
-    gDst = cute.local_tile(h0_source, (1, TILE_V, TILE_K), (batch_idx, None, 0))
+    # Compute state index: use pool indexing if enabled (h0_indices maps batch to pool slot)
+    if cutlass.const_expr(use_pool_indexing):
+        pool_idx = h0_indices[i_n]
+        state_idx = pool_idx * HV + i_hv
+    else:
+        pool_idx = 0  # dummy, always valid when not using pool indexing
+        state_idx = batch_idx
 
-    # V 方向分 tiles
-    gSrc = cute.local_tile(
-        gSrc_batch, (TILE_V, TILE_K), (None, 0)
-    )  # (TILE_V, TILE_K, num_v_tiles)
+    # When pool indexing: skip computation for padding slots (negative indices)
+    # and write zeros to output. When not pool indexing: always valid (pool_idx=0).
+    if pool_idx >= 0:
+        # Get current batch
+        gSrc_batch = h0_source[(state_idx, None, None)]  # (V, K)
+        gDst = cute.local_tile(h0_source, (1, TILE_V, TILE_K), (state_idx, None, 0))
 
-    # Partition for load
-    thr_copy_load = tiled_copy_load.get_slice(tidx)
+        # V 方向分 tiles
+        gSrc = cute.local_tile(
+            gSrc_batch, (TILE_V, TILE_K), (None, 0)
+        )  # (TILE_V, TILE_K, num_v_tiles)
 
-    # ===================================================================
-    # Prefetch: All threads participate in cp.async load
-    # ===================================================================
-    start_v_tiles = batch_inner * num_v_tiles_per_block
-    prefetch_count = cutlass.min(NUM_STAGES - 1, num_v_tiles_per_block)
-    for v_tiles in range(start_v_tiles, start_v_tiles + prefetch_count):
-        stage = (v_tiles - start_v_tiles) % NUM_STAGES
+        # Partition for load
+        thr_copy_load = tiled_copy_load.get_slice(tidx)
 
-        gSrc_tile = gSrc[(None, None, v_tiles)]
-        sData_stage = sData[(None, None, stage)]
+        # ===================================================================
+        # Prefetch: All threads participate in cp.async load
+        # ===================================================================
+        start_v_tiles = batch_inner * num_v_tiles_per_block
+        prefetch_count = cutlass.min(NUM_STAGES - 1, num_v_tiles_per_block)
+        for v_tiles in range(start_v_tiles, start_v_tiles + prefetch_count):
+            stage = (v_tiles - start_v_tiles) % NUM_STAGES
 
-        thr_gSrc = thr_copy_load.partition_S(gSrc_tile)
-        thr_sData = thr_copy_load.partition_D(sData_stage)
+            gSrc_tile = gSrc[(None, None, v_tiles)]
+            sData_stage = sData[(None, None, stage)]
 
-        cute.copy(tiled_copy_load, thr_gSrc, thr_sData)
-        cute.arch.cp_async_commit_group()
-
-    # Load q, k into BF16 registers using autovec_copy (contiguous pattern)
-    q_tile = cute.local_tile(q, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane_id))
-    k_tile = cute.local_tile(k, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane_id))
-    cute.autovec_copy(q_tile, r_q_bf16)
-    cute.autovec_copy(k_tile, r_k_bf16)
-
-    # Convert BF16 to FP32
-    for i in cutlass.range_constexpr(vec_size):
-        r_q[i] = cutlass.Float32(r_q_bf16[i])
-        r_k[i] = cutlass.Float32(r_k_bf16[i])
-
-    # Load v into BF16 registers using autovec_copy, convert to FP32, store to sV
-    v_tile = cute.local_tile(v, (1, 1, 1, vec_size), (i_n, i_t, i_hv, lane_id))
-    cute.autovec_copy(v_tile, r_v_bf16)
-    for i in cutlass.range_constexpr(vec_size):
-        sV[k_start + i] = cutlass.Float32(r_v_bf16[i])
-
-    cute.arch.barrier()  # Ensure all threads finish writing to sV
-
-    # ===================================================================
-    # Compute g and beta (scalar values)
-    # ===================================================================
-    r_g = 0.0
-    r_beta = 0.0
-    if lane_id == 0:
-        x = r_a + r_dt_bias
-        beta_x = softplus_beta * x
-        softplus_x = 0.0
-
-        if beta_x <= softplus_threshold:
-            # softplus(x) = (1/beta) * log(1 + exp(beta*x))
-            # Compute in Float32
-            exp_beta_x = cute.exp(beta_x, fastmath=True)
-            log_input = cutlass.Float32(1.0 + exp_beta_x)
-            log_result = cutlass.Float32(cute.log(log_input, fastmath=True))
-            softplus_x = cutlass.Float32(
-                (cutlass.Float32(1.0) / softplus_beta) * log_result
-            )
-        else:
-            softplus_x = x
-
-        # Compute g = exp(A_log) * softplus_x
-        r_g_value = -cute.exp(r_A_log, fastmath=True) * softplus_x
-
-        # Compute beta = 1 / (1 + exp(-b))
-        r_beta = 1.0 / (1.0 + cute.exp(-r_b, fastmath=True))
-
-        # Store to scalar (Float32)
-        r_g = cute.exp(r_g_value, fastmath=True)
-
-    r_g = cute.arch.shuffle_sync(r_g, 0)
-    r_beta = cute.arch.shuffle_sync(r_beta, 0)
-
-    if use_qk_l2norm:
-        # Compute L2 norm of q and k
-        sum_q = 0.0
-        sum_k = 0.0
-        for i in cutlass.range_constexpr(vec_size):
-            sum_q += r_q[i] * r_q[i]
-            sum_k += r_k[i] * r_k[i]
-        # Warp-level reduction using butterfly shuffle
-        for offset in [16, 8, 4, 2, 1]:
-            sum_q += cute.arch.shuffle_sync_bfly(
-                sum_q, offset=offset, mask=-1, mask_and_clamp=31
-            )
-            sum_k += cute.arch.shuffle_sync_bfly(
-                sum_k, offset=offset, mask=-1, mask_and_clamp=31
-            )
-
-        inv_norm_q = cute.rsqrt(sum_q + 1e-6, fastmath=True)
-        inv_norm_k = cute.rsqrt(sum_k + 1e-6, fastmath=True)
-        for i in cutlass.range_constexpr(vec_size):
-            r_q[i] = r_q[i] * inv_norm_q
-            r_k[i] = r_k[i] * inv_norm_k
-
-    # Apply scaling in Float32
-    for i in cutlass.range_constexpr(vec_size):
-        r_q[i] = r_q[i] * scale
-
-    # ===================================================================
-    # Mainloop: All threads participate
-    # ===================================================================
-    end_v_tiles = start_v_tiles + num_v_tiles_per_block
-    for v_tiles in range(start_v_tiles, end_v_tiles):
-        stage = (v_tiles - start_v_tiles) % NUM_STAGES
-
-        # Step 1: Wait for current stage to complete
-        cute.arch.cp_async_wait_group(0)
-        cute.arch.barrier()
-
-        # Step 2: Issue async load for next tile (after compute)
-        next_v_tiles = v_tiles + prefetch_count
-        if next_v_tiles < end_v_tiles:
-            next_stage = (next_v_tiles - start_v_tiles) % NUM_STAGES
-
-            gSrc_next = gSrc[(None, None, next_v_tiles)]
-            sData_next = sData[(None, None, next_stage)]
-
-            thr_gSrc = thr_copy_load.partition_S(gSrc_next)
-            thr_sData = thr_copy_load.partition_D(sData_next)
+            thr_gSrc = thr_copy_load.partition_S(gSrc_tile)
+            thr_sData = thr_copy_load.partition_D(sData_stage)
 
             cute.copy(tiled_copy_load, thr_gSrc, thr_sData)
             cute.arch.cp_async_commit_group()
 
-        # Step 3: Compute using data from current stage (contiguous access pattern)
-        for row in cutlass.range_constexpr(0, TILE_V, 4):
-            row_offset = tidx // 32
-            sum_hk = 0.0
+        # Load q, k into BF16 registers using autovec_copy (contiguous pattern)
+        q_tile = cute.local_tile(q, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane_id))
+        k_tile = cute.local_tile(k, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane_id))
+        cute.autovec_copy(q_tile, r_q_bf16)
+        cute.autovec_copy(k_tile, r_k_bf16)
 
-            # Load h from sData using 3D local_tile + autovec_copy (contiguous in K)
-            sData_tile = cute.local_tile(
-                sData, (1, vec_size, 1), (row + row_offset, lane_id, stage)
-            )
-            cute.autovec_copy(sData_tile, r_h)
+        # Convert BF16 to FP32
+        for i in cutlass.range_constexpr(vec_size):
+            r_q[i] = cutlass.Float32(r_q_bf16[i])
+            r_k[i] = cutlass.Float32(r_k_bf16[i])
 
+        # Load v into BF16 registers using autovec_copy, convert to FP32, store to sV
+        v_tile = cute.local_tile(v, (1, 1, 1, vec_size), (i_n, i_t, i_hv, lane_id))
+        cute.autovec_copy(v_tile, r_v_bf16)
+        for i in cutlass.range_constexpr(vec_size):
+            sV[k_start + i] = cutlass.Float32(r_v_bf16[i])
+
+        cute.arch.barrier()  # Ensure all threads finish writing to sV
+
+        # ===================================================================
+        # Compute g and beta (scalar values)
+        # ===================================================================
+        r_g = 0.0
+        r_beta = 0.0
+        if lane_id == 0:
+            x = r_a + r_dt_bias
+            beta_x = softplus_beta * x
+            softplus_x = 0.0
+
+            if beta_x <= softplus_threshold:
+                # softplus(x) = (1/beta) * log(1 + exp(beta*x))
+                # Compute in Float32
+                exp_beta_x = cute.exp(beta_x, fastmath=True)
+                log_input = cutlass.Float32(1.0 + exp_beta_x)
+                log_result = cutlass.Float32(cute.log(log_input, fastmath=True))
+                softplus_x = cutlass.Float32(
+                    (cutlass.Float32(1.0) / softplus_beta) * log_result
+                )
+            else:
+                softplus_x = x
+
+            # Compute g = exp(A_log) * softplus_x
+            r_g_value = -cute.exp(r_A_log, fastmath=True) * softplus_x
+
+            # Compute beta = 1 / (1 + exp(-b))
+            r_beta = 1.0 / (1.0 + cute.exp(-r_b, fastmath=True))
+
+            # Store to scalar (Float32)
+            r_g = cute.exp(r_g_value, fastmath=True)
+
+        r_g = cute.arch.shuffle_sync(r_g, 0)
+        r_beta = cute.arch.shuffle_sync(r_beta, 0)
+
+        if use_qk_l2norm:
+            # Compute L2 norm of q and k
+            sum_q = 0.0
+            sum_k = 0.0
             for i in cutlass.range_constexpr(vec_size):
-                r_h[i] = r_h[i] * r_g
-                sum_hk += r_h[i] * r_k[i]
-
+                sum_q += r_q[i] * r_q[i]
+                sum_k += r_k[i] * r_k[i]
+            # Warp-level reduction using butterfly shuffle
             for offset in [16, 8, 4, 2, 1]:
-                sum_hk += cute.arch.shuffle_sync_bfly(
-                    sum_hk, offset=offset, mask=-1, mask_and_clamp=31
+                sum_q += cute.arch.shuffle_sync_bfly(
+                    sum_q, offset=offset, mask=-1, mask_and_clamp=31
+                )
+                sum_k += cute.arch.shuffle_sync_bfly(
+                    sum_k, offset=offset, mask=-1, mask_and_clamp=31
                 )
 
-            v_new = sV[v_tiles * TILE_V + row + row_offset] - sum_hk
-            v_new = v_new * r_beta
-
-            sum_hq = 0.0
+            inv_norm_q = cute.rsqrt(sum_q + 1e-6, fastmath=True)
+            inv_norm_k = cute.rsqrt(sum_k + 1e-6, fastmath=True)
             for i in cutlass.range_constexpr(vec_size):
-                r_h[i] += r_k[i] * v_new
-                sum_hq += r_h[i] * r_q[i]
+                r_q[i] = r_q[i] * inv_norm_q
+                r_k[i] = r_k[i] * inv_norm_k
 
-            # Write h to gDst using 4D local_tile + autovec_copy (contiguous in K)
-            gDst_tile = cute.local_tile(
-                gDst, (1, 1, vec_size, 1), (0, row + row_offset, lane_id, v_tiles)
-            )
-            cute.autovec_copy(r_h, gDst_tile)
+        # Apply scaling in Float32
+        for i in cutlass.range_constexpr(vec_size):
+            r_q[i] = r_q[i] * scale
 
-            for offset in [16, 8, 4, 2, 1]:
-                sum_hq += cute.arch.shuffle_sync_bfly(
-                    sum_hq, offset=offset, mask=-1, mask_and_clamp=31
+        # ===================================================================
+        # Mainloop: All threads participate
+        # ===================================================================
+        end_v_tiles = start_v_tiles + num_v_tiles_per_block
+        for v_tiles in range(start_v_tiles, end_v_tiles):
+            stage = (v_tiles - start_v_tiles) % NUM_STAGES
+
+            # Step 1: Wait for current stage to complete
+            cute.arch.cp_async_wait_group(0)
+            cute.arch.barrier()
+
+            # Step 2: Issue async load for next tile (after compute)
+            next_v_tiles = v_tiles + prefetch_count
+            if next_v_tiles < end_v_tiles:
+                next_stage = (next_v_tiles - start_v_tiles) % NUM_STAGES
+
+                gSrc_next = gSrc[(None, None, next_v_tiles)]
+                sData_next = sData[(None, None, next_stage)]
+
+                thr_gSrc = thr_copy_load.partition_S(gSrc_next)
+                thr_sData = thr_copy_load.partition_D(sData_next)
+
+                cute.copy(tiled_copy_load, thr_gSrc, thr_sData)
+                cute.arch.cp_async_commit_group()
+
+            # Step 3: Compute using data from current stage (contiguous access pattern)
+            for row in cutlass.range_constexpr(0, TILE_V, 4):
+                row_offset = tidx // 32
+                sum_hk = 0.0
+
+                # Load h from sData using 3D local_tile + autovec_copy (contiguous in K)
+                sData_tile = cute.local_tile(
+                    sData, (1, vec_size, 1), (row + row_offset, lane_id, stage)
                 )
+                cute.autovec_copy(sData_tile, r_h)
 
-            o_idx = v_tiles * TILE_V + row + row_offset
-            if lane_id == 0 and o_idx < V:
-                sOutput[o_idx] = cutlass.BFloat16(sum_hq)
+                for i in cutlass.range_constexpr(vec_size):
+                    r_h[i] = r_h[i] * r_g
+                    sum_hk += r_h[i] * r_k[i]
 
-    # ===================================================================
-    # Final writeback: Copy output from shared memory to global memory
-    # All threads write (V=128, NUM_THREADS=128)
-    # ===================================================================
-    cute.arch.barrier()  # Ensure all writes to sOutput are complete
-    if tidx >= start_v_tiles * TILE_V and tidx < end_v_tiles * TILE_V:
-        o[(i_n, i_t, i_hv, tidx)] = sOutput[tidx]
+                for offset in [16, 8, 4, 2, 1]:
+                    sum_hk += cute.arch.shuffle_sync_bfly(
+                        sum_hk, offset=offset, mask=-1, mask_and_clamp=31
+                    )
+
+                v_new = sV[v_tiles * TILE_V + row + row_offset] - sum_hk
+                v_new = v_new * r_beta
+
+                sum_hq = 0.0
+                for i in cutlass.range_constexpr(vec_size):
+                    r_h[i] += r_k[i] * v_new
+                    sum_hq += r_h[i] * r_q[i]
+
+                # Write h to gDst using 4D local_tile + autovec_copy (contiguous in K)
+                gDst_tile = cute.local_tile(
+                    gDst, (1, 1, vec_size, 1), (0, row + row_offset, lane_id, v_tiles)
+                )
+                cute.autovec_copy(r_h, gDst_tile)
+
+                for offset in [16, 8, 4, 2, 1]:
+                    sum_hq += cute.arch.shuffle_sync_bfly(
+                        sum_hq, offset=offset, mask=-1, mask_and_clamp=31
+                    )
+
+                o_idx = v_tiles * TILE_V + row + row_offset
+                if lane_id == 0 and o_idx < V:
+                    sOutput[o_idx] = cutlass.BFloat16(sum_hq)
+
+        # ===================================================================
+        # Final writeback: Copy output from shared memory to global memory
+        # All threads write (V=128, NUM_THREADS=128)
+        # ===================================================================
+        cute.arch.barrier()  # Ensure all writes to sOutput are complete
+        if tidx >= start_v_tiles * TILE_V and tidx < end_v_tiles * TILE_V:
+            o[(i_n, i_t, i_hv, tidx)] = sOutput[tidx]
+    else:
+        # Padding slot: write zeros to output
+        start_v_tiles = batch_inner * num_v_tiles_per_block
+        if (
+            tidx >= start_v_tiles * TILE_V
+            and tidx < (start_v_tiles + num_v_tiles_per_block) * TILE_V
+        ):
+            o[(i_n, i_t, i_hv, tidx)] = cutlass.BFloat16(0.0)
 
 
 @cute.kernel
@@ -432,6 +452,7 @@ def gdn_decode_kernel_big_batch_pretranspose(
     use_initial_state: cutlass.Constexpr[bool],
     use_qk_l2norm: cutlass.Constexpr[bool],
     is_varlen: cutlass.Constexpr[bool],
+    use_pool_indexing: cutlass.Constexpr[bool] = False,
 ):
     """Each block uses pipeline to load one batch and vectorized writeback"""
 
@@ -489,188 +510,201 @@ def gdn_decode_kernel_big_batch_pretranspose(
 
     cute.arch.barrier()
 
-    # Get current batch
-    gSrc_batch = h0_source[(batch_idx, None, None)]  # (V, K)
-    gDst = cute.local_tile(h0_source, (1, TILE_V, TILE_K), (batch_idx, None, 0))
+    # Compute state index: use pool indexing if enabled (h0_indices maps batch to pool slot)
+    if cutlass.const_expr(use_pool_indexing):
+        pool_idx = h0_indices[i_n]
+        state_idx = pool_idx * HV + i_hv
+    else:
+        pool_idx = 0  # dummy, always valid
+        state_idx = batch_idx
 
-    # V 方向分 tiles
-    gSrc = cute.local_tile(
-        gSrc_batch, (TILE_V, TILE_K), (None, 0)
-    )  # (TILE_V, TILE_K, num_v_tiles)
+    if pool_idx >= 0:
+        # Get current batch
+        gSrc_batch = h0_source[(state_idx, None, None)]  # (V, K)
+        gDst = cute.local_tile(h0_source, (1, TILE_V, TILE_K), (state_idx, None, 0))
 
-    # Partition for load
-    thr_copy_load = tiled_copy_load.get_slice(tidx)
+        # V 方向分 tiles
+        gSrc = cute.local_tile(
+            gSrc_batch, (TILE_V, TILE_K), (None, 0)
+        )  # (TILE_V, TILE_K, num_v_tiles)
 
-    # ===================================================================
-    # Prefetch: All threads participate in cp.async load
-    # ===================================================================
-    prefetch_count = cutlass.min(NUM_STAGES - 1, num_v_tiles)
-    for v_tiles in range(prefetch_count):
-        stage = v_tiles % NUM_STAGES
+        # Partition for load
+        thr_copy_load = tiled_copy_load.get_slice(tidx)
 
-        gSrc_tile = gSrc[(None, None, v_tiles)]
-        sData_stage = sData[(None, None, stage)]
+        # ===================================================================
+        # Prefetch: All threads participate in cp.async load
+        # ===================================================================
+        prefetch_count = cutlass.min(NUM_STAGES - 1, num_v_tiles)
+        for v_tiles in range(prefetch_count):
+            stage = v_tiles % NUM_STAGES
 
-        thr_gSrc = thr_copy_load.partition_S(gSrc_tile)
-        thr_sData = thr_copy_load.partition_D(sData_stage)
+            gSrc_tile = gSrc[(None, None, v_tiles)]
+            sData_stage = sData[(None, None, stage)]
 
-        cute.copy(tiled_copy_load, thr_gSrc, thr_sData)
-        cute.arch.cp_async_commit_group()
-
-    # Load q, k into BF16 registers using autovec_copy (contiguous pattern)
-    q_tile = cute.local_tile(q, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane_id))
-    k_tile = cute.local_tile(k, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane_id))
-    cute.autovec_copy(q_tile, r_q_bf16)
-    cute.autovec_copy(k_tile, r_k_bf16)
-
-    # Convert BF16 to FP32
-    for i in cutlass.range_constexpr(vec_size):
-        r_q[i] = cutlass.Float32(r_q_bf16[i])
-        r_k[i] = cutlass.Float32(r_k_bf16[i])
-
-    # Load v into BF16 registers using autovec_copy, convert to FP32, store to sV
-    v_tile = cute.local_tile(v, (1, 1, 1, vec_size), (i_n, i_t, i_hv, lane_id))
-    cute.autovec_copy(v_tile, r_v_bf16)
-    for i in cutlass.range_constexpr(vec_size):
-        sV[k_start + i] = cutlass.Float32(r_v_bf16[i])
-
-    cute.arch.barrier()  # Ensure all threads finish writing to sV
-
-    # ===================================================================
-    # Compute g and beta (scalar values)
-    # ===================================================================
-    r_g = 0.0
-    r_beta = 0.0
-    if lane_id == 0:
-        x = r_a + r_dt_bias
-        beta_x = softplus_beta * x
-        softplus_x = 0.0
-
-        if beta_x <= softplus_threshold:
-            # softplus(x) = (1/beta) * log(1 + exp(beta*x))
-            # Compute in Float32
-            exp_beta_x = cute.exp(beta_x, fastmath=True)
-            log_input = cutlass.Float32(1.0 + exp_beta_x)
-            log_result = cutlass.Float32(cute.log(log_input, fastmath=True))
-            softplus_x = cutlass.Float32(
-                (cutlass.Float32(1.0) / softplus_beta) * log_result
-            )
-        else:
-            softplus_x = x
-
-        # Compute g = exp(A_log) * softplus_x
-        r_g_value = -cute.exp(r_A_log, fastmath=True) * softplus_x
-
-        # Compute beta = 1 / (1 + exp(-b))
-        r_beta = 1.0 / (1.0 + cute.exp(-r_b, fastmath=True))
-
-        # Store to scalar (Float32)
-        r_g = cute.exp(r_g_value, fastmath=True)
-
-    r_g = cute.arch.shuffle_sync(r_g, 0)
-    r_beta = cute.arch.shuffle_sync(r_beta, 0)
-
-    if use_qk_l2norm:
-        # Compute L2 norm of q and k
-        sum_q = 0.0
-        sum_k = 0.0
-        for i in cutlass.range_constexpr(vec_size):
-            sum_q += r_q[i] * r_q[i]
-            sum_k += r_k[i] * r_k[i]
-        # Warp-level reduction using butterfly shuffle
-        for offset in [16, 8, 4, 2, 1]:
-            sum_q += cute.arch.shuffle_sync_bfly(
-                sum_q, offset=offset, mask=-1, mask_and_clamp=31
-            )
-            sum_k += cute.arch.shuffle_sync_bfly(
-                sum_k, offset=offset, mask=-1, mask_and_clamp=31
-            )
-
-        inv_norm_q = cute.rsqrt(sum_q + 1e-6, fastmath=True)
-        inv_norm_k = cute.rsqrt(sum_k + 1e-6, fastmath=True)
-        for i in cutlass.range_constexpr(vec_size):
-            r_q[i] = r_q[i] * inv_norm_q
-            r_k[i] = r_k[i] * inv_norm_k
-
-    # Apply scaling in Float32
-    for i in cutlass.range_constexpr(vec_size):
-        r_q[i] = r_q[i] * scale
-
-    # ===================================================================
-    # Mainloop: All threads participate
-    # ===================================================================
-    for v_tiles in range(num_v_tiles):
-        stage = v_tiles % NUM_STAGES
-
-        # Step 1: Wait for current stage to complete
-        cute.arch.cp_async_wait_group(0)
-        cute.arch.barrier()
-
-        # Step 2: Issue async load for next tile (after compute)
-        next_v_tiles = v_tiles + prefetch_count
-        if next_v_tiles < num_v_tiles:
-            next_stage = next_v_tiles % NUM_STAGES
-
-            gSrc_next = gSrc[(None, None, next_v_tiles)]
-            sData_next = sData[(None, None, next_stage)]
-
-            thr_gSrc = thr_copy_load.partition_S(gSrc_next)
-            thr_sData = thr_copy_load.partition_D(sData_next)
+            thr_gSrc = thr_copy_load.partition_S(gSrc_tile)
+            thr_sData = thr_copy_load.partition_D(sData_stage)
 
             cute.copy(tiled_copy_load, thr_gSrc, thr_sData)
             cute.arch.cp_async_commit_group()
 
-        # Step 3: Compute using data from current stage (contiguous access pattern)
-        for row in cutlass.range_constexpr(0, TILE_V, 4):
-            row_offset = tidx // 32
-            sum_hk = 0.0
+        # Load q, k into BF16 registers using autovec_copy (contiguous pattern)
+        q_tile = cute.local_tile(q, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane_id))
+        k_tile = cute.local_tile(k, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane_id))
+        cute.autovec_copy(q_tile, r_q_bf16)
+        cute.autovec_copy(k_tile, r_k_bf16)
 
-            # Load h from sData using 3D local_tile + autovec_copy (contiguous in K)
-            sData_tile = cute.local_tile(
-                sData, (1, vec_size, 1), (row + row_offset, lane_id, stage)
-            )
-            cute.autovec_copy(sData_tile, r_h)
+        # Convert BF16 to FP32
+        for i in cutlass.range_constexpr(vec_size):
+            r_q[i] = cutlass.Float32(r_q_bf16[i])
+            r_k[i] = cutlass.Float32(r_k_bf16[i])
 
+        # Load v into BF16 registers using autovec_copy, convert to FP32, store to sV
+        v_tile = cute.local_tile(v, (1, 1, 1, vec_size), (i_n, i_t, i_hv, lane_id))
+        cute.autovec_copy(v_tile, r_v_bf16)
+        for i in cutlass.range_constexpr(vec_size):
+            sV[k_start + i] = cutlass.Float32(r_v_bf16[i])
+
+        cute.arch.barrier()  # Ensure all threads finish writing to sV
+
+        # ===================================================================
+        # Compute g and beta (scalar values)
+        # ===================================================================
+        r_g = 0.0
+        r_beta = 0.0
+        if lane_id == 0:
+            x = r_a + r_dt_bias
+            beta_x = softplus_beta * x
+            softplus_x = 0.0
+
+            if beta_x <= softplus_threshold:
+                # softplus(x) = (1/beta) * log(1 + exp(beta*x))
+                # Compute in Float32
+                exp_beta_x = cute.exp(beta_x, fastmath=True)
+                log_input = cutlass.Float32(1.0 + exp_beta_x)
+                log_result = cutlass.Float32(cute.log(log_input, fastmath=True))
+                softplus_x = cutlass.Float32(
+                    (cutlass.Float32(1.0) / softplus_beta) * log_result
+                )
+            else:
+                softplus_x = x
+
+            # Compute g = exp(A_log) * softplus_x
+            r_g_value = -cute.exp(r_A_log, fastmath=True) * softplus_x
+
+            # Compute beta = 1 / (1 + exp(-b))
+            r_beta = 1.0 / (1.0 + cute.exp(-r_b, fastmath=True))
+
+            # Store to scalar (Float32)
+            r_g = cute.exp(r_g_value, fastmath=True)
+
+        r_g = cute.arch.shuffle_sync(r_g, 0)
+        r_beta = cute.arch.shuffle_sync(r_beta, 0)
+
+        if use_qk_l2norm:
+            # Compute L2 norm of q and k
+            sum_q = 0.0
+            sum_k = 0.0
             for i in cutlass.range_constexpr(vec_size):
-                r_h[i] = r_h[i] * r_g
-                sum_hk += r_h[i] * r_k[i]
-
+                sum_q += r_q[i] * r_q[i]
+                sum_k += r_k[i] * r_k[i]
+            # Warp-level reduction using butterfly shuffle
             for offset in [16, 8, 4, 2, 1]:
-                sum_hk += cute.arch.shuffle_sync_bfly(
-                    sum_hk, offset=offset, mask=-1, mask_and_clamp=31
+                sum_q += cute.arch.shuffle_sync_bfly(
+                    sum_q, offset=offset, mask=-1, mask_and_clamp=31
+                )
+                sum_k += cute.arch.shuffle_sync_bfly(
+                    sum_k, offset=offset, mask=-1, mask_and_clamp=31
                 )
 
-            v_new = sV[v_tiles * TILE_V + row + row_offset] - sum_hk
-            v_new = v_new * r_beta
-
-            sum_hq = 0.0
+            inv_norm_q = cute.rsqrt(sum_q + 1e-6, fastmath=True)
+            inv_norm_k = cute.rsqrt(sum_k + 1e-6, fastmath=True)
             for i in cutlass.range_constexpr(vec_size):
-                r_h[i] += r_k[i] * v_new
-                sum_hq += r_h[i] * r_q[i]
+                r_q[i] = r_q[i] * inv_norm_q
+                r_k[i] = r_k[i] * inv_norm_k
 
-            # Write h to gDst using 4D local_tile + autovec_copy (contiguous in K)
-            gDst_tile = cute.local_tile(
-                gDst, (1, 1, vec_size, 1), (0, row + row_offset, lane_id, v_tiles)
-            )
-            cute.autovec_copy(r_h, gDst_tile)
+        # Apply scaling in Float32
+        for i in cutlass.range_constexpr(vec_size):
+            r_q[i] = r_q[i] * scale
 
-            for offset in [16, 8, 4, 2, 1]:
-                sum_hq += cute.arch.shuffle_sync_bfly(
-                    sum_hq, offset=offset, mask=-1, mask_and_clamp=31
+        # ===================================================================
+        # Mainloop: All threads participate
+        # ===================================================================
+        for v_tiles in range(num_v_tiles):
+            stage = v_tiles % NUM_STAGES
+
+            # Step 1: Wait for current stage to complete
+            cute.arch.cp_async_wait_group(0)
+            cute.arch.barrier()
+
+            # Step 2: Issue async load for next tile (after compute)
+            next_v_tiles = v_tiles + prefetch_count
+            if next_v_tiles < num_v_tiles:
+                next_stage = next_v_tiles % NUM_STAGES
+
+                gSrc_next = gSrc[(None, None, next_v_tiles)]
+                sData_next = sData[(None, None, next_stage)]
+
+                thr_gSrc = thr_copy_load.partition_S(gSrc_next)
+                thr_sData = thr_copy_load.partition_D(sData_next)
+
+                cute.copy(tiled_copy_load, thr_gSrc, thr_sData)
+                cute.arch.cp_async_commit_group()
+
+            # Step 3: Compute using data from current stage (contiguous access pattern)
+            for row in cutlass.range_constexpr(0, TILE_V, 4):
+                row_offset = tidx // 32
+                sum_hk = 0.0
+
+                # Load h from sData using 3D local_tile + autovec_copy (contiguous in K)
+                sData_tile = cute.local_tile(
+                    sData, (1, vec_size, 1), (row + row_offset, lane_id, stage)
                 )
+                cute.autovec_copy(sData_tile, r_h)
 
-            o_idx = v_tiles * TILE_V + row + row_offset
-            if lane_id == 0 and o_idx < V:
-                sOutput[o_idx] = cutlass.BFloat16(sum_hq)
+                for i in cutlass.range_constexpr(vec_size):
+                    r_h[i] = r_h[i] * r_g
+                    sum_hk += r_h[i] * r_k[i]
 
-    # ===================================================================
-    # Final writeback: Copy output from shared memory to global memory
-    # All threads write (V=128, NUM_THREADS=128)
-    # ===================================================================
-    cute.arch.barrier()  # Ensure all writes to sOutput are complete
+                for offset in [16, 8, 4, 2, 1]:
+                    sum_hk += cute.arch.shuffle_sync_bfly(
+                        sum_hk, offset=offset, mask=-1, mask_and_clamp=31
+                    )
 
-    if tidx < V:
-        o[(i_n, i_t, i_hv, tidx)] = sOutput[tidx]
+                v_new = sV[v_tiles * TILE_V + row + row_offset] - sum_hk
+                v_new = v_new * r_beta
+
+                sum_hq = 0.0
+                for i in cutlass.range_constexpr(vec_size):
+                    r_h[i] += r_k[i] * v_new
+                    sum_hq += r_h[i] * r_q[i]
+
+                # Write h to gDst using 4D local_tile + autovec_copy (contiguous in K)
+                gDst_tile = cute.local_tile(
+                    gDst, (1, 1, vec_size, 1), (0, row + row_offset, lane_id, v_tiles)
+                )
+                cute.autovec_copy(r_h, gDst_tile)
+
+                for offset in [16, 8, 4, 2, 1]:
+                    sum_hq += cute.arch.shuffle_sync_bfly(
+                        sum_hq, offset=offset, mask=-1, mask_and_clamp=31
+                    )
+
+                o_idx = v_tiles * TILE_V + row + row_offset
+                if lane_id == 0 and o_idx < V:
+                    sOutput[o_idx] = cutlass.BFloat16(sum_hq)
+
+        # ===================================================================
+        # Final writeback: Copy output from shared memory to global memory
+        # All threads write (V=128, NUM_THREADS=128)
+        # ===================================================================
+        cute.arch.barrier()  # Ensure all writes to sOutput are complete
+
+        if tidx < V:
+            o[(i_n, i_t, i_hv, tidx)] = sOutput[tidx]
+    else:
+        # Padding slot (negative pool index): write zeros to output
+        if tidx < V:
+            o[(i_n, i_t, i_hv, tidx)] = cutlass.BFloat16(0.0)
 
 
 @cute.jit
@@ -698,11 +732,12 @@ def run_gdn_decode_kernel_small_batch_pretranspose(
     use_initial_state: cutlass.Constexpr[bool],
     use_qk_l2norm: cutlass.Constexpr[bool],
     is_varlen: cutlass.Constexpr[bool],
-    stream: cuda.CUstream,
+    use_pool_indexing: cutlass.Constexpr[bool] = False,
+    stream: cuda.CUstream = None,
 ):
     """Launch original pipelined kernel for small batch pretranspose."""
-    # h0_source: (B*HV, V, K)
-    batch_size, v_dim, k_dim = (
+    # h0_source: (B*HV, V, K) or (pool_size*HV, V, K) when use_pool_indexing=True
+    _, v_dim, k_dim = (
         h0_source.layout.shape[0],
         h0_source.layout.shape[1],
         h0_source.layout.shape[2],
@@ -725,7 +760,6 @@ def run_gdn_decode_kernel_small_batch_pretranspose(
     tiled_copy_load = cute.make_tiled_copy_tv(copy_atom, thread_layout, val_layout)
 
     num_v_tiles = cute.ceil_div(v_dim, TILE_V)
-    v_dim * k_dim * batch_size * 4 / 1024 / 1024
 
     vec_size = (
         TILE_K // 32
@@ -740,6 +774,9 @@ def run_gdn_decode_kernel_small_batch_pretranspose(
     # sV: K * 4 bytes (Float32)
     # sOutput: V * 2 bytes (BFloat16)
     smem_bytes = 4 * TILE_V * TILE_K * NUM_STAGES + 4 * k_dim + 2 * v_dim + 32
+
+    # Grid size: use B*HV (actual batch) not h0_source.shape[0] (which may be pool_size*HV)
+    grid_batch = B * HV
 
     gdn_decode_kernel_small_batch_pretranspose(
         tiled_copy_load,
@@ -769,8 +806,9 @@ def run_gdn_decode_kernel_small_batch_pretranspose(
         use_initial_state,
         use_qk_l2norm,
         is_varlen,
+        use_pool_indexing,
     ).launch(
-        grid=(batch_size * NUM_BLOCKS_PER_STATE, 1, 1),
+        grid=(grid_batch * NUM_BLOCKS_PER_STATE, 1, 1),
         block=[NUM_THREADS, 1, 1],
         smem=smem_bytes,
         stream=stream,
@@ -802,10 +840,11 @@ def run_gdn_decode_kernel_big_batch_pretranspose(
     use_initial_state: cutlass.Constexpr[bool],
     use_qk_l2norm: cutlass.Constexpr[bool],
     is_varlen: cutlass.Constexpr[bool],
-    stream: cuda.CUstream,
+    use_pool_indexing: cutlass.Constexpr[bool] = False,
+    stream: cuda.CUstream = None,
 ):
-    # h0_source: (B*HV, V, K)
-    batch_size, v_dim, k_dim = (
+    # h0_source: (B*HV, V, K) or (pool_size*HV, V, K) when use_pool_indexing=True
+    _, v_dim, k_dim = (
         h0_source.layout.shape[0],
         h0_source.layout.shape[1],
         h0_source.layout.shape[2],
@@ -828,17 +867,10 @@ def run_gdn_decode_kernel_big_batch_pretranspose(
     tiled_copy_load = cute.make_tiled_copy_tv(copy_atom, thread_layout, val_layout)
 
     num_v_tiles = cute.ceil_div(v_dim, TILE_V)
-    v_dim * k_dim * batch_size * 4 / 1024 / 1024
 
     vec_size = (
         TILE_K // 32
     )  # Each thread in a warp processes this many elements (always 4 for TILE_K=128)
-
-    # print(f"Batched CP.ASYNC Load + Store (bypass L1 cache)")
-    # print(f"  {batch_size} batches x {v_dim}x{k_dim} matrices")
-    # print(f"  Tile: {TILE_V}x{TILE_K}, {num_v_tiles} tiles/batch")
-    # print(f"  Threads: {NUM_THREADS} ({NUM_THREADS // 32} warps), vec_size: {vec_size}")
-    # print(f"  Total: {total_data_mb:.1f} MB\n")
 
     # Create SMEM layout
     smem_layout_staged = cute.make_layout(
@@ -849,6 +881,9 @@ def run_gdn_decode_kernel_big_batch_pretranspose(
     # sV: K * 4 bytes (Float32)
     # sOutput: V * 2 bytes (BFloat16)
     smem_bytes = 4 * TILE_V * TILE_K * NUM_STAGES + 4 * k_dim + 2 * v_dim + 32
+
+    # Grid size: use B*HV (actual batch) not h0_source.shape[0] (which may be pool_size*HV)
+    grid_batch = B * HV
 
     gdn_decode_kernel_big_batch_pretranspose(
         tiled_copy_load,
@@ -878,8 +913,9 @@ def run_gdn_decode_kernel_big_batch_pretranspose(
         use_initial_state,
         use_qk_l2norm,
         is_varlen,
+        use_pool_indexing,
     ).launch(
-        grid=(batch_size, 1, 1),
+        grid=(grid_batch, 1, 1),
         block=[NUM_THREADS, 1, 1],
         smem=smem_bytes,
         stream=stream,
@@ -899,28 +935,20 @@ def _get_compiled_decode_kernel(
     HV: int,
     K: int,
     V: int,
+    pool_size: int,
     dtype: torch.dtype,
     scale: float,
     use_qk_l2norm: bool,
+    use_pool_indexing: bool,
 ):
-    """Cache compiled kernel for given configuration (pretranspose version)."""
-    # This will be populated on first call
-    return {}
+    """Cache compiled kernel for given configuration (pretranspose version).
 
-
-@functools.cache
-def _get_compiled_decode_kernel_nontranspose(
-    B: int,
-    T: int,
-    H: int,
-    HV: int,
-    K: int,
-    V: int,
-    dtype: torch.dtype,
-    scale: float,
-    use_qk_l2norm: bool,
-):
-    """Cache compiled kernel for given configuration (nontranspose version)."""
+    When ``use_pool_indexing=True``, the kernel reads/writes state from a shared
+    pool using ``state_indices``.  Because ``use_pool_indexing`` is a
+    ``cutlass.Constexpr``, the two modes produce different compiled CUDA code and
+    must have separate cache entries (ensured by including ``pool_size`` and
+    ``use_pool_indexing`` in the key).
+    """
     # This will be populated on first call
     return {}
 
@@ -938,11 +966,17 @@ def gated_delta_rule_decode_pretranspose(
     scale: Optional[float] = None,
     output: Optional[torch.Tensor] = None,
     use_qk_l2norm: bool = True,
+    state_indices: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Gated Delta Rule Decode kernel for single-token generation.
 
     This implements the decode phase of gated delta rule linear attention,
     processing one token at a time and updating the recurrent state.
+
+    When ``state_indices`` is provided, the kernel reads/writes state directly
+    from/to the state pool using indirect indexing (zero-copy pooled mode),
+    eliminating the need for gather before and scatter after the kernel call.
+    Negative indices are treated as padding and skipped.
 
     Args:
         q (torch.Tensor):
@@ -952,8 +986,9 @@ def gated_delta_rule_decode_pretranspose(
         v (torch.Tensor):
             Current value of shape ``[B, 1, HV, V]``. Must be float16/bfloat16.
         state (torch.Tensor):
-            Current state of shape ``[B, HV, V, K]`` (v-major layout).
-            Must be float32. Will be updated in-place.
+            Current state of shape ``[B, HV, V, K]`` or, when ``state_indices``
+            is provided, the full state pool of shape ``[pool_size, HV, V, K]``
+            (V-major / K-last layout).  Must be float32.  Updated in-place.
         A_log (torch.Tensor):
             Log decay parameter of shape ``[HV]``. Must be float32.
         a (torch.Tensor):
@@ -969,27 +1004,52 @@ def gated_delta_rule_decode_pretranspose(
             If None, will be allocated automatically.
         use_qk_l2norm (bool):
             Whether to apply L2 normalization to q and k. Default: ``True``.
+        state_indices (Optional[torch.Tensor]):
+            When provided, enables pool-indexed (zero-copy) mode.  Shape ``[B]``,
+            dtype ``int32``.  Each element maps a batch element to a slot in the
+            state pool.  Negative values are treated as padding (output zeroed,
+            state not updated).  Default: ``None`` (direct 1:1 batch mapping).
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]:
             - output: Output tensor of shape ``[B, 1, HV, V]``
-            - state: Updated state tensor of shape ``[B, HV, V, K]``
+            - state: The (updated) state tensor
 
     Note:
         - Requires SM90 (Hopper) architecture
         - State is updated in-place
         - K and V must be multiples of 4 for vectorized loads
-        - State layout is v-major: [B, HV, V, K]
+        - State layout is V-major: [*, HV, V, K]
     """
+    use_pool_indexing = state_indices is not None
+
     # Validate input shapes
     B, T, H, K = q.shape
     assert T == 1, f"Decode only supports T=1, got T={T}"
     _, _, HV, V = v.shape
+    pool_size = state.shape[0]
 
     # Validate state shape
-    assert state.shape == (B, HV, V, K), (
-        f"Expected state shape [B={B}, HV={HV}, V={V}, K={K}], got {state.shape}"
+    assert state.shape[1:] == (HV, V, K), (
+        f"Expected state shape [*, HV={HV}, V={V}, K={K}], got {state.shape}"
     )
+    if not use_pool_indexing:
+        assert state.shape[0] == B, (
+            f"Without state_indices, state dim-0 must equal B={B}, got {state.shape[0]}"
+        )
+
+    # Validate indices (pooled mode)
+    if use_pool_indexing:
+        assert state.is_contiguous(), (
+            "state must be contiguous when using pool indexing (state_indices); "
+            "a non-contiguous tensor may silently produce incorrect results"
+        )
+        assert state_indices.shape == (B,), (
+            f"Expected state_indices shape [{B}], got {state_indices.shape}"
+        )
+        assert state_indices.dtype == torch.int32, (
+            f"state_indices must be int32, got {state_indices.dtype}"
+        )
 
     # Validate K and V constraints
     assert K >= 128, f"K must be at least 128, got K={K}"
@@ -1018,18 +1078,35 @@ def gated_delta_rule_decode_pretranspose(
         # Kernel outputs bfloat16, allocate in that dtype first
         output = torch.zeros((B, T, HV, V), dtype=torch.bfloat16, device=q.device)
 
-    # Convert state from [B, HV, V, K] to [B*HV, V, K] for kernel
-    h0_source = state.reshape(B * HV, V, K)
+    # Convert state from [pool_size, HV, V, K] to [pool_size*HV, V, K] for kernel
+    h0_source = state.reshape(pool_size * HV, V, K)
 
     # Compile kernel with TVM FFI (cached)
-    cache_key = (B, T, H, HV, K, V, q.dtype, scale, use_qk_l2norm)
+    cache_key = (
+        B,
+        T,
+        H,
+        HV,
+        K,
+        V,
+        pool_size,
+        q.dtype,
+        scale,
+        use_qk_l2norm,
+        use_pool_indexing,
+    )
     cache = _get_compiled_decode_kernel(*cache_key)
 
     # Get or create h0_indices and cu_seqlens (cached per config)
-    if "h0_indices" not in cache or cache["h0_indices"].device != q.device:
-        cache["h0_indices"] = torch.zeros(B, dtype=torch.int32, device=q.device)
+    if use_pool_indexing:
+        h0_indices = state_indices
+    else:
+        if "h0_indices" not in cache or cache["h0_indices"].device != q.device:
+            cache["h0_indices"] = torch.zeros(B, dtype=torch.int32, device=q.device)
+        h0_indices = cache["h0_indices"]
+
+    if "cu_seqlens" not in cache or cache["cu_seqlens"].device != q.device:
         cache["cu_seqlens"] = torch.zeros(B + 1, dtype=torch.int32, device=q.device)
-    h0_indices = cache["h0_indices"]
     cu_seqlens = cache["cu_seqlens"]
 
     if "compiled" not in cache:
@@ -1080,6 +1157,7 @@ def gated_delta_rule_decode_pretranspose(
             use_initial_state=True,
             use_qk_l2norm=use_qk_l2norm,
             is_varlen=False,
+            use_pool_indexing=use_pool_indexing,
             stream=stream,
             options="--enable-tvm-ffi",
         )
@@ -1093,9 +1171,10 @@ def gated_delta_rule_decode_pretranspose(
         h0_source, A_log, a, dt_bias, q, k, v, b, output, h0_indices, cu_seqlens, stream
     )
 
-    # Copy state back only if state was not contiguous
+    # Copy state back only if non-pooled mode and state was not contiguous
     # (if contiguous, reshape returns a view and kernel updated state in-place)
-    if not state.is_contiguous():
+    # In pooled mode, state is always updated in-place via pool indexing.
+    if not use_pool_indexing and not state.is_contiguous():
         state.copy_(h0_source.reshape(B, HV, V, K))
 
     # Convert output to target dtype if needed (kernel outputs bfloat16)
@@ -1108,6 +1187,23 @@ def gated_delta_rule_decode_pretranspose(
 # ============================================================================
 # NONTRANSPOSE Version Kernels - K-major layout [pool, HV, K, V]
 # ============================================================================
+
+
+@functools.cache
+def _get_compiled_decode_kernel_nontranspose(
+    B: int,
+    T: int,
+    H: int,
+    HV: int,
+    K: int,
+    V: int,
+    dtype: torch.dtype,
+    scale: float,
+    use_qk_l2norm: bool,
+):
+    """Cache compiled kernel for given configuration (nontranspose version)."""
+    # This will be populated on first call
+    return {}
 
 
 @cute.kernel
