@@ -99,7 +99,11 @@ def load_h_chunk_async(h_sh_chunk, h_global, tidx, row_offset):
     val_layout = cute.make_layout((1, copy_elems))
 
     atom_async_copy = cute.make_copy_atom(
-        cute.nvgpu.cpasync.CopyG2SOp(), cutlass.BFloat16, num_bits_per_copy=copy_bits
+        cute.nvgpu.cpasync.CopyG2SOp(
+            cache_mode=cute.nvgpu.cpasync.LoadCacheMode.GLOBAL
+        ),
+        cutlass.BFloat16,
+        num_bits_per_copy=copy_bits,
     )
     tiled_copy = cute.make_tiled_copy_tv(atom_async_copy, thr_layout, val_layout)
     thr_copy = tiled_copy.get_slice(tidx)
@@ -124,14 +128,16 @@ def compute_single_gate(
     beta_x = softplus_beta * x
     softplus_x = cutlass.Float32(0.0)
     if beta_x <= softplus_threshold:
-        softplus_x = (cutlass.Float32(1.0) / softplus_beta) * cute.math.log(
-            cutlass.Float32(1.0) + cute.math.exp(beta_x)
+        softplus_x = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
+            cutlass.Float32(1.0) + cute.exp(beta_x, fastmath=True), fastmath=True
         )
     else:
         softplus_x = x
-    g = -cute.math.exp(A_log_val) * softplus_x
-    g_exp = cute.math.exp(g)
-    beta = cutlass.Float32(1.0) / (cutlass.Float32(1.0) + cute.math.exp(-beta_raw))
+    g = -cute.exp(A_log_val, fastmath=True) * softplus_x
+    g_exp = cute.exp(g, fastmath=True)
+    beta = cutlass.Float32(1.0) / (
+        cutlass.Float32(1.0) + cute.exp(-beta_raw, fastmath=True)
+    )
     return g_exp, beta
 
 
@@ -173,8 +179,8 @@ def normalize_and_store_qk_to_smem(q_head, k_head, q_sh, k_sh, lane_idx, scale, 
             k_sum_sq, offset=1 << i, mask=0xFFFFFFFF
         )
 
-    q_norm = cutlass.Float32(1.0) / cute.math.sqrt(q_sum_sq + eps)
-    k_norm = cutlass.Float32(1.0) / cute.math.sqrt(k_sum_sq + eps)
+    q_norm = cute.rsqrt(q_sum_sq + eps, fastmath=True)
+    k_norm = cute.rsqrt(k_sum_sq + eps, fastmath=True)
     q_scale_factor = q_norm * scale
 
     for i in cutlass.range_constexpr(4):
