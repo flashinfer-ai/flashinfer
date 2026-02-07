@@ -271,6 +271,7 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
     cluster_shape_mn: Tuple[int, int] = (2, 1),
     raster_along_m: bool = False,
     sm_count: Optional[int] = None,
+    zero_output: bool = True,
 ) -> torch.Tensor:
     """Blockscaled Contiguous Grouped GEMM with Finalize Fusion for MoE workloads.
 
@@ -404,7 +405,7 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
             dtype=cutlass_to_torch_dtype(out_dtype_cutlass),
             device=a.device,
         )
-    else:
+    elif zero_output:
         # Ensure output is zero for proper accumulation
         out.zero_()
 
