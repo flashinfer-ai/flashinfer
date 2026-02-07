@@ -2276,7 +2276,7 @@ def trtllm_fp8_per_tensor_scale_moe(
         routing_method_type,
         enable_pdl,
         tune_max_num_tokens,
-        activation_type,
+        ActivationType(activation_type),
     )
 
 
