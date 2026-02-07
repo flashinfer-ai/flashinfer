@@ -25,7 +25,15 @@ This module provides high-performance GPU kernels implemented using NVIDIA CuTe-
     removed in a future release.
 """
 
-from .utils import is_cute_dsl_available, make_ptr, get_cutlass_dtype, get_num_sm
+from .utils import (
+    is_cute_dsl_available,
+    make_ptr,
+    get_cutlass_dtype,
+    get_num_sm,
+    convert_sf_to_mma_layout,
+    convert_sf_from_mma_layout,
+    get_mma_sf_shape,
+)
 
 # Conditionally import CuTe-DSL kernels
 if is_cute_dsl_available():
@@ -52,6 +60,10 @@ __all__ = [
     "make_ptr",
     "get_cutlass_dtype",
     "get_num_sm",
+    # Scale factor layout conversion utilities
+    "convert_sf_to_mma_layout",
+    "convert_sf_from_mma_layout",
+    "get_mma_sf_shape",
 ]
 
 if is_cute_dsl_available():
