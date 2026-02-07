@@ -15,13 +15,32 @@ limitations under the License.
 """
 
 import functools
-from typing import Optional, Tuple
+from typing import Literal, Optional, Tuple
 
 import torch
 
 from .api_logging import flashinfer_api
 from .jit.rope import gen_rope_module
 from .utils import register_custom_op, register_fake_op
+
+
+def _is_cute_dsl_available() -> bool:
+    """Check if CuTe-DSL backend is available."""
+    try:
+        from .cute_dsl import is_cute_dsl_available
+
+        return is_cute_dsl_available()
+    except ImportError:
+        return False
+
+
+def _get_cute_dsl_rope_kernel(
+    head_dim: int, rotary_dim: int, interleave: bool, dtype_str: str
+):
+    """Get the compiled CuTe-DSL RoPE kernel."""
+    from .cute_dsl.rope import _get_compiled_kernel
+
+    return _get_compiled_kernel(head_dim, rotary_dim, interleave, dtype_str)
 
 
 @functools.cache
@@ -759,6 +778,7 @@ def apply_rope(
     interleave: bool = False,
     rope_scale: float = 1,
     rope_theta: float = 1e4,
+    backend: Literal["cuda", "cute-dsl"] = "cuda",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Apply rotary embedding to a batch of queries/keys (stored as RaggedTensor).
     cos/sin values are computed on the fly inside the kernel.
@@ -799,6 +819,11 @@ def apply_rope(
         The scaling factor used in the rope embedding, default: ``1``.
     rope_theta : float
         The theta value used in the rope embedding, default: ``1e4``.
+    backend : Literal["cuda", "cute-dsl"]
+        Backend to use for the RoPE computation, default: ``"cuda"``.
+
+        * ``"cuda"``: Use the CUDA C++ backend (default).
+        * ``"cute-dsl"``: Use the CuTe-DSL backend (requires CuTe-DSL to be available).
 
     Returns
     -------
@@ -845,6 +870,26 @@ def apply_rope(
     k_rope = torch.empty_like(k)
     if rotary_dim is None:
         rotary_dim = q.size(-1)
+
+    if backend == "cute-dsl":
+        if not _is_cute_dsl_available():
+            raise RuntimeError(
+                "CuTe-DSL backend is not available. Please install CuTe-DSL."
+            )
+        from .cute_dsl.rope import apply_rope_with_indptr_cute_dsl
+
+        return apply_rope_with_indptr_cute_dsl(
+            q,
+            k,
+            indptr,
+            offsets,
+            rotary_dim=rotary_dim,
+            interleave=interleave,
+            rope_scale=rope_scale,
+            rope_theta=rope_theta,
+        )
+
+    # Default: CUDA C++ backend
     _apply_rope(
         q,
         k,
@@ -869,27 +914,19 @@ def apply_rope_pos_ids(
     interleave: bool = False,
     rope_scale: float = 1,
     rope_theta: float = 1e4,
+    backend: Literal["cuda", "cute-dsl"] = "cuda",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    r"""Apply rotary embedding to a batch of queries/keys (stored as RaggedTensor).
+    r"""Apply rotary embedding to a batch of queries/keys using position IDs.
     cos/sin values are computed on the fly inside the kernel.
-
-    We use :attr:`indptr` to denote the start pointer of each segment in the batch, the i-th
-    segment the query of the i-th segment is ``q[indptr[i]:indptr[i+1]]`` and the key of the
-    i-th segment is ``k[indptr[i]:indptr[i+1]]``, the first element of :attr:`indptr` is always
-    0 and the last element of :attr:`indptr` is the total number of queries/keys in the batch.
-    Please see :ref:`Ragged Tensor tutorial <kv-layout>` for more details about the
-    ragged tensor.
 
     Parameters
     ----------
     q : torch.Tensor
-        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)`, where ``nnz`` is the last
-        element of ``indptr``.
+        Query tensor, shape: ``(nnz, num_q_heads, head_dim)``.
     k : torch.Tensor
-        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``, where ``nnz`` is the last
-        element of ``indptr``.
+        Key tensor, shape: ``(nnz, num_k_heads, head_dim)``.
     pos_ids : torch.Tensor
-        Position indices, shape: ``(batch_size + 1)``.
+        Position indices, shape: ``(nnz,)``.
     rotary_dim : Optional[int]
         The dimensions to apply RoPE, if ``None``, we apply RoPE to the entire head dimension,
         otherwise, we apply RoPE to the first ``rotary_dim`` dimensions, default: ``None``.
@@ -907,6 +944,11 @@ def apply_rope_pos_ids(
         The scaling factor used in the rope embedding, default: ``1``.
     rope_theta : float
         The theta value used in the rope embedding, default: ``1e4``.
+    backend : Literal["cuda", "cute-dsl"]
+        Backend to use for the RoPE computation, default: ``"cuda"``.
+
+        * ``"cuda"``: Use the CUDA C++ backend (default).
+        * ``"cute-dsl"``: Use the CuTe-DSL backend (requires CuTe-DSL to be available).
 
     Returns
     -------
@@ -923,6 +965,25 @@ def apply_rope_pos_ids(
     k_rope = torch.empty_like(k)
     if rotary_dim is None:
         rotary_dim = q.size(-1)
+
+    if backend == "cute-dsl":
+        if not _is_cute_dsl_available():
+            raise RuntimeError(
+                "CuTe-DSL backend is not available. Please install CuTe-DSL."
+            )
+        from .cute_dsl.rope import apply_rope_cute_dsl
+
+        return apply_rope_cute_dsl(
+            q,
+            k,
+            pos_ids,
+            rotary_dim=rotary_dim,
+            interleave=interleave,
+            rope_scale=rope_scale,
+            rope_theta=rope_theta,
+        )
+
+    # Default: CUDA C++ backend
     _apply_rope_pos_ids(
         q, k, q_rope, k_rope, pos_ids, rotary_dim, interleave, rope_scale, rope_theta
     )
@@ -942,6 +1003,7 @@ def apply_llama31_rope(
     low_freq_factor: float = 1,
     high_freq_factor: float = 4,
     old_context_len: int = 8192,
+    backend: Literal["cuda", "cute-dsl"] = "cuda",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Apply Llama 3.1 style rotary embedding to a batch of queries/keys (stored as
     RaggedTensor). cos/sin values are computed on the fly inside the kernel.
@@ -988,6 +1050,11 @@ def apply_llama31_rope(
         The high frequency factor used in Llama 3.1 RoPE, default: ``4``.
     old_context_len : int
         The old context length used in Llama 3.1 RoPE, default: ``8192``.
+    backend : Literal["cuda", "cute-dsl"]
+        Backend to use for the RoPE computation, default: ``"cuda"``.
+
+        * ``"cuda"``: Use the CUDA C++ backend (default).
+        * ``"cute-dsl"``: Use the CuTe-DSL backend (requires CuTe-DSL to be available).
 
     Returns
     -------
@@ -1034,6 +1101,29 @@ def apply_llama31_rope(
     k_rope = torch.empty_like(k)
     if rotary_dim is None:
         rotary_dim = q.size(-1)
+
+    if backend == "cute-dsl":
+        if not _is_cute_dsl_available():
+            raise RuntimeError(
+                "CuTe-DSL backend is not available. Please install CuTe-DSL."
+            )
+        from .cute_dsl.rope import apply_llama31_rope_with_indptr_cute_dsl
+
+        return apply_llama31_rope_with_indptr_cute_dsl(
+            q,
+            k,
+            indptr,
+            offsets,
+            rotary_dim=rotary_dim,
+            interleave=interleave,
+            rope_scale=rope_scale,
+            rope_theta=rope_theta,
+            low_freq_factor=low_freq_factor,
+            high_freq_factor=high_freq_factor,
+            old_context_len=old_context_len,
+        )
+
+    # Default: CUDA C++ backend
     _apply_llama31_rope(
         q,
         k,
@@ -1064,25 +1154,17 @@ def apply_llama31_rope_pos_ids(
     low_freq_factor: float = 1,
     high_freq_factor: float = 4,
     old_context_len: int = 8192,
+    backend: Literal["cuda", "cute-dsl"] = "cuda",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    r"""Apply Llama 3.1 style rotary embedding to a batch of queries/keys (stored as
-    RaggedTensor). cos/sin values are computed on the fly inside the kernel.
-
-    We use :attr:`indptr` to denote the start pointer of each segment in the batch, the i-th
-    segment the query of the i-th segment is ``q[indptr[i]:indptr[i+1]]`` and the key of the
-    i-th segment is ``k[indptr[i]:indptr[i+1]]``, the first element of :attr:`indptr` is always
-    0 and the last element of :attr:`indptr` is the total number of queries/keys in the batch.
-    Please see :ref:`Ragged Tensor tutorial <kv-layout>` for more details about the
-    ragged tensor.
+    r"""Apply Llama 3.1 style rotary embedding to queries/keys using position IDs.
+    cos/sin values are computed on the fly inside the kernel.
 
     Parameters
     ----------
     q : torch.Tensor
-        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)``, where ``nnz`` is the last
-        element of ``indptr``.
+        Query tensor, shape: ``(nnz, num_q_heads, head_dim)``.
     k : torch.Tensor
-        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``, where ``nnz`` is the last
-        element of ``indptr``.
+        Key tensor, shape: ``(nnz, num_k_heads, head_dim)``.
     pos_ids : torch.Tensor
         Position indices, shape: ``(nnz)``.
     rotary_dim : Optional[int]
@@ -1107,6 +1189,11 @@ def apply_llama31_rope_pos_ids(
         The high frequency factor used in Llama 3.1 RoPE, default: ``4``.
     old_context_len : int
         The old context length used in Llama 3.1 RoPE, default: ``8192``.
+    backend : Literal["cuda", "cute-dsl"]
+        Backend to use for the RoPE computation, default: ``"cuda"``.
+
+        * ``"cuda"``: Use the CUDA C++ backend (default).
+        * ``"cute-dsl"``: Use the CuTe-DSL backend (requires CuTe-DSL to be available).
 
     Returns
     -------
@@ -1123,6 +1210,28 @@ def apply_llama31_rope_pos_ids(
     k_rope = torch.empty_like(k)
     if rotary_dim is None:
         rotary_dim = q.size(-1)
+
+    if backend == "cute-dsl":
+        if not _is_cute_dsl_available():
+            raise RuntimeError(
+                "CuTe-DSL backend is not available. Please install CuTe-DSL."
+            )
+        from .cute_dsl.rope import apply_rope_cute_dsl
+
+        return apply_rope_cute_dsl(
+            q,
+            k,
+            pos_ids,
+            rotary_dim=rotary_dim,
+            interleave=interleave,
+            rope_scale=rope_scale,
+            rope_theta=rope_theta,
+            low_freq_factor=low_freq_factor,
+            high_freq_factor=high_freq_factor,
+            old_context_len=old_context_len,
+        )
+
+    # Default: CUDA C++ backend
     _apply_llama31_rope_pos_ids(
         q,
         k,

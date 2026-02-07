@@ -19,6 +19,7 @@ import torch
 from tests.test_helpers.rope_reference import *
 
 import flashinfer
+from flashinfer.cute_dsl.utils import is_cute_dsl_available
 
 
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
@@ -30,6 +31,7 @@ import flashinfer
 @pytest.mark.parametrize("llama_version", ["llama", "llama31"])
 @pytest.mark.parametrize("partial_rotary_factor", [0.25, 0.5, 0.75, 1.0])
 @pytest.mark.parametrize("inplace", [False, True])
+@pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
 def test_rope(
     batch_size,
     qkv_len,
@@ -40,7 +42,15 @@ def test_rope(
     llama_version,
     partial_rotary_factor,
     inplace,
+    backend,
 ):
+    # Skip cute-dsl backend if not available or for inplace operations
+    if backend == "cute-dsl":
+        if not is_cute_dsl_available():
+            pytest.skip("CuTe-DSL not available")
+        if inplace:
+            pytest.skip("CuTe-DSL backend does not support inplace operations")
+
     rotary_dim = int(head_dim * partial_rotary_factor)
     nnz = batch_size * qkv_len
     qkv_packed = torch.randn(
@@ -107,6 +117,7 @@ def test_rope(
                 rotary_dim=rotary_dim,
                 interleave=True,
                 rope_theta=1e4,
+                backend=backend,
             )
     else:
         if inplace:
@@ -129,6 +140,7 @@ def test_rope(
                 rotary_dim=rotary_dim,
                 interleave=True,
                 rope_theta=5e5,
+                backend=backend,
             )
 
     # compare
@@ -147,6 +159,7 @@ def test_rope(
 @pytest.mark.parametrize("inplace", [False, True])
 @pytest.mark.parametrize("interleave", [True, False])
 @pytest.mark.parametrize("idtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
 def test_rope_pos_ids(
     batch_size,
     qkv_len,
@@ -159,7 +172,15 @@ def test_rope_pos_ids(
     inplace,
     interleave,
     idtype,
+    backend,
 ):
+    # Skip cute-dsl backend if not available or for inplace operations
+    if backend == "cute-dsl":
+        if not is_cute_dsl_available():
+            pytest.skip("CuTe-DSL not available")
+        if inplace:
+            pytest.skip("CuTe-DSL backend does not support inplace operations")
+
     rotary_dim = int(head_dim * partial_rotary_factor)
     nnz = batch_size * qkv_len
     qkv_packed = torch.randn(
@@ -215,6 +236,7 @@ def test_rope_pos_ids(
                 rotary_dim=rotary_dim,
                 interleave=interleave,
                 rope_theta=1e4,
+                backend=backend,
             )
 
             q_rope_pos_ids, k_rope_pos_ids = flashinfer.apply_rope_pos_ids(
@@ -224,6 +246,7 @@ def test_rope_pos_ids(
                 rotary_dim=rotary_dim,
                 interleave=interleave,
                 rope_theta=1e4,
+                backend=backend,
             )
     else:
         if inplace:
@@ -256,6 +279,7 @@ def test_rope_pos_ids(
                 rotary_dim=rotary_dim,
                 interleave=interleave,
                 rope_theta=5e5,
+                backend=backend,
             )
 
             q_rope_pos_ids, k_rope_pos_ids = flashinfer.apply_llama31_rope_pos_ids(
@@ -265,6 +289,7 @@ def test_rope_pos_ids(
                 rotary_dim=rotary_dim,
                 interleave=interleave,
                 rope_theta=5e5,
+                backend=backend,
             )
 
     # compare
