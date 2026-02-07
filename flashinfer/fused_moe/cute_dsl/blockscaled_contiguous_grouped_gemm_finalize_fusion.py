@@ -297,7 +297,8 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
             expanded_idx = token_idx * topk + topk_idx. Invalid rows have -1.
         token_final_scales: Router scaling factors, shape (seq_len, topk), float32/bf16/fp16
         out: Optional output tensor, shape (seq_len, n). Created if None.
-             This tensor is used for atomic accumulation, so it should be zero-initialized.
+             Must be zero-initialized by the caller when provided, as this kernel
+             uses atomic adds for scatter-reduction.
         ab_dtype: Data type for A and B matrices. Default: "float4_e2m1fn"
         sf_dtype: Data type for scale factors. Default: "float8_e4m3fn"
         out_dtype: Data type for output matrix. Default: "bfloat16"
@@ -404,9 +405,6 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
             dtype=cutlass_to_torch_dtype(out_dtype_cutlass),
             device=a.device,
         )
-    else:
-        # Ensure output is zero for proper accumulation
-        out.zero_()
 
     # Get SM count
     if sm_count is None:
