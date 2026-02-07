@@ -53,6 +53,10 @@ if is_cute_dsl_available():
         add_rmsnorm_fp4quant,
         AddRMSNormFP4QuantKernel,
     )
+    from .gated_delta_rule import (
+        gated_delta_rule,
+        GatedDeltaRuleKernel,
+    )
 
 __all__ = [
     # Utils (always available)
@@ -79,4 +83,7 @@ if is_cute_dsl_available():
         # Add + RMSNorm + FP4 Quantization
         "add_rmsnorm_fp4quant",
         "AddRMSNormFP4QuantKernel",
+        # Gated Delta Rule
+        "gated_delta_rule",
+        "GatedDeltaRuleKernel",
     ]
