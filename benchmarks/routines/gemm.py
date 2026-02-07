@@ -1267,9 +1267,6 @@ def testMmMxfp8(args):
 
     ## Parse input arguments
     backends = args.backends
-    if "cutlass" not in backends:
-        # Only cutlass is supported for mm_mxfp8
-        backends = ["cutlass"]
     m = args.m
     n = args.n
     k = args.k
@@ -1308,11 +1305,17 @@ def testMmMxfp8(args):
 
     ## Prepare input tensors
     # Use swizzled layout for optimal performance
+    is_sf_swizzled_layout = True
+
     input = torch.randn([m, k], device=device, dtype=torch.bfloat16)
-    input_mxfp8, input_scale = mxfp8_quantize(input, is_sf_swizzled_layout=True)
+    input_mxfp8, input_scale = mxfp8_quantize(
+        input, is_sf_swizzled_layout=is_sf_swizzled_layout
+    )
 
     mat2 = torch.randn([n, k], device=device, dtype=torch.bfloat16)
-    mat2_mxfp8, mat2_scale = mxfp8_quantize(mat2, is_sf_swizzled_layout=True)
+    mat2_mxfp8, mat2_scale = mxfp8_quantize(
+        mat2, is_sf_swizzled_layout=is_sf_swizzled_layout
+    )
 
     if args.verbose >= 2:
         print(f"[VVERBOSE] {input_mxfp8.shape = }")
@@ -1379,7 +1382,8 @@ def testMmMxfp8(args):
             input_args=(cur_backend, input_mxfp8, mat2_mxfp8, input_scale, mat2_scale),
         )
 
-    min_cos_sim = 0.9
+    # Minimum cosine similarity for swizzled layout
+    min_cos_sim = 0.98
 
     tested_backends = list(outputs.keys())
     tested_outputs = list(outputs.values())
@@ -1393,13 +1397,15 @@ def testMmMxfp8(args):
                 )
                 if cos_sim < min_cos_sim:
                     print(
-                        f"[ERROR] Output tensor mismatch between backends {tested_backends[0]} and {tested_backends[i]}"
+                        "[ERROR] Output tensor mismatch between reference "
+                        f"{tested_backends[0]} and backend {tested_backends[i]}"
                     )
                     if not args.allow_output_mismatch:
                         raise AssertionError(
-                            f"[ERROR] Backend {tested_backends[i]} output mismatch with cos_sim={cos_sim}"
+                            "[ERROR] Output tensor mismatch between reference "
+                            f"{tested_backends[0]} and backend {tested_backends[i]} "
+                            f"with {cos_sim=} (expected >= {min_cos_sim})"
                         )
-
     for backend in backends:
         backend_name = backend + (
             "_autotune"
