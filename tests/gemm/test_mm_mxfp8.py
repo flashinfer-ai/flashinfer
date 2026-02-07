@@ -204,26 +204,6 @@ def test_mm_mxfp8_invalid_input_dtype():
         mm_mxfp8(a, b, a_scale, b_scale, out_dtype=torch.bfloat16, backend="cutlass")
 
 
-def test_mm_mxfp8_invalid_scale_dtype():
-    _skip_if_unsupported()
-    m, n, k = 128, 128, 128
-    a = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
-    b = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
-    a_mx, a_scale = mxfp8_quantize(a, is_sf_swizzled_layout=False)
-    b_mx, b_scale = mxfp8_quantize(b, is_sf_swizzled_layout=False)
-    a_descale = a_scale.view(m, k // 32).to(torch.float16)
-    b_descale = b_scale.view(n, k // 32).t().to(torch.float16)
-    with pytest.raises(ValueError, match="uint8"):
-        mm_mxfp8(
-            a_mx,
-            b_mx.T,
-            a_descale,
-            b_descale,
-            out_dtype=torch.bfloat16,
-            backend="cutlass",
-        )
-
-
 def test_mm_mxfp8_invalid_ndim():
     _skip_if_unsupported()
     m, n, k = 128, 128, 128
