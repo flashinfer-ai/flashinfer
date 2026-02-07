@@ -1040,6 +1040,10 @@ def gated_delta_rule_decode_pretranspose(
 
     # Validate indices (pooled mode)
     if use_pool_indexing:
+        assert state.is_contiguous(), (
+            "state must be contiguous when using pool indexing (state_indices); "
+            "a non-contiguous tensor may silently produce incorrect results"
+        )
         assert state_indices.shape == (B,), (
             f"Expected state_indices shape [{B}], got {state_indices.shape}"
         )
