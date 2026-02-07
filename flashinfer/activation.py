@@ -28,7 +28,7 @@ from .utils import (
     register_fake_op,
     get_compute_capability,
 )
-from .fp4_quantization import get_fp4_quantization_module
+from .quantization.fp4_quantization import get_fp4_quantization_module
 
 
 @functools.cache
