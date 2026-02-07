@@ -935,28 +935,20 @@ def _get_compiled_decode_kernel(
     HV: int,
     K: int,
     V: int,
+    pool_size: int,
     dtype: torch.dtype,
     scale: float,
     use_qk_l2norm: bool,
+    use_pool_indexing: bool,
 ):
-    """Cache compiled kernel for given configuration (pretranspose version)."""
-    # This will be populated on first call
-    return {}
+    """Cache compiled kernel for given configuration (pretranspose version).
 
-
-@functools.cache
-def _get_compiled_decode_kernel_nontranspose(
-    B: int,
-    T: int,
-    H: int,
-    HV: int,
-    K: int,
-    V: int,
-    dtype: torch.dtype,
-    scale: float,
-    use_qk_l2norm: bool,
-):
-    """Cache compiled kernel for given configuration (nontranspose version)."""
+    When ``use_pool_indexing=True``, the kernel reads/writes state from a shared
+    pool using ``state_indices``.  Because ``use_pool_indexing`` is a
+    ``cutlass.Constexpr``, the two modes produce different compiled CUDA code and
+    must have separate cache entries (ensured by including ``pool_size`` and
+    ``use_pool_indexing`` in the key).
+    """
     # This will be populated on first call
     return {}
 
@@ -974,11 +966,17 @@ def gated_delta_rule_decode_pretranspose(
     scale: Optional[float] = None,
     output: Optional[torch.Tensor] = None,
     use_qk_l2norm: bool = True,
+    state_indices: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Gated Delta Rule Decode kernel for single-token generation.
 
     This implements the decode phase of gated delta rule linear attention,
     processing one token at a time and updating the recurrent state.
+
+    When ``state_indices`` is provided, the kernel reads/writes state directly
+    from/to the state pool using indirect indexing (zero-copy pooled mode),
+    eliminating the need for gather before and scatter after the kernel call.
+    Negative indices are treated as padding and skipped.
 
     Args:
         q (torch.Tensor):
@@ -988,8 +986,9 @@ def gated_delta_rule_decode_pretranspose(
         v (torch.Tensor):
             Current value of shape ``[B, 1, HV, V]``. Must be float16/bfloat16.
         state (torch.Tensor):
-            Current state of shape ``[B, HV, V, K]`` (v-major layout).
-            Must be float32. Will be updated in-place.
+            Current state of shape ``[B, HV, V, K]`` or, when ``state_indices``
+            is provided, the full state pool of shape ``[pool_size, HV, V, K]``
+            (V-major / K-last layout).  Must be float32.  Updated in-place.
         A_log (torch.Tensor):
             Log decay parameter of shape ``[HV]``. Must be float32.
         a (torch.Tensor):
@@ -1005,27 +1004,48 @@ def gated_delta_rule_decode_pretranspose(
             If None, will be allocated automatically.
         use_qk_l2norm (bool):
             Whether to apply L2 normalization to q and k. Default: ``True``.
+        state_indices (Optional[torch.Tensor]):
+            When provided, enables pool-indexed (zero-copy) mode.  Shape ``[B]``,
+            dtype ``int32``.  Each element maps a batch element to a slot in the
+            state pool.  Negative values are treated as padding (output zeroed,
+            state not updated).  Default: ``None`` (direct 1:1 batch mapping).
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]:
             - output: Output tensor of shape ``[B, 1, HV, V]``
-            - state: Updated state tensor of shape ``[B, HV, V, K]``
+            - state: The (updated) state tensor
 
     Note:
         - Requires SM90 (Hopper) architecture
         - State is updated in-place
         - K and V must be multiples of 4 for vectorized loads
-        - State layout is v-major: [B, HV, V, K]
+        - State layout is V-major: [*, HV, V, K]
     """
+    use_pool_indexing = state_indices is not None
+
     # Validate input shapes
     B, T, H, K = q.shape
     assert T == 1, f"Decode only supports T=1, got T={T}"
     _, _, HV, V = v.shape
+    pool_size = state.shape[0]
 
     # Validate state shape
-    assert state.shape == (B, HV, V, K), (
-        f"Expected state shape [B={B}, HV={HV}, V={V}, K={K}], got {state.shape}"
+    assert state.shape[1:] == (HV, V, K), (
+        f"Expected state shape [*, HV={HV}, V={V}, K={K}], got {state.shape}"
     )
+    if not use_pool_indexing:
+        assert state.shape[0] == B, (
+            f"Without state_indices, state dim-0 must equal B={B}, got {state.shape[0]}"
+        )
+
+    # Validate indices (pooled mode)
+    if use_pool_indexing:
+        assert state_indices.shape == (B,), (
+            f"Expected state_indices shape [{B}], got {state_indices.shape}"
+        )
+        assert state_indices.dtype == torch.int32, (
+            f"state_indices must be int32, got {state_indices.dtype}"
+        )
 
     # Validate K and V constraints
     assert K >= 128, f"K must be at least 128, got K={K}"
@@ -1054,18 +1074,35 @@ def gated_delta_rule_decode_pretranspose(
         # Kernel outputs bfloat16, allocate in that dtype first
         output = torch.zeros((B, T, HV, V), dtype=torch.bfloat16, device=q.device)
 
-    # Convert state from [B, HV, V, K] to [B*HV, V, K] for kernel
-    h0_source = state.reshape(B * HV, V, K)
+    # Convert state from [pool_size, HV, V, K] to [pool_size*HV, V, K] for kernel
+    h0_source = state.reshape(pool_size * HV, V, K)
 
     # Compile kernel with TVM FFI (cached)
-    cache_key = (B, T, H, HV, K, V, q.dtype, scale, use_qk_l2norm)
+    cache_key = (
+        B,
+        T,
+        H,
+        HV,
+        K,
+        V,
+        pool_size,
+        q.dtype,
+        scale,
+        use_qk_l2norm,
+        use_pool_indexing,
+    )
     cache = _get_compiled_decode_kernel(*cache_key)
 
     # Get or create h0_indices and cu_seqlens (cached per config)
-    if "h0_indices" not in cache or cache["h0_indices"].device != q.device:
-        cache["h0_indices"] = torch.zeros(B, dtype=torch.int32, device=q.device)
+    if use_pool_indexing:
+        h0_indices = state_indices
+    else:
+        if "h0_indices" not in cache or cache["h0_indices"].device != q.device:
+            cache["h0_indices"] = torch.zeros(B, dtype=torch.int32, device=q.device)
+        h0_indices = cache["h0_indices"]
+
+    if "cu_seqlens" not in cache or cache["cu_seqlens"].device != q.device:
         cache["cu_seqlens"] = torch.zeros(B + 1, dtype=torch.int32, device=q.device)
-    h0_indices = cache["h0_indices"]
     cu_seqlens = cache["cu_seqlens"]
 
     if "compiled" not in cache:
@@ -1116,6 +1153,7 @@ def gated_delta_rule_decode_pretranspose(
             use_initial_state=True,
             use_qk_l2norm=use_qk_l2norm,
             is_varlen=False,
+            use_pool_indexing=use_pool_indexing,
             stream=stream,
             options="--enable-tvm-ffi",
         )
@@ -1129,9 +1167,10 @@ def gated_delta_rule_decode_pretranspose(
         h0_source, A_log, a, dt_bias, q, k, v, b, output, h0_indices, cu_seqlens, stream
     )
 
-    # Copy state back only if state was not contiguous
+    # Copy state back only if non-pooled mode and state was not contiguous
     # (if contiguous, reshape returns a view and kernel updated state in-place)
-    if not state.is_contiguous():
+    # In pooled mode, state is always updated in-place via pool indexing.
+    if not use_pool_indexing and not state.is_contiguous():
         state.copy_(h0_source.reshape(B, HV, V, K))
 
     # Convert output to target dtype if needed (kernel outputs bfloat16)
@@ -1141,228 +1180,26 @@ def gated_delta_rule_decode_pretranspose(
     return output, state
 
 
+# ============================================================================
+# NONTRANSPOSE Version Kernels - K-major layout [pool, HV, K, V]
+# ============================================================================
+
+
 @functools.cache
-def _get_compiled_decode_kernel_pooled(
+def _get_compiled_decode_kernel_nontranspose(
     B: int,
     T: int,
     H: int,
     HV: int,
     K: int,
     V: int,
-    pool_size: int,
     dtype: torch.dtype,
     scale: float,
     use_qk_l2norm: bool,
 ):
-    """Cache compiled kernel for pooled pretranspose decode (different constexpr → separate cache)."""
+    """Cache compiled kernel for given configuration (nontranspose version)."""
+    # This will be populated on first call
     return {}
-
-
-@flashinfer_api
-def gated_delta_rule_decode_pretranspose_pooled(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    initial_state: torch.Tensor,
-    initial_state_indices: torch.Tensor,
-    A_log: torch.Tensor,
-    a: torch.Tensor,
-    dt_bias: torch.Tensor,
-    b: torch.Tensor,
-    scale: Optional[float] = None,
-    output: Optional[torch.Tensor] = None,
-    use_qk_l2norm: bool = True,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    r"""Gated Delta Rule Decode kernel with direct pool indexing (zero-copy).
-
-    Like ``gated_delta_rule_decode_pretranspose`` but reads/writes state directly
-    from/to the state pool using ``initial_state_indices``, eliminating the need
-    for gather before and scatter (index_copy_) after the kernel call.
-
-    Args:
-        q (torch.Tensor):
-            Current query of shape ``[B, 1, H, K]``. Must be float16/bfloat16.
-        k (torch.Tensor):
-            Current key of shape ``[B, 1, H, K]``. Must be float16/bfloat16.
-        v (torch.Tensor):
-            Current value of shape ``[B, 1, HV, V]``. Must be float16/bfloat16.
-        initial_state (torch.Tensor):
-            State pool of shape ``[pool_size, HV, V, K]`` (K-last / V-major layout).
-            Must be float32. Will be updated in-place at the indexed positions.
-        initial_state_indices (torch.Tensor):
-            Indices mapping each batch element to its pool slot, shape ``[B]``.
-            Must be int32. Negative indices are treated as padding (skipped).
-        A_log (torch.Tensor):
-            Log decay parameter of shape ``[HV]``. Must be float32.
-        a (torch.Tensor):
-            Input-dependent decay of shape ``[B, 1, HV]``. Must be float16/bfloat16.
-        dt_bias (torch.Tensor):
-            Decay bias of shape ``[HV]``. Must be bfloat16 or float32.
-        b (torch.Tensor):
-            Update gate (beta) input of shape ``[B, 1, HV]``. Must be float16/bfloat16.
-        scale (Optional[float]):
-            Scale factor for queries. If None, defaults to ``1 / sqrt(K)``.
-        output (Optional[torch.Tensor]):
-            Pre-allocated output tensor of shape ``[B, 1, HV, V]``.
-            If None, will be allocated automatically.
-        use_qk_l2norm (bool):
-            Whether to apply L2 normalization to q and k. Default: ``True``.
-
-    Returns:
-        Tuple[torch.Tensor, torch.Tensor]:
-            - output: Output tensor of shape ``[B, 1, HV, V]``
-            - initial_state: The same state pool tensor (updated in-place)
-
-    Note:
-        - Requires SM90 (Hopper) architecture
-        - State is updated in-place at positions given by initial_state_indices
-        - K and V must be multiples of 4 for vectorized loads
-        - State layout is V-major: [pool_size, HV, V, K]
-        - Unlike ``gated_delta_rule_decode_pretranspose``, no gather/scatter needed
-    """
-    # Validate input shapes
-    B, T, H, K = q.shape
-    assert T == 1, f"Decode only supports T=1, got T={T}"
-    _, _, HV, V = v.shape
-    pool_size = initial_state.shape[0]
-
-    # Validate state shape
-    assert initial_state.shape == (pool_size, HV, V, K), (
-        f"Expected initial_state shape [pool_size={pool_size}, HV={HV}, V={V}, K={K}], got {initial_state.shape}"
-    )
-
-    # Validate indices
-    assert initial_state_indices.shape == (B,), (
-        f"Expected initial_state_indices shape [{B}], got {initial_state_indices.shape}"
-    )
-    assert initial_state_indices.dtype == torch.int32, (
-        f"initial_state_indices must be int32, got {initial_state_indices.dtype}"
-    )
-
-    # Validate K and V constraints
-    assert K >= 128, f"K must be at least 128, got K={K}"
-    assert V >= 128, f"V must be at least 128, got V={V}"
-    assert V % TILE_V == 0, (
-        f"V must be divisible by {TILE_V} to prevent out-of-bounds access, got V={V}"
-    )
-
-    # Validate dtypes
-    assert q.dtype in (torch.float16, torch.bfloat16), (
-        f"q must be float16/bfloat16, got {q.dtype}"
-    )
-    assert initial_state.dtype == torch.float32, (
-        f"initial_state must be float32, got {initial_state.dtype}"
-    )
-    assert A_log.dtype == torch.float32, f"A_log must be float32, got {A_log.dtype}"
-
-    # Set default scale
-    if scale is None:
-        scale = K**-0.5
-
-    # Allocate output if not provided
-    output_provided = output is not None
-    target_dtype = output.dtype if output_provided else q.dtype
-
-    if output is None:
-        output = torch.zeros((B, T, HV, V), dtype=torch.bfloat16, device=q.device)
-
-    # Reshape state pool from [pool_size, HV, V, K] to [pool_size*HV, V, K]
-    h0_source = initial_state.reshape(pool_size * HV, V, K)
-
-    # Compile kernel with TVM FFI (cached, separate cache from non-pooled version)
-    cache_key = (B, T, H, HV, K, V, pool_size, q.dtype, scale, use_qk_l2norm)
-    cache = _get_compiled_decode_kernel_pooled(*cache_key)
-
-    # Get or create cu_seqlens (cached per config)
-    if "cu_seqlens" not in cache or cache["cu_seqlens"].device != q.device:
-        cache["cu_seqlens"] = torch.zeros(B + 1, dtype=torch.int32, device=q.device)
-    cu_seqlens = cache["cu_seqlens"]
-
-    if "compiled" not in cache:
-        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-
-        # Convert tensors to CuTe format for compilation only
-        h0_source_tensor = from_dlpack(h0_source, assumed_align=16)
-        A_log_tensor = from_dlpack(A_log, assumed_align=16)
-        a_tensor = from_dlpack(a, assumed_align=16)
-        dt_bias_tensor = from_dlpack(dt_bias, assumed_align=16)
-        q_tensor = from_dlpack(q, assumed_align=16)
-        k_tensor = from_dlpack(k, assumed_align=16)
-        v_tensor = from_dlpack(v, assumed_align=16)
-        b_tensor = from_dlpack(b, assumed_align=16)
-        o_tensor = from_dlpack(output, assumed_align=16)
-        h0_indices_tensor = from_dlpack(initial_state_indices, assumed_align=16)
-        cu_seqlens_tensor = from_dlpack(cu_seqlens, assumed_align=16)
-
-        # Choose kernel based on batch size
-        if B <= 32:
-            run_func = run_gdn_decode_kernel_small_batch_pretranspose
-        else:
-            run_func = run_gdn_decode_kernel_big_batch_pretranspose
-
-        # Use TVM FFI to reduce runtime overhead
-        compiled = cute.compile(
-            run_func,
-            h0_source_tensor,
-            A_log_tensor,
-            a_tensor,
-            dt_bias_tensor,
-            q_tensor,
-            k_tensor,
-            v_tensor,
-            b_tensor,
-            o_tensor,
-            h0_indices_tensor,
-            cu_seqlens_tensor,
-            softplus_beta=1.0,
-            softplus_threshold=20.0,
-            scale=scale,
-            HV=HV,
-            B=B,
-            T=T,
-            H=H,
-            K=K,
-            V=V,
-            use_initial_state=True,
-            use_qk_l2norm=use_qk_l2norm,
-            is_varlen=False,
-            use_pool_indexing=True,
-            stream=stream,
-            options="--enable-tvm-ffi",
-        )
-        cache["compiled"] = compiled
-    else:
-        compiled = cache["compiled"]
-
-    # Run kernel directly with PyTorch tensors (no from_dlpack needed)
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    cache["compiled"](
-        h0_source,
-        A_log,
-        a,
-        dt_bias,
-        q,
-        k,
-        v,
-        b,
-        output,
-        initial_state_indices,
-        cu_seqlens,
-        stream,
-    )
-
-    # State is updated in-place via pool indexing — no copy needed
-
-    # Convert output to target dtype if needed (kernel outputs bfloat16)
-    if output.dtype != target_dtype:
-        output = output.to(target_dtype)
-
-    return output, initial_state
-
-
-# ============================================================================
-# NONTRANSPOSE Version Kernels - K-major layout [pool, HV, K, V]
-# ============================================================================
 
 
 @cute.kernel
