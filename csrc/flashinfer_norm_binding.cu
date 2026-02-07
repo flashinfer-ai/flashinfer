@@ -17,14 +17,14 @@
 
 void rmsnorm(TensorView out, TensorView input, TensorView weight, double eps, bool enable_pdl);
 
-void rmsnorm_quant(TensorView out, TensorView input, TensorView weight, double scale, double eps,
-                   bool enable_pdl);
+void rmsnorm_quant(TensorView out, TensorView input, TensorView weight, TensorView scale,
+                   double eps, bool enable_pdl);
 
 void fused_add_rmsnorm(TensorView input, TensorView residual, TensorView weight, double eps,
                        bool enable_pdl);
 
 void fused_add_rmsnorm_quant(TensorView output, TensorView input, TensorView residual,
-                             TensorView weight, double scale, double eps, bool enable_pdl);
+                             TensorView weight, TensorView scale, double eps, bool enable_pdl);
 
 void gemma_rmsnorm(TensorView out, TensorView input, TensorView weight, double eps,
                    bool enable_pdl);

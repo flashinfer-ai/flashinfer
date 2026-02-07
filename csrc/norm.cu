@@ -77,13 +77,15 @@ void rmsnorm(TensorView output, TensorView input, TensorView weight, double eps,
   }
 }
 
-void rmsnorm_quant(TensorView output, TensorView input, TensorView weight, double scale, double eps,
-                   bool enable_pdl) {
+void rmsnorm_quant(TensorView output, TensorView input, TensorView weight, TensorView scale,
+                   double eps, bool enable_pdl) {
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(output);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(weight);
   CHECK_DEVICE(input, weight);
+  CHECK_DEVICE(input, scale);
   CHECK_DIM(1, weight);  // weight: (hidden_size)
+  TVM_FFI_ICHECK_EQ(scale.numel(), 1);
 
   auto input_ndim = input.ndim();
   if (input_ndim == 2) {
@@ -103,7 +105,7 @@ void rmsnorm_quant(TensorView output, TensorView input, TensorView weight, doubl
         cudaError_t status = norm::RMSNormQuant(
             static_cast<c_type*>(input.data_ptr()), static_cast<c_type*>(weight.data_ptr()),
             static_cast<o_type*>(output.data_ptr()), batch_size, hidden_size, input.stride(0),
-            output.stride(0), static_cast<float>(scale), eps, enable_pdl, stream);
+            output.stride(0), static_cast<float*>(scale.data_ptr()), eps, enable_pdl, stream);
         TVM_FFI_ICHECK(status == cudaSuccess)
             << "RMSNormQuant failed with error code " << cudaGetErrorString(status);
         return true;
@@ -145,7 +147,7 @@ void fused_add_rmsnorm(TensorView input, TensorView residual, TensorView weight,
 }
 
 void fused_add_rmsnorm_quant(TensorView output, TensorView input, TensorView residual,
-                             TensorView weight, double scale, double eps, bool enable_pdl) {
+                             TensorView weight, TensorView scale, double eps, bool enable_pdl) {
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(residual);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(weight);
@@ -153,6 +155,7 @@ void fused_add_rmsnorm_quant(TensorView output, TensorView input, TensorView res
   CHECK_DEVICE(input, residual);
   CHECK_DEVICE(input, weight);
   CHECK_DEVICE(input, output);
+  CHECK_DEVICE(input, scale);
   CHECK_DIM(2, input);     // input: (batch_size, hidden_size)
   CHECK_DIM(2, residual);  // residual: (batch_size, hidden_size)
   CHECK_DIM(1, weight);    // weight: (hidden_size)
@@ -162,6 +165,7 @@ void fused_add_rmsnorm_quant(TensorView output, TensorView input, TensorView res
   TVM_FFI_ICHECK_EQ(residual.size(0), batch_size);
   TVM_FFI_ICHECK_EQ(residual.size(1), hidden_size);
   TVM_FFI_ICHECK_EQ(weight.size(0), hidden_size);
+  TVM_FFI_ICHECK_EQ(scale.numel(), 1);
   ffi::CUDADeviceGuard device_guard(input.device().device_id);
   const cudaStream_t stream = get_stream(input.device());
 
@@ -170,8 +174,8 @@ void fused_add_rmsnorm_quant(TensorView output, TensorView input, TensorView res
       cudaError_t status = norm::FusedAddRMSNormQuant(
           static_cast<c_type*>(input.data_ptr()), static_cast<c_type*>(residual.data_ptr()),
           static_cast<c_type*>(weight.data_ptr()), static_cast<o_type*>(output.data_ptr()),
-          batch_size, hidden_size, input.stride(0), residual.stride(0), output.stride(0), scale,
-          eps, enable_pdl, stream);
+          batch_size, hidden_size, input.stride(0), residual.stride(0), output.stride(0),
+          static_cast<float*>(scale.data_ptr()), eps, enable_pdl, stream);
 
       TVM_FFI_ICHECK(status == cudaSuccess)
           << "FusedAddRMSNormQuant failed with error code " << cudaGetErrorString(status);

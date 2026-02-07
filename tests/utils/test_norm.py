@@ -149,7 +149,9 @@ def test_norm_quant(
 
     y_ref = llama_rms_norm_quant(x, w, quant_scale)
     y = torch.empty_like(x, dtype=torch.float8_e4m3fn, device="cuda")
-    flashinfer.norm.rmsnorm_quant(y, x, w, quant_scale, enable_pdl=enable_pdl)
+    flashinfer.norm.rmsnorm_quant(
+        y, x, w, torch.tensor(quant_scale, device="cuda"), enable_pdl=enable_pdl
+    )
 
     torch.testing.assert_close(y_ref.float(), y.float(), rtol=1, atol=1)
 
@@ -250,7 +252,13 @@ def test_fused_add_rmsnorm_quant(
     residual_fused = residual.clone()
     y = torch.empty_like(x, dtype=torch.float8_e4m3fn, device="cuda")
     flashinfer.norm.fused_add_rmsnorm_quant(
-        y, x_fused, residual_fused, weight, quant_scale, eps, enable_pdl=enable_pdl
+        y,
+        x_fused,
+        residual_fused,
+        weight,
+        torch.tensor(quant_scale, device="cuda"),
+        eps,
+        enable_pdl=enable_pdl,
     )
 
     torch.testing.assert_close(y.float(), x_native.float(), rtol=1, atol=1)
