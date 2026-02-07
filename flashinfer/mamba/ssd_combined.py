@@ -283,22 +283,13 @@ class _SSDKernel:
             d_tensor = None
 
         if self.has_init_states and init_states is not None:
-            # init_states: (batch, nheads, headdim, dstate) -> (headdim, dstate, nheads, batch)
-            # Kernel expects: (D, N, EH, B) = (headdim, dstate, nheads, batch)
-            # init_states_reshaped = init_states.permute(2, 3, 1, 0)
-            # init_states_tensor, init_states_dst = _create_cutlass_tensor(
-            #     [batch, nheads, headdim, dstate],
-            #     [2, 3, 1, 0],
-            #     self.io_dtype,
-            #     [2, 3],
-            #     cutlass_torch,
-            #     from_dlpack,
-            # )
+
             # init_states_dst.copy_(init_states_reshaped.to(init_states_dst.dtype))
             assert init_states.dtype == cutlass_torch.dtype(self.io_dtype), (
                 f"init_states dtype {init_states.dtype} doesn't match cumsum_dtype {self.io_dtype}"
             )
-            init_states_reshaped = init_states.permute(3, 2, 1, 0) # (N, D, EH, B)
+            # B, EH, D, N -> D, N, EH, B - zero-copy view
+            init_states_reshaped = init_states.permute(3, 2, 1, 0)
             init_states_tensor = from_dlpack(init_states_reshaped, assumed_align=16)
             for mode in [2, 3]:  # EH and B are dynamic
                 init_states_tensor = init_states_tensor.mark_compact_shape_dynamic(
@@ -321,7 +312,7 @@ class _SSDKernel:
         # fstate: (headdim, dstate, nheads, batch)
         fstate_tensor, fstate_cutlass = _create_cutlass_tensor(
             [batch, nheads, headdim, dstate],
-            [2, 3, 1, 0],
+            [3, 2, 1, 0],
             self.io_dtype,
             [2, 3],
             cutlass_torch,
@@ -372,10 +363,8 @@ class _SSDKernel:
         y_permuted = y_cutlass.permute(4, 2, 0, 3, 1)
         y_out = y_permuted.reshape(batch, seqlen, nheads, headdim)
 
-        # fstate_cutlass is (D, N, EH, B)
-        # We need (batch, nheads, headdim, dstate)
-        # Permute (D, N, EH, B) -> (B, EH, D, N)
-        fstate_out = fstate_cutlass.permute(3, 2, 0, 1).contiguous()
+        # return to torch indexing
+        fstate_out = fstate_cutlass.permute(3, 2, 1, 0)
 
         return y_out, fstate_out
 

@@ -258,10 +258,16 @@ class SSDKernel:
         )
 
         # P is ACC operand (from tmem) of INTER1_MMA, to be TMA stored by PRE_INTER
+        # self.p_smem_layout_store = sm100_utils.make_smem_layout_epi(
+        #     self.io_dtype,
+        #     utils.LayoutEnum.ROW_MAJOR,
+        #     self.tile_shape_mnk_inter2[1:],
+        #     self.internal_stages,
+        # )
         self.p_smem_layout_store = sm100_utils.make_smem_layout_epi(
             self.io_dtype,
-            utils.LayoutEnum.ROW_MAJOR,
-            self.tile_shape_mnk_inter2[1:],
+            utils.LayoutEnum.COL_MAJOR,
+            (self.tile_shape_mnk_inter2[2], self.tile_shape_mnk_inter2[1]),
             self.internal_stages,
         )
 
@@ -1700,7 +1706,7 @@ class SSDKernel:
                 tma_atom_p,
                 tma_tensor_p,
                 smem_p_store,
-                self.tile_shape_mnk_inter2[1:],
+                (self.tile_shape_mnk_inter2[2], self.tile_shape_mnk_inter2[1]),  # (N, D) to match gmem
             )
 
             # Pipeline B/Delta/INTER1_ACC consumer state
@@ -1731,7 +1737,7 @@ class SSDKernel:
             tma_p_pipeline = pipeline.PipelineTmaStore.create(
                 num_stages=self.internal_stages,
                 producer_group=pipeline.CooperativeGroup(
-                    pipeline.Agent.Thread, 32 * len(self.pre_inter_warp_id), 128
+                    pipeline.Agent.Thread, 32 * len(self.pre_inter_warp_id)
                 ),
             )
 
@@ -2266,7 +2272,7 @@ class SSDKernel:
             tma_y_pipeline = pipeline.PipelineTmaStore.create(
                 num_stages=self.output_stages,
                 producer_group=pipeline.CooperativeGroup(
-                    pipeline.Agent.Thread, 32 * len(self.epilog_warp_id), 128
+                    pipeline.Agent.Thread, 32 * len(self.epilog_warp_id)
                 ),
             )
 
@@ -2735,7 +2741,7 @@ class SSDKernel:
                 len([self.mma_intra_warp_id, self.mma_inter_warp_id]),
             )
             x_consumer_group_async = pipeline.CooperativeGroup(
-                pipeline.Agent.Thread, 32 * len(self.epilog_warp_id), 128
+                pipeline.Agent.Thread, 32 * len(self.epilog_warp_id)
             )
             return pipeline.PipelineTmaMultiConsumersAsync.create(
                 num_stages=self.input_stages,
@@ -2754,7 +2760,7 @@ class SSDKernel:
             pipeline.Agent.Thread, len([self.mma_intra_warp_id])
         )
         b_consumer_group_async = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, 32 * len(self.pre_inter_warp_id), 128
+            pipeline.Agent.Thread, 32 * len(self.pre_inter_warp_id)
         )
         return pipeline.PipelineTmaMultiConsumersAsync.create(
             num_stages=self.input_stages,
@@ -2789,9 +2795,6 @@ class SSDKernel:
             len(
                 [*self.pre_inter_warp_id, *self.pre_intra_warp_id, *self.epilog_warp_id]
             ),
-            len(
-                [*self.pre_inter_warp_id, *self.pre_intra_warp_id, *self.epilog_warp_id]
-            ),
         )
 
         return pipeline.PipelineTmaAsync.create(
@@ -2809,7 +2812,6 @@ class SSDKernel:
             )
             init_states_consumer_group = pipeline.CooperativeGroup(
                 pipeline.Agent.Thread,
-                len(self.pre_inter_warp_id),
                 len(self.pre_inter_warp_id),
             )
             return pipeline.PipelineTmaAsync.create(
@@ -2832,7 +2834,6 @@ class SSDKernel:
             d_consumer_group = pipeline.CooperativeGroup(
                 pipeline.Agent.Thread,
                 len(self.epilog_warp_id),
-                len(self.epilog_warp_id),
             )
 
             return pipeline.PipelineTmaAsync.create(
@@ -2848,7 +2849,7 @@ class SSDKernel:
             pipeline.Agent.Thread, len([self.mma_intra_warp_id])
         )
         intra1_acc_consumer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, 32 * len(self.pre_intra_warp_id), 128
+            pipeline.Agent.Thread, 32 * len(self.pre_intra_warp_id)
         )
         return pipeline.PipelineUmmaAsync.create(
             num_stages=self.intra1_acc_stages,
@@ -2859,7 +2860,7 @@ class SSDKernel:
 
     def make_and_init_intra2_q_pipeline(self, intra2_q_full_mbar_ptr):
         intra2_q_producer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, 32 * len(self.pre_intra_warp_id), 128
+            pipeline.Agent.Thread, 32 * len(self.pre_intra_warp_id)
         )
         intra2_q_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, len([self.mma_intra_warp_id])
@@ -2876,7 +2877,7 @@ class SSDKernel:
             pipeline.Agent.Thread, len([self.mma_intra_warp_id])
         )
         intra2_acc_consumer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, 32 * len(self.epilog_warp_id), 128
+            pipeline.Agent.Thread, 32 * len(self.epilog_warp_id)
         )
         return pipeline.PipelineUmmaAsync.create(
             num_stages=self.internal_stages,
@@ -2887,7 +2888,7 @@ class SSDKernel:
 
     def make_and_init_inter1_b_pipeline(self, inter1_b_full_mbar_ptr):
         inter1_b_producer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, 32 * len(self.pre_inter_warp_id), 128
+            pipeline.Agent.Thread, 32 * len(self.pre_inter_warp_id)
         )
         inter1_b_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, len([self.mma_inter_warp_id])
@@ -2904,7 +2905,7 @@ class SSDKernel:
             pipeline.Agent.Thread, len([self.mma_inter_warp_id])
         )
         inter1_acc_consumer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, 32 * len(self.pre_inter_warp_id), 128
+            pipeline.Agent.Thread, 32 * len(self.pre_inter_warp_id)
         )
         return pipeline.PipelineUmmaAsync.create(
             num_stages=self.internal_stages,
@@ -2915,7 +2916,7 @@ class SSDKernel:
 
     def make_and_init_inter2_p_pipeline(self, inter2_p_full_mbar_ptr):
         inter2_p_producer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, 32 * len(self.pre_inter_warp_id), 128
+            pipeline.Agent.Thread, 32 * len(self.pre_inter_warp_id)
         )
         inter2_p_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, len([self.mma_inter_warp_id])
@@ -2932,7 +2933,7 @@ class SSDKernel:
             pipeline.Agent.Thread, len([self.mma_inter_warp_id])
         )
         inter2_acc_consumer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, 32 * len(self.epilog_warp_id), 128
+            pipeline.Agent.Thread, 32 * len(self.epilog_warp_id)
         )
         return pipeline.PipelineUmmaAsync.create(
             num_stages=self.internal_stages,
