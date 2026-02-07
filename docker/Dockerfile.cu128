@@ -29,3 +29,9 @@ RUN bash /install/install_python_packages.sh cu128
 
 # Install mpi4py in the conda environment
 RUN conda install -n py312 -y mpi4py mpich
+
+# Configure pip for user-site installations (allows arbitrary users to install packages)
+# This enables 'pip install --user' and 'pip install -e .' to work for any user
+RUN mkdir -p /opt/pip-user && chmod 1777 /opt/pip-user
+ENV PYTHONUSERBASE=/opt/pip-user
+ENV PATH="/opt/pip-user/bin:$PATH"
