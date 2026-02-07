@@ -737,7 +737,7 @@ def run_gdn_decode_kernel_small_batch_pretranspose(
 ):
     """Launch original pipelined kernel for small batch pretranspose."""
     # h0_source: (B*HV, V, K) or (pool_size*HV, V, K) when use_pool_indexing=True
-    batch_size, v_dim, k_dim = (
+    _, v_dim, k_dim = (
         h0_source.layout.shape[0],
         h0_source.layout.shape[1],
         h0_source.layout.shape[2],
@@ -760,7 +760,6 @@ def run_gdn_decode_kernel_small_batch_pretranspose(
     tiled_copy_load = cute.make_tiled_copy_tv(copy_atom, thread_layout, val_layout)
 
     num_v_tiles = cute.ceil_div(v_dim, TILE_V)
-    v_dim * k_dim * batch_size * 4 / 1024 / 1024
 
     vec_size = (
         TILE_K // 32
@@ -845,7 +844,7 @@ def run_gdn_decode_kernel_big_batch_pretranspose(
     stream: cuda.CUstream = None,
 ):
     # h0_source: (B*HV, V, K) or (pool_size*HV, V, K) when use_pool_indexing=True
-    batch_size, v_dim, k_dim = (
+    _, v_dim, k_dim = (
         h0_source.layout.shape[0],
         h0_source.layout.shape[1],
         h0_source.layout.shape[2],
@@ -868,17 +867,10 @@ def run_gdn_decode_kernel_big_batch_pretranspose(
     tiled_copy_load = cute.make_tiled_copy_tv(copy_atom, thread_layout, val_layout)
 
     num_v_tiles = cute.ceil_div(v_dim, TILE_V)
-    v_dim * k_dim * batch_size * 4 / 1024 / 1024
 
     vec_size = (
         TILE_K // 32
     )  # Each thread in a warp processes this many elements (always 4 for TILE_K=128)
-
-    # print(f"Batched CP.ASYNC Load + Store (bypass L1 cache)")
-    # print(f"  {batch_size} batches x {v_dim}x{k_dim} matrices")
-    # print(f"  Tile: {TILE_V}x{TILE_K}, {num_v_tiles} tiles/batch")
-    # print(f"  Threads: {NUM_THREADS} ({NUM_THREADS // 32} warps), vec_size: {vec_size}")
-    # print(f"  Total: {total_data_mb:.1f} MB\n")
 
     # Create SMEM layout
     smem_layout_staged = cute.make_layout(
