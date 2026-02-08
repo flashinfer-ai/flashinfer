@@ -8,7 +8,7 @@ name: PR Test
 on:
   push:
     branches: [main]
-  pull_request_target:
+  pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
@@ -47,7 +47,7 @@ jobs:
           GH_TOKEN: ${{ secrets.FLASHINFER_GITHUB_TOKEN }}
         run: |
           # Always allow push to main and workflow_dispatch
-          if [[ "${{ github.event_name }}" != "pull_request_target" ]]; then
+          if [[ "${{ github.event_name }}" != "pull_request" ]]; then
             echo "authorized=true" >> "$GITHUB_OUTPUT"
             echo "Not a PR, authorized"
             exit 0
@@ -113,14 +113,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # For pull_request_target, checkout PR head (not base branch)
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
 
       - name: Get HEAD SHA
         id: get-sha
         run: |
-          if [ "${{ github.event_name }}" == "pull_request_target" ]; then
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
             echo "sha=${{ github.event.pull_request.head.sha }}" >> $GITHUB_OUTPUT
           else
             echo "sha=${{ github.sha }}" >> $GITHUB_OUTPUT
@@ -140,7 +139,7 @@ jobs:
       - name: Check Skip Conditions
         id: check
         run: |
-          if [ "${{ github.event_name }}" != "pull_request_target" ]; then
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
             echo "skip=false" >> $GITHUB_OUTPUT
             exit 0
           fi
@@ -187,7 +186,7 @@ jobs:
 
       - name: Create Check Runs (PR only)
         id: create-checks
-        if: github.event_name == 'pull_request_target' && env.HAS_SECRETS == 'true'
+        if: github.event_name == 'pull_request' && env.HAS_SECRETS == 'true'
         env:
           GH_TOKEN: ${{ steps.flashinfer-token.outputs.token }}
         run: |
@@ -265,7 +264,7 @@ jobs:
   report-unauthorized:
     name: Report Unauthorized
     needs: gate
-    if: github.event_name == 'pull_request_target' && needs.gate.outputs.authorized != 'true'
+    if: github.event_name == 'pull_request' && needs.gate.outputs.authorized != 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Post Comment
