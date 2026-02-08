@@ -8,7 +8,7 @@ name: PR Test
 on:
   push:
     branches: [main]
-  pull_request:
+  pull_request_target:
     branches: [main]
     types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
@@ -23,7 +23,7 @@ on:
         default: false
 
 concurrency:
-  group: pr-test-${{ github.ref }}
+  group: pr-test-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -47,7 +47,7 @@ jobs:
           GH_TOKEN: ${{ secrets.FLASHINFER_GITHUB_TOKEN }}
         run: |
           # Always allow push to main and workflow_dispatch
-          if [[ "${{ github.event_name }}" != "pull_request" ]]; then
+          if [[ "${{ github.event_name }}" != "pull_request_target" ]]; then
             echo "authorized=true" >> "$GITHUB_OUTPUT"
             echo "Not a PR, authorized"
             exit 0
@@ -113,12 +113,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          # For pull_request_target, checkout PR head (not base branch)
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
 
       - name: Get HEAD SHA
         id: get-sha
         run: |
-          if [ "${{ github.event_name }}" == "pull_request" ]; then
+          if [ "${{ github.event_name }}" == "pull_request_target" ]; then
             echo "sha=${{ github.event.pull_request.head.sha }}" >> $GITHUB_OUTPUT
           else
             echo "sha=${{ github.sha }}" >> $GITHUB_OUTPUT
@@ -138,7 +140,7 @@ jobs:
       - name: Check Skip Conditions
         id: check
         run: |
-          if [ "${{ github.event_name }}" != "pull_request" ]; then
+          if [ "${{ github.event_name }}" != "pull_request_target" ]; then
             echo "skip=false" >> $GITHUB_OUTPUT
             exit 0
           fi
@@ -170,9 +172,12 @@ jobs:
       needs.gate.outputs.authorized == 'true' &&
       needs.setup.outputs.skip_build != 'true'
     runs-on: ubuntu-latest
+    env:
+      HAS_SECRETS: ${{ secrets.GH_APP_ID != '' }}
     steps:
       - name: Generate Token (flashinfer)
         id: flashinfer-token
+        if: env.HAS_SECRETS == 'true'
         uses: actions/create-github-app-token@v1
         with:
           app-id: ${{ secrets.GH_APP_ID }}
@@ -180,24 +185,15 @@ jobs:
           owner: flashinfer-ai
           repositories: flashinfer
 
-      - name: Generate Token (ci-infra)
-        id: ci-infra-token
-        uses: actions/create-github-app-token@v1
-        with:
-          app-id: ${{ secrets.GH_APP_ID }}
-          private-key: ${{ secrets.GH_APP_KEY }}
-          owner: flashinfer-ai
-          repositories: ci-infra
-
       - name: Create Check Runs (PR only)
         id: create-checks
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request_target' && env.HAS_SECRETS == 'true'
         env:
           GH_TOKEN: ${{ steps.flashinfer-token.outputs.token }}
         run: |
           SHA="${{ needs.setup.outputs.head_sha }}"
           REPO="${{ github.repository }}"
-          RUNNER_URL="https://github.com/flashinfer-ai/ci-infra/actions/workflows/pr-test-runner.yml"
+          RUNNER_URL="${{ github.server_url }}/${{ github.repository }}/actions/workflows/pr-test-runner.yml"
 
           if [ "${{ github.event.inputs.skip_aot }}" != "true" ]; then
             AOT_CHECK=$(gh api repos/$REPO/check-runs \
@@ -241,8 +237,7 @@ jobs:
 
       - name: Trigger Test Runner
         env:
-          GH_ACTION_TOKEN: ${{ github.token }}
-          CI_INFRA_TOKEN: ${{ steps.ci-infra-token.outputs.token }}
+          GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ needs.setup.outputs.head_sha }}
           DOCKER_TAG: ${{ needs.setup.outputs.docker_tag }}
           AOT_CHECK_ID: ${{ steps.create-checks.outputs.aot_check_id || '' }}
@@ -251,13 +246,10 @@ jobs:
           SUMMARY_CHECK_ID: ${{ steps.create-checks.outputs.summary_check_id || '' }}
           SKIP_AOT: ${{ github.event.inputs.skip_aot || 'false' }}
           SKIP_GPU: ${{ github.event.inputs.skip_gpu || 'false' }}
-          CONCURRENCY_KEY: pr-test-${{ github.ref }}
-          DISPATCH_REF: ${{ github.head_ref || github.ref_name }}
+          CONCURRENCY_KEY: pr-test-${{ github.event.pull_request.number || github.ref }}
+          DISPATCH_REF: ${{ (github.event.pull_request.head.repo.full_name == github.repository && github.head_ref) || github.ref_name }}
         run: |
-          # Try workflow_dispatch first (works after pr-test-runner.yml is on main)
-          # Uses GITHUB_TOKEN (has actions:write) - App token doesn't have Actions permission
-          # --ref uses PR branch (to test PR changes to runner) or main (for push)
-          if GH_TOKEN="$GH_ACTION_TOKEN" gh workflow run pr-test-runner.yml \
+          gh workflow run pr-test-runner.yml \
             --repo "${{ github.repository }}" \
             --ref "$DISPATCH_REF" \
             -f pr_head_sha="$HEAD_SHA" \
@@ -268,28 +260,12 @@ jobs:
             -f summary_check_id="$SUMMARY_CHECK_ID" \
             -f skip_aot="$SKIP_AOT" \
             -f skip_gpu="$SKIP_GPU" \
-            -f concurrency_key="$CONCURRENCY_KEY" 2>/dev/null; then
-            echo "Triggered via workflow_dispatch (flashinfer)"
-          else
-            # Fallback: repository_dispatch to ci-infra (bootstrap)
-            GH_TOKEN="$CI_INFRA_TOKEN" gh api repos/flashinfer-ai/ci-infra/dispatches \
-              -f event_type="run-pr-test" \
-              -f client_payload[pr_head_sha]="$HEAD_SHA" \
-              -f client_payload[docker_tag]="$DOCKER_TAG" \
-              -f client_payload[aot_check_id]="$AOT_CHECK_ID" \
-              -f client_payload[gpu_a10g_check_id]="$GPU_A10G_CHECK_ID" \
-              -f client_payload[gpu_t4_check_id]="$GPU_T4_CHECK_ID" \
-              -f client_payload[summary_check_id]="$SUMMARY_CHECK_ID" \
-              -f client_payload[skip_aot]="$SKIP_AOT" \
-              -f client_payload[skip_gpu]="$SKIP_GPU" \
-              -f client_payload[concurrency_key]="$CONCURRENCY_KEY"
-            echo "Triggered via repository_dispatch (ci-infra bootstrap)"
-          fi
+            -f concurrency_key="$CONCURRENCY_KEY"
 
   report-unauthorized:
     name: Report Unauthorized
     needs: gate
-    if: github.event_name == 'pull_request' && needs.gate.outputs.authorized != 'true'
+    if: github.event_name == 'pull_request_target' && needs.gate.outputs.authorized != 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Post Comment
