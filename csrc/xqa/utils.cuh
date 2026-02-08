@@ -752,6 +752,7 @@ __device__ inline Vec<uint32_t, 2> convertKCacheWordToF16(uint32_t i8data) {
   return ret;
 }
 
+#if ENABLE_4BIT_KV_CACHE
 template <>
 __device__ inline Vec<uint32_t, 2> convertKCacheWordToF16<half, __nv_fp4_e2m1>(uint32_t i8data) {
   Vec<uint32_t, 2> ret;
@@ -816,6 +817,7 @@ __device__ inline Vec<uint32_t, 2> convertKCacheWordToF16<__nv_bfloat16, __nv_fp
 #endif
   return ret;
 }
+#endif
 
 template <typename InputElem, typename CacheElem>
 __device__ inline Vec<uint32_t, 2> convertVCacheWordToF16(uint32_t i8data) {
