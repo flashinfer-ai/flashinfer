@@ -23,7 +23,6 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
     - `gemm_fp8_nt_groupwise` - GEMM with FP8 data types using groupwise scaling.
     - `group_gemm_fp8_nt_groupwise` - Group GEMM with FP8 data types using groupwise scaling.
     - `bmm_fp8` - Batched matrix multiplication with FP8 inputs.
-    - `bmm_mxfp8` - Batched matrix multiplication with MxFP8 inputs (Blackwell SM10.0+).
     - `mm_fp4` - Matrix multiplication with NVFP4 inputs.
     - `mm_bf16` - Matrix multiplication with BF16 inputs (Blackwell SM10.0+).
     - `bmm_bf16` - Batched matrix multiplication with BF16 inputs (Blackwell SM10.0+).
@@ -223,8 +222,8 @@ The output CSV will contain detailed metrics including:
 | `--use_128x4_sf_layout`  | Use 128x4 scale/format layout for FP4 GEMM (for `mm_fp4` routine)                                          |
 | `--use_nvfp4`            | Whether to use nvfp4 quantization or mxfp4 quantization, defaults to False.(for `mm_fp4` routine)          |
 | `--autotune`             | Enable autotune for supported operation (`mm_fp4`, `bmm_fp8`, `mm_bf16`, `bmm_bf16` routines)              |
-| `--bias`                 | Use bias for `mm_bf16` (TGV backend only)                                                                  |
-| `--pdl`                  | Use persistent data loader mode for `mm_bf16` (TGV backend only)                                           |
+| `--bias`                 | Use bias for `mm_bf16` (Enabled for TGV backend)                                                           |
+| `--pdl`                  | Use persistent data loader mode for `mm_bf16` (Enabled for TGV backend)                                    |
 
 ### MOE Flags
 | Flag                     | Description                                                                                                 |
@@ -459,7 +458,7 @@ Backend Legend:
 - cudnn: cuDNN (via wrapper API)
 - cudnn-native: cuDNN (direct API call)
 - cutlass: CUTLASS
-- tgv: TGV (Tensor Giga-Vectors) BF16 GEMM kernels (Blackwell SM10.0+)
+- tgv: TGV
 - trtllm: TensorRT-LLM
 - trtllm-gen: TensorRT-LLM
 - trtllm-native: TensorRT-LLM (out-of-wrapper)

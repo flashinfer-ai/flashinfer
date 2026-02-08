@@ -1493,7 +1493,7 @@ def testMmBf16(args):
         )
 
     ## Parse input arguments
-    backends = list(args.backends)  # Make a copy to avoid modifying original
+    backends = args.backends
     m = args.m
     n = args.n
     k = args.k
@@ -1514,7 +1514,6 @@ def testMmBf16(args):
         raise ValueError(
             f"Unsupported output dtype: {args.out_dtype}. Supported dtypes are bfloat16 and float16."
         )
-    ## Done parsing input arguments
 
     # Filter backends based on TGV-specific features
     if use_bias or use_pdl:
@@ -1702,7 +1701,7 @@ def testBmmBf16(args):
         )
 
     ## Parse input arguments
-    backends = list(args.backends)  # Make a copy to avoid modifying original
+    backends = args.backends
     batch_size = args.batch_size
     m = args.m
     n = args.n
@@ -1722,7 +1721,6 @@ def testBmmBf16(args):
         raise ValueError(
             f"Unsupported output dtype: {args.out_dtype}. Supported dtypes are bfloat16 and float16."
         )
-    ## Done parsing input arguments
 
     ## Prepare input tensors
     # A: (batch_size, m, k), row-major
