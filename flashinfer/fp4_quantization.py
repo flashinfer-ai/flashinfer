@@ -865,7 +865,7 @@ def nvfp4_quantize(
             a_global_sf.cuda(),
             sf_vec_size,
             sf_use_ue8m0=False,
-            is_sf_swizzled_layout=True,
+            is_sf_swizzled_layout=sfLayout != SfLayout.layout_linear,
             is_sf_8x4_layout=sfLayout == SfLayout.layout_8x4,
             enable_pdl=enable_pdl,
         )

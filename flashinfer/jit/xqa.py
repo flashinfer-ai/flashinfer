@@ -54,6 +54,8 @@ def gen_xqa_module(
         flag_kv_cache_dtype = ["-DCACHE_ELEM_ENUM=2"]
     elif kv_cache_dtype == torch.int8:
         flag_kv_cache_dtype = ["-DCACHE_ELEM_ENUM=1"]
+    elif kv_cache_dtype == torch.uint8:
+        flag_kv_cache_dtype = ["-DCACHE_ELEM_ENUM=3"]
     else:
         flag_kv_cache_dtype = ["-DCACHE_ELEM_ENUM=0"]
 

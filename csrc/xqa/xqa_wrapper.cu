@@ -54,6 +54,7 @@ void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbK
                  int64_t slidingWinSize, double qScale, Optional<TensorView> qScaleTensor,
                  TensorView output, double rcpOutScale, TensorView q,
                  Optional<TensorView> attentionSinks, TensorView kCacheVLLM, TensorView vCacheVLLM,
+                 Optional<TensorView> kSfCacheVLLM, Optional<TensorView> vSfCacheVLLM,
                  TensorView kvCachePageList, int64_t maxSeqLen, TensorView seqLen,
                  int64_t batchSize, double kvCacheScale, Optional<TensorView> kvScaleTensor,
                  int64_t qSeqLen, Optional<TensorView> mask, TensorView semaphores,
@@ -84,6 +85,9 @@ void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbK
       mask.has_value() ? reinterpret_cast<MaskType const*>(mask.value().data_ptr()) : nullptr;
 #endif
 
+  void* kSfCachePtr = kSfCacheVLLM.has_value() ? kSfCacheVLLM.value().data_ptr() : nullptr;
+  void* vSfCachePtr = vSfCacheVLLM.has_value() ? vSfCacheVLLM.value().data_ptr() : nullptr;
+
   mha_func(multiProcessorCount, nbKHeads, slidingWinSize, qScale, qScalePtr,
            reinterpret_cast<OutputHead*>(output.data_ptr()),
 #if LOW_PREC_OUTPUT
@@ -92,6 +96,10 @@ void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbK
            reinterpret_cast<InputHead const*>(q.data_ptr()), attentionSinksPtr,
            reinterpret_cast<GMemCacheHead*>(kCacheVLLM.data_ptr()),
            reinterpret_cast<GMemCacheHead*>(vCacheVLLM.data_ptr()),
+#if ENABLE_4BIT_KV_CACHE
+           reinterpret_cast<GMemCacheHeadSf*>(kSfCachePtr),
+           reinterpret_cast<GMemCacheHeadSf*>(vSfCachePtr),
+#endif
            reinterpret_cast<KVCachePageIndex const*>(kvCachePageList.data_ptr()), maxSeqLen,
            reinterpret_cast<uint32_t const*>(seqLen.data_ptr()), batchSize, kvCacheScale,
            kvScalePtr,
