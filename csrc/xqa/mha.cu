@@ -983,10 +983,13 @@ __device__ inline void smemQKPartGemm(Warp const& warp, WarpAcc& acc,
   constexpr uint32_t mnEx = 2;
   static_assert(mha::is_same_v<InputElem, half> || mha::is_same_v<InputElem, __nv_bfloat16>,
                 "not implemented");
+#if !ENABLE_4BIT_KV_CACHE
   static_assert((mha::is_same_v<KElemType, half> || mha::is_same_v<KElemType, __nv_bfloat16> ||
-                 mha::is_same_v<KElemType, int8_t> || mha::is_same_v<KElemType, __nv_fp8_e4m3> ||
-                 mha::is_same_v<KElemType, __nv_fp4_e2m1>),
+                 mha::is_same_v<KElemType, int8_t> || mha::is_same_v<KElemType, __nv_fp8_e4m3>),
                 "not implemented");
+#else
+  static_assert(mha::is_same_v<KElemType, __nv_fp4_e2m1>, "not implemented");
+#endif
   constexpr uint32_t nbInstInMatPerSliceInGemmKDim = 1;
   constexpr uint32_t kElemSize = sizeof(KElemType);
   constexpr uint32_t elemsPerKHeadPart = exactDiv(kHeadPartBytes, kElemSize);
@@ -1065,9 +1068,7 @@ __device__ inline void smemQKPartGemm(Warp const& warp, WarpAcc& acc,
     auto const kSlice = [&]() -> Array2D<InstInMat<mnExK, kEx>, kSliceRows, kSliceCols> {
       if constexpr (mha::is_same_v<InputElem, KElemType>) {
         return kSliceOrig;
-      } else if constexpr ((mha::is_same_v<KElemType, int8_t> ||
-                            mha::is_same_v<KElemType, __nv_fp8_e4m3> ||
-                            mha::is_same_v<KElemType, __nv_fp4_e2m1>)) {
+      } else {
         Array2D<InstInMat<mnExK, kEx>, kSliceRows, kSliceCols> ret;
 #pragma unroll
         for (uint32_t m = 0; m < kSliceRows; m++) {
@@ -1094,9 +1095,6 @@ __device__ inline void smemQKPartGemm(Warp const& warp, WarpAcc& acc,
           }
         }
         return ret;
-      } else {
-        assert(!"not implemented");
-        trap();
       }
     }();
 // compute
@@ -1129,10 +1127,14 @@ __device__ inline void smemXVPartGemm(Warp const& warp, WarpAcc& acc, bool skipX
                                       uint32_t idxNSplit) {
   static_assert(mha::is_same_v<InputElem, half> || mha::is_same_v<InputElem, __nv_bfloat16>,
                 "not implemented");
+#if !ENABLE_4BIT_KV_CACHE
   static_assert((mha::is_same_v<VElemType, half> || mha::is_same_v<VElemType, __nv_bfloat16> ||
-                 mha::is_same_v<VElemType, int8_t> || mha::is_same_v<VElemType, __nv_fp8_e4m3> ||
-                 mha::is_same_v<VElemType, __nv_fp4_e2m1>),
+                 mha::is_same_v<VElemType, int8_t> || mha::is_same_v<VElemType, __nv_fp8_e4m3>),
                 "not implemented");
+#else
+  static_assert(mha::is_same_v<VElemType, __nv_fp4_e2m1>, "not implemented");
+#endif
+
   constexpr uint32_t kEx = 2;
   constexpr uint32_t mnEx = 2;
   constexpr uint32_t nbInstInMatPerSliceInGemmKDim = 1;
@@ -1283,9 +1285,7 @@ __device__ inline void smemXVPartGemm(Warp const& warp, WarpAcc& acc, bool skipX
     Array2D<InstInMat<mnExV, kEx>, vSliceCols, vSliceRows> const vSlice = [&]() {
       if constexpr (mha::is_same_v<InputElem, VElemType>) {
         return vSliceOrig;
-      } else if constexpr ((mha::is_same_v<VElemType, int8_t> ||
-                            mha::is_same_v<VElemType, __nv_fp8_e4m3> ||
-                            mha::is_same_v<VElemType, __nv_fp4_e2m1>)) {
+      } else {
         Array2D<InstInMat<mnExV, kEx>, vSliceCols, vSliceRows> ret;
 #pragma unroll
         for (uint32_t m = 0; m < ret.rows; m++) {
@@ -1330,9 +1330,6 @@ __device__ inline void smemXVPartGemm(Warp const& warp, WarpAcc& acc, bool skipX
           }
         }
         return ret;
-      } else {
-        assert(!"not implemented");
-        trap();
       }
     }();
 // compute
