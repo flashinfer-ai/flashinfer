@@ -526,10 +526,12 @@ def gen_trtllm_gen_gemm_module() -> JitSpec:
         cached_hash = artifact_hash_path.read_text().strip()
         if cached_hash != ArtifactPath.TRTLLM_GEN_GEMM:
             raise RuntimeError(
-                f"Cached trtllm gemm headers were downloaded for artifact "
+                f"Detected inconsistent cached artifacts. "
+                f"(Cached trtllm gemm headers were downloaded for artifact "
                 f"'{cached_hash}', but current code expects "
-                f"'{ArtifactPath.TRTLLM_GEN_GEMM}'. "
-                f"Please clear the cache: rm -rf {header_dest_dir}"
+                f"'{ArtifactPath.TRTLLM_GEN_GEMM}'). "
+                f"Please clear the cache to confirm and allow the new headers to be downloaded: "
+                f"rm -rf {header_dest_dir}."
             )
 
     for file in header_files:
@@ -728,10 +730,12 @@ def gen_trtllm_low_latency_gemm_module() -> JitSpec:
         cached_hash = artifact_hash_path.read_text().strip()
         if cached_hash != ArtifactPath.TRTLLM_GEN_GEMM:
             raise RuntimeError(
-                f"Cached trtllm gemm headers were downloaded for artifact "
+                f"Detected inconsistent cached artifacts. "
+                f"(Cached trtllm gemm headers were downloaded for artifact "
                 f"'{cached_hash}', but current code expects "
-                f"'{ArtifactPath.TRTLLM_GEN_GEMM}'. "
-                f"Please clear the cache: rm -rf {header_dest_dir}"
+                f"'{ArtifactPath.TRTLLM_GEN_GEMM}'). "
+                f"Please clear the cache to confirm and allow the new headers to be downloaded: "
+                f"rm -rf {header_dest_dir}."
             )
 
     for file in header_files:

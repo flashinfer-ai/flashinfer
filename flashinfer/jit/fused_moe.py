@@ -269,10 +269,12 @@ def gen_trtllm_gen_fused_moe_sm100_module() -> JitSpec:
         cached_hash = artifact_hash_path.read_text().strip()
         if cached_hash != ArtifactPath.TRTLLM_GEN_BMM:
             raise RuntimeError(
-                f"Cached trtllm bmm headers were downloaded for artifact "
+                f"Detected inconsistent cached artifacts. "
+                f"(Cached trtllm bmm headers were downloaded for artifact "
                 f"'{cached_hash}', but current code expects "
                 f"'{ArtifactPath.TRTLLM_GEN_BMM}'. "
-                f"Please clear the cache: rm -rf {header_dest_dir}"
+                f"Please clear the cache to confirm and allow the new headers to be downloaded: "
+                f"rm -rf {header_dest_dir}."
             )
 
     for file in header_files:
