@@ -1040,7 +1040,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 self._cached_module = self._jit_module
             else:
                 if self._backend == "auto":
-                    if q_data_type in [torch.float8_e4m3fn, torch.float8_e5m2]:
+                    if q_data_type in {torch.float8_e4m3fn, torch.float8_e5m2}:
                         self._backend = determine_attention_backend(
                             self.device,
                             PosEncodingMode[pos_encoding_mode].value,
