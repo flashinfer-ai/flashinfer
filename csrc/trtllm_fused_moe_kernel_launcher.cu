@@ -48,6 +48,20 @@ enum class Fp8QuantizationType {
   PerTensorFp8,
 };
 
+inline std::string fp8QuantizationTypeToString(Fp8QuantizationType quantization_type) {
+  switch (quantization_type) {
+    default:
+    case Fp8QuantizationType::NoneFp8:
+      return "NoneFp8";
+    case Fp8QuantizationType::DeepSeekFp8:
+      return "DeepSeekFp8";
+    case Fp8QuantizationType::MxFp8:
+      return "MxFp8";
+    case Fp8QuantizationType::PerTensorFp8:
+      return "PerTensorFp8";
+  }
+}
+
 // Utility function to compute the next power of two
 inline int32_t nextPowerOfTwo(float value) {
   int32_t n = static_cast<int32_t>(std::ceil(value));
@@ -870,6 +884,8 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
       TVM_FFI_ICHECK_EQ(hidden_states_scale.size(1), args->num_tokens)
           << "hidden_states_scale dim1 must match num_tokens.";
     } else if (quantization_type == Fp8QuantizationType::MxFp8) {
+      TVM_FFI_CHECK(weight_layout == batchedGemm::gemm::MatrixLayout::MajorK,
+                    "weight_layout must be MajorK for MxFp8.");
       TVM_FFI_ICHECK_EQ(hidden_states_scale.dtype(), dl_uint8);
     }
 
@@ -2082,8 +2098,7 @@ Array<Array<int64_t>> trtllm_get_valid_moe_configs(
       << "Unsupported data type combination for getValidConfigs: "
       << "dtype_act=" << static_cast<int>(dtype_act)
       << ", dtype_weights=" << static_cast<int>(dtype_weights)
-      << ", quantization_type=" << static_cast<int>(quantization_type)
-      << ", useDeepSeekFp8=" << useDeepSeekFp8;
+      << ", quantization_type=" << fp8QuantizationTypeToString(quantization_type);
 
   // Unreachable code - added to suppress compiler warning
   return Array<Array<int64_t>>();
