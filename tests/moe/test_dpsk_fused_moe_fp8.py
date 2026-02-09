@@ -475,7 +475,6 @@ def stats_accuracy(
     percent: float = 0.85,
 ):
     H = ref_out.shape[1]
-    assert H == 7168
 
     # Compare
     ref_f32 = ref_out.float()
@@ -547,7 +546,7 @@ TUNE_MAX_NUM_TOKENS = 4096
         (1024, 32, True),
     ],
 )
-@pytest.mark.parametrize("intermediate_size", [2048, 1024, 768, 512, 384])
+@pytest.mark.parametrize("intermediate_size", [2048, 1024, 768, 640, 512, 384])
 @pytest.mark.parametrize(
     "routing_config",
     [
@@ -589,6 +588,21 @@ TUNE_MAX_NUM_TOKENS = 4096
                 "enable_autotune": False,
             },
             id="DSLite",
+        ),
+        # Issue #2356: Qwen3-480B-like config (scaled down) for small scale testing
+        pytest.param(
+            {
+                "num_experts": 32,  # Reduced from 160
+                "top_k": 8,
+                "padding": 8,
+                "n_groups": 8,
+                "top_k_groups": 4,
+                "routed_scaling": 2.5,
+                "compatible_intermediate_size": [640],
+                "enable_autotune": True,
+                "hidden_size": 1536,  # Reduced from 6144, override default 7168
+            },
+            id="Qwen3_480B",
         ),
     ],
 )
@@ -669,10 +683,10 @@ def test_correctness_dpsk_fp8_fused_moe(
     device = "cuda"
     torch.manual_seed(42)
 
-    # Constants (DeepSeek-V3)
+    # Constants (DeepSeek-V3 defaults, can be overridden by routing_config)
     E_GLOBAL = routing_config["num_experts"]  # deepseek v3: 256
-    E_LOCAL = 32  # todo(yingyi): default to tp8 for now, update later
-    H = 7168
+    E_LOCAL = min(32, E_GLOBAL)  # default to tp8, but cap at num_experts
+    H = routing_config.get("hidden_size", 7168)  # allow override for Qwen3-480B test
     I = intermediate_size  # deepseek v3: 2048
     TOP_K = routing_config["top_k"]  # deepseek v3: 8
     N_GROUP = routing_config["n_groups"]  # deepseek v3: 8
