@@ -145,8 +145,11 @@ def get_meta_hash(
     checksums_lines = checksums_bytes.decode("utf-8").splitlines()
     for line in checksums_lines:
         sha256, filename = line.strip().split()
-        # Match specifically flashinferMetaInfo.h (case-insensitive for the 'I' in Infer)
-        if filename.lower().endswith(target_file.lower()):
+        # Match on path segment boundary to avoid substring collisions
+        # (e.g. "Enums.h" must not match "BatchedGemmEnums.h")
+        if filename.lower() == target_file.lower() or filename.lower().endswith(
+            "/" + target_file.lower()
+        ):
             return sha256
     raise ValueError("Invalid checksums.txt, no flashinferMetaInfo.h found")
 

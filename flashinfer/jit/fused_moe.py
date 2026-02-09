@@ -26,7 +26,8 @@ from .core import (
     sm89_nvcc_flags,
 )
 from .cpp_ext import is_cuda_version_at_least
-from .cubin_loader import get_cubin, get_meta_hash, make_symlink, get_file
+from .cubin_loader import get_cubin, get_meta_hash, get_file
+from .utils import write_if_different
 from .gemm.cutlass.generate_kernels import generate_gemm_operations
 
 
@@ -250,23 +251,39 @@ def gen_trtllm_gen_fused_moe_sm100_module() -> JitSpec:
         "trtllm/gen/DtypeDecl.h",
         "trtllm/gen/MmaDecl.h",
         "trtllm/gen/SfLayoutDecl.h",
+        "trtllm/gen/SparsityDecl.h",
     ]
 
     header_path = f"{include_path}/trtllmGen_bmm_export"
+    header_dest_dir = (
+        jit_env.FLASHINFER_CUBIN_DIR
+        / "flashinfer"
+        / "trtllm"
+        / "batched_gemm"
+        / "trtllmGen_bmm_export"
+    )
+    artifact_hash_path = header_dest_dir / ".artifact_hash"
+
+    # Check if cached headers are from a different artifact version (e.g. after git checkout)
+    if artifact_hash_path.exists():
+        cached_hash = artifact_hash_path.read_text().strip()
+        if cached_hash != ArtifactPath.TRTLLM_GEN_BMM:
+            raise RuntimeError(
+                f"Cached trtllm bmm headers were downloaded for artifact "
+                f"'{cached_hash}', but current code expects "
+                f"'{ArtifactPath.TRTLLM_GEN_BMM}'. "
+                f"Please clear the cache: rm -rf {header_dest_dir}"
+            )
+
     for file in header_files:
         uri_path = f"{header_path}/{file}"
         file_hash = get_meta_hash(checksum, file)
-        file_path = str(jit_env.FLASHINFER_CUBIN_DIR / "trtllmGen_bmm_export" / file)
+        file_path = str(header_dest_dir / file)
         result = get_file(uri_path, file_hash, file_path)
         assert result, f"{file} not found"
-    # Create directory flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export pointing to trtllmGen_bmm_export
 
-    symlink_parent = str(
-        jit_env.FLASHINFER_CUBIN_DIR / "flashinfer/trtllm/batched_gemm"
-    )
-    make_symlink(
-        "../../../trtllmGen_bmm_export", symlink_parent, "trtllmGen_bmm_export"
-    )
+    # Record which artifact version these headers belong to
+    write_if_different(artifact_hash_path, ArtifactPath.TRTLLM_GEN_BMM)
 
     # currently only support Blackwell
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(

@@ -33,7 +33,6 @@ from ..core import (
 from ..cubin_loader import (
     get_cubin,
     get_meta_hash,
-    make_symlink,
     get_file,
 )
 from ..utils import dtype_cutlass_map, filename_safe_dtype_map, write_if_different
@@ -512,16 +511,34 @@ def gen_trtllm_gen_gemm_module() -> JitSpec:
     ]
 
     header_path = f"{include_path}/trtllmGen_gemm_export"
+    header_dest_dir = (
+        jit_env.FLASHINFER_CUBIN_DIR
+        / "flashinfer"
+        / "trtllm"
+        / "gemm"
+        / "trtllmGen_gemm_export"
+    )
+    artifact_hash_path = header_dest_dir / ".artifact_hash"
+
+    # Check if cached headers are from a different artifact version (e.g. after git checkout)
+    if artifact_hash_path.exists():
+        cached_hash = artifact_hash_path.read_text().strip()
+        if cached_hash != ArtifactPath.TRTLLM_GEN_GEMM:
+            raise RuntimeError(
+                f"Cached trtllm gemm headers were downloaded for artifact "
+                f"'{cached_hash}', but current code expects "
+                f"'{ArtifactPath.TRTLLM_GEN_GEMM}'. "
+                f"Please clear the cache: rm -rf {header_dest_dir}"
+            )
+
     for file in header_files:
         uri_path = f"{header_path}/{file}"
         file_hash = get_meta_hash(checksum, file)
-        file_path = str(jit_env.FLASHINFER_CUBIN_DIR / "trtllmGen_gemm_export" / file)
+        file_path = str(header_dest_dir / file)
         get_file(uri_path, file_hash, file_path)
-    # Create directory flashinfer/trtllm/gemm/trtllmGen_gemm_export pointing to trtllmGen_gemm_export
-    symlink_parent = str(jit_env.FLASHINFER_CUBIN_DIR / "flashinfer/trtllm/gemm")
-    make_symlink(
-        "../../../trtllmGen_gemm_export", symlink_parent, "trtllmGen_gemm_export"
-    )
+
+    # Record which artifact version these headers belong to
+    write_if_different(artifact_hash_path, ArtifactPath.TRTLLM_GEN_GEMM)
 
     return gen_jit_spec(
         "trtllm_gemm",
@@ -695,17 +712,35 @@ def gen_trtllm_low_latency_gemm_module() -> JitSpec:
     ]
 
     header_path = f"{include_path}/trtllmGen_gemm_export"
+    header_dest_dir = (
+        jit_env.FLASHINFER_CUBIN_DIR
+        / "flashinfer"
+        / "trtllm"
+        / "gemm"
+        / "trtllmGen_gemm_export"
+    )
+    artifact_hash_path = header_dest_dir / ".artifact_hash"
+
+    # Check if cached headers are from a different artifact version (e.g. after git checkout)
+    if artifact_hash_path.exists():
+        cached_hash = artifact_hash_path.read_text().strip()
+        if cached_hash != ArtifactPath.TRTLLM_GEN_GEMM:
+            raise RuntimeError(
+                f"Cached trtllm gemm headers were downloaded for artifact "
+                f"'{cached_hash}', but current code expects "
+                f"'{ArtifactPath.TRTLLM_GEN_GEMM}'. "
+                f"Please clear the cache: rm -rf {header_dest_dir}"
+            )
+
     for file in header_files:
         uri_path = f"{header_path}/{file}"
         file_hash = get_meta_hash(checksum, file)
-        file_path = str(jit_env.FLASHINFER_CUBIN_DIR / "trtllmGen_gemm_export" / file)
+        file_path = str(header_dest_dir / file)
         result = get_file(uri_path, file_hash, file_path)
         assert result, f"{file} not found"
-    # Create directory flashinfer/trtllm/gemm/trtllmGen_gemm_export pointing to trtllmGen_gemm_export
-    symlink_parent = str(jit_env.FLASHINFER_CUBIN_DIR / "flashinfer/trtllm/gemm")
-    make_symlink(
-        "../../../trtllmGen_gemm_export", symlink_parent, "trtllmGen_gemm_export"
-    )
+
+    # Record which artifact version these headers belong to
+    write_if_different(artifact_hash_path, ArtifactPath.TRTLLM_GEN_GEMM)
 
     return gen_jit_spec(
         "trtllm_low_latency_gemm",
@@ -719,7 +754,9 @@ def gen_trtllm_low_latency_gemm_module() -> JitSpec:
             f'-DTLLM_GEN_GEMM_CUBIN_PATH=\\"{ArtifactPath.TRTLLM_GEN_GEMM}\\"',
         ]
         + sm100a_nvcc_flags,
-        # link "include" sub-directory in cache
-        extra_include_paths=[jit_env.FLASHINFER_CUBIN_DIR / include_path],
+        extra_include_paths=[
+            jit_env.FLASHINFER_CUBIN_DIR,
+            jit_env.FLASHINFER_CUBIN_DIR / include_path,
+        ],
         extra_ldflags=["-lcuda"],
     )
