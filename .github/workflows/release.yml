@@ -191,11 +191,8 @@ jobs:
           export CUDA_MINOR
           export FLASHINFER_LOCAL_VERSION="cu${CUDA_MAJOR}${CUDA_MINOR}"
 
-          chown -R $(id -u):$(id -g) ${{ github.workspace }}
           mkdir -p ${{ github.workspace }}/ci-cache
-          chown -R $(id -u):$(id -g) ${{ github.workspace }}/ci-cache
 
-          # Run the build script inside the container with proper mounts
           docker run --rm \
             -v ${{ github.workspace }}:/workspace \
             -v ${{ github.workspace }}/ci-cache:/ci-cache \
@@ -206,7 +203,6 @@ jobs:
             -e FLASHINFER_LOCAL_VERSION="$FLASHINFER_LOCAL_VERSION" \
             -e ARCH="${{ matrix.arch }}" \
             -e FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST}" \
-            --user $(id -u):$(id -g) \
             -w /workspace \
             ${{ env.DOCKER_IMAGE }} \
             bash /workspace/scripts/build_flashinfer_jit_cache_whl.sh
