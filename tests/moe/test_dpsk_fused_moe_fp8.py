@@ -378,10 +378,21 @@ def generate_random_inputs_moe(
     local_expert_offset: int = 0,
     routed_scaling_factor: float = 2.5,
     device: str = "cuda",
+    small_scale_fraction: float = 0.0,
+    small_scale_magnitude: float = 1e-4,
 ):
+    """
+    Generate random inputs for FP8 block-scale MoE testing.
+
+    Args:
+        small_scale_fraction: Fraction of weight blocks to have small values (0.0-1.0).
+            Set to ~0.45 to reproduce issue #2356 (Qwen3-480B has ~45% small scales).
+        small_scale_magnitude: Multiplier for small blocks. 1e-4 results in scales ~1e-8.
+    """
     assert hidden_size % 128 == 0 and intermediate_size % 128 == 0
     T, H, I = seq_len, hidden_size, intermediate_size
     E_global, E_local = num_experts_global, num_local_experts
+    BLOCK = 128
 
     # Inputs for routing
     routing_logits = torch.randn(T, E_global, dtype=torch.float32, device=device)
@@ -392,7 +403,9 @@ def generate_random_inputs_moe(
 
     # Activations: start from bf16, then FP8 block-quant with dequant scales
     a_bf16 = 2.0 * torch.randn(T, H, dtype=torch.bfloat16, device=device)
-    a_fp8, a_scales_TxNb = _fp8_block_quant_1d(a_bf16, block=128)  # scales: [T, H/128]
+    a_fp8, a_scales_TxNb = _fp8_block_quant_1d(
+        a_bf16, block=BLOCK
+    )  # scales: [T, H/128]
     hidden_states = a_fp8
     hidden_states_scale = a_scales_TxNb.transpose(0, 1).contiguous()  # [H/128, T]
 
@@ -401,11 +414,40 @@ def generate_random_inputs_moe(
     w13_bf16 = torch.randn(E_local, 2 * I, H, dtype=torch.bfloat16, device=device)
     w2_bf16 = torch.randn(E_local, H, I, dtype=torch.bfloat16, device=device)
 
+    # Apply bimodal scale distribution if requested (issue #2356 repro)
+    # ~45% of blocks in Qwen3-480B have scales < 1e-6
+    if small_scale_fraction > 0:
+        # W13: [E_local, 2I, H] -> blocks of shape [E_local, (2I)/128, H/128]
+        num_blocks_r_w13 = (2 * I) // BLOCK
+        num_blocks_c_w13 = H // BLOCK
+        block_mask_w13 = (
+            torch.rand(E_local, num_blocks_r_w13, 1, num_blocks_c_w13, 1, device=device)
+            < small_scale_fraction
+        )
+        block_mask_w13 = block_mask_w13.expand(
+            E_local, num_blocks_r_w13, BLOCK, num_blocks_c_w13, BLOCK
+        ).reshape(E_local, 2 * I, H)
+        w13_bf16 = torch.where(
+            block_mask_w13, w13_bf16 * small_scale_magnitude, w13_bf16
+        )
+
+        # W2: [E_local, H, I] -> blocks of shape [E_local, H/128, I/128]
+        num_blocks_r_w2 = H // BLOCK
+        num_blocks_c_w2 = I // BLOCK
+        block_mask_w2 = (
+            torch.rand(E_local, num_blocks_r_w2, 1, num_blocks_c_w2, 1, device=device)
+            < small_scale_fraction
+        )
+        block_mask_w2 = block_mask_w2.expand(
+            E_local, num_blocks_r_w2, BLOCK, num_blocks_c_w2, BLOCK
+        ).reshape(E_local, H, I)
+        w2_bf16 = torch.where(block_mask_w2, w2_bf16 * small_scale_magnitude, w2_bf16)
+
     w13_fp8, w13_scales = _fp8_block_quant_2d(
-        w13_bf16, block=128
+        w13_bf16, block=BLOCK
     )  # scales: [E, (2I)/128, H/128]
     w2_fp8, w2_scales = _fp8_block_quant_2d(
-        w2_bf16, block=128
+        w2_bf16, block=BLOCK
     )  # scales: [E, H/128, I/128]
 
     return {
@@ -640,6 +682,9 @@ def test_correctness_dpsk_fp8_fused_moe(
         )
 
     # Generate random but consistent inputs
+    # Issue #2356: Add small_scale_fraction to test bimodal scale distributions
+    # Real models like Qwen3-480B have ~45% of scales < 1e-6
+    small_scale_fraction = 0.45  # Set to 0.0 to disable
     inputs = generate_random_inputs_moe(
         seq_len,
         num_experts_global=E_GLOBAL,
@@ -650,6 +695,8 @@ def test_correctness_dpsk_fp8_fused_moe(
         local_expert_offset=local_expert_offset,
         routed_scaling_factor=routing_config["routed_scaling"],
         device=device,
+        small_scale_fraction=small_scale_fraction,
+        small_scale_magnitude=1e-2,
     )
 
     # Run reference (returns bf16)
