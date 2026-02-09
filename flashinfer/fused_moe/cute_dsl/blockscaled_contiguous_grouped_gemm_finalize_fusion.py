@@ -209,6 +209,7 @@ def _get_compiled_finalize_kernel(
             sf_vec_size=sf_vec_size,
             mma_tiler_mn=mma_tiler_mn,
             cluster_shape_mn=cluster_shape_mn,
+            use_blkred=True,
             raster_along_m=raster_along_m,
         )
 
