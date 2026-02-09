@@ -7,8 +7,10 @@ from flashinfer.fused_moe import (
     WeightLayout,
     trtllm_fp8_block_scale_moe,
 )
-from .utils import skip_checks, QuantMode
-from flashinfer import ActivationType
+
+# from .utils import skip_checks
+from .utils import QuantMode
+# from flashinfer import ActivationType
 
 
 def dequant_fp8_block_scaled(
@@ -654,15 +656,15 @@ def test_correctness_dpsk_fp8_fused_moe(
         weight_processing["compatible_moe_impls"] = [type(moe_impl)]
 
     # Use the complete skip_checks function from utils
-    skip_checks(
-        moe_impl=moe_impl,
-        routing_config=routing_config,
-        weight_processing=weight_processing,
-        activation_type=ActivationType.Swiglu,
-        num_tokens=seq_len,
-        hidden_size=7168,  # DeepSeek-V3 hidden size
-        intermediate_size=intermediate_size,
-    )
+    # skip_checks(
+    #    moe_impl=moe_impl,
+    #    routing_config=routing_config,
+    #    weight_processing=weight_processing,
+    #    activation_type=ActivationType.Swiglu,
+    #    num_tokens=seq_len,
+    #    hidden_size=7168,  # DeepSeek-V3 hidden size
+    #    intermediate_size=intermediate_size,
+    # )
 
     device = "cuda"
     torch.manual_seed(42)
