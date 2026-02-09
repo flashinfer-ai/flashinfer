@@ -171,9 +171,11 @@ def gen_gemm_sm120_module_cutlass_fp4() -> JitSpec:
     with open(jit_env.FLASHINFER_CSRC_DIR / "fp4_gemm_cutlass_sm120.jinja") as f:
         kernel_inst_templ = jinja2.Template(f.read())
         dtype_list = ["__nv_bfloat16", "half"]
-        # SM120/121 uses only 128x128x128 tile configuration with implied 1x1x1 cluster shape
+        # SM120/121 tile configurations with implied 1x1x1 cluster shape
         cta_m_n_k_list = [
             (128, 128, 128),
+            (128, 128, 256),
+            (256, 128, 128),
         ]
         for cta_m, cta_n, cta_k in cta_m_n_k_list:
             for dtype in dtype_list:
