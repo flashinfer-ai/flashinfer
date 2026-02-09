@@ -1249,7 +1249,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
         q_len_per_req : int
             The number of query tokens per request, if not provided, will be set to ``1``.
         skip_softmax_threshold_scale_factor: Optional[float] = None
-            threshold scale factor for skipping softmax.
+            threshold scale factor for skipping softmax operations.
+            Providing a value for this parameter enables skip-softmax sparsity as described in: https://arxiv.org/abs/2512.12087
+            If no value is provided, then standard attention is used.
+            Setting the threshold to a higher value generally increases kernel performance at the cost of accuracy degradation.
+            The actual threshold value equals the provided threshold_scale_factor divided by the context length.
         Returns
         -------
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -2224,7 +2228,11 @@ def trtllm_batch_decode_with_kv_cache(
         When None, all requests use uniform query length specified by ``q_len_per_req``.
 
     skip_softmax_threshold_scale_factor: Optional[float] = None
-        threshold scale factor for skipping softmax.
+        threshold scale factor for skipping softmax operations.
+        Providing a value for this parameter enables skip-softmax sparsity as described in: https://arxiv.org/abs/2512.12087
+        If no value is provided, then standard attention is used.
+        Setting the threshold to a higher value generally increases kernel performance at the cost of accuracy degradation.
+        The actual threshold value equals the provided threshold_scale_factor divided by the context length.
 
     Returns
     -------

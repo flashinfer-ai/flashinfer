@@ -3625,7 +3625,11 @@ def trtllm_batch_context_with_kv_cache(
     sinks : Optional[List[torch.Tensor]] = None
         additional value per head in the denominator of the softmax.
     skip_softmax_threshold_scale_factor: Optional[float] = None
-        threshold scale factor for skipping softmax.
+        threshold scale factor for skipping softmax operations.
+        Providing a value for this parameter enables skip-softmax sparsity as described in: https://arxiv.org/abs/2512.12087
+        If no value is provided, then standard attention is used.
+        Setting the threshold to a higher value generally increases kernel performance at the cost of accuracy degradation.
+        The actual threshold value equals the provided threshold_scale_factor divided by the context length.
     Returns
     -------
     out: Union[torch.Tensor, FP4Tensor]
