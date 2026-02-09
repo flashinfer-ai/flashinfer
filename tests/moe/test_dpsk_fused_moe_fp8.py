@@ -378,10 +378,21 @@ def generate_random_inputs_moe(
     local_expert_offset: int = 0,
     routed_scaling_factor: float = 2.5,
     device: str = "cuda",
+    small_scale_fraction: float = 0.0,
+    small_scale_magnitude: float = 1e-4,
 ):
+    """
+    Generate random inputs for FP8 block-scale MoE testing.
+
+    Args:
+        small_scale_fraction: Fraction of weight blocks to have small values (0.0-1.0).
+            Set to ~0.45 to reproduce issue #2356 (Qwen3-480B has ~45% small scales).
+        small_scale_magnitude: Multiplier for small blocks. 1e-4 results in scales ~1e-8.
+    """
     assert hidden_size % 128 == 0 and intermediate_size % 128 == 0
     T, H, I = seq_len, hidden_size, intermediate_size
     E_global, E_local = num_experts_global, num_local_experts
+    BLOCK = 128
 
     # Inputs for routing
     routing_logits = torch.randn(T, E_global, dtype=torch.float32, device=device)
@@ -392,7 +403,9 @@ def generate_random_inputs_moe(
 
     # Activations: start from bf16, then FP8 block-quant with dequant scales
     a_bf16 = 2.0 * torch.randn(T, H, dtype=torch.bfloat16, device=device)
-    a_fp8, a_scales_TxNb = _fp8_block_quant_1d(a_bf16, block=128)  # scales: [T, H/128]
+    a_fp8, a_scales_TxNb = _fp8_block_quant_1d(
+        a_bf16, block=BLOCK
+    )  # scales: [T, H/128]
     hidden_states = a_fp8
     hidden_states_scale = a_scales_TxNb.transpose(0, 1).contiguous()  # [H/128, T]
 
@@ -401,11 +414,40 @@ def generate_random_inputs_moe(
     w13_bf16 = torch.randn(E_local, 2 * I, H, dtype=torch.bfloat16, device=device)
     w2_bf16 = torch.randn(E_local, H, I, dtype=torch.bfloat16, device=device)
 
+    # Apply bimodal scale distribution if requested (issue #2356 repro)
+    # ~45% of blocks in Qwen3-480B have scales < 1e-6
+    if small_scale_fraction > 0:
+        # W13: [E_local, 2I, H] -> blocks of shape [E_local, (2I)/128, H/128]
+        num_blocks_r_w13 = (2 * I) // BLOCK
+        num_blocks_c_w13 = H // BLOCK
+        block_mask_w13 = (
+            torch.rand(E_local, num_blocks_r_w13, 1, num_blocks_c_w13, 1, device=device)
+            < small_scale_fraction
+        )
+        block_mask_w13 = block_mask_w13.expand(
+            E_local, num_blocks_r_w13, BLOCK, num_blocks_c_w13, BLOCK
+        ).reshape(E_local, 2 * I, H)
+        w13_bf16 = torch.where(
+            block_mask_w13, w13_bf16 * small_scale_magnitude, w13_bf16
+        )
+
+        # W2: [E_local, H, I] -> blocks of shape [E_local, H/128, I/128]
+        num_blocks_r_w2 = H // BLOCK
+        num_blocks_c_w2 = I // BLOCK
+        block_mask_w2 = (
+            torch.rand(E_local, num_blocks_r_w2, 1, num_blocks_c_w2, 1, device=device)
+            < small_scale_fraction
+        )
+        block_mask_w2 = block_mask_w2.expand(
+            E_local, num_blocks_r_w2, BLOCK, num_blocks_c_w2, BLOCK
+        ).reshape(E_local, H, I)
+        w2_bf16 = torch.where(block_mask_w2, w2_bf16 * small_scale_magnitude, w2_bf16)
+
     w13_fp8, w13_scales = _fp8_block_quant_2d(
-        w13_bf16, block=128
+        w13_bf16, block=BLOCK
     )  # scales: [E, (2I)/128, H/128]
     w2_fp8, w2_scales = _fp8_block_quant_2d(
-        w2_bf16, block=128
+        w2_bf16, block=BLOCK
     )  # scales: [E, H/128, I/128]
 
     return {
@@ -640,6 +682,9 @@ def test_correctness_dpsk_fp8_fused_moe(
         )
 
     # Generate random but consistent inputs
+    # Issue #2356: Add small_scale_fraction to test bimodal scale distributions
+    # Real models like Qwen3-480B have ~45% of scales < 1e-6
+    small_scale_fraction = 0.45  # Set to 0.0 to disable
     inputs = generate_random_inputs_moe(
         seq_len,
         num_experts_global=E_GLOBAL,
@@ -650,6 +695,8 @@ def test_correctness_dpsk_fp8_fused_moe(
         local_expert_offset=local_expert_offset,
         routed_scaling_factor=routing_config["routed_scaling"],
         device=device,
+        small_scale_fraction=small_scale_fraction,
+        small_scale_magnitude=1e-2,
     )
 
     # Run reference (returns bf16)
@@ -734,6 +781,142 @@ def test_correctness_dpsk_fp8_fused_moe(
             enable_pdl=enable_pdl,
             tune_max_num_tokens=TUNE_MAX_NUM_TOKENS,
         )
+
+    stats_accuracy(ref_out, fi_out, atol=atol, rtol=rtol, percent=percent)
+
+
+# -----------------------------
+# Issue #2356 Reproduction Test: Small scales cause accuracy degradation
+# https://github.com/flashinfer-ai/flashinfer/issues/2356
+# -----------------------------
+@pytest.mark.parametrize("seq_len", [16, 64, 256])
+@pytest.mark.parametrize("small_scale_fraction", [0.45])
+def test_issue_2356_small_scales_repro(
+    seq_len: int,
+    small_scale_fraction: float,
+    atol: float = 1e-1,
+    rtol: float = 2e-1,
+    percent: float = 0.85,
+):
+    """
+    Reproduction test for issue #2356: trtllm_fp8_block_scale_moe accuracy
+    degrades significantly when ~45% of weight scales are very small (<1e-6).
+
+    This was observed in Qwen3-Coder-480B where:
+      - gate_proj: 432/960 (45.0%) scales < 1e-6
+      - up_proj: 432/960 (45.0%) scales < 1e-6
+      - down_proj: 407/960 (42.4%) scales < 1e-6
+
+    The kernel showed 40% mean relative error vs 6.6% for Triton reference.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    if trtllm_fp8_block_scale_moe is None:
+        pytest.skip("flashinfer fused_moe kernel not available")
+
+    # Skip check for SM90+ (Hopper/Blackwell)
+    sm = torch.cuda.get_device_capability()
+    if sm[0] < 9:
+        pytest.skip(f"Requires SM90+, got SM{sm[0]}{sm[1]}")
+
+    device = "cuda"
+    torch.manual_seed(42)
+
+    # DeepSeek-V3 style config
+    E_GLOBAL = 256
+    E_LOCAL = 32
+    H = 7168
+    I = 2048
+    TOP_K = 8
+    N_GROUP = 8
+    TOPK_GROUP = 4
+
+    # Generate inputs with bimodal scale distribution (45% small scales)
+    inputs = generate_random_inputs_moe(
+        seq_len,
+        num_experts_global=E_GLOBAL,
+        num_local_experts=E_LOCAL,
+        hidden_size=H,
+        intermediate_size=I,
+        use_bias=True,
+        local_expert_offset=0,
+        routed_scaling_factor=2.5,
+        device=device,
+        small_scale_fraction=small_scale_fraction,
+        small_scale_magnitude=1e-2,  # Results in scales ~1e-6
+    )
+
+    # Bias routing logits so tokens are more likely to hit local experts 0-31
+    # This ensures the test actually exercises the kernel with the local experts
+    inputs["routing_logits"][:, :E_LOCAL] += 5.0
+
+    # Verify we actually have small scales
+    w13_scales = inputs["gemm1_weights_scale"]
+    small_scale_count = (w13_scales < 1e-6).sum().item()
+    total_scales = w13_scales.numel()
+    actual_fraction = small_scale_count / total_scales
+    print(
+        f"\nScale distribution: {small_scale_count}/{total_scales} ({actual_fraction * 100:.1f}%) scales < 1e-6"
+    )
+    print(
+        f"W13 scale range: [{w13_scales.min().item():.2e}, {w13_scales.max().item():.2e}]"
+    )
+    print(f"Hidden states norm: {inputs['hidden_states'].float().norm().item():.2e}")
+
+    # Run reference
+    ref_out = run_fp8_block_scale_moe_reference(
+        routing_logits=inputs["routing_logits"],
+        routing_bias=inputs["routing_bias"],
+        hidden_states=inputs["hidden_states"],
+        hidden_states_scale=inputs["hidden_states_scale"],
+        gemm1_weights=inputs["gemm1_weights"],
+        gemm1_weights_scale=inputs["gemm1_weights_scale"],
+        gemm2_weights=inputs["gemm2_weights"],
+        gemm2_weights_scale=inputs["gemm2_weights_scale"],
+        local_expert_offset=inputs["local_expert_offset"],
+        routed_scaling_factor=inputs["routed_scaling_factor"],
+        hidden_size=H,
+        intermediate_size=I,
+        num_experts_global=E_GLOBAL,
+        num_local_experts=E_LOCAL,
+        top_k=TOP_K,
+        n_group=N_GROUP,
+        topk_group=TOPK_GROUP,
+    )
+
+    # Run FlashInfer kernel
+    with autotune(False):
+        fi_out = trtllm_fp8_block_scale_moe(
+            inputs["routing_logits"].to(torch.float32),
+            inputs["routing_bias"],
+            inputs["hidden_states"],
+            inputs["hidden_states_scale"],
+            inputs["gemm1_weights"],
+            inputs["gemm1_weights_scale"].to(torch.float32),
+            inputs["gemm2_weights"],
+            inputs["gemm2_weights_scale"].to(torch.float32),
+            E_GLOBAL,
+            TOP_K,
+            N_GROUP,
+            TOPK_GROUP,
+            I,
+            inputs["local_expert_offset"],
+            inputs["local_num_experts"],
+            inputs["routed_scaling_factor"],
+            routing_method_type=2,
+            use_shuffled_weight=False,
+            weight_layout=WeightLayout.MajorK,
+            enable_pdl=True,
+            tune_max_num_tokens=TUNE_MAX_NUM_TOKENS,
+        )
+
+    # Debug: check if outputs are non-zero
+    ref_norm = ref_out.float().norm().item()
+    fi_norm = fi_out.float().norm().item()
+    print(f"Output norms: ref={ref_norm:.6e}, fi={fi_norm:.6e}")
+    if ref_norm < 1e-6 and fi_norm < 1e-6:
+        pytest.skip("Both outputs are near-zero (no tokens routed to local experts)")
 
     stats_accuracy(ref_out, fi_out, atol=atol, rtol=rtol, percent=percent)
 
