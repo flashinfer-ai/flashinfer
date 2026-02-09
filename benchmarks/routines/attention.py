@@ -197,15 +197,6 @@ def parse_attention_args(line, parser):
 
     # Normalize backend names (handle deprecated names)
     args.backends = normalize_backends(args.backends)
-    auto_backend_supported_routines = {
-        "BatchDecodeWithPagedKVCacheWrapper",
-        "BatchPrefillWithPagedKVCacheWrapper",
-    }
-    if "auto" in args.backends and args.routine not in auto_backend_supported_routines:
-        raise ValueError(
-            f"backend=auto is only supported for {', '.join(sorted(auto_backend_supported_routines))}."
-        )
-
     if args.verbose >= 1:
         print(f"[INFO] {args = }")
     return args
