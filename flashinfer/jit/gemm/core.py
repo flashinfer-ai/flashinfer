@@ -494,6 +494,7 @@ def gen_trtllm_gen_gemm_module() -> JitSpec:
     # make sure "flashinferMetaInfo.h" is downloaded or cached
     assert metainfo, f"{header_name}.h not found"
 
+    # whitelisted headers for integrity
     header_files = [
         "GemmInterface.h",
         "GemmOptions.h",
@@ -695,6 +696,7 @@ def gen_trtllm_low_latency_gemm_module() -> JitSpec:
     # make sure "flashinferMetaInfo.h" is downloaded or cached
     assert metainfo, f"{header_name}.h not found"
 
+    # whitelisted headers for integrity
     header_files = [
         "GemmInterface.h",
         "GemmOptions.h",

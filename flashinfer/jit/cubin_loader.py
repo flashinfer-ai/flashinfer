@@ -195,17 +195,6 @@ def load_cubin(cubin_path: str, sha256: str) -> bytes:
     return b""
 
 
-def make_symlink(src: str, symlink_parent: str, symlink_name: str) -> None:
-    """
-    Create a symlink from {src} to {symlink_parent}/{symlink_name}.
-    If the symlink does not exist, create the parent directory and create the symlink.
-    """
-    symlink_path = os.path.join(symlink_parent, symlink_name)
-    if not os.path.lexists(symlink_path):
-        os.makedirs(symlink_parent, exist_ok=True)
-        os.symlink(src, symlink_path)
-
-
 def get_file(
     uri_path: str,
     sha256: str,
