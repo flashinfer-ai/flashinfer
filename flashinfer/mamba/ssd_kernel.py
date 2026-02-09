@@ -185,9 +185,11 @@ class SSDKernel:
         )
 
         # XT is same shape as ACC operand of INTER2_MMA, before postprocessing by EPILOG
+        # smem_xt shares storage with smem_x. With MN-major x_smem_layout (D contiguous),
+        # the transposed view (L, D) needs ROW_MAJOR to keep D contiguous in mode 1.
         self.xt_smem_layout = sm100_utils.make_smem_layout_epi(
             self.io_dtype,
-            utils.LayoutEnum.COL_MAJOR,
+            utils.LayoutEnum.ROW_MAJOR,
             self.tile_shape_mnk_intra2[:2],
             self.input_stages,
         )
@@ -2693,7 +2695,7 @@ class SSDKernel:
         tiled_mma_intra2 = sm100_utils.make_trivial_tiled_mma(
             io_dtype,
             tcgen05.OperandMajorMode("k"),
-            tcgen05.OperandMajorMode("k"),
+            tcgen05.OperandMajorMode("mn"),  # B operand (x) is N-major (D-contiguous)
             acc_dtype,
             cta_group,
             tile_shape_mnk_intra2[:2],
@@ -2702,7 +2704,7 @@ class SSDKernel:
         tiled_mma_inter1 = sm100_utils.make_trivial_tiled_mma(
             io_dtype,
             tcgen05.OperandMajorMode("k"),
-            tcgen05.OperandMajorMode("k"),
+            tcgen05.OperandMajorMode("mn"),  # B operand (x) is N-major (D-contiguous)
             acc_dtype,
             cta_group,
             tile_shape_mnk_inter1[:2],
@@ -3490,7 +3492,7 @@ class SSDKernel:
     ):
         dtype = smem_xt.element_type
         copy_atom_s2r_x = cute.make_copy_atom(
-            cute.nvgpu.warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4),
+            cute.nvgpu.warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4),
             dtype,
         )
         tiled_s2r_x = cute.make_tiled_copy_D(copy_atom_s2r_x, tiled_t2r_inter2_intra2)

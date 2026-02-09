@@ -185,22 +185,21 @@ class _SSDKernel:
         nchunks = seqlen // chunk_size
 
         # Convert tensors to CUTLASS layout
-        # x: Triton (batch, seqlen, nheads, headdim) -> CUTLASS (headdim, chunk_size, nchunks, nheads, batch)
-        x_reshaped = x.reshape(batch, nchunks, chunk_size, nheads, headdim)
-        x_tensor, x_dst = _create_cutlass_tensor(
-            [batch, nheads, headdim, nchunks, chunk_size],
-            [2, 4, 3, 1, 0],
-            self.io_dtype,
-            [2, 3, 4],
-            cutlass_torch,
-            from_dlpack,
-        )
-        x_dst.copy_(x_reshaped.permute(4, 2, 1, 3, 0).to(x_dst.dtype))
+        io_torch_dtype = cutlass_torch.dtype(self.io_dtype)
 
+        # x: zero-copy (D, L, C, EH, B) with D stride 1 (N-major for MMA B operand)
+        # Full reversal of (B, C, L, EH, D) gives monotonically increasing strides
+        x_reshaped = x.reshape(batch, nchunks, chunk_size, nheads, headdim)
+        assert x.dtype == io_torch_dtype, f"x dtype {x.dtype} doesn't match {io_torch_dtype}"
+        x_permuted = x_reshaped.permute(4, 2, 1, 3, 0)  # (D, L, C, EH, B)
+        x_tensor = from_dlpack(x_permuted, assumed_align=16)
+        for mode in [2, 3, 4]:
+            x_tensor = x_tensor.mark_compact_shape_dynamic(
+                mode=mode, stride_order=x_permuted.dim_order()
+            )
         # delta (dt_processed): (batch, nheads, nchunks, chunk_size) -> (chunk_size, nchunks, nheads, batch)
         # Need dtype conversion from float32 to bf16, but keep the non-contiguous permuted layout
         # so that mode 0 (L) has stride 1 as the kernel expects
-        io_torch_dtype = cutlass_torch.dtype(self.io_dtype)
         # First convert dtype (creates contiguous copy in original layout), then permute (zero-copy view)
         dt_permuted = dt_processed.to(io_torch_dtype).permute(
             3, 2, 1, 0
