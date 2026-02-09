@@ -30,6 +30,7 @@ from flashinfer import (
     mxfp8_quantize,
     reorder_rows_for_gated_act_gemm,
     shuffle_matrix_a,
+    shuffle_matrix_sf_a,
 )
 from flashinfer.autotuner import autotune
 from flashinfer.fp4_quantization import block_scale_interleave
@@ -864,10 +865,10 @@ class FP8BlockScaleMoe(Moe):
             ).to(torch.float)
         elif self.fp8_quantization_type == QuantMode.FP8_BLOCK_SCALE_MXFP8:
             gemm1_weights_fp8, gemm1_scales = mxfp8_quantize_batches(
-                gemm1_weights, True
+                gemm1_weights, False
             )
             gemm2_weights_fp8, gemm2_scales = mxfp8_quantize_batches(
-                gemm2_weights, True
+                gemm2_weights, False
             )
         else:
             raise ValueError(
@@ -994,21 +995,39 @@ class FP8BlockScaleMoe(Moe):
             )
 
             gemm1_weights_fp8_interleaved = args.gemm1_weights.clone()
+            gemm1_scales_fp8_interleaved = args.gemm1_scales.clone()
             if self.fp8_quantization_type == QuantMode.FP8_BLOCK_SCALE_MXFP8:
                 # Reorder rows of W1 for fused gated activation
                 gemm1_weights_fp8_interleaved = []
+                gemm1_scales_fp8_interleaved = []
                 for i in range(num_experts):
                     gemm1_weights_fp8_interleaved.append(
-                        reorder_rows_for_gated_act_gemm(args.gemm1_weights[i].clone())
+                        reorder_rows_for_gated_act_gemm(
+                            args.gemm1_weights[i]
+                            .clone()
+                            .reshape(2 * intermediate_size, -1)
+                        )
+                    )
+                    gemm1_scales_fp8_interleaved.append(
+                        reorder_rows_for_gated_act_gemm(
+                            args.gemm1_scales[i]
+                            .clone()
+                            .reshape(2 * intermediate_size, -1)
+                        )
                     )
 
                 # Stack weights and scales for all experts
                 gemm1_weights_fp8_interleaved = torch.stack(
                     gemm1_weights_fp8_interleaved
-                ).reshape(num_experts, 2 * intermediate_size, hidden_size)
+                ).reshape(args.gemm1_weights.shape)
+                gemm1_scales_fp8_interleaved = torch.stack(
+                    gemm1_scales_fp8_interleaved
+                ).reshape(args.gemm1_scales.shape)
 
             gemm1_weights_fp8_shuffled = []
             gemm2_weights_fp8_shuffled = []
+            gemm1_scales_fp8_shuffled = []
+            gemm2_scales_fp8_shuffled = []
             for i in range(num_experts):
                 tmp_weights1 = shuffle_matrix_a(
                     gemm1_weights_fp8_interleaved[i].view(torch.uint8), epilogue_tile_m
@@ -1016,6 +1035,19 @@ class FP8BlockScaleMoe(Moe):
                 tmp_weights2 = shuffle_matrix_a(
                     args.gemm2_weights[i].view(torch.uint8), epilogue_tile_m
                 )
+                if self.fp8_quantization_type == QuantMode.FP8_BLOCK_SCALE_MXFP8:
+                    tmp_scales1 = shuffle_matrix_sf_a(
+                        gemm1_scales_fp8_interleaved[i]
+                        .view(torch.uint8)
+                        .reshape(2 * intermediate_size, -1),
+                        epilogue_tile_m,
+                    )
+                    tmp_scales2 = shuffle_matrix_sf_a(
+                        args.gemm2_scales[i].view(torch.uint8).reshape(hidden_size, -1),
+                        epilogue_tile_m,
+                    )
+                    gemm1_scales_fp8_shuffled.append(tmp_scales1)
+                    gemm2_scales_fp8_shuffled.append(tmp_scales2)
 
                 if weight_layout == WeightLayout.BlockMajorK:
                     block_k = 128
@@ -1031,15 +1063,27 @@ class FP8BlockScaleMoe(Moe):
             kernel_gemm2_weights = torch.stack(gemm2_weights_fp8_shuffled).view(
                 torch.float8_e4m3fn
             )
+            if self.fp8_quantization_type == QuantMode.FP8_BLOCK_SCALE_MXFP8:
+                kernel_gemm1_scales = torch.stack(gemm1_scales_fp8_shuffled).reshape(
+                    args.gemm1_scales.shape
+                )
+                kernel_gemm2_scales = torch.stack(gemm2_scales_fp8_shuffled).reshape(
+                    args.gemm2_scales.shape
+                )
+            else:
+                kernel_gemm1_scales = args.gemm1_scales
+                kernel_gemm2_scales = args.gemm2_scales
         else:
             kernel_gemm1_weights = args.gemm1_weights
             kernel_gemm2_weights = args.gemm2_weights
+            kernel_gemm1_scales = args.gemm1_scales
+            kernel_gemm2_scales = args.gemm2_scales
 
         return {
             "gemm1_weights": kernel_gemm1_weights,
-            "gemm1_scales": args.gemm1_scales,
+            "gemm1_scales": kernel_gemm1_scales,
             "gemm2_weights": kernel_gemm2_weights,
-            "gemm2_scales": args.gemm2_scales,
+            "gemm2_scales": kernel_gemm2_scales,
             "use_shuffled_weight": use_shuffled_weight,
             "weight_layout": weight_layout,
         }
@@ -2229,11 +2273,13 @@ def run_moe_reference_mxfp8(args):
     gemm1_weights_dequant = mxfp8_dequantize_batches(
         args.gemm1_weights,
         args.gemm1_scales,
+        False,
     ).cuda()
 
     gemm2_weights_dequant = mxfp8_dequantize_batches(
         args.gemm2_weights,
         args.gemm2_scales,
+        False,
     ).cuda()
 
     args_dequant = moe_args_dequant(
