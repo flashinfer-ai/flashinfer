@@ -13,8 +13,8 @@ flashinfer/_build_meta.py
 flashinfer/data/
 flashinfer/jit/aot_config.py
 csrc/aot_default_additional_params.h
-flashinfer/trtllm/gemm/
-flashinfer/trtllm/batched_gemm/
+flashinfer/trtllm/gemm/trtllmGen_gemm_export
+flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export
 
 # DS_Store files
 .DS_store
