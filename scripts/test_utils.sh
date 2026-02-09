@@ -7,6 +7,7 @@
 : "${MAX_JOBS:=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
 : "${CUDA_VISIBLE_DEVICES:=0}"
 : "${SAMPLE_RATE:=5}"  # Run every Nth test in sanity mode (5 = ~20% coverage)
+: "${PARALLEL_TESTS:=true}"  # Enable parallel test execution by default
 
 # Randomize starting offset (0 to SAMPLE_RATE-1) for sampling variety
 if [ -z "${SAMPLE_OFFSET:-}" ]; then
@@ -356,6 +357,239 @@ run_full_test_file() {
     echo ""
 }
 
+# Detect available GPUs from CUDA_VISIBLE_DEVICES or nvidia-smi
+detect_gpus() {
+    if [ "$PARALLEL_TESTS" != "true" ]; then
+        echo "0"
+        return
+    fi
+
+    # Parse CUDA_VISIBLE_DEVICES if set
+    if [ -n "$CUDA_VISIBLE_DEVICES" ] && [ "$CUDA_VISIBLE_DEVICES" != "-1" ]; then
+        # Handle various formats: "0,1,2,3" or "0 1 2 3"
+        AVAILABLE_GPUS=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' ' ' | tr -s ' ')
+        echo "$AVAILABLE_GPUS"
+        return
+    fi
+
+    # Fallback to nvidia-smi
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        AVAILABLE_GPUS=$(nvidia-smi --list-gpus 2>/dev/null | awk '{print NR-1}' | tr '\n' ' ' | sed 's/ $//')
+        if [ -n "$AVAILABLE_GPUS" ]; then
+            echo "$AVAILABLE_GPUS"
+            return
+        fi
+    fi
+
+    # Default to single GPU
+    echo "0"
+}
+
+# Run tests in parallel across multiple GPUs
+run_tests_parallel() {
+    local test_files=$1
+    local mode=$2  # "sanity" or "full"
+
+    # Detect available GPUs
+    local gpu_string
+    gpu_string=$(detect_gpus)
+    local -a GPU_LIST
+    IFS=' ' read -r -a GPU_LIST <<< "$gpu_string"
+    local NUM_GPUS=${#GPU_LIST[@]}
+
+    echo "=========================================="
+    echo "PARALLEL EXECUTION MODE"
+    echo "=========================================="
+    echo "Available GPUs: ${GPU_LIST[*]}"
+    echo "Number of GPUs: $NUM_GPUS"
+    echo "Test mode: $mode"
+    echo ""
+
+    # Create a temporary directory for parallel job state
+    PARALLEL_TMP_DIR=$(mktemp -d)
+    trap 'rm -rf "$PARALLEL_TMP_DIR"' EXIT
+
+    # Convert test files to array
+    local -a test_files_array
+    IFS=' ' read -r -a test_files_array <<< "$test_files"
+    local total_files=${#test_files_array[@]}
+
+    echo "Total test files to execute: $total_files"
+    echo ""
+
+    # Create a results file for each test
+    declare -A test_result_files
+    declare -A test_pid_map
+    local active_jobs=0
+
+    # Function to run a single test file
+    run_single_test_background() {
+        local test_file=$1
+        local gpu_id=$2
+        local file_index=$3
+        local result_file="$PARALLEL_TMP_DIR/result_${file_index}"
+        local log_file="$PARALLEL_TMP_DIR/log_${file_index}"
+
+        (
+            # Set GPU for this test
+            export CUDA_VISIBLE_DEVICES=$gpu_id
+
+            # Redirect output to log file
+            exec > "$log_file" 2>&1
+
+            echo "=========================================="
+            echo "[$file_index/$total_files] Processing: $test_file"
+            echo "GPU: $gpu_id"
+            echo "=========================================="
+
+            if [ "$mode" = "sanity" ]; then
+                # Run sanity test
+                collect_tests "$test_file"
+
+                if [ -z "$ALL_NODE_IDS" ]; then
+                    if [ $COLLECTION_EXIT_CODE -ne 0 ]; then
+                        echo "⚠️  Collection failed for $test_file (skipping)"
+                    else
+                        echo "⚠️  No tests found in $test_file"
+                    fi
+                    echo "SKIPPED" > "$result_file"
+                    exit 0
+                fi
+
+                TOTAL_IN_FILE=$(echo "$ALL_NODE_IDS" | wc -l)
+                sample_tests "$ALL_NODE_IDS"
+                SAMPLED_IN_FILE=$(echo "$SAMPLED_NODE_IDS" | wc -l)
+
+                if [ "$SAMPLED_IN_FILE" -eq 0 ]; then
+                    echo "⚠️  No tests sampled from $test_file, skipping"
+                    echo "SKIPPED" > "$result_file"
+                    exit 0
+                fi
+
+                mapfile -t SAMPLED_NODE_IDS_ARRAY <<< "$SAMPLED_NODE_IDS"
+                JUNIT_FILENAME="${test_file//\//_}.xml"
+                JUNIT_FLAG="--junitxml=${JUNIT_DIR}/${JUNIT_FILENAME}"
+
+                # shellcheck disable=SC2086
+                if ${PYTEST_COMMAND_PREFIX} pytest $PYTEST_FLAGS "${JUNIT_FLAG}" "${SAMPLED_NODE_IDS_ARRAY[@]}"; then
+                    echo "✅ PASSED: $test_file ($SAMPLED_IN_FILE/$TOTAL_IN_FILE tests)"
+                    echo "PASSED:$TOTAL_IN_FILE:$SAMPLED_IN_FILE" > "$result_file"
+                else
+                    echo "❌ FAILED: $test_file ($SAMPLED_IN_FILE/$TOTAL_IN_FILE tests)"
+                    echo "FAILED:$TOTAL_IN_FILE:$SAMPLED_IN_FILE" > "$result_file"
+                fi
+            else
+                # Run full test
+                JUNIT_FILENAME="${test_file//\//_}.xml"
+                JUNIT_FLAG="--junitxml=${JUNIT_DIR}/${JUNIT_FILENAME}"
+
+                # shellcheck disable=SC2086
+                if ${PYTEST_COMMAND_PREFIX} pytest $PYTEST_FLAGS "${JUNIT_FLAG}" "${test_file}"; then
+                    echo "✅ PASSED: $test_file"
+                    echo "PASSED" > "$result_file"
+                else
+                    echo "❌ FAILED: $test_file"
+                    echo "FAILED" > "$result_file"
+                fi
+            fi
+        ) &
+
+        local pid=$!
+        echo "$pid:$test_file:$result_file:$log_file:$file_index"
+    }
+
+    # Launch tests in parallel
+    echo "Launching tests in parallel..."
+    for i in "${!test_files_array[@]}"; do
+        local test_file="${test_files_array[$i]}"
+        local gpu_index=$((i % NUM_GPUS))
+        local gpu_id="${GPU_LIST[$gpu_index]}"
+        local file_index=$((i + 1))
+
+        # Launch test in background
+        local job_info
+        job_info=$(run_single_test_background "$test_file" "$gpu_id" "$file_index")
+
+        # Parse job info
+        local pid result_file log_file
+        IFS=':' read -r pid test_file result_file log_file file_index <<< "$job_info"
+        test_result_files[$pid]="$result_file:$test_file:$log_file:$file_index"
+        test_pid_map[$pid]="$test_file"
+
+        active_jobs=$((active_jobs + 1))
+
+        # Limit concurrent jobs to NUM_GPUS
+        while [ $active_jobs -ge $NUM_GPUS ]; do
+            # Wait for any job to finish
+            for pid in "${!test_pid_map[@]}"; do
+                if ! kill -0 "$pid" 2>/dev/null; then
+                    # Job finished, process result
+                    wait "$pid" 2>/dev/null || true
+                    active_jobs=$((active_jobs - 1))
+                    unset "test_pid_map[$pid]"
+                    break
+                fi
+            done
+            sleep 0.1
+        done
+    done
+
+    # Wait for all remaining jobs
+    echo ""
+    echo "Waiting for all tests to complete..."
+    for pid in "${!test_result_files[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+
+    echo ""
+    echo "All tests completed. Processing results..."
+    echo ""
+
+    # Process results
+    for pid in "${!test_result_files[@]}"; do
+        local result_file test_file log_file file_index
+        IFS=':' read -r result_file test_file log_file file_index <<< "${test_result_files[$pid]}"
+
+        # Show log output
+        if [ -f "$log_file" ]; then
+            cat "$log_file"
+            echo ""
+        fi
+
+        # Process result
+        if [ -f "$result_file" ]; then
+            local result
+            result=$(cat "$result_file")
+            TOTAL_TESTS=$((TOTAL_TESTS + 1))
+
+            if [[ "$result" == PASSED* ]]; then
+                PASSED_TESTS=$((PASSED_TESTS + 1))
+                if [ "$mode" = "sanity" ]; then
+                    local total_in_file sampled_in_file
+                    # shellcheck disable=SC2034  # status is part of the read but unused
+                    IFS=':' read -r _ total_in_file sampled_in_file <<< "$result"
+                    TOTAL_TEST_CASES=$((TOTAL_TEST_CASES + total_in_file))
+                    SAMPLED_TEST_CASES=$((SAMPLED_TEST_CASES + sampled_in_file))
+                fi
+            elif [[ "$result" == FAILED* ]]; then
+                FAILED_TESTS="$FAILED_TESTS\n  - $test_file"
+                # shellcheck disable=SC2034  # EXIT_CODE is used by calling scripts
+                EXIT_CODE=1
+                if [ "$mode" = "sanity" ]; then
+                    local total_in_file sampled_in_file
+                    # shellcheck disable=SC2034  # status is part of the read but unused
+                    IFS=':' read -r _ total_in_file sampled_in_file <<< "$result"
+                    TOTAL_TEST_CASES=$((TOTAL_TEST_CASES + total_in_file))
+                    SAMPLED_TEST_CASES=$((SAMPLED_TEST_CASES + sampled_in_file))
+                fi
+            elif [[ "$result" == SKIPPED* ]]; then
+                # Don't count skipped tests as passed
+                TOTAL_TESTS=$((TOTAL_TESTS - 1))
+            fi
+        fi
+    done
+}
+
 # Print execution summary
 print_execution_summary() {
     if [ "$SANITY_TEST" == "true" ]; then
@@ -422,16 +656,27 @@ execute_tests() {
 
     mkdir -p "${JUNIT_DIR}"
 
-    if [ "$SANITY_TEST" == "true" ]; then
-        FILE_COUNT=0
-        for test_file in $test_files; do
-            FILE_COUNT=$((FILE_COUNT + 1))
-            run_sanity_test_file "$test_file" "$FILE_COUNT"
-        done
+    # Check if parallel execution is enabled
+    if [ "$PARALLEL_TESTS" == "true" ]; then
+        # Run tests in parallel
+        if [ "$SANITY_TEST" == "true" ]; then
+            run_tests_parallel "$test_files" "sanity"
+        else
+            run_tests_parallel "$test_files" "full"
+        fi
     else
-        for test_file in $test_files; do
-            run_full_test_file "$test_file"
-        done
+        # Original sequential execution
+        if [ "$SANITY_TEST" == "true" ]; then
+            FILE_COUNT=0
+            for test_file in $test_files; do
+                FILE_COUNT=$((FILE_COUNT + 1))
+                run_sanity_test_file "$test_file" "$FILE_COUNT"
+            done
+        else
+            for test_file in $test_files; do
+                run_full_test_file "$test_file"
+            done
+        fi
     fi
 
     print_execution_summary
