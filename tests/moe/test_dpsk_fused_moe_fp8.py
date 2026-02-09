@@ -1,3 +1,4 @@
+import os
 import pytest
 import torch
 from flashinfer import shuffle_matrix_a
@@ -702,6 +703,20 @@ def test_correctness_dpsk_fp8_fused_moe(
     # Generate random but consistent inputs
     # Issue #2356: Add small_scale_fraction to test bimodal scale distributions
     # Real models like Qwen3-480B have ~45% of scales < 1e-6
+    # Environment variables override routing_config for sweep testing
+    small_scale_fraction = float(
+        os.environ.get(
+            "SMALL_SCALE_FRACTION", routing_config.get("small_scale_fraction", 0.0)
+        )
+    )
+    small_scale_magnitude = float(
+        os.environ.get(
+            "SMALL_SCALE_MAGNITUDE", routing_config.get("small_scale_magnitude", 0.01)
+        )
+    )
+    print(
+        f"\n=== small_scale_fraction={small_scale_fraction}, small_scale_magnitude={small_scale_magnitude} ==="
+    )
     inputs = generate_random_inputs_moe(
         seq_len,
         num_experts_global=E_GLOBAL,
@@ -712,8 +727,8 @@ def test_correctness_dpsk_fp8_fused_moe(
         local_expert_offset=local_expert_offset,
         routed_scaling_factor=routing_config["routed_scaling"],
         device=device,
-        small_scale_fraction=routing_config.get("small_scale_fraction", 0.0),
-        small_scale_magnitude=routing_config.get("small_scale_magnitude", 0.01),
+        small_scale_fraction=small_scale_fraction,
+        small_scale_magnitude=small_scale_magnitude,
     )
 
     # Run reference (returns bf16)
