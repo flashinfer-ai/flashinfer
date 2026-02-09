@@ -601,6 +601,8 @@ TUNE_MAX_NUM_TOKENS = 4096
                 "compatible_intermediate_size": [640],
                 "enable_autotune": True,
                 "hidden_size": 1536,  # Reduced from 6144, override default 7168
+                "small_scale_fraction": 0.45,
+                "small_scale_magnitude": 0.01,
             },
             id="Qwen3_480B",
         ),
@@ -700,7 +702,6 @@ def test_correctness_dpsk_fp8_fused_moe(
     # Generate random but consistent inputs
     # Issue #2356: Add small_scale_fraction to test bimodal scale distributions
     # Real models like Qwen3-480B have ~45% of scales < 1e-6
-    small_scale_fraction = 0.45  # Set to 0.0 to disable
     inputs = generate_random_inputs_moe(
         seq_len,
         num_experts_global=E_GLOBAL,
@@ -711,8 +712,8 @@ def test_correctness_dpsk_fp8_fused_moe(
         local_expert_offset=local_expert_offset,
         routed_scaling_factor=routing_config["routed_scaling"],
         device=device,
-        small_scale_fraction=small_scale_fraction,
-        small_scale_magnitude=1e-2,
+        small_scale_fraction=routing_config.get("small_scale_fraction", 0.0),
+        small_scale_magnitude=routing_config.get("small_scale_magnitude", 0.01),
     )
 
     # Run reference (returns bf16)
