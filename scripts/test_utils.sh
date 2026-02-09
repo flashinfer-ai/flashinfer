@@ -5,7 +5,7 @@
 # Default environment variables
 : "${JUNIT_DIR:=$(realpath ./junit)}"
 : "${MAX_JOBS:=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
-: "${CUDA_VISIBLE_DEVICES:=0}"
+# CUDA_VISIBLE_DEVICES: Not set by default - let detect_gpus() auto-detect via nvidia-smi
 : "${SAMPLE_RATE:=5}"  # Run every Nth test in sanity mode (5 = ~20% coverage)
 : "${PARALLEL_TESTS:=true}"  # Enable parallel test execution by default
 
