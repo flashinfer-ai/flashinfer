@@ -538,7 +538,8 @@ def gen_trtllm_gen_gemm_module() -> JitSpec:
         uri_path = f"{header_path}/{file}"
         file_hash = get_meta_hash(checksum, file)
         file_path = str(header_dest_dir / file)
-        get_file(uri_path, file_hash, file_path)
+        result = get_file(uri_path, file_hash, file_path)
+        assert result, f"{file} not found"
 
     # Record which artifact version these headers belong to
     write_if_different(artifact_hash_path, ArtifactPath.TRTLLM_GEN_GEMM)
