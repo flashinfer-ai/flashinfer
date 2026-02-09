@@ -94,6 +94,7 @@ def chunk_gated_delta_rule(
     output_final_state: bool = False,
     cu_seqlens: Optional[torch.Tensor] = None,
     use_qk_l2norm_in_kernel: bool = False,
+    g_space: str = "linear",
     output: Optional[torch.Tensor] = None,
     output_state: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
@@ -117,6 +118,7 @@ def chunk_gated_delta_rule(
             Forget gate (alpha) of shape ``[total_seq_len, num_sab_heads]`` where
             ``num_sab_heads = max(num_q_heads, num_v_heads)``. Must be float32.
             If None, defaults to all ones. Default: ``None``.
+            The space of this tensor is controlled by ``g_space`` parameter.
         beta (Optional[torch.Tensor]):
             Update gate (beta) of shape ``[total_seq_len, num_sab_heads]``.
             Must be float32. If None, defaults to all ones. Default: ``None``.
@@ -133,6 +135,19 @@ def chunk_gated_delta_rule(
             Required for variable-length sequences (varlen mode).
         use_qk_l2norm_in_kernel (bool):
             Whether to use QK L2 normalization in kernel. Default: ``False``.
+        g_space (str):
+            The space of the ``g`` (alpha) parameter. Options:
+
+            - ``"linear"``: g is in linear space (default, backward compatible).
+              The kernel will apply log2 internally for numerical stability.
+            - ``"log"``: g is in natural log (ln) space. Will be converted to
+              linear space via exp(g) before processing.
+            - ``"log2"``: g is in log2 space. Will be converted to linear space
+              via exp2(g) before processing.
+
+            Note: The kernel always performs cumulative product in log2 space
+            internally for numerical stability, regardless of input space.
+            Default: ``"linear"``.
         output (Optional[torch.Tensor]):
             Pre-allocated output tensor of shape ``[total_seq_len, num_o_heads, head_size]``
             where ``num_o_heads = max(num_q_heads, num_v_heads)``.
@@ -156,6 +171,9 @@ def chunk_gated_delta_rule(
         - Requires SM90 (Hopper) architecture.
     """
     assert cu_seqlens is not None, "cu_seqlens is required for varlen mode"
+    assert g_space in ["linear", "log", "log2"], (
+        f"Invalid g_space: {g_space}. Must be 'linear', 'log', or 'log2'."
+    )
 
     num_seqs = cu_seqlens.size(0) - 1
     total_seq_len = q.size(0)
@@ -188,6 +206,14 @@ def chunk_gated_delta_rule(
             device=q.device,
         )
 
+    # Convert g to linear space if needed
+    g_linear = g
+    if g is not None and g_space != "linear":
+        if g_space == "log":
+            g_linear = torch.exp(g)
+        elif g_space == "log2":
+            g_linear = torch.exp2(g)
+
     # Prepare workspace buffer for TMA Store in kernel
     # 128B tensormap for each SM on Hopper architecture
     workspace_size = get_device_sm_count(q.device) * 128
@@ -201,7 +227,7 @@ def chunk_gated_delta_rule(
         v,
         cu_seqlens.to(torch.int64),  # C++ kernel expects int64
         initial_state,
-        g,
+        g_linear,
         beta,
         scale if scale is not None else 0.0,
         workspace_buffer,

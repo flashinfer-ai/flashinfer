@@ -435,3 +435,114 @@ def test_chunked_prefill(
         beta,
         seed,
     )
+
+
+@pytest.mark.parametrize("g_space", ["linear", "log", "log2"])
+@pytest.mark.parametrize("head_size", [128])
+@pytest.mark.parametrize("num_q_heads, num_k_heads, num_v_heads", [(4, 4, 4)])
+@pytest.mark.parametrize("seq_lens", [[128]])
+@pytest.mark.parametrize("dtype", ["float16"])
+def test_g_space_conversion(
+    qkv_factory,
+    dtype: str,
+    num_q_heads: int,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_size: int,
+    seq_lens: list[int],
+    g_space: str,
+    seed: int = int(os.environ.get("SEED", "0")),
+):
+    """Test that different g_space values produce consistent results."""
+    _skip_if_not_sm90()
+
+    random.seed(seed)
+    torch.random.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+
+    num_seqs = len(seq_lens)
+    total_seqlen = sum(seq_lens)
+    num_o_heads = max(num_q_heads, num_v_heads)
+    num_sab_heads = max(num_q_heads, num_v_heads)
+
+    dtype = getattr(torch, dtype)
+    device = torch.device("cuda")
+
+    with device:
+        q, k, v = qkv_factory(
+            seq_lens, num_q_heads, num_k_heads, num_v_heads, head_size, dtype
+        )
+        k = torch.nn.functional.normalize(k, p=2.0, dim=-1)
+        cu_seq_lens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int64)
+
+        # Create alpha in linear space
+        alpha_linear = torch.rand(total_seqlen, num_sab_heads)
+
+        # Convert to different spaces for testing
+        if g_space == "linear":
+            alpha_test = alpha_linear
+        elif g_space == "log":
+            alpha_test = torch.log(alpha_linear)
+        elif g_space == "log2":
+            alpha_test = torch.log2(alpha_linear)
+
+        beta = torch.rand(total_seqlen, num_sab_heads)
+        scale = 1.0 / math.sqrt(head_size)
+
+    # Test with converted space
+    our_o_test = torch.empty(
+        [total_seqlen, num_o_heads, head_size], dtype=q.dtype, device=q.device
+    )
+    our_state_test = torch.empty(
+        (num_seqs, num_sab_heads, head_size, head_size),
+        dtype=torch.float32,
+        device=q.device,
+    )
+
+    chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        alpha_test,
+        beta,
+        scale,
+        None,
+        True,
+        cu_seq_lens,
+        True,
+        g_space=g_space,
+        output=our_o_test,
+        output_state=our_state_test,
+    )
+
+    # Test with linear space (baseline)
+    our_o_baseline = torch.empty(
+        [total_seqlen, num_o_heads, head_size], dtype=q.dtype, device=q.device
+    )
+    our_state_baseline = torch.empty(
+        (num_seqs, num_sab_heads, head_size, head_size),
+        dtype=torch.float32,
+        device=q.device,
+    )
+
+    chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        alpha_linear,
+        beta,
+        scale,
+        None,
+        True,
+        cu_seq_lens,
+        True,
+        g_space="linear",
+        output=our_o_baseline,
+        output_state=our_state_baseline,
+    )
+
+    torch.cuda.synchronize()
+
+    # The results should be identical regardless of g_space
+    torch.testing.assert_close(our_o_test, our_o_baseline, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(our_state_test, our_state_baseline, atol=1e-5, rtol=1e-5)
