@@ -168,6 +168,12 @@ def parse_gemm_args(line, parser):
         default=False,
         help="Use bias for mm_bf16 (TGV backend only).",
     )
+    parser.add_argument(
+        "--enable_pdl",
+        action="store_true",
+        default=False,
+        help="Enable programmatic dependent launch.",
+    )
 
     args = parser.parse_args(line)
     if args.verbose >= 1:
@@ -1533,6 +1539,25 @@ def testMmBf16(args):
             and backend not in autotune_supported_backends
         ):
             print(f"[INFO] {backend} backend does not support autotune")
+            backends_to_remove.append(backend)
+            continue
+
+        # Filter backends based on TGV-specific features
+        if use_bias and backend != "tgv":
+            print(f"[INFO] {backend} backend does not support bias (TGV only)")
+            backends_to_remove.append(backend)
+            continue
+
+        if use_pdl and backend != "tgv":
+            print(f"[INFO] {backend} backend does not support PDL (TGV only)")
+            backends_to_remove.append(backend)
+            continue
+
+        # TGV backend only supports bfloat16 output
+        if backend == "tgv" and out_dtype != torch.bfloat16:
+            print(
+                f"[INFO] TGV backend only supports bfloat16 output dtype, got {out_dtype}"
+            )
             backends_to_remove.append(backend)
             continue
 
