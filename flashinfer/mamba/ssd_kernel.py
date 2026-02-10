@@ -2685,7 +2685,7 @@ class SSDKernel:
     ):
         tiled_mma_intra1 = sm100_utils.make_trivial_tiled_mma(
             io_dtype,
-            tcgen05.OperandMajorMode("mn"),
+            tcgen05.OperandMajorMode("k"),   # A operand (C) is K-major (N-contiguous)
             tcgen05.OperandMajorMode("mn"),
             acc_dtype,
             cta_group,
@@ -2712,7 +2712,7 @@ class SSDKernel:
         )
         tiled_mma_inter2 = sm100_utils.make_trivial_tiled_mma(
             io_dtype,
-            tcgen05.OperandMajorMode("mn"),
+            tcgen05.OperandMajorMode("k"),   # A operand (C) is K-major (N-contiguous)
             tcgen05.OperandMajorMode("k"),
             acc_dtype,
             cta_group,
@@ -2958,7 +2958,7 @@ class SSDKernel:
         # (D, L, 1, 1, C, EH, B)
         gX = cute.local_tile(
             tma_tensor_x,
-            self.tile_shape_mnk_intra2[1:],
+            self.tile_shape_mnk_intra2[1:], # mnk = (L, D, L)
             (None, None, None, None, None),
         )
         # Partition global tensor with regard to TiledMMA
@@ -2992,6 +2992,8 @@ class SSDKernel:
         block_in_cluster_coord_vmnk,
     ):
         # Local_tile partition global tensors
+        # C global layout is (L, N, C, G, B) with N stride 1 (K-major for MMA A operand)
+        # Modes 0,1 are (M, K) = (L, N) matching make_tiled_tma_atom_A expectations
         # (L, N, 1, 1, C, G, B)
         gC = cute.local_tile(
             tma_tensor_c,
@@ -3000,7 +3002,7 @@ class SSDKernel:
         )
         # Partition global tensor with regard to TiledMMA
         thr_mma_intra1 = tiled_mma_intra1.get_slice(mma_tile_coord_v)
-        # (MMA, MMA_M/N, MMA_K, 1, 1, C, G, B)
+        # (MMA, MMA_M, MMA_K, 1, 1, C, G, B)
         tCgC = thr_mma_intra1.partition_A(gC)
 
         # Partition global/shared tensor for TMA C

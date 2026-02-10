@@ -238,17 +238,17 @@ class _SSDKernel:
         )
         b_dst.copy_(B_reshaped.permute(2, 4, 1, 3, 0).to(b_dst.dtype))
 
-        # C: same layout as B
+        # C: zero-copy (L, N, C, G, B) with N stride 1 (K-major for MMA A operand)
+        # PyTorch (B, C, L, G, N) permuted (2, 4, 1, 3, 0) gives (L, N, C, G, B) with N contiguous
+        # Modes 0,1 are (M, K) = (L, N) matching make_tiled_tma_atom_A expectations
         C_reshaped = C.reshape(batch, nchunks, chunk_size, ngroups, dstate)
-        c_tensor, c_dst = _create_cutlass_tensor(
-            [batch, ngroups, dstate, nchunks, chunk_size],
-            [4, 2, 3, 1, 0],
-            self.io_dtype,
-            [2, 3, 4],
-            cutlass_torch,
-            from_dlpack,
-        )
-        c_dst.copy_(C_reshaped.permute(2, 4, 1, 3, 0).to(c_dst.dtype))
+        assert C.dtype == io_torch_dtype, f"C dtype {C.dtype} doesn't match {io_torch_dtype}"
+        c_permuted = C_reshaped.permute(2, 4, 1, 3, 0)  # (L, N, C, G, B)
+        c_tensor = from_dlpack(c_permuted, assumed_align=16)
+        for mode in [2, 3, 4]:
+            c_tensor = c_tensor.mark_compact_shape_dynamic(
+                mode=mode, stride_order=c_permuted.dim_order()
+            )
 
         # D: (nheads,) -> CUTLASS (1, nheads) or (headdim, nheads)
         if self.has_d and D is not None:
