@@ -1573,11 +1573,9 @@ def testMmBf16(args):
             raise ValueError(f"Unsupported backend: {backend}")
 
     has_reference_output = False
+    reference_output_base = None
     if run_refcheck:
-        reference_output = torch.mm(a, b)
-        if bias is not None:
-            reference_output = reference_output + bias.unsqueeze(0)
-        reference_output = reference_output.to(out_dtype)
+        reference_output_base = torch.mm(a, b).to(out_dtype)
         has_reference_output = True
 
     if getattr(args, "autotune", False):
@@ -1616,6 +1614,14 @@ def testMmBf16(args):
     if len(tested_backends) > 0:
         if run_refcheck and has_reference_output:
             for i in range(len(tested_backends)):
+                # Only add bias to reference when comparing against tgv backend
+                if tested_backends[i] == "tgv" and bias is not None:
+                    reference_output = reference_output_base + bias.unsqueeze(0).to(
+                        out_dtype
+                    )
+                else:
+                    reference_output = reference_output_base
+
                 cos_sim = F.cosine_similarity(
                     reference_output.reshape(-1),
                     tested_outputs[i].reshape(-1),
