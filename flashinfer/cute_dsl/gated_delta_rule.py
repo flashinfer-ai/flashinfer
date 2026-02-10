@@ -755,8 +755,14 @@ def gated_delta_rule_decode_kernel_seqlen1(
     q_sh = smem.allocate_tensor(cutlass.Float32, 128)
     k_sh = smem.allocate_tensor(cutlass.Float32, 128)
 
-    pred_sh = smem.allocate_tensor(cutlass.Float32, cute.make_layout((4, 32)))
-    out_sh = smem.allocate_tensor(cutlass.Float32, cute.make_layout((4, 32)))
+    # pred_sh = smem.allocate_tensor(cutlass.Float32, cute.make_layout((4, 32)))
+    # out_sh = smem.allocate_tensor(cutlass.Float32, cute.make_layout((4, 32)))
+    pred_sh = smem.allocate_tensor(
+        cutlass.Float32, cute.make_layout((32, 4), stride=(1, 32))
+    )
+    out_sh = smem.allocate_tensor(
+        cutlass.Float32, cute.make_layout((32, 4), stride=(1, 32))
+    )
 
     h_global = gH[(batch_idx, value_head_idx, None, None)]
 
@@ -823,13 +829,13 @@ def gated_delta_rule_decode_kernel_seqlen1(
         )
     pred = pred + pred2
 
-    pred_sh[warp_idx, lane_idx] = pred
+    pred_sh[lane_idx, warp_idx] = pred
     cute.arch.sync_threads()
     pred_final = (
-        pred_sh[0, lane_idx]
-        + pred_sh[1, lane_idx]
-        + pred_sh[2, lane_idx]
-        + pred_sh[3, lane_idx]
+        pred_sh[lane_idx, 0]
+        + pred_sh[lane_idx, 1]
+        + pred_sh[lane_idx, 2]
+        + pred_sh[lane_idx, 3]
     )
 
     v_val = (v_sh[lane_idx] - pred_final) * beta
@@ -855,13 +861,13 @@ def gated_delta_rule_decode_kernel_seqlen1(
         )
     out = out + out2
 
-    out_sh[warp_idx, lane_idx] = out
+    out_sh[lane_idx, warp_idx] = out
     cute.arch.sync_threads()
     out_final = (
-        out_sh[0, lane_idx]
-        + out_sh[1, lane_idx]
-        + out_sh[2, lane_idx]
-        + out_sh[3, lane_idx]
+        out_sh[lane_idx, 0]
+        + out_sh[lane_idx, 1]
+        + out_sh[lane_idx, 2]
+        + out_sh[lane_idx, 3]
     )
 
     write_h_chunk_to_smem(h_chunk, h_sh_chunk0, lane_idx, k_base)
@@ -900,13 +906,13 @@ def gated_delta_rule_decode_kernel_seqlen1(
         )
     pred = pred + pred2
 
-    pred_sh[warp_idx, lane_idx] = pred
+    pred_sh[lane_idx, warp_idx] = pred
     cute.arch.sync_threads()
     pred_final = (
-        pred_sh[0, lane_idx]
-        + pred_sh[1, lane_idx]
-        + pred_sh[2, lane_idx]
-        + pred_sh[3, lane_idx]
+        pred_sh[lane_idx, 0]
+        + pred_sh[lane_idx, 1]
+        + pred_sh[lane_idx, 2]
+        + pred_sh[lane_idx, 3]
     )
 
     v_val = (v_sh[32 + lane_idx] - pred_final) * beta
@@ -931,13 +937,13 @@ def gated_delta_rule_decode_kernel_seqlen1(
         )
     out = out + out2
 
-    out_sh[warp_idx, lane_idx] = out
+    out_sh[lane_idx, warp_idx] = out
     cute.arch.sync_threads()
     out_final = (
-        out_sh[0, lane_idx]
-        + out_sh[1, lane_idx]
-        + out_sh[2, lane_idx]
-        + out_sh[3, lane_idx]
+        out_sh[lane_idx, 0]
+        + out_sh[lane_idx, 1]
+        + out_sh[lane_idx, 2]
+        + out_sh[lane_idx, 3]
     )
 
     write_h_chunk_to_smem(h_chunk, h_sh_chunk1, lane_idx, k_base)
@@ -971,13 +977,13 @@ def gated_delta_rule_decode_kernel_seqlen1(
         )
     pred = pred + pred2
 
-    pred_sh[warp_idx, lane_idx] = pred
+    pred_sh[lane_idx, warp_idx] = pred
     cute.arch.sync_threads()
     pred_final = (
-        pred_sh[0, lane_idx]
-        + pred_sh[1, lane_idx]
-        + pred_sh[2, lane_idx]
-        + pred_sh[3, lane_idx]
+        pred_sh[lane_idx, 0]
+        + pred_sh[lane_idx, 1]
+        + pred_sh[lane_idx, 2]
+        + pred_sh[lane_idx, 3]
     )
 
     v_val = (v_sh[64 + lane_idx] - pred_final) * beta
@@ -1002,13 +1008,13 @@ def gated_delta_rule_decode_kernel_seqlen1(
         )
     out = out + out2
 
-    out_sh[warp_idx, lane_idx] = out
+    out_sh[lane_idx, warp_idx] = out
     cute.arch.sync_threads()
     out_final = (
-        out_sh[0, lane_idx]
-        + out_sh[1, lane_idx]
-        + out_sh[2, lane_idx]
-        + out_sh[3, lane_idx]
+        out_sh[lane_idx, 0]
+        + out_sh[lane_idx, 1]
+        + out_sh[lane_idx, 2]
+        + out_sh[lane_idx, 3]
     )
 
     write_h_chunk_to_smem(h_chunk, h_sh_chunk2, lane_idx, k_base)
@@ -1042,13 +1048,13 @@ def gated_delta_rule_decode_kernel_seqlen1(
         )
     pred = pred + pred2
 
-    pred_sh[warp_idx, lane_idx] = pred
+    pred_sh[lane_idx, warp_idx] = pred
     cute.arch.sync_threads()
     pred_final = (
-        pred_sh[0, lane_idx]
-        + pred_sh[1, lane_idx]
-        + pred_sh[2, lane_idx]
-        + pred_sh[3, lane_idx]
+        pred_sh[lane_idx, 0]
+        + pred_sh[lane_idx, 1]
+        + pred_sh[lane_idx, 2]
+        + pred_sh[lane_idx, 3]
     )
 
     v_val = (v_sh[96 + lane_idx] - pred_final) * beta
@@ -1073,13 +1079,13 @@ def gated_delta_rule_decode_kernel_seqlen1(
         )
     out = out + out2
 
-    out_sh[warp_idx, lane_idx] = out
+    out_sh[lane_idx, warp_idx] = out
     cute.arch.sync_threads()
     out_final = (
-        out_sh[0, lane_idx]
-        + out_sh[1, lane_idx]
-        + out_sh[2, lane_idx]
-        + out_sh[3, lane_idx]
+        out_sh[lane_idx, 0]
+        + out_sh[lane_idx, 1]
+        + out_sh[lane_idx, 2]
+        + out_sh[lane_idx, 3]
     )
 
     write_h_chunk_to_smem(h_chunk, h_sh_chunk3, lane_idx, k_base)
