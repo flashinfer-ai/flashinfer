@@ -336,6 +336,14 @@ class FusedMoeLauncher {
           args->top_k, args->hidden_size, args->intermediate_size, args->local_num_experts,
           args->num_tokens);
     }
+    auto valid_cfgs =
+        moe_runner->getValidConfigIndices(args->top_k, args->hidden_size, args->intermediate_size,
+                                          args->local_num_experts, args->num_tokens);
+    auto valid_it = std::find(valid_cfgs.begin(), valid_cfgs.end(), moe_tactic);
+    FLASHINFER_CHECK(valid_it != valid_cfgs.end(), "Invalid MoE tactic ", moe_tactic,
+                     " for tile_N=", tile_tokens_dim, ". Number of valid tactics for this tile is ",
+                     valid_cfgs.size(),
+                     ". This often indicates a stale or mismatched autotuner cache entry.");
     this->moe_tactic = moe_tactic;
 
     auto workspace_sizes = moe_runner->getWorkspaceSizeInBytes(*args, moe_tactic);
@@ -728,7 +736,15 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
 
 class Fp8BlockScaleLauncher : public FusedMoeLauncher {
  public:
-  static constexpr std::array<int32_t, 5> mSupportedTileNums = {8, 16, 32, 64, 128};
+  static constexpr std::array<int32_t, 5> mBaseSupportedTileNums = {8, 16, 32, 64, 128};
+
+  static std::vector<int32_t> getSupportedTileNums(Fp8QuantizationType quantization_type) {
+    std::vector<int32_t> tiles(mBaseSupportedTileNums.begin(), mBaseSupportedTileNums.end());
+    if (quantization_type == Fp8QuantizationType::MxFp8) {
+      tiles.push_back(256);
+    }
+    return tiles;
+  }
 
   Fp8BlockScaleLauncher(Optional<TensorView> const& routing_logits,
                         Optional<TensorView> const& routing_bias, TensorView const& hidden_states,
@@ -1052,10 +1068,7 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
                                                Fp8QuantizationType quantization_type) {
     Array<Array<int64_t>> valid_configs;
 
-    std::vector<int32_t> supported_tile_nums(mSupportedTileNums.begin(), mSupportedTileNums.end());
-    // if (quantization_type == Fp8QuantizationType::MxFp8) {
-    //   supported_tile_nums.push_back(256);
-    // }
+    auto supported_tile_nums = getSupportedTileNums(quantization_type);
     std::set<int32_t> selected_tile_nums =
         computeSelectedTileN(supported_tile_nums, num_tokens, top_k, num_local_experts);
 
@@ -1766,13 +1779,9 @@ Tensor trtllm_fp8_block_scale_moe(
   auto const num_tokens = hidden_states.size(0);
   auto const hidden_size = hidden_states.size(1);
 
-  std::vector<int32_t> mSupportedTileN(Fp8BlockScaleLauncher::mSupportedTileNums.begin(),
-                                       Fp8BlockScaleLauncher::mSupportedTileNums.end());
-  // if (quantization_type == Fp8QuantizationType::MxFp8) {
-  //   mSupportedTileN.push_back(256);
-  // }
+  auto supported_tile_nums = Fp8BlockScaleLauncher::getSupportedTileNums(quantization_type);
   std::set<int32_t> selected_tile_nums =
-      computeSelectedTileN(mSupportedTileN, num_tokens, top_k, local_num_experts);
+      computeSelectedTileN(supported_tile_nums, num_tokens, top_k, local_num_experts);
 
   // Create a map of launchers for each tile size
   std::unordered_map<int32_t, std::unique_ptr<Fp8BlockScaleLauncher>> launchers_map;
@@ -2075,8 +2084,7 @@ Array<Array<int64_t>> trtllm_get_valid_moe_configs(
 
   } else if (dtype_act == btg::Dtype::E4m3 && dtype_weights == btg::Dtype::E4m3) {
     // FP8
-    if (quantization_type == Fp8QuantizationType::DeepSeekFp8 ||
-        quantization_type == Fp8QuantizationType::MxFp8) {
+    if (quantization_type == Fp8QuantizationType::DeepSeekFp8) {
       // FP8 block scale
       return Fp8BlockScaleLauncher::getValidConfigs(
           top_k, hidden_size, intermediate_size, num_local_experts, num_tokens, use_shuffled_weight,
@@ -2087,6 +2095,10 @@ Array<Array<int64_t>> trtllm_get_valid_moe_configs(
           top_k, hidden_size, intermediate_size, num_local_experts, num_tokens, act_type,
           use_shuffled_weight, weight_layout, dtype_act, dtype_weights);
     }
+  } else if (dtype_act == btg::Dtype::MxE4m3 && dtype_weights == btg::Dtype::MxE4m3) {
+    return Fp8BlockScaleLauncher::getValidConfigs(
+        top_k, hidden_size, intermediate_size, num_local_experts, num_tokens, use_shuffled_weight,
+        weight_layout, dtype_weights, quantization_type);
   } else if (dtype_weights == btg::Dtype::E2m1 || dtype_weights == btg::Dtype::MxE2m1) {
     // FP4 block scale
     return FP4BlockScaleLauncher::getValidConfigs(top_k, hidden_size, intermediate_size,

@@ -1132,6 +1132,9 @@ def get_trtllm_moe_sm100_module():
             elif (
                 self.dtype_act == DtypeTrtllmGen.E4m3
                 and self.dtype_weights == DtypeTrtllmGen.E4m3
+            ) or (
+                self.dtype_act == DtypeTrtllmGen.MxE4m3
+                and self.dtype_weights == DtypeTrtllmGen.MxE4m3
             ):
                 # FP8 operations
                 if (
@@ -1645,8 +1648,16 @@ def get_trtllm_moe_sm100_module():
                 else torch.empty(0, dtype=routing_dtype, device=hidden_states.device)
             )
 
-        dtype_act = DtypeTrtllmGen.E4m3  # FP8 activation
-        dtype_weights = DtypeTrtllmGen.E4m3  # FP8 weights
+        dtype_act = (
+            DtypeTrtllmGen.E4m3
+            if fp8_quantization_type == Fp8QuantizationType.DeepSeekFp8
+            else DtypeTrtllmGen.MxE4m3
+        )  # FP8 activation
+        dtype_weights = (
+            DtypeTrtllmGen.E4m3
+            if fp8_quantization_type == Fp8QuantizationType.DeepSeekFp8
+            else DtypeTrtllmGen.MxE4m3
+        )  # FP8 weights
 
         moe_runner = MoERunner(
             top_k=top_k,

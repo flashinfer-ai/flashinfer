@@ -112,12 +112,6 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
         continue;
       }
 
-      if (options.mDtypeA == tg::Dtype::MxE4m3 && options.mDtypeB == tg::Dtype::MxE4m3) {
-        if (options.mNumSlicesForSplitK > 1 || options.mUseUnrollLoop2xForMma == 1) {
-          continue;
-        }
-      }
-
       if (mOptions.transposeMmaOutput && options.mEpilogueTileM == mOptions.epilogueTileM) {
         mPassingConfigIndices.push_back(i);
       }
@@ -141,7 +135,7 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
 size_t TrtllmGenBatchedGemmRunner::getWorkspaceSizeInBytes(
     int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens, int32_t numTokens,
     int32_t numBatches, int32_t maxNumCtasInBatchDim, int32_t configIndex) const {
-  BatchedGemmData gemmData;
+  BatchedGemmData gemmData{};
   gemmData.mProblemDimensions.mNumBatches = numBatches;
   gemmData.mProblemDimensions.mNumTokens = numTokens;
   gemmData.mProblemDimensions.mBatchM = !mOptions.transposeMmaOutput;
@@ -180,7 +174,7 @@ void TrtllmGenBatchedGemmRunner::run(
     CUstream stream, int device, int32_t configIndex, bool enable_pdl) {
   auto bmm = BatchedGemmInterface();
 
-  BatchedGemmData gemmData;
+  BatchedGemmData gemmData{};
 
   auto const configs = bmm.getBatchedGemmConfigs();
 
@@ -334,7 +328,7 @@ std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(
 
   int32_t multiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
 
-  BatchedGemmData gemmData;
+  BatchedGemmData gemmData{};
   // Dims
   gemmData.mProblemDimensions.mNumBatches = numBatches;
   gemmData.mProblemDimensions.mNumTokens = numTokens;
@@ -443,7 +437,7 @@ bool TrtllmGenBatchedGemmRunner::isValidConfigIndex(int32_t configIndex, int32_t
   auto const bmm = BatchedGemmInterface();
   auto const configs = bmm.getBatchedGemmConfigs();
 
-  BatchedGemmData gemmData;
+  BatchedGemmData gemmData{};
   // Dims
   gemmData.mProblemDimensions.mNumBatches = numBatches;
   gemmData.mProblemDimensions.mNumTokens = numTokens;
@@ -458,6 +452,9 @@ bool TrtllmGenBatchedGemmRunner::isValidConfigIndex(int32_t configIndex, int32_t
   gemmData.mProblemDimensions.mRank = 0;
   gemmData.mProblemDimensions.mWorldSize = 1;
   gemmData.mProblemDimensions.mMaxNumCtasInTokenDim = maxNumCtasInBatchDim;
+  gemmData.mProblemDimensions.mValidM = gemmData.mProblemDimensions.mM;
+  gemmData.mProblemDimensions.mValidN = gemmData.mProblemDimensions.mN;
+  gemmData.mProblemDimensions.mValidK = gemmData.mProblemDimensions.mK;
 
   auto const& config = configs[configIndex];
 
