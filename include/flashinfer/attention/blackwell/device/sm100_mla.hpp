@@ -116,6 +116,10 @@ class MLA {
     auto [H, K, D, B] = args.problem_shape;
     int sm_count = args.hw_info.sm_count;
     int max_splits = ceil_div(K, 128);
+    // NOTE: This heuristic depends on batch size B, which means the split count
+    // (and thus the reduction kernel behavior) varies with batch size.
+    // This is why batch_invariant flag may not guarantee full batch invariance
+    // for MLA attention - different batch sizes lead to different split counts.
     int sms_per_batch = max(1, sm_count / B);
     int split_heur = min(max_splits, sms_per_batch);
     int waves = ceil_div(B * split_heur, sm_count);

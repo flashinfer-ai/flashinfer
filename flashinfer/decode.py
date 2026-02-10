@@ -1918,6 +1918,7 @@ class TrtllmGenDecodeModule:
         workspace_size: int,
         window_left: int = -1,
         enable_pdl: bool = None,
+        batch_invariant: bool = False,
         out: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -1958,6 +1959,7 @@ class TrtllmGenDecodeModule:
             0,  # sparse_mla_top_k
             self._sm_count,
             enable_pdl,
+            batch_invariant,
             workspace_size,
             sinks,
             None,  # cum_seq_lens_q
@@ -2118,6 +2120,7 @@ def trtllm_batch_decode_with_kv_cache(
     sinks: Optional[List[torch.Tensor]] = None,
     kv_layout: str = "HND",
     enable_pdl: Optional[bool] = None,
+    batch_invariant: bool = False,
     backend: str = "auto",
     q_len_per_req: Optional[int] = 1,
     o_scale: Optional[float] = 1.0,
@@ -2184,6 +2187,12 @@ def trtllm_batch_decode_with_kv_cache(
     enable_pdl : Optional[bool] = None
         Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
         When set to ``None``, the backend will be chosen based on the device architecture and kernel availability.
+
+    batch_invariant : bool = False
+        When set to True, disables multi-CTA optimization in the generation kernel.
+        This ensures the output is invariant to batch size, allowing per-request
+        processing without a for loop while maintaining consistent results.
+        Only supported by trtllm-gen backend. Defaults to False.
 
     backend : str = "auto"
         The implementation backend, could be ``auto``/``xqa`` or ``trtllm-gen``. Defaults to ``auto``.
@@ -2384,6 +2393,7 @@ def trtllm_batch_decode_with_kv_cache(
             0,  # sparse_mla_top_k
             sm_count,
             enable_pdl,
+            batch_invariant,
             workspace_buffer.numel() * workspace_buffer.element_size(),
             sinks,
             cum_seq_lens_q,
