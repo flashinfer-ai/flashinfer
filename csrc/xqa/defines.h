@@ -83,6 +83,12 @@ static_assert(SPEC_DEC, "SPEC_Q_SEQ_LEN should only be used when SPEC_DEC is ena
 #define CACHE_ELEM_ENUM 2
 #endif
 
+#if CACHE_ELEM_ENUM == 3
+#define ENABLE_4BIT_KV_CACHE 1
+#else
+#define ENABLE_4BIT_KV_CACHE 0
+#endif
+
 // don't modify
 #define USE_KV_CACHE true
 
@@ -181,8 +187,51 @@ static_assert(CACHE_ELEM_ENUM != 0);
 
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
+
+#if ENABLE_4BIT_KV_CACHE
+#include <cuda_fp4.h>
+#endif
+
 template <int32_t elemTypeEnum>
-using ElemType = mha::conditional_t<
-    elemTypeEnum == 0, INPUT_ELEM,
-    mha::conditional_t<elemTypeEnum == 1, int8_t,
-                       mha::conditional_t<elemTypeEnum == 2, __nv_fp8_e4m3, void>>>;
+struct ElemTypeConverter;
+// Specialization for elemTypeEnum = 0 (half/bf16)
+template <>
+struct ElemTypeConverter<0> {
+  using Type = INPUT_ELEM;
+  using ContainerType = INPUT_ELEM;
+  static constexpr int ElemsPerContainer = 1;
+  using ScalingFactorType = void;
+  static constexpr int QuantVectorSize = 1;
+};
+
+// Specialization for elemTypeEnum = 1 (int8)
+template <>
+struct ElemTypeConverter<1> {
+  using Type = int8_t;
+  using ContainerType = int8_t;
+  static constexpr int ElemsPerContainer = 1;
+  using ScalingFactorType = void;
+  static constexpr int QuantVectorSize = 1;
+};
+
+// Specialization for elemTypeEnum = 2 (fp8)
+template <>
+struct ElemTypeConverter<2> {
+  using Type = __nv_fp8_e4m3;
+  using ContainerType = __nv_fp8_e4m3;
+  static constexpr int ElemsPerContainer = 1;
+  using ScalingFactorType = void;
+  static constexpr int QuantVectorSize = 1;
+};
+
+#if ENABLE_4BIT_KV_CACHE
+// Specialization for elemTypeEnum = 3 (NVFP4)
+template <>
+struct ElemTypeConverter<3> {
+  using Type = __nv_fp4_e2m1;
+  using ContainerType = __nv_fp4x2_e2m1;
+  static constexpr int ElemsPerContainer = 2;
+  using ScalingFactorType = __nv_fp8_e4m3;
+  static constexpr int QuantVectorSize = 16;
+};
+#endif

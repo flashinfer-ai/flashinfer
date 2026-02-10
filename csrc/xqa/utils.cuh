@@ -552,6 +552,70 @@ __device__ inline Vec<uint32_t, nbMat * 2> ldmatrix_16x16_trans(LdGrain const* r
   }
 }
 
+template <uint32_t nbMat>
+__device__ inline Vec<uint32_t, nbMat * 2> ldmatrix_16x16_trans_unpack_4b(LdGrain const* row) {
+#if __CUDA_ARCH__ >= 1000
+  uint32_t a, b, c, d;
+  if constexpr (nbMat == 1) {
+    asm("ldmatrix.sync.aligned.m16n16.x1.trans.shared::cta.b8x16.b4x16_p64 {%0, %1}, [%2];\n"
+        : "=r"(a), "=r"(b)
+        : "l"(__cvta_generic_to_shared(row))
+        : "memory");
+    return Vec<uint32_t, 2>{a, b};
+  } else if constexpr (nbMat == 2) {
+    asm("ldmatrix.sync.aligned.m16n16.x2.trans.shared::cta.b8x16.b4x16_p64 {%0, %1, %2, %3}, "
+        "[%4];\n"
+        : "=r"(a), "=r"(b), "=r"(c), "=r"(d)
+        : "l"(__cvta_generic_to_shared(row))
+        : "memory");
+    return Vec<uint32_t, 4>{a, b, c, d};
+  } else {
+    static_assert(nbMat == 1 || nbMat == 2);
+  }
+#else
+  trap();
+#endif
+}
+
+template <uint32_t nbMat>
+__device__ inline Vec<uint32_t, nbMat> ldmatrix_8x16_4x_unpack_4b(LdGrain const* row) {
+#if __CUDA_ARCH__ >= 1000
+  uint32_t a, b, c, d;
+  if constexpr (nbMat == 4) {
+    asm("ldmatrix.sync.aligned.m8n16.x4.shared.b8x16.b4x16_p64 {%0, %1, %2, %3}, [%4];\n"
+        : "=r"(a), "=r"(b), "=r"(c), "=r"(d)
+        : "l"(__cvta_generic_to_shared(row))
+        : "memory");
+    return Vec<uint32_t, 4>{a, b, c, d};
+  } else if constexpr (nbMat == 2) {
+    asm("ldmatrix.sync.aligned.m8n16.x2.shared.b8x16.b4x16_p64 {%0, %1}, [%2];\n"
+        : "=r"(a), "=r"(b)
+        : "l"(__cvta_generic_to_shared(row))
+        : "memory");
+    return Vec<uint32_t, 2>{a, b};
+  } else if constexpr (nbMat == 1) {
+    asm("ldmatrix.sync.aligned.m8n16.x1.shared.b8x16.b4x16_p64 {%0}, [%1];\n"
+        : "=r"(a)
+        : "l"(__cvta_generic_to_shared(row))
+        : "memory");
+    return Vec<uint32_t, 1>{a};
+  } else {
+    static_assert(nbMat == 1 || nbMat == 2 || nbMat == 4);
+  }
+#else
+  trap();
+#endif
+}
+
+template <bool transpose>
+__device__ inline Vec<uint32_t, 4> ldmatrix_4x_unpack_4b(Warp const& warp, LdGrain const* row) {
+  if constexpr (transpose) {
+    return ldmatrix_16x16_trans_unpack_4b<2>(row);
+  } else {
+    return ldmatrix_8x16_4x_unpack_4b<4>(row);
+  }
+}
+
 template <bool transpose, uint32_t nbMat>
 __device__ inline void stmatrix(LdGrain* row, Vec<uint32_t, nbMat> const& data) {
 #if __CUDA_ARCH__ >= 900
@@ -688,6 +752,73 @@ __device__ inline Vec<uint32_t, 2> convertKCacheWordToF16(uint32_t i8data) {
   return ret;
 }
 
+#if ENABLE_4BIT_KV_CACHE
+template <>
+__device__ inline Vec<uint32_t, 2> convertKCacheWordToF16<half, __nv_fp4_e2m1>(uint32_t i8data) {
+  Vec<uint32_t, 2> ret;
+#if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  uint32_t src = i8data | (i8data >> 4);
+  uint32_t(&dst)[2] = reinterpret_cast<uint32_t(&)[2]>(ret);
+  asm("{\n"
+      ".reg .b8 byte0, byte2;\n"
+      "mov.b32 {byte0, _, byte2, _}, %2;\n"
+      "cvt.rn.f16x2.e2m1x2 %0, byte0;\n"
+      "cvt.rn.f16x2.e2m1x2 %1, byte2;\n"
+      "}"
+      : "=r"(dst[0]), "=r"(dst[1])
+      : "r"(src));
+#else
+  assert(!"need arch >= 1000");
+  trap();
+#endif
+  return ret;
+}
+
+template <>
+__device__ inline Vec<uint32_t, 2> convertKCacheWordToF16<__nv_bfloat16, __nv_fp4_e2m1>(
+    uint32_t i8data) {
+  Vec<uint32_t, 2> ret;
+  // This needs CUDA Toolkit version >= 13.2
+#if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+#if (defined __CUDACC_VER_MAJOR__) && (__CUDACC_VER_MAJOR__ >= 13) && \
+    (defined __CUDACC_VER_MINOR__) && (__CUDACC_VER_MINOR__ >= 2)
+  uint32_t src = i8data | (i8data >> 4);
+  uint32_t(&dst)[2] = reinterpret_cast<uint32_t(&)[2]>(ret);
+  asm("{\n"
+      ".reg .b8 byte0, byte2;\n"
+      "mov.b32 {byte0, _, byte2, _}, %2;\n"
+      "cvt.rn.bf16x2.e2m1x2 %0, byte0;\n"
+      "cvt.rn.bf16x2.e2m1x2 %1, byte2;\n"
+      "}"
+      : "=r"(dst[0]), "=r"(dst[1])
+      : "r"(src));
+#else
+  // Fallback: convert e2m1 -> fp16 -> bf16
+  uint32_t src = i8data | (i8data >> 4);
+  __half halfData[4];
+  uint32_t(&dst)[2] = reinterpret_cast<uint32_t(&)[2]>(halfData);
+  asm("{\n"
+      ".reg .b8 byte0, byte2;\n"
+      "mov.b32 {byte0, _, byte2, _}, %2;\n"
+      "cvt.rn.f16x2.e2m1x2 %0, byte0;\n"
+      "cvt.rn.f16x2.e2m1x2 %1, byte2;\n"
+      "}"
+      : "=r"(dst[0]), "=r"(dst[1])
+      : "r"(src));
+  auto bf16Data = reinterpret_cast<__nv_bfloat16(&)[4]>(ret);
+#pragma unroll
+  for (uint32_t ii = 0; ii < 4; ii++) {
+    bf16Data[ii] = __nv_bfloat16(halfData[ii]);
+  }
+#endif
+#else
+  assert(!"need arch >= 1000");
+  trap();
+#endif
+  return ret;
+}
+#endif
+
 template <typename InputElem, typename CacheElem>
 __device__ inline Vec<uint32_t, 2> convertVCacheWordToF16(uint32_t i8data) {
   static_assert(mha::is_same_v<InputElem, half> || mha::is_same_v<InputElem, __nv_bfloat16>,
@@ -723,6 +854,41 @@ __device__ inline Vec<uint32_t, 2> convertVCacheWordToF16(uint32_t i8data) {
     }
   }
 
+  return ret;
+}
+
+template <typename InputElem>
+__device__ inline Vec<uint32_t, 2> applyF16ScalingFactors(uint32_t x01, uint32_t x23, uint32_t y) {
+  // Applies half-precision multiplication:
+  // (o0, o1) = (x0, x1) * (y0, y0); (o2, o3) = (x2, x3) * (y1, y1)
+  // (y0, y1) are packed in y.
+  Vec<uint32_t, 2> ret;
+  if constexpr (mha::is_same_v<InputElem, half>) {
+    asm("{\n"
+        ".reg .b16 sf0, sf1;\n"
+        "mov.b32 {sf0, sf1}, %4;\n"
+        ".reg .b32 sf0_0, sf1_1;\n"
+        "mov.b32 sf0_0, {sf0, sf0};\n"
+        "mov.b32 sf1_1, {sf1, sf1};\n"
+        "mul.rn.f16x2 %0, %2, sf0_0;\n"
+        "mul.rn.f16x2 %1, %3, sf1_1;\n"
+        "}"
+        : "=r"(ret[0]), "=r"(ret[1])
+        : "r"(x01), "r"(x23), "r"(y));
+  } else {
+    static_assert(mha::is_same_v<InputElem, __nv_bfloat16>);
+    asm("{\n"
+        ".reg .b16 sf0, sf1;\n"
+        "mov.b32 {sf0, sf1}, %4;\n"
+        ".reg .b32 sf0_0, sf1_1;\n"
+        "mov.b32 sf0_0, {sf0, sf0};\n"
+        "mov.b32 sf1_1, {sf1, sf1};\n"
+        "mul.rn.bf16x2 %0, %2, sf0_0;\n"
+        "mul.rn.bf16x2 %1, %3, sf1_1;\n"
+        "}"
+        : "=r"(ret[0]), "=r"(ret[1])
+        : "r"(x01), "r"(x23), "r"(y));
+  }
   return ret;
 }
 
