@@ -1525,6 +1525,215 @@ def gated_delta_rule_launch_seqlen1(
     )
 
 
+# ==============================================================================
+# LOW-BS SEQLEN=1 KERNEL - 1 V-CHUNK PER CTA (T=1, BS<=4)
+# ==============================================================================
+
+
+@cute.kernel
+def gated_delta_rule_decode_kernel_seqlen1_lowBS_1chunk(
+    gQ: cute.Tensor,
+    gK: cute.Tensor,
+    gV: cute.Tensor,
+    ga: cute.Tensor,
+    gb: cute.Tensor,
+    gA_log: cute.Tensor,
+    gdt_bias: cute.Tensor,
+    gH: cute.Tensor,
+    gO: cute.Tensor,
+    scale: cutlass.Float32,
+    softplus_beta: cutlass.Float32,
+    softplus_threshold: cutlass.Float32,
+    eps: cutlass.Float32,
+):
+    """
+    Seqlen=1 kernel with 1 V-chunk (32 V rows) per CTA.
+    For T=1, batch_size <= 4: more CTAs per batch*head for better SM utilization.
+    Grid: batch_idx * HV * 4 + value_head_idx * 4 + v_chunk_idx (0..3).
+    """
+    tidx, _, _ = cute.arch.thread_idx()
+    bidx, _, _ = cute.arch.block_idx()
+
+    HV = cutlass.Int32(gV.shape[2])
+    H = cutlass.Int32(gQ.shape[2])
+
+    batch_idx = bidx // (HV * 4)
+    remainder = bidx % (HV * 4)
+    value_head_idx = remainder // 4
+    v_chunk_idx = remainder % 4
+
+    query_head_idx = value_head_idx // (HV // H)
+    v_row_base = v_chunk_idx * 32
+
+    smem = utils.SmemAllocator()
+
+    alpha = ga[(batch_idx, 0, value_head_idx)].to(cutlass.Float32)
+    beta_raw = gb[(batch_idx, 0, value_head_idx)].to(cutlass.Float32)
+    A_log_val = gA_log[value_head_idx]
+    dt_bias_val = gdt_bias[value_head_idx]
+    g_exp, beta = compute_single_gate(
+        alpha, beta_raw, dt_bias_val, A_log_val, softplus_beta, softplus_threshold
+    )
+
+    h_sh_chunk = smem.allocate_tensor(
+        cutlass.BFloat16, cute.make_layout((32, 128), stride=(H_SMEM_STRIDE, 1))
+    )
+
+    q_sh = smem.allocate_tensor(cutlass.Float32, 128)
+    k_sh = smem.allocate_tensor(cutlass.Float32, 128)
+
+    pred_sh = smem.allocate_tensor(
+        cutlass.Float32, cute.make_layout((32, 4), stride=(1, 32))
+    )
+    out_sh = smem.allocate_tensor(
+        cutlass.Float32, cute.make_layout((32, 4), stride=(1, 32))
+    )
+
+    h_global = gH[(batch_idx, value_head_idx, None, None)]
+
+    load_h_chunk_async(h_sh_chunk, h_global, tidx, v_row_base)
+    nvvm.cp_async_commit_group()
+
+    q_head = gQ[(batch_idx, 0, query_head_idx, None)]
+    k_head = gK[(batch_idx, 0, query_head_idx, None)]
+
+    warp_idx = tidx // 32
+    lane_idx = tidx % 32
+
+    if warp_idx == 0:
+        normalize_and_store_qk_to_smem(q_head, k_head, q_sh, k_sh, lane_idx, scale, eps)
+
+    cute.arch.sync_threads()
+
+    v_head = gV[(batch_idx, 0, value_head_idx, None)]
+    v_sh = smem.allocate_tensor(cutlass.Float32, 32)
+    if tidx < 32:
+        v_sh[tidx] = v_head[v_row_base + tidx].to(cutlass.Float32)
+
+    h_chunk = cute.make_rmem_tensor((32,), cutlass.Float32)
+    k_chunk = cute.make_rmem_tensor((32,), cutlass.Float32)
+    qk_temp = cute.make_rmem_tensor((32,), cutlass.Float32)
+
+    k_base = warp_idx * 32
+
+    for i in cutlass.range_constexpr(32):
+        k_chunk[i] = k_sh[k_base + i]
+
+    h_out = gH[(batch_idx, value_head_idx, None, None)]
+    o_head = gO[(batch_idx, 0, value_head_idx, None)]
+
+    nvvm.cp_async_wait_group(0)
+    cute.arch.sync_threads()
+
+    pred = cutlass.Float32(0.0)
+    pred2 = cutlass.Float32(0.0)
+    for i in cutlass.range_constexpr(0, 32, 2):
+        h_chunk[i], h_chunk[i + 1] = cute.arch.fma_packed_f32x2(
+            src_a=(
+                h_sh_chunk[lane_idx, k_base + i].to(cutlass.Float32),
+                h_sh_chunk[lane_idx, k_base + i + 1].to(cutlass.Float32),
+            ),
+            src_b=(g_exp, g_exp),
+            src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
+        )
+    for i in cutlass.range_constexpr(0, 32, 2):
+        pred, pred2 = cute.arch.fma_packed_f32x2(
+            src_a=(h_chunk[i], h_chunk[i + 1]),
+            src_b=(k_chunk[i], k_chunk[i + 1]),
+            src_c=(pred, pred2),
+        )
+    pred = pred + pred2
+
+    pred_sh[lane_idx, warp_idx] = pred
+    cute.arch.sync_threads()
+    pred_final = (
+        pred_sh[lane_idx, 0]
+        + pred_sh[lane_idx, 1]
+        + pred_sh[lane_idx, 2]
+        + pred_sh[lane_idx, 3]
+    )
+
+    v_val = (v_sh[lane_idx] - pred_final) * beta
+
+    for i in cutlass.range_constexpr(0, 32, 2):
+        h_chunk[i], h_chunk[i + 1] = cute.arch.fma_packed_f32x2(
+            src_a=(k_chunk[i], k_chunk[i + 1]),
+            src_b=(v_val, v_val),
+            src_c=(h_chunk[i], h_chunk[i + 1]),
+        )
+
+    for i in cutlass.range_constexpr(32):
+        qk_temp[i] = q_sh[k_base + i]
+
+    out = cutlass.Float32(0.0)
+    out2 = cutlass.Float32(0.0)
+    for i in cutlass.range_constexpr(0, 32, 2):
+        out, out2 = cute.arch.fma_packed_f32x2(
+            src_a=(h_chunk[i], h_chunk[i + 1]),
+            src_b=(qk_temp[i], qk_temp[i + 1]),
+            src_c=(out, out2),
+        )
+    out = out + out2
+
+    out_sh[lane_idx, warp_idx] = out
+    cute.arch.sync_threads()
+    out_final = (
+        out_sh[lane_idx, 0]
+        + out_sh[lane_idx, 1]
+        + out_sh[lane_idx, 2]
+        + out_sh[lane_idx, 3]
+    )
+
+    write_h_chunk_to_smem(h_chunk, h_sh_chunk, lane_idx, k_base)
+    if warp_idx == 0:
+        o_head[v_row_base + lane_idx] = out_final.to(cutlass.BFloat16)
+
+    cute.arch.sync_threads()
+    store_h_smem_to_gmem(h_sh_chunk, h_out, tidx, v_row_base)
+
+
+@cute.jit
+def gated_delta_rule_launch_seqlen1_lowBS_1chunk(
+    mQ: cute.Tensor,
+    mK: cute.Tensor,
+    mV: cute.Tensor,
+    ma: cute.Tensor,
+    mb: cute.Tensor,
+    mA_log: cute.Tensor,
+    mdt_bias: cute.Tensor,
+    mH: cute.Tensor,
+    mO: cute.Tensor,
+    scale: cutlass.Float32,
+    softplus_beta: cutlass.Float32,
+    softplus_threshold: cutlass.Float32,
+    eps: cutlass.Float32,
+    stream: cuda.CUstream,
+):
+    """Launch LowBS-1 kernel: 4 CTAs per (batch, value_head)."""
+    batch_size = mQ.shape[0]
+    HV = mV.shape[2]
+
+    gated_delta_rule_decode_kernel_seqlen1_lowBS_1chunk(
+        mQ,
+        mK,
+        mV,
+        ma,
+        mb,
+        mA_log,
+        mdt_bias,
+        mH,
+        mO,
+        scale,
+        softplus_beta,
+        softplus_threshold,
+        eps,
+    ).launch(
+        grid=[batch_size * HV * 4, 1, 1],
+        block=[128, 1, 1],
+        stream=stream,
+    )
+
+
 @cute.jit
 def gated_delta_rule_launch_seqlen2(
     mQ: cute.Tensor,
@@ -1786,7 +1995,9 @@ def gated_delta_rule(
     cache_key = (T, B)
     if cache_key not in _compiled_kernels:
         # Select and compile the appropriate kernel
-        if T == 1:
+        if T == 1 and B <= 4:
+            launch_fn = gated_delta_rule_launch_seqlen1_lowBS_1chunk
+        elif T == 1:
             launch_fn = gated_delta_rule_launch_seqlen1
         elif T == 2:
             launch_fn = gated_delta_rule_launch_seqlen2
