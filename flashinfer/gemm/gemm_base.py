@@ -2645,7 +2645,7 @@ def mm_mxfp8(
         Input A tensor, shape (m, k), mxfp8 e4m3.
 
     b: torch.Tensor
-        Input Btensor, shape (k, n), should be column major, mxfp8 e4m3.
+        Input B tensor, shape (k, n), should be column major, mxfp8 e4m3.
 
     a_descale: torch.Tensor
         Block scale tensor for A. Can be:
