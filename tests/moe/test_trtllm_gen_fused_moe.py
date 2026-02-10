@@ -30,7 +30,6 @@ from flashinfer import (
     mxfp8_quantize,
     reorder_rows_for_gated_act_gemm,
     shuffle_matrix_a,
-    shuffle_matrix_sf_a,
 )
 from flashinfer.autotuner import autotune
 from flashinfer.fp4_quantization import block_scale_interleave
@@ -1029,22 +1028,77 @@ class FP8BlockScaleMoe(Moe):
             gemm1_scales_fp8_shuffled = []
             gemm2_scales_fp8_shuffled = []
             for i in range(num_experts):
-                tmp_weights1 = shuffle_matrix_a(
-                    gemm1_weights_fp8_interleaved[i].view(torch.uint8), epilogue_tile_m
+                # tmp_weights1 = shuffle_matrix_a(
+                #     gemm1_weights_fp8_interleaved[i].reshape(2 * intermediate_size, -1).view(torch.uint8), epilogue_tile_m
+                # )
+                # tmp_weights2 = shuffle_matrix_a(
+                #     args.gemm2_weights[i].view(torch.uint8), epilogue_tile_m
+                # )
+                w1_indices = _maybe_get_cached_w3_w1_permute_indices(
+                    self._cache_permute_indices,
+                    gemm1_weights_fp8_interleaved[i]
+                    .reshape(2 * intermediate_size, -1)
+                    .view(torch.uint8),
+                    epilogue_tile_m,
+                    is_gated_act_gemm=True,
                 )
-                tmp_weights2 = shuffle_matrix_a(
-                    args.gemm2_weights[i].view(torch.uint8), epilogue_tile_m
+                tmp_weights1 = (
+                    gemm1_weights_fp8_interleaved[i]
+                    .view(torch.uint8)[
+                        w1_indices.to(gemm1_weights_fp8_interleaved.device)
+                    ]
+                    .contiguous()
                 )
+                w2_indices = get_w2_permute_indices_with_cache(
+                    self._cache_permute_indices,
+                    args.gemm2_weights[i].view(torch.uint8),
+                    epilogue_tile_m,
+                )
+                tmp_weights2 = (
+                    args.gemm2_weights[i]
+                    .view(torch.uint8)[w2_indices.to(args.gemm2_weights.device)]
+                    .contiguous()
+                )
+
                 if self.fp8_quantization_type == QuantMode.FP8_BLOCK_SCALE_MXFP8:
-                    tmp_scales1 = shuffle_matrix_sf_a(
+                    # tmp_scales1 = shuffle_matrix_sf_a(
+                    #     gemm1_scales_fp8_interleaved[i]
+                    #     .view(torch.uint8)
+                    #     .reshape(2 * intermediate_size, -1),
+                    #     epilogue_tile_m,
+                    # )
+                    # tmp_scales2 = shuffle_matrix_sf_a(
+                    #     args.gemm2_scales[i].view(torch.uint8).reshape(hidden_size, -1),
+                    #     epilogue_tile_m,
+                    # )
+
+                    s1_indices = _maybe_get_cached_w3_w1_permute_indices(
+                        self._cache_permute_indices,
                         gemm1_scales_fp8_interleaved[i]
                         .view(torch.uint8)
                         .reshape(2 * intermediate_size, -1),
                         epilogue_tile_m,
+                        num_elts_per_sf=32,
                     )
-                    tmp_scales2 = shuffle_matrix_sf_a(
+                    tmp_scales1 = (
+                        gemm1_scales_fp8_interleaved[i]
+                        .reshape(2 * intermediate_size, -1)
+                        .view(torch.uint8)[
+                            s1_indices.to(gemm1_scales_fp8_interleaved.device)
+                        ]
+                        .contiguous()
+                    )
+                    s2_indices = get_w2_permute_indices_with_cache(
+                        self._cache_permute_indices,
                         args.gemm2_scales[i].view(torch.uint8).reshape(hidden_size, -1),
                         epilogue_tile_m,
+                        num_elts_per_sf=32,
+                    )
+                    tmp_scales2 = (
+                        args.gemm2_scales[i]
+                        .reshape(hidden_size, -1)
+                        .view(torch.uint8)[s2_indices.to(args.gemm2_scales.device)]
+                        .contiguous()
                     )
                     gemm1_scales_fp8_shuffled.append(tmp_scales1)
                     gemm2_scales_fp8_shuffled.append(tmp_scales2)
