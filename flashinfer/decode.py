@@ -59,6 +59,7 @@ from .utils import (
     _check_pos_encoding_mode,
     check_shape_dtype_device,
     _get_cache_alibi_slopes_buf,
+    _get_sink_buf,
     _get_cache_buf,
     _get_range_buf,
     _unpack_paged_kv_cache,
@@ -251,6 +252,7 @@ def get_batch_decode_module(*args):
         window_left: int,
         enable_pdl: bool,
         alibi_slopes: Optional[torch.Tensor],
+        maybe_s_aux: Optional[torch.Tensor],
         logits_soft_cap: float,
         sm_scale: float,
         rope_scale: float,
@@ -272,6 +274,7 @@ def get_batch_decode_module(*args):
             window_left,
             enable_pdl,
             alibi_slopes,
+            maybe_s_aux,
             logits_soft_cap,
             sm_scale,
             1.0 / rope_scale,  # rope_rcp_scale
@@ -295,6 +298,7 @@ def get_batch_decode_module(*args):
         window_left: int,
         enable_pdl: bool,
         alibi_slopes: Optional[torch.Tensor],
+        maybe_s_aux: Optional[torch.Tensor],
         logits_soft_cap: float,
         sm_scale: float,
         rope_scale: float,
@@ -394,6 +398,7 @@ def single_decode_with_kv_cache(
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
     return_lse: Literal[True] = True,
+    sinks: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
 
@@ -414,6 +419,7 @@ def single_decode_with_kv_cache(
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
     return_lse: bool = False,
+    sinks: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Decode attention with KV Cache for single request, return attention output.
 
@@ -540,6 +546,7 @@ def single_decode_with_kv_cache(
             window_left,
             None,  # packed_custom_mask
             _get_cache_alibi_slopes_buf(num_qo_heads, q.device),
+            sinks,  # maybe_s_aux
             logits_soft_cap,
             sm_scale,
             None,  # scale_q, not supported yet
@@ -1369,7 +1376,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     self._kv_lens_buffer,
                     page_size,
                     self._max_kv_len,
-                    sinks,
+                    _get_sink_buf(sinks),
                 ]
 
             self._cached_module.paged_run(*run_args)
@@ -1403,6 +1410,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             else:
                 run_args += [
                     _get_cache_alibi_slopes_buf(q.shape[1], q.device),
+                    _get_sink_buf(sinks),
                     logits_soft_cap,
                     sm_scale,
                     rope_scale,

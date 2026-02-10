@@ -90,6 +90,16 @@ struct DefaultAttention : AttentionVariantBase {
     }
     return mask;
   })
+
+  REGISTER_M_D_UPDATE(params, kv_tile_idx, qo_head_idx, m, d, scale, {
+    if constexpr (use_softmax) {
+      if (params.maybe_s_aux != nullptr) {
+        constexpr float LOG2_E = 1.4426950408889634f;  // log2(e)
+        float s_aux_val = params.maybe_s_aux[qo_head_idx];
+        d += math::ptx_exp2((s_aux_val - m) * LOG2_E);
+      }
+    }
+  })
 };
 
 };  // namespace flashinfer
