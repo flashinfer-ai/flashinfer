@@ -132,7 +132,7 @@ jobs:
           }
 
           assign_or_invite "$TARGET_USER" \
-            "@${TARGET_USER} You've been sent a repository invitation. Please [accept the invitation](https://github.com/notifications) and then comment \`!claim\` again to be assigned."
+            "@${TARGET_USER} You've been sent a repository invitation. Please [accept the invitation](https://github.com/notifications) and then comment \`!claim\` again so we can assign you."
 
       - name: Handle !assign (unauthorized)
         if: |
@@ -219,7 +219,7 @@ jobs:
           }
 
           assign_or_invite "$TARGET_USER" \
-            "@${TARGET_USER} has been sent a repository invitation. Once they [accept the invitation](https://github.com/notifications), they will be assigned to this issue."
+            "@${TARGET_USER} has been sent a repository invitation. Once they [accept the invitation](https://github.com/notifications), run \`!assign @${TARGET_USER}\` again to complete the assignment."
 
       - name: Handle !assign with no username
         if: steps.parse.outputs.command == 'assign-no-user'
