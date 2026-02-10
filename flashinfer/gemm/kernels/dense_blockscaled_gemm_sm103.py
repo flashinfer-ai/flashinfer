@@ -158,7 +158,11 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
         self.tmem_alloc_sync_bar_id = 2
         self.tmem_dealloc_sync_bar_id = 3
         self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_103")
-        self.num_tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols("sm_103")
+        # SM103 TMEM capacity is 512 columns (same as SM100).
+        # This replaces cute.arch.get_max_tmem_alloc_cols("sm_103") which
+        # may not be available in older cutlass-dsl versions.
+        SM103_TMEM_CAPACITY_COLUMNS = 512
+        self.num_tmem_alloc_cols = SM103_TMEM_CAPACITY_COLUMNS
         self.sf_buffers_per_tile_k = 4 if self.sf_vec_size == 16 else 2
 
     def _setup_attributes(self):
