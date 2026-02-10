@@ -367,15 +367,15 @@ class SSDKernel:
     @cute.jit
     def __call__(
         self,
-        x: cute.Tensor,
-        cumsum_delta: cute.Tensor,
-        delta: cute.Tensor,
-        b: cute.Tensor,
-        c: cute.Tensor,
-        y: cute.Tensor,
-        init_states: cute.Tensor,
-        fstate: cute.Tensor,
-        d: cute.Tensor,
+        x: cute.Tensor,           # (D, L, C, EH, B) - D stride 1
+        cumsum_delta: cute.Tensor,  # (L, C, EH, B) - L stride 1
+        delta: cute.Tensor,         # (L, C, EH, B) - L stride 1
+        b: cute.Tensor,             # (L, N, C, G, B) - L stride 1
+        c: cute.Tensor,             # (L, N, C, G, B) - L stride 1
+        y: cute.Tensor,             # (L, D, C, EH, B) - L stride 1 (output)
+        init_states: cute.Tensor,   # (D, N, EH, B) - D stride 1 (optional)
+        fstate: cute.Tensor,        # (D, N, EH, B) - D stride 1 (output)
+        d: cute.Tensor,             # (D, EH) or (1, EH) (optional)
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
