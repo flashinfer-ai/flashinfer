@@ -2,12 +2,17 @@
 # Commands:
 #   !claim          - Self-assign an unassigned issue (anyone)
 #   !assign @user   - Assign a specific user (maintainers only)
+#
+# Also auto-assigns users when they accept a repository invitation
+# triggered by this workflow.
 
 name: Issue Claim
 
 on:
   issue_comment:
     types: [created]
+  member:
+    types: [added]
 
 permissions:
   contents: read
@@ -18,6 +23,7 @@ jobs:
     # Only run on issue comments (not PRs) that start with !claim or !assign
     # Skip comments from bots
     if: |
+      github.event_name == 'issue_comment' &&
       !github.event.issue.pull_request &&
       github.event.comment.user.type != 'Bot' &&
       (startsWith(github.event.comment.body, '!claim') || startsWith(github.event.comment.body, '!assign'))
@@ -132,7 +138,7 @@ jobs:
           }
 
           assign_or_invite "$TARGET_USER" \
-            "@${TARGET_USER} You've been sent a repository invitation. Please [accept the invitation](https://github.com/notifications) and then comment \`!claim\` again so we can assign you."
+            "@${TARGET_USER} You've been sent a repository invitation. Please [accept the invitation](https://github.com/notifications). You'll be automatically assigned once you accept. <!-- pending-claim:${TARGET_USER} -->"
 
       - name: Handle !assign (unauthorized)
         if: |
@@ -219,7 +225,7 @@ jobs:
           }
 
           assign_or_invite "$TARGET_USER" \
-            "@${TARGET_USER} has been sent a repository invitation. Once they [accept the invitation](https://github.com/notifications), run \`!assign @${TARGET_USER}\` again to complete the assignment."
+            "@${TARGET_USER} has been sent a repository invitation. They'll be automatically assigned once they [accept the invitation](https://github.com/notifications). <!-- pending-assign:${TARGET_USER} -->"
 
       - name: Handle !assign with no username
         if: steps.parse.outputs.command == 'assign-no-user'
@@ -236,3 +242,72 @@ jobs:
           gh api -X POST \
             "/repos/${REPO}/issues/${ISSUE_NUMBER}/comments" \
             -f body="Usage: \`!assign @username\`"
+
+  # Auto-assign users after they accept a repository invitation
+  auto-assign-on-accept:
+    if: github.event_name == 'member' && github.event.action == 'added'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Assign to pending issues
+        env:
+          GH_TOKEN: ${{ secrets.FLASHINFER_BOT_TOKEN }}
+          REPO: ${{ github.repository }}
+          NEW_MEMBER: ${{ github.event.member.login }}
+        run: |
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo "::error::FLASHINFER_BOT_TOKEN secret is not set"
+            exit 1
+          fi
+
+          echo "New collaborator added: ${NEW_MEMBER}"
+          echo "Searching for pending assignment comments..."
+
+          # Search for open issues with pending invitation comments for this user
+          # The marker format is <!-- pending-claim:USERNAME --> or <!-- pending-assign:USERNAME -->
+          ISSUES=$(gh api -X GET "/search/issues" \
+            --raw-field "q=repo:${REPO} is:issue is:open in:comments pending-claim:${NEW_MEMBER} OR pending-assign:${NEW_MEMBER}" \
+            --jq '.items[].number' 2>&1) || true
+
+          if [ -z "$ISSUES" ]; then
+            echo "No pending issues found for ${NEW_MEMBER}"
+            exit 0
+          fi
+
+          echo "Found pending issues: $ISSUES"
+
+          for ISSUE_NUMBER in $ISSUES; do
+            echo "Processing issue #${ISSUE_NUMBER}..."
+
+            # Verify the issue has a pending marker comment for this user
+            HAS_MARKER=$(gh api --paginate \
+              "/repos/${REPO}/issues/${ISSUE_NUMBER}/comments" \
+              --jq "[.[] | select(.body | test(\"pending-(claim|assign):${NEW_MEMBER}\"))] | length" 2>&1) || HAS_MARKER="0"
+
+            if [ "$HAS_MARKER" = "0" ]; then
+              echo "No marker found in issue #${ISSUE_NUMBER}, skipping"
+              continue
+            fi
+
+            # Try to assign
+            ASSIGN_RESPONSE=$(gh api -X POST \
+              "/repos/${REPO}/issues/${ISSUE_NUMBER}/assignees" \
+              -f "assignees[]=${NEW_MEMBER}" 2>&1) && ASSIGN_OK=true || ASSIGN_OK=false
+
+            if [ "$ASSIGN_OK" = "true" ]; then
+              IS_ASSIGNED=$(echo "$ASSIGN_RESPONSE" | jq --arg u "$NEW_MEMBER" \
+                '[.assignees[].login] | map(ascii_downcase) | contains([$u | ascii_downcase])')
+            else
+              IS_ASSIGNED="false"
+            fi
+
+            if [ "$IS_ASSIGNED" = "true" ]; then
+              echo "Assigned ${NEW_MEMBER} to issue #${ISSUE_NUMBER}"
+              gh api -X POST \
+                "/repos/${REPO}/issues/${ISSUE_NUMBER}/comments" \
+                -f body="Issue assigned to @${NEW_MEMBER} (invitation accepted)."
+            else
+              echo "Failed to assign ${NEW_MEMBER} to issue #${ISSUE_NUMBER}"
+            fi
+          done
