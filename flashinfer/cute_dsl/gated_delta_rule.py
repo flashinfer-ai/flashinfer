@@ -1974,15 +1974,15 @@ def gated_delta_rule(
 
     output = torch.empty(B, T, HV, V, device=q.device, dtype=q.dtype)
 
-    q_ = from_dlpack(q, assumed_align=32)
-    k_ = from_dlpack(k, assumed_align=32)
-    v_ = from_dlpack(v, assumed_align=32)
-    a_ = from_dlpack(a, assumed_align=32)
-    b_ = from_dlpack(b, assumed_align=32)
-    A_log_ = from_dlpack(A_log, assumed_align=32)
-    dt_bias_ = from_dlpack(dt_bias, assumed_align=32)
-    h_ = from_dlpack(initial_state_source, assumed_align=32)
-    o_ = from_dlpack(output, assumed_align=32)
+    q_ = from_dlpack(q, assumed_align=32, enable_tvm_ffi=True)
+    k_ = from_dlpack(k, assumed_align=32, enable_tvm_ffi=True)
+    v_ = from_dlpack(v, assumed_align=32, enable_tvm_ffi=True)
+    a_ = from_dlpack(a, assumed_align=32, enable_tvm_ffi=True)
+    b_ = from_dlpack(b, assumed_align=32, enable_tvm_ffi=True)
+    A_log_ = from_dlpack(A_log, assumed_align=32, enable_tvm_ffi=True)
+    dt_bias_ = from_dlpack(dt_bias, assumed_align=32, enable_tvm_ffi=True)
+    h_ = from_dlpack(initial_state_source, assumed_align=32, enable_tvm_ffi=True)
+    o_ = from_dlpack(output, assumed_align=32, enable_tvm_ffi=True)
 
     scale_f32 = cutlass.Float32(scale)
     softplus_beta_f32 = cutlass.Float32(softplus_beta)
@@ -2022,7 +2022,7 @@ def gated_delta_rule(
             softplus_threshold_f32,
             eps_f32,
             stream,
-            options="--generate-line-info",
+            options="--enable-tvm-ffi --generate-line-info",
         )
 
     # Execute
