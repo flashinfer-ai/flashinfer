@@ -161,12 +161,11 @@ def parse_gemm_args(line, parser):
             "Enable autotuner warmup for supported routines (mm_fp4, bmm_fp8, bmm_mxfp8, mm_mxfp8, mm_bf16, bmm_bf16)."
         ),
     )
-    # BF16 GEMM specific arguments
     parser.add_argument(
         "--bias",
         action="store_true",
         default=False,
-        help="Use bias for mm_bf16 (TGV backend only).",
+        help="Use bias (enabled for mm_bf16 with TGV backend for now)",
     )
     parser.add_argument(
         "--enable_pdl",
@@ -1544,20 +1543,18 @@ def testMmBf16(args):
 
         # Filter backends based on TGV-specific features
         if use_bias and backend != "tgv":
-            print(f"[INFO] {backend} backend does not support bias (TGV only)")
+            print(f"[INFO] {backend} backend does not have bias enabled at this time")
             backends_to_remove.append(backend)
             continue
 
         if use_pdl and backend != "tgv":
-            print(f"[INFO] {backend} backend does not support PDL (TGV only)")
+            print(f"[INFO] {backend} backend does not have bias enabled at this time")
             backends_to_remove.append(backend)
             continue
 
         # TGV backend only supports bfloat16 output
         if backend == "tgv" and out_dtype != torch.bfloat16:
-            print(
-                f"[INFO] TGV backend only supports bfloat16 output dtype, got {out_dtype}"
-            )
+            print(f"[INFO] TGV backend does not support {out_dtype} at this time")
             backends_to_remove.append(backend)
             continue
 
