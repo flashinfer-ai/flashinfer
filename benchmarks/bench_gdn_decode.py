@@ -18,21 +18,21 @@ limitations under the License.
 GDN Decode Benchmark
 
 This benchmark supports:
-1. All layouts comparison (default for decode): FlashInfer/Triton x pretranspose/nontranspose + Improved CuTe-DSL
+1. All layouts comparison (default for decode): FlashInfer/Triton x pretranspose/nontranspose + gdn_decode_klast_bf16_state
 2. Single layout comparison: FlashInfer (CuTe DSL) vs Triton kernel (--compare)
 3. MTP benchmark (--version mtp)
-4. Improved CuTe-DSL multi-token benchmark (--version improved_cutedsl) for T=1,2,3,4
+4. gdn_decode_klast_bf16_state benchmark (--version gdn_decode_klast_bf16_state) for T=1,2,3,4
 
 Kernels benchmarked:
 - FlashInfer Pretranspose [B, HV, V, K] (V-major layout)
 - FlashInfer Nontranspose [B, HV, K, V] (K-major layout)
 - Triton Pretranspose [B, HV, V, K]
 - Triton Nontranspose [B, HV, K, V]
-- Improved CuTe-DSL Kernel [B, HV, V, K] (K-fast layout, supports T=1,2,3,4)
+- gdn_decode_klast_bf16_state [B, HV, V, K] (K-fast layout, T=1..4, bf16 state)
   from flashinfer.cute_dsl.gated_delta_rule
 
 Usage:
-    # Default: All layouts comparison (FlashInfer/Triton x pretranspose/nontranspose + Improved CuTe-DSL)
+    # Default: All layouts comparison (FlashInfer/Triton x pretranspose/nontranspose + gdn_decode_klast_bf16_state)
     python benchmarks/bench_gdn_decode.py --batch-size 1 4 8 16 32 64 128 256 512
 
     # Single layout comparison: FlashInfer vs Triton
@@ -44,8 +44,8 @@ Usage:
     # MTP comparison: FlashInfer vs Triton
     python benchmarks/bench_gdn_decode.py --version mtp --compare --batch-size 1 32 128
 
-    # Improved CuTe-DSL multi-token benchmark (T=1,2,3,4)
-    python benchmarks/bench_gdn_decode.py --version improved_cutedsl --batch-size 1 32 128 512
+    # gdn_decode_klast_bf16_state benchmark (T=1,2,3,4)
+    python benchmarks/bench_gdn_decode.py --version gdn_decode_klast_bf16_state --batch-size 1 32 128 512
 
     # Use Qwen3-Next preset (q=k=16, v=32, d=128)
     python benchmarks/bench_gdn_decode.py --preset qwen3-next --batch-size 1 32 128 512
@@ -62,15 +62,15 @@ from flashinfer.gdn_decode import (
 )
 from flashinfer.testing import bench_gpu_time
 
-# Import the improved CuTe-DSL kernel for benchmarking (supports T=1,2,3,4)
+# Import the gdn_decode_klast_bf16_state kernel for benchmarking (T=1..4, bf16 state, K-last)
 try:
     from flashinfer.cute_dsl.gated_delta_rule import (
-        gated_delta_rule as improved_cutedsl_gdn,
+        gated_delta_rule as gdn_decode_klast_bf16_state,
     )
 
-    IMPROVED_CUTEDSL_AVAILABLE = True
+    GDN_DECODE_KLAST_BF16_STATE_AVAILABLE = True
 except ImportError:
-    IMPROVED_CUTEDSL_AVAILABLE = False
+    GDN_DECODE_KLAST_BF16_STATE_AVAILABLE = False
 
 
 # ============================================================================
@@ -1832,7 +1832,7 @@ def verify_correctness_pretranspose(
 # ============================================================================
 
 
-def improved_cutedsl_gdn_wrapper(
+def gdn_decode_klast_bf16_state_wrapper(
     q: torch.Tensor,  # [B, T, H_Q, K] where T=1,2,3,4
     k: torch.Tensor,  # [B, T, H_K, K]
     v: torch.Tensor,  # [B, T, HV, V]
@@ -1848,18 +1848,18 @@ def improved_cutedsl_gdn_wrapper(
     softplus_threshold: float = 20.0,
 ):
     """
-    Wrapper for improved CuTe-DSL GDN kernel.
+    Wrapper for gdn_decode_klast_bf16_state GDN kernel.
     Supports T=1,2,3,4 (sequence lengths up to 4).
     Adapts the interface to match the benchmark's calling convention.
 
     Note: The kernel returns output directly, no copy needed.
     """
-    if not IMPROVED_CUTEDSL_AVAILABLE:
-        raise RuntimeError("Improved CuTe-DSL kernel is not available")
+    if not GDN_DECODE_KLAST_BF16_STATE_AVAILABLE:
+        raise RuntimeError("gdn_decode_klast_bf16_state kernel is not available")
 
-    # Call improved CuTe-DSL kernel directly - no wrapper overhead
+    # Call gdn_decode_klast_bf16_state kernel directly - no wrapper overhead
     # Kernel modifies state in-place and returns output tensor
-    return improved_cutedsl_gdn(
+    return gdn_decode_klast_bf16_state(
         A_log=A_log,
         a=a,
         dt_bias=dt_bias,
@@ -2030,15 +2030,15 @@ def bench_all_layouts(
         results["tr_pretrans_us"] = None
         results["tr_nontrans_us"] = None
 
-    # ========== Improved CuTe-DSL Kernel (K-fast/pretranspose layout) ==========
-    if IMPROVED_CUTEDSL_AVAILABLE:
-        # Improved CuTe-DSL uses [B, HV, V, K] layout (K-fast, same as pretranspose)
+    # ========== gdn_decode_klast_bf16_state Kernel (K-fast/pretranspose layout) ==========
+    if GDN_DECODE_KLAST_BF16_STATE_AVAILABLE:
+        # gdn_decode_klast_bf16_state uses [B, HV, V, K] layout (K-fast, same as pretranspose)
         state = torch.randn(
             batch_size,
             num_sab_heads,
             head_size,
             head_size,
-            dtype=torch.bfloat16,  # Improved CuTe-DSL uses BF16 state
+            dtype=torch.bfloat16,  # gdn_decode_klast_bf16_state uses BF16 state
             device="cuda",
         )
         output = torch.empty(
@@ -2047,19 +2047,21 @@ def bench_all_layouts(
 
         try:
             times = bench_gpu_time(
-                lambda: improved_cutedsl_gdn_wrapper(
+                lambda: gdn_decode_klast_bf16_state_wrapper(
                     q, k, v, state, A_log, a, dt_bias, b, scale, output, use_qk_l2norm
                 ),
                 enable_cupti=True,
                 dry_run_iters=warmup_iters,
                 repeat_iters=bench_iters,
             )
-            results["improved_cutedsl_us"] = np.median(times) * 1000
+            results["gdn_decode_klast_bf16_state_us"] = np.median(times) * 1000
         except Exception as e:
-            results["improved_cutedsl_us"] = None
-            print(f"  Improved CuTe-DSL kernel failed: {type(e).__name__}: {e}")
+            results["gdn_decode_klast_bf16_state_us"] = None
+            print(
+                f"  gdn_decode_klast_bf16_state kernel failed: {type(e).__name__}: {e}"
+            )
     else:
-        results["improved_cutedsl_us"] = None
+        results["gdn_decode_klast_bf16_state_us"] = None
 
     return results
 
@@ -2102,7 +2104,9 @@ def run_all_layouts_benchmark(args, dtype, use_qk_l2norm):
         print()
 
     print("\n" + "=" * 160)
-    print("GDN Decode Benchmark (T=1): FlashInfer vs Triton vs Improved CuTe-DSL")
+    print(
+        "GDN Decode Benchmark (T=1): FlashInfer vs Triton vs gdn_decode_klast_bf16_state"
+    )
     print(
         f"Config: q_heads={args.num_q_heads}, k_heads={args.num_k_heads}, "
         f"v_heads={args.num_v_heads}, head_size={args.head_size}, "
@@ -2111,8 +2115,8 @@ def run_all_layouts_benchmark(args, dtype, use_qk_l2norm):
     print("=" * 160)
     print()
     print(
-        f"{'batch':>6} | {'FI-PreTr':>8} {'FI-NonTr':>8} | {'TR-PreTr':>8} {'TR-NonTr':>8} | {'ImpCuTe':>8} | "
-        f"{'FI/TR-Pre':>9} {'ImpCuTe/FI':>10} {'ImpCuTe/TR':>10}"
+        f"{'batch':>6} | {'FI-PreTr':>8} {'FI-NonTr':>8} | {'TR-PreTr':>8} {'TR-NonTr':>8} | {'KlastBf16':>9} | "
+        f"{'FI/TR-Pre':>9} {'KlastBf16/FI':>11} {'KlastBf16/TR':>11}"
     )
     print(
         f"{'':>6} | {'(us)':>8} {'(us)':>8} | {'(us)':>8} {'(us)':>8} | {'(us)':>8} | "
@@ -2139,21 +2143,21 @@ def run_all_layouts_benchmark(args, dtype, use_qk_l2norm):
         fi_non = result.get("fi_nontrans_us")
         tr_pre = result.get("tr_pretrans_us")
         tr_non = result.get("tr_nontrans_us")
-        imp_cute = result.get("improved_cutedsl_us")
+        klast_bf16_us = result.get("gdn_decode_klast_bf16_state_us")
 
         # FI/TR speedup (>1 means FI faster)
         fi_tr_pre = format_speedup(fi_pre, tr_pre)
 
-        # Improved CuTe-DSL vs FI-PreTr speedup (>1 means Improved CuTe-DSL faster)
-        imp_cute_fi_speedup = format_speedup(imp_cute, fi_pre)
+        # gdn_decode_klast_bf16_state vs FI-PreTr speedup (>1 means klast_bf16 faster)
+        klast_bf16_fi_speedup = format_speedup(klast_bf16_us, fi_pre)
 
-        # Improved CuTe-DSL vs TR-PreTr speedup (>1 means Improved CuTe-DSL faster)
-        imp_cute_tr_speedup = format_speedup(imp_cute, tr_pre)
+        # gdn_decode_klast_bf16_state vs TR-PreTr speedup (>1 means klast_bf16 faster)
+        klast_bf16_tr_speedup = format_speedup(klast_bf16_us, tr_pre)
 
         print(
             f"{batch_size:>6} | {format_time(fi_pre)} {format_time(fi_non)} | "
-            f"{format_time(tr_pre)} {format_time(tr_non)} | {format_time(imp_cute)} | "
-            f"{fi_tr_pre} {imp_cute_fi_speedup:>10} {imp_cute_tr_speedup:>10}"
+            f"{format_time(tr_pre)} {format_time(tr_non)} | {format_time(klast_bf16_us)} | "
+            f"{fi_tr_pre} {klast_bf16_fi_speedup:>10} {klast_bf16_tr_speedup:>10}"
         )
 
     print("-" * 160)
@@ -2164,22 +2168,24 @@ def run_all_layouts_benchmark(args, dtype, use_qk_l2norm):
     print("  TR-PreTr  = Triton Pretranspose [B, HV, V, K]")
     print("  TR-NonTr  = Triton Nontranspose [B, HV, K, V]")
     print(
-        "  ImpCuTe   = Improved CuTe-DSL Kernel [B, HV, V, K] (K-fast layout, supports T=1,2,3,4)"
+        "  KlastBf16 = gdn_decode_klast_bf16_state [B, HV, V, K] (K-fast layout, T=1..4, bf16 state)"
     )
     print("  FI/TR speedup > 1.0 means FlashInfer is faster than Triton")
     print(
-        "  ImpCuTe/FI speedup > 1.0 means Improved CuTe-DSL is faster than FlashInfer Pretranspose"
+        "  KlastBf16/FI speedup > 1.0 means gdn_decode_klast_bf16_state is faster than FlashInfer Pretranspose"
     )
     print(
-        "  ImpCuTe/TR speedup > 1.0 means Improved CuTe-DSL is faster than Triton Pretranspose"
+        "  KlastBf16/TR speedup > 1.0 means gdn_decode_klast_bf16_state is faster than Triton Pretranspose"
     )
     print()
 
     # Summary statistics
     fi_pre_times = [r["fi_pretrans_us"] for r in all_results if r.get("fi_pretrans_us")]
     tr_pre_times = [r["tr_pretrans_us"] for r in all_results if r.get("tr_pretrans_us")]
-    imp_cute_times = [
-        r["improved_cutedsl_us"] for r in all_results if r.get("improved_cutedsl_us")
+    klast_bf16_times = [
+        r["gdn_decode_klast_bf16_state_us"]
+        for r in all_results
+        if r.get("gdn_decode_klast_bf16_state_us")
     ]
 
     if fi_pre_times and tr_pre_times:
@@ -2188,29 +2194,29 @@ def run_all_layouts_benchmark(args, dtype, use_qk_l2norm):
             f"FlashInfer vs Triton (Pretranspose) - Average speedup: {np.mean(speedups):.2f}x"
         )
 
-    if imp_cute_times and fi_pre_times and len(imp_cute_times) == len(fi_pre_times):
+    if klast_bf16_times and fi_pre_times and len(klast_bf16_times) == len(fi_pre_times):
         speedups = [
-            fi / cute for cute, fi in zip(imp_cute_times, fi_pre_times, strict=False)
+            fi / t for t, fi in zip(klast_bf16_times, fi_pre_times, strict=False)
         ]
         print(
-            f"Improved CuTe-DSL vs FlashInfer (Pretranspose) - Average speedup: {np.mean(speedups):.2f}x"
+            f"gdn_decode_klast_bf16_state vs FlashInfer (Pretranspose) - Average speedup: {np.mean(speedups):.2f}x"
         )
 
-    if imp_cute_times and tr_pre_times and len(imp_cute_times) == len(tr_pre_times):
+    if klast_bf16_times and tr_pre_times and len(klast_bf16_times) == len(tr_pre_times):
         speedups = [
-            tr / cute for cute, tr in zip(imp_cute_times, tr_pre_times, strict=False)
+            tr / t for t, tr in zip(klast_bf16_times, tr_pre_times, strict=False)
         ]
         print(
-            f"Improved CuTe-DSL vs Triton (Pretranspose) - Average speedup: {np.mean(speedups):.2f}x"
+            f"gdn_decode_klast_bf16_state vs Triton (Pretranspose) - Average speedup: {np.mean(speedups):.2f}x"
         )
 
 
 # ============================================================================
-# Improved CuTe-DSL Multi-Token Benchmark (T=1,2,3,4)
+# gdn_decode_klast_bf16_state Multi-Token Benchmark (T=1,2,3,4)
 # ============================================================================
 
 
-def bench_improved_cutedsl(
+def bench_gdn_decode_klast_bf16_state(
     batch_size: int,
     seq_len: int,  # T=1,2,3,4
     num_q_heads: int,
@@ -2222,12 +2228,12 @@ def bench_improved_cutedsl(
     warmup_iters: int = 10,
     bench_iters: int = 100,
 ):
-    """Benchmark Improved CuTe-DSL kernel for T=1,2,3,4."""
-    if not IMPROVED_CUTEDSL_AVAILABLE:
-        raise RuntimeError("Improved CuTe-DSL kernel is not available")
+    """Benchmark gdn_decode_klast_bf16_state kernel for T=1,2,3,4."""
+    if not GDN_DECODE_KLAST_BF16_STATE_AVAILABLE:
+        raise RuntimeError("gdn_decode_klast_bf16_state kernel is not available")
 
     assert seq_len in [1, 2, 3, 4], (
-        f"Improved CuTe-DSL supports T=1,2,3,4, got T={seq_len}"
+        f"gdn_decode_klast_bf16_state supports T=1,2,3,4, got T={seq_len}"
     )
 
     num_o_heads = max(num_q_heads, num_v_heads)
@@ -2265,7 +2271,7 @@ def bench_improved_cutedsl(
 
     # Benchmark with bench_gpu_time (CUPTI for accurate kernel timing)
     kernel_times_ms = bench_gpu_time(
-        lambda: improved_cutedsl_gdn_wrapper(
+        lambda: gdn_decode_klast_bf16_state_wrapper(
             q, k, v, state, A_log, a, dt_bias, b, scale, output, use_qk_l2norm
         ),
         enable_cupti=True,
@@ -2278,7 +2284,7 @@ def bench_improved_cutedsl(
     flops = gdn_decode_flops(
         batch_size, num_q_heads, num_k_heads, num_v_heads, head_size, seq_len
     )
-    # Improved CuTe-DSL uses BF16 state (2 bytes), not FP32 (4 bytes)
+    # gdn_decode_klast_bf16_state uses BF16 state (2 bytes), not FP32 (4 bytes)
     bytes_accessed = gdn_decode_bytes(
         batch_size,
         num_q_heads,
@@ -2288,7 +2294,7 @@ def bench_improved_cutedsl(
         dtype,
         seq_len,
         disable_state_update=False,
-        state_dtype_bytes=2,  # BF16 state for improved CuTe-DSL
+        state_dtype_bytes=2,  # BF16 state for gdn_decode_klast_bf16_state
     )
 
     kernel_tflops = flops / kernel_median_ms / 1e9 if kernel_median_ms > 0 else 0
@@ -2305,10 +2311,10 @@ def bench_improved_cutedsl(
     }
 
 
-def run_improved_cutedsl_benchmark(args, dtype, use_qk_l2norm):
-    """Run Improved CuTe-DSL benchmark for T=1,2,3,4."""
-    if not IMPROVED_CUTEDSL_AVAILABLE:
-        print("Error: Improved CuTe-DSL kernel is not available.")
+def run_gdn_decode_klast_bf16_state_benchmark(args, dtype, use_qk_l2norm):
+    """Run gdn_decode_klast_bf16_state benchmark for T=1,2,3,4."""
+    if not GDN_DECODE_KLAST_BF16_STATE_AVAILABLE:
+        print("Error: gdn_decode_klast_bf16_state kernel is not available.")
         print("Make sure flashinfer.cute_dsl.gated_delta_rule is importable.")
         return
 
@@ -2319,7 +2325,7 @@ def run_improved_cutedsl_benchmark(args, dtype, use_qk_l2norm):
         return
 
     print("\n" + "=" * 100)
-    print(f"Improved CuTe-DSL GDN Benchmark (T={valid_seq_lens})")
+    print(f"gdn_decode_klast_bf16_state GDN Benchmark (T={valid_seq_lens})")
     print(
         f"Config: q_heads={args.num_q_heads}, k_heads={args.num_k_heads}, "
         f"v_heads={args.num_v_heads}, head_size={args.head_size}, "
@@ -2334,7 +2340,7 @@ def run_improved_cutedsl_benchmark(args, dtype, use_qk_l2norm):
     for batch_size in args.batch_size:
         for seq_len in valid_seq_lens:
             try:
-                result = bench_improved_cutedsl(
+                result = bench_gdn_decode_klast_bf16_state(
                     batch_size=batch_size,
                     seq_len=seq_len,
                     num_q_heads=args.num_q_heads,
@@ -2675,8 +2681,8 @@ Examples:
   # MTP comparison: FlashInfer vs Triton
   python benchmarks/bench_gdn_decode.py --version mtp --compare --batch-size 1 32 128
 
-  # Improved CuTe-DSL benchmark (T=1,2,3,4)
-  python benchmarks/bench_gdn_decode.py --version improved_cutedsl --batch-size 1 32 128 512
+  # gdn_decode_klast_bf16_state benchmark (T=1,2,3,4)
+  python benchmarks/bench_gdn_decode.py --version gdn_decode_klast_bf16_state --batch-size 1 32 128 512
 """,
     )
     parser.add_argument(
@@ -2708,16 +2714,22 @@ Examples:
     parser.add_argument(
         "--version",
         type=str,
-        choices=["pretranspose", "nontranspose", "mtp", "improved_cutedsl", "all"],
+        choices=[
+            "pretranspose",
+            "nontranspose",
+            "mtp",
+            "gdn_decode_klast_bf16_state",
+            "all",
+        ],
         default="nontranspose",
-        help="Kernel version: pretranspose (V-major state), nontranspose (K-major state), mtp (Multiple Token Processing), improved_cutedsl (T=1,2,3,4), or all",
+        help="Kernel version: pretranspose (V-major state), nontranspose (K-major state), mtp (Multiple Token Processing), gdn_decode_klast_bf16_state (T=1..4, bf16 state, K-last), or all",
     )
     parser.add_argument(
         "--seq-len",
         type=int,
         nargs="+",
         default=[1, 2, 3, 4],
-        help="Sequence lengths: for MTP use T>1, for improved_cutedsl use T=1,2,3,4",
+        help="Sequence lengths: for MTP use T>1, for gdn_decode_klast_bf16_state use T=1,2,3,4",
     )
     parser.add_argument(
         "--cache-intermediate-states",
@@ -2772,11 +2784,11 @@ Examples:
             run_comparison_benchmark(args, dtype, use_qk_l2norm)
         else:
             run_flashinfer_only_benchmark(args, dtype, use_qk_l2norm)
-    elif args.version == "improved_cutedsl":
-        # Improved CuTe-DSL benchmark for T=1,2,3,4
-        run_improved_cutedsl_benchmark(args, dtype, use_qk_l2norm)
+    elif args.version == "gdn_decode_klast_bf16_state":
+        # gdn_decode_klast_bf16_state benchmark for T=1,2,3,4
+        run_gdn_decode_klast_bf16_state_benchmark(args, dtype, use_qk_l2norm)
     else:
-        # Non-MTP: always run all layouts comparison (FlashInfer/Triton x pretranspose/nontranspose + Improved CuTe-DSL)
+        # Non-MTP: always run all layouts comparison (FlashInfer/Triton x pretranspose/nontranspose + gdn_decode_klast_bf16_state)
         run_all_layouts_benchmark(args, dtype, use_qk_l2norm)
 
 
