@@ -136,7 +136,16 @@ def _test_prefill_kernel(
 @pytest.mark.parametrize("head_size", [128])
 @pytest.mark.parametrize(
     "num_q_heads, num_k_heads, num_v_heads",
-    [(1, 1, 1), (4, 1, 1), (3, 3, 3), (6, 2, 2), (1, 1, 2), (2, 2, 4)],
+    [
+        (1, 1, 1),
+        (4, 1, 1),
+        (3, 3, 3),
+        (6, 2, 2),
+        (1, 1, 2),
+        (2, 2, 4),
+        (16, 16, 32),
+        (16, 16, 64),
+    ],
 )
 @pytest.mark.parametrize("seq_lens", [[64], [128], [256], [256, 256], [64, 128, 512]])
 @pytest.mark.parametrize("block_size", [64])
@@ -178,7 +187,16 @@ def test_prefill_kernel_basic(
 @pytest.mark.parametrize("head_size", [128])
 @pytest.mark.parametrize(
     "num_q_heads, num_k_heads, num_v_heads",
-    [(1, 1, 1), (4, 1, 1), (3, 3, 3), (6, 2, 2), (1, 1, 2), (2, 2, 4)],
+    [
+        (1, 1, 1),
+        (4, 1, 1),
+        (3, 3, 3),
+        (6, 2, 2),
+        (1, 1, 2),
+        (2, 2, 4),
+        (16, 16, 32),
+        (16, 16, 64),
+    ],
 )
 @pytest.mark.parametrize(
     "seq_lens",
@@ -381,7 +399,8 @@ def _test_chunked_prefill(
 @pytest.mark.parametrize("scale", [1.0, "auto"])
 @pytest.mark.parametrize("head_size", [128])
 @pytest.mark.parametrize(
-    "num_q_heads, num_k_heads, num_v_heads", [(6, 2, 2), (2, 2, 4)]
+    "num_q_heads, num_k_heads, num_v_heads",
+    [(6, 2, 2), (2, 2, 4), (16, 16, 32), (16, 16, 64)],
 )
 @pytest.mark.parametrize(
     "seq_lens1, seq_lens2",
