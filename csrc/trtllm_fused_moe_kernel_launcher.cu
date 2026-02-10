@@ -110,6 +110,7 @@ class FusedMoeLauncher {
   btg::Dtype mRoutingBiasDtype{
       btg::Dtype::Bfloat16};  // Dtype for expert weights in routing, based on routing bias
   ActivationType activation_type{ActivationType::Swiglu};
+  btg::Dtype mDtypeScore{btg::Dtype::Bfloat16};
 
  public:
   // Constructor that initializes all TensorView members
@@ -355,8 +356,8 @@ class FusedMoeLauncher {
         static_cast<int*>(num_tokens_per_expert.data_ptr()),
         static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr()),
         static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr()),
-        static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt, mRoutingBiasDtype,
-        use_routing_scales_on_input, use_deep_seek_fp8,
+        static_cast<int*>(num_non_exiting_ctas.data_ptr()), mDtypeScore, args->mDtypeElt,
+        mRoutingBiasDtype, use_routing_scales_on_input, use_deep_seek_fp8,
         static_cast<RoutingMethodType>(routing_method_type), routing_stream);
 
     check_moe();
@@ -581,6 +582,10 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
     workspace.expert_weights = expert_weights.data_ptr();
     if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Llama4) {
       workspace.token_scales = expert_weights.data_ptr();  // Consumed by permuteGemm1 kernel
+    }
+    if (routing_logits.has_value()) {
+      mDtypeScore =
+          routing_logits.value().dtype() == dl_float32 ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16;
     }
   }
 
@@ -842,6 +847,11 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
     } else {
       workspace.expert_weights = const_cast<void*>(expert_weights.data_ptr());
     }
+
+    if (routing_logits.has_value()) {
+      mDtypeScore =
+          routing_logits.value().dtype() == dl_float32 ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16;
+    }
   }
 
   void check_moe() const override {
@@ -970,8 +980,8 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
         static_cast<int*>(num_tokens_per_expert.data_ptr()),
         static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr()),
         static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr()),
-        static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt, mRoutingBiasDtype,
-        use_routing_scales_on_input, use_deep_seek_fp8,
+        static_cast<int*>(num_non_exiting_ctas.data_ptr()), mDtypeScore, args->mDtypeElt,
+        mRoutingBiasDtype, use_routing_scales_on_input, use_deep_seek_fp8,
         static_cast<RoutingMethodType>(routing_method_type), routing_stream);
 
     check_moe();
@@ -1432,8 +1442,8 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
         static_cast<int*>(num_tokens_per_expert.data_ptr()),
         static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr()),
         static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr()),
-        static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt, mRoutingBiasDtype,
-        use_routing_scales_on_input, use_deep_seek_fp8,
+        static_cast<int*>(num_non_exiting_ctas.data_ptr()), mDtypeScore, args->mDtypeElt,
+        mRoutingBiasDtype, use_routing_scales_on_input, use_deep_seek_fp8,
         static_cast<RoutingMethodType>(routing_method_type), routing_stream);
 
     check_moe();
@@ -1562,13 +1572,12 @@ Tensor trtllm_fp8_per_tensor_scale_moe(
   // Basic type validation
   auto dtype = hidden_states.dtype();
   auto activation = static_cast<ActivationType>(activation_type);
-  if (use_routing_scales_on_input) {
-    TVM_FFI_ICHECK_EQ(routing_logits.dtype(), dl_bfloat16) << "routing_logits must be bfloat16.";
-  } else if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3) {
-    TVM_FFI_ICHECK_EQ(routing_logits.dtype(), dl_float32) << "routing_logits must be float.";
-  } else {
-    TVM_FFI_ICHECK_EQ(routing_logits.dtype(), dl_bfloat16) << "routing_logits must be bfloat16.";
+
+  if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3) {
+    TVM_FFI_ICHECK_EQ(routing_logits.dtype(), dl_float32)
+        << "routing_logits must be float for DeepSeekV3.";
   }
+
   TVM_FFI_ICHECK(dtype == dl_float8_e4m3fn || dtype == dl_float16 || dtype == dl_bfloat16)
       << "FP8 MoE: hidden_states must be float8_e4m3fn, float16, or bfloat16.";
   TVM_FFI_ICHECK_EQ(gemm1_weights.dtype(), dl_float8_e4m3fn)
@@ -1666,9 +1675,6 @@ Tensor trtllm_fp8_block_scale_moe(
     if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3) {
       TVM_FFI_ICHECK_EQ(routing_logits.value().dtype(), dl_float32)
           << "routing_logits must be float.";
-    } else {
-      TVM_FFI_ICHECK_EQ(routing_logits.value().dtype(), dl_bfloat16)
-          << "routing_logits must be bfloat16.";
     }
   }
   TVM_FFI_ICHECK(dtype == dl_float16 || dtype == dl_bfloat16 || dtype == dl_float8_e4m3fn)

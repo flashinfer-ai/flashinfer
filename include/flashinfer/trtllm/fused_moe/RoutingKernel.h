@@ -265,6 +265,7 @@ namespace routingRenormalize {
 
 struct Data : public DataBase {
   tg::Dtype mDtypeExpW{tg::Dtype::Fp32};
+  tg::Dtype mDtypeScore{tg::Dtype::Fp32};
   tg::Dtype mDtypeElt{tg::Dtype::Bfloat16};
 
   bool mDoSoftmaxBeforeTopK{false};
