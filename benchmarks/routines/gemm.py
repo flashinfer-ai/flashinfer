@@ -1541,29 +1541,12 @@ def testMmBf16(args):
             backends_to_remove.append(backend)
             continue
 
-        # Filter backends based on TGV-specific features
-        if use_bias and backend != "tgv":
-            print(f"[INFO] {backend} backend does not have bias enabled at this time")
-            backends_to_remove.append(backend)
-            continue
-
-        if use_pdl and backend != "tgv":
-            print(f"[INFO] {backend} backend does not have bias enabled at this time")
-            backends_to_remove.append(backend)
-            continue
-
-        # TGV backend only supports bfloat16 output
-        if backend == "tgv" and out_dtype != torch.bfloat16:
-            print(f"[INFO] TGV backend does not support {out_dtype} at this time")
-            backends_to_remove.append(backend)
-            continue
-
         try:
             flashinfer.mm_bf16(
                 a=a,
                 b=b,
-                bias=bias if backend == "tgv" else None,
-                pdl=use_pdl if backend == "tgv" else False,
+                bias=bias,
+                pdl=use_pdl,
                 out_dtype=out_dtype,
                 backend=backend,
             )
@@ -1586,8 +1569,8 @@ def testMmBf16(args):
             return flashinfer.mm_bf16(
                 a=a,
                 b=b,
-                bias=bias if backend == "tgv" else None,
-                pdl=use_pdl if backend == "tgv" else False,
+                bias=bias,
+                pdl=use_pdl,
                 out_dtype=out_dtype,
                 backend=backend,
             )
