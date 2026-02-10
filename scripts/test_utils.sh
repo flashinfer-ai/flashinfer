@@ -397,6 +397,28 @@ run_tests_parallel() {
     IFS=' ' read -r -a GPU_LIST <<< "$gpu_string"
     local NUM_GPUS=${#GPU_LIST[@]}
 
+    # Auto-fallback to sequential if only one GPU
+    if [ "$NUM_GPUS" -eq 1 ]; then
+        echo "=========================================="
+        echo "Only 1 GPU detected - using sequential execution"
+        echo "=========================================="
+        echo "GPU: ${GPU_LIST[0]}"
+        echo ""
+        # Run sequentially instead
+        if [ "$mode" = "sanity" ]; then
+            FILE_COUNT=0
+            for test_file in $test_files; do
+                FILE_COUNT=$((FILE_COUNT + 1))
+                run_sanity_test_file "$test_file" "$FILE_COUNT"
+            done
+        else
+            for test_file in $test_files; do
+                run_full_test_file "$test_file"
+            done
+        fi
+        return
+    fi
+
     echo "=========================================="
     echo "PARALLEL EXECUTION MODE"
     echo "=========================================="
@@ -407,7 +429,10 @@ run_tests_parallel() {
 
     # Create a temporary directory for parallel job state
     PARALLEL_TMP_DIR=$(mktemp -d)
-    trap 'rm -rf "$PARALLEL_TMP_DIR"' EXIT
+
+    # Preserve existing EXIT trap and add cleanup
+    PREV_EXIT_TRAP=$(trap -p EXIT | sed -E "s/^trap -- '(.*)' EXIT$/\1/")
+    trap 'rm -rf "$PARALLEL_TMP_DIR"; '"$PREV_EXIT_TRAP" EXIT
 
     # Convert test files to array
     local -a test_files_array
@@ -420,7 +445,10 @@ run_tests_parallel() {
     # Create a results file for each test
     declare -A test_result_files
     declare -A test_pid_map
-    local active_jobs=0
+    declare -A test_gpu_map
+
+    # Free GPU queue for proper GPU assignment
+    local -a available_gpus=("${GPU_LIST[@]}")
 
     # Function to run a single test file
     run_single_test_background() {
@@ -498,15 +526,34 @@ run_tests_parallel() {
         echo "$pid:$test_file:$result_file:$log_file:$file_index"
     }
 
-    # Launch tests in parallel
+    # Launch tests in parallel with GPU queue
     echo "Launching tests in parallel..."
-    for i in "${!test_files_array[@]}"; do
-        local test_file="${test_files_array[$i]}"
-        local gpu_index=$((i % NUM_GPUS))
-        local gpu_id="${GPU_LIST[$gpu_index]}"
-        local file_index=$((i + 1))
+    local test_idx=0
+    while [ $test_idx -lt $total_files ]; do
+        # Wait for a GPU to become available
+        while [ ${#available_gpus[@]} -eq 0 ]; do
+            # Check for finished jobs and reclaim their GPUs
+            for pid in "${!test_pid_map[@]}"; do
+                if ! kill -0 "$pid" 2>/dev/null; then
+                    # Job finished, reclaim its GPU
+                    wait "$pid" 2>/dev/null || true
+                    local freed_gpu="${test_gpu_map[$pid]}"
+                    available_gpus+=("$freed_gpu")
+                    unset "test_pid_map[$pid]"
+                    unset "test_gpu_map[$pid]"
+                fi
+            done
+            # Small sleep to avoid busy-waiting
+            [ ${#available_gpus[@]} -eq 0 ] && sleep 0.1
+        done
 
-        # Launch test in background
+        # Get next available GPU
+        local gpu_id="${available_gpus[0]}"
+        available_gpus=("${available_gpus[@]:1}")  # Remove first element
+
+        # Launch test on this GPU
+        local test_file="${test_files_array[$test_idx]}"
+        local file_index=$((test_idx + 1))
         local job_info
         job_info=$(run_single_test_background "$test_file" "$gpu_id" "$file_index")
 
@@ -515,23 +562,9 @@ run_tests_parallel() {
         IFS=':' read -r pid test_file result_file log_file file_index <<< "$job_info"
         test_result_files[$pid]="$result_file:$test_file:$log_file:$file_index"
         test_pid_map[$pid]="$test_file"
+        test_gpu_map[$pid]="$gpu_id"
 
-        active_jobs=$((active_jobs + 1))
-
-        # Limit concurrent jobs to NUM_GPUS
-        while [ $active_jobs -ge $NUM_GPUS ]; do
-            # Wait for any job to finish
-            for pid in "${!test_pid_map[@]}"; do
-                if ! kill -0 "$pid" 2>/dev/null; then
-                    # Job finished, process result
-                    wait "$pid" 2>/dev/null || true
-                    active_jobs=$((active_jobs - 1))
-                    unset "test_pid_map[$pid]"
-                    break
-                fi
-            done
-            sleep 0.1
-        done
+        test_idx=$((test_idx + 1))
     done
 
     # Wait for all remaining jobs
@@ -545,8 +578,20 @@ run_tests_parallel() {
     echo "All tests completed. Processing results..."
     echo ""
 
-    # Process results
+    # Sort results by file_index for deterministic output
+    local -a sorted_pids=()
     for pid in "${!test_result_files[@]}"; do
+        local result_file test_file log_file file_index
+        IFS=':' read -r result_file test_file log_file file_index <<< "${test_result_files[$pid]}"
+        sorted_pids+=("$file_index:$pid")
+    done
+    local sorted_list
+    sorted_list=$(printf '%s\n' "${sorted_pids[@]}" | sort -n)
+    mapfile -t sorted_pids <<< "$sorted_list"
+
+    # Process results in order
+    for entry in "${sorted_pids[@]}"; do
+        local pid="${entry#*:}"
         local result_file test_file log_file file_index
         IFS=':' read -r result_file test_file log_file file_index <<< "${test_result_files[$pid]}"
 
