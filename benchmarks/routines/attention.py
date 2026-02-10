@@ -666,8 +666,15 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 o_dtype=q_dtype,
             )
             resolved_backend = resolved_backends.get(backend, backend)
+            wrapper = backend_wrappers.get(backend)
+            if (
+                wrapper is not None
+                and resolved_backend == "fa2"
+                and wrapper.use_tensor_cores
+            ):
+                resolved_backend = "fa2_tc"
             display_backend = (
-                f"auto({resolved_backend})" if backend == "auto" else backend
+                f"auto({resolved_backend})" if backend == "auto" else resolved_backend
             )
             print_perf_metrics(
                 display_backend, median_time, std_time, tflops, tb_per_sec
