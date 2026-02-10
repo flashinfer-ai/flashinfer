@@ -223,7 +223,6 @@ The output CSV will contain detailed metrics including:
 | `--use_nvfp4`            | Whether to use nvfp4 quantization or mxfp4 quantization, defaults to False.(for `mm_fp4` routine)          |
 | `--autotune`             | Enable autotune for supported operation (`mm_fp4`, `bmm_fp8`, `mm_bf16`, `bmm_bf16` routines)              |
 | `--bias`                 | Use bias for `mm_bf16` (Enabled for TGV backend)                                                           |
-| `--pdl`                  | Use persistent data loader mode for `mm_bf16` (Enabled for TGV backend)                                    |
 
 ### MOE Flags
 | Flag                     | Description                                                                                                 |

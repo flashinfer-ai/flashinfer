@@ -168,12 +168,6 @@ def parse_gemm_args(line, parser):
         default=False,
         help="Use bias for mm_bf16 (TGV backend only).",
     )
-    parser.add_argument(
-        "--pdl",
-        action="store_true",
-        default=False,
-        help="Use persistent data loader mode for mm_bf16 (TGV backend only).",
-    )
 
     args = parser.parse_args(line)
     if args.verbose >= 1:
@@ -1498,45 +1492,17 @@ def testMmBf16(args):
     n = args.n
     k = args.k
     use_bias = getattr(args, "bias", False)
-    use_pdl = getattr(args, "pdl", False)
+    use_pdl = getattr(args, "enable_pdl", False)
     is_cuda_graph_compatible = not args.no_cuda_graph
     run_refcheck = args.refcheck
     autotune_supported_backends = ["cudnn", "cutlass", "tgv"]
     res = []
-
-    backends = filter_backends_by_compute_capability(backends, args.routine, device)
-    if len(backends) == 0:
-        print("[ERROR] No backends to test. Exiting.")
-        return res
 
     out_dtype = dtype_str_to_torch_dtype(args.out_dtype)
     if out_dtype not in [torch.bfloat16, torch.float16]:
         raise ValueError(
             f"Unsupported output dtype: {args.out_dtype}. Supported dtypes are bfloat16 and float16."
         )
-
-    # Filter backends based on TGV-specific features
-    if use_bias or use_pdl:
-        backends_to_remove = []
-        for backend in backends:
-            if backend != "tgv":
-                print(
-                    f"[INFO] --bias and --pdl are only supported by tgv backend, removing {backend}"
-                )
-                backends_to_remove.append(backend)
-        for backend in backends_to_remove:
-            backends.remove(backend)
-
-    # TGV only supports bfloat16 output
-    if "tgv" in backends and out_dtype != torch.bfloat16:
-        print(
-            "[WARNING] TGV backend only supports bfloat16 output, removing tgv from backends"
-        )
-        backends.remove("tgv")
-
-    if len(backends) == 0:
-        print("[ERROR] No backends to test after filtering. Exiting.")
-        return res
 
     ## Prepare input tensors
     # a: (m, k), row-major
@@ -1557,6 +1523,41 @@ def testMmBf16(args):
             print(f"[VVERBOSE] {bias.shape = }")
             print(f"[VVERBOSE] {bias.dtype = }")
         print(f"[VVERBOSE] {use_pdl = }")
+
+    # Programmatically filter backends
+    backends_to_remove = []
+    for backend in backends:
+        # Skip autotune check for now (handled separately below)
+        if (
+            getattr(args, "autotune", False)
+            and backend not in autotune_supported_backends
+        ):
+            print(f"[INFO] {backend} backend does not support autotune")
+            backends_to_remove.append(backend)
+            continue
+
+        try:
+            flashinfer.mm_bf16(
+                a=a,
+                b=b,
+                bias=bias if backend == "tgv" else None,
+                pdl=use_pdl if backend == "tgv" else False,
+                out_dtype=out_dtype,
+                backend=backend,
+            )
+        except Exception as e:
+            print(
+                f"[INFO] {backend} backend does not support this configuration: {type(e).__name__}: {e}"
+            )
+            backends_to_remove.append(backend)
+
+    # Remove unsupported backends
+    for backend in backends_to_remove:
+        backends.remove(backend)
+
+    if len(backends) == 0:
+        print("[ERROR] No backends passed validation. Exiting.")
+        return res
 
     def run_backend(backend, a, b, bias, use_pdl, out_dtype):
         if backend in ["cudnn", "cutlass", "tgv"]:
@@ -1668,7 +1669,7 @@ def testMmBf16(args):
                 cur_res["out_dtype"] = str(out_dtype)
                 cur_res["backend"] = backend_name
                 cur_res["bias"] = use_bias
-                cur_res["pdl"] = use_pdl
+                cur_res["enable_pdl"] = use_pdl
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
     return res
@@ -1711,11 +1712,6 @@ def testBmmBf16(args):
     autotune_supported_backends = ["cudnn", "cutlass"]
     res = []
 
-    backends = filter_backends_by_compute_capability(backends, args.routine, device)
-    if len(backends) == 0:
-        print("[ERROR] No backends to test. Exiting.")
-        return res
-
     out_dtype = dtype_str_to_torch_dtype(args.out_dtype)
     if out_dtype not in [torch.bfloat16, torch.float16]:
         raise ValueError(
@@ -1735,6 +1731,39 @@ def testBmmBf16(args):
         print(f"[VVERBOSE] {A.dtype = }")
         print(f"[VVERBOSE] {B.shape = }")
         print(f"[VVERBOSE] {B.dtype = }")
+
+    # Programmatically filter backends
+    backends_to_remove = []
+    for backend in backends:
+        # Skip autotune check for now (handled separately below)
+        if (
+            getattr(args, "autotune", False)
+            and backend not in autotune_supported_backends
+        ):
+            print(f"[INFO] {backend} backend does not support autotune")
+            backends_to_remove.append(backend)
+            continue
+
+        try:
+            flashinfer.bmm_bf16(
+                A=A,
+                B=B,
+                out_dtype=out_dtype,
+                backend=backend,
+            )
+        except Exception as e:
+            print(
+                f"[INFO] {backend} backend does not support this configuration: {type(e).__name__}: {e}"
+            )
+            backends_to_remove.append(backend)
+
+    # Remove unsupported backends
+    for backend in backends_to_remove:
+        backends.remove(backend)
+
+    if len(backends) == 0:
+        print("[ERROR] No backends passed validation. Exiting.")
+        return res
 
     def run_backend(backend, A, B, out_dtype):
         if backend in ["cudnn", "cutlass"]:

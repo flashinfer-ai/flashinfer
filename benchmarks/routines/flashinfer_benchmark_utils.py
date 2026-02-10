@@ -36,7 +36,6 @@ output_column_dict = {
         "use_128x4_sf_layout",
         "use_nvfp4",
         "bias",
-        "pdl",
     ],
     "moe": [
         "num_tokens",
@@ -357,27 +356,7 @@ routine_cc_to_supported_backends = {
         "11.0": ["cutlass"],
         "12.0": [],
     },
-    # Note: mm_fp4 uses support checkers to filter backends, so it is not listed here
-    "mm_bf16": {
-        "7.5": [],
-        "8.0": [],
-        "8.6": [],
-        "8.9": [],
-        "9.0": [],
-        "10.0": ["cudnn", "cutlass", "tgv"],
-        "10.3": ["cudnn", "cutlass", "tgv"],
-        "12.0": [],
-    },
-    "bmm_bf16": {
-        "7.5": [],
-        "8.0": [],
-        "8.6": [],
-        "8.9": [],
-        "9.0": [],
-        "10.0": ["cudnn", "cutlass"],
-        "10.3": ["cudnn", "cutlass"],
-        "12.0": [],
-    },
+    # Note: mm_fp4, mm_bf16, and bmm_bf16 use support checkers to filter backends, so they are not listed here
     # MOE
     "trtllm_fp4_block_scale_moe": {
         "7.5": [],
