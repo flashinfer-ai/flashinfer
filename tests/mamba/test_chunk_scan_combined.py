@@ -21,6 +21,65 @@ from .triton_reference.ssd_chunk_scan import _chunk_scan_fwd
 from einops import rearrange
 
 
+def _compute_varlen_metadata(cu_seqlens, chunk_size):
+    """Compute seq_idx, chunk_indices, and chunk_offsets for variable-length sequences.
+
+    Given cumulative sequence lengths and chunk_size, this function constructs
+    the metadata needed for the varlen chunk scan kernels.
+
+    Args:
+        cu_seqlens: 1D tensor of cumulative sequence lengths, e.g. [0, 100, 356, 512]
+            for 3 sequences of lengths 100, 256, 156.
+        chunk_size: int, the chunk size used by the SSD kernel.
+
+    Returns:
+        seq_idx: (1, total_seqlen) tensor mapping each position to its sequence index.
+        chunk_indices: 1D tensor mapping logical chunk index -> physical chunk index.
+        chunk_offsets: 1D tensor mapping logical chunk index -> offset within that physical chunk.
+    """
+    total_seqlen = cu_seqlens[-1].item()
+
+    # Build seq_idx: each position gets its sequence index
+    seq_idx = torch.zeros(1, total_seqlen, dtype=torch.int32, device=cu_seqlens.device)
+    num_seqs = len(cu_seqlens) - 1
+    for i in range(num_seqs):
+        start = cu_seqlens[i].item()
+        end = cu_seqlens[i + 1].item()
+        seq_idx[0, start:end] = i
+
+    # Build chunk_indices and chunk_offsets by scanning physical chunks
+    # and splitting at sequence boundaries
+    nchunks = (total_seqlen + chunk_size - 1) // chunk_size
+    chunk_indices_list = []
+    chunk_offsets_list = []
+
+    for phys_chunk in range(nchunks):
+        chunk_start = phys_chunk * chunk_size
+        chunk_end = min(chunk_start + chunk_size, total_seqlen)
+
+        # Find which sequences are present in this physical chunk
+        chunk_seq_vals = seq_idx[0, chunk_start:chunk_end]
+
+        # Detect transitions: first element always starts a segment
+        prev_ids = torch.cat(
+            [chunk_seq_vals[:1] - 1, chunk_seq_vals[:-1]]
+        )  # force first to differ
+        transitions = (chunk_seq_vals != prev_ids).nonzero(as_tuple=True)[0]
+
+        for offset in transitions:
+            chunk_indices_list.append(phys_chunk)
+            chunk_offsets_list.append(offset.item())
+
+    chunk_indices = torch.tensor(
+        chunk_indices_list, dtype=torch.int32, device=cu_seqlens.device
+    )
+    chunk_offsets = torch.tensor(
+        chunk_offsets_list, dtype=torch.int32, device=cu_seqlens.device
+    )
+
+    return seq_idx, chunk_indices, chunk_offsets
+
+
 def is_blackwell_available():
     """Check if Blackwell GPU (SM100) is available."""
     if not torch.cuda.is_available():
@@ -515,3 +574,302 @@ class TestChunkScanCombinedWithInitialStates(TestChunkScanCombined):
 
         assert out_match, "Output mismatch with initial states"
         assert states_match, "Final states mismatch with initial states"
+
+
+class TestChunkScanCombinedVarlen:
+    """Test CuTe DSL kernel with variable-length sequences (continuous batching).
+
+    Compares FlashInfer CuTe DSL kernel (ssd_combined_fwd) against
+    per-sequence Triton reference computation.
+
+    Chunk-aligned sequences: all sequence lengths are multiples of chunk_size,
+    so no physical chunk is shared by two sequences.
+
+    Non-chunk-aligned sequences (mid-chunk boundaries) are tested separately
+    and marked xfail until step 4.2 (chunk_size_limit) is implemented.
+    """
+
+    ATOL = 5e-2
+    RTOL = 5e-2
+    INPUT_DTYPE = torch.bfloat16
+
+    @pytest.fixture(params=[8])
+    def nheads(self, request):
+        return request.param
+
+    @pytest.fixture(params=[64])
+    def headdim(self, request):
+        return request.param
+
+    @pytest.fixture(params=[128])
+    def dstate(self, request):
+        return request.param
+
+    @pytest.fixture(params=[128])
+    def chunk_size(self, request):
+        return request.param
+
+    @pytest.fixture(params=[8])
+    def ngroups(self, request):
+        return request.param
+
+    @staticmethod
+    def _make_inputs(nheads, headdim, dstate, chunk_size, ngroups, seq_lengths):
+        """Create packed varlen inputs (batch=1) with initial states."""
+        torch.manual_seed(42)
+
+        num_seqs = len(seq_lengths)
+        total_seqlen = sum(seq_lengths)
+
+        # cu_seqlens
+        cu_seqlens_list = [0]
+        for sl in seq_lengths:
+            cu_seqlens_list.append(cu_seqlens_list[-1] + sl)
+        cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.int32, device="cuda")
+
+        # Compute varlen metadata
+        seq_idx, chunk_indices, chunk_offsets = _compute_varlen_metadata(
+            cu_seqlens, chunk_size
+        )
+
+        # Packed tensors (batch=1)
+        x = torch.randn(
+            1, total_seqlen, nheads, headdim, dtype=torch.bfloat16, device="cuda"
+        )
+        dt = torch.randn(1, total_seqlen, nheads, dtype=torch.float32, device="cuda")
+        A = -torch.rand(nheads, dtype=torch.float32, device="cuda") - 1.0
+        B = torch.randn(
+            1, total_seqlen, ngroups, dstate, dtype=torch.bfloat16, device="cuda"
+        )
+        C = torch.randn(
+            1, total_seqlen, ngroups, dstate, dtype=torch.bfloat16, device="cuda"
+        )
+        D = torch.randn(nheads, dtype=torch.bfloat16, device="cuda")
+        dt_bias = torch.rand(nheads, dtype=torch.float32, device="cuda") - 4.0
+
+        # Initial states: one per sequence
+        initial_states = torch.randn(
+            num_seqs, nheads, headdim, dstate, dtype=torch.bfloat16, device="cuda"
+        )
+
+        return {
+            "x": x,
+            "dt": dt,
+            "A": A,
+            "B": B,
+            "C": C,
+            "D": D,
+            "dt_bias": dt_bias,
+            "chunk_size": chunk_size,
+            "total_seqlen": total_seqlen,
+            "nheads": nheads,
+            "headdim": headdim,
+            "dstate": dstate,
+            "ngroups": ngroups,
+            "initial_states": initial_states,
+            "seq_idx": seq_idx,
+            "chunk_indices": chunk_indices,
+            "chunk_offsets": chunk_offsets,
+            "cu_seqlens": cu_seqlens,
+            "seq_lengths": seq_lengths,
+            "num_seqs": num_seqs,
+        }
+
+    @staticmethod
+    def _compute_per_sequence_reference(inputs):
+        """Compute reference by running each sequence independently through Triton."""
+        x = inputs["x"]
+        dt = inputs["dt"]
+        A = inputs["A"]
+        B = inputs["B"]
+        C = inputs["C"]
+        D = inputs["D"]
+        dt_bias = inputs["dt_bias"]
+        chunk_size = inputs["chunk_size"]
+        initial_states = inputs["initial_states"]
+        cu_seqlens = inputs["cu_seqlens"]
+        num_seqs = inputs["num_seqs"]
+        dstate = inputs["dstate"]
+
+        out_parts = []
+        final_states_list = []
+
+        for i in range(num_seqs):
+            s = cu_seqlens[i].item()
+            e = cu_seqlens[i + 1].item()
+
+            x_i = x[:, s:e, :, :]
+            dt_i = dt[:, s:e, :]
+            B_i = B[:, s:e, :, :]
+            C_i = C[:, s:e, :, :]
+            init_i = initial_states[i : i + 1]
+
+            dA_cumsum_i, dt_proc_i = _chunk_cumsum_fwd(
+                dt_i, A, chunk_size, dt_bias=dt_bias, dt_softplus=True
+            )
+            states_i = _chunk_state_fwd(
+                B_i, x_i, dt_proc_i, dA_cumsum_i, seq_idx=None, states_in_fp32=True
+            )
+            states_i, fstates_i = _state_passing_fwd(
+                rearrange(states_i, "... p n -> ... (p n)"),
+                dA_cumsum_i,
+                initial_states=rearrange(init_i, "... p n -> ... (p n)"),
+                seq_idx=None,
+                chunk_size=chunk_size,
+                out_dtype=C.dtype,
+            )
+            states_i, fstates_i = (
+                rearrange(t, "... (p n) -> ... p n", n=dstate)
+                for t in [states_i, fstates_i]
+            )
+            CB_i = _bmm_chunk_fwd(
+                C_i, B_i, chunk_size, seq_idx=None, output_dtype=torch.float32
+            )
+            out_i = _chunk_scan_fwd(
+                CB_i, x_i, dt_proc_i, dA_cumsum_i, C_i, states_i,
+                D=D, z=None, seq_idx=None, initial_states=None,
+            )
+
+            out_parts.append(out_i)
+            final_states_list.append(fstates_i)
+
+        out_packed = torch.cat(out_parts, dim=1)
+        final_states_packed = torch.cat(final_states_list, dim=0)
+        return out_packed, final_states_packed
+
+    def _print_mismatch_details(self, ref, test, name, atol, rtol):
+        """Print detailed mismatch analysis."""
+        ref_np = ref.detach().cpu().float().numpy()
+        test_np = test.detach().cpu().float().numpy()
+
+        mismatch_mask = ~np.isclose(ref_np, test_np, atol=atol, rtol=rtol)
+        num_mismatches = np.sum(mismatch_mask)
+        total_elements = ref_np.size
+
+        print(f"\nDetailed {name} mismatch analysis:")
+        print(
+            f"Number of mismatched elements: {num_mismatches} / {total_elements} "
+            f"({100 * num_mismatches / total_elements:.2f}%)"
+        )
+
+        if num_mismatches > 0:
+            mismatch_indices = np.argwhere(mismatch_mask)
+            print(f"First few {name} mismatch locations (up to 10):")
+            for idx in mismatch_indices[:10]:
+                idx_tuple = tuple(int(i) for i in idx)
+                ref_val = ref_np[idx_tuple]
+                test_val = test_np[idx_tuple]
+                diff = abs(ref_val - test_val)
+                rel_diff = diff / (abs(ref_val) + 1e-8)
+                print(
+                    f"  Index {idx_tuple}: ref={ref_val:.6f}, test={test_val:.6f}, "
+                    f"diff={diff:.6e}, rel_diff={rel_diff:.6e}"
+                )
+
+    def _check_outputs(self, out_ref, out_test, final_states_ref, final_states_test, tag):
+        """Compare output and final states, print details on mismatch."""
+        out_ref_cmp = out_ref.to(out_test.dtype)
+        out_match = torch.allclose(
+            out_ref_cmp, out_test, atol=self.ATOL, rtol=self.RTOL
+        )
+        if out_match:
+            print(f"OK [{tag}] Outputs match")
+        else:
+            print(f"FAIL [{tag}] Outputs do NOT match")
+            self._print_mismatch_details(
+                out_ref_cmp, out_test, "output", self.ATOL, self.RTOL
+            )
+
+        fs_ref_cmp = final_states_ref.to(final_states_test.dtype)
+        states_match = torch.allclose(
+            fs_ref_cmp, final_states_test, atol=self.ATOL, rtol=self.RTOL
+        )
+        if states_match:
+            print(f"OK [{tag}] Final states match")
+        else:
+            print(f"FAIL [{tag}] Final states do NOT match")
+            self._print_mismatch_details(
+                fs_ref_cmp, final_states_test, "final_states", self.ATOL, self.RTOL
+            )
+
+        assert out_match, f"[{tag}] Output mismatch"
+        assert states_match, f"[{tag}] Final states mismatch"
+
+    def _run_and_check(self, inputs, reference_output, tag):
+        out_ref, final_states_ref = reference_output
+
+        out_test, final_states_test = ssd_combined_fwd(
+            inputs["x"],
+            inputs["dt"],
+            inputs["A"],
+            inputs["B"],
+            inputs["C"],
+            inputs["chunk_size"],
+            D=inputs["D"],
+            dt_bias=inputs["dt_bias"],
+            dt_softplus=True,
+            initial_states=inputs["initial_states"],
+            seq_idx=inputs["seq_idx"],
+            chunk_indices=inputs["chunk_indices"],
+            chunk_offsets=inputs["chunk_offsets"],
+        )
+
+        self._check_outputs(out_ref, out_test, final_states_ref, final_states_test, tag)
+
+    def test_constant_seqlen(self, nheads, headdim, dstate, chunk_size, ngroups):
+        """Single sequence through varlen code path (constant seq length, chunk-aligned)."""
+        inputs = self._make_inputs(nheads, headdim, dstate, chunk_size, ngroups, [2 * chunk_size])
+        ref = self._compute_per_sequence_reference(inputs)
+        self._run_and_check(inputs, ref, "Varlen constant-seqlen")
+
+    @pytest.mark.xfail(raises=AssertionError, reason="init_states reload not yet implemented (step 5.1)")
+    def test_variable_seqlen(self, nheads, headdim, dstate, chunk_size, ngroups):
+        """Multiple sequences with variable chunk-aligned lengths."""
+        inputs = self._make_inputs(nheads, headdim, dstate, chunk_size, ngroups,
+                                   [1 * chunk_size, 2 * chunk_size, 1 * chunk_size])
+        ref = self._compute_per_sequence_reference(inputs)
+        self._run_and_check(inputs, ref, "Varlen variable-seqlen")
+
+
+class TestChunkScanCombinedVarlenNonAligned:
+    """Test CuTe DSL kernel with non-chunk-aligned variable-length sequences.
+
+    Sequences don't align to chunk boundaries, so a physical chunk may
+    contain data from two sequences. Requires step 4.2 (chunk_size_limit
+    masking) — see CHUNK_SCAN_FEATURE_PLAN.md.
+    """
+
+    ATOL = 5e-2
+    RTOL = 5e-2
+
+    @pytest.mark.xfail(raises=AssertionError, reason="CuTe kernel does not yet handle mid-chunk sequence boundaries (steps 4.2 + 5.2)")
+    def test_output_correctness(self):
+        """Test CuTe kernel with non-chunk-aligned varlen sequences."""
+        nheads, headdim, dstate, chunk_size, ngroups = 8, 64, 128, 128, 8
+        # Two sequences: 80 + 176 = 256, first chunk has boundary at position 80
+        seq_lengths = [80, 176]
+        inputs = TestChunkScanCombinedVarlen._make_inputs(
+            nheads, headdim, dstate, chunk_size, ngroups, seq_lengths)
+        ref = TestChunkScanCombinedVarlen._compute_per_sequence_reference(inputs)
+
+        out_ref, final_states_ref = ref
+        out_test, final_states_test = ssd_combined_fwd(
+            inputs["x"],
+            inputs["dt"],
+            inputs["A"],
+            inputs["B"],
+            inputs["C"],
+            inputs["chunk_size"],
+            D=inputs["D"],
+            dt_bias=inputs["dt_bias"],
+            dt_softplus=True,
+            initial_states=inputs["initial_states"],
+            seq_idx=inputs["seq_idx"],
+            chunk_indices=inputs["chunk_indices"],
+            chunk_offsets=inputs["chunk_offsets"],
+        )
+
+        out_match = torch.allclose(out_ref.to(out_test.dtype), out_test, atol=self.ATOL, rtol=self.RTOL)
+        states_match = torch.allclose(final_states_ref.to(final_states_test.dtype), final_states_test, atol=self.ATOL, rtol=self.RTOL)
+        assert out_match, "Varlen non-aligned: output mismatch"
+        assert states_match, "Varlen non-aligned: final states mismatch"

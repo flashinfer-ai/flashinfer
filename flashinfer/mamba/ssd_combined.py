@@ -100,6 +100,7 @@ class _SSDKernel:
         has_d: bool = True,
         d_has_hdim: bool = False,
         has_init_states: bool = False,
+        has_varlen: bool = False,
         io_dtype=None,
         cumsum_dtype=None,
         acc_dtype=None,
@@ -144,6 +145,7 @@ class _SSDKernel:
             has_d,
             d_has_hdim,
             has_init_states,
+            has_varlen,
         )
 
         self._compiled_kernel = None
@@ -157,6 +159,9 @@ class _SSDKernel:
         C: torch.Tensor,
         D: Optional[torch.Tensor] = None,
         init_states: Optional[torch.Tensor] = None,
+        seq_idx: Optional[torch.Tensor] = None,
+        chunk_indices: Optional[torch.Tensor] = None,
+        chunk_offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Run the SSD kernel with preprocessed inputs.
@@ -226,7 +231,7 @@ class _SSDKernel:
                 mode=mode, stride_order=cumsum_permuted.dim_order()
             )
 
-        # B: Triton (batch, seqlen, ngroups, dstate) -> CUTLASS (chunk_size, dstate, nchunks, ngroups, batch)
+        # B: Torch (batch, seqlen, ngroups, dstate) -> CUTLASS (chunk_size, dstate, nchunks, ngroups, batch)
         B_reshaped = B.reshape(batch, nchunks, chunk_size, ngroups, dstate)
         b_tensor, b_dst = _create_cutlass_tensor(
             [batch, ngroups, dstate, nchunks, chunk_size],
@@ -324,6 +329,17 @@ class _SSDKernel:
 
         stream = cutlass.cuda.default_stream()
 
+        # Varlen metadata: tiny 1D int32 tensors, just wrap via from_dlpack
+        seq_idx_tensor = None
+        chunk_indices_tensor = None
+        chunk_offsets_tensor = None
+        if seq_idx is not None:
+            seq_idx_tensor = from_dlpack(seq_idx.contiguous(), assumed_align=4)
+        if chunk_indices is not None:
+            chunk_indices_tensor = from_dlpack(chunk_indices, assumed_align=4)
+        if chunk_offsets is not None:
+            chunk_offsets_tensor = from_dlpack(chunk_offsets, assumed_align=4)
+
         # Compile kernel if not already done
         if self._compiled_kernel is None:
             self._compiled_kernel = cute.compile(
@@ -337,6 +353,9 @@ class _SSDKernel:
                 init_states_tensor,
                 fstate_tensor,
                 d_tensor,
+                seq_idx_tensor,
+                chunk_indices_tensor,
+                chunk_offsets_tensor,
                 max_active_clusters,
                 stream,
             )
@@ -352,6 +371,9 @@ class _SSDKernel:
             init_states_tensor,
             fstate_tensor,
             d_tensor,
+            seq_idx_tensor,
+            chunk_indices_tensor,
+            chunk_offsets_tensor,
             stream,
         )
 
@@ -376,6 +398,7 @@ def _get_ssd_kernel(
     has_d: bool,
     d_has_hdim: bool,
     has_init_states: bool = False,
+    has_varlen: bool = False,
 ) -> _SSDKernel:
     """Get cached SSD kernel."""
     return _SSDKernel(
@@ -385,6 +408,7 @@ def _get_ssd_kernel(
         has_d=has_d,
         d_has_hdim=d_has_hdim,
         has_init_states=has_init_states,
+        has_varlen=has_varlen,
     )
 
 
@@ -401,6 +425,10 @@ def ssd_combined_fwd(
     dt_softplus: bool = False,
     dt_limit: Tuple[float, float] = (0.0, float("inf")),
     initial_states: Optional[torch.Tensor] = None,
+    seq_idx: Optional[torch.Tensor] = None,
+    chunk_indices: Optional[torch.Tensor] = None,
+    chunk_offsets: Optional[torch.Tensor] = None,
+    cu_seqlens: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     SSD (Structured State-Space Duality) combined forward pass for Mamba2.
@@ -431,8 +459,21 @@ def ssd_combined_fwd(
         Whether to apply softplus to dt
     dt_limit : tuple
         (min, max) limits for dt values
-    initial_states: torch.Tensor, optional
-        Optional (batch, nheads, headdim, dstate)
+    initial_states : torch.Tensor, optional
+        Optional (batch, nheads, headdim, dstate) or (num_seqs, nheads, headdim, dstate)
+        when cu_seqlens is provided
+    seq_idx : torch.Tensor, optional
+        Sequence index tensor (batch, seqlen) mapping each position to its sequence ID.
+        Required for variable-length sequence (continuous batching) support.
+    chunk_indices : torch.Tensor, optional
+        Int32 tensor mapping logical chunk index to physical chunk index.
+        Required together with chunk_offsets when seq_idx and initial_states are provided.
+    chunk_offsets : torch.Tensor, optional
+        Int32 tensor mapping logical chunk index to offset within physical chunk.
+        Required together with chunk_indices when seq_idx and initial_states are provided.
+    cu_seqlens : torch.Tensor, optional
+        Cumulative sequence lengths (num_seqs + 1,) for variable-length batching.
+
     Returns
     -------
     out : torch.Tensor
@@ -452,6 +493,22 @@ def ssd_combined_fwd(
         f"seqlen ({seqlen}) must be divisible by chunk_size ({chunk_size})"
     )
 
+    # Validate varlen arguments
+    if seq_idx is not None:
+        assert seq_idx.shape == (batch, seqlen), (
+            f"seq_idx shape {seq_idx.shape} doesn't match (batch={batch}, seqlen={seqlen})"
+        )
+    if chunk_indices is not None:
+        assert chunk_indices.dim() == 1, f"chunk_indices must be 1D, got {chunk_indices.dim()}D"
+        assert chunk_indices.dtype == torch.int32, f"chunk_indices must be int32, got {chunk_indices.dtype}"
+    if chunk_offsets is not None:
+        assert chunk_offsets.dim() == 1, f"chunk_offsets must be 1D, got {chunk_offsets.dim()}D"
+        assert chunk_offsets.dtype == torch.int32, f"chunk_offsets must be int32, got {chunk_offsets.dtype}"
+    if chunk_indices is not None and chunk_offsets is not None:
+        assert chunk_indices.shape == chunk_offsets.shape, (
+            f"chunk_indices and chunk_offsets must have the same shape, "
+            f"got {chunk_indices.shape} vs {chunk_offsets.shape}"
+        )
     # Step 1: Compute cumsum using Triton kernel
     # dA_cumsum: (batch, nheads, nchunks, chunk_size)
     # dt_processed: (batch, nheads, nchunks, chunk_size) - after softplus/bias
@@ -469,6 +526,7 @@ def ssd_combined_fwd(
     d_has_hdim = has_d and D.dim() == 2
     has_init_state = True if initial_states is not None else False
 
+    has_varlen = seq_idx is not None
     kernel = _get_ssd_kernel(
         chunk_size=chunk_size,
         headdim=headdim,
@@ -476,6 +534,7 @@ def ssd_combined_fwd(
         has_d=has_d,
         d_has_hdim=d_has_hdim,
         has_init_states=has_init_state,
+        has_varlen=has_varlen,
     )
 
     out, final_states = kernel.run(
@@ -486,6 +545,9 @@ def ssd_combined_fwd(
         C=C,
         D=D,
         init_states=initial_states,
+        seq_idx=seq_idx,
+        chunk_indices=chunk_indices,
+        chunk_offsets=chunk_offsets,
     )
 
     return out, final_states

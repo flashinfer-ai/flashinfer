@@ -58,6 +58,7 @@ class SSDKernel:
         has_d: bool,
         d_has_hdim: bool,
         has_init_states: bool,
+        has_varlen: bool = False,
     ):
         self.io_dtype: Type[cutlass.Numeric] = io_dtype
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
@@ -65,6 +66,7 @@ class SSDKernel:
         # has_d means epilog warp performs Y += X*D fusion
         self.has_d: bool = has_d
         self.has_init_states: bool = has_init_states
+        self.has_varlen: bool = has_varlen
         # d_has_hdim = True means D is (D, EH) shape and loaded by TMA
         # d_has_hdim = False means D is (1, EH) shape and loaded directly to register
         self.d_has_hdim: bool = d_has_hdim
@@ -376,6 +378,9 @@ class SSDKernel:
         init_states: cute.Tensor,   # (D, N, EH, B) - D stride 1 (optional)
         fstate: cute.Tensor,        # (D, N, EH, B) - D stride 1 (output)
         d: cute.Tensor,             # (D, EH) or (1, EH) (optional)
+        seq_idx: cute.Tensor,        # (seqlen, batch) int32 (optional)
+        chunk_indices: cute.Tensor,  # (num_logical_chunks,) int32 (optional)
+        chunk_offsets: cute.Tensor,  # (num_logical_chunks,) int32 (optional)
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
@@ -652,6 +657,9 @@ class SSDKernel:
             tma_tensor_d,
             tma_atom_initial_states,
             tma_tensor_initial_states,
+            seq_idx,
+            chunk_indices,
+            chunk_offsets,
             self.cluster_layout_vmnk,
             self.x_smem_layout,
             self.xt_smem_layout,
@@ -700,6 +708,9 @@ class SSDKernel:
         tma_tensor_d: cute.Tensor,
         tma_atom_initial_states: Optional[cute.CopyAtom],
         tma_tensor_initial_states: cute.Tensor,
+        seq_idx: cute.Tensor,         # (seqlen, batch) int32 or None
+        chunk_indices: cute.Tensor,   # (num_logical_chunks,) int32 or None
+        chunk_offsets: cute.Tensor,   # (num_logical_chunks,) int32 or None
         cluster_layout_vmnk: cute.Layout,
         x_smem_layout: cute.ComposedLayout,
         xt_smem_layout: cute.ComposedLayout,
@@ -1003,8 +1014,15 @@ class SSDKernel:
                 )
 
                 if cutlass.const_expr(self.has_init_states):
+                    # Load first sequence's init_states before the chunk loop
+                    if cutlass.const_expr(self.has_varlen):
+                        c_idx_0 = chunk_indices[0]
+                        c_off_0 = chunk_offsets[0]
+                        first_seq_id = seq_idx[c_idx_0 * L + c_off_0, 0]
+                    else:
+                        first_seq_id = b_idx
                     tIstategIstate = tIstategIstate_pre_slice[
-                        None, 0, 0, eh_idx, b_idx
+                        None, 0, 0, eh_idx, first_seq_id
                     ]
 
                     # Wait for initial states buffer empty
@@ -1020,6 +1038,7 @@ class SSDKernel:
                     )
                     # Advance initial states producer state
                     istate_producer_state.advance()
+                    prev_seq_id = first_seq_id
 
                 if cutlass.const_expr(self.d_has_hdim):
                     # Wait for D buffer empty
@@ -1036,13 +1055,39 @@ class SSDKernel:
 
                 # Batched load over C dimension
                 for chunk_idx in cutlass.range(C, unroll=1):
+                    # Map logical chunk to physical chunk (c_idx)
+                    if cutlass.const_expr(self.has_varlen):
+                        c_idx = chunk_indices[x_producer_state.count]
+                    else:
+                        c_idx = x_producer_state.count
+
+                    # # Load init_states on sequence transitions
+                    # if cutlass.const_expr(self.has_init_states and self.has_varlen):
+                    #     c_off = chunk_offsets[x_producer_state.count]
+                    #     seq_id = seq_idx[c_idx * L + c_off, 0]
+                    #     if seq_id != prev_seq_id:
+                    #         tIstategIstate = tIstategIstate_pre_slice[
+                    #             None, 0, 0, eh_idx, seq_id
+                    #         ]
+                    #         init_states_pipeline.producer_acquire(istate_producer_state)
+                    #         cute.copy(
+                    #             tma_atom_initial_states,
+                    #             tIstategIstate,
+                    #             tIstatesIstate[None, istate_producer_state.index],
+                    #             tma_bar_ptr=init_states_pipeline.producer_get_barrier(
+                    #                 istate_producer_state
+                    #             ),
+                    #         )
+                    #         istate_producer_state.advance()
+                    #         prev_seq_id = seq_id
+
                     # Conditionally wait for X buffer empty
                     x_pipeline.producer_acquire(x_producer_state, peek_x_empty_status)
 
                     # TMA load X
                     cute.copy(
                         tma_atom_x,
-                        tXgX[None, x_producer_state.count],
+                        tXgX[None, c_idx],
                         tXsX[None, x_producer_state.index],
                         tma_bar_ptr=x_pipeline.producer_get_barrier(x_producer_state),
                     )
@@ -1055,7 +1100,7 @@ class SSDKernel:
                     # TMA load Delta/CumsumDelta
                     cute.copy(
                         tma_atom_delta,
-                        tDeltagDelta[None, deltas_producer_state.count],
+                        tDeltagDelta[None, c_idx],
                         tDeltasDelta[None, deltas_producer_state.index],
                         tma_bar_ptr=deltas_pipeline.producer_get_barrier(
                             deltas_producer_state
@@ -1063,7 +1108,7 @@ class SSDKernel:
                     )
                     cute.copy(
                         tma_atom_cumsum_delta,
-                        tDeltagCumsumDelta[None, deltas_producer_state.count],
+                        tDeltagCumsumDelta[None, c_idx],
                         tDeltasCumsumDelta[None, deltas_producer_state.index],
                         tma_bar_ptr=deltas_pipeline.producer_get_barrier(
                             deltas_producer_state
@@ -1156,13 +1201,19 @@ class SSDKernel:
 
                 # Batched load over C dimension
                 for chunk_idx in cutlass.range(C, unroll=1):
+                    # Map logical chunk to physical chunk (c_idx)
+                    if cutlass.const_expr(self.has_varlen):
+                        c_idx = chunk_indices[b_producer_state.count]
+                    else:
+                        c_idx = b_producer_state.count
+
                     # Conditionally wait for B buffer empty
                     b_pipeline.producer_acquire(b_producer_state, peek_b_empty_status)
 
                     # TMA load B
                     cute.copy(
                         tma_atom_b,
-                        tBgB[None, b_producer_state.count],
+                        tBgB[None, c_idx],
                         tBsB[None, b_producer_state.index],
                         tma_bar_ptr=b_pipeline.producer_get_barrier(b_producer_state),
                     )
@@ -1173,7 +1224,7 @@ class SSDKernel:
                     # TMA load C
                     cute.copy(
                         tma_atom_c,
-                        tCgC[None, c_producer_state.count],
+                        tCgC[None, c_idx],
                         tCsC[None, c_producer_state.index],
                         tma_bar_ptr=c_pipeline.producer_get_barrier(c_producer_state),
                     )
@@ -1769,6 +1820,12 @@ class SSDKernel:
                     for reg_idx in range(cute.size(tRS_rP)):
                         tState[reg_idx] = tRS_rP[reg_idx].to(self.acc_dtype)
 
+                    # # Track current sequence for transition detection
+                    # if cutlass.const_expr(self.has_varlen):
+                    #     c_idx_0 = chunk_indices[0]
+                    #     c_off_0 = chunk_offsets[0]
+                    #     prev_seq_id = seq_idx[c_idx_0 * L + c_off_0, 0]
+
                     # We're not gonna release the pipeline here to
                     # prevent overwriting smem_p by another batch of
                     # init states
@@ -1814,6 +1871,48 @@ class SSDKernel:
 
                 # Batched processing over C dimension
                 for chunk_idx in cutlass.range(C, unroll=1):
+                    # Map logical chunk to physical chunk index and offset
+                    if cutlass.const_expr(self.has_varlen):
+                        c_idx = chunk_indices[chunk_idx]
+                        c_off = chunk_offsets[chunk_idx]
+                    else:
+                        c_idx = chunk_idx
+                        c_off = 0
+
+                    # # Reload init_states on sequence transitions
+                    # if cutlass.const_expr(self.has_init_states and self.has_varlen):
+                    #     seq_id = seq_idx[c_idx * L + c_off, 0]
+                    #     if seq_id != prev_seq_id:
+                    #         # Release old init_states buffer, wait for new one
+                    #         init_states_pipeline.consumer_release(istate_consumer_state)
+                    #         istate_consumer_state.advance()
+                    #         init_states_pipeline.consumer_wait(istate_consumer_state)
+                    #
+                    #         istate_coord = (None, None, None, istate_consumer_state.index)
+                    #         cute.copy(tiled_s2r_p, tS2R_sP[istate_coord], tRS_rP)
+                    #
+                    #         for reg_idx in range(cute.size(tRS_rP)):
+                    #             tState[reg_idx] = tRS_rP[reg_idx].to(self.acc_dtype)
+                    #
+                    #         prev_seq_id = seq_id
+                    #
+                    #         # Re-emit INTER2_P with new init_state so intra-chunk
+                    #         # path picks up the correct state.
+                    #         # INTER2_P was already advanced past this slot in the
+                    #         # previous iteration, so we need to wait for it to be
+                    #         # consumed, then overwrite.
+                    #         inter2_p_pipeline.producer_acquire(inter2_p_producer_state)
+                    #         for reg_idx in range(cute.size(tState)):
+                    #             tRS_rP[reg_idx] = tState[reg_idx].to(self.io_dtype)
+                    #         inter2_p_coord = (None, None, None, inter2_p_producer_state.index)
+                    #         cute.copy(tiled_r2s_p, tRS_rP, tRS_sP[inter2_p_coord])
+                    #         cute.arch.fence_proxy(
+                    #             cute.arch.ProxyKind.async_shared,
+                    #             space=cute.arch.SharedSpace.shared_cta,
+                    #         )
+                    #         inter2_p_pipeline.producer_commit(inter2_p_producer_state)
+                    #         inter2_p_producer_state.advance()
+
                     # Conditionally wait for B/Delta/B_TMEM buffer full/full/empty
                     b_pipeline.consumer_wait(b_consumer_state, peek_b_full_status)
                     deltas_pipeline.consumer_wait(
@@ -1834,6 +1933,15 @@ class SSDKernel:
                     last_column = smem_cumsum_delta[
                         smem_cumsum_delta.shape[0] - 1, deltas_consumer_state.index
                     ]
+
+                    # Adjust last_column for chunk offset boundary
+                    # When c_off > 0, the logical chunk starts mid-physical-chunk,
+                    # so dA_cumsum values must be relative to the sequence start.
+                    if c_off > 0:
+                        dA_cs_boundary = smem_cumsum_delta[
+                            c_off - 1, deltas_consumer_state.index
+                        ]
+                        last_column = last_column - dA_cs_boundary
 
                     # Fence for shared memory
                     cute.arch.fence_proxy(
@@ -2338,6 +2446,14 @@ class SSDKernel:
 
                 # Batched processing over C dimension
                 for chunk_idx in cutlass.range(C, unroll=1):
+                    # Map logical chunk to physical chunk (c_idx) and offset (c_off)
+                    if cutlass.const_expr(self.has_varlen):
+                        c_idx = chunk_indices[chunk_idx]
+                        c_off = chunk_offsets[chunk_idx]
+                    else:
+                        c_idx = chunk_idx
+                        c_off = 0
+
                     # Conditionally wait for Delta/INTRA2_ACC/INTER2_ACC/X buffer full
                     deltas_pipeline.consumer_wait(
                         deltas_consumer_state, peek_deltas_full_status
@@ -2403,6 +2519,16 @@ class SSDKernel:
                                 # Load vector D from smem (d_has_hdim = True)
                                 d_coord = subtile_coord + (d_consumer_state.index,)
                                 cute.copy(s2r_atom_d, tRS_sD[d_coord], tRS_rD)
+
+                            # Adjust dA_cumsum for chunk offset boundary
+                            # When c_off > 0, shift all dA values so they're
+                            # relative to the sequence start within the chunk.
+                            if c_off > 0:
+                                dA_cs_boundary = smem_cumsum_delta[
+                                    c_off - 1, deltas_consumer_state.index
+                                ]
+                                for reg_idx in range(cute.size(tTR_rDeltaA)):
+                                    tTR_rDeltaA[reg_idx] = tTR_rDeltaA[reg_idx] - dA_cs_boundary
 
                             # Combine INTRA2_ACC/INTER2_ACC/Delta/X/D
                             for reg_idx in range(0, cute.size(tRS_rCompute), 2):
@@ -2504,7 +2630,7 @@ class SSDKernel:
                                 cute.copy(
                                     tma_atom_y,
                                     bSG_sY[None, epi_buffer_idx],
-                                    bSG_gY[None, epi_m, epi_n, chunk_idx],
+                                    bSG_gY[None, epi_m, epi_n, c_idx],
                                 )
 
                                 # Commit TMA store
