@@ -1,0 +1,238 @@
+# Issue self-claim workflow for external contributors
+# Commands:
+#   !claim          - Self-assign an unassigned issue (anyone)
+#   !assign @user   - Assign a specific user (maintainers only)
+
+name: Issue Claim
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  handle-claim:
+    # Only run on issue comments (not PRs) that start with !claim or !assign
+    # Skip comments from bots
+    if: |
+      !github.event.issue.pull_request &&
+      github.event.comment.user.type != 'Bot' &&
+      (startsWith(github.event.comment.body, '!claim') || startsWith(github.event.comment.body, '!assign'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Parse command
+        id: parse
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENTER: ${{ github.event.comment.user.login }}
+        run: |
+          FIRST_LINE=$(echo "$COMMENT_BODY" | head -1)
+
+          if echo "$FIRST_LINE" | grep -qi '^!claim\b'; then
+            echo "command=claim" >> "$GITHUB_OUTPUT"
+            echo "target_user=${COMMENTER}" >> "$GITHUB_OUTPUT"
+
+          elif echo "$FIRST_LINE" | grep -qi '^!assign[[:space:]]'; then
+            # Extract username: strip !assign prefix, optional @, take first word
+            TARGET=$(echo "$FIRST_LINE" | sed 's/^![Aa][Ss][Ss][Ii][Gg][Nn][[:space:]]*//')
+            TARGET="${TARGET#@}"
+            TARGET="${TARGET%% *}"
+
+            # Validate GitHub username format: alphanumeric and hyphens, 1-39 chars
+            if [ -n "$TARGET" ] && echo "$TARGET" | grep -q '^[a-zA-Z0-9][a-zA-Z0-9-]*$' && [ ${#TARGET} -le 39 ]; then
+              echo "command=assign" >> "$GITHUB_OUTPUT"
+              echo "target_user=$TARGET" >> "$GITHUB_OUTPUT"
+            else
+              echo "command=assign-no-user" >> "$GITHUB_OUTPUT"
+              echo "target_user=" >> "$GITHUB_OUTPUT"
+            fi
+
+          elif echo "$FIRST_LINE" | grep -qi '^!assign$'; then
+            echo "command=assign-no-user" >> "$GITHUB_OUTPUT"
+            echo "target_user=" >> "$GITHUB_OUTPUT"
+
+          else
+            echo "command=unknown" >> "$GITHUB_OUTPUT"
+            echo "target_user=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Handle !claim
+        if: steps.parse.outputs.command == 'claim'
+        env:
+          GH_TOKEN: ${{ secrets.FLASHINFER_BOT_TOKEN }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          REPO: ${{ github.repository }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          TARGET_USER: ${{ steps.parse.outputs.target_user }}
+        run: |
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo "::error::FLASHINFER_BOT_TOKEN secret is not set"
+            exit 1
+          fi
+
+          # Check if issue already has assignees
+          ASSIGNEE_COUNT=$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${REPO}/issues/${ISSUE_NUMBER}" \
+            --jq '.assignees | length')
+
+          if [ "$ASSIGNEE_COUNT" -gt 0 ]; then
+            gh api -X POST \
+              "/repos/${REPO}/issues/comments/${COMMENT_ID}/reactions" \
+              -f content='confused'
+
+            gh api -X POST \
+              "/repos/${REPO}/issues/${ISSUE_NUMBER}/comments" \
+              -f body="This issue is already assigned. If you'd like to take over, ask a maintainer to use \`!assign @${TARGET_USER}\`."
+            exit 0
+          fi
+
+          # Try to assign the user
+          assign_or_invite() {
+            local user="$1"
+            local invite_msg="$2"
+
+            ASSIGN_RESPONSE=$(gh api -X POST \
+              "/repos/${REPO}/issues/${ISSUE_NUMBER}/assignees" \
+              -f "assignees[]=${user}" 2>&1) && ASSIGN_OK=true || ASSIGN_OK=false
+
+            if [ "$ASSIGN_OK" = "true" ]; then
+              IS_ASSIGNED=$(echo "$ASSIGN_RESPONSE" | jq --arg u "$user" \
+                '[.assignees[].login] | map(ascii_downcase) | contains([$u | ascii_downcase])')
+            else
+              IS_ASSIGNED="false"
+            fi
+
+            if [ "$IS_ASSIGNED" = "true" ]; then
+              gh api -X POST \
+                "/repos/${REPO}/issues/comments/${COMMENT_ID}/reactions" \
+                -f content='+1'
+
+              gh api -X POST \
+                "/repos/${REPO}/issues/${ISSUE_NUMBER}/comments" \
+                -f body="Issue assigned to @${user}."
+            else
+              gh api -X PUT \
+                "/repos/${REPO}/collaborators/${user}" \
+                -f permission='triage' 2>&1 || true
+
+              gh api -X POST \
+                "/repos/${REPO}/issues/comments/${COMMENT_ID}/reactions" \
+                -f content='+1'
+
+              gh api -X POST \
+                "/repos/${REPO}/issues/${ISSUE_NUMBER}/comments" \
+                -f body="$invite_msg"
+            fi
+          }
+
+          assign_or_invite "$TARGET_USER" \
+            "@${TARGET_USER} You've been sent a repository invitation. Please [accept the invitation](https://github.com/notifications) and then comment \`!claim\` again to be assigned."
+
+      - name: Handle !assign (unauthorized)
+        if: |
+          steps.parse.outputs.command == 'assign' &&
+          github.event.comment.author_association != 'OWNER' &&
+          github.event.comment.author_association != 'MEMBER' &&
+          github.event.comment.author_association != 'COLLABORATOR'
+        env:
+          GH_TOKEN: ${{ secrets.FLASHINFER_BOT_TOKEN }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh api -X POST \
+            "/repos/${REPO}/issues/comments/${COMMENT_ID}/reactions" \
+            -f content='confused'
+
+      - name: Handle !assign (authorized)
+        if: |
+          steps.parse.outputs.command == 'assign' &&
+          (github.event.comment.author_association == 'OWNER' ||
+           github.event.comment.author_association == 'MEMBER' ||
+           github.event.comment.author_association == 'COLLABORATOR')
+        env:
+          GH_TOKEN: ${{ secrets.FLASHINFER_BOT_TOKEN }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          REPO: ${{ github.repository }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          TARGET_USER: ${{ steps.parse.outputs.target_user }}
+        run: |
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo "::error::FLASHINFER_BOT_TOKEN secret is not set"
+            exit 1
+          fi
+
+          # Remove existing assignees first
+          CURRENT_ASSIGNEES=$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${REPO}/issues/${ISSUE_NUMBER}" \
+            --jq '[.assignees[].login]')
+
+          if [ "$CURRENT_ASSIGNEES" != "[]" ] && [ "$CURRENT_ASSIGNEES" != "null" ]; then
+            gh api -X DELETE \
+              "/repos/${REPO}/issues/${ISSUE_NUMBER}/assignees" \
+              --input <(echo "$CURRENT_ASSIGNEES" | jq '{assignees: .}') 2>&1 || true
+          fi
+
+          # Try to assign target user
+          assign_or_invite() {
+            local user="$1"
+            local invite_msg="$2"
+
+            ASSIGN_RESPONSE=$(gh api -X POST \
+              "/repos/${REPO}/issues/${ISSUE_NUMBER}/assignees" \
+              -f "assignees[]=${user}" 2>&1) && ASSIGN_OK=true || ASSIGN_OK=false
+
+            if [ "$ASSIGN_OK" = "true" ]; then
+              IS_ASSIGNED=$(echo "$ASSIGN_RESPONSE" | jq --arg u "$user" \
+                '[.assignees[].login] | map(ascii_downcase) | contains([$u | ascii_downcase])')
+            else
+              IS_ASSIGNED="false"
+            fi
+
+            if [ "$IS_ASSIGNED" = "true" ]; then
+              gh api -X POST \
+                "/repos/${REPO}/issues/comments/${COMMENT_ID}/reactions" \
+                -f content='+1'
+
+              gh api -X POST \
+                "/repos/${REPO}/issues/${ISSUE_NUMBER}/comments" \
+                -f body="Issue assigned to @${user}."
+            else
+              gh api -X PUT \
+                "/repos/${REPO}/collaborators/${user}" \
+                -f permission='triage' 2>&1 || true
+
+              gh api -X POST \
+                "/repos/${REPO}/issues/comments/${COMMENT_ID}/reactions" \
+                -f content='+1'
+
+              gh api -X POST \
+                "/repos/${REPO}/issues/${ISSUE_NUMBER}/comments" \
+                -f body="$invite_msg"
+            fi
+          }
+
+          assign_or_invite "$TARGET_USER" \
+            "@${TARGET_USER} has been sent a repository invitation. Once they [accept the invitation](https://github.com/notifications), they will be assigned to this issue."
+
+      - name: Handle !assign with no username
+        if: steps.parse.outputs.command == 'assign-no-user'
+        env:
+          GH_TOKEN: ${{ secrets.FLASHINFER_BOT_TOKEN }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          gh api -X POST \
+            "/repos/${REPO}/issues/comments/${COMMENT_ID}/reactions" \
+            -f content='confused'
+
+          gh api -X POST \
+            "/repos/${REPO}/issues/${ISSUE_NUMBER}/comments" \
+            -f body="Usage: \`!assign @username\`"
