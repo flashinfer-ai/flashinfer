@@ -1375,9 +1375,9 @@ def get_trtllm_moe_sm100_module():
             enable_pdl,
             [-1, -1] if tactic == -1 else tactic,
         )
-        
+
         if do_finalize:
-            return [output]
+            return [torch.from_dlpack(intermediate_output[0])]
         else:
             gemm2_output, _, expanded_idx_to_permuted_idx = intermediate_output
             return [
@@ -1703,7 +1703,7 @@ def get_trtllm_moe_sm100_module():
         )
 
         if do_finalize:
-            return [output]
+            return [torch.from_dlpack(intermediate_output[0])]
         else:
             gemm2_output, _, expanded_idx_to_permuted_idx = intermediate_output
             return [
