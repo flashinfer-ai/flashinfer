@@ -2578,7 +2578,7 @@ def _check_mm_fp4_problem_size(
     block_size: int = 16,
     use_8x4_sf_layout: bool = False,  # unused
     backend: Literal[
-        "cudnn", "trtllm", "cutlass", "cute_dsl", "auto"
+        "cudnn", "trtllm", "cutlass", "cute-dsl", "auto"
     ] = "auto",  # unused
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
@@ -2638,7 +2638,7 @@ def _cudnn_gemm_fp4_requirement(
     block_size: int = 16,
     use_8x4_sf_layout: bool = False,
     backend: Literal[
-        "cudnn", "trtllm", "cutlass", "cute_dsl", "auto"
+        "cudnn", "trtllm", "cutlass", "cute-dsl", "auto"
     ] = "auto",  # unused
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
@@ -2702,7 +2702,7 @@ def _trtllm_gemm_fp4_requirement(
     block_size: int = 16,  # unused
     use_8x4_sf_layout: bool = False,  # unused
     backend: Literal[
-        "cudnn", "trtllm", "cutlass", "cute_dsl", "auto"
+        "cudnn", "trtllm", "cutlass", "cute-dsl", "auto"
     ] = "auto",  # unused
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
@@ -2729,7 +2729,7 @@ def _cutlass_gemm_fp4_requirement(
     block_size: int = 16,  # unused
     use_8x4_sf_layout: bool = False,
     backend: Literal[
-        "cudnn", "trtllm", "cutlass", "cute_dsl", "auto"
+        "cudnn", "trtllm", "cutlass", "cute-dsl", "auto"
     ] = "auto",  # unused
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
@@ -2753,7 +2753,7 @@ def _cute_dsl_gemm_fp4_requirement(
     block_size: int = 16,  # unused
     use_8x4_sf_layout: bool = False,
     backend: Literal[
-        "cudnn", "trtllm", "cutlass", "cute_dsl", "auto"
+        "cudnn", "trtllm", "cutlass", "cute-dsl", "auto"
     ] = "auto",  # unused
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
@@ -2779,7 +2779,7 @@ def _cute_dsl_gemm_fp4_requirement(
 # Module-level kernel cache for CuTe DSL GEMM, shared across runner instances.
 # Keyed by (sf_vec_size, mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch,
 #            kernel_type, use_tma_store, enable_pdl, out_dtype).
-_CUTE_DSL_KERNEL_CACHE = {}
+_CUTE_DSL_MM_FP4_KERNEL_CACHE = {}
 
 
 def _cute_dsl_gemm_fp4_runner(
@@ -2798,7 +2798,7 @@ def _cute_dsl_gemm_fp4_runner(
     import cutlass
     import cutlass.cute as cute
 
-    from .kernels.cute_dsl_gemm_utils import make_ptr, ceil_div
+    from cutlass.cute.runtime import make_ptr
     from .kernels.dense_blockscaled_gemm_sm100 import (
         Sm100BlockScaledPersistentDenseGemmKernel,
     )
@@ -3060,9 +3060,9 @@ def _cute_dsl_gemm_fp4_runner(
                 kernel_a_sf, kernel_b_sf = a_descale, b_descale.T
 
             # Compute scale factor dimensions (128x4 padded)
-            sf_m = ceil_div(kernel_m, 128)
-            sf_n = ceil_div(kernel_n, 128)
-            sf_k = ceil_div(real_k // sf_vec_size, 4)
+            sf_m = (kernel_m + 127) // 128
+            sf_n = (kernel_n + 127) // 128
+            sf_k = (real_k // sf_vec_size + 3) // 4
 
             # Cache key for compiled kernel
             cache_key = (
@@ -3077,7 +3077,7 @@ def _cute_dsl_gemm_fp4_runner(
                 out_dtype,
             )
 
-            if cache_key not in _CUTE_DSL_KERNEL_CACHE:
+            if cache_key not in _CUTE_DSL_MM_FP4_KERNEL_CACHE:
                 # Create kernel instance
                 if kernel_type == "sm103" and Sm103Kernel is not None:
                     gemm = Sm103Kernel(  # type: ignore[assignment]
@@ -3096,47 +3096,26 @@ def _cute_dsl_gemm_fp4_runner(
                         enable_pdl,
                     )
 
-                # Create CuTe pointers for compilation
-                a_ptr = make_ptr(
-                    cutlass.Float4E2M1FN,
-                    kernel_a.data_ptr(),
-                    cute.AddressSpace.gmem,
-                    32,
-                )
-                b_ptr = make_ptr(
-                    cutlass.Float4E2M1FN,
-                    kernel_b.data_ptr(),
-                    cute.AddressSpace.gmem,
-                    32,
-                )
+                # Compilation uses dummy pointers (no real data needed) and
+                # a fake stream that uses the current CUDA stream at runtime.
+                # This follows the TVM-FFI pattern from commit edb37cd:
+                # - Dummy aligned pointers for compilation (cheaper than real data_ptr)
+                # - make_fake_compact_tensor for alpha (passes torch tensor directly)
+                # - make_fake_stream for automatic stream management
+                a_ptr = make_ptr(cutlass.Float4E2M1FN, 32, cute.AddressSpace.gmem, 32)
+                b_ptr = make_ptr(cutlass.Float4E2M1FN, 32, cute.AddressSpace.gmem, 32)
                 a_sf_ptr = make_ptr(
-                    cutlass.Float8E4M3FN,
-                    kernel_a_sf.data_ptr(),
-                    cute.AddressSpace.gmem,
-                    16,
+                    cutlass.Float8E4M3FN, 16, cute.AddressSpace.gmem, 16
                 )
                 b_sf_ptr = make_ptr(
-                    cutlass.Float8E4M3FN,
-                    kernel_b_sf.data_ptr(),
-                    cute.AddressSpace.gmem,
-                    16,
+                    cutlass.Float8E4M3FN, 16, cute.AddressSpace.gmem, 16
                 )
-                c_ptr = make_ptr(
-                    c_cutlass_dtype, out.data_ptr(), cute.AddressSpace.gmem, 16
-                )
+                c_ptr = make_ptr(c_cutlass_dtype, 16, cute.AddressSpace.gmem, 16)
 
-                # Alpha: ensure 1-dim shape [1] for consistent TVM FFI compilation
-                if alpha_tensor is not None:
-                    alpha_compile = (
-                        alpha_tensor.reshape(1)
-                        if alpha_tensor.dim() != 1
-                        else alpha_tensor
-                    )
-                    alpha_cute = cute.runtime.from_dlpack(alpha_compile)
-                else:
-                    alpha_cute = cute.runtime.from_dlpack(
-                        torch.tensor([1.0], dtype=torch.float32, device=a.device)
-                    )
+                # Alpha: fake 1-dim tensor for TVM-FFI -- torch tensor passed directly at runtime
+                alpha_fake = cute.runtime.make_fake_compact_tensor(
+                    cutlass.Float32, (1,), assumed_align=4
+                )
 
                 # Get max active clusters
                 from flashinfer.cute_dsl.utils import get_max_active_clusters
@@ -3145,8 +3124,9 @@ def _cute_dsl_gemm_fp4_runner(
                     cluster_shape_mn[0] * cluster_shape_mn[1]
                 )
 
-                # Create a fake stream for compilation
-                stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+                # Fake stream: uses current CUDA stream at runtime automatically
+                # No need to pass stream at launch time.
+                stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
                 compiled_gemm = cute.compile(
                     gemm.wrapper,
@@ -3162,16 +3142,21 @@ def _cute_dsl_gemm_fp4_runner(
                     a_sf_ptr,
                     b_sf_ptr,
                     c_ptr,
-                    alpha_cute,
+                    alpha_fake,
                     max_active_clusters,
-                    stream,
+                    stream_fake,
                     swap_ab,
                     options="--opt-level 2 --enable-tvm-ffi",
                 )
 
-                _CUTE_DSL_KERNEL_CACHE[cache_key] = (compiled_gemm, max_active_clusters)
+                _CUTE_DSL_MM_FP4_KERNEL_CACHE[cache_key] = (
+                    compiled_gemm,
+                    max_active_clusters,
+                )
 
-            compiled_gemm, max_active_clusters = _CUTE_DSL_KERNEL_CACHE[cache_key]
+            compiled_gemm, max_active_clusters = _CUTE_DSL_MM_FP4_KERNEL_CACHE[
+                cache_key
+            ]
 
             # Handle output tensor for swap_ab
             if swap_ab:
@@ -3191,7 +3176,9 @@ def _cute_dsl_gemm_fp4_runner(
             else:
                 alpha_for_launch = alpha_tensor.reshape(1)
 
-            # Launch with TVM FFI (pass raw data pointers)
+            # Launch via TVM-FFI: pass torch tensors directly for pointers
+            # (TVM-FFI handles dlpack at C level), and int values for sizes.
+            # No stream argument needed -- make_fake_stream uses env stream.
             compiled_gemm(
                 kernel_m,
                 kernel_n,
@@ -3223,7 +3210,7 @@ def _heuristic_func_mm_fp4(
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
     use_8x4_sf_layout: bool = False,
-    backend: Literal["cudnn", "trtllm", "cutlass", "cute_dsl", "auto"] = "cudnn",
+    backend: Literal["cudnn", "trtllm", "cutlass", "cute-dsl", "auto"] = "cudnn",
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
 ):
@@ -3319,7 +3306,7 @@ _MM_FP4_TUNING_CONFIG_128x4 = TuningConfig(
         "cudnn": _cudnn_gemm_fp4_requirement,
         "trtllm": _trtllm_gemm_fp4_requirement,
         "cutlass": _cutlass_gemm_fp4_requirement,
-        "cute_dsl": _cute_dsl_gemm_fp4_requirement,
+        "cute-dsl": _cute_dsl_gemm_fp4_requirement,
     },
     common_check=_check_mm_fp4_problem_size,
     heuristic_func=_heuristic_func_mm_fp4,  # result stored in mm_fp4.suitable_auto_backends
@@ -3335,7 +3322,7 @@ def mm_fp4(
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
     use_8x4_sf_layout: bool = False,
-    backend: Literal["cudnn", "trtllm", "cutlass", "cute_dsl", "auto"] = "auto",
+    backend: Literal["cudnn", "trtllm", "cutlass", "cute-dsl", "auto"] = "auto",
     use_nvfp4: bool = True,
     enable_pdl: bool = True,
 ) -> torch.Tensor:
@@ -3370,10 +3357,10 @@ def mm_fp4(
     use_8x4_sf_layout: bool
         Whether to use 8x4 scale factor layout or 128x4 scale factor layout, defaults to False.
 
-    backend: Literal["cudnn", "trtllm", "cutlass", "cute_dsl", "auto"]
+    backend: Literal["cudnn", "trtllm", "cutlass", "cute-dsl", "auto"]
         Backend to use, defaults to ``"auto"``, which automatically selects the best
         backend between ``"cudnn"`` and ``"cutlass"`` based on the current CUDA and
-        cuDNN versions. The ``"trtllm"`` and ``"cute_dsl"`` backends are never selected
+        cuDNN versions. The ``"trtllm"`` and ``"cute-dsl"`` backends are never selected
         when ``backend="auto"`` because they require different weight preparation.
 
     use_nvfp4: bool
@@ -3442,7 +3429,7 @@ def mm_fp4(
         "cutlass": lambda: get_cutlass_fp4_gemm_module(
             major, minor
         ).cutlass_fp4_gemm_runner(),
-        "cute_dsl": lambda: _cute_dsl_gemm_fp4_runner(
+        "cute-dsl": lambda: _cute_dsl_gemm_fp4_runner(
             major, minor, enable_pdl, out_dtype
         ),
     }

@@ -43,10 +43,7 @@ import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 import cutlass.utils.blackwell_helpers as sm103_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
-from .cute_dsl_gemm_utils import (
-    griddepcontrol_launch_dependents,
-    griddepcontrol_wait,
-)
+from cutlass.cute.arch import griddepcontrol_launch_dependents, griddepcontrol_wait
 
 
 class Sm103BlockScaledPersistentDenseGemmKernel:

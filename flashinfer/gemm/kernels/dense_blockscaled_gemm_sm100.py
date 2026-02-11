@@ -41,13 +41,8 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
-from .cute_dsl_gemm_utils import (
-    PipelineTmaUmma,
-    PipelineUmmaAsync,
-    griddepcontrol_launch_dependents,
-    griddepcontrol_wait,
-    is_power_of_2,
-)
+from cutlass.cute.arch import griddepcontrol_launch_dependents, griddepcontrol_wait
+from cutlass.pipeline import PipelineTmaUmma, PipelineUmmaAsync
 
 
 class Sm100BlockScaledPersistentDenseGemmKernel:
@@ -1970,6 +1965,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         if cluster_shape_mn[0] % (2 if mma_tiler_mn[0] == 256 else 1) != 0:
             is_valid = False
         # Skip invalid cluster shape
+        _is_power_of_2 = lambda x: x > 0 and (x & (x - 1)) == 0
         if (
             cluster_shape_mn[0] * cluster_shape_mn[1] > 16
             or cluster_shape_mn[0] <= 0
@@ -1978,8 +1974,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             # Due to limited size of scale factors, we can't multicast among more than 4 CTAs.
             or cluster_shape_mn[0] > 4
             or cluster_shape_mn[1] > 4
-            or not is_power_of_2(cluster_shape_mn[0])
-            or not is_power_of_2(cluster_shape_mn[1])
+            or not _is_power_of_2(cluster_shape_mn[0])
+            or not _is_power_of_2(cluster_shape_mn[1])
         ):
             is_valid = False
         return is_valid
