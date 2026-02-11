@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from collections import namedtuple
 
 import pytest
@@ -362,6 +362,18 @@ EP_NUM_EXPERTS = [8]
 ACTIVATION_TYPES = [ActivationType.Swiglu, ActivationType.Relu2]
 ACTIVATION_TYPES_IDS = ["swiglu", "relu2"]
 
+import time
+
+
+@contextmanager
+def time_block(label):
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        end = time.perf_counter()
+        print(f"\n[TIME] {label}: {end - start:.4f}s")
+
 
 @pytest.mark.parametrize("moe_config", SMALL_MOE_CONFIGS)
 def test_moe(moe_config):
@@ -420,77 +432,89 @@ def test_moe_fp8(
     otype,
     wtype,
 ):
-    batch_size, hidden_size, num_experts, top_k, intermediate_size = moe_config
-    # Skip invalid configurations
-    if top_k > num_experts:
-        pytest.skip(
-            f"top_k ({top_k}) cannot be greater than num_experts ({num_experts})"
+    with time_block("setup"):
+        batch_size, hidden_size, num_experts, top_k, intermediate_size = moe_config
+        # Skip invalid configurations
+        if top_k > num_experts:
+            pytest.skip(
+                f"top_k ({top_k}) cannot be greater than num_experts ({num_experts})"
+            )
+
+        torch.manual_seed(42)
+        input_shape = (batch_size, hidden_size)
+        w31_factor = 2 if activation_type == ActivationType.Swiglu else 1
+        w31_shape = (num_experts, w31_factor * intermediate_size, hidden_size)
+        w2_shape = (num_experts, hidden_size, intermediate_size)
+
+    with time_block("data generation"):
+        x = cast_to_representable(gen_tensor(input_shape, otype))
+        router_logits = gen_tensor((batch_size, num_experts), otype)
+
+        # Create weight tensors
+        w31_weight = gen_tensor(w31_shape, otype, wtype)
+        w2_weight = gen_tensor(w2_shape, otype, wtype)
+        w31_scales = torch.empty(num_experts, 2, dtype=otype).cuda()
+        w2_scales = torch.empty(num_experts, 1, dtype=otype).cuda()
+
+        w31_dequantized = gen_tensor(w31_shape, otype)
+        w2_dequantized = gen_tensor(w2_shape, otype)
+    with time_block("quantization"):
+        for expert_id in range(num_experts):
+            w31 = cast_to_representable(gen_tensor(w31_shape[1:], otype, scale=0.1))
+            w2 = cast_to_representable(gen_tensor(w2_shape[1:], otype, scale=0.09))
+
+            w31_quant, s31 = dynamic_per_tensor_fp8_quant(w31)
+            w2_quant, s2 = dynamic_per_tensor_fp8_quant(w2)
+
+            w31_weight.data[expert_id].copy_(w31_quant)
+            w2_weight.data[expert_id].copy_(w2_quant)
+            w31_scales.data[expert_id].copy_(s31)
+            w2_scales.data[expert_id].copy_(s2)
+            w31_dequantized.data[expert_id].copy_(
+                torch.mul(w31_quant.to(dtype=otype), s31)
+            )
+            w2_dequantized.data[expert_id].copy_(
+                torch.mul(w2_quant.to(dtype=otype), s2)
+            )
+
+    with time_block("compute routing"):
+        routing_weights, selected_experts = compute_routing(router_logits, top_k)
+    with time_block("reference computation"):
+        ref_output = compute_with_experts(
+            num_experts,
+            x,
+            w31_dequantized,
+            w2_dequantized,
+            selected_experts,
+            routing_weights,
+            activation_type=activation_type,
         )
+    with time_block("fused_moe computation"):
+        flash_output = torch.empty_like(ref_output)
+        # For fp8, the hidden_state expects quantized.
+        _, w1_scales = torch.chunk(w31_scales, 2, dim=-1)
+        x_quant, hidden_states_scale = dynamic_per_tensor_fp8_quant(x)
+        hidden_states_scale = torch.tensor(hidden_states_scale[0]).cuda()
+        quant_scales = [
+            torch.squeeze(w1_scales * hidden_states_scale).float(),
+            torch.tensor(1.0).cuda(),
+            torch.squeeze(1.0 * w2_scales).float(),
+            hidden_states_scale,
+        ]
 
-    torch.manual_seed(42)
-    input_shape = (batch_size, hidden_size)
-    w31_factor = 2 if activation_type == ActivationType.Swiglu else 1
-    w31_shape = (num_experts, w31_factor * intermediate_size, hidden_size)
-    w2_shape = (num_experts, hidden_size, intermediate_size)
-    x = cast_to_representable(gen_tensor(input_shape, otype))
-    router_logits = gen_tensor((batch_size, num_experts), otype)
-
-    # Create weight tensors
-    w31_weight = gen_tensor(w31_shape, otype, wtype)
-    w2_weight = gen_tensor(w2_shape, otype, wtype)
-    w31_scales = torch.empty(num_experts, 2, dtype=otype).cuda()
-    w2_scales = torch.empty(num_experts, 1, dtype=otype).cuda()
-
-    w31_dequantized = gen_tensor(w31_shape, otype)
-    w2_dequantized = gen_tensor(w2_shape, otype)
-    for expert_id in range(num_experts):
-        w31 = cast_to_representable(gen_tensor(w31_shape[1:], otype, scale=0.1))
-        w2 = cast_to_representable(gen_tensor(w2_shape[1:], otype, scale=0.09))
-
-        w31_quant, s31 = dynamic_per_tensor_fp8_quant(w31)
-        w2_quant, s2 = dynamic_per_tensor_fp8_quant(w2)
-
-        w31_weight.data[expert_id].copy_(w31_quant)
-        w2_weight.data[expert_id].copy_(w2_quant)
-        w31_scales.data[expert_id].copy_(s31)
-        w2_scales.data[expert_id].copy_(s2)
-        w31_dequantized.data[expert_id].copy_(torch.mul(w31_quant.to(dtype=otype), s31))
-        w2_dequantized.data[expert_id].copy_(torch.mul(w2_quant.to(dtype=otype), s2))
-
-    routing_weights, selected_experts = compute_routing(router_logits, top_k)
-    ref_output = compute_with_experts(
-        num_experts,
-        x,
-        w31_dequantized,
-        w2_dequantized,
-        selected_experts,
-        routing_weights,
-        activation_type=activation_type,
-    )
-    flash_output = torch.empty_like(ref_output)
-    # For fp8, the hidden_state expects quantized.
-    _, w1_scales = torch.chunk(w31_scales, 2, dim=-1)
-    x_quant, hidden_states_scale = dynamic_per_tensor_fp8_quant(x)
-    hidden_states_scale = torch.tensor(hidden_states_scale[0]).cuda()
-    quant_scales = [
-        torch.squeeze(w1_scales * hidden_states_scale).float(),
-        torch.tensor(1.0).cuda(),
-        torch.squeeze(1.0 * w2_scales).float(),
-        hidden_states_scale,
-    ]
-
-    _ = fused_moe.cutlass_fused_moe(
-        x_quant,
-        selected_experts.to(torch.int),
-        routing_weights,
-        w31_weight,
-        w2_weight,
-        otype,
-        quant_scales=quant_scales,
-        output=flash_output,
-        activation_type=activation_type,
-    )
-    torch.testing.assert_close(ref_output, flash_output, rtol=1e-1, atol=1e-1)
+        _ = fused_moe.cutlass_fused_moe(
+            x_quant,
+            selected_experts.to(torch.int),
+            routing_weights,
+            w31_weight,
+            w2_weight,
+            otype,
+            quant_scales=quant_scales,
+            output=flash_output,
+            activation_type=activation_type,
+        )
+    with time_block("validation"):
+        torch.testing.assert_close(ref_output, flash_output, rtol=1e-1, atol=1e-1)
 
 
 @pytest.mark.parametrize("moe_config", FULL_MOE_CONFIGS)
