@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from collections import namedtuple
 
 import pytest
@@ -51,7 +51,7 @@ def dynamic_per_tensor_fp8_quant(x: torch.tensor) -> tuple[torch.tensor, torch.t
 
 
 def gen_tensor(shape, dtype, stype=None, scale=1.0):
-    x = torch.randn(*shape, dtype=dtype).cuda() * scale
+    x = torch.randn(*shape, dtype=dtype, device="cuda") * scale
     return x.to(stype) if stype else x
 
 
@@ -362,18 +362,6 @@ EP_NUM_EXPERTS = [8]
 ACTIVATION_TYPES = [ActivationType.Swiglu, ActivationType.Relu2]
 ACTIVATION_TYPES_IDS = ["swiglu", "relu2"]
 
-import time
-
-
-@contextmanager
-def time_block(label):
-    start = time.perf_counter()
-    try:
-        yield
-    finally:
-        end = time.perf_counter()
-        print(f"\n[TIME] {label}: {end - start:.4f}s")
-
 
 @pytest.mark.parametrize("moe_config", SMALL_MOE_CONFIGS)
 def test_moe(moe_config):
@@ -385,18 +373,28 @@ def test_moe(moe_config):
         )
 
     torch.manual_seed(42)
-    x = torch.randn(batch_size, hidden_size, dtype=torch.float16).cuda() / 5
-    router_logits = torch.randn(batch_size, num_experts, dtype=torch.float32).cuda()
+    x = torch.randn(batch_size, hidden_size, dtype=torch.float16, device="cuda") / 5
+    router_logits = torch.randn(
+        batch_size, num_experts, dtype=torch.float32, device="cuda"
+    )
     w31_weight = (
         torch.randn(
-            num_experts, 2 * intermediate_size, hidden_size, dtype=torch.float16
-        ).cuda()
+            num_experts,
+            2 * intermediate_size,
+            hidden_size,
+            dtype=torch.float16,
+            device="cuda",
+        )
         / 5
     )
     w2_weight = (
         torch.randn(
-            num_experts, hidden_size, intermediate_size, dtype=torch.float16
-        ).cuda()
+            num_experts,
+            hidden_size,
+            intermediate_size,
+            dtype=torch.float16,
+            device="cuda",
+        )
         / 5
     )
 
@@ -432,89 +430,78 @@ def test_moe_fp8(
     otype,
     wtype,
 ):
-    with time_block("setup"):
-        batch_size, hidden_size, num_experts, top_k, intermediate_size = moe_config
-        # Skip invalid configurations
-        if top_k > num_experts:
-            pytest.skip(
-                f"top_k ({top_k}) cannot be greater than num_experts ({num_experts})"
-            )
-
-        torch.manual_seed(42)
-        input_shape = (batch_size, hidden_size)
-        w31_factor = 2 if activation_type == ActivationType.Swiglu else 1
-        w31_shape = (num_experts, w31_factor * intermediate_size, hidden_size)
-        w2_shape = (num_experts, hidden_size, intermediate_size)
-
-    with time_block("data generation"):
-        x = cast_to_representable(gen_tensor(input_shape, otype))
-        router_logits = gen_tensor((batch_size, num_experts), otype)
-
-        # Create weight tensors
-        w31_weight = gen_tensor(w31_shape, otype, wtype)
-        w2_weight = gen_tensor(w2_shape, otype, wtype)
-        w31_scales = torch.empty(num_experts, 2, dtype=otype).cuda()
-        w2_scales = torch.empty(num_experts, 1, dtype=otype).cuda()
-
-        w31_dequantized = gen_tensor(w31_shape, otype)
-        w2_dequantized = gen_tensor(w2_shape, otype)
-    with time_block("quantization"):
-        for expert_id in range(num_experts):
-            w31 = cast_to_representable(gen_tensor(w31_shape[1:], otype, scale=0.1))
-            w2 = cast_to_representable(gen_tensor(w2_shape[1:], otype, scale=0.09))
-
-            w31_quant, s31 = dynamic_per_tensor_fp8_quant(w31)
-            w2_quant, s2 = dynamic_per_tensor_fp8_quant(w2)
-
-            w31_weight.data[expert_id].copy_(w31_quant)
-            w2_weight.data[expert_id].copy_(w2_quant)
-            w31_scales.data[expert_id].copy_(s31)
-            w2_scales.data[expert_id].copy_(s2)
-            w31_dequantized.data[expert_id].copy_(
-                torch.mul(w31_quant.to(dtype=otype), s31)
-            )
-            w2_dequantized.data[expert_id].copy_(
-                torch.mul(w2_quant.to(dtype=otype), s2)
-            )
-
-    with time_block("compute routing"):
-        routing_weights, selected_experts = compute_routing(router_logits, top_k)
-    with time_block("reference computation"):
-        ref_output = compute_with_experts(
-            num_experts,
-            x,
-            w31_dequantized,
-            w2_dequantized,
-            selected_experts,
-            routing_weights,
-            activation_type=activation_type,
+    batch_size, hidden_size, num_experts, top_k, intermediate_size = moe_config
+    # Skip invalid configurations
+    if top_k > num_experts:
+        pytest.skip(
+            f"top_k ({top_k}) cannot be greater than num_experts ({num_experts})"
         )
-    with time_block("fused_moe computation"):
-        flash_output = torch.empty_like(ref_output)
-        # For fp8, the hidden_state expects quantized.
-        _, w1_scales = torch.chunk(w31_scales, 2, dim=-1)
-        x_quant, hidden_states_scale = dynamic_per_tensor_fp8_quant(x)
-        hidden_states_scale = torch.tensor(hidden_states_scale[0]).cuda()
-        quant_scales = [
-            torch.squeeze(w1_scales * hidden_states_scale).float(),
-            torch.tensor(1.0).cuda(),
-            torch.squeeze(1.0 * w2_scales).float(),
-            hidden_states_scale,
-        ]
 
-        _ = fused_moe.cutlass_fused_moe(
-            x_quant,
-            selected_experts.to(torch.int),
-            routing_weights,
-            w31_weight,
-            w2_weight,
-            otype,
-            quant_scales=quant_scales,
-            output=flash_output,
-            activation_type=activation_type,
-        )
-    with time_block("validation"):
-        torch.testing.assert_close(ref_output, flash_output, rtol=1e-1, atol=1e-1)
+    torch.manual_seed(42)
+    input_shape = (batch_size, hidden_size)
+    w31_factor = 2 if activation_type == ActivationType.Swiglu else 1
+    w31_shape = (num_experts, w31_factor * intermediate_size, hidden_size)
+    w2_shape = (num_experts, hidden_size, intermediate_size)
+
+    x = cast_to_representable(gen_tensor(input_shape, otype))
+    router_logits = gen_tensor((batch_size, num_experts), otype)
+
+    # Create weight tensors
+    w31_weight = gen_tensor(w31_shape, otype, wtype)
+    w2_weight = gen_tensor(w2_shape, otype, wtype)
+    w31_scales = torch.empty(num_experts, 2, dtype=otype, device="cuda")
+    w2_scales = torch.empty(num_experts, 1, dtype=otype, device="cuda")
+
+    w31_dequantized = gen_tensor(w31_shape, otype)
+    w2_dequantized = gen_tensor(w2_shape, otype)
+    for expert_id in range(num_experts):
+        w31 = cast_to_representable(gen_tensor(w31_shape[1:], otype, scale=0.1))
+        w2 = cast_to_representable(gen_tensor(w2_shape[1:], otype, scale=0.09))
+
+        w31_quant, s31 = dynamic_per_tensor_fp8_quant(w31)
+        w2_quant, s2 = dynamic_per_tensor_fp8_quant(w2)
+
+        w31_weight.data[expert_id].copy_(w31_quant)
+        w2_weight.data[expert_id].copy_(w2_quant)
+        w31_scales.data[expert_id].copy_(s31)
+        w2_scales.data[expert_id].copy_(s2)
+        w31_dequantized.data[expert_id].copy_(torch.mul(w31_quant.to(dtype=otype), s31))
+        w2_dequantized.data[expert_id].copy_(torch.mul(w2_quant.to(dtype=otype), s2))
+
+    routing_weights, selected_experts = compute_routing(router_logits, top_k)
+    ref_output = compute_with_experts(
+        num_experts,
+        x,
+        w31_dequantized,
+        w2_dequantized,
+        selected_experts,
+        routing_weights,
+        activation_type=activation_type,
+    )
+    flash_output = torch.empty_like(ref_output)
+    # For fp8, the hidden_state expects quantized.
+    _, w1_scales = torch.chunk(w31_scales, 2, dim=-1)
+    x_quant, hidden_states_scale = dynamic_per_tensor_fp8_quant(x)
+    hidden_states_scale = torch.tensor(hidden_states_scale[0], device="cuda")
+    quant_scales = [
+        torch.squeeze(w1_scales * hidden_states_scale).float(),
+        torch.tensor(1.0, device="cuda"),
+        torch.squeeze(1.0 * w2_scales).float(),
+        hidden_states_scale,
+    ]
+
+    _ = fused_moe.cutlass_fused_moe(
+        x_quant,
+        selected_experts.to(torch.int),
+        routing_weights,
+        w31_weight,
+        w2_weight,
+        otype,
+        quant_scales=quant_scales,
+        output=flash_output,
+        activation_type=activation_type,
+    )
+    torch.testing.assert_close(ref_output, flash_output, rtol=1e-1, atol=1e-1)
 
 
 @pytest.mark.parametrize("moe_config", FULL_MOE_CONFIGS)
@@ -592,13 +579,13 @@ def test_moe_nvfp4(
 
         w2_q[expert], w2_blockscale[expert] = fp4_quantize(w2[expert], w2_gs[expert])
 
-    x = torch.randn(m, k, dtype=otype).cuda()
+    x = torch.randn(m, k, dtype=otype, device="cuda")
     a1_gs = (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX) / torch.abs(x).max().to(
         torch.float32
     ).cuda()
     a1_gs = torch.tensor(1.0, device="cuda", dtype=torch.float32)
     a2_gs = torch.tensor(1.0, device="cuda", dtype=torch.float32)
-    router_logits = torch.randn(m, e, dtype=otype).cuda()
+    router_logits = torch.randn(m, e, dtype=otype, device="cuda")
     routing_weights, selected_experts = compute_routing(router_logits, top_k)
 
     # quant_scales format
@@ -709,7 +696,7 @@ def test_moe_expert_parallel(moe_config, activation_type):
     torch.manual_seed(42)
 
     # Create input tensors
-    x = torch.randn(batch_size, hidden_size, dtype=torch.float16).cuda()
+    x = torch.randn(batch_size, hidden_size, dtype=torch.float16, device="cuda")
 
     # Create weight tensors - each GPU will have one expert
     w31_factor = 2 if activation_type == ActivationType.Swiglu else 1
@@ -719,21 +706,26 @@ def test_moe_expert_parallel(moe_config, activation_type):
             w31_factor * intermediate_size,
             hidden_size,
             dtype=torch.float16,
-        ).cuda()
+            device="cuda",
+        )
         / 10
     )
     w2_weight = (
         torch.randn(
-            num_experts, hidden_size, intermediate_size, dtype=torch.float16
-        ).cuda()
+            num_experts,
+            hidden_size,
+            intermediate_size,
+            dtype=torch.float16,
+            device="cuda",
+        )
         / 10
     )
 
     selected_experts = torch.stack(
-        [torch.randperm(num_experts)[:top_k] for _ in range(batch_size)]
-    ).cuda()
+        [torch.randperm(num_experts, device="cuda")[:top_k] for _ in range(batch_size)]
+    )
 
-    routing_weights = torch.randn((batch_size, top_k)).cuda()
+    routing_weights = torch.randn((batch_size, top_k), device="cuda")
     routing_weights = F.softmax(routing_weights, dim=1)
     ref_output = compute_with_experts(
         num_experts,
@@ -819,7 +811,7 @@ def test_moe_tensor_parallel(moe_config, tp_size, activation_type):
     torch.manual_seed(42)
     top_k = 2
     # Create input tensors
-    x = torch.randn(batch_size, hidden_size, dtype=torch.float16).cuda()
+    x = torch.randn(batch_size, hidden_size, dtype=torch.float16, device="cuda")
 
     # Create weight tensors
     w31_factor = 2 if activation_type == ActivationType.Swiglu else 1
@@ -829,22 +821,27 @@ def test_moe_tensor_parallel(moe_config, tp_size, activation_type):
             w31_factor * intermediate_size,
             hidden_size,
             dtype=torch.float16,
-        ).cuda()
+            device="cuda",
+        )
         / 10
     )
     w2_weight = (
         torch.randn(
-            num_experts, hidden_size, intermediate_size, dtype=torch.float16
-        ).cuda()
+            num_experts,
+            hidden_size,
+            intermediate_size,
+            dtype=torch.float16,
+            device="cuda",
+        )
         / 10
     )
 
     # Generate unique random expert indices for each token
     selected_experts = torch.stack(
-        [torch.randperm(num_experts)[:top_k] for _ in range(batch_size)]
-    ).cuda()
+        [torch.randperm(num_experts, device="cuda")[:top_k] for _ in range(batch_size)]
+    )
 
-    routing_weights = torch.randn((batch_size, top_k)).cuda()
+    routing_weights = torch.randn((batch_size, top_k), device="cuda")
     routing_weights = F.softmax(routing_weights, dim=1)
 
     # Run reference implementation (no parallelism)
@@ -948,7 +945,7 @@ def test_moe_tensor_expert_parallel(
     """
     batch_size, hidden_size, num_experts, top_k, intermediate_size = moe_config
     torch.manual_seed(42)
-    x = torch.randn(batch_size, hidden_size, dtype=torch.float16).cuda()
+    x = torch.randn(batch_size, hidden_size, dtype=torch.float16, device="cuda")
     w31_factor = 2 if activation_type == ActivationType.Swiglu else 1
     w31_weight = (
         torch.randn(
@@ -956,22 +953,27 @@ def test_moe_tensor_expert_parallel(
             w31_factor * intermediate_size,
             hidden_size,
             dtype=torch.float16,
-        ).cuda()
+            device="cuda",
+        )
         / 10
     )
     w2_weight = (
         torch.randn(
-            num_experts, hidden_size, intermediate_size, dtype=torch.float16
-        ).cuda()
+            num_experts,
+            hidden_size,
+            intermediate_size,
+            dtype=torch.float16,
+            device="cuda",
+        )
         / 10
     )
 
     # Generate unique random expert indices for each token
     selected_experts = torch.stack(
-        [torch.randperm(num_experts)[:top_k] for _ in range(batch_size)]
-    ).cuda()
+        [torch.randperm(num_experts, device="cuda")[:top_k] for _ in range(batch_size)]
+    )
 
-    routing_weights = torch.randn((batch_size, top_k)).cuda()
+    routing_weights = torch.randn((batch_size, top_k), device="cuda")
     routing_weights = F.softmax(routing_weights, dim=1)
 
     # Run reference implementation (no parallelism)
@@ -1180,23 +1182,27 @@ def test_moe_fp8_block_scaling(moe_config):
     torch.manual_seed(42)
     otype = torch.bfloat16
 
-    x = torch.randn(batch_size, hidden_size, dtype=otype).cuda()
+    x = torch.randn(batch_size, hidden_size, dtype=otype, device="cuda")
 
     w31_weight = (
-        torch.randn(num_experts, 2 * intermediate_size, hidden_size, dtype=otype).cuda()
+        torch.randn(
+            num_experts, 2 * intermediate_size, hidden_size, dtype=otype, device="cuda"
+        )
         / 10
     )
     w2_weight = (
-        torch.randn(num_experts, hidden_size, intermediate_size, dtype=otype).cuda()
+        torch.randn(
+            num_experts, hidden_size, intermediate_size, dtype=otype, device="cuda"
+        )
         / 10
     )
 
     # Generate unique random expert indices for each token
     selected_experts = torch.stack(
-        [torch.randperm(num_experts)[:top_k] for _ in range(batch_size)]
-    ).cuda()
+        [torch.randperm(num_experts, device="cuda")[:top_k] for _ in range(batch_size)]
+    )
 
-    routing_weights = torch.randn((batch_size, top_k)).cuda()
+    routing_weights = torch.randn((batch_size, top_k), device="cuda")
     routing_weights = F.softmax(routing_weights, dim=1)
 
     # Quantize input and weights
@@ -1211,13 +1217,15 @@ def test_moe_fp8_block_scaling(moe_config):
         ceil_div(2 * intermediate_size, 128),
         ceil_div(hidden_size, 128),
         dtype=torch.float32,
-    ).cuda()
+        device="cuda",
+    )
     w2_scales = torch.zeros(
         num_experts,
         ceil_div(hidden_size, 128),
         ceil_div(intermediate_size, 128),
         dtype=torch.float32,
-    ).cuda()
+        device="cuda",
+    )
 
     for expert_id in range(num_experts):
         w31, w31_s = per_block_cast_to_fp8(w31_weight[expert_id, :])
@@ -1330,7 +1338,7 @@ def test_moe_mxfp8_mxfp4(
     n = intermediate_size
     k = hidden_size
 
-    x = torch.randn(m, k, dtype=otype).cuda()
+    x = torch.randn(m, k, dtype=otype, device="cuda")
     w1 = torch.randn((e, 2 * n, k), device="cuda", dtype=otype) / 10
     w2 = torch.randn((e, k, n), device="cuda", dtype=otype) / 10
 
@@ -1339,7 +1347,7 @@ def test_moe_mxfp8_mxfp4(
     mxfp4_w1, mxfp4_w1_scale = quant_mxfp4_batches(w1, e)
     mxfp4_w2, mxfp4_w2_scale = quant_mxfp4_batches(w2, e)
 
-    router_logits = torch.randn(m, e, dtype=otype).cuda()
+    router_logits = torch.randn(m, e, dtype=otype, device="cuda")
     routing_weights, selected_experts = compute_routing(router_logits, top_k)
 
     fake_input_scale = torch.ones(e, device=x.device)
@@ -1466,7 +1474,7 @@ def test_moe_bf16_mxfp4(
     n = intermediate_size
     k = hidden_size
 
-    x = torch.randn(m, k, dtype=torch.bfloat16).cuda()
+    x = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
     w1 = torch.randint(0, 256, (e, 2 * n, k // 2), device="cuda", dtype=torch.uint8)
     w2 = torch.randint(0, 256, (e, k, n // 2), device="cuda", dtype=torch.uint8)
 
@@ -1477,7 +1485,7 @@ def test_moe_bf16_mxfp4(
         118, 123, (e, k, n // 32), device="cuda", dtype=torch.uint8
     )
 
-    router_logits = torch.randn(m, e, dtype=torch.bfloat16).cuda()
+    router_logits = torch.randn(m, e, dtype=torch.bfloat16, device="cuda")
     routing_weights, selected_experts = compute_routing(router_logits, top_k)
 
     flash_output = torch.zeros_like(x)
