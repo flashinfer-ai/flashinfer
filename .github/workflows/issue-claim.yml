@@ -8,6 +8,8 @@ name: Issue Claim
 on:
   issue_comment:
     types: [created]
+  schedule:
+    - cron: '*/5 * * * *'
 
 permissions:
   contents: read
@@ -18,6 +20,7 @@ jobs:
     # Only run on issue comments (not PRs) that start with !claim or !assign
     # Skip comments from bots
     if: |
+      github.event_name == 'issue_comment' &&
       !github.event.issue.pull_request &&
       github.event.comment.user.type != 'Bot' &&
       (startsWith(github.event.comment.body, '!claim') || startsWith(github.event.comment.body, '!assign'))
@@ -191,7 +194,7 @@ jobs:
           }
 
           assign_or_invite "$TARGET_USER" \
-            "@${TARGET_USER} has been sent a repository invitation. Once they [accept the invitation](https://github.com/notifications), a maintainer can run \`!assign @${TARGET_USER}\` again to complete the assignment."
+            "@${TARGET_USER} has been sent a repository invitation. They'll be automatically assigned once they [accept the invitation](https://github.com/notifications)."
 
       - name: Handle !assign with no username
         if: steps.parse.outputs.command == 'assign-no-user'
@@ -208,3 +211,76 @@ jobs:
           gh api -X POST \
             "/repos/${REPO}/issues/${ISSUE_NUMBER}/comments" \
             -f body="Usage: \`!assign @username\`"
+
+  auto-assign-on-accept:
+    # Poll for users who accepted repo invitations after !assign
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Check pending invitations
+        env:
+          GH_TOKEN: ${{ secrets.FLASHINFER_BOT_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo "::error::FLASHINFER_BOT_TOKEN secret is not set"
+            exit 1
+          fi
+
+          # Search for open issues with !assign comments in this repo
+          SEARCH_RESULTS=$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            "/search/issues?q=repo:${REPO}+is:issue+is:open+no:assignee+%22!assign+%40%22+in:comments&per_page=50" \
+            --jq '.items[].number') || true
+
+          if [ -z "$SEARCH_RESULTS" ]; then
+            echo "No open issues with !assign comments found."
+            exit 0
+          fi
+
+          for ISSUE_NUMBER in $SEARCH_RESULTS; do
+            echo "--- Checking issue #${ISSUE_NUMBER} ---"
+
+            # Get the most recent !assign @user comment (last one wins)
+            LAST_ASSIGN=$(gh api \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/${REPO}/issues/${ISSUE_NUMBER}/comments?per_page=100" \
+              --jq '[.[] | select(.body | test("^!assign\\s+@?"))] | last | .body')
+
+            if [ -z "$LAST_ASSIGN" ] || [ "$LAST_ASSIGN" = "null" ]; then
+              echo "No !assign comments found in issue #${ISSUE_NUMBER}, skipping."
+              continue
+            fi
+
+            # Extract username from the most recent !assign comment
+            USERNAME=$(echo "$LAST_ASSIGN" | \
+              sed -n 's/^!assign[[:space:]]*@\?\([a-zA-Z0-9][a-zA-Z0-9-]*\).*/\1/p')
+
+            if [ -z "$USERNAME" ]; then
+              echo "Could not extract username from !assign comment, skipping."
+              continue
+            fi
+
+            echo "Most recent !assign target: $USERNAME"
+
+            # Check if user is now a collaborator (accepted invitation)
+            if gh api \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/${REPO}/collaborators/${USERNAME}" \
+              --silent 2>/dev/null; then
+
+              echo "User $USERNAME is now a collaborator. Assigning to issue #${ISSUE_NUMBER}."
+
+              gh api -X POST \
+                "/repos/${REPO}/issues/${ISSUE_NUMBER}/assignees" \
+                -f "assignees[]=${USERNAME}"
+
+              gh api -X POST \
+                "/repos/${REPO}/issues/${ISSUE_NUMBER}/comments" \
+                -f body="@${USERNAME} has accepted the repository invitation and has been automatically assigned to this issue."
+            else
+              echo "User $USERNAME is not yet a collaborator, skipping."
+            fi
+          done
