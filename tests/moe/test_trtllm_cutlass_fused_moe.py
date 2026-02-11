@@ -289,6 +289,7 @@ def compute_with_experts(
     alpha=None,
     beta=None,
     limit=None,
+    activation_type=ActivationType.Swiglu,
 ):
     results = torch.zeros_like(x)
     for expert_id in range(num_experts):
@@ -296,26 +297,33 @@ def compute_with_experts(
         if not mask.sum():
             continue
         batch_idx, nth_expert = torch.where(mask)
-        w31_expert = w31_weight[expert_id]  # [2 * intermediate_size, hidden_size]
+        # [2 * intermediate_size, hidden_size] for SwiGLU
+        # [intermediate_size, hidden_size] for ReLU2
+        w31_expert = w31_weight[expert_id]
         w2_expert = w2_weight[expert_id]  # [hidden_size, intermediate_size]
 
         # Split w13 into w1 and w3
-        w3_expert, w1_expert = torch.chunk(w31_expert, 2, dim=0)
+        if activation_type == ActivationType.Swiglu:
+            w3_expert, w1_expert = torch.chunk(w31_expert, 2, dim=0)
 
-        expert_inputs = x[batch_idx]
-        if alpha is not None and limit is not None and beta is not None:
-            # SwiGLUBias
-            x1 = expert_inputs @ w1_expert.t()
-            x1 = x1.clamp_(min=None, max=limit)
-            x1_scaled = x1 * torch.sigmoid(alpha * x1)
-            x2 = expert_inputs @ w3_expert.t()
-            x2 = x2.clamp_(min=-limit, max=limit) + beta
+            expert_inputs = x[batch_idx]
+            if alpha is not None and limit is not None and beta is not None:
+                # SwiGLUBias
+                x1 = expert_inputs @ w1_expert.t()
+                x1 = x1.clamp_(min=None, max=limit)
+                x1_scaled = x1 * torch.sigmoid(alpha * x1)
+                x2 = expert_inputs @ w3_expert.t()
+                x2 = x2.clamp_(min=-limit, max=limit) + beta
 
-            inter = x1_scaled * x2
+                inter = x1_scaled * x2
+            else:
+                inter = F.silu(expert_inputs @ w1_expert.t()) * (
+                    expert_inputs @ w3_expert.t()
+                )
         else:
-            inter = F.silu(expert_inputs @ w1_expert.t()) * (
-                expert_inputs @ w3_expert.t()
-            )
+            w1_expert = w31_expert
+            expert_inputs = x[batch_idx]
+            inter = F.relu(expert_inputs @ w1_expert.t()) ** 2
         output = inter @ w2_expert.t()
         results[batch_idx] += routing_weights[batch_idx, nth_expert, None] * output
     return results.view_as(x)
@@ -335,6 +343,8 @@ INTERMEDIATE_SIZES = [
 ]
 EP_NUM_EXPERTS = [8]
 EP_TOP_K = [2]
+ACTIVATION_TYPES = [ActivationType.Swiglu, ActivationType.Relu2]
+ACTIVATION_TYPES_IDS = ["swiglu", "relu2"]
 
 
 @pytest.mark.parametrize("batch_size", BATCH_SIZES)
@@ -389,9 +399,21 @@ def test_moe(batch_size, hidden_size, num_experts, top_k, intermediate_size):
 @pytest.mark.parametrize("num_experts", NUM_EXPERTS)
 @pytest.mark.parametrize("top_k", TOP_K_VALUES)
 @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
+@pytest.mark.parametrize(
+    "activation_type",
+    ACTIVATION_TYPES,
+    ids=ACTIVATION_TYPES_IDS,
+)
 @pytest.mark.parametrize("otype, wtype", [(torch.float16, torch.float8_e4m3fn)])
 def test_moe_fp8(
-    batch_size, hidden_size, num_experts, top_k, intermediate_size, otype, wtype
+    batch_size,
+    hidden_size,
+    num_experts,
+    top_k,
+    intermediate_size,
+    activation_type,
+    otype,
+    wtype,
 ):
     # Skip invalid configurations
     if top_k > num_experts:
@@ -401,7 +423,8 @@ def test_moe_fp8(
 
     torch.manual_seed(42)
     input_shape = (batch_size, hidden_size)
-    w31_shape = (num_experts, 2 * intermediate_size, hidden_size)
+    w31_factor = 2 if activation_type == ActivationType.Swiglu else 1
+    w31_shape = (num_experts, w31_factor * intermediate_size, hidden_size)
     w2_shape = (num_experts, hidden_size, intermediate_size)
     x = cast_to_representable(gen_tensor(input_shape, otype))
     router_logits = gen_tensor((batch_size, num_experts), otype)
@@ -436,6 +459,7 @@ def test_moe_fp8(
         w2_dequantized,
         selected_experts,
         routing_weights,
+        activation_type=activation_type,
     )
     flash_output = torch.empty_like(ref_output)
     # For fp8, the hidden_state expects quantized.
@@ -458,6 +482,7 @@ def test_moe_fp8(
         otype,
         quant_scales=quant_scales,
         output=flash_output,
+        activation_type=activation_type,
     )
     torch.testing.assert_close(ref_output, flash_output, rtol=1e-1, atol=1e-1)
 
@@ -474,8 +499,8 @@ def test_moe_fp8(
 @pytest.mark.parametrize("quantized_input", [False, True])
 @pytest.mark.parametrize(
     "activation_type",
-    [ActivationType.Swiglu, ActivationType.Relu2],
-    ids=["swiglu", "relu2"],
+    ACTIVATION_TYPES,
+    ids=ACTIVATION_TYPES_IDS,
 )
 @pytest.mark.skipif(
     torch.cuda.get_device_capability()[0] not in [10, 11, 12],
@@ -980,9 +1005,9 @@ def per_block_cast_to_fp8(
 def per_token_group_quant_fp8(x, group_size, eps=1e-10, dtype=torch.float8_e4m3fn):
     """Function to perform per-token-group quantization on an input tensor
     `x` using native torch."""
-    assert x.shape[-1] % group_size == 0, (
-        "the last dimension of `x` cannot be divisible by `group_size`"
-    )
+    assert (
+        x.shape[-1] % group_size == 0
+    ), "the last dimension of `x` cannot be divisible by `group_size`"
     assert x.is_contiguous(), "`x` is not contiguous"
 
     finfo = torch.finfo(dtype)
