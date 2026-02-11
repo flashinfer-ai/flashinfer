@@ -1,0 +1,14 @@
+try adding clamping
+
+# Please enter the commit message for your changes. Lines starting
+# with '#' will be ignored, and an empty message aborts the commit.
+#
+# Date:      Wed Feb 11 19:05:49 2026 +0200
+#
+# On branch add-tests-for-fusedmoe-2694938553
+# Your branch is ahead of 'origin/add-tests-for-fusedmoe-2694938553' by 5 commits.
+#   (use "git push" to publish your local commits)
+#
+# Changes to be committed:
+#   modified:   tests/moe/test_trtllm_cutlass_fused_moe.py
+#
