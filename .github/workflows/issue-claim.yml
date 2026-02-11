@@ -92,47 +92,19 @@ jobs:
             exit 0
           fi
 
-          # Try to assign the user
-          assign_or_invite() {
-            local user="$1"
-            local invite_msg="$2"
+          # Assign the user (commenter has always interacted with the issue,
+          # so GitHub allows assignment without collaborator access)
+          gh api -X POST \
+            "/repos/${REPO}/issues/${ISSUE_NUMBER}/assignees" \
+            -f "assignees[]=${TARGET_USER}"
 
-            ASSIGN_RESPONSE=$(gh api -X POST \
-              "/repos/${REPO}/issues/${ISSUE_NUMBER}/assignees" \
-              -f "assignees[]=${user}" 2>&1) && ASSIGN_OK=true || ASSIGN_OK=false
+          gh api -X POST \
+            "/repos/${REPO}/issues/comments/${COMMENT_ID}/reactions" \
+            -f content='+1'
 
-            if [ "$ASSIGN_OK" = "true" ]; then
-              IS_ASSIGNED=$(echo "$ASSIGN_RESPONSE" | jq --arg u "$user" \
-                '[.assignees[].login] | map(ascii_downcase) | contains([$u | ascii_downcase])')
-            else
-              IS_ASSIGNED="false"
-            fi
-
-            if [ "$IS_ASSIGNED" = "true" ]; then
-              gh api -X POST \
-                "/repos/${REPO}/issues/comments/${COMMENT_ID}/reactions" \
-                -f content='+1'
-
-              gh api -X POST \
-                "/repos/${REPO}/issues/${ISSUE_NUMBER}/comments" \
-                -f body="Issue assigned to @${user}."
-            else
-              gh api -X PUT \
-                "/repos/${REPO}/collaborators/${user}" \
-                -f permission='triage' 2>&1 || true
-
-              gh api -X POST \
-                "/repos/${REPO}/issues/comments/${COMMENT_ID}/reactions" \
-                -f content='+1'
-
-              gh api -X POST \
-                "/repos/${REPO}/issues/${ISSUE_NUMBER}/comments" \
-                -f body="$invite_msg"
-            fi
-          }
-
-          assign_or_invite "$TARGET_USER" \
-            "@${TARGET_USER} You've been sent a repository invitation. Please [accept the invitation](https://github.com/notifications) and then comment \`!claim\` again so we can assign you."
+          gh api -X POST \
+            "/repos/${REPO}/issues/${ISSUE_NUMBER}/comments" \
+            -f body="Issue assigned to @${TARGET_USER}."
 
       - name: Handle !assign (unauthorized)
         if: |
