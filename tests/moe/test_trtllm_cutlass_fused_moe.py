@@ -449,7 +449,7 @@ def test_moe_fp8(
     # Create weight tensors
     w31_weight = gen_tensor(w31_shape, otype, wtype)
     w2_weight = gen_tensor(w2_shape, otype, wtype)
-    w31_scales = torch.empty(num_experts, 2, dtype=otype, device="cuda")
+    w31_scales = torch.empty(num_experts, w31_factor, dtype=otype, device="cuda")
     w2_scales = torch.empty(num_experts, 1, dtype=otype, device="cuda")
 
     w31_dequantized = gen_tensor(w31_shape, otype)
@@ -479,8 +479,11 @@ def test_moe_fp8(
         activation_type=activation_type,
     )
     flash_output = torch.empty_like(ref_output)
-    # For fp8, the hidden_state expects quantized.
-    _, w1_scales = torch.chunk(w31_scales, 2, dim=-1)
+    if activation_type == ActivationType.Swiglu:
+        # For fp8, the hidden_state expects quantized.
+        _, w1_scales = torch.chunk(w31_scales, 2, dim=-1)
+    else:
+        w1_scales = w31_scales
     x_quant, hidden_states_scale = dynamic_per_tensor_fp8_quant(x)
     hidden_states_scale = torch.tensor(hidden_states_scale[0], device="cuda")
     quant_scales = [
