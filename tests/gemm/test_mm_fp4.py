@@ -106,7 +106,7 @@ def _test_mm_fp4(
 @pytest.mark.parametrize("n", [128, 256, 512])
 @pytest.mark.parametrize("k", [128, 256, 512])
 @pytest.mark.parametrize("res_dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("backend", ["cute_dsl"])
+@pytest.mark.parametrize("backend", ["trtllm", "cudnn", "cutlass", "cute_dsl"])
 @pytest.mark.parametrize("use_128x4_sf_layout", [False, True])
 @pytest.mark.parametrize("auto_tuning", [False, True])
 @pytest.mark.parametrize("fp4_type", ["nvfp4", "mxfp4", "mxfp4_alpha"])

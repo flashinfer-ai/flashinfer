@@ -2805,17 +2805,19 @@ def _cute_dsl_gemm_fp4_runner(
 
     sm_version = sm_major * 10 + sm_minor
 
-    # Lazy import SM103 kernel only when needed
+    # TODO(yunzheq): Re-enable SM103 kernel once cutlass-dsl package includes
+    # SM103MmaMXF4Op and compatible PersistentTileSchedulerParams.
+    # To re-enable, remove the `Sm103Kernel = None` line below.
     Sm103Kernel = None
-    if sm_version == 103:
-        try:
-            from .kernels.dense_blockscaled_gemm_sm103 import (
-                Sm103BlockScaledPersistentDenseGemmKernel,
-            )
-
-            Sm103Kernel = Sm103BlockScaledPersistentDenseGemmKernel
-        except ImportError:
-            pass
+    # if sm_version == 103:
+    #     try:
+    #         from .kernels.dense_blockscaled_gemm_sm103 import (
+    #             Sm103BlockScaledPersistentDenseGemmKernel,
+    #         )
+    #
+    #         Sm103Kernel = Sm103BlockScaledPersistentDenseGemmKernel
+    #     except ImportError:
+    #         pass
 
     # Map torch output dtype to cutlass dtype
     _torch_to_cutlass_dtype = {
