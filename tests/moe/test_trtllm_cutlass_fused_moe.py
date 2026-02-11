@@ -662,8 +662,13 @@ def test_moe_nvfp4(
 @pytest.mark.parametrize("num_experts", EP_NUM_EXPERTS)
 @pytest.mark.parametrize("top_k", EP_TOP_K)
 @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
+@pytest.mark.parametrize(
+    "activation_type",
+    ACTIVATION_TYPES,
+    ids=ACTIVATION_TYPES_IDS,
+)
 def test_moe_expert_parallel(
-    batch_size, hidden_size, num_experts, top_k, intermediate_size
+    batch_size, hidden_size, num_experts, top_k, intermediate_size, activation_type
 ):
     """
     Test expert parallelism with X GPUs and Y experts.
@@ -687,9 +692,13 @@ def test_moe_expert_parallel(
     x = torch.randn(batch_size, hidden_size, dtype=torch.float16).cuda()
 
     # Create weight tensors - each GPU will have one expert
+    w31_factor = 2 if activation_type == ActivationType.Swiglu else 1
     w31_weight = (
         torch.randn(
-            num_experts, 2 * intermediate_size, hidden_size, dtype=torch.float16
+            num_experts,
+            w31_factor * intermediate_size,
+            hidden_size,
+            dtype=torch.float16,
         ).cuda()
         / 10
     )
@@ -707,7 +716,13 @@ def test_moe_expert_parallel(
     routing_weights = torch.randn((batch_size, top_k)).cuda()
     routing_weights = F.softmax(routing_weights, dim=1)
     ref_output = compute_with_experts(
-        num_experts, x, w31_weight, w2_weight, selected_experts, routing_weights
+        num_experts,
+        x,
+        w31_weight,
+        w2_weight,
+        selected_experts,
+        routing_weights,
+        activation_type=activation_type,
     )
 
     outputs = []
@@ -741,6 +756,7 @@ def test_moe_expert_parallel(
             ep_rank=ep_rank,
             quant_scales=None,
             output=out_hidden_states_local,
+            activation_type=activation_type,
         )
         outputs.append(out_hidden_states_local)
 
