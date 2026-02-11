@@ -766,7 +766,7 @@ def test_moe_expert_parallel(
     torch.testing.assert_close(ref_output, flash_output, rtol=1e-1, atol=1e-1)
 
 
-TP_SIZES = [2, 4]
+TP_SIZES = [2, 4, 8]
 
 
 @pytest.mark.parametrize("batch_size", BATCH_SIZES)
