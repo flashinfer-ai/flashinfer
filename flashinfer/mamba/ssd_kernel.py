@@ -1707,6 +1707,17 @@ class SSDKernel:
                 tiled_s2r_b, local_tidx, sDeltaA, (None, None, None, 0)
             )
 
+            # Coordinate tensor for chunk_size_limit masking (step 4.2)
+            # tile_shape_mnk_inter1 = (N, D, L); dice to (N, L)
+            if cutlass.const_expr(self.has_varlen):
+                bt_coord_shape = cute.dice(
+                    self.tile_shape_mnk_inter1, (1, None, 1)
+                )
+                bt_coord_tensor = cute.make_identity_tensor(bt_coord_shape)
+                thr_s2r_b_ = tiled_s2r_b.get_slice(local_tidx)
+                # ((S2R_ATOM_V, S2R_REST_V), S2R_M, S2R_N)
+                tBCoord = thr_s2r_b_.partition_D(bt_coord_tensor)
+
             # ((R2S_ATOM_V, R2S_REST_V), R2S_M, R2S_N)
             thr_r2s_b = tiled_r2s_b.get_slice(local_tidx)
             tBrDelta_r2s = thr_r2s_b.retile(tBrDelta_s2r)
@@ -1907,6 +1918,25 @@ class SSDKernel:
                     tScaledB = self.pre_inter_scale_bt_with_delta(
                         tBrB_s2r, tBrDelta_r2s, tBrDeltaA_r2s, last_column
                     )
+
+                    # Mask scaled B beyond chunk_size_limit (step 4.2)
+                    # When two logical chunks share a physical chunk, zero
+                    # out positions belonging to the next sequence so they
+                    # don't contaminate INTER1's chunk state computation.
+                    if cutlass.const_expr(self.has_varlen):
+                        chunk_size_limit = L
+                        if chunk_idx + 1 < C:
+                            c_idx_next = chunk_indices[chunk_idx + 1]
+                            if c_idx_next == c_idx:
+                                chunk_size_limit = chunk_offsets[chunk_idx + 1]
+                        if chunk_size_limit < L:
+                            for reg_idx in cutlass.range(
+                                cute.size(tScaledB), unroll_full=True
+                            ):
+                                coord = tBCoord[reg_idx]
+                                l_coord = coord[1]
+                                if l_coord >= chunk_size_limit:
+                                    tScaledB[reg_idx] = 0.0
 
                     # Store scaled B to tBrB_r2s
                     for reg_idx in range(cute.size(tBrB_r2s)):
