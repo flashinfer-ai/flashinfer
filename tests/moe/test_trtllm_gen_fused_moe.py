@@ -1036,7 +1036,7 @@ class FP8BlockScaleMoe(Moe):
                 enable_pdl=enable_pdl,
                 tune_max_num_tokens=TUNE_MAX_NUM_TOKENS,
             )
-        return output.to(torch.float)
+        return output[0].to(torch.float)
 
     def compute_reference(self, args):
         """FP8 block-scale reference implementation."""

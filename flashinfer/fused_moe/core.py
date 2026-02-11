@@ -1148,6 +1148,7 @@ def get_trtllm_moe_sm100_module():
                         kwargs["routing_method_type"],
                         kwargs["use_shuffled_weight"],
                         kwargs["weight_layout"],
+                        kwargs["do_finalize"],
                         kwargs["enable_pdl"],
                         [-1, -1] if tactic == -1 else tactic,
                     )
@@ -1581,9 +1582,10 @@ def get_trtllm_moe_sm100_module():
         routing_method_type: int,
         use_shuffled_weight: bool = False,
         weight_layout: int = 0,
+        do_finalize: bool = True,
         enable_pdl: Optional[bool] = None,
         tune_max_num_tokens: int = 8192,
-    ) -> torch.Tensor:
+    ) -> List[torch.Tensor]:
         # Determine routing mode: compute from logits or use pre-computed
         if routing_logits is None:
             assert topk_ids is not None, (
@@ -1668,10 +1670,11 @@ def get_trtllm_moe_sm100_module():
             routing_method_type=routing_method_type,
             use_shuffled_weight=use_shuffled_weight,
             weight_layout=weight_layout,
+            do_finalize=do_finalize,
             enable_pdl=enable_pdl,
         )
         # Call the C++ function for block scale MoE
-        result = moe_op.trtllm_fp8_block_scale_moe(
+        intermediate_output = moe_op.trtllm_fp8_block_scale_moe(
             routing_logits,
             topk_ids,
             expert_weights,
@@ -1694,11 +1697,20 @@ def get_trtllm_moe_sm100_module():
             routing_method_type,
             use_shuffled_weight,
             weight_layout,
+            do_finalize,
             enable_pdl,
             [-1, -1] if tactic == -1 else tactic,
         )
 
-        return result
+        if do_finalize:
+            return [output]
+        else:
+            gemm2_output, _, expanded_idx_to_permuted_idx = intermediate_output
+            return [
+                torch.from_dlpack(gemm2_output),
+                expert_weights,
+                torch.from_dlpack(expanded_idx_to_permuted_idx),
+            ]
 
     @register_fake_op("flashinfer::trtllm_fp8_block_scale_moe")
     def _fake_trtllm_fp8_block_scale_moe(
@@ -1724,9 +1736,10 @@ def get_trtllm_moe_sm100_module():
         routing_method_type: int = 0,
         use_shuffled_weight: bool = False,
         weight_layout: int = 0,
+        do_finalize: bool = True,
         enable_pdl: Optional[bool] = None,
         tune_max_num_tokens: int = 8192,
-    ):
+    ) -> List[torch.Tensor]:
         seq_len = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1]
 
@@ -2317,9 +2330,10 @@ def trtllm_fp8_block_scale_moe(
     routing_method_type: int = 0,
     use_shuffled_weight: bool = False,
     weight_layout: int = 0,
+    do_finalize: bool = True,
     enable_pdl: Optional[bool] = None,
     tune_max_num_tokens: int = 8192,
-) -> torch.Tensor:
+) -> List[torch.Tensor]:
     """FP8 block scale MoE operation.
 
     Args:
@@ -2347,10 +2361,12 @@ def trtllm_fp8_block_scale_moe(
         weight_layout: Weight layout format (default: WeightLayout.MajorK). Supported layouts:
             - 0: MajorK - K-major layout [Mn, K]
             - 2: BlockMajorK - Blocked along K dimension [K/blockK, Mn, blockK]
+        do_finalize: Whether to finalize the output (default: True).
         enable_pdl: Whether to enable Programmatic Dependent Launch (PDL). Auto-enabled for >= sm90.
         tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 8192)
     Returns:
-        torch.Tensor: Output tensor of shape [seq_len, hidden_size]
+        List[torch.Tensor]: List of output tensors. If do_finalize=True, returns the final MoE output.
+            Otherwise, returns intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
     """
     output = torch.empty(
         hidden_states.shape, dtype=torch.bfloat16, device=hidden_states.device
@@ -2378,6 +2394,7 @@ def trtllm_fp8_block_scale_moe(
         routing_method_type,
         use_shuffled_weight,
         weight_layout,
+        do_finalize,
         enable_pdl,
         tune_max_num_tokens,
     )
@@ -2404,10 +2421,11 @@ def trtllm_fp8_block_scale_routed_moe(
     routing_method_type: int = 0,
     use_shuffled_weight: bool = False,
     weight_layout: int = 0,
+    do_finalize: bool = True,
     enable_pdl: Optional[bool] = None,
     output: Optional[torch.Tensor] = None,
     tune_max_num_tokens: int = 8192,
-) -> torch.Tensor:
+) -> List[torch.Tensor]:
     """FP8 block scale MoE operation with pre-computed routing (packed format).
 
     This function is used when routing decisions have already been computed
@@ -2438,11 +2456,13 @@ def trtllm_fp8_block_scale_routed_moe(
         use_shuffled_weight: Whether to use shuffled weights
         weight_layout: Weight layout (0 = MajorK, 1 = BlockMajorK)
         enable_pdl: Whether to enable Programmatic Dependent Launch (PDL). Auto-enabled for >= sm90.
+        do_finalize: Whether to finalize the output (default: True).
         output (Optional[torch.Tensor]): shape [seq_len, hidden_size]
             Optional inplace output tensor.
         tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 8192)
     Returns:
-        torch.Tensor: Output tensor of shape [seq_len, hidden_size]
+        List[torch.Tensor]: List of output tensors. If do_finalize=True, returns the final MoE output.
+            Otherwise, returns intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
     """
     return get_trtllm_moe_sm100_module().trtllm_fp8_block_scale_moe(
         None,  # routing_logits
@@ -2467,6 +2487,7 @@ def trtllm_fp8_block_scale_routed_moe(
         routing_method_type,
         use_shuffled_weight,
         weight_layout,
+        do_finalize,
         enable_pdl,
         tune_max_num_tokens,
     )
