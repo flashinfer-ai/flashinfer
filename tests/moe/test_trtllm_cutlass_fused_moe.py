@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 from contextlib import nullcontext
+from collections import namedtuple
 
 import pytest
 from flashinfer.fused_moe.core import ActivationType
@@ -330,29 +331,41 @@ def compute_with_experts(
 
 
 # Test configurations
-BATCH_SIZES = [
-    1,
+MoeConfig = namedtuple(
+    "MoeConfig",
+    [
+        "batch_size",
+        "hidden_size",
+        "num_experts",
+        "top_k",
+        "intermediate_size",
+    ],
+)
+
+SMALL_MOE_CONFIGS = [
+    MoeConfig(
+        batch_size=1, hidden_size=128, num_experts=2, top_k=2, intermediate_size=128
+    )
 ]
-HIDDEN_SIZES = [
-    128,
+
+FULL_MOE_CONFIGS = [
+    *SMALL_MOE_CONFIGS,
+    MoeConfig(
+        batch_size=2, hidden_size=1024, num_experts=64, top_k=4, intermediate_size=2048
+    ),
+    MoeConfig(
+        batch_size=2, hidden_size=2048, num_experts=128, top_k=6, intermediate_size=4096
+    ),
 ]
-NUM_EXPERTS = [2]
-TOP_K_VALUES = [2]
-INTERMEDIATE_SIZES = [
-    128,
-]
+
 EP_NUM_EXPERTS = [8]
-EP_TOP_K = [2]
 ACTIVATION_TYPES = [ActivationType.Swiglu, ActivationType.Relu2]
 ACTIVATION_TYPES_IDS = ["swiglu", "relu2"]
 
 
-@pytest.mark.parametrize("batch_size", BATCH_SIZES)
-@pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
-@pytest.mark.parametrize("num_experts", NUM_EXPERTS)
-@pytest.mark.parametrize("top_k", TOP_K_VALUES)
-@pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
-def test_moe(batch_size, hidden_size, num_experts, top_k, intermediate_size):
+@pytest.mark.parametrize("moe_config", SMALL_MOE_CONFIGS)
+def test_moe(moe_config):
+    batch_size, hidden_size, num_experts, top_k, intermediate_size = moe_config
     # Skip invalid configurations
     if top_k > num_experts:
         pytest.skip(
@@ -394,11 +407,7 @@ def test_moe(batch_size, hidden_size, num_experts, top_k, intermediate_size):
     torch.testing.assert_close(ref_output, flash_output[0], rtol=1e-2, atol=1e-2)
 
 
-@pytest.mark.parametrize("batch_size", BATCH_SIZES)
-@pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
-@pytest.mark.parametrize("num_experts", NUM_EXPERTS)
-@pytest.mark.parametrize("top_k", TOP_K_VALUES)
-@pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
+@pytest.mark.parametrize("moe_config", FULL_MOE_CONFIGS)
 @pytest.mark.parametrize(
     "activation_type",
     ACTIVATION_TYPES,
@@ -406,15 +415,12 @@ def test_moe(batch_size, hidden_size, num_experts, top_k, intermediate_size):
 )
 @pytest.mark.parametrize("otype, wtype", [(torch.float16, torch.float8_e4m3fn)])
 def test_moe_fp8(
-    batch_size,
-    hidden_size,
-    num_experts,
-    top_k,
-    intermediate_size,
+    moe_config,
     activation_type,
     otype,
     wtype,
 ):
+    batch_size, hidden_size, num_experts, top_k, intermediate_size = moe_config
     # Skip invalid configurations
     if top_k > num_experts:
         pytest.skip(
@@ -487,11 +493,7 @@ def test_moe_fp8(
     torch.testing.assert_close(ref_output, flash_output, rtol=1e-1, atol=1e-1)
 
 
-@pytest.mark.parametrize("batch_size", BATCH_SIZES)
-@pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
-@pytest.mark.parametrize("num_experts", NUM_EXPERTS)
-@pytest.mark.parametrize("top_k", TOP_K_VALUES)
-@pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
+@pytest.mark.parametrize("moe_config", FULL_MOE_CONFIGS)
 @pytest.mark.parametrize(
     "otype, wtype",
     [(torch.float16, torch.float8_e4m3fn), (torch.bfloat16, torch.float8_e4m3fn)],
@@ -507,16 +509,13 @@ def test_moe_fp8(
     reason="NVFP4 is only supported on SM100, SM110 and SM120",
 )
 def test_moe_nvfp4(
-    batch_size,
-    hidden_size,
-    num_experts,
-    top_k,
-    intermediate_size,
+    moe_config,
     otype,
     wtype,
     quantized_input,
     activation_type,
 ):
+    batch_size, hidden_size, num_experts, top_k, intermediate_size = moe_config
     # Skip invalid configurations
     if top_k > num_experts:
         pytest.skip(
@@ -657,31 +656,28 @@ def test_moe_nvfp4(
     torch.testing.assert_close(ref_output, flash_output, rtol=2e-1, atol=2e-1)
 
 
-@pytest.mark.parametrize("batch_size", BATCH_SIZES)
-@pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
-@pytest.mark.parametrize("num_experts", EP_NUM_EXPERTS)
-@pytest.mark.parametrize("top_k", EP_TOP_K)
-@pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
+@pytest.mark.parametrize("moe_config", FULL_MOE_CONFIGS)
 @pytest.mark.parametrize(
     "activation_type",
     ACTIVATION_TYPES,
     ids=ACTIVATION_TYPES_IDS,
 )
-def test_moe_expert_parallel(
-    batch_size, hidden_size, num_experts, top_k, intermediate_size, activation_type
-):
+def test_moe_expert_parallel(moe_config, activation_type):
     """
     Test expert parallelism with X GPUs and Y experts.
     Each GPU handles one expert and results are reduced.
 
     Args:
-        batch_size: Batch size for the input
-        hidden_size: Hidden dimension size
-        num_experts: Number of experts (must be 2 for this test)
-        top_k: Number of experts to route to per token
-        intermediate_size: Intermediate dimension size
+        moe_config: Configuration for the MoE layer, including:
+            batch_size: Batch size for the input
+            hidden_size: Hidden dimension size
+            num_experts: Number of experts (must be 2 for this test)
+            top_k: Number of experts to route to per token
+            intermediate_size: Intermediate dimension size
         activation: Activation function type
     """
+    batch_size, hidden_size, num_experts, top_k, intermediate_size = moe_config
+
     # This test is specifically for 2 GPUs and 2 experts
     # GPU 0 (ep_rank=0) handles expert 0
     # GPU 1 (ep_rank=1) handles expert 1
@@ -769,19 +765,14 @@ def test_moe_expert_parallel(
 TP_SIZES = [2, 4, 8]
 
 
-@pytest.mark.parametrize("batch_size", BATCH_SIZES)
-@pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
-@pytest.mark.parametrize("num_experts", NUM_EXPERTS)
+@pytest.mark.parametrize("moe_config", FULL_MOE_CONFIGS)
 @pytest.mark.parametrize("tp_size", TP_SIZES)
-@pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
 @pytest.mark.parametrize(
     "activation_type",
     ACTIVATION_TYPES,
     ids=ACTIVATION_TYPES_IDS,
 )
-def test_moe_tensor_parallel(
-    batch_size, hidden_size, num_experts, tp_size, intermediate_size, activation_type
-):
+def test_moe_tensor_parallel(moe_config, tp_size, activation_type):
     """
     Test tensor parallelism with:
     - w31 sharded along second dimension (non-contracting)
@@ -789,13 +780,17 @@ def test_moe_tensor_parallel(
     - All-reduce to sum partial results
 
     Args:
-        batch_size: Batch size for the input
-        hidden_size: Hidden dimension size
-        num_experts: Number of experts
-        top_k: Number of experts to route to per token
-        intermediate_size: Intermediate dimension size
+        moe_config: Configuration for the MoE layer, including:
+            batch_size: Batch size for the input
+            hidden_size: Hidden dimension size
+            num_experts: Number of experts
+            top_k: Number of experts to route to per token
+            intermediate_size: Intermediate dimension size
+        tp_size: Number of GPUs for tensor parallelism
         activation: Activation function type
     """
+    batch_size, hidden_size, num_experts, top_k, intermediate_size = moe_config
+
     # Set random seed for reproducibility
     torch.manual_seed(42)
     top_k = 2
@@ -897,24 +892,16 @@ def test_moe_tensor_parallel(
     torch.testing.assert_close(ref_output, flash_output, rtol=1e-2, atol=1e-2)
 
 
-@pytest.mark.parametrize("batch_size", BATCH_SIZES)
-@pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
-@pytest.mark.parametrize("num_experts", EP_NUM_EXPERTS)
-@pytest.mark.parametrize("top_k", EP_TOP_K)
+@pytest.mark.parametrize("moe_config", FULL_MOE_CONFIGS)
 @pytest.mark.parametrize("tp_size", TP_SIZES)
-@pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
 @pytest.mark.parametrize(
     "activation_type",
     ACTIVATION_TYPES,
     ids=ACTIVATION_TYPES_IDS,
 )
 def test_moe_tensor_expert_parallel(
-    batch_size,
-    hidden_size,
-    num_experts,
-    top_k,
+    moe_config,
     tp_size,
-    intermediate_size,
     activation_type,
 ):
     """
@@ -926,12 +913,16 @@ def test_moe_tensor_expert_parallel(
     - All-reduce to sum partial results
 
     Args:
-        batch_size: Batch size for the input
-        hidden_size: Hidden dimension size
-        num_experts: Number of experts
+        moe_config: Configuration for the MoE layer, including:
+            batch_size: Batch size for the input
+            hidden_size: Hidden dimension size
+            num_experts: Number of experts
+            tp_size: Number of GPUs for tensor parallelism
+            intermediate_size: Intermediate dimension size
         tp_size: Number of GPUs for tensor parallelism
-        intermediate_size: Intermediate dimension size
+        activation: Activation function type
     """
+    batch_size, hidden_size, num_experts, top_k, intermediate_size = moe_config
     torch.manual_seed(42)
     x = torch.randn(batch_size, hidden_size, dtype=torch.float16).cuda()
     w31_factor = 2 if activation_type == ActivationType.Swiglu else 1
@@ -1144,14 +1135,8 @@ def dequantize_block(
     return x_dequant.view(original_shape)
 
 
-@pytest.mark.parametrize("batch_size", BATCH_SIZES)
-@pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
-@pytest.mark.parametrize("num_experts", NUM_EXPERTS)
-@pytest.mark.parametrize("top_k", TOP_K_VALUES)
-@pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
-def test_moe_fp8_block_scaling(
-    batch_size, hidden_size, num_experts, top_k, intermediate_size
-):
+@pytest.mark.parametrize("moe_config", SMALL_MOE_CONFIGS)
+def test_moe_fp8_block_scaling(moe_config):
     """
     Test MoE with FP8 block scaling (Deepseek style):
     - Activation: BF16 (unquantized)
@@ -1159,12 +1144,15 @@ def test_moe_fp8_block_scaling(
     - Each block has its own scaling factor
 
     Args:
-        batch_size: Batch size for the input
-        hidden_size: Hidden dimension size
-        num_experts: Number of experts
-        top_k: Number of experts to route to per token
-        intermediate_size: Intermediate dimension size
+        moe_config: Configuration for the MoE layer, including:
+            batch_size: Batch size for the input
+            hidden_size: Hidden dimension size
+            num_experts: Number of experts
+            top_k: Number of experts to route to per token
+            intermediate_size: Intermediate dimension size
     """
+    batch_size, hidden_size, num_experts, top_k, intermediate_size = moe_config
+
     torch.manual_seed(42)
     otype = torch.bfloat16
 
@@ -1285,11 +1273,7 @@ def dequant_mxfp4_batches(
     )
 
 
-@pytest.mark.parametrize("batch_size", BATCH_SIZES)
-@pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
-@pytest.mark.parametrize("num_experts", NUM_EXPERTS)
-@pytest.mark.parametrize("top_k", TOP_K_VALUES)
-@pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
+@pytest.mark.parametrize("moe_config", SMALL_MOE_CONFIGS)
 @pytest.mark.parametrize("otype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize(
     ("alpha", "beta", "limit"), [(None, None, None), (0.5, 0.0, 7.0), (1.702, 1.0, 7.0)]
@@ -1299,11 +1283,7 @@ def dequant_mxfp4_batches(
     reason="MXFP8xMXFP4 is only supported on SM100, SM110 and SM120",
 )
 def test_moe_mxfp8_mxfp4(
-    batch_size,
-    hidden_size,
-    num_experts,
-    top_k,
-    intermediate_size,
+    moe_config,
     otype,
     alpha,
     beta,
@@ -1313,6 +1293,7 @@ def test_moe_mxfp8_mxfp4(
     Test MoE with MXFP8 activations and MXFP4 weights.
     Uses mxfp8_quantize for activations and fp4_quantize for weights.
     """
+    batch_size, hidden_size, num_experts, top_k, intermediate_size = moe_config
     # Skip invalid configurations
     if top_k > num_experts:
         pytest.skip(
@@ -1430,11 +1411,7 @@ def dequant_mxfp4_batches_host(
     )
 
 
-@pytest.mark.parametrize("batch_size", BATCH_SIZES)
-@pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
-@pytest.mark.parametrize("num_experts", NUM_EXPERTS)
-@pytest.mark.parametrize("top_k", TOP_K_VALUES)
-@pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
+@pytest.mark.parametrize("moe_config", SMALL_MOE_CONFIGS)
 @pytest.mark.parametrize(
     ("alpha", "beta", "limit"), [(None, None, None), (0.5, 0.0, 7.0), (1.702, 1.0, 7.0)]
 )
@@ -1443,11 +1420,7 @@ def dequant_mxfp4_batches_host(
     reason="BF16xMXFP4 is only supported on SM90",
 )
 def test_moe_bf16_mxfp4(
-    batch_size,
-    hidden_size,
-    num_experts,
-    top_k,
-    intermediate_size,
+    moe_config,
     alpha,
     beta,
     limit,
@@ -1456,6 +1429,7 @@ def test_moe_bf16_mxfp4(
     Test MoE with bf16 activations and MXFP4 weights.
     Uses bf16 for activations and fp4_quantize for weights.
     """
+    batch_size, hidden_size, num_experts, top_k, intermediate_size = moe_config
     # Skip invalid configurations
     if top_k > num_experts:
         pytest.skip(
@@ -1551,21 +1525,14 @@ def test_moe_bf16_mxfp4(
     torch.testing.assert_close(ref_output, flash_output, rtol=1e-1, atol=1e-1)
 
 
-@pytest.mark.parametrize("batch_size", BATCH_SIZES)
-@pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
-@pytest.mark.parametrize("num_experts", NUM_EXPERTS)
-@pytest.mark.parametrize("top_k", TOP_K_VALUES)
-@pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
+@pytest.mark.parametrize("moe_config", SMALL_MOE_CONFIGS)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_moe_w4a8(
-    batch_size: int,
-    hidden_size: int,
-    num_experts: int,
-    top_k: int,
-    intermediate_size: int,
+    moe_config,
     dtype: torch.dtype,
 ):
     """Test MoE with W4A8 quantization (INT4 weights, FP8 activations)."""
+    batch_size, hidden_size, num_experts, top_k, intermediate_size = moe_config
     if torch.cuda.get_device_capability()[0] != 9:
         pytest.skip("W4A8 is only supported on SM90")
     if top_k > num_experts:
