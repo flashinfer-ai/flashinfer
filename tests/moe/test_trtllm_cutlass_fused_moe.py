@@ -774,8 +774,13 @@ TP_SIZES = [2, 4]
 @pytest.mark.parametrize("num_experts", NUM_EXPERTS)
 @pytest.mark.parametrize("tp_size", TP_SIZES)
 @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
+@pytest.mark.parametrize(
+    "activation_type",
+    ACTIVATION_TYPES,
+    ids=ACTIVATION_TYPES_IDS,
+)
 def test_moe_tensor_parallel(
-    batch_size, hidden_size, num_experts, tp_size, intermediate_size
+    batch_size, hidden_size, num_experts, tp_size, intermediate_size, activation_type
 ):
     """
     Test tensor parallelism with:
@@ -798,9 +803,13 @@ def test_moe_tensor_parallel(
     x = torch.randn(batch_size, hidden_size, dtype=torch.float16).cuda()
 
     # Create weight tensors
+    w31_factor = 2 if activation_type == ActivationType.Swiglu else 1
     w31_weight = (
         torch.randn(
-            num_experts, 2 * intermediate_size, hidden_size, dtype=torch.float16
+            num_experts,
+            w31_factor * intermediate_size,
+            hidden_size,
+            dtype=torch.float16,
         ).cuda()
         / 10
     )
@@ -821,7 +830,13 @@ def test_moe_tensor_parallel(
 
     # Run reference implementation (no parallelism)
     ref_output = compute_with_experts(
-        num_experts, x, w31_weight, w2_weight, selected_experts, routing_weights
+        num_experts,
+        x,
+        w31_weight,
+        w2_weight,
+        selected_experts,
+        routing_weights,
+        activation_type=activation_type,
     )
 
     # Simulate tensor parallelism on # TP GPUs
@@ -830,25 +845,31 @@ def test_moe_tensor_parallel(
         # Create output tensor for this GPU
         out_hidden_states_local = torch.zeros_like(x)
 
-        # Shard w31 along second dimension (intermediate_size)
-        # First split w31 into w3 and w1
-        w3_weight, w1_weight = torch.chunk(
-            w31_weight, 2, dim=1
-        )  # [num_experts, intermediate_size, hidden_size] each
+        if activation_type == ActivationType.Swiglu:
+            # Shard w31 along second dimension (intermediate_size)
+            # First split w31 into w3 and w1
+            w3_weight, w1_weight = torch.chunk(
+                w31_weight, 2, dim=1
+            )  # [num_experts, intermediate_size, hidden_size] each
 
-        # Shard w3 and w1 separately
-        w3_shard_size = intermediate_size // tp_size
-        w3_start = tp_rank * w3_shard_size
-        w3_end = w3_start + w3_shard_size
-        w3_weight_local = w3_weight[:, w3_start:w3_end, :]
+            # Shard w3 and w1 separately
+            w3_shard_size = intermediate_size // tp_size
+            w3_start = tp_rank * w3_shard_size
+            w3_end = w3_start + w3_shard_size
+            w3_weight_local = w3_weight[:, w3_start:w3_end, :]
+        else:
+            w1_weight = w31_weight  # [num_experts, intermediate_size, hidden_size]
 
         w1_shard_size = intermediate_size // tp_size
         w1_start = tp_rank * w1_shard_size
         w1_end = w1_start + w1_shard_size
         w1_weight_local = w1_weight[:, w1_start:w1_end, :]
 
-        # Stack the sharded weights back together
-        w31_weight_local = torch.cat([w3_weight_local, w1_weight_local], dim=1)
+        if activation_type == ActivationType.Swiglu:
+            # Stack the sharded weights back together
+            w31_weight_local = torch.cat([w3_weight_local, w1_weight_local], dim=1)
+        else:
+            w31_weight_local = w1_weight_local
 
         # Shard w2 along third dimension (intermediate_size)
         w2_shard_size = intermediate_size // tp_size
@@ -867,6 +888,7 @@ def test_moe_tensor_parallel(
             tp_rank=tp_rank,
             quant_scales=None,
             output=out_hidden_states_local,
+            activation_type=activation_type,
         )
         outputs.append(out_hidden_states_local)
 
