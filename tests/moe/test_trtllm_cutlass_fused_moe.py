@@ -903,8 +903,19 @@ def test_moe_tensor_parallel(
 @pytest.mark.parametrize("top_k", EP_TOP_K)
 @pytest.mark.parametrize("tp_size", TP_SIZES)
 @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
+@pytest.mark.parametrize(
+    "activation_type",
+    ACTIVATION_TYPES,
+    ids=ACTIVATION_TYPES_IDS,
+)
 def test_moe_tensor_expert_parallel(
-    batch_size, hidden_size, num_experts, top_k, tp_size, intermediate_size
+    batch_size,
+    hidden_size,
+    num_experts,
+    top_k,
+    tp_size,
+    intermediate_size,
+    activation_type,
 ):
     """
     Test combined tensor parallelism and expert parallelism:
@@ -923,9 +934,13 @@ def test_moe_tensor_expert_parallel(
     """
     torch.manual_seed(42)
     x = torch.randn(batch_size, hidden_size, dtype=torch.float16).cuda()
+    w31_factor = 2 if activation_type == ActivationType.Swiglu else 1
     w31_weight = (
         torch.randn(
-            num_experts, 2 * intermediate_size, hidden_size, dtype=torch.float16
+            num_experts,
+            w31_factor * intermediate_size,
+            hidden_size,
+            dtype=torch.float16,
         ).cuda()
         / 10
     )
@@ -946,7 +961,13 @@ def test_moe_tensor_expert_parallel(
 
     # Run reference implementation (no parallelism)
     ref_output = compute_with_experts(
-        num_experts, x, w31_weight, w2_weight, selected_experts, routing_weights
+        num_experts,
+        x,
+        w31_weight,
+        w2_weight,
+        selected_experts,
+        routing_weights,
+        activation_type=activation_type,
     )
 
     # Simulate combined parallelism
@@ -963,7 +984,7 @@ def test_moe_tensor_expert_parallel(
         # Get expert weights for this rank
         w31_weight_ep = w31_weight[
             expert_start:expert_end, :
-        ]  # [experts_per_rank, 2*intermediate_size, hidden_size]
+        ]  # [experts_per_rank, w31_factor*intermediate_size, hidden_size]
         w2_weight_ep = w2_weight[
             expert_start:expert_end, :
         ]  # [experts_per_rank, hidden_size, intermediate_size]
@@ -973,22 +994,28 @@ def test_moe_tensor_expert_parallel(
             # Create output tensor for this GPU
             out_hidden_states_local = torch.zeros_like(x)
 
-            # Split w31 into w3 and w1
-            w3_weight, w1_weight = torch.chunk(w31_weight_ep, 2, dim=1)
+            if activation_type == ActivationType.Swiglu:
+                # Split w31 into w3 and w1
+                w3_weight, w1_weight = torch.chunk(w31_weight_ep, 2, dim=1)
 
-            # Shard w3 and w1 separately
-            w3_shard_size = intermediate_size // tp_size
-            w3_start = tp_rank * w3_shard_size
-            w3_end = w3_start + w3_shard_size
-            w3_weight_local = w3_weight[:, w3_start:w3_end, :]
+                # Shard w3 and w1 separately
+                w3_shard_size = intermediate_size // tp_size
+                w3_start = tp_rank * w3_shard_size
+                w3_end = w3_start + w3_shard_size
+                w3_weight_local = w3_weight[:, w3_start:w3_end, :]
+            else:
+                w1_weight = w31_weight_ep
 
             w1_shard_size = intermediate_size // tp_size
             w1_start = tp_rank * w1_shard_size
             w1_end = w1_start + w1_shard_size
             w1_weight_local = w1_weight[:, w1_start:w1_end, :]
 
-            # Stack the sharded weights back together
-            w31_weight_local = torch.cat([w3_weight_local, w1_weight_local], dim=1)
+            if activation_type == ActivationType.Swiglu:
+                # Stack the sharded weights back together
+                w31_weight_local = torch.cat([w3_weight_local, w1_weight_local], dim=1)
+            else:
+                w31_weight_local = w1_weight_local
 
             # Shard w2 along third dimension
             w2_shard_size = intermediate_size // tp_size
@@ -1009,6 +1036,7 @@ def test_moe_tensor_expert_parallel(
                 ep_size=ep_size,
                 ep_rank=ep_rank,
                 quant_scales=None,
+                activation_type=activation_type,
             )
             outputs.append(out_hidden_states_local[0])
 
@@ -1043,9 +1071,9 @@ def per_block_cast_to_fp8(
 def per_token_group_quant_fp8(x, group_size, eps=1e-10, dtype=torch.float8_e4m3fn):
     """Function to perform per-token-group quantization on an input tensor
     `x` using native torch."""
-    assert (
-        x.shape[-1] % group_size == 0
-    ), "the last dimension of `x` cannot be divisible by `group_size`"
+    assert x.shape[-1] % group_size == 0, (
+        "the last dimension of `x` cannot be divisible by `group_size`"
+    )
     assert x.is_contiguous(), "`x` is not contiguous"
 
     finfo = torch.finfo(dtype)
