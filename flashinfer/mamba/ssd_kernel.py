@@ -1860,13 +1860,12 @@ class SSDKernel:
 
                 # Batched processing over C dimension
                 for chunk_idx in cutlass.range(C, unroll=1):
+                    c_idx = chunk_idx
+                    c_off = 0
                     # Map logical chunk to physical chunk index and offset
                     if cutlass.const_expr(self.has_varlen):
                         c_idx = chunk_indices[chunk_idx]
                         c_off = chunk_offsets[chunk_idx]
-                    else:
-                        c_idx = chunk_idx
-                        c_off = 0
 
                     # Conditionally wait for B/Delta/B_TMEM buffer full/full/empty
                     b_pipeline.consumer_wait(b_consumer_state, peek_b_full_status)
@@ -1975,8 +1974,73 @@ class SSDKernel:
                         space=cute.arch.SharedSpace.shared_cta,
                     )
 
-                    # Async arrive INTER1_ACC/INTER2_P buffer empty/full
+                    # Async arrive INTER1_ACC buffer empty
                     inter1_acc_pipeline.consumer_release(inter1_acc_consumer_state)
+
+                    # --- Varlen look-ahead: store fstate / reload init_state ---
+                    if cutlass.const_expr(self.has_init_states and self.has_varlen):
+                        is_last_chunk = chunk_idx == C - 1
+                        seq_id = seq_idx[0, c_idx * L + c_off]
+                        seq_ends_here = is_last_chunk
+                        if not is_last_chunk:
+                            c_idx_next = chunk_indices[chunk_idx + 1]
+                            c_off_next = chunk_offsets[chunk_idx + 1]
+                            next_seq = seq_idx[0, c_idx_next * L + c_off_next]
+                            seq_ends_here = next_seq != seq_id
+
+                        # A. Store final state of ending sequence to gmem
+                        if seq_ends_here:
+                            if local_warp_idx == 0:
+                                bSG_gP_seq = bSG_gP_pre_slice[
+                                    (None, 0, 0, eh_idx, seq_id)
+                                ]
+                                cute.copy(
+                                    tma_atom_p,
+                                    bSG_sP[
+                                        (None, inter2_p_producer_state.index)
+                                    ],
+                                    bSG_gP_seq,
+                                )
+                            # All pre_inter warps must participate in pipeline ops
+                            tma_p_pipeline.producer_commit()
+                            tma_p_pipeline.producer_acquire()
+
+                        # B. Reload init_state for new sequence
+                        if seq_ends_here and not is_last_chunk:
+                            # Release old IS buffer, wait for new one from TMA warp
+                            init_states_pipeline.consumer_release(
+                                istate_consumer_state
+                            )
+                            istate_consumer_state.advance()
+                            init_states_pipeline.consumer_wait(
+                                istate_consumer_state
+                            )
+
+                            # Load new init_state: smem → tRS_rP → tState
+                            istate_coord = (
+                                None,
+                                None,
+                                None,
+                                istate_consumer_state.index,
+                            )
+                            cute.copy(
+                                tiled_s2r_p, tS2R_sP[istate_coord], tRS_rP
+                            )
+                            for reg_idx in range(cute.size(tRS_rP)):
+                                tState[reg_idx] = tRS_rP[reg_idx].to(
+                                    self.acc_dtype
+                                )
+
+                            # Overwrite same inter2_p smem slot with new init_state
+                            for reg_idx in range(cute.size(tState)):
+                                tRS_rP[reg_idx] = tState[reg_idx].to(
+                                    self.io_dtype
+                                )
+                            cute.copy(
+                                tiled_r2s_p, tRS_rP, tRS_sP[inter2_p_coord]
+                            )
+
+                    # Commit INTER2_P buffer full
                     # Last iteration consumer is PRE_INTER warp itself, not MMA_INTER warp
                     if inter2_p_producer_state.count < C:
                         inter2_p_pipeline.producer_commit(inter2_p_producer_state)
@@ -2018,10 +2082,20 @@ class SSDKernel:
 
                 if local_warp_idx == 0:
                     # TMA store P
+                    # For varlen, index by seq_id of last chunk; for non-varlen, use b_idx
+                    if cutlass.const_expr(self.has_init_states and self.has_varlen):
+                        last_c_idx = chunk_indices[C - 1]
+                        last_c_off = chunk_offsets[C - 1]
+                        seq_id = seq_idx[0, last_c_idx * L + last_c_off]
+                        bSG_gP_final = bSG_gP_pre_slice[
+                            (None, 0, 0, eh_idx, seq_id)
+                        ]
+                    else:
+                        bSG_gP_final = bSG_gP
                     cute.copy(
                         tma_atom_p,
                         bSG_sP[(None, inter2_p_producer_state.index)],
-                        bSG_gP,
+                        bSG_gP_final,
                     )
                     # Wait for TMA store done
                     tma_p_pipeline.producer_commit()
