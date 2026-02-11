@@ -1479,14 +1479,14 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
   }
 };
 
-Tensor trtllm_bf16_moe(TensorView const& routing_logits, Optional<TensorView> const& routing_bias,
+Array<Tensor> trtllm_bf16_moe(TensorView const& routing_logits, Optional<TensorView> const& routing_bias,
                        TensorView const& hidden_states, TensorView const& gemm1_weights,
                        TensorView const& gemm2_weights, int64_t num_experts, int64_t top_k,
                        Optional<int64_t> n_group, Optional<int64_t> topk_group,
                        int64_t intermediate_size, int64_t local_expert_offset,
                        int64_t local_num_experts, Optional<double> routed_scaling_factor,
                        int64_t routing_method_type, bool use_shuffled_weight, int64_t weight_layout,
-                       bool enable_pdl, Array<int64_t> moe_tactic) {
+                       bool do_finalize, bool enable_pdl, Array<int64_t> moe_tactic) {
   // Just some basic type validation first and leave more checks to the launcher
   TVM_FFI_ICHECK(routing_logits.dtype() == dl_float32 || routing_logits.dtype() == dl_bfloat16)
       << "BF16 MoE: routing_logits must be bfloat16 or float.";
@@ -1523,6 +1523,7 @@ Tensor trtllm_bf16_moe(TensorView const& routing_logits, Optional<TensorView> co
     args->local_expert_offset = local_expert_offset;
     args->local_num_experts = local_num_experts;
     args->intermediate_size = intermediate_size;
+    args->do_finalize = do_finalize;
 
     // Create and initialize launcher for this tile size
     auto launcher = std::make_unique<Bf16MoeLauncher>(routing_logits, routing_bias, hidden_states,
@@ -1546,7 +1547,7 @@ Tensor trtllm_bf16_moe(TensorView const& routing_logits, Optional<TensorView> co
   auto& selected_launcher = launchers_map.at(tile_N);
 
   // Run the launcher - it will create its own runner internally
-  auto result = selected_launcher->run(config, enable_pdl)[0];
+  auto result = selected_launcher->run(config, enable_pdl);
   return result;
 }
 
