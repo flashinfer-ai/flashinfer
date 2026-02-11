@@ -3907,6 +3907,7 @@ def trtllm_fmha_v2_prefill(
     chunked_attention_size: Optional[int] = 0,
     non_blocking: Optional[bool] = True,
     save_softmax_stats: Optional[bool] = False,
+    skip_softmax_threshold_scale_factor: Optional[float] = 0,
 ) -> torch.Tensor:
     r"""TRT-LLM FMHAv2 prefill attention.
 
@@ -3976,7 +3977,11 @@ def trtllm_fmha_v2_prefill(
         Whether to copy the input tensors to the device asynchronously. Defaults to ``True``.
     save_softmax_stats : Optional[bool]
         Whether to save the softmax statistics. Defaults to ``False``.
-
+    skip_softmax_threshold_scale_factor: Optional[float]
+        The factor of skip-softmax (Sparse Attention),
+        Skip softmax and BMM2 when exp(local_max - global_max) < threshold,
+        where threshold = skip_softmax_threshold_scale_factor / seqlen.
+        0 means disabling it.
     Returns
     -------
     Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -4163,6 +4168,7 @@ def trtllm_fmha_v2_prefill(
         chunked_attention_size,  # Chunked attention size
         pos_encoding_mode == "ALIBI",  # Alibi mode
         softcapping_scale,  # Softcapping scale (0.0 = disabled)
+        skip_softmax_threshold_scale_factor,  # 0.0 = disable
         scale_bmm2_d,  # Pre-populated scale_bmm2 on device (avoids cudaMemcpy)
         lse,  # Optional LSE tensor (None if not saving softmax stats)
         sinks,  # Optional sinks tensor

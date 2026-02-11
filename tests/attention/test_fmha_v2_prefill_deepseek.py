@@ -327,6 +327,7 @@ def test_fmha_v2_prefill_deepseek(
     [
         (torch.float16, torch.float16),
         (torch.bfloat16, torch.bfloat16),
+        (torch.float8_e4m3fn, torch.float8_e4m3fn),
         (torch.float8_e4m3fn, torch.bfloat16),
         (torch.float8_e4m3fn, torch.float16),
     ],
@@ -354,6 +355,7 @@ def test_fmha_v2_prefill_deepseek(
 @pytest.mark.parametrize("non_blocking", [True, False])
 @pytest.mark.parametrize("pos_encoding_mode", ["NONE"])
 @pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
+@pytest.mark.parametrize("skip_softmax_threshold_scale_factor", [0, 1000])
 def test_trtllm_fmha_v2_prefill(
     input_layout,
     batch_size,
@@ -371,6 +373,7 @@ def test_trtllm_fmha_v2_prefill(
     logits_soft_cap,
     pos_encoding_mode,
     save_softmax_stats,
+    skip_softmax_threshold_scale_factor,
 ):
     from flashinfer.prefill import trtllm_fmha_v2_prefill
     from flashinfer.utils import is_sm90a_supported
@@ -571,6 +574,7 @@ def test_trtllm_fmha_v2_prefill(
         window_left=window_left,
         non_blocking=non_blocking,
         logits_soft_cap_scale=logits_soft_cap if logits_soft_cap > 0 else None,
+        skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
         pos_encoding_mode=pos_encoding_mode,
         save_softmax_stats=save_softmax_stats,
     )
