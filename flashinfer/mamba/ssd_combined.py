@@ -313,9 +313,11 @@ class _SSDKernel:
             from_dlpack,
         )
 
-        # fstate: (headdim, dstate, nheads, batch)
+        # fstate: (headdim, dstate, nheads, batch_or_num_seqs)
+        # For varlen, kernel indexes by seq_id so dim 0 must be num_seqs
+        fstate_batch = init_states.shape[0] if init_states is not None else batch
         fstate_tensor, fstate_cutlass = _create_cutlass_tensor(
-            [batch, nheads, headdim, dstate],
+            [fstate_batch, nheads, headdim, dstate],
             [3, 2, 1, 0],
             self.io_dtype,
             [2, 3],
@@ -334,7 +336,7 @@ class _SSDKernel:
         chunk_indices_tensor = None
         chunk_offsets_tensor = None
         if seq_idx is not None:
-            seq_idx_tensor = from_dlpack(seq_idx.contiguous(), assumed_align=4)
+            seq_idx_tensor = from_dlpack(seq_idx, assumed_align=4)
         if chunk_indices is not None:
             chunk_indices_tensor = from_dlpack(chunk_indices, assumed_align=4)
         if chunk_offsets is not None:

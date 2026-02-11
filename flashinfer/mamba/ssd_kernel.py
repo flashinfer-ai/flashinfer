@@ -378,7 +378,7 @@ class SSDKernel:
         init_states: cute.Tensor,   # (D, N, EH, B) - D stride 1 (optional)
         fstate: cute.Tensor,        # (D, N, EH, B) - D stride 1 (output)
         d: cute.Tensor,             # (D, EH) or (1, EH) (optional)
-        seq_idx: cute.Tensor,        # (seqlen, batch) int32 (optional)
+        seq_idx: cute.Tensor,        # (batch, seqlen) int32 (optional)
         chunk_indices: cute.Tensor,  # (num_logical_chunks,) int32 (optional)
         chunk_offsets: cute.Tensor,  # (num_logical_chunks,) int32 (optional)
         max_active_clusters: cutlass.Constexpr,
@@ -708,7 +708,7 @@ class SSDKernel:
         tma_tensor_d: cute.Tensor,
         tma_atom_initial_states: Optional[cute.CopyAtom],
         tma_tensor_initial_states: cute.Tensor,
-        seq_idx: cute.Tensor,         # (seqlen, batch) int32 or None
+        seq_idx: cute.Tensor,         # (batch, seqlen) int32 or None
         chunk_indices: cute.Tensor,   # (num_logical_chunks,) int32 or None
         chunk_offsets: cute.Tensor,   # (num_logical_chunks,) int32 or None
         cluster_layout_vmnk: cute.Layout,
@@ -1018,7 +1018,7 @@ class SSDKernel:
                     if cutlass.const_expr(self.has_varlen):
                         c_idx_0 = chunk_indices[0]
                         c_off_0 = chunk_offsets[0]
-                        first_seq_id = seq_idx[c_idx_0 * L + c_off_0, 0]
+                        first_seq_id = seq_idx[0, c_idx_0 * L + c_off_0]
                     else:
                         first_seq_id = b_idx
                     tIstategIstate = tIstategIstate_pre_slice[
@@ -1056,30 +1056,29 @@ class SSDKernel:
                 # Batched load over C dimension
                 for chunk_idx in cutlass.range(C, unroll=1):
                     # Map logical chunk to physical chunk (c_idx)
+                    c_idx = x_producer_state.count
                     if cutlass.const_expr(self.has_varlen):
                         c_idx = chunk_indices[x_producer_state.count]
-                    else:
-                        c_idx = x_producer_state.count
 
-                    # # Load init_states on sequence transitions
-                    # if cutlass.const_expr(self.has_init_states and self.has_varlen):
-                    #     c_off = chunk_offsets[x_producer_state.count]
-                    #     seq_id = seq_idx[c_idx * L + c_off, 0]
-                    #     if seq_id != prev_seq_id:
-                    #         tIstategIstate = tIstategIstate_pre_slice[
-                    #             None, 0, 0, eh_idx, seq_id
-                    #         ]
-                    #         init_states_pipeline.producer_acquire(istate_producer_state)
-                    #         cute.copy(
-                    #             tma_atom_initial_states,
-                    #             tIstategIstate,
-                    #             tIstatesIstate[None, istate_producer_state.index],
-                    #             tma_bar_ptr=init_states_pipeline.producer_get_barrier(
-                    #                 istate_producer_state
-                    #             ),
-                    #         )
-                    #         istate_producer_state.advance()
-                    #         prev_seq_id = seq_id
+                    # Load init_states on sequence transitions
+                    if cutlass.const_expr(self.has_init_states and self.has_varlen):
+                        c_off = chunk_offsets[x_producer_state.count]
+                        seq_id = seq_idx[0, c_idx * L + c_off]
+                        if seq_id != prev_seq_id:
+                            tIstategIstate = tIstategIstate_pre_slice[
+                                None, 0, 0, eh_idx, seq_id
+                            ]
+                            init_states_pipeline.producer_acquire(istate_producer_state)
+                            cute.copy(
+                                tma_atom_initial_states,
+                                tIstategIstate,
+                                tIstatesIstate[None, istate_producer_state.index],
+                                tma_bar_ptr=init_states_pipeline.producer_get_barrier(
+                                    istate_producer_state
+                                ),
+                            )
+                            istate_producer_state.advance()
+                            prev_seq_id = seq_id
 
                     # Conditionally wait for X buffer empty
                     x_pipeline.producer_acquire(x_producer_state, peek_x_empty_status)
@@ -1819,16 +1818,6 @@ class SSDKernel:
 
                     for reg_idx in range(cute.size(tRS_rP)):
                         tState[reg_idx] = tRS_rP[reg_idx].to(self.acc_dtype)
-
-                    # # Track current sequence for transition detection
-                    # if cutlass.const_expr(self.has_varlen):
-                    #     c_idx_0 = chunk_indices[0]
-                    #     c_off_0 = chunk_offsets[0]
-                    #     prev_seq_id = seq_idx[c_idx_0 * L + c_off_0, 0]
-
-                    # We're not gonna release the pipeline here to
-                    # prevent overwriting smem_p by another batch of
-                    # init states
                 else:
                     tState.fill(0.0)
 
@@ -1878,40 +1867,6 @@ class SSDKernel:
                     else:
                         c_idx = chunk_idx
                         c_off = 0
-
-                    # # Reload init_states on sequence transitions
-                    # if cutlass.const_expr(self.has_init_states and self.has_varlen):
-                    #     seq_id = seq_idx[c_idx * L + c_off, 0]
-                    #     if seq_id != prev_seq_id:
-                    #         # Release old init_states buffer, wait for new one
-                    #         init_states_pipeline.consumer_release(istate_consumer_state)
-                    #         istate_consumer_state.advance()
-                    #         init_states_pipeline.consumer_wait(istate_consumer_state)
-                    #
-                    #         istate_coord = (None, None, None, istate_consumer_state.index)
-                    #         cute.copy(tiled_s2r_p, tS2R_sP[istate_coord], tRS_rP)
-                    #
-                    #         for reg_idx in range(cute.size(tRS_rP)):
-                    #             tState[reg_idx] = tRS_rP[reg_idx].to(self.acc_dtype)
-                    #
-                    #         prev_seq_id = seq_id
-                    #
-                    #         # Re-emit INTER2_P with new init_state so intra-chunk
-                    #         # path picks up the correct state.
-                    #         # INTER2_P was already advanced past this slot in the
-                    #         # previous iteration, so we need to wait for it to be
-                    #         # consumed, then overwrite.
-                    #         inter2_p_pipeline.producer_acquire(inter2_p_producer_state)
-                    #         for reg_idx in range(cute.size(tState)):
-                    #             tRS_rP[reg_idx] = tState[reg_idx].to(self.io_dtype)
-                    #         inter2_p_coord = (None, None, None, inter2_p_producer_state.index)
-                    #         cute.copy(tiled_r2s_p, tRS_rP, tRS_sP[inter2_p_coord])
-                    #         cute.arch.fence_proxy(
-                    #             cute.arch.ProxyKind.async_shared,
-                    #             space=cute.arch.SharedSpace.shared_cta,
-                    #         )
-                    #         inter2_p_pipeline.producer_commit(inter2_p_producer_state)
-                    #         inter2_p_producer_state.advance()
 
                     # Conditionally wait for B/Delta/B_TMEM buffer full/full/empty
                     b_pipeline.consumer_wait(b_consumer_state, peek_b_full_status)

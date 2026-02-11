@@ -822,7 +822,6 @@ class TestChunkScanCombinedVarlen:
         ref = self._compute_per_sequence_reference(inputs)
         self._run_and_check(inputs, ref, "Varlen constant-seqlen")
 
-    @pytest.mark.xfail(raises=AssertionError, reason="init_states reload not yet implemented (step 5.1)")
     def test_variable_seqlen(self, nheads, headdim, dstate, chunk_size, ngroups):
         """Multiple sequences with variable chunk-aligned lengths."""
         inputs = self._make_inputs(nheads, headdim, dstate, chunk_size, ngroups,
