@@ -342,6 +342,9 @@ class _SSDKernel:
         if chunk_offsets is not None:
             chunk_offsets_tensor = from_dlpack(chunk_offsets, assumed_align=4)
 
+        # Number of logical chunks (may differ from physical chunks for varlen)
+        num_logical_chunks = len(chunk_indices) if chunk_indices is not None else nchunks
+
         # Compile kernel if not already done
         if self._compiled_kernel is None:
             self._compiled_kernel = cute.compile(
@@ -358,6 +361,7 @@ class _SSDKernel:
                 seq_idx_tensor,
                 chunk_indices_tensor,
                 chunk_offsets_tensor,
+                num_logical_chunks,
                 max_active_clusters,
                 stream,
             )
@@ -376,6 +380,7 @@ class _SSDKernel:
             seq_idx_tensor,
             chunk_indices_tensor,
             chunk_offsets_tensor,
+            num_logical_chunks,
             stream,
         )
 

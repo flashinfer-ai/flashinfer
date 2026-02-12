@@ -381,6 +381,7 @@ class SSDKernel:
         seq_idx: cute.Tensor,        # (batch, seqlen) int32 (optional)
         chunk_indices: cute.Tensor,  # (num_logical_chunks,) int32 (optional)
         chunk_offsets: cute.Tensor,  # (num_logical_chunks,) int32 (optional)
+        num_logical_chunks: cutlass.Int32,  # len(chunk_indices), or 0 if no varlen
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
@@ -660,6 +661,7 @@ class SSDKernel:
             seq_idx,
             chunk_indices,
             chunk_offsets,
+            num_logical_chunks,
             self.cluster_layout_vmnk,
             self.x_smem_layout,
             self.xt_smem_layout,
@@ -711,6 +713,7 @@ class SSDKernel:
         seq_idx: cute.Tensor,         # (batch, seqlen) int32 or None
         chunk_indices: cute.Tensor,   # (num_logical_chunks,) int32 or None
         chunk_offsets: cute.Tensor,   # (num_logical_chunks,) int32 or None
+        num_logical_chunks: cutlass.Int32,  # len(chunk_indices), or 0 if no varlen
         cluster_layout_vmnk: cute.Layout,
         x_smem_layout: cute.ComposedLayout,
         xt_smem_layout: cute.ComposedLayout,
@@ -753,7 +756,7 @@ class SSDKernel:
         L = cute.size(tma_tensor_x, mode=[1])
         N = cute.size(tma_tensor_b, mode=[1])
         # Dynamic values
-        C = cute.size(tma_tensor_x, mode=[2])
+        C = num_logical_chunks
         EH = cute.size(tma_tensor_x, mode=[3])
         B = cute.size(tma_tensor_x, mode=[4])
         G = cute.size(tma_tensor_b, mode=[3])
@@ -1899,14 +1902,22 @@ class SSDKernel:
                         smem_cumsum_delta.shape[0] - 1, deltas_consumer_state.index
                     ]
 
-                    # Adjust last_column for chunk offset boundary
-                    # When c_off > 0, the logical chunk starts mid-physical-chunk,
-                    # so dA_cumsum values must be relative to the sequence start.
-                    if c_off > 0:
-                        dA_cs_boundary = smem_cumsum_delta[
-                            c_off - 1, deltas_consumer_state.index
-                        ]
-                        last_column = last_column - dA_cs_boundary
+                    # Step 4.2: compute chunk_size_limit and adjust
+                    # last_column for shared physical chunks.
+                    # When two logical chunks share a physical chunk,
+                    # last_column must point to the end of the current
+                    # sequence's range, not the full physical chunk.
+                    if cutlass.const_expr(self.has_varlen):
+                        chunk_size_limit = L
+                        if chunk_idx + 1 < C:
+                            c_idx_next = chunk_indices[chunk_idx + 1]
+                            if c_idx_next == c_idx:
+                                chunk_size_limit = chunk_offsets[chunk_idx + 1]
+                        if chunk_size_limit < L:
+                            last_column = smem_cumsum_delta[
+                                chunk_size_limit - 1,
+                                deltas_consumer_state.index,
+                            ]
 
                     # Fence for shared memory
                     cute.arch.fence_proxy(
@@ -1915,27 +1926,34 @@ class SSDKernel:
                     )
 
                     # Combine B/Delta/DeltaA/last_column
+                    # Note: B scaling uses last_column BEFORE the c_off
+                    # adjustment, so exp(last_column - dA_cs[i]) uses the
+                    # raw cumsum range. The c_off adjustment is only for
+                    # the state recurrence (exp(last_column) * old_state).
                     tScaledB = self.pre_inter_scale_bt_with_delta(
                         tBrB_s2r, tBrDelta_r2s, tBrDeltaA_r2s, last_column
                     )
 
-                    # Mask scaled B beyond chunk_size_limit (step 4.2)
-                    # When two logical chunks share a physical chunk, zero
-                    # out positions belonging to the next sequence so they
-                    # don't contaminate INTER1's chunk state computation.
+                    # Adjust last_column for chunk offset boundary AFTER
+                    # B scaling. The state recurrence needs last_column
+                    # relative to the sequence start within the chunk.
+                    if c_off > 0:
+                        dA_cs_boundary = smem_cumsum_delta[
+                            c_off - 1, deltas_consumer_state.index
+                        ]
+                        last_column = last_column - dA_cs_boundary
+
+                    # Step 4.2: mask scaled B outside [c_off, chunk_size_limit).
+                    # Zero out positions belonging to other sequences
+                    # so they don't contaminate INTER1's chunk state.
                     if cutlass.const_expr(self.has_varlen):
-                        chunk_size_limit = L
-                        if chunk_idx + 1 < C:
-                            c_idx_next = chunk_indices[chunk_idx + 1]
-                            if c_idx_next == c_idx:
-                                chunk_size_limit = chunk_offsets[chunk_idx + 1]
-                        if chunk_size_limit < L:
+                        if chunk_size_limit < L or c_off > 0:
                             for reg_idx in cutlass.range(
                                 cute.size(tScaledB), unroll_full=True
                             ):
                                 coord = tBCoord[reg_idx]
                                 l_coord = coord[1]
-                                if l_coord >= chunk_size_limit:
+                                if l_coord >= chunk_size_limit or l_coord < c_off:
                                     tScaledB[reg_idx] = 0.0
 
                     # Store scaled B to tBrB_r2s
@@ -2509,6 +2527,11 @@ class SSDKernel:
                     if cutlass.const_expr(self.has_varlen):
                         c_idx = chunk_indices[chunk_idx]
                         c_off = chunk_offsets[chunk_idx]
+                        chunk_size_limit = L
+                        if chunk_idx + 1 < C:
+                            c_idx_next = chunk_indices[chunk_idx + 1]
+                            if c_idx_next == c_idx:
+                                chunk_size_limit = chunk_offsets[chunk_idx + 1]
                     else:
                         c_idx = chunk_idx
                         c_off = 0

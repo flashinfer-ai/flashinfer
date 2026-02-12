@@ -841,7 +841,7 @@ class TestChunkScanCombinedVarlenNonAligned:
     ATOL = 7e-2
     RTOL = 7e-2
 
-    @pytest.mark.xfail(raises=AssertionError, reason="CuTe kernel does not yet handle mid-chunk sequence boundaries (steps 4.2 + 5.2)")
+    @pytest.mark.xfail(raises=AssertionError, reason="Epilog Y store overwrites: shared physical chunks need masked write (step 4.2 states are correct)")
     def test_output_correctness(self):
         """Test CuTe kernel with non-chunk-aligned varlen sequences."""
         nheads, headdim, dstate, chunk_size, ngroups = 8, 64, 128, 128, 8
@@ -868,7 +868,51 @@ class TestChunkScanCombinedVarlenNonAligned:
             chunk_offsets=inputs["chunk_offsets"],
         )
 
-        out_match = torch.allclose(out_ref.to(out_test.dtype), out_test, atol=self.ATOL, rtol=self.RTOL)
-        states_match = torch.allclose(final_states_ref.to(final_states_test.dtype), final_states_test, atol=self.ATOL, rtol=self.RTOL)
-        assert out_match, "Varlen non-aligned: output mismatch"
+        out_ref_cmp = out_ref.to(out_test.dtype)
+        out_match = torch.allclose(out_ref_cmp, out_test, atol=self.ATOL, rtol=self.RTOL)
+        if not out_match:
+            diff = (out_ref_cmp - out_test).abs()
+            mm = ~torch.isclose(out_ref_cmp, out_test, atol=self.ATOL, rtol=self.RTOL)
+            n = mm.sum().item()
+            total = out_ref_cmp.numel()
+            print(f"\nOutput mismatch: {n}/{total} ({100*n/total:.2f}%), max_diff={diff.max():.6f}")
+            print(f"  has_inf={torch.isinf(out_test).any()}, has_nan={torch.isnan(out_test).any()}")
+            # Per-sequence breakdown
+            cu = [0] + list(np.cumsum(seq_lengths))
+            for i in range(len(seq_lengths)):
+                s, e = cu[i], cu[i+1]
+                seq_mm = mm[0, s:e]
+                seq_n = seq_mm.sum().item()
+                seq_tot = seq_mm.numel()
+                seq_diff = diff[0, s:e]
+                print(f"  Seq {i} [{s}:{e}]: {seq_n}/{seq_tot} ({100*seq_n/seq_tot:.2f}%), max_diff={seq_diff.max():.6f}")
+            idxs = torch.nonzero(mm)
+            for idx in idxs[:10]:
+                t = tuple(idx.tolist())
+                print(f"  {t}: ref={out_ref_cmp[t]:.6f}, test={out_test[t]:.6f}, diff={diff[t]:.6f}")
+
+        fs_ref_cmp = final_states_ref.to(final_states_test.dtype)
+        states_match = torch.allclose(fs_ref_cmp, final_states_test, atol=self.ATOL, rtol=self.RTOL)
+        # Always print per-seq final states summary
+        fs_diff_all = (fs_ref_cmp - final_states_test).abs()
+        for seq_i in range(final_states_test.shape[0]):
+            fs_mm_i = ~torch.isclose(fs_ref_cmp[seq_i], final_states_test[seq_i], atol=self.ATOL, rtol=self.RTOL)
+            fs_n_i = fs_mm_i.sum().item()
+            fs_tot_i = fs_mm_i.numel()
+            print(f"Final states seq {seq_i}: {fs_n_i}/{fs_tot_i} ({100*fs_n_i/fs_tot_i:.2f}%) mismatch, max_diff={fs_diff_all[seq_i].max():.6f}")
+        if not states_match:
+            fs_diff = (fs_ref_cmp - final_states_test).abs()
+            fs_mm = ~torch.isclose(fs_ref_cmp, final_states_test, atol=self.ATOL, rtol=self.RTOL)
+            fs_n = fs_mm.sum().item()
+            fs_total = fs_ref_cmp.numel()
+            print(f"\nFinal states mismatch: {fs_n}/{fs_total} ({100*fs_n/fs_total:.2f}%), max_diff={fs_diff.max():.6f}")
+            print(f"  has_inf={torch.isinf(final_states_test).any()}, has_nan={torch.isnan(final_states_test).any()}")
+            for seq_i in range(final_states_test.shape[0]):
+                seq_fs_mm = fs_mm[seq_i]
+                seq_fs_n = seq_fs_mm.sum().item()
+                seq_fs_tot = seq_fs_mm.numel()
+                seq_fs_diff = fs_diff[seq_i]
+                print(f"  Seq {seq_i}: {seq_fs_n}/{seq_fs_tot} ({100*seq_fs_n/seq_fs_tot:.2f}%), max_diff={seq_fs_diff.max():.6f}")
+
         assert states_match, "Varlen non-aligned: final states mismatch"
+        assert out_match, "Varlen non-aligned: output mismatch"
