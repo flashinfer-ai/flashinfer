@@ -17,9 +17,11 @@ limitations under the License.
 import ctypes
 import hashlib
 import os
+import pathlib
 from urllib.parse import urljoin
 import shutil
 import time
+from typing import Union
 import uuid
 
 import filelock
@@ -240,8 +242,14 @@ def get_cubin(file_name: str, sha256: str, session=None) -> bytes:
 
 
 def download_trtllm_headers(
-    op: str, header_dest_dir: str, header_path: str, artifact_path: str, checksum: bytes
+    op: str,
+    header_dest_dir: Union[str, pathlib.Path],
+    header_path: str,
+    artifact_path: str,
+    checksum: bytes,
 ):
+    header_dest_dir = pathlib.Path(header_dest_dir)
+
     if op == "bmm":
         header_files = [
             "BatchedGemmEnums.h",
@@ -280,10 +288,10 @@ def download_trtllm_headers(
             "trtllm/gen/CudaArchDecl.h",
         ]
 
-    artifact_hash_path = os.path.join(header_dest_dir, ".artifact_hash")
+    artifact_hash_path = header_dest_dir / ".artifact_hash"
 
     # Check if cached headers are from a different artifact version (e.g. after git checkout)
-    if os.path.exists(artifact_hash_path):
+    if artifact_hash_path.exists():
         with open(artifact_hash_path, "r") as f:
             cached_hash = f.read().strip()
         if cached_hash != artifact_path:
@@ -299,7 +307,7 @@ def download_trtllm_headers(
     for file in header_files:
         uri_path = f"{header_path}/{file}"
         file_hash = get_meta_hash(checksum, file)
-        file_path = str(header_dest_dir) + "/" + file
+        file_path = str(header_dest_dir / file)
         result = get_file(uri_path, file_hash, file_path)
         assert result, f"{file} not found"
 
