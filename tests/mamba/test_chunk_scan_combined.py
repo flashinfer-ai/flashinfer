@@ -287,7 +287,6 @@ class TestChunkScanCombined:
         assert out_match, "Output mismatch between CUTLASS and Triton"
         assert states_match, "Final states mismatch between CUTLASS and Triton"
 
-
 class TestChunkScanCombinedNoD(TestChunkScanCombined):
     """Test chunk scan without D scaling."""
 
@@ -1258,3 +1257,37 @@ class TestChunkScanCombinedWithZVarlen:
         out_packed = torch.cat(out_parts, dim=1)
         final_states_packed = torch.cat(final_states_list, dim=0)
         return out_packed, final_states_packed
+
+
+def test_preallocated_output():
+    """Test that passing a pre-allocated output tensor works correctly."""
+    torch.manual_seed(42)
+    batch, seqlen, nheads, headdim = 1, 128, 8, 64
+    ngroups, dstate, chunk_size = 8, 128, 128
+    dtype = torch.bfloat16
+
+    x = torch.randn(batch, seqlen, nheads, headdim, dtype=dtype, device="cuda")
+    dt = torch.randn(batch, seqlen, nheads, dtype=torch.float32, device="cuda")
+    A = -torch.rand(nheads, dtype=torch.float32, device="cuda") - 1.0
+    B = torch.randn(batch, seqlen, ngroups, dstate, dtype=dtype, device="cuda")
+    C = torch.randn(batch, seqlen, ngroups, dstate, dtype=dtype, device="cuda")
+    D = torch.randn(nheads, dtype=dtype, device="cuda")
+    dt_bias = torch.rand(nheads, dtype=torch.float32, device="cuda") - 4.0
+
+    # Run without pre-allocated output
+    out_ref, _ = ssd_combined_fwd(
+        x, dt, A, B, C, chunk_size, D=D, dt_bias=dt_bias, dt_softplus=True,
+    )
+
+    # Run with pre-allocated output
+    out = torch.empty(batch, seqlen, nheads, headdim, dtype=dtype, device="cuda")
+    out_test, _ = ssd_combined_fwd(
+        x, dt, A, B, C, chunk_size, D=D, dt_bias=dt_bias, dt_softplus=True, out=out,
+    )
+
+    assert out_test.data_ptr() == out.data_ptr(), (
+        "Returned tensor should be the same object as the pre-allocated output"
+    )
+    assert torch.allclose(out_ref, out_test, atol=7e-2, rtol=7e-2), (
+        "Pre-allocated output values don't match non-pre-allocated run"
+    )

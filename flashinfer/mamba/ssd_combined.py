@@ -465,6 +465,7 @@ def ssd_combined_fwd(
     chunk_indices: Optional[torch.Tensor] = None,
     chunk_offsets: Optional[torch.Tensor] = None,
     cu_seqlens: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     SSD (Structured State-Space Duality) combined forward pass for Mamba2.
@@ -509,6 +510,10 @@ def ssd_combined_fwd(
         Required together with chunk_indices when seq_idx and initial_states are provided.
     cu_seqlens : torch.Tensor, optional
         Cumulative sequence lengths (num_seqs + 1,) for variable-length batching.
+    out : torch.Tensor, optional
+        Pre-allocated output tensor with shape (batch, seqlen, nheads, headdim).
+        Must be contiguous and have the same dtype as x. If None, a new tensor
+        is allocated internally.
 
     Returns
     -------
@@ -562,6 +567,21 @@ def ssd_combined_fwd(
             f"chunk_indices and chunk_offsets must have the same shape, "
             f"got {chunk_indices.shape} vs {chunk_offsets.shape}"
         )
+
+    # Validate pre-allocated output tensor
+    if out is not None:
+        assert out.shape == (batch, seqlen, nheads, headdim), (
+            f"out shape {out.shape} doesn't match "
+            f"expected ({batch}, {seqlen}, {nheads}, {headdim})"
+        )
+        assert out.dtype == x.dtype, (
+            f"out dtype {out.dtype} doesn't match x dtype {x.dtype}"
+        )
+        assert out.is_contiguous(), "out must be contiguous"
+        assert out.device == x.device, (
+            f"out device {out.device} doesn't match x device {x.device}"
+        )
+
     # Step 1: Compute cumsum using Triton kernel
     # dA_cumsum: (batch, nheads, nchunks, chunk_size)
     # dt_processed: (batch, nheads, nchunks, chunk_size) - after softplus/bias
@@ -592,7 +612,7 @@ def ssd_combined_fwd(
         has_z=has_z,
     )
 
-    out, final_states = kernel.run(
+    y_out, final_states = kernel.run(
         x=x,
         dA_cumsum=dA_cumsum,
         dt_processed=dt_processed,
@@ -605,5 +625,10 @@ def ssd_combined_fwd(
         chunk_indices=chunk_indices,
         chunk_offsets=chunk_offsets,
     )
+
+    if out is not None:
+        out.copy_(y_out)
+    else:
+        out = y_out.contiguous()
 
     return out, final_states
