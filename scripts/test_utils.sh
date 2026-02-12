@@ -7,7 +7,7 @@
 : "${MAX_JOBS:=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
 # CUDA_VISIBLE_DEVICES: Not set by default - let detect_gpus() auto-detect via nvidia-smi
 : "${SAMPLE_RATE:=5}"  # Run every Nth test in sanity mode (5 = ~20% coverage)
-: "${PARALLEL_TESTS:=true}"  # Enable parallel test execution by default
+: "${PARALLEL_TESTS:=false}"  # Enable parallel test execution by default
 
 # Randomize starting offset (0 to SAMPLE_RATE-1) for sampling variety
 if [ -z "${SAMPLE_OFFSET:-}" ]; then
