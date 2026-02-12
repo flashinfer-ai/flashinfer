@@ -134,8 +134,12 @@ struct KernelParams {
   // The sequence lengths for K/V. Required by pagedKv kernels to avoid unnecessary computation
   // based on (ptrCumSeqLensKv[batchIdx + 1] - ptrCumSeqLensKv[batchIdx]).
   int32_t const* ptrSeqLensKv;
-  // The reserved memory buffer.
-  int32_t* ptrReservedMem;
+  // When collecting skip softmax stats, store them here
+  // Note that softmax and BMM2 are skipped at different granularity (warp vs tile)
+  // [0] -> skipped softmax warp blocks; [1] -> total softmax warp blocks.
+  // [2] -> skipped BMM2s; [3] -> total BMM2s.
+  int32_t* ptrSkipSoftmaxStats;
+
   // The softmax stats buffer.
   float2* ptrSoftmaxStats;
 
@@ -188,8 +192,8 @@ struct KernelParams {
   float mScaleSfKv;
   // The SF scale for O.
   float mScaleSfO;
-  // The reserved parameter.
-  float mReservedParam;
+  // Threshold to decide whether warp skips softmax ops
+  float mSkipSoftmaxThresholdScaleFactor;
   // The start token index in SF tensor. Used for FP4 SF offset calculation in generation phase
   // kernel when inflight batching is enabled in TRT-LLM.
   int32_t mStartTokenIdxSfO;
@@ -798,6 +802,7 @@ struct KernelParams {
     params.mNumTokensPerCtaQ = numTokensPerCtaQ;
     params.mOutputScale = options.outputScale;
     params.mScaleSoftmaxLog2 = options.scaleSoftmaxLog2;
+    params.mSkipSoftmaxThresholdScaleFactor = options.mSkipSoftmaxThresholdScaleFactor;
     params.mStartTokenIdxSfO = options.mSfStartTokenIdx;
     params.mScaleSfKv = options.mScaleSfKv;
     params.ptrSoftmaxStats = options.softmaxStatsPtr;
