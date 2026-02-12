@@ -24,6 +24,7 @@ import uuid
 
 import filelock
 
+from .utils import write_if_different
 from .core import logger
 from .env import FLASHINFER_CUBIN_DIR
 
@@ -236,6 +237,74 @@ def get_cubin(file_name: str, sha256: str, session=None) -> bytes:
     logger.info(f"Fetching cubin {file_name} from {uri}")
     download_file(uri, cubin_path, session=session)
     return load_cubin(cubin_path, sha256)
+
+
+def download_trtllm_headers(
+    op: str, header_dest_dir: str, header_path: str, artifact_path: str, checksum: bytes
+):
+    if op == "bmm":
+        header_files = [
+            "BatchedGemmEnums.h",
+            "BatchedGemmInterface.h",
+            "BatchedGemmOptions.h",
+            "Enums.h",
+            "GemmGatedActOptions.h",
+            "GemmOptions.h",
+            "KernelParams.h",
+            "KernelParamsDecl.h",
+            "KernelTraits.h",
+            "TmaDescriptor.h",
+            "trtllm/gen/CommonUtils.h",
+            "trtllm/gen/CudaArchDecl.h",
+            "trtllm/gen/CudaKernelLauncher.h",
+            "trtllm/gen/DtypeDecl.h",
+            "trtllm/gen/MmaDecl.h",
+            "trtllm/gen/SfLayoutDecl.h",
+            "trtllm/gen/SparsityDecl.h",
+        ]
+
+    else:
+        header_files = [
+            "GemmInterface.h",
+            "GemmOptions.h",
+            "Enums.h",
+            "KernelTraits.h",
+            "KernelParams.h",
+            "KernelParamsDecl.h",
+            "TmaDescriptor.h",
+            "trtllm/gen/CommonUtils.h",
+            "trtllm/gen/CudaKernelLauncher.h",
+            "trtllm/gen/DtypeDecl.h",
+            "trtllm/gen/MmaDecl.h",
+            "trtllm/gen/SfLayoutDecl.h",
+            "trtllm/gen/CudaArchDecl.h",
+        ]
+
+    artifact_hash_path = str(header_dest_dir) + "/.artifact_hash"
+
+    # Check if cached headers are from a different artifact version (e.g. after git checkout)
+    if os.path.exists(artifact_hash_path):
+        with open(artifact_hash_path, "r") as f:
+            cached_hash = f.read().strip()
+        if cached_hash != artifact_path:
+            raise RuntimeError(
+                f"Detected inconsistent cached artifacts. "
+                f"(Cached trtllm headers were downloaded for artifact "
+                f"'{cached_hash}', but current code expects "
+                f"'{artifact_path}'). "
+                f"Please clear the cache to confirm and allow the new headers to be downloaded: "
+                f"rm -rf {header_dest_dir}."
+            )
+
+    for file in header_files:
+        uri_path = f"{header_path}/{file}"
+        file_hash = get_meta_hash(checksum, file)
+        file_path = str(header_dest_dir) + "/" + file
+        result = get_file(uri_path, file_hash, file_path)
+        assert result, f"{file} not found"
+
+    # Record which artifact version these headers belong to
+    write_if_different(artifact_hash_path, artifact_path)
 
 
 def convert_to_ctypes_char_p(data: bytes):

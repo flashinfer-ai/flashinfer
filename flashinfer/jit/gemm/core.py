@@ -31,9 +31,9 @@ from ..core import (
     current_compilation_context,
 )
 from ..cubin_loader import (
+    download_trtllm_headers,
     get_cubin,
     get_meta_hash,
-    get_file,
 )
 from ..utils import dtype_cutlass_map, filename_safe_dtype_map, write_if_different
 
@@ -494,23 +494,6 @@ def gen_trtllm_gen_gemm_module() -> JitSpec:
     # make sure "flashinferMetaInfo.h" is downloaded or cached
     assert metainfo, f"{header_name}.h not found"
 
-    # whitelisted headers for integrity
-    header_files = [
-        "GemmInterface.h",
-        "GemmOptions.h",
-        "Enums.h",
-        "KernelTraits.h",
-        "KernelParams.h",
-        "KernelParamsDecl.h",
-        "TmaDescriptor.h",
-        "trtllm/gen/CommonUtils.h",
-        "trtllm/gen/CudaKernelLauncher.h",
-        "trtllm/gen/DtypeDecl.h",
-        "trtllm/gen/MmaDecl.h",
-        "trtllm/gen/SfLayoutDecl.h",
-        "trtllm/gen/CudaArchDecl.h",
-    ]
-
     header_path = f"{include_path}/trtllmGen_gemm_export"
     header_dest_dir = (
         jit_env.FLASHINFER_CUBIN_DIR
@@ -519,30 +502,9 @@ def gen_trtllm_gen_gemm_module() -> JitSpec:
         / "gemm"
         / "trtllmGen_gemm_export"
     )
-    artifact_hash_path = header_dest_dir / ".artifact_hash"
-
-    # Check if cached headers are from a different artifact version (e.g. after git checkout)
-    if artifact_hash_path.exists():
-        cached_hash = artifact_hash_path.read_text().strip()
-        if cached_hash != ArtifactPath.TRTLLM_GEN_GEMM:
-            raise RuntimeError(
-                f"Detected inconsistent cached artifacts. "
-                f"(Cached trtllm gemm headers were downloaded for artifact "
-                f"'{cached_hash}', but current code expects "
-                f"'{ArtifactPath.TRTLLM_GEN_GEMM}'). "
-                f"Please clear the cache to confirm and allow the new headers to be downloaded: "
-                f"rm -rf {header_dest_dir}."
-            )
-
-    for file in header_files:
-        uri_path = f"{header_path}/{file}"
-        file_hash = get_meta_hash(checksum, file)
-        file_path = str(header_dest_dir / file)
-        result = get_file(uri_path, file_hash, file_path)
-        assert result, f"{file} not found"
-
-    # Record which artifact version these headers belong to
-    write_if_different(artifact_hash_path, ArtifactPath.TRTLLM_GEN_GEMM)
+    download_trtllm_headers(
+        "gemm", header_dest_dir, header_path, ArtifactPath.TRTLLM_GEN_GEMM, checksum
+    )
 
     return gen_jit_spec(
         "trtllm_gemm",
@@ -699,23 +661,6 @@ def gen_trtllm_low_latency_gemm_module() -> JitSpec:
     # make sure "flashinferMetaInfo.h" is downloaded or cached
     assert metainfo, f"{header_name}.h not found"
 
-    # whitelisted headers for integrity
-    header_files = [
-        "GemmInterface.h",
-        "GemmOptions.h",
-        "Enums.h",
-        "KernelTraits.h",
-        "KernelParams.h",
-        "KernelParamsDecl.h",
-        "TmaDescriptor.h",
-        "trtllm/gen/CommonUtils.h",
-        "trtllm/gen/CudaKernelLauncher.h",
-        "trtllm/gen/DtypeDecl.h",
-        "trtllm/gen/MmaDecl.h",
-        "trtllm/gen/SfLayoutDecl.h",
-        "trtllm/gen/CudaArchDecl.h",
-    ]
-
     header_path = f"{include_path}/trtllmGen_gemm_export"
     header_dest_dir = (
         jit_env.FLASHINFER_CUBIN_DIR
@@ -724,30 +669,9 @@ def gen_trtllm_low_latency_gemm_module() -> JitSpec:
         / "gemm"
         / "trtllmGen_gemm_export"
     )
-    artifact_hash_path = header_dest_dir / ".artifact_hash"
-
-    # Check if cached headers are from a different artifact version (e.g. after git checkout)
-    if artifact_hash_path.exists():
-        cached_hash = artifact_hash_path.read_text().strip()
-        if cached_hash != ArtifactPath.TRTLLM_GEN_GEMM:
-            raise RuntimeError(
-                f"Detected inconsistent cached artifacts. "
-                f"(Cached trtllm gemm headers were downloaded for artifact "
-                f"'{cached_hash}', but current code expects "
-                f"'{ArtifactPath.TRTLLM_GEN_GEMM}'). "
-                f"Please clear the cache to confirm and allow the new headers to be downloaded: "
-                f"rm -rf {header_dest_dir}."
-            )
-
-    for file in header_files:
-        uri_path = f"{header_path}/{file}"
-        file_hash = get_meta_hash(checksum, file)
-        file_path = str(header_dest_dir / file)
-        result = get_file(uri_path, file_hash, file_path)
-        assert result, f"{file} not found"
-
-    # Record which artifact version these headers belong to
-    write_if_different(artifact_hash_path, ArtifactPath.TRTLLM_GEN_GEMM)
+    download_trtllm_headers(
+        "gemm", header_dest_dir, header_path, ArtifactPath.TRTLLM_GEN_GEMM, checksum
+    )
 
     return gen_jit_spec(
         "trtllm_low_latency_gemm",
