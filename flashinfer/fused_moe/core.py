@@ -2273,11 +2273,8 @@ def trtllm_fp8_per_tensor_scale_moe(
         tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 8192)
         activation_type (int): Type of activation function (default: 3 - Swiglu)
             - 0: Gelu
-            - 1: Relu
-            - 2: Silu
             - 3: Swiglu
             - 4: Geglu
-            - 5: SwigluBias
             - 6: Relu2
             - 7: Identity
 
@@ -2578,12 +2575,8 @@ def trtllm_fp4_block_scale_moe(
         do_finalize (bool): Whether to finalize the output (default: False)
         enable_pdl (Optional[bool]): Whether to enable Programmatic Dependent Launch (PDL). Auto-enabled for >= sm90.
         activation_type (int): Type of activation function (default: 3 - Swiglu)
-            - 0: Gelu
-            - 1: Relu
-            - 2: Silu
             - 3: Swiglu
             - 4: Geglu
-            - 5: SwigluBias
             - 6: Relu2
             - 7: Identity
         tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 8192)
@@ -2715,12 +2708,8 @@ def trtllm_fp4_block_scale_routed_moe(
             - 4: RenormalizeNaive (Softmax -> TopK -> Renormalize)
         do_finalize (bool): Whether to finalize the output (default: False)
         activation_type (int): Type of activation function (default: 3 - Swiglu)
-            - 0: Gelu
-            - 1: Relu
-            - 2: Silu
             - 3: Swiglu
             - 4: Geglu
-            - 5: SwigluBias
             - 6: Relu2
             - 7: Identity
         tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 8192)
