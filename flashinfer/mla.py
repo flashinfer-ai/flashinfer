@@ -611,6 +611,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
             raise ValueError(
                 f"XQA MLA only supports q_len_per_request == 1, got {query.size(1)}"
             )
+        if skip_softmax_threshold_scale_factor is not None:
+            raise ValueError("skip_softmax is not supported for XQA backend")
         return xqa_batch_decode_with_kv_cache_mla(
             query,
             kv_cache,
@@ -640,6 +642,9 @@ def trtllm_batch_decode_with_kv_cache_mla(
             block_size != 32 and block_size != 64
         ):  # todo(Yingyi): add support for more block sizes?
             raise ValueError(f"Supported block_size are 32 and 64, got {block_size}")
+
+        if skip_softmax_threshold_scale_factor is not None and sparse_mla_top_k != 0:
+            raise ValueError("skip_softmax is not supported for sparse MLA")
 
         # Validate and normalize to 4D
         kv_cache = _check_trtllm_gen_mla_shape(
