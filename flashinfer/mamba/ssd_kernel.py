@@ -285,7 +285,10 @@ class SSDKernel:
             sm100_utils.make_smem_layout_epi(
                 self.io_dtype,
                 utils.LayoutEnum.COL_MAJOR,
-                (self.tile_shape_mnk_inter2[2], self.tile_shape_mnk_inter2[1]),  # (N, D) instead of (D, N)
+                (
+                    self.tile_shape_mnk_inter2[2],
+                    self.tile_shape_mnk_inter2[1],
+                ),  # (N, D) instead of (D, N)
                 self.initial_state_load_stages,
             )
             if self.has_init_states
@@ -369,16 +372,16 @@ class SSDKernel:
     @cute.jit
     def __call__(
         self,
-        x: cute.Tensor,           # (D, L, C, EH, B) - D stride 1
+        x: cute.Tensor,  # (D, L, C, EH, B) - D stride 1
         cumsum_delta: cute.Tensor,  # (L, C, EH, B) - L stride 1
-        delta: cute.Tensor,         # (L, C, EH, B) - L stride 1
-        b: cute.Tensor,             # (L, N, C, G, B) - L stride 1
-        c: cute.Tensor,             # (L, N, C, G, B) - L stride 1
-        y: cute.Tensor,             # (L, D, C, EH, B) - L stride 1 (output)
-        init_states: cute.Tensor,   # (D, N, EH, B) - D stride 1 (optional)
-        fstate: cute.Tensor,        # (D, N, EH, B) - D stride 1 (output)
-        d: cute.Tensor,             # (D, EH) or (1, EH) (optional)
-        seq_idx: cute.Tensor,        # (batch, seqlen) int32 (optional)
+        delta: cute.Tensor,  # (L, C, EH, B) - L stride 1
+        b: cute.Tensor,  # (L, N, C, G, B) - L stride 1
+        c: cute.Tensor,  # (L, N, C, G, B) - L stride 1
+        y: cute.Tensor,  # (L, D, C, EH, B) - L stride 1 (output)
+        init_states: cute.Tensor,  # (D, N, EH, B) - D stride 1 (optional)
+        fstate: cute.Tensor,  # (D, N, EH, B) - D stride 1 (output)
+        d: cute.Tensor,  # (D, EH) or (1, EH) (optional)
+        seq_idx: cute.Tensor,  # (batch, seqlen) int32 (optional)
         chunk_indices: cute.Tensor,  # (num_logical_chunks,) int32 (optional)
         chunk_offsets: cute.Tensor,  # (num_logical_chunks,) int32 (optional)
         num_logical_chunks: cutlass.Int32,  # len(chunk_indices), or 0 if no varlen
@@ -710,9 +713,9 @@ class SSDKernel:
         tma_tensor_d: cute.Tensor,
         tma_atom_initial_states: Optional[cute.CopyAtom],
         tma_tensor_initial_states: cute.Tensor,
-        seq_idx: cute.Tensor,         # (batch, seqlen) int32 or None
-        chunk_indices: cute.Tensor,   # (num_logical_chunks,) int32 or None
-        chunk_offsets: cute.Tensor,   # (num_logical_chunks,) int32 or None
+        seq_idx: cute.Tensor,  # (batch, seqlen) int32 or None
+        chunk_indices: cute.Tensor,  # (num_logical_chunks,) int32 or None
+        chunk_offsets: cute.Tensor,  # (num_logical_chunks,) int32 or None
         num_logical_chunks: cutlass.Int32,  # len(chunk_indices), or 0 if no varlen
         cluster_layout_vmnk: cute.Layout,
         x_smem_layout: cute.ComposedLayout,
@@ -952,7 +955,10 @@ class SSDKernel:
                         tma_atom_initial_states,
                         tma_tensor_initial_states,
                         smem_p_load,  # Must match TMA atom's smem layout (p_smem_layout_load)
-                        (self.tile_shape_mnk_inter2[2], self.tile_shape_mnk_inter2[1]),  # (N, D) shape to match gmem
+                        (
+                            self.tile_shape_mnk_inter2[2],
+                            self.tile_shape_mnk_inter2[1],
+                        ),  # (N, D) shape to match gmem
                     )
                 )
 
@@ -1713,9 +1719,7 @@ class SSDKernel:
             # Coordinate tensor for chunk_size_limit masking (step 4.2)
             # tile_shape_mnk_inter1 = (N, D, L); dice to (N, L)
             if cutlass.const_expr(self.has_varlen):
-                bt_coord_shape = cute.dice(
-                    self.tile_shape_mnk_inter1, (1, None, 1)
-                )
+                bt_coord_shape = cute.dice(self.tile_shape_mnk_inter1, (1, None, 1))
                 bt_coord_tensor = cute.make_identity_tensor(bt_coord_shape)
                 thr_s2r_b_ = tiled_s2r_b.get_slice(local_tidx)
                 # ((S2R_ATOM_V, S2R_REST_V), S2R_M, S2R_N)
@@ -1772,7 +1776,10 @@ class SSDKernel:
                 tma_atom_p,
                 tma_tensor_p,
                 smem_p_store,
-                (self.tile_shape_mnk_inter2[2], self.tile_shape_mnk_inter2[1]),  # (N, D) to match gmem
+                (
+                    self.tile_shape_mnk_inter2[2],
+                    self.tile_shape_mnk_inter2[1],
+                ),  # (N, D) to match gmem
             )
 
             # Pipeline B/Delta/INTER1_ACC consumer state
@@ -1834,8 +1841,6 @@ class SSDKernel:
                         tState[reg_idx] = tRS_rP[reg_idx].to(self.acc_dtype)
                 else:
                     tState.fill(0.0)
-
-
 
                 # Peek (try_wait) B/Delta/INTER1_B buffer full/full/empty status
                 peek_b_full_status = self.conditional_consumer_try_wait(
@@ -2044,9 +2049,7 @@ class SSDKernel:
                                 ]
                                 cute.copy(
                                     tma_atom_p,
-                                    bSG_sP[
-                                        (None, inter2_p_producer_state.index)
-                                    ],
+                                    bSG_sP[(None, inter2_p_producer_state.index)],
                                     bSG_gP_seq,
                                 )
                             # All pre_inter warps must participate in pipeline ops
@@ -2056,13 +2059,9 @@ class SSDKernel:
                         # B. Reload init_state for new sequence
                         if seq_ends_here and not is_last_chunk:
                             # Release old IS buffer, wait for new one from TMA warp
-                            init_states_pipeline.consumer_release(
-                                istate_consumer_state
-                            )
+                            init_states_pipeline.consumer_release(istate_consumer_state)
                             istate_consumer_state.advance()
-                            init_states_pipeline.consumer_wait(
-                                istate_consumer_state
-                            )
+                            init_states_pipeline.consumer_wait(istate_consumer_state)
 
                             # Load new init_state: smem → tRS_rP → tState
                             istate_coord = (
@@ -2071,22 +2070,14 @@ class SSDKernel:
                                 None,
                                 istate_consumer_state.index,
                             )
-                            cute.copy(
-                                tiled_s2r_p, tS2R_sP[istate_coord], tRS_rP
-                            )
+                            cute.copy(tiled_s2r_p, tS2R_sP[istate_coord], tRS_rP)
                             for reg_idx in range(cute.size(tRS_rP)):
-                                tState[reg_idx] = tRS_rP[reg_idx].to(
-                                    self.acc_dtype
-                                )
+                                tState[reg_idx] = tRS_rP[reg_idx].to(self.acc_dtype)
 
                             # Overwrite same inter2_p smem slot with new init_state
                             for reg_idx in range(cute.size(tState)):
-                                tRS_rP[reg_idx] = tState[reg_idx].to(
-                                    self.io_dtype
-                                )
-                            cute.copy(
-                                tiled_r2s_p, tRS_rP, tRS_sP[inter2_p_coord]
-                            )
+                                tRS_rP[reg_idx] = tState[reg_idx].to(self.io_dtype)
+                            cute.copy(tiled_r2s_p, tRS_rP, tRS_sP[inter2_p_coord])
 
                     # Commit INTER2_P buffer full
                     # Last iteration consumer is PRE_INTER warp itself, not MMA_INTER warp
@@ -2135,9 +2126,7 @@ class SSDKernel:
                         last_c_idx = chunk_indices[C - 1]
                         last_c_off = chunk_offsets[C - 1]
                         seq_id = seq_idx[0, last_c_idx * L + last_c_off]
-                        bSG_gP_final = bSG_gP_pre_slice[
-                            (None, 0, 0, eh_idx, seq_id)
-                        ]
+                        bSG_gP_final = bSG_gP_pre_slice[(None, 0, 0, eh_idx, seq_id)]
                     else:
                         bSG_gP_final = bSG_gP
                     cute.copy(
@@ -2159,7 +2148,6 @@ class SSDKernel:
                 if cutlass.const_expr(self.has_init_states):
                     init_states_pipeline.consumer_release(istate_consumer_state)
                     istate_consumer_state.advance()
-
 
                 # Advance to next tile
                 tile_sched.advance_to_next_work()
@@ -2289,10 +2277,43 @@ class SSDKernel:
                         intra1_acc_consumer_state, peek_rd_intra1_acc_full_status
                     )
 
+                    # Step 4.3a: compute c_off/chunk_size_limit for
+                    # cross-sequence CB masking in the INTRA path.
+                    if cutlass.const_expr(self.has_varlen):
+                        c_idx = chunk_indices[chunk_idx]
+                        c_off = chunk_offsets[chunk_idx]
+                        chunk_size_limit = L
+                        if chunk_idx + 1 < C:
+                            c_idx_next = chunk_indices[chunk_idx + 1]
+                            if c_idx_next == c_idx:
+                                chunk_size_limit = chunk_offsets[chunk_idx + 1]
+                    else:
+                        c_off = 0
+                        chunk_size_limit = L
+
                     # Load Q from tmem
                     intra1_coord = (None, None, None, intra1_acc_consumer_state.index)
                     cute.copy(tiled_t2r_intra1, tTR_tQ[intra1_coord], tTR_rQ)
                     cute.arch.fence_view_async_tmem_load()
+
+                    # Step 4.3b: zero cross-sequence CB entries.
+                    # CB = C @ B^T is computed by INTRA1_MMA on the full
+                    # physical chunk. Zero entries where m or n falls
+                    # outside [c_off, chunk_size_limit) so data from
+                    # other sequences doesn't leak through segsum.
+                    if cutlass.const_expr(self.has_varlen):
+                        if chunk_size_limit < L or c_off > 0:
+                            for subtile_idx in cutlass.range(
+                                cute.size(tTR_rQ), unroll_full=True
+                            ):
+                                m, n = tCoord[subtile_idx]
+                                if (
+                                    m >= chunk_size_limit
+                                    or m < c_off
+                                    or n >= chunk_size_limit
+                                    or n < c_off
+                                ):
+                                    tTR_rQ[subtile_idx] = 0.0
 
                     # Load tQsDeltaA_Row/tQsDeltaA_Col/tQsDelta from smem
                     delta_coord = (None, None, None, deltas_consumer_state.index)
@@ -2610,7 +2631,9 @@ class SSDKernel:
                                     c_off - 1, deltas_consumer_state.index
                                 ]
                                 for reg_idx in range(cute.size(tTR_rDeltaA)):
-                                    tTR_rDeltaA[reg_idx] = tTR_rDeltaA[reg_idx] - dA_cs_boundary
+                                    tTR_rDeltaA[reg_idx] = (
+                                        tTR_rDeltaA[reg_idx] - dA_cs_boundary
+                                    )
 
                             # Combine INTRA2_ACC/INTER2_ACC/Delta/X/D
                             for reg_idx in range(0, cute.size(tRS_rCompute), 2):
@@ -2893,7 +2916,7 @@ class SSDKernel:
     ):
         tiled_mma_intra1 = sm100_utils.make_trivial_tiled_mma(
             io_dtype,
-            tcgen05.OperandMajorMode("k"),   # A operand (C) is K-major (N-contiguous)
+            tcgen05.OperandMajorMode("k"),  # A operand (C) is K-major (N-contiguous)
             tcgen05.OperandMajorMode("mn"),
             acc_dtype,
             cta_group,
@@ -2920,7 +2943,7 @@ class SSDKernel:
         )
         tiled_mma_inter2 = sm100_utils.make_trivial_tiled_mma(
             io_dtype,
-            tcgen05.OperandMajorMode("k"),   # A operand (C) is K-major (N-contiguous)
+            tcgen05.OperandMajorMode("k"),  # A operand (C) is K-major (N-contiguous)
             tcgen05.OperandMajorMode("k"),
             acc_dtype,
             cta_group,
@@ -3166,7 +3189,7 @@ class SSDKernel:
         # (D, L, 1, 1, C, EH, B)
         gX = cute.local_tile(
             tma_tensor_x,
-            self.tile_shape_mnk_intra2[1:], # mnk = (L, D, L)
+            self.tile_shape_mnk_intra2[1:],  # mnk = (L, D, L)
             (None, None, None, None, None),
         )
         # Partition global tensor with regard to TiledMMA
@@ -3575,7 +3598,7 @@ class SSDKernel:
     def smem_load_and_partition_istate(self, local_tidx, smem_pt, tiled_t2r_inter1):
         copy_atom_s2r_p = cute.make_copy_atom(
             cute.nvgpu.warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4),
-            smem_pt.element_type
+            smem_pt.element_type,
         )
         # Use make_tiled_copy_D (not _S) so the thread-value layout comes from
         # the destination (SMEM) side of tiled_t2r_inter1, matching the layout
