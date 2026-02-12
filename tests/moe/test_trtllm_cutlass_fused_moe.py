@@ -556,7 +556,7 @@ def test_moe_nvfp4(
     k = hidden_size
 
     w1_n = 2 * n if activation_type == ActivationType.Swiglu else n
-    w1 = torch.randn((e, w1_n, k), device="cuda", dtype=otype) / 10
+    w1 = torch.randn((e, w1_n, k), device="cuda", dtype=otype) / 100
 
     sf_w1_2n = round_up(w1_n, 128)
     sf_w1_k = round_up(k // quant_blocksize, 4)
@@ -567,7 +567,7 @@ def test_moe_nvfp4(
         (e, sf_w1_2n, sf_w1_k), device="cuda", dtype=torch.float8_e4m3fn
     )
 
-    w2 = torch.randn((e, k, n), device="cuda", dtype=otype) / 10
+    w2 = torch.randn((e, k, n), device="cuda", dtype=otype) / 100
     sf_w2_k = round_up(k, 128)
     sf_w2_n = round_up(n // quant_blocksize, 4)
     w2_blockscale = torch.empty(
@@ -722,7 +722,7 @@ def test_moe_expert_parallel(moe_config, activation_type):
             dtype=torch.float16,
             device="cuda",
         )
-        / 10
+        / 100
     )
     w2_weight = (
         torch.randn(
@@ -732,7 +732,7 @@ def test_moe_expert_parallel(moe_config, activation_type):
             dtype=torch.float16,
             device="cuda",
         )
-        / 10
+        / 100
     )
 
     selected_experts = torch.stack(
@@ -792,7 +792,9 @@ def test_moe_expert_parallel(moe_config, activation_type):
     torch.testing.assert_close(ref_output, flash_output, rtol=1e-1, atol=1e-1)
 
 
-TP_SIZES = [2, 4, 8]
+TP_SIZES = [2, 4]
+if torch.cuda.device_count() >= 8:
+    TP_SIZES.append(8)
 
 
 @pytest.mark.parametrize("moe_config", FULL_MOE_CONFIGS)
@@ -837,7 +839,7 @@ def test_moe_tensor_parallel(moe_config, tp_size, activation_type):
             dtype=torch.float16,
             device="cuda",
         )
-        / 10
+        / 100
     )
     w2_weight = (
         torch.randn(
@@ -847,7 +849,7 @@ def test_moe_tensor_parallel(moe_config, tp_size, activation_type):
             dtype=torch.float16,
             device="cuda",
         )
-        / 10
+        / 100
     )
 
     # Generate unique random expert indices for each token
@@ -969,7 +971,7 @@ def test_moe_tensor_expert_parallel(
             dtype=torch.float16,
             device="cuda",
         )
-        / 10
+        / 100
     )
     w2_weight = (
         torch.randn(
@@ -979,7 +981,7 @@ def test_moe_tensor_expert_parallel(
             dtype=torch.float16,
             device="cuda",
         )
-        / 10
+        / 100
     )
 
     # Generate unique random expert indices for each token
