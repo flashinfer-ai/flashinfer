@@ -195,7 +195,9 @@ class _SSDKernel:
         # x: zero-copy (D, L, C, EH, B) with D stride 1 (N-major for MMA B operand)
         # Full reversal of (B, C, L, EH, D) gives monotonically increasing strides
         x_reshaped = x.reshape(batch, nchunks, chunk_size, nheads, headdim)
-        assert x.dtype == io_torch_dtype, f"x dtype {x.dtype} doesn't match {io_torch_dtype}"
+        assert x.dtype == io_torch_dtype, (
+            f"x dtype {x.dtype} doesn't match {io_torch_dtype}"
+        )
         x_permuted = x_reshaped.permute(4, 2, 1, 3, 0)  # (D, L, C, EH, B)
         x_tensor = from_dlpack(x_permuted, assumed_align=16)
         for mode in [2, 3, 4]:
@@ -247,7 +249,9 @@ class _SSDKernel:
         # PyTorch (B, C, L, G, N) permuted (2, 4, 1, 3, 0) gives (L, N, C, G, B) with N contiguous
         # Modes 0,1 are (M, K) = (L, N) matching make_tiled_tma_atom_A expectations
         C_reshaped = C.reshape(batch, nchunks, chunk_size, ngroups, dstate)
-        assert C.dtype == io_torch_dtype, f"C dtype {C.dtype} doesn't match {io_torch_dtype}"
+        assert C.dtype == io_torch_dtype, (
+            f"C dtype {C.dtype} doesn't match {io_torch_dtype}"
+        )
         c_permuted = C_reshaped.permute(2, 4, 1, 3, 0)  # (L, N, C, G, B)
         c_tensor = from_dlpack(c_permuted, assumed_align=16)
         for mode in [2, 3, 4]:
@@ -287,7 +291,6 @@ class _SSDKernel:
             d_tensor = None
 
         if self.has_init_states and init_states is not None:
-
             # init_states_dst.copy_(init_states_reshaped.to(init_states_dst.dtype))
             assert init_states.dtype == cutlass_torch.dtype(self.io_dtype), (
                 f"init_states dtype {init_states.dtype} doesn't match cumsum_dtype {self.io_dtype}"
@@ -343,7 +346,9 @@ class _SSDKernel:
             chunk_offsets_tensor = from_dlpack(chunk_offsets, assumed_align=4)
 
         # Number of logical chunks (may differ from physical chunks for varlen)
-        num_logical_chunks = len(chunk_indices) if chunk_indices is not None else nchunks
+        num_logical_chunks = (
+            len(chunk_indices) if chunk_indices is not None else nchunks
+        )
 
         # Compile kernel if not already done
         if self._compiled_kernel is None:
@@ -496,6 +501,15 @@ def ssd_combined_fwd(
     batch, seqlen, nheads, headdim = x.shape
     _, _, ngroups, dstate = B.shape
 
+    # In varlen (continuous batching) mode, the caller is expected to
+    # independently pad each sequence to a chunk boundary so that no
+    # physical chunk is shared by two sequences. This is the convention
+    # adopted by vLLM (see https://github.com/vllm-project/vllm/pull/24683):
+    # each sequence's new tokens are partitioned so that
+    # len(previous_state) + len(new_partition) = chunk_size, and the
+    # last chunk is zero-padded to a full chunk_size. As a result, the
+    # total packed seqlen is always a multiple of chunk_size.
+    # Supporting non-aligned total seqlen is not planned.
     assert seqlen % chunk_size == 0, (
         f"seqlen ({seqlen}) must be divisible by chunk_size ({chunk_size})"
     )
@@ -506,11 +520,19 @@ def ssd_combined_fwd(
             f"seq_idx shape {seq_idx.shape} doesn't match (batch={batch}, seqlen={seqlen})"
         )
     if chunk_indices is not None:
-        assert chunk_indices.dim() == 1, f"chunk_indices must be 1D, got {chunk_indices.dim()}D"
-        assert chunk_indices.dtype == torch.int32, f"chunk_indices must be int32, got {chunk_indices.dtype}"
+        assert chunk_indices.dim() == 1, (
+            f"chunk_indices must be 1D, got {chunk_indices.dim()}D"
+        )
+        assert chunk_indices.dtype == torch.int32, (
+            f"chunk_indices must be int32, got {chunk_indices.dtype}"
+        )
     if chunk_offsets is not None:
-        assert chunk_offsets.dim() == 1, f"chunk_offsets must be 1D, got {chunk_offsets.dim()}D"
-        assert chunk_offsets.dtype == torch.int32, f"chunk_offsets must be int32, got {chunk_offsets.dtype}"
+        assert chunk_offsets.dim() == 1, (
+            f"chunk_offsets must be 1D, got {chunk_offsets.dim()}D"
+        )
+        assert chunk_offsets.dtype == torch.int32, (
+            f"chunk_offsets must be int32, got {chunk_offsets.dtype}"
+        )
     if chunk_indices is not None and chunk_offsets is not None:
         assert chunk_indices.shape == chunk_offsets.shape, (
             f"chunk_indices and chunk_offsets must have the same shape, "
