@@ -1174,6 +1174,7 @@ def get_trtllm_moe_sm100_module():
                         kwargs["routed_scaling_factor"],
                         kwargs["use_routing_scales_on_input"],
                         kwargs["routing_method_type"],
+                        kwargs["do_finalize"],
                         kwargs["enable_pdl"],
                         [-1, -1] if tactic == -1 else tactic,
                         self.activation_type,
@@ -1435,10 +1436,11 @@ def get_trtllm_moe_sm100_module():
         routed_scaling_factor: Optional[float],
         use_routing_scales_on_input: bool,
         routing_method_type: int = 0,
+        do_finalize: bool = True,
         enable_pdl: Optional[bool] = None,
         tune_max_num_tokens: int = 8192,
         activation_type: ActivationType = ActivationType.Swiglu,
-    ) -> torch.Tensor:
+    ) -> List[torch.Tensor]:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(hidden_states.device)
         # Use AutoTuner to select the best tactic
@@ -1496,11 +1498,12 @@ def get_trtllm_moe_sm100_module():
             routed_scaling_factor=routed_scaling_factor,
             use_routing_scales_on_input=use_routing_scales_on_input,
             routing_method_type=routing_method_type,
+            do_finalize=do_finalize,
             enable_pdl=enable_pdl,
             activation_type=activation_type.value,
         )
         # Call the C++ function
-        result = moe_op.trtllm_fp8_per_tensor_scale_moe(
+        intermediate_output = moe_op.trtllm_fp8_per_tensor_scale_moe(
             routing_logits,
             routing_bias,
             hidden_states,
@@ -1520,12 +1523,21 @@ def get_trtllm_moe_sm100_module():
             routed_scaling_factor,
             use_routing_scales_on_input,
             routing_method_type,
+            do_finalize,
             enable_pdl,
             [-1, -1] if tactic == -1 else tactic,
             activation_type.value,
         )
 
-        return result
+        if do_finalize:
+            return [torch.from_dlpack(intermediate_output[0])]
+        else:
+            gemm2_output, _, expanded_idx_to_permuted_idx = intermediate_output
+            return [
+                torch.from_dlpack(gemm2_output),
+                expert_weights,
+                torch.from_dlpack(expanded_idx_to_permuted_idx),
+            ]
 
     @register_fake_op("flashinfer::trtllm_fp8_per_tensor_scale_moe")
     def _fake_trtllm_fp8_per_tensor_scale_moe(
@@ -1547,6 +1559,7 @@ def get_trtllm_moe_sm100_module():
         routed_scaling_factor: Optional[float],
         use_routing_scales_on_input: bool,
         routing_method_type: int = 0,
+        do_finalize: bool = True,
         enable_pdl: Optional[bool] = None,
         activation_type: int = ActivationType.Swiglu.value,
     ):
@@ -2244,10 +2257,11 @@ def trtllm_fp8_per_tensor_scale_moe(
     routed_scaling_factor: Optional[float],
     use_routing_scales_on_input: bool,
     routing_method_type: int = 0,
+    do_finalize: bool = True,
     enable_pdl: Optional[bool] = None,
     tune_max_num_tokens: int = 8192,
     activation_type: int = ActivationType.Swiglu.value,
-) -> torch.Tensor:
+) -> List[torch.Tensor]:
     """FP8 per tensor scale MoE operation.
 
     Args:
@@ -2269,6 +2283,7 @@ def trtllm_fp8_per_tensor_scale_moe(
         routed_scaling_factor: Scaling factor for routing
         use_routing_scales_on_input: Whether to use routing scales on input
         routing_method_type: Type of routing method to use (default: 0)
+        do_finalize: Whether to finalize the output (default: True).
         enable_pdl: Whether to enable Programmatic Dependent Launch (PDL). Auto-enabled for >= sm90.
         tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 8192)
         activation_type (int): Type of activation function (default: 3 - Swiglu)
@@ -2279,7 +2294,8 @@ def trtllm_fp8_per_tensor_scale_moe(
             - 7: Identity
 
     Returns:
-        torch.Tensor: Output tensor of shape [seq_len, hidden_size]
+        List[torch.Tensor]: List of output tensors. If do_finalize=True, returns the final MoE output.
+            Otherwise, returns intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
     """
     return get_trtllm_moe_sm100_module().trtllm_fp8_per_tensor_scale_moe(
         routing_logits,
@@ -2300,6 +2316,7 @@ def trtllm_fp8_per_tensor_scale_moe(
         routed_scaling_factor,
         use_routing_scales_on_input,
         routing_method_type,
+        do_finalize,
         enable_pdl,
         tune_max_num_tokens,
         activation_type,

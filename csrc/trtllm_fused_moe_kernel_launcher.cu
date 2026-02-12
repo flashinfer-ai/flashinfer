@@ -1553,15 +1553,15 @@ Array<Tensor> trtllm_bf16_moe(TensorView const& routing_logits,
   return result;
 }
 
-Tensor trtllm_fp8_per_tensor_scale_moe(
+Array<Tensor> trtllm_fp8_per_tensor_scale_moe(
     TensorView routing_logits, Optional<TensorView> routing_bias, TensorView hidden_states,
     TensorView gemm1_weights, TensorView output1_scales_scalar,
     TensorView output1_scales_gate_scalar, TensorView gemm2_weights,
     TensorView output2_scales_scalar, TensorView output, int64_t num_experts, int64_t top_k,
     Optional<int64_t> n_group, Optional<int64_t> topk_group, int64_t intermediate_size,
     int64_t local_expert_offset, int64_t local_num_experts, Optional<double> routed_scaling_factor,
-    bool use_routing_scales_on_input, int64_t routing_method_type, bool enable_pdl,
-    Array<int64_t> config_index, int64_t activation_type) {
+    bool use_routing_scales_on_input, int64_t routing_method_type, bool do_finalize,
+    bool enable_pdl, Array<int64_t> config_index, int64_t activation_type) {
   // Basic type validation
   auto dtype = hidden_states.dtype();
   auto activation = static_cast<ActivationType>(activation_type);
@@ -1615,6 +1615,7 @@ Tensor trtllm_fp8_per_tensor_scale_moe(
     args->local_num_experts = local_num_experts;
     args->intermediate_size = intermediate_size;
     args->routed_scaling_factor = routed_scaling_factor.value_or(1.0);
+    args->do_finalize = do_finalize;
 
     // Create and initialize launcher for this tile size
     auto launcher = std::make_unique<Fp8PerTensorLauncher>(
@@ -1639,7 +1640,7 @@ Tensor trtllm_fp8_per_tensor_scale_moe(
   auto& selected_launcher = launchers_map.at(tile_N);
 
   // Run the launcher - it will create its own runner internally
-  auto result = selected_launcher->run(config, enable_pdl, use_routing_scales_on_input)[0];
+  auto result = selected_launcher->run(config, enable_pdl, use_routing_scales_on_input);
   // Return the result tensor
   return result;
 }
