@@ -3096,52 +3096,78 @@ def _cute_dsl_gemm_fp4_runner(
                         enable_pdl,
                     )
 
-                # Compilation uses dummy pointers (no real data needed) and
-                # a fake stream that uses the current CUDA stream at runtime.
-                # This follows the TVM-FFI pattern from commit edb37cd:
-                # - Dummy aligned pointers for compilation (cheaper than real data_ptr)
-                # - make_fake_compact_tensor for alpha (passes torch tensor directly)
-                # - make_fake_stream for automatic stream management
-                a_ptr = make_ptr(cutlass.Float4E2M1FN, 32, cute.AddressSpace.gmem, 32)
-                b_ptr = make_ptr(cutlass.Float4E2M1FN, 32, cute.AddressSpace.gmem, 32)
+                # TVM-FFI compilation pattern (commit edb37cd):
+                # - A, B, C, alpha: make_fake_compact_tensor → torch tensors
+                #   passed directly at runtime via TVM-FFI C-level dlpack
+                # - SF tensors: make_ptr (complex 6D BlockScaledBasicChunk
+                #   layout can't be expressed as torch tensor) → data_ptr() at runtime
+                # - Stream: make_fake_stream → automatic env stream at runtime
+                sym_m = cute.sym_int()
+                sym_k = cute.sym_int()  # k_packed (FP4 stored as uint8)
+                sym_n = cute.sym_int()
+
+                # A/B: FP4 data stored as uint8 in torch (2 FP4 values per byte).
+                # Use Uint8 to match torch.uint8 dtype at runtime. The kernel
+                # wrapper recasts from Uint8 to Float4E2M1FN internally.
+                a_fake = cute.runtime.make_fake_compact_tensor(
+                    cutlass.Uint8,
+                    (sym_m, sym_k),
+                    stride_order=(1, 0),
+                    assumed_align=32,
+                )
+                b_fake = cute.runtime.make_fake_compact_tensor(
+                    cutlass.Uint8,
+                    (sym_n, sym_k),
+                    stride_order=(1, 0),
+                    assumed_align=32,
+                )
+                # C: (m, n) layout depends on swap_ab, torch tensor at runtime
+                if swap_ab:
+                    c_fake = cute.runtime.make_fake_compact_tensor(
+                        c_cutlass_dtype,
+                        (sym_n, sym_m),
+                        stride_order=(0, 1),
+                        assumed_align=16,
+                    )
+                else:
+                    c_fake = cute.runtime.make_fake_compact_tensor(
+                        c_cutlass_dtype,
+                        (sym_m, sym_n),
+                        stride_order=(1, 0),
+                        assumed_align=16,
+                    )
+                # SF tensors: pointers (complex 6D layout, not expressible as torch tensor)
                 a_sf_ptr = make_ptr(
                     cutlass.Float8E4M3FN, 16, cute.AddressSpace.gmem, 16
                 )
                 b_sf_ptr = make_ptr(
                     cutlass.Float8E4M3FN, 16, cute.AddressSpace.gmem, 16
                 )
-                c_ptr = make_ptr(c_cutlass_dtype, 16, cute.AddressSpace.gmem, 16)
-
-                # Alpha: fake 1-dim tensor for TVM-FFI -- torch tensor passed directly at runtime
+                # Alpha: 1-dim tensor, torch tensor at runtime
                 alpha_fake = cute.runtime.make_fake_compact_tensor(
                     cutlass.Float32, (1,), assumed_align=4
                 )
 
-                # Get max active clusters
                 from flashinfer.cute_dsl.utils import get_max_active_clusters
 
                 max_active_clusters = get_max_active_clusters(
                     cluster_shape_mn[0] * cluster_shape_mn[1]
                 )
 
-                # Fake stream: uses current CUDA stream at runtime automatically
-                # No need to pass stream at launch time.
+                # Fake stream: auto uses current CUDA stream at runtime
                 stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
                 compiled_gemm = cute.compile(
                     gemm.wrapper,
-                    kernel_m,
-                    kernel_n,
-                    real_k,
+                    a_fake,
+                    b_fake,
+                    c_fake,
                     sf_m,
                     sf_n,
                     sf_k,
                     batch_size,
-                    a_ptr,
-                    b_ptr,
                     a_sf_ptr,
                     b_sf_ptr,
-                    c_ptr,
                     alpha_fake,
                     max_active_clusters,
                     stream_fake,
@@ -3165,8 +3191,6 @@ def _cute_dsl_gemm_fp4_runner(
                 launch_out = out
 
             # Prepare alpha: ensure it is always a 1-dim tensor with shape [1].
-            # mm_fp4 may pass alpha as a 0-dim scalar tensor or a 1-dim tensor;
-            # the TVM FFI compiled kernel requires a consistent 1-dim shape.
             if alpha_tensor is None:
                 alpha_for_launch = torch.tensor(
                     [1.0], dtype=torch.float32, device=a.device
@@ -3176,21 +3200,19 @@ def _cute_dsl_gemm_fp4_runner(
             else:
                 alpha_for_launch = alpha_tensor.reshape(1)
 
-            # Launch via TVM-FFI: pass torch tensors directly for pointers
-            # (TVM-FFI handles dlpack at C level), and int values for sizes.
-            # No stream argument needed -- make_fake_stream uses env stream.
+            # Launch via TVM-FFI:
+            # - A, B, C, alpha: torch.Tensor directly (C-level dlpack, negligible cost)
+            # - SF pointers: data_ptr() ints (complex 6D layout)
+            # - Stream: automatic (fake_stream)
             compiled_gemm(
-                kernel_m,
-                kernel_n,
-                real_k,
+                kernel_a,
+                kernel_b,
+                launch_out,
                 sf_m,
                 sf_n,
                 sf_k,
-                kernel_a.data_ptr(),
-                kernel_b.data_ptr(),
                 kernel_a_sf.data_ptr(),
                 kernel_b_sf.data_ptr(),
-                launch_out.data_ptr(),
                 alpha_for_launch,
             )
 

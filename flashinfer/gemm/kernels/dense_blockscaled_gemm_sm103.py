@@ -2474,59 +2474,72 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
     @cute.jit
     def wrapper(
         self,
-        m: cutlass.Int64,
-        n: cutlass.Int64,
-        k: cutlass.Int64,
+        mA: cute.Tensor,
+        mB: cute.Tensor,
+        mC: cute.Tensor,
         sf_m: cutlass.Int64,
         sf_n: cutlass.Int64,
         sf_k: cutlass.Int64,
         l: cutlass.Constexpr,
-        a_ptr: cute.Pointer,
-        b_ptr: cute.Pointer,
         a_sf_ptr: cute.Pointer,
         b_sf_ptr: cute.Pointer,
-        c_ptr: cute.Pointer,
         alpha_tensor: cute.Tensor,
         max_active_clusters: cutlass.Constexpr,
-        current_stream: cuda.CUstream,
+        current_stream,
         swap_ab: cutlass.Constexpr = False,
         epilogue_op: cutlass.Constexpr = lambda x: x,
     ):
         """Execute the wrapped GEMM kernel with dynamically shaped tensors.
 
-        Supports swap_ab for transposed output layout.
+        Uses TVM-FFI for efficient tensor passing: A, B, C, and alpha are passed
+        as cute.Tensor directly (torch tensors at runtime via TVM-FFI's C-level
+        dlpack). Scale factor tensors remain as pointers (complex 6D layout).
+
+        Args:
+            mA (cute.Tensor): Input A, shape (m, k_packed), Uint8 (FP4 packed).
+            mB (cute.Tensor): Input B, shape (n, k_packed), Uint8 (FP4 packed).
+            mC (cute.Tensor): Output C, shape (m, n).
+            sf_m/sf_n/sf_k: Scale factor dimensions.
+            l: Batch dimension.
+            a_sf_ptr/b_sf_ptr: Scale factor pointers (6D layout).
+            alpha_tensor: Alpha scaling factor, shape (1,), float32.
+            max_active_clusters: Max active clusters.
+            current_stream: CUDA stream (TVM-FFI fake stream).
+            swap_ab: Whether A/B are swapped (controls C layout).
+            epilogue_op: Elementwise epilogue function.
         """
-        # m, k, l
+        # A/B come in as Uint8 (FP4 packed as uint8 in torch). Recast to FP4.
+        m = cute.size(mA, mode=[0])
+        k_packed = cute.size(mA, mode=[1])
+        n = cute.size(mB, mode=[0])
+        k = k_packed * 2  # 2 FP4 values per uint8 byte
+
+        # Recast Uint8 → Float4E2M1FN and reshape to (m, k, l) K-major
+        a_fp4_ptr = cute.recast_ptr(mA.iterator, dtype=cutlass.Float4E2M1FN)
         a_tensor = cute.make_tensor(
-            a_ptr,
+            a_fp4_ptr,
             layout=cute.make_ordered_layout((m, k, l), order=(1, 0, 2)),
         )
-        # n, k, l
+        b_fp4_ptr = cute.recast_ptr(mB.iterator, dtype=cutlass.Float4E2M1FN)
         b_tensor = cute.make_tensor(
-            b_ptr,
+            b_fp4_ptr,
             layout=cute.make_ordered_layout(
                 (n, k, l),
                 order=(1, 0, 2),
             ),
         )
-        # m, n, l
+        # C: swap_ab is constexpr, determines layout at compile time
         if cutlass.const_expr(swap_ab):
             c_tensor = cute.make_tensor(
-                c_ptr,
-                layout=cute.make_ordered_layout(
-                    (m, n, l),
-                    order=(0, 1, 2),
-                ),
+                mC.iterator,
+                layout=cute.make_ordered_layout((m, n, l), order=(0, 1, 2)),
             )
         else:
             c_tensor = cute.make_tensor(
-                c_ptr,
-                layout=cute.make_ordered_layout(
-                    (m, n, l),
-                    order=(1, 0, 2),
-                ),
+                mC.iterator,
+                layout=cute.make_ordered_layout((m, n, l), order=(1, 0, 2)),
             )
-        # Scale factor layout: (32, 4, sf_m, 4, sf_k, l) with order (2, 1, 4, 0, 3, 5)
+        # Scale factor tensors: 6D BlockScaledBasicChunk layout from pointers
         sfa_tensor = cute.make_tensor(
             a_sf_ptr,
             layout=cute.make_ordered_layout(
