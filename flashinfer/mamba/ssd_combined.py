@@ -466,7 +466,8 @@ def ssd_combined_fwd(
     chunk_offsets: Optional[torch.Tensor] = None,
     cu_seqlens: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    return_final_states: bool = True,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """
     SSD (Structured State-Space Duality) combined forward pass for Mamba2.
 
@@ -514,6 +515,9 @@ def ssd_combined_fwd(
         Pre-allocated output tensor with shape (batch, seqlen, nheads, headdim).
         Must be contiguous and have the same dtype as x. If None, a new tensor
         is allocated internally.
+    return_final_states : bool
+        Whether to return final_states. If False, the second element of the
+        return tuple is None. Default: True.
 
     Returns
     -------
@@ -631,4 +635,7 @@ def ssd_combined_fwd(
     else:
         out = y_out.contiguous()
 
-    return out, final_states
+    if return_final_states:
+        return out, final_states
+    else:
+        return out, None

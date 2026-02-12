@@ -1291,3 +1291,36 @@ def test_preallocated_output():
     assert torch.allclose(out_ref, out_test, atol=7e-2, rtol=7e-2), (
         "Pre-allocated output values don't match non-pre-allocated run"
     )
+
+
+def test_return_final_states_flag():
+    """Test that return_final_states controls whether final_states is returned."""
+    torch.manual_seed(42)
+    batch, seqlen, nheads, headdim = 1, 128, 8, 64
+    ngroups, dstate, chunk_size = 8, 128, 128
+    dtype = torch.bfloat16
+
+    x = torch.randn(batch, seqlen, nheads, headdim, dtype=dtype, device="cuda")
+    dt = torch.randn(batch, seqlen, nheads, dtype=torch.float32, device="cuda")
+    A = -torch.rand(nheads, dtype=torch.float32, device="cuda") - 1.0
+    B = torch.randn(batch, seqlen, ngroups, dstate, dtype=dtype, device="cuda")
+    C = torch.randn(batch, seqlen, ngroups, dstate, dtype=dtype, device="cuda")
+    D = torch.randn(nheads, dtype=dtype, device="cuda")
+    dt_bias = torch.rand(nheads, dtype=torch.float32, device="cuda") - 4.0
+
+    # With return_final_states=True (default), should return final_states
+    out, final_states = ssd_combined_fwd(
+        x, dt, A, B, C, chunk_size, D=D, dt_bias=dt_bias, dt_softplus=True,
+        return_final_states=True,
+    )
+    assert out is not None
+    assert final_states is not None
+    assert final_states.shape == (batch, nheads, headdim, dstate)
+
+    # With return_final_states=False, final_states should be None
+    out2, final_states2 = ssd_combined_fwd(
+        x, dt, A, B, C, chunk_size, D=D, dt_bias=dt_bias, dt_softplus=True,
+        return_final_states=False,
+    )
+    assert out2 is not None
+    assert final_states2 is None
