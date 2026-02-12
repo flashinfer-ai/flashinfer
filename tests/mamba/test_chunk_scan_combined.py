@@ -13,7 +13,10 @@ import torch
 from flashinfer.mamba import ssd_combined_fwd
 
 # Import Triton reference for comparison
-from .triton_reference.ssd_combined import _mamba_chunk_scan_combined_fwd
+from .triton_reference.ssd_combined import (
+    _mamba_chunk_scan_combined_fwd,
+    mamba_chunk_scan_combined,
+)
 from .triton_reference.ssd_chunk_state import _chunk_cumsum_fwd, _chunk_state_fwd
 from .triton_reference.ssd_state_passing import _state_passing_fwd
 from .triton_reference.ssd_bmm import _bmm_chunk_fwd
@@ -1324,3 +1327,104 @@ def test_return_final_states_flag():
     )
     assert out2 is not None
     assert final_states2 is None
+
+
+class TestVarlenEndToEnd:
+    """End-to-end test comparing ssd_combined_fwd against the full Triton
+    mamba_chunk_scan_combined reference (including chunk_state_varlen).
+
+    The reference decomposes into 5 separate Triton kernels + chunk_state_varlen
+    for per-sequence final states. Our fused CuTe kernel computes everything
+    inline. This test validates that final_states from our kernel matches the
+    reference's varlen_states (the true per-sequence final states).
+    """
+
+    ATOL = 7e-2
+    RTOL = 7e-2
+
+    @staticmethod
+    def _make_inputs(seq_lengths, chunk_size=128, nheads=8, headdim=64,
+                     dstate=128, ngroups=8):
+        torch.manual_seed(42)
+        num_seqs = len(seq_lengths)
+        total_seqlen = sum(seq_lengths)
+
+        cu_seqlens = torch.tensor(
+            [0] + list(torch.cumsum(torch.tensor(seq_lengths), dim=0).tolist()),
+            dtype=torch.int32, device="cuda",
+        )
+        seq_idx, chunk_indices, chunk_offsets = _compute_varlen_metadata(
+            cu_seqlens, chunk_size
+        )
+
+        dtype = torch.bfloat16
+        x = torch.randn(1, total_seqlen, nheads, headdim, dtype=dtype, device="cuda")
+        dt = torch.randn(1, total_seqlen, nheads, dtype=torch.float32, device="cuda")
+        A = -torch.rand(nheads, dtype=torch.float32, device="cuda") - 1.0
+        B = torch.randn(1, total_seqlen, ngroups, dstate, dtype=dtype, device="cuda")
+        C = torch.randn(1, total_seqlen, ngroups, dstate, dtype=dtype, device="cuda")
+        D = torch.randn(nheads, dtype=dtype, device="cuda")
+        dt_bias = torch.rand(nheads, dtype=torch.float32, device="cuda") - 4.0
+        initial_states = torch.randn(
+            num_seqs, nheads, headdim, dstate, dtype=dtype, device="cuda"
+        )
+
+        return dict(
+            x=x, dt=dt, A=A, B=B, C=C, D=D, dt_bias=dt_bias,
+            chunk_size=chunk_size, initial_states=initial_states,
+            seq_idx=seq_idx, chunk_indices=chunk_indices,
+            chunk_offsets=chunk_offsets, cu_seqlens=cu_seqlens,
+        )
+
+    def _run_and_check(self, seq_lengths, tag):
+        inp = self._make_inputs(seq_lengths)
+
+        # Reference: full Triton mamba_chunk_scan_combined with return_varlen_states
+        # This calls chunk_state_varlen internally to get per-sequence final states.
+        # return_varlen_states=True, return_final_states=False returns a single tensor.
+        varlen_states_ref = mamba_chunk_scan_combined(
+            inp["x"], inp["dt"], inp["A"], inp["B"], inp["C"],
+            inp["chunk_size"],
+            D=inp["D"], dt_bias=inp["dt_bias"], dt_softplus=True,
+            initial_states=inp["initial_states"],
+            seq_idx=inp["seq_idx"],
+            chunk_indices=inp["chunk_indices"],
+            chunk_offsets=inp["chunk_offsets"],
+            cu_seqlens=inp["cu_seqlens"],
+            return_final_states=False,
+            return_varlen_states=True,
+        )
+
+        # FlashInfer: our final_states IS the per-sequence final states
+        out_test, final_states_test = ssd_combined_fwd(
+            inp["x"], inp["dt"], inp["A"], inp["B"], inp["C"],
+            inp["chunk_size"],
+            D=inp["D"], dt_bias=inp["dt_bias"], dt_softplus=True,
+            initial_states=inp["initial_states"],
+            seq_idx=inp["seq_idx"],
+            chunk_indices=inp["chunk_indices"],
+            chunk_offsets=inp["chunk_offsets"],
+        )
+
+        assert final_states_test is not None
+        assert final_states_test.shape == varlen_states_ref.shape, (
+            f"shape mismatch: {final_states_test.shape} vs {varlen_states_ref.shape}"
+        )
+
+        ref = varlen_states_ref.to(final_states_test.dtype)
+        match = torch.allclose(ref, final_states_test, atol=self.ATOL, rtol=self.RTOL)
+        if not match:
+            diff = (ref - final_states_test).abs()
+            print(f"FAIL [{tag}] max_diff={diff.max().item():.4f}")
+        else:
+            print(f"OK [{tag}] final_states match varlen_states_ref")
+
+        assert match, f"[{tag}] final_states vs varlen_states mismatch"
+
+    def test_chunk_aligned(self):
+        """Chunk-aligned sequences: [128, 256, 128]."""
+        self._run_and_check([128, 256, 128], "e2e chunk-aligned")
+
+    def test_non_chunk_aligned(self):
+        """Non-chunk-aligned sequences: [80, 176]."""
+        self._run_and_check([80, 176], "e2e non-aligned")

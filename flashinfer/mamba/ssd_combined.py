@@ -523,13 +523,27 @@ def ssd_combined_fwd(
     -------
     out : torch.Tensor
         Output tensor with shape (batch, seqlen, nheads, headdim)
-    final_states : torch.Tensor
-        Final state tensor with shape (batch, nheads, headdim, dstate)
+    final_states : torch.Tensor or None
+        Final state tensor with shape (batch, nheads, headdim, dstate),
+        or (num_seqs, nheads, headdim, dstate) when varlen is active
+        (seq_idx provided). None if return_final_states is False.
 
     Notes
     -----
     - Requires SM100+ (Blackwell) for the CuTe DSL SSD kernel.
     - The kernel is hardcoded for N=128 (dstate), L=128 (chunk_size), D=64 (headdim).
+    - Difference from the Triton reference: the reference
+      mamba_chunk_scan_combined has a separate return_varlen_states flag
+      that triggers chunk_state_varlen — an extra Triton kernel that
+      recomputes per-sequence final states from cu_seqlens. This is
+      necessary because the reference's _state_passing_fwd only produces
+      a single final_states of shape (batch, ...), which for batch=1
+      varlen is just the state after the last sequence. Our fused CuTe
+      kernel computes per-sequence final states on the fly (stored to
+      fstate[seq_id] at every sequence transition), so final_states
+      already has shape (num_seqs, nheads, headdim, dstate) when varlen
+      is active. No separate varlen_states tensor or flag is needed —
+      final_states serves both purposes.
     """
     batch, seqlen, nheads, headdim = x.shape
     _, _, ngroups, dstate = B.shape
@@ -571,7 +585,6 @@ def ssd_combined_fwd(
             f"chunk_indices and chunk_offsets must have the same shape, "
             f"got {chunk_indices.shape} vs {chunk_offsets.shape}"
         )
-
     # Validate pre-allocated output tensor
     if out is not None:
         assert out.shape == (batch, seqlen, nheads, headdim), (
