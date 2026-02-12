@@ -653,6 +653,7 @@ class SSDKernel:
             tma_tensor_p,
             tma_atom_y,
             tma_tensor_y,
+            y,
             tma_atom_delta,
             tma_tensor_delta,
             tma_atom_cumsum_delta,
@@ -705,6 +706,7 @@ class SSDKernel:
         tma_tensor_p: cute.Tensor,
         tma_atom_y: cute.CopyAtom,
         tma_tensor_y: cute.Tensor,
+        y_gmem: cute.Tensor,  # (L, D, C, EH, B) raw gmem tensor for masked store
         tma_atom_delta: cute.CopyAtom,
         tma_tensor_delta: cute.Tensor,
         tma_atom_cumsum_delta: cute.CopyAtom,
@@ -2439,6 +2441,16 @@ class SSDKernel:
 
             tRS_rCompute = cute.make_fragment(tRS_rY.shape, self.acc_dtype)
 
+            # Step 4.4a: coordinate tensor for masked warp-level gmem store.
+            # Partition an identity tensor with the same tiled copy used for
+            # tmem load (tiled_t2r_inter2) to get per-register (l, d)
+            # coordinates within epi_tile. The R2S copy derives its thread
+            # layout from tiled_t2r_inter2, so registers align.
+            epi_coord_tensor = cute.make_identity_tensor(epi_tile)
+            thr_t2r_inter2 = tiled_t2r_inter2.get_slice(local_tidx)
+            # ((T2R_ATOM_V, T2R_REST_V), T2R_M, T2R_N)
+            tYCoord = thr_t2r_inter2.partition_D(epi_coord_tensor)
+
             tiled_s2r_x = None
             tSR_sX = None
             tSR_rX = None
@@ -2556,6 +2568,7 @@ class SSDKernel:
                     else:
                         c_idx = chunk_idx
                         c_off = 0
+                        chunk_size_limit = L
 
                     # Conditionally wait for Delta/INTRA2_ACC/INTER2_ACC/X buffer full
                     deltas_pipeline.consumer_wait(
@@ -2730,17 +2743,39 @@ class SSDKernel:
                                         pipeline.PipelineOp.AsyncThread,
                                     )
 
-                            # TMA store Y to global memory
-                            if local_warp_idx == 0:
-                                cute.copy(
-                                    tma_atom_y,
-                                    bSG_sY[None, epi_buffer_idx],
-                                    bSG_gY[None, epi_m, epi_n, c_idx],
-                                )
+                            # Step 4.4b: store Y to global memory.
+                            # For non-aligned boundaries, use masked
+                            # register-to-global store instead of TMA.
+                            l_coord = 0
+                            d_coord = 0
+                            d_off = epi_n * epi_tile[1]
+                            if chunk_size_limit < L or c_off > 0:
+                                # Masked warp-level store: each thread
+                                # stores its registers directly to gmem,
+                                # only for L positions in [c_off, chunk_size_limit).
+                                for reg_idx in cutlass.range(
+                                    cute.size(tRS_rY), unroll_full=True
+                                ):
+                                    coord = tYCoord[reg_idx]
+                                    l_coord = coord[0]
+                                    d_coord = coord[1]
+                                    if l_coord >= c_off and l_coord < chunk_size_limit:
+                                        y_gmem[
+                                            l_coord, d_off + d_coord, c_idx, eh_idx, b_idx
+                                        ] = tRS_rY[reg_idx]
+                            else:
+                                # Normal TMA store (full tile)
+                                if local_warp_idx == 0:
+                                    cute.copy(
+                                        tma_atom_y,
+                                        bSG_sY[None, epi_buffer_idx],
+                                        bSG_gY[None, epi_m, epi_n, c_idx],
+                                    )
 
-                                # Commit TMA store
+                            # Commit + wait TMA pipeline (keeps pipeline
+                            # in sync even when no TMA copy was issued).
+                            if local_warp_idx == 0:
                                 tma_y_pipeline.producer_commit()
-                                # Wait for TMA store
                                 tma_y_pipeline.producer_acquire()
                             # Sync before smem store
                             cute.arch.barrier(
