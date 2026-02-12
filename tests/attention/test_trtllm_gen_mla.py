@@ -485,6 +485,7 @@ def test_trtllm_batch_decode_mla(
 @pytest.mark.parametrize("enable_pdl", [True, False, None])
 @pytest.mark.parametrize("backend", ["trtllm-gen"])
 @pytest.mark.parametrize("MAX_SEQ_LEN", [1024, 8960])
+@pytest.mark.parametrize("skips_softmax", [False, True])
 def test_dsr1_trtllm_mla(
     batch_size: int,
     scale: float,
@@ -495,6 +496,7 @@ def test_dsr1_trtllm_mla(
     enable_pdl: bool,
     backend: str,
     MAX_SEQ_LEN: int,
+    skips_softmax: bool,
 ):
     trtllm_batch_decode_mla(
         batch_size,
@@ -506,7 +508,7 @@ def test_dsr1_trtllm_mla(
         enable_pdl,
         backend,
         MAX_SEQ_LEN,
-        False,  # skips_softmax
+        skips_softmax,
     )
 
 
