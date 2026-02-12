@@ -145,13 +145,19 @@ class FusedMoeLauncher {
                    int64_t weight_layout, ActivationType activation_type);
 
   // Routing logits [num_tokens, num_experts]
-  void check_routing_logits_shape() const {
+  void check_routing_logits() const {
     if (routing_logits.has_value()) {
+      // Check shape
       TVM_FFI_ICHECK_EQ(routing_logits.value().ndim(), 2) << "routing_logits must be 2D.";
       TVM_FFI_ICHECK_EQ(routing_logits.value().size(0), hidden_states.size(0))
           << "routing_logits and hidden_states must have the same number of tokens.";
       TVM_FFI_ICHECK_EQ(routing_logits.value().size(1), args->num_experts)
           << "routing_logits dim1 must match num_experts.";
+
+      // Check dtype
+      TVM_FFI_ICHECK(routing_logits.value().dtype() == dl_float32 ||
+                     routing_logits.value().dtype() == dl_bfloat16)
+          << "routing_logits must be float or bfloat16.";
     }
   }
 
@@ -213,7 +219,7 @@ class FusedMoeLauncher {
                    args->local_expert_offset + args->local_num_experts <= args->num_experts)
         << "expert offset and count must be within valid range";
 
-    check_routing_logits_shape();
+    check_routing_logits();
 
     if (routing_bias.has_value()) {
       check_routing_bias_shape();
@@ -279,6 +285,17 @@ class FusedMoeLauncher {
     workspace.cta_idx_xy_to_batch_idx = static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr());
     workspace.cta_idx_xy_to_mn_limit = static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr());
     workspace.num_non_exiting_ctas = static_cast<int*>(num_non_exiting_ctas.data_ptr());
+
+    // Set dtype of score
+    if (routing_logits.has_value()) {
+      if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3) {
+        TVM_FFI_ICHECK_EQ(routing_logits.value().dtype(), dl_float32)
+            << "routing_logits must be float.";
+        mDtypeScore = btg::Dtype::Fp32;
+      } else {
+        mDtypeScore = btg::Dtype::Bfloat16;
+      }
+    }
   }
 
   void check_moe_common() const {
@@ -583,10 +600,6 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
     if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Llama4) {
       workspace.token_scales = expert_weights.data_ptr();  // Consumed by permuteGemm1 kernel
     }
-    if (routing_logits.has_value()) {
-      mDtypeScore =
-          routing_logits.value().dtype() == dl_float32 ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16;
-    }
   }
 
   void check_moe() const override {
@@ -846,11 +859,6 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
       workspace.expert_weights = FusedMoeLauncher::expert_weights.data_ptr();
     } else {
       workspace.expert_weights = const_cast<void*>(expert_weights.data_ptr());
-    }
-
-    if (routing_logits.has_value()) {
-      mDtypeScore =
-          routing_logits.value().dtype() == dl_float32 ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16;
     }
   }
 
@@ -1778,18 +1786,6 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
       << "unsupported weight_scale_vec_size.";
   auto mDtypeWeights = weight_scale_vec_size == 16 ? btg::Dtype::E2m1 : btg::Dtype::MxE2m1;
 
-  if (routing_logits.has_value()) {
-    TVM_FFI_ICHECK(routing_logits.value().dtype() == dl_float32 ||
-                   routing_logits.value().dtype() == dl_bfloat16)
-        << "routing_logits must be float or bfloat16.";
-    TVM_FFI_ICHECK_EQ(routing_logits.value().ndim(), 2) << "routing_logits must be 2D.";
-    TVM_FFI_ICHECK_EQ(routing_logits.value().size(1), num_experts)
-        << "routing_logits has incorrect shape.";
-    if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3) {
-      TVM_FFI_ICHECK_EQ(routing_logits.value().dtype(), dl_float32)
-          << "routing_logits must be float.";
-    }
-  }
   if (routing_bias.has_value()) {
     TVM_FFI_ICHECK(routing_bias.value().dtype() == dl_bfloat16 ||
                    routing_bias.value().dtype() == dl_float32)

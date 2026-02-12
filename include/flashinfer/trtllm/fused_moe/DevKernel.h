@@ -266,7 +266,7 @@ namespace moe::dev {
     LAUNCH_TILEN(data, coopLaunch, LAUNCH_ESC(__nv_bfloat16, __nv_bfloat16, numExperts, false),    \
                  kernel, numBlocks, numThreads, smemSize, stream);                                 \
   } else {                                                                                         \
-    FLASHINFER_WARN("Unsupported mDtypeScore/mDtypeExpW combination");                             \
+    FLASHINFER_WARN("Unsupported combination of mDtypeScore and mDtypeExpW");                      \
   }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
