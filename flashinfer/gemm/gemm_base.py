@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import functools
+import threading
 from enum import Enum
 from types import SimpleNamespace
 from typing import List, Literal, Optional, Tuple
@@ -1912,6 +1913,256 @@ def execute_cudnn_gemm_fp4_graph(
     else:
         graph.execute_plan_at_index(
             variant_pack, workspace_buffer, tactic, handle=_get_cudnn_handle(stream)
+        )
+
+
+# ============================================================================
+# Dynamic shape FP4 GEMM support (requires cuDNN >= 9.18.0)
+# Build ONE graph, execute with different shapes via override_uids/shapes/strides.
+# This avoids the ~287ms per-graph JIT compilation overhead for each unique shape.
+# ============================================================================
+
+CUDNN_DYNAMIC_SHAPE_MIN_VERSION = 91800
+
+# Cache keyed by (topology + max shapes) to ensure graphs built for different
+# max dimensions are not incorrectly reused.
+_dynamic_fp4_graph_cache: dict[tuple, object] = {}
+_dynamic_fp4_graph_cache_lock = threading.Lock()
+
+
+def create_cudnn_dynamic_fp4_gemm_graph(
+    max_a_shape,
+    max_a_stride,
+    max_b_shape,
+    max_b_stride,
+    max_a_descale_shape,
+    max_a_descale_stride,
+    max_b_descale_shape,
+    max_b_descale_stride,
+    ab_type,
+    o_type,
+    block_size,
+    device,
+    alpha_is_not_none,
+    use_nvfp4,
+):
+    """Build a cuDNN FP4 GEMM graph with dynamic shape support.
+
+    The graph is built once with max dimensions and can be executed
+    with different (smaller) shapes via override_uids/shapes/strides.
+
+    Requires cuDNN >= 9.18.0 for is_dynamic_shape_enabled support.
+    """
+    if cudnn.backend_version() < CUDNN_DYNAMIC_SHAPE_MIN_VERSION:
+        raise RuntimeError(
+            f"Dynamic shape FP4 GEMM requires cuDNN >= 9.18.0, "
+            f"but got {cudnn.backend_version_string()}"
+        )
+
+    # Cache key includes max shapes to ensure graphs built for different
+    # max dimensions are not incorrectly reused.
+    cache_key = (
+        max_a_shape,
+        max_a_stride,
+        max_b_shape,
+        max_b_stride,
+        max_a_descale_shape,
+        max_a_descale_stride,
+        max_b_descale_shape,
+        max_b_descale_stride,
+        ab_type,
+        o_type,
+        block_size,
+        str(device),
+        alpha_is_not_none,
+        use_nvfp4,
+    )
+
+    # Double-checked locking for thread safety.
+    if cache_key in _dynamic_fp4_graph_cache:
+        return _dynamic_fp4_graph_cache[cache_key]
+
+    with _dynamic_fp4_graph_cache_lock:
+        # Re-check after acquiring lock.
+        if cache_key in _dynamic_fp4_graph_cache:
+            return _dynamic_fp4_graph_cache[cache_key]
+
+    stream = torch.cuda.current_stream(device)
+    with cudnn.graph(_get_cudnn_handle(stream)) as (graph, _):
+        graph.is_dynamic_shape_enabled = True
+
+        scale_type = cudnn.data_type.FP8_E4M3 if use_nvfp4 else cudnn.data_type.FP8_E8M0
+
+        a_cudnn_tensor = graph.tensor(
+            name="a", dim=max_a_shape, stride=max_a_stride, data_type=ab_type
+        )
+        b_cudnn_tensor = graph.tensor(
+            name="b", dim=max_b_shape, stride=max_b_stride, data_type=ab_type
+        )
+        block_descale_a_cudnn_tensor = graph.tensor(
+            name="block_descale_a",
+            dim=max_a_descale_shape,
+            stride=max_a_descale_stride,
+            data_type=scale_type,
+            reordering_type=cudnn.tensor_reordering.F8_128x4,
+        )
+        block_descale_b_cudnn_tensor = graph.tensor(
+            name="block_descale_b",
+            dim=max_b_descale_shape,
+            stride=max_b_descale_stride,
+            data_type=scale_type,
+            reordering_type=cudnn.tensor_reordering.F8_128x4,
+        )
+
+        dequant_a_tensor = graph.block_scale_dequantize(
+            a_cudnn_tensor,
+            block_descale_a_cudnn_tensor,
+            block_size=[1, block_size],
+            name="dequant_a",
+        )
+        dequant_a_tensor.set_data_type(cudnn.data_type.FLOAT)
+        dequant_b_tensor = graph.block_scale_dequantize(
+            b_cudnn_tensor,
+            block_descale_b_cudnn_tensor,
+            block_size=[block_size, 1],
+            name="dequant_b",
+        )
+        dequant_b_tensor.set_data_type(cudnn.data_type.FLOAT)
+        c_tensor = graph.matmul(
+            dequant_a_tensor,
+            dequant_b_tensor,
+            compute_data_type=cudnn.data_type.FLOAT,
+            name="gemm",
+        )
+        c_tensor.set_data_type(cudnn.data_type.FLOAT)
+
+        c_final_cudnn_tensor = c_tensor
+
+        if alpha_is_not_none:
+            global_scale_cudnn_tensor = graph.tensor(
+                name="global_scale",
+                dim=(1, 1, 1),
+                stride=(1, 1, 1),
+                data_type=cudnn.data_type.FLOAT,
+            )
+            c_final_cudnn_tensor = graph.mul(
+                name="scale_mul",
+                a=c_tensor,
+                b=global_scale_cudnn_tensor,
+                compute_data_type=cudnn.data_type.FLOAT,
+            )
+            global_scale_cudnn_tensor.set_uid(UIDs.ALPHA_UID.value)
+
+        c_final_cudnn_tensor.set_name("c_final").set_output(True).set_data_type(o_type)
+
+        a_cudnn_tensor.set_uid(UIDs.A_UID.value)
+        b_cudnn_tensor.set_uid(UIDs.B_UID.value)
+        block_descale_a_cudnn_tensor.set_uid(UIDs.BLOCK_DESCALE_A_UID.value)
+        block_descale_b_cudnn_tensor.set_uid(UIDs.BLOCK_DESCALE_B_UID.value)
+        c_final_cudnn_tensor.set_uid(UIDs.O_UID.value)
+
+        graph.validate()
+        graph.build_operation_graph()
+        graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.B])
+
+        if (alpha_is_not_none) and (not _is_cublas_fp4_available_in_cudnn()):
+            graph.deselect_engines(["eng0"])
+
+        graph.check_support()
+        graph.build_plans()
+
+        _dynamic_fp4_graph_cache[cache_key] = graph
+        return graph
+
+
+def execute_cudnn_dynamic_fp4_graph(
+    graph,
+    a,
+    b,
+    a_descale,
+    b_descale,
+    alpha,
+    c_final,
+    workspace_buffer,
+    tactic: int = -1,
+):
+    """Execute a dynamic-shape FP4 GEMM graph with runtime shape overrides."""
+    # Compute actual shapes and strides for the runtime tensors
+    real_a_shape, real_a_stride = _get_real_fp4_shape_from_packed_uint8(a)
+    real_b_shape, real_b_stride = _get_real_fp4_shape_from_packed_uint8(b)
+    batch = real_a_shape[0]
+    expanded_a_descale_shape, expanded_a_descale_stride = (
+        _expand_block_scale_tensor_shape(a_descale, batch)
+    )
+    expanded_b_descale_shape, expanded_b_descale_stride = (
+        _expand_block_scale_tensor_shape(b_descale, batch)
+    )
+
+    # Output shape: (batch, M, N)
+    m = real_a_shape[1]
+    n = real_b_shape[2]
+    c_shape = list(real_a_shape)
+    c_shape[2] = n
+    c_stride = [m * n, n, 1]
+
+    override_uids = [
+        UIDs.A_UID.value,
+        UIDs.B_UID.value,
+        UIDs.BLOCK_DESCALE_A_UID.value,
+        UIDs.BLOCK_DESCALE_B_UID.value,
+        UIDs.O_UID.value,
+    ]
+    override_shapes = [
+        list(real_a_shape),
+        list(real_b_shape),
+        list(expanded_a_descale_shape),
+        list(expanded_b_descale_shape),
+        c_shape,
+    ]
+    override_strides = [
+        list(real_a_stride),
+        list(real_b_stride),
+        list(expanded_a_descale_stride),
+        list(expanded_b_descale_stride),
+        c_stride,
+    ]
+
+    variant_pack = {
+        UIDs.A_UID.value: a.view(get_native_fp4_dtype()),
+        UIDs.B_UID.value: b.view(get_native_fp4_dtype()),
+        UIDs.BLOCK_DESCALE_A_UID.value: a_descale,
+        UIDs.BLOCK_DESCALE_B_UID.value: b_descale,
+        UIDs.O_UID.value: c_final,
+    }
+
+    if alpha is not None:
+        variant_pack[UIDs.ALPHA_UID.value] = alpha.view(torch.float)
+
+    if workspace_buffer.numel() < graph.get_workspace_size():
+        workspace_buffer = torch.empty(
+            graph.get_workspace_size(), device=a.device, dtype=torch.uint8
+        )
+
+    stream = torch.cuda.current_stream(a.device)
+
+    if tactic == -1:
+        graph.execute(
+            variant_pack,
+            workspace_buffer,
+            handle=_get_cudnn_handle(stream),
+            override_uids=override_uids,
+            override_shapes=override_shapes,
+            override_strides=override_strides,
+        )
+    else:
+        graph.execute_plan_at_index(
+            variant_pack,
+            workspace_buffer,
+            tactic,
+            handle=_get_cudnn_handle(stream),
+            override_uids=override_uids,
+            override_shapes=override_shapes,
+            override_strides=override_strides,
         )
 
 
