@@ -44,12 +44,10 @@ def test_rope(
     inplace,
     backend,
 ):
-    # Skip cute-dsl backend if not available or for inplace operations
+    # Skip cute-dsl backend if not available
     if backend == "cute-dsl":
         if not is_cute_dsl_available():
             pytest.skip("CuTe-DSL not available")
-        if inplace:
-            pytest.skip("CuTe-DSL backend does not support inplace operations")
 
     rotary_dim = int(head_dim * partial_rotary_factor)
     nnz = batch_size * qkv_len
@@ -174,12 +172,10 @@ def test_rope_pos_ids(
     idtype,
     backend,
 ):
-    # Skip cute-dsl backend if not available or for inplace operations
+    # Skip cute-dsl backend if not available
     if backend == "cute-dsl":
         if not is_cute_dsl_available():
             pytest.skip("CuTe-DSL not available")
-        if inplace:
-            pytest.skip("CuTe-DSL backend does not support inplace operations")
 
     rotary_dim = int(head_dim * partial_rotary_factor)
     nnz = batch_size * qkv_len
