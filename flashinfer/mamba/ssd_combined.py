@@ -101,6 +101,7 @@ class _SSDKernel:
         d_has_hdim: bool = False,
         has_init_states: bool = False,
         has_varlen: bool = False,
+        has_z: bool = False,
         io_dtype=None,
         cumsum_dtype=None,
         acc_dtype=None,
@@ -115,6 +116,7 @@ class _SSDKernel:
             has_d: Whether to fuse D scaling (Y += X*D)
             d_has_hdim: If True, D is (headdim, nheads), else (1, nheads)
             has_init_states: Whether initial states are provided
+            has_z: Whether to apply z gating (y *= z * sigmoid(z))
             io_dtype: Input/output dtype (default: cutlass.BFloat16)
             cumsum_dtype: Cumsum intermediate dtype (default: cutlass.Float32)
             acc_dtype: Accumulator dtype (default: cutlass.Float32)
@@ -146,6 +148,7 @@ class _SSDKernel:
             d_has_hdim,
             has_init_states,
             has_varlen,
+            has_z,
         )
 
         self._compiled_kernel = None
@@ -158,6 +161,7 @@ class _SSDKernel:
         B: torch.Tensor,
         C: torch.Tensor,
         D: Optional[torch.Tensor] = None,
+        z: Optional[torch.Tensor] = None,
         init_states: Optional[torch.Tensor] = None,
         seq_idx: Optional[torch.Tensor] = None,
         chunk_indices: Optional[torch.Tensor] = None,
@@ -204,6 +208,21 @@ class _SSDKernel:
             x_tensor = x_tensor.mark_compact_shape_dynamic(
                 mode=mode, stride_order=x_permuted.dim_order()
             )
+
+        # z: same layout as x — (D, L, C, EH, B) with D stride 1, zero-copy
+        z_tensor = None
+        if z is not None:
+            z_reshaped = z.reshape(batch, nchunks, chunk_size, nheads, headdim)
+            assert z.dtype == io_torch_dtype, (
+                f"z dtype {z.dtype} doesn't match {io_torch_dtype}"
+            )
+            z_permuted = z_reshaped.permute(4, 2, 1, 3, 0)  # (D, L, C, EH, B)
+            z_tensor = from_dlpack(z_permuted, assumed_align=16)
+            for mode in [2, 3, 4]:
+                z_tensor = z_tensor.mark_compact_shape_dynamic(
+                    mode=mode, stride_order=z_permuted.dim_order()
+                )
+
         # delta (dt_processed): (batch, nheads, nchunks, chunk_size) -> (chunk_size, nchunks, nheads, batch)
         # Need dtype conversion from float32 to bf16, but keep the non-contiguous permuted layout
         # so that mode 0 (L) has stride 1 as the kernel expects
@@ -363,6 +382,7 @@ class _SSDKernel:
                 init_states_tensor,
                 fstate_tensor,
                 d_tensor,
+                z_tensor,
                 seq_idx_tensor,
                 chunk_indices_tensor,
                 chunk_offsets_tensor,
@@ -382,6 +402,7 @@ class _SSDKernel:
             init_states_tensor,
             fstate_tensor,
             d_tensor,
+            z_tensor,
             seq_idx_tensor,
             chunk_indices_tensor,
             chunk_offsets_tensor,
@@ -411,6 +432,7 @@ def _get_ssd_kernel(
     d_has_hdim: bool,
     has_init_states: bool = False,
     has_varlen: bool = False,
+    has_z: bool = False,
 ) -> _SSDKernel:
     """Get cached SSD kernel."""
     return _SSDKernel(
@@ -421,6 +443,7 @@ def _get_ssd_kernel(
         d_has_hdim=d_has_hdim,
         has_init_states=has_init_states,
         has_varlen=has_varlen,
+        has_z=has_z,
     )
 
 
@@ -433,6 +456,7 @@ def ssd_combined_fwd(
     C: torch.Tensor,
     chunk_size: int,
     D: Optional[torch.Tensor] = None,
+    z: Optional[torch.Tensor] = None,
     dt_bias: Optional[torch.Tensor] = None,
     dt_softplus: bool = False,
     dt_limit: Tuple[float, float] = (0.0, float("inf")),
@@ -556,6 +580,7 @@ def ssd_combined_fwd(
     has_init_state = True if initial_states is not None else False
 
     has_varlen = seq_idx is not None
+    has_z = z is not None
     kernel = _get_ssd_kernel(
         chunk_size=chunk_size,
         headdim=headdim,
@@ -564,6 +589,7 @@ def ssd_combined_fwd(
         d_has_hdim=d_has_hdim,
         has_init_states=has_init_state,
         has_varlen=has_varlen,
+        has_z=has_z,
     )
 
     out, final_states = kernel.run(
@@ -573,6 +599,7 @@ def ssd_combined_fwd(
         B=B,
         C=C,
         D=D,
+        z=z,
         init_states=initial_states,
         seq_idx=seq_idx,
         chunk_indices=chunk_indices,

@@ -59,6 +59,7 @@ class SSDKernel:
         d_has_hdim: bool,
         has_init_states: bool,
         has_varlen: bool = False,
+        has_z: bool = False,
     ):
         self.io_dtype: Type[cutlass.Numeric] = io_dtype
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
@@ -67,6 +68,8 @@ class SSDKernel:
         self.has_d: bool = has_d
         self.has_init_states: bool = has_init_states
         self.has_varlen: bool = has_varlen
+        # has_z means epilog warp applies z gating: y *= z * sigmoid(z)
+        self.has_z: bool = has_z
         # d_has_hdim = True means D is (D, EH) shape and loaded by TMA
         # d_has_hdim = False means D is (1, EH) shape and loaded directly to register
         self.d_has_hdim: bool = d_has_hdim
@@ -381,6 +384,7 @@ class SSDKernel:
         init_states: cute.Tensor,  # (D, N, EH, B) - D stride 1 (optional)
         fstate: cute.Tensor,  # (D, N, EH, B) - D stride 1 (output)
         d: cute.Tensor,  # (D, EH) or (1, EH) (optional)
+        z: cute.Tensor,  # (D, L, C, EH, B) - D stride 1 (optional, for z gating)
         seq_idx: cute.Tensor,  # (batch, seqlen) int32 (optional)
         chunk_indices: cute.Tensor,  # (num_logical_chunks,) int32 (optional)
         chunk_offsets: cute.Tensor,  # (num_logical_chunks,) int32 (optional)
@@ -662,6 +666,7 @@ class SSDKernel:
             tma_tensor_d,
             tma_atom_initial_states,
             tma_tensor_initial_states,
+            z,
             seq_idx,
             chunk_indices,
             chunk_offsets,
@@ -715,6 +720,7 @@ class SSDKernel:
         tma_tensor_d: cute.Tensor,
         tma_atom_initial_states: Optional[cute.CopyAtom],
         tma_tensor_initial_states: cute.Tensor,
+        z_gmem: cute.Tensor,  # (D, L, C, EH, B) raw gmem tensor for z gating (or None)
         seq_idx: cute.Tensor,  # (batch, seqlen) int32 or None
         chunk_indices: cute.Tensor,  # (num_logical_chunks,) int32 or None
         chunk_offsets: cute.Tensor,  # (num_logical_chunks,) int32 or None
@@ -2441,7 +2447,11 @@ class SSDKernel:
 
             tRS_rCompute = cute.make_fragment(tRS_rY.shape, self.acc_dtype)
 
-            # Step 4.4a: coordinate tensor for masked warp-level gmem store.
+            # Register fragment for z gating (loaded from gmem per subtile)
+            tRS_rZ = None
+            if cutlass.const_expr(self.has_z):
+                tRS_rZ = cute.make_fragment(tRS_rY.shape, self.acc_dtype)
+
             # Partition an identity tensor with the same tiled copy used for
             # tmem load (tiled_t2r_inter2) to get per-register (l, d)
             # coordinates within epi_tile. The R2S copy derives its thread
@@ -2701,6 +2711,37 @@ class SSDKernel:
                                             tRS_rCompute[reg_idx],
                                             tRS_rCompute[reg_idx + 1],
                                         ),
+                                    )
+
+                            # Z gating: y *= z * sigmoid(z) = y *= silu(z)
+                            if cutlass.const_expr(self.has_z):
+                                z_d_off = epi_n * epi_tile[1]
+                                for reg_idx in cutlass.range(
+                                    cute.size(tRS_rZ), unroll_full=True
+                                ):
+                                    coord = tYCoord[reg_idx]
+                                    z_l = coord[0]
+                                    z_d = coord[1]
+                                    tRS_rZ[reg_idx] = z_gmem[
+                                        z_d_off + z_d, z_l, c_idx, eh_idx, b_idx
+                                    ].to(self.acc_dtype)
+                                for reg_idx in range(0, cute.size(tRS_rCompute), 2):
+                                    z0 = tRS_rZ[reg_idx]
+                                    z1 = tRS_rZ[reg_idx + 1]
+                                    # silu(z) = z / (1 + exp(-z))
+                                    s0 = z0 / (
+                                        cutlass.Float32(1.0)
+                                        + cute.math.exp(-z0, fastmath=True)
+                                    )
+                                    s1 = z1 / (
+                                        cutlass.Float32(1.0)
+                                        + cute.math.exp(-z1, fastmath=True)
+                                    )
+                                    tRS_rCompute[reg_idx] = (
+                                        tRS_rCompute[reg_idx] * s0
+                                    )
+                                    tRS_rCompute[reg_idx + 1] = (
+                                        tRS_rCompute[reg_idx + 1] * s1
                                     )
 
                             tRS_rY.store(tRS_rCompute.load().to(self.io_dtype))

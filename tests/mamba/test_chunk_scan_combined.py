@@ -964,3 +964,297 @@ class TestChunkScanCombinedVarlenNonAligned:
 
         assert states_match, "Varlen non-aligned: final states mismatch"
         assert out_match, "Varlen non-aligned: output mismatch"
+
+
+class TestChunkScanCombinedWithZ:
+    """Test chunk scan with z gating: output *= z * sigmoid(z)."""
+
+    ATOL = 7e-2
+    RTOL = 7e-2
+    INPUT_DTYPE = torch.bfloat16
+
+    @pytest.fixture(params=[1, 2])
+    def batch(self, request):
+        return request.param
+
+    @pytest.fixture(params=[8])
+    def nheads(self, request):
+        return request.param
+
+    @pytest.fixture(params=[64])
+    def headdim(self, request):
+        return request.param
+
+    @pytest.fixture(params=[128])
+    def dstate(self, request):
+        return request.param
+
+    @pytest.fixture(params=[128])
+    def chunk_size(self, request):
+        return request.param
+
+    @pytest.fixture(params=[1, 4])
+    def nchunks(self, request):
+        return request.param
+
+    @pytest.fixture(params=[8])
+    def ngroups(self, request):
+        return request.param
+
+    @pytest.fixture
+    def inputs(self, batch, nheads, headdim, dstate, chunk_size, nchunks, ngroups):
+        """Create test inputs with z tensor."""
+        torch.manual_seed(42)
+
+        seqlen = chunk_size * nchunks
+
+        x = torch.randn(
+            batch, seqlen, nheads, headdim, dtype=self.INPUT_DTYPE, device="cuda"
+        )
+        dt = torch.randn(batch, seqlen, nheads, dtype=torch.float32, device="cuda")
+        A = -torch.rand(nheads, dtype=torch.float32, device="cuda") - 1.0
+        B = torch.randn(
+            batch, seqlen, ngroups, dstate, dtype=self.INPUT_DTYPE, device="cuda"
+        )
+        C = torch.randn(
+            batch, seqlen, ngroups, dstate, dtype=self.INPUT_DTYPE, device="cuda"
+        )
+        D = torch.randn(nheads, dtype=self.INPUT_DTYPE, device="cuda")
+        dt_bias = torch.rand(nheads, dtype=torch.float32, device="cuda") - 4.0
+        z = torch.randn(
+            batch, seqlen, nheads, headdim, dtype=self.INPUT_DTYPE, device="cuda"
+        )
+
+        return {
+            "x": x,
+            "dt": dt,
+            "A": A,
+            "B": B,
+            "C": C,
+            "D": D,
+            "z": z,
+            "dt_bias": dt_bias,
+            "chunk_size": chunk_size,
+        }
+
+    @pytest.fixture
+    def reference_output(self, inputs):
+        """Compute reference output using Triton implementation with z gating.
+
+        The Triton combined reference returns un-gated output when z is provided.
+        We compute without z, then apply z gating manually: out *= silu(z).
+        """
+        out, dt_out, dA_cumsum, states, final_states = _mamba_chunk_scan_combined_fwd(
+            inputs["x"],
+            inputs["dt"],
+            inputs["A"],
+            inputs["B"],
+            inputs["C"],
+            inputs["chunk_size"],
+            D=inputs["D"],
+            z=None,
+            dt_bias=inputs["dt_bias"],
+            initial_states=None,
+            seq_idx=None,
+            dt_softplus=True,
+        )
+        # Apply z gating: out *= z * sigmoid(z) = out *= silu(z)
+        z = inputs["z"].float()
+        out = out.float() * (z * torch.sigmoid(z))
+        return out, final_states
+
+    def test_output_correctness(self, inputs, reference_output):
+        """Test that FlashInfer kernel output matches Triton reference with z gating."""
+        out_ref, final_states_ref = reference_output
+
+        out_test, final_states_test = ssd_combined_fwd(
+            inputs["x"],
+            inputs["dt"],
+            inputs["A"],
+            inputs["B"],
+            inputs["C"],
+            inputs["chunk_size"],
+            D=inputs["D"],
+            z=inputs["z"],
+            dt_bias=inputs["dt_bias"],
+            dt_softplus=True,
+        )
+
+        out_ref_cmp = out_ref.to(out_test.dtype)
+        out_match = torch.allclose(
+            out_ref_cmp, out_test, atol=self.ATOL, rtol=self.RTOL
+        )
+
+        if out_match:
+            print(
+                f"✓ [Z] Outputs match within tolerance (atol={self.ATOL}, rtol={self.RTOL})"
+            )
+        else:
+            print("✗ [Z] Outputs do NOT match within tolerance")
+            ref_np = out_ref_cmp.detach().cpu().float().numpy()
+            test_np = out_test.detach().cpu().float().numpy()
+            mismatch_mask = ~np.isclose(ref_np, test_np, atol=self.ATOL, rtol=self.RTOL)
+            n = np.sum(mismatch_mask)
+            total = ref_np.size
+            print(f"  Mismatched: {n}/{total} ({100 * n / total:.2f}%)")
+            idxs = np.argwhere(mismatch_mask)
+            for idx in idxs[:10]:
+                t = tuple(int(i) for i in idx)
+                print(
+                    f"  {t}: ref={ref_np[t]:.6f}, test={test_np[t]:.6f}, "
+                    f"diff={abs(ref_np[t] - test_np[t]):.6e}"
+                )
+
+        # Final states should be unaffected by z gating
+        final_states_ref_cmp = final_states_ref.to(final_states_test.dtype)
+        states_match = torch.allclose(
+            final_states_ref_cmp, final_states_test, atol=self.ATOL, rtol=self.RTOL
+        )
+        if states_match:
+            print(
+                f"✓ [Z] Final states match within tolerance (atol={self.ATOL}, rtol={self.RTOL})"
+            )
+        else:
+            print("✗ [Z] Final states do NOT match within tolerance")
+
+        assert out_match, "[Z] Output mismatch"
+        assert states_match, "[Z] Final states mismatch"
+
+
+class TestChunkScanCombinedWithZVarlen:
+    """Test z gating combined with variable-length sequences."""
+
+    ATOL = 7e-2
+    RTOL = 7e-2
+
+    def test_output_correctness(self):
+        """Test z gating with non-aligned varlen sequences."""
+        nheads, headdim, dstate, chunk_size, ngroups = 8, 64, 128, 128, 8
+        seq_lengths = [80, 176]
+        inputs = TestChunkScanCombinedVarlen._make_inputs(
+            nheads, headdim, dstate, chunk_size, ngroups, seq_lengths
+        )
+
+        # Add z tensor
+        torch.manual_seed(123)
+        z = torch.randn_like(inputs["x"])
+        inputs["z"] = z
+
+        # Compute reference per-sequence with z gating
+        ref = self._compute_per_sequence_reference_with_z(inputs)
+        out_ref, final_states_ref = ref
+
+        out_test, final_states_test = ssd_combined_fwd(
+            inputs["x"],
+            inputs["dt"],
+            inputs["A"],
+            inputs["B"],
+            inputs["C"],
+            inputs["chunk_size"],
+            D=inputs["D"],
+            z=inputs["z"],
+            dt_bias=inputs["dt_bias"],
+            dt_softplus=True,
+            initial_states=inputs["initial_states"],
+            seq_idx=inputs["seq_idx"],
+            chunk_indices=inputs["chunk_indices"],
+            chunk_offsets=inputs["chunk_offsets"],
+        )
+
+        out_ref_cmp = out_ref.to(out_test.dtype)
+        out_match = torch.allclose(
+            out_ref_cmp, out_test, atol=self.ATOL, rtol=self.RTOL
+        )
+        if out_match:
+            print("OK [Z+Varlen] Outputs match")
+        else:
+            diff = (out_ref_cmp - out_test).abs()
+            print(f"FAIL [Z+Varlen] Outputs mismatch, max_diff={diff.max():.6f}")
+
+        fs_ref_cmp = final_states_ref.to(final_states_test.dtype)
+        states_match = torch.allclose(
+            fs_ref_cmp, final_states_test, atol=self.ATOL, rtol=self.RTOL
+        )
+        if states_match:
+            print("OK [Z+Varlen] Final states match")
+        else:
+            diff = (fs_ref_cmp - final_states_test).abs()
+            print(f"FAIL [Z+Varlen] Final states mismatch, max_diff={diff.max():.6f}")
+
+        assert out_match, "[Z+Varlen] Output mismatch"
+        assert states_match, "[Z+Varlen] Final states mismatch"
+
+    @staticmethod
+    def _compute_per_sequence_reference_with_z(inputs):
+        """Compute reference per-sequence with z gating."""
+        x = inputs["x"]
+        dt = inputs["dt"]
+        A = inputs["A"]
+        B = inputs["B"]
+        C = inputs["C"]
+        D = inputs["D"]
+        z = inputs["z"]
+        dt_bias = inputs["dt_bias"]
+        chunk_size = inputs["chunk_size"]
+        initial_states = inputs["initial_states"]
+        cu_seqlens = inputs["cu_seqlens"]
+        num_seqs = inputs["num_seqs"]
+        dstate = inputs["dstate"]
+
+        out_parts = []
+        final_states_list = []
+
+        for i in range(num_seqs):
+            s = cu_seqlens[i].item()
+            e = cu_seqlens[i + 1].item()
+
+            x_i = x[:, s:e, :, :]
+            dt_i = dt[:, s:e, :]
+            B_i = B[:, s:e, :, :]
+            C_i = C[:, s:e, :, :]
+            z_i = z[:, s:e, :, :]
+            init_i = initial_states[i : i + 1]
+
+            dA_cumsum_i, dt_proc_i = _chunk_cumsum_fwd(
+                dt_i, A, chunk_size, dt_bias=dt_bias, dt_softplus=True
+            )
+            states_i = _chunk_state_fwd(
+                B_i, x_i, dt_proc_i, dA_cumsum_i, seq_idx=None, states_in_fp32=True
+            )
+            states_i, fstates_i = _state_passing_fwd(
+                rearrange(states_i, "... p n -> ... (p n)"),
+                dA_cumsum_i,
+                initial_states=rearrange(init_i, "... p n -> ... (p n)"),
+                seq_idx=None,
+                chunk_size=chunk_size,
+                out_dtype=C.dtype,
+            )
+            states_i, fstates_i = (
+                rearrange(t, "... (p n) -> ... p n", n=dstate)
+                for t in [states_i, fstates_i]
+            )
+            CB_i = _bmm_chunk_fwd(
+                C_i, B_i, chunk_size, seq_idx=None, output_dtype=torch.float32
+            )
+            out_i = _chunk_scan_fwd(
+                CB_i,
+                x_i,
+                dt_proc_i,
+                dA_cumsum_i,
+                C_i,
+                states_i,
+                D=D,
+                z=None,
+                seq_idx=None,
+                initial_states=None,
+            )
+            # Apply z gating manually: out *= silu(z)
+            z_f = z_i.float()
+            out_i = out_i.float() * (z_f * torch.sigmoid(z_f))
+
+            out_parts.append(out_i)
+            final_states_list.append(fstates_i)
+
+        out_packed = torch.cat(out_parts, dim=1)
+        final_states_packed = torch.cat(final_states_list, dim=0)
+        return out_packed, final_states_packed
