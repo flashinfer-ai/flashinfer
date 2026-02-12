@@ -49,6 +49,47 @@ def get_seed_and_offset(
     return int(seed), int(offset)
 
 
+def _validate_per_request_generator(
+    seed_arr: torch.Tensor,
+    offset_arr: torch.Tensor,
+    batch_size: int,
+) -> None:
+    """Validate per-request generator tensors.
+
+    Parameters
+    ----------
+    seed_arr : torch.Tensor
+        Seed array tensor
+    offset_arr : torch.Tensor
+        Offset array tensor
+    batch_size : int
+        Expected batch size
+
+    Raises
+    ------
+    TypeError
+        If tensors are not int64
+    ValueError
+        If tensors are not on CUDA device or have incorrect shape
+    """
+    if seed_arr.dtype != torch.int64:
+        raise TypeError(f"seed_arr must be int64 tensor, got {seed_arr.dtype}")
+    if offset_arr.dtype != torch.int64:
+        raise TypeError(f"offset_arr must be int64 tensor, got {offset_arr.dtype}")
+    if not seed_arr.is_cuda:
+        raise ValueError(f"seed_arr must be on CUDA device, got {seed_arr.device}")
+    if not offset_arr.is_cuda:
+        raise ValueError(f"offset_arr must be on CUDA device, got {offset_arr.device}")
+    if seed_arr.shape != (batch_size,):
+        raise ValueError(
+            f"seed_arr must have shape ({batch_size},), got {seed_arr.shape}"
+        )
+    if offset_arr.shape != (batch_size,):
+        raise ValueError(
+            f"offset_arr must have shape ({batch_size},), got {offset_arr.shape}"
+        )
+
+
 @functools.cache
 def get_sampling_module():
     module = gen_sampling_module().build_and_load()
@@ -144,16 +185,35 @@ def get_sampling_module():
         batch_size = indices.size(0) if indices is not None else probs.size(0)
         out_dtype = indices.dtype if indices is not None else torch.int32
         samples = torch.empty(batch_size, dtype=out_dtype, device=device)
-        if seed is None or offset is None:
-            seed, offset = get_seed_and_offset(batch_size, generator, device)
-        module.sampling_from_probs(
-            probs,
-            samples,
-            indices,
-            deterministic,
-            seed,
-            offset,
-        )
+
+        # Check if generator is a tuple of tensors (per-request generators)
+        if isinstance(generator, tuple):
+            seed_arr, offset_arr = generator
+            _validate_per_request_generator(seed_arr, offset_arr, batch_size)
+            module.sampling_from_probs(
+                probs,
+                samples,
+                indices,
+                deterministic,
+                0,
+                0,  # scalar seed/offset (ignored when arrays provided)
+                seed_arr,
+                offset_arr,
+            )
+        else:
+            # Traditional single generator path
+            if seed is None or offset is None:
+                seed, offset = get_seed_and_offset(batch_size, generator, device)
+            module.sampling_from_probs(
+                probs,
+                samples,
+                indices,
+                deterministic,
+                seed,
+                offset,
+                None,
+                None,  # no per-request generators
+            )
         return samples
 
     # torch library for sampling_from_probs
@@ -190,18 +250,39 @@ def get_sampling_module():
         batch_size = indices.size(0) if indices is not None else probs.size(0)
         out_dtype = indices.dtype if indices is not None else torch.int32
         samples = torch.empty(batch_size, dtype=out_dtype, device=device)
-        if seed is None or offset is None:
-            seed, offset = get_seed_and_offset(batch_size * 32, generator, device)
-        module.top_p_sampling_from_probs(
-            probs,
-            samples,
-            indices,
-            maybe_top_p_arr,
-            top_p_val,
-            deterministic,
-            seed,
-            offset,
-        )
+
+        # Check if generator is a tuple of tensors (per-request generators)
+        if isinstance(generator, tuple):
+            seed_arr, offset_arr = generator
+            _validate_per_request_generator(seed_arr, offset_arr, batch_size)
+            module.top_p_sampling_from_probs(
+                probs,
+                samples,
+                indices,
+                maybe_top_p_arr,
+                top_p_val,
+                deterministic,
+                0,
+                0,  # scalar seed/offset (ignored when arrays provided)
+                seed_arr,
+                offset_arr,
+            )
+        else:
+            # Traditional single generator path
+            if seed is None or offset is None:
+                seed, offset = get_seed_and_offset(batch_size * 32, generator, device)
+            module.top_p_sampling_from_probs(
+                probs,
+                samples,
+                indices,
+                maybe_top_p_arr,
+                top_p_val,
+                deterministic,
+                seed,
+                offset,
+                None,
+                None,  # no per-request generators
+            )
         return samples
 
     @register_fake_op("flashinfer::top_p_sampling_from_probs")
@@ -237,18 +318,39 @@ def get_sampling_module():
         maybe_top_k_arr = maybe_top_k_arr.int() if maybe_top_k_arr is not None else None
         out_dtype = indices.dtype if indices is not None else torch.int32
         samples = torch.empty(batch_size, dtype=out_dtype, device=device)
-        if seed is None or offset is None:
-            seed, offset = get_seed_and_offset(batch_size * 32, generator, device)
-        module.top_k_sampling_from_probs(
-            probs,
-            samples,
-            indices,
-            maybe_top_k_arr,
-            top_k_val,
-            deterministic,
-            seed,
-            offset,
-        )
+
+        # Check if generator is a tuple of tensors (per-request generators)
+        if isinstance(generator, tuple):
+            seed_arr, offset_arr = generator
+            _validate_per_request_generator(seed_arr, offset_arr, batch_size)
+            module.top_k_sampling_from_probs(
+                probs,
+                samples,
+                indices,
+                maybe_top_k_arr,
+                top_k_val,
+                deterministic,
+                0,
+                0,  # scalar seed/offset (ignored when arrays provided)
+                seed_arr,
+                offset_arr,
+            )
+        else:
+            # Traditional single generator path
+            if seed is None or offset is None:
+                seed, offset = get_seed_and_offset(batch_size * 32, generator, device)
+            module.top_k_sampling_from_probs(
+                probs,
+                samples,
+                indices,
+                maybe_top_k_arr,
+                top_k_val,
+                deterministic,
+                seed,
+                offset,
+                None,
+                None,  # no per-request generators
+            )
         return samples
 
     @register_fake_op("flashinfer::top_k_sampling_from_probs")
@@ -286,18 +388,39 @@ def get_sampling_module():
         batch_size = indices.size(0) if indices is not None else probs.size(0)
         out_dtype = indices.dtype if indices is not None else torch.int32
         samples = torch.empty(batch_size, dtype=out_dtype, device=device)
-        if seed is None or offset is None:
-            seed, offset = get_seed_and_offset(batch_size, generator, device)
-        module.min_p_sampling_from_probs(
-            probs,
-            samples,
-            indices,
-            maybe_min_p_arr,
-            min_p_val,
-            deterministic,
-            seed,
-            offset,
-        )
+
+        # Check if generator is a tuple of tensors (per-request generators)
+        if isinstance(generator, tuple):
+            seed_arr, offset_arr = generator
+            _validate_per_request_generator(seed_arr, offset_arr, batch_size)
+            module.min_p_sampling_from_probs(
+                probs,
+                samples,
+                indices,
+                maybe_min_p_arr,
+                min_p_val,
+                deterministic,
+                0,
+                0,  # scalar seed/offset (ignored when arrays provided)
+                seed_arr,
+                offset_arr,
+            )
+        else:
+            # Traditional single generator path
+            if seed is None or offset is None:
+                seed, offset = get_seed_and_offset(batch_size, generator, device)
+            module.min_p_sampling_from_probs(
+                probs,
+                samples,
+                indices,
+                maybe_min_p_arr,
+                min_p_val,
+                deterministic,
+                seed,
+                offset,
+                None,
+                None,  # no per-request generators
+            )
         return samples
 
     # torch library for top_k_top_p_sampling_from_probs
@@ -324,20 +447,43 @@ def get_sampling_module():
         batch_size = indices.size(0) if indices is not None else probs.size(0)
         out_dtype = indices.dtype if indices is not None else torch.int32
         samples = torch.empty(batch_size, dtype=out_dtype, device=device)
-        if seed is None or offset is None:
-            seed, offset = get_seed_and_offset(batch_size * 32, generator, device)
-        module.top_k_top_p_sampling_from_probs(
-            probs,
-            samples,
-            indices,
-            maybe_top_k_arr,
-            top_k_val,
-            maybe_top_p_arr,
-            top_p_val,
-            deterministic,
-            seed,
-            offset,
-        )
+
+        # Check if generator is a tuple of tensors (per-request generators)
+        if isinstance(generator, tuple):
+            seed_arr, offset_arr = generator
+            _validate_per_request_generator(seed_arr, offset_arr, batch_size)
+            module.top_k_top_p_sampling_from_probs(
+                probs,
+                samples,
+                indices,
+                maybe_top_k_arr,
+                top_k_val,
+                maybe_top_p_arr,
+                top_p_val,
+                deterministic,
+                0,
+                0,  # scalar seed/offset (ignored when arrays provided)
+                seed_arr,
+                offset_arr,
+            )
+        else:
+            # Traditional single generator path
+            if seed is None or offset is None:
+                seed, offset = get_seed_and_offset(batch_size * 32, generator, device)
+            module.top_k_top_p_sampling_from_probs(
+                probs,
+                samples,
+                indices,
+                maybe_top_k_arr,
+                top_k_val,
+                maybe_top_p_arr,
+                top_p_val,
+                deterministic,
+                seed,
+                offset,
+                None,
+                None,  # no per-request generators
+            )
         return samples
 
     @register_fake_op("flashinfer::top_k_top_p_sampling_from_probs")
@@ -668,7 +814,9 @@ def sampling_from_probs(
     probs: torch.Tensor,
     indices: Optional[torch.Tensor] = None,
     deterministic: bool = True,
-    generator: Optional[torch.Generator] = None,
+    generator: Optional[
+        Union[torch.Generator, Tuple[torch.Tensor, torch.Tensor]]
+    ] = None,
     check_nan: bool = False,
     seed: Optional[int] = None,
     offset: Optional[int] = None,
@@ -691,8 +839,38 @@ def sampling_from_probs(
         and output dtype defaults to ``torch.int32``.
     deterministic: bool
         Whether to use deterministic kernel implementation, default is ``True``.
-    generator: Optional[torch.Generator]
-        A random number generator for the operation.
+    generator: Optional[Union[torch.Generator, Tuple[torch.Tensor, torch.Tensor]]]
+        Random number generator. Can be either:
+
+        - A ``torch.Generator`` for traditional single-generator sampling (default)
+        - A tuple of ``(seed_arr, offset_arr)`` tensors for per-request generators,
+          where both are int64 tensors of shape ``(batch_size,)`` on CUDA.
+
+        **Per-request generator behavior:**
+
+        - Each request uses its own seed from ``seed_arr[i]``
+        - Offsets track RNG state and are automatically updated in-place after sampling
+        - Each RNG call consumes 4 values, so offsets increment by 4 per call
+        - For iterative samplers (top_p, top_k, top_k_top_p), offsets increment by ``4 * num_rounds``
+          where ``num_rounds`` varies based on the sampling algorithm
+        - Sequential calls with the same generator tuple will use updated offsets (cumulative)
+
+        **Example with per-request generators:**
+
+        .. code-block:: python
+
+            # Create per-request generators
+            seed_arr = torch.randint(0, 2**32, (batch_size,), dtype=torch.int64, device="cuda")
+            offset_arr = torch.zeros(batch_size, dtype=torch.int64, device="cuda")
+
+            # First sampling call
+            samples1 = sampling_from_probs(probs1, generator=(seed_arr, offset_arr))
+            # offset_arr is now [4, 4, 4, ...] (automatically updated)
+
+            # Second sampling call reuses same generators with updated offsets
+            samples2 = sampling_from_probs(probs2, generator=(seed_arr, offset_arr))
+            # offset_arr is now [8, 8, 8, ...] (cumulative)
+
     check_nan: bool
         Whether to check nan in :attr:`probs`, default is ``False``.
     seed: Optional[int]
@@ -742,7 +920,9 @@ def top_p_sampling_from_probs(
     top_p: Union[torch.Tensor, float],
     indices: Optional[torch.Tensor] = None,
     deterministic: bool = True,
-    generator: Optional[torch.Generator] = None,
+    generator: Optional[
+        Union[torch.Generator, Tuple[torch.Tensor, torch.Tensor]]
+    ] = None,
     check_nan: bool = False,
     seed: Optional[int] = None,
     offset: Optional[int] = None,
@@ -774,8 +954,12 @@ def top_p_sampling_from_probs(
         and output dtype defaults to ``torch.int32``.
     deterministic: bool
         Whether to use deterministic kernel implementation, default is ``True``.
-    generator: Optional[torch.Generator]
-        A random number generator for the operation.
+    generator: Optional[Union[torch.Generator, Tuple[torch.Tensor, torch.Tensor]]]
+        Random number generator. Can be either:
+        - A ``torch.Generator`` for traditional single-generator sampling (default)
+        - A tuple of ``(seed_arr, offset_arr)`` tensors for per-request generators,
+          where both are int64 tensors of shape ``(batch_size,)`` on CUDA.
+          Offsets are automatically updated in-place after sampling.
     check_nan: bool
         Whether to check nan in :attr:`probs`, default is ``False``.
     seed: Optional[int]
@@ -839,7 +1023,9 @@ def top_k_sampling_from_probs(
     top_k: Union[torch.Tensor, int],
     indices: Optional[torch.Tensor] = None,
     deterministic: bool = True,
-    generator: Optional[torch.Generator] = None,
+    generator: Optional[
+        Union[torch.Generator, Tuple[torch.Tensor, torch.Tensor]]
+    ] = None,
     check_nan: bool = False,
     seed: Optional[int] = None,
     offset: Optional[int] = None,
@@ -871,8 +1057,12 @@ def top_k_sampling_from_probs(
         and output dtype defaults to ``torch.int32``.
     deterministic: bool
         Whether to use deterministic kernel implementation, default is ``True``.
-    generator: Optional[torch.Generator]
-        A random number generator for the operation.
+    generator: Optional[Union[torch.Generator, Tuple[torch.Tensor, torch.Tensor]]]
+        Random number generator. Can be either:
+        - A ``torch.Generator`` for traditional single-generator sampling (default)
+        - A tuple of ``(seed_arr, offset_arr)`` tensors for per-request generators,
+          where both are int64 tensors of shape ``(batch_size,)`` on CUDA.
+          Offsets are automatically updated in-place after sampling.
     check_nan: bool
         Whether to check nan in :attr:`probs`, default is ``False``.
     seed: Optional[int]
@@ -936,7 +1126,9 @@ def min_p_sampling_from_probs(
     min_p: Union[torch.Tensor, float],
     indices: Optional[torch.Tensor] = None,
     deterministic: bool = True,
-    generator: Optional[torch.Generator] = None,
+    generator: Optional[
+        Union[torch.Generator, Tuple[torch.Tensor, torch.Tensor]]
+    ] = None,
     check_nan: bool = False,
     seed: Optional[int] = None,
     offset: Optional[int] = None,
@@ -969,8 +1161,12 @@ def min_p_sampling_from_probs(
         and output dtype defaults to ``torch.int32``.
     deterministic: bool
         Whether to use deterministic kernel implementation, default is ``True``.
-    generator: Optional[torch.Generator]
-        A random number generator for the operation.
+    generator: Optional[Union[torch.Generator, Tuple[torch.Tensor, torch.Tensor]]]
+        Random number generator. Can be either:
+        - A ``torch.Generator`` for traditional single-generator sampling (default)
+        - A tuple of ``(seed_arr, offset_arr)`` tensors for per-request generators,
+          where both are int64 tensors of shape ``(batch_size,)`` on CUDA.
+          Offsets are automatically updated in-place after sampling.
     check_nan: bool
         Whether to check nan in :attr:`probs`, default is ``False``.
     seed: Optional[int]
@@ -1031,7 +1227,9 @@ def top_k_top_p_sampling_from_logits(
     indices: Optional[torch.Tensor] = None,
     filter_apply_order: str = "top_k_first",
     deterministic: bool = True,
-    generator: Optional[torch.Generator] = None,
+    generator: Optional[
+        Union[torch.Generator, Tuple[torch.Tensor, torch.Tensor]]
+    ] = None,
     check_nan: bool = False,
     seed: Optional[int] = None,
     offset: Optional[int] = None,
@@ -1072,8 +1270,12 @@ def top_k_top_p_sampling_from_logits(
         If ``"joint"``, we apply top-k and top-p filter simultaneously in each round. Default is ``"top_k_first"``.
     deterministic: bool
         Whether to use deterministic kernel implementation, default is ``True``.
-    generator: Optional[torch.Generator]
-        A random number generator for the operation.
+    generator: Optional[Union[torch.Generator, Tuple[torch.Tensor, torch.Tensor]]]
+        Random number generator. Can be either:
+        - A ``torch.Generator`` for traditional single-generator sampling (default)
+        - A tuple of ``(seed_arr, offset_arr)`` tensors for per-request generators,
+          where both are int64 tensors of shape ``(batch_size,)`` on CUDA.
+          Offsets are automatically updated in-place after sampling.
     check_nan: bool
         Whether to check nan in :attr:`probs`, default is ``False``.
     seed: Optional[int]
@@ -1164,7 +1366,9 @@ def top_k_top_p_sampling_from_probs(
     indices: Optional[torch.Tensor] = None,
     filter_apply_order: str = "top_k_first",
     deterministic: bool = True,
-    generator: Optional[torch.Generator] = None,
+    generator: Optional[
+        Union[torch.Generator, Tuple[torch.Tensor, torch.Tensor]]
+    ] = None,
     check_nan: bool = False,
     seed: Optional[int] = None,
     offset: Optional[int] = None,
@@ -1205,8 +1409,12 @@ def top_k_top_p_sampling_from_probs(
         If ``"joint"``, we apply top-k and top-p filter simultaneously in each round. Default is ``"top_k_first"``.
     deterministic: bool
         Whether to use deterministic kernel implementation, default is ``True``.
-    generator: Optional[torch.Generator]
-        A random number generator for the operation.
+    generator: Optional[Union[torch.Generator, Tuple[torch.Tensor, torch.Tensor]]]
+        Random number generator. Can be either:
+        - A ``torch.Generator`` for traditional single-generator sampling (default)
+        - A tuple of ``(seed_arr, offset_arr)`` tensors for per-request generators,
+          where both are int64 tensors of shape ``(batch_size,)`` on CUDA.
+          Offsets are automatically updated in-place after sampling.
     check_nan: bool
         Whether to check nan in :attr:`probs`, default is ``False``.
     seed: Optional[int]
