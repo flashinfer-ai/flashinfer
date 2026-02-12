@@ -559,11 +559,13 @@ def testSelectiveStateUpdate(args):
                 cur_res["tb_per_sec"] = tb_per_sec
                 cur_res["backend"] = backend
                 # Mamba-specific columns
+                cur_res["batch_size"] = batch_size
                 cur_res["nheads"] = nheads
                 cur_res["dim"] = dim
                 cur_res["dstate"] = dstate
                 cur_res["ngroups"] = ngroups
                 cur_res["cache_steps"] = cache_steps
+                cur_res["input_dtype"] = str(input_dtype)
                 cur_res["state_dtype"] = str(state_dtype)
                 cur_res["weight_dtype"] = str(weight_dtype)
                 cur_res["has_z"] = has_z
