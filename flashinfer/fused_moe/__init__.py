@@ -15,8 +15,8 @@ limitations under the License.
 """
 
 from .core import (
+    ActivationType,
     RoutingMethodType,
-    GatedActType,
     WeightLayout,
     convert_to_block_layout,
     cutlass_fused_moe,
@@ -29,6 +29,7 @@ from .core import (
     trtllm_fp4_block_scale_moe,
     trtllm_fp4_block_scale_routed_moe,
     trtllm_fp8_block_scale_moe,
+    trtllm_fp8_block_scale_routed_moe,
     trtllm_fp8_per_tensor_scale_moe,
     trtllm_bf16_moe,
     trtllm_mxint4_block_scale_moe,
@@ -38,9 +39,20 @@ from .fused_routing_dsv3 import (  # noqa: F401
     fused_topk_deepseek as fused_topk_deepseek,
 )
 
+# CuteDSL MoE APIs (conditionally imported if cute_dsl available)
+try:
+    from .cute_dsl import (
+        cute_dsl_fused_moe_nvfp4,
+        CuteDslMoEWrapper,
+    )
+
+    _cute_dsl_available = True
+except ImportError:
+    _cute_dsl_available = False
+
 __all__ = [
+    "ActivationType",
     "RoutingMethodType",
-    "GatedActType",
     "WeightLayout",
     "convert_to_block_layout",
     "cutlass_fused_moe",
@@ -54,7 +66,15 @@ __all__ = [
     "trtllm_fp4_block_scale_moe",
     "trtllm_fp4_block_scale_routed_moe",
     "trtllm_fp8_block_scale_moe",
+    "trtllm_fp8_block_scale_routed_moe",
     "trtllm_fp8_per_tensor_scale_moe",
     "trtllm_mxint4_block_scale_moe",
     "fused_topk_deepseek",
 ]
+
+# Add CuteDSL exports if available
+if _cute_dsl_available:
+    __all__ += [
+        "cute_dsl_fused_moe_nvfp4",
+        "CuteDslMoEWrapper",
+    ]
