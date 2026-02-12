@@ -2244,20 +2244,26 @@ def testBatchMLAPagedAttentionWrapper(args):
             actual_seq_lens_q_flat = torch.ones_like(
                 actual_seq_lens_kv.flatten().to("cpu")
             )
-            o_mem_bytes = (
-                actual_seq_lens_q_flat.numel()
-                * num_qo_heads
-                * head_dim_ckv
-                * q_dtype.itemsize
+
+            # Query bytes (q_nope + q_pe): batch_size * num_heads * head_dim
+            q_mem_bytes = (
+                q_nope.numel() * q_nope.element_size()
+                + q_pe.numel() * q_pe.element_size()
             )
-            qkv_mem_bytes = sum(
-                [
-                    _.numel() * _.element_size()
-                    for _ in [q_nope, q_pe, ckv_cache, kpe_cache]
-                ]
+
+            # KV cache bytes: based on actual sequence lengths accessed, not full allocation
+            actual_kv_tokens = actual_seq_lens_kv_flat.sum().item()
+            kv_elem_size = ckv_cache.element_size()  # Same dtype for ckv and kpe
+            kv_mem_bytes = (
+                actual_kv_tokens * (head_dim_ckv + head_dim_kpe) * kv_elem_size
             )
-            total_mem_bytes = o_mem_bytes + qkv_mem_bytes
-            tb_per_sec = (total_mem_bytes / (median_time * 1e9)).item()
+
+            # Output bytes: batch_size * num_heads * head_dim_ckv
+            o_elem_size = q_nope.element_size()  # Output has same dtype as query
+            o_mem_bytes = batch_size * num_qo_heads * head_dim_ckv * o_elem_size
+
+            total_mem_bytes = q_mem_bytes + kv_mem_bytes + o_mem_bytes
+            tb_per_sec = total_mem_bytes / (median_time * 1e9)
             tflops_total = (
                 2
                 * torch.dot(

@@ -5,6 +5,7 @@ import numpy as np
 import torch
 
 import flashinfer
+from flashinfer import ActivationType
 from flashinfer.autotuner import autotune
 from flashinfer.fused_moe import (
     trtllm_fp4_block_scale_moe,
@@ -21,6 +22,7 @@ from flashinfer.testing.utils import (
 
 from .flashinfer_benchmark_utils import (
     dtype_str_to_torch_dtype,
+    enum_type,
     get_device,
     print_perf_metrics,
     filter_backends_by_compute_capability,
@@ -170,12 +172,12 @@ def parse_moe_args(line, parser):
         help="Data type of the weights (before quantization).",
     )
     parser.add_argument(
-        "--gated_act",
-        type=str,
+        "--activation-type",
+        type=enum_type(ActivationType),
+        metavar=str([e.name for e in ActivationType]),
         required=False,
-        default="swiglu",
-        choices=["swiglu", "geglu"],
-        help="Type of gated activation function: swiglu | geglu.",
+        default=ActivationType.Swiglu,
+        help=f"Type of activation function: {[e.name for e in ActivationType]}",
     )
     parser.add_argument(
         "--autotune",
@@ -242,13 +244,6 @@ def parse_moe_args(line, parser):
     }
     args.routing_method_type = routing_method_name_to_type[args.routing_method]
 
-    # Normalize gated act type (map string to internal int expected by kernels)
-    gated_act_name_to_type = {
-        "swiglu": 0,
-        "geglu": 1,
-    }
-    args.gated_act_type = gated_act_name_to_type[args.gated_act]
-
     if args.verbose >= 1:
         print(f"[INFO] {args = }")
     return args
@@ -281,32 +276,25 @@ def create_trtllm_moe_test_data(
     # Different MOE kernels have different routing_logits dtype requirements:
 
     if moe_kernel_type == "fp8_block_scale":
-        # FP8 block scale MOE always expects float32 routing logits (line 333 in kernel_launcher.cu)
+        # DeepSeekV3 routing uses float32, others use bfloat16
+        routing_dtype = torch.float32 if routing_method_type == 2 else torch.bfloat16
         routing_logits = torch.randn(
-            (num_tokens, num_experts), device=device, dtype=torch.float32
+            (num_tokens, num_experts), device=device, dtype=routing_dtype
         )
     elif moe_kernel_type == "fp8_per_tensor":
         # FP8 per-tensor MOE dtype depends on use_routing_scales_on_input parameter
         # For Llama4: use_routing_scales_on_input=True -> bfloat16
         # For others: use_routing_scales_on_input=False -> float32
-        if routing_method_type == 3:  # Llama4 uses routing scales on input
-            routing_logits = torch.randn(
-                (num_tokens, num_experts), device=device, dtype=torch.bfloat16
-            )
-        else:
-            routing_logits = torch.randn(
-                (num_tokens, num_experts), device=device, dtype=torch.float32
-            )
+        routing_dtype = torch.bfloat16 if routing_method_type == 3 else torch.float32
+        routing_logits = torch.randn(
+            (num_tokens, num_experts), device=device, dtype=routing_dtype
+        )
     elif moe_kernel_type == "fp4_block_scale":
         # FP4 block scale MOE follows the test pattern: float32 for DeepSeekV3, bfloat16 for others
-        if routing_method_type == 2:  # DeepSeekV3 - uses float32
-            routing_logits = torch.randn(
-                (num_tokens, num_experts), device=device, dtype=torch.float32
-            )
-        else:  # All other routing methods (Renormalize, RenormalizeNaive, Llama4) - use bfloat16
-            routing_logits = torch.randn(
-                (num_tokens, num_experts), device=device, dtype=torch.bfloat16
-            )
+        routing_dtype = torch.float32 if routing_method_type == 2 else torch.bfloat16
+        routing_logits = torch.randn(
+            (num_tokens, num_experts), device=device, dtype=routing_dtype
+        )
     else:
         raise ValueError(f"Unknown MOE kernel type: {moe_kernel_type}")
 
@@ -451,7 +439,7 @@ def testTrtllmFp4BlockScaleMoe(args):
     use_shuffled_weight = args.use_shuffled_weight
     weight_layout = args.weight_layout
     is_cuda_graph_compatible = not args.no_cuda_graph
-    gated_act_type = args.gated_act_type
+    activation_type = args.activation_type
     res = []
 
     backends = ["trtllm"]
@@ -610,7 +598,7 @@ def testTrtllmFp4BlockScaleMoe(args):
             local_num_experts=local_num_experts,
             routed_scaling_factor=routed_scaling_factor,
             routing_method_type=routing_method_type,
-            gated_act_type=gated_act_type,
+            activation_type=activation_type.value,
             do_finalize=True,
         )
 
@@ -715,7 +703,7 @@ def testTrtllmFp4BlockScaleMoe(args):
         cur_res["use_routing_scales_on_input"] = args.use_routing_scales_on_input
         cur_res["input_dtype"] = input_dtype
         cur_res["weight_dtype"] = weight_dtype
-        cur_res["gated_act"] = args.gated_act
+        cur_res["activation_type"] = args.activation_type.name
         res.append(cur_res)
 
     return res
@@ -1471,6 +1459,7 @@ def testTrtllmFp8PerTensorScaleMoe(args):
         output1_scales_gate_scalar,
         gemm2_weights_fp8,
         output2_scales_scalar,
+        activation_type,
     ):
         # Note: FP8 per-tensor MOE expects int64_t for n_group/topk_group, not Optional[int64_t]
         # So we convert None to 0 to indicate "no groups" mode
@@ -1493,6 +1482,7 @@ def testTrtllmFp8PerTensorScaleMoe(args):
             routed_scaling_factor=routed_scaling_factor,
             use_routing_scales_on_input=use_routing_scales_on_input,
             routing_method_type=routing_method_type,
+            activation_type=activation_type.value,
         )
 
     # Benchmark timing
@@ -1513,6 +1503,7 @@ def testTrtllmFp8PerTensorScaleMoe(args):
             output1_scales_gate_scalar,
             gemm2_weights_fp8,
             output2_scales_scalar,
+            args.activation_type,
         ),
     )
 
@@ -1564,6 +1555,7 @@ def testTrtllmFp8PerTensorScaleMoe(args):
         cur_res["use_routing_scales_on_input"] = use_routing_scales_on_input
         cur_res["input_dtype"] = input_dtype
         cur_res["weight_dtype"] = weight_dtype
+        cur_res["activation_type"] = args.activation_type.name
         res.append(cur_res)
 
     return res

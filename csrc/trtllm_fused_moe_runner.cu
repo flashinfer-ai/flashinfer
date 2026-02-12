@@ -60,7 +60,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
                  btg::Dtype dtypeBias, bool useRoutingScalesOnInput, bool useDeepSeekFp8,
                  RoutingMethodType routingMethodType, cudaStream_t stream) {
   if (routingMethodType == RoutingMethodType::DeepSeekV3) {
-    FLASHINFER_CHECK(topK <= 8, "For DeepSeek routing method, must have topK <= 8");
+    FLASHINFER_CHECK(topK <= 22, "For DeepSeek routing method, must have topK <= 22");
     FLASHINFER_CHECK(topkGroup <= 4, "For DeepSeek routing method, must have topkGroup <= 4");
     moe::dev::routing::routingDeepSeek::Data routingData;
     routingData.mDtypeExpW =
@@ -196,13 +196,49 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
 
 namespace PermuteGemm1 {
 
+using tensorrt_llm::kernels::trtllmgen_moe::MoE::ActivationType;
+using tensorrt_llm::kernels::trtllmgen_moe::MoE::isGatedActivation;
+using tensorrt_llm::kernels::trtllmgen_moe::MoE::serializeActivationType;
+
+static inline ActType activationTypeToGatedActType(ActivationType actType) {
+  switch (actType) {
+    case ActivationType::Swiglu:
+      return ActType::SwiGlu;
+    case ActivationType::Geglu:
+      return ActType::GeGlu;
+    default:
+      FLASHINFER_CHECK(false, "Unsupported gated activation type ",
+                       serializeActivationType(actType), " of enum ",
+                       static_cast<int64_t>(actType));
+  }
+  return ActType::SwiGlu;
+}
+
+static inline EltwiseActType activationTypeToEltwiseActType(ActivationType actType) {
+  switch (actType) {
+    case ActivationType::Relu2:
+      return EltwiseActType::Relu2;
+    case ActivationType::Identity:
+      return EltwiseActType::None;
+    default:
+      FLASHINFER_CHECK(false, "Unsupported eltwise activation type ",
+                       serializeActivationType(actType), " of enum ",
+                       static_cast<int64_t>(actType));
+  }
+  return EltwiseActType::None;
+}
+
 tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
     btg::Dtype dtypeAct, btg::Dtype dtypeWeights, int32_t tileTokensDim, bool useDeepSeekFp8,
-    MoE::GatedActType gatedActType, bool useShuffledMatrixA,
+    ActivationType activationType, bool useShuffledMatrix,
     batchedGemm::gemm::MatrixLayout weightLayout) {
-  if (gatedActType == MoE::GatedActType::SwiGlu || gatedActType == MoE::GatedActType::GeGlu) {
-    ActType actType =
-        (gatedActType == MoE::GatedActType::SwiGlu) ? ActType::SwiGlu : ActType::GeGlu;
+  int64_t actTypeInt = static_cast<int64_t>(activationType);
+  FLASHINFER_CHECK(
+      0 <= actTypeInt && actTypeInt < static_cast<int64_t>(ActivationType::InvalidType),
+      "Unknown activation type", serializeActivationType(activationType), "of enum", actTypeInt);
+  bool isGatedAct = isGatedActivation(activationType);
+  if (isGatedAct) {
+    ActType actType = activationTypeToGatedActType(activationType);
     tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions options = {
         // Swap A and B dtypes because transposeMmaOutput is hardcoded to true
         .dtypeA = dtypeWeights,
@@ -216,24 +252,40 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
         .transposeMmaOutput = true,
         .tileSize = tileTokensDim,
         .epilogueTileM = useDeepSeekFp8 ? 64 : 128,
-        .useShuffledMatrixA = useShuffledMatrixA,
+        .useShuffledMatrix = useShuffledMatrix,
         .weightLayout = weightLayout};
     return options;
   } else {
-    FLASHINFER_CHECK(false, "Unimplemented gated act type ",
-                     MoE::serializeGatedActType(gatedActType), " of enum ", (int)gatedActType);
+    EltwiseActType actType = activationTypeToEltwiseActType(activationType);
+    tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions options = {
+        // Swap A and B dtypes because transposeMmaOutput is hardcoded to true
+        .dtypeA = dtypeWeights,
+        .dtypeB = dtypeAct,
+        .dtypeC = dtypeAct,
+        .eltwiseActType = actType,
+        .deepSeekFp8 = useDeepSeekFp8,
+        .fusedAct = false,
+        .routeAct = true,
+        .staticBatch = false,
+        .transposeMmaOutput = true,
+        .tileSize = tileTokensDim,
+        .epilogueTileM = 128,
+        .useShuffledMatrix = useShuffledMatrix,
+        .weightLayout = weightLayout};
+    return options;
   }
 }
 
 Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, bool useDeepSeekFp8, int tileTokensDim,
-               MoE::GatedActType gatedActType, bool useShuffledMatrixA,
+               ActivationType activationType, bool useShuffledMatrix,
                batchedGemm::gemm::MatrixLayout weightLayout)
     : mDtypeAct(dtypeAct),
       mDtypeWeights(dtypeWeights),
       mTileTokensDim(tileTokensDim),
       mRunner(tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner(
-          getOptions(mDtypeAct, mDtypeWeights, mTileTokensDim, useDeepSeekFp8, gatedActType,
-                     useShuffledMatrixA, weightLayout))) {}
+          getOptions(mDtypeAct, mDtypeWeights, mTileTokensDim, useDeepSeekFp8, activationType,
+                     useShuffledMatrix, weightLayout))),
+      mActType(activationType) {}
 
 void Runner::run(void* hiddenState, void* hiddenStateScale, void* weights, void* weightsScale,
                  void* expertWeights, float* outputScalesScalar, float* outputScalesGateScalar,
@@ -246,12 +298,14 @@ void Runner::run(void* hiddenState, void* hiddenStateScale, void* weights, void*
                  int device, cudaStream_t stream, int32_t configIndex, bool enable_pdl) {
   auto maxNumCtasInBatchDim =
       Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
-  mRunner.run(numTokens, 2 * intermediateSize, hiddenSize, {}, numTokens, numExperts,
-              maxNumCtasInBatchDim, hiddenState, hiddenStateScale, weights, weightsScale,
-              expertWeights, /* perTokensSfB */ nullptr, outputScalesScalar, outputScalesGateScalar,
-              ptrBias, ptrAlpha, ptrBeta, ptrClampLimit, output, outputScale, permutedIdxToTokenIdx,
-              ptrTotalNumPaddedTokens, ptrCtaIdxXyToBatchIdx, ptrCtaIdxXyToMnLimit,
-              ptrNumNonExitingCtas, bmm1Workspace, stream, device, configIndex, enable_pdl);
+  int32_t intermediateSizeFactor = (isGatedActivation(mActType) ? 2 : 1);
+  mRunner.run(numTokens, intermediateSizeFactor * intermediateSize, hiddenSize, {}, numTokens,
+              numExperts, maxNumCtasInBatchDim, hiddenState, hiddenStateScale, weights,
+              weightsScale, expertWeights, /* perTokensSfB */ nullptr, outputScalesScalar,
+              outputScalesGateScalar, ptrBias, ptrAlpha, ptrBeta, ptrClampLimit, output,
+              outputScale, permutedIdxToTokenIdx, ptrTotalNumPaddedTokens, ptrCtaIdxXyToBatchIdx,
+              ptrCtaIdxXyToMnLimit, ptrNumNonExitingCtas, bmm1Workspace, stream, device,
+              configIndex, enable_pdl);
 }
 
 size_t Runner::getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
@@ -259,8 +313,10 @@ size_t Runner::getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t
                                        int32_t configIndex) const {
   auto maxNumCtasInBatchDim =
       Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
-  return mRunner.getWorkspaceSizeInBytes(numTokens, 2 * intermediateSize, hiddenSize, {}, numTokens,
-                                         numExperts, maxNumCtasInBatchDim, configIndex);
+  int32_t intermediateSizeFactor = (isGatedActivation(mActType) ? 2 : 1);
+  return mRunner.getWorkspaceSizeInBytes(numTokens, intermediateSizeFactor * intermediateSize,
+                                         hiddenSize, {}, numTokens, numExperts,
+                                         maxNumCtasInBatchDim, configIndex);
 }
 
 int32_t Runner::getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize,
@@ -268,8 +324,10 @@ int32_t Runner::getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize,
                                            int32_t numTokens) const {
   auto maxNumCtasInBatchDim =
       Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
-  return mRunner.getDefaultValidConfigIndex(numTokens, 2 * intermediateSize, hiddenSize, {},
-                                            numTokens, numExperts, maxNumCtasInBatchDim);
+  int32_t intermediateSizeFactor = (isGatedActivation(mActType) ? 2 : 1);
+  return mRunner.getDefaultValidConfigIndex(numTokens, intermediateSizeFactor * intermediateSize,
+                                            hiddenSize, {}, numTokens, numExperts,
+                                            maxNumCtasInBatchDim);
 }
 
 bool Runner::isValidConfigIndex(int32_t configIndex, int32_t topK, int32_t hiddenSize,
@@ -278,9 +336,10 @@ bool Runner::isValidConfigIndex(int32_t configIndex, int32_t topK, int32_t hidde
   auto maxNumCtasInBatchDim =
       Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
 
+  int32_t intermediateSizeFactor = (isGatedActivation(mActType) ? 2 : 1);
   auto const isValid =
-      mRunner.isValidConfigIndex(configIndex, numTokens, 2 * intermediateSize, hiddenSize, {},
-                                 numTokens, numExperts, maxNumCtasInBatchDim);
+      mRunner.isValidConfigIndex(configIndex, numTokens, intermediateSizeFactor * intermediateSize,
+                                 hiddenSize, {}, numTokens, numExperts, maxNumCtasInBatchDim);
 
   return isValid;
 }
@@ -293,12 +352,13 @@ std::vector<int64_t> Runner::getPassingConfigIndices() const {
 namespace Gemm2 {
 tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
     btg::Dtype dtypeAct, btg::Dtype dtypeWeights, btg::Dtype dtypeOut, int32_t tileTokensDim,
-    bool useDeepSeekFp8, bool useShuffledMatrixA, batchedGemm::gemm::MatrixLayout weightLayout) {
+    bool useDeepSeekFp8, bool useShuffledMatrix, batchedGemm::gemm::MatrixLayout weightLayout) {
   tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions options = {
       // Swap A and B dtypes because transposeMmaOutput is hardcoded to true
       .dtypeA = dtypeWeights,
       .dtypeB = dtypeAct,
       .dtypeC = dtypeOut,
+      .eltwiseActType = EltwiseActType::None,
       .deepSeekFp8 = useDeepSeekFp8,
       .fusedAct = false,
       .routeAct = false,
@@ -306,13 +366,13 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
       .transposeMmaOutput = true,
       .tileSize = tileTokensDim,
       .epilogueTileM = useDeepSeekFp8 ? 64 : 128,
-      .useShuffledMatrixA = useShuffledMatrixA,
+      .useShuffledMatrix = useShuffledMatrix,
       .weightLayout = weightLayout};
   return options;
 }
 
 Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, btg::Dtype dtypeOut,
-               bool useDeepSeekFp8, int tileTokensDim, bool useShuffledMatrixA,
+               bool useDeepSeekFp8, int tileTokensDim, bool useShuffledMatrix,
                batchedGemm::gemm::MatrixLayout weightLayout)
     : mDtypeAct(dtypeAct),
       mDtypeWeights(dtypeWeights),
@@ -320,7 +380,7 @@ Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, btg::Dtype dtypeOut
       mTileTokensDim(tileTokensDim),
       mRunner(tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner(
           getOptions(dtypeAct, dtypeWeights, dtypeOut, tileTokensDim, useDeepSeekFp8,
-                     useShuffledMatrixA, weightLayout))) {}
+                     useShuffledMatrix, weightLayout))) {}
 
 void Runner::run(void* permutedHiddenState, void* permutedHiddenStateScale, void* weights,
                  void* weightsScale, float* outputScalesScalar, float* ptrBias, void* output,
@@ -380,12 +440,12 @@ std::vector<int64_t> Runner::getPassingConfigIndices() const {
 
 namespace MoE {
 Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, bool useDeepSeekFp8,
-               int32_t tileTokensDim, GatedActType gatedActType, bool useShuffledMatrixA,
+               int32_t tileTokensDim, ActivationType activationType, bool useShuffledMatrix,
                batchedGemm::gemm::MatrixLayout weightLayout)
     : mPermuteGemm1(PermuteGemm1::Runner(dtypeAct, dtypeWeights, useDeepSeekFp8, tileTokensDim,
-                                         gatedActType, useShuffledMatrixA, weightLayout)),
+                                         activationType, useShuffledMatrix, weightLayout)),
       mGemm2(Gemm2::Runner(dtypeAct, dtypeWeights, btg::Dtype::Bfloat16, useDeepSeekFp8,
-                           tileTokensDim, useShuffledMatrixA, weightLayout)) {
+                           tileTokensDim, useShuffledMatrix, weightLayout)) {
   auto const& gemm1PassingIndices = mPermuteGemm1.getPassingConfigIndices();
   auto const& gemm2PassingIndices = mGemm2.getPassingConfigIndices();
 
@@ -402,9 +462,9 @@ Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, bool useDeepSeekFp8
 }
 
 Runner::Runner(btg::Dtype dtypeElt, bool useDeepSeekFp8, int32_t tileTokensDim,
-               bool useShuffledMatrixA, batchedGemm::gemm::MatrixLayout weightLayout)
-    : Runner(dtypeElt, dtypeElt, useDeepSeekFp8, tileTokensDim, GatedActType::SwiGlu,
-             useShuffledMatrixA, weightLayout) {}
+               bool useShuffledMatrix, batchedGemm::gemm::MatrixLayout weightLayout)
+    : Runner(dtypeElt, dtypeElt, useDeepSeekFp8, tileTokensDim, ActivationType::Swiglu,
+             useShuffledMatrix, weightLayout) {}
 
 void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace,
                         moe::dev::convertsf::Data& convertSfData,
@@ -427,7 +487,8 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
   activationData.outPtr = workspace.activation_output;
   activationData.inDqSfsPtr = workspace.gemm1_output_scale;
   activationData.outDqSfsPtr = workspace.activation_output_scale;
-  activationData.innerDim = args.intermediate_size * 2;
+  activationData.innerDim =
+      args.intermediate_size * (isGatedActivation(args.activation_type) ? 2 : 1);
   activationData.topK = args.top_k;
   activationData.numTokens = args.num_tokens;
   activationData.expandedIdxToPermutedIdx = workspace.expanded_idx_to_permuted_idx;
