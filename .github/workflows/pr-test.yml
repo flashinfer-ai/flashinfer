@@ -157,7 +157,7 @@ jobs:
           HEAD_SHA="${{ github.event.pull_request.head.sha }}"
           CHANGED=$(git diff --name-only "$BASE_SHA...$HEAD_SHA")
           # TODO (yongwww): Add back ^\.github/ before merging to main
-          SKIP_PATTERNS="README.md|^docs/|^docker/|^licenses/|^LICENSE$|^NOTICE$|^version\.txt$"
+          SKIP_PATTERNS="\.md$|\.txt$|^docs/|^docker/|^licenses/|^LICENSE$|^NOTICE$|^benchmarks/"
 
           SKIP=true
           while IFS= read -r file; do

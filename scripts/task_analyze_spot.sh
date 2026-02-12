@@ -28,12 +28,13 @@ fi
 SPOT_TERMINATION=false
 
 # Temp file for job logs (cleaned up on exit)
-LOG_FILE="/tmp/job_log.txt"
-cleanup() { rm -f "$LOG_FILE" "${LOG_FILE}.zip"; }
+LOG_FILE=$(mktemp)
+LOG_FILE_ZIP="${LOG_FILE}.zip"
+cleanup() { rm -f "$LOG_FILE" "$LOG_FILE_ZIP"; }
 trap cleanup EXIT
 
 # Include both failed and cancelled jobs (spot termination can cause either)
-FAILED_JOBS=$(gh api "/repos/${REPOSITORY}/actions/runs/${RUN_ID}/jobs?per_page=100" \
+FAILED_JOBS=$(gh api --paginate "/repos/${REPOSITORY}/actions/runs/${RUN_ID}/jobs" \
   --jq ".jobs[] | select(.name | ${JOB_FILTER}) | select(.conclusion == \"failure\" or .conclusion == \"cancelled\") | .id")
 
 if [ -z "$FAILED_JOBS" ]; then
@@ -53,17 +54,17 @@ for JOB_ID in $FAILED_JOBS; do
   fi
 
   # Try to download job logs to /tmp
-  if ! gh api "/repos/${REPOSITORY}/actions/jobs/${JOB_ID}/logs" > "${LOG_FILE}.zip" 2>/dev/null; then
+  if ! gh api "/repos/${REPOSITORY}/actions/jobs/${JOB_ID}/logs" > "$LOG_FILE_ZIP" 2>/dev/null; then
     echo "Detected: Cannot download logs, likely infrastructure failure (job $JOB_ID)"
     SPOT_TERMINATION=true
     break
   fi
 
   # Handle both zip and plain text log formats
-  if file "${LOG_FILE}.zip" | grep -q "Zip archive"; then
-    unzip -p "${LOG_FILE}.zip" > "$LOG_FILE" 2>/dev/null || mv "${LOG_FILE}.zip" "$LOG_FILE"
+  if file "$LOG_FILE_ZIP" | grep -q "Zip archive"; then
+    unzip -p "$LOG_FILE_ZIP" > "$LOG_FILE" 2>/dev/null || mv "$LOG_FILE_ZIP" "$LOG_FILE"
   else
-    mv "${LOG_FILE}.zip" "$LOG_FILE"
+    mv "$LOG_FILE_ZIP" "$LOG_FILE"
   fi
 
   # Check for spot termination marker from task_monitor_spot.sh
