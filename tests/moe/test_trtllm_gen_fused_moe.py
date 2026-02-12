@@ -1230,7 +1230,7 @@ class FP8PerTensorMoe(Moe):
                 activation_type=activation_type,
             )
 
-        return output.to(torch.float)
+        return output[0].to(torch.float)
 
     def compute_reference(self, args):
         """FP8 per-tensor reference implementation."""
