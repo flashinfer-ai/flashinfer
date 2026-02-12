@@ -11,6 +11,7 @@
 #include <cutlass/cutlass.h>
 #include <cutlass/numeric_conversion.h>
 #include <cutlass/numeric_types.h>
+#include <cooperative_groups.h>
 
 #include "variants.cuh"
 
@@ -81,8 +82,10 @@ CUTLASS_DEVICE void mma_f16(
   if (work_idx != 0) {
     int lane_predicate = cute::elect_one_sync();
     if (cutlass::canonical_warp_idx_sync() == Ktraits::NUM_WARPS - 1 && lane_predicate) {
+    // This assumes a thread block cluster size of 1 (1 CTA/cluster).
++   // A cluster size > 1 could cause race conditions with barrier_O.arrive() below.
++   assert(cooperative_groups::this_cluster().size() == 1);
 #pragma unroll
-static_assert(cooperative_groups::this_cluster().size() == 1 && "This assumes a thread block cluster size of 1; ie 1CTA/cluster. Setting a cluster size > 1 could result in race conditions due to the type of barrier_O.arrive() used below.");
       for (uint32_t cta_id = 0; cta_id < 1; ++cta_id) {
         shared_storage.barrier_O.arrive(cta_id, lane_predicate);
       }
