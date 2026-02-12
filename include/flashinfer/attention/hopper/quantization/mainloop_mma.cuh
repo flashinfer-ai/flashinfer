@@ -80,6 +80,7 @@ CUTLASS_DEVICE void mma_fp8(const Params& mainloop_params, AttentionVariant& var
     int lane_predicate = cute::elect_one_sync();
     if (cutlass::canonical_warp_idx_sync() == Ktraits::NUM_WARPS - 1 && lane_predicate) {
 #pragma unroll
+      // This assumes a thread block cluster size of 1; ie 1CTA/cluster. Setting a cluster size > 1 could result in race conditions due to the type of barrier_O.arrive() used below.
       for (uint32_t cta_id = 0; cta_id < 1; ++cta_id) {
         shared_storage.barrier_O.arrive(cta_id, lane_predicate);
       }
