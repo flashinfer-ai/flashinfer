@@ -280,7 +280,7 @@ def download_trtllm_headers(
             "trtllm/gen/CudaArchDecl.h",
         ]
 
-    artifact_hash_path = str(header_dest_dir) + "/.artifact_hash"
+    artifact_hash_path = os.path.join(header_dest_dir, ".artifact_hash")
 
     # Check if cached headers are from a different artifact version (e.g. after git checkout)
     if os.path.exists(artifact_hash_path):
