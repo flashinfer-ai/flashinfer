@@ -656,7 +656,6 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
         alloc_tensor({args->num_tokens, args->hidden_size}, dl_bfloat16, hidden_states.device());
     args->output = output.data_ptr();
     args->output_scale = nullptr;
-    args->do_finalize = true;  // FP8 per-tensor scale always finalizes
 
     // Set scale pointers
     TVM_FFI_ICHECK(output1_scales_scalar.has_value());
@@ -927,7 +926,6 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
         alloc_tensor({args->num_tokens, args->hidden_size}, dl_bfloat16, hidden_states.device());
     args->output = output.data_ptr();
     args->output_scale = nullptr;
-    args->do_finalize = true;
 
     args->hidden_states_scale = static_cast<float*>(hidden_states_scale.data_ptr());
     args->gemm1_weights_scale = static_cast<float*>(gemm1_weights_scale.data_ptr());
@@ -984,7 +982,7 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
     if (args->do_finalize) {
       return {output};
     }
-    return {gemm2_output, expanded_idx_to_permuted_idx};
+    return {gemm2_output, expert_weights, expanded_idx_to_permuted_idx};
   }
 
   static Array<Array<int64_t>> getValidConfigs(int64_t top_k, int64_t hidden_size,
@@ -1447,7 +1445,7 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     if (args->do_finalize) {
       return {};
     }
-    return {gemm2_output, expanded_idx_to_permuted_idx};
+    return {gemm2_output, expert_weights, expanded_idx_to_permuted_idx};
   }
 
   static Array<Array<int64_t>> getValidConfigs(int64_t top_k, int64_t hidden_size,
