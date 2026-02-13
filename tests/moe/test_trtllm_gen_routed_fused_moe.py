@@ -338,7 +338,7 @@ def test_trtllm_gen_fp8_routed_fused_moe(
         False,  # use_shuffled_weight
         0,  # weight_layout
         enable_pdl,
-    ).to(torch.float)
+    )[0].to(torch.float)
 
     # Compute routing using reference implementation
     permute_info, expert_weights_ref = routing_reference_renormalize(

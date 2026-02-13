@@ -1361,6 +1361,7 @@ def get_trtllm_moe_sm100_module():
             hidden_states,
             gemm1_weights,
             gemm2_weights,
+            output,
             num_experts,
             top_k,
             n_group,
@@ -1376,15 +1377,13 @@ def get_trtllm_moe_sm100_module():
             enable_pdl,
             [-1, -1] if tactic == -1 else tactic,
         )
-
         if do_finalize:
             return [output]
         else:
-            gemm2_output, expanded_idx_to_permuted_idx = intermediate_output
             return [
-                torch.from_dlpack(gemm2_output),
+                torch.from_dlpack(intermediate_output[0]),
                 expert_weights,
-                torch.from_dlpack(expanded_idx_to_permuted_idx),
+                torch.from_dlpack(intermediate_output[2]),
             ]
 
     @register_fake_op("flashinfer::trtllm_bf16_moe")
@@ -1528,15 +1527,13 @@ def get_trtllm_moe_sm100_module():
             [-1, -1] if tactic == -1 else tactic,
             activation_type.value,
         )
-
         if do_finalize:
             return [output]
         else:
-            gemm2_output, expanded_idx_to_permuted_idx = intermediate_output
             return [
-                torch.from_dlpack(gemm2_output),
+                torch.from_dlpack(intermediate_output[0]),
                 expert_weights,
-                torch.from_dlpack(expanded_idx_to_permuted_idx),
+                torch.from_dlpack(intermediate_output[2]),
             ]
 
     @register_fake_op("flashinfer::trtllm_fp8_per_tensor_scale_moe")
@@ -1718,11 +1715,10 @@ def get_trtllm_moe_sm100_module():
         if do_finalize:
             return [output]
         else:
-            gemm2_output, expanded_idx_to_permuted_idx = intermediate_output
             return [
-                torch.from_dlpack(gemm2_output),
+                torch.from_dlpack(intermediate_output[0]),
                 expert_weights,
-                torch.from_dlpack(expanded_idx_to_permuted_idx),
+                torch.from_dlpack(intermediate_output[2]),
             ]
 
     @register_fake_op("flashinfer::trtllm_fp8_block_scale_moe")
@@ -1940,11 +1936,10 @@ def get_trtllm_moe_sm100_module():
         if do_finalize:
             return [output]
         else:
-            gemm2_output, expanded_idx_to_permuted_idx = intermediate_output
             return [
-                torch.from_dlpack(gemm2_output),
+                torch.from_dlpack(intermediate_output[0]),
                 expert_weights,
-                torch.from_dlpack(expanded_idx_to_permuted_idx),
+                torch.from_dlpack(intermediate_output[2]),
             ]
 
     @register_fake_op("flashinfer::trtllm_fp4_block_scale_moe")
@@ -2116,11 +2111,10 @@ def get_trtllm_moe_sm100_module():
         if do_finalize:
             return [output]
         else:
-            gemm2_output, expanded_idx_to_permuted_idx = intermediate_output
             return [
-                torch.from_dlpack(gemm2_output),
+                torch.from_dlpack(intermediate_output[0]),
                 expert_weights,
-                torch.from_dlpack(expanded_idx_to_permuted_idx),
+                torch.from_dlpack(intermediate_output[2]),
             ]
 
     @register_fake_op("flashinfer::trtllm_mxint4_block_scale_moe")

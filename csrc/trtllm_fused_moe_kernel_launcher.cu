@@ -367,7 +367,7 @@ class FusedMoeLauncher {
                     enable_pdl);
 
     if (args->do_finalize) {
-      return {};
+      return {output};
     }
     return {gemm2_output, expanded_idx_to_permuted_idx};
   }
@@ -478,9 +478,11 @@ class Bf16MoeLauncher : public FusedMoeLauncher {
     workspace.gemm2_output = gemm2_output.data_ptr();
     workspace.gemm2_output_scale = nullptr;
 
-    output =
-        alloc_tensor({args->num_tokens, args->hidden_size}, dl_bfloat16, hidden_states.device());
-    args->output = output.data_ptr();
+    if (args->output == nullptr) {
+      output =
+          alloc_tensor({args->num_tokens, args->hidden_size}, dl_bfloat16, hidden_states.device());
+      args->output = output.data_ptr();
+    }
     args->output_scale = nullptr;
   }
 
@@ -652,9 +654,11 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
     workspace.gemm2_output = gemm2_output.data_ptr();
     workspace.gemm2_output_scale = nullptr;
 
-    output =
-        alloc_tensor({args->num_tokens, args->hidden_size}, dl_bfloat16, hidden_states.device());
-    args->output = output.data_ptr();
+    if (args->output == nullptr) {
+      output =
+          alloc_tensor({args->num_tokens, args->hidden_size}, dl_bfloat16, hidden_states.device());
+      args->output = output.data_ptr();
+    }
     args->output_scale = nullptr;
 
     // Set scale pointers
@@ -922,9 +926,11 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
     workspace.gemm2_output = gemm2_output.data_ptr();
     workspace.gemm2_output_scale = nullptr;
 
-    output =
-        alloc_tensor({args->num_tokens, args->hidden_size}, dl_bfloat16, hidden_states.device());
-    args->output = output.data_ptr();
+    if (args->output == nullptr) {
+      output =
+          alloc_tensor({args->num_tokens, args->hidden_size}, dl_bfloat16, hidden_states.device());
+      args->output = output.data_ptr();
+    }
     args->output_scale = nullptr;
 
     args->hidden_states_scale = static_cast<float*>(hidden_states_scale.data_ptr());
@@ -980,7 +986,7 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
                     enable_pdl);
 
     if (args->do_finalize) {
-      return {};
+      return {output};
     }
     return {gemm2_output, expanded_idx_to_permuted_idx};
   }
@@ -1443,7 +1449,7 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
 
     // Match original FP4 behavior for return values
     if (args->do_finalize) {
-      return {};
+      return {output};
     }
     return {gemm2_output, expanded_idx_to_permuted_idx};
   }
@@ -1480,13 +1486,13 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
 Array<Tensor> trtllm_bf16_moe(TensorView const& routing_logits,
                               Optional<TensorView> const& routing_bias,
                               TensorView const& hidden_states, TensorView const& gemm1_weights,
-                              TensorView const& gemm2_weights, int64_t num_experts, int64_t top_k,
-                              Optional<int64_t> n_group, Optional<int64_t> topk_group,
-                              int64_t intermediate_size, int64_t local_expert_offset,
-                              int64_t local_num_experts, Optional<double> routed_scaling_factor,
-                              int64_t routing_method_type, bool use_shuffled_weight,
-                              int64_t weight_layout, bool do_finalize, bool enable_pdl,
-                              Array<int64_t> moe_tactic) {
+                              TensorView const& gemm2_weights, TensorView output,
+                              int64_t num_experts, int64_t top_k, Optional<int64_t> n_group,
+                              Optional<int64_t> topk_group, int64_t intermediate_size,
+                              int64_t local_expert_offset, int64_t local_num_experts,
+                              Optional<double> routed_scaling_factor, int64_t routing_method_type,
+                              bool use_shuffled_weight, int64_t weight_layout, bool do_finalize,
+                              bool enable_pdl, Array<int64_t> moe_tactic) {
   // Just some basic type validation first and leave more checks to the launcher
   TVM_FFI_ICHECK(routing_logits.dtype() == dl_float32 || routing_logits.dtype() == dl_bfloat16)
       << "BF16 MoE: routing_logits must be bfloat16 or float.";
@@ -1524,6 +1530,8 @@ Array<Tensor> trtllm_bf16_moe(TensorView const& routing_logits,
     args->local_num_experts = local_num_experts;
     args->intermediate_size = intermediate_size;
     args->do_finalize = do_finalize;
+    args->output = output.data_ptr();
+    args->output_scale = nullptr;
 
     // Create and initialize launcher for this tile size
     auto launcher = std::make_unique<Bf16MoeLauncher>(routing_logits, routing_bias, hidden_states,
@@ -1547,8 +1555,7 @@ Array<Tensor> trtllm_bf16_moe(TensorView const& routing_logits,
   auto& selected_launcher = launchers_map.at(tile_N);
 
   // Run the launcher - it will create its own runner internally
-  auto result = selected_launcher->run(config, enable_pdl);
-  return result;
+  return selected_launcher->run(config, enable_pdl);
 }
 
 Array<Tensor> trtllm_fp8_per_tensor_scale_moe(
@@ -1614,6 +1621,8 @@ Array<Tensor> trtllm_fp8_per_tensor_scale_moe(
     args->intermediate_size = intermediate_size;
     args->routed_scaling_factor = routed_scaling_factor.value_or(1.0);
     args->do_finalize = do_finalize;
+    args->output = output.data_ptr();
+    args->output_scale = nullptr;
 
     // Create and initialize launcher for this tile size
     auto launcher = std::make_unique<Fp8PerTensorLauncher>(
@@ -1638,9 +1647,7 @@ Array<Tensor> trtllm_fp8_per_tensor_scale_moe(
   auto& selected_launcher = launchers_map.at(tile_N);
 
   // Run the launcher - it will create its own runner internally
-  auto result = selected_launcher->run(config, enable_pdl, use_routing_scales_on_input);
-  // Return the result tensor
-  return result;
+  return selected_launcher->run(config, enable_pdl, use_routing_scales_on_input);
 }
 
 Array<Tensor> trtllm_fp8_block_scale_moe(
@@ -1712,6 +1719,8 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
     args->intermediate_size = intermediate_size;
     args->routed_scaling_factor = routed_scaling_factor.value_or(1.0);
     args->do_finalize = do_finalize;
+    args->output = output.data_ptr();
+    args->output_scale = nullptr;
 
     // Create and initialize launcher for this tile size
     auto launcher = std::make_unique<Fp8BlockScaleLauncher>(
@@ -1736,10 +1745,8 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
   auto& selected_launcher = launchers_map.at(tile_N);
 
   // Run the launcher with DeepSeek FP8 enabled - it will create its own runner internally
-  auto result = selected_launcher->run(config, enable_pdl, false /* use_routing_scales_on_input */,
-                                       true /* use_deep_seek_fp8 */);
-  // Return the result tensor
-  return result;
+  return selected_launcher->run(config, enable_pdl, false /* use_routing_scales_on_input */,
+                                true /* use_deep_seek_fp8 */);
 }
 
 Array<Tensor> trtllm_fp4_block_scale_moe(
@@ -1971,12 +1978,7 @@ Array<Tensor> trtllm_mxint4_block_scale_moe(
   auto& selected_launcher = launchers_map.at(tile_N);
 
   // Run the launcher - it will create its own runner internally
-  auto result = selected_launcher->run(config, enable_pdl);
-  if (do_finalize) {
-    return {output};
-  } else {
-    return {gemm2_output, expanded_idx_to_permuted_idx};
-  }
+  return selected_launcher->run(config, enable_pdl);
 }
 
 Array<Array<int64_t>> trtllm_get_valid_moe_configs(
