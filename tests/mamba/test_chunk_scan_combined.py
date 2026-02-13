@@ -290,6 +290,7 @@ class TestChunkScanCombined:
         assert out_match, "Output mismatch between CUTLASS and Triton"
         assert states_match, "Final states mismatch between CUTLASS and Triton"
 
+
 class TestChunkScanCombinedNoD(TestChunkScanCombined):
     """Test chunk scan without D scaling."""
 
@@ -1279,13 +1280,30 @@ def test_preallocated_output():
 
     # Run without pre-allocated output
     out_ref, _ = ssd_combined_fwd(
-        x, dt, A, B, C, chunk_size, D=D, dt_bias=dt_bias, dt_softplus=True,
+        x,
+        dt,
+        A,
+        B,
+        C,
+        chunk_size,
+        D=D,
+        dt_bias=dt_bias,
+        dt_softplus=True,
     )
 
     # Run with pre-allocated output
     out = torch.empty(batch, seqlen, nheads, headdim, dtype=dtype, device="cuda")
     out_test, _ = ssd_combined_fwd(
-        x, dt, A, B, C, chunk_size, D=D, dt_bias=dt_bias, dt_softplus=True, out=out,
+        x,
+        dt,
+        A,
+        B,
+        C,
+        chunk_size,
+        D=D,
+        dt_bias=dt_bias,
+        dt_softplus=True,
+        out=out,
     )
 
     assert out_test.data_ptr() == out.data_ptr(), (
@@ -1313,7 +1331,15 @@ def test_return_final_states_flag():
 
     # With return_final_states=True (default), should return final_states
     out, final_states = ssd_combined_fwd(
-        x, dt, A, B, C, chunk_size, D=D, dt_bias=dt_bias, dt_softplus=True,
+        x,
+        dt,
+        A,
+        B,
+        C,
+        chunk_size,
+        D=D,
+        dt_bias=dt_bias,
+        dt_softplus=True,
         return_final_states=True,
     )
     assert out is not None
@@ -1322,7 +1348,15 @@ def test_return_final_states_flag():
 
     # With return_final_states=False, final_states should be None
     out2, final_states2 = ssd_combined_fwd(
-        x, dt, A, B, C, chunk_size, D=D, dt_bias=dt_bias, dt_softplus=True,
+        x,
+        dt,
+        A,
+        B,
+        C,
+        chunk_size,
+        D=D,
+        dt_bias=dt_bias,
+        dt_softplus=True,
         return_final_states=False,
     )
     assert out2 is not None
@@ -1343,15 +1377,17 @@ class TestVarlenEndToEnd:
     RTOL = 7e-2
 
     @staticmethod
-    def _make_inputs(seq_lengths, chunk_size=128, nheads=8, headdim=64,
-                     dstate=128, ngroups=8):
+    def _make_inputs(
+        seq_lengths, chunk_size=128, nheads=8, headdim=64, dstate=128, ngroups=8
+    ):
         torch.manual_seed(42)
         num_seqs = len(seq_lengths)
         total_seqlen = sum(seq_lengths)
 
         cu_seqlens = torch.tensor(
             [0] + list(torch.cumsum(torch.tensor(seq_lengths), dim=0).tolist()),
-            dtype=torch.int32, device="cuda",
+            dtype=torch.int32,
+            device="cuda",
         )
         seq_idx, chunk_indices, chunk_offsets = _compute_varlen_metadata(
             cu_seqlens, chunk_size
@@ -1370,10 +1406,19 @@ class TestVarlenEndToEnd:
         )
 
         return dict(
-            x=x, dt=dt, A=A, B=B, C=C, D=D, dt_bias=dt_bias,
-            chunk_size=chunk_size, initial_states=initial_states,
-            seq_idx=seq_idx, chunk_indices=chunk_indices,
-            chunk_offsets=chunk_offsets, cu_seqlens=cu_seqlens,
+            x=x,
+            dt=dt,
+            A=A,
+            B=B,
+            C=C,
+            D=D,
+            dt_bias=dt_bias,
+            chunk_size=chunk_size,
+            initial_states=initial_states,
+            seq_idx=seq_idx,
+            chunk_indices=chunk_indices,
+            chunk_offsets=chunk_offsets,
+            cu_seqlens=cu_seqlens,
         )
 
     def _run_and_check(self, seq_lengths, tag):
@@ -1383,9 +1428,15 @@ class TestVarlenEndToEnd:
         # This calls chunk_state_varlen internally to get per-sequence final states.
         # return_varlen_states=True, return_final_states=False returns a single tensor.
         varlen_states_ref = mamba_chunk_scan_combined(
-            inp["x"], inp["dt"], inp["A"], inp["B"], inp["C"],
+            inp["x"],
+            inp["dt"],
+            inp["A"],
+            inp["B"],
+            inp["C"],
             inp["chunk_size"],
-            D=inp["D"], dt_bias=inp["dt_bias"], dt_softplus=True,
+            D=inp["D"],
+            dt_bias=inp["dt_bias"],
+            dt_softplus=True,
             initial_states=inp["initial_states"],
             seq_idx=inp["seq_idx"],
             chunk_indices=inp["chunk_indices"],
@@ -1397,9 +1448,15 @@ class TestVarlenEndToEnd:
 
         # FlashInfer: our final_states IS the per-sequence final states
         out_test, final_states_test = ssd_combined_fwd(
-            inp["x"], inp["dt"], inp["A"], inp["B"], inp["C"],
+            inp["x"],
+            inp["dt"],
+            inp["A"],
+            inp["B"],
+            inp["C"],
             inp["chunk_size"],
-            D=inp["D"], dt_bias=inp["dt_bias"], dt_softplus=True,
+            D=inp["D"],
+            dt_bias=inp["dt_bias"],
+            dt_softplus=True,
             initial_states=inp["initial_states"],
             seq_idx=inp["seq_idx"],
             chunk_indices=inp["chunk_indices"],

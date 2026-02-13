@@ -388,7 +388,9 @@ class SSDKernel:
         seq_idx: cute.Tensor,  # (batch, seqlen) int32 (optional)
         chunk_indices: cute.Tensor,  # (num_logical_chunks,) int32 (optional)
         chunk_offsets: cute.Tensor,  # (num_logical_chunks,) int32 (optional)
+        seq_chunk_cumsum: cute.Tensor,  # (num_seqs+1,) int32 (optional, varlen only)
         num_logical_chunks: cutlass.Int32,  # len(chunk_indices), or 0 if no varlen
+        num_seqs: cutlass.Int32,  # number of sequences (0 if no varlen)
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
@@ -545,7 +547,7 @@ class SSDKernel:
         )
 
         # Compute grid size
-        tile_sched_params, grid = self._compute_grid(y, b, max_active_clusters)
+        tile_sched_params, grid = self._compute_grid(y, b, max_active_clusters, num_seqs)
 
         # Plan shared memory storage
         swizzle_buffer_align_bytes = 1024
@@ -670,7 +672,9 @@ class SSDKernel:
             seq_idx,
             chunk_indices,
             chunk_offsets,
+            seq_chunk_cumsum,
             num_logical_chunks,
+            num_seqs,
             self.cluster_layout_vmnk,
             self.x_smem_layout,
             self.xt_smem_layout,
@@ -724,7 +728,9 @@ class SSDKernel:
         seq_idx: cute.Tensor,  # (batch, seqlen) int32 or None
         chunk_indices: cute.Tensor,  # (num_logical_chunks,) int32 or None
         chunk_offsets: cute.Tensor,  # (num_logical_chunks,) int32 or None
+        seq_chunk_cumsum: cute.Tensor,  # (num_seqs+1,) int32 or None
         num_logical_chunks: cutlass.Int32,  # len(chunk_indices), or 0 if no varlen
+        num_seqs: cutlass.Int32,  # number of sequences (0 if no varlen)
         cluster_layout_vmnk: cute.Layout,
         x_smem_layout: cute.ComposedLayout,
         xt_smem_layout: cute.ComposedLayout,
@@ -767,7 +773,11 @@ class SSDKernel:
         L = cute.size(tma_tensor_x, mode=[1])
         N = cute.size(tma_tensor_b, mode=[1])
         # Dynamic values
+        # In varlen mode, C/first_chunk are set per-tile from seq_chunk_cumsum.
+        # In non-varlen mode, C = num_logical_chunks and first_chunk = 0.
         C = num_logical_chunks
+        first_chunk = cutlass.Int32(0)
+        seq_id = cutlass.Int32(0)
         EH = cute.size(tma_tensor_x, mode=[3])
         B = cute.size(tma_tensor_x, mode=[4])
         G = cute.size(tma_tensor_b, mode=[3])
@@ -1001,6 +1011,13 @@ class SSDKernel:
             while work_tile.is_valid_tile:
                 b_idx, eh_idx, g_idx = work_tile.tile_idx
 
+                # Varlen: b_idx from scheduler is seq_idx
+                if cutlass.const_expr(self.has_varlen):
+                    seq_id = b_idx
+                    b_idx = cutlass.Int32(0)
+                    first_chunk = seq_chunk_cumsum[seq_id]
+                    C = seq_chunk_cumsum[seq_id + 1] - first_chunk
+
                 # Slice global tensor to current tile idx
                 # ((ATOM_V, REST_V), C)
                 tXgX = tXgX_pre_slice[None, 0, 0, None, eh_idx, b_idx]
@@ -1033,9 +1050,7 @@ class SSDKernel:
                 if cutlass.const_expr(self.has_init_states):
                     # Load first sequence's init_states before the chunk loop
                     if cutlass.const_expr(self.has_varlen):
-                        c_idx_0 = chunk_indices[0]
-                        c_off_0 = chunk_offsets[0]
-                        first_seq_id = seq_idx[0, c_idx_0 * L + c_off_0]
+                        first_seq_id = seq_id
                     else:
                         first_seq_id = b_idx
                     tIstategIstate = tIstategIstate_pre_slice[
@@ -1072,15 +1087,17 @@ class SSDKernel:
 
                 # Batched load over C dimension
                 for chunk_idx in cutlass.range(C, unroll=1):
-                    # Map logical chunk to physical chunk (c_idx)
-                    c_idx = x_producer_state.count
+                    # Index into global chunk_indices/chunk_offsets arrays
+                    physical_chunk = first_chunk + x_producer_state.count
+                    # Map to physical chunk (chunk)
+                    chunk = physical_chunk
                     if cutlass.const_expr(self.has_varlen):
-                        c_idx = chunk_indices[x_producer_state.count]
+                        chunk = chunk_indices[physical_chunk]
 
                     # Load init_states on sequence transitions
                     if cutlass.const_expr(self.has_init_states and self.has_varlen):
-                        c_off = chunk_offsets[x_producer_state.count]
-                        seq_id = seq_idx[0, c_idx * L + c_off]
+                        chunk_offset = chunk_offsets[physical_chunk]
+                        seq_id = seq_idx[0, chunk * L + chunk_offset]
                         if seq_id != prev_seq_id:
                             tIstategIstate = tIstategIstate_pre_slice[
                                 None, 0, 0, eh_idx, seq_id
@@ -1103,7 +1120,7 @@ class SSDKernel:
                     # TMA load X
                     cute.copy(
                         tma_atom_x,
-                        tXgX[None, c_idx],
+                        tXgX[None, chunk],
                         tXsX[None, x_producer_state.index],
                         tma_bar_ptr=x_pipeline.producer_get_barrier(x_producer_state),
                     )
@@ -1116,7 +1133,7 @@ class SSDKernel:
                     # TMA load Delta/CumsumDelta
                     cute.copy(
                         tma_atom_delta,
-                        tDeltagDelta[None, c_idx],
+                        tDeltagDelta[None, chunk],
                         tDeltasDelta[None, deltas_producer_state.index],
                         tma_bar_ptr=deltas_pipeline.producer_get_barrier(
                             deltas_producer_state
@@ -1124,7 +1141,7 @@ class SSDKernel:
                     )
                     cute.copy(
                         tma_atom_cumsum_delta,
-                        tDeltagCumsumDelta[None, c_idx],
+                        tDeltagCumsumDelta[None, chunk],
                         tDeltasCumsumDelta[None, deltas_producer_state.index],
                         tma_bar_ptr=deltas_pipeline.producer_get_barrier(
                             deltas_producer_state
@@ -1198,6 +1215,13 @@ class SSDKernel:
             while work_tile.is_valid_tile:
                 b_idx, eh_idx, g_idx = work_tile.tile_idx
 
+                # Varlen: b_idx from scheduler is seq_idx
+                if cutlass.const_expr(self.has_varlen):
+                    seq_id = b_idx
+                    b_idx = cutlass.Int32(0)
+                    first_chunk = seq_chunk_cumsum[seq_id]
+                    C = seq_chunk_cumsum[seq_id + 1] - first_chunk
+
                 # Slice global tensor to current tile idx
                 # ((ATOM_V, REST_V), C)
                 tBgB = tBgB_pre_slice[None, 0, 0, None, g_idx, b_idx]
@@ -1217,11 +1241,13 @@ class SSDKernel:
 
                 # Batched load over C dimension
                 for chunk_idx in cutlass.range(C, unroll=1):
-                    # Map logical chunk to physical chunk (c_idx)
+                    # Index into global chunk_indices/chunk_offsets arrays
+                    physical_chunk = first_chunk + b_producer_state.count
+                    # Map to physical chunk (chunk)
                     if cutlass.const_expr(self.has_varlen):
-                        c_idx = chunk_indices[b_producer_state.count]
+                        chunk = chunk_indices[physical_chunk]
                     else:
-                        c_idx = b_producer_state.count
+                        chunk = physical_chunk
 
                     # Conditionally wait for B buffer empty
                     b_pipeline.producer_acquire(b_producer_state, peek_b_empty_status)
@@ -1229,7 +1255,7 @@ class SSDKernel:
                     # TMA load B
                     cute.copy(
                         tma_atom_b,
-                        tBgB[None, c_idx],
+                        tBgB[None, chunk],
                         tBsB[None, b_producer_state.index],
                         tma_bar_ptr=b_pipeline.producer_get_barrier(b_producer_state),
                     )
@@ -1240,7 +1266,7 @@ class SSDKernel:
                     # TMA load C
                     cute.copy(
                         tma_atom_c,
-                        tCgC[None, c_idx],
+                        tCgC[None, chunk],
                         tCsC[None, c_producer_state.index],
                         tma_bar_ptr=c_pipeline.producer_get_barrier(c_producer_state),
                     )
@@ -1323,6 +1349,13 @@ class SSDKernel:
             )
 
             while work_tile.is_valid_tile:
+                # Varlen: compute per-CTA chunk range
+                if cutlass.const_expr(self.has_varlen):
+                    b_idx, eh_idx, g_idx = work_tile.tile_idx
+                    seq_id = b_idx
+                    first_chunk = seq_chunk_cumsum[seq_id]
+                    C = seq_chunk_cumsum[seq_id + 1] - first_chunk
+
                 # Reset count for pipeline state
                 b_consumer_state.reset_count()
                 c_consumer_state.reset_count()
@@ -1570,6 +1603,13 @@ class SSDKernel:
             )
 
             while work_tile.is_valid_tile:
+                # Varlen: compute per-CTA chunk range
+                if cutlass.const_expr(self.has_varlen):
+                    b_idx, eh_idx, g_idx = work_tile.tile_idx
+                    seq_id = b_idx
+                    first_chunk = seq_chunk_cumsum[seq_id]
+                    C = seq_chunk_cumsum[seq_id + 1] - first_chunk
+
                 # Reset count for pipeline state
                 x_consumer_state.reset_count()
                 c_consumer_state.reset_count()
@@ -1828,6 +1868,13 @@ class SSDKernel:
             while work_tile.is_valid_tile:
                 b_idx, eh_idx, g_idx = work_tile.tile_idx
 
+                # Varlen: b_idx from scheduler is seq_idx
+                if cutlass.const_expr(self.has_varlen):
+                    seq_id = b_idx
+                    b_idx = cutlass.Int32(0)
+                    first_chunk = seq_chunk_cumsum[seq_id]
+                    C = seq_chunk_cumsum[seq_id + 1] - first_chunk
+
                 # Slice global tensor to current tile idx
                 # ((ATOM_V, REST_V))
                 bSG_gP = bSG_gP_pre_slice[(None, 0, 0, eh_idx, b_idx)]
@@ -1890,12 +1937,14 @@ class SSDKernel:
 
                 # Batched processing over C dimension
                 for chunk_idx in cutlass.range(C, unroll=1):
-                    c_idx = chunk_idx
-                    c_off = 0
-                    # Map logical chunk to physical chunk index and offset
+                    # Index into global chunk_indices/chunk_offsets arrays
+                    physical_chunk = first_chunk + chunk_idx
+                    chunk = physical_chunk
+                    chunk_offset = 0
+                    # Map to physical chunk index and offset
                     if cutlass.const_expr(self.has_varlen):
-                        c_idx = chunk_indices[chunk_idx]
-                        c_off = chunk_offsets[chunk_idx]
+                        chunk = chunk_indices[physical_chunk]
+                        chunk_offset = chunk_offsets[physical_chunk]
 
                     # Conditionally wait for B/Delta/B_TMEM buffer full/full/empty
                     b_pipeline.consumer_wait(b_consumer_state, peek_b_full_status)
@@ -1923,12 +1972,14 @@ class SSDKernel:
                     # When two logical chunks share a physical chunk,
                     # last_column must point to the end of the current
                     # sequence's range, not the full physical chunk.
+                    # Check against global num_logical_chunks (not per-CTA C)
+                    # because the next logical chunk may belong to the next CTA.
                     if cutlass.const_expr(self.has_varlen):
                         chunk_size_limit = L
-                        if chunk_idx + 1 < C:
-                            c_idx_next = chunk_indices[chunk_idx + 1]
-                            if c_idx_next == c_idx:
-                                chunk_size_limit = chunk_offsets[chunk_idx + 1]
+                        if physical_chunk + 1 < num_logical_chunks:
+                            next_chunk = chunk_indices[physical_chunk + 1]
+                            if next_chunk == chunk:
+                                chunk_size_limit = chunk_offsets[physical_chunk + 1]
                         if chunk_size_limit < L:
                             last_column = smem_cumsum_delta[
                                 chunk_size_limit - 1,
@@ -1942,9 +1993,9 @@ class SSDKernel:
                     )
 
                     # Combine B/Delta/DeltaA/last_column
-                    # Note: B scaling uses last_column BEFORE the c_off
+                    # Note: B scaling uses last_column BEFORE the chunk_offset
                     # adjustment, so exp(last_column - dA_cs[i]) uses the
-                    # raw cumsum range. The c_off adjustment is only for
+                    # raw cumsum range. The chunk_offset adjustment is only for
                     # the state recurrence (exp(last_column) * old_state).
                     tScaledB = self.pre_inter_scale_bt_with_delta(
                         tBrB_s2r, tBrDelta_r2s, tBrDeltaA_r2s, last_column
@@ -1953,23 +2004,23 @@ class SSDKernel:
                     # Adjust last_column for chunk offset boundary AFTER
                     # B scaling. The state recurrence needs last_column
                     # relative to the sequence start within the chunk.
-                    if c_off > 0:
+                    if chunk_offset > 0:
                         dA_cs_boundary = smem_cumsum_delta[
-                            c_off - 1, deltas_consumer_state.index
+                            chunk_offset - 1, deltas_consumer_state.index
                         ]
                         last_column = last_column - dA_cs_boundary
 
-                    # Step 4.2: mask scaled B outside [c_off, chunk_size_limit).
+                    # Step 4.2: mask scaled B outside [chunk_offset, chunk_size_limit).
                     # Zero out positions belonging to other sequences
                     # so they don't contaminate INTER1's chunk state.
                     if cutlass.const_expr(self.has_varlen):
-                        if chunk_size_limit < L or c_off > 0:
+                        if chunk_size_limit < L or chunk_offset > 0:
                             for reg_idx in cutlass.range(
                                 cute.size(tScaledB), unroll_full=True
                             ):
                                 coord = tBCoord[reg_idx]
                                 l_coord = coord[1]
-                                if l_coord >= chunk_size_limit or l_coord < c_off:
+                                if l_coord >= chunk_size_limit or l_coord < chunk_offset:
                                     tScaledB[reg_idx] = 0.0
 
                     # Store scaled B to tBrB_r2s
@@ -2044,12 +2095,12 @@ class SSDKernel:
                     # --- Varlen look-ahead: store fstate / reload init_state ---
                     if cutlass.const_expr(self.has_init_states and self.has_varlen):
                         is_last_chunk = chunk_idx == C - 1
-                        seq_id = seq_idx[0, c_idx * L + c_off]
+                        seq_id = seq_idx[0, chunk * L + chunk_offset]
                         seq_ends_here = is_last_chunk
                         if not is_last_chunk:
-                            c_idx_next = chunk_indices[chunk_idx + 1]
-                            c_off_next = chunk_offsets[chunk_idx + 1]
-                            next_seq = seq_idx[0, c_idx_next * L + c_off_next]
+                            next_chunk = chunk_indices[physical_chunk + 1]
+                            chunk_offset_next = chunk_offsets[physical_chunk + 1]
+                            next_seq = seq_idx[0, next_chunk * L + chunk_offset_next]
                             seq_ends_here = next_seq != seq_id
 
                         # A. Store final state of ending sequence to gmem
@@ -2132,11 +2183,8 @@ class SSDKernel:
 
                 if local_warp_idx == 0:
                     # TMA store P
-                    # For varlen, index by seq_id of last chunk; for non-varlen, use b_idx
+                    # For varlen, use seq_id from tile scheduler; for non-varlen, use b_idx
                     if cutlass.const_expr(self.has_init_states and self.has_varlen):
-                        last_c_idx = chunk_indices[C - 1]
-                        last_c_off = chunk_offsets[C - 1]
-                        seq_id = seq_idx[0, last_c_idx * L + last_c_off]
                         bSG_gP_final = bSG_gP_pre_slice[(None, 0, 0, eh_idx, seq_id)]
                     else:
                         bSG_gP_final = bSG_gP
@@ -2265,6 +2313,13 @@ class SSDKernel:
             )
 
             while work_tile.is_valid_tile:
+                # Varlen: compute per-CTA chunk range
+                if cutlass.const_expr(self.has_varlen):
+                    b_idx, eh_idx, g_idx = work_tile.tile_idx
+                    seq_id = b_idx
+                    first_chunk = seq_chunk_cumsum[seq_id]
+                    C = seq_chunk_cumsum[seq_id + 1] - first_chunk
+
                 # Reset count for pipeline state
                 deltas_consumer_state.reset_count()
                 intra1_acc_consumer_state.reset_count()
@@ -2280,6 +2335,9 @@ class SSDKernel:
 
                 # Batched processing over C dimension
                 for chunk_idx in cutlass.range(C, unroll=1):
+                    # Index into global chunk_indices/chunk_offsets arrays
+                    physical_chunk = first_chunk + chunk_idx
+
                     # Conditionally wait for Delta/INTRA1_ACC buffer full
                     deltas_pipeline.consumer_wait(
                         deltas_consumer_state, peek_deltas_full_status
@@ -2288,18 +2346,18 @@ class SSDKernel:
                         intra1_acc_consumer_state, peek_rd_intra1_acc_full_status
                     )
 
-                    # Step 4.3a: compute c_off/chunk_size_limit for
+                    # Step 4.3a: compute chunk_offset/chunk_size_limit for
                     # cross-sequence CB masking in the INTRA path.
                     if cutlass.const_expr(self.has_varlen):
-                        c_idx = chunk_indices[chunk_idx]
-                        c_off = chunk_offsets[chunk_idx]
+                        chunk = chunk_indices[physical_chunk]
+                        chunk_offset = chunk_offsets[physical_chunk]
                         chunk_size_limit = L
-                        if chunk_idx + 1 < C:
-                            c_idx_next = chunk_indices[chunk_idx + 1]
-                            if c_idx_next == c_idx:
-                                chunk_size_limit = chunk_offsets[chunk_idx + 1]
+                        if physical_chunk + 1 < num_logical_chunks:
+                            next_chunk = chunk_indices[physical_chunk + 1]
+                            if next_chunk == chunk:
+                                chunk_size_limit = chunk_offsets[physical_chunk + 1]
                     else:
-                        c_off = 0
+                        chunk_offset = 0
                         chunk_size_limit = L
 
                     # Load Q from tmem
@@ -2310,19 +2368,19 @@ class SSDKernel:
                     # Step 4.3b: zero cross-sequence CB entries.
                     # CB = C @ B^T is computed by INTRA1_MMA on the full
                     # physical chunk. Zero entries where m or n falls
-                    # outside [c_off, chunk_size_limit) so data from
+                    # outside [chunk_offset, chunk_size_limit) so data from
                     # other sequences doesn't leak through segsum.
                     if cutlass.const_expr(self.has_varlen):
-                        if chunk_size_limit < L or c_off > 0:
+                        if chunk_size_limit < L or chunk_offset > 0:
                             for subtile_idx in cutlass.range(
                                 cute.size(tTR_rQ), unroll_full=True
                             ):
                                 m, n = tCoord[subtile_idx]
                                 if (
                                     m >= chunk_size_limit
-                                    or m < c_off
+                                    or m < chunk_offset
                                     or n >= chunk_size_limit
-                                    or n < c_off
+                                    or n < chunk_offset
                                 ):
                                     tTR_rQ[subtile_idx] = 0.0
 
@@ -2533,6 +2591,13 @@ class SSDKernel:
             while work_tile.is_valid_tile:
                 b_idx, eh_idx, g_idx = work_tile.tile_idx
 
+                # Varlen: b_idx from scheduler is seq_idx
+                if cutlass.const_expr(self.has_varlen):
+                    seq_id = b_idx
+                    b_idx = cutlass.Int32(0)
+                    first_chunk = seq_chunk_cumsum[seq_id]
+                    C = seq_chunk_cumsum[seq_id + 1] - first_chunk
+
                 # Slice global tensor to current tile idx
                 # ((ATOM_V, REST_V), EPI_M, EPI_N, C)
                 bSG_gY = bSG_gY_pre_slice[(None, None, None, 0, 0, None, eh_idx, b_idx)]
@@ -2569,18 +2634,20 @@ class SSDKernel:
 
                 # Batched processing over C dimension
                 for chunk_idx in cutlass.range(C, unroll=1):
-                    # Map logical chunk to physical chunk (c_idx) and offset (c_off)
+                    # Index into global chunk_indices/chunk_offsets arrays
+                    physical_chunk = first_chunk + chunk_idx
+                    # Map to physical chunk (chunk) and offset (chunk_offset)
                     if cutlass.const_expr(self.has_varlen):
-                        c_idx = chunk_indices[chunk_idx]
-                        c_off = chunk_offsets[chunk_idx]
+                        chunk = chunk_indices[physical_chunk]
+                        chunk_offset = chunk_offsets[physical_chunk]
                         chunk_size_limit = L
-                        if chunk_idx + 1 < C:
-                            c_idx_next = chunk_indices[chunk_idx + 1]
-                            if c_idx_next == c_idx:
-                                chunk_size_limit = chunk_offsets[chunk_idx + 1]
+                        if physical_chunk + 1 < num_logical_chunks:
+                            next_chunk = chunk_indices[physical_chunk + 1]
+                            if next_chunk == chunk:
+                                chunk_size_limit = chunk_offsets[physical_chunk + 1]
                     else:
-                        c_idx = chunk_idx
-                        c_off = 0
+                        chunk = physical_chunk
+                        chunk_offset = 0
                         chunk_size_limit = L
 
                     # Conditionally wait for Delta/INTRA2_ACC/INTER2_ACC/X buffer full
@@ -2650,11 +2717,11 @@ class SSDKernel:
                                 cute.copy(s2r_atom_d, tRS_sD[d_coord], tRS_rD)
 
                             # Adjust dA_cumsum for chunk offset boundary
-                            # When c_off > 0, shift all dA values so they're
+                            # When chunk_offset > 0, shift all dA values so they're
                             # relative to the sequence start within the chunk.
-                            if c_off > 0:
+                            if chunk_offset > 0:
                                 dA_cs_boundary = smem_cumsum_delta[
-                                    c_off - 1, deltas_consumer_state.index
+                                    chunk_offset - 1, deltas_consumer_state.index
                                 ]
                                 for reg_idx in range(cute.size(tTR_rDeltaA)):
                                     tTR_rDeltaA[reg_idx] = (
@@ -2726,7 +2793,7 @@ class SSDKernel:
                                     z_l = coord[0]
                                     z_d = coord[1]
                                     tRS_rZ[reg_idx] = z_gmem[
-                                        z_d_off + z_d, z_l, c_idx, eh_idx, b_idx
+                                        z_d_off + z_d, z_l, chunk, eh_idx, b_idx
                                     ].to(self.acc_dtype)
                                 for reg_idx in range(0, cute.size(tRS_rCompute), 2):
                                     z0 = tRS_rZ[reg_idx]
@@ -2791,21 +2858,21 @@ class SSDKernel:
                             l_coord = 0
                             d_coord = 0
                             d_off = epi_n * epi_tile[1]
-                            if chunk_size_limit < L or c_off > 0:
+                            if chunk_size_limit < L or chunk_offset > 0:
                                 # Masked warp-level store: each thread
                                 # stores its registers directly to gmem,
-                                # only for L positions in [c_off, chunk_size_limit).
+                                # only for L positions in [chunk_offset, chunk_size_limit).
                                 for reg_idx in cutlass.range(
                                     cute.size(tRS_rY), unroll_full=True
                                 ):
                                     coord = tYCoord[reg_idx]
                                     l_coord = coord[0]
                                     d_coord = coord[1]
-                                    if l_coord >= c_off and l_coord < chunk_size_limit:
+                                    if l_coord >= chunk_offset and l_coord < chunk_size_limit:
                                         y_gmem[
                                             l_coord,
                                             d_off + d_coord,
-                                            c_idx,
+                                            chunk,
                                             eh_idx,
                                             b_idx,
                                         ] = tRS_rY[reg_idx]
@@ -2815,7 +2882,7 @@ class SSDKernel:
                                     cute.copy(
                                         tma_atom_y,
                                         bSG_sY[None, epi_buffer_idx],
-                                        bSG_gY[None, epi_m, epi_n, c_idx],
+                                        bSG_gY[None, epi_m, epi_n, chunk],
                                     )
 
                             # Commit + wait TMA pipeline (keeps pipeline
@@ -2887,13 +2954,17 @@ class SSDKernel:
     def _compute_stages(smem_capacity):
         return 2, 2, 1, 2  # input, output, internal, intra1_acc
 
-    @staticmethod
-    def _compute_grid(y, b, max_active_clusters):
+    def _compute_grid(self, y, b, max_active_clusters, num_seqs=0):
         B = cute.size(y, mode=[4])
         EH = cute.size(y, mode=[3])
         G = cute.size(b, mode=[3])
         NGROUP_RATIO = EH // G
-        num_blocks = B * EH
+        # In varlen mode, launch num_seqs * EH CTAs so each CTA handles
+        # one (sequence, head) pair instead of all sequences serially.
+        if cutlass.const_expr(self.has_varlen):
+            num_blocks = num_seqs * EH
+        else:
+            num_blocks = B * EH
 
         tile_sched_params = Mamba2SSDTileSchedulerParams(num_blocks, EH, NGROUP_RATIO)
         grid = Mamba2SSDTileScheduler.get_grid_shape(

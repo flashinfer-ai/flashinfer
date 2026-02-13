@@ -361,12 +361,27 @@ class _SSDKernel:
         seq_idx_tensor = None
         chunk_indices_tensor = None
         chunk_offsets_tensor = None
+        seq_chunk_cumsum_tensor = None
+        num_seqs = 0
         if seq_idx is not None:
             seq_idx_tensor = from_dlpack(seq_idx, assumed_align=4)
         if chunk_indices is not None:
             chunk_indices_tensor = from_dlpack(chunk_indices, assumed_align=4)
         if chunk_offsets is not None:
             chunk_offsets_tensor = from_dlpack(chunk_offsets, assumed_align=4)
+
+        # Compute per-sequence logical chunk ranges for varlen parallelization
+        if seq_idx is not None and chunk_indices is not None and chunk_offsets is not None:
+            # num_seqs from init_states batch dim (already on host, no sync)
+            num_seqs = init_states.shape[0] if init_states is not None else 1
+            # seq_id for each logical chunk (device ops, no host sync)
+            seq_ids = seq_idx[0, chunk_indices.long() * chunk_size + chunk_offsets.long()]
+            counts = torch.bincount(seq_ids, minlength=num_seqs)
+            seq_chunk_cumsum = torch.zeros(
+                num_seqs + 1, dtype=torch.int32, device=seq_idx.device
+            )
+            torch.cumsum(counts.int(), dim=0, out=seq_chunk_cumsum[1:])
+            seq_chunk_cumsum_tensor = from_dlpack(seq_chunk_cumsum, assumed_align=4)
 
         # Number of logical chunks (may differ from physical chunks for varlen)
         num_logical_chunks = (
@@ -394,7 +409,9 @@ class _SSDKernel:
                 seq_idx_tensor,
                 chunk_indices_tensor,
                 chunk_offsets_tensor,
+                seq_chunk_cumsum_tensor,
                 num_logical_chunks,
+                num_seqs,
                 max_active_clusters,
                 stream,
             )
@@ -416,7 +433,9 @@ class _SSDKernel:
             seq_idx_tensor,
             chunk_indices_tensor,
             chunk_offsets_tensor,
+            seq_chunk_cumsum_tensor,
             num_logical_chunks,
+            num_seqs,
             stream,
         )
         torch.cuda.nvtx.range_pop()  # run:launch
