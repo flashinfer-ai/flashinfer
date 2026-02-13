@@ -1489,17 +1489,6 @@ cudaError_t allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const& par
     }
   }
 
-  // Avoid CUDA 701 ("too many resources requested for launch") when
-  // register-limited max_threads_per_block is below the computed block size.
-  // Prefer reducing block size by increasing cluster_size while preserving
-  // full token coverage.
-  while (oneshot && block_size > max_threads_per_block && cluster_size < 8 &&
-         threads_per_token % (cluster_size * 2) == 0) {
-    cluster_size *= 2;
-    threads_per_block = threads_per_token / cluster_size;
-    block_size = threads_per_block;
-  }
-
   FLASHINFER_CHECK(!oneshot || threads_per_block * cluster_size == threads_per_token,
                    "oneshot launch config mismatch: threads_per_block * cluster_size != "
                    "threads_per_token");
