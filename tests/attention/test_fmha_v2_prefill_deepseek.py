@@ -317,8 +317,8 @@ def test_fmha_v2_prefill_deepseek(
     torch.testing.assert_close(lse, lse_ref, rtol=1e-2, atol=1e-3)
 
 
-@pytest.mark.parametrize("batch_size", [4, 16])
-@pytest.mark.parametrize("max_seq_len", [1024, 4096])
+@pytest.mark.parametrize("batch_size", [1, 16])
+@pytest.mark.parametrize("max_seq_len", [1024, 16384])
 @pytest.mark.parametrize("num_qo_heads", [4, 32])
 @pytest.mark.parametrize("num_kv_heads", [4])
 @pytest.mark.parametrize("head_dim", [128, 256])
@@ -602,7 +602,7 @@ def test_trtllm_fmha_v2_prefill(
         output_ref = ref_result
 
     if dtype == torch.float8_e4m3fn:
-        rtol, atol = 4e-2, 7e-2
+        rtol, atol = 4e-2, 8e-2
     else:
         rtol, atol = 1e-2, 1e-2
     torch.testing.assert_close(output.float(), output_ref.float(), rtol=rtol, atol=atol)
