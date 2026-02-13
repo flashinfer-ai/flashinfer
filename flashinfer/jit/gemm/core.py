@@ -305,6 +305,53 @@ def gen_gemm_sm100_module_cutlass_bf16() -> JitSpec:
     )
 
 
+def gen_gemm_sm100_module_cutlass_mxfp8() -> JitSpec:
+    gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / "gen_gemm_sm100_cutlass_mxfp8"
+    os.makedirs(gen_directory, exist_ok=True)
+    source_paths = [
+        jit_env.FLASHINFER_CSRC_DIR / "mxfp8_gemm_cutlass.cu",
+    ]
+
+    with open(jit_env.FLASHINFER_CSRC_DIR / "mxfp8_gemm_cutlass.jinja") as f:
+        kernel_inst_templ = jinja2.Template(f.read())
+        dtype_list = ["__nv_bfloat16", "half"]
+        cta_m_n_k_list = [
+            (128, 64, 128),
+            (128, 256, 128),
+            (128, 128, 256),
+            (128, 256, 256),
+        ]
+        for cta_m, cta_n, cta_k in cta_m_n_k_list:
+            for dtype in dtype_list:
+                dest_path = (
+                    gen_directory
+                    / f"mxfp8_gemm_cutlass_{dtype}_{cta_m}_{cta_n}_{cta_k}.cu"
+                )
+                source_paths.append(dest_path)
+                source = kernel_inst_templ.render(
+                    type=dtype,
+                    cta_m=cta_m,
+                    cta_n=cta_n,
+                    cta_k=cta_k,
+                )
+                write_if_different(dest_path, source)
+
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[10, 11]
+    )
+    return gen_jit_spec(
+        "mxfp8_gemm_cutlass",
+        source_paths,
+        extra_cuda_cflags=nvcc_flags
+        + [
+            "-DENABLE_BF16",
+        ],
+        extra_cflags=[
+            "-DFAST_BUILD",
+        ],
+    )
+
+
 def gen_gemm_sm100_module() -> JitSpec:
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / "gen_gemm_sm100"
     os.makedirs(gen_directory, exist_ok=True)

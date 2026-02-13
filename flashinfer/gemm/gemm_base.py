@@ -53,6 +53,7 @@ from ..jit.gemm import gen_gemm_sm120_module_cutlass_fp4
 from ..jit.gemm import gen_gemm_sm100_module_cutlass_fp4
 from ..jit.gemm import gen_gemm_sm103_module_cutlass_fp4
 from ..jit.gemm import gen_gemm_sm100_module_cutlass_fp8
+from ..jit.gemm import gen_gemm_sm100_module_cutlass_mxfp8
 from ..jit.gemm import gen_gemm_sm100_module_cutlass_bf16
 from ..jit.gemm import gen_trtllm_gen_gemm_module
 from ..jit.gemm import gen_tgv_gemm_sm10x_module
@@ -2414,6 +2415,382 @@ def mm_fp8(
     return out
 
 
+def _create_cutlass_mxfp8_gemm_module(module, op_name: str, tuner_name: str):
+    """Helper function to create cutlass MXFP8 GEMM module."""
+
+    def cutlass_mxfp8_gemm_runner():
+        class CutlassMxfp8GemmRunner(TunableRunner):
+            def get_valid_tactics(
+                self,
+                inputs: List[torch.Tensor],
+                profile: OptimizationProfile,
+            ) -> List[int]:
+                return list(range(module.mxfp8_gemm_tactic_num()))
+
+            def forward(
+                self,
+                inputs: List[torch.Tensor],
+                tactic: int = -1,
+                do_preparation: bool = False,
+                **kwargs,
+            ):
+                (
+                    a,
+                    b,
+                    a_descale,
+                    b_descale,
+                    _,
+                    out,
+                    workspace_buffer,
+                ) = inputs
+
+                # CUTLASS expects b_descale in (N, K/32).
+                # 2D input is (K/32, N) and must be transposed; 1D swizzled is pass-through.
+                if b_descale.ndim == 2:
+                    # Input is (K/32, N), transpose to (N, K/32) for CUTLASS
+                    b_descale_processed = b_descale.T
+                    if not b_descale_processed.is_contiguous():
+                        b_descale_processed = b_descale_processed.contiguous()
+                else:
+                    # 1D swizzled format - pass as-is, just ensure contiguous
+                    b_descale_processed = b_descale
+                    if not b_descale_processed.is_contiguous():
+                        b_descale_processed = b_descale_processed.contiguous()
+
+                module.mxfp8_gemm(
+                    a,
+                    b.T,
+                    a_descale,
+                    b_descale_processed,
+                    out,
+                    workspace_buffer,
+                    tactic,
+                )
+                return out
+
+        return CutlassMxfp8GemmRunner()
+
+    return SimpleNamespace(
+        cutlass_mxfp8_gemm_runner=cutlass_mxfp8_gemm_runner,
+    )
+
+
+@functools.cache
+def get_gemm_sm100_module_cutlass_mxfp8():
+    """Get the SM100/103/110 MXFP8 GEMM module."""
+    module = gen_gemm_sm100_module_cutlass_mxfp8().build_and_load()
+    return _create_cutlass_mxfp8_gemm_module(
+        module, "flashinfer::cutlass_mxfp8_gemm", "cutlass_mxfp8_gemm"
+    )
+
+
+def get_cutlass_mxfp8_gemm_module(
+    sm_major: int,
+):
+    if sm_major in [10, 11]:
+        return get_gemm_sm100_module_cutlass_mxfp8()
+    else:
+        raise ValueError(f"Unsupported SM major version: {sm_major}")
+
+
+def _check_mm_mxfp8_problem_size(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_descale: torch.Tensor,
+    b_descale: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    backend: Literal["cutlass", "auto"] = "auto",  # unused
+) -> bool:
+    # Generic checks
+    ## pre-check the input tensors and block scale tensors
+    if a.ndim != 2 or b.ndim != 2:
+        raise ValueError(f"mm_mxfp8 accepts 2d tensors, got {a.shape=} and {b.shape=}")
+
+    # b is passed transposed (shape [k, n]), so verify K matches.
+    if a.shape[1] != b.shape[0]:
+        raise ValueError(
+            f"K dimension mismatch in mm_mxfp8. got {a.shape[1]=}, {b.shape[0]=}"
+        )
+
+    # The output may contain NaN/Inf if the dimensions are too small
+    min_n = 128
+    min_k = 128
+    if b.shape[1] < min_n or a.shape[1] < min_k:
+        raise ValueError(
+            f"MXFP8 requires n >= {min_n} and k >= {min_k} for CUTLASS MXFP8. "
+            f"got m={a.shape[0]}, n={b.shape[1]}, k={a.shape[1]}."
+        )
+
+    # Input dtype as returned by mxfp8_quantize_sm100
+    if a.dtype != torch.float8_e4m3fn:
+        raise ValueError(f"a must be a float8_e4m3fn tensor, got {a.dtype=}")
+
+    if b.dtype != torch.float8_e4m3fn:
+        raise ValueError(f"b must be a float8_e4m3fn tensor, got {b.dtype=}")
+
+    # Scale dtype as returned by mxfp8_quantize_sm100
+    if a_descale.dtype != torch.uint8:
+        raise ValueError(f"a_descale must be a uint8 tensor, got {a_descale.dtype=}")
+
+    if b_descale.dtype != torch.uint8:
+        raise ValueError(f"b_descale must be a uint8 tensor, got {b_descale.dtype=}")
+
+    # MXFP8 block size
+    sf_vec_size = 32
+
+    if a_descale.ndim == 1:
+        expected_len = _mxfp8_swizzled_scale_len(a.shape[0], a.shape[1])
+        if a_descale.shape[0] != expected_len:
+            raise ValueError(
+                "a_descale shape mismatch for swizzled layout. "
+                f"Expected {(expected_len,)}, got {a_descale.shape}."
+            )
+    elif a_descale.ndim == 2:
+        if a.shape[1] % sf_vec_size != 0:
+            raise ValueError(
+                "a_descale shape mismatch for non-swizzled layout. "
+                f"a.shape[1] must be divisible by {sf_vec_size}, got {a.shape[1]}."
+            )
+        expected_shape = (a.shape[0], a.shape[1] // sf_vec_size)
+        if a_descale.shape != expected_shape:
+            raise ValueError(
+                "a_descale shape mismatch for non-swizzled layout. "
+                f"Expected {expected_shape}, got {a_descale.shape}."
+            )
+    else:
+        raise ValueError(
+            f"a_descale must be 1D (swizzled) or 2D (non-swizzled), got {a_descale.shape}."
+        )
+
+    if b_descale.ndim == 1:
+        expected_len = _mxfp8_swizzled_scale_len(b.shape[1], b.shape[0])
+        if b_descale.shape[0] != expected_len:
+            raise ValueError(
+                "b_descale shape mismatch for swizzled layout. "
+                f"Expected {(expected_len,)}, got {b_descale.shape}."
+            )
+    elif b_descale.ndim == 2:
+        if b.shape[0] % sf_vec_size != 0:
+            raise ValueError(
+                "b_descale shape mismatch for non-swizzled layout. "
+                f"b.shape[0] must be divisible by {sf_vec_size}, got {b.shape[0]}."
+            )
+        expected_shape = (b.shape[0] // sf_vec_size, b.shape[1])
+        if b_descale.shape != expected_shape:
+            raise ValueError(
+                "b_descale shape mismatch for non-swizzled layout. "
+                f"Expected {expected_shape}, got {b_descale.shape}."
+            )
+    else:
+        raise ValueError(
+            f"b_descale must be 1D (swizzled) or 2D (non-swizzled), got {b_descale.shape}."
+        )
+
+    if out is not None:
+        expected_shape = (a.shape[0], b.shape[1])
+        if out.shape != expected_shape:
+            raise ValueError(
+                f"Output shape mismatch. Expected {expected_shape}, got {out.shape}."
+            )
+        if out.device != a.device:
+            raise ValueError(
+                f"Output device mismatch. Expected {a.device}, got {out.device}."
+            )
+        if out.dtype != out_dtype:
+            raise ValueError(
+                f"Output dtype mismatch. Expected {out_dtype}, got {out.dtype}."
+            )
+
+    _validate_mxfp8_output_dtype(out_dtype)
+    return True
+
+
+@supported_compute_capability([100, 103, 110])
+def _cutlass_gemm_mxfp8_requirement(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_descale: torch.Tensor,
+    b_descale: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    backend: Literal["cutlass", "auto"] = "auto",
+):
+    return True
+
+
+def _heuristic_func_mm_mxfp8(
+    suitable_backends: List[str],
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_descale: torch.Tensor,
+    b_descale: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    backend: Literal["cutlass", "auto"] = "auto",
+) -> List[str]:
+    if "cutlass" in suitable_backends:
+        return ["cutlass"]
+    return []
+
+
+@backend_requirement(
+    {
+        "cutlass": _cutlass_gemm_mxfp8_requirement,
+    },
+    common_check=_check_mm_mxfp8_problem_size,
+    heuristic_func=_heuristic_func_mm_mxfp8,  # result stored in mm_mxfp8.suitable_auto_backends
+)
+@flashinfer_api
+def mm_mxfp8(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_descale: torch.Tensor,
+    b_descale: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    backend: Literal["cutlass", "auto"] = "auto",
+) -> torch.Tensor:
+    r"""MM MXFP8 (block size 32)
+
+    Parameters
+    ----------
+    a: torch.Tensor
+        Input A tensor, shape (m, k), mxfp8 e4m3.
+
+    b: torch.Tensor
+        Input B tensor, shape (k, n), should be column major, mxfp8 e4m3.
+
+    a_descale: torch.Tensor
+        Block scale tensor for A. Can be:
+        - 2D non-swizzled: shape (m, k // 32)
+        - 1D swizzled: shape (M_padded * K_padded,) where M_padded = round_up(m, 128), K_padded = round_up(k // 32, 4)
+        dtype: uint8.
+
+    b_descale: torch.Tensor
+        Block scale tensor for B. Can be:
+        - 2D non-swizzled: shape (k // 32, n) - transposed format
+        - 1D swizzled: shape (N_padded * K_padded,) where N_padded = round_up(n, 128), K_padded = round_up(k // 32, 4)
+        dtype: uint8.
+        Note: For 2D format, this is the transposed version (typically passed as scale.t()).
+        For 1D swizzled format, it's flattened from (N_padded, K_padded) layout.
+
+    out: Optional[torch.Tensor]
+        Out tensor, shape (m, n), bf16 or fp16. If provided, can only be used with the CUTLASS backend. Defaults to ``None``.
+
+    out_dtype: torch.dtype
+        Output dtype, bf16 or fp16. Defaults to ``torch.bfloat16``.
+
+    backend: Literal["cutlass", "auto"]
+        The backend to use for the operation. Defaults to ``"auto"``.
+        ``"auto"`` selects the CUTLASS backend.
+
+    Returns
+    -------
+    out: torch.Tensor
+        Out tensor, shape (m, n), bf16 or fp16.
+
+    Examples
+    --------
+    >>> import torch
+    >>> from flashinfer import mxfp8_quantize, mm_mxfp8
+    >>> m, n, k = 512, 256, 128
+    >>> # Create input tensors - note: weight is [n, k] for typical NN layers
+    >>> a = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
+    >>> weight = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
+    >>>
+    >>> # Option 1: Use swizzled layout (recommended for accuracy)
+    >>> # Quantize input [m, k] - scales are 1D swizzled for (M, K/32) layout
+    >>> a_mx, a_sf = mxfp8_quantize(input=a, is_sf_swizzled_layout=True)
+    >>> # Quantize weight [n, k] - scales are 1D swizzled for (N, K/32) layout
+    >>> w_mx, w_sf = mxfp8_quantize(input=weight, is_sf_swizzled_layout=True)
+    >>> # Pass weight.T as [k, n] and 1D swizzled scales directly
+    >>> out = mm_mxfp8(a_mx, w_mx.t(), a_sf, w_sf, out_dtype=torch.bfloat16)
+    >>> out.shape
+    torch.Size([512, 256])
+    >>>
+    >>> # Option 2: Use non-swizzled layout (for compatibility)
+    >>> a_mx, a_sf = mxfp8_quantize(input=a, is_sf_swizzled_layout=False)
+    >>> w_mx, w_sf = mxfp8_quantize(input=weight, is_sf_swizzled_layout=False)
+    >>> # For non-swizzled: reshape to 2D and transpose weight scale to (k//32, n)
+    >>> a_sf_2d = a_sf.view(m, k // 32)
+    >>> w_sf_2d = w_sf.view(n, k // 32).t()  # Transpose to (k // 32, n)
+    >>> out = mm_mxfp8(a_mx, w_mx.t(), a_sf_2d, w_sf_2d, out_dtype=torch.bfloat16)
+    >>> out.shape
+    torch.Size([512, 256])
+    """
+
+    assert a.ndim == 2, f"mm_mxfp8: a must be 2D, got {a.ndim}D with shape {a.shape}"
+    assert b.ndim == 2, f"mm_mxfp8: b must be 2D, got {b.ndim}D with shape {b.shape}"
+    assert a.shape[1] == b.shape[0], (
+        f"mm_mxfp8: K dimension mismatch: a.shape[1]={a.shape[1]}, b.shape[0]={b.shape[0]}"
+    )
+
+    assert a_descale.ndim in (1, 2), (
+        f"mm_mxfp8: a_descale must be 1D (swizzled) or 2D (non-swizzled), "
+        f"got {a_descale.ndim}D with shape {a_descale.shape}, dtype={a_descale.dtype}"
+    )
+    assert b_descale.ndim in (1, 2), (
+        f"mm_mxfp8: b_descale must be 1D (swizzled) or 2D (non-swizzled), "
+        f"got {b_descale.ndim}D with shape {b_descale.shape}, dtype={b_descale.dtype}"
+    )
+
+    # NOTE: do NOT reshape swizzled 1D scales to 2D; it breaks the F8_128x4 layout.
+
+    # allocate the output tensor if not provided
+    if out is None:
+        out = torch.empty(
+            (a.shape[0], b.shape[1]),
+            device=a.device,
+            dtype=out_dtype,
+        )
+
+    workspace_buffer = _get_cache_buf(
+        "mm_mxfp8_workspace", DEFAULT_WORKSPACE_SIZE, a.device
+    )
+
+    if backend == "auto":
+        backends = mm_mxfp8.suitable_auto_backends
+    else:
+        backends = [backend]
+
+    major, _ = get_compute_capability(a.device)
+
+    backend_to_runner_factory = {
+        "cutlass": lambda: get_cutlass_mxfp8_gemm_module(
+            major
+        ).cutlass_mxfp8_gemm_runner(),
+    }
+
+    runners: List[TunableRunner] = [
+        backend_to_runner_factory[cur_backend]() for cur_backend in backends
+    ]
+
+    tuner = AutoTuner.get()
+
+    tuning_config = _MM_MXFP8_TUNING_CONFIG
+
+    inputs = [
+        a,
+        b,
+        a_descale,
+        b_descale,
+        out_dtype,
+        out,
+        workspace_buffer,
+    ]
+
+    runner, tactic = tuner.choose_one(
+        custom_op="mxfp8_gemm",
+        runners=runners,
+        tuning_config=tuning_config,
+        inputs=inputs,
+    )
+
+    runner(inputs=inputs, tactic=tactic)
+    return out
+
+
 def _get_cudnn_fp4_gemm_graph(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -2782,6 +3159,13 @@ def _pad_up(x, y):
     return ((x + y - 1) // y) * y
 
 
+def _mxfp8_swizzled_scale_len(m: int, k: int) -> int:
+    """Return the 1D swizzled scale length for MXFP8 (F8_128x4 layout)."""
+    m_padded = _pad_up(m, 128)
+    num_k_tiles = _pad_up(k, 128) // 128
+    return m_padded * num_k_tiles * 4
+
+
 _MM_FP4_TUNING_CONFIG_8x4 = TuningConfig(
     dynamic_tensor_specs=(
         DynamicTensorSpec(
@@ -2823,6 +3207,34 @@ _MM_FP4_TUNING_CONFIG_128x4 = TuningConfig(
         ),
         ConstraintSpec(
             6,  # out_tensor_index
+            0,
+            lambda shapes: shapes[0][0],
+        ),
+    ),
+)
+
+
+_MM_MXFP8_TUNING_CONFIG = TuningConfig(
+    dynamic_tensor_specs=(
+        DynamicTensorSpec(
+            (0,),  # a_tensor_index
+            (0,),
+            get_last_power_of_2_num_tokens_buckets,
+            last_positive_power_of_2,
+        ),
+    ),
+    constraint_specs=(
+        ConstraintSpec(
+            2,  # a_descale_tensor_index
+            0,
+            lambda shapes: (
+                _mxfp8_swizzled_scale_len(shapes[0][0], shapes[0][1])
+                if len(shapes[2]) == 1
+                else shapes[0][0]
+            ),
+        ),
+        ConstraintSpec(
+            5,  # out_tensor_index
             0,
             lambda shapes: shapes[0][0],
         ),
@@ -2982,7 +3394,7 @@ def mm_fp4(
     return out
 
 
-@supported_compute_capability([89, 90, 100, 103, 120, 121])
+@supported_compute_capability([89, 90, 100, 103, 110, 120, 121])
 def _cudnn_bmm_fp8_requirement(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -2996,7 +3408,7 @@ def _cudnn_bmm_fp8_requirement(
     return True
 
 
-@supported_compute_capability([89, 90, 100, 103, 120, 121])
+@supported_compute_capability([89, 90, 100, 103, 110, 120, 121])
 def _cublas_bmm_fp8_requirement(
     A: torch.Tensor,
     B: torch.Tensor,
