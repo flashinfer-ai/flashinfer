@@ -369,7 +369,7 @@ class FusedMoeLauncher {
     if (args->do_finalize) {
       return {output};
     }
-    return {gemm2_output, expert_weights, expanded_idx_to_permuted_idx};
+    return {gemm2_output, expanded_idx_to_permuted_idx};
   }
 };
 
@@ -478,9 +478,11 @@ class Bf16MoeLauncher : public FusedMoeLauncher {
     workspace.gemm2_output = gemm2_output.data_ptr();
     workspace.gemm2_output_scale = nullptr;
 
-    output =
-        alloc_tensor({args->num_tokens, args->hidden_size}, dl_bfloat16, hidden_states.device());
-    args->output = output.data_ptr();
+    if (args->output == nullptr) {
+      output =
+          alloc_tensor({args->num_tokens, args->hidden_size}, dl_bfloat16, hidden_states.device());
+      args->output = output.data_ptr();
+    }
     args->output_scale = nullptr;
   }
 
@@ -652,11 +654,12 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
     workspace.gemm2_output = gemm2_output.data_ptr();
     workspace.gemm2_output_scale = nullptr;
 
-    output =
-        alloc_tensor({args->num_tokens, args->hidden_size}, dl_bfloat16, hidden_states.device());
-    args->output = output.data_ptr();
+    if (args->output == nullptr) {
+      output =
+          alloc_tensor({args->num_tokens, args->hidden_size}, dl_bfloat16, hidden_states.device());
+      args->output = output.data_ptr();
+    }
     args->output_scale = nullptr;
-    args->do_finalize = true;  // FP8 per-tensor scale always finalizes
 
     // Set scale pointers
     TVM_FFI_ICHECK(output1_scales_scalar.has_value());
@@ -923,11 +926,12 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
     workspace.gemm2_output = gemm2_output.data_ptr();
     workspace.gemm2_output_scale = nullptr;
 
-    output =
-        alloc_tensor({args->num_tokens, args->hidden_size}, dl_bfloat16, hidden_states.device());
-    args->output = output.data_ptr();
+    if (args->output == nullptr) {
+      output =
+          alloc_tensor({args->num_tokens, args->hidden_size}, dl_bfloat16, hidden_states.device());
+      args->output = output.data_ptr();
+    }
     args->output_scale = nullptr;
-    args->do_finalize = true;
 
     args->hidden_states_scale = static_cast<float*>(hidden_states_scale.data_ptr());
     args->gemm1_weights_scale = static_cast<float*>(gemm1_weights_scale.data_ptr());
@@ -1445,7 +1449,7 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
 
     // Match original FP4 behavior for return values
     if (args->do_finalize) {
-      return {};
+      return {output};
     }
     return {gemm2_output, expanded_idx_to_permuted_idx};
   }
@@ -1479,14 +1483,16 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
   }
 };
 
-Tensor trtllm_bf16_moe(TensorView const& routing_logits, Optional<TensorView> const& routing_bias,
-                       TensorView const& hidden_states, TensorView const& gemm1_weights,
-                       TensorView const& gemm2_weights, int64_t num_experts, int64_t top_k,
-                       Optional<int64_t> n_group, Optional<int64_t> topk_group,
-                       int64_t intermediate_size, int64_t local_expert_offset,
-                       int64_t local_num_experts, Optional<double> routed_scaling_factor,
-                       int64_t routing_method_type, bool use_shuffled_weight, int64_t weight_layout,
-                       bool enable_pdl, Array<int64_t> moe_tactic) {
+Array<Tensor> trtllm_bf16_moe(TensorView const& routing_logits,
+                              Optional<TensorView> const& routing_bias,
+                              TensorView const& hidden_states, TensorView const& gemm1_weights,
+                              TensorView const& gemm2_weights, TensorView output,
+                              int64_t num_experts, int64_t top_k, Optional<int64_t> n_group,
+                              Optional<int64_t> topk_group, int64_t intermediate_size,
+                              int64_t local_expert_offset, int64_t local_num_experts,
+                              Optional<double> routed_scaling_factor, int64_t routing_method_type,
+                              bool use_shuffled_weight, int64_t weight_layout, bool do_finalize,
+                              bool enable_pdl, Array<int64_t> moe_tactic) {
   // Just some basic type validation first and leave more checks to the launcher
   TVM_FFI_ICHECK(routing_logits.dtype() == dl_float32 || routing_logits.dtype() == dl_bfloat16)
       << "BF16 MoE: routing_logits must be bfloat16 or float.";
@@ -1523,6 +1529,9 @@ Tensor trtllm_bf16_moe(TensorView const& routing_logits, Optional<TensorView> co
     args->local_expert_offset = local_expert_offset;
     args->local_num_experts = local_num_experts;
     args->intermediate_size = intermediate_size;
+    args->do_finalize = do_finalize;
+    args->output = output.data_ptr();
+    args->output_scale = nullptr;
 
     // Create and initialize launcher for this tile size
     auto launcher = std::make_unique<Bf16MoeLauncher>(routing_logits, routing_bias, hidden_states,
@@ -1546,19 +1555,18 @@ Tensor trtllm_bf16_moe(TensorView const& routing_logits, Optional<TensorView> co
   auto& selected_launcher = launchers_map.at(tile_N);
 
   // Run the launcher - it will create its own runner internally
-  auto result = selected_launcher->run(config, enable_pdl)[0];
-  return result;
+  return selected_launcher->run(config, enable_pdl);
 }
 
-Tensor trtllm_fp8_per_tensor_scale_moe(
+Array<Tensor> trtllm_fp8_per_tensor_scale_moe(
     TensorView routing_logits, Optional<TensorView> routing_bias, TensorView hidden_states,
     TensorView gemm1_weights, TensorView output1_scales_scalar,
     TensorView output1_scales_gate_scalar, TensorView gemm2_weights,
     TensorView output2_scales_scalar, TensorView output, int64_t num_experts, int64_t top_k,
     Optional<int64_t> n_group, Optional<int64_t> topk_group, int64_t intermediate_size,
     int64_t local_expert_offset, int64_t local_num_experts, Optional<double> routed_scaling_factor,
-    bool use_routing_scales_on_input, int64_t routing_method_type, bool enable_pdl,
-    Array<int64_t> config_index, int64_t activation_type) {
+    bool use_routing_scales_on_input, int64_t routing_method_type, bool do_finalize,
+    bool enable_pdl, Array<int64_t> config_index, int64_t activation_type) {
   // Basic type validation
   auto dtype = hidden_states.dtype();
   auto activation = static_cast<ActivationType>(activation_type);
@@ -1612,6 +1620,9 @@ Tensor trtllm_fp8_per_tensor_scale_moe(
     args->local_num_experts = local_num_experts;
     args->intermediate_size = intermediate_size;
     args->routed_scaling_factor = routed_scaling_factor.value_or(1.0);
+    args->do_finalize = do_finalize;
+    args->output = output.data_ptr();
+    args->output_scale = nullptr;
 
     // Create and initialize launcher for this tile size
     auto launcher = std::make_unique<Fp8PerTensorLauncher>(
@@ -1636,20 +1647,18 @@ Tensor trtllm_fp8_per_tensor_scale_moe(
   auto& selected_launcher = launchers_map.at(tile_N);
 
   // Run the launcher - it will create its own runner internally
-  auto result = selected_launcher->run(config, enable_pdl, use_routing_scales_on_input)[0];
-  // Return the result tensor
-  return result;
+  return selected_launcher->run(config, enable_pdl, use_routing_scales_on_input);
 }
 
-Tensor trtllm_fp8_block_scale_moe(
+Array<Tensor> trtllm_fp8_block_scale_moe(
     Optional<TensorView> routing_logits, TensorView expert_indices, TensorView expert_weights,
     Optional<TensorView> routing_bias, TensorView hidden_states, TensorView hidden_states_scale,
     TensorView gemm1_weights, TensorView gemm1_weights_scale, TensorView gemm2_weights,
     TensorView gemm2_weights_scale, TensorView output, int64_t num_experts, int64_t top_k,
     Optional<int64_t> n_group, Optional<int64_t> topk_group, int64_t intermediate_size,
     int64_t local_expert_offset, int64_t local_num_experts, Optional<double> routed_scaling_factor,
-    int64_t routing_method_type, bool use_shuffled_weight, int64_t weight_layout, bool enable_pdl,
-    Array<int64_t> config_index) {
+    int64_t routing_method_type, bool use_shuffled_weight, int64_t weight_layout, bool do_finalize,
+    bool enable_pdl, Array<int64_t> config_index) {
   // Basic type validation
   auto dtype = hidden_states.dtype();
 
@@ -1709,6 +1718,9 @@ Tensor trtllm_fp8_block_scale_moe(
     args->local_num_experts = local_num_experts;
     args->intermediate_size = intermediate_size;
     args->routed_scaling_factor = routed_scaling_factor.value_or(1.0);
+    args->do_finalize = do_finalize;
+    args->output = output.data_ptr();
+    args->output_scale = nullptr;
 
     // Create and initialize launcher for this tile size
     auto launcher = std::make_unique<Fp8BlockScaleLauncher>(
@@ -1733,10 +1745,8 @@ Tensor trtllm_fp8_block_scale_moe(
   auto& selected_launcher = launchers_map.at(tile_N);
 
   // Run the launcher with DeepSeek FP8 enabled - it will create its own runner internally
-  auto result = selected_launcher->run(config, enable_pdl, false /* use_routing_scales_on_input */,
-                                       true /* use_deep_seek_fp8 */)[0];
-  // Return the result tensor
-  return result;
+  return selected_launcher->run(config, enable_pdl, false /* use_routing_scales_on_input */,
+                                true /* use_deep_seek_fp8 */);
 }
 
 Array<Tensor> trtllm_fp4_block_scale_moe(
@@ -1889,7 +1899,8 @@ Array<Tensor> trtllm_mxint4_block_scale_moe(
     TensorView gemm2_weights, TensorView gemm2_weights_scale, int64_t num_experts, int64_t top_k,
     Optional<int64_t> n_group, Optional<int64_t> topk_group, int64_t intermediate_size,
     int64_t local_expert_offset, int64_t local_num_experts, Optional<double> routed_scaling_factor,
-    int64_t routing_method_type, bool enable_pdl, TensorView output, Array<int64_t> config_index) {
+    int64_t routing_method_type, bool do_finalize, bool enable_pdl, TensorView output,
+    Array<int64_t> config_index) {
   // Determine data types based on input format
   int const num_tokens = hidden_states.size(0);
   int hidden_size = hidden_states.size(1);
@@ -1940,7 +1951,7 @@ Array<Tensor> trtllm_mxint4_block_scale_moe(
     args->local_num_experts = local_num_experts;
     args->intermediate_size = intermediate_size;
     args->routed_scaling_factor = routed_scaling_factor.value_or(1.0);
-    args->do_finalize = true;
+    args->do_finalize = do_finalize;
     args->output = output.data_ptr();
     args->output_scale = nullptr;
 
@@ -2010,8 +2021,9 @@ Array<Array<int64_t>> trtllm_get_valid_moe_configs(
   }
 
   TVM_FFI_LOG_AND_THROW(NotImplementedError)
-      << "Unsupported data type combination for getValidConfigs: " << "dtype_act="
-      << static_cast<int>(dtype_act) << ", dtype_weights=" << static_cast<int>(dtype_weights)
+      << "Unsupported data type combination for getValidConfigs: "
+      << "dtype_act=" << static_cast<int>(dtype_act)
+      << ", dtype_weights=" << static_cast<int>(dtype_weights)
       << ", useDeepSeekFp8=" << useDeepSeekFp8;
 
   // Unreachable code - added to suppress compiler warning
