@@ -1578,48 +1578,30 @@ class SSDKernel:
                 inter2_p_consumer_state.reset_count()
                 inter2_acc_producer_state.reset_count()
 
-                # Peek (try_wait) C/INTER2_P/INTER2_ACC buffer full/full/empty status
-                peek_c_full_status = self.conditional_consumer_try_wait(
-                    c_consumer_state, c_pipeline, C
+                # Peek (try_wait) X/INTER1_B/INTER1_ACC buffer full/full/empty status
+                # MMA1 runs first so we peek its inputs at loop entry
+                peek_x_full_status = self.conditional_consumer_try_wait(
+                    x_consumer_state, x_pipeline, C
                 )
-                peek_inter2_p_full_status = self.conditional_consumer_try_wait(
-                    inter2_p_consumer_state, inter2_p_pipeline, C
+                peek_inter1_b_full_status = self.conditional_consumer_try_wait(
+                    inter1_b_consumer_state, inter1_b_pipeline, C
                 )
-                peek_inter2_acc_empty_status = self.conditional_producer_try_acquire(
-                    inter2_acc_producer_state, inter2_acc_pipeline, C
+                peek_inter1_acc_empty_status = self.conditional_producer_try_acquire(
+                    inter1_acc_producer_state, inter1_acc_pipeline, C
                 )
 
                 # Batched gemm over C dimension
+                # MMA1 (B_scaled^T @ X) runs before MMA2 (C @ P) so that
+                # the pre-inter warp has more time to prepare inter2_p.
                 for chunk_idx in cutlass.range(C, unroll=1):
-                    # Conditionally wait for C/INTER2_P/INTER2_ACC buffer full/full/empty
-                    c_pipeline.consumer_wait(c_consumer_state, peek_c_full_status)
-                    inter2_p_pipeline.consumer_wait(
-                        inter2_p_consumer_state, peek_inter2_p_full_status
+                    # Conditionally wait for X/INTER1_B/INTER1_ACC buffer full/full/empty
+                    x_pipeline.consumer_wait(x_consumer_state, peek_x_full_status)
+                    inter1_b_pipeline.consumer_wait(
+                        inter1_b_consumer_state, peek_inter1_b_full_status
                     )
-                    inter2_acc_pipeline.producer_acquire(
-                        inter2_acc_producer_state, peek_inter2_acc_empty_status
+                    inter1_acc_pipeline.producer_acquire(
+                        inter1_acc_producer_state, peek_inter1_acc_empty_status
                     )
-
-                    # INTER MMA2
-                    tiled_mma_inter2 = self.exec_mma(
-                        tiled_mma_inter2,
-                        tCtAccInter2,
-                        tCrC,
-                        tCrP,
-                        inter2_acc_producer_state,
-                        c_consumer_state,
-                        inter2_p_consumer_state,
-                    )
-
-                    # Async arrive C/INTER2_P/INTER2_ACC buffer empty/empty/full
-                    c_pipeline.consumer_release(c_consumer_state)
-                    inter2_p_pipeline.consumer_release(inter2_p_consumer_state)
-                    inter2_acc_pipeline.producer_commit(inter2_acc_producer_state)
-
-                    # Wait for X/INTER1_B/INTER1_ACC buffer full/full/empty
-                    x_pipeline.consumer_wait(x_consumer_state)
-                    inter1_b_pipeline.consumer_wait(inter1_b_consumer_state)
-                    inter1_acc_pipeline.producer_acquire(inter1_acc_producer_state)
 
                     # INTER MMA1
                     tiled_mma_inter1 = self.exec_mma(
@@ -1642,6 +1624,27 @@ class SSDKernel:
                     inter1_b_pipeline.consumer_release(inter1_b_consumer_state)
                     inter1_acc_pipeline.producer_commit(inter1_acc_producer_state)
 
+                    # Wait for C/INTER2_P/INTER2_ACC buffer full/full/empty
+                    c_pipeline.consumer_wait(c_consumer_state)
+                    inter2_p_pipeline.consumer_wait(inter2_p_consumer_state)
+                    inter2_acc_pipeline.producer_acquire(inter2_acc_producer_state)
+
+                    # INTER MMA2
+                    tiled_mma_inter2 = self.exec_mma(
+                        tiled_mma_inter2,
+                        tCtAccInter2,
+                        tCrC,
+                        tCrP,
+                        inter2_acc_producer_state,
+                        c_consumer_state,
+                        inter2_p_consumer_state,
+                    )
+
+                    # Async arrive C/INTER2_P/INTER2_ACC buffer empty/empty/full
+                    c_pipeline.consumer_release(c_consumer_state)
+                    inter2_p_pipeline.consumer_release(inter2_p_consumer_state)
+                    inter2_acc_pipeline.producer_commit(inter2_acc_producer_state)
+
                     # Advance X/C/INTER1_B/INTER1_ACC/INTER2_P/INTER2_ACC state
                     x_consumer_state.advance()
                     c_consumer_state.advance()
@@ -1650,16 +1653,16 @@ class SSDKernel:
                     inter2_p_consumer_state.advance()
                     inter2_acc_producer_state.advance()
 
-                    # Peek (try_wait) C/INTER2_P/INTER2_ACC buffer full/full/empty for chunk_idx = chunk_idx + 1
-                    peek_c_full_status = self.conditional_consumer_try_wait(
-                        c_consumer_state, c_pipeline, C
+                    # Peek (try_wait) X/INTER1_B/INTER1_ACC buffer full/full/empty for chunk_idx + 1
+                    peek_x_full_status = self.conditional_consumer_try_wait(
+                        x_consumer_state, x_pipeline, C
                     )
-                    peek_inter2_p_full_status = self.conditional_consumer_try_wait(
-                        inter2_p_consumer_state, inter2_p_pipeline, C
+                    peek_inter1_b_full_status = self.conditional_consumer_try_wait(
+                        inter1_b_consumer_state, inter1_b_pipeline, C
                     )
-                    peek_inter2_acc_empty_status = (
+                    peek_inter1_acc_empty_status = (
                         self.conditional_producer_try_acquire(
-                            inter2_acc_producer_state, inter2_acc_pipeline, C
+                            inter1_acc_producer_state, inter1_acc_pipeline, C
                         )
                     )
 
@@ -2737,9 +2740,7 @@ class SSDKernel:
                                         cutlass.Float32(1.0)
                                         + cute.math.exp(-z1, fastmath=True)
                                     )
-                                    tRS_rCompute[reg_idx] = (
-                                        tRS_rCompute[reg_idx] * s0
-                                    )
+                                    tRS_rCompute[reg_idx] = tRS_rCompute[reg_idx] * s0
                                     tRS_rCompute[reg_idx + 1] = (
                                         tRS_rCompute[reg_idx + 1] * s1
                                     )
@@ -2802,7 +2803,11 @@ class SSDKernel:
                                     d_coord = coord[1]
                                     if l_coord >= c_off and l_coord < chunk_size_limit:
                                         y_gmem[
-                                            l_coord, d_off + d_coord, c_idx, eh_idx, b_idx
+                                            l_coord,
+                                            d_off + d_coord,
+                                            c_idx,
+                                            eh_idx,
+                                            b_idx,
                                         ] = tRS_rY[reg_idx]
                             else:
                                 # Normal TMA store (full tile)

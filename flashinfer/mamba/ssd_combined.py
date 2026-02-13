@@ -29,6 +29,8 @@ import torch
 from ..api_logging import flashinfer_api
 from ..triton.kernels.ssd_chunk_state import chunk_cumsum_fwd
 
+from cutlass.base_dsl.compiler import GenerateLineInfo  # profiling
+
 
 def _import_cutlass_modules():
     """Import CUTLASS modules (only when needed, as they require SM100)."""
@@ -192,6 +194,8 @@ class _SSDKernel:
         _, _, ngroups, dstate = B.shape
         chunk_size = self.chunk_size
         nchunks = seqlen // chunk_size
+
+        torch.cuda.nvtx.range_push("run:tensor_prep")
 
         # Convert tensors to CUTLASS layout
         io_torch_dtype = cutlass_torch.dtype(self.io_dtype)
@@ -369,9 +373,13 @@ class _SSDKernel:
             len(chunk_indices) if chunk_indices is not None else nchunks
         )
 
+        torch.cuda.nvtx.range_pop()  # run:tensor_prep
+
         # Compile kernel if not already done
         if self._compiled_kernel is None:
-            self._compiled_kernel = cute.compile(
+            torch.cuda.nvtx.range_push("run:compile")
+            # self._compiled_kernel = cute.compile(
+            self._compiled_kernel = cute.compile[GenerateLineInfo(True)](
                 self.kernel,
                 x_tensor,
                 cumsum_delta_tensor,
@@ -390,8 +398,10 @@ class _SSDKernel:
                 max_active_clusters,
                 stream,
             )
+            torch.cuda.nvtx.range_pop()  # run:compile
 
         # Run kernel
+        torch.cuda.nvtx.range_push("run:launch")
         self._compiled_kernel(
             x_tensor,
             cumsum_delta_tensor,
@@ -409,7 +419,9 @@ class _SSDKernel:
             num_logical_chunks,
             stream,
         )
+        torch.cuda.nvtx.range_pop()  # run:launch
 
+        torch.cuda.nvtx.range_push("run:output_convert")
         # Convert outputs back to Triton layout
         # y_cutlass is (L, D, C, EH, B)
         # We need to map it back to (batch, seqlen, nheads, headdim)
@@ -419,6 +431,7 @@ class _SSDKernel:
 
         # return to torch indexing
         fstate_out = fstate_cutlass.permute(3, 2, 1, 0)
+        torch.cuda.nvtx.range_pop()  # run:output_convert
 
         return y_out, fstate_out
 
@@ -602,6 +615,7 @@ def ssd_combined_fwd(
     # Step 1: Compute cumsum using Triton kernel
     # dA_cumsum: (batch, nheads, nchunks, chunk_size)
     # dt_processed: (batch, nheads, nchunks, chunk_size) - after softplus/bias
+    torch.cuda.nvtx.range_push("cumsum_fwd")
     dA_cumsum, dt_processed = chunk_cumsum_fwd(
         dt,
         A,
@@ -610,6 +624,7 @@ def ssd_combined_fwd(
         dt_softplus=dt_softplus,
         dt_limit=dt_limit,
     )
+    torch.cuda.nvtx.range_pop()
 
     # Step 2: Run SSD kernel
     has_d = D is not None
@@ -618,6 +633,7 @@ def ssd_combined_fwd(
 
     has_varlen = seq_idx is not None
     has_z = z is not None
+    torch.cuda.nvtx.range_push("get_ssd_kernel")
     kernel = _get_ssd_kernel(
         chunk_size=chunk_size,
         headdim=headdim,
@@ -628,7 +644,9 @@ def ssd_combined_fwd(
         has_varlen=has_varlen,
         has_z=has_z,
     )
+    torch.cuda.nvtx.range_pop()
 
+    torch.cuda.nvtx.range_push("kernel.run")
     y_out, final_states = kernel.run(
         x=x,
         dA_cumsum=dA_cumsum,
@@ -642,11 +660,14 @@ def ssd_combined_fwd(
         chunk_indices=chunk_indices,
         chunk_offsets=chunk_offsets,
     )
+    torch.cuda.nvtx.range_pop()
 
+    torch.cuda.nvtx.range_push("output_copy")
     if out is not None:
         out.copy_(y_out)
     else:
         out = y_out.contiguous()
+    torch.cuda.nvtx.range_pop()
 
     if return_final_states:
         return out, final_states

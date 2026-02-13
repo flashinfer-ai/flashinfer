@@ -35,7 +35,7 @@ import torch
 
 # FlashInfer
 from flashinfer.mamba import ssd_combined_fwd
-from flashinfer.testing.utils import bench_gpu_time
+from flashinfer.testing.utils import bench_gpu_time, bench_kineto
 
 # Triton reference (lives in tests/)
 sys.path.insert(0, "tests/mamba")
@@ -284,10 +284,13 @@ def bench_batched(
             ngroups,
             dtype,
         )
+        initial_states = torch.randn(
+            batch, nheads, headdim, dstate, dtype=dtype, device="cuda"
+        )
 
-        # FlashInfer
-        fi_times = bench_gpu_time(
-            lambda: ssd_combined_fwd(
+        # FlashInfer — use bench_kineto to measure only GPU kernel time
+        def fi_fn():
+            ssd_combined_fwd(
                 x,
                 dt,
                 A,
@@ -297,10 +300,14 @@ def bench_batched(
                 D=D,
                 dt_bias=dt_bias,
                 dt_softplus=True,
-            ),
-            enable_cupti=enable_cupti,
-            dry_run_iters=warmup_iters,
-            repeat_iters=repeat_iters,
+                initial_states=initial_states,
+            )
+
+        fi_kernel_time = bench_kineto(
+            fi_fn,
+            "SSDKernel",
+            num_tests=repeat_iters or 30,
+            suppress_kineto_output=True,
         )
 
         # Triton reference (no initial_states — the reference has a bug
@@ -323,7 +330,7 @@ def bench_batched(
             repeat_iters=repeat_iters,
         )
 
-        fi_med = np.median(fi_times)
+        fi_med = fi_kernel_time * 1e3  # bench_kineto returns seconds
         tr_med = np.median(triton_times)
         speedup = tr_med / fi_med
 
@@ -368,6 +375,17 @@ def main():
         type=int,
         default=None,
         help="Number of measurement iterations (default: auto)",
+    )
+    parser.add_argument(
+        "--batch", type=int, default=None, help="Single-point: batch size"
+    )
+    parser.add_argument(
+        "--nchunks", type=int, default=None, help="Single-point: number of chunks"
+    )
+    parser.add_argument(
+        "--ncu",
+        action="store_true",
+        help="NCU profiling mode: run kernel exactly once (use with --batch/--nchunks)",
     )
     args = parser.parse_args()
 
@@ -451,6 +469,65 @@ def main():
     )
     torch.cuda.synchronize()
     print("  Done.")
+
+    # -- NCU profiling mode: single kernel launch, no timing --
+    if args.ncu:
+        assert args.batch is not None and args.nchunks is not None, (
+            "--ncu requires --batch and --nchunks"
+        )
+        seqlen = args.nchunks * args.chunk_size
+        x, dt, A, B, C, D, dt_bias = make_inputs(
+            args.batch,
+            seqlen,
+            args.nheads,
+            args.headdim,
+            args.dstate,
+            args.ngroups,
+            dtype,
+        )
+        torch.cuda.synchronize()
+        print(
+            f"  NCU mode: launching kernel once (batch={args.batch}, "
+            f"nchunks={args.nchunks}, seqlen={seqlen})"
+        )
+        ssd_combined_fwd(
+            x,
+            dt,
+            A,
+            B,
+            C,
+            args.chunk_size,
+            D=D,
+            dt_bias=dt_bias,
+            dt_softplus=True,
+        )
+        torch.cuda.synchronize()
+        print("  Done.")
+        return
+
+    # -- Single-point mode --
+    if args.batch is not None and args.nchunks is not None:
+        print()
+        print("=" * 100)
+        print("SINGLE POINT (batched, no varlen)")
+        print("=" * 100)
+        bench_batched(
+            [(args.batch, args.nchunks)],
+            nheads=args.nheads,
+            headdim=args.headdim,
+            dstate=args.dstate,
+            ngroups=args.ngroups,
+            chunk_size=args.chunk_size,
+            dtype=dtype,
+            enable_cupti=args.cupti,
+            warmup_iters=args.warmup,
+            repeat_iters=args.repetitions,
+        )
+        print()
+        print("=" * 100)
+        print("Done.")
+        print("=" * 100)
+        return
 
     # -- Varlen: simulate serving with packed user sequences --
     if not args.skip_varlen:
