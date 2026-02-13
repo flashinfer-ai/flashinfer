@@ -149,7 +149,7 @@ def make_varlen_inputs(
 # ---------------------------------------------------------------------------
 
 
-def bench_varlen(
+def bench_configs(
     configs,
     nheads,
     headdim,
@@ -161,105 +161,11 @@ def bench_varlen(
     warmup_iters,
     repeat_iters,
 ):
-    """Sweep over (num_seqs, chunks_per_seq) configs in varlen mode.
+    """Benchmark a list of configs.
 
-    Each config is (num_seqs, chunks_per_seq). Total packed seqlen =
-    num_seqs * chunks_per_seq * chunk_size.
+    Each config is a dict with keys for make_inputs / make_varlen_inputs.
+    Required: 'batch', 'seqlen' (or 'num_seqs' + 'chunks_per_seq' for varlen).
     """
-    print()
-    print(
-        f"  chunk_size={chunk_size}, nheads={nheads}, headdim={headdim}, "
-        f"dstate={dstate}, ngroups={ngroups}"
-    )
-    print()
-    print(
-        f"  {'num_seqs':<10} {'chunks/seq':<12} {'total_seqlen':<14} {'nchunks':<10} "
-        f"{'FlashInfer (ms)':<18} {'Triton (ms)':<18} {'Speedup':<10}"
-    )
-    print("  " + "-" * 92)
-
-    for num_seqs, chunks_per_seq in configs:
-        inp = make_varlen_inputs(
-            num_seqs,
-            chunks_per_seq,
-            nheads,
-            headdim,
-            dstate,
-            ngroups,
-            chunk_size,
-            dtype,
-        )
-        total_seqlen = inp["total_seqlen"]
-        nchunks = total_seqlen // chunk_size
-
-        # FlashInfer
-        fi_times = bench_gpu_time(
-            lambda: ssd_combined_fwd(
-                inp["x"],
-                inp["dt"],
-                inp["A"],
-                inp["B"],
-                inp["C"],
-                chunk_size,
-                D=inp["D"],
-                dt_bias=inp["dt_bias"],
-                dt_softplus=True,
-                initial_states=inp["initial_states"],
-                seq_idx=inp["seq_idx"],
-                chunk_indices=inp["chunk_indices"],
-                chunk_offsets=inp["chunk_offsets"],
-            ),
-            enable_cupti=enable_cupti,
-            dry_run_iters=warmup_iters,
-            repeat_iters=repeat_iters,
-        )
-
-        # Triton reference
-        triton_times = bench_gpu_time(
-            lambda: _mamba_chunk_scan_combined_fwd(
-                inp["x"],
-                inp["dt"],
-                inp["A"],
-                inp["B"],
-                inp["C"],
-                chunk_size,
-                D=inp["D"],
-                dt_bias=inp["dt_bias"],
-                dt_softplus=True,
-                initial_states=inp["initial_states"],
-                seq_idx=inp["seq_idx"],
-                chunk_indices=inp["chunk_indices"],
-                chunk_offsets=inp["chunk_offsets"],
-                cu_seqlens=inp["cu_seqlens"],
-            ),
-            enable_cupti=enable_cupti,
-            dry_run_iters=warmup_iters,
-            repeat_iters=repeat_iters,
-        )
-
-        fi_med = np.median(fi_times)
-        tr_med = np.median(triton_times)
-        speedup = tr_med / fi_med
-
-        print(
-            f"  {num_seqs:<10} {chunks_per_seq:<12} {total_seqlen:<14} {nchunks:<10} "
-            f"{fi_med:<18.4f} {tr_med:<18.4f} {speedup:<10.2f}x"
-        )
-
-
-def bench_batched(
-    configs,
-    nheads,
-    headdim,
-    dstate,
-    ngroups,
-    chunk_size,
-    dtype,
-    enable_cupti,
-    warmup_iters,
-    repeat_iters,
-):
-    """Sweep over (batch, nchunks) configs in batched mode."""
     print()
     print(
         f"  chunk_size={chunk_size}, nheads={nheads}, headdim={headdim}, "
@@ -272,59 +178,73 @@ def bench_batched(
     )
     print("  " + "-" * 74)
 
-    for batch, nchunks in configs:
-        seqlen = nchunks * chunk_size
+    for cfg in configs:
+        is_varlen = "num_seqs" in cfg
 
-        x, dt, A, B, C, D, dt_bias = make_inputs(
-            batch,
-            seqlen,
-            nheads,
-            headdim,
-            dstate,
-            ngroups,
-            dtype,
-        )
-        initial_states = torch.randn(
-            batch, nheads, headdim, dstate, dtype=dtype, device="cuda"
-        )
-
-        # FlashInfer — use bench_kineto to measure only GPU kernel time
-        def fi_fn():
-            ssd_combined_fwd(
-                x,
-                dt,
-                A,
-                B,
-                C,
+        if is_varlen:
+            inp = make_varlen_inputs(
+                cfg["num_seqs"],
+                cfg["chunks_per_seq"],
+                nheads,
+                headdim,
+                dstate,
+                ngroups,
                 chunk_size,
-                D=D,
-                dt_bias=dt_bias,
+                dtype,
+            )
+            batch = 1
+            seqlen = inp["total_seqlen"]
+            nchunks = seqlen // chunk_size
+            fi_kwargs = dict(
+                x=inp["x"],
+                dt=inp["dt"],
+                A=inp["A"],
+                B=inp["B"],
+                C=inp["C"],
+                chunk_size=chunk_size,
+                D=inp["D"],
+                dt_bias=inp["dt_bias"],
                 dt_softplus=True,
+                initial_states=inp["initial_states"],
+                seq_idx=inp["seq_idx"],
+                chunk_indices=inp["chunk_indices"],
+                chunk_offsets=inp["chunk_offsets"],
+            )
+            tr_kwargs = dict(
+                **fi_kwargs,
+                cu_seqlens=inp["cu_seqlens"],
+            )
+        else:
+            batch = cfg["batch"]
+            nchunks = cfg["nchunks"]
+            seqlen = nchunks * chunk_size
+            x, dt, A, B, C, D, dt_bias = make_inputs(
+                batch, seqlen, nheads, headdim, dstate, ngroups, dtype,
+            )
+            initial_states = torch.randn(
+                batch, nheads, headdim, dstate, dtype=dtype, device="cuda",
+            )
+            fi_kwargs = dict(
+                x=x, dt=dt, A=A, B=B, C=C, chunk_size=chunk_size,
+                D=D, dt_bias=dt_bias, dt_softplus=True,
                 initial_states=initial_states,
             )
+            tr_kwargs = dict(
+                x=x, dt=dt, A=A, B=B, C=C, chunk_size=chunk_size,
+                D=D, dt_bias=dt_bias, dt_softplus=True,
+            )
 
+        # FlashInfer — bench_kineto measures only GPU kernel time
         fi_kernel_time = bench_kineto(
-            fi_fn,
+            lambda: ssd_combined_fwd(**fi_kwargs),
             "SSDKernel",
             num_tests=repeat_iters or 30,
             suppress_kineto_output=True,
         )
 
-        # Triton reference (no initial_states — the reference has a bug
-        # where _chunk_scan_fwd expects chunk_indices when initial_states
-        # is provided with batch > 1)
+        # Triton reference
         triton_times = bench_gpu_time(
-            lambda: _mamba_chunk_scan_combined_fwd(
-                x,
-                dt,
-                A,
-                B,
-                C,
-                chunk_size,
-                D=D,
-                dt_bias=dt_bias,
-                dt_softplus=True,
-            ),
+            lambda: _mamba_chunk_scan_combined_fwd(**tr_kwargs),
             enable_cupti=enable_cupti,
             dry_run_iters=warmup_iters,
             repeat_iters=repeat_iters,
@@ -511,8 +431,8 @@ def main():
         print("=" * 100)
         print("SINGLE POINT (batched, no varlen)")
         print("=" * 100)
-        bench_batched(
-            [(args.batch, args.nchunks)],
+        bench_configs(
+            [{"batch": args.batch, "nchunks": args.nchunks}],
             nheads=args.nheads,
             headdim=args.headdim,
             dstate=args.dstate,
@@ -529,84 +449,47 @@ def main():
         print("=" * 100)
         return
 
-    # -- Varlen: simulate serving with packed user sequences --
+    # -- Build config list --
+    all_configs = []
+
+    # Varlen: simulate serving with packed user sequences
     if not args.skip_varlen:
-        print()
-        print("=" * 100)
-        print("VARLEN: serving scenario — packed user sequences (batch=1)")
-        print("=" * 100)
-
-        # Realistic serving configs: (num_users, chunks_per_user)
-        # Total tokens = num_users * chunks_per_user * chunk_size
+        # (num_seqs, chunks_per_seq) — total tokens = num_seqs * chunks_per_seq * chunk_size
         varlen_configs = [
-            # Few users, short sequences
-            (1, 1),  # 128 tokens
-            (4, 1),  # 512 tokens
-            (8, 1),  # 1K tokens
-            # More users, short sequences (decode-like prefill)
-            (32, 1),  # 4K tokens
-            (64, 1),  # 8K tokens
-            (128, 1),  # 16K tokens
-            (256, 1),  # 32K tokens
-            # Fewer users, longer sequences (prefill-heavy)
-            (4, 8),  # 4K tokens
-            (8, 8),  # 8K tokens
-            (16, 8),  # 16K tokens
-            (32, 8),  # 32K tokens
-            (64, 8),  # 64K tokens
-            # Large serving batches
-            (32, 32),  # 128K tokens
-            (64, 32),  # 256K tokens
-            (128, 32),  # 512K tokens
+            (1, 1), (4, 1), (8, 1),
+            (32, 1), (64, 1), (128, 1), (256, 1),
+            (4, 8), (8, 8), (16, 8), (32, 8), (64, 8),
+            (32, 32), (64, 32), (128, 32),
         ]
-
-        bench_varlen(
-            varlen_configs,
-            nheads=args.nheads,
-            headdim=args.headdim,
-            dstate=args.dstate,
-            ngroups=args.ngroups,
-            chunk_size=args.chunk_size,
-            dtype=dtype,
-            enable_cupti=args.cupti,
-            warmup_iters=args.warmup,
-            repeat_iters=args.repetitions,
+        all_configs.extend(
+            {"num_seqs": ns, "chunks_per_seq": cps}
+            for ns, cps in varlen_configs
         )
 
-    # -- Batched: uniform sequence lengths --
+    # Batched: uniform sequence lengths
     if not args.skip_batched:
-        print()
-        print("=" * 100)
-        print("BATCHED: uniform sequence lengths (no varlen metadata)")
-        print("=" * 100)
-
         batched_configs = [
-            (1, 1),
-            (1, 4),
-            (1, 16),
-            (1, 64),
-            (1, 256),
-            (4, 1),
-            (4, 4),
-            (4, 16),
-            (4, 64),
-            (16, 1),
-            (16, 4),
-            (16, 16),
+            (1, 1), (1, 4), (1, 16), (1, 64), (1, 256),
+            (4, 1), (4, 4), (4, 16), (4, 64),
+            (16, 1), (16, 4), (16, 16),
         ]
-
-        bench_batched(
-            batched_configs,
-            nheads=args.nheads,
-            headdim=args.headdim,
-            dstate=args.dstate,
-            ngroups=args.ngroups,
-            chunk_size=args.chunk_size,
-            dtype=dtype,
-            enable_cupti=args.cupti,
-            warmup_iters=args.warmup,
-            repeat_iters=args.repetitions,
+        all_configs.extend(
+            {"batch": b, "nchunks": nc}
+            for b, nc in batched_configs
         )
+
+    bench_configs(
+        all_configs,
+        nheads=args.nheads,
+        headdim=args.headdim,
+        dstate=args.dstate,
+        ngroups=args.ngroups,
+        chunk_size=args.chunk_size,
+        dtype=dtype,
+        enable_cupti=args.cupti,
+        warmup_iters=args.warmup,
+        repeat_iters=args.repetitions,
+    )
 
     print()
     print("=" * 100)
