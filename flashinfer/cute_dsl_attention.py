@@ -172,12 +172,18 @@ def cute_dsl_prefill_sm120(
     dtype_bits = 16  # FP16 and BF16 are both 16-bit
     align_divisibility = 128 // dtype_bits  # 8 elements for 16-byte alignment
 
+    def _get_stride_order(t):
+        """Get stride order, with fallback for PyTorch < 2.7."""
+        if hasattr(t, "dim_order"):
+            return t.dim_order()
+        return tuple(range(t.ndim))
+
     def to_cute_tensor(t):
         """Convert a torch tensor to CuTe tensor with proper alignment hints."""
         ct = from_dlpack(t, assumed_align=16).mark_layout_dynamic(leading_dim=3)
         ct = ct.mark_compact_shape_dynamic(
             mode=3,
-            stride_order=t.dim_order(),
+            stride_order=_get_stride_order(t),
             divisibility=align_divisibility,
         )
         return ct
@@ -198,10 +204,28 @@ def cute_dsl_prefill_sm120(
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
-    # Compile (cached after first call for each unique shape+dtype)
-    compiled = cute.compile(fa2_fwd, q_cute, k_cute, v_cute, o_cute, sm_scale, stream)
+    # cute.compile has no internal memoization, so we cache the compiled
+    # executor keyed by (shape, dtype, causal, sm_scale, block sizes).
+    cache_key = (
+        query.shape,
+        key.shape,
+        dtype_str,
+        causal,
+        sm_scale,
+        m_block_size,
+        n_block_size,
+    )
+    compiled = _compile_cache.get(cache_key)
+    if compiled is None:
+        compiled = cute.compile(
+            fa2_fwd, q_cute, k_cute, v_cute, o_cute, sm_scale, stream
+        )
+        _compile_cache[cache_key] = compiled
 
-    # Launch
     compiled(q_cute, k_cute, v_cute, o_cute, sm_scale, stream)
 
     return out
+
+
+# Module-level cache for cute.compile results
+_compile_cache: dict = {}
