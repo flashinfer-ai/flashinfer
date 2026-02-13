@@ -24,8 +24,7 @@ import functools
 import importlib
 import math
 import os
-import sys
-from typing import Optional, Tuple, Union
+from typing import Optional
 
 import torch
 
@@ -46,9 +45,6 @@ def _find_cute_dsl_fa_module():
 
     # Check common CUTLASS repo locations
     candidates = [
-        os.path.expanduser(
-            "~/snc-repos/cutlass/examples/python/CuTeDSL/blackwell_geforce/flash_attention_v2.py"
-        ),
         os.path.expanduser(
             "~/cutlass/examples/python/CuTeDSL/blackwell_geforce/flash_attention_v2.py"
         ),
@@ -82,16 +78,6 @@ def _get_compiled_kernel(head_dim, m_block, n_block, num_threads, is_causal, dty
         )
 
     fa_module = _load_fa_module(module_path)
-
-    import cutlass
-    import cutlass.cute as cute
-    from cutlass.cute.runtime import from_dlpack
-
-    dtype_map = {
-        "float16": cutlass.Float16,
-        "bfloat16": cutlass.BFloat16,
-    }
-    cutlass_dtype = dtype_map[dtype_str]
 
     fa2_fwd = fa_module.FlashAttentionForwardSm120(
         head_dim, m_block, n_block, num_threads, is_causal
@@ -146,22 +132,19 @@ def cute_dsl_prefill_sm120(
             "(RTX 5090, DGX Spark GB10)."
         )
     if query.dtype not in (torch.bfloat16, torch.float16):
-        raise ValueError(
-            f"Only BF16 and FP16 are supported, got {query.dtype}."
-        )
+        raise ValueError(f"Only BF16 and FP16 are supported, got {query.dtype}.")
     head_dim = query.shape[-1]
     if head_dim % 8 != 0:
         raise ValueError(f"head_dim must be divisible by 8, got {head_dim}.")
 
     try:
-        import cutlass
         import cutlass.cute as cute
         from cutlass.cute.runtime import from_dlpack
-    except ImportError:
+    except ImportError as e:
         raise ImportError(
             "nvidia-cutlass-dsl package is required for CuTe DSL attention. "
             "Install with: pip install nvidia-cutlass-dsl"
-        )
+        ) from e
 
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(head_dim)
@@ -193,7 +176,13 @@ def cute_dsl_prefill_sm120(
     o_cute = to_cute_tensor(out)
 
     # Get CUDA stream
-    from cuda import cuda
+    try:
+        from cuda import cuda
+    except ImportError as e:
+        raise ImportError(
+            "cuda-python package is required for CuTe DSL attention. "
+            "Install with: pip install cuda-python"
+        ) from e
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
