@@ -299,9 +299,10 @@ void trtllm_paged_attention_decode(
                               ? static_cast<float*>(maybe_bmm2_scale_tensor.value().data_ptr())
                               : nullptr;
 
-  bool const skips_softmax = skip_softmax_threshold_scale_factor.has_value();
+  // If threshold is zero we can fall back to standard attention to reduce overheads.
   float const skip_softmax_threshold_scale_factor_value =
       skip_softmax_threshold_scale_factor.value_or(0.0f);
+  bool const skips_softmax = skip_softmax_threshold_scale_factor_value != 0.0f;
 
   trtllm_paged_attention_launcher(
       out.data_ptr(), output_sf_ptr, query.data_ptr(), key_cache.data_ptr(), value_cache.data_ptr(),
@@ -388,9 +389,10 @@ void trtllm_paged_attention_context(
                               ? static_cast<float*>(maybe_bmm2_scale_tensor.value().data_ptr())
                               : nullptr;
 
-  bool const skips_softmax = skip_softmax_threshold_scale_factor.has_value();
+  // If threshold is zero we can fall back to standard attention to reduce overheads.
   float const skip_softmax_threshold_scale_factor_value =
       skip_softmax_threshold_scale_factor.value_or(0.0f);
+  bool const skips_softmax = skip_softmax_threshold_scale_factor_value != 0.0f;
 
   trtllm_paged_attention_launcher(
       out.data_ptr(), output_sf_ptr, query.data_ptr(), key_cache.data_ptr(), value_cache.data_ptr(),
@@ -566,9 +568,10 @@ void trtllm_ragged_attention(TensorView out, TensorView query, TensorView key, T
                               ? static_cast<float*>(maybe_bmm2_scale_tensor.value().data_ptr())
                               : nullptr;
 
-  bool const skips_softmax = skip_softmax_threshold_scale_factor.has_value();
+  // If threshold is zero we can fall back to standard attention to reduce overheads.
   float const skip_softmax_threshold_scale_factor_value =
       skip_softmax_threshold_scale_factor.value_or(0.0f);
+  bool const skips_softmax = skip_softmax_threshold_scale_factor_value != 0.0f;
 
   trtllm_ragged_attention_launcher(
       out.data_ptr(), query.data_ptr(), key.data_ptr(), value.data_ptr(),

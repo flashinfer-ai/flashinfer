@@ -544,8 +544,8 @@ def _test_trtllm_batch_prefill(
     else:
         q_input = q.contiguous()
 
-    # Using 0.0 threshold should give the same result as normal attention.
-    skip_softmax_threshold_scale_factor = 0.0 if skips_softmax else None
+    # Using a tiny threshold should give the same result as normal attention.
+    skip_softmax_threshold_scale_factor = 1e-30 if skips_softmax else None
 
     output = flashinfer.prefill.trtllm_batch_context_with_kv_cache(
         q_input,
@@ -959,8 +959,8 @@ def _test_trtllm_batch_decode(
     else:
         q_input = q.contiguous()
 
-    # Using 0.0 threshold should give the same result as normal attention.
-    skip_softmax_threshold_scale_factor = 0.0 if skips_softmax else None
+    # Using a tiny threshold should give the same result as normal attention.
+    skip_softmax_threshold_scale_factor = 1e-30 if skips_softmax else None
 
     output = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
         q_input,
@@ -1475,8 +1475,8 @@ def test_trtllm_gen_prefill_deepseek(
     bmm1_scale = scale
     bmm2_scale = 1.0
 
-    # Using 0.0 threshold should give the same result as normal attention.
-    skip_softmax_threshold_scale_factor = 0.0 if skips_softmax else None
+    # Using a tiny threshold should give the same result as normal attention.
+    skip_softmax_threshold_scale_factor = 1e-30 if skips_softmax else None
 
     output_trtllm, lse_trtllm = flashinfer.prefill.trtllm_ragged_attention_deepseek(
         q,

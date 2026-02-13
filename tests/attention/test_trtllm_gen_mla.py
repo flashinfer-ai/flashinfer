@@ -310,8 +310,8 @@ def trtllm_batch_decode_mla(
     workspace_buffer = global_trtllm_gen_fmha_workspace_buffer
     workspace_buffer_ref = global_workspace_buffer
 
-    # Threshold 0.0 should give the same output as standard attention
-    skip_softmax_threshold_scale_factor = 0.0 if skips_softmax else None
+    # Using a tiny threshold should give the same output as standard attention
+    skip_softmax_threshold_scale_factor = 1e-30 if skips_softmax else None
 
     # Run decode-MLA
     output = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
