@@ -367,9 +367,9 @@ class FusedMoeLauncher {
                     enable_pdl);
 
     if (args->do_finalize) {
-      return {output};
+      return {};
     }
-    return {gemm2_output, expert_weights, expanded_idx_to_permuted_idx};
+    return {gemm2_output, expanded_idx_to_permuted_idx};
   }
 };
 
@@ -980,9 +980,9 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
                     enable_pdl);
 
     if (args->do_finalize) {
-      return {output};
+      return {};
     }
-    return {gemm2_output, expert_weights, expanded_idx_to_permuted_idx};
+    return {gemm2_output, expanded_idx_to_permuted_idx};
   }
 
   static Array<Array<int64_t>> getValidConfigs(int64_t top_k, int64_t hidden_size,
@@ -1445,7 +1445,7 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     if (args->do_finalize) {
       return {};
     }
-    return {gemm2_output, expert_weights, expanded_idx_to_permuted_idx};
+    return {gemm2_output, expanded_idx_to_permuted_idx};
   }
 
   static Array<Array<int64_t>> getValidConfigs(int64_t top_k, int64_t hidden_size,
@@ -1892,7 +1892,8 @@ Array<Tensor> trtllm_mxint4_block_scale_moe(
     TensorView gemm2_weights, TensorView gemm2_weights_scale, int64_t num_experts, int64_t top_k,
     Optional<int64_t> n_group, Optional<int64_t> topk_group, int64_t intermediate_size,
     int64_t local_expert_offset, int64_t local_num_experts, Optional<double> routed_scaling_factor,
-    int64_t routing_method_type, bool enable_pdl, TensorView output, Array<int64_t> config_index) {
+    int64_t routing_method_type, bool do_finalize, bool enable_pdl, TensorView output,
+    Array<int64_t> config_index) {
   // Determine data types based on input format
   int const num_tokens = hidden_states.size(0);
   int hidden_size = hidden_states.size(1);
@@ -1943,7 +1944,7 @@ Array<Tensor> trtllm_mxint4_block_scale_moe(
     args->local_num_experts = local_num_experts;
     args->intermediate_size = intermediate_size;
     args->routed_scaling_factor = routed_scaling_factor.value_or(1.0);
-    args->do_finalize = true;
+    args->do_finalize = do_finalize;
     args->output = output.data_ptr();
     args->output_scale = nullptr;
 
@@ -1970,7 +1971,12 @@ Array<Tensor> trtllm_mxint4_block_scale_moe(
   auto& selected_launcher = launchers_map.at(tile_N);
 
   // Run the launcher - it will create its own runner internally
-  return selected_launcher->run(config, enable_pdl);
+  auto result = selected_launcher->run(config, enable_pdl);
+  if (do_finalize) {
+    return {output};
+  } else {
+    return {gemm2_output, expanded_idx_to_permuted_idx};
+  }
 }
 
 Array<Array<int64_t>> trtllm_get_valid_moe_configs(

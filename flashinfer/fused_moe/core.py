@@ -1378,9 +1378,9 @@ def get_trtllm_moe_sm100_module():
         )
 
         if do_finalize:
-            return [torch.from_dlpack(intermediate_output[0])]
+            return [output]
         else:
-            gemm2_output, _, expanded_idx_to_permuted_idx = intermediate_output
+            gemm2_output, expanded_idx_to_permuted_idx = intermediate_output
             return [
                 torch.from_dlpack(gemm2_output),
                 expert_weights,
@@ -1530,9 +1530,9 @@ def get_trtllm_moe_sm100_module():
         )
 
         if do_finalize:
-            return [torch.from_dlpack(intermediate_output[0])]
+            return [output]
         else:
-            gemm2_output, _, expanded_idx_to_permuted_idx = intermediate_output
+            gemm2_output, expanded_idx_to_permuted_idx = intermediate_output
             return [
                 torch.from_dlpack(gemm2_output),
                 expert_weights,
@@ -1716,9 +1716,9 @@ def get_trtllm_moe_sm100_module():
         )
 
         if do_finalize:
-            return [torch.from_dlpack(intermediate_output[0])]
+            return [output]
         else:
-            gemm2_output, _, expanded_idx_to_permuted_idx = intermediate_output
+            gemm2_output, expanded_idx_to_permuted_idx = intermediate_output
             return [
                 torch.from_dlpack(gemm2_output),
                 expert_weights,
@@ -2011,6 +2011,7 @@ def get_trtllm_moe_sm100_module():
         num_local_experts: int,
         routed_scaling_factor: Optional[float],
         routing_method_type: int,
+        do_finalize: bool = True,
         enable_pdl: Optional[bool] = None,
         output: Optional[torch.Tensor] = None,
         tune_max_num_tokens: int = 8192,
@@ -2082,11 +2083,12 @@ def get_trtllm_moe_sm100_module():
             local_expert_offset=local_expert_offset,
             routed_scaling_factor=routed_scaling_factor,
             routing_method_type=routing_method_type,
+            do_finalize=do_finalize,
             enable_pdl=enable_pdl,
         )
 
         # Call the C++ function for block scale MoE
-        moe_op.trtllm_mxint4_block_scale_moe(
+        intermediate_output = moe_op.trtllm_mxint4_block_scale_moe(
             routing_logits,
             routing_bias,
             hidden_states,
@@ -2106,11 +2108,20 @@ def get_trtllm_moe_sm100_module():
             num_local_experts,
             routed_scaling_factor,
             routing_method_type,
+            do_finalize,
             enable_pdl,
             output,
             [-1, -1] if tactic == -1 else tactic,
         )
-        return output
+        if do_finalize:
+            return [output]
+        else:
+            gemm2_output, expanded_idx_to_permuted_idx = intermediate_output
+            return [
+                torch.from_dlpack(gemm2_output),
+                expert_weights,
+                torch.from_dlpack(expanded_idx_to_permuted_idx),
+            ]
 
     @register_fake_op("flashinfer::trtllm_mxint4_block_scale_moe")
     def _fake_trtllm_mxint4_block_scale_moe(
@@ -2794,6 +2805,7 @@ def trtllm_mxint4_block_scale_moe(
     local_num_experts: int,
     routed_scaling_factor: Optional[float],
     routing_method_type: int = 0,
+    do_finalize: bool = True,
     enable_pdl: Optional[bool] = None,
     output: Optional[torch.Tensor] = None,
     tune_max_num_tokens: int = 8192,
@@ -2835,12 +2847,14 @@ def trtllm_mxint4_block_scale_moe(
             - 2: DeepSeekV3 (Sigmoid -> RoutingBiasAdd -> Top2 in group -> Top4 groups -> Top8 experts)
             - 3: Llama4 (Top1 -> Sigmoid)
             - 4: RenormalizeNaive (Softmax -> TopK -> Renormalize)
+        do_finalize (bool): Whether to finalize the output (default: False)
         enable_pdl (Optional[bool]): Whether to enable Programmatic Dependent Launch (PDL). Auto-enabled for >= sm90.
         tune_max_num_tokens(int): Maximum number of tokens for tuning. (default: 8192)
         output (Optional[torch.Tensor]): shape [seq_len, hidden_size]
             Optional inplace output tensor.
     Returns:
-        torch.Tensor: returns the final MoE output.
+        List[torch.Tensor]: List of output tensors. If do_finalize=True, returns the final MoE output.
+            Otherwise, returns intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) that need further processing.
     """
     return get_trtllm_moe_sm100_module().trtllm_mxint4_block_scale_moe(
         routing_logits,
@@ -2862,6 +2876,7 @@ def trtllm_mxint4_block_scale_moe(
         local_num_experts,
         routed_scaling_factor,
         routing_method_type,
+        do_finalize,
         enable_pdl,
         output,
         tune_max_num_tokens,
