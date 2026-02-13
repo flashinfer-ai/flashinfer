@@ -17,18 +17,6 @@
 #include "../utils.cuh"
 #include "../vec_dtypes.cuh"
 
-#ifndef FLASHINFER_AR_FUSION_ONESHOT_DEBUG
-#define FLASHINFER_AR_FUSION_ONESHOT_DEBUG 0
-#endif
-
-#ifndef FLASHINFER_AR_FUSION_ONESHOT_DEBUG_MAX_TOKENS
-#define FLASHINFER_AR_FUSION_ONESHOT_DEBUG_MAX_TOKENS 2048
-#endif
-
-#ifndef FLASHINFER_AR_FUSION_ONESHOT_DEBUG_MAX_ACCESS
-#define FLASHINFER_AR_FUSION_ONESHOT_DEBUG_MAX_ACCESS 4
-#endif
-
 namespace flashinfer {
 
 namespace trtllm_allreduce_fusion {
@@ -1128,32 +1116,6 @@ __device__ __forceinline__ bool has_neg_zero(const vec_t<T, VEC_SIZE>& vec) {
 }
 
 template <typename T, uint32_t VEC_SIZE>
-__device__ __forceinline__ bool has_non_finite(const vec_t<T, VEC_SIZE>& vec) {
-#pragma unroll
-  for (int i = 0; i < VEC_SIZE; ++i) {
-    float v = static_cast<float>(vec[i]);
-    if (isnan(v) || isinf(v)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-template <typename T, uint32_t VEC_SIZE>
-__device__ __forceinline__ bool vec_equal_f32(const vec_t<T, VEC_SIZE>& lhs,
-                                              const vec_t<T, VEC_SIZE>& rhs) {
-#pragma unroll
-  for (int i = 0; i < VEC_SIZE; ++i) {
-    float lv = static_cast<float>(lhs[i]);
-    float rv = static_cast<float>(rhs[i]);
-    if (lv != rv) {
-      return false;
-    }
-  }
-  return true;
-}
-
-template <typename T, uint32_t VEC_SIZE>
 __device__ __forceinline__ void remove_neg_zero(vec_t<T, VEC_SIZE>& vec) {
 #pragma unroll
   for (int i = 0; i < VEC_SIZE; ++i) {
@@ -1249,18 +1211,6 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams<T>
   LamportComm<NRanks> comm(params.workspace, params.rank);
   int clear_size = comm.clear_size;
   int clear_access = clear_size / VEC_SIZE;
-#if FLASHINFER_AR_FUSION_ONESHOT_DEBUG
-  if (blockIdx.x == 0 && threadIdx.x == 0) {
-    int required_clear_size = params.size * NRanks;
-    if (comm.clear_size < required_clear_size) {
-      printf(
-          "AR_FUSION_ONESHOT_DEBUG stale_clear rank=%d pattern=%d token_num=%d hidden_dim=%d "
-          "clear_size=%d required_clear_size=%d comm_size=%d flag_value=%d\n",
-          params.rank, static_cast<int>(params.pattern), params.size / params.hidden_dim,
-          params.hidden_dim, comm.clear_size, required_clear_size, comm.comm_size, comm.flag_value);
-    }
-  }
-#endif
 
   for (int idx = access_id; idx < tot_access; idx += access_stride) {
     vec_t<T, VEC_SIZE> val;
@@ -1283,7 +1233,6 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams<T>
     fused_op.update(idx);
     vec_t<T, VEC_SIZE> vals[NRanks];
     bool done = false;
-    int spin_iters = 0;
 
     while (!done) {
       done = true;
@@ -1294,50 +1243,7 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams<T>
                                      (r * tot_access + idx) * VEC_SIZE);
         done &= !has_neg_zero<T, VEC_SIZE>(vals[r]);
       }
-      ++spin_iters;
     }
-#if FLASHINFER_AR_FUSION_ONESHOT_DEBUG
-    if (tidx < FLASHINFER_AR_FUSION_ONESHOT_DEBUG_MAX_TOKENS &&
-        access_id_in_token < FLASHINFER_AR_FUSION_ONESHOT_DEBUG_MAX_ACCESS) {
-      vec_t<T, VEC_SIZE> local_input;
-      local_input.load(reinterpret_cast<T*>(params.allreduce_in) + idx * VEC_SIZE);
-      remove_neg_zero<T, VEC_SIZE>(local_input);
-
-      bool local_input_non_finite = has_non_finite<T, VEC_SIZE>(local_input);
-      bool self_comm_non_finite = has_non_finite<T, VEC_SIZE>(vals[params.rank]);
-      bool self_comm_mismatch = !vec_equal_f32<T, VEC_SIZE>(local_input, vals[params.rank]);
-
-      bool any_comm_non_finite = false;
-      bool comm_read_unstable = false;
-#pragma unroll
-      for (int r = 0; r < NRanks; ++r) {
-        any_comm_non_finite |= has_non_finite<T, VEC_SIZE>(vals[r]);
-        vec_t<T, VEC_SIZE> vals_again;
-        vals_again.load_global_volatile(reinterpret_cast<T*>(comm.data_bufs[params.rank]) +
-                                        (r * tot_access + idx) * VEC_SIZE);
-        comm_read_unstable |= !vec_equal_f32<T, VEC_SIZE>(vals[r], vals_again);
-      }
-
-      bool self_path_suspicious =
-          !local_input_non_finite && (self_comm_non_finite || self_comm_mismatch);
-      if (self_path_suspicious || any_comm_non_finite || comm_read_unstable) {
-        float local0 = static_cast<float>(local_input[0]);
-        float self0 = static_cast<float>(vals[params.rank][0]);
-        float r0 = static_cast<float>(vals[0][0]);
-        float r1 = (NRanks > 1) ? static_cast<float>(vals[1][0]) : 0.f;
-        printf(
-            "AR_FUSION_ONESHOT_DEBUG rank=%d pattern=%d token=%d idx=%d access=%d spin=%d "
-            "self_path_suspicious=%d local_input_non_finite=%d self_comm_non_finite=%d "
-            "self_comm_mismatch=%d any_comm_non_finite=%d comm_read_unstable=%d "
-            "sample(local=%f self=%f r0=%f r1=%f)\n",
-            params.rank, static_cast<int>(params.pattern), tidx, idx, access_id_in_token,
-            spin_iters, static_cast<int>(self_path_suspicious),
-            static_cast<int>(local_input_non_finite), static_cast<int>(self_comm_non_finite),
-            static_cast<int>(self_comm_mismatch), static_cast<int>(any_comm_non_finite),
-            static_cast<int>(comm_read_unstable), local0, self0, r0, r1);
-      }
-    }
-#endif
     vec_t<T, VEC_SIZE> sum_val = allreduce_sum<T, VEC_SIZE, NRanks, Fp32Acc>(vals);
     fused_op(sum_val, tidx);
   }
