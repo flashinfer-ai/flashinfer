@@ -837,7 +837,7 @@ struct LamportComm {
     flag_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[2];
     clear_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[4];
     flag_value = *flag_ptr;
-    comm_size = reinterpret_cast<int*>(workspace[NRanks * 3])[3];
+    int comm_size = reinterpret_cast<int*>(workspace[NRanks * 3])[3];
     clear_size = *clear_ptr;
     int data_offset = flag_value % 3;
     int clear_offset = (flag_value + 2) % 3;
@@ -867,7 +867,6 @@ struct LamportComm {
   int* clear_ptr;
   uint8_t* data_bufs[NRanks];
   uint8_t* clear_buf;
-  int comm_size;
   int clear_size;
   int flag_value;
 };
