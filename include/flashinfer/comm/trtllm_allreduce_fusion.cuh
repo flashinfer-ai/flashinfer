@@ -1428,6 +1428,13 @@ cudaError_t allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const& par
 
   int block_size = threads_per_block;
   auto is_power_of_two = [](int x) { return x > 0 && (x & (x - 1)) == 0; };
+  auto adjust_for_sm_count = [&](int& threads_per_block_ref, int& cluster_size_ref) {
+    while (cluster_num * cluster_size_ref > sm_count && cluster_size_ref > 1 &&
+           threads_per_block_ref <= max_threads_per_block / 2) {
+      threads_per_block_ref *= 2;
+      cluster_size_ref /= 2;
+    }
+  };
   // Save a known-good baseline launch configuration before FP4 specialization.
   // This baseline always preserves full token coverage.
   int baseline_threads_per_block = threads_per_block;
@@ -1459,33 +1466,16 @@ cudaError_t allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const& par
 
   // SM count check: adjust if cluster_num * cluster_size > sm_count
   // But respect FP4 optimization if already applied
-  while (cluster_num * cluster_size > sm_count && cluster_size > 1 &&
-         threads_per_block <= max_threads_per_block / 2) {
-    threads_per_block *= 2;
-    cluster_size /= 2;
-    // If FP4 optimization was applied, update block_size to match
-    if constexpr (GetQuantType<Pattern> == QuantType::kFP4) {
-      block_size = threads_per_block;
-    }
-  }
-
-  // Update block_size if not FP4 (FP4 already set it above)
-  if constexpr (GetQuantType<Pattern> != QuantType::kFP4) {
-    block_size = threads_per_block;
-  }
+  adjust_for_sm_count(threads_per_block, cluster_size);
+  block_size = threads_per_block;
 
   if (oneshot && threads_per_block * cluster_size != threads_per_token) {
     // Fallback to baseline launch config when FP4 specialization produces
     // an invalid coverage configuration.
     threads_per_block = baseline_threads_per_block;
     cluster_size = baseline_cluster_size;
+    adjust_for_sm_count(threads_per_block, cluster_size);
     block_size = threads_per_block;
-    while (cluster_num * cluster_size > sm_count && cluster_size > 1 &&
-           threads_per_block <= max_threads_per_block / 2) {
-      threads_per_block *= 2;
-      cluster_size /= 2;
-      block_size = threads_per_block;
-    }
   }
 
   FLASHINFER_CHECK(!oneshot || threads_per_block * cluster_size == threads_per_token,
