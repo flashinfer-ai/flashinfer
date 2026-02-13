@@ -118,9 +118,6 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
                 device=device,
             )
         else:  # MxFP8xMxFP8
-            print(
-                f"hidden_states shape: {hidden_states.shape}, w13 shape: {w13.shape}, w2 shape: {w2.shape}"
-            )
             hidden_states, hidden_states_scale = mxfp8_quantize(hidden_states, False)
             w13, w13_scale = mxfp8_quantize(w13, True)
             w2, w2_scale = mxfp8_quantize(w2, True)
@@ -131,9 +128,6 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
                 num_experts, intermediate_size * 2, -1
             )
             w2_scale = w2_scale.view(torch.uint8).reshape(num_experts, hidden_size, -1)
-            print(
-                f"hidden_states_scale shape: {hidden_states_scale.shape}, w13_scale shape: {w13_scale.shape}, w2_scale shape: {w2_scale.shape}"
-            )
 
     output1_scale_scalar = (
         torch.tensor([hidden_states_scale * w13_scale] * num_experts, device=device)

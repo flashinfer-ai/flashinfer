@@ -53,6 +53,7 @@ except ImportError:
 
 __all__ = [
     "ActivationType",
+    "Fp8QuantizationType",
     "RoutingMethodType",
     "WeightLayout",
     "convert_to_block_layout",

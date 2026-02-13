@@ -903,6 +903,9 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
       TVM_FFI_CHECK(weight_layout == batchedGemm::gemm::MatrixLayout::MajorK,
                     "weight_layout must be MajorK for MxFp8.");
       TVM_FFI_ICHECK_EQ(hidden_states_scale.dtype(), dl_uint8);
+    } else {
+      TVM_FFI_LOG_AND_THROW(NotImplementedError)
+          << "trtllm_fp8_block_scale_moe only supports DeepSeekFp8 or MxFp8.";
     }
 
     TVM_FFI_ICHECK_EQ(gemm1_weights.dtype(), dl_float8_e4m3fn) << "gemm1_weights must be fp8.";
@@ -923,6 +926,9 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
     } else if (quantization_type == Fp8QuantizationType::MxFp8) {
       TVM_FFI_ICHECK_EQ(gemm1_weights_scale.dtype(), dl_uint8)
           << "gemm1_weights_scale must be uint8.";
+    } else {
+      TVM_FFI_LOG_AND_THROW(NotImplementedError)
+          << "trtllm_fp8_block_scale_moe only supports DeepSeekFp8 or MxFp8.";
     }
 
     if (quantization_type == Fp8QuantizationType::DeepSeekFp8) {
@@ -938,6 +944,9 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
     } else if (quantization_type == Fp8QuantizationType::MxFp8) {
       TVM_FFI_ICHECK_EQ(gemm2_weights_scale.dtype(), dl_uint8)
           << "gemm2_weights_scale must be uint8.";
+    } else {
+      TVM_FFI_LOG_AND_THROW(NotImplementedError)
+          << "trtllm_fp8_block_scale_moe only supports DeepSeekFp8 or MxFp8.";
     }
 
     check_weights_shape("gemm1");
@@ -1754,6 +1763,9 @@ Tensor trtllm_fp8_block_scale_moe(
   } else if (quantization_type == Fp8QuantizationType::MxFp8) {
     TVM_FFI_ICHECK_EQ(hidden_states_scale.dtype(), dl_uint8)
         << "FP8 block scale MoE: hidden_states_scale must be uint8.";
+  } else {
+    TVM_FFI_LOG_AND_THROW(NotImplementedError)
+        << "trtllm_fp8_block_scale_moe only supports DeepSeekFp8 or MxFp8.";
   }
   TVM_FFI_ICHECK_EQ(gemm1_weights.dtype(), dl_float8_e4m3fn)
       << "FP8 block scale MoE: gemm1_weights must be fp8.";
@@ -1769,6 +1781,9 @@ Tensor trtllm_fp8_block_scale_moe(
         << "FP8 block scale MoE: gemm1_weights_scale must be uint8.";
     TVM_FFI_ICHECK_EQ(gemm2_weights_scale.dtype(), dl_uint8)
         << "FP8 block scale MoE: gemm2_weights_scale must be uint8.";
+  } else {
+    TVM_FFI_LOG_AND_THROW(NotImplementedError)
+        << "trtllm_fp8_block_scale_moe only supports DeepSeekFp8 or MxFp8.";
   }
 
   if (quantization_type == Fp8QuantizationType::MxFp8) {
