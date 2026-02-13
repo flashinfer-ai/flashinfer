@@ -100,12 +100,7 @@ def get_fmha_module(
     device: torch.device,
     use_fp16_qk_reduction: bool = False,
 ):
-    if (
-        is_sm100a_supported(device)
-        or is_sm110a_supported(device)
-        or is_sm120a_supported(device)
-        or is_sm121a_supported(device)
-    ):
+    if is_sm100a_supported(device) or is_sm110a_supported(device):
         return gen_fmha_cutlass_sm100a_module(
             dtype_q,
             dtype_kv,
@@ -118,7 +113,11 @@ def get_fmha_module(
             use_logits_soft_cap,
         ).build_and_load()
     else:
-        raise ValueError("SM100A is not supported on this device")
+        raise ValueError(
+            "CUTLASS FMHA requires SM100a (B200/GB200) or SM110a. "
+            "SM12x (RTX 5090/DGX Spark) lacks tcgen05 MMA required by this kernel. "
+            "Use backend='fa2' instead."
+        )
 
 
 def make_hashable_cache(func):
@@ -3821,8 +3820,8 @@ def fmha_v2_prefill_deepseek(
         If return_lse is True, the output will be a tuple of two tensors, the first is the output tensor, the second is the lse tensor.
         If return_lse is False, the output will be a single tensor.
     """
-    if not is_sm120a_supported(query.device):
-        raise ValueError("fmha_v2_prefill_deepseek is only supported on SM120 GPUs.")
+    if not (is_sm120a_supported(query.device) or is_sm121a_supported(query.device)):
+        raise ValueError("fmha_v2_prefill_deepseek is only supported on SM12x GPUs.")
     assert query.shape[3] == 192 and key.shape[3] == 192 and value.shape[3] == 128, (
         "currently only support deepseek r1 192 query and 128 value"
     )
