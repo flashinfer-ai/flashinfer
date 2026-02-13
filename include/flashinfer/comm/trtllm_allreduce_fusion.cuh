@@ -849,7 +849,7 @@ struct LamportComm {
     flag_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[2];
     clear_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[4];
     flag_value = *flag_ptr;
-    int comm_size = reinterpret_cast<int*>(workspace[NRanks * 3])[3];
+    comm_size = reinterpret_cast<int*>(workspace[NRanks * 3])[3];
     clear_size = *clear_ptr;
     int data_offset = flag_value % 3;
     int clear_offset = (flag_value + 2) % 3;
@@ -879,6 +879,7 @@ struct LamportComm {
   int* clear_ptr;
   uint8_t* data_bufs[NRanks];
   uint8_t* clear_buf;
+  int comm_size;
   int clear_size;
   int flag_value;
 };
@@ -1247,6 +1248,18 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams<T>
 #endif
   LamportComm<NRanks> comm(params.workspace, params.rank);
   int clear_access = comm.clear_size / VEC_SIZE;
+#if FLASHINFER_AR_FUSION_ONESHOT_DEBUG
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    int required_clear_size = params.size * NRanks;
+    if (comm.clear_size < required_clear_size) {
+      printf(
+          "AR_FUSION_ONESHOT_DEBUG stale_clear rank=%d pattern=%d token_num=%d hidden_dim=%d "
+          "clear_size=%d required_clear_size=%d comm_size=%d flag_value=%d\n",
+          params.rank, static_cast<int>(params.pattern), params.size / params.hidden_dim,
+          params.hidden_dim, comm.clear_size, required_clear_size, comm.comm_size, comm.flag_value);
+    }
+  }
+#endif
 
   for (int idx = access_id; idx < tot_access; idx += access_stride) {
     vec_t<T, VEC_SIZE> val;
