@@ -895,15 +895,13 @@ class AutoTuner:
 
     def _save_on_exit(self) -> None:
         """atexit handler: save profiling cache to FLASHINFER_AUTOTUNER_CONFIG_SAVE_PATH."""
+        if not self._save_path:
+            return
         if self.profiling_cache or self._file_configs:
-            try:
+            # Best-effort save; don't crash during interpreter shutdown.
+            # Avoid logging here — streams may already be closed at exit.
+            with contextlib.suppress(Exception):
                 self.save_configs(self._save_path)
-            except Exception as e:
-                # Best-effort save; don't crash during interpreter shutdown
-                logger.warning(
-                    f"[Autotuner]: Failed to save configs on exit to "
-                    f"{self._save_path}: {e}"
-                )
 
     def save_configs(self, path: str) -> None:
         """Save the current profiling cache to a JSON file.
