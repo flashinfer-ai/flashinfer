@@ -29,10 +29,6 @@
 #define FLASHINFER_AR_FUSION_ONESHOT_DEBUG_MAX_ACCESS 4
 #endif
 
-#ifndef FORCE_FULL_CLEAR
-#define FORCE_FULL_CLEAR 0
-#endif
-
 namespace flashinfer {
 
 namespace trtllm_allreduce_fusion {
@@ -1251,12 +1247,7 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams<T>
   }
 #endif
   LamportComm<NRanks> comm(params.workspace, params.rank);
-#if FORCE_FULL_CLEAR
-  // comm_size is in bytes while clear_size tracks element count.
-  int clear_size = comm.comm_size / static_cast<int>(sizeof(T));
-#else
   int clear_size = comm.clear_size;
-#endif
   int clear_access = clear_size / VEC_SIZE;
 #if FLASHINFER_AR_FUSION_ONESHOT_DEBUG
   if (blockIdx.x == 0 && threadIdx.x == 0) {
@@ -1351,12 +1342,7 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams<T>
     fused_op(sum_val, tidx);
   }
 
-#if FORCE_FULL_CLEAR
-  // Store full clear size (element count) to avoid stale regions across dynamic shapes.
-  comm.update(comm.comm_size / static_cast<int>(sizeof(T)));
-#else
   comm.update(params.size * NRanks);
-#endif
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   if constexpr (TriggerCompletionAtEnd) {
