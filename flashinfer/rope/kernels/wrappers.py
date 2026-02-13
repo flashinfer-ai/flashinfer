@@ -615,10 +615,9 @@ def apply_rope_with_cos_sin_cache_cute_dsl(
 
 
 __all__ = [
-    # Original API names (match rope_restored.py)
+    # Public API wrapper functions
     "apply_rope_cute_dsl",
     "apply_rope_with_indptr_cute_dsl",
     "apply_llama31_rope_with_indptr_cute_dsl",
     "apply_rope_with_cos_sin_cache_cute_dsl",
-    "_compute_pos_ids_from_indptr_offsets",
 ]

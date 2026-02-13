@@ -34,26 +34,9 @@ from .wrappers import (
     apply_rope_with_cos_sin_cache_cute_dsl,
 )
 
-from .kernels import (
-    RopeKernelNonInterleavedVec,
-    RopeKernelInterleavedVec,
-    RopeKernelSeqHeads,
-    RopeKernelWithIndptr,
-    RopeKernelCosSinCache,
-    RopeKernelCosSinCacheSeqHeads,
-)
-
 __all__ = [
-    # Wrapper functions
     "apply_rope_cute_dsl",
     "apply_rope_with_indptr_cute_dsl",
     "apply_llama31_rope_with_indptr_cute_dsl",
     "apply_rope_with_cos_sin_cache_cute_dsl",
-    # Kernel classes (for advanced users)
-    "RopeKernelNonInterleavedVec",
-    "RopeKernelInterleavedVec",
-    "RopeKernelSeqHeads",
-    "RopeKernelWithIndptr",
-    "RopeKernelCosSinCache",
-    "RopeKernelCosSinCacheSeqHeads",
 ]
