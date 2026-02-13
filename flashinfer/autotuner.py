@@ -3,6 +3,7 @@ import copy
 import importlib
 import inspect
 import itertools
+import json
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -21,6 +22,30 @@ from .jit.core import logger
 # such as when new kernels or configs are added. In such cases, the tuning configs
 # should also be updated. Currently, this process is manual, but it should be automated in the future.
 _nvfp4_cutlass_version = "0.1"
+
+
+def _tactic_to_json(tactic):
+    """Convert a tactic value to a JSON-compatible format.
+
+    Tuples are converted to lists recursively so that JSON serialization
+    works natively for both simple int tactics and compound tuple tactics
+    (e.g. CuteDSL's (tile_size, gemm1_tactic, gemm2_tactic)).
+    """
+    if isinstance(tactic, (tuple, list)):
+        return [_tactic_to_json(v) for v in tactic]
+    return tactic
+
+
+def _json_to_tactic(val):
+    """Convert a JSON-deserialized tactic value back to its original format.
+
+    Lists are recursively converted to tuples so that compound tactics
+    (e.g. CuteDSL's (tile_size, gemm1_tactic, gemm2_tactic)) are restored
+    to their expected tuple form.
+    """
+    if isinstance(val, list):
+        return tuple(_json_to_tactic(v) for v in val)
+    return val
 
 
 def get_config_path(is_module: bool):
@@ -358,11 +383,39 @@ class AutoTuner:
 
         self.profiling_debug = True
 
+        # User-loaded configs from JSON files (populated by load_configs or env var)
+        self._file_configs: Dict[str, Tuple] = {}
+        # Track which file config keys have been logged (to avoid per-call spam)
+        self._logged_file_hits: Set[Tuple[str, str]] = set()
+        # Whether we've attempted to load configs from the env var path
+        self._env_config_loaded = False
+
+        # Auto-save on process exit when FLASHINFER_AUTOTUNER_CONFIG_SAVE_PATH is set
+        self._save_path = os.environ.get("FLASHINFER_AUTOTUNER_CONFIG_SAVE_PATH")
+        if self._save_path:
+            import atexit
+
+            atexit.register(self._save_on_exit)
+
     @classmethod
     def get(cls):
         if cls._instance is None:
             cls._instance = AutoTuner()
         return cls._instance
+
+    def _ensure_env_configs_loaded(self):
+        """Lazily load configs from the FLASHINFER_AUTOTUNER_CONFIG_LOAD_PATH env var."""
+        if not self._env_config_loaded:
+            self._env_config_loaded = True
+            config_path = os.environ.get("FLASHINFER_AUTOTUNER_CONFIG_LOAD_PATH")
+            if config_path:
+                try:
+                    self.load_configs(config_path)
+                except Exception as e:
+                    logger.warning(
+                        f"[Autotuner]: Failed to load configs from "
+                        f"FLASHINFER_AUTOTUNER_CONFIG_LOAD_PATH={config_path}: {e}"
+                    )
 
     def search_cache(
         self,
@@ -373,28 +426,69 @@ class AutoTuner:
     ) -> Tuple[bool, int, int, OptimizationProfile]:
         """Search for cached profiling results matching the current configuration.
 
+        Searches the following sources in priority order:
+            1. In-memory profiling_cache (from live autotuning in the current process)
+            2. User-loaded configs (via load_configs() or FLASHINFER_AUTOTUNER_CONFIG_LOAD_PATH)
+            3. Bundled package configs (existing FLASHINFER_AUTOTUNER_LOAD_FROM_FILE=1 behavior)
+            4. Fallback tactic (-1)
+
         Args:
             custom_op (str): The name of the custom operation to be tuned
             runners (List[TunableRunner]): List of candidate implementations to profile
-            profile (OptimizationProfile): Optimization profile
+            input_shapes (Tuple[torch.Size]): Shapes of the input tensors
+            tuning_config (TuningConfig): Tuning configuration
 
         Returns:
             A tuple containing:
             [is_cache_hit, runner_id, tactic, stored_profile]
         """
+        # Ensure env var configs are loaded on first access
+        self._ensure_env_configs_loaded()
+
         for r in runners:
             cache_key = AutoTuner._get_cache_key(
                 custom_op, r, input_shapes, tuning_config
             )
+
+            # 1. In-memory cache (from live tuning)
+            if cache_key in self.profiling_cache:
+                return True, *self.profiling_cache[cache_key]
+
+            # Build the hash-free file key used by both user configs and bundled configs
+            file_key = str((cache_key[0], cache_key[1], cache_key[3]))
+
+            # 2. User-loaded configs (from load_configs or FLASHINFER_AUTOTUNER_CONFIG_LOAD_PATH)
+            #    Always consulted, even during tuning mode — loaded configs take priority
+            #    so that already-tuned shapes are never re-profiled.
+            if file_key in self._file_configs:
+                runner_name, tactic = self._file_configs[file_key]
+                runner_id = next(
+                    (
+                        i
+                        for i, runner in enumerate(runners)
+                        if runner.__class__.__name__ == runner_name
+                    ),
+                    0,  # fallback to first runner if name not found
+                )
+                log_key = (custom_op, runner_name)
+                if log_key not in self._logged_file_hits:
+                    self._logged_file_hits.add(log_key)
+                    logger.info(
+                        f"[Autotuner]: Config cache hit for {custom_op} "
+                        f"(runner={runner_name}, source=config file)"
+                    )
+                return True, runner_id, tactic, None
+
+            # 3. Bundled package configs (legacy .py files)
             if (
                 os.environ.get("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "0") == "1"
                 and not self.is_tuning_mode
             ):
                 output = load_from_file(cache_key)
-                return output
-            elif cache_key in self.profiling_cache:
-                return True, *self.profiling_cache[cache_key]
+                if output[0]:  # is_cache_hit
+                    return output
 
+        # 4. Fallback
         return False, 0, -1, None
 
     def choose_one(
@@ -799,9 +893,107 @@ class AutoTuner:
             tensors.append(tensor)
         return tensors
 
+    def _save_on_exit(self) -> None:
+        """atexit handler: save profiling cache to FLASHINFER_AUTOTUNER_CONFIG_SAVE_PATH."""
+        if self.profiling_cache or self._file_configs:
+            try:
+                self.save_configs(self._save_path)
+            except Exception as e:
+                # Best-effort save; don't crash during interpreter shutdown
+                logger.warning(
+                    f"[Autotuner]: Failed to save configs on exit to "
+                    f"{self._save_path}: {e}"
+                )
+
+    def save_configs(self, path: str) -> None:
+        """Save the current profiling cache to a JSON file.
+
+        Serializes all cached (runner, tactic) results so they can be loaded
+        later via ``load_configs()`` or the ``FLASHINFER_AUTOTUNER_CONFIG_LOAD_PATH``
+        environment variable, avoiding the need to re-run autotuning.
+
+        When configs were previously loaded via ``load_configs()``, those
+        entries are included in the output as well (with in-memory profiling
+        results taking priority for overlapping keys). This ensures the saved
+        file is always a complete, self-contained config.
+
+        Args:
+            path: File path to write the JSON config to.
+
+        Example::
+
+            with autotune(True):
+                # run workload to populate profiling cache
+                model(inputs)
+            AutoTuner.get().save_configs("/path/to/my_tuning_config.json")
+        """
+        configs = {}
+
+        # Include previously loaded file configs as a base
+        for file_key, (runner_name, tactic) in self._file_configs.items():
+            configs[file_key] = [runner_name, _tactic_to_json(tactic)]
+
+        num_previous = len(configs)
+
+        # Overlay in-memory profiling results (take priority over loaded configs)
+        for cache_key, cache_value in self.profiling_cache.items():
+            custom_op, runner_class_name, _runner_hash, profile = cache_key
+            runner_id, tactic, _opt_profile = cache_value
+
+            # Use hash-free key: (custom_op, runner_class_name, profile)
+            file_key = str((custom_op, runner_class_name, profile))
+
+            # Store runner class name (not positional index) for robustness
+            tactic_json = _tactic_to_json(tactic)
+            configs[file_key] = [runner_class_name, tactic_json]
+
+        num_new = len(configs) - num_previous
+
+        dir_name = os.path.dirname(os.path.abspath(path))
+        if dir_name:
+            os.makedirs(dir_name, exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(configs, f, indent=2, sort_keys=True)
+
+        logger.info(
+            f"[Autotuner]: Saved {len(configs)} configs to {path} "
+            f"({num_new} new, {num_previous} from previous config)"
+        )
+
+    def load_configs(self, path: str) -> None:
+        """Load autotuner configs from a JSON file.
+
+        Populates the internal config lookup table so that ``search_cache()``
+        can return pre-tuned results without re-running autotuning.
+
+        Args:
+            path: File path to the JSON config file (produced by
+                ``save_configs()``).
+
+        Raises:
+            FileNotFoundError: If the config file does not exist.
+            json.JSONDecodeError: If the file is not valid JSON.
+
+        Example::
+
+            AutoTuner.get().load_configs("/path/to/my_tuning_config.json")
+        """
+        with open(path, "r") as f:
+            configs = json.load(f)
+
+        for key, value in configs.items():
+            runner_name = value[0]
+            tactic = _json_to_tactic(value[1])
+            self._file_configs[key] = (runner_name, tactic)
+
+        logger.info(f"[Autotuner]: Loaded {len(configs)} configs from {path}")
+
     def clear_cache(self) -> None:
-        """Clear the profiling cache."""
+        """Clear the profiling cache and user-loaded file configs."""
         self.profiling_cache.clear()
+        self._file_configs.clear()
+        self._logged_file_hits.clear()
+        self._env_config_loaded = False
 
     def reset_statistics(self) -> None:
         """Reset all statistics counters."""
