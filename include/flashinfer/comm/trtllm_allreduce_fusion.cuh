@@ -1209,8 +1209,7 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams<T>
   }
 #endif
   LamportComm<NRanks> comm(params.workspace, params.rank);
-  int clear_size = comm.clear_size;
-  int clear_access = clear_size / VEC_SIZE;
+  int clear_access = comm.clear_size / VEC_SIZE;
 
   for (int idx = access_id; idx < tot_access; idx += access_stride) {
     vec_t<T, VEC_SIZE> val;
@@ -1429,31 +1428,33 @@ cudaError_t allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const& par
   int max_threads_per_block = min(max_registers / registers_per_thread, 1024);
 
   int block_size = threads_per_block;
+  auto is_power_of_two = [](int x) { return x > 0 && (x & (x - 1)) == 0; };
   // Save a known-good baseline launch configuration before FP4 specialization.
   // This baseline always preserves full token coverage.
   int baseline_threads_per_block = threads_per_block;
   int baseline_cluster_size = cluster_size;
 
-  // FP4 optimization: apply BEFORE SM count check to avoid being overridden
-  // This allows FP4 to use smaller block_size even when cluster_num is large
+  // FP4 optimization: keep occupancy-friendly candidates, but only accept
+  // configurations with power-of-two cluster_size to avoid unstable schedules.
   if constexpr (GetQuantType<Pattern> == QuantType::kFP4) {
-    // Try to use 160 as block_size if possible (better occupancy for FP4)
-    if (threads_per_token % 160 == 0 && 160 <= max_threads_per_block && 160 >= 128) {
-      block_size = 160;
-      cluster_size = threads_per_token / 160;
-      if (cluster_size > 8) cluster_size = 8;
+    auto try_fp4_block_size = [&](int candidate_block_size) -> bool {
+      if (candidate_block_size < 128 || candidate_block_size > max_threads_per_block) {
+        return false;
+      }
+      if (threads_per_token % candidate_block_size != 0) {
+        return false;
+      }
+      int candidate_cluster_size = threads_per_token / candidate_block_size;
+      if (candidate_cluster_size > 8 || !is_power_of_two(candidate_cluster_size)) {
+        return false;
+      }
+      block_size = candidate_block_size;
+      cluster_size = candidate_cluster_size;
+      return true;
+    };
+    if (!try_fp4_block_size(160) && !try_fp4_block_size(192)) {
+      (void)try_fp4_block_size(128);
     }
-    // Fallback: try 192, 128 if 160 doesn't work
-    else if (threads_per_token % 192 == 0 && 192 <= max_threads_per_block && 192 >= 128) {
-      block_size = 192;
-      cluster_size = threads_per_token / 192;
-      if (cluster_size > 8) cluster_size = 8;
-    } else if (threads_per_token % 128 == 0 && 128 <= max_threads_per_block) {
-      block_size = 128;
-      cluster_size = threads_per_token / 128;
-      if (cluster_size > 8) cluster_size = 8;
-    }
-    // Update threads_per_block to match block_size for SM count check
     threads_per_block = block_size;
   }
 
@@ -1486,6 +1487,17 @@ cudaError_t allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const& par
       cluster_size /= 2;
       block_size = threads_per_block;
     }
+  }
+
+  // Avoid CUDA 701 ("too many resources requested for launch") when
+  // register-limited max_threads_per_block is below the computed block size.
+  // Prefer reducing block size by increasing cluster_size while preserving
+  // full token coverage.
+  while (oneshot && block_size > max_threads_per_block && cluster_size < 8 &&
+         threads_per_token % (cluster_size * 2) == 0) {
+    cluster_size *= 2;
+    threads_per_block = threads_per_token / cluster_size;
+    block_size = threads_per_block;
   }
 
   FLASHINFER_CHECK(!oneshot || threads_per_block * cluster_size == threads_per_token,
