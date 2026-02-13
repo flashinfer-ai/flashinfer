@@ -176,7 +176,8 @@ def cute_dsl_prefill_sm120(
         """Get stride order, with fallback for PyTorch < 2.7."""
         if hasattr(t, "dim_order"):
             return t.dim_order()
-        return tuple(range(t.ndim))
+        # Derive order from strides: largest stride first (dim_order convention)
+        return tuple(sorted(range(t.ndim), key=lambda i: t.stride(i), reverse=True))
 
     def to_cute_tensor(t):
         """Convert a torch tensor to CuTe tensor with proper alignment hints."""
@@ -214,6 +215,7 @@ def cute_dsl_prefill_sm120(
         sm_scale,
         m_block_size,
         n_block_size,
+        num_threads,
     )
     compiled = _compile_cache.get(cache_key)
     if compiled is None:
