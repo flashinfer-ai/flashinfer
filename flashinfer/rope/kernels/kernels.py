@@ -45,6 +45,8 @@ from .helpers import (
     apply_rope_interleaved_bf16,
     apply_rope_non_interleaved_fp16,
     apply_rope_non_interleaved_bf16,
+    apply_rope_interleaved_dispatch,
+    apply_rope_non_interleaved_dispatch,
     compute_llama31_freq,
 )
 
@@ -835,41 +837,21 @@ class RopeKernelSeqHeads:
                 if interleave:
                     # Interleaved: process each pair directly with helper functions
                     if elem_offset < rotary_dim:
-                        if cutlass.const_expr(is_fp16):
-                            out_v0 = apply_rope_interleaved_fp16(
-                                v0, sin_reg[0], cos_reg[0]
-                            )
-                        else:
-                            out_v0 = apply_rope_interleaved_bf16(
-                                v0, sin_reg[0], cos_reg[0]
-                            )
+                        out_v0 = apply_rope_interleaved_dispatch(
+                            v0, sin_reg[0], cos_reg[0], is_fp16
+                        )
                     if elem_offset + 2 < rotary_dim:
-                        if cutlass.const_expr(is_fp16):
-                            out_v1 = apply_rope_interleaved_fp16(
-                                v1, sin_reg[1], cos_reg[1]
-                            )
-                        else:
-                            out_v1 = apply_rope_interleaved_bf16(
-                                v1, sin_reg[1], cos_reg[1]
-                            )
+                        out_v1 = apply_rope_interleaved_dispatch(
+                            v1, sin_reg[1], cos_reg[1], is_fp16
+                        )
                     if elem_offset + 4 < rotary_dim:
-                        if cutlass.const_expr(is_fp16):
-                            out_v2 = apply_rope_interleaved_fp16(
-                                v2, sin_reg[2], cos_reg[2]
-                            )
-                        else:
-                            out_v2 = apply_rope_interleaved_bf16(
-                                v2, sin_reg[2], cos_reg[2]
-                            )
+                        out_v2 = apply_rope_interleaved_dispatch(
+                            v2, sin_reg[2], cos_reg[2], is_fp16
+                        )
                     if elem_offset + 6 < rotary_dim:
-                        if cutlass.const_expr(is_fp16):
-                            out_v3 = apply_rope_interleaved_fp16(
-                                v3, sin_reg[3], cos_reg[3]
-                            )
-                        else:
-                            out_v3 = apply_rope_interleaved_bf16(
-                                v3, sin_reg[3], cos_reg[3]
-                            )
+                        out_v3 = apply_rope_interleaved_dispatch(
+                            v3, sin_reg[3], cos_reg[3], is_fp16
+                        )
                 else:
                     # Non-interleaved: load pair vector
                     pair_base_offset = (
@@ -880,89 +862,49 @@ class RopeKernelSeqHeads:
 
                     # Process each pair directly with helper functions
                     if elem_offset < rotary_dim:
-                        if cutlass.const_expr(is_fp16):
-                            out_v0 = apply_rope_non_interleaved_fp16(
-                                v0,
-                                p0,
-                                sin_reg[0],
-                                cos_reg[0],
-                                sin_reg[1],
-                                cos_reg[1],
-                                rope_sign,
-                            )
-                        else:
-                            out_v0 = apply_rope_non_interleaved_bf16(
-                                v0,
-                                p0,
-                                sin_reg[0],
-                                cos_reg[0],
-                                sin_reg[1],
-                                cos_reg[1],
-                                rope_sign,
-                            )
+                        out_v0 = apply_rope_non_interleaved_dispatch(
+                            v0,
+                            p0,
+                            sin_reg[0],
+                            cos_reg[0],
+                            sin_reg[1],
+                            cos_reg[1],
+                            rope_sign,
+                            is_fp16,
+                        )
                     if elem_offset + 2 < rotary_dim:
-                        if cutlass.const_expr(is_fp16):
-                            out_v1 = apply_rope_non_interleaved_fp16(
-                                v1,
-                                p1,
-                                sin_reg[2],
-                                cos_reg[2],
-                                sin_reg[3],
-                                cos_reg[3],
-                                rope_sign,
-                            )
-                        else:
-                            out_v1 = apply_rope_non_interleaved_bf16(
-                                v1,
-                                p1,
-                                sin_reg[2],
-                                cos_reg[2],
-                                sin_reg[3],
-                                cos_reg[3],
-                                rope_sign,
-                            )
+                        out_v1 = apply_rope_non_interleaved_dispatch(
+                            v1,
+                            p1,
+                            sin_reg[2],
+                            cos_reg[2],
+                            sin_reg[3],
+                            cos_reg[3],
+                            rope_sign,
+                            is_fp16,
+                        )
                     if elem_offset + 4 < rotary_dim:
-                        if cutlass.const_expr(is_fp16):
-                            out_v2 = apply_rope_non_interleaved_fp16(
-                                v2,
-                                p2,
-                                sin_reg[4],
-                                cos_reg[4],
-                                sin_reg[5],
-                                cos_reg[5],
-                                rope_sign,
-                            )
-                        else:
-                            out_v2 = apply_rope_non_interleaved_bf16(
-                                v2,
-                                p2,
-                                sin_reg[4],
-                                cos_reg[4],
-                                sin_reg[5],
-                                cos_reg[5],
-                                rope_sign,
-                            )
+                        out_v2 = apply_rope_non_interleaved_dispatch(
+                            v2,
+                            p2,
+                            sin_reg[4],
+                            cos_reg[4],
+                            sin_reg[5],
+                            cos_reg[5],
+                            rope_sign,
+                            is_fp16,
+                        )
                     if elem_offset + 6 < rotary_dim:
-                        if cutlass.const_expr(is_fp16):
-                            out_v3 = apply_rope_non_interleaved_fp16(
-                                v3,
-                                p3,
-                                sin_reg[6],
-                                cos_reg[6],
-                                sin_reg[7],
-                                cos_reg[7],
-                                rope_sign,
-                            )
-                        else:
-                            out_v3 = apply_rope_non_interleaved_bf16(
-                                v3,
-                                p3,
-                                sin_reg[6],
-                                cos_reg[6],
-                                sin_reg[7],
-                                cos_reg[7],
-                                rope_sign,
-                            )
+                        out_v3 = apply_rope_non_interleaved_dispatch(
+                            v3,
+                            p3,
+                            sin_reg[6],
+                            cos_reg[6],
+                            sin_reg[7],
+                            cos_reg[7],
+                            rope_sign,
+                            is_fp16,
+                        )
 
                 st_global_v4_u32(q_rope_ptr, out_v0, out_v1, out_v2, out_v3)
 
@@ -980,41 +922,21 @@ class RopeKernelSeqHeads:
                 if interleave:
                     # Interleaved: process each pair directly
                     if elem_offset < rotary_dim:
-                        if cutlass.const_expr(is_fp16):
-                            out_v0 = apply_rope_interleaved_fp16(
-                                v0, sin_reg[0], cos_reg[0]
-                            )
-                        else:
-                            out_v0 = apply_rope_interleaved_bf16(
-                                v0, sin_reg[0], cos_reg[0]
-                            )
+                        out_v0 = apply_rope_interleaved_dispatch(
+                            v0, sin_reg[0], cos_reg[0], is_fp16
+                        )
                     if elem_offset + 2 < rotary_dim:
-                        if cutlass.const_expr(is_fp16):
-                            out_v1 = apply_rope_interleaved_fp16(
-                                v1, sin_reg[1], cos_reg[1]
-                            )
-                        else:
-                            out_v1 = apply_rope_interleaved_bf16(
-                                v1, sin_reg[1], cos_reg[1]
-                            )
+                        out_v1 = apply_rope_interleaved_dispatch(
+                            v1, sin_reg[1], cos_reg[1], is_fp16
+                        )
                     if elem_offset + 4 < rotary_dim:
-                        if cutlass.const_expr(is_fp16):
-                            out_v2 = apply_rope_interleaved_fp16(
-                                v2, sin_reg[2], cos_reg[2]
-                            )
-                        else:
-                            out_v2 = apply_rope_interleaved_bf16(
-                                v2, sin_reg[2], cos_reg[2]
-                            )
+                        out_v2 = apply_rope_interleaved_dispatch(
+                            v2, sin_reg[2], cos_reg[2], is_fp16
+                        )
                     if elem_offset + 6 < rotary_dim:
-                        if cutlass.const_expr(is_fp16):
-                            out_v3 = apply_rope_interleaved_fp16(
-                                v3, sin_reg[3], cos_reg[3]
-                            )
-                        else:
-                            out_v3 = apply_rope_interleaved_bf16(
-                                v3, sin_reg[3], cos_reg[3]
-                            )
+                        out_v3 = apply_rope_interleaved_dispatch(
+                            v3, sin_reg[3], cos_reg[3], is_fp16
+                        )
                 else:
                     # Non-interleaved: load pair vector
                     pair_base_offset = (
@@ -1025,89 +947,49 @@ class RopeKernelSeqHeads:
 
                     # Process each pair directly
                     if elem_offset < rotary_dim:
-                        if cutlass.const_expr(is_fp16):
-                            out_v0 = apply_rope_non_interleaved_fp16(
-                                v0,
-                                p0,
-                                sin_reg[0],
-                                cos_reg[0],
-                                sin_reg[1],
-                                cos_reg[1],
-                                rope_sign,
-                            )
-                        else:
-                            out_v0 = apply_rope_non_interleaved_bf16(
-                                v0,
-                                p0,
-                                sin_reg[0],
-                                cos_reg[0],
-                                sin_reg[1],
-                                cos_reg[1],
-                                rope_sign,
-                            )
+                        out_v0 = apply_rope_non_interleaved_dispatch(
+                            v0,
+                            p0,
+                            sin_reg[0],
+                            cos_reg[0],
+                            sin_reg[1],
+                            cos_reg[1],
+                            rope_sign,
+                            is_fp16,
+                        )
                     if elem_offset + 2 < rotary_dim:
-                        if cutlass.const_expr(is_fp16):
-                            out_v1 = apply_rope_non_interleaved_fp16(
-                                v1,
-                                p1,
-                                sin_reg[2],
-                                cos_reg[2],
-                                sin_reg[3],
-                                cos_reg[3],
-                                rope_sign,
-                            )
-                        else:
-                            out_v1 = apply_rope_non_interleaved_bf16(
-                                v1,
-                                p1,
-                                sin_reg[2],
-                                cos_reg[2],
-                                sin_reg[3],
-                                cos_reg[3],
-                                rope_sign,
-                            )
+                        out_v1 = apply_rope_non_interleaved_dispatch(
+                            v1,
+                            p1,
+                            sin_reg[2],
+                            cos_reg[2],
+                            sin_reg[3],
+                            cos_reg[3],
+                            rope_sign,
+                            is_fp16,
+                        )
                     if elem_offset + 4 < rotary_dim:
-                        if cutlass.const_expr(is_fp16):
-                            out_v2 = apply_rope_non_interleaved_fp16(
-                                v2,
-                                p2,
-                                sin_reg[4],
-                                cos_reg[4],
-                                sin_reg[5],
-                                cos_reg[5],
-                                rope_sign,
-                            )
-                        else:
-                            out_v2 = apply_rope_non_interleaved_bf16(
-                                v2,
-                                p2,
-                                sin_reg[4],
-                                cos_reg[4],
-                                sin_reg[5],
-                                cos_reg[5],
-                                rope_sign,
-                            )
+                        out_v2 = apply_rope_non_interleaved_dispatch(
+                            v2,
+                            p2,
+                            sin_reg[4],
+                            cos_reg[4],
+                            sin_reg[5],
+                            cos_reg[5],
+                            rope_sign,
+                            is_fp16,
+                        )
                     if elem_offset + 6 < rotary_dim:
-                        if cutlass.const_expr(is_fp16):
-                            out_v3 = apply_rope_non_interleaved_fp16(
-                                v3,
-                                p3,
-                                sin_reg[6],
-                                cos_reg[6],
-                                sin_reg[7],
-                                cos_reg[7],
-                                rope_sign,
-                            )
-                        else:
-                            out_v3 = apply_rope_non_interleaved_bf16(
-                                v3,
-                                p3,
-                                sin_reg[6],
-                                cos_reg[6],
-                                sin_reg[7],
-                                cos_reg[7],
-                                rope_sign,
-                            )
+                        out_v3 = apply_rope_non_interleaved_dispatch(
+                            v3,
+                            p3,
+                            sin_reg[6],
+                            cos_reg[6],
+                            sin_reg[7],
+                            cos_reg[7],
+                            rope_sign,
+                            is_fp16,
+                        )
 
                 st_global_v4_u32(k_rope_ptr, out_v0, out_v1, out_v2, out_v3)
 
@@ -1764,41 +1646,21 @@ class RopeKernelCosSinCache:
 
                 if interleave:
                     if elem_offset < rotary_dim:
-                        if cutlass.const_expr(is_fp16):
-                            out_v0 = apply_rope_interleaved_fp16(
-                                v0, sin_reg[0], cos_reg[0]
-                            )
-                        else:
-                            out_v0 = apply_rope_interleaved_bf16(
-                                v0, sin_reg[0], cos_reg[0]
-                            )
+                        out_v0 = apply_rope_interleaved_dispatch(
+                            v0, sin_reg[0], cos_reg[0], is_fp16
+                        )
                     if elem_offset + 2 < rotary_dim:
-                        if cutlass.const_expr(is_fp16):
-                            out_v1 = apply_rope_interleaved_fp16(
-                                v1, sin_reg[1], cos_reg[1]
-                            )
-                        else:
-                            out_v1 = apply_rope_interleaved_bf16(
-                                v1, sin_reg[1], cos_reg[1]
-                            )
+                        out_v1 = apply_rope_interleaved_dispatch(
+                            v1, sin_reg[1], cos_reg[1], is_fp16
+                        )
                     if elem_offset + 4 < rotary_dim:
-                        if cutlass.const_expr(is_fp16):
-                            out_v2 = apply_rope_interleaved_fp16(
-                                v2, sin_reg[2], cos_reg[2]
-                            )
-                        else:
-                            out_v2 = apply_rope_interleaved_bf16(
-                                v2, sin_reg[2], cos_reg[2]
-                            )
+                        out_v2 = apply_rope_interleaved_dispatch(
+                            v2, sin_reg[2], cos_reg[2], is_fp16
+                        )
                     if elem_offset + 6 < rotary_dim:
-                        if cutlass.const_expr(is_fp16):
-                            out_v3 = apply_rope_interleaved_fp16(
-                                v3, sin_reg[3], cos_reg[3]
-                            )
-                        else:
-                            out_v3 = apply_rope_interleaved_bf16(
-                                v3, sin_reg[3], cos_reg[3]
-                            )
+                        out_v3 = apply_rope_interleaved_dispatch(
+                            v3, sin_reg[3], cos_reg[3], is_fp16
+                        )
                 else:
                     # Non-interleaved: need to load paired elements
                     pair_offset = (
@@ -1808,89 +1670,49 @@ class RopeKernelCosSinCache:
                     p0, p1, p2, p3 = ld_global_v4_u32(pair_ptr)
 
                     if elem_offset < rotary_dim:
-                        if cutlass.const_expr(is_fp16):
-                            out_v0 = apply_rope_non_interleaved_fp16(
-                                v0,
-                                p0,
-                                sin_reg[0],
-                                cos_reg[0],
-                                sin_reg[1],
-                                cos_reg[1],
-                                rope_sign,
-                            )
-                        else:
-                            out_v0 = apply_rope_non_interleaved_bf16(
-                                v0,
-                                p0,
-                                sin_reg[0],
-                                cos_reg[0],
-                                sin_reg[1],
-                                cos_reg[1],
-                                rope_sign,
-                            )
+                        out_v0 = apply_rope_non_interleaved_dispatch(
+                            v0,
+                            p0,
+                            sin_reg[0],
+                            cos_reg[0],
+                            sin_reg[1],
+                            cos_reg[1],
+                            rope_sign,
+                            is_fp16,
+                        )
                     if elem_offset + 2 < rotary_dim:
-                        if cutlass.const_expr(is_fp16):
-                            out_v1 = apply_rope_non_interleaved_fp16(
-                                v1,
-                                p1,
-                                sin_reg[2],
-                                cos_reg[2],
-                                sin_reg[3],
-                                cos_reg[3],
-                                rope_sign,
-                            )
-                        else:
-                            out_v1 = apply_rope_non_interleaved_bf16(
-                                v1,
-                                p1,
-                                sin_reg[2],
-                                cos_reg[2],
-                                sin_reg[3],
-                                cos_reg[3],
-                                rope_sign,
-                            )
+                        out_v1 = apply_rope_non_interleaved_dispatch(
+                            v1,
+                            p1,
+                            sin_reg[2],
+                            cos_reg[2],
+                            sin_reg[3],
+                            cos_reg[3],
+                            rope_sign,
+                            is_fp16,
+                        )
                     if elem_offset + 4 < rotary_dim:
-                        if cutlass.const_expr(is_fp16):
-                            out_v2 = apply_rope_non_interleaved_fp16(
-                                v2,
-                                p2,
-                                sin_reg[4],
-                                cos_reg[4],
-                                sin_reg[5],
-                                cos_reg[5],
-                                rope_sign,
-                            )
-                        else:
-                            out_v2 = apply_rope_non_interleaved_bf16(
-                                v2,
-                                p2,
-                                sin_reg[4],
-                                cos_reg[4],
-                                sin_reg[5],
-                                cos_reg[5],
-                                rope_sign,
-                            )
+                        out_v2 = apply_rope_non_interleaved_dispatch(
+                            v2,
+                            p2,
+                            sin_reg[4],
+                            cos_reg[4],
+                            sin_reg[5],
+                            cos_reg[5],
+                            rope_sign,
+                            is_fp16,
+                        )
                     if elem_offset + 6 < rotary_dim:
-                        if cutlass.const_expr(is_fp16):
-                            out_v3 = apply_rope_non_interleaved_fp16(
-                                v3,
-                                p3,
-                                sin_reg[6],
-                                cos_reg[6],
-                                sin_reg[7],
-                                cos_reg[7],
-                                rope_sign,
-                            )
-                        else:
-                            out_v3 = apply_rope_non_interleaved_bf16(
-                                v3,
-                                p3,
-                                sin_reg[6],
-                                cos_reg[6],
-                                sin_reg[7],
-                                cos_reg[7],
-                                rope_sign,
-                            )
+                        out_v3 = apply_rope_non_interleaved_dispatch(
+                            v3,
+                            p3,
+                            sin_reg[6],
+                            cos_reg[6],
+                            sin_reg[7],
+                            cos_reg[7],
+                            rope_sign,
+                            is_fp16,
+                        )
 
                 st_global_v4_u32(q_rope_ptr, out_v0, out_v1, out_v2, out_v3)
 
@@ -1907,41 +1729,21 @@ class RopeKernelCosSinCache:
 
                 if interleave:
                     if elem_offset < rotary_dim:
-                        if cutlass.const_expr(is_fp16):
-                            out_v0 = apply_rope_interleaved_fp16(
-                                v0, sin_reg[0], cos_reg[0]
-                            )
-                        else:
-                            out_v0 = apply_rope_interleaved_bf16(
-                                v0, sin_reg[0], cos_reg[0]
-                            )
+                        out_v0 = apply_rope_interleaved_dispatch(
+                            v0, sin_reg[0], cos_reg[0], is_fp16
+                        )
                     if elem_offset + 2 < rotary_dim:
-                        if cutlass.const_expr(is_fp16):
-                            out_v1 = apply_rope_interleaved_fp16(
-                                v1, sin_reg[1], cos_reg[1]
-                            )
-                        else:
-                            out_v1 = apply_rope_interleaved_bf16(
-                                v1, sin_reg[1], cos_reg[1]
-                            )
+                        out_v1 = apply_rope_interleaved_dispatch(
+                            v1, sin_reg[1], cos_reg[1], is_fp16
+                        )
                     if elem_offset + 4 < rotary_dim:
-                        if cutlass.const_expr(is_fp16):
-                            out_v2 = apply_rope_interleaved_fp16(
-                                v2, sin_reg[2], cos_reg[2]
-                            )
-                        else:
-                            out_v2 = apply_rope_interleaved_bf16(
-                                v2, sin_reg[2], cos_reg[2]
-                            )
+                        out_v2 = apply_rope_interleaved_dispatch(
+                            v2, sin_reg[2], cos_reg[2], is_fp16
+                        )
                     if elem_offset + 6 < rotary_dim:
-                        if cutlass.const_expr(is_fp16):
-                            out_v3 = apply_rope_interleaved_fp16(
-                                v3, sin_reg[3], cos_reg[3]
-                            )
-                        else:
-                            out_v3 = apply_rope_interleaved_bf16(
-                                v3, sin_reg[3], cos_reg[3]
-                            )
+                        out_v3 = apply_rope_interleaved_dispatch(
+                            v3, sin_reg[3], cos_reg[3], is_fp16
+                        )
                 else:
                     # Non-interleaved: need to load paired elements
                     pair_offset = (
@@ -1951,89 +1753,49 @@ class RopeKernelCosSinCache:
                     p0, p1, p2, p3 = ld_global_v4_u32(pair_ptr)
 
                     if elem_offset < rotary_dim:
-                        if cutlass.const_expr(is_fp16):
-                            out_v0 = apply_rope_non_interleaved_fp16(
-                                v0,
-                                p0,
-                                sin_reg[0],
-                                cos_reg[0],
-                                sin_reg[1],
-                                cos_reg[1],
-                                rope_sign,
-                            )
-                        else:
-                            out_v0 = apply_rope_non_interleaved_bf16(
-                                v0,
-                                p0,
-                                sin_reg[0],
-                                cos_reg[0],
-                                sin_reg[1],
-                                cos_reg[1],
-                                rope_sign,
-                            )
+                        out_v0 = apply_rope_non_interleaved_dispatch(
+                            v0,
+                            p0,
+                            sin_reg[0],
+                            cos_reg[0],
+                            sin_reg[1],
+                            cos_reg[1],
+                            rope_sign,
+                            is_fp16,
+                        )
                     if elem_offset + 2 < rotary_dim:
-                        if cutlass.const_expr(is_fp16):
-                            out_v1 = apply_rope_non_interleaved_fp16(
-                                v1,
-                                p1,
-                                sin_reg[2],
-                                cos_reg[2],
-                                sin_reg[3],
-                                cos_reg[3],
-                                rope_sign,
-                            )
-                        else:
-                            out_v1 = apply_rope_non_interleaved_bf16(
-                                v1,
-                                p1,
-                                sin_reg[2],
-                                cos_reg[2],
-                                sin_reg[3],
-                                cos_reg[3],
-                                rope_sign,
-                            )
+                        out_v1 = apply_rope_non_interleaved_dispatch(
+                            v1,
+                            p1,
+                            sin_reg[2],
+                            cos_reg[2],
+                            sin_reg[3],
+                            cos_reg[3],
+                            rope_sign,
+                            is_fp16,
+                        )
                     if elem_offset + 4 < rotary_dim:
-                        if cutlass.const_expr(is_fp16):
-                            out_v2 = apply_rope_non_interleaved_fp16(
-                                v2,
-                                p2,
-                                sin_reg[4],
-                                cos_reg[4],
-                                sin_reg[5],
-                                cos_reg[5],
-                                rope_sign,
-                            )
-                        else:
-                            out_v2 = apply_rope_non_interleaved_bf16(
-                                v2,
-                                p2,
-                                sin_reg[4],
-                                cos_reg[4],
-                                sin_reg[5],
-                                cos_reg[5],
-                                rope_sign,
-                            )
+                        out_v2 = apply_rope_non_interleaved_dispatch(
+                            v2,
+                            p2,
+                            sin_reg[4],
+                            cos_reg[4],
+                            sin_reg[5],
+                            cos_reg[5],
+                            rope_sign,
+                            is_fp16,
+                        )
                     if elem_offset + 6 < rotary_dim:
-                        if cutlass.const_expr(is_fp16):
-                            out_v3 = apply_rope_non_interleaved_fp16(
-                                v3,
-                                p3,
-                                sin_reg[6],
-                                cos_reg[6],
-                                sin_reg[7],
-                                cos_reg[7],
-                                rope_sign,
-                            )
-                        else:
-                            out_v3 = apply_rope_non_interleaved_bf16(
-                                v3,
-                                p3,
-                                sin_reg[6],
-                                cos_reg[6],
-                                sin_reg[7],
-                                cos_reg[7],
-                                rope_sign,
-                            )
+                        out_v3 = apply_rope_non_interleaved_dispatch(
+                            v3,
+                            p3,
+                            sin_reg[6],
+                            cos_reg[6],
+                            sin_reg[7],
+                            cos_reg[7],
+                            rope_sign,
+                            is_fp16,
+                        )
 
                 st_global_v4_u32(k_rope_ptr, out_v0, out_v1, out_v2, out_v3)
 
@@ -2222,41 +1984,21 @@ class RopeKernelCosSinCacheSeqHeads:
 
                 if interleave:
                     if elem_offset < rotary_dim:
-                        if cutlass.const_expr(is_fp16):
-                            out_v0 = apply_rope_interleaved_fp16(
-                                v0, sin_reg[0], cos_reg[0]
-                            )
-                        else:
-                            out_v0 = apply_rope_interleaved_bf16(
-                                v0, sin_reg[0], cos_reg[0]
-                            )
+                        out_v0 = apply_rope_interleaved_dispatch(
+                            v0, sin_reg[0], cos_reg[0], is_fp16
+                        )
                     if elem_offset + 2 < rotary_dim:
-                        if cutlass.const_expr(is_fp16):
-                            out_v1 = apply_rope_interleaved_fp16(
-                                v1, sin_reg[1], cos_reg[1]
-                            )
-                        else:
-                            out_v1 = apply_rope_interleaved_bf16(
-                                v1, sin_reg[1], cos_reg[1]
-                            )
+                        out_v1 = apply_rope_interleaved_dispatch(
+                            v1, sin_reg[1], cos_reg[1], is_fp16
+                        )
                     if elem_offset + 4 < rotary_dim:
-                        if cutlass.const_expr(is_fp16):
-                            out_v2 = apply_rope_interleaved_fp16(
-                                v2, sin_reg[2], cos_reg[2]
-                            )
-                        else:
-                            out_v2 = apply_rope_interleaved_bf16(
-                                v2, sin_reg[2], cos_reg[2]
-                            )
+                        out_v2 = apply_rope_interleaved_dispatch(
+                            v2, sin_reg[2], cos_reg[2], is_fp16
+                        )
                     if elem_offset + 6 < rotary_dim:
-                        if cutlass.const_expr(is_fp16):
-                            out_v3 = apply_rope_interleaved_fp16(
-                                v3, sin_reg[3], cos_reg[3]
-                            )
-                        else:
-                            out_v3 = apply_rope_interleaved_bf16(
-                                v3, sin_reg[3], cos_reg[3]
-                            )
+                        out_v3 = apply_rope_interleaved_dispatch(
+                            v3, sin_reg[3], cos_reg[3], is_fp16
+                        )
                 else:
                     # Non-interleaved: load paired elements
                     pair_offset = (
@@ -2266,89 +2008,49 @@ class RopeKernelCosSinCacheSeqHeads:
                     p0, p1, p2, p3 = ld_global_v4_u32(pair_ptr)
 
                     if elem_offset < rotary_dim:
-                        if cutlass.const_expr(is_fp16):
-                            out_v0 = apply_rope_non_interleaved_fp16(
-                                v0,
-                                p0,
-                                sin_reg[0],
-                                cos_reg[0],
-                                sin_reg[1],
-                                cos_reg[1],
-                                rope_sign,
-                            )
-                        else:
-                            out_v0 = apply_rope_non_interleaved_bf16(
-                                v0,
-                                p0,
-                                sin_reg[0],
-                                cos_reg[0],
-                                sin_reg[1],
-                                cos_reg[1],
-                                rope_sign,
-                            )
+                        out_v0 = apply_rope_non_interleaved_dispatch(
+                            v0,
+                            p0,
+                            sin_reg[0],
+                            cos_reg[0],
+                            sin_reg[1],
+                            cos_reg[1],
+                            rope_sign,
+                            is_fp16,
+                        )
                     if elem_offset + 2 < rotary_dim:
-                        if cutlass.const_expr(is_fp16):
-                            out_v1 = apply_rope_non_interleaved_fp16(
-                                v1,
-                                p1,
-                                sin_reg[2],
-                                cos_reg[2],
-                                sin_reg[3],
-                                cos_reg[3],
-                                rope_sign,
-                            )
-                        else:
-                            out_v1 = apply_rope_non_interleaved_bf16(
-                                v1,
-                                p1,
-                                sin_reg[2],
-                                cos_reg[2],
-                                sin_reg[3],
-                                cos_reg[3],
-                                rope_sign,
-                            )
+                        out_v1 = apply_rope_non_interleaved_dispatch(
+                            v1,
+                            p1,
+                            sin_reg[2],
+                            cos_reg[2],
+                            sin_reg[3],
+                            cos_reg[3],
+                            rope_sign,
+                            is_fp16,
+                        )
                     if elem_offset + 4 < rotary_dim:
-                        if cutlass.const_expr(is_fp16):
-                            out_v2 = apply_rope_non_interleaved_fp16(
-                                v2,
-                                p2,
-                                sin_reg[4],
-                                cos_reg[4],
-                                sin_reg[5],
-                                cos_reg[5],
-                                rope_sign,
-                            )
-                        else:
-                            out_v2 = apply_rope_non_interleaved_bf16(
-                                v2,
-                                p2,
-                                sin_reg[4],
-                                cos_reg[4],
-                                sin_reg[5],
-                                cos_reg[5],
-                                rope_sign,
-                            )
+                        out_v2 = apply_rope_non_interleaved_dispatch(
+                            v2,
+                            p2,
+                            sin_reg[4],
+                            cos_reg[4],
+                            sin_reg[5],
+                            cos_reg[5],
+                            rope_sign,
+                            is_fp16,
+                        )
                     if elem_offset + 6 < rotary_dim:
-                        if cutlass.const_expr(is_fp16):
-                            out_v3 = apply_rope_non_interleaved_fp16(
-                                v3,
-                                p3,
-                                sin_reg[6],
-                                cos_reg[6],
-                                sin_reg[7],
-                                cos_reg[7],
-                                rope_sign,
-                            )
-                        else:
-                            out_v3 = apply_rope_non_interleaved_bf16(
-                                v3,
-                                p3,
-                                sin_reg[6],
-                                cos_reg[6],
-                                sin_reg[7],
-                                cos_reg[7],
-                                rope_sign,
-                            )
+                        out_v3 = apply_rope_non_interleaved_dispatch(
+                            v3,
+                            p3,
+                            sin_reg[6],
+                            cos_reg[6],
+                            sin_reg[7],
+                            cos_reg[7],
+                            rope_sign,
+                            is_fp16,
+                        )
 
                 st_global_v4_u32(q_rope_ptr, out_v0, out_v1, out_v2, out_v3)
 
@@ -2365,41 +2067,21 @@ class RopeKernelCosSinCacheSeqHeads:
 
                 if interleave:
                     if elem_offset < rotary_dim:
-                        if cutlass.const_expr(is_fp16):
-                            out_v0 = apply_rope_interleaved_fp16(
-                                v0, sin_reg[0], cos_reg[0]
-                            )
-                        else:
-                            out_v0 = apply_rope_interleaved_bf16(
-                                v0, sin_reg[0], cos_reg[0]
-                            )
+                        out_v0 = apply_rope_interleaved_dispatch(
+                            v0, sin_reg[0], cos_reg[0], is_fp16
+                        )
                     if elem_offset + 2 < rotary_dim:
-                        if cutlass.const_expr(is_fp16):
-                            out_v1 = apply_rope_interleaved_fp16(
-                                v1, sin_reg[1], cos_reg[1]
-                            )
-                        else:
-                            out_v1 = apply_rope_interleaved_bf16(
-                                v1, sin_reg[1], cos_reg[1]
-                            )
+                        out_v1 = apply_rope_interleaved_dispatch(
+                            v1, sin_reg[1], cos_reg[1], is_fp16
+                        )
                     if elem_offset + 4 < rotary_dim:
-                        if cutlass.const_expr(is_fp16):
-                            out_v2 = apply_rope_interleaved_fp16(
-                                v2, sin_reg[2], cos_reg[2]
-                            )
-                        else:
-                            out_v2 = apply_rope_interleaved_bf16(
-                                v2, sin_reg[2], cos_reg[2]
-                            )
+                        out_v2 = apply_rope_interleaved_dispatch(
+                            v2, sin_reg[2], cos_reg[2], is_fp16
+                        )
                     if elem_offset + 6 < rotary_dim:
-                        if cutlass.const_expr(is_fp16):
-                            out_v3 = apply_rope_interleaved_fp16(
-                                v3, sin_reg[3], cos_reg[3]
-                            )
-                        else:
-                            out_v3 = apply_rope_interleaved_bf16(
-                                v3, sin_reg[3], cos_reg[3]
-                            )
+                        out_v3 = apply_rope_interleaved_dispatch(
+                            v3, sin_reg[3], cos_reg[3], is_fp16
+                        )
                 else:
                     # Non-interleaved: load paired elements
                     pair_offset = (
@@ -2409,89 +2091,49 @@ class RopeKernelCosSinCacheSeqHeads:
                     p0, p1, p2, p3 = ld_global_v4_u32(pair_ptr)
 
                     if elem_offset < rotary_dim:
-                        if cutlass.const_expr(is_fp16):
-                            out_v0 = apply_rope_non_interleaved_fp16(
-                                v0,
-                                p0,
-                                sin_reg[0],
-                                cos_reg[0],
-                                sin_reg[1],
-                                cos_reg[1],
-                                rope_sign,
-                            )
-                        else:
-                            out_v0 = apply_rope_non_interleaved_bf16(
-                                v0,
-                                p0,
-                                sin_reg[0],
-                                cos_reg[0],
-                                sin_reg[1],
-                                cos_reg[1],
-                                rope_sign,
-                            )
+                        out_v0 = apply_rope_non_interleaved_dispatch(
+                            v0,
+                            p0,
+                            sin_reg[0],
+                            cos_reg[0],
+                            sin_reg[1],
+                            cos_reg[1],
+                            rope_sign,
+                            is_fp16,
+                        )
                     if elem_offset + 2 < rotary_dim:
-                        if cutlass.const_expr(is_fp16):
-                            out_v1 = apply_rope_non_interleaved_fp16(
-                                v1,
-                                p1,
-                                sin_reg[2],
-                                cos_reg[2],
-                                sin_reg[3],
-                                cos_reg[3],
-                                rope_sign,
-                            )
-                        else:
-                            out_v1 = apply_rope_non_interleaved_bf16(
-                                v1,
-                                p1,
-                                sin_reg[2],
-                                cos_reg[2],
-                                sin_reg[3],
-                                cos_reg[3],
-                                rope_sign,
-                            )
+                        out_v1 = apply_rope_non_interleaved_dispatch(
+                            v1,
+                            p1,
+                            sin_reg[2],
+                            cos_reg[2],
+                            sin_reg[3],
+                            cos_reg[3],
+                            rope_sign,
+                            is_fp16,
+                        )
                     if elem_offset + 4 < rotary_dim:
-                        if cutlass.const_expr(is_fp16):
-                            out_v2 = apply_rope_non_interleaved_fp16(
-                                v2,
-                                p2,
-                                sin_reg[4],
-                                cos_reg[4],
-                                sin_reg[5],
-                                cos_reg[5],
-                                rope_sign,
-                            )
-                        else:
-                            out_v2 = apply_rope_non_interleaved_bf16(
-                                v2,
-                                p2,
-                                sin_reg[4],
-                                cos_reg[4],
-                                sin_reg[5],
-                                cos_reg[5],
-                                rope_sign,
-                            )
+                        out_v2 = apply_rope_non_interleaved_dispatch(
+                            v2,
+                            p2,
+                            sin_reg[4],
+                            cos_reg[4],
+                            sin_reg[5],
+                            cos_reg[5],
+                            rope_sign,
+                            is_fp16,
+                        )
                     if elem_offset + 6 < rotary_dim:
-                        if cutlass.const_expr(is_fp16):
-                            out_v3 = apply_rope_non_interleaved_fp16(
-                                v3,
-                                p3,
-                                sin_reg[6],
-                                cos_reg[6],
-                                sin_reg[7],
-                                cos_reg[7],
-                                rope_sign,
-                            )
-                        else:
-                            out_v3 = apply_rope_non_interleaved_bf16(
-                                v3,
-                                p3,
-                                sin_reg[6],
-                                cos_reg[6],
-                                sin_reg[7],
-                                cos_reg[7],
-                                rope_sign,
-                            )
+                        out_v3 = apply_rope_non_interleaved_dispatch(
+                            v3,
+                            p3,
+                            sin_reg[6],
+                            cos_reg[6],
+                            sin_reg[7],
+                            cos_reg[7],
+                            rope_sign,
+                            is_fp16,
+                        )
 
                 st_global_v4_u32(k_rope_ptr, out_v0, out_v1, out_v2, out_v3)
 

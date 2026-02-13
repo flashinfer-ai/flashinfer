@@ -22,6 +22,7 @@ This module provides helper functions for RoPE computation:
 - compute_llama31_freq: Compute Llama 3.1 frequency scaling
 """
 
+import cutlass
 from cutlass import Float32, Uint32
 
 from .ptx_ops import (
@@ -171,10 +172,86 @@ def compute_llama31_freq(
     return scaled_freq + smooth * (base_freq - scaled_freq)
 
 
+def apply_rope_interleaved_dispatch(
+    v: Uint32,
+    sin_val: Float32,
+    cos_val: Float32,
+    is_fp16: bool,
+) -> Uint32:
+    """Dispatch to fp16 or bf16 interleaved RoPE based on compile-time flag.
+
+    This helper reduces code duplication by encapsulating the cutlass.const_expr()
+    dispatch pattern.
+
+    Parameters
+    ----------
+    v : Uint32
+        Input vector (2 elements packed)
+    sin_val : Float32
+        Sin value
+    cos_val : Float32
+        Cos value
+    is_fp16 : bool
+        Compile-time flag: True for fp16, False for bf16
+
+    Returns
+    -------
+    Uint32
+        Rotated vector
+    """
+    if cutlass.const_expr(is_fp16):
+        return apply_rope_interleaved_fp16(v, sin_val, cos_val)
+    else:
+        return apply_rope_interleaved_bf16(v, sin_val, cos_val)
+
+
+def apply_rope_non_interleaved_dispatch(
+    v: Uint32,
+    p: Uint32,
+    sin0: Float32,
+    cos0: Float32,
+    sin1: Float32,
+    cos1: Float32,
+    rope_sign: Float32,
+    is_fp16: bool,
+) -> Uint32:
+    """Dispatch to fp16 or bf16 non-interleaved RoPE based on compile-time flag.
+
+    This helper reduces code duplication by encapsulating the cutlass.const_expr()
+    dispatch pattern.
+
+    Parameters
+    ----------
+    v : Uint32
+        Main vector (2 elements packed)
+    p : Uint32
+        Pair vector (2 elements packed)
+    sin0, cos0 : Float32
+        Sin/cos for first element
+    sin1, cos1 : Float32
+        Sin/cos for second element
+    rope_sign : Float32
+        -1.0 if in first half, +1.0 if in second half
+    is_fp16 : bool
+        Compile-time flag: True for fp16, False for bf16
+
+    Returns
+    -------
+    Uint32
+        Rotated vector
+    """
+    if cutlass.const_expr(is_fp16):
+        return apply_rope_non_interleaved_fp16(v, p, sin0, cos0, sin1, cos1, rope_sign)
+    else:
+        return apply_rope_non_interleaved_bf16(v, p, sin0, cos0, sin1, cos1, rope_sign)
+
+
 __all__ = [
     "apply_rope_interleaved_fp16",
     "apply_rope_interleaved_bf16",
     "apply_rope_non_interleaved_fp16",
     "apply_rope_non_interleaved_bf16",
+    "apply_rope_interleaved_dispatch",
+    "apply_rope_non_interleaved_dispatch",
     "compute_llama31_freq",
 ]
