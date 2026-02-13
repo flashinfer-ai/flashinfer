@@ -509,6 +509,14 @@ void TRTLLMFMHAv2StandardRun(TensorView q, TensorView k, TensorView v, TensorVie
   launch_params.total_q_seqlen = q_seqlen;
   launch_params.total_kv_seqlen = kv_seqlen;
 
+  // Validate head_dim before any CUDA allocations to avoid leaks on bad input
+  if (data_type == DATA_TYPE_BF16 || data_type == DATA_TYPE_FP16) {
+    if (head_dim != 64 && head_dim != 128) {
+      throw std::runtime_error(
+          "Unsupported head_dim for standard attention on SM120. Supported: 64, 128.");
+    }
+  }
+
   void* scale_bmm2_d;
   FMHA_CHECK_CUDA(cudaMalloc(&scale_bmm2_d, sizeof(uint32_t)));
 
