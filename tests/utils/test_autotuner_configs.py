@@ -2,7 +2,7 @@
 Tests for AutoTuner save_configs / load_configs functionality.
 
 These tests exercise the JSON-based config save/load round-trip,
-environment variable loading, and the fallback chain in search_cache().
+autotune(cache=...) context manager, and the fallback chain in search_cache().
 
 No GPU is required for these tests — they use mock data to populate
 the profiling cache and verify serialization behavior.
@@ -20,6 +20,7 @@ from flashinfer.autotuner import (
     TuningConfig,
     _json_to_tactic,
     _tactic_to_json,
+    autotune,
 )
 
 
@@ -107,13 +108,10 @@ class TestTacticConversion:
 class TestSaveLoadRoundTrip:
     def setup_method(self):
         """Reset the singleton AutoTuner for each test."""
-        os.environ.pop("FLASHINFER_AUTOTUNER_CONFIG_SAVE_PATH", None)
         AutoTuner._instance = None
         self.tuner = AutoTuner.get()
 
     def teardown_method(self):
-        if AutoTuner._instance is not None:
-            AutoTuner._instance._save_path = None
         AutoTuner._instance = None
 
     def test_save_and_load_basic(self):
@@ -227,13 +225,10 @@ class TestSaveLoadRoundTrip:
 
 class TestLoadConfigsErrors:
     def setup_method(self):
-        os.environ.pop("FLASHINFER_AUTOTUNER_CONFIG_SAVE_PATH", None)
         AutoTuner._instance = None
         self.tuner = AutoTuner.get()
 
     def teardown_method(self):
-        if AutoTuner._instance is not None:
-            AutoTuner._instance._save_path = None
         AutoTuner._instance = None
 
     def test_load_nonexistent_file_raises(self):
@@ -253,103 +248,17 @@ class TestLoadConfigsErrors:
 
 
 # ---------------------------------------------------------------------------
-# Tests: environment variable config loading
-# ---------------------------------------------------------------------------
-
-
-class TestEnvVarLoading:
-    def setup_method(self):
-        for var in [
-            "FLASHINFER_AUTOTUNER_CONFIG_SAVE_PATH",
-            "FLASHINFER_AUTOTUNER_CONFIG_LOAD_PATH",
-            "FLASHINFER_AUTOTUNER_LOAD_FROM_FILE",
-        ]:
-            os.environ.pop(var, None)
-        AutoTuner._instance = None
-        self.tuner = AutoTuner.get()
-
-    def teardown_method(self):
-        if AutoTuner._instance is not None:
-            AutoTuner._instance._save_path = None
-        AutoTuner._instance = None
-        for var in [
-            "FLASHINFER_AUTOTUNER_CONFIG_SAVE_PATH",
-            "FLASHINFER_AUTOTUNER_CONFIG_LOAD_PATH",
-            "FLASHINFER_AUTOTUNER_LOAD_FROM_FILE",
-        ]:
-            os.environ.pop(var, None)
-
-    def test_env_var_loads_on_first_search(self):
-        """Configs should be lazily loaded from FLASHINFER_AUTOTUNER_CONFIG_LOAD_PATH."""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-            data = {"('test::op', 'FakeRunnerA', ((1, 2),))": ["FakeRunnerA", 7]}
-            json.dump(data, f)
-            tmp_path = f.name
-
-        try:
-            os.environ["FLASHINFER_AUTOTUNER_CONFIG_LOAD_PATH"] = tmp_path
-            assert not self.tuner._env_config_loaded
-
-            # Trigger search_cache which should lazily load
-            runner = FakeRunnerA()
-            self.tuner.search_cache(
-                "test::op",
-                [runner],
-                ((1, 2),),
-                _TUNING_CONFIG,
-            )
-
-            assert self.tuner._env_config_loaded
-            assert len(self.tuner._file_configs) == 1
-        finally:
-            os.unlink(tmp_path)
-
-    def test_env_var_invalid_path_warns(self):
-        """Invalid env var path should warn, not crash."""
-        os.environ["FLASHINFER_AUTOTUNER_CONFIG_LOAD_PATH"] = "/nonexistent/path.json"
-
-        runner = FakeRunnerA()
-        # Should not raise
-        result = self.tuner.search_cache(
-            "test::op", [runner], ((1, 2),), _TUNING_CONFIG
-        )
-        assert self.tuner._env_config_loaded
-        assert result[0] is False  # cache miss, falls through to fallback
-
-    def test_env_var_not_set(self):
-        """When env var is not set, no file loading should occur."""
-        runner = FakeRunnerA()
-        self.tuner.search_cache("test::op", [runner], ((1, 2),), _TUNING_CONFIG)
-        assert self.tuner._env_config_loaded
-        assert len(self.tuner._file_configs) == 0
-
-
-# ---------------------------------------------------------------------------
 # Tests: search_cache fallback chain
 # ---------------------------------------------------------------------------
 
 
 class TestSearchCacheFallbackChain:
     def setup_method(self):
-        for var in [
-            "FLASHINFER_AUTOTUNER_CONFIG_SAVE_PATH",
-            "FLASHINFER_AUTOTUNER_CONFIG_LOAD_PATH",
-            "FLASHINFER_AUTOTUNER_LOAD_FROM_FILE",
-        ]:
-            os.environ.pop(var, None)
         AutoTuner._instance = None
         self.tuner = AutoTuner.get()
 
     def teardown_method(self):
-        if AutoTuner._instance is not None:
-            AutoTuner._instance._save_path = None
         AutoTuner._instance = None
-        for var in [
-            "FLASHINFER_AUTOTUNER_CONFIG_SAVE_PATH",
-            "FLASHINFER_AUTOTUNER_CONFIG_LOAD_PATH",
-            "FLASHINFER_AUTOTUNER_LOAD_FROM_FILE",
-        ]:
-            os.environ.pop(var, None)
 
     def test_in_memory_cache_has_priority(self):
         """In-memory cache should be checked before file configs."""
@@ -415,17 +324,15 @@ class TestSearchCacheFallbackChain:
         assert tactic == -1
 
     def test_clear_cache_resets_all(self):
-        """clear_cache should reset in-memory cache, file configs, and env flag."""
+        """clear_cache should reset in-memory cache and file configs."""
         runner = FakeRunnerA(value=1)
         _populate_cache(self.tuner, runner, "op1", ((1, 2),), tactic=5)
         self.tuner._file_configs["some_key"] = ("FakeRunnerA", 3)
-        self.tuner._env_config_loaded = True
 
         self.tuner.clear_cache()
 
         assert len(self.tuner.profiling_cache) == 0
         assert len(self.tuner._file_configs) == 0
-        assert not self.tuner._env_config_loaded
 
 
 # ---------------------------------------------------------------------------
@@ -435,13 +342,10 @@ class TestSearchCacheFallbackChain:
 
 class TestEndToEnd:
     def setup_method(self):
-        os.environ.pop("FLASHINFER_AUTOTUNER_CONFIG_SAVE_PATH", None)
         AutoTuner._instance = None
         self.tuner = AutoTuner.get()
 
     def teardown_method(self):
-        if AutoTuner._instance is not None:
-            AutoTuner._instance._save_path = None
         AutoTuner._instance = None
 
     def test_save_then_load_then_search(self):
@@ -473,35 +377,6 @@ class TestEndToEnd:
             assert runner_id == 0
             assert tactic == 3
         finally:
-            os.unlink(tmp_path)
-
-    def test_save_then_env_load_then_search(self):
-        """Full workflow using env var: tune -> save -> clear -> set env -> search hits."""
-        runner = FakeRunnerA(value=20)
-        profile = ((64, 1024),)
-        _populate_cache(self.tuner, runner, "env_op", profile, tactic=7)
-
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-            tmp_path = f.name
-
-        try:
-            self.tuner.save_configs(tmp_path)
-
-            # Reset tuner completely
-            AutoTuner._instance = None
-            self.tuner = AutoTuner.get()
-
-            # Set env var
-            os.environ["FLASHINFER_AUTOTUNER_CONFIG_LOAD_PATH"] = tmp_path
-
-            # Search should lazily load from env var and hit
-            is_hit, runner_id, tactic, _ = self.tuner.search_cache(
-                "env_op", [runner], profile, _TUNING_CONFIG
-            )
-            assert is_hit
-            assert tactic == 7
-        finally:
-            os.environ.pop("FLASHINFER_AUTOTUNER_CONFIG_LOAD_PATH", None)
             os.unlink(tmp_path)
 
     def test_save_merges_loaded_and_profiled_configs(self):
@@ -567,130 +442,196 @@ class TestEndToEnd:
 
 
 # ---------------------------------------------------------------------------
-# Tests: FLASHINFER_AUTOTUNER_CONFIG_SAVE_PATH (atexit auto-save)
+# Tests: autotune(cache=...) context manager
 # ---------------------------------------------------------------------------
 
 
-class TestSavePathEnvVar:
+class TestAutotuneCache:
     def setup_method(self):
-        for var in [
-            "FLASHINFER_AUTOTUNER_CONFIG_SAVE_PATH",
-            "FLASHINFER_AUTOTUNER_CONFIG_LOAD_PATH",
-            "FLASHINFER_AUTOTUNER_LOAD_FROM_FILE",
-        ]:
-            os.environ.pop(var, None)
         AutoTuner._instance = None
 
     def teardown_method(self):
-        for var in [
-            "FLASHINFER_AUTOTUNER_CONFIG_SAVE_PATH",
-            "FLASHINFER_AUTOTUNER_CONFIG_LOAD_PATH",
-            "FLASHINFER_AUTOTUNER_LOAD_FROM_FILE",
-        ]:
-            os.environ.pop(var, None)
-        # Neutralize atexit handlers on any lingering instance
-        if AutoTuner._instance is not None:
-            AutoTuner._instance._save_path = None
         AutoTuner._instance = None
 
-    def test_save_path_registers_atexit(self):
-        """When FLASHINFER_AUTOTUNER_CONFIG_SAVE_PATH is set, _save_path should be populated."""
+    def test_autotune_cache_loads_on_entry(self):
+        """autotune(cache=path) should load configs from the file on entry."""
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump({"('op1', 'FakeRunnerA', ((1, 2),))": ["FakeRunnerA", 7]}, f)
             tmp_path = f.name
 
         try:
-            os.environ["FLASHINFER_AUTOTUNER_CONFIG_SAVE_PATH"] = tmp_path
-            tuner = AutoTuner()
-            assert tuner._save_path == tmp_path
+            tuner = AutoTuner.get()
+            assert len(tuner._file_configs) == 0
+
+            with autotune(False, cache=tmp_path):
+                assert len(tuner._file_configs) == 1
         finally:
-            tuner._save_path = None  # prevent atexit handler from firing
             os.unlink(tmp_path)
 
-    def test_no_save_path_means_none(self):
-        """When FLASHINFER_AUTOTUNER_CONFIG_SAVE_PATH is not set, _save_path should be None."""
-        tuner = AutoTuner()
-        assert tuner._save_path is None
-
-    def test_save_on_exit_writes_file(self):
-        """_save_on_exit should write the profiling cache to the save path."""
+    def test_autotune_cache_saves_on_exit_when_tuning(self):
+        """autotune(True, cache=path) should save configs on exit."""
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
             tmp_path = f.name
 
         try:
-            os.environ["FLASHINFER_AUTOTUNER_CONFIG_SAVE_PATH"] = tmp_path
-            AutoTuner._instance = None
             tuner = AutoTuner.get()
-
             runner = FakeRunnerA(value=1)
-            _populate_cache(tuner, runner, "exit_op", ((5, 10),), tactic=8)
+            _populate_cache(tuner, runner, "op1", ((1, 2),), tactic=5)
 
-            # Simulate atexit by calling _save_on_exit directly
-            tuner._save_on_exit()
+            with autotune(True, cache=tmp_path):
+                pass  # configs already in cache from _populate_cache
 
-            # Verify the file was written
+            # Verify file was written
             with open(tmp_path, "r") as f:
                 data = json.load(f)
             assert len(data) == 1
             entry = list(data.values())[0]
-            assert entry == ["FakeRunnerA", 8]
+            assert entry == ["FakeRunnerA", 5]
         finally:
-            tuner._save_path = None  # prevent atexit handler from firing again
             os.unlink(tmp_path)
 
-    def test_save_on_exit_skips_when_empty(self):
-        """_save_on_exit should not write when there's nothing to save."""
+    def test_autotune_cache_no_save_when_not_tuning(self):
+        """autotune(False, cache=path) should NOT save on exit."""
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-            # Write some content so we can verify it's not overwritten
             f.write("original content")
             tmp_path = f.name
 
         try:
-            os.environ["FLASHINFER_AUTOTUNER_CONFIG_SAVE_PATH"] = tmp_path
-            AutoTuner._instance = None
             tuner = AutoTuner.get()
+            runner = FakeRunnerA(value=1)
+            _populate_cache(tuner, runner, "op1", ((1, 2),), tactic=5)
 
-            # Don't populate any cache
-            tuner._save_on_exit()
+            with autotune(False, cache=tmp_path):
+                pass
 
-            # File should still have original content (not overwritten)
+            # File should NOT have been overwritten (tune_mode=False)
             with open(tmp_path, "r") as f:
                 content = f.read()
             assert content == "original content"
         finally:
-            tuner._save_path = None  # prevent atexit handler from firing again
             os.unlink(tmp_path)
 
-    def test_full_workflow_save_then_load_via_env(self):
-        """End-to-end: SAVE_PATH captures tuning, CONFIG_PATH loads it back."""
+    def test_autotune_cache_nonexistent_file_creates_on_exit(self):
+        """First run: cache file doesn't exist yet, should be created on exit."""
+        tmp_dir = tempfile.mkdtemp()
+        cache_path = os.path.join(tmp_dir, "new_cache.json")
+
+        try:
+            assert not os.path.exists(cache_path)
+
+            tuner = AutoTuner.get()
+            runner = FakeRunnerA(value=1)
+            _populate_cache(tuner, runner, "op1", ((1, 2),), tactic=9)
+
+            with autotune(True, cache=cache_path):
+                pass
+
+            # File should now exist with the config
+            assert os.path.exists(cache_path)
+            with open(cache_path, "r") as f:
+                data = json.load(f)
+            assert len(data) == 1
+        finally:
+            if os.path.exists(cache_path):
+                os.unlink(cache_path)
+            os.rmdir(tmp_dir)
+
+    def test_autotune_cache_no_cache_param(self):
+        """autotune() without cache= should behave as before (no file I/O)."""
+        tuner = AutoTuner.get()
+        assert len(tuner._file_configs) == 0
+
+        with autotune(True):
+            pass
+
+        # No file configs loaded, no errors
+        assert len(tuner._file_configs) == 0
+
+    def test_full_workflow_tune_then_inference(self):
+        """End-to-end: autotune(True, cache=) then autotune(False, cache=)."""
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
             tmp_path = f.name
 
         try:
-            # Phase 1: Tune and save via SAVE_PATH
-            os.environ["FLASHINFER_AUTOTUNER_CONFIG_SAVE_PATH"] = tmp_path
-            AutoTuner._instance = None
+            # Phase 1: Tune and save
             tuner = AutoTuner.get()
-
             runner = FakeRunnerA(value=42)
             profile = ((128, 4096),)
             _populate_cache(tuner, runner, "e2e_op", profile, tactic=13)
 
-            # Simulate process exit
-            tuner._save_on_exit()
-            tuner._save_path = None  # prevent atexit handler from firing again
-            os.environ.pop("FLASHINFER_AUTOTUNER_CONFIG_SAVE_PATH", None)
+            with autotune(True, cache=tmp_path):
+                pass
 
-            # Phase 2: Fresh process loads via CONFIG_PATH
+            # Phase 2: Fresh tuner, load and use cached configs
             AutoTuner._instance = None
-            os.environ["FLASHINFER_AUTOTUNER_CONFIG_LOAD_PATH"] = tmp_path
             tuner2 = AutoTuner.get()
 
-            is_hit, runner_id, tactic, _ = tuner2.search_cache(
-                "e2e_op", [runner], profile, _TUNING_CONFIG
-            )
-            assert is_hit
-            assert tactic == 13
+            with autotune(False, cache=tmp_path):
+                is_hit, runner_id, tactic, _ = tuner2.search_cache(
+                    "e2e_op", [runner], profile, _TUNING_CONFIG
+                )
+                assert is_hit
+                assert tactic == 13
         finally:
-            os.environ.pop("FLASHINFER_AUTOTUNER_CONFIG_LOAD_PATH", None)
-            os.environ.pop("FLASHINFER_AUTOTUNER_CONFIG_SAVE_PATH", None)
+            os.unlink(tmp_path)
+
+    def test_incremental_cache_across_blocks(self):
+        """Multiple autotune(True, cache=) blocks should accumulate configs."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            tmp_path = f.name
+
+        try:
+            runner_a = FakeRunnerA(value=1)
+            runner_b = FakeRunnerB(value=2)
+
+            # Block 1: tune op1
+            tuner = AutoTuner.get()
+            _populate_cache(tuner, runner_a, "op1", ((1, 2),), tactic=10)
+            with autotune(True, cache=tmp_path):
+                pass
+
+            with open(tmp_path, "r") as f:
+                data = json.load(f)
+            assert len(data) == 1
+
+            # Block 2: tune op2 (should merge with op1)
+            _populate_cache(tuner, runner_b, "op2", ((3, 4),), tactic=20)
+            with autotune(True, cache=tmp_path):
+                pass
+
+            with open(tmp_path, "r") as f:
+                data = json.load(f)
+            # Should have both op1 (from loaded file) and op2 (from profiling)
+            assert len(data) == 2
+        finally:
+            os.unlink(tmp_path)
+
+    def test_cache_hit_skips_profiling_during_tune(self):
+        """Loaded configs should be used even during autotune(True), skipping profiling."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            tmp_path = f.name
+
+        try:
+            # Create a cache file with a known config
+            tuner = AutoTuner.get()
+            runner = FakeRunnerA(value=1)
+            profile = ((10, 20),)
+            _populate_cache(tuner, runner, "op1", profile, tactic=42)
+            tuner.save_configs(tmp_path)
+
+            # Reset tuner
+            AutoTuner._instance = None
+            tuner2 = AutoTuner.get()
+
+            # Use autotune(True, cache=) — should load and hit, not re-profile
+            with autotune(True, cache=tmp_path):
+                is_hit, runner_id, tactic, _ = tuner2.search_cache(
+                    "op1", [runner], profile, _TUNING_CONFIG
+                )
+                assert is_hit
+                assert tactic == 42
+                # Should be in _file_configs, not profiling_cache
+                assert len(tuner2.profiling_cache) == 0
+                assert len(tuner2._file_configs) == 1
+        finally:
             os.unlink(tmp_path)

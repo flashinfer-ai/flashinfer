@@ -273,18 +273,49 @@ class TunableRunner(ABC):
 
 
 @contextlib.contextmanager
-def autotune(tune_mode: bool = True):
-    old_mode = AutoTuner.get().is_tuning_mode
-    AutoTuner.get().is_tuning_mode = tune_mode
+def autotune(tune_mode: bool = True, cache: Optional[str] = None):
+    """Context manager for autotuning with optional file-based caching.
+
+    Args:
+        tune_mode: If True, profile uncovered shapes during execution.
+            If False, only use cached/loaded configs (no profiling).
+        cache: Optional path to a JSON config file.
+            On entry, configs are loaded from this file (if it exists).
+            On exit, configs are saved back to this file (only when
+            ``tune_mode=True``).
+
+    Examples::
+
+        # Tune and persist results to a cache file
+        with autotune(True, cache="my_configs.json"):
+            model(inputs)
+
+        # Load cached configs for inference (no profiling, no save)
+        with autotune(False, cache="my_configs.json"):
+            model(inputs)
+    """
+    tuner = AutoTuner.get()
+
+    # Load configs from cache file on entry (if it exists)
+    if cache is not None:
+        if os.path.isfile(cache):
+            tuner.load_configs(cache)
+
+    old_mode = tuner.is_tuning_mode
+    tuner.is_tuning_mode = tune_mode
     autotune_enabled = tune_mode and not old_mode
     if autotune_enabled:
         logger.info("[Autotuner]: Autotuning process starts ...")
     try:
         yield
     finally:
-        AutoTuner.get().is_tuning_mode = old_mode
+        tuner.is_tuning_mode = old_mode
         if autotune_enabled:
             logger.info("[Autotuner]: Autotuning process ends")
+
+        # Save configs on exit when tuning with a cache path
+        if cache is not None and tune_mode:
+            tuner.save_configs(cache)
 
 
 @dataclass
@@ -383,39 +414,16 @@ class AutoTuner:
 
         self.profiling_debug = True
 
-        # User-loaded configs from JSON files (populated by load_configs or env var)
+        # User-loaded configs from JSON files (populated by load_configs or autotune(cache=))
         self._file_configs: Dict[str, Tuple] = {}
         # Track which file config keys have been logged (to avoid per-call spam)
         self._logged_file_hits: Set[Tuple[str, str]] = set()
-        # Whether we've attempted to load configs from the env var path
-        self._env_config_loaded = False
-
-        # Auto-save on process exit when FLASHINFER_AUTOTUNER_CONFIG_SAVE_PATH is set
-        self._save_path = os.environ.get("FLASHINFER_AUTOTUNER_CONFIG_SAVE_PATH")
-        if self._save_path:
-            import atexit
-
-            atexit.register(self._save_on_exit)
 
     @classmethod
     def get(cls):
         if cls._instance is None:
             cls._instance = AutoTuner()
         return cls._instance
-
-    def _ensure_env_configs_loaded(self):
-        """Lazily load configs from the FLASHINFER_AUTOTUNER_CONFIG_LOAD_PATH env var."""
-        if not self._env_config_loaded:
-            self._env_config_loaded = True
-            config_path = os.environ.get("FLASHINFER_AUTOTUNER_CONFIG_LOAD_PATH")
-            if config_path:
-                try:
-                    self.load_configs(config_path)
-                except Exception as e:
-                    logger.warning(
-                        f"[Autotuner]: Failed to load configs from "
-                        f"FLASHINFER_AUTOTUNER_CONFIG_LOAD_PATH={config_path}: {e}"
-                    )
 
     def search_cache(
         self,
@@ -428,8 +436,8 @@ class AutoTuner:
 
         Searches the following sources in priority order:
             1. In-memory profiling_cache (from live autotuning in the current process)
-            2. User-loaded configs (via load_configs() or FLASHINFER_AUTOTUNER_CONFIG_LOAD_PATH)
-            3. Bundled package configs (existing FLASHINFER_AUTOTUNER_LOAD_FROM_FILE=1 behavior)
+            2. User-loaded configs (via load_configs() or autotune(cache=...))
+            3. Bundled package configs (legacy .py files)
             4. Fallback tactic (-1)
 
         Args:
@@ -442,9 +450,6 @@ class AutoTuner:
             A tuple containing:
             [is_cache_hit, runner_id, tactic, stored_profile]
         """
-        # Ensure env var configs are loaded on first access
-        self._ensure_env_configs_loaded()
-
         for r in runners:
             cache_key = AutoTuner._get_cache_key(
                 custom_op, r, input_shapes, tuning_config
@@ -457,7 +462,7 @@ class AutoTuner:
             # Build the hash-free file key used by both user configs and bundled configs
             file_key = str((cache_key[0], cache_key[1], cache_key[3]))
 
-            # 2. User-loaded configs (from load_configs or FLASHINFER_AUTOTUNER_CONFIG_LOAD_PATH)
+            # 2. User-loaded configs (from load_configs or autotune(cache=...))
             #    Always consulted, even during tuning mode — loaded configs take priority
             #    so that already-tuned shapes are never re-profiled.
             if file_key in self._file_configs:
@@ -893,37 +898,36 @@ class AutoTuner:
             tensors.append(tensor)
         return tensors
 
-    def _save_on_exit(self) -> None:
-        """atexit handler: save profiling cache to FLASHINFER_AUTOTUNER_CONFIG_SAVE_PATH."""
-        if not self._save_path:
-            return
-        if self.profiling_cache or self._file_configs:
-            # Best-effort save; don't crash during interpreter shutdown.
-            # Avoid logging here — streams may already be closed at exit.
-            with contextlib.suppress(Exception):
-                self.save_configs(self._save_path)
-
     def save_configs(self, path: str) -> None:
         """Save the current profiling cache to a JSON file.
 
         Serializes all cached (runner, tactic) results so they can be loaded
-        later via ``load_configs()`` or the ``FLASHINFER_AUTOTUNER_CONFIG_LOAD_PATH``
-        environment variable, avoiding the need to re-run autotuning.
+        later via ``load_configs()`` or ``autotune(cache=...)``, avoiding the
+        need to re-run autotuning.
 
         When configs were previously loaded via ``load_configs()``, those
         entries are included in the output as well (with in-memory profiling
         results taking priority for overlapping keys). This ensures the saved
         file is always a complete, self-contained config.
 
+        Note:
+            This is called automatically on exit from
+            ``with autotune(True, cache=path):``. Direct calls are only needed
+            for advanced use cases.
+
         Args:
             path: File path to write the JSON config to.
 
         Example::
 
-            with autotune(True):
-                # run workload to populate profiling cache
+            # Preferred: use autotune(cache=...) for automatic save/load
+            with autotune(True, cache="/path/to/config.json"):
                 model(inputs)
-            AutoTuner.get().save_configs("/path/to/my_tuning_config.json")
+
+            # Advanced: manual save after tuning
+            with autotune(True):
+                model(inputs)
+            AutoTuner.get().save_configs("/path/to/config.json")
         """
         configs = {}
 
@@ -964,6 +968,11 @@ class AutoTuner:
         Populates the internal config lookup table so that ``search_cache()``
         can return pre-tuned results without re-running autotuning.
 
+        Note:
+            This is called automatically on entry to
+            ``with autotune(cache=path):``. Direct calls are only needed
+            for advanced use cases.
+
         Args:
             path: File path to the JSON config file (produced by
                 ``save_configs()``).
@@ -974,7 +983,12 @@ class AutoTuner:
 
         Example::
 
-            AutoTuner.get().load_configs("/path/to/my_tuning_config.json")
+            # Preferred: use autotune(cache=...) for automatic save/load
+            with autotune(False, cache="/path/to/config.json"):
+                model(inputs)
+
+            # Advanced: manual load
+            AutoTuner.get().load_configs("/path/to/config.json")
         """
         with open(path, "r") as f:
             configs = json.load(f)
@@ -991,7 +1005,6 @@ class AutoTuner:
         self.profiling_cache.clear()
         self._file_configs.clear()
         self._logged_file_hits.clear()
-        self._env_config_loaded = False
 
     def reset_statistics(self) -> None:
         """Reset all statistics counters."""
