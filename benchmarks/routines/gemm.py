@@ -1401,7 +1401,6 @@ def testMmMxfp8(args):
     # Minimum cosine similarity for swizzled layout
     min_cos_sim = 0.98
 
-
     tested_backends = list(outputs.keys())
     tested_outputs = list(outputs.values())
     if len(tested_backends) > 0:
