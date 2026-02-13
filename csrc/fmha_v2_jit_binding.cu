@@ -32,8 +32,9 @@ void fmha_v2_run(ffi::TensorView q, ffi::TensorView k, ffi::TensorView v, ffi::T
                  int max_q_len, int max_kv_len, int batch_size, int total_q_tokens,
                  int total_kv_tokens, const std::string& mask_mode_str, float scale_softmax,
                  float scale_bmm1, float scale_bmm2, int window_left, int chunked_attention_size,
-                 bool has_alibi, float softcapping_scale, ffi::TensorView scale_bmm2_d,
-                 Optional<ffi::TensorView> softmax_stats, Optional<ffi::TensorView> sinks);
+                 bool has_alibi, float softcapping_scale, float skip_softmax_threshold_scale_factor,
+                 ffi::TensorView scale_bmm2_d, Optional<ffi::TensorView> softmax_stats,
+                 Optional<ffi::TensorView> sinks);
 
 // FMHAv2 attention operator
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, fmha_v2_run);
