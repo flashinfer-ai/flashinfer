@@ -172,17 +172,33 @@ def apply_rope_cute_dsl(
     assert dtype in [torch.float16, torch.bfloat16], f"Unsupported dtype: {dtype}"
     dtype_str = "float16" if dtype == torch.float16 else "bfloat16"
 
+    # Check for aliasing (same tensor as input and output)
+    # TVM FFI creates a memcpy when it detects aliasing, causing 2x slowdown on B300.
+    # We avoid this by using separate tensors internally, then copying back.
+    q_aliased = q_rope is not None and q_rope is q
+    k_aliased = k_rope is not None and k_rope is k
+
     # Allocate output tensors if not provided
     if q_rope is None:
         q_rope = torch.empty_like(q)
+        q_aliased = False
     if k_rope is None:
         k_rope = torch.empty_like(k)
+        k_aliased = False
+
+    # If aliased, use temporary tensors to avoid TVM FFI memcpy overhead
+    if q_aliased or k_aliased:
+        q_rope_temp = torch.empty_like(q) if q_aliased else q_rope
+        k_rope_temp = torch.empty_like(k) if k_aliased else k_rope
+    else:
+        q_rope_temp = q_rope
+        k_rope_temp = k_rope
 
     # Ensure contiguous tensors
     q = q.contiguous()
     k = k.contiguous()
-    q_rope = q_rope.contiguous()
-    k_rope = k_rope.contiguous()
+    q_rope_temp = q_rope_temp.contiguous()
+    k_rope_temp = k_rope_temp.contiguous()
 
     # Determine idtype for pos_ids (int32 or int64, matching CUDA's type dispatch)
     if pos_ids.dtype == torch.int32:
@@ -252,8 +268,8 @@ def apply_rope_cute_dsl(
     kernel(
         q,
         k,
-        q_rope,
-        k_rope,
+        q_rope_temp,
+        k_rope_temp,
         pos_ids,
         nnz,
         num_qo_heads,
@@ -263,6 +279,16 @@ def apply_rope_cute_dsl(
         smooth_a,
         smooth_b,
     )
+
+    # Copy back if we used temporary tensors to avoid aliasing
+    if q_aliased:
+        q.copy_(q_rope_temp)
+        # Return the original tensor (q) since it now contains the result
+        q_rope = q
+    if k_aliased:
+        k.copy_(k_rope_temp)
+        # Return the original tensor (k) since it now contains the result
+        k_rope = k
 
     return q_rope, k_rope
 
@@ -384,17 +410,33 @@ def apply_rope_with_indptr_cute_dsl(
     assert dtype in [torch.float16, torch.bfloat16], f"Unsupported dtype: {dtype}"
     dtype_str = "float16" if dtype == torch.float16 else "bfloat16"
 
+    # Check for aliasing (same tensor as input and output)
+    # TVM FFI creates a memcpy when it detects aliasing, causing 2x slowdown on B300.
+    # We avoid this by using separate tensors internally, then copying back.
+    q_aliased = q_rope is not None and q_rope is q
+    k_aliased = k_rope is not None and k_rope is k
+
     # Allocate output tensors if not provided
     if q_rope is None:
         q_rope = torch.empty_like(q)
+        q_aliased = False
     if k_rope is None:
         k_rope = torch.empty_like(k)
+        k_aliased = False
+
+    # If aliased, use temporary tensors to avoid TVM FFI memcpy overhead
+    if q_aliased or k_aliased:
+        q_rope_temp = torch.empty_like(q) if q_aliased else q_rope
+        k_rope_temp = torch.empty_like(k) if k_aliased else k_rope
+    else:
+        q_rope_temp = q_rope
+        k_rope_temp = k_rope
 
     # Ensure contiguous tensors
     q = q.contiguous()
     k = k.contiguous()
-    q_rope = q_rope.contiguous()
-    k_rope = k_rope.contiguous()
+    q_rope_temp = q_rope_temp.contiguous()
+    k_rope_temp = k_rope_temp.contiguous()
 
     # Determine idtype for indptr/offsets (int32 or int64, matching CUDA's type dispatch)
     # Note: indptr and offsets must have the same dtype
@@ -436,8 +478,8 @@ def apply_rope_with_indptr_cute_dsl(
     kernel(
         q,
         k,
-        q_rope,
-        k_rope,
+        q_rope_temp,
+        k_rope_temp,
         indptr,
         offsets,
         batch_size,
@@ -448,6 +490,16 @@ def apply_rope_with_indptr_cute_dsl(
         smooth_a,
         smooth_b,
     )
+
+    # Copy back if we used temporary tensors to avoid aliasing
+    if q_aliased:
+        q.copy_(q_rope_temp)
+        # Return the original tensor (q) since it now contains the result
+        q_rope = q
+    if k_aliased:
+        k.copy_(k_rope_temp)
+        # Return the original tensor (k) since it now contains the result
+        k_rope = k
 
     return q_rope, k_rope
 
@@ -567,17 +619,35 @@ def apply_rope_with_cos_sin_cache_cute_dsl(
     else:
         raise ValueError(f"pos_ids must be int32 or int64, got {pos_ids.dtype}")
 
+    # Check for aliasing (same tensor as input and output)
+    # TVM FFI creates a memcpy when it detects aliasing, causing 2x slowdown on B300.
+    # We avoid this by using separate tensors internally, then copying back.
+    q_aliased = q_rope is not None and q_rope is q
+    k_aliased = k_rope is not None and k_rope is k
+
     # Allocate output if not provided
     if q_rope is None:
         q_rope = torch.empty_like(q)
+        q_aliased = False
     if k_rope is None:
         k_rope = torch.empty_like(k)
+        k_aliased = False
+
+    # If aliased, use temporary tensors to avoid TVM FFI memcpy overhead
+    if q_aliased or k_aliased:
+        q_rope_temp = torch.empty_like(q) if q_aliased else q_rope
+        k_rope_temp = torch.empty_like(k) if k_aliased else k_rope
+    else:
+        q_rope_temp = q_rope
+        k_rope_temp = k_rope
 
     # Ensure contiguous (no dtype conversion needed - kernel handles both int32/int64)
     q = q.contiguous()
     k = k.contiguous()
     cos_sin_cache = cos_sin_cache.contiguous()
     pos_ids = pos_ids.contiguous()
+    q_rope_temp = q_rope_temp.contiguous()
+    k_rope_temp = k_rope_temp.contiguous()
 
     # Adaptive kernel selection (matching CUDA's occupancy-based approach):
     # - Head-parallel: Better for small workloads - maximizes GPU parallelism
@@ -602,14 +672,24 @@ def apply_rope_with_cos_sin_cache_cute_dsl(
     kernel_obj(
         q,
         k,
-        q_rope,
-        k_rope,
+        q_rope_temp,
+        k_rope_temp,
         cos_sin_cache,
         pos_ids,
         nnz,
         num_qo_heads,
         num_kv_heads,
     )
+
+    # Copy back if we used temporary tensors to avoid aliasing
+    if q_aliased:
+        q.copy_(q_rope_temp)
+        # Return the original tensor (q) since it now contains the result
+        q_rope = q
+    if k_aliased:
+        k.copy_(k_rope_temp)
+        # Return the original tensor (k) since it now contains the result
+        k_rope = k
 
     return q_rope, k_rope
 
