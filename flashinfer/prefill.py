@@ -4168,7 +4168,7 @@ def trtllm_fmha_v2_prefill(
         chunked_attention_size,  # Chunked attention size
         pos_encoding_mode == "ALIBI",  # Alibi mode
         softcapping_scale,  # Softcapping scale (0.0 = disabled)
-        skip_softmax_threshold_scale_factor,  # 0.0 = disable
+        skip_softmax_threshold_scale_factor,  # threshold_scale_factor for skip-softmax (0.0 = disable)
         scale_bmm2_d,  # Pre-populated scale_bmm2 on device (avoids cudaMemcpy)
         lse,  # Optional LSE tensor (None if not saving softmax stats)
         sinks,  # Optional sinks tensor

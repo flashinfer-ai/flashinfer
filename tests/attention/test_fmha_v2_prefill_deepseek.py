@@ -317,8 +317,8 @@ def test_fmha_v2_prefill_deepseek(
     torch.testing.assert_close(lse, lse_ref, rtol=1e-2, atol=1e-3)
 
 
-@pytest.mark.parametrize("batch_size", [4, 16])
-@pytest.mark.parametrize("max_seq_len", [1024, 4096])
+@pytest.mark.parametrize("batch_size", [1, 4, 16])
+@pytest.mark.parametrize("max_seq_len", [1024, 4096, 16384])
 @pytest.mark.parametrize("num_qo_heads", [4, 32])
 @pytest.mark.parametrize("num_kv_heads", [4])
 @pytest.mark.parametrize("head_dim", [128, 256])
@@ -355,7 +355,7 @@ def test_fmha_v2_prefill_deepseek(
 @pytest.mark.parametrize("non_blocking", [True, False])
 @pytest.mark.parametrize("pos_encoding_mode", ["NONE"])
 @pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
-@pytest.mark.parametrize("skip_softmax_threshold_scale_factor", [0, 1000])
+@pytest.mark.parametrize("skip_softmax_threshold_scale_factor", [0.0, 500.0, 10000.0])
 def test_trtllm_fmha_v2_prefill(
     input_layout,
     batch_size,
