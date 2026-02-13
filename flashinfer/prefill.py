@@ -3852,6 +3852,7 @@ def fmha_v2_prefill_deepseek(
         return out
 
 
+@flashinfer_api
 def fmha_v2_prefill_sm120(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -3891,15 +3892,25 @@ def fmha_v2_prefill_sm120(
             "fmha_v2_prefill_sm120 is only supported on SM12x GPUs "
             "(RTX 5090, DGX Spark GB10)."
         )
+    if query.dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(
+            f"fmha_v2_prefill_sm120 only supports BF16 and FP16, got {query.dtype}."
+        )
+    if key.dtype != query.dtype or value.dtype != query.dtype:
+        raise ValueError("query, key, and value must have the same dtype.")
+    if key.device != query.device or value.device != query.device:
+        raise ValueError("query, key, and value must be on the same device.")
     head_dim = query.shape[3]
     if head_dim not in (64, 128):
         raise ValueError(
             f"fmha_v2_prefill_sm120 only supports head_dim 64 or 128, got {head_dim}."
         )
-    if query.dtype not in (torch.bfloat16, torch.float16):
-        raise ValueError(
-            f"fmha_v2_prefill_sm120 only supports BF16 and FP16, got {query.dtype}."
-        )
+    if query.shape[0] != key.shape[0] or query.shape[0] != value.shape[0]:
+        raise ValueError("query, key, and value must have the same batch size.")
+    if key.shape[1] != value.shape[1]:
+        raise ValueError("key and value must have the same sequence length.")
+    if key.shape[2] != value.shape[2]:
+        raise ValueError("key and value must have the same number of KV heads.")
 
     batch_size = query.shape[0]
     q_seqlen = query.shape[1]

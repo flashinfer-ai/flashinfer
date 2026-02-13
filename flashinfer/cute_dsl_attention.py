@@ -28,6 +28,7 @@ from typing import Optional
 
 import torch
 
+from .api_logging import flashinfer_api
 from .utils import is_sm120a_supported, is_sm121a_supported
 
 
@@ -86,6 +87,7 @@ def _get_compiled_kernel(head_dim, m_block, n_block, num_threads, is_causal, dty
     return fa2_fwd, fa_module
 
 
+@flashinfer_api
 def cute_dsl_prefill_sm120(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -133,6 +135,16 @@ def cute_dsl_prefill_sm120(
         )
     if query.dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(f"Only BF16 and FP16 are supported, got {query.dtype}.")
+    if key.dtype != query.dtype or value.dtype != query.dtype:
+        raise ValueError("query, key, and value must have the same dtype.")
+    if key.device != query.device or value.device != query.device:
+        raise ValueError("query, key, and value must be on the same device.")
+    if query.shape[0] != key.shape[0] or query.shape[0] != value.shape[0]:
+        raise ValueError("query, key, and value must have the same batch size.")
+    if key.shape[1] != value.shape[1]:
+        raise ValueError("key and value must have the same sequence length.")
+    if key.shape[2] != value.shape[2]:
+        raise ValueError("key and value must have the same number of KV heads.")
     head_dim = query.shape[-1]
     if head_dim % 8 != 0:
         raise ValueError(f"head_dim must be divisible by 8, got {head_dim}.")
