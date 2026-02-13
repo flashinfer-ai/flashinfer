@@ -176,7 +176,6 @@ class FusedMoeLauncher {
       TVM_FFI_ICHECK_EQ(routing_logits.value().size(1), args->num_experts)
           << "routing_logits dim1 must match num_experts.";
     }
-    int64_t intermediate_size_factor = isGatedActivation(activation_type) ? 2 : 1;
   }
 
   // Routing bias [num_experts]
@@ -985,6 +984,7 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
                                          workspace.total_max_padded_tokens},
                                         dl_float32, hidden_states.device());
     } else if (quantization_type == Fp8QuantizationType::MxFp8) {
+      // MxFP8 fuses the activation so no need for intermediate_size_factor
       int64_t sf_size = tensorrt_llm::computeSwizzledLayoutSFSize(max_num_padded_tokens_gemm1,
                                                                   args->intermediate_size / 32);
       gemm1_output_scale = alloc_tensor({sf_size}, dl_uint8, hidden_states.device());
