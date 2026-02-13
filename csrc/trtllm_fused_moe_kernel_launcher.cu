@@ -132,6 +132,8 @@ class FusedMoeLauncher {
       btg::Dtype::Bfloat16};  // Dtype for expert weights in routing, based on routing bias
   ActivationType activation_type{ActivationType::Swiglu};
 
+  int64_t intermediate_size_factor{2};
+
  public:
   // Constructor that initializes all TensorView members
   FusedMoeLauncher(const Optional<TensorView>& routing_logits,
@@ -155,7 +157,8 @@ class FusedMoeLauncher {
         weight_layout{batchedGemm::gemm::MatrixLayout::MajorK},
         mDtypeAct{btg::Dtype::Bfloat16},
         mDtypeWeights{btg::Dtype::Bfloat16},
-        activation_type{ActivationType::Swiglu} {}
+        activation_type{ActivationType::Swiglu},
+        intermediate_size_factor{2} {}
 
  protected:
   // Initialize common data necessary for later.
@@ -173,6 +176,7 @@ class FusedMoeLauncher {
       TVM_FFI_ICHECK_EQ(routing_logits.value().size(1), args->num_experts)
           << "routing_logits dim1 must match num_experts.";
     }
+    int64_t intermediate_size_factor = isGatedActivation(activation_type) ? 2 : 1;
   }
 
   // Routing bias [num_experts]
@@ -919,7 +923,8 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
           << "gemm1_weights_scale has incorrect shape.";
       TVM_FFI_ICHECK_EQ(args->intermediate_size % 128, 0)
           << "intermediate_size must be a multiple of 128.";
-      TVM_FFI_ICHECK_EQ(gemm1_weights_scale.size(1), 2 * args->intermediate_size / 128)
+      TVM_FFI_ICHECK_EQ(gemm1_weights_scale.size(1),
+                        intermediate_size_factor * args->intermediate_size / 128)
           << "gemm1_weights_scale has incorrect shape.";
       TVM_FFI_ICHECK_EQ(gemm1_weights_scale.size(2), args->hidden_size / 128)
           << "gemm1_weights_scale has incorrect shape.";
@@ -971,13 +976,14 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
             workspace.total_max_padded_tokens, args->hidden_size,
             btg::dtypeGetNumBits(args->mDtypeOut));
 
-    gemm1_output = alloc_tensor({max_num_padded_tokens_gemm1, 2 * args->intermediate_size},
-                                dl_uint8, hidden_states.device());
+    gemm1_output = alloc_tensor(
+        {max_num_padded_tokens_gemm1, intermediate_size_factor * args->intermediate_size}, dl_uint8,
+        hidden_states.device());
 
     if (quantization_type == Fp8QuantizationType::DeepSeekFp8) {
-      gemm1_output_scale =
-          alloc_tensor({2 * args->intermediate_size / 128, workspace.total_max_padded_tokens},
-                       dl_float32, hidden_states.device());
+      gemm1_output_scale = alloc_tensor({intermediate_size_factor * args->intermediate_size / 128,
+                                         workspace.total_max_padded_tokens},
+                                        dl_float32, hidden_states.device());
     } else if (quantization_type == Fp8QuantizationType::MxFp8) {
       int64_t sf_size = tensorrt_llm::computeSwizzledLayoutSFSize(max_num_padded_tokens_gemm1,
                                                                   args->intermediate_size / 32);
