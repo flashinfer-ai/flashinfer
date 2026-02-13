@@ -100,12 +100,9 @@ def get_fmha_module(
     device: torch.device,
     use_fp16_qk_reduction: bool = False,
 ):
-    if (
-        is_sm100a_supported(device)
-        or is_sm110a_supported(device)
-        or is_sm120a_supported(device)
-        or is_sm121a_supported(device)
-    ):
+    # SM12x (RTX 5090, DGX Spark) cannot use CUTLASS FMHA SM100 (requires tcgen05).
+    # SM12x should use FA2 JIT kernels or fmha_v2 HMMA kernels instead.
+    if is_sm100a_supported(device) or is_sm110a_supported(device):
         return gen_fmha_cutlass_sm100a_module(
             dtype_q,
             dtype_kv,
@@ -3821,8 +3818,8 @@ def fmha_v2_prefill_deepseek(
         If return_lse is True, the output will be a tuple of two tensors, the first is the output tensor, the second is the lse tensor.
         If return_lse is False, the output will be a single tensor.
     """
-    if not is_sm120a_supported(query.device):
-        raise ValueError("fmha_v2_prefill_deepseek is only supported on SM120 GPUs.")
+    if not (is_sm120a_supported(query.device) or is_sm121a_supported(query.device)):
+        raise ValueError("fmha_v2_prefill_deepseek is only supported on SM12x GPUs.")
     assert query.shape[3] == 192 and key.shape[3] == 192 and value.shape[3] == 128, (
         "currently only support deepseek r1 192 query and 128 value"
     )
@@ -3849,6 +3846,87 @@ def fmha_v2_prefill_deepseek(
         is_e4m3,
         is_bf16_output,
     )
+    if return_lse:
+        return out, lse
+    else:
+        return out
+
+
+def fmha_v2_prefill_sm120(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    causal: bool = True,
+    sm_scale: Optional[float] = None,
+    return_lse: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    """Standard attention prefill using fmha_v2 HMMA kernels on SM120 GPUs.
+
+    Supports BF16 and FP16 with head_dim 64 or 128 (covers Llama, Qwen,
+    Mistral, and similar architectures). Uses tiled HMMA flash attention
+    kernels compiled for SM120 (RTX 5090, DGX Spark GB10).
+
+    Parameters
+    ----------
+    query : torch.Tensor
+        Query tensor with shape [batch_size, q_seqlen, num_heads, head_dim].
+    key : torch.Tensor
+        Key tensor with shape [batch_size, kv_seqlen, num_kv_heads, head_dim].
+    value : torch.Tensor
+        Value tensor with shape [batch_size, kv_seqlen, num_kv_heads, head_dim].
+    causal : bool
+        Whether to use causal masking.
+    sm_scale : Optional[float]
+        Softmax scale factor. If None, defaults to 1/sqrt(head_dim).
+    return_lse : bool
+        Whether to return the log-sum-exp of attention output.
+
+    Returns
+    -------
+    out : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        Output tensor, or (output, lse) if return_lse is True.
+    """
+    if not (is_sm120a_supported(query.device) or is_sm121a_supported(query.device)):
+        raise ValueError(
+            "fmha_v2_prefill_sm120 is only supported on SM12x GPUs "
+            "(RTX 5090, DGX Spark GB10)."
+        )
+    head_dim = query.shape[3]
+    if head_dim not in (64, 128):
+        raise ValueError(
+            f"fmha_v2_prefill_sm120 only supports head_dim 64 or 128, got {head_dim}."
+        )
+    if query.dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(
+            f"fmha_v2_prefill_sm120 only supports BF16 and FP16, got {query.dtype}."
+        )
+
+    batch_size = query.shape[0]
+    q_seqlen = query.shape[1]
+    num_heads = query.shape[2]
+
+    out = torch.empty(
+        batch_size,
+        q_seqlen,
+        num_heads,
+        head_dim,
+        dtype=query.dtype,
+        device=query.device,
+    )
+    lse = None
+    if return_lse:
+        lse = torch.empty(
+            batch_size, q_seqlen, num_heads, 2, dtype=torch.float32, device=query.device
+        )
+
+    if sm_scale is None:
+        import math
+
+        sm_scale = 1.0 / math.sqrt(head_dim)
+
+    module = get_trtllm_fmha_v2_module()
+    module.run_standard(query, key, value, out, lse, causal, sm_scale)
+
     if return_lse:
         return out, lse
     else:

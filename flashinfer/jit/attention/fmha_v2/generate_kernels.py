@@ -6,6 +6,7 @@ from .generator_utils import (
     InputLayout,
     encode_name,
     enumerate_hmma_flash_kernels,
+    enumerate_hmma_flash_kernels_base,
     enumerate_qmma_flash_kernels,
     generate_files,
 )
@@ -44,11 +45,23 @@ def enumerate_kernels(src_target: Path, gen_dir: Path):
     # Enumerate kernels, emit to generated/ directory
     with working_directory(gen_dir):
         specs: list = []
+        # DeepSeek MLA kernels (192/128 separate-q-k-v)
         enumerate_hmma_flash_kernels(specs, sm=120, dtype="bf16", head_size_v=128)
         enumerate_qmma_flash_kernels(specs, sm=120, dtype="e4m3_fp32", head_sizes=[192])
         enumerate_qmma_flash_kernels(
             specs, sm=120, dtype="e4m3_fp32", head_sizes=[192], output_dtype="bf16"
         )
+        # Standard attention kernels with SEPARATE_Q_K_V layout for SM120
+        # (used by flashinfer which passes Q, K, V as separate tensors)
+        # fp16_fp32 = FP16 data with FP32 accumulator (better accuracy)
+        for std_dtype in ["bf16", "fp16_fp32"]:
+            enumerate_hmma_flash_kernels_base(
+                specs,
+                sm=120,
+                dtype=std_dtype,
+                input_layout=InputLayout.SEPARATE_Q_K_V,
+                enable_attn_logit_softcapping=False,
+            )
 
         # Expand the cartesian product of the list fields "seq_len" and "head_size".
         specs_expanded = []
@@ -142,6 +155,22 @@ def enumerate_kernels(src_target: Path, gen_dir: Path):
                         (kspec.warp_specialization and not kspec.alibi)  # sm90
                         or (not kspec.warp_specialization and kspec.tiled)
                     )  # non-sm90
+                    and not kspec.enable_attn_logit_softcapping
+                )
+                # SM120 standard attention with SEPARATE_Q_K_V layout
+                # (for flashinfer which passes Q, K, V as separate tensors)
+                or (
+                    kspec.sm == 120
+                    and kspec.dtype in ["fp16_fp32", "bf16"]
+                    and kspec.head_size in [64, 128]
+                    and kspec.head_size_v == 0
+                    and kspec.input_layout == InputLayout.SEPARATE_Q_K_V
+                    and kspec.sage_block_sizes is None
+                    and kspec.version == 2
+                    and not kspec.cross_mha
+                    and kspec.flash_attention
+                    and not kspec.warp_specialization
+                    and kspec.tiled
                     and not kspec.enable_attn_logit_softcapping
                 )
                 # SageAttention (warp_spec, head_size in (80, 128), packed QKV, padding mask)
