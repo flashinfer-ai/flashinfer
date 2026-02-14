@@ -33,7 +33,7 @@ namespace norm {
 
 using namespace tensorrt_llm::common;
 
-template <uint32_t VEC_SIZE, typename T>
+template <uint32_t VEC_SIZE, typename T, bool CACHE_INPUT = false>
 __global__ void RMSNormKernel(T* __restrict__ input, T* __restrict__ weight, T* __restrict__ output,
                               const uint32_t d, const uint32_t stride_input,
                               const uint32_t stride_output, float weight_bias, float eps) {
@@ -46,6 +46,8 @@ __global__ void RMSNormKernel(T* __restrict__ input, T* __restrict__ weight, T* 
   const uint32_t num_threads = num_warps * warp_size;
   const uint32_t rounds = ceil_div(d, VEC_SIZE * num_threads);
   extern __shared__ float smem[];
+  const uint32_t smem_reduce_elems = ceil_div(num_warps, 4u) * 4u;
+  [[maybe_unused]] T* smem_input = reinterpret_cast<T*>(smem + smem_reduce_elems);
 
   float sum_sq = 0.f;
 
@@ -56,8 +58,15 @@ __global__ void RMSNormKernel(T* __restrict__ input, T* __restrict__ weight, T* 
   for (uint32_t i = 0; i < rounds; i++) {
     vec_t<T, VEC_SIZE> input_vec;
     input_vec.fill(0.f);
-    if ((i * num_threads + thread_id) * VEC_SIZE < d) {
-      input_vec.load(input + bx * stride_input + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
+    const uint32_t vec_offset = (i * num_threads + thread_id) * VEC_SIZE;
+    if (vec_offset < d) {
+      input_vec.load(input + bx * stride_input + vec_offset);
+      if constexpr (CACHE_INPUT) {
+#pragma unroll
+        for (uint32_t j = 0; j < VEC_SIZE; j++) {
+          smem_input[vec_offset + j] = input_vec[j];
+        }
+      }
     }
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; j++) {
@@ -92,17 +101,21 @@ __global__ void RMSNormKernel(T* __restrict__ input, T* __restrict__ weight, T* 
     vec_t<T, VEC_SIZE> output_vec;
     input_vec.fill(0.f);
     weight_vec.fill(0.f);
-    if ((i * num_threads + thread_id) * VEC_SIZE < d) {
-      input_vec.load(input + bx * stride_input + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
-      weight_vec.load(weight + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
+    const uint32_t vec_offset = (i * num_threads + thread_id) * VEC_SIZE;
+    if (vec_offset < d) {
+      if constexpr (CACHE_INPUT) {
+        input_vec.load(smem_input + vec_offset);
+      } else {
+        input_vec.load(input + bx * stride_input + vec_offset);
+      }
+      weight_vec.load(weight + vec_offset);
     }
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; j++) {
       output_vec[j] = float(input_vec[j]) * rms_rcp * (weight_bias + float(weight_vec[j]));
     }
-    if ((i * num_threads + thread_id) * VEC_SIZE < d) {
-      output_vec.store(output + bx * stride_output + i * num_threads * VEC_SIZE +
-                       thread_id * VEC_SIZE);
+    if (vec_offset < d) {
+      output_vec.store(output + bx * stride_output + vec_offset);
     }
   }
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
@@ -120,9 +133,19 @@ cudaError_t RMSNorm(T* input, T* weight, T* output, uint32_t batch_size, uint32_
   const uint32_t num_warps = ceil_div(block_size, 32);
   dim3 nblks(batch_size);
   dim3 nthrs(32, num_warps);
-  const uint32_t smem_size = num_warps * sizeof(float);
+  const uint32_t smem_reduce_elems = ceil_div(num_warps, 4u) * 4u;
+  const uint32_t smem_size_no_cache = smem_reduce_elems * sizeof(float);
+  const size_t smem_size_with_cache =
+      static_cast<size_t>(smem_size_no_cache) + static_cast<size_t>(d) * sizeof(T);
+  int device;
+  FLASHINFER_CUDA_CALL(cudaGetDevice(&device));
+  int max_smem_per_block;
+  FLASHINFER_CUDA_CALL(
+      cudaDeviceGetAttribute(&max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+  const bool cache_input = smem_size_with_cache <= static_cast<size_t>(max_smem_per_block);
+  const uint32_t smem_size =
+      cache_input ? static_cast<uint32_t>(smem_size_with_cache) : smem_size_no_cache;
   float weight_bias = 0.f;
-  void* args[] = {&input, &weight, &output, &d, &stride_input, &stride_output, &weight_bias, &eps};
 
   cudaLaunchConfig_t config;
   config.gridDim = nblks;
@@ -136,16 +159,24 @@ cudaError_t RMSNorm(T* input, T* weight, T* output, uint32_t batch_size, uint32_
   config.attrs = attrs;
 
   DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
-    auto kernel = RMSNormKernel<VEC_SIZE, T>;
-    FLASHINFER_CUDA_CALL(
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-    FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, input, weight, output, d, stride_input,
-                                            stride_output, weight_bias, eps));
+    if (cache_input) {
+      auto kernel = RMSNormKernel<VEC_SIZE, T, true>;
+      FLASHINFER_CUDA_CALL(
+          cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+      FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, input, weight, output, d,
+                                              stride_input, stride_output, weight_bias, eps));
+    } else {
+      auto kernel = RMSNormKernel<VEC_SIZE, T, false>;
+      FLASHINFER_CUDA_CALL(
+          cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+      FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, input, weight, output, d,
+                                              stride_input, stride_output, weight_bias, eps));
+    }
   });
   return cudaSuccess;
 }
 
-template <uint32_t VEC_SIZE, typename T, typename O>
+template <uint32_t VEC_SIZE, typename T, typename O, bool CACHE_INPUT = false>
 __global__ void RMSNormQuantKernel(T* __restrict__ input, T* __restrict__ weight,
                                    O* __restrict__ output, const uint32_t d,
                                    const uint32_t stride_input, const uint32_t stride_output,
@@ -160,6 +191,8 @@ __global__ void RMSNormQuantKernel(T* __restrict__ input, T* __restrict__ weight
   const uint32_t rounds = ceil_div(d, VEC_SIZE * num_threads);
   const float scale_inv = 1.0f / scale;
   extern __shared__ float smem[];
+  const uint32_t smem_reduce_elems = ceil_div(num_warps, 4u) * 4u;
+  [[maybe_unused]] T* smem_input = reinterpret_cast<T*>(smem + smem_reduce_elems);
 
   float sum_sq = 0.f;
 
@@ -170,8 +203,15 @@ __global__ void RMSNormQuantKernel(T* __restrict__ input, T* __restrict__ weight
   for (uint32_t i = 0; i < rounds; i++) {
     vec_t<T, VEC_SIZE> input_vec;
     input_vec.fill(0.f);
-    if ((i * num_threads + thread_id) * VEC_SIZE < d) {
-      input_vec.load(input + bx * stride_input + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
+    const uint32_t vec_offset = (i * num_threads + thread_id) * VEC_SIZE;
+    if (vec_offset < d) {
+      input_vec.load(input + bx * stride_input + vec_offset);
+      if constexpr (CACHE_INPUT) {
+#pragma unroll
+        for (uint32_t j = 0; j < VEC_SIZE; j++) {
+          smem_input[vec_offset + j] = input_vec[j];
+        }
+      }
     }
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; j++) {
@@ -206,9 +246,14 @@ __global__ void RMSNormQuantKernel(T* __restrict__ input, T* __restrict__ weight
     vec_t<float, VEC_SIZE> output_vec;
     input_vec.fill(0.f);
     weight_vec.fill(0.f);
-    if ((i * num_threads + thread_id) * VEC_SIZE < d) {
-      input_vec.load(input + bx * stride_input + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
-      weight_vec.load(weight + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
+    const uint32_t vec_offset = (i * num_threads + thread_id) * VEC_SIZE;
+    if (vec_offset < d) {
+      if constexpr (CACHE_INPUT) {
+        input_vec.load(smem_input + vec_offset);
+      } else {
+        input_vec.load(input + bx * stride_input + vec_offset);
+      }
+      weight_vec.load(weight + vec_offset);
     }
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; j++) {
@@ -216,9 +261,8 @@ __global__ void RMSNormQuantKernel(T* __restrict__ input, T* __restrict__ weight
           float(input_vec[j]) * rms_rcp * (weight_bias + float(weight_vec[j])) * scale_inv;
       output_vec[j] = fmaxf(-448.0f, fminf(output_vec[j], 448.0f));
     }
-    if ((i * num_threads + thread_id) * VEC_SIZE < d) {
-      output_vec.cast_store(output + bx * stride_output + i * num_threads * VEC_SIZE +
-                            thread_id * VEC_SIZE);
+    if (vec_offset < d) {
+      output_vec.cast_store(output + bx * stride_output + vec_offset);
     }
   }
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
@@ -236,7 +280,18 @@ cudaError_t RMSNormQuant(T* input, T* weight, O* output, uint32_t batch_size, ui
   const uint32_t num_warps = ceil_div(block_size, 32);
   dim3 nblks(batch_size);
   dim3 nthrs(32, num_warps);
-  const uint32_t smem_size = num_warps * sizeof(float);
+  const uint32_t smem_reduce_elems = ceil_div(num_warps, 4u) * 4u;
+  const uint32_t smem_size_no_cache = smem_reduce_elems * sizeof(float);
+  const size_t smem_size_with_cache =
+      static_cast<size_t>(smem_size_no_cache) + static_cast<size_t>(d) * sizeof(T);
+  int device;
+  FLASHINFER_CUDA_CALL(cudaGetDevice(&device));
+  int max_smem_per_block;
+  FLASHINFER_CUDA_CALL(
+      cudaDeviceGetAttribute(&max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+  const bool cache_input = smem_size_with_cache <= static_cast<size_t>(max_smem_per_block);
+  const uint32_t smem_size =
+      cache_input ? static_cast<uint32_t>(smem_size_with_cache) : smem_size_no_cache;
   float weight_bias = 0.f;
 
   cudaLaunchConfig_t config;
@@ -251,11 +306,21 @@ cudaError_t RMSNormQuant(T* input, T* weight, O* output, uint32_t batch_size, ui
   config.attrs = attrs;
 
   DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
-    auto kernel = RMSNormQuantKernel<VEC_SIZE, T, O>;
-    FLASHINFER_CUDA_CALL(
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-    FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, input, weight, output, d, stride_input,
-                                            stride_output, weight_bias, scale, eps));
+    if (cache_input) {
+      auto kernel = RMSNormQuantKernel<VEC_SIZE, T, O, true>;
+      FLASHINFER_CUDA_CALL(
+          cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+      FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, input, weight, output, d,
+                                              stride_input, stride_output, weight_bias, scale,
+                                              eps));
+    } else {
+      auto kernel = RMSNormQuantKernel<VEC_SIZE, T, O, false>;
+      FLASHINFER_CUDA_CALL(
+          cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+      FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, input, weight, output, d,
+                                              stride_input, stride_output, weight_bias, scale,
+                                              eps));
+    }
   });
   return cudaSuccess;
 }
