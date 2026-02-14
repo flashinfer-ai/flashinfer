@@ -56,6 +56,10 @@ CUTLASS_DEVICE void mma_f16(
   Tensor tSrK = threadMmaQK.partition_fragment_B(sK);
   Tensor tOrV = threadMmaPV.partition_fragment_B(sVt);
 
+  // Create identity tensor once, outside loops
+  Tensor cS = cute::make_identity_tensor(select<0, 1>(TileShape_QKD{}));
+  Tensor tScS = threadMmaQK.partition_C(cS);
+
   auto consumer_wait = [](auto& pipeline, auto& smem_pipe_read) {
     auto barrier_token = pipeline.consumer_try_wait(smem_pipe_read);
     pipeline.consumer_wait(smem_pipe_read, barrier_token);
@@ -95,44 +99,43 @@ CUTLASS_DEVICE void mma_f16(
   auto col_limit_left = [&](int qo_idx) {
     return qo_idx + kv_len - qo_len - mainloop_params.window_left;
   };
-  auto mask_multi_item_scoring = [&](decltype(tSrS)& tSrS, int i, int qo_idx, int kv_idx) {
+
+  // Multi-item scoring mask functions
+  auto mask_multi_item_scoring = [&](auto& tSrS_ref, int i, int qo_idx, int kv_idx) {
     const uint32_t idx_in_original_seq = qo_idx + kv_len - qo_len;
     const bool out_of_boundary =
         kv_idx > idx_in_original_seq || (kv_idx >= std::min(kv_len, col_limit_right(qo_idx)));
     const bool is_prefix = idx_in_original_seq < prefix_len;
     uint16_t token_pos_in_items_regs = 0;
-    // Only access idx_in_original_seq >= prefix_len && idx_in_original_seq < kv_len to avoid
-    // out-of-bounds memory access
     if (idx_in_original_seq >= prefix_len & idx_in_original_seq < kv_len) {
       token_pos_in_items_regs = __ldca(token_pos_in_items + idx_in_original_seq - prefix_len);
     }
     if (out_of_boundary || is_prefix) {
-      tSrS(i) = out_of_boundary ? (AttentionUpdater::fill_value) : tSrS(i);
+      tSrS_ref(i) = out_of_boundary ? (AttentionUpdater::fill_value) : tSrS_ref(i);
     } else {
-      tSrS(i) = (kv_idx < prefix_len | (idx_in_original_seq < kv_idx + token_pos_in_items_regs))
-                    ? tSrS(i)
-                    : (AttentionUpdater::fill_value);
+      tSrS_ref(i) = (kv_idx < prefix_len | (idx_in_original_seq < kv_idx + token_pos_in_items_regs))
+                        ? tSrS_ref(i)
+                        : (AttentionUpdater::fill_value);
     }
   };
-  auto mask_multi_item_scoring_assume_in_bound = [&](decltype(tSrS)& tSrS, int i, int qo_idx,
+
+  auto mask_multi_item_scoring_assume_in_bound = [&](auto& tSrS_ref, int i, int qo_idx,
                                                      int kv_idx) {
     const uint32_t idx_in_original_seq = qo_idx + kv_len - qo_len;
     const bool is_prefix = idx_in_original_seq < prefix_len;
     if (is_prefix) {
-      tSrS(i) = AttentionUpdater::fill_value;
+      tSrS_ref(i) = AttentionUpdater::fill_value;
     } else {
       uint16_t token_pos_in_items_regs = 0;
-      // Only access idx_in_original_seq >= prefix_len && idx_in_original_seq < kv_len to avoid
-      // out-of-bounds memory access
       if (idx_in_original_seq >= prefix_len & idx_in_original_seq < kv_len) {
         token_pos_in_items_regs = __ldca(token_pos_in_items + idx_in_original_seq - prefix_len);
       }
-
-      tSrS(i) = (kv_idx < prefix_len | (idx_in_original_seq < kv_idx + token_pos_in_items_regs))
-                    ? tSrS(i)
-                    : (AttentionUpdater::fill_value);
+      tSrS_ref(i) = (kv_idx < prefix_len | (idx_in_original_seq < kv_idx + token_pos_in_items_regs))
+                        ? tSrS_ref(i)
+                        : (AttentionUpdater::fill_value);
     }
   };
+
   auto kv_tile_idx_decrement = [&](int kv_tile_idx) {
     int result = kv_tile_idx - 1;
     if constexpr (MULTIITEMSCORING) {
@@ -143,51 +146,116 @@ CUTLASS_DEVICE void mma_f16(
     }
     return result;
   };
-  {
-    Tensor cS = cute::make_identity_tensor(select<0, 1>(TileShape_QKD{}));
-    Tensor tScS = threadMmaQK.partition_C(cS);
+
+  // ============================================================================
+  // Compile-time specialized mask functions (FA3 style)
+  // ============================================================================
+
+  // Causal mask with seqlen check (first iteration)
+  auto causal_mask_with_seqlen_fn = [&](auto& tSrS_local, int kv_tile) {
 #pragma unroll
-    for (int i = 0; i < size(tSrS); ++i) {
+    for (int i = 0; i < size(tSrS_local); ++i) {
       int qo_idx = get<0>(tScS(i)) + q_tile_idx * CTA_Q;
-      int kv_idx = get<1>(tScS(i)) + kv_tile_idx * CTA_KV;
-      tSrS(i) = variant.LogitsTransform(mainloop_params, tSrS(i), /*batch_idx=*/0, qo_idx, kv_idx,
-                                        qo_head_idx, kv_head_idx);
+      int kv_idx = get<1>(tScS(i)) + kv_tile * CTA_KV;
+      tSrS_local(i) = variant.LogitsTransform(mainloop_params, tSrS_local(i), /*batch_idx=*/0,
+                                              qo_idx, kv_idx, qo_head_idx, kv_head_idx);
       if constexpr (MULTIITEMSCORING) {
-        mask_multi_item_scoring(tSrS, i, qo_idx, kv_idx);
-      } else if constexpr (!CAUSAL) {  // Just masking based on col
+        mask_multi_item_scoring(tSrS_local, i, qo_idx, kv_idx);
+      } else if constexpr (!CAUSAL) {
         if (kv_idx >= kv_len) {
-          tSrS(i) = AttentionUpdater::fill_value;
+          tSrS_local(i) = AttentionUpdater::fill_value;
         }
       } else {
         if (kv_idx >= std::min(kv_len, col_limit_right(qo_idx))) {
-          tSrS(i) = AttentionUpdater::fill_value;
+          tSrS_local(i) = AttentionUpdater::fill_value;
         }
       }
       if constexpr (LEFT_SLIDING_WINDOW) {
         if (kv_idx < col_limit_left(qo_idx)) {
-          tSrS(i) = AttentionUpdater::fill_value;
+          tSrS_local(i) = AttentionUpdater::fill_value;
         }
       }
     }
-  }
+  };
 
+  // Causal mask without seqlen check (masking iterations)
+  auto causal_mask_fn = [&](auto& tSrS_local, int kv_tile) {
+#pragma unroll
+    for (int i = 0; i < size(tSrS_local); ++i) {
+      int qo_idx = get<0>(tScS(i)) + q_tile_idx * CTA_Q;
+      int kv_idx = get<1>(tScS(i)) + kv_tile * CTA_KV;
+      tSrS_local(i) = variant.LogitsTransform(mainloop_params, tSrS_local(i), /*batch_idx=*/0,
+                                              qo_idx, kv_idx, qo_head_idx, kv_head_idx);
+      if constexpr (MULTIITEMSCORING) {
+        mask_multi_item_scoring(tSrS_local, i, qo_idx, kv_idx);
+      } else {
+        if (kv_idx >= col_limit_right(qo_idx)) {
+          tSrS_local(i) = AttentionUpdater::fill_value;
+        }
+      }
+      if constexpr (LEFT_SLIDING_WINDOW) {
+        if (kv_idx < col_limit_left(qo_idx)) {
+          tSrS_local(i) = AttentionUpdater::fill_value;
+        }
+      }
+    }
+  };
+
+  // No mask function (main loop - no causal boundary)
+  auto no_mask_fn = [&](auto& tSrS_local, int kv_tile) {
+#pragma unroll
+    for (int i = 0; i < size(tSrS_local); ++i) {
+      int qo_idx = get<0>(tScS(i)) + q_tile_idx * CTA_Q;
+      int kv_idx = get<1>(tScS(i)) + kv_tile * CTA_KV;
+      tSrS_local(i) = variant.LogitsTransform(mainloop_params, tSrS_local(i), /*batch_idx=*/0,
+                                              qo_idx, kv_idx, qo_head_idx, kv_head_idx);
+    }
+    if constexpr (MULTIITEMSCORING) {
+      if (kv_tile >= num_kv_tiles_prefix - 1) {
+#pragma unroll
+        for (int i = 0; i < size(tSrS_local); ++i) {
+          int qo_idx = get<0>(tScS(i)) + q_tile_idx * CTA_Q;
+          int kv_idx = get<1>(tScS(i)) + kv_tile * CTA_KV;
+          mask_multi_item_scoring_assume_in_bound(tSrS_local, i, qo_idx, kv_idx);
+        }
+      }
+    }
+  };
+
+  // Sliding window left mask function
+  auto swa_left_mask_fn = [&](auto& tSrS_local, int kv_tile) {
+#pragma unroll
+    for (int i = 0; i < size(tSrS_local); ++i) {
+      int qo_idx = get<0>(tScS(i)) + q_tile_idx * CTA_Q;
+      int kv_idx = get<1>(tScS(i)) + kv_tile * CTA_KV;
+      tSrS_local(i) = variant.LogitsTransform(mainloop_params, tSrS_local(i), /*batch_idx=*/0,
+                                              qo_idx, kv_idx, qo_head_idx, kv_head_idx);
+      if (kv_idx < col_limit_left(qo_idx)) {
+        tSrS_local(i) = AttentionUpdater::fill_value;
+      }
+    }
+  };
+
+  // ============================================================================
+  // First iteration (with seqlen check)
+  // ============================================================================
+  causal_mask_with_seqlen_fn(tSrS, kv_tile_idx);
   attention_updater.update</*init=*/true>(tSrS);
   Tensor tOrP = make_tensor(convert_type<DTypeKV>(tSrS).data(),
                             convert_layout_acc_Aregs<typename Ktraits::TiledMmaPV>(tSrS.layout()));
 
-  constexpr int n_masking_steps = MULTIITEMSCORING ? (cute::ceil_div(CTA_Q, CTA_KV) + 1)
-                                                   : (CAUSAL ? cute::ceil_div(CTA_Q, CTA_KV) : 0);
-  // masking loops
-  // ziangl@nvidia.com: for multi item scoring, we use this loop only to mask along the diagonal
-#pragma unroll
-  for (int masking_step = 0; masking_step < n_masking_steps && kv_tile_idx > swa_begin_kv_tile_idx;
-       ++masking_step, kv_tile_idx = kv_tile_idx_decrement(kv_tile_idx)) {
-    Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_QKD{}));
+  // ============================================================================
+  // Forward step with compile-time specialized mask function
+  // ============================================================================
+  auto fwd_step = [&](int kv_tile, auto mask_fn, auto is_first_type) {
+    static constexpr bool Is_first = decltype(is_first_type)::value;
+
+    Tensor tSrS_local = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_QKD{}));
     consumer_wait(pipeline_k, smem_pipe_read_k);
     WarpScheduler::barrier_sync();
     gemm</*init=*/true, /*wg_wait=*/-1>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read_k.index()),
-                                        tSrS);
-    if (masking_step > 0) {
+                                        tSrS_local);
+    if constexpr (!Is_first) {
       attention_updater.rescale_o(tOrO);
     }
     consumer_wait(pipeline_v, smem_pipe_read_v);
@@ -195,123 +263,55 @@ CUTLASS_DEVICE void mma_f16(
                                          tOrV(_, _, _, smem_pipe_read_v.index()), tOrO);
     WarpScheduler::barrier_arrive();
     warpgroup_wait<1>();
-    pipeline_k.consumer_release(smem_pipe_read_k);  // release K
-    Tensor cS = cute::make_identity_tensor(select<0, 1>(TileShape_QKD{}));
-    Tensor tScS = threadMmaQK.partition_C(cS);
-#pragma unroll
-    for (int i = 0; i < size(tSrS); ++i) {
-      int qo_idx = get<0>(tScS(i)) + q_tile_idx * CTA_Q;
-      int kv_idx = get<1>(tScS(i)) + kv_tile_idx_decrement(kv_tile_idx) * CTA_KV;
-      tSrS(i) = variant.LogitsTransform(mainloop_params, tSrS(i), /*batch_idx=*/0, qo_idx, kv_idx,
-                                        qo_head_idx, kv_head_idx);
-      if (MULTIITEMSCORING) {
-        mask_multi_item_scoring(tSrS, i, qo_idx, kv_idx);
-      } else {
-        if (kv_idx >= col_limit_right(qo_idx)) {
-          tSrS(i) = AttentionUpdater::fill_value;
-        }
-      }
-      if constexpr (LEFT_SLIDING_WINDOW) {
-        if (kv_idx < col_limit_left(qo_idx)) {
-          tSrS(i) = AttentionUpdater::fill_value;
-        }
-      }
-    }
-    attention_updater.update</*init=*/false>(tSrS);
+    pipeline_k.consumer_release(smem_pipe_read_k);
+
+    // Apply mask function (compile-time specialized)
+    mask_fn(tSrS_local, kv_tile);
+
+    attention_updater.template update</*init=*/Is_first>(tSrS_local);
     warpgroup_wait<0>();
-    pipeline_v.consumer_release(smem_pipe_read_v);  // release V
+    pipeline_v.consumer_release(smem_pipe_read_v);
     ++smem_pipe_read_k;
     ++smem_pipe_read_v;
-    cute::copy(make_tensor(convert_type<DTypeKV>(tSrS).data(),
-                           convert_layout_acc_Aregs<typename Ktraits::TiledMmaPV>(tSrS.layout())),
-               tOrP);
+    cute::copy(
+        make_tensor(convert_type<DTypeKV>(tSrS_local).data(),
+                    convert_layout_acc_Aregs<typename Ktraits::TiledMmaPV>(tSrS_local.layout())),
+        tOrP);
+  };
+
+  constexpr int n_masking_steps = MULTIITEMSCORING ? (cute::ceil_div(CTA_Q, CTA_KV) + 1)
+                                                   : (CAUSAL ? cute::ceil_div(CTA_Q, CTA_KV) : 0);
+
+  // ============================================================================
+  // Masking loop (causal boundary iterations)
+  // ============================================================================
+#pragma unroll 1
+  for (int masking_step = 0; masking_step < n_masking_steps && kv_tile_idx > swa_begin_kv_tile_idx;
+       ++masking_step, kv_tile_idx = kv_tile_idx_decrement(kv_tile_idx)) {
+    fwd_step(kv_tile_idx_decrement(kv_tile_idx), causal_mask_fn, cute::false_type{});
   }
 
+  // ============================================================================
+  // Main loop (no causal masking needed)
+  // ============================================================================
 #pragma unroll 1
   for (; kv_tile_idx > swa_end_kv_tile_idx + 1; kv_tile_idx = kv_tile_idx_decrement(kv_tile_idx)) {
-    Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_QKD{}));
-    consumer_wait(pipeline_k, smem_pipe_read_k);
-    WarpScheduler::barrier_sync();
-    gemm</*init=*/true, /*wg_wait=*/-1>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read_k.index()),
-                                        tSrS);
-    attention_updater.rescale_o(tOrO);
-    consumer_wait(pipeline_v, smem_pipe_read_v);
-    gemm</*init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, tOrP,
-                                         tOrV(_, _, _, smem_pipe_read_v.index()), tOrO);
-    WarpScheduler::barrier_arrive();
-    warpgroup_wait<1>();
-    pipeline_k.consumer_release(smem_pipe_read_k);  // release K
-                                                    // #pragma unroll
-    Tensor cS = cute::make_identity_tensor(select<0, 1>(TileShape_QKD{}));
-    Tensor tScS = threadMmaQK.partition_C(cS);
-#pragma unroll
-    for (int i = 0; i < size(tSrS); ++i) {
-      int qo_idx = get<0>(tScS(i)) + q_tile_idx * CTA_Q;
-      int kv_idx = get<1>(tScS(i)) + kv_tile_idx_decrement(kv_tile_idx) * CTA_KV;
-      tSrS(i) = variant.LogitsTransform(mainloop_params, tSrS(i), /*batch_idx=*/0, qo_idx, kv_idx,
-                                        qo_head_idx, kv_head_idx);
-    }
-    if constexpr (MULTIITEMSCORING) {
-      // auto nums_tiles_outside_causal_diagonal = kv_tile_idx_count - cute::ceil_div(CTA_Q,
-      // CTA_KV);
-      if (kv_tile_idx >= num_kv_tiles_prefix - 1) {
-#pragma unroll
-        for (int i = 0; i < size(tSrS); ++i) {
-          int qo_idx = get<0>(tScS(i)) + q_tile_idx * CTA_Q;
-          int kv_idx = get<1>(tScS(i)) + kv_tile_idx_decrement(kv_tile_idx) * CTA_KV;
-          mask_multi_item_scoring_assume_in_bound(tSrS, i, qo_idx, kv_idx);
-        }
-      }
-    }
-    attention_updater.update</*init=*/false>(tSrS);
-    warpgroup_wait<0>();
-    pipeline_v.consumer_release(smem_pipe_read_v);  // release V
-    ++smem_pipe_read_k;
-    ++smem_pipe_read_v;
-    cute::copy(make_tensor(convert_type<DTypeKV>(tSrS).data(),
-                           convert_layout_acc_Aregs<typename Ktraits::TiledMmaPV>(tSrS.layout())),
-               tOrP);
+    fwd_step(kv_tile_idx_decrement(kv_tile_idx), no_mask_fn, cute::false_type{});
   }
 
+  // ============================================================================
+  // Sliding window left mask loop (if enabled)
+  // ============================================================================
   if constexpr (LEFT_SLIDING_WINDOW) {
 #pragma unroll 1
     for (; kv_tile_idx > swa_begin_kv_tile_idx; --kv_tile_idx) {
-      Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_QKD{}));
-      consumer_wait(pipeline_k, smem_pipe_read_k);
-      WarpScheduler::barrier_sync();
-      gemm</*init=*/true, /*wg_wait=*/-1>(tiled_mma_qk, tSrQ,
-                                          tSrK(_, _, _, smem_pipe_read_k.index()), tSrS);
-      attention_updater.rescale_o(tOrO);
-      consumer_wait(pipeline_v, smem_pipe_read_v);
-      gemm</*init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, tOrP,
-                                           tOrV(_, _, _, smem_pipe_read_v.index()), tOrO);
-      WarpScheduler::barrier_arrive();
-      warpgroup_wait<1>();
-      pipeline_k.consumer_release(smem_pipe_read_k);  // release K
-      Tensor cS = cute::make_identity_tensor(select<0, 1>(TileShape_QKD{}));
-      Tensor tScS = threadMmaQK.partition_C(cS);
-#pragma unroll
-      for (int i = 0; i < size(tSrS); ++i) {
-        int qo_idx = get<0>(tScS(i)) + q_tile_idx * CTA_Q;
-        int kv_idx = get<1>(tScS(i)) + (kv_tile_idx - 1) * CTA_KV;
-        tSrS(i) = variant.LogitsTransform(mainloop_params, tSrS(i), /*batch_idx=*/0, qo_idx, kv_idx,
-                                          qo_head_idx, kv_head_idx);
-        if (kv_idx < col_limit_left(qo_idx)) {
-          tSrS(i) = AttentionUpdater::fill_value;
-        }
-      }
-      attention_updater.update</*init=*/false>(tSrS);
-      warpgroup_wait<0>();
-      pipeline_v.consumer_release(smem_pipe_read_v);  // release V
-      ++smem_pipe_read_k;
-      ++smem_pipe_read_v;
-      cute::copy(make_tensor(convert_type<DTypeKV>(tSrS).data(),
-                             convert_layout_acc_Aregs<typename Ktraits::TiledMmaPV>(tSrS.layout())),
-                 tOrP);
+      fwd_step(kv_tile_idx - 1, swa_left_mask_fn, cute::false_type{});
     }
   }
 
-  // Tell warp 0 that smem_q is ready
+  // ============================================================================
+  // Epilogue: final V gemm
+  // ============================================================================
   cutlass::arch::NamedBarrier::arrive(NUM_MMA_THREADS + Ktraits::NUM_PRODUCER_THREADS,
                                       /*id=*/static_cast<int>(NamedBarriers::kQueryEmpty));
   attention_updater.rescale_o(tOrO);
@@ -320,7 +320,7 @@ CUTLASS_DEVICE void mma_f16(
                                        tOrO);
   attention_updater.finalize(tSrS, get_variant_scale_pv(variant));
   warpgroup_wait<0>();
-  pipeline_v.consumer_release(smem_pipe_read_v);  // release V, otherwise producers will hang
+  pipeline_v.consumer_release(smem_pipe_read_v);
   ++smem_pipe_read_v;
 
   attention_updater.rescale_o(tOrO);
