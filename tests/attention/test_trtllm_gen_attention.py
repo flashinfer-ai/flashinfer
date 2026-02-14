@@ -544,8 +544,8 @@ def _test_trtllm_batch_prefill(
     else:
         q_input = q.contiguous()
 
-    # Using 0.0 threshold should give the same result as normal attention.
-    skip_softmax_threshold_scale_factor = 0.0 if skips_softmax else None
+    # Using a tiny threshold should give the same result as normal attention.
+    skip_softmax_threshold_scale_factor = 1e-30 if skips_softmax else None
 
     output = flashinfer.prefill.trtllm_batch_context_with_kv_cache(
         q_input,
@@ -959,8 +959,8 @@ def _test_trtllm_batch_decode(
     else:
         q_input = q.contiguous()
 
-    # Using 0.0 threshold should give the same result as normal attention.
-    skip_softmax_threshold_scale_factor = 0.0 if skips_softmax else None
+    # Using a tiny threshold should give the same result as normal attention.
+    skip_softmax_threshold_scale_factor = 1e-30 if skips_softmax else None
 
     output = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
         q_input,
@@ -1383,8 +1383,9 @@ def test_trtllm_batch_decode_long_sequence_length(
 @pytest.mark.parametrize("num_kv_heads", [16, 32])
 @pytest.mark.parametrize("head_grp_size", [1, 5, 8])
 @pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("skips_softmax", [False, True])
 def test_trtllm_gen_prefill_deepseek(
-    batch_size, s_qo, s_kv, num_kv_heads, head_grp_size, causal
+    batch_size, s_qo, s_kv, num_kv_heads, head_grp_size, causal, skips_softmax
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] != 10:
@@ -1473,6 +1474,10 @@ def test_trtllm_gen_prefill_deepseek(
 
     bmm1_scale = scale
     bmm2_scale = 1.0
+
+    # Using a tiny threshold should give the same result as normal attention.
+    skip_softmax_threshold_scale_factor = 1e-30 if skips_softmax else None
+
     output_trtllm, lse_trtllm = flashinfer.prefill.trtllm_ragged_attention_deepseek(
         q,
         k_cache,
@@ -1491,6 +1496,7 @@ def test_trtllm_gen_prefill_deepseek(
         False,
         causal,
         True,
+        skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
         out=output,
     )
     torch.testing.assert_close(
@@ -1516,11 +1522,12 @@ def test_trtllm_gen_prefill_deepseek(
 @pytest.mark.parametrize("num_kv_heads", [128])
 @pytest.mark.parametrize("head_grp_size", [1])
 @pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("skips_softmax", [False, True])
 def test_trtllm_gen_prefill_deepseek_bs1(
-    batch_size, s_qo, s_kv, num_kv_heads, head_grp_size, causal
+    batch_size, s_qo, s_kv, num_kv_heads, head_grp_size, causal, skips_softmax
 ):
     test_trtllm_gen_prefill_deepseek(
-        batch_size, s_qo, s_kv, num_kv_heads, head_grp_size, causal
+        batch_size, s_qo, s_kv, num_kv_heads, head_grp_size, causal, skips_softmax
     )
 
 
