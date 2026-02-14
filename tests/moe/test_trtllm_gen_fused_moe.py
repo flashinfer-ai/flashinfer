@@ -2667,8 +2667,8 @@ def run_moe_test(
 @pytest.mark.parametrize(
     "activation_type",
     [
-        pytest.param(ActivationType.Swiglu, id="Swiglu"),
-        pytest.param(ActivationType.Geglu, id="Geglu"),
+        pytest.param(ActivationType.Swiglu.value, id="Swiglu"),
+        pytest.param(ActivationType.Geglu.value, id="Geglu"),
     ],
 )
 def test_renormalize_routing(
@@ -2855,9 +2855,9 @@ def test_renormalize_routing(
 @pytest.mark.parametrize(
     "activation_type",
     [
-        pytest.param(ActivationType.Swiglu, id="Swiglu"),
-        pytest.param(ActivationType.Geglu, id="Geglu"),
-        pytest.param(ActivationType.Relu2, id="Relu2"),
+        pytest.param(ActivationType.Swiglu.value, id="Swiglu"),
+        pytest.param(ActivationType.Geglu.value, id="Geglu"),
+        pytest.param(ActivationType.Relu2.value, id="Relu2"),
     ],
 )
 def test_deepseekv3_routing(
@@ -2931,8 +2931,8 @@ def test_deepseekv3_routing(
 @pytest.mark.parametrize(
     "activation_type",
     [
-        pytest.param(ActivationType.Swiglu, id="Swiglu"),
-        pytest.param(ActivationType.Geglu, id="Geglu"),
+        pytest.param(ActivationType.Swiglu.value, id="Swiglu"),
+        pytest.param(ActivationType.Geglu.value, id="Geglu"),
     ],
 )
 def test_topk_routing(
@@ -3005,7 +3005,7 @@ def test_topk_routing(
 @pytest.mark.parametrize(
     "activation_type",
     [
-        pytest.param(ActivationType.Swiglu, id="Swiglu"),
+        pytest.param(ActivationType.Swiglu.value, id="Swiglu"),
     ],
 )
 def test_llama4_routing(
