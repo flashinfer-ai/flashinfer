@@ -52,9 +52,11 @@ from .jit.fused_moe import (
 from .jit.gemm import (
     gen_gemm_module,
     gen_gemm_sm90_module,
+    gen_fp8_blockscale_gemm_sm90_module,
     gen_gemm_sm100_module,
     gen_gemm_sm100_module_cutlass_fp4,
     gen_gemm_sm100_module_cutlass_fp8,
+    gen_gemm_sm100_module_cutlass_mxfp8,
     gen_tgv_gemm_sm10x_module,
     gen_gemm_sm120_module,
     gen_gemm_sm120_module_cutlass_fp4,
@@ -476,6 +478,8 @@ def gen_all_modules(
         jit_specs.append(gen_gemm_module())
         if has_sm90:
             jit_specs.append(gen_gemm_sm90_module())
+            # fp8 blockscale GEMM (SM90)
+            jit_specs.append(gen_fp8_blockscale_gemm_sm90_module())
             jit_specs.append(gen_fp4_quantization_sm90_module())
             jit_specs.append(gen_cutlass_fused_moe_sm90_module())
         if has_sm100:
@@ -484,6 +488,7 @@ def gen_all_modules(
             jit_specs.append(gen_gemm_sm100_module())
             jit_specs.append(gen_gemm_sm100_module_cutlass_fp4())
             jit_specs.append(gen_gemm_sm100_module_cutlass_fp8())
+            jit_specs.append(gen_gemm_sm100_module_cutlass_mxfp8())
             # Add TGV GEMM modules for both bf16 and fp16
             jit_specs.append(
                 gen_tgv_gemm_sm10x_module(torch.bfloat16, use_sm_100f=False)

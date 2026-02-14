@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import contextlib
 import importlib.util
 
 from .version import __version__ as __version__
@@ -84,6 +85,13 @@ from .fused_moe import (
     trtllm_fp8_block_scale_moe,
     trtllm_fp8_per_tensor_scale_moe,
 )
+
+# CuteDSL MoE high-level APIs (conditionally if cute_dsl available)
+with contextlib.suppress(ImportError):
+    from .fused_moe import (
+        cute_dsl_fused_moe_nvfp4 as cute_dsl_fused_moe_nvfp4,
+        CuteDslMoEWrapper as CuteDslMoEWrapper,
+    )
 from .gdn_prefill import chunk_gated_delta_rule as chunk_gated_delta_rule
 from .gemm import SegmentGEMMWrapper as SegmentGEMMWrapper
 from .gemm import bmm_bf16 as bmm_bf16
@@ -92,6 +100,7 @@ from .gemm import bmm_mxfp8 as bmm_mxfp8
 from .gemm import mm_bf16 as mm_bf16
 from .gemm import mm_fp4 as mm_fp4
 from .gemm import mm_fp8 as mm_fp8
+from .gemm import mm_mxfp8 as mm_mxfp8
 from .gemm import tgv_gemm_sm100 as tgv_gemm_sm100
 from .mla import BatchMLAPagedAttentionWrapper as BatchMLAPagedAttentionWrapper
 from .norm import fused_add_rmsnorm as fused_add_rmsnorm
