@@ -17,6 +17,7 @@
 #define FLASHINFER_NORM_CUH_
 
 #include <cstdint>
+#include <cstdlib>
 #include <numeric>
 
 #include "flashinfer/trtllm/common/cudaTypeUtils.cuh"
@@ -32,6 +33,39 @@ namespace flashinfer {
 namespace norm {
 
 using namespace tensorrt_llm::common;
+
+inline int GetRMSNormNumWarpsOverrideFromEnv() {
+  static int num_warps_override = []() -> int {
+    const char* env = std::getenv("FLASHINFER_RMSNORM_NUM_WARPS");
+    if (env == nullptr || env[0] == 0) {
+      return 0;
+    }
+    char* end = nullptr;
+    unsigned long parsed = std::strtoul(env, &end, 10);
+    if (end == env || *end != 0 || parsed == 0) {
+      return 0;
+    }
+    return static_cast<int>(parsed);
+  }();
+  return num_warps_override;
+}
+
+inline uint32_t GetRMSNormNumWarps(uint32_t d, uint32_t vec_size) {
+  const uint32_t max_threads = std::max<uint32_t>(32u, std::min<uint32_t>(1024u, d / vec_size));
+  const uint32_t max_num_warps = ceil_div(max_threads, 32u);
+
+  const int override = GetRMSNormNumWarpsOverrideFromEnv();
+  if (override > 0) {
+    return std::min<uint32_t>(max_num_warps, static_cast<uint32_t>(override));
+  }
+
+  const uint32_t vec_chunks = d / vec_size;
+  uint32_t target_threads = ceil_div(vec_chunks, 4u);
+  target_threads = ceil_div(target_threads, 32u) * 32u;
+  target_threads = std::max<uint32_t>(32u, std::min<uint32_t>(256u, target_threads));
+  target_threads = std::min<uint32_t>(target_threads, max_threads);
+  return std::max<uint32_t>(1u, ceil_div(target_threads, 32u));
+}
 
 template <uint32_t VEC_SIZE, typename T, bool CACHE_INPUT = false>
 __global__ void RMSNormKernel(T* __restrict__ input, T* __restrict__ weight, T* __restrict__ output,
@@ -129,8 +163,7 @@ cudaError_t RMSNorm(T* input, T* weight, T* output, uint32_t batch_size, uint32_
                     bool enable_pdl = false, cudaStream_t stream = 0) {
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
-  const uint32_t block_size = std::min<uint32_t>(1024, d / vec_size);
-  const uint32_t num_warps = ceil_div(block_size, 32);
+  const uint32_t num_warps = GetRMSNormNumWarps(d, vec_size);
   dim3 nblks(batch_size);
   dim3 nthrs(32, num_warps);
   const uint32_t smem_reduce_elems = ceil_div(num_warps, 4u) * 4u;
@@ -276,8 +309,7 @@ cudaError_t RMSNormQuant(T* input, T* weight, O* output, uint32_t batch_size, ui
                          float eps = 1e-5, bool enable_pdl = false, cudaStream_t stream = 0) {
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
-  const uint32_t block_size = std::min<uint32_t>(1024, d / vec_size);
-  const uint32_t num_warps = ceil_div(block_size, 32);
+  const uint32_t num_warps = GetRMSNormNumWarps(d, vec_size);
   dim3 nblks(batch_size);
   dim3 nthrs(32, num_warps);
   const uint32_t smem_reduce_elems = ceil_div(num_warps, 4u) * 4u;
@@ -718,8 +750,7 @@ cudaError_t GemmaRMSNorm(T* input, T* weight, T* output, uint32_t batch_size, ui
                          bool enable_pdl = false, cudaStream_t stream = 0) {
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
-  const uint32_t block_size = std::min<uint32_t>(1024, d / vec_size);
-  const uint32_t num_warps = ceil_div(block_size, 32);
+  const uint32_t num_warps = GetRMSNormNumWarps(d, vec_size);
   dim3 nblks(batch_size);
   dim3 nthrs(32, num_warps);
   const uint32_t smem_size = num_warps * sizeof(float);
