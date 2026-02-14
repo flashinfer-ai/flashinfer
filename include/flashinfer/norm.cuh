@@ -16,8 +16,11 @@
 #ifndef FLASHINFER_NORM_CUH_
 #define FLASHINFER_NORM_CUH_
 
+#include <atomic>
+#include <cerrno>
 #include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <numeric>
 
 #include "flashinfer/trtllm/common/cudaTypeUtils.cuh"
@@ -41,8 +44,10 @@ inline int GetRMSNormNumWarpsOverrideFromEnv() {
       return 0;
     }
     char* end = nullptr;
+    errno = 0;
     unsigned long parsed = std::strtoul(env, &end, 10);
-    if (end == env || *end != 0 || parsed == 0) {
+    if (end == env || *end != 0 || parsed == 0 || errno == ERANGE ||
+        parsed > static_cast<unsigned long>(std::numeric_limits<int>::max())) {
       return 0;
     }
     return static_cast<int>(parsed);
@@ -65,6 +70,27 @@ inline uint32_t GetRMSNormNumWarps(uint32_t d, uint32_t vec_size) {
   target_threads = std::max<uint32_t>(32u, std::min<uint32_t>(256u, target_threads));
   target_threads = std::min<uint32_t>(target_threads, max_threads);
   return std::max<uint32_t>(1u, ceil_div(target_threads, 32u));
+}
+
+// Thread-safe per-process cache. Assumes each process uses one active CUDA device.
+inline int GetRMSNormMaxSharedMemoryPerBlockOptin() {
+  static std::atomic<int> max_smem_per_block{0};
+  int cached = max_smem_per_block.load(std::memory_order_relaxed);
+  if (cached == 0) {
+    constexpr int kDefaultSmemLimit = 48 * 1024;
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) {
+      return kDefaultSmemLimit;
+    }
+    int queried = 0;
+    if (cudaDeviceGetAttribute(&queried, cudaDevAttrMaxSharedMemoryPerBlockOptin, device) !=
+        cudaSuccess) {
+      return kDefaultSmemLimit;
+    }
+    cached = queried;
+    max_smem_per_block.store(cached, std::memory_order_relaxed);
+  }
+  return cached;
 }
 
 template <uint32_t VEC_SIZE, typename T, bool CACHE_INPUT = false>
@@ -170,11 +196,7 @@ cudaError_t RMSNorm(T* input, T* weight, T* output, uint32_t batch_size, uint32_
   const uint32_t smem_size_no_cache = smem_reduce_elems * sizeof(float);
   const size_t smem_size_with_cache =
       static_cast<size_t>(smem_size_no_cache) + static_cast<size_t>(d) * sizeof(T);
-  int device;
-  FLASHINFER_CUDA_CALL(cudaGetDevice(&device));
-  int max_smem_per_block;
-  FLASHINFER_CUDA_CALL(
-      cudaDeviceGetAttribute(&max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+  const int max_smem_per_block = GetRMSNormMaxSharedMemoryPerBlockOptin();
   const bool cache_input = smem_size_with_cache <= static_cast<size_t>(max_smem_per_block);
   const uint32_t smem_size =
       cache_input ? static_cast<uint32_t>(smem_size_with_cache) : smem_size_no_cache;
@@ -194,14 +216,18 @@ cudaError_t RMSNorm(T* input, T* weight, T* output, uint32_t batch_size, uint32_
   DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
     if (cache_input) {
       auto kernel = RMSNormKernel<VEC_SIZE, T, true>;
-      FLASHINFER_CUDA_CALL(
-          cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+      if (smem_size > 48 * 1024) {
+        FLASHINFER_CUDA_CALL(
+            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+      }
       FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, input, weight, output, d,
                                               stride_input, stride_output, weight_bias, eps));
     } else {
       auto kernel = RMSNormKernel<VEC_SIZE, T, false>;
-      FLASHINFER_CUDA_CALL(
-          cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+      if (smem_size > 48 * 1024) {
+        FLASHINFER_CUDA_CALL(
+            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+      }
       FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, input, weight, output, d,
                                               stride_input, stride_output, weight_bias, eps));
     }
@@ -316,11 +342,7 @@ cudaError_t RMSNormQuant(T* input, T* weight, O* output, uint32_t batch_size, ui
   const uint32_t smem_size_no_cache = smem_reduce_elems * sizeof(float);
   const size_t smem_size_with_cache =
       static_cast<size_t>(smem_size_no_cache) + static_cast<size_t>(d) * sizeof(T);
-  int device;
-  FLASHINFER_CUDA_CALL(cudaGetDevice(&device));
-  int max_smem_per_block;
-  FLASHINFER_CUDA_CALL(
-      cudaDeviceGetAttribute(&max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+  const int max_smem_per_block = GetRMSNormMaxSharedMemoryPerBlockOptin();
   const bool cache_input = smem_size_with_cache <= static_cast<size_t>(max_smem_per_block);
   const uint32_t smem_size =
       cache_input ? static_cast<uint32_t>(smem_size_with_cache) : smem_size_no_cache;
@@ -340,15 +362,19 @@ cudaError_t RMSNormQuant(T* input, T* weight, O* output, uint32_t batch_size, ui
   DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
     if (cache_input) {
       auto kernel = RMSNormQuantKernel<VEC_SIZE, T, O, true>;
-      FLASHINFER_CUDA_CALL(
-          cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+      if (smem_size > 48 * 1024) {
+        FLASHINFER_CUDA_CALL(
+            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+      }
       FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, input, weight, output, d,
                                               stride_input, stride_output, weight_bias, scale,
                                               eps));
     } else {
       auto kernel = RMSNormQuantKernel<VEC_SIZE, T, O, false>;
-      FLASHINFER_CUDA_CALL(
-          cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+      if (smem_size > 48 * 1024) {
+        FLASHINFER_CUDA_CALL(
+            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+      }
       FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, input, weight, output, d,
                                               stride_input, stride_output, weight_bias, scale,
                                               eps));
@@ -753,9 +779,15 @@ cudaError_t GemmaRMSNorm(T* input, T* weight, T* output, uint32_t batch_size, ui
   const uint32_t num_warps = GetRMSNormNumWarps(d, vec_size);
   dim3 nblks(batch_size);
   dim3 nthrs(32, num_warps);
-  const uint32_t smem_size = num_warps * sizeof(float);
+  const uint32_t smem_reduce_elems = ceil_div(num_warps, 4u) * 4u;
+  const uint32_t smem_size_no_cache = smem_reduce_elems * sizeof(float);
+  const size_t smem_size_with_cache =
+      static_cast<size_t>(smem_size_no_cache) + static_cast<size_t>(d) * sizeof(T);
+  const int max_smem_per_block = GetRMSNormMaxSharedMemoryPerBlockOptin();
+  const bool cache_input = smem_size_with_cache <= static_cast<size_t>(max_smem_per_block);
+  const uint32_t smem_size =
+      cache_input ? static_cast<uint32_t>(smem_size_with_cache) : smem_size_no_cache;
   float weight_bias = 1.f;
-  void* args[] = {&input, &weight, &output, &d, &stride_input, &stride_output, &weight_bias, &eps};
 
   cudaLaunchConfig_t config;
   config.gridDim = nblks;
@@ -769,11 +801,23 @@ cudaError_t GemmaRMSNorm(T* input, T* weight, T* output, uint32_t batch_size, ui
   config.attrs = attrs;
 
   DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
-    auto kernel = RMSNormKernel<VEC_SIZE, T>;
-    FLASHINFER_CUDA_CALL(
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-    FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, input, weight, output, d, stride_input,
-                                            stride_output, weight_bias, eps));
+    if (cache_input) {
+      auto kernel = RMSNormKernel<VEC_SIZE, T, true>;
+      if (smem_size > 48 * 1024) {
+        FLASHINFER_CUDA_CALL(
+            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+      }
+      FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, input, weight, output, d,
+                                              stride_input, stride_output, weight_bias, eps));
+    } else {
+      auto kernel = RMSNormKernel<VEC_SIZE, T, false>;
+      if (smem_size > 48 * 1024) {
+        FLASHINFER_CUDA_CALL(
+            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+      }
+      FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, input, weight, output, d,
+                                              stride_input, stride_output, weight_bias, eps));
+    }
   });
   return cudaSuccess;
 }
