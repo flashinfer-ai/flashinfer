@@ -72,23 +72,32 @@ inline uint32_t GetRMSNormNumWarps(uint32_t d, uint32_t vec_size) {
   return std::max<uint32_t>(1u, ceil_div(target_threads, 32u));
 }
 
-// Thread-safe per-process cache. Assumes each process uses one active CUDA device.
+// Thread-safe per-process cache. Supports multiple CUDA devices in one process.
 inline int GetRMSNormMaxSharedMemoryPerBlockOptin() {
-  static std::atomic<int> max_smem_per_block{0};
-  int cached = max_smem_per_block.load(std::memory_order_relaxed);
+  constexpr int kDefaultSmemLimit = 48 * 1024;
+  int device = 0;
+  if (cudaGetDevice(&device) != cudaSuccess || device < 0) {
+    return kDefaultSmemLimit;
+  }
+
+  constexpr int kMaxCachedDevices = 32;
+  static std::atomic<int> max_smem_per_block[kMaxCachedDevices]{};
+
+  int cached = 0;
+  if (device < kMaxCachedDevices) {
+    cached = max_smem_per_block[device].load(std::memory_order_relaxed);
+  }
+
   if (cached == 0) {
-    constexpr int kDefaultSmemLimit = 48 * 1024;
-    int device = 0;
-    if (cudaGetDevice(&device) != cudaSuccess) {
-      return kDefaultSmemLimit;
-    }
     int queried = 0;
     if (cudaDeviceGetAttribute(&queried, cudaDevAttrMaxSharedMemoryPerBlockOptin, device) !=
         cudaSuccess) {
       return kDefaultSmemLimit;
     }
     cached = queried;
-    max_smem_per_block.store(cached, std::memory_order_relaxed);
+    if (device < kMaxCachedDevices) {
+      max_smem_per_block[device].store(cached, std::memory_order_relaxed);
+    }
   }
   return cached;
 }
