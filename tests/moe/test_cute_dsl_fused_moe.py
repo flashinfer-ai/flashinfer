@@ -120,10 +120,7 @@ def compute_reference_moe_fp4(
     num_local_experts: int = None,
     local_expert_offset: int = 0,
 ) -> torch.Tensor:
-    """Compute reference MoE output using PyTorch operations.
-
-    Computation is done on CPU to avoid cuBLAS issues with certain tensor layouts,
-    then moved back to the original device.
+    """Compute reference MoE output using PyTorch operations on GPU.
 
     Args:
         hidden_states: Input hidden states [num_tokens, hidden_size]
@@ -148,21 +145,18 @@ def compute_reference_moe_fp4(
 
     device = hidden_states.device
 
-    # Move to CPU for reference computation to avoid cuBLAS layout issues
-    hidden_states_cpu = hidden_states.float().cpu()
-    gemm1_weights_cpu = gemm1_weights.float().cpu()
-    gemm2_weights_cpu = gemm2_weights.float().cpu()
-    token_selected_experts_cpu = token_selected_experts.cpu()
-    token_final_scales_cpu = token_final_scales.cpu()
+    hidden_states = hidden_states.float()
+    gemm1_weights = gemm1_weights.float()
+    gemm2_weights = gemm2_weights.float()
 
-    output = torch.zeros((num_tokens, hidden_size), dtype=torch.float32)
+    output = torch.zeros((num_tokens, hidden_size), dtype=torch.float32, device=device)
 
     for token_idx in range(num_tokens):
-        token_input = hidden_states_cpu[token_idx : token_idx + 1]
+        token_input = hidden_states[token_idx : token_idx + 1]
 
         for k in range(top_k):
-            expert_idx = token_selected_experts_cpu[token_idx, k].item()
-            scale = token_final_scales_cpu[token_idx, k].item()
+            expert_idx = token_selected_experts[token_idx, k].item()
+            scale = token_final_scales[token_idx, k].item()
 
             # Skip invalid expert IDs
             if expert_idx < 0 or expert_idx >= num_experts:
@@ -174,7 +168,7 @@ def compute_reference_moe_fp4(
                 # This expert is not on this EP rank, skip
                 continue
 
-            w1 = gemm1_weights_cpu[local_idx]
+            w1 = gemm1_weights[local_idx]
             gemm1_out = token_input @ w1.T
 
             linear = gemm1_out[:, :intermediate_size]
@@ -183,15 +177,15 @@ def compute_reference_moe_fp4(
 
             if fc2_input_scale is not None:
                 swiglu_out = quant_dequant_fp4_reference(
-                    swiglu_out.to(device), fc2_input_scale, sf_vec_size=16
-                ).cpu()
+                    swiglu_out, fc2_input_scale, sf_vec_size=16
+                )
 
-            w2 = gemm2_weights_cpu[local_idx]
+            w2 = gemm2_weights[local_idx]
             gemm2_out = swiglu_out @ w2.T
 
             output[token_idx] += scale * gemm2_out.squeeze(0)
 
-    return output.to(device)
+    return output
 
 
 def create_moe_tensors(
